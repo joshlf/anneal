@@ -35,8 +35,15 @@ Exercises:
    type-checked substituted goals, degradation notes that tell a probe the tactics
    failed to prove apart from one a heartbeat or recursion cap cut off,
    starved-budget syntactic fibre classification, native `Option`/`Except`/`BinTree`
-   negative controls, `TotalClaim` / `ModularClaim` declarations, and the literal
-   cross-language `VacuityClass` wire names.
+   negative controls, `TotalClaim` / `ModularClaim` declarations, the literal
+   cross-language `VacuityClass` wire names, and the prover-free syntactic layer
+   (contradictory `requires` / `ensures`, ex falso, conjunctive and symmetric
+   hypotheses, `decide`-wrapped and quantified reflexivity) under a starved budget.
+   It closes with the **Cross-Language 1:1 Vacuity Parity Suite**
+   (`CrossLanguageParitySuite`): 4 strong contracts (`CL_POS_01..CL_POS_04`) and 5
+   intentional vacuity mutants (`CL_VAC_01..CL_VAC_05`) shared ID-for-ID with the Rust
+   dynamic checker's `cross_language_parity_suite` test module, asserting that both
+   languages emit the same canonical `VacuityClass` names in the same order.
 4. **Compile-Time Kernel Axiom Audit (EOF)**: Audits every constant defined by the
    `Anneal.SpecRealizability` module and by this file (selected by defining module, not
    by name prefix), of every kind (theorems, definitions, instances), for
@@ -2324,6 +2331,520 @@ theorem binTreeLeafPost_dichotomy :
     { stepHeartbeats := 1, totalHeartbeats := 1 }
   unless starvedExt.bindsOutput && !starvedExt.notes.isEmpty do
     throwError "expected starved sliceIsEmptyExtContract accepted with degradation note, got {repr starvedExt}"
+
+/-! ### 3.20 Prover-Free Syntactic Layer: Contradictions, Hypotheses & Disguised Tautologies -/
+
+-- Every fixture below is settled by `detectSyntacticTautology` /
+-- `detectSyntacticContradiction` alone: the `#eval` checks run with a starved probe
+-- budget, under which no tactic can prove anything.
+
+/-- Ex falso from a contradictory hypothesis. -/
+def exFalsoHypPost (x ret : Nat) : Prop := ret ≠ ret → x = 0
+
+/-- Projection out of a conjunctive hypothesis. -/
+def conjHypProjPost (x ret : Nat) : Prop := (ret = x ∧ x < 10) → ret = x
+
+/-- Symmetric restatement of an equality hypothesis. -/
+def symmHypPost (x ret : Nat) : Prop := x = ret → ret = x
+
+/-- The law of non-contradiction. -/
+def nonContradictionPost (x ret : Nat) : Prop := ¬ (ret = x ∧ ret ≠ x)
+
+/-- Boolean-decidable reflexivity. -/
+def decideReflPost (_x ret : Nat) : Prop := decide (ret = ret) = true
+
+/-- Reflexivity under a dependent `∀`. -/
+def forallReflPost (_x ret : Nat) : Prop := ∀ k : Nat, k + ret = k + ret
+
+/-- Excluded middle split across a nested disjunction. -/
+def nestedExcludedMiddlePost (x ret : Nat) : Prop := (ret = x ∨ x < 5) ∨ ret ≠ x
+
+/-- Symmetric restatement as an equality of propositions. -/
+def symmEqPropPost (x ret : Nat) : Prop := (ret = x) = (x = ret)
+
+/-- A complementary pair of conjuncts: unrealizable. -/
+def contraSynPost (x ret : Nat) : Prop := ret = x ∧ ret ≠ x
+
+/-- A complementary pair of conjuncts in a `requires`: dead. -/
+def deadSynPre (x : Nat) : Prop := x = 0 ∧ x ≠ 0
+
+/-- Negative control: a hypothesis that does not entail the conclusion. -/
+def hypGuardedGenuinePost (x ret : Nat) : Prop := x < 10 → ret = x
+
+/-- Negative control: conjuncts that only look complementary. -/
+def eqAndNeOtherPost (x ret : Nat) : Prop := ret = x ∧ ret ≠ x + 1
+
+theorem exFalsoHypPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) exFalsoHypPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ h => absurd rfl h)
+
+theorem conjHypProjPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) conjHypProjPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ h => h.1)
+
+theorem symmHypPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) symmHypPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ h => h.symm)
+
+theorem nonContradictionPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) nonContradictionPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ h => h.2 h.1)
+
+theorem decideReflPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) decideReflPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    show decide (ret = ret) = true
+    exact decide_eq_true rfl)
+
+theorem forallReflPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) forallReflPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ _ => rfl)
+
+theorem nestedExcludedMiddlePost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) nestedExcludedMiddlePost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    show (ret = x ∨ x < 5) ∨ ret ≠ x
+    by_cases h : ret = x
+    · exact Or.inl (Or.inl h)
+    · exact Or.inr h)
+
+theorem symmEqPropPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) symmEqPropPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    show (ret = x) = (x = ret)
+    exact propext ⟨Eq.symm, Eq.symm⟩)
+
+theorem contraSynPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) contraSynPost := by
+  rintro ⟨_, _, _, hEq, hNe⟩
+  exact hNe hEq
+
+theorem deadSynPre_not_satisfiable : ¬ PreconditionSatisfiable deadSynPre := by
+  rintro ⟨_, hEq, hNe⟩
+  exact hNe hEq
+
+theorem hypGuardedGenuinePost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) hypGuardedGenuinePost := by
+  refine ⟨0, trivial, ⟨0, ?_⟩, ⟨1, ?_⟩⟩ <;> simp [hypGuardedGenuinePost]
+
+theorem eqAndNeOtherPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) eqAndNeOtherPost := by
+  refine ⟨0, trivial, ⟨0, ?_⟩, ⟨1, ?_⟩⟩ <;> simp [eqAndNeOtherPost]
+
+#eval assertEnsuresVacuous (Lean.mkConst ``exFalsoHypPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``conjHypProjPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``symmHypPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``nonContradictionPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``decideReflPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``forallReflPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``nestedExcludedMiddlePost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``symmEqPropPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+-- A syntactically contradictory `ensures` is unrealizable, and a syntactically
+-- contradictory `requires` is dead, with no prover involved.
+#eval assertEnsuresVacuous (Lean.mkConst ``contraSynPost) none (some .specViolation)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``deadPost) (some (Lean.mkConst ``deadSynPre)) (some .deadPrecondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval show Lean.Meta.MetaM Unit from do
+  let starved ← checkRequiresSatisfiable (Lean.mkConst ``deadSynPre)
+    { stepHeartbeats := 0, totalHeartbeats := 0 }
+  unless starved.satisfiable? == some false do
+    throwError "expected deadSynPre refuted syntactically, got {repr starved}"
+-- Negative controls: neither recognizer may fire on a genuine postcondition.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``hypGuardedGenuinePost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``eqAndNeOtherPost)
+
+/-! ### 3.21 Cross-Language 1:1 Vacuity Parity Suite (`CrossLanguageParitySuite`) -/
+
+namespace CrossLanguageParitySuite
+
+/-!
+#### Cross-Language Vacuity Parity Benchmark Matrix
+
+Each row is one contract, stated once here over `Nat` models of the Rust types and
+once in `crates/anneal-spec/tests/spec_check_tests.rs` (module
+`cross_language_parity_suite`) as a real `#[spec]` / `#[external_spec]` /
+`#[embed_spec]` companion. Both files use the canonical benchmark ID verbatim as the
+name of the row.
+
+| Benchmark ID                       | Verdict in both languages |
+|------------------------------------|---------------------------|
+| `CL_POS_01_checked_add_u32`        | strong                    |
+| `CL_POS_02_slice_bounds_and_empty` | strong                    |
+| `CL_POS_03_saturating_clamp_u32`   | strong                    |
+| `CL_POS_04_stateful_bounded_step`  | strong                    |
+| `CL_VAC_01_dead_precondition`      | `DeadPrecondition`        |
+| `CL_VAC_02_spec_violation`         | `SpecViolation`           |
+| `CL_VAC_03_trivial_postcondition`  | `TrivialPostcondition`    |
+| `CL_VAC_04_unbound_return_output`  | `UnboundReturnOutput`     |
+| `CL_VAC_05_survived_all_mutants`   | `SurvivedAllMutants`      |
+
+The contracts (`requires` ⟹ `ensures`):
+
+* `CL_POS_01`: `u32::checked_add`, `Some(a + b)` iff `a + b ≤ u32::MAX`, else `None`.
+* `CL_POS_02`: `idx ≤ len` ⟹ `ret = (len == 0, idx < len)` (emptiness and index bounds).
+* `CL_POS_03`: `lo ≤ hi` ⟹ `ret = clamp(val, lo, hi)`.
+* `CL_POS_04`: `val < limit` ⟹ `ret = val' = val + 1` and `limit' = limit` (`&mut` step).
+* `CL_VAC_01`: `x > 100 ∧ x < 50` ⟹ `ret = x` (contradictory `requires`).
+* `CL_VAC_02`: `lo ≤ hi` ⟹ `lo ≤ ret ≤ hi ∧ ret = hi + 1` (dishonest off-by-one clamp).
+* `CL_VAC_03`: `ret = ret ∨ ret = 0` (disguised reflexive tautology).
+* `CL_VAC_04`: `lo ≤ hi` ⟹ `let _ = ret; lo ≤ hi` (discarded output).
+* `CL_VAC_05`: `x < 10` ⟹ `x < 10 ∨ ret = 42` (`requires`-masked postcondition).
+
+Lean reaches each verdict statically (`checkEnsuresBindsOutput`, backed by the kernel
+theorems below); Rust reaches it dynamically (`check_contract` /
+`check_stateful_contract` with the classification probe allowed to leave the
+precondition, matching the fact that the static analysis reasons about `ensures` on
+every input).
+-/
+
+/-! ##### `CL_POS_01_checked_add_u32` -/
+
+def CL_POS_01_checked_add_u32_pre (a b : Nat) : Prop :=
+  a < 4294967296 ∧ b < 4294967296
+
+def CL_POS_01_checked_add_u32_post (a b : Nat) (ret : Option Nat) : Prop :=
+  (a + b < 4294967296 ∧ ret = some (a + b)) ∨ (4294967296 ≤ a + b ∧ ret = none)
+
+theorem CL_POS_01_checked_add_u32_realizable_some :
+    ContractRealizable (fun p : Nat × Nat => CL_POS_01_checked_add_u32_pre p.1 p.2)
+      (fun p ret => CL_POS_01_checked_add_u32_post p.1 p.2 ret) := by
+  refine ⟨(2, 3), ?_, some 5, ?_⟩ <;>
+    simp [CL_POS_01_checked_add_u32_pre, CL_POS_01_checked_add_u32_post]
+
+theorem CL_POS_01_checked_add_u32_realizable_none :
+    ContractRealizable (fun p : Nat × Nat => CL_POS_01_checked_add_u32_pre p.1 p.2)
+      (fun p ret => CL_POS_01_checked_add_u32_post p.1 p.2 ret) := by
+  refine ⟨(4294967295, 1), ?_, none, ?_⟩ <;>
+    simp [CL_POS_01_checked_add_u32_pre, CL_POS_01_checked_add_u32_post]
+
+theorem CL_POS_01_checked_add_u32_dichotomy :
+    PostconditionDichotomy (fun p : Nat × Nat => CL_POS_01_checked_add_u32_pre p.1 p.2)
+      (fun p ret => CL_POS_01_checked_add_u32_post p.1 p.2 ret) := by
+  refine ⟨(2, 3), ?_, ⟨some 5, ?_⟩, ⟨none, ?_⟩⟩ <;>
+    simp [CL_POS_01_checked_add_u32_pre, CL_POS_01_checked_add_u32_post]
+
+/-! ##### `CL_POS_02_slice_bounds_and_empty` -/
+
+def CL_POS_02_slice_bounds_and_empty_pre (len idx : Nat) : Prop := idx ≤ len
+
+/-- `ret.1` is `is_empty` and `ret.2` is whether `idx` is a valid index. -/
+def CL_POS_02_slice_bounds_and_empty_post (len idx : Nat) (ret : Bool × Bool) : Prop :=
+  (ret.1 = true ↔ len = 0) ∧ (ret.2 = true ↔ idx < len)
+
+theorem CL_POS_02_slice_bounds_and_empty_realizable_empty :
+    ContractRealizable (fun p : Nat × Nat => CL_POS_02_slice_bounds_and_empty_pre p.1 p.2)
+      (fun p ret => CL_POS_02_slice_bounds_and_empty_post p.1 p.2 ret) := by
+  refine ⟨(0, 0), ?_, (true, false), ?_⟩ <;>
+    simp [CL_POS_02_slice_bounds_and_empty_pre, CL_POS_02_slice_bounds_and_empty_post]
+
+theorem CL_POS_02_slice_bounds_and_empty_realizable_in_bounds :
+    ContractRealizable (fun p : Nat × Nat => CL_POS_02_slice_bounds_and_empty_pre p.1 p.2)
+      (fun p ret => CL_POS_02_slice_bounds_and_empty_post p.1 p.2 ret) := by
+  refine ⟨(1, 0), ?_, (false, true), ?_⟩ <;>
+    simp [CL_POS_02_slice_bounds_and_empty_pre, CL_POS_02_slice_bounds_and_empty_post]
+
+theorem CL_POS_02_slice_bounds_and_empty_dichotomy :
+    PostconditionDichotomy
+      (fun p : Nat × Nat => CL_POS_02_slice_bounds_and_empty_pre p.1 p.2)
+      (fun p ret => CL_POS_02_slice_bounds_and_empty_post p.1 p.2 ret) := by
+  refine ⟨(0, 0), ?_, ⟨(true, false), ?_⟩, ⟨(false, false), ?_⟩⟩ <;>
+    simp [CL_POS_02_slice_bounds_and_empty_pre, CL_POS_02_slice_bounds_and_empty_post]
+
+/-! ##### `CL_POS_03_saturating_clamp_u32` -/
+
+def CL_POS_03_saturating_clamp_u32_pre (_val lo hi : Nat) : Prop := lo ≤ hi
+
+def CL_POS_03_saturating_clamp_u32_post (val lo hi ret : Nat) : Prop :=
+  lo ≤ ret ∧ ret ≤ hi ∧
+    ((val < lo ∧ ret = lo) ∨ (hi < val ∧ ret = hi) ∨ (lo ≤ val ∧ val ≤ hi ∧ ret = val))
+
+theorem CL_POS_03_saturating_clamp_u32_realizable_eq_bounds :
+    ContractRealizable
+      (fun p : Nat × Nat × Nat => CL_POS_03_saturating_clamp_u32_pre p.1 p.2.1 p.2.2)
+      (fun p ret => CL_POS_03_saturating_clamp_u32_post p.1 p.2.1 p.2.2 ret) := by
+  refine ⟨(7, 3, 3), ?_, 3, ?_⟩ <;>
+    simp [CL_POS_03_saturating_clamp_u32_pre, CL_POS_03_saturating_clamp_u32_post]
+
+theorem CL_POS_03_saturating_clamp_u32_dichotomy :
+    PostconditionDichotomy
+      (fun p : Nat × Nat × Nat => CL_POS_03_saturating_clamp_u32_pre p.1 p.2.1 p.2.2)
+      (fun p ret => CL_POS_03_saturating_clamp_u32_post p.1 p.2.1 p.2.2 ret) := by
+  refine ⟨(5, 0, 10), ?_, ⟨5, ?_⟩, ⟨6, ?_⟩⟩ <;>
+    simp [CL_POS_03_saturating_clamp_u32_pre, CL_POS_03_saturating_clamp_u32_post]
+
+/-! ##### `CL_POS_04_stateful_bounded_step` -/
+
+/-- Pre-state `(val, limit)` of the bounded counter behind `&mut self`. -/
+def CL_POS_04_stateful_bounded_step_pre (val limit : Nat) : Prop :=
+  val < limit ∧ limit < 4294967296
+
+/-- `ret.1` is the returned value, `ret.2.1` the post-state `val'`, and `ret.2.2` the
+    post-state `limit'`. -/
+def CL_POS_04_stateful_bounded_step_post
+    (val limit : Nat) (ret : Nat × Nat × Nat) : Prop :=
+  ret.1 = val + 1 ∧ ret.2.1 = val + 1 ∧ ret.2.2 = limit
+
+theorem CL_POS_04_stateful_bounded_step_dichotomy :
+    PostconditionDichotomy
+      (fun p : Nat × Nat => CL_POS_04_stateful_bounded_step_pre p.1 p.2)
+      (fun p ret => CL_POS_04_stateful_bounded_step_post p.1 p.2 ret) := by
+  refine ⟨(0, 1), ?_, ⟨(1, 1, 1), ?_⟩, ⟨(2, 1, 1), ?_⟩⟩ <;>
+    simp [CL_POS_04_stateful_bounded_step_pre, CL_POS_04_stateful_bounded_step_post]
+
+/-- The return value is constrained with the post-state held fixed (the Rust checker's
+    return-value mutant axis). -/
+theorem CL_POS_04_stateful_bounded_step_returnAxisDichotomy :
+    DichotomyModuloObservation
+      (fun (_ : Nat × Nat) (ret : Nat × Nat × Nat) => ret.2)
+      (fun p : Nat × Nat => CL_POS_04_stateful_bounded_step_pre p.1 p.2)
+      (fun p ret => CL_POS_04_stateful_bounded_step_post p.1 p.2 ret) := by
+  refine ⟨(0, 1), ?_, (1, 1, 1), (2, 1, 1), ?_, ?_, ?_⟩ <;>
+    simp [CL_POS_04_stateful_bounded_step_pre, CL_POS_04_stateful_bounded_step_post]
+
+/-- The post-state is constrained with the return value held fixed (the Rust checker's
+    state mutant axis). -/
+theorem CL_POS_04_stateful_bounded_step_stateAxisDichotomy :
+    DichotomyModuloObservation
+      (fun (_ : Nat × Nat) (ret : Nat × Nat × Nat) => ret.1)
+      (fun p : Nat × Nat => CL_POS_04_stateful_bounded_step_pre p.1 p.2)
+      (fun p ret => CL_POS_04_stateful_bounded_step_post p.1 p.2 ret) := by
+  refine ⟨(0, 1), ?_, (1, 1, 1), (1, 2, 1), ?_, ?_, ?_⟩ <;>
+    simp [CL_POS_04_stateful_bounded_step_pre, CL_POS_04_stateful_bounded_step_post]
+
+/-! ##### `CL_VAC_01_dead_precondition` -/
+
+def CL_VAC_01_dead_precondition_pre (x : Nat) : Prop := x > 100 ∧ x < 50
+
+def CL_VAC_01_dead_precondition_post (x ret : Nat) : Prop := ret = x
+
+theorem CL_VAC_01_dead_precondition_pre_unsat :
+    ¬ PreconditionSatisfiable CL_VAC_01_dead_precondition_pre := by
+  rintro ⟨x, hGt, hLt⟩
+  omega
+
+theorem CL_VAC_01_dead_precondition_not_realizable :
+    ¬ ContractRealizable CL_VAC_01_dead_precondition_pre CL_VAC_01_dead_precondition_post :=
+  not_contractRealizable_of_unsat_pre CL_VAC_01_dead_precondition_pre_unsat
+
+/-! ##### `CL_VAC_02_spec_violation` -/
+
+def CL_VAC_02_spec_violation_pre (_val lo hi : Nat) : Prop := lo ≤ hi
+
+/-- Dishonest off-by-one clamp: the result is claimed to lie in `[lo, hi]` and to equal
+    `hi + 1`. -/
+def CL_VAC_02_spec_violation_post (_val lo hi ret : Nat) : Prop :=
+  lo ≤ ret ∧ ret ≤ hi ∧ ret = hi + 1
+
+theorem CL_VAC_02_spec_violation_unrealizable (val lo hi ret : Nat) :
+    ¬ CL_VAC_02_spec_violation_post val lo hi ret := by
+  rintro ⟨_, hLe, hEq⟩
+  omega
+
+theorem CL_VAC_02_spec_violation_not_realizable :
+    ¬ ContractRealizable
+        (fun p : Nat × Nat × Nat => CL_VAC_02_spec_violation_pre p.1 p.2.1 p.2.2)
+        (fun p ret => CL_VAC_02_spec_violation_post p.1 p.2.1 p.2.2 ret) := by
+  rintro ⟨p, _, ret, hPost⟩
+  exact CL_VAC_02_spec_violation_unrealizable p.1 p.2.1 p.2.2 ret hPost
+
+/-! ##### `CL_VAC_03_trivial_postcondition` -/
+
+def CL_VAC_03_trivial_postcondition_post (_x ret : Nat) : Prop := ret = ret ∨ ret = 0
+
+theorem CL_VAC_03_trivial_postcondition_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) CL_VAC_03_trivial_postcondition_post :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => Or.inl rfl)
+
+/-! ##### `CL_VAC_04_unbound_return_output` -/
+
+def CL_VAC_04_unbound_return_output_pre (_val lo hi : Nat) : Prop := lo ≤ hi
+
+def CL_VAC_04_unbound_return_output_post (_val lo hi ret : Nat) : Prop :=
+  let _ := ret
+  lo ≤ hi
+
+theorem CL_VAC_04_unbound_return_output_not_dichotomy :
+    ¬ PostconditionDichotomy
+        (fun p : Nat × Nat × Nat => CL_VAC_04_unbound_return_output_pre p.1 p.2.1 p.2.2)
+        (fun p ret => CL_VAC_04_unbound_return_output_post p.1 p.2.1 p.2.2 ret) :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ _ h => h)
+
+/-! ##### `CL_VAC_05_survived_all_mutants` -/
+
+def CL_VAC_05_survived_all_mutants_pre (x : Nat) : Prop := x < 10
+
+def CL_VAC_05_survived_all_mutants_post (x ret : Nat) : Prop := x < 10 ∨ ret = 42
+
+theorem CL_VAC_05_survived_all_mutants_not_dichotomy :
+    ¬ PostconditionDichotomy
+        CL_VAC_05_survived_all_mutants_pre CL_VAC_05_survived_all_mutants_post :=
+  not_postconditionDichotomy_of_trivial (fun _ _ hPre => Or.inl hPre)
+
+/-- Outside `requires` the same postcondition does bind the output, which is what
+    separates `SurvivedAllMutants` from `TrivialPostcondition` and
+    `UnboundReturnOutput`. -/
+theorem CL_VAC_05_survived_all_mutants_dichotomy_without_requires :
+    PostconditionDichotomy (fun _ : Nat => True) CL_VAC_05_survived_all_mutants_post := by
+  refine ⟨10, trivial, ⟨42, ?_⟩, ⟨0, ?_⟩⟩ <;> simp [CL_VAC_05_survived_all_mutants_post]
+
+/-! ##### The Matrix, Checked at Compile Time -/
+
+/-- One row of the benchmark matrix: its canonical cross-language ID and the names of
+    its `ensures` and (optional) `requires` predicates. -/
+structure Benchmark where
+  benchmarkId : String
+  ensuresName : Lean.Name
+  requiresName? : Option Lean.Name
+
+/-- The 4 shared strong contracts, in canonical order. -/
+def positiveBenchmarks : List Benchmark := [
+  { benchmarkId := "CL_POS_01_checked_add_u32"
+    ensuresName := ``CL_POS_01_checked_add_u32_post
+    requiresName? := some ``CL_POS_01_checked_add_u32_pre },
+  { benchmarkId := "CL_POS_02_slice_bounds_and_empty"
+    ensuresName := ``CL_POS_02_slice_bounds_and_empty_post
+    requiresName? := some ``CL_POS_02_slice_bounds_and_empty_pre },
+  { benchmarkId := "CL_POS_03_saturating_clamp_u32"
+    ensuresName := ``CL_POS_03_saturating_clamp_u32_post
+    requiresName? := some ``CL_POS_03_saturating_clamp_u32_pre },
+  { benchmarkId := "CL_POS_04_stateful_bounded_step"
+    ensuresName := ``CL_POS_04_stateful_bounded_step_post
+    requiresName? := some ``CL_POS_04_stateful_bounded_step_pre }
+]
+
+/-- The 5 shared intentional vacuity mutants with their expected class, in canonical
+    order. -/
+def vacuityBenchmarks : List (Benchmark × VacuityClass) := [
+  ({ benchmarkId := "CL_VAC_01_dead_precondition"
+     ensuresName := ``CL_VAC_01_dead_precondition_post
+     requiresName? := some ``CL_VAC_01_dead_precondition_pre }, .deadPrecondition),
+  ({ benchmarkId := "CL_VAC_02_spec_violation"
+     ensuresName := ``CL_VAC_02_spec_violation_post
+     requiresName? := some ``CL_VAC_02_spec_violation_pre }, .specViolation),
+  ({ benchmarkId := "CL_VAC_03_trivial_postcondition"
+     ensuresName := ``CL_VAC_03_trivial_postcondition_post
+     requiresName? := none }, .trivialPostcondition),
+  ({ benchmarkId := "CL_VAC_04_unbound_return_output"
+     ensuresName := ``CL_VAC_04_unbound_return_output_post
+     requiresName? := some ``CL_VAC_04_unbound_return_output_pre }, .unboundReturnOutput),
+  ({ benchmarkId := "CL_VAC_05_survived_all_mutants"
+     ensuresName := ``CL_VAC_05_survived_all_mutants_post
+     requiresName? := some ``CL_VAC_05_survived_all_mutants_pre }, .survivedAllMutants)
+]
+
+/-- The class names `CL_VAC_01..CL_VAC_05` must emit, in order. The Rust suite pins the
+    same list (`EXPECTED_CLASS_NAMES`). -/
+def expectedClassNames : List String :=
+  ["DeadPrecondition", "SpecViolation", "TrivialPostcondition", "UnboundReturnOutput",
+    "SurvivedAllMutants"]
+
+-- The benchmark IDs are the canonical ones, in canonical order.
+#eval show Lean.Meta.MetaM Unit from do
+  let positiveIds := positiveBenchmarks.map (fun b => b.benchmarkId)
+  unless positiveIds ==
+      ["CL_POS_01_checked_add_u32", "CL_POS_02_slice_bounds_and_empty",
+        "CL_POS_03_saturating_clamp_u32", "CL_POS_04_stateful_bounded_step"] do
+    throwError "unexpected positive benchmark IDs: {positiveIds}"
+  let vacuityIds := vacuityBenchmarks.map (fun row => row.1.benchmarkId)
+  unless vacuityIds ==
+      ["CL_VAC_01_dead_precondition", "CL_VAC_02_spec_violation",
+        "CL_VAC_03_trivial_postcondition", "CL_VAC_04_unbound_return_output",
+        "CL_VAC_05_survived_all_mutants"] do
+    throwError "unexpected vacuity benchmark IDs: {vacuityIds}"
+
+/-- Run the static checker on one row of the matrix. -/
+def checkBenchmark (b : Benchmark) : Lean.Meta.MetaM EnsuresCheckResult :=
+  checkEnsuresBindsOutput (Lean.mkConst b.ensuresName)
+    (b.requiresName?.map (fun n => Lean.mkConst n))
+
+/-- Assert that positive row `idx` is accepted as a strong contract whose `requires`
+    is never refuted. -/
+def assertPositiveRow (idx : Nat) : Lean.Meta.MetaM Unit := do
+  let some b := positiveBenchmarks[idx]?
+    | throwError "no positive benchmark at row {idx}"
+  let res ← checkBenchmark b
+  unless res.bindsOutput do
+    throwError "{b.benchmarkId}: expected a strong contract, got {repr res}"
+  if let some pre := b.requiresName? then
+    let sat ← checkRequiresSatisfiable (Lean.mkConst pre)
+    if sat.satisfiable? == some false then
+      throwError "{b.benchmarkId}: requires was refuted: {repr sat}"
+
+/-- Assert that vacuity row `idx` is flagged with exactly its expected class, and that
+    the canonical name it emits is entry `idx` of `expectedClassNames`. -/
+def assertVacuityRow (idx : Nat) : Lean.Meta.MetaM Unit := do
+  let some (b, expected) := vacuityBenchmarks[idx]?
+    | throwError "no vacuity benchmark at row {idx}"
+  let res ← checkBenchmark b
+  if res.bindsOutput then
+    throwError "{b.benchmarkId}: expected {expected.canonicalName}, but it was accepted"
+  let some cls := res.vacuityClass?
+    | throwError "{b.benchmarkId}: flagged vacuous without a VacuityClass"
+  unless cls == expected do
+    throwError "{b.benchmarkId}: expected {expected.canonicalName}, got \
+      {cls.canonicalName} ({repr res})"
+  unless expectedClassNames[idx]? == some cls.canonicalName do
+    throwError "{b.benchmarkId}: emitted {cls.canonicalName} out of cross-language order"
+
+-- The matrix has 4 strong contracts and 5 vacuity mutants, and its expected-class
+-- column is the canonical name list in the shared 1:1 order.
+#eval show Lean.Meta.MetaM Unit from do
+  unless positiveBenchmarks.length == 4 && vacuityBenchmarks.length == 5 do
+    throwError "the matrix must hold 4 strong contracts and 5 vacuity mutants"
+  let expectedColumn := vacuityBenchmarks.map (fun row => row.2.canonicalName)
+  unless expectedColumn == expectedClassNames do
+    throwError "expected-class column out of cross-language order: {expectedColumn}"
+
+-- `CL_POS_01..CL_POS_04`: every strong contract is accepted, and its `requires` is
+-- never refuted. Each row is checked by its own command, so every row gets a full
+-- probe budget.
+#eval assertPositiveRow 0
+#eval assertPositiveRow 1
+#eval assertPositiveRow 2
+#eval assertPositiveRow 3
+
+-- The MIR-level `&mut`-state form of `CL_POS_04_stateful_bounded_step` (a
+-- `StatefulClaim` over `Memory`) passes with the post-memory held fixed.
+#eval assertDeclEnsuresBindsOutput ``statefulCounterStepClaim { strictReturnValue := true }
+
+-- `CL_VAC_01..CL_VAC_05`: row `i` is flagged with exactly its expected class and emits
+-- entry `i` of `expectedClassNames`, so the five canonical class names come out as
+-- `["DeadPrecondition", "SpecViolation", "TrivialPostcondition", "UnboundReturnOutput",
+-- "SurvivedAllMutants"]` in exact 1:1 order.
+#eval assertVacuityRow 0
+#eval assertVacuityRow 1
+#eval assertVacuityRow 2
+#eval assertVacuityRow 3
+#eval assertVacuityRow 4
+
+-- `CL_VAC_01_dead_precondition`: the `requires` itself is refuted.
+#eval show Lean.Meta.MetaM Unit from do
+  let dead ← checkRequiresSatisfiable (Lean.mkConst ``CL_VAC_01_dead_precondition_pre)
+  unless dead.satisfiable? == some false do
+    throwError "CL_VAC_01_dead_precondition: expected a refuted requires, got {repr dead}"
+
+-- The frozen taxonomy enumerates the classes in the same order, and every canonical
+-- name parses back to its class.
+#eval show Lean.Meta.MetaM Unit from do
+  unless VacuityClass.all.map VacuityClass.canonicalName == expectedClassNames do
+    throwError "VacuityClass.all is out of cross-language order"
+  for c in VacuityClass.all do
+    unless VacuityClass.ofCanonicalName? c.canonicalName == some c do
+      throwError "canonical name {c.canonicalName} does not round-trip"
+  unless (VacuityClass.ofCanonicalName? "NotAVacuityClass").isNone do
+    throwError "an unknown canonical name was parsed"
+
+end CrossLanguageParitySuite
 
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 

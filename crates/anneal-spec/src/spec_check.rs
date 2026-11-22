@@ -95,6 +95,16 @@ pub enum VacuityClass {
 }
 
 impl VacuityClass {
+    /// All five classes in their frozen cross-language order, the order in
+    /// which the Lean static analysis enumerates them (`VacuityClass.all`).
+    pub const ALL: [Self; 5] = [
+        Self::DeadPrecondition,
+        Self::SpecViolation,
+        Self::TrivialPostcondition,
+        Self::UnboundReturnOutput,
+        Self::SurvivedAllMutants,
+    ];
+
     /// Returns the canonical cross-language diagnostic identifier for this class.
     pub const fn canonical_name(self) -> &'static str {
         match self {
@@ -104,6 +114,15 @@ impl VacuityClass {
             Self::UnboundReturnOutput => "UnboundReturnOutput",
             Self::SurvivedAllMutants => "SurvivedAllMutants",
         }
+    }
+
+    /// Parses a canonical cross-language identifier back into its class, the
+    /// inverse of [`Self::canonical_name`]. Returns `None` for any other
+    /// string; matching is exact and case-sensitive.
+    pub fn from_canonical_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|class| class.canonical_name() == name)
     }
 }
 
@@ -1682,7 +1701,8 @@ pub enum FailureDetail {
     /// Live conformance violation or fail-closed degenerate configuration.
     Violation(ViolationKind),
     /// Zero distinct mutants were tested (e.g. `max_mutants_per_hit == 0` or
-    /// every custom mutant equaled the actual output).
+    /// every custom mutant equaled the actual output, however often the bank
+    /// repeats it).
     NoDistinctMutantsTested,
     /// All tested mutants satisfied the postcondition; includes probe telemetry.
     AllMutantsSurvived {
@@ -2331,11 +2351,15 @@ where
         if !R::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
             if let Some(slice) = custom_mutants {
-                for ret_bad in slice {
+                for (bank_idx, ret_bad) in slice.iter().enumerate() {
                     if tested_this_hit >= config.max_mutants_per_hit {
                         break;
                     }
-                    if ret_bad == &ret_ok {
+                    // Skip the actual output and every repeat of an earlier
+                    // bank entry: a bank padded with duplicates must neither
+                    // inflate `mutants_tested` nor spend the per-hit budget
+                    // before a distinct candidate is reached.
+                    if ret_bad == &ret_ok || slice[..bank_idx].contains(ret_bad) {
                         continue;
                     }
                     tested_this_hit += 1;
@@ -2456,10 +2480,12 @@ where
 /// Checks a stateless contract `(pre, body, post)` using an explicit custom
 /// mutant slice `mutants` during Stage D3.
 ///
-/// Any candidate in `mutants` equal to the actual output `ret_ok` is skipped
-/// and never counted toward `mutants_tested`; if zero distinct mutants are
-/// tested on a non-subsingleton return type, the check fails closed with
-/// [`VacuityClass::SurvivedAllMutants`].
+/// Any candidate in `mutants` equal to the actual output `ret_ok`, or equal to
+/// an earlier candidate in `mutants`, is skipped: it is never counted toward
+/// `mutants_tested` and never spends the `max_mutants_per_hit` budget, so a
+/// bank padded with duplicates behaves exactly like its distinct entries. If
+/// zero distinct mutants are tested on a non-subsingleton return type, the
+/// check fails closed with [`VacuityClass::SurvivedAllMutants`].
 pub fn check_contract_with_mutants<I, R, Pre, Body, Post>(
     config: SpecCheckConfig,
     mutants: &[R],

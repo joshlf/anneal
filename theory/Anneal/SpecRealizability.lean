@@ -80,6 +80,21 @@ theorem VacuityClass.canonicalName_injective {a b : VacuityClass}
     (h : a.canonicalName = b.canonicalName) : a = b := by
   cases a <;> cases b <;> first | rfl | (simp [VacuityClass.canonicalName] at h)
 
+/-- All five `VacuityClass` variants in their frozen cross-language order. The Rust
+    dynamic checker lists the same classes in the same order (`VacuityClass::ALL`). -/
+def VacuityClass.all : List VacuityClass :=
+  [.deadPrecondition, .specViolation, .trivialPostcondition, .unboundReturnOutput,
+    .survivedAllMutants]
+
+/-- `VacuityClass.all` enumerates every variant. -/
+theorem VacuityClass.mem_all (c : VacuityClass) : c ∈ VacuityClass.all := by
+  cases c <;> decide
+
+/-- Parse a canonical wire name back into its `VacuityClass` (`none` for any other
+    string), the inverse of `VacuityClass.canonicalName`. -/
+def VacuityClass.ofCanonicalName? (name : String) : Option VacuityClass :=
+  VacuityClass.all.find? (fun c => c.canonicalName == name)
+
 /-! ## Part I — Pure Kernel Realizability, Dichotomy, Mutant-Kill & Observation-Fibre Calculus -/
 
 section PureCalculus
@@ -1853,26 +1868,157 @@ private def unwrapNot? (e : Expr) : Option Expr :=
   else
     none
 
+/-- Whether `neg` is syntactically the negation of `p`: either `¬ p`, or `a ≠ b` when
+    `p` is `a = b`. -/
+private def isNegationOf (neg p : Expr) : Bool :=
+  let neg := neg.consumeMData
+  let p := p.consumeMData
+  match unwrapNot? neg with
+  | some inner => inner.consumeMData == p
+  | none =>
+    if neg.isAppOfArity ``Ne 3 && p.isAppOfArity ``Eq 3 then
+      let negArgs := neg.getAppArgs
+      let pArgs := p.getAppArgs
+      negArgs[1]!.consumeMData == pArgs[1]!.consumeMData &&
+        negArgs[2]!.consumeMData == pArgs[2]!.consumeMData
+    else
+      false
+
+/-- Whether `q` restates `p` with the two sides of an `Eq` or `Ne` swapped (`a = b`
+    versus `b = a`). The two are equivalent by symmetry in every model. -/
+private def isSymmetricRestatement (p q : Expr) : Bool :=
+  let p := p.consumeMData
+  let q := q.consumeMData
+  if (p.isAppOfArity ``Eq 3 && q.isAppOfArity ``Eq 3) ||
+     (p.isAppOfArity ``Ne 3 && q.isAppOfArity ``Ne 3) then
+    let pArgs := p.getAppArgs
+    let qArgs := q.getAppArgs
+    pArgs[1]!.consumeMData == qArgs[2]!.consumeMData &&
+      pArgs[2]!.consumeMData == qArgs[1]!.consumeMData
+  else
+    false
+
+/-- Fuel-bounded flattening of a nested conjunction into its conjuncts. -/
+private def flattenConjuncts : Nat → Expr → List Expr
+  | 0, e => [e.consumeMData]
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``And 2 then
+      flattenConjuncts fuel e.appFn!.appArg! ++ flattenConjuncts fuel e.appArg!
+    else
+      [e]
+
+/-- Fuel-bounded flattening of a nested disjunction into its disjuncts. -/
+private def flattenDisjuncts : Nat → Expr → List Expr
+  | 0, e => [e.consumeMData]
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isAppOfArity ``Or 2 then
+      flattenDisjuncts fuel e.appFn!.appArg! ++ flattenDisjuncts fuel e.appArg!
+    else
+      [e]
+
+/-- Whether some member of `props` is syntactically the negation of another member. -/
+private def hasComplementaryPair (props : List Expr) : Bool :=
+  props.any (fun p => props.any (fun q => isNegationOf q p))
+
+/-- Fast syntactic contradiction recognizer for `Prop` expressions (`False`, `r ≠ r`,
+    `¬ True`, `¬ (r = r)`, `¬ (P ↔ P)`, `P ↔ ¬ P`, a conjunction with a contradictory
+    conjunct or with a complementary pair `P`, `¬ P` among its conjuncts, and a
+    disjunction of contradictions).
+
+    Every recognized shape is unsatisfiable in all models, so the recognizer needs no
+    prover and stays effective when the probe heartbeat budget is exhausted. Like
+    `detectSyntacticTautology`, it never appeals to the order relations `<` and `≤`,
+    whose irreflexivity depends on a lawful instance. -/
+def detectSyntacticContradiction : Nat → Expr → Bool
+  | 0, _ => false
+  | fuel + 1, e =>
+    let e := e.consumeMData
+    if e.isConstOf ``False then
+      true
+    else if e.isAppOfArity ``Ne 3 then
+      let args := e.getAppArgs
+      args[1]!.consumeMData == args[2]!.consumeMData
+    else if e.isAppOfArity ``Not 1 then
+      let inner := e.appArg!.consumeMData
+      if inner.isConstOf ``True then
+        true
+      else if inner.isAppOfArity ``Eq 3 then
+        let args := inner.getAppArgs
+        args[1]!.consumeMData == args[2]!.consumeMData
+      else if inner.isAppOfArity ``Iff 2 then
+        inner.appFn!.appArg!.consumeMData == inner.appArg!.consumeMData
+      else
+        false
+    else if e.isAppOfArity ``And 2 then
+      let conjuncts := flattenConjuncts fuel e
+      conjuncts.any (fun c => detectSyntacticContradiction fuel c) ||
+        hasComplementaryPair conjuncts
+    else if e.isAppOfArity ``Or 2 then
+      detectSyntacticContradiction fuel e.appFn!.appArg! &&
+        detectSyntacticContradiction fuel e.appArg!
+    else if e.isAppOfArity ``Iff 2 then
+      let lhs := e.appFn!.appArg!
+      let rhs := e.appArg!
+      isNegationOf lhs rhs || isNegationOf rhs lhs
+    else
+      false
+
+/-- Extend the hypothesis list `hyps` with `h`, also recording the conjuncts of a
+    conjunctive hypothesis so `P ∧ Q → P` is recognized. -/
+private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
+  let h := h.consumeMData
+  if h.isAppOfArity ``And 2 then
+    h :: (flattenConjuncts 8 h ++ hyps)
+  else
+    h :: hyps
+
 /-- Fast syntactic tautology recognizer for `Prop` expressions (`True`, `r = r`,
-    `¬ (r ≠ r)`, `P ↔ P`, `P → P`, `A → B → A`, `r = r ∨ P`, `P ∨ ¬ P`).
+    `HEq r r`, `decide (r = r) = true`, `¬ (r ≠ r)`, `¬ (P ∧ ¬ P)`, `P ↔ P`,
+    `(a = b) ↔ (b = a)`, `(a = b) = (b = a)`, `P → P`, `A → B → A`, `P ∧ Q → P`,
+    `a = b → b = a`, ex falso from a contradictory hypothesis (`r ≠ r → P`),
+    `r = r ∨ P`, `P ∨ Q ∨ ¬ P`, `if`/`dite` with tautological branches, and `∀ y, T`
+    with a tautological body).
 
     Every recognized shape is valid in all models. In particular `r ≤ r` is *not*
     recognized syntactically: `LE.le` is an arbitrary user-supplied relation, and
     reflexivity fails for lawless instances (IEEE `Float`, where `NaN ≤ NaN` is false,
     or any strict or partial user-defined `LE`), for which `r ≤ r` is a genuine
-    constraint on `r`. Reflexive inequalities over lawful orders are still caught by
-    the bounded prover, which must actually prove them. -/
+    constraint on `r`. `(r == r) = true` is left to the prover for the same reason
+    (`BEq` need not be reflexive), whereas `decide (r = r) = true` is equivalent to
+    `r = r`. Reflexive inequalities over lawful orders are still caught by the bounded
+    prover, which must actually prove them.
+
+    `hyps` holds the hypotheses in scope. A hypothesis mentioning a loose bound
+    variable is only ever compared against goals at its own binder depth: binders are
+    crossed either into a body with no loose bound variable at all, or (for a
+    dependent `∀`) after discarding every such hypothesis. -/
 def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacuityReason
   | 0, _, _ => none
   | fuel + 1, hyps, e =>
     let e := e.consumeMData
     if e.isConstOf ``True then
       some .trivialConstantTrue
-    else if hyps.any (fun h => h == e) then
+    else if hyps.any (fun h => h == e || isSymmetricRestatement h e) then
       some .tautologicalImplication
     else if e.isAppOfArity ``Eq 3 then
       let args := e.getAppArgs
-      if args[1]!.consumeMData == args[2]!.consumeMData then some .reflexiveEquality else none
+      let lhs := args[1]!.consumeMData
+      let rhs := args[2]!.consumeMData
+      if lhs == rhs then
+        some .reflexiveEquality
+      else if isSymmetricRestatement lhs rhs then
+        some .tautologicalImplication
+      else if rhs.isConstOf ``Bool.true && lhs.isAppOfArity ``Decidable.decide 2 then
+        detectSyntacticTautology fuel hyps lhs.appFn!.appArg!
+      else if lhs.isConstOf ``Bool.true && rhs.isAppOfArity ``Decidable.decide 2 then
+        detectSyntacticTautology fuel hyps rhs.appFn!.appArg!
+      else
+        none
+    else if e.isAppOfArity ``HEq 4 then
+      let args := e.getAppArgs
+      if args[1]!.consumeMData == args[3]!.consumeMData then some .reflexiveEquality else none
     else if e.isAppOfArity ``Iff 2 then
       let args := e.getAppArgs
       let lhs := args[0]!.consumeMData
@@ -1882,14 +2028,8 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       else if (detectSyntacticTautology fuel hyps lhs).isSome &&
               (detectSyntacticTautology fuel hyps rhs).isSome then
         some .tautologicalImplication
-      else if lhs.isAppOfArity ``Eq 3 && rhs.isAppOfArity ``Eq 3 then
-        let la := lhs.getAppArgs
-        let ra := rhs.getAppArgs
-        if la[1]!.consumeMData == ra[2]!.consumeMData &&
-           la[2]!.consumeMData == ra[1]!.consumeMData then
-          some .tautologicalImplication
-        else
-          none
+      else if isSymmetricRestatement lhs rhs then
+        some .tautologicalImplication
       else
         none
     else if e.isAppOfArity ``ite 5 then
@@ -1897,11 +2037,23 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       let cond := args[1]!.consumeMData
       let tBranch := args[3]!
       let fBranch := args[4]!
-      if (detectSyntacticTautology fuel (cond :: hyps) tBranch).isSome &&
+      if (detectSyntacticTautology fuel (assumeHyp cond hyps) tBranch).isSome &&
          (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome then
         some .tautologicalImplication
       else
         none
+    else if e.isAppOfArity ``dite 5 then
+      let args := e.getAppArgs
+      let cond := args[1]!.consumeMData
+      match args[3]!.consumeMData, args[4]!.consumeMData with
+      | .lam _ _ tBody _, .lam _ _ fBody _ =>
+        if !tBody.hasLooseBVars && !fBody.hasLooseBVars &&
+           (detectSyntacticTautology fuel (assumeHyp cond hyps) tBody).isSome &&
+           (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBody).isSome then
+          some .tautologicalImplication
+        else
+          none
+      | _, _ => none
     else if e.isAppOfArity ``Not 1 then
       let inner := e.appArg!.consumeMData
       if inner.isConstOf ``False then
@@ -1913,15 +2065,17 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
         match detectSyntacticTautology fuel hyps inner.appArg! with
         | some r => some r
         | none => none
+      else if detectSyntacticContradiction fuel inner then
+        some .tautologicalImplication
+      else if hasComplementaryPair (assumeHyp inner hyps) then
+        some .tautologicalImplication
       else
         none
     else if e.isAppOfArity ``Or 2 then
-      let lhs := e.appFn!.appArg!.consumeMData
-      let rhs := e.appArg!.consumeMData
-      if (detectSyntacticTautology fuel hyps lhs).isSome ||
-         (detectSyntacticTautology fuel hyps rhs).isSome then
+      let disjuncts := flattenDisjuncts fuel e
+      if disjuncts.any (fun d => (detectSyntacticTautology fuel hyps d).isSome) then
         some .tautologicalDisjunction
-      else if unwrapNot? lhs == some rhs || unwrapNot? rhs == some lhs then
+      else if hasComplementaryPair disjuncts then
         some .tautologicalDisjunction
       else
         none
@@ -1941,12 +2095,20 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
             some .tautologicalImplication
           else if dom == body then
             some .tautologicalImplication
-          else if (detectSyntacticTautology fuel (dom :: hyps) body).isSome then
+          else if detectSyntacticContradiction fuel dom then
+            some .tautologicalImplication
+          else if hasComplementaryPair (assumeHyp dom hyps) then
+            some .tautologicalImplication
+          else if (detectSyntacticTautology fuel (assumeHyp dom hyps) body).isSome then
             some .tautologicalImplication
           else
             none
         else
-          none
+          let closedHyps := hyps.filter (fun h => !h.hasLooseBVars)
+          if (detectSyntacticTautology fuel closedHyps body).isSome then
+            some .tautologicalImplication
+          else
+            none
       | _ => none
 
 /-! ### `MirCallAns` Boilerplate-Atom Cofactoring (`k ≤ 8`) -/
@@ -2557,6 +2719,8 @@ private def analyzeNormalizedSpec
   if let some preNorm := preNorm? then
     if preNorm.isConstOf ``False then
       return .vacuous .requiresUnsatisfiable ["requires is syntactically False"]
+    if detectSyntacticContradiction 32 preNorm then
+      return .vacuous .requiresUnsatisfiable ["requires is syntactically contradictory"]
     if ← tryProveWithin budget (← mkForallFVars preInputs (negate preNorm)) cutOffOpt then
       return .vacuous .requiresUnsatisfiable
         ["requires proved unsatisfiable for all inputs"]
@@ -2621,6 +2785,9 @@ private def analyzeNormalizedSpec
     if normDiscarded.isConstOf ``False then
       return .vacuous .unrealizableUnderRequires
         ["ensures reduces to False after discarding output"]
+    if detectSyntacticContradiction 32 normDiscarded then
+      return .vacuous .unrealizableUnderRequires
+        ["ensures is syntactically contradictory after discarding output"]
     if ← proveClosed (negate normDiscarded) then
       return .vacuous .unrealizableUnderRequires
         ["ensures with discarded output proved unsatisfiable"]
@@ -2639,6 +2806,9 @@ private def analyzeNormalizedSpec
       return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
     if let some tautReason := detectSyntacticTautology 32 [] body then
       return .vacuous tautReason ["input-only ensures is syntactically tautological"]
+    if detectSyntacticContradiction 32 body then
+      return .vacuous .unrealizableUnderRequires
+        ["input-only ensures is syntactically contradictory"]
     if ← proveClosed body then
       return .vacuous .tautologicalByProver ["input-only ensures proved universally valid"]
     if ← proveClosed (negate body) then
@@ -2706,7 +2876,7 @@ private def analyzeNormalizedSpec
       -- Classify the residual user postcondition of one boilerplate fibre, keeping
       -- the fibre's atom assignment in scope so impossible branches are pruned.
       let classifyFibre (fibreAssump res : Expr) : MetaM FibreKind := do
-        if res.isConstOf ``False then
+        if res.isConstOf ``False || detectSyntacticContradiction 32 res then
           return .contradictory
         if res.isConstOf ``True then
           if ← proveFibreContra fibreAssump res then
@@ -2824,6 +2994,10 @@ private def analyzeNormalizedSpec
   -- Phase 4: Syntactic tautology & global prover checks (without `requires`).
   if let some tautReason := detectSyntacticTautology 32 [] workBody then
     return .vacuous tautReason (notes ++ ["detected syntactic tautology"])
+
+  if detectSyntacticContradiction 32 workBody then
+    return .vacuous .unrealizableUnderRequires
+      (notes ++ ["detected syntactic contradiction"])
 
   if ← proveClosed workBody then
     return .vacuous .tautologicalByProver
@@ -3037,6 +3211,11 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
     let normBody ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 rawBody)
     if normBody.isConstOf ``False then
       return { satisfiable? := some false, reason := "precondition is syntactically False" }
+    if detectSyntacticContradiction 32 normBody then
+      return {
+        satisfiable? := some false
+        reason := "precondition is syntactically contradictory"
+      }
     let unsatGoal ← mkForallFVars inputs (mkApp (mkConst ``Not) normBody)
     if ← tryProveWithin budget unsatGoal then
       return {

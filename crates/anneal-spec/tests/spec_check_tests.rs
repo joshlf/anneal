@@ -3194,3 +3194,759 @@ fn array_both_ends_joint_mutant_and_false_positive_guards() {
     );
     assert!(cond_stateful.is_pointwise_strong());
 }
+
+// ---------------------------------------------------------------------------
+// Adversarial bypass hardening: padded mutant banks, narrow-equality
+// preconditions, late traps, and degenerate configurations
+// ---------------------------------------------------------------------------
+
+#[test]
+fn padded_custom_mutant_banks_are_deduplicated() {
+    // A bank repeating one distinct wrong answer tests it once per hit, so duplicates
+    // cannot inflate `mutants_tested` or `mutants_killed`.
+    let repeated = check_contract_with_mutants(
+        SpecCheckConfig::default(),
+        &[9u32, 9, 9, 9],
+        |&x: &u32| __anodized_fn_requires_const_seven_fn(x),
+        |&x| const_seven_fn(x),
+        |&x, &r| __anodized_fn_ensures_const_seven_fn(x, r),
+    );
+    assert!(repeated.is_strong());
+    let repeated_stats = repeated.stats();
+    assert!(repeated_stats.precondition_hits > 0);
+    assert_eq!(
+        repeated_stats.mutants_tested,
+        repeated_stats.precondition_hits
+    );
+    assert_eq!(
+        repeated_stats.mutants_killed,
+        repeated_stats.precondition_hits
+    );
+
+    // Duplicates do not spend the per-hit budget ahead of a distinct candidate: with a
+    // budget of two, `0` is still reached behind three copies of `1` and kills `r > 0`.
+    let padded = check_contract_with_mutants(
+        SpecCheckConfig::default().with_max_mutants_per_hit(2),
+        &[1u32, 1, 1, 0],
+        |&x: &u32| __anodized_fn_requires_loose_positive_fn(x),
+        |&x| loose_positive_fn(x),
+        |&x, &r| __anodized_fn_ensures_loose_positive_fn(x, r),
+    );
+    assert!(padded.is_strong());
+    let padded_stats = padded.stats();
+    assert!(padded_stats.is_pointwise_strong());
+    assert!(padded_stats.mutants_tested <= 2 * padded_stats.precondition_hits);
+
+    // A bank that only repeats the actual output tests nothing, however long it is.
+    let only_output = check_contract_with_mutants(
+        SpecCheckConfig::default(),
+        &[7u32; 8],
+        |&x: &u32| __anodized_fn_requires_const_seven_fn(x),
+        |&x| const_seven_fn(x),
+        |&x, &r| __anodized_fn_ensures_const_seven_fn(x, r),
+    );
+    assert_eq!(
+        only_output.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert_eq!(only_output.stats().mutants_tested, 0);
+    assert_eq!(
+        only_output.failure().map(|f| f.detail),
+        Some(FailureDetail::NoDistinctMutantsTested)
+    );
+}
+
+/// Index of the first deterministic boundary trial whose sampled input satisfies `pre`.
+fn first_boundary_hit<I: SampleInput, P: Fn(&I) -> bool>(pre: P) -> Option<usize> {
+    let config = SpecCheckConfig::default();
+    (0..I::BOUNDARY_COUNT).find(|&trial_idx| {
+        anneal_spec::spec_check::replay_trial_input::<I>(config, trial_idx)
+            .is_some_and(|input| pre(&input))
+    })
+}
+
+#[test]
+fn narrow_equality_preconditions_are_hit_within_the_boundary_corpus() {
+    // Each narrow equality is first satisfied by a deterministic boundary trial, never
+    // left to a seeded draw.
+    assert_eq!(
+        first_boundary_hit::<(u32, u32), _>(|&(a, b)| a == b),
+        Some(0)
+    );
+    assert_eq!(
+        first_boundary_hit::<(u32, u32, u32), _>(|&(_, lo, hi)| lo == hi),
+        Some(0)
+    );
+    assert_eq!(first_boundary_hit::<u32, _>(|&x| x == 0), Some(0));
+    assert!(first_boundary_hit::<u32, _>(|&x| x == u32::MAX).is_some());
+    assert!(
+        first_boundary_hit::<(u32, u32), _>(|&(a, b)| a == u32::MAX && b == u32::MAX).is_some()
+    );
+    assert!(first_boundary_hit::<(u32, u32), _>(|&(a, b)| a.checked_add(1) == Some(b)).is_some());
+
+    // Restricted to the boundary corpus alone, each contract is still reached and strong.
+    let eq_pair = check_contract(
+        SpecCheckConfig::default().with_max_trials(<(u32, u32) as SampleInput>::BOUNDARY_COUNT),
+        |&(a, b): &(u32, u32)| a == b,
+        |&(a, b)| a ^ b,
+        |_, &r| r == 0,
+    );
+    assert!(eq_pair.is_strong());
+    assert!(eq_pair.stats().precondition_hits >= 2);
+
+    let eq_bounds = check_contract(
+        SpecCheckConfig::default()
+            .with_max_trials(<(u32, u32, u32) as SampleInput>::BOUNDARY_COUNT),
+        |&(_, lo, hi): &(u32, u32, u32)| lo == hi,
+        |&(val, lo, hi)| clamp_u32(val, lo, hi),
+        |&(_, lo, _), &r| r == lo,
+    );
+    assert!(eq_bounds.is_strong());
+    assert!(eq_bounds.stats().precondition_hits >= 2);
+
+    let at_zero = check_contract(
+        SpecCheckConfig::default().with_max_trials(<u32 as SampleInput>::BOUNDARY_COUNT),
+        |&x: &u32| x == 0,
+        |&x| x.checked_sub(1),
+        |_, r: &Option<u32>| r.is_none(),
+    );
+    assert!(at_zero.is_strong());
+    assert_eq!(at_zero.stats().precondition_hits, 1);
+
+    let at_max = check_contract(
+        SpecCheckConfig::default().with_max_trials(<u32 as SampleInput>::BOUNDARY_COUNT),
+        |&x: &u32| x == u32::MAX,
+        |&x| x.checked_add(1),
+        |_, r: &Option<u32>| r.is_none(),
+    );
+    assert!(at_max.is_strong());
+    assert_eq!(at_max.stats().precondition_hits, 1);
+}
+
+#[test]
+fn traps_after_strong_evidence_are_never_swallowed() {
+    // By trial 3 the contract already has three precondition hits and killed mutants, yet
+    // a trapping precondition is still reported, never skipped as a missed precondition.
+    let pre_trap = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| if x == 3 { Err(()) } else { Ok(x < 3) },
+        |&x| Ok(x),
+        |&x, &r: &u32| Ok(r == x),
+    );
+    assert_eq!(pre_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert_eq!(
+        pre_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 3,
+            trap: TrapKind::PreconditionPanicked,
+        }))
+    );
+    assert_eq!(pre_trap.stats().trials_run, 4);
+    assert_eq!(pre_trap.stats().precondition_hits, 3);
+    assert!(pre_trap.stats().mutants_killed > 0);
+
+    // A body that traps on a later admissible input.
+    let body_trap = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| Ok(x < 100),
+        |&x| if x == 2 { Err(()) } else { Ok(x) },
+        |&x, &r: &u32| Ok(r == x),
+    );
+    assert_eq!(body_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert_eq!(
+        body_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 2,
+            trap: TrapKind::BodyPanicked,
+        }))
+    );
+    assert_eq!(body_trap.stats().precondition_hits, 3);
+    assert!(body_trap.stats().mutants_killed > 0);
+
+    // A postcondition that traps on the live output of a later admissible input, after
+    // rejecting mutants normally on earlier ones.
+    let post_trap = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| Ok(x < 100),
+        |&x| Ok(x),
+        |&x, &r: &u32| {
+            if x == 2 && r == x {
+                Err(())
+            } else {
+                Ok(r == x)
+            }
+        },
+    );
+    assert_eq!(post_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert_eq!(
+        post_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 2,
+            trap: TrapKind::PostconditionPanicked,
+        }))
+    );
+    assert!(post_trap.stats().mutants_killed > 0);
+
+    // The stateful entry point reports a late precondition trap the same way.
+    let stateful_pre_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| if *old == 2 { Err(()) } else { Ok(*old < 100) },
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| Ok(*new == *old + 1 && *ret == *new),
+    );
+    assert_eq!(
+        stateful_pre_trap.vacuity_class(),
+        Some(VacuityClass::SpecViolation)
+    );
+    assert_eq!(
+        stateful_pre_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 2,
+            trap: TrapKind::PreconditionPanicked,
+        }))
+    );
+    assert_eq!(stateful_pre_trap.stats().precondition_hits, 2);
+}
+
+#[test]
+fn degenerate_configs_fail_closed_before_any_callback_runs() {
+    let degenerate = [
+        SpecCheckConfig::default().with_max_trials(0),
+        SpecCheckConfig::default().with_min_precondition_hits(0),
+        SpecCheckConfig::default()
+            .with_max_trials(8)
+            .with_min_precondition_hits(9),
+    ];
+
+    for config in degenerate {
+        let stateless = check_contract_fallible(
+            config,
+            |_: &u32| -> Result<bool, ()> { panic!("`pre` ran under a degenerate config") },
+            |_: &u32| -> Result<u32, ()> { panic!("`body` ran under a degenerate config") },
+            |_: &u32, _: &u32| -> Result<bool, ()> {
+                panic!("`post` ran under a degenerate config")
+            },
+        );
+        assert_eq!(
+            stateless.vacuity_class(),
+            Some(VacuityClass::DeadPrecondition)
+        );
+        assert_eq!(
+            stateless.failure().map(|f| f.detail),
+            Some(FailureDetail::Violation(ViolationKind::DegenerateConfig))
+        );
+        assert_eq!(stateless.stats().trials_run, 0);
+
+        let stateful = check_stateful_contract_fallible(
+            config,
+            |_: &u32, _: &()| -> Result<bool, ()> { panic!("`pre` ran under a degenerate config") },
+            |_: &mut u32, _: &()| -> Result<u32, ()> {
+                panic!("`body` ran under a degenerate config")
+            },
+            |_: &u32, _: &(), _: &u32, _: &u32| -> Result<bool, ()> {
+                panic!("`post` ran under a degenerate config")
+            },
+        );
+        assert_eq!(
+            stateful.vacuity_class(),
+            Some(VacuityClass::DeadPrecondition)
+        );
+        assert_eq!(
+            stateful.failure().map(|f| f.detail),
+            Some(FailureDetail::Violation(ViolationKind::DegenerateConfig))
+        );
+        assert_eq!(stateful.stats().trials_run, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-language 1:1 vacuity parity suite
+// ---------------------------------------------------------------------------
+
+/// Cross-Language Vacuity Parity Benchmark Matrix.
+///
+/// Each row is one contract, stated once here as a real `#[spec]`,
+/// `#[external_spec]`, or `#[embed_spec]` companion and once in
+/// `tests/mir/SpecRealizabilityTests.lean` (namespace `CrossLanguageParitySuite`)
+/// over `Nat` models of the same types. Both files use the canonical benchmark
+/// ID verbatim as the name of the row.
+///
+/// | Benchmark ID                       | Verdict in both languages |
+/// |------------------------------------|---------------------------|
+/// | `CL_POS_01_checked_add_u32`        | strong                    |
+/// | `CL_POS_02_slice_bounds_and_empty` | strong                    |
+/// | `CL_POS_03_saturating_clamp_u32`   | strong                    |
+/// | `CL_POS_04_stateful_bounded_step`  | strong                    |
+/// | `CL_VAC_01_dead_precondition`      | `DeadPrecondition`        |
+/// | `CL_VAC_02_spec_violation`         | `SpecViolation`           |
+/// | `CL_VAC_03_trivial_postcondition`  | `TrivialPostcondition`    |
+/// | `CL_VAC_04_unbound_return_output`  | `UnboundReturnOutput`     |
+/// | `CL_VAC_05_survived_all_mutants`   | `SurvivedAllMutants`      |
+///
+/// Lean reaches each verdict statically; this module reaches it dynamically.
+/// Every check runs under `parity_config`, which lets the classification
+/// probe leave the precondition: the static analysis reasons about `ensures`
+/// on every input, and every postcondition below is total.
+mod cross_language_parity_suite {
+    use super::*;
+
+    /// Canonical IDs of the 4 shared strong contracts, in matrix order.
+    const POSITIVE_BENCHMARK_IDS: [&str; 4] = [
+        "CL_POS_01_checked_add_u32",
+        "CL_POS_02_slice_bounds_and_empty",
+        "CL_POS_03_saturating_clamp_u32",
+        "CL_POS_04_stateful_bounded_step",
+    ];
+
+    /// Canonical IDs of the 5 shared intentional vacuity mutants, in matrix order.
+    const VACUITY_BENCHMARK_IDS: [&str; 5] = [
+        "CL_VAC_01_dead_precondition",
+        "CL_VAC_02_spec_violation",
+        "CL_VAC_03_trivial_postcondition",
+        "CL_VAC_04_unbound_return_output",
+        "CL_VAC_05_survived_all_mutants",
+    ];
+
+    /// The class names `CL_VAC_01..CL_VAC_05` must emit, in order. The Lean suite
+    /// pins the same list (`expectedClassNames`).
+    const EXPECTED_CLASS_NAMES: [&str; 5] = [
+        "DeadPrecondition",
+        "SpecViolation",
+        "TrivialPostcondition",
+        "UnboundReturnOutput",
+        "SurvivedAllMutants",
+    ];
+
+    /// Shared checker configuration of the parity suite.
+    fn parity_config() -> SpecCheckConfig {
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained)
+    }
+
+    // `CL_POS_02_slice_bounds_and_empty`: `ret.0` is `is_empty` and `ret.1` is whether
+    // `idx` is a valid index. `CL_POS_01`, `CL_POS_03`, and `CL_POS_04` reuse the
+    // `spec_u32_checked_add`, `clamp_u32`, and `Counter::step` companions above.
+    #[spec(
+        requires: idx <= slice.len(),
+        ensures: |ret| [
+            ret.0 == (slice.len() == 0),
+            ret.1 == (idx < slice.len()),
+        ],
+    )]
+    fn cl_pos_02_slice_bounds_and_empty_fn(slice: &[u32], idx: usize) -> (bool, bool) {
+        (slice.is_empty(), slice.get(idx).is_some())
+    }
+
+    // `CL_VAC_01_dead_precondition`: contradictory `requires`.
+    #[spec(
+        requires: [x > 100, x < 50],
+        ensures: |ret| ret == x,
+    )]
+    fn cl_vac_01_dead_precondition_fn(x: u32) -> u32 {
+        x
+    }
+
+    // `CL_VAC_02_spec_violation`: dishonest off-by-one clamp, claimed to lie in
+    // `[lo, hi]` and to equal `hi + 1`.
+    #[spec(
+        requires: lo <= hi,
+        ensures: |ret| [
+            ret >= lo,
+            ret <= hi,
+            (ret as u64) == (hi as u64) + 1,
+        ],
+    )]
+    fn cl_vac_02_spec_violation_fn(val: u32, lo: u32, hi: u32) -> u32 {
+        clamp_u32(val, lo, hi)
+    }
+
+    // `CL_VAC_03_trivial_postcondition`: disguised reflexive tautology.
+    #[spec(
+        ensures: |ret| ret == ret || ret == 0,
+    )]
+    fn cl_vac_03_trivial_postcondition_fn(x: u32) -> u32 {
+        x
+    }
+
+    // `CL_VAC_04_unbound_return_output`: the output is bound and discarded.
+    #[spec(
+        requires: lo <= hi,
+        ensures: |ret| {
+            let _ = ret;
+            lo <= hi
+        },
+    )]
+    fn cl_vac_04_unbound_return_output_fn(val: u32, lo: u32, hi: u32) -> u32 {
+        clamp_u32(val, lo, hi)
+    }
+
+    // `CL_VAC_05_survived_all_mutants`: postcondition masked by its own `requires`.
+    #[spec(
+        requires: x < 10,
+        ensures: |ret| x < 10 || ret == 42,
+    )]
+    fn cl_vac_05_survived_all_mutants_fn(x: u32) -> u32 {
+        x
+    }
+
+    fn cl_vac_01_outcome() -> SpecCheckOutcome {
+        check_contract(
+            parity_config(),
+            |&x: &u32| __anodized_fn_requires_cl_vac_01_dead_precondition_fn(x),
+            |&x| cl_vac_01_dead_precondition_fn(x),
+            |&x, &ret| __anodized_fn_ensures_cl_vac_01_dead_precondition_fn(x, ret),
+        )
+    }
+
+    fn cl_vac_02_outcome() -> SpecCheckOutcome {
+        check_contract(
+            parity_config(),
+            |&(val, lo, hi): &(u32, u32, u32)| {
+                __anodized_fn_requires_cl_vac_02_spec_violation_fn(val, lo, hi)
+            },
+            |&(val, lo, hi)| cl_vac_02_spec_violation_fn(val, lo, hi),
+            |&(val, lo, hi), &ret| {
+                __anodized_fn_ensures_cl_vac_02_spec_violation_fn(val, lo, hi, ret)
+            },
+        )
+    }
+
+    fn cl_vac_03_outcome() -> SpecCheckOutcome {
+        check_contract(
+            parity_config(),
+            |&x: &u32| __anodized_fn_requires_cl_vac_03_trivial_postcondition_fn(x),
+            |&x| cl_vac_03_trivial_postcondition_fn(x),
+            |&x, &ret| __anodized_fn_ensures_cl_vac_03_trivial_postcondition_fn(x, ret),
+        )
+    }
+
+    fn cl_vac_04_outcome() -> SpecCheckOutcome {
+        check_contract(
+            parity_config(),
+            |&(val, lo, hi): &(u32, u32, u32)| {
+                __anodized_fn_requires_cl_vac_04_unbound_return_output_fn(val, lo, hi)
+            },
+            |&(val, lo, hi)| cl_vac_04_unbound_return_output_fn(val, lo, hi),
+            |&(val, lo, hi), &ret| {
+                __anodized_fn_ensures_cl_vac_04_unbound_return_output_fn(val, lo, hi, ret)
+            },
+        )
+    }
+
+    fn cl_vac_05_outcome() -> SpecCheckOutcome {
+        check_contract(
+            parity_config(),
+            |&x: &u32| __anodized_fn_requires_cl_vac_05_survived_all_mutants_fn(x),
+            |&x| cl_vac_05_survived_all_mutants_fn(x),
+            |&x, &ret| __anodized_fn_ensures_cl_vac_05_survived_all_mutants_fn(x, ret),
+        )
+    }
+
+    /// The 5 vacuity mutants paired with their canonical IDs, in matrix order.
+    fn vacuity_matrix() -> [(&'static str, SpecCheckOutcome); 5] {
+        [
+            (VACUITY_BENCHMARK_IDS[0], cl_vac_01_outcome()),
+            (VACUITY_BENCHMARK_IDS[1], cl_vac_02_outcome()),
+            (VACUITY_BENCHMARK_IDS[2], cl_vac_03_outcome()),
+            (VACUITY_BENCHMARK_IDS[3], cl_vac_04_outcome()),
+            (VACUITY_BENCHMARK_IDS[4], cl_vac_05_outcome()),
+        ]
+    }
+
+    #[test]
+    fn cl_pos_01_checked_add_u32() {
+        let mut saw_some = false;
+        let mut saw_none = false;
+
+        let stats = assert_contract_strong(
+            parity_config(),
+            |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
+            |&(a, b)| {
+                let ret = a.checked_add(b);
+                if ret.is_some() {
+                    saw_some = true;
+                } else {
+                    saw_none = true;
+                }
+                ret
+            },
+            |&(a, b), &ret| __anodized_fn_ensures_spec_u32_checked_add(a, b, ret),
+        );
+
+        assert!(
+            saw_some,
+            "{}: no `Some(a + b)` trial",
+            POSITIVE_BENCHMARK_IDS[0]
+        );
+        assert!(
+            saw_none,
+            "{}: no overflowing `None` trial",
+            POSITIVE_BENCHMARK_IDS[0]
+        );
+        assert!(stats.is_pointwise_strong());
+    }
+
+    #[test]
+    fn cl_pos_02_slice_bounds_and_empty() {
+        let mut saw_empty = false;
+        let mut saw_in_bounds = false;
+        let mut saw_one_past_end = false;
+
+        let bounds_stats = assert_contract_strong(
+            parity_config(),
+            |&(arr, prefix_len, idx): &([u32; 4], usize, usize)| {
+                prefix_len <= 4
+                    && __anodized_fn_requires_cl_pos_02_slice_bounds_and_empty_fn(
+                        &arr[..prefix_len],
+                        idx,
+                    )
+            },
+            |&(arr, prefix_len, idx)| {
+                if prefix_len == 0 {
+                    saw_empty = true;
+                } else if idx < prefix_len {
+                    saw_in_bounds = true;
+                } else {
+                    saw_one_past_end = true;
+                }
+                cl_pos_02_slice_bounds_and_empty_fn(&arr[..prefix_len], idx)
+            },
+            |&(arr, prefix_len, idx), &ret| {
+                __anodized_fn_ensures_cl_pos_02_slice_bounds_and_empty_fn(
+                    &arr[..prefix_len],
+                    idx,
+                    ret,
+                )
+            },
+        );
+
+        assert!(
+            saw_empty,
+            "{}: no empty slice trial",
+            POSITIVE_BENCHMARK_IDS[1]
+        );
+        assert!(
+            saw_in_bounds,
+            "{}: no `idx < len` trial",
+            POSITIVE_BENCHMARK_IDS[1]
+        );
+        assert!(
+            saw_one_past_end,
+            "{}: no `idx == len` trial",
+            POSITIVE_BENCHMARK_IDS[1]
+        );
+        assert!(bounds_stats.is_pointwise_strong());
+
+        // The standard-library contracts behind the same row: `len == 0 <-> is_empty`.
+        let len_stats = assert_contract_strong(
+            parity_config(),
+            |&(arr, prefix_len): &([u32; 4], usize)| {
+                prefix_len <= 4 && __anodized_fn_requires_spec_slice_u32_len(&arr[..prefix_len])
+            },
+            |&(arr, prefix_len)| arr[..prefix_len].len(),
+            |&(arr, prefix_len), &ret| {
+                __anodized_fn_ensures_spec_slice_u32_len(&arr[..prefix_len], ret)
+            },
+        );
+        assert!(len_stats.is_pointwise_strong());
+
+        let empty_stats = assert_contract_strong(
+            parity_config(),
+            |&(arr, prefix_len): &([u32; 4], usize)| {
+                prefix_len <= 4
+                    && __anodized_fn_requires_spec_slice_u32_is_empty(&arr[..prefix_len])
+            },
+            |&(arr, prefix_len)| arr[..prefix_len].is_empty(),
+            |&(arr, prefix_len), &ret| {
+                __anodized_fn_ensures_spec_slice_u32_is_empty(&arr[..prefix_len], ret)
+            },
+        );
+        assert!(empty_stats.is_pointwise_strong());
+    }
+
+    #[test]
+    fn cl_pos_03_saturating_clamp_u32() {
+        let mut saw_below = false;
+        let mut saw_in_range = false;
+        let mut saw_above = false;
+        let mut saw_eq_bounds = false;
+
+        let stats = assert_contract_strong(
+            parity_config(),
+            |&(val, lo, hi): &(u32, u32, u32)| __anodized_fn_requires_clamp_u32(val, lo, hi),
+            |&(val, lo, hi)| {
+                if lo == hi {
+                    saw_eq_bounds = true;
+                }
+                if val < lo {
+                    saw_below = true;
+                } else if val > hi {
+                    saw_above = true;
+                } else {
+                    saw_in_range = true;
+                }
+                clamp_u32(val, lo, hi)
+            },
+            |&(val, lo, hi), &ret| __anodized_fn_ensures_clamp_u32(val, lo, hi, ret),
+        );
+
+        assert!(
+            saw_below,
+            "{}: no `val < lo` trial",
+            POSITIVE_BENCHMARK_IDS[2]
+        );
+        assert!(
+            saw_in_range,
+            "{}: no in-range trial",
+            POSITIVE_BENCHMARK_IDS[2]
+        );
+        assert!(
+            saw_above,
+            "{}: no `val > hi` trial",
+            POSITIVE_BENCHMARK_IDS[2]
+        );
+        assert!(
+            saw_eq_bounds,
+            "{}: no `lo == hi` trial",
+            POSITIVE_BENCHMARK_IDS[2]
+        );
+        assert!(stats.is_pointwise_strong());
+    }
+
+    #[test]
+    fn cl_pos_04_stateful_bounded_step() {
+        // Both output axes (the return value and the `&mut` post-state) must kill mutants
+        // independently, as `require_both_state_and_return_kills` demands by default.
+        let stats = assert_stateful_contract_strong(
+            parity_config(),
+            |old: &Counter, &()| old.clone().__anodized_fn_requires_step(),
+            |counter: &mut Counter, &()| counter.step(),
+            |old: &Counter, &(), new: &Counter, ret: &u32| {
+                old.clone().__anodized_fn_ensures_step(*ret)
+                    && new.value == *ret
+                    && new.limit == old.limit
+            },
+        );
+        assert!(
+            stats.precondition_hits > 0,
+            "{}: precondition never hit",
+            POSITIVE_BENCHMARK_IDS[3]
+        );
+        assert!(stats.is_pointwise_strong());
+        assert!(!stats.subsingleton_return);
+    }
+
+    #[test]
+    fn cl_vac_01_dead_precondition() {
+        let outcome = cl_vac_01_outcome();
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::DeadPrecondition)
+        );
+        assert_eq!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::InsufficientPreconditionHits {
+                required: 1,
+                observed: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn cl_vac_02_spec_violation() {
+        let outcome = cl_vac_02_outcome();
+        assert_eq!(outcome.vacuity_class(), Some(VacuityClass::SpecViolation));
+        assert_eq!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::Violation(
+                ViolationKind::PostconditionFalse { trial_idx: 0 }
+            ))
+        );
+        // The counterexample is the very first boundary trial.
+        assert_eq!(
+            anneal_spec::spec_check::replay_trial_input::<(u32, u32, u32)>(parity_config(), 0),
+            Some((0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn cl_vac_03_trivial_postcondition() {
+        let outcome = cl_vac_03_outcome();
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::TrivialPostcondition)
+        );
+        assert!(matches!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::AllMutantsSurvived {
+                saw_any_false: false,
+                saw_output_sensitivity: false,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cl_vac_04_unbound_return_output() {
+        let outcome = cl_vac_04_outcome();
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::UnboundReturnOutput)
+        );
+        assert!(matches!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::AllMutantsSurvived {
+                out_of_precondition_probes,
+                saw_any_false: true,
+                saw_output_sensitivity: false,
+                ..
+            }) if out_of_precondition_probes > 0
+        ));
+    }
+
+    #[test]
+    fn cl_vac_05_survived_all_mutants() {
+        let outcome = cl_vac_05_outcome();
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::SurvivedAllMutants)
+        );
+        assert!(matches!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::AllMutantsSurvived {
+                saw_any_false: true,
+                saw_output_sensitivity: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn cl_vacuity_class_names_match_the_lean_matrix_in_exact_order() {
+        let matrix = vacuity_matrix();
+        assert_eq!(matrix.map(|(id, _)| id), VACUITY_BENCHMARK_IDS);
+
+        let emitted = matrix.map(|(id, outcome)| match outcome.vacuity_class() {
+            Some(class) => class.canonical_name(),
+            None => panic!("{id}: expected a vacuity verdict, got a strong contract"),
+        });
+        assert_eq!(emitted, EXPECTED_CLASS_NAMES);
+
+        // The frozen taxonomy enumerates the classes in the same order, and every
+        // canonical name parses back to its class.
+        assert_eq!(
+            VacuityClass::ALL.map(VacuityClass::canonical_name),
+            EXPECTED_CLASS_NAMES
+        );
+        for class in VacuityClass::ALL {
+            assert_eq!(
+                VacuityClass::from_canonical_name(class.canonical_name()),
+                Some(class)
+            );
+        }
+        assert_eq!(VacuityClass::from_canonical_name("NotAVacuityClass"), None);
+        assert_eq!(VacuityClass::from_canonical_name("deadprecondition"), None);
+    }
+}
