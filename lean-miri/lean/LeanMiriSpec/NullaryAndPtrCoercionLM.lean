@@ -295,9 +295,133 @@ by `annealCastHooksNullaryPtr.lockstepTails` and consumed only by its `typeInfo`
 inside vendored `Cast.unsizeIntoPointer`. -/
 def npUnsizeArrayTailTyId : Miri.MIR.TyId := 3500
 
+/-- Mirror of Trusted `MirSemantics.unsizeArrayLen?`: extracts `(elemTy, len)`
+exactly when `ck = "Unsize"` and `(opTy, targetKind)` is a valid Rust
+array-to-slice unsizing (`&[T; n] -> &[T]`, `&mut [T; n] -> &mut [T]`,
+`&mut [T; n] -> &[T]`, `&[T; n] -> *const [T]`, `&mut [T; n] -> *mut/*const [T]`,
+`*const [T; n] -> *const [T]`, `*mut [T; n] -> *mut/*const [T]`) with compatible
+mutability (`unsizeMutabilityCompatible`), identical element type (`rigidTyEq`),
+and 64-bit `usize` length (`n < scalarModulus 8`). Rejects mutability upgrades
+(`*const -> *mut`, `& -> &mut`, `& -> *mut`), raw-to-ref upgrades
+(`*const/*mut -> &/&mut`), element mismatches (`[u32; 3] -> [u8]`), and
+`n ≥ 2^64` length overflow (preventing silent `UInt64.ofNat` truncation). -/
+def npUnsizeArraySpec? (ck : String) (opTy : Option Ty) (targetKind : RigidTy) :
+    Option (RigidTy × Nat) :=
+  match unsizeArrayLen? ck opTy targetKind with
+  | some n =>
+    match targetKind with
+    | .ref _ (.slice dstElem) | .rawPtr _ (.slice dstElem) => some (dstElem, n)
+    | _ => none
+  | none => none
+
+/-- **Exact 1-to-1 agreement between `npUnsizeArraySpec?` and Trusted
+`MirSemantics.unsizeArrayLen?`** across EVERY coercion tag, operand type, and
+target type. -/
+theorem npUnsizeArraySpec?_snd_eq_unsizeArrayLen? (ck : String) (opTy : Option Ty)
+    (targetKind : RigidTy) :
+    (npUnsizeArraySpec? ck opTy targetKind).map Prod.snd =
+      unsizeArrayLen? ck opTy targetKind := by
+  unfold npUnsizeArraySpec?
+  cases hU : unsizeArrayLen? ck opTy targetKind with
+  | none => rfl
+  | some n =>
+    cases targetKind with
+    | ref _ pt =>
+      cases pt with
+      | slice _ => rfl
+      | _ => unfold unsizeArrayLen? at hU; split at hU <;> simp at hU
+    | rawPtr _ pt =>
+      cases pt with
+      | slice _ => rfl
+      | _ => unfold unsizeArrayLen? at hU; split at hU <;> simp at hU
+    | _ => unfold unsizeArrayLen? at hU; split at hU <;> simp at hU
+
+/-- **Universal `Unsize` Coercion Specification Laws**:
+1. exact agreement with Trusted `unsizeArrayLen?`;
+2. mutability upgrades (`*const -> *mut`, `& -> &mut`, `& -> *mut`) are ALWAYS
+   rejected (`none`);
+3. raw-to-reference upgrades (`*const/*mut -> &/&mut`) are ALWAYS rejected;
+4. element type mismatches (`rigidTyEq srcElem dstElem = false`) are ALWAYS
+   rejected;
+5. 64-bit `usize` length overflows (`scalarModulus 8 ≤ n`) are ALWAYS rejected;
+6. all 9 valid `(srcPtr, dstPtr)` combinations with `n < scalarModulus 8` and
+   `rigidTyEq elem elem = true` succeed with `some (elem, n)`. -/
+theorem np_v2_unsize_spec_laws :
+    (∀ ck opTy targetKind,
+      (npUnsizeArraySpec? ck opTy targetKind).map Prod.snd = unsizeArrayLen? ck opTy targetKind) ∧
+    (∀ (elem : RigidTy) (n li : Nat),
+      npUnsizeArraySpec? "Unsize" (some { kind := .rawPtr .not (.array elem n), layoutIdx := li })
+        (.rawPtr .mut (.slice elem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref .not (.array elem n), layoutIdx := li })
+        (.ref .mut (.slice elem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref .not (.array elem n), layoutIdx := li })
+        (.rawPtr .mut (.slice elem)) = none) ∧
+    (∀ (srcMut dstMut : Mutability) (elem : RigidTy) (n li : Nat),
+      npUnsizeArraySpec? "Unsize" (some { kind := .rawPtr srcMut (.array elem n), layoutIdx := li })
+        (.ref dstMut (.slice elem)) = none) ∧
+    (∀ (srcMut dstMut : Mutability) (srcElem dstElem : RigidTy) (n li : Nat),
+      rigidTyEq srcElem dstElem = false →
+      npUnsizeArraySpec? "Unsize" (some { kind := .rawPtr srcMut (.array srcElem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice dstElem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array srcElem n), layoutIdx := li })
+        (.ref dstMut (.slice dstElem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array srcElem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice dstElem)) = none) ∧
+    (∀ (srcMut dstMut : Mutability) (elem : RigidTy) (n li : Nat),
+      scalarModulus 8 ≤ n →
+      npUnsizeArraySpec? "Unsize" (some { kind := .rawPtr srcMut (.array elem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice elem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array elem n), layoutIdx := li })
+        (.ref dstMut (.slice elem)) = none ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array elem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice elem)) = none) ∧
+    (∀ (srcMut dstMut : Mutability) (elem : RigidTy) (n li : Nat),
+      unsizeMutabilityCompatible srcMut dstMut = true →
+      rigidTyEq elem elem = true →
+      n < scalarModulus 8 →
+      npUnsizeArraySpec? "Unsize" (some { kind := .rawPtr srcMut (.array elem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice elem)) = some (elem, n) ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array elem n), layoutIdx := li })
+        (.ref dstMut (.slice elem)) = some (elem, n) ∧
+      npUnsizeArraySpec? "Unsize" (some { kind := .ref srcMut (.array elem n), layoutIdx := li })
+        (.rawPtr dstMut (.slice elem)) = some (elem, n)) := by
+  have hStr : stringEq "Unsize" "Unsize" = true := by decide
+  refine ⟨npUnsizeArraySpec?_snd_eq_unsizeArrayLen?, ?_, ?_, ?_, ?_, ?_⟩
+  · intro elem n li
+    refine ⟨?_, ?_, ?_⟩ <;>
+      simp [npUnsizeArraySpec?, unsizeArrayLen?, hStr, unsizeBorrowPermCompatible, lookupBorrow,
+            unsizeMutabilityCompatible, mutabilityEq]
+  · intro srcMut dstMut elem n li
+    simp [npUnsizeArraySpec?, unsizeArrayLen?, hStr, unsizeBorrowPermCompatible, lookupBorrow]
+  · intro srcMut dstMut srcElem dstElem n li hNe
+    refine ⟨?_, ?_, ?_⟩ <;>
+      simp [npUnsizeArraySpec?, unsizeArrayLen?, hStr, unsizeBorrowPermCompatible, lookupBorrow, hNe]
+  · intro srcMut dstMut elem n li hGe
+    have hBlt : Nat.blt n (scalarModulus 8) = false := by
+      cases h : Nat.blt n (scalarModulus 8) with
+      | false => rfl
+      | true => exact absurd (Nat.blt_eq.mp h) (Nat.not_lt.mpr hGe)
+    refine ⟨?_, ?_, ?_⟩ <;>
+      simp [npUnsizeArraySpec?, unsizeArrayLen?, hStr, unsizeBorrowPermCompatible, lookupBorrow, hBlt]
+  · intro srcMut dstMut elem n li hMut hEq hLt
+    have hBlt : Nat.blt n (scalarModulus 8) = true := Nat.blt_eq.mpr hLt
+    refine ⟨?_, ?_, ?_⟩ <;>
+      (unfold npUnsizeArraySpec? unsizeArrayLen?
+       simp [hStr, hBlt, hMut, hEq, unsizeBorrowPermCompatible, lookupBorrow])
+
+/-- Diagnostic boolean for the cross-root kernel bridge negative control:
+`true` iff `npUnsizeArraySpec?` erroneously accepts a mutability upgrade
+(`*const [u32; 3] -> *mut [u32]`) or element mismatch
+(`*const [u32; 3] -> *const [u8]`). Guaranteed `false`. -/
+def npIllTypedUnsizeAccepted : Bool :=
+  (npUnsizeArraySpec? "Unsize" (some npRawConstArr3U32MirTy) (.rawPtr .mut (.slice (.uint .u32)))).isSome ||
+  (npUnsizeArraySpec? "Unsize" (some npRawConstArr3U32MirTy) (.rawPtr .not (.slice (.uint .u8)))).isSome
+
 /-- Recover `(elem, len)` of the source array pointee when the statement at the
-current PC of `currentBody` is `_ = <op> as <*[T]> (PointerCoercion(Unsize))` with
-`op : *const/*mut [elem; len]` (the information canonical `typeInfo` supplies). -/
+current PC of `currentBody` is a valid Rust array-to-slice `PointerCoercion(Unsize)`
+(`npUnsizeArraySpec?` / Trusted `unsizeArrayLen?`), covering both raw pointers
+and safe references while rejecting mutability upgrades, raw-to-ref upgrades,
+element mismatches, and `n ≥ 2^64` length overflows. -/
 def npActiveUnsizeArrayInfo? (currentBody : CapturedMir) (st : AnnealStepState) :
     Option (RigidTy × Nat) :=
   match st.stack.currentFrame? with
@@ -308,25 +432,56 @@ def npActiveUnsizeArrayInfo? (currentBody : CapturedMir) (st : AnnealStepState) 
       | some bb =>
         match get? bb.statements loc.statementIndex with
         | some { kind := .assign _ (.cast (.pointerCoercion ck) op targetTy), .. } =>
-          if stringEq ck "Unsize" then
-            match operandTy currentBody.localDecls currentBody.layouts op, targetTy.kind with
-            | some { kind := .rawPtr _ (.array elem n), .. }, .rawPtr _ (.slice _) => some (elem, n)
-            | _, _ => none
-          else none
+          npUnsizeArraySpec? ck (operandTy currentBody.localDecls currentBody.layouts op) targetTy.kind
         | _ => none
       | none => none
     | .unwinding _ => none
   | none => none
 
-/-- `CastHooks` overlay for `PointerCoercion(Unsize)` on raw array pointers,
-extending `annealCastHooksUnwindFnPtrClosure` with exactly the three leaves that
-vendored `Cast.cast` -> `unsizeInto` -> `unsizeIntoPointer` needs:
-* `lockstepTails`: for an active array-to-slice coercion, the source tail is the
-  array pointee (`npUnsizeArrayTailTyId`) and the target tail is unchanged; every
-  other unsizing (struct tails, `dyn Trait`) fails closed with `unsupported`;
-* `typeInfo`: classifies `npUnsizeArrayTailTyId` as `.array elem len`;
-* `validatePlace`: a freshly built wide raw pointer has no validity invariant
-  beyond its two initialized scalars, so the post-cast validation is a no-op. -/
+/-- Detect when the statement at the current PC is an array-to-slice
+`PointerCoercion("Unsize")` that failed `npUnsizeArraySpec?` (ill-typed
+mutability upgrade, raw-to-ref upgrade, element mismatch, or `n ≥ 2^64`), so
+`lockstepTails` reports `StepError.invalidProgram` matching vendored
+`Cast.unsizeInto`, distinct from non-array `Unsize` (`StepError.unsupported`). -/
+def npIsIllTypedArrayToSliceUnsize (currentBody : CapturedMir) (st : AnnealStepState) : Bool :=
+  match st.stack.currentFrame? with
+  | some frame =>
+    match frame.location with
+    | .mir loc =>
+      match get? currentBody.basicBlocks loc.block with
+      | some bb =>
+        match get? bb.statements loc.statementIndex with
+        | some { kind := .assign _ (.cast (.pointerCoercion ck) op targetTy), .. } =>
+          if stringEq ck "Unsize" then
+            let opTy := operandTy currentBody.localDecls currentBody.layouts op
+            let isArrToSlice : Bool :=
+              match opTy, targetTy.kind with
+              | some { kind := .rawPtr _ (.array _ _), .. }, .rawPtr _ (.slice _)
+              | some { kind := .rawPtr _ (.array _ _), .. }, .ref _ (.slice _)
+              | some { kind := .ref _ (.array _ _), .. }, .ref _ (.slice _)
+              | some { kind := .ref _ (.array _ _), .. }, .rawPtr _ (.slice _) => true
+              | _, _ => false
+            isArrToSlice && (npUnsizeArraySpec? ck opTy targetTy.kind).isNone
+          else false
+        | _ => false
+      | none => false
+    | .unwinding _ => false
+  | none => false
+
+/-- `CastHooks` overlay for `PointerCoercion(Unsize)` on array raw pointers and
+safe references, extending `annealCastHooksUnwindFnPtrClosure` with exactly the
+three leaves that vendored `Cast.cast` -> `unsizeInto` -> `unsizeIntoPointer` needs:
+* `lockstepTails`: for a valid array-to-slice coercion (`npActiveUnsizeArrayInfo?`),
+  the source tail is `npUnsizeArrayTailTyId` and the target tail is unchanged; an
+  ill-typed array-to-slice coercion fails closed with `StepError.invalidProgram`,
+  and every non-array unsizing (`dyn Trait`, struct tails) fails closed with
+  `StepError.unsupported`;
+* `typeInfo`: classifies `npUnsizeArrayTailTyId` as `.array elem len` (guarded by
+  `n < 2^64` via `unsizeArrayLen?`);
+* `validatePlace`: wide raw pointers (`*const/*mut [T]`) have no extra validity
+  invariant (`pure ()`), while safe wide slice references (`&/&mut [T]`) run
+  `annealValidateSafeWideSliceRef` (catching null, dangling, undersized,
+  `SliceTooBig`, or misaligned safe slice references as UB). -/
 def annealCastHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry := .nil) :
     Miri.Interpreter.CastHooks AnnealProv AnnealStepState Unit
       (Miri.Interpreter.RuntimePlace AnnealProv) :=
@@ -338,15 +493,36 @@ def annealCastHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEn
       | some (elem, n) =>
         if tyId == npUnsizeArrayTailTyId then
           pure (Miri.Interpreter.CastTypeInfo.array
-            (encodeTyId { kind := elem, layoutIdx := 0 }) (UInt64.ofNat n))
+            (encodeTyIdOverlay { kind := elem, layoutIdx := 0 }) (UInt64.ofNat n))
         else base.typeInfo c tyId
       | none => base.typeInfo c tyId
     lockstepTails := fun _ _ dstTail => do
       let st ← get
       match npActiveUnsizeArrayInfo? currentBody st with
       | some _ => pure (npUnsizeArrayTailTyId, dstTail)
-      | none => throw (.unsupported "Unsize outside the raw array-to-slice fragment")
-    validatePlace := fun _ _ _ _ => pure () }
+      | none =>
+        if npIsIllTypedArrayToSliceUnsize currentBody st then
+          throw (.invalidProgram "ill-typed array-to-slice unsizing")
+        else
+          throw (.unsupported "Unsize outside the array-to-slice fragment")
+    validatePlace := fun _ dest _ _ => do
+      if isWideSafeRefTyId dest.layout.ty then
+        let st ← get
+        let some frame := st.stack.currentFrame? | throw (.stack .emptyStack)
+        let op : Miri.Interpreter.Operand AnnealProv ←
+          match dest.ref with
+          | .local _ localId none _ =>
+            match frame.getLocalOperand localId with
+            | .ok opVal => pure opVal
+            | .error (.localExpectedLive _) => throw (.undefinedBehavior "read of dead local")
+            | .error e => throw (.stack e)
+          | .memory mp => pure (.indirect mp)
+          | .local _ _ (some _) _ =>
+            throw (.unsupported "projected local safe wide slice ref validation")
+        let imm ← annealReadImmediateOverlay ⟨op, dest.layout⟩
+        annealValidateSafeWideSliceRef currentBody.layouts imm (nullFirst := false)
+      else
+        pure () }
 
 /-- Syntactic predicate for `Assign` rvalues routed through the overlay's own
 `RvalueHooks`: `Operand.RuntimeChecks` uses and `PointerCoercion(Unsize)` casts. -/
@@ -384,53 +560,88 @@ only in `treeBorrows` mode and only through an `UnwrapUnsafeBinder` place. -/
 def npTbWriteGate (treeBorrows : Bool) (place : Miri.MIR.Place) : Bool :=
   treeBorrows && hasRealUnwrapUnsafeBinder place
 
-/-- Tree Borrows write through the root local of `place`. When that local is
-memory-backed (`.indirect mp`), its allocation carries a borrow tree, and the
-machine a borrow tracker, the write is applied to the local's whole byte range
-(`UnwrapUnsafeBinder` is layout-preserving, so the written range is the binder
-itself) with `ep2ApplyTreeBorrowsWrite` — unmodified vendored
-`Tree.LocationState.performAccess` per node with the vendored global protected-tag
-table — and the transitioned tree is persisted with `Allocation.setExtra`. A
-conflict is `StepError.undefinedBehavior`. Immediate locals (which have no memory,
-hence no borrow tree) and untracked allocations are left untouched. -/
-def npTreeBorrowsWriteApply (place : Miri.MIR.Place) (state : AnnealStepState) :
+/-- Apply a Tree Borrows write to the byte range `[absAddr - baseAddr, +size)`
+of the live allocation referenced by `prov` via `ep2ApplyTreeBorrowsWrite`
+(unmodified vendored `Tree.LocationState.performAccess` per node with the
+vendored global protected-tag table), persisting the transitioned borrow tree
+with `Allocation.setExtra` and rejecting conflicts or offset overflows as
+`StepError.undefinedBehavior`. Untracked allocations and non-concrete
+provenances are left untouched. -/
+def npApplyTreeBorrowsWriteAt (prov : Option AnnealProv) (absAddr : UInt64)
+    (size : Miri.ABI.Size) (state : AnnealStepState) :
     Except Miri.Interpreter.StepError AnnealStepState :=
-  match state.stack.currentFrame? with
-  | none => .ok state
-  | some frame =>
-    match frame.getLocal place.localId with
-    | .ok { value := .live (.indirect mp), layout := lay? } =>
-      match lay?, mp.ptr.provenance with
-      | some lay, some (.concrete aid tag) =>
-        match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
-              ep2RelOffset? state.machine aid mp.ptr.offset.bytes with
-        | some lIdx, some rel =>
-          match state.machine.memory.live[lIdx]? with
-          | some (_, liveAlloc) =>
-            match state.machine.borrowTracker, liveAlloc.allocation.extra with
-            | some bt, some tree =>
-              match ep2ApplyTreeBorrowsWrite bt.global.protectedTags tree tag
-                  (Miri.ABI.Size.ofBytes rel) lay.layout.size with
-              | some tree' =>
-                .ok { state with
-                      machine := updateAllocMachine state.machine lIdx aid liveAlloc.kind
-                        (liveAlloc.allocation.setExtra (some tree')) }
-              | none =>
-                .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place")
-            | _, _ => .ok state
-          | none => .ok state
+  match prov with
+  | some (.concrete aid tag) =>
+    match state.machine.memory.live.findIdx? (fun e => e.1 == aid),
+          ep2RelOffset? state.machine aid absAddr with
+    | some lIdx, some rel =>
+      if rel.toNat + size.bytes.toNat ≥ 2 ^ 64 then
+        .error (.undefinedBehavior "Tree Borrows write offset overflow on unwrapUnsafeBinder place")
+      else
+      match state.machine.memory.live[lIdx]? with
+      | some (_, liveAlloc) =>
+        match state.machine.borrowTracker, liveAlloc.allocation.extra with
+        | some bt, some tree =>
+          match ep2ApplyTreeBorrowsWrite bt.global.protectedTags tree tag
+              (Miri.ABI.Size.ofBytes rel) size with
+          | some tree' =>
+            .ok { state with
+                  machine := updateAllocMachine state.machine lIdx aid liveAlloc.kind
+                    (liveAlloc.allocation.setExtra (some tree')) }
+          | none =>
+            .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place")
         | _, _ => .ok state
-      | _, _ => .ok state
-    | _ => .ok state
+      | none => .ok state
+    | _, _ => .ok state
+  | _ => .ok state
+
+/-- Tree Borrows write through a resolved `UnwrapUnsafeBinder` destination
+place. Resolves `place` with canonical `annealEvalPlaceOverlay`
+(`Miri.Interpreter.PlaceDynamic.evalPlace`) so that BOTH:
+* memory-backed locals (whole local `_1.unwrapUnsafeBinder` AND projected
+  sub-places `(_1.unwrapUnsafeBinder).field(k)` using exact sub-place offset
+  `off` and size `rp.layout.layout.size`, preserving sibling bytes), AND
+* dereferenced pointer places (`(*_1).unwrapUnsafeBinder` and
+  `*(_1.unwrapUnsafeBinder)` where `_1` is an immediate or indirect pointer to a
+  memory-backed allocation carrying a borrow tree, yielding `.memory mp`)
+apply `ep2ApplyTreeBorrowsWrite` to the exact target allocation, byte offset,
+and written byte range. Immediate non-dereferenced locals, untracked allocations,
+and place-resolution errors (which immediately surface from the subsequent
+`evalRvalueIntoPlace` step) are left untouched. -/
+def npTreeBorrowsWriteApply (currentBody : CapturedMir) (place : Miri.MIR.Place)
+    (state : AnnealStepState) : Except Miri.Interpreter.StepError AnnealStepState :=
+  match annealEvalPlaceOverlay currentBody.localDecls currentBody.layouts place true state with
+  | .error _ _ => .ok state
+  | .ok rp _ =>
+    match rp.ref with
+    | .memory mp =>
+      npApplyTreeBorrowsWriteAt mp.ptr.provenance mp.ptr.offset.bytes rp.layout.layout.size state
+    | .local _ localId offOpt _ =>
+      match state.stack.currentFrame? with
+      | none => .ok state
+      | some frame =>
+        match frame.getLocal localId with
+        | .ok { value := .live (.indirect mp), .. } =>
+          let relInLocal := (offOpt.getD Miri.ABI.Size.ZERO).bytes
+          if mp.ptr.offset.bytes.toNat + relInLocal.toNat ≥ 2 ^ 64 then
+            .error (.undefinedBehavior "Tree Borrows write offset overflow on unwrapUnsafeBinder place")
+          else
+            npApplyTreeBorrowsWriteAt mp.ptr.provenance (mp.ptr.offset.bytes + relInLocal)
+              rp.layout.layout.size state
+        | _ => .ok state
 
 /-- Gated Tree Borrows write check run before an assignment. -/
-def npTreeBorrowsWriteCheck (treeBorrows : Bool) (place : Miri.MIR.Place)
-    (state : AnnealStepState) : Except Miri.Interpreter.StepError AnnealStepState :=
-  if npTbWriteGate treeBorrows place then npTreeBorrowsWriteApply place state else .ok state
+def npTreeBorrowsWriteCheck (currentBody : CapturedMir) (treeBorrows : Bool)
+    (place : Miri.MIR.Place) (state : AnnealStepState) :
+    Except Miri.Interpreter.StepError AnnealStepState :=
+  if npTbWriteGate treeBorrows place then
+    npTreeBorrowsWriteApply currentBody place state
+  else .ok state
 
 /-- Outside `treeBorrows` mode the write check never changes the state. -/
-theorem npTreeBorrowsWriteCheck_basic_mode (place : Miri.MIR.Place) (state : AnnealStepState) :
-    npTreeBorrowsWriteCheck false place state = .ok state := rfl
+theorem npTreeBorrowsWriteCheck_basic_mode (currentBody : CapturedMir)
+    (place : Miri.MIR.Place) (state : AnnealStepState) :
+    npTreeBorrowsWriteCheck currentBody false place state = .ok state := rfl
 
 /-- Conservative `StepHooks` overlay extending `annealStepHooksDropBinderSubtype`:
 * assignments first run `npTreeBorrowsWriteCheck` (a no-op unless
@@ -450,7 +661,7 @@ def annealStepHooksNullaryPtr (currentBody : CapturedMir)
   let base := annealStepHooksDropBinderSubtype currentBody treeBorrows callees poppedFrame fnPtrs
   { base with
     assign := fun choice place rvalue state =>
-      match npTreeBorrowsWriteCheck treeBorrows place state with
+      match npTreeBorrowsWriteCheck currentBody treeBorrows place state with
       | .error e => (state, .error e)
       | .ok state' =>
         if isNullaryPtrRvalue rvalue then
@@ -757,6 +968,11 @@ private def npIsUnsupportedErr {α : Type} (res : Except Miri.Interpreter.StepEr
   | .error (.unsupported _) => true
   | _ => false
 
+private def npIsInvalidProgErr {α : Type} (res : Except Miri.Interpreter.StepError α) : Bool :=
+  match res with
+  | .error (.invalidProgram _) => true
+  | _ => false
+
 private def npMkState (body : CapturedMir) (retTy : Ty)
     (locs : Array (Miri.Interpreter.LocalState AnnealProv Miri.Interpreter.LocalLayout))
     (mach : AnnealMachine := AnnealMachine.empty) : AnnealStepState :=
@@ -1046,6 +1262,128 @@ private def mkNpTbUnwrapState (body : CapturedMir) (childProtected : Bool) : Ann
     #[npUninit (translateTyOverlay u32MirTy npLayouts),
       ⟨.live (.indirect mp), some (translateTyOverlay npBinderU32MirTy npLayouts)⟩] mach
 
+/-! ### `V2` `Unsize` fidelity & `V4` deref / sub-place Tree Borrows fixtures -/
+
+@[reducible] private def npRawMutArr3U32MirTy : Ty :=
+  { kind := .rawPtr .mut (.array (.uint .u32) 3), layoutIdx := 0 }
+@[reducible] private def npRawMutSliceU32MirTy : Ty :=
+  { kind := .rawPtr .mut (.slice (.uint .u32)), layoutIdx := 0 }
+@[reducible] private def npRawConstSliceU8MirTy : Ty :=
+  { kind := .rawPtr .not (.slice (.uint .u8)), layoutIdx := 0 }
+@[reducible] private def npRawConstArrOverflowU32MirTy : Ty :=
+  { kind := .rawPtr .not (.array (.uint .u32) (scalarModulus 8 + 3)), layoutIdx := 0 }
+@[reducible] private def npRefArr3U32MirTy : Ty :=
+  { kind := .ref .not (.array (.uint .u32) 3), layoutIdx := 0 }
+@[reducible] private def npRefMutArr3U32MirTy : Ty :=
+  { kind := .ref .mut (.array (.uint .u32) 3), layoutIdx := 0 }
+@[reducible] private def npRefSliceU32MirTy : Ty :=
+  { kind := .ref .not (.slice (.uint .u32)), layoutIdx := 0 }
+@[reducible] private def npRefMutSliceU32MirTy : Ty :=
+  { kind := .ref .mut (.slice (.uint .u32)), layoutIdx := 0 }
+
+private def mkNpUnsizeMir (name : String) (srcTy dstTy : Ty) : CapturedMir :=
+  mkMirBody name [mkDecl usizeMirTy, mkDecl srcTy, mkDecl dstTy] 1
+    [mkBb [mkSt (.assign (locPlace 2) (.cast (.pointerCoercion "Unsize") (.copy (locPlace 1)) dstTy)),
+           mkSt (.assign (locPlace 0) (.unaryOp .ptrMetadata (.copy (locPlace 2))))]
+      .return_]
+
+private def npUnsizeMutToConstMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_mut_to_const" npRawMutArr3U32MirTy rawConstSliceU32MirTy
+private def npUnsizeMutToMutMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_mut_to_mut" npRawMutArr3U32MirTy npRawMutSliceU32MirTy
+private def npUnsizeRefConstMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_ref_const" npRefArr3U32MirTy npRefSliceU32MirTy
+private def npUnsizeRefMutToConstMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_ref_mut_to_const" npRefMutArr3U32MirTy npRefSliceU32MirTy
+private def npUnsizeRefToRawMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_ref_to_raw" npRefArr3U32MirTy rawConstSliceU32MirTy
+private def npUnsizeBadMutUpgradeMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_bad_mut_upgrade" npRawConstArr3U32MirTy npRawMutSliceU32MirTy
+private def npUnsizeBadElemMismatchMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_bad_elem_mismatch" npRawConstArr3U32MirTy npRawConstSliceU8MirTy
+private def npUnsizeBadLenOverflowMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_bad_len_overflow" npRawConstArrOverflowU32MirTy rawConstSliceU32MirTy
+private def npUnsizeBadRawToRefMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_bad_raw_to_ref" npRawConstArr3U32MirTy npRefSliceU32MirTy
+private def npUnsizeBadRefMutUpgradeMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_bad_ref_mut_upgrade" npRefArr3U32MirTy npRefMutSliceU32MirTy
+
+private def npArr3U32Alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv)
+      #[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0] npAlign4 .Mut with
+  | .ok al => al.withExtra none
+  | .error _ => npUninit4Alloc
+
+private def npMachine5Live : AnnealMachine :=
+  { memory := { AnnealMachine.empty.memory with live := #[(npAid5, ⟨.stack, npArr3U32Alloc⟩)] },
+    addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid5, npBase5⟩] } }
+
+private def mkNpUnsizeState (body : CapturedMir) (srcTy dstTy : Ty)
+    (src : Miri.Interpreter.LocalValue AnnealProv)
+    (mach : AnnealMachine := npMachine5) : AnnealStepState :=
+  npMkState body usizeMirTy
+    #[npUninit (translateTyOverlay usizeMirTy emptyLayoutTable),
+      ⟨src, some (translateTyOverlay srcTy emptyLayoutTable)⟩,
+      npUninit (translateTyOverlay dstTy emptyLayoutTable)]
+    mach
+
+private def npV4DerefUnwrapProtectedMir : CapturedMir :=
+  mkMirBody "np::w_v4_deref_unwrap_protected"
+    [mkDecl u32MirTy, mkDecl rawMutU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.deref, .unwrapUnsafeBinder u32MirTy]) (.use (constU32 42))),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.deref, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+
+private def npV4UnwrapDerefProtectedMir : CapturedMir :=
+  mkMirBody "np::w_v4_unwrap_deref_protected"
+    [mkDecl u32MirTy, mkDecl rawMutU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder rawMutU32MirTy, .deref]) (.use (constU32 42))),
+           mkSt (.assign (locPlace 0) (.use (.copy (locPlace 1 [.unwrapUnsafeBinder rawMutU32MirTy, .deref]))))]
+      .return_]
+
+private def mkNpTbDerefUnwrapState (body : CapturedMir) (childProtected : Bool) : AnnealStepState :=
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, npU32Alloc11⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  npMkState body u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy emptyLayoutTable),
+      npScalarLocal (npPtrScalarTagged npAid1 npBase1 retagParentTag)
+        (translateTyOverlay rawMutU32MirTy emptyLayoutTable)]
+    mach
+
+private def npPaddedAlloc8 : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree) :=
+  match Miri.Memory.Allocation.fromBytes (Prov := AnnealProv)
+      #[7, 0, 0, 0, 11, 0, 0, 0] npAlign4 .Mut with
+  | .ok al => al.withExtra (some (hooksTwoNodeTree .unique))
+  | .error _ => npUninit4Alloc
+
+private def npV4FieldUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_field_unwrap_subrange"
+    [mkDecl u32MirTy, mkDecl npPaddedMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.unwrapUnsafeBinder npPaddedMirTy, .field 1 u32MirTy])
+             (.use (constU32 42))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.unwrapUnsafeBinder npPaddedMirTy, .field 1 u32MirTy]))))]
+      .return_]
+    npLayouts
+
+private def mkNpTbFieldUnwrapState (childProtected : Bool) : AnnealStepState :=
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, npPaddedAlloc8⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  let mp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Miri.ABI.Size.ofBytes npBase1, some (.concrete npAid1 retagParentTag)⟩, .none, none⟩
+  npMkState npV4FieldUnwrapMir u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy npLayouts),
+      ⟨.live (.indirect mp), some (translateTyOverlay npPaddedMirTy npLayouts)⟩]
+    mach
+
 /-! ## §4. Per-Variant Concrete Witnesses (`V1`–`V4`) -/
 
 /-- **`V1` (`Rvalue.nullaryOp`) Boundary & Lowered Witness**:
@@ -1125,6 +1463,91 @@ theorem lm_np_v2_unsize_base_boundary :
       | .error (.undefinedBehavior _) => false
       | .error _ => true) = true := by
   decide +kernel
+
+/-- **`V2` `Unsize` Coercion Fidelity, Safe-Reference Validation, & Ill-Typed
+Negative Controls (Stepped Through Unmodified Vendored `Step.step` + Trusted
+Parity)**:
+1. Valid positive cases (`*mut [u32; 3] -> *const [u32]`, `*mut -> *mut`,
+   `&[u32; 3] -> &[u32]`, `&mut [u32; 3] -> &[u32]`, `&[u32; 3] -> *const [u32]`)
+   all step cleanly to `.usizeVal 3` and agree with Trusted `evalUnsizeCoercion`;
+2. Post-cast safe-reference validation (`validatePlace` ->
+   `annealValidateSafeWideSliceRef`) catches BOTH a null `&[u32; 3] -> &[u32]`
+   and a dangling `&[u32; 3] -> &[u32]` as `.ub`;
+3. Ill-typed array-to-slice coercions — mutability upgrade
+   (`*const [u32; 3] -> *mut [u32]`, `&[u32; 3] -> &mut [u32]`), element
+   mismatch (`*const [u32; 3] -> *const [u8]`), raw-to-ref upgrade
+   (`*const [u32; 3] -> &[u32]`), and 64-bit `usize` length overflow
+   (`*const [u32; 2^64 + 3] -> *const [u32]`) — are ALL rejected cleanly
+   (`StepError.invalidProgram`, never silently coerced), matching Trusted
+   `evalUnsizeCoercion` / `unsizeArrayLen?`! -/
+theorem lm_np_v2_unsize_fidelity_and_negative_witness :
+    let okPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalar npAid5 npBase5)))
+    let nullPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npScalarUInt 0 8)))
+    let tLocs : List LocalSlot := [.uninit, .init (.ptr ⟨5, 0⟩ 8), .uninit]
+    -- Positive stepped witnesses
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToConstMir) 8
+      (mkNpUnsizeState npUnsizeMutToConstMir npRawMutArr3U32MirTy rawConstSliceU32MirTy okPtr)) =
+      .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToMutMir) 8
+      (mkNpUnsizeState npUnsizeMutToMutMir npRawMutArr3U32MirTy npRawMutSliceU32MirTy okPtr)) =
+      .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeRefConstMir) 8
+      (mkNpUnsizeState npUnsizeRefConstMir npRefArr3U32MirTy npRefSliceU32MirTy okPtr npMachine5Live)) =
+      .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeRefMutToConstMir) 8
+      (mkNpUnsizeState npUnsizeRefMutToConstMir npRefMutArr3U32MirTy npRefSliceU32MirTy okPtr npMachine5Live)) =
+      .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeRefToRawMir) 8
+      (mkNpUnsizeState npUnsizeRefToRawMir npRefArr3U32MirTy rawConstSliceU32MirTy okPtr)) =
+      .usizeVal 3 ∧
+    -- Safe-reference post-cast UB controls (null and dangling)
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeRefConstMir) 8
+      (mkNpUnsizeState npUnsizeRefConstMir npRefArr3U32MirTy npRefSliceU32MirTy nullPtr npMachine5Live)) =
+      .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeRefConstMir) 8
+      (mkNpUnsizeState npUnsizeRefConstMir npRefArr3U32MirTy npRefSliceU32MirTy okPtr npMachine5)) =
+      .ub ∧
+    -- Rejected ill-typed array-to-slice coercions (mutability, element, overflow, raw-to-ref)
+    npIsInvalidProgErr (runMiriSteps (annealStepHooksNullaryPtr npUnsizeBadMutUpgradeMir) 8
+      (mkNpUnsizeState npUnsizeBadMutUpgradeMir npRawConstArr3U32MirTy npRawMutSliceU32MirTy okPtr)) =
+      true ∧
+    npIsInvalidProgErr (runMiriSteps (annealStepHooksNullaryPtr npUnsizeBadElemMismatchMir) 8
+      (mkNpUnsizeState npUnsizeBadElemMismatchMir npRawConstArr3U32MirTy npRawConstSliceU8MirTy okPtr)) =
+      true ∧
+    npIsInvalidProgErr (runMiriSteps (annealStepHooksNullaryPtr npUnsizeBadLenOverflowMir) 8
+      (mkNpUnsizeState npUnsizeBadLenOverflowMir npRawConstArrOverflowU32MirTy rawConstSliceU32MirTy okPtr)) =
+      true ∧
+    npIsInvalidProgErr (runMiriSteps (annealStepHooksNullaryPtr npUnsizeBadRawToRefMir) 8
+      (mkNpUnsizeState npUnsizeBadRawToRefMir npRawConstArr3U32MirTy npRefSliceU32MirTy okPtr npMachine5Live)) =
+      true ∧
+    npIsInvalidProgErr (runMiriSteps (annealStepHooksNullaryPtr npUnsizeBadRefMutUpgradeMir) 8
+      (mkNpUnsizeState npUnsizeBadRefMutUpgradeMir npRefArr3U32MirTy npRefMutSliceU32MirTy okPtr npMachine5Live)) =
+      true ∧
+    -- Trusted-side parity
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) rawConstSliceU32MirTy emptyMemory
+      npUnsizeMutToConstMir.localDecls emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]) tLocs emptyMemory ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRefSliceU32MirTy emptyMemory
+      npUnsizeRefConstMir.localDecls emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]) tLocs emptyMemory ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRawMutSliceU32MirTy emptyMemory
+      npUnsizeBadMutUpgradeMir.localDecls emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRawConstSliceU8MirTy emptyMemory
+      npUnsizeBadElemMismatchMir.localDecls emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRefSliceU32MirTy emptyMemory
+      npUnsizeBadRawToRefMir.localDecls emptyLayoutTable = .ub ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) npRefMutSliceU32MirTy emptyMemory
+      npUnsizeBadRefMutUpgradeMir.localDecls emptyLayoutTable = .ub ∧
+    unsizeArrayLen? "Unsize" (some npRawConstArrOverflowU32MirTy) (.rawPtr .not (.slice (.uint .u32))) =
+      none ∧
+    npIllTypedUnsizeAccepted = false := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          rfl, rfl, rfl, rfl,
+          rfl, rfl, rfl, rfl⟩
 
 /-- **`V3` (`CastKind.fnPtrToPtr`) UB & Divergence Witness** on `v3FnPtrToPtrConstMir`:
 1. a function pointer at a nonzero offset into its function allocation is UB;
@@ -1211,6 +1634,69 @@ theorem lm_np_v4_unwrapUnsafeBinder_witness :
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel⟩
+
+/-- **`V4` Deref & Projected Sub-Place `UnwrapUnsafeBinder` Tree Borrows Witness**:
+1. **`(*_1).unwrapUnsafeBinder`** (`npV4DerefUnwrapProtectedMir`) where `_1 : *mut u32`
+   is an **immediate** pointer scalar pointing to memory-backed `npAid1` carrying
+   `npU32ChildTree`: `treeBorrows = false` returns `42` even when the child is
+   protected; `treeBorrows = true` rejects the protected child with a Tree Borrows
+   write conflict, accepts the unprotected child (`42`), and persists the disabled
+   child permission in `npAid1`'s borrow tree;
+2. **`*(_1.unwrapUnsafeBinder)`** (`npV4UnwrapDerefProtectedMir`): likewise enforces
+   the protector on `npAid1` when `treeBorrows = true` and returns `42` when
+   unprotected;
+3. **Projected sub-place `(_1.unwrapUnsafeBinder).field(1)`** (`npV4FieldUnwrapMir`)
+   on an 8-byte memory-backed `np::PaddedU8U32` carrying 8-byte
+   `hooksTwoNodeTree .unique`: rejects a protected child, and when unprotected
+   returns `42` while transitioning ONLY `[4, 8)` (disabling `retagChildTag` on
+   field 1 while preserving `retagChildTag`'s `Unique` permission on untouched
+   sibling bytes `[0, 4)`!). -/
+theorem lm_np_v4_deref_and_subplace_unwrap_tb_witness :
+    -- 1. (*_1).unwrapUnsafeBinder with immediate pointer local _1
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4DerefUnwrapProtectedMir false) 8
+      (mkNpTbDerefUnwrapState npV4DerefUnwrapProtectedMir true)) = .u32Val 42 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4DerefUnwrapProtectedMir true) 8
+      (mkNpTbDerefUnwrapState npV4DerefUnwrapProtectedMir true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4DerefUnwrapProtectedMir true) 8
+      (mkNpTbDerefUnwrapState npV4DerefUnwrapProtectedMir false)) = .u32Val 42 ∧
+    (match runMiriSteps (annealStepHooksNullaryPtr npV4DerefUnwrapProtectedMir true) 8
+        (mkNpTbDerefUnwrapState npV4DerefUnwrapProtectedMir false) with
+      | .ok (st, _) =>
+        (match st.machine.memory.live[0]? with
+          | some (_, la) =>
+            match la.allocation.extra with
+            | some t => ep2ProtectorConflict {} t retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4)
+            | none => false
+          | none => false)
+      | _ => false) = true ∧
+    -- 2. *(_1.unwrapUnsafeBinder) with immediate pointer local _1
+    (runMiriSteps (annealStepHooksNullaryPtr npV4UnwrapDerefProtectedMir true) 8
+      (mkNpTbDerefUnwrapState npV4UnwrapDerefProtectedMir true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4UnwrapDerefProtectedMir true) 8
+      (mkNpTbDerefUnwrapState npV4UnwrapDerefProtectedMir false)) = .u32Val 42 ∧
+    -- 3. (_1.unwrapUnsafeBinder).field(1) sub-range precision ([4, 8) disabled, [0, 4) preserved)
+    (runMiriSteps (annealStepHooksNullaryPtr npV4FieldUnwrapMir true) 8
+      (mkNpTbFieldUnwrapState true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4FieldUnwrapMir true) 8
+      (mkNpTbFieldUnwrapState false)) = .u32Val 42 ∧
+    (match runMiriSteps (annealStepHooksNullaryPtr npV4FieldUnwrapMir true) 8
+        (mkNpTbFieldUnwrapState false) with
+      | .ok (st, _) =>
+        (match st.machine.memory.live[0]? with
+          | some (_, la) =>
+            match la.allocation.extra with
+            | some t =>
+              ep2ProtectorConflict {} t retagChildTag (Miri.ABI.Size.ofBytes 4) (Miri.ABI.Size.ofBytes 4) &&
+              !(ep2ProtectorConflict {} t retagChildTag Miri.ABI.Size.ZERO (Miri.ABI.Size.ofBytes 4))
+            | none => false
+          | none => false)
+      | _ => false) = true := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel⟩
 
 /-- **Trusted-side anchors** (`Trusted.Rustc.V2026_06_01.MirSemantics`):
 1. the constants produced by `lowerNullaryMirBody` are exactly Trusted

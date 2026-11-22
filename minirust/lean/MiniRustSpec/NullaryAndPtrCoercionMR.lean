@@ -633,6 +633,604 @@ result is the type's static size and alignment, for a slice it is scaled by
 the element count. -/
 abbrev np_v1_minirust_metadata_sized_boundary := @evalUnOpM_rawPtr_meta_size_align
 
+private theorem np_scalarModulus_8 : scalarModulus 8 = 2 ^ (8 * 8) := by decide
+
+private theorem np_bool_and_eq_true {a b : Bool} (h : Bool.and a b = true) :
+    a = true ∧ b = true := by
+  cases a <;> cases b <;> simp_all [Bool.and]
+
+private theorem np_set?_get?_eq {α : Type} {xs xs' : List α} {i : Nat} {v : α}
+    (h : set? xs i v = some xs') : get? xs' i = some v := by
+  unfold set? at h
+  split at h
+  · rename_i hlt
+    cases h
+    unfold get?
+    exact List.getElem?_set_self hlt
+  · cases h
+
+private theorem np_encodeM_u8_one {M : Type} [Gen.Memory M] :
+    Type.encodeM (M := M) u8MrTy (.Int 1) = .ok [.Init 1 none] := by
+  have hEnc : Endianness.encode x86_64.ENDIANNESS .Unsigned ⟨1⟩ 1 = some [1] := by decide
+  unfold u8MrTy Type.encodeM Type.encodeIntM
+  dsimp only
+  rw [hEnc]; rfl
+
+private theorem np_v1_evalValueM_computeSize {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrTy : Gen.Type) (sz : Nat) (al : LibSpecr.Align)
+    (hMeta : Type.meta_kind mrTy = .None)
+    (hLay : Type.layout mrTy = .ok (.Sized ⟨sz⟩ al)) :
+    evalValueM m (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType)) =
+      .ok ((.Int (Int.ofNat sz), usizeMrTy), m) := by
+  have hUn : evalUnOpM (.ComputeSize mrTy) (.Tuple [], unitType) (some m) =
+      .ok (.Int (Int.ofNat sz), usizeMrTy) := by
+    unfold evalUnOpM
+    dsimp only
+    rw [hMeta]
+    simp only [PointerMetaKind.decode_valueM, bind, Except.bind, pure, Except.pure]
+    rw [hLay]
+    simp only [computeSizeM, LayoutStrategy.compute_size_and_align,
+      bind, Except.bind, pure, Except.pure, usizeMrTy]; rfl
+  unfold evalValueM
+  rw [show evalValueM m (.Tuple [] unitType) = .ok ((.Tuple [], unitType), m) from rfl]
+  simp only [hUn, bind, Except.bind, pure, Except.pure]
+
+private theorem np_v1_evalValueM_computeAlign {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrTy : Gen.Type) (sz : LibSpecr.Size) (al : Nat)
+    (hMeta : Type.meta_kind mrTy = .None)
+    (hLay : Type.layout mrTy = .ok (.Sized sz ⟨al⟩)) :
+    evalValueM m (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType)) =
+      .ok ((.Int (Int.ofNat al), usizeMrTy), m) := by
+  have hUn : evalUnOpM (.ComputeAlign mrTy) (.Tuple [], unitType) (some m) =
+      .ok (.Int (Int.ofNat al), usizeMrTy) := by
+    unfold evalUnOpM
+    dsimp only
+    rw [hMeta]
+    simp only [PointerMetaKind.decode_valueM, bind, Except.bind, pure, Except.pure]
+    rw [hLay]
+    simp only [computeAlignM, LayoutStrategy.compute_size_and_align,
+      bind, Except.bind, pure, Except.pure, usizeMrTy]; rfl
+  unfold evalValueM
+  rw [show evalValueM m (.Tuple [] unitType) = .ok ((.Tuple [], unitType), m) from rfl]
+  simp only [hUn, bind, Except.bind, pure, Except.pure]
+
+/-- Generic single-statement `stepM` lifting lemma (parallel to
+`stepM_of_evalTerminatorM`), factoring `Interp.step` (`M = BM`, via
+`stepM_bm_eq`) and `Interp.stepTB` (`M = TBM`, preserving `MachTB.wfLive`
+via `stepTB_wfLive`) across any statement evaluation. -/
+theorem np_stepM_of_evalStatementM {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m m1 mAfter : Machine M} (fr : StackFrame M) (blk : Gen.BasicBlock) (stmt : Gen.Statement)
+    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true)
+    (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
+    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr)
+    (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
+    (hNe : fr.next_stmt ≠ (blk.statements.length : Int))
+    (hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" = .ok stmt)
+    (hEval : evalStatementM { m with mem := { m.mem with accesses := [] } } stmt = .ok m1)
+    (hMut : mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) = .ok mAfter)
+    (hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
+      (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()) :
+    stepM m = .ok mAfter := by
+  unfold stepM
+  simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM,
+    hPick, hCur, hBlk, hNe, hStmt, hEval, hMut, hRace, bind, Except.bind, pure, Except.pure]
+
+/-- Generic single-statement `stepM` error-propagation lemma. -/
+theorem np_stepM_error_of_evalStatementM {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m : Machine M} {e : Stop} (fr : StackFrame M) (blk : Gen.BasicBlock) (stmt : Gen.Statement)
+    (hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true)
+    (hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread)
+    (hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr)
+    (hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk)
+    (hNe : fr.next_stmt ≠ (blk.statements.length : Int))
+    (hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" = .ok stmt)
+    (hEval : evalStatementM { m with mem := { m.mem with accesses := [] } } stmt = .error e) :
+    stepM m = .error e := by
+  unfold stepM
+  simp only [hEn, Bool.not_true, Bool.false_eq_true, ↓reduceIte, resetDataRaceTrackingM,
+    hPick, hCur, hBlk, hNe, hStmt, hEval, bind, Except.bind]
+
+/-- **V1 Universal Value-Coupled (`Ep2ValRel`) Evaluation Law (`Mach` & `MachTB`)**:
+for EVERY `M ∈ {BM, TBM}`, EVERY layout table with 64-bit pointers, EVERY state
+`(locals, mem, m)`, and EVERY `NullOp ∈ {.sizeOf, .alignOf, .offsetOf fields, .ubChecks}`,
+Trusted `evalRvalue (.nullaryOp op argTy)` and MiniRust `evalValueM m mrSrc` produce
+values coupled by `Ep2ValRel allocBase provAllocId` (preserving both `locals`/`mem`
+and `m`), covering `UnOp.ComputeSize`, `UnOp.ComputeAlign`, constant `usize`,
+`u8` `Switch`-scrutinee `1`, and native `Bool` `true` (with identical byte encoding
+`[.Init 1 none]`). -/
+theorem np_v1_evalValueM_nullaryOp_M {M : Type} [Gen.Memory M] [MemoryOps M]
+    (allocBase : Nat → Nat) (provAllocId : Gen.Memory.Provenance M → Nat)
+    (locals : List LocalSlot) (mem : MirSemantics.Memory)
+    (decls : List MirAst.LocalDecl) (layouts : LayoutTable) (m : Machine M)
+    (hPtr8 : layoutPointerBytes layouts = 8) :
+    (∀ (ty : MirAst.Ty) (mrTy : Gen.Type) (sz : Nat) (al : LibSpecr.Align),
+      intrinsicRigidTyByteSize decls layouts ty.kind = .some sz →
+      Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1) = true →
+      Type.meta_kind mrTy = .None →
+      Type.layout mrTy = .ok (.Sized ⟨sz⟩ al) →
+      evalRvalue locals (.nullaryOp .sizeOf ty) mem decls layouts =
+        .ok (.scalar ⟨sz, 8⟩) locals mem ∧
+      evalValueM m (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType)) =
+        .ok ((.Int (Int.ofNat sz), usizeMrTy), m) ∧
+      evalValueM m (.Constant (.Int (Int.ofNat sz)) usizeMrTy) =
+        .ok ((.Int (Int.ofNat sz), usizeMrTy), m) ∧
+      Ep2ValRel allocBase provAllocId (.scalar ⟨sz, 8⟩) (.Int (Int.ofNat sz))) ∧
+    (∀ (ty : MirAst.Ty) (mrTy : Gen.Type) (sz al : Nat) (szMr : LibSpecr.Size),
+      intrinsicRigidTyByteSize decls layouts ty.kind = .some sz →
+      intrinsicRigidTyAlign decls layouts ty.kind = .some al →
+      Bool.and
+        (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1))
+        (Bool.and (Trusted.Rustc.V2026_06_01.Layout.Align.isPowerOfTwoBytes ⟨al⟩)
+          (Nat.blt al (scalarModulus (layoutPointerBytes layouts)))) = true →
+      Type.meta_kind mrTy = .None →
+      Type.layout mrTy = .ok (.Sized szMr ⟨al⟩) →
+      evalRvalue locals (.nullaryOp .alignOf ty) mem decls layouts =
+        .ok (.scalar ⟨al, 8⟩) locals mem ∧
+      evalValueM m (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType)) =
+        .ok ((.Int (Int.ofNat al), usizeMrTy), m) ∧
+      evalValueM m (.Constant (.Int (Int.ofNat al)) usizeMrTy) =
+        .ok ((.Int (Int.ofNat al), usizeMrTy), m) ∧
+      Ep2ValRel allocBase provAllocId (.scalar ⟨al, 8⟩) (.Int (Int.ofNat al))) ∧
+    (∀ (ty : MirAst.Ty) (fields : List (VariantIdx × FieldIdx)) (sz off : Nat),
+      intrinsicRigidTyByteSize decls layouts ty.kind = .some sz →
+      resolveOffsetOfPath layouts
+        (intrinsicRigidTyByteSize decls layouts)
+        (intrinsicRigidTyAlign decls layouts)
+        (findDeclLayoutForRigidTy decls layouts)
+        (.some ty.kind)
+        (findDeclLayoutForRigidTy decls layouts ty.kind)
+        fields = .some off →
+      Bool.and
+        (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes layouts)) 2) 1))
+        (Nat.ble off sz) = true →
+      evalRvalue locals (.nullaryOp (.offsetOf fields) ty) mem decls layouts =
+        .ok (.scalar ⟨off, 8⟩) locals mem ∧
+      evalValueM m (.Constant (.Int (Int.ofNat off)) usizeMrTy) =
+        .ok ((.Int (Int.ofNat off), usizeMrTy), m) ∧
+      Ep2ValRel allocBase provAllocId (.scalar ⟨off, 8⟩) (.Int (Int.ofNat off))) ∧
+    (∀ (li : Nat),
+      evalRvalue locals (.nullaryOp .ubChecks { kind := .bool, layoutIdx := li }) mem decls layouts =
+        .ok (.scalar (boolToScalar true)) locals mem ∧
+      evalValueM m (.Constant (.Int 1) u8MrTy) = .ok ((.Int 1, u8MrTy), m) ∧
+      evalValueM m (.Constant (.Bool true) .Bool) = .ok ((.Bool true, .Bool), m) ∧
+      Ep2ValRel allocBase provAllocId (.scalar (boolToScalar true)) (.Int 1) ∧
+      Type.encodeM (M := M) .Bool (.Bool true) = .ok [.Init 1 none] ∧
+      Type.encodeM (M := M) u8MrTy (.Int 1) = .ok [.Init 1 none]) := by
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · intro ty mrTy sz al hSz hLe hMeta hLay
+    have hEv := np_v1_nullary_sizeOf_of_intrinsic locals ty mem decls layouts sz hSz hLe
+    rw [hPtr8] at hEv hLe
+    have hBound : sz < 2 ^ (8 * 8) :=
+      Nat.lt_of_le_of_lt (Nat.ble_eq.mp hLe) (by decide)
+    exact ⟨hEv, np_v1_evalValueM_computeSize m mrTy sz al hMeta hLay, rfl,
+      .scalar sz 8 hBound⟩
+  · intro ty mrTy sz al szMr hSz hAl hOk hMeta hLay
+    have hEv := np_v1_nullary_alignOf_of_intrinsic locals ty mem decls layouts sz al hSz hAl hOk
+    rw [hPtr8] at hEv hOk
+    have hBlt : Nat.blt al (scalarModulus 8) = true :=
+      (np_bool_and_eq_true (np_bool_and_eq_true hOk).2).2
+    have hBound : al < 2 ^ (8 * 8) := by
+      have hLt := Nat.blt_eq.mp hBlt
+      rw [np_scalarModulus_8] at hLt
+      exact hLt
+    exact ⟨hEv, np_v1_evalValueM_computeAlign m mrTy szMr al hMeta hLay, rfl,
+      .scalar al 8 hBound⟩
+  · intro ty fields sz off hSz hOff hOk
+    have hEv := np_v1_nullary_offsetOf_of_intrinsic locals ty mem decls layouts fields sz off
+      hSz hOff hOk
+    rw [hPtr8] at hEv hOk
+    have hAnd := np_bool_and_eq_true hOk
+    have hBound : off < 2 ^ (8 * 8) :=
+      Nat.lt_of_le_of_lt (Nat.le_trans (Nat.ble_eq.mp hAnd.2) (Nat.ble_eq.mp hAnd.1)) (by decide)
+    exact ⟨hEv, rfl, .scalar off 8 hBound⟩
+  · intro li
+    exact ⟨rfl, rfl, rfl, .scalar 1 1 (by decide), rfl, np_encodeM_u8_one⟩
+
+/-- Single-statement execution context for a MiniRust
+`Statement.Assign (.Local mrDst) mrSrc` step on `Machine M` (`Mach` or `MachTB`).
+Carries NO assumption on `evalValueM` or `Ep2ValRel` — those are derived directly
+by the `V1` simulation theorems for each `NullOp`. -/
+structure NpMrAssignFrame {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 mAfter : Machine M) (mrDst : Gen.LocalName) (mrSrc : Gen.ValueExpr)
+    (mv : Gen.Value M) (dstTy : Gen.Type) where
+  fr : StackFrame M
+  blk : Gen.BasicBlock
+  place : Gen.Place M
+  hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true
+  hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread
+  hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr
+  hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk
+  hNe : fr.next_stmt ≠ (blk.statements.length : Int)
+  hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" =
+    .ok (.Assign (.Local mrDst) mrSrc)
+  hp : evalPlaceM { m with mem := { m.mem with accesses := [] } } (.Local mrDst) =
+    .ok ((place, dstTy), { m with mem := { m.mem with accesses := [] } })
+  hst : placeStoreM { m with mem := { m.mem with accesses := [] } } place mv dstTy = .ok m1
+  hMut : mutateCurFrameM m1 (fun f => { f with next_stmt := f.next_stmt + 1 }) = .ok mAfter
+  hRace : ConcurrentMemory.check_data_races mAfter.mem mAfter.active_thread
+    (setInsert m.synchronized_threads m.active_thread, m.mem.accesses) = .ok ()
+
+/-- Single-statement execution context for a MiniRust `Assign (.Local mrDst) mrSrc`
+whose destination local `mrDst` is dead (`mapGet fr.locals mrDst = none`). -/
+structure NpMrDeadAssignFrame {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Machine M) (mrDst : Gen.LocalName) (mrSrc : Gen.ValueExpr) where
+  fr : StackFrame M
+  blk : Gen.BasicBlock
+  dstTy : Gen.Type
+  hEn : m.threads.any (fun th => decide (th.state = .Enabled)) = true
+  hPick : pickActiveThreadM { m with mem := { m.mem with accesses := [] } } = .ok m.active_thread
+  hCur : curFrameM { m with mem := { m.mem with accesses := [] } } = .ok fr
+  hBlk : mapIndex fr.func.blocks fr.next_block "frame.func.blocks[frame.next_block]" = .ok blk
+  hNe : fr.next_stmt ≠ (blk.statements.length : Int)
+  hStmt : listIndex blk.statements fr.next_stmt "block.statements[frame.next_stmt]" =
+    .ok (.Assign (.Local mrDst) mrSrc)
+  hDecl : mapIndex fr.func.locals mrDst "self.cur_frame().func.locals[name]" = .ok dstTy
+  hDead : mapGet fr.locals mrDst = none
+
+private theorem np_v1_trusted_assign_step (body : CapturedMir) (bb : BasicBlockData)
+    (s : MachineState) (dstLoc : Nat) (op : NullOp) (argTy : MirAst.Ty) (span : String)
+    (tv : MirSemantics.Value) (slot : LocalSlot) (locals2 : List LocalSlot)
+    (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup)
+    (hBb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb)
+    (hSt : get? bb.statements s.frame.stmtIdx =
+      some { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span })
+    (hNull : evalNullaryOp s.frame.locals op argTy s.memory
+      (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts =
+      .ok tv s.frame.locals s.memory)
+    (hLive : slot ≠ .dead)
+    (hGet : get? s.frame.locals dstLoc = some slot)
+    (hSet : set? s.frame.locals dstLoc (.init tv) = some locals2)
+    (hProt : s.memory.activeProtectors = []) :
+    let s' := advanceStmt s locals2 { s.memory with
+      borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+    evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span }
+        (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts =
+      MirStepNode.step s' ∧
+    stepMirFn body s = .tau (.running s') ∧
+    get? s'.frame.locals dstLoc = some (.init tv) := by
+  intro s'
+  have hEv : evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span }
+      (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts =
+      MirStepNode.step s' := by
+    cases slot with
+    | dead => exact absurd rfl hLive
+    | uninit | init _ =>
+      simp only [evalStmt, evalRvalue, hNull, locPlace, hGet, hSet, hProt, s']
+  have hStep : stepMirFn body s = .tau (.running s') := by
+    unfold stepMirFn
+    dsimp only
+    rw [hPhase, hBb]
+    dsimp only
+    rw [hSt]
+    exact hEv
+  exact ⟨hEv, hStep, np_set?_get?_eq hSet⟩
+
+private theorem np_v1_mr_assign_stepM {M : Type} [Gen.Memory M] [MemoryOps M]
+    {m m1 mAfter : Machine M} {mrDst : Gen.LocalName} {mrSrc : Gen.ValueExpr}
+    {mv : Gen.Value M} {dstTy srcTy : Gen.Type}
+    (w : NpMrAssignFrame m m1 mAfter mrDst mrSrc mv dstTy)
+    (hv : evalValueM { m with mem := { m.mem with accesses := [] } } mrSrc =
+      .ok ((mv, srcTy), { m with mem := { m.mem with accesses := [] } })) :
+    evalStatementM { m with mem := { m.mem with accesses := [] } }
+        (.Assign (.Local mrDst) mrSrc) = .ok m1 ∧
+    stepM m = .ok mAfter := by
+  have hEv : evalStatementM { m with mem := { m.mem with accesses := [] } }
+      (.Assign (.Local mrDst) mrSrc) = .ok m1 := by
+    dsimp only [evalStatementM]
+    rw [w.hp, ok_bind, hv, ok_bind]
+    exact w.hst
+  exact ⟨hEv, np_stepM_of_evalStatementM w.fr w.blk (.Assign (.Local mrDst) mrSrc)
+    w.hEn w.hPick w.hCur w.hBlk w.hNe w.hStmt hEv w.hMut w.hRace⟩
+
+/-- **V1 Universal Value-Coupled (`Ep2ValRel`) Full-Step Simulation across
+Trusted `evalStmt`/`stepMirFn`, MiniRust `Interp.step` (`Mach`), and MiniRust
+`Interp.stepTB` (`MachTB`, preserving `MachTB.wfLive`)**:
+covers all 4 supported `Rvalue.nullaryOp` variants —
+1. `.sizeOf` (lowered to `UnOp.ComputeSize mrTy ()`),
+2. `.alignOf` (lowered to `UnOp.ComputeAlign mrTy ()`),
+3. `.offsetOf fields` (lowered to `Constant (.Int off) usizeMrTy`), and
+4. `.ubChecks` (lowered BOTH to `Constant (.Int 1) u8MrTy` with direct `Ep2ValRel`
+   agreement AND to `Constant (.Bool true) .Bool` with identical encoded byte
+   representation `[.Init 1 none]`).
+Every conjunct derives `evalNullaryOp`, `evalValueM`, destination-local updates,
+`MachTB.wfLive` preservation, and `Ep2ValRel` directly from the operational
+semantics without taking any evaluation or value-relation hypothesis. -/
+theorem np_v1_nullaryOp_coupled_step_sim_all_four
+    (allocBaseBM : Nat → Nat) (provAllocIdBM : Gen.Memory.Provenance BM → Nat)
+    (allocBaseTB : Nat → Nat) (provAllocIdTB : Gen.Memory.Provenance TBM → Nat)
+    (body : CapturedMir) (bb : BasicBlockData) (s : MachineState) (dstLoc : Nat) (span : String)
+    (slot : LocalSlot) (mrDst : Gen.LocalName)
+    (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup)
+    (hBb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb)
+    (hPtr8 : layoutPointerBytes (s.memory.activeCallee.getD body).layouts = 8)
+    (hLive : slot ≠ .dead) (hGet : get? s.frame.locals dstLoc = some slot)
+    (hProt : s.memory.activeProtectors = []) :
+    let cur := s.memory.activeCallee.getD body
+    -- 1. `.sizeOf` via `UnOp.ComputeSize mrTy ()`
+    (∀ (ty : MirAst.Ty) (mrTy : Gen.Type) (sz : Nat) (al : LibSpecr.Align)
+        (locals2 : List LocalSlot) (mBM mBM1 mBMf : Mach) (mTB mTB1 mTBf : MachTB),
+      get? bb.statements s.frame.stmtIdx =
+        some { kind := .assign (locPlace dstLoc) (.nullaryOp .sizeOf ty), span := span } →
+      intrinsicRigidTyByteSize cur.localDecls cur.layouts ty.kind = .some sz →
+      Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes cur.layouts)) 2) 1) = true →
+      set? s.frame.locals dstLoc (.init (.scalar ⟨sz, 8⟩)) = some locals2 →
+      Type.meta_kind mrTy = .None →
+      Type.layout mrTy = .ok (.Sized ⟨sz⟩ al) →
+      NpMrAssignFrame mBM mBM1 mBMf mrDst (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType))
+        (.Int (Int.ofNat sz)) usizeMrTy →
+      MachTB.wfLive mTB →
+      NpMrAssignFrame mTB mTB1 mTBf mrDst (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType))
+        (.Int (Int.ofNat sz)) usizeMrTy →
+      let s' := advanceStmt s locals2 { s.memory with
+        borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+      evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp .sizeOf ty), span := span }
+          cur.localDecls cur.layouts = MirStepNode.step s' ∧
+      stepMirFn body s = .tau (.running s') ∧
+      get? s'.frame.locals dstLoc = some (.init (.scalar ⟨sz, 8⟩)) ∧
+      Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType))) = .ok mBM1 ∧
+      Interp.step mBM = .ok mBMf ∧
+      evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.UnOp (.ComputeSize mrTy) (.Tuple [] unitType))) = .ok mTB1 ∧
+      Interp.stepTB mTB = .ok mTBf ∧ MachTB.wfLive mTBf ∧
+      Ep2ValRel allocBaseBM provAllocIdBM (.scalar ⟨sz, 8⟩) (.Int (Int.ofNat sz)) ∧
+      Ep2ValRel allocBaseTB provAllocIdTB (.scalar ⟨sz, 8⟩) (.Int (Int.ofNat sz))) ∧
+    -- 2. `.alignOf` via `UnOp.ComputeAlign mrTy ()`
+    (∀ (ty : MirAst.Ty) (mrTy : Gen.Type) (sz al : Nat) (szMr : LibSpecr.Size)
+        (locals2 : List LocalSlot) (mBM mBM1 mBMf : Mach) (mTB mTB1 mTBf : MachTB),
+      get? bb.statements s.frame.stmtIdx =
+        some { kind := .assign (locPlace dstLoc) (.nullaryOp .alignOf ty), span := span } →
+      intrinsicRigidTyByteSize cur.localDecls cur.layouts ty.kind = .some sz →
+      intrinsicRigidTyAlign cur.localDecls cur.layouts ty.kind = .some al →
+      Bool.and
+        (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes cur.layouts)) 2) 1))
+        (Bool.and (Trusted.Rustc.V2026_06_01.Layout.Align.isPowerOfTwoBytes ⟨al⟩)
+          (Nat.blt al (scalarModulus (layoutPointerBytes cur.layouts)))) = true →
+      set? s.frame.locals dstLoc (.init (.scalar ⟨al, 8⟩)) = some locals2 →
+      Type.meta_kind mrTy = .None →
+      Type.layout mrTy = .ok (.Sized szMr ⟨al⟩) →
+      NpMrAssignFrame mBM mBM1 mBMf mrDst (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType))
+        (.Int (Int.ofNat al)) usizeMrTy →
+      MachTB.wfLive mTB →
+      NpMrAssignFrame mTB mTB1 mTBf mrDst (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType))
+        (.Int (Int.ofNat al)) usizeMrTy →
+      let s' := advanceStmt s locals2 { s.memory with
+        borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+      evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp .alignOf ty), span := span }
+          cur.localDecls cur.layouts = MirStepNode.step s' ∧
+      stepMirFn body s = .tau (.running s') ∧
+      get? s'.frame.locals dstLoc = some (.init (.scalar ⟨al, 8⟩)) ∧
+      Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType))) = .ok mBM1 ∧
+      Interp.step mBM = .ok mBMf ∧
+      evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.UnOp (.ComputeAlign mrTy) (.Tuple [] unitType))) = .ok mTB1 ∧
+      Interp.stepTB mTB = .ok mTBf ∧ MachTB.wfLive mTBf ∧
+      Ep2ValRel allocBaseBM provAllocIdBM (.scalar ⟨al, 8⟩) (.Int (Int.ofNat al)) ∧
+      Ep2ValRel allocBaseTB provAllocIdTB (.scalar ⟨al, 8⟩) (.Int (Int.ofNat al))) ∧
+    -- 3. `.offsetOf fields` via `Constant (.Int off) usizeMrTy`
+    (∀ (ty : MirAst.Ty) (fields : List (VariantIdx × FieldIdx)) (sz off : Nat)
+        (locals2 : List LocalSlot) (mBM mBM1 mBMf : Mach) (mTB mTB1 mTBf : MachTB),
+      get? bb.statements s.frame.stmtIdx =
+        some { kind := .assign (locPlace dstLoc) (.nullaryOp (.offsetOf fields) ty), span := span } →
+      intrinsicRigidTyByteSize cur.localDecls cur.layouts ty.kind = .some sz →
+      resolveOffsetOfPath cur.layouts
+        (intrinsicRigidTyByteSize cur.localDecls cur.layouts)
+        (intrinsicRigidTyAlign cur.localDecls cur.layouts)
+        (findDeclLayoutForRigidTy cur.localDecls cur.layouts)
+        (.some ty.kind)
+        (findDeclLayoutForRigidTy cur.localDecls cur.layouts ty.kind)
+        fields = .some off →
+      Bool.and
+        (Nat.ble sz (Nat.sub (Nat.div (scalarModulus (layoutPointerBytes cur.layouts)) 2) 1))
+        (Nat.ble off sz) = true →
+      set? s.frame.locals dstLoc (.init (.scalar ⟨off, 8⟩)) = some locals2 →
+      NpMrAssignFrame mBM mBM1 mBMf mrDst (.Constant (.Int (Int.ofNat off)) usizeMrTy)
+        (.Int (Int.ofNat off)) usizeMrTy →
+      MachTB.wfLive mTB →
+      NpMrAssignFrame mTB mTB1 mTBf mrDst (.Constant (.Int (Int.ofNat off)) usizeMrTy)
+        (.Int (Int.ofNat off)) usizeMrTy →
+      let s' := advanceStmt s locals2 { s.memory with
+        borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+      evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp (.offsetOf fields) ty), span := span }
+          cur.localDecls cur.layouts = MirStepNode.step s' ∧
+      stepMirFn body s = .tau (.running s') ∧
+      get? s'.frame.locals dstLoc = some (.init (.scalar ⟨off, 8⟩)) ∧
+      Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Int (Int.ofNat off)) usizeMrTy)) = .ok mBM1 ∧
+      Interp.step mBM = .ok mBMf ∧
+      evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Int (Int.ofNat off)) usizeMrTy)) = .ok mTB1 ∧
+      Interp.stepTB mTB = .ok mTBf ∧ MachTB.wfLive mTBf ∧
+      Ep2ValRel allocBaseBM provAllocIdBM (.scalar ⟨off, 8⟩) (.Int (Int.ofNat off)) ∧
+      Ep2ValRel allocBaseTB provAllocIdTB (.scalar ⟨off, 8⟩) (.Int (Int.ofNat off))) ∧
+    -- 4a. `.ubChecks` via `u8` `Switch`-scrutinee lowering (`Constant (.Int 1) u8MrTy`)
+    (∀ (li : Nat) (locals2 : List LocalSlot) (mBM mBM1 mBMf : Mach) (mTB mTB1 mTBf : MachTB),
+      get? bb.statements s.frame.stmtIdx =
+        some { kind := .assign (locPlace dstLoc) (.nullaryOp .ubChecks { kind := .bool, layoutIdx := li }), span := span } →
+      set? s.frame.locals dstLoc (.init (.scalar (boolToScalar true))) = some locals2 →
+      NpMrAssignFrame mBM mBM1 mBMf mrDst (.Constant (.Int 1) u8MrTy) (.Int 1) u8MrTy →
+      MachTB.wfLive mTB →
+      NpMrAssignFrame mTB mTB1 mTBf mrDst (.Constant (.Int 1) u8MrTy) (.Int 1) u8MrTy →
+      let s' := advanceStmt s locals2 { s.memory with
+        borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+      evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp .ubChecks { kind := .bool, layoutIdx := li }), span := span }
+          cur.localDecls cur.layouts = MirStepNode.step s' ∧
+      stepMirFn body s = .tau (.running s') ∧
+      get? s'.frame.locals dstLoc = some (.init (.scalar (boolToScalar true))) ∧
+      Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Int 1) u8MrTy)) = .ok mBM1 ∧
+      Interp.step mBM = .ok mBMf ∧
+      evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Int 1) u8MrTy)) = .ok mTB1 ∧
+      Interp.stepTB mTB = .ok mTBf ∧ MachTB.wfLive mTBf ∧
+      Ep2ValRel allocBaseBM provAllocIdBM (.scalar (boolToScalar true)) (.Int 1) ∧
+      Ep2ValRel allocBaseTB provAllocIdTB (.scalar (boolToScalar true)) (.Int 1)) ∧
+    -- 4b. `.ubChecks` via native `.Bool` lowering (`Constant (.Bool true) .Bool`)
+    (∀ (li : Nat) (locals2 : List LocalSlot) (mBM mBM1 mBMf : Mach) (mTB mTB1 mTBf : MachTB),
+      get? bb.statements s.frame.stmtIdx =
+        some { kind := .assign (locPlace dstLoc) (.nullaryOp .ubChecks { kind := .bool, layoutIdx := li }), span := span } →
+      set? s.frame.locals dstLoc (.init (.scalar (boolToScalar true))) = some locals2 →
+      NpMrAssignFrame mBM mBM1 mBMf mrDst (.Constant (.Bool true) .Bool) (.Bool true) .Bool →
+      MachTB.wfLive mTB →
+      NpMrAssignFrame mTB mTB1 mTBf mrDst (.Constant (.Bool true) .Bool) (.Bool true) .Bool →
+      let s' := advanceStmt s locals2 { s.memory with
+        borrows := invalidateConflictingBorrows s.memory.borrows dstLoc .none (length s.memory.callStack) }
+      evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp .ubChecks { kind := .bool, layoutIdx := li }), span := span }
+          cur.localDecls cur.layouts = MirStepNode.step s' ∧
+      stepMirFn body s = .tau (.running s') ∧
+      get? s'.frame.locals dstLoc = some (.init (.scalar (boolToScalar true))) ∧
+      Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Bool true) .Bool)) = .ok mBM1 ∧
+      Interp.step mBM = .ok mBMf ∧
+      evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+          (.Assign (.Local mrDst) (.Constant (.Bool true) .Bool)) = .ok mTB1 ∧
+      Interp.stepTB mTB = .ok mTBf ∧ MachTB.wfLive mTBf ∧
+      Type.encodeM (M := BM) .Bool (.Bool true) = .ok [.Init 1 none] ∧
+      Type.encodeM (M := TBM) .Bool (.Bool true) = .ok [.Init 1 none]) := by
+  intro cur
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · intro ty mrTy sz al locals2 mBM mBM1 mBMf mTB mTB1 mTBf hSt hSz hLe hSet hMeta hLay wBM hwfTB wTB
+    have hVBM := (np_v1_evalValueM_nullaryOp_M allocBaseBM provAllocIdBM s.frame.locals s.memory
+      cur.localDecls cur.layouts { mBM with mem := { mBM.mem with accesses := [] } } hPtr8).1
+      ty mrTy sz al hSz hLe hMeta hLay
+    have hVTB := (np_v1_evalValueM_nullaryOp_M allocBaseTB provAllocIdTB s.frame.locals s.memory
+      cur.localDecls cur.layouts { mTB with mem := { mTB.mem with accesses := [] } } hPtr8).1
+      ty mrTy sz al hSz hLe hMeta hLay
+    have hTr := np_v1_trusted_assign_step body bb s dstLoc .sizeOf ty span (.scalar ⟨sz, 8⟩)
+      slot locals2 hPhase hBb hSt hVBM.1 hLive hGet hSet hProt
+    have hBM := np_v1_mr_assign_stepM wBM hVBM.2.1
+    have hTB := np_v1_mr_assign_stepM wTB hVTB.2.1
+    exact ⟨hTr.1, hTr.2.1, hTr.2.2,
+      by rw [← evalStatementM_bm_eq]; exact hBM.1,
+      by rw [← stepM_bm_eq]; exact hBM.2,
+      hTB.1, hTB.2, stepTB_wfLive hwfTB hTB.2,
+      hVBM.2.2.2, hVTB.2.2.2⟩
+  · intro ty mrTy sz al szMr locals2 mBM mBM1 mBMf mTB mTB1 mTBf hSt hSz hAl hOk hSet hMeta hLay wBM hwfTB wTB
+    have hVBM := (np_v1_evalValueM_nullaryOp_M allocBaseBM provAllocIdBM s.frame.locals s.memory
+      cur.localDecls cur.layouts { mBM with mem := { mBM.mem with accesses := [] } } hPtr8).2.1
+      ty mrTy sz al szMr hSz hAl hOk hMeta hLay
+    have hVTB := (np_v1_evalValueM_nullaryOp_M allocBaseTB provAllocIdTB s.frame.locals s.memory
+      cur.localDecls cur.layouts { mTB with mem := { mTB.mem with accesses := [] } } hPtr8).2.1
+      ty mrTy sz al szMr hSz hAl hOk hMeta hLay
+    have hTr := np_v1_trusted_assign_step body bb s dstLoc .alignOf ty span (.scalar ⟨al, 8⟩)
+      slot locals2 hPhase hBb hSt hVBM.1 hLive hGet hSet hProt
+    have hBM := np_v1_mr_assign_stepM wBM hVBM.2.1
+    have hTB := np_v1_mr_assign_stepM wTB hVTB.2.1
+    exact ⟨hTr.1, hTr.2.1, hTr.2.2,
+      by rw [← evalStatementM_bm_eq]; exact hBM.1,
+      by rw [← stepM_bm_eq]; exact hBM.2,
+      hTB.1, hTB.2, stepTB_wfLive hwfTB hTB.2,
+      hVBM.2.2.2, hVTB.2.2.2⟩
+  · intro ty fields sz off locals2 mBM mBM1 mBMf mTB mTB1 mTBf hSt hSz hOff hOk hSet wBM hwfTB wTB
+    have hVBM := (np_v1_evalValueM_nullaryOp_M allocBaseBM provAllocIdBM s.frame.locals s.memory
+      cur.localDecls cur.layouts { mBM with mem := { mBM.mem with accesses := [] } } hPtr8).2.2.1
+      ty fields sz off hSz hOff hOk
+    have hVTB := (np_v1_evalValueM_nullaryOp_M allocBaseTB provAllocIdTB s.frame.locals s.memory
+      cur.localDecls cur.layouts { mTB with mem := { mTB.mem with accesses := [] } } hPtr8).2.2.1
+      ty fields sz off hSz hOff hOk
+    have hTr := np_v1_trusted_assign_step body bb s dstLoc (.offsetOf fields) ty span (.scalar ⟨off, 8⟩)
+      slot locals2 hPhase hBb hSt hVBM.1 hLive hGet hSet hProt
+    have hBM := np_v1_mr_assign_stepM wBM hVBM.2.1
+    have hTB := np_v1_mr_assign_stepM wTB hVTB.2.1
+    exact ⟨hTr.1, hTr.2.1, hTr.2.2,
+      by rw [← evalStatementM_bm_eq]; exact hBM.1,
+      by rw [← stepM_bm_eq]; exact hBM.2,
+      hTB.1, hTB.2, stepTB_wfLive hwfTB hTB.2,
+      hVBM.2.2, hVTB.2.2⟩
+  · intro li locals2 mBM mBM1 mBMf mTB mTB1 mTBf hSt hSet wBM hwfTB wTB
+    have hVBM := (np_v1_evalValueM_nullaryOp_M allocBaseBM provAllocIdBM s.frame.locals s.memory
+      cur.localDecls cur.layouts { mBM with mem := { mBM.mem with accesses := [] } } hPtr8).2.2.2 li
+    have hVTB := (np_v1_evalValueM_nullaryOp_M allocBaseTB provAllocIdTB s.frame.locals s.memory
+      cur.localDecls cur.layouts { mTB with mem := { mTB.mem with accesses := [] } } hPtr8).2.2.2 li
+    have hTr := np_v1_trusted_assign_step body bb s dstLoc .ubChecks { kind := .bool, layoutIdx := li }
+      span (.scalar (boolToScalar true)) slot locals2 hPhase hBb hSt hVBM.1 hLive hGet hSet hProt
+    have hBM := np_v1_mr_assign_stepM wBM hVBM.2.1
+    have hTB := np_v1_mr_assign_stepM wTB hVTB.2.1
+    exact ⟨hTr.1, hTr.2.1, hTr.2.2,
+      by rw [← evalStatementM_bm_eq]; exact hBM.1,
+      by rw [← stepM_bm_eq]; exact hBM.2,
+      hTB.1, hTB.2, stepTB_wfLive hwfTB hTB.2,
+      hVBM.2.2.2.1, hVTB.2.2.2.1⟩
+  · intro li locals2 mBM mBM1 mBMf mTB mTB1 mTBf hSt hSet wBM hwfTB wTB
+    have hVBM := (np_v1_evalValueM_nullaryOp_M allocBaseBM provAllocIdBM s.frame.locals s.memory
+      cur.localDecls cur.layouts { mBM with mem := { mBM.mem with accesses := [] } } hPtr8).2.2.2 li
+    have hVTB := (np_v1_evalValueM_nullaryOp_M allocBaseTB provAllocIdTB s.frame.locals s.memory
+      cur.localDecls cur.layouts { mTB with mem := { mTB.mem with accesses := [] } } hPtr8).2.2.2 li
+    have hTr := np_v1_trusted_assign_step body bb s dstLoc .ubChecks { kind := .bool, layoutIdx := li }
+      span (.scalar (boolToScalar true)) slot locals2 hPhase hBb hSt hVBM.1 hLive hGet hSet hProt
+    have hBM := np_v1_mr_assign_stepM wBM hVBM.2.2.1
+    have hTB := np_v1_mr_assign_stepM wTB hVTB.2.2.1
+    exact ⟨hTr.1, hTr.2.1, hTr.2.2,
+      by rw [← evalStatementM_bm_eq]; exact hBM.1,
+      by rw [← stepM_bm_eq]; exact hBM.2,
+      hTB.1, hTB.2, stepTB_wfLive hwfTB hTB.2,
+      hVBM.2.2.2.2.1, hVTB.2.2.2.2.1⟩
+
+/-- **V1 Universal Dead-Destination UB Lockstep (`Mach` & `MachTB`)**:
+whenever a `Rvalue.nullaryOp` evaluates cleanly (`evalNullaryOp = .ok tv ...`)
+and the destination local is dead on BOTH Trusted (`get? locals dstLoc = some .dead`)
+and MiniRust (`mapGet fr.locals mrDst = none`), Trusted `evalStmt`/`stepMirFn`,
+MiniRust `Interp.step` (`Mach`), and MiniRust `Interp.stepTB` (`MachTB`) ALL
+fault with `.ub`. -/
+theorem np_v1_nullaryOp_dead_dst_ub_lockstep (body : CapturedMir) (bb : BasicBlockData)
+    (s : MachineState) (dstLoc : Nat) (op : NullOp) (argTy : MirAst.Ty) (span : String)
+    (tv : MirSemantics.Value) (mrDst : Gen.LocalName) (mrSrc : Gen.ValueExpr)
+    (mBM : Mach) (mTB : MachTB)
+    (hPhase : (s.memory.activeCallee.getD body).phase = .runtimePostCleanup)
+    (hBb : get? (s.memory.activeCallee.getD body).basicBlocks s.frame.blockIdx = some bb)
+    (hSt : get? bb.statements s.frame.stmtIdx =
+      some { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span })
+    (hNull : evalNullaryOp s.frame.locals op argTy s.memory
+      (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts =
+      .ok tv s.frame.locals s.memory)
+    (hDeadT : get? s.frame.locals dstLoc = some .dead)
+    (wBM : NpMrDeadAssignFrame mBM mrDst mrSrc)
+    (wTB : NpMrDeadAssignFrame mTB mrDst mrSrc) :
+    let cur := s.memory.activeCallee.getD body
+    evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span }
+        cur.localDecls cur.layouts = MirStepNode.fail .ub ∧
+    stepMirFn body s = MirStepNode.fail .ub ∧
+    Interp.evalStatement { mBM with mem := { mBM.mem with accesses := [] } }
+        (.Assign (.Local mrDst) mrSrc) = .error (.ub "access to a dead local") ∧
+    Interp.step mBM = .error (.ub "access to a dead local") ∧
+    evalStatementM { mTB with mem := { mTB.mem with accesses := [] } }
+        (.Assign (.Local mrDst) mrSrc) = .error (.ub "access to a dead local") ∧
+    Interp.stepTB mTB = .error (.ub "access to a dead local") := by
+  have hEvT : evalStmt s { kind := .assign (locPlace dstLoc) (.nullaryOp op argTy), span := span }
+      (s.memory.activeCallee.getD body).localDecls (s.memory.activeCallee.getD body).layouts =
+      MirStepNode.fail .ub := by
+    simp only [evalStmt, evalRvalue, hNull, locPlace, hDeadT]
+  have hStepT : stepMirFn body s = MirStepNode.fail .ub := by
+    unfold stepMirFn
+    dsimp only
+    rw [hPhase, hBb]
+    dsimp only
+    rw [hSt]
+    exact hEvT
+  have hMrDead : ∀ {M : Type} [Gen.Memory M] [MemoryOps M] {m : Machine M}
+      (w : NpMrDeadAssignFrame m mrDst mrSrc),
+      evalStatementM { m with mem := { m.mem with accesses := [] } }
+          (.Assign (.Local mrDst) mrSrc) = .error (.ub "access to a dead local") ∧
+      stepM m = .error (.ub "access to a dead local") := by
+    intro M _ _ m w
+    have hPl : evalPlaceM { m with mem := { m.mem with accesses := [] } } (.Local mrDst) =
+        .error (.ub "access to a dead local") := by
+      unfold evalPlaceM
+      simp only [w.hCur, w.hDecl, w.hDead, bind, Except.bind, Interp.ub]
+    have hEv : evalStatementM { m with mem := { m.mem with accesses := [] } }
+        (.Assign (.Local mrDst) mrSrc) = .error (.ub "access to a dead local") := by
+      dsimp only [evalStatementM]
+      rw [hPl]; rfl
+    exact ⟨hEv, np_stepM_error_of_evalStatementM w.fr w.blk (.Assign (.Local mrDst) mrSrc)
+      w.hEn w.hPick w.hCur w.hBlk w.hNe w.hStmt hEv⟩
+  have hBM := hMrDead wBM
+  have hTB := hMrDead wTB
+  exact ⟨hEvT, hStepT,
+    by rw [← evalStatementM_bm_eq]; exact hBM.1,
+    by rw [← stepM_bm_eq]; exact hBM.2,
+    hTB.1, hTB.2⟩
+
 /-- MiniRust machine for `v1NullaryTupleMir`: `size_of` and `align_of` are
 `UnOp.ComputeSize` / `UnOp.ComputeAlign` on `npTuple16MrTy` with unit
 metadata, `offset_of!(.2)` is the constant field offset of `npTuple16MrTy`,

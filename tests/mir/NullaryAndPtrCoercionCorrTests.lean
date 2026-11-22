@@ -167,6 +167,11 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v1_nullary_padded_offset_universal
   have _ := @np_v1_nullary_unsized_unsupported
   have _ := @np_v1_minirust_layout_and_offset_agreement
+  have _ := @np_stepM_of_evalStatementM
+  have _ := @np_stepM_error_of_evalStatementM
+  have _ := @np_v1_evalValueM_nullaryOp_M
+  have _ := @np_v1_nullaryOp_coupled_step_sim_all_four
+  have _ := @np_v1_nullaryOp_dead_dst_ub_lockstep
   have _ := @np_v1_nullaryOp_three_way_witness
   have _ := @np_v2_pointerCoercion_dispatch
   have _ := @np_v2_reify_and_closure_fnPointer_lockstep
@@ -436,7 +441,11 @@ run_cmd do
           type := mkApp3 (mkConst ``Eq [1]) capMirTy
             (mkConst (mrNs ++ `v1NullaryTupleMir)) (mkConst (lmNs ++ `v1NullaryUbChecksMir)),
           value := mkApp2 (mkConst ``Eq.refl [1]) capMirTy
-            (mkConst (mrNs ++ `v1NullaryTupleMir)) }) ]
+            (mkConst (mrNs ++ `v1NullaryTupleMir)) }),
+        ("forged ill-typed Unsize acceptance (mutability upgrade / element mismatch)", .thmDecl {
+          name := ns ++ `forged.illTypedUnsizeAccepted, levelParams := [],
+          type := eqTrue (mkConst (lmNs ++ `npIllTypedUnsizeAccepted)),
+          value := reflTrue }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -468,6 +477,21 @@ run_cmd do
       for a in ← collectAxioms n do
         unless isStdAx a do
           throwError "cross-root: {n} depends on non-standard axiom {a}"
+        crAxioms := crAxioms.insert a
+    -- Verify new LM B1 fidelity & Tree Borrows theorems are present, non-trivial, and axiom-clean.
+    let lmDeepThms : List Name :=
+      [ lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayLen?,
+        lmNs ++ `np_v2_unsize_spec_laws,
+        lmNs ++ `lm_np_v2_unsize_fidelity_and_negative_witness,
+        lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness ]
+    for n in lmDeepThms do
+      let some (.thmInfo v) := env.find? n
+        | throwError "cross-root: required LM theorem {n} missing"
+      if isTrivialProp v.type then
+        throwError "cross-root: LM theorem {n} is trivial"
+      for a in ← collectAxioms n do
+        unless isStdAx a do
+          throwError "cross-root: LM theorem {n} depends on non-standard axiom {a}"
         crAxioms := crAxioms.insert a
     -- Self-tests: auditor MUST detect sorryAx, Lean.ofReduceBool, and trivial theorems.
     unless !(← collectAxioms ``sorryAx).all isStdAx do
@@ -514,7 +538,7 @@ run_cmd do
     { fileName := "<np-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, bundleCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount ≥ 48 && bundleCount = 5 && rejectedCount = 5 do
+  unless addedCount ≥ 48 && bundleCount = 5 && rejectedCount = 6 do
     throwError "cross-root: unexpected counts (added={addedCount}, bundles={bundleCount}, rejected={rejectedCount})"
   logInfo m!"np cross-root kernel bridge: added {addedCount} declarations ({bundleCount} bundles, 16 fixture locks), rejected {rejectedCount} forged controls, reached Trusted+MiniRust+Miri, axioms {crAxioms}"
 
