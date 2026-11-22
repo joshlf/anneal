@@ -860,22 +860,43 @@ macro_rules! impl_return_mutants_unsigned {
 
             fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
                 let v = *self;
-                emit(v.wrapping_add(1));
-                emit(v.wrapping_sub(1));
-                emit(v ^ 1);
-                emit(!v);
-                emit(0);
-                emit(1);
-                emit(<$ty>::MAX);
-                emit(<$ty>::MAX.wrapping_sub(1));
-                emit(v >> 1);
-                emit(v.wrapping_mul(2));
                 // Stratified small PRNG draw + full-width PRNG draw.
                 let r1: $ty = $full_draw(rng);
-                emit(r1 & (0x3F as $ty));
-                emit($full_draw(rng));
-                emit(v.wrapping_add(2));
-                emit(v.wrapping_sub(2));
+                let r2: $ty = $full_draw(rng);
+                let candidates: [$ty; 14] = [
+                    v.wrapping_add(1),
+                    v.wrapping_sub(1),
+                    v ^ 1,
+                    !v,
+                    0,
+                    1,
+                    <$ty>::MAX,
+                    <$ty>::MAX.wrapping_sub(1),
+                    v.wrapping_add(2),
+                    v.wrapping_sub(2),
+                    v >> 1,
+                    v.wrapping_mul(2),
+                    r1 & (0x3F as $ty),
+                    r2,
+                ];
+                let mut seen = [v; 15];
+                let mut seen_len = 1usize;
+                for cand in candidates {
+                    let mut dup = false;
+                    let mut i = 0usize;
+                    while i < seen_len {
+                        if seen[i] == cand {
+                            dup = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !dup {
+                        seen[seen_len] = cand;
+                        seen_len += 1;
+                        emit(cand);
+                    }
+                }
             }
         }
     };
@@ -895,22 +916,43 @@ macro_rules! impl_return_mutants_signed {
 
             fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
                 let v = *self;
-                emit(v.wrapping_add(1));
-                emit(v.wrapping_sub(1));
-                emit(v ^ 1);
-                emit(!v);
-                emit(v.wrapping_neg());
-                emit(0);
-                emit(1);
-                emit(-1);
-                emit(<$ty>::MIN);
-                emit(<$ty>::MAX);
-                emit(<$ty>::MAX.wrapping_sub(1));
-                emit(v >> 1);
-                emit(v.wrapping_mul(2));
                 let r1 = rng.next_u64();
-                emit(((r1 & 0x7F) as $ty).wrapping_sub(64));
-                emit($full_draw(rng));
+                let r2: $ty = $full_draw(rng);
+                let candidates: [$ty; 15] = [
+                    v.wrapping_add(1),
+                    v.wrapping_sub(1),
+                    v ^ 1,
+                    !v,
+                    v.wrapping_neg(),
+                    0,
+                    1,
+                    -1,
+                    <$ty>::MIN,
+                    <$ty>::MAX,
+                    <$ty>::MAX.wrapping_sub(1),
+                    v >> 1,
+                    v.wrapping_mul(2),
+                    ((r1 & 0x7F) as $ty).wrapping_sub(64),
+                    r2,
+                ];
+                let mut seen = [v; 16];
+                let mut seen_len = 1usize;
+                for cand in candidates {
+                    let mut dup = false;
+                    let mut i = 0usize;
+                    while i < seen_len {
+                        if seen[i] == cand {
+                            dup = true;
+                            break;
+                        }
+                        i += 1;
+                    }
+                    if !dup {
+                        seen[seen_len] = cand;
+                        seen_len += 1;
+                        emit(cand);
+                    }
+                }
             }
         }
     };
@@ -944,10 +986,18 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
             }
             None => {
                 emit(Some(T::sample_at(0, rng)));
-                emit(Some(T::sample_at(1, rng)));
-                emit(Some(T::sample_at(2, rng)));
-                emit(Some(T::sample_at(T::BOUNDARY_COUNT, rng)));
-                emit(Some(T::sample_at(T::BOUNDARY_COUNT.saturating_add(1), rng)));
+                if !T::IS_SUBSINGLETON {
+                    if T::BOUNDARY_COUNT >= 2 {
+                        emit(Some(T::sample_at(1, rng)));
+                    }
+                    if T::BOUNDARY_COUNT >= 3 {
+                        emit(Some(T::sample_at(2, rng)));
+                    }
+                    if T::BOUNDARY_COUNT > 2 {
+                        emit(Some(T::sample_at(T::BOUNDARY_COUNT, rng)));
+                        emit(Some(T::sample_at(T::BOUNDARY_COUNT.saturating_add(1), rng)));
+                    }
+                }
             }
         }
     }
@@ -961,18 +1011,72 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
     const IS_SUBSINGLETON: bool = false;
 
     fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
+        let mut flip_rng = rng.fork();
         match self {
             Ok(v) => {
-                emit(Err(E::sample_at(0, rng)));
-                emit(Err(E::sample_at(1, rng)));
-                emit(Err(E::sample_at(E::BOUNDARY_COUNT, rng)));
-                v.visit_mutants(rng, |m| emit(Ok(m)));
+                let mut emitted_flips = false;
+                if !T::IS_SUBSINGLETON {
+                    v.visit_mutants(rng, |m| {
+                        emit(Ok(m));
+                        if !emitted_flips {
+                            emitted_flips = true;
+                            // Emit opposite-variant flips right after the first payload
+                            // mutant so small budgets test both axes without duplicating
+                            // subsingleton payloads and mutant chains advance within `Ok`.
+                            emit(Err(E::sample_at(0, &mut flip_rng)));
+                            if !E::IS_SUBSINGLETON {
+                                if E::BOUNDARY_COUNT >= 2 {
+                                    emit(Err(E::sample_at(1, &mut flip_rng)));
+                                }
+                                if E::BOUNDARY_COUNT > 2 {
+                                    emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
+                                }
+                            }
+                        }
+                    });
+                }
+                if !emitted_flips {
+                    emit(Err(E::sample_at(0, &mut flip_rng)));
+                    if !E::IS_SUBSINGLETON {
+                        if E::BOUNDARY_COUNT >= 2 {
+                            emit(Err(E::sample_at(1, &mut flip_rng)));
+                        }
+                        if E::BOUNDARY_COUNT > 2 {
+                            emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
+                        }
+                    }
+                }
             }
             Err(e) => {
-                emit(Ok(T::sample_at(0, rng)));
-                emit(Ok(T::sample_at(1, rng)));
-                emit(Ok(T::sample_at(T::BOUNDARY_COUNT, rng)));
-                e.visit_mutants(rng, |m| emit(Err(m)));
+                let mut emitted_flips = false;
+                if !E::IS_SUBSINGLETON {
+                    e.visit_mutants(rng, |m| {
+                        emit(Err(m));
+                        if !emitted_flips {
+                            emitted_flips = true;
+                            emit(Ok(T::sample_at(0, &mut flip_rng)));
+                            if !T::IS_SUBSINGLETON {
+                                if T::BOUNDARY_COUNT >= 2 {
+                                    emit(Ok(T::sample_at(1, &mut flip_rng)));
+                                }
+                                if T::BOUNDARY_COUNT > 2 {
+                                    emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
+                                }
+                            }
+                        }
+                    });
+                }
+                if !emitted_flips {
+                    emit(Ok(T::sample_at(0, &mut flip_rng)));
+                    if !T::IS_SUBSINGLETON {
+                        if T::BOUNDARY_COUNT >= 2 {
+                            emit(Ok(T::sample_at(1, &mut flip_rng)));
+                        }
+                        if T::BOUNDARY_COUNT > 2 {
+                            emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1105,19 +1209,25 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
             return;
         }
 
-        // Perturb the fixed representative positions `0`, `N / 2`, and `N - 1`
-        // plus one PRNG-selected roving position per call. Across precondition
-        // hits the roving position visits every index, so a postcondition that
-        // pins only an interior element is not mistaken for an output-blind one.
-        // `N >= 1` here because `[T; 0]` is a subsingleton.
-        let last = N.saturating_sub(1);
-        let roving = (rng.next_u64() % (N as u64).max(1)) as usize;
+        // Place one PRNG-selected roving index first, followed by the fixed
+        // representative positions `0`, `N / 2` (when `N >= 3`), and `N - 1`
+        // (when `N >= 2`), deduplicated. Putting `roving` first guarantees that
+        // even tight mutant budgets (`max_mutants_per_hit` <= 8) visit every
+        // interior index across precondition hits. `N >= 1` here because
+        // `[T; 0]` is a subsingleton.
+        let last = N - 1;
+        let mid = N / 2;
+        let roving = (rng.next_u64() % (N as u64)) as usize;
         let indices: [Option<usize>; 4] = [
-            Some(0),
-            if N >= 3 { Some(N / 2) } else { None },
-            if N >= 2 { Some(last) } else { None },
-            if roving != 0 && roving != N / 2 && roving != last {
-                Some(roving)
+            Some(roving),
+            if roving != 0 { Some(0) } else { None },
+            if N >= 3 && mid != roving {
+                Some(mid)
+            } else {
+                None
+            },
+            if N >= 2 && last != roving {
+                Some(last)
             } else {
                 None
             },
@@ -2105,44 +2215,92 @@ where
     } = anchor;
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0x51A7_E001_C3C3_3C3C);
+    let mut state_probe_rng = probe_rng.fork();
+    let mut ret_probe_rng = probe_rng.fork();
     let mut saw_sensitivity = false;
-    let mut rejected_witness: Option<(S, A, S, bool)> = None;
-    let mut accepted_witness: Option<(S, A, S, bool)> = None;
+    // Stratified witness slots indexed by `(admissible as usize) * 3 + kind`
+    // (`kind`: 0 = `anchor_new_s`/`old_s`, 1 = first mutant of `old_s`, 2 = second mutant)
+    // so an early state-clause rejection on `old_s` cannot shadow a state-matching
+    // witness (such as `old_s + 1` or `old_s - 1`) in conjunctive postconditions.
+    let mut rejected_witnesses: [Option<(S, A, S, bool)>; 6] = [None, None, None, None, None, None];
+    let mut accepted_witnesses: [Option<(S, A, S, bool)>; 2] = [None, None];
 
     for idx in 0..64 {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
         let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
             continue;
         };
-        let probe_new_s = if idx % 2 == 0 {
-            anchor_new_s.clone()
+
+        let mut state_cands: [Option<(S, usize)>; 5] = [None, None, None, None, None];
+        if idx % 2 == 0 {
+            state_cands[0] = Some((anchor_new_s.clone(), 0));
+            state_cands[1] = Some((old_s.clone(), 0));
         } else {
-            old_s.clone()
-        };
-        let base = probe_verdict(post(&old_s, &args, &probe_new_s, &anchor_ret), admissible);
-        if base == ProbeVerdict::Undefined {
-            continue;
+            state_cands[0] = Some((old_s.clone(), 0));
+            state_cands[1] = Some((anchor_new_s.clone(), 0));
+        }
+        if !S::IS_SUBSINGLETON {
+            let mut m_slot = 2usize;
+            old_s.visit_mutants(&mut state_probe_rng, |cand_s| {
+                if m_slot < state_cands.len() && cand_s != old_s {
+                    let kind = if m_slot == 2 { 1 } else { 2 };
+                    state_cands[m_slot] = Some((cand_s, kind));
+                    m_slot += 1;
+                }
+            });
         }
 
-        let mut varied = false;
-        anchor_ret.visit_mutants(&mut probe_rng, |cand| {
+        let acc_slot = usize::from(admissible);
+        let mut best_rej: Option<(usize, S)> = None;
+        let mut best_acc: Option<(usize, S)> = None;
+
+        for cand_slot in state_cands {
+            let Some((probe_new_s, kind)) = cand_slot else {
+                continue;
+            };
+            let base = probe_verdict(post(&old_s, &args, &probe_new_s, &anchor_ret), admissible);
+            if base == ProbeVerdict::Undefined {
+                continue;
+            }
+
+            let mut varied = false;
+            anchor_ret.visit_mutants(&mut ret_probe_rng, |cand| {
+                if varied {
+                    return;
+                }
+                let verdict = probe_verdict(post(&old_s, &args, &probe_new_s, &cand), admissible);
+                if verdict != ProbeVerdict::Undefined && verdict != base {
+                    varied = true;
+                }
+            });
             if varied {
-                return;
+                saw_sensitivity = true;
+                break;
             }
-            let verdict = probe_verdict(post(&old_s, &args, &probe_new_s, &cand), admissible);
-            if verdict != ProbeVerdict::Undefined && verdict != base {
-                varied = true;
+
+            if base == ProbeVerdict::Rejected {
+                let rej_slot = acc_slot * 3 + kind;
+                let prefer = match &best_rej {
+                    None => true,
+                    Some((prev_slot, _)) => *prev_slot < rej_slot,
+                };
+                if rejected_witnesses[rej_slot].is_none() && prefer {
+                    best_rej = Some((rej_slot, probe_new_s));
+                }
+            } else if base == ProbeVerdict::Accepted
+                && accepted_witnesses[acc_slot].is_none()
+                && best_acc.is_none()
+            {
+                best_acc = Some((acc_slot, probe_new_s));
             }
-        });
-        if varied {
-            saw_sensitivity = true;
+        }
+        if saw_sensitivity {
             break;
         }
-
-        if base == ProbeVerdict::Rejected && rejected_witness.is_none() {
-            rejected_witness = Some((old_s, args, probe_new_s, admissible));
-        } else if base == ProbeVerdict::Accepted && accepted_witness.is_none() {
-            accepted_witness = Some((old_s, args, probe_new_s, admissible));
+        if let Some((slot, probe_new_s)) = best_rej {
+            rejected_witnesses[slot] = Some((old_s, args, probe_new_s, admissible));
+        } else if let Some((slot, probe_new_s)) = best_acc {
+            accepted_witnesses[slot] = Some((old_s, args, probe_new_s, admissible));
         }
     }
 
@@ -2152,15 +2310,17 @@ where
             if probe_verdict(live, true) == ProbeVerdict::Rejected {
                 return true;
             }
-            if let Some((os, a, ns, admissible)) = accepted_witness.as_ref()
-                && probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Rejected
-            {
-                return true;
+            for witness in accepted_witnesses.iter().flatten() {
+                let (os, a, ns, admissible) = witness;
+                if probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Rejected {
+                    return true;
+                }
             }
-            if let Some((os, a, ns, admissible)) = rejected_witness.as_ref()
-                && probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Accepted
-            {
-                return true;
+            for witness in rejected_witnesses.iter().flatten() {
+                let (os, a, ns, admissible) = witness;
+                if probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Accepted {
+                    return true;
+                }
             }
             false
         });
@@ -2199,42 +2359,114 @@ where
     } = anchor;
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0x51A7_E002_C3C3_3C3C);
+    let mut state_probe_rng = probe_rng.fork();
+    let mut ret_probe_rng = probe_rng.fork();
     let mut saw_sensitivity = false;
-    let mut rejected_witness: Option<(S, A, bool)> = None;
-    let mut accepted_witness: Option<(S, A, bool)> = None;
+    // Stratified witness slots indexed by `(admissible as usize) * 2 + (mutated_ret as usize)`
+    // (`None` in the third field means borrow `&anchor_ret`, avoiding any `R: Clone` bound).
+    let mut rejected_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
+    let mut accepted_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
 
     for idx in 0..64 {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
         let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
             continue;
         };
+
+        let acc_slot = usize::from(admissible);
+        let mut base_anchor = ProbeVerdict::Undefined;
+
+        // First probe while holding `anchor_ret` fixed.
         let base = probe_verdict(post(&old_s, &args, &anchor_new_s, &anchor_ret), admissible);
-        if base == ProbeVerdict::Undefined {
-            continue;
+        if base != ProbeVerdict::Undefined {
+            base_anchor = base;
+            let revert = probe_verdict(post(&old_s, &args, &old_s, &anchor_ret), admissible);
+            let mut varied = revert != ProbeVerdict::Undefined && revert != base;
+            if !varied {
+                anchor_new_s.visit_mutants(&mut state_probe_rng, |cand_s| {
+                    if varied {
+                        return;
+                    }
+                    let verdict =
+                        probe_verdict(post(&old_s, &args, &cand_s, &anchor_ret), admissible);
+                    if verdict != ProbeVerdict::Undefined && verdict != base {
+                        varied = true;
+                    }
+                });
+            }
+            if varied {
+                saw_sensitivity = true;
+                break;
+            }
         }
 
-        let revert = probe_verdict(post(&old_s, &args, &old_s, &anchor_ret), admissible);
-        let mut varied = revert != ProbeVerdict::Undefined && revert != base;
-        if !varied {
-            anchor_new_s.visit_mutants(&mut probe_rng, |cand_s| {
-                if varied {
-                    return;
-                }
-                let verdict = probe_verdict(post(&old_s, &args, &cand_s, &anchor_ret), admissible);
-                if verdict != ProbeVerdict::Undefined && verdict != base {
-                    varied = true;
+        // Also probe up to 5 mutants of `anchor_ret` (still holding each candidate fixed
+        // while varying `new_s`) so conjunctive constraints pairing `ret` with `old_s`
+        // do not hide state-axis sensitivity.
+        let mut best_rej_mut: Option<R> = None;
+        let mut best_acc_mut: Option<R> = None;
+        if !R::IS_SUBSINGLETON {
+            let mut ret_cands: [Option<R>; 5] = [None, None, None, None, None];
+            let mut r_slot = 0usize;
+            anchor_ret.visit_mutants(&mut ret_probe_rng, |cand_r| {
+                if r_slot < ret_cands.len() && cand_r != anchor_ret {
+                    ret_cands[r_slot] = Some(cand_r);
+                    r_slot += 1;
                 }
             });
-        }
-        if varied {
-            saw_sensitivity = true;
-            break;
+
+            for probe_ret in ret_cands.into_iter().flatten() {
+                let b = probe_verdict(post(&old_s, &args, &anchor_new_s, &probe_ret), admissible);
+                if b == ProbeVerdict::Undefined {
+                    continue;
+                }
+                let rev = probe_verdict(post(&old_s, &args, &old_s, &probe_ret), admissible);
+                let mut varied = rev != ProbeVerdict::Undefined && rev != b;
+                if !varied {
+                    anchor_new_s.visit_mutants(&mut state_probe_rng, |cand_s| {
+                        if varied {
+                            return;
+                        }
+                        let verdict =
+                            probe_verdict(post(&old_s, &args, &cand_s, &probe_ret), admissible);
+                        if verdict != ProbeVerdict::Undefined && verdict != b {
+                            varied = true;
+                        }
+                    });
+                }
+                if varied {
+                    saw_sensitivity = true;
+                    break;
+                }
+                if b == ProbeVerdict::Rejected
+                    && rejected_witnesses[acc_slot * 2 + 1].is_none()
+                    && best_rej_mut.is_none()
+                {
+                    best_rej_mut = Some(probe_ret);
+                } else if b == ProbeVerdict::Accepted
+                    && accepted_witnesses[acc_slot * 2 + 1].is_none()
+                    && best_acc_mut.is_none()
+                {
+                    best_acc_mut = Some(probe_ret);
+                }
+            }
+            if saw_sensitivity {
+                break;
+            }
         }
 
-        if base == ProbeVerdict::Rejected && rejected_witness.is_none() {
-            rejected_witness = Some((old_s, args, admissible));
-        } else if base == ProbeVerdict::Accepted && accepted_witness.is_none() {
-            accepted_witness = Some((old_s, args, admissible));
+        if let Some(probe_ret) = best_rej_mut {
+            rejected_witnesses[acc_slot * 2 + 1] = Some((old_s, args, Some(probe_ret), admissible));
+        } else if base_anchor == ProbeVerdict::Rejected
+            && rejected_witnesses[acc_slot * 2].is_none()
+        {
+            rejected_witnesses[acc_slot * 2] = Some((old_s, args, None, admissible));
+        } else if let Some(probe_ret) = best_acc_mut {
+            accepted_witnesses[acc_slot * 2 + 1] = Some((old_s, args, Some(probe_ret), admissible));
+        } else if base_anchor == ProbeVerdict::Accepted
+            && accepted_witnesses[acc_slot * 2].is_none()
+        {
+            accepted_witnesses[acc_slot * 2] = Some((old_s, args, None, admissible));
         }
     }
 
@@ -2244,17 +2476,21 @@ where
             if probe_verdict(live, true) == ProbeVerdict::Rejected {
                 return true;
             }
-            if let Some((os, a, admissible)) = accepted_witness.as_ref()
-                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
-                    == ProbeVerdict::Rejected
-            {
-                return true;
+            for witness in accepted_witnesses.iter().flatten() {
+                let (os, a, opt_r, admissible) = witness;
+                let r_ref = opt_r.as_ref().unwrap_or(&anchor_ret);
+                if probe_verdict(post(os, a, cand_s, r_ref), *admissible) == ProbeVerdict::Rejected
+                {
+                    return true;
+                }
             }
-            if let Some((os, a, admissible)) = rejected_witness.as_ref()
-                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
-                    == ProbeVerdict::Accepted
-            {
-                return true;
+            for witness in rejected_witnesses.iter().flatten() {
+                let (os, a, opt_r, admissible) = witness;
+                let r_ref = opt_r.as_ref().unwrap_or(&anchor_ret);
+                if probe_verdict(post(os, a, cand_s, r_ref), *admissible) == ProbeVerdict::Accepted
+                {
+                    return true;
+                }
             }
             false
         });

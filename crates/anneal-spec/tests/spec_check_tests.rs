@@ -1749,3 +1749,264 @@ fn integer_samplers_and_mutants_cover_extremes_without_overflow() {
     );
     assert!(result_flip.mutants_killed > 0);
 }
+
+// ---------------------------------------------------------------------------
+// 8. Subsingleton Bounds, Deduplicated Mutants, Tight Budgets & Stateful Axes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn subsingleton_flags_and_deduplicated_variant_mutants() {
+    // `Option<()>` and `Result<(), ()>` each have two distinct inhabitants.
+    assert!(!<Option<()> as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<Result<(), ()> as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<Result<(), u8> as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<Result<u8, ()> as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<Option<Option<u8>> as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(<[(); 0] as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(<[(); 4] as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<([u8; 0], u8) as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(<([u8; 0], ()) as ReturnMutants>::IS_SUBSINGLETON);
+
+    let mut rng = SplitMix64::new(0xC0DE);
+
+    // Subsingleton inner payloads must emit their opposite variant exactly once.
+    let mut opt_unit_muts = Vec::new();
+    None::<()>.visit_mutants(&mut rng, |m| opt_unit_muts.push(m));
+    assert_eq!(opt_unit_muts, vec![Some(())]);
+
+    let mut res_ok_unit_muts = Vec::new();
+    Ok::<(), ()>(()).visit_mutants(&mut rng, |m| res_ok_unit_muts.push(m));
+    assert_eq!(res_ok_unit_muts, vec![Err(())]);
+
+    let mut res_err_unit_muts = Vec::new();
+    Err::<(), ()>(()).visit_mutants(&mut rng, |m| res_err_unit_muts.push(m));
+    assert_eq!(res_err_unit_muts, vec![Ok(())]);
+
+    // With a tight mutant budget of 2, `Result<u32, ()>` and `Result<(), u32>` must cover
+    // both payload mutation and opposite-variant flip without starving on duplicates.
+    let tight = SpecCheckConfig::default().with_max_mutants_per_hit(2);
+
+    let res_ok_payload = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| Ok::<u32, ()>(x),
+        |&x, r: &Result<u32, ()>| r.is_err() || *r == Ok(x),
+    );
+    assert!(res_ok_payload.mutants_killed > 0);
+
+    let res_ok_variant = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| Ok::<u32, ()>(x),
+        |_x, r: &Result<u32, ()>| r.is_ok(),
+    );
+    assert!(res_ok_variant.mutants_killed > 0);
+
+    let res_err_payload = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| Err::<(), u32>(x),
+        |&x, r: &Result<(), u32>| r.is_ok() || *r == Err(x),
+    );
+    assert!(res_err_payload.mutants_killed > 0);
+
+    // Integer mutant generators must never emit `self` or duplicate candidates.
+    macro_rules! assert_no_int_dups {
+        ($val:expr) => {{
+            let val = $val;
+            let mut emitted = Vec::new();
+            val.visit_mutants(&mut rng, |m| {
+                assert_ne!(m, val, "integer visit_mutants must not emit self");
+                assert!(
+                    !emitted.contains(&m),
+                    "integer visit_mutants must not emit duplicates"
+                );
+                emitted.push(m);
+            });
+            assert!(!emitted.is_empty());
+        }};
+    }
+
+    assert_no_int_dups!(0u32);
+    assert_no_int_dups!(u32::MAX);
+    assert_no_int_dups!(0i8);
+    assert_no_int_dups!(i8::MIN);
+    assert_no_int_dups!(i128::MIN);
+}
+
+#[test]
+fn array_roving_index_kills_interior_under_tight_mutant_budget() {
+    // Placing the roving index first ensures even `max_mutants_per_hit = 4` visits
+    // interior indices of `[u32; 8]` instead of exhausting its budget on `0`, `N/2`, `N-1`.
+    let tight = SpecCheckConfig::default().with_max_mutants_per_hit(4);
+    let interior = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| [x; 8],
+        |&x, r: &[u32; 8]| r[5] == x,
+    );
+    assert!(interior.mutants_killed > 0);
+
+    // For `N = 2`, both index `0` and index `1` (`last == N / 2`) must remain covered.
+    let pair_first = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| [x, x],
+        |&x, r: &[u32; 2]| r[0] == x,
+    );
+    assert!(pair_first.mutants_killed > 0);
+
+    let pair_second = assert_contract_strong(
+        tight,
+        |_x: &u32| true,
+        |&x| [x, x],
+        |&x, r: &[u32; 2]| r[1] == x,
+    );
+    assert!(pair_second.mutants_killed > 0);
+
+    let mut rng = SplitMix64::new(0x1234);
+    for _ in 0..16 {
+        let base = [0u32, 0u32];
+        let mut saw_idx0 = false;
+        let mut saw_idx1 = false;
+        base.visit_mutants(&mut rng, |m| {
+            if m[0] != 0 && m[1] == 0 {
+                saw_idx0 = true;
+            }
+            if m[0] == 0 && m[1] != 0 {
+                saw_idx1 = true;
+            }
+        });
+        assert!(
+            saw_idx0 && saw_idx1,
+            "`[T; 2]::visit_mutants` must perturb both indices"
+        );
+    }
+}
+
+#[test]
+fn result_mutant_chain_and_nested_option_classify_cleanly() {
+    // `Result<u32, u32>` mutant chains advance monotonically through `Ok(0), Ok(1), ...`
+    // rather than bouncing `Ok <-> Err`, reaching `Ok(42)` under `ProbeDomain::Unconstrained`.
+    let outcome = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| x < 10,
+        |&x| Ok::<u32, u32>(x),
+        |&x, r: &Result<u32, u32>| x < 10 || *r == Ok(42),
+    );
+    assert_eq!(
+        outcome.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+
+    // Nested `Option<Option<u8>>` covers `None`, `Some(None)`, and `Some(Some(_))`.
+    let nested_opt = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u8| true,
+        |&x| {
+            if x == 0 {
+                None
+            } else if x == 1 {
+                Some(None)
+            } else {
+                Some(Some(x))
+            }
+        },
+        |&x, &r: &Option<Option<u8>>| {
+            r == if x == 0 {
+                None
+            } else if x == 1 {
+                Some(None)
+            } else {
+                Some(Some(x))
+            }
+        },
+    );
+    assert!(nested_opt.mutants_killed > 0);
+}
+
+#[test]
+fn stateful_pure_read_and_conjunctive_axis_probes() {
+    // Pure read via `&mut S` leaving `*state == old_state` intentionally: with the frame
+    // condition `*new == *old`, both state and return axes kill mutants.
+    let pure_read_strong = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| *state,
+        |old: &u32, &(), new: &u32, ret: &u32| *new == *old && *ret == *old,
+    );
+    assert!(pure_read_strong.mutants_killed > 0);
+
+    // Omitting the frame condition `*new == *old` on a pure read is caught on the state axis.
+    let pure_read_missing_frame = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| *state,
+        |old: &u32, &(), _new: &u32, ret: &u32| *ret == *old,
+    );
+    assert_eq!(
+        pure_read_missing_frame.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        pure_read_missing_frame.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed,
+            state_mutants_killed: 0,
+            ..
+        }) if return_mutants_killed > 0
+    ));
+
+    // Conjunctive `requires`-vacuous return axis: `*new == old.wrapping_add(1)` pins `new`
+    // while `(*old < 100 || *ret == 42)` varies with `ret` outside `requires`.
+    let unconstrained = SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained);
+    let conj_ret_vacuous = check_stateful_contract(
+        unconstrained,
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            *new == old.wrapping_add(1) && (*old < 100 || *ret == 42)
+        },
+    );
+    assert_eq!(
+        conj_ret_vacuous.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert!(matches!(
+        conj_ret_vacuous.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed: 0,
+            state_mutants_killed,
+            ..
+        }) if state_mutants_killed > 0
+    ));
+
+    // Conjunctive `requires`-vacuous state axis: `*ret == old.wrapping_add(1)` pins `ret`
+    // while `(*old == 0 || *new == 42)` varies with `new` outside `requires`.
+    let conj_state_vacuous = check_stateful_contract(
+        unconstrained,
+        |old: &u32, &()| *old == 0,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            *ret == old.wrapping_add(1) && (*old == 0 || *new == 42)
+        },
+    );
+    assert_eq!(
+        conj_state_vacuous.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert!(matches!(
+        conj_state_vacuous.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed,
+            state_mutants_killed: 0,
+            ..
+        }) if return_mutants_killed > 0
+    ));
+}

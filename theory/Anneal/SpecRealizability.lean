@@ -1375,7 +1375,10 @@ def zetaBetaReduce : Nat → Expr → Expr
       .proj s i (zetaBetaReduce fuel struct)
     | other => other
 
-/-- Reduce trivial structure projections (`Meta.reduceProj?`) alongside `zetaBetaReduce`. -/
+/-- Reduce structure projections (both raw `Expr.proj` and non-class projection
+    function applications such as `Prod.snd (a, b)` or custom structure field
+    getters applied to a constructor) alongside `zetaBetaReduce`, opening binders
+    with `withLocalDecl` so `Meta.reduceProj?` never sees loose bound variables. -/
 def zetaBetaProjReduce : Nat → Expr → MetaM Expr
   | 0, e => return zetaBetaReduce 64 e
   | fuel + 1, e => do
@@ -1392,11 +1395,32 @@ def zetaBetaProjReduce : Nat → Expr → MetaM Expr
       let a' ← zetaBetaProjReduce fuel a
       match f' with
       | .lam _ _ body _ => zetaBetaProjReduce fuel (body.instantiate1 a')
-      | _ => return .app f' a'
+      | _ =>
+        let e' := Expr.app f' a'
+        if let .const fnName _ := e'.getAppFn then
+          if let some projInfo := (← getEnv).getProjectionFnInfo? fnName then
+            if !projInfo.fromClass then
+              let args := e'.getAppArgs
+              if hStruct : projInfo.numParams < args.size then
+                let structVal := args[projInfo.numParams].consumeMData
+                if structVal.getAppFn.isConstOf projInfo.ctorName then
+                  let ctorArgs := structVal.getAppArgs
+                  let fieldIdx := projInfo.numParams + projInfo.i
+                  if hField : fieldIdx < ctorArgs.size then
+                    let restArgs := args.extract (projInfo.numParams + 1) args.size
+                    let reduced := mkAppN ctorArgs[fieldIdx] restArgs
+                    return ← zetaBetaProjReduce fuel reduced
+        return e'
     | .lam n t b bi =>
-      return .lam n (← zetaBetaProjReduce fuel t) (← zetaBetaProjReduce fuel b) bi
+      let t' ← zetaBetaProjReduce fuel t
+      withLocalDecl n bi t' fun fv => do
+        let b' ← zetaBetaProjReduce fuel (b.instantiate1 fv)
+        return .lam n t' (b'.abstract #[fv]) bi
     | .forallE n t b bi =>
-      return .forallE n (← zetaBetaProjReduce fuel t) (← zetaBetaProjReduce fuel b) bi
+      let t' ← zetaBetaProjReduce fuel t
+      withLocalDecl n bi t' fun fv => do
+        let b' ← zetaBetaProjReduce fuel (b.instantiate1 fv)
+        return .forallE n t' (b'.abstract #[fv]) bi
     | other => return other
 
 /-- Check whether `e` is or reduces to natural number literal `target` (handling both
@@ -1556,7 +1580,33 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       if args[1]! == args[2]! then some .reflexiveEquality else none
     else if e.isAppOfArity ``Iff 2 then
       let args := e.getAppArgs
-      if args[0]! == args[1]! then some .tautologicalImplication else none
+      let lhs := args[0]!.consumeMData
+      let rhs := args[1]!.consumeMData
+      if lhs == rhs then
+        some .tautologicalImplication
+      else if (detectSyntacticTautology fuel hyps lhs).isSome &&
+              (detectSyntacticTautology fuel hyps rhs).isSome then
+        some .tautologicalImplication
+      else if lhs.isAppOfArity ``Eq 3 && rhs.isAppOfArity ``Eq 3 then
+        let la := lhs.getAppArgs
+        let ra := rhs.getAppArgs
+        if la[1]!.consumeMData == ra[2]!.consumeMData &&
+           la[2]!.consumeMData == ra[1]!.consumeMData then
+          some .tautologicalImplication
+        else
+          none
+      else
+        none
+    else if e.isAppOfArity ``ite 5 then
+      let args := e.getAppArgs
+      let cond := args[1]!.consumeMData
+      let tBranch := args[3]!
+      let fBranch := args[4]!
+      if (detectSyntacticTautology fuel (cond :: hyps) tBranch).isSome &&
+         (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome then
+        some .tautologicalImplication
+      else
+        none
     else if e.isAppOfArity ``Not 1 then
       let inner := e.appArg!.consumeMData
       if inner.isConstOf ``False then
@@ -1742,19 +1792,72 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
             e
         | _ => e
 
-/-- Unfold a user-defined head predicate (excluding `Init`/`Std`/`Trusted` primitives)
-    to expose constant or trivial `extraPost` definitions after boilerplate cofactoring. -/
+/-- Fast sound recognizer for boilerplate atoms whose truth value is fixed
+    independently of variables (for example `callFramePreserved m m`, which holds
+    for every `m` by `callFramePreserved_refl`). -/
+private def atomFixedTruth? (e : Expr) : Option Bool :=
+  let e := e.consumeMData
+  if e.isAppOfArity ``Trusted.VerificationResult.callFramePreserved 2 then
+    let args := e.getAppArgs
+    if args[0]!.consumeMData == args[1]!.consumeMData then
+      some true
+    else
+      none
+  else
+    none
+
+/-- Build the propositional conjunction characterizing a boilerplate fibre
+    (`atom_i` for bit `1`, `¬ atom_i` for bit `0`). -/
+private def mkFibreAssumption (atoms : Array Expr) (mask : Nat) : Expr := Id.run do
+  let mut acc? : Option Expr := none
+  for i in [:atoms.size] do
+    let b := ((mask >>> i) &&& 1) == 1
+    let lit := if b then atoms[i]! else mkApp (mkConst ``Not) atoms[i]!
+    acc? := match acc? with
+      | none => some lit
+      | some prev => some (mkApp2 (mkConst ``And) prev lit)
+  return acc?.getD (mkConst ``True)
+
+/-- Root component of a hierarchical `Name` (e.g. `Init` for `Init.Prelude`). -/
+private def nameRoot : Name → Name
+  | .str .anonymous s => .str .anonymous s
+  | .str p _ => nameRoot p
+  | .num p _ => nameRoot p
+  | .anonymous => .anonymous
+
+/-- Whether `name` is a core/standard/trusted primitive, matcher, or projection
+    that user-predicate unfolding must leave intact. -/
+private def isProtectedConst (env : Environment) (name : Name) : Bool :=
+  if name == ``True || name == ``False || name == ``And || name == ``Or ||
+     name == ``Not || name == ``Eq || name == ``Ne || name == ``Iff ||
+     name == ``Exists || name == ``LE.le || name == ``LT.lt ||
+     name == ``GE.ge || name == ``GT.gt || name == ``ite || name == ``dite ||
+     name == ``Trusted.VerificationResult.callFramePreserved ||
+     name == ``Trusted.VerificationResult.retMatchesCalleeReturnTy ||
+     env.isProjectionFn name || isMatcherCore env name then
+    true
+  else
+    match env.getModuleIdxFor? name with
+    | some idx =>
+      let mods := env.allImportedModuleNames
+      if h : idx.toNat < mods.size then
+        let root := nameRoot mods[idx.toNat]
+        root == `Init || root == `Std || root == `Lean || root == `Trusted
+      else
+        false
+    | none => false
+
+/-- Unfold a user-defined head predicate (excluding `Init`/`Std`/`Lean`/`Trusted`
+    primitives, matchers, and projections) to expose hidden definitions in `requires`
+    and `ensures` clauses. -/
 private def unfoldUserHead : Nat → Expr → MetaM Expr
   | 0, e => return zetaBetaReduce 64 e
   | fuel + 1, e => do
     let e := zetaBetaReduce 64 e
     match e.getAppFn with
     | .const name _ =>
-      let s := name.toString
-      if s.startsWith "Init." || s.startsWith "Std." || s.startsWith "Trusted." ||
-         name == ``True || name == ``False || name == ``And || name == ``Or ||
-         name == ``Not || name == ``Eq || name == ``Ne || name == ``Iff ||
-         name == ``Exists || name == ``LE.le || name == ``LT.lt then
+      let env ← getEnv
+      if isProtectedConst env name then
         return e
       match ← unfoldDefinition? e with
       | some e' =>
@@ -1762,21 +1865,50 @@ private def unfoldUserHead : Nat → Expr → MetaM Expr
       | none => return e
     | _ => return e
 
-/-- Unfold user-defined head predicates at every leaf of a conjunction, so that a
-    `requires` clause such as `defPathOk ∧ arityOk ∧ userPre args` enters the prover's
-    local context with `userPre args` already unfolded (and therefore usable by
-    `simp_all`, `omega`, and `grind`). Each step is a definitional unfolding, so the
-    result is definitionally equal to the input. -/
-private def unfoldUserConjuncts : Nat → Expr → MetaM Expr
+/-- Unfold user-defined head predicates recursively through propositional connectives
+    (`And`, `Or`, `Iff`, `Not`, non-dependent `→`, and `ite` branches), preserving
+    auto-generated boilerplate atoms. Each step is a definitional unfolding or
+    zeta/beta/projection reduction, so the result is definitionally equal to the input. -/
+private def unfoldUserConnectives : Nat → Expr → MetaM Expr
   | 0, e => return e
   | fuel + 1, e => do
-    let e ← unfoldUserHead 8 e
-    if e.isAppOfArity ``And 2 then
-      let lhs ← unfoldUserConjuncts fuel e.appFn!.appArg!
-      let rhs ← unfoldUserConjuncts fuel e.appArg!
-      return mkApp2 (mkConst ``And) lhs rhs
-    else
+    let e := e.consumeMData
+    if isBoilerplateAtom e then
       return e
+    let e1 ← unfoldUserHead 6 e
+    let e ← if e1 != e then zetaBetaProjReduce 8 e1 else pure e1
+    if isBoilerplateAtom e then
+      return e
+    if e.isAppOfArity ``And 2 then
+      let lhs ← unfoldUserConnectives fuel e.appFn!.appArg!
+      let rhs ← unfoldUserConnectives fuel e.appArg!
+      return mkApp2 (mkConst ``And) lhs rhs
+    else if e.isAppOfArity ``Or 2 then
+      let lhs ← unfoldUserConnectives fuel e.appFn!.appArg!
+      let rhs ← unfoldUserConnectives fuel e.appArg!
+      return mkApp2 (mkConst ``Or) lhs rhs
+    else if e.isAppOfArity ``Iff 2 then
+      let lhs ← unfoldUserConnectives fuel e.appFn!.appArg!
+      let rhs ← unfoldUserConnectives fuel e.appArg!
+      return mkApp2 (mkConst ``Iff) lhs rhs
+    else if e.isAppOfArity ``Not 1 then
+      let inner ← unfoldUserConnectives fuel e.appArg!
+      return mkApp (mkConst ``Not) inner
+    else if e.isAppOfArity ``ite 5 then
+      let args := e.getAppArgs
+      let t' ← unfoldUserConnectives fuel args[3]!
+      let f' ← unfoldUserConnectives fuel args[4]!
+      return mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+    else
+      match e with
+      | .forallE n dom body bi =>
+        if !body.hasLooseBVars then
+          let dom' ← unfoldUserConnectives fuel dom
+          let body' ← unfoldUserConnectives fuel body
+          return .forallE n dom' body' bi
+        else
+          return e
+      | _ => return e
 
 /-! ### Top-Level Lambda / Projection Normalization & Input/Output Splitting -/
 
@@ -1878,7 +2010,7 @@ private def withOutputCopies {α : Type} [Inhabited α]
         fun copies => pure (ovTy.replaceFVars (outVars.extract 0 copies.size) copies))
   withLocalDeclsD infos k
 
-/-- Build the output-insensitivity goal `∀ binders outs', body → body[outs := outs']`,
+/-- Build the output-insensitivity goal `∀ binders outs', (extraHyp →) body → body[outs := outs']`,
     where `binders` must bind every free variable of `body` (including `outVars`
     themselves). Proving it establishes `ForwardOutputInsensitive`, which refutes
     `PostconditionDichotomy` (`not_postconditionDichotomy_of_forwardOutputInsensitive`).
@@ -1887,12 +2019,36 @@ private def withOutputCopies {α : Type} [Inhabited α]
     `Meta.check` (for instance because another binder's type depends on an output
     variable), so an ill-typed substitution is never handed to the prover. -/
 private def mkOutputInsensitivityGoal?
-    (binders outVars : Array Expr) (body : Expr) : MetaM (Option Expr) := do
+    (binders outVars : Array Expr) (body : Expr)
+    (extraHyp? : Option Expr := none) : MetaM (Option Expr) := do
   if outVars.isEmpty then
     return none
   withOutputCopies outVars fun copies => do
     let body' := body.replaceFVars outVars copies
-    let goal ← mkForallFVars (binders ++ copies) (← mkArrow body body')
+    let core ← mkArrow body body'
+    let inner ← match extraHyp? with
+      | some hyp => mkArrow hyp core
+      | none => pure core
+    let goal ← mkForallFVars (binders ++ copies) inner
+    if ← isTypeCorrect goal then
+      return some goal
+    else
+      return none
+
+/-- Build the per-fibre output-insensitivity goal
+    `∀ binders outs', cfpReflTy → fibreAssump → fibreAssump[outs := outs'] → body → body[outs := outs']`,
+    matching `not_dichotomyModuloObservation_of_fibre_forwardInsensitive`. -/
+private def mkFibreInsensitivityGoal?
+    (binders outVars : Array Expr) (cfpReflTy fibreAssump body : Expr) :
+    MetaM (Option Expr) := do
+  if outVars.isEmpty then
+    return none
+  withOutputCopies outVars fun copies => do
+    let fa' := fibreAssump.replaceFVars outVars copies
+    let body' := body.replaceFVars outVars copies
+    let inner ← mkArrow cfpReflTy
+      (← mkArrow fibreAssump (← mkArrow fa' (← mkArrow body body')))
+    let goal ← mkForallFVars (binders ++ copies) inner
     if ← isTypeCorrect goal then
       return some goal
     else
@@ -1900,9 +2056,9 @@ private def mkOutputInsensitivityGoal?
 
 /-- How one boilerplate fibre of a `MirCallAns` postcondition treats the outputs. -/
 private inductive FibreKind : Type where
-  /-- The residual is `False` or provably unsatisfiable: the fibre accepts nothing. -/
+  /-- The residual is `False` or provably unsatisfiable on this fibre: it accepts nothing. -/
   | contradictory
-  /-- The residual mentions an output yet is tautological. -/
+  /-- The residual is tautological. -/
   | tautological (reason : EnsuresVacuityReason)
   /-- The residual accepts something but does not distinguish outputs. -/
   | insensitive
@@ -1919,9 +2075,9 @@ private inductive FibreKind : Type where
     * Phase 0 refutes `requires` (`DeadPrecondition`).
     * Phase 1 rejects subsingleton or empty output types (`UnboundReturnOutput`).
     * Phase 2 handles bodies that do not mention an output after reduction.
-    * Phase 3 cofactors `MirCallAns` bodies over their boilerplate atoms and demands a
-      fibre whose residual genuinely distinguishes outputs. Contradictory fibres are
-      pruned, so an unreachable branch can never supply the "genuine" constraint.
+    * Phase 3 cofactors `MirCallAns` bodies over their boilerplate atoms while keeping
+      each fibre's atom assumptions in scope, pruning impossible fibres so an
+      unreachable branch can never supply a "genuine" constraint.
     * Phase 4 tries to prove the body valid, unsatisfiable, or output-insensitive
       without `requires`.
     * Phase 5 repeats those probes under `requires`.
@@ -1939,32 +2095,41 @@ private def analyzeNormalizedSpec
   let allVars := preInputs ++ fixedVars ++ outVars
   let mentionsOutput (e : Expr) : Bool := e.hasAnyFVar (fun fv => outFVarIds.contains fv)
   let negate (e : Expr) : Expr := mkApp (mkConst ``Not) e
+  let cfpReflTy? : Option Expr ←
+    if isMirCallAns then
+      some <$> inferType (mkConst ``callFramePreserved_refl)
+    else
+      pure none
+  let withCfpRefl (goal : Expr) : MetaM Expr :=
+    match cfpReflTy? with
+    | some ty => mkArrow ty goal
+    | none => pure goal
 
-  -- `∀ allVars, goal`.
+  -- `∀ allVars, (cfpRefl →) goal`.
   let proveClosed (goal : Expr) : MetaM Bool := do
-    tryProveWithin budget (← mkForallFVars allVars goal)
-  -- `∀ preInputs (h_pre : requires) fixedVars outVars, goal`.
+    tryProveWithin budget (← mkForallFVars allVars (← withCfpRefl goal))
+  -- `∀ preInputs (h_pre : requires) fixedVars outVars, (cfpRefl →) goal`.
   let proveUnderRequires (preNorm goal : Expr) : MetaM Bool :=
     withLocalDeclD `h_pre preNorm fun hPre => do
       tryProveWithin budget
-        (← mkForallFVars (preInputs ++ #[hPre] ++ fixedVars ++ outVars) goal)
-  -- `∀ allVars outs', body → body[outs := outs']`.
+        (← mkForallFVars (preInputs ++ #[hPre] ++ fixedVars ++ outVars) (← withCfpRefl goal))
+  -- `∀ allVars outs', (cfpRefl →) body → body[outs := outs']`.
   let proveInsensitive (body : Expr) : MetaM Bool := do
-    match ← mkOutputInsensitivityGoal? allVars outVars body with
+    match ← mkOutputInsensitivityGoal? allVars outVars body cfpReflTy? with
     | some goal => tryProveWithin budget goal
     | none => return false
   -- The same goal with `h_pre : requires` in scope.
   let proveInsensitiveUnderRequires (preNorm body : Expr) : MetaM Bool :=
     withLocalDeclD `h_pre preNorm fun hPre => do
       let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
-      match ← mkOutputInsensitivityGoal? scopedVars outVars body with
+      match ← mkOutputInsensitivityGoal? scopedVars outVars body cfpReflTy? with
       | some goal => tryProveWithin budget goal
       | none => return false
 
   -- Phase 0: Check whether `requires` is provably unsatisfiable (`DeadPrecondition`).
-  -- The `requires` expression is exposed down to its defining lambda and its
-  -- conjuncts are unfolded, so later `requires`-aware probes see usable hypotheses
-  -- rather than an opaque `c.pre req` projection.
+  -- The `requires` expression is exposed down to its defining lambda and user
+  -- predicates under connectives are unfolded, so later `requires`-aware probes see
+  -- usable hypotheses rather than an opaque `c.pre req` projection.
   let preProp? ←
     if cfg.useRequires then
       match requiresExpr? with
@@ -1975,7 +2140,8 @@ private def analyzeNormalizedSpec
 
   let preNorm? ←
     match preProp? with
-    | some preProp => pure (some (← unfoldUserConjuncts 16 (zetaBetaReduce 64 preProp)))
+    | some preProp =>
+      pure (some (← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 preProp)))
     | none => pure none
 
   if let some preNorm := preNorm? then
@@ -1984,6 +2150,13 @@ private def analyzeNormalizedSpec
     if ← tryProveWithin budget (← mkForallFVars preInputs (negate preNorm)) then
       return .vacuous .requiresUnsatisfiable
         ["requires proved unsatisfiable for all inputs"]
+
+  -- Drop a syntactically `True` precondition after Phase 0 so later phases do not
+  -- repeat identical prover probes with a redundant `h_pre : True` hypothesis.
+  let preNorm? : Option Expr :=
+    match preNorm? with
+    | some p => if p.isConstOf ``True then none else some p
+    | none => none
 
   -- Phase 1: Subsingleton or empty output type (`UnboundReturnOutput`).
   if !outVars.isEmpty then
@@ -1997,7 +2170,7 @@ private def analyzeNormalizedSpec
       return .vacuous .subsingletonOutputType
         ["all inspected output types are subsingleton or empty"]
 
-  -- Phase 2: Bare `True` / `False`, discarded `let`/beta bindings, unused output binder.
+  -- Phase 2: Bare `True` / `False`, discarded `let`/beta/projection bindings, unused output binder.
   let rawClean := rawBody.consumeMData
   if rawClean.isConstOf ``True then
     return .vacuous .trivialConstantTrue ["ensures is syntactically True"]
@@ -2008,71 +2181,138 @@ private def analyzeNormalizedSpec
   let reducedBody ← zetaBetaProjReduce 32 rawClean
   let freeAfter := mentionsOutput reducedBody
 
+  if reducedBody.isConstOf ``False then
+    return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
+
   if freeBefore && !freeAfter then
     return .vacuous .discardedLetBinding
-      ["output variable occurs only in a discarded let/beta binding"]
+      ["output variable occurs only in a discarded let/beta/projection binding"]
 
-  if !freeAfter then
-    -- The body is input-only. It is trivial when it holds for every input,
-    -- unrealizable when it fails for every (admissible) input, and otherwise an
-    -- unbound-output specification.
-    if reducedBody.isConstOf ``True then
+  let classifyInputOnly (body : Expr) (fallbackReason : EnsuresVacuityReason)
+      (fallbackNote : String) : MetaM EnsuresCheckResult := do
+    if body.isConstOf ``True then
       return .vacuous .trivialConstantTrue ["ensures reduces to True"]
-    if reducedBody.isConstOf ``False then
+    if body.isConstOf ``False then
       return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
-    if let some tautReason := detectSyntacticTautology 32 [] reducedBody then
+    if let some tautReason := detectSyntacticTautology 32 [] body then
       return .vacuous tautReason ["input-only ensures is syntactically tautological"]
-    if ← proveClosed reducedBody then
+    if ← proveClosed body then
       return .vacuous .tautologicalByProver ["input-only ensures proved universally valid"]
-    if ← proveClosed (negate reducedBody) then
+    if ← proveClosed (negate body) then
       return .vacuous .unrealizableUnderRequires ["input-only ensures proved unsatisfiable"]
     if let some preNorm := preNorm? then
-      if ← proveUnderRequires preNorm (negate reducedBody) then
+      if ← proveUnderRequires preNorm (negate body) then
         return .vacuous .unrealizableUnderRequires
           ["input-only ensures proved unsatisfiable under requires"]
-    return .vacuous .unusedOutputBinder
-      ["output variable does not occur free in ensures body"]
+    return .vacuous fallbackReason [fallbackNote]
+
+  if !freeAfter then
+    let normInputOnly ← unfoldUserConnectives 8 reducedBody
+    return ← classifyInputOnly normInputOnly .unusedOutputBinder
+      "output variable does not occur free in ensures body"
+
+  -- Unfold user helper predicates nested under connectives (preserving boilerplate
+  -- atoms, core/trusted primitives, matchers, and projections).
+  let workBody ← unfoldUserConnectives 8 reducedBody
+  if !mentionsOutput workBody then
+    return ← classifyInputOnly workBody .outputInsensitive
+      "output variable drops out once user helper predicates are unfolded"
 
   -- Phase 3: `MirCallAns` boilerplate-atom cofactoring (`k ≤ 8`).
   let mut notes : List String := []
-  let mut fibreGenuine := false
   if isMirCallAns && cfg.userEnsuresOnly then
-    let (atoms, overflow) := collectBoilerplateAtoms 64 8 reducedBody #[]
+    let (atoms, overflow) := collectBoilerplateAtoms 64 8 workBody #[]
     if overflow then
       notes := notes ++ ["skipped boilerplate cofactoring: >8 boilerplate atoms"]
     else if !atoms.isEmpty then
-      -- Classify the residual user postcondition of one boilerplate fibre. A fibre
-      -- counts as genuine only when no probe can show its residual to be
-      -- output-insensitive (which subsumes tautological and contradictory).
-      let classifyFibre (res : Expr) : MetaM FibreKind := do
+      let cfpReflTy ← inferType (mkConst ``callFramePreserved_refl)
+      let proveFibreContra (fibreAssump res : Expr) : MetaM Bool := do
+        let body ←
+          if res.isConstOf ``True then pure (negate fibreAssump)
+          else mkArrow fibreAssump (negate res)
+        tryProveWithin budget (← mkForallFVars allVars (← mkArrow cfpReflTy body))
+      let proveFibreContraUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
+        withLocalDeclD `h_pre preNorm fun hPre => do
+          let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
+          let body ←
+            if res.isConstOf ``True then pure (negate fibreAssump)
+            else mkArrow fibreAssump (negate res)
+          tryProveWithin budget (← mkForallFVars scopedVars (← mkArrow cfpReflTy body))
+      let proveFibreInsensitive (fibreAssump res : Expr) : MetaM Bool := do
+        match ← mkFibreInsensitivityGoal? allVars outVars cfpReflTy fibreAssump res with
+        | some goal => tryProveWithin budget goal
+        | none => return false
+      let proveFibreInsensitiveUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
+        withLocalDeclD `h_pre preNorm fun hPre => do
+          let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
+          match ← mkFibreInsensitivityGoal? scopedVars outVars cfpReflTy fibreAssump res with
+          | some goal => tryProveWithin budget goal
+          | none => return false
+
+      -- Classify the residual user postcondition of one boilerplate fibre, keeping
+      -- the fibre's atom assignment in scope so impossible branches are pruned.
+      let classifyFibre (fibreAssump res : Expr) : MetaM FibreKind := do
         if res.isConstOf ``False then
           return .contradictory
-        if !mentionsOutput res then
+        if res.isConstOf ``True then
+          if ← proveFibreContra fibreAssump res then
+            return .contradictory
+          if let some preNorm := preNorm? then
+            if ← proveFibreContraUnderRequires preNorm fibreAssump res then
+              return .contradictory
           return .insensitive
-        if let some tautReason := detectSyntacticTautology 32 [] res then
-          return .tautological tautReason
-        if ← proveInsensitive res then
+        if !mentionsOutput res then
+          if ← proveFibreContra fibreAssump res then
+            return .contradictory
+          if let some preNorm := preNorm? then
+            if ← proveFibreContraUnderRequires preNorm fibreAssump res then
+              return .contradictory
+          if let some tautReason := detectSyntacticTautology 32 [] res then
+            return .tautological tautReason
           if ← proveClosed res then
             return .tautological .tautologicalByProver
-          if ← proveClosed (negate res) then
+          return .insensitive
+        if let some tautReason := detectSyntacticTautology 32 [] res then
+          if ← proveFibreContra fibreAssump (mkConst ``True) then
             return .contradictory
+          if let some preNorm := preNorm? then
+            if ← proveFibreContraUnderRequires preNorm fibreAssump (mkConst ``True) then
+              return .contradictory
+          return .tautological tautReason
+        if ← proveFibreInsensitive fibreAssump res then
+          if ← proveFibreContra fibreAssump res then
+            return .contradictory
+          if ← proveClosed res then
+            return .tautological .tautologicalByProver
           return .insensitive
         if let some preNorm := preNorm? then
-          if ← proveInsensitiveUnderRequires preNorm res then
-            if ← proveUnderRequires preNorm (negate res) then
+          if ← proveFibreInsensitiveUnderRequires preNorm fibreAssump res then
+            if ← proveFibreContraUnderRequires preNorm fibreAssump res then
               return .contradictory
             return .insensitiveUnderRequires
         return .genuine
 
       let numMasks := 1 <<< atoms.size
+      let mut feasibleMasks : Nat := 0
+      let mut fibreGenuine := false
       let mut liveFibres : Nat := 0
       let mut allLiveTrue := true
       let mut anyInsensitive := false
       let mut firstTautReason? : Option EnsuresVacuityReason := none
       for mask in [:numMasks] do
-        let rawRes := cofactorBoilerplate 64 atoms mask reducedBody
-        let res ← unfoldUserHead 8 rawRes
-        match ← classifyFibre res with
+        let mut maskFeasible := true
+        for i in [:atoms.size] do
+          if let some fixedVal := atomFixedTruth? atoms[i]! then
+            if (((mask >>> i) &&& 1) == 1) != fixedVal then
+              maskFeasible := false
+              break
+        if !maskFeasible then
+          continue
+        feasibleMasks := feasibleMasks + 1
+        let fibreAssump := mkFibreAssumption atoms mask
+        let rawRes := cofactorBoilerplate 64 atoms mask workBody
+        let res ← unfoldUserConnectives 8 rawRes
+        match ← classifyFibre fibreAssump res with
         | .contradictory => pure ()
         | .tautological tautReason =>
           liveFibres := liveFibres + 1
@@ -2096,7 +2336,7 @@ private def analyzeNormalizedSpec
         if let some tautReason := firstTautReason? then
           return .vacuous tautReason
             (notes ++ ["residual user ensures across boilerplate fibres is tautological"])
-        if allLiveTrue && liveFibres == numMasks then
+        if allLiveTrue && liveFibres == feasibleMasks then
           return .vacuous .trivialConstantTrue
             (notes ++ ["ensures is a propositional tautology over boilerplate atoms"])
         if anyInsensitive then
@@ -2106,35 +2346,34 @@ private def analyzeNormalizedSpec
           (notes ++ ["residual user ensures is output-insensitive under requires in every fibre"])
 
   -- Phase 4: Syntactic tautology & global prover checks (without `requires`).
-  if let some tautReason := detectSyntacticTautology 32 [] reducedBody then
+  if let some tautReason := detectSyntacticTautology 32 [] workBody then
     return .vacuous tautReason (notes ++ ["detected syntactic tautology"])
 
-  if ← proveClosed reducedBody then
+  if ← proveClosed workBody then
     return .vacuous .tautologicalByProver
       (notes ++ ["ensures proved universally valid independent of requires"])
 
-  if ← proveClosed (negate reducedBody) then
+  if ← proveClosed (negate workBody) then
     return .vacuous .unrealizableUnderRequires
       (notes ++ ["ensures proved unsatisfiable for all inputs and outputs"])
 
-  -- A genuine boilerplate fibre already rules out output-insensitivity of the body.
-  if !fibreGenuine then
-    if ← proveInsensitive reducedBody then
-      return .vacuous .outputInsensitive
-        (notes ++ ["ensures proved independent of the output"])
+  -- Always run the sound global output-insensitivity check: an unresolved or
+  -- unreachable boilerplate fibre in Phase 3 does not refute global insensitivity.
+  if ← proveInsensitive workBody then
+    return .vacuous .outputInsensitive
+      (notes ++ ["ensures proved independent of the output"])
 
   -- Phase 5: `requires`-aware semantic realizability and vacuity checks.
   if let some preNorm := preNorm? then
-    if ← proveUnderRequires preNorm (negate reducedBody) then
+    if ← proveUnderRequires preNorm (negate workBody) then
       return .vacuous .unrealizableUnderRequires
         (notes ++ ["ensures proved unsatisfiable under requires"])
-    if ← proveUnderRequires preNorm reducedBody then
+    if ← proveUnderRequires preNorm workBody then
       return .vacuous .vacuousUnderRequires
         (notes ++ ["ensures proved vacuously true for all outputs under requires"])
-    if !fibreGenuine then
-      if ← proveInsensitiveUnderRequires preNorm reducedBody then
-        return .vacuous .outputInsensitiveUnderRequires
-          (notes ++ ["ensures proved independent of the output under requires"])
+    if ← proveInsensitiveUnderRequires preNorm workBody then
+      return .vacuous .outputInsensitiveUnderRequires
+        (notes ++ ["ensures proved independent of the output under requires"])
 
   return .ok notes
 
@@ -2182,11 +2421,14 @@ def checkEnsuresBindsOutput
       -- Apply `ensuresExposed` to `allArgs` and perform ONLY head beta reduction so
       -- internal `let _ := ret; ...` bindings are preserved for Phase 2 detection.
       let rawBody := (mkAppN ensuresExposed allArgs).headBeta
-      -- Shape 2: Stateful `(args, mem, ret, mem')` where last binder is `Memory`.
+      -- Shape 2: Stateful `(inputs..., mem : Memory, ret, mem' : Memory)`.
+      -- Requiring `allArgs[n - 3]` to also have type `Memory` avoids misclassifying
+      -- ordinary stateless 4-argument functions returning `Memory` as stateful specs.
       let isStateful4 ← do
         if n >= 4 && lastTy.isConstOf ``Memory then
+          let preMemTy ← whnf (← inferType allArgs[n - 3]!)
           let prevTy ← whnf (← inferType allArgs[n - 2]!)
-          pure (!prevTy.isConstOf ``Memory)
+          pure (preMemTy.isConstOf ``Memory && !prevTy.isConstOf ``Memory)
         else
           pure false
       if isStateful4 then
@@ -2278,18 +2520,22 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
   let budget ← ProbeBudget.init cfg
   let reqExposed ← exposeHeadLambda 16 requiresExpr
   let reqTy ← inferType reqExposed
-  forallTelescopeReducing reqTy fun inputs _ => do
+  forallTelescopeReducing reqTy fun inputs retSort => do
+    if !(← isDefEq retSort (mkSort Level.zero)) then
+      return {
+        satisfiable? := none
+        reason := "precondition expression does not return Prop"
+      }
     let rawBody := (mkAppN reqExposed inputs).headBeta
-    let normBody ← unfoldUserHead 8 (zetaBetaReduce 64 rawBody)
+    let normBody ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 rawBody)
     if normBody.isConstOf ``False then
       return { satisfiable? := some false, reason := "precondition is syntactically False" }
-    if let some cap ← budget.nextCap? then
-      let unsatGoal ← mkForallFVars inputs (mkApp (mkConst ``Not) rawBody)
-      if ← tryProve unsatGoal cap then
-        return {
-          satisfiable? := some false
-          reason := "precondition proved unsatisfiable for all inputs"
-        }
+    let unsatGoal ← mkForallFVars inputs (mkApp (mkConst ``Not) normBody)
+    if ← tryProveWithin budget unsatGoal then
+      return {
+        satisfiable? := some false
+        reason := "precondition proved unsatisfiable for all inputs"
+      }
     if normBody.isConstOf ``True then
       -- `True` is satisfiable exactly when every input type is inhabited. A
       -- proposition-typed input (a hypothesis binder) counts only if an instance
@@ -2309,7 +2555,7 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
     -- Try instantiating inputs with canonical default witnesses (e.g. `0`, `[]`, `emptyMemory`).
     -- The type of a dependent input is instantiated with the witnesses already chosen
     -- for the inputs it depends on, so the instantiated precondition stays well-typed
-    -- (and `tryProve` re-checks type-correctness before attempting a proof).
+    -- (and `tryProveWithin` re-checks type-correctness before attempting a proof).
     let mut witnesses : Array Expr := #[]
     let mut allWitnessed := true
     for inp in inputs do
@@ -2320,20 +2566,19 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
         allWitnessed := false
         break
     if allWitnessed then
-      if let some cap ← budget.nextCap? then
-        let instGoal := (mkAppN reqExposed witnesses).headBeta
-        if ← tryProve instGoal cap then
-          return {
-            satisfiable? := some true
-            reason := "precondition proved satisfiable via canonical witness"
-          }
-    if let some cap ← budget.nextCap? then
-      let satGoal ← mkNestedExists inputs rawBody
-      if ← tryProve satGoal cap then
+      let instRaw := (mkAppN reqExposed witnesses).headBeta
+      let instGoal ← unfoldUserConnectives 16 (← zetaBetaProjReduce 32 instRaw)
+      if ← tryProveWithin budget instGoal then
         return {
           satisfiable? := some true
-          reason := "precondition proved satisfiable"
+          reason := "precondition proved satisfiable via canonical witness"
         }
+    let satGoal ← mkNestedExists inputs normBody
+    if ← tryProveWithin budget satGoal then
+      return {
+        satisfiable? := some true
+        reason := "precondition proved satisfiable"
+      }
     return {
       satisfiable? := none
       reason := "precondition satisfiability undecided within bounded budget"

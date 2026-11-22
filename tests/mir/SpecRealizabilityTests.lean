@@ -1249,6 +1249,250 @@ theorem absurdHypRequires_unsatisfiable :
   unless absurdSat.satisfiable? == some false do
     throwError "expected absurdHypRequires unsatisfiable, got {repr absurdSat}"
 
+/-! ### 3.9 Unreachable Boilerplate Fibres & Input-Only Boilerplate Residuals -/
+
+open scoped Classical in
+/-- Tautological frame atom (`callFramePreserved req.memory req.memory`) cannot hide an
+    unbound return value behind its impossible `else` branch. -/
+def reflMaskBypassContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if callFramePreserved req.memory req.memory then
+        callFramePreserved req.memory memAfter
+      else
+        retVal = .unit
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+theorem reflMaskBypass_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy reflMaskBypassContract := by
+  rintro ⟨req, m, v_ok, v_bad, _, hOk, hBad⟩
+  have hRefl : callFramePreserved req.memory req.memory := callFramePreserved_refl req.memory
+  have hOk' : if callFramePreserved req.memory req.memory then
+      callFramePreserved req.memory m else v_ok = .unit := hOk
+  rw [ite_eq_left hRefl] at hOk'
+  apply hBad
+  show if callFramePreserved req.memory req.memory then
+    callFramePreserved req.memory m else v_bad = .unit
+  rw [ite_eq_left hRefl]
+  exact hOk'
+
+open scoped Classical in
+/-- `memAfter = req.memory` implies `callFramePreserved req.memory memAfter`, so the
+    `else` branch constraining `retVal` is unreachable. -/
+def eqMemMaskBypassContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      memAfter = req.memory ∧
+      (if callFramePreserved req.memory memAfter then
+        True
+      else
+        retVal = .unit)
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+theorem eqMemMaskBypass_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy eqMemMaskBypassContract := by
+  rintro ⟨req, m, v_ok, v_bad, _, hOk, hBad⟩
+  have hEq : m = req.memory := hOk.1
+  have hFrame : callFramePreserved req.memory m := by
+    rw [hEq]
+    exact callFramePreserved_refl req.memory
+  apply hBad
+  refine ⟨hEq, ?_⟩
+  show if callFramePreserved req.memory m then True else v_bad = .unit
+  rw [ite_eq_left hFrame]
+  trivial
+
+/-- Contradictory input-only residual behind a boilerplate guard is `SpecViolation`,
+    not `UnboundReturnOutput`. -/
+def contraInputOnlyBoilerplateContract : MirCallContract := {
+  pre := fun req => req.args = []
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∧ req.args ≠ []
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem contraInputOnlyBoilerplate_not_realizable :
+    ¬ MirCallContractRealizable contraInputOnlyBoilerplateContract := by
+  rintro ⟨req, _, _, hPre, _, hNe⟩
+  exact hNe hPre
+
+/-- Tautological input-only disjunct beside a boilerplate atom is `TrivialPostcondition`. -/
+def tautInputOnlyBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∨ req.args = req.args
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem tautInputOnlyBoilerplate_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy tautInputOnlyBoilerplateContract := by
+  rintro ⟨_, _, _, _, _, _, _, hBad⟩
+  exact hBad (Or.inr rfl)
+
+#eval assertDeclEnsuresVacuous ``reflMaskBypassContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``reflMaskBypassContract (some .unboundReturnOutput)
+  { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``eqMemMaskBypassContract (some .unboundReturnOutput)
+  { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``eqMemMaskBypassContract (some .unboundReturnOutput)
+  { strictReturnValue := true, userEnsuresOnly := false }
+#eval assertDeclEnsuresVacuous ``contraInputOnlyBoilerplateContract (some .specViolation)
+#eval assertDeclEnsuresVacuous ``tautInputOnlyBoilerplateContract (some .trivialPostcondition)
+
+/-! ### 3.10 Projection Reduction, Nested Helper Predicates & Syntactic Disguises -/
+
+/-- Custom two-field structure with no `@[simp]` lemmas on its projections. -/
+structure PairBox (α β : Type) : Type where
+  fst : α
+  snd : β
+
+def projDiscardStatefulClaim : StatefulClaim := {
+  body := statefulCounterStepBody
+  pre := fun _ _ => True
+  post := fun _ mem retVal mem' => (PairBox.mk retVal mem').snd = mem
+}
+
+theorem projDiscardStateful_not_returnDichotomy :
+    ¬ StatefulClaimReturnDichotomy projDiscardStatefulClaim :=
+  not_statefulClaimReturnDichotomy_of_returnInsensitive
+    (fun _ _ _ _ _ _ h => h)
+
+def prodSndDiscardStatefulClaim : StatefulClaim := {
+  body := statefulCounterStepBody
+  pre := fun _ _ => True
+  post := fun _ mem retVal mem' => (retVal, mem').2 = mem
+}
+
+theorem prodSndDiscardStateful_not_returnDichotomy :
+    ¬ StatefulClaimReturnDichotomy prodSndDiscardStatefulClaim :=
+  not_statefulClaimReturnDichotomy_of_returnInsensitive
+    (fun _ _ _ _ _ _ h => h)
+
+/-- Genuine postcondition projecting a binder-local variable under `∀` (must not
+    trigger loose-bvar errors in `zetaBetaProjReduce`). -/
+def quantifiedProjPost (x ret : Nat) : Prop :=
+  ∀ p : Nat × Nat, p.1 = x → ret = x
+
+theorem quantifiedProjPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) quantifiedProjPost := by
+  refine ⟨0, trivial, ⟨0, fun _ _ => rfl⟩, ⟨1, ?_⟩⟩
+  intro hAll
+  have hEq : (1 : Nat) = 0 := hAll (0, 0) rfl
+  exact Nat.succ_ne_zero 0 hEq
+
+def discardedLetFalsePost (_x ret : Nat) : Prop :=
+  let _ := ret
+  False
+
+theorem discardedLetFalse_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) discardedLetFalsePost := by
+  rintro ⟨_, _, _, hFalse⟩
+  exact hFalse
+
+def helperIgnoreRet (_ret : Nat) : Prop := True
+def helperReflRet (ret : Nat) : Prop := ret = ret
+
+def conjHelperIgnorePost (x ret : Nat) : Prop :=
+  x < 100 ∧ helperIgnoreRet ret
+
+def disjHelperReflPost (x ret : Nat) : Prop :=
+  x < 100 ∨ helperReflRet ret
+
+def symmEqIffPost (x ret : Nat) : Prop :=
+  (ret = x) ↔ (x = ret)
+
+def iteTautPost (x ret : Nat) : Prop :=
+  if x < 10 then ret = ret else True
+
+theorem conjHelperIgnorePost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) conjHelperIgnorePost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ _ h => ⟨h.1, trivial⟩)
+
+theorem disjHelperReflPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) disjHelperReflPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => Or.inr rfl)
+
+theorem symmEqIffPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) symmEqIffPost :=
+  not_postconditionDichotomy_of_trivial (fun _ _ _ => ⟨Eq.symm, Eq.symm⟩)
+
+theorem iteTautPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) iteTautPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    show if x < 10 then ret = ret else True
+    split
+    · rfl
+    · trivial)
+
+#eval assertDeclEnsuresVacuous ``projDiscardStatefulClaim (some .unboundReturnOutput)
+  { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``prodSndDiscardStatefulClaim (some .unboundReturnOutput)
+  { strictReturnValue := true }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``quantifiedProjPost)
+#eval assertEnsuresVacuous (Lean.mkConst ``discardedLetFalsePost) none (some .specViolation)
+#eval assertEnsuresVacuous (Lean.mkConst ``conjHelperIgnorePost) none (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``disjHelperReflPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``symmEqIffPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``iteTautPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+
+/-! ### 3.11 Stateless `Memory`-Returning Specs & Conjunctive `requires` Unfolding -/
+
+def statelessMemBuilderPre (a b c : Nat) : Prop := a + b + c < 100
+def statelessMemBuilderPost (a _b _c : Nat) (ret : Memory) : Prop := ret.nextTag = a
+def statelessMemBuilderBadPost (_a _b c : Nat) (_ret : Memory) : Prop := c = 0
+
+theorem statelessMemBuilder_dichotomy :
+    PostconditionDichotomy
+      (fun t : Nat × Nat × Nat => statelessMemBuilderPre t.1 t.2.1 t.2.2)
+      (fun t ret => statelessMemBuilderPost t.1 t.2.1 t.2.2 ret) := by
+  refine ⟨(1, 0, 0), by dsimp [statelessMemBuilderPre]; decide,
+    ⟨emptyMemory, rfl⟩,
+    ⟨{ emptyMemory with nextTag := 2 }, ?_⟩⟩
+  intro hEq
+  dsimp [statelessMemBuilderPost, emptyMemory] at hEq
+  omega
+
+def hiddenContraClause (x : Nat) : Prop := x > 5 ∧ x < 3
+def conjHiddenContraPre (x : Nat) : Prop := x < 100 ∧ hiddenContraClause x
+
+theorem conjHiddenContraPre_not_satisfiable :
+    ¬ PreconditionSatisfiable conjHiddenContraPre := by
+  rintro ⟨x, hPre⟩
+  rcases hPre with ⟨_, hClause⟩
+  rcases hClause with ⟨hGt, hLt⟩
+  omega
+
+#eval assertEnsuresBindsOutput
+  (Lean.mkConst ``statelessMemBuilderPost) (some (Lean.mkConst ``statelessMemBuilderPre))
+#eval assertEnsuresBindsOutput
+  (Lean.mkConst ``statelessMemBuilderPost) (some (Lean.mkConst ``statelessMemBuilderPre))
+  { strictReturnValue := true }
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``statelessMemBuilderBadPost) (some (Lean.mkConst ``statelessMemBuilderPre))
+  (some .unboundReturnOutput)
+#eval show Lean.Meta.MetaM Unit from do
+  let res ← checkRequiresSatisfiable (Lean.mkConst ``conjHiddenContraPre)
+  unless res.satisfiable? == some false do
+    throwError "expected conjHiddenContraPre unsatisfiable, got {repr res}"
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
