@@ -1999,20 +1999,20 @@ theorem wit_constValidatePlace150_vendored_eq_noFuel
     ValidityVisitor.constValidatePlace deepPatternHooks () 454
         ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
         ⟨"ConstRoot", #[]⟩ tracking mode =
-      RealVisit.realConstValidatePlaceNoFuel deepPatternHooks () id
+      RealVisit.realConstValidatePlaceNoFuel deepPatternHooks () (fun _ => id)
         ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
         ⟨"ConstRoot", #[]⟩ tracking mode :=
-  RealVisit.vendored_constValidatePlace_eq_noFuel deepPatternHooks () id
-    RealVisit.deepGood (fun _ => false) RealVisit.deepPattern_visitHooksDescend
-    RealVisit.deepPattern_unionHooksDescend 0
-    (fun p _ hp _ hunsz _ => by
+  RealVisit.vendored_constValidatePlace_eq_noFuel deepPatternHooks () (fun _ => id)
+    RealVisit.deepGood (fun _ => false) (fun _ => RealVisit.deepPattern_visitHooksDescend)
+    (fun _ => RealVisit.deepPattern_unionHooksDescend) 0
+    (fun _ p _ hp _ hunsz _ => by
       cases hp_ref : p.ref with
       | «local» => simp [RealVisit.deepGood, hp_ref] at hp
       | memory _ =>
         simp only [RealVisit.deepGood, hp_ref, decide_eq_true_eq] at hp
         rw [hp] at hunsz
         cases hunsz)
-    454 _ _ tracking mode (by decide +kernel) (by decide +kernel)
+    454 _ _ tracking mode (by decide +kernel) (fun _ => by decide +kernel)
 
 /-- Fuelled `RefTracking.next` loop (`drainPointeesFuel`) agrees with `drainPointees` when
 `remaining ≥ todo.size` and exhausts with `"recursive validity tracker fuel"` when `remaining < todo.size`. -/
@@ -2037,7 +2037,8 @@ theorem wit_lifo3Ref_validatePlace_visits_reverse_order :
     let arrayRoot : RuntimePlace CtfeProvenance :=
       ⟨.memory ⟨⟨Size.ZERO, some RealVisit.witnessProv⟩, .none, none⟩, RealVisit.lifoArrayLayout⟩
     let typeRank : Miri.MIR.TyId → Nat := fun ty => if ty == 2 then 1 else 0
-    (match RealVisit.realValidatePlaceNoFuel RealVisit.lifo3RefHooks () typeRank arrayRoot true false #[] with
+    (match RealVisit.realValidatePlaceNoFuel RealVisit.lifo3RefHooks () (fun _ => typeRank) arrayRoot
+        true false #[] with
      | .error (.undefinedBehavior msg) visitedOffsets =>
        visitedOffsets == #[16, 8, 0] && msg.startsWith "validation[0]"
      | _ => false) = true :=

@@ -2628,26 +2628,28 @@ private def resetPaddingMirrored (h : Hooks P S C E F A Pad) (c : C) (session : 
   let writes ← liftResult ((paddingWrites ranges start size).mapError fun error => .invalidProgram s!"padding: {repr error}")
   for range in writes do h.writePadding c handle range
 
-/-- **Fuel-free `constValidatePlace` (`lean-miri#90` L787–797)** over `realVisitNoFuel`. -/
+/-- **Fuel-free `constValidatePlace` (`lean-miri#90` L787–797)** over `realVisitNoFuel`. As in
+`lean-miri#90` (`visit h c (h.typeRank (← get)) …`), the Schema 17 rank map is read from the machine
+state at the visit site (`typeRankOf (← get)`), not fixed up front. -/
 def realConstValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
     (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
     M S (RefTracking (Key P) ValidationPath) := h.withGhostValidation do
   let session : Session P :=
     { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none }
-  let session ← realVisitNoFuel h c typeRank session place
+  let session ← realVisitNoFuel h c (typeRankOf (← get)) session place
   match session.refTracking with
   | some tracking => return tracking
   | none => throw (.invalidProgram "const validation lost tracker")
 
 /-- **`Classical.choice`-free structural companion of `realConstValidatePlaceNoFuel`** via `realVisitLexRank`. -/
 def realConstValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
     (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
     M S (RefTracking (Key P) ValidationPath) := h.withGhostValidation do
   let session : Session P :=
     { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none }
-  let session ← realVisitLexRank h c typeRank session place
+  let session ← realVisitLexRank h c (typeRankOf (← get)) session place
   match session.refTracking with
   | some tracking => return tracking
   | none => throw (.invalidProgram "const validation lost tracker")
@@ -2655,49 +2657,48 @@ def realConstValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
 /-- Unconditional equality between `Classical.choice`-free `realConstValidatePlaceLexRank` and
 `realConstValidatePlaceNoFuel`. -/
 theorem realConstValidatePlaceLexRank_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
     (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
-    realConstValidatePlaceLexRank h c typeRank place path tracking mode =
-      realConstValidatePlaceNoFuel h c typeRank place path tracking mode := by
+    realConstValidatePlaceLexRank h c typeRankOf place path tracking mode =
+      realConstValidatePlaceNoFuel h c typeRankOf place path tracking mode := by
   unfold realConstValidatePlaceLexRank realConstValidatePlaceNoFuel
-  dsimp only
-  rw [realVisitLexRank_eq_noFuel]
+  simp only [realVisitLexRank_eq_noFuel]
 
-/-- **Real vendored `constValidatePlace` adequacy.** Whenever `fuel > visitFuelBound maxSized typeRank place.layout`,
-the unmodified vendored `Miri.Interpreter.ValidityVisitor.constValidatePlace` agrees identically
-with `realConstValidatePlaceNoFuel`. -/
+/-- **Real vendored `constValidatePlace` adequacy.** Whenever, for every machine state `σ` the
+rank map `typeRankOf σ` may be read in, the hooks descend and
+`fuel > visitFuelBound maxSized (typeRankOf σ) place.layout`, the unmodified vendored
+`Miri.Interpreter.ValidityVisitor.constValidatePlace` agrees identically with
+`realConstValidatePlaceNoFuel`. -/
 theorem vendored_constValidatePlace_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
-    (hd : VisitHooksDescend h c typeRank good goodU)
-    (hdU : UnionHooksDescend h c typeRank (fun l => goodU l = true)) (maxSized : Nat)
-    (hmax : ∀ parent child : RuntimePlace P, good parent = true → good child = true →
+    (typeRankOf : S → MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hd : ∀ σ, VisitHooksDescend h c (typeRankOf σ) good goodU)
+    (hdU : ∀ σ, UnionHooksDescend h c (typeRankOf σ) (fun l => goodU l = true)) (maxSized : Nat)
+    (hmax : ∀ σ, ∀ parent child : RuntimePlace P, good parent = true → good child = true →
       parent.layout.layout.isSized = false → child.layout.layout.isSized = true →
-      layoutOrder typeRank child.layout ≤ maxSized)
+      layoutOrder (typeRankOf σ) child.layout ≤ maxSized)
     (fuel : Nat) (place : RuntimePlace P) (path : ValidationPath)
     (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode)
-    (hp : good place = true) (hfuel : visitFuelBound maxSized typeRank place.layout < fuel) :
+    (hp : good place = true)
+    (hfuel : ∀ σ, visitFuelBound maxSized (typeRankOf σ) place.layout < fuel) :
     ValidityVisitor.constValidatePlace h c fuel place path tracking mode =
-      realConstValidatePlaceNoFuel h c typeRank place path tracking mode := by
+      realConstValidatePlaceNoFuel h c typeRankOf place path tracking mode := by
+  have hv : ∀ (σ : S) (session : Session P),
+      realVisitNoFuel h c (typeRankOf σ) session place =
+        ValidityVisitor.visit h c fuel session place := fun σ session =>
+    (vendored_visit_eq_noFuel h c (typeRankOf σ) good goodU (hd σ) (hdU σ) maxSized (hmax σ)
+      fuel session place hp (hfuel σ)).symm
   unfold ValidityVisitor.constValidatePlace realConstValidatePlaceNoFuel
-  change h.withGhostValidation (do
-      let session ← ValidityVisitor.visit h c fuel
-        { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none } place
-      match session.refTracking with
-      | some tracking => pure tracking
-      | none => throw (.invalidProgram "const validation lost tracker")) =
-    h.withGhostValidation (do
-      let session ← realVisitNoFuel h c typeRank
-        { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none } place
-      match session.refTracking with
-      | some tracking => pure tracking
-      | none => throw (.invalidProgram "const validation lost tracker"))
-  rw [vendored_visit_eq_noFuel h c typeRank good goodU hd hdU maxSized hmax fuel _ place hp hfuel]
+  simp only [hv]
+  rfl
 
 /-- **Fuel-free `validatePlace` (`lean-miri#90` L746–784)**: validates the root place via
 `realVisitNoFuel`, then drains tracked pointees in LIFO order via `drainPointees` (`todo.reverse`)
-under `pointeeSession` without arbitrary `"recursive validity tracker fuel"`. -/
+under `pointeeSession` without arbitrary `"recursive validity tracker fuel"`. As in `lean-miri#90`,
+the rank map is re-read from the current machine state (`typeRankOf (← get)`) at the root visit and
+again at *each* pointee visit. -/
 def realValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) : M S Unit := do
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) :
+    M S Unit := do
   let name ← h.typeName c place.layout.ty
   let initial : Session P := {
     path := ⟨name, #[]⟩, flags := ⟨reset, false⟩, ctfeMode := none
@@ -2706,7 +2707,7 @@ def realValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
     let mut session := initial
     if reset then
       if let .indirect _ := (← h.toOp c place).op then session := { session with dataBytes := some .empty }
-    session ← realVisitNoFuel h c typeRank session place
+    session ← realVisitNoFuel h c (typeRankOf (← get)) session place
     resetPaddingMirrored h c session place
     return session
   if recursive then
@@ -2714,12 +2715,13 @@ def realValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
     drainPointees tracking fun key path =>
       h.withGhostValidation do
         let child : RuntimePlace P := ⟨.memory key.mplace, key.layout⟩
-        let visited ← realVisitNoFuel h c typeRank (pointeeSession path) child
+        let visited ← realVisitNoFuel h c (typeRankOf (← get)) (pointeeSession path) child
         resetPaddingMirrored h c visited child
 
 /-- **`Classical.choice`-free structural companion of `realValidatePlaceNoFuel`** via `realVisitLexRank`. -/
 def realValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) : M S Unit := do
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) :
+    M S Unit := do
   let name ← h.typeName c place.layout.ty
   let initial : Session P := {
     path := ⟨name, #[]⟩, flags := ⟨reset, false⟩, ctfeMode := none
@@ -2728,7 +2730,7 @@ def realValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
     let mut session := initial
     if reset then
       if let .indirect _ := (← h.toOp c place).op then session := { session with dataBytes := some .empty }
-    session ← realVisitLexRank h c typeRank session place
+    session ← realVisitLexRank h c (typeRankOf (← get)) session place
     resetPaddingMirrored h c session place
     return session
   if recursive then
@@ -2736,15 +2738,15 @@ def realValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
     drainPointees tracking fun key path =>
       h.withGhostValidation do
         let child : RuntimePlace P := ⟨.memory key.mplace, key.layout⟩
-        let visited ← realVisitLexRank h c typeRank (pointeeSession path) child
+        let visited ← realVisitLexRank h c (typeRankOf (← get)) (pointeeSession path) child
         resetPaddingMirrored h c visited child
 
 /-- Unconditional equality between `Classical.choice`-free `realValidatePlaceLexRank` and
 `realValidatePlaceNoFuel` (both root and LIFO pointee sub-traversals). -/
 theorem realValidatePlaceLexRank_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
-    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) :
-    realValidatePlaceLexRank h c typeRank place recursive reset =
-      realValidatePlaceNoFuel h c typeRank place recursive reset := by
+    (typeRankOf : S → MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) :
+    realValidatePlaceLexRank h c typeRankOf place recursive reset =
+      realValidatePlaceNoFuel h c typeRankOf place recursive reset := by
   unfold realValidatePlaceLexRank realValidatePlaceNoFuel
   simp only [realVisitLexRank_eq_noFuel]
 
@@ -2762,9 +2764,16 @@ private theorem list_dropLast_snoc {α : Type} :
     show x :: ((y :: zs).dropLast ++ [(y :: zs)[n]'(by omega)]) = x :: y :: zs
     rw [list_dropLast_snoc (y :: zs) n hlen']
 
-/-- Structural (`Nat.rec`, `Classical.choice`-free) model of the vendored `validatePlace`
-`RefTracking.next` worklist loop (`ValidityVisitor.lean` L543–556), consuming 1 unit of
-`"recursive validity tracker fuel"` per popped pointee. -/
+/-- Structural (`Nat.rec`, `Classical.choice`-free) *model* of the body of the vendored
+`validatePlace` `RefTracking.next` worklist loop (`ValidityVisitor.lean` L543–556), consuming 1 unit
+of `"recursive validity tracker fuel"` per popped pointee.
+
+It is a model, not a mirror: the vendored `while continueLoop do …` elaborates to
+`Lean.Loop.forIn` / `repeatM`, whose implementation `repeatM.impl` is an `opaque` constant with no
+unfolding equations (and pulls `Classical.choice` into `ValidityVisitor.validatePlace`, see the
+`#guard_msgs` pin in §8). No theorem can therefore relate the vendored loop's behaviour to anything;
+`lean-miri#90`'s replacement `for (key, path) in tracking.todo.reverse do …` is a structural
+`forIn` over a finite array, which `drainPointees` mirrors. -/
 def drainPointeesFuel {P S : Type} :
     Nat → RefTracking (Key P) ValidationPath → (Key P → ValidationPath → M S Unit) → M S Unit
   | 0, tracking, _ =>
@@ -3447,7 +3456,7 @@ theorem lifo3Ref_validatePlace_visits_reverse_order :
     let arrayRoot : RuntimePlace CtfeProvenance :=
       ⟨.memory ⟨⟨Size.ZERO, some witnessProv⟩, .none, none⟩, lifoArrayLayout⟩
     let typeRank : MIR.TyId → Nat := fun ty => if ty == 2 then 1 else 0
-    (match realValidatePlaceNoFuel lifo3RefHooks () typeRank arrayRoot true false #[] with
+    (match realValidatePlaceNoFuel lifo3RefHooks () (fun _ => typeRank) arrayRoot true false #[] with
      | .error (.undefinedBehavior msg) visitedOffsets =>
        visitedOffsets == #[16, 8, 0] && msg.startsWith "validation[0]"
      | _ => false) = true := by
@@ -3521,6 +3530,17 @@ and `Nat.rec × Nat.rec`) companions (`RankedWalk.walkRank`, `VisitLexWalk.walkR
 /-- info: 'LeanMiriSpec.ValidationRankCert.RealVisit.realVisitLexRank' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms RealVisit.realVisitLexRank
+
+/- The vendored fuelled `validatePlace` already depends on `Classical.choice` *today* (its `while`
+loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structural LIFO drain
+(`RealVisit.realValidatePlaceLexRank` below) is `Classical.choice`-free. -/
+/-- info: 'Miri.Interpreter.ValidityVisitor.validatePlace' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs in
+#print axioms ValidityVisitor.validatePlace
+
+/-- info: 'Miri.Interpreter.ValidityVisitor.visit' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms ValidityVisitor.visit
 
 /-- info: 'LeanMiriSpec.ValidationRankCert.RealVisit.realValidatePlaceLexRank' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
