@@ -3476,7 +3476,9 @@ differ observably from their post-borrowck erasure:
   with `SetDiscriminant(_l, vIdx)` on any initialized enum aggregate without `.uninit`
   fields when the cast preserves the resolved type and touches no union, whereas on an
   uninitialized enum local (`LocalSlot.uninit`) `SetDiscriminant((_l as T), vIdx)` faults
-  with `.ub` while `SetDiscriminant(_l, vIdx)` initializes the enum shell and steps.
+  with `.ub` while `SetDiscriminant(_l, vIdx)` initializes the enum shell and steps; and
+  where the root place has no enum payload to pad (`padSetDiscriminantInitFields? = none`,
+  as for every local when `decls = []`) both fail closed with `.ub`, for any root aggregate.
 Unreachable for captured bodies (`MirPhase::Runtime` forbids `OpaqueCast`,
 `opaqueCast_leanMiri_phase_boundary`); tracked as `DIV-TR-OPAQUECAST-ROOT-DISPATCH` in
 `scripts/run_nightly_verification_suite.py`. -/
@@ -3565,7 +3567,20 @@ theorem opaqueCast_trusted_root_dispatch_divergence
               borrows := invalidateConflictingBorrows s.memory.borrows l none
                 (length s.memory.callStack) }) ∧
         evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts ≠
-          evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts)) := by
+          evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts) ∧
+     (∀ (s : MachineState) (decls : List LocalDecl) (oldVi vIdx : VariantIdx)
+        (fields : List Value) (span : String),
+      get? s.frame.locals l = some (.init (.aggregate oldVi fields)) →
+      placeTyResolved decls layouts ⟨l, [.opaqueCast t]⟩ = placeTyResolved decls layouts ⟨l, []⟩ →
+      placeTouchesUnion decls layouts ⟨l, [.opaqueCast t]⟩ = false →
+      padSetDiscriminantInitFields? decls layouts ⟨l, []⟩ vIdx fields = none →
+      evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+          MirStepNode.fail .ub ∧
+        evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts = MirStepNode.fail .ub) ∧
+     (∀ (s : MachineState) (oldVi vIdx : VariantIdx) (fields : List Value) (span : String),
+      get? s.frame.locals l = some (.init (.aggregate oldVi fields)) →
+      evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ [] layouts =
+        evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ [] layouts)) := by
   have hrd : ∀ (ls : List LocalSlot) (w : Value), valueContainsUninit w = false →
       readProjectedValue ls w [.opaqueCast t] = .ok w := by
     intro ls w hw
@@ -3657,7 +3672,7 @@ theorem opaqueCast_trusted_root_dispatch_divergence
     simp only [MirStepNode.step, advanceStmt, Option.some.injEq] at hl
     rw [hl, hgetU] at hgetIU
     cases hgetIU
-  · refine ⟨?_, ?_⟩
+  · refine ⟨?_, ?_, ?_, ?_⟩
     · intro s decls oldVi vIdx fields fields' span hv hnoUninit htyR hpu hpad hvalW
       obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init (.aggregate vIdx fields')) hv
       have hpadOc : padSetDiscriminantInitFields? decls layouts ⟨l, [.opaqueCast t]⟩ vIdx fields =
@@ -3712,6 +3727,32 @@ theorem opaqueCast_trusted_root_dispatch_divergence
       rw [hsdOc, hsdRoot]
       intro h
       simp [MirStepNode.fail, MirStepNode.step] at h
+    · intro s decls oldVi vIdx fields span hv htyR hpu hpad
+      have hpadOc : padSetDiscriminantInitFields? decls layouts ⟨l, [.opaqueCast t]⟩ vIdx fields =
+          none := by
+        simpa only [padSetDiscriminantInitFields?, htyR] using hpad
+      refine ⟨?_, by simp only [evalStmt, hv, hpad]⟩
+      cases hc : valueContainsUninit (.aggregate oldVi fields) with
+      | false =>
+        have hrdAgg := hrd s.frame.locals (.aggregate oldVi fields) hc
+        simp only [evalStmt, evalOperand, hv, hpu, hrdAgg, hpadOc]
+      | true =>
+        have hrdUb : readProjectedValue s.frame.locals (.aggregate oldVi fields) [.opaqueCast t] =
+            .ub := by
+          rw [(opaqueCast_trusted_traversal_universal s.frame.locals (.aggregate oldVi fields)
+            (.aggregate oldVi fields) t []).1]
+          simp only [valueContainsUninit] at hc
+          simp only [readProjectedValue, hc]
+        simp only [evalStmt, evalOperand, hv, hpu, hrdUb]
+    · intro s oldVi vIdx fields span hv
+      have hpad1 : padSetDiscriminantInitFields? [] layouts ⟨l, [.opaqueCast t]⟩ vIdx fields = none := by
+        simp [padSetDiscriminantInitFields?, placeTyResolved, get?]
+      have hpad2 : padSetDiscriminantInitFields? [] layouts ⟨l, []⟩ vIdx fields = none := by
+        simp [padSetDiscriminantInitFields?, placeTyResolved, get?]
+      simp only [evalStmt, evalOperand, hv, readProjectedValue, hpad2]
+      cases valueContainsUninit (Value.aggregate oldVi fields) with
+      | true => rfl
+      | false => simp only [hpad1]
 
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
@@ -4071,7 +4112,7 @@ theorem opaqueCast_witness_root_dispatch :
       (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩]))) [u32Decl "_0", ocEnumDecl]
       1 0 [.scalar ⟨7, 4⟩] [.scalar ⟨7, 4⟩] "w" rfl rfl rfl rfl rfl rfl)
   have hsdUninit :=
-    ((opaqueCast_trusted_root_dispatch_divergence [] [] ocAdtLayouts 1 tyOcEnum pairVal pairVal).2.2.2.2.2
+    ((opaqueCast_trusted_root_dispatch_divergence [] [] ocAdtLayouts 1 tyOcEnum pairVal pairVal).2.2.2.2.2.1
       (ocDeinitState .uninit) [u32Decl "_0", ocEnumDecl] 0 [] "w" rfl rfl rfl rfl)
   obtain ⟨_, _, hsdOcUb, _, hsdNe⟩ := hsdUninit
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, hdo, hdr, ?_, rfl, hsdInit.1, hsdOcUb, rfl, hsdNe⟩

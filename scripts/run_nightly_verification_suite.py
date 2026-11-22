@@ -4897,10 +4897,17 @@ def audit_flip_direction_transitions(baseline_root: Path, current_root: Path) ->
 # ---------------------------------------------------------------------------
 
 WRAPPER_TIMEOUT_GRACE_SEC = 30
-# `anneal-lean-run --mode build` first queues for a host build slot for up to
-# `max(30, --timeout)` seconds (`acquire_build_slot`), and only then starts the
-# command's own `--timeout` clock; its `file` mode never queues.
+# `anneal-lean-run` first queues for a host build slot and only then starts the
+# command's own `--timeout` clock (`run_bounded_command`): for up to 1200 s in `build`
+# mode and, on a memory-capped slice, up to 180 s in `file` mode, whatever `--timeout`
+# says. Wrappers older than the cgroup-v2 governance sync queued `build` mode for
+# `max(30, --timeout)` seconds instead (`LEAN_RUN_SLOT_WAIT_FLOOR_SEC`).
+LEAN_RUN_SLOT_WAIT_SEC = {"file": 180, "build": 1200}
 LEAN_RUN_SLOT_WAIT_FLOOR_SEC = 30
+# A `build`-mode command that the OOM killer ends is retried once after evicting LSP
+# workers, with a timeout that expires at most this long after the slot was acquired,
+# again whatever `--timeout` says (`--no-oom-retry` turns the retry off).
+LEAN_RUN_OOM_RETRY_WINDOW_SEC = 1200
 LEAN_RUN_DEFAULT_TIMEOUT_SEC = {"file": 180, "build": 900}
 # SIGTERM -> SIGKILL escalation window for a timed-out step's process group, so
 # `anneal-lean-run` can forward the signal and reap its own (separate-session) scope.
@@ -5015,17 +5022,30 @@ def _resolve_lean_run_opt(opt: str) -> str:
     return matches[0] if len(matches) == 1 else opt
 
 
-def _is_lean_run_wrapped(cmd: list[str]) -> bool:
-    return bool(cmd) and Path(cmd[0]).name == "anneal-lean-run"
+def _is_lean_run_wrapped(cmd: list[str], env: Mapping[str, str] | None = None) -> bool:
+    """Whether `cmd` runs through an `anneal-lean-run` wrapper: its executable is named
+    `anneal-lean-run`, or it is the `ANNEAL_LEAN_RUN` override of `env` (default
+    `os.environ`), which `_resolve_anneal_lean_run` prefers whatever its file name. Steps
+    wrapped by a renamed override need the same outer deadline and `MemoryMax` probe."""
+    if not cmd:
+        return False
+    if Path(cmd[0]).name == "anneal-lean-run":
+        return True
+    override = (os.environ if env is None else env).get("ANNEAL_LEAN_RUN", "").strip()
+    return bool(override) and os.path.abspath(override) == os.path.abspath(cmd[0])
 
 
-def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool]:
-    """`(mode, timeout_sec, slot_lock, saw_timeout_flag)` from the `anneal-lean-run`
-    options preceding `--` or the first positional command token."""
+def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool, bool]:
+    """`(mode, timeout_sec, slot_lock, saw_timeout_flag, oom_retry)` from the
+    `anneal-lean-run` options preceding `--` or the first positional command token.
+    `slot_lock` is whether the wrapper queues for a build slot (`--exclusive` always
+    does, `--no-slot-lock` otherwise does not)."""
     mode = "auto"
     timeout: int | None = None
     saw_timeout = False
     slot_lock = True
+    exclusive = False
+    oom_retry = True
     i = 1
     n = len(cmd)
     while i < n:
@@ -5047,6 +5067,10 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
                 i += 1
         if opt == "--no-slot-lock":
             slot_lock = False
+        elif opt == "--exclusive":
+            exclusive = True
+        elif opt == "--no-oom-retry":
+            oom_retry = False
         elif opt == "--mode" and val is not None:
             mode = val
         elif opt == "--timeout" and val is not None:
@@ -5067,14 +5091,14 @@ def _parse_lean_run_wrapper(cmd: list[str]) -> tuple[str, int | None, bool, bool
         mode = "file" if is_lean_file and "--run" not in inner else "build"
     if timeout is not None and timeout <= 0:
         timeout = None
-    return mode, timeout, slot_lock, saw_timeout
+    return mode, timeout, slot_lock or exclusive, saw_timeout, oom_retry
 
 
 def _lean_run_wrapper_flags(cmd: list[str]) -> tuple[str, int | None, bool]:
     """`(mode, timeout_sec, slot_lock)` from the `anneal-lean-run` options preceding
     `--` or the first positional command token (an `auto` mode resolves like the
     wrapper: `lean` or `lake env lean` without `--run` is `file`)."""
-    mode, timeout, slot_lock, _saw_timeout = _parse_lean_run_wrapper(cmd)
+    mode, timeout, slot_lock, _saw_timeout, _oom_retry = _parse_lean_run_wrapper(cmd)
     return mode, timeout, slot_lock
 
 
@@ -5083,11 +5107,13 @@ def _outer_timeout_sec(
 ) -> int:
     """Outer Python deadline for a step: the step budget itself for direct commands,
     and for `anneal-lean-run` wrapped ones the wrapper's worst-case lifetime (build
-    slot queueing + its own `--timeout` + termination) plus a grace margin, so the
-    wrapper's structured exit-124 diagnostic always wins the race."""
-    if not _is_lean_run_wrapped(cmd):
+    slot queueing + its own `--timeout`, or its OOM-retry window if that is longer +
+    termination) plus a grace margin, so the wrapper's structured diagnostics (exit 124,
+    `BUILD_SLOT_TIMEOUT`, the OOM-retry verdict) always win the race and a step that
+    merely queued behind another build is not killed while still inside its budget."""
+    if not _is_lean_run_wrapped(cmd, env):
         return timeout_sec
-    mode, inner_timeout, slot_lock, saw_timeout = _parse_lean_run_wrapper(cmd)
+    mode, inner_timeout, slot_lock, saw_timeout, oom_retry = _parse_lean_run_wrapper(cmd)
     if inner_timeout is None and not saw_timeout:
         env_map = os.environ if env is None else env
         raw_env_timeout = env_map.get("ANNEAL_LEAN_TIMEOUT_SEC", "").strip()
@@ -5100,8 +5126,13 @@ def _outer_timeout_sec(
                 pass
     inner = inner_timeout if inner_timeout is not None else LEAN_RUN_DEFAULT_TIMEOUT_SEC[mode]
     worst = inner
-    if mode == "build" and slot_lock:
-        worst += max(LEAN_RUN_SLOT_WAIT_FLOOR_SEC, inner)
+    if mode == "build" and oom_retry:
+        worst = max(worst, LEAN_RUN_OOM_RETRY_WINDOW_SEC)
+    if slot_lock:
+        slot_wait = LEAN_RUN_SLOT_WAIT_SEC[mode]
+        if mode == "build":
+            slot_wait = max(slot_wait, LEAN_RUN_SLOT_WAIT_FLOOR_SEC, inner)
+        worst += slot_wait
     return max(timeout_sec, worst) + WRAPPER_TIMEOUT_GRACE_SEC
 
 
@@ -5325,7 +5356,7 @@ def _probe_lean_run_memory_max_mib(
     --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped
     or the probe fails. The suite process is outside that scope, so its own cgroup
     hierarchy cannot show this cap."""
-    if not _is_lean_run_wrapped(cmd):
+    if not _is_lean_run_wrapped(cmd, env):
         return None
     opts: list[str] = []
     i, n = 1, len(cmd)

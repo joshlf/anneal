@@ -132,6 +132,20 @@ pub fn dyn_dispatch(x: &u32) -> u32 {
 
 
 class NightlyVerificationSuiteTests(unittest.TestCase):
+    # Operator knobs read from the ambient environment that change which wrapper the suite
+    # resolves or how long it waits for it. The suite runs these tests as one of its own
+    # steps (`scripts_python_unit_tests`), with whatever the operator exported for the run.
+    _AMBIENT_SUITE_KNOBS = ("ANNEAL_LEAN_RUN", "ANNEAL_LEAN_TIMEOUT_SEC")
+
+    def setUp(self) -> None:
+        # Every test starts without those knobs, and whatever a test writes to `os.environ`
+        # is rolled back when it ends.
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for knob in self._AMBIENT_SUITE_KNOBS:
+            os.environ.pop(knob, None)
+
     def test_stage_a_syntactic_completeness_on_repo(self) -> None:
         stage_a = suite.compute_stage_a_syntactic_completeness(REPO_ROOT)
         mir = stage_a["anneal_mir_ast"]
@@ -1708,30 +1722,65 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
     def test_outer_timeout_covers_wrapper_slot_wait_and_grace(self) -> None:
         lr = str(REPO_ROOT / "scripts/anneal-lean-run")
         grace = suite.WRAPPER_TIMEOUT_GRACE_SEC
+        # What the wrapper does whatever its `--timeout` is (`run_bounded_command` in both
+        # `scripts/anneal-lean-run` and the fleet copy): queue up to 1200 s for a build slot
+        # in `build` mode and up to 180 s in `file` mode on a memory-capped slice, and give a
+        # `build` command the OOM killer ended one retry that expires at most 1200 s after
+        # the slot was acquired.
+        build_wait = suite.LEAN_RUN_SLOT_WAIT_SEC["build"]
+        file_wait = suite.LEAN_RUN_SLOT_WAIT_SEC["file"]
+        retry = suite.LEAN_RUN_OOM_RETRY_WINDOW_SEC
+        self.assertEqual((build_wait, file_wait, retry), (1200, 180, 1200))
+        wrapper_src = (REPO_ROOT / "scripts/anneal-lean-run").read_text(encoding="utf-8")
+        self.assertIn("slot_timeout = 1200\n", wrapper_src)
+        self.assertIn("slot_timeout = 180\n", wrapper_src)
+        self.assertIn(
+            "retry_timeout = min(900, max(120, int(1200 - (time.monotonic() - slot_t0))))", wrapper_src
+        )
         # Direct commands: the step budget is the only deadline.
         self.assertEqual(suite._outer_timeout_sec(["cargo", "test"], 600), 600)
-        # `--mode build` may queue up to `max(30, T)` s for a build slot before its own
-        # `T`-second clock starts, so the outer deadline must exceed `T + max(30, T)`.
+        # `--mode build`: the outer deadline must exceed the slot queue plus the longer of
+        # the command's own `T`-second clock and the OOM-retry window. (A wrapper from before
+        # the fixed 1200 s queue waited `max(30, T)` s, which a `T` above 1200 still covers.)
         build = [lr, "--mode", "build", "--concurrency", "1", "--timeout", "1200", "--", "lake", "build"]
         self.assertEqual(suite._outer_timeout_sec(build, 1200), 1200 + 1200 + grace)
+        long_build = [lr, "--mode", "build", "--timeout", "1800", "--", "lake", "build"]
+        self.assertEqual(suite._outer_timeout_sec(long_build, 1800), 1800 + 1800 + grace)
         short = [lr, "--mode", "build", "--timeout", "10", "--", "lake", "build"]
-        self.assertEqual(suite._outer_timeout_sec(short, 10), 10 + 30 + grace)
-        # `file` mode and `--no-slot-lock` never queue.
+        self.assertEqual(suite._outer_timeout_sec(short, 10), build_wait + retry + grace)
+        mid = [lr, "--mode", "build", "--timeout", "600", "--", "cargo", "test"]
+        self.assertEqual(suite._outer_timeout_sec(mid, 600), build_wait + retry + grace)
+        # A step that queued 700 s behind another build and then needs 550 s of its 600 s
+        # budget is still running at 1250 s: the old `T + max(30, T) + grace` deadline
+        # (1230 s) killed it.
+        self.assertGreater(suite._outer_timeout_sec(mid, 600), 700 + 550)
+        # `file` mode queues only on a memory-capped slice, and never retries.
         file_cmd = [lr, "--mode", "file", "--timeout", "300", "--", "lake", "env", "lean", "X.lean"]
-        self.assertEqual(suite._outer_timeout_sec(file_cmd, 300), 300 + grace)
+        self.assertEqual(suite._outer_timeout_sec(file_cmd, 300), 300 + file_wait + grace)
+        # `--no-slot-lock` never queues (unless `--exclusive` asks for every slot), and
+        # `--no-oom-retry` leaves the command's own clock as the only one.
         nolock = [lr, "--mode", "build", "--no-slot-lock", "--timeout=900", "--", "lake", "build"]
         self.assertEqual(suite._lean_run_wrapper_flags(nolock), ("build", 900, False))
-        self.assertEqual(suite._outer_timeout_sec(nolock, 900), 900 + grace)
+        self.assertEqual(suite._outer_timeout_sec(nolock, 900), retry + grace)
+        noretry = [lr, "--mode", "build", "--no-slot-lock", "--no-oom-retry", "--timeout=900", "--", "lake"]
+        self.assertEqual(suite._outer_timeout_sec(noretry, 900), 900 + grace)
+        queued_noretry = [lr, "--mode", "build", "--no-oom", "--timeout", "900", "--", "lake", "build"]
+        self.assertEqual(suite._outer_timeout_sec(queued_noretry, 900), build_wait + 900 + grace)
+        exclusive = [lr, "--mode", "build", "--no-slot-lock", "--exclusive", "--timeout", "900", "--", "lake"]
+        self.assertEqual(suite._lean_run_wrapper_flags(exclusive), ("build", 900, True))
+        self.assertEqual(suite._outer_timeout_sec(exclusive, 900), build_wait + retry + grace)
+        file_nolock = [lr, "--mode", "file", "--no-slot-lock", "--timeout", "300", "--", "lean", "X.lean"]
+        self.assertEqual(suite._outer_timeout_sec(file_nolock, 300), 300 + grace)
         # `auto` resolves like the wrapper; without `--timeout` the wrapper defaults apply.
         auto_file = [lr, "--", "lake", "env", "lean", "X.lean"]
         self.assertEqual(suite._lean_run_wrapper_flags(auto_file), ("file", None, True))
-        self.assertEqual(suite._outer_timeout_sec(auto_file, 60), 180 + grace)
+        self.assertEqual(suite._outer_timeout_sec(auto_file, 60), 180 + file_wait + grace)
         auto_file_nosep = [lr, "lake", "env", "lean", "X.lean"]
         self.assertEqual(suite._lean_run_wrapper_flags(auto_file_nosep), ("file", None, True))
-        self.assertEqual(suite._outer_timeout_sec(auto_file_nosep, 60), 180 + grace)
+        self.assertEqual(suite._outer_timeout_sec(auto_file_nosep, 60), 180 + file_wait + grace)
         auto_build = [lr, "--", "lake", "build", "Anneal"]
         self.assertEqual(suite._lean_run_wrapper_flags(auto_build), ("build", None, True))
-        self.assertEqual(suite._outer_timeout_sec(auto_build, 60), 900 + 900 + grace)
+        self.assertEqual(suite._outer_timeout_sec(auto_build, 60), build_wait + retry + grace)
         # Inner command `--` and inner flags (e.g. `cargo test -- --no-slot-lock --timeout 5`)
         # must never be mistaken for wrapper flags.
         inner_sep = [
@@ -1750,19 +1799,19 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "5",
         ]
         self.assertEqual(suite._lean_run_wrapper_flags(inner_sep), ("build", 600, True))
-        self.assertEqual(suite._outer_timeout_sec(inner_sep, 600), 600 + 600 + grace)
+        self.assertEqual(suite._outer_timeout_sec(inner_sep, 600), build_wait + retry + grace)
         # `argparse` long-option prefix abbreviations (`--time`, `--no-slot`, `--conc`) and
         # `ANNEAL_LEAN_TIMEOUT_SEC` env fallback when `--timeout` is omitted.
         abbrev = [lr, "--mo", "build", "--no-slot", "--conc=1", "--time", "450", "--", "lake", "build"]
         self.assertEqual(suite._lean_run_wrapper_flags(abbrev), ("build", 450, False))
-        self.assertEqual(suite._outer_timeout_sec(abbrev, 300), 450 + grace)
+        self.assertEqual(suite._outer_timeout_sec(abbrev, 300), retry + grace)
         self.assertEqual(
             suite._outer_timeout_sec(auto_build, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "1500"}),
             1500 + 1500 + grace,
         )
         self.assertEqual(
             suite._outer_timeout_sec(auto_file, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "240"}),
-            240 + grace,
+            240 + file_wait + grace,
         )
         # Explicit `--timeout 0` on the command line overrides `ANNEAL_LEAN_TIMEOUT_SEC`
         # (falling back to the mode default 900s/180s), and `-- --` leaves the second
@@ -1770,18 +1819,26 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         explicit_zero = [lr, "--timeout", "0", "--", "lake", "build", "Anneal"]
         self.assertEqual(
             suite._outer_timeout_sec(explicit_zero, 60, env={"ANNEAL_LEAN_TIMEOUT_SEC": "1500"}),
-            900 + 900 + grace,
+            build_wait + retry + grace,
         )
         double_sep = [lr, "--", "--", "lake", "env", "lean", "X.lean"]
         self.assertEqual(suite._lean_run_wrapper_flags(double_sep), ("build", None, True))
-        # A wrapped step never gets a shorter outer deadline than its own budget.
+        # A wrapped step never gets a shorter outer deadline than its wrapper can take:
+        # the queue for a slot, then the step budget or (in `build` mode) the retry window.
         for profile in ("quick", "nightly"):
             for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, profile):
                 outer = suite._outer_timeout_sec(cmd, timeout_sec)
                 if suite._is_lean_run_wrapped(cmd):
                     mode, _t, _lock = suite._lean_run_wrapper_flags(cmd)
-                    slot = max(30, timeout_sec) if mode == "build" else 0
-                    self.assertEqual(outer, timeout_sec + slot + grace, f"{profile}/{name}")
+                    if mode == "build":
+                        expected = max(build_wait, timeout_sec) + max(retry, timeout_sec) + grace
+                        self.assertGreaterEqual(
+                            outer, timeout_sec + max(30, timeout_sec) + grace, f"{profile}/{name}"
+                        )
+                    else:
+                        expected = file_wait + timeout_sec + grace
+                    self.assertEqual(outer, expected, f"{profile}/{name}")
+                    self.assertGreaterEqual(outer, timeout_sec + grace, f"{profile}/{name}")
                 else:
                     self.assertEqual(outer, timeout_sec, f"{profile}/{name}")
 
@@ -4394,6 +4451,103 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 os.chdir(old_cwd)
             self.assertEqual(from_env, env_wrapper)
             self.assertEqual(from_path, path_wrapper)
+
+    def test_renamed_anneal_lean_run_override_keeps_wrapper_deadline_and_ram_probe(self) -> None:
+        # `ANNEAL_LEAN_RUN` may give the wrapper any file name. A step it wraps still queues
+        # for a build slot and enforces its own `--timeout`, so the outer deadline must
+        # cover both (at the bare step budget the suite would kill a queued step and lose the
+        # wrapper's exit-124 diagnostic), and the `MemoryMax` it plans must still right-size
+        # `lake_build_lean_miri_spec`. Recognizing the wrapper by its name alone missed both.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            renamed = root / "bin/lean-run-v2"
+            renamed.parent.mkdir()
+            renamed.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "if '--probe' in args:\n"
+                "    print(json.dumps({'memory_max_mb': 5712}))\n"
+                "    sys.exit(0)\n"
+                "cmd = args[args.index('--') + 1:]\n"
+                "os.execvp(cmd[0], cmd)\n",
+                encoding="utf-8",
+            )
+            renamed.chmod(0o755)
+            self.assertNotIn("ANNEAL_LEAN_RUN", os.environ)
+            canonical = {
+                name: (cmd, timeout_sec)
+                for name, _cat, cmd, timeout_sec in suite.build_suite_steps(REPO_ROOT, "nightly")
+            }
+            canonical_outer = {
+                name: suite._outer_timeout_sec(cmd, timeout_sec) for name, (cmd, timeout_sec) in canonical.items()
+            }
+            canonical_wrapped = {
+                name for name, (cmd, _t) in canonical.items() if Path(cmd[0]).name == "anneal-lean-run"
+            }
+            self.assertEqual(len(canonical), 27)
+            self.assertEqual(len(canonical_wrapped), 19)
+
+            with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN": os.fspath(renamed), "LEAN_NUM_THREADS": "7"}):
+                steps = suite.build_suite_steps(REPO_ROOT, "nightly")
+                self.assertEqual([name for name, _c, _cmd, _t in steps], list(canonical))
+                for name, _cat, cmd, timeout_sec in steps:
+                    canon_cmd, canon_timeout = canonical[name]
+                    self.assertEqual(timeout_sec, canon_timeout, name)
+                    if name not in canonical_wrapped:
+                        self.assertEqual(cmd, canon_cmd, name)
+                        self.assertFalse(suite._is_lean_run_wrapped(cmd), name)
+                        self.assertEqual(suite._outer_timeout_sec(cmd, timeout_sec), timeout_sec, name)
+                        continue
+                    self.assertEqual(cmd, [os.fspath(renamed), *canon_cmd[1:]], name)
+                    self.assertTrue(suite._is_lean_run_wrapped(cmd), name)
+                    self.assertEqual(suite._lean_run_wrapper_flags(cmd), suite._lean_run_wrapper_flags(canon_cmd), name)
+                    self.assertEqual(suite._outer_timeout_sec(cmd, timeout_sec), canonical_outer[name], name)
+                    self.assertGreaterEqual(
+                        suite._outer_timeout_sec(cmd, timeout_sec),
+                        timeout_sec + suite.WRAPPER_TIMEOUT_GRACE_SEC,
+                        name,
+                    )
+                miri_cmd = next(cmd for name, _c, cmd, _t in steps if name == "lake_build_lean_miri_spec")
+                self.assertEqual(suite._outer_timeout_sec(miri_cmd, 1800), 2 * 1800 + suite.WRAPPER_TIMEOUT_GRACE_SEC)
+                self.assertEqual(suite._probe_lean_run_memory_max_mib(miri_cmd), 5712)
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536):
+                    step_env = suite._build_step_env("lake_build_lean_miri_spec", cmd=miri_cmd, cwd=root)
+                    other_env = suite._build_step_env("lake_build_minirust_spec", cmd=miri_cmd, cwd=root)
+                self.assertEqual(step_env["LEAN_NUM_THREADS"], "1")
+                self.assertEqual(other_env["LEAN_NUM_THREADS"], "7")
+                self.assertEqual(os.environ["LEAN_NUM_THREADS"], "7")
+                # End to end: the wrapped step itself sees the right-sized thread count.
+                out_file = root / "threads.txt"
+                dump = (
+                    "import os, pathlib; "
+                    f"pathlib.Path({str(out_file)!r}).write_text(os.environ.get('LEAN_NUM_THREADS', '<unset>'))"
+                )
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536):
+                    res = suite._run_step(
+                        name="lake_build_lean_miri_spec",
+                        category="cat2_correspondence_suites",
+                        cmd=[os.fspath(renamed), "--mode", "build", "--timeout", "30", "--"]
+                        + [sys.executable, "-c", dump],
+                        cwd=root,
+                        timeout_sec=30,
+                    )
+                self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
+                self.assertEqual(out_file.read_text(encoding="utf-8"), "1")
+
+            # Without that override in its environment the same file is an ordinary command,
+            # and an override that names another file changes nothing for it.
+            for env in ({}, {"ANNEAL_LEAN_RUN": ""}, {"ANNEAL_LEAN_RUN": os.fspath(root / "bin/other")}):
+                self.assertFalse(suite._is_lean_run_wrapped(miri_cmd, env), env)
+                self.assertEqual(suite._outer_timeout_sec(miri_cmd, 1800, env=env), 1800, env)
+                self.assertIsNone(suite._probe_lean_run_memory_max_mib(miri_cmd, env=env), env)
+            self.assertFalse(suite._is_lean_run_wrapped([], {"ANNEAL_LEAN_RUN": os.fspath(renamed)}))
+            # A relative override is anchored like `_resolve_anneal_lean_run` anchors it.
+            self.assertTrue(
+                suite._is_lean_run_wrapped(
+                    miri_cmd, {"ANNEAL_LEAN_RUN": f"  {os.path.relpath(renamed)}  "}
+                )
+            )
 
     def test_tracecheck_import_isolation_matches_check_trusted_downstream_targets(self) -> None:
         tc_path = REPO_ROOT / "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean"
