@@ -415,10 +415,64 @@ def schema17ByValueChildren (node : Schema17TypeNode) : Except String (List Miri
 def Schema17TypeNode.toCert (nodes : List Schema17TypeNode) : ValidationRankCert :=
   ⟨nodes.map fun n => (n.id, n.validationRank)⟩
 
-/-- Executable Schema 17 table validator mirroring `lean-miri#90` `Decoder.lean` L56–80:
-verifies coroutine saved-type indices, rejects missing child `TyId`s, and enforces strict
-`source.validationRank < node.validationRank` across all composite/alias by-value edges. -/
+/-- Reject duplicate `TypeNode.id` entries in a Schema 17 table (mirroring `Decoder.lean`'s
+indexed `d.types` table invariant `d.types[id].id = id`), closing the shadow-entry soundness gap
+where an earlier low-rank node with the same `id` could mask a later cyclic node under `List.find?`
+and `Schema17TypeNode.toCert.tyRank`. -/
+def checkSchema17UniqueIds : List Schema17TypeNode → Except String Unit
+  | [] => .ok ()
+  | n :: ns =>
+    if ns.any (·.id == n.id) then
+      .error s!"duplicate validation type id {n.id}"
+    else
+      checkSchema17UniqueIds ns
+
+private theorem list_any_true_of_mem {α : Type} (p : α → Bool) :
+    ∀ {xs : List α} {x : α}, x ∈ xs → p x = true → xs.any p = true
+  | _ :: _, _, .head _, hpx => by simp only [List.any_cons, hpx, Bool.true_or]
+  | _ :: _, _, .tail _ hmem, hpx => by
+    simp only [List.any_cons, list_any_true_of_mem p hmem hpx, Bool.or_true]
+
+/-- Under `checkSchema17UniqueIds`, `Schema17TypeNode.toCert.tyRank` agrees identically with every
+declared node's `validationRank` (no earlier duplicate `id` can shadow it). -/
+theorem toCert_tyRank_of_uniqueIds :
+    ∀ (nodes : List Schema17TypeNode),
+      checkSchema17UniqueIds nodes = .ok () →
+      ∀ {n : Schema17TypeNode}, n ∈ nodes →
+      (Schema17TypeNode.toCert nodes).tyRank n.id = n.validationRank
+  | [], _, _, hmem => nomatch hmem
+  | hd :: tl, huniq, n, hmem => by
+    simp only [checkSchema17UniqueIds] at huniq
+    cases hany : tl.any (·.id == hd.id) with
+    | true => rw [hany] at huniq; cases huniq
+    | false =>
+      rw [hany] at huniq
+      simp only [Bool.false_eq_true, ↓reduceIte] at huniq
+      cases hmem with
+      | head _ =>
+        unfold Schema17TypeNode.toCert ValidationRankCert.tyRank
+        simp only [List.map_cons, List.find?_cons, beq_self_eq_true, Option.map_some, Option.getD_some]
+      | tail _ htl =>
+        have hne : (hd.id == n.id) = false := by
+          cases hbeq : (hd.id == n.id) with
+          | false => rfl
+          | true =>
+            have hid : (n.id == hd.id) = true := by
+              rw [beq_iff_eq] at hbeq ⊢; exact hbeq.symm
+            have htrue : tl.any (·.id == hd.id) = true :=
+              list_any_true_of_mem (·.id == hd.id) htl hid
+            rw [hany] at htrue; cases htrue
+        have ih := toCert_tyRank_of_uniqueIds tl huniq htl
+        unfold Schema17TypeNode.toCert ValidationRankCert.tyRank at ih ⊢
+        simp only [List.map_cons, List.find?_cons, hne]
+        exact ih
+
+/-- Executable Schema 17 table validator mirroring `lean-miri#90` `Decoder.lean` L55–80:
+enforces unique `TypeNode.id`s (`validateParsedTables`), verifies coroutine saved-type indices,
+rejects missing child `TyId`s, and enforces strict `source.validationRank < node.validationRank`
+across all composite/alias by-value edges. -/
 def checkSchema17Table (nodes : List Schema17TypeNode) : Except String Unit := do
+  checkSchema17UniqueIds nodes
   let checkNode (node : Schema17TypeNode) : Except String Unit := do
     let children ← schema17ByValueChildren node
     children.forM fun childId => do
@@ -429,6 +483,15 @@ def checkSchema17Table (nodes : List Schema17TypeNode) : Except String Unit := d
       else
         throw s!"validation rank does not decrease from type {node.id} to {childId}"
   nodes.forM checkNode
+
+/-- Every Schema 17 table accepted by `checkSchema17Table` has pairwise distinct `TypeNode.id`s. -/
+theorem checkSchema17Table_uniqueIds (nodes : List Schema17TypeNode)
+    (h : checkSchema17Table nodes = .ok ()) :
+    checkSchema17UniqueIds nodes = .ok () := by
+  unfold checkSchema17Table at h
+  cases hu : checkSchema17UniqueIds nodes with
+  | error _ => simp [hu, bind, Except.bind] at h
+  | ok _ => rfl
 
 private theorem list_forM_ok_iff {α : Type} (f : α → Except String Unit) (xs : List α) :
     xs.forM f = .ok () ↔ ∀ x ∈ xs, f x = .ok () := by
@@ -455,15 +518,16 @@ theorem checkSchema17Table_sound (nodes : List Schema17TypeNode)
       ∀ childId ∈ children, ∃ source,
         nodes.find? (·.id == childId) = some source ∧
         source.validationRank < node.validationRank := by
+  have hu := checkSchema17Table_uniqueIds nodes h
   unfold checkSchema17Table at h
-  rw [list_forM_ok_iff] at h
+  simp only [hu, bind, Except.bind, list_forM_ok_iff] at h
   intro node hnode
   have hn := h node hnode
   cases hch : schema17ByValueChildren node with
-  | error e => simp [hch, bind, Except.bind] at hn
+  | error e => simp [hch] at hn
   | ok children =>
     refine ⟨children, rfl, ?_⟩
-    simp only [hch, bind, Except.bind, list_forM_ok_iff] at hn
+    simp only [hch, list_forM_ok_iff] at hn
     intro childId hc
     have hci := hn childId hc
     cases hfind : nodes.find? (·.id == childId) with
@@ -473,6 +537,26 @@ theorem checkSchema17Table_sound (nodes : List Schema17TypeNode)
       by_cases hlt : source.validationRank < node.validationRank
       · exact hlt
       · simp [hfind, hlt, throw] at hci
+
+/-- **Certificate bridge for `checkSchema17Table`:** for `cert := Schema17TypeNode.toCert nodes`,
+every by-value child `childId` of every `node ∈ nodes` satisfies strict `cert.tyRank` descent
+`cert.tyRank childId < cert.tyRank node.id`. -/
+theorem checkSchema17Table_toCert_rank_lt (nodes : List Schema17TypeNode)
+    (h : checkSchema17Table nodes = .ok ()) :
+    ∀ node ∈ nodes, ∃ children,
+      schema17ByValueChildren node = .ok children ∧
+      ∀ childId ∈ children,
+        (Schema17TypeNode.toCert nodes).tyRank childId <
+          (Schema17TypeNode.toCert nodes).tyRank node.id := by
+  have hu := checkSchema17Table_uniqueIds nodes h
+  intro node hnode
+  obtain ⟨children, hch, hall⟩ := checkSchema17Table_sound nodes h node hnode
+  refine ⟨children, hch, fun childId hc => ?_⟩
+  obtain ⟨source, hfind, hlt⟩ := hall childId hc
+  have hmem : source ∈ nodes := List.mem_of_find?_eq_some hfind
+  have hid : source.id = childId := by simpa [beq_iff_eq] using List.find?_some hfind
+  rw [← hid, toCert_tyRank_of_uniqueIds nodes hu hmem, toCert_tyRank_of_uniqueIds nodes hu hnode]
+  exact hlt
 
 /-- Transitive by-value dependency relation across a Schema 17 type table. -/
 inductive Schema17Reach (nodes : List Schema17TypeNode) :
@@ -1199,6 +1283,48 @@ theorem drainPointees_push {P S : Type} (tracking : RefTracking (Key P) Validati
     drainPointees { tracking with todo := tracking.todo.push (key, path) } visitPointee =
       (do visitPointee key path; drainPointees tracking visitPointee) := by
   simp [drainPointees, Array.toList_push, List.reverse_append, List.forM_cons]
+
+/-- Verbatim `for (key, path) in tracking.todo.reverse do` mirror of `lean-miri#90`
+`ValidityVisitor.validatePlace` L778 (`Array.reverse` + `forIn` in `do`-notation). -/
+def drainPointeesForIn {P S : Type} (tracking : RefTracking (Key P) ValidationPath)
+    (visitPointee : Key P → ValidationPath → M S Unit) : M S Unit := do
+  for (key, path) in tracking.todo.reverse do
+    visitPointee key path
+
+private theorem list_forIn_unit_eq_forM {P S : Type}
+    (visitPointee : Key P → ValidationPath → M S Unit) :
+    ∀ (xs : List (Key P × ValidationPath)),
+      (forIn (m := M S) xs () (fun (key, path) _ => do
+        visitPointee key path
+        pure (ForInStep.yield ())) >>= fun _ => pure ()) =
+      xs.forM fun entry => visitPointee entry.1 entry.2
+  | [] => rfl
+  | (k, p) :: xs => by
+    have ih := list_forIn_unit_eq_forM visitPointee xs
+    funext s
+    unfold List.forM
+    change (forIn (m := M S) ((k, p) :: xs) () (fun (key, path) _ => do
+        visitPointee key path
+        pure (ForInStep.yield ())) >>= fun _ => pure ()) s =
+      (visitPointee k p >>= fun _ => xs.forM fun entry => visitPointee entry.1 entry.2) s
+    simp only [forIn, List.forIn'_cons, bind, EStateM.bind, pure, EStateM.pure]
+    cases visitPointee k p s with
+    | error e s' => rfl
+    | ok u s' => exact congrFun ih s'
+
+/-- Exact extensional equality (`Classical.choice`-free) between `lean-miri#90`'s verbatim
+`for (key, path) in tracking.todo.reverse do` loop (`drainPointeesForIn`) and `drainPointees`
+(`tracking.todo.toList.reverse.forM`). -/
+theorem drainPointeesForIn_eq_drainPointees {P S : Type}
+    (tracking : RefTracking (Key P) ValidationPath)
+    (visitPointee : Key P → ValidationPath → M S Unit) :
+    drainPointeesForIn tracking visitPointee = drainPointees tracking visitPointee := by
+  unfold drainPointeesForIn drainPointees
+  change (forIn tracking.todo.reverse () (fun (key, path) _ => do
+      visitPointee key path
+      pure (ForInStep.yield ())) >>= fun _ => pure ()) = _
+  rw [← Array.forIn_toList, Array.toList_reverse]
+  exact list_forIn_unit_eq_forM visitPointee tracking.todo.toList.reverse
 
 /-! ## 4. Static certificates induce certified hooks -/
 
@@ -3464,6 +3590,405 @@ theorem lifo3Ref_validatePlace_visits_reverse_order :
   rw [← realValidatePlaceLexRank_eq_noFuel]
   decide +kernel
 
+/-! #### Port of `lean-miri#90` fuel-free `visit_fieldless` (`ValidityVisitor.lean` L500–520) -/
+
+/-- **Fuel-free `visit_fieldless` (`lean-miri#90` L725–742):** a fieldless inhabited single-variant
+aggregate at runtime (`ctfeMode = none`, `debugAssertions = false`) has no value bytes or child
+projections, so `realVisitNoFuel` returns `.ok session state` directly without invoking any
+continuation. -/
+theorem realVisitNoFuel_fieldless {P S C E F A Pad : Type} [PointerProvenance P] [DecidableEq P]
+    (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) (session : Session P)
+    (place : RuntimePlace P) (state : S) (variant : Nat)
+    (classify : h.classify c place.layout.ty state =
+      .ok (.aggregate false false false) state)
+    (inhabited : h.opsemInhabited c place.layout.ty state = .ok true state)
+    (fields : place.layout.layout.fields = .Arbitrary #[] #[])
+    (variants : place.layout.layout.variants = .Single variant)
+    (runtime : session.ctfeMode = none) (debugOff : h.debugAssertions = false) :
+    realVisitNoFuel h c typeRank session place state = .ok session state := by
+  rw [realVisitNoFuel_eq]
+  simp [visitStep, classify, primitive, fields, variants, runtime, inhabited, debugOff,
+    bind, EStateM.bind, pure, EStateM.pure]
+  cases session with
+  | mk path flags mode tracking bytes =>
+    cases flags
+    simp_all
+
+/-- **`Classical.choice`-free structural `realVisitLexRank_fieldless`** (`lean4#13851`-ready). -/
+theorem realVisitLexRank_fieldless {P S C E F A Pad : Type} [PointerProvenance P] [DecidableEq P]
+    (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) (session : Session P)
+    (place : RuntimePlace P) (state : S) (variant : Nat)
+    (classify : h.classify c place.layout.ty state =
+      .ok (.aggregate false false false) state)
+    (inhabited : h.opsemInhabited c place.layout.ty state = .ok true state)
+    (fields : place.layout.layout.fields = .Arbitrary #[] #[])
+    (variants : place.layout.layout.variants = .Single variant)
+    (runtime : session.ctfeMode = none) (debugOff : h.debugAssertions = false) :
+    realVisitLexRank h c typeRank session place state = .ok session state := by
+  rw [realVisitLexRank_eq_noFuel]
+  exact realVisitNoFuel_fieldless h c typeRank session place state variant
+    classify inhabited fields variants runtime debugOff
+
+/-! #### Witness 4: Dynamic `RuntimeArrayTypes.intern` rank extension & state-varying `typeRankOf` (`lean-miri#90` L245–278) -/
+
+/-- Model of `lean-miri#90` `Miri.Input.RuntimeArrayTypes.World` (`lean_miri_pr90.diff` L238–278):
+combines static Schema 17 compiler `TypeNode` ranks with dynamically interned `[Elem; N]` array
+types allocated during execution/projection at `validationRank := typeRank world elemTy + 1`. -/
+structure RuntimeArrayWorld where
+  staticRanks : ValidationRankCert
+  dynamicEntries : List (MIR.TyId × Nat)
+  nextId : MIR.TyId
+  deriving Repr
+
+/-- Lookup mirroring `RuntimeArrayTypes.typeRank`: consults static compiler ranks first, then
+dynamically interned runtime array entries, defaulting to `0`. -/
+def RuntimeArrayWorld.typeRank (w : RuntimeArrayWorld) (ty : MIR.TyId) : Nat :=
+  if w.staticRanks.ranks.any (·.1 == ty) then w.staticRanks.tyRank ty
+  else ((w.dynamicEntries.find? (·.1 == ty)).map (·.2)).getD 0
+
+/-- Dynamic runtime array interning mirroring `RuntimeArrayTypes.intern` (`lean-miri#90` L261–278):
+allocates `newId := w.nextId` with `validationRank := w.typeRank elemTy + 1`. -/
+def RuntimeArrayWorld.internArray (w : RuntimeArrayWorld) (elemTy : MIR.TyId) :
+    MIR.TyId × RuntimeArrayWorld :=
+  let newId := w.nextId
+  let elemRank := w.typeRank elemTy
+  (newId, { w with
+    dynamicEntries := w.dynamicEntries ++ [(newId, elemRank + 1)]
+    nextId := newId + 1 })
+
+/-- **Soundness of dynamic runtime array interning (`Classical.choice`-free):** interning a fresh
+`w.nextId` preserves the element's rank and assigns the new array rank `w.typeRank elemTy + 1`,
+establishing strict Schema 17 descent `w'.typeRank elemTy < w'.typeRank arrTy`. -/
+theorem RuntimeArrayWorld.internArray_rank_lt (w : RuntimeArrayWorld) (elemTy : MIR.TyId)
+    (hstaticFresh : w.staticRanks.ranks.any (·.1 == w.nextId) = false)
+    (hdynFresh : w.dynamicEntries.any (·.1 == w.nextId) = false)
+    (hne : elemTy ≠ w.nextId) :
+    let (arrTy, w') := w.internArray elemTy
+    w'.typeRank elemTy = w.typeRank elemTy ∧
+      w'.typeRank arrTy = w.typeRank elemTy + 1 ∧
+      w'.typeRank elemTy < w'.typeRank arrTy := by
+  dsimp only [RuntimeArrayWorld.internArray]
+  have h1 : ({ w with dynamicEntries := w.dynamicEntries ++ [(w.nextId, w.typeRank elemTy + 1)],
+                      nextId := w.nextId + 1 } : RuntimeArrayWorld).typeRank elemTy =
+      w.typeRank elemTy := by
+    unfold RuntimeArrayWorld.typeRank
+    cases hs : w.staticRanks.ranks.any (·.1 == elemTy) with
+    | true => simp
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte, List.find?_append]
+      cases w.dynamicEntries.find? (·.1 == elemTy) with
+      | some _ => simp
+      | none =>
+        have hneq : (w.nextId == elemTy) = false := by simp [beq_eq_false_iff_ne, Ne.symm hne]
+        simp [hneq]
+  have h2 : ({ w with dynamicEntries := w.dynamicEntries ++ [(w.nextId, w.typeRank elemTy + 1)],
+                      nextId := w.nextId + 1 } : RuntimeArrayWorld).typeRank w.nextId =
+      w.typeRank elemTy + 1 := by
+    unfold RuntimeArrayWorld.typeRank
+    simp only [hstaticFresh, Bool.false_eq_true, ↓reduceIte, List.find?_append]
+    have hnone : w.dynamicEntries.find? (·.1 == w.nextId) = none := by
+      cases hf : w.dynamicEntries.find? (·.1 == w.nextId) with
+      | none => rfl
+      | some entry =>
+        have hmem := List.mem_of_find?_eq_some hf
+        have hpred : (fun x : MIR.TyId × Nat => x.1 == w.nextId) entry = true :=
+          @List.find?_some _ (fun x : MIR.TyId × Nat => x.1 == w.nextId) _ _ hf
+        have htrue : w.dynamicEntries.any (·.1 == w.nextId) = true :=
+          list_any_true_of_mem (·.1 == w.nextId) hmem hpred
+        rw [hdynFresh] at htrue
+        cases htrue
+    simp [hnone]
+  exact ⟨h1, h2, by omega⟩
+
+/-- ZST unit layout (`ty = 0`, `size = 0`) for sequence end-of-array inbounds checks. -/
+def dynInternZstUnit : LocalLayout :=
+  ⟨0, { wrapperLayout with fields := .Primitive, size := Size.ZERO }⟩
+
+/-- Element aggregate layout (`BoolWrap`, `ty = 10`, static rank `1`, wrapping `lifoBoolLayout` `ty = 3`). -/
+def dynInternElemLayout : LocalLayout :=
+  ⟨10, { wrapperLayout with size := Size.ofBytes 1 }⟩
+
+/-- Dynamically interned 1-element array layout `[BoolWrap; 1]` at `arrTy` (`ty = 99`, interned rank `2`). -/
+def dynInternArrLayout (arrTy : MIR.TyId) : LocalLayout :=
+  ⟨arrTy, { wrapperLayout with
+    fields := .Array (Size.ofBytes 1) 1
+    size := Size.ofBytes 1 }⟩
+
+private def unusedIntern {A : Type} : M RuntimeArrayWorld A :=
+  throw (StepError.unsupported "unused")
+
+/-- Concrete `ValidityVisitor.Hooks` over `State := RuntimeArrayWorld`: dereferencing the root
+reference (`ty = 1`) in `ptrToPlace` dynamically interns `[BoolWrap; 1]` (`ty = 99`, rank `2`) into
+the machine state before the LIFO pointee drain runs. -/
+def dynInternHooks : Hooks CtfeProvenance RuntimeArrayWorld Unit Unit Unit Unit Unit where
+  target := RuntimeTargetDataLayout.default
+  projection := {
+    place := {
+      getFrame := unusedIntern, setFrame := fun _ => unusedIntern
+      debugAssertions := false, frameIndex := unusedIntern
+      resolveLayout := fun _ _ => unusedIntern
+      localToOp := fun _ _ => unusedIntern
+      projection := fun _ => unusedIntern
+      deref := fun _ _ _ => unusedIntern
+      checkPlaceType := fun _ _ _ => unusedIntern
+      allocateStack := fun _ _ => unusedIntern
+      writeMemoryNoValidate := fun _ _ _ => unusedIntern
+      afterLocalMovedToMemory := fun _ _ _ => unusedIntern
+      memoryOffset := fun _ base offset _ metaVal =>
+        match base.ptr.offset.add offset with
+        | .ok off => pure { base with ptr := { base.ptr with offset := off }, metadata := metaVal }
+        | .error e => throw (StepError.invalidProgram (reprStr e))
+      writeLocalImmediate := fun _ _ _ _ => unusedIntern
+      enforceValidity := fun _ _ => pure true, validate := fun _ _ => pure ()
+    }
+    target := RuntimeTargetDataLayout.default.base
+    maxSizeOfVal := Size.ofBytes 0x7FFF_FFFF_FFFF_FFFF
+    dynamic := {
+      target := RuntimeTargetDataLayout.default.base
+      maxSizeOfVal := Size.ofBytes 0x7FFF_FFFF_FFFF_FFFF
+      classify := fun _ _ => unusedIntern
+      field := fun _ _ _ => unusedIntern
+      packedAlign := fun _ _ => pure none
+      vtableSizeAndAlign := fun _ _ _ => unusedIntern
+    }
+    dynamicFuel := 0
+    isSliceOrStr := fun _ _ => pure false
+    field := fun _ parent _ =>
+      pure (if parent.ty == 10 then lifoBoolLayout else dynInternElemLayout)
+    variant := fun _ parent _ => pure parent
+    packedAlign := fun _ _ => pure none
+    subsliceLayout := fun _ _ _ => unusedIntern
+    layoutOf := fun _ ty =>
+      pure (if ty == 1 then lifoRefLayout
+            else if ty == 10 then dynInternElemLayout
+            else if ty == 3 then lifoBoolLayout
+            else dynInternArrLayout ty)
+    localIndex := fun _ _ => unusedIntern
+  }
+  vtable := {
+    target := RuntimeTargetDataLayout.default.base
+    isDynamic := fun _ _ => pure false, memoryOffset := fun _ _ _ _ _ => unusedIntern
+    resolvePointer := fun _ _ => unusedIntern
+    globalVTable := fun _ _ => unusedIntern
+    globalFunction := fun _ _ => unusedIntern
+    predicates := fun _ _ => pure #[], normalizePredicate := fun _ p => pure p.id
+    layoutOf := fun _ _ => unusedIntern
+    eraseAndAnonymize := fun _ _ _ => unusedIntern
+    ensureMonomorphicType := fun _ _ => pure (), ensureMonomorphicDyn := fun _ _ => pure ()
+    globalSalt := fun _ => pure 0, reserveVTable := fun _ _ _ _ => unusedIntern
+    globalRootPointer := fun _ _ => unusedIntern
+    entries := fun _ _ _ => pure #[], assertVirtualInstanceMatches := fun _ _ _ _ _ => pure ()
+  }
+  discriminant := {
+    runtimeTarget := RuntimeTargetDataLayout.default
+    discriminantLayout := fun _ _ => unusedIntern
+    tagLayout := fun _ _ => unusedIntern
+    discriminantValue := fun _ _ _ => unusedIntern
+    variantForDiscriminant := fun _ _ _ => unusedIntern
+    adtVariantCount := fun _ _ => pure 0
+    projectRead := fun _ _ _ => unusedIntern
+    readImmediate := fun _ _ => unusedIntern
+    destLayout := fun p => p.layout
+    projectWrite := fun _ _ _ => unusedIntern
+    writeScalar := fun _ _ _ => unusedIntern
+    toOp := fun _ _ => unusedIntern
+    scalarMayBeNull := fun _ _ => pure false
+  }
+  debugAssertions := false
+  classify := fun _ ty =>
+    pure (if ty == 1 then .reference false
+          else if ty == 3 then .boolean
+          else if ty == 10 then .aggregate false false false
+          else .sequence 10)
+  unitLayout := fun _ => pure dynInternZstUnit
+  typeName := fun _ _ => pure "RefRoot"
+  opsemInhabited := fun _ _ => pure true
+  isFreeze := fun _ _ => pure true
+  fieldPath := fun _ _ idx _ => pure (.field s!"{idx}")
+  variantPath := fun _ _ v => pure (.variant s!"{v}")
+  projectBox := fun _ _ => unusedIntern
+  toOp := fun _ place =>
+    match place.ref with
+    | .memory m => pure ⟨.indirect m, place.layout⟩
+    | .local .. => throw (StepError.invalidProgram "expected memory place")
+  readImmediate := fun _ place _ => do
+    if place.layout.ty == 1 then
+      let sc := Scalar.fromPointer RuntimeTargetDataLayout.default.base ⟨Size.ZERO, witnessProv⟩
+      pure ⟨.scalar sc, place.layout⟩
+    else
+      pure ⟨.scalar (Scalar.fromBool true), place.layout⟩
+  clearProvenance := fun _ _ => pure ()
+  writeNoValidate := fun _ _ _ => pure ()
+  sizeAndAlign := fun _ _ => pure (some (Size.ofBytes 1, Align.ONE))
+  ptrToPlace := fun _ val => do
+    let .scalar sc := val.imm | throw (StepError.invalidProgram "expected scalar pointer")
+    let .ok ptr := sc.toPointer RuntimeTargetDataLayout.default.base
+      | throw (StepError.invalidProgram "expected valid pointer")
+    let arrTy ← modifyGet fun w => w.internArray 10
+    pure ⟨⟨ptr, .none, none⟩, dynInternArrLayout arrTy⟩
+  metadataTail := fun _ _ => pure .foreign
+  checkPointerAccess := fun _ _ _ => pure (.ok ())
+  checkPointerAlign := fun _ _ _ => pure ()
+  checkPointerAlignResult := fun _ _ _ => pure (.ok ())
+  scalarMayBeNull := fun _ _ => pure false
+  retagPointer := fun _ _ _ => pure none
+  ctfePointerLookup := fun _ _ _ => unusedIntern
+  inMutableMemory := fun _ _ => pure true
+  readBytes := fun _ _ _ _ => pure ()
+  clearBytesProvenance := fun _ _ _ => pure ()
+  beginPadding := fun _ _ _ => pure none
+  writePadding := fun _ _ _ => pure ()
+  cachedUnionRanges := fun _ _ comp => comp
+  withGhostValidation := fun comp => comp
+
+/-- Initial `RuntimeArrayWorld` prior to root validation (`ty = 99` not yet interned, so
+`initInternWorld.typeRank 99 = 0 < 1 = initInternWorld.typeRank 10`). -/
+def initInternWorld : RuntimeArrayWorld where
+  staticRanks := ⟨[(1, 0), (10, 1), (3, 0)]⟩
+  dynamicEntries := []
+  nextId := 99
+
+/-- **Kernel-evaluated state-varying `typeRankOf` witness (`lean-miri#90` L759, L782):**
+- Re-reading `RuntimeArrayWorld.typeRank (← get)` at each pointee visit **succeeds** after root
+  dereference interns `ty = 99` at rank `2 > 1`;
+- Capturing a stale upfront rank map `fun _ => initInternWorld.typeRank` (`ty = 99 ↦ 0 < 1`)
+  **falsely fails** with `.invalidProgram "validity projection does not descend"`! -/
+theorem stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects :
+    let refRoot : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, some witnessProv⟩, .none, none⟩, lifoRefLayout⟩
+    (match realValidatePlaceNoFuel dynInternHooks () RuntimeArrayWorld.typeRank refRoot true false initInternWorld with
+     | .ok () w' => w'.dynamicEntries == [(99, 2)] && w'.typeRank 99 == 2
+     | .error _ _ => false) = true ∧
+    (match realValidatePlaceNoFuel dynInternHooks () (fun _ => initInternWorld.typeRank) refRoot true false initInternWorld with
+     | .error (.invalidProgram msg) _ => msg == "validity projection does not descend"
+     | _ => false) = true := by
+  intro refRoot
+  rw [← realValidatePlaceLexRank_eq_noFuel, ← realValidatePlaceLexRank_eq_noFuel]
+  exact ⟨by decide +kernel, by decide +kernel⟩
+
+/-! #### Witness 5: Non-vacuous `.Union` `dataBytes` hand-off (`realVisitNoFuel -> realUnionRangesNoFuel`) -/
+
+/-- 4-byte scalar union field layout (`ty = 0`, `layoutOrder = 0`). -/
+def unionField4Layout : LocalLayout :=
+  ⟨0, { wrapperLayout with
+    fields := .Primitive
+    size := Size.ofBytes 4
+    backendRepr := .Scalar (ABI.Scalar.Initialized
+      (value := .Int .I32 false) (validRange := ⟨0, 0xFFFF_FFFF⟩)) }⟩
+
+/-- 4-byte `.Union 1` root layout (`ty = 1`, `layoutOrder = 4`). -/
+def unionRoot4Layout : LocalLayout :=
+  ⟨1, { wrapperLayout with
+    fields := .Union 1
+    size := Size.ofBytes 4 }⟩
+
+/-- Concrete `ValidityVisitor.Hooks` exercising `.Union` `resetProvenanceAndPadding` + `dataBytes`
+hand-off from `visit` into `unionRanges`. -/
+def unionResetVisitHooks : Hooks CtfeProvenance Unit Unit Unit Unit Unit Unit :=
+  let base := minimalValidityHooks
+    (fun _ _ => unionField4Layout)
+    (fun ty => if ty == 1 then unionRoot4Layout else unionField4Layout)
+    (fun ty => if ty == 1 then .aggregate false false false else .integer)
+  { base with
+    toOp := fun _ place =>
+      match place.ref with
+      | .memory m => pure ⟨.indirect m, place.layout⟩
+      | .local .. => throw (.invalidProgram "expected memory place") }
+
+/-- Non-empty `goodU` layout invariant covering both the `.Union 1` root and its 4-byte scalar field. -/
+def unionResetGoodU (l : LocalLayout) : Bool :=
+  decide (l = unionRoot4Layout) || decide (l = unionField4Layout)
+
+/-- Good places for `unionResetVisitHooks`: zero-offset memory places on `unionRoot4Layout`. -/
+def unionResetGood (p : RuntimePlace CtfeProvenance) : Bool :=
+  match p.ref with
+  | .memory m => m.ptr.offset == Size.ZERO && decide (p.layout = unionRoot4Layout)
+  | .local .. => false
+
+/-- Non-vacuous `UnionHooksDescend` for `unionResetVisitHooks`. -/
+theorem unionReset_unionHooksDescend :
+    UnionHooksDescend unionResetVisitHooks () id (fun l => unionResetGoodU l = true) := by
+  intro l hl _
+  simp only [unionResetGoodU, Bool.or_eq_true, decide_eq_true_eq] at hl
+  refine ⟨fun hnotPrim _ s child s' hm => ?_, fun ⟨_, _, _, _, hvs⟩ => ?_⟩
+  · cases s; cases s'
+    rcases hl with rfl | rfl
+    · simp only [unionResetVisitHooks, minimalValidityHooks, pure, EStateM.pure,
+        EStateM.Result.ok.injEq] at hm
+      obtain ⟨rfl, -⟩ := hm
+      exact ⟨by simp [unionResetGoodU], by decide +kernel⟩
+    · exact absurd rfl hnotPrim
+  · rcases hl with rfl | rfl <;> simp [unionRoot4Layout, unionField4Layout, wrapperLayout] at hvs
+
+/-- `VisitHooksDescend` for `unionResetVisitHooks` with non-empty `unionResetGoodU`. -/
+theorem unionReset_visitHooksDescend :
+    VisitHooksDescend unionResetVisitHooks () id unionResetGood unionResetGoodU := by
+  apply visitHooksDescend_of_conditions
+  have unpackU : ∀ p, unionResetGood p = true →
+      ∃ prov metaVal mis, p = ⟨.memory ⟨⟨Size.ZERO, prov⟩, metaVal, mis⟩, unionRoot4Layout⟩ := by
+    rintro ⟨ref, lay⟩ hp
+    cases ref with
+    | «local» => simp [unionResetGood] at hp
+    | memory m =>
+      rcases m with ⟨⟨off, prov⟩, metaVal, mis⟩
+      simp only [unionResetGood, Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at hp
+      rcases hp with ⟨rfl, rfl⟩
+      exact ⟨prov, metaVal, mis, rfl⟩
+  refine {
+    seqZst := fun p hp _ _ _ _ _ _ hcls _ => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; nomatch hcls
+    arrayElem := fun p hp _ _ hfs => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; simp [unionRoot4Layout] at hfs
+    pattern := fun p hp _ _ _ _ _ _ _ _ _ hcls _ _ => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; nomatch hcls
+    dynamic := fun p hp _ _ _ _ _ _ _ _ _ _ hcls _ _ _ => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; nomatch hcls
+    box := fun p hp _ _ _ _ _ _ hcls _ => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; nomatch hcls
+    arbitrary := fun p hp _ _ hfs => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; simp [unionRoot4Layout] at hfs
+    multiple := fun p hp _ _ _ _ hvs => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; simp [unionRoot4Layout, wrapperLayout] at hvs
+    union := fun p hp _ _ => by
+      obtain ⟨_, _, _, rfl⟩ := unpackU p hp; simp [unionResetGoodU]
+  }
+
+/-- **Real vendored `visit` -> `unionRanges` adequacy with non-vacuous `goodU` (`fuel > 5`):**
+when `resetProvenanceAndPadding = true` and `dataBytes = some .empty`, unmodified vendored
+`ValidityVisitor.visit` invokes vendored `unionRanges` at `fuel - 1` and agrees identically with
+`realVisitNoFuel` -> `realUnionRangesNoFuel`. -/
+theorem unionReset_vendored_visit_eq_noFuel (fuel : Nat) (prov : Option CtfeProvenance)
+    (metaVal : MemPlaceMeta CtfeProvenance) (mis : Option Misalignment)
+    (session : Session CtfeProvenance) (hfuel : 5 < fuel) :
+    ValidityVisitor.visit unionResetVisitHooks () fuel session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, metaVal, mis⟩, unionRoot4Layout⟩ =
+      realVisitNoFuel unionResetVisitHooks () id session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, metaVal, mis⟩, unionRoot4Layout⟩ := by
+  refine vendored_visit_eq_noFuel_of_sized unionResetVisitHooks () id unionResetGood
+    unionResetGoodU unionReset_visitHooksDescend unionReset_unionHooksDescend
+    fuel session _ (by simp [unionResetGood]) rfl ?_
+  change layoutOrder id unionRoot4Layout + 1 < fuel
+  have hord : layoutOrder id unionRoot4Layout = 4 := by decide +kernel
+  omega
+
+/-- Kernel-evaluated check that `realVisitNoFuel` marks `[0, 4)` in `session.dataBytes` via
+`realUnionRangesNoFuel`. -/
+theorem unionReset_marks_dataBytes :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, unionRoot4Layout⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"UnionRoot", #[]⟩, flags := ⟨true, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := some .empty }
+    (match realVisitNoFuel unionResetVisitHooks () id init root () with
+     | .ok sess () =>
+       match sess.dataBytes with
+       | some rs => rs.toArray == #[allocRange Size.ZERO (Size.ofBytes 4)]
+       | none => false
+     | .error _ _ => false) = true := by
+  intro root init
+  rw [← realVisitLexRank_eq_noFuel]
+  decide +kernel
+
 end RealVisit
 
 /-! ## 8. `leanprover/lean4#13851` axiom footprint audit
@@ -3550,6 +4075,10 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
 #guard_msgs in
 #print axioms RealVisit.drainPointeesFuel
 
+/-- info: 'LeanMiriSpec.ValidationRankCert.drainPointeesForIn' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms drainPointeesForIn
+
 
 #assert_choice_free
   layoutOrder
@@ -3564,7 +4093,9 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   checkCert_reach_descends
   checkCert_acyclic
   checkCert_rejects_cycle
+  checkSchema17UniqueIds
   checkSchema17Table
+  checkSchema17Table_uniqueIds
   checkSchema17Table_sound
   checkSchema17Table_acyclic
   RankedWalk.walkGuarded
@@ -3579,6 +4110,8 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   vendored_unionRanges_eq_guarded
   drainPointees
   drainPointees_push
+  drainPointeesForIn
+  drainPointeesForIn_eq_drainPointees
   wrapper150_fuel151
   wrapper150_small_fuel_exhausts
   deepUnion150_vendored
@@ -3605,8 +4138,20 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   RealVisit.enumPhase_visitHooksDescend
   RealVisit.enumPhase_vendored_visit_eq_noFuel
   RealVisit.enumPhase_visit_ok
+  RealVisit.RuntimeArrayWorld.typeRank
+  RealVisit.RuntimeArrayWorld.internArray
+  RealVisit.stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects
+  RealVisit.unionReset_unionHooksDescend
+  RealVisit.unionReset_visitHooksDescend
+  RealVisit.unionReset_vendored_visit_eq_noFuel
+  RealVisit.unionReset_marks_dataBytes
 
 #assert_standard_axioms
+  toCert_tyRank_of_uniqueIds
+  checkSchema17Table_toCert_rank_lt
+  RealVisit.realVisitNoFuel_fieldless
+  RealVisit.realVisitLexRank_fieldless
+  RealVisit.RuntimeArrayWorld.internArray_rank_lt
   RankedWalk.walkNoFuel
   VisitLexWalk.walkNoFuel
   visitNoFuel
@@ -3661,5 +4206,10 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   RealVisit.enumPhase_vendored_visit_eq_noFuel
   RealVisit.enumPhase_visit_ok
   RealVisit.lifo3Ref_validatePlace_visits_reverse_order
+  RealVisit.stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects
+  RealVisit.unionReset_unionHooksDescend
+  RealVisit.unionReset_visitHooksDescend
+  RealVisit.unionReset_vendored_visit_eq_noFuel
+  RealVisit.unionReset_marks_dataBytes
 
 end LeanMiriSpec.ValidationRankCert

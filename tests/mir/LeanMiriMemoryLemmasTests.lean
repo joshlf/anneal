@@ -1683,6 +1683,26 @@ theorem wit_schema17_alias_mismatch_rejected :
     (checkSchema17Table schema17AliasMismatch).isOk = false := by
   decide +kernel
 
+/-- Duplicate-ID shadow attack: an earlier `{ id := 0, rank := 0, .primitive }` entry attempts to
+shadow a self-referential `{ id := 0, rank := 1, .array 0 }` entry under `List.find?` and `toCert`. -/
+def schema17DuplicateIdShadow : List Schema17TypeNode := [
+  { id := 0, validationRank := 0, shape := .primitive },
+  { id := 0, validationRank := 1, shape := .array 0 }
+]
+
+theorem wit_schema17_duplicate_id_shadow_rejected :
+    checkSchema17Table schema17DuplicateIdShadow =
+      .error "duplicate validation type id 0" := by
+  decide +kernel
+
+theorem wit_schema17_goodTable_toCert_rank_lt :
+    ∀ node ∈ schema17GoodTable, ∃ children,
+      schema17ByValueChildren node = .ok children ∧
+      ∀ childId ∈ children,
+        (Schema17TypeNode.toCert schema17GoodTable).tyRank childId <
+          (Schema17TypeNode.toCert schema17GoodTable).tyRank node.id :=
+  checkSchema17Table_toCert_rank_lt schema17GoodTable wit_schema17_pointer_recursive_ok
+
 /-! ### 3d. `visitOrder` (`(if isSized then 0 else 1, layoutOrder)`) & `dyn Trait` dynamic unpacking -/
 
 /-- Unsized `dyn Trait` layout (`ty = 0`, `backendRepr = .Memory (sized := false)`, `isSized = false`,
@@ -2043,6 +2063,82 @@ theorem wit_lifo3Ref_validatePlace_visits_reverse_order :
        visitedOffsets == #[16, 8, 0] && msg.startsWith "validation[0]"
      | _ => false) = true :=
   RealVisit.lifo3Ref_validatePlace_visits_reverse_order
+
+/-! ### 3e'''. Verbatim `for .. in todo.reverse` drain, `visit_fieldless`, state-varying `typeRankOf`, and `.Union` `dataBytes` hand-off -/
+
+/-- Exact extensional equality between `lean-miri#90`'s verbatim `for (key, path) in tracking.todo.reverse do`
+(`drainPointeesForIn`) and `drainPointees`, plus LIFO execution order check. -/
+theorem wit_drainPointeesForIn_eq_drainPointees
+    (tracking : RefTracking (Key CtfeProvenance) ValidationPath)
+    (step : Key CtfeProvenance → ValidationPath → M (Array ValidationPath) Unit) :
+    drainPointeesForIn tracking step = drainPointees tracking step :=
+  drainPointeesForIn_eq_drainPointees tracking step
+
+/-- Concrete instantiation of `RealVisit.realVisitNoFuel_fieldless` (`lean-miri#90` L725–742) and
+`realVisitLexRank_fieldless` on a fieldless inhabited runtime aggregate (`dynVisitLayout 100`
+with `.Single 0`, `fields = .Arbitrary #[] #[]`). -/
+theorem wit_realVisitNoFuel_fieldless (m : MemPlace CtfeProvenance) (reset mayDangle : Bool)
+    (tracking : Option (RefTracking (Key CtfeProvenance) ValidationPath))
+    (bytes : Option DataRangeSet) :
+    let place : RuntimePlace CtfeProvenance :=
+      ⟨.memory m, ⟨42, { wrapperLayout with fields := .Arbitrary #[] #[] }⟩⟩
+    let session : Session CtfeProvenance :=
+      { path := ⟨"ZstAgg", #[]⟩, flags := ⟨reset, mayDangle⟩, ctfeMode := none,
+        refTracking := tracking, dataBytes := bytes }
+    RealVisit.realVisitNoFuel RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank
+        session place () = .ok session () ∧
+      RealVisit.realVisitLexRank RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank
+        session place () = .ok session () := by
+  intro place session
+  exact ⟨RealVisit.realVisitNoFuel_fieldless _ _ _ session place () 0 rfl rfl rfl rfl rfl rfl,
+    RealVisit.realVisitLexRank_fieldless _ _ _ session place () 0 rfl rfl rfl rfl rfl rfl⟩
+
+/-- Dynamic `RuntimeArrayTypes.intern` rank extension (`lean-miri#90` L261–278): interning `[BoolWrap; 1]`
+(`elemTy = 10` at rank `1`, fresh `nextId = 99`) assigns rank `2 > 1`. -/
+theorem wit_runtimeArray_intern_rank_lt :
+    let (arrTy, w') := RealVisit.initInternWorld.internArray 10
+    arrTy = 99 ∧ w'.typeRank 10 = 1 ∧ w'.typeRank arrTy = 2 ∧ w'.typeRank 10 < w'.typeRank arrTy := by
+  have h := RealVisit.RuntimeArrayWorld.internArray_rank_lt RealVisit.initInternWorld 10
+    (by decide +kernel) (by decide +kernel) (by decide)
+  exact ⟨rfl, h.1, h.2.1, h.2.2⟩
+
+/-- State-varying `typeRankOf` separation: re-reading `RuntimeArrayWorld.typeRank (← get)` at the
+pointee visit succeeds after root dereference interns `ty = 99`, whereas stale upfront capture
+`fun _ => initInternWorld.typeRank` fails with `"validity projection does not descend"`. -/
+theorem wit_stateVaryingRank_validatePlace_separates_staleRank :
+    let refRoot : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, some RealVisit.witnessProv⟩, .none, none⟩, RealVisit.lifoRefLayout⟩
+    (match RealVisit.realValidatePlaceNoFuel RealVisit.dynInternHooks ()
+        RealVisit.RuntimeArrayWorld.typeRank refRoot true false RealVisit.initInternWorld with
+     | .ok () w' => w'.dynamicEntries == [(99, 2)] && w'.typeRank 99 == 2
+     | .error _ _ => false) = true ∧
+    (match RealVisit.realValidatePlaceNoFuel RealVisit.dynInternHooks ()
+        (fun _ => RealVisit.initInternWorld.typeRank) refRoot true false RealVisit.initInternWorld with
+     | .error (.invalidProgram msg) _ => msg == "validity projection does not descend"
+     | _ => false) = true :=
+  RealVisit.stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects
+
+/-- Non-vacuous `.Union` `dataBytes` hand-off (`goodU ≠ ∅`): vendored `ValidityVisitor.visit` equals
+`realVisitNoFuel` at `fuel = 6 > 5` and kernel-evaluates `session.dataBytes = #[0..4)`. -/
+theorem wit_unionReset_vendored_eq_noFuel_and_marks_dataBytes
+    (session : Session CtfeProvenance) :
+    ValidityVisitor.visit RealVisit.unionResetVisitHooks () 6 session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.unionRoot4Layout⟩ =
+      RealVisit.realVisitNoFuel RealVisit.unionResetVisitHooks () id session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.unionRoot4Layout⟩ ∧
+    (let root : RuntimePlace CtfeProvenance :=
+       ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.unionRoot4Layout⟩
+     let init : Session CtfeProvenance :=
+       { path := ⟨"UnionRoot", #[]⟩, flags := ⟨true, false⟩, ctfeMode := none,
+         refTracking := none, dataBytes := some .empty }
+     match RealVisit.realVisitNoFuel RealVisit.unionResetVisitHooks () id init root () with
+     | .ok sess () =>
+       match sess.dataBytes with
+       | some rs => rs.toArray == #[allocRange Size.ZERO (Size.ofBytes 4)]
+       | none => false
+     | .error _ _ => false) = true :=
+  ⟨RealVisit.unionReset_vendored_visit_eq_noFuel 6 none .none none session (by decide),
+    RealVisit.unionReset_marks_dataBytes⟩
 
 /-! ### 3f. Dynamic hook-boundary violations, `unionWrapper`, and LIFO pointee draining -/
 
