@@ -66,7 +66,11 @@ and `DataRangeSet` types:
      reading `typeRankOf (← get)` from machine state per root and pointee visit, alongside
      `RealVisit.RuntimeArrayWorld` and key-memoized `RealVisit.MemoRuntimeArrayWorld`, and
    - `drainPointees` / `drainPointeesForIn` (`for (key, path) in tracking.todo.reverse do`) /
-     `RealVisit.drainPointeesFuel` / `pointeeSession` LIFO pointee queue draining.
+     `RealVisit.drainPointeesFuel` / `pointeeSession` LIFO pointee queue draining. The vendored
+     fuelled `validatePlace` worklist loop itself is logically opaque (its `while` goes through the
+     `opaque` `repeatM.impl`, which also brings `Classical.choice` into it), so
+     `RealVisit.drainPointeesFuel` models its body; no adequacy theorem about that loop is
+     possible, and none is claimed.
 4. Equivalences, deterministic `.invalidProgram` hook-violation rejection, and the
    `Anneal.MirFuelFree` bridge (`rankCountdown_converges_iff`, `rankCountdown_canonical`,
    `walkFuel_eq_walkNoFuel_of_wpCoalBounded`, `vendored_unionRanges_eq_noFuel_of_wpCoalBounded`,
