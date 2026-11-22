@@ -4901,9 +4901,8 @@ WRAPPER_TIMEOUT_GRACE_SEC = 30
 # command's own `--timeout` clock (`run_bounded_command`): for up to 1200 s in `build`
 # mode and, on a memory-capped slice, up to 180 s in `file` mode, whatever `--timeout`
 # says. Wrappers older than the cgroup-v2 governance sync queued `build` mode for
-# `max(30, --timeout)` seconds instead (`LEAN_RUN_SLOT_WAIT_FLOOR_SEC`).
+# `max(30, --timeout)` seconds instead, which `_outer_timeout_sec` also covers.
 LEAN_RUN_SLOT_WAIT_SEC = {"file": 180, "build": 1200}
-LEAN_RUN_SLOT_WAIT_FLOOR_SEC = 30
 # A `build`-mode command that the OOM killer ends is retried once after evicting LSP
 # workers, with a timeout that expires at most this long after the slot was acquired,
 # again whatever `--timeout` says (`--no-oom-retry` turns the retry off).
@@ -5205,7 +5204,7 @@ def _outer_timeout_sec(
     if slot_lock:
         slot_wait = LEAN_RUN_SLOT_WAIT_SEC[mode]
         if mode == "build":
-            slot_wait = max(slot_wait, LEAN_RUN_SLOT_WAIT_FLOOR_SEC, inner)
+            slot_wait = max(slot_wait, inner)
         worst += slot_wait
     return max(timeout_sec, worst) + WRAPPER_TIMEOUT_GRACE_SEC
 
@@ -5928,8 +5927,10 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
        that root is then stale against `Trusted`, or
     3. Lake built it (its private `.trace` is a build trace, which records the
        `<Dep>:importAllArts` hash of each direct import) and either a recorded import is
-       itself stale, or that import's artifacts were re-recorded after the trace was
-       written (a `.hash` sidecar of `_lean_import_all_arts_parts` is newer than the
+       itself stale, or a recorded import from a library of this Lake root (a `lean_lib`
+       of its `lakefile.toml`; without one, any non-core module whose source is found)
+       has no `.olean` there, or that import's artifacts were re-recorded after the trace
+       was written (a `.hash` sidecar of `_lean_import_all_arts_parts` is newer than the
        trace) with a different `importAllArts` hash: the import was rebuilt without the
        module, e.g. by a partial `lake build Trusted`.
 
@@ -6151,9 +6152,6 @@ def _run_step(
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     t0 = time.monotonic()
-    env = _build_step_env(name, env_overrides=env_overrides, cmd=cmd, cwd=cwd)
-    outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
-    timed_out = False
     if not cmd:
         return {
             "name": name,
@@ -6165,6 +6163,9 @@ def _run_step(
             "audit_tags": [],
             "failure_excerpt": "Failed to launch <empty>: empty command",
         }
+    env = _build_step_env(name, env_overrides=env_overrides, cmd=cmd, cwd=cwd)
+    outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
+    timed_out = False
     try:
         proc = subprocess.Popen(
             cmd,

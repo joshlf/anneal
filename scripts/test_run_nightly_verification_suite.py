@@ -12,6 +12,8 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.machinery
+import importlib.util
 import io
 import json
 import os
@@ -4560,19 +4562,19 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             fake_home = root / "fake_home"
             (fake_home / ".elan/bin").mkdir(parents=True)
             (fake_home / ".cargo/bin").mkdir(parents=True)
-            real_home = str(Path.home())
 
-            # Isolated `base_env` with explicit `HOME` prepends only that `HOME`'s toolchains
-            # and never leaks the host process's `Path.home()`.
+            # Isolated `base_env` with explicit `HOME` prepends exactly that `HOME`'s existing
+            # toolchain directories, and nothing of the host process's `Path.home()`. (The
+            # temporary directory may itself be under the host home, as with `TMPDIR=~/tmp`,
+            # so the whole `PATH` is compared rather than its entries' prefixes.)
             env_with_home = suite._build_step_env(
                 "ci_check_non_stable_version",
                 base_env={"HOME": str(fake_home), "PATH": "/usr/bin"},
             )
-            path_parts = env_with_home["PATH"].split(os.pathsep)
-            self.assertIn(str(fake_home / ".elan/bin"), path_parts)
-            self.assertIn(str(fake_home / ".cargo/bin"), path_parts)
-            if real_home != str(fake_home):
-                self.assertFalse(any(p.startswith(real_home + os.sep) for p in path_parts), path_parts)
+            self.assertEqual(
+                env_with_home["PATH"].split(os.pathsep),
+                [str(fake_home / ".elan/bin"), str(fake_home / ".cargo/bin"), "/usr/bin"],
+            )
 
             # Isolated `base_env` without `HOME` must not leak ambient host `HOME` either.
             env_no_home = suite._build_step_env(
@@ -4586,7 +4588,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             # `env_overrides` still takes final precedence.
             renamed = root / "custom-wrapper"
             renamed.write_text(
-                "#!/usr/bin/env python3\n"
+                f"#!{sys.executable}\n"
                 "import json, os, sys\n"
                 "mb = int(os.environ.get('ANNEAL_LEAN_MEMORY_MAX_MB', '5712'))\n"
                 "print(json.dumps({'memory_max_mb': mb}))\n",
@@ -4660,6 +4662,42 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(suite._outer_timeout_sec(file_cmd, 180, env={}), file_wait + 180 + grace, file_cmd)
         run_cmd = [lr, "--timeout", "180", "--", "lake", "--dir", "examples", "env", "lean", "--run", "Foo.lean"]
         self.assertEqual(suite._lean_run_wrapper_flags(run_cmd)[0], "build")
+
+    def test_auto_mode_detection_matches_the_in_repo_wrapper(self) -> None:
+        # `_lake_env_lean_index` and its three option tables are a copy of the wrapper's
+        # (`detect_mode`). Load the wrapper and compare, so the copy cannot drift silently.
+        loader = importlib.machinery.SourceFileLoader(
+            "anneal_lean_run_under_test", os.fspath(REPO_ROOT / "scripts/anneal-lean-run")
+        )
+        wrapper = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        with mock.patch.object(sys, "dont_write_bytecode", True):
+            loader.exec_module(wrapper)
+        for table in ("_LAKE_VALUE_OPTS", "_LAKE_VALUE_EQ_PREFIXES", "_LAKE_FLAG_OPTS"):
+            self.assertEqual(set(getattr(suite, table)), set(getattr(wrapper, table)), table)
+        lr = "/opt/bin/anneal-lean-run"
+        for inner in (
+            ["lean", "Foo.lean"],
+            ["/toolchain/bin/lean", "--run", "Foo.lean"],
+            ["lake", "env", "lean", "Foo.lean"],
+            ["lake", "env", "--", "lean", "Foo.lean"],
+            ["lake", "env", "lean", "--run", "Foo.lean"],
+            ["lake", "--dir", "examples", "env", "lean", "Foo.lean"],
+            ["lake", "-d", "examples", "-q", "env", "lean", "Foo.lean"],
+            ["lake", "-dexamples", "+nightly", "-Kfoo=bar", "--wfail", "env", "lean", "Foo.lean"],
+            ["lake", "--file=lakefile.toml", "--packages=p.json", "env", "lean", "Foo.lean"],
+            ["lake", "--dir", "examples", "build", "LeanMiriSpec"],
+            ["lake", "--unknown-flag", "env", "lean", "Foo.lean"],
+            ["lake", "--", "env", "lean", "Foo.lean"],
+            ["lake", "-d"],
+            ["lake", "env"],
+            ["lake", "env", "printenv"],
+            ["lake", "exe", "lean", "Foo.lean"],
+            ["cargo", "test"],
+            ["env", "lean", "Foo.lean"],
+        ):
+            expected = wrapper.detect_mode(inner, "auto")
+            self.assertEqual(suite._lean_run_wrapper_flags([lr, "--", *inner])[0], expected, inner)
+            self.assertEqual(suite._lean_run_wrapper_flags([lr, *inner])[0], expected, inner)
 
     def test_run_step_empty_cmd_and_dashboard_corrupt_state_json_resilience(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
