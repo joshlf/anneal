@@ -3941,6 +3941,190 @@ theorem starvedCofactorCap_not_measured_from_phase_start :
       starvedCofactorCap? 7000000 7000000 = starvedCofactorCap? 0 0 :=
   ⟨by decide, starvedCofactorCap_depends_only_on_starved_usage _ _ _ _ (by decide)⟩
 
+/-- A nearly dry budget (or a sub-floor `stepHeartbeats`) never receives a smaller Phase 3
+    cofactoring cap than an already-exhausted budget with the same starved floor. -/
+theorem phase3CofactorCap_never_below_starved_floor
+    (remCap starvedStart now fc : Nat)
+    (hFloor : starvedCofactorCap? starvedStart now = some fc) :
+    ∃ cap,
+      phase3CofactorCap? (some remCap) (starvedCofactorCap? starvedStart now) = some cap ∧
+      fc ≤ cap := by
+  rw [hFloor]
+  exact ⟨_, rfl, Nat.le_max_right _ _⟩
+
+/-- Concrete regression values for `phase3CofactorCap?` across sub-floor, well-funded,
+    starved, and exhausted budgets. -/
+theorem phase3CofactorCap_subfloor_step_keeps_floor :
+    phase3CofactorCap? (some 1000) (starvedCofactorCap? 7000000 7000000) = some 250000 ∧
+      phase3CofactorCap? (some 50000000) none = some 2000000 ∧
+      phase3CofactorCap? none (starvedCofactorCap? 7000000 7000000) = some 250000 ∧
+      phase3CofactorCap? none (starvedCofactorCap? 7000000 9000000) = none := by
+  decide
+
+-- A sub-floor `stepHeartbeats` with ample `totalHeartbeats` still grants `cofactorBoilerplate`
+-- the starved structural floor, matching `{ stepHeartbeats := 0, totalHeartbeats := 0 }`.
+#eval assertDeclEnsuresVacuous ``matchOptionU32BoilerplateContract (some .unboundReturnOutput)
+  { stepHeartbeats := 1, totalHeartbeats := 250000 }
+
+/-! ### 3.28 Comprehensive Negative-Control Matrix (Branches, Parity Witnesses, Stateful Read/Write & `Option`/`Except`) -/
+
+/-- Bounded precondition shared by the Round 4 negative-control contracts (`x ≤ 100`). -/
+def boundedInputPre (x : Nat) : Prop := x ≤ 100
+
+/-- Multi-way conditional-branch contract (`if`/`else if`/`else`) classifying `x` into
+    three distinct buckets. -/
+def piecewiseBucketPost (x ret : Nat) : Prop :=
+  if x = 0 then ret = 0 else if x < 50 then ret = 1 else ret = 2
+
+/-- Genuine dependent-`if` (`dite`) stateless contract referencing its branch proof `h`. -/
+def diteBoundedIndexPost (x ret : Nat) : Prop :=
+  if h : x < 10 then (⟨x, h⟩ : Fin 10).val = ret else ret = 10
+
+/-- Conditional existential-witness parity contract: even inputs require an even witness
+    `∃ k, ret = 2 * k`, odd inputs require an odd witness `∃ k, ret = 2 * k + 1`. -/
+def conditionalParityWitnessPost (x ret : Nat) : Prop :=
+  if x % 2 = 0 then ∃ k : Nat, ret = 2 * k else ∃ k : Nat, ret = 2 * k + 1
+
+/-- MIR stub for a stateful read/write register contract. -/
+def statefulReadWriteBody : CapturedMir :=
+  mkStubBody "register::read_or_write" 2
+    [mkLocalDecl u32MirTy, mkLocalDecl boolMirTy, mkLocalDecl u32MirTy]
+    u32Layout true
+
+/-- Precondition for `statefulReadWriteClaim`: `mode ∈ {0, 1}`, bounded `delta`, and
+    no `u32` overflow on `mem.nextTag + delta`. -/
+def statefulReadWritePre (args : List Value) (mem : Memory) : Prop :=
+  ∃ mode delta : Nat,
+    mode < 2 ∧ delta < 1000 ∧ mem.nextTag + delta < scalarModulus 4 ∧
+    args = [.scalar { bits := mode, sizeBytes := 1 }, .scalar { bits := delta, sizeBytes := 4 }]
+
+/-- Stateful read/write invariant postcondition preserving untouched memory fields
+    (`nextAllocId`, `globals`) while reading `mem.nextTag` on `mode = 0` or writing
+    `mem.nextTag + delta` on `mode = 1`. -/
+def statefulReadWritePost
+    (args : List Value) (mem : Memory) (ret : Value) (mem' : Memory) : Prop :=
+  ∃ mode delta : Nat,
+    args = [.scalar { bits := mode, sizeBytes := 1 }, .scalar { bits := delta, sizeBytes := 4 }] ∧
+    mem'.nextAllocId = mem.nextAllocId ∧
+    mem'.globals = mem.globals ∧
+    (if mode = 0 then
+      ret = .scalar { bits := mem.nextTag, sizeBytes := 4 } ∧ mem' = mem
+    else
+      ret = .scalar { bits := mem.nextTag + delta, sizeBytes := 4 } ∧
+      mem' = { mem with nextTag := mem.nextTag + delta })
+
+def statefulReadWriteClaim : StatefulClaim := {
+  body := statefulReadWriteBody
+  pre := statefulReadWritePre
+  post := statefulReadWritePost
+}
+
+/-- Genuine `Option Nat` contract combining constructor branching with existential parity
+    witnesses (`some v` iff `x = 2 * k ∧ v = k`, `none` iff `x = 2 * k + 1`). -/
+def optionParityWitnessPost (x : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => ∃ k : Nat, x = 2 * k ∧ v = k
+  | none => ∃ k : Nat, x = 2 * k + 1
+
+/-- Genuine `Except Nat Nat` (Lean `Result` analog) contract combining an existential
+    evenness witness on `.ok` (`x ≤ 50`) with exact excess on `.error` (`50 < x`). -/
+def exceptParityOrExcessPost (x : Nat) (ret : Except Nat Nat) : Prop :=
+  match ret with
+  | .ok v => x ≤ 50 ∧ ∃ k : Nat, v = 2 * k ∧ x ≤ v
+  | .error e => 50 < x ∧ e = x - 50
+
+theorem piecewiseBucketPost_dichotomy :
+    PostconditionDichotomy boundedInputPre piecewiseBucketPost := by
+  refine ⟨25, by simp [boundedInputPre], ⟨1, ?_⟩, ⟨2, ?_⟩⟩ <;>
+    simp [piecewiseBucketPost]
+
+theorem diteBoundedIndexPost_dichotomy :
+    PostconditionDichotomy boundedInputPre diteBoundedIndexPost := by
+  refine ⟨3, by simp [boundedInputPre], ⟨3, ?_⟩, ⟨4, ?_⟩⟩ <;>
+    simp [diteBoundedIndexPost]
+
+theorem conditionalParityWitnessPost_dichotomy :
+    PostconditionDichotomy boundedInputPre conditionalParityWitnessPost := by
+  have hEven : (4 : Nat) % 2 = 0 := by decide
+  refine ⟨4, by simp [boundedInputPre], ⟨8, ?_⟩, ⟨9, ?_⟩⟩
+  · unfold conditionalParityWitnessPost
+    simp only [hEven, ↓reduceIte]
+    exact ⟨4, rfl⟩
+  · intro hBad
+    unfold conditionalParityWitnessPost at hBad
+    simp only [hEven, ↓reduceIte] at hBad
+    rcases hBad with ⟨k, hk⟩
+    omega
+
+theorem statefulReadWriteClaim_returnDichotomy :
+    StatefulClaimReturnDichotomy statefulReadWriteClaim := by
+  have hNe : ¬ ((1 : Nat) = 0) := by decide
+  refine ⟨[.scalar { bits := 1, sizeBytes := 1 }, .scalar { bits := 3, sizeBytes := 4 }],
+    emptyMemory, { emptyMemory with nextTag := emptyMemory.nextTag + 3 },
+    .scalar { bits := emptyMemory.nextTag + 3, sizeBytes := 4 },
+    .scalar { bits := 0, sizeBytes := 4 },
+    ⟨1, 3, by decide, by decide, by decide, rfl⟩,
+    ⟨1, 3, rfl, rfl, rfl, ?_⟩,
+    ?_⟩
+  · simp [hNe]
+  · rintro ⟨mode, delta, hArgs, _, _, hBranch⟩
+    rcases list_pair_inj hArgs with ⟨hMode, hDelta⟩
+    have hm : (1 : Nat) = mode := (scalar_bits_inj hMode).1
+    have hd : (3 : Nat) = delta := (scalar_bits_inj hDelta).1
+    subst hm; subst hd
+    simp only [hNe, ↓reduceIte] at hBranch
+    have hBits : (0 : Nat) = emptyMemory.nextTag + 3 := (scalar_bits_inj hBranch.1).1
+    dsimp [emptyMemory] at hBits
+    omega
+
+theorem optionParityWitnessPost_dichotomy :
+    PostconditionDichotomy boundedInputPre optionParityWitnessPost := by
+  refine ⟨4, by simp [boundedInputPre], ⟨some 2, ?_⟩, ⟨none, ?_⟩⟩
+  · exact ⟨2, rfl, rfl⟩
+  · rintro ⟨k, hk⟩
+    omega
+
+theorem exceptParityOrExcessPost_dichotomy :
+    PostconditionDichotomy boundedInputPre exceptParityOrExcessPost := by
+  refine ⟨4, by simp [boundedInputPre], ⟨.ok 4, ?_⟩, ⟨.error 0, ?_⟩⟩
+  · exact ⟨by decide, ⟨2, rfl, Nat.le_refl 4⟩⟩
+  · rintro ⟨hGt, _⟩
+    omega
+
+-- Negative controls across all four contract families: none may be false-flagged under
+-- default budgets, with or without `requires`, under `strictReturnValue`, or under a
+-- starved probe budget.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``piecewiseBucketPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``piecewiseBucketPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``piecewiseBucketPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``diteBoundedIndexPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``diteBoundedIndexPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsEvenPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsEvenPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``conditionalParityWitnessPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``conditionalParityWitnessPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``conditionalParityWitnessPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertDeclEnsuresBindsOutput ``statefulReadWriteClaim
+#eval assertDeclEnsuresBindsOutput ``statefulReadWriteClaim { strictReturnValue := true }
+#eval assertDeclEnsuresBindsOutput ``statefulReadWriteClaim
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``optionParityWitnessPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``optionParityWitnessPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``exceptParityOrExcessPost)
+  (some (Lean.mkConst ``boundedInputPre))
+#eval assertEnsuresBindsOutput (Lean.mkConst ``exceptParityOrExcessPost)
+  (some (Lean.mkConst ``boundedInputPre)) { stepHeartbeats := 0, totalHeartbeats := 0 }
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
@@ -4036,7 +4220,8 @@ def auditViolation? (n : Lean.Name) : Lean.Meta.MetaM (Option String) := do
     ``not_externalSpecEnsuresDichotomy_of_trivial_extraPost,
     ``exists_handler_holdsOn_of_universalNormalRealizable,
     ``cappedHeartbeats_never_unlimited,
-    ``starvedCofactorCap_depends_only_on_starved_usage
+    ``starvedCofactorCap_depends_only_on_starved_usage,
+    ``phase3CofactorCap_never_below_starved_floor
   ]
   for n in requiredTheorems do
     unless isTarget n do

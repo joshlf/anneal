@@ -5617,3 +5617,302 @@ fn probed_inputs_counts_the_anchor_plus_a_trial_bounded_sample() {
         }) if out_of_precondition_probes > 0
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Comprehensive negative-control matrix: conditional branches, existential
+// parity witnesses, stateful read/write invariants, and Option/Result contracts
+// (dynamic counterparts of Lean `SpecRealizabilityTests` section 3.28)
+// ---------------------------------------------------------------------------
+
+#[spec(
+    pure,
+    total,
+    requires: x > i32::MIN,
+    ensures: |ret| if x < 0 {
+        ret == -1
+    } else if x == 0 {
+        ret == 0
+    } else {
+        ret == 1
+    },
+)]
+fn piecewise_sign_i32(x: i32) -> i8 {
+    if x < 0 {
+        -1
+    } else if x == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+#[spec(
+    pure,
+    total,
+    requires: x <= 100,
+    ensures: |ret| (ret / 2).checked_mul(2) == Some(ret),
+)]
+fn even_parity_witness_u32(x: u32) -> u32 {
+    2 * x
+}
+
+#[spec(
+    pure,
+    total,
+    requires: x <= 100,
+    ensures: |ret| ret <= 200 && (0..=100u32).any(|k| k * 2 == ret),
+)]
+fn bounded_even_witness_u32(x: u32) -> u32 {
+    2 * x
+}
+
+#[spec(
+    pure,
+    total,
+    requires: x <= 100,
+    ensures: |ret| if x % 2 == 0 {
+        (ret / 2).checked_mul(2) == Some(ret)
+    } else {
+        (ret / 2).checked_mul(2).and_then(|v| v.checked_add(1)) == Some(ret)
+    },
+)]
+fn conditional_parity_witness_u32(x: u32) -> u32 {
+    if x % 2 == 0 { 2 * x } else { 2 * x + 1 }
+}
+
+#[spec(
+    pure,
+    total,
+    requires: x <= 100,
+    ensures: |ret| match ret {
+        Some(k) => k.checked_mul(2) == Some(x),
+        None => x % 2 == 1,
+    },
+)]
+fn checked_half_even_u32(x: u32) -> Option<u32> {
+    if x % 2 == 0 { Some(x / 2) } else { None }
+}
+
+#[spec(
+    pure,
+    total,
+    requires: x <= 128,
+    ensures: |ret| match ret {
+        Ok(v) => x <= 50 && (v / 2).checked_mul(2) == Some(v) && v >= x,
+        Err(excess) => x > 50 && excess == (x - 50) as u8,
+    },
+)]
+fn checked_even_or_excess_u32(x: u32) -> Result<u32, u8> {
+    if x <= 50 {
+        Ok(2 * x)
+    } else {
+        Err((x - 50) as u8)
+    }
+}
+
+#[invariant(self.cursor <= self.written, self.written <= self.capacity)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadWriteBuffer {
+    cursor: u16,
+    written: u16,
+    capacity: u16,
+}
+
+anneal_spec::impl_spec_check_struct!(ReadWriteBuffer {
+    cursor: u16,
+    written: u16,
+    capacity: u16,
+});
+
+#[test]
+fn negative_controls_conditional_branches_and_existential_parity_witnesses() {
+    for seed in [0u64, 1, 0xCAFE_BABE, u64::MAX] {
+        for domain in [ProbeDomain::PreconditionOnly, ProbeDomain::Unconstrained] {
+            let cfg = SpecCheckConfig::default()
+                .with_seed(seed)
+                .with_probe_domain(domain);
+            let tight = cfg.with_max_mutants_per_hit(1);
+
+            // 1. Multi-branch conditional contract (`if` / `else if` / `else`).
+            let mut saw_neg = false;
+            let mut saw_zero = false;
+            let mut saw_pos = false;
+            let sign_stats = assert_contract_strong(
+                cfg,
+                |&x: &i32| __anodized_fn_requires_piecewise_sign_i32(x),
+                |&x| {
+                    if x < 0 {
+                        saw_neg = true;
+                    } else if x == 0 {
+                        saw_zero = true;
+                    } else {
+                        saw_pos = true;
+                    }
+                    piecewise_sign_i32(x)
+                },
+                |&x, &ret| __anodized_fn_ensures_piecewise_sign_i32(x, ret),
+            );
+            assert!(saw_neg && saw_zero && saw_pos, "seed {seed:#x}");
+            assert!(sign_stats.is_pointwise_strong(), "seed {seed:#x}");
+            assert!(sign_stats.kills_every_mutant(), "seed {seed:#x}");
+
+            let sign_tight = assert_contract_strong(
+                tight,
+                |&x: &i32| __anodized_fn_requires_piecewise_sign_i32(x),
+                |&x| piecewise_sign_i32(x),
+                |&x, &ret| __anodized_fn_ensures_piecewise_sign_i32(x, ret),
+            );
+            assert!(sign_tight.is_pointwise_strong(), "seed {seed:#x}");
+
+            // 2. Existential parity witness (`∃ k, ret = 2 * k`): genuinely relational
+            //    (even-offset mutants like `ret + 2` survive) yet never false-flagged.
+            let even_stats = assert_contract_strong(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_even_parity_witness_u32(x),
+                |&x| even_parity_witness_u32(x),
+                |&x, &ret| __anodized_fn_ensures_even_parity_witness_u32(x, ret),
+            );
+            assert!(even_stats.is_pointwise_strong(), "seed {seed:#x}");
+            assert!(even_stats.mutants_survived() > 0, "seed {seed:#x}");
+
+            let even_tight = assert_contract_strong(
+                tight,
+                |&x: &u32| __anodized_fn_requires_even_parity_witness_u32(x),
+                |&x| even_parity_witness_u32(x),
+                |&x, &ret| __anodized_fn_ensures_even_parity_witness_u32(x, ret),
+            );
+            assert!(even_tight.is_pointwise_strong(), "seed {seed:#x}");
+
+            let bounded_even = assert_contract_strong(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_bounded_even_witness_u32(x),
+                |&x| bounded_even_witness_u32(x),
+                |&x, &ret| __anodized_fn_ensures_bounded_even_witness_u32(x, ret),
+            );
+            assert!(bounded_even.is_pointwise_strong(), "seed {seed:#x}");
+            assert!(bounded_even.mutants_survived() > 0, "seed {seed:#x}");
+
+            // 3. Conditional existential parity (`even` vs `odd` branches).
+            let mut saw_even = false;
+            let mut saw_odd = false;
+            let cond_parity = assert_contract_strong(
+                cfg,
+                |&x: &u32| __anodized_fn_requires_conditional_parity_witness_u32(x),
+                |&x| {
+                    if x % 2 == 0 {
+                        saw_even = true;
+                    } else {
+                        saw_odd = true;
+                    }
+                    conditional_parity_witness_u32(x)
+                },
+                |&x, &ret| __anodized_fn_ensures_conditional_parity_witness_u32(x, ret),
+            );
+            assert!(saw_even && saw_odd, "seed {seed:#x}");
+            assert!(cond_parity.is_pointwise_strong(), "seed {seed:#x}");
+            assert!(cond_parity.mutants_survived() > 0, "seed {seed:#x}");
+        }
+    }
+}
+
+#[test]
+fn negative_controls_stateful_read_write_invariants_and_option_result_contracts() {
+    for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX] {
+        let cfg = SpecCheckConfig::default().with_seed(seed);
+
+        // 1. Stateful read/write invariant (`#[invariant]` + frame preservation +
+        //    conditional read/write/full-error branches returning `Result<u16, u16>`).
+        let mut saw_read = false;
+        let mut saw_write_ok = false;
+        let mut saw_write_full = false;
+        let rw_stats = assert_stateful_contract_strong(
+            cfg,
+            |old: &ReadWriteBuffer, &(is_write, delta): &(bool, u16)| {
+                old.__anneal_type_invariant_read_write_buffer() && (!is_write || delta <= 16)
+            },
+            |buf: &mut ReadWriteBuffer, &(is_write, delta): &(bool, u16)| -> Result<u16, u16> {
+                if !is_write {
+                    saw_read = true;
+                    Ok(buf.written - buf.cursor)
+                } else if let Some(next_written) = buf.written.checked_add(delta)
+                    && next_written <= buf.capacity
+                {
+                    saw_write_ok = true;
+                    buf.written = next_written;
+                    Ok(next_written)
+                } else {
+                    saw_write_full = true;
+                    Err(buf.capacity - buf.written)
+                }
+            },
+            |old: &ReadWriteBuffer,
+             &(is_write, delta): &(bool, u16),
+             new: &ReadWriteBuffer,
+             ret: &Result<u16, u16>| {
+                new.__anneal_type_invariant_read_write_buffer()
+                    && new.cursor == old.cursor
+                    && new.capacity == old.capacity
+                    && if !is_write {
+                        new.written == old.written
+                            && *ret == Ok(old.written.saturating_sub(old.cursor))
+                    } else if let Some(next_written) = old.written.checked_add(delta)
+                        && next_written <= old.capacity
+                    {
+                        new.written == next_written && *ret == Ok(next_written)
+                    } else {
+                        new.written == old.written
+                            && *ret == Err(old.capacity.saturating_sub(old.written))
+                    }
+            },
+        );
+        assert!(
+            saw_read && saw_write_ok && saw_write_full,
+            "seed {seed:#x}: expected read, write-ok, and write-full paths"
+        );
+        assert!(rw_stats.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(rw_stats.kills_every_mutant(), "seed {seed:#x}");
+
+        // 2. Genuine `Option<u32>` contract with parity witness (`Some(k)` iff `2 * k == x`).
+        let mut saw_some = false;
+        let mut saw_none = false;
+        let opt_stats = assert_contract_strong(
+            cfg,
+            |&x: &u32| __anodized_fn_requires_checked_half_even_u32(x),
+            |&x| {
+                let res = checked_half_even_u32(x);
+                if res.is_some() {
+                    saw_some = true;
+                } else {
+                    saw_none = true;
+                }
+                res
+            },
+            |&x, &ret| __anodized_fn_ensures_checked_half_even_u32(x, ret),
+        );
+        assert!(saw_some && saw_none, "seed {seed:#x}");
+        assert!(opt_stats.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(opt_stats.kills_every_mutant(), "seed {seed:#x}");
+
+        // 3. Genuine `Result<u32, u8>` contract combining relational parity witness on
+        //    `Ok` with exact excess on `Err`.
+        let mut saw_ok = false;
+        let mut saw_err = false;
+        let res_stats = assert_contract_strong(
+            cfg,
+            |&x: &u32| __anodized_fn_requires_checked_even_or_excess_u32(x),
+            |&x| {
+                let res = checked_even_or_excess_u32(x);
+                if res.is_ok() {
+                    saw_ok = true;
+                } else {
+                    saw_err = true;
+                }
+                res
+            },
+            |&x, &ret| __anodized_fn_ensures_checked_even_or_excess_u32(x, ret),
+        );
+        assert!(saw_ok && saw_err, "seed {seed:#x}");
+        assert!(res_stats.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(res_stats.mutants_survived() > 0, "seed {seed:#x}");
+    }
+}

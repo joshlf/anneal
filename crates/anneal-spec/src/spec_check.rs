@@ -1765,9 +1765,10 @@ pub enum FailureDetail {
     InsufficientPreconditionHits { required: usize, observed: usize },
     /// Live conformance violation or fail-closed degenerate configuration.
     Violation(ViolationKind),
-    /// Zero distinct mutants were tested (e.g. `max_mutants_per_hit == 0` or
-    /// every custom mutant equaled the actual output, however often the bank
-    /// repeats it).
+    /// Zero distinct mutants were tested (e.g. an empty custom mutant bank,
+    /// every custom mutant equaled the actual output however often the bank
+    /// repeats it, or a custom [`ReturnMutants`] implementation emitted no
+    /// distinct mutant).
     NoDistinctMutantsTested,
     /// All tested mutants satisfied the postcondition; includes probe telemetry.
     AllMutantsSurvived {

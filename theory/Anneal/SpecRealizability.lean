@@ -1745,6 +1745,23 @@ def starvedCofactorCap? (starvedStart now : Nat) : Option Nat :=
   else
     none
 
+/-- Effective internal-heartbeat cap for one `cofactorBoilerplate` call in Phase 3,
+    combining `remCap?` (from `ProbeBudget.nextCap?`) with the starved structural floor
+    `floorCap?` (from `starvedCofactorCap?`).
+
+    Monotone across the starvation boundary: a nearly dry budget (`some remCap` with
+    `remCap < closedNatSubtermHeartbeats`) or a sub-floor `stepHeartbeats` never
+    receives a smaller cofactoring cap than an already-exhausted budget (`none`), while
+    a well-funded budget stays capped at `min remCap closedNatFoldHeartbeats`. -/
+def phase3CofactorCap? (remCap? floorCap? : Option Nat) : Option Nat :=
+  match remCap? with
+  | some remCap =>
+    let bounded := min remCap closedNatFoldHeartbeats
+    match floorCap? with
+    | some fc => some (max bounded fc)
+    | none => some bounded
+  | none => floorCap?
+
 /-- Conservative syntactic pre-check that avoids calling `whnf` on closed `Nat`
     exponentiations, shifts, or scalar moduli whose literal operand would already
     produce a value at or above `closedNatFoldBound` (`2 ^ 512`), preventing
@@ -4095,21 +4112,29 @@ private def analyzeNormalizedSpec
         let fibreAssump := mkFibreAssumption expandedAtoms mask
         -- Bound `cofactorBoilerplate` so nested `match` expressions composed with up to
         -- `2^8 = 256` boilerplate masks cannot exhaust the enclosing command's heartbeats.
-        -- Once `budget` is spent, pure syntactic cofactoring retains a bounded structural
-        -- floor (`starvedCofactorCap?`: `closedNatFoldHeartbeats` in total across the
-        -- masks processed after `budget` ran dry) so starved-budget syntactic checks
-        -- still succeed while pathological masks degrade conservatively.
+        -- Near or after budget exhaustion (or under a sub-floor `stepHeartbeats`), pure
+        -- syntactic cofactoring retains a bounded structural floor (`phase3CofactorCap?`
+        -- + `starvedCofactorCap?`: `closedNatFoldHeartbeats` in total across remaining
+        -- masks) so starved-budget syntactic checks still succeed while pathological
+        -- masks degrade conservatively.
         let mut cofactorCap? : Option Nat := none
         match ← budget.nextCap? with
         | some remCap =>
-          cofactorCap? := some (min remCap closedNatFoldHeartbeats)
+          if remCap >= closedNatSubtermHeartbeats then
+            cofactorCap? := phase3CofactorCap? (some remCap) none
+          else
+            let now ← IO.getNumHeartbeats
+            let starvedStart := phase3StarvedStart?.getD now
+            phase3StarvedStart? := some starvedStart
+            cofactorCap? :=
+              phase3CofactorCap? (some remCap) (starvedCofactorCap? starvedStart now)
         | none =>
           phase3BudgetExhausted := true
           probeCutOffRef.set true
           let now ← IO.getNumHeartbeats
           let starvedStart := phase3StarvedStart?.getD now
           phase3StarvedStart? := some starvedStart
-          cofactorCap? := starvedCofactorCap? starvedStart now
+          cofactorCap? := phase3CofactorCap? none (starvedCofactorCap? starvedStart now)
         let mut rawRes := workBody
         match cofactorCap? with
         | none =>
