@@ -35,6 +35,13 @@ This module provides:
      (`cappedHeartbeats?`, never passing `0`), message-log-isolated `MetaM` analyzer
      (`checkEnsuresBindsOutput`, `checkDeclEnsuresBindsOutput`,
      `checkRequiresSatisfiable`, `assertEnsuresBindsOutput`, `assertEnsuresVacuous`).
+   - Every vacuity verdict that is not purely syntactic rests on a `Meta.check`ed
+     proof: of validity, of unsatisfiability, or of output-insensitivity
+     (`∀ x y y', post x y → post x y'`, i.e. `ForwardOutputInsensitive`, which refutes
+     `PostconditionDichotomy`). A probe that fails or exhausts its heartbeat budget
+     (a runtime exception, contained by `withBoundedHeartbeats`) never flags a
+     specification, so the checker has no false positives by construction; missed
+     detections are bounded by the strength of the prover.
 -/
 
 namespace Anneal.SpecRealizability
@@ -126,6 +133,13 @@ def OutputInsensitive {X : Type u} {Y : Type v}
     (pre : X → Prop) (post : X → Y → Prop) : Prop :=
   ∀ x, pre x → ∀ y₁ y₂, post x y₁ ↔ post x y₂
 
+/-- One-directional form of `OutputInsensitive`: under `pre`, accepting one output
+    forces accepting every other output. This is the exact shape discharged by the
+    `MetaM` output-insensitivity probe (`∀ x y y', post x y → post x y'`). -/
+def ForwardOutputInsensitive {X : Type u} {Y : Type v}
+    (pre : X → Prop) (post : X → Y → Prop) : Prop :=
+  ∀ x, pre x → ∀ y₁ y₂, post x y₁ → post x y₂
+
 /-- Postcondition `post` achieves dichotomy within a single observation fibre of `obs`,
     ruling out vacuous dichotomy caused solely by differing `obs` boilerplate values. -/
 def DichotomyModuloObservation {X : Type u} {Y : Type v} {Z : Type w}
@@ -212,12 +226,11 @@ theorem postconditionDichotomy_iff_exists_killed_mutant
   · rintro ⟨x, y_ok, y_bad, hPre, _, hOk, hBad⟩
     exact ⟨x, hPre, ⟨y_ok, hOk⟩, ⟨y_bad, hBad⟩⟩
 
-/-- Under `UniversalContractRealizable`, observational determinism holds iff the
-    postcondition kills every mutant whose observation differs from an accepted output. -/
+/-- Observational determinism holds iff the postcondition kills every mutant whose
+    observation differs from an accepted output. -/
 theorem contractDeterministicOn_iff_kills_every_obs_nonequivalent_mutant
     {X : Type u} {Y : Type v} {Z : Type w}
-    {obs : Y → Z} {pre : X → Prop} {post : X → Y → Prop}
-    (_hReal : UniversalContractRealizable pre post) :
+    {obs : Y → Z} {pre : X → Prop} {post : X → Y → Prop} :
     ContractDeterministicOn obs pre post ↔
       ∀ x y_ok y_bad,
         pre x → post x y_ok → obs y_bad ≠ obs y_ok → ¬ post x y_bad := by
@@ -302,6 +315,39 @@ theorem not_postconditionDichotomy_of_outputInsensitive
   rintro ⟨x, hPre, ⟨y_ok, hOk⟩, ⟨y_bad, hBad⟩⟩
   exact hBad ((hInsens x hPre y_ok y_bad).mp hOk)
 
+theorem outputInsensitive_iff_forwardOutputInsensitive
+    {X : Type u} {Y : Type v} {pre : X → Prop} {post : X → Y → Prop} :
+    OutputInsensitive pre post ↔ ForwardOutputInsensitive pre post := by
+  constructor
+  · intro h x hPre y₁ y₂ h1
+    exact (h x hPre y₁ y₂).mp h1
+  · intro h x hPre y₁ y₂
+    exact ⟨h x hPre y₁ y₂, h x hPre y₂ y₁⟩
+
+/-- Kernel justification of the `MetaM` output-insensitivity probe: a contract whose
+    postcondition is forward output-insensitive under `pre` can never satisfy
+    `PostconditionDichotomy`, so flagging it is never a false positive. -/
+theorem not_postconditionDichotomy_of_forwardOutputInsensitive
+    {X : Type u} {Y : Type v} {pre : X → Prop} {post : X → Y → Prop}
+    (hInsens : ForwardOutputInsensitive pre post) :
+    ¬ PostconditionDichotomy pre post := by
+  rintro ⟨x, hPre, ⟨y_ok, hOk⟩, ⟨y_bad, hBad⟩⟩
+  exact hBad (hInsens x hPre y_ok y_bad hOk)
+
+/-- A tautological-under-`pre` postcondition is forward output-insensitive. -/
+theorem forwardOutputInsensitive_of_trivial
+    {X : Type u} {Y : Type v} {pre : X → Prop} {post : X → Y → Prop}
+    (hTriv : ∀ x y, pre x → post x y) :
+    ForwardOutputInsensitive pre post :=
+  fun x hPre _ y₂ _ => hTriv x y₂ hPre
+
+/-- An unrealizable-under-`pre` postcondition is forward output-insensitive. -/
+theorem forwardOutputInsensitive_of_impossible
+    {X : Type u} {Y : Type v} {pre : X → Prop} {post : X → Y → Prop}
+    (hImp : ∀ x y, pre x → ¬ post x y) :
+    ForwardOutputInsensitive pre post :=
+  fun x hPre y₁ _ h1 => absurd h1 (hImp x y₁ hPre)
+
 theorem not_postconditionDichotomy_of_subsingleton
     {X : Type u} {Y : Type v} [Subsingleton Y]
     {pre : X → Prop} {post : X → Y → Prop} :
@@ -316,6 +362,18 @@ theorem not_dichotomyModuloObservation_of_fibre_insensitive
     ¬ DichotomyModuloObservation obs pre post := by
   rintro ⟨x, hPre, y_ok, y_bad, hObsEq, hOk, hBad⟩
   exact hBad ((hInsens x y_ok y_bad hPre hObsEq).mp hOk)
+
+/-- One-directional form of `not_dichotomyModuloObservation_of_fibre_insensitive`,
+    matching the per-fibre output-insensitivity goal discharged by the `MetaM` checker:
+    a postcondition that cannot tell apart two outputs sharing an observation has no
+    dichotomy modulo that observation. -/
+theorem not_dichotomyModuloObservation_of_fibre_forwardInsensitive
+    {X : Type u} {Y : Type v} {Z : Type w}
+    {obs : X → Y → Z} {pre : X → Prop} {post : X → Y → Prop}
+    (hInsens : ∀ x y₁ y₂, pre x → obs x y₁ = obs x y₂ → post x y₁ → post x y₂) :
+    ¬ DichotomyModuloObservation obs pre post := by
+  rintro ⟨x, hPre, y_ok, y_bad, hObsEq, hOk, hBad⟩
+  exact hBad (hInsens x y_ok y_bad hPre hObsEq hOk)
 
 theorem not_postconditionDichotomy_of_post_true
     {X : Type u} {Y : Type v} (pre : X → Prop) :
@@ -524,6 +582,17 @@ theorem StatefulClaimReturnDichotomy.toDichotomy {c : StatefulClaim}
     (h : StatefulClaimReturnDichotomy c) : StatefulClaimDichotomy c :=
   ((statefulClaimReturnDichotomy_iff_moduloMemory c).mp h).postconditionDichotomy
 
+/-- Kernel justification of `strictReturnValue`: a `StatefulClaim` whose postcondition
+    cannot tell two return values apart once `(args, mem, mem')` are fixed has no strict
+    return-value dichotomy, however tightly it constrains `mem'` (for example
+    `retVal = retVal ∧ mem' = mem`). -/
+theorem not_statefulClaimReturnDichotomy_of_returnInsensitive {c : StatefulClaim}
+    (hInsens : ∀ args mem mem' v₁ v₂,
+      c.pre args mem → c.post args mem v₁ mem' → c.post args mem v₂ mem') :
+    ¬ StatefulClaimReturnDichotomy c := by
+  rintro ⟨args, mem, mem', v_ok, v_bad, hPre, hOk, hBad⟩
+  exact hBad (hInsens args mem mem' v_ok v_bad hPre hOk)
+
 theorem StatefulClaimDichotomy.toRealizable {c : StatefulClaim}
     (h : StatefulClaimDichotomy c) : StatefulClaimRealizable c :=
   PostconditionDichotomy.contractRealizable h
@@ -701,6 +770,15 @@ theorem MirCallContractReturnValueDichotomy.toNormalDichotomy {c : MirCallContra
     (h : MirCallContractReturnValueDichotomy c) : MirCallContractNormalDichotomy c := by
   rcases h with ⟨req, m, v_ok, v_bad, hPre, hOk, hBad⟩
   exact ⟨req, v_ok, m, v_bad, m, hPre, hOk, hBad⟩
+
+/-- A `MirCallContract` whose normal-return postcondition cannot tell two return values
+    apart once `(req, memAfter)` are fixed has no strict return-value dichotomy. -/
+theorem not_mirCallContractReturnValueDichotomy_of_returnInsensitive {c : MirCallContract}
+    (hInsens : ∀ req m v₁ v₂,
+      c.pre req → c.post req (.returned v₁ m) → c.post req (.returned v₂ m)) :
+    ¬ MirCallContractReturnValueDichotomy c := by
+  rintro ⟨req, m, v_ok, v_bad, hPre, hOk, hBad⟩
+  exact hBad (hInsens req m v_ok v_bad hPre hOk)
 
 /-- **Soundness Trap 1**: Naive `ContractRealizable c.pre c.post` on any
     `externalSpecCallContract` collapses to `PreconditionSatisfiable c.pre`—even when
@@ -1002,7 +1080,9 @@ inductive EnsuresVacuityReason : Type where
   | discardedLetBinding
   | subsingletonOutputType
   | boilerplateOnlyMasking
+  | outputInsensitive
   | vacuousUnderRequires
+  | outputInsensitiveUnderRequires
   deriving DecidableEq, Repr, Inhabited
 
 /-- Map each fine-grained `EnsuresVacuityReason` to its frozen cross-language
@@ -1019,11 +1099,20 @@ def EnsuresVacuityReason.toVacuityClass : EnsuresVacuityReason → VacuityClass
   | .discardedLetBinding => .unboundReturnOutput
   | .subsingletonOutputType => .unboundReturnOutput
   | .boilerplateOnlyMasking => .unboundReturnOutput
+  | .outputInsensitive => .unboundReturnOutput
   | .vacuousUnderRequires => .survivedAllMutants
+  | .outputInsensitiveUnderRequires => .survivedAllMutants
 
 /-- Configuration options for `checkEnsuresBindsOutput` and
     `checkDeclEnsuresBindsOutput`. `stepHeartbeats` and `totalHeartbeats` are
-    specified in `maxHeartbeats` option units (1 unit = 1000 internal heartbeats). -/
+    specified in `maxHeartbeats` option units (1 unit = 1000 internal heartbeats).
+    `totalHeartbeats` is additionally clamped to three quarters of what the enclosing
+    `maxHeartbeats` context has left (`clampProbeBudget`).
+
+    With `strictReturnValue := true`, a stateful `(args, mem, ret, mem')` or external
+    call postcondition must distinguish return values with the post-memory held
+    fixed: constraining only `mem'`, or mentioning `ret` without constraining it
+    (`ret = ret ∧ mem' = mem`), is reported as `UnboundReturnOutput`. -/
 structure EnsuresCheckConfig : Type where
   useRequires : Bool := true
   userEnsuresOnly : Bool := true
@@ -1073,8 +1162,14 @@ def cappedHeartbeats? (remainingInternal : Nat) (stepUnits : Nat) : Option Nat :
     some (max 1000 (min remainingInternal stepInternal))
 
 /-- Run a `MetaM` computation under a strictly positive heartbeat cap, also respecting
-    any tighter outer `Core.Context.maxHeartbeats`. Catches heartbeat timeouts and
-    exceptions cleanly without leaking errors. -/
+    any tighter outer `Core.Context.maxHeartbeats`. Returns `none` when the computation
+    throws, including when it exhausts the heartbeat cap or the recursion depth.
+
+    Heartbeat and recursion-depth exhaustion are *runtime* exceptions, which the
+    ordinary `try ... catch` of `CoreM`-based monads deliberately re-throws; they are
+    intercepted here with `tryCatchRuntimeEx` so an over-budget probe is reported as
+    undecided instead of aborting the whole checker. Interrupt exceptions still
+    propagate. -/
 def withBoundedHeartbeats {α : Type} (capInternal : Nat) (x : MetaM α) :
     MetaM (Option α) := do
   let safeCap := max 1000 capInternal
@@ -1088,13 +1183,13 @@ def withBoundedHeartbeats {α : Type} (capInternal : Nat) (x : MetaM α) :
       let parentRem :=
         if used < origCtx.maxHeartbeats then origCtx.maxHeartbeats - used else 1000
       max 1000 (min safeCap parentRem)
-  try
-    let res ← withTheReader Core.Context
-      (fun ctx => { ctx with initHeartbeats := now, maxHeartbeats := effCap })
-      x
-    return some res
-  catch _ =>
-    return none
+  tryCatchRuntimeEx
+    (do
+      let res ← withTheReader Core.Context
+        (fun ctx => { ctx with initHeartbeats := now, maxHeartbeats := effCap })
+        x
+      return some res)
+    (fun _ => return none)
 
 /-- Mutable internal-heartbeat budget tracker across bounded prover probes. -/
 structure ProbeBudget : Type where
@@ -1102,9 +1197,29 @@ structure ProbeBudget : Type where
   totalInternal : Nat
   stepUnits : Nat
 
-def ProbeBudget.init (cfg : EnsuresCheckConfig) : BaseIO ProbeBudget := do
+/-- Clamp a requested total probe budget (internal heartbeats) against what the
+    enclosing `maxHeartbeats` context has left (`none` when that context is unlimited).
+
+    At most three quarters of the remaining outer budget is ever claimed, so the
+    probes run dry and the checker returns a verdict before the enclosing command's
+    own heartbeat limit is reached; otherwise a default `totalHeartbeats` larger than
+    the ambient `maxHeartbeats` would turn a hard specification into an outer timeout.
+    The result is never below `1000` and never `0`. -/
+def clampProbeBudget (requestedInternal : Nat) (outerRemaining? : Option Nat) : Nat :=
+  let requested := max 1000 requestedInternal
+  match outerRemaining? with
+  | none => requested
+  | some outerRemaining => max 1000 (min requested (outerRemaining / 4 * 3))
+
+def ProbeBudget.init (cfg : EnsuresCheckConfig) : CoreM ProbeBudget := do
   let now ← IO.getNumHeartbeats
-  let totalInternal := max 1000 (cfg.totalHeartbeats * 1000)
+  let ctx ← read
+  let outerRemaining? : Option Nat :=
+    if ctx.maxHeartbeats == 0 then
+      none
+    else
+      some (ctx.maxHeartbeats - (now - ctx.initHeartbeats))
+  let totalInternal := clampProbeBudget (cfg.totalHeartbeats * 1000) outerRemaining?
   return { startHeartbeats := now, totalInternal, stepUnits := cfg.stepHeartbeats }
 
 def ProbeBudget.nextCap? (b : ProbeBudget) : BaseIO (Option Nat) := do
@@ -1164,7 +1279,12 @@ private def destructHypsAux : Nat → Array FVarId → MVarId → MetaM (Option 
 
 /-- Run a single tactic syntax snippet against `goalTy` inside a fresh isolated
     metavariable, restoring `Core.State.messages`, verifying zero errors, zero `sorry`,
-    zero unassigned metavariables, and full `Meta.check` kernel typechecking. -/
+    zero unassigned metavariables, and full `Meta.check` kernel typechecking.
+
+    The goal itself is typechecked first: a goal assembled by substitution (for
+    example, an output-insensitivity goal over a dependent output type) is never
+    handed to a tactic unless it is type-correct, so an ill-typed goal can never be
+    reported as proved. -/
 private def tryTacticSnippet
     (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM Bool := do
   let savedMsgs := (← getThe Core.State).messages
@@ -1172,6 +1292,8 @@ private def tryTacticSnippet
     modifyThe Core.State fun s => { s with messages := {} }
     let attempt? ← withBoundedHeartbeats stepCapInternal do
       let goalTy ← instantiateMVars goalTy
+      if !(← isTypeCorrect goalTy) then
+        return false
       if !(← isProp goalTy) then
         return false
       let mvar ← mkFreshExprSyntheticOpaqueMVar goalTy
@@ -1196,23 +1318,35 @@ private def tryTacticSnippet
   modifyThe Core.State fun s => { s with messages := savedMsgs }
   return result
 
+/-- The fixed, ordered battery of tactic snippets tried by the bounded prover: fast
+    deterministic closers, then `simp_all`-normalized closers, then `grind`. -/
+private def proverSnippets : MetaM (Array (TSyntax `tactic)) := do
+  let tac1 ← `(tactic| first | trivial | rfl | assumption | contradiction | decide | omega)
+  let tac2 ← `(tactic| (try simp_all) <;> first | trivial | rfl | assumption | contradiction | decide | omega)
+  let tac3 ← `(tactic| grind)
+  return #[tac1, tac2, tac3]
+
 /-- Sound, heartbeat-bounded, message-log-isolated prover for closed or local-context
     propositions `goalTy`. Tries fast deterministic tactics (`trivial`/`rfl`/
     `assumption`/`contradiction`/`decide`, `omega`, `simp_all`, `grind`) and accepts
     a proof only after `Meta.check` confirms zero `sorry`, zero mvars, and zero errors. -/
 def tryProve (goalTy : Expr) (stepCapInternal : Nat := 50000000) : MetaM Bool := do
   let goalTy ← instantiateMVars goalTy
-  if !(← isProp goalTy) then
-    return false
-  let tac1 ← `(tactic| first | trivial | rfl | assumption | contradiction | decide | omega)
-  if ← tryTacticSnippet goalTy stepCapInternal tac1 then
-    return true
-  let tac2 ← `(tactic| (try simp_all) <;> first | trivial | rfl | assumption | contradiction | decide | omega)
-  if ← tryTacticSnippet goalTy stepCapInternal tac2 then
-    return true
-  let tac3 ← `(tactic| grind)
-  if ← tryTacticSnippet goalTy stepCapInternal tac3 then
-    return true
+  for tac in (← proverSnippets) do
+    if ← tryTacticSnippet goalTy stepCapInternal tac then
+      return true
+  return false
+
+/-- Budget-aware variant of `tryProve`: re-derives a strictly positive heartbeat cap
+    from `budget` before every tactic snippet, and reports the goal as undecided as
+    soon as the total budget is exhausted. A single probe can therefore overshoot the
+    total budget by at most one per-snippet cap. -/
+private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr) : MetaM Bool := do
+  let goalTy ← instantiateMVars goalTy
+  for tac in (← proverSnippets) do
+    let some cap ← budget.nextCap? | return false
+    if ← tryTacticSnippet goalTy cap tac then
+      return true
   return false
 
 /-! ### Structural Reduction, Subsingleton/Empty Type & Tautology Helpers -/
@@ -1283,12 +1417,26 @@ private def exprIsNatLit (e : Expr) (target : Nat) : MetaM Bool := do
 
 /-- Fuel-bounded conservative detector for provably empty types (`Empty`, `PEmpty`,
     `False`, `Fin 0`, empty inductives, products with an empty component, or inductives
-    every constructor of which requires an empty argument). Uses a `visited` cycle guard
-    so recursive inhabited inductives (`Nat`, `List`, `Value`) are never false-flagged. -/
-private def isEmptyTypeAux : Nat → NameSet → Expr → MetaM Bool
+    every constructor of which requires an argument of empty type).
+
+    Recursive occurrences are resolved coinductively: `visiting` holds the exact types
+    whose emptiness is currently being established, and re-encountering one of them
+    counts as empty. Inhabitation of an inductive type is a least fixed point (some
+    constructor must have all arguments inhabited, bottoming out at a constructor with
+    no recursive argument), so emptiness is the complementary greatest fixed point.
+    This catches uninhabited recursive inductives such as
+    `inductive Bad | mk : Bad → Bad`, while `Nat`, `List α`, `Value`, and rose trees
+    are never flagged because each has a constructor all of whose argument types are
+    refuted as empty without appeal to the cycle rule.
+
+    `visiting` is keyed by the full (weak-head-normal) type rather than by the type
+    constructor name, so a nested instance such as `Box (Box Nat)` is not mistaken
+    for a recursive occurrence of `Box Nat`. Function-typed arguments, indexed
+    families other than `Fin`, and anything not understood yield `false`. -/
+private def isEmptyTypeAux : Nat → List Expr → Expr → MetaM Bool
   | 0, _, _ => return false
-  | fuel + 1, visited, ty => do
-    let ty ← whnf ty
+  | fuel + 1, visiting, ty => do
+    let ty ← instantiateMVars (← whnf ty)
     let fn := ty.getAppFn
     let args := ty.getAppArgs
     match fn with
@@ -1298,13 +1446,13 @@ private def isEmptyTypeAux : Nat → NameSet → Expr → MetaM Bool
       if name == ``Fin && args.size == 1 then
         return ← exprIsNatLit args[0]! 0
       if (name == ``Prod || name == ``PProd || name == ``And) && args.size == 2 then
-        if ← isEmptyTypeAux fuel visited args[0]! then return true
-        return ← isEmptyTypeAux fuel visited args[1]!
+        if ← isEmptyTypeAux fuel visiting args[0]! then return true
+        return ← isEmptyTypeAux fuel visiting args[1]!
       if (name == ``Sum || name == ``PSum) && args.size == 2 then
-        if !(← isEmptyTypeAux fuel visited args[0]!) then return false
-        return ← isEmptyTypeAux fuel visited args[1]!
-      if visited.contains name then
-        return false
+        if !(← isEmptyTypeAux fuel visiting args[0]!) then return false
+        return ← isEmptyTypeAux fuel visiting args[1]!
+      if visiting.any (fun t => t == ty) then
+        return true
       let env ← getEnv
       match env.find? name with
       | some (.inductInfo indVal) =>
@@ -1313,7 +1461,7 @@ private def isEmptyTypeAux : Nat → NameSet → Expr → MetaM Bool
         -- Skip indexed families other than `Fin` handled above so we stay sound.
         if indVal.numIndices > 0 || args.size < indVal.numParams then
           return false
-        let visited' := visited.insert name
+        let visiting' := ty :: visiting
         let params := args.extract 0 indVal.numParams
         for ctorName in indVal.ctors do
           let some (.ctorInfo ctorVal) := env.find? ctorName | return false
@@ -1323,7 +1471,7 @@ private def isEmptyTypeAux : Nat → NameSet → Expr → MetaM Bool
           let ctorEmpty ← forallTelescope ctorInst fun ctorArgs _ => do
             for a in ctorArgs do
               let aTy ← inferType a
-              if ← isEmptyTypeAux fuel visited' aTy then
+              if ← isEmptyTypeAux fuel visiting' aTy then
                 return true
             return false
           if !ctorEmpty then
@@ -1331,6 +1479,19 @@ private def isEmptyTypeAux : Nat → NameSet → Expr → MetaM Bool
         return true
       | _ => return false
     | _ => return false
+
+/-- Synthesize an instance of the `Sort`-polymorphic class `cls` (`Inhabited`,
+    `Nonempty`, or `Subsingleton`, each declared over `α : Sort u`) at `ty`.
+
+    The class must be instantiated at the sort level `u` of `ty` itself (`ty : Sort u`),
+    not at its predecessor: for `ty : Type` that is `u = 1`, and `Subsingleton.{0} ty`
+    would be ill-typed and never synthesize. Returns `none` on any failure. -/
+private def synthSortClassInstance? (cls : Name) (ty : Expr) : MetaM (Option Expr) := do
+  try
+    let u ← getLevel ty
+    synthInstance? (mkApp (mkConst cls [u]) ty)
+  catch _ =>
+    return none
 
 /-- Conservative detector for subsingleton or empty output types (`Unit`, `PUnit`, `True`,
     `Empty`, `PEmpty`, `False`, `Fin 0`, `Fin 1`, `Option Empty`, `Option (Fin 0)`,
@@ -1342,7 +1503,7 @@ def isSubsingletonOrEmptyType : Nat → Expr → MetaM Bool
     let ty ← whnf ty
     if ← isProp ty then
       return true
-    if ← isEmptyTypeAux (fuel + 1) {} ty then
+    if ← isEmptyTypeAux (fuel + 1) [] ty then
       return true
     let fn := ty.getAppFn
     let args := ty.getAppArgs
@@ -1353,9 +1514,9 @@ def isSubsingletonOrEmptyType : Nat → Expr → MetaM Bool
         if ← exprIsNatLit args[0]! 0 then return true
         if ← exprIsNatLit args[0]! 1 then return true
       if name == ``Option && args.size == 1 then
-        if ← isEmptyTypeAux (fuel + 1) {} args[0]! then return true
+        if ← isEmptyTypeAux (fuel + 1) [] args[0]! then return true
       if name == ``List && args.size == 1 then
-        if ← isEmptyTypeAux (fuel + 1) {} args[0]! then return true
+        if ← isEmptyTypeAux (fuel + 1) [] args[0]! then return true
       if (name == ``Prod || name == ``PProd) && args.size == 2 then
         let s0 ← isSubsingletonOrEmptyType fuel args[0]!
         let s1 ← isSubsingletonOrEmptyType fuel args[1]!
@@ -1363,15 +1524,7 @@ def isSubsingletonOrEmptyType : Nat → Expr → MetaM Bool
       if name == ``Subtype && args.size == 2 then
         if ← isSubsingletonOrEmptyType fuel args[0]! then return true
     -- Fall back to Lean's `Subsingleton` typeclass synthesis (sound by construction).
-    try
-      let u ← getLevel ty
-      match u with
-      | .succ u' =>
-        let subInst? ← synthInstance? (mkApp (mkConst ``Subsingleton [u']) ty)
-        return subInst?.isSome
-      | _ => return false
-    catch _ =>
-      return false
+    return (← synthSortClassInstance? ``Subsingleton ty).isSome
 
 /-- Strip `Not` if `e` is `Not inner`. -/
 private def unwrapNot? (e : Expr) : Option Expr :=
@@ -1382,7 +1535,14 @@ private def unwrapNot? (e : Expr) : Option Expr :=
     none
 
 /-- Fast syntactic tautology recognizer for `Prop` expressions (`True`, `r = r`,
-    `¬ (r ≠ r)`, `r ≤ r`, `P ↔ P`, `P → P`, `A → B → A`, `r = r ∨ P`, `P ∨ ¬ P`). -/
+    `¬ (r ≠ r)`, `P ↔ P`, `P → P`, `A → B → A`, `r = r ∨ P`, `P ∨ ¬ P`).
+
+    Every recognized shape is valid in all models. In particular `r ≤ r` is *not*
+    recognized syntactically: `LE.le` is an arbitrary user-supplied relation, and
+    reflexivity fails for lawless instances (IEEE `Float`, where `NaN ≤ NaN` is false,
+    or any strict or partial user-defined `LE`), for which `r ≤ r` is a genuine
+    constraint on `r`. Reflexive inequalities over lawful orders are still caught by
+    the bounded prover, which must actually prove them. -/
 def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacuityReason
   | 0, _, _ => none
   | fuel + 1, hyps, e =>
@@ -1394,9 +1554,6 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
     else if e.isAppOfArity ``Eq 3 then
       let args := e.getAppArgs
       if args[1]! == args[2]! then some .reflexiveEquality else none
-    else if e.isAppOfArity ``LE.le 4 then
-      let args := e.getAppArgs
-      if args[2]! == args[3]! then some .reflexiveEquality else none
     else if e.isAppOfArity ``Iff 2 then
       let args := e.getAppArgs
       if args[0]! == args[1]! then some .tautologicalImplication else none
@@ -1605,6 +1762,22 @@ private def unfoldUserHead : Nat → Expr → MetaM Expr
       | none => return e
     | _ => return e
 
+/-- Unfold user-defined head predicates at every leaf of a conjunction, so that a
+    `requires` clause such as `defPathOk ∧ arityOk ∧ userPre args` enters the prover's
+    local context with `userPre args` already unfolded (and therefore usable by
+    `simp_all`, `omega`, and `grind`). Each step is a definitional unfolding, so the
+    result is definitionally equal to the input. -/
+private def unfoldUserConjuncts : Nat → Expr → MetaM Expr
+  | 0, e => return e
+  | fuel + 1, e => do
+    let e ← unfoldUserHead 8 e
+    if e.isAppOfArity ``And 2 then
+      let lhs ← unfoldUserConjuncts fuel e.appFn!.appArg!
+      let rhs ← unfoldUserConjuncts fuel e.appArg!
+      return mkApp2 (mkConst ``And) lhs rhs
+    else
+      return e
+
 /-! ### Top-Level Lambda / Projection Normalization & Input/Output Splitting -/
 
 /-- Expose leading lambda binders of `ensuresExpr` without destroying internal `let`
@@ -1690,8 +1863,71 @@ private def reduceMirCallAnsReturned (postExpr req retVal memAfter : Expr) :
   let applied := mkApp2 postExpr req ans
   reduceMirCallAnsReturnedAux 24 applied
 
+/-! ### Output-Insensitivity Goals -/
+
+/-- Run `k` with a fresh copy of every output variable in `outVars` in scope. The type
+    of each copy is the type of the original with all earlier output variables replaced
+    by their copies, so mutually dependent output types stay well-typed. -/
+private def withOutputCopies {α : Type} [Inhabited α]
+    (outVars : Array Expr) (k : Array Expr → MetaM α) : MetaM α := do
+  let mut infos : Array (Name × (Array Expr → MetaM Expr)) := #[]
+  for i in [:outVars.size] do
+    let ovTy ← inferType outVars[i]!
+    infos := infos.push
+      (Name.mkSimple s!"out{i}'",
+        fun copies => pure (ovTy.replaceFVars (outVars.extract 0 copies.size) copies))
+  withLocalDeclsD infos k
+
+/-- Build the output-insensitivity goal `∀ binders outs', body → body[outs := outs']`,
+    where `binders` must bind every free variable of `body` (including `outVars`
+    themselves). Proving it establishes `ForwardOutputInsensitive`, which refutes
+    `PostconditionDichotomy` (`not_postconditionDichotomy_of_forwardOutputInsensitive`).
+
+    Returns `none` when there is no output variable or when the substituted goal fails
+    `Meta.check` (for instance because another binder's type depends on an output
+    variable), so an ill-typed substitution is never handed to the prover. -/
+private def mkOutputInsensitivityGoal?
+    (binders outVars : Array Expr) (body : Expr) : MetaM (Option Expr) := do
+  if outVars.isEmpty then
+    return none
+  withOutputCopies outVars fun copies => do
+    let body' := body.replaceFVars outVars copies
+    let goal ← mkForallFVars (binders ++ copies) (← mkArrow body body')
+    if ← isTypeCorrect goal then
+      return some goal
+    else
+      return none
+
+/-- How one boilerplate fibre of a `MirCallAns` postcondition treats the outputs. -/
+private inductive FibreKind : Type where
+  /-- The residual is `False` or provably unsatisfiable: the fibre accepts nothing. -/
+  | contradictory
+  /-- The residual mentions an output yet is tautological. -/
+  | tautological (reason : EnsuresVacuityReason)
+  /-- The residual accepts something but does not distinguish outputs. -/
+  | insensitive
+  /-- The residual fails to distinguish outputs only under `requires`. -/
+  | insensitiveUnderRequires
+  /-- The residual genuinely constrains an output. -/
+  | genuine
+
 /-- Core analyzer operating once `preInputs`, `fixedVars`, `outVars`, `rawBody`,
-    `isMirCallAns`, and `requiresExpr?` have been isolated inside the local context. -/
+    `isMirCallAns`, and `requiresExpr?` have been isolated inside the local context.
+
+    A specification is accepted only if no phase can show it vacuous:
+
+    * Phase 0 refutes `requires` (`DeadPrecondition`).
+    * Phase 1 rejects subsingleton or empty output types (`UnboundReturnOutput`).
+    * Phase 2 handles bodies that do not mention an output after reduction.
+    * Phase 3 cofactors `MirCallAns` bodies over their boilerplate atoms and demands a
+      fibre whose residual genuinely distinguishes outputs. Contradictory fibres are
+      pruned, so an unreachable branch can never supply the "genuine" constraint.
+    * Phase 4 tries to prove the body valid, unsatisfiable, or output-insensitive
+      without `requires`.
+    * Phase 5 repeats those probes under `requires`.
+
+    Every prover probe is sound: a specification is flagged only on a `Meta.check`ed
+    proof, never on a failed proof attempt. -/
 private def analyzeNormalizedSpec
     (preInputs fixedVars outVars : Array Expr)
     (rawBody : Expr)
@@ -1700,31 +1936,54 @@ private def analyzeNormalizedSpec
     (cfg : EnsuresCheckConfig) : MetaM EnsuresCheckResult := do
   let budget ← ProbeBudget.init cfg
   let outFVarIds : Array FVarId := outVars.map Expr.fvarId!
-  let allFixed := preInputs ++ fixedVars
-  let allVars := allFixed ++ outVars
+  let allVars := preInputs ++ fixedVars ++ outVars
+  let mentionsOutput (e : Expr) : Bool := e.hasAnyFVar (fun fv => outFVarIds.contains fv)
+  let negate (e : Expr) : Expr := mkApp (mkConst ``Not) e
+
+  -- `∀ allVars, goal`.
+  let proveClosed (goal : Expr) : MetaM Bool := do
+    tryProveWithin budget (← mkForallFVars allVars goal)
+  -- `∀ preInputs (h_pre : requires) fixedVars outVars, goal`.
+  let proveUnderRequires (preNorm goal : Expr) : MetaM Bool :=
+    withLocalDeclD `h_pre preNorm fun hPre => do
+      tryProveWithin budget
+        (← mkForallFVars (preInputs ++ #[hPre] ++ fixedVars ++ outVars) goal)
+  -- `∀ allVars outs', body → body[outs := outs']`.
+  let proveInsensitive (body : Expr) : MetaM Bool := do
+    match ← mkOutputInsensitivityGoal? allVars outVars body with
+    | some goal => tryProveWithin budget goal
+    | none => return false
+  -- The same goal with `h_pre : requires` in scope.
+  let proveInsensitiveUnderRequires (preNorm body : Expr) : MetaM Bool :=
+    withLocalDeclD `h_pre preNorm fun hPre => do
+      let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
+      match ← mkOutputInsensitivityGoal? scopedVars outVars body with
+      | some goal => tryProveWithin budget goal
+      | none => return false
 
   -- Phase 0: Check whether `requires` is provably unsatisfiable (`DeadPrecondition`).
+  -- The `requires` expression is exposed down to its defining lambda and its
+  -- conjuncts are unfolded, so later `requires`-aware probes see usable hypotheses
+  -- rather than an opaque `c.pre req` projection.
   let preProp? ←
     if cfg.useRequires then
       match requiresExpr? with
-      | some reqExpr => applyRequiresSafe reqExpr preInputs
+      | some reqExpr => applyRequiresSafe (← exposeHeadLambda 16 reqExpr) preInputs
       | none => pure none
     else
       pure none
 
   let preNorm? ←
     match preProp? with
-    | some preProp => pure (some (← unfoldUserHead 8 (zetaBetaReduce 64 preProp)))
+    | some preProp => pure (some (← unfoldUserConjuncts 16 (zetaBetaReduce 64 preProp)))
     | none => pure none
 
   if let some preNorm := preNorm? then
     if preNorm.isConstOf ``False then
       return .vacuous .requiresUnsatisfiable ["requires is syntactically False"]
-    if let some cap ← budget.nextCap? then
-      let unsatPreGoal ← mkForallFVars preInputs (mkApp (mkConst ``Not) preNorm)
-      if ← tryProve unsatPreGoal cap then
-        return .vacuous .requiresUnsatisfiable
-          ["requires proved unsatisfiable for all inputs"]
+    if ← tryProveWithin budget (← mkForallFVars preInputs (negate preNorm)) then
+      return .vacuous .requiresUnsatisfiable
+        ["requires proved unsatisfiable for all inputs"]
 
   -- Phase 1: Subsingleton or empty output type (`UnboundReturnOutput`).
   if !outVars.isEmpty then
@@ -1745,104 +2004,137 @@ private def analyzeNormalizedSpec
   if rawClean.isConstOf ``False then
     return .vacuous .unrealizableUnderRequires ["ensures is syntactically False"]
 
-  let freeBefore := rawClean.hasAnyFVar (fun fv => outFVarIds.contains fv)
+  let freeBefore := mentionsOutput rawClean
   let reducedBody ← zetaBetaProjReduce 32 rawClean
-  let freeAfter := reducedBody.hasAnyFVar (fun fv => outFVarIds.contains fv)
+  let freeAfter := mentionsOutput reducedBody
 
   if freeBefore && !freeAfter then
     return .vacuous .discardedLetBinding
       ["output variable occurs only in a discarded let/beta binding"]
 
   if !freeAfter then
-    -- Check syntactic tautologies (e.g. `x < 10 → x < 10`) vs unused input-only formulas.
+    -- The body is input-only. It is trivial when it holds for every input,
+    -- unrealizable when it fails for every (admissible) input, and otherwise an
+    -- unbound-output specification.
     if reducedBody.isConstOf ``True then
       return .vacuous .trivialConstantTrue ["ensures reduces to True"]
     if reducedBody.isConstOf ``False then
       return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
+    if let some tautReason := detectSyntacticTautology 32 [] reducedBody then
+      return .vacuous tautReason ["input-only ensures is syntactically tautological"]
+    if ← proveClosed reducedBody then
+      return .vacuous .tautologicalByProver ["input-only ensures proved universally valid"]
+    if ← proveClosed (negate reducedBody) then
+      return .vacuous .unrealizableUnderRequires ["input-only ensures proved unsatisfiable"]
+    if let some preNorm := preNorm? then
+      if ← proveUnderRequires preNorm (negate reducedBody) then
+        return .vacuous .unrealizableUnderRequires
+          ["input-only ensures proved unsatisfiable under requires"]
     return .vacuous .unusedOutputBinder
       ["output variable does not occur free in ensures body"]
 
   -- Phase 3: `MirCallAns` boilerplate-atom cofactoring (`k ≤ 8`).
   let mut notes : List String := []
+  let mut fibreGenuine := false
   if isMirCallAns && cfg.userEnsuresOnly then
     let (atoms, overflow) := collectBoilerplateAtoms 64 8 reducedBody #[]
     if overflow then
       notes := notes ++ ["skipped boilerplate cofactoring: >8 boilerplate atoms"]
     else if !atoms.isEmpty then
+      -- Classify the residual user postcondition of one boilerplate fibre. A fibre
+      -- counts as genuine only when no probe can show its residual to be
+      -- output-insensitive (which subsumes tautological and contradictory).
+      let classifyFibre (res : Expr) : MetaM FibreKind := do
+        if res.isConstOf ``False then
+          return .contradictory
+        if !mentionsOutput res then
+          return .insensitive
+        if let some tautReason := detectSyntacticTautology 32 [] res then
+          return .tautological tautReason
+        if ← proveInsensitive res then
+          if ← proveClosed res then
+            return .tautological .tautologicalByProver
+          if ← proveClosed (negate res) then
+            return .contradictory
+          return .insensitive
+        if let some preNorm := preNorm? then
+          if ← proveInsensitiveUnderRequires preNorm res then
+            if ← proveUnderRequires preNorm (negate res) then
+              return .contradictory
+            return .insensitiveUnderRequires
+        return .genuine
+
       let numMasks := 1 <<< atoms.size
-      let mut anyNonFalse := false
-      let mut anyGenuineOutputConstraint := false
+      let mut liveFibres : Nat := 0
+      let mut allLiveTrue := true
+      let mut anyInsensitive := false
       let mut firstTautReason? : Option EnsuresVacuityReason := none
       for mask in [:numMasks] do
         let rawRes := cofactorBoilerplate 64 atoms mask reducedBody
         let res ← unfoldUserHead 8 rawRes
-        if res.isConstOf ``False then
-          continue
-        anyNonFalse := true
-        -- Check whether this non-False fibre still constrains an output variable.
-        let fibreBindsOut := res.hasAnyFVar (fun fv => outFVarIds.contains fv)
-        if !fibreBindsOut then
-          continue
-        -- Output occurs in `res`; verify `res` is not syntactically tautological.
-        match detectSyntacticTautology 32 [] res with
-        | some r =>
-          if firstTautReason?.isNone then firstTautReason? := some r
-        | none =>
-          -- Check bounded prover tautology / impossibility on this fibre.
-          let mut fibreTrivial := false
-          if let some cap ← budget.nextCap? then
-            let fibreTautGoal ← mkForallFVars allVars res
-            if ← tryProve fibreTautGoal cap then
-              fibreTrivial := true
-              if firstTautReason?.isNone then
-                firstTautReason? := some .tautologicalByProver
-          if !fibreTrivial then
-            anyGenuineOutputConstraint := true
-      if !anyNonFalse then
-        return .vacuous .unrealizableUnderRequires
-          (notes ++ ["all boilerplate fibres simplify to False"])
-      if !anyGenuineOutputConstraint then
-        match firstTautReason? with
-        | some r =>
-          return .vacuous r
+        match ← classifyFibre res with
+        | .contradictory => pure ()
+        | .tautological tautReason =>
+          liveFibres := liveFibres + 1
+          allLiveTrue := false
+          if firstTautReason?.isNone then firstTautReason? := some tautReason
+        | .insensitive =>
+          liveFibres := liveFibres + 1
+          anyInsensitive := true
+          if !res.isConstOf ``True then allLiveTrue := false
+        | .insensitiveUnderRequires =>
+          liveFibres := liveFibres + 1
+          allLiveTrue := false
+        | .genuine =>
+          fibreGenuine := true
+        -- One genuine fibre settles Phase 3; skip the remaining fibres.
+        if fibreGenuine then break
+      if !fibreGenuine then
+        if liveFibres == 0 then
+          return .vacuous .unrealizableUnderRequires
+            (notes ++ ["every boilerplate fibre is contradictory"])
+        if let some tautReason := firstTautReason? then
+          return .vacuous tautReason
             (notes ++ ["residual user ensures across boilerplate fibres is tautological"])
-        | none =>
+        if allLiveTrue && liveFibres == numMasks then
+          return .vacuous .trivialConstantTrue
+            (notes ++ ["ensures is a propositional tautology over boilerplate atoms"])
+        if anyInsensitive then
           return .vacuous .boilerplateOnlyMasking
             (notes ++ ["normal-return postcondition constrains only boilerplate atoms"])
+        return .vacuous .outputInsensitiveUnderRequires
+          (notes ++ ["residual user ensures is output-insensitive under requires in every fibre"])
 
   -- Phase 4: Syntactic tautology & global prover checks (without `requires`).
   if let some tautReason := detectSyntacticTautology 32 [] reducedBody then
     return .vacuous tautReason (notes ++ ["detected syntactic tautology"])
 
-  if let some cap ← budget.nextCap? then
-    let globalTautGoal ← mkForallFVars allVars reducedBody
-    if ← tryProve globalTautGoal cap then
-      return .vacuous .tautologicalByProver
-        (notes ++ ["ensures proved universally valid independent of requires"])
+  if ← proveClosed reducedBody then
+    return .vacuous .tautologicalByProver
+      (notes ++ ["ensures proved universally valid independent of requires"])
 
-  if let some cap ← budget.nextCap? then
-    let globalUnsatGoal ← mkForallFVars allVars (mkApp (mkConst ``Not) reducedBody)
-    if ← tryProve globalUnsatGoal cap then
-      return .vacuous .unrealizableUnderRequires
-        (notes ++ ["ensures proved unsatisfiable for all inputs and outputs"])
+  if ← proveClosed (negate reducedBody) then
+    return .vacuous .unrealizableUnderRequires
+      (notes ++ ["ensures proved unsatisfiable for all inputs and outputs"])
+
+  -- A genuine boilerplate fibre already rules out output-insensitivity of the body.
+  if !fibreGenuine then
+    if ← proveInsensitive reducedBody then
+      return .vacuous .outputInsensitive
+        (notes ++ ["ensures proved independent of the output"])
 
   -- Phase 5: `requires`-aware semantic realizability and vacuity checks.
   if let some preNorm := preNorm? then
-    let resUnderPre ← withLocalDeclD `h_pre preNorm fun hPre => do
-      let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
-      if let some cap ← budget.nextCap? then
-        let unsatGoal ← mkForallFVars scopedVars (mkApp (mkConst ``Not) reducedBody)
-        if ← tryProve unsatGoal cap then
-          return some (EnsuresCheckResult.vacuous .unrealizableUnderRequires
-            (notes ++ ["ensures proved unsatisfiable under requires"]))
-      if let some cap ← budget.nextCap? then
-        let tautGoal ← mkForallFVars scopedVars reducedBody
-        if ← tryProve tautGoal cap then
-          return some (EnsuresCheckResult.vacuous .vacuousUnderRequires
-            (notes ++ ["ensures proved vacuously true for all outputs under requires"]))
-      return none
-    if let some r := resUnderPre then
-      return r
+    if ← proveUnderRequires preNorm (negate reducedBody) then
+      return .vacuous .unrealizableUnderRequires
+        (notes ++ ["ensures proved unsatisfiable under requires"])
+    if ← proveUnderRequires preNorm reducedBody then
+      return .vacuous .vacuousUnderRequires
+        (notes ++ ["ensures proved vacuously true for all outputs under requires"])
+    if !fibreGenuine then
+      if ← proveInsensitiveUnderRequires preNorm reducedBody then
+        return .vacuous .outputInsensitiveUnderRequires
+          (notes ++ ["ensures proved independent of the output under requires"])
 
   return .ok notes
 
@@ -1971,14 +2263,11 @@ private def defaultWitnessForType? (ty : Expr) : MetaM (Option Expr) := do
     match u with
     | .succ u' => return some (mkApp (mkConst ``List.nil [u']) elemTy)
     | _ => pure ()
-  try
-    let u ← getLevel ty
-    match u with
-    | .succ u' =>
-      if let some inh ← synthInstance? (mkApp (mkConst ``Inhabited [u']) ty) then
-        return some (mkApp2 (mkConst ``Inhabited.default [u']) ty inh)
-    | _ => pure ()
-  catch _ => pure ()
+  if let some inh ← synthSortClassInstance? ``Inhabited ty then
+    try
+      let u ← getLevel ty
+      return some (mkApp2 (mkConst ``Inhabited.default [u]) ty inh)
+    catch _ => pure ()
   return none
 
 /-- Check whether `requiresExpr` is satisfiable, returning `some false` when refuted
@@ -2002,29 +2291,29 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
           reason := "precondition proved unsatisfiable for all inputs"
         }
     if normBody.isConstOf ``True then
+      -- `True` is satisfiable exactly when every input type is inhabited. A
+      -- proposition-typed input (a hypothesis binder) counts only if an instance
+      -- witnesses it; it is never assumed inhabited.
       let mut allInhabited := true
       for inp in inputs do
         let inpTy ← inferType inp
-        let u ← getLevel inpTy
-        match u with
-        | .succ u' =>
-          let inh? ← synthInstance? (mkApp (mkConst ``Nonempty [u']) inpTy)
-          if inh?.isNone then
-            let def? ← synthInstance? (mkApp (mkConst ``Inhabited [u']) inpTy)
-            if def?.isNone then
-              allInhabited := false
-              break
-        | _ => pure ()
+        if (← synthSortClassInstance? ``Nonempty inpTy).isNone then
+          if (← synthSortClassInstance? ``Inhabited inpTy).isNone then
+            allInhabited := false
+            break
       if allInhabited then
         return {
           satisfiable? := some true
           reason := "precondition is True over inhabited input types"
         }
     -- Try instantiating inputs with canonical default witnesses (e.g. `0`, `[]`, `emptyMemory`).
+    -- The type of a dependent input is instantiated with the witnesses already chosen
+    -- for the inputs it depends on, so the instantiated precondition stays well-typed
+    -- (and `tryProve` re-checks type-correctness before attempting a proof).
     let mut witnesses : Array Expr := #[]
     let mut allWitnessed := true
     for inp in inputs do
-      let inpTy ← inferType inp
+      let inpTy := (← inferType inp).replaceFVars (inputs.extract 0 witnesses.size) witnesses
       match ← defaultWitnessForType? inpTy with
       | some w => witnesses := witnesses.push w
       | none =>

@@ -12,10 +12,11 @@
 use core::num::Wrapping;
 
 use anneal_spec::spec_check::{
-    FailureDetail, ReturnMutants, SampleInput, SpecCheckConfig, SpecCheckOutcome, SplitMix64,
-    SyntacticBindingHint, TrapKind, VacuityClass, ViolationKind, assert_contract_strong,
-    assert_stateful_contract_strong, check_contract, check_contract_fallible,
-    check_contract_with_mutants, check_stateful_contract,
+    FailureDetail, ProbeDomain, ReturnMutants, SampleInput, SpecCheckConfig, SpecCheckOutcome,
+    SplitMix64, SyntacticBindingHint, TrapKind, VacuityClass, ViolationKind,
+    assert_contract_strong, assert_stateful_contract_strong, check_contract,
+    check_contract_fallible, check_contract_with_mutants, check_stateful_contract,
+    check_stateful_contract_fallible,
 };
 use anneal_spec::*;
 
@@ -240,6 +241,16 @@ fn hinted_return_unused_fn(x: u32) -> u32 {
     ensures: |r| x < 10 || r == 42,
 )]
 fn vacuous_under_requires_fn(x: u32) -> u32 {
+    x
+}
+
+// `x + 100` overflows for `x > u32::MAX - 100`, far outside `requires: x < 100`,
+// so this postcondition is only total on precondition-admissible inputs.
+#[spec(
+    requires: x < 100,
+    ensures: |_r| x + 100 < 500,
+)]
+fn overflow_guarded_fn(x: u32) -> u32 {
     x
 }
 
@@ -703,9 +714,10 @@ fn catches_trivial_postcondition_variants() {
 
 #[test]
 fn catches_unbound_return_output_dynamic_and_hinted() {
-    // Purely dynamic detection (`x < 500` is false for `x >= 500`, yet independent of `r`).
+    // `x < 500` is total, so the probe may leave `requires: x < 100`: it is false for
+    // `x >= 500`, yet independent of `r`.
     let dynamic_outcome = check_contract(
-        SpecCheckConfig::default(),
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
         |&x: &u32| __anodized_fn_requires_unbound_return_fn(x),
         |&x| unbound_return_fn(x),
         |&x, &r| __anodized_fn_ensures_unbound_return_fn(x, r),
@@ -714,6 +726,40 @@ fn catches_unbound_return_output_dynamic_and_hinted() {
         dynamic_outcome.vacuity_class(),
         Some(VacuityClass::UnboundReturnOutput)
     );
+    assert!(matches!(
+        dynamic_outcome.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            saw_any_false: true,
+            saw_output_sensitivity: false,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+
+    // Inside `requires: x < 100` the same postcondition never rejects anything, so the
+    // default precondition-only probe still fails closed, reports it as trivially true
+    // on its domain, and records that inputs were withheld from `post`.
+    let default_outcome = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_unbound_return_fn(x),
+        |&x| unbound_return_fn(x),
+        |&x, &r| __anodized_fn_ensures_unbound_return_fn(x, r),
+    );
+    assert!(!default_outcome.is_strong());
+    assert_eq!(
+        default_outcome.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        default_outcome.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes: 0,
+            skipped_out_of_precondition,
+            saw_any_false: false,
+            saw_output_sensitivity: false,
+            ..
+        }) if skipped_out_of_precondition > 0
+    ));
 
     // Syntactically hinted detection on `let _ = r; true`.
     let hinted_outcome = check_contract(
@@ -730,9 +776,10 @@ fn catches_unbound_return_output_dynamic_and_hinted() {
 
 #[test]
 fn catches_survived_all_mutants_under_requires_and_weak_bank() {
-    // `x < 10 || r == 42`: output-sensitive when `x >= 10`, yet every mutant survives under `x < 10`.
+    // `x < 10 || r == 42` is total and output-sensitive when `x >= 10`, yet every mutant
+    // survives under `x < 10`.
     let vacuous_under_req = check_contract(
-        SpecCheckConfig::default(),
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
         |&x: &u32| __anodized_fn_requires_vacuous_under_requires_fn(x),
         |&x| vacuous_under_requires_fn(x),
         |&x, &r| __anodized_fn_ensures_vacuous_under_requires_fn(x, r),
@@ -746,6 +793,28 @@ fn catches_survived_all_mutants_under_requires_and_weak_bank() {
         Some(FailureDetail::AllMutantsSurvived {
             saw_any_false: true,
             saw_output_sensitivity: true,
+            ..
+        })
+    ));
+
+    // The default precondition-only probe never leaves `x < 10`, where the postcondition
+    // is identically true; it still fails closed.
+    let default_under_req = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_vacuous_under_requires_fn(x),
+        |&x| vacuous_under_requires_fn(x),
+        |&x, &r| __anodized_fn_ensures_vacuous_under_requires_fn(x, r),
+    );
+    assert!(!default_under_req.is_strong());
+    assert_eq!(
+        default_under_req.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        default_under_req.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes: 0,
+            saw_any_false: false,
             ..
         })
     ));
@@ -991,4 +1060,692 @@ fn signed_wrapping_option_unit_tuples_and_arrays_supported() {
         |&(x,), &(r,)| r == x + 1,
     );
     assert!(tuple1_stats.mutants_killed > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 5. Precondition-Domain Safety of the Classification Probes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn probe_domain_defaults_to_precondition_only() {
+    assert_eq!(ProbeDomain::default(), ProbeDomain::PreconditionOnly);
+    assert_eq!(
+        SpecCheckConfig::default().probe_domain,
+        ProbeDomain::PreconditionOnly
+    );
+    assert_eq!(
+        SpecCheckConfig::default()
+            .with_probe_domain(ProbeDomain::Unconstrained)
+            .probe_domain,
+        ProbeDomain::Unconstrained
+    );
+}
+
+#[test]
+fn classification_probe_never_evaluates_spec_ensures_outside_requires() {
+    // The real `#[spec]` companion computes `x + 100`, which overflows (and panics under
+    // overflow checks) on the probe's boundary inputs near `u32::MAX`. The companion is
+    // called without any guard: the checker itself must keep it inside `requires`.
+    let unguarded = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_overflow_guarded_fn(x),
+        |&x| overflow_guarded_fn(x),
+        |&x, &r| __anodized_fn_ensures_overflow_guarded_fn(x, r),
+    );
+    assert!(!unguarded.is_strong());
+    assert_eq!(
+        unguarded.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+
+    // Independently of overflow checks, count every evaluation outside `requires`.
+    let mut ensures_calls_outside_requires = 0usize;
+    let counted = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_overflow_guarded_fn(x),
+        |&x| overflow_guarded_fn(x),
+        |&x, &r| {
+            if !__anodized_fn_requires_overflow_guarded_fn(x) {
+                ensures_calls_outside_requires += 1;
+                return true;
+            }
+            __anodized_fn_ensures_overflow_guarded_fn(x, r)
+        },
+    );
+    assert_eq!(ensures_calls_outside_requires, 0);
+    assert_eq!(
+        counted.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        counted.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes: 0,
+            skipped_out_of_precondition,
+            saw_any_false: false,
+            saw_output_sensitivity: false,
+        }) if probed_inputs > 0 && skipped_out_of_precondition > 0
+    ));
+}
+
+#[test]
+fn stateless_probe_stays_inside_precondition_for_partial_postconditions() {
+    const TABLE: [u32; 4] = [10, 20, 30, 40];
+
+    // Input-only postcondition that indexes with the input: out of bounds (a panic in
+    // every build profile) for any `x` violating `requires: x < TABLE.len()`.
+    let indexing = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &usize| x < TABLE.len(),
+        |&x| TABLE[x],
+        |&x, _r: &u32| TABLE[x] >= 10,
+    );
+    assert_eq!(
+        indexing.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+
+    // Postcondition that divides by a quantity which is zero outside `requires: x > 0`.
+    let dividing = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| x > 0,
+        |&x| x,
+        |&x, _r: &u32| 100 / x <= 100,
+    );
+    assert_eq!(
+        dividing.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+
+    // Postcondition that asserts its own precondition, with a custom mutant bank.
+    let asserting = check_contract_with_mutants(
+        SpecCheckConfig::default(),
+        &[1u32, 2, 3, 5, 10],
+        |&x: &u32| x < 10,
+        |&x| x,
+        |&x, &r: &u32| {
+            assert!(x < 10, "postcondition evaluated outside its precondition");
+            x < 10 || r == 42
+        },
+    );
+    assert_eq!(
+        asserting.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(asserting.stats().mutants_tested > 0);
+    assert_eq!(asserting.stats().mutants_killed, 0);
+
+    // A precondition admitting a single non-boundary-adjacent value still yields probe
+    // evidence, because the live anchor input is always probed.
+    let narrow = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| x == 1_000,
+        |&x| x,
+        |&x, _r: &u32| {
+            assert!(
+                x == 1_000,
+                "postcondition evaluated outside its precondition"
+            );
+            true
+        },
+    );
+    assert_eq!(
+        narrow.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        narrow.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes: 0,
+            ..
+        }) if probed_inputs >= 1
+    ));
+}
+
+#[test]
+fn precondition_only_probe_still_finds_output_sensitivity_under_requires() {
+    // `r != 100` rejects exactly one output. No first-order mutant of the outputs `0..10`
+    // equals `100`, but the mutant chain walked on the admissible anchor input reaches it.
+    let outcome = check_contract_with_mutants(
+        SpecCheckConfig::default(),
+        &[1u32, 2, 3, 5, 7],
+        |&x: &u32| x < 10,
+        |&x| x,
+        |&x, &r: &u32| {
+            assert!(x < 10, "postcondition evaluated outside its precondition");
+            r != 100
+        },
+    );
+    assert_eq!(
+        outcome.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert!(matches!(
+        outcome.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes: 0,
+            saw_any_false: true,
+            saw_output_sensitivity: true,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn unconstrained_probe_domain_refines_classification_for_total_postconditions() {
+    let unconstrained = SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained);
+
+    // `true` everywhere: trivial on the whole sampled domain.
+    let trivial = check_contract(
+        unconstrained,
+        |&x: &u32| x < 100,
+        |&x| x,
+        |_x: &u32, _r: &u32| true,
+    );
+    assert_eq!(
+        trivial.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        trivial.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            skipped_out_of_precondition: 0,
+            saw_any_false: false,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+
+    // Input-only: false outside the precondition, never output-sensitive.
+    let input_only = check_contract(
+        unconstrained,
+        |&x: &u32| x < 100,
+        |&x| x,
+        |&x, _r: &u32| x < 500,
+    );
+    assert_eq!(
+        input_only.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+
+    // Output-sensitive only outside the precondition.
+    let outside_only = check_contract(
+        unconstrained,
+        |&x: &u32| x < 10,
+        |&x| x,
+        |&x, &r: &u32| x < 10 || r == 42,
+    );
+    assert_eq!(
+        outside_only.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+
+    // Through the fallible entry point a trap outside the precondition is tolerated and
+    // carries no evidence: the postcondition is still trivial where it is defined.
+    let partial = check_contract_fallible(
+        unconstrained,
+        |&x: &u32| Ok(x < 100),
+        |&x| Ok(x),
+        |&x, _r: &u32| if x < 100 { Ok(true) } else { Err(()) },
+    );
+    assert_eq!(
+        partial.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        partial.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            saw_any_false: false,
+            saw_output_sensitivity: false,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+}
+
+#[test]
+fn stateful_probes_stay_inside_precondition_by_default() {
+    // Every postcondition below panics, in every build profile, when it is evaluated on a
+    // pre-state violating `requires: *old < 100`.
+    fn next(old: &u32) -> u32 {
+        assert!(
+            *old < 100,
+            "stateful postcondition evaluated outside its precondition"
+        );
+        *old + 1
+    }
+
+    // (1) Vacuous along both output axes: the joint classification probe runs.
+    let vacuous = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), _new: &u32, _ret: &u32| next(old) > 0,
+    );
+    assert_eq!(
+        vacuous.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        vacuous.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes: 0,
+            skipped_out_of_precondition,
+            saw_any_false: false,
+            ..
+        }) if probed_inputs >= 1 && skipped_out_of_precondition > 0
+    ));
+
+    // (2) Return value unbound: the return-axis probe runs.
+    let ret_unbound = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), new: &u32, _ret: &u32| *new == next(old),
+    );
+    assert_eq!(
+        ret_unbound.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        ret_unbound.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed: 0,
+            state_mutants_killed,
+            ..
+        }) if state_mutants_killed > 0
+    ));
+
+    // (3) Post-state unbound: the state-axis probe runs.
+    let state_unbound = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), _new: &u32, ret: &u32| *ret == next(old),
+    );
+    assert_eq!(
+        state_unbound.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        state_unbound.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed,
+            state_mutants_killed: 0,
+            ..
+        }) if return_mutants_killed > 0
+    ));
+
+    // (4) The fully constraining contract is strong and likewise never leaves `requires`.
+    let strong = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| *old < 100,
+        |state: &mut u32, &()| {
+            *state += 1;
+            *state
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| *new == next(old) && *ret == *new,
+    );
+    assert!(strong.mutants_killed > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. Trapping Postconditions and Fallible Stateful Contracts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn trapping_postcondition_rejects_mutants() {
+    // Assertion-style postcondition: it traps on every wrong output instead of returning
+    // `false`. Each trap rejects that mutant, so the contract is strong.
+    let asserting = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| Ok(x < 100),
+        |&x| Ok(x.wrapping_mul(3)),
+        |&x, &r: &u32| {
+            if r == x.wrapping_mul(3) {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        },
+    );
+    assert!(asserting.is_strong());
+    let stats = asserting.stats();
+    assert!(stats.mutants_tested > 0);
+    assert_eq!(stats.mutants_killed, stats.mutants_tested);
+    assert_eq!(stats.mutants_trapped, stats.mutants_killed);
+
+    // The same holds for a real unwinding panic intercepted by `catch_unwind`: indexing
+    // with an out-of-range mutant of the returned index panics.
+    const SORTED: [u32; 4] = [10, 20, 30, 40];
+    let indexing = check_contract_fallible(
+        SpecCheckConfig::default()
+            .with_max_trials(8)
+            .with_max_mutants_per_hit(4),
+        |&x: &usize| Ok(x < SORTED.len()),
+        |&x| Ok(x),
+        |&x, &r: &usize| std::panic::catch_unwind(move || SORTED[r] == SORTED[x]).map_err(|_| ()),
+    );
+    assert!(indexing.is_strong());
+    assert!(indexing.stats().mutants_killed > 0);
+
+    // A postcondition that returns `false` is unaffected and reports no trapped mutants.
+    let plain = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| Ok(x < 100),
+        |&x| Ok(x),
+        |&x, &r: &u32| Ok(r == x),
+    );
+    assert!(plain.is_strong());
+    assert_eq!(plain.stats().mutants_trapped, 0);
+
+    // A trap on the live output is still a specification violation, never a kill.
+    let live_trap = check_contract_fallible(
+        SpecCheckConfig::default(),
+        |&x: &u32| Ok(x < 100),
+        |&x| Ok(x),
+        |_x: &u32, _r: &u32| Err(()),
+    );
+    assert_eq!(live_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert_eq!(live_trap.stats().mutants_tested, 0);
+}
+
+#[test]
+fn stateful_fallible_reports_traps_and_discards_partial_mutation() {
+    // The body mutates its state and only then traps, on the admissible pre-state `3`.
+    let mut observed_partial_state = false;
+    let body_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            *state += 1;
+            if *state == 4 { Err(()) } else { Ok(*state) }
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *old == 3 {
+                observed_partial_state = true;
+            }
+            Ok(*new == *old + 1 && *ret == *new)
+        },
+    );
+    assert_eq!(body_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert!(matches!(
+        body_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trap: TrapKind::BodyPanicked,
+            ..
+        }))
+    ));
+    assert!(
+        !observed_partial_state,
+        "postcondition must never observe the state left behind by a trapping body"
+    );
+
+    let pre_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| if *old == 2 { Err(()) } else { Ok(*old < 100) },
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| Ok(*new == *old + 1 && *ret == *new),
+    );
+    assert_eq!(pre_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert!(matches!(
+        pre_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trap: TrapKind::PreconditionPanicked,
+            ..
+        }))
+    ));
+
+    let post_trap = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *old == 1 && *new == 2 && *ret == 2 {
+                Err(())
+            } else {
+                Ok(*new == *old + 1 && *ret == *new)
+            }
+        },
+    );
+    assert_eq!(post_trap.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert!(matches!(
+        post_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trap: TrapKind::PostconditionPanicked,
+            ..
+        }))
+    ));
+
+    // A strong contract passes through the fallible entry point, and a postcondition that
+    // rejects perturbed post-states and return values by trapping kills every mutant.
+    let trapping_strong = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *new == *old + 1 && *ret == *new {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        },
+    );
+    assert!(trapping_strong.is_strong());
+    let stats = trapping_strong.stats();
+    assert!(stats.mutants_killed > 0);
+    assert_eq!(stats.mutants_trapped, stats.mutants_killed);
+
+    // Half-weak detection is unchanged through the fallible entry point.
+    let ret_ignored = check_stateful_contract_fallible(
+        SpecCheckConfig::default(),
+        |old: &u32, &()| Ok(*old < 100),
+        |state: &mut u32, &()| {
+            *state += 1;
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, _ret: &u32| Ok(*new == *old + 1),
+    );
+    assert_eq!(
+        ret_ignored.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Sampler and Mutant-Generator Edge Cases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn array_return_mutants_reach_interior_positions() {
+    // The output array is all-equal, so the structural mutants (swap, reverse, rotate) are
+    // no-ops, and the postcondition pins only an interior element.
+    let interior_4 = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |&x| [x; 4],
+        |&x, r: &[u32; 4]| r[1] == x,
+    );
+    assert!(interior_4.mutants_killed > 0);
+
+    let interior_8 = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |&x| [x; 8],
+        |&x, r: &[u32; 8]| r[5] == x,
+    );
+    assert!(interior_8.mutants_killed > 0);
+
+    // An array postcondition that ignores every element is still caught.
+    let ignores_elements = check_contract(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |&x| [x; 4],
+        |_x: &u32, r: &[u32; 4]| r.len() == 4,
+    );
+    assert_eq!(
+        ignores_elements.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+}
+
+#[test]
+fn zero_and_short_arrays_never_index_out_of_bounds() {
+    let mut rng = SplitMix64::new(7);
+
+    // `[T; 0]` is a subsingleton: sampling it and visiting its mutants must not index.
+    for trial_idx in 0..256 {
+        let empty: [u32; 0] = SampleInput::sample_at(trial_idx, &mut rng);
+        let mut emitted = 0usize;
+        empty.visit_mutants(&mut rng, |_mutant| emitted += 1);
+        assert_eq!(emitted, 0);
+    }
+    assert_eq!(<[u32; 0] as SampleInput>::BOUNDARY_COUNT, 1);
+
+    // `[T; 1]`, `[T; 2]`, and `[T; 3]` exercise every position-selection branch.
+    for trial_idx in 0..256 {
+        let one: [u8; 1] = SampleInput::sample_at(trial_idx, &mut rng);
+        let mut distinct = 0usize;
+        one.visit_mutants(&mut rng, |mutant| distinct += usize::from(mutant != one));
+        assert!(distinct > 0);
+
+        let two: [i8; 2] = SampleInput::sample_at(trial_idx, &mut rng);
+        let mut distinct = 0usize;
+        two.visit_mutants(&mut rng, |mutant| distinct += usize::from(mutant != two));
+        assert!(distinct > 0);
+
+        let three: [bool; 3] = SampleInput::sample_at(trial_idx, &mut rng);
+        let mut distinct = 0usize;
+        three.visit_mutants(&mut rng, |mutant| distinct += usize::from(mutant != three));
+        assert!(distinct > 0);
+    }
+
+    // A unit-returning contract over a zero-length array input is exempt, not a panic.
+    let empty_input = check_contract(
+        SpecCheckConfig::default(),
+        |_a: &[u32; 0]| true,
+        |_a| [0u8; 0],
+        |_a, _r: &[u8; 0]| true,
+    );
+    assert!(empty_input.is_strong());
+    assert!(empty_input.stats().subsingleton_return);
+}
+
+#[test]
+fn integer_samplers_and_mutants_cover_extremes_without_overflow() {
+    // Under overflow checks any non-wrapping arithmetic in a sampler or mutant generator
+    // panics at the extremes exercised here.
+    macro_rules! check_int {
+        ($ty:ty, [$($extreme:expr),+ $(,)?]) => {{
+            let mut rng = SplitMix64::new(0x5EED);
+            let mut saw_min = false;
+            let mut saw_max = false;
+            for trial_idx in 0..512 {
+                let value = <$ty as SampleInput>::sample_at(trial_idx, &mut rng);
+                saw_min |= value == <$ty>::MIN;
+                saw_max |= value == <$ty>::MAX;
+            }
+            assert!(saw_min && saw_max, "boundary corpus must contain MIN and MAX");
+
+            for extreme in [$($extreme),+] {
+                let extreme: $ty = extreme;
+                let mut distinct = 0usize;
+                extreme.visit_mutants(&mut rng, |mutant| {
+                    distinct += usize::from(mutant != extreme);
+                });
+                assert!(distinct > 0, "every integer value must have a distinct mutant");
+            }
+        }};
+    }
+
+    check_int!(u8, [u8::MIN, 1, u8::MAX - 1, u8::MAX]);
+    check_int!(u16, [u16::MIN, 1, u16::MAX - 1, u16::MAX]);
+    check_int!(u32, [u32::MIN, 1, u32::MAX - 1, u32::MAX]);
+    check_int!(u64, [u64::MIN, 1, u64::MAX - 1, u64::MAX]);
+    check_int!(u128, [u128::MIN, 1, u128::MAX - 1, u128::MAX]);
+    check_int!(usize, [usize::MIN, 1, usize::MAX - 1, usize::MAX]);
+    check_int!(i8, [i8::MIN, i8::MIN + 1, -1, 0, 1, i8::MAX - 1, i8::MAX]);
+    check_int!(
+        i16,
+        [i16::MIN, i16::MIN + 1, -1, 0, 1, i16::MAX - 1, i16::MAX]
+    );
+    check_int!(
+        i32,
+        [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX]
+    );
+    check_int!(
+        i64,
+        [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX]
+    );
+    check_int!(
+        i128,
+        [i128::MIN, i128::MIN + 1, -1, 0, 1, i128::MAX - 1, i128::MAX]
+    );
+    check_int!(
+        isize,
+        [
+            isize::MIN,
+            isize::MIN + 1,
+            -1,
+            0,
+            1,
+            isize::MAX - 1,
+            isize::MAX
+        ]
+    );
+
+    // Signed boundary corpora lead with `0`, `1`, `-1`.
+    let mut rng = SplitMix64::default();
+    assert_eq!(<i8 as SampleInput>::sample_at(0, &mut rng), 0);
+    assert_eq!(<i8 as SampleInput>::sample_at(1, &mut rng), 1);
+    assert_eq!(<i8 as SampleInput>::sample_at(2, &mut rng), -1);
+    assert_eq!(<i128 as SampleInput>::sample_at(2, &mut rng), -1);
+
+    // Negation of `i8::MIN` wraps to itself and is skipped as a non-distinct mutant, so a
+    // contract over the full `i8` domain stays strong at the extreme.
+    let wrapping_neg = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &i8| true,
+        |&x| x.wrapping_neg(),
+        |&x, &r: &i8| r == x.wrapping_neg(),
+    );
+    assert!(wrapping_neg.mutants_killed > 0);
+
+    // `Option` and `Result` returns flip variants in both directions.
+    let option_flip = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u8| true,
+        |&x| x.checked_add(1),
+        |&x, &r: &Option<u8>| r == x.checked_add(1),
+    );
+    assert!(option_flip.mutants_killed > 0);
+
+    let result_flip = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &i8| true,
+        |&x| if x < 0 { Err(x) } else { Ok(x as u8) },
+        |&x, &r: &Result<u8, i8>| r == if x < 0 { Err(x) } else { Ok(x as u8) },
+    );
+    assert!(result_flip.mutants_killed > 0);
 }

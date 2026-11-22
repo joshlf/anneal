@@ -23,6 +23,35 @@
 //!    post-state for stateful `&mut S` contracts) via [`ReturnMutants`] to verify
 //!    postcondition dichotomy and distinguish [`VacuityClass::TrivialPostcondition`],
 //!    [`VacuityClass::UnboundReturnOutput`], and [`VacuityClass::SurvivedAllMutants`].
+//!
+//! # Domain safety
+//!
+//! A postcondition is only required to be meaningful on inputs its
+//! precondition admits: outside `pre` it may overflow, index out of bounds,
+//! loop for an impractical number of iterations, or rely on `unsafe` code whose
+//! safety argument is the precondition itself. The checker therefore upholds
+//! one invariant in every stage and in every entry point:
+//!
+//! > `post(input, output)` is evaluated only when `pre(input)` returned `true`.
+//!
+//! The single exception is the opt-in [`ProbeDomain::Unconstrained`]
+//! classification probe, by which a caller asserts that `post` is total on
+//! every sampled input. Under the default [`ProbeDomain::PreconditionOnly`],
+//! a postcondition that never rejects an output on precondition-admissible
+//! inputs is reported as [`VacuityClass::TrivialPostcondition`], and
+//! [`FailureDetail::AllMutantsSurvived::skipped_out_of_precondition`] records
+//! how many sampled inputs were withheld from `post`; refining that verdict
+//! into [`VacuityClass::UnboundReturnOutput`] or
+//! [`VacuityClass::SurvivedAllMutants`] requires either a
+//! [`SyntacticBindingHint`] or [`ProbeDomain::Unconstrained`].
+//!
+//! Stage D3 necessarily evaluates `post` on perturbed outputs. The infallible
+//! entry points ([`check_contract`], [`check_contract_with_mutants`], and
+//! [`check_stateful_contract`]) cannot intercept a panic in `core`-only code,
+//! so a postcondition that can trap on a wrong output (for example by indexing
+//! with the return value) must be checked through [`check_contract_fallible`]
+//! or [`check_stateful_contract_fallible`], which count a trapping mutant
+//! evaluation as that mutant being rejected.
 
 use core::array;
 use core::fmt;
@@ -35,14 +64,17 @@ pub enum VacuityClass {
     DeadPrecondition,
     /// Live execution violated the postcondition or trapped during evaluation.
     SpecViolation,
-    /// Postcondition evaluated to `true` across all probed `(input, output)` pairs.
+    /// Postcondition accepted every probed `(input, output)` pair. The probed
+    /// inputs are the precondition-admissible ones unless
+    /// [`ProbeDomain::Unconstrained`] is selected.
     TrivialPostcondition,
-    /// Postcondition depends on inputs (evaluates to `false` for some input)
-    /// yet appears independent of the output (or mutated post-state).
+    /// Postcondition depends on inputs (rejects every probed output for some
+    /// probed input) yet appears independent of the output (or mutated
+    /// post-state).
     UnboundReturnOutput,
-    /// Postcondition varies with the output somewhere in the unconstrained
-    /// domain (or no distinct mutants were tested), yet every tested mutant
-    /// survived on precondition-admissible inputs.
+    /// Postcondition varies with the output somewhere in the probed domain (or
+    /// no distinct mutants were tested), yet every tested mutant survived on
+    /// precondition-admissible inputs.
     SurvivedAllMutants,
 }
 
@@ -1073,18 +1105,31 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
             return;
         }
 
-        // Select up to 3 distinct representative element positions: `0`, `N/2`, `N-1`.
-        let indices: [Option<usize>; 3] = [
+        // Perturb the fixed representative positions `0`, `N / 2`, and `N - 1`
+        // plus one PRNG-selected roving position per call. Across precondition
+        // hits the roving position visits every index, so a postcondition that
+        // pins only an interior element is not mistaken for an output-blind one.
+        // `N >= 1` here because `[T; 0]` is a subsingleton.
+        let last = N.saturating_sub(1);
+        let roving = (rng.next_u64() % (N as u64).max(1)) as usize;
+        let indices: [Option<usize>; 4] = [
             Some(0),
             if N >= 3 { Some(N / 2) } else { None },
-            if N >= 2 {
-                Some(N.saturating_sub(1))
+            if N >= 2 { Some(last) } else { None },
+            if roving != 0 && roving != N / 2 && roving != last {
+                Some(roving)
             } else {
                 None
             },
         ];
         let active_positions = indices.iter().filter(|idx| idx.is_some()).count();
-        let per_pos_cap = if active_positions <= 1 { 16 } else { 4 };
+        // Leave room for the four structural mutants below within the default
+        // `max_mutants_per_hit` budget of 16.
+        let per_pos_cap = match active_positions {
+            0 | 1 => 16,
+            2 | 3 => 4,
+            _ => 3,
+        };
 
         let mut first_front_mut: Option<T> = None;
         for maybe_pos in indices {
@@ -1138,6 +1183,34 @@ pub enum SyntacticBindingHint {
     SyntacticallyTautological,
 }
 
+/// Domain over which a vacuity-classification probe may evaluate a
+/// postcondition once every tested mutant has survived.
+///
+/// Stages D2 and D3 always stay inside the precondition. The classification
+/// probe gathers further evidence about how `post` behaves, and this policy
+/// decides whether that evidence may come from inputs that violate `pre`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ProbeDomain {
+    /// Evaluate `post` only on inputs satisfying `pre`.
+    ///
+    /// This is always safe and is the default: a postcondition is only
+    /// required to be total, terminating, and free of undefined behavior on
+    /// inputs its precondition admits.
+    #[default]
+    PreconditionOnly,
+    /// Additionally evaluate `post` on sampled inputs that violate `pre`.
+    ///
+    /// Selecting this domain asserts that `post` neither panics, diverges, nor
+    /// exhibits undefined behavior on any sampled input, admissible or not. It
+    /// lets the probe distinguish a postcondition that is `true` everywhere
+    /// ([`VacuityClass::TrivialPostcondition`]) from one that is input-only
+    /// ([`VacuityClass::UnboundReturnOutput`]) or that binds the output only
+    /// outside the precondition ([`VacuityClass::SurvivedAllMutants`]). Through
+    /// the fallible entry points, a trap on a precondition-violating input is
+    /// tolerated and carries no evidence.
+    Unconstrained,
+}
+
 /// Configuration parameters controlling dynamic contract checking.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SpecCheckConfig {
@@ -1155,6 +1228,8 @@ pub struct SpecCheckConfig {
     /// (mutated post-state `S` and return value `R`) to independently kill at
     /// least one mutant.
     pub require_both_state_and_return_kills: bool,
+    /// Inputs on which the vacuity-classification probe may evaluate `post`.
+    pub probe_domain: ProbeDomain,
 }
 
 impl Default for SpecCheckConfig {
@@ -1166,6 +1241,7 @@ impl Default for SpecCheckConfig {
             max_mutants_per_hit: 16,
             syntactic_hint: None,
             require_both_state_and_return_kills: true,
+            probe_domain: ProbeDomain::PreconditionOnly,
         }
     }
 }
@@ -1207,9 +1283,15 @@ impl SpecCheckConfig {
         self.require_both_state_and_return_kills = require_both;
         self
     }
+
+    /// Sets the [`ProbeDomain`] of the vacuity-classification probe.
+    pub const fn with_probe_domain(mut self, probe_domain: ProbeDomain) -> Self {
+        self.probe_domain = probe_domain;
+        self
+    }
 }
 
-/// Identifies which phase trapped during [`check_contract_fallible`].
+/// Identifies which phase trapped during a fallible contract check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TrapKind {
     /// Precondition evaluation panicked or returned `Err(())`.
@@ -1244,10 +1326,21 @@ pub enum FailureDetail {
     /// Zero distinct mutants were tested (e.g. `max_mutants_per_hit == 0` or
     /// every custom mutant equaled the actual output).
     NoDistinctMutantsTested,
-    /// All tested mutants satisfied the postcondition; includes domain probe telemetry.
+    /// All tested mutants satisfied the postcondition; includes probe telemetry.
     AllMutantsSurvived {
+        /// Number of inputs on which the classification probe evaluated `post`.
         probed_inputs: usize,
+        /// Number of those inputs that violated `pre`. Always `0` under
+        /// [`ProbeDomain::PreconditionOnly`].
+        out_of_precondition_probes: usize,
+        /// Number of sampled probe inputs withheld from `post` because they
+        /// violated `pre` (or `pre` trapped on them). A nonzero count under
+        /// [`ProbeDomain::PreconditionOnly`] means the verdict describes `post`
+        /// relative to the precondition only.
+        skipped_out_of_precondition: usize,
+        /// Whether `post` rejected any probed `(input, output)` pair.
         saw_any_false: bool,
+        /// Whether `post` both accepted and rejected outputs for one input.
         saw_output_sensitivity: bool,
     },
     /// In a stateful contract check, at least one required non-subsingleton
@@ -1269,8 +1362,12 @@ pub struct SpecCheckStats {
     pub precondition_hits: usize,
     /// Total number of distinct output/state mutants evaluated.
     pub mutants_tested: usize,
-    /// Total number of mutants rejected (`post == false`).
+    /// Total number of mutants rejected (`post == false` or `post` trapped).
     pub mutants_killed: usize,
+    /// Number of killed mutants rejected by a trapping postcondition
+    /// (`Err(())` through a fallible entry point); a subset of
+    /// `mutants_killed`.
+    pub mutants_trapped: usize,
     /// True iff the return type `R` is a subsingleton (`R::IS_SUBSINGLETON`).
     pub subsingleton_return: bool,
 }
@@ -1334,32 +1431,287 @@ impl SpecCheckOutcome {
     }
 }
 
-/// Runs the deterministic domain-wide classification probe when
+/// Verdict of one probe evaluation of a postcondition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// The postcondition accepted the candidate output.
+    Accepted,
+    /// The postcondition rejected the candidate output.
+    Rejected,
+    /// The postcondition trapped on a precondition-violating input, where it
+    /// is not required to be defined.
+    Undefined,
+}
+
+/// Interprets one evaluation of `post` on an input whose precondition
+/// admissibility is `admissible`.
+///
+/// On a precondition-admissible input a trapping postcondition rejects the
+/// candidate output, exactly as it would at run time. Outside the precondition
+/// a trap carries no evidence.
+const fn probe_verdict(outcome: Result<bool, ()>, admissible: bool) -> ProbeVerdict {
+    match outcome {
+        Ok(true) => ProbeVerdict::Accepted,
+        Ok(false) => ProbeVerdict::Rejected,
+        Err(()) => {
+            if admissible {
+                ProbeVerdict::Rejected
+            } else {
+                ProbeVerdict::Undefined
+            }
+        }
+    }
+}
+
+/// Decides whether a sampled probe input may be handed to `post`.
+///
+/// Returns `Some(true)` for a precondition-admissible input, `Some(false)` for
+/// a precondition-violating input under [`ProbeDomain::Unconstrained`], and
+/// `None` when `post` must not be evaluated on the input (it violates `pre`
+/// under [`ProbeDomain::PreconditionOnly`], or `pre` itself trapped so its
+/// admissibility is unknown).
+const fn probe_admission(domain: ProbeDomain, pre_outcome: Result<bool, ()>) -> Option<bool> {
+    match pre_outcome {
+        Ok(true) => Some(true),
+        Ok(false) => match domain {
+            ProbeDomain::Unconstrained => Some(false),
+            ProbeDomain::PreconditionOnly => None,
+        },
+        Err(()) => None,
+    }
+}
+
+/// Maps a [`SyntacticBindingHint`] to the class it asserts.
+const fn hint_class(hint: SyntacticBindingHint) -> VacuityClass {
+    match hint {
+        SyntacticBindingHint::ReturnUnused => VacuityClass::UnboundReturnOutput,
+        SyntacticBindingHint::SyntacticallyTautological => VacuityClass::TrivialPostcondition,
+    }
+}
+
+/// Records one Stage D3 mutant evaluation in `stats`, returning `true` iff the
+/// mutant was rejected. A trapping postcondition rejects the mutant.
+fn record_mutant(stats: &mut SpecCheckStats, outcome: Result<bool, ()>) -> bool {
+    stats.mutants_tested += 1;
+    match outcome {
+        Ok(true) => false,
+        Ok(false) => {
+            stats.mutants_killed += 1;
+            true
+        }
+        Err(()) => {
+            stats.mutants_killed += 1;
+            stats.mutants_trapped += 1;
+            true
+        }
+    }
+}
+
+/// Builds the fail-closed outcome for a live execution trap.
+const fn execution_trapped(
+    stats: SpecCheckStats,
+    trial_idx: usize,
+    trap: TrapKind,
+) -> SpecCheckOutcome {
+    SpecCheckOutcome::Failed(SpecCheckFailure {
+        class: VacuityClass::SpecViolation,
+        stats,
+        detail: FailureDetail::Violation(ViolationKind::ExecutionTrapped { trial_idx, trap }),
+    })
+}
+
+/// Accumulates one accept/reject observation for a single probed input.
+fn note_verdict(verdict: ProbeVerdict, accepted: &mut bool, rejected: &mut bool) {
+    match verdict {
+        ProbeVerdict::Accepted => *accepted = true,
+        ProbeVerdict::Rejected => *rejected = true,
+        ProbeVerdict::Undefined => {}
+    }
+}
+
+/// Evidence accumulated by a vacuity-classification probe.
+#[derive(Clone, Copy, Debug, Default)]
+struct ProbeEvidence {
+    probed_inputs: usize,
+    out_of_precondition_probes: usize,
+    skipped_out_of_precondition: usize,
+    saw_any_false: bool,
+    saw_output_sensitivity: bool,
+}
+
+impl ProbeEvidence {
+    /// Records the outputs observed for one probed input.
+    fn record_input(&mut self, admissible: bool, accepted: bool, rejected: bool) {
+        self.probed_inputs += 1;
+        if !admissible {
+            self.out_of_precondition_probes += 1;
+        }
+        if rejected {
+            self.saw_any_false = true;
+        }
+        if accepted && rejected {
+            self.saw_output_sensitivity = true;
+        }
+    }
+
+    /// Records that a witness input accepted one output and rejected another.
+    fn record_flip(&mut self) {
+        self.saw_any_false = true;
+        self.saw_output_sensitivity = true;
+    }
+
+    /// Classifies the accumulated evidence.
+    const fn class(&self) -> VacuityClass {
+        if !self.saw_any_false {
+            VacuityClass::TrivialPostcondition
+        } else if !self.saw_output_sensitivity {
+            VacuityClass::UnboundReturnOutput
+        } else {
+            VacuityClass::SurvivedAllMutants
+        }
+    }
+
+    /// Renders the accumulated evidence as probe telemetry.
+    const fn detail(&self) -> FailureDetail {
+        FailureDetail::AllMutantsSurvived {
+            probed_inputs: self.probed_inputs,
+            out_of_precondition_probes: self.out_of_precondition_probes,
+            skipped_out_of_precondition: self.skipped_out_of_precondition,
+            saw_any_false: self.saw_any_false,
+            saw_output_sensitivity: self.saw_output_sensitivity,
+        }
+    }
+}
+
+/// Maximum number of mutant-of-mutant steps taken by [`mutant_chain_finds_flip`].
+const MUTANT_CHAIN_STEPS: usize = 128;
+
+/// Walks a bounded chain of mutants-of-mutants starting at `start`, handing
+/// every candidate to `flips` until it reports that some witness input flipped
+/// its verdict. Returns `true` iff a flip was reported.
+///
+/// The chain lets point constraints such as `x < 10 || r == 42` be classified
+/// deterministically: successive `+1` perturbations reach `42` from any small
+/// anchor well within [`MUTANT_CHAIN_STEPS`].
+fn mutant_chain_finds_flip<T, F>(start: T, rng: &mut SplitMix64, mut flips: F) -> bool
+where
+    T: ReturnMutants + PartialEq,
+    F: FnMut(&T) -> bool,
+{
+    let mut cur = start;
+    let mut seen: [Option<T>; 4] = [None, None, None, None];
+    let mut prev_cur: Option<T> = None;
+
+    for _ in 0..MUTANT_CHAIN_STEPS {
+        let mut found = false;
+        let mut next_cur: Option<T> = None;
+        cur.visit_mutants(rng, |cand| {
+            if found {
+                return;
+            }
+            if flips(&cand) {
+                found = true;
+                return;
+            }
+            if next_cur.is_none()
+                && cand != cur
+                && prev_cur.as_ref() != Some(&cand)
+                && !seen.iter().any(|slot| slot.as_ref() == Some(&cand))
+            {
+                next_cur = Some(cand);
+            }
+        });
+        if found {
+            return true;
+        }
+
+        let Some(next) = next_cur else {
+            break;
+        };
+        if let Some(slot) = seen.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(cur);
+        } else {
+            prev_cur = Some(cur);
+        }
+        cur = next;
+    }
+
+    false
+}
+
+/// Evaluates `post(x, r)` across `anchor_ret`, `extra_outputs`, and the
+/// first-order mutants of `anchor_ret`, stopping once both an accepted and a
+/// rejected output were observed. Returns `(accepted, rejected)`.
+fn observe_outputs_at<I, R, Post>(
+    x: &I,
+    admissible: bool,
+    anchor_ret: &R,
+    extra_outputs: &[R],
+    rng: &mut SplitMix64,
+    post: &mut Post,
+) -> (bool, bool)
+where
+    R: ReturnMutants,
+    Post: FnMut(&I, &R) -> Result<bool, ()>,
+{
+    let mut accepted = false;
+    let mut rejected = false;
+
+    note_verdict(
+        probe_verdict(post(x, anchor_ret), admissible),
+        &mut accepted,
+        &mut rejected,
+    );
+
+    for r in extra_outputs {
+        if accepted && rejected {
+            break;
+        }
+        note_verdict(
+            probe_verdict(post(x, r), admissible),
+            &mut accepted,
+            &mut rejected,
+        );
+    }
+
+    if !(accepted && rejected) {
+        anchor_ret.visit_mutants(rng, |cand| {
+            if accepted && rejected {
+                return;
+            }
+            note_verdict(
+                probe_verdict(post(x, &cand), admissible),
+                &mut accepted,
+                &mut rejected,
+            );
+        });
+    }
+
+    (accepted, rejected)
+}
+
+/// Runs the deterministic classification probe once
 /// `mutants_tested > 0 && mutants_killed == 0` on a non-subsingleton return.
-fn classify_all_mutants_survived<I, R, Post>(
+///
+/// `(anchor_input, anchor_ret)` is a live precondition-admissible pair that
+/// satisfied `post`. Every other probe input is first submitted to `pre`, and
+/// `post` is evaluated on it only when [`probe_admission`] allows.
+fn classify_all_mutants_survived<I, R, Pre, Post>(
     config: SpecCheckConfig,
+    anchor_input: I,
     anchor_ret: R,
     extra_outputs: &[R],
+    pre: &mut Pre,
     post: &mut Post,
 ) -> (VacuityClass, FailureDetail)
 where
     I: SampleInput,
     R: ReturnMutants + PartialEq,
+    Pre: FnMut(&I) -> Result<bool, ()>,
     Post: FnMut(&I, &R) -> Result<bool, ()>,
 {
     if let Some(hint) = config.syntactic_hint {
-        let class = match hint {
-            SyntacticBindingHint::ReturnUnused => VacuityClass::UnboundReturnOutput,
-            SyntacticBindingHint::SyntacticallyTautological => VacuityClass::TrivialPostcondition,
-        };
-        return (
-            class,
-            FailureDetail::AllMutantsSurvived {
-                probed_inputs: 0,
-                saw_any_false: false,
-                saw_output_sensitivity: false,
-            },
-        );
+        return (hint_class(hint), ProbeEvidence::default().detail());
     }
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0xA5A5_5A5A_C3C3_3C3C);
@@ -1369,137 +1721,76 @@ where
         64
     };
 
-    let mut probed_inputs = 0usize;
-    let mut saw_any_false = false;
-    let mut saw_output_sensitivity = false;
-    let mut false_witness_x: Option<I> = None;
-    let mut true_witness_x: Option<I> = None;
+    let mut evidence = ProbeEvidence::default();
+    let mut rejected_witness: Option<(I, bool)> = None;
+    let mut accepted_witness: Option<(I, bool)> = None;
 
-    for idx in 0..probe_input_count {
-        let x_probe = I::sample_at(idx, &mut probe_rng);
-        probed_inputs += 1;
-        let mut saw_true_here = false;
-        let mut saw_false_here = false;
+    // The anchor input is admissible by construction, so it is always safe to
+    // probe and guarantees at least one probed input however narrow `pre` is.
+    let (accepted, rejected) = observe_outputs_at(
+        &anchor_input,
+        true,
+        &anchor_ret,
+        extra_outputs,
+        &mut probe_rng,
+        post,
+    );
+    evidence.record_input(true, accepted, rejected);
 
-        if let Ok(holds) = post(&x_probe, &anchor_ret) {
-            if holds {
-                saw_true_here = true;
-            } else {
-                saw_false_here = true;
-                saw_any_false = true;
-            }
-        }
-
-        for r in extra_outputs {
-            if saw_true_here && saw_false_here {
-                break;
-            }
-            if let Ok(holds) = post(&x_probe, r) {
-                if holds {
-                    saw_true_here = true;
-                } else {
-                    saw_false_here = true;
-                    saw_any_false = true;
-                }
-            }
-        }
-
-        if !(saw_true_here && saw_false_here) {
-            anchor_ret.visit_mutants(&mut probe_rng, |cand| {
-                if saw_true_here && saw_false_here {
-                    return;
-                }
-                if let Ok(holds) = post(&x_probe, &cand) {
-                    if holds {
-                        saw_true_here = true;
-                    } else {
-                        saw_false_here = true;
-                        saw_any_false = true;
-                    }
-                }
-            });
-        }
-
-        if saw_true_here && saw_false_here {
-            saw_output_sensitivity = true;
-            break;
-        }
-
-        if saw_false_here && false_witness_x.is_none() {
-            false_witness_x = Some(x_probe);
-        } else if saw_true_here && true_witness_x.is_none() {
-            true_witness_x = Some(x_probe);
-        }
-    }
-
-    // If `post` evaluated to `false` on some input outside `pre` (or `true` on
-    // some input) without yet observing output sensitivity, walk a bounded
-    // mutant chain from `anchor_ret` so point-equality clauses such as
-    // `x < 10 || r == 42` are deterministically classified as `SurvivedAllMutants`.
-    if !saw_output_sensitivity && (false_witness_x.is_some() || true_witness_x.is_some()) {
-        let mut cur = anchor_ret;
-        let mut seen: [Option<R>; 4] = [None, None, None, None];
-        let mut prev_cur: Option<R> = None;
-
-        for _ in 0..128 {
-            if saw_output_sensitivity {
-                break;
-            }
-            let mut next_cur: Option<R> = None;
-            cur.visit_mutants(&mut probe_rng, |cand| {
-                if saw_output_sensitivity {
-                    return;
-                }
-                if let Some(fx) = false_witness_x.as_ref()
-                    && matches!(post(fx, &cand), Ok(true))
-                {
-                    saw_output_sensitivity = true;
-                    return;
-                }
-                if let Some(tx) = true_witness_x.as_ref()
-                    && matches!(post(tx, &cand), Ok(false))
-                {
-                    saw_any_false = true;
-                    saw_output_sensitivity = true;
-                    return;
-                }
-                if next_cur.is_none()
-                    && cand != cur
-                    && prev_cur.as_ref() != Some(&cand)
-                    && !seen.iter().any(|slot| slot.as_ref() == Some(&cand))
-                {
-                    next_cur = Some(cand);
-                }
-            });
-
-            let Some(next) = next_cur else {
-                break;
+    if !evidence.saw_output_sensitivity {
+        for idx in 0..probe_input_count {
+            let x_probe = I::sample_at(idx, &mut probe_rng);
+            let Some(admissible) = probe_admission(config.probe_domain, pre(&x_probe)) else {
+                evidence.skipped_out_of_precondition += 1;
+                continue;
             };
-            if let Some(slot) = seen.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(cur);
-            } else {
-                prev_cur = Some(cur);
+
+            let (accepted, rejected) = observe_outputs_at(
+                &x_probe,
+                admissible,
+                &anchor_ret,
+                extra_outputs,
+                &mut probe_rng,
+                post,
+            );
+            evidence.record_input(admissible, accepted, rejected);
+            if evidence.saw_output_sensitivity {
+                break;
             }
-            cur = next;
+
+            if rejected && rejected_witness.is_none() {
+                rejected_witness = Some((x_probe, admissible));
+            } else if accepted && accepted_witness.is_none() {
+                accepted_witness = Some((x_probe, admissible));
+            }
         }
     }
 
-    let class = if !saw_any_false {
-        VacuityClass::TrivialPostcondition
-    } else if !saw_output_sensitivity {
-        VacuityClass::UnboundReturnOutput
-    } else {
-        VacuityClass::SurvivedAllMutants
-    };
+    // Walk a bounded mutant chain from `anchor_ret` looking for an output that
+    // flips the verdict of the anchor input or of a recorded witness input.
+    if !evidence.saw_output_sensitivity {
+        let flipped = mutant_chain_finds_flip(anchor_ret, &mut probe_rng, |cand| {
+            if probe_verdict(post(&anchor_input, cand), true) == ProbeVerdict::Rejected {
+                return true;
+            }
+            if let Some((x, admissible)) = accepted_witness.as_ref()
+                && probe_verdict(post(x, cand), *admissible) == ProbeVerdict::Rejected
+            {
+                return true;
+            }
+            if let Some((x, admissible)) = rejected_witness.as_ref()
+                && probe_verdict(post(x, cand), *admissible) == ProbeVerdict::Accepted
+            {
+                return true;
+            }
+            false
+        });
+        if flipped {
+            evidence.record_flip();
+        }
+    }
 
-    (
-        class,
-        FailureDetail::AllMutantsSurvived {
-            probed_inputs,
-            saw_any_false,
-            saw_output_sensitivity,
-        },
-    )
+    (evidence.class(), evidence.detail())
 }
 
 /// Shared fallible core powering [`check_contract`],
@@ -1534,7 +1825,7 @@ where
 
     let mut rng = SplitMix64::new(config.seed);
     let mut mutant_rng = rng.fork();
-    let mut anchor_ret: Option<R> = None;
+    let mut anchor: Option<(I, R)> = None;
 
     for trial_idx in 0..config.max_trials {
         let input = I::sample_at(trial_idx, &mut rng);
@@ -1543,14 +1834,7 @@ where
         let pre_holds = match pre(&input) {
             Ok(holds) => holds,
             Err(()) => {
-                return SpecCheckOutcome::Failed(SpecCheckFailure {
-                    class: VacuityClass::SpecViolation,
-                    stats,
-                    detail: FailureDetail::Violation(ViolationKind::ExecutionTrapped {
-                        trial_idx,
-                        trap: TrapKind::PreconditionPanicked,
-                    }),
-                });
+                return execution_trapped(stats, trial_idx, TrapKind::PreconditionPanicked);
             }
         };
 
@@ -1562,29 +1846,13 @@ where
 
         let ret_ok = match body(&input) {
             Ok(ret) => ret,
-            Err(()) => {
-                return SpecCheckOutcome::Failed(SpecCheckFailure {
-                    class: VacuityClass::SpecViolation,
-                    stats,
-                    detail: FailureDetail::Violation(ViolationKind::ExecutionTrapped {
-                        trial_idx,
-                        trap: TrapKind::BodyPanicked,
-                    }),
-                });
-            }
+            Err(()) => return execution_trapped(stats, trial_idx, TrapKind::BodyPanicked),
         };
 
         let post_ok = match post(&input, &ret_ok) {
             Ok(holds) => holds,
             Err(()) => {
-                return SpecCheckOutcome::Failed(SpecCheckFailure {
-                    class: VacuityClass::SpecViolation,
-                    stats,
-                    detail: FailureDetail::Violation(ViolationKind::ExecutionTrapped {
-                        trial_idx,
-                        trap: TrapKind::PostconditionPanicked,
-                    }),
-                });
+                return execution_trapped(stats, trial_idx, TrapKind::PostconditionPanicked);
             }
         };
 
@@ -1606,35 +1874,22 @@ where
                     if ret_bad == &ret_ok {
                         continue;
                     }
-                    if let Ok(holds) = post(&input, ret_bad) {
-                        tested_this_hit += 1;
-                        stats.mutants_tested += 1;
-                        if !holds {
-                            stats.mutants_killed += 1;
-                        }
-                    }
+                    tested_this_hit += 1;
+                    record_mutant(&mut stats, post(&input, ret_bad));
                 }
             } else {
                 ret_ok.visit_mutants(&mut mutant_rng, |ret_bad| {
-                    if tested_this_hit >= config.max_mutants_per_hit {
+                    if tested_this_hit >= config.max_mutants_per_hit || ret_bad == ret_ok {
                         return;
                     }
-                    if ret_bad == ret_ok {
-                        return;
-                    }
-                    if let Ok(holds) = post(&input, &ret_bad) {
-                        tested_this_hit += 1;
-                        stats.mutants_tested += 1;
-                        if !holds {
-                            stats.mutants_killed += 1;
-                        }
-                    }
+                    tested_this_hit += 1;
+                    record_mutant(&mut stats, post(&input, &ret_bad));
                 });
             }
         }
 
-        if anchor_ret.is_none() {
-            anchor_ret = Some(ret_ok);
+        if anchor.is_none() {
+            anchor = Some((input, ret_ok));
         }
     }
 
@@ -1654,11 +1909,7 @@ where
             return SpecCheckOutcome::Failed(SpecCheckFailure {
                 class: VacuityClass::TrivialPostcondition,
                 stats,
-                detail: FailureDetail::AllMutantsSurvived {
-                    probed_inputs: 0,
-                    saw_any_false: false,
-                    saw_output_sensitivity: false,
-                },
+                detail: ProbeEvidence::default().detail(),
             });
         }
         return SpecCheckOutcome::Strong(stats);
@@ -1682,8 +1933,15 @@ where
 
     if stats.mutants_killed == 0 {
         let extra = custom_mutants.unwrap_or(&[]);
-        let (class, detail) = match anchor_ret {
-            Some(ret) => classify_all_mutants_survived(config, ret, extra, &mut post),
+        let (class, detail) = match anchor {
+            Some((anchor_input, anchor_ret)) => classify_all_mutants_survived(
+                config,
+                anchor_input,
+                anchor_ret,
+                extra,
+                &mut pre,
+                &mut post,
+            ),
             None => (
                 VacuityClass::SurvivedAllMutants,
                 FailureDetail::NoDistinctMutantsTested,
@@ -1701,6 +1959,11 @@ where
 
 /// Checks a stateless contract `(pre, body, post)` using [`SampleInput`] and
 /// [`ReturnMutants`].
+///
+/// `post` is evaluated only on inputs satisfying `pre` (see the module-level
+/// *Domain safety* section), but Stage D3 evaluates it on perturbed outputs.
+/// Because a panic cannot be intercepted in `core`-only code, a `post` that can
+/// panic on a wrong output must be checked through [`check_contract_fallible`].
 pub fn check_contract<I, R, Pre, Body, Post>(
     config: SpecCheckConfig,
     mut pre: Pre,
@@ -1760,6 +2023,10 @@ where
 /// immediately with [`VacuityClass::SpecViolation`] and the corresponding
 /// [`TrapKind`]; panics are never silently swallowed as precondition rejection
 /// or skipped trials.
+///
+/// An `Err(())` from `post` on a perturbed output of a precondition-admissible
+/// input means the postcondition rejected that mutant by trapping, so it is
+/// counted in both `mutants_killed` and `mutants_trapped`.
 pub fn check_contract_fallible<I, R, Pre, Body, Post>(
     config: SpecCheckConfig,
     pre: Pre,
@@ -1803,45 +2070,67 @@ where
     }
 }
 
+/// Live precondition-admissible execution `(old_s, args) -> (new_s, ret)` of a
+/// stateful contract that satisfied its postcondition.
+struct StatefulAnchor<S, A, R> {
+    old_s: S,
+    args: A,
+    new_s: S,
+    ret: R,
+}
+
 /// Probes whether `post` varies with `ret` (holding `(old_s, args, new_s)` fixed).
-fn probe_stateful_return_axis<S, A, R, Post>(
+fn probe_stateful_return_axis<S, A, R, Pre, Post>(
     config: SpecCheckConfig,
-    anchor_new_s: &S,
-    anchor_ret: R,
+    anchor: StatefulAnchor<S, A, R>,
+    pre: &mut Pre,
     post: &mut Post,
 ) -> VacuityClass
 where
     S: SampleInput + ReturnMutants + Clone + PartialEq,
     A: SampleInput,
     R: ReturnMutants + PartialEq,
-    Post: FnMut(&S, &A, &S, &R) -> bool,
+    Pre: FnMut(&S, &A) -> Result<bool, ()>,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
 {
     if let Some(hint) = config.syntactic_hint {
-        return match hint {
-            SyntacticBindingHint::ReturnUnused => VacuityClass::UnboundReturnOutput,
-            SyntacticBindingHint::SyntacticallyTautological => VacuityClass::TrivialPostcondition,
-        };
+        return hint_class(hint);
     }
+
+    let StatefulAnchor {
+        old_s: anchor_old_s,
+        args: anchor_args,
+        new_s: anchor_new_s,
+        ret: anchor_ret,
+    } = anchor;
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0x51A7_E001_C3C3_3C3C);
     let mut saw_sensitivity = false;
-    let mut false_witness: Option<(S, A, S)> = None;
-    let mut true_witness: Option<(S, A, S)> = None;
+    let mut rejected_witness: Option<(S, A, S, bool)> = None;
+    let mut accepted_witness: Option<(S, A, S, bool)> = None;
 
     for idx in 0..64 {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
+        let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
+            continue;
+        };
         let probe_new_s = if idx % 2 == 0 {
             anchor_new_s.clone()
         } else {
             old_s.clone()
         };
-        let base = post(&old_s, &args, &probe_new_s, &anchor_ret);
+        let base = probe_verdict(post(&old_s, &args, &probe_new_s, &anchor_ret), admissible);
+        if base == ProbeVerdict::Undefined {
+            continue;
+        }
+
         let mut varied = false;
         anchor_ret.visit_mutants(&mut probe_rng, |cand| {
             if varied {
                 return;
             }
-            if post(&old_s, &args, &probe_new_s, &cand) != base {
+            let verdict = probe_verdict(post(&old_s, &args, &probe_new_s, &cand), admissible);
+            if verdict != ProbeVerdict::Undefined && verdict != base {
                 varied = true;
             }
         });
@@ -1849,57 +2138,32 @@ where
             saw_sensitivity = true;
             break;
         }
-        if !base && false_witness.is_none() {
-            false_witness = Some((old_s, args, probe_new_s));
-        } else if base && true_witness.is_none() {
-            true_witness = Some((old_s, args, probe_new_s));
+
+        if base == ProbeVerdict::Rejected && rejected_witness.is_none() {
+            rejected_witness = Some((old_s, args, probe_new_s, admissible));
+        } else if base == ProbeVerdict::Accepted && accepted_witness.is_none() {
+            accepted_witness = Some((old_s, args, probe_new_s, admissible));
         }
     }
 
-    if !saw_sensitivity && (false_witness.is_some() || true_witness.is_some()) {
-        let mut cur = anchor_ret;
-        let mut seen: [Option<R>; 4] = [None, None, None, None];
-        let mut prev_cur: Option<R> = None;
-
-        for _ in 0..128 {
-            if saw_sensitivity {
-                break;
+    if !saw_sensitivity {
+        saw_sensitivity = mutant_chain_finds_flip(anchor_ret, &mut probe_rng, |cand| {
+            let live = post(&anchor_old_s, &anchor_args, &anchor_new_s, cand);
+            if probe_verdict(live, true) == ProbeVerdict::Rejected {
+                return true;
             }
-            let mut next_cur: Option<R> = None;
-            cur.visit_mutants(&mut probe_rng, |cand| {
-                if saw_sensitivity {
-                    return;
-                }
-                if let Some((os, a, ns)) = false_witness.as_ref()
-                    && post(os, a, ns, &cand)
-                {
-                    saw_sensitivity = true;
-                    return;
-                }
-                if let Some((os, a, ns)) = true_witness.as_ref()
-                    && !post(os, a, ns, &cand)
-                {
-                    saw_sensitivity = true;
-                    return;
-                }
-                if next_cur.is_none()
-                    && cand != cur
-                    && prev_cur.as_ref() != Some(&cand)
-                    && !seen.iter().any(|slot| slot.as_ref() == Some(&cand))
-                {
-                    next_cur = Some(cand);
-                }
-            });
-            let Some(next) = next_cur else {
-                break;
-            };
-            if let Some(slot) = seen.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(cur);
-            } else {
-                prev_cur = Some(cur);
+            if let Some((os, a, ns, admissible)) = accepted_witness.as_ref()
+                && probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Rejected
+            {
+                return true;
             }
-            cur = next;
-        }
+            if let Some((os, a, ns, admissible)) = rejected_witness.as_ref()
+                && probe_verdict(post(os, a, ns, cand), *admissible) == ProbeVerdict::Accepted
+            {
+                return true;
+            }
+            false
+        });
     }
 
     if saw_sensitivity {
@@ -1910,40 +2174,54 @@ where
 }
 
 /// Probes whether `post` varies with `new_s` (holding `(old_s, args, ret)` fixed).
-fn probe_stateful_state_axis<S, A, R, Post>(
+fn probe_stateful_state_axis<S, A, R, Pre, Post>(
     config: SpecCheckConfig,
-    anchor_new_s: S,
-    anchor_ret: &R,
+    anchor: StatefulAnchor<S, A, R>,
+    pre: &mut Pre,
     post: &mut Post,
 ) -> VacuityClass
 where
     S: SampleInput + ReturnMutants + Clone + PartialEq,
     A: SampleInput,
     R: ReturnMutants + PartialEq,
-    Post: FnMut(&S, &A, &S, &R) -> bool,
+    Pre: FnMut(&S, &A) -> Result<bool, ()>,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
 {
     if let Some(hint) = config.syntactic_hint {
-        return match hint {
-            SyntacticBindingHint::ReturnUnused => VacuityClass::UnboundReturnOutput,
-            SyntacticBindingHint::SyntacticallyTautological => VacuityClass::TrivialPostcondition,
-        };
+        return hint_class(hint);
     }
+
+    let StatefulAnchor {
+        old_s: anchor_old_s,
+        args: anchor_args,
+        new_s: anchor_new_s,
+        ret: anchor_ret,
+    } = anchor;
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0x51A7_E002_C3C3_3C3C);
     let mut saw_sensitivity = false;
-    let mut false_witness: Option<(S, A)> = None;
-    let mut true_witness: Option<(S, A)> = None;
+    let mut rejected_witness: Option<(S, A, bool)> = None;
+    let mut accepted_witness: Option<(S, A, bool)> = None;
 
     for idx in 0..64 {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
-        let base = post(&old_s, &args, &anchor_new_s, anchor_ret);
-        let mut varied = post(&old_s, &args, &old_s, anchor_ret) != base;
+        let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
+            continue;
+        };
+        let base = probe_verdict(post(&old_s, &args, &anchor_new_s, &anchor_ret), admissible);
+        if base == ProbeVerdict::Undefined {
+            continue;
+        }
+
+        let revert = probe_verdict(post(&old_s, &args, &old_s, &anchor_ret), admissible);
+        let mut varied = revert != ProbeVerdict::Undefined && revert != base;
         if !varied {
             anchor_new_s.visit_mutants(&mut probe_rng, |cand_s| {
                 if varied {
                     return;
                 }
-                if post(&old_s, &args, &cand_s, anchor_ret) != base {
+                let verdict = probe_verdict(post(&old_s, &args, &cand_s, &anchor_ret), admissible);
+                if verdict != ProbeVerdict::Undefined && verdict != base {
                     varied = true;
                 }
             });
@@ -1952,57 +2230,34 @@ where
             saw_sensitivity = true;
             break;
         }
-        if !base && false_witness.is_none() {
-            false_witness = Some((old_s, args));
-        } else if base && true_witness.is_none() {
-            true_witness = Some((old_s, args));
+
+        if base == ProbeVerdict::Rejected && rejected_witness.is_none() {
+            rejected_witness = Some((old_s, args, admissible));
+        } else if base == ProbeVerdict::Accepted && accepted_witness.is_none() {
+            accepted_witness = Some((old_s, args, admissible));
         }
     }
 
-    if !saw_sensitivity && (false_witness.is_some() || true_witness.is_some()) {
-        let mut cur = anchor_new_s;
-        let mut seen: [Option<S>; 4] = [None, None, None, None];
-        let mut prev_cur: Option<S> = None;
-
-        for _ in 0..128 {
-            if saw_sensitivity {
-                break;
+    if !saw_sensitivity {
+        saw_sensitivity = mutant_chain_finds_flip(anchor_new_s, &mut probe_rng, |cand_s| {
+            let live = post(&anchor_old_s, &anchor_args, cand_s, &anchor_ret);
+            if probe_verdict(live, true) == ProbeVerdict::Rejected {
+                return true;
             }
-            let mut next_cur: Option<S> = None;
-            cur.visit_mutants(&mut probe_rng, |cand_s| {
-                if saw_sensitivity {
-                    return;
-                }
-                if let Some((os, a)) = false_witness.as_ref()
-                    && post(os, a, &cand_s, anchor_ret)
-                {
-                    saw_sensitivity = true;
-                    return;
-                }
-                if let Some((os, a)) = true_witness.as_ref()
-                    && !post(os, a, &cand_s, anchor_ret)
-                {
-                    saw_sensitivity = true;
-                    return;
-                }
-                if next_cur.is_none()
-                    && cand_s != cur
-                    && prev_cur.as_ref() != Some(&cand_s)
-                    && !seen.iter().any(|slot| slot.as_ref() == Some(&cand_s))
-                {
-                    next_cur = Some(cand_s);
-                }
-            });
-            let Some(next) = next_cur else {
-                break;
-            };
-            if let Some(slot) = seen.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(cur);
-            } else {
-                prev_cur = Some(cur);
+            if let Some((os, a, admissible)) = accepted_witness.as_ref()
+                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
+                    == ProbeVerdict::Rejected
+            {
+                return true;
             }
-            cur = next;
-        }
+            if let Some((os, a, admissible)) = rejected_witness.as_ref()
+                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
+                    == ProbeVerdict::Accepted
+            {
+                return true;
+            }
+            false
+        });
     }
 
     if saw_sensitivity {
@@ -2012,232 +2267,199 @@ where
     }
 }
 
+/// Evaluates `post(old_s, args, s, r)` across the anchor outputs, the pre-state
+/// revert `s = old_s`, and the first-order mutants of each non-subsingleton
+/// output axis, stopping once both an accepted and a rejected output pair were
+/// observed. Returns `(accepted, rejected)`.
+fn observe_stateful_outputs_at<S, A, R, Post>(
+    old_s: &S,
+    args: &A,
+    admissible: bool,
+    anchor_new_s: &S,
+    anchor_ret: &R,
+    rng: &mut SplitMix64,
+    post: &mut Post,
+) -> (bool, bool)
+where
+    S: ReturnMutants,
+    R: ReturnMutants,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
+{
+    let mut accepted = false;
+    let mut rejected = false;
+
+    note_verdict(
+        probe_verdict(post(old_s, args, anchor_new_s, anchor_ret), admissible),
+        &mut accepted,
+        &mut rejected,
+    );
+
+    if !S::IS_SUBSINGLETON {
+        note_verdict(
+            probe_verdict(post(old_s, args, old_s, anchor_ret), admissible),
+            &mut accepted,
+            &mut rejected,
+        );
+        if !(accepted && rejected) {
+            anchor_new_s.visit_mutants(rng, |cand_s| {
+                if accepted && rejected {
+                    return;
+                }
+                note_verdict(
+                    probe_verdict(post(old_s, args, &cand_s, anchor_ret), admissible),
+                    &mut accepted,
+                    &mut rejected,
+                );
+            });
+        }
+    }
+
+    if !R::IS_SUBSINGLETON && !(accepted && rejected) {
+        anchor_ret.visit_mutants(rng, |cand_r| {
+            if accepted && rejected {
+                return;
+            }
+            note_verdict(
+                probe_verdict(post(old_s, args, anchor_new_s, &cand_r), admissible),
+                &mut accepted,
+                &mut rejected,
+            );
+        });
+    }
+
+    (accepted, rejected)
+}
+
 /// Probes both `(new_s, ret)` output axes jointly when zero mutants were killed
 /// across both axes of a stateful contract.
-fn classify_stateful_all_survived<S, A, R, Post>(
+fn classify_stateful_all_survived<S, A, R, Pre, Post>(
     config: SpecCheckConfig,
-    anchor_new_s: S,
-    anchor_ret: R,
+    anchor: StatefulAnchor<S, A, R>,
+    pre: &mut Pre,
     post: &mut Post,
 ) -> (VacuityClass, FailureDetail)
 where
     S: SampleInput + ReturnMutants + Clone + PartialEq,
     A: SampleInput,
     R: ReturnMutants + PartialEq,
-    Post: FnMut(&S, &A, &S, &R) -> bool,
+    Pre: FnMut(&S, &A) -> Result<bool, ()>,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
 {
     if let Some(hint) = config.syntactic_hint {
-        let class = match hint {
-            SyntacticBindingHint::ReturnUnused => VacuityClass::UnboundReturnOutput,
-            SyntacticBindingHint::SyntacticallyTautological => VacuityClass::TrivialPostcondition,
-        };
-        return (
-            class,
-            FailureDetail::AllMutantsSurvived {
-                probed_inputs: 0,
-                saw_any_false: false,
-                saw_output_sensitivity: false,
-            },
-        );
+        return (hint_class(hint), ProbeEvidence::default().detail());
     }
+
+    let StatefulAnchor {
+        old_s: anchor_old_s,
+        args: anchor_args,
+        new_s: anchor_new_s,
+        ret: anchor_ret,
+    } = anchor;
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0x51A7_E003_C3C3_3C3C);
-    let mut probed_inputs = 0usize;
-    let mut saw_any_false = false;
-    let mut saw_output_sensitivity = false;
-    let mut false_witness: Option<(S, A)> = None;
-    let mut true_witness: Option<(S, A)> = None;
+    let mut evidence = ProbeEvidence::default();
+    let mut rejected_witness: Option<(S, A, bool)> = None;
+    let mut accepted_witness: Option<(S, A, bool)> = None;
 
-    for idx in 0..64 {
-        let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
-        probed_inputs += 1;
-        let mut saw_true_here = false;
-        let mut saw_false_here = false;
+    // The anchor execution is admissible by construction, so it is always safe
+    // to probe and guarantees at least one probed input.
+    let (accepted, rejected) = observe_stateful_outputs_at(
+        &anchor_old_s,
+        &anchor_args,
+        true,
+        &anchor_new_s,
+        &anchor_ret,
+        &mut probe_rng,
+        post,
+    );
+    evidence.record_input(true, accepted, rejected);
 
-        let base = post(&old_s, &args, &anchor_new_s, &anchor_ret);
-        if base {
-            saw_true_here = true;
-        } else {
-            saw_false_here = true;
-            saw_any_false = true;
-        }
+    if !evidence.saw_output_sensitivity {
+        for idx in 0..64 {
+            let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
+            let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
+                evidence.skipped_out_of_precondition += 1;
+                continue;
+            };
 
-        if !S::IS_SUBSINGLETON {
-            if post(&old_s, &args, &old_s, &anchor_ret) {
-                saw_true_here = true;
-            } else {
-                saw_false_here = true;
-                saw_any_false = true;
+            let (accepted, rejected) = observe_stateful_outputs_at(
+                &old_s,
+                &args,
+                admissible,
+                &anchor_new_s,
+                &anchor_ret,
+                &mut probe_rng,
+                post,
+            );
+            evidence.record_input(admissible, accepted, rejected);
+            if evidence.saw_output_sensitivity {
+                break;
             }
-            if !(saw_true_here && saw_false_here) {
-                anchor_new_s.visit_mutants(&mut probe_rng, |cand_s| {
-                    if saw_true_here && saw_false_here {
-                        return;
-                    }
-                    if post(&old_s, &args, &cand_s, &anchor_ret) {
-                        saw_true_here = true;
-                    } else {
-                        saw_false_here = true;
-                        saw_any_false = true;
-                    }
-                });
-            }
-        }
 
-        if !R::IS_SUBSINGLETON && !(saw_true_here && saw_false_here) {
-            anchor_ret.visit_mutants(&mut probe_rng, |cand_r| {
-                if saw_true_here && saw_false_here {
-                    return;
-                }
-                if post(&old_s, &args, &anchor_new_s, &cand_r) {
-                    saw_true_here = true;
-                } else {
-                    saw_false_here = true;
-                    saw_any_false = true;
-                }
-            });
-        }
-
-        if saw_true_here && saw_false_here {
-            saw_output_sensitivity = true;
-            break;
-        }
-
-        if saw_false_here && false_witness.is_none() {
-            false_witness = Some((old_s, args));
-        } else if saw_true_here && true_witness.is_none() {
-            true_witness = Some((old_s, args));
-        }
-    }
-
-    if !saw_output_sensitivity && (false_witness.is_some() || true_witness.is_some()) {
-        if !S::IS_SUBSINGLETON {
-            let mut cur_s = anchor_new_s.clone();
-            let mut seen_s: [Option<S>; 4] = [None, None, None, None];
-            let mut prev_s: Option<S> = None;
-
-            for _ in 0..128 {
-                if saw_output_sensitivity {
-                    break;
-                }
-                let mut next_s: Option<S> = None;
-                cur_s.visit_mutants(&mut probe_rng, |cand_s| {
-                    if saw_output_sensitivity {
-                        return;
-                    }
-                    if let Some((os, a)) = false_witness.as_ref()
-                        && post(os, a, &cand_s, &anchor_ret)
-                    {
-                        saw_output_sensitivity = true;
-                        return;
-                    }
-                    if let Some((os, a)) = true_witness.as_ref()
-                        && !post(os, a, &cand_s, &anchor_ret)
-                    {
-                        saw_any_false = true;
-                        saw_output_sensitivity = true;
-                        return;
-                    }
-                    if next_s.is_none()
-                        && cand_s != cur_s
-                        && prev_s.as_ref() != Some(&cand_s)
-                        && !seen_s.iter().any(|slot| slot.as_ref() == Some(&cand_s))
-                    {
-                        next_s = Some(cand_s);
-                    }
-                });
-                let Some(next) = next_s else {
-                    break;
-                };
-                if let Some(slot) = seen_s.iter_mut().find(|slot| slot.is_none()) {
-                    *slot = Some(cur_s);
-                } else {
-                    prev_s = Some(cur_s);
-                }
-                cur_s = next;
-            }
-        }
-
-        if !saw_output_sensitivity && !R::IS_SUBSINGLETON {
-            let mut cur_r = anchor_ret;
-            let mut seen_r: [Option<R>; 4] = [None, None, None, None];
-            let mut prev_r: Option<R> = None;
-
-            for _ in 0..128 {
-                if saw_output_sensitivity {
-                    break;
-                }
-                let mut next_r: Option<R> = None;
-                cur_r.visit_mutants(&mut probe_rng, |cand_r| {
-                    if saw_output_sensitivity {
-                        return;
-                    }
-                    if let Some((os, a)) = false_witness.as_ref()
-                        && post(os, a, &anchor_new_s, &cand_r)
-                    {
-                        saw_output_sensitivity = true;
-                        return;
-                    }
-                    if let Some((os, a)) = true_witness.as_ref()
-                        && !post(os, a, &anchor_new_s, &cand_r)
-                    {
-                        saw_any_false = true;
-                        saw_output_sensitivity = true;
-                        return;
-                    }
-                    if next_r.is_none()
-                        && cand_r != cur_r
-                        && prev_r.as_ref() != Some(&cand_r)
-                        && !seen_r.iter().any(|slot| slot.as_ref() == Some(&cand_r))
-                    {
-                        next_r = Some(cand_r);
-                    }
-                });
-                let Some(next) = next_r else {
-                    break;
-                };
-                if let Some(slot) = seen_r.iter_mut().find(|slot| slot.is_none()) {
-                    *slot = Some(cur_r);
-                } else {
-                    prev_r = Some(cur_r);
-                }
-                cur_r = next;
+            if rejected && rejected_witness.is_none() {
+                rejected_witness = Some((old_s, args, admissible));
+            } else if accepted && accepted_witness.is_none() {
+                accepted_witness = Some((old_s, args, admissible));
             }
         }
     }
 
-    let class = if !saw_any_false {
-        VacuityClass::TrivialPostcondition
-    } else if !saw_output_sensitivity {
-        VacuityClass::UnboundReturnOutput
-    } else {
-        VacuityClass::SurvivedAllMutants
-    };
+    if !evidence.saw_output_sensitivity && !S::IS_SUBSINGLETON {
+        let flipped = mutant_chain_finds_flip(anchor_new_s.clone(), &mut probe_rng, |cand_s| {
+            let live = post(&anchor_old_s, &anchor_args, cand_s, &anchor_ret);
+            if probe_verdict(live, true) == ProbeVerdict::Rejected {
+                return true;
+            }
+            if let Some((os, a, admissible)) = accepted_witness.as_ref()
+                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
+                    == ProbeVerdict::Rejected
+            {
+                return true;
+            }
+            if let Some((os, a, admissible)) = rejected_witness.as_ref()
+                && probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
+                    == ProbeVerdict::Accepted
+            {
+                return true;
+            }
+            false
+        });
+        if flipped {
+            evidence.record_flip();
+        }
+    }
 
-    (
-        class,
-        FailureDetail::AllMutantsSurvived {
-            probed_inputs,
-            saw_any_false,
-            saw_output_sensitivity,
-        },
-    )
+    if !evidence.saw_output_sensitivity && !R::IS_SUBSINGLETON {
+        let flipped = mutant_chain_finds_flip(anchor_ret, &mut probe_rng, |cand_r| {
+            let live = post(&anchor_old_s, &anchor_args, &anchor_new_s, cand_r);
+            if probe_verdict(live, true) == ProbeVerdict::Rejected {
+                return true;
+            }
+            if let Some((os, a, admissible)) = accepted_witness.as_ref()
+                && probe_verdict(post(os, a, &anchor_new_s, cand_r), *admissible)
+                    == ProbeVerdict::Rejected
+            {
+                return true;
+            }
+            if let Some((os, a, admissible)) = rejected_witness.as_ref()
+                && probe_verdict(post(os, a, &anchor_new_s, cand_r), *admissible)
+                    == ProbeVerdict::Accepted
+            {
+                return true;
+            }
+            false
+        });
+        if flipped {
+            evidence.record_flip();
+        }
+    }
+
+    (evidence.class(), evidence.detail())
 }
 
-/// Checks a stateful `&mut S` contract accepting `(old_state, args)` and
-/// validating `(old_state, args, new_state, ret)`.
-///
-/// Tests BOTH:
-/// - Return-value perturbations `post(&old_s, &args, &new_s, &bad_ret)` when
-///   `!R::IS_SUBSINGLETON`, AND
-/// - State-mutation perturbations `post(&old_s, &args, &bad_s, &ok_ret)` when
-///   `!S::IS_SUBSINGLETON`, ALWAYS testing pre-state revert `bad_s = old_s`
-///   whenever `new_s != old_s` in addition to `S::visit_mutants`.
-///
-/// When `config.require_both_state_and_return_kills` is `true` (default), every
-/// non-subsingleton output axis (`S` and `R`) must independently kill at least
-/// one mutant so a stateful spec cannot silently ignore either `new_s` or `ret`.
-pub fn check_stateful_contract<S, A, R, Pre, Body, Post>(
+/// Shared fallible core powering [`check_stateful_contract`] and
+/// [`check_stateful_contract_fallible`].
+fn check_stateful_contract_core<S, A, R, Pre, Body, Post>(
     config: SpecCheckConfig,
     mut pre: Pre,
     mut body: Body,
@@ -2247,9 +2469,9 @@ where
     S: SampleInput + ReturnMutants + Clone + PartialEq,
     A: SampleInput,
     R: ReturnMutants + PartialEq,
-    Pre: FnMut(&S, &A) -> bool,
-    Body: FnMut(&mut S, &A) -> R,
-    Post: FnMut(&S, &A, &S, &R) -> bool,
+    Pre: FnMut(&S, &A) -> Result<bool, ()>,
+    Body: FnMut(&mut S, &A) -> Result<R, ()>,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
 {
     let mut stats = SpecCheckStats {
         subsingleton_return: R::IS_SUBSINGLETON,
@@ -2272,22 +2494,41 @@ where
     let mut return_mutants_killed = 0usize;
     let mut state_mutants_tested = 0usize;
     let mut state_mutants_killed = 0usize;
-    let mut anchor: Option<(S, R)> = None;
+    let mut anchor: Option<StatefulAnchor<S, A, R>> = None;
 
     for trial_idx in 0..config.max_trials {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(trial_idx, &mut rng);
         stats.trials_run += 1;
 
-        if !pre(&old_s, &args) {
+        let pre_holds = match pre(&old_s, &args) {
+            Ok(holds) => holds,
+            Err(()) => {
+                return execution_trapped(stats, trial_idx, TrapKind::PreconditionPanicked);
+            }
+        };
+
+        if !pre_holds {
             continue;
         }
 
         stats.precondition_hits += 1;
 
+        // A trapping body may leave `new_s` partially mutated; the trap is
+        // reported immediately and that state is never used as an output.
         let mut new_s = old_s.clone();
-        let ret_ok = body(&mut new_s, &args);
+        let ret_ok = match body(&mut new_s, &args) {
+            Ok(ret) => ret,
+            Err(()) => return execution_trapped(stats, trial_idx, TrapKind::BodyPanicked),
+        };
 
-        if !post(&old_s, &args, &new_s, &ret_ok) {
+        let post_ok = match post(&old_s, &args, &new_s, &ret_ok) {
+            Ok(holds) => holds,
+            Err(()) => {
+                return execution_trapped(stats, trial_idx, TrapKind::PostconditionPanicked);
+            }
+        };
+
+        if !post_ok {
             return SpecCheckOutcome::Failed(SpecCheckFailure {
                 class: VacuityClass::SpecViolation,
                 stats,
@@ -2299,18 +2540,13 @@ where
         if !R::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
             ret_ok.visit_mutants(&mut ret_mutant_rng, |ret_bad| {
-                if tested_this_hit >= config.max_mutants_per_hit {
-                    return;
-                }
-                if ret_bad == ret_ok {
+                if tested_this_hit >= config.max_mutants_per_hit || ret_bad == ret_ok {
                     return;
                 }
                 tested_this_hit += 1;
                 return_mutants_tested += 1;
-                stats.mutants_tested += 1;
-                if !post(&old_s, &args, &new_s, &ret_bad) {
+                if record_mutant(&mut stats, post(&old_s, &args, &new_s, &ret_bad)) {
                     return_mutants_killed += 1;
-                    stats.mutants_killed += 1;
                 }
             });
         }
@@ -2319,38 +2555,37 @@ where
         // whenever `new_s != old_s`).
         if !S::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
-            let tested_pre_revert = if new_s != old_s {
+            let tested_pre_revert = new_s != old_s;
+            if tested_pre_revert {
                 tested_this_hit += 1;
                 state_mutants_tested += 1;
-                stats.mutants_tested += 1;
-                if !post(&old_s, &args, &old_s, &ret_ok) {
+                if record_mutant(&mut stats, post(&old_s, &args, &old_s, &ret_ok)) {
                     state_mutants_killed += 1;
-                    stats.mutants_killed += 1;
                 }
-                true
-            } else {
-                false
-            };
+            }
 
             new_s.visit_mutants(&mut state_mutant_rng, |bad_s| {
-                if tested_this_hit >= config.max_mutants_per_hit {
-                    return;
-                }
-                if bad_s == new_s || (tested_pre_revert && bad_s == old_s) {
+                if tested_this_hit >= config.max_mutants_per_hit
+                    || bad_s == new_s
+                    || (tested_pre_revert && bad_s == old_s)
+                {
                     return;
                 }
                 tested_this_hit += 1;
                 state_mutants_tested += 1;
-                stats.mutants_tested += 1;
-                if !post(&old_s, &args, &bad_s, &ret_ok) {
+                if record_mutant(&mut stats, post(&old_s, &args, &bad_s, &ret_ok)) {
                     state_mutants_killed += 1;
-                    stats.mutants_killed += 1;
                 }
             });
         }
 
         if anchor.is_none() {
-            anchor = Some((new_s, ret_ok));
+            anchor = Some(StatefulAnchor {
+                old_s,
+                args,
+                new_s,
+                ret: ret_ok,
+            });
         }
     }
 
@@ -2370,11 +2605,7 @@ where
             return SpecCheckOutcome::Failed(SpecCheckFailure {
                 class: VacuityClass::TrivialPostcondition,
                 stats,
-                detail: FailureDetail::AllMutantsSurvived {
-                    probed_inputs: 0,
-                    saw_any_false: false,
-                    saw_output_sensitivity: false,
-                },
+                detail: ProbeEvidence::default().detail(),
             });
         }
         return SpecCheckOutcome::Strong(stats);
@@ -2405,9 +2636,7 @@ where
 
     if stats.mutants_killed == 0 {
         let (class, detail) = match anchor {
-            Some((anchor_new_s, anchor_ret)) => {
-                classify_stateful_all_survived(config, anchor_new_s, anchor_ret, &mut post)
-            }
+            Some(anchor) => classify_stateful_all_survived(config, anchor, &mut pre, &mut post),
             None => (
                 VacuityClass::SurvivedAllMutants,
                 FailureDetail::NoDistinctMutantsTested,
@@ -2422,12 +2651,11 @@ where
 
     if config.require_both_state_and_return_kills {
         if !R::IS_SUBSINGLETON && return_mutants_killed == 0 {
-            let class = if return_mutants_tested == 0 {
-                VacuityClass::SurvivedAllMutants
-            } else if let Some((anchor_new_s, anchor_ret)) = anchor {
-                probe_stateful_return_axis(config, &anchor_new_s, anchor_ret, &mut post)
-            } else {
-                VacuityClass::SurvivedAllMutants
+            let class = match anchor {
+                Some(anchor) if return_mutants_tested > 0 => {
+                    probe_stateful_return_axis(config, anchor, &mut pre, &mut post)
+                }
+                _ => VacuityClass::SurvivedAllMutants,
             };
             return SpecCheckOutcome::Failed(SpecCheckFailure {
                 class,
@@ -2437,12 +2665,11 @@ where
         }
 
         if !S::IS_SUBSINGLETON && state_mutants_killed == 0 {
-            let class = if state_mutants_tested == 0 {
-                VacuityClass::SurvivedAllMutants
-            } else if let Some((anchor_new_s, anchor_ret)) = anchor {
-                probe_stateful_state_axis(config, anchor_new_s, &anchor_ret, &mut post)
-            } else {
-                VacuityClass::SurvivedAllMutants
+            let class = match anchor {
+                Some(anchor) if state_mutants_tested > 0 => {
+                    probe_stateful_state_axis(config, anchor, &mut pre, &mut post)
+                }
+                _ => VacuityClass::SurvivedAllMutants,
             };
             return SpecCheckOutcome::Failed(SpecCheckFailure {
                 class,
@@ -2453,6 +2680,74 @@ where
     }
 
     SpecCheckOutcome::Strong(stats)
+}
+
+/// Checks a stateful `&mut S` contract accepting `(old_state, args)` and
+/// validating `(old_state, args, new_state, ret)`.
+///
+/// Tests BOTH:
+/// - Return-value perturbations `post(&old_s, &args, &new_s, &bad_ret)` when
+///   `!R::IS_SUBSINGLETON`, AND
+/// - State-mutation perturbations `post(&old_s, &args, &bad_s, &ok_ret)` when
+///   `!S::IS_SUBSINGLETON`, ALWAYS testing pre-state revert `bad_s = old_s`
+///   whenever `new_s != old_s` in addition to `S::visit_mutants`.
+///
+/// When `config.require_both_state_and_return_kills` is `true` (default), every
+/// non-subsingleton output axis (`S` and `R`) must independently kill at least
+/// one mutant so a stateful spec cannot silently ignore either `new_s` or `ret`.
+///
+/// `post` is evaluated only on `(old_state, args)` pairs satisfying `pre` (see
+/// the module-level *Domain safety* section). Because a panic cannot be
+/// intercepted in `core`-only code, a `body` or `post` that can panic must be
+/// checked through [`check_stateful_contract_fallible`].
+pub fn check_stateful_contract<S, A, R, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    mut pre: Pre,
+    mut body: Body,
+    mut post: Post,
+) -> SpecCheckOutcome
+where
+    S: SampleInput + ReturnMutants + Clone + PartialEq,
+    A: SampleInput,
+    R: ReturnMutants + PartialEq,
+    Pre: FnMut(&S, &A) -> bool,
+    Body: FnMut(&mut S, &A) -> R,
+    Post: FnMut(&S, &A, &S, &R) -> bool,
+{
+    check_stateful_contract_core(
+        config,
+        |old_s, args| Ok(pre(old_s, args)),
+        |state, args| Ok(body(state, args)),
+        |old_s, args, new_s, ret| Ok(post(old_s, args, new_s, ret)),
+    )
+}
+
+/// Checks a stateful `&mut S` contract whose `pre`, `body`, and `post`
+/// callbacks may trap (for example, when wrapped in `std::panic::catch_unwind`
+/// in tests).
+///
+/// An `Err(())` in `pre`, `body`, or live `post` ALWAYS fails immediately with
+/// [`VacuityClass::SpecViolation`] and the corresponding [`TrapKind`]. A `body`
+/// that traps after partially mutating its state is reported as
+/// [`TrapKind::BodyPanicked`]; the partially mutated state is discarded and is
+/// never treated as an output. An `Err(())` from `post` on a perturbed output
+/// or post-state of a precondition-admissible input counts as that mutant being
+/// rejected (`mutants_killed` and `mutants_trapped`).
+pub fn check_stateful_contract_fallible<S, A, R, Pre, Body, Post>(
+    config: SpecCheckConfig,
+    pre: Pre,
+    body: Body,
+    post: Post,
+) -> SpecCheckOutcome
+where
+    S: SampleInput + ReturnMutants + Clone + PartialEq,
+    A: SampleInput,
+    R: ReturnMutants + PartialEq,
+    Pre: FnMut(&S, &A) -> Result<bool, ()>,
+    Body: FnMut(&mut S, &A) -> Result<R, ()>,
+    Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
+{
+    check_stateful_contract_core(config, pre, body, post)
 }
 
 /// Panics if [`check_stateful_contract`] does not return

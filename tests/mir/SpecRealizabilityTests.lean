@@ -26,10 +26,20 @@ Exercises:
    `UnboundReturnOutput`, `SurvivedAllMutants`) plus explicit instantiations of
    external-spec Soundness Traps 1, 2, and 3, paired with kernel refutation theorems
    and compile-time `#eval assertEnsuresVacuous` / `assertDeclEnsuresVacuous` checks.
-3. **Compile-Time Kernel Axiom Audit (EOF)**: Audits every constant under
-   `Anneal.SpecRealizability` and `SpecRealizabilityTests` for `isUnsafe == false`,
-   zero axioms, zero `sorryAx`/`Lean.ofReduceBool`/`Lean.trustCompiler`, axioms
-   strictly within `[propext, Classical.choice, Quot.sound]`, and `≥ 30` theorems.
+3. **Checker Hardening Regression Suite**: Paired kernel theorems and compile-time
+   `#eval` checks for probe-budget containment (heartbeat exhaustion never escapes and
+   never becomes Lean's unlimited `maxHeartbeats = 0`), `strictReturnValue` on
+   postconditions that merely mention `retVal`, uninhabited and inhabited recursive
+   output types, non-reflexive `LE`, outputs hidden behind definitions, input-only
+   tautologies, contradictory and `requires`-vacuous boilerplate fibres, and
+   type-checked substituted goals.
+4. **Compile-Time Kernel Axiom Audit (EOF)**: Audits every constant defined by the
+   `Anneal.SpecRealizability` module and by this file (selected by defining module, not
+   by name prefix), of every kind (theorems, definitions, instances), for
+   `isUnsafe == false`, no `axiom`, no `opaque`/`partial`, and transitive axioms
+   strictly within `[propext, Classical.choice, Quot.sound]` (so `sorryAx`,
+   `Lean.ofReduceBool`, and `Lean.trustCompiler` are rejected); requires the
+   load-bearing results to be kernel theorems and `≥ 140` theorems overall.
 -/
 
 namespace SpecRealizabilityTests
@@ -804,41 +814,546 @@ theorem trap3_ensuresDichotomy_fails :
         sliceIsEmptyPre (fun _ _ => True) :=
   boilerplateOnlyExt_not_ensuresDichotomy
 
-/-! ## 3. Mandatory Compile-Time Kernel Axiom Audit -/
+/-! ## 3. Checker Hardening Regression Suite -/
+
+/-! ### 3.1 Probe Budgets: Heartbeat Exhaustion Is Contained and Never Unlimited -/
+
+/-- `cappedHeartbeats?` never yields `0` (Lean's "unlimited" `maxHeartbeats` sentinel):
+    every cap it returns is at least one `maxHeartbeats` option unit. -/
+theorem cappedHeartbeats_never_unlimited (remaining stepUnits cap : Nat)
+    (h : cappedHeartbeats? remaining stepUnits = some cap) : 1000 ≤ cap := by
+  unfold cappedHeartbeats? at h
+  split at h
+  · cases h
+  · cases h
+    exact Nat.le_max_left _ _
+
+theorem cappedHeartbeats_exhausted (stepUnits : Nat) :
+    cappedHeartbeats? 0 stepUnits = none :=
+  rfl
+
+/-- The total probe budget is never `0`, and under a limited enclosing `maxHeartbeats`
+    context it never exceeds what that context has left. -/
+theorem clampProbeBudget_bounds (requested : Nat) (outer? : Option Nat) :
+    1000 ≤ clampProbeBudget requested outer? ∧
+      ∀ outer, outer? = some outer →
+        clampProbeBudget requested outer? ≤ max 1000 outer := by
+  cases outer? with
+  | none => exact ⟨Nat.le_max_left _ _, fun _ h => by cases h⟩
+  | some remaining =>
+    refine ⟨Nat.le_max_left _ _, fun outer h => ?_⟩
+    cases h
+    show max 1000 (min (max 1000 requested) (remaining / 4 * 3)) ≤ max 1000 remaining
+    omega
+
+/-- Genuine nonlinear postcondition used to starve the bounded prover. -/
+def budgetProbePost (x ret : Nat) : Prop :=
+  ∃ a b c : Nat, a + b + c = x ∧ ret = a * b + c ∧ (a < 3 ∨ b < 5 ∨ c < 7)
+
+theorem budgetProbePost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) budgetProbePost := by
+  refine ⟨0, trivial, ⟨0, 0, 0, 0, rfl, rfl, Or.inl (by decide)⟩, ⟨1, ?_⟩⟩
+  rintro ⟨a, b, c, hSum, hRet, _⟩
+  have ha : a = 0 := by omega
+  have hc : c = 0 := by omega
+  subst ha
+  subst hc
+  omega
+
+#eval show Lean.Meta.MetaM Unit from do
+  -- A heartbeat-hungry computation under a 1000-heartbeat cap is cut off and reported
+  -- as `none`: heartbeat exhaustion is a runtime exception that must not escape.
+  let cutOff ← withBoundedHeartbeats 1000 do
+    let mut acc := Lean.mkNatLit 0
+    for i in [0:20000] do
+      acc ← Lean.Meta.whnf (Lean.mkNatAdd acc (Lean.mkNatLit i))
+      Lean.Core.checkSystem "SpecRealizabilityTests budget probe"
+    return acc
+  if cutOff.isSome then
+    throwError "expected withBoundedHeartbeats to cut off an over-budget computation"
+  -- With a one-unit per-snippet cap every prover probe times out. The checker must
+  -- still return a verdict (an undecided probe never flags) instead of throwing.
+  let starved ← checkEnsuresBindsOutput (Lean.mkConst ``budgetProbePost) none
+    { stepHeartbeats := 1, totalHeartbeats := 250000 }
+  unless starved.bindsOutput do
+    throwError "expected starved probes to leave a genuine ensures accepted, got {repr starved}"
+  -- A zero budget degrades to the purely syntactic phases, which still catch `True`.
+  let zeroBudget ← checkEnsuresBindsOutput (Lean.mkConst ``trivTruePost) none
+    { stepHeartbeats := 0, totalHeartbeats := 0 }
+  unless zeroBudget.vacuityClass? == some .trivialPostcondition do
+    throwError "expected zero-budget check to flag `True`, got {repr zeroBudget}"
+  -- The default total budget is clamped to three quarters of what the enclosing
+  -- `maxHeartbeats` context has left, so probes run dry before the outer limit.
+  let now ← IO.getNumHeartbeats
+  let clamped ← withTheReader Lean.Core.Context
+    (fun ctx => { ctx with initHeartbeats := now, maxHeartbeats := 8000000 })
+    (ProbeBudget.init {} : Lean.Meta.MetaM ProbeBudget)
+  unless 1000 ≤ clamped.totalInternal && clamped.totalInternal ≤ 6000000 do
+    throwError "expected a clamped total probe budget, got {clamped.totalInternal}"
+
+/-! ### 3.2 `strictReturnValue`: Mentioning `retVal` Is Not Constraining It -/
+
+/-- Pins `mem'` but only mentions `retVal` reflexively. -/
+def reflRetStatefulClaim : StatefulClaim := {
+  body := statefulCounterStepBody
+  pre := fun _ _ => True
+  post := fun _ mem retVal mem' => retVal = retVal ∧ mem' = mem
+}
+
+theorem reflRetStateful_not_returnDichotomy :
+    ¬ StatefulClaimReturnDichotomy reflRetStatefulClaim :=
+  not_statefulClaimReturnDichotomy_of_returnInsensitive
+    (fun _ _ _ _ _ _ h => ⟨rfl, h.2⟩)
+
+theorem reflRetStateful_dichotomy :
+    StatefulClaimDichotomy reflRetStatefulClaim := by
+  refine ⟨([], emptyMemory), trivial,
+    ⟨(.unit, emptyMemory), ⟨rfl, rfl⟩⟩,
+    ⟨(.unit, { emptyMemory with nextTag := 2 }), ?_⟩⟩
+  rintro ⟨_, hEq⟩
+  exact memory_nextTag_ne_1_2 hEq.symm
+
+#eval assertDeclEnsuresVacuous ``reflRetStatefulClaim (some .unboundReturnOutput)
+  { strictReturnValue := true }
+-- Without `strictReturnValue` the pair `(retVal, mem')` is the output, and `mem' = mem`
+-- does constrain it.
+#eval assertDeclEnsuresBindsOutput ``reflRetStatefulClaim
+
+/-! ### 3.3 Empty and Subsingleton Output Types: Recursive Inductives -/
+
+/-- Uninhabited recursive inductive: its only constructor needs an inhabitant. -/
+inductive EndlessChain : Type where
+  | link : EndlessChain → EndlessChain
+
+/-- Inhabited nested recursive inductive (`node []`). -/
+inductive RoseTree : Type where
+  | node : List RoseTree → RoseTree
+
+/-- Non-recursive wrapper used to nest one type instance inside another. -/
+structure Boxed (α : Type) : Type where
+  val : α
+
+theorem endlessChain_isEmpty (c : EndlessChain) : False := by
+  induction c with
+  | link _ ih => exact ih
+
+theorem optionEndlessChain_subsingleton : Subsingleton (Option EndlessChain) :=
+  ⟨fun a b => by
+    cases a with
+    | none =>
+      cases b with
+      | none => rfl
+      | some c => exact (endlessChain_isEmpty c).elim
+    | some c => exact (endlessChain_isEmpty c).elim⟩
+
+def endlessChainPost (_x : Nat) (ret : EndlessChain) : Prop := ret = .link ret
+def optEndlessChainPost (_x : Nat) (ret : Option EndlessChain) : Prop := ret = none
+def optFinZeroPost (_x : Nat) (ret : Option (Fin 0)) : Prop := ret = none
+def prodUnitEmptyPost (_x : Nat) (ret : Unit × Empty) : Prop := ret.1 = ()
+def roseTreePost (_x : Nat) (ret : RoseTree) : Prop := ret = .node []
+def listNatPost (x : Nat) (ret : List Nat) : Prop := ret = [x]
+def boxedBoxedPost (x : Nat) (ret : Boxed (Boxed Nat)) : Prop := ret.val.val = x
+
+theorem endlessChainPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) endlessChainPost := by
+  rintro ⟨_, _, c, _⟩
+  exact endlessChain_isEmpty c
+
+theorem optEndlessChainPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) optEndlessChainPost :=
+  @not_postconditionDichotomy_of_subsingleton _ _ optionEndlessChain_subsingleton _ _
+
+theorem roseTreePost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) roseTreePost :=
+  ⟨0, trivial, ⟨.node [], rfl⟩,
+    ⟨.node [.node []], fun h => List.cons_ne_nil _ _ (RoseTree.node.inj h)⟩⟩
+
+theorem listNatPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) listNatPost :=
+  ⟨0, trivial, ⟨[0], rfl⟩, ⟨[], fun h => List.cons_ne_nil 0 [] (Eq.symm h)⟩⟩
+
+theorem boxedBoxedPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) boxedBoxedPost :=
+  ⟨0, trivial, ⟨⟨⟨0⟩⟩, rfl⟩, ⟨⟨⟨1⟩⟩, fun h => Nat.succ_ne_zero 0 h⟩⟩
+
+#eval assertEnsuresVacuous (Lean.mkConst ``endlessChainPost) none (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``optEndlessChainPost) none (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``optFinZeroPost) none (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``prodUnitEmptyPost) none (some .unboundReturnOutput)
+-- Inhabited recursive, list, and nested-instance output types must not be flagged.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``roseTreePost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``listNatPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``boxedBoxedPost)
+
+/-! ### 3.4 `r ≤ r` Is Only Trivial for a Reflexive Order -/
+
+/-- Float-like value: comparisons involving a non-number are false. -/
+structure MaybeNaN : Type where
+  isNumber : Bool
+  magnitude : Nat
+
+instance : LE MaybeNaN :=
+  ⟨fun a b => a.isNumber = true ∧ b.isNumber = true ∧ a.magnitude ≤ b.magnitude⟩
+
+/-- `ret ≤ ret` holds exactly when `ret` is a number: a genuine constraint. -/
+def notNaNPost (_x : Nat) (ret : MaybeNaN) : Prop := ret ≤ ret
+
+def natLeReflPost (_x ret : Nat) : Prop := ret ≤ ret
+
+theorem notNaNPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) notNaNPost := by
+  refine ⟨0, trivial, ⟨⟨true, 0⟩, ⟨rfl, rfl, Nat.le_refl 0⟩⟩, ⟨⟨false, 0⟩, ?_⟩⟩
+  rintro ⟨hNumber, _⟩
+  cases hNumber
+
+theorem natLeReflPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) natLeReflPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => Nat.le_refl ret)
+
+#eval assertEnsuresBindsOutput (Lean.mkConst ``notNaNPost)
+#eval assertEnsuresVacuous (Lean.mkConst ``natLeReflPost) none (some .trivialPostcondition)
+
+/-! ### 3.5 Output Hidden Behind a Definition That Ignores It -/
+
+def hiddenInputOnlyPost (x ret : Nat) : Prop := inputOnlyPost x ret
+
+def hiddenWrapperPost : Nat → Nat → Prop := fun x ret => hiddenInputOnlyPost x ret
+
+theorem hiddenWrapperPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) hiddenWrapperPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ _ h => h)
+
+#eval assertEnsuresVacuous (Lean.mkConst ``hiddenInputOnlyPost) none (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``hiddenWrapperPost) none (some .unboundReturnOutput)
+
+/-! ### 3.6 Input-Only Postconditions: Tautological, Contradictory, or Unbound -/
+
+def inputOnlyReflPost (x _ret : Nat) : Prop := x = x
+def inputOnlyArithTautPost (x _ret : Nat) : Prop := x < 10 ∨ x ≥ 10
+def inputOnlyContraPost (x _ret : Nat) : Prop := x < x
+
+theorem inputOnlyArithTautPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) inputOnlyArithTautPost :=
+  not_postconditionDichotomy_of_trivial (fun x _ _ => by
+    show x < 10 ∨ x ≥ 10
+    omega)
+
+theorem inputOnlyContraPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) inputOnlyContraPost := by
+  rintro ⟨x, _, _, hLt⟩
+  exact Nat.lt_irrefl x hLt
+
+#eval assertEnsuresVacuous (Lean.mkConst ``inputOnlyReflPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``inputOnlyArithTautPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``inputOnlyContraPost) none (some .specViolation)
+-- An input-only postcondition that is neither is still an unbound-output specification.
+#eval assertEnsuresVacuous (Lean.mkConst ``inputOnlyPost) none (some .unboundReturnOutput)
+
+/-! ### 3.7 Boilerplate Cofactoring: Contradictory Fibres, Insensitive Residuals, `requires` -/
+
+open scoped Classical in
+/-- Trap 3 variant: the frame-preserving fibre accepts every return value and the other
+    fibre accepts none, so no fibre distinguishes return values even though the two
+    fibres differ. The second fibre is contradictory but not syntactically `False`. -/
+def contradictoryFibreContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if callFramePreserved req.memory memAfter then
+        True
+      else
+        retVal = .unit ∧ retVal = .scalar { bits := 1, sizeBytes := 4 }
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+theorem contradictoryFibre_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy contradictoryFibreContract := by
+  rintro ⟨req, m, v_ok, v_bad, _, hOk, hBad⟩
+  by_cases hFrame : callFramePreserved req.memory m
+  · apply hBad
+    show if callFramePreserved req.memory m then True
+      else v_bad = .unit ∧ v_bad = .scalar { bits := 1, sizeBytes := 4 }
+    rw [ite_eq_left hFrame]
+    trivial
+  · have hOk' : if callFramePreserved req.memory m then True
+        else v_ok = .unit ∧ v_ok = .scalar { bits := 1, sizeBytes := 4 } := hOk
+    rw [ite_eq_right hFrame] at hOk'
+    have hEq : Value.unit = Value.scalar { bits := 1, sizeBytes := 4 } :=
+      hOk'.1.symm.trans hOk'.2
+    cases hEq
+
+/-- External spec whose user `ensures` mentions `ret` but constrains only the inputs. -/
+def argsEmptyIgnoringRetPost (args : List Value) (ret : Value) : Prop :=
+  ret = ret ∧ args = []
+
+def argsEmptyIgnoringRetExtContract : MirCallContract :=
+  externalSpecCallContract "core::slice::is_empty" sliceIsEmptySidecar
+    (fun _ => True) argsEmptyIgnoringRetPost
+
+theorem argsEmptyIgnoringRet_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "core::slice::is_empty" sliceIsEmptySidecar
+        (fun _ => True) argsEmptyIgnoringRetPost := by
+  intro h
+  rcases (externalSpecEnsuresDichotomy_iff_moduloObservation
+    "core::slice::is_empty" sliceIsEmptySidecar (fun _ => True) argsEmptyIgnoringRetPost).mp h with
+    ⟨_, _, _, _, _, _, _, _, hOk, hBad⟩
+  exact hBad ⟨rfl, hOk.2⟩
+
+/-- Call contract whose normal-return `ensures` binds `retVal` only outside `requires`. -/
+def vacuousUnderRequiresCallContract : MirCallContract := {
+  pre := fun req => req.args = []
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧ (req.args = [] ∨ retVal = .unit)
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem vacuousUnderRequiresCall_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy vacuousUnderRequiresCallContract :=
+  not_mirCallContractReturnValueDichotomy_of_returnInsensitive
+    (fun _ _ _ _ hPre h => ⟨h.1, Or.inl hPre⟩)
+
+/-- Propositional tautology over a boilerplate atom. -/
+def boilerplateExcludedMiddleContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∨ ¬ callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- Biconditional between the two boilerplate atoms: no user constraint at all. -/
+def boilerplateIffContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ↔
+        retMatchesCalleeReturnTy sliceIsEmptySidecar retVal
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- Genuine conditional contract: the frame condition guards a return-value constraint. -/
+def frameImpliesRetContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter →
+        retVal = .scalar { bits := 7, sizeBytes := 4 }
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem frameImpliesRet_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy frameImpliesRetContract := by
+  let req : MirCallReq := { defPath := "", args := .nil, memory := emptyMemory }
+  refine ⟨req, emptyMemory, .scalar { bits := 7, sizeBytes := 4 }, .unit,
+    trivial, fun _ => rfl, ?_⟩
+  intro hImp
+  have hEq : Value.unit = Value.scalar { bits := 7, sizeBytes := 4 } :=
+    hImp (callFramePreserved_refl emptyMemory)
+  cases hEq
+
+#eval assertDeclEnsuresVacuous ``contradictoryFibreContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``argsEmptyIgnoringRetExtContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``vacuousUnderRequiresCallContract (some .survivedAllMutants)
+#eval assertDeclEnsuresVacuous ``boilerplateExcludedMiddleContract (some .trivialPostcondition)
+#eval assertDeclEnsuresVacuous ``boilerplateIffContract (some .unboundReturnOutput)
+-- Genuine conditional contracts must pass, with and without `strictReturnValue`.
+#eval assertDeclEnsuresBindsOutput ``frameImpliesRetContract
+#eval assertDeclEnsuresBindsOutput ``frameImpliesRetContract { strictReturnValue := true }
+#eval assertDeclEnsuresBindsOutput ``condFrameContract { strictReturnValue := true }
+
+/-! ### 3.8 Dependent Types: Substituted Goals Are Type-Checked Before Proving -/
+
+/-- Genuine postcondition over an output whose type depends on the input. -/
+def finSuccPost (n : Nat) (ret : Fin (n + 1)) : Prop := ret.val = n
+
+/-- Precondition whose second input has a type depending on the first. -/
+def dependentRequires (n : Nat) (i : Fin (n + 1)) : Prop := i.val = n
+
+theorem dependentRequires_satisfiable :
+    ∃ (n : Nat) (i : Fin (n + 1)), dependentRequires n i :=
+  ⟨0, 0, rfl⟩
+
+/-- Single-valued structure known to be a subsingleton only through its instance. -/
+structure SoleToken : Type where
+  token : Unit
+
+instance : Subsingleton SoleToken :=
+  ⟨fun a b => by
+    cases a
+    cases b
+    rfl⟩
+
+def soleTokenPost (_x : Nat) (ret : SoleToken) : Prop := ret = ⟨()⟩
+
+theorem soleTokenPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) soleTokenPost :=
+  not_postconditionDichotomy_of_subsingleton
+
+/-- Trivially true precondition over an input type that is inhabited only by instance. -/
+def soleTokenRequires (_t : SoleToken) : Prop := True
+
+instance : Inhabited SoleToken := ⟨⟨()⟩⟩
+
+/-- Trivially true precondition guarded by an unprovable hypothesis binder. -/
+def absurdHypRequires (x : Nat) (_h : x < x) : Prop := True
+
+theorem absurdHypRequires_unsatisfiable :
+    ¬ ∃ (x : Nat) (h : x < x), absurdHypRequires x h := by
+  rintro ⟨x, h, _⟩
+  exact Nat.lt_irrefl x h
+
+#eval assertEnsuresBindsOutput (Lean.mkConst ``finSuccPost)
+-- `Subsingleton`, `Inhabited`, and `Nonempty` are `Sort`-polymorphic: instances must be
+-- synthesized at the sort level of the type itself.
+#eval assertEnsuresVacuous (Lean.mkConst ``soleTokenPost) none (some .unboundReturnOutput)
+
+#eval show Lean.Meta.MetaM Unit from do
+  let nat := Lean.mkConst ``Nat
+  let eqNat (a b : Lean.Expr) : Lean.Expr :=
+    Lean.mkApp3 (Lean.mkConst ``Eq [Lean.Level.succ Lean.Level.zero]) nat a b
+  -- Positive control: `∀ n : Nat, n = n` is provable.
+  let reflGoal := Lean.mkForall `n .default nat (eqNat (Lean.mkBVar 0) (Lean.mkBVar 0))
+  unless ← tryProve reflGoal do
+    throwError "expected tryProve to prove `∀ n : Nat, n = n`"
+  -- `@Eq Nat True True` looks reflexive but is ill-typed (`True` is not a `Nat`): the
+  -- prover must refuse it rather than report a proof.
+  let illTyped := eqNat (Lean.mkConst ``True) (Lean.mkConst ``True)
+  if ← tryProve illTyped then
+    throwError "tryProve accepted an ill-typed goal"
+  -- A non-proposition is never proved.
+  if ← tryProve nat then
+    throwError "tryProve accepted a non-proposition"
+  -- The canonical witness for a dependent input is typed against the witnesses already
+  -- chosen for the inputs it depends on.
+  let depSat ← checkRequiresSatisfiable (Lean.mkConst ``dependentRequires)
+  unless depSat.satisfiable? == some true do
+    throwError "expected dependentRequires satisfiable, got {repr depSat}"
+  -- `True` over an input type that is inhabited by instance is satisfiable.
+  let tokenSat ← checkRequiresSatisfiable (Lean.mkConst ``soleTokenRequires)
+  unless tokenSat.satisfiable? == some true do
+    throwError "expected soleTokenRequires satisfiable, got {repr tokenSat}"
+  -- A hypothesis binder is never assumed inhabited: `True` behind `h : x < x` is dead.
+  let absurdSat ← checkRequiresSatisfiable (Lean.mkConst ``absurdHypRequires)
+  unless absurdSat.satisfiable? == some false do
+    throwError "expected absurdHypRequires unsatisfiable, got {repr absurdSat}"
+
+/-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
+
+/-- Axioms a kernel-checked declaration of this development may depend on. -/
+def auditAllowedAxioms : List Lean.Name :=
+  [``propext, ``Classical.choice, ``Quot.sound]
+
+/-- Describes the first way in which constant `n` violates the audit policy, if any:
+    it must exist, be safe, be neither an axiom nor an opaque (`opaque` / `partial`)
+    constant, and depend transitively only on `auditAllowedAxioms`. This applies to
+    every kind of constant (theorems, definitions, instances, structures), so a
+    *definition* depending on `sorryAx` or `Lean.ofReduceBool` is rejected just like a
+    theorem. -/
+def auditViolation? (n : Lean.Name) : Lean.Meta.MetaM (Option String) := do
+  let env ← Lean.getEnv
+  let some ci := env.find? n
+    | return some "unknown constant"
+  if ci.isUnsafe then
+    return some "unsafe declaration"
+  if ci matches .axiomInfo _ then
+    return some "axiom declaration"
+  if ci matches .opaqueInfo _ then
+    return some "opaque declaration (`opaque` or `partial`)"
+  for ax in (← Lean.collectAxioms n) do
+    unless auditAllowedAxioms.contains ax do
+      return some s!"depends on disallowed axiom `{ax}`"
+  return none
+
+-- Self-test: the audit policy rejects each forbidden kind of constant and accepts a
+-- standard-axiom theorem, so a silently permissive audit cannot pass.
+#eval show Lean.Meta.MetaM Unit from do
+  let mustReject : List Lean.Name :=
+    [``sorryAx, ``Lean.ofReduceBool, ``Lean.trustCompiler, ``unsafeCast,
+      ``IO.getNumHeartbeats, `SpecRealizabilityTests.thisConstantDoesNotExist]
+  for n in mustReject do
+    if (← auditViolation? n).isNone then
+      throwError "kernel audit self-test failed: `{n}` was not rejected"
+  let mustAccept : List Lean.Name :=
+    [``Nat.add_comm, ``Classical.em, ``postconditionDichotomy_iff_exists_killed_mutant,
+      ``checkEnsuresBindsOutput, ``auditViolation?]
+  for n in mustAccept do
+    if let some why ← auditViolation? n then
+      throwError "kernel audit self-test failed: `{n}` was rejected ({why})"
 
 #eval show Lean.Meta.MetaM Unit from do
   let env ← Lean.getEnv
-  let allowed : List Lean.Name := [``propext, ``Classical.choice, ``Quot.sound]
-  let forbidden : List Lean.Name := [`sorryAx, `Lean.ofReduceBool, `Lean.trustCompiler]
-  let matchesPrefix (n : Lean.Name) : Bool :=
-    (`Anneal.SpecRealizability).isPrefixOf n || (`SpecRealizabilityTests).isPrefixOf n
+  -- Audit by defining module rather than by name prefix, so a declaration placed
+  -- outside the `Anneal.SpecRealizability` / `SpecRealizabilityTests` namespaces (or
+  -- under `_root_`) cannot escape: every constant defined by the
+  -- `Anneal.SpecRealizability` module and by this file is audited.
+  let some specModIdx := env.getModuleIdx? `Anneal.SpecRealizability
+    | throwError "kernel audit failed: module `Anneal.SpecRealizability` is not imported"
   let isTarget (n : Lean.Name) : Bool :=
-    matchesPrefix n ||
-      match Lean.privateToUserName? n with
-      | some u => matchesPrefix u
-      | none => false
+    match env.getModuleIdxFor? n with
+    | some idx => idx.toNat == specModIdx.toNat
+    | none => true
   let allEntries : List (Lean.Name × Lean.ConstantInfo) :=
     env.constants.map₁.toList ++ env.constants.map₂.toList
   let mut declCount : Nat := 0
   let mut thmCount : Nat := 0
+  let mut specDeclCount : Nat := 0
+  let mut testDeclCount : Nat := 0
   for (n, ci) in allEntries do
     if !isTarget n then
       continue
     declCount := declCount + 1
-    if ci.isUnsafe then
-      throwError "kernel audit failed: unsafe declaration `{n}`"
-    if ci matches .axiomInfo _ then
-      throwError "kernel audit failed: axiom declaration `{n}`"
+    if (env.getModuleIdxFor? n).isSome then
+      specDeclCount := specDeclCount + 1
+    else
+      testDeclCount := testDeclCount + 1
     if ci matches .thmInfo _ then
       thmCount := thmCount + 1
-      let axs ← Lean.collectAxioms n
-      for ax in axs do
-        if forbidden.contains ax then
-          throwError "kernel audit failed: theorem `{n}` depends on forbidden axiom `{ax}`"
-        unless allowed.contains ax do
-          throwError "kernel audit failed: theorem `{n}` depends on disallowed axiom `{ax}`"
-  if thmCount < 30 then
-    throwError "kernel audit failed: audited only {thmCount} theorems (expected ≥ 30)"
+    if let some why ← auditViolation? n then
+      throwError "kernel audit failed: `{n}`: {why}"
+  -- The load-bearing results must exist and be kernel theorems (not definitions,
+  -- axioms, or opaque constants standing in for them).
+  let requiredTheorems : List Lean.Name := [
+    ``VacuityClass.canonicalName_injective,
+    ``postconditionDichotomy_iff_exists_killed_mutant,
+    ``contractDeterministicOn_iff_kills_every_obs_nonequivalent_mutant,
+    ``not_postconditionDichotomy_of_trivial,
+    ``not_postconditionDichotomy_of_outputInsensitive,
+    ``not_postconditionDichotomy_of_forwardOutputInsensitive,
+    ``not_postconditionDichotomy_of_subsingleton,
+    ``not_dichotomyModuloObservation_of_fibre_forwardInsensitive,
+    ``statefulClaimReturnDichotomy_iff_moduloMemory,
+    ``not_statefulClaimReturnDichotomy_of_returnInsensitive,
+    ``not_mirCallContractReturnValueDichotomy_of_returnInsensitive,
+    ``externalSpecCallContract_naive_realizable_iff_preSatisfiable,
+    ``normalDichotomy_strictly_stronger_than_dichotomy,
+    ``externalSpecEnsuresDichotomy_iff_moduloObservation,
+    ``not_externalSpecEnsuresDichotomy_of_trivial_extraPost,
+    ``exists_handler_holdsOn_of_universalNormalRealizable,
+    ``cappedHeartbeats_never_unlimited
+  ]
+  for n in requiredTheorems do
+    unless isTarget n do
+      throwError "kernel audit failed: required theorem `{n}` is outside the audited modules"
+    match env.find? n with
+    | some (.thmInfo _) => pure ()
+    | _ => throwError "kernel audit failed: `{n}` is not a kernel theorem"
+  if specDeclCount == 0 || testDeclCount == 0 then
+    throwError "kernel audit failed: audited {specDeclCount} library and \
+      {testDeclCount} test declarations"
+  if thmCount < 140 then
+    throwError "kernel audit failed: audited only {thmCount} theorems (expected ≥ 140)"
   Lean.logInfo
     m!"SpecRealizability kernel axiom audit passed: {declCount} declarations ({thmCount} theorems, all clean)"
 
