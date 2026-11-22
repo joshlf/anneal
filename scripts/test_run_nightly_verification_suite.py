@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import importlib.machinery
 import importlib.util
 import io
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -4698,6 +4700,114 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             expected = wrapper.detect_mode(inner, "auto")
             self.assertEqual(suite._lean_run_wrapper_flags([lr, "--", *inner])[0], expected, inner)
             self.assertEqual(suite._lean_run_wrapper_flags([lr, *inner])[0], expected, inner)
+
+    def test_run_step_survives_real_wrapper_slot_contention_exceeding_step_budget(self) -> None:
+        # End-to-end verification under real `flock` build-slot contention using the actual
+        # `scripts/anneal-lean-run` implementation (isolated to a temp runtime dir so it never
+        # touches host build slots or systemd):
+        # 1. A `build` step with `timeout_sec=1` queues behind a held slot lock for ~2.2s
+        #    (> `timeout_sec`), then runs within its 1s budget and PASSes because
+        #    `_outer_timeout_sec` covers the wrapper's slot queue wait.
+        # 2. With `ANNEAL_LEAN_RUN_IN_SCOPE=1` (re-entrancy pass-through, where the real
+        #    wrapper `exec`s immediately with no slot lock and no internal `--timeout`),
+        #    a 5s command under `timeout_sec=1` times out cleanly near 1s instead of hanging
+        #    for the wrapped build deadline.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            runtime_dir = root / "rt"
+            slot_dir = runtime_dir / f"anneal-build-slots-{os.getuid()}"
+            slot_dir.mkdir(parents=True)
+            marker = root / "ran.txt"
+            shim = root / "anneal-lean-run"
+            wrapper_src = REPO_ROOT / "scripts/anneal-lean-run"
+            shim.write_text(
+                f"#!{sys.executable}\n"
+                "import importlib.machinery, importlib.util, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                f"loader = importlib.machinery.SourceFileLoader('alr_real', {os.fspath(wrapper_src)!r})\n"
+                "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(mod)\n"
+                f"rt = pathlib.Path({os.fspath(runtime_dir)!r})\n"
+                "mod.resolve_runtime_base = lambda: (rt, False)\n"
+                "orig_probe = mod.probe_host_envelope\n"
+                "def _probe(*a, **kw):\n"
+                "    d = orig_probe(*a, **kw)\n"
+                "    d['build_slots'] = 1\n"
+                "    d['runtime_base'] = str(rt)\n"
+                "    d['user_systemd_active'] = False\n"
+                "    d['systemd_user_scope'] = False\n"
+                "    d['memory_max_mb'] = max(int(d.get('memory_max_mb', 0)), 4096)\n"
+                "    return d\n"
+                "mod.probe_host_envelope = _probe\n"
+                "sys.exit(mod.main(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+
+            lock_path = slot_dir / "slot-1.lock"
+            lock_fd = os.open(os.fspath(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def release_later() -> None:
+                time.sleep(2.2)
+                os.close(lock_fd)
+
+            holder = threading.Thread(target=release_later, daemon=True)
+            holder.start()
+            try:
+                cmd = [
+                    os.fspath(shim),
+                    "--mode",
+                    "build",
+                    "--concurrency",
+                    "1",
+                    "--timeout",
+                    "1",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    f"import pathlib; pathlib.Path({os.fspath(marker)!r}).write_text('ok')",
+                ]
+                res = suite._run_step(
+                    "queued_real_wrapper_build",
+                    "cat1_trusted_boundary",
+                    cmd,
+                    cwd=root,
+                    timeout_sec=1,
+                )
+            finally:
+                holder.join(timeout=5.0)
+
+            self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
+            self.assertEqual(marker.read_text(encoding="utf-8"), "ok")
+            self.assertGreaterEqual(res["duration_sec"], 2.0)
+
+            # Negative control: in passthrough mode (`ANNEAL_LEAN_RUN_IN_SCOPE=1`),
+            # the wrapper executes `exec` directly with no internal timer, so the
+            # outer deadline enforces `timeout_sec=1` promptly rather than waiting 2430s.
+            sleep_cmd = [
+                os.fspath(shim),
+                "--mode",
+                "build",
+                "--timeout",
+                "1",
+                "--",
+                sys.executable,
+                "-c",
+                "import time; time.sleep(10)",
+            ]
+            res_pt = suite._run_step(
+                "passthrough_real_wrapper_timeout",
+                "cat1_trusted_boundary",
+                sleep_cmd,
+                cwd=root,
+                timeout_sec=1,
+                env_overrides={"ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+            )
+            self.assertEqual(res_pt["status"], "TIMEOUT")
+            self.assertEqual(res_pt["exit_code"], 124)
+            self.assertLess(res_pt["duration_sec"], 5.0)
 
     def test_run_step_empty_cmd_and_dashboard_corrupt_state_json_resilience(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
