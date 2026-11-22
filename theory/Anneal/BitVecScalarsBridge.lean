@@ -587,11 +587,91 @@ theorem evalBinOp_le_signed_eq_sle {sz : Nat} (hsz : 0 < sz) (a b : Nat) :
   rw [Anneal.Scalars.evalBinOp_le_signed hsz, ← Anneal.Scalars.signedLe_eq_sle,
     signedLe_eq_decide]
 
+/-- `evalBinOp .gt` (signed) decides ported `slt` with swapped arguments. -/
+theorem evalBinOp_gt_signed_eq_slt {sz : Nat} (hsz : 0 < sz) (a b : Nat) :
+    Anneal.Scalars.evalBinOp .gt ⟨a, sz⟩ ⟨b, sz⟩ true =
+      some (boolToScalar
+        (decide (Anneal.BitVecArith.slt (BitVec.ofNat (8 * sz) b) (BitVec.ofNat (8 * sz) a)))) := by
+  rw [Anneal.Scalars.evalBinOp_gt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt,
+    signedLt_eq_decide]
+
+/-- `evalBinOp .ge` (signed) decides ported `sle` with swapped arguments. -/
+theorem evalBinOp_ge_signed_eq_sle {sz : Nat} (hsz : 0 < sz) (a b : Nat) :
+    Anneal.Scalars.evalBinOp .ge ⟨a, sz⟩ ⟨b, sz⟩ true =
+      some (boolToScalar
+        (decide (Anneal.BitVecArith.sle (BitVec.ofNat (8 * sz) b) (BitVec.ofNat (8 * sz) a)))) := by
+  rw [Anneal.Scalars.evalBinOp_ge_signed hsz, ← Anneal.Scalars.signedLe_eq_sle,
+    signedLe_eq_decide]
+
+/-- Wrapping multiplication of scalar bits is ported `Anneal.BitVec.mul` (arbitrary operands). -/
+theorem mul_mod_eq_toNat_mul (a b sz : Nat) :
+    (a * b) % 2 ^ (8 * sz) =
+      (Anneal.BitVec.mul (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat := by
+  rw [Anneal.BitVec.toNat_mul, natMod_eq, natPow_eq, _root_.BitVec.toNat_ofNat,
+    _root_.BitVec.toNat_ofNat, ← Nat.mul_mod]
+
+/-- `evalBinOp .mul` computes ported `mul` (arbitrary operands). -/
+theorem evalBinOp_mul_eq_mul {sz : Nat} (hsz : 0 < sz) (a b : Nat) (isSigned : Bool) :
+    Anneal.Scalars.evalBinOp .mul ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      some ⟨(Anneal.BitVec.mul (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat, sz⟩ := by
+  rw [Anneal.Scalars.evalBinOp_mul_apply hsz, mul_mod_eq_toNat_mul]
+
+/-- `evalBinOp .div` (unsigned) computes ported `udiv` on canonical operands with non-zero divisor. -/
+theorem evalBinOp_div_unsigned_eq_udiv {sz : Nat} (hsz : 0 < sz) {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (hbz : b ≠ 0) :
+    Anneal.Scalars.evalBinOp .div ⟨a, sz⟩ ⟨b, sz⟩ false =
+      some ⟨(Anneal.BitVec.udiv (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat, sz⟩ := by
+  rw [Anneal.Scalars.evalBinOp_div_unsigned hsz hbz, Anneal.BitVec.toNat_udiv, natDiv_eq,
+    toNat_ofNat_of_lt ha, toNat_ofNat_of_lt hb]
+  rw [scalarModulus_eq] at ha
+  rw [Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.div_le_self a b) ha)]
+
+/-- `evalBinOp .rem` (unsigned) computes ported `urem` on canonical operands with non-zero divisor. -/
+theorem evalBinOp_rem_unsigned_eq_urem {sz : Nat} (hsz : 0 < sz) {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (hbz : b ≠ 0) :
+    Anneal.Scalars.evalBinOp .rem ⟨a, sz⟩ ⟨b, sz⟩ false =
+      some ⟨(Anneal.BitVecArith.urem (BitVec.ofNat (8 * sz) a)
+        (BitVec.ofNat (8 * sz) b)).toNat, sz⟩ := by
+  rw [Anneal.Scalars.evalBinOp_rem_unsigned hsz hbz, Anneal.BitVecArith.toNat_urem, natMod_eq,
+    toNat_ofNat_of_lt ha, toNat_ofNat_of_lt hb]
+  rw [scalarModulus_eq] at ha
+  rw [Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.mod_le a b) ha)]
+
 /-- Every `evalBinOp` on a zero-width left operand is rejected: the `sz = 0` edge is
 excluded by the evaluator, not silently treated as a `BitVec 0` computation. -/
 theorem evalBinOp_eq_none_of_size_zero (op : BinOp) (a : Nat) (rhs : ScalarInt)
     (isSigned : Bool) :
     Anneal.Scalars.evalBinOp op ⟨a, 0⟩ rhs isSigned = none := rfl
+
+/-- `evalUnOp .not` on integer scalars computes ported `Anneal.BitVec.not` (arbitrary operand). -/
+theorem evalUnOp_not_eq_not {sz : Nat} (hsz : 0 < sz) (a : Nat) :
+    Anneal.Scalars.evalUnOp .not ⟨a, sz⟩ false =
+      some ⟨(Anneal.BitVec.not (BitVec.ofNat (8 * sz) a)).toNat, sz⟩ := by
+  rw [Anneal.Scalars.evalUnOp_not_int_apply hsz, Anneal.BitVecArith.toNat_not_eq_sub, natPow_eq,
+    _root_.BitVec.toNat_ofNat]
+
+/-- `evalUnOp .neg` computes ported `Anneal.BitVecArith.neg` (arbitrary operand). -/
+theorem evalUnOp_neg_eq_neg {sz : Nat} (hsz : 0 < sz) (a : Nat) (isBool : Bool) :
+    Anneal.Scalars.evalUnOp .neg ⟨a, sz⟩ isBool =
+      some ⟨(Anneal.BitVecArith.neg (BitVec.ofNat (8 * sz) a)).toNat, sz⟩ := by
+  rw [Anneal.Scalars.evalUnOp_neg_apply hsz, Anneal.BitVecArith.toNat_neg, natMod_eq, natPow_eq,
+    _root_.BitVec.toNat_ofNat]
+
+/-- Operational `evalUnaryNot` on unsigned integer types computes ported `Anneal.BitVec.not`. -/
+theorem evalUnaryNot_uint_eq_not {sz : Nat} (hsz : 0 < sz) (a : Nat) (w : UintTy) (idx : LayoutIdx)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalUnaryNot ⟨a, sz⟩ (some { kind := .uint w, layoutIdx := idx }) locals mem =
+      .ok (.scalar ⟨(Anneal.BitVec.not (BitVec.ofNat (8 * sz) a)).toNat, sz⟩) locals mem := by
+  rw [Anneal.Scalars.evalUnaryNot_uint_eq_evalUnOp hsz w idx]
+  rfl
+
+/-- Operational `evalUnaryNot` on signed integer types computes ported `Anneal.BitVec.not`. -/
+theorem evalUnaryNot_int_eq_not {sz : Nat} (hsz : 0 < sz) (a : Nat) (w : IntTy) (idx : LayoutIdx)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalUnaryNot ⟨a, sz⟩ (some { kind := .int w, layoutIdx := idx }) locals mem =
+      .ok (.scalar ⟨(Anneal.BitVec.not (BitVec.ofNat (8 * sz) a)).toNat, sz⟩) locals mem := by
+  rw [Anneal.Scalars.evalUnaryNot_int_eq_evalUnOp hsz w idx]
+  rfl
 
 /-- Operational (`Trusted`) `evalScalarBinOp .bitAnd` computes ported `and`. -/
 theorem evalScalarBinOp_bitAnd_eq_and {sz : Nat} (hsz : 0 < sz) (a b : Nat)
@@ -672,6 +752,82 @@ theorem evalScalarBinOp_sub_eq_sub {sz : Nat} (hsz : 0 < sz) (a b : Nat)
         locals mem := by
   rw [Anneal.Scalars.evalScalarBinOp_sub hsz, sub_mod_eq_toNat_sub]
 
+/-- Operational `evalScalarBinOp .mul` computes ported `mul`. -/
+theorem evalScalarBinOp_mul_eq_mul {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    evalScalarBinOp .mul ⟨a, sz⟩ ⟨b, sz⟩ locals mem isSigned =
+      .ok (.scalar
+        ⟨(Anneal.BitVec.mul (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat, sz⟩)
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_mul hsz, mul_mod_eq_toNat_mul]
+
+/-- Operational `evalScalarBinOp .div` (unsigned) computes ported `udiv` on canonical operands. -/
+theorem evalScalarBinOp_div_unsigned_eq_udiv {sz : Nat} (hsz : 0 < sz) {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (hbz : b ≠ 0)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .div ⟨a, sz⟩ ⟨b, sz⟩ locals mem false =
+      .ok (.scalar
+        ⟨(Anneal.BitVec.udiv (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat, sz⟩)
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_div_unsigned hsz hbz, Anneal.BitVec.toNat_udiv, natDiv_eq,
+    toNat_ofNat_of_lt ha, toNat_ofNat_of_lt hb]
+  rw [scalarModulus_eq] at ha
+  rw [Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.div_le_self a b) ha)]
+
+/-- Operational `evalScalarBinOp .rem` (unsigned) computes ported `urem` on canonical operands. -/
+theorem evalScalarBinOp_rem_unsigned_eq_urem {sz : Nat} (hsz : 0 < sz) {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (hbz : b ≠ 0)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .rem ⟨a, sz⟩ ⟨b, sz⟩ locals mem false =
+      .ok (.scalar
+        ⟨(Anneal.BitVecArith.urem (BitVec.ofNat (8 * sz) a)
+          (BitVec.ofNat (8 * sz) b)).toNat, sz⟩)
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_rem_unsigned hsz hbz, Anneal.BitVecArith.toNat_urem, natMod_eq,
+    toNat_ofNat_of_lt ha, toNat_ofNat_of_lt hb]
+  rw [scalarModulus_eq] at ha
+  rw [Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.mod_le a b) ha)]
+
+/-- Operational `evalScalarBinOp .lt` (signed) decides ported `slt`. -/
+theorem evalScalarBinOp_lt_signed_eq_slt {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .lt ⟨a, sz⟩ ⟨b, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar
+        (decide (Anneal.BitVecArith.slt (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)))))
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_lt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt,
+    signedLt_eq_decide]
+
+/-- Operational `evalScalarBinOp .le` (signed) decides ported `sle`. -/
+theorem evalScalarBinOp_le_signed_eq_sle {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .le ⟨a, sz⟩ ⟨b, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar
+        (decide (Anneal.BitVecArith.sle (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)))))
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_le_signed hsz, ← Anneal.Scalars.signedLe_eq_sle,
+    signedLe_eq_decide]
+
+/-- Operational `evalScalarBinOp .gt` (signed) decides ported `slt` with swapped arguments. -/
+theorem evalScalarBinOp_gt_signed_eq_slt {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .gt ⟨a, sz⟩ ⟨b, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar
+        (decide (Anneal.BitVecArith.slt (BitVec.ofNat (8 * sz) b) (BitVec.ofNat (8 * sz) a)))))
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_gt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt,
+    signedLt_eq_decide]
+
+/-- Operational `evalScalarBinOp .ge` (signed) decides ported `sle` with swapped arguments. -/
+theorem evalScalarBinOp_ge_signed_eq_sle {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .ge ⟨a, sz⟩ ⟨b, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar
+        (decide (Anneal.BitVecArith.sle (BitVec.ofNat (8 * sz) b) (BitVec.ofNat (8 * sz) a)))))
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_ge_signed hsz, ← Anneal.Scalars.signedLe_eq_sle,
+    signedLe_eq_decide]
+
 /-- `evalWrappingAdd` computes wrapping `BitVec` addition (arbitrary operands). -/
 theorem evalWrappingAdd_eq_add {sz : Nat} (hsz : 0 < sz) (a b : Nat) :
     evalWrappingAdd ⟨a, sz⟩ ⟨b, sz⟩ =
@@ -731,6 +887,40 @@ theorem evalWrappingAdd_eq_none_iff (x y : ScalarInt) :
 theorem evalWrappingSub_eq_none_iff (x y : ScalarInt) :
     evalWrappingSub x y = none ↔ x.sizeBytes = 0 ∨ x.sizeBytes ≠ y.sizeBytes := by
   unfold evalWrappingSub
+  cases h0 : Nat.beq x.sizeBytes 0 with
+  | true =>
+    exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
+  | false =>
+    have hne : x.sizeBytes ≠ 0 := fun h => by rw [h] at h0; nomatch h0
+    cases h1 : Nat.beq x.sizeBytes y.sizeBytes with
+    | true =>
+      have heq : x.sizeBytes = y.sizeBytes := Nat.eq_of_beq_eq_true h1
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · cases h
+      · cases h with
+        | inl h => exact absurd h hne
+        | inr h => exact absurd heq h
+    | false =>
+      have hneq : x.sizeBytes ≠ y.sizeBytes := fun h => by
+        rw [h, nat_beq_self] at h1; nomatch h1
+      exact ⟨fun _ => Or.inr hneq, fun _ => rfl⟩
+
+/-- `evalWrappingMul` computes ported `Anneal.BitVec.mul` (arbitrary operands). -/
+theorem evalWrappingMul_eq_mul {sz : Nat} (hsz : 0 < sz) (a b : Nat) :
+    evalWrappingMul ⟨a, sz⟩ ⟨b, sz⟩ =
+      some ⟨(Anneal.BitVec.mul (BitVec.ofNat (8 * sz) a) (BitVec.ofNat (8 * sz) b)).toNat, sz⟩ := by
+  have h0 : Nat.beq sz 0 = false := beq_zero_of_pos hsz
+  have h1 : Nat.beq sz sz = true := nat_beq_self sz
+  unfold evalWrappingMul
+  simp only [h0, h1, Bool.not_true, Bool.or_false]
+  rw [Anneal.Scalars.wrapScalarBits_eq_mod_modulus, Anneal.Scalars.wrapScalarBits_eq_mod_modulus,
+    Anneal.Scalars.wrapScalarBits_eq_mod_modulus, scalarModulus_eq, natMul_eq, ← Nat.mul_mod,
+    mul_mod_eq_toNat_mul]
+
+/-- `evalWrappingMul` is rejected exactly on zero-width or mismatched-width operands. -/
+theorem evalWrappingMul_eq_none_iff (x y : ScalarInt) :
+    evalWrappingMul x y = none ↔ x.sizeBytes = 0 ∨ x.sizeBytes ≠ y.sizeBytes := by
+  unfold evalWrappingMul
   cases h0 : Nat.beq x.sizeBytes 0 with
   | true =>
     exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
@@ -883,6 +1073,13 @@ theorem extractField_eq_extractBits {sz x : Nat} (hx : x < scalarModulus sz) (lo
       (Anneal.BitVecArith.extractBits (BitVec.ofNat (8 * sz) x) lo len).toNat := by
   rw [← extractField_toNat, toNat_ofNat_of_lt hx]
 
+/-- `extractField` on canonicalized (`wrapScalarBits`) bits is ported `extractBits`, for
+arbitrary (possibly non-canonical) `x`. -/
+theorem extractField_wrap_eq_extractBits (sz x lo len : Nat) :
+    extractField sz (wrapScalarBits x (scalarModulus sz)) lo len =
+      (Anneal.BitVecArith.extractBits (BitVec.ofNat (8 * sz) x) lo len).toNat := by
+  rw [wrapScalarBits_eq_toNat, extractField_toNat]
+
 /-- Extraction distributes over OR-packing of canonical scalars. -/
 theorem extractField_bitwiseOrBits {sz x y : Nat} (hx : x < scalarModulus sz)
     (hy : y < scalarModulus sz) (lo len : Nat) :
@@ -1020,11 +1217,11 @@ theorem evalBinOp_bitOr_disjoint_injective {sz : Nat} (hsz : 0 < sz)
     (ScalarInt.mk.inj (Option.some.inj h)).1
 
 /-- Shift-and-OR pack injectivity on `evalBinOp`: equal results of the MIR pipeline
-`(a << lo₁) | (b << lo₂)` force equal in-range fields when the bit ranges are disjoint. -/
+`(a << lo₁) | (b << lo₂)` force equal in-range fields when the bit ranges are disjoint,
+including zero-width fields (`len₁ = 0` or `len₂ = 0`, even at `lo = 8 * sz`). -/
 theorem evalBinOp_pack_injective {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
     {lo₁ len₁ lo₂ len₂ a₁ b₁ a₂ b₂ : Nat}
     (ha₁ : a₁ < 2 ^ len₁) (hb₁ : b₁ < 2 ^ len₂) (ha₂ : a₂ < 2 ^ len₁) (hb₂ : b₂ < 2 ^ len₂)
-    (hl₁ : 0 < len₁) (hl₂ : 0 < len₂)
     (h₁ : lo₁ + len₁ ≤ 8 * sz) (h₂ : lo₂ + len₂ ≤ 8 * sz)
     (hd : lo₁ + len₁ ≤ lo₂ ∨ lo₂ + len₂ ≤ lo₁)
     (h : (Anneal.Scalars.evalBinOp .shl ⟨a₁, sz⟩ ⟨lo₁, szR⟩ false).bind (fun sa =>
@@ -1034,12 +1231,59 @@ theorem evalBinOp_pack_injective {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
           (Anneal.Scalars.evalBinOp .shl ⟨b₂, sz⟩ ⟨lo₂, szR⟩ false).bind (fun sb =>
             Anneal.Scalars.evalBinOp .bitOr sa sb false))) :
     a₁ = a₂ ∧ b₁ = b₂ := by
-  have hlo₁ : lo₁ < 8 * sz := by omega
-  have hlo₂ : lo₂ < 8 * sz := by omega
-  rw [evalBinOp_shl_bitOr_eq_pack hsz hszR hlo₁ hlo₂,
-    evalBinOp_shl_bitOr_eq_pack hsz hszR hlo₁ hlo₂] at h
-  exact pack_disjoint_injective ha₁ hb₁ ha₂ hb₂ h₁ h₂ hd
-    (ScalarInt.mk.inj (Option.some.inj h)).1
+  cases Nat.eq_zero_or_pos len₁ with
+  | inl hl₁ =>
+    subst hl₁
+    have ha₁0 : a₁ = 0 := by simpa using ha₁
+    have ha₂0 : a₂ = 0 := by simpa using ha₂
+    subst ha₁0; subst ha₂0
+    cases Nat.eq_zero_or_pos len₂ with
+    | inl hl₂ =>
+      subst hl₂
+      have hb₁0 : b₁ = 0 := by simpa using hb₁
+      have hb₂0 : b₂ = 0 := by simpa using hb₂
+      exact ⟨rfl, hb₁0.trans hb₂0.symm⟩
+    | inr hl₂ =>
+      have hlo₂ : lo₂ < 8 * sz := by omega
+      simp only [Anneal.Scalars.evalBinOp_shl_apply hsz hszR, Option.bind_some,
+        Anneal.Scalars.evalBinOp_bitOr_apply hsz, Nat.mod_eq_of_lt hlo₂] at h
+      have hbits : (0 ||| (b₁ <<< lo₂) % 2 ^ (8 * sz)) % 2 ^ (8 * sz) =
+          (0 ||| (b₂ <<< lo₂) % 2 ^ (8 * sz)) % 2 ^ (8 * sz) := by
+        simpa [Nat.zero_shiftLeft] using (ScalarInt.mk.inj (Option.some.inj h)).1
+      rw [Nat.zero_or, Nat.zero_or, Nat.mod_mod, Nat.mod_mod,
+        ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod,
+        ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod] at hbits
+      have e₁ := extractField_shiftLeftBits_self hb₁ h₂
+      have e₂ := extractField_shiftLeftBits_self hb₂ h₂
+      rw [hbits] at e₁
+      exact ⟨rfl, e₁.symm.trans e₂⟩
+  | inr hl₁ =>
+    cases Nat.eq_zero_or_pos len₂ with
+    | inl hl₂ =>
+      subst hl₂
+      have hb₁0 : b₁ = 0 := by simpa using hb₁
+      have hb₂0 : b₂ = 0 := by simpa using hb₂
+      subst hb₁0; subst hb₂0
+      have hlo₁ : lo₁ < 8 * sz := by omega
+      simp only [Anneal.Scalars.evalBinOp_shl_apply hsz hszR, Option.bind_some,
+        Anneal.Scalars.evalBinOp_bitOr_apply hsz, Nat.mod_eq_of_lt hlo₁] at h
+      have hbits : ((a₁ <<< lo₁) % 2 ^ (8 * sz) ||| 0) % 2 ^ (8 * sz) =
+          ((a₂ <<< lo₁) % 2 ^ (8 * sz) ||| 0) % 2 ^ (8 * sz) := by
+        simpa [Nat.zero_shiftLeft] using (ScalarInt.mk.inj (Option.some.inj h)).1
+      rw [Nat.or_zero, Nat.or_zero, Nat.mod_mod, Nat.mod_mod,
+        ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod,
+        ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod] at hbits
+      have e₁ := extractField_shiftLeftBits_self ha₁ h₁
+      have e₂ := extractField_shiftLeftBits_self ha₂ h₁
+      rw [hbits] at e₁
+      exact ⟨e₁.symm.trans e₂, rfl⟩
+    | inr hl₂ =>
+      have hlo₁ : lo₁ < 8 * sz := by omega
+      have hlo₂ : lo₂ < 8 * sz := by omega
+      rw [evalBinOp_shl_bitOr_eq_pack hsz hszR hlo₁ hlo₂,
+        evalBinOp_shl_bitOr_eq_pack hsz hszR hlo₁ hlo₂] at h
+      exact pack_disjoint_injective ha₁ hb₁ ha₂ hb₂ h₁ h₂ hd
+        (ScalarInt.mk.inj (Option.some.inj h)).1
 
 /-! ## 5. Abstract-Domain Transfers (`ScalarTnum`, `ScalarRange`, `ScalarSRange`) -/
 
@@ -1100,6 +1344,93 @@ theorem scalarTnum_allOnes_iff {sz : Nat} {v : BitVec (8 * sz)} {sc : ScalarInt}
     ScalarTnum sz (Anneal.BitVec.allOnes (8 * sz)) v sc ↔
       sc.sizeBytes = sz ∧ sc.bits < scalarModulus sz :=
   ⟨fun h => ⟨h.1, h.2.1⟩, fun h => ⟨h.1, h.2, Anneal.BitVec.maskEq_allOnes _ _⟩⟩
+
+/-- No non-canonical scalar (`sc.bits ≥ scalarModulus sz`) satisfies any `ScalarTnum`. -/
+theorem scalarTnum_not_noncanonical {sz : Nat} {m v : BitVec (8 * sz)} {sc : ScalarInt}
+    (hge : scalarModulus sz ≤ sc.bits) : ¬ ScalarTnum sz m v sc :=
+  fun h => Nat.not_lt_of_ge hge h.2.1
+
+/-- Reference-value canonicalization for `ScalarTnum` (`v ↔ v &&& ~~~m`). -/
+theorem scalarTnum_canonical {sz : Nat} {m v : BitVec (8 * sz)} {sc : ScalarInt} :
+    ScalarTnum sz m v sc ↔ ScalarTnum sz m (Anneal.BitVec.and v (Anneal.BitVec.not m)) sc :=
+  ⟨fun h => ⟨h.1, h.2.1, Anneal.BitVec.maskEq_canonical.1 h.2.2⟩,
+   fun h => ⟨h.1, h.2.1, Anneal.BitVec.maskEq_canonical.2 h.2.2⟩⟩
+
+/-- Mask monotonicity: weakening the unknown mask preserves `ScalarTnum`. -/
+theorem scalarTnum_mono {sz : Nat} {m₁ m₂ v : BitVec (8 * sz)} {sc : ScalarInt}
+    (hsub : Anneal.BitVec.and m₁ (Anneal.BitVec.not m₂) = BitVec.ofNat (8 * sz) 0)
+    (h : ScalarTnum sz m₁ v sc) : ScalarTnum sz m₂ v sc :=
+  ⟨h.1, h.2.1, Anneal.BitVec.maskEq_mono hsub h.2.2⟩
+
+/-- Exact meet (intersection) of two `ScalarTnum` abstractions: any scalar satisfying both
+satisfies the sharpened mask `m₁ &&& m₂` with reference value `(v₁ &&& ~~~m₁) ||| (v₂ &&& ~~~m₂)`. -/
+theorem scalarTnum_inter {sz : Nat} {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {sc : ScalarInt}
+    (h₁ : ScalarTnum sz m₁ v₁ sc) (h₂ : ScalarTnum sz m₂ v₂ sc) :
+    ScalarTnum sz (Anneal.BitVec.and m₁ m₂)
+      (Anneal.BitVec.or (Anneal.BitVec.and v₁ (Anneal.BitVec.not m₁))
+        (Anneal.BitVec.and v₂ (Anneal.BitVec.not m₂))) sc := by
+  refine ⟨h₁.1, h₁.2.1, Anneal.BitVec.maskEq_iff_getLsbD.2 (fun i hi hm => ?_)⟩
+  rw [Anneal.BitVec.getLsbD_and] at hm
+  have e₁ := Anneal.BitVec.maskEq_iff_getLsbD.1 h₁.2.2 i hi
+  have e₂ := Anneal.BitVec.maskEq_iff_getLsbD.1 h₂.2.2 i hi
+  rw [Anneal.BitVec.getLsbD_or, Anneal.BitVec.getLsbD_and, Anneal.BitVec.getLsbD_and,
+    Anneal.BitVec.getLsbD_not_of_lt _ hi, Anneal.BitVec.getLsbD_not_of_lt _ hi]
+  cases hm₁ : Anneal.BitVec.getLsbD m₁ i with
+  | false =>
+    cases hm₂ : Anneal.BitVec.getLsbD m₂ i with
+    | false =>
+      have hv₁ := e₁ hm₁
+      have hv₂ := e₂ hm₂
+      rw [← hv₁, ← hv₂]
+      simp
+    | true =>
+      rw [e₁ hm₁]
+      simp
+  | true =>
+    cases hm₂ : Anneal.BitVec.getLsbD m₂ i with
+    | false =>
+      rw [e₂ hm₂]
+      simp
+    | true =>
+      rw [hm₁, hm₂] at hm
+      cases hm
+
+/-- Tnum-to-range widening (`Anneal.BitVec.tnum_and_bounds_sound`, closing the `ScalarTnum ↔
+ScalarRange` connection without requiring canonicality of `v`): every scalar satisfying
+`ScalarTnum sz m v` lies in `[v &&& ~~~m, v ||| m]`. -/
+theorem scalarRange_of_scalarTnum {sz : Nat} {m v : BitVec (8 * sz)} {sc : ScalarInt}
+    (h : ScalarTnum sz m v sc) :
+    ScalarRange sz (Anneal.BitVec.and v (Anneal.BitVec.not m)) (Anneal.BitVec.or v m) sc := by
+  have hc : Anneal.BitVec.MaskEq m (BitVec.ofNat (8 * sz) sc.bits)
+      (Anneal.BitVec.and v (Anneal.BitVec.not m)) :=
+    Anneal.BitVec.maskEq_canonical.1 h.2.2
+  have hdisj : Anneal.BitVec.and (Anneal.BitVec.and v (Anneal.BitVec.not m)) m =
+      BitVec.ofNat (8 * sz) 0 := by
+    apply Anneal.BitVec.eq_of_getLsbD_eq
+    intro i hi
+    rw [Anneal.BitVec.getLsbD_and, Anneal.BitVec.getLsbD_and,
+      Anneal.BitVec.getLsbD_not_of_lt _ hi, Anneal.BitVec.getLsbD_zero]
+    cases Anneal.BitVec.getLsbD m i <;> simp
+  have hor : Anneal.BitVec.or (Anneal.BitVec.and v (Anneal.BitVec.not m)) m =
+      Anneal.BitVec.or v m := by
+    apply Anneal.BitVec.eq_of_getLsbD_eq
+    intro i hi
+    rw [Anneal.BitVec.getLsbD_or, Anneal.BitVec.getLsbD_and,
+      Anneal.BitVec.getLsbD_not_of_lt _ hi, Anneal.BitVec.getLsbD_or]
+    cases Anneal.BitVec.getLsbD m i <;> simp
+  have hb := Anneal.BitVec.tnum_and_bounds_sound hc hdisj
+  rw [hor] at hb
+  exact ⟨h.1, h.2.1, hb.1, hb.2⟩
+
+/-- No non-canonical scalar (`sc.bits ≥ scalarModulus sz`) satisfies any `ScalarRange`. -/
+theorem scalarRange_not_noncanonical {sz : Nat} {lo hi : BitVec (8 * sz)} {sc : ScalarInt}
+    (hge : scalarModulus sz ≤ sc.bits) : ¬ ScalarRange sz lo hi sc :=
+  fun h => Nat.not_lt_of_ge hge h.2.1
+
+/-- No non-canonical scalar (`sc.bits ≥ scalarModulus sz`) satisfies any `ScalarSRange`. -/
+theorem scalarSRange_not_noncanonical {sz : Nat} {lo hi : BitVec (8 * sz)} {sc : ScalarInt}
+    (hge : scalarModulus sz ≤ sc.bits) : ¬ ScalarSRange sz lo hi sc :=
+  fun h => Nat.not_lt_of_ge hge h.2.1
 
 /-- Introduction: the scalar carrying a bitvector lies in every unsigned interval the bitvector
 does. -/
@@ -1309,6 +1640,127 @@ theorem scalarTnum_evalBinOp_shr_signed {sz : Nat} (hsz : 0 < sz) {m v : BitVec 
     exact ⟨_, evalBinOp_shr_signed_eq_ashr hsz hy xb yb,
       scalarTnum_of_bitVec _ (Anneal.BitVecArith.tnum_ashr_sound _ hxm)⟩
 
+/-- Tnum transfer through `extractField` (`Anneal.BitVecArith.tnum_extractBits_sound`): extracting
+`len` bits starting at `lo` from a scalar abstracted by `(m, v)` satisfies the extracted tnum
+at width `len`. -/
+theorem scalarTnum_extractField {sz : Nat} {m v : BitVec (8 * sz)} {x : ScalarInt}
+    (hx : ScalarTnum sz m v x) (lo len : Nat) :
+    Anneal.BitVec.MaskEq (Anneal.BitVecArith.extractBits m lo len)
+      (BitVec.ofNat len (extractField sz x.bits lo len))
+      (Anneal.BitVecArith.extractBits v lo len) := by
+  rw [extractField_eq_extractBits hx.2.1, ofNat_toNat_self]
+  exact Anneal.BitVecArith.tnum_extractBits_sound lo len hx.2.2
+
+/-- Tnum bitwise-NOT transfer through `evalUnOp .not` (`Anneal.BitVec.tnum_not_sound`). -/
+theorem scalarTnum_evalUnOp_not {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)} {x : ScalarInt}
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, Anneal.Scalars.evalUnOp .not x false = some r ∧
+      ScalarTnum sz m (Anneal.BitVec.not v) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  exact ⟨_, evalUnOp_not_eq_not hsz xb, scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_not_sound hxm)⟩
+
+/-- Operational tnum bitwise-NOT transfer through `Trusted` `evalUnaryNot` on unsigned types. -/
+theorem scalarTnum_evalUnaryNot_uint {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)}
+    {x : ScalarInt} (w : UintTy) (idx : LayoutIdx) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalUnaryNot x (some { kind := .uint w, layoutIdx := idx }) locals mem =
+        .ok (.scalar r) locals mem ∧
+      ScalarTnum sz m (Anneal.BitVec.not v) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  exact ⟨_, evalUnaryNot_uint_eq_not hsz xb w idx locals mem,
+    scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_not_sound hxm)⟩
+
+/-- Operational tnum bitwise-NOT transfer through `Trusted` `evalUnaryNot` on signed types. -/
+theorem scalarTnum_evalUnaryNot_int {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)}
+    {x : ScalarInt} (w : IntTy) (idx : LayoutIdx) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalUnaryNot x (some { kind := .int w, layoutIdx := idx }) locals mem =
+        .ok (.scalar r) locals mem ∧
+      ScalarTnum sz m (Anneal.BitVec.not v) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  exact ⟨_, evalUnaryNot_int_eq_not hsz xb w idx locals mem,
+    scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_not_sound hxm)⟩
+
+/-- Operational tnum AND transfer through `Trusted` `evalScalarBinOp .bitAnd`. -/
+theorem scalarTnum_evalScalarBinOp_bitAnd {sz : Nat} (hsz : 0 < sz)
+    {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m₁ v₁ x) (hy : ScalarTnum sz m₂ v₂ y) :
+    ∃ r, evalScalarBinOp .bitAnd x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz
+        (Anneal.BitVec.or (Anneal.BitVec.or (Anneal.BitVec.and m₁ m₂) (Anneal.BitVec.and m₁ v₂))
+          (Anneal.BitVec.and v₁ m₂))
+        (Anneal.BitVec.and v₁ v₂) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
+  exact ⟨_, evalScalarBinOp_bitAnd_eq_and hsz xb yb locals mem isSigned,
+    scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_and_sound hxm hym)⟩
+
+/-- Operational tnum OR transfer through `Trusted` `evalScalarBinOp .bitOr`. -/
+theorem scalarTnum_evalScalarBinOp_bitOr {sz : Nat} (hsz : 0 < sz)
+    {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m₁ v₁ x) (hy : ScalarTnum sz m₂ v₂ y) :
+    ∃ r, evalScalarBinOp .bitOr x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz
+        (Anneal.BitVec.or
+          (Anneal.BitVec.or (Anneal.BitVec.and m₁ m₂)
+            (Anneal.BitVec.and m₁ (Anneal.BitVec.not v₂)))
+          (Anneal.BitVec.and (Anneal.BitVec.not v₁) m₂))
+        (Anneal.BitVec.or v₁ v₂) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
+  exact ⟨_, evalScalarBinOp_bitOr_eq_or hsz xb yb locals mem isSigned,
+    scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_or_sound hxm hym)⟩
+
+/-- Operational tnum XOR transfer through `Trusted` `evalScalarBinOp .bitXor`. -/
+theorem scalarTnum_evalScalarBinOp_bitXor {sz : Nat} (hsz : 0 < sz)
+    {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m₁ v₁ x) (hy : ScalarTnum sz m₂ v₂ y) :
+    ∃ r, evalScalarBinOp .bitXor x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVec.or m₁ m₂) (Anneal.BitVec.xor v₁ v₂) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
+  exact ⟨_, evalScalarBinOp_bitXor_eq_xor hsz xb yb locals mem isSigned,
+    scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_xor_sound hxm hym)⟩
+
+/-- Operational tnum left-shift transfer through `Trusted` `evalScalarBinOp .shl`. -/
+theorem scalarTnum_evalScalarBinOp_shl {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)}
+    {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes) (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shl x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVec.shl m (y.bits % (8 * sz)))
+        (Anneal.BitVec.shl v (y.bits % (8 * sz))) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    exact ⟨_, evalScalarBinOp_shl_eq_shl hsz hy xb yb locals mem isSigned,
+      scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_shl_sound _ hxm)⟩
+
+/-- Operational tnum logical-right-shift transfer through unsigned `Trusted` `evalScalarBinOp .shr`. -/
+theorem scalarTnum_evalScalarBinOp_shr_unsigned {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)}
+    {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shr x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVec.ushr m (y.bits % (8 * sz)))
+        (Anneal.BitVec.ushr v (y.bits % (8 * sz))) r := by
+  obtain ⟨xb, rfl, hxb, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    exact ⟨_, evalScalarBinOp_shr_unsigned_eq_ushr hsz hy hxb yb locals mem,
+      scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_ushr_sound _ hxm)⟩
+
+/-- Operational tnum arithmetic-right-shift transfer through signed `Trusted` `evalScalarBinOp .shr`. -/
+theorem scalarTnum_evalScalarBinOp_shr_signed {sz : Nat} (hsz : 0 < sz) {m v : BitVec (8 * sz)}
+    {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shr x y locals mem true = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVecArith.ashr m (y.bits % (8 * sz)))
+        (Anneal.BitVecArith.ashr v (y.bits % (8 * sz))) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    exact ⟨_, evalScalarBinOp_shr_signed_eq_ashr hsz hy xb yb locals mem,
+      scalarTnum_of_bitVec _ (Anneal.BitVecArith.tnum_ashr_sound _ hxm)⟩
+
 /-! ### 5.2 Tnum transfers through wrapping addition and subtraction -/
 
 /-- Unknown-bit mask of the carry-propagating tnum sum (`Anneal.BitVecArith.tnum_add_sound_general`,
@@ -1398,6 +1850,28 @@ theorem scalarTnum_evalWrappingSub {sz : Nat} (hsz : 0 < sz)
   obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
   obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
   exact ⟨_, evalWrappingSub_eq_sub hsz xb yb, scalarTnum_of_bitVec _ (tnumSub_sound hxm hym)⟩
+
+/-- Operational tnum addition transfer through `Trusted` `evalScalarBinOp .add`. -/
+theorem scalarTnum_evalScalarBinOp_add {sz : Nat} (hsz : 0 < sz)
+    {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m₁ v₁ x) (hy : ScalarTnum sz m₂ v₂ y) :
+    ∃ r, evalScalarBinOp .add x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (tnumAddMask m₁ v₁ m₂ v₂) (tnumAddValue m₁ v₁ m₂ v₂) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
+  exact ⟨_, evalScalarBinOp_add_eq_add hsz xb yb locals mem isSigned,
+    scalarTnum_of_bitVec _ (tnumAdd_sound hxm hym)⟩
+
+/-- Operational tnum subtraction transfer through `Trusted` `evalScalarBinOp .sub`. -/
+theorem scalarTnum_evalScalarBinOp_sub {sz : Nat} (hsz : 0 < sz)
+    {m₁ v₁ m₂ v₂ : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot) (mem : Memory)
+    (isSigned : Bool) (hx : ScalarTnum sz m₁ v₁ x) (hy : ScalarTnum sz m₂ v₂ y) :
+    ∃ r, evalScalarBinOp .sub x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (tnumSubMask m₁ v₁ m₂ v₂) (tnumSubValue m₁ v₁ m₂ v₂) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  obtain ⟨yb, rfl, _, hym⟩ := scalarTnum_exists hy
+  exact ⟨_, evalScalarBinOp_sub_eq_sub hsz xb yb locals mem isSigned,
+    scalarTnum_of_bitVec _ (tnumSub_sound hxm hym)⟩
 
 /-! ### 5.3 Empty-abstraction pruning (`arXiv:2611.23584`) -/
 
@@ -1600,6 +2074,328 @@ theorem scalarSRange_refine_evalBinOp_le {sz : Nat} (hsz : 0 < sz) {lo hi : BitV
   obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
   rw [Anneal.Scalars.evalBinOp_le_signed hsz, ← Anneal.Scalars.signedLe_eq_sle] at hle
   exact scalarSRange_refine_signedLe hx c ((boolToScalar_eq_true_iff _).1 (Option.some.inj hle))
+
+/-- Unsigned interval intersection (`Anneal.BitVecArith.range_intersect_sound`). -/
+theorem scalarRange_intersect {sz : Nat} {lo₁ hi₁ lo₂ hi₂ : BitVec (8 * sz)} {x : ScalarInt}
+    (h₁ : ScalarRange sz lo₁ hi₁ x) (h₂ : ScalarRange sz lo₂ hi₂ x) :
+    ScalarRange sz (Anneal.BitVecArith.bvMax lo₁ lo₂) (Anneal.BitVecArith.bvMin hi₁ hi₂) x := by
+  have hs := Anneal.BitVecArith.range_intersect_sound h₁.2.2 h₂.2.2
+  exact ⟨h₁.1, h₁.2.1, hs.1, hs.2⟩
+
+/-- Signed interval intersection (`Anneal.BitVecArith.signed_range_intersect_sound`). -/
+theorem scalarSRange_intersect {sz : Nat} {lo₁ hi₁ lo₂ hi₂ : BitVec (8 * sz)} {x : ScalarInt}
+    (h₁ : ScalarSRange sz lo₁ hi₁ x) (h₂ : ScalarSRange sz lo₂ hi₂ x) :
+    ScalarSRange sz (Anneal.BitVecArith.sbvMax lo₁ lo₂) (Anneal.BitVecArith.sbvMin hi₁ hi₂) x := by
+  have hs := Anneal.BitVecArith.signed_range_intersect_sound h₁.2.2 h₂.2.2
+  exact ⟨h₁.1, h₁.2.1, hs.1, hs.2⟩
+
+/-- Operational unsigned interval transfer through `Trusted` `evalScalarBinOp .add`. -/
+theorem scalarRange_evalScalarBinOp_add {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) :
+    ∃ r, evalScalarBinOp .add x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (rangeAddLo a_lo a_hi b_lo b_hi) (rangeAddHi a_lo a_hi b_lo b_hi) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hs := rangeAdd_sound hx₁ hx₂ hy₁ hy₂
+  exact ⟨_, evalScalarBinOp_add_eq_add hsz xb yb locals mem isSigned,
+    scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Operational unsigned interval transfer through unsigned `Trusted` `evalScalarBinOp .shr`. -/
+theorem scalarRange_evalScalarBinOp_shr_unsigned {sz : Nat} (hsz : 0 < sz)
+    {umin umax : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    (locals : List LocalSlot) (mem : Memory) {kmin kmax : Nat}
+    (hx : ScalarRange sz umin umax x)
+    (hk₁ : kmin ≤ y.bits % (8 * sz)) (hk₂ : y.bits % (8 * sz) ≤ kmax) :
+    ∃ r, evalScalarBinOp .shr x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (Anneal.BitVec.ushr umin kmax) (Anneal.BitVec.ushr umax kmin) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  cases y with
+  | mk yb ys =>
+    have hs := Anneal.BitVecArith.range_ushr_sound hx₁ hx₂ hk₁ hk₂
+    exact ⟨_, evalScalarBinOp_shr_unsigned_eq_ushr hsz hy hxb yb locals mem,
+      scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval transfer through `evalBinOp .sub` without underflow
+(`Anneal.BitVec.range_sub_no_underflow_sound`). -/
+theorem scalarRange_evalBinOp_sub_no_underflow {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) (hno : b_hi ≤ a_lo) :
+    ∃ r, Anneal.Scalars.evalBinOp .sub x y isSigned = some r ∧
+      ScalarRange sz (a_lo - b_hi) (a_hi - b_lo) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hs := Anneal.BitVec.range_sub_no_underflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  exact ⟨_, evalBinOp_sub_eq_sub hsz xb yb isSigned, scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval transfer through `evalWrappingSub` without underflow. -/
+theorem scalarRange_evalWrappingSub_no_underflow {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) (hno : b_hi ≤ a_lo) :
+    ∃ r, evalWrappingSub x y = some r ∧
+      ScalarRange sz (a_lo - b_hi) (a_hi - b_lo) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hs := Anneal.BitVec.range_sub_no_underflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  exact ⟨_, evalWrappingSub_eq_sub hsz xb yb, scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval transfer through `evalBinOp .mul` without overflow
+(`Anneal.BitVec.range_mul_no_overflow_sound`). -/
+theorem scalarRange_evalBinOp_mul_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat * b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, Anneal.Scalars.evalBinOp .mul x y isSigned = some r ∧
+      ScalarRange sz (Anneal.BitVec.mul a_lo b_lo) (Anneal.BitVec.mul a_hi b_hi) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hs := Anneal.BitVec.range_mul_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  exact ⟨_, evalBinOp_mul_eq_mul hsz xb yb isSigned, scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval transfer through `evalWrappingMul` without overflow. -/
+theorem scalarRange_evalWrappingMul_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat * b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, evalWrappingMul x y = some r ∧
+      ScalarRange sz (Anneal.BitVec.mul a_lo b_lo) (Anneal.BitVec.mul a_hi b_hi) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hs := Anneal.BitVec.range_mul_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  exact ⟨_, evalWrappingMul_eq_mul hsz xb yb, scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval transfer through unsigned `evalBinOp .div` with positive lower bound on the
+divisor (`Anneal.BitVec.range_udiv_sound`). -/
+theorem scalarRange_evalBinOp_div_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) (hb : 0 < b_lo.toNat) :
+    ∃ r, Anneal.Scalars.evalBinOp .div x y false = some r ∧
+      ScalarRange sz (Anneal.BitVec.udiv a_lo b_hi) (Anneal.BitVec.udiv a_hi b_lo) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hypos : 0 < yb := by
+    have hle : b_lo.toNat ≤ (BitVec.ofNat (8 * sz) yb).toNat := hy₁
+    rw [toNat_ofNat_of_lt hyb] at hle
+    exact Nat.lt_of_lt_of_le hb hle
+  have hs := Anneal.BitVec.range_udiv_sound hx₁ hx₂ hy₁ hy₂ hb
+  exact ⟨_, evalBinOp_div_unsigned_eq_udiv hsz hxb hyb (Nat.ne_of_gt hypos),
+    scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Unsigned interval upper bound through unsigned `evalBinOp .rem`
+(`Anneal.BitVecArith.range_urem_sound`). -/
+theorem scalarRange_evalBinOp_rem_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) (hb : 0 < b_lo.toNat) :
+    ∃ r, Anneal.Scalars.evalBinOp .rem x y false = some r ∧
+      r.bits ≤ a_hi.toNat ∧ r.bits < b_hi.toNat := by
+  obtain ⟨xb, rfl, hxb, _, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hypos : 0 < (BitVec.ofNat (8 * sz) yb).toNat := by
+    have hle : b_lo.toNat ≤ (BitVec.ofNat (8 * sz) yb).toNat := hy₁
+    exact Nat.lt_of_lt_of_le hb hle
+  have hyne : yb ≠ 0 := by
+    rw [toNat_ofNat_of_lt hyb] at hypos
+    exact Nat.ne_of_gt hypos
+  have hs := Anneal.BitVecArith.range_urem_sound hypos hx₂ hy₂
+  exact ⟨_, evalBinOp_rem_unsigned_eq_urem hsz hxb hyb hyne, hs.1, hs.2⟩
+
+/-- Unsigned interval transfer through `evalBinOp .shl` without overflow
+(`Anneal.BitVecArith.range_shl_no_overflow_sound`). -/
+theorem scalarRange_evalBinOp_shl_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {umin umax : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    {kmin kmax : Nat} (isSigned : Bool) (hx : ScalarRange sz umin umax x)
+    (hk₁ : kmin ≤ y.bits % (8 * sz)) (hk₂ : y.bits % (8 * sz) ≤ kmax)
+    (hno : umax.toNat * 2 ^ kmax < 2 ^ (8 * sz)) :
+    ∃ r, Anneal.Scalars.evalBinOp .shl x y isSigned = some r ∧
+      ScalarRange sz (Anneal.BitVec.shl umin kmin) (Anneal.BitVec.shl umax kmax) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  cases y with
+  | mk yb ys =>
+    have hs := Anneal.BitVecArith.range_shl_no_overflow_sound hx₁ hx₂ hk₁ hk₂ hno
+    exact ⟨_, evalBinOp_shl_eq_shl hsz hy xb yb isSigned, scalarRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Signed interval transfer through `evalWrappingAdd` when neither signed underflow nor signed
+overflow can occur. -/
+theorem scalarSRange_evalWrappingAdd_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {smin₁ smax₁ smin₂ smax₂ : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarSRange sz smin₁ smax₁ x) (hy : ScalarSRange sz smin₂ smax₂ y)
+    (hno_udf : 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey smin₁ + Anneal.BitVecArith.signedKey smin₂)
+    (hno_ovf : Anneal.BitVecArith.signedKey smax₁ + Anneal.BitVecArith.signedKey smax₂ <
+      2 ^ (8 * sz - 1) + 2 ^ (8 * sz)) :
+    ∃ r, evalWrappingAdd x y = some r ∧
+      ScalarSRange sz (smin₁ + smin₂) (smax₁ + smax₂) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarSRange_exists hy
+  have hs := Anneal.BitVecArith.signed_range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno_udf hno_ovf
+  exact ⟨_, evalWrappingAdd_eq_add hsz xb yb, scalarSRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Operational signed interval transfer through `Trusted` `evalScalarBinOp .add`. -/
+theorem scalarSRange_evalScalarBinOp_add_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {smin₁ smax₁ smin₂ smax₂ : BitVec (8 * sz)} {x y : ScalarInt}
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool)
+    (hx : ScalarSRange sz smin₁ smax₁ x) (hy : ScalarSRange sz smin₂ smax₂ y)
+    (hno_udf : 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey smin₁ + Anneal.BitVecArith.signedKey smin₂)
+    (hno_ovf : Anneal.BitVecArith.signedKey smax₁ + Anneal.BitVecArith.signedKey smax₂ <
+      2 ^ (8 * sz - 1) + 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .add x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarSRange sz (smin₁ + smin₂) (smax₁ + smax₂) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarSRange_exists hy
+  have hs := Anneal.BitVecArith.signed_range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno_udf hno_ovf
+  exact ⟨_, evalScalarBinOp_add_eq_add hsz xb yb locals mem isSigned,
+    scalarSRange_of_bitVec _ hs.1 hs.2⟩
+
+/-- Signed branch refinement on a taken signed `evalBinOp .gt x c` test
+(`Anneal.BitVecArith.signed_range_refine_sgt`). -/
+theorem scalarSRange_refine_evalBinOp_gt {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (hx : ScalarSRange sz lo hi x)
+    (hgt : Anneal.Scalars.evalBinOp .gt x ⟨c, sz⟩ true = some (boolToScalar true)) :
+    ScalarSRange sz
+      (Anneal.BitVecArith.sbvMax lo (BitVec.ofNat (8 * sz) c + BitVec.ofNat (8 * sz) 1)) hi x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_gt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt] at hgt
+  have hlt := (signedLt_eq_true_iff c xb sz).1 ((boolToScalar_eq_true_iff _).1 (Option.some.inj hgt))
+  have hs := Anneal.BitVecArith.signed_range_refine_sgt hx.2.2.1 hx.2.2.2 hlt
+  exact ⟨hx.1, hx.2.1, hs.1, hs.2⟩
+
+/-- Signed branch refinement on a taken signed `evalBinOp .ge x c` test
+(`Anneal.BitVecArith.signed_range_refine_sge`). -/
+theorem scalarSRange_refine_evalBinOp_ge {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (hx : ScalarSRange sz lo hi x)
+    (hge : Anneal.Scalars.evalBinOp .ge x ⟨c, sz⟩ true = some (boolToScalar true)) :
+    ScalarSRange sz (Anneal.BitVecArith.sbvMax lo (BitVec.ofNat (8 * sz) c)) hi x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_ge_signed hsz, ← Anneal.Scalars.signedLe_eq_sle] at hge
+  have hle := (signedLe_eq_true_iff c xb sz).1 ((boolToScalar_eq_true_iff _).1 (Option.some.inj hge))
+  have hs := Anneal.BitVecArith.signed_range_refine_sge hx.2.2.1 hx.2.2.2 hle
+  exact ⟨hx.1, hx.2.1, hs.1, hs.2⟩
+
+/-- Operational signed branch refinement on `Trusted` `evalScalarBinOp .lt`. -/
+theorem scalarSRange_refine_evalScalarBinOp_lt {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz lo hi x)
+    (hlt : evalScalarBinOp .lt x ⟨c, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar true)) locals mem) :
+    ScalarSRange sz lo
+      (Anneal.BitVecArith.sbvMin hi (BitVec.ofNat (8 * sz) c - BitVec.ofNat (8 * sz) 1)) x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalScalarBinOp_lt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt] at hlt
+  have hsc : boolToScalar (signedLt xb c sz) = boolToScalar true :=
+    Value.scalar.inj (RvalueEvalResult.ok.inj hlt).1
+  exact scalarSRange_refine_signedLt hx c ((boolToScalar_eq_true_iff _).1 hsc)
+
+/-- Operational signed branch refinement on `Trusted` `evalScalarBinOp .le`. -/
+theorem scalarSRange_refine_evalScalarBinOp_le {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz lo hi x)
+    (hle : evalScalarBinOp .le x ⟨c, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar true)) locals mem) :
+    ScalarSRange sz lo (Anneal.BitVecArith.sbvMin hi (BitVec.ofNat (8 * sz) c)) x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalScalarBinOp_le_signed hsz, ← Anneal.Scalars.signedLe_eq_sle] at hle
+  have hsc : boolToScalar (signedLe xb c sz) = boolToScalar true :=
+    Value.scalar.inj (RvalueEvalResult.ok.inj hle).1
+  exact scalarSRange_refine_signedLe hx c ((boolToScalar_eq_true_iff _).1 hsc)
+
+/-- Operational signed branch refinement on `Trusted` `evalScalarBinOp .gt`. -/
+theorem scalarSRange_refine_evalScalarBinOp_gt {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz lo hi x)
+    (hgt : evalScalarBinOp .gt x ⟨c, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar true)) locals mem) :
+    ScalarSRange sz
+      (Anneal.BitVecArith.sbvMax lo (BitVec.ofNat (8 * sz) c + BitVec.ofNat (8 * sz) 1)) hi x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalScalarBinOp_gt_signed hsz, ← Anneal.Scalars.signedLt_eq_slt] at hgt
+  have hsc : boolToScalar (signedLt c xb sz) = boolToScalar true :=
+    Value.scalar.inj (RvalueEvalResult.ok.inj hgt).1
+  have hs := Anneal.BitVecArith.signed_range_refine_sgt hx.2.2.1 hx.2.2.2
+    ((signedLt_eq_true_iff c xb sz).1 ((boolToScalar_eq_true_iff _).1 hsc))
+  exact ⟨hx.1, hx.2.1, hs.1, hs.2⟩
+
+/-- Operational signed branch refinement on `Trusted` `evalScalarBinOp .ge`. -/
+theorem scalarSRange_refine_evalScalarBinOp_ge {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} (c : Nat) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz lo hi x)
+    (hge : evalScalarBinOp .ge x ⟨c, sz⟩ locals mem true =
+      .ok (.scalar (boolToScalar true)) locals mem) :
+    ScalarSRange sz (Anneal.BitVecArith.sbvMax lo (BitVec.ofNat (8 * sz) c)) hi x := by
+  obtain ⟨xb, rfl, _, _, _⟩ := scalarSRange_exists hx
+  rw [Anneal.Scalars.evalScalarBinOp_ge_signed hsz, ← Anneal.Scalars.signedLe_eq_sle] at hge
+  have hsc : boolToScalar (signedLe c xb sz) = boolToScalar true :=
+    Value.scalar.inj (RvalueEvalResult.ok.inj hge).1
+  have hs := Anneal.BitVecArith.signed_range_refine_sge hx.2.2.1 hx.2.2.2
+    ((signedLe_eq_true_iff c xb sz).1 ((boolToScalar_eq_true_iff _).1 hsc))
+  exact ⟨hx.1, hx.2.1, hs.1, hs.2⟩
+
+/-- Unsigned branch refinement on a taken unsigned `evalBinOp .lt x c` test
+(`Anneal.BitVecArith.range_refine_ult`). -/
+theorem scalarRange_refine_evalBinOp_lt {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} {c : Nat} (hc : c < scalarModulus sz) (hx : ScalarRange sz lo hi x)
+    (hlt : Anneal.Scalars.evalBinOp .lt x ⟨c, sz⟩ false = some (boolToScalar true)) :
+    ScalarRange sz lo
+      (Anneal.BitVecArith.bvMin hi (BitVec.ofNat (8 * sz) c - BitVec.ofNat (8 * sz) 1)) x := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_lt_unsigned hsz] at hlt
+  have hlt' : xb < c := of_decide_eq_true ((boolToScalar_eq_true_iff _).1 (Option.some.inj hlt))
+  have hbv : BitVec.ofNat (8 * sz) xb < BitVec.ofNat (8 * sz) c := by
+    show (BitVec.ofNat (8 * sz) xb).toNat < (BitVec.ofNat (8 * sz) c).toNat
+    rw [toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hc]
+    exact hlt'
+  have hs := Anneal.BitVecArith.range_refine_ult hx₁ hx₂ hbv
+  exact ⟨rfl, hxb, hs.1, hs.2⟩
+
+/-- Unsigned branch refinement on a taken unsigned `evalBinOp .le x c` test
+(`Anneal.BitVecArith.range_refine_ule`). -/
+theorem scalarRange_refine_evalBinOp_le {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} {c : Nat} (hc : c < scalarModulus sz) (hx : ScalarRange sz lo hi x)
+    (hle : Anneal.Scalars.evalBinOp .le x ⟨c, sz⟩ false = some (boolToScalar true)) :
+    ScalarRange sz lo (Anneal.BitVecArith.bvMin hi (BitVec.ofNat (8 * sz) c)) x := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_le_unsigned hsz] at hle
+  have hle' : xb ≤ c := of_decide_eq_true ((boolToScalar_eq_true_iff _).1 (Option.some.inj hle))
+  have hbv : BitVec.ofNat (8 * sz) xb ≤ BitVec.ofNat (8 * sz) c := by
+    show (BitVec.ofNat (8 * sz) xb).toNat ≤ (BitVec.ofNat (8 * sz) c).toNat
+    rw [toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hc]
+    exact hle'
+  have hs := Anneal.BitVecArith.range_refine_ule hx₁ hx₂ hbv
+  exact ⟨rfl, hxb, hs.1, hs.2⟩
+
+/-- Unsigned branch refinement on a taken unsigned `evalBinOp .gt x c` test
+(`Anneal.BitVecArith.range_refine_ugt`). -/
+theorem scalarRange_refine_evalBinOp_gt {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} {c : Nat} (hc : c < scalarModulus sz) (hx : ScalarRange sz lo hi x)
+    (hgt : Anneal.Scalars.evalBinOp .gt x ⟨c, sz⟩ false = some (boolToScalar true)) :
+    ScalarRange sz
+      (Anneal.BitVecArith.bvMax lo (BitVec.ofNat (8 * sz) c + BitVec.ofNat (8 * sz) 1)) hi x := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_gt_unsigned hsz] at hgt
+  have hgt' : c < xb := of_decide_eq_true ((boolToScalar_eq_true_iff _).1 (Option.some.inj hgt))
+  have hbv : BitVec.ofNat (8 * sz) c < BitVec.ofNat (8 * sz) xb := by
+    show (BitVec.ofNat (8 * sz) c).toNat < (BitVec.ofNat (8 * sz) xb).toNat
+    rw [toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hc]
+    exact hgt'
+  have hs := Anneal.BitVecArith.range_refine_ugt hx₁ hx₂ hbv
+  exact ⟨rfl, hxb, hs.1, hs.2⟩
+
+/-- Unsigned branch refinement on a taken unsigned `evalBinOp .ge x c` test
+(`Anneal.BitVecArith.range_refine_uge`). -/
+theorem scalarRange_refine_evalBinOp_ge {sz : Nat} (hsz : 0 < sz) {lo hi : BitVec (8 * sz)}
+    {x : ScalarInt} {c : Nat} (hc : c < scalarModulus sz) (hx : ScalarRange sz lo hi x)
+    (hge : Anneal.Scalars.evalBinOp .ge x ⟨c, sz⟩ false = some (boolToScalar true)) :
+    ScalarRange sz (Anneal.BitVecArith.bvMax lo (BitVec.ofNat (8 * sz) c)) hi x := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  rw [Anneal.Scalars.evalBinOp_ge_unsigned hsz] at hge
+  have hge' : c ≤ xb := of_decide_eq_true ((boolToScalar_eq_true_iff _).1 (Option.some.inj hge))
+  have hbv : BitVec.ofNat (8 * sz) c ≤ BitVec.ofNat (8 * sz) xb := by
+    show (BitVec.ofNat (8 * sz) c).toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat
+    rw [toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hc]
+    exact hge'
+  have hs := Anneal.BitVecArith.range_refine_uge hx₁ hx₂ hbv
+  exact ⟨rfl, hxb, hs.1, hs.2⟩
 
 /-- Range-to-tnum tightening (`Anneal.BitVec.maskEq_clz_of_bounds`): a scalar in `[umin, umax]`
 shares with `umin` every bit above the highest bit where `umin` and `umax` differ. -/
@@ -1844,6 +2640,37 @@ theorem evalCtlzNonzero_eq_clz {sz retBytes : Nat} (hsz : 0 < sz) (hret : 0 < re
   simp only [hnz]
   rw [natMul_eight, ctlzBits_eq_clz]
 
+/-- Leading-zero count is antitone in the unsigned bitvector order: `a ≤ b → clz b ≤ clz a`,
+at every bit width `w` (including `w = 0`). -/
+theorem clz_antitone {w : Nat} {a b : BitVec w} (h : a ≤ b) :
+    Anneal.BitVec.clz b ≤ Anneal.BitVec.clz a := by
+  by_cases hb : b = BitVec.ofNat w 0
+  · subst hb
+    have ha0 : a.toNat = 0 := Nat.eq_zero_of_le_zero h
+    have ha : a = BitVec.ofNat w 0 :=
+      Anneal.BitVec.eq_of_toNat_eq (ha0.trans (Anneal.BitVec.toNat_zero w).symm)
+    subst ha
+    exact Nat.le_refl _
+  · by_cases hle : Anneal.BitVec.clz b ≤ Anneal.BitVec.clz a
+    · exact hle
+    · exfalso
+      have hlt : Anneal.BitVec.clz a < Anneal.BitVec.clz b := Nat.lt_of_not_ge hle
+      have hcb : Anneal.BitVec.clz b ≤ w := Anneal.BitVec.clz_le b
+      have ha_ne : a ≠ BitVec.ofNat w 0 := by
+        intro ha0
+        have hca := (Anneal.BitVec.clz_eq_width_iff a).2 ha0
+        omega
+      have hbit : a.toNat.testBit (w - Anneal.BitVec.clz a - 1) = true :=
+        Anneal.BitVec.getLsbD_sub_clz_sub_one ha_ne
+      have ha_ge : 2 ^ (w - Anneal.BitVec.clz a - 1) ≤ a.toNat :=
+        Nat.ge_two_pow_of_testBit hbit
+      have hb_lt : b.toNat < 2 ^ (w - Anneal.BitVec.clz b) :=
+        Anneal.BitVec.toNat_lt_two_pow_sub_clz b
+      have hpow : 2 ^ (w - Anneal.BitVec.clz b) ≤ 2 ^ (w - Anneal.BitVec.clz a - 1) :=
+        Nat.pow_le_pow_right (by decide) (by omega)
+      have hab : a.toNat ≤ b.toNat := h
+      omega
+
 /-- Range-to-tnum tightening with the mask computed by the MIR `ctlz` kernel on the MIR XOR of
 the interval endpoints (`maskEq_clz_of_bounds` end to end on `Trusted` operations). -/
 theorem scalarTnum_of_scalarRange_ctlzBits {sz : Nat} {umin umax : BitVec (8 * sz)}
@@ -1952,6 +2779,20 @@ theorem toNat_bswapBytes_eq_bswapLoop (n : Nat) (x : BitVec (8 * n)) :
     (Anneal.BitVecArith.bswapBytes n x).toNat =
       Trusted.Rustc.V2026_06_01.MirSemantics.bswapLoop n x.toNat 0 := by
   rw [toNat_bswapBytes_eq_fromBeBytes, bswapLoop_eq_fromBeBytes]
+
+/-- Little-endian serialization of `bswapBytes n x` is big-endian serialization of `x`
+(equivalently, reversing the little-endian bytes of `x`), for every `n` including `n = 0`. -/
+theorem toLeBytes_bswapBytes (n : Nat) (x : BitVec (8 * n)) :
+    Anneal.LeBytes.toLeBytes n (toLeWidth (Anneal.BitVecArith.bswapBytes n x)) =
+      Anneal.LeBytes.toBeBytes n (toLeWidth x) := by
+  unfold Anneal.LeBytes.toLeBytes Anneal.LeBytes.toBeBytes
+  rw [toNat_toLeWidth, toNat_bswapBytes_eq_fromBeBytes]
+  unfold Anneal.LeBytes.fromBeBytes
+  have hlen : (Anneal.LeBytes.toLeBytesAux n x.toNat).reverse.length = n := by
+    rw [List.length_reverse, Anneal.LeBytes.toLeBytesAux_length]
+  have h := Anneal.LeBytes.toLeBytesAux_fromLeBytes (Anneal.LeBytes.toLeBytesAux n x.toNat).reverse
+  rw [hlen] at h
+  exact h
 
 /-- `evalBswap` computes the ported `bswapBytes`, for arbitrary (possibly non-canonical) bits. -/
 theorem evalBswap_eq_bswapBytes {sz : Nat} (hsz : 0 < sz) (bits : Nat) :
@@ -2146,6 +2987,84 @@ theorem map_extractInitBvBytes_of_uniform (prov : Option (Nat × Nat)) :
     rw [ih]
     rfl
 
+/-- Payload extraction distributes over list concatenation (even when `.uninit` bytes are present). -/
+theorem extractInitBvBytes_append :
+    ∀ xs ys : List AbstractByte,
+      extractInitBvBytes (xs ++ ys) = extractInitBvBytes xs ++ extractInitBvBytes ys
+  | [], _ => rfl
+  | .uninit :: rest, ys => extractInitBvBytes_append rest ys
+  | .init b _ :: rest, ys => congrArg (b.toBitVec :: ·) (extractInitBvBytes_append rest ys)
+
+/-- On a fully initialized byte list, `extractInitBvBytes` commutes with `List.take`. -/
+theorem extractInitBvBytes_take :
+    ∀ (n : Nat) (bs : List AbstractByte),
+      allBytesInitialized bs = true →
+        extractInitBvBytes (bs.take n) = (extractInitBvBytes bs).take n
+  | 0, _, _ => rfl
+  | _ + 1, [], _ => rfl
+  | _ + 1, .uninit :: _, h => nomatch h
+  | k + 1, .init b _ :: rest, h => congrArg (b.toBitVec :: ·) (extractInitBvBytes_take k rest h)
+
+/-- On a fully initialized byte list, `extractInitBvBytes` commutes with `List.drop`. -/
+theorem extractInitBvBytes_drop :
+    ∀ (n : Nat) (bs : List AbstractByte),
+      allBytesInitialized bs = true →
+        extractInitBvBytes (bs.drop n) = (extractInitBvBytes bs).drop n
+  | 0, _, _ => rfl
+  | _ + 1, [], _ => rfl
+  | _ + 1, .uninit :: _, h => nomatch h
+  | k + 1, .init _ _ :: rest, h => extractInitBvBytes_drop k rest h
+
+/-- On a fully initialized byte list, `extractInitBvBytes` commutes with `chunksOf n` for every
+`n` (including `n = 0`). -/
+theorem chunksOf_extractInitBvBytes (n : Nat) (bs : List AbstractByte)
+    (hinit : allBytesInitialized bs = true) :
+    (Anneal.ListChunks.chunksOf n bs).map extractInitBvBytes =
+      Anneal.ListChunks.chunksOf n (extractInitBvBytes bs) := by
+  cases Nat.eq_zero_or_pos n with
+  | inl hn =>
+    subst hn
+    rw [Anneal.ListChunks.chunksOf_zero_size, Anneal.ListChunks.chunksOf_zero_size]
+    rfl
+  | inr hn =>
+    suffices haux : ∀ (fuel : Nat) (xs : List AbstractByte),
+        allBytesInitialized xs = true → xs.length ≤ fuel →
+          (Anneal.ListChunks.chunksOfAux n fuel xs).map extractInitBvBytes =
+            Anneal.ListChunks.chunksOfAux n fuel (extractInitBvBytes xs) by
+      have hlen : (extractInitBvBytes bs).length = bs.length :=
+        (length_extractInitBvBytes_eq_iff bs).2 hinit
+      unfold Anneal.ListChunks.chunksOf
+      simp only [Nat.ne_of_gt hn, ↓reduceIte]
+      rw [hlen]
+      exact haux bs.length bs hinit (Nat.le_refl _)
+    intro fuel
+    induction fuel with
+    | zero =>
+      intro xs _ _
+      rfl
+    | succ f ih =>
+      intro xs hxi hle
+      cases xs with
+      | nil => rfl
+      | cons b rest =>
+        cases b with
+        | uninit => nomatch hxi
+        | init byte prov =>
+          show extractInitBvBytes ((AbstractByte.init byte prov :: rest).take n) ::
+              (Anneal.ListChunks.chunksOfAux n f
+                ((AbstractByte.init byte prov :: rest).drop n)).map extractInitBvBytes =
+            (extractInitBvBytes (AbstractByte.init byte prov :: rest)).take n ::
+              Anneal.ListChunks.chunksOfAux n f
+                ((extractInitBvBytes (AbstractByte.init byte prov :: rest)).drop n)
+          rw [extractInitBvBytes_take n _ hxi, ← extractInitBvBytes_drop n _ hxi]
+          have hdrop_init : allBytesInitialized ((AbstractByte.init byte prov :: rest).drop n) = true :=
+            allBytesInitialized_drop n hxi
+          have hdrop_le : ((AbstractByte.init byte prov :: rest).drop n).length ≤ f := by
+            rw [List.length_drop, List.length_cons]
+            rw [List.length_cons] at hle
+            omega
+          rw [ih _ hdrop_init hdrop_le]
+
 /-- `encodeLittleEndianBytes` is the embedded `Anneal.LeBytes.toLeBytesAux` byte list, for every
 byte count (including `n = 0`), every (possibly out-of-range) `bits` and every provenance. Note
 the argument orders: `encodeLittleEndianBytes bits n` vs `toLeBytesAux n bits`. -/
@@ -2231,6 +3150,27 @@ theorem decodeLittleEndianBytes_eq_none_iff (bs : List AbstractByte) :
       cases h
   · exact decodeLittleEndianBytes_eq_none_of_uninit bs
 
+/-- Round trip of `encodeLittleEndianBytes` followed by `decodeLittleEndianBytes` at every byte
+count `n` (including `n = 0`, where provenance collapses to `none`). -/
+theorem decodeLittleEndianBytes_encodeLittleEndianBytes (n v : Nat)
+    (prov : Option (Nat × Nat)) :
+    decodeLittleEndianBytes (encodeLittleEndianBytes v n prov) =
+      some (v % 2 ^ (n * 8), match n with | 0 => none | _ + 1 => prov) := by
+  rw [encodeLittleEndianBytes_eq_map, decodeLittleEndianBytes_map,
+    Anneal.LeBytes.fromLeBytes_toLeBytesAux]
+  cases n <;> rfl
+
+/-- `encodeScalarBytes` rejects exactly zero-width scalars. -/
+theorem encodeScalarBytes_eq_none_iff (sv : ScalarVal) (prov : Option (Nat × Nat)) :
+    encodeScalarBytes sv prov = none ↔ sv.sizeBytes = 0 := by
+  unfold encodeScalarBytes
+  cases h0 : Nat.beq sv.sizeBytes 0 with
+  | true => exact ⟨fun _ => Nat.eq_of_beq_eq_true h0, fun _ => rfl⟩
+  | false =>
+    refine ⟨fun h => ?_, fun h => ?_⟩
+    · cases h
+    · rw [h] at h0; cases h0
+
 /-- `decodeScalarBytes` on a non-empty embedded byte list is `fromLeBytes` at the list's
 length. -/
 theorem decodeScalarBytes_map (prov : Option (Nat × Nat)) {bs : List (BitVec 8)}
@@ -2263,6 +3203,37 @@ theorem decodeScalarBytes_eq_none_of_uninit {bs : List AbstractByte}
   dsimp only
   rw [decodeLittleEndianBytes_eq_none_of_uninit bs h]
   cases Nat.beq (Trusted.Sequence.length bs) 0 <;> rfl
+
+/-- On any non-empty fully initialized byte list (arbitrary, possibly mixed provenance),
+`decodeScalarBytes` returns `fromLeBytes` of the extracted payload at the list's length. -/
+theorem decodeScalarBytes_of_init {bs : List AbstractByte} (hne : bs ≠ [])
+    (hinit : allBytesInitialized bs = true) (signed : Bool) :
+    ∃ prov, decodeScalarBytes bs signed =
+      some (⟨Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs), bs.length⟩, prov) := by
+  obtain ⟨prov, hp⟩ := decodeLittleEndianBytes_of_init bs hinit
+  have hpos : 0 < bs.length := List.length_pos_iff.2 hne
+  refine ⟨prov, ?_⟩
+  unfold decodeScalarBytes
+  dsimp only
+  rw [seqLength_eq, beq_zero_of_pos hpos, hp]
+
+/-- `decodeScalarBytes` fails exactly when the byte list is empty or contains an `.uninit` byte. -/
+theorem decodeScalarBytes_eq_none_iff (bs : List AbstractByte) (signed : Bool) :
+    decodeScalarBytes bs signed = none ↔ bs = [] ∨ allBytesInitialized bs = false := by
+  cases bs with
+  | nil => exact ⟨fun _ => Or.inl rfl, fun _ => rfl⟩
+  | cons b rest =>
+    constructor
+    · intro h
+      cases hi : allBytesInitialized (b :: rest) with
+      | false => exact Or.inr rfl
+      | true =>
+        obtain ⟨p, hp⟩ := decodeScalarBytes_of_init (by simp) hi signed
+        rw [hp] at h
+        cases h
+    · rintro (he | hu)
+      · cases he
+      · exact decodeScalarBytes_eq_none_of_uninit hu signed
 
 /-- Scalar round trip through the byte lists: decoding the little-endian encoding of `v` at a
 positive width `n` returns `v` reduced modulo `2 ^ (n * 8)` (so a non-canonical `v` is
@@ -2447,6 +3418,13 @@ theorem encodeScalarBytes_eq_bitVecLE_encode (sz : Nat) (hNz : 0 < sz) (x : BitV
   unfold encodeScalarBytes
   simp only [beq_zero_of_pos hNz]
   rfl
+
+/-- `bitVecLE.encode` on a byte-swapped value is the reversed encoding of the original value. -/
+theorem bitVecLE_encode_bswapBytes (sz : Nat) (hNz : 0 < sz) (x : BitVec (8 * sz)) :
+    (bitVecLE sz hNz).encode (Anneal.BitVecArith.bswapBytes sz x) =
+      ((bitVecLE sz hNz).encode x).reverse := by
+  rw [bitVecLE_encode_eq_toLeBytes, bitVecLE_encode_eq_toLeBytes, toLeBytes_bswapBytes,
+    Anneal.LeBytes.toBeBytes, List.map_reverse]
 
 /-- Concatenating two `bitVecLE` encodings is the `bitVecLE` encoding of the concatenated
 value at the summed width: the 4-byte-pair / 8-byte-chunk correspondence behind `[u32; 2k]` to
@@ -2665,6 +3643,53 @@ theorem decodeArrayChunksWith_eq_none_of_length_ne (decVal : List AbstractByte �
   rw [decodeArrayChunksWith_eq_chunksOf decVal hn]
   simp only [hne, ↓reduceIte]
 
+/-- `decodeArrayChunksWith` rejects every buffer one of whose `chunksOf n` chunks fails to decode
+(symmetric to `decodeChunks_eq_none_of_chunk`). -/
+theorem decodeArrayChunksWith_eq_none_of_chunk (decVal : List AbstractByte → Option Value)
+    {n : Nat} (hn : 0 < n) (k : Nat) {bs ch : List AbstractByte}
+    (hmem : ch ∈ Anneal.ListChunks.chunksOf n bs) (hch : decVal ch = none) :
+    decodeArrayChunksWith decVal n k bs = none := by
+  rw [decodeArrayChunksWith_eq_chunksOf decVal hn]
+  have hnone : sequenceOptions ((Anneal.ListChunks.chunksOf n bs).map decVal) = none :=
+    sequenceOptions_eq_none_of_mem _ (hch ▸ List.mem_map_of_mem hmem)
+  rw [hnone]
+  cases Nat.decEq bs.length (k * n) with
+  | isTrue he => simp only [he, ↓reduceIte]
+  | isFalse hne => simp only [hne, ↓reduceIte]
+
+/-- Zero-width chunk decoding (`n = 0`) on `[]`: when `decVal [] = some v`, `decodeArrayChunksWith`
+produces `k` copies of `v`, whereas `chunksOf 0 [] = []` has length `0` (so `0 < n` in
+`decodeArrayChunksWith_eq_chunksOf` is genuinely necessary). -/
+theorem decodeArrayChunksWith_zero_width (decVal : List AbstractByte → Option Value)
+    {v : Value} (hv : decVal [] = some v) :
+    ∀ k : Nat, decodeArrayChunksWith decVal 0 k [] = some (List.replicate k v)
+  | 0 => rfl
+  | k + 1 => by
+    unfold decodeArrayChunksWith
+    dsimp only
+    rw [seqLength_eq, takeAbstractBytes_eq_take, dropAbstractBytes_eq_drop]
+    simp only [List.length_nil, Nat.ble_self_eq_true, List.take_nil, List.drop_nil, hv,
+      decodeArrayChunksWith_zero_width decVal hv k, List.replicate_succ]
+
+/-- Zero-width `decodeChunks` (`n = 0`) on `[]`: produces `k` copies of `x` whenever
+`c.decode [] = some x`, demonstrating why `0 < n` is necessary in `decodeChunks_eq_chunksOf`. -/
+theorem decodeChunks_zero_width {α : Type} (c : FixedByteCodec α 0) {x : α}
+    (hx : c.decode [] = some x) :
+    ∀ k : Nat, (c.decodeChunks k []).map Subtype.val = some (List.replicate k x)
+  | 0 => rfl
+  | k + 1 => by
+    have ih := decodeChunks_zero_width c hx k
+    unfold FixedByteCodec.decodeChunks
+    simp only [List.length_nil, Nat.ble_self_eq_true, List.take_nil, List.drop_nil, hx]
+    cases hr : c.decodeChunks k [] with
+    | none => rw [hr] at ih; cases ih
+    | some tl =>
+      rw [hr] at ih
+      obtain ⟨xs, hxs⟩ := tl
+      have hval : xs = List.replicate k x := Option.some.inj ih
+      subst hval
+      rfl
+
 /-- Exact agreement between `FixedByteCodec.decodeChunks` and `Anneal.ListChunks.chunksOf`. -/
 theorem decodeChunks_eq_chunksOf {α : Type} {n : Nat} (c : FixedByteCodec α n) (hn : 0 < n) :
     ∀ (k : Nat) (bs : List AbstractByte),
@@ -2841,6 +3866,44 @@ theorem encodeListWith_injective {sz : Nat} (hNz : 0 < sz)
   have e₂ := FixedByteCodec.encodeListWith_map_eq_encodeElems (bitVecLE sz hNz) toVal encVal hEnc ys
   exact encodeElems_injective (bitVecLE sz hNz) hNz (Option.some.inj (e₁.symm.trans (h.trans e₂)))
 
+/-- Chunking distributes over any successful `Trusted` `encodeListWith` at positive element width
+`n` (no `FixedByteCodec` required): splitting the encoded buffer into `n`-byte chunks recovers
+every element's encoding in order. -/
+theorem chunksOf_of_encodeListWith (encVal : Value → Option (List AbstractByte)) {n : Nat}
+    (hn : 0 < n) : ∀ {vs : List Value} {bs : List AbstractByte},
+    encodeListWith encVal n vs = some bs →
+      (Anneal.ListChunks.chunksOf n bs).map some = vs.map encVal
+  | [], bs, h => by
+    have hbs : bs = [] := (Option.some.inj h).symm
+    subst hbs
+    rw [Anneal.ListChunks.chunksOf_nil]
+    rfl
+  | v :: rest, bs, h => by
+    unfold encodeListWith at h
+    cases he : encVal v with
+    | none => rw [he] at h; cases h
+    | some eBs =>
+      rw [he] at h
+      dsimp only at h
+      cases hbeq : Nat.beq (Trusted.Sequence.length eBs) n with
+      | false => rw [hbeq] at h; cases h
+      | true =>
+        rw [hbeq] at h
+        dsimp only at h
+        cases hr : encodeListWith encVal n rest with
+        | none => rw [hr] at h; cases h
+        | some restBs =>
+          rw [hr] at h
+          have hbs : eBs ++ restBs = bs := by
+            rw [← appendAbstractBytes_eq_append]
+            exact Option.some.inj h
+          subst hbs
+          have hlen : eBs.length = n := Nat.eq_of_beq_eq_true hbeq
+          have hmod : eBs.length % n = 0 := by rw [hlen, Nat.mod_self]
+          rw [Anneal.ListChunks.chunksOf_append_exact hn _ _ hmod, chunksOf_eq_singleton hn hlen,
+            List.singleton_append, List.map_cons, List.map_cons, he,
+            chunksOf_of_encodeListWith encVal hn hr]
+
 /-- The MIR runtime value of an array of `sz`-byte unsigned integers given as bitvectors. -/
 def bitVecArrayValue (sz : Nat) (xs : List (BitVec (8 * sz))) : Value :=
   .aggregate 0 (xs.map (fun x => Value.scalar ⟨x.toNat, sz⟩))
@@ -2852,57 +3915,62 @@ theorem rigidTyByteSize_array_uint (layouts : LayoutTable) (w : UintTy) (n : Nat
       some (MirValueCodec.uintByteSize w * n) := by
   cases w <;> rfl
 
-/-- `encodeValueToBytes` on a non-empty array of unsigned integers given as bitvectors is the
-element-wise `bitVecLE` encoding. -/
+/-- `encodeValueToBytes` on any array of unsigned integers given as bitvectors (including the
+empty array `xs = []`) is the element-wise `bitVecLE` encoding. -/
 theorem encodeValueToBytes_bitVecArray (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx)
-    {xs : List (BitVec (8 * MirValueCodec.uintByteSize w))} (hne : xs ≠ []) :
+    (xs : List (BitVec (8 * MirValueCodec.uintByteSize w))) :
     encodeValueToBytes defaultCodecFuel layouts
         { kind := .array (.uint w) xs.length, layoutIdx := idx }
         (bitVecArrayValue (MirValueCodec.uintByteSize w) xs) =
       some ((bitVecLE (MirValueCodec.uintByteSize w)
         (MirValueCodec.uintByteSize_pos w)).encodeElems xs) := by
-  have hk : 0 < xs.length := List.length_pos_iff.2 hne
-  have h := (MirValueCodec.uintArray layouts w xs.length hk idx).encode_toValue
-    ⟨xs.map (fun x => (⟨x.toNat, x.isLt⟩ :
-      { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩
-  rw [encodeElems_bitVecLE_eq_uintBitsLE]
-  have hv : bitVecArrayValue (MirValueCodec.uintByteSize w) xs =
-      (MirValueCodec.uintArray layouts w xs.length hk idx).toValue
-        ⟨xs.map (fun x => (⟨x.toNat, x.isLt⟩ :
-          { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩ := by
-    show Value.aggregate 0 _ = Value.aggregate 0 _
-    rw [List.map_map]
-    rfl
-  rw [hv]
-  exact h
+  cases xs with
+  | nil => rfl
+  | cons y ys =>
+    have hk : 0 < (y :: ys).length := Nat.succ_pos ys.length
+    have h := (MirValueCodec.uintArray layouts w (y :: ys).length hk idx).encode_toValue
+      ⟨(y :: ys).map (fun x => (⟨x.toNat, x.isLt⟩ :
+        { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩
+    rw [encodeElems_bitVecLE_eq_uintBitsLE]
+    have hv : bitVecArrayValue (MirValueCodec.uintByteSize w) (y :: ys) =
+        (MirValueCodec.uintArray layouts w (y :: ys).length hk idx).toValue
+          ⟨(y :: ys).map (fun x => (⟨x.toNat, x.isLt⟩ :
+            { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩ := by
+      show Value.aggregate 0 _ = Value.aggregate 0 _
+      rw [List.map_map]
+      rfl
+    rw [hv]
+    exact h
 
-/-- `decodeValueFromBytes` recovers a non-empty array of unsigned integers from its element-wise
-`bitVecLE` encoding. -/
+/-- `decodeValueFromBytes` recovers any array of unsigned integers (including the empty array
+`xs = []`) from its element-wise `bitVecLE` encoding. -/
 theorem decodeValueFromBytes_encodeElems_bitVecLE (layouts : LayoutTable) (w : UintTy)
-    (idx : LayoutIdx) {xs : List (BitVec (8 * MirValueCodec.uintByteSize w))} (hne : xs ≠ []) :
+    (idx : LayoutIdx) (xs : List (BitVec (8 * MirValueCodec.uintByteSize w))) :
     decodeValueFromBytes defaultCodecFuel layouts
         { kind := .array (.uint w) xs.length, layoutIdx := idx }
         ((bitVecLE (MirValueCodec.uintByteSize w)
           (MirValueCodec.uintByteSize_pos w)).encodeElems xs) =
       some (bitVecArrayValue (MirValueCodec.uintByteSize w) xs) := by
-  have hk : 0 < xs.length := List.length_pos_iff.2 hne
-  have m := MirValueCodec.uintArray layouts w xs.length hk idx
-  rw [encodeElems_bitVecLE_eq_uintBitsLE,
-    (MirValueCodec.uintArray layouts w xs.length hk idx).decode_eq_map]
-  have hdec := (MirValueCodec.uintArray layouts w xs.length hk idx).codec.decode_encode
-    ⟨xs.map (fun x => (⟨x.toNat, x.isLt⟩ :
-      { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩
-  have henc : (MirValueCodec.uintArray layouts w xs.length hk idx).codec.encode
-      ⟨xs.map (fun x => (⟨x.toNat, x.isLt⟩ :
-        { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩ =
-      (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w)
-        (MirValueCodec.uintByteSize_pos w)).encodeElems
-        (xs.map (fun x => (⟨x.toNat, x.isLt⟩ :
-          { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) }))) := rfl
-  rw [← henc, hdec, Option.map_some]
-  show some (Value.aggregate 0 _) = some (Value.aggregate 0 _)
-  rw [List.map_map]
-  rfl
+  cases xs with
+  | nil => rfl
+  | cons y ys =>
+    have hk : 0 < (y :: ys).length := Nat.succ_pos ys.length
+    rw [encodeElems_bitVecLE_eq_uintBitsLE,
+      (MirValueCodec.uintArray layouts w (y :: ys).length hk idx).decode_eq_map]
+    have hdec := (MirValueCodec.uintArray layouts w (y :: ys).length hk idx).codec.decode_encode
+      ⟨(y :: ys).map (fun x => (⟨x.toNat, x.isLt⟩ :
+        { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩
+    have henc : (MirValueCodec.uintArray layouts w (y :: ys).length hk idx).codec.encode
+        ⟨(y :: ys).map (fun x => (⟨x.toNat, x.isLt⟩ :
+          { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) })), List.length_map _⟩ =
+        (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w)
+          (MirValueCodec.uintByteSize_pos w)).encodeElems
+          ((y :: ys).map (fun x => (⟨x.toNat, x.isLt⟩ :
+            { bits : Nat // bits < 2 ^ (8 * MirValueCodec.uintByteSize w) }))) := rfl
+    rw [← henc, hdec, Option.map_some]
+    show some (Value.aggregate 0 _) = some (Value.aggregate 0 _)
+    rw [List.map_map]
+    rfl
 
 /-- `BitValidity` array-trait compatibility: any value of `[uA; n₁]` transmutes soundly to
 `[uB; n₂]` whenever the byte sizes agree (`array_uint_isIntoBytes`, `array_uint_isFromBytes`,
@@ -2919,18 +3987,17 @@ theorem array_uint_transmute_sound (layouts : LayoutTable) (w₁ w₂ : UintTy) 
     (array_uint_isIntoBytes layouts w₁ n₁ idx₁) (array_uint_isFromBytes layouts w₂ n₂ idx₂)
     (by rw [rigidTyByteSize_array_uint, rigidTyByteSize_array_uint, hsize]) v bs hEnc
 
-/-- Typed transmutation of bitvector arrays: the bytes of a non-empty `[uA; n₁]` array given as
-bitvectors decode at `[uB; n₂]` whenever the byte sizes agree. -/
+/-- Typed transmutation of bitvector arrays (including the empty array `xs = []`): the bytes of
+any `[uA; n₁]` array given as bitvectors decode at `[uB; n₂]` whenever the byte sizes agree. -/
 theorem bitVecArray_transmute_sound (layouts : LayoutTable) (w₁ w₂ : UintTy) (n₂ : Nat)
-    (idx₁ idx₂ : LayoutIdx) {xs : List (BitVec (8 * MirValueCodec.uintByteSize w₁))}
-    (hne : xs ≠ [])
+    (idx₁ idx₂ : LayoutIdx) (xs : List (BitVec (8 * MirValueCodec.uintByteSize w₁)))
     (hsize : MirValueCodec.uintByteSize w₁ * xs.length = MirValueCodec.uintByteSize w₂ * n₂) :
     ∃ v', decodeValueFromBytes defaultCodecFuel layouts
       { kind := .array (.uint w₂) n₂, layoutIdx := idx₂ }
       ((bitVecLE (MirValueCodec.uintByteSize w₁)
         (MirValueCodec.uintByteSize_pos w₁)).encodeElems xs) = some v' :=
   array_uint_transmute_sound layouts w₁ w₂ xs.length n₂ idx₁ idx₂ hsize _ _
-    (encodeValueToBytes_bitVecArray layouts w₁ idx₁ hne)
+    (encodeValueToBytes_bitVecArray layouts w₁ idx₁ xs)
 
 /-! ## 10. Derived Transfers: Abstraction Normalization, Signed Casts and `ctlz` from Ranges -/
 
@@ -2986,6 +4053,36 @@ theorem scalarTnum_evalCastValue_signed {srcSz dstSz : Nat} (hs : 0 < srcSz) (hd
   exact ⟨_, evalCastValue_signed_eq_signExtend hs hd xb,
     scalarTnum_of_bitVec _ (Anneal.BitVecArith.tnum_signExtend_sound (8 * dstSz) hxm)⟩
 
+/-- Unsigned `evalCastValue` on a canonical operand computes ported `Anneal.BitVec.setWidth`
+(zero-extension when widening, low-bit truncation when narrowing). Canonicality is required when
+widening because `evalCastValue` does not wrap the source before modding by the destination. -/
+theorem evalCastValue_unsigned_eq_setWidth {srcSz dstSz : Nat} (hs : 0 < srcSz) (hd : 0 < dstSz)
+    {bits : Nat} (hb : bits < scalarModulus srcSz) :
+    Anneal.Scalars.evalCastValue ⟨bits, srcSz⟩ dstSz false =
+      some ⟨(Anneal.BitVec.setWidth (8 * dstSz) (BitVec.ofNat (8 * srcSz) bits)).toNat, dstSz⟩ := by
+  rw [Anneal.Scalars.evalCastValue_unsigned_apply hs hd, Anneal.BitVec.toNat_setWidth, natMod_eq,
+    natPow_eq, toNat_ofNat_of_lt hb]
+
+/-- Unconditional unsigned `evalCastValue` bridge using `wrapScalarBits` canonicalization. -/
+theorem evalCastValue_unsigned_wrap_eq_setWidth {srcSz dstSz : Nat} (hs : 0 < srcSz)
+    (hd : 0 < dstSz) (bits : Nat) :
+    Anneal.Scalars.evalCastValue ⟨wrapScalarBits bits (scalarModulus srcSz), srcSz⟩ dstSz false =
+      some ⟨(Anneal.BitVec.setWidth (8 * dstSz) (BitVec.ofNat (8 * srcSz) bits)).toNat, dstSz⟩ := by
+  have hlt : wrapScalarBits bits (scalarModulus srcSz) < scalarModulus srcSz := by
+    rw [wrapScalarBits_eq_toNat]
+    exact toNat_lt_scalarModulus _
+  rw [evalCastValue_unsigned_eq_setWidth hs hd hlt, wrapScalarBits_eq_toNat, ofNat_toNat_self]
+
+/-- Tnum transfer through an unsigned integer cast (`Anneal.BitVecArith.tnum_setWidth_sound`). -/
+theorem scalarTnum_evalCastValue_unsigned {srcSz dstSz : Nat} (hs : 0 < srcSz) (hd : 0 < dstSz)
+    {m v : BitVec (8 * srcSz)} {x : ScalarInt} (hx : ScalarTnum srcSz m v x) :
+    ∃ r, Anneal.Scalars.evalCastValue x dstSz false = some r ∧
+      ScalarTnum dstSz (Anneal.BitVec.setWidth (8 * dstSz) m)
+        (Anneal.BitVec.setWidth (8 * dstSz) v) r := by
+  obtain ⟨xb, rfl, hxb, hxm⟩ := scalarTnum_exists hx
+  exact ⟨_, evalCastValue_unsigned_eq_setWidth hs hd hxb,
+    scalarTnum_of_bitVec _ (Anneal.BitVecArith.tnum_setWidth_sound (8 * dstSz) hxm)⟩
+
 /-- The ported leading-zero count of a value whose highest set bit is bit `k`. -/
 theorem clz_eq_of_bounds {w k : Nat} (x : BitVec w) (hk : k < w) (hlo : 2 ^ k ≤ x.toNat)
     (hhi : x.toNat < 2 ^ (k + 1)) : Anneal.BitVec.clz x = w - 1 - k := by
@@ -3026,6 +4123,71 @@ theorem scalarRange_evalCtlz {sz retBytes k : Nat} (hsz : 0 < sz) (hret : 0 < re
   have h₂ : (BitVec.ofNat (8 * sz) xb).toNat ≤ hi.toNat := hx₂
   rw [toNat_ofNat_of_lt hxb] at h₁ h₂
   exact evalCtlz_eq_of_bounds hsz hret hk (Nat.le_trans hlo h₁) (Nat.lt_of_le_of_lt h₂ hhi)
+
+/-- General antitone interval transfer through `evalCtlz`: for *any* unsigned interval `[lo, hi]`
+(even spanning multiple bit lengths) whose width fits in `retBytes`, `evalCtlz x retBytes`
+lies in `[clz hi, clz lo]`. -/
+theorem scalarRange_evalCtlz_range {sz retBytes : Nat} (hsz : 0 < sz) (hret : 0 < retBytes)
+    (hfit : 8 * sz < scalarModulus retBytes)
+    {lo hi : BitVec (8 * sz)} {x : ScalarInt} (hx : ScalarRange sz lo hi x) :
+    ∃ r, evalCtlz x retBytes = some r ∧
+      ScalarRange retBytes (BitVec.ofNat (8 * retBytes) (Anneal.BitVec.clz hi))
+        (BitVec.ofNat (8 * retBytes) (Anneal.BitVec.clz lo)) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  have hlo_lt : Anneal.BitVec.clz hi < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le hi) hfit
+  have hhi_lt : Anneal.BitVec.clz lo < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le lo) hfit
+  have hcur_lt : Anneal.BitVec.clz (BitVec.ofNat (8 * sz) xb) < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le _) hfit
+  refine ⟨_, evalCtlz_eq_clz hsz hret xb, scalarRange_iff_bits.2 ⟨hcur_lt, ?_, ?_⟩⟩
+  · rw [toNat_ofNat_of_lt hlo_lt]; exact clz_antitone hx₂
+  · rw [toNat_ofNat_of_lt hhi_lt]; exact clz_antitone hx₁
+
+/-- Non-zero interval transfer through `evalCtlzNonzero`: whenever `0 < lo.toNat`, `evalCtlzNonzero`
+never hits UB and its result lies in `[clz hi, clz lo]` (strictly below `8 * sz`). -/
+theorem scalarRange_evalCtlzNonzero_range {sz retBytes : Nat} (hsz : 0 < sz) (hret : 0 < retBytes)
+    (hfit : 8 * sz < scalarModulus retBytes)
+    {lo hi : BitVec (8 * sz)} {x : ScalarInt} (hx : ScalarRange sz lo hi x) (hpos : 0 < lo.toNat) :
+    ∃ r, evalCtlzNonzero x retBytes = some r ∧ r.bits < 8 * sz ∧
+      ScalarRange retBytes (BitVec.ofNat (8 * retBytes) (Anneal.BitVec.clz hi))
+        (BitVec.ofNat (8 * retBytes) (Anneal.BitVec.clz lo)) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  have hne : BitVec.ofNat (8 * sz) xb ≠ BitVec.ofNat (8 * sz) 0 := by
+    intro hz
+    have hle : lo.toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat := hx₁
+    rw [hz, Anneal.BitVec.toNat_zero] at hle
+    omega
+  have hev := evalCtlzNonzero_eq_clz hsz hret hne
+  have hlo_lt : Anneal.BitVec.clz hi < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le hi) hfit
+  have hhi_lt : Anneal.BitVec.clz lo < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le lo) hfit
+  have hcur_lt : Anneal.BitVec.clz (BitVec.ofNat (8 * sz) xb) < scalarModulus retBytes :=
+    Nat.lt_of_le_of_lt (Anneal.BitVec.clz_le _) hfit
+  refine ⟨_, hev.1, hev.2, scalarRange_iff_bits.2 ⟨hcur_lt, ?_, ?_⟩⟩
+  · rw [toNat_ofNat_of_lt hlo_lt]; exact clz_antitone hx₂
+  · rw [toNat_ofNat_of_lt hhi_lt]; exact clz_antitone hx₁
+
+/-- Exact interval transfer through `evalCtlzNonzero` when the highest set bit is fixed at `k`. -/
+theorem scalarRange_evalCtlzNonzero {sz retBytes k : Nat} (hsz : 0 < sz) (hret : 0 < retBytes)
+    {lo hi : BitVec (8 * sz)} {x : ScalarInt} (hx : ScalarRange sz lo hi x) (hk : k < 8 * sz)
+    (hlo : 2 ^ k ≤ lo.toNat) (hhi : hi.toNat < 2 ^ (k + 1)) :
+    evalCtlzNonzero x retBytes = some ⟨8 * sz - 1 - k, retBytes⟩ := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  have h₁ : lo.toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat := hx₁
+  have h₂ : (BitVec.ofNat (8 * sz) xb).toNat ≤ hi.toNat := hx₂
+  have hpow : 0 < 2 ^ k := Nat.two_pow_pos k
+  have hne : BitVec.ofNat (8 * sz) xb ≠ BitVec.ofNat (8 * sz) 0 := by
+    intro hz
+    rw [hz, Anneal.BitVec.toNat_zero] at h₁
+    omega
+  have hev := (evalCtlzNonzero_eq_clz hsz hret hne).1
+  rw [toNat_ofNat_of_lt hxb] at h₁ h₂
+  have hclz : Anneal.BitVec.clz (BitVec.ofNat (8 * sz) xb) = 8 * sz - 1 - k :=
+    clz_eq_of_bounds _ hk (by rw [toNat_ofNat_of_lt hxb]; exact Nat.le_trans hlo h₁)
+      (by rw [toNat_ofNat_of_lt hxb]; exact Nat.lt_of_le_of_lt h₂ hhi)
+  rw [hev, hclz]
 
 /-- A fully-known tnum on a literal scalar determines its bits (stated on `⟨b, sz⟩` so that the
 conclusion mentions `b` verbatim, without a structure projection). -/
@@ -3072,6 +4234,15 @@ theorem evalBinOp_shr_unsigned_eq_extractBits {szL szR : Nat} (hszL : 0 < szL) (
       some ⟨(Anneal.BitVecArith.extractBits
         (BitVec.ofNat (8 * szL + b % (8 * szL)) a) (b % (8 * szL)) (8 * szL)).toNat, szL⟩ := by
   rw [Anneal.Scalars.evalBinOp_shr_unsigned hszL hszR, shiftRight_mod_eq_extractBits]
+
+/-- Unconditional form of the unsigned operational `Trusted` `evalScalarBinOp .shr` bridge. -/
+theorem evalScalarBinOp_shr_unsigned_eq_extractBits {szL szR : Nat} (hszL : 0 < szL)
+    (hszR : 0 < szR) (a b : Nat) (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp .shr ⟨a, szL⟩ ⟨b, szR⟩ locals mem false =
+      .ok (.scalar ⟨(Anneal.BitVecArith.extractBits
+        (BitVec.ofNat (8 * szL + b % (8 * szL)) a) (b % (8 * szL)) (8 * szL)).toNat, szL⟩)
+        locals mem := by
+  rw [Anneal.Scalars.evalScalarBinOp_shr_unsigned hszL hszR, shiftRight_mod_eq_extractBits]
 
 /-- Chunk width `0` is degenerate: `chunksOf 0` returns no chunks at all, so
 `chunksOf_encodeElems` genuinely needs `0 < n`. -/
