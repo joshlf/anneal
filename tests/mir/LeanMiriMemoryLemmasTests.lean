@@ -1856,6 +1856,63 @@ theorem wit_deepPattern150_vendored_visit :
       (ValidityVisitor.visit deepPatternHooks () 150 init root ()) = true :=
   deepPattern150_vendored_visit
 
+/-! ### 3e'. General adequacy of the unmodified vendored `ValidityVisitor.visit` (`RealVisit`) -/
+
+/-- The vendored `visit` at fuel `453 > 3 * 150 + 2` equals the fuel-free `lean-miri#90`
+`realVisitNoFuel` at depth 150, by the *general* adequacy theorem (no evaluation involved). -/
+theorem wit_deepPattern150_vendored_eq_realVisitNoFuel (session : Session CtfeProvenance) :
+    ValidityVisitor.visit deepPatternHooks () 453 session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩ =
+      RealVisit.realVisitNoFuel deepPatternHooks () id session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩ :=
+  RealVisit.deepPattern_vendored_visit_eq_noFuel 150 453 _ session (by decide)
+
+/-- Fuel-free real `visit` succeeds at depth 150 in the kernel (transported through the
+structural, `Classical.choice`-free `realVisitRank`), and also agrees with vendored fuel `151`. -/
+theorem wit_deepPattern150_realVisitNoFuel_ok :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"Root", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    resultOk (RealVisit.realVisitNoFuel deepPatternHooks () id init root ()) = true ∧
+      resultOk (RealVisit.realVisitRank deepPatternHooks () id init root ()) = true := by
+  intro root init
+  have hr : RealVisit.realVisitRank deepPatternHooks () id init root =
+      RealVisit.realVisitNoFuel deepPatternHooks () id init root :=
+    RealVisit.realVisitRank_eq_noFuel _ _ _ _ _ rfl
+  refine ⟨?_, ?_⟩
+  · rw [← hr]; decide +kernel
+  · decide +kernel
+
+/-- Small fuel on the vendored `visit` exhausts at depth 150 for *every* fuel `≤ 150`, while the
+fuel-free traversal succeeds. -/
+theorem wit_deepPattern150_vendored_small_fuel_exhausts :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"Root", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    (List.range 151).all (fun fuel =>
+      resultExhausted "validity traversal fuel"
+        (ValidityVisitor.visit deepPatternHooks () fuel init root ())) = true := by
+  decide +kernel
+
+/-- Negative witness: a self-looping `.pattern` projection is deterministically rejected by the
+fuel-free real `visit` (`.invalidProgram "validity projection does not descend"`), while the
+vendored `visit` only exhausts its fuel. -/
+theorem wit_selfPattern_rejected :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨7, wrapperLayout⟩⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"Root", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    RealVisit.resultInvalidProgram "validity projection does not descend"
+        (RealVisit.realVisitNoFuel RealVisit.selfPatternHooks () id init root ()) = true ∧
+      resultExhausted "validity traversal fuel"
+        (ValidityVisitor.visit RealVisit.selfPatternHooks () 151 init root ()) = true :=
+  RealVisit.selfPattern_noFuel_rejects_vendored_exhausts
+
 /-! ### 3f. Dynamic hook-boundary violations, `unionWrapper`, and LIFO pointee draining -/
 
 /-- A projection hook that returns the place itself (a by-value cycle). -/
