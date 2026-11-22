@@ -432,6 +432,73 @@
       ]
     },
     {
+      "module": "Workbench.Pass1.ClassicalEm",
+      "path": "lean/Workbench/Pass1/ClassicalEm.lean",
+      "badge": "pass1_portable",
+      "summary": "Anneal's 51 locked `Init.*` foundation modules exclude `Init.Classical`, and `TrustedBoundary.allowedTheoryTacticKinds` excludes `by_cases`. This module derives Diaconescu's theorem (`prop_em : p ∨ ¬ p`), double-negation elimination (`of_not_not`), proof by contradiction (`by_contra`), and existential witness selection (`chooseExists` / `chooseExists_spec`) directly from `Init.Core` using only `[propext, Classical.choice]` and allowed Pass-1 tactics (`0` `._unsafe_rec`). Usage in Pass-1 proofs (replacing `by_cases h : P`): ```lean cases prop_em P with | inl h => ... | inr h => ... ```",
+      "line_count": 134,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.Tactics"
+      ],
+      "declaration_count": 13,
+      "declarations": [
+        {
+          "kind": "def",
+          "name": "chooseSub"
+        },
+        {
+          "kind": "theorem",
+          "name": "chooseSub_spec"
+        },
+        {
+          "kind": "def",
+          "name": "chooseBool"
+        },
+        {
+          "kind": "theorem",
+          "name": "chooseBool_spec"
+        },
+        {
+          "kind": "theorem",
+          "name": "chooseBool_congr"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_eq_or_ne"
+        },
+        {
+          "kind": "theorem",
+          "name": "prop_em"
+        },
+        {
+          "kind": "theorem",
+          "name": "of_not_not"
+        },
+        {
+          "kind": "theorem",
+          "name": "by_contra"
+        },
+        {
+          "kind": "theorem",
+          "name": "imp_iff_not_or"
+        },
+        {
+          "kind": "theorem",
+          "name": "not_and_iff_or_not"
+        },
+        {
+          "kind": "def",
+          "name": "chooseExists"
+        },
+        {
+          "kind": "theorem",
+          "name": "chooseExists_spec"
+        }
+      ]
+    },
+    {
       "module": "Workbench.Pass1.Firewall",
       "path": "lean/Workbench/Pass1/Firewall.lean",
       "badge": "pass1_portable",
@@ -1586,14 +1653,15 @@
       "path": "lean/Workbench/Pass1.lean",
       "badge": "pass1_portable",
       "summary": "",
-      "line_count": 15,
+      "line_count": 16,
       "imports": [
         "Workbench.Pass1.InitLemmas",
         "Workbench.Pass1.Firewall",
         "Workbench.Pass1.SpineForce",
         "Workbench.Pass1.PTree",
         "Workbench.Pass1.LinearArith",
-        "Workbench.Pass1.BitTrieLrat"
+        "Workbench.Pass1.BitTrieLrat",
+        "Workbench.Pass1.ClassicalEm"
       ],
       "declaration_count": 0,
       "declarations": []

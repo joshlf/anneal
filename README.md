@@ -40,6 +40,9 @@ scripts.
     - `BitTrieLrat.lean`: Radix-2 trie RUP/LRAT propositional UNSAT checker
       (`checkRupProof_sound`) — drop-in Pass-1 replacement for boolean
       `bv_decide`.
+    - `ClassicalEm.lean`: Diaconescu's `prop_em : p ∨ ¬ p`, `by_contra`, and
+      `chooseExists` over `prelude` + `Init.Core` without `Init.Classical`
+      (replacing banned `by_cases` via `cases prop_em P`).
   - `Workbench/Lab/` (`lab_meta` — rapid falsification & profiling):
     - `Counterexample.lean`: SplitMix64 + boundary-seed counterexample search
       (`findCounterexample1/2/3`) and 3-axis spec vacuity/output-sensitivity

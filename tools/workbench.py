@@ -54,7 +54,7 @@ def find_build_wrapper(disable_wrapper: bool) -> list[str]:
         shutil.which("anneal-lean-run"),
     ):
         if candidate and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return [candidate, "--"]
+            return [candidate, "--mode", "file", "--"]
     return []
 
 
