@@ -311,9 +311,10 @@ and 64-bit `usize` length (`n < scalarModulus 8`). Rejects mutability upgrades
 
 When `treeBorrows = true`, `annealCastHooksNullaryPtr` additionally enforces the
 live Tree Borrows tag-permission check (`npCheckUnsizeTreeBorrowsPerm` /
-`npUnsizeTreeBorrowsPermCheck`), rejecting unregistered or `.Disabled` tags for
-every slice target and `.Frozen` tags for mutable slice targets (`&mut [T]` /
-`*mut [T]`), matching Trusted `unsizeBorrowPermCompatible` and
+`npUnsizeTreeBorrowsPermCheck`), rejecting `.Disabled` tags for every slice
+target and `.Frozen` tags for mutable slice targets (`&mut [T]` / `*mut [T]`),
+and accepting a tag that is not registered in the borrow tree, matching Trusted
+`unsizeBorrowPermCompatible` and
 `evalUnsizeCoercion`'s inline `borrowValid` check
 (`npUnsizeTreeBorrowsPermCheck_eq_trusted_universal`,
 `lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness`). -/
@@ -586,30 +587,47 @@ def npActiveUnsizeTargetMut? (currentBody : CapturedMir) (st : AnnealStepState) 
     | .unwinding _ => none
   | none => none
 
-/-- Check whether `tag` in `tree` has sufficient Tree Borrows permission across
-`[startNat, startNat + max 1 spanBytes)` for an `Unsize` coercion
-(`isMutTarget = true` for `&mut [T]` / `*mut [T]`, `false` for `&[T]` /
-`*const [T]`), mirroring Trusted `unsizeBorrowPermCompatible` /
+/-- Check whether `tag` in `tree` has sufficient Tree Borrows permission for an
+`Unsize` coercion of a pointer at byte offset `startNat` whose slice spans
+`spanBytes` bytes (`isMutTarget = true` for `&mut [T]` / `*mut [T]`, `false` for
+`&[T]` / `*const [T]`), mirroring Trusted `unsizeBorrowPermCompatible` /
 `evalUnsizeCoercion.borrowValid`:
-* unregistered tag (`tree.tagMapping.get tag = none`) -> UB;
-* `.Disabled` permission at any overlapping segment -> UB for every target;
-* `.Frozen` permission at any overlapping segment when `isMutTarget = true` -> UB;
+* a tag that is not registered in `tree` passes, exactly as Trusted accepts a
+  pointer whose tag has no `BorrowEntry` (`lookupBorrow … = none`); a cast is not
+  a memory access, so the vendored `.MissingTag` access error does not apply;
+* `.Disabled` permission at any probed segment -> UB for every target;
+* `.Frozen` permission at any probed segment when `isMutTarget = true` -> UB;
 * `.Frozen` for const targets and `.Unique` / `.ReservedFrz _` / `.ReservedIM` /
-  `.Cell` for all targets -> `.ok ()`. -/
+  `.Cell` for all targets -> `.ok ()`.
+
+The probed window is `[startNat, startNat + spanBytes)`. Trusted's check does
+not depend on the slice length, so a zero-length coercion (`[T; 0]`, or a
+zero-sized element type) still probes one byte: the byte at `startNat`, or, for
+a pointer at or past the end of the tracked range (one past the end), the last
+tracked byte. A tracked allocation of size zero has no location states, so the
+check passes there, while Trusted (whose permission is per borrow entry rather
+than per byte) can still reject (`lm_np_v2_unsize_tb_perm_edge_cases_witness`). -/
 def npUnsizeTreeBorrowsPermCheck (tree : Miri.TreeBorrows.BorrowTree)
     (tag : Miri.Memory.BorTag) (startNat spanBytes : Nat) (isMutTarget : Bool) :
     Except Miri.Interpreter.StepError Unit :=
   match tree.tagMapping.get tag with
-  | none =>
-    .error (.undefinedBehavior "Tree Borrows unregistered tag on Unsize pointer coercion")
+  | none => .ok ()
   | some tagIdx =>
-    let endNat := startNat + max 1 spanBytes
+    let trackedEnd : Nat :=
+      tree.locations.entries.foldl
+        (fun (acc : Nat)
+            (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) =>
+          max acc seg.range.stop.toNat) 0
+    let probeStart : Nat :=
+      if spanBytes = 0 ∧ trackedEnd ≤ startNat ∧ 0 < trackedEnd then trackedEnd - 1
+      else startNat
+    let endNat := probeStart + max 1 spanBytes
     let checkSeg (_ : Unit)
         (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
         Except Miri.Interpreter.StepError Unit :=
       let s0 := seg.range.start.toNat
       let s1 := seg.range.stop.toNat
-      if s0 < endNat && startNat < s1 then
+      if s0 < endNat && probeStart < s1 then
         let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
           match seg.data.perms.get tagIdx with
           | some ls => some ls
@@ -1819,10 +1837,11 @@ theorem npUnsizeTreeBorrowsPermCheck_eq_trusted_universal (perm : TreeBorrowPerm
 3. Stepped through unmodified vendored `Miri.Interpreter.Step.step` over live
    `BorrowTree` allocations (`npMachine5Tree`), `annealStepHooksNullaryPtr` in
    `treeBorrows = true` mode achieves **2-way UB agreement** with Trusted on
-   `.disabled -> *const [u32]`, `.frozen -> *mut [u32]`,
-   `.frozen -> &mut [u32]`, and unregistered tags (`⟨999⟩`), and **2-way positive
-   agreement** (`3`) on `.frozen -> *const [u32]`, `.unique -> *mut [u32]`, and
-   `.unique -> &mut [u32]`;
+   `.disabled -> *const [u32]`, `.frozen -> *mut [u32]`, and
+   `.frozen -> &mut [u32]`, and **2-way positive agreement** (`3`) on
+   `.frozen -> *const [u32]`, `.unique -> *mut [u32]`, `.unique -> &mut [u32]`,
+   and a tag (`⟨999⟩`) that is not registered in the borrow tree (Trusted accepts
+   a pointer whose tag has no `BorrowEntry`);
 4. Genuine `treeBorrows = false` vs. `true` mode sensitivity on `Unsize`: in
    basic mode (`treeBorrows = false`), `.disabled -> *const [u32]`,
    `.frozen -> *mut [u32]`, and `.frozen -> &mut [u32]` all return `.usizeVal 3`,
@@ -1888,11 +1907,10 @@ theorem lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness :
       (mkNpUnsizeState npUnsizeRefMutToMutMir npRefMutArr3U32MirTy npRefMutSliceU32MirTy
         childPtr (npMachine5Tree .frozen))).map (·.2) =
       .error (.undefinedBehavior "Tree Borrows frozen tag on mutable Unsize pointer coercion") ∧
-    (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToConstMir true) 8
-      (mkNpUnsizeState npUnsizeMutToConstMir npRawMutArr3U32MirTy rawConstSliceU32MirTy
-        unregPtr (npMachine5Tree .unique))).map (·.2) =
-      .error (.undefinedBehavior "Tree Borrows unregistered tag on Unsize pointer coercion") ∧
     -- 4. LeanMiri `treeBorrows = true` 2-way positive agreement
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToConstMir true) 8
+      (mkNpUnsizeState npUnsizeMutToConstMir npRawMutArr3U32MirTy rawConstSliceU32MirTy
+        unregPtr (npMachine5Tree .unique))) = .usizeVal 3 ∧
     npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToConstMir true) 8
       (mkNpUnsizeState npUnsizeMutToConstMir npRawMutArr3U32MirTy rawConstSliceU32MirTy
         childPtr (npMachine5Tree .frozen))) = .usizeVal 3 ∧
@@ -1917,6 +1935,174 @@ theorem lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness :
           by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **Zero-Length `Unsize` Tree Borrows Permission Correspondence**: for a
+zero-length coercion (`spanBytes = 0`) of a pointer in the interior (offset `4`)
+and one past the end (offset `12`) of the 12-byte tracked range, across ALL
+`TreeBorrowPerm` states and BOTH target mutabilities,
+`npUnsizeTreeBorrowsPermCheck` agrees with Trusted `unsizeBorrowPermCompatible`
+(whose verdict does not depend on the slice length). -/
+theorem npUnsizeTreeBorrowsPermCheck_zero_len_eq_trusted_universal (perm : TreeBorrowPerm)
+    (isMutTarget : Bool) :
+    (npUnsizeTreeBorrowsPermCheck (npArr3U32Tree perm) retagChildTag 4 0 isMutTarget).isOk =
+      unsizeBorrowPermCompatible
+        [{ tag := 5, targetLocal := 3, targetProjection := [], perm := perm,
+           targetFrameDepth := 0 }]
+        5 (if isMutTarget then .rawPtr .mut (.slice (.uint .u32))
+           else .rawPtr .not (.slice (.uint .u32))) ∧
+    (npUnsizeTreeBorrowsPermCheck (npArr3U32Tree perm) retagChildTag 12 0 isMutTarget).isOk =
+      unsizeBorrowPermCompatible
+        [{ tag := 5, targetLocal := 3, targetProjection := [], perm := perm,
+           targetFrameDepth := 0 }]
+        5 (if isMutTarget then .rawPtr .mut (.slice (.uint .u32))
+           else .rawPtr .not (.slice (.uint .u32))) := by
+  cases perm with
+  | reservedFrz b => cases b <;> cases isMutTarget <;> decide +kernel
+  | _ => cases isMutTarget <;> decide +kernel
+
+@[reducible] private def npRawMutArr0U32MirTy : Ty :=
+  { kind := .rawPtr .mut (.array (.uint .u32) 0), layoutIdx := 0 }
+
+private def npUnsizeZeroLenMir : CapturedMir :=
+  mkNpUnsizeMir "np::w_unsize_zero_len" npRawMutArr0U32MirTy rawConstSliceU32MirTy
+
+/-- **`V2` `Unsize` Tree Borrows Permission Edge Cases (pure check vs. Trusted)**:
+1. a tag that is not registered in the borrow tree passes the check, and Trusted
+   accepts the same coercion when the pointer's tag has no `BorrowEntry` (here
+   the only entry is a `.disabled` borrow under a different tag);
+2. a zero-length coercion of a pointer one past the end of the tracked range
+   through a `.disabled` tag is rejected by the check and by Trusted
+   `evalUnsizeCoercion` on `*mut [u32; 0] -> *const [u32]`;
+3. a provenance-free integer pointer (`4096`) is accepted by Trusted for a raw
+   slice target whatever the borrow table holds (the check never runs for a
+   pointer without concrete provenance, `npCheckUnsizeTreeBorrowsPerm`);
+4. residual boundary: on a tracked allocation of size zero the check passes
+   even for a tree whose only child permission is `.disabled`, because a
+   zero-sized allocation has no location states; Trusted's permission is per
+   borrow entry and still rejects (conjunct 2 does not depend on the size of
+   the borrowed local). -/
+theorem lm_np_v2_unsize_tb_perm_edge_cases_witness :
+    let eDisabled5 : BorrowEntry :=
+      { tag := 5, targetLocal := 3, targetProjection := [], perm := .disabled,
+        targetFrameDepth := 0 }
+    let eDisabled6 : BorrowEntry :=
+      { tag := 6, targetLocal := 3, targetProjection := [], perm := .disabled,
+        targetFrameDepth := 0 }
+    let unregTag : Miri.Memory.BorTag := ⟨999, by decide⟩
+    let arr : LocalSlot :=
+      .init (.aggregate 0 [.scalar ⟨1, 4⟩, .scalar ⟨2, 4⟩, .scalar ⟨3, 4⟩])
+    let tLocs : List LocalSlot := [.uninit, .init (.ptr ⟨5, 0⟩ 8), .uninit, arr]
+    let tLocsEnd : List LocalSlot := [.uninit, .init (.ptr ⟨5, 12⟩ 8), .uninit, arr]
+    let tLocsInt : List LocalSlot := [.uninit, .init (.scalar ⟨4096, 8⟩), .uninit, arr]
+    -- 1. Unregistered tag
+    (npUnsizeTreeBorrowsPermCheck (npArr3U32Tree .disabled) unregTag 0 12 true).isOk = true ∧
+    unsizeBorrowPermCompatible [eDisabled6] 5 (.rawPtr .mut (.slice (.uint .u32))) = true ∧
+    evalUnsizeCoercion tLocs (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eDisabled6] } npUnsizeMutToConstMir.localDecls
+      emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]) tLocs
+        { emptyMemory with borrows := [eDisabled6] } ∧
+    -- 2. Zero-length coercion one past the end through a `.disabled` tag
+    (npUnsizeTreeBorrowsPermCheck (npArr3U32Tree .disabled) retagChildTag 12 0 false).isOk =
+      false ∧
+    evalUnsizeCoercion tLocsEnd (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eDisabled5] } npUnsizeZeroLenMir.localDecls
+      emptyLayoutTable = .ub ∧
+    -- 3. Provenance-free integer pointer
+    evalUnsizeCoercion tLocsInt (.copy (locPlace 1)) rawConstSliceU32MirTy
+      { emptyMemory with borrows := [eDisabled5] } npUnsizeMutToConstMir.localDecls
+      emptyLayoutTable =
+      .ok
+        (.aggregate 0 [.scalar ⟨wrapScalarBits 4096 (scalarModulus 8), 8⟩, .scalar ⟨3, 8⟩])
+        tLocsInt { emptyMemory with borrows := [eDisabled5] } ∧
+    -- 4. Zero-sized tracked allocation (residual boundary)
+    (npUnsizeTreeBorrowsPermCheck
+      { hooksTwoNodeTree .disabled with
+        locations := Miri.DataStructures.DedupRangeMap.new (Miri.ABI.Size.ofBytes 0)
+          (hooksLocTree .disabled) }
+      retagChildTag 0 0 false).isOk = true := by
+  refine ⟨by decide +kernel, rfl, rfl, by decide +kernel, rfl, rfl, by decide +kernel⟩
+
+/-- **`V2` `Unsize` Tree Borrows Edge Cases, Stepped** through unmodified vendored
+`Miri.Interpreter.Step.step` under `annealStepHooksNullaryPtr`:
+1. in `treeBorrows = true` mode a provenance-free integer pointer
+   (`0x1000 as *mut [u32; 3] as *const [u32]`) is unsized to length `3` even
+   though the machine's tracked allocation has a `.disabled` child tag (the
+   pointer carries no tag to check);
+2. a zero-length `*mut [u32; 0] -> *const [u32]` coercion of a pointer one past
+   the end of the 12-byte allocation is UB in `treeBorrows = true` mode through
+   a `.disabled` tag, returns length `0` through a `.unique` tag, and returns
+   length `0` in basic mode. -/
+theorem lm_np_v2_unsize_tb_edge_cases_stepped_witness :
+    let intPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npScalarUInt 0x1000 8)))
+    let endPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid5 (npBase5 + 12) retagChildTag)))
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeMutToConstMir true) 8
+      (mkNpUnsizeState npUnsizeMutToConstMir npRawMutArr3U32MirTy rawConstSliceU32MirTy
+        intPtr (npMachine5Tree .disabled))) = .usizeVal 3 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npUnsizeZeroLenMir true) 8
+      (mkNpUnsizeState npUnsizeZeroLenMir npRawMutArr0U32MirTy rawConstSliceU32MirTy
+        endPtr (npMachine5Tree .disabled))).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows disabled tag on Unsize pointer coercion") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeZeroLenMir true) 8
+      (mkNpUnsizeState npUnsizeZeroLenMir npRawMutArr0U32MirTy rawConstSliceU32MirTy
+        endPtr (npMachine5Tree .unique))) = .usizeVal 0 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npUnsizeZeroLenMir false) 8
+      (mkNpUnsizeState npUnsizeZeroLenMir npRawMutArr0U32MirTy rawConstSliceU32MirTy
+        endPtr (npMachine5Tree .disabled))) = .usizeVal 0 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+private def npMutToConstSliceMir : CapturedMir :=
+  mkMirBody "np::w_mut_to_const_slice"
+    [mkDecl usizeMirTy, mkDecl npRawMutSliceU32MirTy, mkDecl rawConstSliceU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 2)
+             (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1))
+               rawConstSliceU32MirTy)),
+           mkSt (.assign (locPlace 0) (.unaryOp .ptrMetadata (.copy (locPlace 2))))]
+      .return_]
+
+private def npStMutToConstSlice (src : Miri.Interpreter.LocalValue AnnealProv) :
+    AnnealStepState :=
+  npMkState npMutToConstSliceMir usizeMirTy
+    #[npUninit (translateTyOverlay usizeMirTy emptyLayoutTable),
+      ⟨src, some (translateTyOverlay npRawMutSliceU32MirTy emptyLayoutTable)⟩,
+      npUninit (translateTyOverlay rawConstSliceU32MirTy emptyLayoutTable)]
+    npMachine5
+
+/-- **`V2` Wide-Slice `MutToConstPointer` (`*mut [u32] -> *const [u32]`) Witness**,
+completing the three `MutToConstPointer` shapes (thin and wide `dyn Trait` are
+covered by `lm_np_v2_pointerCoercion_six_subkinds_witness`):
+1. one vendored `Miri.Interpreter.Step.step` copies BOTH the data pointer
+   (allocation `5`) and the slice length metadata (`3`) into the destination;
+2. the full run then reads the length back with `PtrMetadata` (`3`), in basic
+   and in `treeBorrows = true` mode;
+3. a dead source local is UB;
+4. Trusted `evalRvalue` returns the same wide pointer `(⟨5, 0⟩, 3)` unchanged. -/
+theorem lm_np_v2_mutToConstPointer_wide_slice_witness :
+    let widePtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalarPair (npPtrScalar npAid5 npBase5) (npScalarUInt 3 8)))
+    let tLocs : List LocalSlot :=
+      [.uninit, .init (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]), .uninit]
+    (match Miri.Interpreter.Step.step (annealStepHooksNullaryPtr npMutToConstSliceMir) ()
+        (npStMutToConstSlice widePtr) with
+      | (st', .ok true) =>
+        (match npLocalVal? st' 2 with
+          | some (.live (.immediate (.scalarPair a b))) =>
+            decide (npDecodeScalar a = .ptrAlloc 5) && decide (npDecodeScalar b = .usizeVal 3)
+          | _ => false)
+      | _ => false) = true ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npMutToConstSliceMir) 8
+      (npStMutToConstSlice widePtr)) = .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npMutToConstSliceMir true) 8
+      (npStMutToConstSlice widePtr)) = .usizeVal 3 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npMutToConstSliceMir) 8
+      (npStMutToConstSlice .dead)) = .ub ∧
+    evalRvalue tLocs
+      (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1)) rawConstSliceU32MirTy)
+      emptyMemory npMutToConstSliceMir.localDecls emptyLayoutTable =
+      .ok (.aggregate 0 [.ptr ⟨5, 0⟩ 8, .scalar ⟨3, 8⟩]) tLocs emptyMemory := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel, rfl⟩
 
 /-- **`V3` (`CastKind.fnPtrToPtr`) UB & Divergence Witness** on `v3FnPtrToPtrConstMir`:
 1. a function pointer at a nonzero offset into its function allocation is UB;
@@ -2065,6 +2251,78 @@ theorem lm_np_v4_deref_and_subplace_unwrap_tb_witness :
       | _ => false) = true := by
   refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel⟩
+
+private def npV4NestedFieldUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_nested_field_unwrap"
+    [mkDecl u32MirTy, mkDecl npPaddedMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npLayouts
+
+/-- Two-node borrow tree over 8 bytes in which the child tag `retagChildTag` has
+an accessed `.Unique` location state on only one 4-byte half (`[0, 4)` when
+`childOnFst = true`, `[4, 8)` otherwise) and no location state on the other
+half (it never accessed those bytes). -/
+private def npSplitChildTree (childOnFst : Bool) : Miri.TreeBorrows.BorrowTree :=
+  let rootOnly : Miri.TreeBorrows.LocationTree :=
+    { perms := ⟨#[some ⟨.Unique, true, .None⟩, none]⟩
+      exposedCache := {} }
+  { hooksTwoNodeTree .unique with
+    locations :=
+      ⟨#[⟨⟨0, 4⟩, if childOnFst then hooksLocTree .unique else rootOnly⟩,
+         ⟨⟨4, 8⟩, if childOnFst then rootOnly else hooksLocTree .unique⟩]⟩ }
+
+private def mkNpTbNestedFieldUnwrapState
+    (alloc : Miri.Memory.Allocation AnnealProv (Option Miri.TreeBorrows.BorrowTree))
+    (childProtected : Bool) : AnnealStepState :=
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, alloc⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  let mp : Miri.Interpreter.MemPlace AnnealProv :=
+    ⟨⟨Miri.ABI.Size.ofBytes npBase1, some (.concrete npAid1 retagParentTag)⟩, .none, none⟩
+  npMkState npV4NestedFieldUnwrapMir u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy npLayouts),
+      ⟨.live (.indirect mp), some (translateTyOverlay npPaddedMirTy npLayouts)⟩]
+    mach
+
+/-- **`V4` Nested Projection `(_1.1).unwrapUnsafeBinder` & Sub-Range Tree Borrows
+Disjointness** (`Field` then `UnwrapUnsafeBinder`, the reverse of the
+`(_1.unwrapUnsafeBinder).field(1)` order of
+`lm_np_v4_deref_and_subplace_unwrap_tb_witness`). The outer struct is the frozen
+8-byte `np::PaddedU8U32` (`u8` at offset `0`, `u32` at offset `4`), memory-backed
+at `npAid1`; the write `(_1.1).unwrapUnsafeBinder = 99` covers bytes `[4, 8)`:
+1. basic mode returns `99`;
+2. `treeBorrows = true`, protected child tag that accessed only `[0, 4)`: the
+   write to the disjoint bytes `[4, 8)` is accepted and returns `99`;
+3. `treeBorrows = true`, protected child tag that accessed only `[4, 8)`: the
+   same write is a Tree Borrows conflict (UB);
+4. `treeBorrows = true`, protected child tag over the whole `[0, 8)`: UB;
+5. `treeBorrows = true`, unprotected child tag that accessed only `[4, 8)`:
+   returns `99`. -/
+theorem lm_np_v4_nested_field_unwrap_disjoint_tb_witness :
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4NestedFieldUnwrapMir false) 8
+      (mkNpTbNestedFieldUnwrapState npPaddedAlloc8 true)) = .u32Val 99 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4NestedFieldUnwrapMir true) 8
+      (mkNpTbNestedFieldUnwrapState (npPaddedAlloc8.setExtra (some (npSplitChildTree true)))
+        true)) = .u32Val 99 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4NestedFieldUnwrapMir true) 8
+      (mkNpTbNestedFieldUnwrapState (npPaddedAlloc8.setExtra (some (npSplitChildTree false)))
+        true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4NestedFieldUnwrapMir true) 8
+      (mkNpTbNestedFieldUnwrapState npPaddedAlloc8 true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4NestedFieldUnwrapMir true) 8
+      (mkNpTbNestedFieldUnwrapState (npPaddedAlloc8.setExtra (some (npSplitChildTree false)))
+        false)) = .u32Val 99 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel⟩
 
 /-- **`V4` Zero-Sized (`()`) `UnwrapUnsafeBinder` Write 3-Layer Boundary

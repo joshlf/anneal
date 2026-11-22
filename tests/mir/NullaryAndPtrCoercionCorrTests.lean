@@ -203,6 +203,9 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v4_wrapUnsafeBinder_universal_sim
   have _ := @np_v4_unwrapUnsafeBinder_three_way_witness
   have _ := @np_storage_lifecycle_three_way_witness
+  have _ := @np_v2_mutToConstPointer_wide_slice_three_way_witness
+  have _ := @np_v4_nested_field_unwrap_trusted_witness
+  have _ := @np_v4_nested_field_unwrap_mach_and_tb_witness
   have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
@@ -498,10 +501,15 @@ run_cmd do
         lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayToSliceSpec?_of_lt,
         lmNs ++ `np_v2_unsize_spec_laws,
         lmNs ++ `npUnsizeTreeBorrowsPermCheck_eq_trusted_universal,
+        lmNs ++ `npUnsizeTreeBorrowsPermCheck_zero_len_eq_trusted_universal,
         lmNs ++ `npApplyTreeBorrowsWriteAt_zst_noop,
         lmNs ++ `lm_np_v2_unsize_fidelity_and_negative_witness,
         lmNs ++ `lm_np_v2_unsize_tb_perm_agreement_and_mode_sensitivity_witness,
+        lmNs ++ `lm_np_v2_unsize_tb_perm_edge_cases_witness,
+        lmNs ++ `lm_np_v2_unsize_tb_edge_cases_stepped_witness,
+        lmNs ++ `lm_np_v2_mutToConstPointer_wide_slice_witness,
         lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness,
+        lmNs ++ `lm_np_v4_nested_field_unwrap_disjoint_tb_witness,
         lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
         lmNs ++ `lm_np_storage_lifecycle_witness ]
     for n in lmDeepThms do

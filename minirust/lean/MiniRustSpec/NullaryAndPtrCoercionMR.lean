@@ -1909,6 +1909,76 @@ theorem np_v2_pointerCoercion_three_way_witness :
    by decide +kernel,
    ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel)⟩
 
+/-! ### Wide-slice `MutToConstPointer` (`Mach` & `MachTB`)
+
+`np_v2_mutToConstPointer_all_shapes_and_ub` couples Trusted `evalRvalue` with the
+MiniRust `Transmute` lowering on every runtime value shape. The witness below
+steps the wide-slice shape (`*mut [u32] -> *const [u32]`) end to end. -/
+
+/-- Trusted fixture: `_2 = _1 as *const [u32]` (`MutToConstPointer` of the wide
+`*mut [u32]` local `_1`), then `_0 = PtrMetadata(_2)`. -/
+def npMutToConstSliceMir : CapturedMir :=
+  mkMirBody "np::w_mut_to_const_slice"
+    [mkDecl usizeMirTy, mkDecl rawMutSliceU32MirTy, mkDecl rawConstSliceU32MirTy] 1
+    [mkBb [mkSt (.assign (locPlace 2)
+             (.cast (.pointerCoercion "MutToConstPointer") (.copy (locPlace 1))
+               rawConstSliceU32MirTy)),
+           mkSt (.assign (locPlace 0) (.unaryOp .ptrMetadata (.copy (locPlace 2))))]
+      .return_]
+
+/-- MiniRust machine for `npMutToConstSliceMir`: local `_1` holds the wide
+pointer `(data 1024, len 3)` into allocation `3` (the 12-byte array at `1024`);
+`MutToConstPointer` is the `Transmute` at the wide slice pointer type into
+`_2`, and `PtrMetadata` is `UnOp.GetMetadata`. -/
+def npMutToConstSliceMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, usizeMrTy), (localName 1, wideSlicePtrMrTy), (localName 2, wideSlicePtrMrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Assign (.Local (localName 2))
+          (.UnOp (.Cast (.Transmute wideSlicePtrMrTy)) (.Load (.Local (localName 1)))),
+        .Assign (.Local (localName 0)) (.UnOp .GetMetadata (.Load (.Local (localName 2))))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 8 .Uninit) 8,
+     mkStackAlloc 256 (ptrBytes 1024 (some (⟨3⟩, ())) ++ scalarBytes IntType.usize_ty 3) 8,
+     mkStackAlloc 512 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 1024 (scalarBytes u32 10 ++ scalarBytes u32 20 ++ scalarBytes u32 30) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 512, provenance := some (⟨2⟩, ()) })]]
+
+/-- **V2 Wide-Slice `MutToConstPointer` Three-Way Witness (Trusted, `Mach`,
+`MachTB` with `MachTB.wfLive`)**, completing the three `MutToConstPointer`
+shapes (thin, wide slice, wide `dyn Trait`):
+1. one Trusted `stepMirFn` step copies the wide pointer `(⟨5, 0⟩, 3)` unchanged
+   into `_2`, and the full run reads the length `3` back with `PtrMetadata`;
+2. on `Mach`, the `Transmute` writes the same 16 bytes (data pointer with its
+   provenance, then the length `3`) into `_2`, and `GetMetadata` returns `3`;
+3. on `MachTB` the same run returns `3` and preserves `MachTB.wfLive`. -/
+theorem np_v2_mutToConstPointer_wide_slice_three_way_witness :
+    (match stepMirFn npMutToConstSliceMir
+        (npInitLiveState npMutToConstSliceMir
+          [.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]]) with
+     | .tau (.running s1) =>
+       get? s1.frame.locals 2 =
+         some (.init (.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]))
+     | _ => False) ∧
+    npRunTrusted npMutToConstSliceMir 16
+      (npInitLiveState npMutToConstSliceMir
+        [.aggregate 0 [.ptr { allocId := 5, offsetBytes := 0 } 8, .scalar ⟨3, 8⟩]]) =
+      .usizeVal 3 ∧
+    (∃ m2, Interp.steps 2 npMutToConstSliceMach = .ok m2 ∧
+      ([2, 0].map (fun i => m2.mem.memory.allocations[i]?.map (·.data))) =
+        [some (ptrBytes 1024 (some (⟨3⟩, ())) ++ scalarBytes IntType.usize_ty 3),
+         some (scalarBytes IntType.usize_ty 3)]) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB npMutToConstSliceMach) = .ok m2 ∧ MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes IntType.usize_ty 3).map (projByteTB ∘ liftByteTB))) :=
+  ⟨rfl, by decide +kernel,
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
+
 /-! ### `dyn Trait` Unsizing / Wide-Pointer Bridge (`Mach` & `MachTB`)
 
 `MiniRustSpec.Interp` keeps `BinOp.ConstructWidePointer` fail-closed
@@ -2669,6 +2739,64 @@ theorem np_storage_lifecycle_three_way_witness :
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    by decide +kernel,
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Nested projection `(_1.1).unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
+
+/-- Trusted fixture writing `99` to, then reading, the nested place
+`(_1.1).unwrapUnsafeBinder` (`Field` then `UnwrapUnsafeBinder`) of the 8-byte
+`np::PaddedU8U32` (`u8` at offset `0`, `u32` at offset `4`). -/
+def npV4NestedFieldUnwrapMir : CapturedMir :=
+  mkMirBody "np::w_v4_nested_field_unwrap"
+    [mkDecl u32MirTy, mkDecl npPaddedMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 99))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npLayouts
+
+/-- MiniRust machine for `npV4NestedFieldUnwrapMir`: the binder projection is
+transparent, so the nested place is the field place `_1.1` of
+`npPaddedU8U32MrTy` at byte offset `4`. Allocation `1` is `_1`, holding the
+`u8` `7`, three padding bytes, and the `u32` `11`. -/
+def npV4NestedFieldUnwrapMach : Mach :=
+  let fn := mkMrFn [(localName 0, u32MrTy), (localName 1, npPaddedU8U32MrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Assign (.Field (.Local (localName 1)) 1) (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0)) (.Load (.Field (.Local (localName 1)) 1))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256
+       (([.Init 7 none, .Uninit, .Uninit, .Uninit] : List Byte) ++ scalarBytes u32 11) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) })]]
+
+/-- **V4 Nested `(_1.1).unwrapUnsafeBinder` on Trusted**: the write through
+`Field` then `UnwrapUnsafeBinder` replaces only field `1`, and the read through
+the same nested place returns `99`. -/
+theorem np_v4_nested_field_unwrap_trusted_witness :
+    npRunTrusted npV4NestedFieldUnwrapMir 16
+      (npInitLiveState npV4NestedFieldUnwrapMir
+        [.aggregate 0 [.scalar ⟨7, 1⟩, .scalar ⟨11, 4⟩]]) = .u32Val 99 := by
+  decide +kernel
+
+/-- **V4 Nested `(_1.1).unwrapUnsafeBinder` on `Mach` & `MachTB` (with
+`MachTB.wfLive`)**: the store at byte offset `4` writes exactly bytes `[4, 8)`
+of `_1` (the `u8` field and the padding bytes `[0, 4)` are unchanged), and the
+load returns `99`. -/
+theorem np_v4_nested_field_unwrap_mach_and_tb_witness :
+    (∃ m2, Interp.steps 2 npV4NestedFieldUnwrapMach = .ok m2 ∧
+      ([1, 0].map (fun i => m2.mem.memory.allocations[i]?.map (·.data))) =
+        [some (([.Init 7 none, .Uninit, .Uninit, .Uninit] : List Byte) ++ scalarBytes u32 99),
+         some (scalarBytes u32 99)]) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB npV4NestedFieldUnwrapMach) = .ok m2 ∧
+      MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 99).map (projByteTB ∘ liftByteTB))) :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel)⟩
 
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 
