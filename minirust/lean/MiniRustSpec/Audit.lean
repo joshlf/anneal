@@ -18819,6 +18819,74 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
     have hwf3 : MachTB.wfLive t3 := evalValueM_tb_wfLive _ hwf2 ht3
     exact ⟨t1, t2, t3, ht1, ht2, hmem2, ht3, hwf3⟩
 
+/-- **Episode 1 capstone: vtables and trait-object safe pointers.** A single
+entry point to the universal laws and the concrete `Mach` / `MachTB` witnesses
+of the four construct groups. Every conjunct is the statement of the theorem
+named at the same position of the proof term, and each universal law comes
+once for `Mach` and once for the polymorphic `Machine M` (so for `MachTB`).
+1. `Machine::vtable_from_ptr` and `check_ptr_metadata`: `vtable_from_ptr`
+   agrees with `Machine::vtable_lookup` on success, is UB for a pointer that
+   is not the address of a vtable, and the vtable case of `check_ptr_metadata`
+   is `check_ptr` at `PtrType::VTablePtr`.
+2. `check_ptr` at `PtrType::VTablePtr` and on trait-object safe pointers
+   (`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`): the characterization of
+   a stand-alone vtable pointer, wrong-trait UB, validity at the vtable's
+   dynamic size and alignment with `Memory::dereferenceable`, and the
+   unaligned and non-dereferenceable UB cases.
+3. `UnOp::{GetMetadata, ComputeSize, ComputeAlign}` on vtable metadata: the
+   single sanity check of `GetMetadata`, its complete characterization, and
+   its composition into `ComputeSize` / `ComputeAlign` with the exact dynamic
+   size and alignment.
+4. `UnOp::VTableMethodLookup`: the looked-up function pointer is the value of
+   `Constant::FnPointer`, the callee of a dynamic call.
+5. Concrete positive and UB witnesses on both `Mach` and `MachTB`. The
+   `steps` / `stepsTB` executions of dynamic dispatch are in
+   `MiniRustSpec.UnwindSetDiscrAndFnPtrMR`
+   (`dynDispatch_call_mach_and_machTB_witness` and the witnesses after it),
+   which this module does not import. -/
+theorem ep1_minirust_vtable_and_safeptr_capstone :
+    -- 1. `Machine::vtable_from_ptr` and `check_ptr_metadata`
+    (type_of% @vtableFromPtr_ok_iff_vtableLookup_ok) ∧
+    (type_of% @vtableFromPtrM_ok_iff_vtableLookupM_ok) ∧
+    (type_of% @vtableFromPtr_ub_of_not_mem) ∧
+    (type_of% @vtableFromPtrM_ub_of_not_mem) ∧
+    (type_of% @checkPtrMetadata_vtable_eq_checkPtr) ∧
+    (type_of% @checkPtrMetadataM_vtable_eq_checkPtrM) ∧
+    -- 2. `check_ptr` at `PtrType::VTablePtr` and on trait-object safe pointers
+    (type_of% @checkPtr_vtablePtr_eq) ∧
+    (type_of% @checkPtrM_vtablePtr_eq) ∧
+    (type_of% @checkPtr_vtablePtr_wrong_trait_ub) ∧
+    (type_of% @checkPtrM_vtablePtr_wrong_trait_ub) ∧
+    (type_of% @checkPtr_traitObject_ok) ∧
+    (type_of% @checkPtrM_traitObject_ok) ∧
+    (type_of% @checkPtr_traitObject_unaligned_ub) ∧
+    (type_of% @checkPtrM_traitObject_unaligned_ub) ∧
+    (type_of% @checkPtr_traitObject_nonDereferenceable_ub) ∧
+    (type_of% @checkPtrM_traitObject_nonDereferenceable_ub) ∧
+    -- 3. `UnOp::{GetMetadata, ComputeSize, ComputeAlign}` on vtable metadata
+    (type_of% @evalUnOp_getMetadata_eq_sanity) ∧
+    (type_of% @evalUnOpM_getMetadata_eq_sanity) ∧
+    (type_of% @ep1_evalUnOpM_getMetadata_complete_spec) ∧
+    (type_of% @ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn) ∧
+    -- 4. `UnOp::VTableMethodLookup`
+    (type_of% @evalUnOp_vtableMethodLookup_eq_fnPointer) ∧
+    (type_of% @evalUnOpM_vtableMethodLookup_eq_fnPointer) ∧
+    -- 5. concrete witnesses on `Mach` and `MachTB`
+    (type_of% @ep1_vtable_dyn_safe_ptr_and_unops_witness) ∧
+    (type_of% @ep1_vtable_dyn_safe_ptr_ub_witness) :=
+  ⟨@vtableFromPtr_ok_iff_vtableLookup_ok, @vtableFromPtrM_ok_iff_vtableLookupM_ok,
+   @vtableFromPtr_ub_of_not_mem, @vtableFromPtrM_ub_of_not_mem,
+   @checkPtrMetadata_vtable_eq_checkPtr, @checkPtrMetadataM_vtable_eq_checkPtrM,
+   @checkPtr_vtablePtr_eq, @checkPtrM_vtablePtr_eq, @checkPtr_vtablePtr_wrong_trait_ub,
+   @checkPtrM_vtablePtr_wrong_trait_ub, @checkPtr_traitObject_ok, @checkPtrM_traitObject_ok,
+   @checkPtr_traitObject_unaligned_ub, @checkPtrM_traitObject_unaligned_ub,
+   @checkPtr_traitObject_nonDereferenceable_ub, @checkPtrM_traitObject_nonDereferenceable_ub,
+   @evalUnOp_getMetadata_eq_sanity, @evalUnOpM_getMetadata_eq_sanity,
+   @ep1_evalUnOpM_getMetadata_complete_spec,
+   @ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn,
+   @evalUnOp_vtableMethodLookup_eq_fnPointer, @evalUnOpM_vtableMethodLookup_eq_fnPointer,
+   @ep1_vtable_dyn_safe_ptr_and_unops_witness, @ep1_vtable_dyn_safe_ptr_ub_witness⟩
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -18893,6 +18961,7 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
   ep1_cellsToFreezeMask_zero_dichotomy
   ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+  ep1_minirust_vtable_and_safeptr_capstone
 
 #assert_standard_axioms
   vtableFromPtrM_bm_eq
@@ -18986,6 +19055,7 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
   ep1_cellsToFreezeMask_zero_dichotomy
   ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+  ep1_minirust_vtable_and_safeptr_capstone
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
