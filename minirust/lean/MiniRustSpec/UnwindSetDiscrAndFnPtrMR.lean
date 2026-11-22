@@ -78,6 +78,9 @@ memory and shows the alignment UB of a trait-object place whose data pointer
 is misaligned for its vtable. `dynDispatch_safe_ref_receiver_call_return_witness`
 dispatches on a safe `&dyn Trait` receiver that is also passed to the callee,
 validated there at function entry, and released again on `Return`.
+`dynDispatch_same_trait_two_impls_polymorphism_witness` registers two
+implementations of one trait (different size, alignment, and methods) and runs
+one caller body on receivers that differ only in their vtable pointer.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3760,6 +3763,163 @@ theorem dynDispatch_return_dynRef_valid_and_ub_witness :
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Runtime Polymorphism: Two Implementations of One Trait (`Mach` & `MachTB`)
+
+Two vtables for the *same* trait are registered at once: a small
+implementation (size `4`, alignment `4`) and a large one (size `16`,
+alignment `8`), each with its own functions for the trait's two methods. One
+caller body reads the dynamic size and alignment
+(`ComputeSize(GetMetadata(self))`, `ComputeAlign(GetMetadata(self))`) and
+calls `VTableMethodLookup(GetMetadata(self))`. Which callee runs, which size
+and alignment are read, and whether the `&dyn Trait` receiver is valid at all
+depend only on the vtable pointer in the receiver's metadata: the trait check
+of `check_ptr` passes for both vtables, so pairing the small object with the
+large vtable is caught by the dynamic size (`Memory::dereferenceable`) or
+alignment check instead. -/
+
+/-- The small implementation's vtable for trait `0`: size `4`, alignment `4`,
+method `0` is function `1` and method `1` is function `2`. -/
+def dynPolyVTableSmall : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(⟨⟨0⟩⟩, fnName 1), (⟨⟨1⟩⟩, fnName 2)]⟩ }
+
+/-- The large implementation's vtable for the same trait `0`: size `16`,
+alignment `8`, method `0` is function `3` and method `1` is function `4`. -/
+def dynPolyVTableLarge : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨16⟩, align := ⟨8⟩, cells := [],
+    methods := ⟨[(⟨⟨0⟩⟩, fnName 3), (⟨⟨1⟩⟩, fnName 4)]⟩ }
+
+/-- A method implementation: it writes `k` to its `u32` return local. -/
+def dynPolyCallee (k : Int) : Gen.Function := mkMrFn [(localName 0, u32MrTy)] [] (localName 0)
+  [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int k) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller body, the same for every receiver: store the dynamic size and
+alignment of the `&dyn Trait` receiver in local `1` to locals `2` and `3`,
+then call method `meth` through the receiver's vtable. -/
+def dynPolyCaller (meth : Nat) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy), (localName 2, usizeMrTy),
+      (localName 3, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 2)) (.UnOp (.ComputeSize (.TraitObject (traitNameOf 0)))
+          (.UnOp .GetMetadata (.Load (.Local (localName 1))))),
+        .Assign (.Local (localName 3)) (.UnOp (.ComputeAlign (.TraitObject (traitNameOf 0)))
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))],
+       .Call (.UnOp (.VTableMethodLookup ⟨⟨meth⟩⟩)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [] (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run `dynPolyCaller meth`. Allocations `0`
+to `3` are functions `1` to `4`, `4` to `7` the caller's locals, `8` and `9`
+the small and the large vtable (at `8192` and `8200`), `10` a 4-byte object
+at `640`, `11` a 16-byte object at `768`, and `12` a 4-byte object at `900`
+(aligned to `4` but not to `8`). The receiver in local `1` has the data
+pointer `dataAddr` with the provenance of allocation `dataAlloc`, and the
+vtable pointer of the large implementation if `vtLarge`, else of the small
+one. -/
+def dynPolyMach (vtLarge : Bool) (dataAddr : Nat) (dataAlloc : Int) (meth : Nat) : Mach :=
+  let caller := dynPolyCaller meth
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, dynPolyCallee 11), (fnName 2, dynPolyCallee 12),
+        (fnName 3, dynPolyCallee 31), (fnName 4, dynPolyCallee 32)]⟩,
+      start := fnName 0, globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[⟨⟨0⟩⟩, ⟨⟨1⟩⟩]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynPolyVTableSmall), (⟨⟨1⟩⟩, dynPolyVTableLarge)]⟩ }
+  let vtSmall : Ptr := { addr := 8192, provenance := some (⟨8⟩, ()) }
+  let vtLargePtr : Ptr := { addr := 8200, provenance := some (⟨9⟩, ()) }
+  let recvBytes : List Byte := ptrBytes dataAddr (some (⟨dataAlloc⟩, ())) ++
+    (if vtLarge then ptrBytes 8200 (some (⟨9⟩, ())) else ptrBytes 8192 (some (⟨8⟩, ())))
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkFnAlloc 4104, mkFnAlloc 4112, mkFnAlloc 4120,
+     mkStackAlloc 128 (List.replicate 4 .Uninit) 4, mkStackAlloc 256 recvBytes 8,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8, mkStackAlloc 512 (List.replicate 8 .Uninit) 8,
+     mkVTableAlloc 8192, mkVTableAlloc 8200,
+     mkStackAlloc 640 (scalarBytes u32 5) 4, mkStackAlloc 768 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 900 (scalarBytes u32 6) 4]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨4⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨5⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨6⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨7⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) }),
+     (fnName 2, { addr := 4104, provenance := some (⟨1⟩, ()) }),
+     (fnName 3, { addr := 4112, provenance := some (⟨2⟩, ()) }),
+     (fnName 4, { addr := 4120, provenance := some (⟨3⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtSmall), (⟨⟨1⟩⟩, vtLargePtr)]⟩ }
+
+/-- Concrete runtime-polymorphism witness on `Mach` and `MachTB`: two
+implementations of the same trait, selected only by the receiver's vtable
+pointer.
+1. With the small vtable and the 4-byte object, the five steps (two
+   assignments, `Call`, the callee's assignment, `Return`) store the callee
+   result `11`, size `4`, and alignment `4`.
+2. The same caller body with the large vtable and the 16-byte object stores
+   `31`, size `16`, and alignment `8`.
+3. Method `1` reaches the other function of each implementation (`12` and
+   `32`).
+4. The large vtable with the 4-byte object at `640` passes the trait check
+   (both vtables are for trait `0`) and the alignment check, but the object
+   is too small for the vtable's size: UB when the receiver is first loaded.
+5. The large vtable with the 4-byte object at `900` is UB for the vtable's
+   alignment `8`, although the small vtable accepts the same object.
+6. A method that the vtable does not have (`99`) is the spec panic of
+   `vtable.methods[method]` at the call, after both assignments ran. -/
+theorem dynDispatch_same_trait_two_impls_polymorphism_witness :
+    -- 1. the small implementation
+    (∃ m5, Interp.steps 5 (dynPolyMach false 640 10 0) = .ok m5 ∧
+      ([4, 6, 7].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 11), some (scalarBytes IntType.usize_ty 4),
+         some (scalarBytes IntType.usize_ty 4)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach false 640 10 0)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([4, 6, 7].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 11).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 4).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 4).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 2. the large implementation, same caller body
+    (∃ m5, Interp.steps 5 (dynPolyMach true 768 11 0) = .ok m5 ∧
+      ([4, 6, 7].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 31), some (scalarBytes IntType.usize_ty 16),
+         some (scalarBytes IntType.usize_ty 8)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach true 768 11 0)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([4, 6, 7].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 31).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 16).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 8).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 3. method `1` of each implementation
+    (∃ m5, Interp.steps 5 (dynPolyMach false 640 10 1) = .ok m5 ∧
+      m5.mem.memory.allocations[4]?.map (·.data) = some (scalarBytes u32 12)) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach true 768 11 1)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      m5.mem.memory.mem.allocations[4]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 32).map (projByteTB ∘ liftByteTB))) ∧
+    -- 4. large vtable, small object: too small for the vtable's size
+    Interp.steps 1 (dynPolyMach true 640 10 0) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPolyMach true 640 10 0)) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    -- 5. the object at `900`: fine for the small vtable, unaligned for the large one
+    (∃ m5, Interp.steps 5 (dynPolyMach false 900 12 0) = .ok m5 ∧
+      m5.mem.memory.allocations[4]?.map (·.data) = some (scalarBytes u32 11)) ∧
+    Interp.steps 1 (dynPolyMach true 900 12 0) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPolyMach true 900 12 0)) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    -- 6. a method missing from the vtable
+    Interp.steps 3 (dynPolyMach false 640 10 99) =
+      .error (.specPanic "map index: missing key (vtable.methods[method])") ∧
+    Interp.stepsTB 3 (liftMachToTB (dynPolyMach false 640 10 99)) =
+      .error (.specPanic "map index: missing key (vtable.methods[method])") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel)⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 /-- **C9 Fragment Boundary (`translatePlace_unwrapUnsafeBinder_none`)**:
