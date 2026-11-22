@@ -3434,6 +3434,416 @@ theorem np_v4_pair_deref_caller_frame_full_return_witness :
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
    by decide +kernel⟩
 
+/-! ### Dedicated Stepped MiniRust `Frozen` / `Cell` (`UnsafeCell`) / `ReservedIM` & Foreign-Read-Freeze `unwrapUnsafeBinder` Machines -/
+
+/-- Shared `&np::PairU32Binder` (`Freeze`, `unsafe_cells = .Sized []`): bytes
+`[0, 8)` are all frozen. -/
+@[reducible] def npRefPairFrozenMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable
+    { layout := .Sized ⟨8⟩ ⟨4⟩, inhabited := true,
+      unsafe_cells := .Sized [], freeze := true, unpin := true })
+
+/-- Shared `&np::PairU32Binder` with `UnsafeCell` on `snd` (`unsafe_cells = .Sized [(⟨4⟩, ⟨4⟩)]`,
+`freeze = false`): bytes `[0, 4)` (`fst`) are frozen while bytes `[4, 8)`
+(`snd : BinderU32`) are interior-mutable (`.Cell`). -/
+@[reducible] def npRefPairSndCellMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable
+    { layout := .Sized ⟨8⟩ ⟨4⟩, inhabited := true,
+      unsafe_cells := .Sized [(⟨4⟩, ⟨4⟩)], freeze := false, unpin := true })
+
+/-- Mutable `&mut np::PairU32Binder` (`Freeze`, `unsafe_cells = .Sized []`). -/
+@[reducible] def npRefMutPairFrozenMrTy : Gen.Type :=
+  .Ptr (.Ref .Mutable
+    { layout := .Sized ⟨8⟩ ⟨4⟩, inhabited := true,
+      unsafe_cells := .Sized [], freeze := true, unpin := true })
+
+/-- Mutable `&mut np::PairU32Binder` with `UnsafeCell` on `snd` (`unsafe_cells = .Sized [(⟨4⟩, ⟨4⟩)]`,
+`freeze = false`), yielding `ReservedIm` on `[4, 8)` under `Validate _ false`. -/
+@[reducible] def npRefMutPairSndCellMrTy : Gen.Type :=
+  .Ptr (.Ref .Mutable
+    { layout := .Sized ⟨8⟩ ⟨4⟩, inhabited := true,
+      unsafe_cells := .Sized [(⟨4⟩, ⟨4⟩)], freeze := false, unpin := true })
+
+/-- MiniRust machine performing a LOCAL write `(*_2).1.unwrapUnsafeBinder = 99`
+through a function-entry-validated `Frozen` `&np::PairU32Binder` (`cells = []`):
+succeeds (`99`) on `Mach`, faults protected `Frozen` local-write UB on `MachTB`. -/
+def npV4PairFrozenLocalWriteMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefPairFrozenMrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]]
+
+/-- MiniRust machine performing a FOREIGN write `(*_3).1.unwrapUnsafeBinder = 99`
+through parent raw pointer `_3` over a function-entry-validated `Frozen`
+`&np::PairU32Binder` (`cells = []`): succeeds (`99`) on `Mach`, faults protected
+`Frozen` foreign-write UB on `MachTB`. -/
+def npV4PairFrozenForeignWriteMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefPairFrozenMrTy), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- MiniRust machine reading `(*_2).1.unwrapUnsafeBinder` (`11`) through a
+function-entry-validated `Frozen` `&np::PairU32Binder`: succeeds on BOTH `Mach`
+and `MachTB` (preserving `MachTB.wfLive`). -/
+def npV4PairFrozenLocalReadMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefPairFrozenMrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) })]]
+
+/-- MiniRust machine with `UnsafeCell` on `snd` (`cells = [(4, 4)]`,
+`fn_entry = true`): BOTH a local write (`88` via `_2`) AND a foreign write (`99`
+via parent raw pointer `_3`) to `[4, 8)` (`snd.unwrapUnsafeBinder`) succeed
+under the active function-entry protector on BOTH `Mach` and `MachTB`
+(preserving `MachTB.wfLive`), leaving `fst` (`[0, 4)`) untouched (`7`). -/
+def npV4PairCellLocalAndForeignWriteMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefPairSndCellMrTy), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 88) u32MrTy),
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- Sub-range `UnsafeCell` contrast on the exact same `npRefPairSndCellMrTy`
+(`cells = [(4, 4)]` ONLY): a foreign write to `fst` (`[0, 4)`, still protected
+`Frozen`) returns `99` on `Mach` and faults UB on `MachTB`. -/
+def npV4PairCellFrozenFstConflictMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefPairSndCellMrTy), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) true,
+        .Assign (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- Unprotected `ReservedIm` interior-mutability machine (`&mut np::PairU32Binder`
+with `cells = [(4, 4)]`, `fn_entry = false`): a foreign write `99` via `_3` to
+`[4, 8)` leaves `ReservedIm` intact (unlike `Reserved`), so a subsequent local
+write `55` via `_2` activates `ReservedIm -> Unique` and returns `55` on BOTH
+`Mach` and `MachTB` (preserving `MachTB.wfLive`). -/
+def npV4PairReservedImForeignWriteMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefMutPairSndCellMrTy), (localName 3, thinRawPtrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) false,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 99) u32MrTy),
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 55) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+
+/-- **Dedicated Stepped MiniRust `Frozen` vs. `Cell` (`UnsafeCell`) vs.
+`ReservedIM` `unwrapUnsafeBinder` Witness (`Mach` & `MachTB` with
+`MachTB.wfLive`)**, completing concrete 3-authority parity on
+`{ fst: u32, snd: BinderU32 }` alongside
+`np_v4_deref_field_frozen_disabled_cell_trusted_witness` and
+`lm_np_v4_deref_field_tb_frozen_disabled_cell_witness`:
+1. `Frozen` `&PairU32Binder` (`cells = []`, `fn_entry = true`): local write and
+   foreign write to `snd.unwrapUnsafeBinder` return `99` on `Mach` and fault UB
+   on `MachTB`, while local read returns `11` on both `Mach` and `MachTB`;
+2. `Cell` (`UnsafeCell` on `snd`, `cells = [(4, 4)]`, `fn_entry = true`): BOTH
+   local write (`88`) AND foreign write (`99`) to `[4, 8)` succeed on BOTH
+   `Mach` and `MachTB` (preserving `MachTB.wfLive` and `[0, 4) = 7`), whereas a
+   foreign write to the non-cell `[0, 4)` field (`fst`) still faults UB on
+   `MachTB`;
+3. `ReservedIM` (`&mut PairU32Binder`, `cells = [(4, 4)]`, `fn_entry = false`):
+   a foreign write (`99`) leaves `ReservedIm` writable, so the subsequent local
+   write (`55`) activates to `Unique` and returns `55` on BOTH `Mach` and
+   `MachTB` (preserving `MachTB.wfLive`). -/
+theorem np_v4_pair_frozen_vs_cell_mach_and_tb_witness :
+    -- 1. `Frozen` (`cells = []`): local write UB, foreign write UB, local read ok
+    (∃ m3, Interp.steps 3 npV4PairFrozenLocalWriteMach = .ok m3 ∧
+      ([0, 1].map (fun i => m3.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 99), some (scalarBytes u32 7 ++ scalarBytes u32 99)]) ∧
+    Interp.stepsTB 3 (liftMachToTB npV4PairFrozenLocalWriteMach) =
+      .error (.ub "Tree Borrows: local write to protected Frozen reference") ∧
+    (∃ m3, Interp.steps 3 npV4PairFrozenForeignWriteMach = .ok m3 ∧
+      m3.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 99)) ∧
+    Interp.stepsTB 3 (liftMachToTB npV4PairFrozenForeignWriteMach) =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    (∃ m2, Interp.steps 2 npV4PairFrozenLocalReadMach = .ok m2 ∧
+      m2.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 11)) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB npV4PairFrozenLocalReadMach) = .ok m2 ∧
+      MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[0]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 11).map (projByteTB ∘ liftByteTB))) ∧
+    -- 2. `Cell` (`cells = [(4, 4)]`, protected): local + foreign writes on `[4, 8)` ok; `[0, 4)` UB
+    (∃ m4, Interp.steps 4 npV4PairCellLocalAndForeignWriteMach = .ok m4 ∧
+      ([0, 1].map (fun i => m4.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 99), some (scalarBytes u32 7 ++ scalarBytes u32 99)]) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB npV4PairCellLocalAndForeignWriteMach) = .ok m4 ∧
+      MachTB.wfLive m4 ∧
+      ([0, 1].map (fun i => m4.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 99).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 99).map (projByteTB ∘ liftByteTB))]) ∧
+    (∃ m3, Interp.steps 3 npV4PairCellFrozenFstConflictMach = .ok m3 ∧
+      m3.mem.memory.allocations[0]?.map (·.data) = some (scalarBytes u32 99)) ∧
+    Interp.stepsTB 3 (liftMachToTB npV4PairCellFrozenFstConflictMach) =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    -- 3. `ReservedIM` (`cells = [(4, 4)]`, unprotected): foreign write then local write ok
+    (∃ m4, Interp.steps 4 npV4PairReservedImForeignWriteMach = .ok m4 ∧
+      ([0, 1].map (fun i => m4.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 55), some (scalarBytes u32 7 ++ scalarBytes u32 55)]) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB npV4PairReservedImForeignWriteMach) = .ok m4 ∧
+      MachTB.wfLive m4 ∧
+      ([0, 1].map (fun i => m4.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 55).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 7 ++ scalarBytes u32 55).map (projByteTB ∘ liftByteTB))]) :=
+  ⟨ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel)⟩
+
+/-- Trusted fixture matching `NullaryAndPtrCoercionLM.npV4PairForeignReadThenChildWriteMir`:
+foreign read `(*_1).1.unwrapUnsafeBinder`, then child write `(*_2).1.unwrapUnsafeBinder = 55`,
+then read back into `_0`. -/
+def npV4PairForeignReadThenChildWriteMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_foreign_read_then_child_write"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npRawMutPairU32BinderMirTy,
+     mkDecl npPairU32BinderMirTy, mkDecl u32MirTy] 2
+    [mkBb [mkSt (.assign (locPlace 4)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])))),
+           mkSt (.assign (locPlace 2 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy])
+             (.use (constU32 55))),
+           mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 2 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- Trusted initial state for `npV4PairForeignReadThenChildWriteMir` with parent
+borrow tag `1` (`_1`) and child borrow tag `2` (`_2`) targeting `_3 = { 7, 11 }`. -/
+def npPairForeignReadTrustedInit (childPerm : TreeBorrowPerm) (protectedMode : Bool) :
+    MachineState :=
+  let bParent : BorrowEntry :=
+    { tag := 1, targetLocal := 3, targetProjection := [], perm := .unique,
+      rangeOffset := 0, rangeLen := 0, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  let bChild : BorrowEntry :=
+    { tag := 2, targetLocal := 3, targetProjection := [], perm := childPerm,
+      rangeOffset := 0, rangeLen := 0,
+      protector := if protectedMode then some 1 else none,
+      parentTag := some 1, targetFrameDepth := 0, allocDead := false }
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.ptr ⟨2, 0⟩ 8),
+                          .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨11, 4⟩]), .uninit] },
+    memory := { (initMachineState npV4PairForeignReadThenChildWriteMir []).memory with
+      borrows := [bParent, bChild],
+      activeProtectors := if protectedMode then [1] else [] } }
+
+/-- MiniRust machine witnessing persisted foreign-read `.Unique -> .Frozen`
+demotion on `snd.unwrapUnsafeBinder` (`[4, 8)`):
+1. `Validate _2 false` creates unprotected `Reserved` child on `[0, 8)`;
+2. local write `(*_2).1.unwrapUnsafeBinder = 88` activates `[4, 8)` to `Unique`;
+3. foreign read `_4 = (*_3).1.unwrapUnsafeBinder` demotes `[4, 8)` to `Frozen`;
+4. subsequent local write `(*_2).1.unwrapUnsafeBinder = 55` succeeds (`55`) on
+   `Mach` and faults `"Tree Borrows: local write of Frozen reference"` on `MachTB`. -/
+def npV4PairForeignReadFreezeMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefMutPairFrozenMrTy), (localName 3, thinRawPtrTy),
+     (localName 4, u32MrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) false,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 88) u32MrTy),
+        .Assign (.Local (localName 4))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)),
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 55) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 640 (List.replicate 4 .Uninit) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) }),
+       (localName 4, { addr := 640, provenance := some (⟨4⟩, ()) })]]
+
+/-- Sub-range precision companion: after foreign read on `[4, 8)` freezes `[4, 8)`,
+a local write via `_2` to disjoint `[0, 4)` (`(*_2).0 = 55`) activates `[0, 4)`
+to `Unique` and returns `55` on BOTH `Mach` and `MachTB` (preserving `MachTB.wfLive`). -/
+def npV4PairForeignReadSndWriteFstMach : Mach :=
+  let fn := mkMrFn
+    [(localName 0, u32MrTy), (localName 1, npPairU32BinderMrTy),
+     (localName 2, npRefMutPairFrozenMrTy), (localName 3, thinRawPtrTy),
+     (localName 4, u32MrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[
+        .Validate (.Local (localName 2)) false,
+        .Assign (.Field (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 1) 0)
+          (.Constant (.Int 88) u32MrTy),
+        .Assign (.Local (localName 4))
+          (.Load (.Field (.Field (.Deref (.Load (.Local (localName 3))) npPairU32BinderMrTy) 1) 0)),
+        .Assign (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 0)
+          (.Constant (.Int 55) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Field (.Deref (.Load (.Local (localName 2))) npPairU32BinderMrTy) 0))],
+      .Return, .Regular⟩)]
+  mkMrMach (mkMrProg [(fnName 0, fn)])
+    [mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (scalarBytes u32 7 ++ scalarBytes u32 11) 4,
+     mkStackAlloc 384 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 512 (ptrBytes 256 (some (⟨1⟩, ()))) 8,
+     mkStackAlloc 640 (List.replicate 4 .Uninit) 4]
+    [mkRootFrame fn
+      [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) }),
+       (localName 4, { addr := 640, provenance := some (⟨4⟩, ()) })]]
+
+/-- **Persisted Foreign-Read `.Unique -> .Frozen` & Protected `ReservedFrz`
+Conflict Three-Way Parity (Trusted + MiniRust `Mach` & `MachTB` with
+`MachTB.wfLive`)**, completing 3-authority parity with
+`lm_np_v4_deref_field_read_persistence_witness`:
+1. Trusted: foreign read `(*parentPtr).1.unwrapUnsafeBinder` freezes unprotected
+   `.unique` -> `.frozen` (making the subsequent child write `.ub`) and marks
+   protected `.reservedFrz false` conflicted -> `.reservedFrz true` (making the
+   subsequent child write `.ub`), while unprotected `.reservedFrz false` and
+   `.cell` complete to `.u32Val 55`;
+2. MiniRust: foreign read on `[4, 8)` demotes `[4, 8)` from `Unique` to `Frozen`,
+   so writing `[4, 8)` succeeds (`55`) on `Mach` and faults
+   `"Tree Borrows: local write of Frozen reference"` on `MachTB`, while writing
+   disjoint `[0, 4)` succeeds (`55`) on BOTH `Mach` and `MachTB` (preserving
+   `MachTB.wfLive`). -/
+theorem np_v4_pair_foreign_read_freeze_three_way_witness :
+    -- 1. Trusted persisted foreign-read transitions
+    npRunTrusted npV4PairForeignReadThenChildWriteMir 16
+      (npPairForeignReadTrustedInit .unique false) = .ub ∧
+    npRunTrusted npV4PairForeignReadThenChildWriteMir 16
+      (npPairForeignReadTrustedInit (.reservedFrz false) true) = .ub ∧
+    npRunTrusted npV4PairForeignReadThenChildWriteMir 16
+      (npPairForeignReadTrustedInit (.reservedFrz false) false) = .u32Val 55 ∧
+    npRunTrusted npV4PairForeignReadThenChildWriteMir 16
+      (npPairForeignReadTrustedInit .cell false) = .u32Val 55 ∧
+    -- 2. MiniRust foreign-read freeze on `[4, 8)` (`Mach` ok vs. `MachTB` Frozen write UB)
+    (∃ m5, Interp.steps 5 npV4PairForeignReadFreezeMach = .ok m5 ∧
+      ([0, 1].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 55), some (scalarBytes u32 7 ++ scalarBytes u32 55)]) ∧
+    Interp.stepsTB 5 (liftMachToTB npV4PairForeignReadFreezeMach) =
+      .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+    -- 3. MiniRust sub-range precision: disjoint `[0, 4)` write succeeds on `Mach` and `MachTB`
+    (∃ m5, Interp.steps 5 npV4PairForeignReadSndWriteFstMach = .ok m5 ∧
+      ([0, 1].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 55), some (scalarBytes u32 55 ++ scalarBytes u32 88)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB npV4PairForeignReadSndWriteFstMach) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([0, 1].map (fun i => m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 55).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 55 ++ scalarBytes u32 88).map (projByteTB ∘ liftByteTB))]) :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel)⟩
+
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 
 Directly executes `MiniRustSpec.Interp.{steps, stepsTB}` for all 4 MIR

@@ -212,6 +212,8 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_tb_frozen_write_and_disabled_read_ub_minirust
   have _ := @np_tb_protected_unsafeCell_interior_mut_three_way
   have _ := @np_v4_pair_deref_caller_frame_full_return_witness
+  have _ := @np_v4_pair_frozen_vs_cell_mach_and_tb_witness
+  have _ := @np_v4_pair_foreign_read_freeze_three_way_witness
   have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
@@ -514,7 +516,31 @@ run_cmd do
     -- Verify LM fidelity, Tree Borrows, ZST boundary, & lifecycle theorems are present,
     -- non-trivial, and axiom-clean.
     let lmDeepThms : List Name :=
-      [ lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayLen?,
+      [ lmNs ++ `np_runtimeChecks_operand_universal,
+        lmNs ++ `npTreeBorrowsWriteCheck_basic_mode,
+        lmNs ++ `step_nullaryPtr_overlay_eq_ep2_of_free,
+        lmNs ++ `np_rvalueHooks_cast_eq_unwind_on_c6_c8,
+        lmNs ++ `np_rvalueHooks_evalOperandAt_eq_unwind_on_places,
+        lmNs ++ `np_rvalueHooks_cast_unsize_dispatch,
+        lmNs ++ `lm_np_v1_base_translate_boundary,
+        lmNs ++ `lowerNullaryRvalue_resolved,
+        lmNs ++ `lowerNullaryRvalue_unresolved,
+        lmNs ++ `lowerNullaryRvalue_runtime_flags,
+        lmNs ++ `lowerNullaryMirBody_fixtures,
+        lmNs ++ `lm_np_v1_nullaryOp_boundary_and_lowered_witness,
+        lmNs ++ `lm_np_v2_pointerCoercion_six_subkinds_witness,
+        lmNs ++ `lm_np_v2_unsize_base_boundary,
+        lmNs ++ `lm_np_v3_fnPtrToPtr_ub_and_divergence_witness,
+        lmNs ++ `np_unwrap_write_tb_conflict_bridges_vendored,
+        lmNs ++ `lm_np_v4_unwrapUnsafeBinder_witness,
+        lmNs ++ `lm_np_trusted_side_witness,
+        lmNs ++ `npLmObserve_v1_nullaryOp_table,
+        lmNs ++ `npLmObserve_v2_pointerCoercion_table,
+        lmNs ++ `npLmObserve_v3_fnPtrToPtr_table,
+        lmNs ++ `npLmObserve_v4_unwrapUnsafeBinder_table,
+        lmNs ++ `npLmObserve_all_32_table,
+        lmNs ++ `npLmObserve_unwrap_mode_sensitivity,
+        lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayLen?,
         lmNs ++ `npUnsizeArraySpec?_snd_eq_unsizeArrayToSliceSpec?_of_lt,
         lmNs ++ `np_v2_unsize_spec_laws,
         lmNs ++ `npUnsizeTreeBorrowsPermCheck_eq_trusted_universal,
@@ -525,14 +551,18 @@ run_cmd do
         lmNs ++ `lm_np_v2_unsize_tb_perm_edge_cases_witness,
         lmNs ++ `lm_np_v2_unsize_tb_edge_cases_stepped_witness,
         lmNs ++ `np_vendored_borrowTree_zero_size_and_oob_boundary,
+        lmNs ++ `lm_np_v2_unsize_reservedIM_cell_stepped_witness,
         lmNs ++ `lm_np_v2_mutToConstPointer_wide_slice_witness,
         lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness,
         lmNs ++ `lm_np_v4_nested_field_unwrap_disjoint_tb_witness,
         lmNs ++ `lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness,
         lmNs ++ `lm_np_v4_deref_field_bad_pointer_ub_witness,
         lmNs ++ `lm_np_v4_deref_field_misaligned_ub_witness,
+        lmNs ++ `lm_np_v4_deref_field_misaligned_read_ub_witness,
         lmNs ++ `npTreeBorrowsReadPermitted_perm_table,
+        lmNs ++ `npApplyTreeBorrowsReadAt_zst_noop,
         lmNs ++ `lm_np_v4_deref_field_tb_frozen_disabled_cell_witness,
+        lmNs ++ `lm_np_v4_deref_field_read_persistence_witness,
         lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
         lmNs ++ `lm_np_storage_lifecycle_witness,
         lmNs ++ `lm_np_v1_multihop_offsetof_and_failclosed_unsupported_witness ]
