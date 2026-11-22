@@ -5091,3 +5091,237 @@ fn multi_arg_spec_and_external_spec_companion_arities_zero_through_four() {
         assert!(four_spec.kills_every_mutant(), "seed {seed:#x}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Unreachable-branch bindings and constructor-exhaustive tautologies
+// (dynamic counterparts of Lean `SpecRealizabilityTests` section 3.25)
+// ---------------------------------------------------------------------------
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| if false { ret == 5 } else { true },
+)]
+fn dead_false_branch_fn(x: u32) -> u32 {
+    x
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| if x < 10 && x >= 10 { ret == 5 } else { true },
+)]
+fn dead_arith_branch_fn(x: u32) -> u32 {
+    x
+}
+
+#[spec(
+    requires: x < 10,
+    ensures: |ret| if false { ret == 5 } else { x < 10 },
+)]
+fn dead_branch_input_only_fn(x: u32) -> u32 {
+    x
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| if x < 10 && x >= 1 { ret == 5 } else { true },
+)]
+fn live_branch_fn(x: u32) -> u32 {
+    if (1..10).contains(&x) { 5 } else { x }
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| match ret {
+        Some(v) => v == v,
+        None => true,
+    },
+)]
+fn option_match_refl_fn(x: u32) -> Option<u32> {
+    x.checked_add(1)
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| match ret {
+        Ok(v) => v == v,
+        Err(_) => true,
+    },
+)]
+fn result_match_refl_fn(x: u32) -> Result<u32, u8> {
+    if x % 2 == 0 { Ok(x) } else { Err(0) }
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| ret.is_some() || ret.is_none(),
+)]
+fn option_ctor_exhaust_fn(x: u32) -> Option<u32> {
+    x.checked_sub(1)
+}
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| ret == Some(x) || (ret.is_none() && x == 0),
+)]
+fn option_some_input_fn(x: u32) -> Option<u32> {
+    Some(x)
+}
+
+/// Asserts that `outcome` is a [`VacuityClass::TrivialPostcondition`] whose
+/// postcondition never rejected any probed `(input, output)` pair, although
+/// every sampled input satisfied the precondition.
+fn assert_never_rejects_any_output(outcome: &SpecCheckOutcome) {
+    assert_eq!(
+        outcome.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    let stats = outcome.stats();
+    assert_eq!(stats.precondition_hits, stats.trials_run);
+    assert!(stats.mutants_tested > 0);
+    assert_eq!(stats.mutants_killed, 0);
+    assert!(matches!(
+        outcome.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes: 0,
+            skipped_out_of_precondition: 0,
+            saw_any_false: false,
+            saw_output_sensitivity: false,
+        }) if probed_inputs > 0
+    ));
+}
+
+#[test]
+fn unreachable_branch_bindings_are_trivial_postconditions() {
+    // `requires` is `true`, and the only mention of `ret` sits behind a guard
+    // that no input satisfies, so no output is ever rejected. Probing outside
+    // the precondition cannot change that: there is no such input.
+    for domain in [ProbeDomain::PreconditionOnly, ProbeDomain::Unconstrained] {
+        let cfg = SpecCheckConfig::default().with_probe_domain(domain);
+
+        let dead_false = check_contract(
+            cfg,
+            |&x: &u32| __anodized_fn_requires_dead_false_branch_fn(x),
+            |&x| dead_false_branch_fn(x),
+            |&x, &r| __anodized_fn_ensures_dead_false_branch_fn(x, r),
+        );
+        assert_never_rejects_any_output(&dead_false);
+
+        let dead_arith = check_contract(
+            cfg,
+            |&x: &u32| __anodized_fn_requires_dead_arith_branch_fn(x),
+            |&x| dead_arith_branch_fn(x),
+            |&x, &r| __anodized_fn_ensures_dead_arith_branch_fn(x, r),
+        );
+        assert_never_rejects_any_output(&dead_arith);
+    }
+
+    // Returning exactly the value named on the dead branch, and offering both
+    // `5` and non-`5` candidates through a custom mutant bank, changes nothing:
+    // the guarded equation is never evaluated.
+    let banked = check_contract_with_mutants(
+        SpecCheckConfig::default(),
+        &[5u32, 6, 0, u32::MAX],
+        |&x: &u32| __anodized_fn_requires_dead_arith_branch_fn(x),
+        |_x| 5u32,
+        |&x, &r| __anodized_fn_ensures_dead_arith_branch_fn(x, r),
+    );
+    assert_never_rejects_any_output(&banked);
+
+    // A dead binding beside an input-only reachable branch leaves the output
+    // unbound. Inside `requires` the postcondition holds for every output; the
+    // unconstrained probe sees it fail for `x >= 10` whatever the output is.
+    let input_only = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| __anodized_fn_requires_dead_branch_input_only_fn(x),
+        |&x| dead_branch_input_only_fn(x),
+        |&x, &r| __anodized_fn_ensures_dead_branch_input_only_fn(x, r),
+    );
+    assert_eq!(
+        input_only.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        input_only.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes,
+            skipped_out_of_precondition: 0,
+            saw_any_false: true,
+            saw_output_sensitivity: false,
+        }) if probed_inputs > out_of_precondition_probes && out_of_precondition_probes > 0
+    ));
+
+    // Negative control: once the guard is reachable (`1 <= x < 10`) the binding
+    // is live and kills mutants there, while hits outside it kill none.
+    let live = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_live_branch_fn(x),
+        |&x| live_branch_fn(x),
+        |&x, &r| __anodized_fn_ensures_live_branch_fn(x, r),
+    );
+    assert!(live.mutants_killed > 0);
+    assert!(live.hits_with_kill > 0);
+    assert!(live.hits_without_kill() > 0);
+    assert!(!live.is_pointwise_strong());
+}
+
+#[test]
+fn constructor_exhaustive_tautologies_are_trivial_postconditions() {
+    // `match ret { Some(v) => v == v, None => true }` accepts both variants and
+    // every payload, including the variant flips Stage D3 tests.
+    let option_refl = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_option_match_refl_fn(x),
+        |&x| option_match_refl_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_match_refl_fn(x, r),
+    );
+    assert_never_rejects_any_output(&option_refl);
+
+    // The same tautology over `Result`, whose body returns both variants.
+    let mut saw_ok = false;
+    let mut saw_err = false;
+    let result_refl = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_result_match_refl_fn(x),
+        |&x| {
+            let ret = result_match_refl_fn(x);
+            if ret.is_ok() {
+                saw_ok = true;
+            } else {
+                saw_err = true;
+            }
+            ret
+        },
+        |&x, &r| __anodized_fn_ensures_result_match_refl_fn(x, r),
+    );
+    assert!(saw_ok && saw_err);
+    assert_never_rejects_any_output(&result_refl);
+
+    // Constructor exhaustion without a `match`: `is_some() || is_none()`.
+    let ctor_exhaust = check_contract(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_option_ctor_exhaust_fn(x),
+        |&x| option_ctor_exhaust_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_ctor_exhaust_fn(x, r),
+    );
+    assert_never_rejects_any_output(&ctor_exhaust);
+
+    // Negative control: a constructor-sensitive postcondition rejects a mutant
+    // on every hit (`None` is admitted only for `x == 0`, `Some` only with
+    // payload `x`).
+    let genuine = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&x: &u32| __anodized_fn_requires_option_some_input_fn(x),
+        |&x| option_some_input_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_some_input_fn(x, r),
+    );
+    assert!(genuine.is_pointwise_strong());
+}

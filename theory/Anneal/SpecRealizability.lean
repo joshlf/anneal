@@ -1423,7 +1423,7 @@ private inductive ProbeOutcome : Type where
 private def tryTacticSnippetOutcome
     (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM ProbeOutcome := do
   let savedMsgs := (← getThe Core.State).messages
-  let result ← withoutModifyingState do
+  let result ← withoutModifyingState <| withOptions (fun opts => Elab.async.set opts false) do
     modifyThe Core.State fun s => { s with messages := {} }
     let attempt ← withBoundedHeartbeatsOutcome stepCapInternal do
       let goalTy ← instantiateMVars goalTy
@@ -1450,6 +1450,8 @@ private def tryTacticSnippetOutcome
       let proofTy ← inferType proof
       if !(← isDefEq proofTy goalTy) then
         return false
+      Meta.checkWithKernel
+        (ShareCommon.shareCommon' (mkApp2 (mkConst ``id [Level.zero]) goalTy proof))
       return true
     match attempt with
     | .done true => return .proved
@@ -1518,16 +1520,85 @@ private def splitMatchGoals (maxGoals : Nat) :
       let (finalGoals, didAny) ← splitMatchGoals maxGoals fuel rest (mid :: done)
       return (finalGoals, didAny)
 
+/-- Whether `ty` is, up to `whnf`, a non-recursive, non-nested, non-indexed inductive
+    datatype with two to four constructors (`Option`, `Except`, `Sum`, `Bool`,
+    `Ordering`, or a user `Result`-like type): a type whose values a single `cases`
+    step exhausts. Propositions are excluded, since `destructHypsMulti` owns
+    hypotheses. -/
+private def isSmallSumType (ty : Expr) : MetaM Bool := do
+  if ← isProp ty then
+    return false
+  let tyWhnf ← whnf ty
+  match tyWhnf.getAppFn with
+  | .const name _ =>
+    match (← getEnv).find? name with
+    | some (.inductInfo iv) =>
+      return !iv.isRec && iv.numNested == 0 && iv.numIndices == 0 &&
+        Nat.ble 2 iv.ctors.length && Nat.ble iv.ctors.length 4
+    | _ => return false
+  | _ => return false
+
+/-- Bounded data case analysis for the fallback prover: repeatedly `cases` on the most
+    recently introduced local variable whose type `isSmallSumType` (outputs and their
+    primed copies are introduced last), keeping at most `maxGoals` goals open and
+    rolling back any step that would exceed the cap. Returns the resulting goals and
+    whether at least one `cases` step happened.
+
+    A postcondition can be a tautology only up to the constructors of its output
+    (`ret = none ∨ ∃ v, ret = some v`, `ret.isSome ∨ ret.isNone`) without containing
+    any `match` for `splitMatchGoals` to split. Exhausting the constructors reduces
+    such a goal to leaves the deterministic closers decide. -/
+private def casesSmallSumLocals (maxGoals : Nat) :
+    Nat → List MVarId → List MVarId → MetaM (List MVarId × Bool)
+  | 0, pending, done => return (done ++ pending, false)
+  | _, [], done => return (done, false)
+  | fuel + 1, mid :: rest, done => do
+    let maxSgs := maxGoals - (done.length + rest.length)
+    let cand? : Option FVarId ← mid.withContext do
+      let lctx ← getLCtx
+      let mut found? : Option FVarId := none
+      for decl in lctx do
+        if decl.isImplementationDetail then continue
+        let ty ← instantiateMVars decl.type
+        if ← isSmallSumType ty then
+          found? := some decl.fvarId
+      return found?
+    let casesRes? : Option (List MVarId) ←
+      match cand? with
+      | none => pure none
+      | some fvarId =>
+        commitWhenSome? do
+          let r? ← try (some <$> mid.cases fvarId) catch _ => pure none
+          match r? with
+          | some sgs =>
+            if Nat.ble sgs.size maxSgs then
+              return some (sgs.toList.map (fun sg => sg.mvarId))
+            else
+              return none
+          | none => return none
+    match casesRes? with
+    | some sgs =>
+      let (finalGoals, _) ← casesSmallSumLocals maxGoals fuel (sgs ++ rest) done
+      return (finalGoals, true)
+    | none =>
+      let (finalGoals, didAny) ← casesSmallSumLocals maxGoals fuel rest (mid :: done)
+      return (finalGoals, didAny)
+
 /-- Bounded fallback prover for goals containing `match` / `ite` expressions (such as
     nested `match` over `Value.scalar` / `Value.aggregate` for `Option<u32>` MIR lowering)
     that `proverSnippets` did not close directly: splits up to 12 `match`/`ite` nodes
     capped at 16 open subgoals, unpacks newly exposed hypotheses on each leaf, closes
     each leaf with `simp_all` + deterministic closers, and `Meta.check`s the resulting
-    proof term. Exits immediately without re-running tactics when no split applies. -/
+    proof term. Exits immediately without re-running tactics when no split applies.
+
+    With `dataCases := true` it instead first exhausts the constructors of up to three
+    small sum-typed local variables (`casesSmallSumLocals`), exiting immediately when
+    there is none, and then splits and closes the resulting goals the same way. -/
 private def trySplitAndProveOutcome
-    (goalTy : Expr) (stepCapInternal : Nat) : MetaM ProbeOutcome := do
+    (goalTy : Expr) (stepCapInternal : Nat) (dataCases : Bool := false) :
+    MetaM ProbeOutcome := do
   let savedMsgs := (← getThe Core.State).messages
-  let result ← withoutModifyingState do
+  let result ← withoutModifyingState <| withOptions (fun opts => Elab.async.set opts false) do
     modifyThe Core.State fun s => { s with messages := {} }
     let attempt ← withBoundedHeartbeatsOutcome stepCapInternal do
       let goalTy ← instantiateMVars goalTy
@@ -1538,8 +1609,12 @@ private def trySplitAndProveOutcome
       let mvar ← mkFreshExprSyntheticOpaqueMVar goalTy
       let mvarId ← introsUnfoldingNot 8 mvar.mvarId!
       let goals ← destructHypsMulti 8 128 [(mvarId, #[])] []
-      let (splitGoals, didSplit) ← splitMatchGoals 16 12 goals []
-      if !didSplit then
+      let (casedGoals, didCases) ←
+        if dataCases then casesSmallSumLocals 16 3 goals [] else pure (goals, false)
+      if dataCases && !didCases then
+        return false
+      let (splitGoals, didSplit) ← splitMatchGoals 16 12 casedGoals []
+      if !dataCases && !didSplit then
         return false
       let closeTac ←
         `(tactic| (try simp_all) <;> first | trivial | rfl | assumption | contradiction | decide | omega)
@@ -1563,6 +1638,8 @@ private def trySplitAndProveOutcome
       let proofTy ← inferType proof
       if !(← isDefEq proofTy goalTy) then
         return false
+      Meta.checkWithKernel
+        (ShareCommon.shareCommon' (mkApp2 (mkConst ``id [Level.zero]) goalTy proof))
       return true
     match attempt with
     | .done true => return .proved
@@ -1574,15 +1651,18 @@ private def trySplitAndProveOutcome
 
 /-- Sound, heartbeat-bounded, message-log-isolated prover for closed or local-context
     propositions `goalTy`. Tries fast deterministic tactics (`trivial`/`rfl`/
-    `assumption`/`contradiction`/`decide`, `omega`, `simp_all`, `grind`) and bounded
-    `match`/`ite` splitting, accepting a proof only after `Meta.check` confirms zero
-    `sorry`, zero mvars, and zero errors. -/
+    `assumption`/`contradiction`/`decide`, `omega`, `simp_all`, `grind`), bounded
+    `match`/`ite` splitting, and bounded case analysis on small sum-typed variables,
+    accepting a proof only after `Meta.check` confirms zero `sorry`, zero mvars, and
+    zero errors. -/
 def tryProve (goalTy : Expr) (stepCapInternal : Nat := 50000000) : MetaM Bool := do
   let goalTy ← instantiateMVars goalTy
   for tac in (← proverSnippets) do
     if ← tryTacticSnippet goalTy stepCapInternal tac then
       return true
-  return (← trySplitAndProveOutcome goalTy stepCapInternal) == .proved
+  if (← trySplitAndProveOutcome goalTy stepCapInternal) == .proved then
+    return true
+  return (← trySplitAndProveOutcome goalTy stepCapInternal (dataCases := true)) == .proved
 
 /-! ### Closed-Arithmetic Goal Normalization -/
 
@@ -1785,6 +1865,22 @@ private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr)
     return false
   | some cap =>
     match ← trySplitAndProveOutcome goalTy cap with
+    | .proved => return true
+    | .undecided => pure ()
+    | .cutOff =>
+      if let some ref := cutOffRef? then
+        ref.set true
+      return false
+  -- Last resort, reached only when every earlier stage ran to completion without a
+  -- proof: exhaust the constructors of small sum-typed variables. It exits at once
+  -- when the goal has no such variable.
+  match ← budget.nextCap? with
+  | none =>
+    if let some ref := cutOffRef? then
+      ref.set true
+    return false
+  | some cap =>
+    match ← trySplitAndProveOutcome goalTy cap (dataCases := true) with
     | .proved => return true
     | .undecided => return false
     | .cutOff =>
@@ -1992,8 +2088,49 @@ private def unwrapNot? (e : Expr) : Option Expr :=
   else
     none
 
-/-- Whether `neg` is syntactically the negation of `p`: either `¬ p`, or `a ≠ b` when
-    `p` is `a = b`. -/
+/-- Decompose an order atom over `Nat` stated with the core instances `instLTNat` /
+    `instLENat` into `(strict, lo, hi)`: `lo < hi` when `strict`, `lo ≤ hi` otherwise
+    (`a > b` and `a ≥ b` are read right to left).
+
+    Only the two core `Nat` instances are recognized, for which `<` and `≤` have their
+    standard meaning in every model. An order atom over any other type, or over `Nat`
+    with a user-supplied `LT`/`LE` instance (which need not be lawful), is never
+    decomposed. -/
+private def natOrderAtom? (e : Expr) : Option (Bool × Expr × Expr) :=
+  let e := e.consumeMData
+  let args := e.getAppArgs
+  if args.size != 4 then
+    none
+  else if !(args[0]!.consumeMData.isConstOf ``Nat) then
+    none
+  else
+    let inst := args[1]!.consumeMData
+    let a := args[2]!.consumeMData
+    let b := args[3]!.consumeMData
+    if e.isAppOf ``LT.lt && inst.isConstOf ``instLTNat then
+      some (true, a, b)
+    else if e.isAppOf ``GT.gt && inst.isConstOf ``instLTNat then
+      some (true, b, a)
+    else if e.isAppOf ``LE.le && inst.isConstOf ``instLENat then
+      some (false, a, b)
+    else if e.isAppOf ``GE.ge && inst.isConstOf ``instLENat then
+      some (false, b, a)
+    else
+      none
+
+/-- Whether `p` and `q` are complementary core `Nat` order atoms: `a < b` against
+    `b ≤ a`, in any of the `<`/`>`/`≤`/`≥` spellings. Exactly one of the two holds for
+    all `a b : Nat` (`Nat.lt_or_ge`, `Nat.not_le_of_gt`), so each is the negation of
+    the other. -/
+private def isNatOrderComplement (p q : Expr) : Bool :=
+  match natOrderAtom? p, natOrderAtom? q with
+  | some (strictP, loP, hiP), some (strictQ, loQ, hiQ) =>
+    strictP != strictQ && loP == hiQ && hiP == loQ
+  | _, _ => false
+
+/-- Whether `neg` is syntactically the negation of `p`: either `¬ p`, `a ≠ b` when
+    `p` is `a = b`, or the complementary core `Nat` order atom (`a ≥ b` when `p` is
+    `a < b`; see `isNatOrderComplement`). -/
 private def isNegationOf (neg p : Expr) : Bool :=
   let neg := neg.consumeMData
   let p := p.consumeMData
@@ -2006,7 +2143,7 @@ private def isNegationOf (neg p : Expr) : Bool :=
       negArgs[1]!.consumeMData == pArgs[1]!.consumeMData &&
         negArgs[2]!.consumeMData == pArgs[2]!.consumeMData
     else
-      false
+      isNatOrderComplement neg p
 
 /-- Whether `q` restates `p` with the two sides of an `Eq` or `Ne` swapped (`a = b`
     versus `b = a`). The two are equivalent by symmetry in every model. -/
@@ -2049,14 +2186,17 @@ private def hasComplementaryPair (props : List Expr) : Bool :=
 /-- Fast syntactic contradiction recognizer for `Prop` expressions (`False`, `r ≠ r`,
     `true = false`, `decide (r ≠ r) = true`, `decide (r = r) = false`, `¬ True`,
     `¬ (r = r)`, `¬ (P ↔ P)`, `P ↔ ¬ P`, a conjunction with a contradictory conjunct
-    or with a complementary pair `P`, `¬ P` among its conjuncts, a disjunction or
-    `ite`/`dite` whose branches are all contradictory, and an existential with a
+    or with a complementary pair `P`, `¬ P` among its conjuncts, a disjunction whose
+    disjuncts are all contradictory, an `ite`/`dite` whose branches are all
+    contradictory or whose only reachable branch is, and an existential with a
     contradictory body).
 
     Every recognized shape is unsatisfiable in all models, so the recognizer needs no
     prover and stays effective when the probe heartbeat budget is exhausted. Like
-    `detectSyntacticTautology`, it never appeals to the order relations `<` and `≤`,
-    whose irreflexivity depends on a lawful instance. -/
+    `detectSyntacticTautology`, it never appeals to an arbitrary order relation `<` or
+    `≤`, whose laws depend on a lawful instance. The one exception is a complementary
+    pair of order atoms over `Nat` with the core instances (`x < 10 ∧ x ≥ 10`), whose
+    meaning is fixed (`isNatOrderComplement`). -/
 def detectSyntacticContradiction : Nat → Expr → Bool
   | 0, _ => false
   | fuel + 1, e =>
@@ -2116,15 +2256,25 @@ def detectSyntacticContradiction : Nat → Expr → Bool
       let rhs := e.appArg!
       isNegationOf lhs rhs || isNegationOf rhs lhs
     else if e.isAppOfArity ``ite 5 then
+      -- `ite c t f` is unsatisfiable when both branches are, and also when its only
+      -- reachable branch is: `c` contradictory leaves `f`, `¬ c` contradictory leaves `t`.
       let args := e.getAppArgs
-      detectSyntacticContradiction fuel args[3]! &&
-        detectSyntacticContradiction fuel args[4]!
+      let cond := args[1]!
+      let tContra := detectSyntacticContradiction fuel args[3]!
+      let fContra := detectSyntacticContradiction fuel args[4]!
+      (tContra && fContra) ||
+        (fContra && detectSyntacticContradiction fuel cond) ||
+        (tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond))
     else if e.isAppOfArity ``dite 5 then
       let args := e.getAppArgs
+      let cond := args[1]!
       match args[3]!.consumeMData, args[4]!.consumeMData with
       | .lam _ _ tBody _, .lam _ _ fBody _ =>
-        detectSyntacticContradiction fuel tBody &&
-          detectSyntacticContradiction fuel fBody
+        let tContra := detectSyntacticContradiction fuel tBody
+        let fContra := detectSyntacticContradiction fuel fBody
+        (tContra && fContra) ||
+          (fContra && detectSyntacticContradiction fuel cond) ||
+          (tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond))
       | _, _ => false
     else if e.isAppOfArity ``Exists 2 then
       match e.appArg!.consumeMData with
@@ -2547,9 +2697,10 @@ private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
     `HEq r r`, `decide (r = r) = true`, `decide (r ≠ r) = false`, `¬ (r ≠ r)`,
     `¬ (P ∧ ¬ P)`, `P ↔ P`, `(a = b) ↔ (b = a)`, `(a = b) = (b = a)`, `P → P`,
     `A → B → A`, `P ∧ Q → P`, `a = b → b = a`, ex falso from a contradictory
-    hypothesis (`r ≠ r → P`), `r = r ∨ P`, `P ∨ Q ∨ ¬ P`, `if`/`dite` with
-    tautological branches, `∃ k, k = ret` (including branching existentials), and
-    `∀ k, k = ret → k = ret`).
+    hypothesis (`r ≠ r → P`), `r = r ∨ P`, `P ∨ Q ∨ ¬ P`, `if`/`dite` whose reachable
+    branches are tautological (a branch guarded by a contradictory condition, or the
+    `else` of a tautological one, is unreachable and is not inspected), `∃ k, k = ret`
+    (including branching existentials), and `∀ k, k = ret → k = ret`).
 
     Every recognized shape is valid in all models. In particular `r ≤ r` is *not*
     recognized syntactically: `LE.le` is an arbitrary user-supplied relation, and
@@ -2558,7 +2709,8 @@ private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
     constraint on `r`. `(r == r) = true` is left to the prover for the same reason
     (`BEq` need not be reflexive), whereas `decide (r = r) = true` is equivalent to
     `r = r`. Reflexive inequalities over lawful orders are still caught by the bounded
-    prover, which must actually prove them.
+    prover, which must actually prove them. Complementary order atoms are paired only
+    over `Nat` with the core instances (`x < 10 ∨ x ≥ 10`; see `isNatOrderComplement`).
 
     `hyps` holds the hypotheses in scope at the current binder depth: non-dependent
     implications lower `body` via `lowerLooseBVars 1 1` so `dom`, `body`, and `hyps`
@@ -2613,8 +2765,19 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       let cond := args[1]!.consumeMData
       let tBranch := args[3]!
       let fBranch := args[4]!
-      if (detectSyntacticTautology fuel (assumeHyp cond hyps) tBranch).isSome &&
-         (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome then
+      -- `ite c t f` is valid iff `c → t` and `¬ c → f`. A branch whose guard can never
+      -- hold is unreachable and owes nothing, so a constraint on the output placed
+      -- there (`if False then ret = 5 else True`) binds nothing: the `then` branch is
+      -- dead when `c` is contradictory (alone or against `hyps`), the `else` branch
+      -- when `c` is tautological under `hyps`.
+      let thenDead :=
+        detectSyntacticContradiction fuel cond || hasComplementaryPair (assumeHyp cond hyps)
+      let elseDead := (detectSyntacticTautology fuel hyps cond).isSome
+      let thenOk := thenDead ||
+        (detectSyntacticTautology fuel (assumeHyp cond hyps) tBranch).isSome
+      let elseOk := elseDead ||
+        (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome
+      if thenOk && elseOk then
         some .tautologicalImplication
       else
         none
@@ -2623,14 +2786,21 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       let cond := args[1]!.consumeMData
       match args[3]!.consumeMData, args[4]!.consumeMData with
       | .lam _ _ tBody _, .lam _ _ fBody _ =>
-        if !tBody.hasLooseBVar 0 && !fBody.hasLooseBVar 0 then
-          let tBody' := tBody.lowerLooseBVars 1 1
-          let fBody' := fBody.lowerLooseBVars 1 1
-          if (detectSyntacticTautology fuel (assumeHyp cond hyps) tBody').isSome &&
-             (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBody').isSome then
-            some .tautologicalImplication
-          else
-            none
+        -- As for `ite`. A dead branch is never inspected, so it may freely mention
+        -- its guard proof; a live branch must not (`hasLooseBVar 0`).
+        let thenDead :=
+          detectSyntacticContradiction fuel cond || hasComplementaryPair (assumeHyp cond hyps)
+        let elseDead := (detectSyntacticTautology fuel hyps cond).isSome
+        let thenOk := thenDead ||
+          (!tBody.hasLooseBVar 0 &&
+            (detectSyntacticTautology fuel (assumeHyp cond hyps)
+              (tBody.lowerLooseBVars 1 1)).isSome)
+        let elseOk := elseDead ||
+          (!fBody.hasLooseBVar 0 &&
+            (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps)
+              (fBody.lowerLooseBVars 1 1)).isSome)
+        if thenOk && elseOk then
+          some .tautologicalImplication
         else
           none
       | _, _ => none

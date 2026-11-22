@@ -3571,6 +3571,188 @@ theorem existsUnderReqInsensitivePost_dichotomy_without_pre :
   (some (Lean.mkConst ``smallInputPre)) (some .survivedAllMutants)
 #eval assertEnsuresBindsOutput (Lean.mkConst ``existsUnderReqInsensitivePost)
 
+/-! ### 3.25 Unreachable Branches & Constructor-Exhaustive Tautologies -/
+
+/-- `requires` that admits every input. -/
+def anyInputPre (_x : Nat) : Prop := True
+
+/-- `ret = 5` sits on a branch guarded by `False`: no input reaches it. -/
+def deadFalseBranchPost (_x ret : Nat) : Prop :=
+  if False then ret = 5 else True
+
+/-- `ret = 5` sits behind a guard that no `x : Nat` satisfies. -/
+def deadArithBranchPost (x ret : Nat) : Prop :=
+  if x < 10 ∧ x ≥ 10 then ret = 5 else True
+
+/-- `ret = 5` sits on the `else` branch of a tautological guard. -/
+def deadElseBranchPost (x ret : Nat) : Prop :=
+  if x = x then True else ret = 5
+
+/-- `ret = 5` sits on the `then` branch of a `dite` with a contradictory guard. -/
+def deadDiteBranchPost (x ret : Nat) : Prop :=
+  if _h : x ≠ x then ret = 5 else True
+
+/-- The only reachable branch is input-only: the dead `ret = 5` binds nothing
+    (`UnboundReturnOutput`). -/
+def deadBranchInputOnlyPost (x ret : Nat) : Prop :=
+  if False then ret = 5 else x < 10
+
+/-- Negative control: the guard holds for `1 ≤ x < 10`, where `ret = 5` is binding. -/
+def liveBranchPost (x ret : Nat) : Prop :=
+  if x < 10 ∧ x ≥ 1 then ret = 5 else True
+
+/-- Tautological on every constructor of an `Option` output. -/
+def optionMatchReflPost (_x : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => v = v
+  | none => True
+
+/-- Tautological on every constructor of an `Except` (Lean `Result` analog) output. -/
+def exceptMatchReflPost (_x : Nat) (ret : Except Nat Nat) : Prop :=
+  match ret with
+  | .ok v => v = v
+  | .error _ => True
+
+/-- The payload of `some` is bound only on an unreachable branch. -/
+def optionDeadArmPost (x : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => if x < 10 ∧ x ≥ 10 then v = 5 else True
+  | none => True
+
+/-- Arithmetic tautologies on both constructors, neither one syntactically reflexive. -/
+def optionMatchArithTautPost (x : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => v + x ≥ x
+  | none => x + 1 > x
+
+/-- Constructor exhaustion without any `match`: every `Option` is `none` or `some _`. -/
+def optionCtorExhaustPost (_x : Nat) (ret : Option Nat) : Prop :=
+  ret = none ∨ ∃ v : Nat, ret = some v
+
+/-- Constructor exhaustion through the `Bool` observers `isSome` / `isNone`. -/
+def optionIsSomeOrNonePost (_x : Nat) (ret : Option Nat) : Prop :=
+  ret.isSome = true ∨ ret.isNone = true
+
+/-- Constructor exhaustion of an `Except` output without any `match`. -/
+def exceptCtorExhaustPost (_x : Nat) (ret : Except Nat Nat) : Prop :=
+  (∃ v : Nat, ret = Except.ok v) ∨ (∃ e : Nat, ret = Except.error e)
+
+/-- Negative control: `none` is admitted only for `x = 0`, `some` only with payload `x`. -/
+def optionSomeInputPost (x : Nat) (ret : Option Nat) : Prop :=
+  ret = some x ∨ (ret = none ∧ x = 0)
+
+/-- A lawless "less-than" on `Nat` that relates every pair. -/
+@[instance_reducible] def alwaysLT : LT Nat := ⟨fun _ _ => True⟩
+
+/-- Negative control: under a user-supplied `LT Nat` instance, `ret < x` and `ret ≥ x`
+    are not complementary. The first conjunct is `True`, so the body is the genuine
+    lower bound `ret ≥ x`. -/
+def lawlessNatOrderPost (x ret : Nat) : Prop :=
+  @LT.lt Nat alwaysLT ret x ∧ ret ≥ x
+
+theorem deadFalseBranchPost_not_dichotomy :
+    ¬ PostconditionDichotomy anyInputPre deadFalseBranchPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    show if False then ret = 5 else True
+    simp)
+
+theorem deadArithBranchPost_not_dichotomy :
+    ¬ PostconditionDichotomy anyInputPre deadArithBranchPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    show if x < 10 ∧ x ≥ 10 then ret = 5 else True
+    split <;> first | trivial | omega)
+
+theorem liveBranchPost_dichotomy :
+    PostconditionDichotomy anyInputPre liveBranchPost := by
+  refine ⟨2, trivial, ⟨5, ?_⟩, ⟨6, ?_⟩⟩
+  · show if (2 : Nat) < 10 ∧ (2 : Nat) ≥ 1 then (5 : Nat) = 5 else True
+    decide
+  · intro h
+    have h' : if (2 : Nat) < 10 ∧ (2 : Nat) ≥ 1 then (6 : Nat) = 5 else True := h
+    revert h'
+    decide
+
+theorem optionMatchReflPost_not_dichotomy :
+    ¬ PostconditionDichotomy anyInputPre optionMatchReflPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    cases ret with
+    | none => exact True.intro
+    | some v => exact Eq.refl v)
+
+theorem optionCtorExhaustPost_not_dichotomy :
+    ¬ PostconditionDichotomy anyInputPre optionCtorExhaustPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    unfold optionCtorExhaustPost
+    cases ret with
+    | none => exact Or.inl rfl
+    | some v => exact Or.inr ⟨v, rfl⟩)
+
+theorem optionSomeInputPost_dichotomy :
+    PostconditionDichotomy anyInputPre optionSomeInputPost := by
+  refine ⟨1, trivial, ⟨some 1, Or.inl rfl⟩, ⟨none, ?_⟩⟩
+  rintro (hSome | ⟨_, hZero⟩)
+  · cases hSome
+  · exact Nat.succ_ne_zero 0 hZero
+
+-- An output constraint on an unreachable branch binds nothing. With `requires := True`
+-- every fixture is a `TrivialPostcondition`, and the syntactic layer alone settles it:
+-- these checks run with a starved probe budget, under which no tactic proves anything.
+#eval assertEnsuresVacuous (Lean.mkConst ``deadFalseBranchPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``deadArithBranchPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``deadElseBranchPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``deadDiteBranchPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+-- The same verdicts under the default budget, with and without `requires`.
+#eval assertEnsuresVacuous (Lean.mkConst ``deadFalseBranchPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``deadArithBranchPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``deadFalseBranchPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``deadArithBranchPost) none
+  (some .trivialPostcondition)
+-- A dead binding beside an input-only reachable branch leaves the output unbound.
+#eval assertEnsuresVacuous (Lean.mkConst ``deadBranchInputOnlyPost) none
+  (some .unboundReturnOutput)
+-- Negative control: a reachable guard keeps its binding.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``liveBranchPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``liveBranchPost)
+  (some (Lean.mkConst ``anyInputPre))
+
+-- Tautologies up to the constructors of an `Option` / `Except` output: `match` arms
+-- that are reflexive or dead collapse syntactically (starved budget).
+#eval assertEnsuresVacuous (Lean.mkConst ``optionMatchReflPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``exceptMatchReflPost)
+  (some (Lean.mkConst ``anyInputPre)) (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``optionDeadArmPost) none
+  (some .trivialPostcondition) { stepHeartbeats := 0, totalHeartbeats := 0 }
+-- Arithmetic arms need the bounded prover's `match` splitting, and constructor
+-- exhaustion stated without any `match` needs its case analysis on the output.
+#eval assertEnsuresVacuous (Lean.mkConst ``optionMatchReflPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``optionMatchArithTautPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``optionCtorExhaustPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``optionIsSomeOrNonePost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``exceptCtorExhaustPost) none
+  (some .trivialPostcondition)
+-- Negative controls: a constructor-sensitive postcondition is still accepted, and
+-- order atoms over a user-supplied `Nat` instance are never paired as complements.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``optionSomeInputPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``lawlessNatOrderPost)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``lawlessNatOrderPost) none
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
