@@ -2214,7 +2214,8 @@ theorem contradictoryHypVal_not_dichotomy (pre : Value → Prop) :
   not_dichotomy_of_universal_post fun _ _ _ ⟨h₁, h₂⟩ =>
     nomatch h₁.symm.trans h₂
 
-#expect_vacuous contradictoryHypVal semanticallyInsensitive
+-- Conjunctive congruence now refutes `a = .unit ∧ a = .uninit` syntactically.
+#expect_vacuous contradictoryHypVal reflexiveTautology
 
 vacuous_case nonemptyFin semanticallyInsensitive :=
   fun _ r => Nonempty (Fin (r + 1))
@@ -4272,6 +4273,550 @@ run_meta do
       verdict\n{r.describe}"
 
 end HardeningA3
+
+/-! ## Hardening (pass B4): budget caps, closed arithmetic, subsingletons, fibres, and gates -/
+
+namespace HardeningB4
+
+open Trusted.Rustc.V2026_06_01.Layout
+
+/-! ### 1. Budget caps (`probeHeartbeats := 0`, `checkRequiresSatisfiable`, empty domain) -/
+
+/-- Empty input domain whose structural refutation needs no tactic probes. -/
+def emptyProdPre : Empty × Nat → Prop := fun _ => True
+
+theorem emptyProdPre_not_preSatisfiable : ¬ PreconditionSatisfiable emptyProdPre :=
+  fun ⟨⟨e, _⟩, _⟩ => e.elim
+
+run_meta do
+  -- `probeHeartbeats := 0` disables tactic probes rather than passing Lean's
+  -- `maxHeartbeats := 0` unlimited sentinel (even when `maxAnalysisHeartbeats`
+  -- is non-zero).
+  let r ← reportOf ``HardeningA3.leSelfPlus
+    (cfg := { probeHeartbeats := 0, maxAnalysisHeartbeats := 500 })
+  unless r.bindsOutput do
+    throwError "leSelfPlus (probeHeartbeats=0): expected conservative binds\n\
+      {r.describe}"
+  -- `checkRequiresSatisfiable` respects `maxAnalysisHeartbeats` and never
+  -- times its caller out, returning conservative `refuted := false` with note.
+  let rr ← checkDeclRequiresSatisfiable ``Class1.contradictoryPreContract
+    (cfg := { maxAnalysisHeartbeats := 1 })
+  unless !rr.refuted && rr.notes.contains EnsuresCheck.analysisBudgetNote do
+    throwError "contradictoryPreContract (starved requires): expected \
+      un-refuted with budget note, got refuted={rr.refuted} notes={rr.notes}"
+  -- Structural empty-domain refutation works even with `semanticProbe := false`.
+  let re ← checkDeclRequiresSatisfiable ``emptyProdPre
+    (cfg := { semanticProbe := false })
+  unless re.refuted do
+    throwError "emptyProdPre (semanticProbe=false): expected structural refutation"
+
+/-! ### 2. Closed 0-ary `Nat` and `Int` arithmetic definitions -/
+
+def myU32Mod : Nat := 2 ^ 32
+def modByConst : Nat → Nat → Prop := fun _ r => r % myU32Mod < myU32Mod
+
+theorem modByConst_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre modByConst :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    Nat.mod_lt r (Nat.pos_of_ne_zero (by decide))
+
+def intModulus (n : Nat) : Int := (scalarModulus n : Int)
+def intModVacuous : Int → Int → Prop := fun _ r => r % intModulus 4 < intModulus 4
+
+theorem intModVacuous_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre intModVacuous :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    Int.emod_lt_of_pos r (by decide)
+
+def myIntMod : Int := 2 ^ 32
+def intModConstVacuous : Int → Int → Prop := fun _ r => r % myIntMod < myIntMod
+
+theorem intModConstVacuous_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre intModConstVacuous :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    Int.emod_lt_of_pos r (by decide)
+
+def myNegShift : Int := -5
+def intNegShiftVacuous : Int → Int → Prop := fun _ r => r + myNegShift < r
+
+theorem intNegShiftVacuous_not_dichotomy (pre : Int → Prop) :
+    ¬ PostconditionDichotomy pre intNegShiftVacuous :=
+  not_dichotomy_of_const_true fun _ r _ => by
+    dsimp [intNegShiftVacuous, myNegShift]
+    omega
+
+#expect_vacuous modByConst semanticallyInsensitive
+#expect_vacuous intModVacuous semanticallyInsensitive
+#expect_vacuous intModConstVacuous semanticallyInsensitive
+#expect_vacuous intNegShiftVacuous semanticallyInsensitive
+
+/-! ### 3. Composite subsingletons, function spaces, subtypes, and base-less inductives -/
+
+def optEmptyFin1 : Nat → Option Empty × Fin 1 → Prop :=
+  fun _ r => r = (.none, ⟨0, by decide⟩)
+
+theorem optEmptyFin1_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optEmptyFin1 :=
+  not_dichotomy_of_prod_subsingletons
+    (fun a b => match a, b with
+      | none, none => rfl
+      | some e, _ => e.elim
+      | _, some e => e.elim)
+    Subsingleton.elim
+
+def sumFin0Fin1 : Nat → Sum (Fin 0) (Fin 1) → Prop :=
+  fun _ r => r = .inr ⟨0, by decide⟩
+
+theorem sumFin0Fin1_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre sumFin0Fin1 :=
+  not_dichotomy_of_sum_empty_left Fin.elim0 fun _ b₁ b₂ _ => by
+    have h : b₁ = b₂ := Subsingleton.elim b₁ b₂
+    rw [h]
+
+def fnToOptEmpty : Nat → (Nat → Option Empty) → Prop :=
+  fun _ f => f = fun _ => .none
+
+theorem fnToOptEmpty_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre fnToOptEmpty :=
+  not_dichotomy_of_pi_subsingleton_codomain fun _ a b =>
+    match a, b with
+    | none, none => rfl
+    | some e, _ => e.elim
+    | _, some e => e.elim
+
+def fnFromEmptyProd : Nat → (Empty × Nat → Nat) → Prop :=
+  fun _ f => f = fun p => p.1.elim
+
+theorem fnFromEmptyProd_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre fnFromEmptyProd :=
+  not_dichotomy_of_pi_empty_domain fun p => p.1.elim
+
+def fnFromFin0 : Nat → (Fin 0 → Nat) → Prop :=
+  fun _ f => f = fun i => nomatch i
+
+theorem fnFromFin0_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre fnFromFin0 :=
+  not_dichotomy_of_pi_empty_domain Fin.elim0
+
+def subUniqueNatEq : Nat → { n : Nat // n = 0 } → Prop :=
+  fun _ r => r = ⟨0, rfl⟩
+
+theorem subUniqueNatEq_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre subUniqueNatEq :=
+  not_dichotomy_of_subsingleton_output fun ⟨_, ha⟩ ⟨_, hb⟩ =>
+    Subtype.ext (ha.trans hb.symm)
+
+def optEmptySubUnique : Nat → Option Empty × { n : Nat // n = 0 } → Prop :=
+  fun _ r => r = (.none, ⟨0, rfl⟩)
+
+theorem optEmptySubUnique_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optEmptySubUnique :=
+  not_dichotomy_of_prod_subsingletons
+    (fun a b => match a, b with
+      | none, none => rfl
+      | some e, _ => e.elim
+      | _, some e => e.elim)
+    (fun ⟨_, ha⟩ ⟨_, hb⟩ => Subtype.ext (ha.trans hb.symm))
+
+/-- A strictly self-recursive inductive type with no base constructor is empty. -/
+inductive NoBase : Type where
+  | step : NoBase → NoBase
+
+theorem noBase_empty : NoBase → False := fun x => by
+  induction x with
+  | step _ ih => exact ih
+
+def noBaseOut : Nat → NoBase → Prop := fun _ r => r = r
+
+theorem noBaseOut_not_realizable (pre : Nat → Prop) :
+    ¬ ContractRealizable pre noBaseOut :=
+  not_realizable_of_empty_output noBase_empty
+
+theorem noBaseOut_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre noBaseOut :=
+  not_dichotomy_of_empty_output noBase_empty
+
+def optNoBase : Nat → Option NoBase → Prop := fun _ r => r = .none
+
+theorem optNoBase_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre optNoBase :=
+  not_dichotomy_of_option_empty noBase_empty
+
+/-- Non-regression guard: a higher-order constructor `Empty → LiveTree` is inhabited. -/
+inductive LiveTree : Type where
+  | node : (Empty → LiveTree) → LiveTree
+  | leaf : Nat → LiveTree
+
+def genuineLiveTree : Nat → LiveTree → Prop := fun _ t => t = .leaf 0
+
+theorem genuineLiveTree_dichotomy :
+    PostconditionDichotomy (fun _ => True) genuineLiveTree :=
+  ⟨0, .leaf 0, .node Empty.elim, trivial, rfl, nofun⟩
+
+def fnToOptUnit : Nat → (Nat → Option Unit) → Prop := fun _ f => f 0 = some ()
+
+theorem fnToOptUnit_dichotomy :
+    PostconditionDichotomy (fun _ => True) fnToOptUnit :=
+  ⟨0, fun _ => some (), fun _ => none, trivial, rfl, nofun⟩
+
+def optEmptyFin2 : Nat → Option Empty × Fin 2 → Prop := fun _ r => r.2.val = 0
+
+theorem optEmptyFin2_dichotomy :
+    PostconditionDichotomy (fun _ => True) optEmptyFin2 :=
+  ⟨0, (.none, ⟨0, by decide⟩), (.none, ⟨1, by decide⟩), trivial, rfl,
+    fun (h : (1 : Nat) = 0) => absurd h (by decide)⟩
+
+def subTwoNat : Nat → { n : Nat // n ≤ 1 } → Prop := fun _ r => r.val = 0
+
+theorem subTwoNat_dichotomy :
+    PostconditionDichotomy (fun _ => True) subTwoNat :=
+  ⟨0, ⟨0, by decide⟩, ⟨1, by decide⟩, trivial, rfl,
+    fun (h : (1 : Nat) = 0) => absurd h (by decide)⟩
+
+#expect_vacuous optEmptyFin1 reflexiveTautology
+#expect_vacuous sumFin0Fin1 semanticallyInsensitive
+#expect_vacuous fnToOptEmpty reflexiveTautology
+#expect_vacuous fnFromEmptyProd reflexiveTautology
+#expect_vacuous fnFromFin0 semanticallyInsensitive
+#expect_vacuous subUniqueNatEq semanticallyInsensitive
+#expect_vacuous optEmptySubUnique semanticallyInsensitive
+#expect_vacuous optNoBase reflexiveTautology
+#expect_binds genuineLiveTree
+#expect_binds fnToOptUnit
+#expect_binds optEmptyFin2
+#expect_binds subTwoNat
+
+/-! ### 4. Fibre-relativised boilerplate checking and concrete external specs -/
+
+def demoU32Layout : TypeLayout :=
+  { size := { bytes := 4 }, align := { bytes := 4 }
+    backendRepr := .memory, fields := .primitive
+    variants := .single 0, isUninhabited := false }
+
+def demoAbi : FnAbi :=
+  { args := [], ret := { layout := demoU32Layout, mode := .direct }
+    conv := .rust, canUnwind := false }
+
+def demoU32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+def demoBoolTy : Ty := { kind := .bool, layoutIdx := 0 }
+
+def mkSidecar (name : String) (retTy : Ty) (argTys : List Ty) : CapturedMir :=
+  { defPath := name
+    phase := .runtimePostCleanup
+    role := .subject
+    argCount := argTys.length
+    localDecls :=
+      ({ mutability := .mut, ty := retTy, debugName := some "_0" } ::
+        argTys.map fun t => { mutability := .not, ty := t, debugName := none })
+    basicBlocks := []
+    fnAbi := demoAbi
+    layouts := emptyLayoutTable
+    allocations := [] }
+
+def u32Sidecar : CapturedMir := mkSidecar "demo::ret_u32" demoU32Ty [demoU32Ty]
+def boolSidecar : CapturedMir := mkSidecar "demo::ret_bool" demoBoolTy [demoU32Ty]
+
+/-- Restating a conjunct of `callFramePreserved` binds nothing beyond the frame. -/
+def restatesFrameField : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        memAfter.activeProtectors = req.memory.activeProtectors
+    | .panicked _ => False
+    | .aborted => True
+
+theorem restatesFrameField_not_beyond_frame :
+    ¬ DichotomyModuloObservation
+        (fun (req : MirCallReq) (out : Value × Memory) =>
+          callFramePreserved req.memory out.2)
+        restatesFrameField.pre (mirCallNormalPost restatesFrameField) :=
+  not_dichotomyModuloObservation_of_fibre_constant
+    (cof := fun b req out =>
+      b ∧ out.2.activeProtectors = req.memory.activeProtectors)
+    (fun _ _ _ => Iff.rfl)
+    fun b => by
+      by_cases hb : b
+      · left
+        intro req out _ hobs
+        have hcf : callFramePreserved req.memory out.2 := hobs.symm ▸ hb
+        exact ⟨hb, hcf.2.2.2.1⟩
+      · right
+        intro _ _ _ _ hc
+        exact hb hc.1
+
+/-- `ensures(ret <= u32::MAX)` restated existentially on a `u32` external spec. -/
+def restatesU32ReturnTy : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun _ ret => ∃ bits, bits < scalarModulus 4 ∧ ret = u32Arg bits)
+
+theorem restatesU32ReturnTy_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun _ ret => ∃ bits, bits < scalarModulus 4 ∧ ret = u32Arg bits) :=
+  not_externalSpecEnsuresDichotomy_of_implied_by_retTy _ _ _ _ fun _ _ _ h => h
+
+/-- `ensures(ret <= u32::MAX)` restated by pattern matching on `Value.scalar`. -/
+def restatesU32Match : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun _ ret =>
+      match ret with
+      | Value.scalar sv => sv.bits < scalarModulus 4 ∧ sv.sizeBytes = 4
+      | _ => False)
+
+theorem restatesU32Match_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun _ ret =>
+        match ret with
+        | Value.scalar sv => sv.bits < scalarModulus 4 ∧ sv.sizeBytes = 4
+        | _ => False) :=
+  not_externalSpecEnsuresDichotomy_of_implied_by_retTy _ _ _ _ fun _ _ _ h => by
+    rcases h with ⟨bits, hlt, rfl⟩
+    exact ⟨hlt, rfl⟩
+
+/-- `ensures(ret == false || ret == true)` on a `bool` external spec. -/
+def restatesBoolReturnTy : MirCallContract :=
+  externalSpecCallContract "demo::ret_bool" boolSidecar (fun _ => True)
+    (fun _ ret => ret = Value.scalar ⟨0, 1⟩ ∨ ret = Value.scalar ⟨1, 1⟩)
+
+theorem restatesBoolReturnTy_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "demo::ret_bool" boolSidecar (fun _ => True)
+      (fun _ ret => ret = Value.scalar ⟨0, 1⟩ ∨ ret = Value.scalar ⟨1, 1⟩) :=
+  not_externalSpecEnsuresDichotomy_of_implied_by_retTy _ _ _ _ fun _ _ _ h => by
+    rcases h with ⟨b, hlt, rfl⟩
+    have hb : b = 0 ∨ b = 1 := by omega
+    rcases hb with rfl | rfl
+    · exact .inl rfl
+    · exact .inr rfl
+
+/-- Genuine `u32` spec strictly stronger than the return type (`bits < 100`). -/
+def genuineU32Range : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun _ ret => ∃ bits, bits < 100 ∧ ret = u32Arg bits)
+
+theorem genuineU32Range_ensuresDichotomy :
+    ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun _ ret => ∃ bits, bits < 100 ∧ ret = u32Arg bits) := by
+  refine ⟨{ defPath := "demo::ret_u32", args := [u32Arg 0], memory := emptyMemory },
+    u32Arg 0, u32Arg 100, ?_, ⟨0, by decide, rfl⟩, ⟨0, by decide, rfl⟩,
+    ⟨100, by decide, rfl⟩, ?_⟩
+  · exact ⟨rfl, rfl, ⟨⟨0, by decide, rfl⟩, trivial⟩, trivial⟩
+  · rintro ⟨bits, hlt, heq⟩
+    have := u32Arg_inj heq
+    omega
+
+/-- Genuine `bool` spec pinning the return to `true`. -/
+def genuineBoolTrue : MirCallContract :=
+  externalSpecCallContract "demo::ret_bool" boolSidecar (fun _ => True)
+    (fun _ ret => ret = Value.scalar ⟨1, 1⟩)
+
+theorem genuineBoolTrue_ensuresDichotomy :
+    ExternalSpecEnsuresDichotomy "demo::ret_bool" boolSidecar (fun _ => True)
+      (fun _ ret => ret = Value.scalar ⟨1, 1⟩) := by
+  refine ⟨{ defPath := "demo::ret_bool", args := [u32Arg 0], memory := emptyMemory },
+    Value.scalar ⟨1, 1⟩, Value.scalar ⟨0, 1⟩, ?_,
+    ⟨1, by decide, rfl⟩, rfl, ⟨0, by decide, rfl⟩, ?_⟩
+  · exact ⟨rfl, rfl, ⟨⟨0, by decide, rfl⟩, trivial⟩, trivial⟩
+  · intro h
+    cases h
+
+/-- Wrong-arity `extraPost` (`[]` on a 1-arg callee) always falls through to `True`. -/
+def wrongArityExtSpec : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun args ret =>
+      match args with
+      | [] => ret = u32Arg 0
+      | _ => True)
+
+theorem wrongArityExtSpec_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun args ret =>
+        match args with
+        | [] => ret = u32Arg 0
+        | _ => True) := by
+  rintro ⟨req, _, _, hp, _, _, _, hbad⟩
+  have hlen : req.args.length = 1 := hp.2.1
+  cases hargs : req.args with
+  | nil => simp [hargs] at hlen
+  | cons _ _ => exact hbad (by simp [hargs])
+
+/-- Wrong-arity `extraPost` (`[a, _]` on a 1-arg callee) also always yields `True`. -/
+def wrongArityTwoArgsExtSpec : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun args ret =>
+      match args with
+      | [a, _] => ret = a
+      | _ => True)
+
+theorem wrongArityTwoArgsExtSpec_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun args ret =>
+        match args with
+        | [a, _] => ret = a
+        | _ => True) := by
+  rintro ⟨req, _, _, hp, _, _, _, hbad⟩
+  have hlen : req.args.length = 1 := hp.2.1
+  match hargs : req.args with
+  | [_, _] => simp [hargs] at hlen
+  | [] => exact hbad (by simp [hargs])
+  | [_] => exact hbad (by simp [hargs])
+  | _ :: _ :: _ :: _ => exact hbad (by simp [hargs])
+
+/-- Matching-arity `extraPost` (`[a] => ret = a`) genuinely binds `ret`. -/
+def rightArityExtSpec : MirCallContract :=
+  externalSpecCallContract "demo::ret_u32" u32Sidecar (fun _ => True)
+    (fun args ret =>
+      match args with
+      | [a] => ret = a
+      | _ => True)
+
+theorem rightArityExtSpec_ensuresDichotomy :
+    ExternalSpecEnsuresDichotomy "demo::ret_u32" u32Sidecar (fun _ => True)
+      (fun args ret =>
+        match args with
+        | [a] => ret = a
+        | _ => True) := by
+  refine ⟨{ defPath := "demo::ret_u32", args := [u32Arg 0], memory := emptyMemory },
+    u32Arg 0, u32Arg 1, ?_, ⟨0, by decide, rfl⟩, rfl, ⟨1, by decide, rfl⟩, ?_⟩
+  · exact ⟨rfl, rfl, ⟨⟨0, by decide, rfl⟩, trivial⟩, trivial⟩
+  · intro h
+    exact absurd (u32Arg_inj h) (by decide)
+
+run_meta do
+  let userCfg : EnsuresCheckConfig := { userEnsuresOnly := true }
+  expectReason ``restatesFrameField .boilerplateOnly (cfg := userCfg)
+  expectReason ``restatesU32ReturnTy .boilerplateOnly (cfg := userCfg)
+  expectReason ``restatesU32Match .boilerplateOnly (cfg := userCfg)
+  expectReason ``restatesBoolReturnTy .boilerplateOnly (cfg := userCfg)
+  expectReason ``wrongArityExtSpec .boilerplateOnly (cfg := userCfg)
+  expectReason ``wrongArityTwoArgsExtSpec .boilerplateOnly (cfg := userCfg)
+  assertEnsuresBindsOutput ``genuineU32Range (cfg := userCfg)
+  assertEnsuresBindsOutput ``genuineBoolTrue (cfg := userCfg)
+  assertEnsuresBindsOutput ``rightArityExtSpec (cfg := userCfg)
+
+/-! ### 5. Conjunctive congruence, helpers under `requires`, `Fin n`, `Total`/`Modular` -/
+
+/-- `And`-equated MIR scrutinee collapses the nested `match` to input-only. -/
+def eqAndMatchMirInputOnly : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned r _ =>
+      req.args = [u32Arg 0] ∧
+        match req.args with
+        | [Value.scalar ⟨0, 4⟩] => True
+        | _ => r = u32Arg 1
+    | .panicked _ => False
+    | .aborted => False
+
+theorem eqAndMatchMirInputOnly_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy eqAndMatchMirInputOnly :=
+  not_mirCallContractNormalDichotomy_of_return_blind fun req _ _ _ _ _ => by
+    dsimp [eqAndMatchMirInputOnly]
+    constructor <;> rintro ⟨h, _⟩ <;> exact ⟨h, by rw [h]; trivial⟩
+
+/-- `And`-equated MIR scrutinee refutes a `match`-shaped precondition. -/
+def unsatMatchPre : MirCallContract where
+  pre req :=
+    req.args = [u32Arg 1] ∧
+      match req.args with
+      | [v] => v = u32Arg 0
+      | _ => False
+  post _ ans :=
+    match ans with
+    | .returned r _ => r = u32Arg 0
+    | .panicked _ => False
+    | .aborted => False
+
+theorem unsatMatchPre_not_preSatisfiable :
+    ¬ MirCallContractPreSatisfiable unsatMatchPre := by
+  rintro ⟨req, h₁, h₂⟩
+  rw [h₁] at h₂
+  exact absurd (u32Arg_inj h₂) (by decide)
+
+def zeroPre : Nat → Prop := fun x => x = 0
+def onePre : Nat → Prop := fun x => x = 1
+def belowTenPre : Nat → Prop := fun x => x < 10
+def geTenPre : Nat → Prop := fun x => x ≥ 10
+
+def mulBy (x r : Nat) : Nat := x * r
+def mulByZeroPost : Nat → Nat → Prop := fun x r => mulBy x r = 0
+
+theorem mulByZeroPost_not_dichotomy_under_zero :
+    ¬ PostconditionDichotomy zeroPre mulByZeroPost :=
+  not_dichotomy_of_const_true fun x r (hx : x = 0) => by
+    subst hx
+    simp [mulByZeroPost, mulBy]
+
+theorem mulByZeroPost_dichotomy_under_one :
+    PostconditionDichotomy onePre mulByZeroPost :=
+  ⟨1, 0, 1, rfl, rfl, fun (h : 1 * 1 = 0) => absurd h (by decide)⟩
+
+def clampZero (x r : Nat) : Nat := if x < 10 then 0 else r
+def clampZeroPost : Nat → Nat → Prop := fun x r => clampZero x r = 0
+
+theorem clampZeroPost_not_dichotomy_under_belowTen :
+    ¬ PostconditionDichotomy belowTenPre clampZeroPost :=
+  not_dichotomy_of_const_true fun x r (hx : x < 10) => by
+    simp [clampZeroPost, clampZero, hx]
+
+theorem clampZeroPost_dichotomy_under_geTen :
+    PostconditionDichotomy geTenPre clampZeroPost :=
+  ⟨10, 0, 1, Nat.le_refl 10, by simp [clampZeroPost, clampZero],
+    by simp [clampZeroPost, clampZero]⟩
+
+def eqOnePre : Nat → Prop := fun n => n = 1
+def eqZeroPre : Nat → Prop := fun n => n = 0
+def geTwoPre : Nat → Prop := fun n => n ≥ 2
+def depFinPost : (n : Nat) → Fin n → Prop := fun _ r => r.val = 0
+
+/-- `TotalClaim` with a frame-only postcondition (unconstrained return value). -/
+def totalClaimFrameOnly (body : CapturedMir) : TotalClaim where
+  body := body
+  pre _ _ := True
+  post _ mem _ mem' := mem' = mem
+
+/-- `TotalClaim` with an unsatisfiable precondition. -/
+def totalClaimUnsatPre (body : CapturedMir) : TotalClaim where
+  body := body
+  pre args _ := ∃ a, args = [u32Arg a] ∧ a < 5 ∧ a > 10
+  post _ _ r _ := r = u32Arg 0
+
+theorem totalClaimUnsatPre_verified (body : CapturedMir) :
+    TotalVerificationResult (totalClaimUnsatPre body) :=
+  totalVerificationResult_of_not_preSatisfiable fun ⟨_, _, a, _, h₁, h₂⟩ => by omega
+
+/-- `ModularClaim` binding both the return value and the post-memory. -/
+def modularClaimGenuine (body : CapturedMir) : ModularClaim where
+  body := body
+  envAssumed _ := True
+  pre _ _ := True
+  post _ mem r mem' := mem' = mem ∧ r = u32Arg 0
+
+#expect_vacuous eqAndMatchMirInputOnly returnBlind
+#expect_vacuous unsatMatchPre requiresUnsatisfiable
+
+run_meta do
+  assertRequiresRefuted ``unsatMatchPre
+  assertRequiresRefuted ``totalClaimUnsatPre
+  assertEnsuresVacuous ``mulByZeroPost (some .vacuousUnderRequires)
+    (preDecl? := some ``zeroPre)
+  assertEnsuresBindsOutput ``mulByZeroPost (preDecl? := some ``onePre)
+  assertEnsuresVacuous ``clampZeroPost (some .vacuousUnderRequires)
+    (preDecl? := some ``belowTenPre)
+  assertEnsuresBindsOutput ``clampZeroPost (preDecl? := some ``geTenPre)
+  assertEnsuresVacuous ``depFinPost (some .vacuousUnderRequires)
+    (preDecl? := some ``eqOnePre)
+  assertEnsuresVacuous ``depFinPost (some .unrealizableUnderRequires)
+    (preDecl? := some ``eqZeroPre)
+  assertEnsuresBindsOutput ``depFinPost (preDecl? := some ``geTwoPre)
+  expectReason ``totalClaimFrameOnly .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+  assertEnsuresVacuous ``totalClaimUnsatPre (some .requiresUnsatisfiable)
+  assertEnsuresBindsOutput ``modularClaimGenuine
+    (cfg := { strictReturnValue := true })
+
+end HardeningB4
 
 /-! ## Axiom and soundness audit -/
 

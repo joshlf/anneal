@@ -1040,6 +1040,49 @@ theorem not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive
         ((h_cof inp ok hp).mp hok)))
 
 /--
+Fibre-relativised cofactor soundness: to rule out `DichotomyModuloObservation`,
+each cofactor `cof b` need only be output-insensitive *on its own fibre*
+(`obs inp out = b`). This strictly strengthens
+`not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`: a cofactor
+need not be globally output-insensitive when the observation itself already
+implies or refutes it on that fibre (for instance, `ensures(ret <= u32::MAX)`
+on a `u32`-returning external spec, or repeating a field of
+`callFramePreserved`).
+-/
+theorem not_dichotomyModuloObservation_of_fibre_insensitive
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (cof : Obs → Input → Output → Prop)
+    (h_cof : ∀ inp out, pre inp → (post inp out ↔ cof (obs inp out) inp out))
+    (h_ins : ∀ b inp out₁ out₂, pre inp →
+      obs inp out₁ = b → obs inp out₂ = b →
+      cof b inp out₁ → cof b inp out₂) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  fun ⟨inp, ok, bad, hp, heq, hok, hbad⟩ =>
+    hbad ((h_cof inp bad hp).mpr
+      (heq ▸ h_ins (obs inp ok) inp ok bad hp rfl heq.symm
+        ((h_cof inp ok hp).mp hok)))
+
+/--
+A postcondition whose cofactor `cof b` is constant on each fibre (either
+implied by `obs inp out = b` or refuted by `obs inp out = b`) has no dichotomy
+modulo `obs`. This covers empty fibres, user clauses implied by boilerplate,
+and user clauses contradicting boilerplate.
+-/
+theorem not_dichotomyModuloObservation_of_fibre_constant
+    {Obs : Type w} {obs : Input → Output → Obs}
+    (cof : Obs → Input → Output → Prop)
+    (h_cof : ∀ inp out, pre inp → (post inp out ↔ cof (obs inp out) inp out))
+    (h_const : ∀ b,
+      (∀ inp out, pre inp → obs inp out = b → cof b inp out) ∨
+      (∀ inp out, pre inp → obs inp out = b → ¬ cof b inp out)) :
+    ¬ DichotomyModuloObservation obs pre post :=
+  not_dichotomyModuloObservation_of_fibre_insensitive cof h_cof
+    fun b inp _ out₂ hp h₁ h₂ hok =>
+      match h_const b with
+      | .inl ht => ht inp out₂ hp h₂
+      | .inr hf => absurd hok (hf inp _ hp h₁)
+
+/--
 Strengthening a postcondition preserves dichotomy modulo `obs` whenever an
 admissible input has an accepted output of the stronger postcondition and a
 rejected output of the weaker one that share their observation.
@@ -1130,6 +1173,38 @@ theorem not_dichotomy_of_sum_empty_left {α β : Type v} (h_empty : α → False
     | .inl x, _ => (h_empty x).elim
     | _, .inl y => (h_empty y).elim
     | .inr b₁, .inr b₂ => h inp b₁ b₂ hp
+
+/-- An empty output type admits no realizing output, hence no dichotomy. -/
+theorem not_realizable_of_empty_output (h_empty : Output → False) :
+    ¬ ContractRealizable pre post :=
+  fun ⟨_, out, _, _⟩ => h_empty out
+
+theorem not_dichotomy_of_empty_output (h_empty : Output → False) :
+    ¬ PostconditionDichotomy pre post :=
+  fun h => not_realizable_of_empty_output h_empty h.toContractRealizable
+
+/-- Functions out of an empty domain form a subsingleton, refuting dichotomy. -/
+theorem not_dichotomy_of_pi_empty_domain {α : Type v} {β : α → Type w}
+    (h_empty : α → False) {post : Input → ((x : α) → β x) → Prop} :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_subsingleton_output fun _ _ =>
+    funext fun x => (h_empty x).elim
+
+/-- Functions into a subsingleton codomain form a subsingleton, refuting dichotomy. -/
+theorem not_dichotomy_of_pi_subsingleton_codomain {α : Type v} {β : α → Type w}
+    (h_sub : ∀ x (y₁ y₂ : β x), y₁ = y₂)
+    {post : Input → ((x : α) → β x) → Prop} :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_subsingleton_output fun _ _ =>
+    funext fun x => h_sub x _ _
+
+/-- A product of two subsingletons is a subsingleton, refuting dichotomy. -/
+theorem not_dichotomy_of_prod_subsingletons {α : Type v} {β : Type w}
+    (h₁ : ∀ a₁ a₂ : α, a₁ = a₂) (h₂ : ∀ b₁ b₂ : β, b₁ = b₂)
+    {post : Input → α × β → Prop} :
+    ¬ PostconditionDichotomy pre post :=
+  not_dichotomy_of_subsingleton_output fun ⟨a₁, b₁⟩ ⟨a₂, b₂⟩ => by
+    rw [h₁ a₁ a₂, h₂ b₁ b₂]
 
 /-! ### Componentwise dichotomy of a pair output -/
 
@@ -1872,7 +1947,8 @@ theorem not_externalSpecEnsuresDichotomy_of_return_blind
 An `ensures` clause that the return type already implies binds nothing beyond
 boilerplate: it accepts every well-typed return. This covers a clause that
 restates the type in its own words (`ensures(ret <= u32::MAX)` on a `u32`
-function); the checker recognises only the literal boilerplate predicate.
+function); in Part II, fibre-condition checking discharges concrete return-type
+restatements (`u32`, `bool`, ...) as `boilerplateOnly`.
 -/
 theorem not_externalSpecEnsuresDichotomy_of_implied_by_retTy
     (h : ∀ args v, extraPre args → retMatchesCalleeReturnTy sidecarBody v →
@@ -2416,10 +2492,10 @@ constrains its designated output binders.
   to 10 atoms) that detects classical tautologies/contradictions and eliminates
   propositionally irrelevant atoms (De Morgan, contraposition, Peirce's law,
   absorption, dead-branch implications, exhaustive case splits), and kernel-
-  typechecked rewriting of a conclusion or remaining disjuncts by equational
-  premises (`v = t → C[v]` as `v = t → C[t]`, and `¬(v = t) ∨ C[v]` as
-  `¬(v = t) ∨ C[t]`, exposing both `ret = x → f ret = f x` and
-  `ret ≠ x ∨ f ret = f x` without ever producing ill-typed dependent terms);
+  typechecked rewriting of a conclusion, remaining disjuncts, or remaining
+  conjuncts by equational premises (`v = t → C[v]`, `¬(v = t) ∨ C[v]`, and
+  `E ∧ C`, exposing `ret = x → f ret = f x`, `ret ≠ x ∨ f ret = f x`, and
+  equated `match` scrutinees without ever producing ill-typed dependent terms);
 * reflexivity of `Eq` (compared up to orientation and subsingleton types),
   `HEq`, `Iff`, of `≤`/`≥` (and irreflexivity of `<`/`>`) only where the law is
   provable for the instance at hand, of `BEq.beq` only under a `ReflBEq`/
@@ -2430,55 +2506,63 @@ constrains its designated output binders.
   one-point rules `∃ y, y = t ∧ P y ↔ P t` and `∀ y, y = t → P y ↔ P t` for
   `y` not in `t`.
 
-An output is *bound* when its type is not a subsingleton (by instance, by
-proof, or structurally with recursive emptiness: at most one constructor can
-build a value, covering `Option Empty`, `List Empty`, `Option (Empty × Nat)`,
-`Option (Sum Empty Empty)`, `Option (Fin 0)`, `Option { n : Nat // n < 0 }`,
-`Option (Unit → Empty)`, and structures over such types), it still occurs in
-the residual, a bounded, `sorry`-free proof search (`rfl`, `omega`,
-`simp +arith`, `decide`, `infer_instance`, `subst_vars`, `grind`, top-level
-`Iff` splitting including existential witness search via `underHyp`,
-existential witness search — over `Nat` including `v / 2`, `Int` including
-`Int.ediv v 2`, and `List` including `[]`/`List.replicate` for a leading `∃`,
-behind a `∀`/`→` prefix, and by Herbrand expansion of `Nat`/`Int` existentials
-nested in positive positions —, nested subformula probing, and single-step
-unfolding of small non-recursive output helpers) can neither discharge the
-subformulas mentioning it nor prove the residual insensitive to it, and a case
-split on its constructors (for an inductive output with two to eight of them,
-skipping those that need a value of an empty type) does not reduce the
-postcondition to one proposition free of it. All rewrites are equivalences, so
-a postcondition reported as not binding an output is semantically insensitive
-to that output; a postcondition reported as binding may still be vacuous in a
-way the search does not see (for example behind an `opaque` or `irreducible`
-definition, a fact needing induction or nonlinear arithmetic, or an
-existential whose witness is not among the candidates).
+An output is *bound* when its type is not a subsingleton (by proof irrelevance,
+`Subsingleton` instance, function types from an empty domain or into a
+subsingleton codomain such as `Fin 0 → Nat` or `Nat → Option Empty`, inductive
+types with at most one non-empty constructor whose fields each satisfy the same
+test — skipping constructors with empty or direct base-less recursive fields,
+covering `Option Empty × Fin 1`, `Option NoBase`, `List (Fin 0)`, ... — or a
+direct proof of uniqueness), it still occurs in the residual, a bounded,
+`sorry`-free proof search (`rfl`, `assumption`, `omega`, `simp +arith`,
+`decide`, `infer_instance`, `subst_vars`, `grind`, top-level `Iff` splitting
+including existential witness search via `underHyp`, existential witness search
+— over `Nat` including `v / 2`, `Int` including `Int.ediv v 2`, and `List`
+including `[]`/`List.replicate` for a leading `∃`, behind a `∀`/`→` prefix, and
+by Herbrand expansion of `Nat`/`Int` existentials nested in positive positions
+—, nested subformula probing, and single-step unfolding of small non-recursive
+output helpers) can neither discharge the subformulas mentioning it nor prove
+the residual insensitive to it, and a case split on its constructors (for an
+inductive output with two to eight of them, skipping those that need a value of
+an empty type) does not reduce the postcondition to one proposition free of it.
+All rewrites are equivalences, so a postcondition reported as not binding an
+output is semantically insensitive to that output; a postcondition reported as
+binding may still be vacuous in a way the search does not see (for example
+behind an `opaque` or `irreducible` definition, a fact needing induction or
+nonlinear arithmetic, or an existential whose witness is not among the
+candidates).
 
 **Cost.** The checker is advisory and must never take the calling command down
-with a deterministic timeout. Every tactic probe runs under `probeHeartbeats`
-(`simp +arith`, which may spend a whole budget failing, under a smaller one;
-single arithmetic witnesses are tried with `rfl`/`omega` alone), and a whole
-analysis runs under `maxAnalysisHeartbeats` and at most seven eighths of what
-the caller has left: once that is spent, every further probe fails closed, so
-the report can only lose *vacuous* verdicts, and it carries a note saying so.
-Closed `Nat` terms behind a definition (`scalarModulus 4`) are evaluated to
-numerals before the arithmetic probes.
+with a deterministic timeout. Every tactic probe and bounded `whnf` call runs
+under `cappedHeartbeats?` (so `probeHeartbeats := 0` disables probing rather
+than invoking Lean's `maxHeartbeats := 0` unlimited sentinel; `simp +arith`,
+which may spend a whole budget failing, uses a smaller cap; single arithmetic
+witnesses are tried with `rfl`/`assumption`/`omega` alone), and every whole
+analysis (`checkEnsuresBindsOutput` and `checkRequiresSatisfiable`) runs under
+`maxAnalysisHeartbeats` and at most seven eighths of what the caller has left:
+once that is spent, every further probe fails closed, so the report can only
+lose *vacuous* verdicts, and it carries a note saying so. Closed `Nat` and `Int`
+terms behind definitions (applications such as `scalarModulus 4` /
+`intModulus 4` and 0-ary constants such as `myU32Mod`) are evaluated to
+numerals and `Trusted.Sequence.length` is unfolded to `List.length` before
+arithmetic probes.
 
 **Relative to the precondition.** `PostconditionDichotomy pre post` ranges over
 admissible inputs, and an `ensures` clause that binds its output in general
 may bind nothing on them (`requires(x < 10) ensures(x >= 10 ==> ret == 5)`,
 `exists_dichotomy_lost_under_requires`). When the precondition is known (the
-`pre` field of a `Claim`, `StatefulClaim`, or `MirCallContract`, or an explicit
-`preExpr?`), it is first checked for unsatisfiability via the shared
-`refuteUnderExists` and empty-domain check (keeping `checkRequiresSatisfiable`
-and `checkEnsuresBindsOutput` consistent), and what the passes above leave
-bound is then re-examined under it: top-level disjunctive preconditions are
-split (`postconditionDichotomy_or_pre_iff`), existentials are opened, equations
-rewrite the residual (and implication guards rewrite precondition facts) with
-typechecked substitution, constructor case splitting is re-run on the rewritten
-residual, and remaining facts feed both `grind` and existential witness search.
-The verdicts `requiresUnsatisfiable`, `vacuousUnderRequires`, and
-`unrealizableUnderRequires` are the ones that needed it; `useRequires := false`
-judges the postcondition alone.
+`pre` field of a `Claim`, `StatefulClaim`, `TotalClaim`, `ModularClaim`, or
+`MirCallContract`, or an explicit `preExpr?`), it is first checked for
+unsatisfiability via the shared `refuteUnderExists` and empty-domain check
+(keeping `checkRequiresSatisfiable` and `checkEnsuresBindsOutput` consistent),
+and what the passes above leave bound is then re-examined under it: top-level
+disjunctive preconditions are split (`postconditionDichotomy_or_pre_iff`),
+existentials are opened, equations rewrite the residual (and implication guards
+rewrite precondition facts) with typechecked substitution, constructor case
+splitting and small-helper unfolding are re-run on the rewritten residual, and
+remaining facts feed both `grind` and existential witness search. The verdicts
+`requiresUnsatisfiable`, `vacuousUnderRequires`, and `unrealizableUnderRequires`
+are the ones that needed it; `useRequires := false` judges the postcondition
+alone.
 
 **User `ensures` mode.** The one deliberate projection is `userEnsuresOnly`
 (and the `bindsBeyondBoilerplate` field), which asks whether the clause still
@@ -2497,13 +2581,15 @@ collapses `frame → ret = 1`, `if frame then ret = 1 else ret = 2`, and
 normalises with boilerplate kept opaque and then evaluates the cofactors over
 **all** feasible truth assignments `{True, False}^k` to the distinct closed
 boilerplate atoms occurring in the residual (skipping empty fibres where an
-atom is provably constant, such as `callFramePreserved m m = True`, justified
-by `not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`, and
-short-circuiting at zero cost whenever no boilerplate constant was seen).
-Replacement descends into `.lam`, `.letE`, and `.mdata` so boilerplate inside
-`match` alternatives is substituted as well. An output is bound beyond
-boilerplate iff it is bound in the full analysis and some feasible cofactor
-constrains it (`not_dichotomyModuloObservation_of_cofactors_insensitive`). The
+atom is provably constant, such as `callFramePreserved m m = True`, and
+skipping fibres where the boilerplate atoms themselves imply or refute the
+cofactor residual, such as `ensures(ret <= u32::MAX)` or restating a field of
+`callFramePreserved`, justified by
+`not_dichotomyModuloObservation_of_fibre_constant`, and short-circuiting at zero
+cost whenever no boilerplate constant was seen). Replacement descends into
+`.lam`, `.letE`, and `.mdata` so boilerplate inside `match` alternatives is
+substituted as well. An output is bound beyond boilerplate iff it is bound in
+the full analysis and some feasible non-constant cofactor constrains it. The
 assignments are never sampled, since the one cofactor carrying a dichotomy can
 be any of them; past eight atoms, or when a cofactor cannot be judged, the
 verdict is the conservative *binds*. By convention every closed application of
@@ -2891,20 +2977,30 @@ def heartbeatsExhausted : CoreM Bool := do
   return (← heartbeatsRemaining) == some 0
 
 /--
+Cap `requestedRaw` (in raw heartbeats) by what remains of the enclosing budget.
+Returns `none` when `requestedRaw == 0` (so a zero budget disables probing
+rather than passing Lean's `maxHeartbeats := 0` sentinel for *unlimited*) or
+when the enclosing budget is already exhausted.
+-/
+def cappedHeartbeats? (requestedRaw : Nat) : CoreM (Option Nat) := do
+  if requestedRaw == 0 then
+    return none
+  match ← heartbeatsRemaining with
+  | none => return some requestedRaw
+  | some 0 => return none
+  | some left => return some (min requestedRaw left)
+
+/--
 Run a single heartbeat-bounded tactic against `goal`, isolating and restoring
 both the elaboration state and the message log, and verifying that the produced
 proof term contains neither `sorry` nor unassigned metavariables. The tactic
 gets `heartbeats` thousand heartbeats, or what is left of the enclosing budget
-if that is less; with nothing left the probe fails closed.
+if that is less; with zero budget or nothing left the probe fails closed.
 -/
 def runTacticClosed (goal : Expr) (heartbeats : Nat) (tac : TSyntax `tactic) :
     MetaM Bool := do
-  -- A probe never outspends what is left of the enclosing budget.
-  let budget ←
-    match ← heartbeatsRemaining with
-    | none => pure (heartbeats * 1000)
-    | some 0 => return false
-    | some left => pure (min (heartbeats * 1000) left)
+  -- A probe never outspends the enclosing budget, and `0` never means infinite.
+  let some budget ← cappedHeartbeats? (heartbeats * 1000) | return false
   let saved ← saveState
   let savedMsgs ← Core.getMessageLog
   Core.resetMessageLog
@@ -2928,36 +3024,84 @@ def runTacticClosed (goal : Expr) (heartbeats : Nat) (tac : TSyntax `tactic) :
 /-- Heartbeat budget (in thousands) of one `simp +arith` attempt. -/
 def simpProbeHeartbeats : Nat := 300
 
+/-- Canonical `Int` numeral `n` via `OfNat.ofNat`. -/
+def mkIntConst (n : Nat) : MetaM Expr :=
+  mkAppOptM ``OfNat.ofNat #[some (mkConst ``Int), some (mkRawNatLit n), none]
+
 /--
-Replace closed `Nat` subterms headed by a definition by their numeral
-(`scalarModulus 4` by `4294967296`), so that `omega` sees a literal where it
-would otherwise see an opaque atom (`r % scalarModulus 4 < scalarModulus 4`).
-The replacement is a definitional unfolding, evaluated by `whnf` under a small
-heartbeat budget; the goal it yields is definitionally equal to the original.
+Normalise closed arithmetic terms behind definitions (`Nat` and `Int`, both
+applications such as `scalarModulus 4` / `intModulus 4` and 0-ary constants
+such as `myU32Mod` / `myIntMod`) to numerals, and replace the thin alias
+`Trusted.Sequence.length` with `List.length`, so that `omega` and `grind` see
+literals and list lengths rather than opaque atoms. Every replacement is
+definitionally equal to the original and respects the enclosing heartbeat
+budget (`cappedHeartbeats?`).
 -/
-def evalClosedNats (e : Expr) : MetaM Expr := do
+def evalClosedArith (e : Expr) : MetaM Expr := do
+  if ← heartbeatsExhausted then
+    return e
+  let env ← getEnv
+  let isDefn (n : Name) : Bool :=
+    match env.find? n with
+    | some (.defnInfo _) => true
+    | _ => false
   let candidate (sub : Expr) : Bool :=
-    sub.isApp && !sub.hasFVar && !sub.hasLooseBVars && !sub.hasMVar &&
-      match sub.getAppFn with
-      | .const n _ => n != ``OfNat.ofNat && n != ``Nat.succ && n != ``Nat.zero
-      | _ => false
+    if sub.isAppOfArity ``Trusted.Sequence.length 2 then
+      true
+    else
+      (sub.isApp || sub.isConst) &&
+        !sub.hasFVar && !sub.hasLooseBVars && !sub.hasMVar &&
+        match sub.getAppFn with
+        | .const n _ =>
+          n != ``OfNat.ofNat && n != ``Nat.succ && n != ``Nat.zero &&
+            n != ``Int.ofNat && n != ``Int.negSucc && n != ``Neg.neg &&
+            isDefn n
+        | _ => false
   if (e.find? candidate).isNone then
     return e
   safely (Meta.transform e (pre := fun sub => do
+    if sub.isAppOfArity ``Trusted.Sequence.length 2 then
+      let args := sub.getAppArgs
+      return .continue (mkApp2 (mkConst ``List.length sub.getAppFn.constLevels!)
+        args[0]! args[1]!)
     unless candidate sub do
       return .continue
-    unless (← whnfR (← inferType sub)).isConstOf ``Nat do
+    if let .const n _ := sub then
+      if (← isIrreducible n) || (← isInstance n) then
+        return .continue
+    let ty ← whnfR (← inferType sub)
+    let isNat := ty.isConstOf ``Nat
+    let isInt := !isNat && ty.isConstOf ``Int
+    unless isNat || isInt do
       return .continue
-    let v ← withCurrHeartbeats <|
-      withTheReader Core.Context (fun c => { c with maxHeartbeats := 200000 }) <|
-        whnf sub
-    match v.rawNatLit? <|> v.nat? with
-    | some n => return .done (mkNatLit n)
-    | none => return .continue)) e
+    let some hb ← cappedHeartbeats? 200000 | return .done sub
+    let whnfBounded (t : Expr) : MetaM Expr :=
+      withCurrHeartbeats <|
+        withTheReader Core.Context (fun c => { c with maxHeartbeats := hb }) <|
+          whnf t
+    let v ← whnfBounded sub
+    if isNat then
+      match v.rawNatLit? <|> v.nat? with
+      | some n => return .done (mkNatLit n)
+      | none => return .continue
+    else
+      match v.getAppFnArgs with
+      | (``Int.ofNat, #[k]) =>
+        let kv ← whnfBounded k
+        match kv.rawNatLit? <|> kv.nat? with
+        | some n => return .done (← mkIntConst n)
+        | none => return .continue
+      | (``Int.negSucc, #[k]) =>
+        let kv ← whnfBounded k
+        match kv.rawNatLit? <|> kv.nat? with
+        | some n =>
+          return .done (← mkAppM ``Neg.neg #[← mkIntConst (n + 1)])
+        | none => return .continue
+      | _ => return .continue)) e
 
 /--
-Fast heartbeat-bounded tactic portfolio (excludes `grind`): `rfl`, `omega`,
-`simp +arith`, `decide`, `infer_instance`, `subst_vars`, in that order.
+Fast heartbeat-bounded tactic portfolio (excludes `grind`): `rfl`, `assumption`,
+`omega`, `simp +arith`, `decide`, `infer_instance`, `subst_vars`, in that order.
 
 `simp +arith` closes a goal quickly or not at all, but on goals it cannot close
 (linear integer arithmetic with a free witness, for one) it may run until its
@@ -2966,8 +3110,11 @@ every other tactic together, and the witness search makes many attempts, so
 `simp +arith` runs under `simpProbeHeartbeats`.
 -/
 def tryProveFast (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
-  let goal ← evalClosedNats goal
-  if ← runTacticClosed goal heartbeats (← `(tactic| first | rfl | (intros; omega))) then
+  if heartbeats == 0 || (← heartbeatsExhausted) then
+    return false
+  let goal ← evalClosedArith goal
+  if ← runTacticClosed goal heartbeats
+      (← `(tactic| first | rfl | (intros; assumption) | (intros; omega))) then
     return true
   if ← runTacticClosed goal (min heartbeats simpProbeHeartbeats)
       (← `(tactic| (simp +arith; done))) then
@@ -2977,17 +3124,22 @@ def tryProveFast (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
 
 /-- Deep fallback (`grind`: congruence closure, case splits, ring arithmetic). -/
 def tryProveGrind (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
+  if heartbeats == 0 || (← heartbeatsExhausted) then
+    return false
   let tac ← `(tactic| grind)
-  runTacticClosed (← evalClosedNats goal) heartbeats tac
+  runTacticClosed (← evalClosedArith goal) heartbeats tac
 
 /--
-The cheap arithmetic core (`rfl`, `omega`) used for one candidate witness over
-`Nat` or `Int`. The witness search tries many candidates, almost all of which
-fail; the full portfolio is kept for the Herbrand disjunction of all of them.
+The cheap arithmetic core (`rfl`, `assumption`, `omega`) used for one candidate
+witness over `Nat` or `Int`. The witness search tries many candidates, almost
+all of which fail; the full portfolio is kept for the Herbrand disjunction of
+all of them.
 -/
 def tryProveArith (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
-  runTacticClosed (← evalClosedNats goal) heartbeats
-    (← `(tactic| first | rfl | (intros; omega)))
+  if heartbeats == 0 || (← heartbeatsExhausted) then
+    return false
+  runTacticClosed (← evalClosedArith goal) heartbeats
+    (← `(tactic| first | rfl | (intros; assumption) | (intros; omega)))
 
 /--
 Try to close a single `goal` with a short, heartbeat-bounded tactic portfolio,
@@ -3092,7 +3244,7 @@ def matchingFVars (e α : Expr) : MetaM (Array Expr) := do
   let mut out : Array Expr := #[]
   for fv in st.fvarIds do
     let fvar := mkFVar fv
-    let ty ← safely (inferType fvar) (mkConst ``Empty)
+    let some ty ← safely (do return some (← inferType fvar)) none | continue
     if ← safely (withNewMCtxDepth <| withReducible <| isDefEq ty α) false then
       out := out.push fvar
   return out
@@ -3116,21 +3268,23 @@ partial def collectNatLits (e : Expr) (acc : Array Nat := #[]) : Array Nat :=
 
 /--
 Candidate `Nat` witnesses built from the `Nat` variables occurring in `e`: `0`,
-every bare variable `v` first (so later variables are never starved by derived
-terms of earlier ones), then `v + 1`, `v - 1`, `v / 2`, `v - k` for small
-literals `k` in `e`, the sum of all and its successor, and for two variables
-their truncated differences (and predecessors).
+`1`, every bare variable `v` first (so later variables are never starved by
+derived terms of earlier ones), then `v + 1`, `v - 1`, `v / 2`, small bare
+literals `k` and `v - k` for literals in `e`, the sum of all and its successor,
+and for two variables their truncated differences (and predecessors).
 -/
 def natWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
   let fvars ← matchingFVars e (mkConst ``Nat)
   let lits := collectNatLits e
-  let mut cands : Array Expr := #[mkNatLit 0] ++ fvars
+  let mut cands : Array Expr := #[mkNatLit 0, mkNatLit 1] ++ fvars
   for v in fvars do
     cands := cands.push (mkNatAdd v (mkNatLit 1))
     cands := cands.push (mkNatSub v (mkNatLit 1))
     if let some half ← safely (do
         return some (← mkAppM ``HDiv.hDiv #[v, mkNatLit 2])) none then
       cands := cands.push half
+  for n in lits.extract 0 2 do
+    cands := cands.push (mkNatLit n)
   for v in fvars.extract 0 2 do
     for n in lits.extract 0 2 do
       cands := cands.push (mkNatSub v (mkNatLit n))
@@ -3144,22 +3298,22 @@ def natWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
       cands := cands.push (mkNatSub (mkNatSub v w) (mkNatLit 1))
   return cands
 
-/-- Canonical `Int` numeral `n` via `OfNat.ofNat`. -/
-def mkIntConst (n : Nat) : MetaM Expr :=
-  mkAppOptM ``OfNat.ofNat #[some (mkConst ``Int), some (mkRawNatLit n), none]
-
 /--
 Candidate `Int` witnesses built from the `Int` variables occurring in `e`: `0`,
-every bare variable `v` first, then `v + 1`, `v - 1`, `-v`, Euclidean half
-`v / 2` (which satisfies `r = 2 * q ∨ r = 2 * q + 1` for negative and
-non-negative integers alike), sums, and differences.
+`1`, `-1`, every bare variable `v` first, then `v + 1`, `v - 1`, `-v`,
+Euclidean half `v / 2` (which satisfies `r = 2 * q ∨ r = 2 * q + 1` for
+negative and non-negative integers alike), sums, and differences.
 -/
 def intWitnessCandidates (e : Expr) : MetaM (Array Expr) := do
   let fvars ← matchingFVars e (mkConst ``Int)
   let some zero ← safely (do return some (← mkIntConst 0)) none | return fvars
   let some one ← safely (do return some (← mkIntConst 1)) none | return #[zero] ++ fvars
+  let negOne? ← safely (do return some (← mkAppM ``Neg.neg #[one])) none
   let two? ← safely (do return some (← mkIntConst 2)) none
-  let mut cands : Array Expr := #[zero] ++ fvars
+  let mut cands : Array Expr := #[zero, one]
+  if let some negOne := negOne? then
+    cands := cands.push negOne
+  cands := cands ++ fvars
   for v in fvars do
     if let some vp1 ← safely (do return some (← mkAppM ``HAdd.hAdd #[v, one])) none then
       cands := cands.push vp1
@@ -3250,15 +3404,19 @@ attempted implies the original one, so this cannot introduce false positives.
 -/
 partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
     (exFuel : Nat := 1) : MetaM Bool := do
+  if heartbeats == 0 || (← heartbeatsExhausted) then
+    return false
   if ← tryProveCore goal heartbeats deep then
     return true
+  if ← heartbeatsExhausted then
+    return false
   if let (``Exists, #[α, p]) := goal.getAppFnArgs then
     let αn ← safely (whnfR α) α
     let cands ←
       if αn.isConstOf ``Nat then
-        natWitnessCandidates p
+        natWitnessCandidates (← evalClosedArith p)
       else if αn.isConstOf ``Int then
-        intWitnessCandidates p
+        intWitnessCandidates (← evalClosedArith p)
       else if let (``List, #[β]) := αn.getAppFnArgs then
         let fvars ← matchingFVars p αn
         let mut cs : Array Expr := #[]
@@ -3277,11 +3435,11 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
         pure cs
       else
         matchingFVars p αn
-    let cap := if exFuel > 0 then 14 else 5
+    let cap := if exFuel > 0 then 16 else 5
     let arith := αn.isConstOf ``Nat || αn.isConstOf ``Int
     let mut tried := 0
     for w in cands do
-      if tried ≥ cap then
+      if tried ≥ cap || (← heartbeatsExhausted) then
         break
       tried := tried + 1
       let inst := p.beta #[w]
@@ -3314,7 +3472,7 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
     match sub.getAppFnArgs with
     | (``Exists, #[α, _]) => α.isConstOf ``Nat || α.isConstOf ``Int
     | _ => false
-  if exFuel > 0 && (goal.find? arithExists).isSome then
+  if exFuel > 0 && !(← heartbeatsExhausted) && (goal.find? arithExists).isSome then
     let strengthened ← safely (herbrandArith goal) goal
     if strengthened != goal && sizeUpTo 2501 strengthened ≤ 2500 then
       if ← safely (do check strengthened; return true) false then
@@ -3372,11 +3530,11 @@ def knownTwoInhabitants (α : Expr) : MetaM Bool := do
 
 /--
 Recursive emptiness check for types: detects constructorless inductives
-(`Empty`, `PEmpty`, `False`), inductives where every constructor requires a
-field of an empty type (`Empty × Nat`, `Sum Empty Empty`), arrows from a known-
-nonempty domain into an empty codomain (`Unit → Empty`), and — when
-`semanticProbe` is enabled — tactic-provable emptiness (`Fin 0`,
-`{ n : Nat // n < 0 }`).
+(`Empty`, `PEmpty`, `False`), non-mutual base-less recursive inductives where
+every constructor requires an empty field or a direct self-recursive field
+(`Empty × Nat`, `Sum Empty Empty`, `NoBase`), arrows from a known-nonempty
+domain into an empty codomain (`Unit → Empty`), and — when `semanticProbe` is
+enabled — tactic-provable emptiness (`Fin 0`, `{ n : Nat // n < 0 }`).
 -/
 partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
     (fuel : Nat := 3) : MetaM Bool :=
@@ -3408,9 +3566,11 @@ partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
         if let some (.inductInfo ind) := (← getEnv).find? n then
           if ind.ctors.isEmpty then
             return true
-          if ind.numIndices == 0 && fuel > 0 && ind.ctors.length ≤ 8 then
+          if ind.numIndices == 0 && tyw.getAppArgs.size == ind.numParams &&
+              fuel > 0 && ind.ctors.length ≤ 8 then
             let mut allDead := true
             let mut anyTriviallyLive := false
+            let nonMutual := ind.all.length == 1
             for c in ind.ctors do
               let ctor := mkAppN (mkConst c lvls) tyw.getAppArgs
               let (dead, trivLive) ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
@@ -3418,6 +3578,12 @@ partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
                 let mut allKn := true
                 for f in fields do
                   let fTy ← inferType f
+                  if nonMutual then
+                    let fTyw ← safely (whnf fTy) fTy
+                    if fTyw.getAppFn.isConstOf n then
+                      d := true
+                      allKn := false
+                      break
                   if ← isEmptyType fTy semanticProbe heartbeats (fuel - 1) then
                     d := true
                     allKn := false
@@ -3437,7 +3603,7 @@ partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
               return true
             if anyTriviallyLive then
               return false
-    if semanticProbe then
+    if semanticProbe && heartbeats > 0 then
       let notInhab := mkForall `x .default tyn (mkConst ``False)
       let tac ← `(tactic|
         first | (intro x; cases x) | (intros; omega) | (simp +arith; done))
@@ -3446,8 +3612,8 @@ partial def isEmptyType (ty : Expr) (semanticProbe : Bool) (heartbeats : Nat)
 
 /--
 Whether the constructor application `ctor` (parameters supplied) has a field of
-an empty type (`Empty`, `Empty × Nat`, `Fin 0`, `Unit → Empty`, ...), together
-with its number of fields. Such a constructor builds no value.
+an empty type (`Empty`, `Empty × Nat`, `Fin 0`, `Unit → Empty`, `NoBase`, ...),
+together with its number of fields. Such a constructor builds no value.
 -/
 def ctorFieldInfo (ctor : Expr) (semanticProbe : Bool := false)
     (heartbeats : Nat := 0) : MetaM (Bool × Nat) :=
@@ -3458,63 +3624,76 @@ def ctorFieldInfo (ctor : Expr) (semanticProbe : Bool := false)
       return (dead, fields.size)) (false, 1)
 
 /--
-Structural subsingleton test: at most one constructor of the inductive type
-`α` can build a value (skipping constructors with a recursively empty field),
-and each of its fields ranges over a proposition or a type that passes the same
-test (to depth `fuel`). Covers `Option Empty`, `List Empty`, `Option (Empty × Nat)`,
-`Option (Sum Empty Empty)`, `Option (Fin 0)`, `Option { n : Nat // n < 0 }`,
-`Option (Unit → Empty)`, `Empty`, `Unit`, and structures over such types.
+Whether `α` has at most one inhabitant: proof irrelevance, `Subsingleton α`
+instances, function types `(x : dom) → cod x` whose domain is empty (`Fin 0 → Nat`,
+`Empty × Nat → Nat`) or whose codomain is a subsingleton (`Nat → Option Empty`),
+inductive types with at most one non-empty constructor whose fields each pass
+the same test (`Option Empty × Fin 1`, `Option NoBase`, `List (Fin 0)`, ...),
+or — when `semanticProbe` is enabled — a direct proof of uniqueness (`Subtype`
+predicate uniqueness or `∀ a b : α, a = b`).
 -/
-partial def inductiveAtMostOne (α : Expr) (semanticProbe : Bool := false)
-    (heartbeats : Nat := 0) (fuel : Nat := 3) : MetaM Bool :=
-  safely (do
-    if ← isProp α then
-      return true
-    let ty ← whnf α
-    let .const n lvls := ty.getAppFn | return false
-    let some (.inductInfo ind) := (← getEnv).find? n | return false
-    if ind.numIndices != 0 then
-      return false
-    let mut live := 0
-    for c in ind.ctors do
-      let ctor := mkAppN (mkConst c lvls) ty.getAppArgs
-      -- `none`: builds no value; `some ok`: builds one, `ok` iff at most one.
-      let verdict? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
-        for f in fields do
-          if ← isEmptyType (← inferType f) semanticProbe heartbeats (fuel - 1) then
-            return none
-        for f in fields do
-          if fuel == 0 then
-            return some false
-          unless ← inductiveAtMostOne (← inferType f) semanticProbe heartbeats
-              (fuel - 1) do
-            return some false
-        return some true
-      match verdict? with
-      | none => pure ()
-      | some false => return false
-      | some true => live := live + 1
-    return live ≤ 1) false
-
-/--
-Whether `α` has at most one inhabitant (`Subsingleton α`, proof irrelevance,
-structural `inductiveAtMostOne`, or — when `semanticProbe` is enabled — a direct
-proof of `∀ a b : α, a = b`).
--/
-def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
-    MetaM Bool := do
+partial def typeSubsingleton (α : Expr) (semanticProbe : Bool)
+    (heartbeats : Nat) (fuel : Nat := 3) : MetaM Bool := do
   if ← safely (isProp α) false then
     return true
   if ← knownTwoInhabitants α then
     return false
-  if ← inductiveAtMostOne α semanticProbe heartbeats then
-    return true
   let hasInst ← safely (do
     let u ← getLevel α
     return (← synthInstance? (mkApp (mkConst ``Subsingleton [u]) α)).isSome) false
   if hasInst then
     return true
-  if semanticProbe then
+  let ty ← safely (whnf α) α
+  match ty with
+  | .forallE n dom body bi =>
+    if fuel > 0 then
+      if ← isEmptyType dom semanticProbe heartbeats (fuel - 1) then
+        return true
+      let codSub ← safely (withLocalDecl n bi dom fun x =>
+        typeSubsingleton (body.instantiate1 x) semanticProbe heartbeats (fuel - 1)) false
+      if codSub then
+        return true
+  | _ =>
+    if let .const n lvls := ty.getAppFn then
+      if let some (.inductInfo ind) := (← getEnv).find? n then
+        if ind.numIndices == 0 && ty.getAppArgs.size == ind.numParams &&
+            ind.ctors.length ≤ 8 then
+          let ok ← safely (do
+            let mut live := 0
+            for c in ind.ctors do
+              let ctor := mkAppN (mkConst c lvls) ty.getAppArgs
+              -- `none`: builds no value; `some ok`: builds one, `ok` iff at most one.
+              let verdict? ← forallTelescopeReducing (← inferType ctor) fun fields _ => do
+                for f in fields do
+                  if ← isEmptyType (← inferType f) semanticProbe heartbeats (fuel - 1) then
+                    return none
+                for f in fields do
+                  if fuel == 0 then
+                    return some false
+                  unless ← typeSubsingleton (← inferType f) semanticProbe heartbeats
+                      (fuel - 1) do
+                    return some false
+                return some true
+              match verdict? with
+              | none => pure ()
+              | some false => return false
+              | some true =>
+                live := live + 1
+                if live > 1 then
+                  return false
+            return live ≤ 1) false
+          if ok then
+            return true
+  if semanticProbe && heartbeats > 0 && fuel > 0 then
+    if let (``Subtype, #[β, pred]) := ty.getAppFnArgs then
+      let pinned ← safely (do
+        withLocalDeclD `a β fun a =>
+        withLocalDeclD `b β fun b => do
+          let g := mkForall `ha .default (pred.beta #[a])
+            (mkForall `hb .default (pred.beta #[b]) (← mkEq a b))
+          tryProveCore g heartbeats) false
+      if pinned then
+        return true
     return ← safely (do
       withLocalDeclD `a α fun a =>
       withLocalDeclD `b α fun b => do
@@ -3523,7 +3702,7 @@ def typeSubsingleton (α : Expr) (semanticProbe : Bool) (heartbeats : Nat) :
 
 /-- Whether `ty` is provably empty (`∀ x : ty, False`). -/
 def isEmptyDomain (ty : Expr) (heartbeats : Nat) : MetaM Bool :=
-  isEmptyType ty true heartbeats
+  isEmptyType ty (heartbeats > 0) heartbeats
 
 /--
 Whether `e` is a bare equation or disequation `o = t`, `t = o`, `¬(o = t)`, or
@@ -4146,7 +4325,57 @@ partial def simpProp (e : Expr) : CheckM Expr := do
   let e ← headReduce e
   match e.getAppFnArgs with
   | (``True, #[]) | (``False, #[]) => return e
-  | (``And, #[a, b]) => mkAndS (← simpProp a) (← simpProp b)
+  | (``And, #[a, b]) =>
+    let res ← mkAndS (← simpProp a) (← simpProp b)
+    let cs := conjuncts res
+    if cs.size ≤ 1 || cs.size > 16 then
+      return res
+    -- Conjunctive congruence: `E₁ ∧ … ∧ Eₘ ∧ C` is equivalent to rewriting
+    -- each `Eᵢ` only by earlier `Eⱼ` (`j < i`, avoiding circularity) and
+    -- rewriting non-equation conjuncts `C` by all `E₁..Eₘ`, guarding every
+    -- substitution with kernel `check`.
+    let mut eqConjs : Array (Expr × Expr × Expr) := #[]
+    let mut otherConjs : Array Expr := #[]
+    for c in cs do
+      if let some (lhs, rhs) ← rewriteRule? c then
+        eqConjs := eqConjs.push (c, lhs, rhs)
+      else
+        otherConjs := otherConjs.push c
+    if eqConjs.isEmpty then
+      return res
+    let applyRules (rules : Array (Expr × Expr)) (t : Expr) : CheckM Expr := do
+      let mut cur := t
+      for (lhs, rhs) in rules do
+        let cand := cur.replace fun sub => if sub == lhs then some rhs else none
+        if cand != cur && (← safely (do check cand; return true) false) then
+          cur := cand
+      return cur
+    let mut acc := mkConst ``True
+    let mut changed := false
+    let mut priorRules : Array (Expr × Expr) := #[]
+    for (c, lhs, rhs) in eqConjs do
+      if priorRules.isEmpty then
+        acc ← mkAndS acc c
+      else
+        let c' ← applyRules priorRules c
+        if c' != c then
+          changed := true
+          acc ← mkAndS acc (← simpProp c')
+        else
+          acc ← mkAndS acc c
+      if isFalseConst acc then
+        return acc
+      priorRules := priorRules.push (lhs, rhs)
+    for c in otherConjs do
+      let c' ← applyRules priorRules c
+      if c' != c then
+        changed := true
+        acc ← mkAndS acc (← simpProp c')
+      else
+        acc ← mkAndS acc c
+      if isFalseConst acc then
+        return acc
+    return if changed then acc else res
   | (``Or, #[a, b]) =>
     withoutBoilerplate do
       let res ← mkOrS (← simpProp a) (← simpProp b)
@@ -4348,7 +4577,8 @@ partial def exposeCtor (α e : Expr) :
   let arith := α.isConstOf ``Nat || α.isConstOf ``Int
   unless (!arith || (← mentionsOutput e)) && (← canUnfoldConst fn) do
     return (e, none)
-  let budget := (← read).cfg.probeHeartbeats * 1000
+  let some budget ← cappedHeartbeats? ((← read).cfg.probeHeartbeats * 1000)
+    | return (e, none)
   let e' ← safely
     (withCurrHeartbeats <|
       withTheReader Core.Context (fun c => { c with maxHeartbeats := budget }) <|
@@ -4538,6 +4768,22 @@ partial def collapseMatch? (propLevel : Bool) (e : Expr) :
   let e'' ← headReduce e'
   if e'' != e' then
     return some (← if propLevel then simpProp e'' else normData e'')
+  -- If a discriminant is a structured-data definition (e.g. `u32Arg 0`),
+  -- exposing its constructor may unblock the `match`/`casesOn`.
+  let mut discrsExposed := discrs
+  let mut exposedAny := false
+  for i in [0:discrs.size] do
+    let d := discrs[i]!
+    if let some dTy ← safely (do return some (← whnfR (← inferType d))) none then
+      let (d', ctor?) ← withoutBoilerplate (exposeCtor dTy d)
+      if ctor?.isSome && d' != d then
+        discrsExposed := discrsExposed.set! i d'
+        exposedAny := true
+  if exposedAny then
+    let eExp := ({ app with discrs := discrsExposed }).toExpr
+    let eExp' ← headReduce eExp
+    if eExp' != eExp then
+      return some (← if propLevel then simpProp eExp' else normData eExp')
   let mut alts : Array Expr := #[]
   let mut common? : Option Expr := none
   let mut collapsible := true
@@ -4574,14 +4820,19 @@ partial def collapseMatch? (propLevel : Bool) (e : Expr) :
   let rebuilt? :=
     if remaining.isEmpty then some ({ app with alts := alts }).toExpr else none
   -- Alternative by alternative the `match` does not collapse. When it scrutinises
-  -- an output, judge its case tree as well: a constructor discriminant selects a
-  -- subtree there even if another discriminant, or a nested pattern, is stuck.
-  if (← isMatcher app.matcherName) && (← app.discrs.anyM mentionsOutput) then
+  -- an output or a constructor application, judge its case tree as well: a
+  -- constructor discriminant selects a subtree there even if another
+  -- discriminant, or a nested pattern, is stuck.
+  let anyCtorDiscr ← app.discrs.anyM fun d => do
+    return (← safely (constructorApp? d) none).isSome
+  if (← isMatcher app.matcherName) &&
+      ((← app.discrs.anyM mentionsOutput) || anyCtorDiscr) then
     if let some tree ← unfoldMatcher? e' then
       let saved ← get
       let treeRes ←
         if propLevel then propSimplify (← simpProp tree) else normData tree
-      if (← outputCount treeRes) < (← outputCount (rebuilt?.getD e')) then
+      if isTrueConst treeRes || isFalseConst treeRes ||
+          (← outputCount treeRes) < (← outputCount (rebuilt?.getD e')) then
         return some treeRes
       let now ← get
       set { saved with steps := now.steps, unfolds := now.unfolds,
@@ -5158,6 +5409,14 @@ def analyzeBody (cfg : EnsuresCheckConfig)
                 return ← tryProve (← wrap g) hb false 1
               return false
           if isTrueConst resUnder || (← prove resUnder) then
+            -- On a dependent output type (e.g. `Fin n` under `n = 0`), an empty
+            -- output domain makes both `post` and `¬ post` hold vacuously: the
+            -- contract is unrealizable, not merely universally accepting.
+            let depOut ← outputs.anyM fun o => do
+              return (← safely (inferType o) (mkConst ``Nat)).hasFVar
+            if depOut && (← prove (mkNot resUnder)) then
+              return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
+                some (mkConst ``False))
             return (some EnsuresVacuityReason.vacuousUnderRequires, none',
               some (mkConst ``True))
           if isFalseConst resUnder || (← prove (mkNot resUnder)) then
@@ -5191,6 +5450,41 @@ def analyzeBody (cfg : EnsuresCheckConfig)
                   if unbound then
                     bound' := bound'.set! i false
                     reason? := some .vacuousUnderRequires
+          -- Fallback under `requires`: unfold small non-recursive output helpers
+          -- once (e.g. `mulBy x r = 0` under `x = 0`, `clampZero x r = 0` under
+          -- `x < 10`) and re-test against `facts`.
+          if bound'.any id && !(← heartbeatsExhausted) then
+            if let some rawUnf ← unfoldSmallOutputHelpers cfg mentions resUnder then
+              let mut candUnf ← do
+                let (c, _) ← ((do propSimplify (← simpProp rawUnf)).run ctx).run {}
+                pure c
+              for f in facts do
+                if let some (lhs, rhs) ← rewriteRule? f then
+                  let rw := candUnf.replace fun sub =>
+                    if sub == lhs then some rhs else none
+                  if rw != candUnf && (← safely (do check rw; return true) false) then
+                    let (c, _) ← ((do propSimplify (← simpProp rw)).run ctx).run {}
+                    candUnf := c
+              if small candUnf then
+                if isTrueConst candUnf || (← prove candUnf) then
+                  return (some EnsuresVacuityReason.vacuousUnderRequires, none',
+                    some (mkConst ``True))
+                if isFalseConst candUnf || (← prove (mkNot candUnf)) then
+                  return (some EnsuresVacuityReason.unrealizableUnderRequires, none',
+                    some (mkConst ``False))
+                for i in [0:outputs.size] do
+                  if bound'[i]! then
+                    let o := outputs[i]!
+                    let unbound ←
+                      if !candUnf.containsFVar o.fvarId! then
+                        pure true
+                      else
+                        withLocalDeclD `o' (← inferType o) fun o' =>
+                          prove (mkApp2 (mkConst ``Iff) candUnf
+                            (candUnf.replaceFVar o o'))
+                    if unbound then
+                      bound' := bound'.set! i false
+                      reason? := some .vacuousUnderRequires
           return (reason?, bound', none)
       let mut boundAcc := Array.replicate outputs.size false
       let mut allUnrealizable := true
@@ -5273,16 +5567,100 @@ def atomFixedTruth? (cfg : EnsuresCheckConfig) (a : Expr) : MetaM (Option Bool) 
   return none
 
 /--
+Expand a positive boilerplate atom for fibre-condition checking. For
+`retMatchesCalleeReturnTy`, which reads only `localDecls[0]` and `layouts`
+(never `basicBlocks`), `CapturedMir` projections are briefly permitted under a
+small heartbeat cap so concrete return types (`u32`, `bool`, ...) expose their
+validity predicates.
+-/
+def expandFibreAtom (cfg : EnsuresCheckConfig) (atom : Expr) : MetaM Expr := do
+  let cfg' :=
+    if atom.isAppOf ``retMatchesCalleeReturnTy then
+      { cfg with opaqueStructTypes := #[] }
+    else
+      cfg
+  let some hb ← cappedHeartbeats? 300000 | return atom
+  safely
+    (withCurrHeartbeats <|
+      withTheReader Core.Context (fun c => { c with maxHeartbeats := hb }) <| do
+        let ctx : Context :=
+          { cfg := cfg', outputs := #[], stripBoilerplate := false }
+        let (r, _) ← ((do propSimplify (← simpProp atom)).run ctx).run {}
+        return r) atom
+
+/--
+Check whether `residual` is provably constant (`True` or `False`) on the fibre
+defined by `atoms`/`mask` and `hyp?`: justified by
+`not_dichotomyModuloObservation_of_fibre_constant`, such a fibre contributes no
+dichotomy beyond the boilerplate observation (covering clauses implied by
+`retMatchesCalleeReturnTy` or `callFramePreserved`, clauses refuted by them, and
+jointly inconsistent boilerplate fibres).
+-/
+def fibreMakesResidualConst (cfg : EnsuresCheckConfig)
+    (atoms : Array Expr) (mask : Nat) (hyp? : Option Expr) (residual : Expr) :
+    MetaM Bool := do
+  if !cfg.semanticProbe || cfg.probeHeartbeats == 0 || (← heartbeatsExhausted) then
+    return false
+  if sizeUpTo (cfg.probeMaxSize + 1) residual > cfg.probeMaxSize then
+    return false
+  let mut rawHyps : List Expr := []
+  if let some h := hyp? then
+    if sizeUpTo (cfg.probeMaxSize + 1) h ≤ cfg.probeMaxSize then
+      rawHyps := h :: rawHyps
+  for i in [0:atoms.size] do
+    let a := atoms[i]!
+    if ((mask >>> i) &&& 1) == 1 then
+      let exp ← expandFibreAtom cfg a
+      if sizeUpTo (cfg.probeMaxSize + 1) exp ≤ cfg.probeMaxSize then
+        rawHyps := exp :: rawHyps
+    else
+      if !a.isAppOf ``retMatchesCalleeReturnTy &&
+          sizeUpTo (cfg.probeMaxSize + 1) a ≤ cfg.probeMaxSize then
+        rawHyps := mkNot a :: rawHyps
+  if rawHyps.isEmpty then
+    return false
+  let hb := cfg.probeHeartbeats
+  let ctx : Context := { cfg, outputs := #[], stripBoilerplate := false }
+  openHyps rawHyps #[] #[] fun ws facts => do
+    let mut rewritten := residual
+    for f in facts do
+      if let some (lhs, rhs) ← rewriteRule? f then
+        let cand := rewritten.replace fun sub =>
+          if sub == lhs then some rhs else none
+        if cand != rewritten && (← safely (do check cand; return true) false) then
+          rewritten := cand
+    let resUnder ←
+      if rewritten == residual then
+        pure residual
+      else
+        let (r, _) ← ((do propSimplify (← simpProp rewritten)).run ctx).run {}
+        pure r
+    let wrap (g : Expr) : MetaM Expr :=
+      mkForallFVars ws (facts.foldr (fun f acc => mkForall `h .default f acc) g)
+    let proveFibre (g : Expr) : MetaM Bool := do
+      let wg ← wrap g
+      if sizeUpTo (cfg.probeMaxSize * 3 + 1) wg > cfg.probeMaxSize * 3 then
+        return false
+      tryProveFast wg hb
+    if isTrueConst resUnder || (← proveFibre resUnder) then
+      return true
+    if isFalseConst resUnder || (← proveFibre (mkNot resUnder)) then
+      return true
+    return false
+
+/--
 Determine which outputs are constrained *beyond* the predicates in
 `cfg.boilerplate`, by exact cofactoring: normalise with boilerplate kept
 opaque, enumerate **every** feasible truth assignment `{True, False}^k` to the
 distinct closed boilerplate atoms occurring in the residual (skipping empty
-fibres where an atom is provably constant, such as `callFramePreserved m m`),
-and OR per-output binding across cofactors clamped by `full.bound` (preserving
-monotonicity: `user.bound[i] → full.bound[i]`). This decides
-`DichotomyModuloObservation` for the observation "truth values of those atoms",
-which for one atom is `DichotomyBeyondPredicate` (soundness:
-`not_dichotomyModuloObservation_of_inhabited_cofactors_insensitive`).
+fibres where an atom is provably constant, such as `callFramePreserved m m`, and
+skipping fibres on which the boilerplate atoms themselves imply or refute the
+cofactor residual, such as `ensures(ret <= u32::MAX)` or repeating a field of
+`callFramePreserved`), and OR per-output binding across cofactors clamped by
+`full.bound` (preserving monotonicity: `user.bound[i] → full.bound[i]`). This
+decides `DichotomyModuloObservation` for the observation "truth values of those
+atoms", which for one atom is `DichotomyBeyondPredicate` (soundness:
+`not_dichotomyModuloObservation_of_fibre_constant`).
 
 The enumeration is never sampled: a dichotomy modulo the observation lives in
 exactly one cofactor (`DichotomyModuloObservation.exists_cofactor_dichotomy`),
@@ -5346,11 +5724,22 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
     let a ← analyzeBodySplit cfg outputs cand hyp?
     if first?.isNone then
       first? := some a
-    let mut anyReal := false
+    let mut hasCandidate := false
     for i in [0:outputs.size] do
       if a.bound[i]! && full.bound[i]! then
-        boundAcc := boundAcc.set! i true
-        anyReal := true
+        hasCandidate := true
+        break
+    let fibreConst ←
+      if hasCandidate then
+        fibreMakesResidualConst cfg atoms mask hyp? a.residual
+      else
+        pure false
+    let mut anyReal := false
+    if !fibreConst then
+      for i in [0:outputs.size] do
+        if a.bound[i]! && full.bound[i]! then
+          boundAcc := boundAcc.set! i true
+          anyReal := true
     if anyReal && best?.isNone then
       best? := some a
     if boundAcc == full.bound then
@@ -5554,14 +5943,13 @@ the calling command has left.
 
 The checker is advisory and must not take the calling command down with a
 deterministic timeout. Once the budget is spent every further probe fails
-closed (`safely`, `runTacticClosed`), so the report computed from then on can
-only lose *vacuous* verdicts, never gain one; it is returned with
-`analysisBudgetNote`. A timeout that escapes the probes yields `fallback`, the
-conservative report in which every designated output is bound.
+closed (`safely`, `runTacticClosed`, `cappedHeartbeats?`), so the report
+computed from then on can only lose *vacuous* verdicts, never gain one; it is
+returned tagged with `analysisBudgetNote`. A timeout that escapes the probes
+yields `fallback` tagged via `addNote`.
 -/
-def withAnalysisBudget (cfg : EnsuresCheckConfig)
-    (fallback : EnsuresCheckReport) (x : MetaM EnsuresCheckReport) :
-    MetaM EnsuresCheckReport := do
+def withBudget {α : Type} (cfg : EnsuresCheckConfig)
+    (fallback : α) (addNote : α → String → α) (x : MetaM α) : MetaM α := do
   if cfg.maxAnalysisHeartbeats == 0 then
     return ← x
   -- At most the configured budget, and at most seven eighths of what the
@@ -5583,9 +5971,14 @@ def withAnalysisBudget (cfg : EnsuresCheckConfig)
   let spent := (← IO.getNumHeartbeats) - start ≥ limit
   match r? with
   | some r =>
-    return if spent then { r with notes := r.notes.push analysisBudgetNote } else r
+    return if spent then addNote r analysisBudgetNote else r
   | none =>
-    return { fallback with notes := fallback.notes.push analysisBudgetNote }
+    return addNote fallback analysisBudgetNote
+
+def withAnalysisBudget (cfg : EnsuresCheckConfig)
+    (fallback : EnsuresCheckReport) (x : MetaM EnsuresCheckReport) :
+    MetaM EnsuresCheckReport :=
+  withBudget cfg fallback (fun r n => { r with notes := r.notes.push n }) x
 
 /--
 Resolve the designated outputs of a postcondition `body` over `binders` and
@@ -5636,11 +6029,11 @@ def analyzePost (cfg : EnsuresCheckConfig) (kind : String) (body : Expr)
         let ctx : Context := { cfg, outputs := #[], stripBoilerplate := false }
         let (hyp, _) ← ((do propSimplify (← simpProp pre)).run ctx).run {}
         preRefuted ← refuteUnderExists cfg hyp
-        if !preRefuted && cfg.semanticProbe then
+        if !preRefuted then
           for i in [0:binders.size] do
             if !outIdxs.contains i then
               let bTy ← safely (inferType binders[i]!) (mkConst ``Unit)
-              if ← isEmptyDomain bTy cfg.probeHeartbeats then
+              if ← isEmptyType bTy cfg.semanticProbe cfg.probeHeartbeats then
                 preRefuted := true
                 break
         if !preRefuted && !isTrueConst hyp then
@@ -5671,9 +6064,9 @@ binders.
   binders `outputParamIdxs` (default: the last binder, or the last two for the
   `StatefulClaim` shape `List Value → Memory → Value → Memory → Prop`), which
   covers `Claim.post`, `MirCallContract.post`, and `extraPost` lambdas; or
-* a term of type `MirCallContract`, `Claim`, or `StatefulClaim`, possibly under
-  leading parameters, whose `post` field is analysed with the indices counted
-  among the binders of `post`.
+* a term of type `MirCallContract`, `Claim`, `StatefulClaim`, `TotalClaim`, or
+  `ModularClaim`, possibly under leading parameters, whose `post` field is
+  analysed with the indices counted among the binders of `post`.
 
 An output of type `MirCallAns` is analysed outcome by outcome; see the section
 documentation.
@@ -5746,16 +6139,35 @@ def checkEnsuresBindsOutput (postExpr : Expr)
           (mkApp5 (mkConst ``StatefulClaim.post) applied args mem ret mem')
           #[args, mem, ret, mem'] outputParamIdxs
           (some (mkApp3 (mkConst ``StatefulClaim.pre) applied args mem))
+    else if resTy.isConstOf ``TotalClaim then
+      withLocalDeclD `args argsTy fun args =>
+      withLocalDeclD `mem memTy fun mem =>
+      withLocalDeclD `ret valTy fun ret =>
+      withLocalDeclD `mem' memTy fun mem' =>
+        EnsuresCheck.analyzePost cfg "TotalClaim"
+          (mkApp5 (mkConst ``TotalClaim.post) applied args mem ret mem')
+          #[args, mem, ret, mem'] outputParamIdxs
+          (some (mkApp3 (mkConst ``TotalClaim.pre) applied args mem))
+    else if resTy.isConstOf ``ModularClaim then
+      withLocalDeclD `args argsTy fun args =>
+      withLocalDeclD `mem memTy fun mem =>
+      withLocalDeclD `ret valTy fun ret =>
+      withLocalDeclD `mem' memTy fun mem' =>
+        EnsuresCheck.analyzePost cfg "ModularClaim"
+          (mkApp5 (mkConst ``ModularClaim.post) applied args mem ret mem')
+          #[args, mem, ret, mem'] outputParamIdxs
+          (some (mkApp3 (mkConst ``ModularClaim.pre) applied args mem))
     else
       throwError "checkEnsuresBindsOutput: expected a postcondition \
-        `∀ x₁ … xₙ, Prop`, a `MirCallContract`, a `Claim`, or a \
-        `StatefulClaim`, but the result type is{indentExpr resTy}"
+        `∀ x₁ … xₙ, Prop`, a `MirCallContract`, a `Claim`, a `StatefulClaim`, \
+        a `TotalClaim`, or a `ModularClaim`, but the result type is\
+        {indentExpr resTy}"
 
 /--
 `checkEnsuresBindsOutput` on the constant `declName`: a postcondition function,
-a `MirCallContract`, a `Claim`, or a `StatefulClaim` (each possibly under
-leading parameters). `preDecl?` names the precondition of a function-shaped
-postcondition.
+a `MirCallContract`, a `Claim`, a `StatefulClaim`, a `TotalClaim`, or a
+`ModularClaim` (each possibly under leading parameters). `preDecl?` names the
+precondition of a function-shaped postcondition.
 -/
 def checkDeclEnsuresBindsOutput (declName : Name)
     (outputParamIdxs : Option (Array Nat) := none)
@@ -5800,7 +6212,10 @@ def assertEnsuresVacuous (declName : Name)
 
 /-- Result of `checkRequiresSatisfiable`. -/
 structure RequiresCheckReport where
-  /-- What was analysed: `function`, `Claim`, `StatefulClaim`, `MirCallContract`. -/
+  /--
+  What was analysed: `function`, `Claim`, `StatefulClaim`, `TotalClaim`,
+  `ModularClaim`, or `MirCallContract`.
+  -/
   kind : String
   /-- Number of precondition binders. -/
   arity : Nat
@@ -5812,14 +6227,18 @@ structure RequiresCheckReport where
   refuted : Bool
   /-- The normalised precondition. -/
   residual : String
+  /-- Diagnostic notes (for example when `maxAnalysisHeartbeats` is spent). -/
+  notes : Array String := #[]
   deriving Repr, Inhabited
 
 /--
 Look for a proof that the precondition `preExpr` is unsatisfiable (vacuity
 class 1). `preExpr` is a predicate `∀ x₁ … xₙ, Prop` (or `Bool`), or a
-`MirCallContract`, `Claim`, or `StatefulClaim` (possibly under leading
-parameters), whose `pre` field is analysed. Satisfiability itself is not
-decided: a report with `refuted = false` is not a realizability proof.
+`MirCallContract`, `Claim`, `StatefulClaim`, `TotalClaim`, or `ModularClaim`
+(possibly under leading parameters), whose `pre` field is analysed under
+`cfg.maxAnalysisHeartbeats` so it never times its caller out. Satisfiability
+itself is not decided: a report with `refuted = false` is not a realizability
+proof.
 -/
 def checkRequiresSatisfiable (preExpr : Expr)
     (cfg : EnsuresCheckConfig := {}) : MetaM RequiresCheckReport := do
@@ -5832,21 +6251,25 @@ def checkRequiresSatisfiable (preExpr : Expr)
     let argsTy := mkApp (mkConst ``List [Level.zero]) valTy
     let run (kind : String) (body : Expr) (arity : Nat)
         (domainBinders : Array Expr) : MetaM RequiresCheckReport := do
-      let ctx : EnsuresCheck.Context :=
-        { cfg, outputs := #[], stripBoilerplate := false }
-      let (res, _) ←
-        ((do EnsuresCheck.propSimplify (← EnsuresCheck.simpProp body)).run ctx).run {}
-      let mut refuted ← EnsuresCheck.refuteUnderExists cfg res
-      if !refuted && cfg.semanticProbe then
-        for b in domainBinders do
-          let bTy ← EnsuresCheck.safely (inferType b) (mkConst ``Unit)
-          if ← EnsuresCheck.isEmptyDomain bTy cfg.probeHeartbeats then
-            refuted := true
-            break
-      return {
-        kind, arity
-        refuted
-        residual := ← EnsuresCheck.ppResidual res }
+      let fallback : RequiresCheckReport :=
+        { kind, arity, refuted := false, residual := "<not analysed>", notes := #[] }
+      EnsuresCheck.withBudget cfg fallback
+          (fun r n => { r with notes := r.notes.push n }) do
+        let ctx : EnsuresCheck.Context :=
+          { cfg, outputs := #[], stripBoilerplate := false }
+        let (res, _) ←
+          ((do EnsuresCheck.propSimplify (← EnsuresCheck.simpProp body)).run ctx).run {}
+        let mut refuted ← EnsuresCheck.refuteUnderExists cfg res
+        if !refuted then
+          for b in domainBinders do
+            let bTy ← EnsuresCheck.safely (inferType b) (mkConst ``Unit)
+            if ← EnsuresCheck.isEmptyType bTy cfg.semanticProbe cfg.probeHeartbeats then
+              refuted := true
+              break
+        return {
+          kind, arity
+          refuted
+          residual := ← EnsuresCheck.ppResidual res }
     if resTy.isProp then
       run "function" applied xs.size xs
     else if resTy.isConstOf ``Bool then
@@ -5863,10 +6286,21 @@ def checkRequiresSatisfiable (preExpr : Expr)
       withLocalDeclD `mem (mkConst ``Memory) fun mem =>
         run "StatefulClaim"
           (mkApp3 (mkConst ``StatefulClaim.pre) applied args mem) 2 #[args, mem]
+    else if resTy.isConstOf ``TotalClaim then
+      withLocalDeclD `args argsTy fun args =>
+      withLocalDeclD `mem (mkConst ``Memory) fun mem =>
+        run "TotalClaim"
+          (mkApp3 (mkConst ``TotalClaim.pre) applied args mem) 2 #[args, mem]
+    else if resTy.isConstOf ``ModularClaim then
+      withLocalDeclD `args argsTy fun args =>
+      withLocalDeclD `mem (mkConst ``Memory) fun mem =>
+        run "ModularClaim"
+          (mkApp3 (mkConst ``ModularClaim.pre) applied args mem) 2 #[args, mem]
     else
       throwError "checkRequiresSatisfiable: expected a precondition \
-        `∀ x₁ … xₙ, Prop`, a `MirCallContract`, a `Claim`, or a \
-        `StatefulClaim`, but the result type is{indentExpr resTy}"
+        `∀ x₁ … xₙ, Prop`, a `MirCallContract`, a `Claim`, a `StatefulClaim`, \
+        a `TotalClaim`, or a `ModularClaim`, but the result type is\
+        {indentExpr resTy}"
 
 /-- `checkRequiresSatisfiable` on the constant `declName`. -/
 def checkDeclRequiresSatisfiable (declName : Name)
