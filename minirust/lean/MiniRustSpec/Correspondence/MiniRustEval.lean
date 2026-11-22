@@ -8694,24 +8694,34 @@ theorem mutateCurStack_append {m : Mach} {ctx : Ctx} {frames : List Frame}
       .ok ((), rethread m ctx (frames ++ [fr])) := by
   simp [mutateCurStack, activeThread, listIndex, h.threads, h.active, thread1, listSet, rethread]
 
+/-- `Machine::check_ptr` reads only the machine's memory and vtables (`mem`,
+`vtable_ptrs`, and `prog.vtables`); `prog.functions`, `prog.globals`,
+`prog.traits`, `prog.start`, `fn_ptrs`, and threads are irrelevant. -/
+theorem checkPtr_congr_vtables {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables)
+    (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType) :
+    checkPtr ptr ptrTy (some M1) = checkPtr ptr ptrTy (some M2) := by
+  have hvl : vtableLookup M1 = vtableLookup M2 := by
+    funext p; unfold vtableLookup; rw [hvt, hvts]
+  have hvf : vtableFromPtr M1 = vtableFromPtr M2 := by
+    funext p; unfold vtableFromPtr; rw [hvt, hvts]
+  unfold checkPtr checkPtrMetadata
+  simp only [hvl, hvf, hmem]
+
 /-- `Machine::check_ptr` reads only the machine's memory and vtables. -/
 theorem checkPtr_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hprog : M1.prog = M2.prog)
     (ptr : Gen.Pointer Prov) (ptrTy : Gen.PtrType) :
-    checkPtr ptr ptrTy (some M1) = checkPtr ptr ptrTy (some M2) := by
-  have hvl : vtableLookup M1 = vtableLookup M2 := by
-    funext p; unfold vtableLookup; rw [hvt, hprog]
-  have hvf : vtableFromPtr M1 = vtableFromPtr M2 := by
-    funext p; unfold vtableFromPtr; rw [hvt, hprog]
-  unfold checkPtr checkPtrMetadata
-  simp only [hvl, hvf, hmem]
+    checkPtr ptr ptrTy (some M1) = checkPtr ptr ptrTy (some M2) :=
+  checkPtr_congr_vtables hmem hvt (congrArg Gen.Program.vtables hprog) ptr ptrTy
 
-/-- `Machine::check_value` reads only the machine's memory and vtables. -/
-theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
-    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hprog : M1.prog = M2.prog)
+/-- `Machine::check_value` reads only the machine's memory and vtables (`mem`,
+`vtable_ptrs`, and `prog.vtables`). -/
+theorem checkValue_congr_vtables {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables)
     (v : Val) (t : Gen.Type) :
     checkValue v t (some M1) = checkValue v t (some M2) := by
-  have hptr := checkPtr_congr_mach hmem hvt hprog
+  have hptr := checkPtr_congr_vtables hmem hvt hvts
   suffices h : some M1 = some M1 → checkValue v t (some M1) = checkValue v t (some M2) from h rfl
   refine checkValue.induct
     (motive_1 := fun v t mo => mo = some M1 → checkValue v t mo = checkValue v t (some M2))
@@ -8775,21 +8785,145 @@ theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     intro d ty tagger rest disc data m hne ih hm; subst hm
     simp only [checkVariant, hne, ↓reduceIte, ih rfl]
 
+/-- `Machine::check_value` reads only the machine's memory and vtables. -/
+theorem checkValue_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hprog : M1.prog = M2.prog)
+    (v : Val) (t : Gen.Type) :
+    checkValue v t (some M1) = checkValue v t (some M2) :=
+  checkValue_congr_vtables hmem hvt (congrArg Gen.Program.vtables hprog) v t
+
+/-- `Machine::eval_un_op` reads only the machine's memory, vtables
+(`vtable_ptrs`, `prog.vtables`), and function pointers (`fn_ptrs`). -/
+theorem evalUnOp_congr_vtables {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables)
+    (hfn : M1.fn_ptrs = M2.fn_ptrs)
+    (op : Gen.UnOp) (arg : Val × Gen.Type) :
+    evalUnOp op arg (some M1) = evalUnOp op arg (some M2) := by
+  have hcv := checkValue_congr_vtables hmem hvt hvts
+  have hvl : vtableLookup M1 = vtableLookup M2 := by
+    funext p; unfold vtableLookup; rw [hvt, hvts]
+  have hcs : ∀ lay pm, computeSize M1 lay pm = computeSize M2 lay pm := by
+    intro lay pm; unfold computeSize; rw [hvl]
+  have hca : ∀ lay pm, computeAlign M1 lay pm = computeAlign M2 lay pm := by
+    intro lay pm; unfold computeAlign; rw [hvl]
+  unfold evalUnOp evalCastOp transmute
+  simp only [hcv, hcs, hca, hvl, hfn]
+
 /-- `Machine::eval_un_op` reads only the machine's memory, vtables, and
 function pointers (the latter in `UnOp::VTableMethodLookup`). -/
 theorem evalUnOp_congr_mach {M1 M2 : Mach} (hmem : M1.mem = M2.mem)
     (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hprog : M1.prog = M2.prog)
     (hfn : M1.fn_ptrs = M2.fn_ptrs)
     (op : Gen.UnOp) (arg : Val × Gen.Type) :
-    evalUnOp op arg (some M1) = evalUnOp op arg (some M2) := by
-  have hcv := checkValue_congr_mach hmem hvt hprog
-  have hvl : vtableLookup M1 = vtableLookup M2 := by
-    funext p; unfold vtableLookup; rw [hvt, hprog]
-  have hcs : ∀ lay pm, computeSize M1 lay pm = computeSize M2 lay pm := by
-    intro lay pm; unfold computeSize; rw [hvl]
-  have hca : ∀ lay pm, computeAlign M1 lay pm = computeAlign M2 lay pm := by
-    intro lay pm; unfold computeAlign; rw [hvl]
-  unfold evalUnOp evalCastOp transmute
+    evalUnOp op arg (some M1) = evalUnOp op arg (some M2) :=
+  evalUnOp_congr_vtables hmem hvt (congrArg Gen.Program.vtables hprog) hfn op arg
+
+/-- Polymorphic `Machine::check_ptr` reads only the machine's memory and
+vtables (`mem`, `vtable_ptrs`, and `prog.vtables`), across every `Memory` `M`
+(in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem checkPtrM_congr_mach {M : Type} [Gen.Memory M] [MemoryOps M]
+    {M1 M2 : Gen.Machine M} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables)
+    (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType) :
+    checkPtrM ptr ptrTy (some M1) = checkPtrM ptr ptrTy (some M2) := by
+  have hvl : vtableLookupM M1 = vtableLookupM M2 := by
+    funext p; unfold vtableLookupM; rw [hvt, hvts]
+  have hvf : vtableFromPtrM M1 = vtableFromPtrM M2 := by
+    funext p; unfold vtableFromPtrM; rw [hvt, hvts]
+  unfold checkPtrM
+  simp only [Option.map, hvl, hvf, hmem]
+
+mutual
+
+/-- Polymorphic `Machine::check_value` reads only the machine's memory and
+vtables (`mem`, `vtable_ptrs`, and `prog.vtables`), across every `Memory` `M`
+(in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem checkValueM_congr_mach {M : Type} [Gen.Memory M] [MemoryOps M]
+    {M1 M2 : Gen.Machine M} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables) :
+    ∀ (val : Gen.Value M) (ty : Gen.Type),
+      checkValueM val ty (some M1) = checkValueM val ty (some M2)
+  | val, .Int _ => by unfold checkValueM; cases val <;> rfl
+  | val, .Bool => by unfold checkValueM; cases val <;> rfl
+  | val, .Ptr ptrTy => by
+    unfold checkValueM
+    cases val with
+    | Ptr ptr => exact checkPtrM_congr_mach hmem hvt hvts ptr ptrTy
+    | _ => rfl
+  | val, .Tuple fields _ unsizedField => by
+    unfold checkValueM
+    cases val with
+    | Tuple vals =>
+      cases unsizedField with
+      | some _ => rfl
+      | none =>
+        dsimp only
+        simp only [checkFieldsM_congr_mach hmem hvt hvts vals fields]
+    | _ => rfl
+  | val, .Array elem count => by
+    unfold checkValueM
+    cases val with
+    | Tuple vals =>
+      dsimp only
+      have hfn : (fun (v : Gen.Value M) => checkValueM v elem (some M1)) =
+          (fun (v : Gen.Value M) => checkValueM v elem (some M2)) :=
+        funext fun v => checkValueM_congr_mach hmem hvt hvts v elem
+      simp only [hfn]
+    | _ => rfl
+  | val, .Union _ chunks _ _ => by
+    unfold checkValueM
+    cases val <;> rfl
+  | val, .Enum ⟨variants⟩ _ _ _ _ => by
+    unfold checkValueM
+    cases val with
+    | Variant disc data => exact checkVariantM_congr_mach hmem hvt hvts variants disc data
+    | _ => rfl
+  | val, .Slice _ => by unfold checkValueM; cases val <;> rfl
+  | val, .TraitObject _ => by unfold checkValueM; cases val <;> rfl
+
+private theorem checkFieldsM_congr_mach {M : Type} [Gen.Memory M] [MemoryOps M]
+    {M1 M2 : Gen.Machine M} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables) :
+    ∀ (vals : List (Gen.Value M)) (fields : List (Gen.Offset × Gen.Type)),
+      checkFieldsM vals fields (some M1) = checkFieldsM vals fields (some M2)
+  | [], _ => by unfold checkFieldsM; rfl
+  | _ :: _, [] => by unfold checkFieldsM; rfl
+  | val :: vals, (_, ty) :: fields => by
+    unfold checkFieldsM
+    simp only [checkValueM_congr_mach hmem hvt hvts val ty,
+      checkFieldsM_congr_mach hmem hvt hvts vals fields]
+
+private theorem checkVariantM_congr_mach {M : Type} [Gen.Memory M] [MemoryOps M]
+    {M1 M2 : Gen.Machine M} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables) :
+    ∀ (variants : List (Int × Gen.Variant)) (disc : Int) (data : Gen.Value M),
+      checkVariantM variants disc data (some M1) = checkVariantM variants disc data (some M2)
+  | [], _, _ => by unfold checkVariantM; rfl
+  | (_, ⟨ty, _⟩) :: rest, disc, data => by
+    unfold checkVariantM
+    split
+    · exact checkValueM_congr_mach hmem hvt hvts data ty
+    · exact checkVariantM_congr_mach hmem hvt hvts rest disc data
+
+end
+
+/-- Polymorphic `Machine::eval_un_op` reads only the machine's memory,
+vtables (`vtable_ptrs`, `prog.vtables`), and function pointers (`fn_ptrs`),
+across every `Memory` `M` (in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem evalUnOpM_congr_mach {M : Type} [Gen.Memory M] [MemoryOps M]
+    {M1 M2 : Gen.Machine M} (hmem : M1.mem = M2.mem)
+    (hvt : M1.vtable_ptrs = M2.vtable_ptrs) (hvts : M1.prog.vtables = M2.prog.vtables)
+    (hfn : M1.fn_ptrs = M2.fn_ptrs)
+    (op : Gen.UnOp) (arg : Gen.Value M × Gen.Type) :
+    evalUnOpM op arg (some M1) = evalUnOpM op arg (some M2) := by
+  have hcv := checkValueM_congr_mach hmem hvt hvts
+  have hvl : vtableLookupM M1 = vtableLookupM M2 := by
+    funext p; unfold vtableLookupM; rw [hvt, hvts]
+  have hcs : ∀ lay pm, computeSizeM M1 lay pm = computeSizeM M2 lay pm := by
+    intro lay pm; unfold computeSizeM; rw [hvl]
+  have hca : ∀ lay pm, computeAlignM M1 lay pm = computeAlignM M2 lay pm := by
+    intro lay pm; unfold computeAlignM; rw [hvl]
+  unfold evalUnOpM evalCastOpM transmuteM
   simp only [hcv, hcs, hca, hvl, hfn]
 
 /-- `retag_ptr` of `BasicMemory` on a machine whose single thread has a

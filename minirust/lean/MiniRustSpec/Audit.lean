@@ -9898,6 +9898,472 @@ theorem ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness :
     have hwf3 := TreeBorrowsMemory.end_call_wfLive hwf2 htbm3
     exact ⟨m1, tbm2, tbm3, hm1, hwf1, hfw, htbm2, hwf2, hdead, htbm3, hwf3⟩
 
+set_option maxRecDepth 8192 in
+/-- **ZST `dyn Trait` (`vtable.size = 0`, `vtable.align = 8`), uninhabited
+`PointeeInfo.inhabited = false` precedence, and safe `&dyn Trait`
+`PlaceExpr::Deref`** on both `Mach` and `MachTB` (with `MachTB.wfLive`):
+1. ZST `dyn Trait0` (`size = 0`, `align = 8`, `cells = []`) across `&dyn Trait0`,
+   `&mut dyn Trait0`, and `Box<dyn Trait0>` with a dead data allocation:
+   * dangling provenance-free aligned `⟨0x8, none⟩` passes `checkPtr[M]`,
+     `Statement::Validate` (`fn_entry = false` and `true`, preserving
+     `MachTB.wfLive` and pushing zero Tree Borrows protectors), and safe
+     `PlaceExpr::Deref` (`aligned = true`);
+   * null `⟨0x0, none⟩` raises `"Value::Ptr: null safe pointer"`;
+   * misaligned `⟨0x4, none⟩` raises `"Value::Ptr: unaligned safe pointer"`;
+2. `PointeeInfo.inhabited = false` precedence across `&dyn Trait0`,
+   `&mut dyn Trait0`, and `Box<dyn Trait0>`:
+   * aligned non-null ZST `⟨0x8, none⟩` raises
+     `"Value::Ptr: safe pointer to uninhabited type"`;
+   * misaligned `⟨0x4, none⟩` raises `"Value::Ptr: unaligned safe pointer"`
+     (alignment precedes inhabitedness) and `⟨0x0, none⟩` raises
+     `"Value::Ptr: null safe pointer"` (non-null precedes alignment);
+   * non-ZST (`size = 8`) non-dereferenceable `⟨0x1000, none⟩` still raises
+     `"Value::Ptr: safe pointer to uninhabited type"` (inhabitedness precedes
+     `Memory::dereferenceable`);
+3. `PlaceExpr::Deref` on non-ZST safe `&dyn Trait0` (`size = 8`, `align = 8`):
+   succeeds with `aligned = true` (and `MachTB.wfLive`) on a live 8-byte
+   allocation, and raises `"Value::Ptr: non-dereferenceable safe pointer"` when
+   the backing allocation is dead. -/
+theorem ep1_vtable_zst_uninhabited_and_deref_witness :
+    let vtZst : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨0⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ }
+    let vtSize8 : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨8⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ }
+    let zstProg : Gen.Program :=
+      { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+        traits := ⟨[(ep1VtTrait0, ⟨[]⟩)]⟩,
+        vtables := ⟨[(⟨⟨0⟩⟩, vtZst), (⟨⟨1⟩⟩, vtSize8)]⟩ }
+    let dynPointee := ep1DynPointee ep1VtTrait0
+    let uninhPointee : Gen.PointeeInfo := { dynPointee with inhabited := false }
+    let dynRef : Gen.PtrType := .Ref .Immutable dynPointee
+    let dynMut : Gen.PtrType := .Ref .Mutable dynPointee
+    let dynBox : Gen.PtrType := .Box dynPointee
+    let uninhRef : Gen.PtrType := .Ref .Immutable uninhPointee
+    let uninhMut : Gen.PtrType := .Ref .Mutable uninhPointee
+    let uninhBox : Gen.PtrType := .Box uninhPointee
+    let vtZstPtr : Ptr := ⟨0x4000, some (⟨2⟩, ())⟩
+    let vt8Ptr : Ptr := ⟨0x4008, some (⟨3⟩, ())⟩
+    let vtZstTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨2⟩, [])⟩
+    let vt8TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨3⟩, [])⟩
+    let zstWideBytes : List Byte :=
+      encodePtrBytes none 0 [0x08, 0, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let liveWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨3⟩, ())) 0 [0x08, 0x40, 0, 0, 0, 0, 0, 0]
+    let mkBM (ptrTy : Gen.PtrType) (dataLive : Bool) (local1Bytes : List Byte) : Mach :=
+      { ep1MachBM
+          [{ data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := dataLive, extra := () },
+           { data := local1Bytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+           { data := [], addr := 0x4008, align := ⟨1⟩, kind := .VTable, live := true, extra := () }]
+          [(⟨⟨1⟩⟩, ⟨0x2000, some (⟨1⟩, ())⟩)]
+          [(⟨⟨1⟩⟩, .Ptr ptrTy)] with
+        prog := zstProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtZstPtr), (⟨⟨1⟩⟩, vt8Ptr)]⟩ }
+    let mkTB (ptrTy : Gen.PtrType) (dataLive : Bool) (local1Bytes : List Byte) : MachTB :=
+      liftMachToTB (mkBM ptrTy dataLive local1Bytes)
+    let bmZst := mkBM dynRef false zstWideBytes
+    let tbZst := mkTB dynRef false zstWideBytes
+    let derefExpr : Gen.PlaceExpr := .Deref (.Load (.Local ⟨⟨1⟩⟩)) (.TraitObject ep1VtTrait0)
+    let nullUb := "Value::Ptr: null safe pointer"
+    let alignUb := "Value::Ptr: unaligned safe pointer"
+    let uninhUb := "Value::Ptr: safe pointer to uninhabited type"
+    let nonDerefUb := "Value::Ptr: non-dereferenceable safe pointer"
+    -- 1a. `Mach`: ZST `checkPtr`, `Validate`, and `PlaceExpr::Deref`
+    (checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .error (.ub alignUb) ∧
+     (∃ m1, evalStatement (mkBM dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalStatement (mkBM dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalStatement (mkBM dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalPlace bmZst derefExpr =
+       .ok (({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1))) ∧
+    -- 1b. `MachTB`: ZST `checkPtrM`, `Validate` (`fn_entry = false/true`, 0 protectors), `Deref`
+    (checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) =
+       .error (.ub alignUb) ∧
+     (∃ m1, evalStatementM (mkTB dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalStatementM (mkTB dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       MachTB.wfLive m1) ∧
+     (∃ m1, evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalPlaceM tbZst derefExpr =
+       .ok (({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1) ∧ MachTB.wfLive m1)) ∧
+    -- 2. Uninhabited (`PointeeInfo.inhabited = false`) & error precedence (`Mach` & `MachTB`)
+    (checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhMut (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhBox (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x1000, none⟩, some (.VTablePointer vt8Ptr)⟩ uninhRef (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhMut (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhBox (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x1000, none⟩, some (.VTablePointer vt8TB)⟩ uninhRef (some tbZst) =
+       .error (.ub uninhUb)) ∧
+    -- 3. `PlaceExpr::Deref` on non-ZST safe `&dyn Trait0` (live ok vs dead UB)
+    ((∃ m1, evalPlace (mkBM dynRef true liveWideBytes) derefExpr =
+       .ok (({ ptr := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt8Ptr)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1)) ∧
+     evalPlace (mkBM dynRef false liveWideBytes) derefExpr = .error (.ub nonDerefUb) ∧
+     (∃ m1, evalPlaceM (mkTB dynRef true liveWideBytes) derefExpr =
+       .ok (({ ptr := ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt8TB)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1) ∧ MachTB.wfLive m1) ∧
+     evalPlaceM (mkTB dynRef false liveWideBytes) derefExpr = .error (.ub nonDerefUb)) := by
+  intro vtZst vtSize8 zstProg dynPointee uninhPointee dynRef dynMut dynBox uninhRef uninhMut
+    uninhBox vtZstPtr vt8Ptr vtZstTB vt8TB zstWideBytes liveWideBytes mkBM mkTB bmZst tbZst
+    derefExpr nullUb alignUb uninhUb nonDerefUb
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_⟩⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : (do
+        let _ ← evalStatement (mkBM dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : (do
+        let _ ← evalStatement (mkBM dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : (do
+        let _ ← evalStatement (mkBM dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : Prod.fst <$> evalPlace bmZst derefExpr =
+        .ok ({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    exact ep1_ok_of_map_fst h
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : (do
+        let _ ← evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynBox false zstWideBytes)) hm1⟩
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynBox false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : Prod.fst <$> evalPlaceM tbZst derefExpr =
+        .ok ({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1⟩ := ep1_ok_of_map_fst h
+    exact ⟨m1, hm1, evalPlaceM_tb_wfLive _ (liftMachToTB_wfLive bmZst) hm1⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : Prod.fst <$> evalPlace (mkBM dynRef true liveWideBytes) derefExpr =
+        .ok ({ ptr := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt8Ptr)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    exact ep1_ok_of_map_fst h
+  · ep1_kernel_rfl
+  · have h : Prod.fst <$> evalPlaceM (mkTB dynRef true liveWideBytes) derefExpr =
+        .ok ({ ptr := ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt8TB)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1⟩ := ep1_ok_of_map_fst h
+    exact ⟨m1, hm1, evalPlaceM_tb_wfLive _ (liftMachToTB_wfLive (mkBM dynRef true liveWideBytes)) hm1⟩
+  · ep1_kernel_rfl
+
+/-- **`BinOp::ConstructWidePointer` fail-closed boundary and `VTablePointer`
+decode + check witness**, on both `Mach` and `MachTB`:
+1. `evalBinOp[M]` and `evalValue[M]` on `BinOp::ConstructWidePointer` evaluate
+   both operands first (propagating dead-local UB from either operand) and then
+   fail closed with `unsupported`;
+2. `PointerMetaKind::decode_value[M]` + `checkValue[M]` on `dyn Trait0` wide
+   pointers accepts a valid thin vtable pointer for trait `0`, rejects wrong
+   trait (`"Value::Ptr: invalid vtable in metadata"`) and unmapped vtable
+   pointers (`"invalid pointer for vtable lookup"`), and panics with
+   `"PointerMeta::decode_value called with invalid value"` on non-pointer or
+   wide-pointer metadata inputs. -/
+theorem ep1_vtable_constructWidePointer_boundary_and_decode_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let rawDyn : Gen.PtrType := .Raw (.VTablePointer ep1VtTrait0)
+    let vtTy0 : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let cwpBM : Mach :=
+      { ep1MachBM ep1VtAllocsBM [] [(⟨⟨0⟩⟩, .Ptr (.Raw .None))] with
+        prog := ep1VtProg
+        fn_ptrs := ep1VtMachBM.fn_ptrs
+        vtable_ptrs := ep1VtMachBM.vtable_ptrs }
+    let cwpTB : MachTB := liftMachToTB cwpBM
+    let thinExpr : Gen.ValueExpr :=
+      .Constant (.PointerWithoutProvenance 0x1000) (.Ptr (.Raw .None))
+    let vtExpr : Gen.ValueExpr := .Constant (.VTablePointer ⟨⟨0⟩⟩) vtTy0
+    let deadExpr : Gen.ValueExpr := .Load (.Local ⟨⟨0⟩⟩)
+    let unsupMsg :=
+      "eval_bin_op for an operator outside BinOp::Int, BinOp::IntWithOverflow, and BinOp::Rel"
+    let decodePanic := "PointerMeta::decode_value called with invalid value"
+    let obj : Ptr := ⟨0x1000, some (⟨0⟩, ())⟩
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt1 : Ptr := ⟨0x4008, some (⟨4⟩, ())⟩
+    let objTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, some (⟨0⟩, [])⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let vt1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨4⟩, [])⟩
+    -- 1. `ConstructWidePointer` fail-closed boundary & operand UB precedence (`Mach` & `MachTB`)
+    (evalBinOp (.ConstructWidePointer dynRef)
+        (.Ptr (ThinPointer.widen obj none), .Ptr (.Raw .None))
+        (.Ptr (ThinPointer.widen vt0 none), vtTy0) = .error (.unsupported unsupMsg) ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) thinExpr vtExpr) =
+       .error (.unsupported unsupMsg) ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) deadExpr vtExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) thinExpr deadExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalBinOpM (M := TBM) (.ConstructWidePointer dynRef)
+        (.Ptr (ThinPointer.widen objTB none), .Ptr (.Raw .None))
+        (.Ptr (ThinPointer.widen vt0TB none), vtTy0) = .error (.unsupported unsupMsg) ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) thinExpr vtExpr) =
+       .error (.unsupported unsupMsg) ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) deadExpr vtExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) thinExpr deadExpr) =
+       .error (.ub "access to a dead local")) ∧
+    -- 2. `decode_value[M]` + `checkValue[M]` for `dyn Trait0` (`Mach` & `MachTB`)
+    ((do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen vt0 none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr dynRef) (some cwpBM)) = .ok () ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind rawDyn)
+          (.Ptr (ThinPointer.widen vt1 none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr rawDyn) (some cwpBM)) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen ⟨0, none⟩ none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr dynRef) (some cwpBM)) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     PointerMetaKind.decode_value (.VTablePointer ep1VtTrait0) (.Int 0) = specPanic decodePanic ∧
+     PointerMetaKind.decode_value (.VTablePointer ep1VtTrait0)
+       (.Ptr ⟨vt0, some (.VTablePointer vt0)⟩) = specPanic decodePanic ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen vt0TB none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr dynRef) (some cwpTB)) = .ok () ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind rawDyn)
+          (.Ptr (ThinPointer.widen vt1TB none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr rawDyn) (some cwpTB)) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen ⟨0, none⟩ none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr dynRef) (some cwpTB)) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     PointerMetaKind.decode_valueM (M := TBM) (.VTablePointer ep1VtTrait0) (.Int 0) =
+       specPanic decodePanic ∧
+     PointerMetaKind.decode_valueM (M := TBM) (.VTablePointer ep1VtTrait0)
+       (.Ptr ⟨vt0TB, some (.VTablePointer vt0TB)⟩) = specPanic decodePanic) := by
+  intro dynRef rawDyn vtTy0 cwpBM cwpTB thinExpr vtExpr deadExpr unsupMsg decodePanic
+    obj vt0 vt1 objTB vt0TB vt1TB
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-- **Exactness and non-vacuity of machine-congruence hypotheses**
+(`checkPtr_congr_vtables`, `checkPtrM_congr_mach`, `evalUnOp_congr_vtables`,
+`evalUnOpM_congr_mach`), on both `Mach` and `MachTB`:
+1. Changing non-`vtables` `Program` fields (`start`, `traits`, so `M'.prog ≠ M.prog`
+   while `M'.prog.vtables = M.prog.vtables`) leaves both `checkPtr[M]` and
+   `evalUnOp[M]` unchanged;
+2. Perturbing **any single** required field alone — `mem` (killing alloc `0`),
+   `vtable_ptrs` (clearing the table), `prog.vtables` (changing the vtable's
+   `trait_name`), or `fn_ptrs` (clearing function pointers, while `checkPtr[M]`
+   remains invariant!) — strictly changes the result of `checkPtr[M]` or
+   `evalUnOp[M] (.VTableMethodLookup _)`. -/
+theorem ep1_vtable_congr_mach_hypotheses_necessary_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let vtTy : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let fn1 : Ptr := ⟨0x5000, some (⟨5⟩, ())⟩
+    let wide : Gen.Pointer Prov := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt0)⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let fn1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x5000, some (⟨5⟩, [])⟩
+    let wideTB : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt0TB)⟩
+    let mProgOtherBM : Mach :=
+      { ep1VtMachBM with prog := { ep1VtMachBM.prog with start := ⟨⟨99⟩⟩, traits := ⟨[]⟩ } }
+    let mProgOtherTB : MachTB :=
+      { ep1VtMachTB with prog := { ep1VtMachTB.prog with start := ⟨⟨99⟩⟩, traits := ⟨[]⟩ } }
+    let deadAlloc0BM : Gen.Allocation Unit Unit :=
+      { data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+        kind := .Heap, live := false, extra := () }
+    let mDeadMemBM : Mach :=
+      { ep1VtMachBM with
+        mem := { ep1VtMachBM.mem with
+          memory := { ep1VtMachBM.mem.memory with
+            allocations := deadAlloc0BM :: ep1VtAllocsBM.drop 1 } } }
+    let mDeadMemTB : MachTB :=
+      { ep1VtMachTB with
+        mem := { ep1VtMachTB.mem with
+          memory := { ep1VtMachTB.mem.memory with
+            mem := { ep1VtMachTB.mem.memory.mem with
+              allocations := ep1VtAllocTB 0x1000 8 8 .Heap false :: ep1VtAllocsTB.drop 1 } } } }
+    let mNoVtPtrsBM : Mach := { ep1VtMachBM with vtable_ptrs := ⟨[]⟩ }
+    let mNoVtPtrsTB : MachTB := { ep1VtMachTB with vtable_ptrs := ⟨[]⟩ }
+    let mWrongVtsBM : Mach :=
+      { ep1VtMachBM with
+        prog := { ep1VtMachBM.prog with
+          vtables := ⟨[(⟨⟨0⟩⟩, { ep1VTable0 with trait_name := ep1VtTrait1 })]⟩ } }
+    let mWrongVtsTB : MachTB :=
+      { ep1VtMachTB with
+        prog := { ep1VtMachTB.prog with
+          vtables := ⟨[(⟨⟨0⟩⟩, { ep1VTable0 with trait_name := ep1VtTrait1 })]⟩ } }
+    let mNoFnPtrsBM : Mach := { ep1VtMachBM with fn_ptrs := ⟨[]⟩ }
+    let mNoFnPtrsTB : MachTB := { ep1VtMachTB with fn_ptrs := ⟨[]⟩ }
+    let missingFnPanic := "map index: missing key (self.fn_ptrs[fn_name])"
+    -- 1. Non-`vtables` `Program` fields are irrelevant (`Mach` & `MachTB`)
+    (mProgOtherBM.prog ≠ ep1VtMachBM.prog ∧
+     checkPtr wide dynRef (some mProgOtherBM) = checkPtr wide dynRef (some ep1VtMachBM) ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some mProgOtherBM) =
+       evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) ∧
+     mProgOtherTB.prog ≠ ep1VtMachTB.prog ∧
+     checkPtrM wideTB dynRef (some mProgOtherTB) = checkPtrM wideTB dynRef (some ep1VtMachTB) ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some mProgOtherTB) =
+       evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some ep1VtMachTB)) ∧
+    -- 2. Necessity of `hmem`, `hvt`, `hvts`, and `hfn` (`Mach`)
+    (checkPtr wide dynRef (some ep1VtMachBM) = .ok () ∧
+     checkPtr wide dynRef (some mDeadMemBM) =
+       .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+     checkPtr wide dynRef (some mNoVtPtrsBM) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     checkPtr wide dynRef (some mWrongVtsBM) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     checkPtr wide dynRef (some mNoFnPtrsBM) = .ok () ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = .ok (.Ptr (ThinPointer.widen fn1 none), .Ptr .FnPtr) ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some mNoFnPtrsBM) = specPanic missingFnPanic) ∧
+    -- 3. Necessity of `hmem`, `hvt`, `hvts`, and `hfn` (`MachTB`)
+    (checkPtrM wideTB dynRef (some ep1VtMachTB) = .ok () ∧
+     checkPtrM wideTB dynRef (some mDeadMemTB) =
+       .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+     checkPtrM wideTB dynRef (some mNoVtPtrsTB) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     checkPtrM wideTB dynRef (some mWrongVtsTB) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     checkPtrM wideTB dynRef (some mNoFnPtrsTB) = .ok () ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some ep1VtMachTB) = .ok (.Ptr (ThinPointer.widen fn1TB none), .Ptr .FnPtr) ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some mNoFnPtrsTB) = specPanic missingFnPanic) := by
+  intro dynRef vtTy vt0 fn1 wide vt0TB fn1TB wideTB mProgOtherBM mProgOtherTB deadAlloc0BM
+    mDeadMemBM mDeadMemTB mNoVtPtrsBM mNoVtPtrsTB mWrongVtsBM mWrongVtsTB mNoFnPtrsBM
+    mNoFnPtrsTB missingFnPanic
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  · intro h; have hs := congrArg Gen.Program.start h
+    simp [mProgOtherBM, ep1VtMachBM, ep1VtProg] at hs
+  · exact checkPtr_congr_vtables rfl rfl rfl wide dynRef
+  · exact evalUnOp_congr_vtables rfl rfl rfl rfl (.VTableMethodLookup ep1VtMeth0)
+      (.Ptr (ThinPointer.widen vt0 none), vtTy)
+  · intro h; have hs := congrArg Gen.Program.start h
+    simp [mProgOtherTB, ep1VtMachTB, ep1VtProg] at hs
+  · exact checkPtrM_congr_mach (M1 := mProgOtherTB) (M2 := ep1VtMachTB) rfl rfl rfl wideTB dynRef
+  · exact evalUnOpM_congr_mach (M1 := mProgOtherTB) (M2 := ep1VtMachTB) rfl rfl rfl rfl
+      (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · exact (checkPtr_congr_vtables (M1 := mNoFnPtrsBM) (M2 := ep1VtMachBM) rfl rfl rfl wide
+      dynRef).trans (by ep1_kernel_rfl)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · exact (checkPtrM_congr_mach (M1 := mNoFnPtrsTB) (M2 := ep1VtMachTB) rfl rfl rfl wideTB
+      dynRef).trans (by ep1_kernel_rfl)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+
 /-- **Ill-formed `ValueExpr::Variant` / `ValueExpr::Union` ASTs are spec panics, not UB**, on
 both `Mach` and `MachTB`:
 
@@ -17829,6 +18295,9 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_error_precedence_and_corrupt_table_witness
   ep1_vtable_unsized_struct_tail_packed_and_overflow_witness
   ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness
+  ep1_vtable_zst_uninhabited_and_deref_witness
+  ep1_vtable_constructWidePointer_boundary_and_decode_witness
+  ep1_vtable_congr_mach_hypotheses_necessary_witness
 
 #assert_standard_axioms
   vtableFromPtrM_bm_eq
@@ -17868,6 +18337,27 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   checkPtrM_traitObject_unaligned_ub
   checkPtr_traitObject_nonDereferenceable_ub
   checkPtrM_traitObject_nonDereferenceable_ub
+  checkPtr_traitObject_null_ub
+  checkPtrM_traitObject_null_ub
+  checkPtr_traitObject_uninhabited_ub
+  checkPtrM_traitObject_uninhabited_ub
+  checkPtr_traitObject_zst_ok
+  checkPtrM_traitObject_zst_tb_ok
+  retag_ptr_traitObject_zst_noProv
+  evalPlace_deref_safe_traitObject
+  evalPlaceM_deref_safe_traitObject
+  evalBinOp_constructWidePointer_unsupported
+  evalBinOpM_constructWidePointer_unsupported
+  evalValue_constructWidePointer_ok_operands_unsupported
+  evalValueM_constructWidePointer_ok_operands_unsupported
+  decode_vtablePointer_and_checkValue_dyn
+  decode_vtablePointer_and_checkValueM_dyn
+  checkPtr_congr_vtables
+  checkValue_congr_vtables
+  evalUnOp_congr_vtables
+  checkPtrM_congr_mach
+  checkValueM_congr_mach
+  evalUnOpM_congr_mach
   checkPtr_tuple_traitObject_metadata_error
   checkPtrM_tuple_traitObject_metadata_error
   checkPtr_tuple_traitObject_eq_sized
@@ -17890,6 +18380,9 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_error_precedence_and_corrupt_table_witness
   ep1_vtable_unsized_struct_tail_packed_and_overflow_witness
   ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness
+  ep1_vtable_zst_uninhabited_and_deref_witness
+  ep1_vtable_constructWidePointer_boundary_and_decode_witness
+  ep1_vtable_congr_mach_hypotheses_necessary_witness
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
