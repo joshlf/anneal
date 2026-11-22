@@ -59,6 +59,8 @@ Sections:
     subtraction range transfers, and typed signed-array transmutation.
 14. Exact signed-overflow biconditionals, unary negation, unsigned/signed saturating arithmetic,
     `bitreverse`/`cttz` alignment, `extractBits`/product byte-splitting, and `ByteSeqValid`.
+15. Sharpened `(k + 1)`-bit `cttz`/`evalCttzNonzero` tnums, signed saturating clamping, `ctpop`
+    complement identities, and core `unchecked_*`/`three_way_compare` bridges.
 -/
 
 /-! ## 0. Notation Bridges -/
@@ -6608,5 +6610,649 @@ theorem byteSeqValid_encodeElems_bitVecLE_int (layouts : LayoutTable) (w : IntTy
   exact ⟨hbv, ⟨MirValueCodec.intByteSize w * xs.length, hsz_ty, hlen, hinit⟩,
     byteSeqValid_bitValid_implies_asInitialized layouts _ _ hbv,
     byteSeqValid_bitValid_implies_uninit layouts _ _ hbv⟩
+
+/-! ## 15. Sharpened `cttz` / `evalCttzNonzero` Tnum, Signed Saturating Clamping, `ctpop`, and Core Unchecked/Three-Way Intrinsics -/
+
+/-- `evalBswap` is an involution up to `wrapScalarBits` normalization on arbitrary (possibly
+non-canonical) bits, matching `evalBitreverse_evalBitreverse`. -/
+theorem evalBswap_evalBswap_general {sz : Nat} (hsz : 0 < sz) (bits : Nat) :
+    (evalBswap ⟨bits, sz⟩).bind evalBswap =
+      some ⟨wrapScalarBits bits (scalarModulus sz), sz⟩ := by
+  rw [evalBswap_eq_bswapBytes hsz, Option.bind_some, evalBswap_eq_bswapBytes hsz,
+    ofNat_toNat_self, Anneal.BitVecArith.bswapBytes_bswapBytes, wrapScalarBits_eq_toNat]
+
+/-- Recursive characterization of `b % 2 ^ (k + 1) = 0` in terms of `b % 2` and `b / 2`. -/
+theorem mod_two_pow_succ_eq_zero_iff (k b : Nat) :
+    b % 2 ^ (k + 1) = 0 ↔ b % 2 = 0 ∧ (b / 2) % 2 ^ k = 0 := by
+  have hpow : 2 ^ (k + 1) = 2 * 2 ^ k := by rw [Nat.pow_succ, Nat.mul_comm]
+  rw [hpow]
+  constructor
+  · intro h
+    have h2 : b % 2 = 0 := by
+      have hdvd : 2 ∣ 2 * 2 ^ k := ⟨2 ^ k, rfl⟩
+      rw [← Nat.mod_mod_of_dvd b hdvd, h]
+    have hdiv : (b / 2) % 2 ^ k = 0 := by
+      rw [← Nat.mod_mul_left_div_self, Nat.mul_comm _ 2, h]
+    exact ⟨h2, hdiv⟩
+  · rintro ⟨h2, hdiv⟩
+    have h1 := (Nat.div_add_mod b 2).symm
+    have h3 := (Nat.div_add_mod (b / 2) (2 ^ k)).symm
+    rw [h2, Nat.add_zero] at h1
+    rw [hdiv, Nat.add_zero] at h3
+    rw [h1, h3, ← Nat.mul_assoc, Nat.mul_mod_right]
+
+/-- `cttzLoop w v` never exceeds `w` (for every `w`, including `w = 0`). -/
+theorem cttzLoop_le :
+    ∀ (w v : Nat), Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop w v ≤ w
+  | 0, _ => Nat.le_refl 0
+  | k + 1, v => by
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop
+    rw [natMod_eq, natDiv_eq]
+    cases Nat.beq (v % 2) 0 with
+    | false => exact Nat.zero_le _
+    | true =>
+      dsimp only
+      rw [natAdd_eq]
+      have ih := cttzLoop_le k (v / 2)
+      omega
+
+/-- Whenever `cttzLoop w v < w`, bit `cttzLoop w v` of `v` is set (`true`). -/
+theorem testBit_cttzLoop_of_lt :
+    ∀ (w v : Nat), Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop w v < w →
+      v.testBit (Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop w v) = true
+  | 0, _, h => by cases h
+  | k + 1, v, h => by
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop at h ⊢
+    rw [natMod_eq, natDiv_eq] at h ⊢
+    cases Nat.mod_two_eq_zero_or_one v with
+    | inr h1 =>
+      rw [h1]
+      dsimp only
+      rw [Nat.testBit_zero, h1]
+      rfl
+    | inl h0 =>
+      rw [h0] at h ⊢
+      dsimp only at h ⊢
+      rw [natAdd_eq] at h ⊢
+      have hcomm : 1 + Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop k (v / 2) =
+          Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop k (v / 2) + 1 := Nat.add_comm _ _
+      rw [hcomm, Nat.testBit_add_one]
+      exact testBit_cttzLoop_of_lt k (v / 2) (by omega)
+
+/-- `cttzLoop w v` equals the full width `w` iff the low `w` bits of `v` are all zero. -/
+theorem cttzLoop_eq_width_iff :
+    ∀ (w v : Nat), Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop w v = w ↔ v % 2 ^ w = 0
+  | 0, v => by simp [Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop, Nat.mod_one]
+  | k + 1, v => by
+    unfold Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop
+    rw [natMod_eq, natDiv_eq, mod_two_pow_succ_eq_zero_iff, ← cttzLoop_eq_width_iff k (v / 2)]
+    cases Nat.mod_two_eq_zero_or_one v with
+    | inl h0 =>
+      rw [h0]
+      dsimp only
+      rw [natAdd_eq]
+      omega
+    | inr h1 =>
+      rw [h1]
+      dsimp only
+      omega
+
+/-- On a non-zero `8 * sz`-bit operand, `evalCttzNonzero` succeeds and returns `cttzLoop`, which is
+strictly below `8 * sz` (holds for arbitrary, possibly non-canonical `bits`). -/
+theorem evalCttzNonzero_eq_cttzLoop {sz retBytes : Nat} (hsz : 0 < sz) (hret : 0 < retBytes)
+    {bits : Nat} (hne : BitVec.ofNat (8 * sz) bits ≠ BitVec.ofNat (8 * sz) 0) :
+    evalCttzNonzero ⟨bits, sz⟩ retBytes =
+        some ⟨Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop (8 * sz)
+          (BitVec.ofNat (8 * sz) bits).toNat, retBytes⟩ ∧
+      Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop (8 * sz)
+        (BitVec.ofNat (8 * sz) bits).toNat < 8 * sz := by
+  have hnz : Nat.beq (BitVec.ofNat (8 * sz) bits).toNat 0 = false :=
+    nat_beq_eq_false_of_ne (fun hz =>
+      hne (Anneal.BitVec.eq_of_toNat_eq (hz.trans (Anneal.BitVec.toNat_zero _).symm)))
+  have hlt : Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop (8 * sz)
+      (BitVec.ofNat (8 * sz) bits).toNat < 8 * sz := by
+    apply Nat.lt_of_le_of_ne (cttzLoop_le _ _)
+    intro heq
+    have hmod := (cttzLoop_eq_width_iff (8 * sz) (BitVec.ofNat (8 * sz) bits).toNat).1 heq
+    rw [Nat.mod_eq_of_lt (BitVec.ofNat (8 * sz) bits).isLt] at hmod
+    exact hne (Anneal.BitVec.eq_of_toNat_eq (hmod.trans (Anneal.BitVec.toNat_zero _).symm))
+  refine ⟨?_, hlt⟩
+  unfold evalCttzNonzero
+  simp only [beq_zero_of_pos hsz, beq_zero_of_pos hret, Bool.or_false, wrapScalarBits_eq_toNat,
+    hnz, natMul_eight]
+
+/-- Sharpened `(k + 1)`-bit `ScalarTnum` from `evalCttz`: whenever `evalCttz x retBytes = some ⟨k, _⟩`
+with `k < 8 * sz`, not only are bits `0 .. k - 1` zero, bit `k` itself is `1`, pinning all low
+`k + 1` bits to `2 ^ k` (`MaskEq (not (lowMask (8 * sz) (k + 1))) x (2 ^ k)`). -/
+theorem scalarTnum_exact_lowMask_of_evalCttz {sz retBytes k : Nat} (hsz : 0 < sz)
+    (hret : 0 < retBytes) {x : ScalarInt} (hszx : x.sizeBytes = sz)
+    (hcan : x.bits < scalarModulus sz) (hcttz : evalCttz x retBytes = some ⟨k, retBytes⟩)
+    (hlt : k < 8 * sz) :
+    ScalarTnum sz (Anneal.BitVec.not (Anneal.BitVec.lowMask (8 * sz) (k + 1)))
+        (BitVec.ofNat (8 * sz) (2 ^ k)) x ∧
+      x.bits % 2 ^ k = 0 ∧ x.bits ≠ 0 := by
+  have ⟨_, hmod⟩ := scalarTnum_lowMask_of_evalCttz hsz hret hszx hcan hcttz
+  obtain ⟨xb, xs⟩ := x
+  dsimp only at hszx hcan hcttz hmod ⊢
+  subst xs
+  unfold evalCttz at hcttz
+  simp only [beq_zero_of_pos hsz, beq_zero_of_pos hret, Bool.or_false, natMul_eight,
+    wrapScalarBits_of_lt hcan] at hcttz
+  have hk : Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop (8 * sz) xb = k :=
+    (ScalarInt.mk.inj (Option.some.inj hcttz)).1
+  have hbitk : xb.testBit k = true := by
+    rw [← hk]
+    exact testBit_cttzLoop_of_lt (8 * sz) xb (hk ▸ hlt)
+  have hlow : ∀ j, j < k → xb.testBit j = false := fun j hj =>
+    testBit_false_of_lt_cttzLoop (8 * sz) xb j (hk.symm ▸ hj)
+  have hpow_lt : 2 ^ k < 2 ^ (8 * sz) := Nat.pow_lt_pow_right (by decide) hlt
+  have hnz : xb ≠ 0 := by
+    intro hz
+    subst hz
+    rw [Nat.zero_testBit] at hbitk
+    cases hbitk
+  refine ⟨⟨rfl, hcan, Anneal.BitVec.maskEq_iff_getLsbD.2 (fun i hi hm => ?_)⟩, hmod, hnz⟩
+  rw [Anneal.BitVec.getLsbD_not_of_lt _ hi, Anneal.BitVec.getLsbD_lowMask hi] at hm
+  have hik : i < k + 1 := by
+    cases hdec : decide (i < k + 1) with
+    | true => exact of_decide_eq_true hdec
+    | false => rw [hdec] at hm; cases hm
+  show (BitVec.ofNat (8 * sz) xb).toNat.testBit i =
+    (BitVec.ofNat (8 * sz) (2 ^ k)).toNat.testBit i
+  rw [toNat_ofNat_of_lt hcan, _root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hpow_lt,
+    Nat.testBit_two_pow]
+  cases Nat.lt_or_ge i k with
+  | inl hik' =>
+    have hne : k ≠ i := Nat.ne_of_gt hik'
+    simp [hne, hlow i hik']
+  | inr hge =>
+    have heq : i = k := by omega
+    subst heq
+    simp [hbitk]
+
+/-- `evalCttzNonzero` automatically guarantees `k < 8 * sz` and therefore always yields the sharp
+`(k + 1)`-bit `ScalarTnum` (`bits 0 .. k - 1 = 0` and `bit k = 1`), `2^k`-alignment, and `x.bits ≠ 0`. -/
+theorem scalarTnum_of_evalCttzNonzero {sz retBytes k : Nat} (hsz : 0 < sz) (hret : 0 < retBytes)
+    {x : ScalarInt} (hszx : x.sizeBytes = sz) (hcan : x.bits < scalarModulus sz)
+    (hcttz : evalCttzNonzero x retBytes = some ⟨k, retBytes⟩) :
+    k < 8 * sz ∧
+      ScalarTnum sz (Anneal.BitVec.not (Anneal.BitVec.lowMask (8 * sz) (k + 1)))
+        (BitVec.ofNat (8 * sz) (2 ^ k)) x ∧
+      x.bits % 2 ^ k = 0 ∧ x.bits ≠ 0 := by
+  obtain ⟨xb, xs⟩ := x
+  dsimp only at hszx hcan hcttz ⊢
+  subst xs
+  have hne : BitVec.ofNat (8 * sz) xb ≠ BitVec.ofNat (8 * sz) 0 := by
+    intro hz
+    rw [(evalCttzNonzero_eq_none_iff hsz hret xb).2 hz] at hcttz
+    cases hcttz
+  have ⟨hev, hlt_loop⟩ := evalCttzNonzero_eq_cttzLoop hsz hret hne
+  rw [hev] at hcttz
+  have hk : Trusted.Rustc.V2026_06_01.MirSemantics.cttzLoop (8 * sz)
+      (BitVec.ofNat (8 * sz) xb).toNat = k :=
+    (ScalarInt.mk.inj (Option.some.inj hcttz)).1
+  have hlt : k < 8 * sz := hk ▸ hlt_loop
+  rw [toNat_ofNat_of_lt hcan] at hk
+  have hev_cttz : evalCttz ⟨xb, sz⟩ retBytes = some ⟨k, retBytes⟩ := by
+    unfold evalCttz
+    simp only [beq_zero_of_pos hsz, beq_zero_of_pos hret, Bool.or_false, natMul_eight,
+      wrapScalarBits_of_lt hcan, hk]
+  exact ⟨hlt, scalarTnum_exact_lowMask_of_evalCttz hsz hret rfl hcan hev_cttz hlt⟩
+
+/-- `evalSaturatingAdd` fails iff the left operand is zero-width or the operand byte widths differ. -/
+theorem evalSaturatingAdd_eq_none_iff (lhs rhs : ScalarInt) (isSigned : Bool) :
+    evalSaturatingAdd lhs rhs isSigned = none ↔
+      lhs.sizeBytes = 0 ∨ lhs.sizeBytes ≠ rhs.sizeBytes := by
+  unfold evalSaturatingAdd
+  cases h0 : Nat.beq lhs.sizeBytes 0 with
+  | true =>
+    rw [Bool.true_or]
+    exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
+  | false =>
+    have hnz : lhs.sizeBytes ≠ 0 := fun h => by rw [h] at h0; nomatch h0
+    cases heq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+    | false =>
+      have hne : lhs.sizeBytes ≠ rhs.sizeBytes := fun h => by
+        rw [h, Nat.beq_refl] at heq; nomatch heq
+      rw [Bool.false_or, Bool.not_false]
+      exact ⟨fun _ => Or.inr hne, fun _ => rfl⟩
+    | true =>
+      have hsz_eq : lhs.sizeBytes = rhs.sizeBytes := Nat.eq_of_beq_eq_true heq
+      rw [Bool.false_or, Bool.not_true]
+      dsimp only
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · cases isSigned with
+        | false =>
+          cases hb : Nat.ble (scalarModulus lhs.sizeBytes)
+            (Nat.add (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+              (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes))) <;>
+            rw [hb] at h <;> cases h
+        | true =>
+          cases ho : signedOverflowAdd (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+            (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) lhs.sizeBytes with
+          | false => rw [ho] at h; cases h
+          | true =>
+            rw [ho] at h
+            cases hn : isSignedNegative (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+              lhs.sizeBytes <;> rw [hn] at h <;> cases h
+      · rcases h with hz | hne
+        · exact absurd hz hnz
+        · exact absurd hsz_eq hne
+
+/-- `evalSaturatingSub` fails iff the left operand is zero-width or the operand byte widths differ. -/
+theorem evalSaturatingSub_eq_none_iff (lhs rhs : ScalarInt) (isSigned : Bool) :
+    evalSaturatingSub lhs rhs isSigned = none ↔
+      lhs.sizeBytes = 0 ∨ lhs.sizeBytes ≠ rhs.sizeBytes := by
+  unfold evalSaturatingSub
+  cases h0 : Nat.beq lhs.sizeBytes 0 with
+  | true =>
+    rw [Bool.true_or]
+    exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
+  | false =>
+    have hnz : lhs.sizeBytes ≠ 0 := fun h => by rw [h] at h0; nomatch h0
+    cases heq : Nat.beq lhs.sizeBytes rhs.sizeBytes with
+    | false =>
+      have hne : lhs.sizeBytes ≠ rhs.sizeBytes := fun h => by
+        rw [h, Nat.beq_refl] at heq; nomatch heq
+      rw [Bool.false_or, Bool.not_false]
+      exact ⟨fun _ => Or.inr hne, fun _ => rfl⟩
+    | true =>
+      have hsz_eq : lhs.sizeBytes = rhs.sizeBytes := Nat.eq_of_beq_eq_true heq
+      rw [Bool.false_or, Bool.not_true]
+      dsimp only
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · cases isSigned with
+        | false =>
+          cases hb : Nat.ble (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes))
+            (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes)) <;>
+            rw [hb] at h <;> cases h
+        | true =>
+          cases ho : signedOverflowSub (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+            (wrapScalarBits rhs.bits (scalarModulus lhs.sizeBytes)) lhs.sizeBytes with
+          | false => rw [ho] at h; cases h
+          | true =>
+            rw [ho] at h
+            cases hn : isSignedNegative (wrapScalarBits lhs.bits (scalarModulus lhs.sizeBytes))
+              lhs.sizeBytes <;> rw [hn] at h <;> cases h
+      · rcases h with hz | hne
+        · exact absurd hz hnz
+        · exact absurd hsz_eq hne
+
+/-- Signed `evalSaturatingAdd` under guaranteed signed underflow
+(`signedKey a_hi + signedKey b_hi < 2^(8*sz - 1)`): clamps to `T::MIN = signBit` (`2^(8*sz - 1)`). -/
+theorem scalarSRange_evalSaturatingAdd_underflow_clamps {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarSRange sz a_lo a_hi x) (hy : ScalarSRange sz b_lo b_hi y)
+    (hudf : Anneal.BitVecArith.signedKey a_hi + Anneal.BitVecArith.signedKey b_hi <
+      2 ^ (8 * sz - 1)) :
+    evalSaturatingAdd x y true =
+      some ⟨(Anneal.BitVecArith.signBit (w := 8 * sz)).toNat, sz⟩ := by
+  obtain ⟨xb, rfl, hxb, _, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, hyb, _, hy₂⟩ := scalarSRange_exists hy
+  have hw : 0 < 8 * sz := by omega
+  have hsum_lt : Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) xb) +
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) yb) < 2 ^ (8 * sz - 1) :=
+    Nat.lt_of_le_of_lt (Nat.add_le_add hx₂ hy₂) hudf
+  have hovf : signedOverflowAdd xb yb sz = true := by
+    cases ho : signedOverflowAdd xb yb sz with
+    | true => rfl
+    | false =>
+      have hb := (signedOverflowAdd_eq_false_iff_signedKey_bounds hsz xb yb).1 ho
+      omega
+  have hneg : isSignedNegative xb sz = true := by
+    rw [Anneal.Scalars.isSignedNegative_eq_msb, ← msb_eq_core]
+    cases hm : Anneal.BitVecArith.msb (BitVec.ofNat (8 * sz) xb) with
+    | true => rfl
+    | false =>
+      have hge := Anneal.BitVecArith.half_le_signedKey_of_msb_false hw hm
+      rw [natPow_eq] at hge
+      omega
+  unfold evalSaturatingAdd
+  simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+    wrapScalarBits_of_lt hxb, wrapScalarBits_of_lt hyb, hovf, hneg]
+  rw [Anneal.Scalars.signedHalfModulus_eq_two_pow hsz,
+    Anneal.BitVecArith.toNat_signBit_of_pos hw, natPow_eq]
+
+/-- Signed `evalSaturatingAdd` under guaranteed signed overflow
+(`2^(8*sz - 1) + 2^(8*sz) ≤ signedKey a_lo + signedKey b_lo`): clamps to `T::MAX = 2^(8*sz - 1) - 1`. -/
+theorem scalarSRange_evalSaturatingAdd_overflow_clamps {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarSRange sz a_lo a_hi x) (hy : ScalarSRange sz b_lo b_hi y)
+    (hovf_in : 2 ^ (8 * sz - 1) + 2 ^ (8 * sz) ≤
+      Anneal.BitVecArith.signedKey a_lo + Anneal.BitVecArith.signedKey b_lo) :
+    evalSaturatingAdd x y true = some ⟨2 ^ (8 * sz - 1) - 1, sz⟩ := by
+  obtain ⟨xb, rfl, hxb, hx₁, _⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, _⟩ := scalarSRange_exists hy
+  have hw : 0 < 8 * sz := by omega
+  have hsum_ge : 2 ^ (8 * sz - 1) + 2 ^ (8 * sz) ≤
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) xb) +
+        Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) yb) :=
+    Nat.le_trans hovf_in (Nat.add_le_add hx₁ hy₁)
+  have hovf : signedOverflowAdd xb yb sz = true := by
+    cases ho : signedOverflowAdd xb yb sz with
+    | true => rfl
+    | false =>
+      have hb := (signedOverflowAdd_eq_false_iff_signedKey_bounds hsz xb yb).1 ho
+      omega
+  have hneg : isSignedNegative xb sz = false := by
+    rw [Anneal.Scalars.isSignedNegative_eq_msb, ← msb_eq_core]
+    cases hm : Anneal.BitVecArith.msb (BitVec.ofNat (8 * sz) xb) with
+    | false => rfl
+    | true =>
+      have hlt_x := Anneal.BitVecArith.signedKey_lt_half_of_msb_true hw hm
+      have hlt_y := Anneal.BitVecArith.signedKey_lt (BitVec.ofNat (8 * sz) yb)
+      rw [natPow_eq] at hlt_x hlt_y
+      omega
+  unfold evalSaturatingAdd
+  simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+    wrapScalarBits_of_lt hxb, wrapScalarBits_of_lt hyb, hovf, hneg]
+  rw [Anneal.Scalars.signedHalfModulus_eq_two_pow hsz, natSub_eq]
+
+/-- Signed `evalSaturatingSub` under guaranteed signed underflow
+(`signedKey a_hi + 2^(8*sz - 1) < signedKey b_lo`): clamps to `T::MIN = signBit` (`2^(8*sz - 1)`). -/
+theorem scalarSRange_evalSaturatingSub_underflow_clamps {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarSRange sz a_lo a_hi x) (hy : ScalarSRange sz b_lo b_hi y)
+    (hudf : Anneal.BitVecArith.signedKey a_hi + 2 ^ (8 * sz - 1) <
+      Anneal.BitVecArith.signedKey b_lo) :
+    evalSaturatingSub x y true =
+      some ⟨(Anneal.BitVecArith.signBit (w := 8 * sz)).toNat, sz⟩ := by
+  obtain ⟨xb, rfl, hxb, _, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, _⟩ := scalarSRange_exists hy
+  have hw : 0 < 8 * sz := by omega
+  have hpow : 2 ^ (8 * sz) = 2 * 2 ^ (8 * sz - 1) := by
+    have hw' : 8 * sz = (8 * sz - 1) + 1 := by omega
+    conv => lhs; rw [hw']
+    rw [Nat.pow_succ, Nat.mul_comm]
+  have hx₂' : Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) xb) ≤
+      Anneal.BitVecArith.signedKey a_hi := hx₂
+  have hy₁' : Anneal.BitVecArith.signedKey b_lo ≤
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) yb) := hy₁
+  have hovf : signedOverflowSub xb yb sz = true := by
+    cases ho : signedOverflowSub xb yb sz with
+    | true => rfl
+    | false =>
+      have hb := (signedOverflowSub_eq_false_iff_signedKey_bounds hsz xb yb).1 ho
+      omega
+  have hneg : isSignedNegative xb sz = true := by
+    rw [Anneal.Scalars.isSignedNegative_eq_msb, ← msb_eq_core]
+    cases hm : Anneal.BitVecArith.msb (BitVec.ofNat (8 * sz) xb) with
+    | true => rfl
+    | false =>
+      have hge := Anneal.BitVecArith.half_le_signedKey_of_msb_false hw hm
+      have hlt_y := Anneal.BitVecArith.signedKey_lt (BitVec.ofNat (8 * sz) yb)
+      rw [natPow_eq] at hge hlt_y
+      omega
+  unfold evalSaturatingSub
+  simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+    wrapScalarBits_of_lt hxb, wrapScalarBits_of_lt hyb, hovf, hneg]
+  rw [Anneal.Scalars.signedHalfModulus_eq_two_pow hsz,
+    Anneal.BitVecArith.toNat_signBit_of_pos hw, natPow_eq]
+
+/-- Signed `evalSaturatingSub` under guaranteed signed overflow
+(`signedKey b_hi + 2^(8*sz - 1) ≤ signedKey a_lo`): clamps to `T::MAX = 2^(8*sz - 1) - 1`. -/
+theorem scalarSRange_evalSaturatingSub_overflow_clamps {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt}
+    (hx : ScalarSRange sz a_lo a_hi x) (hy : ScalarSRange sz b_lo b_hi y)
+    (hovf_in : Anneal.BitVecArith.signedKey b_hi + 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey a_lo) :
+    evalSaturatingSub x y true = some ⟨2 ^ (8 * sz - 1) - 1, sz⟩ := by
+  obtain ⟨xb, rfl, hxb, hx₁, _⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, hyb, _, hy₂⟩ := scalarSRange_exists hy
+  have hw : 0 < 8 * sz := by omega
+  have hx₁' : Anneal.BitVecArith.signedKey a_lo ≤
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) xb) := hx₁
+  have hy₂' : Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) yb) ≤
+      Anneal.BitVecArith.signedKey b_hi := hy₂
+  have hovf : signedOverflowSub xb yb sz = true := by
+    cases ho : signedOverflowSub xb yb sz with
+    | true => rfl
+    | false =>
+      have hb := (signedOverflowSub_eq_false_iff_signedKey_bounds hsz xb yb).1 ho
+      omega
+  have hneg : isSignedNegative xb sz = false := by
+    rw [Anneal.Scalars.isSignedNegative_eq_msb, ← msb_eq_core]
+    cases hm : Anneal.BitVecArith.msb (BitVec.ofNat (8 * sz) xb) with
+    | false => rfl
+    | true =>
+      have hlt_x := Anneal.BitVecArith.signedKey_lt_half_of_msb_true hw hm
+      rw [natPow_eq] at hlt_x
+      omega
+  unfold evalSaturatingSub
+  simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+    wrapScalarBits_of_lt hxb, wrapScalarBits_of_lt hyb, hovf, hneg]
+  rw [Anneal.Scalars.signedHalfModulus_eq_two_pow hsz, natSub_eq]
+
+/-- `ctpopLoop w b` never exceeds `w` (for every `w`, including `w = 0`). -/
+theorem ctpopLoop_le :
+    ∀ (w b : Nat), Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w b ≤ w
+  | 0, _ => Nat.le_refl 0
+  | k + 1, b => by
+    have hstep : Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop (k + 1) b =
+        b % 2 + Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop k (b / 2) := rfl
+    have hmod : b % 2 < 2 := Nat.mod_lt b (by decide)
+    have ih := ctpopLoop_le k (b / 2)
+    rw [hstep]
+    omega
+
+/-- `ctpopLoop w b` is zero iff the low `w` bits of `b` are all zero. -/
+theorem ctpopLoop_eq_zero_iff :
+    ∀ (w b : Nat), Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w b = 0 ↔ b % 2 ^ w = 0
+  | 0, b => by simp [Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop, Nat.mod_one]
+  | k + 1, b => by
+    have hstep : Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop (k + 1) b =
+        b % 2 + Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop k (b / 2) := rfl
+    rw [hstep, mod_two_pow_succ_eq_zero_iff, ← ctpopLoop_eq_zero_iff k (b / 2)]
+    omega
+
+/-- Complement population-count helper on natural numbers below `2 ^ w`. -/
+theorem ctpopLoop_sub_one :
+    ∀ (w b : Nat), b < 2 ^ w →
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w (2 ^ w - 1 - b) +
+        Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w b = w
+  | 0, b, _ => rfl
+  | k + 1, b, hb => by
+    have hpow : 2 ^ (k + 1) = 2 * 2 ^ k := by rw [Nat.pow_succ, Nat.mul_comm]
+    have hstep1 : Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop (k + 1)
+          (2 ^ (k + 1) - 1 - b) =
+        (2 ^ (k + 1) - 1 - b) % 2 +
+          Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop k ((2 ^ (k + 1) - 1 - b) / 2) := rfl
+    have hstep2 : Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop (k + 1) b =
+        b % 2 + Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop k (b / 2) := rfl
+    have hdiv : (2 ^ (k + 1) - 1 - b) / 2 = 2 ^ k - 1 - b / 2 := by omega
+    have hmod_sum : (2 ^ (k + 1) - 1 - b) % 2 + b % 2 = 1 := by omega
+    have ih := ctpopLoop_sub_one k (b / 2) (by omega)
+    rw [hstep1, hstep2, hdiv]
+    omega
+
+/-- Complement population-count identity on `BitVec w` (including `w = 0`):
+`ctpopLoop w (~~~x) + ctpopLoop w x = w`. -/
+theorem ctpopLoop_not {w : Nat} (x : BitVec w) :
+    Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w (Anneal.BitVec.not x).toNat +
+      Trusted.Rustc.V2026_06_01.MirSemantics.ctpopLoop w x.toNat = w := by
+  rw [Anneal.BitVecArith.toNat_not_eq_sub, natPow_eq]
+  exact ctpopLoop_sub_one w x.toNat x.isLt
+
+/-- `evalCtpop` fails iff the operand or return width is zero. -/
+theorem evalCtpop_eq_none_iff (sc : ScalarInt) (retBytes : Nat) :
+    evalCtpop sc retBytes = none ↔ sc.sizeBytes = 0 ∨ retBytes = 0 := by
+  unfold evalCtpop
+  cases h0 : Nat.beq sc.sizeBytes 0 with
+  | true => exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
+  | false =>
+    have hne : sc.sizeBytes ≠ 0 := fun h => by rw [h] at h0; nomatch h0
+    cases h1 : Nat.beq retBytes 0 with
+    | true => exact ⟨fun _ => Or.inr (Nat.eq_of_beq_eq_true h1), fun _ => rfl⟩
+    | false =>
+      have hne' : retBytes ≠ 0 := fun h => by rw [h] at h1; nomatch h1
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · cases h
+      · rcases h with h | h
+        · exact absurd h hne
+        · exact absurd h hne'
+
+/-- On positive operand and return widths, `evalCtpop` succeeds with population count `≤ 8 * sz`. -/
+theorem evalCtpop_bits_le {sz retBytes : Nat} (hsz : 0 < sz) (hret : 0 < retBytes) (bits : Nat) :
+    ∃ r, evalCtpop ⟨bits, sz⟩ retBytes = some r ∧ r.bits ≤ 8 * sz ∧ r.sizeBytes = retBytes := by
+  unfold evalCtpop
+  simp only [beq_zero_of_pos hsz, beq_zero_of_pos hret, Bool.or_false, natMul_eight]
+  exact ⟨_, rfl, ctpopLoop_le (8 * sz) _, rfl⟩
+
+/-- On canonical scalars (including `sz = 0`), the core `unchecked_add` intrinsic `evalUncheckedAdd`
+agrees identically with `Anneal.Scalars.evalBinOp .addUnchecked`. -/
+theorem evalUncheckedAdd_eq_evalBinOp {sz : Nat} {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (isSigned : Bool) :
+    evalUncheckedAdd ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      Anneal.Scalars.evalBinOp .addUnchecked ⟨a, sz⟩ ⟨b, sz⟩ isSigned := by
+  cases Nat.eq_zero_or_pos sz with
+  | inl hz => subst hz; rfl
+  | inr hsz =>
+    cases isSigned with
+    | false =>
+      rw [Anneal.Scalars.evalBinOp_addUnchecked_apply_unsigned hsz]
+      unfold evalUncheckedAdd
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      simp only [scalarModulus_eq, natAdd_eq]
+      cases Nat.ble (2 ^ (8 * sz)) (a + b) <;> rfl
+    | true =>
+      rw [Anneal.Scalars.evalBinOp_addUnchecked_apply_signed hsz]
+      unfold evalUncheckedAdd
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      simp only [natAdd_eq, Anneal.Scalars.wrapScalarBits_eq_mod_modulus, scalarModulus_eq]
+      cases signedOverflowAdd a b sz <;> rfl
+
+/-- On canonical scalars (including `sz = 0`), the core `unchecked_sub` intrinsic `evalUncheckedSub`
+agrees identically with `Anneal.Scalars.evalBinOp .subUnchecked`. -/
+theorem evalUncheckedSub_eq_evalBinOp {sz : Nat} {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (isSigned : Bool) :
+    evalUncheckedSub ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      Anneal.Scalars.evalBinOp .subUnchecked ⟨a, sz⟩ ⟨b, sz⟩ isSigned := by
+  cases Nat.eq_zero_or_pos sz with
+  | inl hz => subst hz; rfl
+  | inr hsz =>
+    cases isSigned with
+    | false =>
+      rw [Anneal.Scalars.evalBinOp_subUnchecked_apply_unsigned hsz]
+      unfold evalUncheckedSub
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      simp only [scalarModulus_eq, natSub_eq]
+      cases hble : Nat.ble b a with
+      | false =>
+        have hnle : ¬ b ≤ a := fun h => by rw [Nat.ble_eq_true_of_le h] at hble; cases hble
+        simp [hnle]
+      | true =>
+        have hle : b ≤ a := Nat.le_of_ble_eq_true hble
+        simp only [hle, ↓reduceDIte]
+        cases Nat.ble (2 ^ (8 * sz)) (a - b) <;> rfl
+    | true =>
+      rw [Anneal.Scalars.evalBinOp_subUnchecked_apply_signed hsz]
+      unfold evalUncheckedSub
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      cases signedOverflowSub a b sz with
+      | true => rfl
+      | false =>
+        dsimp only
+        have ha' : a < 2 ^ (8 * sz) := by rwa [← scalarModulus_eq]
+        have hb' : b < 2 ^ (8 * sz) := by rwa [← scalarModulus_eq]
+        rw [Nat.mod_eq_of_lt ha', Nat.mod_eq_of_lt hb']
+        cases hble : Nat.ble b a with
+        | false =>
+          simp only [Anneal.Scalars.wrapScalarBits_eq_mod_modulus, scalarModulus_eq,
+            natAdd_eq, natSub_eq]
+        | true =>
+          have hle : b ≤ a := Nat.le_of_ble_eq_true hble
+          simp only [Anneal.Scalars.wrapScalarBits_eq_mod_modulus, scalarModulus_eq, natSub_eq]
+          have heq : 2 ^ (8 * sz) + a - b = (a - b) + 2 ^ (8 * sz) := by omega
+          rw [heq, Nat.add_mod_right]
+
+/-- On canonical scalars (including `sz = 0`), the core `unchecked_mul` intrinsic `evalUncheckedMul`
+agrees identically with `Anneal.Scalars.evalBinOp .mulUnchecked`. -/
+theorem evalUncheckedMul_eq_evalBinOp {sz : Nat} {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (isSigned : Bool) :
+    evalUncheckedMul ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      Anneal.Scalars.evalBinOp .mulUnchecked ⟨a, sz⟩ ⟨b, sz⟩ isSigned := by
+  cases Nat.eq_zero_or_pos sz with
+  | inl hz => subst hz; rfl
+  | inr hsz =>
+    cases isSigned with
+    | false =>
+      rw [Anneal.Scalars.evalBinOp_mulUnchecked_apply_unsigned hsz]
+      unfold evalUncheckedMul
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      simp only [scalarModulus_eq, natMul_eq]
+      cases Nat.ble (2 ^ (8 * sz)) (a * b) <;> rfl
+    | true =>
+      rw [Anneal.Scalars.evalBinOp_mulUnchecked_apply_signed hsz]
+      unfold evalUncheckedMul
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      simp only [natMul_eq, Anneal.Scalars.wrapScalarBits_eq_mod_modulus, scalarModulus_eq]
+      cases signedOverflowMul a b sz <;> rfl
+
+/-- `evalUncheckedShl` triggers undefined behavior (`none`) whenever `rhsIsSigned = true` and the
+shift operand has its sign bit set (`msb = true`, i.e., a negative shift amount). -/
+theorem evalUncheckedShl_eq_none_of_msb_true (lhs rhs : ScalarInt)
+    (hneg : Anneal.BitVecArith.msb (BitVec.ofNat (8 * rhs.sizeBytes) rhs.bits) = true) :
+    evalUncheckedShl lhs rhs true = none := by
+  unfold evalUncheckedShl
+  cases h0 : Bool.or (Nat.beq lhs.sizeBytes 0) (Nat.beq rhs.sizeBytes 0) with
+  | true => rfl
+  | false =>
+    dsimp only
+    rw [Anneal.Scalars.isSignedNegative_wrapScalarBits, Anneal.Scalars.isSignedNegative_eq_msb,
+      ← msb_eq_core, hneg, Bool.true_and, Bool.true_or]
+
+/-- `evalUncheckedShr` triggers undefined behavior (`none`) whenever `rhsIsSigned = true` and the
+shift operand has its sign bit set (`msb = true`, i.e., a negative shift amount). -/
+theorem evalUncheckedShr_eq_none_of_msb_true (lhs rhs : ScalarInt) (lhsIsSigned : Bool)
+    (hneg : Anneal.BitVecArith.msb (BitVec.ofNat (8 * rhs.sizeBytes) rhs.bits) = true) :
+    evalUncheckedShr lhs rhs lhsIsSigned true = none := by
+  unfold evalUncheckedShr
+  cases h0 : Bool.or (Nat.beq lhs.sizeBytes 0) (Nat.beq rhs.sizeBytes 0) with
+  | true => rfl
+  | false =>
+    dsimp only
+    rw [Anneal.Scalars.isSignedNegative_wrapScalarBits, Anneal.Scalars.isSignedNegative_eq_msb,
+      ← msb_eq_core, hneg, Bool.true_and, Bool.true_or]
+
+/-- On canonical scalars (including `sz = 0`), `evalThreeWayCompare` agrees identically with
+`Anneal.Scalars.evalBinOp .cmp` across both signednesses (`Ordering::Less = 255`,
+`Ordering::Equal = 0`, `Ordering::Greater = 1`). -/
+theorem evalThreeWayCompare_eq_evalBinOp_cmp {sz : Nat} {a b : Nat}
+    (ha : a < scalarModulus sz) (hb : b < scalarModulus sz) (isSigned : Bool) :
+    evalThreeWayCompare ⟨a, sz⟩ ⟨b, sz⟩ isSigned =
+      Anneal.Scalars.evalBinOp .cmp ⟨a, sz⟩ ⟨b, sz⟩ isSigned := by
+  cases Nat.eq_zero_or_pos sz with
+  | inl hz => subst hz; rfl
+  | inr hsz =>
+    cases isSigned with
+    | false =>
+      rw [Anneal.Scalars.evalBinOp_cmp_unsigned hsz]
+      unfold evalThreeWayCompare
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb]
+      cases Nat.beq a b <;> cases Nat.ble a b <;> rfl
+    | true =>
+      have ha' : a < 2 ^ (8 * sz) := by rwa [← scalarModulus_eq]
+      have hb' : b < 2 ^ (8 * sz) := by rwa [← scalarModulus_eq]
+      rw [Anneal.Scalars.evalBinOp_cmp_signed hsz]
+      unfold evalThreeWayCompare
+      dsimp only
+      simp only [beq_zero_of_pos hsz, nat_beq_self, Bool.not_true, Bool.or_false,
+        wrapScalarBits_of_lt ha, wrapScalarBits_of_lt hb, Nat.mod_eq_of_lt ha',
+        Nat.mod_eq_of_lt hb', Anneal.Scalars.signedLt_eq_slt]
+      cases Nat.beq a b <;> cases (BitVec.ofNat (8 * sz) a).slt (BitVec.ofNat (8 * sz) b) <;> rfl
 
 end Anneal.BitVecScalarsBridge
