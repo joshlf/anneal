@@ -1835,6 +1835,94 @@ theorem contraReflUnderReq_not_realizable :
   (Lean.mkConst ``contraReflUnderReqPost) (some (Lean.mkConst ``survivedPre))
   (some .specViolation)
 
+/-! ### 3.14 Closed Arithmetic Constants, `Trusted.Sequence.length` & Costly Type Indices -/
+
+/-- Vacuously true: the guard is a closed falsehood. `scalarModulus 4` is an opaque atom
+    to `omega`/`simp`, so the checker must evaluate it to a numeral before proving. -/
+def closedModulusDeadGuardPost (x ret : Nat) : Prop :=
+  scalarModulus 4 ≤ 0 → ret = x
+
+theorem closedModulusDeadGuardPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) closedModulusDeadGuardPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret _ => by
+    show scalarModulus 4 ≤ 0 → ret = x
+    intro hLe
+    exact absurd hLe (by decide))
+
+/-- True of every `ret`: reduction modulo a closed positive modulus. -/
+def closedModulusRangePost (_x ret : Nat) : Prop :=
+  ret % scalarModulus 4 < scalarModulus 4
+
+theorem closedModulusRangePost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) closedModulusRangePost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    show ret % scalarModulus 4 < scalarModulus 4
+    exact Nat.mod_lt ret (by decide))
+
+/-- Genuine range constraint against the same closed modulus: must still pass. -/
+def closedModulusBoundPost (_x ret : Nat) : Prop :=
+  ret < scalarModulus 4
+
+theorem closedModulusBoundPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) closedModulusBoundPost := by
+  refine ⟨0, trivial, ⟨0, ?_⟩, ⟨scalarModulus 4, ?_⟩⟩
+  · show (0 : Nat) < scalarModulus 4
+    decide
+  · show ¬ (scalarModulus 4 < scalarModulus 4)
+    exact Nat.lt_irrefl _
+
+/-- Argument-count conjunct written with `Trusted.Sequence.length`, exactly as in an
+    external-spec `requires`: `args = []` contradicts the closed arity `1`, so no
+    output satisfies the postcondition even though it mentions `ret`. -/
+def seqLengthContraPost (args : List Value) (ret : Value) : Prop :=
+  ret = ret ∧ args = [] ∧
+    Trusted.Sequence.length args = sliceIsEmptySidecar.argCount
+
+theorem seqLengthContraPost_not_realizable :
+    ¬ ContractRealizable (fun _ : List Value => True) seqLengthContraPost := by
+  rintro ⟨_, _, _, _, rfl, hLen⟩
+  exact absurd hLen (by decide)
+
+/-- Closed type index whose evaluation needs thousands of nested unfolding steps, far
+    beyond the elaborator's recursion-depth limit. -/
+def deepIndex : Nat → Nat
+  | 0 => 1
+  | n + 1 => deepIndex n + 1
+
+theorem deepIndex_gt (n : Nat) : n < deepIndex n := by
+  induction n with
+  | zero => exact Nat.zero_lt_one
+  | succ k ih =>
+    show k + 1 < deepIndex k + 1
+    exact Nat.succ_lt_succ ih
+
+/-- `Fin (deepIndex 5000)` has 5001 inhabitants, but deciding whether it is `Fin 0` or
+    `Fin 1` means evaluating the index, which exhausts the recursion depth. -/
+def deepIndexFinPost (_x : Nat) (ret : Fin (deepIndex 5000)) : Prop :=
+  ret.val = 0
+
+theorem deepIndexFinPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) deepIndexFinPost :=
+  ⟨0, trivial,
+    ⟨⟨0, Nat.lt_of_le_of_lt (Nat.zero_le 5000) (deepIndex_gt 5000)⟩, rfl⟩,
+    ⟨⟨1, Nat.lt_of_le_of_lt (by decide : (1 : Nat) ≤ 5000) (deepIndex_gt 5000)⟩,
+      fun h => Nat.succ_ne_zero 0 h⟩⟩
+
+-- Closed constants are evaluated before proving: a dead closed guard and a range fact
+-- that holds for every output are both tautologies, while a genuine bound still passes.
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``closedModulusDeadGuardPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``closedModulusRangePost) none (some .trivialPostcondition)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``closedModulusBoundPost)
+-- `Trusted.Sequence.length` and a closed sidecar arity reduce to `List.length args = 1`,
+-- so unrealizability (`SpecViolation`) is proved instead of mere output-insensitivity.
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``seqLengthContraPost) none (some .specViolation)
+-- Inspecting a costly output-type index is contained: the check returns a verdict
+-- (the output is genuinely bound) instead of escaping with a runtime exception.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``deepIndexFinPost)
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/

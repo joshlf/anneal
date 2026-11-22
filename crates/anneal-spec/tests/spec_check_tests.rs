@@ -2430,3 +2430,213 @@ fn splitmix64_seed_zero_and_four_tuple_return_mutants() {
     );
     assert!(res_forbids_err_max.mutants_killed > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Struct plug-in macro and counterexample replay
+// ---------------------------------------------------------------------------
+
+/// Invariant-carrying range (`lo <= hi`) wired into the checker by one macro call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Span {
+    lo: u16,
+    hi: u16,
+}
+
+anneal_spec::impl_spec_check_struct!(Span { lo: u16, hi: u16 });
+
+/// Newtype wired through the tuple-struct arm of the macro.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Meters(u32);
+
+anneal_spec::impl_spec_check_struct!(Meters(u32));
+
+#[test]
+fn struct_macro_plugs_custom_types_into_sampling_and_mutation() {
+    // The generated impls mirror the tuple (or inner-type) impls exactly.
+    assert_eq!(
+        <Span as SampleInput>::BOUNDARY_COUNT,
+        <(u16, u16) as SampleInput>::BOUNDARY_COUNT
+    );
+    assert_eq!(
+        <Meters as SampleInput>::BOUNDARY_COUNT,
+        <u32 as SampleInput>::BOUNDARY_COUNT
+    );
+    assert!(!<Span as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<Meters as ReturnMutants>::IS_SUBSINGLETON);
+
+    let mut struct_rng = SplitMix64::new(7);
+    let mut tuple_rng = SplitMix64::new(7);
+    for idx in 0..96 {
+        let span = <Span as SampleInput>::sample_at(idx, &mut struct_rng);
+        let (lo, hi) = <(u16, u16) as SampleInput>::sample_at(idx, &mut tuple_rng);
+        assert_eq!(span, Span { lo, hi });
+    }
+
+    let mut struct_mutants = 0usize;
+    let mut tuple_mutants = 0usize;
+    let origin = Span { lo: 3, hi: 9 };
+    origin.visit_mutants(&mut SplitMix64::new(11), |m| {
+        assert_ne!(m, origin);
+        struct_mutants += 1;
+    });
+    (3u16, 9u16).visit_mutants(&mut SplitMix64::new(11), |_| tuple_mutants += 1);
+    assert!(struct_mutants > 0);
+    assert_eq!(struct_mutants, tuple_mutants);
+
+    // Stateless return type: a span normalizer must return the ordered endpoints.
+    let normalize = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_s: &Span| true,
+        |s| Span {
+            lo: s.lo.min(s.hi),
+            hi: s.lo.max(s.hi),
+        },
+        |s, r: &Span| r.lo == s.lo.min(s.hi) && r.hi == s.lo.max(s.hi),
+    );
+    assert!(normalize.is_pointwise_strong());
+
+    // The invariant alone (`lo <= hi`) is a weaker but still output-binding
+    // postcondition: mutants that break the invariant are legitimate wrong answers.
+    let invariant_only = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_s: &Span| true,
+        |s| Span {
+            lo: s.lo.min(s.hi),
+            hi: s.lo.max(s.hi),
+        },
+        |_s, r: &Span| r.lo <= r.hi,
+    );
+    assert!(invariant_only.mutants_killed > 0);
+
+    // Stateful `&mut Span`: the invariant is part of `pre`, so samples violating it
+    // are rejected as inadmissible inputs rather than filtered by the sampler.
+    let widen = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |old: &Span, &()| old.lo <= old.hi && old.hi < u16::MAX,
+        |span: &mut Span, &()| {
+            span.hi += 1;
+            span.hi
+        },
+        |old: &Span, &(), new: &Span, ret: &u16| {
+            new.lo == old.lo && new.lo <= new.hi && new.hi == old.hi + 1 && *ret == new.hi
+        },
+    );
+    assert!(widen.precondition_hits > 0);
+    assert!(widen.precondition_hits < widen.trials_run);
+    assert!(widen.is_pointwise_strong());
+
+    // Newtype input and output.
+    let double = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |m: &Meters| m.0 <= u32::MAX / 2,
+        |m| Meters(m.0 * 2),
+        |m, r: &Meters| r.0 == m.0 * 2,
+    );
+    assert!(double.is_pointwise_strong());
+}
+
+#[test]
+fn counterexample_trial_replays_the_exact_failing_input() {
+    use anneal_spec::spec_check::{replay_stateful_trial_input, replay_trial_input};
+
+    let cfg = SpecCheckConfig::default().with_seed(0x00C0_FFEE);
+
+    // Record every sampled input so the replay is compared against ground truth.
+    let mut seen = [(0u32, 0u32); 256];
+    let mut seen_len = 0usize;
+    let outcome = check_contract(
+        cfg,
+        |&(a, b): &(u32, u32)| {
+            if seen_len < seen.len() {
+                seen[seen_len] = (a, b);
+            }
+            seen_len += 1;
+            true
+        },
+        |&(a, b)| a.wrapping_add(b),
+        // Wrong whenever the sum overflows `u32`.
+        |&(a, b), &r: &u32| u64::from(r) == u64::from(a) + u64::from(b),
+    );
+    let failure = *outcome
+        .failure()
+        .expect("an overflowing sum violates the spec");
+    assert_eq!(failure.class, VacuityClass::SpecViolation);
+    let trial_idx = failure
+        .counterexample_trial()
+        .expect("a live violation carries its trial index");
+    assert_eq!(
+        failure.detail,
+        FailureDetail::Violation(ViolationKind::PostconditionFalse { trial_idx })
+    );
+    assert_eq!(failure.stats.trials_run, trial_idx + 1);
+    assert_eq!(seen_len, trial_idx + 1);
+
+    let (a, b): (u32, u32) = replay_trial_input(cfg, trial_idx).expect("the trial ran");
+    assert_eq!((a, b), seen[trial_idx]);
+    assert!(a.checked_add(b).is_none());
+    // Every earlier trial replays as well, and trials past the budget never ran.
+    for (idx, expected) in seen.iter().enumerate().take(trial_idx) {
+        assert_eq!(replay_trial_input::<(u32, u32)>(cfg, idx), Some(*expected));
+    }
+    assert_eq!(replay_trial_input::<(u32, u32)>(cfg, cfg.max_trials), None);
+    // A different seed samples a different stream past the boundary corpus.
+    let other = cfg.with_seed(cfg.seed ^ 1);
+    let prng_idx = <(u32, u32) as SampleInput>::BOUNDARY_COUNT + 3;
+    assert!(prng_idx < cfg.max_trials);
+    assert_ne!(
+        replay_trial_input::<(u32, u32)>(cfg, prng_idx),
+        replay_trial_input::<(u32, u32)>(other, prng_idx)
+    );
+
+    // Stateful trap: the replayed `(old_state, args)` pair is the one whose body trapped.
+    let stateful = check_stateful_contract_fallible(
+        cfg,
+        |_old: &u8, _delta: &u8| Ok(true),
+        |state: &mut u8, delta: &u8| match state.checked_add(*delta) {
+            Some(sum) => {
+                *state = sum;
+                Ok(sum)
+            }
+            None => Err(()),
+        },
+        |old: &u8, delta: &u8, new: &u8, ret: &u8| {
+            Ok(old.checked_add(*delta) == Some(*new) && ret == new)
+        },
+    );
+    let trapped = *stateful.failure().expect("an overflowing add traps");
+    let trapped_idx = trapped
+        .counterexample_trial()
+        .expect("a trap carries its trial index");
+    assert_eq!(
+        trapped.detail,
+        FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: trapped_idx,
+            trap: TrapKind::BodyPanicked,
+        })
+    );
+    let (old, delta): (u8, u8) =
+        replay_stateful_trial_input(cfg, trapped_idx).expect("the trial ran");
+    assert!(old.checked_add(delta).is_none());
+    for idx in 0..trapped_idx {
+        let (s, d): (u8, u8) = replay_stateful_trial_input(cfg, idx).expect("the trial ran");
+        assert!(s.checked_add(d).is_some());
+    }
+    assert_eq!(
+        replay_stateful_trial_input::<u8, u8>(cfg, cfg.max_trials),
+        None
+    );
+
+    // Failures that are not tied to one trial report no counterexample trial.
+    let vacuous = check_contract(cfg, |_x: &u32| true, |&x| x, |_x, _r: &u32| true);
+    assert_eq!(
+        vacuous.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert_eq!(
+        vacuous.failure().and_then(|f| f.counterexample_trial()),
+        None
+    );
+    let dead = check_contract(cfg, |_x: &u32| false, |&x| x, |&x, &r: &u32| r == x);
+    assert_eq!(dead.vacuity_class(), Some(VacuityClass::DeadPrecondition));
+    assert_eq!(dead.failure().and_then(|f| f.counterexample_trial()), None);
+}

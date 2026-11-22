@@ -1383,12 +1383,111 @@ def tryProve (goalTy : Expr) (stepCapInternal : Nat := 50000000) : MetaM Bool :=
       return true
   return false
 
+/-! ### Closed-Arithmetic Goal Normalization -/
+
+/-- Exclusive upper bound on the numerals `foldClosedArith` introduces. A closed term
+    evaluating to a larger value stays symbolic, so no oversized literal enters a goal. -/
+private def closedNatFoldBound : Nat := 2 ^ 512
+
+/-- Internal-heartbeat cap for one `foldClosedArith` pass. Evaluating the closed
+    constants of a realistic specification (`scalarModulus 8`, a sidecar's `argCount`)
+    needs a few thousand heartbeats. An expensive closed term abandons the pass, and
+    the goal is then proved as written, instead of draining the probe budget. -/
+private def closedNatFoldHeartbeats : Nat := 2000000
+
+/-- Evaluate `e` to a numeral when it is a closed `Nat`-typed term: one with no free,
+    meta, or loose bound variable, so its value depends on no input or output.
+
+    Returns `some e` unchanged when `e` already is a numeral, `some lit` when `whnf`
+    evaluates `e` to a value below `closedNatFoldBound`, and `none` otherwise. `whnf`
+    only produces definitionally equal terms, so `lit` is definitionally equal to `e`. -/
+private def evalClosedNatLit? (e : Expr) : MetaM (Option Expr) := do
+  if e.hasFVar || e.hasExprMVar || e.hasLooseBVars then
+    return none
+  if (← Meta.getNatValue? e).isSome then
+    return some e
+  let ty ← whnf (← inferType e)
+  if !ty.isConstOf ``Nat then
+    return none
+  let v ← whnf e
+  if let some n ← Meta.getNatValue? v then
+    if n < closedNatFoldBound then
+      return some (mkNatLit n)
+    return none
+  if v.isConstOf ``Nat.zero then
+    return some (mkNatLit 0)
+  return none
+
+/-- Fuel-bounded normalizer applied to a goal before it reaches the bounded prover.
+
+    * Every maximal closed `Nat`-typed subterm is replaced by the numeral it evaluates
+      to (`evalClosedNatLit?`). `omega`, `simp`, and `grind` treat a closed application
+      such as `scalarModulus 4` or `sidecar.argCount` as an opaque atom, so without
+      this step `scalarModulus 4 ≤ 0 → ret = x` (vacuously true) and
+      `ret % scalarModulus 4 < scalarModulus 4` (true of every `ret`) are accepted as
+      binding postconditions.
+    * `Trusted.Sequence.length` is replaced by `List.length`, its definition, so the
+      standard list-length lemmas apply to the argument-count conjunct
+      `Trusted.Sequence.length req.args = sidecar.argCount` of an external-spec
+      `requires`.
+
+    Both rewrites replace a subterm by a definitionally equal one of the same type, so
+    the result is definitionally equal to the input and a proof of the normalized goal
+    proves the original. Subterms nested deeper than `fuel` are left untouched. -/
+private def foldClosedArith : Nat → Expr → MetaM Expr
+  | 0, e => return e
+  | fuel + 1, e => do
+    match e with
+    | .mdata d b =>
+      return .mdata d (← foldClosedArith fuel b)
+    | .lam n t b bi =>
+      return .lam n (← foldClosedArith fuel t) (← foldClosedArith fuel b) bi
+    | .forallE n t b bi =>
+      return .forallE n (← foldClosedArith fuel t) (← foldClosedArith fuel b) bi
+    | .letE n t v b nd =>
+      return .letE n (← foldClosedArith fuel t) (← foldClosedArith fuel v)
+        (← foldClosedArith fuel b) nd
+    | .proj s i b =>
+      if let some lit ← evalClosedNatLit? e then
+        return lit
+      return .proj s i (← foldClosedArith fuel b)
+    | .const name us =>
+      if name == ``Trusted.Sequence.length then
+        return .const ``List.length us
+      if let some lit ← evalClosedNatLit? e then
+        return lit
+      return e
+    | .app .. =>
+      if let some lit ← evalClosedNatLit? e then
+        return lit
+      let fn ← foldClosedArith fuel e.getAppFn
+      let mut args : Array Expr := #[]
+      for a in e.getAppArgs do
+        args := args.push (← foldClosedArith fuel a)
+      return mkAppN fn args
+    | _ => return e
+
+/-- Normalize `goalTy` with `foldClosedArith` under a small heartbeat cap drawn from
+    `budget`. Returns `goalTy` unchanged when the budget is exhausted or the pass is
+    cut off (heartbeats or recursion depth), so a costly closed term never aborts or
+    starves a probe. -/
+private def normalizeGoalArith (budget : ProbeBudget) (goalTy : Expr) : MetaM Expr := do
+  let some cap ← budget.nextCap? | return goalTy
+  let folded? ← withBoundedHeartbeats (min cap closedNatFoldHeartbeats)
+    (foldClosedArith 96 goalTy)
+  return folded?.getD goalTy
+
 /-- Budget-aware variant of `tryProve`: re-derives a strictly positive heartbeat cap
     from `budget` before every tactic snippet, and reports the goal as undecided as
     soon as the total budget is exhausted. A single probe can therefore overshoot the
-    total budget by at most one per-snippet cap. -/
+    total budget by at most one per-snippet cap.
+
+    The goal is first normalized by `normalizeGoalArith`, so closed arithmetic
+    constants reach the tactics as numerals. The normalized goal is definitionally
+    equal to `goalTy`, so every verdict still rests on a `Meta.check`ed proof of a
+    statement equivalent to the one requested. -/
 private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr) : MetaM Bool := do
-  let goalTy ← instantiateMVars goalTy
+  let goalTy ← normalizeGoalArith budget (← instantiateMVars goalTy)
   for tac in (← proverSnippets) do
     let some cap ← budget.nextCap? | return false
     if ← tryTacticSnippet goalTy cap tac then
@@ -2305,11 +2404,18 @@ private def analyzeNormalizedSpec
     | none => none
 
   -- Phase 1: Subsingleton or empty output type (`UnboundReturnOutput`).
+  -- Deciding emptiness can evaluate a type index (`Fin n`) and run instance synthesis,
+  -- so every output type is inspected under a heartbeat cap. An inspection that runs
+  -- out of heartbeats or recursion depth (both runtime exceptions) leaves the type
+  -- unflagged instead of aborting the whole check. The cap has a fixed floor so the
+  -- purely structural cases still resolve under a starved probe configuration.
   if !outVars.isEmpty then
+    let typeCap := max 1000000 (cfg.stepHeartbeats * 1000)
     let mut allSubsingleton := true
     for ov in outVars do
       let ovTy ← inferType ov
-      if !(← isSubsingletonOrEmptyType 16 ovTy) then
+      let isSub? ← withBoundedHeartbeats typeCap (isSubsingletonOrEmptyType 16 ovTy)
+      if !(isSub?.getD false) then
         allSubsingleton := false
         break
     if allSubsingleton then

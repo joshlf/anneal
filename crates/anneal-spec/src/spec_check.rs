@@ -52,6 +52,22 @@
 //! with the return value) must be checked through [`check_contract_fallible`]
 //! or [`check_stateful_contract_fallible`], which count a trapping mutant
 //! evaluation as that mutant being rejected.
+//!
+//! # Reproducing a failure
+//!
+//! Every check is a pure function of its [`SpecCheckConfig`] and callbacks: the
+//! same seed samples the same inputs and mutants on every run. A live violation
+//! or trap reports the index of the offending trial
+//! ([`SpecCheckFailure::counterexample_trial`]); [`replay_trial_input`] and
+//! [`replay_stateful_trial_input`] rebuild the exact input sampled at that
+//! index, without requiring inputs to be `Copy` or `Debug`.
+//!
+//! # Custom types
+//!
+//! A struct or newtype becomes a checkable input, output, or `&mut` state with
+//! one `impl_spec_check_struct!` invocation, which delegates [`SampleInput`]
+//! and [`ReturnMutants`] to the field types. Types with an invariant need no
+//! special sampler: state the invariant in the precondition.
 
 use core::array;
 use core::fmt;
@@ -1631,6 +1647,26 @@ pub struct SpecCheckFailure {
     pub detail: FailureDetail,
 }
 
+impl SpecCheckFailure {
+    /// Returns the index of the trial whose live execution violated the
+    /// postcondition or trapped, or `None` for failures that are not tied to
+    /// one trial (dead precondition, surviving mutants, degenerate
+    /// configuration).
+    ///
+    /// Pass the index to [`replay_trial_input`] (or
+    /// [`replay_stateful_trial_input`]) with the same [`SpecCheckConfig`] to
+    /// reconstruct the exact counterexample input.
+    pub const fn counterexample_trial(&self) -> Option<usize> {
+        match self.detail {
+            FailureDetail::Violation(
+                ViolationKind::PostconditionFalse { trial_idx }
+                | ViolationKind::ExecutionTrapped { trial_idx, .. },
+            ) => Some(trial_idx),
+            _ => None,
+        }
+    }
+}
+
 /// Outcome of a dynamic contract and mutant check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SpecCheckOutcome {
@@ -2041,6 +2077,66 @@ where
     (evidence.class(), evidence.detail())
 }
 
+/// Seeds the streams of a stateless check: the input-sampling stream and the
+/// Stage D3 mutant stream. Sampling draws only from the first, so the input of
+/// a trial never depends on how many mutants earlier trials consumed.
+const fn stateless_streams(seed: u64) -> (SplitMix64, SplitMix64) {
+    let mut rng = SplitMix64::new(seed);
+    let mutant_rng = rng.fork();
+    (rng, mutant_rng)
+}
+
+/// Seeds the streams of a stateful check: the input-sampling stream, the
+/// return-value mutant stream, and the post-state mutant stream.
+const fn stateful_streams(seed: u64) -> (SplitMix64, SplitMix64, SplitMix64) {
+    let mut rng = SplitMix64::new(seed);
+    let ret_mutant_rng = rng.fork();
+    let state_mutant_rng = rng.fork();
+    (rng, ret_mutant_rng, state_mutant_rng)
+}
+
+/// Reconstructs the input that [`check_contract`],
+/// [`check_contract_with_mutants`], or [`check_contract_fallible`] sampled at
+/// `trial_idx` under `config`.
+///
+/// A failure reports only a trial index (see
+/// [`SpecCheckFailure::counterexample_trial`]) because the checker is
+/// allocation-free and does not require inputs to be `Copy` or `Debug`. The
+/// sampling stream is a pure function of `config.seed` and the input type, so
+/// replaying it yields the exact counterexample for inspection or for a
+/// regression test. Returns `None` when `trial_idx >= config.max_trials`, a
+/// trial the checker never runs. The cost is `trial_idx + 1` samples.
+pub fn replay_trial_input<I: SampleInput>(config: SpecCheckConfig, trial_idx: usize) -> Option<I> {
+    if trial_idx >= config.max_trials {
+        return None;
+    }
+    let (mut rng, _) = stateless_streams(config.seed);
+    for earlier in 0..trial_idx {
+        let _ = I::sample_at(earlier, &mut rng);
+    }
+    Some(I::sample_at(trial_idx, &mut rng))
+}
+
+/// Reconstructs the `(old_state, args)` pair that [`check_stateful_contract`]
+/// or [`check_stateful_contract_fallible`] sampled at `trial_idx` under
+/// `config`.
+///
+/// The stateful counterpart of [`replay_trial_input`]: returns `None` when
+/// `trial_idx >= config.max_trials`.
+pub fn replay_stateful_trial_input<S: SampleInput, A: SampleInput>(
+    config: SpecCheckConfig,
+    trial_idx: usize,
+) -> Option<(S, A)> {
+    if trial_idx >= config.max_trials {
+        return None;
+    }
+    let (mut rng, _, _) = stateful_streams(config.seed);
+    for earlier in 0..trial_idx {
+        let _ = <(S, A) as SampleInput>::sample_at(earlier, &mut rng);
+    }
+    Some(<(S, A) as SampleInput>::sample_at(trial_idx, &mut rng))
+}
+
 /// Shared fallible core powering [`check_contract`],
 /// [`check_contract_with_mutants`], and [`check_contract_fallible`].
 fn check_contract_core<I, R, Pre, Body, Post>(
@@ -2074,8 +2170,7 @@ where
         });
     }
 
-    let mut rng = SplitMix64::new(config.seed);
-    let mut mutant_rng = rng.fork();
+    let (mut rng, mut mutant_rng) = stateless_streams(config.seed);
     let mut anchor: Option<(I, R)> = None;
 
     for trial_idx in 0..config.max_trials {
@@ -2870,9 +2965,7 @@ where
         });
     }
 
-    let mut rng = SplitMix64::new(config.seed);
-    let mut ret_mutant_rng = rng.fork();
-    let mut state_mutant_rng = rng.fork();
+    let (mut rng, mut ret_mutant_rng, mut state_mutant_rng) = stateful_streams(config.seed);
 
     let mut return_mutants_tested = 0usize;
     let mut return_mutants_killed = 0usize;
@@ -3167,4 +3260,88 @@ where
             );
         }
     }
+}
+
+/// Implements [`SampleInput`](crate::spec_check::SampleInput) and
+/// [`ReturnMutants`](crate::spec_check::ReturnMutants) for a struct by
+/// delegating to the implementations of its field types.
+///
+/// A struct with one to four named fields samples and mutates exactly like the
+/// tuple of its field types (boundary cross-products first, then seeded draws;
+/// per-field and joint perturbations), and a single-field tuple struct behaves
+/// like its inner type:
+///
+/// ```text
+/// struct Span { lo: u16, hi: u16 }
+/// anneal_spec::impl_spec_check_struct!(Span { lo: u16, hi: u16 });
+///
+/// struct Meters(u32);
+/// anneal_spec::impl_spec_check_struct!(Meters(u32));
+/// ```
+///
+/// Every field type must implement `SampleInput`, `ReturnMutants`, and `Clone`.
+///
+/// The generated sampler and mutant generator ignore any invariant the struct
+/// carries, which is what the checker needs. On the input side, state the
+/// invariant in the precondition: samples that violate it are rejected like any
+/// other inadmissible input. On the output side, a mutant that violates the
+/// invariant is a legitimate wrong answer that a postcondition restating the
+/// invariant must reject.
+#[macro_export]
+macro_rules! impl_spec_check_struct {
+    ($name:ident { $($field:ident : $fty:ty),+ $(,)? }) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <($($fty,)+) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                let ($($field,)+) =
+                    <($($fty,)+) as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng);
+                Self { $($field),+ }
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <($($fty,)+) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                let fields = ($(::core::clone::Clone::clone(&self.$field),)+);
+                $crate::spec_check::ReturnMutants::visit_mutants(
+                    &fields,
+                    rng,
+                    |($($field,)+)| emit(Self { $($field),+ }),
+                );
+            }
+        }
+    };
+    ($name:ident ( $fty:ty )) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <$fty as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                Self(<$fty as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng))
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <$fty as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                $crate::spec_check::ReturnMutants::visit_mutants(&self.0, rng, |inner| {
+                    emit(Self(inner))
+                });
+            }
+        }
+    };
 }
