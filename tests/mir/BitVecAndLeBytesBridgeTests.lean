@@ -1389,6 +1389,170 @@ theorem canary3_big_endian_and_signed_array_witness (layouts : LayoutTable) (idx
   rw [hbytes]
   exact decodeValueFromBytes_encodeElems_bitVecLE_int layouts .i64 idx [0xFFFFFFFFFFFFFFFF#64]
 
+/-! ### 4.3 Signed Subtraction Ranges, Pure `evalBinOpChecked` ↔ Operational `*WithOverflow`/`*Unchecked`, and Typed Signed-Array Transmutes -/
+
+/-- Canary 1m (signed subtraction intervals across wrapping, checked, and unchecked MIR ops): for
+*every* `sx ∈ [-5, 5]` and `sy ∈ [-3, 3]` (witnessed by `witness_srange_xy`), `sx - sy` never
+underflows or overflows, stays in `[-8, 8]` across `evalBinOp .sub`, `evalWrappingSub`, and
+`Trusted` `evalScalarBinOp .sub`, never triggers `.ub` under signed `subUnchecked`, and sets
+`overflow = false` under signed `subWithOverflow`. -/
+theorem canary1_signed_sub_ranges_and_checked (locals : List LocalSlot) (mem : Memory)
+    (sx sy : ScalarInt)
+    (hsx : ScalarSRange 4 0xFFFFFFFB#32 0x00000005#32 sx)
+    (hsy : ScalarSRange 4 0xFFFFFFFD#32 0x00000003#32 sy) :
+    (∃ r, Anneal.Scalars.evalBinOp .sub sx sy true = some r ∧
+        ScalarSRange 4 0xFFFFFFF8#32 0x00000008#32 r) ∧
+      (∃ r, evalWrappingSub sx sy = some r ∧
+        ScalarSRange 4 0xFFFFFFF8#32 0x00000008#32 r) ∧
+      (∃ r, evalScalarBinOp .sub sx sy locals mem true = .ok (.scalar r) locals mem ∧
+        ScalarSRange 4 0xFFFFFFF8#32 0x00000008#32 r) ∧
+      (∃ r, evalScalarBinOp .subUnchecked sx sy locals mem true = .ok (.scalar r) locals mem ∧
+        ScalarSRange 4 0xFFFFFFF8#32 0x00000008#32 r) ∧
+      (∃ r, evalScalarBinOp .subWithOverflow sx sy locals mem true =
+          .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar false)]) locals mem ∧
+        ScalarSRange 4 0xFFFFFFF8#32 0x00000008#32 r) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · obtain ⟨r, hr, hrg⟩ :=
+      scalarSRange_evalBinOp_sub_no_overflow (by decide) true hsx hsy (by decide) (by decide)
+    exact ⟨r, hr, scalarSRange_congr (by decide) (by decide) hrg⟩
+  · obtain ⟨r, hr, hrg⟩ :=
+      scalarSRange_evalWrappingSub_no_overflow (by decide) hsx hsy (by decide) (by decide)
+    exact ⟨r, hr, scalarSRange_congr (by decide) (by decide) hrg⟩
+  · obtain ⟨r, hr, hrg⟩ :=
+      scalarSRange_evalScalarBinOp_sub_no_overflow (by decide) locals mem true hsx hsy
+        (by decide) (by decide)
+    exact ⟨r, hr, scalarSRange_congr (by decide) (by decide) hrg⟩
+  · obtain ⟨r, hr, hrg⟩ :=
+      scalarSRange_evalScalarBinOp_subUnchecked_signed (by decide) locals mem hsx hsy
+        (by decide) (by decide)
+    exact ⟨r, hr, scalarSRange_congr (by decide) (by decide) hrg⟩
+  · obtain ⟨r, hr, hrg⟩ :=
+      scalarSRange_evalScalarBinOp_subWithOverflow_signed (by decide) locals mem hsx hsy
+        (by decide) (by decide)
+    exact ⟨r, hr, scalarSRange_congr (by decide) (by decide) hrg⟩
+
+/-- Boundary counterexamples for signed subtraction overflow/underflow plus the `w = 0` edge case:
+both `i32::MIN - 1` (signed underflow) and `i32::MAX - (-1)` (signed overflow) trigger `.ub` under
+signed `subUnchecked` and raise `overflow = true` under `subWithOverflow`, while width `0`
+satisfies `signed_range_sub_no_overflow_sound` cleanly. -/
+theorem canary1_signed_sub_overflow_counterexamples (locals : List LocalSlot) (mem : Memory)
+    (z₁ z₂ : BitVec 0) :
+    evalScalarBinOp .subUnchecked ⟨0x80000000, 4⟩ ⟨1, 4⟩ locals mem true = .ub ∧
+      evalScalarBinOp .subWithOverflow ⟨0x80000000, 4⟩ ⟨1, 4⟩ locals mem true =
+        .ok (.aggregate 0 [.scalar ⟨0x7FFFFFFF, 4⟩, .scalar (boolToScalar true)]) locals mem ∧
+      evalScalarBinOp .subUnchecked ⟨0x7FFFFFFF, 4⟩ ⟨0xFFFFFFFF, 4⟩ locals mem true = .ub ∧
+      evalScalarBinOp .subWithOverflow ⟨0x7FFFFFFF, 4⟩ ⟨0xFFFFFFFF, 4⟩ locals mem true =
+        .ok (.aggregate 0 [.scalar ⟨0x80000000, 4⟩, .scalar (boolToScalar true)]) locals mem ∧
+      (Anneal.BitVecArith.sle (z₁ - z₂) (z₁ - z₂) ∧
+        Anneal.BitVecArith.sle (z₁ - z₂) (z₁ - z₂)) := by
+  have hk1 := Anneal.BitVecArith.signedKey_lt z₁
+  have hk2 := Anneal.BitVecArith.signedKey_lt z₂
+  rw [natPow_eq] at hk1 hk2
+  refine ⟨?_, ?_, ?_, ?_,
+    signed_range_sub_no_overflow_sound (Anneal.BitVecArith.sle_refl z₁)
+      (Anneal.BitVecArith.sle_refl z₁) (Anneal.BitVecArith.sle_refl z₂)
+      (Anneal.BitVecArith.sle_refl z₂) (by omega) (by omega)⟩
+  · rw [← (evalScalarBinOp_unchecked_arith_iff (by decide) (Or.inr (Or.inl rfl))
+      0x80000000 1 locals mem true).2]
+    rfl
+  · rw [Anneal.Scalars.evalScalarBinOp_subWithOverflow (by decide)]; rfl
+  · rw [← (evalScalarBinOp_unchecked_arith_iff (by decide) (Or.inr (Or.inl rfl))
+      0x7FFFFFFF 0xFFFFFFFF locals mem true).2]
+    rfl
+  · rw [Anneal.Scalars.evalScalarBinOp_subWithOverflow (by decide)]; rfl
+
+/-- Signed and unsigned overflow flags of `evalBinOpChecked` at the 32-bit boundary:
+`i32::MAX + 1`, `i32::MIN - 1`, and `0x10000 * 0x10000` wrap and raise their respective flags;
+`(-1) + 1` and `5 - 3` do not overflow signed; for *every* pair with the same sign bit signed
+subtraction never overflows; and for *every* pair with opposite sign bits signed addition never
+overflows. -/
+theorem checked_overflow_flags (a b c d : Nat)
+    (hsame : Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) a) =
+      Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) b))
+    (hopp : Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) c) ≠
+      Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) d)) :
+    Anneal.Scalars.evalBinOpChecked .add ⟨0x7FFFFFFF, 4⟩ ⟨1, 4⟩ true =
+        some (⟨0x80000000, 4⟩, true) ∧
+      Anneal.Scalars.evalBinOpChecked .sub ⟨0x80000000, 4⟩ ⟨1, 4⟩ true =
+        some (⟨0x7FFFFFFF, 4⟩, true) ∧
+      Anneal.Scalars.evalBinOpChecked .add ⟨0xFFFFFFFF, 4⟩ ⟨1, 4⟩ true = some (⟨0, 4⟩, false) ∧
+      Anneal.Scalars.evalBinOpChecked .add ⟨0xFFFFFFFF, 4⟩ ⟨1, 4⟩ false = some (⟨0, 4⟩, true) ∧
+      Anneal.Scalars.evalBinOpChecked .mul ⟨0x10000, 4⟩ ⟨0x10000, 4⟩ false = some (⟨0, 4⟩, true) ∧
+      Anneal.Scalars.evalBinOpChecked .sub ⟨5, 4⟩ ⟨3, 4⟩ true = some (⟨2, 4⟩, false) ∧
+      signedOverflowSub a b 4 = false ∧
+      signedOverflowAdd c d 4 = false := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_,
+    signedOverflowSub_eq_false_of_msb_eq hsame,
+    signedOverflowAdd_eq_false_of_msb_ne hopp⟩
+  · rw [evalBinOpChecked_add_signed_eq (by decide)]; rfl
+  · rw [evalBinOpChecked_sub_signed_eq (by decide)]; rfl
+  · rw [evalBinOpChecked_add_signed_eq (by decide)]; rfl
+  · rw [evalBinOpChecked_add_unsigned_eq (by decide)]; rfl
+  · rw [evalBinOpChecked_mul_unsigned_eq (by decide)]; rfl
+  · rw [evalBinOpChecked_sub_signed_eq (by decide)]; rfl
+
+/-- Satisfiability witness for `checked_overflow_flags`: `(3, 5)` share sign bit `false` and
+`(0x80000000, 1)` have opposite sign bits (`true ≠ false`). -/
+theorem checked_overflow_flags_witness :
+    Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) 3) =
+        Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) 5) ∧
+      Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) 0x80000000) ≠
+        Anneal.BitVecArith.msb (BitVec.ofNat (8 * 4) 1) ∧
+      signedOverflowSub 0x80000000 1 4 = true :=
+  ⟨by decide, by decide, rfl⟩
+
+/-- Symbolic equivalence of pure `evalBinOpChecked` / `evalBinOp` with operational `Trusted`
+`evalScalarBinOp` on `*WithOverflow` and `*Unchecked` across arbitrary bits and sign flags, plus
+rejection of zero-width, mismatched-width, and non-checked operators by `evalBinOpChecked`. -/
+theorem checked_and_unchecked_operational_equivalence (a b : Nat) (isSigned : Bool)
+    (locals : List LocalSlot) (mem : Memory) :
+    (∃ r ovf,
+        Anneal.Scalars.evalBinOpChecked .subWithOverflow ⟨a, 4⟩ ⟨b, 4⟩ isSigned = some (r, ovf) ∧
+        evalScalarBinOp .subWithOverflow ⟨a, 4⟩ ⟨b, 4⟩ locals mem isSigned =
+          .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar ovf)]) locals mem ∧
+        some r = Anneal.Scalars.evalBinOp .sub ⟨a, 4⟩ ⟨b, 4⟩ isSigned) ∧
+      (Anneal.Scalars.evalBinOp .subUnchecked ⟨a, 4⟩ ⟨b, 4⟩ isSigned = none ↔
+        evalScalarBinOp .subUnchecked ⟨a, 4⟩ ⟨b, 4⟩ locals mem isSigned = .ub) ∧
+      (Anneal.Scalars.evalBinOp .shrUnchecked ⟨a, 4⟩ ⟨b, 1⟩ isSigned = none ↔
+        evalScalarBinOp .shrUnchecked ⟨a, 4⟩ ⟨b, 1⟩ locals mem isSigned = .ub) ∧
+      Anneal.Scalars.evalBinOpChecked .add ⟨a, 0⟩ ⟨b, 0⟩ isSigned = none ∧
+      Anneal.Scalars.evalBinOpChecked .add ⟨a, 4⟩ ⟨b, 8⟩ isSigned = none ∧
+      Anneal.Scalars.evalBinOpChecked .bitAnd ⟨a, 4⟩ ⟨b, 4⟩ isSigned = none := by
+  obtain ⟨r, ovf, hchk, hop⟩ :=
+    evalScalarBinOp_withOverflow_of_evalBinOpChecked (sz := 4) (by decide)
+      (Or.inr (Or.inl rfl)) a b locals mem isSigned
+  have hfst : (Anneal.Scalars.evalBinOpChecked .sub ⟨a, 4⟩ ⟨b, 4⟩ isSigned).map Prod.fst =
+      Anneal.Scalars.evalBinOp .sub ⟨a, 4⟩ ⟨b, 4⟩ isSigned :=
+    evalBinOpChecked_fst_eq_evalBinOp (Or.inr (Or.inl rfl)) ⟨a, 4⟩ ⟨b, 4⟩ isSigned
+  rw [← evalBinOpChecked_subWithOverflow_eq_sub, hchk] at hfst
+  exact ⟨⟨r, ovf, hchk, hop, hfst⟩,
+    (evalScalarBinOp_unchecked_arith_iff (by decide) (Or.inr (Or.inl rfl))
+      a b locals mem isSigned).2,
+    (evalScalarBinOp_unchecked_shift_iff (by decide) (by decide) (Or.inr rfl)
+      a b locals mem isSigned).2,
+    (evalBinOpChecked_eq_none_iff _ _ _ _).2 (Or.inl rfl),
+    (evalBinOpChecked_eq_none_iff _ _ _ _).2 (Or.inr (Or.inl (fun h => nomatch h))),
+    (evalBinOpChecked_eq_none_iff _ _ _ _).2
+      (Or.inr (Or.inr (by rintro (h | h | h | h | h | h) <;> cases h)))⟩
+
+/-- Canary 3j (typed `BitVec` array transmutation square including `xs = []`): `[i32; 4] → [i64; 2]`,
+`[u32; 4] → [i64; 2]`, `[i32; 4] → [u64; 2]`, and empty `[i32; 0] → [i64; 0]` all succeed directly
+from typed `BitVec` element lists without needing an external encoding witness. -/
+theorem canary3_typed_signed_array_transmute_square (layouts : LayoutTable)
+    (idx₁ idx₂ : LayoutIdx) (a b c d : BitVec 32) :
+    (∃ v', decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .array (.int .i64) 2, layoutIdx := idx₂ }
+        (u32LE.encodeElems [a, b, c, d]) = some v') ∧
+      (∃ v', decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .array (.uint .u64) 2, layoutIdx := idx₂ }
+        (u32LE.encodeElems [a, b, c, d]) = some v') ∧
+      (∃ v', decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .array (.int .i64) 0, layoutIdx := idx₂ }
+        (u32LE.encodeElems []) = some v') :=
+  ⟨bitVecArray_int_transmute_sound layouts .i32 .i64 2 idx₁ idx₂ [a, b, c, d] rfl,
+    bitVecArray_int_to_uint_transmute_sound layouts .i32 .u64 2 idx₁ idx₂ [a, b, c, d] rfl,
+    bitVecArray_uint_to_int_transmute_sound layouts .u32 .i64 0 idx₁ idx₂ [] rfl⟩
+
 /-! ## 5. Axiom Audit Guards
 
 Every declaration of `Anneal.BitVecScalarsBridge` (theorems, definitions and instances) and every
@@ -3036,6 +3200,130 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecScalarsBridge.decodeValueFromBytes_encodeElems_bitVecLE_int
 
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_msb' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_msb
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowSub_eq_msb' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowSub_eq_msb
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_of_msb_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_of_msb_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_false_of_msb_ne' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowAdd_eq_false_of_msb_ne
+
+/-- info: 'Anneal.BitVecScalarsBridge.mod_of_lt_two_mul' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.mod_of_lt_two_mul
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedKey_linear' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedKey_linear
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedKey_sub_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedKey_sub_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.signed_range_sub_no_overflow_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signed_range_sub_no_overflow_sound
+
+/-- info: 'Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_of_signedKey_bounds' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.signedOverflowSub_eq_false_of_signedKey_bounds
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalBinOp_sub_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalBinOp_sub_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalWrappingSub_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalWrappingSub_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_sub_no_overflow' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_sub_no_overflow
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_subUnchecked_signed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_subUnchecked_signed
+
+/-- info: 'Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_subWithOverflow_signed' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.scalarSRange_evalScalarBinOp_subWithOverflow_signed
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_eq_none_iff' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_eq_none_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_addWithOverflow_eq_add' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_addWithOverflow_eq_add
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_subWithOverflow_eq_sub' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_subWithOverflow_eq_sub
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_mulWithOverflow_eq_mul' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_mulWithOverflow_eq_mul
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_add_signed_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_add_signed_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_add_unsigned_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_add_unsigned_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_sub_signed_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_sub_signed_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_sub_unsigned_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_sub_unsigned_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_mul_signed_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_mul_signed_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_mul_unsigned_eq' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_mul_unsigned_eq
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalBinOpChecked_fst_eq_evalBinOp' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalBinOpChecked_fst_eq_evalBinOp
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarBinOp_withOverflow_of_evalBinOpChecked' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarBinOp_withOverflow_of_evalBinOpChecked
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarBinOp_unchecked_arith_iff' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarBinOp_unchecked_arith_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.evalScalarBinOp_unchecked_shift_iff' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.evalScalarBinOp_unchecked_shift_iff
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecArray_int_transmute_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecArray_int_transmute_sound
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecArray_uint_to_int_transmute_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecArray_uint_to_int_transmute_sound
+
+/-- info: 'Anneal.BitVecScalarsBridge.bitVecArray_int_to_uint_transmute_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecScalarsBridge.bitVecArray_int_to_uint_transmute_sound
+
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.ctlz_width_zero
@@ -3407,5 +3695,29 @@ theorem and definition of this file is pinned to its exact axiom set. All sets a
 /-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary3_big_endian_and_signed_array_witness' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms Anneal.BitVecAndLeBytesBridgeTests.canary3_big_endian_and_signed_array_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_sub_ranges_and_checked' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_sub_ranges_and_checked
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_sub_overflow_counterexamples' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary1_signed_sub_overflow_counterexamples
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.checked_overflow_flags' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.checked_overflow_flags
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.checked_overflow_flags_witness' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.checked_overflow_flags_witness
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.checked_and_unchecked_operational_equivalence' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.checked_and_unchecked_operational_equivalence
+
+/-- info: 'Anneal.BitVecAndLeBytesBridgeTests.canary3_typed_signed_array_transmute_square' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms Anneal.BitVecAndLeBytesBridgeTests.canary3_typed_signed_array_transmute_square
 
 end Anneal.BitVecAndLeBytesBridgeTests
