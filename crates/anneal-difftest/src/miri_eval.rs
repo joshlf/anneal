@@ -4604,23 +4604,27 @@ fn resolve_miri_toolchain_safe() -> Result<MiriToolchain, String> {
         let _ = f.lock();
     }
     let toolchain = MiriToolchain::resolve(None, None, None)?;
-    // If an external process is currently running `cargo miri setup` on this
-    // sysroot, wait for it to release `<sysroot>/.setup.lock`.
-    let setup_lock = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(toolchain.miri_sysroot.join(".setup.lock"))
-        .ok();
+    // An `ANNEAL_MIRI_SYSROOT` override belongs to the operator: `resolve` never
+    // provisions it, so it is only checked here, never locked or rebuilt.
+    let operator_supplied = env::var_os("ANNEAL_MIRI_SYSROOT").is_some_and(|v| !v.is_empty());
+    // If an external process is currently running `cargo miri setup` on the
+    // auto-provisioned sysroot, wait for it to release `<sysroot>/.setup.lock`.
+    let setup_lock = if operator_supplied {
+        None
+    } else {
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(toolchain.miri_sysroot.join(".setup.lock"))
+            .ok()
+    };
     if let Some(ref f) = setup_lock {
         let _ = f.lock();
     }
     if !miri_sysroot_has_core_rlib(&toolchain.miri_sysroot) {
         drop(setup_lock);
-        let rustlib = toolchain.miri_sysroot.join("lib/rustlib");
-        if rustlib.is_dir() {
-            let _ = fs::remove_dir_all(&rustlib);
-        }
+        discard_incomplete_miri_sysroot(&toolchain.miri_sysroot, operator_supplied)?;
         let rebuilt = MiriToolchain::resolve(None, None, None)?;
         if !miri_sysroot_has_core_rlib(&rebuilt.miri_sysroot) {
             return Err(format!(
@@ -4631,6 +4635,33 @@ fn resolve_miri_toolchain_safe() -> Result<MiriToolchain, String> {
         return Ok(rebuilt);
     }
     Ok(toolchain)
+}
+
+/// Removes `<sysroot>/lib/rustlib` of an auto-provisioned Miri sysroot that an
+/// interrupted `cargo miri setup` left without `libcore*.rlib`, so the next
+/// `MiriToolchain::resolve` rebuilds it under `<sysroot>/.setup.lock`.
+///
+/// An operator-supplied sysroot (`ANNEAL_MIRI_SYSROOT`) is never modified: a
+/// directory this crate did not create may be a shared or read-only toolchain
+/// tree, and `resolve` would not rebuild it anyway.
+fn discard_incomplete_miri_sysroot(sysroot: &Path, operator_supplied: bool) -> Result<(), String> {
+    if operator_supplied {
+        return Err(format!(
+            "ANNEAL_MIRI_SYSROOT {} has no libcore*.rlib under lib/rustlib/<target>/lib; \
+             run `cargo miri setup` for it or unset ANNEAL_MIRI_SYSROOT",
+            sysroot.display()
+        ));
+    }
+    let rustlib = sysroot.join("lib/rustlib");
+    if rustlib.is_dir() {
+        fs::remove_dir_all(&rustlib).map_err(|e| {
+            format!(
+                "failed to remove incomplete Miri sysroot {}: {e}",
+                rustlib.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Upper cap on Lean's per-process memory flag (`lean -M`, in MiB) for Stage 1
@@ -14314,6 +14345,37 @@ pub fn cand_ep1_b4_rename() -> u32 {
             miri_sysroot_has_core_rlib(&tmp),
             "populated libcore*.rlib must satisfy readiness check"
         );
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn discard_incomplete_miri_sysroot_never_touches_an_operator_supplied_sysroot() {
+        let tmp = env::temp_dir().join(format!(
+            "anneal_miri_sysroot_discard_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        // `lib/rustlib` without `libcore*.rlib`: an interrupted `cargo miri setup`,
+        // or an operator's toolchain tree with only `rust-src` installed.
+        let marker = tmp.join("lib/rustlib/src/rust/library/core/src/lib.rs");
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(&marker, b"stub").unwrap();
+        assert!(!miri_sysroot_has_core_rlib(&tmp));
+
+        let err = discard_incomplete_miri_sysroot(&tmp, true)
+            .expect_err("an operator-supplied sysroot must be rejected, not rebuilt");
+        assert!(err.contains("ANNEAL_MIRI_SYSROOT"), "{err}");
+        assert!(err.contains(&tmp.display().to_string()), "{err}");
+        assert!(marker.is_file(), "operator-supplied sysroot must be left intact");
+
+        discard_incomplete_miri_sysroot(&tmp, false).expect("auto-provisioned sysroot is discarded");
+        assert!(!tmp.join("lib/rustlib").exists(), "incomplete lib/rustlib must be removed");
+        assert!(tmp.join("lib").is_dir(), "only lib/rustlib is removed");
+        // Nothing left to discard is not an error.
+        discard_incomplete_miri_sysroot(&tmp, false).expect("idempotent");
         let _ = fs::remove_dir_all(&tmp);
     }
 }

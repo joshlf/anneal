@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -19,8 +21,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import run_nightly_verification_suite as suite  # noqa: E402
@@ -3091,6 +3095,484 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             suite.clean_stale_oleans(root)
             self.assertTrue(escape_file.is_file())
 
+    def test_lake_hash_matches_lean_4_34_1_known_answers(self) -> None:
+        # Ground truth printed by Lean 4.34.1 itself (`import Lake`,
+        # `#eval (Lake.Hash.ofText s).hex` / `(Lake.Hash.ofByteArray b).hex`); the same
+        # function reproduces the source hashes in real `.lake/build/lib/lean/*.trace` files.
+        for text, expected in (
+            ("", "21c42906adea99f5"),
+            ("a", "6ccb214a796350f7"),
+            ("abcdefg", "5ada98fa484c431b"),  # 7-byte tail only
+            ("abcdefgh", "4a88fc15a029668c"),  # exactly one 8-byte block
+            ("import Trusted\n\ndef x := 1\n", "6a39cb7a09a54b0c"),
+            ("import Trusted\r\n\r\ndef x := 1\r\n", "6a39cb7a09a54b0c"),  # `\r\n` -> `\n`
+            ("a\rb\n", "c1b3a4fcd8bb7ad6"),  # a lone `\r` is kept
+            ("theorem «π» : α → β := λ x => x -- ∀∃\n", "7b8d1ae2cbe92fc4"),
+        ):
+            self.assertEqual(suite._lake_text_hash_hex(text.encode("utf-8")), expected, repr(text))
+        self.assertEqual(
+            suite._lake_bytes_hash_hex(bytes([0, 1, 2, 255, 13, 10, 7, 8, 9])), "0692aef1a8bd5877"
+        )
+        # Binary hashing never normalizes line endings.
+        self.assertNotEqual(suite._lake_bytes_hash_hex(b"a\r\nb"), suite._lake_text_hash_hex(b"a\r\nb"))
+
+    @staticmethod
+    def _write_file_at(path: Path, content: bytes, ts_sec: float) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        os.utime(path, (ts_sec, ts_sec))
+        return path
+
+    def _write_lake_built_module(
+        self,
+        lib_dir: Path,
+        rel_mod: str,
+        built_from: bytes,
+        built_at: float,
+        *,
+        module_system: bool = False,
+        fetched_at: float | None = None,
+    ) -> dict[str, Path]:
+        """Lay down what Lake 4.34.1 leaves in `.lake/build/lib/lean/` for module `rel_mod`
+        built from source text `built_from` at `built_at` in some other checkout: the
+        `.olean` parts, `.ilean`, their `.hash` sidecars and the `.trace` naming the source
+        and output content hashes (`schemaVersion` `2025-09-10`).
+
+        With `fetched_at`, the artifacts were instead restored from Lake's cache at that
+        time: they keep their `built_at` mtime (hard links), while the `.hash` sidecars and
+        the `.trace` are written at `fetched_at`, and the trace is the synthetic one of
+        `BuildMetadata.ofFetch`, which names the outputs but no inputs."""
+        files: dict[str, Path] = {}
+        hashes: dict[str, str] = {}
+        parts = [".olean", ".olean.server", ".olean.private"] if module_system else [".olean"]
+        extras = [".ir", ".ir.sig", ".ltar"] if module_system else []
+        for suffix in (*parts, ".ilean", *extras):
+            content = f"{rel_mod}{suffix}:".encode("utf-8") + built_from
+            hashes[suffix] = suite._lake_bytes_hash_hex(content)
+            files[suffix] = self._write_file_at(lib_dir / f"{rel_mod}{suffix}", content, built_at)
+            files[f"{suffix}.hash"] = self._write_file_at(
+                lib_dir / f"{rel_mod}{suffix}.hash",
+                hashes[suffix].encode("ascii"),
+                built_at if fetched_at is None else fetched_at,
+            )
+        trace = {
+            "synthetic": False,
+            "schemaVersion": "2025-09-10",
+            "depHash": "56989c8629fa0281",
+            "log": [],
+            "inputs": [
+                ["deps", [["imports", [["Trusted:importAllArts", "927a2227cd6747b8"]]]]],
+                ["Lean 4.34.1, commit 5045d0056413266e57c625dcd7c365b10e377c52", "e9f3658beb070375"],
+                [
+                    f"/some/other/worktree/examples/../src/{rel_mod}.lean",
+                    suite._lake_text_hash_hex(built_from),
+                ],
+                ["options", "00000000000006bb"],
+                [f"Module.name: {rel_mod.replace('/', '.')}", "48eba4641e299005"],
+            ],
+            "outputs": {
+                "o": [f"{hashes[suffix]}{suffix}" for suffix in parts],
+                "m": module_system,
+                "i": f"{hashes['.ilean']}.ilean",
+                "c": "27e03df3817a8e48.c",
+            },
+        }
+        if fetched_at is not None:
+            trace = {
+                "synthetic": True,
+                "schemaVersion": "2025-09-10",
+                "outputs": trace["outputs"],
+                "log": [],
+                "inputs": [],
+                "depHash": "cca9185a3f3ac0e6",
+            }
+        files[".trace"] = self._write_file_at(
+            lib_dir / f"{rel_mod}.trace",
+            json.dumps(trace).encode("utf-8"),
+            built_at if fetched_at is None else fetched_at,
+        )
+        return files
+
+    def test_clean_stale_oleans_trusts_lake_content_hashes_over_inverted_mtimes(self) -> None:
+        # Lake hard-links cached artifacts into the build directory, so a restored `.olean`
+        # keeps the mtime of whichever checkout first built it; a cache seeded from another
+        # worktree looks the same. Every source of this checkout is then "newer" than its
+        # `.olean` although Lake (which decides by content hash) considers all of it fresh.
+        t_built, t_checkout, t_edit = 1_700_000_000.0, 1_700_000_500.0, 1_700_001_000.0
+        sources = {
+            "trusted/lean/Trusted.lean": b"import Trusted.Core\n",
+            "trusted/lean/Trusted/Core.lean": b"def core := 1\n",
+            "theory/Anneal/Mod.lean": b"import Trusted\ndef m := core\n",
+            "theory/Anneal/Other.lean": b"import Trusted\ndef o := core\n",
+            "lean-miri/vendor/Miri/Keep.lean": b"def keep := 0\n",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lib = root / ".lake/build/lib/lean"
+            ex_lib = root / "examples/.lake/build/lib/lean"
+            for rel, text in sources.items():
+                self._write_file_at(root / rel, text, t_checkout)
+            # A CRLF checkout of the LF text Lake hashed is still the same source.
+            self._write_file_at(
+                root / "theory/Anneal/Mod.lean",
+                sources["theory/Anneal/Mod.lean"].replace(b"\n", b"\r\n"),
+                t_checkout,
+            )
+            built: dict[tuple[str, str], dict[str, Path]] = {}
+            for where, lib_dir, rel_mod, src_rel in (
+                ("root", lib, "Trusted", "trusted/lean/Trusted.lean"),
+                ("root", lib, "Trusted/Core", "trusted/lean/Trusted/Core.lean"),
+                ("root", lib, "Anneal/Mod", "theory/Anneal/Mod.lean"),
+                ("root", lib, "Anneal/Other", "theory/Anneal/Other.lean"),
+                ("examples", ex_lib, "Trusted", "trusted/lean/Trusted.lean"),
+                ("examples", ex_lib, "Trusted/Core", "trusted/lean/Trusted/Core.lean"),
+                ("examples", ex_lib, "Miri/Keep", "lean-miri/vendor/Miri/Keep.lean"),
+            ):
+                built[(where, rel_mod)] = self._write_lake_built_module(
+                    lib_dir, rel_mod, sources[src_rel], t_built, module_system=rel_mod == "Anneal/Other"
+                )
+            all_files = {p for files in built.values() for p in files.values()}
+
+            def files_of(*keys: tuple[str, str]) -> set[Path]:
+                return {p for key in keys for p in built[key].values()}
+
+            # Nothing is stale: the guard must not wipe a coherent cache (it used to delete
+            # every one of these files, `Trusted` first and then everything downstream).
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertTrue(all(p.is_file() for p in all_files))
+
+            # A real edit of one module removes exactly that module's files, including the
+            # module-system `.olean.server` / `.olean.private` / `.ir` / `.ir.sig` companions
+            # and its `.ltar` archive.
+            self._write_file_at(root / "theory/Anneal/Other.lean", b"import Trusted\ndef o := 2\n", t_edit)
+            removed = suite.clean_stale_oleans(root)
+            self.assertEqual(set(removed), files_of(("root", "Anneal/Other")))
+            self.assertEqual(
+                {p.name for p in removed},
+                {
+                    f"Other{sfx}{tail}"
+                    for sfx in (
+                        ".olean",
+                        ".olean.server",
+                        ".olean.private",
+                        ".ilean",
+                        ".ir",
+                        ".ir.sig",
+                        ".ltar",
+                    )
+                    for tail in ("", ".hash")
+                }
+                | {"Other.trace"},
+            )
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+
+            # A real edit of a `Trusted` source invalidates `Trusted` and everything downstream
+            # in both Lake roots, and still spares vendored `Miri`.
+            self._write_file_at(root / "trusted/lean/Trusted/Core.lean", b"def core := 2\n", t_edit)
+            removed = suite.clean_stale_oleans(root)
+            self.assertEqual(
+                set(removed),
+                files_of(
+                    ("root", "Trusted"),
+                    ("root", "Trusted/Core"),
+                    ("root", "Anneal/Mod"),
+                    ("examples", "Trusted"),
+                    ("examples", "Trusted/Core"),
+                ),
+            )
+            self.assertTrue(all(p.is_file() for p in files_of(("examples", "Miri/Keep"))))
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+
+    def test_clean_stale_oleans_exoneration_requires_private_self_consistent_lake_records(self) -> None:
+        # An mtime-stale module is kept only on positive evidence. Each tampering below
+        # leaves the source "newer" than its `.olean` and breaks one link of that evidence,
+        # so the guard must fall back to the mtime verdict and remove the module.
+        t_built, t_checkout = 1_700_000_000.0, 1_700_000_500.0
+        source = b"import Trusted\ndef m := 1\n"
+
+        def retime(path: Path, ts_sec: float) -> None:
+            os.utime(path, (ts_sec, ts_sec))
+
+        def rewrite_trace(files: dict[str, Path], edit) -> None:
+            doc = json.loads(files[".trace"].read_text(encoding="utf-8"))
+            edit(doc)
+            self._write_file_at(files[".trace"], json.dumps(doc).encode("utf-8"), t_built)
+
+        def other_source_named(doc: dict) -> None:
+            doc["inputs"][2][0] = "/some/other/worktree/src/Anneal/NotMod.lean"
+
+        def source_named_twice(doc: dict) -> None:
+            doc["inputs"].append(["/elsewhere/Anneal/Mod.lean", "0123456789abcdef"])
+
+        def uppercase_source_hash(doc: dict) -> None:
+            doc["inputs"][2][1] = doc["inputs"][2][1].upper() if doc["inputs"][2][1].upper() != doc["inputs"][2][1] else "G" * 16
+
+        def olean_output_dropped(doc: dict) -> None:
+            doc["outputs"]["o"] = []
+
+        def extra_part_named(doc: dict) -> None:
+            doc["outputs"]["o"].append("0123456789abcdef.olean.server")
+
+        tamperings = {
+            "source_edited_in_place": lambda root, f: self._write_file_at(
+                root / "theory/Anneal/Mod.lean", b"import Trusted\ndef m := 2\n", t_checkout
+            ),
+            "trace_missing": lambda root, f: f.pop(".trace").unlink(),
+            "trace_not_json": lambda root, f: self._write_file_at(f[".trace"], b"{not json", t_built),
+            "trace_not_an_object": lambda root, f: self._write_file_at(f[".trace"], b"[]", t_built),
+            "trace_is_a_symlink": lambda root, f: (
+                shutil.move(str(f[".trace"]), str(root / "elsewhere.trace")),
+                f[".trace"].symlink_to(root / "elsewhere.trace"),
+            ),
+            # `cp -al`-seeded caches share `.trace` / `.hash` inodes with another tree, whose
+            # Lake rewrites them in place for *its* sources.
+            "trace_hard_linked": lambda root, f: os.link(f[".trace"], root / "other_tree.trace"),
+            "trace_names_another_source": lambda root, f: rewrite_trace(f, other_source_named),
+            "trace_names_the_source_twice": lambda root, f: rewrite_trace(f, source_named_twice),
+            "trace_source_hash_malformed": lambda root, f: rewrite_trace(f, uppercase_source_hash),
+            "trace_without_olean_output": lambda root, f: rewrite_trace(f, olean_output_dropped),
+            "trace_names_a_part_missing_on_disk": lambda root, f: rewrite_trace(f, extra_part_named),
+            "olean_part_on_disk_not_in_trace": lambda root, f: f.update(
+                {
+                    ".olean.private": self._write_file_at(
+                        f[".olean"].with_name("Mod.olean.private"), b"stray", t_built
+                    )
+                }
+            ),
+            "sidecar_missing": lambda root, f: f.pop(".olean.hash").unlink(),
+            "sidecar_mismatch": lambda root, f: self._write_file_at(
+                f[".olean.hash"], b"0123456789abcdef", t_built
+            ),
+            "sidecar_hard_linked": lambda root, f: os.link(f[".olean.hash"], root / "other_tree.hash"),
+            # The `.olean` was replaced after Lake recorded its hash (an interrupted rebuild).
+            "sidecar_older_than_olean": lambda root, f: retime(f[".olean"], t_built + 60),
+        }
+        for name, tamper in tamperings.items():
+            with self.subTest(tampering=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                self._write_file_at(root / "theory/Anneal/Mod.lean", source, t_checkout)
+                files = self._write_lake_built_module(
+                    root / ".lake/build/lib/lean", "Anneal/Mod", source, t_built
+                )
+                self.assertEqual(suite.clean_stale_oleans(root), [], "control: coherent records")
+                tamper(root, files)
+                self.assertEqual(set(suite.clean_stale_oleans(root)), set(files.values()))
+                self.assertFalse(any(os.path.lexists(p) for p in files.values()))
+                self.assertTrue((root / "theory/Anneal/Mod.lean").is_file())
+
+    def test_clean_stale_oleans_trusts_lake_cache_fetch_traces_written_after_the_source(self) -> None:
+        # What the guard itself causes: it removes a stale module, Lake restores the module
+        # from its artifact cache, and the restored `.olean` (a hard link) is again older than
+        # the source. Lake then writes a synthetic `.trace` without inputs, so no source hash
+        # can be compared; but Lake derived the module's input hash from the source when it
+        # wrote that trace. If such a trace were not accepted, every restored module would be
+        # removed and restored again on every run.
+        t_built, t_checkout, t_fetched, t_edit = (
+            1_700_000_000.0,
+            1_700_000_500.0,
+            1_700_001_000.0,
+            1_700_001_500.0,
+        )
+        sources = {
+            "trusted/lean/Trusted/Core.lean": ("Trusted/Core", b"def core := 1\n"),
+            "theory/Anneal/Mod.lean": ("Anneal/Mod", b"import Trusted.Core\n"),
+        }
+
+        def lay_out(root: Path, fetched_at: float) -> set[Path]:
+            files: set[Path] = set()
+            for rel, (rel_mod, text) in sources.items():
+                self._write_file_at(root / rel, text, t_checkout)
+                files.update(
+                    self._write_lake_built_module(
+                        root / ".lake/build/lib/lean", rel_mod, text, t_built, fetched_at=fetched_at
+                    ).values()
+                )
+            return files
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = lay_out(root, t_fetched)
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            # Fetched in the very instant the source was written still counts.
+            for path in (root / ".lake/build/lib/lean").rglob("*.trace"):
+                os.utime(path, (t_checkout, t_checkout))
+            for path in (root / ".lake/build/lib/lean").rglob("*.hash"):
+                os.utime(path, (t_checkout, t_checkout))
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            # A later edit is newer than the restore: the module is stale again, and an
+            # edited `Trusted` module takes its dependents with it.
+            self._write_file_at(root / "theory/Anneal/Mod.lean", b"import Trusted.Core\ndef m := 1\n", t_edit)
+            removed = set(suite.clean_stale_oleans(root))
+            self.assertEqual({p.name.split(".")[0] for p in removed}, {"Mod"})
+            self.assertTrue(removed < files)
+            self._write_file_at(root / "trusted/lean/Trusted/Core.lean", b"def core := 2\n", t_edit)
+            self.assertEqual(set(suite.clean_stale_oleans(root)), files - removed)
+
+        # A cache seeded from another checkout carries fetch traces that predate this
+        # checkout's sources: nothing ties them to these sources, so the mtime verdict stands.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            files = lay_out(root, t_built + 60)
+            self.assertEqual(set(suite.clean_stale_oleans(root)), files)
+
+        # A fetch trace is trusted on the same terms as a build trace: private files only,
+        # and a sidecar that still matches the output the trace names.
+        for name in ("trace_hard_linked", "sidecar_mismatch", "inputs_present_on_synthetic_trace"):
+            with self.subTest(tampering=name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                files = lay_out(root, t_fetched)
+                mod_trace = root / ".lake/build/lib/lean/Anneal/Mod.trace"
+                if name == "trace_hard_linked":
+                    os.link(mod_trace, root / "other_tree.trace")
+                elif name == "sidecar_mismatch":
+                    self._write_file_at(
+                        root / ".lake/build/lib/lean/Anneal/Mod.olean.hash", b"0123456789abcdef", t_fetched
+                    )
+                else:
+                    doc = json.loads(mod_trace.read_text(encoding="utf-8"))
+                    doc["inputs"] = [["options", "00000000000006bb"]]
+                    self._write_file_at(mod_trace, json.dumps(doc).encode("utf-8"), t_fetched)
+                removed = set(suite.clean_stale_oleans(root))
+                self.assertEqual({p.name.split(".")[0] for p in removed}, {"Mod"})
+
+    def test_clean_stale_oleans_is_stable_after_an_incremental_trusted_rebuild(self) -> None:
+        # Lake rebuilds only the importers of an edited module. After `Trusted/Edited.lean`
+        # changes, the unrelated `Trusted/Leaf.olean` legitimately stays older than the newest
+        # `trusted/lean` source forever; comparing every `Trusted` `.olean` with that newest
+        # source would wipe the whole root on every later run. No Lake records are involved.
+        t_first_build, t_edit, t_rebuild = 1_700_000_000.0, 1_700_000_500.0, 1_700_001_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lib = root / ".lake/build/lib/lean"
+            self._write_file_at(root / "trusted/lean/Trusted/Leaf.lean", b"def leaf := 0\n", t_first_build - 100)
+            self._write_file_at(root / "trusted/lean/Trusted/Edited.lean", b"def edited := 2\n", t_edit)
+            self._write_file_at(root / "theory/Anneal/Mod.lean", b"import Trusted.Edited\n", t_first_build - 100)
+            self._write_file_at(root / "theory/Anneal/Indep.lean", b"import Trusted.Leaf\n", t_first_build - 100)
+            leaf = self._write_file_at(lib / "Trusted/Leaf.olean", b"x", t_first_build)
+            indep = self._write_file_at(lib / "Anneal/Indep.olean", b"x", t_first_build)
+            edited = self._write_file_at(lib / "Trusted/Edited.olean", b"x", t_rebuild)
+            mod = self._write_file_at(lib / "Anneal/Mod.olean", b"x", t_rebuild)
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+            self.assertTrue(all(p.is_file() for p in (leaf, indep, edited, mod)))
+            # Once a `Trusted` source is newer than its own `.olean` (and nothing proves it
+            # unchanged), the whole root is stale against `Trusted`.
+            self._write_file_at(root / "trusted/lean/Trusted/Leaf.lean", b"def leaf := 1\n", t_rebuild + 100)
+            self.assertEqual(set(suite.clean_stale_oleans(root)), {leaf, indep, edited, mod})
+
+    def test_clean_stale_oleans_unreadable_and_symlinked_artifacts(self) -> None:
+        t_built, t_checkout = 1_700_000_000.0, 1_700_000_500.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lib = root / ".lake/build/lib/lean"
+            outside = self._write_file_at(root / "elsewhere/Linked.olean", b"x", t_built)
+            for mod in ("Dangling", "Linked", "Fresh"):
+                self._write_file_at(root / f"theory/Anneal/{mod}.lean", b"def x := 1\n", t_built - 100)
+            fresh = self._write_file_at(lib / "Anneal/Fresh.olean", b"x", t_built)
+            # A dangling `.olean` can never be loaded: the module is stale even though its
+            # source is older than everything, and so are its readable companions.
+            dangling = lib / "Anneal/Dangling.olean"
+            dangling.symlink_to(root / "elsewhere/missing.olean")
+            dangling_ilean = self._write_file_at(lib / "Anneal/Dangling.ilean", b"x", t_built)
+            # A symlinked `.olean` is judged by its target and, when stale, only unlinked.
+            linked = lib / "Anneal/Linked.olean"
+            linked.symlink_to(outside)
+            self.assertEqual(suite.clean_stale_oleans(root), [dangling_ilean, dangling])
+            self.assertFalse(os.path.lexists(dangling))
+            self.assertTrue(linked.is_symlink() and fresh.is_file())
+            self._write_file_at(root / "theory/Anneal/Linked.lean", b"def x := 2\n", t_checkout)
+            self.assertEqual(suite.clean_stale_oleans(root), [linked])
+            self.assertFalse(os.path.lexists(linked))
+            self.assertTrue(outside.is_file() and fresh.is_file())
+
+            # An unreadable `Trusted` `.olean` makes the whole root stale against `Trusted`.
+            broken_trusted = lib / "Trusted/Core.olean"
+            broken_trusted.parent.mkdir(parents=True)
+            broken_trusted.symlink_to(root / "elsewhere/missing.olean")
+            self.assertEqual(set(suite.clean_stale_oleans(root)), {broken_trusted, fresh})
+
+    def test_preflight_stale_olean_guard_runs_once_before_lake_steps_and_never_aborts_the_suite(self) -> None:
+        events: list[str] = []
+
+        def fake_run_step(name: str, category: str, cmd: list[str], cwd: Path, timeout_sec: int = 900, **_kw):
+            events.append(f"step:{name}")
+            return {
+                "name": name,
+                "category": category,
+                "status": "PASS",
+                "exit_code": 0,
+                "duration_sec": 0.0,
+                "command": " ".join(cmd),
+                "audit_tags": [],
+                "failure_excerpt": "",
+            }
+
+        def fake_clean(repo_root: Path) -> list[Path]:
+            events.append(f"clean:{repo_root}")
+            return []
+
+        def failing_clean(repo_root: Path) -> list[Path]:
+            events.append("clean:boom")
+            raise RuntimeError("boom")
+
+        def run(profile: str, clean) -> tuple[int, str]:
+            events.clear()
+            stderr = io.StringIO()
+            with (
+                tempfile.TemporaryDirectory() as tmp,
+                mock.patch.object(suite, "_run_step", fake_run_step),
+                mock.patch.object(suite, "clean_stale_oleans", clean),
+                contextlib.redirect_stderr(stderr),
+            ):
+                code, dashboard, _md = suite.run_suite_and_generate_dashboard(
+                    repo_root=REPO_ROOT, profile=profile, state_dir=Path(tmp) / "state"
+                )
+            self.assertEqual(
+                dashboard["pillar_2_correctness_and_correspondence"]["steps_total"],
+                len(suite.build_suite_steps(REPO_ROOT, profile)),
+            )
+            return code, stderr.getvalue()
+
+        for profile in ("quick", "nightly"):
+            code, err = run(profile, fake_clean)
+            self.assertEqual(code, 0)
+            self.assertEqual(err, "")
+            # Exactly once, on the suite's repo root, before the first step runs.
+            self.assertEqual(events[0], f"clean:{REPO_ROOT}")
+            self.assertEqual([e for e in events if e.startswith("clean:")], [events[0]])
+            self.assertEqual(
+                events[1:], [f"step:{name}" for name, _c, _cmd, _t in suite.build_suite_steps(REPO_ROOT, profile)]
+            )
+        # `census-only` runs no Lake/Lean step, so the build directories are left alone.
+        code, _err = run("census-only", fake_clean)
+        self.assertEqual(code, 0)
+        self.assertFalse(any(e.startswith("clean:") for e in events))
+        # The guard is best-effort: its failure is reported and every step still runs.
+        code, err = run("quick", failing_clean)
+        self.assertEqual(code, 0)
+        self.assertIn("stale .olean pre-flight failed (RuntimeError: boom)", err)
+        self.assertEqual(events[0], "clean:boom")
+        self.assertEqual(len(events), 1 + len(suite.build_suite_steps(REPO_ROOT, "quick")))
+
+    def test_preflight_stale_olean_guard_reports_what_it_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_file_at(root / "theory/Anneal/Stale.lean", b"def s := 1\n", 1_700_000_500.0)
+            stale = self._write_file_at(root / ".lake/build/lib/lean/Anneal/Stale.olean", b"x", 1_700_000_000.0)
+            ilean = self._write_file_at(root / ".lake/build/lib/lean/Anneal/Stale.ilean", b"x", 1_700_000_000.0)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                removed = suite._preflight_clean_stale_oleans(root)
+            self.assertEqual(removed, [ilean, stale])
+            self.assertEqual(
+                stderr.getvalue(),
+                "[nightly-suite] stale .olean pre-flight removed 2 artifact file(s) of 1 module(s): "
+                ".lake/build/lib/lean/Anneal/Stale.olean\n",
+            )
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(suite._preflight_clean_stale_oleans(root), [])
+            self.assertEqual(stderr.getvalue(), "")
+
     def test_probe_ram_ceiling_and_lean_miri_spec_single_thread_right_sizing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -3182,6 +3664,170 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         )
         self.assertEqual(other_low["LEAN_NUM_THREADS"], "4")
 
+    def test_lean_miri_spec_right_sizing_honors_wrapper_planned_memory_max(self) -> None:
+        # `anneal-lean-run` runs the step in its own scope with `MemoryMax=<memory_max_mb>M`
+        # (5712M on an 8 GiB capsule). The suite process is outside that scope, so on a host
+        # whose own RAM looks ample only the wrapper's `--probe --json` reveals the cap.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "bin/anneal-lean-run"
+            argv_log = root / "argv.jsonl"
+            reply = root / "reply.txt"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, os, sys
+                    args = sys.argv[1:]
+                    with open({str(argv_log)!r}, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(args) + "\\n")
+                    if "--probe" in args:
+                        reply = open({str(reply)!r}, encoding="utf-8").read()
+                        if reply.startswith("exit:"):
+                            sys.exit(int(reply[5:]))
+                        sys.stdout.write(reply)
+                        sys.exit(0)
+                    cmd = args[args.index("--") + 1:]
+                    os.execvp(cmd[0], cmd)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            argv_log.write_text("", encoding="utf-8")
+
+            def probes() -> list[list[str]]:
+                return [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+
+            step_cmd = [
+                str(wrapper),
+                "--mode",
+                "build",
+                "--concurrency",
+                "1",
+                "--timeout",
+                "1800",
+                "--",
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec",
+            ]
+            # The probe forwards exactly the wrapper's own options and never the command.
+            reply.write_text(json.dumps({"memory_max_mb": 5712, "threads": 8}), encoding="utf-8")
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 5712)
+            self.assertEqual(
+                probes(), [["--mode", "build", "--concurrency", "1", "--timeout", "1800", "--probe", "--json"]]
+            )
+            joined = [str(wrapper), "--mode=build", "--time", "60", "--no-slot-lock", "lake", "build"]
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(joined), 5712)
+            self.assertEqual(
+                probes()[-1], ["--mode=build", "--time", "60", "--no-slot-lock", "--probe", "--json"]
+            )
+            # Anything but a positive integer `memory_max_mb` from a successful probe is no answer.
+            for bad in (
+                "exit:3",
+                "not json",
+                "[]",
+                json.dumps({"threads": 4}),
+                json.dumps({"memory_max_mb": "5712"}),
+                json.dumps({"memory_max_mb": 0}),
+                json.dumps({"memory_max_mb": True}),
+                json.dumps({"memory_max_mb": 5712.5}),
+            ):
+                reply.write_text(bad, encoding="utf-8")
+                self.assertIsNone(suite._probe_lean_run_memory_max_mib(step_cmd), bad)
+            self.assertIsNone(suite._probe_lean_run_memory_max_mib(["lake", "build", "LeanMiriSpec"]))
+            self.assertIsNone(
+                suite._probe_lean_run_memory_max_mib([str(root / "missing/anneal-lean-run"), "--", "lake"])
+            )
+
+            def threads(step: str, cmd: list[str] | None, **kwargs: object) -> str | None:
+                env = suite._build_step_env(step, base_env={"PATH": "/usr/bin"}, cmd=cmd, cwd=root, **kwargs)
+                return env.get("LEAN_NUM_THREADS")
+
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536):
+                reply.write_text(json.dumps({"memory_max_mb": 5712}), encoding="utf-8")
+                self.assertEqual(threads("lake_build_lean_miri_spec", step_cmd), "1")
+                reply.write_text(json.dumps({"memory_max_mb": 10239}), encoding="utf-8")
+                self.assertEqual(threads("lake_build_lean_miri_spec", step_cmd), "1")
+                reply.write_text(json.dumps({"memory_max_mb": 10240}), encoding="utf-8")
+                self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd))
+                # A failed wrapper probe falls back to the host/cgroup ceiling alone.
+                reply.write_text("exit:3", encoding="utf-8")
+                self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd))
+                # Neither an unwrapped command, another step, nor an explicit ceiling asks the wrapper.
+                reply.write_text(json.dumps({"memory_max_mb": 5712}), encoding="utf-8")
+                asked = len(probes())
+                self.assertIsNone(threads("lake_build_lean_miri_spec", ["lake", "build", "LeanMiriSpec"]))
+                self.assertIsNone(threads("lake_build_lean_miri_spec", None))
+                self.assertIsNone(threads("lake_build_core_theory", step_cmd))
+                self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd, effective_ram_mib=32768))
+                self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd, effective_ram_mib=None))
+                self.assertEqual(len(probes()), asked)
+            # The tightest ceiling wins in either direction, and an unreadable host probe
+            # still leaves the wrapper's answer.
+            reply.write_text(json.dumps({"memory_max_mb": 157253}), encoding="utf-8")
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=5712):
+                self.assertEqual(threads("lake_build_lean_miri_spec", step_cmd), "1")
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=None):
+                self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd))
+                reply.write_text(json.dumps({"memory_max_mb": 5712}), encoding="utf-8")
+                self.assertEqual(threads("lake_build_lean_miri_spec", step_cmd), "1")
+
+            # End to end: `_run_step` hands the wrapped step `LEAN_NUM_THREADS=1` exactly when
+            # the wrapper's planned cap is below 10 GiB.
+            out_file = root / "threads.txt"
+            dump = (
+                "import os, pathlib; "
+                f"pathlib.Path({str(out_file)!r}).write_text(os.environ.get('LEAN_NUM_THREADS', '<unset>'))"
+            )
+            run_cmd = [str(wrapper), "--mode", "build", "--timeout", "30", "--", sys.executable, "-c", dump]
+            for mem_max_mb, expected in ((5712, "1"), (157253, "7")):
+                reply.write_text(json.dumps({"memory_max_mb": mem_max_mb}), encoding="utf-8")
+                with (
+                    mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536),
+                    mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "7"}),
+                ):
+                    res = suite._run_step(
+                        name="lake_build_lean_miri_spec",
+                        category="cat2_correspondence_suites",
+                        cmd=run_cmd,
+                        cwd=root,
+                        timeout_sec=30,
+                    )
+                self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
+                self.assertEqual(out_file.read_text(encoding="utf-8"), expected)
+
+    def test_resolve_anneal_lean_run_anchors_relative_candidates(self) -> None:
+        # Steps run with `cwd=repo_root`; a relative `ANNEAL_LEAN_RUN` or `PATH` entry that
+        # was found executable from the current directory must not be re-resolved there.
+        def make_exe(path: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            path.chmod(0o755)
+            return path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            repo = root / "repo"
+            repo.mkdir()
+            env_wrapper = make_exe(root / "custom/anneal-lean-run")
+            path_wrapper = make_exe(root / "bin/anneal-lean-run")
+            old_cwd = os.getcwd()
+            os.chdir(root)
+            try:
+                from_env = suite._resolve_anneal_lean_run(
+                    repo, env={"ANNEAL_LEAN_RUN": "custom/anneal-lean-run", "PATH": ""}
+                )
+                from_path = suite._resolve_anneal_lean_run(repo, env={"PATH": "bin"})
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(from_env, env_wrapper)
+            self.assertEqual(from_path, path_wrapper)
+
     def test_tracecheck_import_isolation_matches_check_trusted_downstream_targets(self) -> None:
         tc_path = REPO_ROOT / "theory/Anneal/Rustc/V2026_06_01/TraceCheck.lean"
         tc_imports = suite._lean_header_imports(tc_path)
@@ -3218,6 +3864,31 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             [imp for imp in lower_imports if not imp.startswith(("Init", "Std"))],
             json.loads(m_lower.group(1)),
         )
+
+        # The re-export keeps `SymbolicEval` importing `Lower` (never the reverse), and neither
+        # the consumers of the moved names nor the memory-slimmed `MirLiftCore` gained or lost
+        # an import: every registered header is still matched exactly.
+        self.assertNotIn("Anneal.Rustc.V2026_06_01.SymbolicEval", lower_imports)
+        for module in (
+            "Anneal.Rustc.V2026_06_01.SymbolicEval",
+            "Anneal.Rustc.V2026_06_01.SymReflect",
+            "Anneal.MirFuelFree",
+            "Anneal.MirLiftCore",
+        ):
+            entry = re.search(
+                rf'\("{re.escape(module)}",\s*"([^"]+)",\s*(\[[^\]]*\]),\s*"theory"\)', check_trusted_src
+            )
+            self.assertIsNotNone(entry, f"{module} missing from check_trusted.py DOWNSTREAM_TARGETS")
+            assert entry is not None
+            registered = json.loads(entry.group(2))
+            imports = suite._lean_header_imports(REPO_ROOT / entry.group(1))
+            self.assertIsNotNone(imports, module)
+            assert imports is not None
+            self.assertEqual(
+                [imp for imp in imports if imp in registered or not imp.startswith(("Init", "Std"))],
+                registered,
+                module,
+            )
 
     def test_domain_integration_tests_anneal_difftest_config_and_timeout_invariants(self) -> None:
         nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")

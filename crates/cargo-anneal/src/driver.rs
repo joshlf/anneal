@@ -2633,7 +2633,7 @@ example :
     valueValidForTy sampleAdtLayoutTable
       { kind := .adt "my_crate::UnitMarker" [], layoutIdx := 1 }
       .unit :=
-  ⟨trivial, trivial⟩
+  ⟨rfl, rfl⟩
 
 example :
     evalRvalue
@@ -2944,9 +2944,10 @@ theorem callerFfiAndLen_verified :
   cases ans with
   | returned retVal memAfter =>
     rcases h_post with ⟨_, h_ret, _⟩
+    obtain ⟨bits, h_lt, rfl⟩ := h_ret
     intro r m h_out
     cases h_out
-    exact ⟨trivial, h_ret⟩
+    exact ⟨trivial, bits, h_lt, rfl⟩
   | panicked memAfter =>
     exact False.elim h_post
   | aborted =>
@@ -3238,9 +3239,10 @@ theorem verified : ModularVerificationResult Obligations.CrateA.caller_ffi_and_l
   cases ans with
   | returned retVal memAfter =>
     rcases h_post with ⟨_, h_ret, _⟩
+    obtain ⟨bits, h_lt, rfl⟩ := h_ret
     intro r m h_out
     cases h_out
-    exact ⟨trivial, h_ret⟩
+    exact ⟨trivial, bits, h_lt, rfl⟩
   | panicked memAfter =>
     exact False.elim h_post
   | aborted =>

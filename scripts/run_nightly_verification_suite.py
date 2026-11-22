@@ -34,6 +34,12 @@ Profiles (`--profile`):
                `cargo-anneal` end-to-end suites, and real-world Fuchsia/Fxfs example
                crate verifications.
 
+Step environment: every step runs with `LAKE_ARTIFACT_CACHE=true` and
+`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_lean_miri_spec` with `LEAN_NUM_THREADS=1`
+when its effective RAM ceiling is below 10 GiB. Before their first step, `quick` and
+`nightly` remove stale Lean build artifacts from `.lake/build/lib/lean/` and
+`examples/.lake/build/lib/lean/` (`clean_stale_oleans`) and report them on stderr.
+
 Exit codes:
   0  All executed suite steps passed and zero active test/build regressions occurred.
   1  Internal script or configuration error.
@@ -54,6 +60,8 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -4916,24 +4924,48 @@ LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB = 10240
 # `None` (representing an unreadable `/proc` / cgroup probe).
 _RAM_UNSET: object = object()
 
-# Ordered longest-first so `.olean.server` / `.olean.private` / `.olean.hash` match
-# before `.olean`.
-_LEAN_ARTIFACT_SUFFIXES: tuple[str, ...] = (
-    ".olean.server.hash",
-    ".olean.private.hash",
-    ".olean.server",
-    ".olean.private",
-    ".olean.hash",
-    ".ilean.hash",
-    ".olean",
-    ".ilean",
-    ".trace",
-)
+# Per-module files Lake keeps under `.lake/build/lib/lean/` (`<Mod>.<suffix>`): the
+# primary artifacts loaded through `LEAN_PATH`, the module-system IR companions, the
+# module archive, and Lake's `.trace` / `.hash` bookkeeping for each of them.
 _LEAN_PRIMARY_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
     (".olean", ".olean.server", ".olean.private", ".ilean")
 )
+_LEAN_OLEAN_PART_SUFFIXES: frozenset[str] = frozenset((".olean", ".olean.server", ".olean.private"))
+_LEAN_ARTIFACT_SUFFIXES: frozenset[str] = frozenset(
+    (
+        *_LEAN_PRIMARY_ARTIFACT_SUFFIXES,
+        ".ir",
+        ".ir.sig",
+        ".ltar",
+        ".trace",
+        *(f"{sfx}.hash" for sfx in (*_LEAN_PRIMARY_ARTIFACT_SUFFIXES, ".ir", ".ir.sig", ".ltar")),
+    )
+)
+_TRUSTED_LIB = "Trusted"
 # Vendored upstream `Miri` modules (`lean-miri/vendor/Miri`) never import `Trusted`.
 _TRUSTED_INDEPENDENT_LIBS: frozenset[str] = frozenset(("Miri",))
+# Source roots tried (after the `lakefile.toml` `srcDir` of the module's library) when
+# mapping `<Mod>.olean` back to `<Mod>.lean` in synthetic or partial trees.
+_LEAN_SOURCE_FALLBACK_DIRS: tuple[str, ...] = (
+    "trusted/lean",
+    "theory",
+    "minirust/lean",
+    "lean-miri/lean",
+    "lean-miri/vendor",
+    "examples",
+    "examples/refinement",
+    "examples/step-result",
+    "examples/pass",
+    "examples/mir",
+)
+
+# Lake's 64-bit content hash (`Lake.Hash`): `MurmurHash64A` with seed 11 (`String.hash` /
+# `ByteArray.hash`) mixed into `Hash.nil` (`Hash.ofHashable`), printed as 16 hex digits.
+_LAKE_HASH_MASK = (1 << 64) - 1
+_LAKE_HASH_MUL = 0xC6A4A7935BD1E995
+_LAKE_HASH_SEED = 11
+_LAKE_HASH_NIL = 1723
+_LAKE_HASH_HEX_RE = re.compile(r"[0-9a-f]{16}")
 
 
 _LEAN_RUN_VALUE_OPTS: frozenset[str] = frozenset(
@@ -5101,11 +5133,13 @@ def _resolve_anneal_lean_run(
     """
     env_map: Mapping[str, str] = os.environ if env is None else env
 
+    # Steps run with `cwd=repo_root`, so a relative `ANNEAL_LEAN_RUN` or `PATH` hit is
+    # anchored here, against the directory it was just found executable in.
     env_lean_run = env_map.get("ANNEAL_LEAN_RUN", "").strip()
     if env_lean_run:
         env_path = Path(env_lean_run)
         if _is_executable_file(env_path):
-            return env_path
+            return Path(os.path.abspath(env_path))
 
     raw_path = env_map.get("PATH", "")
     if raw_path:
@@ -5113,7 +5147,7 @@ def _resolve_anneal_lean_run(
         if path_lean_run:
             found_path = Path(path_lean_run)
             if _is_executable_file(found_path):
-                return found_path
+                return Path(os.path.abspath(found_path))
 
     home_dir = home
     if home_dir is None:
@@ -5244,12 +5278,60 @@ def _probe_effective_ram_ceiling_mib(
     return min(candidates_mib) if candidates_mib else None
 
 
+def _probe_lean_run_memory_max_mib(
+    cmd: list[str],
+    *,
+    env: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+    timeout_sec: float = 20.0,
+) -> int | None:
+    """`MemoryMax` (MiB) that the `anneal-lean-run` wrapper of `cmd` plans for the
+    scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
+    --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped
+    or the probe fails. The suite process is outside that scope, so its own cgroup
+    hierarchy cannot show this cap."""
+    if not _is_lean_run_wrapped(cmd):
+        return None
+    opts: list[str] = []
+    i, n = 1, len(cmd)
+    while i < n:
+        tok = cmd[i]
+        if tok == "--" or tok == "-" or not tok.startswith("-"):
+            break
+        opts.append(tok)
+        if "=" not in tok and _resolve_lean_run_opt(tok) in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
+            opts.append(cmd[i + 1])
+            i += 1
+        i += 1
+    try:
+        out = subprocess.run(
+            [cmd[0], *opts, "--probe", "--json"],
+            cwd=None if cwd is None else str(cwd),
+            env=None if env is None else dict(env),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=timeout_sec,
+            check=False,
+        )
+        limits = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    mem_max = limits.get("memory_max_mb") if isinstance(limits, dict) else None
+    if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
+        return mem_max
+    return None
+
+
 def _build_step_env(
     step_name: str,
     *,
     base_env: Mapping[str, str] | None = None,
     env_overrides: Mapping[str, str] | None = None,
     effective_ram_mib: int | None | object = _RAM_UNSET,
+    cmd: list[str] | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, str]:
     """Build an isolated subprocess environment for suite step `step_name`.
 
@@ -5257,19 +5339,28 @@ def _build_step_env(
     - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
       so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
     - For `lake_build_lean_miri_spec`, injects `LEAN_NUM_THREADS=1` whenever the
-      effective host/cgroup RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while
-      preserving normal multi-threaded builds on `>= 10 GiB` hosts.
+      effective RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while preserving normal
+      multi-threaded builds on `>= 10 GiB` hosts. Unless `effective_ram_mib` is given,
+      the ceiling is the tightest of the host/cgroup probe and, for an
+      `anneal-lean-run`-wrapped step `cmd`, the `MemoryMax` the wrapper plans for it.
     - Explicit `env_overrides` take final precedence.
     """
     env = dict(os.environ if base_env is None else base_env)
     _ensure_toolchain_path(env)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
     if step_name == "lake_build_lean_miri_spec":
-        ram_mib = (
-            _probe_effective_ram_ceiling_mib()
-            if effective_ram_mib is _RAM_UNSET
-            else effective_ram_mib
-        )
+        if effective_ram_mib is _RAM_UNSET:
+            ceilings = [
+                mib
+                for mib in (
+                    _probe_effective_ram_ceiling_mib(),
+                    _probe_lean_run_memory_max_mib(cmd, env=env, cwd=cwd) if cmd else None,
+                )
+                if mib is not None
+            ]
+            ram_mib: int | None | object = min(ceilings) if ceilings else None
+        else:
+            ram_mib = effective_ram_mib
         if (
             isinstance(ram_mib, int)
             and not isinstance(ram_mib, bool)
@@ -5281,214 +5372,358 @@ def _build_step_env(
     return env
 
 
-def _lake_lib_src_dirs(lake_root: Path, repo_root: Path) -> tuple[dict[str, list[Path]], list[Path]]:
-    """Map top-level Lean library names to source directories from `lakefile.toml`,
-    plus ordered fallback source roots for synthetic/partial trees."""
-    by_lib: dict[str, list[Path]] = {}
-    lakefile = lake_root / "lakefile.toml"
-    if lakefile.is_file():
-        try:
-            cfg = tomllib.loads(lakefile.read_text(encoding="utf-8"))
-            for lib in cfg.get("lean_lib", []):
-                if not isinstance(lib, dict) or not lib.get("name"):
-                    continue
-                src_dir = (lake_root / str(lib.get("srcDir", "."))).resolve()
-                lib_name = str(lib["name"])
-                by_lib.setdefault(lib_name, [])
-                if src_dir not in by_lib[lib_name]:
-                    by_lib[lib_name].append(src_dir)
-                roots = lib.get("roots")
-                if isinstance(roots, list):
-                    for r in roots:
-                        if isinstance(r, str) and r:
-                            top = r.split(".", 1)[0]
-                            by_lib.setdefault(top, [])
-                            if src_dir not in by_lib[top]:
-                                by_lib[top].append(src_dir)
-        except (OSError, ValueError, TypeError, KeyError):
-            pass
+def _lake_bytes_hash_hex(data: bytes) -> str:
+    """Lake's `Hash.ofByteArray data` (also `Hash.ofString` of UTF-8 `data`), as the
+    16-digit lowercase hex Lake writes to `.trace` and `.hash` files."""
+    mask, mul = _LAKE_HASH_MASK, _LAKE_HASH_MUL
+    size = len(data)
+    body = size & ~7
+    h = (_LAKE_HASH_SEED ^ (size * mul)) & mask
+    for (k,) in struct.iter_unpack("<Q", memoryview(data)[:body]):
+        k = (k * mul) & mask
+        k ^= k >> 47
+        h = ((h ^ ((k * mul) & mask)) * mul) & mask
+    if body != size:
+        h = ((h ^ int.from_bytes(data[body:], "little")) * mul) & mask
+    h ^= h >> 47
+    h = (h * mul) & mask
+    h ^= h >> 47
+    # `mixHash Hash.nil h` (`lean_uint64_mix_hash`).
+    k = (h * mul) & mask
+    k ^= k >> 47
+    k ^= mul
+    return f"{((_LAKE_HASH_NIL ^ k) * mul) & mask:016x}"
 
-    fallback_rels: tuple[str, ...] = (
-        "trusted/lean",
-        "theory",
-        "minirust/lean",
-        "lean-miri/lean",
-        "lean-miri/vendor",
-        "examples",
-        "examples/refinement",
-        "examples/step-result",
-        "examples/pass",
-        "examples/mir",
-    )
-    fallbacks = [(repo_root / rel).resolve() for rel in fallback_rels]
+
+def _lake_text_hash_hex(data: bytes) -> str:
+    """Lake's `Hash.ofText` (`computeTextFileHash`): the hash of `data` with `\\r\\n`
+    normalized to `\\n`, which is how Lake hashes a module's `.lean` source."""
+    return _lake_bytes_hash_hex(data.replace(b"\r\n", b"\n"))
+
+
+def _lake_trace_recorded_hashes(
+    trace_text: str, rel_mod: str
+) -> tuple[str | None, dict[str, str]] | None:
+    """`(source_text_hash, {olean_part_suffix: content_hash})` recorded by Lake in the
+    `.trace` of module `rel_mod` (`Lib/Sub/Mod`), or `None` if the trace is malformed.
+
+    A trace Lake wrote after building the module (`BuildMetadata.ofBuild`) must name
+    exactly one `<...>/<rel_mod>.lean` input. The synthetic trace Lake writes when it
+    fetches the module's artifacts from its cache (`BuildMetadata.ofFetch`:
+    `"synthetic": true`, no `inputs`) records no source hash: `source_text_hash` is
+    `None`. Either kind must name a well-formed `.olean` output."""
+    try:
+        doc = json.loads(trace_text)
+    except ValueError:
+        return None
+    if not isinstance(doc, dict):
+        return None
+    inputs, outputs = doc.get("inputs"), doc.get("outputs")
+    if not isinstance(inputs, list) or not isinstance(outputs, dict):
+        return None
+    src_hash: str | None = None
+    if not (doc.get("synthetic") is True and not inputs):
+        src_name = f"{rel_mod}.lean"
+        src_hashes = [
+            item[1]
+            for item in inputs
+            if isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and (item[0] == src_name or item[0].replace("\\", "/").endswith("/" + src_name))
+        ]
+        if (
+            len(src_hashes) != 1
+            or not isinstance(src_hashes[0], str)
+            or not _LAKE_HASH_HEX_RE.fullmatch(src_hashes[0])
+        ):
+            return None
+        src_hash = src_hashes[0]
+    descrs = outputs.get("o")
+    if isinstance(descrs, str):
+        descrs = [descrs]
+    if not isinstance(descrs, list):
+        return None
+    olean_hashes: dict[str, str] = {}
+    for descr in descrs:
+        if not isinstance(descr, str):
+            return None
+        content_hash, _dot, ext = descr.partition(".")
+        suffix = f".{ext}"
+        if (
+            not _LAKE_HASH_HEX_RE.fullmatch(content_hash)
+            or suffix not in _LEAN_OLEAN_PART_SUFFIXES
+            or suffix in olean_hashes
+        ):
+            return None
+        olean_hashes[suffix] = content_hash
+    if ".olean" not in olean_hashes:
+        return None
+    return src_hash, olean_hashes
+
+
+def _private_regular_file_stat(path: str) -> os.stat_result | None:
+    """`lstat` of `path` if it is a regular file with a single hard link, else `None`.
+    Lake never links its `.trace` / `.hash` bookkeeping files, so a second link means
+    another tree (a `cp -al`-seeded cache) can rewrite the file in place."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    return st if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 else None
+
+
+def _lake_records_prove_source_unchanged(
+    rel_mod: str, arts: Mapping[str, str], src_path: str, src_mtime_ns: int
+) -> bool:
+    """Whether Lake's own bookkeeping shows that module `rel_mod`'s `.olean` parts were
+    built from exactly the current content of `src_path` (last modified at
+    `src_mtime_ns`), although the `.olean` is older than the source.
+
+    Lake hard-links cached artifacts into `.lake/build/lib/lean/` (`LAKE_RESTORE_ARTIFACTS`),
+    so a restored `.olean` keeps the mtime of whichever checkout first built it, and a
+    source that `git` merely rewrote looks newer although nothing changed. Lake itself
+    decides freshness by content hash, and so does this check. It accepts the module only
+    on positive evidence, when all of the following hold:
+
+    - the module's `.trace` is a private regular file naming its `.olean` parts with
+      hashes `h_out`;
+    - every `.olean` part on disk is one the trace names, and its private `.hash`
+      sidecar (the hash Lake trusts for the file) is not older than it and equals `h_out`;
+    - the trace ties those parts to this source: a build trace names the source with
+      Lake's text hash of its current content; a cache-fetch trace names no input, but
+      Lake computed the module's input hash from the source when it wrote the trace, so
+      the trace must not be older than the source.
+    """
+    trace_path = arts.get(".trace")
+    if trace_path is None:
+        return False
+    trace_st = _private_regular_file_stat(trace_path)
+    if trace_st is None:
+        return False
+    try:
+        with open(trace_path, encoding="utf-8", errors="replace") as fh:
+            recorded = _lake_trace_recorded_hashes(fh.read(), rel_mod)
+    except OSError:
+        return False
+    if recorded is None:
+        return False
+    src_hash, olean_hashes = recorded
+    if {sfx for sfx in arts if sfx in _LEAN_OLEAN_PART_SUFFIXES} != set(olean_hashes):
+        return False
+    for suffix, content_hash in olean_hashes.items():
+        sidecar_path = arts.get(f"{suffix}.hash")
+        if sidecar_path is None:
+            return False
+        sidecar_st = _private_regular_file_stat(sidecar_path)
+        if sidecar_st is None:
+            return False
+        try:
+            if sidecar_st.st_mtime_ns < os.stat(arts[suffix]).st_mtime_ns:
+                return False
+            with open(sidecar_path, encoding="ascii", errors="replace") as fh:
+                if fh.read(64).strip() != content_hash:
+                    return False
+        except OSError:
+            return False
+    if src_hash is None:
+        return trace_st.st_mtime_ns >= src_mtime_ns
+    try:
+        with open(src_path, "rb") as fh:
+            return _lake_text_hash_hex(fh.read()) == src_hash
+    except OSError:
+        return False
+
+
+def _lake_lib_src_dirs(lake_root: Path, repo_root: Path) -> tuple[dict[str, list[str]], list[str]]:
+    """Map top-level Lean module-name components to source directories from
+    `lakefile.toml` (`lean_lib` names and `roots`), plus ordered fallback source roots
+    for synthetic/partial trees."""
+    by_lib: dict[str, list[str]] = {}
+
+    def add(top: str, src_dir: str) -> None:
+        dirs = by_lib.setdefault(top, [])
+        if src_dir not in dirs:
+            dirs.append(src_dir)
+
+    try:
+        cfg = tomllib.loads((lake_root / "lakefile.toml").read_text(encoding="utf-8"))
+        libs = cfg.get("lean_lib", [])
+        for lib in libs if isinstance(libs, list) else []:
+            if not isinstance(lib, dict) or not lib.get("name"):
+                continue
+            src_dir = os.path.realpath(lake_root / str(lib.get("srcDir", ".")))
+            add(str(lib["name"]), src_dir)
+            roots = lib.get("roots")
+            for root_mod in roots if isinstance(roots, list) else []:
+                if isinstance(root_mod, str) and root_mod:
+                    add(root_mod.split(".", 1)[0], src_dir)
+    except (OSError, ValueError, TypeError, KeyError):
+        by_lib = {}
+    fallbacks = [os.path.realpath(repo_root / rel) for rel in _LEAN_SOURCE_FALLBACK_DIRS]
     return by_lib, fallbacks
 
 
 def _find_lean_source_for_module(
-    rel_mod: Path,
-    by_lib: dict[str, list[Path]],
-    fallbacks: list[Path],
-) -> Path | None:
-    top = rel_mod.parts[0]
-    rel_lean = Path(f"{rel_mod.as_posix()}.lean")
-    seen: set[Path] = set()
-    for base in (*by_lib.get(top, ()), *fallbacks):
+    rel_mod: str,
+    by_lib: Mapping[str, list[str]],
+    fallbacks: list[str],
+) -> tuple[str, int] | None:
+    """`(path, st_mtime_ns)` of the `.lean` source of module `rel_mod` (`Lib/Sub/Mod`)."""
+    rel_lean = f"{rel_mod}.lean"
+    seen: set[str] = set()
+    for base in (*by_lib.get(rel_mod.partition("/")[0], ()), *fallbacks):
         if base in seen:
             continue
         seen.add(base)
-        cand = base / rel_lean
+        cand = os.path.join(base, rel_lean)
         try:
-            if cand.is_file():
-                return cand
+            st = os.stat(cand)
         except OSError:
             continue
+        if stat.S_ISREG(st.st_mode):
+            return cand, st.st_mtime_ns
     return None
 
 
-def _newest_lean_mtime_ns(root_dir: Path) -> int | None:
-    """Return the newest `st_mtime_ns` among all `*.lean` files under `root_dir`,
-    or `None` if `root_dir` is absent or contains no `.lean` files."""
-    if not root_dir.is_dir():
+def _scan_lean_module_artifacts(lib_lean_dir: str) -> dict[str, dict[str, str]]:
+    """`{Lib/Sub/Mod: {suffix: path}}` for every `_LEAN_ARTIFACT_SUFFIXES` file under
+    `lib_lean_dir`, never descending into symlinked directories."""
+    modules: dict[str, dict[str, str]] = {}
+    stack = [(lib_lean_dir, "")]
+    while stack:
+        dir_path, prefix = stack.pop()
+        try:
+            with os.scandir(dir_path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append((entry.path, f"{prefix}{name}/"))
+                            continue
+                    except OSError:
+                        continue
+                    stem, dot, ext = name.partition(".")
+                    if stem and dot and (suffix := f".{ext}") in _LEAN_ARTIFACT_SUFFIXES:
+                        modules.setdefault(prefix + stem, {})[suffix] = entry.path
+        except OSError:
+            continue
+    return modules
+
+
+def _lean_module_artifact_mtime_ns(arts: Mapping[str, str]) -> int | None:
+    """Representative `st_mtime_ns` of a module's primary artifacts: its `.olean`, else
+    the oldest other primary artifact; `None` if one is unreadable (a broken symlink)."""
+    paths = (
+        [arts[".olean"]]
+        if ".olean" in arts
+        else [arts[sfx] for sfx in _LEAN_PRIMARY_ARTIFACT_SUFFIXES if sfx in arts]
+    )
+    try:
+        return min(os.stat(path).st_mtime_ns for path in paths)
+    except OSError:
         return None
-    newest: int | None = None
-    for dirpath, dirnames, filenames in os.walk(root_dir, followlinks=False):
-        dp = Path(dirpath)
-        dirnames[:] = [d for d in dirnames if not (dp / d).is_symlink()]
-        for fname in filenames:
-            if not fname.endswith(".lean"):
-                continue
-            try:
-                mtime_ns = (dp / fname).stat().st_mtime_ns
-            except OSError:
-                continue
-            if newest is None or mtime_ns > newest:
-                newest = mtime_ns
-    return newest
-
-
-def _split_lean_artifact_name(filename: str) -> tuple[str, str] | None:
-    for suffix in _LEAN_ARTIFACT_SUFFIXES:
-        if filename.endswith(suffix) and len(filename) > len(suffix):
-            return filename[: -len(suffix)], suffix
-    return None
 
 
 def clean_stale_oleans(repo_root: Path) -> list[Path]:
     """Pre-flight `.olean` freshness coherence guard across workspace Lake roots
     (`.` and `examples`).
 
-    Removes `.lake/build/lib/lean/<ModPath>.{olean,olean.server,olean.private,ilean}`
-    (and companion `.hash`/`.trace` files) when either:
-    1. Its corresponding `.lean` source file under `trusted/lean/`, `theory/`,
-       `minirust/lean/`, `lean-miri/`, or `examples/` has `mtime > olean_mtime`, or
-    2. Any `Trusted` `.olean` in that Lake root predates the newest
-       `trusted/lean/**/*.lean` source file (or a downstream `Trusted`-dependent
-       `.olean` itself predates the newest `trusted/lean/**/*.lean` source file).
+    A module `<Mod>` of `<lake_root>/.lake/build/lib/lean/` is stale, and every one of
+    its files there is removed (`.olean`, `.olean.server`, `.olean.private`, `.ilean`,
+    `.ir`, `.ir.sig`, `.ltar` and their `.hash` / `.trace` companions, so Lake rebuilds
+    it or restores it from its artifact cache), when either:
+
+    1. a primary artifact is unreadable, or its `.lean` source (under `trusted/lean/`,
+       `theory/`, `minirust/lean/`, `lean-miri/` or `examples/`) has `mtime > olean_mtime`
+       and Lake's own records do not prove the source unchanged
+       (`_lake_records_prove_source_unchanged`), or
+    2. it can depend on `Trusted` (any library but vendored `Miri`) and some `Trusted`
+       module of the same Lake root is stale by rule 1: every downstream `.olean` of
+       that root is then stale against `Trusted`.
+
+    Rule 1's check of Lake's records is what keeps the guard a no-op on coherent trees
+    whose mtimes are not: artifacts Lake restored by hard link, a cache seeded from another
+    worktree, or sources `git` rewrote without changing. Rule 2 deliberately compares
+    each `Trusted` `.olean` with its own source rather than with the newest
+    `trusted/lean/**/*.lean` file: Lake rebuilds only the importers of an edited module,
+    so every unrelated `Trusted` `.olean` legitimately stays older than that edit, and
+    comparing against it would wipe the whole root on every run from then on.
 
     Never follows directory symlinks or deletes anything outside
-    `<lake_root>/.lake/build/lib/lean/`. Fast no-op (`< 50 ms`) when `.olean`s
-    are fresh or absent.
+    `<lake_root>/.lake/build/lib/lean/`; when no source is newer than its `.olean`
+    (or there are no `.olean`s) it only stats files.
     """
-    newest_trusted_src_ns = _newest_lean_mtime_ns(repo_root / "trusted/lean")
-    removed: list[Path] = []
-
+    removed: list[str] = []
     for lake_root in (repo_root, repo_root / "examples"):
         lake_dir = lake_root / ".lake"
-        build_dir = lake_dir / "build"
-        lib_dir = build_dir / "lib"
-        lib_lean_dir = lib_dir / "lean"
-        if any(p.is_symlink() for p in (lake_dir, build_dir, lib_dir, lib_lean_dir)):
+        lib_lean_dir = lake_dir / "build" / "lib" / "lean"
+        if any(p.is_symlink() for p in (lake_dir, lake_dir / "build", lib_lean_dir.parent, lib_lean_dir)):
             continue
         if not lib_lean_dir.is_dir():
             continue
-        lib_lean_real = lib_lean_dir.resolve()
-
-        # Group artifact files by module relative path (`Mod/SubMod`).
-        modules: dict[Path, dict[str, Path]] = {}
-        for dirpath, dirnames, filenames in os.walk(lib_lean_dir, followlinks=False):
-            dp = Path(dirpath)
-            dirnames[:] = [d for d in dirnames if not (dp / d).is_symlink()]
-            rel_dir = dp.relative_to(lib_lean_dir)
-            for fname in filenames:
-                parsed = _split_lean_artifact_name(fname)
-                if parsed is None:
-                    continue
-                stem, suffix = parsed
-                rel_mod = (rel_dir / stem) if rel_dir != Path(".") else Path(stem)
-                modules.setdefault(rel_mod, {})[suffix] = dp / fname
-
+        lib_lean_real = os.path.realpath(lib_lean_dir)
+        modules = _scan_lean_module_artifacts(os.fspath(lib_lean_dir))
         if not modules:
             continue
-
         by_lib, fallbacks = _lake_lib_src_dirs(lake_root, repo_root)
 
-        # Compute representative mtime (`st_mtime_ns`) for each module that owns
-        # at least one primary `.olean`/`.ilean` artifact (`None` => broken symlink / stale).
-        mod_mtime_ns: dict[Path, int | None] = {}
+        tops: dict[str, str] = {}
+        stale: set[str] = set()
         for rel_mod, arts in modules.items():
-            if not any(s in arts for s in _LEAN_PRIMARY_ARTIFACT_SUFFIXES):
+            if _LEAN_PRIMARY_ARTIFACT_SUFFIXES.isdisjoint(arts):
                 continue
-            if ".olean" in arts:
-                try:
-                    mod_mtime_ns[rel_mod] = arts[".olean"].stat().st_mtime_ns
-                except OSError:
-                    mod_mtime_ns[rel_mod] = None
-            else:
-                mtimes: list[int] = []
-                broken = False
-                for s in _LEAN_PRIMARY_ARTIFACT_SUFFIXES:
-                    p = arts.get(s)
-                    if p is None:
-                        continue
-                    try:
-                        mtimes.append(p.stat().st_mtime_ns)
-                    except OSError:
-                        broken = True
-                        break
-                mod_mtime_ns[rel_mod] = None if (broken or not mtimes) else min(mtimes)
+            tops[rel_mod] = rel_mod.partition("/")[0]
+            art_ns = _lean_module_artifact_mtime_ns(arts)
+            if art_ns is None:
+                stale.add(rel_mod)
+                continue
+            src = _find_lean_source_for_module(rel_mod, by_lib, fallbacks)
+            if (
+                src is not None
+                and src[1] > art_ns
+                and not _lake_records_prove_source_unchanged(rel_mod, arts, src[0], src[1])
+            ):
+                stale.add(rel_mod)
+        if any(tops[rel_mod] == _TRUSTED_LIB for rel_mod in stale):
+            stale.update(
+                rel_mod for rel_mod, top in tops.items() if top not in _TRUSTED_INDEPENDENT_LIBS
+            )
 
-        trusted_stale_in_root = False
-        if newest_trusted_src_ns is not None:
-            for rel_mod, art_ns in mod_mtime_ns.items():
-                if rel_mod.parts[0] == "Trusted" and (
-                    art_ns is None or art_ns < newest_trusted_src_ns
-                ):
-                    trusted_stale_in_root = True
-                    break
-
-        stale_mods: list[Path] = []
-        for rel_mod, art_ns in mod_mtime_ns.items():
-            top = rel_mod.parts[0]
-            is_stale = art_ns is None
-            if not is_stale and newest_trusted_src_ns is not None and top not in _TRUSTED_INDEPENDENT_LIBS:
-                if trusted_stale_in_root or art_ns < newest_trusted_src_ns:
-                    is_stale = True
-            if not is_stale:
-                src_lean = _find_lean_source_for_module(rel_mod, by_lib, fallbacks)
-                if src_lean is not None:
-                    try:
-                        if src_lean.stat().st_mtime_ns > art_ns:
-                            is_stale = True
-                    except OSError:
-                        pass
-            if is_stale:
-                stale_mods.append(rel_mod)
-
-        for rel_mod in sorted(stale_mods):
+        for rel_mod in sorted(stale):
             for art_path in sorted(modules[rel_mod].values()):
-                try:
-                    parent_real = art_path.parent.resolve()
-                except OSError:
-                    continue
-                if not parent_real.is_relative_to(lib_lean_real):
+                parent_real = os.path.realpath(os.path.dirname(art_path))
+                if parent_real != lib_lean_real and not parent_real.startswith(lib_lean_real + os.sep):
                     continue
                 try:
-                    art_path.unlink(missing_ok=True)
-                    removed.append(art_path)
+                    os.unlink(art_path)
+                except FileNotFoundError:
+                    pass
                 except OSError:
                     continue
+                removed.append(art_path)
 
-    return sorted(removed)
+    return sorted(Path(p) for p in removed)
+
+
+def _preflight_clean_stale_oleans(repo_root: Path) -> list[Path]:
+    """Run `clean_stale_oleans` before the suite's Lake/Lean steps, reporting what it
+    removed on stderr. The guard is best-effort: a failure in it is reported, and the
+    steps still run (Lake then decides freshness on its own)."""
+    try:
+        removed = clean_stale_oleans(repo_root)
+    except Exception as exc:  # noqa: BLE001 - never let the pre-flight abort the suite
+        sys.stderr.write(f"[nightly-suite] stale .olean pre-flight failed ({type(exc).__name__}: {exc})\n")
+        return []
+    if removed:
+        stale_oleans = [p for p in removed if p.name.endswith(".olean")]
+        shown = ", ".join(os.path.relpath(p, repo_root) for p in stale_oleans[:5])
+        more = f", ... (+{len(stale_oleans) - 5} more)" if len(stale_oleans) > 5 else ""
+        sys.stderr.write(
+            f"[nightly-suite] stale .olean pre-flight removed {len(removed)} artifact file(s) "
+            f"of {len(stale_oleans)} module(s): {shown}{more}\n"
+        )
+    return removed
 
 
 def _signal_process_group(pgid: int, sig: int) -> None:
@@ -5550,7 +5785,7 @@ def _run_step(
     env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     t0 = time.monotonic()
-    env = _build_step_env(name, env_overrides=env_overrides)
+    env = _build_step_env(name, env_overrides=env_overrides, cmd=cmd, cwd=cwd)
     outer_timeout = _outer_timeout_sec(cmd, timeout_sec, env=env)
     timed_out = False
     try:
@@ -5998,11 +6233,13 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             300,
             wrap="build",
         )
-        # Measures ~570 s on a 32-core host across `--lib`, `campaign_orchestrator`,
+        # Measures ~575 s warm on a 96-core host across `--lib`, `campaign_orchestrator`,
         # `itree_difftest_oracle`, and `miri_difftest_oracle` (after preserving
         # `anneal-trace` staging artifacts, narrowing ITree Lean imports to
-        # `TraceCheck`, and serializing Miri sysroot setup); 1500 s preserves ~2x
-        # headroom on 8-core capsules without adding wall time.
+        # `TraceCheck`, and serializing Miri sysroot setup). `itree_difftest_oracle`
+        # alone is ~350 s and mostly serial (13 min CPU over 6 min wall: one staging
+        # slot, one `lake env lean` worker), so extra cores barely help it; 1500 s
+        # keeps ~2.5x headroom for slower hosts.
         add(
             "domain_integration_tests_anneal_difftest",
             "cat4_rust_domain_integration_tests",
@@ -6293,7 +6530,7 @@ def run_suite_and_generate_dashboard(
 
     steps_spec = build_suite_steps(repo_root, profile)
     if any(s_name.startswith("lake_build_") for s_name, _, _, _ in steps_spec):
-        clean_stale_oleans(repo_root)
+        _preflight_clean_stale_oleans(repo_root)
     step_results: list[dict[str, Any]] = []
     t0 = time.monotonic()
     for s_name, s_cat, s_cmd, s_timeout in steps_spec:
