@@ -3971,6 +3971,60 @@ mod cross_language_parity_suite {
             );
             assert!(add.is_strong(), "seed {seed:#x}: {add:?}");
             assert!(add.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(add.stats().kills_every_mutant(), "seed {seed:#x}");
+
+            let slice_bounds = check_contract(
+                config,
+                |&(arr, prefix_len, idx): &([u32; 4], usize, usize)| {
+                    prefix_len <= 4
+                        && __anodized_fn_requires_cl_pos_02_slice_bounds_and_empty_fn(
+                            &arr[..prefix_len],
+                            idx,
+                        )
+                },
+                |&(arr, prefix_len, idx)| {
+                    cl_pos_02_slice_bounds_and_empty_fn(&arr[..prefix_len], idx)
+                },
+                |&(arr, prefix_len, idx), &ret| {
+                    __anodized_fn_ensures_cl_pos_02_slice_bounds_and_empty_fn(
+                        &arr[..prefix_len],
+                        idx,
+                        ret,
+                    )
+                },
+            );
+            assert!(slice_bounds.is_strong(), "seed {seed:#x}: {slice_bounds:?}");
+            assert!(slice_bounds.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(slice_bounds.stats().kills_every_mutant(), "seed {seed:#x}");
+
+            let slice_len = check_contract(
+                config,
+                |&(arr, prefix_len): &([u32; 4], usize)| {
+                    prefix_len <= 4 && __anodized_fn_requires_spec_slice_u32_len(&arr[..prefix_len])
+                },
+                |&(arr, prefix_len)| arr[..prefix_len].len(),
+                |&(arr, prefix_len), &ret| {
+                    __anodized_fn_ensures_spec_slice_u32_len(&arr[..prefix_len], ret)
+                },
+            );
+            assert!(slice_len.is_strong(), "seed {seed:#x}: {slice_len:?}");
+            assert!(slice_len.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(slice_len.stats().kills_every_mutant(), "seed {seed:#x}");
+
+            let slice_empty = check_contract(
+                config,
+                |&(arr, prefix_len): &([u32; 4], usize)| {
+                    prefix_len <= 4
+                        && __anodized_fn_requires_spec_slice_u32_is_empty(&arr[..prefix_len])
+                },
+                |&(arr, prefix_len)| arr[..prefix_len].is_empty(),
+                |&(arr, prefix_len), &ret| {
+                    __anodized_fn_ensures_spec_slice_u32_is_empty(&arr[..prefix_len], ret)
+                },
+            );
+            assert!(slice_empty.is_strong(), "seed {seed:#x}: {slice_empty:?}");
+            assert!(slice_empty.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(slice_empty.stats().kills_every_mutant(), "seed {seed:#x}");
 
             let clamp = check_contract(
                 config,
@@ -3980,6 +4034,7 @@ mod cross_language_parity_suite {
             );
             assert!(clamp.is_strong(), "seed {seed:#x}: {clamp:?}");
             assert!(clamp.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(clamp.stats().kills_every_mutant(), "seed {seed:#x}");
 
             let step = check_stateful_contract(
                 config,
@@ -3993,6 +4048,7 @@ mod cross_language_parity_suite {
             );
             assert!(step.is_strong(), "seed {seed:#x}: {step:?}");
             assert!(step.stats().is_pointwise_strong(), "seed {seed:#x}");
+            assert!(step.stats().kills_every_mutant(), "seed {seed:#x}");
         }
     }
 
@@ -4575,4 +4631,463 @@ fn half_weak_multi_field_state_is_exposed_by_strict_mutant_kill_helpers() {
     );
     assert!(full.kills_every_mutant());
     assert_eq!(full.mutants_survived(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Episode 2 Round 2 hardening: signed/unsigned boundary interactions
+// (`i32::checked_abs`, `checked_sub`, `saturating_sub`), `Option`/`Result`
+// signed-`MIN` variant-flip mutants, and multi-argument companion arities
+// (0, 1, 2, 3, and 4 arguments) across `#[spec]` and `#[external_spec]`
+// ---------------------------------------------------------------------------
+
+#[external_spec(
+    for = i32::checked_abs,
+    pure,
+    total,
+    ensures: |ret| match ret {
+        Some(v) => v >= 0 && x != i32::MIN && (v as i64) == (x as i64).abs(),
+        None => x == i32::MIN,
+    },
+)]
+fn spec_i32_checked_abs(x: i32) -> Option<i32>;
+
+#[external_spec(
+    for = u32::checked_sub,
+    pure,
+    total,
+    ensures: |ret| match ret {
+        Some(diff) => a >= b && diff == a - b,
+        None => a < b,
+    },
+)]
+fn spec_u32_checked_sub(a: u32, b: u32) -> Option<u32>;
+
+#[external_spec(
+    for = u32::saturating_sub,
+    pure,
+    total,
+    ensures: |ret| if a >= b { ret == a - b } else { ret == 0 },
+)]
+fn spec_u32_saturating_sub(a: u32, b: u32) -> u32;
+
+#[external_spec(
+    for = i32::checked_sub,
+    pure,
+    total,
+    ensures: |ret| {
+        let exact = (a as i64) - (b as i64);
+        match ret {
+            Some(diff) => {
+                exact >= (i32::MIN as i64)
+                    && exact <= (i32::MAX as i64)
+                    && (diff as i64) == exact
+            }
+            None => exact < (i32::MIN as i64) || exact > (i32::MAX as i64),
+        }
+    },
+)]
+fn spec_i32_checked_sub(a: i32, b: i32) -> Option<i32>;
+
+#[external_spec(
+    for = i32::saturating_sub,
+    pure,
+    total,
+    ensures: |ret| {
+        let exact = (a as i64) - (b as i64);
+        if exact < (i32::MIN as i64) {
+            ret == i32::MIN
+        } else if exact > (i32::MAX as i64) {
+            ret == i32::MAX
+        } else {
+            (ret as i64) == exact
+        }
+    },
+)]
+fn spec_i32_saturating_sub(a: i32, b: i32) -> i32;
+
+#[spec(
+    pure,
+    total,
+    ensures: |ret| ret == 42,
+)]
+fn zero_arg_const_u32() -> u32 {
+    42
+}
+
+#[external_spec(
+    for = <u32 as core::default::Default>::default,
+    pure,
+    total,
+    ensures: |ret| ret == 0,
+)]
+fn spec_u32_default() -> u32;
+
+#[external_spec(
+    for = <i32 as core::cmp::Ord>::clamp,
+    pure,
+    total,
+    requires: lo <= hi,
+    ensures: |ret| [
+        ret >= lo,
+        ret <= hi,
+        (val < lo && ret == lo)
+            || (val > hi && ret == hi)
+            || (val >= lo && val <= hi && ret == val),
+    ],
+)]
+fn spec_i32_clamp(val: i32, lo: i32, hi: i32) -> i32;
+
+#[spec(
+    pure,
+    total,
+    requires: lo <= hi,
+    ensures: |ret| {
+        let exact = (a as i64) - (b as i64);
+        match ret {
+            Some(v) => {
+                exact >= (i32::MIN as i64)
+                    && exact <= (i32::MAX as i64)
+                    && v == (exact as i32).clamp(lo, hi)
+            }
+            None => exact < (i32::MIN as i64) || exact > (i32::MAX as i64),
+        }
+    },
+)]
+fn signed_sub_clamped_4(a: i32, b: i32, lo: i32, hi: i32) -> Option<i32> {
+    a.checked_sub(b).map(|diff| diff.clamp(lo, hi))
+}
+
+#[test]
+fn i32_checked_abs_boundary_and_option_min_mutant_coverage() {
+    let boundary_only =
+        SpecCheckConfig::default().with_max_trials(<i32 as SampleInput>::BOUNDARY_COUNT);
+
+    // The `i32` boundary corpus alone hits `i32::MIN` (`None`), negative values,
+    // zero, and positive values, and the strong `#[external_spec]` kills every mutant.
+    let mut saw_min_none = false;
+    let mut saw_negative_some = false;
+    let mut saw_zero_some = false;
+    let mut saw_positive_some = false;
+    let strong = assert_contract_strong(
+        boundary_only,
+        |&x: &i32| __anodized_fn_requires_spec_i32_checked_abs(x),
+        |&x| {
+            let ret = x.checked_abs();
+            if x == i32::MIN && ret.is_none() {
+                saw_min_none = true;
+            } else if x < 0 && ret.is_some() {
+                saw_negative_some = true;
+            } else if x == 0 && ret == Some(0) {
+                saw_zero_some = true;
+            } else if x > 0 && ret == Some(x) {
+                saw_positive_some = true;
+            }
+            ret
+        },
+        |&x, &ret| __anodized_fn_ensures_spec_i32_checked_abs(x, ret),
+    );
+    assert!(
+        saw_min_none,
+        "boundary corpus must hit `i32::MIN.checked_abs() == None`"
+    );
+    assert!(saw_negative_some, "boundary corpus must hit negative `i32`");
+    assert!(saw_zero_some, "boundary corpus must hit `0i32`");
+    assert!(saw_positive_some, "boundary corpus must hit positive `i32`");
+    assert!(strong.is_pointwise_strong());
+    assert!(strong.kills_every_mutant());
+
+    // Classic signed-overflow spec bug: omitting `v >= 0` / `x != i32::MIN` and writing
+    // `v == x.wrapping_abs()` allows the mutant `Some(i32::MIN)` to survive on the
+    // `x == i32::MIN` hit (`i32::MIN.wrapping_abs() == i32::MIN`). Because
+    // `Option<i32>::visit_mutants` on `None` deterministically emits `Some(i32::MIN)`,
+    // the surviving mutant is exposed on the boundary corpus alone across every seed.
+    for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX] {
+        let weak = assert_contract_strong(
+            boundary_only.with_seed(seed),
+            |&_x: &i32| true,
+            |&x| x.checked_abs(),
+            |&x, &ret| match ret {
+                Some(v) => v == x.wrapping_abs(),
+                None => x == i32::MIN,
+            },
+        );
+        assert!(weak.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(weak.mutants_survived() > 0, "seed {seed:#x}");
+        assert!(!weak.kills_every_mutant(), "seed {seed:#x}");
+    }
+
+    // Under the strong `#[external_spec]`, a dishonest body returning
+    // `Some(x.wrapping_abs())` triggers `SpecViolation` deterministically at `i32::MIN`.
+    let dishonest = check_contract(
+        boundary_only,
+        |&x: &i32| __anodized_fn_requires_spec_i32_checked_abs(x),
+        |&x| Some(x.wrapping_abs()),
+        |&x, &ret| __anodized_fn_ensures_spec_i32_checked_abs(x, ret),
+    );
+    assert_eq!(dishonest.vacuity_class(), Some(VacuityClass::SpecViolation));
+}
+
+#[test]
+fn result_variant_flip_mutants_cover_signed_min_on_both_arms() {
+    let boundary_only =
+        SpecCheckConfig::default().with_max_trials(<i32 as SampleInput>::BOUNDARY_COUNT);
+
+    // `Err -> Ok(i32::MIN)` flip exposes a weak `Ok` arm using `wrapping_abs()`.
+    let weak_err_to_ok = assert_contract_strong(
+        boundary_only,
+        |&_x: &i32| true,
+        |&x| x.checked_abs().ok_or(x),
+        |&x, &ret: &Result<i32, i32>| match ret {
+            Ok(v) => v == x.wrapping_abs(),
+            Err(e) => x == i32::MIN && e == i32::MIN,
+        },
+    );
+    assert!(weak_err_to_ok.is_pointwise_strong());
+    assert!(weak_err_to_ok.mutants_survived() > 0);
+    assert!(!weak_err_to_ok.kills_every_mutant());
+
+    // `Ok -> Err(i32::MIN)` flip exposes a weak `Err` arm that omits `x == i32::MIN`.
+    let weak_ok_to_err = assert_contract_strong(
+        boundary_only,
+        |&_x: &i32| true,
+        |&x| if x == i32::MIN { Err(i32::MIN) } else { Ok(x) },
+        |&x, &ret: &Result<i32, i32>| match ret {
+            Ok(v) => v == x && x != i32::MIN,
+            Err(e) => e == i32::MIN,
+        },
+    );
+    assert!(weak_ok_to_err.is_pointwise_strong());
+    assert!(weak_ok_to_err.mutants_survived() > 0);
+    assert!(!weak_ok_to_err.kills_every_mutant());
+
+    // Tightening both arms kills every mutant across seeds, including when
+    // `max_mutants_per_hit` exceeds the legacy 16-entry dedup cap.
+    for seed in [0u64, 1, 0xCAFE_BABE, u64::MAX] {
+        let full = assert_contract_strong(
+            boundary_only.with_seed(seed).with_max_mutants_per_hit(24),
+            |&_x: &i32| true,
+            |&x| x.checked_abs().ok_or(x),
+            |&x, &ret: &Result<i32, i32>| match ret {
+                Ok(v) => v >= 0 && x != i32::MIN && (v as i64) == (x as i64).abs(),
+                Err(e) => x == i32::MIN && e == i32::MIN,
+            },
+        );
+        assert!(full.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(full.kills_every_mutant(), "seed {seed:#x}");
+    }
+}
+
+#[test]
+fn signed_and_unsigned_sub_boundaries_are_covered_deterministically() {
+    let u32_pair_cfg =
+        SpecCheckConfig::default().with_max_trials(<(u32, u32) as SampleInput>::BOUNDARY_COUNT);
+    let i32_pair_cfg =
+        SpecCheckConfig::default().with_max_trials(<(i32, i32) as SampleInput>::BOUNDARY_COUNT);
+
+    // `u32::checked_sub`: hits both in-range `Some` and underflow `None` (`0 - 1`).
+    let mut saw_u_checked_some = false;
+    let mut saw_u_checked_none = false;
+    let u_checked = assert_contract_strong(
+        u32_pair_cfg,
+        |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_sub(a, b),
+        |&(a, b)| {
+            let ret = a.checked_sub(b);
+            if ret.is_some() {
+                saw_u_checked_some = true;
+            } else {
+                saw_u_checked_none = true;
+            }
+            ret
+        },
+        |&(a, b), &ret| __anodized_fn_ensures_spec_u32_checked_sub(a, b, ret),
+    );
+    assert!(saw_u_checked_some && saw_u_checked_none);
+    assert!(u_checked.is_pointwise_strong());
+    assert!(u_checked.kills_every_mutant());
+
+    // `u32::saturating_sub`: hits both exact subtraction and zero saturation (`a < b`).
+    let mut saw_u_sat_exact = false;
+    let mut saw_u_sat_zero = false;
+    let u_sat = assert_contract_strong(
+        u32_pair_cfg,
+        |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_saturating_sub(a, b),
+        |&(a, b)| {
+            if a >= b {
+                saw_u_sat_exact = true;
+            } else {
+                saw_u_sat_zero = true;
+            }
+            a.saturating_sub(b)
+        },
+        |&(a, b), &ret| __anodized_fn_ensures_spec_u32_saturating_sub(a, b, ret),
+    );
+    assert!(saw_u_sat_exact && saw_u_sat_zero);
+    assert!(u_sat.is_pointwise_strong());
+    assert!(u_sat.kills_every_mutant());
+
+    // `i32::checked_sub`: hits in-range `Some`, negative underflow `None` (`MIN - 1`),
+    // and positive overflow `None` (`MAX - (-1)` / `0 - MIN`).
+    let mut saw_i_checked_some = false;
+    let mut saw_i_checked_underflow = false;
+    let mut saw_i_checked_overflow = false;
+    let i_checked = assert_contract_strong(
+        i32_pair_cfg,
+        |&(a, b): &(i32, i32)| __anodized_fn_requires_spec_i32_checked_sub(a, b),
+        |&(a, b)| {
+            let exact = (a as i64) - (b as i64);
+            let ret = a.checked_sub(b);
+            if exact < (i32::MIN as i64) {
+                saw_i_checked_underflow = true;
+            } else if exact > (i32::MAX as i64) {
+                saw_i_checked_overflow = true;
+            } else {
+                saw_i_checked_some = true;
+            }
+            ret
+        },
+        |&(a, b), &ret| __anodized_fn_ensures_spec_i32_checked_sub(a, b, ret),
+    );
+    assert!(saw_i_checked_some);
+    assert!(
+        saw_i_checked_underflow,
+        "missing signed underflow (`MIN - 1`)"
+    );
+    assert!(
+        saw_i_checked_overflow,
+        "missing signed overflow (`MAX - (-1)`)"
+    );
+    assert!(i_checked.is_pointwise_strong());
+    assert!(i_checked.kills_every_mutant());
+
+    // `i32::saturating_sub`: hits exact, `MIN`-saturated, and `MAX`-saturated regions.
+    let mut saw_i_sat_exact = false;
+    let mut saw_i_sat_min = false;
+    let mut saw_i_sat_max = false;
+    let i_sat = assert_contract_strong(
+        i32_pair_cfg,
+        |&(a, b): &(i32, i32)| __anodized_fn_requires_spec_i32_saturating_sub(a, b),
+        |&(a, b)| {
+            let exact = (a as i64) - (b as i64);
+            if exact < (i32::MIN as i64) {
+                saw_i_sat_min = true;
+            } else if exact > (i32::MAX as i64) {
+                saw_i_sat_max = true;
+            } else {
+                saw_i_sat_exact = true;
+            }
+            a.saturating_sub(b)
+        },
+        |&(a, b), &ret| __anodized_fn_ensures_spec_i32_saturating_sub(a, b, ret),
+    );
+    assert!(saw_i_sat_exact);
+    assert!(saw_i_sat_min, "missing `i32::MIN` saturation");
+    assert!(saw_i_sat_max, "missing `i32::MAX` saturation");
+    assert!(i_sat.is_pointwise_strong());
+    assert!(i_sat.kills_every_mutant());
+}
+
+#[test]
+fn multi_arg_spec_and_external_spec_companion_arities_zero_through_four() {
+    // 0-argument `#[spec]` and `#[external_spec]` companions (`I = ()`).
+    let zero_spec = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&(): &()| __anodized_fn_requires_zero_arg_const_u32(),
+        |&()| zero_arg_const_u32(),
+        |&(), &ret| __anodized_fn_ensures_zero_arg_const_u32(ret),
+    );
+    assert!(zero_spec.is_pointwise_strong());
+    assert!(zero_spec.kills_every_mutant());
+
+    let zero_ext = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&(): &()| __anodized_fn_requires_spec_u32_default(),
+        |&()| u32::default(),
+        |&(), &ret| __anodized_fn_ensures_spec_u32_default(ret),
+    );
+    assert!(zero_ext.is_pointwise_strong());
+    assert!(zero_ext.kills_every_mutant());
+
+    // 3-argument `#[external_spec]` (`<i32 as Ord>::clamp`) across signed boundaries.
+    let i32_triple_cfg = SpecCheckConfig::default()
+        .with_max_trials(<(i32, i32, i32) as SampleInput>::BOUNDARY_COUNT);
+    let mut saw_clamp_min = false;
+    let mut saw_clamp_below = false;
+    let mut saw_clamp_inside = false;
+    let mut saw_clamp_above = false;
+    let three_ext = assert_contract_strong(
+        i32_triple_cfg,
+        |&(val, lo, hi): &(i32, i32, i32)| __anodized_fn_requires_spec_i32_clamp(val, lo, hi),
+        |&(val, lo, hi)| {
+            if val == i32::MIN || lo == i32::MIN {
+                saw_clamp_min = true;
+            }
+            if val < lo {
+                saw_clamp_below = true;
+            } else if val > hi {
+                saw_clamp_above = true;
+            } else {
+                saw_clamp_inside = true;
+            }
+            val.clamp(lo, hi)
+        },
+        |&(val, lo, hi), &ret| __anodized_fn_ensures_spec_i32_clamp(val, lo, hi, ret),
+    );
+    assert!(saw_clamp_min && saw_clamp_below && saw_clamp_inside && saw_clamp_above);
+    assert!(three_ext.is_pointwise_strong());
+    assert!(three_ext.kills_every_mutant());
+
+    // 4-argument `#[spec]` (`signed_sub_clamped_4`): the `(i32, i32, i32, i32)` boundary
+    // corpus alone (including its 4 axis-isolated `MIN` probes) deterministically covers
+    // signed underflow (`MIN - 1 -> None`), signed overflow (`0 - MIN -> None`),
+    // negative in-range `Some`, and clamped `Some` across every seed.
+    let i32_quad_cfg = SpecCheckConfig::default()
+        .with_max_trials(<(i32, i32, i32, i32) as SampleInput>::BOUNDARY_COUNT);
+    for seed in [0u64, 1, 0xDEAD_BEEF, u64::MAX] {
+        let mut saw_underflow_none = false;
+        let mut saw_overflow_none = false;
+        let mut saw_negative_some = false;
+        let mut saw_clamped_some = false;
+        let four_spec = assert_contract_strong(
+            i32_quad_cfg.with_seed(seed),
+            |&(a, b, lo, hi): &(i32, i32, i32, i32)| {
+                __anodized_fn_requires_signed_sub_clamped_4(a, b, lo, hi)
+            },
+            |&(a, b, lo, hi)| {
+                let exact = (a as i64) - (b as i64);
+                let ret = signed_sub_clamped_4(a, b, lo, hi);
+                if exact < (i32::MIN as i64) && ret.is_none() {
+                    saw_underflow_none = true;
+                } else if exact > (i32::MAX as i64) && ret.is_none() {
+                    saw_overflow_none = true;
+                } else if let Some(v) = ret {
+                    if v < 0 {
+                        saw_negative_some = true;
+                    }
+                    if exact < (lo as i64) || exact > (hi as i64) {
+                        saw_clamped_some = true;
+                    }
+                }
+                ret
+            },
+            |&(a, b, lo, hi), &ret| __anodized_fn_ensures_signed_sub_clamped_4(a, b, lo, hi, ret),
+        );
+        assert!(
+            saw_underflow_none,
+            "seed {seed:#x}: missing 4-arg signed underflow"
+        );
+        assert!(
+            saw_overflow_none,
+            "seed {seed:#x}: missing 4-arg signed overflow"
+        );
+        assert!(
+            saw_negative_some,
+            "seed {seed:#x}: missing 4-arg negative `Some`"
+        );
+        assert!(
+            saw_clamped_some,
+            "seed {seed:#x}: missing 4-arg clamped `Some`"
+        );
+        assert!(four_spec.is_pointwise_strong(), "seed {seed:#x}");
+        assert!(four_spec.kills_every_mutant(), "seed {seed:#x}");
+    }
 }

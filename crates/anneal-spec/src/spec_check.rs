@@ -757,7 +757,10 @@ impl<A: SampleInput, B: SampleInput, C: SampleInput> SampleInput for (A, B, C) {
 }
 
 impl<A: SampleInput, B: SampleInput, C: SampleInput, D: SampleInput> SampleInput for (A, B, C, D) {
-    // Up to 3^4 = 81 representative 4-tuples followed by diagonal `(i, i, i, i)`.
+    // Up to 3^4 = 81 representative 4-tuples, followed by diagonal `(i, i, i, i)`
+    // tuples and 4 axis-isolated midpoint (`BOUNDARY_COUNT / 2`, holding `MIN` for
+    // every signed integer type) probes so 4-argument signed contracts hit `MIN`
+    // off-diagonal deterministically on the boundary corpus.
     const BOUNDARY_COUNT: usize = {
         let ka = min_usize(A::BOUNDARY_COUNT, 3);
         let kb = min_usize(B::BOUNDARY_COUNT, 3);
@@ -773,7 +776,12 @@ impl<A: SampleInput, B: SampleInput, C: SampleInput, D: SampleInput> SampleInput
         } else {
             0
         };
-        cross.saturating_add(diag)
+        let mid_probes = if ka > 0 && kb > 0 && kc > 0 && kd > 0 && max_abcd > 3 {
+            4
+        } else {
+            0
+        };
+        cross.saturating_add(diag).saturating_add(mid_probes)
     };
 
     fn sample_at(trial_idx: usize, rng: &mut SplitMix64) -> Self {
@@ -782,6 +790,16 @@ impl<A: SampleInput, B: SampleInput, C: SampleInput, D: SampleInput> SampleInput
         let kc = min_usize(C::BOUNDARY_COUNT, 3);
         let kd = min_usize(D::BOUNDARY_COUNT, 3);
         let cross = ka * kb * kc * kd;
+        let max_abcd = max_usize(
+            max_usize(A::BOUNDARY_COUNT, B::BOUNDARY_COUNT),
+            max_usize(C::BOUNDARY_COUNT, D::BOUNDARY_COUNT),
+        );
+        let diag = if ka > 0 && kb > 0 && kc > 0 && kd > 0 && max_abcd > 3 {
+            max_abcd
+        } else {
+            0
+        };
+        let diag_end = cross.saturating_add(diag);
         if trial_idx < cross && kb > 0 && kc > 0 && kd > 0 {
             let cd = kc * kd;
             let bcd = kb * cd;
@@ -797,7 +815,7 @@ impl<A: SampleInput, B: SampleInput, C: SampleInput, D: SampleInput> SampleInput
                 C::sample_at(ic, rng),
                 D::sample_at(id, rng),
             )
-        } else if trial_idx < Self::BOUNDARY_COUNT
+        } else if trial_idx < diag_end
             && A::BOUNDARY_COUNT > 0
             && B::BOUNDARY_COUNT > 0
             && C::BOUNDARY_COUNT > 0
@@ -809,6 +827,29 @@ impl<A: SampleInput, B: SampleInput, C: SampleInput, D: SampleInput> SampleInput
                 B::sample_at(d % B::BOUNDARY_COUNT, rng),
                 C::sample_at(d % C::BOUNDARY_COUNT, rng),
                 D::sample_at(d % D::BOUNDARY_COUNT, rng),
+            )
+        } else if trial_idx < Self::BOUNDARY_COUNT
+            && A::BOUNDARY_COUNT > 0
+            && B::BOUNDARY_COUNT > 0
+            && C::BOUNDARY_COUNT > 0
+            && D::BOUNDARY_COUNT > 0
+        {
+            let a0 = 0;
+            let a1 = min_usize(1, A::BOUNDARY_COUNT - 1);
+            let b1 = min_usize(1, B::BOUNDARY_COUNT - 1);
+            let c0 = 0;
+            let d_last = D::BOUNDARY_COUNT - 1;
+            let (ia, ib, ic, id) = match trial_idx - diag_end {
+                0 => (A::BOUNDARY_COUNT / 2, b1, c0, d_last),
+                1 => (a0, B::BOUNDARY_COUNT / 2, c0, d_last),
+                2 => (a0, b1, C::BOUNDARY_COUNT / 2, d_last),
+                _ => (a1, b1, c0, D::BOUNDARY_COUNT / 2),
+            };
+            (
+                A::sample_at(ia, rng),
+                B::sample_at(ib, rng),
+                C::sample_at(ic, rng),
+                D::sample_at(id, rng),
             )
         } else {
             (
@@ -1046,6 +1087,13 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
                     if T::BOUNDARY_COUNT >= 3 {
                         emit(Some(T::sample_at(2, rng)));
                     }
+                    if T::BOUNDARY_COUNT >= 6 {
+                        // Index `BOUNDARY_COUNT / 2` holds `MIN` for every signed
+                        // integer type (`i8..=isize`) and is strictly distinct from
+                        // `0`, `1`, `2`, and `BOUNDARY_COUNT - 1` whenever
+                        // `BOUNDARY_COUNT >= 6`.
+                        emit(Some(T::sample_at(T::BOUNDARY_COUNT / 2, rng)));
+                    }
                     if T::BOUNDARY_COUNT >= 4 {
                         emit(Some(T::sample_at(T::BOUNDARY_COUNT - 1, rng)));
                     }
@@ -1055,6 +1103,34 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Emits representative opposite-variant payloads of type `U` covering `0`,
+/// `1`, the signed-`MIN` midpoint (`BOUNDARY_COUNT / 2`), `BOUNDARY_COUNT - 1`,
+/// and one PRNG draw, wrapped via `wrap`.
+fn emit_variant_flip_samples<U, R, W, F>(rng: &mut SplitMix64, mut wrap: W, emit: &mut F)
+where
+    U: SampleInput + ReturnMutants,
+    W: FnMut(U) -> R,
+    F: FnMut(R),
+{
+    emit(wrap(U::sample_at(0, rng)));
+    if !U::IS_SUBSINGLETON {
+        if U::BOUNDARY_COUNT >= 2 {
+            emit(wrap(U::sample_at(1, rng)));
+        }
+        if U::BOUNDARY_COUNT >= 4 {
+            // Strictly distinct from `0`, `1`, and `BOUNDARY_COUNT - 1`; covers
+            // `MIN` for every signed integer type (`i8..=isize`).
+            emit(wrap(U::sample_at(U::BOUNDARY_COUNT / 2, rng)));
+        }
+        if U::BOUNDARY_COUNT >= 3 {
+            emit(wrap(U::sample_at(U::BOUNDARY_COUNT - 1, rng)));
+        }
+        if U::BOUNDARY_COUNT != 2 {
+            emit(wrap(U::sample_at(U::BOUNDARY_COUNT, rng)));
         }
     }
 }
@@ -1079,34 +1155,12 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                             // Emit opposite-variant flips right after the first payload
                             // mutant so small budgets test both axes without duplicating
                             // subsingleton payloads and mutant chains advance within `Ok`.
-                            emit(Err(E::sample_at(0, &mut flip_rng)));
-                            if !E::IS_SUBSINGLETON {
-                                if E::BOUNDARY_COUNT >= 2 {
-                                    emit(Err(E::sample_at(1, &mut flip_rng)));
-                                }
-                                if E::BOUNDARY_COUNT >= 3 {
-                                    emit(Err(E::sample_at(E::BOUNDARY_COUNT - 1, &mut flip_rng)));
-                                }
-                                if E::BOUNDARY_COUNT != 2 {
-                                    emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
-                                }
-                            }
+                            emit_variant_flip_samples(&mut flip_rng, Err, &mut emit);
                         }
                     });
                 }
                 if !emitted_flips {
-                    emit(Err(E::sample_at(0, &mut flip_rng)));
-                    if !E::IS_SUBSINGLETON {
-                        if E::BOUNDARY_COUNT >= 2 {
-                            emit(Err(E::sample_at(1, &mut flip_rng)));
-                        }
-                        if E::BOUNDARY_COUNT >= 3 {
-                            emit(Err(E::sample_at(E::BOUNDARY_COUNT - 1, &mut flip_rng)));
-                        }
-                        if E::BOUNDARY_COUNT != 2 {
-                            emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
-                        }
-                    }
+                    emit_variant_flip_samples(&mut flip_rng, Err, &mut emit);
                 }
             }
             Err(e) => {
@@ -1116,34 +1170,12 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                         emit(Err(m));
                         if !emitted_flips {
                             emitted_flips = true;
-                            emit(Ok(T::sample_at(0, &mut flip_rng)));
-                            if !T::IS_SUBSINGLETON {
-                                if T::BOUNDARY_COUNT >= 2 {
-                                    emit(Ok(T::sample_at(1, &mut flip_rng)));
-                                }
-                                if T::BOUNDARY_COUNT >= 3 {
-                                    emit(Ok(T::sample_at(T::BOUNDARY_COUNT - 1, &mut flip_rng)));
-                                }
-                                if T::BOUNDARY_COUNT != 2 {
-                                    emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
-                                }
-                            }
+                            emit_variant_flip_samples(&mut flip_rng, Ok, &mut emit);
                         }
                     });
                 }
                 if !emitted_flips {
-                    emit(Ok(T::sample_at(0, &mut flip_rng)));
-                    if !T::IS_SUBSINGLETON {
-                        if T::BOUNDARY_COUNT >= 2 {
-                            emit(Ok(T::sample_at(1, &mut flip_rng)));
-                        }
-                        if T::BOUNDARY_COUNT >= 3 {
-                            emit(Ok(T::sample_at(T::BOUNDARY_COUNT - 1, &mut flip_rng)));
-                        }
-                        if T::BOUNDARY_COUNT != 2 {
-                            emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
-                        }
-                    }
+                    emit_variant_flip_samples(&mut flip_rng, Ok, &mut emit);
                 }
             }
         }
@@ -2319,8 +2351,10 @@ pub fn replay_stateful_trial_input<S: SampleInput, A: SampleInput>(
     Some(<(S, A) as SampleInput>::sample_at(trial_idx, &mut rng))
 }
 
-/// Fixed stack capacity for zero-allocation Stage D3 mutant deduplication.
-const STAGE_D3_DEDUP_CAP: usize = 16;
+/// Fixed stack capacity for zero-allocation Stage D3 mutant deduplication
+/// (large enough to hold every built-in `ReturnMutants` candidate emitted by
+/// `Option<T>` and `Result<T, E>` over signed/unsigned integers).
+const STAGE_D3_DEDUP_CAP: usize = 24;
 
 /// Maximum number of distinct mutants Stage D3 tests beyond
 /// [`SpecCheckConfig::max_mutants_per_hit`] on a hit (or stateful output axis)

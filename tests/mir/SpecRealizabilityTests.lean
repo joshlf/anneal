@@ -3251,6 +3251,326 @@ theorem existsEvenPost_dichotomy :
 #eval assertEnsuresBindsOutput (Lean.mkConst ``natAddInputGeTenPost)
   (some (Lean.mkConst ``smallInputPre))
 
+/-! ### 3.24 Dependent/Indexed Types, Nested `Value` Matches & Multi-Clause External Specs -/
+
+/-- Precondition restricting `Fin n` to have at most one inhabitant (`n ≤ 1`). -/
+def finLeOnePre (n : Nat) : Prop := n ≤ 1
+
+/-- Genuine over arbitrary `n`, but output-insensitive once `requires` forces `n ≤ 1`. -/
+def finLeOnePost (n : Nat) (ret : Fin n) : Prop := ret.val = 0
+
+/-- Tautological upper bound already enforced by the `Fin (n + 1)` index invariant. -/
+def finSuccBoundTautPost (n : Nat) (ret : Fin (n + 1)) : Prop := ret.val ≤ n
+
+/-- `Subtype` postcondition merely restating the output's own refinement predicate. -/
+def subtypeRestatePost (_x : Nat) (ret : { y : Nat // y < 10 }) : Prop := ret.val < 10
+
+/-- `Subtype` postcondition contradicting the output's own refinement predicate. -/
+def subtypeContraPost (_x : Nat) (ret : { y : Nat // y < 10 }) : Prop := ret.val ≥ 10
+
+/-- Syntactically singleton `Subtype` output `{ y : Nat // y = x }` (Phase 1). -/
+def subtypeSingletonEqPost (x : Nat) (ret : { y : Nat // y = x }) : Prop := ret.val = 0
+
+/-- Semantically singleton `Subtype` output `{ y : Nat // y ≤ x ∧ x ≤ y }` (Phase 4). -/
+def subtypeSemanticSingletonPost (x : Nat) (ret : { y : Nat // y ≤ x ∧ x ≤ y }) : Prop :=
+  ret.val = 0
+
+/-- Syntactically empty `Subtype` output `{ y : Nat // y ≠ y }` (Phase 1). -/
+def subtypeUnsatPredPost (_x : Nat) (ret : { y : Nat // y ≠ y }) : Prop := ret.val = 0
+
+/-- `Subtype` input invariant masking an output constraint (`TrivialPostcondition`). -/
+def subtypeInputMaskPost (x : { n : Nat // n < 10 }) (ret : Nat) : Prop :=
+  x.val < 10 ∨ ret = 42
+
+/-- Negative control: genuine constraint between two multi-valued `Subtype`s. -/
+def subtypeGenuinePost (x : { n : Nat // n < 10 }) (ret : { y : Nat // y < 20 }) : Prop :=
+  ret.val = x.val + 1
+
+/-- Syntactically tautological nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32TautPost (_args : List Value) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => True
+  | .aggregate 1 [.scalar sv] => sv.bits = sv.bits
+  | _ => True
+
+/-- Input-only nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32InputOnlyPost (x : Nat) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => x < 10
+  | .aggregate 1 [.scalar _] => x < 10
+  | _ => x < 10
+
+/-- Arithmetically tautological nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32ArithTautPost (_x : Nat) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => True
+  | .aggregate 1 [.scalar sv] => sv.bits + 0 = sv.bits
+  | _ => True
+
+/-- Arithmetically contradictory nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32ArithContraPost (_x : Nat) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => False
+  | .aggregate 1 [.scalar sv] => sv.bits + 1 ≤ sv.bits
+  | _ => False
+
+/-- Existentially tautological nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32ExistsTautPost (_x : Nat) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => True
+  | .aggregate 1 [.scalar sv] => ∃ k : Nat, sv.bits ≤ k
+  | _ => True
+
+/-- Boilerplate atoms hidden inside a nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32BoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      match retVal with
+      | .aggregate 0 [] => callFramePreserved req.memory memAfter ∧ retVal = retVal
+      | .aggregate 1 [.scalar sv] => callFramePreserved req.memory memAfter ∧ sv.bits = sv.bits
+      | _ => callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- Negative control: genuine nested `match` over `Option<u32>` MIR lowering. -/
+def matchOptionU32GenuinePost (a b : Nat) (ret : Value) : Prop :=
+  match ret with
+  | .aggregate 0 [] => scalarModulus 4 ≤ a + b
+  | .aggregate 1 [.scalar sv] =>
+    sv.sizeBytes = 4 ∧ a + b < scalarModulus 4 ∧ sv.bits = a + b
+  | _ => False
+
+/-- Multi-clause `externalSpecCallContract` whose user conjunct is reflexive (`retVal = retVal`)
+    alongside boilerplate (`callFramePreserved ∧ retMatchesCalleeReturnTy`). -/
+def multiClauseReflExtContract : MirCallContract :=
+  externalSpecCallContract "core::slice::is_empty" sliceIsEmptySidecar
+    sliceIsEmptyPre (fun _ retVal => retVal = retVal)
+
+/-- Multi-clause call contract conjoining `retVal = retVal` with `callFramePreserved`. -/
+def multiClauseReflAndFrameContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      retVal = retVal ∧ callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+/-- Mixed-fibre call contract: one fibre is tautological (`retVal = retVal`) while the
+    other is input-only (`req.args = []`), so the contract is `UnboundReturnOutput`, not
+    `TrivialPostcondition`. -/
+def mixedFibreTautAndInputOnlyContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if callFramePreserved req.memory memAfter then
+        retVal = retVal
+      else
+        req.args = []
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+/-- Mixed-fibre call contract: one fibre is tautological (`retVal = retVal`) while the
+    other binds `retVal` outside `requires` (`req.args = []`), so the contract is
+    `SurvivedAllMutants`, not `TrivialPostcondition`. -/
+def mixedFibreTautAndUnderReqContract : MirCallContract := {
+  pre := fun req => req.args = []
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if callFramePreserved req.memory memAfter then
+        retVal = retVal
+      else
+        req.args = [] ∨ retVal = .unit
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- External-spec `extraPost` matching on `Value.scalar` with an unbounded existential
+    upper bound `∃ k, sv.bits ≤ k`. -/
+def existsInBoilerplateExtContract : MirCallContract :=
+  externalSpecCallContract "test::exists_in_fibre" rangeClampSidecar
+    (fun _ => True)
+    (fun _ retVal => match retVal with | .scalar sv => ∃ k : Nat, sv.bits ≤ k | _ => False)
+
+/-- Existential output-insensitivity only under `requires` (`x < 10`): neither tautological
+    nor unsatisfiable under `x < 10`, and genuinely binds `ret = 0` when `x ≥ 10`. -/
+def existsUnderReqInsensitivePost (x ret : Nat) : Prop :=
+  ∃ k : Nat, ret ≤ k ∧ (if x < 10 then x = 0 else ret = 0)
+
+theorem finLeOnePost_no_two_outputs :
+    ∀ (n : Nat), finLeOnePre n → ∀ (r₁ r₂ : Fin n),
+      finLeOnePost n r₁ → finLeOnePost n r₂ := by
+  intro n hPre _ r₂ _
+  have h2 : r₂.val < n := r₂.isLt
+  dsimp [finLeOnePre] at hPre
+  dsimp [finLeOnePost]
+  omega
+
+theorem finSuccBoundTautPost_always_true (n : Nat) (ret : Fin (n + 1)) :
+    finSuccBoundTautPost n ret :=
+  Nat.le_of_lt_succ ret.isLt
+
+theorem subtypeRestatePost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) subtypeRestatePost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => ret.property)
+
+theorem subtypeContraPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) subtypeContraPost := by
+  rintro ⟨_, _, ret, hGe⟩
+  exact absurd hGe (Nat.not_le_of_gt ret.property)
+
+theorem subtypeSemanticSingletonPost_no_two_outputs :
+    ∀ (x : Nat) (r₁ r₂ : { y : Nat // y ≤ x ∧ x ≤ y }),
+      subtypeSemanticSingletonPost x r₁ → subtypeSemanticSingletonPost x r₂ := by
+  intro x r₁ r₂ h1
+  have hEq1 : r₁.val = x := Nat.le_antisymm r₁.property.1 r₁.property.2
+  have hEq2 : r₂.val = x := Nat.le_antisymm r₂.property.1 r₂.property.2
+  dsimp [subtypeSemanticSingletonPost] at h1 ⊢
+  exact hEq2.trans (hEq1.symm.trans h1)
+
+theorem subtypeInputMaskPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : { n : Nat // n < 10 } => True) subtypeInputMaskPost :=
+  not_postconditionDichotomy_of_trivial (fun x _ _ => Or.inl x.property)
+
+theorem subtypeGenuinePost_dichotomy :
+    PostconditionDichotomy (fun _ : { n : Nat // n < 10 } => True) subtypeGenuinePost := by
+  refine ⟨⟨0, by decide⟩, trivial, ⟨⟨1, by decide⟩, rfl⟩, ⟨⟨0, by decide⟩, ?_⟩⟩
+  intro h
+  exact Nat.zero_ne_one h
+
+theorem matchOptionU32TautPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : List Value => True) matchOptionU32TautPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    dsimp [matchOptionU32TautPost]
+    split <;> first | trivial | rfl)
+
+theorem matchOptionU32InputOnlyPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) matchOptionU32InputOnlyPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ _ h => by
+    dsimp [matchOptionU32InputOnlyPost] at h ⊢
+    split at h <;> split <;> exact h)
+
+theorem matchOptionU32ArithContraPost_not_realizable :
+    ¬ ContractRealizable (fun _ : Nat => True) matchOptionU32ArithContraPost := by
+  rintro ⟨_, _, _, h⟩
+  dsimp [matchOptionU32ArithContraPost] at h
+  split at h <;> first | exact h | omega
+
+theorem matchOptionU32ExistsTautPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) matchOptionU32ExistsTautPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    dsimp [matchOptionU32ExistsTautPost]
+    split
+    · trivial
+    · exact ⟨_, Nat.le_refl _⟩
+    · trivial)
+
+theorem matchOptionU32GenuinePost_dichotomy :
+    PostconditionDichotomy
+      (fun _ : Nat × Nat => True)
+      (fun p ret => matchOptionU32GenuinePost p.1 p.2 ret) := by
+  refine ⟨(2, 3), trivial,
+    ⟨.aggregate 1 [.scalar { bits := 5, sizeBytes := 4 }], ⟨rfl, by decide, rfl⟩⟩,
+    ⟨.aggregate 0 [], ?_⟩⟩
+  intro h
+  have hBound : scalarModulus 4 ≤ 2 + 3 := h
+  have hNot : ¬ (scalarModulus 4 ≤ 2 + 3) := by decide
+  exact hNot hBound
+
+theorem multiClauseReflExtContract_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "core::slice::is_empty" sliceIsEmptySidecar
+        sliceIsEmptyPre (fun _ retVal => retVal = retVal) :=
+  not_externalSpecEnsuresDichotomy_of_trivial_extraPost
+    "core::slice::is_empty" sliceIsEmptySidecar sliceIsEmptyPre (fun _ _ => rfl)
+
+theorem existsInBoilerplateExtContract_not_ensuresDichotomy :
+    ¬ ExternalSpecEnsuresDichotomy "test::exists_in_fibre" rangeClampSidecar
+        (fun _ => True)
+        (fun _ retVal => match retVal with | .scalar sv => ∃ k : Nat, sv.bits ≤ k | _ => False) := by
+  intro h
+  rcases (externalSpecEnsuresDichotomy_iff_moduloObservation
+    "test::exists_in_fibre" rangeClampSidecar (fun _ => True)
+    (fun _ retVal => match retVal with | .scalar sv => ∃ k : Nat, sv.bits ≤ k | _ => False)).mp h with
+    ⟨_, _, _, v_bad, _, _, _, hTyBad, _, hNotBad⟩
+  have hTy : ∃ bits : Nat, bits < scalarModulus 4 ∧
+      v_bad = .scalar { bits := bits, sizeBytes := 4 } := hTyBad
+  rcases hTy with ⟨bits, _, hEq⟩
+  subst hEq
+  exact hNotBad ⟨bits, Nat.le_refl bits⟩
+
+theorem existsUnderReqInsensitivePost_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy smallInputPre existsUnderReqInsensitivePost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun x hPre _ y₂ h => by
+    dsimp [existsUnderReqInsensitivePost, smallInputPre] at hPre h ⊢
+    rcases h with ⟨_, _, hIf⟩
+    refine ⟨y₂, Nat.le_refl y₂, ?_⟩
+    simpa [hPre] using hIf)
+
+theorem existsUnderReqInsensitivePost_dichotomy_without_pre :
+    PostconditionDichotomy (fun _ : Nat => True) existsUnderReqInsensitivePost := by
+  refine ⟨10, trivial, ⟨0, ⟨0, Nat.le_refl 0, rfl⟩⟩, ⟨1, ?_⟩⟩
+  rintro ⟨_, _, hIf⟩
+  exact Nat.succ_ne_zero 0 hIf
+
+-- Dependent/indexed types (`Fin n`, `Subtype`): invariants opened in prover probes and
+-- singleton/empty `Subtype` outputs detected syntactically in Phase 1.
+#eval assertEnsuresVacuous (Lean.mkConst ``finLeOnePost) (some (Lean.mkConst ``finLeOnePre))
+  (some .survivedAllMutants)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``finLeOnePost)
+#eval assertEnsuresVacuous (Lean.mkConst ``finSuccBoundTautPost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeRestatePost) none (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeContraPost) none (some .specViolation)
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeSingletonEqPost) none (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeSemanticSingletonPost) none
+  (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeUnsatPredPost) none (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``subtypeInputMaskPost) none (some .trivialPostcondition)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``subtypeGenuinePost)
+
+-- Nested `match` over `Value` (`Option<u32>` MIR lowering): syntactic collapse, bounded
+-- `match` splitting, existential witness instantiation, and boilerplate cofactoring.
+#eval assertEnsuresVacuous (Lean.mkConst ``matchOptionU32TautPost) none (some .trivialPostcondition)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``matchOptionU32InputOnlyPost) none
+  (some .unboundReturnOutput) { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresVacuous (Lean.mkConst ``matchOptionU32ArithTautPost) none
+  (some .trivialPostcondition)
+#eval assertEnsuresVacuous (Lean.mkConst ``matchOptionU32ArithContraPost) none
+  (some .specViolation)
+#eval assertEnsuresVacuous (Lean.mkConst ``matchOptionU32ExistsTautPost) none
+  (some .trivialPostcondition)
+#eval assertDeclEnsuresVacuous ``matchOptionU32BoilerplateContract (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertEnsuresBindsOutput (Lean.mkConst ``matchOptionU32GenuinePost)
+
+-- Multi-clause `externalSpecCallContract` / boilerplate-mixed fibres and existential
+-- output-insensitivity under `requires` (Phase 3 & Phase 5).
+#eval assertDeclEnsuresVacuous ``multiClauseReflExtContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``multiClauseReflExtContract (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertDeclEnsuresVacuous ``multiClauseReflAndFrameContract (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertDeclEnsuresVacuous ``multiClauseReflAndFrameContract (some .unboundReturnOutput)
+  { strictReturnValue := true, userEnsuresOnly := false }
+#eval assertDeclEnsuresVacuous ``mixedFibreTautAndInputOnlyContract (some .unboundReturnOutput)
+  { stepHeartbeats := 0, totalHeartbeats := 0 }
+#eval assertDeclEnsuresVacuous ``mixedFibreTautAndUnderReqContract (some .survivedAllMutants)
+#eval assertDeclEnsuresVacuous ``existsInBoilerplateExtContract (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``existsUnderReqInsensitivePost)
+  (some (Lean.mkConst ``smallInputPre)) (some .survivedAllMutants)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``existsUnderReqInsensitivePost)
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
