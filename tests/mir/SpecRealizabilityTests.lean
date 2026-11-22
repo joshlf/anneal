@@ -1493,6 +1493,132 @@ theorem conjHiddenContraPre_not_satisfiable :
   unless res.satisfiable? == some false do
     throwError "expected conjHiddenContraPre unsatisfiable, got {repr res}"
 
+/-! ### 3.12 Nested `match ans`, Parameterized Contracts & Existential `requires` -/
+
+/-- Helper predicate that re-matches on `ans`: its frame atom only becomes visible
+    once the matcher is iota-reduced on `MirCallAns.returned retVal memAfter`. -/
+def framedAnsHelper (req : MirCallReq) (ans : MirCallAns) : Prop :=
+  match ans with
+  | .returned _ memAfter => callFramePreserved req.memory memAfter
+  | .panicked _ => False
+  | .aborted => True
+
+/-- Helper predicate hiding the return-type atom behind a second `match ans`. -/
+def retTyAnsHelper (ans : MirCallAns) : Prop :=
+  match ans with
+  | .returned retVal _ => retMatchesCalleeReturnTy sliceIsEmptySidecar retVal
+  | .panicked _ => False
+  | .aborted => False
+
+/-- Boilerplate-only contract whose atoms hide behind helper wrappers that re-match
+    on `ans` under a conjunction. -/
+def nestedMatchBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans => framedAnsHelper req ans ∧ retTyAnsHelper ans
+}
+
+/-- The normal-return postcondition is exactly the auto-generated boilerplate. -/
+theorem nestedMatchBoilerplate_post_returned
+    (req : MirCallReq) (retVal : Value) (memAfter : Memory) :
+    nestedMatchBoilerplateContract.post req (.returned retVal memAfter) ↔
+      (callFramePreserved req.memory memAfter ∧
+        retMatchesCalleeReturnTy sliceIsEmptySidecar retVal) :=
+  Iff.rfl
+
+/-- Genuine contract behind the same helper plus an inline nested `match ans`: iota
+    reduction must expose, not erase, the return-value constraint. -/
+def nestedMatchGenuineContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    framedAnsHelper req ans ∧
+    (match ans with
+     | .returned retVal _ => retVal = Value.unit
+     | .panicked _ => False
+     | .aborted => False)
+}
+
+theorem nestedMatchGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy nestedMatchGenuineContract := by
+  let req : MirCallReq := { defPath := "", args := .nil, memory := emptyMemory }
+  refine ⟨req, emptyMemory, Value.unit, .scalar { bits := 7, sizeBytes := 4 },
+    trivial, ⟨callFramePreserved_refl emptyMemory, rfl⟩, ?_⟩
+  rintro ⟨_, hRet⟩
+  have hEq : Value.scalar { bits := 7, sizeBytes := 4 } = Value.unit := hRet
+  cases hEq
+
+/-- Parameterized contract: `checkDeclEnsuresBindsOutput` must open the declaration's
+    own parameters instead of misreading `Nat → Claim` as a non-`Prop` predicate. -/
+def boundedEchoClaim (bound : Nat) : Claim := {
+  body := sliceIsEmptySidecar
+  pre := fun args => ∃ n : Nat, n < bound ∧ args = [.scalar { bits := n, sizeBytes := 8 }]
+  post := fun args ret => args = [ret]
+}
+
+theorem boundedEchoClaim_dichotomy : ClaimDichotomy (boundedEchoClaim 1) := by
+  refine ⟨[.scalar { bits := 0, sizeBytes := 8 }], ⟨0, by decide, rfl⟩,
+    ⟨.scalar { bits := 0, sizeBytes := 8 }, rfl⟩,
+    ⟨Value.unit, ?_⟩⟩
+  intro hPost
+  have hList : [Value.scalar { bits := 0, sizeBytes := 8 }] = [Value.unit] := hPost
+  have hVal : Value.scalar { bits := 0, sizeBytes := 8 } = Value.unit :=
+    list_singleton_inj hList
+  cases hVal
+
+/-- Parameterized contract whose `ensures` is trivial at every instantiation. -/
+def boundedTrivialClaim (bound : Nat) : Claim := {
+  body := sliceIsEmptySidecar
+  pre := fun args => ∃ n : Nat, n < bound ∧ args = [.scalar { bits := n, sizeBytes := 8 }]
+  post := fun _ _ => True
+}
+
+theorem boundedTrivialClaim_not_dichotomy (bound : Nat) :
+    ¬ ClaimDichotomy (boundedTrivialClaim bound) := by
+  rintro ⟨_, _, _, ⟨_, hBad⟩⟩
+  exact hBad trivial
+
+/-- Existential list-encoded `requires`, the shape of `sliceIsEmptyPre`. -/
+def existsLenPre (args : List Value) : Prop :=
+  ∃ len : Nat, len < 10 ∧ args = [.scalar { bits := len, sizeBytes := 8 }]
+
+/-- Vacuous under the existential `requires`: every admissible `len` already satisfies
+    the left disjunct, so `ret` is constrained only outside the precondition. -/
+def existsLenVacuousPost (args : List Value) (ret : Value) : Prop :=
+  ∀ len : Nat, args = [.scalar { bits := len, sizeBytes := 8 }] →
+    len < 10 ∨ ret = Value.unit
+
+def existsLenVacuousClaim : Claim := {
+  body := sliceIsEmptySidecar
+  pre := existsLenPre
+  post := existsLenVacuousPost
+}
+
+theorem existsLenVacuousPost_not_dichotomy :
+    ¬ PostconditionDichotomy existsLenPre existsLenVacuousPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive
+    (fun _ hPre _ _ _ => by
+      obtain ⟨n, hLt, hArgs⟩ := hPre
+      intro len hLen
+      have hEqArgs : [Value.scalar { bits := n, sizeBytes := 8 }] =
+          [Value.scalar { bits := len, sizeBytes := 8 }] :=
+        hArgs.symm.trans hLen
+      have hN : n = len := (scalar_bits_inj (list_singleton_inj hEqArgs)).1
+      subst hN
+      exact Or.inl hLt)
+
+-- Boilerplate atoms behind helper wrappers that re-match on `ans` are still cofactored.
+#eval assertDeclEnsuresVacuous ``nestedMatchBoilerplateContract (some .unboundReturnOutput)
+-- A genuine constraint behind a nested `match ans` must pass in both modes.
+#eval assertDeclEnsuresBindsOutput ``nestedMatchGenuineContract
+#eval assertDeclEnsuresBindsOutput ``nestedMatchGenuineContract { strictReturnValue := true }
+-- Parameterized contracts are analyzed at arbitrary parameter values.
+#eval assertDeclEnsuresBindsOutput ``boundedEchoClaim
+#eval assertDeclEnsuresVacuous ``boundedTrivialClaim (some .trivialPostcondition)
+-- `requires`-relative vacuity is caught under an existential list-encoded `requires`.
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``existsLenVacuousPost) (some (Lean.mkConst ``existsLenPre))
+  (some .survivedAllMutants)
+#eval assertDeclEnsuresVacuous ``existsLenVacuousClaim (some .survivedAllMutants)
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/

@@ -2010,3 +2010,221 @@ fn stateful_pure_read_and_conjunctive_axis_probes() {
         }) if return_mutants_killed > 0
     ));
 }
+
+/// Asserts the `SpecCheckStats` accounting invariants that every outcome must satisfy,
+/// whether the check ran to completion or returned early.
+fn assert_stats_invariants(outcome: &SpecCheckOutcome) {
+    let stats = outcome.stats();
+    assert!(
+        stats.precondition_hits <= stats.trials_run,
+        "precondition_hits exceeds trials_run: {outcome:?}"
+    );
+    assert!(
+        stats.mutants_killed <= stats.mutants_tested,
+        "mutants_killed exceeds mutants_tested: {outcome:?}"
+    );
+    assert!(
+        stats.mutants_trapped <= stats.mutants_killed,
+        "mutants_trapped exceeds mutants_killed: {outcome:?}"
+    );
+    if let Some(FailureDetail::StatefulAxisUnconstrained {
+        return_mutants_tested,
+        return_mutants_killed,
+        state_mutants_tested,
+        state_mutants_killed,
+    }) = outcome.failure().map(|f| f.detail)
+    {
+        assert!(return_mutants_killed <= return_mutants_tested);
+        assert!(state_mutants_killed <= state_mutants_tested);
+        assert_eq!(
+            return_mutants_tested + state_mutants_tested,
+            stats.mutants_tested
+        );
+        assert_eq!(
+            return_mutants_killed + state_mutants_killed,
+            stats.mutants_killed
+        );
+    }
+}
+
+#[test]
+fn stats_invariants_hold_on_every_early_return_path() {
+    let cfg = SpecCheckConfig::default();
+
+    // Degenerate configuration: fails closed before sampling any input.
+    let degenerate = check_contract(
+        cfg.with_max_trials(0),
+        |_x: &u32| true,
+        |&x| x,
+        |&x, &r: &u32| r == x,
+    );
+    assert_stats_invariants(&degenerate);
+    assert_eq!(
+        degenerate.vacuity_class(),
+        Some(VacuityClass::DeadPrecondition)
+    );
+    assert_eq!(degenerate.stats().trials_run, 0);
+
+    // Dead precondition: every trial is sampled and none is admissible.
+    let dead = check_contract(cfg, |_x: &u32| false, |&x| x, |&x, &r: &u32| r == x);
+    assert_stats_invariants(&dead);
+    assert_eq!(dead.vacuity_class(), Some(VacuityClass::DeadPrecondition));
+    assert_eq!(dead.stats().trials_run, cfg.max_trials);
+    assert_eq!(dead.stats().precondition_hits, 0);
+
+    // Live postcondition violation on the very first admissible trial.
+    let violated = check_contract(cfg, |_x: &u32| true, |&x| x, |&x, &r: &u32| r != x);
+    assert_stats_invariants(&violated);
+    assert_eq!(violated.vacuity_class(), Some(VacuityClass::SpecViolation));
+    assert_eq!(violated.stats().trials_run, 1);
+    assert_eq!(violated.stats().precondition_hits, 1);
+    assert_eq!(violated.stats().mutants_tested, 0);
+
+    // Live postcondition violation after an earlier trial already killed mutants.
+    let late_violation = check_contract(
+        cfg,
+        |_x: &u32| true,
+        |&x| x,
+        |&x, &r: &u32| r == x && x != 1,
+    );
+    assert_stats_invariants(&late_violation);
+    assert_eq!(
+        late_violation.vacuity_class(),
+        Some(VacuityClass::SpecViolation)
+    );
+
+    // Trapping `pre`, `body`, and live `post` each fail closed immediately.
+    let pre_trap = check_contract_fallible(
+        cfg,
+        |_x: &u32| Err(()),
+        |&x| Ok(x),
+        |&x, &r: &u32| Ok(r == x),
+    );
+    assert_stats_invariants(&pre_trap);
+    assert!(matches!(
+        pre_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 0,
+            trap: TrapKind::PreconditionPanicked,
+        }))
+    ));
+    assert_eq!(pre_trap.stats().trials_run, 1);
+    assert_eq!(pre_trap.stats().precondition_hits, 0);
+
+    let body_trap = check_contract_fallible(
+        cfg,
+        |_x: &u32| Ok(true),
+        |_x| Err::<u32, ()>(()),
+        |&x, &r: &u32| Ok(r == x),
+    );
+    assert_stats_invariants(&body_trap);
+    assert!(matches!(
+        body_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 0,
+            trap: TrapKind::BodyPanicked,
+        }))
+    ));
+    assert_eq!(body_trap.stats().precondition_hits, 1);
+
+    let post_trap =
+        check_contract_fallible(cfg, |_x: &u32| Ok(true), |&x| Ok(x), |_x, _r: &u32| Err(()));
+    assert_stats_invariants(&post_trap);
+    assert!(matches!(
+        post_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 0,
+            trap: TrapKind::PostconditionPanicked,
+        }))
+    ));
+    assert_eq!(post_trap.stats().mutants_tested, 0);
+
+    // Zero mutant budget on a non-subsingleton return fails closed after all trials.
+    let no_budget = check_contract(
+        cfg.with_max_mutants_per_hit(0),
+        |_x: &u32| true,
+        |&x| x,
+        |&x, &r: &u32| r == x,
+    );
+    assert_stats_invariants(&no_budget);
+    assert_eq!(
+        no_budget.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert_eq!(no_budget.stats().mutants_tested, 0);
+
+    // Every mutant survives a constant-true postcondition.
+    let survived = check_contract(cfg, |_x: &u32| true, |&x| x, |_x, _r: &u32| true);
+    assert_stats_invariants(&survived);
+    assert_eq!(
+        survived.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(survived.stats().mutants_tested > 0);
+    assert_eq!(survived.stats().mutants_killed, 0);
+
+    // Strong contract: the invariants also hold on success.
+    let strong = check_contract(cfg, |_x: &u32| true, |&x| x, |&x, &r: &u32| r == x);
+    assert_stats_invariants(&strong);
+    assert!(strong.is_strong());
+    assert!(strong.stats().mutants_killed > 0);
+
+    // Stateful: an unconstrained post-state axis reports consistent per-axis counters.
+    let half_weak = check_stateful_contract(
+        cfg,
+        |_old: &u32, &()| true,
+        |state: &mut u32, &()| {
+            *state = state.wrapping_add(1);
+            *state
+        },
+        |old: &u32, &(), _new: &u32, ret: &u32| *ret == old.wrapping_add(1),
+    );
+    assert_stats_invariants(&half_weak);
+    assert!(matches!(
+        half_weak.failure().map(|f| f.detail),
+        Some(FailureDetail::StatefulAxisUnconstrained {
+            return_mutants_killed,
+            state_mutants_killed: 0,
+            ..
+        }) if return_mutants_killed > 0
+    ));
+
+    // Stateful: a trapping body fails closed with consistent counters.
+    let stateful_body_trap = check_stateful_contract_fallible(
+        cfg,
+        |_old: &u32, &()| Ok(true),
+        |_state: &mut u32, &()| Err::<u32, ()>(()),
+        |_old: &u32, &(), _new: &u32, _ret: &u32| Ok(true),
+    );
+    assert_stats_invariants(&stateful_body_trap);
+    assert!(matches!(
+        stateful_body_trap.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::ExecutionTrapped {
+            trial_idx: 0,
+            trap: TrapKind::BodyPanicked,
+        }))
+    ));
+
+    // Stateful: an assertion-style postcondition traps on every mutant of both axes.
+    let stateful_trapping = check_stateful_contract_fallible(
+        cfg,
+        |_old: &u32, &()| Ok(true),
+        |state: &mut u32, &()| {
+            *state = state.wrapping_add(1);
+            Ok(*state)
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| {
+            if *new == old.wrapping_add(1) && *ret == *new {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        },
+    );
+    assert_stats_invariants(&stateful_trapping);
+    assert!(stateful_trapping.is_strong());
+    let trapped = stateful_trapping.stats();
+    assert!(trapped.mutants_tested > 0);
+    assert_eq!(trapped.mutants_killed, trapped.mutants_tested);
+    assert_eq!(trapped.mutants_trapped, trapped.mutants_killed);
+}

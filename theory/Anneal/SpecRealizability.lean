@@ -1848,12 +1848,23 @@ private def isProtectedConst (env : Environment) (name : Name) : Bool :=
     | none => false
 
 /-- Unfold a user-defined head predicate (excluding `Init`/`Std`/`Lean`/`Trusted`
-    primitives, matchers, and projections) to expose hidden definitions in `requires`
-    and `ensures` clauses. -/
+    primitives, stuck matchers, and projections) to expose hidden definitions in
+    `requires` and `ensures` clauses.
+
+    A matcher applied to constructor discriminants is iota-reduced to its selected
+    alternative. Without this step a `match ans with ...` nested under a connective,
+    or hidden behind a helper predicate, stays opaque once `ans` has been
+    instantiated to `MirCallAns.returned retVal memAfter`, and the boilerplate atoms
+    inside its alternatives escape cofactoring. A matcher stuck on a variable is left
+    intact. Every step is a definitional unfolding or iota reduction, so the result
+    is definitionally equal to the input. -/
 private def unfoldUserHead : Nat → Expr → MetaM Expr
   | 0, e => return zetaBetaReduce 64 e
   | fuel + 1, e => do
     let e := zetaBetaReduce 64 e
+    match ← reduceMatcher? e with
+    | .reduced val => return ← unfoldUserHead fuel val
+    | _ => pure ()
     match e.getAppFn with
     | .const name _ =>
       let env ← getEnv
@@ -2446,36 +2457,51 @@ def checkEnsuresBindsOutput
         analyzeNormalizedSpec preInputs #[] outVars rawBody false requiresExpr? cfg
 
 /-- Check a named declaration (`Claim`, `StatefulClaim`, `TotalClaim`, `ModularClaim`,
-    `MirCallContract`, or standalone `ensures` predicate) for vacuity. -/
+    `MirCallContract`, or standalone `ensures` predicate) for vacuity. For the five
+    contract structures, `pre` is passed as `requires` whenever `cfg.useRequires`.
+
+    A parameterized contract such as `def boundedClaim (bound : Nat) : Claim` is
+    analyzed with its own parameters opened as local hypotheses. Every probe is then
+    proved for arbitrary parameter values, so such a contract is flagged only when it
+    is vacuous at every instantiation, instead of being misread as an `ensures`
+    predicate that does not return `Prop`. -/
 def checkDeclEnsuresBindsOutput
     (declName : Name) (cfg : EnsuresCheckConfig := {}) : MetaM EnsuresCheckResult := do
   let env ← getEnv
   let some info := env.find? declName
     | throwError "checkDeclEnsuresBindsOutput: unknown declaration `{declName}`"
-  let declExpr := mkConst declName (info.levelParams.map Level.param)
-  let ty ← whnf info.type
-  if ty.isConstOf ``Claim then
-    let preExpr := mkApp (mkConst ``Claim.pre) declExpr
-    let postExpr := mkApp (mkConst ``Claim.post) declExpr
-    checkEnsuresBindsOutput postExpr (if cfg.useRequires then some preExpr else none) cfg
-  else if ty.isConstOf ``StatefulClaim then
-    let preExpr := mkApp (mkConst ``StatefulClaim.pre) declExpr
-    let postExpr := mkApp (mkConst ``StatefulClaim.post) declExpr
-    checkEnsuresBindsOutput postExpr (if cfg.useRequires then some preExpr else none) cfg
-  else if ty.isConstOf ``TotalClaim then
-    let preExpr := mkApp (mkConst ``TotalClaim.pre) declExpr
-    let postExpr := mkApp (mkConst ``TotalClaim.post) declExpr
-    checkEnsuresBindsOutput postExpr (if cfg.useRequires then some preExpr else none) cfg
-  else if ty.isConstOf ``ModularClaim then
-    let preExpr := mkApp (mkConst ``ModularClaim.pre) declExpr
-    let postExpr := mkApp (mkConst ``ModularClaim.post) declExpr
-    checkEnsuresBindsOutput postExpr (if cfg.useRequires then some preExpr else none) cfg
-  else if ty.isConstOf ``MirCallContract then
-    let preExpr := mkApp (mkConst ``MirCallContract.pre) declExpr
-    let postExpr := mkApp (mkConst ``MirCallContract.post) declExpr
-    checkEnsuresBindsOutput postExpr (if cfg.useRequires then some preExpr else none) cfg
-  else
-    checkEnsuresBindsOutput declExpr none cfg
+  let declConst := mkConst declName (info.levelParams.map Level.param)
+  let contractResult? : Option EnsuresCheckResult ←
+    forallTelescopeReducing info.type fun (params : Array Expr) (resTy : Expr) => do
+      let declExpr := mkAppN declConst params
+      let ty ← whnf resTy
+      let projNames? : Option (Name × Name) :=
+        if ty.isConstOf ``Claim then
+          some (``Claim.pre, ``Claim.post)
+        else if ty.isConstOf ``StatefulClaim then
+          some (``StatefulClaim.pre, ``StatefulClaim.post)
+        else if ty.isConstOf ``TotalClaim then
+          some (``TotalClaim.pre, ``TotalClaim.post)
+        else if ty.isConstOf ``ModularClaim then
+          some (``ModularClaim.pre, ``ModularClaim.post)
+        else if ty.isConstOf ``MirCallContract then
+          some (``MirCallContract.pre, ``MirCallContract.post)
+        else
+          none
+      match projNames? with
+      | some (preName, postName) =>
+        let preExpr := mkApp (mkConst preName) declExpr
+        let postExpr := mkApp (mkConst postName) declExpr
+        let res ← checkEnsuresBindsOutput postExpr
+          (if cfg.useRequires then some preExpr else none) cfg
+        return some res
+      | none => return none
+  match contractResult? with
+  | some res => return res
+  | none =>
+    -- Standalone `ensures` predicate: analyzed outside the parameter telescope so its
+    -- own binders are split into inputs and outputs by `checkEnsuresBindsOutput`.
+    checkEnsuresBindsOutput declConst none cfg
 
 /-- Build nested `Exists` proposition `∃ x₀ ... x_{k-1}, body` over `fvars`. -/
 private def mkNestedExists (fvars : Array Expr) (body : Expr) : MetaM Expr := do
