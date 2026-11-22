@@ -31,8 +31,11 @@ Exercises:
    never becomes Lean's unlimited `maxHeartbeats = 0`), `strictReturnValue` on
    postconditions that merely mention `retVal`, uninhabited and inhabited recursive
    output types, non-reflexive `LE`, outputs hidden behind definitions, input-only
-   tautologies, contradictory and `requires`-vacuous boilerplate fibres, and
-   type-checked substituted goals.
+   tautologies, contradictory and `requires`-vacuous boilerplate fibres,
+   type-checked substituted goals, degradation notes that tell a probe the tactics
+   failed to prove apart from one a heartbeat or recursion cap cut off,
+   `TotalClaim` / `ModularClaim` declarations, and the literal cross-language
+   `VacuityClass` wire names.
 4. **Compile-Time Kernel Axiom Audit (EOF)**: Audits every constant defined by the
    `Anneal.SpecRealizability` module and by this file (selected by defining module, not
    by name prefix), of every kind (theorems, definitions, instances), for
@@ -2078,6 +2081,143 @@ theorem multiArgConjProtectors_not_dichotomyModuloBoilerplate :
     { stepHeartbeats := 1, totalHeartbeats := 1 }
   unless starvedCall.bindsOutput && !starvedCall.notes.isEmpty do
     throwError "expected starved MirCallAns check to accept with degradation note, got {repr starvedCall}"
+
+/-! ### 3.16 A Failed Probe Is Not a Cutoff: Degradation Notes Only on Real Cutoffs -/
+
+/-- Genuine linear postcondition. Every vacuity probe against it fails fast: the
+    tactics give up with an ordinary error long before any heartbeat or recursion cap. -/
+def succExactPost (x ret : Nat) : Prop := ret = x + 1
+
+theorem succExactPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) succExactPost := by
+  refine ⟨0, trivial, ⟨1, ?_⟩, ⟨0, ?_⟩⟩
+  · show (1 : Nat) = 0 + 1
+    rfl
+  · intro h
+    have h' : (0 : Nat) = 0 + 1 := h
+    omega
+
+#eval show Lean.Meta.MetaM Unit from do
+  -- An ordinary exception (what a tactic that cannot close its goal throws) is a
+  -- failure, not a cutoff; only heartbeat or recursion exhaustion is a cutoff.
+  let failed ← withBoundedHeartbeatsOutcome 1000000
+    (throwError "ordinary probe failure" : Lean.Meta.MetaM Nat)
+  unless failed.isFailed && !failed.isCutOff && failed.toOption.isNone do
+    throwError "expected an ordinary exception to be classified as failed, not cut off"
+  let finished ← withBoundedHeartbeatsOutcome 1000000 (pure 7 : Lean.Meta.MetaM Nat)
+  unless finished.toOption == some 7 && !finished.isFailed && !finished.isCutOff do
+    throwError "expected a normal return to be classified as done"
+  let cutOff ← withBoundedHeartbeatsOutcome 1000 do
+    let mut acc := Lean.mkNatLit 0
+    for i in [0:20000] do
+      acc ← Lean.Meta.whnf (Lean.mkNatAdd acc (Lean.mkNatLit i))
+      Lean.Core.checkSystem "SpecRealizabilityTests cutoff classification probe"
+    return acc
+  unless cutOff.isCutOff && !cutOff.isFailed && cutOff.toOption.isNone do
+    throwError "expected heartbeat exhaustion to be classified as cut off"
+  -- A genuine postcondition under the default budget is accepted with no note at
+  -- all: its probes are refuted by failing tactics, and a failed tactic must not be
+  -- reported as a probe that "exceeded its heartbeat/recursion cap".
+  let cleanRes ← checkEnsuresBindsOutput (Lean.mkConst ``succExactPost)
+  unless cleanRes.bindsOutput && cleanRes.notes.isEmpty do
+    throwError "expected succExactPost accepted without degradation notes, got {repr cleanRes}"
+  -- The same postcondition under a one-unit per-snippet cap really is cut off, and
+  -- only then carries a degradation note.
+  let starvedClean ← checkEnsuresBindsOutput (Lean.mkConst ``succExactPost) none
+    { stepHeartbeats := 1, totalHeartbeats := 250000 }
+  unless starvedClean.bindsOutput && !starvedClean.notes.isEmpty do
+    throwError "expected starved succExactPost accepted with a degradation note, got {repr starvedClean}"
+
+/-! ### 3.17 `TotalClaim` and `ModularClaim` Declarations -/
+
+/-- Total-correctness counterpart of `statefulCounterStepClaim`. -/
+def totalCounterStepClaim : TotalClaim := {
+  body := statefulCounterStepBody
+  pre := statefulCounterStepPre
+  post := statefulCounterStepPost
+}
+
+/-- Rely-guarantee counterpart of `statefulCounterStepClaim`. -/
+def modularCounterStepClaim : ModularClaim := {
+  body := statefulCounterStepBody
+  envAssumed := fun _ => True
+  pre := statefulCounterStepPre
+  post := statefulCounterStepPost
+}
+
+/-- Total-correctness claim that pins `mem'` and never mentions the return value. -/
+def memOnlyTotalClaim : TotalClaim := {
+  body := statefulCounterStepBody
+  pre := fun _ _ => True
+  post := fun _ mem _ mem' => mem' = mem
+}
+
+/-- Rely-guarantee claim that pins `mem'` and never mentions the return value. -/
+def memOnlyModularClaim : ModularClaim := {
+  body := statefulCounterStepBody
+  envAssumed := fun _ => True
+  pre := fun _ _ => True
+  post := fun _ mem _ mem' => mem' = mem
+}
+
+theorem totalCounterStep_returnDichotomy :
+    TotalClaimReturnDichotomy totalCounterStepClaim := by
+  refine ⟨[], emptyMemory, { emptyMemory with nextTag := emptyMemory.nextTag + 1 },
+    .scalar { bits := emptyMemory.nextTag, sizeBytes := 4 },
+    .scalar { bits := 0, sizeBytes := 4 },
+    ⟨rfl, by decide⟩, ⟨rfl, rfl⟩, ?_⟩
+  rintro ⟨hRet, _⟩
+  have hBits : (0 : Nat) = emptyMemory.nextTag := (scalar_bits_inj hRet).1
+  dsimp [emptyMemory] at hBits
+  omega
+
+theorem modularCounterStep_returnDichotomy :
+    ModularClaimReturnDichotomy modularCounterStepClaim := by
+  refine ⟨[], emptyMemory, { emptyMemory with nextTag := emptyMemory.nextTag + 1 },
+    .scalar { bits := emptyMemory.nextTag, sizeBytes := 4 },
+    .scalar { bits := 0, sizeBytes := 4 },
+    ⟨rfl, by decide⟩, ⟨rfl, rfl⟩, ?_⟩
+  rintro ⟨hRet, _⟩
+  have hBits : (0 : Nat) = emptyMemory.nextTag := (scalar_bits_inj hRet).1
+  dsimp [emptyMemory] at hBits
+  omega
+
+theorem memOnlyTotal_not_returnDichotomy :
+    ¬ TotalClaimReturnDichotomy memOnlyTotalClaim := by
+  rintro ⟨_, _, _, _, _, _, hOk, hBad⟩
+  exact hBad hOk
+
+theorem memOnlyModular_not_returnDichotomy :
+    ¬ ModularClaimReturnDichotomy memOnlyModularClaim := by
+  rintro ⟨_, _, _, _, _, _, hOk, hBad⟩
+  exact hBad hOk
+
+-- `checkDeclEnsuresBindsOutput` reads `pre` / `post` off all four claim structures:
+-- the genuine counter step passes and the return-ignoring claim is flagged, exactly
+-- as for the `StatefulClaim` versions of the same contracts.
+#eval assertDeclEnsuresBindsOutput ``totalCounterStepClaim
+#eval assertDeclEnsuresBindsOutput ``totalCounterStepClaim { strictReturnValue := true }
+#eval assertDeclEnsuresBindsOutput ``modularCounterStepClaim
+#eval assertDeclEnsuresBindsOutput ``modularCounterStepClaim { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``memOnlyTotalClaim (some .unboundReturnOutput)
+  { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``memOnlyModularClaim (some .unboundReturnOutput)
+  { strictReturnValue := true }
+-- Without `strictReturnValue` the pair `(retVal, mem')` is the output, and `mem' = mem`
+-- does constrain it.
+#eval assertDeclEnsuresBindsOutput ``memOnlyTotalClaim
+#eval assertDeclEnsuresBindsOutput ``memOnlyModularClaim
+
+/-! ### 3.18 Cross-Language `VacuityClass` Wire Names -/
+
+-- The five canonical names are pinned literally. The Rust dynamic checker's
+-- `VacuityClass::canonical_name` returns exactly these strings, and its test suite
+-- pins the same five literals, so neither side can drift without a test failing.
+example : VacuityClass.deadPrecondition.canonicalName = "DeadPrecondition" := rfl
+example : VacuityClass.specViolation.canonicalName = "SpecViolation" := rfl
+example : VacuityClass.trivialPostcondition.canonicalName = "TrivialPostcondition" := rfl
+example : VacuityClass.unboundReturnOutput.canonicalName = "UnboundReturnOutput" := rfl
+example : VacuityClass.survivedAllMutants.canonicalName = "SurvivedAllMutants" := rfl
 
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 

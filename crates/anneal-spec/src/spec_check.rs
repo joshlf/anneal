@@ -1365,22 +1365,43 @@ impl<
                 ));
             }
             if k == 0 {
-                if let (Some(a0), Some(b0)) = (a_muts[0].as_ref(), b_muts[0].as_ref()) {
+                let a0 = a_muts[0].as_ref();
+                let b0 = b_muts[0].as_ref();
+                let c0 = c_muts[0].as_ref();
+                let d0 = d_muts[0].as_ref();
+                if let (Some(a0), Some(b0)) = (a0, b0) {
                     emit((a0.clone(), b0.clone(), self.2.clone(), self.3.clone()));
                 }
-                if let (Some(b0), Some(c0)) = (b_muts[0].as_ref(), c_muts[0].as_ref()) {
+                if let (Some(b0), Some(c0)) = (b0, c0) {
                     emit((self.0.clone(), b0.clone(), c0.clone(), self.3.clone()));
                 }
-                if let (Some(c0), Some(d0)) = (c_muts[0].as_ref(), d_muts[0].as_ref()) {
+                if let (Some(c0), Some(d0)) = (c0, d0) {
                     emit((self.0.clone(), self.1.clone(), c0.clone(), d0.clone()));
                 }
-                if let (Some(a0), Some(b0), Some(c0), Some(d0)) = (
-                    a_muts[0].as_ref(),
-                    b_muts[0].as_ref(),
-                    c_muts[0].as_ref(),
-                    d_muts[0].as_ref(),
-                ) {
-                    emit((a0.clone(), b0.clone(), c0.clone(), d0.clone()));
+                // Jointly perturb every axis that produced a mutant, keeping the
+                // original component on an axis that produced none (a
+                // subsingleton field such as `()`). A postcondition that is a
+                // disjunction over two components (`r.0 == a || r.2 == b`) is
+                // only ever falsified by perturbing both at once; requiring all
+                // four axes to be active would leave such a genuine contract
+                // with no killable mutant whenever the tuple carries a
+                // subsingleton component. The joint is skipped when it would
+                // repeat the single adjacent pair emitted just above.
+                let joint_axes = usize::from(a0.is_some())
+                    + usize::from(b0.is_some())
+                    + usize::from(c0.is_some())
+                    + usize::from(d0.is_some());
+                let repeats_adjacent_pair = joint_axes == 2
+                    && ((a0.is_some() && b0.is_some())
+                        || (b0.is_some() && c0.is_some())
+                        || (c0.is_some() && d0.is_some()));
+                if joint_axes >= 2 && !repeats_adjacent_pair {
+                    emit((
+                        a0.cloned().unwrap_or_else(|| self.0.clone()),
+                        b0.cloned().unwrap_or_else(|| self.1.clone()),
+                        c0.cloned().unwrap_or_else(|| self.2.clone()),
+                        d0.cloned().unwrap_or_else(|| self.3.clone()),
+                    ));
                 }
             }
         }

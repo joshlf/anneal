@@ -1194,17 +1194,46 @@ def cappedHeartbeats? (remainingInternal : Nat) (stepUnits : Nat) : Option Nat :
     let stepInternal := max 1000 (stepUnits * 1000)
     some (max 1000 (min remainingInternal stepInternal))
 
+/-- How a heartbeat-bounded computation ended (`withBoundedHeartbeatsOutcome`). -/
+inductive BoundedOutcome (α : Type) : Type where
+  /-- The computation returned `val`. -/
+  | done (val : α)
+  /-- The computation threw an ordinary exception, such as a tactic that failed to
+      close its goal. Its budget is not what stopped it. -/
+  | failed
+  /-- The computation exhausted its heartbeat cap or the recursion depth. -/
+  | cutOff
+
+/-- The value of a computation that returned normally. -/
+def BoundedOutcome.toOption {α : Type} : BoundedOutcome α → Option α
+  | .done val => some val
+  | .failed => none
+  | .cutOff => none
+
+/-- `true` exactly for an ordinary (non-runtime) exception. -/
+def BoundedOutcome.isFailed {α : Type} : BoundedOutcome α → Bool
+  | .done _ => false
+  | .failed => true
+  | .cutOff => false
+
+/-- `true` exactly for heartbeat or recursion-depth exhaustion. -/
+def BoundedOutcome.isCutOff {α : Type} : BoundedOutcome α → Bool
+  | .done _ => false
+  | .failed => false
+  | .cutOff => true
+
 /-- Run a `MetaM` computation under a strictly positive heartbeat cap, also respecting
-    any tighter outer `Core.Context.maxHeartbeats`. Returns `none` when the computation
-    throws, including when it exhausts the heartbeat cap or the recursion depth.
+    any tighter outer `Core.Context.maxHeartbeats`, and report how it ended.
 
     Heartbeat and recursion-depth exhaustion are *runtime* exceptions, which the
     ordinary `try ... catch` of `CoreM`-based monads deliberately re-throws; they are
-    intercepted here with `tryCatchRuntimeEx` so an over-budget probe is reported as
-    undecided instead of aborting the whole checker. Interrupt exceptions still
-    propagate. -/
-def withBoundedHeartbeats {α : Type} (capInternal : Nat) (x : MetaM α) :
-    MetaM (Option α) := do
+    intercepted here with `tryCatchRuntimeEx` and reported as `.cutOff`, so an
+    over-budget probe never aborts the whole checker. Every other exception is
+    reported as `.failed`: a tactic that cannot close its goal throws an ordinary
+    exception well within its budget, and that is not a degraded probe. Interrupt
+    exceptions still propagate. -/
+def withBoundedHeartbeatsOutcome {α : Type} (capInternal : Nat) (x : MetaM α) :
+    MetaM (BoundedOutcome α) := do
   let safeCap := max 1000 capInternal
   let now ← IO.getNumHeartbeats
   let origCtx ← readThe Core.Context
@@ -1221,8 +1250,16 @@ def withBoundedHeartbeats {α : Type} (capInternal : Nat) (x : MetaM α) :
       let res ← withTheReader Core.Context
         (fun ctx => { ctx with initHeartbeats := now, maxHeartbeats := effCap })
         x
-      return some res)
-    (fun _ => return none)
+      return BoundedOutcome.done res)
+    (fun (ex : Lean.Exception) =>
+      return (if ex.isRuntime then BoundedOutcome.cutOff else BoundedOutcome.failed))
+
+/-- `withBoundedHeartbeatsOutcome` for callers that only need the value: returns
+    `none` when the computation throws, including when it exhausts the heartbeat cap
+    or the recursion depth. -/
+def withBoundedHeartbeats {α : Type} (capInternal : Nat) (x : MetaM α) :
+    MetaM (Option α) := do
+  return (← withBoundedHeartbeatsOutcome capInternal x).toOption
 
 /-- Mutable internal-heartbeat budget tracker across bounded prover probes. -/
 structure ProbeBudget : Type where
@@ -1325,7 +1362,10 @@ private def destructHypsMulti
       catch _ =>
         destructHypsMulti maxGoals fuel ((mvarId, tried'.push fvarId) :: rest) done
 
-/-- Outcome of a single bounded tactic probe. -/
+/-- Outcome of a single bounded tactic probe. `undecided` covers a tactic that ran to
+    completion without proving the goal (it left goals open, or threw an ordinary
+    tactic-failure exception); `cutOff` is reserved for a probe that the heartbeat or
+    recursion-depth cap stopped before it could finish. -/
 private inductive ProbeOutcome : Type where
   | proved
   | undecided
@@ -1339,14 +1379,19 @@ private inductive ProbeOutcome : Type where
     The goal itself is typechecked first: a goal assembled by substitution (for
     example, an output-insensitivity goal over a dependent output type) is never
     handed to a tactic unless it is type-correct, so an ill-typed goal can never be
-    reported as proved. Returns `.cutOff` when the heartbeat or recursion-depth cap
-    aborts the probe. -/
+    reported as proved.
+
+    Returns `.cutOff` only when the heartbeat or recursion-depth cap aborts the probe.
+    A tactic that fails to close its goal throws an ordinary exception (`Tactic.run`
+    re-throws it) and is `.undecided`, exactly like one that leaves goals open: a
+    genuine specification refutes every vacuity probe this way, well within budget,
+    and must not be reported as a degraded check. -/
 private def tryTacticSnippetOutcome
     (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM ProbeOutcome := do
   let savedMsgs := (← getThe Core.State).messages
   let result ← withoutModifyingState do
     modifyThe Core.State fun s => { s with messages := {} }
-    let attempt? ← withBoundedHeartbeats stepCapInternal do
+    let attempt ← withBoundedHeartbeatsOutcome stepCapInternal do
       let goalTy ← instantiateMVars goalTy
       if !(← isTypeCorrect goalTy) then
         return false
@@ -1372,10 +1417,11 @@ private def tryTacticSnippetOutcome
       if !(← isDefEq proofTy goalTy) then
         return false
       return true
-    match attempt? with
-    | some true => return .proved
-    | some false => return .undecided
-    | none => return .cutOff
+    match attempt with
+    | .done true => return .proved
+    | .done false => return .undecided
+    | .failed => return .undecided
+    | .cutOff => return .cutOff
   modifyThe Core.State fun s => { s with messages := savedMsgs }
   return result
 

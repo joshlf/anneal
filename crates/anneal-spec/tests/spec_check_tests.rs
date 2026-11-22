@@ -2989,3 +2989,115 @@ fn zero_panic_all_primitive_widths_wrapping_signed_and_array_lengths() {
     assert!(saw_i128_min);
     assert!(wrap_i128_add.is_pointwise_strong());
 }
+
+// ---------------------------------------------------------------------------
+// 4-tuple joint mutants across subsingleton components
+// ---------------------------------------------------------------------------
+
+/// Named 4-field struct with a subsingleton marker between its live fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TaggedTriple {
+    head: u8,
+    tag: UnitMarker,
+    mid: u8,
+    tail: u8,
+}
+
+anneal_spec::impl_spec_check_struct!(TaggedTriple {
+    head: u8,
+    tag: UnitMarker,
+    mid: u8,
+    tail: u8,
+});
+
+#[test]
+fn quad_joint_mutants_span_non_adjacent_axes_around_subsingleton_components() {
+    // The joint mutant perturbs every component that has a mutant and keeps a
+    // subsingleton component as is, so it exists even when a `()` separates
+    // the live components.
+    let mut joint_count = 0usize;
+    let mut total = 0usize;
+    (10u8, (), 20u8, 30u8).visit_mutants(&mut SplitMix64::new(7), |m| {
+        total += 1;
+        if m.0 != 10 && m.2 != 20 && m.3 != 30 {
+            joint_count += 1;
+        }
+    });
+    assert_eq!(joint_count, 1);
+    assert!(total <= 16);
+
+    // Two live components that are not adjacent still get one joint mutant.
+    let mut far_joint_count = 0usize;
+    (10u8, (), (), 30u8).visit_mutants(&mut SplitMix64::new(7), |m| {
+        if m.0 != 10 && m.3 != 30 {
+            far_joint_count += 1;
+        }
+    });
+    assert_eq!(far_joint_count, 1);
+
+    // An adjacent live pair is perturbed jointly exactly once, not twice.
+    let mut near_joint_count = 0usize;
+    (10u8, 20u8, (), ()).visit_mutants(&mut SplitMix64::new(7), |m| {
+        if m.0 != 10 && m.1 != 20 {
+            near_joint_count += 1;
+        }
+    });
+    assert_eq!(near_joint_count, 1);
+
+    // With all four components live the mutant set stays within the default
+    // 16-mutant budget and still ends round 0 with the all-axes joint.
+    let mut full_total = 0usize;
+    let mut full_joint_count = 0usize;
+    (10u8, 20u8, 30u8, 40u8).visit_mutants(&mut SplitMix64::new(7), |m| {
+        full_total += 1;
+        if m.0 != 10 && m.1 != 20 && m.2 != 30 && m.3 != 40 {
+            full_joint_count += 1;
+        }
+    });
+    assert_eq!(full_total, 16);
+    assert_eq!(full_joint_count, 1);
+
+    // A disjunction over two components is a genuine (if loose) contract: each
+    // single-component mutant survives because the other disjunct still holds,
+    // so only a joint perturbation can falsify it. It must not be reported as
+    // vacuous merely because a subsingleton sits between the two components.
+    let across_unit = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_i: &(u8, u8)| true,
+        |&(a, b)| (a, (), b, 0u8),
+        |&(a, b), r: &(u8, (), u8, u8)| r.0 == a || r.2 == b,
+    );
+    assert!(across_unit.mutants_killed > 0);
+
+    let across_two_units = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_i: &(u8, u8)| true,
+        |&(a, b)| (a, (), (), b),
+        |&(a, b), r: &(u8, (), (), u8)| r.0 == a || r.3 == b,
+    );
+    assert!(across_two_units.mutants_killed > 0);
+
+    // The same holds for a struct that delegates to the 4-tuple of its fields.
+    let tagged = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_i: &(u8, u8)| true,
+        |&(a, b)| TaggedTriple {
+            head: a,
+            tag: UnitMarker,
+            mid: b,
+            tail: 0,
+        },
+        |&(a, b), r: &TaggedTriple| r.head == a || r.mid == b,
+    );
+    assert!(tagged.mutants_killed > 0);
+
+    // A postcondition that ignores the output is still caught: the wider joint
+    // adds a mutant to test, never a way to pass.
+    let ignores_output = check_contract(
+        SpecCheckConfig::default(),
+        |_i: &(u8, u8)| true,
+        |&(a, b)| (a, (), b, 0u8),
+        |_i, _r: &(u8, (), u8, u8)| true,
+    );
+    assert!(matches!(ignores_output, SpecCheckOutcome::Failed(_)));
+}
