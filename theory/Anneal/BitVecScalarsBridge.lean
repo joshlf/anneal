@@ -53,6 +53,8 @@ Sections:
 9. Chunking, arrays and `BitValidity` transmutation.
 10. Derived transfers: abstraction normalization, signed casts, `ctlz` from ranges.
 11. Sign-flag independence, operational `evalScalarBinOp` lifts, signed-integer arrays.
+12. Checked/unchecked MIR arithmetic & shifts, bitwise interval bounds, big-endian decode and
+    typed `[iN; n]` codecs.
 -/
 
 /-! ## 0. Notation Bridges -/
@@ -4517,5 +4519,678 @@ theorem array_int_to_uint_transmute_sound (layouts : LayoutTable) (w₁ : IntTy)
   transmute_sound_of_into_from_bytes layouts _ _
     (array_int_isIntoBytes layouts w₁ n₁ idx₁) (array_uint_isFromBytes layouts w₂ n₂ idx₂)
     (by rw [rigidTyByteSize_array_int, rigidTyByteSize_array_uint, hsize]) v bs hEnc
+
+/-! ## 12. Checked/Unchecked Arithmetic & Shifts, Bitwise Ranges, Big-Endian Decode and `[iN; n]` -/
+
+/-- Generic operational lift for unsigned division and remainder: any transfer proved on
+`evalBinOp` lifts directly to `Trusted` `evalScalarBinOp`. -/
+theorem evalScalarBinOp_divRem_unsigned_transfer {sz : Nat} (hsz : 0 < sz) {op : BinOp}
+    (hop : op = .div ∨ op = .rem) {x y : ScalarInt} (hx : x.sizeBytes = sz) (hy : y.sizeBytes = sz)
+    {P : ScalarInt → Prop} (h : ∃ r, Anneal.Scalars.evalBinOp op x y false = some r ∧ P r)
+    (locals : List LocalSlot) (mem : Memory) :
+    ∃ r, evalScalarBinOp op x y locals mem false = .ok (.scalar r) locals mem ∧ P r := by
+  cases x with
+  | mk a sx =>
+    cases y with
+    | mk b sy =>
+      have hx' : sx = sz := hx
+      have hy' : sy = sz := hy
+      subst hx'; subst hy'
+      obtain ⟨r, hr, hP⟩ := h
+      exact ⟨r, evalScalarBinOp_divRem_unsigned_of_evalBinOp hsz hop hr locals mem, hP⟩
+
+/-- `evalCastValue` is rejected exactly on a zero-width source or zero-width destination. -/
+theorem evalCastValue_eq_none_iff (sc : ScalarInt) (dstBytes : Nat) (srcIsSigned : Bool) :
+    Anneal.Scalars.evalCastValue sc dstBytes srcIsSigned = none ↔
+      sc.sizeBytes = 0 ∨ dstBytes = 0 := by
+  unfold Anneal.Scalars.evalCastValue
+  cases h0 : Nat.beq sc.sizeBytes 0 with
+  | true => exact ⟨fun _ => Or.inl (Nat.eq_of_beq_eq_true h0), fun _ => rfl⟩
+  | false =>
+    have hne : sc.sizeBytes ≠ 0 := fun h => by rw [h] at h0; nomatch h0
+    cases h1 : Nat.beq dstBytes 0 with
+    | true => exact ⟨fun _ => Or.inr (Nat.eq_of_beq_eq_true h1), fun _ => rfl⟩
+    | false =>
+      have hne' : dstBytes ≠ 0 := fun h => by rw [h] at h1; nomatch h1
+      refine ⟨fun h => ?_, fun h => ?_⟩
+      · cases h
+      · cases h with
+        | inl h => exact absurd h hne
+        | inr h => exact absurd h hne'
+
+/-- `signedOverflowAdd` is `false` whenever the ported `signedKey` sum stays within the
+two's-complement no-underflow / no-overflow window (`2^(w-1) ≤ signedKey a + signedKey b <
+2^(w-1) + 2^w`). -/
+theorem signedOverflowAdd_eq_false_of_signedKey_bounds {sz : Nat} (hsz : 0 < sz) (a b : Nat)
+    (hno_udf : 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) a) +
+        Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) b))
+    (hno_ovf :
+      Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) a) +
+        Anneal.BitVecArith.signedKey (BitVec.ofNat (8 * sz) b) <
+          2 ^ (8 * sz - 1) + 2 ^ (8 * sz)) :
+    signedOverflowAdd a b sz = false := by
+  have hw : 0 < 8 * sz := by omega
+  have hsum := Anneal.BitVecArith.signedKey_add_no_overflow hw
+    (a := BitVec.ofNat (8 * sz) a) (b := BitVec.ofNat (8 * sz) b) hno_udf hno_ovf
+  rw [Anneal.Scalars.signedOverflowAdd_eq_msb]
+  cases ha : (BitVec.ofNat (8 * sz) a).msb with
+  | false =>
+    cases hb : (BitVec.ofNat (8 * sz) b).msb with
+    | true => rfl
+    | false =>
+      have hka := Anneal.BitVecArith.half_le_signedKey_of_msb_false hw ha
+      have hkb := Anneal.BitVecArith.half_le_signedKey_of_msb_false hw hb
+      rw [natPow_eq] at hka hkb hsum
+      cases hs : (BitVec.ofNat (8 * sz) a + BitVec.ofNat (8 * sz) b).msb with
+      | false => rfl
+      | true =>
+        have hks := Anneal.BitVecArith.signedKey_lt_half_of_msb_true hw hs
+        rw [natPow_eq] at hks
+        omega
+  | true =>
+    cases hb : (BitVec.ofNat (8 * sz) b).msb with
+    | false => rfl
+    | true =>
+      have hka := Anneal.BitVecArith.signedKey_lt_half_of_msb_true hw ha
+      have hkb := Anneal.BitVecArith.signedKey_lt_half_of_msb_true hw hb
+      rw [natPow_eq] at hka hkb hsum
+      cases hs : (BitVec.ofNat (8 * sz) a + BitVec.ofNat (8 * sz) b).msb with
+      | true => rfl
+      | false =>
+        have hks := Anneal.BitVecArith.half_le_signedKey_of_msb_false hw hs
+        rw [natPow_eq] at hks
+        omega
+
+/-- Operational unsigned `addUnchecked`: when `a_hi + b_hi < 2^(8*sz)`, `evalScalarBinOp`
+never hits `.ub` and returns a scalar in `[a_lo + b_lo, a_hi + b_hi]`. -/
+theorem scalarRange_evalScalarBinOp_addUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat + b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .addUnchecked x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (a_lo + b_lo) (a_hi + b_hi) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hle_x : xb ≤ a_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) xb).toNat ≤ a_hi.toNat := hx₂
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hle_y : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hlt : xb + yb < 2 ^ (8 * sz) := by omega
+  have hble : Nat.ble (2 ^ (8 * sz)) (xb + yb) = false := by
+    cases h : Nat.ble (2 ^ (8 * sz)) (xb + yb) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      omega
+  have hs := Anneal.BitVec.range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  have heq : (BitVec.ofNat (8 * sz) xb + BitVec.ofNat (8 * sz) yb).toNat = xb + yb := by
+    rw [← add_mod_eq_toNat_add, Nat.mod_eq_of_lt hlt]
+  refine ⟨⟨xb + yb, sz⟩, ?_, ?_⟩
+  · rw [Anneal.Scalars.evalScalarBinOp_addUnchecked_unsigned hsz, hble]
+  · rw [← heq]
+    exact scalarRange_of_bitVec _ hs.1 hs.2
+
+/-- Operational unsigned `addWithOverflow`: when `a_hi + b_hi < 2^(8*sz)`, the overflow flag is
+`false` (`0`) and the sum lies in `[a_lo + b_lo, a_hi + b_hi]`. -/
+theorem scalarRange_evalScalarBinOp_addWithOverflow_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat + b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .addWithOverflow x y locals mem false =
+        .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar false)]) locals mem ∧
+      ScalarRange sz (a_lo + b_lo) (a_hi + b_hi) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hle_x : xb ≤ a_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) xb).toNat ≤ a_hi.toNat := hx₂
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hle_y : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hble : Nat.ble (2 ^ (8 * sz)) (xb + yb) = false := by
+    cases h : Nat.ble (2 ^ (8 * sz)) (xb + yb) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      omega
+  have hs := Anneal.BitVec.range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  refine ⟨⟨(BitVec.ofNat (8 * sz) xb + BitVec.ofNat (8 * sz) yb).toNat, sz⟩, ?_,
+    scalarRange_of_bitVec _ hs.1 hs.2⟩
+  rw [Anneal.Scalars.evalScalarBinOp_addWithOverflow hsz, hble, add_mod_eq_toNat_add]
+  rfl
+
+/-- Operational unsigned `subUnchecked`: when `b_hi ≤ a_lo`, `evalScalarBinOp` never hits `.ub`
+and returns a scalar in `[a_lo - b_hi, a_hi - b_lo]`. -/
+theorem scalarRange_evalScalarBinOp_subUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : b_hi ≤ a_lo) :
+    ∃ r, evalScalarBinOp .subUnchecked x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (a_lo - b_hi) (a_hi - b_lo) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hax : a_lo.toNat ≤ xb := by
+    have h : a_lo.toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat := hx₁
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hby : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hba : b_hi.toNat ≤ a_lo.toNat := hno
+  have hyx : yb ≤ xb := by omega
+  have hxb_lt : xb < 2 ^ (8 * sz) := by rw [← scalarModulus_eq]; exact hxb
+  have hble : Nat.ble (2 ^ (8 * sz)) (xb - yb) = false := by
+    cases h : Nat.ble (2 ^ (8 * sz)) (xb - yb) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      omega
+  have hs := Anneal.BitVec.range_sub_no_underflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  have hbv_le : BitVec.ofNat (8 * sz) yb ≤ BitVec.ofNat (8 * sz) xb := by
+    show (BitVec.ofNat (8 * sz) yb).toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat
+    rw [toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hyb]
+    exact hyx
+  have heq : (BitVec.ofNat (8 * sz) xb - BitVec.ofNat (8 * sz) yb).toNat = xb - yb := by
+    rw [Anneal.BitVec.toNat_sub_of_le hbv_le, toNat_ofNat_of_lt hxb, toNat_ofNat_of_lt hyb]
+  refine ⟨⟨xb - yb, sz⟩, ?_, ?_⟩
+  · rw [Anneal.Scalars.evalScalarBinOp_subUnchecked_unsigned hsz]
+    simp only [hyx, ↓reduceDIte, hble]
+  · rw [← heq]
+    exact scalarRange_of_bitVec _ hs.1 hs.2
+
+/-- Operational unsigned `subWithOverflow`: when `b_hi ≤ a_lo`, the overflow flag is `false` (`0`)
+and the difference lies in `[a_lo - b_hi, a_hi - b_lo]`. -/
+theorem scalarRange_evalScalarBinOp_subWithOverflow_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : b_hi ≤ a_lo) :
+    ∃ r, evalScalarBinOp .subWithOverflow x y locals mem false =
+        .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar false)]) locals mem ∧
+      ScalarRange sz (a_lo - b_hi) (a_hi - b_lo) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hax : a_lo.toNat ≤ xb := by
+    have h : a_lo.toNat ≤ (BitVec.ofNat (8 * sz) xb).toNat := hx₁
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hby : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hba : b_hi.toNat ≤ a_lo.toNat := hno
+  have hble : Nat.ble yb xb = true := Nat.ble_eq_true_of_le (by omega)
+  have hs := Anneal.BitVec.range_sub_no_underflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  refine ⟨⟨(BitVec.ofNat (8 * sz) xb - BitVec.ofNat (8 * sz) yb).toNat, sz⟩, ?_,
+    scalarRange_of_bitVec _ hs.1 hs.2⟩
+  rw [Anneal.Scalars.evalScalarBinOp_subWithOverflow hsz, hble, sub_mod_eq_toNat_sub]
+  rfl
+
+/-- Operational unsigned `mulUnchecked`: when `a_hi * b_hi < 2^(8*sz)`, `evalScalarBinOp` never
+hits `.ub` and returns a scalar in `[a_lo * b_lo, a_hi * b_hi]`. -/
+theorem scalarRange_evalScalarBinOp_mulUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat * b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .mulUnchecked x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (Anneal.BitVec.mul a_lo b_lo) (Anneal.BitVec.mul a_hi b_hi) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hle_x : xb ≤ a_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) xb).toNat ≤ a_hi.toNat := hx₂
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hle_y : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hlt : xb * yb < 2 ^ (8 * sz) :=
+    Nat.lt_of_le_of_lt (Nat.mul_le_mul hle_x hle_y) hno
+  have hble : Nat.ble (2 ^ (8 * sz)) (xb * yb) = false := by
+    cases h : Nat.ble (2 ^ (8 * sz)) (xb * yb) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      omega
+  have hs := Anneal.BitVec.range_mul_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  have heq : (Anneal.BitVec.mul (BitVec.ofNat (8 * sz) xb) (BitVec.ofNat (8 * sz) yb)).toNat =
+      xb * yb := by
+    rw [← mul_mod_eq_toNat_mul, Nat.mod_eq_of_lt hlt]
+  refine ⟨⟨xb * yb, sz⟩, ?_, ?_⟩
+  · rw [Anneal.Scalars.evalScalarBinOp_mulUnchecked_unsigned hsz, hble]
+  · rw [← heq]
+    exact scalarRange_of_bitVec _ hs.1 hs.2
+
+/-- Operational unsigned `mulWithOverflow`: when `a_hi * b_hi < 2^(8*sz)`, the overflow flag is
+`false` (`0`) and the product lies in `[a_lo * b_lo, a_hi * b_hi]`. -/
+theorem scalarRange_evalScalarBinOp_mulWithOverflow_unsigned {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (locals : List LocalSlot)
+    (mem : Memory) (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y)
+    (hno : a_hi.toNat * b_hi.toNat < 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .mulWithOverflow x y locals mem false =
+        .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar false)]) locals mem ∧
+      ScalarRange sz (Anneal.BitVec.mul a_lo b_lo) (Anneal.BitVec.mul a_hi b_hi) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, hyb, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hle_x : xb ≤ a_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) xb).toNat ≤ a_hi.toNat := hx₂
+    rwa [toNat_ofNat_of_lt hxb] at h
+  have hle_y : yb ≤ b_hi.toNat := by
+    have h : (BitVec.ofNat (8 * sz) yb).toNat ≤ b_hi.toNat := hy₂
+    rwa [toNat_ofNat_of_lt hyb] at h
+  have hlt : xb * yb < 2 ^ (8 * sz) :=
+    Nat.lt_of_le_of_lt (Nat.mul_le_mul hle_x hle_y) hno
+  have hble : Nat.ble (2 ^ (8 * sz)) (xb * yb) = false := by
+    cases h : Nat.ble (2 ^ (8 * sz)) (xb * yb) with
+    | false => rfl
+    | true =>
+      have := Nat.le_of_ble_eq_true h
+      omega
+  have hs := Anneal.BitVec.range_mul_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno
+  refine ⟨⟨(Anneal.BitVec.mul (BitVec.ofNat (8 * sz) xb) (BitVec.ofNat (8 * sz) yb)).toNat, sz⟩,
+    ?_, scalarRange_of_bitVec _ hs.1 hs.2⟩
+  rw [Anneal.Scalars.evalScalarBinOp_mulWithOverflow hsz, hble, mul_mod_eq_toNat_mul]
+  rfl
+
+/-- Operational signed `addUnchecked`: when the `ScalarSRange` endpoints satisfy the
+no-underflow and no-overflow bounds, `evalScalarBinOp` never hits `.ub` and returns a scalar in
+`[smin₁ + smin₂, smax₁ + smax₂]`. -/
+theorem scalarSRange_evalScalarBinOp_addUnchecked_signed {sz : Nat} (hsz : 0 < sz)
+    {smin₁ smax₁ smin₂ smax₂ : BitVec (8 * sz)} {x y : ScalarInt}
+    (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz smin₁ smax₁ x) (hy : ScalarSRange sz smin₂ smax₂ y)
+    (hno_udf : 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey smin₁ + Anneal.BitVecArith.signedKey smin₂)
+    (hno_ovf : Anneal.BitVecArith.signedKey smax₁ + Anneal.BitVecArith.signedKey smax₂ <
+      2 ^ (8 * sz - 1) + 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .addUnchecked x y locals mem true = .ok (.scalar r) locals mem ∧
+      ScalarSRange sz (smin₁ + smin₂) (smax₁ + smax₂) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarSRange_exists hy
+  have hovf : signedOverflowAdd xb yb sz = false :=
+    signedOverflowAdd_eq_false_of_signedKey_bounds hsz xb yb
+      (Nat.le_trans hno_udf (Nat.add_le_add hx₁ hy₁))
+      (Nat.lt_of_le_of_lt (Nat.add_le_add hx₂ hy₂) hno_ovf)
+  have hs := Anneal.BitVecArith.signed_range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno_udf hno_ovf
+  refine ⟨⟨(BitVec.ofNat (8 * sz) xb + BitVec.ofNat (8 * sz) yb).toNat, sz⟩, ?_,
+    scalarSRange_of_bitVec _ hs.1 hs.2⟩
+  rw [Anneal.Scalars.evalScalarBinOp_addUnchecked_signed hsz, hovf, add_mod_eq_toNat_add]
+
+/-- Operational signed `addWithOverflow`: when the `ScalarSRange` endpoints satisfy the
+no-underflow and no-overflow bounds, the overflow flag is `false` (`0`) and the sum lies in
+`[smin₁ + smin₂, smax₁ + smax₂]`. -/
+theorem scalarSRange_evalScalarBinOp_addWithOverflow_signed {sz : Nat} (hsz : 0 < sz)
+    {smin₁ smax₁ smin₂ smax₂ : BitVec (8 * sz)} {x y : ScalarInt}
+    (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarSRange sz smin₁ smax₁ x) (hy : ScalarSRange sz smin₂ smax₂ y)
+    (hno_udf : 2 ^ (8 * sz - 1) ≤
+      Anneal.BitVecArith.signedKey smin₁ + Anneal.BitVecArith.signedKey smin₂)
+    (hno_ovf : Anneal.BitVecArith.signedKey smax₁ + Anneal.BitVecArith.signedKey smax₂ <
+      2 ^ (8 * sz - 1) + 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .addWithOverflow x y locals mem true =
+        .ok (.aggregate 0 [.scalar r, .scalar (boolToScalar false)]) locals mem ∧
+      ScalarSRange sz (smin₁ + smin₂) (smax₁ + smax₂) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarSRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarSRange_exists hy
+  have hovf : signedOverflowAdd xb yb sz = false :=
+    signedOverflowAdd_eq_false_of_signedKey_bounds hsz xb yb
+      (Nat.le_trans hno_udf (Nat.add_le_add hx₁ hy₁))
+      (Nat.lt_of_le_of_lt (Nat.add_le_add hx₂ hy₂) hno_ovf)
+  have hs := Anneal.BitVecArith.signed_range_add_no_overflow_sound hx₁ hx₂ hy₁ hy₂ hno_udf hno_ovf
+  refine ⟨⟨(BitVec.ofNat (8 * sz) xb + BitVec.ofNat (8 * sz) yb).toNat, sz⟩, ?_,
+    scalarSRange_of_bitVec _ hs.1 hs.2⟩
+  rw [Anneal.Scalars.evalScalarBinOp_addWithOverflow hsz, hovf, add_mod_eq_toNat_add]
+  rfl
+
+/-- Operational tnum transfer through `shlUnchecked` when the shift amount is in bounds
+(`y.bits < 8 * sz`): no `.ub` and exact unmasked shift transfer. -/
+theorem scalarTnum_evalScalarBinOp_shlUnchecked {sz : Nat} (hsz : 0 < sz)
+    {m v : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    (hb : y.bits < 8 * sz) (locals : List LocalSlot) (mem : Memory) (isSigned : Bool)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shlUnchecked x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVec.shl m y.bits) (Anneal.BitVec.shl v y.bits) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    refine ⟨_, ?_, scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_shl_sound yb hxm)⟩
+    rw [Anneal.Scalars.evalScalarBinOp_shlUnchecked hsz hy hb,
+      ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod, shiftLeftBits_eq_shl]
+
+/-- Operational tnum transfer through unsigned `shrUnchecked` when `y.bits < 8 * sz`. -/
+theorem scalarTnum_evalScalarBinOp_shrUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    {m v : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    (hb : y.bits < 8 * sz) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shrUnchecked x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVec.ushr m y.bits) (Anneal.BitVec.ushr v y.bits) r := by
+  obtain ⟨xb, rfl, hxb, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    have hlt : xb >>> yb < 2 ^ (8 * sz) := by
+      have hxb' : xb < 2 ^ (8 * sz) := by rw [← scalarModulus_eq]; exact hxb
+      exact Nat.lt_of_le_of_lt (Nat.shiftRight_le xb yb) hxb'
+    refine ⟨_, ?_, scalarTnum_of_bitVec _ (Anneal.BitVec.tnum_ushr_sound yb hxm)⟩
+    rw [Anneal.Scalars.evalScalarBinOp_shrUnchecked_unsigned hsz hy hb, Nat.mod_eq_of_lt hlt,
+      ushr_eq_core, _root_.BitVec.toNat_ushiftRight, toNat_ofNat_of_lt hxb]
+
+/-- Operational tnum transfer through signed `shrUnchecked` when `y.bits < 8 * sz`. -/
+theorem scalarTnum_evalScalarBinOp_shrUnchecked_signed {sz : Nat} (hsz : 0 < sz)
+    {m v : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    (hb : y.bits < 8 * sz) (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarTnum sz m v x) :
+    ∃ r, evalScalarBinOp .shrUnchecked x y locals mem true = .ok (.scalar r) locals mem ∧
+      ScalarTnum sz (Anneal.BitVecArith.ashr m y.bits) (Anneal.BitVecArith.ashr v y.bits) r := by
+  obtain ⟨xb, rfl, _, hxm⟩ := scalarTnum_exists hx
+  cases y with
+  | mk yb ys =>
+    refine ⟨_, ?_, scalarTnum_of_bitVec _ (Anneal.BitVecArith.tnum_ashr_sound yb hxm)⟩
+    rw [Anneal.Scalars.evalScalarBinOp_shrUnchecked_signed hsz hy hb, ashr_eq_core]
+
+/-- Operational unsigned interval transfer through `shlUnchecked` when `kmax < 8 * sz` and no
+overflow occurs. -/
+theorem scalarRange_evalScalarBinOp_shlUnchecked_no_overflow {sz : Nat} (hsz : 0 < sz)
+    {umin umax : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    {kmin kmax : Nat} (locals : List LocalSlot) (mem : Memory) (isSigned : Bool)
+    (hx : ScalarRange sz umin umax x) (hk₁ : kmin ≤ y.bits) (hk₂ : y.bits ≤ kmax)
+    (hklt : kmax < 8 * sz) (hno : umax.toNat * 2 ^ kmax < 2 ^ (8 * sz)) :
+    ∃ r, evalScalarBinOp .shlUnchecked x y locals mem isSigned = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (Anneal.BitVec.shl umin kmin) (Anneal.BitVec.shl umax kmax) r := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  cases y with
+  | mk yb ys =>
+    have hb : yb < 8 * sz := Nat.lt_of_le_of_lt hk₂ hklt
+    have hs := Anneal.BitVecArith.range_shl_no_overflow_sound hx₁ hx₂ hk₁ hk₂ hno
+    refine ⟨_, ?_, scalarRange_of_bitVec _ hs.1 hs.2⟩
+    rw [Anneal.Scalars.evalScalarBinOp_shlUnchecked hsz hy hb,
+      ← Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod, shiftLeftBits_eq_shl]
+
+/-- Operational unsigned interval transfer through unsigned `shrUnchecked` when `kmax < 8 * sz`. -/
+theorem scalarRange_evalScalarBinOp_shrUnchecked_unsigned {sz : Nat} (hsz : 0 < sz)
+    {umin umax : BitVec (8 * sz)} {x : ScalarInt} (y : ScalarInt) (hy : 0 < y.sizeBytes)
+    {kmin kmax : Nat} (locals : List LocalSlot) (mem : Memory)
+    (hx : ScalarRange sz umin umax x) (hk₁ : kmin ≤ y.bits) (hk₂ : y.bits ≤ kmax)
+    (hklt : kmax < 8 * sz) :
+    ∃ r, evalScalarBinOp .shrUnchecked x y locals mem false = .ok (.scalar r) locals mem ∧
+      ScalarRange sz (Anneal.BitVec.ushr umin kmax) (Anneal.BitVec.ushr umax kmin) r := by
+  obtain ⟨xb, rfl, hxb, hx₁, hx₂⟩ := scalarRange_exists hx
+  cases y with
+  | mk yb ys =>
+    have hb : yb < 8 * sz := Nat.lt_of_le_of_lt hk₂ hklt
+    have hlt : xb >>> yb < 2 ^ (8 * sz) := by
+      have hxb' : xb < 2 ^ (8 * sz) := by rw [← scalarModulus_eq]; exact hxb
+      exact Nat.lt_of_le_of_lt (Nat.shiftRight_le xb yb) hxb'
+    have hs := Anneal.BitVecArith.range_ushr_sound hx₁ hx₂ hk₁ hk₂
+    refine ⟨_, ?_, scalarRange_of_bitVec _ hs.1 hs.2⟩
+    rw [Anneal.Scalars.evalScalarBinOp_shrUnchecked_unsigned hsz hy hb, Nat.mod_eq_of_lt hlt,
+      ushr_eq_core, _root_.BitVec.toNat_ushiftRight, toNat_ofNat_of_lt hxb]
+
+/-- Unsigned interval transfer through `evalBinOp .bitAnd` (`Anneal.BitVecArith.range_and_upper_sound`):
+the result lies in `[0, min a_hi b_hi]`. -/
+theorem scalarRange_evalBinOp_bitAnd {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) :
+    ∃ r, Anneal.Scalars.evalBinOp .bitAnd x y isSigned = some r ∧
+      ScalarRange sz (BitVec.ofNat (8 * sz) 0) (Anneal.BitVecArith.bvMin a_hi b_hi) r := by
+  obtain ⟨xb, rfl, _, _, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, _, hy₂⟩ := scalarRange_exists hy
+  have hu := Anneal.BitVecArith.range_and_upper_sound hx₂ hy₂
+  have hmin : (Anneal.BitVecArith.bvMin a_hi b_hi).toNat = min a_hi.toNat b_hi.toNat := by
+    unfold Anneal.BitVecArith.bvMin
+    cases hle : decide (a_hi.toNat ≤ b_hi.toNat) with
+    | true =>
+      have h := of_decide_eq_true hle
+      simp [h, Nat.min_eq_left h]
+    | false =>
+      have hn : ¬ (a_hi.toNat ≤ b_hi.toNat) := of_decide_eq_false hle
+      have h : b_hi.toNat ≤ a_hi.toNat := Nat.le_of_not_ge hn
+      simp [hn, Nat.min_eq_right h]
+  refine ⟨_, evalBinOp_bitAnd_eq_and hsz xb yb isSigned,
+    scalarRange_of_bitVec _ (Nat.zero_le _) ?_⟩
+  show (Anneal.BitVec.and _ _).toNat ≤ (Anneal.BitVecArith.bvMin a_hi b_hi).toNat
+  rw [hmin]
+  exact hu
+
+/-- Unsigned interval bounds through `evalBinOp .bitOr` (`Anneal.BitVecArith.range_or_lower_sound`,
+`range_or_upper_sound`): `max a_lo b_lo ≤ r.bits ≤ a_hi + b_hi` (and `r.bits < 2^(8*sz)`). -/
+theorem scalarRange_evalBinOp_bitOr_bounds {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) :
+    ∃ r, Anneal.Scalars.evalBinOp .bitOr x y isSigned = some r ∧
+      max a_lo.toNat b_lo.toNat ≤ r.bits ∧ r.bits ≤ a_hi.toNat + b_hi.toNat ∧
+      r.bits < scalarModulus sz := by
+  obtain ⟨xb, rfl, _, hx₁, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, hy₁, hy₂⟩ := scalarRange_exists hy
+  have hlo := Anneal.BitVecArith.range_or_lower_sound hx₁ hy₁
+  have hhi := Anneal.BitVecArith.range_or_upper_sound hx₂ hy₂
+  exact ⟨_, evalBinOp_bitOr_eq_or hsz xb yb isSigned, hlo, hhi.1,
+    by rw [scalarModulus_eq]; exact hhi.2⟩
+
+/-- Unsigned interval upper bound through `evalBinOp .bitXor`
+(`Anneal.BitVecArith.range_xor_upper_sound`): `r.bits ≤ a_hi + b_hi` (and `r.bits < 2^(8*sz)`). -/
+theorem scalarRange_evalBinOp_bitXor_upper {sz : Nat} (hsz : 0 < sz)
+    {a_lo a_hi b_lo b_hi : BitVec (8 * sz)} {x y : ScalarInt} (isSigned : Bool)
+    (hx : ScalarRange sz a_lo a_hi x) (hy : ScalarRange sz b_lo b_hi y) :
+    ∃ r, Anneal.Scalars.evalBinOp .bitXor x y isSigned = some r ∧
+      r.bits ≤ a_hi.toNat + b_hi.toNat ∧ r.bits < scalarModulus sz := by
+  obtain ⟨xb, rfl, _, _, hx₂⟩ := scalarRange_exists hx
+  obtain ⟨yb, rfl, _, _, hy₂⟩ := scalarRange_exists hy
+  have hhi := Anneal.BitVecArith.range_xor_upper_sound hx₂ hy₂
+  exact ⟨_, evalBinOp_bitXor_eq_xor hsz xb yb isSigned, hhi.1,
+    by rw [scalarModulus_eq]; exact hhi.2⟩
+
+/-- `allBytesInitialized` is invariant under list reversal. -/
+theorem allBytesInitialized_reverse :
+    ∀ bs : List AbstractByte, allBytesInitialized bs.reverse = allBytesInitialized bs
+  | [] => rfl
+  | .uninit :: rest => by
+    rw [List.reverse_cons]
+    exact allBytesInitialized_append_eq_false_right rest.reverse rfl
+  | .init b p :: rest => by
+    rw [List.reverse_cons]
+    cases hi : allBytesInitialized rest with
+    | true =>
+      have hrev : allBytesInitialized rest.reverse = true := by
+        rw [allBytesInitialized_reverse rest]; exact hi
+      exact allBytesInitialized_append hrev rfl
+    | false =>
+      have hrev : allBytesInitialized rest.reverse = false := by
+        rw [allBytesInitialized_reverse rest]; exact hi
+      exact allBytesInitialized_append_eq_false_left _ hrev
+
+/-- `extractInitBvBytes` commutes with list reversal (even when `.uninit` bytes are present). -/
+theorem extractInitBvBytes_reverse :
+    ∀ bs : List AbstractByte, extractInitBvBytes bs.reverse = (extractInitBvBytes bs).reverse
+  | [] => rfl
+  | .uninit :: rest => by
+    rw [List.reverse_cons, extractInitBvBytes_append, extractInitBvBytes_reverse rest]
+    exact List.append_nil _
+  | .init b _ :: rest => by
+    rw [List.reverse_cons, extractInitBvBytes_append, extractInitBvBytes_reverse rest]
+    show (extractInitBvBytes rest).reverse ++ [b.toBitVec] =
+      (b.toBitVec :: extractInitBvBytes rest).reverse
+    rw [List.reverse_cons]
+
+/-- Big-endian decoding via `bitVecLE` + `bswapBytes`: decoding a reversed byte buffer with
+`bitVecLE` agrees with decoding the buffer in little-endian order and byte-swapping the result,
+for *every* `bs : List AbstractByte` (including wrong-length, `.uninit`, and mixed-provenance
+buffers). -/
+theorem bitVecLE_decode_reverse (sz : Nat) (hNz : 0 < sz) (bs : List AbstractByte) :
+    (bitVecLE sz hNz).decode bs.reverse =
+      ((bitVecLE sz hNz).decode bs).map (Anneal.BitVecArith.bswapBytes sz) := by
+  cases Nat.decEq bs.length sz with
+  | isFalse hne =>
+    have hne' : bs.reverse.length ≠ sz := by rw [List.length_reverse]; exact hne
+    rw [bitVecLE_decode_eq_none_of_length_ne sz hNz hne',
+      bitVecLE_decode_eq_none_of_length_ne sz hNz hne]
+    rfl
+  | isTrue hlen =>
+    cases hi : allBytesInitialized bs with
+    | false =>
+      have hi' : allBytesInitialized bs.reverse = false := by
+        rw [allBytesInitialized_reverse]; exact hi
+      rw [bitVecLE_decode_eq_none_of_uninit sz hNz hi',
+        bitVecLE_decode_eq_none_of_uninit sz hNz hi]
+      rfl
+    | true =>
+      have hi' : allBytesInitialized bs.reverse = true := by
+        rw [allBytesInitialized_reverse]; exact hi
+      have hlen' : bs.reverse.length = sz := by rw [List.length_reverse]; exact hlen
+      have hexLen : (extractInitBvBytes bs).length = sz := by
+        rw [(length_extractInitBvBytes_eq_iff bs).2 hi, hlen]
+      have hx_lt : Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs) < 2 ^ (8 * sz) := by
+        have h := Anneal.LeBytes.fromLeBytes_lt (extractInitBvBytes bs)
+        rw [hexLen, Nat.mul_comm] at h
+        exact h
+      let x : BitVec (8 * sz) := BitVec.ofNat (8 * sz)
+        (Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs))
+      have hdec : (bitVecLE sz hNz).decode bs = some x :=
+        (bitVecLE_decode_eq_some_iff sz hNz bs x).2 ⟨hlen, hi, by
+          show _ = (BitVec.ofNat (8 * sz) _).toNat
+          rw [_root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hx_lt]⟩
+      have hswap : Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs.reverse) =
+          (Anneal.BitVecArith.bswapBytes sz x).toNat := by
+        rw [extractInitBvBytes_reverse, toNat_bswapBytes_eq_fromBeBytes]
+        have hx_nat : x.toNat = Anneal.LeBytes.fromLeBytes (extractInitBvBytes bs) := by
+          show (BitVec.ofNat (8 * sz) _).toNat = _
+          rw [_root_.BitVec.toNat_ofNat, Nat.mod_eq_of_lt hx_lt]
+        rw [hx_nat]
+        have haux := Anneal.LeBytes.toLeBytesAux_fromLeBytes (extractInitBvBytes bs)
+        rw [hexLen] at haux
+        rw [haux]
+        rfl
+      have hdec_rev : (bitVecLE sz hNz).decode bs.reverse =
+          some (Anneal.BitVecArith.bswapBytes sz x) :=
+        (bitVecLE_decode_eq_some_iff sz hNz bs.reverse _).2 ⟨hlen', hi', hswap⟩
+      rw [hdec_rev, hdec]
+      rfl
+
+/-- Single unsigned scalar `encodeValueToBytes` agrees with `bitVecLE.encode`. -/
+theorem encodeValueToBytes_bitVec_uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx)
+    (x : BitVec (8 * MirValueCodec.uintByteSize w)) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .uint w, layoutIdx := idx }
+        (.scalar ⟨x.toNat, MirValueCodec.uintByteSize w⟩) =
+      some ((bitVecLE (MirValueCodec.uintByteSize w)
+        (MirValueCodec.uintByteSize_pos w)).encode x) := by
+  cases w <;> rfl
+
+/-- Single unsigned scalar `decodeValueFromBytes` agrees with `bitVecLE.decode`. -/
+theorem decodeValueFromBytes_bitVec_uint (layouts : LayoutTable) (w : UintTy) (idx : LayoutIdx)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts { kind := .uint w, layoutIdx := idx } bs =
+      ((bitVecLE (MirValueCodec.uintByteSize w)
+        (MirValueCodec.uintByteSize_pos w)).decode bs).map
+          (fun x => Value.scalar ⟨x.toNat, MirValueCodec.uintByteSize w⟩) := by
+  have h := (MirValueCodec.uint layouts w idx).decode_eq_map bs
+  rw [h]
+  show ((FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w)
+      (MirValueCodec.uintByteSize_pos w)).decode bs).map _ =
+    (((FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w)
+      (MirValueCodec.uintByteSize_pos w)).decode bs).map _).map _
+  cases (FixedByteCodec.uintBitsLE (MirValueCodec.uintByteSize w)
+      (MirValueCodec.uintByteSize_pos w)).decode bs <;> rfl
+
+/-- Single signed scalar `encodeValueToBytes` agrees with `bitVecLE.encode` (using the same
+two's-complement bit pattern). -/
+theorem encodeValueToBytes_bitVec_int (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
+    (x : BitVec (8 * MirValueCodec.intByteSize w)) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .int w, layoutIdx := idx }
+        (.scalar ⟨x.toNat, MirValueCodec.intByteSize w⟩) =
+      some ((bitVecLE (MirValueCodec.intByteSize w)
+        (MirValueCodec.intByteSize_pos w)).encode x) := by
+  cases w <;> rfl
+
+/-- Single signed scalar `decodeValueFromBytes` agrees with `bitVecLE.decode`. -/
+theorem decodeValueFromBytes_bitVec_int (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
+    (bs : List AbstractByte) :
+    decodeValueFromBytes defaultCodecFuel layouts { kind := .int w, layoutIdx := idx } bs =
+      ((bitVecLE (MirValueCodec.intByteSize w)
+        (MirValueCodec.intByteSize_pos w)).decode bs).map
+          (fun x => Value.scalar ⟨x.toNat, MirValueCodec.intByteSize w⟩) := by
+  have h := (MirValueCodec.int layouts w idx).decode_eq_map bs
+  rw [h]
+  show ((FixedByteCodec.uintBitsLE (MirValueCodec.intByteSize w)
+      (MirValueCodec.intByteSize_pos w)).decode bs).map _ =
+    (((FixedByteCodec.uintBitsLE (MirValueCodec.intByteSize w)
+      (MirValueCodec.intByteSize_pos w)).decode bs).map _).map _
+  cases (FixedByteCodec.uintBitsLE (MirValueCodec.intByteSize w)
+      (MirValueCodec.intByteSize_pos w)).decode bs <;> rfl
+
+/-- `encodeValueToBytes` on any signed integer array `[iN; n]` given as bitvectors (including the
+empty array `xs = []`) is the element-wise `bitVecLE` encoding. -/
+theorem encodeValueToBytes_bitVecArray_int (layouts : LayoutTable) (w : IntTy) (idx : LayoutIdx)
+    (xs : List (BitVec (8 * MirValueCodec.intByteSize w))) :
+    encodeValueToBytes defaultCodecFuel layouts
+        { kind := .array (.int w) xs.length, layoutIdx := idx }
+        (bitVecArrayValue (MirValueCodec.intByteSize w) xs) =
+      some ((bitVecLE (MirValueCodec.intByteSize w)
+        (MirValueCodec.intByteSize_pos w)).encodeElems xs) := by
+  cases xs with
+  | nil => rfl
+  | cons y ys =>
+    have hne : Nat.beq (y :: ys).length 0 = false := rfl
+    have hlen : Nat.beq (Trusted.Sequence.length ((y :: ys).map
+        (fun x => Value.scalar ⟨x.toNat, MirValueCodec.intByteSize w⟩))) (y :: ys).length = true := by
+      rw [seqLength_eq, List.length_map]
+      exact nat_beq_self _
+    have hsz : rigidTyKindByteSize (.int w) = some (MirValueCodec.intByteSize w) := by
+      cases w <;> rfl
+    unfold defaultCodecFuel encodeValueToBytes bitVecArrayValue
+    simp only [hne, hlen, hsz]
+    exact FixedByteCodec.encodeListWith_map_eq_encodeElems
+      (bitVecLE (MirValueCodec.intByteSize w) (MirValueCodec.intByteSize_pos w))
+      (fun x => Value.scalar ⟨x.toNat, MirValueCodec.intByteSize w⟩)
+      (fun e => encodeValueToBytes 15 layouts { kind := .int w, layoutIdx := 0 } e)
+      (fun x => by cases w <;> rfl) (y :: ys)
+
+/-- `decodeValueFromBytes` recovers any signed integer array `[iN; n]` (including `xs = []`) from
+its element-wise `bitVecLE` encoding. -/
+theorem decodeValueFromBytes_encodeElems_bitVecLE_int (layouts : LayoutTable) (w : IntTy)
+    (idx : LayoutIdx) (xs : List (BitVec (8 * MirValueCodec.intByteSize w))) :
+    decodeValueFromBytes defaultCodecFuel layouts
+        { kind := .array (.int w) xs.length, layoutIdx := idx }
+        ((bitVecLE (MirValueCodec.intByteSize w)
+          (MirValueCodec.intByteSize_pos w)).encodeElems xs) =
+      some (bitVecArrayValue (MirValueCodec.intByteSize w) xs) := by
+  cases xs with
+  | nil => rfl
+  | cons y ys =>
+    let sz := MirValueCodec.intByteSize w
+    let hNz := MirValueCodec.intByteSize_pos w
+    let c := bitVecLE sz hNz
+    have hne : Nat.beq (y :: ys).length 0 = false := rfl
+    have hsz : rigidTyKindByteSize (.int w) = some sz := by cases w <;> rfl
+    have hlen_eq : (c.encodeElems (y :: ys)).length = sz * (y :: ys).length := by
+      rw [FixedByteCodec.length_encodeElems, Nat.mul_comm]
+    have hbeq : Nat.beq (Trusted.Sequence.length (c.encodeElems (y :: ys)))
+        (Nat.mul sz (y :: ys).length) = true := by
+      rw [seqLength_eq, natMul_eq, hlen_eq]
+      exact nat_beq_self _
+    have hdecElem : ∀ x : BitVec (8 * sz),
+        decodeValueFromBytes 15 layouts { kind := .int w, layoutIdx := 0 } (c.encode x) =
+          some (Value.scalar ⟨x.toNat, sz⟩) := by
+      intro x
+      have h1 : decodeValueFromBytes 15 layouts { kind := .int w, layoutIdx := 0 } (c.encode x) =
+          decodeValueFromBytes defaultCodecFuel layouts { kind := .int w, layoutIdx := 0 }
+            (c.encode x) := by
+        cases w <;> rfl
+      rw [h1, decodeValueFromBytes_bitVec_int, c.decode_encode x]
+      rfl
+    have hchunks : decodeArrayChunksWith
+        (fun ch => decodeValueFromBytes 15 layouts { kind := .int w, layoutIdx := 0 } ch)
+        sz (y :: ys).length (c.encodeElems (y :: ys)) =
+          some ((y :: ys).map (fun x => Value.scalar ⟨x.toNat, sz⟩)) := by
+      rw [decodeArrayChunksWith_eq_some_iff _ hNz]
+      refine ⟨FixedByteCodec.length_encodeElems c (y :: ys), ?_⟩
+      rw [chunksOf_encodeElems c hNz, List.map_map, List.map_map]
+      congr 1
+      funext x
+      exact hdecElem x
+    unfold defaultCodecFuel decodeValueFromBytes bitVecArrayValue
+    dsimp only
+    rw [hne]
+    dsimp only
+    rw [hsz]
+    dsimp only
+    rw [hbeq]
+    dsimp only
+    rw [hchunks]
 
 end Anneal.BitVecScalarsBridge
