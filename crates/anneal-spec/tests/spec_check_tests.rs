@@ -2020,6 +2020,24 @@ fn assert_stats_invariants(outcome: &SpecCheckOutcome) {
         "precondition_hits exceeds trials_run: {outcome:?}"
     );
     assert!(
+        stats.hits_with_kill <= stats.precondition_hits,
+        "hits_with_kill exceeds precondition_hits: {outcome:?}"
+    );
+    assert!(
+        stats.hits_with_kill <= stats.mutants_killed,
+        "hits_with_kill exceeds mutants_killed: {outcome:?}"
+    );
+    assert_eq!(
+        stats.hits_with_kill > 0,
+        stats.mutants_killed > 0,
+        "hits_with_kill and mutants_killed disagree on non-zero kills: {outcome:?}"
+    );
+    assert_eq!(
+        stats.hits_with_kill + stats.hits_without_kill(),
+        stats.precondition_hits,
+        "hits_with_kill + hits_without_kill != precondition_hits: {outcome:?}"
+    );
+    assert!(
         stats.mutants_killed <= stats.mutants_tested,
         "mutants_killed exceeds mutants_tested: {outcome:?}"
     );
@@ -2227,4 +2245,188 @@ fn stats_invariants_hold_on_every_early_return_path() {
     assert!(trapped.mutants_tested > 0);
     assert_eq!(trapped.mutants_killed, trapped.mutants_tested);
     assert_eq!(trapped.mutants_trapped, trapped.mutants_killed);
+}
+
+#[test]
+fn min_precondition_hits_exceeding_max_trials_fails_closed() {
+    let impossible = SpecCheckConfig::default()
+        .with_max_trials(10)
+        .with_min_precondition_hits(11);
+
+    let mut stateless_pre_calls = 0usize;
+    let stateless = check_contract(
+        impossible,
+        |_x: &u32| {
+            stateless_pre_calls += 1;
+            true
+        },
+        |&x| x,
+        |&x, &r: &u32| r == x,
+    );
+    assert_stats_invariants(&stateless);
+    assert_eq!(stateless_pre_calls, 0);
+    assert_eq!(stateless.stats().trials_run, 0);
+    assert_eq!(
+        stateless.vacuity_class(),
+        Some(VacuityClass::DeadPrecondition)
+    );
+    assert_eq!(
+        stateless.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::DegenerateConfig))
+    );
+
+    let mut stateful_pre_calls = 0usize;
+    let stateful = check_stateful_contract(
+        impossible,
+        |_old: &u32, &()| {
+            stateful_pre_calls += 1;
+            true
+        },
+        |state: &mut u32, &()| {
+            *state = state.wrapping_add(1);
+            *state
+        },
+        |old: &u32, &(), new: &u32, ret: &u32| *new == old.wrapping_add(1) && *ret == *new,
+    );
+    assert_stats_invariants(&stateful);
+    assert_eq!(stateful_pre_calls, 0);
+    assert_eq!(stateful.stats().trials_run, 0);
+    assert_eq!(
+        stateful.vacuity_class(),
+        Some(VacuityClass::DeadPrecondition)
+    );
+    assert_eq!(
+        stateful.failure().map(|f| f.detail),
+        Some(FailureDetail::Violation(ViolationKind::DegenerateConfig))
+    );
+}
+
+#[test]
+fn multi_branch_existential_dichotomy_and_pointwise_stats() {
+    // Full `u32::checked_add` kills mutants on every admissible trial (pointwise strong).
+    let full = check_contract(
+        SpecCheckConfig::default(),
+        |&(a, b): &(u32, u32)| __anodized_fn_requires_spec_u32_checked_add(a, b),
+        |&(a, b)| a.checked_add(b),
+        |&(a, b), &ret| __anodized_fn_ensures_spec_u32_checked_add(a, b, ret),
+    );
+    assert_stats_invariants(&full);
+    assert!(full.is_strong());
+    let full_stats = full.stats();
+    assert!(full_stats.is_pointwise_strong());
+    assert_eq!(full_stats.hits_without_kill(), 0);
+    assert_eq!(full_stats.hits_with_kill, full_stats.precondition_hits);
+
+    // Multi-branch `u32::checked_add` whose overflow branch accepts any `Option<u32>`:
+    // existential `PostconditionDichotomy` still holds (`Strong`), while `SpecCheckStats`
+    // surfaces the unconstrained overflow hits via `hits_without_kill() > 0`.
+    let partial_checked_add = check_contract(
+        SpecCheckConfig::default(),
+        |_ab: &(u32, u32)| true,
+        |&(a, b)| a.checked_add(b),
+        |&(a, b), &ret: &Option<u32>| {
+            if (a as u64) + (b as u64) > (u32::MAX as u64) {
+                true
+            } else {
+                ret == Some(a + b)
+            }
+        },
+    );
+    assert_stats_invariants(&partial_checked_add);
+    assert!(partial_checked_add.is_strong());
+    let partial_stats = partial_checked_add.stats();
+    assert!(partial_stats.hits_with_kill > 0);
+    assert!(partial_stats.hits_without_kill() > 0);
+    assert!(!partial_stats.is_pointwise_strong());
+
+    // Multi-branch `Result` contract leaving the divide-by-zero branch unconstrained:
+    // still existentially `Strong`, with non-zero `hits_without_kill()`.
+    let partial_div = check_contract(
+        SpecCheckConfig::default(),
+        |_dd: &(u32, u32)| true,
+        |&(dividend, divisor)| checked_div_u32(dividend, divisor),
+        |&(dividend, divisor), &ret: &Result<u32, u8>| {
+            if divisor == 0 {
+                true
+            } else {
+                ret == Ok(dividend / divisor)
+            }
+        },
+    );
+    assert_stats_invariants(&partial_div);
+    assert!(partial_div.is_strong());
+    let div_stats = partial_div.stats();
+    assert!(div_stats.hits_with_kill > 0);
+    assert!(div_stats.hits_without_kill() > 0);
+    assert!(!div_stats.is_pointwise_strong());
+}
+
+#[test]
+fn splitmix64_seed_zero_and_four_tuple_return_mutants() {
+    // Seed `0` must yield a non-degenerate, deterministic stream distinct from `DEFAULT_SEED`.
+    let mut z0 = SplitMix64::new(0);
+    let mut z0_again = SplitMix64::new(0);
+    let mut z_def = SplitMix64::default();
+    let a = z0.next_u64();
+    let b = z0.next_u64();
+    assert_ne!(a, 0);
+    assert_ne!(a, b);
+    assert_eq!(a, z0_again.next_u64());
+    assert_ne!(a, z_def.next_u64());
+
+    let seed_zero_cfg = SpecCheckConfig::default().with_seed(0);
+    let run1 = check_contract(
+        seed_zero_cfg,
+        |&(val, lo, hi): &(u32, u32, u32)| __anodized_fn_requires_clamp_u32(val, lo, hi),
+        |&(val, lo, hi)| clamp_u32(val, lo, hi),
+        |&(val, lo, hi), &ret| __anodized_fn_ensures_clamp_u32(val, lo, hi, ret),
+    );
+    let run2 = check_contract(
+        seed_zero_cfg,
+        |&(val, lo, hi): &(u32, u32, u32)| __anodized_fn_requires_clamp_u32(val, lo, hi),
+        |&(val, lo, hi)| clamp_u32(val, lo, hi),
+        |&(val, lo, hi), &ret| __anodized_fn_ensures_clamp_u32(val, lo, hi, ret),
+    );
+    assert_eq!(run1, run2);
+    assert!(run1.is_strong());
+    assert_stats_invariants(&run1);
+
+    // 4-tuple `ReturnMutants` subsingleton flags and per-axis coverage within default budget.
+    assert!(<((), (), (), ()) as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<((), (), (), bool) as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(!<(u8, i8, u16, bool) as ReturnMutants>::IS_SUBSINGLETON);
+
+    let pin_axis_0 = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_t: &(u8, i8, u16, bool)| true,
+        |&t| t,
+        |&(a, _, _, _), &(ra, _, _, _): &(u8, i8, u16, bool)| ra == a,
+    );
+    assert!(pin_axis_0.is_pointwise_strong());
+
+    let pin_axis_3 = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_t: &(u8, i8, u16, bool)| true,
+        |&t| t,
+        |&(_, _, _, d), &(_, _, _, rd): &(u8, i8, u16, bool)| rd == d,
+    );
+    assert!(pin_axis_3.is_pointwise_strong());
+
+    // Extremal boundary flips for `Option<u32>` (`Some(u32::MAX)`) and `Result<u32, u32>`
+    // (`Err(u32::MAX)` / `Ok(u32::MAX)`) kill specs that only forbid `MAX` on the opposite variant.
+    let opt_forbids_max = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |_x| None::<u32>,
+        |_x, &r: &Option<u32>| r != Some(u32::MAX),
+    );
+    assert!(opt_forbids_max.mutants_killed > 0);
+
+    let res_forbids_err_max = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |&x| Ok::<u32, u32>(x),
+        |_x, &r: &Result<u32, u32>| r != Err(u32::MAX),
+    );
+    assert!(res_forbids_err_max.mutants_killed > 0);
 }

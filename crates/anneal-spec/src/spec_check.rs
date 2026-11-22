@@ -993,7 +993,10 @@ impl<T: SampleInput + ReturnMutants> ReturnMutants for Option<T> {
                     if T::BOUNDARY_COUNT >= 3 {
                         emit(Some(T::sample_at(2, rng)));
                     }
-                    if T::BOUNDARY_COUNT > 2 {
+                    if T::BOUNDARY_COUNT >= 4 {
+                        emit(Some(T::sample_at(T::BOUNDARY_COUNT - 1, rng)));
+                    }
+                    if T::BOUNDARY_COUNT != 2 {
                         emit(Some(T::sample_at(T::BOUNDARY_COUNT, rng)));
                         emit(Some(T::sample_at(T::BOUNDARY_COUNT.saturating_add(1), rng)));
                     }
@@ -1028,7 +1031,10 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                                 if E::BOUNDARY_COUNT >= 2 {
                                     emit(Err(E::sample_at(1, &mut flip_rng)));
                                 }
-                                if E::BOUNDARY_COUNT > 2 {
+                                if E::BOUNDARY_COUNT >= 3 {
+                                    emit(Err(E::sample_at(E::BOUNDARY_COUNT - 1, &mut flip_rng)));
+                                }
+                                if E::BOUNDARY_COUNT != 2 {
                                     emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
                                 }
                             }
@@ -1041,7 +1047,10 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                         if E::BOUNDARY_COUNT >= 2 {
                             emit(Err(E::sample_at(1, &mut flip_rng)));
                         }
-                        if E::BOUNDARY_COUNT > 2 {
+                        if E::BOUNDARY_COUNT >= 3 {
+                            emit(Err(E::sample_at(E::BOUNDARY_COUNT - 1, &mut flip_rng)));
+                        }
+                        if E::BOUNDARY_COUNT != 2 {
                             emit(Err(E::sample_at(E::BOUNDARY_COUNT, &mut flip_rng)));
                         }
                     }
@@ -1059,7 +1068,10 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                                 if T::BOUNDARY_COUNT >= 2 {
                                     emit(Ok(T::sample_at(1, &mut flip_rng)));
                                 }
-                                if T::BOUNDARY_COUNT > 2 {
+                                if T::BOUNDARY_COUNT >= 3 {
+                                    emit(Ok(T::sample_at(T::BOUNDARY_COUNT - 1, &mut flip_rng)));
+                                }
+                                if T::BOUNDARY_COUNT != 2 {
                                     emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
                                 }
                             }
@@ -1072,7 +1084,10 @@ impl<T: SampleInput + ReturnMutants, E: SampleInput + ReturnMutants> ReturnMutan
                         if T::BOUNDARY_COUNT >= 2 {
                             emit(Ok(T::sample_at(1, &mut flip_rng)));
                         }
-                        if T::BOUNDARY_COUNT > 2 {
+                        if T::BOUNDARY_COUNT >= 3 {
+                            emit(Ok(T::sample_at(T::BOUNDARY_COUNT - 1, &mut flip_rng)));
+                        }
+                        if T::BOUNDARY_COUNT != 2 {
                             emit(Ok(T::sample_at(T::BOUNDARY_COUNT, &mut flip_rng)));
                         }
                     }
@@ -1196,6 +1211,104 @@ impl<A: ReturnMutants + Clone, B: ReturnMutants + Clone, C: ReturnMutants + Clon
                     }
                 }
                 c_emitted += 1;
+            }
+        });
+    }
+}
+
+impl<
+    A: ReturnMutants + Clone,
+    B: ReturnMutants + Clone,
+    C: ReturnMutants + Clone,
+    D: ReturnMutants + Clone,
+> ReturnMutants for (A, B, C, D)
+{
+    const IS_SUBSINGLETON: bool =
+        A::IS_SUBSINGLETON && B::IS_SUBSINGLETON && C::IS_SUBSINGLETON && D::IS_SUBSINGLETON;
+
+    fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
+        let active_axes = (!A::IS_SUBSINGLETON as usize)
+            + (!B::IS_SUBSINGLETON as usize)
+            + (!C::IS_SUBSINGLETON as usize)
+            + (!D::IS_SUBSINGLETON as usize);
+        let per_axis_cap = if active_axes <= 1 { 16 } else { 3 };
+
+        let mut first_a: Option<A> = None;
+        let mut a_emitted = 0usize;
+        self.0.visit_mutants(rng, |a_mut| {
+            if a_emitted < per_axis_cap {
+                if first_a.is_none() {
+                    first_a = Some(a_mut.clone());
+                }
+                emit((a_mut, self.1.clone(), self.2.clone(), self.3.clone()));
+                a_emitted += 1;
+            }
+        });
+
+        let mut first_b: Option<B> = None;
+        let mut b_emitted = 0usize;
+        self.1.visit_mutants(rng, |b_mut| {
+            if b_emitted < per_axis_cap {
+                if first_b.is_none() {
+                    first_b = Some(b_mut.clone());
+                }
+                emit((
+                    self.0.clone(),
+                    b_mut.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                ));
+                if b_emitted == 0
+                    && let Some(a1) = first_a.as_ref()
+                {
+                    emit((a1.clone(), b_mut, self.2.clone(), self.3.clone()));
+                }
+                b_emitted += 1;
+            }
+        });
+
+        let mut first_c: Option<C> = None;
+        let mut c_emitted = 0usize;
+        self.2.visit_mutants(rng, |c_mut| {
+            if c_emitted < per_axis_cap {
+                if first_c.is_none() {
+                    first_c = Some(c_mut.clone());
+                }
+                emit((
+                    self.0.clone(),
+                    self.1.clone(),
+                    c_mut.clone(),
+                    self.3.clone(),
+                ));
+                if c_emitted == 0
+                    && let Some(b1) = first_b.as_ref()
+                {
+                    emit((self.0.clone(), b1.clone(), c_mut, self.3.clone()));
+                }
+                c_emitted += 1;
+            }
+        });
+
+        let mut d_emitted = 0usize;
+        self.3.visit_mutants(rng, |d_mut| {
+            if d_emitted < per_axis_cap {
+                emit((
+                    self.0.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                    d_mut.clone(),
+                ));
+                if d_emitted == 0 {
+                    if let Some(c1) = first_c.as_ref() {
+                        emit((self.0.clone(), self.1.clone(), c1.clone(), d_mut.clone()));
+                    }
+                    if let (Some(a1), Some(b1), Some(c1)) =
+                        (first_a.as_ref(), first_b.as_ref(), first_c.as_ref())
+                    {
+                        emit((a1.clone(), b1.clone(), c1.clone(), d_mut));
+                    }
+                }
+                d_emitted += 1;
             }
         });
     }
@@ -1422,7 +1535,9 @@ pub enum ViolationKind {
     PostconditionFalse { trial_idx: usize },
     /// Live execution trapped during `trap` at `trial_idx`.
     ExecutionTrapped { trial_idx: usize, trap: TrapKind },
-    /// Checker configuration had a zero trial or zero hit budget (fail-closed).
+    /// Checker configuration had a zero trial/hit/mutant budget or an
+    /// unsatisfiable `min_precondition_hits > max_trials` requirement
+    /// (fail-closed).
     DegenerateConfig,
 }
 
@@ -1470,6 +1585,13 @@ pub struct SpecCheckStats {
     pub trials_run: usize,
     /// Number of trials satisfying the precondition.
     pub precondition_hits: usize,
+    /// Number of precondition-admissible trials on which at least one output
+    /// (or mutated post-state) mutant was killed.
+    ///
+    /// Satisfies `hits_with_kill <= precondition_hits`,
+    /// `hits_with_kill <= mutants_killed`, and
+    /// `(hits_with_kill > 0) == (mutants_killed > 0)`.
+    pub hits_with_kill: usize,
     /// Total number of distinct output/state mutants evaluated.
     pub mutants_tested: usize,
     /// Total number of mutants rejected (`post == false` or `post` trapped).
@@ -1480,6 +1602,22 @@ pub struct SpecCheckStats {
     pub mutants_trapped: usize,
     /// True iff the return type `R` is a subsingleton (`R::IS_SUBSINGLETON`).
     pub subsingleton_return: bool,
+}
+
+impl SpecCheckStats {
+    /// Number of precondition-admissible trials on which zero mutants were
+    /// killed (for example, an unconstrained branch of a multi-branch contract,
+    /// or a subsingleton return type).
+    pub const fn hits_without_kill(&self) -> usize {
+        self.precondition_hits.saturating_sub(self.hits_with_kill)
+    }
+
+    /// Returns `true` iff at least one precondition-admissible trial ran and
+    /// every such trial killed at least one mutant (the dynamic counterpart of
+    /// pointwise postcondition dichotomy).
+    pub const fn is_pointwise_strong(&self) -> bool {
+        self.precondition_hits > 0 && self.hits_with_kill == self.precondition_hits
+    }
 }
 
 /// Structured failure report emitted when a contract fails strength checking.
@@ -1924,8 +2062,11 @@ where
         ..SpecCheckStats::default()
     };
 
-    // Fail-closed guard against zero-trial or zero-hit budgets.
-    if config.max_trials == 0 || config.min_precondition_hits == 0 {
+    // Fail-closed guard against zero or unsatisfiable trial/hit budgets.
+    if config.max_trials == 0
+        || config.min_precondition_hits == 0
+        || config.min_precondition_hits > config.max_trials
+    {
         return SpecCheckOutcome::Failed(SpecCheckFailure {
             class: VacuityClass::DeadPrecondition,
             stats,
@@ -1974,6 +2115,7 @@ where
             });
         }
 
+        let kills_before = stats.mutants_killed;
         if !R::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
             if let Some(slice) = custom_mutants {
@@ -1996,6 +2138,9 @@ where
                     record_mutant(&mut stats, post(&input, &ret_bad));
                 });
             }
+        }
+        if stats.mutants_killed > kills_before {
+            stats.hits_with_kill += 1;
         }
 
         if anchor.is_none() {
@@ -2714,7 +2859,10 @@ where
         ..SpecCheckStats::default()
     };
 
-    if config.max_trials == 0 || config.min_precondition_hits == 0 {
+    if config.max_trials == 0
+        || config.min_precondition_hits == 0
+        || config.min_precondition_hits > config.max_trials
+    {
         return SpecCheckOutcome::Failed(SpecCheckFailure {
             class: VacuityClass::DeadPrecondition,
             stats,
@@ -2772,6 +2920,8 @@ where
             });
         }
 
+        let kills_before = stats.mutants_killed;
+
         // Return-value mutant perturbation axis.
         if !R::IS_SUBSINGLETON && config.max_mutants_per_hit > 0 {
             let mut tested_this_hit = 0usize;
@@ -2813,6 +2963,10 @@ where
                     state_mutants_killed += 1;
                 }
             });
+        }
+
+        if stats.mutants_killed > kills_before {
+            stats.hits_with_kill += 1;
         }
 
         if anchor.is_none() {

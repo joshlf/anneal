@@ -425,6 +425,39 @@ theorem DichotomyModuloObservation.of_refining_obs
   rcases h with ⟨x, hPre, y_ok, y_bad, hObsEq, hOk, hBad⟩
   exact ⟨x, hPre, y_ok, y_bad, hRef x y_ok y_bad hObsEq, hOk, hBad⟩
 
+/-- Disjunctive preconditions satisfy `PostconditionDichotomy` iff at least one
+    branch satisfies dichotomy: a multi-branch contract that genuinely binds its
+    output on one valid branch is not vacuous merely because another branch is weaker. -/
+theorem postconditionDichotomy_or_pre_iff
+    {X : Type u} {Y : Type v} {pre₁ pre₂ : X → Prop} {post : X → Y → Prop} :
+    PostconditionDichotomy (fun x => pre₁ x ∨ pre₂ x) post ↔
+      PostconditionDichotomy pre₁ post ∨ PostconditionDichotomy pre₂ post := by
+  constructor
+  · rintro ⟨x, hPre, hOk, hBad⟩
+    rcases hPre with h1 | h2
+    · exact Or.inl ⟨x, h1, hOk, hBad⟩
+    · exact Or.inr ⟨x, h2, hOk, hBad⟩
+  · intro hOr
+    rcases hOr with ⟨x, h1, hOk, hBad⟩ | ⟨x, h2, hOk, hBad⟩
+    · exact ⟨x, Or.inl h1, hOk, hBad⟩
+    · exact ⟨x, Or.inr h2, hOk, hBad⟩
+
+/-- A disjunctive precondition refutes `PostconditionDichotomy` iff every branch
+    fails dichotomy (for example, one branch is unsatisfiable and the other makes
+    `post` output-insensitive). -/
+theorem not_postconditionDichotomy_or_pre_iff
+    {X : Type u} {Y : Type v} {pre₁ pre₂ : X → Prop} {post : X → Y → Prop} :
+    ¬ PostconditionDichotomy (fun x => pre₁ x ∨ pre₂ x) post ↔
+      ¬ PostconditionDichotomy pre₁ post ∧ ¬ PostconditionDichotomy pre₂ post := by
+  constructor
+  · intro hNot
+    exact ⟨fun h1 => hNot (Iff.mpr (postconditionDichotomy_or_pre_iff (pre₁ := pre₁) (pre₂ := pre₂)) (Or.inl h1)),
+      fun h2 => hNot (Iff.mpr (postconditionDichotomy_or_pre_iff (pre₁ := pre₁) (pre₂ := pre₂)) (Or.inr h2))⟩
+  · rintro ⟨hNot1, hNot2⟩ hOr
+    rcases Iff.mp (postconditionDichotomy_or_pre_iff (pre₁ := pre₁) (pre₂ := pre₂)) hOr with h1 | h2
+    · exact hNot1 h1
+    · exact hNot2 h2
+
 theorem preconditionSatisfiable_prod
     {X₁ : Type u₁} {X₂ : Type u₂} {pre₁ : X₁ → Prop} {pre₂ : X₂ → Prop}
     (h₁ : PreconditionSatisfiable pre₁) (h₂ : PreconditionSatisfiable pre₂) :
@@ -1241,41 +1274,52 @@ private def introsUnfoldingNot : Nat → MVarId → MetaM MVarId
     else
       return mvarId
 
-/-- Destruct `Exists`, `And`, and `False` hypotheses in the local context of `mvarId`
-    with explicit fuel (zero `partial`) and a `tried` guard so dependent hypotheses
-    that reject `cases` never cause failures or loops. -/
-private def destructHypsAux : Nat → Array FVarId → MVarId → MetaM (Option MVarId)
-  | 0, _, mvarId => return some mvarId
-  | fuel + 1, tried, mvarId => do
-    mvarId.withContext do
+/-- Destruct `False`, `And`, `Exists`, and (up to `maxGoals` total leaves) `Or`
+    hypotheses in the local contexts of `pending` with explicit fuel (zero `partial`)
+    and per-goal `tried` guards so dependent hypotheses that reject `cases` never
+    cause failures or loops. Non-branching hypotheses (`False`, `And`, `Exists`) are
+    always prioritized ahead of branching `Or` splits so disjunctive preconditions
+    like `(∃ n, P n) ∨ (∃ n, Q n)` open cleanly on every branch. -/
+private def destructHypsMulti
+    (maxGoals : Nat) : Nat → List (MVarId × Array FVarId) → List MVarId → MetaM (List MVarId)
+  | 0, pending, done => return done ++ pending.map Prod.fst
+  | _, [], done => return done
+  | fuel + 1, (mvarId, tried) :: rest, done => do
+    let canSplitOr : Bool := Nat.ble (done.length + rest.length + 2) maxGoals
+    let target? ← mvarId.withContext do
       let lctx ← getLCtx
-      let mut target? : Option (FVarId × Nat) := none
+      let mut nonBranch? : Option (FVarId × Nat) := none
+      let mut orCand? : Option FVarId := none
       for decl in lctx do
         if decl.isImplementationDetail || tried.contains decl.fvarId then continue
         let ty ← instantiateMVars decl.type
         let tyWhnf ← whnf ty
         if tyWhnf.isConstOf ``False then
-          target? := some (decl.fvarId, 0)
+          nonBranch? := some (decl.fvarId, 0)
           break
         else if tyWhnf.isAppOfArity ``And 2 then
-          target? := some (decl.fvarId, 1)
+          nonBranch? := some (decl.fvarId, 1)
           break
         else if tyWhnf.isAppOfArity ``Exists 2 then
-          target? := some (decl.fvarId, 2)
+          nonBranch? := some (decl.fvarId, 2)
           break
-      match target? with
-      | none => return some mvarId
-      | some (fvarId, kind) =>
-        try
-          let subgoals ← mvarId.cases fvarId
-          if kind == 0 then
-            return none
-          match subgoals.toList with
-          | [] => return none
-          | [sg] => destructHypsAux fuel tried sg.mvarId
-          | _ => return some mvarId
-        catch _ =>
-          destructHypsAux fuel (tried.push fvarId) mvarId
+        else if canSplitOr && orCand?.isNone && tyWhnf.isAppOfArity ``Or 2 then
+          orCand? := some decl.fvarId
+      match nonBranch? with
+      | some nb => return some nb
+      | none => return orCand?.map (fun fv => (fv, 3))
+    match target? with
+    | none => destructHypsMulti maxGoals fuel rest (mvarId :: done)
+    | some (fvarId, kind) =>
+      try
+        let subgoals ← mvarId.cases fvarId
+        if kind == 0 then
+          destructHypsMulti maxGoals fuel rest done
+        else
+          let nextGoals := subgoals.toList.map (fun sg => (sg.mvarId, tried))
+          destructHypsMulti maxGoals fuel (nextGoals ++ rest) done
+      catch _ =>
+        destructHypsMulti maxGoals fuel ((mvarId, tried.push fvarId) :: rest) done
 
 /-- Run a single tactic syntax snippet against `goalTy` inside a fresh isolated
     metavariable, restoring `Core.State.messages`, verifying zero errors, zero `sorry`,
@@ -1298,12 +1342,14 @@ private def tryTacticSnippet
         return false
       let mvar ← mkFreshExprSyntheticOpaqueMVar goalTy
       let mvarId ← introsUnfoldingNot 8 mvar.mvarId!
-      let next? ← destructHypsAux 24 #[] mvarId
-      let remaining ← match next? with
-        | none => pure []
-        | some mid =>
-          Term.TermElabM.run' <| Tactic.run mid <| Tactic.evalTactic tac
-      if !remaining.isEmpty then
+      let goals ← destructHypsMulti 8 32 [(mvarId, #[])] []
+      let mut allClosed := true
+      for mid in goals do
+        let rem ← Term.TermElabM.run' <| Tactic.run mid <| Tactic.evalTactic tac
+        if !rem.isEmpty then
+          allClosed := false
+          break
+      if !allClosed then
         return false
       let proof ← instantiateMVars mvar
       let hasErrs := (← getThe Core.State).messages.hasErrors
@@ -1666,15 +1712,18 @@ private def isBoilerplateAtom (e : Expr) : Bool :=
     name == ``Trusted.VerificationResult.retMatchesCalleeReturnTy
   | _ => false
 
-/-- Collect distinct boilerplate atoms occurring under propositional connectives,
-    stopping once `limit` atoms have been gathered (bounded by `fuel`). -/
+/-- Collect distinct closed (zero loose bvar) boilerplate atoms occurring under
+    propositional connectives, `ite`/`dite`, `.lam`, and `.letE`, stopping once `limit`
+    atoms have been gathered (bounded by `fuel`). -/
 private def collectBoilerplateAtoms :
     Nat → Nat → Expr → Array Expr → Array Expr × Bool
   | 0, _, _, acc => (acc, false)
   | fuel + 1, limit, e, acc =>
     let e := e.consumeMData
     if isBoilerplateAtom e then
-      if acc.any (fun a => a == e) then
+      if e.hasLooseBVars then
+        (acc, false)
+      else if acc.any (fun a => a == e) then
         (acc, false)
       else if acc.size < limit then
         (acc.push e, false)
@@ -1703,6 +1752,8 @@ private def collectBoilerplateAtoms :
           (acc, false)
       | .lam _ _ body _ =>
         collectBoilerplateAtoms fuel limit body acc
+      | .letE _ _ val body _ =>
+        collectBoilerplateAtoms fuel limit (body.instantiate1 val) acc
       | _ => (acc, false)
 
 /-- Lookup the truth assignment (`true` / `false`) for `e` in `atoms` under bitmask `mask`. -/
@@ -1715,9 +1766,25 @@ private def lookupAtomMask? (atoms : Array Expr) (mask : Nat) (e : Expr) : Optio
 private def mkBoolProp (b : Bool) : Expr :=
   if b then mkConst ``True else mkConst ``False
 
+/-- Eliminate a `Prop`-valued `if cond' then t' else f'` into propositionally
+    equivalent connectives without needing a fresh `Decidable cond'` instance.
+    Caller guarantees `cond'`, `t'`, and `f'` are `Prop` expressions with no loose
+    bound variables so constructing non-dependent arrows cannot capture any `bvar`. -/
+private def simplifyPropIte (cond' t' f' : Expr) : Expr :=
+  let mkNonDepArrow (p q : Expr) : Expr := .forallE Name.anonymous p q .default
+  let negCond := mkApp (mkConst ``Not) cond'
+  if t' == f' then t'
+  else if t'.isConstOf ``True && f'.isConstOf ``False then cond'
+  else if t'.isConstOf ``False && f'.isConstOf ``True then negCond
+  else if t'.isConstOf ``True then mkNonDepArrow negCond f'
+  else if f'.isConstOf ``True then mkNonDepArrow cond' t'
+  else if t'.isConstOf ``False then mkApp2 (mkConst ``And) negCond f'
+  else if f'.isConstOf ``False then mkApp2 (mkConst ``And) cond' t'
+  else mkApp2 (mkConst ``And) (mkNonDepArrow cond' t') (mkNonDepArrow negCond f')
+
 /-- Shannon cofactor `e` with respect to `atoms` under truth-assignment bitmask `mask`,
-    simplifying propositional connectives and `ite`/`dite` conditions while keeping the
-    resulting `Prop` expression well-typed. -/
+    simplifying propositional connectives, `ite`/`dite` conditions and branches, `.lam`
+    bodies, and `.letE` bindings while keeping the resulting `Prop` well-typed. -/
 private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
   | 0, _, _, e => e
   | fuel + 1, atoms, mask, e =>
@@ -1747,7 +1814,8 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
       else if e.isAppOfArity ``Iff 2 then
         let p := cofactorBoilerplate fuel atoms mask e.appFn!.appArg!
         let q := cofactorBoilerplate fuel atoms mask e.appArg!
-        if p.isConstOf ``True then q
+        if p == q then mkConst ``True
+        else if p.isConstOf ``True then q
         else if q.isConstOf ``True then p
         else if p.isConstOf ``False then
           if q.isConstOf ``False then mkConst ``True else mkApp (mkConst ``Not) q
@@ -1763,22 +1831,59 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
         else
           let t' := cofactorBoilerplate fuel atoms mask args[3]!
           let f' := cofactorBoilerplate fuel atoms mask args[4]!
-          mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+          let isPropRes := args[0]!.consumeMData == mkSort Level.zero
+          if t' == f' then
+            t'
+          else if isPropRes && cond' != args[1]! &&
+              !cond'.hasLooseBVars && !t'.hasLooseBVars && !f'.hasLooseBVars then
+            simplifyPropIte cond' t' f'
+          else
+            mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
       else if e.isAppOfArity ``dite 5 then
         let args := e.getAppArgs
         let cond' := cofactorBoilerplate fuel atoms mask args[1]!
+        let tLam := args[3]!.consumeMData
+        let fLam := args[4]!.consumeMData
         if cond'.isConstOf ``True then
-          match args[3]! with
-          | .lam _ _ tb _ =>
-            if !tb.hasLooseBVar 0 then cofactorBoilerplate fuel atoms mask tb else e
+          match tLam with
+          | .lam n dom tb bi =>
+            let tb' := cofactorBoilerplate fuel atoms mask tb
+            if !tb'.hasLooseBVars then tb'
+            else
+              let fLam' := match fLam with
+                | .lam fn fdom fb fbi => .lam fn fdom (cofactorBoilerplate fuel atoms mask fb) fbi
+                | other => other
+              mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, .lam n dom tb' bi, fLam']
           | _ => e
         else if cond'.isConstOf ``False then
-          match args[4]! with
-          | .lam _ _ fb _ =>
-            if !fb.hasLooseBVar 0 then cofactorBoilerplate fuel atoms mask fb else e
+          match fLam with
+          | .lam n dom fb bi =>
+            let fb' := cofactorBoilerplate fuel atoms mask fb
+            if !fb'.hasLooseBVars then fb'
+            else
+              let tLam' := match tLam with
+                | .lam tn tdom tb tbi => .lam tn tdom (cofactorBoilerplate fuel atoms mask tb) tbi
+                | other => other
+              mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, tLam', .lam n dom fb' bi]
           | _ => e
         else
-          e
+          match tLam, fLam with
+          | .lam tn tdom tb tbi, .lam fn fdom fb fbi =>
+            let tb' := cofactorBoilerplate fuel atoms mask tb
+            let fb' := cofactorBoilerplate fuel atoms mask fb
+            let isPropRes := args[0]!.consumeMData == mkSort Level.zero
+            if !tb'.hasLooseBVars && !fb'.hasLooseBVars then
+              if tb' == fb' then
+                tb'
+              else if isPropRes && cond' != args[1]! && !cond'.hasLooseBVars then
+                simplifyPropIte cond' tb' fb'
+              else
+                mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!,
+                  .lam tn tdom tb' tbi, .lam fn fdom fb' fbi]
+            else
+              mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!,
+                .lam tn tdom tb' tbi, .lam fn fdom fb' fbi]
+          | _, _ => e
       else
         match e with
         | .forallE n dom body bi =>
@@ -1790,6 +1895,10 @@ private def cofactorBoilerplate : Nat → Array Expr → Nat → Expr → Expr
             else .forallE n d' b' bi
           else
             e
+        | .lam n dom body bi =>
+          .lam n dom (cofactorBoilerplate fuel atoms mask body) bi
+        | .letE _ _ val body _ =>
+          cofactorBoilerplate fuel atoms mask (body.instantiate1 val)
         | _ => e
 
 /-- Fast sound recognizer for boilerplate atoms whose truth value is fixed
@@ -1877,9 +1986,10 @@ private def unfoldUserHead : Nat → Expr → MetaM Expr
     | _ => return e
 
 /-- Unfold user-defined head predicates recursively through propositional connectives
-    (`And`, `Or`, `Iff`, `Not`, non-dependent `→`, and `ite` branches), preserving
-    auto-generated boilerplate atoms. Each step is a definitional unfolding or
-    zeta/beta/projection reduction, so the result is definitionally equal to the input. -/
+    (`And`, `Or`, `Iff`, `Not`, non-dependent `→`, and `ite`/`dite` conditions and
+    branches), preserving auto-generated boilerplate atoms. Each step is a definitional
+    unfolding or zeta/beta/projection/iota reduction, so the result is definitionally
+    equal to the input. -/
 private def unfoldUserConnectives : Nat → Expr → MetaM Expr
   | 0, e => return e
   | fuel + 1, e => do
@@ -1887,7 +1997,7 @@ private def unfoldUserConnectives : Nat → Expr → MetaM Expr
     if isBoilerplateAtom e then
       return e
     let e1 ← unfoldUserHead 6 e
-    let e ← if e1 != e then zetaBetaProjReduce 8 e1 else pure e1
+    let e ← if e1 != e then unfoldUserHead 4 (← zetaBetaProjReduce 8 e1) else pure e1
     if isBoilerplateAtom e then
       return e
     if e.isAppOfArity ``And 2 then
@@ -1907,8 +2017,33 @@ private def unfoldUserConnectives : Nat → Expr → MetaM Expr
       return mkApp (mkConst ``Not) inner
     else if e.isAppOfArity ``ite 5 then
       let args := e.getAppArgs
+      let cond' ← unfoldUserConnectives fuel args[1]!
       let t' ← unfoldUserConnectives fuel args[3]!
       let f' ← unfoldUserConnectives fuel args[4]!
+      if cond' != args[1]! then
+        let withCond := mkAppN e.getAppFn #[args[0]!, cond', args[2]!, t', f']
+        if ← isTypeCorrect withCond then
+          return withCond
+      return mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
+    else if e.isAppOfArity ``dite 5 then
+      let args := e.getAppArgs
+      let cond' ← unfoldUserConnectives fuel args[1]!
+      let t' ← match args[3]!.consumeMData with
+        | .lam n dom body bi =>
+          withLocalDecl n bi dom fun fv => do
+            let body' ← unfoldUserConnectives fuel (body.instantiate1 fv)
+            return .lam n dom (body'.abstract #[fv]) bi
+        | other => pure other
+      let f' ← match args[4]!.consumeMData with
+        | .lam n dom body bi =>
+          withLocalDecl n bi dom fun fv => do
+            let body' ← unfoldUserConnectives fuel (body.instantiate1 fv)
+            return .lam n dom (body'.abstract #[fv]) bi
+        | other => pure other
+      if cond' != args[1]! then
+        let withCond := mkAppN e.getAppFn #[args[0]!, cond', args[2]!, t', f']
+        if ← isTypeCorrect withCond then
+          return withCond
       return mkAppN e.getAppFn #[args[0]!, args[1]!, args[2]!, t', f']
     else
       match e with
@@ -2196,6 +2331,17 @@ private def analyzeNormalizedSpec
     return .vacuous .unrealizableUnderRequires ["ensures reduces to False"]
 
   if freeBefore && !freeAfter then
+    let normDiscarded ← unfoldUserConnectives 8 reducedBody
+    if normDiscarded.isConstOf ``False then
+      return .vacuous .unrealizableUnderRequires
+        ["ensures reduces to False after discarding output"]
+    if ← proveClosed (negate normDiscarded) then
+      return .vacuous .unrealizableUnderRequires
+        ["ensures with discarded output proved unsatisfiable"]
+    if let some preNorm := preNorm? then
+      if ← proveUnderRequires preNorm (negate normDiscarded) then
+        return .vacuous .unrealizableUnderRequires
+          ["ensures with discarded output proved unsatisfiable under requires"]
     return .vacuous .discardedLetBinding
       ["output variable occurs only in a discarded let/beta/projection binding"]
 
@@ -2293,6 +2439,9 @@ private def analyzeNormalizedSpec
         if ← proveFibreInsensitive fibreAssump res then
           if ← proveFibreContra fibreAssump res then
             return .contradictory
+          if let some preNorm := preNorm? then
+            if ← proveFibreContraUnderRequires preNorm fibreAssump res then
+              return .contradictory
           if ← proveClosed res then
             return .tautological .tautologicalByProver
           return .insensitive
@@ -2370,7 +2519,13 @@ private def analyzeNormalizedSpec
 
   -- Always run the sound global output-insensitivity check: an unresolved or
   -- unreachable boilerplate fibre in Phase 3 does not refute global insensitivity.
+  -- Check `requires`-relative unsatisfiability before returning `outputInsensitive` so
+  -- unrealizable specs (`ret = ret ∧ ¬ pre`) are classified as `SpecViolation`.
   if ← proveInsensitive workBody then
+    if let some preNorm := preNorm? then
+      if ← proveUnderRequires preNorm (negate workBody) then
+        return .vacuous .unrealizableUnderRequires
+          (notes ++ ["ensures proved unsatisfiable under requires"])
     return .vacuous .outputInsensitive
       (notes ++ ["ensures proved independent of the output"])
 

@@ -1085,13 +1085,23 @@ theorem contradictoryFibre_not_returnValueDichotomy :
       hOk'.1.symm.trans hOk'.2
     cases hEq
 
-/-- External spec whose user `ensures` mentions `ret` but constrains only the inputs. -/
+/-- External spec whose user `ensures` mentions `ret` but constrains only the inputs
+    in a way compatible with `sliceIsEmptySidecar.argCount = 1`. -/
 def argsEmptyIgnoringRetPost (args : List Value) (ret : Value) : Prop :=
+  ret = ret ∧ args.length = 1
+
+/-- External spec whose input-only `ensures` (`args = []`) contradicts `argCount = 1`,
+    making normal return unrealizable (`SpecViolation`). -/
+def argsEmptyContraRetPost (args : List Value) (ret : Value) : Prop :=
   ret = ret ∧ args = []
 
 def argsEmptyIgnoringRetExtContract : MirCallContract :=
   externalSpecCallContract "core::slice::is_empty" sliceIsEmptySidecar
     (fun _ => True) argsEmptyIgnoringRetPost
+
+def argsEmptyContraRetExtContract : MirCallContract :=
+  externalSpecCallContract "core::slice::is_empty" sliceIsEmptySidecar
+    (fun _ => True) argsEmptyContraRetPost
 
 theorem argsEmptyIgnoringRet_not_ensuresDichotomy :
     ¬ ExternalSpecEnsuresDichotomy "core::slice::is_empty" sliceIsEmptySidecar
@@ -1165,6 +1175,7 @@ theorem frameImpliesRet_returnValueDichotomy :
 
 #eval assertDeclEnsuresVacuous ``contradictoryFibreContract (some .unboundReturnOutput)
 #eval assertDeclEnsuresVacuous ``argsEmptyIgnoringRetExtContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``argsEmptyContraRetExtContract (some .specViolation)
 #eval assertDeclEnsuresVacuous ``vacuousUnderRequiresCallContract (some .survivedAllMutants)
 #eval assertDeclEnsuresVacuous ``boilerplateExcludedMiddleContract (some .trivialPostcondition)
 #eval assertDeclEnsuresVacuous ``boilerplateIffContract (some .unboundReturnOutput)
@@ -1619,6 +1630,211 @@ theorem existsLenVacuousPost_not_dichotomy :
   (some .survivedAllMutants)
 #eval assertDeclEnsuresVacuous ``existsLenVacuousClaim (some .survivedAllMutants)
 
+/-! ### 3.13 `dite`/Compound-`ite` Boilerplate, Disjunctive `requires` & Unrealizability Precedence -/
+
+open scoped Classical in
+/-- Boilerplate atoms inside both branches of a dependent `if h : ...` must be
+    cofactored rather than escaping behind the branch lambdas. -/
+def diteBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if _h : req.args = [] then
+        callFramePreserved req.memory memAfter
+      else
+        callFramePreserved req.memory memAfter ∧
+          retMatchesCalleeReturnTy sliceIsEmptySidecar retVal
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+theorem diteBoilerplate_not_dichotomyModuloBoilerplate :
+    ¬ DichotomyModuloObservation
+        (externalSpecBoilerplateObs sliceIsEmptySidecar)
+        diteBoilerplateContract.pre
+        (fun req q => diteBoilerplateContract.post req (.returned q.1 q.2)) := by
+  apply not_dichotomyModuloObservation_of_fibre_forwardInsensitive
+  intro req q₁ q₂ _ hObsEq hOk
+  have hFrameEq : callFramePreserved req.memory q₁.2 = callFramePreserved req.memory q₂.2 :=
+    congrArg Prod.fst hObsEq
+  have hTyEq : retMatchesCalleeReturnTy sliceIsEmptySidecar q₁.1 =
+      retMatchesCalleeReturnTy sliceIsEmptySidecar q₂.1 :=
+    congrArg Prod.snd hObsEq
+  dsimp [diteBoilerplateContract] at hOk ⊢
+  split at hOk <;> split
+  · exact hFrameEq ▸ hOk
+  · contradiction
+  · contradiction
+  · exact ⟨hFrameEq ▸ hOk.1, hTyEq ▸ hOk.2⟩
+
+open scoped Classical in
+/-- Genuine return constraint inside a dependent `if h : ...` branch must pass. -/
+def diteGenuineContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      if _h : req.args = [] then
+        callFramePreserved req.memory memAfter ∧ retVal = Value.unit
+      else
+        callFramePreserved req.memory memAfter
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+theorem diteGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy diteGenuineContract := by
+  let req : MirCallReq := { defPath := "", args := .nil, memory := emptyMemory }
+  refine ⟨req, emptyMemory, Value.unit, .scalar { bits := 7, sizeBytes := 4 },
+    trivial, ?_, ?_⟩
+  · dsimp [diteGenuineContract, req]
+    exact ⟨callFramePreserved_refl emptyMemory, rfl⟩
+  · intro hBad
+    dsimp [diteGenuineContract, req] at hBad
+    nomatch hBad.2
+
+/-- Helper wrapping a boilerplate atom used inside an `ite` condition. -/
+def hiddenFrameCond (req : MirCallReq) (memAfter : Memory) : Prop :=
+  callFramePreserved req.memory memAfter
+
+open scoped Classical in
+def hiddenCondBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      if hiddenFrameCond req memAfter then True else False
+    | .panicked _ => False
+    | .aborted => True
+}
+
+open scoped Classical in
+/-- Compound `ite` condition mixing a boilerplate atom and an input predicate. -/
+def compoundIteCondBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      if callFramePreserved req.memory memAfter ∧ req.args = [] then True else False
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- `let`-bound boilerplate atom must still be collected and cofactored. -/
+def letBoilerplateContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      let ok := callFramePreserved req.memory memAfter
+      ok ∧ retMatchesCalleeReturnTy sliceIsEmptySidecar retVal
+    | .panicked _ => False
+    | .aborted => True
+}
+
+/-- Disjunctive precondition where branch 1 is vacuous and branch 2 genuinely binds `ret`:
+    `PostconditionDichotomy` holds existentially, so the checker must NOT false-flag it. -/
+def disjPartialVacuousPre (x : Nat) : Prop := x < 10 ∨ x ≥ 100
+def disjPartialVacuousPost (x ret : Nat) : Prop := x < 10 ∨ ret = x
+
+theorem disjPartialVacuous_dichotomy :
+    PostconditionDichotomy disjPartialVacuousPre disjPartialVacuousPost := by
+  change PostconditionDichotomy (fun x : Nat => x < 10 ∨ x ≥ 100) disjPartialVacuousPost
+  apply Iff.mpr (postconditionDichotomy_or_pre_iff
+    (pre₁ := fun x : Nat => x < 10) (pre₂ := fun x : Nat => x ≥ 100))
+  refine Or.inr ⟨100, by omega, ⟨100, Or.inr rfl⟩, ⟨0, ?_⟩⟩
+  intro hBad
+  dsimp [disjPartialVacuousPost] at hBad
+  rcases hBad with hLt | hEq <;> omega
+
+/-- Disjunctive existential precondition: branch 1 is unsatisfiable and branch 2 forces
+    `len < 10`, so `existsLenVacuousPost` is vacuous on every satisfiable branch. -/
+def disjExistsVacuousPre (args : List Value) : Prop :=
+  (∃ len : Nat, len > 10 ∧ len < 5 ∧ args = [.scalar { bits := len, sizeBytes := 8 }]) ∨
+  (∃ len : Nat, len < 10 ∧ args = [.scalar { bits := len, sizeBytes := 8 }])
+
+theorem disjExistsVacuous_not_dichotomy :
+    ¬ PostconditionDichotomy disjExistsVacuousPre existsLenVacuousPost := by
+  change ¬ PostconditionDichotomy
+    (fun args =>
+      (∃ len : Nat, len > 10 ∧ len < 5 ∧ args = [.scalar { bits := len, sizeBytes := 8 }]) ∨
+      existsLenPre args)
+    existsLenVacuousPost
+  apply Iff.mpr (not_postconditionDichotomy_or_pre_iff
+    (pre₁ := fun args =>
+      ∃ len : Nat, len > 10 ∧ len < 5 ∧ args = [.scalar { bits := len, sizeBytes := 8 }])
+    (pre₂ := existsLenPre))
+  refine ⟨not_postconditionDichotomy_of_unsat_pre ?_, existsLenVacuousPost_not_dichotomy⟩
+  rintro ⟨_, len, hGt, hLt, _⟩
+  omega
+
+/-- Disjunctive existential precondition where both branches are unsatisfiable. -/
+def disjBothDeadPre (args : List Value) : Prop :=
+  (∃ len : Nat, len > 10 ∧ len < 5 ∧ args = [.scalar { bits := len, sizeBytes := 8 }]) ∨
+  (∃ len : Nat, len > 20 ∧ len < 15 ∧ args = [.scalar { bits := len, sizeBytes := 8 }])
+
+theorem disjBothDeadPre_not_satisfiable :
+    ¬ PreconditionSatisfiable disjBothDeadPre := by
+  rintro ⟨_, hPre⟩
+  rcases hPre with ⟨len, hGt, hLt, _⟩ | ⟨len, hGt, hLt, _⟩ <;> omega
+
+/-- Discarded output binding with an arithmetically unsatisfiable residual (`SpecViolation`). -/
+def discardedLetArithContraPost (x ret : Nat) : Prop :=
+  let _ := ret
+  x < x
+
+/-- Unrealizable boilerplate-guarded contract mentioning `retVal` reflexively (`SpecViolation`). -/
+def contraReflBoilerplateContract : MirCallContract := {
+  pre := fun req => req.args = []
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧ (retVal = retVal ∧ req.args ≠ [])
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem contraReflBoilerplate_not_realizable :
+    ¬ MirCallContractRealizable contraReflBoilerplateContract := by
+  rintro ⟨req, _, _, hPre, _, _, hNe⟩
+  exact hNe hPre
+
+/-- Unrealizable under `survivedPre` (`x < 10`) while mentioning `ret` reflexively (`SpecViolation`). -/
+def contraReflUnderReqPost (x ret : Nat) : Prop :=
+  ret = ret ∧ x ≥ 10
+
+theorem contraReflUnderReq_not_realizable :
+    ¬ ContractRealizable survivedPre contraReflUnderReqPost := by
+  rintro ⟨x, hLt, _, _, hGe⟩
+  dsimp [survivedPre] at hLt
+  omega
+
+#eval assertDeclEnsuresVacuous ``diteBoilerplateContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresBindsOutput ``diteGenuineContract
+#eval assertDeclEnsuresBindsOutput ``diteGenuineContract { strictReturnValue := true }
+#eval assertDeclEnsuresVacuous ``hiddenCondBoilerplateContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``compoundIteCondBoilerplateContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``letBoilerplateContract (some .unboundReturnOutput)
+-- Disjunctive `requires`: genuine branch passes; all-branches vacuous/dead are caught.
+#eval assertEnsuresBindsOutput
+  (Lean.mkConst ``disjPartialVacuousPost) (some (Lean.mkConst ``disjPartialVacuousPre))
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``existsLenVacuousPost) (some (Lean.mkConst ``disjExistsVacuousPre))
+  (some .survivedAllMutants)
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``existsLenVacuousPost) (some (Lean.mkConst ``disjBothDeadPre))
+  (some .deadPrecondition)
+-- Unrealizability (`SpecViolation`) takes precedence over `UnboundReturnOutput` across Phases 2/3/4.
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``discardedLetArithContraPost) none (some .specViolation)
+#eval assertDeclEnsuresVacuous ``contraReflBoilerplateContract (some .specViolation)
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``contraReflUnderReqPost) (some (Lean.mkConst ``survivedPre))
+  (some .specViolation)
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
@@ -1703,6 +1919,8 @@ def auditViolation? (n : Lean.Name) : Lean.Meta.MetaM (Option String) := do
     ``not_postconditionDichotomy_of_forwardOutputInsensitive,
     ``not_postconditionDichotomy_of_subsingleton,
     ``not_dichotomyModuloObservation_of_fibre_forwardInsensitive,
+    ``postconditionDichotomy_or_pre_iff,
+    ``not_postconditionDichotomy_or_pre_iff,
     ``statefulClaimReturnDichotomy_iff_moduloMemory,
     ``not_statefulClaimReturnDichotomy_of_returnInsensitive,
     ``not_mirCallContractReturnValueDichotomy_of_returnInsensitive,
