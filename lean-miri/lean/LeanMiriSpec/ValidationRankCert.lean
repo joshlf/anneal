@@ -51,17 +51,26 @@ and `DataRangeSet` types:
      (`vendored_unionRanges_eq_noFuel`),
    - `RealVisit.realVisitNoFuel` (verbatim `lean-miri#90` `visit`, well-founded on `visitOrder`,
      over the kernel-checked factorization `RealVisit.vendored_visit_succ` of the **actual
-     vendored `Miri.Interpreter.ValidityVisitor.visit`** into `RealVisit.visitStep`), proved
-     equivalent to the vendored `visit` for every hook instance satisfying the one-step
+     vendored `Miri.Interpreter.ValidityVisitor.visit`** into `RealVisit.visitStep`), paired with
+     the unconditional `Classical.choice`-free `ω · 2` structural companion
+     `RealVisit.realVisitLexRank` (`RealVisit.realVisitLexRank_eq_noFuel`) and proved equivalent
+     to the vendored `visit` for every hook instance satisfying the one-step
      `RealVisit.VisitHooksDescend` (`RealVisit.vendored_visit_eq_noFuel`; sized-root form
-     `RealVisit.vendored_visit_eq_noFuel_of_sized` at fuel `> layoutOrder + 1`), with the
-     hypothesis discharged for the deep `.pattern` chain at *every* depth
-     (`RealVisit.deepPattern_vendored_visit_eq_noFuel`) and a self-looping projection rejected
-     (`RealVisit.selfPattern_noFuel_rejects_vendored_exhausts`), and
-   - `drainPointees` / `pointeeSession` LIFO pointee queue draining.
+     `RealVisit.vendored_visit_eq_noFuel_of_sized` at fuel `> layoutOrder + 1`), decomposed across
+     all 7 projection boundaries via `RealVisit.visitHooksDescend_of_conditions`, connected
+     end-to-end to `checkSchema17Table` via `RealVisit.schema17_vendored_visit_eq_noFuel`, and
+     witnessed across 150-level `.pattern`, `dyn Trait`, same-`TyId` enum-phase, and `.Union`
+     `dataBytes` reset traversals,
+   - `RealVisit.realValidatePlaceNoFuel` / `RealVisit.realConstValidatePlaceNoFuel` (and their
+     `Classical.choice`-free `*LexRank` companions + `RealVisit.vendored_constValidatePlace_eq_noFuel`)
+     reading `typeRankOf (← get)` from machine state per root and pointee visit, alongside
+     `RealVisit.RuntimeArrayWorld` and key-memoized `RealVisit.MemoRuntimeArrayWorld`, and
+   - `drainPointees` / `drainPointeesForIn` (`for (key, path) in tracking.todo.reverse do`) /
+     `RealVisit.drainPointeesFuel` / `pointeeSession` LIFO pointee queue draining.
 4. Equivalences, deterministic `.invalidProgram` hook-violation rejection, and the
    `Anneal.MirFuelFree` bridge (`rankCountdown_converges_iff`, `rankCountdown_canonical`,
-   `walkFuel_eq_walkNoFuel_of_wpCoalBounded`, `vendored_unionRanges_eq_noFuel_of_wpCoalBounded`).
+   `walkFuel_eq_walkNoFuel_of_wpCoalBounded`, `vendored_unionRanges_eq_noFuel_of_wpCoalBounded`,
+   `RealVisit.vendored_visit_eq_noFuel_of_wpCoalBounded`).
 5. Kernel-evaluated 150-level nested single-field wrapper, union, and pattern witnesses over both
    the companion traversals and the actual vendored `ValidityVisitor.{unionRanges, visit}`.
 6. `leanprover/lean4#13851` axiom footprint audit (§8: `#guard_msgs` `#print axioms`,
@@ -3757,9 +3766,11 @@ theorem realVisitLexRank_fieldless {P S C E F A Pad : Type} [PointerProvenance P
 
 /-! #### Witness 4: Dynamic `RuntimeArrayTypes.intern` rank extension & state-varying `typeRankOf` (`lean-miri#90` L245–278) -/
 
-/-- Model of `lean-miri#90` `Miri.Input.RuntimeArrayTypes.World` (`lean_miri_pr90.diff` L238–278):
-combines static Schema 17 compiler `TypeNode` ranks with dynamically interned `[Elem; N]` array
-types allocated during execution/projection at `validationRank := typeRank world elemTy + 1`. -/
+/-- Fresh-allocation model of `lean-miri#90` `Miri.Input.RuntimeArrayTypes.World`
+(`lean_miri_pr90.diff` L238–278): combines static Schema 17 compiler `TypeNode` ranks with
+dynamically interned `[Elem; N]` array types allocated at `validationRank := typeRank world elemTy + 1`.
+(See `MemoRuntimeArrayWorld` below for the full `(elemTy, count)` cache-hit memoizing model matching
+`RuntimeArrayTypes.intern`'s `entries.find? (·.key == key)` lookup.) -/
 structure RuntimeArrayWorld where
   staticRanks : ValidationRankCert
   dynamicEntries : List (MIR.TyId × Nat)
@@ -4115,6 +4126,424 @@ theorem unionReset_marks_dataBytes :
   rw [← realVisitLexRank_eq_noFuel]
   decide +kernel
 
+/-! #### Key-memoized `MemoRuntimeArrayWorld` (`lean-miri#90` `RuntimeArrayTypes.intern` L263–278) -/
+
+/-- Cached runtime `[elemTy; count]` interning entry storing its assigned `arrTy` and
+`validationRank = typeRank elemTy + 1` (`lean-miri#90` `RuntimeArrayTypes.Entry`). -/
+structure MemoArrayEntry where
+  elemTy : MIR.TyId
+  count : UInt64
+  arrTy : MIR.TyId
+  validationRank : Nat
+  deriving Repr
+
+/-- Key-memoized model of `lean-miri#90` `Miri.Input.RuntimeArrayTypes.World` (`lean_miri_pr90.diff`
+L238–278): extends `RuntimeArrayWorld` with `(elemTy, count)` cache-hit reuse (`entries.find?`),
+so repeated dynamic projections of `[Elem; N]` reuse `prior.arrTy` without allocating duplicate `TyId`s. -/
+structure MemoRuntimeArrayWorld where
+  staticRanks : ValidationRankCert
+  entries : List MemoArrayEntry
+  nextId : MIR.TyId
+  deriving Repr
+
+/-- Lookup mirroring `RuntimeArrayTypes.typeRank` over `MemoRuntimeArrayWorld`: consults static
+Schema 17 compiler ranks first, then memoized runtime array entries by `arrTy`, defaulting to `0`. -/
+def MemoRuntimeArrayWorld.typeRank (w : MemoRuntimeArrayWorld) (ty : MIR.TyId) : Nat :=
+  if w.staticRanks.ranks.any (·.1 == ty) then w.staticRanks.tyRank ty
+  else ((w.entries.find? (·.arrTy == ty)).map (·.validationRank)).getD 0
+
+/-- Memoized runtime array interning (`lean-miri#90` `RuntimeArrayTypes.intern` L263–278):
+returns the existing `(prior.arrTy, w)` unchanged on a `(elemTy, count)` cache hit, and otherwise
+allocates `w.nextId` at `validationRank := w.typeRank elemTy + 1`. -/
+def MemoRuntimeArrayWorld.intern (w : MemoRuntimeArrayWorld) (elemTy : MIR.TyId) (count : UInt64) :
+    MIR.TyId × MemoRuntimeArrayWorld :=
+  match w.entries.find? (fun e => e.elemTy == elemTy && e.count == count) with
+  | some prior => (prior.arrTy, w)
+  | none =>
+    let newId := w.nextId
+    let elemRank := w.typeRank elemTy
+    (newId, { w with
+      entries := w.entries ++ [⟨elemTy, count, newId, elemRank + 1⟩]
+      nextId := newId + 1 })
+
+/-- On a `(elemTy, count)` cache hit, `MemoRuntimeArrayWorld.intern` returns `(prior.arrTy, w)`
+without mutating the world or advancing `nextId`. -/
+theorem MemoRuntimeArrayWorld.intern_memo_hit (w : MemoRuntimeArrayWorld)
+    (elemTy : MIR.TyId) (count : UInt64) (prior : MemoArrayEntry)
+    (hhit : w.entries.find? (fun e => e.elemTy == elemTy && e.count == count) = some prior) :
+    w.intern elemTy count = (prior.arrTy, w) := by
+  simp [MemoRuntimeArrayWorld.intern, hhit]
+
+/-- `MemoRuntimeArrayWorld.intern` is idempotent on `(elemTy, count)`: re-interning the same
+`(elemTy, count)` pair immediately hits the memoized entry and leaves `(arrTy, w')` unchanged. -/
+theorem MemoRuntimeArrayWorld.intern_memo_idempotent (w : MemoRuntimeArrayWorld)
+    (elemTy : MIR.TyId) (count : UInt64) :
+    let (arrTy, w') := w.intern elemTy count
+    w'.intern elemTy count = (arrTy, w') := by
+  dsimp only [MemoRuntimeArrayWorld.intern]
+  cases hfind : w.entries.find? (fun e => e.elemTy == elemTy && e.count == count) with
+  | some prior => simp [hfind]
+  | none => simp [List.find?_append, hfind]
+
+/-- Unified hit-and-miss Schema 17 descent for memoized runtime array interning:
+if existing entries already witness `w.typeRank e.elemTy < w.typeRank e.arrTy` and `w.nextId` is
+fresh, then `(arrTy, w') := w.intern elemTy count` satisfies `w'.typeRank elemTy < w'.typeRank arrTy`
+on both cache hits and fresh allocations. -/
+theorem MemoRuntimeArrayWorld.intern_rank_lt (w : MemoRuntimeArrayWorld)
+    (elemTy : MIR.TyId) (count : UInt64)
+    (hinv : ∀ e ∈ w.entries, w.typeRank e.elemTy < w.typeRank e.arrTy)
+    (hstaticFresh : w.staticRanks.ranks.any (·.1 == w.nextId) = false)
+    (hdynFresh : w.entries.any (·.arrTy == w.nextId) = false)
+    (hne : elemTy ≠ w.nextId) :
+    let (arrTy, w') := w.intern elemTy count
+    w'.typeRank elemTy < w'.typeRank arrTy := by
+  dsimp only [MemoRuntimeArrayWorld.intern]
+  cases hfind : w.entries.find? (fun e => e.elemTy == elemTy && e.count == count) with
+  | some prior =>
+    dsimp only
+    have hmem : prior ∈ w.entries := List.mem_of_find?_eq_some hfind
+    have hpred : (fun e : MemoArrayEntry => e.elemTy == elemTy && e.count == count) prior = true :=
+      @List.find?_some _ (fun e : MemoArrayEntry => e.elemTy == elemTy && e.count == count) _ _ hfind
+    simp only [Bool.and_eq_true, beq_iff_eq] at hpred
+    rw [← hpred.1]
+    exact hinv prior hmem
+  | none =>
+    dsimp only
+    have h1 : ({ w with entries := w.entries ++ [⟨elemTy, count, w.nextId, w.typeRank elemTy + 1⟩],
+                        nextId := w.nextId + 1 } : MemoRuntimeArrayWorld).typeRank elemTy =
+        w.typeRank elemTy := by
+      unfold MemoRuntimeArrayWorld.typeRank
+      cases w.staticRanks.ranks.any (·.1 == elemTy) with
+      | true => simp
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte, List.find?_append]
+        cases w.entries.find? (·.arrTy == elemTy) with
+        | some _ => simp
+        | none =>
+          have hneq : (w.nextId == elemTy) = false := by simp [beq_eq_false_iff_ne, Ne.symm hne]
+          simp [hneq]
+    have h2 : ({ w with entries := w.entries ++ [⟨elemTy, count, w.nextId, w.typeRank elemTy + 1⟩],
+                        nextId := w.nextId + 1 } : MemoRuntimeArrayWorld).typeRank w.nextId =
+        w.typeRank elemTy + 1 := by
+      unfold MemoRuntimeArrayWorld.typeRank
+      simp only [hstaticFresh, Bool.false_eq_true, ↓reduceIte, List.find?_append]
+      have hnone : w.entries.find? (·.arrTy == w.nextId) = none := by
+        cases hf : w.entries.find? (·.arrTy == w.nextId) with
+        | none => rfl
+        | some entry =>
+          have hmem := List.mem_of_find?_eq_some hf
+          have hpred : (fun e : MemoArrayEntry => e.arrTy == w.nextId) entry = true :=
+            @List.find?_some _ (fun e : MemoArrayEntry => e.arrTy == w.nextId) _ _ hf
+          have htrue : w.entries.any (·.arrTy == w.nextId) = true :=
+            list_any_true_of_mem (·.arrTy == w.nextId) hmem hpred
+          rw [hdynFresh] at htrue
+          cases htrue
+      simp [hnone]
+    omega
+
+/-! #### Phase-aware `Schema17EdgeStep` & end-to-end `checkSchema17Table -> vendored_visit_eq_noFuel` bridge -/
+
+/-- The four valid `lean-miri#90` `ValidityVisitor.visit` projection descent mechanisms relative to
+a Schema 17 `TypeNode` table (`STATUS.md` L933–937):
+1. `byValueChild`: same-sizedness projection to a declared by-value child `TyId` of `parent`'s
+   `Schema17TypeNode` (`toCert.tyRank child.ty < toCert.tyRank parent.ty`);
+2. `sameTyVariant`: same-`TyId`, same-sizedness `.Multiple` enum downcast to a non-`.Multiple`
+   variant (`layoutPhase` `2 -> ≤ 1`);
+3. `sameTyPrimitive`: same-`TyId`, same-sizedness projection from a non-`.Primitive` layout to a
+   single-variant `.Primitive` scalar field (`layoutPhase` `≥ 1 -> 0`);
+4. `unsizedUnpack`: dynamic unpacking from an unsized trait object (`isSized = false`) to a concrete
+   sized layout (`isSized = true`, `Prod.Lex.left`). -/
+inductive Schema17EdgeStep (nodes : List Schema17TypeNode) (parent child : LocalLayout) : Prop
+  | byValueChild (node : Schema17TypeNode) (children : List MIR.TyId) :
+      nodes.find? (·.id == parent.ty) = some node →
+      schema17ByValueChildren node = .ok children →
+      child.ty ∈ children →
+      child.layout.isSized = parent.layout.isSized →
+      Schema17EdgeStep nodes parent child
+  | sameTyVariant :
+      child.ty = parent.ty →
+      child.layout.isSized = parent.layout.isSized →
+      (∃ tag enc field vs, parent.layout.variants = .Multiple tag enc field vs) →
+      (∀ tag enc field vs, child.layout.variants ≠ .Multiple tag enc field vs) →
+      Schema17EdgeStep nodes parent child
+  | sameTyPrimitive :
+      child.ty = parent.ty →
+      child.layout.isSized = parent.layout.isSized →
+      parent.layout.fields ≠ .Primitive →
+      child.layout.fields = .Primitive →
+      (∀ tag enc field vs, child.layout.variants ≠ .Multiple tag enc field vs) →
+      Schema17EdgeStep nodes parent child
+  | unsizedUnpack :
+      parent.layout.isSized = false →
+      child.layout.isSized = true →
+      Schema17EdgeStep nodes parent child
+
+/-- Every `Schema17EdgeStep` over a table accepted by `checkSchema17Table` strictly descends in
+`visitOrder (Schema17TypeNode.toCert nodes).tyRank`. -/
+theorem schema17EdgeStep_visitOrder_lt (nodes : List Schema17TypeNode)
+    (hcheck : checkSchema17Table nodes = .ok ()) {parent child : LocalLayout}
+    (hstep : Schema17EdgeStep nodes parent child) :
+    VisitOrderLt (visitOrder (Schema17TypeNode.toCert nodes).tyRank child)
+      (visitOrder (Schema17TypeNode.toCert nodes).tyRank parent) := by
+  cases hstep with
+  | byValueChild node children hfind hch hmem hsz =>
+    have hnodeMem : node ∈ nodes := List.mem_of_find?_eq_some hfind
+    have hid : node.id = parent.ty := by simpa [beq_iff_eq] using List.find?_some hfind
+    obtain ⟨children', hch', hlt⟩ := checkSchema17Table_toCert_rank_lt nodes hcheck node hnodeMem
+    rw [hch] at hch'
+    injection hch' with hce
+    subst hce
+    have hrk : (Schema17TypeNode.toCert nodes).tyRank child.ty <
+        (Schema17TypeNode.toCert nodes).tyRank parent.ty := by
+      rw [← hid]
+      exact hlt child.ty hmem
+    exact visitOrder_lt_of_same_sized _ parent child hsz (layoutOrder_lt_of_rank_lt _ parent child hrk)
+  | sameTyVariant hty hsz hp hc =>
+    exact visitOrder_lt_of_same_sized _ parent child hsz (layoutOrder_variant_lt _ parent child hty hp hc)
+  | sameTyPrimitive hty hsz hpf hcf hcv =>
+    exact visitOrder_lt_of_same_sized _ parent child hsz
+      (layoutOrder_primitive_lt _ parent child hty hcf hcv hpf)
+  | unsizedUnpack hdyn hconc =>
+    exact visitOrder_lt_of_unsized_unpack _ parent child hdyn hconc
+
+section Schema17RealVisitBridge
+variable {P S C E F A Pad : Type} [PointerProvenance P] [DecidableEq P]
+
+/-- A real `ValidityVisitor.Hooks` instance *respects* a Schema 17 table `nodes` on `(good, goodU)`
+when each of the 7 `visit` projections preserves `good` and steps along `Schema17EdgeStep nodes`,
+and `.Union` places land in `goodU`. -/
+structure Schema17HooksRespect (nodes : List Schema17TypeNode)
+    (h : Hooks P S C E F A Pad) (c : C)
+    (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool) : Prop where
+  seqZst : ∀ place, good place = true →
+    ∀ elem s₀ s₁ s₂ child s₃,
+      h.classify c place.layout.ty s₀ = .ok (.sequence elem) s₁ →
+      PlaceDynamic.index h.projection c place 0 s₂ = .ok child s₃ →
+      good child = true ∧ Schema17EdgeStep nodes place.layout child.layout
+  arrayElem : ∀ place, good place = true →
+    ∀ stride cnt, place.layout.layout.fields = .Array stride cnt →
+    ∀ s₀ elem s₁ off s₂ child s₃,
+      h.projection.field c place.layout 0 s₀ = .ok elem s₁ →
+      PlaceDynamic.offsetWithMeta h.projection c place off .wrapping .none elem s₂ = .ok child s₃ →
+      good child = true ∧ Schema17EdgeStep nodes place.layout child.layout
+  pattern : ∀ place, good place = true →
+    ∀ base s₀ s₁ s₂ lay s₃ s₄ child s₅,
+      h.classify c place.layout.ty s₀ = .ok (.pattern base) s₁ →
+      h.projection.layoutOf c base s₂ = .ok lay s₃ →
+      PlaceDynamic.offsetWithMeta h.projection c place Size.ZERO .wrapping .none lay s₄ = .ok child s₅ →
+      good child = true ∧ Schema17EdgeStep nodes place.layout child.layout
+  dynamic : ∀ place, good place = true →
+    ∀ expected s₀ s₁ s₂ op s₃ s₄ inner s₅ memory,
+      h.classify c place.layout.ty s₀ = .ok (.dynamic expected) s₁ →
+      h.toOp c place s₂ = .ok op s₃ →
+      VTable.unpackDynTrait h.vtable c op expected s₄ = .ok inner s₅ →
+      inner.op = .indirect memory →
+      good ⟨.memory memory, inner.layout⟩ = true ∧ Schema17EdgeStep nodes place.layout inner.layout
+  box : ∀ place, good place = true →
+    ∀ s₀ s₁ s₂ ptr allocator s₃,
+      h.classify c place.layout.ty s₀ = .ok .box s₁ →
+      h.projectBox c place s₂ = .ok (ptr, allocator) s₃ →
+      good allocator = true ∧ Schema17EdgeStep nodes place.layout allocator.layout
+  arbitrary : ∀ place, good place = true →
+    ∀ offsets order, place.layout.layout.fields = .Arbitrary offsets order →
+    ∀ idx s₀ child s₁,
+      PlaceDynamic.field h.projection c place idx s₀ = .ok child s₁ →
+      good child = true ∧ Schema17EdgeStep nodes place.layout child.layout
+  multiple : ∀ place, good place = true →
+    ∀ tag enc tf vs, place.layout.layout.variants = .Multiple tag enc tf vs →
+    ∀ s₀ op s₁ s₂ variant s₃ s₄ child s₅,
+      h.toOp c place s₀ = .ok op s₁ →
+      Discriminant.readDiscriminant h.discriminant c op s₂ = .ok variant s₃ →
+      PlaceDynamic.downcast h.projection c place variant s₄ = .ok child s₅ →
+      good child = true ∧ Schema17EdgeStep nodes place.layout child.layout
+  union : ∀ place, good place = true →
+    ∀ cnt, place.layout.layout.fields = .Union cnt → goodU place.layout = true
+
+/-- **Schema 17 table → `VisitHooksDescend`.** Any `checkSchema17Table`-accepted table and
+`Schema17HooksRespect` witness immediately discharge `VisitHooksDescend` under
+`(Schema17TypeNode.toCert nodes).tyRank`. -/
+theorem schema17_visitHooksDescend (nodes : List Schema17TypeNode)
+    (h : Hooks P S C E F A Pad) (c : C)
+    (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hcheck : checkSchema17Table nodes = .ok ())
+    (hresp : Schema17HooksRespect nodes h c good goodU) :
+    VisitHooksDescend h c (Schema17TypeNode.toCert nodes).tyRank good goodU := by
+  apply visitHooksDescend_of_conditions
+  refine {
+    seqZst := fun p hp el s₀ s₁ s₂ ch s₃ h1 h2 =>
+      let ⟨hg, hs⟩ := hresp.seqZst p hp el s₀ s₁ s₂ ch s₃ h1 h2
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    arrayElem := fun p hp st cnt hfs s₀ el s₁ off s₂ ch s₃ h1 h2 =>
+      let ⟨hg, hs⟩ := hresp.arrayElem p hp st cnt hfs s₀ el s₁ off s₂ ch s₃ h1 h2
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    pattern := fun p hp b s₀ s₁ s₂ lay s₃ s₄ ch s₅ h1 h2 h3 =>
+      let ⟨hg, hs⟩ := hresp.pattern p hp b s₀ s₁ s₂ lay s₃ s₄ ch s₅ h1 h2 h3
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    dynamic := fun p hp ex s₀ s₁ s₂ op s₃ s₄ inn s₅ mem h1 h2 h3 h4 =>
+      let ⟨hg, hs⟩ := hresp.dynamic p hp ex s₀ s₁ s₂ op s₃ s₄ inn s₅ mem h1 h2 h3 h4
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    box := fun p hp s₀ s₁ s₂ ptr alloc s₃ h1 h2 =>
+      let ⟨hg, hs⟩ := hresp.box p hp s₀ s₁ s₂ ptr alloc s₃ h1 h2
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    arbitrary := fun p hp offs ord hfs idx s₀ ch s₁ h1 =>
+      let ⟨hg, hs⟩ := hresp.arbitrary p hp offs ord hfs idx s₀ ch s₁ h1
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    multiple := fun p hp tg enc tf vs hvs s₀ op s₁ s₂ var s₃ s₄ ch s₅ h1 h2 h3 =>
+      let ⟨hg, hs⟩ := hresp.multiple p hp tg enc tf vs hvs s₀ op s₁ s₂ var s₃ s₄ ch s₅ h1 h2 h3
+      ⟨hg, schema17EdgeStep_visitOrder_lt nodes hcheck hs⟩
+    union := hresp.union
+  }
+
+/-- **End-to-end Schema 17 checker → unmodified vendored `ValidityVisitor.visit` adequacy.**
+Whenever `checkSchema17Table nodes = .ok ()`, `(h, c)` respects `nodes` via `Schema17HooksRespect`,
+and `fuel > visitFuelBound maxSized (Schema17TypeNode.toCert nodes).tyRank place.layout`, the
+unmodified vendored `Miri.Interpreter.ValidityVisitor.visit` agrees identically with
+`realVisitNoFuel`. -/
+theorem schema17_vendored_visit_eq_noFuel (nodes : List Schema17TypeNode)
+    (h : Hooks P S C E F A Pad) (c : C)
+    (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hcheck : checkSchema17Table nodes = .ok ())
+    (hresp : Schema17HooksRespect nodes h c good goodU)
+    (hdU : UnionHooksDescend h c (Schema17TypeNode.toCert nodes).tyRank (fun l => goodU l = true))
+    (maxSized : Nat)
+    (hmax : ∀ parent child : RuntimePlace P, good parent = true → good child = true →
+      parent.layout.layout.isSized = false → child.layout.layout.isSized = true →
+      layoutOrder (Schema17TypeNode.toCert nodes).tyRank child.layout ≤ maxSized)
+    (fuel : Nat) (session : Session P) (place : RuntimePlace P) (hp : good place = true)
+    (hfuel : visitFuelBound maxSized (Schema17TypeNode.toCert nodes).tyRank place.layout < fuel) :
+    ValidityVisitor.visit h c fuel session place =
+      realVisitNoFuel h c (Schema17TypeNode.toCert nodes).tyRank session place :=
+  vendored_visit_eq_noFuel h c _ good goodU
+    (schema17_visitHooksDescend nodes h c good goodU hcheck hresp)
+    hdU maxSized hmax fuel session place hp hfuel
+
+/-- Sized-root specialization of `schema17_vendored_visit_eq_noFuel` (`fuel > layoutOrder + 1`). -/
+theorem schema17_vendored_visit_eq_noFuel_of_sized (nodes : List Schema17TypeNode)
+    (h : Hooks P S C E F A Pad) (c : C)
+    (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hcheck : checkSchema17Table nodes = .ok ())
+    (hresp : Schema17HooksRespect nodes h c good goodU)
+    (hdU : UnionHooksDescend h c (Schema17TypeNode.toCert nodes).tyRank (fun l => goodU l = true))
+    (fuel : Nat) (session : Session P) (place : RuntimePlace P) (hp : good place = true)
+    (hs : place.layout.layout.isSized = true)
+    (hfuel : layoutOrder (Schema17TypeNode.toCert nodes).tyRank place.layout + 1 < fuel) :
+    ValidityVisitor.visit h c fuel session place =
+      realVisitNoFuel h c (Schema17TypeNode.toCert nodes).tyRank session place :=
+  vendored_visit_eq_noFuel_of_sized h c _ good goodU
+    (schema17_visitHooksDescend nodes h c good goodU hcheck hresp)
+    hdU fuel session place hp hs hfuel
+
+end Schema17RealVisitBridge
+
+/-- Primitive leaf layout (`ty = 0`) for the Schema 17 `ListNode` (`ty = 2 -> [0, 1]`) witness. -/
+def s17Prim0Layout : LocalLayout := ⟨0, { wrapperLayout with fields := .Primitive }⟩
+
+/-- Pointer-indirection leaf layout (`ty = 1`, `Box<ListNode>`) for the Schema 17 `ListNode` witness. -/
+def s17Ptr1Layout : LocalLayout := ⟨1, { wrapperLayout with fields := .Primitive }⟩
+
+/-- Two-field `ListNode` ADT layout (`ty = 2`, `.Arbitrary #[0, 0] #[0, 1]`) for Schema 17 witness. -/
+def s17Adt2Layout : LocalLayout :=
+  ⟨2, { wrapperLayout with fields := .Arbitrary #[Size.ZERO, Size.ZERO] #[0, 1] }⟩
+
+/-- Concrete `ValidityVisitor.Hooks` projecting `s17Adt2Layout` (`ty = 2`) to `s17Prim0Layout` (`ty = 0`)
+and `s17Ptr1Layout` (`ty = 1`) via `PlaceDynamic.field`. -/
+def s17AdtHooks : Hooks CtfeProvenance Unit Unit Unit Unit Unit Unit :=
+  let base := minimalValidityHooks
+    (fun _ idx => if idx == 0 then s17Prim0Layout else s17Ptr1Layout)
+    (fun ty => if ty == 2 then s17Adt2Layout else if ty == 1 then s17Ptr1Layout else s17Prim0Layout)
+    (fun ty => if ty == 2 then .aggregate false false false else .foreign)
+  { base with
+    fieldPath := fun _ _ idx _ => pure (.field s!"{idx}")
+    toOp := fun _ place =>
+      match place.ref with
+      | .memory m => pure ⟨.indirect m, place.layout⟩
+      | .local .. => throw (.invalidProgram "expected memory place") }
+
+/-- Invariant predicate over `s17Adt2Layout`, `s17Prim0Layout`, and `s17Ptr1Layout` memory places. -/
+def s17AdtGood (p : RuntimePlace CtfeProvenance) : Bool :=
+  match p.ref with
+  | .memory ⟨⟨off, _⟩, metaVal, _⟩ =>
+    off == Size.ZERO && decide (metaVal = .none) &&
+      (decide (p.layout = s17Adt2Layout) ||
+        decide (p.layout = s17Prim0Layout) ||
+        decide (p.layout = s17Ptr1Layout))
+  | .local .. => false
+
+/-- Any Schema 17 table resolving `id = 2` to `{ id := 2, validationRank := 1, shape := .adt [[0, 1]] }`
+is respected by `s17AdtHooks` on `s17AdtGood`. -/
+theorem s17Adt_respects (nodes : List Schema17TypeNode)
+    (hfind2 : nodes.find? (·.id == 2) = some { id := 2, validationRank := 1, shape := .adt [[0, 1]] }) :
+    Schema17HooksRespect nodes s17AdtHooks () s17AdtGood (fun _ => false) := by
+  have unpackG : ∀ p, s17AdtGood p = true →
+      ∃ prov mis, p = ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, p.layout⟩ ∧
+        (p.layout = s17Adt2Layout ∨ p.layout = s17Prim0Layout ∨ p.layout = s17Ptr1Layout) := by
+    rintro ⟨ref, lay⟩ hp
+    cases ref with
+    | «local» => simp [s17AdtGood] at hp
+    | memory m =>
+      rcases m with ⟨⟨off, prov⟩, metaVal, mis⟩
+      simp only [s17AdtGood, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq,
+        decide_eq_true_eq, or_assoc] at hp
+      rcases hp with ⟨⟨rfl, rfl⟩, hlay⟩
+      exact ⟨prov, mis, rfl, hlay⟩
+  have badCls : ∀ {ty : MIR.TyId} {k : TypeKind} {s₀ s₁ : Unit},
+      (∀ a b c, k ≠ .aggregate a b c) → k ≠ .foreign →
+      s17AdtHooks.classify () ty s₀ = .ok k s₁ → False := by
+    intro ty k _ _ h1 h2 hcls
+    simp only [s17AdtHooks, minimalValidityHooks, pure, EStateM.pure, EStateM.Result.ok.injEq] at hcls
+    obtain ⟨hcls, -⟩ := hcls
+    cases h2eq : (ty == 2)
+    · simp only [h2eq, Bool.false_eq_true, ↓reduceIte] at hcls; exact h2 hcls.symm
+    · simp only [h2eq, ↓reduceIte] at hcls; exact h1 _ _ _ hcls.symm
+  refine {
+    seqZst := fun _ _ _ _ _ _ _ _ hcls _ =>
+      False.elim (badCls (fun _ _ _ h => by cases h) (fun h => by cases h) hcls)
+    arrayElem := fun p hp _ _ hfs => by
+      obtain ⟨_, _, _, hlay⟩ := unpackG p hp
+      rcases hlay with h | h | h <;> (rw [h] at hfs; simp [s17Adt2Layout, s17Prim0Layout, s17Ptr1Layout] at hfs)
+    pattern := fun _ _ _ _ _ _ _ _ _ _ _ hcls _ _ =>
+      False.elim (badCls (fun _ _ _ h => by cases h) (fun h => by cases h) hcls)
+    dynamic := fun _ _ _ _ _ _ _ _ _ _ _ _ hcls _ _ _ =>
+      False.elim (badCls (fun _ _ _ h => by cases h) (fun h => by cases h) hcls)
+    box := fun _ _ _ _ _ _ _ _ hcls _ =>
+      False.elim (badCls (fun _ _ _ h => by cases h) (fun h => by cases h) hcls)
+    arbitrary := ?_
+    multiple := fun p hp _ _ _ _ hvs => by
+      obtain ⟨_, _, _, hlay⟩ := unpackG p hp
+      rcases hlay with h | h | h <;> (rw [h] at hvs; simp [s17Adt2Layout, s17Prim0Layout, s17Ptr1Layout, wrapperLayout] at hvs)
+    union := fun p hp _ hfs => by
+      obtain ⟨_, _, _, hlay⟩ := unpackG p hp
+      rcases hlay with h | h | h <;> (rw [h] at hfs; simp [s17Adt2Layout, s17Prim0Layout, s17Ptr1Layout] at hfs)
+  }
+  intro p hp offsets order hfs idx s₀ child s₁ hfield
+  cases s₀; cases s₁
+  obtain ⟨prov, mis, heq, hlay⟩ := unpackG p hp
+  rcases hlay with hadt | hprim | hptr
+  · rw [heq, hadt] at hfield ⊢
+    cases idx with
+    | zero =>
+      have h0 : PlaceDynamic.field s17AdtHooks.projection ()
+          ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, s17Adt2Layout⟩ 0 () =
+          .ok ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, s17Prim0Layout⟩ () := rfl
+      rw [h0] at hfield; cases hfield
+      exact ⟨by simp [s17AdtGood], Schema17EdgeStep.byValueChild _ [0, 1] hfind2 rfl (.head _) rfl⟩
+    | succ idx1 =>
+      cases idx1 with
+      | zero =>
+        have h1 : PlaceDynamic.field s17AdtHooks.projection ()
+            ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, s17Adt2Layout⟩ 1 () =
+            .ok ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, s17Ptr1Layout⟩ () := rfl
+        rw [h1] at hfield; cases hfield
+        exact ⟨by simp [s17AdtGood],
+          Schema17EdgeStep.byValueChild _ [0, 1] hfind2 rfl (.tail _ (.head _)) rfl⟩
+      | succ k =>
+        have herr : PlaceDynamic.field s17AdtHooks.projection ()
+            ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, s17Adt2Layout⟩ (k + 2) () =
+            .error (.invalidProgram s!"place layout: {repr (LayoutError.fieldOutOfBounds (k + 2) 2)}") () := rfl
+        rw [herr] at hfield; cases hfield
+  · rw [hprim] at hfs; simp [s17Prim0Layout] at hfs
+  · rw [hptr] at hfs; simp [s17Ptr1Layout] at hfs
+
 end RealVisit
 
 /-! ## 8. `leanprover/lean4#13851` axiom footprint audit
@@ -4266,6 +4695,10 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   RealVisit.enumPhase_visit_ok
   RealVisit.RuntimeArrayWorld.typeRank
   RealVisit.RuntimeArrayWorld.internArray
+  RealVisit.MemoRuntimeArrayWorld.typeRank
+  RealVisit.MemoRuntimeArrayWorld.intern
+  RealVisit.MemoRuntimeArrayWorld.intern_memo_hit
+  RealVisit.s17Adt_respects
   RealVisit.stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects
   RealVisit.unionReset_unionHooksDescend
   RealVisit.unionReset_visitHooksDescend
@@ -4278,6 +4711,14 @@ loop goes through the opaque `repeatM.impl`), whereas `lean-miri#90`'s structura
   RealVisit.realVisitNoFuel_fieldless
   RealVisit.realVisitLexRank_fieldless
   RealVisit.RuntimeArrayWorld.internArray_rank_lt
+  RealVisit.MemoRuntimeArrayWorld.intern_memo_hit
+  RealVisit.MemoRuntimeArrayWorld.intern_memo_idempotent
+  RealVisit.MemoRuntimeArrayWorld.intern_rank_lt
+  RealVisit.schema17EdgeStep_visitOrder_lt
+  RealVisit.schema17_visitHooksDescend
+  RealVisit.schema17_vendored_visit_eq_noFuel
+  RealVisit.schema17_vendored_visit_eq_noFuel_of_sized
+  RealVisit.s17Adt_respects
   RankedWalk.walkNoFuel
   VisitLexWalk.walkNoFuel
   visitNoFuel

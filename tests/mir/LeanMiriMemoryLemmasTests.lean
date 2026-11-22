@@ -1729,6 +1729,39 @@ theorem wit_schema17_goodTable_canonical_fuel :
         schema17LayoutFor (fun _ acc => pure acc)).walkFuel 2 (schema17LayoutFor 3) () ()) = true := by
   exact ⟨by decide +kernel, by decide +kernel⟩
 
+/-- **End-to-end Schema 17 checker → unmodified vendored `ValidityVisitor.visit` adequacy** on
+`schema17GoodTable`: instantiating `RealVisit.schema17_vendored_visit_eq_noFuel_of_sized` with
+`wit_schema17_pointer_recursive_ok` and `RealVisit.s17Adt_respects` proves that on `ListNode`
+(`ty = 2 -> [0, 1]`, `validationRank = 1`, `layoutOrder = 4`), unmodified vendored
+`Miri.Interpreter.ValidityVisitor.visit` agrees identically with `RealVisit.realVisitNoFuel`
+for every `fuel > 5`, kernel-evaluates to `.ok` at canonical `fuel = 6`, and exhausts at `fuel = 1`. -/
+theorem wit_schema17_goodTable_realVisit_adequacy (fuel : Nat) (hfuel : 5 < fuel)
+    (prov : Option CtfeProvenance) (mis : Option Misalignment)
+    (session : Session CtfeProvenance) :
+    ValidityVisitor.visit RealVisit.s17AdtHooks () fuel session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, RealVisit.s17Adt2Layout⟩ =
+      RealVisit.realVisitNoFuel RealVisit.s17AdtHooks ()
+        (Schema17TypeNode.toCert schema17GoodTable).tyRank session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, RealVisit.s17Adt2Layout⟩ ∧
+    resultOk (ValidityVisitor.visit RealVisit.s17AdtHooks () 6
+      { path := ⟨"ListNode", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.s17Adt2Layout⟩ ()) = true ∧
+    resultExhausted "validity traversal fuel" (ValidityVisitor.visit RealVisit.s17AdtHooks () 1
+      { path := ⟨"ListNode", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.s17Adt2Layout⟩ ()) = true := by
+  refine ⟨RealVisit.schema17_vendored_visit_eq_noFuel_of_sized schema17GoodTable
+    RealVisit.s17AdtHooks () RealVisit.s17AdtGood (fun _ => false)
+    wit_schema17_pointer_recursive_ok (RealVisit.s17Adt_respects schema17GoodTable rfl)
+    (fun l hl => absurd hl (by simp)) fuel session _
+    (by simp [RealVisit.s17AdtGood]) rfl ?_, by decide +kernel, by decide +kernel⟩
+  change layoutOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank
+    RealVisit.s17Adt2Layout + 1 < fuel
+  have hord : layoutOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank
+      RealVisit.s17Adt2Layout = 4 := by decide +kernel
+  omega
+
 /-! ### 3d. `visitOrder` (`(if isSized then 0 else 1, layoutOrder)`) & `dyn Trait` dynamic unpacking -/
 
 /-- Unsized `dyn Trait` layout (`ty = 0`, `backendRepr = .Memory (sized := false)`, `isSized = false`,
@@ -1769,6 +1802,23 @@ theorem wit_dynTrait_visitOrder_descends :
     layoutOrder id unsizedDynTrait < layoutOrder id concreteImpl50 ∧
       VisitOrderLt (visitOrder id concreteImpl50) (visitOrder id unsizedDynTrait) :=
   ⟨by decide +kernel, visitOrder_lt_of_unsized_unpack id unsizedDynTrait concreteImpl50 rfl rfl⟩
+
+/-- Phase-aware `RealVisit.Schema17EdgeStep` witnesses over `schema17GoodTable` exercising same-`TyId`
+`.Multiple` enum downcast (`sameTyVariant`), same-`TyId` synthetic `.Primitive` scalar field
+(`sameTyPrimitive`), and `dyn Trait` unsized-to-sized unpacking (`unsizedUnpack`). -/
+theorem wit_schema17_goodTable_phase_steps :
+    VisitOrderLt (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank RealVisit.enumDowncastLayout)
+      (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank RealVisit.enumRootLayout) ∧
+    VisitOrderLt (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank RealVisit.enumScalarLeafLayout)
+      (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank RealVisit.enumDowncastLayout) ∧
+    VisitOrderLt (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank concreteImpl50)
+      (visitOrder (Schema17TypeNode.toCert schema17GoodTable).tyRank unsizedDynTrait) :=
+  ⟨RealVisit.schema17EdgeStep_visitOrder_lt schema17GoodTable wit_schema17_pointer_recursive_ok
+      (.sameTyVariant rfl rfl ⟨_, _, _, _, rfl⟩ (fun _ _ _ _ h => by cases h)),
+    RealVisit.schema17EdgeStep_visitOrder_lt schema17GoodTable wit_schema17_pointer_recursive_ok
+      (.sameTyPrimitive rfl rfl (fun h => by cases h) rfl (fun _ _ _ _ h => by cases h)),
+    RealVisit.schema17EdgeStep_visitOrder_lt schema17GoodTable wit_schema17_pointer_recursive_ok
+      (.unsizedUnpack rfl rfl)⟩
 
 /-- `VisitLexWalk.walkNoFuel` succeeds across unsized-to-higher-rank-sized `dyn Trait` unpacking,
 visiting all 3 nodes (`0 ↦ 1 ↦ 2 ↦ 3`). -/
@@ -2143,6 +2193,41 @@ theorem wit_stateVaryingRank_validatePlace_separates_staleRank :
      | .error (.invalidProgram msg) _ => msg == "validity projection does not descend"
      | _ => false) = true :=
   RealVisit.stateVaryingRank_validatePlace_succeeds_while_staleRank_rejects
+
+/-- Key-memoized `RuntimeArrayTypes.intern` (`MemoRuntimeArrayWorld`) regression:
+1. First `intern 10 4` (cache miss on `[ty10; 4]`, static `tyRank 10 = 1`) allocates `arrTy = 99`
+   with `typeRank 99 = 2 > 1` and advances `nextId` from `99` to `100`;
+2. Re-interning `intern 10 4` (cache hit!) reuses `(99, w₁)` unchanged (`nextId = 100`,
+   `entries.length = 1`, no duplicate `TyId` allocated), whereas `intern 10 8` (distinct length)
+   allocates fresh `arrTy = 100`;
+3. Both the miss (`w₀ -> w₁`) and cache hit (`w₁ -> w₂`) satisfy `MemoRuntimeArrayWorld.intern_rank_lt`. -/
+theorem wit_memoRuntimeArray_intern_hit_and_miss :
+    let w₀ : RealVisit.MemoRuntimeArrayWorld :=
+      { staticRanks := ⟨[(10, 1)]⟩, entries := [], nextId := 99 }
+    let (ty₁, w₁) := w₀.intern 10 4
+    let (ty₂, w₂) := w₁.intern 10 4
+    let (ty₃, w₃) := w₂.intern 10 8
+    (ty₁ == 99 && w₁.typeRank 99 == 2 && w₁.nextId == 100 && w₁.entries.length == 1 &&
+      ty₂ == 99 && w₂.nextId == 100 && w₂.entries.length == 1 &&
+      ty₃ == 100 && w₃.typeRank 100 == 2 && w₃.nextId == 101 && w₃.entries.length == 2) = true ∧
+      w₁.intern 10 4 = (ty₁, w₁) ∧
+      w₁.typeRank 10 < w₁.typeRank ty₁ ∧
+      w₂.typeRank 10 < w₂.typeRank ty₂ := by
+  refine ⟨by decide +kernel,
+    RealVisit.MemoRuntimeArrayWorld.intern_memo_idempotent
+      { staticRanks := ⟨[(10, 1)]⟩, entries := [], nextId := 99 } 10 4,
+    RealVisit.MemoRuntimeArrayWorld.intern_rank_lt
+      { staticRanks := ⟨[(10, 1)]⟩, entries := [], nextId := 99 } 10 4
+      (fun _ h => nomatch h) (by decide) (by decide) (by decide),
+    RealVisit.MemoRuntimeArrayWorld.intern_rank_lt
+      (RealVisit.MemoRuntimeArrayWorld.intern
+        { staticRanks := ⟨[(10, 1)]⟩, entries := [], nextId := 99 } 10 4).2 10 4
+      (fun e he => by
+        dsimp [RealVisit.MemoRuntimeArrayWorld.intern] at he
+        cases he with
+        | head _ => decide +kernel
+        | tail _ h => nomatch h)
+      (by decide) (by decide) (by decide)⟩
 
 /-- Non-vacuous `.Union` `dataBytes` hand-off (`goodU ≠ ∅`): vendored `ValidityVisitor.visit` equals
 `realVisitNoFuel` at `fuel = 6 > 5` and kernel-evaluates `session.dataBytes = #[0..4)`. -/
