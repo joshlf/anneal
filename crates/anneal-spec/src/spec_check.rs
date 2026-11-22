@@ -1121,56 +1121,78 @@ impl<A: ReturnMutants> ReturnMutants for (A,) {
     }
 }
 
+/// Collects up to `CAP` mutants from `value` into a fixed-size stack buffer
+/// without heap allocation, returning `(buffer, count)`.
+fn collect_axis_mutants<T: ReturnMutants, const CAP: usize>(
+    value: &T,
+    rng: &mut SplitMix64,
+) -> ([Option<T>; CAP], usize) {
+    let mut buf: [Option<T>; CAP] = array::from_fn(|_| None);
+    let mut len = 0usize;
+    if !T::IS_SUBSINGLETON {
+        value.visit_mutants(rng, |m| {
+            if len < CAP {
+                buf[len] = Some(m);
+                len += 1;
+            }
+        });
+    }
+    (buf, len)
+}
+
 impl<A: ReturnMutants + Clone, B: ReturnMutants + Clone> ReturnMutants for (A, B) {
     const IS_SUBSINGLETON: bool = A::IS_SUBSINGLETON && B::IS_SUBSINGLETON;
 
     fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
-        let per_axis_cap = if A::IS_SUBSINGLETON || B::IS_SUBSINGLETON {
-            16
-        } else {
-            5
-        };
-
-        let mut first_a: Option<A> = None;
-        let mut second_a: Option<A> = None;
-        let mut a_emitted = 0usize;
-        self.0.visit_mutants(rng, |a_mut| {
-            if a_emitted < per_axis_cap {
-                if first_a.is_none() {
-                    first_a = Some(a_mut.clone());
-                } else if second_a.is_none() {
-                    second_a = Some(a_mut.clone());
+        if Self::IS_SUBSINGLETON {
+            return;
+        }
+        if B::IS_SUBSINGLETON {
+            let mut emitted = 0usize;
+            self.0.visit_mutants(rng, |a_mut| {
+                if emitted < 16 {
+                    emit((a_mut, self.1.clone()));
+                    emitted += 1;
                 }
-                emit((a_mut, self.1.clone()));
-                a_emitted += 1;
-            }
-        });
+            });
+            return;
+        }
+        if A::IS_SUBSINGLETON {
+            let mut emitted = 0usize;
+            self.1.visit_mutants(rng, |b_mut| {
+                if emitted < 16 {
+                    emit((self.0.clone(), b_mut));
+                    emitted += 1;
+                }
+            });
+            return;
+        }
 
-        let mut b_emitted = 0usize;
-        self.1.visit_mutants(rng, |b_mut| {
-            if b_emitted < per_axis_cap {
+        const CAP: usize = 5;
+        let (a_muts, a_len) = collect_axis_mutants::<A, CAP>(&self.0, rng);
+        let (b_muts, _) = collect_axis_mutants::<B, CAP>(&self.1, rng);
+
+        // Interleave axes round-robin so tight `max_mutants_per_hit` budgets
+        // (even `max_mutants_per_hit == 2`) perturb every active component.
+        for k in 0..CAP {
+            if let Some(a_mut) = a_muts[k].as_ref() {
+                emit((a_mut.clone(), self.1.clone()));
+            }
+            if let Some(b_mut) = b_muts[k].as_ref() {
                 emit((self.0.clone(), b_mut.clone()));
-                match b_emitted {
-                    0 => {
-                        if let Some(a1) = first_a.as_ref() {
-                            emit((a1.clone(), b_mut));
-                        }
-                    }
-                    1 => {
-                        if let Some(a2) = second_a.as_ref().or(first_a.as_ref()) {
-                            emit((a2.clone(), b_mut));
-                        }
-                    }
-                    2 => {
-                        if let Some(a1) = first_a.as_ref() {
-                            emit((a1.clone(), b_mut));
-                        }
-                    }
-                    _ => {}
-                }
-                b_emitted += 1;
             }
-        });
+            // Emit joint two-axis perturbations early (rounds 0..3) while
+            // staying within the default 16-mutant budget (`5 + 5 + 3 = 13`).
+            if k < 3
+                && a_len > 0
+                && let Some(b_mut) = b_muts[k].as_ref()
+            {
+                let a_idx = if k == 1 && a_len > 1 { 1 } else { 0 };
+                if let Some(a_mut) = a_muts[a_idx].as_ref() {
+                    emit((a_mut.clone(), b_mut.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -1180,55 +1202,72 @@ impl<A: ReturnMutants + Clone, B: ReturnMutants + Clone, C: ReturnMutants + Clon
     const IS_SUBSINGLETON: bool = A::IS_SUBSINGLETON && B::IS_SUBSINGLETON && C::IS_SUBSINGLETON;
 
     fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
+        if Self::IS_SUBSINGLETON {
+            return;
+        }
         let active_axes = (!A::IS_SUBSINGLETON as usize)
             + (!B::IS_SUBSINGLETON as usize)
             + (!C::IS_SUBSINGLETON as usize);
-        let per_axis_cap = if active_axes <= 1 { 16 } else { 4 };
-
-        let mut first_a: Option<A> = None;
-        let mut a_emitted = 0usize;
-        self.0.visit_mutants(rng, |a_mut| {
-            if a_emitted < per_axis_cap {
-                if first_a.is_none() {
-                    first_a = Some(a_mut.clone());
-                }
-                emit((a_mut, self.1.clone(), self.2.clone()));
-                a_emitted += 1;
+        if active_axes == 1 {
+            let mut emitted = 0usize;
+            if !A::IS_SUBSINGLETON {
+                self.0.visit_mutants(rng, |a_mut| {
+                    if emitted < 16 {
+                        emit((a_mut, self.1.clone(), self.2.clone()));
+                        emitted += 1;
+                    }
+                });
+            } else if !B::IS_SUBSINGLETON {
+                self.1.visit_mutants(rng, |b_mut| {
+                    if emitted < 16 {
+                        emit((self.0.clone(), b_mut, self.2.clone()));
+                        emitted += 1;
+                    }
+                });
+            } else {
+                self.2.visit_mutants(rng, |c_mut| {
+                    if emitted < 16 {
+                        emit((self.0.clone(), self.1.clone(), c_mut));
+                        emitted += 1;
+                    }
+                });
             }
-        });
+            return;
+        }
 
-        let mut first_b: Option<B> = None;
-        let mut b_emitted = 0usize;
-        self.1.visit_mutants(rng, |b_mut| {
-            if b_emitted < per_axis_cap {
-                if first_b.is_none() {
-                    first_b = Some(b_mut.clone());
-                }
+        const CAP: usize = 4;
+        let (a_muts, _) = collect_axis_mutants::<A, CAP>(&self.0, rng);
+        let (b_muts, _) = collect_axis_mutants::<B, CAP>(&self.1, rng);
+        let (c_muts, _) = collect_axis_mutants::<C, CAP>(&self.2, rng);
+
+        // Interleave axes round-robin so tight budgets (`max_mutants_per_hit >= 3`)
+        // perturb every active component on every hit.
+        for k in 0..CAP {
+            if let Some(a_mut) = a_muts[k].as_ref() {
+                emit((a_mut.clone(), self.1.clone(), self.2.clone()));
+            }
+            if let Some(b_mut) = b_muts[k].as_ref() {
                 emit((self.0.clone(), b_mut.clone(), self.2.clone()));
-                if b_emitted == 0
-                    && let Some(a1) = first_a.as_ref()
-                {
-                    emit((a1.clone(), b_mut, self.2.clone()));
-                }
-                b_emitted += 1;
             }
-        });
-
-        let mut c_emitted = 0usize;
-        self.2.visit_mutants(rng, |c_mut| {
-            if c_emitted < per_axis_cap {
+            if let Some(c_mut) = c_muts[k].as_ref() {
                 emit((self.0.clone(), self.1.clone(), c_mut.clone()));
-                if c_emitted == 0 {
-                    if let Some(b1) = first_b.as_ref() {
-                        emit((self.0.clone(), b1.clone(), c_mut.clone()));
-                    }
-                    if let (Some(a1), Some(b1)) = (first_a.as_ref(), first_b.as_ref()) {
-                        emit((a1.clone(), b1.clone(), c_mut));
+            }
+            if k == 0 {
+                if let (Some(a0), Some(b0)) = (a_muts[0].as_ref(), b_muts[0].as_ref()) {
+                    emit((a0.clone(), b0.clone(), self.2.clone()));
+                }
+                if let (Some(b0), Some(c0)) = (b_muts[0].as_ref(), c_muts[0].as_ref()) {
+                    emit((self.0.clone(), b0.clone(), c0.clone()));
+                }
+                if let (Some(a0), Some(c0)) = (a_muts[0].as_ref(), c_muts[0].as_ref()) {
+                    if let Some(b0) = b_muts[0].as_ref() {
+                        emit((a0.clone(), b0.clone(), c0.clone()));
+                    } else {
+                        emit((a0.clone(), self.1.clone(), c0.clone()));
                     }
                 }
-                c_emitted += 1;
             }
-        });
+        }
     }
 }
 
@@ -1243,90 +1282,108 @@ impl<
         A::IS_SUBSINGLETON && B::IS_SUBSINGLETON && C::IS_SUBSINGLETON && D::IS_SUBSINGLETON;
 
     fn visit_mutants<F: FnMut(Self)>(&self, rng: &mut SplitMix64, mut emit: F) {
+        if Self::IS_SUBSINGLETON {
+            return;
+        }
         let active_axes = (!A::IS_SUBSINGLETON as usize)
             + (!B::IS_SUBSINGLETON as usize)
             + (!C::IS_SUBSINGLETON as usize)
             + (!D::IS_SUBSINGLETON as usize);
-        let per_axis_cap = if active_axes <= 1 { 16 } else { 3 };
-
-        let mut first_a: Option<A> = None;
-        let mut a_emitted = 0usize;
-        self.0.visit_mutants(rng, |a_mut| {
-            if a_emitted < per_axis_cap {
-                if first_a.is_none() {
-                    first_a = Some(a_mut.clone());
-                }
-                emit((a_mut, self.1.clone(), self.2.clone(), self.3.clone()));
-                a_emitted += 1;
+        if active_axes == 1 {
+            let mut emitted = 0usize;
+            if !A::IS_SUBSINGLETON {
+                self.0.visit_mutants(rng, |a_mut| {
+                    if emitted < 16 {
+                        emit((a_mut, self.1.clone(), self.2.clone(), self.3.clone()));
+                        emitted += 1;
+                    }
+                });
+            } else if !B::IS_SUBSINGLETON {
+                self.1.visit_mutants(rng, |b_mut| {
+                    if emitted < 16 {
+                        emit((self.0.clone(), b_mut, self.2.clone(), self.3.clone()));
+                        emitted += 1;
+                    }
+                });
+            } else if !C::IS_SUBSINGLETON {
+                self.2.visit_mutants(rng, |c_mut| {
+                    if emitted < 16 {
+                        emit((self.0.clone(), self.1.clone(), c_mut, self.3.clone()));
+                        emitted += 1;
+                    }
+                });
+            } else {
+                self.3.visit_mutants(rng, |d_mut| {
+                    if emitted < 16 {
+                        emit((self.0.clone(), self.1.clone(), self.2.clone(), d_mut));
+                        emitted += 1;
+                    }
+                });
             }
-        });
+            return;
+        }
 
-        let mut first_b: Option<B> = None;
-        let mut b_emitted = 0usize;
-        self.1.visit_mutants(rng, |b_mut| {
-            if b_emitted < per_axis_cap {
-                if first_b.is_none() {
-                    first_b = Some(b_mut.clone());
-                }
+        const CAP: usize = 3;
+        let (a_muts, _) = collect_axis_mutants::<A, CAP>(&self.0, rng);
+        let (b_muts, _) = collect_axis_mutants::<B, CAP>(&self.1, rng);
+        let (c_muts, _) = collect_axis_mutants::<C, CAP>(&self.2, rng);
+        let (d_muts, _) = collect_axis_mutants::<D, CAP>(&self.3, rng);
+
+        // Interleave axes round-robin so tight budgets (`max_mutants_per_hit >= 4`)
+        // perturb every active component on every hit.
+        for k in 0..CAP {
+            if let Some(a_mut) = a_muts[k].as_ref() {
+                emit((
+                    a_mut.clone(),
+                    self.1.clone(),
+                    self.2.clone(),
+                    self.3.clone(),
+                ));
+            }
+            if let Some(b_mut) = b_muts[k].as_ref() {
                 emit((
                     self.0.clone(),
                     b_mut.clone(),
                     self.2.clone(),
                     self.3.clone(),
                 ));
-                if b_emitted == 0
-                    && let Some(a1) = first_a.as_ref()
-                {
-                    emit((a1.clone(), b_mut, self.2.clone(), self.3.clone()));
-                }
-                b_emitted += 1;
             }
-        });
-
-        let mut first_c: Option<C> = None;
-        let mut c_emitted = 0usize;
-        self.2.visit_mutants(rng, |c_mut| {
-            if c_emitted < per_axis_cap {
-                if first_c.is_none() {
-                    first_c = Some(c_mut.clone());
-                }
+            if let Some(c_mut) = c_muts[k].as_ref() {
                 emit((
                     self.0.clone(),
                     self.1.clone(),
                     c_mut.clone(),
                     self.3.clone(),
                 ));
-                if c_emitted == 0
-                    && let Some(b1) = first_b.as_ref()
-                {
-                    emit((self.0.clone(), b1.clone(), c_mut, self.3.clone()));
-                }
-                c_emitted += 1;
             }
-        });
-
-        let mut d_emitted = 0usize;
-        self.3.visit_mutants(rng, |d_mut| {
-            if d_emitted < per_axis_cap {
+            if let Some(d_mut) = d_muts[k].as_ref() {
                 emit((
                     self.0.clone(),
                     self.1.clone(),
                     self.2.clone(),
                     d_mut.clone(),
                 ));
-                if d_emitted == 0 {
-                    if let Some(c1) = first_c.as_ref() {
-                        emit((self.0.clone(), self.1.clone(), c1.clone(), d_mut.clone()));
-                    }
-                    if let (Some(a1), Some(b1), Some(c1)) =
-                        (first_a.as_ref(), first_b.as_ref(), first_c.as_ref())
-                    {
-                        emit((a1.clone(), b1.clone(), c1.clone(), d_mut));
-                    }
-                }
-                d_emitted += 1;
             }
-        });
+            if k == 0 {
+                if let (Some(a0), Some(b0)) = (a_muts[0].as_ref(), b_muts[0].as_ref()) {
+                    emit((a0.clone(), b0.clone(), self.2.clone(), self.3.clone()));
+                }
+                if let (Some(b0), Some(c0)) = (b_muts[0].as_ref(), c_muts[0].as_ref()) {
+                    emit((self.0.clone(), b0.clone(), c0.clone(), self.3.clone()));
+                }
+                if let (Some(c0), Some(d0)) = (c_muts[0].as_ref(), d_muts[0].as_ref()) {
+                    emit((self.0.clone(), self.1.clone(), c0.clone(), d0.clone()));
+                }
+                if let (Some(a0), Some(b0), Some(c0), Some(d0)) = (
+                    a_muts[0].as_ref(),
+                    b_muts[0].as_ref(),
+                    c_muts[0].as_ref(),
+                    d_muts[0].as_ref(),
+                ) {
+                    emit((a0.clone(), b0.clone(), c0.clone(), d0.clone()));
+                }
+            }
+        }
     }
 }
 
@@ -1340,10 +1397,11 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
 
         // Place one PRNG-selected roving index first, followed by the fixed
         // representative positions `0`, `N / 2` (when `N >= 3`), and `N - 1`
-        // (when `N >= 2`), deduplicated. Putting `roving` first guarantees that
-        // even tight mutant budgets (`max_mutants_per_hit` <= 8) visit every
-        // interior index across precondition hits. `N >= 1` here because
-        // `[T; 0]` is a subsingleton.
+        // (when `N >= 2`), deduplicated. Interleaving rounds across these
+        // positions guarantees that even tight budgets (`max_mutants_per_hit <= 4`)
+        // probe every selected position on every hit while roving covers all
+        // interior indices across hits. `N >= 1` here because `[T; 0]` is a
+        // subsingleton.
         let last = N - 1;
         let mid = N / 2;
         let roving = (rng.next_u64() % (N as u64)) as usize;
@@ -1362,51 +1420,83 @@ impl<T: ReturnMutants + Clone, const N: usize> ReturnMutants for [T; N] {
             },
         ];
         let active_positions = indices.iter().filter(|idx| idx.is_some()).count();
-        // Leave room for the four structural mutants below within the default
-        // `max_mutants_per_hit` budget of 16.
-        let per_pos_cap = match active_positions {
-            0 | 1 => 16,
-            2 | 3 => 4,
-            _ => 3,
-        };
-
-        let mut first_front_mut: Option<T> = None;
-        for maybe_pos in indices {
-            let Some(pos) = maybe_pos else {
-                continue;
-            };
+        if active_positions <= 1 {
             let mut emitted = 0usize;
-            self[pos].visit_mutants(rng, |elem_mut| {
-                if emitted < per_pos_cap {
-                    if pos == 0 && first_front_mut.is_none() {
-                        first_front_mut = Some(elem_mut.clone());
-                    }
+            self[0].visit_mutants(rng, |elem_mut| {
+                if emitted < 16 {
                     let mut mutated = self.clone();
-                    mutated[pos] = elem_mut;
+                    mutated[0] = elem_mut;
                     emit(mutated);
                     emitted += 1;
                 }
             });
+            return;
         }
 
-        if N >= 2 {
-            let mut swapped = self.clone();
-            swapped.swap(0, N - 1);
-            emit(swapped);
+        // Leave room for the structural mutants below within the default
+        // `max_mutants_per_hit` budget of 16.
+        let per_pos_cap = match active_positions {
+            2 | 3 => 4,
+            _ => 3,
+        };
 
-            let mut reversed = self.clone();
-            reversed.reverse();
-            emit(reversed);
+        let mut pos_muts: [[Option<T>; 4]; 4] = array::from_fn(|_| array::from_fn(|_| None));
+        let mut first_front_mut: Option<T> = None;
+        for (slot, maybe_pos) in indices.iter().enumerate() {
+            let Some(pos) = *maybe_pos else {
+                continue;
+            };
+            let mut collected = 0usize;
+            self[pos].visit_mutants(rng, |elem_mut| {
+                if collected < per_pos_cap {
+                    if pos == 0 && first_front_mut.is_none() {
+                        first_front_mut = Some(elem_mut.clone());
+                    }
+                    pos_muts[slot][collected] = Some(elem_mut);
+                    collected += 1;
+                }
+            });
+        }
 
-            let mut rotated = self.clone();
-            rotated.rotate_left(1);
-            emit(rotated);
+        // Interleave rounds across active positions, emitting distinct
+        // structural permutations after round 0 so tight budgets see both
+        // single-element and permutation mutants without duplicate work.
+        for round in 0..per_pos_cap {
+            for (slot, maybe_pos) in indices.iter().enumerate() {
+                let Some(pos) = *maybe_pos else {
+                    continue;
+                };
+                if let Some(elem_mut) = pos_muts[slot][round].as_ref() {
+                    let mut mutated = self.clone();
+                    mutated[pos] = elem_mut.clone();
+                    emit(mutated);
+                }
+            }
+            if round == 0 && N >= 2 {
+                // For `N == 2`, `swap(0, 1)`, `reverse()`, and `rotate_left(1)`
+                // coincide; for `N == 3`, `swap(0, 2)` and `reverse()` coincide.
+                let mut swapped = self.clone();
+                swapped.swap(0, N - 1);
+                emit(swapped);
 
-            if let Some(m0) = first_front_mut {
-                let mut both_ends = self.clone();
-                both_ends[0] = m0.clone();
-                both_ends[N - 1] = m0;
-                emit(both_ends);
+                if N >= 3 {
+                    let mut rotated = self.clone();
+                    rotated.rotate_left(1);
+                    emit(rotated);
+                }
+
+                if N >= 4 {
+                    let mut reversed = self.clone();
+                    reversed.reverse();
+                    emit(reversed);
+                }
+
+                if let Some(m0) = first_front_mut.as_ref() {
+                    let mut both_ends = self.clone();
+                    both_ends[0] = m0.clone();
+                    both_ends[N - 1] = m0.clone();
+                    emit(both_ends);
+                }
             }
         }
     }
@@ -3266,66 +3356,154 @@ where
 /// [`ReturnMutants`](crate::spec_check::ReturnMutants) for a struct by
 /// delegating to the implementations of its field types.
 ///
-/// A struct with one to four named fields samples and mutates exactly like the
-/// tuple of its field types (boundary cross-products first, then seeded draws;
-/// per-field and joint perturbations), and a single-field tuple struct behaves
-/// like its inner type:
+/// Supports unit structs, empty braced structs, named structs with one to four
+/// fields, and tuple structs with one to four fields. Multi-field structs
+/// sample and mutate identically to the tuple of their field types (boundary
+/// cross-products first, then seeded draws; round-robin interleaved per-field
+/// and joint perturbations):
 ///
 /// ```text
+/// struct Marker;
+/// anneal_spec::impl_spec_check_struct!(Marker);
+///
 /// struct Span { lo: u16, hi: u16 }
 /// anneal_spec::impl_spec_check_struct!(Span { lo: u16, hi: u16 });
 ///
 /// struct Meters(u32);
 /// anneal_spec::impl_spec_check_struct!(Meters(u32));
+///
+/// struct Pair(u16, u16);
+/// anneal_spec::impl_spec_check_struct!(Pair(u16, u16));
 /// ```
 ///
-/// Every field type must implement `SampleInput`, `ReturnMutants`, and `Clone`.
+/// Single-field structs require only `SampleInput` and `ReturnMutants` on their
+/// inner field; multi-field structs additionally require `Clone` on each field.
 ///
 /// The generated sampler and mutant generator ignore any invariant the struct
 /// carries, which is what the checker needs. On the input side, state the
-/// invariant in the precondition: samples that violate it are rejected like any
-/// other inadmissible input. On the output side, a mutant that violates the
-/// invariant is a legitimate wrong answer that a postcondition restating the
-/// invariant must reject.
+/// invariant (or call the `#[invariant]` companion method) in the precondition:
+/// samples that violate it are rejected like any other inadmissible input. On
+/// the output side, a mutant that violates the invariant is a legitimate wrong
+/// answer that a postcondition restating the invariant must reject.
 #[macro_export]
 macro_rules! impl_spec_check_struct {
-    ($name:ident { $($field:ident : $fty:ty),+ $(,)? }) => {
+    ($name:ident) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize = 1;
+
+            fn sample_at(
+                _trial_idx: usize,
+                _rng: &mut $crate::spec_check::SplitMix64,
+            ) -> Self {
+                Self
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool = true;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                _rng: &mut $crate::spec_check::SplitMix64,
+                _emit: F,
+            ) {
+            }
+        }
+    };
+    ($name:ident {}) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize = 1;
+
+            fn sample_at(
+                _trial_idx: usize,
+                _rng: &mut $crate::spec_check::SplitMix64,
+            ) -> Self {
+                Self {}
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool = true;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                _rng: &mut $crate::spec_check::SplitMix64,
+                _emit: F,
+            ) {
+            }
+        }
+    };
+    ($name:ident { $field:ident : $fty:ty $(,)? }) => {
         impl $crate::spec_check::SampleInput for $name {
             const BOUNDARY_COUNT: usize =
-                <($($fty,)+) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+                <$fty as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
 
             fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
-                let ($($field,)+) =
-                    <($($fty,)+) as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng);
-                Self { $($field),+ }
+                Self {
+                    $field: <$fty as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng),
+                }
             }
         }
 
         impl $crate::spec_check::ReturnMutants for $name {
             const IS_SUBSINGLETON: bool =
-                <($($fty,)+) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+                <$fty as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
 
             fn visit_mutants<F: FnMut(Self)>(
                 &self,
                 rng: &mut $crate::spec_check::SplitMix64,
                 mut emit: F,
             ) {
-                let fields = ($(::core::clone::Clone::clone(&self.$field),)+);
+                $crate::spec_check::ReturnMutants::visit_mutants(&self.$field, rng, |$field| {
+                    emit(Self { $field })
+                });
+            }
+        }
+    };
+    ($name:ident { $first:ident : $first_ty:ty, $($field:ident : $fty:ty),+ $(,)? }) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <($first_ty, $($fty,)+) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                let ($first, $($field,)+) =
+                    <($first_ty, $($fty,)+) as $crate::spec_check::SampleInput>::sample_at(
+                        trial_idx, rng,
+                    );
+                Self { $first, $($field),+ }
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <($first_ty, $($fty,)+) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                let fields = (
+                    ::core::clone::Clone::clone(&self.$first),
+                    $(::core::clone::Clone::clone(&self.$field),)+
+                );
                 $crate::spec_check::ReturnMutants::visit_mutants(
                     &fields,
                     rng,
-                    |($($field,)+)| emit(Self { $($field),+ }),
+                    |($first, $($field,)+)| emit(Self { $first, $($field),+ }),
                 );
             }
         }
     };
-    ($name:ident ( $fty:ty )) => {
+    ($name:ident ( $fty:ty $(,)? )) => {
         impl $crate::spec_check::SampleInput for $name {
             const BOUNDARY_COUNT: usize =
                 <$fty as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
 
             fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
-                Self(<$fty as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng))
+                Self(<$fty as $crate::spec_check::SampleInput>::sample_at(
+                    trial_idx, rng,
+                ))
             }
         }
 
@@ -3341,6 +3519,108 @@ macro_rules! impl_spec_check_struct {
                 $crate::spec_check::ReturnMutants::visit_mutants(&self.0, rng, |inner| {
                     emit(Self(inner))
                 });
+            }
+        }
+    };
+    ($name:ident ( $t0:ty, $t1:ty $(,)? )) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <($t0, $t1) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                let (v0, v1) =
+                    <($t0, $t1) as $crate::spec_check::SampleInput>::sample_at(trial_idx, rng);
+                Self(v0, v1)
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <($t0, $t1) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                let fields = (
+                    ::core::clone::Clone::clone(&self.0),
+                    ::core::clone::Clone::clone(&self.1),
+                );
+                $crate::spec_check::ReturnMutants::visit_mutants(&fields, rng, |(v0, v1)| {
+                    emit(Self(v0, v1))
+                });
+            }
+        }
+    };
+    ($name:ident ( $t0:ty, $t1:ty, $t2:ty $(,)? )) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <($t0, $t1, $t2) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                let (v0, v1, v2) =
+                    <($t0, $t1, $t2) as $crate::spec_check::SampleInput>::sample_at(
+                        trial_idx, rng,
+                    );
+                Self(v0, v1, v2)
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <($t0, $t1, $t2) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                let fields = (
+                    ::core::clone::Clone::clone(&self.0),
+                    ::core::clone::Clone::clone(&self.1),
+                    ::core::clone::Clone::clone(&self.2),
+                );
+                $crate::spec_check::ReturnMutants::visit_mutants(&fields, rng, |(v0, v1, v2)| {
+                    emit(Self(v0, v1, v2))
+                });
+            }
+        }
+    };
+    ($name:ident ( $t0:ty, $t1:ty, $t2:ty, $t3:ty $(,)? )) => {
+        impl $crate::spec_check::SampleInput for $name {
+            const BOUNDARY_COUNT: usize =
+                <($t0, $t1, $t2, $t3) as $crate::spec_check::SampleInput>::BOUNDARY_COUNT;
+
+            fn sample_at(trial_idx: usize, rng: &mut $crate::spec_check::SplitMix64) -> Self {
+                let (v0, v1, v2, v3) =
+                    <($t0, $t1, $t2, $t3) as $crate::spec_check::SampleInput>::sample_at(
+                        trial_idx, rng,
+                    );
+                Self(v0, v1, v2, v3)
+            }
+        }
+
+        impl $crate::spec_check::ReturnMutants for $name {
+            const IS_SUBSINGLETON: bool =
+                <($t0, $t1, $t2, $t3) as $crate::spec_check::ReturnMutants>::IS_SUBSINGLETON;
+
+            fn visit_mutants<F: FnMut(Self)>(
+                &self,
+                rng: &mut $crate::spec_check::SplitMix64,
+                mut emit: F,
+            ) {
+                let fields = (
+                    ::core::clone::Clone::clone(&self.0),
+                    ::core::clone::Clone::clone(&self.1),
+                    ::core::clone::Clone::clone(&self.2),
+                    ::core::clone::Clone::clone(&self.3),
+                );
+                $crate::spec_check::ReturnMutants::visit_mutants(
+                    &fields,
+                    rng,
+                    |(v0, v1, v2, v3)| emit(Self(v0, v1, v2, v3)),
+                );
             }
         }
     };

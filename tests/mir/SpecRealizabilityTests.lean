@@ -1923,6 +1923,162 @@ theorem deepIndexFinPost_dichotomy :
 -- (the output is genuinely bound) instead of escaping with a runtime exception.
 #eval assertEnsuresBindsOutput (Lean.mkConst ``deepIndexFinPost)
 
+/-! ### 3.15 Closed-Nat Isolation, Budget Starvation Notes & Boilerplate Restatement -/
+
+/-- Combines a recursion-deep closed type index (`Fin (deepIndex 5000)`) with a cheap
+    closed dead guard (`scalarModulus 4 ≤ 0`): per-subterm isolation must skip
+    `deepIndex 5000` without preventing `scalarModulus 4` from folding. -/
+def deepIndexWithClosedModulusPost (_x : Nat) (ret : Fin (deepIndex 5000)) : Prop :=
+  scalarModulus 4 ≤ 0 → ret.val = 0
+
+theorem deepIndexWithClosedModulusPost_not_dichotomy :
+    ¬ PostconditionDichotomy (fun _ : Nat => True) deepIndexWithClosedModulusPost :=
+  not_postconditionDichotomy_of_trivial (fun _ ret _ => by
+    show scalarModulus 4 ≤ 0 → ret.val = 0
+    intro hLe
+    exact absurd hLe (by decide))
+
+private theorem scalarModulus_pos (k : Nat) : 0 < scalarModulus k := by
+  induction k with
+  | zero => exact Nat.zero_lt_one
+  | succ n ih =>
+    show 0 < Nat.mul 256 (scalarModulus n)
+    exact Nat.mul_pos (by decide) ih
+
+/-- Genuine postcondition mentioning an oversized closed power (`2 ^ 1000000`) and
+    large `scalarModulus 1000`: both must stay symbolic without bignum stalls. -/
+def oversizedExpPost (_x ret : Nat) : Prop :=
+  ret < 2 ^ 1000000 ∧ ret < scalarModulus 1000
+
+theorem oversizedExpPost_dichotomy :
+    PostconditionDichotomy (fun _ : Nat => True) oversizedExpPost := by
+  refine ⟨0, trivial, ⟨0, ?_, ?_⟩, ⟨2 ^ 1000000, ?_⟩⟩
+  · exact Nat.pow_pos Nat.zero_lt_two
+  · exact scalarModulus_pos 1000
+  · rintro ⟨hLt, _⟩
+    exact Nat.lt_irrefl _ hLt
+
+/-- Precondition over a recursion-deep type index: `checkRequiresSatisfiable` must
+    contain typeclass and witness timeouts instead of throwing a runtime exception. -/
+def deepIndexReq (_x : Fin (deepIndex 5000)) : Prop := True
+
+/-- Conjunctive boilerplate restatement: `memAfter.activeProtectors = req.memory.activeProtectors`
+    is already implied by `callFramePreserved req.memory memAfter`, so it constrains
+    nothing beyond the frame boilerplate (`UnboundReturnOutput`). -/
+def restateProtectorsAndContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        memAfter.activeProtectors = req.memory.activeProtectors
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem restateProtectorsAnd_not_dichotomyModuloFrame :
+    ¬ DichotomyModuloObservation
+        (fun req (q : Value × Memory) => callFramePreserved req.memory q.2)
+        restateProtectorsAndContract.pre
+        (fun req q => restateProtectorsAndContract.post req (.returned q.1 q.2)) := by
+  apply not_dichotomyModuloObservation_of_fibre_forwardInsensitive
+  intro req q₁ q₂ _ hObsEq hOk
+  dsimp [restateProtectorsAndContract] at hOk ⊢
+  have hFrame₂ : callFramePreserved req.memory q₂.2 := hObsEq ▸ hOk.1
+  rcases hFrame₂ with ⟨hC, hS, hA, hP, hF⟩
+  exact ⟨⟨hC, hS, hA, hP, hF⟩, hP⟩
+
+/-- Implicational boilerplate restatement: holds for every `(req, retVal, memAfter)`
+    because `callFramePreserved` already implies `activeProtectors` equality, so the
+    normal-return postcondition is universally valid (`TrivialPostcondition`). -/
+def restateProtectorsImpliesContract : MirCallContract := {
+  pre := fun _ => True
+  post := fun req ans =>
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter →
+        memAfter.activeProtectors = req.memory.activeProtectors
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem restateProtectorsImplies_not_normalDichotomy :
+    ¬ MirCallContractNormalDichotomy restateProtectorsImpliesContract := by
+  rintro ⟨_, _, _, _, _, _, _, hBad⟩
+  apply hBad
+  intro hFrame
+  rcases hFrame with ⟨_, _, _, hP, _⟩
+  exact hP
+
+/-- 3-argument `externalSpecCallContract`-shaped contract whose precondition carries
+    all parameter-validity conjuncts, `rangeClampPre`, and `req.memory.activeProtectors = []`.
+    Inside the frame-preserving fibre, transitivity of equality forces
+    `memAfter.activeProtectors = []`, so the `retVal` disjunct is vacuous under `pre`
+    (`SurvivedAllMutants`). Unpacking all precondition and boilerplate conjuncts requires
+    more than 32 hypothesis-destruction steps. -/
+def multiArgConjProtectorsContract : MirCallContract := {
+  pre := fun req =>
+    (externalSpecCallContract "core::cmp::Ord::clamp" rangeClampSidecar
+      rangeClampPre (fun _ _ => True)).pre req ∧
+    req.memory.activeProtectors = []
+  post := fun req ans =>
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        retMatchesCalleeReturnTy rangeClampSidecar retVal ∧
+        (memAfter.activeProtectors = [] ∨ retVal = .scalar { bits := 0, sizeBytes := 4 })
+    | .panicked _ => False
+    | .aborted => True
+}
+
+theorem multiArgConjProtectors_not_dichotomyModuloBoilerplate :
+    ¬ DichotomyModuloObservation
+        (externalSpecBoilerplateObs rangeClampSidecar)
+        multiArgConjProtectorsContract.pre
+        (fun req q => multiArgConjProtectorsContract.post req (.returned q.1 q.2)) := by
+  apply not_dichotomyModuloObservation_of_fibre_forwardInsensitive
+  intro req q₁ q₂ hPre hObsEq hOk
+  have hFrameEq : callFramePreserved req.memory q₁.2 = callFramePreserved req.memory q₂.2 :=
+    congrArg Prod.fst hObsEq
+  have hTyEq : retMatchesCalleeReturnTy rangeClampSidecar q₁.1 =
+      retMatchesCalleeReturnTy rangeClampSidecar q₂.1 :=
+    congrArg Prod.snd hObsEq
+  dsimp [multiArgConjProtectorsContract] at hPre hOk ⊢
+  have hFrame₂ : callFramePreserved req.memory q₂.2 := hFrameEq ▸ hOk.1
+  have hTy₂ : retMatchesCalleeReturnTy rangeClampSidecar q₂.1 := hTyEq ▸ hOk.2.1
+  rcases hFrame₂ with ⟨hC, hS, hA, hP, hF⟩
+  exact ⟨⟨hC, hS, hA, hP, hF⟩, hTy₂, Or.inl (hP.trans hPre.2)⟩
+
+-- Per-subterm isolation folds `scalarModulus 4` even beside `Fin (deepIndex 5000)`.
+#eval assertEnsuresVacuous
+  (Lean.mkConst ``deepIndexWithClosedModulusPost) none (some .trivialPostcondition)
+-- Oversized exponents and moduli stay symbolic without stalling bignum evaluation.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``oversizedExpPost)
+-- Boilerplate restatements and deep multi-arg conjunctive equation propagation.
+#eval assertDeclEnsuresVacuous ``restateProtectorsAndContract (some .unboundReturnOutput)
+#eval assertDeclEnsuresVacuous ``restateProtectorsImpliesContract (some .trivialPostcondition)
+#eval assertDeclEnsuresVacuous ``multiArgConjProtectorsContract (some .survivedAllMutants)
+
+#eval show Lean.Meta.MetaM Unit from do
+  -- `checkRequiresSatisfiable` contains costly type indices without throwing.
+  let reqRes ← checkRequiresSatisfiable (Lean.mkConst ``deepIndexReq)
+  if reqRes.satisfiable? == some false then
+    throwError "expected deepIndexReq not falsely refuted, got {repr reqRes}"
+  -- Phase 1 cutoff on `deepIndexFinPost` records an informative conservative-degradation note.
+  let deepRes ← checkEnsuresBindsOutput (Lean.mkConst ``deepIndexFinPost)
+  unless deepRes.bindsOutput && !deepRes.notes.isEmpty do
+    throwError "expected deepIndexFinPost to accept with cutoff note, got {repr deepRes}"
+  -- Starved probes on a hard genuine postcondition degrade conservatively with notes.
+  let starvedRes ← checkEnsuresBindsOutput (Lean.mkConst ``budgetProbePost) none
+    { stepHeartbeats := 1, totalHeartbeats := 250000 }
+  unless starvedRes.bindsOutput && !starvedRes.notes.isEmpty do
+    throwError "expected starved budgetProbePost to accept with degradation note, got {repr starvedRes}"
+  -- Starved multi-fibre `MirCallAns` check degrades conservatively with notes.
+  let starvedCall ← checkDeclEnsuresBindsOutput ``frameImpliesRetContract
+    { stepHeartbeats := 1, totalHeartbeats := 1 }
+  unless starvedCall.bindsOutput && !starvedCall.notes.isEmpty do
+    throwError "expected starved MirCallAns check to accept with degradation note, got {repr starvedCall}"
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/

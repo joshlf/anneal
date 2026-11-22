@@ -2640,3 +2640,352 @@ fn counterexample_trial_replays_the_exact_failing_input() {
     assert_eq!(dead.vacuity_class(), Some(VacuityClass::DeadPrecondition));
     assert_eq!(dead.failure().and_then(|f| f.counterexample_trial()), None);
 }
+
+// ---------------------------------------------------------------------------
+// Tight-budget multi-axis interleaving, `#[invariant]` integration, full
+// struct arities, and exhaustive width/array zero-panic audit
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuadNamed {
+    a: u8,
+    b: i8,
+    c: u16,
+    d: bool,
+}
+
+anneal_spec::impl_spec_check_struct!(QuadNamed {
+    a: u8,
+    b: i8,
+    c: u16,
+    d: bool,
+});
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PairTuple(u16, u16);
+
+anneal_spec::impl_spec_check_struct!(PairTuple(u16, u16));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TripleTuple(u8, i16, bool);
+
+anneal_spec::impl_spec_check_struct!(TripleTuple(u8, i16, bool));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuadTuple(u8, i8, u16, bool);
+
+anneal_spec::impl_spec_check_struct!(QuadTuple(u8, i8, u16, bool));
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnitMarker;
+
+anneal_spec::impl_spec_check_struct!(UnitMarker);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EmptyBrace {}
+
+anneal_spec::impl_spec_check_struct!(EmptyBrace {});
+
+/// Intentionally non-`Clone` single-field struct proving 1-field macro arms
+/// require neither `Clone` nor `Copy`.
+#[derive(Debug, PartialEq, Eq)]
+struct NonCloneWrap {
+    inner: u32,
+}
+
+anneal_spec::impl_spec_check_struct!(NonCloneWrap { inner: u32 });
+
+#[derive(Debug, PartialEq, Eq)]
+struct NonCloneNewtype(u32);
+
+anneal_spec::impl_spec_check_struct!(NonCloneNewtype(u32,));
+
+#[invariant(self.lo <= self.hi, self.hi < 1_000)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CheckedWindow {
+    lo: u16,
+    hi: u16,
+}
+
+anneal_spec::impl_spec_check_struct!(CheckedWindow { lo: u16, hi: u16 });
+
+#[test]
+fn tight_budget_multi_axis_interleaving_for_tuples_structs_and_arrays() {
+    // 2-tuple and 2-field tuple struct reach axis 1 even with `max_mutants_per_hit = 2`.
+    let cfg2 = SpecCheckConfig::default().with_max_mutants_per_hit(2);
+    let tuple2_last = assert_contract_strong(
+        cfg2,
+        |_t: &(u16, u16)| true,
+        |&t| t,
+        |&(_, b), &(_, rb): &(u16, u16)| rb == b,
+    );
+    assert!(tuple2_last.is_pointwise_strong());
+
+    let pair_last = assert_contract_strong(
+        cfg2,
+        |_p: &PairTuple| true,
+        |&p| p,
+        |p, r: &PairTuple| r.1 == p.1,
+    );
+    assert!(pair_last.is_pointwise_strong());
+
+    // 3-tuple and 3-field tuple struct reach axis 2 even with `max_mutants_per_hit = 3`.
+    let cfg3 = SpecCheckConfig::default().with_max_mutants_per_hit(3);
+    let tuple3_last = assert_contract_strong(
+        cfg3,
+        |_t: &(u8, i16, bool)| true,
+        |&t| t,
+        |&(_, _, c), &(_, _, rc): &(u8, i16, bool)| rc == c,
+    );
+    assert!(tuple3_last.is_pointwise_strong());
+
+    let triple_last = assert_contract_strong(
+        cfg3,
+        |_t: &TripleTuple| true,
+        |&t| t,
+        |t, r: &TripleTuple| r.2 == t.2,
+    );
+    assert!(triple_last.is_pointwise_strong());
+
+    // 4-tuple, 4-field named struct, and 4-field tuple struct reach axis 3 even
+    // with `max_mutants_per_hit = 4`.
+    let cfg4 = SpecCheckConfig::default().with_max_mutants_per_hit(4);
+    let tuple4_last = assert_contract_strong(
+        cfg4,
+        |_t: &(u8, i8, u16, bool)| true,
+        |&t| t,
+        |&(_, _, _, d), &(_, _, _, rd): &(u8, i8, u16, bool)| rd == d,
+    );
+    assert!(tuple4_last.is_pointwise_strong());
+
+    let quad_named_last = assert_contract_strong(
+        cfg4,
+        |_q: &QuadNamed| true,
+        |&q| q,
+        |q, r: &QuadNamed| r.d == q.d,
+    );
+    assert!(quad_named_last.is_pointwise_strong());
+
+    let quad_tuple_last = assert_contract_strong(
+        cfg4,
+        |_q: &QuadTuple| true,
+        |&q| q,
+        |q, r: &QuadTuple| r.3 == q.3,
+    );
+    assert!(quad_tuple_last.is_pointwise_strong());
+
+    // `[u16; 8]` interleaves positions so even `max_mutants_per_hit = 4` hits `last`
+    // (`index 7`) on every hit.
+    let arr8_last = assert_contract_strong(
+        cfg4,
+        |_a: &[u16; 8]| true,
+        |&a| a,
+        |a, r: &[u16; 8]| r[7] == a[7],
+    );
+    assert!(arr8_last.is_pointwise_strong());
+
+    // Structural permutation deduplication: `[1, 2]` emits `[2, 1]` once (not 3x),
+    // and `[1, 2, 3]` emits `[3, 2, 1]` and `[2, 3, 1]` once each (not duplicated).
+    let mut swapped_2_count = 0usize;
+    [1u8, 2u8].visit_mutants(&mut SplitMix64::new(19), |m| {
+        if m == [2, 1] {
+            swapped_2_count += 1;
+        }
+    });
+    assert_eq!(swapped_2_count, 1);
+
+    let mut swapped_3_count = 0usize;
+    let mut rotated_3_count = 0usize;
+    [1u8, 2u8, 3u8].visit_mutants(&mut SplitMix64::new(19), |m| {
+        if m == [3, 2, 1] {
+            swapped_3_count += 1;
+        }
+        if m == [2, 3, 1] {
+            rotated_3_count += 1;
+        }
+    });
+    assert_eq!(swapped_3_count, 1);
+    assert_eq!(rotated_3_count, 1);
+}
+
+#[test]
+fn invariant_attribute_and_full_struct_arities_integrate_with_spec_check() {
+    // Unit and empty-braced structs are subsingletons with 1 boundary sample.
+    assert!(<UnitMarker as ReturnMutants>::IS_SUBSINGLETON);
+    assert!(<EmptyBrace as ReturnMutants>::IS_SUBSINGLETON);
+    assert_eq!(<UnitMarker as SampleInput>::BOUNDARY_COUNT, 1);
+    assert_eq!(<EmptyBrace as SampleInput>::BOUNDARY_COUNT, 1);
+
+    let unit_ok = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_u: &UnitMarker| true,
+        |_| EmptyBrace {},
+        |_u, _e: &EmptyBrace| true,
+    );
+    assert!(unit_ok.subsingleton_return);
+
+    // Non-`Clone` 1-field named and tuple structs work end-to-end.
+    let wrap_ok = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |w: &NonCloneWrap| w.inner < u32::MAX,
+        |w| NonCloneWrap { inner: w.inner + 1 },
+        |w, r: &NonCloneWrap| r.inner == w.inner + 1,
+    );
+    assert!(wrap_ok.is_pointwise_strong());
+
+    let newtype_ok = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |n: &NonCloneNewtype| n.0 > 0,
+        |n| NonCloneNewtype(n.0 - 1),
+        |n, r: &NonCloneNewtype| r.0 == n.0 - 1,
+    );
+    assert!(newtype_ok.is_pointwise_strong());
+
+    // `#[invariant]` companion method wired into stateless and stateful contracts.
+    let inv_stateless = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |w: &CheckedWindow| w.__anneal_type_invariant_checked_window(),
+        |w| CheckedWindow { lo: w.lo, hi: w.hi },
+        |w, r: &CheckedWindow| {
+            r.__anneal_type_invariant_checked_window() && r.lo == w.lo && r.hi == w.hi
+        },
+    );
+    assert!(inv_stateless.precondition_hits > 0);
+    assert!(inv_stateless.precondition_hits < inv_stateless.trials_run);
+    assert!(inv_stateless.is_pointwise_strong());
+
+    // Even the `#[invariant]` check alone kills output mutants that break `lo <= hi`
+    // or `hi < 1_000`.
+    let inv_only = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |w: &CheckedWindow| w.__anneal_type_invariant_checked_window(),
+        |w| CheckedWindow { lo: w.lo, hi: w.hi },
+        |_w, r: &CheckedWindow| r.__anneal_type_invariant_checked_window(),
+    );
+    assert!(inv_only.mutants_killed > 0);
+
+    let inv_stateful = assert_stateful_contract_strong(
+        SpecCheckConfig::default(),
+        |old: &CheckedWindow, &step: &u16| {
+            old.__anneal_type_invariant_checked_window()
+                && step <= 10
+                && old.hi.saturating_add(step) < 1_000
+        },
+        |w: &mut CheckedWindow, &step: &u16| {
+            w.hi += step;
+            w.hi - w.lo
+        },
+        |old: &CheckedWindow, &step: &u16, new: &CheckedWindow, &width: &u16| {
+            new.__anneal_type_invariant_checked_window()
+                && new.lo == old.lo
+                && new.hi == old.hi + step
+                && width == new.hi - new.lo
+        },
+    );
+    assert!(inv_stateful.precondition_hits > 0);
+    assert!(inv_stateful.is_pointwise_strong());
+}
+
+#[test]
+fn zero_panic_all_primitive_widths_wrapping_signed_and_array_lengths() {
+    fn exercise_type<T: SampleInput + ReturnMutants + PartialEq>(seed: u64) {
+        let mut rng = SplitMix64::new(seed);
+        let mut mrng = rng.fork();
+        let mut distinct_mutants = 0usize;
+        let total = T::BOUNDARY_COUNT + 32;
+        for idx in 0..total {
+            let val = T::sample_at(idx, &mut rng);
+            val.visit_mutants(&mut mrng, |m| {
+                if m != val {
+                    distinct_mutants += 1;
+                }
+            });
+        }
+        assert!(T::IS_SUBSINGLETON || distinct_mutants > 0);
+    }
+
+    // All unsigned and signed primitive widths (`8..=128` plus pointer-width).
+    exercise_type::<u8>(1);
+    exercise_type::<u16>(2);
+    exercise_type::<u32>(3);
+    exercise_type::<u64>(4);
+    exercise_type::<u128>(5);
+    exercise_type::<usize>(6);
+    exercise_type::<i8>(7);
+    exercise_type::<i16>(8);
+    exercise_type::<i32>(9);
+    exercise_type::<i64>(10);
+    exercise_type::<i128>(11);
+    exercise_type::<isize>(12);
+
+    // `Wrapping<T>` across every unsigned and signed primitive width.
+    exercise_type::<Wrapping<u8>>(13);
+    exercise_type::<Wrapping<u16>>(14);
+    exercise_type::<Wrapping<u32>>(15);
+    exercise_type::<Wrapping<u64>>(16);
+    exercise_type::<Wrapping<u128>>(17);
+    exercise_type::<Wrapping<usize>>(18);
+    exercise_type::<Wrapping<i8>>(19);
+    exercise_type::<Wrapping<i16>>(20);
+    exercise_type::<Wrapping<i32>>(21);
+    exercise_type::<Wrapping<i64>>(22);
+    exercise_type::<Wrapping<i128>>(23);
+    exercise_type::<Wrapping<isize>>(24);
+
+    // Every array length `0..=8` across unsigned, signed, and subsingleton elements.
+    exercise_type::<[u8; 0]>(30);
+    exercise_type::<[u8; 1]>(31);
+    exercise_type::<[u8; 2]>(32);
+    exercise_type::<[u8; 3]>(33);
+    exercise_type::<[u8; 4]>(34);
+    exercise_type::<[u8; 5]>(35);
+    exercise_type::<[u8; 6]>(36);
+    exercise_type::<[u8; 7]>(37);
+    exercise_type::<[u8; 8]>(38);
+
+    exercise_type::<[i8; 0]>(40);
+    exercise_type::<[i8; 1]>(41);
+    exercise_type::<[i8; 2]>(42);
+    exercise_type::<[i8; 3]>(43);
+    exercise_type::<[i8; 4]>(44);
+    exercise_type::<[i8; 5]>(45);
+    exercise_type::<[i8; 6]>(46);
+    exercise_type::<[i8; 7]>(47);
+    exercise_type::<[i8; 8]>(48);
+
+    exercise_type::<[(); 0]>(50);
+    exercise_type::<[(); 1]>(51);
+    exercise_type::<[(); 8]>(52);
+
+    // Signed `Wrapping<i8>` and `Wrapping<i128>` extremal boundary contracts
+    // (`MIN`, `MAX`, `-1`, `0`) exercise two's-complement wrap-around without panicking.
+    let mut saw_i8_min = false;
+    let wrap_i8_neg = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&x: &Wrapping<i8>| {
+            if x.0 == i8::MIN {
+                saw_i8_min = true;
+            }
+            true
+        },
+        |&x| Wrapping(x.0.wrapping_neg()),
+        |&x, &r: &Wrapping<i8>| r.0 == x.0.wrapping_neg(),
+    );
+    assert!(saw_i8_min);
+    assert!(wrap_i8_neg.is_pointwise_strong());
+
+    let mut saw_i128_min = false;
+    let wrap_i128_add = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |&(a, _b): &(Wrapping<i128>, Wrapping<i128>)| {
+            if a.0 == i128::MIN {
+                saw_i128_min = true;
+            }
+            true
+        },
+        |&(a, b)| a + b,
+        |&(a, b), &r: &Wrapping<i128>| r.0 == a.0.wrapping_add(b.0),
+    );
+    assert!(saw_i128_min);
+    assert!(wrap_i128_add.is_pointwise_strong());
+}

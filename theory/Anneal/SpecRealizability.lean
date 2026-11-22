@@ -1286,12 +1286,13 @@ private def destructHypsMulti
   | _, [], done => return done
   | fuel + 1, (mvarId, tried) :: rest, done => do
     let canSplitOr : Bool := Nat.ble (done.length + rest.length + 2) maxGoals
-    let target? ← mvarId.withContext do
+    let (target?, tried') ← mvarId.withContext do
       let lctx ← getLCtx
       let mut nonBranch? : Option (FVarId × Nat) := none
       let mut orCand? : Option FVarId := none
+      let mut nextTried := tried
       for decl in lctx do
-        if decl.isImplementationDetail || tried.contains decl.fvarId then continue
+        if decl.isImplementationDetail || nextTried.contains decl.fvarId then continue
         let ty ← instantiateMVars decl.type
         let tyWhnf ← whnf ty
         if tyWhnf.isConstOf ``False then
@@ -1303,11 +1304,14 @@ private def destructHypsMulti
         else if tyWhnf.isAppOfArity ``Exists 2 then
           nonBranch? := some (decl.fvarId, 2)
           break
-        else if canSplitOr && orCand?.isNone && tyWhnf.isAppOfArity ``Or 2 then
-          orCand? := some decl.fvarId
+        else if tyWhnf.isAppOfArity ``Or 2 then
+          if canSplitOr && orCand?.isNone then
+            orCand? := some decl.fvarId
+        else
+          nextTried := nextTried.push decl.fvarId
       match nonBranch? with
-      | some nb => return some nb
-      | none => return orCand?.map (fun fv => (fv, 3))
+      | some nb => return (some nb, nextTried)
+      | none => return (orCand?.map (fun fv => (fv, 3)), nextTried)
     match target? with
     | none => destructHypsMulti maxGoals fuel rest (mvarId :: done)
     | some (fvarId, kind) =>
@@ -1316,10 +1320,17 @@ private def destructHypsMulti
         if kind == 0 then
           destructHypsMulti maxGoals fuel rest done
         else
-          let nextGoals := subgoals.toList.map (fun sg => (sg.mvarId, tried))
+          let nextGoals := subgoals.toList.map (fun sg => (sg.mvarId, tried'))
           destructHypsMulti maxGoals fuel (nextGoals ++ rest) done
       catch _ =>
-        destructHypsMulti maxGoals fuel ((mvarId, tried.push fvarId) :: rest) done
+        destructHypsMulti maxGoals fuel ((mvarId, tried'.push fvarId) :: rest) done
+
+/-- Outcome of a single bounded tactic probe. -/
+private inductive ProbeOutcome : Type where
+  | proved
+  | undecided
+  | cutOff
+  deriving DecidableEq
 
 /-- Run a single tactic syntax snippet against `goalTy` inside a fresh isolated
     metavariable, restoring `Core.State.messages`, verifying zero errors, zero `sorry`,
@@ -1328,9 +1339,10 @@ private def destructHypsMulti
     The goal itself is typechecked first: a goal assembled by substitution (for
     example, an output-insensitivity goal over a dependent output type) is never
     handed to a tactic unless it is type-correct, so an ill-typed goal can never be
-    reported as proved. -/
-private def tryTacticSnippet
-    (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM Bool := do
+    reported as proved. Returns `.cutOff` when the heartbeat or recursion-depth cap
+    aborts the probe. -/
+private def tryTacticSnippetOutcome
+    (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM ProbeOutcome := do
   let savedMsgs := (← getThe Core.State).messages
   let result ← withoutModifyingState do
     modifyThe Core.State fun s => { s with messages := {} }
@@ -1342,7 +1354,7 @@ private def tryTacticSnippet
         return false
       let mvar ← mkFreshExprSyntheticOpaqueMVar goalTy
       let mvarId ← introsUnfoldingNot 8 mvar.mvarId!
-      let goals ← destructHypsMulti 8 32 [(mvarId, #[])] []
+      let goals ← destructHypsMulti 8 128 [(mvarId, #[])] []
       let mut allClosed := true
       for mid in goals do
         let rem ← Term.TermElabM.run' <| Tactic.run mid <| Tactic.evalTactic tac
@@ -1360,9 +1372,16 @@ private def tryTacticSnippet
       if !(← isDefEq proofTy goalTy) then
         return false
       return true
-    return attempt?.getD false
+    match attempt? with
+    | some true => return .proved
+    | some false => return .undecided
+    | none => return .cutOff
   modifyThe Core.State fun s => { s with messages := savedMsgs }
   return result
+
+private def tryTacticSnippet
+    (goalTy : Expr) (stepCapInternal : Nat) (tac : TSyntax `tactic) : MetaM Bool := do
+  return (← tryTacticSnippetOutcome goalTy stepCapInternal tac) == .proved
 
 /-- The fixed, ordered battery of tactic snippets tried by the bounded prover: fast
     deterministic closers, then `simp_all`-normalized closers, then `grind`. -/
@@ -1391,32 +1410,92 @@ private def closedNatFoldBound : Nat := 2 ^ 512
 
 /-- Internal-heartbeat cap for one `foldClosedArith` pass. Evaluating the closed
     constants of a realistic specification (`scalarModulus 8`, a sidecar's `argCount`)
-    needs a few thousand heartbeats. An expensive closed term abandons the pass, and
-    the goal is then proved as written, instead of draining the probe budget. -/
+    needs a few thousand heartbeats. An expensive closed term abandons only its own
+    subterm evaluation (under `closedNatSubtermHeartbeats`) instead of aborting the
+    whole pass or draining the probe budget. -/
 private def closedNatFoldHeartbeats : Nat := 2000000
+
+/-- Per-subterm internal-heartbeat cap inside `evalClosedNatLit?`. Isolating each
+    closed `Nat` evaluation ensures one costly or recursion-deep closed term (such as
+    `Fin (deepIndex 5000)` in a binder type) stays symbolic without preventing other
+    closed constants (`scalarModulus 4`, `sidecar.argCount`) in the same goal from
+    folding. -/
+private def closedNatSubtermHeartbeats : Nat := 250000
+
+/-- Conservative syntactic pre-check that avoids calling `whnf` on closed `Nat`
+    exponentiations, shifts, or scalar moduli whose literal operand would already
+    produce a value at or above `closedNatFoldBound` (`2 ^ 512`), preventing
+    oversized bignum allocation before heartbeats are checked. -/
+private def isOversizedNatOp? (e : Expr) : MetaM Bool := do
+  let fn := e.getAppFn
+  let args := e.getAppArgs
+  let .const name _ := fn | return false
+  if name == ``HPow.hPow && args.size == 6 then
+    if let some exp ← Meta.getNatValue? args[5]! then
+      if Nat.ble 512 exp then
+        if let some base ← Meta.getNatValue? args[4]! then
+          return Nat.ble 2 base
+        return true
+  else if name == ``Nat.pow && args.size == 2 then
+    if let some exp ← Meta.getNatValue? args[1]! then
+      if Nat.ble 512 exp then
+        if let some base ← Meta.getNatValue? args[0]! then
+          return Nat.ble 2 base
+        return true
+  else if name == ``HShiftLeft.hShiftLeft && args.size == 6 then
+    if let some shift ← Meta.getNatValue? args[5]! then
+      if Nat.ble 512 shift then
+        if let some base ← Meta.getNatValue? args[4]! then
+          return Nat.ble 1 base
+        return true
+  else if name == ``Nat.shiftLeft && args.size == 2 then
+    if let some shift ← Meta.getNatValue? args[1]! then
+      if Nat.ble 512 shift then
+        if let some base ← Meta.getNatValue? args[0]! then
+          return Nat.ble 1 base
+        return true
+  else if name == ``scalarModulus && args.size == 1 then
+    if let some bytes ← Meta.getNatValue? args[0]! then
+      return Nat.ble 64 bytes
+  else if name == ``scalarPow2 && args.size == 1 then
+    if let some bits ← Meta.getNatValue? args[0]! then
+      return Nat.ble 512 bits
+  return false
 
 /-- Evaluate `e` to a numeral when it is a closed `Nat`-typed term: one with no free,
     meta, or loose bound variable, so its value depends on no input or output.
 
     Returns `some e` unchanged when `e` already is a numeral, `some lit` when `whnf`
-    evaluates `e` to a value below `closedNatFoldBound`, and `none` otherwise. `whnf`
-    only produces definitionally equal terms, so `lit` is definitionally equal to `e`. -/
-private def evalClosedNatLit? (e : Expr) : MetaM (Option Expr) := do
+    evaluates `e` to a value below `closedNatFoldBound` within `subtermCap` internal
+    heartbeats, and `none` otherwise (including on heartbeat or recursion-depth cutoff).
+    `whnf` only produces definitionally equal terms, so `lit` is definitionally equal
+    to `e`. -/
+private def evalClosedNatLit? (subtermCap : Nat) (e : Expr) : MetaM (Option Expr) := do
   if e.hasFVar || e.hasExprMVar || e.hasLooseBVars then
     return none
   if (← Meta.getNatValue? e).isSome then
     return some e
-  let ty ← whnf (← inferType e)
-  if !ty.isConstOf ``Nat then
+  if ← isOversizedNatOp? e then
     return none
-  let v ← whnf e
-  if let some n ← Meta.getNatValue? v then
-    if n < closedNatFoldBound then
-      return some (mkNatLit n)
+  let eval? ← withBoundedHeartbeats subtermCap do
+    let rawTy ← inferType e
+    match rawTy with
+    | .forallE .. | .sort .. => return none
+    | _ => pure ()
+    let ty ← if rawTy.isConstOf ``Nat then pure rawTy else whnf rawTy
+    if !ty.isConstOf ``Nat then
+      return none
+    let v ← whnf e
+    if let some n ← Meta.getNatValue? v then
+      if n < closedNatFoldBound then
+        return some (mkNatLit n)
+      return none
+    if v.isConstOf ``Nat.zero then
+      return some (mkNatLit 0)
     return none
-  if v.isConstOf ``Nat.zero then
-    return some (mkNatLit 0)
-  return none
+  match eval? with
+  | some res => return res
+  | none => return none
 
 /-- Fuel-bounded normalizer applied to a goal before it reaches the bounded prover.
 
@@ -1425,7 +1504,9 @@ private def evalClosedNatLit? (e : Expr) : MetaM (Option Expr) := do
       such as `scalarModulus 4` or `sidecar.argCount` as an opaque atom, so without
       this step `scalarModulus 4 ≤ 0 → ret = x` (vacuously true) and
       `ret % scalarModulus 4 < scalarModulus 4` (true of every `ret`) are accepted as
-      binding postconditions.
+      binding postconditions. Each subterm evaluation is isolated under a per-subterm
+      heartbeat/recursion cap so one costly subterm cannot prevent other closed
+      constants in the same goal from folding.
     * `Trusted.Sequence.length` is replaced by `List.length`, its definition, so the
       standard list-length lemmas apply to the argument-count conjunct
       `Trusted.Sequence.length req.args = sidecar.argCount` of an external-spec
@@ -1434,36 +1515,40 @@ private def evalClosedNatLit? (e : Expr) : MetaM (Option Expr) := do
     Both rewrites replace a subterm by a definitionally equal one of the same type, so
     the result is definitionally equal to the input and a proof of the normalized goal
     proves the original. Subterms nested deeper than `fuel` are left untouched. -/
-private def foldClosedArith : Nat → Expr → MetaM Expr
+private def foldClosedArith (passEnd : Nat) : Nat → Expr → MetaM Expr
   | 0, e => return e
   | fuel + 1, e => do
+    let now ← IO.getNumHeartbeats
+    if now >= passEnd then
+      return e
+    let subCap := min (passEnd - now) closedNatSubtermHeartbeats
     match e with
     | .mdata d b =>
-      return .mdata d (← foldClosedArith fuel b)
+      return .mdata d (← foldClosedArith passEnd fuel b)
     | .lam n t b bi =>
-      return .lam n (← foldClosedArith fuel t) (← foldClosedArith fuel b) bi
+      return .lam n (← foldClosedArith passEnd fuel t) (← foldClosedArith passEnd fuel b) bi
     | .forallE n t b bi =>
-      return .forallE n (← foldClosedArith fuel t) (← foldClosedArith fuel b) bi
+      return .forallE n (← foldClosedArith passEnd fuel t) (← foldClosedArith passEnd fuel b) bi
     | .letE n t v b nd =>
-      return .letE n (← foldClosedArith fuel t) (← foldClosedArith fuel v)
-        (← foldClosedArith fuel b) nd
+      return .letE n (← foldClosedArith passEnd fuel t) (← foldClosedArith passEnd fuel v)
+        (← foldClosedArith passEnd fuel b) nd
     | .proj s i b =>
-      if let some lit ← evalClosedNatLit? e then
+      if let some lit ← evalClosedNatLit? subCap e then
         return lit
-      return .proj s i (← foldClosedArith fuel b)
+      return .proj s i (← foldClosedArith passEnd fuel b)
     | .const name us =>
       if name == ``Trusted.Sequence.length then
         return .const ``List.length us
-      if let some lit ← evalClosedNatLit? e then
+      if let some lit ← evalClosedNatLit? subCap e then
         return lit
       return e
     | .app .. =>
-      if let some lit ← evalClosedNatLit? e then
+      if let some lit ← evalClosedNatLit? subCap e then
         return lit
-      let fn ← foldClosedArith fuel e.getAppFn
+      let fn ← foldClosedArith passEnd fuel e.getAppFn
       let mut args : Array Expr := #[]
       for a in e.getAppArgs do
-        args := args.push (← foldClosedArith fuel a)
+        args := args.push (← foldClosedArith passEnd fuel a)
       return mkAppN fn args
     | _ => return e
 
@@ -1473,8 +1558,11 @@ private def foldClosedArith : Nat → Expr → MetaM Expr
     starves a probe. -/
 private def normalizeGoalArith (budget : ProbeBudget) (goalTy : Expr) : MetaM Expr := do
   let some cap ← budget.nextCap? | return goalTy
-  let folded? ← withBoundedHeartbeats (min cap closedNatFoldHeartbeats)
-    (foldClosedArith 96 goalTy)
+  let passCap := min cap closedNatFoldHeartbeats
+  let now ← IO.getNumHeartbeats
+  let passEnd := now + passCap
+  let folded? ← withBoundedHeartbeats passCap
+    (foldClosedArith passEnd 96 goalTy)
   return folded?.getD goalTy
 
 /-- Budget-aware variant of `tryProve`: re-derives a strictly positive heartbeat cap
@@ -1485,13 +1573,24 @@ private def normalizeGoalArith (budget : ProbeBudget) (goalTy : Expr) : MetaM Ex
     The goal is first normalized by `normalizeGoalArith`, so closed arithmetic
     constants reach the tactics as numerals. The normalized goal is definitionally
     equal to `goalTy`, so every verdict still rests on a `Meta.check`ed proof of a
-    statement equivalent to the one requested. -/
-private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr) : MetaM Bool := do
+    statement equivalent to the one requested. When `cutOffRef?` is provided, it is
+    set to `true` if any snippet hits a heartbeat/recursion cap or budget exhaustion. -/
+private def tryProveWithin (budget : ProbeBudget) (goalTy : Expr)
+    (cutOffRef? : Option (IO.Ref Bool) := none) : MetaM Bool := do
   let goalTy ← normalizeGoalArith budget (← instantiateMVars goalTy)
   for tac in (← proverSnippets) do
-    let some cap ← budget.nextCap? | return false
-    if ← tryTacticSnippet goalTy cap tac then
-      return true
+    match ← budget.nextCap? with
+    | none =>
+      if let some ref := cutOffRef? then
+        ref.set true
+      return false
+    | some cap =>
+      match ← tryTacticSnippetOutcome goalTy cap tac with
+      | .proved => return true
+      | .undecided => pure ()
+      | .cutOff =>
+        if let some ref := cutOffRef? then
+          ref.set true
   return false
 
 /-! ### Structural Reduction, Subsingleton/Empty Type & Tautology Helpers -/
@@ -2336,6 +2435,8 @@ private def analyzeNormalizedSpec
     (requiresExpr? : Option Expr)
     (cfg : EnsuresCheckConfig) : MetaM EnsuresCheckResult := do
   let budget ← ProbeBudget.init cfg
+  let probeCutOffRef ← IO.mkRef false
+  let cutOffOpt : Option (IO.Ref Bool) := some probeCutOffRef
   let outFVarIds : Array FVarId := outVars.map Expr.fvarId!
   let allVars := preInputs ++ fixedVars ++ outVars
   let mentionsOutput (e : Expr) : Bool := e.hasAnyFVar (fun fv => outFVarIds.contains fv)
@@ -2352,23 +2453,24 @@ private def analyzeNormalizedSpec
 
   -- `∀ allVars, (cfpRefl →) goal`.
   let proveClosed (goal : Expr) : MetaM Bool := do
-    tryProveWithin budget (← mkForallFVars allVars (← withCfpRefl goal))
+    tryProveWithin budget (← mkForallFVars allVars (← withCfpRefl goal)) cutOffOpt
   -- `∀ preInputs (h_pre : requires) fixedVars outVars, (cfpRefl →) goal`.
   let proveUnderRequires (preNorm goal : Expr) : MetaM Bool :=
     withLocalDeclD `h_pre preNorm fun hPre => do
       tryProveWithin budget
         (← mkForallFVars (preInputs ++ #[hPre] ++ fixedVars ++ outVars) (← withCfpRefl goal))
+        cutOffOpt
   -- `∀ allVars outs', (cfpRefl →) body → body[outs := outs']`.
   let proveInsensitive (body : Expr) : MetaM Bool := do
     match ← mkOutputInsensitivityGoal? allVars outVars body cfpReflTy? with
-    | some goal => tryProveWithin budget goal
+    | some goal => tryProveWithin budget goal cutOffOpt
     | none => return false
   -- The same goal with `h_pre : requires` in scope.
   let proveInsensitiveUnderRequires (preNorm body : Expr) : MetaM Bool :=
     withLocalDeclD `h_pre preNorm fun hPre => do
       let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
       match ← mkOutputInsensitivityGoal? scopedVars outVars body cfpReflTy? with
-      | some goal => tryProveWithin budget goal
+      | some goal => tryProveWithin budget goal cutOffOpt
       | none => return false
 
   -- Phase 0: Check whether `requires` is provably unsatisfiable (`DeadPrecondition`).
@@ -2392,7 +2494,7 @@ private def analyzeNormalizedSpec
   if let some preNorm := preNorm? then
     if preNorm.isConstOf ``False then
       return .vacuous .requiresUnsatisfiable ["requires is syntactically False"]
-    if ← tryProveWithin budget (← mkForallFVars preInputs (negate preNorm)) then
+    if ← tryProveWithin budget (← mkForallFVars preInputs (negate preNorm)) cutOffOpt then
       return .vacuous .requiresUnsatisfiable
         ["requires proved unsatisfiable for all inputs"]
 
@@ -2403,24 +2505,35 @@ private def analyzeNormalizedSpec
     | some p => if p.isConstOf ``True then none else some p
     | none => none
 
+  let mut notes : List String := []
+  let mut budgetExhaustedNoteAdded := false
+
   -- Phase 1: Subsingleton or empty output type (`UnboundReturnOutput`).
   -- Deciding emptiness can evaluate a type index (`Fin n`) and run instance synthesis,
-  -- so every output type is inspected under a heartbeat cap. An inspection that runs
-  -- out of heartbeats or recursion depth (both runtime exceptions) leaves the type
-  -- unflagged instead of aborting the whole check. The cap has a fixed floor so the
-  -- purely structural cases still resolve under a starved probe configuration.
+  -- so every output type is inspected under a heartbeat cap bounded by `budget`. An
+  -- inspection that runs out of heartbeats or recursion depth (both runtime exceptions)
+  -- records a conservative degradation note instead of aborting the whole check. The
+  -- cap retains a fixed structural floor so trivial types still resolve under starved
+  -- probe configurations.
   if !outVars.isEmpty then
-    let typeCap := max 1000000 (cfg.stepHeartbeats * 1000)
+    let typeCap := max 1000000 (min budget.totalInternal (cfg.stepHeartbeats * 1000))
     let mut allSubsingleton := true
     for ov in outVars do
       let ovTy ← inferType ov
       let isSub? ← withBoundedHeartbeats typeCap (isSubsingletonOrEmptyType 16 ovTy)
-      if !(isSub?.getD false) then
+      match isSub? with
+      | some true => pure ()
+      | some false =>
+        allSubsingleton := false
+        break
+      | none =>
+        notes := notes ++
+          ["output-type subsingleton/emptiness check exceeded heartbeat/recursion cap; skipped conservatively"]
         allSubsingleton := false
         break
     if allSubsingleton then
       return .vacuous .subsingletonOutputType
-        ["all inspected output types are subsingleton or empty"]
+        (notes ++ ["all inspected output types are subsingleton or empty"])
 
   -- Phase 2: Bare `True` / `False`, discarded `let`/beta/projection bindings, unused output binder.
   let rawClean := rawBody.consumeMData
@@ -2482,7 +2595,6 @@ private def analyzeNormalizedSpec
       "output variable drops out once user helper predicates are unfolded"
 
   -- Phase 3: `MirCallAns` boilerplate-atom cofactoring (`k ≤ 8`).
-  let mut notes : List String := []
   if isMirCallAns && cfg.userEnsuresOnly then
     let (atoms, overflow) := collectBoilerplateAtoms 64 8 workBody #[]
     if overflow then
@@ -2493,23 +2605,23 @@ private def analyzeNormalizedSpec
         let body ←
           if res.isConstOf ``True then pure (negate fibreAssump)
           else mkArrow fibreAssump (negate res)
-        tryProveWithin budget (← mkForallFVars allVars (← mkArrow cfpReflTy body))
+        tryProveWithin budget (← mkForallFVars allVars (← mkArrow cfpReflTy body)) cutOffOpt
       let proveFibreContraUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
         withLocalDeclD `h_pre preNorm fun hPre => do
           let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
           let body ←
             if res.isConstOf ``True then pure (negate fibreAssump)
             else mkArrow fibreAssump (negate res)
-          tryProveWithin budget (← mkForallFVars scopedVars (← mkArrow cfpReflTy body))
+          tryProveWithin budget (← mkForallFVars scopedVars (← mkArrow cfpReflTy body)) cutOffOpt
       let proveFibreInsensitive (fibreAssump res : Expr) : MetaM Bool := do
         match ← mkFibreInsensitivityGoal? allVars outVars cfpReflTy fibreAssump res with
-        | some goal => tryProveWithin budget goal
+        | some goal => tryProveWithin budget goal cutOffOpt
         | none => return false
       let proveFibreInsensitiveUnderRequires (preNorm fibreAssump res : Expr) : MetaM Bool :=
         withLocalDeclD `h_pre preNorm fun hPre => do
           let scopedVars := preInputs ++ #[hPre] ++ fixedVars ++ outVars
           match ← mkFibreInsensitivityGoal? scopedVars outVars cfpReflTy fibreAssump res with
-          | some goal => tryProveWithin budget goal
+          | some goal => tryProveWithin budget goal cutOffOpt
           | none => return false
 
       -- Classify the residual user postcondition of one boilerplate fibre, keeping
@@ -2574,10 +2686,19 @@ private def analyzeNormalizedSpec
               break
         if !maskFeasible then
           continue
+        let remCap? ← budget.nextCap?
+        if remCap?.isNone then
+          notes := notes ++
+            ["probe heartbeat budget exhausted during boilerplate cofactoring; remaining fibres degraded conservatively"]
+          budgetExhaustedNoteAdded := true
+          fibreGenuine := true
+          break
+        let remCap := remCap?.getD 1000
         feasibleMasks := feasibleMasks + 1
         let fibreAssump := mkFibreAssumption atoms mask
         let rawRes := cofactorBoilerplate 64 atoms mask workBody
-        let res ← unfoldUserConnectives 8 rawRes
+        let res? ← withBoundedHeartbeats remCap (unfoldUserConnectives 8 rawRes)
+        let res := res?.getD rawRes
         match ← classifyFibre fibreAssump res with
         | .contradictory => pure ()
         | .tautological tautReason =>
@@ -2605,6 +2726,10 @@ private def analyzeNormalizedSpec
         if allLiveTrue && liveFibres == feasibleMasks then
           return .vacuous .trivialConstantTrue
             (notes ++ ["ensures is a propositional tautology over boilerplate atoms"])
+        if liveFibres == feasibleMasks then
+          if ← proveClosed workBody then
+            return .vacuous .tautologicalByProver
+              (notes ++ ["ensures proved universally valid across all boilerplate fibres"])
         if anyInsensitive then
           return .vacuous .boilerplateOnlyMasking
             (notes ++ ["normal-return postcondition constrains only boilerplate atoms"])
@@ -2646,6 +2771,15 @@ private def analyzeNormalizedSpec
     if ← proveInsensitiveUnderRequires preNorm workBody then
       return .vacuous .outputInsensitiveUnderRequires
         (notes ++ ["ensures proved independent of the output under requires"])
+
+  let probeCutOff ← probeCutOffRef.get
+  let budgetExhausted := (← budget.nextCap?).isNone
+  if !budgetExhaustedNoteAdded && budgetExhausted then
+    notes := notes ++
+      ["probe heartbeat budget exhausted; remaining semantic vacuity checks degraded conservatively"]
+  else if !budgetExhaustedNoteAdded && probeCutOff then
+    notes := notes ++
+      ["one or more semantic vacuity probes exceeded their heartbeat/recursion cap; degraded conservatively"]
 
   return .ok notes
 
@@ -2805,6 +2939,7 @@ private def defaultWitnessForType? (ty : Expr) : MetaM (Option Expr) := do
 def checkRequiresSatisfiable (requiresExpr : Expr)
     (cfg : EnsuresCheckConfig := {}) : MetaM RequiresCheckResult := do
   let budget ← ProbeBudget.init cfg
+  let typeCap := max 1000000 (min budget.totalInternal (cfg.stepHeartbeats * 1000))
   let reqExposed ← exposeHeadLambda 16 requiresExpr
   let reqTy ← inferType reqExposed
   forallTelescopeReducing reqTy fun inputs retSort => do
@@ -2826,12 +2961,21 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
     if normBody.isConstOf ``True then
       -- `True` is satisfiable exactly when every input type is inhabited. A
       -- proposition-typed input (a hypothesis binder) counts only if an instance
-      -- witnesses it; it is never assumed inhabited.
+      -- witnesses it; it is never assumed inhabited. Instance synthesis is bounded
+      -- so costly type indices (e.g. `Fin (deepIndex 5000)`) degrade cleanly.
       let mut allInhabited := true
       for inp in inputs do
         let inpTy ← inferType inp
-        if (← synthSortClassInstance? ``Nonempty inpTy).isNone then
-          if (← synthSortClassInstance? ``Inhabited inpTy).isNone then
+        let nonEmpty? ← withBoundedHeartbeats typeCap (synthSortClassInstance? ``Nonempty inpTy)
+        let hasNonEmpty : Bool := match nonEmpty? with
+          | some (some _) => true
+          | _ => false
+        if !hasNonEmpty then
+          let inh? ← withBoundedHeartbeats typeCap (synthSortClassInstance? ``Inhabited inpTy)
+          let hasInh : Bool := match inh? with
+            | some (some _) => true
+            | _ => false
+          if !hasInh then
             allInhabited := false
             break
       if allInhabited then
@@ -2847,9 +2991,10 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
     let mut allWitnessed := true
     for inp in inputs do
       let inpTy := (← inferType inp).replaceFVars (inputs.extract 0 witnesses.size) witnesses
-      match ← defaultWitnessForType? inpTy with
-      | some w => witnesses := witnesses.push w
-      | none =>
+      let w? ← withBoundedHeartbeats typeCap (defaultWitnessForType? inpTy)
+      match w? with
+      | some (some w) => witnesses := witnesses.push w
+      | _ =>
         allWitnessed := false
         break
     if allWitnessed then
@@ -2865,6 +3010,11 @@ def checkRequiresSatisfiable (requiresExpr : Expr)
       return {
         satisfiable? := some true
         reason := "precondition proved satisfiable"
+      }
+    if (← budget.nextCap?).isNone then
+      return {
+        satisfiable? := none
+        reason := "precondition satisfiability undecided: probe heartbeat budget exhausted"
       }
     return {
       satisfiable? := none
