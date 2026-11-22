@@ -53,6 +53,10 @@ scripts.
   - `audit_lean_hygiene.py`: Compiled `Lean.Environment` inspector pinpointing
     `._unsafe_rec` parent definitions, `isPartial`/`isUnsafe` leaks, `sorryAx`,
     and non-standard axioms (`_native.*` / `Lean.ofReduceBool`).
+  - `replay_audit_lean.py`: Compiles any standalone `.lean` file (no Lake
+    project required) with `-DElab.async=false -Ddebug.skipKernelTC=false` and
+    runs fresh `trustLevel := 0`, `loadExts := false` `Kernel.Environment.replay`
+    plus optional namespace reachability checks.
   - `olean_profiler.py`: Ranks `.olean` sizes and per-declaration `Expr`
     DAG/tree node hotspots.
   - `farkas_cert_gen.py`: Synthesizes verified `Workbench.Pass1.LinearArith`

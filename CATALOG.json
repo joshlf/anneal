@@ -1653,6 +1653,23 @@
       ]
     },
     {
+      "name": "replay_audit_lean",
+      "path": "scripts/replay_audit_lean.py",
+      "badge": "host_script",
+      "summary": "Compiles any standalone `.lean` file and runs fresh `Kernel.Environment.replay` audit.",
+      "cli_flags": [
+        "--base-module",
+        "--json",
+        "--lean-bin",
+        "--lean-path",
+        "--module",
+        "--no-wrapper",
+        "--reach-prefix",
+        "--reach-root",
+        "--root-dir"
+      ]
+    },
+    {
       "name": "split_lean_module",
       "path": "scripts/split_lean_module.py",
       "badge": "host_script",
