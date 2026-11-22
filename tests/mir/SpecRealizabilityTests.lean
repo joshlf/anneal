@@ -3753,6 +3753,159 @@ theorem optionSomeInputPost_dichotomy :
 #eval assertEnsuresBindsOutput (Lean.mkConst ``lawlessNatOrderPost) none
   { stepHeartbeats := 0, totalHeartbeats := 0 }
 
+/-! ### 3.26 Disjunctive `requires`, Breadth-First Case/Match Splitting & Composed Budgets -/
+
+/-- Four-branch disjunctive `requires` exercising breadth-first splitting across every
+    branch without starving later disjuncts. -/
+def disj4Pre (x : Nat) : Prop :=
+  x = 0 ∨ x = 1 ∨ x = 2 ∨ x = 3
+
+/-- Under `disj4Pre` every branch falls into the constructor-exhaustive `Option` tautology;
+    outside `disj4Pre` (`x ≥ 4`) it genuinely pins `ret = some x`. -/
+def optionCtorExhaustUnderDisjReqPost (x : Nat) (ret : Option Nat) : Prop :=
+  if x < 4 then (ret = none ∨ ∃ v : Nat, ret = some v) else ret = some x
+
+/-- Input-only constraint disguised with constructor exhaustion on `Option Nat`:
+    independent of `ret`, yet neither universally valid nor unsatisfiable. -/
+def optionCtorExhaustInputOnlyPost (x : Nat) (ret : Option Nat) : Prop :=
+  x < 10 ∧ (ret = none ∨ ∃ v : Nat, ret = some v)
+
+/-- Nested `match`/`if` postcondition whose arms are arithmetic tautologies on every
+    branch of `disj4Pre`, while genuinely binding `ret` for `x ≥ 4`. -/
+def disj4NestedMatchPost (x : Nat) (ret : Option Nat) : Prop :=
+  match ret with
+  | some v => if x < 4 then v + x ≥ x else v = x
+  | none => if x < 4 then x + 1 > x else False
+
+/-- 1-argument `Option<u32>` stub sidecar for composed `MirCallContract` tests. -/
+def disj4OptionSidecar : CapturedMir :=
+  mkStubBody "test::disj4_option" 1
+    [mkLocalDecl optionU32MirTy, mkLocalDecl u32MirTy]
+    u32Layout true
+
+/-- Four-branch disjunctive `MirCallReq` precondition over a single `u32` scalar arg. -/
+def disj4MirArgsPre (args : List Value) : Prop :=
+  args = [.scalar { bits := 0, sizeBytes := 4 }] ∨
+  args = [.scalar { bits := 1, sizeBytes := 4 }] ∨
+  args = [.scalar { bits := 2, sizeBytes := 4 }] ∨
+  args = [.scalar { bits := 3, sizeBytes := 4 }]
+
+/-- Genuine `MirCallContract` composing a 4-branch disjunctive `requires`, nested `Value`
+    `match` (`Option<u32>` MIR lowering), and external-spec boilerplate atoms. -/
+def disj4NestedMatchBoilerplateGenuineContract : MirCallContract :=
+  externalSpecCallContract "test::disj4_option" disj4OptionSidecar
+    disj4MirArgsPre
+    (fun args retVal =>
+      match retVal with
+      | .aggregate 0 [] => args = [.scalar { bits := 0, sizeBytes := 4 }]
+      | .aggregate 1 [.scalar sv] =>
+        sv.sizeBytes = 4 ∧ sv.bits < scalarModulus 4 ∧
+          args = [.scalar { bits := sv.bits, sizeBytes := 4 }]
+      | _ => False)
+
+/-- Negative control: genuine multi-branch `Except` postcondition carrying unused
+    `Bool` and `Option Nat` inputs that `casesSmallSumLocals` must skip cleanly. -/
+def multiOptionInputsGenuinePost
+    (_flag : Bool) (_hint : Option Nat) (x : Nat) (ret : Except Nat Nat) : Prop :=
+  match ret with
+  | .ok v => x < 10 ∧ v = x + 1
+  | .error e => x ≥ 10 ∧ e = x
+
+theorem optionCtorExhaustUnderDisjReqPost_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy disj4Pre optionCtorExhaustUnderDisjReqPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret hPre => by
+    have hLt : x < 4 := by
+      dsimp [disj4Pre] at hPre
+      rcases hPre with rfl | rfl | rfl | rfl <;> decide
+    show if x < 4 then (ret = none ∨ ∃ v : Nat, ret = some v) else ret = some x
+    simp only [hLt, ↓reduceIte]
+    cases ret with
+    | none => exact Or.inl rfl
+    | some v => exact Or.inr ⟨v, rfl⟩)
+
+theorem optionCtorExhaustUnderDisjReqPost_dichotomy_without_pre :
+    PostconditionDichotomy anyInputPre optionCtorExhaustUnderDisjReqPost := by
+  refine ⟨4, trivial, ⟨some 4, ?_⟩, ⟨none, ?_⟩⟩ <;>
+    simp [optionCtorExhaustUnderDisjReqPost]
+
+theorem optionCtorExhaustInputOnlyPost_not_dichotomy :
+    ¬ PostconditionDichotomy anyInputPre optionCtorExhaustInputOnlyPost :=
+  not_postconditionDichotomy_of_forwardOutputInsensitive (fun _ _ _ r₂ h => by
+    refine ⟨h.1, ?_⟩
+    cases r₂ with
+    | none => exact Or.inl rfl
+    | some v => exact Or.inr ⟨v, rfl⟩)
+
+theorem disj4NestedMatchPost_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy disj4Pre disj4NestedMatchPost :=
+  not_postconditionDichotomy_of_trivial (fun x ret hPre => by
+    have hLt : x < 4 := by
+      dsimp [disj4Pre] at hPre
+      rcases hPre with rfl | rfl | rfl | rfl <;> decide
+    cases ret with
+    | none =>
+      show if x < 4 then x + 1 > x else False
+      simp only [hLt, ↓reduceIte]
+      omega
+    | some v =>
+      show if x < 4 then v + x ≥ x else v = x
+      simp only [hLt, ↓reduceIte]
+      omega)
+
+theorem disj4NestedMatchPost_dichotomy_without_pre :
+    PostconditionDichotomy anyInputPre disj4NestedMatchPost := by
+  refine ⟨4, trivial, ⟨some 4, ?_⟩, ⟨none, ?_⟩⟩ <;>
+    simp [disj4NestedMatchPost]
+
+theorem disj4NestedMatchBoilerplateGenuine_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy disj4NestedMatchBoilerplateGenuineContract := by
+  let req : MirCallReq := {
+    defPath := "test::disj4_option"
+    args := [.scalar { bits := 2, sizeBytes := 4 }]
+    memory := emptyMemory
+  }
+  refine ⟨req, emptyMemory,
+    .aggregate 1 [.scalar { bits := 2, sizeBytes := 4 }],
+    .aggregate 0 [],
+    ⟨rfl, rfl, ⟨⟨2, by decide, rfl⟩, trivial⟩, Or.inr (Or.inr (Or.inl rfl))⟩,
+    ⟨callFramePreserved_refl emptyMemory, rfl, ⟨rfl, by decide, rfl⟩⟩,
+    ?_⟩
+  rintro ⟨_, _, hArgs⟩
+  have hBits : (2 : Nat) = 0 := (scalar_bits_inj (list_singleton_inj hArgs)).1
+  exact Nat.succ_ne_zero 1 hBits
+
+theorem multiOptionInputsGenuinePost_dichotomy :
+    PostconditionDichotomy (fun _ : Bool × Option Nat × Nat => True)
+      (fun p ret => multiOptionInputsGenuinePost p.1 p.2.1 p.2.2 ret) := by
+  refine ⟨(false, none, 3), trivial, ⟨.ok 4, ⟨by decide, rfl⟩⟩, ⟨.error 3, ?_⟩⟩
+  rintro ⟨hGe, _⟩
+  exact absurd hGe (by decide)
+
+-- Breadth-first `casesSmallSumLocals` and `splitMatchGoals` handle multi-branch
+-- disjunctive `requires` and output-insensitivity goals without starving later branches.
+#eval assertEnsuresVacuous (Lean.mkConst ``optionCtorExhaustUnderDisjReqPost)
+  (some (Lean.mkConst ``disj4Pre)) (some .survivedAllMutants)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``optionCtorExhaustUnderDisjReqPost)
+#eval assertEnsuresVacuous (Lean.mkConst ``optionCtorExhaustInputOnlyPost) none
+  (some .unboundReturnOutput)
+#eval assertEnsuresVacuous (Lean.mkConst ``disj4NestedMatchPost)
+  (some (Lean.mkConst ``disj4Pre)) (some .survivedAllMutants)
+#eval assertEnsuresBindsOutput (Lean.mkConst ``disj4NestedMatchPost)
+
+-- Composed nested `match` + disjunctive `requires` + boilerplate `MirCallContract`
+-- passes under default and strict modes and degrades conservatively under a tight budget.
+#eval assertDeclEnsuresBindsOutput ``disj4NestedMatchBoilerplateGenuineContract
+#eval assertDeclEnsuresBindsOutput ``disj4NestedMatchBoilerplateGenuineContract
+  { strictReturnValue := true }
+#eval show Lean.Meta.MetaM Unit from do
+  let res ← checkDeclEnsuresBindsOutput ``disj4NestedMatchBoilerplateGenuineContract
+    { stepHeartbeats := 1, totalHeartbeats := 1 }
+  unless res.bindsOutput && !res.notes.isEmpty do
+    throwError "expected tight-budget composed MirCallContract accepted with degradation note, got {repr res}"
+
+-- Genuine multi-branch `Except` with unused small-sum inputs is never false-flagged.
+#eval assertEnsuresBindsOutput (Lean.mkConst ``multiOptionInputsGenuinePost)
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/

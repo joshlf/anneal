@@ -1444,7 +1444,7 @@ private def tryTacticSnippetOutcome
         return false
       let proof ← instantiateMVars mvar
       let hasErrs := (← getThe Core.State).messages.hasErrors
-      if hasErrs || proof.hasSorry || proof.hasExprMVar then
+      if hasErrs || proof.hasSorry || proof.hasExprMVar || proof.hasLevelMVar then
         return false
       Meta.check proof
       let proofTy ← inferType proof
@@ -1473,15 +1473,18 @@ private def proverSnippets : MetaM (Array (TSyntax `tactic)) := do
   let tac3 ← `(tactic| grind)
   return #[tac1, tac2, tac3]
 
-/-- Fuel-bounded case-splitting of `match` / `ite` expressions in the goal target or in
-    `Prop`-typed local hypotheses, capping total open subgoals at `maxGoals` and rolling
-    back any split that would exceed the cap. Returns the resulting goals and whether at
-    least one split occurred. -/
+/-- Fuel-bounded breadth-first case-splitting of `match` / `ite` expressions in the goal
+    target or in `Prop`-typed local hypotheses, capping total open subgoals at `maxGoals`
+    and actual splits at `splitsLeft` (without charging `splitsLeft` for already-finished
+    leaves, so earlier disjunctive `requires` branches never starve later ones), rolling
+    back any split that would exceed `maxGoals`. Returns the resulting goals and whether
+    at least one split occurred. -/
 private def splitMatchGoals (maxGoals : Nat) :
-    Nat → List MVarId → List MVarId → MetaM (List MVarId × Bool)
-  | 0, pending, done => return (done ++ pending, false)
-  | _, [], done => return (done, false)
-  | fuel + 1, mid :: rest, done => do
+    Nat → Nat → List MVarId → List MVarId → MetaM (List MVarId × Bool)
+  | 0, _, pending, done => return (done ++ pending, false)
+  | _, 0, pending, done => return (done ++ pending, false)
+  | _, _, [], done => return (done, false)
+  | iterFuel + 1, splitsLeft + 1, mid :: rest, done => do
     if done.length + rest.length + 1 >= maxGoals then
       return (done ++ (mid :: rest), false)
     let maxSgs := maxGoals - (done.length + rest.length)
@@ -1514,14 +1517,16 @@ private def splitMatchGoals (maxGoals : Nat) :
           return found?
     match splitRes? with
     | some sgs =>
-      let (finalGoals, _) ← splitMatchGoals maxGoals fuel (sgs ++ rest) done
+      let (finalGoals, _) ←
+        splitMatchGoals maxGoals iterFuel splitsLeft (rest ++ sgs) done
       return (finalGoals, true)
     | none =>
-      let (finalGoals, didAny) ← splitMatchGoals maxGoals fuel rest (mid :: done)
+      let (finalGoals, didAny) ←
+        splitMatchGoals maxGoals iterFuel (splitsLeft + 1) rest (mid :: done)
       return (finalGoals, didAny)
 
-/-- Whether `ty` is, up to `whnf`, a non-recursive, non-nested, non-indexed inductive
-    datatype with two to four constructors (`Option`, `Except`, `Sum`, `Bool`,
+/-- Whether `ty` is, up to `whnf`, a non-recursive, non-mutual, non-nested, non-indexed
+    inductive datatype with two to four constructors (`Option`, `Except`, `Sum`, `Bool`,
     `Ordering`, or a user `Result`-like type): a type whose values a single `cases`
     step exhausts. Propositions are excluded, since `destructHypsMulti` owns
     hypotheses. -/
@@ -1534,66 +1539,97 @@ private def isSmallSumType (ty : Expr) : MetaM Bool := do
     match (← getEnv).find? name with
     | some (.inductInfo iv) =>
       return !iv.isRec && iv.numNested == 0 && iv.numIndices == 0 &&
-        Nat.ble 2 iv.ctors.length && Nat.ble iv.ctors.length 4
+        iv.all.length == 1 && Nat.ble 2 iv.ctors.length && Nat.ble iv.ctors.length 4
     | _ => return false
   | _ => return false
 
-/-- Bounded data case analysis for the fallback prover: repeatedly `cases` on the most
-    recently introduced local variable whose type `isSmallSumType` (outputs and their
-    primed copies are introduced last), keeping at most `maxGoals` goals open and
-    rolling back any step that would exceed the cap. Returns the resulting goals and
-    whether at least one `cases` step happened.
+/-- Bounded breadth-first data case analysis for the fallback prover: repeatedly `cases`
+    on the most recently introduced relevant local variable whose type `isSmallSumType`
+    (outputs and their primed copies are introduced last), skipping `let`-declarations,
+    typeclass instances, and variables that occur nowhere in the goal or hypotheses.
+    Tracks per-goal `tried` guards so a candidate that fails `cases` or exceeds `maxSgs`
+    falls through to earlier small-sum locals, caps open subgoals at `maxGoals` and
+    actual `cases` steps at `splitsLeft` (without charging `splitsLeft` for finished
+    goals), and queues subgoals breadth-first so disjunctive `requires` branches and
+    output-insensitivity goals split evenly.
 
     A postcondition can be a tautology only up to the constructors of its output
     (`ret = none ∨ ∃ v, ret = some v`, `ret.isSome ∨ ret.isNone`) without containing
     any `match` for `splitMatchGoals` to split. Exhausting the constructors reduces
     such a goal to leaves the deterministic closers decide. -/
 private def casesSmallSumLocals (maxGoals : Nat) :
-    Nat → List MVarId → List MVarId → MetaM (List MVarId × Bool)
-  | 0, pending, done => return (done ++ pending, false)
-  | _, [], done => return (done, false)
-  | fuel + 1, mid :: rest, done => do
+    Nat → Nat → List (MVarId × Array FVarId) → List MVarId → MetaM (List MVarId × Bool)
+  | 0, _, pending, done => return (done ++ pending.map Prod.fst, false)
+  | _, 0, pending, done => return (done ++ pending.map Prod.fst, false)
+  | _, _, [], done => return (done, false)
+  | iterFuel + 1, splitsLeft + 1, (mid, tried) :: rest, done => do
+    if done.length + rest.length + 1 >= maxGoals then
+      return (done ++ ((mid, tried) :: rest).map Prod.fst, false)
     let maxSgs := maxGoals - (done.length + rest.length)
     let cand? : Option FVarId ← mid.withContext do
       let lctx ← getLCtx
+      let tgt ← instantiateMVars (← mid.getType)
       let mut found? : Option FVarId := none
       for decl in lctx do
-        if decl.isImplementationDetail then continue
+        if decl.isImplementationDetail || decl.isLet (allowNondep := true) ||
+            decl.binderInfo == .instImplicit || tried.contains decl.fvarId then
+          continue
+        let mut occurs := tgt.containsFVar decl.fvarId
+        if !occurs then
+          for other in lctx do
+            if other.isImplementationDetail || other.fvarId == decl.fvarId then continue
+            if (← instantiateMVars other.type).containsFVar decl.fvarId then
+              occurs := true
+              break
+            if let some val := other.value? (allowNondep := true) then
+              if (← instantiateMVars val).containsFVar decl.fvarId then
+                occurs := true
+                break
+        if !occurs then
+          continue
         let ty ← instantiateMVars decl.type
         if ← isSmallSumType ty then
           found? := some decl.fvarId
       return found?
-    let casesRes? : Option (List MVarId) ←
-      match cand? with
-      | none => pure none
-      | some fvarId =>
-        commitWhenSome? do
-          let r? ← try (some <$> mid.cases fvarId) catch _ => pure none
-          match r? with
-          | some sgs =>
-            if Nat.ble sgs.size maxSgs then
-              return some (sgs.toList.map (fun sg => sg.mvarId))
-            else
-              return none
-          | none => return none
-    match casesRes? with
-    | some sgs =>
-      let (finalGoals, _) ← casesSmallSumLocals maxGoals fuel (sgs ++ rest) done
-      return (finalGoals, true)
+    match cand? with
     | none =>
-      let (finalGoals, didAny) ← casesSmallSumLocals maxGoals fuel rest (mid :: done)
+      let (finalGoals, didAny) ←
+        casesSmallSumLocals maxGoals iterFuel (splitsLeft + 1) rest (mid :: done)
       return (finalGoals, didAny)
+    | some fvarId =>
+      let casesRes? : Option (List MVarId) ← commitWhenSome? do
+        let r? ← try (some <$> mid.cases fvarId) catch _ => pure none
+        match r? with
+        | some sgs =>
+          if Nat.ble sgs.size maxSgs then
+            return some (sgs.toList.map (fun sg => sg.mvarId))
+          else
+            return none
+        | none => return none
+      match casesRes? with
+      | some sgs =>
+        let nextGoals := sgs.map (fun sg => (sg, tried))
+        let (finalGoals, _) ←
+          casesSmallSumLocals maxGoals iterFuel splitsLeft (rest ++ nextGoals) done
+        return (finalGoals, true)
+      | none =>
+        let (finalGoals, didAny) ←
+          casesSmallSumLocals maxGoals iterFuel (splitsLeft + 1)
+            ((mid, tried.push fvarId) :: rest) done
+        return (finalGoals, didAny)
 
 /-- Bounded fallback prover for goals containing `match` / `ite` expressions (such as
     nested `match` over `Value.scalar` / `Value.aggregate` for `Option<u32>` MIR lowering)
     that `proverSnippets` did not close directly: splits up to 12 `match`/`ite` nodes
     capped at 16 open subgoals, unpacks newly exposed hypotheses on each leaf, closes
-    each leaf with `simp_all` + deterministic closers, and `Meta.check`s the resulting
-    proof term. Exits immediately without re-running tactics when no split applies.
+    each leaf with `simp_all` + deterministic closers, and `Meta.check`s + kernel-checks
+    the resulting proof term. Exits immediately without re-running tactics when no split
+    applies.
 
-    With `dataCases := true` it instead first exhausts the constructors of up to three
-    small sum-typed local variables (`casesSmallSumLocals`), exiting immediately when
-    there is none, and then splits and closes the resulting goals the same way. -/
+    With `dataCases := true` it instead first exhausts the constructors of relevant
+    small sum-typed local variables (`casesSmallSumLocals`, capped at 12 `cases` steps
+    and 16 open subgoals), exiting immediately when there is none, and then splits and
+    closes the resulting goals the same way. -/
 private def trySplitAndProveOutcome
     (goalTy : Expr) (stepCapInternal : Nat) (dataCases : Bool := false) :
     MetaM ProbeOutcome := do
@@ -1610,10 +1646,13 @@ private def trySplitAndProveOutcome
       let mvarId ← introsUnfoldingNot 8 mvar.mvarId!
       let goals ← destructHypsMulti 8 128 [(mvarId, #[])] []
       let (casedGoals, didCases) ←
-        if dataCases then casesSmallSumLocals 16 3 goals [] else pure (goals, false)
+        if dataCases then
+          casesSmallSumLocals 16 64 12 (goals.map (fun g => (g, #[]))) []
+        else
+          pure (goals, false)
       if dataCases && !didCases then
         return false
-      let (splitGoals, didSplit) ← splitMatchGoals 16 12 casedGoals []
+      let (splitGoals, didSplit) ← splitMatchGoals 16 64 12 casedGoals []
       if !dataCases && !didSplit then
         return false
       let closeTac ←
@@ -1632,7 +1671,7 @@ private def trySplitAndProveOutcome
         return false
       let proof ← instantiateMVars mvar
       let hasErrs := (← getThe Core.State).messages.hasErrors
-      if hasErrs || proof.hasSorry || proof.hasExprMVar then
+      if hasErrs || proof.hasSorry || proof.hasExprMVar || proof.hasLevelMVar then
         return false
       Meta.check proof
       let proofTy ← inferType proof
@@ -2261,20 +2300,22 @@ def detectSyntacticContradiction : Nat → Expr → Bool
       let args := e.getAppArgs
       let cond := args[1]!
       let tContra := detectSyntacticContradiction fuel args[3]!
-      let fContra := detectSyntacticContradiction fuel args[4]!
-      (tContra && fContra) ||
-        (fContra && detectSyntacticContradiction fuel cond) ||
-        (tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond))
+      if tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond) then
+        true
+      else
+        let fContra := detectSyntacticContradiction fuel args[4]!
+        (tContra && fContra) || (fContra && detectSyntacticContradiction fuel cond)
     else if e.isAppOfArity ``dite 5 then
       let args := e.getAppArgs
       let cond := args[1]!
       match args[3]!.consumeMData, args[4]!.consumeMData with
       | .lam _ _ tBody _, .lam _ _ fBody _ =>
         let tContra := detectSyntacticContradiction fuel tBody
-        let fContra := detectSyntacticContradiction fuel fBody
-        (tContra && fContra) ||
-          (fContra && detectSyntacticContradiction fuel cond) ||
-          (tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond))
+        if tContra && detectSyntacticContradiction fuel (mkApp (mkConst ``Not) cond) then
+          true
+        else
+          let fContra := detectSyntacticContradiction fuel fBody
+          (tContra && fContra) || (fContra && detectSyntacticContradiction fuel cond)
       | _, _ => false
     else if e.isAppOfArity ``Exists 2 then
       match e.appArg!.consumeMData with
@@ -2684,6 +2725,34 @@ private def instantiateExistsWitness (pick : Nat) : Nat → Expr → MetaM (Expr
                     return (rebuilt, true)
         return (e, false)
 
+/-- Budget-aware wrapper around `instantiateExistsWitness` for candidate picks `0, 1, 2`.
+    Returns `#[]` immediately once `budget` is exhausted and isolates each candidate's
+    `withBoundedHeartbeatsOutcome` cap and `Core.State.messages` so existential
+    instantiation inside nested `match` expressions never runs unbounded across
+    boilerplate fibres. -/
+private def boundedInstantiateWitnesses
+    (budget : ProbeBudget) (cutOffRef? : Option (IO.Ref Bool)) (e : Expr) :
+    MetaM (Array Expr) := do
+  let mut goals : Array Expr := #[]
+  for pick in [0, 1, 2] do
+    match ← budget.nextCap? with
+    | none => break
+    | some cap =>
+      let subCap := min cap closedNatSubtermHeartbeats
+      let savedMsgs := (← getThe Core.State).messages
+      let outcome ← withBoundedHeartbeatsOutcome subCap (instantiateExistsWitness pick 32 e)
+      modifyThe Core.State fun s => { s with messages := savedMsgs }
+      match outcome with
+      | .done (strengthened, changed) =>
+        if changed && !goals.contains strengthened then
+          goals := goals.push strengthened
+      | .failed => pure ()
+      | .cutOff =>
+        if let some ref := cutOffRef? then
+          ref.set true
+        break
+  return goals
+
 /-- Extend the hypothesis list `hyps` with `h`, also recording the conjuncts of a
     conjunctive hypothesis so `P ∧ Q → P` is recognized. -/
 private def assumeHyp (h : Expr) (hyps : List Expr) : List Expr :=
@@ -2770,17 +2839,17 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       -- there (`if False then ret = 5 else True`) binds nothing: the `then` branch is
       -- dead when `c` is contradictory (alone or against `hyps`), the `else` branch
       -- when `c` is tautological under `hyps`.
-      let thenDead :=
-        detectSyntacticContradiction fuel cond || hasComplementaryPair (assumeHyp cond hyps)
-      let elseDead := (detectSyntacticTautology fuel hyps cond).isSome
-      let thenOk := thenDead ||
-        (detectSyntacticTautology fuel (assumeHyp cond hyps) tBranch).isSome
-      let elseOk := elseDead ||
-        (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome
-      if thenOk && elseOk then
-        some .tautologicalImplication
-      else
+      let thenHyps := assumeHyp cond hyps
+      let thenOk :=
+        detectSyntacticContradiction fuel cond || hasComplementaryPair thenHyps ||
+          (detectSyntacticTautology fuel thenHyps tBranch).isSome
+      if !thenOk then
         none
+      else
+        let elseOk :=
+          (detectSyntacticTautology fuel hyps cond).isSome ||
+            (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps) fBranch).isSome
+        if elseOk then some .tautologicalImplication else none
     else if e.isAppOfArity ``dite 5 then
       let args := e.getAppArgs
       let cond := args[1]!.consumeMData
@@ -2788,21 +2857,20 @@ def detectSyntacticTautology : Nat → List Expr → Expr → Option EnsuresVacu
       | .lam _ _ tBody _, .lam _ _ fBody _ =>
         -- As for `ite`. A dead branch is never inspected, so it may freely mention
         -- its guard proof; a live branch must not (`hasLooseBVar 0`).
-        let thenDead :=
-          detectSyntacticContradiction fuel cond || hasComplementaryPair (assumeHyp cond hyps)
-        let elseDead := (detectSyntacticTautology fuel hyps cond).isSome
-        let thenOk := thenDead ||
-          (!tBody.hasLooseBVar 0 &&
-            (detectSyntacticTautology fuel (assumeHyp cond hyps)
-              (tBody.lowerLooseBVars 1 1)).isSome)
-        let elseOk := elseDead ||
-          (!fBody.hasLooseBVar 0 &&
-            (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps)
-              (fBody.lowerLooseBVars 1 1)).isSome)
-        if thenOk && elseOk then
-          some .tautologicalImplication
-        else
+        let thenHyps := assumeHyp cond hyps
+        let thenOk :=
+          detectSyntacticContradiction fuel cond || hasComplementaryPair thenHyps ||
+            (!tBody.hasLooseBVar 0 &&
+              (detectSyntacticTautology fuel thenHyps (tBody.lowerLooseBVars 1 1)).isSome)
+        if !thenOk then
           none
+        else
+          let elseOk :=
+            (detectSyntacticTautology fuel hyps cond).isSome ||
+              (!fBody.hasLooseBVar 0 &&
+                (detectSyntacticTautology fuel (mkApp (mkConst ``Not) cond :: hyps)
+                  (fBody.lowerLooseBVars 1 1)).isSome)
+          if elseOk then some .tautologicalImplication else none
       | _, _ => none
     else if e.isAppOfArity ``Not 1 then
       let inner := e.appArg!.consumeMData
@@ -3951,11 +4019,7 @@ private def analyzeNormalizedSpec
           if ← proveClosed res then
             return .tautological .tautologicalByProver
           return .insensitive
-        let mut fibreWitnessGoals : Array Expr := #[]
-        for pick in [0, 1, 2] do
-          let (strengthened, changed) ← instantiateExistsWitness pick 32 res
-          if changed && !fibreWitnessGoals.contains strengthened then
-            fibreWitnessGoals := fibreWitnessGoals.push strengthened
+        let fibreWitnessGoals ← boundedInstantiateWitnesses budget cutOffOpt res
         for goal in fibreWitnessGoals do
           if ← proveFibreInsensitiveVia fibreAssump res goal then
             if ← proveFibreContra fibreAssump res then
@@ -3990,6 +4054,8 @@ private def analyzeNormalizedSpec
       let mut anyUnderRequires := false
       let mut firstTautReason? : Option EnsuresVacuityReason := none
       let mut phase3BudgetExhausted := false
+      let mut phase3CofactorAborted := false
+      let phase3CofactorStart ← IO.getNumHeartbeats
       for mask in [:numMasks] do
         let mut maskFeasible := true
         for i in [:atoms.size] do
@@ -4001,16 +4067,55 @@ private def analyzeNormalizedSpec
           continue
         feasibleMasks := feasibleMasks + 1
         let fibreAssump := mkFibreAssumption expandedAtoms mask
-        let rawRes ← cofactorBoilerplate 64 atoms mask workBody
-        -- Even once the prover heartbeat budget is exhausted, pure boilerplate
-        -- cofactoring and syntactic fibre checks (`False`, `True`, `!mentionsOutput`,
-        -- `detectSyntacticTautology`) still run at zero heartbeat cost while every
-        -- semantic probe degrades conservatively to `false`.
+        -- Bound `cofactorBoilerplate` so nested `match` expressions composed with up to
+        -- `2^8 = 256` boilerplate masks cannot exhaust the enclosing command's heartbeats.
+        -- Once `budget` is spent, pure syntactic cofactoring retains a bounded structural
+        -- floor (`closedNatFoldHeartbeats` total across remaining masks) so starved-budget
+        -- syntactic checks still succeed while pathological masks degrade conservatively.
+        let mut cofactorCap? : Option Nat := none
+        match ← budget.nextCap? with
+        | some remCap =>
+          cofactorCap? := some (min remCap closedNatFoldHeartbeats)
+        | none =>
+          phase3BudgetExhausted := true
+          probeCutOffRef.set true
+          let now ← IO.getNumHeartbeats
+          let used := now - phase3CofactorStart
+          if used < closedNatFoldHeartbeats then
+            cofactorCap? := some (min (closedNatFoldHeartbeats - used) closedNatSubtermHeartbeats)
+        let mut rawRes := workBody
+        match cofactorCap? with
+        | none =>
+          phase3CofactorAborted := true
+          fibreGenuine := true
+          break
+        | some cofactorCap =>
+          let savedCofMsgs := (← getThe Core.State).messages
+          let cofactorOutcome ← withBoundedHeartbeatsOutcome cofactorCap
+            (cofactorBoilerplate 64 atoms mask workBody)
+          modifyThe Core.State fun s => { s with messages := savedCofMsgs }
+          match cofactorOutcome with
+          | .done r => rawRes := r
+          | .failed => pure ()
+          | .cutOff =>
+            phase3BudgetExhausted := true
+            phase3CofactorAborted := true
+            probeCutOffRef.set true
+            fibreGenuine := true
+            break
         let mut res := eliminateOnePointExists 16 rawRes
         match ← budget.nextCap? with
         | some remCap =>
-          let unfolded? ← withBoundedHeartbeats remCap (unfoldUserConnectives 8 rawRes)
-          res := eliminateOnePointExists 16 (unfolded?.getD rawRes)
+          let savedUnfMsgs := (← getThe Core.State).messages
+          let unfoldedOutcome ← withBoundedHeartbeatsOutcome
+            (min remCap closedNatFoldHeartbeats) (unfoldUserConnectives 8 rawRes)
+          modifyThe Core.State fun s => { s with messages := savedUnfMsgs }
+          match unfoldedOutcome with
+          | .done unfolded => res := eliminateOnePointExists 16 unfolded
+          | .failed => pure ()
+          | .cutOff =>
+            phase3BudgetExhausted := true
+            probeCutOffRef.set true
         | none =>
           phase3BudgetExhausted := true
           probeCutOffRef.set true
@@ -4030,6 +4135,9 @@ private def analyzeNormalizedSpec
           fibreGenuine := true
         -- One genuine fibre settles Phase 3; skip the remaining fibres.
         if fibreGenuine then break
+      if phase3CofactorAborted then
+        notes := notes ++
+          ["boilerplate cofactoring exceeded heartbeat/recursion cap; skipped remaining fibres conservatively"]
       if !fibreGenuine then
         if phase3BudgetExhausted then
           notes := notes ++
@@ -4050,15 +4158,6 @@ private def analyzeNormalizedSpec
         return .vacuous .boilerplateOnlyMasking
           (notes ++ ["normal-return postcondition constrains only boilerplate atoms"])
 
-  -- Existential witness instantiation. Every goal in `witnessGoals` implies `workBody`
-  -- (`instantiateExistsWitness`), so proving one of them establishes `workBody` even
-  -- when the bounded prover cannot synthesize the witness itself (`∃ k, ret ≤ k`).
-  let mut witnessGoals : Array Expr := #[]
-  for pick in [0, 1, 2] do
-    let (strengthened, changed) ← instantiateExistsWitness pick 32 workBody
-    if changed && !witnessGoals.contains strengthened then
-      witnessGoals := witnessGoals.push strengthened
-
   -- Phase 4: Syntactic tautology & global prover checks (without `requires`).
   if let some tautReason := detectSyntacticTautology 32 [] workBody then
     return .vacuous tautReason (notes ++ ["detected syntactic tautology"])
@@ -4070,6 +4169,12 @@ private def analyzeNormalizedSpec
   if ← proveClosed workBody then
     return .vacuous .tautologicalByProver
       (notes ++ ["ensures proved universally valid independent of requires"])
+
+  -- Existential witness instantiation. Every goal in `witnessGoals` implies `workBody`
+  -- (`instantiateExistsWitness`), so proving one of them establishes `workBody` even
+  -- when the bounded prover cannot synthesize the witness itself (`∃ k, ret ≤ k`).
+  -- Runs after syntactic checks and under `budget` so starved checks do no wasted work.
+  let witnessGoals ← boundedInstantiateWitnesses budget cutOffOpt workBody
 
   for goal in witnessGoals do
     if ← proveClosed goal then

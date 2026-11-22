@@ -2188,6 +2188,37 @@ where
     (accepted, rejected)
 }
 
+/// Minimum number of deterministic PRNG probe inputs drawn beyond the input
+/// type's `BOUNDARY_COUNT` whenever the caller's trial budget allows.
+const MIN_PROBE_PRNG_DRAWS: usize = 16;
+
+/// Upper cap on the number of sampled inputs evaluated by a vacuity
+/// classification probe so very large `max_trials` budgets do not turn failure
+/// classification into an unbounded scan.
+const MAX_PROBE_INPUTS: usize = 256;
+
+/// Scales a vacuity-classification probe's input budget deterministically with
+/// both `boundary_count` and `max_trials`:
+///
+/// - Never exceeds `max_trials`, so shrinking `max_trials` to bound callback
+///   cost also bounds classification probes.
+/// - Covers the entire boundary corpus plus at least [`MIN_PROBE_PRNG_DRAWS`]
+///   PRNG draws whenever `max_trials` and [`MAX_PROBE_INPUTS`] permit, so
+///   3-tuple, 4-tuple, and compound stateful inputs whose `BOUNDARY_COUNT >= 64`
+///   neither truncate their boundary corpus nor draw zero PRNG samples.
+/// - Scales smoothly with larger `max_trials` (`max_trials / 4`) up to
+///   [`MAX_PROBE_INPUTS`].
+const fn probe_input_budget(boundary_count: usize, max_trials: usize) -> usize {
+    let target = max_usize(
+        64,
+        max_usize(
+            boundary_count.saturating_add(MIN_PROBE_PRNG_DRAWS),
+            max_trials / 4,
+        ),
+    );
+    min_usize(max_trials, min_usize(target, MAX_PROBE_INPUTS))
+}
+
 /// Runs the deterministic classification probe once
 /// `mutants_tested > 0 && mutants_killed == 0` on a non-subsingleton return.
 ///
@@ -2213,11 +2244,7 @@ where
     }
 
     let mut probe_rng = SplitMix64::new(config.seed ^ 0xA5A5_5A5A_C3C3_3C3C);
-    let probe_input_count = if I::BOUNDARY_COUNT > 64 {
-        min_usize(I::BOUNDARY_COUNT, 128)
-    } else {
-        64
-    };
+    let probe_input_count = probe_input_budget(I::BOUNDARY_COUNT, config.max_trials);
 
     let mut evidence = ProbeEvidence::default();
     let mut rejected_witness: Option<(I, bool)> = None;
@@ -2728,7 +2755,9 @@ where
     let mut rejected_witnesses: [Option<(S, A, S, bool)>; 6] = [None, None, None, None, None, None];
     let mut accepted_witnesses: [Option<(S, A, S, bool)>; 2] = [None, None];
 
-    for idx in 0..64 {
+    let probe_input_count =
+        probe_input_budget(<(S, A) as SampleInput>::BOUNDARY_COUNT, config.max_trials);
+    for idx in 0..probe_input_count {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
         let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
             continue;
@@ -2870,7 +2899,9 @@ where
     let mut rejected_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
     let mut accepted_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
 
-    for idx in 0..64 {
+    let probe_input_count =
+        probe_input_budget(<(S, A) as SampleInput>::BOUNDARY_COUNT, config.max_trials);
+    for idx in 0..probe_input_count {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
         let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
             continue;
@@ -3114,7 +3145,9 @@ where
     evidence.record_input(true, accepted, rejected);
 
     if !evidence.saw_output_sensitivity {
-        for idx in 0..64 {
+        let probe_input_count =
+            probe_input_budget(<(S, A) as SampleInput>::BOUNDARY_COUNT, config.max_trials);
+        for idx in 0..probe_input_count {
             let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
             let Some(admissible) = probe_admission(config.probe_domain, pre(&old_s, &args)) else {
                 evidence.skipped_out_of_precondition += 1;

@@ -5325,3 +5325,207 @@ fn constructor_exhaustive_tautologies_are_trivial_postconditions() {
     );
     assert!(genuine.is_pointwise_strong());
 }
+
+// ---------------------------------------------------------------------------
+// Deterministic trial-budget scaling & disjunctive-requires Option exhaustion
+// (dynamic counterparts of Lean `SpecRealizabilityTests` section 3.26)
+// ---------------------------------------------------------------------------
+
+#[spec(
+    requires: x == 0 || x == 1 || x == 2 || x == 3,
+    ensures: |ret| if x < 4 { ret.is_some() || ret.is_none() } else { ret == Some(x) },
+)]
+fn option_ctor_exhaust_under_disj_req_fn(x: u32) -> Option<u32> {
+    Some(x)
+}
+
+#[spec(
+    requires: x < 10,
+    ensures: |ret| x < 10 && (ret.is_some() || ret.is_none()),
+)]
+fn option_ctor_exhaust_input_only_fn(x: u32) -> Option<u32> {
+    Some(x)
+}
+
+#[test]
+fn disjunctive_requires_and_input_only_option_ctor_exhaustion() {
+    // Under its 4-branch disjunctive `requires`, every admissible input enters
+    // the constructor-exhaustive tautology, while outside `requires` (`x >= 4`)
+    // `ret == Some(x)` is output-sensitive (`SurvivedAllMutants`).
+    let masked = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| __anodized_fn_requires_option_ctor_exhaust_under_disj_req_fn(x),
+        |&x| option_ctor_exhaust_under_disj_req_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_ctor_exhaust_under_disj_req_fn(x, r),
+    );
+    assert_eq!(
+        masked.vacuity_class(),
+        Some(VacuityClass::SurvivedAllMutants)
+    );
+    assert!(matches!(
+        masked.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            saw_any_false: true,
+            saw_output_sensitivity: true,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+
+    // Negative control: without the masking `requires`, `x >= 4` genuinely binds `ret`.
+    let unmasked = assert_contract_strong(
+        SpecCheckConfig::default(),
+        |_x: &u32| true,
+        |&x| option_ctor_exhaust_under_disj_req_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_ctor_exhaust_under_disj_req_fn(x, r),
+    );
+    assert!(unmasked.hits_with_kill > 0);
+    assert!(unmasked.hits_without_kill() > 0);
+
+    // Input-only condition conjoined with constructor exhaustion is `UnboundReturnOutput`.
+    let input_only = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| __anodized_fn_requires_option_ctor_exhaust_input_only_fn(x),
+        |&x| option_ctor_exhaust_input_only_fn(x),
+        |&x, &r| __anodized_fn_ensures_option_ctor_exhaust_input_only_fn(x, r),
+    );
+    assert_eq!(
+        input_only.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        input_only.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            saw_any_false: true,
+            saw_output_sensitivity: false,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+}
+
+#[test]
+fn probe_input_budget_scales_deterministically_across_trial_budgets_and_arities() {
+    // 1. Shrinking `max_trials` also bounds vacuity-classification probes instead
+    //    of running a fixed 64..=128 probe scan.
+    let tight_stateless = check_contract(
+        SpecCheckConfig::default().with_max_trials(8),
+        |_x: &u32| true,
+        |&x| x,
+        |_x, _r: &u32| true,
+    );
+    assert_eq!(
+        tight_stateless.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        tight_stateless.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs: 9,
+            ..
+        })
+    ));
+
+    let tight_stateful = check_stateful_contract(
+        SpecCheckConfig::default().with_max_trials(12),
+        |_s: &Counter, _a: &(u32, u32)| true,
+        |s: &mut Counter, _a: &(u32, u32)| s.value,
+        |_old: &Counter, _a: &(u32, u32), _new: &Counter, _ret: &u32| true,
+    );
+    assert_eq!(
+        tight_stateful.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        tight_stateful.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs: 13,
+            ..
+        })
+    ));
+
+    // 2. Compound 3-tuple (`BOUNDARY_COUNT == 79 > 64`): the classification probe
+    //    covers the full boundary corpus plus deterministic PRNG draws, exposing
+    //    an input-only predicate that holds on all 79 boundary triples.
+    fn is_u32_key4(v: u32) -> bool {
+        matches!(v, 0 | 1 | 0x7F | u32::MAX)
+    }
+    fn on_triple_boundary(&(a, b, c): &(u32, u32, u32)) -> bool {
+        (a == b && b == c) || (is_u32_key4(a) && is_u32_key4(b) && is_u32_key4(c))
+    }
+    let triple_boundary_count = <(u32, u32, u32) as SampleInput>::BOUNDARY_COUNT;
+    assert_eq!(triple_boundary_count, 79);
+
+    let triple_input_only = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        on_triple_boundary,
+        |&(a, _, _)| a,
+        |x, _r: &u32| on_triple_boundary(x),
+    );
+    assert_eq!(
+        triple_input_only.vacuity_class(),
+        Some(VacuityClass::UnboundReturnOutput)
+    );
+    assert!(matches!(
+        triple_input_only.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            out_of_precondition_probes,
+            saw_any_false: true,
+            saw_output_sensitivity: false,
+            ..
+        }) if probed_inputs > triple_boundary_count && out_of_precondition_probes > 0
+    ));
+
+    // 3. Compound stateful `(Counter, (u32, u32))` (`BOUNDARY_COUNT == 87 > 64`):
+    //    stateful classification probes cover the full boundary corpus plus PRNG
+    //    draws instead of truncating at 64.
+    let stateful_boundary_count = <(Counter, (u32, u32)) as SampleInput>::BOUNDARY_COUNT;
+    assert_eq!(stateful_boundary_count, 87);
+    let stateful_full = check_stateful_contract(
+        SpecCheckConfig::default(),
+        |_s: &Counter, _a: &(u32, u32)| true,
+        |s: &mut Counter, _a: &(u32, u32)| s.value,
+        |_old: &Counter, _a: &(u32, u32), _new: &Counter, _ret: &u32| true,
+    );
+    assert_eq!(
+        stateful_full.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        stateful_full.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs,
+            ..
+        }) if probed_inputs > stateful_boundary_count
+    ));
+
+    // 4. Widening `max_trials` scales the probe deterministically up to the 256-input
+    //    cap without turning large trial counts into an unbounded probe scan.
+    let wide_1024 = check_contract(
+        SpecCheckConfig::default().with_max_trials(1024),
+        |_x: &u32| true,
+        |&x| x,
+        |_x, _r: &u32| true,
+    );
+    let wide_2048 = check_contract(
+        SpecCheckConfig::default().with_max_trials(2048),
+        |_x: &u32| true,
+        |&x| x,
+        |_x, _r: &u32| true,
+    );
+    assert!(matches!(
+        wide_1024.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs: 257,
+            ..
+        })
+    ));
+    assert!(matches!(
+        wide_2048.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs: 257,
+            ..
+        })
+    ));
+}
