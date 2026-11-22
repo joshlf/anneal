@@ -3027,13 +3027,16 @@ Vtable metadata (`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer`
 and `UnOp::VTableMethodLookup` read the machine's vtables
 (`Machine::vtable_from_ptr` in the `GetMetadata` sanity check,
 `Machine::vtable_lookup` in the other three operators) and its `fn_ptrs`.
-With a machine (`m = some mach`) they are interpreted as upstream. Without
-one (`m = none`) they fail closed with `unsupported`: `GetMetadata` before its
-sanity check (which is the same `check_value` call in both branches of the
-match on the metadata kind), so that the result does not depend on the
-address of the vtable pointer, `ComputeSize` and `ComputeAlign` at the vtable
-lookup of `LayoutStrategy::compute_size_and_align`, and `VTableMethodLookup`
-after the operand shape check. -/
+With a machine (`m = some mach`) they are interpreted as upstream; in
+`GetMetadata` on vtable metadata, upstream's `.expect(..)` catches UB from
+`check_value` while letting an internal spec panic (such as a missing
+`prog.vtables` entry) propagate directly. Without a machine (`m = none`) they
+fail closed with `unsupported`: `GetMetadata` before its sanity check (which is
+the same `check_value` call in both branches of the match on the metadata kind),
+so that the result does not depend on the address of the vtable pointer,
+`ComputeSize` and `ComputeAlign` at the vtable lookup of
+`LayoutStrategy::compute_size_and_align`, and `VTableMethodLookup` after the
+operand shape check. -/
 def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
     Interp (Val × «Type») :=
   match op, arg with
@@ -3059,7 +3062,8 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
         let metaTy := PointerMetaKind.ty metaKind
         match checkValue metaValue metaTy m with
         | .ok () => pure (metaValue, metaTy)
-        | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error e => .error e
       | none => unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
     | _ =>
       let metaTy := PointerMetaKind.ty metaKind
@@ -8128,7 +8132,8 @@ def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × 
         let metaTy := PointerMetaKind.ty metaKind
         match checkValueM metaValue metaTy m with
         | .ok () => pure (metaValue, metaTy)
-        | .error _ => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error e => .error e
       | none => unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
     | _ =>
       let metaTy := PointerMetaKind.ty metaKind

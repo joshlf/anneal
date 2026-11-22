@@ -7918,6 +7918,400 @@ theorem evalUnOpM_vtableMethodLookup_eq_fnPointer {M : Type} [Gen.Memory M] [Mem
   rw [h, hvt, ok_bind, hfn, ok_bind, hc]
   cases mapIndex m.fn_ptrs fnName "self.fn_ptrs[fn_name]" <;> rfl
 
+/-- When `m.vtable_ptrs` maps `ptr` to `vtableName`, `Machine::vtable_from_ptr`
+reduces directly to indexing `m.prog.vtables[vtableName]` (raising a map-index
+spec panic if `m.prog.vtables` is missing that entry, never UB). -/
+theorem vtableFromPtr_eq_mapIndex_of_find (m : Mach) (ptr : Ptr) (vtableName : Gen.VTableName)
+    (vp : Ptr)
+    (hfind : m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : Ptr)) => decide (vtablePtr = ptr)) = some (vtableName, vp)) :
+    vtableFromPtr m ptr = mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]" := by
+  unfold vtableFromPtr
+  rw [hfind]
+
+/-- Polymorphic `vtableFromPtr_eq_mapIndex_of_find`. -/
+theorem vtableFromPtrM_eq_mapIndex_of_find {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (ptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (vtableName : Gen.VTableName) (vp : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hfind : m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : Gen.ThinPointer (Gen.Memory.Provenance M))) =>
+        decide (vtablePtr = ptr)) = some (vtableName, vp)) :
+    vtableFromPtrM m ptr = mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]" := by
+  unfold vtableFromPtrM
+  rw [hfind]
+
+/-- An out-of-bounds address at `PtrType::VTablePtr` is UB before metadata or
+vtable lookup, with or without a machine. -/
+theorem checkPtr_vtablePtr_outOfBounds_ub (ptr : Gen.Pointer Prov) (traitName : Gen.TraitName)
+    (m : Option Mach)
+    (hAddr : inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = false) :
+    checkPtr ptr (.VTablePtr traitName) m = .error (.ub "Value::Ptr: pointer out-of-bounds") := by
+  unfold checkPtr
+  rw [hAddr, ensureElseUb_false, error_bind]
+
+/-- Polymorphic `checkPtr_vtablePtr_outOfBounds_ub`. -/
+theorem checkPtrM_vtablePtr_outOfBounds_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ptr : Gen.Pointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Option (Gen.Machine M))
+    (hAddr : inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE = false) :
+    checkPtrM ptr (.VTablePtr traitName) m = .error (.ub "Value::Ptr: pointer out-of-bounds") := by
+  unfold checkPtrM
+  rw [hAddr, ensureElseUb_false, error_bind]
+
+/-- Non-empty metadata on a stand-alone `PtrType::VTablePtr` is UB
+(`"Value::Ptr: invalid metadata"`), with or without a machine. -/
+theorem checkPtr_vtablePtr_nonNone_meta_ub (thin : Ptr) (pm : Gen.PointerMeta Prov)
+    (traitName : Gen.TraitName) (m : Option Mach)
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtr (ThinPointer.widen thin (some pm)) (.VTablePtr traitName) m =
+      .error (.ub "Value::Ptr: invalid metadata") := by
+  unfold checkPtr
+  dsimp only [ThinPointer.widen, PtrType.meta_kind]
+  rw [hAddr, ensureElseUb_true, ok_bind]
+  cases pm <;> rfl
+
+/-- Polymorphic `checkPtr_vtablePtr_nonNone_meta_ub`. -/
+theorem checkPtrM_vtablePtr_nonNone_meta_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (pm : Gen.PointerMeta (Gen.Memory.Provenance M))
+    (traitName : Gen.TraitName) (m : Option (Gen.Machine M))
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtrM (ThinPointer.widen thin (some pm)) (.VTablePtr traitName) m =
+      .error (.ub "Value::Ptr: invalid metadata") := by
+  unfold checkPtrM
+  dsimp only [ThinPointer.widen, PtrType.meta_kind]
+  rw [hAddr, ensureElseUb_true, ok_bind]
+  cases pm <;> rfl
+
+/-- **Raw `*const dyn Trait` validity (`ucg#516`)**: even for a raw pointer
+`PtrType::Raw(VTablePointer(trait_name))`, whose data pointer may be null,
+unaligned, or dangling (as long as its address fits in `usize`), `check_ptr`
+validates its vtable metadata identically to `PtrType::VTablePtr(trait_name)`. -/
+theorem checkPtr_rawTraitObject_eq_vtablePtr (thin vptr : Ptr) (traitName : Gen.TraitName)
+    (m : Mach) (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr)))
+        (.Raw (.VTablePointer traitName)) (some m) =
+      checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) := by
+  have h : checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr)))
+      (.Raw (.VTablePointer traitName)) (some m) =
+      (do
+        ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+          "Value::Ptr: pointer out-of-bounds"
+        checkPtrMetadata (some (.VTablePointer vptr)) (.VTablePointer traitName) (some m)
+        pure ()) := rfl
+  rw [h, hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_vtable_eq_checkPtr]
+  cases checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) with
+  | error _ => rfl
+  | ok u => cases u; rfl
+
+/-- Polymorphic `checkPtr_rawTraitObject_eq_vtablePtr` (in particular on `MachTB`). -/
+theorem checkPtrM_rawTraitObject_eq_vtablePtr {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (traitName : Gen.TraitName)
+    (m : Gen.Machine M) (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr)))
+        (.Raw (.VTablePointer traitName)) (some m) =
+      checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) := by
+  have h : checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr)))
+      (.Raw (.VTablePointer traitName)) (some m) =
+      (do
+        ensureElseUb (inBounds thin.addr .Unsigned x86_64.PTR_SIZE)
+          "Value::Ptr: pointer out-of-bounds"
+        checkPtrMetadataM (some (.VTablePointer vptr)) (.VTablePointer traitName)
+          (some (vtableFromPtrM m))
+        pure ()) := rfl
+  rw [h, hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_vtable_eq_checkPtrM]
+  cases checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) with
+  | error _ => rfl
+  | ok u => cases u; rfl
+
+/-- `LayoutStrategy::compute_size_and_align` on an unsized struct with a
+trait-object tail (`LayoutStrategy::Tuple { head, tail: TraitObject(..) }`)
+combines `head` (including `packed_align` capping and head alignment) with the
+vtable's size and alignment via `TupleHeadLayout::full_size_and_align`. -/
+theorem compute_size_and_align_tuple_traitObject {Provenance : Type}
+    (vtables : Gen.ThinPointer Provenance → Interp Gen.VTable) (head : Gen.TupleHeadLayout)
+    (traitName : Gen.TraitName) (vptr : Gen.ThinPointer Provenance) :
+    LayoutStrategy.compute_size_and_align vtables (.Tuple head (.TraitObject traitName))
+        (some (.VTablePointer vptr)) =
+      (do
+        let vtable ← vtables vptr
+        pure (TupleHeadLayout.full_size_and_align head vtable.size vtable.align)) := by
+  have h : LayoutStrategy.compute_size_and_align vtables (.Tuple head (.TraitObject traitName))
+      (some (.VTablePointer vptr)) =
+      (do
+        let (tailSize, tailAlign) ← LayoutStrategy.compute_size_and_align vtables
+          (.TraitObject traitName) (some (.VTablePointer vptr))
+        pure (TupleHeadLayout.full_size_and_align head tailSize tailAlign)) := rfl
+  rw [h, compute_size_and_align_traitObject]
+  cases vtables vptr <;> rfl
+
+/-- **`check_ptr` on an unsized struct with a trait-object tail whose vtable
+metadata is ill formed**: metadata is checked before computing the tuple layout
+or safe-pointer checks, so every `PtrType::VTablePtr` failure propagates. -/
+theorem checkPtr_tuple_traitObject_metadata_error (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Mach) (e : Stop)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMeta : checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) = .error e) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error e := by
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_vtable_eq_checkPtr, hMeta, error_bind]
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_vtable_eq_checkPtr, hMeta, error_bind]
+
+/-- Polymorphic `checkPtr_tuple_traitObject_metadata_error`. -/
+theorem checkPtrM_tuple_traitObject_metadata_error {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Gen.Machine M) (e : Stop)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMeta : checkPtrM (ThinPointer.widen vptr none) (.VTablePtr traitName) (some m) =
+      .error e) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error e := by
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_vtable_eq_checkPtrM, hMeta,
+      error_bind]
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_vtable_eq_checkPtrM, hMeta,
+      error_bind]
+
+/-- **`check_ptr` on an unsized struct with a trait-object tail**
+(`&StructWithDyn`, `&mut StructWithDyn`, `Box<StructWithDyn>`): once the vtable
+metadata is validated to vtable `vt`, the safe pointer is checked identically to
+a thin safe pointer whose sized layout is
+`TupleHeadLayout::full_size_and_align head vt.size vt.align` (accounting for
+`head.end`, `head.align`, `head.packed_align`, tail offset alignment, and
+trailing padding). -/
+theorem checkPtr_tuple_traitObject_eq_sized (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      checkPtr (ThinPointer.widen thin none)
+        (mk { pointee with
+          layout := .Sized
+            (TupleHeadLayout.full_size_and_align head vt.size vt.align).1
+            (TupleHeadLayout.full_size_and_align head vt.size vt.align).2 }) (some m) := by
+  have hMeta : checkPtrMetadata (some (.VTablePointer vptr)) (.VTablePointer traitName) (some m) =
+      .ok () := by
+    rw [checkPtrMetadata_vtable_eq_checkPtr]
+    exact checkPtr_vtablePtr_ok vptr traitName m vt hVAddr hvt hTrait
+  have hvl : vtableLookup m vptr = .ok vt :=
+    (vtableFromPtr_ok_iff_vtableLookup_ok m vptr vt).mp hvt
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadata_none, compute_size_and_align_tuple_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadata_none, compute_size_and_align_tuple_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+
+/-- Polymorphic `checkPtr_tuple_traitObject_eq_sized` (in particular on `MachTB`). -/
+theorem checkPtrM_tuple_traitObject_eq_sized {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      checkPtrM (ThinPointer.widen thin none)
+        (mk { pointee with
+          layout := .Sized
+            (TupleHeadLayout.full_size_and_align head vt.size vt.align).1
+            (TupleHeadLayout.full_size_and_align head vt.size vt.align).2 }) (some m) := by
+  have hMeta : checkPtrMetadataM (some (.VTablePointer vptr)) (.VTablePointer traitName)
+      (some (vtableFromPtrM m)) = .ok () := by
+    rw [checkPtrMetadataM_vtable_eq_checkPtrM]
+    exact checkPtrM_vtablePtr_ok vptr traitName m vt hVAddr hvt hTrait
+  have hvl : vtableLookupM m vptr = .ok vt :=
+    (vtableFromPtrM_ok_iff_vtableLookupM_ok m vptr vt).mp hvt
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout
+  subst hLayout
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee, Option.map]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadataM_none, compute_size_and_align_tuple_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee, Option.map]
+    refine bind_congr_right _ (fun _ => ?_)
+    rw [hMeta, checkPtrMetadataM_none, compute_size_and_align_tuple_traitObject, hvl,
+      compute_size_and_align_sized]
+    rfl
+
+/-- **`isize::MAX` overflow UB on an unsized struct with a trait-object tail**:
+when `TupleHeadLayout::full_size_and_align head vt.size vt.align` exceeds
+`isize::MAX`, `check_ptr` raises `"Value::Ptr: total size exeeds isize::MAX"`
+before checking non-null, alignment, inhabitedness, or dereferenceability (even
+if `vt.size` alone fits in `isize::MAX`). -/
+theorem checkPtr_tuple_traitObject_size_overflow_ub (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Mach) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtr m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hOverflow :
+      inBounds ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int)
+        .Signed x86_64.PTR_SIZE = false) :
+    checkPtr (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") := by
+  rw [checkPtr_tuple_traitObject_eq_sized thin vptr mk pointee head traitName m vt
+    hMk hLayout hVAddr hvt hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hOverflow, ensureElseUb_false, error_bind]
+  · unfold checkPtr
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadata_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hOverflow, ensureElseUb_false, error_bind]
+
+/-- Polymorphic `checkPtr_tuple_traitObject_size_overflow_ub`. -/
+theorem checkPtrM_tuple_traitObject_size_overflow_ub {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (head : Gen.TupleHeadLayout) (traitName : Gen.TraitName) (m : Gen.Machine M) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .Tuple head (.TraitObject traitName))
+    (hAddr : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableFromPtrM m vptr = .ok vt) (hTrait : vt.trait_name = traitName)
+    (hOverflow :
+      inBounds ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int)
+        .Signed x86_64.PTR_SIZE = false) :
+    checkPtrM (ThinPointer.widen thin (some (.VTablePointer vptr))) (mk pointee) (some m) =
+      .error (.ub "Value::Ptr: total size exeeds isize::MAX") := by
+  rw [checkPtrM_tuple_traitObject_eq_sized thin vptr mk pointee head traitName m vt
+    hMk hLayout hVAddr hvt hTrait]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hOverflow, ensureElseUb_false, error_bind]
+  · unfold checkPtrM
+    dsimp only [ThinPointer.widen, PtrType.meta_kind, LayoutStrategy.meta_kind,
+      PtrType.safe_pointee]
+    rw [hAddr, ensureElseUb_true, ok_bind, checkPtrMetadataM_none, ok_bind,
+      compute_size_and_align_sized, ok_bind, hOverflow, ensureElseUb_false, error_bind]
+
+/-- `UnOp::ComputeSize` and `UnOp::ComputeAlign` on an unsized struct with a
+trait-object tail (`Type::Tuple _ head (some (TraitObject trait_name))`) compute
+`TupleHeadLayout::full_size_and_align head vt.size vt.align` with a machine. -/
+theorem evalUnOp_tuple_traitObject_size_align (m : Mach) (vptr : Ptr)
+    (fields : List (Gen.Offset × Gen.«Type»)) (head : Gen.TupleHeadLayout)
+    (traitName : Gen.TraitName) (opTy : Gen.«Type») (vt : Gen.VTable)
+    (hvt : vtableLookup m vptr = .ok vt) :
+    evalUnOp (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int),
+        .Int IntType.usize_ty) ∧
+    evalUnOp (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).2.bytes : Int),
+        .Int IntType.usize_ty) := by
+  constructor
+  · have h : evalUnOp (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+        (do
+          let size ← computeSize m (.Tuple head (.TraitObject traitName))
+            (some (.VTablePointer vptr))
+          pure (.Int (size.bytes : Int), .Int IntType.usize_ty)) := rfl
+    rw [h]
+    unfold computeSize
+    rw [compute_size_and_align_tuple_traitObject, hvt]
+    rfl
+  · have h : evalUnOp (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+        (do
+          let align ← computeAlign m (.Tuple head (.TraitObject traitName))
+            (some (.VTablePointer vptr))
+          pure (.Int (align.bytes : Int), .Int IntType.usize_ty)) := rfl
+    rw [h]
+    unfold computeAlign
+    rw [compute_size_and_align_tuple_traitObject, hvt]
+    rfl
+
+/-- Polymorphic `evalUnOp_tuple_traitObject_size_align` (in particular on `MachTB`). -/
+theorem evalUnOpM_tuple_traitObject_size_align {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m : Gen.Machine M) (vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (fields : List (Gen.Offset × Gen.«Type»)) (head : Gen.TupleHeadLayout)
+    (traitName : Gen.TraitName) (opTy : Gen.«Type») (vt : Gen.VTable)
+    (hvt : vtableLookupM m vptr = .ok vt) :
+    evalUnOpM (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int),
+        .Int IntType.usize_ty) ∧
+    evalUnOpM (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).2.bytes : Int),
+        .Int IntType.usize_ty) := by
+  constructor
+  · have h : evalUnOpM (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+        (do
+          let size ← computeSizeM m (.Tuple head (.TraitObject traitName))
+            (some (.VTablePointer vptr))
+          pure (.Int (size.bytes : Int), .Int IntType.usize_ty)) := rfl
+    rw [h]
+    unfold computeSizeM
+    rw [compute_size_and_align_tuple_traitObject, hvt]
+    rfl
+  · have h : evalUnOpM (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
+        (.Ptr (ThinPointer.widen vptr none), opTy) (some m) =
+        (do
+          let align ← computeAlignM m (.Tuple head (.TraitObject traitName))
+            (some (.VTablePointer vptr))
+          pure (.Int (align.bytes : Int), .Int IntType.usize_ty)) := rfl
+    rw [h]
+    unfold computeAlignM
+    rw [compute_size_and_align_tuple_traitObject, hvt]
+    rfl
+
 private theorem comparePtrM_bm_eq (lp rp : Gen.Pointer Prov) :
     comparePtrM lp rp = comparePtr lp rp := by
   unfold comparePtrM comparePtr
