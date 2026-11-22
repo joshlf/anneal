@@ -1913,6 +1913,136 @@ theorem wit_selfPattern_rejected :
         (ValidityVisitor.visit RealVisit.selfPatternHooks () 151 init root ()) = true :=
   RealVisit.selfPattern_noFuel_rejects_vendored_exhausts
 
+/-! ### 3e''. Unconditional `realVisitLexRank`, `dyn Trait` unpack, same-`TyId` enum phases, `constValidatePlace`, and 3-ref LIFO `validatePlace` -/
+
+/-- Unconditional `ω · 2` structural adequacy (`realVisitLexRank_eq_noFuel`) instantiated directly on
+an unsized `dyn Trait` root (`isSized = false`), requiring no `isSized = true` side condition. -/
+theorem wit_realVisitLexRank_unsized_eq_noFuel (session : Session CtfeProvenance)
+    (m : MemPlace CtfeProvenance) :
+    RealVisit.realVisitLexRank RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank session
+        ⟨.memory m, RealVisit.dynVisitLayout 100⟩ =
+      RealVisit.realVisitNoFuel RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank session
+        ⟨.memory m, RealVisit.dynVisitLayout 100⟩ :=
+  RealVisit.realVisitLexRank_eq_noFuel _ _ _ _ _
+
+/-- General unsized `vendored_visit_eq_noFuel` adequacy across `VTable.unpackDynTrait` (`ty = 100`
+unsized `dyn Trait` -> `ty = 50 -> 49 -> 48 -> 0` concrete sized implementor chain, `fuel = 155 > 154`). -/
+theorem wit_dynTrait_vendored_eq_realVisitNoFuel (session : Session CtfeProvenance)
+    (prov : Option CtfeProvenance) (mis : Option Misalignment) :
+    ValidityVisitor.visit RealVisit.dynTraitVisitHooks () 155 session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, RealVisit.witnessVTableMeta, mis⟩, RealVisit.dynVisitLayout 100⟩ =
+      RealVisit.realVisitNoFuel RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, RealVisit.witnessVTableMeta, mis⟩, RealVisit.dynVisitLayout 100⟩ :=
+  RealVisit.dynTrait_vendored_visit_eq_noFuel 155 prov mis session (by decide)
+
+/-- `Anneal.MirFuelFree` `wpCoalBounded` bridge for `ValidityVisitor.visit` on the unsized `dyn Trait`
+root (`fuel = 500`, `visitFuelBound 151 = 154`). -/
+theorem wit_dynTrait_vendored_visit_mirFuelFree_bridge (session : Session CtfeProvenance) :
+    ValidityVisitor.visit RealVisit.dynTraitVisitHooks () 500 session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, RealVisit.witnessVTableMeta, none⟩, RealVisit.dynVisitLayout 100⟩ =
+      RealVisit.realVisitNoFuel RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank session
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, RealVisit.witnessVTableMeta, none⟩, RealVisit.dynVisitLayout 100⟩ := by
+  refine RealVisit.vendored_visit_eq_noFuel_of_wpCoalBounded RealVisit.dynTraitVisitHooks ()
+    RealVisit.dynVisitTypeRank RealVisit.dynTraitGood (fun _ => false)
+    RealVisit.dynTrait_visitHooksDescend RealVisit.dynTrait_unionHooksDescend 151 ?_
+    500 session _ (by simp [RealVisit.dynTraitGood, RealVisit.dynVisitLayout]) PUnit.unit
+    (rankCountdown_canonical _ 500 PUnit.unit (by decide +kernel))
+  rintro ⟨refP, layP⟩ ⟨refC, layC⟩ _ hgoodC _ hszC
+  cases refC with
+  | «local» => simp [RealVisit.dynTraitGood] at hgoodC
+  | memory m =>
+    rcases m with ⟨⟨off, _⟩, metaVal, _⟩
+    simp only [RealVisit.dynTraitGood, Bool.and_eq_true, decide_eq_true_eq, Bool.or_eq_true,
+      beq_iff_eq, or_assoc] at hgoodC
+    rcases hgoodC with ⟨⟨_, ⟨h100, _⟩ | ⟨h50 | h49 | h48 | h0, _⟩⟩, hlayC⟩
+    · have hbad : layC.layout.isSized = false := by rw [hlayC, h100]; rfl
+      rw [hbad] at hszC; cases hszC
+    · dsimp only; rw [hlayC, h50]; decide +kernel
+    · dsimp only; rw [hlayC, h49]; decide +kernel
+    · dsimp only; rw [hlayC, h48]; decide +kernel
+    · dsimp only; rw [hlayC, h0]; decide +kernel
+
+/-- Kernel-evaluated witness separating `realVisitLexRank` (succeeds, agreeing with `realVisitNoFuel`
+and vendored `visit`) from sized-only `realVisitRank` (falsely exhausts fuel at `fuel = 3`!). -/
+theorem wit_dynTrait_lexRank_separates_sizedRank :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, RealVisit.witnessVTableMeta, none⟩, RealVisit.dynVisitLayout 100⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"DynRoot", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    resultOk (RealVisit.realVisitLexRank RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank init root ()) = true ∧
+      resultOk (RealVisit.realVisitNoFuel RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank init root ()) = true ∧
+      resultOk (ValidityVisitor.visit RealVisit.dynTraitVisitHooks () 5 init root ()) = true ∧
+      resultExhausted "validity traversal fuel"
+        (RealVisit.realVisitRank RealVisit.dynTraitVisitHooks () RealVisit.dynVisitTypeRank init root ()) = true :=
+  RealVisit.dynTrait_lexRank_succeeds_while_sizedRank_exhausts
+
+/-- Same-`TyId` (`ty = 0`, `typeRank = 0`) multi-variant enum `.Multiple` -> `.Single 0` aggregate ->
+`.Primitive` scalar adequacy and kernel-evaluated success. -/
+theorem wit_enumPhase_vendored_eq_realVisitNoFuel (session : Session CtfeProvenance)
+    (prov : Option CtfeProvenance) (mis : Option Misalignment) :
+    ValidityVisitor.visit RealVisit.enumPhaseVisitHooks () 4 session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, RealVisit.enumRootLayout⟩ =
+      RealVisit.realVisitNoFuel RealVisit.enumPhaseVisitHooks () (fun _ => 0) session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, RealVisit.enumRootLayout⟩ ∧
+    resultOk (RealVisit.realVisitNoFuel RealVisit.enumPhaseVisitHooks () (fun _ => 0)
+      { path := ⟨"EnumRoot", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, RealVisit.enumRootLayout⟩ ()) = true :=
+  ⟨RealVisit.enumPhase_vendored_visit_eq_noFuel 4 prov mis session (by decide),
+    RealVisit.enumPhase_visit_ok.1⟩
+
+/-- Direct adequacy between unmodified vendored `ValidityVisitor.constValidatePlace` and
+`realConstValidatePlaceNoFuel` at depth 150 (`fuel = 454 > 452`). -/
+theorem wit_constValidatePlace150_vendored_eq_noFuel
+    (tracking : RefTracking (Key CtfeProvenance) ValidationPath) (mode : CtfeMode) :
+    ValidityVisitor.constValidatePlace deepPatternHooks () 454
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
+        ⟨"ConstRoot", #[]⟩ tracking mode =
+      RealVisit.realConstValidatePlaceNoFuel deepPatternHooks () id
+        ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
+        ⟨"ConstRoot", #[]⟩ tracking mode :=
+  RealVisit.vendored_constValidatePlace_eq_noFuel deepPatternHooks () id
+    RealVisit.deepGood (fun _ => false) RealVisit.deepPattern_visitHooksDescend
+    RealVisit.deepPattern_unionHooksDescend 0
+    (fun p _ hp _ hunsz _ => by
+      cases hp_ref : p.ref with
+      | «local» => simp [RealVisit.deepGood, hp_ref] at hp
+      | memory _ =>
+        simp only [RealVisit.deepGood, hp_ref, decide_eq_true_eq] at hp
+        rw [hp] at hunsz
+        cases hunsz)
+    454 _ _ tracking mode (by decide +kernel) (by decide +kernel)
+
+/-- Fuelled `RefTracking.next` loop (`drainPointeesFuel`) agrees with `drainPointees` when
+`remaining ≥ todo.size` and exhausts with `"recursive validity tracker fuel"` when `remaining < todo.size`. -/
+theorem wit_drainPointeesFuel_adequacy_and_exhaustion
+    (k₁ k₂ k₃ : Key CtfeProvenance) (p₁ p₂ p₃ : ValidationPath) :
+    let tr : RefTracking (Key CtfeProvenance) ValidationPath :=
+      { seen := #[], todo := #[(k₁, p₁), (k₂, p₂), (k₃, p₃)] }
+    let step : Key CtfeProvenance → ValidationPath → M (Array ValidationPath) Unit :=
+      fun _ path => modify (·.push path)
+    RealVisit.drainPointeesFuel 3 tr step #[] = .ok () #[p₃, p₂, p₁] ∧
+      RealVisit.drainPointeesFuel 2 tr step #[] =
+        .error (.resourceExhaustion "recursive validity tracker fuel") #[p₃, p₂] := by
+  intro tr step
+  refine ⟨?_, rfl⟩
+  rw [RealVisit.drainPointeesFuel_eq_drainPointees 3 tr step (Nat.le_refl 3)]
+  rfl
+
+/-- 3-reference array `[&b0, &b1, &b2]` LIFO pointee validation (`realValidatePlaceNoFuel`):
+visits offsets in reverse discovery order `#[16, 8, 0]` and reports `.undefinedBehavior` starting
+with `"validation[0]"` on the invalid first boolean (`b0 = 2`). -/
+theorem wit_lifo3Ref_validatePlace_visits_reverse_order :
+    let arrayRoot : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, some RealVisit.witnessProv⟩, .none, none⟩, RealVisit.lifoArrayLayout⟩
+    let typeRank : Miri.MIR.TyId → Nat := fun ty => if ty == 2 then 1 else 0
+    (match RealVisit.realValidatePlaceNoFuel RealVisit.lifo3RefHooks () typeRank arrayRoot true false #[] with
+     | .error (.undefinedBehavior msg) visitedOffsets =>
+       visitedOffsets == #[16, 8, 0] && msg.startsWith "validation[0]"
+     | _ => false) = true :=
+  RealVisit.lifo3Ref_validatePlace_visits_reverse_order
+
 /-! ### 3f. Dynamic hook-boundary violations, `unionWrapper`, and LIFO pointee draining -/
 
 /-- A projection hook that returns the place itself (a by-value cycle). -/

@@ -2214,6 +2214,1247 @@ theorem selfPattern_noFuel_rejects_vendored_exhausts :
   rw [realVisitNoFuel_eq]
   decide +kernel
 
+
+/-! ### Unconditional `ω · 2` structural companion (`realVisitLexRank`, `Classical.choice`-free)
+
+`realVisitRank` above budgets `layoutOrder + 2`, which suffices only on sized roots (`hs : isSized = true`):
+when an unsized `dyn Trait` root (`isSized = false`) unpacks via `VTable.unpackDynTrait` to a concrete
+sized implementor of higher `typeRank` and deeper field chain, `realVisitRank` falsely exhausts fuel.
+Matching `VisitLexWalk.walkRank`, `realVisitLexRank` uses nested structural recursion (`Nat.rec` inside
+`Nat.rec`, `ω · 2`) together with `realUnionRangesRank`, dynamically budgeting `layoutOrder child + 1`
+upon unsized-to-sized transition so `realVisitLexRank_eq_noFuel` holds **unconditionally** on every
+place (sized or unsized) while remaining `Classical.choice`-free after `leanprover/lean4#13851`. -/
+
+section LexStructuralAndCongruence
+variable {P S C E F A Pad : Type} [PointerProvenance P] [DecidableEq P]
+
+/-- Structural (`Nat.rec`, `Classical.choice`-free) companion for sized subtrees of `realVisitNoFuel`. -/
+def realVisitSized (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) :
+    Nat → Session P → RuntimePlace P → M S (Session P)
+  | 0, _, _ => throw (.resourceExhaustion "validity traversal fuel")
+  | fuel + 1, session, place =>
+    visitStep h c (visitGuard typeRank place (realVisitSized h c typeRank fuel))
+      (realUnionRangesRank h c typeRank place.layout Size.ZERO .empty) session place
+
+/-- Structural (`Nat.rec`, `Classical.choice`-free) companion for unsized places (`dyn Trait`, slices):
+transitions into `realVisitSized (layoutOrder typeRank child.layout + 1)` whenever dynamic unpacking
+produces a sized concrete child. -/
+def realVisitUnsized (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) :
+    Nat → Session P → RuntimePlace P → M S (Session P)
+  | 0, _, _ => throw (.resourceExhaustion "validity traversal fuel")
+  | fuel + 1, session, place =>
+    visitStep h c
+      (visitGuard typeRank place fun s child =>
+        if child.layout.layout.isSized then
+          realVisitSized h c typeRank (layoutOrder typeRank child.layout + 1) s child
+        else
+          realVisitUnsized h c typeRank fuel s child)
+      (realUnionRangesRank h c typeRank place.layout Size.ZERO .empty) session place
+
+/-- **Unconditional `Classical.choice`-free structural companion of `realVisitNoFuel`** across the
+entire `ω · 2` `visitOrder` domain (valid on both sized and unsized roots, any hooks). -/
+def realVisitLexRank (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat)
+    (session : Session P) (place : RuntimePlace P) : M S (Session P) :=
+  if place.layout.layout.isSized then
+    realVisitSized h c typeRank (layoutOrder typeRank place.layout + 1) session place
+  else
+    realVisitUnsized h c typeRank (layoutOrder typeRank place.layout + 1) session place
+
+/-- Sized structural companion agrees with `realVisitNoFuel` whenever `fuel > layoutOrder`. -/
+theorem realVisitSized_eq_noFuel (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) :
+    ∀ (fuel : Nat) (session : Session P) (place : RuntimePlace P),
+      place.layout.layout.isSized = true → layoutOrder typeRank place.layout < fuel →
+      realVisitSized h c typeRank fuel session place = realVisitNoFuel h c typeRank session place
+  | 0, _, _, _, hlt => absurd hlt (Nat.not_lt_zero _)
+  | fuel + 1, session, place, hs, hlt => by
+    rw [realVisitNoFuel_eq]
+    simp only [realVisitSized, realUnionRangesRank_eq_noFuel]
+    congr 1
+    funext s child
+    unfold visitGuard
+    by_cases hc : VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+    · simp only [hc, ↓reduceIte]
+      obtain ⟨hcs, hclt⟩ := visitOrder_lt_of_sized_parent typeRank place.layout child.layout hs hc
+      exact realVisitSized_eq_noFuel h c typeRank fuel s child hcs (by omega)
+    · simp only [hc, ↓reduceIte]
+
+/-- Unsized structural companion agrees with `realVisitNoFuel` whenever `fuel > layoutOrder`. -/
+theorem realVisitUnsized_eq_noFuel (h : Hooks P S C E F A Pad) (c : C) (typeRank : MIR.TyId → Nat) :
+    ∀ (fuel : Nat) (session : Session P) (place : RuntimePlace P),
+      place.layout.layout.isSized = false → layoutOrder typeRank place.layout < fuel →
+      realVisitUnsized h c typeRank fuel session place = realVisitNoFuel h c typeRank session place
+  | 0, _, _, _, hlt => absurd hlt (Nat.not_lt_zero _)
+  | fuel + 1, session, place, hunsz, hlt => by
+    rw [realVisitNoFuel_eq]
+    simp only [realVisitUnsized, realUnionRangesRank_eq_noFuel]
+    congr 1
+    funext s child
+    unfold visitGuard
+    by_cases hc : VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+    · simp only [hc, ↓reduceIte]
+      cases hcs : child.layout.layout.isSized
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        have hclt : layoutOrder typeRank child.layout < layoutOrder typeRank place.layout := by
+          unfold VisitOrderLt visitOrder at hc
+          rw [Prod.lex_def] at hc
+          simp only [hcs, hunsz, Bool.false_eq_true, ↓reduceIte] at hc
+          omega
+        exact realVisitUnsized_eq_noFuel h c typeRank fuel s child hcs (by omega)
+      · simp only [↓reduceIte]
+        exact realVisitSized_eq_noFuel h c typeRank _ s child hcs (Nat.lt_succ_self _)
+    · simp only [hc, ↓reduceIte]
+
+/-- **Unconditional structural adequacy (`Classical.choice`-free `realVisitLexRank = realVisitNoFuel`)**
+for every place (sized or unsized) and every hook instance, with zero side conditions. -/
+theorem realVisitLexRank_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (session : Session P) (place : RuntimePlace P) :
+    realVisitLexRank h c typeRank session place = realVisitNoFuel h c typeRank session place := by
+  unfold realVisitLexRank
+  cases hs : place.layout.layout.isSized
+  · simp only [Bool.false_eq_true, ↓reduceIte]
+    exact realVisitUnsized_eq_noFuel h c typeRank _ session place hs (Nat.lt_succ_self _)
+  · simp only [↓reduceIte]
+    exact realVisitSized_eq_noFuel h c typeRank _ session place hs (Nat.lt_succ_self _)
+
+/-! ### `Anneal.MirFuelFree` `wpCoalBounded` bridges for `RealVisit` -/
+
+/-- **`Anneal.MirFuelFree` bridge for `ValidityVisitor.visit` (general unsized/sized form).**
+Whenever `rankCountdown` converges in `fuel` steps from `visitFuelBound maxSized typeRank place.layout`,
+the unmodified vendored `ValidityVisitor.visit` agrees identically with `realVisitNoFuel`. -/
+theorem vendored_visit_eq_noFuel_of_wpCoalBounded (h : Hooks P S C E F A Pad)
+    (c : C) (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hd : VisitHooksDescend h c typeRank good goodU)
+    (hdU : UnionHooksDescend h c typeRank (fun l => goodU l = true)) (maxSized : Nat)
+    (hmax : ∀ parent child : RuntimePlace P, good parent = true → good child = true →
+      parent.layout.layout.isSized = false → child.layout.layout.isSized = true →
+      layoutOrder typeRank child.layout ≤ maxSized)
+    (fuel : Nat) (session : Session P) (place : RuntimePlace P) (hp : good place = true) (s : PUnit)
+    (hconv : Anneal.ITreeWP.wpCoalBounded fuel emptyWP rankCountdown (fun _ _ => True)
+      (visitFuelBound maxSized typeRank place.layout) s) :
+    ValidityVisitor.visit h c fuel session place = realVisitNoFuel h c typeRank session place :=
+  vendored_visit_eq_noFuel h c typeRank good goodU hd hdU maxSized hmax fuel session place hp
+    ((rankCountdown_converges_iff _ _ s).mp hconv)
+
+/-- **`Anneal.MirFuelFree` bridge for `ValidityVisitor.visit` (sized-root form).** -/
+theorem vendored_visit_eq_noFuel_of_sized_wpCoalBounded (h : Hooks P S C E F A Pad)
+    (c : C) (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hd : VisitHooksDescend h c typeRank good goodU)
+    (hdU : UnionHooksDescend h c typeRank (fun l => goodU l = true))
+    (fuel : Nat) (session : Session P) (place : RuntimePlace P) (hp : good place = true)
+    (hs : place.layout.layout.isSized = true) (s : PUnit)
+    (hconv : Anneal.ITreeWP.wpCoalBounded fuel emptyWP rankCountdown (fun _ _ => True)
+      (layoutOrder typeRank place.layout + 1) s) :
+    ValidityVisitor.visit h c fuel session place = realVisitNoFuel h c typeRank session place :=
+  vendored_visit_eq_noFuel_of_sized h c typeRank good goodU hd hdU fuel session place hp hs
+    ((rankCountdown_converges_iff _ _ s).mp hconv)
+
+/-! ### Structural decomposition of `VisitHooksDescend` across all 7 projection boundaries -/
+
+/-- Explicit hook-level descent conditions corresponding to the 7 recursive `descend` sites and 1
+`unionRanges` hand-off in `ValidityVisitor.visit` (`lean-miri#90` L402–486). -/
+structure VisitHookConditions (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool) :
+    Prop where
+  seqZst : ∀ place, good place = true →
+    ∀ elem s₀ s₁ s₂ child s₃,
+      h.classify c place.layout.ty s₀ = .ok (.sequence elem) s₁ →
+      PlaceDynamic.index h.projection c place 0 s₂ = .ok child s₃ →
+      good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+  arrayElem : ∀ place, good place = true →
+    ∀ stride cnt, place.layout.layout.fields = .Array stride cnt →
+    ∀ s₀ elem s₁ off s₂ child s₃,
+      h.projection.field c place.layout 0 s₀ = .ok elem s₁ →
+      PlaceDynamic.offsetWithMeta h.projection c place off .wrapping .none elem s₂ = .ok child s₃ →
+      good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+  pattern : ∀ place, good place = true →
+    ∀ base s₀ s₁ s₂ lay s₃ s₄ child s₅,
+      h.classify c place.layout.ty s₀ = .ok (.pattern base) s₁ →
+      h.projection.layoutOf c base s₂ = .ok lay s₃ →
+      PlaceDynamic.offsetWithMeta h.projection c place Size.ZERO .wrapping .none lay s₄ = .ok child s₅ →
+      good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+  dynamic : ∀ place, good place = true →
+    ∀ expected s₀ s₁ s₂ op s₃ s₄ inner s₅ memory,
+      h.classify c place.layout.ty s₀ = .ok (.dynamic expected) s₁ →
+      h.toOp c place s₂ = .ok op s₃ →
+      VTable.unpackDynTrait h.vtable c op expected s₄ = .ok inner s₅ →
+      inner.op = .indirect memory →
+      good ⟨.memory memory, inner.layout⟩ = true ∧
+        VisitOrderLt (visitOrder typeRank inner.layout) (visitOrder typeRank place.layout)
+  box : ∀ place, good place = true →
+    ∀ s₀ s₁ s₂ ptr allocator s₃,
+      h.classify c place.layout.ty s₀ = .ok .box s₁ →
+      h.projectBox c place s₂ = .ok (ptr, allocator) s₃ →
+      good allocator = true ∧
+        VisitOrderLt (visitOrder typeRank allocator.layout) (visitOrder typeRank place.layout)
+  arbitrary : ∀ place, good place = true →
+    ∀ offsets order, place.layout.layout.fields = .Arbitrary offsets order →
+    ∀ idx s₀ child s₁,
+      PlaceDynamic.field h.projection c place idx s₀ = .ok child s₁ →
+      good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+  multiple : ∀ place, good place = true →
+    ∀ tag enc tf vs, place.layout.layout.variants = .Multiple tag enc tf vs →
+    ∀ s₀ op s₁ s₂ variant s₃ s₄ child s₅,
+      h.toOp c place s₀ = .ok op s₁ →
+      Discriminant.readDiscriminant h.discriminant c op s₂ = .ok variant s₃ →
+      PlaceDynamic.downcast h.projection c place variant s₄ = .ok child s₅ →
+      good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)
+  union : ∀ place, good place = true →
+    ∀ cnt, place.layout.layout.fields = .Union cnt → goodU place.layout = true
+
+private theorem bind_congr_ok' {σ α β : Type} {m : M σ α} {f g : α → M σ β}
+    (hfg : ∀ s a s', m s = .ok a s' → f a s' = g a s') :
+    (m >>= f) = (m >>= g) := by
+  funext s
+  simp only [bind, EStateM.bind]
+  cases hm : m s with
+  | error e s' => rfl
+  | ok a s' => exact hfg s a s' hm
+
+private theorem bind_eq_bind' {σ α β : Type} {m₁ m₂ : M σ α} {k₁ k₂ : α → M σ β}
+    (hm : m₁ = m₂) (hk : ∀ a, k₁ a = k₂ a) :
+    (m₁ >>= k₁) = (m₂ >>= k₂) := by
+  rw [hm]
+  have : k₁ = k₂ := by funext a; exact hk a
+  rw [this]
+
+private theorem have_eq_both {α β : Type} (f₁ f₂ : α → β) (v₁ v₂ : α)
+    (hv : v₁ = v₂) (hf : ∀ x, f₁ x = f₂ x) :
+    f₁ v₁ = f₂ v₂ :=
+  congr (funext hf) hv
+
+private theorem have_eq_val {α β : Type} (f : α → β) (v₁ v₂ : α)
+    (hv : v₁ = v₂) : f v₁ = f v₂ :=
+  congrArg f hv
+
+private theorem have_eq_body {α β : Type} (f₁ f₂ : α → β) (v : α)
+    (hf : ∀ x, f₁ x = f₂ x) : f₁ v = f₂ v :=
+  congrFun (funext hf) v
+
+open Lean Meta Elab Tactic in
+local elab "peel_have" : tactic => withMainContext do
+  let goal ← getMainGoal
+  let tgt ← instantiateMVars (← goal.getType)
+  let some (_, lhs0, rhs0) := tgt.eq? | throwError "peel_have: expected equality goal"
+  let (lhs, rhs) ← withConfig (fun cfg => { cfg with zeta := false, zetaHave := false, zetaDelta := false }) do
+    pure (← whnf lhs0, ← whnf rhs0)
+  let .letE nm ty v₁ b₁ _ := lhs | throwError "peel_have: LHS is not a `have`, got:\n{lhs}"
+  let .letE _ _ v₂ b₂ _ := rhs | throwError "peel_have: RHS is not a `have`, got:\n{rhs}"
+  let f₁ := mkLambda nm .default ty b₁
+  let f₂ := mkLambda nm .default ty b₂
+  let fEq ← withLocalDeclD nm ty fun x => do
+    mkForallFVars #[x] (← mkEq (b₁.instantiate1 x) (b₂.instantiate1 x))
+  if v₁ == v₂ then
+    let subF ← mkFreshExprMVar fEq
+    let pf ← mkAppM ``have_eq_body #[f₁, f₂, v₁, subF]
+    goal.assign pf
+    replaceMainGoal [subF.mvarId!]
+  else if f₁ == f₂ then
+    let subV ← mkFreshExprMVar (← mkEq v₁ v₂)
+    let pf ← mkAppM ``have_eq_val #[f₁, v₁, v₂, subV]
+    goal.assign pf
+    replaceMainGoal [subV.mvarId!]
+  else
+    let subV ← mkFreshExprMVar (← mkEq v₁ v₂)
+    let subF ← mkFreshExprMVar fEq
+    let pf ← mkAppM ``have_eq_both #[f₁, f₂, v₁, v₂, subV, subF]
+    goal.assign pf
+    replaceMainGoal [subV.mvarId!, subF.mvarId!]
+
+omit [PointerProvenance P] [DecidableEq P] in
+private theorem goodGuard_of_descends (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool)
+    (place child : RuntimePlace P) (k : Session P → RuntimePlace P → M S (Session P))
+    (session : Session P)
+    (hcd : good child = true ∧ VisitOrderLt (visitOrder typeRank child.layout) (visitOrder typeRank place.layout)) :
+    goodGuard typeRank good place k session child = k session child := by
+  unfold goodGuard
+  simp only [hcd, and_self, ↓reduceIte]
+
+/-- **General body-congruence theorem for `ValidityVisitor.visit`.** Discharges `VisitHooksDescend`
+across all 7 projection boundaries (`sequence`, `pattern`, `dynamic`, `box`, `Arbitrary`, `Array`,
+`Multiple`) and the `.Union` `unionRanges` hand-off from `VisitHookConditions`, without requiring
+callers to unfold `visitStep` (`Classical.choice`-free). -/
+theorem visitHooksDescend_of_conditions (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hcond : VisitHookConditions h c typeRank good goodU) :
+    VisitHooksDescend h c typeRank good goodU := by
+  intro place hp k u session
+  have harr : ∀ stride cnt, place.layout.layout.fields = .Array stride cnt →
+      ∀ (stride' : Size) elem0 s₀ s₁, h.projection.field c place.layout 0 s₀ = .ok elem0 s₁ →
+      (fun (index : Nat) (sess : Session P) => do
+        let offset ← sizeResult (stride'.mul (UInt64.ofNat index))
+        let child ← PlaceDynamic.offsetWithMeta h.projection c place offset .wrapping .none elem0
+        let path := sess.path
+        let sess ← goodGuard typeRank good place k { sess with path := path.push (.arrayElem index) } child
+        pure (ForInStep.yield { sess with path })) =
+      (fun (index : Nat) (sess : Session P) => do
+        let offset ← sizeResult (stride'.mul (UInt64.ofNat index))
+        let child ← PlaceDynamic.offsetWithMeta h.projection c place offset .wrapping .none elem0
+        let path := sess.path
+        let sess ← k { sess with path := path.push (.arrayElem index) } child
+        pure (ForInStep.yield { sess with path })) := by
+    intro stride cnt hfs stride' elem0 s₀ s₁ hfield0
+    funext index sess
+    apply bind_eq_bind' rfl; intro offset
+    apply bind_congr_ok'; intro s₂ child s₃ hoff
+    rw [goodGuard_of_descends _ _ _ _ _ _
+      (hcond.arrayElem place hp stride cnt hfs s₀ elem0 s₁ offset s₂ child s₃ hfield0 hoff)]
+  have harb : ∀ offsets order, place.layout.layout.fields = .Arbitrary offsets order →
+      (fun (index : Nat) (sess : Session P) => do
+        let child ← PlaceDynamic.field h.projection c place index
+        let path := sess.path
+        let sess ← goodGuard typeRank good place k { sess with path := path.push (← h.fieldPath c place.layout index child.layout.ty) } child
+        pure (ForInStep.yield { sess with path })) =
+      (fun (index : Nat) (sess : Session P) => do
+        let child ← PlaceDynamic.field h.projection c place index
+        let path := sess.path
+        let sess ← k { sess with path := path.push (← h.fieldPath c place.layout index child.layout.ty) } child
+        pure (ForInStep.yield { sess with path })) := by
+    intro offsets order hfs
+    funext index sess
+    apply bind_congr_ok'; intro s₀ child s₁ hfield
+    refine congrFun (bind_eq_bind' rfl fun fpath => ?_) s₁
+    rw [goodGuard_of_descends _ _ _ _ _ _
+      (hcond.arbitrary place hp offsets order hfs index s₀ child s₁ hfield)]
+  unfold visitStep
+  apply bind_congr_ok'; intro s₀ kind s₁ hcls
+  apply congrFun
+  apply bind_eq_bind' rfl
+  rintro (_ | session)
+  · peel_have; intro session
+    peel_have; funext _
+    peel_have; intro jpEpi
+    cases kind with
+    | string => rfl
+    | sequence elem =>
+      apply bind_congr_ok'; intro s₂ elemKind s₃ _
+      by_cases hnum : (elemKind == .integer || elemKind == .float) = true
+      · simp only [hnum, ↓reduceIte]
+      · simp only [hnum, Bool.false_eq_true, ↓reduceIte]
+        refine congrFun (bind_congr_ok' fun s₄ elemLay s₅ _ => ?_) s₃
+        cases elemLay.layout.isZst
+        · simp only [Bool.false_eq_true, ↓reduceIte]
+          cases hfs : place.layout.layout.fields with
+          | Primitive | Union _ | Arbitrary _ _ => rfl
+          | Array stride cnt =>
+            apply congrFun
+            apply bind_eq_bind' rfl; intro stride'
+            apply bind_eq_bind' rfl; intro len
+            apply bind_congr_ok'; intro s₆ elem0 s₇ hfield0
+            refine congrFun (bind_eq_bind' rfl fun endOff => ?_) s₇
+            apply bind_eq_bind' rfl; intro _
+            rw [harr stride cnt hfs stride' elem0 s₆ s₇ hfield0]
+        · simp only [↓reduceIte]
+          apply congrFun
+          apply bind_eq_bind' rfl; intro len
+          by_cases hgt : len > 0
+          · simp only [hgt, ↓reduceIte]
+            apply bind_congr_ok'; intro s₆ child s₇ hidx
+            rw [goodGuard_of_descends _ _ _ _ _ _ (hcond.seqZst place hp elem s₀ s₁ s₆ child s₇ hcls hidx)]
+          · simp only [hgt, ↓reduceIte]
+    | pattern base =>
+      apply bind_congr_ok'; intro s₂ lay s₃ hlay
+      by_cases hmis : (!lay.layout.isSized || !place.layout.layout.isSized || lay.layout.size != place.layout.layout.size) = true
+      · simp only [hmis, ↓reduceIte]; rfl
+      · simp only [hmis, Bool.false_eq_true, ↓reduceIte]
+        refine congrFun (bind_congr_ok' fun s₄ child s₅ hoff => ?_) s₃
+        rw [goodGuard_of_descends _ _ _ _ _ _ (hcond.pattern place hp base s₀ s₁ s₂ lay s₃ s₄ child s₅ hcls hlay hoff)]
+    | dynamic expected =>
+      peel_have; intro oldMayDangle
+      peel_have; funext _ session
+      peel_have; intro _
+      apply bind_congr_ok'; intro s₂ op s₃ htoOp
+      refine congrFun (bind_congr_ok' fun s₄ inner s₅ hunpack => ?_) s₃
+      cases hop : inner.op with
+      | immediate _ => rfl
+      | indirect memory =>
+        apply congrFun
+        peel_have; intro path
+        apply bind_eq_bind' rfl; intro fpath
+        rw [goodGuard_of_descends _ _ _ _ _ _
+          (hcond.dynamic place hp expected s₀ s₁ s₂ op s₃ s₄ inner s₅ memory hcls htoOp hunpack hop)]
+    | box =>
+      peel_have; intro oldMayDangle
+      peel_have; funext _ session
+      peel_have; intro _
+      simp only [beq_self_eq_true, ↓reduceIte]
+      apply bind_congr_ok'; intro s₂ ⟨ptr, allocator⟩ s₃ hbox
+      refine congrFun (bind_eq_bind' rfl fun sess1 => ?_) s₃
+      apply bind_eq_bind' rfl; intro fpath
+      rw [goodGuard_of_descends _ _ _ _ _ _ (hcond.box place hp s₀ s₁ s₂ ptr allocator s₃ hcls hbox)]
+    | boolean | character | integer | float | functionPointer | never | foreign | functionDefinition
+    | rawPointer _ _ | reference _ | unsafeBinder | invalid | aggregate _ _ _ =>
+      (peel_have; intro oldMayDangle
+       peel_have; funext _ session
+       peel_have; intro _
+       peel_have
+       · funext _ sess
+         cases hvs : place.layout.layout.variants with
+         | Empty | Single _ => rfl
+         | Multiple tag enc tf vs =>
+           apply bind_congr_ok'; intro s₂ op s₃ htoOp
+           refine congrFun (bind_congr_ok' fun s₄ variant s₅ hdiscr => ?_) s₃
+           refine congrFun (bind_congr_ok' fun s₆ child s₇ hdown => ?_) s₅
+           refine congrFun (bind_eq_bind' rfl fun vpath => ?_) s₇
+           rw [goodGuard_of_descends _ _ _ _ _ _
+             (hcond.multiple place hp tag enc tf vs hvs s₂ op s₃ s₄ variant s₅ s₆ child s₇ htoOp hdiscr hdown)]
+       · intro jpVar
+         cases hfs : place.layout.layout.fields with
+         | Primitive => rfl
+         | Union cnt =>
+           have hu : unionGuard goodU place u = u := by
+             unfold unionGuard; simp only [hcond.union place hp cnt hfs, ↓reduceIte]
+           simp only [hu]
+         | Arbitrary offsets order =>
+           rw [harb offsets order hfs]
+         | Array stride cnt =>
+           apply bind_eq_bind' rfl; intro len
+           apply bind_congr_ok'; intro s₂ elem0 s₃ hfield0
+           refine congrFun (bind_eq_bind' rfl fun endOff => ?_) s₃
+           apply bind_eq_bind' rfl; intro _
+           rw [harr stride cnt hfs stride elem0 s₂ s₃ hfield0])
+  · rfl
+
+/-! ### Fuel-free `validatePlace` and `constValidatePlace` (`lean-miri#90` LIFO pointee drain) -/
+
+private def resetPaddingMirrored (h : Hooks P S C E F A Pad) (c : C) (session : Session P)
+    (place : RuntimePlace P) : M S Unit := do
+  let some ranges := session.dataBytes | return
+  let memory ← forceAllocation h.projection.place c place
+  let dynamic ← h.sizeAndAlign c memory
+  let size := (dynamic.getD (memory.layout.layout.size, memory.layout.layout.align.abi)).1
+  let start := memory.mplace.ptr.offset
+  if ranges.toArray == #[allocRange start size] then return
+  let some handle ← h.beginPadding c memory size | return
+  let writes ← liftResult ((paddingWrites ranges start size).mapError fun error => .invalidProgram s!"padding: {repr error}")
+  for range in writes do h.writePadding c handle range
+
+/-- **Fuel-free `constValidatePlace` (`lean-miri#90` L787–797)** over `realVisitNoFuel`. -/
+def realConstValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
+    M S (RefTracking (Key P) ValidationPath) := h.withGhostValidation do
+  let session : Session P :=
+    { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none }
+  let session ← realVisitNoFuel h c typeRank session place
+  match session.refTracking with
+  | some tracking => return tracking
+  | none => throw (.invalidProgram "const validation lost tracker")
+
+/-- **`Classical.choice`-free structural companion of `realConstValidatePlaceNoFuel`** via `realVisitLexRank`. -/
+def realConstValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
+    M S (RefTracking (Key P) ValidationPath) := h.withGhostValidation do
+  let session : Session P :=
+    { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none }
+  let session ← realVisitLexRank h c typeRank session place
+  match session.refTracking with
+  | some tracking => return tracking
+  | none => throw (.invalidProgram "const validation lost tracker")
+
+/-- Unconditional equality between `Classical.choice`-free `realConstValidatePlaceLexRank` and
+`realConstValidatePlaceNoFuel`. -/
+theorem realConstValidatePlaceLexRank_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode) :
+    realConstValidatePlaceLexRank h c typeRank place path tracking mode =
+      realConstValidatePlaceNoFuel h c typeRank place path tracking mode := by
+  unfold realConstValidatePlaceLexRank realConstValidatePlaceNoFuel
+  dsimp only
+  rw [realVisitLexRank_eq_noFuel]
+
+/-- **Real vendored `constValidatePlace` adequacy.** Whenever `fuel > visitFuelBound maxSized typeRank place.layout`,
+the unmodified vendored `Miri.Interpreter.ValidityVisitor.constValidatePlace` agrees identically
+with `realConstValidatePlaceNoFuel`. -/
+theorem vendored_constValidatePlace_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (good : RuntimePlace P → Bool) (goodU : LocalLayout → Bool)
+    (hd : VisitHooksDescend h c typeRank good goodU)
+    (hdU : UnionHooksDescend h c typeRank (fun l => goodU l = true)) (maxSized : Nat)
+    (hmax : ∀ parent child : RuntimePlace P, good parent = true → good child = true →
+      parent.layout.layout.isSized = false → child.layout.layout.isSized = true →
+      layoutOrder typeRank child.layout ≤ maxSized)
+    (fuel : Nat) (place : RuntimePlace P) (path : ValidationPath)
+    (tracking : RefTracking (Key P) ValidationPath) (mode : CtfeMode)
+    (hp : good place = true) (hfuel : visitFuelBound maxSized typeRank place.layout < fuel) :
+    ValidityVisitor.constValidatePlace h c fuel place path tracking mode =
+      realConstValidatePlaceNoFuel h c typeRank place path tracking mode := by
+  unfold ValidityVisitor.constValidatePlace realConstValidatePlaceNoFuel
+  change h.withGhostValidation (do
+      let session ← ValidityVisitor.visit h c fuel
+        { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none } place
+      match session.refTracking with
+      | some tracking => pure tracking
+      | none => throw (.invalidProgram "const validation lost tracker")) =
+    h.withGhostValidation (do
+      let session ← realVisitNoFuel h c typeRank
+        { path, flags := ⟨false, false⟩, ctfeMode := some mode, refTracking := some tracking, dataBytes := none } place
+      match session.refTracking with
+      | some tracking => pure tracking
+      | none => throw (.invalidProgram "const validation lost tracker"))
+  rw [vendored_visit_eq_noFuel h c typeRank good goodU hd hdU maxSized hmax fuel _ place hp hfuel]
+
+/-- **Fuel-free `validatePlace` (`lean-miri#90` L746–784)**: validates the root place via
+`realVisitNoFuel`, then drains tracked pointees in LIFO order via `drainPointees` (`todo.reverse`)
+under `pointeeSession` without arbitrary `"recursive validity tracker fuel"`. -/
+def realValidatePlaceNoFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) : M S Unit := do
+  let name ← h.typeName c place.layout.ty
+  let initial : Session P := {
+    path := ⟨name, #[]⟩, flags := ⟨reset, false⟩, ctfeMode := none
+    refTracking := if recursive then some .empty else none, dataBytes := none }
+  let session ← h.withGhostValidation do
+    let mut session := initial
+    if reset then
+      if let .indirect _ := (← h.toOp c place).op then session := { session with dataBytes := some .empty }
+    session ← realVisitNoFuel h c typeRank session place
+    resetPaddingMirrored h c session place
+    return session
+  if recursive then
+    let some tracking := session.refTracking | return
+    drainPointees tracking fun key path =>
+      h.withGhostValidation do
+        let child : RuntimePlace P := ⟨.memory key.mplace, key.layout⟩
+        let visited ← realVisitNoFuel h c typeRank (pointeeSession path) child
+        resetPaddingMirrored h c visited child
+
+/-- **`Classical.choice`-free structural companion of `realValidatePlaceNoFuel`** via `realVisitLexRank`. -/
+def realValidatePlaceLexRank (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) : M S Unit := do
+  let name ← h.typeName c place.layout.ty
+  let initial : Session P := {
+    path := ⟨name, #[]⟩, flags := ⟨reset, false⟩, ctfeMode := none
+    refTracking := if recursive then some .empty else none, dataBytes := none }
+  let session ← h.withGhostValidation do
+    let mut session := initial
+    if reset then
+      if let .indirect _ := (← h.toOp c place).op then session := { session with dataBytes := some .empty }
+    session ← realVisitLexRank h c typeRank session place
+    resetPaddingMirrored h c session place
+    return session
+  if recursive then
+    let some tracking := session.refTracking | return
+    drainPointees tracking fun key path =>
+      h.withGhostValidation do
+        let child : RuntimePlace P := ⟨.memory key.mplace, key.layout⟩
+        let visited ← realVisitLexRank h c typeRank (pointeeSession path) child
+        resetPaddingMirrored h c visited child
+
+/-- Unconditional equality between `Classical.choice`-free `realValidatePlaceLexRank` and
+`realValidatePlaceNoFuel` (both root and LIFO pointee sub-traversals). -/
+theorem realValidatePlaceLexRank_eq_noFuel (h : Hooks P S C E F A Pad) (c : C)
+    (typeRank : MIR.TyId → Nat) (place : RuntimePlace P) (recursive reset : Bool) :
+    realValidatePlaceLexRank h c typeRank place recursive reset =
+      realValidatePlaceNoFuel h c typeRank place recursive reset := by
+  unfold realValidatePlaceLexRank realValidatePlaceNoFuel
+  simp only [realVisitLexRank_eq_noFuel]
+
+end LexStructuralAndCongruence
+
+/-! ### Fuelled `RefTracking.next` loop adequacy against `drainPointees` -/
+
+private theorem list_dropLast_snoc {α : Type} :
+    ∀ (l : List α) (n : Nat) (hlen : l.length = n + 1),
+      l.dropLast ++ [l[n]'(by omega)] = l
+  | [], _, hlen => nomatch hlen
+  | [x], 0, _ => rfl
+  | x :: y :: zs, n + 1, hlen => by
+    have hlen' : (y :: zs).length = n + 1 := by simp only [List.length_cons] at hlen ⊢; omega
+    show x :: ((y :: zs).dropLast ++ [(y :: zs)[n]'(by omega)]) = x :: y :: zs
+    rw [list_dropLast_snoc (y :: zs) n hlen']
+
+/-- Structural (`Nat.rec`, `Classical.choice`-free) model of the vendored `validatePlace`
+`RefTracking.next` worklist loop (`ValidityVisitor.lean` L543–556), consuming 1 unit of
+`"recursive validity tracker fuel"` per popped pointee. -/
+def drainPointeesFuel {P S : Type} :
+    Nat → RefTracking (Key P) ValidationPath → (Key P → ValidationPath → M S Unit) → M S Unit
+  | 0, tracking, _ =>
+    match tracking.next with
+    | none => pure ()
+    | some _ => throw (.resourceExhaustion "recursive validity tracker fuel")
+  | remaining + 1, tracking, visitPointee =>
+    match tracking.next with
+    | none => pure ()
+    | some ((key, path), tracking') => do
+      visitPointee key path
+      drainPointeesFuel remaining tracking' visitPointee
+
+/-- Whenever `remaining ≥ tracking.todo.size`, iterative `RefTracking.next` popping agrees
+identically with `lean-miri#90`'s fuel-free `drainPointees` (`tracking.todo.reverse.forM`). -/
+theorem drainPointeesFuel_eq_drainPointees {P S : Type} :
+    ∀ (remaining : Nat) (tracking : RefTracking (Key P) ValidationPath)
+      (visitPointee : Key P → ValidationPath → M S Unit),
+      tracking.todo.size ≤ remaining →
+      drainPointeesFuel remaining tracking visitPointee = drainPointees tracking visitPointee
+  | 0, tracking, visitPointee, hrem => by
+    have hsz : tracking.todo.size = 0 := Nat.eq_zero_of_le_zero hrem
+    have hback : tracking.todo.back? = none := by simp [Array.back?, hsz]
+    have hlist : tracking.todo.toList = [] :=
+      Array.toList_eq_nil_iff.mpr (Array.size_eq_zero_iff.mp hsz)
+    simp [drainPointeesFuel, RefTracking.next, hback, drainPointees, hlist, List.forM_nil]
+  | remaining + 1, tracking, visitPointee, hrem => by
+    cases hsz : tracking.todo.size with
+    | zero =>
+      have hback : tracking.todo.back? = none := by simp [Array.back?, hsz]
+      have hlist : tracking.todo.toList = [] :=
+        Array.toList_eq_nil_iff.mpr (Array.size_eq_zero_iff.mp hsz)
+      simp [drainPointeesFuel, RefTracking.next, hback, drainPointees, hlist, List.forM_nil]
+    | succ n =>
+      have hback_some : tracking.todo.back? = some (tracking.todo[n]'(by omega)) := by
+        simp [Array.back?, hsz]
+      simp only [drainPointeesFuel, RefTracking.next, hback_some, bind, Option.bind, pure]
+      have hpop_sz : tracking.todo.pop.size = n := by simp [Array.size_pop, hsz]
+      have hsplit : tracking.todo.toList =
+          tracking.todo.pop.toList ++ [tracking.todo[n]'(by omega)] := by
+        rw [Array.toList_pop]
+        have hlen : tracking.todo.toList.length = n + 1 := by simp [hsz]
+        exact (list_dropLast_snoc tracking.todo.toList n hlen).symm
+      unfold drainPointees
+      rw [hsplit]
+      simp only [List.reverse_append, List.reverse_singleton, List.singleton_append]
+      change (do
+          let _ ← visitPointee (tracking.todo[n]'(by omega)).1 (tracking.todo[n]'(by omega)).2
+          drainPointeesFuel remaining { seen := tracking.seen, todo := tracking.todo.pop } visitPointee) =
+        (do
+          let _ ← visitPointee (tracking.todo[n]'(by omega)).1 (tracking.todo[n]'(by omega)).2
+          tracking.todo.pop.toList.reverse.forM fun entry => visitPointee entry.1 entry.2)
+      congr 1; funext _
+      exact drainPointeesFuel_eq_drainPointees remaining
+        { seen := tracking.seen, todo := tracking.todo.pop } visitPointee (by simp [hpop_sz]; omega)
+
+/-- Conversely, when `remaining < tracking.todo.size` and each pointee check succeeds,
+`drainPointeesFuel` deterministically fails with `"recursive validity tracker fuel"`. -/
+theorem drainPointeesFuel_exhausts_of_lt {P S : Type} :
+    ∀ (remaining : Nat) (tracking : RefTracking (Key P) ValidationPath)
+      (visitPointee : Key P → ValidationPath → M S Unit) (s : S),
+      remaining < tracking.todo.size →
+      (∀ k p σ, ∃ σ', visitPointee k p σ = .ok () σ') →
+      ∃ s', drainPointeesFuel remaining tracking visitPointee s =
+        .error (.resourceExhaustion "recursive validity tracker fuel") s'
+  | 0, tracking, _, s, hlt, _ => by
+    have _ := hlt
+    have hback : tracking.todo.back? = some (tracking.todo[tracking.todo.size - 1]'(by omega)) := by
+      simp [Array.back?]
+    exact ⟨s, by simp [drainPointeesFuel, RefTracking.next, hback, bind, Option.bind, pure]; rfl⟩
+  | remaining + 1, tracking, visitPointee, s, hlt, hok => by
+    have hpos : 0 < tracking.todo.size := by omega
+    have _ := hpos
+    have hback : tracking.todo.back? = some (tracking.todo[tracking.todo.size - 1]'(by omega)) := by
+      simp [Array.back?]
+    simp only [drainPointeesFuel, RefTracking.next, hback, bind, Option.bind, pure, EStateM.bind]
+    obtain ⟨s₁, hs₁⟩ := hok _ _ s
+    rw [hs₁]
+    exact drainPointeesFuel_exhausts_of_lt remaining
+      { seen := tracking.seen, todo := tracking.todo.pop } visitPointee s₁
+      (by simp [Array.size_pop]; omega) hok
+
+/-! ### Non-vacuous `RealVisit` witnesses:
+1. Unsized `dyn Trait` dynamic unpacking (`VTable.unpackDynTrait`) discharging general `vendored_visit_eq_noFuel`
+   and proving `realVisitLexRank` succeeds where sized-only `realVisitRank` falsely exhausts fuel.
+2. Same-`TyId` multi-variant enum + aggregate (`Discriminant.readDiscriminant` + `PlaceDynamic.downcast` +
+   `PlaceDynamic.field`) descending purely by `layoutPhase` `2 -> 1 -> 0` at constant `typeRank = 0`.
+3. 3-reference array LIFO pointee draining (`realValidatePlaceNoFuel`, `#[16, 8, 0]`, `"validation[0]"`)
+   mirroring `lean-miri#90` `ConnectedPointerAlignment.lean` L863–906. -/
+
+/-- Canonical test `AllocId = 1` for symbolic vtable and reference witnesses. -/
+def witnessAllocId : AllocId := ⟨1, by decide⟩
+
+/-- Canonical `CtfeProvenance` on `witnessAllocId`. -/
+def witnessProv : CtfeProvenance :=
+  match h : CtfeProvenance.fromAllocId witnessAllocId with
+  | .ok p => p
+  | .error _ => False.elim (by simp [CtfeProvenance.fromAllocId, witnessAllocId] at h)
+
+/-- Symbolic vtable metadata scalar pointing to `witnessAllocId` at offset `0`. -/
+def witnessVTableMeta : MemPlaceMeta CtfeProvenance :=
+  .metadata (Scalar.fromPointer RuntimeTargetDataLayout.default.base ⟨Size.ZERO, witnessProv⟩)
+
+/-- Layouts for the unsized `dyn Trait` `RealVisit` witness:
+- `ty = 100`: unsized `dyn Trait` (`typeRank 100 = 0`, `isSized = false`, `fields = .Arbitrary #[] #[]`,
+  `layoutOrder = 1`, `visitOrder = (1, 1)`),
+- `ty = 50, 49, 48`: concrete sized single-field aggregates (`typeRank ty = ty`, `isSized = true`,
+  `layoutOrder = 151, 148, 145`),
+- `ty = 0`: sized `.Primitive` leaf (`typeRank 0 = 0`, `layoutOrder = 0`, `visitOrder = (0, 0)`). -/
+def dynVisitLayout (ty : MIR.TyId) : LocalLayout :=
+  if ty == 100 then
+    ⟨100, { wrapperLayout with fields := .Arbitrary #[] #[], backendRepr := .Memory (sized := false) }⟩
+  else if ty == 0 then
+    ⟨0, { wrapperLayout with fields := .Primitive }⟩
+  else
+    ⟨ty, wrapperLayout⟩
+
+/-- Schema 17 `typeRank` assigning rank `0` to the unsized trait object `ty = 100` and `ty` otherwise. -/
+def dynVisitTypeRank (ty : MIR.TyId) : Nat :=
+  if ty == 100 then 0 else ty
+
+/-- Concrete `ValidityVisitor.Hooks` exercising `VTable.unpackDynTrait` (`ty = 100 -> ty = 50`)
+followed by 3 `.Arbitrary` aggregate field projections (`50 -> 49 -> 48 -> 0`). -/
+def dynTraitVisitHooks : Hooks CtfeProvenance Unit Unit Unit Unit Unit Unit :=
+  let base := minimalValidityHooks
+    (fun parent _ => dynVisitLayout (if parent.ty == 48 then 0 else parent.ty - 1))
+    dynVisitLayout
+    (fun ty =>
+      if ty == 100 then .dynamic 0
+      else if ty == 0 then .foreign
+      else .aggregate false false false)
+  { base with
+    fieldPath := fun _ _ idx _ => pure (.field s!"{idx}")
+    toOp := fun _ place =>
+      match place.ref with
+      | .memory m => pure ⟨.indirect m, place.layout⟩
+      | .local .. => throw (.invalidProgram "expected memory place")
+    vtable := { base.vtable with
+      isDynamic := fun _ ty => pure (ty == 100)
+      memoryOffset := fun _ baseMem offset _ metaVal =>
+        match baseMem.ptr.offset.add offset with
+        | .ok off => pure { baseMem with ptr := { baseMem.ptr with offset := off }, metadata := metaVal }
+        | .error e => throw (.invalidProgram (reprStr e))
+      resolvePointer := fun _ ptr => pure (.ok (witnessAllocId, ptr.offset))
+      globalVTable := fun _ _ => pure (some (50, 0))
+      predicates := fun _ _ => pure #[]
+      normalizePredicate := fun _ p => pure p.id
+      layoutOf := fun _ ty => pure (dynVisitLayout ty) } }
+
+/-- Good places for `dynTraitVisitHooks`: zero-offset memory places at `ty ∈ {100, 50, 49, 48, 0}`
+with `witnessVTableMeta` at `ty = 100` and `.none` metadata on concrete sized projections. -/
+def dynTraitGood (p : RuntimePlace CtfeProvenance) : Bool :=
+  match p.ref with
+  | .memory ⟨⟨off, _⟩, metaVal, _⟩ =>
+    off == Size.ZERO &&
+      ((p.layout.ty == 100 && decide (metaVal = witnessVTableMeta)) ||
+       ((p.layout.ty == 50 || p.layout.ty == 49 || p.layout.ty == 48 || p.layout.ty == 0) &&
+        decide (metaVal = .none))) &&
+      decide (p.layout = dynVisitLayout p.layout.ty)
+  | .local .. => false
+
+private theorem dyn_field_ok_inv (prov : Option CtfeProvenance) (mis : Option Misalignment)
+    (t next : Nat) (ht : t = 50 ∨ t = 49 ∨ t = 48)
+    (hnext : (if t == 48 then 0 else t - 1) = next)
+    (idx : Nat) (child : RuntimePlace CtfeProvenance)
+    (hfield : PlaceDynamic.field dynTraitVisitHooks.projection ()
+      ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout t⟩ idx () = .ok child ()) :
+    child = ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout next⟩ := by
+  subst hnext
+  have hstep : ∀ s, s = 50 ∨ s = 49 ∨ s = 48 →
+      PlaceDynamic.field dynTraitVisitHooks.projection ()
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout s⟩ idx () =
+        (match idx with
+         | 0 => .ok ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout (if s == 48 then 0 else s - 1)⟩ ()
+         | k + 1 => .error (.invalidProgram s!"place layout: {repr (LayoutError.fieldOutOfBounds (k + 1) 1)}") ()) := by
+    intro s hs
+    rcases hs with rfl | rfl | rfl <;> (cases idx <;> rfl)
+  rw [hstep t ht] at hfield
+  cases idx with
+  | zero => cases hfield; rfl
+  | succ _ => cases hfield
+
+/-- `dynTraitVisitHooks` satisfies `VisitHooksDescend` (discharged via `visitHooksDescend_of_conditions`). -/
+theorem dynTrait_visitHooksDescend :
+    VisitHooksDescend dynTraitVisitHooks () dynVisitTypeRank dynTraitGood (fun _ => false) := by
+  apply visitHooksDescend_of_conditions
+  have unpackTy : ∀ p : RuntimePlace CtfeProvenance, dynTraitGood p = true →
+      ∃ prov mis,
+        (p = ⟨.memory ⟨⟨Size.ZERO, prov⟩, witnessVTableMeta, mis⟩, dynVisitLayout 100⟩ ∧ p.layout.ty = 100) ∨
+        (p = ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout p.layout.ty⟩ ∧
+          (p.layout.ty = 50 ∨ p.layout.ty = 49 ∨ p.layout.ty = 48 ∨ p.layout.ty = 0)) := by
+    rintro ⟨ref, lay⟩ hp
+    cases ref with
+    | «local» => simp [dynTraitGood] at hp
+    | memory m =>
+      rcases m with ⟨⟨off, prov⟩, metaVal, mis⟩
+      simp only [dynTraitGood, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq,
+        or_assoc] at hp
+      rcases hp with ⟨⟨rfl, ⟨hty, rfl⟩ | ⟨htys, rfl⟩⟩, hlay⟩
+      · exact ⟨prov, mis, Or.inl ⟨by rw [hlay, hty], hty⟩⟩
+      · exact ⟨prov, mis, Or.inr ⟨by dsimp only; rw [← hlay], htys⟩⟩
+  have badCls : ∀ {ty : MIR.TyId} {k : TypeKind} {s₀ s₁ : Unit},
+      (∀ e, k ≠ .dynamic e) → k ≠ .foreign → (∀ a b c, k ≠ .aggregate a b c) →
+      dynTraitVisitHooks.classify () ty s₀ = .ok k s₁ → False := by
+    intro ty k s₀ s₁ h1 h2 h3 hcls
+    simp only [dynTraitVisitHooks, minimalValidityHooks, pure, EStateM.pure, EStateM.Result.ok.injEq] at hcls
+    obtain ⟨hcls, -⟩ := hcls
+    cases h100 : (ty == 100)
+    · simp only [h100, Bool.false_eq_true, ↓reduceIte] at hcls
+      cases h0 : (ty == 0)
+      · simp only [h0, Bool.false_eq_true, ↓reduceIte] at hcls
+        exact h3 _ _ _ hcls.symm
+      · simp only [h0, ↓reduceIte] at hcls
+        exact h2 hcls.symm
+    · simp only [h100, ↓reduceIte] at hcls
+      exact h1 0 hcls.symm
+  refine {
+    seqZst := fun _ _ _ _ _ _ _ _ hcls _ =>
+      False.elim (badCls (fun _ h => by cases h) (fun h => by cases h) (fun _ _ _ h => by cases h) hcls)
+    arrayElem := fun place hp stride cnt hfs => by
+      obtain ⟨_, _, ⟨heq, _⟩ | ⟨heq, hcases⟩⟩ := unpackTy place hp
+      · rw [heq] at hfs; simp [dynVisitLayout, wrapperLayout] at hfs
+      · rcases hcases with h | h | h | h <;> (rw [heq] at hfs; simp [h, dynVisitLayout, wrapperLayout] at hfs)
+    pattern := fun _ _ _ _ _ _ _ _ _ _ _ hcls _ _ =>
+      False.elim (badCls (fun _ h => by cases h) (fun h => by cases h) (fun _ _ _ h => by cases h) hcls)
+    dynamic := ?_
+    box := fun _ _ _ _ _ _ _ _ hcls _ =>
+      False.elim (badCls (fun _ h => by cases h) (fun h => by cases h) (fun _ _ _ h => by cases h) hcls)
+    arbitrary := ?_
+    multiple := fun place hp tag enc tf vs hvs => by
+      obtain ⟨_, _, ⟨heq, _⟩ | ⟨heq, hcases⟩⟩ := unpackTy place hp
+      · rw [heq] at hvs; simp [dynVisitLayout, wrapperLayout] at hvs
+      · rcases hcases with h | h | h | h <;> (rw [heq] at hvs; simp [h, dynVisitLayout, wrapperLayout] at hvs)
+    union := fun place hp cnt hfs => by
+      obtain ⟨_, _, ⟨heq, _⟩ | ⟨heq, hcases⟩⟩ := unpackTy place hp
+      · rw [heq] at hfs; simp [dynVisitLayout, wrapperLayout] at hfs
+      · rcases hcases with h | h | h | h <;> (rw [heq] at hfs; simp [h, dynVisitLayout, wrapperLayout] at hfs)
+  }
+  · intro place hp expected s₀ s₁ s₂ op s₃ s₄ inner s₅ memory hcls htoOp hunpack hop
+    cases s₂; cases s₃; cases s₄; cases s₅
+    obtain ⟨prov, mis, ⟨heq, hty100⟩ | ⟨_, hcases⟩⟩ := unpackTy place hp
+    · have hexp : expected = 0 := by
+        simp [hty100, dynTraitVisitHooks, minimalValidityHooks, pure, EStateM.pure] at hcls
+        exact hcls.symm
+      subst hexp
+      rw [heq] at htoOp ⊢
+      simp only [dynTraitVisitHooks, pure, EStateM.pure, EStateM.Result.ok.injEq] at htoOp
+      obtain ⟨rfl, -⟩ := htoOp
+      have hm : VTable.unpackDynTrait dynTraitVisitHooks.vtable ()
+          ⟨.indirect ⟨⟨Size.ZERO, prov⟩, witnessVTableMeta, mis⟩, dynVisitLayout 100⟩ 0 () =
+          .ok ⟨.indirect ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, dynVisitLayout 50⟩ () := rfl
+      rw [hm] at hunpack
+      cases hunpack
+      cases hop
+      refine ⟨by simp [dynTraitGood, dynVisitLayout], ?_⟩
+      exact visitOrder_lt_of_unsized_unpack dynVisitTypeRank
+        (dynVisitLayout 100) (dynVisitLayout 50) rfl rfl
+    · simp only [dynTraitVisitHooks, minimalValidityHooks, pure, EStateM.pure,
+        EStateM.Result.ok.injEq] at hcls
+      rcases hcases with h | h | h | h <;> simp [h] at hcls
+  · intro place hp offsets order hfs idx s₀ child s₁ hfield
+    cases s₀; cases s₁
+    obtain ⟨prov, mis, ⟨heq, _⟩ | ⟨heq, hcases⟩⟩ := unpackTy place hp
+    · rw [heq] at hfield
+      have herr : PlaceDynamic.field dynTraitVisitHooks.projection ()
+          ⟨.memory ⟨⟨Size.ZERO, prov⟩, witnessVTableMeta, mis⟩, dynVisitLayout 100⟩ idx () =
+          .error (.invalidProgram s!"place layout: {repr (LayoutError.fieldOutOfBounds idx 0)}") () := rfl
+      rw [herr] at hfield; cases hfield
+    · rcases hcases with h50 | h49 | h48 | h0
+      · rw [heq, h50] at hfield ⊢
+        rw [dyn_field_ok_inv prov mis 50 49 (Or.inl rfl) rfl idx child hfield]
+        exact ⟨by simp [dynTraitGood, dynVisitLayout], by dsimp only; decide +kernel⟩
+      · rw [heq, h49] at hfield ⊢
+        rw [dyn_field_ok_inv prov mis 49 48 (Or.inr (Or.inl rfl)) rfl idx child hfield]
+        exact ⟨by simp [dynTraitGood, dynVisitLayout], by dsimp only; decide +kernel⟩
+      · rw [heq, h48] at hfield ⊢
+        rw [dyn_field_ok_inv prov mis 48 0 (Or.inr (Or.inr rfl)) rfl idx child hfield]
+        exact ⟨by simp [dynTraitGood, dynVisitLayout], by dsimp only; decide +kernel⟩
+      · rw [heq, h0] at hfs
+        simp [dynVisitLayout] at hfs
+
+/-- `UnionHooksDescend` holds vacuously for `dynTraitVisitHooks`'s empty union invariant. -/
+theorem dynTrait_unionHooksDescend :
+    UnionHooksDescend dynTraitVisitHooks () dynVisitTypeRank
+      (fun l => (fun _ => false : LocalLayout → Bool) l = true) := by
+  intro l hl
+  exact absurd hl (by simp)
+
+/-- **General unsized `vendored_visit_eq_noFuel` instantiated on `dynTraitVisitHooks` (`maxSized = 151`).**
+For every valid vtable-backed `dyn Trait` place (`ty = 100`) and every `fuel > 154`
+(`visitFuelBound 151 dynVisitTypeRank (dynVisitLayout 100) = 154`), the unmodified vendored
+`ValidityVisitor.visit` equals `realVisitNoFuel` across `VTable.unpackDynTrait` and all 3 concrete
+field projections. -/
+theorem dynTrait_vendored_visit_eq_noFuel (fuel : Nat) (prov : Option CtfeProvenance)
+    (mis : Option Misalignment) (session : Session CtfeProvenance) (hfuel : 154 < fuel) :
+    ValidityVisitor.visit dynTraitVisitHooks () fuel session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, witnessVTableMeta, mis⟩, dynVisitLayout 100⟩ =
+      realVisitNoFuel dynTraitVisitHooks () dynVisitTypeRank session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, witnessVTableMeta, mis⟩, dynVisitLayout 100⟩ := by
+  refine vendored_visit_eq_noFuel dynTraitVisitHooks () dynVisitTypeRank dynTraitGood
+    (fun _ => false) dynTrait_visitHooksDescend dynTrait_unionHooksDescend 151 ?_
+    fuel session _ (by simp [dynTraitGood, dynVisitLayout]) ?_
+  · rintro ⟨refP, layP⟩ ⟨refC, layC⟩ _ hgoodC _ hszC
+    cases refC with
+    | «local» => simp [dynTraitGood] at hgoodC
+    | memory m =>
+      rcases m with ⟨⟨off, _⟩, metaVal, _⟩
+      simp only [dynTraitGood, Bool.and_eq_true, Bool.or_eq_true, decide_eq_true_eq, beq_iff_eq,
+        or_assoc] at hgoodC
+      rcases hgoodC with ⟨⟨_, ⟨h100, _⟩ | ⟨h50 | h49 | h48 | h0, _⟩⟩, hlayC⟩
+      · have hbad : layC.layout.isSized = false := by rw [hlayC, h100]; rfl
+        rw [hbad] at hszC; cases hszC
+      · dsimp only; rw [hlayC, h50]; decide +kernel
+      · dsimp only; rw [hlayC, h49]; decide +kernel
+      · dsimp only; rw [hlayC, h48]; decide +kernel
+      · dsimp only; rw [hlayC, h0]; decide +kernel
+  · change visitFuelBound 151 dynVisitTypeRank (dynVisitLayout 100) < fuel
+    have hb : visitFuelBound 151 dynVisitTypeRank (dynVisitLayout 100) = 154 := by decide +kernel
+    omega
+
+/-- **Kernel-evaluated witness separating `realVisitLexRank` from sized-only `realVisitRank` on `dyn Trait`!**
+On the unsized `dyn Trait` root (`ty = 100 -> 50 -> 49 -> 48 -> 0`, 5 places):
+- `realVisitLexRank` (and therefore `realVisitNoFuel`, by `realVisitLexRank_eq_noFuel`) **succeeds**,
+- vendored `ValidityVisitor.visit` at `fuel = 5` **succeeds**, whereas
+- sized-only `realVisitRank` (`fuel = layoutOrder 100 + 2 = 3`) **falsely exhausts fuel**! -/
+theorem dynTrait_lexRank_succeeds_while_sizedRank_exhausts :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, witnessVTableMeta, none⟩, dynVisitLayout 100⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"DynRoot", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    resultOk (realVisitLexRank dynTraitVisitHooks () dynVisitTypeRank init root ()) = true ∧
+      resultOk (realVisitNoFuel dynTraitVisitHooks () dynVisitTypeRank init root ()) = true ∧
+      resultOk (ValidityVisitor.visit dynTraitVisitHooks () 5 init root ()) = true ∧
+      resultExhausted "validity traversal fuel"
+        (realVisitRank dynTraitVisitHooks () dynVisitTypeRank init root ()) = true := by
+  intro root init
+  have hlex : realVisitLexRank dynTraitVisitHooks () dynVisitTypeRank init root =
+      realVisitNoFuel dynTraitVisitHooks () dynVisitTypeRank init root :=
+    realVisitLexRank_eq_noFuel _ _ _ _ _
+  refine ⟨by decide +kernel, ?_, by decide +kernel, by decide +kernel⟩
+  rw [← hlex]
+  decide +kernel
+
+/-! #### Witness 2: Same-`TyId` multi-variant enum -> aggregate -> scalar (`typeRank = 0` throughout) -/
+
+/-- One-byte `u8` tag scalar (`0..=1` valid range) for the multi-variant enum witness. -/
+def enumU8Tag : ABI.Scalar :=
+  ABI.Scalar.Initialized (value := .Int .I8 false) (validRange := ⟨0, 1⟩)
+
+/-- Variant 0 layout for the same-`TyId` enum witness (`size = 1`, one field at offset `0`). -/
+def enumVariant0 : VariantLayout where
+  size := Size.ofBytes 1
+  backendRepr := .Scalar enumU8Tag
+  fieldOffsets := #[Size.ZERO]
+  fieldsInMemoryOrder := #[0]
+  largestNiche := none
+  uninhabited := false
+
+/-- Phase-2 multi-variant enum layout (`ty = 0`, `variants = .Multiple`, `layoutPhase = 2`). -/
+def enumRootLayout : LocalLayout :=
+  ⟨0, { wrapperLayout with
+    fields := .Primitive
+    variants := .Multiple enumU8Tag .Direct 0 #[enumVariant0, enumVariant0]
+    backendRepr := .Scalar enumU8Tag }⟩
+
+/-- Phase-1 downcasted single-variant aggregate layout (`ty = 0`, `variants = .Single 0`, `fields = .Arbitrary`, `layoutPhase = 1`). -/
+def enumDowncastLayout : LocalLayout :=
+  ⟨0, wrapperLayout⟩
+
+/-- Phase-0 primitive scalar field layout (`ty = 0`, `variants = .Single 0`, `fields = .Primitive`, `layoutPhase = 0`). -/
+def enumScalarLeafLayout : LocalLayout :=
+  ⟨0, { wrapperLayout with
+    fields := .Primitive
+    backendRepr := .Scalar enumU8Tag }⟩
+
+/-- Tag scalar layout (`u8`, unsigned scalar backendRepr) returned by `discriminantLayout` / `tagLayout`. -/
+def enumTagFieldLayout : LocalLayout :=
+  ⟨0, { wrapperLayout with
+    fields := .Primitive
+    backendRepr := .Scalar (ABI.Scalar.Initialized (value := .Int .I8 false) (validRange := ⟨0, 255⟩)) }⟩
+
+/-- Valid `0 : u8` scalar immediate (`Scalar.fromBool false`) for discriminant reading. -/
+def zeroU8Scalar : Scalar CtfeProvenance :=
+  Scalar.fromBool false
+
+/-- Concrete `ValidityVisitor.Hooks` exercising `.Multiple` enum discriminant read + `PlaceDynamic.downcast`
+(`phase 2 -> phase 1`) followed by `.Arbitrary` `PlaceDynamic.field` (`phase 1 -> phase 0`), all at
+the SAME `TyId = 0` (`typeRank = fun _ => 0`)! -/
+def enumPhaseVisitHooks : Hooks CtfeProvenance Unit Unit Unit Unit Unit Unit :=
+  let base := minimalValidityHooks
+    (fun _ _ => enumScalarLeafLayout)
+    (fun _ => enumRootLayout)
+    (fun _ => .aggregate false false true)
+  { base with
+    classify := fun _ _ => pure (.aggregate false false true)
+    fieldPath := fun _ _ idx _ => pure (.field s!"{idx}")
+    variantPath := fun _ _ v => pure (.variant s!"{v}")
+    toOp := fun _ place =>
+      match place.ref with
+      | .memory m => pure ⟨.indirect m, place.layout⟩
+      | .local .. => throw (.invalidProgram "expected memory place")
+    projection := { base.projection with
+      variant := fun _ _ _ => pure enumDowncastLayout
+      field := fun _ _ _ => pure enumScalarLeafLayout }
+    discriminant := { base.discriminant with
+      discriminantLayout := fun _ _ => pure enumTagFieldLayout
+      tagLayout := fun _ _ => pure enumTagFieldLayout
+      projectRead := fun _ op _ => pure ⟨op.op, enumTagFieldLayout⟩
+      readImmediate := fun _ _ => pure ⟨.scalar zeroU8Scalar, enumTagFieldLayout⟩
+      variantForDiscriminant := fun _ _ _ => pure (some 0) } }
+
+/-- Good places for `enumPhaseVisitHooks`: zero-offset thin memory places at one of the 3 `ty = 0` phase layouts. -/
+def enumPhaseGood (p : RuntimePlace CtfeProvenance) : Bool :=
+  match p.ref with
+  | .memory ⟨⟨off, _⟩, metaVal, _⟩ =>
+    off == Size.ZERO && decide (metaVal = .none) &&
+      (decide (p.layout = enumRootLayout) ||
+        decide (p.layout = enumDowncastLayout) ||
+        decide (p.layout = enumScalarLeafLayout))
+  | .local .. => false
+
+/-- `enumPhaseVisitHooks` satisfies `VisitHooksDescend` at constant `typeRank = 0`, descending purely
+via `layoutOrder_variant_lt` (`2 -> 1`) and `layoutOrder_primitive_lt` (`1 -> 0`). -/
+theorem enumPhase_visitHooksDescend :
+    VisitHooksDescend enumPhaseVisitHooks () (fun _ => 0) enumPhaseGood (fun _ => false) := by
+  apply visitHooksDescend_of_conditions
+  have unpackP : ∀ p : RuntimePlace CtfeProvenance, enumPhaseGood p = true →
+      ∃ prov mis, p = ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, p.layout⟩ ∧
+        (p.layout = enumRootLayout ∨ p.layout = enumDowncastLayout ∨ p.layout = enumScalarLeafLayout) := by
+    rintro ⟨ref, lay⟩ hp
+    cases ref with
+    | «local» => simp [enumPhaseGood] at hp
+    | memory m =>
+      rcases m with ⟨⟨off, prov⟩, metaVal, mis⟩
+      simp only [enumPhaseGood, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq,
+        decide_eq_true_eq, or_assoc] at hp
+      rcases hp with ⟨⟨rfl, rfl⟩, hlay⟩
+      exact ⟨prov, mis, rfl, hlay⟩
+  refine {
+    seqZst := fun _ _ _ _ _ _ _ _ hcls _ => nomatch hcls
+    arrayElem := fun place hp stride cnt hfs => by
+      obtain ⟨_, _, _, hlay⟩ := unpackP place hp
+      rcases hlay with h | h | h <;> (rw [h] at hfs; simp [enumRootLayout, enumDowncastLayout, enumScalarLeafLayout, wrapperLayout] at hfs)
+    pattern := fun _ _ _ _ _ _ _ _ _ _ _ hcls _ _ => nomatch hcls
+    dynamic := fun _ _ _ _ _ _ _ _ _ _ _ _ hcls _ _ _ => nomatch hcls
+    box := fun _ _ _ _ _ _ _ _ hcls _ => nomatch hcls
+    arbitrary := ?_
+    multiple := ?_
+    union := fun place hp cnt hfs => by
+      obtain ⟨_, _, _, hlay⟩ := unpackP place hp
+      rcases hlay with h | h | h <;> (rw [h] at hfs; simp [enumRootLayout, enumDowncastLayout, enumScalarLeafLayout, wrapperLayout] at hfs)
+  }
+  · intro place hp offsets order hfs idx s₀ child s₁ hfield
+    cases s₀; cases s₁
+    obtain ⟨prov, mis, heq, hlay⟩ := unpackP place hp
+    rcases hlay with hroot | hdown | hleaf
+    · rw [hroot] at hfs; simp [enumRootLayout] at hfs
+    · rw [heq, hdown] at hfield ⊢
+      cases idx with
+      | zero =>
+        have h0 : PlaceDynamic.field enumPhaseVisitHooks.projection ()
+            ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumDowncastLayout⟩ 0 () =
+            .ok ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumScalarLeafLayout⟩ () := rfl
+        rw [h0] at hfield
+        cases hfield
+        refine ⟨by simp [enumPhaseGood], ?_⟩
+        exact visitOrder_lt_of_same_sized (fun _ => 0) enumDowncastLayout enumScalarLeafLayout rfl
+          (layoutOrder_primitive_lt (fun _ => 0) enumDowncastLayout enumScalarLeafLayout
+            rfl rfl (by intro _ _ _ _ h; cases h) (by decide))
+      | succ k =>
+        have herr : PlaceDynamic.field enumPhaseVisitHooks.projection ()
+            ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumDowncastLayout⟩ (k + 1) () =
+            .error (.invalidProgram s!"place layout: {repr (LayoutError.fieldOutOfBounds (k + 1) 1)}") () := rfl
+        rw [herr] at hfield; cases hfield
+    · rw [hleaf] at hfs; simp [enumScalarLeafLayout] at hfs
+  · intro place hp tag enc tf vs hvs s₀ op s₁ s₂ variant s₃ s₄ child s₅ _ _ hdown
+    cases s₄; cases s₅
+    obtain ⟨prov, mis, heq, hlay⟩ := unpackP place hp
+    rcases hlay with hroot | hdownL | hleaf
+    · rw [heq, hroot] at hdown ⊢
+      have hd : PlaceDynamic.downcast enumPhaseVisitHooks.projection ()
+          ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumRootLayout⟩ variant () =
+          .ok ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumDowncastLayout⟩ () := rfl
+      rw [hd] at hdown
+      cases hdown
+      refine ⟨by simp [enumPhaseGood], ?_⟩
+      exact visitOrder_lt_of_same_sized (fun _ => 0) enumRootLayout enumDowncastLayout rfl
+        (layoutOrder_variant_lt (fun _ => 0) enumRootLayout enumDowncastLayout
+          rfl ⟨_, _, _, _, rfl⟩ (by intro _ _ _ _ h; cases h))
+    · rw [hdownL] at hvs; simp [enumDowncastLayout, wrapperLayout] at hvs
+    · rw [hleaf] at hvs; simp [enumScalarLeafLayout, wrapperLayout] at hvs
+
+/-- **Same-`TyId` enum + aggregate adequacy (`typeRank = 0`):** for every `fuel > 3`, unmodified
+vendored `ValidityVisitor.visit` equals `realVisitNoFuel` across `.Multiple` downcast and `.Arbitrary`
+field projection, AND succeeds in the kernel (`decide +kernel`). -/
+theorem enumPhase_vendored_visit_eq_noFuel (fuel : Nat) (prov : Option CtfeProvenance)
+    (mis : Option Misalignment) (session : Session CtfeProvenance) (hfuel : 3 < fuel) :
+    ValidityVisitor.visit enumPhaseVisitHooks () fuel session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumRootLayout⟩ =
+      realVisitNoFuel enumPhaseVisitHooks () (fun _ => 0) session
+        ⟨.memory ⟨⟨Size.ZERO, prov⟩, .none, mis⟩, enumRootLayout⟩ := by
+  refine vendored_visit_eq_noFuel_of_sized enumPhaseVisitHooks () (fun _ => 0) enumPhaseGood
+    (fun _ => false) enumPhase_visitHooksDescend (fun l hl => absurd hl (by simp))
+    fuel session _ (by simp [enumPhaseGood]) rfl ?_
+  change layoutOrder (fun _ => 0) enumRootLayout + 1 < fuel
+  have hord : layoutOrder (fun _ => 0) enumRootLayout = 2 := by decide +kernel
+  omega
+
+/-- Kernel-evaluated success of `enumPhaseVisitHooks` on both vendored `visit` (`fuel = 4`) and
+`realVisitNoFuel` (via `realVisitLexRank`). -/
+theorem enumPhase_visit_ok :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, enumRootLayout⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"EnumRoot", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    resultOk (realVisitNoFuel enumPhaseVisitHooks () (fun _ => 0) init root ()) = true ∧
+      resultOk (ValidityVisitor.visit enumPhaseVisitHooks () 4 init root ()) = true := by
+  intro root init
+  rw [← realVisitLexRank_eq_noFuel]
+  exact ⟨by decide +kernel, by decide +kernel⟩
+
+/-! #### Witness 3: 3-reference array LIFO pointee draining (`lean-miri#90` `ConnectedPointerAlignment.lean` L863–906) -/
+
+/-- Reference layout (`ty = 1`, 8-byte thin pointer). -/
+def lifoRefLayout : LocalLayout :=
+  ⟨1, { wrapperLayout with
+    fields := .Primitive
+    size := Size.ofBytes 8
+    backendRepr := .Scalar (ABI.Scalar.Initialized
+      (value := .Pointer .ZERO) (validRange := ⟨0, 0xFFFF_FFFF_FFFF_FFFF⟩)) }⟩
+
+/-- 3-element array `[&bool; 3]` layout (`ty = 2`, stride `8`, count `3`, size `24`). -/
+def lifoArrayLayout : LocalLayout :=
+  ⟨2, { wrapperLayout with
+    fields := .Array (Size.ofBytes 8) 3
+    size := Size.ofBytes 24 }⟩
+
+/-- Pointee `bool` layout (`ty = 3`, 1-byte boolean). -/
+def lifoBoolLayout : LocalLayout :=
+  ⟨3, { wrapperLayout with
+    fields := .Primitive
+    size := Size.ofBytes 1
+    backendRepr := .Scalar (ABI.Scalar.Initialized (value := .Int .I8 false) (validRange := ⟨0, 1⟩)) }⟩
+
+private def unusedLifo {A : Type} : M (Array UInt64) A := throw (StepError.unsupported "unused")
+
+/-- Concrete `ValidityVisitor.Hooks` over `State := Array UInt64` (recording visited boolean byte
+offsets) reproducing `lean-miri#90` `ConnectedPointerAlignment.lean` L863–906:
+- `ty = 2` is `.sequence 1` (`[&bool; 3]` at offsets `0, 8, 16`),
+- `ty = 1` is `.reference false` reading a pointer to the same offset (`0, 8, 16`),
+- `ty = 3` is `.boolean` recording `offset.bytes` into state and returning `2` (invalid `bool`!) at
+  offset `0` vs `1` (valid `true`) at offsets `8` and `16`. -/
+def lifo3RefHooks : Hooks CtfeProvenance (Array UInt64) Unit Unit Unit Unit Unit where
+  target := RuntimeTargetDataLayout.default
+  projection := {
+    place := {
+      getFrame := unusedLifo, setFrame := fun _ => unusedLifo
+      debugAssertions := false, frameIndex := unusedLifo
+      resolveLayout := fun _ _ => unusedLifo
+      localToOp := fun _ _ => unusedLifo
+      projection := fun _ => unusedLifo
+      deref := fun _ _ _ => unusedLifo
+      checkPlaceType := fun _ _ _ => unusedLifo
+      allocateStack := fun _ _ => unusedLifo
+      writeMemoryNoValidate := fun _ _ _ => unusedLifo
+      afterLocalMovedToMemory := fun _ _ _ => unusedLifo
+      memoryOffset := fun _ base offset _ metaVal =>
+        match base.ptr.offset.add offset with
+        | .ok off => pure { base with ptr := { base.ptr with offset := off }, metadata := metaVal }
+        | .error e => throw (StepError.invalidProgram (reprStr e))
+      writeLocalImmediate := fun _ _ _ _ => unusedLifo
+      enforceValidity := fun _ _ => pure true, validate := fun _ _ => pure ()
+    }
+    target := RuntimeTargetDataLayout.default.base
+    maxSizeOfVal := Size.ofBytes 0x7FFF_FFFF_FFFF_FFFF
+    dynamic := {
+      target := RuntimeTargetDataLayout.default.base
+      maxSizeOfVal := Size.ofBytes 0x7FFF_FFFF_FFFF_FFFF
+      classify := fun _ _ => unusedLifo
+      field := fun _ _ _ => unusedLifo
+      packedAlign := fun _ _ => pure none
+      vtableSizeAndAlign := fun _ _ _ => unusedLifo
+    }
+    dynamicFuel := 0
+    isSliceOrStr := fun _ _ => pure false
+    field := fun _ _ _ => pure lifoRefLayout
+    variant := fun _ parent _ => pure parent
+    packedAlign := fun _ _ => pure none
+    subsliceLayout := fun _ _ _ => unusedLifo
+    layoutOf := fun _ ty =>
+      pure (if ty == 2 then lifoArrayLayout else if ty == 1 then lifoRefLayout else lifoBoolLayout)
+    localIndex := fun _ _ => unusedLifo
+  }
+  vtable := {
+    target := RuntimeTargetDataLayout.default.base
+    isDynamic := fun _ _ => pure false, memoryOffset := fun _ _ _ _ _ => unusedLifo
+    resolvePointer := fun _ _ => unusedLifo
+    globalVTable := fun _ _ => unusedLifo
+    globalFunction := fun _ _ => unusedLifo
+    predicates := fun _ _ => pure #[], normalizePredicate := fun _ p => pure p.id
+    layoutOf := fun _ _ => unusedLifo
+    eraseAndAnonymize := fun _ _ _ => unusedLifo
+    ensureMonomorphicType := fun _ _ => pure (), ensureMonomorphicDyn := fun _ _ => pure ()
+    globalSalt := fun _ => pure 0, reserveVTable := fun _ _ _ _ => unusedLifo
+    globalRootPointer := fun _ _ => unusedLifo
+    entries := fun _ _ _ => pure #[], assertVirtualInstanceMatches := fun _ _ _ _ _ => pure ()
+  }
+  discriminant := {
+    runtimeTarget := RuntimeTargetDataLayout.default
+    discriminantLayout := fun _ _ => unusedLifo
+    tagLayout := fun _ _ => unusedLifo
+    discriminantValue := fun _ _ _ => unusedLifo
+    variantForDiscriminant := fun _ _ _ => unusedLifo
+    adtVariantCount := fun _ _ => pure 0
+    projectRead := fun _ _ _ => unusedLifo
+    readImmediate := fun _ _ => unusedLifo
+    destLayout := fun p => p.layout
+    projectWrite := fun _ _ _ => unusedLifo
+    writeScalar := fun _ _ _ => unusedLifo
+    toOp := fun _ _ => unusedLifo
+    scalarMayBeNull := fun _ _ => pure false
+  }
+  debugAssertions := false
+  classify := fun _ ty =>
+    pure (if ty == 2 then .sequence 1 else if ty == 1 then .reference false else .boolean)
+  unitLayout := fun _ => pure lifoRefLayout
+  typeName := fun _ _ => pure "Root"
+  opsemInhabited := fun _ _ => pure true
+  isFreeze := fun _ _ => pure true
+  fieldPath := fun _ _ idx _ => pure (.field s!"{idx}")
+  variantPath := fun _ _ v => pure (.variant s!"{v}")
+  projectBox := fun _ _ => unusedLifo
+  toOp := fun _ place =>
+    match place.ref with
+    | .memory m => pure ⟨.indirect m, place.layout⟩
+    | .local .. => throw (StepError.invalidProgram "expected memory place")
+  readImmediate := fun _ place _ => do
+    let .memory memory := place.ref | throw (StepError.invalidProgram "expected memory place")
+    if place.layout.ty == 1 then
+      let sc := Scalar.fromPointer RuntimeTargetDataLayout.default.base
+        ⟨memory.ptr.offset, witnessProv⟩
+      pure ⟨.scalar sc, place.layout⟩
+    else
+      modify fun trace => trace.push memory.ptr.offset.bytes
+      let bits : U128 := if memory.ptr.offset == Size.ZERO then 2 else 1
+      match Scalar.fromUInt (Prov := CtfeProvenance) bits (Size.ofBytes 1) with
+      | .ok sc => pure ⟨.scalar sc, place.layout⟩
+      | .error _ => throw (StepError.invalidProgram "scalar construction failed")
+  clearProvenance := fun _ _ => pure ()
+  writeNoValidate := fun _ _ _ => pure ()
+  sizeAndAlign := fun _ _ => pure (some (Size.ofBytes 1, Align.ONE))
+  ptrToPlace := fun _ val => do
+    let .scalar sc := val.imm | throw (StepError.invalidProgram "expected scalar pointer")
+    let .ok ptr := sc.toPointer RuntimeTargetDataLayout.default.base
+      | throw (StepError.invalidProgram "expected valid pointer")
+    pure ⟨⟨ptr, .none, none⟩, lifoBoolLayout⟩
+  metadataTail := fun _ _ => pure .foreign
+  checkPointerAccess := fun _ _ _ => pure (.ok ())
+  checkPointerAlign := fun _ _ _ => pure ()
+  checkPointerAlignResult := fun _ _ _ => pure (.ok ())
+  scalarMayBeNull := fun _ _ => pure false
+  retagPointer := fun _ _ _ => pure none
+  ctfePointerLookup := fun _ _ _ => unusedLifo
+  inMutableMemory := fun _ _ => pure true
+  readBytes := fun _ _ _ _ => pure ()
+  clearBytesProvenance := fun _ _ _ => pure ()
+  beginPadding := fun _ _ _ => pure none
+  writePadding := fun _ _ _ => pure ()
+  cachedUnionRanges := fun _ _ comp => comp
+  withGhostValidation := fun comp => comp
+
+/-- **Kernel-evaluated 3-reference LIFO pointee witness (`lean-miri#90` `ConnectedPointerAlignment.lean` L863–906).**
+Validating `[&b0, &b1, &b2]` recursively via `realValidatePlaceNoFuel` (transported through the
+`Classical.choice`-free `realValidatePlaceLexRank`) visits the three pointees in **reverse discovery
+order `#[16, 8, 0]`** and fails with `.undefinedBehavior` starting with `"validation[0]"` on the
+invalid first boolean (`b0 = 2`). -/
+theorem lifo3Ref_validatePlace_visits_reverse_order :
+    let arrayRoot : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, some witnessProv⟩, .none, none⟩, lifoArrayLayout⟩
+    let typeRank : MIR.TyId → Nat := fun ty => if ty == 2 then 1 else 0
+    (match realValidatePlaceNoFuel lifo3RefHooks () typeRank arrayRoot true false #[] with
+     | .error (.undefinedBehavior msg) visitedOffsets =>
+       visitedOffsets == #[16, 8, 0] && msg.startsWith "validation[0]"
+     | _ => false) = true := by
+  intro arrayRoot typeRank
+  rw [← realValidatePlaceLexRank_eq_noFuel]
+  decide +kernel
+
 end RealVisit
 
 /-! ## 8. `leanprover/lean4#13851` axiom footprint audit
@@ -2277,6 +3518,18 @@ and `Nat.rec × Nat.rec`) companions (`RankedWalk.walkRank`, `VisitLexWalk.walkR
 #guard_msgs in
 #print axioms RealVisit.realVisitNoFuel
 
+/-- info: 'LeanMiriSpec.ValidationRankCert.RealVisit.realVisitLexRank' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms RealVisit.realVisitLexRank
+
+/-- info: 'LeanMiriSpec.ValidationRankCert.RealVisit.realValidatePlaceLexRank' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms RealVisit.realValidatePlaceLexRank
+
+/-- info: 'LeanMiriSpec.ValidationRankCert.RealVisit.drainPointeesFuel' does not depend on any axioms -/
+#guard_msgs in
+#print axioms RealVisit.drainPointeesFuel
+
 
 #assert_choice_free
   layoutOrder
@@ -2314,7 +3567,24 @@ and `Nat.rec × Nat.rec`) companions (`RankedWalk.walkRank`, `VisitLexWalk.walkR
   RealVisit.vendored_visit_succ
   RealVisit.realVisitGuarded
   RealVisit.realVisitRank
+  RealVisit.realVisitSized
+  RealVisit.realVisitUnsized
+  RealVisit.realVisitLexRank
+  RealVisit.realVisitLexRank_eq_noFuel
+  RealVisit.realConstValidatePlaceLexRank
+  RealVisit.realConstValidatePlaceLexRank_eq_noFuel
+  RealVisit.vendored_constValidatePlace_eq_noFuel
+  RealVisit.realValidatePlaceLexRank
+  RealVisit.realValidatePlaceLexRank_eq_noFuel
+  RealVisit.drainPointeesFuel
+  RealVisit.drainPointeesFuel_eq_drainPointees
+  RealVisit.drainPointeesFuel_exhausts_of_lt
   RealVisit.vendored_visit_eq_guarded
+  RealVisit.visitHooksDescend_of_conditions
+  RealVisit.dynTrait_lexRank_succeeds_while_sizedRank_exhausts
+  RealVisit.enumPhase_visitHooksDescend
+  RealVisit.enumPhase_vendored_visit_eq_noFuel
+  RealVisit.enumPhase_visit_ok
 
 #assert_standard_axioms
   RankedWalk.walkNoFuel
@@ -2353,7 +3623,23 @@ and `Nat.rec × Nat.rec`) companions (`RankedWalk.walkRank`, `VisitLexWalk.walkR
   RealVisit.realVisitGuarded_eq_noFuel
   RealVisit.vendored_visit_eq_noFuel
   RealVisit.vendored_visit_eq_noFuel_of_sized
+  RealVisit.realVisitSized_eq_noFuel
+  RealVisit.realVisitUnsized_eq_noFuel
+  RealVisit.realVisitLexRank_eq_noFuel
+  RealVisit.vendored_visit_eq_noFuel_of_wpCoalBounded
+  RealVisit.vendored_visit_eq_noFuel_of_sized_wpCoalBounded
+  RealVisit.realConstValidatePlaceNoFuel
+  RealVisit.realConstValidatePlaceLexRank_eq_noFuel
+  RealVisit.vendored_constValidatePlace_eq_noFuel
+  RealVisit.realValidatePlaceNoFuel
+  RealVisit.realValidatePlaceLexRank_eq_noFuel
   RealVisit.deepPattern_vendored_visit_eq_noFuel
   RealVisit.selfPattern_noFuel_rejects_vendored_exhausts
+  RealVisit.dynTrait_visitHooksDescend
+  RealVisit.dynTrait_vendored_visit_eq_noFuel
+  RealVisit.dynTrait_lexRank_succeeds_while_sizedRank_exhausts
+  RealVisit.enumPhase_vendored_visit_eq_noFuel
+  RealVisit.enumPhase_visit_ok
+  RealVisit.lifo3Ref_validatePlace_visits_reverse_order
 
 end LeanMiriSpec.ValidationRankCert
