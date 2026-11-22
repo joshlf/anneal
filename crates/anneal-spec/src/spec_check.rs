@@ -1642,6 +1642,13 @@ pub struct SpecCheckConfig {
     /// Deterministic PRNG seed for [`SplitMix64`].
     pub seed: u64,
     /// Total number of input trials to execute (must be `>= 1`).
+    ///
+    /// Also bounds failure classification: once every tested mutant survived,
+    /// the vacuity-classification probe samples at most
+    /// `min(max_trials, MAX_PROBE_INPUTS)` further inputs (see
+    /// [`MAX_PROBE_INPUTS`]). A budget below the input type's
+    /// [`SampleInput::BOUNDARY_COUNT`] therefore classifies from a truncated
+    /// boundary corpus, exactly as it checks from one.
     pub max_trials: usize,
     /// Minimum number of precondition-admissible trials required (must be `>= 1`).
     pub min_precondition_hits: usize,
@@ -1764,7 +1771,11 @@ pub enum FailureDetail {
     NoDistinctMutantsTested,
     /// All tested mutants satisfied the postcondition; includes probe telemetry.
     AllMutantsSurvived {
-        /// Number of inputs on which the classification probe evaluated `post`.
+        /// Number of inputs on which the classification probe evaluated `post`:
+        /// the live anchor input plus at most
+        /// `min(max_trials, MAX_PROBE_INPUTS)` sampled inputs (see
+        /// [`MAX_PROBE_INPUTS`]). `0` when a [`SyntacticBindingHint`] decided
+        /// the class without probing.
         probed_inputs: usize,
         /// Number of those inputs that violated `pre`. Always `0` under
         /// [`ProbeDomain::PreconditionOnly`].
@@ -2193,21 +2204,28 @@ where
 const MIN_PROBE_PRNG_DRAWS: usize = 16;
 
 /// Upper cap on the number of sampled inputs evaluated by a vacuity
-/// classification probe so very large `max_trials` budgets do not turn failure
-/// classification into an unbounded scan.
-const MAX_PROBE_INPUTS: usize = 256;
+/// classification probe, so very large [`SpecCheckConfig::max_trials`] budgets
+/// do not turn failure classification into an unbounded scan.
+///
+/// The probe additionally evaluates the live anchor input that exposed the
+/// failure, so [`FailureDetail::AllMutantsSurvived::probed_inputs`] is at most
+/// `MAX_PROBE_INPUTS + 1`.
+pub const MAX_PROBE_INPUTS: usize = 256;
 
-/// Scales a vacuity-classification probe's input budget deterministically with
-/// both `boundary_count` and `max_trials`:
+/// Scales a vacuity-classification probe's sampled-input budget
+/// deterministically with both `boundary_count` and `max_trials`:
 ///
 /// - Never exceeds `max_trials`, so shrinking `max_trials` to bound callback
-///   cost also bounds classification probes.
+///   cost also bounds the inputs a classification probe samples. The live
+///   anchor input and the [`MUTANT_CHAIN_STEPS`]-bounded mutant chain are
+///   evaluated on top of this budget and do not scale with `max_trials`.
 /// - Covers the entire boundary corpus plus at least [`MIN_PROBE_PRNG_DRAWS`]
 ///   PRNG draws whenever `max_trials` and [`MAX_PROBE_INPUTS`] permit, so
 ///   3-tuple, 4-tuple, and compound stateful inputs whose `BOUNDARY_COUNT >= 64`
 ///   neither truncate their boundary corpus nor draw zero PRNG samples.
 /// - Scales smoothly with larger `max_trials` (`max_trials / 4`) up to
 ///   [`MAX_PROBE_INPUTS`].
+/// - Is monotone in `max_trials` and nonzero whenever `max_trials >= 1`.
 const fn probe_input_budget(boundary_count: usize, max_trials: usize) -> usize {
     let target = max_usize(
         64,
@@ -2218,6 +2236,27 @@ const fn probe_input_budget(boundary_count: usize, max_trials: usize) -> usize {
     );
     min_usize(max_trials, min_usize(target, MAX_PROBE_INPUTS))
 }
+
+// Compile-time regression checks pinning `probe_input_budget` at the default
+// budget, at tight and wide budgets, and at its saturating extremes.
+const _: () = {
+    // Default `max_trials == 256`: 64 inputs for a scalar corpus, the full
+    // corpus plus `MIN_PROBE_PRNG_DRAWS` draws for compound inputs.
+    assert!(probe_input_budget(15, 256) == 64);
+    assert!(probe_input_budget(79, 256) == 79 + MIN_PROBE_PRNG_DRAWS);
+    assert!(probe_input_budget(87, 256) == 87 + MIN_PROBE_PRNG_DRAWS);
+    // Tight budgets bound the probe and never starve it entirely.
+    assert!(probe_input_budget(15, 1) == 1);
+    assert!(probe_input_budget(79, 8) == 8);
+    assert!(probe_input_budget(79, 79) == 79);
+    // Wide budgets scale as `max_trials / 4` up to the cap.
+    assert!(probe_input_budget(15, 512) == 128);
+    assert!(probe_input_budget(15, 1024) == MAX_PROBE_INPUTS);
+    assert!(probe_input_budget(15, usize::MAX) == MAX_PROBE_INPUTS);
+    // An oversized corpus is capped rather than overflowing.
+    assert!(probe_input_budget(usize::MAX, usize::MAX) == MAX_PROBE_INPUTS);
+    assert!(probe_input_budget(usize::MAX, 0) == 0);
+};
 
 /// Runs the deterministic classification probe once
 /// `mutants_tested > 0 && mutants_killed == 0` on a non-subsingleton return.

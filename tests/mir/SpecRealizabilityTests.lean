@@ -3906,6 +3906,41 @@ theorem multiOptionInputsGenuinePost_dichotomy :
 -- Genuine multi-branch `Except` with unused small-sum inputs is never false-flagged.
 #eval assertEnsuresBindsOutput (Lean.mkConst ``multiOptionInputsGenuinePost)
 
+/-! ### 3.27 Starved Cofactoring Floor Is Measured From Where the Budget Ran Dry -/
+
+/-- The starved-budget cofactoring cap depends only on the heartbeats spent since the
+    probe budget ran dry: two starvation points with the same starved usage get the same
+    cap, however many heartbeats were spent before either of them. -/
+theorem starvedCofactorCap_depends_only_on_starved_usage
+    (start₁ now₁ start₂ now₂ : Nat) (h : now₁ - start₁ = now₂ - start₂) :
+    starvedCofactorCap? start₁ now₁ = starvedCofactorCap? start₂ now₂ := by
+  unfold starvedCofactorCap?
+  rw [h]
+
+/-- A budget that runs dry 7,000,000 heartbeats into Phase 3 still grants the first
+    starved `cofactorBoilerplate` call the full per-call cap. -/
+theorem starvedCofactorCap_full_at_starvation :
+    starvedCofactorCap? 7000000 7000000 = some 250000 := by
+  decide
+
+/-- The cap shrinks to what is left of the 2,000,000-heartbeat starved floor. -/
+theorem starvedCofactorCap_shrinks_with_starved_usage :
+    starvedCofactorCap? 7000000 8900000 = some 100000 := by
+  decide
+
+/-- Once the starved floor itself is spent, no further cofactoring is attempted. -/
+theorem starvedCofactorCap_exhausted :
+    starvedCofactorCap? 7000000 9000000 = none := by
+  decide
+
+/-- Regression: measuring the floor from the start of Phase 3 (baseline `0`) instead of
+    from the starvation point would leave the same budget with no floor at all, so every
+    remaining syntactically decidable fibre would be skipped. -/
+theorem starvedCofactorCap_not_measured_from_phase_start :
+    starvedCofactorCap? 0 7000000 = none ∧
+      starvedCofactorCap? 7000000 7000000 = starvedCofactorCap? 0 0 :=
+  ⟨by decide, starvedCofactorCap_depends_only_on_starved_usage _ _ _ _ (by decide)⟩
+
 /-! ## 4. Mandatory Compile-Time Kernel Axiom Audit -/
 
 /-- Axioms a kernel-checked declaration of this development may depend on. -/
@@ -4000,7 +4035,8 @@ def auditViolation? (n : Lean.Name) : Lean.Meta.MetaM (Option String) := do
     ``externalSpecEnsuresDichotomy_iff_moduloObservation,
     ``not_externalSpecEnsuresDichotomy_of_trivial_extraPost,
     ``exists_handler_holdsOn_of_universalNormalRealizable,
-    ``cappedHeartbeats_never_unlimited
+    ``cappedHeartbeats_never_unlimited,
+    ``starvedCofactorCap_depends_only_on_starved_usage
   ]
   for n in requiredTheorems do
     unless isTarget n do

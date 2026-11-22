@@ -1296,6 +1296,9 @@ def clampProbeBudget (requestedInternal : Nat) (outerRemaining? : Option Nat) : 
   | none => requested
   | some outerRemaining => max 1000 (min requested (outerRemaining / 4 * 3))
 
+/-- Start a probe budget for one check: `cfg.totalHeartbeats` (in `maxHeartbeats` option
+    units) clamped by `clampProbeBudget` against what the enclosing `maxHeartbeats`
+    context has left, measured from the current heartbeat count. -/
 def ProbeBudget.init (cfg : EnsuresCheckConfig) : CoreM ProbeBudget := do
   let now ← IO.getNumHeartbeats
   let ctx ← read
@@ -1307,6 +1310,9 @@ def ProbeBudget.init (cfg : EnsuresCheckConfig) : CoreM ProbeBudget := do
   let totalInternal := clampProbeBudget (cfg.totalHeartbeats * 1000) outerRemaining?
   return { startHeartbeats := now, totalInternal, stepUnits := cfg.stepHeartbeats }
 
+/-- Internal-heartbeat cap for the next bounded probe (`cappedHeartbeats?` of what is left
+    of the total and the per-step cap), or `none` once the total budget is spent. Every
+    heartbeat since `ProbeBudget.init` counts, whichever phase spent it. -/
 def ProbeBudget.nextCap? (b : ProbeBudget) : BaseIO (Option Nat) := do
   let now ← IO.getNumHeartbeats
   let used := now - b.startHeartbeats
@@ -1722,6 +1728,22 @@ private def closedNatFoldHeartbeats : Nat := 2000000
     closed constants (`scalarModulus 4`, `sidecar.argCount`) in the same goal from
     folding. -/
 private def closedNatSubtermHeartbeats : Nat := 250000
+
+/-- Internal-heartbeat cap for one `cofactorBoilerplate` call made after the probe budget
+    ran dry, or `none` once the starved structural floor is spent.
+
+    `starvedStart` is the heartbeat count at which the budget was first observed
+    exhausted and `now` the current count. The floor is `closedNatFoldHeartbeats` in
+    total across all starved calls, at most `closedNatSubtermHeartbeats` per call. The
+    result depends only on `now - starvedStart`: heartbeats spent before the budget ran
+    dry (for example by semantic probes on earlier boilerplate fibres) never consume
+    the floor, so the purely syntactic fibre checks still run on the remaining fibres
+    however expensive the fibres before them were. -/
+def starvedCofactorCap? (starvedStart now : Nat) : Option Nat :=
+  if now - starvedStart < closedNatFoldHeartbeats then
+    some (min (closedNatFoldHeartbeats - (now - starvedStart)) closedNatSubtermHeartbeats)
+  else
+    none
 
 /-- Conservative syntactic pre-check that avoids calling `whnf` on closed `Nat`
     exponentiations, shifts, or scalar moduli whose literal operand would already
@@ -4055,7 +4077,11 @@ private def analyzeNormalizedSpec
       let mut firstTautReason? : Option EnsuresVacuityReason := none
       let mut phase3BudgetExhausted := false
       let mut phase3CofactorAborted := false
-      let phase3CofactorStart ← IO.getNumHeartbeats
+      -- Heartbeat count at which Phase 3 first observed `budget` exhausted. The starved
+      -- structural floor is measured from this point, never from the start of Phase 3:
+      -- heartbeats that semantic probes spent on earlier fibres while `budget` still had
+      -- room must not pre-consume it.
+      let mut phase3StarvedStart? : Option Nat := none
       for mask in [:numMasks] do
         let mut maskFeasible := true
         for i in [:atoms.size] do
@@ -4070,8 +4096,9 @@ private def analyzeNormalizedSpec
         -- Bound `cofactorBoilerplate` so nested `match` expressions composed with up to
         -- `2^8 = 256` boilerplate masks cannot exhaust the enclosing command's heartbeats.
         -- Once `budget` is spent, pure syntactic cofactoring retains a bounded structural
-        -- floor (`closedNatFoldHeartbeats` total across remaining masks) so starved-budget
-        -- syntactic checks still succeed while pathological masks degrade conservatively.
+        -- floor (`starvedCofactorCap?`: `closedNatFoldHeartbeats` in total across the
+        -- masks processed after `budget` ran dry) so starved-budget syntactic checks
+        -- still succeed while pathological masks degrade conservatively.
         let mut cofactorCap? : Option Nat := none
         match ← budget.nextCap? with
         | some remCap =>
@@ -4080,9 +4107,9 @@ private def analyzeNormalizedSpec
           phase3BudgetExhausted := true
           probeCutOffRef.set true
           let now ← IO.getNumHeartbeats
-          let used := now - phase3CofactorStart
-          if used < closedNatFoldHeartbeats then
-            cofactorCap? := some (min (closedNatFoldHeartbeats - used) closedNatSubtermHeartbeats)
+          let starvedStart := phase3StarvedStart?.getD now
+          phase3StarvedStart? := some starvedStart
+          cofactorCap? := starvedCofactorCap? starvedStart now
         let mut rawRes := workBody
         match cofactorCap? with
         | none =>

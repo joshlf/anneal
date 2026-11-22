@@ -5529,3 +5529,91 @@ fn probe_input_budget_scales_deterministically_across_trial_budgets_and_arities(
         })
     ));
 }
+
+#[test]
+fn probed_inputs_counts_the_anchor_plus_a_trial_bounded_sample() {
+    use anneal_spec::spec_check::MAX_PROBE_INPUTS;
+
+    // The probe always evaluates the live anchor input and samples at most
+    // `min(max_trials, MAX_PROBE_INPUTS)` further inputs: never zero, even at
+    // `max_trials == 1`, and never more than the cap.
+    let u32_boundaries = <u32 as SampleInput>::BOUNDARY_COUNT;
+    assert_eq!(u32_boundaries, 15);
+    for (max_trials, sampled) in [
+        (1, 1),
+        (u32_boundaries, u32_boundaries),
+        (64, 64),
+        (256, 64),
+        (4096, MAX_PROBE_INPUTS),
+    ] {
+        let outcome = check_contract(
+            SpecCheckConfig::default().with_max_trials(max_trials),
+            |_x: &u32| true,
+            |&x| x,
+            |_x, _r: &u32| true,
+        );
+        assert_eq!(
+            outcome.vacuity_class(),
+            Some(VacuityClass::TrivialPostcondition)
+        );
+        assert_eq!(
+            outcome.failure().map(|f| f.detail),
+            Some(FailureDetail::AllMutantsSurvived {
+                probed_inputs: sampled + 1,
+                out_of_precondition_probes: 0,
+                skipped_out_of_precondition: 0,
+                saw_any_false: false,
+                saw_output_sensitivity: false,
+            }),
+            "max_trials = {max_trials}"
+        );
+    }
+
+    // A budget below the boundary corpus classifies from the truncated corpus it
+    // checked from. At `max_trials == 4` every sampled `u32` (`0..=3`) satisfies
+    // `x < 4`, so even an unconstrained probe never leaves the precondition and
+    // reports the class its evidence supports.
+    let post = |&x: &u32, &r: &u32| x < 4 || r == x;
+    let tight = check_contract(
+        SpecCheckConfig::default()
+            .with_max_trials(4)
+            .with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| x < 4,
+        |&x| x,
+        post,
+    );
+    assert_eq!(
+        tight.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        tight.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            probed_inputs: 5,
+            out_of_precondition_probes: 0,
+            saw_any_false: false,
+            ..
+        })
+    ));
+
+    // The default budget reaches `x >= 4`, where `post` rejects the anchor output,
+    // so the same contract is no longer reported as trivially true.
+    let default_budget = check_contract(
+        SpecCheckConfig::default().with_probe_domain(ProbeDomain::Unconstrained),
+        |&x: &u32| x < 4,
+        |&x| x,
+        post,
+    );
+    assert_ne!(
+        default_budget.vacuity_class(),
+        Some(VacuityClass::TrivialPostcondition)
+    );
+    assert!(matches!(
+        default_budget.failure().map(|f| f.detail),
+        Some(FailureDetail::AllMutantsSurvived {
+            out_of_precondition_probes,
+            saw_any_false: true,
+            ..
+        }) if out_of_precondition_probes > 0
+    ));
+}
