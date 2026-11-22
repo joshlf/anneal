@@ -18,20 +18,24 @@ set_option autoImplicit false
 
 Kernel-checked positive and negative regression tests (no `sorry`, no `native_decide`):
 
-1. **Signature pins.** Every one of the 50 `MemoryLemmas` theorems is checked against its
-   full statement, so renaming, weakening a hypothesis, strengthening a premise, dropping a
-   conjunct, or deleting a theorem fails this file.
+1. **Signature pins + `BinderInfo` parity.** Every one of the 50 `MemoryLemmas` theorems is checked
+   against its full statement, universe parameters, and exact per-binder `BinderInfo` (`()` vs `{}`
+   vs `[]`), with `-Dlinter.unusedVariables=true` active throughout.
 2. **`MemoryLemmas` witnesses.** Concrete instantiations on real `lean-miri` states:
    `.Lazy false` → `.Materialized` multi-word `InitMask` transitions and framing, `ProvenanceMap.new`
    equations, `fromBytes` / `tryNew` allocations with `withExtra` / `mapExtra`, `getBytesUnchecked`
    split / subrange, partial-range `writeBytes` / `writeUninit` / `copy` / `copyRepeatedly` with byte
    and mask framing, little- and big-endian integer and pointer `readScalar` round trips, exposed
    provenance, and uninitialized-byte errors.
-3. **`ValidationRankCert` witnesses.** The 150-level nested wrapper (fuel-free success, agreement
-   with fuel `151`, exhaustion for every fuel `≤ 150`); certified adequacy on a static layout graph;
-   rejection of cyclic and non-descending certificates; deterministic `.invalidProgram` rejection of
-   a non-descending projection hook (where the vendored-style fuel walk only exhausts its fuel);
-   the union-range instance; the `Anneal.MirFuelFree` bridge; and LIFO pointee draining.
+3. **`ValidationRankCert` witnesses.** The 150-level nested wrapper, 150-level vendored
+   `ValidityVisitor.unionRanges` (with direct `vendored_unionRanges_eq_noFuel` adequacy and
+   `Anneal.MirFuelFree` bridge) and vendored `ValidityVisitor.visit` pattern walk; static
+   `LayoutGraph` certificates (including unclosed missing-child cycle rejection); Schema 17
+   `Decoder.lean` type-table validation (pointer-indirection recursion vs by-value cycle /
+   missing-child / coroutine `savedTypes` rejections); `visitOrder` (`(if isSized then 0 else 1,
+   layoutOrder)`) `dyn Trait` dynamic unpacking (where `VisitLexWalk` succeeds and naive
+   `layoutOrder`-only `RankedWalk` falsely rejects); LIFO pointee draining; and module-wide
+   standard-axiom verification (`#assert_test_standard_axioms`).
 -/
 
 /-! ## 1. Signature pins for all 50 `MemoryLemmas` theorems
@@ -40,25 +44,24 @@ Each pin restates a theorem's full statement (with its binder names, for readabi
 that the theorem has exactly that type. -/
 
 section SignaturePins
-set_option linter.unusedVariables false
 
 namespace Miri.Memory.InitMask.WriteProof
 open Miri.ABI Miri.Memory
 
 /-- Pin: `get_ok_of_wellFormed`. -/
-example : ∀ (mask : InitMask) (idx : Size)
-    (valid : WellFormed mask) (inBounds : idx.bytes.toNat < mask.len.bytes.toNat),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_01_get_ok_of_wellFormed : ∀ (mask : InitMask) (idx : Size)
+    (_valid : WellFormed mask) (_inBounds : idx.bytes.toNat < mask.len.bytes.toNat),
     ∃ b, mask.get idx = .ok b :=
   @Miri.Memory.InitMask.WriteProof.get_ok_of_wellFormed
 
 /-- Pin: `set_range_get`. -/
-example : ∀ (mask updated : InitMask) (range : AllocRange) (finish idx : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_02_set_range_get : ∀ (mask updated : InitMask) (range : AllocRange) (finish idx : Size)
     (state : Bool)
-    (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
-    (nonempty : range.start.bytes.toNat < finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
-    (idxInBounds : idx.bytes.toNat < mask.len.bytes.toNat)
-    (h_set : mask.setRange range state = .ok updated),
+    (_valid : WellFormed mask) (_endpoint : range.endExclusive = .ok finish)
+    (_nonempty : range.start.bytes.toNat < finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
+    (_idxInBounds : idx.bytes.toNat < mask.len.bytes.toNat)
+    (_h_set : mask.setRange range state = .ok updated),
     updated.get idx =
       if range.start.bytes.toNat ≤ idx.bytes.toNat ∧ idx.bytes.toNat < finish.bytes.toNat then
         .ok state
@@ -67,10 +70,10 @@ example : ∀ (mask updated : InitMask) (range : AllocRange) (finish idx : Size)
   @Miri.Memory.InitMask.WriteProof.set_range_get
 
 /-- Pin: `isRangeInitialized_nonempty_iff`. -/
-example : ∀ (mask : InitMask) (range : AllocRange) (finish : Size)
-    (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
-    (nonempty : range.start.bytes.toNat < finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_03_isRangeInitialized_nonempty_iff : ∀ (mask : InitMask) (range : AllocRange) (finish : Size)
+    (_valid : WellFormed mask) (_endpoint : range.endExclusive = .ok finish)
+    (_nonempty : range.start.bytes.toNat < finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat),
     (mask.isRangeInitialized range = .ok (.ok ()) ↔
       ∀ (idx : Size), range.start.bytes.toNat ≤ idx.bytes.toNat → idx.bytes.toNat < finish.bytes.toNat →
         mask.get idx = .ok true) ∧
@@ -80,48 +83,48 @@ example : ∀ (mask : InitMask) (range : AllocRange) (finish : Size)
   @Miri.Memory.InitMask.WriteProof.isRangeInitialized_nonempty_iff
 
 /-- Pin: `isRangeInitialized_after_setRange_true`. -/
-example : ∀ (mask updated : InitMask)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_04_isRangeInitialized_after_setRange_true : ∀ (mask updated : InitMask)
     (range : AllocRange) (finish : Size)
-    (valid : WellFormed mask) (endpoint : range.endExclusive = .ok finish)
-    (nonempty : range.start.bytes.toNat < finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
-    (h_set : mask.setRange range true = .ok updated),
+    (_valid : WellFormed mask) (_endpoint : range.endExclusive = .ok finish)
+    (_nonempty : range.start.bytes.toNat < finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
+    (_h_set : mask.setRange range true = .ok updated),
     updated.isRangeInitialized range = .ok (.ok ()) :=
   @Miri.Memory.InitMask.WriteProof.isRangeInitialized_after_setRange_true
 
 /-- Pin: `isRangeInitialized_frame`. -/
-example : ∀ (mask updated : InitMask)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_05_isRangeInitialized_frame : ∀ (mask updated : InitMask)
     (writeRange queryRange : AllocRange) (writeFinish queryFinish : Size) (state : Bool)
-    (valid : WellFormed mask)
-    (wEnd : writeRange.endExclusive = .ok writeFinish)
-    (qEnd : queryRange.endExclusive = .ok queryFinish)
-    (wNonempty : writeRange.start.bytes.toNat < writeFinish.bytes.toNat)
-    (qNonempty : queryRange.start.bytes.toNat < queryFinish.bytes.toNat)
-    (wInBounds : writeFinish.bytes.toNat ≤ mask.len.bytes.toNat)
-    (qInBounds : queryFinish.bytes.toNat ≤ mask.len.bytes.toNat)
-    (disjoint : writeFinish.bytes.toNat ≤ queryRange.start.bytes.toNat ∨
+    (_valid : WellFormed mask)
+    (_wEnd : writeRange.endExclusive = .ok writeFinish)
+    (_qEnd : queryRange.endExclusive = .ok queryFinish)
+    (_wNonempty : writeRange.start.bytes.toNat < writeFinish.bytes.toNat)
+    (_qNonempty : queryRange.start.bytes.toNat < queryFinish.bytes.toNat)
+    (_wInBounds : writeFinish.bytes.toNat ≤ mask.len.bytes.toNat)
+    (_qInBounds : queryFinish.bytes.toNat ≤ mask.len.bytes.toNat)
+    (_disjoint : writeFinish.bytes.toNat ≤ queryRange.start.bytes.toNat ∨
       queryFinish.bytes.toNat ≤ writeRange.start.bytes.toNat)
-    (h_set : mask.setRange writeRange state = .ok updated),
+    (_h_set : mask.setRange writeRange state = .ok updated),
     (updated.isRangeInitialized queryRange = .ok (.ok ()) ↔
       mask.isRangeInitialized queryRange = .ok (.ok ())) :=
   @Miri.Memory.InitMask.WriteProof.isRangeInitialized_frame
 
 /-- Pin: `prepareCopy_of_uniform`. -/
-example : ∀ (mask : InitMask) (range : AllocRange) (finish : Size) (state : Bool)
-    (valid : WellFormed mask)
-    (endpoint : range.endExclusive = .ok finish)
-    (nonempty : range.start.bytes.toNat < finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
-    (uniform : ∀ (idx : Size), range.start.bytes.toNat ≤ idx.bytes.toNat →
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_06_prepareCopy_of_uniform : ∀ (mask : InitMask) (range : AllocRange) (finish : Size) (state : Bool)
+    (_valid : WellFormed mask)
+    (_endpoint : range.endExclusive = .ok finish)
+    (_nonempty : range.start.bytes.toNat < finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ mask.len.bytes.toNat)
+    (_uniform : ∀ (idx : Size), range.start.bytes.toNat ≤ idx.bytes.toNat →
       idx.bytes.toNat < finish.bytes.toNat → mask.get idx = .ok state),
     mask.prepareCopy range = .ok ⟨state, #[range.size.bytes]⟩ :=
   @Miri.Memory.InitMask.WriteProof.prepareCopy_of_uniform
 
 /-- Pin: `applyCopy_singleton`. -/
-example : ∀ (destMask : InitMask) (destStart srcSize total : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_07_applyCopy_singleton : ∀ (destMask : InitMask) (destStart srcSize total : Size)
     (repeatCount : UInt64) (state : Bool)
-    (nonzero : srcSize.bytes ≠ 0)
-    (h_mul : Size.mul srcSize repeatCount = .ok total),
+    (_nonzero : srcSize.bytes ≠ 0)
+    (_h_mul : Size.mul srcSize repeatCount = .ok total),
     destMask.applyCopy ⟨state, #[srcSize.bytes]⟩ (allocRange destStart srcSize) repeatCount =
       destMask.setRange (allocRange destStart total) state :=
   @Miri.Memory.InitMask.WriteProof.applyCopy_singleton
@@ -132,28 +135,28 @@ namespace Miri.Memory.ProvenanceMap
 open Miri.ABI
 
 /-- Pin: `rangeEmpty_new`. -/
-example : ∀ {P : Type} (range : AllocRange) (pointerSize finish : Size)
-    (positive : pointerSize.bytes ≠ 0) (endEq : range.endExclusive = .ok finish),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_08_rangeEmpty_new : ∀ {P : Type} (range : AllocRange) (pointerSize finish : Size)
+    (_positive : pointerSize.bytes ≠ 0) (_endEq : range.endExclusive = .ok finish),
     (new (Prov := P)).rangeEmpty range pointerSize = .ok true :=
   @Miri.Memory.ProvenanceMap.rangeEmpty_new
 
 /-- Pin: `readPtr_new`. -/
-example : ∀ {P : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_09_readPtr_new : ∀ {P : Type} [DecidableEq P] [PointerProvenance P]
     (offset pointerSize finish : Size)
-    (positive : pointerSize.bytes ≠ 0)
-    (endEq : (allocRange offset pointerSize).endExclusive = .ok finish),
+    (_positive : pointerSize.bytes ≠ 0)
+    (_endEq : (allocRange offset pointerSize).endExclusive = .ok finish),
     (new (Prov := P)).readPtr offset pointerSize = .ok none :=
   @Miri.Memory.ProvenanceMap.readPtr_new
 
 /-- Pin: `prepareCopy_new`. -/
-example : ∀ {P : Type} (range : AllocRange) (data : Array UInt8) (pointerSize finish : Size)
-    (positive : pointerSize.bytes ≠ 0)
-    (endEq : range.endExclusive = .ok finish),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_10_prepareCopy_new : ∀ {P : Type} (range : AllocRange) (data : Array UInt8) (pointerSize finish : Size)
+    (_positive : pointerSize.bytes ≠ 0)
+    (_endEq : range.endExclusive = .ok finish),
     (new (Prov := P)).prepareCopy range data pointerSize = .ok ⟨#[], #[]⟩ :=
   @Miri.Memory.ProvenanceMap.prepareCopy_new
 
 /-- Pin: `applyCopy_empty`. -/
-example : ∀ {P : Type} (range : AllocRange) (repeatCount : UInt64) (pm : ProvenanceMap P),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_11_applyCopy_empty : ∀ {P : Type} (range : AllocRange) (repeatCount : UInt64) (pm : ProvenanceMap P),
     applyCopy ⟨#[], #[]⟩ range repeatCount pm = .ok () pm :=
   @Miri.Memory.ProvenanceMap.applyCopy_empty
 
@@ -163,84 +166,84 @@ namespace Miri.Memory.Allocation
 open Miri.ABI
 
 /-- Pin: `byteSize_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_12_byteSize_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).byteSize = allocation.byteSize :=
   @Miri.Memory.Allocation.byteSize_withExtra
 
 /-- Pin: `len_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_13_len_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).len = allocation.len :=
   @Miri.Memory.Allocation.len_withExtra
 
 /-- Pin: `align_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_14_align_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).align = allocation.align :=
   @Miri.Memory.Allocation.align_withExtra
 
 /-- Pin: `mutability_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_15_mutability_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).mutability = allocation.mutability :=
   @Miri.Memory.Allocation.mutability_withExtra
 
 /-- Pin: `provenanceMap_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_16_provenanceMap_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).provenanceMap = allocation.provenanceMap :=
   @Miri.Memory.Allocation.provenanceMap_withExtra
 
 /-- Pin: `initializationMask_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_17_initializationMask_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E),
     (allocation.withExtra extra).initializationMask = allocation.initializationMask :=
   @Miri.Memory.Allocation.initializationMask_withExtra
 
 /-- Pin: `getBytesUnchecked_withExtra`. -/
-example : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E) (range : AllocRange),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_18_getBytesUnchecked_withExtra : ∀ {P E : Type} (allocation : Allocation P Unit) (extra : E) (range : AllocRange),
     (allocation.withExtra extra).getBytesUnchecked range = allocation.getBytesUnchecked range :=
   @Miri.Memory.Allocation.getBytesUnchecked_withExtra
 
 /-- Pin: `byteSize_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_19_byteSize_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).byteSize = allocation.byteSize :=
   @Miri.Memory.Allocation.byteSize_mapExtra
 
 /-- Pin: `len_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_20_len_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).len = allocation.len :=
   @Miri.Memory.Allocation.len_mapExtra
 
 /-- Pin: `align_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_21_align_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).align = allocation.align :=
   @Miri.Memory.Allocation.align_mapExtra
 
 /-- Pin: `mutability_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_22_mutability_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).mutability = allocation.mutability :=
   @Miri.Memory.Allocation.mutability_mapExtra
 
 /-- Pin: `provenanceMap_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_23_provenanceMap_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).provenanceMap = allocation.provenanceMap :=
   @Miri.Memory.Allocation.provenanceMap_mapExtra
 
 /-- Pin: `initializationMask_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_24_initializationMask_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E'),
     (allocation.mapExtra f).initializationMask = allocation.initializationMask :=
   @Miri.Memory.Allocation.initializationMask_mapExtra
 
 /-- Pin: `getBytesUnchecked_mapExtra`. -/
-example : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E') (range : AllocRange),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_25_getBytesUnchecked_mapExtra : ∀ {P E E' : Type} (allocation : Allocation P E) (f : E → E') (range : AllocRange),
     (allocation.mapExtra f).getBytesUnchecked range = allocation.getBytesUnchecked range :=
   @Miri.Memory.Allocation.getBytesUnchecked_mapExtra
 
 /-- Pin: `getBytesStripProvenance_mapExtra`. -/
-example : ∀ {P E E' : Type} [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_26_getBytesStripProvenance_mapExtra : ∀ {P E E' : Type} [PointerProvenance P]
     (allocation : Allocation P E) (f : E → E') (layout : TargetDataLayout) (range : AllocRange),
     (allocation.mapExtra f).getBytesStripProvenance layout range =
       allocation.getBytesStripProvenance layout range :=
   @Miri.Memory.Allocation.getBytesStripProvenance_mapExtra
 
 /-- Pin: `readScalar_mapExtra`. -/
-example : ∀ {P E E' : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_27_readScalar_mapExtra : ∀ {P E E' : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (f : E → E') (layout : TargetDataLayout)
     (range : AllocRange) (readProvenance : Bool),
     (allocation.mapExtra f).readScalar layout range readProvenance =
@@ -248,7 +251,7 @@ example : ∀ {P E E' : Type} [DecidableEq P] [PointerProvenance P]
   @Miri.Memory.Allocation.readScalar_mapExtra
 
 /-- Pin: `writeBytes_mapExtra`. -/
-example : ∀ {P E E' : Type} (start : Size) (bytes : Array UInt8) (ptrSize : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_28_writeBytes_mapExtra : ∀ {P E E' : Type} (start : Size) (bytes : Array UInt8) (ptrSize : Size)
     (allocation : Allocation P E) (f : E → E'),
     Allocation.writeBytes start bytes ptrSize (allocation.mapExtra f) =
       (match Allocation.writeBytes start bytes ptrSize allocation with
@@ -257,7 +260,7 @@ example : ∀ {P E E' : Type} (start : Size) (bytes : Array UInt8) (ptrSize : Si
   @Miri.Memory.Allocation.writeBytes_mapExtra
 
 /-- Pin: `clearProvenance_mapExtra`. -/
-example : ∀ {P E E' : Type} (range : AllocRange) (ptrSize : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_29_clearProvenance_mapExtra : ∀ {P E E' : Type} (range : AllocRange) (ptrSize : Size)
     (allocation : Allocation P E) (f : E → E'),
     Allocation.clearProvenance range ptrSize (allocation.mapExtra f) =
       (match Allocation.clearProvenance range ptrSize allocation with
@@ -266,9 +269,9 @@ example : ∀ {P E E' : Type} (range : AllocRange) (ptrSize : Size)
   @Miri.Memory.Allocation.clearProvenance_mapExtra
 
 /-- Pin: `fromBytes_spec`. -/
-example : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (mutability : Mutability)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_30_fromBytes_spec : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (mutability : Mutability)
     (alloc : Allocation P Unit)
-    (created : Allocation.fromBytes bytes align mutability = .ok alloc),
+    (_created : Allocation.fromBytes bytes align mutability = .ok alloc),
     alloc.byteSize.bytes.toNat = bytes.size ∧
       alloc.len = bytes.size ∧
       alloc.mutability = mutability ∧
@@ -286,11 +289,11 @@ example : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (mutability : Mut
   @Miri.Memory.Allocation.fromBytes_spec
 
 /-- Pin: `fromBytes_exists`. -/
-example : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (alignmentBytes : UInt64)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_31_fromBytes_exists : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (alignmentBytes : UInt64)
     (mutability : Mutability)
-    (h_bytes : Align.bytes align = .ok alignmentBytes)
-    (h_norm : Align.fromBytes alignmentBytes = .ok align)
-    (h_fits : bytes.size < 2 ^ 64),
+    (_h_bytes : Align.bytes align = .ok alignmentBytes)
+    (_h_norm : Align.fromBytes alignmentBytes = .ok align)
+    (_h_fits : bytes.size < 2 ^ 64),
     ∃ alloc : Allocation P Unit,
       Allocation.fromBytes bytes align mutability = .ok alloc ∧
       alloc.byteSize = Size.ofBytes (UInt64.ofNat bytes.size) ∧
@@ -298,9 +301,9 @@ example : ∀ {P : Type} (bytes : Array UInt8) (align : Align) (alignmentBytes :
   @Miri.Memory.Allocation.fromBytes_exists
 
 /-- Pin: `tryNew_spec`. -/
-example : ∀ {P : Type} (size : Size) (align : Align) (init : AllocInit)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_32_tryNew_spec : ∀ {P : Type} (size : Size) (align : Align) (init : AllocInit)
     (alloc : Allocation P Unit)
-    (created : Allocation.tryNew size align init
+    (_created : Allocation.tryNew size align init
       (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok alloc),
     alloc.byteSize = size ∧
       alloc.len = size.bytes.toNat ∧
@@ -320,9 +323,9 @@ example : ∀ {P : Type} (size : Size) (align : Align) (init : AllocInit)
   @Miri.Memory.Allocation.tryNew_spec
 
 /-- Pin: `tryNew_exists`. -/
-example : ∀ {P : Type} (size : Size) (align : Align) (alignmentBytes : UInt64) (init : AllocInit)
-    (h_bytes : Align.bytes align = .ok alignmentBytes)
-    (h_norm : Align.fromBytes alignmentBytes = .ok align),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_33_tryNew_exists : ∀ {P : Type} (size : Size) (align : Align) (alignmentBytes : UInt64) (init : AllocInit)
+    (_h_bytes : Align.bytes align = .ok alignmentBytes)
+    (_h_norm : Align.fromBytes alignmentBytes = .ok align),
     ∃ alloc : Allocation P Unit,
       Allocation.tryNew size align init
         (fun n _ => some (Array.replicate n.bytes.toNat 0)) = .ok alloc ∧
@@ -330,24 +333,24 @@ example : ∀ {P : Type} (size : Size) (align : Align) (alignmentBytes : UInt64)
   @Miri.Memory.Allocation.tryNew_exists
 
 /-- Pin: `getBytesUnchecked_size`. -/
-example : ∀ {P E : Type} (allocation : Allocation P E) (range : AllocRange) (finish : Size)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (endEq : range.endExclusive = .ok finish)
-    (startLe : range.start.bytes.toNat ≤ finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_34_getBytesUnchecked_size : ∀ {P E : Type} (allocation : Allocation P E) (range : AllocRange) (finish : Size)
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_endEq : range.endExclusive = .ok finish)
+    (_startLe : range.start.bytes.toNat ≤ finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
     ∃ slice, allocation.getBytesUnchecked range = .ok slice ∧
       slice.size = finish.bytes.toNat - range.start.bytes.toNat :=
   @Miri.Memory.Allocation.getBytesUnchecked_size
 
 /-- Pin: `getBytesUnchecked_subrange`. -/
-example : ∀ {P E : Type} (allocation : Allocation P E)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_35_getBytesUnchecked_subrange : ∀ {P E : Type} (allocation : Allocation P E)
     (rOuter rInner : AllocRange) (fOuter fInner : Size) (outerBytes : Array UInt8)
-    (h_outer_end : rOuter.endExclusive = .ok fOuter)
-    (h_inner_end : rInner.endExclusive = .ok fInner)
-    (h_lo : rOuter.start.bytes.toNat ≤ rInner.start.bytes.toNat)
-    (h_mid : rInner.start.bytes.toNat ≤ fInner.bytes.toNat)
-    (h_hi : fInner.bytes.toNat ≤ fOuter.bytes.toNat)
-    (h_outer : allocation.getBytesUnchecked rOuter = .ok outerBytes),
+    (_h_outer_end : rOuter.endExclusive = .ok fOuter)
+    (_h_inner_end : rInner.endExclusive = .ok fInner)
+    (_h_lo : rOuter.start.bytes.toNat ≤ rInner.start.bytes.toNat)
+    (_h_mid : rInner.start.bytes.toNat ≤ fInner.bytes.toNat)
+    (_h_hi : fInner.bytes.toNat ≤ fOuter.bytes.toNat)
+    (_h_outer : allocation.getBytesUnchecked rOuter = .ok outerBytes),
     allocation.getBytesUnchecked rInner =
       .ok (outerBytes.extract
         (rInner.start.bytes.toNat - rOuter.start.bytes.toNat)
@@ -355,55 +358,55 @@ example : ∀ {P E : Type} (allocation : Allocation P E)
   @Miri.Memory.Allocation.getBytesUnchecked_subrange
 
 /-- Pin: `getBytesUnchecked_split`. -/
-example : ∀ {P E : Type} (allocation : Allocation P E)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_36_getBytesUnchecked_split : ∀ {P E : Type} (allocation : Allocation P E)
     (r1 r2 r12 : AllocRange) (mid fin : Size) (b1 b2 : Array UInt8)
-    (h_end1 : r1.endExclusive = .ok mid)
-    (h_start2 : r2.start = mid)
-    (h_end2 : r2.endExclusive = .ok fin)
-    (h_start12 : r12.start = r1.start)
-    (h_end12 : r12.endExclusive = .ok fin)
-    (h_lo1 : r1.start.bytes.toNat ≤ mid.bytes.toNat)
-    (h_lo2 : mid.bytes.toNat ≤ fin.bytes.toNat)
-    (h_get1 : allocation.getBytesUnchecked r1 = .ok b1)
-    (h_get2 : allocation.getBytesUnchecked r2 = .ok b2),
+    (_h_end1 : r1.endExclusive = .ok mid)
+    (_h_start2 : r2.start = mid)
+    (_h_end2 : r2.endExclusive = .ok fin)
+    (_h_start12 : r12.start = r1.start)
+    (_h_end12 : r12.endExclusive = .ok fin)
+    (_h_lo1 : r1.start.bytes.toNat ≤ mid.bytes.toNat)
+    (_h_lo2 : mid.bytes.toNat ≤ fin.bytes.toNat)
+    (_h_get1 : allocation.getBytesUnchecked r1 = .ok b1)
+    (_h_get2 : allocation.getBytesUnchecked r2 = .ok b2),
     allocation.getBytesUnchecked r12 = .ok (b1 ++ b2) :=
   @Miri.Memory.Allocation.getBytesUnchecked_split
 
 /-- Pin: `getBytesStripProvenance_uninit_err`. -/
-example : ∀ {P E : Type} [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_37_getBytesStripProvenance_uninit_err : ∀ {P E : Type} [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range bad : AllocRange)
-    (h_uninit : allocation.initializationMask.isRangeInitialized range = .ok (.error bad)),
+    (_h_uninit : allocation.initializationMask.isRangeInitialized range = .ok (.error bad)),
     allocation.getBytesStripProvenance layout range =
       .error (.invalidUninitBytes (some ⟨range, bad⟩)) :=
   @Miri.Memory.Allocation.getBytesStripProvenance_uninit_err
 
 /-- Pin: `getBytesStripProvenance_ok`. -/
-example : ∀ {P E : Type} [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_38_getBytesStripProvenance_ok : ∀ {P E : Type} [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout) (range : AllocRange)
-    (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
+    (_h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (_h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
       allocation.provenanceMap.rangeEmpty range (Size.fromBits layout.pointerWidth.bits) = .ok true),
     allocation.getBytesStripProvenance layout range = allocation.getBytesUnchecked range :=
   @Miri.Memory.Allocation.getBytesStripProvenance_ok
 
 /-- Pin: `readScalar_uninit_err`. -/
-example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_39_readScalar_uninit_err : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range bad : AllocRange) (readProvenance : Bool)
-    (h_uninit : allocation.initializationMask.isRangeInitialized range = .ok (.error bad)),
+    (_h_uninit : allocation.initializationMask.isRangeInitialized range = .ok (.error bad)),
     allocation.readScalar layout range readProvenance =
       .error (.invalidUninitBytes (some ⟨range, bad⟩)) :=
   @Miri.Memory.Allocation.readScalar_uninit_err
 
 /-- Pin: `readScalar_int_of_bytes`. -/
-example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_40_readScalar_int_of_bytes : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bytes : Array UInt8)
-    (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (h_slice : allocation.getBytesUnchecked range = .ok bytes)
-    (h_limit : bytes.size ≤ 16)
-    (h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
+    (_h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (_h_slice : allocation.getBytesUnchecked range = .ok bytes)
+    (_h_limit : bytes.size ≤ 16)
+    (_h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
       allocation.provenanceMap.rangeEmpty range (Size.fromBits layout.pointerWidth.bits) = .ok true),
     allocation.readScalar layout range false =
       (Scalar.fromUInt (BitVec.ofNat 128 ((List.range bytes.size).foldl (fun acc idx =>
@@ -413,15 +416,15 @@ example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
   @Miri.Memory.Allocation.readScalar_int_of_bytes
 
 /-- Pin: `readScalar_int_roundtrip`. -/
-example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_41_readScalar_int_roundtrip : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
-    (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (h_limit : range.size.bytes.toNat ≤ 16)
-    (h_bits_bound : bits.toNat < 2 ^ (8 * range.size.bytes.toNat))
-    (h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
+    (_h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (_h_limit : range.size.bytes.toNat ≤ 16)
+    (_h_bits_bound : bits.toNat < 2 ^ (8 * range.size.bytes.toNat))
+    (_h_prov : PointerProvenance.offsetIsAddr (Prov := P) = true ∨
       allocation.provenanceMap.rangeEmpty range (Size.fromBits layout.pointerWidth.bits) = .ok true)
-    (h_slice : allocation.getBytesUnchecked range =
+    (_h_slice : allocation.getBytesUnchecked range =
       .ok (Array.ofFn (fun i : Fin range.size.bytes.toNat =>
         UInt8.ofNat ((bits.toNat / 2 ^ (8 *
           (if layout.endian == .little then i.1 else range.size.bytes.toNat - i.1 - 1))) % 256)))),
@@ -430,16 +433,16 @@ example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
   @Miri.Memory.Allocation.readScalar_int_roundtrip
 
 /-- Pin: `readScalar_ptr_roundtrip`. -/
-example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_42_readScalar_ptr_roundtrip : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (ptr : Pointer P)
-    (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (h_ptr_sz : range.size = Size.fromBits layout.pointerWidth.bits)
-    (h_limit : range.size.bytes.toNat ≤ 16)
-    (h_off_bound : ptr.offset.bytes.toNat < 2 ^ (8 * range.size.bytes.toNat))
-    (h_prov : allocation.provenanceMap.readPtr range.start
+    (_h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (_h_ptr_sz : range.size = Size.fromBits layout.pointerWidth.bits)
+    (_h_limit : range.size.bytes.toNat ≤ 16)
+    (_h_off_bound : ptr.offset.bytes.toNat < 2 ^ (8 * range.size.bytes.toNat))
+    (_h_prov : allocation.provenanceMap.readPtr range.start
       (Size.fromBits layout.pointerWidth.bits) = .ok (some ptr.provenance))
-    (h_slice : allocation.getBytesUnchecked range =
+    (_h_slice : allocation.getBytesUnchecked range =
       .ok (Array.ofFn (fun i : Fin range.size.bytes.toNat =>
         UInt8.ofNat ((ptr.offset.bytes.toNat / 2 ^ (8 *
           (if layout.endian == .little then i.1 else range.size.bytes.toNat - i.1 - 1))) % 256)))),
@@ -447,16 +450,16 @@ example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
   @Miri.Memory.Allocation.readScalar_ptr_roundtrip
 
 /-- Pin: `readScalar_ptr_none_roundtrip`. -/
-example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_43_readScalar_ptr_none_roundtrip : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
     (allocation : Allocation P E) (layout : TargetDataLayout)
     (range : AllocRange) (bits : U128)
-    (h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
-    (h_ptr_sz : range.size = Size.fromBits layout.pointerWidth.bits)
-    (h_limit : range.size.bytes.toNat ≤ 16)
-    (h_bits_bound : bits.toNat < 2 ^ (8 * range.size.bytes.toNat))
-    (h_prov : allocation.provenanceMap.readPtr range.start
+    (_h_init : allocation.initializationMask.isRangeInitialized range = .ok (.ok ()))
+    (_h_ptr_sz : range.size = Size.fromBits layout.pointerWidth.bits)
+    (_h_limit : range.size.bytes.toNat ≤ 16)
+    (_h_bits_bound : bits.toNat < 2 ^ (8 * range.size.bytes.toNat))
+    (_h_prov : allocation.provenanceMap.readPtr range.start
       (Size.fromBits layout.pointerWidth.bits) = .ok none)
-    (h_slice : allocation.getBytesUnchecked range =
+    (_h_slice : allocation.getBytesUnchecked range =
       .ok (Array.ofFn (fun i : Fin range.size.bytes.toNat =>
         UInt8.ofNat ((bits.toNat / 2 ^ (8 *
           (if layout.endian == .little then i.1 else range.size.bytes.toNat - i.1 - 1))) % 256)))),
@@ -465,22 +468,22 @@ example : ∀ {P E : Type} [DecidableEq P] [PointerProvenance P]
   @Miri.Memory.Allocation.readScalar_ptr_none_roundtrip
 
 /-- Pin: `writeScalar_spec`. -/
-example : ∀ {P E : Type} (layout : TargetDataLayout)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_44_writeScalar_spec : ∀ {P E : Type} (layout : TargetDataLayout)
     (allocation : Allocation P E) (range : AllocRange) (value : Scalar P)
     (converted : ScalarBitsOrPointer P) (cleared nextProvenance : ProvenanceMap P)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (mutable : allocation.mutability = .Mut)
-    (maskLength : allocation.initializationMask.len = allocation.byteSize)
-    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
-    (nonzero : range.size.bytes ≠ 0)
-    (width : range.size.bytes.toNat ≤ 16)
-    (bound : range.start.bytes.toNat + range.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
-    (conversion : value.toBitsOrPtrInternal range.size = .ok converted)
-    (clear : ∀ fullBytes : Array UInt8,
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_mutable : allocation.mutability = .Mut)
+    (_maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (_maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (_nonzero : range.size.bytes ≠ 0)
+    (_width : range.size.bytes.toNat ≤ 16)
+    (_bound : range.start.bytes.toNat + range.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (_conversion : value.toBitsOrPtrInternal range.size = .ok converted)
+    (_clear : ∀ fullBytes : Array UInt8,
       allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
       allocation.provenanceMap.clear range fullBytes
         (Size.fromBits layout.pointerWidth.bits) = .ok () cleared)
-    (insert : match converted with
+    (_insert : match converted with
       | .bits _ => nextProvenance = cleared
       | .pointer pointer => range.size = Size.fromBits layout.pointerWidth.bits ∧
           cleared.insertPtr range.start pointer.provenance
@@ -518,24 +521,24 @@ example : ∀ {P E : Type} (layout : TargetDataLayout)
   @Miri.Memory.Allocation.writeScalar_spec
 
 /-- Pin: `writeBytes_zero_spec`. -/
-example : ∀ {P E : Type} (start ptrSize : Size) (bytes : Array UInt8)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_45_writeBytes_zero_spec : ∀ {P E : Type} (start ptrSize : Size) (bytes : Array UInt8)
     (allocation : Allocation P E)
-    (h_empty : bytes.size = 0)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (inBounds : start.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
+    (_h_empty : bytes.size = 0)
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_inBounds : start.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
     Allocation.writeBytes start bytes ptrSize allocation = .ok () allocation :=
   @Miri.Memory.Allocation.writeBytes_zero_spec
 
 /-- Pin: `writeBytes_spec`. -/
-example : ∀ {P E : Type} (start ptrSize : Size) (bytes : Array UInt8)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_46_writeBytes_spec : ∀ {P E : Type} (start ptrSize : Size) (bytes : Array UInt8)
     (allocation : Allocation P E) (nextProvenance : ProvenanceMap P)
-    (h_nonempty : 0 < bytes.size)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (mutable : allocation.mutability = .Mut)
-    (maskLength : allocation.initializationMask.len = allocation.byteSize)
-    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
-    (inBounds : start.bytes.toNat + bytes.size ≤ allocation.byteSize.bytes.toNat)
-    (clear : ∀ fullBytes : Array UInt8,
+    (_h_nonempty : 0 < bytes.size)
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_mutable : allocation.mutability = .Mut)
+    (_maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (_maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (_inBounds : start.bytes.toNat + bytes.size ≤ allocation.byteSize.bytes.toNat)
+    (_clear : ∀ fullBytes : Array UInt8,
       allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
       allocation.provenanceMap.clear
         (allocRange start (Size.ofBytes (UInt64.ofNat bytes.size))) fullBytes ptrSize =
@@ -568,26 +571,26 @@ example : ∀ {P E : Type} (start ptrSize : Size) (bytes : Array UInt8)
   @Miri.Memory.Allocation.writeBytes_spec
 
 /-- Pin: `writeUninit_zero_spec`. -/
-example : ∀ {P E : Type} (range : AllocRange) (finish ptrSize : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_47_writeUninit_zero_spec : ∀ {P E : Type} (range : AllocRange) (finish ptrSize : Size)
     (allocation : Allocation P E)
-    (h_zero : range.size.bytes = 0)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (endEq : range.endExclusive = .ok finish)
-    (startLe : range.start.bytes.toNat ≤ finish.bytes.toNat)
-    (inBounds : finish.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
+    (_h_zero : range.size.bytes = 0)
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_endEq : range.endExclusive = .ok finish)
+    (_startLe : range.start.bytes.toNat ≤ finish.bytes.toNat)
+    (_inBounds : finish.bytes.toNat ≤ allocation.byteSize.bytes.toNat),
     Allocation.writeUninit range ptrSize allocation = .ok () allocation :=
   @Miri.Memory.Allocation.writeUninit_zero_spec
 
 /-- Pin: `writeUninit_spec`. -/
-example : ∀ {P E : Type} (range : AllocRange) (ptrSize : Size)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_48_writeUninit_spec : ∀ {P E : Type} (range : AllocRange) (ptrSize : Size)
     (allocation : Allocation P E) (nextProvenance : ProvenanceMap P)
-    (nonzero : range.size.bytes ≠ 0)
-    (storage : allocation.len = allocation.byteSize.bytes.toNat)
-    (mutable : allocation.mutability = .Mut)
-    (maskLength : allocation.initializationMask.len = allocation.byteSize)
-    (maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
-    (inBounds : range.start.bytes.toNat + range.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
-    (clear : ∀ fullBytes : Array UInt8,
+    (_nonzero : range.size.bytes ≠ 0)
+    (_storage : allocation.len = allocation.byteSize.bytes.toNat)
+    (_mutable : allocation.mutability = .Mut)
+    (_maskLength : allocation.initializationMask.len = allocation.byteSize)
+    (_maskValid : InitMask.WriteProof.WellFormed allocation.initializationMask)
+    (_inBounds : range.start.bytes.toNat + range.size.bytes.toNat ≤ allocation.byteSize.bytes.toNat)
+    (_clear : ∀ fullBytes : Array UInt8,
       allocation.getBytesUnchecked (allocRange Size.ZERO allocation.byteSize) = .ok fullBytes →
       allocation.provenanceMap.clear range fullBytes ptrSize = .ok () nextProvenance),
     ∃ updated,
@@ -607,38 +610,38 @@ example : ∀ {P E : Type} (range : AllocRange) (ptrSize : Size)
   @Miri.Memory.Allocation.writeUninit_spec
 
 /-- Pin: `copyRepeatedly_initialized_spec`. -/
-example : ∀ {P E : Type} (source state : Allocation P E)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_49_copyRepeatedly_initialized_spec : ∀ {P E : Type} (source state : Allocation P E)
     (sourceRange : AllocRange) (srcFinish destStart totalSize ptrSize : Size)
     (repeatCount : UInt64) (sameAllocation nonoverlapping : Bool)
     (srcBytes : Array UInt8) (provCopy : ProvenanceCopy P)
     (clearedProv finalProv : ProvenanceMap P)
-    (srcStorage : source.len = source.byteSize.bytes.toNat)
-    (srcEnd : sourceRange.endExclusive = .ok srcFinish)
-    (srcNonzero : sourceRange.size.bytes ≠ 0)
-    (srcMaskLen : source.initializationMask.len = source.byteSize)
-    (srcMaskWF : InitMask.WriteProof.WellFormed source.initializationMask)
-    (srcInit : source.initializationMask.isRangeInitialized sourceRange = .ok (.ok ()))
-    (srcSlice : source.getBytesUnchecked sourceRange = .ok srcBytes)
-    (srcInBounds : srcFinish.bytes.toNat ≤ source.byteSize.bytes.toNat)
-    (h_prepProv : ∀ srcFull : Array UInt8,
+    (_srcStorage : source.len = source.byteSize.bytes.toNat)
+    (_srcEnd : sourceRange.endExclusive = .ok srcFinish)
+    (_srcNonzero : sourceRange.size.bytes ≠ 0)
+    (_srcMaskLen : source.initializationMask.len = source.byteSize)
+    (_srcMaskWF : InitMask.WriteProof.WellFormed source.initializationMask)
+    (_srcInit : source.initializationMask.isRangeInitialized sourceRange = .ok (.ok ()))
+    (_srcSlice : source.getBytesUnchecked sourceRange = .ok srcBytes)
+    (_srcInBounds : srcFinish.bytes.toNat ≤ source.byteSize.bytes.toNat)
+    (_h_prepProv : ∀ srcFull : Array UInt8,
       source.getBytesUnchecked (allocRange Size.ZERO source.byteSize) = .ok srcFull →
       source.provenanceMap.prepareCopy sourceRange srcFull ptrSize = .ok provCopy)
-    (h_repPos : 0 < repeatCount.toNat)
-    (h_mul : Size.mul sourceRange.size repeatCount = .ok totalSize)
-    (h_repMode : repeatCount > 1 → nonoverlapping = true)
-    (h_disjSame : sameAllocation = true → nonoverlapping = true →
+    (_h_repPos : 0 < repeatCount.toNat)
+    (_h_mul : Size.mul sourceRange.size repeatCount = .ok totalSize)
+    (_h_repMode : repeatCount > 1 → nonoverlapping = true)
+    (_h_disjSame : sameAllocation = true → nonoverlapping = true →
       srcFinish.bytes.toNat ≤ destStart.bytes.toNat ∨
         destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ sourceRange.start.bytes.toNat)
-    (destStorage : state.len = state.byteSize.bytes.toNat)
-    (destMut : state.mutability = .Mut)
-    (destMaskLen : state.initializationMask.len = state.byteSize)
-    (destMaskWF : InitMask.WriteProof.WellFormed state.initializationMask)
-    (destInBounds : destStart.bytes.toNat + totalSize.bytes.toNat ≤ state.byteSize.bytes.toNat)
-    (h_clearProv : ∀ stFull : Array UInt8,
+    (_destStorage : state.len = state.byteSize.bytes.toNat)
+    (_destMut : state.mutability = .Mut)
+    (_destMaskLen : state.initializationMask.len = state.byteSize)
+    (_destMaskWF : InitMask.WriteProof.WellFormed state.initializationMask)
+    (_destInBounds : destStart.bytes.toNat + totalSize.bytes.toNat ≤ state.byteSize.bytes.toNat)
+    (_h_clearProv : ∀ stFull : Array UInt8,
       state.getBytesUnchecked (allocRange Size.ZERO state.byteSize) = .ok stFull →
       state.provenanceMap.clear (allocRange destStart totalSize) stFull ptrSize =
         .ok () clearedProv)
-    (h_applyProv : clearedProv.applyCopy provCopy
+    (_h_applyProv : clearedProv.applyCopy provCopy
       (allocRange destStart sourceRange.size) repeatCount = .ok () finalProv),
     ∃ updated,
       Allocation.copyRepeatedly source sourceRange destStart repeatCount
@@ -680,35 +683,35 @@ example : ∀ {P E : Type} (source state : Allocation P E)
   @Miri.Memory.Allocation.copyRepeatedly_initialized_spec
 
 /-- Pin: `copy_initialized_spec`. -/
-example : ∀ {P E : Type} (source state : Allocation P E)
+theorem _root_.LeanMiriMemoryLemmasTests.SignaturePins.pin_50_copy_initialized_spec : ∀ {P E : Type} (source state : Allocation P E)
     (sourceRange : AllocRange) (srcFinish destStart ptrSize : Size)
     (sameAllocation nonoverlapping : Bool)
     (srcBytes : Array UInt8) (provCopy : ProvenanceCopy P)
     (clearedProv finalProv : ProvenanceMap P)
-    (srcStorage : source.len = source.byteSize.bytes.toNat)
-    (srcEnd : sourceRange.endExclusive = .ok srcFinish)
-    (srcNonzero : sourceRange.size.bytes ≠ 0)
-    (srcMaskLen : source.initializationMask.len = source.byteSize)
-    (srcMaskWF : InitMask.WriteProof.WellFormed source.initializationMask)
-    (srcInit : source.initializationMask.isRangeInitialized sourceRange = .ok (.ok ()))
-    (srcSlice : source.getBytesUnchecked sourceRange = .ok srcBytes)
-    (srcInBounds : srcFinish.bytes.toNat ≤ source.byteSize.bytes.toNat)
-    (h_prepProv : ∀ srcFull : Array UInt8,
+    (_srcStorage : source.len = source.byteSize.bytes.toNat)
+    (_srcEnd : sourceRange.endExclusive = .ok srcFinish)
+    (_srcNonzero : sourceRange.size.bytes ≠ 0)
+    (_srcMaskLen : source.initializationMask.len = source.byteSize)
+    (_srcMaskWF : InitMask.WriteProof.WellFormed source.initializationMask)
+    (_srcInit : source.initializationMask.isRangeInitialized sourceRange = .ok (.ok ()))
+    (_srcSlice : source.getBytesUnchecked sourceRange = .ok srcBytes)
+    (_srcInBounds : srcFinish.bytes.toNat ≤ source.byteSize.bytes.toNat)
+    (_h_prepProv : ∀ srcFull : Array UInt8,
       source.getBytesUnchecked (allocRange Size.ZERO source.byteSize) = .ok srcFull →
       source.provenanceMap.prepareCopy sourceRange srcFull ptrSize = .ok provCopy)
-    (h_disjSame : sameAllocation = true → nonoverlapping = true →
+    (_h_disjSame : sameAllocation = true → nonoverlapping = true →
       srcFinish.bytes.toNat ≤ destStart.bytes.toNat ∨
         destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ sourceRange.start.bytes.toNat)
-    (destStorage : state.len = state.byteSize.bytes.toNat)
-    (destMut : state.mutability = .Mut)
-    (destMaskLen : state.initializationMask.len = state.byteSize)
-    (destMaskWF : InitMask.WriteProof.WellFormed state.initializationMask)
-    (destInBounds : destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ state.byteSize.bytes.toNat)
-    (h_clearProv : ∀ stFull : Array UInt8,
+    (_destStorage : state.len = state.byteSize.bytes.toNat)
+    (_destMut : state.mutability = .Mut)
+    (_destMaskLen : state.initializationMask.len = state.byteSize)
+    (_destMaskWF : InitMask.WriteProof.WellFormed state.initializationMask)
+    (_destInBounds : destStart.bytes.toNat + sourceRange.size.bytes.toNat ≤ state.byteSize.bytes.toNat)
+    (_h_clearProv : ∀ stFull : Array UInt8,
       state.getBytesUnchecked (allocRange Size.ZERO state.byteSize) = .ok stFull →
       state.provenanceMap.clear (allocRange destStart sourceRange.size) stFull ptrSize =
         .ok () clearedProv)
-    (h_applyProv : clearedProv.applyCopy provCopy
+    (_h_applyProv : clearedProv.applyCopy provCopy
       (allocRange destStart sourceRange.size) 1 = .ok () finalProv),
     ∃ updated,
       Allocation.copy source sourceRange destStart ptrSize
@@ -751,6 +754,94 @@ example : ∀ {P E : Type} (source state : Allocation P E)
 end Miri.Memory.Allocation
 
 end SignaturePins
+
+section BinderParityAudit
+open Lean Elab Command
+
+/-- Verify that all 50 `SignaturePins` theorems match their `LeanMiriSpec.MemoryLemmas` counterparts
+not only up to definitional type equality, but also in `levelParams` and exact `Expr.forallE`
+`BinderInfo` (`default` vs `implicit` vs `strictImplicit` vs `instImplicit`) at every binder
+position, closing the `@`-application binder-erasure blind spot. -/
+elab "#assert_binder_parity" : command => do
+  let env ← getEnv
+  let pairs : List (Name × Name) := [
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_01_get_ok_of_wellFormed, `Miri.Memory.InitMask.WriteProof.get_ok_of_wellFormed),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_02_set_range_get, `Miri.Memory.InitMask.WriteProof.set_range_get),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_03_isRangeInitialized_nonempty_iff, `Miri.Memory.InitMask.WriteProof.isRangeInitialized_nonempty_iff),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_04_isRangeInitialized_after_setRange_true, `Miri.Memory.InitMask.WriteProof.isRangeInitialized_after_setRange_true),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_05_isRangeInitialized_frame, `Miri.Memory.InitMask.WriteProof.isRangeInitialized_frame),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_06_prepareCopy_of_uniform, `Miri.Memory.InitMask.WriteProof.prepareCopy_of_uniform),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_07_applyCopy_singleton, `Miri.Memory.InitMask.WriteProof.applyCopy_singleton),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_08_rangeEmpty_new, `Miri.Memory.ProvenanceMap.rangeEmpty_new),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_09_readPtr_new, `Miri.Memory.ProvenanceMap.readPtr_new),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_10_prepareCopy_new, `Miri.Memory.ProvenanceMap.prepareCopy_new),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_11_applyCopy_empty, `Miri.Memory.ProvenanceMap.applyCopy_empty),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_12_byteSize_withExtra, `Miri.Memory.Allocation.byteSize_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_13_len_withExtra, `Miri.Memory.Allocation.len_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_14_align_withExtra, `Miri.Memory.Allocation.align_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_15_mutability_withExtra, `Miri.Memory.Allocation.mutability_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_16_provenanceMap_withExtra, `Miri.Memory.Allocation.provenanceMap_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_17_initializationMask_withExtra, `Miri.Memory.Allocation.initializationMask_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_18_getBytesUnchecked_withExtra, `Miri.Memory.Allocation.getBytesUnchecked_withExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_19_byteSize_mapExtra, `Miri.Memory.Allocation.byteSize_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_20_len_mapExtra, `Miri.Memory.Allocation.len_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_21_align_mapExtra, `Miri.Memory.Allocation.align_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_22_mutability_mapExtra, `Miri.Memory.Allocation.mutability_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_23_provenanceMap_mapExtra, `Miri.Memory.Allocation.provenanceMap_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_24_initializationMask_mapExtra, `Miri.Memory.Allocation.initializationMask_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_25_getBytesUnchecked_mapExtra, `Miri.Memory.Allocation.getBytesUnchecked_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_26_getBytesStripProvenance_mapExtra, `Miri.Memory.Allocation.getBytesStripProvenance_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_27_readScalar_mapExtra, `Miri.Memory.Allocation.readScalar_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_28_writeBytes_mapExtra, `Miri.Memory.Allocation.writeBytes_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_29_clearProvenance_mapExtra, `Miri.Memory.Allocation.clearProvenance_mapExtra),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_30_fromBytes_spec, `Miri.Memory.Allocation.fromBytes_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_31_fromBytes_exists, `Miri.Memory.Allocation.fromBytes_exists),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_32_tryNew_spec, `Miri.Memory.Allocation.tryNew_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_33_tryNew_exists, `Miri.Memory.Allocation.tryNew_exists),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_34_getBytesUnchecked_size, `Miri.Memory.Allocation.getBytesUnchecked_size),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_35_getBytesUnchecked_subrange, `Miri.Memory.Allocation.getBytesUnchecked_subrange),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_36_getBytesUnchecked_split, `Miri.Memory.Allocation.getBytesUnchecked_split),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_37_getBytesStripProvenance_uninit_err, `Miri.Memory.Allocation.getBytesStripProvenance_uninit_err),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_38_getBytesStripProvenance_ok, `Miri.Memory.Allocation.getBytesStripProvenance_ok),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_39_readScalar_uninit_err, `Miri.Memory.Allocation.readScalar_uninit_err),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_40_readScalar_int_of_bytes, `Miri.Memory.Allocation.readScalar_int_of_bytes),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_41_readScalar_int_roundtrip, `Miri.Memory.Allocation.readScalar_int_roundtrip),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_42_readScalar_ptr_roundtrip, `Miri.Memory.Allocation.readScalar_ptr_roundtrip),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_43_readScalar_ptr_none_roundtrip, `Miri.Memory.Allocation.readScalar_ptr_none_roundtrip),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_44_writeScalar_spec, `Miri.Memory.Allocation.writeScalar_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_45_writeBytes_zero_spec, `Miri.Memory.Allocation.writeBytes_zero_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_46_writeBytes_spec, `Miri.Memory.Allocation.writeBytes_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_47_writeUninit_zero_spec, `Miri.Memory.Allocation.writeUninit_zero_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_48_writeUninit_spec, `Miri.Memory.Allocation.writeUninit_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_49_copyRepeatedly_initialized_spec, `Miri.Memory.Allocation.copyRepeatedly_initialized_spec),
+    (`LeanMiriMemoryLemmasTests.SignaturePins.pin_50_copy_initialized_spec, `Miri.Memory.Allocation.copy_initialized_spec),
+  ]
+  let rec checkBinders (k : Nat) (e1 e2 : Expr) : Option String :=
+    match e1, e2 with
+    | .forallE n1 _ b1 bi1, .forallE n2 _ b2 bi2 =>
+      if bi1 != bi2 then
+        some s!"binder #{k} ({n1} vs {n2}): pin has {repr bi1}, theorem has {repr bi2}"
+      else
+        checkBinders (k + 1) b1 b2
+    | .forallE n1 _ _ _, _ =>
+      some s!"binder #{k}: pin has extra forall binder {n1}"
+    | _, .forallE n2 _ _ _ =>
+      some s!"binder #{k}: theorem has extra forall binder {n2}"
+    | _, _ => none
+  if pairs.length != 50 then
+    logError m!"Expected 50 signature-pin pairs, got {pairs.length}"
+  for (pinName, thmName) in pairs do
+    let some pinInfo := env.find? pinName
+      | logError m!"Missing signature pin {pinName}"; continue
+    let some thmInfo := env.find? thmName
+      | logError m!"Missing MemoryLemmas theorem {thmName}"; continue
+    if pinInfo.levelParams != thmInfo.levelParams then
+      logError m!"Universe parameter mismatch on {thmName}: {pinInfo.levelParams} vs {thmInfo.levelParams}"
+    if let some msg := checkBinders 0 pinInfo.type thmInfo.type then
+      logError m!"BinderInfo mismatch on {thmName}: {msg}"
+
+#assert_binder_parity
+end BinderParityAudit
 
 /-! ## 2. `MemoryLemmas` witnesses on concrete states -/
 
@@ -1428,65 +1519,80 @@ theorem wit_exposed_provenance_strip_and_transmute (endian : Endian) :
   exact ⟨p0, pPtr, hp0, hwPtr, hnotEmpty, hstrip, htransmute8, hsub⟩
 
 end LeanMiriMemoryLemmasTests.MemoryWitnesses
+
 /-! ## 3. `ValidationRankCert` witnesses -/
 
 namespace LeanMiriMemoryLemmasTests.RankCert
 open Miri.ABI Miri.Memory Miri.Memory.Validity Miri.Interpreter
-open Miri.Interpreter.ValidityVisitor (M Key)
+open Miri.Interpreter.ValidityVisitor (M Key Session)
 open LeanMiriSpec.ValidationRankCert
 
-/-! ### 150-level nested single-field wrapper -/
+/-! ### 3a. 150-level nested single-field wrapper & `Anneal.MirFuelFree` bridge -/
 
-example : wrapperWalk.walkNoFuel (wrapperRoot 150) () () = .ok () () := wrapper150_noFuel
+theorem wit_wrapper150_noFuel :
+    wrapperWalk.walkNoFuel (wrapperRoot 150) () () = .ok () () :=
+  wrapper150_noFuel
 
-example : resultOk (wrapperWalk.walkFuel 151 (wrapperRoot 150) () ()) = true := by
+theorem wit_wrapper150_fuel151_ok :
+    resultOk (wrapperWalk.walkFuel 151 (wrapperRoot 150) () ()) = true := by
   decide +kernel
 
-example : resultExhausted "validity traversal fuel"
-    (wrapperWalk.walkFuel 150 (wrapperRoot 150) () ()) = true := by
+theorem wit_wrapper150_fuel150_exhausted :
+    resultExhausted "validity traversal fuel"
+      (wrapperWalk.walkFuel 150 (wrapperRoot 150) () ()) = true := by
   decide +kernel
 
-example (fuel : Nat) (hfuel : fuel < 150) :
+theorem wit_wrapper150_small_fuel_exhausts (fuel : Nat) (hfuel : fuel < 150) :
     wrapperWalk.walkFuel fuel (wrapperRoot 150) () () =
       .error (.resourceExhaustion "validity traversal fuel") () :=
   wrapper150_small_fuel_exhausts fuel (by omega)
 
-example : wrapperWalk.walkFuel 151 (wrapperRoot 150) () =
-    wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
+theorem wit_wrapper150_fuel151_eq_noFuel :
+    wrapperWalk.walkFuel 151 (wrapperRoot 150) () =
+      wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
   wrapper150_fuel151_eq_noFuel
 
-/-- The general adequacy theorem at the canonical static bound `order root + 1 = 452`. -/
-example : wrapperWalk.walkFuel 452 (wrapperRoot 150) () =
-    wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
+/-- General adequacy at the canonical static bound `order root + 1 = 452`. -/
+theorem wit_wrapper150_fuel452_adequacy :
+    wrapperWalk.walkFuel 452 (wrapperRoot 150) () =
+      wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
   wrapperWalk.walkFuel_eq_walkNoFuel _ wrapperWalk_descendsOn 452 _ () trivial (by decide)
 
-/-- The `Anneal.MirFuelFree` bridge at a budget well above the canonical bound. -/
-example : wrapperWalk.walkFuel 1000 (wrapperRoot 150) () =
-    wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
+/-- `Anneal.MirFuelFree` bridge at a budget well above the canonical bound. -/
+theorem wit_wrapper150_mirFuelFree_bridge :
+    wrapperWalk.walkFuel 1000 (wrapperRoot 150) () =
+      wrapperWalk.walkNoFuel (wrapperRoot 150) () :=
   walkFuel_eq_walkNoFuel_of_wpCoalBounded wrapperWalk _ wrapperWalk_descendsOn 1000 _ () trivial
     PUnit.unit (rankCountdown_canonical _ 1000 PUnit.unit (by decide))
 
-/-- The rank countdown does not converge at the root's order (fuel must exceed it). -/
-example : ¬ Anneal.ITreeWP.wpCoalBounded 451 emptyWP rankCountdown (fun _ _ => True)
-    (wrapperWalk.order (wrapperRoot 150)) PUnit.unit := by
+/-- The rank countdown does not converge at the root's order (fuel must strictly exceed it). -/
+theorem wit_wrapper150_countdown_tight :
+    ¬ Anneal.ITreeWP.wpCoalBounded 451 emptyWP rankCountdown (fun _ _ => True)
+      (wrapperWalk.order (wrapperRoot 150)) PUnit.unit := by
   rw [rankCountdown_converges_iff]
   decide
 
-/-! ### Static certificates -/
+/-! ### 3b. Static `LayoutGraph` certificates (including missing-child unclosed-cycle rejection) -/
 
 def nodeA : LocalLayout := ⟨1, wrapperLayout⟩
 def nodeB : LocalLayout := ⟨2, wrapperLayout⟩
 def nodeC : LocalLayout := ⟨3, wrapperLayout⟩
 
-/-- `C ↦ B ↦ A`. -/
+/-- `C ↦ B ↦ A` (closed acyclic chain). -/
 def chainGraph : LayoutGraph where
   nodes := [nodeC, nodeB, nodeA]
   children := fun p => if p.ty = 3 then [nodeB] else if p.ty = 2 then [nodeA] else []
 
-/-- `A ↦ B ↦ A`. -/
+/-- `A ↦ B ↦ A` (closed 2-cycle). -/
 def cycleGraph : LayoutGraph where
   nodes := [nodeA, nodeB]
   children := fun p => if p.ty = 1 then [nodeB] else [nodeA]
+
+/-- Adversarial unclosed cycle: `C ↦ B ↦ A ↦ C`, where `nodeA` is omitted from `nodes`!
+`checkCert` must reject because `B`'s child `nodeA` is missing from `nodes`. -/
+def unclosedCycleGraph : LayoutGraph where
+  nodes := [nodeC, nodeB]
+  children := fun p => if p.ty = 3 then [nodeB] else if p.ty = 2 then [nodeA] else [nodeC]
 
 def chainCert : ValidationRankCert := ⟨[(1, 1), (2, 2), (3, 3)]⟩
 
@@ -1496,25 +1602,261 @@ def flatCert : ValidationRankCert := ⟨[(1, 5), (2, 5), (3, 5)]⟩
 /-- Inverted ranks: children are larger than their parents. -/
 def invertedCert : ValidationRankCert := ⟨[(1, 3), (2, 2), (3, 1)]⟩
 
-example : checkCert chainCert chainGraph = true := by decide +kernel
-example : chainGraph.closed = true := by decide +kernel
-example : checkCert flatCert chainGraph = false := by decide +kernel
-example : checkCert invertedCert chainGraph = false := by decide +kernel
-example : checkCert chainCert cycleGraph = false := by decide +kernel
+theorem wit_chainCert_accepts : checkCert chainCert chainGraph = true := by decide +kernel
+theorem wit_chainGraph_closed : chainGraph.closed = true := by decide +kernel
+theorem wit_flatCert_rejects : checkCert flatCert chainGraph = false := by decide +kernel
+theorem wit_invertedCert_rejects : checkCert invertedCert chainGraph = false := by decide +kernel
+theorem wit_cycleGraph_rejects : checkCert chainCert cycleGraph = false := by decide +kernel
+theorem wit_unclosedCycleGraph_not_closed : unclosedCycleGraph.closed = false := by decide +kernel
+theorem wit_unclosedCycleGraph_rejects : checkCert chainCert unclosedCycleGraph = false := by
+  decide +kernel
 
 /-- Cyclic graphs are rejected for every rank table. -/
-example (cert : ValidationRankCert) : checkCert cert cycleGraph = false :=
+theorem wit_cycleGraph_rejects_any_cert (cert : ValidationRankCert) :
+    checkCert cert cycleGraph = false :=
   checkCert_rejects_cycle cert cycleGraph nodeA
     (Reach.trans (Reach.edge (p := nodeA) (c := nodeB) (by decide +kernel) (by decide +kernel))
       (Reach.edge (p := nodeB) (c := nodeA) (by decide +kernel) (by decide +kernel)))
 
-/-- Certified adequacy on the static chain, at the canonical bound `order C + 1 = 11`. -/
-example : (ofGraph chainCert chainGraph fun _ acc => (pure acc : M Unit Unit)).walkFuel 11 nodeC () =
-    (ofGraph chainCert chainGraph fun _ acc => (pure acc : M Unit Unit)).walkNoFuel nodeC () :=
-  certified_walkFuel_eq_walkNoFuel chainCert chainGraph _ (by decide +kernel) (by decide +kernel)
+/-- Certified adequacy on the static chain at the canonical bound `order C + 1 = 11`. -/
+theorem wit_certified_chain_adequacy :
+    (ofGraph chainCert chainGraph fun _ acc => (pure acc : M Unit Unit)).walkFuel 11 nodeC () =
+      (ofGraph chainCert chainGraph fun _ acc => (pure acc : M Unit Unit)).walkNoFuel nodeC () :=
+  certified_walkFuel_eq_walkNoFuel chainCert chainGraph _ (by decide +kernel)
     nodeC (by decide +kernel) () 11 (by decide +kernel)
 
-/-! ### Dynamic hook-boundary violations -/
+/-! ### 3c. Schema 17 `Decoder.lean` type-table rank validator (positive & negative cases) -/
+
+/-- Recursive linked list `struct ListNode { head: u32, next: &ListNode }` plus a coroutine
+saving `(u32, ListNode)`: pointer indirection (`ty 1`) decouples the cycle in `ListNode` (`ty 2`),
+matching `lean-miri#90` `Decoder.lean` Schema 17 validation. -/
+def schema17GoodTable : List Schema17TypeNode := [
+  { id := 0, validationRank := 0, shape := .primitive },
+  { id := 1, validationRank := 0, shape := .pointerIndirection 2 },
+  { id := 2, validationRank := 1, shape := .adt [[0, 1]] },
+  { id := 3, validationRank := 2, shape := .coroutine [0] #[0, 2] [[0, 1]] }
+]
+
+/-- Illegal by-value self-cycle `struct Bad { selfField: Bad }`. -/
+def schema17SelfCycle : List Schema17TypeNode := [
+  { id := 0, validationRank := 5, shape := .adt [[0]] }
+]
+
+/-- Illegal reference to an undeclared validation child `TyId = 99`. -/
+def schema17MissingChild : List Schema17TypeNode := [
+  { id := 0, validationRank := 1, shape := .tuple [99] }
+]
+
+/-- Illegal out-of-bounds coroutine `savedTypes` index `5`. -/
+def schema17BadSavedType : List Schema17TypeNode := [
+  { id := 0, validationRank := 1, shape := .coroutine [] #[0] [[5]] }
+]
+
+/-- Illegal `normalizedType` alias mismatch (`ty 0` claims rank `0` while normalizing to `ty 1` of rank `2`). -/
+def schema17AliasMismatch : List Schema17TypeNode := [
+  { id := 0, validationRank := 0, normalizedType := 1, shape := .primitive },
+  { id := 1, validationRank := 2, shape := .primitive }
+]
+
+theorem wit_schema17_pointer_recursive_ok :
+    checkSchema17Table schema17GoodTable = .ok () := by
+  decide +kernel
+
+theorem wit_schema17_pointer_recursive_acyclic (p : Schema17TypeNode) :
+    ¬ Schema17Reach schema17GoodTable p p :=
+  checkSchema17Table_acyclic schema17GoodTable wit_schema17_pointer_recursive_ok p
+
+theorem wit_schema17_self_cycle_rejected :
+    checkSchema17Table schema17SelfCycle =
+      .error "validation rank does not decrease from type 0 to 0" := by
+  decide +kernel
+
+theorem wit_schema17_missing_child_rejected :
+    checkSchema17Table schema17MissingChild = .error "missing validation child 99" := by
+  decide +kernel
+
+theorem wit_schema17_bad_saved_type_rejected :
+    checkSchema17Table schema17BadSavedType = .error "missing coroutine saved type" := by
+  decide +kernel
+
+theorem wit_schema17_alias_mismatch_rejected :
+    (checkSchema17Table schema17AliasMismatch).isOk = false := by
+  decide +kernel
+
+/-! ### 3d. `visitOrder` (`(if isSized then 0 else 1, layoutOrder)`) & `dyn Trait` dynamic unpacking -/
+
+/-- Unsized `dyn Trait` layout (`ty = 0`, `backendRepr = .Memory (sized := false)`, `isSized = false`,
+`typeRank = 0`, `layoutOrder = 1`, `visitOrder = (1, 1)`). -/
+def unsizedDynTrait : LocalLayout :=
+  ⟨0, { wrapperLayout with backendRepr := .Memory (sized := false) }⟩
+
+/-- Concrete sized implementor (`ty = 50`, `isSized = true`, `typeRank = 50`, `layoutOrder = 151`,
+`visitOrder = (0, 151)`): higher `layoutOrder` than `unsizedDynTrait`, but strictly smaller `visitOrder`! -/
+def concreteImpl50 : LocalLayout := ⟨50, wrapperLayout⟩
+
+/-- Sized primitive leaf field (`ty = 0`, `isSized = true`, `layoutOrder = 0`, `visitOrder = (0, 0)`). -/
+def concreteLeaf0 : LocalLayout :=
+  ⟨0, { wrapperLayout with fields := .Primitive }⟩
+
+def dynUnpackChildren (p : LocalLayout) : Array LocalLayout :=
+  if !p.layout.isSized then #[concreteImpl50]
+  else if p.ty == 50 then #[concreteLeaf0]
+  else #[]
+
+/-- Lexicographic `visitOrder` walk (`lean-miri#90` `ValidityVisitor.visit`) over `dyn Trait` unpacking. -/
+def dynUnpackLexWalk : VisitLexWalk Unit LocalLayout Nat where
+  typeRank := id
+  layoutOf := id
+  pre := fun _ n => pure (n + 1)
+  children := fun p => pure (dynUnpackChildren p)
+
+/-- Naive `layoutOrder`-only `RankedWalk` over the exact same `dyn Trait` unpacking projection. -/
+def dynUnpackNaiveRankedWalk : RankedWalk Unit LocalLayout Nat where
+  typeRank := id
+  layoutOf := id
+  pre := fun _ n => pure (n + 1)
+  children := fun p => pure (dynUnpackChildren p)
+
+/-- `concreteImpl50` has strictly larger `layoutOrder` (`151 > 1`) yet strictly smaller `visitOrder`
+(`(0, 151) <ₗₑₓ (1, 1)`) than `unsizedDynTrait`. -/
+theorem wit_dynTrait_visitOrder_descends :
+    layoutOrder id unsizedDynTrait < layoutOrder id concreteImpl50 ∧
+      VisitOrderLt (visitOrder id concreteImpl50) (visitOrder id unsizedDynTrait) :=
+  ⟨by decide +kernel, visitOrder_lt_of_unsized_unpack id unsizedDynTrait concreteImpl50 rfl rfl⟩
+
+/-- `VisitLexWalk.walkNoFuel` succeeds across unsized-to-higher-rank-sized `dyn Trait` unpacking,
+visiting all 3 nodes (`0 ↦ 1 ↦ 2 ↦ 3`). -/
+theorem wit_dynTrait_visitLex_noFuel_ok :
+    (match dynUnpackLexWalk.walkNoFuel unsizedDynTrait 0 () with
+     | .ok n () => n == 3
+     | .error _ _ => false) = true := by
+  rw [← dynUnpackLexWalk.walkRank_eq_walkNoFuel]
+  decide +kernel
+
+/-- `VisitLexWalk.walkFuel_eq_walkNoFuel` adequacy across `dyn Trait` unpacking (`maxSizedOrder = 151`,
+`effectiveOrder 151 unsizedDynTrait = 153 < 154`). -/
+theorem wit_dynTrait_visitLex_fuel_eq_noFuel :
+    dynUnpackLexWalk.walkFuel 154 unsizedDynTrait 0 =
+      dynUnpackLexWalk.walkNoFuel unsizedDynTrait 0 := by
+  have hd : dynUnpackLexWalk.DescendsLexOn
+      (fun p => p = unsizedDynTrait ∨ p = concreteImpl50 ∨ p = concreteLeaf0) 151 := by
+    intro p hp s cs s' hch c hc
+    cases hch
+    rcases hp with rfl | rfl | rfl
+    · have hc_eq : c = concreteImpl50 := by
+        have : dynUnpackChildren unsizedDynTrait = #[concreteImpl50] := by decide +kernel
+        rw [this] at hc
+        simpa using hc
+      subst hc_eq
+      exact ⟨Or.inr (Or.inl rfl),
+        visitOrder_lt_of_unsized_unpack id unsizedDynTrait concreteImpl50 rfl rfl,
+        fun _ => by decide +kernel⟩
+    · have hc_eq : c = concreteLeaf0 := by
+        have : dynUnpackChildren concreteImpl50 = #[concreteLeaf0] := by decide +kernel
+        rw [this] at hc
+        simpa using hc
+      subst hc_eq
+      exact ⟨Or.inr (Or.inr rfl),
+        visitOrder_lt_of_same_sized id concreteImpl50 concreteLeaf0 rfl (by decide +kernel),
+        fun _ => by decide +kernel⟩
+    · have : dynUnpackChildren concreteLeaf0 = #[] := by decide +kernel
+      rw [this] at hc
+      nomatch hc
+  exact dynUnpackLexWalk.walkFuel_eq_walkNoFuel _ 151 hd 154 unsizedDynTrait 0
+    (Or.inl rfl) (by decide +kernel)
+
+/-- Conversely, a naive `layoutOrder`-only `RankedWalk` FALSELY REJECTS valid `dyn Trait` unpacking
+to a higher-rank concrete implementor with `.invalidProgram`. -/
+theorem wit_dynTrait_naiveLayoutOrder_falsely_rejects :
+    dynUnpackNaiveRankedWalk.walkNoFuel unsizedDynTrait 0 () =
+      .error (.invalidProgram "validity projection does not descend") () :=
+  dynUnpackNaiveRankedWalk.walkNoFuel_rejects_nondescending unsizedDynTrait 0 1 concreteImpl50 []
+    () () () #[concreteImpl50] rfl rfl rfl (by decide +kernel)
+
+/-- Conversely, an illegal sized-to-unsized projection IS rejected by `VisitLexWalk.walkNoFuel`. -/
+def badSizedToUnsizedLexWalk : VisitLexWalk Unit LocalLayout Unit where
+  typeRank := id
+  layoutOf := id
+  pre := fun _ acc => pure acc
+  children := fun _ => pure #[unsizedDynTrait]
+
+theorem wit_sized_to_unsized_lex_rejects :
+    badSizedToUnsizedLexWalk.walkNoFuel concreteImpl50 () () =
+      .error (.invalidProgram "validity projection does not descend") () :=
+  badSizedToUnsizedLexWalk.walkNoFuel_rejects_nondescending concreteImpl50 () () unsizedDynTrait []
+    () () () #[unsizedDynTrait] rfl rfl rfl
+    (by
+      intro hlt
+      have ⟨hsz, _⟩ := (badSizedToUnsizedLexWalk.vOrder_lt_of_sized (p := concreteImpl50) rfl).mp hlt
+      exact Bool.noConfusion hsz)
+
+/-! ### 3e. 150-level witnesses on unmodified vendored `ValidityVisitor.{unionRanges, visit}` -/
+
+theorem wit_deepUnion150_noFuel :
+    (match realUnionRangesNoFuel deepUnionHooks () id (deepUnionLayout 150) Size.ZERO .empty () with
+     | .ok ranges () => ranges.toArray == #[allocRange Size.ZERO (Size.ofBytes 1)]
+     | .error _ _ => false) = true :=
+  deepUnion150_noFuel
+
+theorem wit_deepUnion150_vendored :
+    (match ValidityVisitor.unionRanges deepUnionHooks () 151
+        (deepUnionLayout 150) Size.ZERO .empty () with
+     | .ok ranges () => ranges.toArray == #[allocRange Size.ZERO (Size.ofBytes 1)]
+     | .error _ _ => false) = true ∧
+    resultExhausted "union layout traversal fuel"
+      (ValidityVisitor.unionRanges deepUnionHooks () 150
+        (deepUnionLayout 150) Size.ZERO .empty ()) = true :=
+  deepUnion150_vendored
+
+theorem deepUnionHooks_descend :
+    UnionHooksDescend deepUnionHooks () id (fun p => p = deepUnionLayout p.ty) := by
+  intro layout hgood _hzst
+  refine ⟨?_, ?_⟩
+  · intro hnotPrim idx s child s' hm
+    simp only [deepUnionHooks, minimalValidityHooks, pure, EStateM.pure,
+      EStateM.Result.ok.injEq] at hm
+    obtain ⟨rfl, -⟩ := hm
+    cases hty : layout.ty with
+    | zero =>
+      rw [hgood, hty] at hnotPrim
+      exact False.elim (hnotPrim rfl)
+    | succ n =>
+      refine ⟨by simp [deepUnionLayout], ?_⟩
+      exact layoutOrder_lt_of_rank_lt id layout (deepUnionLayout n)
+        (by simp [deepUnionLayout, hty])
+  · rintro ⟨tag, enc, field, vs, hvs⟩
+    rw [hgood] at hvs
+    simp [deepUnionLayout, wrapperLayout] at hvs
+
+/-- Direct adequacy between unmodified vendored `ValidityVisitor.unionRanges` and
+`realUnionRangesNoFuel` on the 150-level nested union (`fuel = 452 > 451 = layoutOrder`). -/
+theorem wit_deepUnion150_vendored_eq_noFuel :
+    ValidityVisitor.unionRanges deepUnionHooks () 452 (deepUnionLayout 150) Size.ZERO .empty =
+      realUnionRangesNoFuel deepUnionHooks () id (deepUnionLayout 150) Size.ZERO .empty :=
+  vendored_unionRanges_eq_noFuel deepUnionHooks () id _ deepUnionHooks_descend
+    452 (deepUnionLayout 150) Size.ZERO .empty rfl (by decide +kernel)
+
+/-- `Anneal.MirFuelFree` `wpCoalBounded` bridge directly into unmodified vendored
+`ValidityVisitor.unionRanges` at depth 150 (`fuel = 1000`). -/
+theorem wit_deepUnion150_vendored_mirFuelFree_bridge :
+    ValidityVisitor.unionRanges deepUnionHooks () 1000 (deepUnionLayout 150) Size.ZERO .empty =
+      realUnionRangesNoFuel deepUnionHooks () id (deepUnionLayout 150) Size.ZERO .empty :=
+  vendored_unionRanges_eq_noFuel_of_wpCoalBounded deepUnionHooks () id _ deepUnionHooks_descend
+    1000 (deepUnionLayout 150) Size.ZERO .empty rfl PUnit.unit
+    (rankCountdown_canonical _ 1000 PUnit.unit (by decide +kernel))
+
+theorem wit_deepPattern150_vendored_visit :
+    let root : RuntimePlace CtfeProvenance :=
+      ⟨.memory ⟨⟨Size.ZERO, none⟩, .none, none⟩, ⟨150, wrapperLayout⟩⟩
+    let init : Session CtfeProvenance :=
+      { path := ⟨"Root", #[]⟩, flags := ⟨false, false⟩, ctfeMode := none,
+        refTracking := none, dataBytes := none }
+    resultOk (ValidityVisitor.visit deepPatternHooks () 151 init root ()) = true ∧
+    resultExhausted "validity traversal fuel"
+      (ValidityVisitor.visit deepPatternHooks () 150 init root ()) = true :=
+  deepPattern150_vendored_visit
+
+/-! ### 3f. Dynamic hook-boundary violations, `unionWrapper`, and LIFO pointee draining -/
 
 /-- A projection hook that returns the place itself (a by-value cycle). -/
 def loopWalk : RankedWalk Unit LocalLayout Unit where
@@ -1524,16 +1866,16 @@ def loopWalk : RankedWalk Unit LocalLayout Unit where
   children := fun p => pure #[p]
 
 /-- The fuel-free traversal rejects the non-descending projection deterministically. -/
-example : loopWalk.walkNoFuel nodeA () () =
-    .error (.invalidProgram "validity projection does not descend") () :=
+theorem wit_loopWalk_rejects :
+    loopWalk.walkNoFuel nodeA () () =
+      .error (.invalidProgram "validity projection does not descend") () :=
   loopWalk.walkNoFuel_rejects_nondescending nodeA () () nodeA [] () () () #[nodeA] rfl rfl rfl
     (Nat.lt_irrefl _)
 
 /-- The vendored-style fuel traversal cannot tell the cycle from a deep value: it only exhausts. -/
-example : resultExhausted "validity traversal fuel" (loopWalk.walkFuel 64 nodeA () ()) = true := by
+theorem wit_loopWalk_fuel64_exhausts :
+    resultExhausted "validity traversal fuel" (loopWalk.walkFuel 64 nodeA () ()) = true := by
   decide +kernel
-
-/-! ### Union ranges and pointee draining -/
 
 /-- The union-range instance over the 150-level wrapper chain. -/
 def unionWrapper : UnionWalk Unit where
@@ -1544,13 +1886,14 @@ def unionWrapper : UnionWalk Unit where
   descendMsg := "union layout projection does not descend"
   fuelMsg := "union layout traversal fuel"
 
-example : resultOk (unionRangesNoFuel unionWrapper (wrapperRoot 150) Size.ZERO .empty ()) = true := by
+theorem wit_unionWrapper150_ok :
+    resultOk (unionRangesNoFuel unionWrapper (wrapperRoot 150) Size.ZERO .empty ()) = true := by
   unfold unionRangesNoFuel
   rw [← RankedWalk.walkRank_eq_walkNoFuel]
   decide +kernel
 
 /-- LIFO: the most recently tracked pointee is drained first. -/
-example {P S : Type} (tracking : RefTracking (Key P) ValidationPath)
+theorem wit_drainPointees_lifo {P S : Type} (tracking : RefTracking (Key P) ValidationPath)
     (visitPointee : Key P → ValidationPath → M S Unit) (k₁ k₂ : Key P) (p₁ p₂ : ValidationPath) :
     drainPointees { tracking with todo := (tracking.todo.push (k₁, p₁)).push (k₂, p₂) } visitPointee =
       (do visitPointee k₂ p₂; visitPointee k₁ p₁; drainPointees tracking visitPointee) := by
@@ -1559,3 +1902,33 @@ example {P S : Type} (tracking : RefTracking (Key P) ValidationPath)
   rw [h, drainPointees_push]
 
 end LeanMiriMemoryLemmasTests.RankCert
+
+/-! ## 4. Module-wide standard-axiom audit -/
+
+section TestAxiomAudit
+open Lean Elab Command
+
+/-- Verify that every declaration in `LeanMiriMemoryLemmasTests` depends strictly on standard Lean
+axioms (`propext`, `Quot.sound`, `Classical.choice`) — zero `sorryAx`, zero `Lean.ofReduceBool`,
+and zero `Lean.trustCompiler`. -/
+elab "#assert_test_standard_axioms" : command => do
+  let env ← getEnv
+  let allowed : List Name := [``propext, ``Quot.sound, ``Classical.choice]
+  let mut count : Nat := 0
+  for (c, _) in env.constants.map₂.toList do
+    let root := c.getRoot.toString
+    if root.startsWith "_aux_" && root.endsWith "_command#assert_test_standard_axioms__1" then
+      continue
+    if root.startsWith "_aux_" && root.endsWith "_command#assert_binder_parity__1" then
+      continue
+    count := count + 1
+    let axs ← liftCoreM <| Lean.collectAxioms c
+    for ax in axs do
+      if !allowed.contains ax then
+        logError m!"{c} depends on non-standard axiom {ax}"
+  if count < 80 then
+    logError m!"Expected at least 80 declarations in LeanMiriMemoryLemmasTests, got {count}"
+  logInfo m!"LeanMiriMemoryLemmasTests module-wide audit: {count} declarations depend only on standard axioms"
+
+#assert_test_standard_axioms
+end TestAxiomAudit
