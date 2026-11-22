@@ -52,6 +52,7 @@ Sections:
 8. `bitVecLE` fixed-width codec.
 9. Chunking, arrays and `BitValidity` transmutation.
 10. Derived transfers: abstraction normalization, signed casts, `ctlz` from ranges.
+11. Sign-flag independence, operational `evalScalarBinOp` lifts, signed-integer arrays.
 -/
 
 /-! ## 0. Notation Bridges -/
@@ -4249,5 +4250,272 @@ theorem evalScalarBinOp_shr_unsigned_eq_extractBits {szL szR : Nat} (hszL : 0 < 
 theorem chunksOf_encodeElems_zero_width {α : Type} (c : FixedByteCodec α 0) (xs : List α) :
     Anneal.ListChunks.chunksOf 0 (c.encodeElems xs) = [] :=
   Anneal.ListChunks.chunksOf_zero_size _
+
+/-! ## 11. Sign-Flag Independence, Operational Lifts and Signed-Integer Arrays -/
+
+/-- The `isSigned` flag is irrelevant to the bitwise, left-shift, wrapping-arithmetic and
+(in)equality operators of `evalBinOp`: any two flags give the same result, on arbitrary
+(possibly zero-width or mismatched-width) operands. -/
+theorem evalBinOp_isSigned_irrel {op : BinOp}
+    (hop : op = .bitAnd ∨ op = .bitOr ∨ op = .bitXor ∨ op = .shl ∨ op = .add ∨ op = .sub ∨
+      op = .mul ∨ op = .eq ∨ op = .ne)
+    (x y : ScalarInt) (s₁ s₂ : Bool) :
+    Anneal.Scalars.evalBinOp op x y s₁ = Anneal.Scalars.evalBinOp op x y s₂ := by
+  rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
+
+/-- `evalBinOp_shr_bitAnd_eq_extractField` with an arbitrary sign flag on the masking step (the
+shift itself must be the unsigned, logical one). -/
+theorem evalBinOp_shr_bitAnd_eq_extractField_flag {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
+    {x lo : Nat} (hx : x < scalarModulus sz) (hlo : lo < 8 * sz) (len : Nat) (s : Bool) :
+    (Anneal.Scalars.evalBinOp .shr ⟨x, sz⟩ ⟨lo, szR⟩ false).bind
+        (fun r => Anneal.Scalars.evalBinOp .bitAnd r ⟨2 ^ len - 1, sz⟩ s) =
+      some ⟨extractField sz x lo len, sz⟩ :=
+  evalBinOp_shr_bitAnd_eq_extractField hsz hszR hx hlo len
+
+/-- `evalBinOp_shl_bitOr_eq_pack` with arbitrary sign flags on all three steps. -/
+theorem evalBinOp_shl_bitOr_eq_pack_flag {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
+    {lo₁ lo₂ : Nat} (h₁ : lo₁ < 8 * sz) (h₂ : lo₂ < 8 * sz) (a b : Nat) (s₁ s₂ s₃ : Bool) :
+    (Anneal.Scalars.evalBinOp .shl ⟨a, sz⟩ ⟨lo₁, szR⟩ s₁).bind (fun sa =>
+        (Anneal.Scalars.evalBinOp .shl ⟨b, sz⟩ ⟨lo₂, szR⟩ s₂).bind (fun sb =>
+          Anneal.Scalars.evalBinOp .bitOr sa sb s₃)) =
+      some ⟨bitwiseOrBits (8 * sz) (shiftLeftBits a lo₁ (scalarModulus sz))
+        (shiftLeftBits b lo₂ (scalarModulus sz)), sz⟩ :=
+  evalBinOp_shl_bitOr_eq_pack hsz hszR h₁ h₂ a b
+
+/-- `evalBinOp_pack_injective` with arbitrary sign flags on all three steps of both packs. -/
+theorem evalBinOp_pack_injective_flag {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
+    {lo₁ len₁ lo₂ len₂ a₁ b₁ a₂ b₂ : Nat} (s₁ s₂ s₃ t₁ t₂ t₃ : Bool)
+    (ha₁ : a₁ < 2 ^ len₁) (hb₁ : b₁ < 2 ^ len₂) (ha₂ : a₂ < 2 ^ len₁) (hb₂ : b₂ < 2 ^ len₂)
+    (h₁ : lo₁ + len₁ ≤ 8 * sz) (h₂ : lo₂ + len₂ ≤ 8 * sz)
+    (hd : lo₁ + len₁ ≤ lo₂ ∨ lo₂ + len₂ ≤ lo₁)
+    (h : (Anneal.Scalars.evalBinOp .shl ⟨a₁, sz⟩ ⟨lo₁, szR⟩ s₁).bind (fun sa =>
+          (Anneal.Scalars.evalBinOp .shl ⟨b₁, sz⟩ ⟨lo₂, szR⟩ s₂).bind (fun sb =>
+            Anneal.Scalars.evalBinOp .bitOr sa sb s₃)) =
+        (Anneal.Scalars.evalBinOp .shl ⟨a₂, sz⟩ ⟨lo₁, szR⟩ t₁).bind (fun sa =>
+          (Anneal.Scalars.evalBinOp .shl ⟨b₂, sz⟩ ⟨lo₂, szR⟩ t₂).bind (fun sb =>
+            Anneal.Scalars.evalBinOp .bitOr sa sb t₃))) :
+    a₁ = a₂ ∧ b₁ = b₂ :=
+  evalBinOp_pack_injective hsz hszR ha₁ hb₁ ha₂ hb₂ h₁ h₂ hd h
+
+/-- On same-width operands, every scalar-returning total operator of `evalBinOp` (bitwise,
+wrapping arithmetic, equality and both signednesses of the comparisons) succeeds, and the
+operational `evalScalarBinOp` returns the same scalar without touching locals or memory. -/
+theorem evalScalarBinOp_of_evalBinOp {sz : Nat} (hsz : 0 < sz) {op : BinOp}
+    (hop : op = .bitAnd ∨ op = .bitOr ∨ op = .bitXor ∨ op = .add ∨ op = .sub ∨ op = .mul ∨
+      op = .eq ∨ op = .ne ∨ op = .lt ∨ op = .le ∨ op = .gt ∨ op = .ge)
+    (a b : Nat) (locals : List LocalSlot) (mem : Memory) (s : Bool) :
+    ∃ r, Anneal.Scalars.evalBinOp op ⟨a, sz⟩ ⟨b, sz⟩ s = some r ∧
+      evalScalarBinOp op ⟨a, sz⟩ ⟨b, sz⟩ locals mem s = .ok (.scalar r) locals mem := by
+  rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
+  · exact ⟨_, Anneal.Scalars.evalBinOp_bitAnd_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_bitAnd hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_bitOr_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_bitOr hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_bitXor_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_bitXor hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_add_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_add hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_sub_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_sub hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_mul_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_mul hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_eq_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_eq hsz locals mem s⟩
+  · exact ⟨_, Anneal.Scalars.evalBinOp_ne_apply hsz s,
+      Anneal.Scalars.evalScalarBinOp_ne hsz locals mem s⟩
+  · cases s with
+    | false => exact ⟨_, Anneal.Scalars.evalBinOp_lt_unsigned hsz,
+        Anneal.Scalars.evalScalarBinOp_lt_unsigned hsz locals mem⟩
+    | true => exact ⟨_, Anneal.Scalars.evalBinOp_lt_signed hsz,
+        Anneal.Scalars.evalScalarBinOp_lt_signed hsz locals mem⟩
+  · cases s with
+    | false => exact ⟨_, Anneal.Scalars.evalBinOp_le_unsigned hsz,
+        Anneal.Scalars.evalScalarBinOp_le_unsigned hsz locals mem⟩
+    | true => exact ⟨_, Anneal.Scalars.evalBinOp_le_signed hsz,
+        Anneal.Scalars.evalScalarBinOp_le_signed hsz locals mem⟩
+  · cases s with
+    | false => exact ⟨_, Anneal.Scalars.evalBinOp_gt_unsigned hsz,
+        Anneal.Scalars.evalScalarBinOp_gt_unsigned hsz locals mem⟩
+    | true => exact ⟨_, Anneal.Scalars.evalBinOp_gt_signed hsz,
+        Anneal.Scalars.evalScalarBinOp_gt_signed hsz locals mem⟩
+  · cases s with
+    | false => exact ⟨_, Anneal.Scalars.evalBinOp_ge_unsigned hsz,
+        Anneal.Scalars.evalScalarBinOp_ge_unsigned hsz locals mem⟩
+    | true => exact ⟨_, Anneal.Scalars.evalBinOp_ge_signed hsz,
+        Anneal.Scalars.evalScalarBinOp_ge_signed hsz locals mem⟩
+
+/-- Shift counterpart of `evalScalarBinOp_of_evalBinOp`: the right operand may have a different
+positive byte width. -/
+theorem evalScalarBinOp_shift_of_evalBinOp {szL szR : Nat} (hszL : 0 < szL) (hszR : 0 < szR)
+    {op : BinOp} (hop : op = .shl ∨ op = .shr) (a b : Nat) (locals : List LocalSlot)
+    (mem : Memory) (s : Bool) :
+    ∃ r, Anneal.Scalars.evalBinOp op ⟨a, szL⟩ ⟨b, szR⟩ s = some r ∧
+      evalScalarBinOp op ⟨a, szL⟩ ⟨b, szR⟩ locals mem s = .ok (.scalar r) locals mem := by
+  rcases hop with rfl | rfl
+  · exact ⟨_, Anneal.Scalars.evalBinOp_shl_apply hszL hszR s,
+      Anneal.Scalars.evalScalarBinOp_shl hszL hszR locals mem s⟩
+  · cases s with
+    | false => exact ⟨_, Anneal.Scalars.evalBinOp_shr_unsigned hszL hszR,
+        Anneal.Scalars.evalScalarBinOp_shr_unsigned hszL hszR locals mem⟩
+    | true => exact ⟨_, Anneal.Scalars.evalBinOp_shr_signed hszL hszR,
+        Anneal.Scalars.evalScalarBinOp_shr_signed hszL hszR locals mem⟩
+
+/-- Unsigned division and remainder: whenever `evalBinOp` returns a scalar (the divisor is
+non-zero), the operational `evalScalarBinOp` returns the same scalar. -/
+theorem evalScalarBinOp_divRem_unsigned_of_evalBinOp {sz : Nat} (hsz : 0 < sz) {op : BinOp}
+    (hop : op = .div ∨ op = .rem) {a b : Nat} {r : ScalarInt}
+    (h : Anneal.Scalars.evalBinOp op ⟨a, sz⟩ ⟨b, sz⟩ false = some r)
+    (locals : List LocalSlot) (mem : Memory) :
+    evalScalarBinOp op ⟨a, sz⟩ ⟨b, sz⟩ locals mem false = .ok (.scalar r) locals mem := by
+  rcases hop with rfl | rfl
+  · cases Nat.eq_zero_or_pos b with
+    | inl hb =>
+      subst hb
+      rw [Anneal.Scalars.evalBinOp_div_zero hsz] at h
+      cases h
+    | inr hb =>
+      rw [Anneal.Scalars.evalBinOp_div_unsigned hsz (Nat.ne_of_gt hb)] at h
+      rw [Anneal.Scalars.evalScalarBinOp_div_unsigned hsz (Nat.ne_of_gt hb),
+        ← Option.some.inj h]
+  · cases Nat.eq_zero_or_pos b with
+    | inl hb =>
+      subst hb
+      rw [Anneal.Scalars.evalBinOp_rem_zero hsz] at h
+      cases h
+    | inr hb =>
+      rw [Anneal.Scalars.evalBinOp_rem_unsigned hsz (Nat.ne_of_gt hb)] at h
+      rw [Anneal.Scalars.evalScalarBinOp_rem_unsigned hsz (Nat.ne_of_gt hb),
+        ← Option.some.inj h]
+
+/-- Generic operational lift: any property established for the `evalBinOp` result of a
+same-width total operator on `sz`-byte scalars (for example a `ScalarTnum`, `ScalarRange` or
+`ScalarSRange` transfer) holds for the scalar returned by the operational `evalScalarBinOp`. -/
+theorem evalScalarBinOp_transfer {sz : Nat} (hsz : 0 < sz) {op : BinOp}
+    (hop : op = .bitAnd ∨ op = .bitOr ∨ op = .bitXor ∨ op = .add ∨ op = .sub ∨ op = .mul ∨
+      op = .eq ∨ op = .ne ∨ op = .lt ∨ op = .le ∨ op = .gt ∨ op = .ge)
+    {x y : ScalarInt} (hx : x.sizeBytes = sz) (hy : y.sizeBytes = sz) (s : Bool)
+    {P : ScalarInt → Prop} (h : ∃ r, Anneal.Scalars.evalBinOp op x y s = some r ∧ P r)
+    (locals : List LocalSlot) (mem : Memory) :
+    ∃ r, evalScalarBinOp op x y locals mem s = .ok (.scalar r) locals mem ∧ P r := by
+  cases x with
+  | mk a sx =>
+    cases y with
+    | mk b sy =>
+      have hx' : sx = sz := hx
+      have hy' : sy = sz := hy
+      subst hx'; subst hy'
+      obtain ⟨r, hr, hP⟩ := h
+      obtain ⟨r', hr', hop'⟩ := evalScalarBinOp_of_evalBinOp hsz hop a b locals mem s
+      have hrr : r' = r := Option.some.inj (hr'.symm.trans hr)
+      subst hrr
+      exact ⟨r', hop', hP⟩
+
+/-- Generic operational lift for shifts (the right operand may have any positive width). -/
+theorem evalScalarBinOp_shift_transfer {szL : Nat} (hszL : 0 < szL) {op : BinOp}
+    (hop : op = .shl ∨ op = .shr) {x y : ScalarInt} (hx : x.sizeBytes = szL)
+    (hy : 0 < y.sizeBytes) (s : Bool) {P : ScalarInt → Prop}
+    (h : ∃ r, Anneal.Scalars.evalBinOp op x y s = some r ∧ P r)
+    (locals : List LocalSlot) (mem : Memory) :
+    ∃ r, evalScalarBinOp op x y locals mem s = .ok (.scalar r) locals mem ∧ P r := by
+  cases x with
+  | mk a sx =>
+    cases y with
+    | mk b sy =>
+      have hx' : sx = szL := hx
+      subst hx'
+      obtain ⟨r, hr, hP⟩ := h
+      obtain ⟨r', hr', hop'⟩ := evalScalarBinOp_shift_of_evalBinOp hszL hy hop a b locals mem s
+      have hrr : r' = r := Option.some.inj (hr'.symm.trans hr)
+      subst hrr
+      exact ⟨r', hop', hP⟩
+
+/-- Operational counterpart of `evalBinOp_shr_bitAnd_eq_extractField`: on a canonical operand
+with an in-range shift amount, the `Trusted` evaluator's logical shift returns
+`shiftRightUnsignedBits`, and masking that result returns `extractField` (any sign flag on the
+mask step). -/
+theorem evalScalarBinOp_shr_bitAnd_eq_extractField {sz szR : Nat} (hsz : 0 < sz)
+    (hszR : 0 < szR) {x lo : Nat} (hx : x < scalarModulus sz) (hlo : lo < 8 * sz) (len : Nat)
+    (locals : List LocalSlot) (mem : Memory) (s : Bool) :
+    evalScalarBinOp .shr ⟨x, sz⟩ ⟨lo, szR⟩ locals mem false =
+        .ok (.scalar ⟨shiftRightUnsignedBits x lo, sz⟩) locals mem ∧
+      evalScalarBinOp .bitAnd ⟨shiftRightUnsignedBits x lo, sz⟩ ⟨2 ^ len - 1, sz⟩ locals mem s =
+        .ok (.scalar ⟨extractField sz x lo len, sz⟩) locals mem := by
+  have hx' : x < 2 ^ (8 * sz) := by rw [← scalarModulus_eq]; exact hx
+  have hle : x >>> lo ≤ x := Nat.shiftRight_le x lo
+  constructor
+  · rw [Anneal.Scalars.evalScalarBinOp_shr_unsigned hsz hszR, Nat.mod_eq_of_lt hlo,
+      Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt hle hx'),
+      Anneal.Scalars.shiftRightUnsignedBits_eq_shiftRight]
+  · rw [Anneal.Scalars.evalScalarBinOp_bitAnd hsz]
+    unfold extractField
+    rw [Anneal.Scalars.bitwiseAndBits_eq_land]
+
+/-- Operational counterpart of `evalBinOp_shl_bitOr_eq_pack`: the `Trusted` evaluator's two
+left shifts return `shiftLeftBits`, and OR-ing those results returns the scalar pack (any sign
+flags, in-range shift amounts). -/
+theorem evalScalarBinOp_shl_bitOr_eq_pack {sz szR : Nat} (hsz : 0 < sz) (hszR : 0 < szR)
+    {lo₁ lo₂ : Nat} (h₁ : lo₁ < 8 * sz) (h₂ : lo₂ < 8 * sz) (a b : Nat)
+    (locals : List LocalSlot) (mem : Memory) (s₁ s₂ s₃ : Bool) :
+    evalScalarBinOp .shl ⟨a, sz⟩ ⟨lo₁, szR⟩ locals mem s₁ =
+        .ok (.scalar ⟨shiftLeftBits a lo₁ (scalarModulus sz), sz⟩) locals mem ∧
+      evalScalarBinOp .shl ⟨b, sz⟩ ⟨lo₂, szR⟩ locals mem s₂ =
+        .ok (.scalar ⟨shiftLeftBits b lo₂ (scalarModulus sz), sz⟩) locals mem ∧
+      evalScalarBinOp .bitOr ⟨shiftLeftBits a lo₁ (scalarModulus sz), sz⟩
+          ⟨shiftLeftBits b lo₂ (scalarModulus sz), sz⟩ locals mem s₃ =
+        .ok (.scalar ⟨bitwiseOrBits (8 * sz) (shiftLeftBits a lo₁ (scalarModulus sz))
+          (shiftLeftBits b lo₂ (scalarModulus sz)), sz⟩) locals mem := by
+  refine ⟨?_, ?_, ?_⟩
+  · rw [Anneal.Scalars.evalScalarBinOp_shl hsz hszR, Nat.mod_eq_of_lt h₁,
+      Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod]
+  · rw [Anneal.Scalars.evalScalarBinOp_shl hsz hszR, Nat.mod_eq_of_lt h₂,
+      Anneal.Scalars.shiftLeftBits_eq_shiftLeft_mod]
+  · rw [Anneal.Scalars.evalScalarBinOp_bitOr hsz, Anneal.Scalars.bitwiseOrBits_eq_lor]
+
+/-- Byte size of `[iN; n]` (including `n = 0`). -/
+theorem rigidTyByteSize_array_int (layouts : LayoutTable) (w : IntTy) (n : Nat)
+    (idx : LayoutIdx) :
+    rigidTyByteSize layouts { kind := .array (.int w) n, layoutIdx := idx } =
+      some (MirValueCodec.intByteSize w * n) := by
+  cases w <;> rfl
+
+/-- Signed-array transmutation: any value of `[iA; n₁]` transmutes soundly to `[iB; n₂]`
+whenever the byte sizes agree (`array_int_isIntoBytes`, `array_int_isFromBytes`). -/
+theorem array_int_transmute_sound (layouts : LayoutTable) (w₁ w₂ : IntTy) (n₁ n₂ : Nat)
+    (idx₁ idx₂ : LayoutIdx)
+    (hsize : MirValueCodec.intByteSize w₁ * n₁ = MirValueCodec.intByteSize w₂ * n₂)
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts
+      { kind := .array (.int w₁) n₁, layoutIdx := idx₁ } v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel layouts
+      { kind := .array (.int w₂) n₂, layoutIdx := idx₂ } bs = some v' :=
+  transmute_sound_of_into_from_bytes layouts _ _
+    (array_int_isIntoBytes layouts w₁ n₁ idx₁) (array_int_isFromBytes layouts w₂ n₂ idx₂)
+    (by rw [rigidTyByteSize_array_int, rigidTyByteSize_array_int, hsize]) v bs hEnc
+
+/-- Unsigned-to-signed array transmutation (`[uA; n₁] → [iB; n₂]`) at equal byte sizes. -/
+theorem array_uint_to_int_transmute_sound (layouts : LayoutTable) (w₁ : UintTy) (w₂ : IntTy)
+    (n₁ n₂ : Nat) (idx₁ idx₂ : LayoutIdx)
+    (hsize : MirValueCodec.uintByteSize w₁ * n₁ = MirValueCodec.intByteSize w₂ * n₂)
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts
+      { kind := .array (.uint w₁) n₁, layoutIdx := idx₁ } v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel layouts
+      { kind := .array (.int w₂) n₂, layoutIdx := idx₂ } bs = some v' :=
+  transmute_sound_of_into_from_bytes layouts _ _
+    (array_uint_isIntoBytes layouts w₁ n₁ idx₁) (array_int_isFromBytes layouts w₂ n₂ idx₂)
+    (by rw [rigidTyByteSize_array_uint, rigidTyByteSize_array_int, hsize]) v bs hEnc
+
+/-- Signed-to-unsigned array transmutation (`[iA; n₁] → [uB; n₂]`) at equal byte sizes. -/
+theorem array_int_to_uint_transmute_sound (layouts : LayoutTable) (w₁ : IntTy) (w₂ : UintTy)
+    (n₁ n₂ : Nat) (idx₁ idx₂ : LayoutIdx)
+    (hsize : MirValueCodec.intByteSize w₁ * n₁ = MirValueCodec.uintByteSize w₂ * n₂)
+    (v : Value) (bs : List AbstractByte)
+    (hEnc : encodeValueToBytes defaultCodecFuel layouts
+      { kind := .array (.int w₁) n₁, layoutIdx := idx₁ } v = some bs) :
+    ∃ v', decodeValueFromBytes defaultCodecFuel layouts
+      { kind := .array (.uint w₂) n₂, layoutIdx := idx₂ } bs = some v' :=
+  transmute_sound_of_into_from_bytes layouts _ _
+    (array_int_isIntoBytes layouts w₁ n₁ idx₁) (array_uint_isFromBytes layouts w₂ n₂ idx₂)
+    (by rw [rigidTyByteSize_array_int, rigidTyByteSize_array_uint, hsize]) v bs hEnc
 
 end Anneal.BitVecScalarsBridge
