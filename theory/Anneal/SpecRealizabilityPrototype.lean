@@ -1131,6 +1131,104 @@ theorem not_dichotomy_of_sum_empty_left {α β : Type v} (h_empty : α → False
     | _, .inl y => (h_empty y).elim
     | .inr b₁, .inr b₂ => h inp b₁ b₂ hp
 
+/-! ### Componentwise dichotomy of a pair output -/
+
+/--
+A dichotomy on a pair output is always a dichotomy *in one component with the
+other held fixed*: either two first components are separated over a common
+second component, or two second components over a common first component.
+(Move from the accepted pair to the rejected one a component at a time; the
+verdict flips at one of the two steps.)
+
+This is what licenses judging several outputs one at a time, as the checker
+does for the `(retVal, mem')` of a `StatefulClaim` and the `(retVal, memAfter)`
+of a normal return: "no designated output is bound" is exactly "no dichotomy".
+-/
+theorem postconditionDichotomy_prod_iff {Out₁ : Type v} {Out₂ : Type w}
+    {post : Input → Out₁ × Out₂ → Prop} :
+    PostconditionDichotomy pre post ↔
+      DichotomyModuloObservation
+          (fun (_ : Input) (out : Out₁ × Out₂) => out.2) pre post ∨
+        DichotomyModuloObservation
+          (fun (_ : Input) (out : Out₁ × Out₂) => out.1) pre post := by
+  constructor
+  · rintro ⟨inp, ⟨a, b⟩, ⟨a', b'⟩, hp, hok, hbad⟩
+    by_cases h : post inp (a', b)
+    · exact .inr ⟨inp, (a', b), (a', b'), hp, rfl, h, hbad⟩
+    · exact .inl ⟨inp, (a, b), (a', b), hp, rfl, hok, h⟩
+  · rintro (h | h) <;> exact h.toPostconditionDichotomy
+
+/--
+The contrapositive, without classical reasoning: a postcondition insensitive
+to each component separately has no dichotomy.
+-/
+theorem not_dichotomy_prod_of_components {Out₁ : Type v} {Out₂ : Type w}
+    {post : Input → Out₁ × Out₂ → Prop}
+    (h₁ : ∀ inp a a' b, pre inp → post inp (a, b) → post inp (a', b))
+    (h₂ : ∀ inp a b b', pre inp → post inp (a, b) → post inp (a, b')) :
+    ¬ PostconditionDichotomy pre post :=
+  fun ⟨inp, (a, b), (a', b'), hp, hok, hbad⟩ =>
+    hbad (h₂ inp a' b b' hp (h₁ inp a a' b hp hok))
+
+/--
+The two disjuncts are independent. Over `Bool × Bool`, the postcondition
+`out.2 = true` has a dichotomy, yet none in the first component: it is found in
+the second. "Some output is bound" therefore does not answer the strict
+question "is the returned value bound?".
+-/
+theorem exists_dichotomy_not_in_first_component :
+    ∃ post : Unit → Bool × Bool → Prop,
+      PostconditionDichotomy (fun _ => True) post ∧
+        ¬ DichotomyModuloObservation
+          (fun (_ : Unit) (out : Bool × Bool) => out.2) (fun _ => True) post :=
+  ⟨fun _ out => out.2 = true,
+    ⟨(), (true, true), (true, false), trivial, rfl, Bool.false_ne_true⟩,
+    fun ⟨_, ok, bad, _, heq, hok, hbad⟩ =>
+      have heq : ok.2 = bad.2 := heq
+      have hok : ok.2 = true := hok
+      hbad (heq.symm.trans hok)⟩
+
+/-! ### Guarded postconditions -/
+
+/--
+A guard over the input alone moves into the precondition: `g inp → post inp out`
+has a dichotomy under `pre` exactly when `post` has one under `pre ∧ g`. This
+is the reading the checker gives an implication whose premise does not mention
+an output.
+-/
+theorem postconditionDichotomy_input_guard_iff (g : Input → Prop) :
+    PostconditionDichotomy pre (fun inp out => g inp → post inp out) ↔
+      PostconditionDichotomy (fun inp => pre inp ∧ g inp) post :=
+  ⟨fun ⟨inp, ok, bad, hp, hok, hbad⟩ =>
+      have hg : g inp := Classical.byContradiction fun hn =>
+        hbad fun hg => absurd hg hn
+      ⟨inp, ok, bad, ⟨hp, hg⟩, hok hg, fun h => hbad fun _ => h⟩,
+    fun ⟨inp, ok, bad, ⟨hp, hg⟩, hok, hbad⟩ =>
+      ⟨inp, ok, bad, hp, fun _ => hok, fun h => hbad (h hg)⟩⟩
+
+/--
+A guard the precondition refutes, whatever it says about the output, leaves a
+postcondition that accepts everything: `requires(x < 10)` with
+`ensures(x >= 10 && ret > 0 ==> ret == 5)`.
+-/
+theorem not_dichotomy_of_guard_refuted_by_pre {guard : Input → Output → Prop}
+    (h : ∀ inp out, pre inp → ¬ guard inp out) :
+    ¬ PostconditionDichotomy pre (fun inp out => guard inp out → post inp out) :=
+  not_dichotomy_of_universal_post fun inp out hp hg => absurd hg (h inp out hp)
+
+/--
+A guard that *does* mention the output is not a precondition: `ret = 5 → x < 3`
+separates `ret = 5` from every other return on each input with `3 ≤ x`,
+although its conclusion never mentions `ret`. A checker that moved such a guard
+into the hypotheses and looked at the conclusion alone would be unsound.
+-/
+theorem exists_output_guard_binding_output :
+    ∃ (guard : Nat → Nat → Prop) (concl : Nat → Prop),
+      PostconditionDichotomy (fun _ => True)
+        (fun x r => guard x r → concl x) :=
+  ⟨fun _ r => r = 5, fun x => x < 3, 7, 0, 5, trivial,
+    fun h => absurd h (by decide), fun h => absurd (h rfl) (by decide)⟩
+
 /-! ### Mutation-testing bridge -/
 
 /--
@@ -1542,6 +1640,38 @@ theorem mirCallContractReturnValueDichotomy_iff_moduloMemory :
     exact ⟨req, ok, bad, m₁, hp, hok, hbad⟩
 
 /--
+Some admissible request has an accepted and a rejected post-call *memory* for
+the same returned value: the memory component of a normal return is bound.
+-/
+def MirCallContractMemoryDichotomy (c : MirCallContract) : Prop :=
+  ∃ req v m_ok m_bad,
+    c.pre req ∧ c.post req (.returned v m_ok) ∧ ¬ c.post req (.returned v m_bad)
+
+theorem MirCallContractMemoryDichotomy.toNormalDichotomy
+    (h : MirCallContractMemoryDichotomy c) : MirCallContractNormalDichotomy c :=
+  let ⟨req, v, m, m', hp, hok, hbad⟩ := h
+  ⟨req, v, m, v, m', hp, hok, hbad⟩
+
+/--
+A normal dichotomy is a dichotomy of the returned value in a fixed memory, or
+of the memory for a fixed returned value. These are the two per-component
+verdicts the checker reports for a `.returned retVal memAfter` answer;
+`strictReturnValue` asks for the first.
+-/
+theorem mirCallContractNormalDichotomy_iff_returnValue_or_memory :
+    MirCallContractNormalDichotomy c ↔
+      MirCallContractReturnValueDichotomy c ∨
+        MirCallContractMemoryDichotomy c := by
+  constructor
+  · rintro ⟨req, v, m, v', m', hp, hok, hbad⟩
+    by_cases h : c.post req (.returned v' m)
+    · exact .inr ⟨req, v', m, m', hp, h, hbad⟩
+    · exact .inl ⟨req, v, v', m, hp, hok, h⟩
+  · rintro (h | h)
+    · exact h.toNormalDichotomy
+    · exact h.toNormalDichotomy
+
+/--
 A frame-only call contract: normal returns must preserve the call frame, but
 every returned `Value` is blindly accepted.
 -/
@@ -1737,6 +1867,20 @@ theorem not_externalSpecEnsuresDichotomy_of_return_blind
       extraPost :=
   fun ⟨req, ok, bad, hp, _, hok, _, hbad⟩ =>
     hbad ((h req.args ok bad hp.2.2.2).mp hok)
+
+/--
+An `ensures` clause that the return type already implies binds nothing beyond
+boilerplate: it accepts every well-typed return. This covers a clause that
+restates the type in its own words (`ensures(ret <= u32::MAX)` on a `u32`
+function); the checker recognises only the literal boilerplate predicate.
+-/
+theorem not_externalSpecEnsuresDichotomy_of_implied_by_retTy
+    (h : ∀ args v, extraPre args → retMatchesCalleeReturnTy sidecarBody v →
+      extraPost args v) :
+    ¬ ExternalSpecEnsuresDichotomy targetDefPath sidecarBody extraPre
+      extraPost :=
+  fun ⟨req, _, bad, hp, _, _, htyBad, hbad⟩ =>
+    hbad (h req.args bad hp.2.2.2 htyBad)
 
 /-- The default `ensures` clause (`fun _ _ => True`) binds nothing. -/
 theorem not_externalSpecEnsuresDichotomy_default :
@@ -2112,6 +2256,37 @@ theorem not_statefulClaimReturnDichotomy_of_return_blind
     hbad ((h args mem r r' m' hp).mp hok)
 
 /--
+Some admissible state has an accepted and a rejected *post-memory* for the same
+returned value.
+-/
+def StatefulClaimMemoryDichotomy (c : StatefulClaim) : Prop :=
+  ∃ args mem ret mem_ok mem_bad,
+    c.pre args mem ∧ c.post args mem ret mem_ok ∧
+      ¬ c.post args mem ret mem_bad
+
+theorem StatefulClaimMemoryDichotomy.toDichotomy
+    (h : StatefulClaimMemoryDichotomy c) : StatefulClaimDichotomy c :=
+  let ⟨args, mem, r, m, m', hp, hok, hbad⟩ := h
+  ⟨args, mem, r, m, r, m', hp, hok, hbad⟩
+
+/--
+A `StatefulClaim` dichotomy is a dichotomy of the returned value or of the
+post-memory: the two outputs the checker judges separately (binders `2` and
+`3`), the first being the one `strictReturnValue` requires.
+-/
+theorem statefulClaimDichotomy_iff_return_or_memory :
+    StatefulClaimDichotomy c ↔
+      StatefulClaimReturnDichotomy c ∨ StatefulClaimMemoryDichotomy c := by
+  constructor
+  · rintro ⟨args, mem, r, m, r', m', hp, hok, hbad⟩
+    by_cases h : c.post args mem r' m
+    · exact .inr ⟨args, mem, r', m, m', hp, h, hbad⟩
+    · exact .inl ⟨args, mem, r, r', m, hp, hok, h⟩
+  · rintro (h | h)
+    · exact h.toDichotomy
+    · exact h.toDichotomy
+
+/--
 A realizable stateful claim that pins the returned value has a return
 dichotomy: `Value` has two distinct inhabitants, and the one that is not the
 pinned return is rejected in the same post-memory.
@@ -2278,6 +2453,16 @@ way the search does not see (for example behind an `opaque` or `irreducible`
 definition, a fact needing induction or nonlinear arithmetic, or an
 existential whose witness is not among the candidates).
 
+**Cost.** The checker is advisory and must never take the calling command down
+with a deterministic timeout. Every tactic probe runs under `probeHeartbeats`
+(`simp +arith`, which may spend a whole budget failing, under a smaller one;
+single arithmetic witnesses are tried with `rfl`/`omega` alone), and a whole
+analysis runs under `maxAnalysisHeartbeats` and at most seven eighths of what
+the caller has left: once that is spent, every further probe fails closed, so
+the report can only lose *vacuous* verdicts, and it carries a note saying so.
+Closed `Nat` terms behind a definition (`scalarModulus 4`) are evaluated to
+numerals before the arithmetic probes.
+
 **Relative to the precondition.** `PostconditionDichotomy pre post` ranges over
 admissible inputs, and an `ensures` clause that binds its output in general
 may bind nothing on them (`requires(x < 10) ensures(x >= 10 ==> ret == 5)`,
@@ -2434,6 +2619,14 @@ structure EnsuresCheckConfig where
   probeHeartbeats : Nat := 4000
   /-- Largest residual (in `Expr` nodes) handed to the proof search. -/
   probeMaxSize : Nat := 400
+  /--
+  Heartbeat budget (in thousands) of one whole analysis, `0` for none; it is
+  further capped by seven eighths of what the calling command has left. The
+  checker is advisory: when the budget runs out it stops probing and reports
+  what it has established, erring towards *binds*, instead of exhausting the
+  heartbeats of the command that called it.
+  -/
+  maxAnalysisHeartbeats : Nat := 100000
 
 /-- Result of `checkEnsuresBindsOutput`. -/
 structure EnsuresCheckReport where
@@ -2679,12 +2872,39 @@ def mkIffS (a b : Expr) : CheckM Expr := do
   return mkApp2 (mkConst ``Iff) a b
 
 /--
+Heartbeats left in the enclosing budget (that of the analysis, see
+`withAnalysisBudget`, or else of the calling command); `none` when it is
+unlimited.
+-/
+def heartbeatsRemaining : CoreM (Option Nat) := do
+  let ctx ← read
+  if ctx.maxHeartbeats == 0 then
+    return none
+  return some (ctx.maxHeartbeats - ((← IO.getNumHeartbeats) - ctx.initHeartbeats))
+
+/--
+Whether the enclosing heartbeat budget is spent. Each tactic probe runs under a
+budget of its own, so without this test the probes would keep running, at full
+cost, after the analysis is out of budget.
+-/
+def heartbeatsExhausted : CoreM Bool := do
+  return (← heartbeatsRemaining) == some 0
+
+/--
 Run a single heartbeat-bounded tactic against `goal`, isolating and restoring
 both the elaboration state and the message log, and verifying that the produced
-proof term contains neither `sorry` nor unassigned metavariables.
+proof term contains neither `sorry` nor unassigned metavariables. The tactic
+gets `heartbeats` thousand heartbeats, or what is left of the enclosing budget
+if that is less; with nothing left the probe fails closed.
 -/
 def runTacticClosed (goal : Expr) (heartbeats : Nat) (tac : TSyntax `tactic) :
     MetaM Bool := do
+  -- A probe never outspends what is left of the enclosing budget.
+  let budget ←
+    match ← heartbeatsRemaining with
+    | none => pure (heartbeats * 1000)
+    | some 0 => return false
+    | some left => pure (min (heartbeats * 1000) left)
   let saved ← saveState
   let savedMsgs ← Core.getMessageLog
   Core.resetMessageLog
@@ -2693,7 +2913,7 @@ def runTacticClosed (goal : Expr) (heartbeats : Nat) (tac : TSyntax `tactic) :
       let mvar ← mkFreshExprMVar goal
       let (goals, _) ← withCurrHeartbeats <|
         withTheReader Core.Context
-          (fun c => { c with maxHeartbeats := heartbeats * 1000 }) <|
+          (fun c => { c with maxHeartbeats := budget }) <|
           Lean.Elab.runTactic mvar.mvarId! tac
       let hasErrs := (← Core.getMessageLog).hasErrors
       if !goals.isEmpty || hasErrs then
@@ -2705,22 +2925,69 @@ def runTacticClosed (goal : Expr) (heartbeats : Nat) (tac : TSyntax `tactic) :
   saved.restore
   return r
 
-/-- Fast heartbeat-bounded tactic portfolio (excludes `grind`). -/
+/-- Heartbeat budget (in thousands) of one `simp +arith` attempt. -/
+def simpProbeHeartbeats : Nat := 300
+
+/--
+Replace closed `Nat` subterms headed by a definition by their numeral
+(`scalarModulus 4` by `4294967296`), so that `omega` sees a literal where it
+would otherwise see an opaque atom (`r % scalarModulus 4 < scalarModulus 4`).
+The replacement is a definitional unfolding, evaluated by `whnf` under a small
+heartbeat budget; the goal it yields is definitionally equal to the original.
+-/
+def evalClosedNats (e : Expr) : MetaM Expr := do
+  let candidate (sub : Expr) : Bool :=
+    sub.isApp && !sub.hasFVar && !sub.hasLooseBVars && !sub.hasMVar &&
+      match sub.getAppFn with
+      | .const n _ => n != ``OfNat.ofNat && n != ``Nat.succ && n != ``Nat.zero
+      | _ => false
+  if (e.find? candidate).isNone then
+    return e
+  safely (Meta.transform e (pre := fun sub => do
+    unless candidate sub do
+      return .continue
+    unless (← whnfR (← inferType sub)).isConstOf ``Nat do
+      return .continue
+    let v ← withCurrHeartbeats <|
+      withTheReader Core.Context (fun c => { c with maxHeartbeats := 200000 }) <|
+        whnf sub
+    match v.rawNatLit? <|> v.nat? with
+    | some n => return .done (mkNatLit n)
+    | none => return .continue)) e
+
+/--
+Fast heartbeat-bounded tactic portfolio (excludes `grind`): `rfl`, `omega`,
+`simp +arith`, `decide`, `infer_instance`, `subst_vars`, in that order.
+
+`simp +arith` closes a goal quickly or not at all, but on goals it cannot close
+(linear integer arithmetic with a free witness, for one) it may run until its
+budget is spent. A failed attempt at the full probe budget costs as much as
+every other tactic together, and the witness search makes many attempts, so
+`simp +arith` runs under `simpProbeHeartbeats`.
+-/
 def tryProveFast (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
-  let tac ← `(tactic|
-    first
-      | rfl
-      | (intros; omega)
-      | (simp +arith; done)
-      | decide
-      | infer_instance
-      | (intros; subst_vars; rfl))
-  runTacticClosed goal heartbeats tac
+  let goal ← evalClosedNats goal
+  if ← runTacticClosed goal heartbeats (← `(tactic| first | rfl | (intros; omega))) then
+    return true
+  if ← runTacticClosed goal (min heartbeats simpProbeHeartbeats)
+      (← `(tactic| (simp +arith; done))) then
+    return true
+  runTacticClosed goal heartbeats
+    (← `(tactic| first | decide | infer_instance | (intros; subst_vars; rfl)))
 
 /-- Deep fallback (`grind`: congruence closure, case splits, ring arithmetic). -/
 def tryProveGrind (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
   let tac ← `(tactic| grind)
-  runTacticClosed goal heartbeats tac
+  runTacticClosed (← evalClosedNats goal) heartbeats tac
+
+/--
+The cheap arithmetic core (`rfl`, `omega`) used for one candidate witness over
+`Nat` or `Int`. The witness search tries many candidates, almost all of which
+fail; the full portfolio is kept for the Herbrand disjunction of all of them.
+-/
+def tryProveArith (goal : Expr) (heartbeats : Nat) : MetaM Bool := do
+  runTacticClosed (← evalClosedNats goal) heartbeats
+    (← `(tactic| first | rfl | (intros; omega)))
 
 /--
 Try to close a single `goal` with a short, heartbeat-bounded tactic portfolio,
@@ -2976,9 +3243,10 @@ partial def herbrandArith (e : Expr) (fuel : Nat := 2) : MetaM Expr := do
   (`r = 0 ∨ ∃ y, r = y + 1`, `(∃ k : Int, r = 2 * k) ∨ ∃ k : Int, r = 2 * k + 1`):
   `herbrandArith`.
 
-Every instance is proved by `tryProveCore` and kernel-checked, and each of the
-goals attempted implies the original one, so this cannot introduce false
-positives.
+Every instance is proved by `tryProveCore` (a single arithmetic candidate by
+the cheaper `tryProveArith`; the full portfolio then runs once on the Herbrand
+disjunction of all candidates) and kernel-checked, and each of the goals
+attempted implies the original one, so this cannot introduce false positives.
 -/
 partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
     (exFuel : Nat := 1) : MetaM Bool := do
@@ -3010,6 +3278,7 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
       else
         matchingFVars p αn
     let cap := if exFuel > 0 then 14 else 5
+    let arith := αn.isConstOf ``Nat || αn.isConstOf ``Int
     let mut tried := 0
     for w in cands do
       if tried ≥ cap then
@@ -3019,6 +3288,8 @@ partial def tryProve (goal : Expr) (heartbeats : Nat) (deep : Bool := false)
       let ok ←
         if inst.isAppOf ``Exists && exFuel > 0 then
           tryProve inst heartbeats false (exFuel - 1)
+        else if arith then
+          tryProveArith inst heartbeats
         else
           tryProveCore inst heartbeats false
       if ok then
@@ -5271,6 +5542,51 @@ def isStatefulShape (binders : Array Expr) : MetaM Bool := do
   return tys[0]! == mkApp (mkConst ``List [Level.zero]) valTy &&
     tys[1]! == memTy && tys[2]! == valTy && tys[3]! == memTy
 
+/-- The note attached to a report whose analysis ran out of heartbeats. -/
+def analysisBudgetNote : String :=
+  "analysis heartbeat budget exhausted (`maxAnalysisHeartbeats`): probing \
+    stopped early and the verdict errs towards `binds output`"
+
+/--
+Run the analysis `x` under its own heartbeat budget: `cfg.maxAnalysisHeartbeats`
+(in thousands; `0` runs it unbounded), capped by seven eighths of the heartbeats
+the calling command has left.
+
+The checker is advisory and must not take the calling command down with a
+deterministic timeout. Once the budget is spent every further probe fails
+closed (`safely`, `runTacticClosed`), so the report computed from then on can
+only lose *vacuous* verdicts, never gain one; it is returned with
+`analysisBudgetNote`. A timeout that escapes the probes yields `fallback`, the
+conservative report in which every designated output is bound.
+-/
+def withAnalysisBudget (cfg : EnsuresCheckConfig)
+    (fallback : EnsuresCheckReport) (x : MetaM EnsuresCheckReport) :
+    MetaM EnsuresCheckReport := do
+  if cfg.maxAnalysisHeartbeats == 0 then
+    return ← x
+  -- At most the configured budget, and at most seven eighths of what the
+  -- caller has left, so that the caller survives the analysis.
+  let limit :=
+    match ← heartbeatsRemaining with
+    | none => cfg.maxAnalysisHeartbeats * 1000
+    | some left => max 1 (min (cfg.maxAnalysisHeartbeats * 1000) (left - left / 8))
+  let start ← IO.getNumHeartbeats
+  let r? ← tryCatchRuntimeEx
+    (do
+      let r ← withCurrHeartbeats <|
+        withTheReader Core.Context (fun c => { c with maxHeartbeats := limit }) x
+      return some r)
+    (fun ex => do
+      if ex.isRuntime then
+        return none
+      throw ex)
+  let spent := (← IO.getNumHeartbeats) - start ≥ limit
+  match r? with
+  | some r =>
+    return if spent then { r with notes := r.notes.push analysisBudgetNote } else r
+  | none =>
+    return { fallback with notes := fallback.notes.push analysisBudgetNote }
+
 /--
 Resolve the designated outputs of a postcondition `body` over `binders` and
 dispatch to the generic or the `MirCallAns` analysis.
@@ -5298,43 +5614,50 @@ def analyzePost (cfg : EnsuresCheckConfig) (kind : String) (body : Expr)
       if pre.containsFVar binders[i]!.fvarId! then
         throwError "checkEnsuresBindsOutput: the precondition mentions the \
           output binder {i}"
-  -- The precondition, normalised, as the hypothesis of the proof search. A
-  -- precondition that is itself refuted (or has an empty input domain) admits
-  -- no input at all.
-  let mut hyp? : Option Expr := none
-  let mut preRefuted := false
-  if let some pre := pre? then
-    if cfg.useRequires then
-      let ctx : Context := { cfg, outputs := #[], stripBoilerplate := false }
-      let (hyp, _) ← ((do propSimplify (← simpProp pre)).run ctx).run {}
-      preRefuted ← refuteUnderExists cfg hyp
-      if !preRefuted && cfg.semanticProbe then
-        for i in [0:binders.size] do
-          if !outIdxs.contains i then
-            let bTy ← safely (inferType binders[i]!) (mkConst ``Unit)
-            if ← isEmptyDomain bTy cfg.probeHeartbeats then
-              preRefuted := true
-              break
-      if !preRefuted && !isTrueConst hyp then
-        hyp? := some hyp
   let retIdxs := if stateful && outIdxs.contains 2 then #[2] else outIdxs
-  let mut isAns := false
-  if outIdxs.size == 1 then
-    let ansTy ← whnfR (← inferType binders[outIdxs[0]!]!)
-    isAns := ansTy.isConstOf ``MirCallAns
-  let report ←
-    if isAns then
-      analyzeMirCallAns cfg kind body binders outIdxs[0]! hyp? preRefuted
+  let isAns ←
+    if outIdxs.size == 1 then
+      pure ((← whnfR (← inferType binders[outIdxs[0]!]!)).isConstOf ``MirCallAns)
     else
-      analyzeGeneric cfg kind body binders outIdxs retIdxs hyp? preRefuted
-  if preRefuted then
-    return { report with
-      reason? := some .requiresUnsatisfiable
-      boundOutputIdxs := #[]
-      bindsBeyondBoilerplate := false
-      notes := report.notes.push
-        "the precondition is unsatisfiable: no input is admissible" }
-  return report
+      pure false
+  -- What is reported when the analysis cannot be completed: nothing is flagged.
+  let fallback : EnsuresCheckReport :=
+    { kind, arity, outputIdxs := outIdxs, boundOutputIdxs := outIdxs
+      reason? := none, bindsBeyondBoilerplate := true
+      residual := "<not analysed>", notes := #[] }
+  withAnalysisBudget cfg fallback do
+    -- The precondition, normalised, as the hypothesis of the proof search. A
+    -- precondition that is itself refuted (or has an empty input domain) admits
+    -- no input at all.
+    let mut hyp? : Option Expr := none
+    let mut preRefuted := false
+    if let some pre := pre? then
+      if cfg.useRequires then
+        let ctx : Context := { cfg, outputs := #[], stripBoilerplate := false }
+        let (hyp, _) ← ((do propSimplify (← simpProp pre)).run ctx).run {}
+        preRefuted ← refuteUnderExists cfg hyp
+        if !preRefuted && cfg.semanticProbe then
+          for i in [0:binders.size] do
+            if !outIdxs.contains i then
+              let bTy ← safely (inferType binders[i]!) (mkConst ``Unit)
+              if ← isEmptyDomain bTy cfg.probeHeartbeats then
+                preRefuted := true
+                break
+        if !preRefuted && !isTrueConst hyp then
+          hyp? := some hyp
+    let report ←
+      if isAns then
+        analyzeMirCallAns cfg kind body binders outIdxs[0]! hyp? preRefuted
+      else
+        analyzeGeneric cfg kind body binders outIdxs retIdxs hyp? preRefuted
+    if preRefuted then
+      return { report with
+        reason? := some .requiresUnsatisfiable
+        boundOutputIdxs := #[]
+        bindsBeyondBoilerplate := false
+        notes := report.notes.push
+          "the precondition is unsatisfiable: no input is admissible" }
+    return report
 
 end EnsuresCheck
 

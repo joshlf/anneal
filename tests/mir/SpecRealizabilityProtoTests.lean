@@ -4031,6 +4031,248 @@ run_meta do
 
 end HardeningB3
 
+/-! ## Hardening (pass A3): components, guards, and the analysis budget -/
+
+namespace HardeningA3
+
+/-! ### Componentwise dichotomy of a pair output -/
+
+/-- Binds the first component of its output, and only that. -/
+def firstOnly : Nat → Nat × Nat → Prop := fun x out => out.1 = x
+
+theorem firstOnly_dichotomy :
+    PostconditionDichotomy (fun _ => True) firstOnly :=
+  ⟨0, (0, 0), (1, 0), trivial, rfl, fun (h : (1 : Nat) = 0) => absurd h (by decide)⟩
+
+theorem firstOnly_not_second_component :
+    ¬ DichotomyModuloObservation (fun (_ : Nat) (out : Nat × Nat) => out.1)
+      (fun _ => True) firstOnly :=
+  fun ⟨_, ok, bad, _, heq, hok, hbad⟩ =>
+    have heq : ok.1 = bad.1 := heq
+    hbad (heq.symm.trans hok)
+
+/-- The decomposition finds the dichotomy in the first component. -/
+theorem firstOnly_first_component :
+    DichotomyModuloObservation (fun (_ : Nat) (out : Nat × Nat) => out.2)
+      (fun _ => True) firstOnly :=
+  (postconditionDichotomy_prod_iff.mp firstOnly_dichotomy).resolve_right
+    firstOnly_not_second_component
+
+/-- Insensitive to each component separately, hence to the pair. -/
+def pairCommutes : Nat → Nat × Nat → Prop :=
+  fun x out => out.1 + out.2 = out.2 + out.1 ∧ x = x
+
+theorem pairCommutes_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre pairCommutes :=
+  not_dichotomy_prod_of_components
+    (fun _ _ _ _ _ _ => ⟨Nat.add_comm _ _, rfl⟩)
+    (fun _ _ _ _ _ _ => ⟨Nat.add_comm _ _, rfl⟩)
+
+#expect_binds firstOnly
+#expect_vacuous pairCommutes semanticallyInsensitive
+
+/-- The frame-only contract separates memories for a fixed returned value. -/
+theorem frameOnly_memoryDichotomy :
+    MirCallContractMemoryDichotomy frameOnlyMirCallContract :=
+  ⟨witnessReq, .unit, emptyMemory, { emptyMemory with activeProtectors := [0] },
+    trivial, callFramePreserved_refl emptyMemory,
+    fun h => List.cons_ne_self 0 _ h.2.2.2.1⟩
+
+/-- Its normal dichotomy is the memory disjunct of the decomposition. -/
+theorem frameOnly_normalDichotomy_is_memory :
+    MirCallContractNormalDichotomy frameOnlyMirCallContract ∧
+      ¬ MirCallContractReturnValueDichotomy frameOnlyMirCallContract ∧
+      MirCallContractMemoryDichotomy frameOnlyMirCallContract :=
+  have hv : ¬ MirCallContractReturnValueDichotomy frameOnlyMirCallContract :=
+    not_mirCallContractReturnValueDichotomy_of_value_blind
+      fun _ _ _ _ _ => Iff.rfl
+  have hn := frameOnly_memoryDichotomy.toNormalDichotomy
+  ⟨hn, hv,
+    (mirCallContractNormalDichotomy_iff_returnValue_or_memory.mp hn).resolve_left
+      hv⟩
+
+/-- The same for the frame-only `StatefulClaim`. -/
+theorem frameOnlyStateful_memoryDichotomy (body : CapturedMir) :
+    StatefulClaimMemoryDichotomy (frameOnlyStatefulClaim body) :=
+  (statefulClaimDichotomy_iff_return_or_memory.mp
+    (frameOnlyStatefulClaim_dichotomy body)).resolve_left
+    (frameOnlyStatefulClaim_not_returnDichotomy body)
+
+run_meta do
+  -- The two disjuncts are the checker's two per-output verdicts.
+  let r ← reportOf ``frameOnlyMirCallContract
+  unless r.bindsOutput do
+    throwError "frameOnlyMirCallContract: expected a (memory) binding\n\
+      {r.describe}"
+  expectReason ``frameOnlyMirCallContract .returnValueUnconstrained
+    (cfg := { strictReturnValue := true })
+
+/-! ### Guarded postconditions -/
+
+/-- `requires(x < 10)`. -/
+def belowTen : Nat → Prop := fun x => x < 10
+
+/-- `ensures(x >= 10 ==> ret == 5)`: the guard is an input predicate. -/
+def inputGuarded : Nat → Nat → Prop := fun x r => 10 ≤ x → r = 5
+
+/-- The guard moves into the precondition, which then admits no input. -/
+theorem inputGuarded_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy belowTen inputGuarded :=
+  fun h => not_dichotomy_of_unsat_pre
+    (not_preconditionSatisfiable_of_unsat
+      fun x (hx : x < 10 ∧ 10 ≤ x) => by omega)
+    ((postconditionDichotomy_input_guard_iff (fun x => 10 ≤ x)).mp h)
+
+/-- `ensures(x >= 10 && ret > 0 ==> ret == 5)`: the guard mentions the output. -/
+def mixedGuarded : Nat → Nat → Prop := fun x r => 10 ≤ x ∧ 0 < r → r = 5
+
+theorem mixedGuarded_dichotomy :
+    PostconditionDichotomy (fun _ => True) mixedGuarded :=
+  ⟨10, 5, 1, trivial, fun _ => rfl,
+    fun h => absurd (h ⟨Nat.le_refl 10, by decide⟩) (by decide)⟩
+
+theorem mixedGuarded_not_dichotomy_under_pre :
+    ¬ PostconditionDichotomy belowTen mixedGuarded :=
+  not_dichotomy_of_guard_refuted_by_pre
+    (guard := fun x r => 10 ≤ x ∧ 0 < r) (post := fun _ r => r = 5)
+    fun x _ (hx : x < 10) (hg : 10 ≤ x ∧ _) => by omega
+
+/--
+A guard on the output with a conclusion on the input: `ret == 5 ==> x < 3`.
+The conclusion never mentions `ret`, yet the clause binds it; the guard is not
+a hypothesis the analysis may assume.
+-/
+def outputGuarded : Nat → Nat → Prop := fun x r => r = 5 → x < 3
+
+theorem outputGuarded_dichotomy_under_pre :
+    PostconditionDichotomy belowTen outputGuarded :=
+  ⟨7, 0, 5, (by decide : (7 : Nat) < 10),
+    fun (h : (0 : Nat) = 5) => absurd h (by decide),
+    fun h => absurd (h rfl) (by decide)⟩
+
+run_meta do
+  assertEnsuresBindsOutput ``inputGuarded
+  assertEnsuresVacuous ``inputGuarded (some .vacuousUnderRequires)
+    (preDecl? := some ``belowTen)
+  assertEnsuresBindsOutput ``mixedGuarded
+  assertEnsuresVacuous ``mixedGuarded (some .vacuousUnderRequires)
+    (preDecl? := some ``belowTen)
+  assertEnsuresBindsOutput ``outputGuarded (preDecl? := some ``belowTen)
+
+/-! ### An `ensures` clause the return type implies -/
+
+/-- `ensures` restates the return-type boilerplate. -/
+def restatesReturnType (target : DefPath) (sidecar : CapturedMir) :
+    MirCallContract :=
+  externalSpecCallContract target sidecar (fun _ => True)
+    (fun _ ret => retMatchesCalleeReturnTy sidecar ret)
+
+theorem restatesReturnType_not_ensuresDichotomy (target : DefPath)
+    (sidecar : CapturedMir) :
+    ¬ ExternalSpecEnsuresDichotomy target sidecar (fun _ => True)
+      (fun _ ret => retMatchesCalleeReturnTy sidecar ret) :=
+  not_externalSpecEnsuresDichotomy_of_implied_by_retTy target sidecar _ _
+    fun _ _ _ h => h
+
+run_meta do
+  let r ← reportOf ``restatesReturnType
+  unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+    throwError "restatesReturnType: expected boilerplate-only binding\n\
+      {r.describe}"
+  expectReason ``restatesReturnType .boilerplateOnly
+    (cfg := { userEnsuresOnly := true })
+
+/-! ### Closed numerals behind a definition -/
+
+/-- A reduction modulo `2 ^ 32` is below `2 ^ 32`: says nothing about `r`. -/
+def reducedBelowModulus : Nat → Nat → Prop :=
+  fun _ r => r % scalarModulus 4 < scalarModulus 4
+
+theorem reducedBelowModulus_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre reducedBelowModulus :=
+  not_dichotomy_of_const_true fun _ r _ =>
+    Nat.mod_lt r (Nat.pos_of_ne_zero (by decide))
+
+/-- The bound itself is a genuine `u32` range constraint. -/
+def belowModulus : Nat → Nat → Prop := fun _ r => r < scalarModulus 4
+
+theorem belowModulus_dichotomy :
+    PostconditionDichotomy (fun _ => True) belowModulus :=
+  ⟨0, 0, scalarModulus 4, trivial, (by decide : 0 < scalarModulus 4),
+    Nat.lt_irrefl _⟩
+
+#expect_vacuous reducedBelowModulus semanticallyInsensitive
+#expect_binds belowModulus
+
+/-! ### The analysis budget: the checker never times its caller out -/
+
+/-- Genuine: `r ≥ x` over `Int`, stated with a witness. -/
+def intOffsetNonneg : Int → Int → Prop := fun x r => ∃ k : Int, r = x + k ∧ k ≥ 0
+
+theorem intOffsetNonneg_dichotomy :
+    PostconditionDichotomy (fun _ => True) intOffsetNonneg :=
+  ⟨0, 0, -1, trivial, ⟨0, by omega, by omega⟩, fun ⟨k, h₁, h₂⟩ => by omega⟩
+
+/-- Genuine: residue `0` or `1` modulo `3`, with witnesses bounded by the input. -/
+def intThirds : Int → Int → Prop :=
+  fun x r => (∃ k : Int, r = 3 * k ∧ k ≥ x) ∨ (∃ k : Int, r = 3 * k + 1 ∧ k ≤ x)
+
+theorem intThirds_dichotomy : PostconditionDichotomy (fun _ => True) intThirds :=
+  ⟨0, 0, 2, trivial, .inl ⟨0, by omega, by omega⟩,
+    fun h => by rcases h with ⟨k, h₁, h₂⟩ | ⟨k, h₁, h₂⟩ <;> omega⟩
+
+/-- Vacuous, but only the proof search can tell. -/
+def leSelfPlus : Nat → Nat → Prop := fun x r => r ≤ r + x
+
+theorem leSelfPlus_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre leSelfPlus :=
+  not_dichotomy_of_const_true fun x r _ => Nat.le_add_right r x
+
+-- Both genuine contracts are judged well inside a tenth of the default
+-- command budget: a failed witness search is not allowed to be expensive.
+set_option maxHeartbeats 20000 in
+#expect_binds intOffsetNonneg
+
+set_option maxHeartbeats 20000 in
+#expect_binds intThirds
+
+run_meta do
+  -- Out of budget, probing stops: the verdict is the conservative one, it is
+  -- labelled, and no exception reaches the caller.
+  let starved : EnsuresCheckConfig := { maxAnalysisHeartbeats := 1 }
+  let r ← reportOf ``leSelfPlus (cfg := starved)
+  unless r.bindsOutput && r.notes.contains EnsuresCheck.analysisBudgetNote do
+    throwError "leSelfPlus (starved): expected a labelled conservative verdict\n\
+      {r.describe}"
+  -- A verdict of the syntactic pass needs no probe and survives.
+  let r ← reportOf ``Class3.reflPost (cfg := starved)
+  unless r.isVacuous || r.notes.contains EnsuresCheck.analysisBudgetNote do
+    throwError "reflPost (starved): expected vacuous or labelled\n{r.describe}"
+  -- With the default budget the probe runs and no label is attached.
+  let r ← reportOf ``leSelfPlus
+  unless r.reason? == some .semanticallyInsensitive &&
+      !r.notes.contains EnsuresCheck.analysisBudgetNote do
+    throwError "leSelfPlus: expected semanticallyInsensitive\n{r.describe}"
+  -- A modest budget is respected (up to one probe) and still labelled.
+  let before ← IO.getNumHeartbeats
+  let r ← reportOf ``intOffsetNonneg (cfg := { maxAnalysisHeartbeats := 500 })
+  let used := (← IO.getNumHeartbeats) - before
+  unless r.bindsOutput && used ≤ 6000000 do
+    throwError "intOffsetNonneg (500k budget): used {used} heartbeats\n\
+      {r.describe}"
+
+-- A caller that is itself nearly out of heartbeats gets a labelled verdict
+-- rather than a timeout: the analysis takes at most seven eighths of what is
+-- left, and `intThirds` would need more.
+set_option maxHeartbeats 4000 in
+run_meta do
+  let r ← reportOf ``intThirds
+  unless r.bindsOutput && r.notes.contains EnsuresCheck.analysisBudgetNote do
+    throwError "intThirds (starved caller): expected a labelled conservative \
+      verdict\n{r.describe}"
+
+end HardeningA3
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit
