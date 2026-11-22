@@ -4818,6 +4818,202 @@ run_meta do
 
 end HardeningB4
 
+/-! ## Hardening (pass A4): boilerplate fibres and inhabited look-alikes -/
+
+namespace HardeningA4
+
+/-! ### Clauses the boilerplate reduces to a condition on the input -/
+
+/-- The frame observation: is the call frame of the request preserved? -/
+def frameObs (req : MirCallReq) (out : Value × Memory) : Prop :=
+  callFramePreserved req.memory out.2
+
+theorem frame_protectors {m m' : Memory} (h : callFramePreserved m m') :
+    m'.activeProtectors = m.activeProtectors :=
+  h.2.2.2.1
+
+/--
+`ensures(memAfter.activeProtectors == [])` next to the frame predicate. Given
+the frame it says `req.memory.activeProtectors = []`: a condition on the
+*request*, neither implied nor refuted by the frame, and no constraint on what
+is returned. It is constant on no fibre, and insensitive on each.
+-/
+def frameAndInputCondition : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∧ memAfter.activeProtectors = []
+    | .panicked _ => False
+    | .aborted => True
+
+theorem frameAndInputCondition_not_dichotomyModuloFrame :
+    ¬ DichotomyModuloObservation frameObs frameAndInputCondition.pre
+      (mirCallNormalPost frameAndInputCondition) :=
+  not_dichotomyModuloObservation_of_factors
+    (fun req b => b ∧ req.memory.activeProtectors = [])
+    fun _ _ _ =>
+      ⟨fun h => ⟨h.1, (frame_protectors h.1).symm.trans h.2⟩,
+        fun h => ⟨h.1, (frame_protectors h.1).trans h.2⟩⟩
+
+/-- The same fact in the form the checker establishes it: fibre by fibre. -/
+theorem frameAndInputCondition_fibre_insensitive :
+    ¬ DichotomyModuloObservation frameObs frameAndInputCondition.pre
+      (mirCallNormalPost frameAndInputCondition) :=
+  not_dichotomyModuloObservation_of_fibre_insensitive
+    (fun b _ out => b ∧ out.2.activeProtectors = [])
+    (fun _ _ _ => Iff.rfl)
+    fun _ req out₁ out₂ _ h₁ h₂ hc =>
+      have hf₁ : callFramePreserved req.memory out₁.2 := Eq.mpr h₁ hc.1
+      have hf₂ : callFramePreserved req.memory out₂.2 := Eq.mpr h₂ hc.1
+      ⟨hc.1, (frame_protectors hf₂).trans
+        ((frame_protectors hf₁).symm.trans hc.2)⟩
+
+theorem frameAndInputCondition_not_returnValueDichotomy :
+    ¬ MirCallContractReturnValueDichotomy frameAndInputCondition :=
+  not_mirCallContractReturnValueDichotomy_of_value_blind
+    fun _ _ _ _ _ => Iff.rfl
+
+/-- A guard the frame refutes: the conclusion on `retVal` is never reached. -/
+def guardRefutedByFrame : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        (memAfter.activeProtectors ≠ req.memory.activeProtectors →
+          retVal = u32Arg 1)
+    | .panicked _ => False
+    | .aborted => True
+
+theorem guardRefutedByFrame_not_dichotomyModuloFrame :
+    ¬ DichotomyModuloObservation frameObs guardRefutedByFrame.pre
+      (mirCallNormalPost guardRefutedByFrame) :=
+  not_dichotomyModuloObservation_of_factors (fun _ b => b)
+    fun _ _ _ =>
+      ⟨fun h => h.1, fun hf => ⟨hf, fun hn => absurd (frame_protectors hf) hn⟩⟩
+
+/-- Control: the guard is *implied* by the frame, so the conclusion binds. -/
+def guardImpliedByFrame : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned retVal memAfter =>
+      callFramePreserved req.memory memAfter ∧
+        (memAfter.activeProtectors = req.memory.activeProtectors →
+          retVal = u32Arg 1)
+    | .panicked _ => False
+    | .aborted => True
+
+theorem guardImpliedByFrame_returnValueDichotomy :
+    MirCallContractReturnValueDichotomy guardImpliedByFrame :=
+  ⟨witnessReq, u32Arg 1, u32Arg 0, emptyMemory, trivial,
+    ⟨callFramePreserved_refl _, fun _ => rfl⟩,
+    fun h => absurd (u32Arg_inj (h.2 rfl)) (by decide)⟩
+
+theorem guardImpliedByFrame_dichotomyModuloFrame :
+    DichotomyModuloObservation frameObs guardImpliedByFrame.pre
+      (mirCallNormalPost guardImpliedByFrame) :=
+  (mirCallContractReturnValueDichotomy_iff_moduloMemory.mp
+    guardImpliedByFrame_returnValueDichotomy).of_coarser
+    fun req o₁ o₂ (h : o₁.2 = o₂.2) => by
+      show frameObs req o₁ = frameObs req o₂
+      simp only [frameObs, h]
+
+/--
+Control: a clause on a field the frame leaves free. Two memories preserving the
+frame differ in `nextTag`; the clause accepts one of them only.
+-/
+def frameAndNextTag : MirCallContract where
+  pre _ := True
+  post req ans :=
+    match ans with
+    | .returned _ memAfter =>
+      callFramePreserved req.memory memAfter ∧ memAfter.nextTag = 0
+    | .panicked _ => False
+    | .aborted => True
+
+theorem frame_empty_nextTag (n : Nat) :
+    callFramePreserved emptyMemory { emptyMemory with nextTag := n } :=
+  ⟨rfl, rfl, rfl, rfl, .nil, rfl⟩
+
+theorem frameAndNextTag_dichotomyModuloFrame :
+    DichotomyModuloObservation frameObs frameAndNextTag.pre
+      (mirCallNormalPost frameAndNextTag) :=
+  ⟨witnessReq, (Value.unit, { emptyMemory with nextTag := 0 }),
+    (Value.unit, { emptyMemory with nextTag := 1 }), trivial,
+    propext ⟨fun _ => frame_empty_nextTag 1, fun _ => frame_empty_nextTag 0⟩,
+    ⟨frame_empty_nextTag 0, rfl⟩,
+    fun h => absurd h.2 (by decide)⟩
+
+run_meta do
+  let user : EnsuresCheckConfig := { userEnsuresOnly := true }
+  let strictUser : EnsuresCheckConfig :=
+    { userEnsuresOnly := true, strictReturnValue := true }
+  -- Neither clause is constant on the frame fibre; both are insensitive on it.
+  for n in #[``frameAndInputCondition, ``guardRefutedByFrame] do
+    let r ← reportOf n
+    unless r.bindsOutput && !r.bindsBeyondBoilerplate do
+      throwError "{n}: expected binding by boilerplate only\n{r.describe}"
+    expectReason n .boilerplateOnly (cfg := user)
+  -- The controls keep binding beyond boilerplate.
+  let r ← reportOf ``guardImpliedByFrame
+  unless r.bindsOutput && r.bindsBeyondBoilerplate do
+    throwError "guardImpliedByFrame: expected binding beyond boilerplate\n\
+      {r.describe}"
+  assertEnsuresBindsOutput ``guardImpliedByFrame (cfg := user)
+  assertEnsuresBindsOutput ``guardImpliedByFrame (cfg := strictUser)
+  let r ← reportOf ``frameAndNextTag
+  unless r.bindsOutput && r.bindsBeyondBoilerplate do
+    throwError "frameAndNextTag: expected binding beyond boilerplate\n\
+      {r.describe}"
+  assertEnsuresBindsOutput ``frameAndNextTag (cfg := user)
+  expectReason ``frameAndNextTag .returnValueUnconstrained (cfg := strictUser)
+
+/-! ### Inductive types that only look uninhabited -/
+
+/-- Every constructor takes rose trees, yet `node []` is one. -/
+inductive Rose where
+  | node : List Rose → Rose
+
+/--
+No base constructor, and the only argument mentions the type itself, yet the
+type is inhabited: the argument is a function out of `Empty`.
+-/
+inductive SelfFed where
+  | mk : (Empty → SelfFed) → SelfFed
+
+def optionRoseNone : Nat → Option Rose → Prop := fun _ r => r = none
+
+theorem optionRoseNone_dichotomy :
+    PostconditionDichotomy (fun _ => True) optionRoseNone :=
+  ⟨0, none, some (.node []), trivial, rfl,
+    fun (h : some (Rose.node []) = none) => nomatch h⟩
+
+def optionSelfFedNone : Nat → Option SelfFed → Prop := fun _ r => r = none
+
+theorem optionSelfFedNone_dichotomy :
+    PostconditionDichotomy (fun _ => True) optionSelfFedNone :=
+  ⟨0, none, some (.mk fun e => nomatch e), trivial, rfl,
+    fun (h : some (SelfFed.mk fun e => nomatch e) = none) => nomatch h⟩
+
+/-- `SelfFed` has exactly one inhabitant. -/
+theorem selfFed_subsingleton : ∀ a b : SelfFed, a = b
+  | .mk _, .mk _ => congrArg SelfFed.mk (funext fun e => nomatch e)
+
+def selfFedPinned : Nat → SelfFed → Prop :=
+  fun _ r => r = .mk fun e => nomatch e
+
+theorem selfFedPinned_not_dichotomy (pre : Nat → Prop) :
+    ¬ PostconditionDichotomy pre selfFedPinned :=
+  not_dichotomy_of_subsingleton_output selfFed_subsingleton
+
+#expect_binds optionRoseNone
+#expect_binds optionSelfFedNone
+#expect_vacuous selfFedPinned reflexiveTautology
+
+end HardeningA4
+
 /-! ## Axiom and soundness audit -/
 
 namespace Audit

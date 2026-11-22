@@ -2584,9 +2584,10 @@ boilerplate atoms occurring in the residual (skipping empty fibres where an
 atom is provably constant, such as `callFramePreserved m m = True`, and
 skipping fibres where the boilerplate atoms themselves imply or refute the
 cofactor residual, such as `ensures(ret <= u32::MAX)` or restating a field of
-`callFramePreserved`, justified by
-`not_dichotomyModuloObservation_of_fibre_constant`, and short-circuiting at zero
-cost whenever no boilerplate constant was seen). Replacement descends into
+`callFramePreserved`, or reduce it to a condition on the input, justified by
+`not_dichotomyModuloObservation_of_fibre_constant` and
+`not_dichotomyModuloObservation_of_fibre_insensitive`, and short-circuiting at
+zero cost whenever no boilerplate constant was seen). Replacement descends into
 `.lam`, `.letE`, and `.mdata` so boilerplate inside `match` alternatives is
 substituted as well. An output is bound beyond boilerplate iff it is bound in
 the full analysis and some feasible non-constant cofactor constrains it. The
@@ -5588,15 +5589,60 @@ def expandFibreAtom (cfg : EnsuresCheckConfig) (atom : Expr) : MetaM Expr := do
         let (r, _) ← ((do propSimplify (← simpProp atom)).run ctx).run {}
         return r) atom
 
+/-- Fresh variables `o'` of the given types, in order. -/
+def withPrimedOutputs {α : Type} (tys : List Expr) (acc : Array Expr)
+    (k : Array Expr → MetaM α) : MetaM α :=
+  match tys with
+  | [] => k acc
+  | t :: rest =>
+    withLocalDeclD `o' t fun o' => withPrimedOutputs rest (acc.push o') k
+
 /--
-Check whether `residual` is provably constant (`True` or `False`) on the fibre
-defined by `atoms`/`mask` and `hyp?`: justified by
-`not_dichotomyModuloObservation_of_fibre_constant`, such a fibre contributes no
-dichotomy beyond the boilerplate observation (covering clauses implied by
-`retMatchesCalleeReturnTy` or `callFramePreserved`, clauses refuted by them, and
-jointly inconsistent boilerplate fibres).
+Whether `residual` cannot tell apart two outputs of the fibre described by
+`hyps`: with `o'` a second copy of the designated outputs, a proof of
+`hyps o → hyps o' → (residual o ↔ residual o')`. This is the hypothesis of
+`not_dichotomyModuloObservation_of_fibre_insensitive`, stated for all outputs
+jointly (no assumption that the fibre is a product), with `hyps` a consequence
+of membership in the fibre. It covers a clause that the boilerplate reduces to
+a condition on the *input* (`callFramePreserved req.memory memAfter ∧
+memAfter.activeProtectors = []` says `req.memory.activeProtectors = []`), which
+is neither implied nor refuted on the fibre, and guards the boilerplate refutes.
 -/
-def fibreMakesResidualConst (cfg : EnsuresCheckConfig)
+def fibreMakesResidualInsensitive (cfg : EnsuresCheckConfig)
+    (outputs : Array Expr) (hyps : List Expr) (residual : Expr) : MetaM Bool := do
+  let mentions (e : Expr) : Bool :=
+    e.hasAnyFVar fun fv => outputs.any fun o => o.fvarId! == fv
+  safely (do
+    let tys ← outputs.mapM inferType
+    -- An output whose type depends on another output is out of scope.
+    if tys.any mentions then
+      return false
+    withPrimedOutputs tys.toList #[] fun os' => do
+      let prime (e : Expr) : Expr := e.replaceFVars outputs os'
+      let mut g := mkApp2 (mkConst ``Iff) residual (prime residual)
+      for h in hyps do
+        if mentions h then
+          g ← underHyp (prime h) g
+      for h in hyps do
+        g ← underHyp h g
+      let goal ← mkForallFVars os' g
+      if sizeUpTo (cfg.probeMaxSize * 4 + 1) goal > cfg.probeMaxSize * 4 then
+        return false
+      if ← tryProveFast goal cfg.probeHeartbeats then
+        return true
+      tryProveGrind goal cfg.probeHeartbeats) false
+
+/--
+Check whether `residual` separates no two outputs of the fibre defined by
+`atoms`/`mask` and `hyp?`: it is provably constant there (`True` or `False`,
+`not_dichotomyModuloObservation_of_fibre_constant`), or provably insensitive to
+the outputs there (`fibreMakesResidualInsensitive`). Such a fibre contributes
+no dichotomy beyond the boilerplate observation. This covers clauses implied by
+`retMatchesCalleeReturnTy` or `callFramePreserved`, clauses refuted by them,
+clauses they reduce to a condition on the input, and jointly inconsistent
+boilerplate fibres.
+-/
+def fibreMakesResidualConst (cfg : EnsuresCheckConfig) (outputs : Array Expr)
     (atoms : Array Expr) (mask : Nat) (hyp? : Option Expr) (residual : Expr) :
     MetaM Bool := do
   if !cfg.semanticProbe || cfg.probeHeartbeats == 0 || (← heartbeatsExhausted) then
@@ -5646,7 +5692,7 @@ def fibreMakesResidualConst (cfg : EnsuresCheckConfig)
       return true
     if isFalseConst resUnder || (← proveFibre (mkNot resUnder)) then
       return true
-    return false
+    fibreMakesResidualInsensitive cfg outputs rawHyps residual
 
 /--
 Determine which outputs are constrained *beyond* the predicates in
@@ -5731,7 +5777,7 @@ def analyzeUserBeyondBoilerplate (cfg : EnsuresCheckConfig)
         break
     let fibreConst ←
       if hasCandidate then
-        fibreMakesResidualConst cfg atoms mask hyp? a.residual
+        fibreMakesResidualConst cfg outputs atoms mask hyp? a.residual
       else
         pure false
     let mut anyReal := false
