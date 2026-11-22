@@ -10364,6 +10364,254 @@ theorem ep1_vtable_congr_mach_hypotheses_necessary_witness :
   · ep1_kernel_rfl
   · ep1_kernel_rfl
 
+/-- **`Statement::Deinit` on an unsized `Type::TraitObject` place (`Mach`)**
+follows upstream `spec/lang/step/statements.md` verbatim: a misaligned place
+raises UB (`"de-initializing a place based on a misaligned pointer"`) first,
+while an aligned `Type::TraitObject` place hits
+`LayoutStrategy::expect_size("WF ensures deinits are sized")` (a spec panic,
+never dynamic-size deinit). -/
+theorem ep1_evalStatement_deinit_traitObject_spec (m m1 : Mach) (place : Gen.PlaceExpr)
+    (p : Gen.Place BM) (traitName : Gen.TraitName)
+    (hPl : evalPlace m place = .ok ((p, .TraitObject traitName), m1)) :
+    (p.aligned = false →
+      evalStatement m (.Deinit place) =
+        .error (.ub "de-initializing a place based on a misaligned pointer")) ∧
+    (p.aligned = true →
+      evalStatement m (.Deinit place) =
+        specPanic "expect_size called on unsized type: WF ensures deinits are sized") := by
+  refine ⟨fun hAl => ?_, fun hAl => ?_⟩
+  · unfold evalStatement
+    simp only [hPl, ok_bind, hAl, Bool.not_false, ↓reduceIte, ub]
+  · unfold evalStatement
+    simp only [hPl, ok_bind, hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+
+/-- Polymorphic `ep1_evalStatement_deinit_traitObject_spec`, across every
+`Memory` `M` (in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem ep1_evalStatementM_deinit_traitObject_spec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) (place : Gen.PlaceExpr)
+    (p : Gen.Place M) (traitName : Gen.TraitName)
+    (hPl : evalPlaceM m place = .ok ((p, .TraitObject traitName), m1)) :
+    (p.aligned = false →
+      evalStatementM m (.Deinit place) =
+        .error (.ub "de-initializing a place based on a misaligned pointer")) ∧
+    (p.aligned = true →
+      evalStatementM m (.Deinit place) =
+        specPanic "expect_size called on unsized type: WF ensures deinits are sized") := by
+  refine ⟨fun hAl => ?_, fun hAl => ?_⟩
+  · unfold evalStatementM
+    simp only [hPl, ok_bind, hAl, Bool.not_false, ↓reduceIte, ub]
+  · unfold evalStatementM
+    simp only [hPl, ok_bind, hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+
+set_option maxRecDepth 8192 in
+/-- **Trait-object `Statement::Deinit` semantics, sized view/head deinit, and
+Tree Borrows write-access mode sensitivity** (`Mach` & `MachTB`, with
+`MachTB.wfLive`):
+1. Direct `Statement::Deinit` on `*p : Type::TraitObject` raises
+   `specPanic "expect_size called on unsized type: WF ensures deinits are sized"`
+   when aligned, and UB `"de-initializing a place based on a misaligned pointer"`
+   when misaligned for `vtable.align = 4` (upstream
+   `spec/lang/step/statements.md`);
+2. Sized 4-byte `Statement::Deinit` through `&mut dyn Trait0` (via
+   `GetThinPointer`) and through `Field 0` of `&mut { head: u32, tail: dyn Trait0 }`
+   turns bytes `[0..4)` to `.Uninit` while preserving bytes `[4..8)` intact on
+   both `Mach` and `MachTB` (preserving `MachTB.wfLive`);
+3. `Statement::Deinit` through validated `&dyn Trait0` succeeds on `Mach` and
+   faults `"Tree Borrows: local write of Frozen reference"` on `MachTB`;
+4. `Statement::Deinit` on a 16-byte `&dyn Trait0` local itself wipes all 16
+   bytes to `.Uninit`, so reloading it raises
+   `"load at type but the data in memory violates the language invariant"`. -/
+theorem ep1_vtable_deinit_traitObject_and_sized_view_witness :
+    let vt4 : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨4⟩, align := ⟨4⟩, cells := [], methods := ⟨[]⟩ }
+    let deinitProg : Gen.Program :=
+      { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+        traits := ⟨[(ep1VtTrait0, ⟨[]⟩)]⟩, vtables := ⟨[(⟨⟨0⟩⟩, vt4)]⟩ }
+    let dynPointee := ep1DynPointee ep1VtTrait0
+    let dynRef : Gen.PtrType := .Ref .Immutable dynPointee
+    let dynMut : Gen.PtrType := .Ref .Mutable dynPointee
+    let rawDyn : Gen.PtrType := .Raw (.VTablePointer ep1VtTrait0)
+    let head4 : Gen.TupleHeadLayout := ⟨⟨4⟩, ⟨4⟩, none⟩
+    let structTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U32)] head4 (some (.TraitObject ep1VtTrait0))
+    let structPointee : Gen.PointeeInfo :=
+      { layout := .Tuple head4 (.TraitObject ep1VtTrait0), inhabited := true,
+        unsafe_cells := .Tuple [] .TraitObject, freeze := true, unpin := true }
+    let structMut : Gen.PtrType := .Ref .Mutable structPointee
+    let initBuf : List Byte :=
+      [.Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let afterDeinit4 : List Byte :=
+      [.Uninit, .Uninit, .Uninit, .Uninit,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let afterDeinit4TB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
+      [.Uninit, .Uninit, .Uninit, .Uninit,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let vt4Ptr : Ptr := ⟨0x4000, some (⟨2⟩, ())⟩
+    let alignedWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let misalignedWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x02, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let mkBM (ptrTy : Gen.PtrType) (local1Bytes : List Byte) : Mach :=
+      { ep1MachBM
+          [{ data := initBuf, addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := true, extra := () },
+           { data := local1Bytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩,
+             kind := .VTable, live := true, extra := () }]
+          [(⟨⟨1⟩⟩, ⟨0x2000, some (⟨1⟩, ())⟩)]
+          [(⟨⟨1⟩⟩, .Ptr ptrTy)] with
+        prog := deinitProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt4Ptr)]⟩ }
+    let mkTB (ptrTy : Gen.PtrType) (local1Bytes : List Byte) : MachTB :=
+      liftMachToTB (mkBM ptrTy local1Bytes)
+    let deinitDynPlace : Gen.Statement :=
+      .Deinit (.Deref (.Load (.Local ⟨⟨1⟩⟩)) (.TraitObject ep1VtTrait0))
+    let deinitView4 : Gen.Statement :=
+      .Deinit (.Deref (.UnOp .GetThinPointer (.Load (.Local ⟨⟨1⟩⟩))) (.Int ep1U32))
+    let deinitHead4 : Gen.Statement :=
+      .Deinit (.Field (.Deref (.Load (.Local ⟨⟨1⟩⟩)) structTy) 0)
+    let deinitWideLocal : Gen.Statement := .Deinit (.Local ⟨⟨1⟩⟩)
+    let unsizedPanic := "expect_size called on unsized type: WF ensures deinits are sized"
+    let misalignedUb := "de-initializing a place based on a misaligned pointer"
+    let frozenUb := "Tree Borrows: local write of Frozen reference"
+    let loadInvUb := "load at type but the data in memory violates the language invariant"
+    -- 1. Direct `Statement::Deinit` on `Type::TraitObject`: aligned panic vs misaligned UB
+    (evalStatement (mkBM dynMut alignedWideBytes) deinitDynPlace = specPanic unsizedPanic ∧
+     evalStatementM (mkTB dynMut alignedWideBytes) deinitDynPlace = specPanic unsizedPanic ∧
+     evalStatement (mkBM rawDyn misalignedWideBytes) deinitDynPlace = .error (.ub misalignedUb) ∧
+     evalStatementM (mkTB rawDyn misalignedWideBytes) deinitDynPlace = .error (.ub misalignedUb)) ∧
+    -- 2. Sized 4-byte `Deinit` via `&mut dyn Trait0` and via `Field 0` of unsized struct
+    ((∃ m1 m2,
+       evalStatement (mkBM dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitView4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1 m2,
+       evalStatementM (mkTB dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatementM m1 deinitView4 = .ok m2 ∧
+       MachTB.wfLive m2 ∧
+       m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data = some afterDeinit4TB) ∧
+     (∃ m1 m2,
+       evalStatement (mkBM structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitHead4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1 m2,
+       evalStatementM (mkTB structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatementM m1 deinitHead4 = .ok m2 ∧
+       MachTB.wfLive m2 ∧
+       m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data = some afterDeinit4TB)) ∧
+    -- 3. Tree Borrows mode sensitivity of `Deinit` on validated `&dyn Trait0`
+    ((∃ m1 m2,
+       evalStatement (mkBM dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitView4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1,
+       evalStatementM (mkTB dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       evalStatementM m1 deinitView4 = .error (.ub frozenUb))) ∧
+    -- 4. `Deinit` on the 16-byte `&dyn Trait0` local itself
+    ((∃ m1,
+       evalStatement (mkBM dynRef alignedWideBytes) deinitWideLocal = .ok m1 ∧
+       m1.mem.memory.allocations[1]?.map Gen.Allocation.data = some (List.replicate 16 .Uninit) ∧
+       evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadInvUb)) ∧
+     (∃ m1,
+       evalStatementM (mkTB dynRef alignedWideBytes) deinitWideLocal = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.mem.memory.mem.allocations[1]?.map Gen.Allocation.data =
+         some (List.replicate 16 .Uninit) ∧
+       evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadInvUb))) := by
+  intro vt4 deinitProg dynPointee dynRef dynMut rawDyn head4 structTy structPointee structMut
+    initBuf afterDeinit4 afterDeinit4TB vt4Ptr alignedWideBytes misalignedWideBytes mkBM mkTB
+    deinitDynPlace deinitView4 deinitHead4 deinitWideLocal unsizedPanic misalignedUb frozenUb
+    loadInvUb
+  refine ⟨⟨?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitView4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 deinitView4
+          pure (m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4TB) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut alignedWideBytes)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    exact ⟨m1, m2, hm1, hm2, hwf2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitHead4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 deinitHead4
+          pure (m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4TB) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive
+      (liftMachToTB_wfLive (mkBM structMut alignedWideBytes)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    exact ⟨m1, m2, hm1, hm2, hwf2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitView4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          pure (evalStatementM m1 deinitView4)) =
+        .ok (.error (.ub frozenUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef alignedWideBytes)) hm1
+    exact ⟨m1, hm1, hwf1, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynRef alignedWideBytes) deinitWideLocal
+          pure (m1.mem.memory.allocations[1]?.map Gen.Allocation.data,
+            evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)))) =
+        .ok (some (List.replicate 16 .Uninit), .error (.ub loadInvUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hdata, hload⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    exact ⟨m1, hm1, hdata, hload⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynRef alignedWideBytes) deinitWideLocal
+          pure (m1.mem.memory.mem.allocations[1]?.map Gen.Allocation.data,
+            evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)))) =
+        .ok (some (List.replicate 16 .Uninit), .error (.ub loadInvUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hdata, hload⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef alignedWideBytes)) hm1
+    exact ⟨m1, hm1, hwf1, hdata, hload⟩
+
 /-- **Ill-formed `ValueExpr::Variant` / `ValueExpr::Union` ASTs are spec panics, not UB**, on
 both `Mach` and `MachTB`:
 
@@ -18357,6 +18605,9 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_constructWidePointer_boundary_and_decode_witness
   ep1_vtable_congr_mach_hypotheses_necessary_witness
   ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+  ep1_evalStatement_deinit_traitObject_spec
+  ep1_evalStatementM_deinit_traitObject_spec
+  ep1_vtable_deinit_traitObject_and_sized_view_witness
 
 #assert_standard_axioms
   vtableFromPtrM_bm_eq
@@ -18443,6 +18694,9 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_vtable_constructWidePointer_boundary_and_decode_witness
   ep1_vtable_congr_mach_hypotheses_necessary_witness
   ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+  ep1_evalStatement_deinit_traitObject_spec
+  ep1_evalStatementM_deinit_traitObject_spec
+  ep1_vtable_deinit_traitObject_and_sized_view_witness
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
