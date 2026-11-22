@@ -208,6 +208,10 @@ theorem np_mr_deep_theorems_used :
   have _ := @np_v4_nested_field_unwrap_trusted_witness
   have _ := @np_v4_nested_field_unwrap_mach_and_tb_witness
   have _ := @np_v4_pair_subrange_disjoint_and_deref_field_three_way_witness
+  have _ := @np_v4_deref_field_frozen_disabled_cell_trusted_witness
+  have _ := @np_tb_frozen_write_and_disabled_read_ub_minirust
+  have _ := @np_tb_protected_unsafeCell_interior_mut_three_way
+  have _ := @np_v4_pair_deref_caller_frame_full_return_witness
   have _ := @np_variant_outcomes_distinct
   have _ := @npTrustedObserve_table
   have _ := @npMrObserveClass_table
@@ -525,6 +529,10 @@ run_cmd do
         lmNs ++ `lm_np_v4_deref_and_subplace_unwrap_tb_witness,
         lmNs ++ `lm_np_v4_nested_field_unwrap_disjoint_tb_witness,
         lmNs ++ `lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness,
+        lmNs ++ `lm_np_v4_deref_field_bad_pointer_ub_witness,
+        lmNs ++ `lm_np_v4_deref_field_misaligned_ub_witness,
+        lmNs ++ `npTreeBorrowsReadPermitted_perm_table,
+        lmNs ++ `lm_np_v4_deref_field_tb_frozen_disabled_cell_witness,
         lmNs ++ `lm_np_v4_zst_unwrap_write_boundary_witness,
         lmNs ++ `lm_np_storage_lifecycle_witness,
         lmNs ++ `lm_np_v1_multihop_offsetof_and_failclosed_unsupported_witness ]

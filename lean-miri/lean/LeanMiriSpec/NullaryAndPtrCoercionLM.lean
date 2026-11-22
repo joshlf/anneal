@@ -860,6 +860,110 @@ def npEvalOperandNullaryPtr (localDecls : List LocalDecl) (layouts : LayoutTable
     else annealEvalOperandOverlay localDecls layouts op known
   | _ => annealEvalOperandOverlay localDecls layouts op known
 
+/-- Whether a Tree Borrows read of `[startNat, startNat + sizeBytes)` through
+`tag` is permitted on `tree`: on every overlapping segment, every node's
+location state must accept the read under unmodified vendored
+`Miri.TreeBorrows.Tree.LocationState.performAccess` (`.Read`; a child access for
+`tag` and its ancestors, a foreign access for every other node; protection from
+the vendored global protected-tag table). This rejects a read through a
+`.Disabled` tag and a foreign read of a protected accessed `.Unique` tag, and
+accepts reads through `.Frozen`, `.Cell`, and reserved tags. A tag that is not
+registered in `tree` is rejected (the vendored `.MissingTag` access error), and
+a zero-sized read is accepted without consulting the tree.
+
+The check does not write the read's permission transitions back into the tree
+(an unprotected foreign `.Unique` tag is not demoted to `.Frozen`), so it never
+reports a conflict that Tree Borrows would not report, but a later write
+through such a tag is not rejected on account of this read. -/
+def npTreeBorrowsReadPermitted (protectedTags : Miri.TreeBorrows.ProtectedTags)
+    (tree : Miri.TreeBorrows.BorrowTree) (tag : Miri.Memory.BorTag)
+    (startNat sizeBytes : Nat) : Bool :=
+  if sizeBytes = 0 then true else
+  match tree.tagMapping.get tag with
+  | none => false
+  | some srcIdx =>
+    let endNat := startNat + sizeBytes
+    let fuel := tree.nodes.data.size + 1
+    let segOk (seg : Miri.DataStructures.RangeMapSegment Miri.TreeBorrows.LocationTree) :
+        Bool :=
+      let s0 := seg.range.start.toNat
+      let s1 := seg.range.stop.toNat
+      if s0 < endNat && startNat < s1 then
+        tree.tagMapping.mapping.all fun (otherTag, otherIdx) =>
+          let relPos : Miri.TreeBorrows.AccessRelatedness :=
+            if ep2IsAncestor tree otherIdx srcIdx fuel then .LocalAccess else .ForeignAccess
+          let isProt : Bool := protectedTags.get otherTag == some .StrongProtector
+          let locSt? : Option Miri.TreeBorrows.Tree.LocationState :=
+            match seg.data.perms.get otherIdx with
+            | some ls => some ls
+            | none => (tree.nodes.get otherIdx).map (·.defaultLocationState)
+          match locSt? with
+          | some ls =>
+            match Miri.TreeBorrows.Tree.LocationState.performAccess ls .Read relPos isProt with
+            | .Success _ _ => true
+            | _ => false
+          | none => true
+      else true
+    tree.locations.entries.all segOk
+
+/-- Tree Borrows read check on the byte range `[absAddr - baseAddr, +size)` of the
+live allocation referenced by `prov` (`npTreeBorrowsReadPermitted`), reporting a
+rejected read as `StepError.undefinedBehavior`. Untracked allocations, machines
+without a borrow tracker, and non-concrete provenances are left unchecked. -/
+def npCheckTreeBorrowsReadAt (prov : Option AnnealProv) (absAddr : UInt64)
+    (size : Miri.ABI.Size) (state : AnnealStepState) :
+    Except Miri.Interpreter.StepError Unit :=
+  match prov with
+  | some (.concrete aid tag) =>
+    match state.machine.borrowTracker,
+          state.machine.memory.live.find? (fun e => e.1 == aid),
+          ep2RelOffset? state.machine aid absAddr with
+    | some bt, some (_, liveAlloc), some rel =>
+      match liveAlloc.allocation.extra with
+      | some tree =>
+        if npTreeBorrowsReadPermitted bt.global.protectedTags tree tag rel.toNat
+            size.bytes.toNat then .ok ()
+        else
+          .error (.undefinedBehavior "Tree Borrows read conflict on dereferenced field place")
+      | none => .ok ()
+    | _, _, _ => .ok ()
+  | _ => .ok ()
+
+/-- Tree Borrows read check for a dereferenced struct-field place
+(`(*ptr).field[.unwrapUnsafeBinder]`): resolves `place` with
+`npEvalPlaceNullaryPtr` and checks the exact byte range read. A place that fails
+to resolve is left to the read itself, which reports the error. -/
+def npTreeBorrowsReadCheck (currentBody : CapturedMir) (place : Miri.MIR.Place)
+    (state : AnnealStepState) : Except Miri.Interpreter.StepError Unit :=
+  match npEvalPlaceNullaryPtr currentBody.localDecls currentBody.layouts place true state with
+  | .error _ _ => .ok ()
+  | .ok rp _ =>
+    match rp.ref with
+    | .memory mp =>
+      npCheckTreeBorrowsReadAt mp.ptr.provenance mp.ptr.offset.bytes rp.layout.layout.size state
+    | .local _ _ _ _ => .ok ()
+
+/-- `npTreeBorrowsReadCheck` on the place read by a `Copy` / `Move` operand. -/
+def npTreeBorrowsReadGate (currentBody : CapturedMir) (st : AnnealStepState)
+    (op : Miri.MIR.Operand) : Miri.Interpreter.RvalueM AnnealStepState Unit :=
+  match op with
+  | .Copy place | .Move place =>
+    match npTreeBorrowsReadCheck currentBody place st with
+    | .ok () => pure ()
+    | .error e => throw e
+  | _ => pure ()
+
+/-- `npEvalOperandNullaryPtr` preceded, in `treeBorrows = true` mode, by the Tree
+Borrows read check of the dereferenced struct-field place (Trusted rejects a
+read through a `.disabled` borrow at the same point). -/
+def npEvalOperandNullaryPtrTb (currentBody : CapturedMir) (treeBorrows : Bool)
+    (op : Miri.MIR.Operand) (known : Option Miri.Interpreter.LocalLayout) :
+    Miri.Interpreter.RvalueM AnnealStepState (Miri.Interpreter.OpTy AnnealProv) := do
+  if treeBorrows then
+    let st ← get
+    npTreeBorrowsReadGate currentBody st op
+  npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts op known
+
 /-- Syntactic predicate for `Assign` rvalues routed through the overlay's own
 `RvalueHooks`: `Operand.RuntimeChecks` uses and `PointerCoercion(Unsize)` casts. -/
 def isNullaryPtrRvalue : Miri.MIR.Rvalue → Bool
@@ -872,8 +976,9 @@ def isNullaryPtrRvalue : Miri.MIR.Rvalue → Bool
 (vendored `Cast.cast` over `annealCastHooksNullaryPtr`, threading `treeBorrows`
 for live BorrowTree permission checks and targeting the destination's own
 wide-pointer `TyId`), and struct-pointer dereference + field projections
-(`(*ptr).field[.unwrapUnsafeBinder]`). Every other operand and cast is delegated
-unchanged. -/
+(`(*ptr).field[.unwrapUnsafeBinder]`), whose reads run the Tree Borrows read
+check `npTreeBorrowsReadCheck` when `treeBorrows = true`. Every other operand
+and cast is delegated unchanged. -/
 def annealRvalueHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtrEntry := .nil)
     (treeBorrows : Bool := false) :
     Miri.Interpreter.RvalueHooks AnnealProv AnnealStepState Unit
@@ -887,18 +992,18 @@ def annealRvalueHooksNullaryPtr (currentBody : CapturedMir) (fnPtrs : List FnPtr
       | .RuntimeChecks checks => npEvalRuntimeChecksOperand currentBody.layouts c checks
       | _ =>
         if match op with | .Copy p | .Move p => npIsDerefFieldPlace p | _ => false then
-          npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts op known
+          npEvalOperandNullaryPtrTb currentBody treeBorrows op known
         else base.evalOperand c op known
     evalOperandAt := fun c path op known =>
       match op with
       | .RuntimeChecks checks => npEvalRuntimeChecksOperand currentBody.layouts c checks
       | _ =>
         if match op with | .Copy p | .Move p => npIsDerefFieldPlace p | _ => false then
-          npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts op known
+          npEvalOperandNullaryPtrTb currentBody treeBorrows op known
         else base.evalOperandAt c path op known
     evalPlaceToOp := fun c p known =>
       if npIsDerefFieldPlace p then
-        npEvalOperandNullaryPtr currentBody.localDecls currentBody.layouts (.Copy p) known
+        npEvalOperandNullaryPtrTb currentBody treeBorrows (.Copy p) known
       else base.evalPlaceToOp c p known
     cast := fun c src kind ty dest =>
       match kind with
@@ -2654,6 +2759,206 @@ theorem lm_np_v4_pair_subrange_disjoint_and_deref_field_tb_witness :
           by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel,
           by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-! ### `V4` `(*ptr).field`: invalid pointers and `Frozen` / `Disabled` / `Cell` tags -/
+
+private def npV4PairDerefSndReadMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_snd_read"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- State for the `(*_1).field` fixtures with an arbitrary pointer local `ptr`
+and borrow tree `tree` on the 8-byte pointee allocation `npAid1` (bytes
+`fst = 7`, `snd = 11`); `retagChildTag` is protected iff `childProtected`. -/
+private def mkNpPairDerefPtrState (body : CapturedMir) (tree : Miri.TreeBorrows.BorrowTree)
+    (ptr : Miri.Interpreter.LocalValue AnnealProv) (childProtected : Bool) : AnnealStepState :=
+  let alloc := npPaddedAlloc8.setExtra (some tree)
+  let mach : AnnealMachine :=
+    { memory := { AnnealMachine.empty.memory with live := #[(npAid1, ⟨.stack, alloc⟩)] },
+      addresses := { AnnealMachine.empty.addresses with baseAddr := #[⟨npAid1, npBase1⟩] },
+      borrowTracker := some
+        { global := { protectedTags := (hooksForChildProtected childProtected).protectedTags },
+          retagMode := .Default } }
+  npMkState body u32MirTy
+    #[npUninit (translateTyOverlay u32MirTy npSubrangeLayouts),
+      ⟨ptr, some (translateTyOverlay npRawMutPairU32BinderMirTy npSubrangeLayouts)⟩,
+      npUninit (translateTyOverlay npPairU32BinderMirTy npSubrangeLayouts)]
+    mach
+
+/-- **`V4` `(*ptr).1.unwrapUnsafeBinder` Through an Invalid Pointer Is UB**
+(write `(*ptr).1.unwrapUnsafeBinder = 99` and read `_0 = (*ptr).1.unwrapUnsafeBinder`,
+stepped through unmodified vendored `Miri.Interpreter.Step.step`):
+1. a dead pointer local is UB on write and on read (also in `treeBorrows = true`);
+2. an uninitialized pointer local is UB on write and on read;
+3. a null integer pointer (write) and a dangling integer pointer `0x2000` (read)
+   are UB;
+4. a pointer one past the end of the 8-byte pointee (field at `[12, 16)`) is UB
+   on write and on read (also on write in `treeBorrows = true`);
+5. control: a valid pointer reads `11`, in basic and in `treeBorrows = true` mode. -/
+theorem lm_np_v4_deref_field_bad_pointer_ub_witness :
+    let uninitPtr : Miri.Interpreter.LocalValue AnnealProv := .live (.immediate .uninit)
+    let nullPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npScalarUInt 0 8)))
+    let danglingPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npScalarUInt 0x2000 8)))
+    let endPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid1 (npBase1 + 8) retagParentTag)))
+    let okPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid1 npBase1 retagParentTag)))
+    -- 1. Dead pointer local
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) .dead false)) =
+      .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) .dead false)) =
+      .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) .dead false)) =
+      .ub ∧
+    -- 2. Uninitialized pointer local
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) uninitPtr
+        false)) = .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) uninitPtr
+        false)) = .ub ∧
+    -- 3. Null and dangling integer pointers
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) nullPtr
+        false)) = .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) danglingPtr
+        false)) = .ub ∧
+    -- 4. Out-of-bounds (one past the end) pointer
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) endPtr
+        false)) = .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) endPtr
+        false)) = .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) endPtr
+        false)) = .ub ∧
+    -- 5. Control: valid pointer
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) okPtr
+        false)) = .u32Val 11 ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) okPtr
+        false)) = .u32Val 11 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+
+/-- **`V4` `(*ptr).0` Through a Misaligned Pointer Is UB**: the pointee
+`np::PairU32Binder` requires 4-byte alignment; a pointer at address `257` into
+the 8-byte allocation at `256` keeps field `0` in bounds (`[257, 261)`), and the
+write `(*ptr).0 = 99` is UB, in basic and in `treeBorrows = true` mode. -/
+theorem lm_np_v4_deref_field_misaligned_ub_witness :
+    let oddPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid1 (npBase1 + 1) retagParentTag)))
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefFstMir) 8
+      (mkNpPairDerefPtrState npV4PairDerefFstMir (hooksTwoNodeTree .unique) oddPtr false)) =
+      .ub ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefFstMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefFstMir (hooksTwoNodeTree .unique) oddPtr false)) =
+      .ub := by
+  refine ⟨by decide +kernel, by decide +kernel⟩
+
+/-- **Tree Borrows Read Check on the 8-Byte Two-Node Tree** (`hooksTwoNodeTree perm`:
+root `retagParentTag`, child `retagChildTag` with accessed permission `perm` on
+`[0, 8)`), for the read of bytes `[4, 8)`:
+1. a read through the child tag is permitted for every permission except
+   `.disabled`, exactly as Trusted rejects a dereferencing read only through a
+   `.disabled` borrow;
+2. a read through the parent tag is a foreign read for the child: it is
+   rejected when the child is a protected `.unique` tag, and permitted when the
+   child is unprotected `.unique`, protected `.frozen`, or protected `.cell`;
+3. a tag that is not registered in the tree is rejected, and a zero-sized read
+   is permitted even through such a tag. -/
+theorem npTreeBorrowsReadPermitted_perm_table (perm : TreeBorrowPerm) :
+    npTreeBorrowsReadPermitted {} (hooksTwoNodeTree perm) retagChildTag 4 4 =
+      (match perm with
+       | .disabled => false
+       | _ => true) ∧
+    npTreeBorrowsReadPermitted (hooksForChildProtected true).protectedTags
+      (hooksTwoNodeTree .unique) retagParentTag 4 4 = false ∧
+    npTreeBorrowsReadPermitted {} (hooksTwoNodeTree .unique) retagParentTag 4 4 = true ∧
+    npTreeBorrowsReadPermitted (hooksForChildProtected true).protectedTags
+      (hooksTwoNodeTree .frozen) retagParentTag 4 4 = true ∧
+    npTreeBorrowsReadPermitted (hooksForChildProtected true).protectedTags
+      (hooksTwoNodeTree .cell) retagParentTag 4 4 = true ∧
+    npTreeBorrowsReadPermitted {} (hooksTwoNodeTree .unique) ⟨999, by decide⟩ 4 4 = false ∧
+    npTreeBorrowsReadPermitted {} (hooksTwoNodeTree .unique) ⟨999, by decide⟩ 4 0 = true := by
+  cases perm with
+  | reservedFrz b => cases b <;> decide +kernel
+  | _ => decide +kernel
+
+/-- **`V4` `(*ptr).1.unwrapUnsafeBinder` Under `Frozen` / `Disabled` / `Cell` Tags**
+(8-byte `hooksTwoNodeTree perm` on the pointee, stepped through unmodified
+vendored `Miri.Interpreter.Step.step`; `ptr` carries the child tag unless noted):
+1. `.frozen`: in `treeBorrows = true` the write is UB and the read returns `11`;
+2. `.disabled`: in `treeBorrows = true` the read is UB (the read check added to
+   the `(*ptr).field` operand path) and the write is UB; in basic mode the read
+   returns `11`;
+3. `.cell`: in `treeBorrows = true` a write through the child tag is accepted
+   and read back (`99`);
+4. foreign write through the parent tag over a protected child: accepted (`99`)
+   when the child is `.cell` (interior mutability does not disable the protected
+   tag), UB when the child is `.unique`;
+5. foreign read through the parent tag: UB when the child is a protected
+   `.unique` tag, `11` when it is unprotected. -/
+theorem lm_np_v4_deref_field_tb_frozen_disabled_cell_witness :
+    let childPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid1 npBase1 retagChildTag)))
+    let parentPtr : Miri.Interpreter.LocalValue AnnealProv :=
+      .live (.immediate (.scalar (npPtrScalarTagged npAid1 npBase1 retagParentTag)))
+    -- 1. `.frozen` child tag
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .frozen) childPtr
+        false)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .frozen) childPtr
+        false)) = .u32Val 11 ∧
+    -- 2. `.disabled` child tag
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .disabled) childPtr
+        false)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows read conflict on dereferenced field place") ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .disabled) childPtr
+        false)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir false) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .disabled) childPtr
+        false)) = .u32Val 11 ∧
+    -- 3. `.cell` child tag: child write accepted
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .cell) childPtr
+        false)) = .u32Val 99 ∧
+    -- 4. Foreign write through the parent tag over a protected child
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .cell) parentPtr
+        true)) = .u32Val 99 ∧
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndUnwrapMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndUnwrapMir (hooksTwoNodeTree .unique) parentPtr
+        true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows write conflict on unwrapUnsafeBinder place") ∧
+    -- 5. Foreign read through the parent tag
+    (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) parentPtr
+        true)).map (·.2) =
+      .error (.undefinedBehavior "Tree Borrows read conflict on dereferenced field place") ∧
+    npToObs (runMiriSteps (annealStepHooksNullaryPtr npV4PairDerefSndReadMir true) 8
+      (mkNpPairDerefPtrState npV4PairDerefSndReadMir (hooksTwoNodeTree .unique) parentPtr
+        false)) = .u32Val 11 := by
+  refine ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+          by decide +kernel, by decide +kernel⟩
 
 /-- **`V4` Zero-Sized (`()`) `UnwrapUnsafeBinder` Write 3-Layer Boundary
 (`DIV-LM-UNWRAP-ZST-WRITE`)**: separates the exact semantics across all three

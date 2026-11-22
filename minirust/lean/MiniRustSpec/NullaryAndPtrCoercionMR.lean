@@ -3299,6 +3299,141 @@ theorem np_v4_pair_subrange_disjoint_and_deref_field_three_way_witness :
    by decide +kernel, by decide +kernel,
    ok_of_map_toOption (by decide +kernel), by decide +kernel⟩
 
+/-! ### `(*ptr).field` through `Frozen` / `Disabled` / `Cell` tags, and a caller-frame pointee -/
+
+/-- Trusted fixture reading the nested place: `_0 = (*_1).1.unwrapUnsafeBinder`. -/
+def npV4PairDerefSndReadMir : CapturedMir :=
+  mkMirBody "np::w_v4_pair_deref_snd_read"
+    [mkDecl u32MirTy, mkDecl npRawMutPairU32BinderMirTy, mkDecl npPairU32BinderMirTy] 1
+    [mkBb [mkSt (.assign (locPlace 0)
+             (.use (.copy (locPlace 1 [.deref, .field 1 u32MirTy, .unwrapUnsafeBinder u32MirTy]))))]
+      .return_]
+    npSubrangeLayouts
+
+/-- `npPairDerefTrustedInit` with the permission of the pointer's own borrow
+(tag `1`) and of the child borrow on `_2.0` (tag `2`, `[0, 4)`) as parameters;
+`npPairDerefTrustedInitPerms body .unique .unique p` is `npPairDerefTrustedInit body p`. -/
+def npPairDerefTrustedInitPerms (body : CapturedMir) (ptrPerm childPerm : TreeBorrowPerm)
+    (protectedMode : Bool) : MachineState :=
+  let bPtr : BorrowEntry :=
+    { tag := 1, targetLocal := 2, targetProjection := [], perm := ptrPerm,
+      rangeOffset := 0, rangeLen := 0, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  let bProt : BorrowEntry :=
+    { tag := 2, targetLocal := 2, targetProjection := [.field 0 u32MirTy], perm := childPerm,
+      rangeOffset := 0, rangeLen := 4,
+      protector := if protectedMode then some 1 else none,
+      parentTag := some 1, targetFrameDepth := 0, allocDead := false }
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8),
+                          .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨11, 4⟩])] },
+    memory := { (initMachineState body []).memory with
+      borrows := [bPtr, bProt],
+      activeProtectors := if protectedMode then [1] else [] } }
+
+/-- **V4 `(*ptr).field` Under `Frozen` / `Disabled` / `Cell` Borrows on Trusted**:
+1. pointer borrow `.frozen`: the write `(*ptr).0 = 99` is `.ub`, the read
+   `(*ptr).1.unwrapUnsafeBinder` returns `11`;
+2. pointer borrow `.disabled`: the read and the write are both `.ub`;
+3. protected child borrow on `[0, 4)`: the foreign write `(*ptr).0 = 99` through
+   the parent pointer is accepted (`99`) when the child is `.cell` (interior
+   mutability), and `.ub` when the child is `.unique`. -/
+theorem np_v4_deref_field_frozen_disabled_cell_trusted_witness :
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefFstMir
+      (npPairDerefTrustedInitPerms npV4PairDerefFstMir .frozen .unique false) = .ub ∧
+    npRunTrusted npV4PairDerefSndReadMir 16
+      (npPairDerefTrustedInitPerms npV4PairDerefSndReadMir .frozen .unique false) = .u32Val 11 ∧
+    npRunTrusted npV4PairDerefSndReadMir 16
+      (npPairDerefTrustedInitPerms npV4PairDerefSndReadMir .disabled .unique false) = .ub ∧
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefFstMir
+      (npPairDerefTrustedInitPerms npV4PairDerefFstMir .disabled .unique false) = .ub ∧
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefFstMir
+      (npPairDerefTrustedInitPerms npV4PairDerefFstMir .unique .cell true) = .u32Val 99 ∧
+    npRunTrustedTwoStmtsLoc0 npV4PairDerefFstMir
+      (npPairDerefTrustedInitPerms npV4PairDerefFstMir .unique .unique true) = .ub :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   by decide +kernel, by decide +kernel⟩
+
+/-- **MiniRust Tree Borrows Ground Truth for `Frozen` / `Disabled` (Episode 1)**:
+on `TreeBorrowsMemory`, a local write through a `Frozen` tag and a local read
+through a `Disabled` tag are UB. This is a memory-model statement; it is not
+stepped through an `unwrapUnsafeBinder` place. -/
+abbrev np_tb_frozen_write_and_disabled_read_ub_minirust :=
+  @MiniRustSpec.Correspondence.RefWitness.treeBorrowsFrozenAndDisabledUb
+
+/-- **Protected `UnsafeCell` Interior Mutability, Three-Way (Episode 1)**: under
+a function-entry protector on `&UnsafeCell<u32>`, an interior write through a
+raw pointer returns `77` on Trusted (with `MirNoUBTree`), `Mach`, and `MachTB`.
+The fixture writes through a raw pointer to the cell's field, not through an
+`unwrapUnsafeBinder` place. -/
+abbrev np_tb_protected_unsafeCell_interior_mut_three_way :=
+  @MiniRustSpec.Correspondence.TbWitness.unsafeCellProtectedInteriorMut_simulation
+
+/-- Caller body for the caller-frame pointee fixture: `_1` is the pointee
+`np::PairU32Binder`, `_0` receives the callee's return value, and block `1`
+(the call's return target) returns `_0`. Block `0` stands for the call site,
+which has already executed when the callee state starts. -/
+def npPairCallerMir : CapturedMir :=
+  mkMirBody "np::w_pair_caller" [mkDecl u32MirTy, mkDecl npPairU32BinderMirTy] 0
+    [mkBb [] .return_, mkBb [] .return_]
+    npSubrangeLayouts
+
+/-- Trusted callee state at frame depth `1` whose pointee lives in the suspended
+caller frame (depth `0`, caller local `_1 = { fst: 7, snd: 11 }`): the callee's
+`_1` holds a pointer with tag `1` to the caller's `_1`, and child borrow tag `2`
+protects only the caller's `_1.0` (`[0, 4)`) when `protectedMode = true`. Both
+borrows record `targetFrameDepth := 0`. -/
+def npPairDerefCallerFrameTrustedInit (body : CapturedMir) (protectedMode : Bool) :
+    MachineState :=
+  let callerSaved : SavedCallerFrame :=
+    { callerBody := npPairCallerMir,
+      frame := { blockIdx := 0, stmtIdx := 0,
+                 locals := [.uninit, .init (.aggregate 0 [.scalar ⟨7, 4⟩, .scalar ⟨11, 4⟩])] },
+      destination := locPlace 0, returnTarget := 1 }
+  let bPtr : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetProjection := [], perm := .unique,
+      rangeOffset := 0, rangeLen := 0, protector := none, parentTag := none,
+      targetFrameDepth := 0, allocDead := false }
+  let bProt : BorrowEntry :=
+    { tag := 2, targetLocal := 1, targetProjection := [.field 0 u32MirTy], perm := .unique,
+      rangeOffset := 0, rangeLen := 4,
+      protector := if protectedMode then some 1 else none,
+      parentTag := some 1, targetFrameDepth := 0, allocDead := false }
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .uninit] },
+    memory := { (initMachineState body []).memory with
+      callStack := [callerSaved],
+      borrows := [bPtr, bProt],
+      activeProtectors := if protectedMode then [1] else [] } }
+
+/-- **V4 Caller-Frame Pointee: Full Run Through `TerminatorKind.return_`**. With
+the pointee in the suspended caller frame (`targetFrameDepth = 0`, active depth
+`1`), the callee's `return_` deallocates only depth-`1` locals, so the protected
+`[0, 4)` borrow does not block it; control returns to the caller, which returns
+the value:
+1. `(*ptr).1.unwrapUnsafeBinder = 99` (disjoint `[4, 8)`) runs to `99`, with and
+   without the protector;
+2. `(*ptr).0 = 99` (the protected `[0, 4)`) is `.ub` with the protector and
+   runs to `99` without it;
+3. contrast (`DIV-MR-TB-FNENTRY-LOCAL-DEALLOC`): with the pointee in the
+   returning frame itself (`npPairDerefTrustedInit`), the same disjoint write
+   succeeds but the full run is `.ub` at `return_`, which is why
+   `np_v4_pair_subrange_disjoint_and_deref_field_three_way_witness` observes the
+   two statements only. -/
+theorem np_v4_pair_deref_caller_frame_full_return_witness :
+    npRunTrusted npV4PairDerefSndUnwrapMir 16
+      (npPairDerefCallerFrameTrustedInit npV4PairDerefSndUnwrapMir true) = .u32Val 99 ∧
+    npRunTrusted npV4PairDerefSndUnwrapMir 16
+      (npPairDerefCallerFrameTrustedInit npV4PairDerefSndUnwrapMir false) = .u32Val 99 ∧
+    npRunTrusted npV4PairDerefFstMir 16
+      (npPairDerefCallerFrameTrustedInit npV4PairDerefFstMir true) = .ub ∧
+    npRunTrusted npV4PairDerefFstMir 16
+      (npPairDerefCallerFrameTrustedInit npV4PairDerefFstMir false) = .u32Val 99 ∧
+    npRunTrusted npV4PairDerefSndUnwrapMir 16
+      (npPairDerefTrustedInit npV4PairDerefSndUnwrapMir true) = .ub :=
+  ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+   by decide +kernel⟩
+
 /-! ## §6. Canonical Executable MiniRust Corpus Observation Interface
 
 Directly executes `MiniRustSpec.Interp.{steps, stepsTB}` for all 4 MIR
