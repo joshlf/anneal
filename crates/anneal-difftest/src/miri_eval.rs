@@ -4575,6 +4575,13 @@ fn miri_sysroot_has_core_rlib(sysroot: &Path) -> bool {
     false
 }
 
+/// Matches `cargo_anneal::miri_oracle::non_empty_env_str` for
+/// `ANNEAL_MIRI_SYSROOT`: non-UTF-8 or whitespace-only values count as unset.
+fn is_operator_supplied_miri_sysroot(raw: Option<&std::ffi::OsStr>) -> bool {
+    raw.and_then(|v| v.to_str())
+        .is_some_and(|s| !s.trim().is_empty())
+}
+
 /// Serializes `MiriToolchain::resolve(None, None, None)` across both threads in
 /// this process and concurrent processes via advisory file locks, and waits on
 /// `<sysroot>/.setup.lock` + verifies `libcore*.rlib` exists so parallel
@@ -4606,7 +4613,8 @@ fn resolve_miri_toolchain_safe() -> Result<MiriToolchain, String> {
     let toolchain = MiriToolchain::resolve(None, None, None)?;
     // An `ANNEAL_MIRI_SYSROOT` override belongs to the operator: `resolve` never
     // provisions it, so it is only checked here, never locked or rebuilt.
-    let operator_supplied = env::var_os("ANNEAL_MIRI_SYSROOT").is_some_and(|v| !v.is_empty());
+    let operator_supplied =
+        is_operator_supplied_miri_sysroot(env::var_os("ANNEAL_MIRI_SYSROOT").as_deref());
     // If an external process is currently running `cargo miri setup` on the
     // auto-provisioned sysroot, wait for it to release `<sysroot>/.setup.lock`.
     let setup_lock = if operator_supplied {
@@ -4623,8 +4631,11 @@ fn resolve_miri_toolchain_safe() -> Result<MiriToolchain, String> {
         let _ = f.lock();
     }
     if !miri_sysroot_has_core_rlib(&toolchain.miri_sysroot) {
-        drop(setup_lock);
+        // Hold `<sysroot>/.setup.lock` across `remove_dir_all` so an external
+        // `cargo-anneal` caller cannot start provisioning mid-delete, then
+        // release it right before `MiriToolchain::resolve` re-acquires it.
         discard_incomplete_miri_sysroot(&toolchain.miri_sysroot, operator_supplied)?;
+        drop(setup_lock);
         let rebuilt = MiriToolchain::resolve(None, None, None)?;
         if !miri_sysroot_has_core_rlib(&rebuilt.miri_sysroot) {
             return Err(format!(
@@ -14377,5 +14388,22 @@ pub fn cand_ep1_b4_rename() -> u32 {
         // Nothing left to discard is not an error.
         discard_incomplete_miri_sysroot(&tmp, false).expect("idempotent");
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn operator_supplied_miri_sysroot_matches_trimmed_utf8_env_rules() {
+        use std::ffi::OsStr;
+        assert!(!is_operator_supplied_miri_sysroot(None));
+        assert!(!is_operator_supplied_miri_sysroot(Some(OsStr::new(""))));
+        assert!(!is_operator_supplied_miri_sysroot(Some(OsStr::new("   \t\n"))));
+        assert!(is_operator_supplied_miri_sysroot(Some(OsStr::new("/custom/miri"))));
+        assert!(is_operator_supplied_miri_sysroot(Some(OsStr::new("  /custom/miri  "))));
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(!is_operator_supplied_miri_sysroot(Some(OsStr::from_bytes(
+                b"\xff\xfe"
+            ))));
+        }
     }
 }

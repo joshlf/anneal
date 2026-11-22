@@ -3987,6 +3987,159 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertTrue(all(p.is_file() for p in miri.values()))
             self.assertEqual(suite.clean_stale_oleans(root), [])
 
+    def test_clean_stale_oleans_removes_module_with_missing_local_dependency(self) -> None:
+        # Regression: a build trace in `<lake_root>/.lake/build/lib/lean/` recording a direct
+        # import of a local workspace library whose `.olean` is absent (e.g. a leftover
+        # downstream `.olean` after a prior partial clean or another branch's build) must be
+        # removed along with its transitive importers, while missing stdlib (`Init.*`) entries
+        # are never treated as stale.
+        t_built = 1_700_000_000.0
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "lakefile.toml").write_text(
+                '[[lean_lib]]\nname = "Trusted"\nsrcDir = "trusted/lean"\n'
+                '[[lean_lib]]\nname = "Anneal"\nsrcDir = "theory"\n',
+                encoding="utf-8",
+            )
+            lib = root / ".lake/build/lib/lean"
+            zombie = self._write_lake_module_with_hashes(
+                lib,
+                "Anneal/MirFuelFree",
+                {".olean": "1111111111111111"},
+                t_built,
+                imports={
+                    "Anneal/Lower": "2222222222222222",
+                    "Init/Prelude": "3333333333333333",
+                },
+            )
+            top = self._write_lake_module_with_hashes(
+                lib,
+                "Anneal/Top",
+                {".olean": "4444444444444444"},
+                t_built + 10,
+                imports={"Anneal/MirFuelFree": self._classic_import_all_arts("1111111111111111")},
+            )
+            stdlib_only = self._write_lake_module_with_hashes(
+                lib,
+                "Anneal/Keep",
+                {".olean": "5555555555555555"},
+                t_built + 10,
+                imports={"Init/Prelude": "3333333333333333"},
+            )
+            removed = set(suite.clean_stale_oleans(root))
+            self.assertEqual(removed, set(zombie.values()) | set(top.values()))
+            self.assertTrue(all(p.is_file() for p in stdlib_only.values()))
+            self.assertEqual(suite.clean_stale_oleans(root), [])
+
+        # Same check without `lakefile.toml` (source-tree fallback) and with a torn dependency
+        # (only `.ilean`, missing `.olean`).
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_file_at(root / "theory/Anneal/Lower.lean", b"def x := 1\n", t_built - 100)
+            lib = root / ".lake/build/lib/lean"
+            torn_ilean = self._write_file_at(lib / "Anneal/Lower.ilean", b"{}", t_built)
+            zombie = self._write_lake_module_with_hashes(
+                lib,
+                "Anneal/Consumer",
+                {".olean": "6666666666666666"},
+                t_built + 10,
+                imports={"Anneal/Lower": "7777777777777777"},
+            )
+            self.assertEqual(set(suite.clean_stale_oleans(root)), set(zombie.values()))
+            self.assertTrue(torn_ilean.is_file())
+
+    def test_read_private_regular_file_handles_short_reads_growth_and_rule1_fifo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sample = root / "trace.json"
+            payload = b"0123456789abcdef"
+            sample.write_bytes(payload)
+
+            # POSIX short read: multiple chunks assembling `expected` bytes succeed.
+            real_read = os.read
+            reads: list[int] = []
+
+            def chunked_read(fd: int, n: int) -> bytes:
+                reads.append(n)
+                return real_read(fd, min(n, 4))
+
+            with mock.patch("os.read", side_effect=chunked_read):
+                got = suite._read_private_regular_file(os.fspath(sample))
+            self.assertIsNotNone(got)
+            assert got is not None
+            self.assertEqual(got[0], payload)
+            self.assertGreaterEqual(len(reads), 4)
+
+            # Concurrent growth past `st_size` is detected and rejected rather than truncated.
+            appended = False
+
+            def growing_read(fd: int, n: int) -> bytes:
+                nonlocal appended
+                if not appended:
+                    appended = True
+                    with open(sample, "ab") as fh:
+                        fh.write(b"EXTRA")
+                return real_read(fd, n)
+
+            with mock.patch("os.read", side_effect=growing_read):
+                self.assertIsNone(suite._read_private_regular_file(os.fspath(sample)))
+
+            # Rule 1 (`_lake_records_prove_source_unchanged`) never blocks on a FIFO `.trace`
+            # or `.olean.hash`.
+            t_old, t_new = 1_700_000_000.0, 1_700_000_200.0
+            src = self._write_file_at(root / "theory/Anneal/Fifo.lean", b"def f := 1\n", t_new)
+            lib = root / ".lake/build/lib/lean/Anneal"
+            lib.mkdir(parents=True)
+            olean = self._write_file_at(lib / "Fifo.olean", b"art", t_old)
+            fifo_trace = lib / "Fifo.trace"
+            os.mkfifo(fifo_trace)
+            self.assertFalse(
+                suite._lake_records_prove_source_unchanged(
+                    "Anneal/Fifo",
+                    {".olean": os.fspath(olean), ".trace": os.fspath(fifo_trace)},
+                    os.fspath(src),
+                    os.stat(src).st_mtime_ns,
+                )
+            )
+
+    def test_probe_ram_ceiling_honors_cgroup_v2_memory_high_and_rejects_escapes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            meminfo = root / "meminfo"
+            meminfo.write_text(
+                "MemTotal:       67108864 kB\nMemAvailable:   52428800 kB\n",
+                encoding="utf-8",
+            )
+            cg_root = root / "cgroup"
+            leaf = cg_root / "user.slice/anneal.scope"
+            leaf.mkdir(parents=True)
+            (cg_root / "memory.max").write_text("max\n", encoding="utf-8")
+            (cg_root / "user.slice/memory.max").write_text("max\n", encoding="utf-8")
+            (leaf / "memory.max").write_text("max\n", encoding="utf-8")
+            (leaf / "memory.high").write_text(str(6144 * 1024 * 1024) + "\n", encoding="utf-8")
+            proc_cg = root / "proc_cg"
+            proc_cg.write_text("0::/user.slice/anneal.scope\n", encoding="utf-8")
+            self.assertEqual(
+                suite._probe_effective_ram_ceiling_mib(
+                    proc_meminfo=meminfo, proc_self_cgroup=proc_cg, cgroup_root=cg_root
+                ),
+                6144,
+            )
+
+            # Symlink escape, NUL byte in cgroup path, and FIFO `memory.max` are safely ignored.
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "memory.max").write_text(str(128 * 1024 * 1024) + "\n", encoding="utf-8")
+            (cg_root / "escape").symlink_to(outside)
+            self.assertIsNone(suite._safe_cgroup_subpath(cg_root, "/escape"))
+            self.assertIsNone(suite._safe_cgroup_subpath(cg_root, "/user.slice/\x00bad"))
+            fifo_lim = leaf / "memory.fifo"
+            os.mkfifo(fifo_lim)
+            self.assertIsNone(suite._parse_cgroup_memory_limit_mib(fifo_lim))
+            link_lim = leaf / "memory.link"
+            link_lim.symlink_to(outside / "memory.max")
+            self.assertIsNone(suite._parse_cgroup_memory_limit_mib(link_lim))
+
     def test_probe_ram_ceiling_and_lean_miri_spec_single_thread_right_sizing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

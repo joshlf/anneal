@@ -1235,8 +1235,8 @@ TRACKED_CORRESPONDENCE_DIVERGENCES: list[dict[str, str]] = [
         "resolution_pin_file": UNTESTED_VARIANT_TEST_FILE,
         "file": UNTESTED_VARIANT_TEST_FILE,
         "anneal_component": "Trusted.Rustc.V2026_06_01.MirSemantics.Places",
-        "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
-        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) fault with UB, and Deinit((_l as T)) leaves _l as LocalSlot.init Value.uninit where Deinit(_l) stores LocalSlot.uninit. Latent: MirPhase::Runtime forbids OpaqueCast.",
+        "switch_to_pass_criterion": "Strip leading/bare ProjectionElem.opaqueCast before the root-vs-projected dispatch in evalOperand (.move), writePlaceValue, evalStmt (.assign / .deinit / .setDiscriminant), and uninitFieldWriteShell?, so (_l as T) and (_l as T).f behave like their post-borrowck erasures _l and _l.f.",
+        "summary": "A bare (_l as T) place takes Trusted's projected path while its erasure _l takes the root path, and uninitFieldWriteShell? returns none on a leading .opaqueCast: move keeps _l initialized, writes/assignments to an uninitialized _l (including (_l as T).f = v) and SetDiscriminant((_l as T), vIdx) on an uninitialized enum fault with UB, and Deinit((_l as T)) leaves _l as LocalSlot.init Value.uninit where Deinit(_l) stores LocalSlot.uninit. Latent: MirPhase::Runtime forbids OpaqueCast.",
     },
     {
         "id": "MODEL-LM-TAILCALL-MODULAR-ROOT",
@@ -5181,13 +5181,22 @@ def _resolve_anneal_lean_run(
 
 
 def _parse_cgroup_memory_limit_mib(path: Path, *, max_sentinel_bytes: int = 1 << 60) -> int | None:
-    """Read a cgroup memory limit file (`memory.max` or `memory.limit_in_bytes`)
-    returning the ceiling in MiB, or `None` if absent, unreadable, `"max"`, or
-    an unbounded kernel sentinel."""
+    """Read a cgroup memory limit file (`memory.max`, `memory.high`, or
+    `memory.limit_in_bytes`) returning the ceiling in MiB, or `None` if absent,
+    unreadable, non-regular/symlink, `"max"`, or an unbounded kernel sentinel."""
     try:
-        raw = path.read_text(encoding="utf-8", errors="replace").strip()
+        fd = os.open(os.fspath(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        raw = os.read(fd, 128).decode("utf-8", errors="replace").strip()
     except OSError:
         return None
+    finally:
+        os.close(fd)
     if not raw or raw == "max":
         return None
     try:
@@ -5201,14 +5210,29 @@ def _parse_cgroup_memory_limit_mib(path: Path, *, max_sentinel_bytes: int = 1 <<
 
 def _safe_cgroup_subpath(cgroup_root: Path, raw_rel: str) -> Path | None:
     """Join a `/proc/self/cgroup` relative path onto `cgroup_root` without
-    allowing `..` traversal outside `cgroup_root`."""
+    allowing `..`, NUL bytes, or symlink traversal outside `cgroup_root`."""
+    if "\x00" in raw_rel:
+        return None
     rel = raw_rel.strip().lstrip("/")
     if not rel:
         return cgroup_root
     parts = [p for p in rel.split("/") if p and p != "."]
     if any(p == ".." for p in parts):
         return None
-    return cgroup_root.joinpath(*parts)
+    cand = cgroup_root.joinpath(*parts)
+    try:
+        root_real = os.path.realpath(cgroup_root)
+        # Walk down checking existing prefix components for symlink escapes.
+        cur = cgroup_root
+        for part in parts:
+            cur = cur / part
+            if cur.is_symlink():
+                target_real = os.path.realpath(cur)
+                if target_real != root_real and not target_real.startswith(root_real + os.sep):
+                    return None
+    except (OSError, ValueError):
+        return None
+    return cand
 
 
 def _probe_effective_ram_ceiling_mib(
@@ -5221,8 +5245,8 @@ def _probe_effective_ram_ceiling_mib(
 
     Takes the minimum finite MiB bound across:
     - Host `/proc/meminfo` `MemTotal` and `MemAvailable` (kB -> MiB),
-    - Cgroup v2 `memory.max` walked upward from the process's `0::` hierarchy
-      to `cgroup_root` (ignoring `"max"` and unbounded sentinels),
+    - Cgroup v2 `memory.max` and `memory.high` walked upward from the process's
+      `0::` hierarchy to `cgroup_root` (ignoring `"max"` and unbounded sentinels),
     - Cgroup v1 `memory.limit_in_bytes` walked upward from any `:memory:`
       hierarchy under `cgroup_root / "memory"` (if present).
 
@@ -5259,9 +5283,10 @@ def _probe_effective_ram_ceiling_mib(
     if v2_rel is not None and cgroup_root.is_dir():
         cur = _safe_cgroup_subpath(cgroup_root, v2_rel)
         while cur is not None:
-            lim = _parse_cgroup_memory_limit_mib(cur / "memory.max", max_sentinel_bytes=1 << 60)
-            if lim is not None:
-                candidates_mib.append(lim)
+            for cg_file in ("memory.max", "memory.high"):
+                lim = _parse_cgroup_memory_limit_mib(cur / cg_file, max_sentinel_bytes=1 << 60)
+                if lim is not None:
+                    candidates_mib.append(lim)
             if cur == cgroup_root:
                 break
             parent = cur.parent
@@ -5488,6 +5513,39 @@ def _private_regular_file_stat(path: str) -> os.stat_result | None:
     return st if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 else None
 
 
+def _read_private_regular_file(path: str) -> tuple[bytes, int] | None:
+    """`(content, st_mtime_ns)` of `path` if it is a regular file with a single hard link
+    (see `_private_regular_file_stat`), else `None`. Never follows a symlink at `path`,
+    never blocks on a FIFO there, handles POSIX short reads, and rejects files that grow
+    or shrink while being read."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            return None
+        expected = st.st_size
+        chunks: list[bytes] = []
+        total = 0
+        # Read up to `expected + 1` bytes so both short reads and concurrent growth are caught.
+        while total <= expected:
+            chunk = os.read(fd, max(1, expected + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        if total != expected:
+            return None
+        data = b"" if not chunks else (chunks[0] if len(chunks) == 1 else b"".join(chunks))
+        return data, st.st_mtime_ns
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
 def _lake_records_prove_source_unchanged(
     rel_mod: str, arts: Mapping[str, str], src_path: str, src_mtime_ns: int
 ) -> bool:
@@ -5511,16 +5569,11 @@ def _lake_records_prove_source_unchanged(
       the trace must not be older than the source.
     """
     trace_path = arts.get(".trace")
-    if trace_path is None:
+    trace = None if trace_path is None else _read_private_regular_file(trace_path)
+    if trace is None:
         return False
-    trace_st = _private_regular_file_stat(trace_path)
-    if trace_st is None:
-        return False
-    try:
-        with open(trace_path, encoding="utf-8", errors="replace") as fh:
-            recorded = _lake_trace_recorded_hashes(fh.read(), rel_mod)
-    except OSError:
-        return False
+    trace_bytes, trace_mtime_ns = trace
+    recorded = _lake_trace_recorded_hashes(trace_bytes.decode("utf-8", errors="replace"), rel_mod)
     if recorded is None:
         return False
     src_hash, olean_hashes = recorded
@@ -5528,47 +5581,24 @@ def _lake_records_prove_source_unchanged(
         return False
     for suffix, content_hash in olean_hashes.items():
         sidecar_path = arts.get(f"{suffix}.hash")
-        if sidecar_path is None:
+        sidecar = None if sidecar_path is None else _read_private_regular_file(sidecar_path)
+        if sidecar is None:
             return False
-        sidecar_st = _private_regular_file_stat(sidecar_path)
-        if sidecar_st is None:
-            return False
+        sidecar_bytes, sidecar_mtime_ns = sidecar
         try:
-            if sidecar_st.st_mtime_ns < os.stat(arts[suffix]).st_mtime_ns:
+            if sidecar_mtime_ns < os.stat(arts[suffix]).st_mtime_ns:
                 return False
-            with open(sidecar_path, encoding="ascii", errors="replace") as fh:
-                if fh.read(64).strip() != content_hash:
-                    return False
         except OSError:
             return False
+        if sidecar_bytes[:64].decode("ascii", errors="replace").strip() != content_hash:
+            return False
     if src_hash is None:
-        return trace_st.st_mtime_ns >= src_mtime_ns
+        return trace_mtime_ns >= src_mtime_ns
     try:
         with open(src_path, "rb") as fh:
             return _lake_text_hash_hex(fh.read()) == src_hash
     except OSError:
         return False
-
-
-def _read_private_regular_file(path: str) -> tuple[bytes, int] | None:
-    """`(content, st_mtime_ns)` of `path` if it is a regular file with a single hard link
-    (see `_private_regular_file_stat`), else `None`. Never follows a symlink at `path`,
-    never blocks on a FIFO there, and costs four system calls."""
-    try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    except OSError:
-        return None
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            return None
-        data = os.read(fd, st.st_size) if st.st_size else b""
-        # A file that changed size under the read is being rewritten: no evidence.
-        return (data, st.st_mtime_ns) if len(data) == st.st_size else None
-    except OSError:
-        return None
-    finally:
-        os.close(fd)
 
 
 def _lake_trace_import_art_hashes(trace: bytes) -> dict[str, str]:
@@ -5857,10 +5887,28 @@ def clean_stale_oleans(repo_root: Path) -> list[Path]:
 
         recorded_ns: dict[str, int | None] = {}
         current_hex: dict[str, str | None] = {}
+        missing_local_dep: dict[str, bool] = {}
         for rel_mod, (trace_ns, imports) in dep_edges.items():
             for dep_mod, recorded_hex in imports.items():
+                if dep_mod in stale:
+                    stale.add(rel_mod)
+                    break
                 dep_arts = modules.get(dep_mod)
-                if dep_arts is None or dep_mod in stale:
+                if dep_arts is None or ".olean" not in dep_arts:
+                    is_local = missing_local_dep.get(dep_mod)
+                    if is_local is None:
+                        dep_top = dep_mod.partition("/")[0]
+                        if by_lib:
+                            is_local = dep_top in by_lib
+                        else:
+                            is_local = (
+                                dep_top not in ("Init", "Std", "Lean", "Lake")
+                                and _find_lean_source_for_module(dep_mod, by_lib, fallbacks) is not None
+                            )
+                        missing_local_dep[dep_mod] = is_local
+                    if is_local:
+                        stale.add(rel_mod)
+                        break
                     continue
                 if dep_mod not in recorded_ns:
                     recorded_ns[dep_mod] = _lean_import_all_arts_recorded_ns(dep_arts)

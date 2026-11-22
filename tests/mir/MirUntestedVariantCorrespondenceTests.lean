@@ -3471,9 +3471,12 @@ differ observably from their post-borrowck erasure:
   field `i`;
 * `Deinit((_l as T))` on a non-union initialized local stores `LocalSlot.init Value.uninit`
   (while invalidating borrows at the whole local); `Deinit(_l)` stores `LocalSlot.uninit`
-  — strictly distinct slot representations (`LocalSlot.init Value.uninit ≠ LocalSlot.uninit`) —
-  whereas `SetDiscriminant((_l as T), vIdx)` on an initialized aggregate with `decls = []`
-  agrees with `SetDiscriminant(_l, vIdx)` (both fail closed with `.ub`).
+  — strictly distinct slot representations (`LocalSlot.init Value.uninit ≠ LocalSlot.uninit`);
+* `SetDiscriminant((_l as T), vIdx)` agrees non-degenerately (both step to the same state)
+  with `SetDiscriminant(_l, vIdx)` on any initialized enum aggregate without `.uninit`
+  fields when the cast preserves the resolved type and touches no union, whereas on an
+  uninitialized enum local (`LocalSlot.uninit`) `SetDiscriminant((_l as T), vIdx)` faults
+  with `.ub` while `SetDiscriminant(_l, vIdx)` initializes the enum shell and steps.
 Unreachable for captured bodies (`MirPhase::Runtime` forbids `OpaqueCast`,
 `opaqueCast_leanMiri_phase_boundary`); tracked as `DIV-TR-OPAQUECAST-ROOT-DISPATCH` in
 `scripts/run_nightly_verification_suite.py`. -/
@@ -3529,10 +3532,40 @@ theorem opaqueCast_trusted_root_dispatch_divergence
                 (length s.memory.callStack) }) ∧
         evalStmt s ⟨.deinit ⟨l, [.opaqueCast t]⟩, span⟩ decls layouts ≠
           evalStmt s ⟨.deinit ⟨l, []⟩, span⟩ decls layouts) ∧
-    (∀ (s : MachineState) (oldVi vIdx : VariantIdx) (fields : List Value) (span : String),
+    ((∀ (s : MachineState) (decls : List LocalDecl) (oldVi vIdx : VariantIdx)
+        (fields fields' : List Value) (span : String),
       get? s.frame.locals l = some (.init (.aggregate oldVi fields)) →
-      evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ [] layouts =
-        evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ [] layouts) := by
+      valueContainsUninit (.aggregate oldVi fields) = false →
+      placeTyResolved decls layouts ⟨l, [.opaqueCast t]⟩ = placeTyResolved decls layouts ⟨l, []⟩ →
+      placeTouchesUnion decls layouts ⟨l, [.opaqueCast t]⟩ = false →
+      padSetDiscriminantInitFields? decls layouts ⟨l, []⟩ vIdx fields = some fields' →
+      validateValueForTy? layouts (placeTy decls layouts ⟨l, [.opaqueCast t]⟩)
+          (.aggregate vIdx fields') = true →
+      evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+          evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts ∧
+        (s.memory.activeProtectors = [] →
+          ∃ locals', set? s.frame.locals l (.init (.aggregate vIdx fields')) = some locals' ∧
+            evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+              MirStepNode.step (advanceStmt s locals'
+                { s.memory with
+                  borrows := invalidateConflictingBorrows s.memory.borrows l none
+                    (length s.memory.callStack) }))) ∧
+     (∀ (s : MachineState) (decls : List LocalDecl) (vIdx : VariantIdx)
+        (uninitFields : List Value) (span : String),
+      get? s.frame.locals l = some .uninit →
+      setDiscriminantUninitDeclOk decls l = true →
+      setDiscriminantUninitPayload? decls layouts l vIdx = some uninitFields →
+      s.memory.activeProtectors = [] →
+      ∃ locals', set? s.frame.locals l (.init (.aggregate vIdx uninitFields)) = some locals' ∧
+        evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+          MirStepNode.fail .ub ∧
+        evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts =
+          MirStepNode.step (advanceStmt s locals'
+            { s.memory with
+              borrows := invalidateConflictingBorrows s.memory.borrows l none
+                (length s.memory.callStack) }) ∧
+        evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts ≠
+          evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts)) := by
   have hrd : ∀ (ls : List LocalSlot) (w : Value), valueContainsUninit w = false →
       readProjectedValue ls w [.opaqueCast t] = .ok w := by
     intro ls w hw
@@ -3624,15 +3657,61 @@ theorem opaqueCast_trusted_root_dispatch_divergence
     simp only [MirStepNode.step, advanceStmt, Option.some.injEq] at hl
     rw [hl, hgetU] at hgetIU
     cases hgetIU
-  · intro s oldVi vIdx fields span hv
-    have hpad1 : padSetDiscriminantInitFields? [] layouts ⟨l, [.opaqueCast t]⟩ vIdx fields = none := by
-      simp [padSetDiscriminantInitFields?, placeTyResolved, get?]
-    have hpad2 : padSetDiscriminantInitFields? [] layouts ⟨l, []⟩ vIdx fields = none := by
-      simp [padSetDiscriminantInitFields?, placeTyResolved, get?]
-    simp only [evalStmt, evalOperand, hv, readProjectedValue, hpad2]
-    cases valueContainsUninit (Value.aggregate oldVi fields) with
-    | true => rfl
-    | false => simp only [hpad1]
+  · refine ⟨?_, ?_⟩
+    · intro s decls oldVi vIdx fields fields' span hv hnoUninit htyR hpu hpad hvalW
+      obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init (.aggregate vIdx fields')) hv
+      have hpadOc : padSetDiscriminantInitFields? decls layouts ⟨l, [.opaqueCast t]⟩ vIdx fields =
+          some fields' := by
+        simpa only [padSetDiscriminantInitFields?, htyR] using hpad
+      have hop : evalOperand s.frame.locals (.copy ⟨l, [.opaqueCast t]⟩) s.memory.borrows
+          s.memory.globals layouts s.memory.callerLocals decls s.memory.callStack =
+          .ok (.aggregate oldVi fields) s.frame.locals := by
+        have hrdAgg := hrd s.frame.locals (.aggregate oldVi fields) hnoUninit
+        simp only [evalOperand, hv, hpu, hrdAgg]
+      have hwp : writePlaceValue s.frame.locals s.memory.borrows ⟨l, [.opaqueCast t]⟩
+          (.aggregate vIdx fields') decls layouts s.memory.callStack =
+          .ok (s.frame.locals.set l (.init (.aggregate vIdx fields'))) := by
+        have hwr : writeProjectedValue s.frame.locals (.aggregate oldVi fields) [.opaqueCast t]
+            (.aggregate vIdx fields') = .ok (.aggregate vIdx fields') := rfl
+        cases decls with
+        | nil => simp only [writePlaceValue, hv, writeProjectedForLocal, hwr, hset]
+        | cons _ _ =>
+          simp only [writePlaceValue, hvalW, hv, writeProjectedForLocal, hpu, hwr, hset]
+      have hrlp : resolveBorrowWriteLocalProj decls layouts s.frame.locals l [.opaqueCast t] =
+          [.opaqueCast t] :=
+        resolveBorrowWriteLocalProj_of_not_union decls layouts s.frame.locals l [.opaqueCast t] hpu
+      have hq : normalizeSubsliceProjections (stripTransparentProjections [.opaqueCast t]) = [] :=
+        rfl
+      have heq :
+          evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+            evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts := by
+        simp only [evalStmt, hop, hv, hpadOc, hpad, evalSetDiscriminantLocal, hset, hrlp, hwp,
+          invalidateAtProj_whole hq]
+        cases hps : s.memory.activeProtectors with
+        | nil =>
+          simp only [hasProtectedWriteConflict_no_prot]
+        | cons ph pt =>
+          simp only [hasProtectedWriteConflict_whole hq]
+      refine ⟨heq, fun hprot => ⟨_, hset, ?_⟩⟩
+      rw [heq]
+      simp only [evalStmt, hv, hpad, evalSetDiscriminantLocal, hset, hprot]
+    · intro s decls vIdx uninitFields span hu hdeclOk hpay hprot
+      obtain ⟨hset, _⟩ := set?_get?_self (LocalSlot.init (.aggregate vIdx uninitFields)) hu
+      have hsdOc :
+          evalStmt s ⟨.setDiscriminant ⟨l, [.opaqueCast t]⟩ vIdx, span⟩ decls layouts =
+            MirStepNode.fail .ub := by
+        simp only [evalStmt, evalOperand, hu]
+      have hsdRoot :
+          evalStmt s ⟨.setDiscriminant ⟨l, []⟩ vIdx, span⟩ decls layouts =
+            MirStepNode.step (advanceStmt s (s.frame.locals.set l (.init (.aggregate vIdx uninitFields)))
+              { s.memory with
+                borrows := invalidateConflictingBorrows s.memory.borrows l none
+                  (length s.memory.callStack) }) := by
+        simp only [evalStmt, hu, hdeclOk, hpay, evalSetDiscriminantLocal, hset, hprot]
+      refine ⟨_, hset, hsdOc, hsdRoot, ?_⟩
+      rw [hsdOc, hsdRoot]
+      intro h
+      simp [MirStepNode.fail, MirStepNode.step] at h
 
 private theorem borrowProjSteps_erase : ∀ p : List ProjectionElem,
     MiniRustSpec.Correspondence.borrowProjSteps (eraseOpaqueCasts p) =
@@ -3774,20 +3853,73 @@ def ocDeinitState (slot : LocalSlot) : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, slot] },
     memory := { borrows := [], nextTag := 7 } }
 
-/-- **Documented type switch (including `.ok` vs `.ub` runtime validity flip).** The opaque
-cast switches `placeTy` (write validation) and `placeTyResolved` (read validation). When an
-array `[u8; 2]` local holding `[2_u8, 0_u8]` is indexed at `0` (`e = .constantIndex 0 1 false`,
-which inherits its element type from the base type), the cast-free read and write of `2_u8`
-succeed at `tyU8`, whereas pre-casting the base via `.opaqueCast tyBoolArr2` switches the
-element type to `bool` (`tyBool`) so `validateValueForTy?` rejects `2` and both
-`evalPlaceRead` and `writePlaceValue` fault with `.ub` — proving the `hty`/`htyR` agreement
-hypotheses of `opaqueCast_trusted_place_rw_with_decls` are necessary even for non-empty
-`e :: r` tails. Likewise for `Deinit`, whose tail is validated at the cast type: on a
-`(u32, u32)` local that is uninitialized (`LocalSlot.uninit`) or holds `Value.uninit`,
+/-- Concrete ADT layouts (`1`: 2-variant enum `{ None, Some(u32) }`; `2`: 2-field struct `Inner2`;
+`3`: 3-field struct `Inner3`; `4`: `OuterA { inner: Inner2 }`; `5`: `OuterB { inner: Inner3 }`)
+used to witness both non-degenerate `SetDiscriminant` behavior and necessity of the root-type
+agreement hypothesis `hroot` in `opaqueCast_trusted_place_rw_with_decls` Clause 4. -/
+def ocAdtLayouts : LayoutTable :=
+  { pointerBits := 64, isLittleEndian := true,
+    entries :=
+      [ u32Layout,
+        { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+          fields := .arbitrary [{ bytes := 0 }] [0],
+          variants := .multiple (.initialized (.int 8 false) ⟨0, 1⟩) 0
+            [.arbitrary [] [], .arbitrary [{ bytes := 4 }] [0]],
+          isUninhabited := false, fieldLayouts := [] },
+        { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+          fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+          variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0] },
+        { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
+          fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }, { bytes := 8 }] [0, 1, 2],
+          variants := .single 0, isUninhabited := false, fieldLayouts := [0, 0, 0] },
+        { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+          fields := .arbitrary [{ bytes := 0 }] [0],
+          variants := .single 0, isUninhabited := false, fieldLayouts := [2] },
+        { size := { bytes := 12 }, align := { bytes := 4 }, backendRepr := .memory,
+          fields := .arbitrary [{ bytes := 0 }] [0],
+          variants := .single 0, isUninhabited := false, fieldLayouts := [3] } ] }
+
+def tyOcEnum : Ty := { kind := .adt "w::OptU32" [], layoutIdx := 1 }
+
+def tyOcInnerUnresolved : Ty := { kind := .adt "w::Inner" [], layoutIdx := 0 }
+
+def tyOcOuterA : Ty := { kind := .adt "w::OuterA" [], layoutIdx := 4 }
+
+def tyOcOuterB : Ty := { kind := .adt "w::OuterB" [], layoutIdx := 5 }
+
+def ocEnumDecl : LocalDecl := { mutability := .mut, ty := tyOcEnum, debugName := some "e" }
+
+def ocOuterADecl : LocalDecl := { mutability := .mut, ty := tyOcOuterA, debugName := some "o" }
+
+def ocNestedPlainPlace : Place := ⟨1, [.field 0 tyOcInnerUnresolved, .field 0 tyU32]⟩
+
+def ocNestedCastPlace : Place :=
+  ⟨1, [.opaqueCast tyOcOuterB, .field 0 tyOcInnerUnresolved, .field 0 tyU32]⟩
+
+def ocNestedState : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .init (.aggregate 0 [.uninit])] },
+    memory := { borrows := [], nextTag := 7 } }
+
+/-- **Documented type switch (including `.ok` vs `.ub` runtime validity flip and `hroot`
+necessity).** The opaque cast switches `placeTy` (write validation) and `placeTyResolved`
+(read validation). When an array `[u8; 2]` local holding `[2_u8, 0_u8]` is indexed at `0`
+(`e = .constantIndex 0 1 false`, which inherits its element type from the base type), the
+cast-free read and write of `2_u8` succeed at `tyU8`, whereas pre-casting the base via
+`.opaqueCast tyBoolArr2` switches the element type to `bool` (`tyBool`) so `validateValueForTy?`
+rejects `2` and both `evalPlaceRead` and `writePlaceValue` fault with `.ub` — proving the
+`hty`/`htyR` agreement hypotheses of `opaqueCast_trusted_place_rw_with_decls` are necessary even
+for non-empty `e :: r` tails. Likewise for `Deinit`, whose tail is validated at the cast type:
+on a `(u32, u32)` local that is uninitialized (`LocalSlot.uninit`) or holds `Value.uninit`,
 `Deinit((_1 as (u32, u32)).0)` steps exactly like `Deinit(_1.0)`, whereas
 `Deinit((_1 as u32).0)` asks `u32` for a field and faults with UB although neither place
 touches a union — the root-type agreement hypothesis of the `Deinit` erasure in
-`opaqueCast_trusted_stmt_placeMention_and_deinit_universal` is necessary. -/
+`opaqueCast_trusted_stmt_placeMention_and_deinit_universal` is necessary. Finally, for nested
+struct initialization `(_1 as OuterB).0.0 = 42` vs `_1.0.0 = 42` on `_1 : OuterA` holding
+`Aggregate 0 [.uninit]`, `placeTy`, `placeTyResolved` (both `some tyU32`), and
+`placeTouchesUnion = false` all agree, yet `ensureNestedFieldShells` materializes a 3-field
+inner shell under `OuterB` vs a 2-field inner shell under `OuterA` (`evalStmt` strictly
+distinct) — proving the `hroot` hypothesis of `opaqueCast_trusted_place_rw_with_decls`
+Clause 4 is strictly necessary. -/
 theorem opaqueCast_witness_type_switch :
     placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 ∧
       placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair ∧
@@ -3818,16 +3950,50 @@ theorem opaqueCast_witness_type_switch :
             wLayouts ∧
         evalStmt (ocDeinitState slot) ⟨.deinit ⟨1, [.opaqueCast tyU32, .field 0 tyU32]⟩, "w"⟩
             [u32Decl "_0", pairDecl] wLayouts =
-          MirStepNode.fail .ub) := by
+          MirStepNode.fail .ub) ∧
+      placeTy [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedCastPlace =
+        placeTy [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedPlainPlace ∧
+      placeTyResolved [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedCastPlace =
+        placeTyResolved [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedPlainPlace ∧
+      placeTouchesUnion [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedCastPlace = false ∧
+      placeTouchesUnion [u32Decl "_0", ocOuterADecl] ocAdtLayouts ocNestedPlainPlace = false ∧
+      evalStmt ocNestedState ⟨.assign ocNestedPlainPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts =
+        MirStepNode.step (advanceStmt ocNestedState
+          [.uninit, .init (.aggregate 0 [.aggregate 0 [.scalar ⟨42, 4⟩, .uninit]])]) ∧
+      evalStmt ocNestedState ⟨.assign ocNestedCastPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts =
+        MirStepNode.step (advanceStmt ocNestedState
+          [.uninit, .init (.aggregate 0 [.aggregate 0 [.scalar ⟨42, 4⟩, .uninit, .uninit]])]) ∧
+      evalStmt ocNestedState ⟨.assign ocNestedCastPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts ≠
+        evalStmt ocNestedState ⟨.assign ocNestedPlainPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts := by
   have h1 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, [.opaqueCast tyU8]⟩ = some tyU8 := rfl
   have h2 : placeTy [u32Decl "_0", pairDecl] wLayouts ⟨1, []⟩ = some tyPair := rfl
-  refine ⟨h1, h2, ?_, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  have hnp :
+      evalStmt ocNestedState ⟨.assign ocNestedPlainPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts =
+        MirStepNode.step (advanceStmt ocNestedState
+          [.uninit, .init (.aggregate 0 [.aggregate 0 [.scalar ⟨42, 4⟩, .uninit]])]) := rfl
+  have hnc :
+      evalStmt ocNestedState ⟨.assign ocNestedCastPlace (.use (cU32 42)), "w"⟩
+          [u32Decl "_0", ocOuterADecl] ocAdtLayouts =
+        MirStepNode.step (advanceStmt ocNestedState
+          [.uninit, .init (.aggregate 0 [.aggregate 0 [.scalar ⟨42, 4⟩, .uninit, .uninit]])]) := rfl
+  refine ⟨h1, h2, ?_, rfl, rfl, rfl, rfl, rfl, rfl, ?_, rfl, rfl, rfl, rfl, hnp, hnc, ?_⟩
   · rw [h1, h2]
     intro h
     simp [tyU8, tyPair] at h
   · intro slot hslot
     simp only [List.mem_cons, List.not_mem_nil, or_false] at hslot
     rcases hslot with rfl | rfl <;> exact ⟨rfl, rfl, rfl⟩
+  · rw [hnc, hnp]
+    intro h
+    have hl := congrArg (fun n : MirStepNode => match n with
+      | .tau (.running st) => some st.frame.locals
+      | _ => none) h
+    simp [MirStepNode.step, advanceStmt] at hl
 
 /-- **Positive witness (moves).** `move (p as T)` is a *projected* move: it yields the whole
 value and keeps `p` initialized (like Miri, whose moves do not de-initialize), whereas the
@@ -3843,14 +4009,17 @@ def dBody : CapturedMir := mkBody "w::d" 1 [u32Decl "_0", pairDecl] [blk [] .ret
 
 def dInit : MachineState := initMachineStateWithCallees dBody [pairVal] []
 
-/-- **Negative witness (root dispatch and `.uninit` field shell).** `(_0 as (u32, u32)) = p`
-and `evalStmt` on `(_0 as u32) = 42` at the uninitialized return place `_0` fault with UB
-while their erasures initialize `_0`; partial field initialization `(_1 as (u32, u32)).0 = 42`
-on an uninitialized tuple `_1` faults with UB (`uninitFieldWriteShell? = none`) while
-`_1.0 = 42` materializes the tuple shell and writes field `0`; and `Deinit((_1 as (u32, u32)))`
-leaves `_1` as `LocalSlot.init Value.uninit` while `Deinit(_1)` stores `LocalSlot.uninit` —
-the opaque cast is observable with no type switch involved
-(`opaqueCast_trusted_root_dispatch_divergence`). -/
+/-- **Negative witness (root dispatch, `.uninit` field shell, and `SetDiscriminant`).**
+`(_0 as (u32, u32)) = p` and `evalStmt` on `(_0 as u32) = 42` at the uninitialized return place
+`_0` fault with UB while their erasures initialize `_0`; partial field initialization
+`(_1 as (u32, u32)).0 = 42` on an uninitialized tuple `_1` faults with UB
+(`uninitFieldWriteShell? = none`) while `_1.0 = 42` materializes the tuple shell and writes
+field `0`; `Deinit((_1 as (u32, u32)))` leaves `_1` as `LocalSlot.init Value.uninit` while
+`Deinit(_1)` stores `LocalSlot.uninit`; and on a 2-variant enum `OptU32` with captured
+`ocAdtLayouts`, `SetDiscriminant((_1 as OptU32), 0)` agrees non-degenerately (both step) on
+an initialized `Some(7)` local whereas on an uninitialized `LocalSlot.uninit` local it faults
+with UB while `SetDiscriminant(_1, 0)` initializes `None` and steps — the opaque cast is
+observable with no type switch involved (`opaqueCast_trusted_root_dispatch_divergence`). -/
 theorem opaqueCast_witness_root_dispatch :
     writePlaceValue ocLocals [] ⟨0, [.opaqueCast tyPair]⟩ pairVal = .ub ∧
       writePlaceValue ocLocals [] ⟨0, []⟩ pairVal = .ok [.init pairVal, .init pairVal] ∧
@@ -3870,12 +4039,42 @@ theorem opaqueCast_witness_root_dispatch :
       evalStmt dInit ⟨.deinit ⟨1, []⟩, "w"⟩ dBody.localDecls wLayouts =
         MirStepNode.step (advanceStmt dInit [.uninit, .uninit]) ∧
       evalStmt dInit ⟨.deinit ⟨1, [.opaqueCast tyPair]⟩, "w"⟩ dBody.localDecls wLayouts ≠
-        evalStmt dInit ⟨.deinit ⟨1, []⟩, "w"⟩ dBody.localDecls wLayouts := by
+        evalStmt dInit ⟨.deinit ⟨1, []⟩, "w"⟩ dBody.localDecls wLayouts ∧
+      evalStmt (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩])))
+          ⟨.setDiscriminant ⟨1, [.opaqueCast tyOcEnum]⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl]
+          ocAdtLayouts =
+        MirStepNode.step (advanceStmt (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩])))
+          [.uninit, .init (.aggregate 0 [.scalar ⟨7, 4⟩])]) ∧
+      evalStmt (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩])))
+          ⟨.setDiscriminant ⟨1, [.opaqueCast tyOcEnum]⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl]
+          ocAdtLayouts =
+        evalStmt (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩])))
+          ⟨.setDiscriminant ⟨1, []⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl] ocAdtLayouts ∧
+      evalStmt (ocDeinitState .uninit)
+          ⟨.setDiscriminant ⟨1, [.opaqueCast tyOcEnum]⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl]
+          ocAdtLayouts =
+        MirStepNode.fail .ub ∧
+      evalStmt (ocDeinitState .uninit)
+          ⟨.setDiscriminant ⟨1, []⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl] ocAdtLayouts =
+        MirStepNode.step (advanceStmt (ocDeinitState .uninit) [.uninit, .init (.aggregate 0 [])]) ∧
+      evalStmt (ocDeinitState .uninit)
+          ⟨.setDiscriminant ⟨1, [.opaqueCast tyOcEnum]⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl]
+          ocAdtLayouts ≠
+        evalStmt (ocDeinitState .uninit)
+          ⟨.setDiscriminant ⟨1, []⟩ 0, "w"⟩ [u32Decl "_0", ocEnumDecl] ocAdtLayouts := by
   have hdo : evalStmt dInit ⟨.deinit ⟨1, [.opaqueCast tyPair]⟩, "w"⟩ dBody.localDecls wLayouts =
       MirStepNode.step (advanceStmt dInit [.uninit, .init .uninit]) := rfl
   have hdr : evalStmt dInit ⟨.deinit ⟨1, []⟩, "w"⟩ dBody.localDecls wLayouts =
       MirStepNode.step (advanceStmt dInit [.uninit, .uninit]) := rfl
-  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, hdo, hdr, ?_⟩
+  have hsdInit :=
+    ((opaqueCast_trusted_root_dispatch_divergence [] [] ocAdtLayouts 1 tyOcEnum pairVal pairVal).2.2.2.2.1
+      (ocDeinitState (.init (.aggregate 1 [.scalar ⟨7, 4⟩]))) [u32Decl "_0", ocEnumDecl]
+      1 0 [.scalar ⟨7, 4⟩] [.scalar ⟨7, 4⟩] "w" rfl rfl rfl rfl rfl rfl)
+  have hsdUninit :=
+    ((opaqueCast_trusted_root_dispatch_divergence [] [] ocAdtLayouts 1 tyOcEnum pairVal pairVal).2.2.2.2.2
+      (ocDeinitState .uninit) [u32Decl "_0", ocEnumDecl] 0 [] "w" rfl rfl rfl rfl)
+  obtain ⟨_, _, hsdOcUb, _, hsdNe⟩ := hsdUninit
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, hdo, hdr, ?_, rfl, hsdInit.1, hsdOcUb, rfl, hsdNe⟩
   rw [hdo, hdr]
   intro h
   have hl := congrArg (fun n : MirStepNode => match n with
