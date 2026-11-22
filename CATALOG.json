@@ -560,7 +560,7 @@
       "path": "lean/Workbench/Pass1/InitLemmas.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, allowed theory tactics only) lemma pack consolidating the six highest-frequency helper clusters otherwise duplicated across `anneal/theory/` and `anneal/correspondence/`:",
-      "line_count": 369,
+      "line_count": 371,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",
@@ -788,7 +788,7 @@
       "path": "lean/Workbench/Pass1/LinearArith.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, `[propext]` only, zero `._unsafe_rec`, zero `omega`) reflective linear-inequality solver replacing banned `omega` in `anneal/theory/` and `anneal/correspondence/`:",
-      "line_count": 1649,
+      "line_count": 1650,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",
@@ -1308,7 +1308,7 @@
       "path": "lean/Workbench/Pass1/PTree.lean",
       "badge": "pass1_portable",
       "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, allowed theory tactics only) Appel-Leroy canonical positive radix trie `PTree α`:",
-      "line_count": 694,
+      "line_count": 696,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",
@@ -1706,6 +1706,18 @@
         "--no-wrapper",
         "--prefix",
         "--top"
+      ]
+    },
+    {
+      "name": "preflight_syntax_check",
+      "path": "scripts/preflight_syntax_check.py",
+      "badge": "host_script",
+      "summary": "Fast Lean 4 `TrustedBoundary` CST syntax preflight checker (no elaboration).",
+      "cli_flags": [
+        "--json",
+        "--lake-dir",
+        "--no-wrapper",
+        "--role"
       ]
     },
     {

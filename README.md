@@ -53,9 +53,13 @@ scripts.
   - `proof_health_scan.py`: `<50ms` static Pass-1 `TrustedBoundary` scanner
     (catches banned tactics, missing `prelude`, disallowed imports, `>=33`-item
     list literals, and cross-module `.eq_1` diamond hazards).
+  - `preflight_syntax_check.py`: Exact non-elaborating Lean 4 `Parser` CST
+    allowlist validator mirroring `TrustedBoundary.lean` (`--role theory` or
+    `--role trusted`).
   - `audit_lean_hygiene.py`: Compiled `Lean.Environment` inspector pinpointing
-    `._unsafe_rec` parent definitions, `isPartial`/`isUnsafe` leaks, `sorryAx`,
-    and non-standard axioms (`_native.*` / `Lean.ofReduceBool`).
+    `._unsafe_rec` parent definitions, `isPartial`/`isUnsafe` leaks,
+    out-of-namespace `realizeConst` `.eq_1` emissions, `sorryAx`, and
+    non-standard axioms (`_native.*` / `Lean.ofReduceBool`).
   - `replay_audit_lean.py`: Compiles any standalone `.lean` file (no Lake
     project required) with `-DElab.async=false -Ddebug.skipKernelTC=false` and
     runs fresh `trustLevel := 0`, `loadExts := false` `Kernel.Environment.replay`

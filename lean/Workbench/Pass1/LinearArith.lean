@@ -59,7 +59,8 @@ theorem add_three_mid (a b c : Nat) : a + b + c = a + c + b := by
 theorem intBalance_iff_of_add_eq {x : Int} {p1 n1 p2 n2 : Nat}
     (h1 : IntBalance x p1 n1) (hEq : p1 + n2 = p2 + n1) :
     IntBalance x p2 n2 := by
-  unfold IntBalance at h1 ⊢
+  unfold IntBalance at h1
+  unfold IntBalance
   have hSum : (intPos x + n2) + (p1 + n1) = (intNeg x + p2) + (p1 + n1) := by
     have hL : (intPos x + n2) + (p1 + n1) = (intPos x + n1) + (p1 + n2) := by
       rw [add_four_rearrange (intPos x) n2 p1 n1, Nat.add_comm n2 n1,

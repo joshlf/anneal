@@ -55,7 +55,17 @@ def main : IO Unit := do
   let mut sorryDecls : List String := []
   let mut badAxiomDecls : List (String × List String) := []
   let mut eqSplitters : List String := []
+  let mut foreignRealized : List (String × String) := []
   let mut allAxiomsUsed : Std.HashSet String := {}
+
+  for i in [:env.header.moduleData.size] do
+    let mName := env.header.modules[i]!.module.toString
+    if startsWithAny mName prefixes then
+      let mData := env.header.moduleData[i]!
+      for c in mData.constNames do
+        let cs := c.toString
+        if !(startsWithAny cs prefixes) && !(cs.startsWith "_private.") then
+          foreignRealized := (mName, cs) :: foreignRealized
 
   for (name, ci) in env.constants.map₁.toList do
     let s := name.toString
@@ -87,6 +97,8 @@ def main : IO Unit := do
     ("partial_or_unsafe", toJson partialOrUnsafe.mergeSort),
     ("sorry_decls", toJson sorryDecls.mergeSort),
     ("eq_or_splitter_decls", toJson eqSplitters.mergeSort),
+    ("foreign_realized_consts", Json.arr (foreignRealized.map (fun (m, c) =>
+      Json.mkObj [("module", toJson m), ("const", toJson c)])).toArray),
     ("axioms_used", toJson allAxiomsUsed.toList.mergeSort),
     ("disallowed_axiom_decls", Json.arr (badAxiomDecls.map (fun (d, axs) =>
       Json.mkObj [("decl", toJson d), ("axioms", toJson axs)])).toArray)
@@ -176,6 +188,7 @@ def run_environment_audit(
         and not data["partial_or_unsafe"]
         and not data["sorry_decls"]
         and not data["disallowed_axiom_decls"]
+        and not data.get("foreign_realized_consts")
     )
     return data
 
@@ -220,6 +233,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  ._unsafe_rec helpers: {len(report['unsafe_rec'])}")
         print(f"  partial/unsafe defs:  {len(report['partial_or_unsafe'])}")
         print(f"  .eq_1 / .splitter:    {len(report['eq_or_splitter_decls'])}")
+        print(f"  foreign realized:     {len(report.get('foreign_realized_consts', []))}")
+        for fr in report.get("foreign_realized_consts", []):
+            print(f"  [FOREIGN] {fr['module']} emitted out-of-namespace `{fr['const']}`")
         for fix in report["unsafe_rec_remediations"]:
             print(f"  [FIX] {fix['parent_decl']} ({fix['auxiliary']}): {fix['remediation']}")
 

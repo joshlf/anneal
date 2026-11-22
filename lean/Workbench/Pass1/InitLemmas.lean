@@ -173,31 +173,33 @@ theorem add_four_rearrange (a b c d : Nat) :
   rw [Nat.add_assoc a b (c + d), ← Nat.add_assoc b c d, Nat.add_comm b c,
       Nat.add_assoc c b d, ← Nat.add_assoc a c (b + d)]
 
-theorem nat_pow_zero (b : Nat) : b ^ 0 = 1 := rfl
+theorem nat_pow_zero (b : Nat) : Nat.pow b 0 = 1 := rfl
 
-theorem nat_pow_succ (b n : Nat) : b ^ (n + 1) = b ^ n * b :=
+theorem nat_pow_succ (b n : Nat) : Nat.pow b (n + 1) = Nat.pow b n * b :=
   Nat.pow_succ b n
 
-theorem nat_pow_add (b m : Nat) : ∀ n : Nat, b ^ (m + n) = b ^ m * b ^ n
+theorem nat_pow_add (b m : Nat) :
+    ∀ n : Nat, Nat.pow b (m + n) = Nat.pow b m * Nat.pow b n
   | 0 => by
     rw [Nat.add_zero, nat_pow_zero, Nat.mul_one]
   | n + 1 => by
     rw [Nat.add_succ, nat_pow_succ, nat_pow_succ, nat_pow_add b m n,
         Nat.mul_assoc]
 
-theorem nat_two_pow_pos : ∀ n : Nat, 0 < 2 ^ n
+theorem nat_two_pow_pos : ∀ n : Nat, 0 < Nat.pow 2 n
   | 0 => by decide
   | n + 1 => by
     rw [nat_pow_succ]
     have ih := nat_two_pow_pos n
-    have hTwo : 2 ^ n * 2 = 2 ^ n + 2 ^ n := Nat.mul_two (2 ^ n)
+    have hTwo : Nat.pow 2 n * 2 = Nat.pow 2 n + Nat.pow 2 n :=
+      Nat.mul_two (Nat.pow 2 n)
     rw [hTwo]
-    exact Nat.lt_of_lt_of_le ih (Nat.le_add_right (2 ^ n) (2 ^ n))
+    exact Nat.lt_of_lt_of_le ih (Nat.le_add_right (Nat.pow 2 n) (Nat.pow 2 n))
 
-theorem nat_div_add_mod (m k : Nat) : k * (m / k) + m % k = m :=
+theorem nat_div_add_mod (m k : Nat) : k * Nat.div m k + Nat.mod m k = m :=
   Nat.div_add_mod m k
 
-theorem nat_mod_eq_of_lt {a b : Nat} (h : a < b) : a % b = a :=
+theorem nat_mod_eq_of_lt {a b : Nat} (h : a < b) : Nat.mod a b = a :=
   Nat.mod_eq_of_lt h
 
 theorem div2_mod2_inj (m n : Nat)

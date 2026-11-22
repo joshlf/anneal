@@ -19,6 +19,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import farkas_cert_gen  # noqa: E402
+import preflight_syntax_check  # noqa: E402
 import proof_health_scan  # noqa: E402
 import split_lean_module  # noqa: E402
 
@@ -116,6 +117,20 @@ class SplitLeanModuleTests(unittest.TestCase):
             self.assertGreaterEqual(len(plan["proposed_chunks"]), 2)
             self.assertEqual(len(plan["cross_chunk_eq1_hazards"]), 1)
             self.assertEqual(plan["cross_chunk_eq1_hazards"][0]["target_def"], "helperFn")
+
+
+class PreflightSyntaxCheckTests(unittest.TestCase):
+    def test_collect_lean_targets_skips_lake_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            keep = root / "Mod.lean"
+            skip_dir = root / ".lake" / "packages"
+            skip_dir.mkdir(parents=True)
+            skip = skip_dir / "Cached.lean"
+            keep.write_text("prelude\n", encoding="utf-8")
+            skip.write_text("prelude\n", encoding="utf-8")
+            found = preflight_syntax_check.collect_lean_targets([str(root)])
+            self.assertEqual(found, [keep.resolve()])
 
 
 if __name__ == "__main__":

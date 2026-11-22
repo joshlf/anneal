@@ -26,6 +26,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import audit_lean_hygiene  # noqa: E402
+import preflight_syntax_check  # noqa: E402
 import proof_health_scan  # noqa: E402
 
 FORBIDDEN_PUBLIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -254,8 +255,22 @@ def run_check(disable_wrapper: bool = False, skip_lean_build: bool = False) -> i
     if ut.returncode != 0:
         errors.append(f"Unit tests failed:\n{ut.stdout}\n{ut.stderr}")
 
-    # 4. Lake build + compiled Environment hygiene audit
+    # 4. Lake build + CST syntax preflight + compiled Environment hygiene audit
     if not skip_lean_build:
+        cst_report = preflight_syntax_check.run_syntax_preflight(
+            files=p1_files,
+            role="theory",
+            lake_dir=ROOT / "lean",
+            disable_wrapper=disable_wrapper,
+        )
+        if not cst_report["clean"]:
+            for fr in cst_report["files"]:
+                for v in fr["violations"]:
+                    errors.append(
+                        f"Pass-1 CST preflight {pathlib.Path(fr['file']).relative_to(ROOT)}"
+                        f":{v['line']}:{v['column']}: {v['message']}"
+                    )
+
         wrapper = find_build_wrapper(disable_wrapper)
         build_proc = subprocess.run(
             [*wrapper, "lake", "build"],

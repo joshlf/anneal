@@ -165,11 +165,13 @@ theorem rawTree_make_isCanon {α : Type} {l r : RawTree α} (v : Option α)
       cases r with
       | leaf => rfl
       | node _ _ _ =>
-        dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf] at hl hr ⊢
+        dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf] at hl hr
+        dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf]
         rw [hr]
         rfl
     | node _ _ _ =>
-      dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf] at hl hr ⊢
+      dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf] at hl hr
+      dsimp only [RawTree.make, RawTree.isCanon, RawTree.isLeaf]
       rw [hl, hr]
       rfl
 
@@ -566,7 +568,7 @@ theorem rawTree_diffWith_isCanon {α : Type} (eqB : α → α → Bool) :
 
 def ptreeWrapDiff {α : Type} (eqB : α → α → Bool) (goal req : RawTree α)
     (hg : goal.isCanon = true) :
-    (opt : Option (RawTree α)) → RawTree.diffWith eqB goal req = opt →
+    ∀ (opt : Option (RawTree α)), RawTree.diffWith eqB goal req = opt →
       Option (PTree α)
   | none, _ => none
   | some rem, h => some ⟨rem, rawTree_diffWith_isCanon eqB goal req rem hg h⟩
