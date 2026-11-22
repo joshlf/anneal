@@ -10612,6 +10612,287 @@ theorem ep1_vtable_deinit_traitObject_and_sized_view_witness :
     have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef alignedWideBytes)) hm1
     exact ⟨m1, hm1, hwf1, hdata, hload⟩
 
+/-- **Misaligned safe trait-object pointer in `PlaceExpr::Deref` (`Mach`)**:
+when the operand of `PlaceExpr::Deref` evaluates to a `&dyn Trait`,
+`&mut dyn Trait`, or `Box<dyn Trait>` whose address is not aligned to the
+vtable's alignment `vt.align`, `evalPlace` hits upstream's internal alignment
+assertion (`spec/lang/step/expressions.md:254`) and raises a `specPanic`
+before calling `Memory::dereferenceable` (for every destination type `ty`). -/
+theorem ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic (m m1 : Mach)
+    (operand : Gen.ValueExpr) (ty : Gen.Type) (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hOp : evalValue m operand =
+      .ok ((.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))), .Ptr (mk pointee)), m1))
+    (hvt : vtableLookup m1 vptr = .ok vt)
+    (hMis : Align.is_aligned vt.align thin.addr = false) :
+    evalPlace m (.Deref operand ty) =
+      specPanic
+        "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)" := by
+  have hca : computeAlign m1 (.TraitObject traitName) (some (.VTablePointer vptr)) =
+      .ok vt.align := by
+    unfold computeAlign
+    rw [compute_size_and_align_traitObject, hvt]
+    rfl
+  unfold evalPlace
+  rw [hOp, ok_bind]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+
+/-- Polymorphic `ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic`,
+across every `Memory` `M` (in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic {M : Type}
+    [Gen.Memory M] [MemoryOps M] (m m1 : Gen.Machine M)
+    (operand : Gen.ValueExpr) (ty : Gen.Type)
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hOp : evalValueM m operand =
+      .ok ((.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))), .Ptr (mk pointee)), m1))
+    (hvt : vtableLookupM m1 vptr = .ok vt)
+    (hMis : Align.is_aligned vt.align thin.addr = false) :
+    evalPlaceM m (.Deref operand ty) =
+      specPanic
+        "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)" := by
+  have hca : computeAlignM m1 (.TraitObject traitName) (some (.VTablePointer vptr)) =
+      .ok vt.align := by
+    unfold computeAlignM
+    rw [compute_size_and_align_traitObject, hvt]
+    rfl
+  unfold evalPlaceM
+  rw [hOp, ok_bind]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+
+private theorem ep1_cellsToFreezeMaskLoop_zero_step (rest : List (Gen.Offset × Size))
+    (mask : List Bool) :
+    cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) ((⟨0⟩, ⟨0⟩) :: rest) mask =
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) rest mask := by
+  have h : cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) ((⟨0⟩, ⟨0⟩) :: rest) mask =
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) rest (mask ++ [] ++ []) := rfl
+  rw [h, List.append_nil, List.append_nil]
+
+private theorem ep1_cellsToFreezeMaskLoop_zero_all :
+    ∀ (xs : List (Gen.Offset × Size)) (mask : List Bool),
+      (∀ c ∈ xs, c = (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) (xs ++ [(⟨0⟩, ⟨0⟩)]) mask = .ok mask
+  | [], mask, _ => by
+    rw [List.nil_append, ep1_cellsToFreezeMaskLoop_zero_step]
+    rfl
+  | c :: rest, mask, hall => by
+    have hc : c = (⟨0⟩, ⟨0⟩) := hall c List.mem_cons_self
+    subst hc
+    rw [List.cons_append, ep1_cellsToFreezeMaskLoop_zero_step]
+    exact ep1_cellsToFreezeMaskLoop_zero_all rest mask
+      (fun x hx => hall x (List.mem_cons_of_mem _ hx))
+
+private theorem ep1_cellsToFreezeMaskLoop_pos_panic :
+    ∀ (xs : List (Gen.Offset × Size)) (cur : Gen.Offset × Size) (mask : List Bool),
+      0 < cur.1.bytes + cur.2.bytes →
+      cellsToFreezeMaskLoop cur (xs ++ [(⟨0⟩, ⟨0⟩)]) mask =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"
+  | [], cur, mask, hpos => by
+    rw [List.nil_append]
+    unfold cellsToFreezeMaskLoop
+    have hlt : ((0 : Nat) : Int) - ((cur.1.bytes + cur.2.bytes : Nat) : Int) < 0 := by omega
+    dsimp only
+    simp only [hlt, ↓reduceIte]
+  | next :: rest, cur, mask, hpos => by
+    rw [List.cons_append]
+    unfold cellsToFreezeMaskLoop
+    by_cases hlt : (next.1.bytes : Int) - ((cur.1.bytes + cur.2.bytes : Nat) : Int) < 0
+    · simp only [hlt, ↓reduceIte]
+    · simp only [hlt, ↓reduceIte]
+      exact ep1_cellsToFreezeMaskLoop_pos_panic rest next _ (by omega)
+
+private theorem ep1_cellsToFreezeMaskLoop_bad_panic :
+    ∀ (xs : List (Gen.Offset × Size)) (mask : List Bool),
+      (∃ c ∈ xs, c ≠ (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) (xs ++ [(⟨0⟩, ⟨0⟩)]) mask =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"
+  | [], _, ⟨_, hmem, _⟩ => nomatch hmem
+  | c :: rest, mask, ⟨bad, hmem, hne⟩ => by
+    by_cases hc : c = (⟨0⟩, ⟨0⟩)
+    · subst hc
+      rw [List.cons_append, ep1_cellsToFreezeMaskLoop_zero_step]
+      have hrest : ∃ b ∈ rest, b ≠ (⟨0⟩, ⟨0⟩) := by
+        rcases List.mem_cons.mp hmem with rfl | hmem'
+        · exact absurd rfl hne
+        · exact ⟨bad, hmem', hne⟩
+      exact ep1_cellsToFreezeMaskLoop_bad_panic rest mask hrest
+    · have hpos : 0 < c.1.bytes + c.2.bytes := by
+        rcases c with ⟨⟨o⟩, ⟨s⟩⟩
+        dsimp only
+        by_cases h0 : o = 0 ∧ s = 0
+        · rcases h0 with ⟨rfl, rfl⟩; exact absurd rfl hc
+        · omega
+      rw [List.cons_append]
+      unfold cellsToFreezeMaskLoop
+      dsimp only
+      split
+      · rfl
+      · exact ep1_cellsToFreezeMaskLoop_pos_panic rest c _ hpos
+
+/-- **Complete dichotomy for `cellsToFreezeMask cells ⟨0⟩`** (arbitrary
+`UnsafeCell` ranges on a zero-sized type):
+1. if every cell is `(⟨0⟩, ⟨0⟩)` (empty list or zero-sized `UnsafeCell<()>` at
+   offset `0`), `cellsToFreezeMask cells ⟨0⟩ = .ok []`;
+2. if any cell has non-zero offset or non-zero size, `cellsToFreezeMask`
+   panics with `"cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"`. -/
+theorem ep1_cellsToFreezeMask_zero_dichotomy (cells : List (Gen.Offset × Size)) :
+    ((∀ c ∈ cells, c = (⟨0⟩, ⟨0⟩)) → cellsToFreezeMask cells ⟨0⟩ = .ok []) ∧
+    ((∃ c ∈ cells, c ≠ (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMask cells ⟨0⟩ =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges") := by
+  refine ⟨fun hall => ?_, fun hbad => ?_⟩
+  · unfold cellsToFreezeMask
+    rw [ep1_cellsToFreezeMaskLoop_zero_all cells [] hall, ok_bind]
+    rfl
+  · unfold cellsToFreezeMask
+    rw [ep1_cellsToFreezeMaskLoop_bad_panic cells [] hbad]
+    unfold specPanic
+    rw [error_bind]
+
+/-- **General ZST `TreeBorrowsMemory.retag_ptr` dichotomy for arbitrary
+`vt.cells`** on a provenance-free trait-object pointer (`vt.size = 0`,
+`thin.provenance = none`), lifting the `vt.cells = []` restriction of
+`retag_ptr_traitObject_zst_noProv`:
+1. whenever every entry in `vt.cells` is `(⟨0⟩, ⟨0⟩)` (including `[]` and
+   zero-sized `UnsafeCell<()>` fields at offset `0`), `retag_ptr` is the
+   identity `(ptr, tbm, frameExtra)` for `&dyn`, `&mut dyn`, and `Box<dyn>` at
+   every `fnEntry`, `fnImplicitWrites`, `freeze`, and `unpin`;
+2. if `vt.cells` contains any cell `≠ (⟨0⟩, ⟨0⟩)`, then:
+   * when retagging runs (`&dyn Trait`, or `&mut dyn Trait` / `Box<dyn Trait>`
+     with `pointee.unpin = true`), `retag_ptr` propagates the `cellsToFreezeMask`
+     `specPanic`;
+   * for pinned `!pointee.unpin` `&mut dyn Trait` / `Box<dyn Trait>`,
+     `ReborrowSettings::new` returns `none` before calling `freeze_mask`, so
+     `retag_ptr` remains the identity. -/
+theorem ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (thin vptr : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (fnEntry fnImplicitWrites : Bool)
+    (vtableLookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
+    (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hCells : pointee.unsafe_cells = .TraitObject)
+    (hvt : vtableLookup vptr = .ok vt)
+    (hSize : vt.size = ⟨0⟩)
+    (hProv : thin.provenance = none) :
+    let ptr := ThinPointer.widen thin (some (.VTablePointer vptr))
+    ((∀ c ∈ vt.cells, c = (⟨0⟩, ⟨0⟩)) →
+      TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+          vtableLookup = .ok (ptr, tbm, frameExtra)) ∧
+    ((∃ c ∈ vt.cells, c ≠ (⟨0⟩, ⟨0⟩)) →
+      ((mk = Gen.PtrType.Ref .Immutable ∨ pointee.unpin = true) →
+        TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+            vtableLookup =
+          specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges") ∧
+      (((mk = Gen.PtrType.Ref .Mutable ∨ mk = Gen.PtrType.Box) ∧ pointee.unpin = false) →
+        TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+            vtableLookup = .ok (ptr, tbm, frameExtra))) := by
+  intro ptr
+  have hReb : ∀ (outside : Gen.Permission) (prot : Gen.Protected),
+      TreeBorrowsMemory.reborrow tbm thin
+        { inside := [], outside := outside, «protected» := prot } frameExtra =
+        .ok (thin, tbm, frameExtra) := by
+    intro outside prot
+    unfold TreeBorrowsMemory.reborrow
+    have hchk : BasicMemory.check_ptr tbm.mem thin ⟨0⟩ = .ok none := rfl
+    dsimp only [List.length]
+    rw [hchk, ok_bind, hProv]
+    rfl
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout hCells
+  subst hLayout; subst hCells
+  refine ⟨fun hall => ?_, fun hbad => ?_⟩
+  · have hFreeze : UnsafeCellStrategy.freeze_mask vtableLookup .TraitObject
+        (.TraitObject traitName) (some (.VTablePointer vptr)) = .ok [] := by
+      unfold UnsafeCellStrategy.freeze_mask
+      rw [hvt, ok_bind, hSize, (ep1_cellsToFreezeMask_zero_dichotomy vt.cells).1 hall]
+    rcases hMk with ⟨mutbl, rfl⟩ | rfl
+    · cases mutbl with
+      | Immutable =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.false_eq_true, ↓reduceIte,
+          hFreeze, ok_bind, List.mapM_nil, pure_ok, ReborrowSettings.perm]
+        cases freeze <;> simp only [Bool.false_eq_true, ↓reduceIte, ok_bind, hReb]
+      | Mutable =>
+        cases unpin with
+        | false =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+            pure_ok, ok_bind]
+        | true =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte, hFreeze, ok_bind, List.mapM_nil, pure_ok,
+            ReborrowSettings.perm, Bool.and_false, hReb]
+    · cases unpin with
+      | false =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
+      | true =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+          Bool.false_eq_true, ↓reduceIte, hFreeze, ok_bind, List.mapM_nil, pure_ok,
+          ReborrowSettings.perm, Bool.and_false, hReb]
+  · have hFreezeBad : UnsafeCellStrategy.freeze_mask vtableLookup .TraitObject
+        (.TraitObject traitName) (some (.VTablePointer vptr)) =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges" := by
+      unfold UnsafeCellStrategy.freeze_mask
+      rw [hvt, ok_bind, hSize, (ep1_cellsToFreezeMask_zero_dichotomy vt.cells).2 hbad]
+    refine ⟨fun hActive => ?_, fun ⟨hMutOrBox, hUnpin⟩ => ?_⟩
+    · rcases hMk with ⟨mutbl, rfl⟩ | rfl
+      · cases mutbl with
+        | Immutable =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.false_eq_true, ↓reduceIte,
+            hFreezeBad, specPanic, error_bind]
+        | Mutable =>
+          rcases hActive with hEq | hUnpin
+          · exfalso
+            have h0 := congrArg (fun f => f ⟨.TraitObject traitName, inhabited, .TraitObject, freeze, unpin⟩) hEq
+            injection h0 with hmut
+            cases hmut
+          · subst hUnpin
+            unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+            simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+              Bool.false_eq_true, ↓reduceIte, hFreezeBad, specPanic, error_bind]
+      · rcases hActive with hEq | hUnpin
+        · exfalso
+          have h0 := congrArg (fun f => f ⟨.TraitObject traitName, inhabited, .TraitObject, freeze, unpin⟩) hEq
+          cases h0
+        · subst hUnpin
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte, hFreezeBad, specPanic, error_bind]
+    · subst hUnpin
+      rcases hMutOrBox with rfl | rfl
+      · unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
+      · unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
+
 /-- **Ill-formed `ValueExpr::Variant` / `ValueExpr::Union` ASTs are spec panics, not UB**, on
 both `Mach` and `MachTB`:
 
@@ -18608,6 +18889,10 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_evalStatement_deinit_traitObject_spec
   ep1_evalStatementM_deinit_traitObject_spec
   ep1_vtable_deinit_traitObject_and_sized_view_witness
+  ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic
+  ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
+  ep1_cellsToFreezeMask_zero_dichotomy
+  ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
 
 #assert_standard_axioms
   vtableFromPtrM_bm_eq
@@ -18697,6 +18982,10 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_evalStatement_deinit_traitObject_spec
   ep1_evalStatementM_deinit_traitObject_spec
   ep1_vtable_deinit_traitObject_and_sized_view_witness
+  ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic
+  ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
+  ep1_cellsToFreezeMask_zero_dichotomy
+  ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and

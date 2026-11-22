@@ -81,6 +81,11 @@ validated there at function entry, and released again on `Return`.
 `dynDispatch_same_trait_two_impls_polymorphism_witness` registers two
 implementations of one trait (different size, alignment, and methods) and runs
 one caller body on receivers that differ only in their vtable pointer.
+`dynDispatch_protector_conflict_and_mut_box_witness`,
+`dynDispatch_return_dynRef_valid_and_ub_witness`, and
+`dynDispatch_same_trait_vtable_cells_interior_mutability_witness` cover Tree
+Borrows protector conflicts, `&mut dyn`/`Box<dyn>` dynamic deallocation,
+returning `&dyn Trait`, and same-trait `vtable.cells` interior mutability.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3920,6 +3925,131 @@ theorem dynDispatch_same_trait_two_impls_polymorphism_witness :
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
    eq_error_specPanic_of_interpSpecPanic (by decide +kernel),
    eq_error_specPanic_of_interpSpecPanic (by decide +kernel)⟩
+
+/-! ### Same-Trait Multi-Impl `vtable.cells` (`UnsafeCell` vs `Freeze`) Interior
+Mutability During Dynamic Dispatch (`Mach` & `MachTB`)
+
+Two implementations of the *same* trait `0` share the same size (`4`),
+alignment (`4`), and callee body, differing **only** in `vtable.cells`:
+* `ImplCell` (`Cell<u32>`): `cells = [(⟨0⟩, ⟨4⟩)]` (interior mutable);
+* `ImplFrozen` (`u32`): `cells = []` (frozen).
+One caller dispatches on `&dyn Trait0` with `PointeeInfo.freeze = false` and
+`unsafe_cells = .TraitObject` (`dynNonFreezeRefMrTy`). Inside the callee,
+`Statement::Validate` computes the inside freeze mask dynamically from
+`vtable.cells` (`UnsafeCellStrategy::TraitObject::freeze_mask`). Writing `42`
+through the receiver's own tag succeeds on both `Mach` and `MachTB` for
+`ImplCell` (preserving `MachTB.wfLive` across both `fn_entry = true` and
+`fn_entry = false`), while for `ImplFrozen` it succeeds on `Mach` and faults UB
+on `MachTB` (`Protected::Strong` or unprotected `Frozen` write conflict). -/
+
+/-- `&dyn Trait0` with `PointeeInfo.freeze = false` (Rust's `dyn Trait`
+reference whose interior mutability is determined dynamically by
+`vtable.cells`). -/
+@[reducible] def dynNonFreezeRefMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable ⟨.TraitObject (traitNameOf 0), true, .TraitObject, false, true⟩)
+
+/-- `ImplCell` (`Cell<u32>`) vtable for trait `0`: `cells = [(0, 4)]`. -/
+def dynCellVTableCell : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [(⟨0⟩, ⟨4⟩)],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- `ImplFrozen` (`u32`) vtable for the same trait `0`: `cells = []`. -/
+def dynCellVTableFrozen : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- Shared callee body for both `ImplCell` and `ImplFrozen`: validates
+`&dyn Trait0` (with `fn_entry := fnEntry`), writes `42` through the receiver's
+own tag (`GetThinPointer`), reads `42` back, and returns it. -/
+def dynCellWriteCallee (fnEntry : Bool) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynNonFreezeRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) fnEntry,
+        .Assign (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy)
+          (.Constant (.Int 42) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy))],
+        .Return, .Regular⟩)]
+
+/-- Caller dispatching dynamically on `&dyn Trait0` (`dynNonFreezeRefMrTy`) and
+passing it by value. -/
+def dynCellCaller : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynNonFreezeRefMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynCellCaller` -> `dynCellWriteCallee fnEntry` selecting
+`ImplCell` (`useFrozen = false`, vtable at `8192` alloc `3`) or `ImplFrozen`
+(`useFrozen = true`, vtable at `8200` alloc `4`) over heap object alloc `5`. -/
+def dynCellMach (useFrozen fnEntry : Bool) : Mach :=
+  let callee := dynCellWriteCallee fnEntry
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynCellCaller), (fnName 1, callee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynCellVTableCell), (⟨⟨1⟩⟩, dynCellVTableFrozen)]⟩ }
+  let vtCell : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let vtFrozen : Ptr := { addr := 8200, provenance := some (⟨4⟩, ()) }
+  let vtBytes : List Byte :=
+    if useFrozen then ptrBytes 8200 (some (⟨4⟩, ())) else ptrBytes 8192 (some (⟨3⟩, ()))
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨5⟩, ())) ++ vtBytes) 8,
+     mkVTableAlloc 8192, mkVTableAlloc 8200, mkHeapAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame dynCellCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtCell), (⟨⟨1⟩⟩, vtFrozen)]⟩ }
+
+set_option maxRecDepth 8192 in
+/-- **Same-trait multi-impl `vtable.cells` interior-mutability witness**
+(`Mach` & `MachTB`):
+1. `ImplCell` (`vtable.cells = [(0, 4)]`): interior mutation through `&dyn Trait0`
+   succeeds across all 5 steps on both `Mach` and `MachTB` (returning `42`,
+   mutating alloc `5` to `42`, and preserving `MachTB.wfLive` across both
+   protected `fn_entry = true` and unprotected `fn_entry = false`).
+2. `ImplFrozen` (`vtable.cells = []`): the identical caller and callee succeed
+   on `Mach` (returning `42`), while `MachTB` completes `Call` + `Validate`
+   (step 2, `MachTB.wfLive`) and faults UB at step 3 with
+   `"Tree Borrows: local write to protected Frozen reference"` (`fn_entry = true`)
+   and `"Tree Borrows: local write of Frozen reference"` (`fn_entry = false`). -/
+theorem dynDispatch_same_trait_vtable_cells_interior_mutability_witness :
+    -- 1. `ImplCell` (`fn_entry = true` and `false`): ok on both `Mach` and `MachTB`
+    (∃ m5, Interp.steps 5 (dynCellMach false true) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynCellMach false true)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([1, 5].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynCellMach false false)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([1, 5].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 2. `ImplFrozen` (`fn_entry = true`): `Mach` ok vs `MachTB` protected Frozen write UB
+    (∃ m5, Interp.steps 5 (dynCellMach true true) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB (dynCellMach true true)) = .ok m2 ∧
+      MachTB.wfLive m2 ∧ m2.mem.memory.mem.allocations[5]?.map Gen.Allocation.live = some true) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynCellMach true true)) =
+      .error (.ub "Tree Borrows: local write to protected Frozen reference") ∧
+    -- 3. `ImplFrozen` (`fn_entry = false`): `Mach` ok vs `MachTB` unprotected Frozen write UB
+    (∃ m5, Interp.steps 5 (dynCellMach true false) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynCellMach true false)) =
+      .error (.ub "Tree Borrows: local write of Frozen reference") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 /-- **C9 Fragment Boundary (`translatePlace_unwrapUnsafeBinder_none`)**:
