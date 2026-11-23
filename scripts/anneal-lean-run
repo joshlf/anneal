@@ -51,7 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Mapping
 
 sys.dont_write_bytecode = True
 
@@ -2130,6 +2130,68 @@ class BuildWatchdog:
         }
 
 
+# Per-tool parallelism variables of the bounded command (`_resolve_thread_env`).
+_THREAD_ENV_VARS: tuple[str, ...] = (
+    "LEAN_NUM_THREADS",
+    "CARGO_BUILD_JOBS",
+    "RAYON_NUM_THREADS",
+)
+
+
+def _resolve_thread_env(
+    threads: int,
+    is_cg_capped: bool,
+    base_env: Mapping[str, str] | None = None,
+) -> dict[str, int]:
+    """Thread count the bounded command runs with, for each `_THREAD_ENV_VARS` variable.
+
+    `threads` is the envelope's thread budget. A positive value the caller already
+    exported (in `base_env`, default `os.environ`) is kept when it is at most that
+    budget, so a caller can always ask for fewer threads (`LEAN_NUM_THREADS=1`). A
+    larger one is clamped to the budget on a memory-capped slice and kept otherwise.
+    Anything else (unset, blank, non-numeric, zero or negative) resolves to the budget.
+    """
+    env = os.environ if base_env is None else base_env
+    resolved: dict[str, int] = {}
+    for var in _THREAD_ENV_VARS:
+        raw = str(env.get(var, "")).strip()
+        existing = 0
+        if raw:
+            try:
+                existing = int(raw)
+            except ValueError:
+                existing = 0
+        if existing > 0:
+            resolved[var] = min(existing, threads) if is_cg_capped else existing
+        else:
+            resolved[var] = threads
+    return resolved
+
+
+def format_threads_diagnostic(
+    threads: int, child_env: Mapping[str, str] | None = None
+) -> str:
+    """`threads=<n>` field of the timeout / OOM diagnostics.
+
+    `<n>` is the `LEAN_NUM_THREADS` the command actually ran with (`child_env`, the
+    environment `_build_child_env` handed it), not the envelope's thread budget
+    `threads`: a caller that exported `LEAN_NUM_THREADS=1` on a 3- or 64-thread budget
+    ran single-threaded and is reported as `threads=1`. When the two differ, the
+    budget (which `CPUQuota` still reflects) follows as `thread_budget=<threads>`.
+    """
+    effective = threads
+    if child_env is not None:
+        try:
+            parsed = int(str(child_env.get("LEAN_NUM_THREADS", "")).strip())
+        except ValueError:
+            parsed = 0
+        if parsed > 0:
+            effective = parsed
+    if effective == threads:
+        return f"threads={effective}"
+    return f"threads={effective}, thread_budget={threads}"
+
+
 def _build_child_env(
     threads: int,
     lean_m_mb: int,
@@ -2142,18 +2204,8 @@ def _build_child_env(
     env["ANNEAL_LEAN_RUN_IN_SCOPE"] = "1"
     env["ANNEAL_LEAN_RUN_ACTIVE"] = "1"
     env["ANNEAL_LEAN_RUN_LEAN_M_MB"] = str(lean_m_mb)
-    for var in ("LEAN_NUM_THREADS", "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS"):
-        raw = env.get(var, "").strip()
-        existing = 0
-        if raw:
-            try:
-                existing = int(raw)
-            except ValueError:
-                existing = 0
-        if existing > 0:
-            env[var] = str(min(existing, threads) if is_cg_capped else existing)
-        else:
-            env[var] = str(threads)
+    for var, count in _resolve_thread_env(threads, is_cg_capped, env).items():
+        env[var] = str(count)
     return env
 
 
@@ -2166,7 +2218,14 @@ def _build_scope_launch_cmd(
     user_systemd_active: bool,
     unit_name: str,
 ) -> tuple[list[str], bool]:
-    """Builds the bounded command (systemd leaf scope + oom_score_adj=700 wrapper)."""
+    """Builds the bounded command (systemd leaf scope + oom_score_adj=700 wrapper).
+
+    `threads` is the envelope's thread budget. `CPUQuota` is a ceiling for the whole
+    scope (Lake, `lean`, `cargo`, `rustc`, linkers), so it stays at that budget even
+    when the caller exported a smaller `LEAN_NUM_THREADS` (`_resolve_thread_env`),
+    which bounds Lean/Lake workers only; the diagnostics report the smaller count
+    (`format_threads_diagnostic`).
+    """
     wrapped_cmd = [
         "/bin/sh",
         "-c",
@@ -2312,7 +2371,7 @@ def run_bounded_command(
 
     def _run_single_attempt(
         att_limits: dict[str, Any], att_timeout: int
-    ) -> tuple[int, bool, bool, bool, float | None]:
+    ) -> tuple[int, bool, bool, bool, float | None, str]:
         att_threads = int(att_limits["threads"])
         att_b_max = int(att_limits["memory_max_mb"])
         att_lean_m = int(att_limits["lean_m_mb"])
@@ -2338,6 +2397,9 @@ def run_bounded_command(
             runtime_base=att_rt_base,
             user_systemd_sock_alive=att_sock_alive,
         )
+        # What the command really runs with: a caller's lower `LEAN_NUM_THREADS` wins
+        # over the envelope's `att_threads` budget (`_resolve_thread_env`).
+        att_threads_diag = format_threads_diagnostic(att_threads, env)
 
         w_cg_raw = att_limits.get("w_cg_path")
         w_cg_p = Path(w_cg_raw) if w_cg_raw else None
@@ -2393,7 +2455,7 @@ def run_bounded_command(
                     sys.stderr.write(
                         f"\n[anneal-lean-run] ERROR: Command timed out after "
                         f"{att_timeout}s (mode={mode}, MemoryMax={att_b_max}M, "
-                        f"threads={att_threads}).\n"
+                        f"{att_threads_diag}).\n"
                         f"{cg_snap}"
                         "  Remediation: Inspect proof goals interactively with "
                         "`lean_goal` / wildcard `change ... _` "
@@ -2454,7 +2516,7 @@ def run_bounded_command(
             _kill_systemd_scope(
                 unit_name if in_scope else None, proc, att_rt_base, att_sock_alive
             )
-            return (128 + caught.signum, False, False, False, None)
+            return (128 + caught.signum, False, False, False, None, att_threads_diag)
         finally:
             for sig, handler in prev_handlers.items():
                 signal.signal(sig, handler)  # type: ignore[arg-type]
@@ -2471,7 +2533,14 @@ def run_bounded_command(
         ):
             att_oom_evt = _read_memory_events_oom_kill(w_cg_p / unit_name) > 0
 
-        return (att_rc, att_timed_out, att_wd_aborted, att_oom_evt, att_pressure_budget)
+        return (
+            att_rc,
+            att_timed_out,
+            att_wd_aborted,
+            att_oom_evt,
+            att_pressure_budget,
+            att_threads_diag,
+        )
 
     eff_slot_timeout = (
         float(slot_timeout_override)
@@ -2519,8 +2588,8 @@ def run_bounded_command(
                 )
                 return 137
 
-            rc, timed_out, watchdog_aborted, oom_evt, _ = _run_single_attempt(
-                cur_limits, timeout_1
+            rc, timed_out, watchdog_aborted, oom_evt, _, final_threads_diag = (
+                _run_single_attempt(cur_limits, timeout_1)
             )
             final_b_max = b_max_1
 
@@ -2554,8 +2623,8 @@ def run_bounded_command(
                         f"(timeout={retry_timeout}s).\n"
                     )
                     final_b_max = b_max_retry
-                    rc, timed_out, watchdog_aborted, oom_evt, _ = _run_single_attempt(
-                        retry_limits, retry_timeout
+                    rc, timed_out, watchdog_aborted, oom_evt, _, final_threads_diag = (
+                        _run_single_attempt(retry_limits, retry_timeout)
                     )
 
             if watchdog_aborted:
@@ -2581,7 +2650,8 @@ def run_bounded_command(
                 sys.stderr.write(
                     f"\n[anneal-lean-run] ERROR: Command was terminated by the OS "
                     f"memory guard (exit 137, MemoryMax={final_b_max}M, "
-                    f"MemorySwapMax=0, mode={mode}, budget_gb={stamp_gb:.2f}).\n"
+                    f"MemorySwapMax=0, mode={mode}, {final_threads_diag}, "
+                    f"budget_gb={stamp_gb:.2f}).\n"
                     f"{cg_snap}"
                     "  Why: The process exceeded its hardware-matched physical RAM "
                     "ceiling and was killed before it could thrash host swap.\n"
@@ -2782,6 +2852,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(json.dumps(limits, indent=2))
         else:
+            probe_lean_threads = _resolve_thread_env(
+                int(limits["threads"]), bool(limits.get("is_cg_capped", False))
+            )["LEAN_NUM_THREADS"]
             print(
                 f"=== Anneal Hardware-Matched Resource Limits "
                 f"(mode={limits['mode']}, W={limits['w_eff']}) ===\n"
@@ -2792,7 +2865,7 @@ def main(argv: list[str] | None = None) -> int:
                 f"  Usable / Budget    : usable={limits['usable_workload_mem_gb']} GiB, "
                 f"single_build_budget={limits['single_build_budget_gb']:.2f} GiB\n"
                 f"  Thread Budget (-j) : {limits['threads']} threads "
-                f"(LEAN_NUM_THREADS={limits['threads']})\n"
+                f"(LEAN_NUM_THREADS={probe_lean_threads})\n"
                 f"  Hard RAM Cap       : {limits['memory_max_mb']} MiB "
                 f"(MemorySwapMax=0, lean -M {limits['lean_m_mb']})\n"
                 f"  LSP Pool Limits    : L_max={limits['l_max_mb']} MiB, "

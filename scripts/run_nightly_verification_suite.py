@@ -26,17 +26,22 @@ Profiles (`--profile`):
                `check_trusted.py --fast`, Python test suites
                (`ci/`, `scripts/`, `tools/anneal-lsp/`), `anneal-minirust-gen --check`,
                `cargo anneal correspondence-bugs lint`, `minirust-sync verify-lock`,
+               `lake --dir examples build Trusted` (so the `trusted/rustc-capture`
+               tests find `examples/.lake/build/lib/lean/Trusted.olean` already built),
                and `cargo test --workspace --lib --bins --locked`.
   nightly      Runs `quick` plus `check_trusted.py --self-test`, a `lake build +<Module>`
                of every workspace module imported by the standalone `tests/mir/*` Lean
                suites, those suites, `lake build Correspondence`, `lake build MiniRustSpec`,
+               `lake --dir examples build Miri` (the vendored Miri library) followed by
                `lake --dir examples build LeanMiriSpec`, domain crate integration tests,
                `cargo-anneal` end-to-end suites, and real-world Fuchsia/Fxfs example
                crate verifications.
 
 Step environment: every step runs with `LAKE_ARTIFACT_CACHE=true` and
-`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_lean_miri_spec` with `LEAN_NUM_THREADS=1`
-when its effective RAM ceiling is below 10 GiB. Before their first step, `quick` and
+`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_minirust_spec` and
+`lake_build_lean_miri_spec` each with `LEAN_NUM_THREADS=1` when its effective RAM ceiling
+is below 10 GiB (`lake_build_examples_miri_vendor` and every other step keep their
+thread count). Before their first step, `quick` and
 `nightly` remove stale Lean build artifacts from `.lake/build/lib/lean/` and
 `examples/.lake/build/lib/lean/` (`clean_stale_oleans`) and report them on stderr.
 
@@ -117,6 +122,23 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 # the parsed `Trusted.Rustc.V2026_06_01.MirAst` inductives (94 constructors). rustc variants that
 # `trusted/rustc-capture` lowers onto an existing constructor are not separate entries (like
 # `FakeRead` -> `.placeMention`, `AggregateKind::CoroutineClosure` -> `.closure`).
+#
+# Dual-authority correspondence modules cited by name below. Each relates
+# `Trusted.Rustc.V2026_06_01.MirSemantics` to MiniRust (`MiniRustSpec.Interp`, the `MR` module)
+# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); a `Bundle` module closes the
+# per-variant `DualCorrespondenceBundle`s over both authorities:
+#   UnwindSetDiscrAndFnPtr{MR,LM}        minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean
+#   DropBinderAndSubtype{MR,LM,Bundle}   minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean,
+#                                        theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean
+#   NullaryAndPtrCoercion{MR,LM,Bundle}  minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean,
+#                                        theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean
+#
+# Census: 90 `proved_corresponding`, 1 `supported_and_tested` (`ProjectionElem.opaqueCast`),
+# 0 `supported_untested`, 3 `unsupported_fail_closed` (`TerminatorKind.inlineAsm`,
+# `Rvalue.threadLocalRef`, `AggregateKind.coroutine`).
 MIR_AST_CATEGORIES: list[dict[str, Any]] = [
     {
         "category": "StatementKind",
@@ -131,10 +153,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("placeMention", "proved_corresponding"),
             ("intrinsic", "proved_corresponding"),
             ("nop", "proved_corresponding"),
-            ("coverage", "supported_and_tested"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C4`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("coverage", "proved_corresponding"),
             # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
             ("constEvalCounter", "proved_corresponding"),
-            ("backwardIncompatibleDropHint", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C5`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("backwardIncompatibleDropHint", "proved_corresponding"),
         ],
     },
     {
@@ -155,11 +179,13 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("unreachable", "proved_corresponding"),
             ("assert", "proved_corresponding"),
             ("call", "proved_corresponding"),
-            ("drop", "supported_and_tested"),
+            # DropBinderAndSubtype{MR,LM,Bundle}.
+            ("drop", "proved_corresponding"),
             # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
             ("tailCall", "proved_corresponding"),
-            ("unwindResume", "unsupported_fail_closed"),
-            ("unwindTerminate", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C2` and `C3`).
+            ("unwindResume", "proved_corresponding"),
+            ("unwindTerminate", "proved_corresponding"),
             ("inlineAsm", "unsupported_fail_closed"),
         ],
     },
@@ -175,7 +201,8 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("downcast", "proved_corresponding"),
             # Phase boundary, not a gap: rustc's validator rejects OpaqueCast at MirPhase::Runtime (after PostAnalysisNormalize) and both vendored Miri paths throw "OpaqueCast after borrowck" (Projection.lean `.invariant` / PlaceDynamic.lean `.invalidProgram`), while Trusted treats it as a value-transparent retype.
             ("opaqueCast", "supported_and_tested"),
-            ("unwrapUnsafeBinder", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
+            ("unwrapUnsafeBinder", "proved_corresponding"),
         ],
     },
     {
@@ -196,10 +223,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # Ground semantics in Trusted (`evalNullaryOp`, `evalShallowInitBox`,
             # `evalWrapUnsafeBinder` in `MirSemantics/Places.lean`), with two-sided
             # equalities and ground round-trip witnesses in Anneal.Mir.PlaceAndRvalue
-            # and Anneal.Mir.AdtAndControl.
-            ("nullaryOp", "supported_and_tested"),
-            ("shallowInitBox", "supported_and_tested"),
-            ("wrapUnsafeBinder", "supported_and_tested"),
+            # and Anneal.Mir.AdtAndControl. Dual-authority correspondence:
+            # NullaryAndPtrCoercion{MR,LM,Bundle} (`nullaryOp`) and
+            # DropBinderAndSubtype{MR,LM,Bundle} (`shallowInitBox`, `wrapUnsafeBinder`).
+            ("nullaryOp", "proved_corresponding"),
+            ("shallowInitBox", "proved_corresponding"),
+            ("wrapUnsafeBinder", "proved_corresponding"),
             ("threadLocalRef", "unsupported_fail_closed"),
         ],
     },
@@ -253,8 +282,11 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("transmute", "proved_corresponding"),
             ("pointerExposeProvenance", "proved_corresponding"),
             ("pointerWithExposedProvenance", "proved_corresponding"),
-            ("pointerCoercion", "supported_and_tested"),
-            ("subtype", "supported_and_tested"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C8`: the five non-`Unsize` coercions) and
+            # NullaryAndPtrCoercion{MR,LM,Bundle} (including `Unsize`).
+            ("pointerCoercion", "proved_corresponding"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C7`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("subtype", "proved_corresponding"),
             # Float casts: evidence is the kernel-checked IEEE-754 reference-model
             # agreement in `theory/Anneal/Mir/IeeeFloatCast.lean` (ties-to-even,
             # saturating float->int, NaN quietization, subnormal single rounding) plus
@@ -264,7 +296,8 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("floatToInt", "proved_corresponding"),
             ("intToFloat", "proved_corresponding"),
             ("floatToFloat", "proved_corresponding"),
-            ("fnPtrToPtr", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C6`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
+            ("fnPtrToPtr", "proved_corresponding"),
         ],
     },
     {
@@ -274,9 +307,11 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("array", "proved_corresponding"),
             ("tuple", "proved_corresponding"),
             ("adt", "proved_corresponding"),
-            ("rawPtr", "supported_and_tested"),
+            # DropBinderAndSubtype{MR,LM,Bundle}.
+            ("rawPtr", "proved_corresponding"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C10`) and DropBinderAndSubtype{MR,LM,Bundle}.
             # Also covers rustc's `AggregateKind::CoroutineClosure`, which `mir_lower.rs` lowers to `.closure`.
-            ("closure", "unsupported_fail_closed"),
+            ("closure", "proved_corresponding"),
             ("coroutine", "unsupported_fail_closed"),
         ],
     },
@@ -4922,9 +4957,17 @@ LAKE_ARTIFACT_CACHE_ENV: dict[str, str] = {
 }
 
 # Hosts / cgroups with an effective RAM ceiling strictly below 10 GiB (10240 MiB)
-# elaborate `LeanMiriSpec` (608-file `Miri` + `LeanMiriSpec` closure) single-threaded
-# to avoid `exit 137` cgroup OOM kills.
+# elaborate the `LOW_RAM_SINGLE_THREAD_STEPS` closures single-threaded to avoid
+# `exit 137` cgroup OOM kills. (The name is historical: the threshold first applied to
+# `lake_build_lean_miri_spec` alone and is kept for callers that import it.)
 LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB = 10240
+# Steps `_build_step_env` runs with `LEAN_NUM_THREADS=1` below that threshold: the
+# `MiniRustSpec` closure and the `LeanMiriSpec` modules. The vendored `Miri` library
+# under them is built by `lake_build_examples_miri_vendor`, which is deliberately not
+# listed and stays multi-threaded.
+LOW_RAM_SINGLE_THREAD_STEPS: frozenset[str] = frozenset(
+    ("lake_build_minirust_spec", "lake_build_lean_miri_spec")
+)
 
 # Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
 # `None` (representing an unreadable `/proc` / cgroup probe).
@@ -5485,9 +5528,11 @@ def _build_step_env(
     - Always populates toolchain dirs on `PATH` without mutating `os.environ`.
     - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
       so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
-    - For `lake_build_lean_miri_spec`, injects `LEAN_NUM_THREADS=1` whenever the
+    - For each `LOW_RAM_SINGLE_THREAD_STEPS` step (`lake_build_minirust_spec` and
+      `lake_build_lean_miri_spec`), injects `LEAN_NUM_THREADS=1` whenever the
       effective RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while preserving normal
-      multi-threaded builds on `>= 10 GiB` hosts. Unless `effective_ram_mib` is given,
+      multi-threaded builds on `>= 10 GiB` hosts and for every other step (including
+      `lake_build_examples_miri_vendor`). Unless `effective_ram_mib` is given,
       the ceiling is the tightest of the host/cgroup probe and, for an
       `anneal-lean-run`-wrapped step `cmd`, the `MemoryMax` the wrapper plans for it.
     - Explicit `env_overrides` take final precedence.
@@ -5495,7 +5540,7 @@ def _build_step_env(
     env = dict(os.environ if base_env is None else base_env)
     _ensure_toolchain_path(env, use_ambient_home=base_env is None)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
-    if step_name == "lake_build_lean_miri_spec":
+    if step_name in LOW_RAM_SINGLE_THREAD_STEPS:
         if effective_ram_mib is _RAM_UNSET:
             probe_env = {**env, **env_overrides} if env_overrides else env
             ceilings = [
@@ -6406,9 +6451,12 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     """Return ordered `(step_name, category, cmd, timeout_sec)` for `profile`.
 
     `quick` and `nightly` start with `lake_build_core_theory` (`Trusted`, `Anneal`,
-    `MiniRust` `.olean`s) before any trusted-boundary or Lean step; `nightly` also
-    builds every workspace module imported by the standalone `tests/mir` files
-    (`lake_build_mir_test_modules`) right before running them. A step wrapped in
+    `MiniRust` `.olean`s) before any trusted-boundary or Lean step, and build `Trusted`
+    in the `examples` Lake root (`lake_build_examples_trusted`) right before
+    `rust_workspace_unit_tests`; `nightly` also builds every workspace module imported
+    by the standalone `tests/mir` files (`lake_build_mir_test_modules`) right before
+    running them, and the vendored `Miri` library (`lake_build_examples_miri_vendor`)
+    right before `lake_build_lean_miri_spec`. A step wrapped in
     `anneal-lean-run` receives its step budget as the wrapper's own `--timeout`, so
     the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
     queueing and a grace margin on top).
@@ -6529,6 +6577,19 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             ],
             180,
         )
+        # `cargo test --workspace` runs the `trusted/rustc-capture` tests in parallel, and
+        # each one that kernel-checks emitted Lean modules starts its own
+        # `lake --dir examples build Trusted` when
+        # `examples/.lake/build/lib/lean/Trusted.olean` is missing: concurrent builds of
+        # one Lake root race. Building `Trusted` there first (a no-op once built) leaves
+        # those tests nothing to build.
+        add(
+            "lake_build_examples_trusted",
+            "cat1_trusted_boundary",
+            ["lake", "--dir", "examples", "build", "Trusted"],
+            600,
+            wrap="build",
+        )
         add(
             "rust_workspace_unit_tests",
             "cat3_rust_unit_tests",
@@ -6577,6 +6638,18 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             "cat2_correspondence_suites",
             ["lake", "build", "MiniRustSpec"],
             1200,
+            wrap="build",
+        )
+        # The `LeanMiriSpec` closure is built in two steps, each with its own budget and
+        # thread policy: first the vendored `Miri` library (`lean-miri/vendor`, which never
+        # imports `Trusted`), always multi-threaded, then the `LeanMiriSpec` modules on top
+        # of it, single-threaded below 10 GiB (`LOW_RAM_SINGLE_THREAD_STEPS`). Both run in
+        # the `examples` Lake root, so the second step reuses the first one's `.olean`s.
+        add(
+            "lake_build_examples_miri_vendor",
+            "cat2_correspondence_suites",
+            ["lake", "--dir", "examples", "build", "Miri"],
+            900,
             wrap="build",
         )
         add(
