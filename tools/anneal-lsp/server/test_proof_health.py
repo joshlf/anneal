@@ -7924,7 +7924,7 @@ class TestNegationPrecedenceB3AdversarialFixes(unittest.TestCase):
         for e in exprs:
             self.assertEqual(ph._split_top_level_eq(e), ph._split_top_level_pat(e, ph._STANDALONE_EQ_SPLIT_RE), e)
             for op, not_before, not_after, pat in (
-                ("=", "=!<>:", "=", ph._STANDALONE_EQ_SPLIT_RE),
+                ("=", "=!<>:", "=>", ph._STANDALONE_EQ_SPLIT_RE),
                 ("<", "<", "<=|-$*", ph._LT_TOP_SPLIT_RE),
                 ("≤", "", "", ph._LE_TOP_SPLIT_RE),
                 (">", "->=|*$", ">=", ph._GT_TOP_SPLIT_RE),
@@ -8406,6 +8406,150 @@ class TestNegationPrecedenceB4AdversarialFixes(unittest.TestCase):
     def test_check_trusted_agrees_on_every_b4_header(self) -> None:
         ct = _load_check_trusted()
         self.assertFalse(hasattr(ct, "_SPLIT_RE_CACHE"))
+        for label, src in {**self.VACUOUS_BOTH_SCOPES, **self.CLEAN}.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
+class TestNegationPrecedenceA4AdversarialFixes(unittest.TestCase):
+    r"""`[adv A4]` final closeout regressions for bugs uncovered across `[adv B4]` and Episode 1:
+
+    1. `_operand_may_be_float`: `<|>` (`OrElse` / `Alternative`) matched both `|>` and `<|`
+       (`x <|> lenFloat`, `lenFloat <|> y`), bare `&>` matched `<&>`, following combinators ran
+       before the argument check (`f lenFloat <| n`, `f lenFloat $ n`, `f lenFloat ∘ g`), closing
+       `»` / `"` delimiters were missed (`«f» lenFloat y`, `f "a" lenFloat y`), and string-literal
+       arguments (`parseFloat "NaN"`) were missed.
+    2. `_quantifier_context_before`: dependent-arrow domains `(x y : Nat) → Fin 0 → Nat → Prop`
+       collapsed 2 parameters into 1 slot (shifting `Fin 0` left onto an inhabited slot),
+       `(Nat : Type) → Nat → Prop` failed to shadow `Nat` for subsequent domains of the arrow, and
+       `(x : Nat := 0) → ...` defaults were not stopped conservatively.
+    3. `_untyped_binders_inhabited_by_calls`: `«f» R s` and `f "a" R s` treated `R` as a call head
+       because `»` / `"` were omitted from preceding delimiters; char literals (`R 'a' s`),
+       string literals (`R "hi" s`, `R r#"hi"# s`), and `_`-separated numerals (`R 0xFF_FF s`) now
+       consume one slot while interpolated strings (`R s!"..." s`) stop conservatively.
+    4. String-literal neutralization in `audit_lean_text`: blanking strings in `code_only` collapsed
+       distinct string literals in theorem headers (`f "a" = f "b"`, `f "a" ≠ f "b"`,
+       `res = .error (.ub "a")` vs `res ≠ .error (.ub "b")`, `R "hi" s`, `parseFloat "NaN"`).
+       Neutralizing real non-comment strings to opaque all-digit `"0<digits>"` tokens preserves
+       distinctness and cache invalidation while leaving `strip_lean_comments_and_strings` intact.
+    5. Conjunct-nested dependent arrows (`P ∧ ((x : Float) → ¬ x ≤ x)`, `P ∧ ((x : Nat) → False)`
+       with shadowed `Nat`, `P ∧ ((x : Nat) → Q x ∧ ((y : Nat) → ¬ Q x))`) missed `has_quant`,
+       dropping `shadowed`, `scope_binds`, and `q_float_vars_out`.
+    6. `_is_trivially_true` handles `∀` optParam defaults (`P ∨ ∀ (x : Float := 0.0), x ≤ x`) and
+       pattern binders (`∀ ⟨a, b⟩, a = a`), and `_split_top_level_eq` excludes `=>`.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "orelse_rhs_lenFloat_not_le": "theorem bad (x lenFloat : Option Nat) (h : ¬ (x <|> lenFloat) ≤ (x <|> lenFloat)) : P := by sorry\n",
+        "orelse_lhs_lenFloat_not_le": "theorem bad (lenFloat y : Option Nat) (h : ¬ (lenFloat <|> y) ≤ (lenFloat <|> y)) : P := by sorry\n",
+        "arg_before_pipe_left_not_le": "theorem bad (f : Option Nat → Nat → Nat) (lenFloat : Option Nat) (n : Nat) (h : ¬ (f lenFloat <| n) ≤ (f lenFloat <| n)) : P := by sorry\n",
+        "arg_before_dollar_not_le": "theorem bad (f : Option Nat → Nat → Nat) (lenFloat : Option Nat) (n : Nat) (h : ¬ (f lenFloat $ n) ≤ (f lenFloat $ n)) : P := by sorry\n",
+        "arg_before_compose_not_le": "theorem bad (f : Option Nat → Nat → Nat) (lenFloat : Option Nat) (g : Nat → Nat) (n : Nat) (h : ¬ (f lenFloat ∘ g) n ≤ (f lenFloat ∘ g) n) : P := by sorry\n",
+        "guillemet_fn_lenFloat_arg": "theorem bad («f» : Option Nat → Nat → Nat) (lenFloat : Option Nat) (y : Nat) (h : ¬ «f» lenFloat y ≤ «f» lenFloat y) : P := by sorry\n",
+        "string_arg_before_lenFloat": 'theorem bad (f : String → Option Nat → Nat → Nat) (lenFloat : Option Nat) (y : Nat) (h : ¬ f "a" lenFloat y ≤ f "a" lenFloat y) : P := by sorry\n',
+        "multi_dep_arrow_inhabited_slot": "theorem bad (R : (x y : Nat) → Prop) (h : ∀ s, R 0 s ∧ False) : P := by sorry\n",
+        "string_arg_inhabited_slot": 'theorem bad (R : String → Nat → Prop) (h : ∀ s, R "hi" s ∧ False) : P := by sorry\n',
+        "raw_string_arg_inhabited_slot": 'theorem bad (R : String → Nat → Prop) (h : ∀ s, R r#"hi"# s ∧ False) : P := by sorry\n',
+        "char_arg_inhabited_slot": "theorem bad (R : Char → Nat → Prop) (h : ∀ s, R 'a' s ∧ False) : P := by sorry\n",
+        "escaped_char_arg_inhabited_slot": "theorem bad (R : Char → Nat → Prop) (h : ∀ s, R '\\'' s ∧ False) : P := by sorry\n",
+        "underscore_hex_arg_inhabited_slot": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 0xFF_FF s ∧ False) : P := by sorry\n",
+        "same_string_neq_contradiction": 'theorem bad (f : String → Nat) (h : f "a" ≠ f "a") : P := by sorry\n',
+        "same_string_pos_neg_pair": 'theorem bad (f : String → Prop) (h1 : f "a") (h2 : ¬ f "a") : P := by sorry\n',
+        "conj_dep_arrow_nested_pair": "theorem bad (P : Prop) (Q : Nat → Prop) (h : P ∧ ((x : Nat) → Q x ∧ ((y : Nat) → ¬ Q x))) : R := by sorry\n",
+    }
+
+    CLEAN = {
+        "multi_dep_arrow_keeps_empty_slot": "theorem ok (R : (x y : Nat) → Fin 0 → Nat → Prop) (h : ∀ s, R 0 1 s ∧ False) : P := by sorry\n",
+        "dep_arrow_shadows_Nat": "theorem ok (R : (Nat : Type) → Nat → Prop) (h : ∀ s, R (Fin 0) s ∧ False) : P := by sorry\n",
+        "dep_arrow_shadows_List": "theorem ok (R : (List : Type → Type) → List Nat → Prop) (h : ∀ s, R (fun _ => Fin 0) s ∧ False) : P := by sorry\n",
+        "dep_arrow_optparam_stops": "theorem ok (R : (x : Nat := 0) → Fin 0 → Nat → Prop) (h : ∀ s, R s ∧ False) : P := by sorry\n",
+        "string_arg_keeps_empty_slot": 'theorem ok (R : String → Fin 0 → Nat → Prop) (h : ∀ s, R "hi" s ∧ False) : P := by sorry\n',
+        "raw_string_arg_keeps_empty_slot": 'theorem ok (R : String → Fin 0 → Nat → Prop) (h : ∀ s, R r#"hi"# s ∧ False) : P := by sorry\n',
+        "interp_string_arg_stops": 'theorem ok (R : String → Fin 0 → Nat → Prop) (h : ∀ s, R s!"hi" s ∧ False) : P := by sorry\n',
+        "char_arg_keeps_empty_slot": "theorem ok (R : Char → Fin 0 → Nat → Prop) (h : ∀ s, R 'a' s ∧ False) : P := by sorry\n",
+        "underscore_hex_keeps_empty_slot": "theorem ok (R : Nat → Fin 0 → Nat → Prop) (h : ∀ s, R 0xFF_FF s ∧ False) : P := by sorry\n",
+        "guillemet_head_not_call_head": "theorem ok («f» : (Nat → Prop) → Fin 0 → Prop) (R : Nat → Prop) (h : ∀ s, «f» R s ∧ False) : P := by sorry\n",
+        "string_arg_before_fn_not_call_head": 'theorem ok (f : String → (Nat → Prop) → Fin 0 → Prop) (R : Nat → Prop) (h : ∀ s, f "a" R s ∧ False) : P := by sorry\n',
+        "parseFloat_string_arg_not_le": 'theorem ok (h : ¬ parseFloat "NaN" ≤ parseFloat "NaN") : P := by sorry\n',
+        "diff_string_neq_hyp": 'theorem ok (f : String → Nat) (h : f "a" ≠ f "b") : P := by sorry\n',
+        "diff_string_neg_eq_hyp": 'theorem ok (f : String → Nat) (h : ¬ f "a" = f "b") : P := by sorry\n',
+        "diff_string_pos_neg_hyps": 'theorem ok (f : String → Prop) (h1 : f "a") (h2 : ¬ f "b") : P := by sorry\n',
+        "diff_string_minirust_ub_pair": 'theorem ok (res : Except String Nat) (h1 : res = .error (.ub "out of bounds")) (h2 : res ≠ .error (.ub "unaligned")) : P := by sorry\n',
+        "diff_string_conclusion": 'theorem ok (f : String → Nat) : f "a" = f "b" := by sorry\n',
+        "diff_string_not_tautology": 'theorem ok (f : String → Prop) (h : f "a") : f "b" := by sorry\n',
+        "refutation_some_string_eq_none": 'theorem noConf (h : some "a" = none) : False := by sorry\n',
+        "conj_dep_arrow_float": "theorem ok (P : Prop) (h : P ∧ ((x : Float) → ¬ x ≤ x)) : Q := by sorry\n",
+        "conj_dep_arrow_shadowed_nat": "theorem ok (Nat : Prop) (P : Prop) (h : P ∧ ((x : Nat) → False)) : Q := by sorry\n",
+        "disj_forall_optparam_float": "theorem ok (P : Prop) : P ∨ ∀ (x : Float := 0.0), x ≤ x := by sorry\n",
+        "string_inside_comment_and_char_quote": "theorem ok (f : String → Nat) (c : Char) (h : c = '\"' ∧ f \"a\" /- \"c\" -/ ≠ f \"b\") : P := by sorry\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_a4_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_a4_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        for label, src in self.CLEAN.items():
+            self.assertEqual(audit.scan_lean_text(src), [], f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_a4_trivial_conclusions_with_strings_and_pattern_binders(self) -> None:
+        rule = audit.RULE_TRIVIAL_CONCLUSION
+        for label, src in (
+            ("same_string_conc", 'theorem bad (f : String → Nat) : f "a" = f "a" := by sorry\n'),
+            ("same_raw_string_conc", 'theorem bad (f : String → Nat) : f r#"a"# = f r#"a"# := by sorry\n'),
+            ("forall_pattern_binder", "theorem bad (P : Prop) : P ∨ ∀ ⟨a, b⟩, a = a := by sorry\n"),
+        ):
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+
+    def test_a4_float_combinators_and_orelse(self) -> None:
+        may_float = proof_health._operand_may_be_float
+        none: frozenset[str] = frozenset()
+        for yes in (
+            'parseFloat "0123"',
+            "if c then toFloat <| n else 0",
+            "(toFloat) <| n",
+            "o <&> toFloat",
+            "n |> toFloat",
+        ):
+            self.assertTrue(may_float(yes, none), yes)
+        for no in (
+            "x <|> lenFloat",
+            "lenFloat <|> y",
+            "x &> lenFloat",
+            "f lenFloat <| n",
+            "f lenFloat $ n",
+            "f lenFloat <$> o",
+            "f lenFloat ∘ g",
+            "f (lenFloat) <| n",
+            "«f» lenFloat y",
+            'f "0123" lenFloat y',
+            "lenFloat |> f",
+        ):
+            self.assertFalse(may_float(no, none), no)
+
+    def test_a4_string_edit_invalidates_theorem_cache(self) -> None:
+        src_clean = 'theorem t (f : String → Nat) : f "a" = f "b" := by sorry\n'
+        src_triv = 'theorem t (f : String → Nat) : f "a" = f "a" := by sorry\n'
+        self.assertEqual(audit.scan_lean_text(src_clean), [])
+        self.assertIn(audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src_triv)))
+        self.assertEqual(audit.scan_lean_text(src_clean), [])
+
+    def test_a4_split_top_level_eq_excludes_fat_arrow(self) -> None:
+        self.assertEqual(proof_health._split_top_level_eq("fun x => x"), ["fun x => x"])
+        self.assertEqual(proof_health._split_top_level_eq("f = fun x => g x"), ["f", "fun x => g x"])
+
+    def test_check_trusted_agrees_on_every_a4_header(self) -> None:
+        ct = _load_check_trusted()
         for label, src in {**self.VACUOUS_BOTH_SCOPES, **self.CLEAN}.items():
             for scope in ("all", "annotated", "annotated-only"):
                 self.assertEqual(

@@ -4436,11 +4436,32 @@ def _first_standalone_use(body: str, name: str) -> int:
         return idx
 
 
-# `[adv B4]` One whole Lean numeric literal: `0xFF` / `0b11` / `0o17`, or decimal digits with an
-# optional fraction and exponent (`12`, `1.5`, `1e5`, `1.5e-3`).
+# `[adv B4]` / `[adv A4]` One whole Lean numeric literal: `0xFF` / `0b11` / `0o17`, or decimal
+# digits with optional `_` digit separators, fraction, and exponent (`12`, `1_000`, `1.5`, `1e5`,
+# `1.5e-3`).
 _NUM_ARG_RE = re.compile(
-    r"0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+    r"0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*"
+    r"|\d(?:_?\d)*(?:\.\d(?:_?\d)*)?(?:[eE][-+]?\d(?:_?\d)*)?"
 )
+_CHAR_ARG_RE = re.compile(r"'u[0-9a-f_]+'|'(?:\\[^\n]{1,8}?|[^\\'\n])'")
+
+
+def _skip_string_literal_arg(body: str, pos: int, n_body: int) -> int:
+    """Advance past a single `\"...\"` literal starting at `body[pos]`, or return `-1` if unclosed."""
+    q = pos + 1
+    while q < n_body:
+        q2 = body.find('"', q)
+        if q2 == -1:
+            return -1
+        bs = 0
+        bk = q2 - 1
+        while bk > pos and body[bk] == "\\":
+            bs += 1
+            bk -= 1
+        q = q2 + 1
+        if bs % 2 == 0:
+            return q
+    return -1
 
 
 def _skip_atomic_proj_chain(body: str, pos: int, n_body: int) -> int:
@@ -4516,7 +4537,7 @@ def _untyped_binders_inhabited_by_calls(
             while prev_i >= 0 and body[prev_i] in " \t\r\n":
                 prev_i -= 1
             if prev_i >= 0 and (
-                _is_lean_ident_char(body[prev_i]) or body[prev_i] in ")]}⟩⦄"
+                _is_lean_ident_char(body[prev_i]) or body[prev_i] in ")]}⟩⦄»\""
             ):
                 continue
             # Parse up to `len(dom_flags)` atomic arguments right after `f_name`.
@@ -4543,6 +4564,20 @@ def _untyped_binders_inhabited_by_calls(
                         break
                     arg_pos = _skip_atomic_proj_chain(body, q, n_body)
                     continue
+                if ch == '"':
+                    # `[adv A4]` Neutralized or raw string literal argument (`R "hi" s`): one slot.
+                    q = _skip_string_literal_arg(body, arg_pos, n_body)
+                    if q == -1:
+                        break
+                    arg_pos = _skip_atomic_proj_chain(body, q, n_body)
+                    continue
+                if ch == "'":
+                    # `[adv A4]` Char literal argument (`R 'a' s`, raw or neutralized `'u61'`): one slot.
+                    m_ch = _CHAR_ARG_RE.match(body, arg_pos)
+                    if m_ch is None:
+                        break
+                    arg_pos = _skip_atomic_proj_chain(body, m_ch.end(), n_body)
+                    continue
                 if ch.isdecimal():
                     # `[adv A3]` Numeral argument (`R 0 s`): consume this slot and advance.
                     # `[adv B4]` The whole literal is one slot. Reading only the leading digits
@@ -4567,6 +4602,10 @@ def _untyped_binders_inhabited_by_calls(
                 if tok in _LEAN_EXPR_KW_STOP:
                     break
                 end_tok = m_id.end()
+                if end_tok < n_body and body[end_tok] == '"':
+                    # `[adv A4]` Interpolated string (`s!"..."` / `m!"..."`): stop conservatively
+                    # so it neither splits across two slots nor hides inner uses of an untyped var.
+                    break
                 if end_tok < n_body and body[end_tok] in ".[":
                     # `s.val` / `s[0]` passes a projection/element of `s`, NOT `s` itself:
                     # e.g. `s : Fin 0` has `s.val : Nat` even though `Fin 0` is empty.
@@ -4787,7 +4826,7 @@ def _hyp_atoms(
 
 
 _SIMPLE_TERM_TOKEN_RE = re.compile(
-    r"\s+|«[^»]*»|(?<![\w'.!?])'[^'\n]*'|\.?[^\W\d][\w'!?]*(?:\.[^\W\d][\w'!?]*)*"
+    r'\s+|«[^»]*»|(?<![\w\'.!?])\'[^\'\n]*\'|"0\d+"|\.?[^\W\d][\w\'!?]*(?:\.[^\W\d][\w\'!?]*)*'
     r"|\.?\d+(?:\.\d+)*|::|\+\+|[-+*/%^@#↑]|!(?!=)|([(\[⟨])|([)\]⟩])"
 )
 _SIMPLE_RELATION_RE = re.compile(
@@ -4978,7 +5017,7 @@ def _any_disjunct_trivial(expr: str, float_vars: frozenset[str] = _NO_BOUND_NAME
     return found_trivial or _is_trivially_true(expr[start:], float_vars)
 
 
-_STANDALONE_EQ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![=!<>:])=(?!=)")
+_STANDALONE_EQ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![=!<>:])=(?![=>])")
 # `[adv B3]` A prefix that is only non-bracket text and balanced bracket groups nested at most two
 # deep, with no `«`: the depth-0 scanners (which count every bracket kind alike and skip `«...»`)
 # are at depth 0 right after it. Unrolled (`run (group run)*`, each group opening on a character
@@ -5012,8 +5051,8 @@ def _split_single_depth0_op(
 
 
 def _split_top_level_eq(expr: str) -> list[str]:
-    """Split `expr` on top-level standalone `=` (excluding `==`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}⟨⟩⦃⦄` and `«...»`."""
-    fast = _split_single_depth0_op(expr, "=", "=!<>:", "=")
+    """Split `expr` on top-level standalone `=` (excluding `==`, `=>`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}⟨⟩⦃⦄` and `«...»`."""
+    fast = _split_single_depth0_op(expr, "=", "=!<>:", "=>")
     if fast is not None:
         return fast
     parts: list[str] = []
@@ -5061,36 +5100,32 @@ def _is_trivially_true(
     if c.startswith("∀") or (
         c.startswith("forall") and len(c) > 6 and not _is_lean_ident_char(c[6])
     ):
-        q_len = 1 if c.startswith("∀") else 6
-        idx_q = q_len
-        n_c = len(c)
-        while idx_q < n_c:
-            ch = c[idx_q]
-            if ch in "({[⦃":
-                idx_q, _ = _scan_binder_group(c, idx_q, n_c)
-                continue
-            if ch == ",":
-                next_fv = float_vars
-                q_bind_str = c[q_len:idx_q]
-                if float_vars or "Float" in q_bind_str:
-                    groups = _parse_quantifier_binder_groups(q_bind_str)
-                    fv_set = set(float_vars)
-                    if groups is not None:
-                        for g_names, g_type in groups:
-                            if g_type is not None and _norm_expr(g_type) in _FLOAT_TYPE_NAMES:
-                                fv_set.update(g_names)
-                            else:
-                                fv_set.difference_update(g_names)
-                    else:
-                        fv_set.difference_update(_quantifier_bound_names(q_bind_str))
-                    next_fv = frozenset(fv_set)
-                body = _norm_expr(c[idx_q + 1 :])
-                return (
-                    _is_trivially_true(body, next_fv, already_norm=True)
-                    or ("∧" in body and _all_conjuncts_trivial(body, next_fv))
-                    or ("∨" in body and _any_disjunct_trivial(body, next_fv))
-                )
-            idx_q += 1
+        q_split = _split_quantifier_prefix(c)
+        if q_split is not None:
+            _, q_bind_str, q_body = q_split
+            next_fv = float_vars
+            if float_vars or "Float" in q_bind_str:
+                groups = _parse_quantifier_binder_groups(q_bind_str)
+                fv_set = set(float_vars)
+                if groups is not None:
+                    for g_names, g_type in groups:
+                        if g_type is not None:
+                            g_bt = _norm_expr(_strip_binder_default(g_type))
+                        else:
+                            g_bt = ""
+                        if g_bt in _FLOAT_TYPE_NAMES:
+                            fv_set.update(g_names)
+                        else:
+                            fv_set.difference_update(g_names)
+                else:
+                    fv_set.difference_update(_quantifier_bound_names(q_bind_str))
+                next_fv = frozenset(fv_set)
+            body = _norm_expr(q_body)
+            return (
+                _is_trivially_true(body, next_fv, already_norm=True)
+                or ("∧" in body and _all_conjuncts_trivial(body, next_fv))
+                or ("∨" in body and _any_disjunct_trivial(body, next_fv))
+            )
     n_c = len(c)
     for op in ("↔", "≤", "="):
         op_i = c.find(op)
@@ -5728,31 +5763,39 @@ def _operand_may_be_float(
                 break
             lo = p
             hi = q + 1
-        # `[adv B4]` `[adv A3]` accepted only `name arg` with nothing but an operator or an opening
-        # bracket before the name, so `toFloat <| n`, `n |> toFloat`, `toFloat ∘ f`, `(toFloat) n`,
-        # `toFloat ↑n` and `if c then toFloat n else 0` lost their `Float` reading, and `¬ e ≤ e`
-        # over them (true of `NaN`) was reported as a contradiction.
-        if p >= 0 and (e[p] == "∘" or (e[p] == ">" and p > 0 and e[p - 1] in "|&")):
+        # `[adv B4]` / `[adv A4]` Recognize preceding right-pipe / composition (`∘`, `|>` excluding
+        # `<|>`, and `<&>`) before checking for a following argument or combinator; check whether
+        # `tok` is an argument to a preceding head (`f lenFloat <| n`, `«f» lenFloat y`,
+        # `f "a" lenFloat y`) before accepting following combinators (`∘`, `$`, `<|` excl. `<|>`, `<$>`).
+        if p >= 0 and (
+            e[p] == "∘"
+            or (e[p] == ">" and p > 0 and e[p - 1] == "|" and (p < 2 or e[p - 2] != "<"))
+            or (p >= 2 and e[p - 2 : p + 1] == "<&>")
+        ):
             return True
         if q >= n_e:
             continue
-        nc = e[q]
-        if nc in "∘$" or e.startswith("<|", q) or e.startswith("<$>", q):
-            return True
-        if p >= 0 and (_is_lean_ident_char(e[p]) or e[p] in ")]}⟩⦄"):
-            # After an identifier or a closing bracket the name is an argument (`f lenFloat y`),
+        if p >= 0 and (_is_lean_ident_char(e[p]) or e[p] in ")]}⟩⦄»\""):
+            # After an identifier or a closing delimiter the name is an argument (`f lenFloat y`),
             # unless that identifier is a keyword (`then toFloat n`).
             w = p + 1
             while w > 0 and _is_lean_ident_char(e[w - 1]):
                 w -= 1
             if e[w : p + 1] not in _LEAN_EXPR_KW_STOP:
                 continue
+        nc = e[q]
+        if (
+            nc in "∘$"
+            or (e.startswith("<|", q) and not e.startswith("<|>", q))
+            or e.startswith("<$>", q)
+        ):
+            return True
         if nc == "(":
             return True
         if q == hi:
             # No blank after the name: an operator or a subscript (`lenFloat+1`, `lenFloat[0]`).
             continue
-        if nc in "[{⟨⦃«↑@#`" or (nc == "." and q + 1 < n_e and _is_lean_ident_char(e[q + 1])):
+        if nc in "[{⟨⦃«↑@#`\"" or (nc == "." and q + 1 < n_e and _is_lean_ident_char(e[q + 1])):
             return True
         m_arg = _IDENT_EXTRACT_RE.match(e, q)
         if m_arg is not None:
@@ -6061,6 +6104,29 @@ def _nat_vars_before(all_hyps: list[tuple[str, str]], limit_idx: int) -> frozens
 
 
 _QUANT_RESERVED_NAMES = _FALSE_ELIM_RESERVED_NAMES | frozenset(("Fin",))
+_DEP_DOM_COLON_RE = re.compile(
+    r"«[^»]*»|" + _SCAN_CHAR_LIT_ALT + "|" + _SCAN_BRACKET_ALTS + r"|(?<!:):(?![=:])"
+)
+
+
+def _find_depth0_colon(expr: str) -> int:
+    """Offset of the first depth-0 standalone `:` (not `:=` or `::`) in `expr`, or `-1`."""
+    if ":" not in expr:
+        return -1
+    depth = 0
+    for m in _DEP_DOM_COLON_RE.finditer(expr):
+        t = m.group(0)
+        c0 = t[0]
+        if c0 == "«" or c0 == "'":
+            continue
+        if c0 in "([{⟨⦃":
+            depth += 1
+        elif c0 in ")]}⟩⦄":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            return m.start()
+    return -1
 
 
 def _quantifier_context_before(
@@ -6070,8 +6136,9 @@ def _quantifier_context_before(
     tracked in telescope order: `shadowed_reserved` are reserved data/container/typeclass names
     (and `Fin`) rebound by earlier binders; `fn_domains` maps each earlier arrow-typed binder to a
     tuple of booleans recording whether each leading explicit domain type (stopping before any
-    implicit/strict-implicit/instance domain `{...}`/`⦃...⦄`/`[...]`, which is omitted at normal
-    call sites) is unconditionally inhabited (left empty when `need_fn_domains` is false)."""
+    implicit/strict-implicit/instance domain `{...}`/`⦃...⦄`/`[...]` or default parameter
+    `(x : T := v)`, which can be omitted at call sites) is unconditionally inhabited (left empty
+    when `need_fn_domains` is false)."""
     if not need_fn_domains:
         shadowed_fast: set[str] = set()
         for b_names, _ in all_hyps[:limit_idx]:
@@ -6094,17 +6161,35 @@ def _quantifier_context_before(
         dom_flags: tuple[bool, ...] = ()
         if "→" in b_type or "->" in b_type:
             doms = _top_level_arrow_domains(b_type)
-            explicit_doms: list[str] = []
+            flags: list[bool] = []
+            cur_sh = set(shadowed)
             for d in doms:
-                if d and d[0] in "{⦃[":
+                if not d or d[0] in "{⦃[":
                     break
-                explicit_doms.append(d)
-            if explicit_doms:
-                sh_snap = frozenset(shadowed) if shadowed else _NO_BOUND_NAMES
-                dom_flags = tuple(
-                    _is_non_prop_binder_type(d, _NO_BOUND_NAMES, shadowed=sh_snap)
-                    for d in explicit_doms
-                )
+                col = _find_depth0_colon(d)
+                if col != -1:
+                    # `[adv A4]` Dependent-arrow domain `(x y : T)` contributes one positional slot
+                    # per bound name and brings those names into scope for all later domains of
+                    # this arrow type (preventing both slot-shift on `(x y : Nat) → Fin 0 → Nat → Prop`
+                    # and unshadowed type reads on `(Nat : Type) → Nat → Prop`).
+                    names_raw = d[:col].strip()
+                    t_raw = d[col + 1 :].strip()
+                    if (
+                        not t_raw
+                        or _BARE_BINDER_NAMES_RE.fullmatch(names_raw) is None
+                        or (":=" in t_raw and _strip_binder_default(t_raw) != t_raw)
+                    ):
+                        break
+                    param_names = names_raw.split()
+                    sh_snap = frozenset(cur_sh) if cur_sh else _NO_BOUND_NAMES
+                    is_inhab = _is_non_prop_binder_type(t_raw, _NO_BOUND_NAMES, shadowed=sh_snap)
+                    flags.extend([is_inhab] * len(param_names))
+                    cur_sh.update(param_names)
+                else:
+                    sh_snap = frozenset(cur_sh) if cur_sh else _NO_BOUND_NAMES
+                    flags.append(_is_non_prop_binder_type(d, _NO_BOUND_NAMES, shadowed=sh_snap))
+            if flags:
+                dom_flags = tuple(flags)
         for tok in names:
             if dom_flags:
                 fn_domains[tok] = dom_flags
@@ -6446,7 +6531,16 @@ def _audit_lean_theorem(
             )
             if has_conj or has_top_quant:
                 has_forall = "∀" in nh or "forall" in nh
-                has_quant = has_top_quant or has_forall or "∃" in nh or "exists" in nh
+                # `[adv A4]` Conjunct-nested dependent arrows (`P ∧ ((x : Float) → ¬ x ≤ x)`,
+                # `P ∧ ((x : Nat) → False)` with shadowed `Nat`) also descend inside `_hyp_atoms`
+                # and need `shadowed`, `scope_binds`, and `q_float_vars_out`.
+                has_quant = (
+                    has_top_quant
+                    or has_forall
+                    or "∃" in nh
+                    or "exists" in nh
+                    or (":" in nh and ("→" in nh or "->" in nh))
+                )
                 if has_quant:
                     scope_binds = {}
                     if "Float" in nh:
@@ -7022,6 +7116,104 @@ def _parse_3axis_metadata_and_conflicts(comment_text: str) -> tuple[dict[str, st
     return res
 
 
+def _neutralize_lean_strings_in_slice(
+    text: str,
+    code_only: str,
+    comment_blocks: list[tuple[int, int, int, str, str]],
+    comment_starts: list[int],
+    start: int,
+    end: int,
+) -> str | None:
+    """Return `code_only[start:end]` with every real Lean string literal (`\"...\"` / `r#\"...\"#`)
+    replaced by a deterministic opaque all-digit literal token `\"0<digits>\"` (matching neither
+    `_IDENT_EXTRACT_RE` nor `_NUM_LIT_RE`, with no brackets/operators/spaces, preserving equality
+    of identical strings and distinctness of different strings), or `None` when no real string
+    literal occurs in `[start, end)` (quotes only inside comments, guillemets, or `'\"'`/`'\\\"'`
+    char literals)."""
+    n_text = len(text)
+    n_comments = len(comment_blocks)
+    find = text.find
+    chunks: list[str] | None = None
+    last_emit = start
+    pos = start
+    while pos < end:
+        q = find('"', pos, end)
+        if q == -1:
+            break
+        if code_only[q] != " ":
+            pos = q + 1
+            continue
+        if n_comments:
+            k = _wa_bisect_right(comment_starts, q) - 1
+            if k >= 0 and comment_blocks[k][0] <= q < comment_blocks[k][1]:
+                pos = comment_blocks[k][1]
+                continue
+        is_raw = False
+        raw_start = q
+        if q > 0 and text[q - 1] in "#r'\\":
+            h = q
+            while h > 0 and text[h - 1] == "#":
+                h -= 1
+            if (
+                h > 0
+                and text[h - 1] == "r"
+                and (h < 2 or not (_is_lean_ident_char(text[h - 2]) or text[h - 2] == "."))
+            ):
+                is_raw = True
+                raw_start = h - 1
+            elif (
+                q + 1 < n_text
+                and text[q + 1] == "'"
+                and (
+                    (
+                        text[q - 1] == "'"
+                        and (
+                            q < 2
+                            or (not _is_lean_ident_char(text[q - 2]) and text[q - 2] != "\\")
+                        )
+                    )
+                    or (
+                        q >= 2
+                        and text[q - 2 : q] == "'\\"
+                        and (q < 3 or not _is_lean_ident_char(text[q - 3]))
+                    )
+                )
+            ):
+                pos = q + 1
+                continue
+        if is_raw:
+            closer = '"' + "#" * (q - (raw_start + 1))
+            c = find(closer, q + 1, end)
+            cur = end if c == -1 else c + len(closer)
+            str_start = raw_start if raw_start >= last_emit else q
+        else:
+            cur = q + 1
+            while cur < end:
+                q2 = find('"', cur, end)
+                if q2 == -1:
+                    cur = end
+                    break
+                bs = 0
+                bk = q2 - 1
+                while bk >= q + 1 and text[bk] == "\\":
+                    bs += 1
+                    bk -= 1
+                cur = q2 + 1
+                if bs % 2 == 0:
+                    break
+            str_start = q
+        if chunks is None:
+            chunks = []
+        chunks.append(code_only[last_emit:str_start])
+        chunks.append(f'"0{int(compute_sha256_pin12(text[str_start:cur]), 16)}"')
+        last_emit = cur
+        pos = cur
+    if chunks is None:
+        return None
+    chunks.append(code_only[last_emit:end])
+    return "".join(chunks)
+
+
 def audit_lean_text(
     text: str,
     *,
@@ -7228,6 +7420,7 @@ def audit_lean_text(
         thm_cache = _THM_AUDIT_CACHE
         thm_cache_get = thm_cache.get
         cache_has_entries = use_thm_cache and bool(thm_cache)
+        has_quote_in_text = '"' in text
         thms = _iter_lean_theorem_headers(code_only)
         n_thms = len(thms)
         for idx_t, (kw_start, name_end, thm_name) in enumerate(thms):
@@ -7240,13 +7433,35 @@ def audit_lean_text(
                     continue
                 contradiction_only = True
             next_thm_bound = thms[idx_t + 1][0] if idx_t + 1 < n_thms else n_code
+            # `[adv A4]` `code_only` blanks string literals to spaces (so `TestStripLeanCommentsAndStrings`
+            # and structural scanning stay untouched), which would collapse distinct strings in a
+            # theorem header (`f "a" ≠ f "b"` -> `f ≠ f`, `R "hi" s` -> `R s`). Neutralize real
+            # string literals only when a `"` appears in this theorem's slice.
+            hdr_code = code_only
+            hdr_start = name_end
+            hdr_end = next_thm_bound
+            if has_quote_in_text and text.find('"', name_end, next_thm_bound) != -1:
+                if comment_starts is None:
+                    comment_starts = [c[0] for c in comment_blocks]
+                neut = _neutralize_lean_strings_in_slice(
+                    text, code_only, comment_blocks, comment_starts, name_end, next_thm_bound
+                )
+                if neut is not None:
+                    hdr_code = neut
+                    hdr_start = 0
+                    hdr_end = len(neut)
             # The audit is a pure function of (name, metadata comment, the exact bounded text
             # `_split_lean_theorem_header` reads, the check scope), so the cache key must be that
             # full slice: A1 truncated it at the first `:=`, which can sit inside a binder's
             # structure literal (`(h : ({ a := 1 } : S).P)`), letting a later edit to the conclusion
             # or to a later hypothesis hit a stale entry (false negatives across scans in one process).
             cache_key = (
-                (thm_name, comment_str, code_only[name_end:next_thm_bound], contradiction_only)
+                (
+                    thm_name,
+                    comment_str,
+                    hdr_code if hdr_code is not code_only else code_only[name_end:next_thm_bound],
+                    contradiction_only,
+                )
                 if use_thm_cache
                 else None
             )
@@ -7289,7 +7504,7 @@ def audit_lean_text(
                             suggestion=f"Keep exactly one `{key.capitalize()}:` line.",
                         )
                     )
-            parsed = _split_lean_theorem_header(code_only, name_end, next_thm_bound)
+            parsed = _split_lean_theorem_header(hdr_code, hdr_start, hdr_end)
             if parsed is not None:
                 hyps, conc, extra_binders = parsed
                 local_findings.extend(
