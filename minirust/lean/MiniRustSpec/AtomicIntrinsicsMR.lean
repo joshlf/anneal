@@ -37,31 +37,42 @@ MiniRust-side facts only (the `BasicMemory` codec equivalences and
   `evalIntrinsicM_atomic_ok_inv`), so it preserves every invariant those
   preserve (`evalIntrinsicM_atomic_preserves`), in particular `MachTB.wfLive`
   (`evalIntrinsicM_atomic_tb_wfLive`), and records only atomic accesses
-  (`evalIntrinsicM_atomic_accesses`).
+  (`evalIntrinsicM_atomic_accesses`). `typed_load` and `typed_store` change
+  memory only through the memory model's `load` and `store`
+  (`typedLoadM_ok_memory`, `typedStoreM_ok_memory`).
 * **§3** Complete bidirectional (`iff`) characterizations of both `.ok` and
   `.error` (UB and specification panic, in exact upstream check order) for all
   four atomic intrinsics in every memory model (`atomicStore_{ok,error}_iff`,
   `atomicLoad_{ok,error}_iff`, `atomicCompareExchange_{ok,error}_iff`,
   `atomicFetchAndOp_{ok,error}_iff`), individual guard/UB/panic laws (arity,
   non-thin first argument, unsized, zero-sized, non-power-of-two, wide-pointer
-  and oversized types, type mismatches, non-integer types, misalignment,
-  complete `eval_int_bin_op` UB and overflow coverage), and the
+  and oversized types, type mismatches, non-integer types, ill-typed operands,
+  misalignment, complete `eval_int_bin_op` UB and overflow coverage), the
   `ConcurrentMemory` data-race interaction laws (`Access::races`,
-  `ConcurrentMemory::check_data_races`, `atomic_atomic_no_data_race`,
-  `atomicStore_nonAtomicLoad_data_race`,
+  `ConcurrentMemory::check_data_races` with `check_data_races_error_iff`,
+  `atomic_atomic_no_data_race`, `atomicStore_nonAtomicLoad_data_race` and its
+  generalization to every type `atomicStore_any_type_nonAtomicLoad_data_race`,
   `atomicCompareExchange_failure_nonAtomicLoad_no_data_race`,
   `atomicCompareExchange_success_nonAtomicLoad_data_race`,
-  `atomicFetchAndOp_nonAtomicLoad_data_race`).
+  `atomicFetchAndOp_nonAtomicLoad_data_race`, and the races of atomic *reads*
+  with non-atomic stores `atomicLoad_nonAtomicStore_data_race` and
+  `atomicCompareExchange_nonAtomicStore_data_race`), and the provenance laws of
+  integer atomics (`encodeM_int_no_provenance`,
+  `atomicCompareExchange_success_stores_no_provenance`,
+  `atomicFetchAndOp_stores_no_provenance`,
+  `atomicCompareExchange_failure_memory_bm`).
 * **§4** Kernel-evaluated witnesses on concrete `Mach` and `MachTB` machines:
   round trips across integer widths, `bool`, and thin raw pointers;
   compare-exchange success and failure with their access logs; fetch-and-op
   (including `AddUnchecked`/`SubUnchecked`/`DivExact`/`Shl` vs `Add` overflow);
-  dangling, out-of-bounds, misaligned, and uninitialized accesses; `CM` and
-  `ConcurrentMemory` data-race witnesses (atomic vs atomic, atomic write vs
-  non-atomic load, synchronized threads, disjoint byte ranges, and failing vs
-  succeeding compare-exchange against a non-atomic load); the Tree Borrows
-  `Frozen` witness; and `Terminator::Intrinsic` end to end through `step` /
-  `steps` and `stepTB` / `stepsTB`.
+  dangling, out-of-bounds, misaligned, and uninitialized accesses; ill-typed
+  operands; `CM` and `ConcurrentMemory` data-race witnesses (atomic vs atomic,
+  atomic write vs non-atomic load, atomic read vs non-atomic store,
+  synchronized threads, disjoint byte ranges, and failing vs succeeding
+  compare-exchange against a non-atomic load); provenance of pointer bytes
+  under integer atomics; the Tree Borrows `Frozen` and `Reserved` witnesses; and
+  `Terminator::Intrinsic` end to end through `step` / `steps` and `stepTB` /
+  `stepsTB`.
 * **§5** Instances showing that the conditional laws (including the data-race
   laws) are not vacuous, and the axiom and import audit.
 
@@ -78,12 +89,16 @@ MiniRust-side facts only (the `BasicMemory` codec equivalences and
    `atomicFetchAndOp_add_u8_overflow_bm`,
    `atomicFetchAndOp_unchecked_and_shift_bm`).
 2. **A failing `AtomicCompareExchange` is a read.** It performs no store, so
-   it logs only an atomic `Load` (`atomicCompareExchange_failure_accesses`),
-   never races with a non-atomic load on an unsynchronized thread
+   it logs only an atomic `Load` (`atomicCompareExchange_failure_accesses`,
+   `atomicCompareExchange_accesses`), never races with a non-atomic load on an
+   unsynchronized thread
    (`atomicCompareExchange_failure_nonAtomicLoad_no_data_race`, contrasting
    with `atomicCompareExchange_success_nonAtomicLoad_data_race`), and, under
    Tree Borrows, succeeds through a `Frozen` shared reference through which a
-   succeeding one is UB (`atomic_frozen_tb`).
+   succeeding one is UB (`atomic_frozen_tb`). It is a read, not a no-op: like
+   `AtomicLoad`, it *does* race with a non-atomic store
+   (`atomicCompareExchange_nonAtomicStore_data_race`,
+   `atomicLoad_nonAtomicStore_data_race`).
 3. **Unsized types: UB for `AtomicStore`, a specification panic for
    `AtomicLoad`.** `AtomicStore` matches on `LayoutStrategy::Sized` and throws
    UB otherwise; `AtomicLoad` calls `expect_size` (`atomic_slice_u8_unsized`).
@@ -99,6 +114,34 @@ MiniRust-side facts only (the `BasicMemory` codec equivalences and
 5. The UB message of `AtomicCompareExchange` at a non-integer type reads
    `Intrinis::AtomicCompareExchange` upstream; the interpretation and
    `atomicCompareExchange_non_int_ub` keep the typo.
+6. **Integer atomics erase provenance exactly when they store.** `Type::decode`
+   at `Type::Int` ignores the provenance of the bytes it reads and
+   `Type::encode` at `Type::Int` writes bytes without provenance. On the bytes
+   of a pointer, `AtomicLoad` and a *failing* `AtomicCompareExchange` at `usize`
+   return the bare address and leave every provenance fragment in memory
+   (`atomicLoad_memory_bm`, `atomicCompareExchange_failure_memory_bm`), whereas
+   a *succeeding* `AtomicCompareExchange` and `AtomicFetchAndOp` erase it, even
+   when they store the integer that was there
+   (`atomicCompareExchange_success_stores_no_provenance`,
+   `atomicFetchAndOp_stores_no_provenance`, `atomic_int_provenance_bm`,
+   `atomic_int_provenance_tb`). Whether a pointer survives a compare-exchange
+   on its bytes therefore depends on whether the comparison succeeds.
+7. **Under Tree Borrows, only an atomic store activates a `Reserved`
+   reference.** Through an unprotected mutable reference that has not been
+   written to, `AtomicLoad` and a failing `AtomicCompareExchange` keep the
+   borrow-tree node `Reserved`, so foreign reads stay harmless; `AtomicStore`,
+   `AtomicFetchAndOp`, and a succeeding `AtomicCompareExchange` make it
+   `Unique`, disable `Frozen` siblings, and expose it to being frozen by the
+   next foreign read (`atomic_reserved_reads_tb`,
+   `atomic_reserved_writes_activate_tb`,
+   `atomic_reserved_foreign_read_asymmetry_tb`).
+8. **`AtomicCompareExchange` checks `next` only when it stores it, and never
+   checks `current`.** An ill-typed `current` makes it fail silently
+   (`atomicCompareExchange_current_not_int`); an ill-formed `next` is a
+   specification panic on success and unnoticed on failure
+   (`atomicCompareExchange_next_out_of_range_specPanic`,
+   `atomic_ill_typed_operands_bm`). An ill-typed operand of `AtomicFetchAndOp`
+   reaches `unreachable!()` (`atomicFetchAndOp_other_not_int_specPanic`).
 -/
 
 namespace MiniRustSpec.AtomicIntrinsicsMR
@@ -170,6 +213,28 @@ theorem list_any_eq_false_iff {α : Type} {l : List α} {p : α → Bool} :
   · intro h x hx hpx
     rw [h x hx] at hpx
     cases hpx
+
+/-- A successful `list[i]` (`listIndex`) found its result at position `i.toNat`. -/
+theorem listIndex_eq_ok {T : Type} {xs : List T} {i : Int} {what : String} {x : T}
+    (h : listIndex xs i what = .ok x) : xs[i.toNat]? = some x := by
+  unfold listIndex at h
+  split at h
+  · generalize xs[i.toNat]? = opt at h
+    cases opt with
+    | none => cases h
+    | some elem =>
+      dsimp only at h
+      obtain rfl := interp_pure_eq_ok h
+      rfl
+  · cases h
+
+/-- A successful `List::set(i, x)` (`listSet`) is `List.set` at position `i.toNat`. -/
+theorem listSet_eq_ok {T : Type} {xs ys : List T} {i : Int} {x : T} {what : String}
+    (h : listSet xs i x what = .ok ys) : ys = xs.set i.toNat x := by
+  unfold listSet at h
+  split at h
+  · exact (interp_pure_eq_ok h).symm
+  · cases h
 
 /-- The four atomic memory intrinsics of `spec/lang/step/intrinsics.md`. -/
 def isAtomicOp : IntrinsicOp → Bool
@@ -660,6 +725,59 @@ theorem typedStoreM_ok_accesses {m m' : Machine M} {ptr : ThinPointer (Memory.Pr
     obtain rfl := interp_pure_eq_ok hstore
     exact ⟨bytes, henc, rfl⟩
 
+/-- What a successful `typed_load` does to memory and where its value comes
+from: the memory of the resulting machine is the one that the memory model's
+`load` returned, and the value is the decoding of exactly the bytes that this
+`load` read. `typed_load` itself never writes a byte. -/
+theorem typedLoadM_ok_memory {m m' : Machine M} {ptr : ThinPointer (Memory.Provenance M)}
+    {ty : «Type»} {align : Align} {atomicity : Atomicity} {val : Value M}
+    (h : typedLoadM m ptr ty align atomicity = .ok (val, m')) :
+    ∃ size a bytes, Type.layout ty = .ok (.Sized size a) ∧
+      MemoryOps.load m.mem.memory ptr size align = .ok (bytes, m'.mem.memory) ∧
+      Type.decodeM (M := M) ty bytes = .ok (some val) := by
+  unfold typedLoadM at h
+  obtain ⟨l, hl, h⟩ := interp_bind_eq_ok h
+  obtain ⟨size, hsz, h⟩ := interp_bind_eq_ok h
+  obtain ⟨⟨bytes, cm⟩, hload, h⟩ := interp_bind_eq_ok h
+  dsimp only at h
+  unfold ConcurrentMemory.load at hload
+  obtain ⟨⟨bytes', mem'⟩, hmem, hload⟩ := interp_bind_eq_ok hload
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hload)
+  obtain ⟨opt, hdec, h⟩ := interp_bind_eq_ok h
+  cases opt with
+  | none => cases h
+  | some v =>
+    obtain ⟨_, _, h⟩ := interp_bind_eq_ok h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    cases l with
+    | Sized s a =>
+      obtain rfl := interp_pure_eq_ok hsz
+      exact ⟨s, a, _, hl, hmem, hdec⟩
+    | _ => cases hsz
+
+/-- What a successful `typed_store` does to memory: the memory of the resulting
+machine is what the memory model's `store` made of the encoding of the stored
+value. Nothing else of the value reaches memory; in particular, provenance
+reaches memory only if `Type::encode` puts it into the bytes. -/
+theorem typedStoreM_ok_memory {m m' : Machine M} {ptr : ThinPointer (Memory.Provenance M)}
+    {val : Value M} {ty : «Type»} {align : Align} {atomicity : Atomicity}
+    (h : typedStoreM m ptr val ty align atomicity = .ok m') :
+    ∃ bytes, Type.encodeM (M := M) ty val = .ok bytes ∧
+      MemoryOps.store m.mem.memory ptr bytes align = .ok m'.mem.memory := by
+  unfold typedStoreM at h
+  dsimp only at h
+  rcases hcv : checkValueM val ty (some m) with _ | ⟨⟩
+  · simp only [hcv] at h
+    cases h
+  · simp only [hcv] at h
+    obtain ⟨bytes, henc, h⟩ := interp_bind_eq_ok h
+    obtain ⟨cm, hstore, h⟩ := interp_bind_eq_ok h
+    obtain rfl := interp_pure_eq_ok h
+    unfold ConcurrentMemory.store at hstore
+    obtain ⟨mem', hmem, hstore⟩ := interp_bind_eq_ok hstore
+    obtain rfl := interp_pure_eq_ok hstore
+    exact ⟨bytes, henc, hmem⟩
+
 /-- Every access that a successful atomic intrinsic records is
 `Atomicity::Atomic` and is at one address: the access log grows by one or two
 entries, all atomic. In particular no atomic intrinsic records a non-atomic
@@ -997,6 +1115,33 @@ theorem encodeM_int_length {t : IntType} {val : Value M}
         simp only [hin, ↓reduceIte] at h
         obtain rfl := interp_pure_eq_ok h
         rw [List.length_map, MiniRustSpec.Correspondence.leBytes_length]
+      | false =>
+        simp only [hin, Bool.false_eq_true, ↓reduceIte, specPanic] at h
+        cases h
+    | _ =>
+      dsimp only [Type.encodeM, Type.encodeIntM, specPanic] at h
+      cases h
+
+omit [MemoryOps M] in
+/-- Encoding any value at an integer type produces bytes without provenance:
+every byte is `AbstractByte::Init(b, None)`. Whatever a `typed_store` at
+`Type::Int` writes, it writes without provenance, in every memory model. -/
+theorem encodeM_int_no_provenance {t : IntType} {val : Value M}
+    {bytes : List (AbstractByte (Memory.Provenance M))}
+    (h : Type.encodeM (M := M) (.Int t) val = .ok bytes) :
+    ∀ b ∈ bytes, ∃ u, b = AbstractByte.Init u none := by
+  cases t with
+  | mk signed size =>
+    cases val with
+    | Int i =>
+      dsimp only [Type.encodeM, Type.encodeIntM, Endianness.encode, x86_64.ENDIANNESS] at h
+      cases hin : inBounds i signed size with
+      | true =>
+        simp only [hin, ↓reduceIte] at h
+        obtain rfl := interp_pure_eq_ok h
+        intro b hb
+        obtain ⟨u, _, rfl⟩ := List.mem_map.mp hb
+        exact ⟨u, rfl⟩
       | false =>
         simp only [hin, Bool.false_eq_true, ↓reduceIte, specPanic] at h
         cases h
@@ -1821,6 +1966,97 @@ theorem atomicCompareExchange_error_iff {m : Machine M} {args : List (Value M ×
         · exact atomicCompareExchange_load_error pty cur next hal hsz hload
         · exact atomicCompareExchange_store_error pty hal hsz hload hstore
 
+/-- A successful `AtomicCompareExchange` at `Type::Int(t)` passed the size
+checks: `t`'s size is a power of two no bigger than `MAX_ATOMIC_SIZE`. The laws
+above that take these two facts as hypotheses next to a successful
+compare-exchange (`atomicCompareExchange_failure_accesses`,
+`atomicCompareExchange_success_accesses`) do not need them. -/
+theorem atomicCompareExchange_ok_size {m m' : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next val : Value M}
+    {t : IntType}
+    (h : evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (val, m')) :
+    ∃ al, alignFromBytes t.size.bytes = some al ∧
+      t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes := by
+  obtain ⟨_, _, _, _, t', al, _, _, hret, hal, hsz, _, _⟩ := atomicCompareExchange_ok_iff.mp h
+  have ht : t = t' := by
+    cases hret
+    rfl
+  rw [← ht] at hal hsz
+  exact ⟨al, hal, hsz⟩
+
+/-- The complete access log of a successful `AtomicCompareExchange`, without
+side hypotheses: it returned `current` and logged an atomic `Load` followed by
+an atomic `Store`, or it returned something else and logged only the atomic
+`Load`. Both accesses cover exactly the `t.size` bytes at the pointer. -/
+theorem atomicCompareExchange_accesses {m m' : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next val : Value M}
+    {t : IntType}
+    (h : evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (val, m')) :
+    (cur = val ∧ m'.mem.accesses = m.mem.accesses ++
+        [⟨.Load, .Atomic, ptr.addr, t.size⟩, ⟨.Store, .Atomic, ptr.addr, t.size⟩]) ∨
+    (cur ≠ val ∧
+      m'.mem.accesses = m.mem.accesses ++ [⟨.Load, .Atomic, ptr.addr, t.size⟩]) := by
+  obtain ⟨_, hal, hsz⟩ := atomicCompareExchange_ok_size h
+  by_cases hcv : cur = val
+  · subst hcv
+    obtain ⟨bytes, henc, hacc⟩ := atomicCompareExchange_success_accesses hal hsz h
+    rw [encodeM_int_length henc] at hacc
+    exact Or.inl ⟨rfl, hacc⟩
+  · exact Or.inr ⟨hcv, atomicCompareExchange_failure_accesses hal hsz h hcv⟩
+
+/-- `AtomicCompareExchange` never checks `current` against the type: upstream
+compares it structurally with the loaded value and nothing else. A `current`
+that is not a `Value::Int` (an ill-typed argument) therefore makes the
+compare-exchange fail silently: it is exactly its load, and `next` is never
+looked at. Contrast `atomicFetchAndOp_other_not_int_specPanic`, where an
+ill-typed operand reaches `unreachable!()`. -/
+theorem atomicCompareExchange_current_not_int {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {cur before : Value M}
+    (next : Value M) {t : IntType} {al : Align}
+    (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (before, m1))
+    (hcur : ∀ i, cur ≠ .Int i) :
+    evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) =
+      .ok (before, m1) := by
+  obtain ⟨i, hi⟩ := typedLoadM_int_returns_int hload
+  exact atomicCompareExchange_failure pty next hal hsz hload (fun hc => hcur i (hc.trans hi))
+
+/-- A succeeding `AtomicCompareExchange` hands the memory model's `store` bytes
+without provenance: the memory of the resulting machine is `M::store` of
+`t.size` bytes that are all `AbstractByte::Init(b, None)`, applied to the memory
+after the load. Whatever provenance the overwritten bytes carried is gone, even
+when `next` is the integer that was there. -/
+theorem atomicCompareExchange_success_stores_no_provenance {m m' : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next : Value M}
+    {t : IntType}
+    (h : evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (cur, m')) :
+    ∃ (al : Align) (m1 : Machine M) (bytes : List (AbstractByte (Memory.Provenance M))),
+      typedLoadM m ptr (.Int t) al .Atomic = .ok (cur, m1) ∧
+      (∀ b ∈ bytes, ∃ u, b = AbstractByte.Init u none) ∧
+      bytes.length = t.size.bytes ∧
+      MemoryOps.store m1.mem.memory ptr bytes al = .ok m'.mem.memory := by
+  obtain ⟨al, hal, hsz⟩ := atomicCompareExchange_ok_size h
+  rw [atomicCompareExchange_eq m ptr pty cur next t hal hsz] at h
+  obtain ⟨⟨b, m1⟩, hload, h⟩ := interp_bind_eq_ok h
+  dsimp only at h
+  cases hv : valueEqM cur b with
+  | true =>
+    simp only [hv, ↓reduceIte] at h
+    obtain ⟨m2, hstore, h⟩ := interp_bind_eq_ok h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    obtain ⟨bytes, henc, hmem⟩ := typedStoreM_ok_memory hstore
+    exact ⟨al, m1, bytes, hload, encodeM_int_no_provenance henc, encodeM_int_length henc, hmem⟩
+  | false =>
+    simp only [hv, Bool.false_eq_true, ↓reduceIte] at h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    rw [valueEqM_refl] at hv
+    cases hv
+
 /-! ### `AtomicFetchAndOp` -/
 
 /-- `AtomicFetchAndOp` whose operand has another type than the return type is
@@ -2168,6 +2404,33 @@ theorem atomicFetchAndOp_error_iff {m : Machine M} {binOp : IntBinOp}
         · exact atomicFetchAndOp_binop_error binOp pty hal hsz hload hop
         · exact atomicFetchAndOp_store_error binOp pty hal hsz hload hop hstore
 
+/-- A successful `AtomicFetchAndOp` hands the memory model's `store` bytes
+without provenance: the memory of the resulting machine is `M::store` of
+`t.size` bytes that are all `AbstractByte::Init(b, None)`, applied to the memory
+after the load. Whatever provenance the overwritten bytes carried is gone, even
+when the operation leaves the integer unchanged (`fetch_add(0)`). -/
+theorem atomicFetchAndOp_stores_no_provenance {m m' : Machine M} {binOp : IntBinOp}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {other val : Value M}
+    {t : IntType}
+    (h : evalIntrinsicM m (.AtomicFetchAndOp binOp)
+        [(.Ptr ⟨ptr, none⟩, pty), (other, .Int t)] (.Int t) = .ok (val, m')) :
+    ∃ (al : Align) (m1 : Machine M) (bytes : List (AbstractByte (Memory.Provenance M))),
+      typedLoadM m ptr (.Int t) al .Atomic = .ok (val, m1) ∧
+      (∀ b ∈ bytes, ∃ u, b = AbstractByte.Init u none) ∧
+      bytes.length = t.size.bytes ∧
+      MemoryOps.store m1.mem.memory ptr bytes al = .ok m'.mem.memory := by
+  obtain ⟨ptr', _, _, _, _, t', al, m1, hargs, hret, hval, _, _, hload, _, hstore⟩ :=
+    atomicFetchAndOp_ok_iff.mp h
+  have h1a := (List.cons.inj hargs).1
+  have hptr : ptr = ptr' := (Pointer.mk.inj (Value.Ptr.inj (Prod.mk.inj h1a).1)).1
+  have ht : t = t' := by
+    cases hret
+    rfl
+  rw [← hptr, ← ht] at hload hstore
+  rw [← hval] at hload
+  obtain ⟨bytes, henc, hmem⟩ := typedStoreM_ok_memory hstore
+  exact ⟨al, m1, bytes, hload, encodeM_int_no_provenance henc, encodeM_int_length henc, hmem⟩
+
 /-! ### `eval_int_bin_op` as used by `AtomicFetchAndOp` -/
 
 /-- `Add`, `Sub`, `Mul`, `BitAnd`, `BitOr`, and `BitXor` never fail and never
@@ -2264,8 +2527,12 @@ theorem evalIntBinOp_divExact_rem_nonzero {l r : Int} {t : IntType} (hr : r ≠ 
     (hin : IntType.can_represent t (Int.tdiv l r) = true) (hrem : Int.tmod l r ≠ 0) :
     evalIntBinOp .DivExact l r t = .error (.ub "non-zero remainder in exact division") := by
   simp only [evalIntBinOp, hr, hin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
-  rw [if_pos hrem]
-  rfl
+  split
+  · rfl
+  · rename_i hc
+    first
+      | exact absurd hrem hc
+      | exact absurd hc hrem
 
 /-- `i32::MIN / -1` and `i32::MIN % -1` are UB. -/
 theorem evalIntBinOp_i32_min_neg_one :
@@ -2512,6 +2779,24 @@ theorem atomicStore_int_out_of_range_specPanic (m : Machine M)
   rw [atomicStore_eq_typedStoreM m ptr pty (.Int n) (.Int t) (layout_int hal) ha hsz,
     typedStoreM_int_out_of_range m ptr n t al .Atomic hn]
   rfl
+
+/-- `AtomicCompareExchange` checks `next` only when it stores it: a succeeding
+compare-exchange whose `next` the integer type cannot represent is a
+specification panic of `typed_store`. A *failing* one with the same `next`
+returns normally (`atomicCompareExchange_failure` holds for every `next`), so
+whether an ill-formed `next` is noticed depends on the value in memory. -/
+theorem atomicCompareExchange_next_out_of_range_specPanic {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {cur : Value M} {n : Int}
+    {t : IntType} {al : Align}
+    (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (cur, m1))
+    (hn : IntType.can_represent t n = false) :
+    evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (.Int n, .Int t)] (.Int t) =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") :=
+  atomicCompareExchange_store_error pty hal hsz hload
+    (typedStoreM_int_out_of_range m1 ptr n t al .Atomic hn)
 
 /-! ### Alignment: an atomic access must be aligned to its own size -/
 
@@ -2802,7 +3087,17 @@ and `ConcurrentMemory::check_data_races` (and `CM.check_data_races` on `BM`):
   unsynchronized thread (`atomicCompareExchange_failure_nonAtomicLoad_no_data_race`),
   whereas a *succeeding* compare-exchange logs an atomic `Store` and therefore
   *does* race with a non-atomic load at an overlapping address
-  (`atomicCompareExchange_success_nonAtomicLoad_data_race`). -/
+  (`atomicCompareExchange_success_nonAtomicLoad_data_race`).
+* The exemption of a failing compare-exchange is only against *loads*. An
+  atomic read, be it an `AtomicLoad` or a compare-exchange that fails, races
+  with a non-atomic *store* at an overlapping address
+  (`atomicLoad_nonAtomicStore_data_race`,
+  `atomicCompareExchange_nonAtomicStore_data_race`).
+* The atomic store of `AtomicStore` races with a non-atomic load at every type
+  it accepts, not only at integer types
+  (`atomicStore_any_type_nonAtomicLoad_data_race`).
+* `ConcurrentMemory::check_data_races` either returns or throws UB
+  `"Data race"`; it has no other outcome (`check_data_races_error_iff`). -/
 
 /-- Exact characterization of `Access::races`. -/
 theorem access_races_iff (a b : Access) :
@@ -2845,17 +3140,17 @@ are loads or stores and regardless of address overlap. -/
 theorem access_races_atomic_atomic_false {a b : Access}
     (ha : a.atomicity = .Atomic) (hb : b.atomicity = .Atomic) :
     Access.races a b = false := by
-  unfold Access.races
-  split
-  · rfl
-  · rw [if_pos ⟨ha, hb⟩]
+  cases h : Access.races a b with
+  | false => rfl
+  | true => exact (((access_races_iff a b).mp h).2.1 ⟨ha, hb⟩).elim
 
 /-- Two loads never race with each other, regardless of atomicity. -/
 theorem access_races_load_load_false {a b : Access}
     (ha : a.ty = .Load) (hb : b.ty = .Load) :
     Access.races a b = false := by
-  unfold Access.races
-  rw [if_pos ⟨ha, hb⟩]
+  cases h : Access.races a b with
+  | false => rfl
+  | true => exact (((access_races_iff a b).mp h).1 ⟨ha, hb⟩).elim
 
 /-- An atomic store and a non-atomic load at overlapping byte ranges race. -/
 theorem access_races_atomic_store_non_atomic_load (addr1 addr2 : Address) (len1 len2 : Size)
@@ -2954,6 +3249,70 @@ theorem check_data_races_ok_iff (cm : ConcurrentMemory M) (tid : ThreadId)
           list_any_eq_false_iff.mp (list_any_eq_false_iff.mp hanyF a ha) p hp
       · intro _; rfl
 
+omit [MemoryOps M] in
+/-- `ConcurrentMemory::check_data_races` has exactly two outcomes: it returns,
+or it throws UB `"Data race"`. It never panics and never stops in any other
+way. -/
+theorem check_data_races_ok_or_ub (cm : ConcurrentMemory M) (tid : ThreadId)
+    (sync : Set ThreadId) (prev : List Access) :
+    ConcurrentMemory.check_data_races cm tid (sync, prev) = .ok () ∨
+    ConcurrentMemory.check_data_races cm tid (sync, prev) = .error (.ub "Data race") := by
+  by_cases hs : setContains sync tid = true
+  · exact Or.inl ((check_data_races_ok_iff cm tid sync prev).mpr (Or.inl hs))
+  · by_cases hr : ∃ a ∈ cm.accesses, ∃ p ∈ prev, Access.races a p = true
+    · refine Or.inr ((check_data_races_ub_iff cm tid sync prev).mpr ⟨?_, hr⟩)
+      cases hb : setContains sync tid with
+      | false => rfl
+      | true => exact absurd hb hs
+    · refine Or.inl ((check_data_races_ok_iff cm tid sync prev).mpr
+        (Or.inr fun a ha p hp => ?_))
+      cases hb : Access.races a p with
+      | false => rfl
+      | true => exact (hr ⟨a, ha, p, hp, hb⟩).elim
+
+omit [MemoryOps M] in
+/-- Complete characterization of every stopping outcome of
+`ConcurrentMemory::check_data_races`, for an arbitrary `Stop`: the only one is
+UB `"Data race"`, and it occurs exactly when the current thread is not
+synchronized with the previous step and one of its accesses races with one of
+the previous step's. (`check_data_races_ub_iff` fixes the `Stop` in advance and
+so does not exclude other ways of stopping.) -/
+theorem check_data_races_error_iff (cm : ConcurrentMemory M) (tid : ThreadId)
+    (sync : Set ThreadId) (prev : List Access) (e : Stop) :
+    ConcurrentMemory.check_data_races cm tid (sync, prev) = .error e ↔
+      e = .ub "Data race" ∧ setContains sync tid = false ∧
+      ∃ a ∈ cm.accesses, ∃ p ∈ prev, Access.races a p = true := by
+  constructor
+  · intro h
+    rcases check_data_races_ok_or_ub cm tid sync prev with hok | hub
+    · rw [hok] at h
+      cases h
+    · have he : e = .ub "Data race" := by
+        rw [hub] at h
+        cases h
+        rfl
+      exact ⟨he, (check_data_races_ub_iff cm tid sync prev).mp hub⟩
+  · rintro ⟨rfl, hrest⟩
+    exact (check_data_races_ub_iff cm tid sync prev).mpr hrest
+
+omit [MemoryOps M] in
+/-- Two steps whose access logs contain a racing pair of accesses are a data
+race in both interleaving orders, for every thread that is not synchronized
+with the other step. -/
+theorem check_data_races_ub_of_mem {cm1 cm2 : ConcurrentMemory M} {a1 a2 : Access}
+    (h1 : a1 ∈ cm1.accesses) (h2 : a2 ∈ cm2.accesses) (hr : Access.races a1 a2 = true)
+    {tid : ThreadId} {sync : Set ThreadId} (hunsync : setContains sync tid = false) :
+    ConcurrentMemory.check_data_races cm2 tid (sync, cm1.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races cm1 tid (sync, cm2.accesses) =
+      .error (.ub "Data race") := by
+  refine ⟨(check_data_races_ub_iff cm2 tid sync cm1.accesses).mpr
+            ⟨hunsync, a2, h2, a1, h1, ?_⟩,
+          (check_data_races_ub_iff cm1 tid sync cm2.accesses).mpr
+            ⟨hunsync, a1, h1, a2, h2, hr⟩⟩
+  rw [access_races_symm]
+  exact hr
+
 /-- Any two successful atomic intrinsics on two steps (each starting from a
 fresh access log, as after `reset_data_race_tracking`) never data-race in
 `ConcurrentMemory::check_data_races`, even on unsynchronized threads accessing
@@ -3027,13 +3386,12 @@ and a failing AtomicCompareExchange are not considered UB!"
 In every memory model, a failing `AtomicCompareExchange` and a non-atomic
 `typed_load` on unsynchronized threads (each starting from an empty access log)
 never trigger a data race in `ConcurrentMemory::check_data_races`, in either
-order, even at the exact same address. -/
+order, even at the exact same address. The size facts about `t1` are not
+hypotheses: `atomicCompareExchange_ok_size` derives them from `hcas`. -/
 theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race
     {m0 m1 m2 m3 : Machine M} {ptr1 ptr2 : ThinPointer (Memory.Provenance M)}
     {pty : «Type»} {cur next before v2 : Value M} {t1 : IntType} {ty2 : «Type»}
-    {al1 al2 : Align}
-    (hal1 : alignFromBytes t1.size.bytes = some al1)
-    (hsz1 : t1.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    {al2 : Align}
     (hemp0 : m0.mem.accesses = []) (hemp2 : m2.mem.accesses = [])
     (hcas : evalIntrinsicM m0 .AtomicCompareExchange
         [(.Ptr ⟨ptr1, none⟩, pty), (cur, .Int t1), (next, .Int t1)] (.Int t1) =
@@ -3043,6 +3401,7 @@ theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race
     (tid : ThreadId) (sync : Set ThreadId) :
     ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) = .ok () ∧
     ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) = .ok () := by
+  obtain ⟨_, hal1, hsz1⟩ := atomicCompareExchange_ok_size hcas
   have hacc1 := atomicCompareExchange_failure_accesses hal1 hsz1 hcas hne
   obtain ⟨sz2, _, _, hacc2⟩ := typedLoadM_ok_accesses hload
   rw [hemp0, List.nil_append] at hacc1
@@ -3068,13 +3427,13 @@ theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race
 /-- In contrast to `atomicCompareExchange_failure_nonAtomicLoad_no_data_race`, a
 *succeeding* `AtomicCompareExchange` performs an atomic store and therefore
 triggers UB `"Data race"` against a non-atomic `typed_load` on an unsynchronized
-thread at an overlapping byte range (in both interleaving orders). -/
+thread at an overlapping byte range (in both interleaving orders). The size
+facts about `t1` are not hypotheses: `atomicCompareExchange_ok_size` derives
+them from `hcas`. -/
 theorem atomicCompareExchange_success_nonAtomicLoad_data_race
     {m0 m1 m2 m3 : Machine M} {ptr1 ptr2 : ThinPointer (Memory.Provenance M)}
     {pty : «Type»} {cur next v2 : Value M} {t1 : IntType} {ty2 : «Type»}
-    {size2 : Size} {a2 al1 al2 : Align}
-    (hal1 : alignFromBytes t1.size.bytes = some al1)
-    (hsz1 : t1.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    {size2 : Size} {a2 al2 : Align}
     (hcas : evalIntrinsicM m0 .AtomicCompareExchange
         [(.Ptr ⟨ptr1, none⟩, pty), (cur, .Int t1), (next, .Int t1)] (.Int t1) =
       .ok (cur, m1))
@@ -3087,6 +3446,7 @@ theorem atomicCompareExchange_success_nonAtomicLoad_data_race
       .error (.ub "Data race") ∧
     ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
       .error (.ub "Data race") := by
+  obtain ⟨_, hal1, hsz1⟩ := atomicCompareExchange_ok_size hcas
   obtain ⟨bytes, henc, hacc1⟩ := atomicCompareExchange_success_accesses hal1 hsz1 hcas
   have hlen : bytes.length = t1.size.bytes := encodeM_int_length henc
   obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses hload
@@ -3156,7 +3516,220 @@ theorem atomicFetchAndOp_nonAtomicLoad_data_race
   rw [access_races_symm]
   exact hrace
 
+/-- `atomicStore_nonAtomicLoad_data_race` without its restriction to integer
+types, to the return type `()`, and to the returned value: a successful
+`AtomicStore` at *any* type (`bool`, a thin pointer, an integer, ...) logs an
+atomic `Store` over the bytes of the encoding of the stored value, and that
+store and a non-atomic `typed_load` on unsynchronized threads at overlapping
+byte ranges are UB `"Data race"`, in both interleaving orders. -/
+theorem atomicStore_any_type_nonAtomicLoad_data_race {m0 m1 m2 m3 : Machine M}
+    {ptr1 ptr2 : ThinPointer (Memory.Provenance M)} {pty retTy : «Type»}
+    {v1 v2 val : Value M} {ty1 ty2 : «Type»} {size2 : Size} {a2 al2 : Align}
+    (h1 : evalIntrinsicM m0 .AtomicStore [(.Ptr ⟨ptr1, none⟩, pty), (v1, ty1)] retTy =
+      .ok (val, m1))
+    (h2 : typedLoadM m2 ptr2 ty2 al2 .None = .ok (v2, m3))
+    (hl2 : Type.layout ty2 = .ok (.Sized size2 a2)) :
+    ∃ bytes, Type.encodeM (M := M) ty1 v1 = .ok bytes ∧
+      ∀ (tid : ThreadId) (sync : Set ThreadId),
+        ptr1.addr + bytes.length > ptr2.addr → ptr2.addr + size2.bytes > ptr1.addr →
+        setContains sync tid = false →
+        ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+          .error (.ub "Data race") ∧
+        ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+          .error (.ub "Data race") := by
+  obtain ⟨ptr, _, v, ty, _, _, align, hargs, _, _, _, _, _, hs⟩ := atomicStore_ok_iff.mp h1
+  have h1a := (List.cons.inj hargs).1
+  have h1b := (List.cons.inj (List.cons.inj hargs).2).1
+  have hptr : ptr1 = ptr := (Pointer.mk.inj (Value.Ptr.inj (Prod.mk.inj h1a).1)).1
+  have hv : v1 = v := (Prod.mk.inj h1b).1
+  have hty : ty1 = ty := (Prod.mk.inj h1b).2
+  rw [← hptr, ← hv, ← hty] at hs
+  obtain ⟨bytes, henc, hacc1⟩ := typedStoreM_ok_accesses hs
+  obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses h2
+  have hsz2 : sz2 = size2 := by
+    rw [hl2] at hl2'
+    cases hl2'
+    rfl
+  rw [hsz2] at hacc2
+  refine ⟨bytes, henc, fun tid sync hov1 hov2 hunsync => ?_⟩
+  have hmem1 : (⟨.Store, .Atomic, ptr1.addr, ⟨bytes.length⟩⟩ : Access) ∈ m1.mem.accesses := by
+    rw [hacc1]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hmem2 : (⟨.Load, .None, ptr2.addr, size2⟩ : Access) ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  exact check_data_races_ub_of_mem hmem1 hmem2
+    (access_races_atomic_store_non_atomic_load ptr1.addr ptr2.addr ⟨bytes.length⟩ size2
+      hov1 hov2)
+    hunsync
+
+/-- An atomic *read* is not exempt from data races: a successful `AtomicLoad`
+logs an atomic `Load`, and that load and a non-atomic `typed_store` on
+unsynchronized threads at overlapping byte ranges are UB `"Data race"`, in both
+interleaving orders. Only atomic-atomic and load-load pairs are exempt. -/
+theorem atomicLoad_nonAtomicStore_data_race {m0 m1 m2 m3 : Machine M}
+    {ptr1 ptr2 : ThinPointer (Memory.Provenance M)} {pty retTy ty2 : «Type»}
+    {val v2 : Value M} {size1 : Size} {a1 al2 : Align}
+    (h1 : evalIntrinsicM m0 .AtomicLoad [(.Ptr ⟨ptr1, none⟩, pty)] retTy = .ok (val, m1))
+    (hl1 : Type.layout retTy = .ok (.Sized size1 a1))
+    (h2 : typedStoreM m2 ptr2 v2 ty2 al2 .None = .ok m3) :
+    ∃ bytes, Type.encodeM (M := M) ty2 v2 = .ok bytes ∧
+      ∀ (tid : ThreadId) (sync : Set ThreadId),
+        ptr2.addr + bytes.length > ptr1.addr → ptr1.addr + size1.bytes > ptr2.addr →
+        setContains sync tid = false →
+        ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+          .error (.ub "Data race") ∧
+        ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+          .error (.ub "Data race") := by
+  obtain ⟨ptr, _, _, _, _, hargs, _, _, _, hl⟩ := atomicLoad_ok_iff.mp h1
+  have hptr : ptr1 = ptr :=
+    (Pointer.mk.inj (Value.Ptr.inj (Prod.mk.inj (List.cons.inj hargs).1).1)).1
+  rw [← hptr] at hl
+  obtain ⟨sz1, _, hl1', hacc1⟩ := typedLoadM_ok_accesses hl
+  have hsz1 : sz1 = size1 := by
+    rw [hl1] at hl1'
+    cases hl1'
+    rfl
+  rw [hsz1] at hacc1
+  obtain ⟨bytes, henc, hacc2⟩ := typedStoreM_ok_accesses h2
+  refine ⟨bytes, henc, fun tid sync hov1 hov2 hunsync => ?_⟩
+  have hmem1 : (⟨.Load, .Atomic, ptr1.addr, size1⟩ : Access) ∈ m1.mem.accesses := by
+    rw [hacc1]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hmem2 : (⟨.Store, .None, ptr2.addr, ⟨bytes.length⟩⟩ : Access) ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  exact And.symm (check_data_races_ub_of_mem hmem2 hmem1
+    (access_races_non_atomic_store_atomic_load ptr2.addr ptr1.addr ⟨bytes.length⟩ size1
+      hov1 hov2)
+    hunsync)
+
+/-- A failing `AtomicCompareExchange` is a read, not a no-op: it is exempt from
+races with non-atomic *loads*
+(`atomicCompareExchange_failure_nonAtomicLoad_no_data_race`), but every
+`AtomicCompareExchange` that returns, failing or succeeding, logs an atomic
+`Load` of `t1.size` bytes, and that load and a non-atomic `typed_store` on
+unsynchronized threads at overlapping byte ranges are UB `"Data race"`, in both
+interleaving orders. -/
+theorem atomicCompareExchange_nonAtomicStore_data_race {m0 m1 m2 m3 : Machine M}
+    {ptr1 ptr2 : ThinPointer (Memory.Provenance M)} {pty ty2 : «Type»}
+    {cur next before v2 : Value M} {t1 : IntType} {al2 : Align}
+    (hcas : evalIntrinsicM m0 .AtomicCompareExchange
+        [(.Ptr ⟨ptr1, none⟩, pty), (cur, .Int t1), (next, .Int t1)] (.Int t1) =
+      .ok (before, m1))
+    (h2 : typedStoreM m2 ptr2 v2 ty2 al2 .None = .ok m3) :
+    ∃ bytes, Type.encodeM (M := M) ty2 v2 = .ok bytes ∧
+      ∀ (tid : ThreadId) (sync : Set ThreadId),
+        ptr2.addr + bytes.length > ptr1.addr → ptr1.addr + t1.size.bytes > ptr2.addr →
+        setContains sync tid = false →
+        ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+          .error (.ub "Data race") ∧
+        ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+          .error (.ub "Data race") := by
+  obtain ⟨bytes, henc, hacc2⟩ := typedStoreM_ok_accesses h2
+  refine ⟨bytes, henc, fun tid sync hov1 hov2 hunsync => ?_⟩
+  have hmem1 : (⟨.Load, .Atomic, ptr1.addr, t1.size⟩ : Access) ∈ m1.mem.accesses := by
+    rcases atomicCompareExchange_accesses hcas with ⟨_, hacc⟩ | ⟨_, hacc⟩
+    · rw [hacc]
+      exact List.mem_append_right _ (List.Mem.head _)
+    · rw [hacc]
+      exact List.mem_append_right _ (List.Mem.head _)
+  have hmem2 : (⟨.Store, .None, ptr2.addr, ⟨bytes.length⟩⟩ : Access) ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  exact And.symm (check_data_races_ub_of_mem hmem2 hmem1
+    (access_races_non_atomic_store_atomic_load ptr2.addr ptr1.addr ⟨bytes.length⟩ t1.size
+      hov1 hov2)
+    hunsync)
+
 end DataRaces
+
+/-! ### Provenance under integer atomics
+
+`Type::decode` at `Type::Int` reads the data of each byte and ignores its
+provenance, and `Type::encode` at `Type::Int` produces bytes without provenance
+(`encodeM_int_no_provenance`). When memory holds the bytes of a pointer and an
+integer atomic of pointer size is applied to them:
+* `AtomicLoad` and a *failing* `AtomicCompareExchange` only load. In every
+  memory model they change memory exactly as `M::load` does
+  (`typedLoadM_ok_memory`), and on `Mach`, where `BasicMemory::load` returns
+  the memory it was given (`bm_load_memory_eq`), memory is unchanged
+  (`atomicLoad_memory_bm`, `atomicCompareExchange_failure_memory_bm`): every
+  byte keeps its provenance.
+* A *succeeding* `AtomicCompareExchange` and `AtomicFetchAndOp` store bytes
+  without provenance (`atomicCompareExchange_success_stores_no_provenance`,
+  `atomicFetchAndOp_stores_no_provenance`), even when the integer stored is the
+  one that was there.
+
+`atomic_int_provenance_bm` and `atomic_int_provenance_tb` in §4 evaluate all
+four cases on concrete machines. -/
+
+/-- `BasicMemory::load` returns the memory it was given: the allocation it
+writes back is the allocation it read. -/
+theorem bm_load_memory_eq {mem mem' : BM} {ptr : Ptr} {len : Size} {align : Align}
+    {bytes : List Byte} (h : BM.load mem ptr len align = .ok (bytes, mem')) : mem' = mem := by
+  unfold BM.load at h
+  split at h
+  · cases h
+  · obtain ⟨r, _, h⟩ := interp_bind_eq_ok h
+    cases r with
+    | none =>
+      cases h
+      rfl
+    | some t =>
+      obtain ⟨_, _, _⟩ := t
+      dsimp only at h
+      obtain ⟨_, hidx, h⟩ := interp_bind_eq_ok h
+      obtain ⟨allocs', hs, h⟩ := interp_bind_eq_ok h
+      obtain ⟨_, _, h⟩ := interp_bind_eq_ok h
+      obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+      have hset : allocs' = mem.allocations :=
+        (listSet_eq_ok hs).trans
+          (MiniRustSpec.Correspondence.set_self_of_getElem? _ _ _ (listIndex_eq_ok hidx))
+      subst hset
+      rfl
+
+/-- On `Mach`, a successful `typed_load` leaves memory unchanged; only the
+access log grows (`typedLoadM_ok_accesses`). -/
+theorem typedLoadM_bm_memory_eq {m m' : Mach} {ptr : Ptr} {ty : «Type»} {align : Align}
+    {atomicity : Atomicity} {val : Val}
+    (h : typedLoadM (M := BM) m ptr ty align atomicity = .ok (val, m')) :
+    m'.mem.memory = m.mem.memory := by
+  obtain ⟨_, _, _, _, hload, _⟩ := typedLoadM_ok_memory h
+  exact bm_load_memory_eq hload
+
+/-- On `Mach`, a successful `AtomicLoad` at any type leaves memory unchanged. In
+particular, loading the bytes of a pointer at an integer type returns the bare
+address and leaves the provenance of every byte in memory. -/
+theorem atomicLoad_memory_bm {m m' : Mach} {args : List (Val × «Type»)} {retTy : «Type»}
+    {val : Val} (h : evalIntrinsicM (M := BM) m .AtomicLoad args retTy = .ok (val, m')) :
+    m'.mem.memory = m.mem.memory := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, hload⟩ := atomicLoad_ok_iff.mp h
+  exact typedLoadM_bm_memory_eq hload
+
+/-- On `Mach`, a failing `AtomicCompareExchange` leaves memory unchanged, byte
+for byte. In particular, a failing compare-exchange at `usize` on the bytes of
+a pointer preserves the provenance of every byte, whereas a succeeding one
+erases it (`atomicCompareExchange_success_stores_no_provenance`). -/
+theorem atomicCompareExchange_failure_memory_bm {m m' : Mach} {ptr : Ptr} {pty : «Type»}
+    {cur next before : Val} {t : IntType}
+    (h : evalIntrinsicM (M := BM) m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (before, m'))
+    (hne : cur ≠ before) : m'.mem.memory = m.mem.memory := by
+  obtain ⟨_, hal, hsz⟩ := atomicCompareExchange_ok_size h
+  rw [atomicCompareExchange_eq m ptr pty cur next t hal hsz] at h
+  obtain ⟨⟨b, m1⟩, hload, h⟩ := interp_bind_eq_ok h
+  dsimp only at h
+  cases hv : valueEqM cur b with
+  | true =>
+    simp only [hv, ↓reduceIte] at h
+    obtain ⟨m2, _, h⟩ := interp_bind_eq_ok h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    exact absurd ((valueEqM_eq_true_iff cur b).mp hv) hne
+  | false =>
+    simp only [hv, Bool.false_eq_true, ↓reduceIte] at h
+    obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    exact typedLoadM_bm_memory_eq hload
 
 /-! ## §4. Concrete machines: operational laws, round trips, and mode sensitivity
 
@@ -3530,6 +4103,136 @@ theorem atomic_data_races_bm :
         (fun m => bmNonAtomicLoad m (bmPtr 4)) 1 = .ok () := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- Non-atomic `typed_store` of the `u32` `i` on `Mach`, returning `i`. -/
+def bmNonAtomicStore (m : Mach) (ptr : Ptr) (i : Int) : Interp (Val × Mach) := do
+  let m' ← typedStore m ptr (.Int i) (.Int itU32) ⟨4⟩ .None
+  pure (.Int i, m')
+
+/-- Atomic *reads* against a non-atomic *store* on `Mach`, and an atomic store
+at a non-integer type, through `resetDataRaceTracking` and
+`CM.check_data_races`:
+1. Unsynchronized `AtomicLoad` + non-atomic `typed_store` at `cellAddr`: UB `"Data race"`.
+2. Unsynchronized *failing* `AtomicCompareExchange` + non-atomic `typed_store`: UB
+   `"Data race"`. A failing compare-exchange is a read, not a no-op.
+3. The same pair on synchronized threads (`1 ∈ sync`): no race.
+4. The same pair on the same thread (`tid = 0`): no race.
+5. Failing `AtomicCompareExchange` at `[0..4)` + non-atomic `typed_store` at `[4..8)`: no race.
+6. Unsynchronized `AtomicStore` of a `bool` + non-atomic `typed_load` of the `u32`
+   that contains it: UB `"Data race"`. -/
+theorem atomic_reads_vs_nonAtomicStore_data_races_bm :
+    bmRaceCheck (bmLoad bmFive bmPtr (.Int itU32))
+        (fun m => bmNonAtomicStore m bmPtr 7) 1 = .error (.ub "Data race") ∧
+    bmRaceCheck (bmCas bmFive bmPtr 6 9 itU32)
+        (fun m => bmNonAtomicStore m bmPtr 7) 1 = .error (.ub "Data race") ∧
+    bmRaceCheck (bmCas bmFive bmPtr 6 9 itU32)
+        (fun m => bmNonAtomicStore m bmPtr 7) 1 ⟨[1]⟩ = .ok () ∧
+    bmRaceCheck (bmCas bmFive bmPtr 6 9 itU32)
+        (fun m => bmNonAtomicStore m bmPtr 7) 0 = .ok () ∧
+    bmRaceCheck (bmCas (bmWith (u32Bytes 5 ++ u32Bytes 7)) bmPtr 6 9 itU32)
+        (fun m => bmNonAtomicStore m (bmPtr 4) 7) 1 = .ok () ∧
+    bmRaceCheck (bmStore bmFive bmPtr (.Bool true) .Bool)
+        (fun m => bmNonAtomicLoad m bmPtr) 1 = .error (.ub "Data race") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Ill-typed and ill-formed operands on `Mach` (`cellAddr` holds `5u32`).
+`AtomicCompareExchange` checks neither `current` nor, when it fails, `next`:
+1. `current = true` at `u32` compares unequal to every integer: the
+   compare-exchange fails silently and returns `5`.
+2. A failing compare-exchange with `next = true` at `u32` returns `5`.
+3. A failing compare-exchange with `next = 2^32` at `u32` returns `5`.
+4. A *succeeding* one with `next = true` at `u32` is a specification panic of
+   `typed_store`.
+5. A *succeeding* one with `next = 2^32` at `u32` is the same specification panic.
+
+`AtomicFetchAndOp` reaches its operand only after the load:
+6. `other = true` at `u32` is the specification panic of upstream's
+   `unreachable!()`.
+7. The same call through a dangling pointer is UB of the load, not a panic. -/
+theorem atomic_ill_typed_operands_bm :
+    bmObs (evalIntrinsic bmFive .AtomicCompareExchange
+        [bmArg bmPtr, (.Bool true, .Int itU32), (.Int 9, .Int itU32)] (.Int itU32)) =
+      some ⟨.Int 5, [u32Bytes 5 ++ uninitBytes 4], [aLoad 4]⟩ ∧
+    bmObs (evalIntrinsic bmFive .AtomicCompareExchange
+        [bmArg bmPtr, (.Int 6, .Int itU32), (.Bool true, .Int itU32)] (.Int itU32)) =
+      some ⟨.Int 5, [u32Bytes 5 ++ uninitBytes 4], [aLoad 4]⟩ ∧
+    bmObs (bmCas bmFive bmPtr 6 4294967296 itU32) =
+      some ⟨.Int 5, [u32Bytes 5 ++ uninitBytes 4], [aLoad 4]⟩ ∧
+    evalIntrinsic bmFive .AtomicCompareExchange
+        [bmArg bmPtr, (.Int 5, .Int itU32), (.Bool true, .Int itU32)] (.Int itU32) =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") ∧
+    bmCas bmFive bmPtr 5 4294967296 itU32 =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") ∧
+    evalIntrinsic bmFive (.AtomicFetchAndOp .Add)
+        [bmArg bmPtr, (.Bool true, .Int itU32)] (.Int itU32) =
+      .error (.specPanic "unreachable: AtomicFetchAndOp other not Value::Int") ∧
+    evalIntrinsic bmDead (.AtomicFetchAndOp .Add)
+        [bmArg bmPtr, (.Bool true, .Int itU32)] (.Int itU32) =
+      .error (.ub "dereferencing pointer to dead allocation") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · decide +kernel
+  · decide +kernel
+  · decide +kernel
+  · kernel_rfl
+  · kernel_rfl
+  · kernel_rfl
+  · kernel_rfl
+
+/-! ### Provenance under integer atomics on `Mach`
+
+The cell holds the bytes of the thin raw pointer `bmPtrVal`, stored atomically
+at pointer type: the address `cellAddr + 4`, each byte carrying a fragment of
+the provenance of allocation 0. Integer atomics at `usize` then read the bare
+address. Those that only load (`AtomicLoad`, a failing `AtomicCompareExchange`)
+leave every provenance fragment in memory, so the pointer can be loaded back
+with its provenance; those that store (a succeeding `AtomicCompareExchange`,
+`AtomicFetchAndOp`) write bytes without provenance, even when they write the
+same integer back, so the pointer loaded back afterwards has no provenance and
+cannot be dereferenced (`atomic_no_provenance_ub_bm`). -/
+
+/-- `AtomicStore` of the thin raw pointer `bmPtrVal` at pointer type into a
+fresh cell, then `op` on the resulting machine. -/
+def bmPtrCell (op : Mach → Interp (Val × Mach)) : Interp (Val × Mach) := do
+  let (_, m) ← bmStore (bmWith []) bmPtr bmPtrVal tyRawPtr
+  op m
+
+/-- The value that an `AtomicLoad` at pointer type finds in the cell after
+`bmPtrCell op`. -/
+def bmPtrCellReload (op : Mach → Interp (Val × Mach)) : Option Val :=
+  (bmObs (bmPtrCell op >>= fun r => bmLoad r.2 bmPtr tyRawPtr)).map (fun o => o.val)
+
+/-- The bytes of `bmPtrVal` in memory: the little-endian address
+`cellAddr + 4`, each byte carrying a fragment of the provenance of allocation 0. -/
+def bmPtrProvBytes : List Byte := provBytes (⟨0⟩, ()) 0 [4, 0, 0, 0, 1, 0, 0, 0]
+
+/-- The same address bytes without provenance. -/
+def bmPtrAddrBytes : List Byte := initBytes [4, 0, 0, 0, 1, 0, 0, 0]
+
+/-- Provenance under integer atomics at `usize` on `Mach`, on a cell that
+holds the bytes of a pointer:
+1. `AtomicLoad` returns the bare address; memory keeps every provenance
+   fragment, and the pointer loads back with its provenance.
+2. A *failing* `AtomicCompareExchange` (expecting `0`) does the same.
+3. A *succeeding* `AtomicCompareExchange` that exchanges the address for itself
+   leaves the same address bytes *without* provenance, and the pointer loads
+   back without provenance.
+4. `AtomicFetchAndOp(Add)` of `0` (`fetch_add(0)`) does the same as 3. -/
+theorem atomic_int_provenance_bm :
+    bmObs (bmPtrCell fun m => bmLoad m bmPtr (.Int itU64)) =
+      some ⟨.Int 4294967300, [bmPtrProvBytes], [aStore 8, aLoad 8]⟩ ∧
+    bmPtrCellReload (fun m => bmLoad m bmPtr (.Int itU64)) = some bmPtrVal ∧
+    bmObs (bmPtrCell fun m => bmCas m bmPtr 0 7 itU64) =
+      some ⟨.Int 4294967300, [bmPtrProvBytes], [aStore 8, aLoad 8]⟩ ∧
+    bmPtrCellReload (fun m => bmCas m bmPtr 0 7 itU64) = some bmPtrVal ∧
+    bmObs (bmPtrCell fun m => bmCas m bmPtr 4294967300 4294967300 itU64) =
+      some ⟨.Int 4294967300, [bmPtrAddrBytes], [aStore 8, aLoad 8, aStore 8]⟩ ∧
+    bmPtrCellReload (fun m => bmCas m bmPtr 4294967300 4294967300 itU64) =
+      some (.Ptr ⟨⟨4294967300, none⟩, none⟩) ∧
+    bmObs (bmPtrCell fun m => bmRmw m bmPtr .Add 0 itU64) =
+      some ⟨.Int 4294967300, [bmPtrAddrBytes], [aStore 8, aLoad 8, aStore 8]⟩ ∧
+    bmPtrCellReload (fun m => bmRmw m bmPtr .Add 0 itU64) =
+      some (.Ptr ⟨⟨4294967300, none⟩, none⟩) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ### `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`) -/
 
 /-- A root borrow-tree node over `n` bytes: `Unique` everywhere, unprotected,
@@ -3869,6 +4572,216 @@ theorem atomic_root_store_disables_shared_tb :
         tbLoad r.2 tbSharedPtr (.Int itU32)) =
       some (.ub "Tree Borrows: local read of Disabled reference") := by
   refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-! ### Provenance under integer atomics on `MachTB`
+
+The same four cases as `atomic_int_provenance_bm`, with Tree Borrows
+provenance (allocation *and* borrow-tree path) in the stored pointer. -/
+
+/-- `AtomicStore` of the thin raw pointer `tbPtrVal` at pointer type into a
+fresh cell, then `op` on the resulting machine. -/
+def tbPtrCell (op : MachTB → Interp (Value TBM × MachTB)) : Interp (Value TBM × MachTB) := do
+  let (_, m) ← tbStore (tbWith []) tbPtr tbPtrVal tyRawPtr
+  op m
+
+/-- The value that an `AtomicLoad` at pointer type finds in the cell after
+`tbPtrCell op`. -/
+def tbPtrCellReload (op : MachTB → Interp (Value TBM × MachTB)) : Option (Value TBM) :=
+  (tbObs (tbPtrCell op >>= fun r => tbLoad r.2 tbPtr tyRawPtr)).map (fun o => o.val)
+
+/-- The bytes of `tbPtrVal` in memory: the little-endian address
+`cellAddr + 4`, each byte carrying a fragment of the provenance
+(allocation 0, path `[0, 1]`). -/
+def tbPtrProvBytes : List (AbstractByte TreeBorrowsProvenance) :=
+  provBytes (⟨0⟩, [0, 1]) 0 [4, 0, 0, 0, 1, 0, 0, 0]
+
+/-- The same address bytes without provenance. -/
+def tbPtrAddrBytes : List (AbstractByte TreeBorrowsProvenance) :=
+  initBytes [4, 0, 0, 0, 1, 0, 0, 0]
+
+/-- Provenance under integer atomics at `usize` on `MachTB`; see
+`atomic_int_provenance_bm`. `AtomicLoad` and a failing `AtomicCompareExchange`
+leave the Tree Borrows provenance of every byte in memory; a succeeding
+`AtomicCompareExchange` of the address for itself and `fetch_add(0)` erase it. -/
+theorem atomic_int_provenance_tb :
+    tbObs (tbPtrCell fun m => tbLoad m tbPtr (.Int itU64)) =
+      some ⟨.Int 4294967300, [tbPtrProvBytes], [aStore 8, aLoad 8]⟩ ∧
+    tbPtrCellReload (fun m => tbLoad m tbPtr (.Int itU64)) = some tbPtrVal ∧
+    tbObs (tbPtrCell fun m => tbCas m tbPtr 0 7 itU64) =
+      some ⟨.Int 4294967300, [tbPtrProvBytes], [aStore 8, aLoad 8]⟩ ∧
+    tbPtrCellReload (fun m => tbCas m tbPtr 0 7 itU64) = some tbPtrVal ∧
+    tbObs (tbPtrCell fun m => tbCas m tbPtr 4294967300 4294967300 itU64) =
+      some ⟨.Int 4294967300, [tbPtrAddrBytes], [aStore 8, aLoad 8, aStore 8]⟩ ∧
+    tbPtrCellReload (fun m => tbCas m tbPtr 4294967300 4294967300 itU64) =
+      some (.Ptr ⟨⟨4294967300, none⟩, none⟩) ∧
+    tbObs (tbPtrCell fun m => tbRmw m tbPtr .Add 0 itU64) =
+      some ⟨.Int 4294967300, [tbPtrAddrBytes], [aStore 8, aLoad 8, aStore 8]⟩ ∧
+    tbPtrCellReload (fun m => tbRmw m tbPtr .Add 0 itU64) =
+      some (.Ptr ⟨⟨4294967300, none⟩, none⟩) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-! ### Tree Borrows `Reserved` permission: only a store activates a two-phase borrow
+
+An unprotected mutable reference `&mut u32` owns a `Reserved` borrow-tree node
+until it is first written through: the reservation phase of a two-phase
+borrow. In the unprotected state machine of
+`spec/mem/tree_borrows/state_machine_unprotected.md`, a local read keeps
+`Reserved`, a foreign read keeps `Reserved`, and a local write makes it
+`Unique` (upstream's name at `d821c6e3` for the activated state, Miri's
+`Active`); a foreign read turns `Unique` into `Frozen`, and a foreign write
+turns `Frozen` into `Disabled` (`permissionUnprot_two_phase_transitions`).
+
+For the atomic intrinsics through a `Reserved` reference this means:
+* `AtomicLoad` and a *failing* `AtomicCompareExchange` are reads. The node
+  stays `Reserved`, a `Frozen` sibling stays usable, and a later foreign read
+  through the parent leaves the reference `Reserved` and still activatable.
+* `AtomicStore`, `AtomicFetchAndOp`, and a *succeeding* `AtomicCompareExchange`
+  are writes. The node becomes `Unique`, a `Frozen` sibling becomes `Disabled`
+  (reading through it is UB), and a later foreign read through the parent
+  freezes the reference, so that writing through it again is UB.
+
+`tbTwoPhase` is the canonical two-phase shape: a mutable reborrow of the root
+followed by a shared reborrow of the root (as for the receiver and the argument
+of `v.push(v.len())`). -/
+
+/-- The borrow-tree node of an unprotected mutable reference to 4 bytes that
+has not been written through: `Reserved`. -/
+def tbReservedNode : Node :=
+  { children := [], permissions := List.replicate 4 (.Unprot .Reserved), «protected» := .No }
+
+/-- The `MachTB` whose allocation holds `5u32` and whose root has been
+reborrowed twice: mutably (child `[0]`, `Reserved`) and then shared (child
+`[1]`, `Frozen`). -/
+def tbTwoPhase : MachTB :=
+  tbMach [{ data := u32Bytes 5, addr := cellAddr, align := ⟨4⟩, kind := .Heap, live := true
+            extra := ⟨tbRoot 4 [tbReservedNode, tbFrozenNode]⟩ }]
+
+/-- The pointer of the mutable reference: provenance path `[0]`. -/
+def tbMutPtr : ThinPointer TreeBorrowsProvenance := tbPtr 0 [0]
+
+/-- The pointer of its shared sibling: provenance path `[1]`. -/
+def tbSibPtr : ThinPointer TreeBorrowsProvenance := tbPtr 0 [1]
+
+/-- Allocate 4 bytes, store `5u32`, and retag the root pointer first as
+`&mut u32` and then as `&u32` (neither at function entry, so unprotected). -/
+def tbTwoPhaseTrace :
+    Interp (Pointer TreeBorrowsProvenance × Pointer TreeBorrowsProvenance × TBM) := do
+  let (root, tbm) ← TreeBorrowsMemory.allocate (TreeBorrowsMemory.new ⟨true⟩) .Heap ⟨4⟩ ⟨4⟩
+  let tbm ← TreeBorrowsMemory.store tbm root (u32Bytes 5) ⟨4⟩
+  let (mutRef, tbm, _) ←
+    TreeBorrowsMemory.retag_ptr tbm TreeBorrowsMemory.new_call ⟨root, none⟩
+      (.Ref .Mutable u32Pointee) false false (fun _ => specPanic "no vtables")
+  let (shared, tbm, _) ←
+    TreeBorrowsMemory.retag_ptr tbm TreeBorrowsMemory.new_call ⟨root, none⟩
+      (.Ref .Immutable u32Pointee) false false (fun _ => specPanic "no vtables")
+  pure (mutRef, shared, tbm)
+
+/-- `tbTwoPhase`, `tbMutPtr`, and `tbSibPtr` are what `TreeBorrowsMemory` itself
+produces for a mutable reborrow followed by a shared reborrow: the mutable
+reference is `Reserved`, and the shared reborrow (a foreign read for it) leaves
+it `Reserved`. -/
+theorem tbTwoPhase_reachable :
+    tbTwoPhaseTrace = .ok (⟨tbMutPtr, none⟩, ⟨tbSibPtr, none⟩, tbTwoPhase.mem.memory) := by
+  kernel_rfl
+
+/-- The transitions of the unprotected Tree Borrows state machine behind the
+two-phase asymmetry: reads, local or foreign, keep `Reserved`; a local write
+activates it to `Unique`; a foreign read freezes `Unique`; `Frozen` rejects a
+local write and is disabled by a foreign write; `Disabled` rejects a local
+read. -/
+theorem permissionUnprot_two_phase_transitions :
+    PermissionUnprot.transition .Reserved .Read .Local = .ok .Reserved ∧
+    PermissionUnprot.transition .Reserved .Read .Foreign = .ok .Reserved ∧
+    PermissionUnprot.transition .Reserved .Write .Local = .ok .Unique ∧
+    PermissionUnprot.transition .Unique .Read .Foreign = .ok .Frozen ∧
+    PermissionUnprot.transition .Frozen .Write .Local =
+      .error (.ub "Tree Borrows: local write of Frozen reference") ∧
+    PermissionUnprot.transition .Frozen .Write .Foreign = .ok .Disabled ∧
+    PermissionUnprot.transition .Disabled .Read .Local =
+      .error (.ub "Tree Borrows: local read of Disabled reference") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- The permissions of `tbTwoPhase`'s root, of the mutable child `[0]`, and of
+the shared child `[1]`, each uniform over the 4 bytes, as `tbPerms` reports
+them. -/
+def tbTwoPhasePerms (root mutRef shared : PermissionUnprot) :
+    Option (List Permission × List (List Permission)) :=
+  some (List.replicate 4 (.Unprot root),
+    [List.replicate 4 (.Unprot mutRef), List.replicate 4 (.Unprot shared)])
+
+/-- Reads through the `Reserved` reference on `MachTB`: `AtomicLoad` and a
+*failing* `AtomicCompareExchange` succeed, return `5`, log only an atomic load,
+and leave the reference `Reserved` and its shared sibling `Frozen`. -/
+theorem atomic_reserved_reads_tb :
+    tbObs (tbLoad tbTwoPhase tbMutPtr (.Int itU32)) =
+      some ⟨.Int 5, [u32Bytes 5], [aLoad 4]⟩ ∧
+    tbPerms (tbLoad tbTwoPhase tbMutPtr (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Reserved .Frozen ∧
+    tbObs (tbCas tbTwoPhase tbMutPtr 6 9 itU32) =
+      some ⟨.Int 5, [u32Bytes 5], [aLoad 4]⟩ ∧
+    tbPerms (tbCas tbTwoPhase tbMutPtr 6 9 itU32) =
+      tbTwoPhasePerms .Unique .Reserved .Frozen := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- Writes through the `Reserved` reference on `MachTB`: `AtomicStore`, a
+*succeeding* `AtomicCompareExchange`, and `AtomicFetchAndOp` succeed, activate
+the reference (`Reserved` becomes `Unique`), and disable its shared sibling
+(`Frozen` becomes `Disabled`). -/
+theorem atomic_reserved_writes_activate_tb :
+    tbPerms (tbStore tbTwoPhase tbMutPtr (.Int 9) (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Unique .Disabled ∧
+    tbObs (tbCas tbTwoPhase tbMutPtr 5 9 itU32) =
+      some ⟨.Int 5, [u32Bytes 9], [aLoad 4, aStore 4]⟩ ∧
+    tbPerms (tbCas tbTwoPhase tbMutPtr 5 9 itU32) =
+      tbTwoPhasePerms .Unique .Unique .Disabled ∧
+    tbObs (tbRmw tbTwoPhase tbMutPtr .Add 1 itU32) =
+      some ⟨.Int 5, [u32Bytes 6], [aLoad 4, aStore 4]⟩ ∧
+    tbPerms (tbRmw tbTwoPhase tbMutPtr .Add 1 itU32) =
+      tbTwoPhasePerms .Unique .Unique .Disabled := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- What the difference means for foreign reads on `MachTB`.
+After a read through the `Reserved` reference (`AtomicLoad`, a failing
+`AtomicCompareExchange`):
+1. and 2. an `AtomicLoad` through the shared sibling succeeds and the reference
+   is still `Reserved`;
+6. after an `AtomicLoad` through the parent (the root pointer), an `AtomicStore`
+   through the reference still succeeds and activates it.
+
+After a write through it (`AtomicStore`, a succeeding `AtomicCompareExchange`,
+`AtomicFetchAndOp`):
+3., 4., and 5. an `AtomicLoad` through the shared sibling is UB;
+7. an `AtomicLoad` through the parent freezes the reference (`Unique` becomes
+   `Frozen`), and
+8. an `AtomicStore` through the reference is then UB. -/
+theorem atomic_reserved_foreign_read_asymmetry_tb :
+    tbPerms (tbLoad tbTwoPhase tbMutPtr (.Int itU32) >>= fun r =>
+        tbLoad r.2 tbSibPtr (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Reserved .Frozen ∧
+    tbPerms (tbCas tbTwoPhase tbMutPtr 6 9 itU32 >>= fun r =>
+        tbLoad r.2 tbSibPtr (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Reserved .Frozen ∧
+    stopOf (tbStore tbTwoPhase tbMutPtr (.Int 9) (.Int itU32) >>= fun r =>
+        tbLoad r.2 tbSibPtr (.Int itU32)) =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    stopOf (tbCas tbTwoPhase tbMutPtr 5 9 itU32 >>= fun r =>
+        tbLoad r.2 tbSibPtr (.Int itU32)) =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    stopOf (tbRmw tbTwoPhase tbMutPtr .Add 1 itU32 >>= fun r =>
+        tbLoad r.2 tbSibPtr (.Int itU32)) =
+      some (.ub "Tree Borrows: local read of Disabled reference") ∧
+    tbPerms (tbCas tbTwoPhase tbMutPtr 6 9 itU32 >>= fun r =>
+        tbLoad r.2 tbPtr (.Int itU32) >>= fun r =>
+        tbStore r.2 tbMutPtr (.Int 7) (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Unique .Disabled ∧
+    tbPerms (tbCas tbTwoPhase tbMutPtr 5 9 itU32 >>= fun r =>
+        tbLoad r.2 tbPtr (.Int itU32)) =
+      tbTwoPhasePerms .Unique .Frozen .Disabled ∧
+    stopOf (tbCas tbTwoPhase tbMutPtr 5 9 itU32 >>= fun r =>
+        tbLoad r.2 tbPtr (.Int itU32) >>= fun r =>
+        tbStore r.2 tbMutPtr (.Int 7) (.Int itU32)) =
+      some (.ub "Tree Borrows: local write of Frozen reference") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ### `Terminator::Intrinsic` end to end: `step` / `steps` and `stepTB` / `stepsTB`
 
@@ -4238,7 +5151,7 @@ theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race_instance :
       1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
         [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
       .ok () :=
-  atomicCompareExchange_failure_nonAtomicLoad_no_data_race (al1 := ⟨4⟩) rfl (by decide) rfl rfl
+  atomicCompareExchange_failure_nonAtomicLoad_no_data_race rfl rfl
     atomicCompareExchange_failure_instance (fun h => absurd (Value.Int.inj h) (by decide))
     typedLoadM_nonAtomic_tbFive 1 ⟨[]⟩
 
@@ -4257,9 +5170,95 @@ theorem atomicCompareExchange_success_nonAtomicLoad_data_race_instance :
         [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
       .error (.ub "Data race") := by
   have hl2 : Type.layout (.Int itU32) = .ok (.Sized itU32.size ⟨4⟩) := by kernel_rfl
-  exact atomicCompareExchange_success_nonAtomicLoad_data_race (al1 := ⟨4⟩) rfl (by decide)
+  exact atomicCompareExchange_success_nonAtomicLoad_data_race
     atomicCompareExchange_success_instance typedLoadM_nonAtomic_tbFive hl2
     (by decide) (by decide) rfl
+
+/-- `atomicFetchAndOp_nonAtomicLoad_data_race` is not vacuous: a successful
+`AtomicFetchAndOp` (`fetch_add(3)` on `tbFive`) and a non-atomic `typed_load`
+on unsynchronized threads at `cellAddr` trigger UB `"Data race"` in both
+orders. -/
+theorem atomicFetchAndOp_nonAtomicLoad_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 8 ++ uninitBytes 4)]
+        [aLoad 4, aStore 4]).mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 8 ++ uninitBytes 4)] [aLoad 4, aStore 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
+        [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
+      .error (.ub "Data race") := by
+  have hl2 : Type.layout (.Int itU32) = .ok (.Sized itU32.size ⟨4⟩) := by kernel_rfl
+  exact atomicFetchAndOp_nonAtomicLoad_data_race atomicFetchAndOp_add_instance
+    typedLoadM_nonAtomic_tbFive hl2 (by decide) (by decide) rfl
+
+/-- The non-atomic `typed_store` of `7u32` on `tbFive`, with the resulting
+machine written out. -/
+theorem typedStoreM_nonAtomic_tbFive :
+    typedStoreM tbFive tbPtr (.Int 7) (.Int itU32) ⟨4⟩ .None =
+      .ok (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)]
+        [⟨.Store, .None, cellAddr, ⟨4⟩⟩]) := by
+  kernel_rfl
+
+/-- `atomicCompareExchange_nonAtomicStore_data_race` is not vacuous: the
+*failing* `AtomicCompareExchange` of `atomicCompareExchange_failure_instance`
+and a non-atomic `typed_store` on unsynchronized threads at `cellAddr` trigger
+UB `"Data race"` in both orders. -/
+theorem atomicCompareExchange_nonAtomicStore_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [⟨.Store, .None, cellAddr, ⟨4⟩⟩]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)]
+        [⟨.Store, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
+      .error (.ub "Data race") := by
+  obtain ⟨bytes, henc, hrace⟩ := atomicCompareExchange_nonAtomicStore_data_race
+    atomicCompareExchange_failure_instance typedStoreM_nonAtomic_tbFive
+  have hlen : bytes.length = 4 := encodeM_int_length henc
+  exact hrace 1 ⟨[]⟩ (by rw [hlen]; decide) (by decide) rfl
+
+/-- `atomicCompareExchange_current_not_int` is not vacuous: on `tbFive`, a
+compare-exchange whose `current` is `true` fails silently and returns `5`. -/
+theorem atomicCompareExchange_current_not_int_instance :
+    evalIntrinsicM tbFive .AtomicCompareExchange
+        [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Bool true, .Int itU32), (.Int 9, .Int itU32)]
+        (.Int itU32) =
+      .ok (.Int 5, tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]) :=
+  atomicCompareExchange_current_not_int tyRawPtr (.Int 9) (al := ⟨4⟩) rfl (by decide)
+    typedLoadM_tbFive (fun _ hc => by cases hc)
+
+/-- `atomicCompareExchange_next_out_of_range_specPanic` is not vacuous: on
+`tbFive`, a succeeding compare-exchange whose `next` is `2^32` at `u32` is a
+specification panic. -/
+theorem atomicCompareExchange_next_out_of_range_specPanic_instance :
+    evalIntrinsicM tbFive .AtomicCompareExchange
+        [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int 5, .Int itU32), (.Int 4294967296, .Int itU32)]
+        (.Int itU32) =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") :=
+  atomicCompareExchange_next_out_of_range_specPanic tyRawPtr (al := ⟨4⟩) rfl (by decide)
+    typedLoadM_tbFive (by decide)
+
+/-- `atomicCompareExchange_failure_memory_bm` is not vacuous: on `bmFive`, the
+polymorphic `evalIntrinsicM` at `M = BasicMemory<x86_64>` evaluates a failing
+compare-exchange to an explicitly known machine, and that machine has the
+memory of `bmFive`. -/
+theorem atomicCompareExchange_failure_memory_bm_instance :
+    evalIntrinsicM (M := BM) bmFive .AtomicCompareExchange
+        [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int 6, .Int itU32), (.Int 9, .Int itU32)]
+        (.Int itU32) =
+      .ok (.Int 5, bmMach [bmCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]) ∧
+    (bmMach [bmCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem.memory =
+      bmFive.mem.memory := by
+  have h : evalIntrinsicM (M := BM) bmFive .AtomicCompareExchange
+      [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int 6, .Int itU32), (.Int 9, .Int itU32)]
+      (.Int itU32) =
+      .ok (.Int 5, bmMach [bmCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]) := by
+    kernel_rfl
+  exact ⟨h, atomicCompareExchange_failure_memory_bm h
+    (fun hc => absurd (Value.Int.inj hc) (by decide))⟩
 
 /-! ### Axiom and import audit -/
 
@@ -4291,7 +5290,7 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.AtomicIntrinsicsMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 140 then
+  if theorems < 230 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.AtomicIntrinsicsMR seen"
   logInfo m!"MiniRustSpec.AtomicIntrinsicsMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
