@@ -1068,7 +1068,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
         ),
     ),
     # ------------------------------------------------------------------
-    # Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean (2 UB guards)
+    # Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean (4 UB guards)
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="intrinsic_assume_false",
@@ -1161,6 +1161,97 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "end GuardMutation\n"
         ),
         quick=True,
+    ),
+    MirSemanticsGuard(
+        guard_id="intrinsic_assume_invalid_bool",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
+        description="evalStmt .intrinsic (.assume op) rejects invalid non-bool bit pattern (2) as UB",
+        anchor=(
+            "  | .intrinsic (.assume op) =>\n"
+            "    match\n"
+            "      evalOperand\n"
+            "        s.frame.locals\n"
+            "        op\n"
+            "        s.memory.borrows\n"
+            "        s.memory.globals\n"
+            "        layouts\n"
+            "        s.memory.callerLocals\n"
+            "        localDecls\n"
+            "        s.memory.callStack\n"
+            "    with\n"
+            "    | .ok (.scalar sc) locals' =>\n"
+            "      match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with\n"
+            "      | true => MirStepNode.step (advanceStmt s locals')\n"
+            "      | false => MirStepNode.fail .ub"
+        ),
+        replacement=(
+            "  | .intrinsic (.assume op) =>\n"
+            "    match\n"
+            "      evalOperand\n"
+            "        s.frame.locals\n"
+            "        op\n"
+            "        s.memory.borrows\n"
+            "        s.memory.globals\n"
+            "        layouts\n"
+            "        s.memory.callerLocals\n"
+            "        localDecls\n"
+            "        s.memory.callStack\n"
+            "    with\n"
+            "    | .ok (.scalar sc) locals' =>\n"
+            "      match Bool.and (Nat.beq sc.sizeBytes 1) (Bool.not (Nat.beq sc.bits 0)) with\n"
+            "      | true => MirStepNode.step (advanceStmt s locals')\n"
+            "      | false => MirStepNode.fail .ub"
+        ),
+        sanity_theorem_name="sanity_intrinsic_assume_invalid_bool",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def trueState : MachineState :=\n"
+            "  { frame := { blockIdx := 0, stmtIdx := 0, locals := .init (.scalar ⟨1, 1⟩) :: .nil }\n"
+            "    memory := emptyMemory }\n"
+            "\n"
+            "def assumeStmt : Statement :=\n"
+            "  { kind := .intrinsic (.assume (.copy { local_ := 0, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem sanity_intrinsic_assume_invalid_bool :\n"
+            "    evalStmt trueState assumeStmt =\n"
+            "      MirStepNode.step\n"
+            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := .init (.scalar ⟨1, 1⟩) :: .nil }\n"
+            "          memory := emptyMemory } :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_intrinsic_assume_invalid_bool",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def invalidBoolState : MachineState :=\n"
+            "  { frame := { blockIdx := 0, stmtIdx := 0, locals := .init (.scalar ⟨2, 1⟩) :: .nil }\n"
+            "    memory := emptyMemory }\n"
+            "\n"
+            "def assumeStmt : Statement :=\n"
+            "  { kind := .intrinsic (.assume (.copy { local_ := 0, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem refute_intrinsic_assume_invalid_bool :\n"
+            "    evalStmt invalidBoolState assumeStmt = MirStepNode.fail .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
     ),
     MirSemanticsGuard(
         guard_id="copy_nonoverlapping_overlap",
@@ -1287,6 +1378,132 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "\n"
             "theorem refute_copy_nonoverlapping_overlap :\n"
             "    evalStmt overlapState overlapCopyStmt = MirStepNode.fail .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
+        guard_id="copy_nonoverlapping_place_overlap",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
+        description="evalCopySingleDirect rejects distinct-tag pointers targeting overlapping places as UB",
+        anchor=(
+            "  let overlaps :=\n"
+            "    match Nat.beq srcPtr.tag dstPtr.tag with\n"
+            "    | true => true\n"
+            "    | false =>\n"
+            "      match\n"
+            "        Nat.beq srcEntry.targetLocal dstEntry.targetLocal\n"
+            "      with\n"
+            "      | false => false\n"
+            "      | true =>\n"
+            "        projectionsOverlap\n"
+            "          srcEntry.targetProjection\n"
+            "          dstEntry.targetProjection\n"
+            "  match overlaps with\n"
+            "  | true => MirStepNode.fail .ub\n"
+            "  | false =>\n"
+            "    let srcRootSlot : Option LocalSlot :="
+        ),
+        replacement=(
+            "  let overlaps :=\n"
+            "    match Nat.beq srcPtr.tag dstPtr.tag with\n"
+            "    | true => true\n"
+            "    | false => false\n"
+            "  match overlaps with\n"
+            "  | true => MirStepNode.fail .ub\n"
+            "  | false =>\n"
+            "    let srcRootSlot : Option LocalSlot :="
+        ),
+        sanity_theorem_name="sanity_copy_nonoverlapping_place_overlap",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def srcBorrow : BorrowEntry :=\n"
+            "  { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def dstBorrow : BorrowEntry :=\n"
+            "  { tag := 2, targetLocal := 1, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def disjointMem : Memory :=\n"
+            "  { emptyMemory with borrows := srcBorrow :: dstBorrow :: .nil }\n"
+            "\n"
+            "def disjointInitLocals : List LocalSlot :=\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.scalar ⟨99, 4⟩) ::\n"
+            "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
+            "\n"
+            "def disjointAfterLocals : List LocalSlot :=\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
+            "\n"
+            "def disjointCopyStmt : Statement :=\n"
+            "  { kind := .intrinsic\n"
+            "      (.copyNonOverlapping\n"
+            "        (.copy { local_ := 2, projection := .nil })\n"
+            "        (.copy { local_ := 3, projection := .nil })\n"
+            "        (.copy { local_ := 4, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem sanity_copy_nonoverlapping_place_overlap :\n"
+            "    evalStmt\n"
+            "      { frame := { blockIdx := 0, stmtIdx := 0, locals := disjointInitLocals }\n"
+            "        memory := disjointMem }\n"
+            "      disjointCopyStmt =\n"
+            "      MirStepNode.step\n"
+            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := disjointAfterLocals }\n"
+            "          memory := disjointMem } :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_copy_nonoverlapping_place_overlap",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def aliasSrcBorrow : BorrowEntry :=\n"
+            "  { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def aliasDstBorrow : BorrowEntry :=\n"
+            "  { tag := 2, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def aliasState : MachineState :=\n"
+            "  { frame :=\n"
+            "      { blockIdx := 0\n"
+            "        stmtIdx := 0\n"
+            "        locals :=\n"
+            "          .init (.scalar ⟨42, 4⟩) ::\n"
+            "          .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "          .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "          .init (.scalar ⟨1, 8⟩) :: .nil }\n"
+            "    memory := { emptyMemory with borrows := aliasSrcBorrow :: aliasDstBorrow :: .nil } }\n"
+            "\n"
+            "def aliasCopyStmt : Statement :=\n"
+            "  { kind := .intrinsic\n"
+            "      (.copyNonOverlapping\n"
+            "        (.copy { local_ := 1, projection := .nil })\n"
+            "        (.copy { local_ := 2, projection := .nil })\n"
+            "        (.copy { local_ := 3, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem refute_copy_nonoverlapping_place_overlap :\n"
+            "    evalStmt aliasState aliasCopyStmt = MirStepNode.fail .ub :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -1725,6 +1942,24 @@ _DIAG_HEADER_RE = re.compile(
 # (`error: toolchain ... is not installed`, `lean: error: ...`).
 _ERROR_TOKEN_RE = re.compile(r"(?:^|[\s:])error(?:\([^)\n]*\))?:")
 
+# An indented line whose FIRST non-whitespace token is `error:` or `error(...):`.
+# Lean 4 diagnostic continuation bodies indent terms, types, goals, and notes
+# (`  note: type error: ...`), never a bare leading `  error: ...`; rejecting
+# these closes the loophole of an indented unlocated error on the same stream
+# right after a located fixture diagnostic.
+_INDENTED_LEADING_ERROR_RE = re.compile(r"^[ \t]+error(?:\([^)\n]*\))?:")
+
+
+def _split_lf_lines_keepends(text: str) -> list[str]:
+    """Split `text` strictly on `\\n` (preserving `\\n`), matching `re.MULTILINE` `^`."""
+    if not text:
+        return []
+    parts = text.split("\n")
+    lines = [f"{part}\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
 
 def classify_refutation_failure(
     returncode: int,
@@ -1762,13 +1997,17 @@ def classify_refutation_failure(
             "ERROR",
             f"unexpected Lean exit code {returncode} (expected 1 on proof failure)",
         )
+    # Normalize CR/CRLF to LF before joining streams so `re.MULTILINE` `^` and
+    # line iteration never desync on `\r` or Unicode line separators.
+    combined_output = combined_output.replace("\r\n", "\n").replace("\r", "\n")
     # Offset at which stderr starts (always at the start of a line).
     stream_break: int | None = None
     if stderr_output is not None:
+        stderr_norm = stderr_output.replace("\r\n", "\n").replace("\r", "\n")
         if combined_output and not combined_output.endswith("\n"):
             combined_output += "\n"
         stream_break = len(combined_output)
-        combined_output += stderr_output
+        combined_output += stderr_norm
     for marker in NON_KILL_ERROR_MARKERS:
         if marker in combined_output:
             return (
@@ -1795,12 +2034,13 @@ def classify_refutation_failure(
 
     # Every line announcing an error must be a located error header in the
     # fixture itself, EXCEPT indented continuation lines inside the body of a
-    # diagnostic already located in `fixture_filename` (which may legitimately
-    # mention phrases like `  type error: ...`). Errors in other files and
-    # unlocated errors (toolchain, wrapper, import resolution) are never kills.
+    # diagnostic already located in `fixture_filename` whose first non-space
+    # token is NOT `error:` / `error(...):` (e.g., `  note: type error: ...`).
+    # Errors in other files and unlocated errors (including indented leading
+    # `  error: ...` on the same stream or on stderr) are never kills.
     pos = 0
     active_header: re.Match[str] | None = None
-    for raw_line in combined_output.splitlines(keepends=True):
+    for raw_line in _split_lf_lines_keepends(combined_output):
         if pos == stream_break:
             # A stdout diagnostic does not continue on stderr.
             active_header = None
@@ -1812,6 +2052,7 @@ def classify_refutation_failure(
             and active_header is not None
             and _is_fixture(active_header)
             and raw_line[:1].isspace()
+            and _INDENTED_LEADING_ERROR_RE.match(raw_line) is None
         )
         if not in_fixture_body and _ERROR_TOKEN_RE.search(raw_line):
             if match is None or match.group("sev") != "error" or not _is_fixture(match):
@@ -1889,9 +2130,10 @@ def _parse_lean_header_ex(lean_source: str) -> tuple[bool, list[str], bool]:
     """
     n = len(lean_source)
     i = 0
+    unclosed_header_comment = False
 
     def skip_ws_and_comments() -> None:
-        nonlocal i
+        nonlocal i, unclosed_header_comment
         while i < n:
             ch = lean_source[i]
             if ch.isspace():
@@ -1911,6 +2153,8 @@ def _parse_lean_header_ex(lean_source: str) -> tuple[bool, list[str], bool]:
                         i += 2
                     else:
                         i += 1
+                if depth > 0:
+                    unclosed_header_comment = True
             else:
                 break
 
@@ -1981,7 +2225,7 @@ def _parse_lean_header_ex(lean_source: str) -> tuple[bool, list[str], bool]:
             complete = False
             break
 
-    return (is_module, imports, complete)
+    return (is_module, imports, complete and not unclosed_header_comment)
 
 
 def _parse_lean_header(lean_source: str) -> tuple[bool, list[str]]:
@@ -2016,9 +2260,172 @@ _TRUSTED_DECL_NAME_RE = re.compile(
 )
 
 
+# Lean prelude primitives and trusted root namespace components that a fixture
+# helper `def` must never shadow.
+_LEAN_CORE_RESERVED_NAMES: frozenset[str] = frozenset(
+    {
+        "Trusted",
+        "Rustc",
+        "V2026_06_01",
+        "MirAst",
+        "MirSemantics",
+        "Effect",
+        "Sequence",
+        "Layout",
+        "Nat",
+        "Bool",
+        "Option",
+        "List",
+        "String",
+        "Unit",
+        "Eq",
+        "rfl",
+        "true",
+        "false",
+        "some",
+        "none",
+        "nil",
+        "cons",
+    }
+)
+
+_TRUSTED_INDUCTIVE_START_RE = re.compile(
+    r"^[ \t]*(?:@\[[^\]\n]*\][ \t]*)*"
+    r"(?:(?:private|protected)[ \t]+)?inductive\b"
+)
+_TRUSTED_CTOR_LINE_RE = re.compile(r"^[ \t]*\|[ \t]+([A-Za-z_][A-Za-z0-9_']*)")
+
+
 def _trusted_declaration_names(lean_source: str) -> set[str]:
     """Return the last name component of every declaration in a trusted file."""
     return {name.split(".")[-1] for name in _TRUSTED_DECL_NAME_RE.findall(lean_source)}
+
+
+def _trusted_constructor_names(lean_source: str) -> set[str]:
+    """Return inductive constructor names declared in a trusted file."""
+    ctors: set[str] = set()
+    in_inductive = False
+    for line in lean_source.splitlines():
+        if _TRUSTED_INDUCTIVE_START_RE.match(line):
+            in_inductive = True
+            continue
+        if not in_inductive:
+            continue
+        if line and not line[0].isspace():
+            in_inductive = False
+            continue
+        match = _TRUSTED_CTOR_LINE_RE.match(line)
+        if match and "=>" not in line:
+            ctors.add(match.group(1))
+    return ctors
+
+
+def _split_top_level_equality(stmt: str) -> list[int]:
+    """Return character indices of top-level standalone `=` operators in `stmt`.
+
+    Ignores `=` inside string literals or nested `(...)`, `[...]`, `{...}`,
+    `⟨...⟩`, as well as compound operators (`:=`, `==`, `!=`, `<=`, `>=`, `=>`).
+    """
+    positions: list[int] = []
+    depth = 0
+    i = 0
+    n = len(stmt)
+    while i < n:
+        ch = stmt[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if stmt[i] == "\\" and i + 1 < n:
+                    i += 2
+                elif stmt[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+        if ch in "([{⟨":
+            depth += 1
+        elif ch in ")]}⟩" and depth > 0:
+            depth -= 1
+        elif ch == "=" and depth == 0:
+            prev_ch = stmt[i - 1] if i > 0 else ""
+            next_ch = stmt[i + 1] if i + 1 < n else ""
+            if prev_ch not in ":<>!=" and next_ch not in "=>":
+                positions.append(i)
+        i += 1
+    return positions
+
+
+def _fixture_statement_errors(
+    kind: str,
+    src_text: str,
+    theorem_name: str,
+    *,
+    trusted_decl_names: frozenset[str] | set[str],
+) -> list[str]:
+    """Reject vacuous (`X = X`, `1 = 1`, `let ...`) or outcome-swapped theorems.
+
+    Enforces that every cataloged sanity/refutation theorem:
+    - contains no `let` or `fun` inside the theorem statement itself,
+    - states a single top-level equality `lhs = rhs` with `lhs != rhs`,
+    - invokes at least one trusted declaration from `trusted_decl_names` on `lhs`,
+    - targets UB (`.ub` or `MirStepNode.fail .ub`) on `rhs` iff `kind == "refute"`.
+    """
+    errors: list[str] = []
+    code_only, _, _ = _scan_lean_source(src_text)
+    code_lines = code_only.splitlines()
+    try:
+        start, end = find_theorem_line_span(src_text, theorem_name)
+    except ValueError:
+        return errors
+    span_lines = [ln for ln in code_lines[start - 1 : end] if ln.strip()]
+    if len(span_lines) < 3 or not span_lines[-2].rstrip().endswith(":="):
+        return errors
+    stmt = "\n".join(span_lines[1:-1]).rstrip()
+    stmt = stmt[:-2].strip()
+    if re.search(r"\b(?:let|fun)\b", stmt):
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} statement must not contain `let` or `fun`"
+        )
+    eq_positions = _split_top_level_equality(stmt)
+    if len(eq_positions) != 1:
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} statement must have exactly one "
+            f"top-level `=`, found {len(eq_positions)}"
+        )
+        return errors
+    eq_idx = eq_positions[0]
+    lhs = stmt[:eq_idx].strip()
+    rhs = stmt[eq_idx + 1 :].strip()
+    lhs_norm = " ".join(lhs.split())
+    rhs_norm = " ".join(rhs.split())
+    if not lhs_norm or not rhs_norm:
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} has empty LHS or RHS around `=`"
+        )
+        return errors
+    if lhs_norm == rhs_norm:
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} is syntactically reflexive (`lhs = lhs`)"
+        )
+    if trusted_decl_names:
+        lhs_idents = set(_LEAN_SIMPLE_IDENT_RE.findall(lhs))
+        if not (lhs_idents & trusted_decl_names):
+            errors.append(
+                f"({kind}): theorem {theorem_name!r} LHS does not reference any "
+                "trusted declaration"
+            )
+    rhs_is_ub = rhs_norm in (".ub", "MirStepNode.fail .ub")
+    if kind == "refute" and not rhs_is_ub:
+        errors.append(
+            f"({kind}): refutation theorem {theorem_name!r} RHS must assert UB "
+            f"(`.ub` or `MirStepNode.fail .ub`), got {rhs_norm!r}"
+        )
+    if kind == "sanity" and rhs_is_ub:
+        errors.append(
+            f"({kind}): positive sanity theorem {theorem_name!r} RHS must not assert UB"
+        )
+    return errors
 
 
 def _fixture_shape_errors(
@@ -2149,16 +2556,18 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
     # Verify BASE_TRUSTED_MODULES + SEMANTICS_MODULES exist and are topologically ordered.
     seen_mods: set[str] = set()
     # Names a fixture helper must not reuse: inside `namespace GuardMutation`
-    # a local `def evalOperand` would win over the `open`ed trusted one, and
-    # the theorem would then be about the fixture's own function.
-    trusted_names: set[str] = set()
+    # a local `def evalOperand` or `def ub` or `def rfl` would win over the
+    # `open`ed trusted/core declaration, detaching the theorem from the TCB.
+    trusted_decl_names: set[str] = set()
+    trusted_ctor_names: set[str] = set()
     for mod in (*BASE_TRUSTED_MODULES, *SEMANTICS_MODULES):
         mod_path = trusted_lean_dir / f"{mod}.lean"
         if not mod_path.is_file():
             errors.append(f"missing trusted Lean module: {mod_path}")
             continue
         mod_text = mod_path.read_text(encoding="utf-8")
-        trusted_names |= _trusted_declaration_names(mod_text)
+        trusted_decl_names |= _trusted_declaration_names(mod_text)
+        trusted_ctor_names |= _trusted_constructor_names(mod_text)
         if not _parse_lean_header_ex(mod_text)[2]:
             errors.append(f"cannot parse every import of trusted module {mod}")
         mod_imports = _extract_trusted_imports(mod_text)
@@ -2177,6 +2586,7 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
                         f"SEMANTICS_UPSTREAM[{mod!r}] is missing live import {imp!r}"
                     )
         seen_mods.add(mod)
+    reserved_names = trusted_decl_names | trusted_ctor_names | _LEAN_CORE_RESERVED_NAMES
 
     for guard in MIR_SEMANTICS_GUARDS:
         if not GUARD_ID_RE.match(guard.guard_id):
@@ -2270,9 +2680,13 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             ("refute", guard.refute_source, guard.theorem_name),
         ):
             for shape_error in _fixture_shape_errors(
-                kind, src_text, thm_name, reserved_names=trusted_names
+                kind, src_text, thm_name, reserved_names=reserved_names
             ):
                 errors.append(f"{guard.guard_id}: {shape_error}")
+            for stmt_error in _fixture_statement_errors(
+                kind, src_text, thm_name, trusted_decl_names=trusted_decl_names
+            ):
+                errors.append(f"{guard.guard_id}: {stmt_error}")
 
             is_module, all_imports = _parse_lean_header(src_text)
             if is_module:
@@ -2660,7 +3074,7 @@ def _read_lakefile_trusted_pkg_name(anneal_root: Path) -> tuple[str | None, str]
     `needs`, `extraDepTargets`, `precompileModules`, `platformIndependent`).
     """
     if (anneal_root / "lakefile.lean").exists():
-        return (None, "lakefile.lean is unsupported for synthetic Lake trace verification")
+        return (None, "lakefile.lean is unsupported for Lake trace verification")
     toml_path = anneal_root / "lakefile.toml"
     if tomllib is None:
         return (None, "cannot read lakefile.toml (needs Python >= 3.11 `tomllib`)")
@@ -2939,7 +3353,6 @@ def _verify_lake_traces(
         if len(trusted_imports) != len(all_imports):
             return (False, f"{mod}: non-Trusted imports are unsupported for Lake trace verification")
         inputs = _trace_pairs(trace.get("inputs"))
-        inputs_map = dict(inputs)
         src_suffix = f"/trusted/lean/{mod}.lean"
         src_hashes = [
             value
@@ -2954,28 +3367,66 @@ def _verify_lake_traces(
         ):
             return (False, f"{mod}: built by a different Lean toolchain")
         # Mutants are compiled by plain `lean` with no extra options, so the
-        # baseline must have been built that way too.
-        if (
-            inputs_map.get("options") != _LAKE_HASH_NIL_HEX
-            or inputs_map.get(_LAKE_DEFAULT_LEAN_ARGS_CAPTION) != _LAKE_HASH_NIL_HEX
-        ):
+        # baseline must have been built that way too. Avoid `dict(inputs)` so
+        # duplicate entries cannot overwrite earlier non-default values.
+        options_vals = [value for caption, value in inputs if caption == "options"]
+        lean_args_entries = [
+            (caption, value)
+            for caption, value in inputs
+            if caption.startswith("Module.leanArgs:")
+        ]
+        if options_vals != [_LAKE_HASH_NIL_HEX] or lean_args_entries != [
+            (_LAKE_DEFAULT_LEAN_ARGS_CAPTION, _LAKE_HASH_NIL_HEX)
+        ]:
             return (False, f"{mod}: built with non-default Lean options or arguments")
 
-        imports_node = dict(_trace_pairs(inputs_map.get("deps"))).get("imports")
+        deps_vals = [value for caption, value in inputs if caption == "deps"]
+        if len(deps_vals) != 1:
+            return (False, f"{mod}: unrecognized imports record in Lake trace")
+        imports_vals = [
+            value
+            for caption, value in _trace_pairs(deps_vals[0])
+            if caption == "imports"
+        ]
+        if len(imports_vals) != 1:
+            return (False, f"{mod}: unrecognized imports record in Lake trace")
+        imports_node = imports_vals[0]
         import_arts: dict[str, str] = {}
         import_legacy: dict[str, str] = {}
         if isinstance(imports_node, list):
-            for caption, value in _trace_pairs(imports_node):
-                if not isinstance(value, str):
-                    continue
+            for entry in imports_node:
+                if not (
+                    isinstance(entry, list)
+                    and len(entry) == 2
+                    and isinstance(entry[0], str)
+                    and isinstance(entry[1], str)
+                ):
+                    return (
+                        False,
+                        f"{mod}: unrecognized imports record in Lake trace",
+                    )
+                caption, value = entry
+                matched_sink: dict[str, str] | None = None
+                dep = ""
                 for suffix, sink in (
                     (_LAKE_IMPORT_ARTS_SUFFIX, import_arts),
                     (_LAKE_IMPORT_LEGACY_SUFFIX, import_legacy),
                 ):
                     if caption.endswith(suffix):
                         dep = caption[: -len(suffix)].replace(".", "/")
-                        if dep.startswith("Trusted/"):
-                            sink[dep] = value
+                        matched_sink = sink
+                        break
+                if matched_sink is None or not dep.startswith("Trusted/"):
+                    return (
+                        False,
+                        f"{mod}: unrecognized imports record in Lake trace ({caption!r})",
+                    )
+                if dep in matched_sink and matched_sink[dep] != value:
+                    return (
+                        False,
+                        f"{mod}: conflicting duplicate import record for {dep} in Lake trace",
+                    )
+                matched_sink[dep] = value
         elif imports_node != _LAKE_HASH_NIL_HEX:
             return (False, f"{mod}: unrecognized imports record in Lake trace")
         if set(import_arts) != set(trusted_imports) or set(import_legacy) != set(
@@ -3452,12 +3903,13 @@ def _check_one_mir_guard(
                 timeout_sec=timeout_sec,
                 lean_run_wrapper=lean_run_wrapper,
             )
-            if res.returncode != 0:
+            mod_combined = (res.stdout + "\n" + res.stderr).strip()
+            if res.returncode != 0 or _has_sorry_warning(mod_combined):
                 return _result(
                     "ERROR",
-                    f"mutated semantics module {mod} failed to compile "
+                    f"mutated semantics module {mod} failed to compile cleanly "
                     f"(rc={res.returncode}): "
-                    f"{(res.stdout + res.stderr).strip()[:300]}",
+                    f"{mod_combined[:300]}",
                 )
             mut_olean = mut_olean_dir / f"{mod}.olean"
             base_olean = base_olean_dir / f"{mod}.olean"

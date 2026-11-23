@@ -2351,9 +2351,20 @@ class GuardMutationB2AdversarialTests(unittest.TestCase):
                 "  lean: error: something\n",
             ):
                 self.assertEqual(self._classify(1, stdout, stderr), "ERROR", (stdout, stderr))
-        # The same text in ONE stream is a diagnostic body (A1's rule).
+        # Indented prose mentioning `error:` is accepted as a diagnostic body
+        # ONLY in the same stream, while an indented LEADING `error:` is
+        # rejected even in one stream (closing B2's residual risk #3).
         self.assertEqual(
-            self._classify(1, self.KILL + "  error: wrapper scope setup failed\n"), "KILLED"
+            self._classify(1, self.KILL, "  note: type error: expected .ub\n"),
+            "ERROR",
+        )
+        self.assertEqual(
+            self._classify(1, self.KILL + "  note: type error: expected .ub\n"),
+            "KILLED",
+        )
+        self.assertEqual(
+            self._classify(1, self.KILL + "  error: wrapper scope setup failed\n"),
+            "ERROR",
         )
 
         # stderr cannot supply the proof-failure marker for a stdout error.
@@ -2627,6 +2638,227 @@ class GuardMutationB2AdversarialTests(unittest.TestCase):
             # The boundary mutant's sanity sits on the last defined shift.
             shift, bits = shift_and_bits(by_id[edge].sanity_source)
             self.assertEqual(shift, bits - 1, edge)
+
+
+class GuardMutationA2AdversarialTests(unittest.TestCase):
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+
+    # -- vacuous & swapped fixture statement checks --------------------
+
+    def test_vacuous_and_swapped_fixture_statements_are_rejected(self) -> None:
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        trusted = {"evalScalarBinOp", "emptyMemory"}
+
+        # Syntactically reflexive `X = X := rfl` is rejected.
+        refl_src = guard.sanity_source.replace(
+            ".ok (.scalar ⟨7, 1⟩) .nil emptyMemory",
+            "evalScalarBinOp .div ⟨42, 1⟩ ⟨6, 1⟩ .nil emptyMemory false",
+        )
+        errs = gmut._fixture_statement_errors(
+            "sanity", refl_src, guard.sanity_theorem_name, trusted_decl_names=trusted
+        )
+        self.assertTrue(any("syntactically reflexive" in e for e in errs), errs)
+
+        # Arithmetic-only `1 + 1 = 2 := rfl` with no trusted call on LHS is rejected.
+        no_tcb = (
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "theorem sanity_div_by_zero :\n"
+            "    1 + 1 = 2 :=\n"
+            "  rfl\n"
+        )
+        errs = gmut._fixture_statement_errors(
+            "sanity", no_tcb, "sanity_div_by_zero", trusted_decl_names=trusted
+        )
+        self.assertTrue(any("does not reference any trusted declaration" in e for e in errs), errs)
+
+        # `let` / `fun` inside theorem statement is rejected.
+        let_src = (
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "theorem sanity_div_by_zero :\n"
+            "    let x := evalScalarBinOp .div ⟨42, 1⟩ ⟨6, 1⟩ .nil emptyMemory false\n"
+            "    x = x :=\n"
+            "  rfl\n"
+        )
+        errs = gmut._fixture_statement_errors(
+            "sanity", let_src, "sanity_div_by_zero", trusted_decl_names=trusted
+        )
+        self.assertTrue(any("must not contain `let` or `fun`" in e for e in errs), errs)
+
+        # Swapped outcomes: refute NOT asserting UB, or sanity asserting UB.
+        swapped_refute = guard.sanity_source.replace(
+            guard.sanity_theorem_name, guard.theorem_name
+        )
+        swapped_sanity = guard.refute_source.replace(
+            guard.theorem_name, guard.sanity_theorem_name
+        )
+        with mock.patch.object(
+            gmut,
+            "MIR_SEMANTICS_GUARDS",
+            _replace_guard("div_by_zero", refute_source=swapped_refute),
+        ):
+            cat_errs = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(any("RHS must assert UB" in e for e in cat_errs), cat_errs)
+
+        with mock.patch.object(
+            gmut,
+            "MIR_SEMANTICS_GUARDS",
+            _replace_guard("div_by_zero", sanity_source=swapped_sanity),
+        ):
+            cat_errs = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(any("RHS must not assert UB" in e for e in cat_errs), cat_errs)
+
+    # -- constructor & core-name shadowing -----------------------------
+
+    def test_constructor_and_core_shadowing_rejected(self) -> None:
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        for shadowed in ("ub", "fail", "rfl", "Trusted", "Nat"):
+            bad = guard.sanity_source.replace(
+                "theorem sanity_div_by_zero",
+                f"def {shadowed} : Nat := 0\n\ntheorem sanity_div_by_zero",
+            )
+            with mock.patch.object(
+                gmut,
+                "MIR_SEMANTICS_GUARDS",
+                _replace_guard("div_by_zero", sanity_source=bad),
+            ):
+                errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+            self.assertTrue(
+                any(f"def {shadowed}" in e and "shadows" in e for e in errors),
+                (shadowed, errors),
+            )
+
+    # -- same-stream indented error & CR/LF classifier hardening -------
+
+    def test_classify_rejects_same_stream_indented_leading_error_and_handles_cr(self) -> None:
+        kill = "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\n"
+        # Same-stream indented prose mentioning `error:` stays KILLED.
+        self.assertEqual(
+            gmut.classify_refutation_failure(
+                1,
+                kill + "  note: type error: expected .ub\n",
+                self.FIXTURE,
+                self.SPAN,
+                stderr_output="",
+            )[0],
+            "KILLED",
+        )
+        # Same-stream indented LEADING `  error:` / `  error(...):` is ERROR.
+        for bad_indented in (
+            "  error: unlocated failure on same stream\n",
+            "\terror(lean.foo): nested unlocated failure\n",
+        ):
+            self.assertEqual(
+                gmut.classify_refutation_failure(
+                    1,
+                    kill + bad_indented,
+                    self.FIXTURE,
+                    self.SPAN,
+                    stderr_output="",
+                )[0],
+                "ERROR",
+                bad_indented,
+            )
+        # CRLF and bare CR do not desync `stream_break` or diagnostic headers.
+        crlf_kill = "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\r\n  rfl\r\n"
+        self.assertEqual(
+            gmut.classify_refutation_failure(
+                1, crlf_kill, self.FIXTURE, self.SPAN, stderr_output=""
+            )[0],
+            "KILLED",
+        )
+        # Bare `\r` before a foreign error is normalized so it cannot slip past.
+        self.assertEqual(
+            gmut.classify_refutation_failure(
+                1,
+                kill,
+                self.FIXTURE,
+                self.SPAN,
+                stderr_output="progress\r/t/Other.lean:1:0: error: boom\n",
+            )[0],
+            "ERROR",
+        )
+
+    # -- unclosed header comment & duplicate/non-Trusted Lake traces ---
+
+    def test_unclosed_header_comment_and_duplicate_or_extra_trace_entries(self) -> None:
+        self.assertEqual(
+            gmut._parse_lean_header_ex("/- unclosed header\nimport Trusted.A\n"),
+            (False, [], False),
+        )
+
+        # Duplicate options / leanArgs / non-Trusted imports / conflicting
+        # duplicate imports inside `synthetic: false` traces all fail closed.
+        def check_mutated_c(fn: object, expected_substr: str) -> None:
+            with tempfile.TemporaryDirectory(prefix="anneal-gmut-a2-trace-") as tmp:
+                root, mods = _make_tiny_lake_root(Path(tmp))
+                tr_path = root / ".lake/build/lib/lean/Trusted/C.trace"
+                trace = json.loads(tr_path.read_text(encoding="utf-8"))
+                fn(trace)  # type: ignore[operator]
+                tr_path.write_text(json.dumps(trace), encoding="utf-8")
+                ok, why = gmut._lake_olean_reuse_decision(root, mods)
+                self.assertFalse(ok, expected_substr)
+                self.assertIn(expected_substr, why)
+
+        # Duplicate `options` where non-default precedes nil (would fool `dict()`).
+        check_mutated_c(
+            lambda t: t["inputs"].insert(0, ["options", "deadbeefdeadbeef"]),
+            "non-default Lean options or arguments",
+        )
+        # Duplicate `Module.leanArgs:` with non-empty args alongside `#[]`.
+        check_mutated_c(
+            lambda t: t["inputs"].insert(0, ['Module.leanArgs: #["-Dfoo=1"]', "deadbeefdeadbeef"]),
+            "non-default Lean options or arguments",
+        )
+        # Extra non-Trusted entry smuggled inside `imports_node`.
+        check_mutated_c(
+            lambda t: t["inputs"][0][1][0][1].append(["Anneal.Sneaky:importAllArts", "0" * 16]),
+            "unrecognized imports record",
+        )
+        # Conflicting duplicate import entry inside `imports_node`.
+        check_mutated_c(
+            lambda t: t["inputs"][0][1][0][1].insert(0, ["Trusted.A:importAllArts", "0" * 16]),
+            "conflicting duplicate import record",
+        )
+
+    # -- mutated TCB sorry rejection & new Statements.lean guards ------
+
+    def test_mutated_tcb_sorry_warning_is_error_and_new_statements_guards(self) -> None:
+        fake_sh = textwrap.dedent(
+            """\
+            if [ -n "$OUT" ]; then
+              mkdir -p "$(dirname "$OUT")"
+              printf 'fake-olean' > "$OUT"
+            fi
+            if [ "$IS_MUTANT" = "1" ] && [ "$BASENAME" = "Scalars.lean" ]; then
+              printf '%s:10:0: warning: declaration uses `sorry`\\n' "$SRC"
+            fi
+            exit 0
+            """
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-a2-sorry-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, fake_sh)
+            res = _run_cli(
+                ["--lean", str(fake), "--no-lake-cache", "--guard", "div_by_zero", "--json"]
+            )
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        report = json.loads(res.stdout)
+        self.assertEqual((report["killed"], report["errors"]), (0, 1))
+        self.assertIn("mutated semantics module", report["results"][0]["detail"])
+
+        # Catalog now covers 18 guards including both new Statements.lean guards.
+        self.assertGreaterEqual(len(gmut.MIR_SEMANTICS_GUARDS), 18)
+        by_id = {g.guard_id: g for g in gmut.MIR_SEMANTICS_GUARDS}
+        self.assertIn("intrinsic_assume_invalid_bool", by_id)
+        self.assertIn("copy_nonoverlapping_place_overlap", by_id)
+        # `intrinsic_assume_invalid_bool` weakens `== 1` to `!= 0` and tests bit pattern 2.
+        self.assertIn("Bool.not (Nat.beq sc.bits 0)", by_id["intrinsic_assume_invalid_bool"].replacement)
+        self.assertIn("⟨2, 1⟩", by_id["intrinsic_assume_invalid_bool"].refute_source)
+        # `copy_nonoverlapping_place_overlap` keeps same-tag check intact and uses distinct tags 1 & 2.
+        self.assertIn("Nat.beq srcPtr.tag dstPtr.tag", by_id["copy_nonoverlapping_place_overlap"].replacement)
+        self.assertIn("tag := 1, targetLocal := 0", by_id["copy_nonoverlapping_place_overlap"].refute_source)
+        self.assertIn("tag := 2, targetLocal := 0", by_id["copy_nonoverlapping_place_overlap"].refute_source)
 
 
 if __name__ == "__main__":
