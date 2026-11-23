@@ -1304,6 +1304,171 @@
       ]
     },
     {
+      "module": "Workbench.Pass1.ModIntOrder",
+      "path": "lean/Workbench/Pass1/ModIntOrder.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + 51 locked `Init.*` foundation modules only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) theorems eliminating repeated boilerplate across real-crate proofs (`zerocopy`, `byteorder`, `ryu`, `bytes`) where `Init.Data.Int.Order` and `Init.Data.Nat.ModLemmas` are outside `foundation-lock.json`:",
+      "line_count": 328,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.SimpLemmas",
+        "Init.Tactics",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.Fin.Basic",
+        "Init.Data.BitVec.BasicAux",
+        "Init.Data.Int.Basic"
+      ],
+      "declaration_count": 36,
+      "declarations": [
+        {
+          "kind": "theorem",
+          "name": "nat_two_pow_lt_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_pow_lt_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_pow_le_of_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mul_div_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_add_mod_self_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mul_mod_self_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mod_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_mod_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mod_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_add_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_mod_mul_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_sq_sub_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_sub_ofNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_sub_negSucc_ofNat_not_nonNeg"
+        },
+        {
+          "kind": "theorem",
+          "name": "nonNeg_subNatNat_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "le_nonNeg_subNatNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_ofNat_zero_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_ofNat_le_of_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "le_of_int_ofNat_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_ofNat_le_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_ofNat_lt_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_negSucc_le_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_negSucc_le_negSucc_iff"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_le_refl"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_le_trans"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_lt_of_lt_of_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_add_one_le_add_one"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_lt_of_le_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_le_antisymm"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_not_add_one_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_not_lt_of_ge"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_not_le_of_gt"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_ofNat_sub"
+        },
+        {
+          "kind": "theorem",
+          "name": "int_sub_ofNat_neg_swap"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_eq_of_toNat_eq"
+        }
+      ]
+    },
+    {
       "module": "Workbench.Pass1.PTree",
       "path": "lean/Workbench/Pass1/PTree.lean",
       "badge": "pass1_portable",
@@ -1653,7 +1818,7 @@
       "path": "lean/Workbench/Pass1.lean",
       "badge": "pass1_portable",
       "summary": "",
-      "line_count": 16,
+      "line_count": 17,
       "imports": [
         "Workbench.Pass1.InitLemmas",
         "Workbench.Pass1.Firewall",
@@ -1661,7 +1826,8 @@
         "Workbench.Pass1.PTree",
         "Workbench.Pass1.LinearArith",
         "Workbench.Pass1.BitTrieLrat",
-        "Workbench.Pass1.ClassicalEm"
+        "Workbench.Pass1.ClassicalEm",
+        "Workbench.Pass1.ModIntOrder"
       ],
       "declaration_count": 0,
       "declarations": []

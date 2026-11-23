@@ -43,6 +43,10 @@ scripts.
     - `ClassicalEm.lean`: Diaconescu's `prop_em : p ∨ ¬ p`, `by_contra`, and
       `chooseExists` over `prelude` + `Init.Core` without `Init.Classical`
       (replacing banned `by_cases` via `cases prop_em P`).
+    - `ModIntOrder.lean`: `Nat` power-of-two monotonicity, modular arithmetic
+      (`nat_mod_mod_mul_left`, `nat_add_mod_mod`, `nat_mod_sq_sub_succ`),
+      constructive `Int` order/subtraction without `Init.Data.Int.Order`, and
+      zero-axiom `BitVec` `bv_eq_of_toNat_eq`.
   - `Workbench/Lab/` (`lab_meta` — rapid falsification & profiling):
     - `Counterexample.lean`: SplitMix64 + boundary-seed counterexample search
       (`findCounterexample1/2/3`) and 3-axis spec vacuity/output-sensitivity
