@@ -52,10 +52,13 @@ Anti-false-kill and isolation invariants
   markers, and signal exit codes are `ERROR`, never a kill.
 * `.lake/build/lib/lean` `.olean`s are reused only when they are proven to
   correspond to the current sources: Lake's own `.trace` records are checked by
-  content (source text hash, `.olean` hash, and the hash of every imported
-  `.olean`, reproduced here in pure Python). File mtimes are consulted only for
-  build trees that have no Lake traces at all, where a source newer than its
-  `.olean` forces a cold build.
+  content — both standard traces (source text hash, `.olean` hash, toolchain,
+  and every imported `.olean` hash) and `"synthetic": true` `$LAKE_CACHE_DIR`
+  traces (by reproducing Lake v4.34's exact cryptographic `depHash` over
+  source, toolchain commit, package/module identity, and transitive import
+  traces in pure Python). File mtimes are consulted only for build trees that
+  have no Lake traces at all, where a source newer than its `.olean` forces a
+  cold build.
 * `.olean`s are shared by hardlink, so no Lean invocation may ever write
   through one: destinations are unlinked before every link and every compile,
   stale downstream modules are never seeded into a mutant overlay, and the
@@ -96,6 +99,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 
 sys.dont_write_bytecode = True
 
@@ -239,20 +243,20 @@ SORRY_OUTPUT_MARKERS: tuple[str, ...] = (
     "declaration uses 'sorry'",
     "sorryAx",
 )
-SORRY_OUTPUT_RE = re.compile(r"\bsorry")
+SORRY_OUTPUT_RE = re.compile(r"\bsorry(?:Ax)?\b")
 
 # Tokens forbidden inside generated sanity and refutation Lean fixtures (and in
 # guard replacements). They either make a proof vacuous (`sorry`, `sorryAx`,
 # `admit`, `axiom`, `opaque`, `native_decide`, `implemented_by`, `extern`,
 # `unsafe`, `partial`), smuggle a second proof obligation into the fixture
 # (`example`, `lemma`, `instance`), or change how the fixture elaborates
-# (`set_option`, `attribute`, `macro`, `syntax`, `elab`, `notation`, `run_cmd`,
-# `initialize`, `#`-commands).
+# (`set_option`, `attribute`, `macro`, `macro_rules`, `syntax`, `elab`,
+# `elab_rules`, `notation`, `run_cmd`, `initialize`, `#`-commands).
 FORBIDDEN_FIXTURE_TOKEN_RE = re.compile(
     r"\bsorry\w*|#[A-Za-z_]\w*|"
     r"\b(?:admit|axiom|opaque|native_decide|implemented_by|extern|unsafe|"
-    r"partial|example|lemma|instance|set_option|attribute|macro|syntax|elab|"
-    r"notation|run_cmd|initialize)\b"
+    r"partial|example|lemma|instance|set_option|attribute|macro|macro_rules|"
+    r"syntax|elab|elab_rules|notation|run_cmd|initialize)\b"
 )
 
 # Lake build trace schema versions whose layout `_verify_lake_traces` knows.
@@ -309,7 +313,7 @@ class GuardResult:
 
 MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
-    # Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean (6 UB guards)
+    # Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean (7 UB guards)
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="div_by_zero",
@@ -574,6 +578,61 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
         ),
     ),
     MirSemanticsGuard(
+        guard_id="shr_oob",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
+        description="evalScalarBinOp .shrUnchecked rejects shift distance >= bit width as UB",
+        anchor=(
+            "    | .shrUnchecked =>\n"
+            "      match Nat.beq rhs.sizeBytes 0 with\n"
+            "      | true => .unsupported\n"
+            "      | false =>\n"
+            "        match Nat.ble numBits b with\n"
+            "        | true => .ub\n"
+            "        | false =>\n"
+            "          let shifted :="
+        ),
+        replacement=(
+            "    | .shrUnchecked =>\n"
+            "      match Nat.beq rhs.sizeBytes 0 with\n"
+            "      | true => .unsupported\n"
+            "      | false =>\n"
+            "        match false with\n"
+            "        | true => .ub\n"
+            "        | false =>\n"
+            "          let shifted :="
+        ),
+        sanity_theorem_name="sanity_shr_oob",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem sanity_shr_oob :\n"
+            "    evalScalarBinOp .shrUnchecked ⟨16, 1⟩ ⟨2, 1⟩ .nil emptyMemory false =\n"
+            "      .ok (.scalar ⟨4, 1⟩) .nil emptyMemory :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_shr_oob",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem refute_shr_oob :\n"
+            "    evalScalarBinOp .shrUnchecked ⟨16, 1⟩ ⟨8, 1⟩ .nil emptyMemory false = .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
         guard_id="bool_valid_range",
         target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
         target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
@@ -635,7 +694,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
         ),
     ),
     # ------------------------------------------------------------------
-    # Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean (2 UB guards)
+    # Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean (3 UB guards)
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="storage_dead_read",
@@ -694,6 +753,69 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "theorem refute_storage_dead_read :\n"
             "    evalOperand\n"
             "      (.dead :: .nil)\n"
+            "      (.copy { local_ := 0, projection := .nil }) = .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
+        guard_id="storage_uninit_read",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Places.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Places",
+        description="evalOperand .copy of a LocalSlot.uninit local faults UB",
+        anchor=(
+            "    | .nil =>\n"
+            "      match get? locals p.local_ with\n"
+            "      | .some (.init rootVal) =>\n"
+            "        match readProjectedValue locals rootVal .nil with\n"
+            "        | .ok fieldVal => .ok fieldVal locals\n"
+            "        | .ub => .ub\n"
+            "        | .unsupported => .unsupported\n"
+            "      | .some .uninit => .ub\n"
+            "      | .some .dead => .ub\n"
+            "      | .none => .ub"
+        ),
+        replacement=(
+            "    | .nil =>\n"
+            "      match get? locals p.local_ with\n"
+            "      | .some (.init rootVal) =>\n"
+            "        match readProjectedValue locals rootVal .nil with\n"
+            "        | .ok fieldVal => .ok fieldVal locals\n"
+            "        | .ub => .ub\n"
+            "        | .unsupported => .unsupported\n"
+            "      | .some .uninit => .ok .unit locals\n"
+            "      | .some .dead => .ub\n"
+            "      | .none => .ub"
+        ),
+        sanity_theorem_name="sanity_storage_uninit_read",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Places\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem sanity_storage_uninit_read :\n"
+            "    evalOperand\n"
+            "      (.init (.scalar ⟨99, 4⟩) :: .nil)\n"
+            "      (.copy { local_ := 0, projection := .nil }) =\n"
+            "      .ok (.scalar ⟨99, 4⟩) (.init (.scalar ⟨99, 4⟩) :: .nil) :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_storage_uninit_read",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Places\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem refute_storage_uninit_read :\n"
+            "    evalOperand\n"
+            "      (.uninit :: .nil)\n"
             "      (.copy { local_ := 0, projection := .nil }) = .ub :=\n"
             "  rfl\n"
             "\n"
@@ -1193,19 +1315,31 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "open Trusted.Rustc.V2026_06_01.MirAst\n"
             "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "\n"
+            "def callerProtectedBorrow : BorrowEntry :=\n"
+            "  { tag := 1\n"
+            "    targetLocal := 1\n"
+            "    targetProjection := .nil\n"
+            "    perm := .unique\n"
+            "    protector := .some 1 }\n"
+            "\n"
+            "def retCleanMemory : Memory :=\n"
+            "  { emptyMemory with\n"
+            "    borrows := callerProtectedBorrow :: .nil\n"
+            "    activeProtectors := 1 :: .nil }\n"
+            "\n"
             "def retCleanState : MachineState :=\n"
             "  { frame :=\n"
             "      { blockIdx := 0\n"
             "        stmtIdx := 0\n"
             "        locals := .init (.scalar ⟨7, 4⟩) :: .nil }\n"
-            "    memory := emptyMemory }\n"
+            "    memory := retCleanMemory }\n"
             "\n"
             "def retTerm : Terminator :=\n"
             "  { kind := .return_, span := \"\" }\n"
             "\n"
             "theorem sanity_tb_return_frame_dealloc_protector_conflict :\n"
             "    evalTerminator retCleanState retTerm =\n"
-            "      MirStepNode.retNormal (.scalar ⟨7, 4⟩) emptyMemory :=\n"
+            "      MirStepNode.retNormal (.scalar ⟨7, 4⟩) retCleanMemory :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -1275,6 +1409,90 @@ def apply_single_guard_mutation(
     return source_text.replace(anchor, replacement, 1)
 
 
+def _strip_lean_comments(lean_source: str) -> tuple[str, bool]:
+    """Replace Lean `--` and nested `/- ... -/` comments with spaces.
+
+    Preserves newlines (so 1-based line numbers match `lean_source`) and
+    respects double-quoted string literals and single-quoted character literals
+    (without misparsing identifier primes such as `mem'`). Returns
+    `(stripped_text, has_unclosed_block_comment)`.
+    """
+    out: list[str] = []
+    n = len(lean_source)
+    i = 0
+    block_depth = 0
+    while i < n:
+        ch = lean_source[i]
+        if block_depth > 0:
+            if lean_source[i : i + 2] == "/-":
+                block_depth += 1
+                out.append("  ")
+                i += 2
+            elif lean_source[i : i + 2] == "-/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
+            elif ch == "\n":
+                out.append("\n")
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+            continue
+
+        if ch == '"':
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = lean_source[i]
+                out.append(c)
+                i += 1
+                if c == "\\" and i < n:
+                    out.append(lean_source[i])
+                    i += 1
+                elif c == '"':
+                    break
+            continue
+
+        if ch == "'" and not (i > 0 and (lean_source[i - 1].isalnum() or lean_source[i - 1] in "_'")):
+            if i + 2 < n and lean_source[i + 1] != "\\" and lean_source[i + 1] != "\n" and lean_source[i + 2] == "'":
+                out.append(lean_source[i : i + 3])
+                i += 3
+                continue
+            if i + 3 < n and lean_source[i + 1] == "\\" and lean_source[i + 3] == "'":
+                out.append(lean_source[i : i + 4])
+                i += 4
+                continue
+
+        if ch == "«":
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = lean_source[i]
+                out.append(c)
+                i += 1
+                if c == "»":
+                    break
+            continue
+
+        if lean_source[i : i + 2] == "--":
+            while i < n and lean_source[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+
+        if lean_source[i : i + 2] == "/-":
+            block_depth = 1
+            out.append("  ")
+            i += 2
+            continue
+
+        out.append(ch)
+        i += 1
+
+    return ("".join(out), block_depth > 0)
+
+
 def find_theorem_line_span(
     fixture_text: str,
     theorem_name: str,
@@ -1285,18 +1503,20 @@ def find_theorem_line_span(
     originated inside the guard's dedicated refutation theorem rather than in
     an unrelated declaration, helper definition, or file header.
 
-    The span starts at the column-0 `theorem <name>` header and covers only the
-    indented continuation lines that follow it. ANY later text at column 0
-    (`example`, `instance`, `#eval`, a comment, `end`, ...) ends the span, and
-    trailing blank lines are excluded, so a failure in whatever follows the
-    theorem can never be attributed to it.
+    The span starts at the column-0 `theorem <name>` header (ignoring comments)
+    and covers only the indented continuation lines that follow it. ANY later
+    text at column 0 (`example`, `instance`, `#eval`, a comment, `end`, ...)
+    ends the span, and trailing blank lines are excluded, so a failure in
+    whatever follows the theorem can never be attributed to it.
     """
     lines = fixture_text.splitlines()
+    code_only, _ = _strip_lean_comments(fixture_text)
+    code_lines = code_only.splitlines()
     target_re = re.compile(
         rf"^(?:(?:private|protected)\s+)?theorem\s+{re.escape(theorem_name)}"
         r"(?![\w'.!?])"
     )
-    starts = [idx for idx, line in enumerate(lines, start=1) if target_re.match(line)]
+    starts = [idx for idx, line in enumerate(code_lines, start=1) if target_re.match(line)]
     if not starts:
         raise ValueError(
             f"theorem {theorem_name!r} not found in fixture source"
@@ -1374,13 +1594,33 @@ def classify_refutation_failure(
     def _is_fixture(match: re.Match[str]) -> bool:
         return re.split(r"[/\\]", match.group("path"))[-1] == fixture_filename
 
-    # Every line that announces an error must be an error header located in the
-    # fixture itself. Errors in other files and errors without a position
-    # (toolchain, wrapper, import resolution) are never a kill.
+    # Every located error diagnostic header must point into `fixture_filename`.
+    for match in headers:
+        if match.group("sev") == "error" and not _is_fixture(match):
+            return (
+                "ERROR",
+                "error diagnostic not located in "
+                f"{fixture_filename}: {match.group(0)!r}",
+            )
+
+    # Every line announcing an error must be a located error header in the
+    # fixture itself, EXCEPT indented continuation lines inside the body of a
+    # diagnostic already located in `fixture_filename` (which may legitimately
+    # mention phrases like `  type error: ...`). Errors in other files and
+    # unlocated errors (toolchain, wrapper, import resolution) are never kills.
     pos = 0
+    active_header: re.Match[str] | None = None
     for raw_line in combined_output.splitlines(keepends=True):
-        if _ERROR_TOKEN_RE.search(raw_line):
-            match = header_by_start.get(pos)
+        match = header_by_start.get(pos)
+        if match is not None:
+            active_header = match
+        in_fixture_body = (
+            match is None
+            and active_header is not None
+            and _is_fixture(active_header)
+            and raw_line[:1].isspace()
+        )
+        if not in_fixture_body and _ERROR_TOKEN_RE.search(raw_line):
             if match is None or match.group("sev") != "error" or not _is_fixture(match):
                 return (
                     "ERROR",
@@ -1431,20 +1671,116 @@ def classify_refutation_failure(
     )
 
 
-def _extract_trusted_imports(lean_source: str) -> list[str]:
-    """Return `Trusted/...` module paths imported by `lean_source`."""
+_LEAN_HEADER_MOD_RE = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_']*|«[^»\n]+»)"
+    r"(?:\.(?:[A-Za-z_][A-Za-z0-9_']*|«[^»\n]+»))*"
+)
+
+
+def _parse_lean_header(lean_source: str) -> tuple[bool, list[str]]:
+    """Parse a Lean 4 module header (`module`, `prelude`, `import` directives).
+
+    Scans only the header (stopping at the first non-header token while
+    skipping whitespace, `--` line comments, and nested `/- ... -/` block
+    comments), so `import` text inside comments, docstrings, or the file body
+    is never mistaken for a real import. Returns `(is_module, imports)` with
+    module names converted to slash paths in exact header order.
+    """
+    n = len(lean_source)
+    i = 0
+
+    def skip_ws_and_comments() -> None:
+        nonlocal i
+        while i < n:
+            ch = lean_source[i]
+            if ch.isspace():
+                i += 1
+            elif lean_source[i : i + 2] == "--":
+                nl = lean_source.find("\n", i + 2)
+                i = n if nl == -1 else nl + 1
+            elif lean_source[i : i + 2] == "/-":
+                depth = 1
+                i += 2
+                while i < n and depth > 0:
+                    if lean_source[i : i + 2] == "/-":
+                        depth += 1
+                        i += 2
+                    elif lean_source[i : i + 2] == "-/":
+                        depth -= 1
+                        i += 2
+                    else:
+                        i += 1
+            else:
+                break
+
+    def read_word() -> tuple[str, int] | None:
+        skip_ws_and_comments()
+        if i >= n:
+            return None
+        match = _LEAN_HEADER_MOD_RE.match(lean_source, i)
+        if match is None:
+            return None
+        return (match.group(0), match.end())
+
+    is_module = False
     imports: list[str] = []
-    for line in lean_source.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("import "):
-            mod = stripped[len("import ") :].strip().replace(".", "/")
-            if mod.startswith("Trusted/"):
-                imports.append(mod)
-    return imports
+
+    tok = read_word()
+    if tok is not None and tok[0] == "module":
+        is_module = True
+        i = tok[1]
+        tok = read_word()
+    if tok is not None and tok[0] == "prelude":
+        i = tok[1]
+
+    while True:
+        saved = i
+        tok = read_word()
+        if tok is None:
+            break
+        word, end = tok
+        if word in ("public", "private"):
+            i = end
+            tok = read_word()
+            if tok is None:
+                i = saved
+                break
+            word, end = tok
+        if word == "meta":
+            i = end
+            tok = read_word()
+            if tok is None:
+                i = saved
+                break
+            word, end = tok
+        if word != "import":
+            i = saved
+            break
+        i = end
+        tok = read_word()
+        if tok is None:
+            break
+        word, end = tok
+        if word == "all":
+            i = end
+            tok = read_word()
+            if tok is None:
+                break
+            word, end = tok
+        imports.append(word.replace(".", "/"))
+        i = end
+
+    return (is_module, imports)
+
+
+def _extract_trusted_imports(lean_source: str) -> list[str]:
+    """Return `Trusted/...` module paths imported by `lean_source` in header order."""
+    _, all_imports = _parse_lean_header(lean_source)
+    return [mod for mod in all_imports if mod.startswith("Trusted/")]
 
 
 def _has_sorry_warning(combined_output: str) -> bool:
-    """Return True if Lean output mentions `sorry` in any quoting style."""
+    """Return True if Lean output mentions `sorry` or `sorryAx` in any quoting style."""
     return bool(SORRY_OUTPUT_RE.search(combined_output))
 
 
@@ -1460,12 +1796,21 @@ def _fixture_shape_errors(
     rejected before Lean ever runs.
     """
     errors: list[str] = []
-    forbidden = FORBIDDEN_FIXTURE_TOKEN_RE.search(src_text)
-    if forbidden:
+    code_only, unclosed_comment = _strip_lean_comments(src_text)
+    if unclosed_comment:
+        errors.append(f"unclosed block comment in {kind}_source")
+    raw_sorry = re.search(r"\bsorry\w*", src_text)
+    if raw_sorry:
         errors.append(
-            f"forbidden token {forbidden.group(0)!r} in {kind}_source"
+            f"forbidden token {raw_sorry.group(0)!r} in {kind}_source"
         )
-    theorem_count = len(re.findall(r"\btheorem\b", src_text))
+    else:
+        forbidden = FORBIDDEN_FIXTURE_TOKEN_RE.search(code_only)
+        if forbidden:
+            errors.append(
+                f"forbidden token {forbidden.group(0)!r} in {kind}_source"
+            )
+    theorem_count = len(re.findall(r"\btheorem\b", code_only))
     if theorem_count != 1:
         errors.append(
             f"{kind}_source must declare exactly one theorem, found {theorem_count}"
@@ -1475,7 +1820,7 @@ def _fixture_shape_errors(
     except ValueError as exc:
         errors.append(f"({kind}): {exc}")
         return errors
-    span_text = "\n".join(src_text.splitlines()[start - 1 : end])
+    span_text = "\n".join(code_only.splitlines()[start - 1 : end])
     if ":=" not in span_text:
         errors.append(
             f"({kind}): theorem {theorem_name!r} line span {start}-{end} "
@@ -1620,7 +1965,18 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             for shape_error in _fixture_shape_errors(kind, src_text, thm_name):
                 errors.append(f"{guard.guard_id}: {shape_error}")
 
-            imports = _extract_trusted_imports(src_text)
+            is_module, all_imports = _parse_lean_header(src_text)
+            if is_module:
+                errors.append(
+                    f"{guard.guard_id} ({kind}): fixture must not use a `module` header"
+                )
+            non_trusted = [imp for imp in all_imports if not imp.startswith("Trusted/")]
+            if non_trusted:
+                errors.append(
+                    f"{guard.guard_id} ({kind}): fixture imports non-Trusted module(s) "
+                    f"{non_trusted!r}"
+                )
+            imports = [imp for imp in all_imports if imp.startswith("Trusted/")]
             if not imports:
                 errors.append(
                     f"{guard.guard_id} ({kind}): fixture imports no Trusted.* module"
@@ -1753,6 +2109,29 @@ _LAKE_HASH_NIL = 1723  # `Lake.Hash.nil`
 _LAKE_HASH_NIL_HEX = f"{_LAKE_HASH_NIL:016x}"
 _LAKE_OLEAN_OUTPUT_RE = re.compile(r"([0-9a-f]{16})\.olean")
 _LAKE_IMPORT_ARTS_SUFFIX = ":importAllArts"
+_LEAN_VERSION_RE = re.compile(r"\bversion\s+(\d+\.\d+\.\d+(?:-[\w.]+)?)\b")
+_LEAN_COMMIT_RE = re.compile(r"\bcommit\s+([0-9a-f]{40})\b")
+_LEAN_GITHASH_RE = re.compile(r"^[0-9a-f]{40}$")
+_LAKE_TOML_ALLOWED_ROOT_KEYS: frozenset[str] = frozenset({
+    "name",
+    "defaultTargets",
+    "lean_lib",
+    "lean_exe",
+    "testDriver",
+    "lintDriver",
+    "version",
+    "description",
+    "keywords",
+    "homepage",
+    "license",
+    "readmeFile",
+})
+_LAKE_TOML_ALLOWED_TRUSTED_LIB_KEYS: frozenset[str] = frozenset({
+    "name",
+    "srcDir",
+    "roots",
+    "globs",
+})
 
 
 def _lean_murmur_hash64a(data: bytes, seed: int = 11) -> int:
@@ -1809,6 +2188,180 @@ def lake_import_arts_hash(olean_hash_hex: str) -> str:
     return f"{_lean_mix_hash(_LAKE_HASH_NIL, int(olean_hash_hex, 16)):016x}"
 
 
+def _lean_name_hash(parts: Sequence[str]) -> int:
+    """Lean `Lean.Name.hash` for a string-component name (`Trusted.Sequence`)."""
+    h = _LAKE_HASH_NIL
+    for part in parts:
+        h = _lean_mix_hash(h, _lean_murmur_hash64a(part.encode("utf-8")))
+    return h
+
+
+def _lake_extra_dep_default_hash() -> int:
+    """Default `LeanLib.extraDep` hash (`Job.nil` mixed with root `Package.extraDep`)."""
+    return _lean_mix_hash(_LAKE_HASH_NIL, _LAKE_HASH_NIL)
+
+
+def _lake_nil_libs_trace_hash() -> int:
+    """Default `libs` trace hash (4 empty dynlib/plugin jobs mixed into `nil`)."""
+    h = _LAKE_HASH_NIL
+    for _ in range(4):
+        h = _lean_mix_hash(h, _LAKE_HASH_NIL)
+    return h
+
+
+def lake_legacy_trans_hash(
+    direct_imports: Sequence[str],
+    all_arts_hashes: dict[str, int],
+    legacy_trans_hashes: dict[str, int],
+) -> int:
+    """Compute Lake's `ModuleImportInfo.legacyTransTrace.hash` for a non-`module` file."""
+    h = _LAKE_HASH_NIL
+    for dep in direct_imports:
+        h = _lean_mix_hash(_lean_mix_hash(h, legacy_trans_hashes[dep]), all_arts_hashes[dep])
+    return h
+
+
+def lake_module_dep_hash(
+    *,
+    module: str,
+    src_bytes: bytes,
+    direct_imports: Sequence[str],
+    all_arts_hashes: dict[str, int],
+    legacy_trans_hashes: dict[str, int],
+    lean_githash: str,
+    pkg_name: str,
+) -> tuple[str, int]:
+    """Reproduce Lake v4.34's `depHash` for a default-configured non-`module` file.
+
+    Returns `(dep_hash_hex, legacy_trans_hash)` where `dep_hash_hex` is the
+    16-char lowercase hex string written to `<Mod>.trace`'s `"depHash"` field
+    (including `"synthetic": true` traces restored from `$LAKE_CACHE_DIR`).
+    """
+    legacy_trans = lake_legacy_trans_hash(
+        direct_imports, all_arts_hashes, legacy_trans_hashes
+    )
+    dep_trace = _lean_mix_hash(
+        _lean_mix_hash(_LAKE_HASH_NIL, _lake_extra_dep_default_hash()),
+        legacy_trans,
+    )
+    lib_trace = _lake_nil_libs_trace_hash()
+    lean_trace = _lean_mix_hash(
+        _LAKE_HASH_NIL, _lean_murmur_hash64a(lean_githash.encode("utf-8"))
+    )
+    src_hash = int(lake_hash_of_text(src_bytes), 16)
+    is_module_false = _lean_mix_hash(_LAKE_HASH_NIL, 13)  # `Hashable Bool`: false => 13
+    mod_name_trace = _lean_mix_hash(
+        _LAKE_HASH_NIL, _lean_name_hash(module.split("/"))
+    )
+    pkg_id_trace = _lean_mix_hash(
+        _LAKE_HASH_NIL,
+        _lean_mix_hash(_lean_murmur_hash64a(pkg_name.encode("utf-8")), 13),
+    )
+
+    h = _LAKE_HASH_NIL
+    h = _lean_mix_hash(h, dep_trace)
+    h = _lean_mix_hash(h, lib_trace)
+    h = _lean_mix_hash(h, lean_trace)
+    h = _lean_mix_hash(h, src_hash)
+    h = _lean_mix_hash(h, _LAKE_HASH_NIL)  # empty `leanOptions`
+    h = _lean_mix_hash(h, is_module_false)
+    h = _lean_mix_hash(h, mod_name_trace)
+    h = _lean_mix_hash(h, pkg_id_trace)
+    h = _lean_mix_hash(h, _LAKE_HASH_NIL)  # empty `Module.leanArgs`
+    return (f"{h:016x}", legacy_trans)
+
+
+def _read_lakefile_trusted_pkg_name(anneal_root: Path) -> tuple[str | None, str]:
+    """Read package `name` from `lakefile.toml` if `Trusted` uses default build opts.
+
+    Fails closed if `lakefile.lean` exists, `lakefile.toml` is missing/invalid,
+    or either the root package or `[[lean_lib]] name = "Trusted"` declares any
+    unmodeled hash-affecting option (e.g., `leanOptions`, `moreLeanArgs`,
+    `needs`, `extraDepTargets`, `precompileModules`, `platformIndependent`).
+    """
+    if (anneal_root / "lakefile.lean").exists():
+        return (None, "lakefile.lean is unsupported for synthetic Lake trace verification")
+    toml_path = anneal_root / "lakefile.toml"
+    try:
+        data = tomllib.loads(toml_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return (None, f"cannot read lakefile.toml ({exc})")
+    if not isinstance(data, dict):
+        return (None, "invalid lakefile.toml root table")
+    extra_root = sorted(set(data) - _LAKE_TOML_ALLOWED_ROOT_KEYS)
+    if extra_root:
+        return (
+            None,
+            "lakefile.toml sets unsupported root key(s) for synthetic trace "
+            f"verification: {', '.join(extra_root)}",
+        )
+    pkg_name = data.get("name")
+    if not isinstance(pkg_name, str) or not pkg_name:
+        return (None, "lakefile.toml missing package `name`")
+    lean_libs = data.get("lean_lib")
+    if not isinstance(lean_libs, list):
+        return (None, "lakefile.toml missing `[[lean_lib]]` table")
+    trusted_libs = [
+        lib for lib in lean_libs if isinstance(lib, dict) and lib.get("name") == "Trusted"
+    ]
+    if len(trusted_libs) != 1:
+        return (
+            None,
+            f"lakefile.toml must declare exactly one `Trusted` lean_lib, found {len(trusted_libs)}",
+        )
+    tlib = trusted_libs[0]
+    extra_lib = sorted(set(tlib) - _LAKE_TOML_ALLOWED_TRUSTED_LIB_KEYS)
+    if extra_lib:
+        return (
+            None,
+            "lakefile.toml `Trusted` lean_lib sets unsupported key(s) for "
+            f"synthetic trace verification: {', '.join(extra_lib)}",
+        )
+    src_dir = tlib.get("srcDir", ".")
+    if not isinstance(src_dir, str) or Path(src_dir).as_posix().rstrip("/") != "trusted/lean":
+        return (
+            None,
+            f"lakefile.toml `Trusted` srcDir {src_dir!r} != 'trusted/lean'",
+        )
+    return (pkg_name, "")
+
+
+def _query_lean_toolchain_githash(
+    lean_bin: Path,
+    anneal_root: Path,
+    expected_version: str,
+) -> tuple[str | None, str]:
+    """Query `lean_bin --version` to verify `expected_version` and get its git commit."""
+    try:
+        res = subprocess.run(
+            [str(lean_bin), "--version"],
+            cwd=str(anneal_root),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return (None, f"failed to query Lean version ({exc})")
+    if res.returncode != 0:
+        return (None, f"Lean --version failed (rc={res.returncode})")
+    combined = f"{res.stdout}\n{res.stderr}"
+    ver_match = _LEAN_VERSION_RE.search(combined)
+    commit_match = _LEAN_COMMIT_RE.search(combined)
+    if ver_match is None or commit_match is None:
+        return (None, "cannot parse Lean version/commit from `lean --version`")
+    actual_version = ver_match.group(1)
+    if actual_version != expected_version:
+        return (
+            None,
+            f"active Lean binary is {actual_version}, expected {expected_version}",
+        )
+    return (commit_match.group(1), "")
+
+
 def _read_lean_toolchain_version(anneal_root: Path) -> str | None:
     """Return `X.Y.Z[-suffix]` from `<anneal_root>/lean-toolchain`, if parseable."""
     try:
@@ -1835,15 +2388,25 @@ def _verify_lake_traces(
     modules: Sequence[str],
     *,
     verify_olean_bytes: bool = False,
+    lean_bin: Path | None = None,
+    lean_githash: str | None = None,
 ) -> tuple[bool, str]:
     """Prove by content that Lake's `.olean`s for `modules` match the sources.
 
-    For every module, Lake's `<Mod>.trace` must record (a) the hash of the
-    CURRENT source text, (b) the hash stored in `<Mod>.olean.hash`, (c) the
-    pinned toolchain version, and (d) for every `Trusted.*` import, the hash of
-    that import's CURRENT `.olean`; and (e) the module's trace must not be
-    older than the trace of any module it imports. Together these chain every
-    `.olean` back to the current sources, independent of source mtimes.
+    Supports both standard Lake traces (`"synthetic": false`) and Lake cache
+    restore traces (`"synthetic": true`, written when Lake restores artifacts
+    from `$LAKE_CACHE_DIR` with `"inputs": []` and a full `"depHash"`):
+
+    * For `"synthetic": false` modules, `<Mod>.trace` must record (a) the hash
+      of the CURRENT source text, (b) the hash stored in `<Mod>.olean.hash`,
+      (c) the pinned toolchain version, (d) for every `Trusted.*` import, the
+      hash of that import's CURRENT `.olean`, and (e) a trace mtime not older
+      than any imported module's trace.
+    * For `"synthetic": true` modules, `depHash` is reproduced from scratch
+      using Lake v4.34's exact hash formula over `lakefile.toml`'s package
+      identity, the verified Lean binary commit matching `lean-toolchain`, the
+      CURRENT source text hash, and the transitive import traces of all
+      imported modules (all verified in topological order).
 
     The `.olean` bytes are re-hashed when `verify_olean_bytes` is set, or when
     the `.olean` is newer than its `.olean.hash` file (the same rule Lake uses
@@ -1857,8 +2420,14 @@ def _verify_lake_traces(
         return (False, "cannot determine pinned Lean version from lean-toolchain")
 
     olean_hashes: dict[str, str] = {}
+    all_arts_hashes: dict[str, int] = {}
+    legacy_trans_hashes: dict[str, int] = {}
     recorded_imports: dict[str, dict[str, str]] = {}
     trace_mtimes: dict[str, int] = {}
+    saw_synthetic = False
+    pkg_name: str | None = None
+    effective_githash: str | None = None
+
     for mod in modules:
         olean = lake_lib_dir / f"{mod}.olean"
         hash_path = lake_lib_dir / f"{mod}.olean.hash"
@@ -1879,6 +2448,8 @@ def _verify_lake_traces(
             return (False, f"{mod}: unsupported Lake trace schema")
 
         outputs = trace.get("outputs")
+        if isinstance(outputs, dict) and outputs.get("m") is True:
+            return (False, f"{mod}: module-system Lake artifacts are not supported")
         olean_outputs = outputs.get("o") if isinstance(outputs, dict) else None
         if isinstance(olean_outputs, str):
             olean_outputs = [olean_outputs]
@@ -1901,6 +2472,77 @@ def _verify_lake_traces(
                 return (False, f"{mod}: unreadable `.olean` ({exc})")
             if actual_olean_hash != olean_hash:
                 return (False, f"{mod}: `.olean` bytes do not match Lake trace")
+
+        synthetic = trace.get("synthetic")
+        if not isinstance(synthetic, bool):
+            return (False, f"{mod}: unrecognized `synthetic` flag in Lake trace")
+
+        src_text = src_bytes.decode("utf-8", errors="replace")
+        is_module, all_imports = _parse_lean_header(src_text)
+        trusted_imports = [imp for imp in all_imports if imp.startswith("Trusted/")]
+        olean_hashes[mod] = olean_hash
+        all_arts_hashes[mod] = _lean_mix_hash(_LAKE_HASH_NIL, int(olean_hash, 16))
+
+        if synthetic:
+            saw_synthetic = True
+            if is_module:
+                return (
+                    False,
+                    f"{mod}: `module` files are unsupported for synthetic Lake trace verification",
+                )
+            non_trusted = [imp for imp in all_imports if not imp.startswith("Trusted/")]
+            if non_trusted:
+                return (
+                    False,
+                    f"{mod}: non-Trusted import(s) {non_trusted!r} unsupported for synthetic Lake trace",
+                )
+            if pkg_name is None:
+                pkg_name, pkg_err = _read_lakefile_trusted_pkg_name(anneal_root)
+                if pkg_name is None:
+                    return (False, f"{mod}: {pkg_err}")
+            if effective_githash is None:
+                if lean_githash is not None:
+                    if not _LEAN_GITHASH_RE.fullmatch(lean_githash):
+                        return (
+                            False,
+                            f"{mod}: invalid lean_githash {lean_githash!r} for synthetic Lake trace",
+                        )
+                    effective_githash = lean_githash
+                elif lean_bin is not None:
+                    effective_githash, git_err = _query_lean_toolchain_githash(
+                        lean_bin, anneal_root, toolchain_version
+                    )
+                    if effective_githash is None:
+                        return (False, f"{mod}: {git_err}")
+                else:
+                    return (
+                        False,
+                        f"{mod}: synthetic Lake trace requires active Lean githash to verify depHash",
+                    )
+            for dep in trusted_imports:
+                if dep not in legacy_trans_hashes or dep not in all_arts_hashes:
+                    return (
+                        False,
+                        f"{mod}: imports {dep}, which was not verified for synthetic Lake trace",
+                    )
+            expected_dep_hash, mod_legacy_trans = lake_module_dep_hash(
+                module=mod,
+                src_bytes=src_bytes,
+                direct_imports=trusted_imports,
+                all_arts_hashes=all_arts_hashes,
+                legacy_trans_hashes=legacy_trans_hashes,
+                lean_githash=effective_githash,
+                pkg_name=pkg_name,
+            )
+            recorded_dep_hash = trace.get("depHash")
+            if not isinstance(recorded_dep_hash, str) or recorded_dep_hash != expected_dep_hash:
+                return (
+                    False,
+                    f"{mod}: synthetic Lake trace depHash mismatch "
+                    f"(expected {expected_dep_hash}, got {recorded_dep_hash!r})",
+                )
+            legacy_trans_hashes[mod] = mod_legacy_trans
+            continue
 
         inputs = _trace_pairs(trace.get("inputs"))
         src_suffix = f"/trusted/lean/{mod}.lean"
@@ -1927,14 +2569,18 @@ def _verify_lake_traces(
                         import_arts[dep] = value
         elif imports_node != _LAKE_HASH_NIL_HEX:
             return (False, f"{mod}: unrecognized imports record in Lake trace")
-        source_imports = set(
-            _extract_trusted_imports(src_bytes.decode("utf-8", errors="replace"))
-        )
-        if set(import_arts) != source_imports:
+        if set(import_arts) != set(trusted_imports):
             return (False, f"{mod}: Lake trace imports differ from source imports")
 
-        olean_hashes[mod] = olean_hash
         recorded_imports[mod] = import_arts
+        if (
+            not is_module
+            and len(trusted_imports) == len(all_imports)
+            and all(dep in legacy_trans_hashes and dep in all_arts_hashes for dep in trusted_imports)
+        ):
+            legacy_trans_hashes[mod] = lake_legacy_trans_hash(
+                trusted_imports, all_arts_hashes, legacy_trans_hashes
+            )
 
     for mod, import_arts in recorded_imports.items():
         for dep, recorded in import_arts.items():
@@ -1943,15 +2589,18 @@ def _verify_lake_traces(
             if recorded != lake_import_arts_hash(olean_hashes[dep]):
                 return (False, f"{mod}: built against a different {dep}.olean")
             # A direct import's `.olean` hash does not pin that import's own
-            # imports. Lake always finishes (and records) an import before its
-            # importer, so an importer recorded BEFORE its import was last
-            # rebuilt may predate a change deeper in the import chain.
+            # imports in a non-synthetic trace whose `depHash` is not recomputed.
+            # Lake always finishes (and records) an import before its importer,
+            # so an importer recorded BEFORE its import was last rebuilt may
+            # predate a change deeper in the import chain.
             if trace_mtimes[mod] < trace_mtimes[dep]:
                 return (
                     False,
                     f"{mod}: Lake build record predates the rebuild of its "
                     f"import {dep}",
                 )
+    if saw_synthetic:
+        return (True, "lake-trace-verified (synthetic)")
     return (True, "lake-trace-verified")
 
 
@@ -2004,6 +2653,8 @@ def _lake_olean_reuse_decision(
     modules: Sequence[str],
     *,
     verify_olean_bytes: bool = False,
+    lean_bin: Path | None = None,
+    lean_githash: str | None = None,
 ) -> tuple[bool, str]:
     """Decide whether `.lake/build/lib/lean` `.olean`s may seed the baseline.
 
@@ -2032,16 +2683,25 @@ def _lake_olean_reuse_decision(
     if not all(traced):
         return (False, "Lake traces present for only some modules")
     return _verify_lake_traces(
-        anneal_root, modules, verify_olean_bytes=verify_olean_bytes
+        anneal_root,
+        modules,
+        verify_olean_bytes=verify_olean_bytes,
+        lean_bin=lean_bin,
+        lean_githash=lean_githash,
     )
 
 
 def _can_reuse_lake_oleans(
     anneal_root: Path,
     modules: Sequence[str],
+    *,
+    lean_bin: Path | None = None,
+    lean_githash: str | None = None,
 ) -> bool:
     """Return True if `.lake/build/lib/lean` `.olean`s for `modules` are reusable."""
-    return _lake_olean_reuse_decision(anneal_root, modules)[0]
+    return _lake_olean_reuse_decision(
+        anneal_root, modules, lean_bin=lean_bin, lean_githash=lean_githash
+    )[0]
 
 
 def _olean_fingerprints(
@@ -2123,25 +2783,22 @@ def _kill_process_group(proc: subprocess.Popen[str]) -> None:
         pass
 
 
-def _kill_live_lean_processes() -> None:
-    with _LIVE_PROCS_LOCK:
-        procs = list(_LIVE_PROCS)
-    for proc in procs:
-        _kill_process_group(proc)
-
-
 def _abort_pending(futures: Sequence[Future[object]]) -> None:
     """Stop a failing or interrupted run promptly.
 
-    Called BEFORE the worker pool is joined: unstarted work is cancelled and
-    running Lean processes are killed, so the pool drains in milliseconds
-    instead of waiting out every in-flight compile (up to `--timeout-sec`
-    each) while holding the temporary directories open.
+    Called BEFORE the worker pool is joined: unstarted work is cancelled, and
+    `_ABORT.set()` plus the `_LIVE_PROCS` snapshot execute atomically under
+    `_LIVE_PROCS_LOCK` so any concurrent `_run_lean` returning from `Popen`
+    observes `_ABORT` under the same lock and kills its own process group
+    immediately instead of slipping past teardown.
     """
-    _ABORT.set()
     for fut in futures:
         fut.cancel()
-    _kill_live_lean_processes()
+    with _LIVE_PROCS_LOCK:
+        _ABORT.set()
+        procs = list(_LIVE_PROCS)
+    for proc in procs:
+        _kill_process_group(proc)
 
 
 def _run_lean(
@@ -2189,8 +2846,25 @@ def _run_lean(
             stdout="",
             stderr=f"failed to execute Lean command {cmd[0]!r}: {exc}",
         )
+    aborted_during_spawn = False
     with _LIVE_PROCS_LOCK:
-        _LIVE_PROCS.add(proc)
+        if _ABORT.is_set():
+            aborted_during_spawn = True
+        else:
+            _LIVE_PROCS.add(proc)
+    if aborted_during_spawn:
+        _kill_process_group(proc)
+        try:
+            with proc:
+                proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=130,
+            stdout="",
+            stderr="run aborted while Lean was starting",
+        )
     try:
         with proc:
             try:
@@ -2548,6 +3222,7 @@ def _run_guard_mutation_suite(
                 anneal_root,
                 baseline_modules,
                 verify_olean_bytes=verify_lake_olean_bytes,
+                lean_bin=lean_bin,
             )
         if used_lake_cache:
             lake_prints = _olean_fingerprints(lake_lib_dir, baseline_modules)

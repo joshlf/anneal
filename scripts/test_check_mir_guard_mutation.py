@@ -57,16 +57,31 @@ MIR_SEMANTICS_FILES: tuple[Path, ...] = (
 )
 
 
-def _write_fake_lean_sh(bin_path: Path, body_sh: str) -> None:
+def _write_fake_lean_sh(
+    bin_path: Path,
+    body_sh: str,
+    *,
+    version_str: str | None = None,
+) -> None:
     """Create a fast executable POSIX-shell fake `lean` binary (~1ms/call).
 
     Pre-parses `-o <out>` into `$OUT` and the trailing source path into `$SRC`
     (with `$BASENAME`), and sets `$IS_MUTANT=1` when `LEAN_PATH` points into a
     per-mutant temp dir rather than `anneal-gmut-base-`.
     """
+    version_block = ""
+    if version_str is not None:
+        safe_ver = version_str.replace("'", "'\\''")
+        version_block = (
+            'if [ "${1:-}" = "--version" ]; then\n'
+            f"  printf '%s\\n' '{safe_ver}'\n"
+            "  exit 0\n"
+            "fi\n"
+        )
     script = (
         "#!/bin/sh\n"
         "set -eu\n"
+        f"{version_block}"
         'OUT=""\n'
         'SRC=""\n'
         'while [ "$#" -gt 0 ]; do\n'
@@ -853,6 +868,21 @@ def _run_cli(
     )
 
 
+TEST_LEAN_V434_GITHASH = "5045d0056413266e57c625dcd7c365b10e377c52"
+TEST_LEAN_V434_VERSION = (
+    "Lean (version 4.34.1, x86_64-unknown-linux-gnu, "
+    f"commit {TEST_LEAN_V434_GITHASH}, Release)"
+)
+TINY_LAKEFILE_TOML = (
+    'name = "Anneal"\n'
+    'defaultTargets = ["Trusted"]\n'
+    "\n"
+    "[[lean_lib]]\n"
+    'name = "Trusted"\n'
+    'srcDir = "trusted/lean"\n'
+)
+
+
 def _make_tcb_copy_root(tmp: Path) -> Path:
     """Copy the live TCB sources into an isolated fake repository root."""
     root = tmp / "root"
@@ -861,6 +891,7 @@ def _make_tcb_copy_root(tmp: Path) -> Path:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ANNEAL_ROOT / "trusted/lean" / f"{mod}.lean", dst)
     shutil.copyfile(ANNEAL_ROOT / "lean-toolchain", root / "lean-toolchain")
+    shutil.copyfile(ANNEAL_ROOT / "lakefile.toml", root / "lakefile.toml")
     return root
 
 
@@ -870,15 +901,24 @@ def _write_lake_build(
     *,
     traces: bool = True,
     base_time: int = 2_000_000_000,
+    synthetic: bool = False,
+    synthetic_modules: set[str] | None = None,
+    lean_githash: str = TEST_LEAN_V434_GITHASH,
+    pkg_name: str = "Anneal",
 ) -> None:
     """Write a fake `.lake/build/lib/lean` tree shaped like Lake's own output.
 
     Traces record the source path of ANOTHER checkout, as they do when a
-    `.lake` directory is hardlinked into a fresh `git worktree`.
+    `.lake` directory is hardlinked into a fresh `git worktree`. When
+    `synthetic=True` (or a module is listed in `synthetic_modules`), writes a
+    `$LAKE_CACHE_DIR`-style `"synthetic": true` trace with `"inputs": []` and
+    the exact Lake v4.34 `"depHash"`.
     """
     lib = root / ".lake/build/lib/lean"
     version = gmut._read_lean_toolchain_version(root)
     olean_hashes: dict[str, str] = {}
+    all_arts_hashes: dict[str, int] = {}
+    legacy_trans_hashes: dict[str, int] = {}
     for idx, mod in enumerate(modules):
         stamp = base_time + idx * 10
         olean = lib / f"{mod}.olean"
@@ -889,40 +929,71 @@ def _write_lake_build(
             continue
         olean_hash = gmut.lake_hash_of_bytes(olean.read_bytes())
         olean_hashes[mod] = olean_hash
+        all_arts_hashes[mod] = gmut._lean_mix_hash(
+            gmut._LAKE_HASH_NIL, int(olean_hash, 16)
+        )
         hash_path = lib / f"{mod}.olean.hash"
         hash_path.write_text(olean_hash, encoding="utf-8")
         os.utime(hash_path, (stamp + 1, stamp + 1))
         src_bytes = (root / "trusted/lean" / f"{mod}.lean").read_bytes()
         imports = gmut._extract_trusted_imports(src_bytes.decode("utf-8"))
-        imports_node: object = [
-            [
-                f"{imp.replace('/', '.')}:importAllArts",
-                gmut.lake_import_arts_hash(olean_hashes[imp]),
-            ]
-            for imp in imports
-        ] or "00000000000006bb"
-        trace = {
-            "synthetic": False,
-            "schemaVersion": "2025-09-10",
-            "outputs": {"o": [f"{olean_hash}.olean"], "m": False},
-            "log": [],
-            "inputs": [
-                ["deps", [["imports", imports_node]]],
-                [f"Lean {version}, commit 0123456789abcdef", "0" * 16],
+        dep_hash, mod_legacy_trans = gmut.lake_module_dep_hash(
+            module=mod,
+            src_bytes=src_bytes,
+            direct_imports=imports,
+            all_arts_hashes=all_arts_hashes,
+            legacy_trans_hashes=legacy_trans_hashes,
+            lean_githash=lean_githash,
+            pkg_name=pkg_name,
+        )
+        legacy_trans_hashes[mod] = mod_legacy_trans
+        is_syn = synthetic or (
+            synthetic_modules is not None and mod in synthetic_modules
+        )
+        if is_syn:
+            trace: dict[str, object] = {
+                "synthetic": True,
+                "schemaVersion": "2025-09-10",
+                "outputs": {"o": [f"{olean_hash}.olean"], "m": False},
+                "log": [],
+                "inputs": [],
+                "depHash": dep_hash,
+            }
+        else:
+            imports_node: object = [
                 [
-                    f"/elsewhere/other-worktree/trusted/lean/{mod}.lean",
-                    gmut.lake_hash_of_text(src_bytes),
+                    f"{imp.replace('/', '.')}:importAllArts",
+                    gmut.lake_import_arts_hash(olean_hashes[imp]),
+                ]
+                for imp in imports
+            ] or "00000000000006bb"
+            trace = {
+                "synthetic": False,
+                "schemaVersion": "2025-09-10",
+                "outputs": {"o": [f"{olean_hash}.olean"], "m": False},
+                "log": [],
+                "inputs": [
+                    ["deps", [["imports", imports_node]]],
+                    [f"Lean {version}, commit {lean_githash}", "0" * 16],
+                    [
+                        f"/elsewhere/other-worktree/trusted/lean/{mod}.lean",
+                        gmut.lake_hash_of_text(src_bytes),
+                    ],
+                    ["options", "00000000000006bb"],
                 ],
-                ["options", "00000000000006bb"],
-            ],
-            "depHash": "0" * 16,
-        }
+                "depHash": dep_hash,
+            }
         trace_path = lib / f"{mod}.trace"
         trace_path.write_text(json.dumps(trace), encoding="utf-8")
         os.utime(trace_path, (stamp + 2, stamp + 2))
 
 
-def _make_tiny_lake_root(tmp: Path) -> tuple[Path, tuple[str, ...]]:
+def _make_tiny_lake_root(
+    tmp: Path,
+    *,
+    synthetic: bool = False,
+    synthetic_modules: set[str] | None = None,
+) -> tuple[Path, tuple[str, ...]]:
     """Three-module fake repo (`A`; `B` imports `A`; `C` imports `A`, `B`)."""
     root = tmp / "tiny"
     sources = {
@@ -935,8 +1006,14 @@ def _make_tiny_lake_root(tmp: Path) -> tuple[Path, tuple[str, ...]]:
         src.parent.mkdir(parents=True, exist_ok=True)
         src.write_text(text, encoding="utf-8")
     (root / "lean-toolchain").write_text("leanprover/lean4:v4.34.1\n", encoding="utf-8")
+    (root / "lakefile.toml").write_text(TINY_LAKEFILE_TOML, encoding="utf-8")
     modules = tuple(sources)
-    _write_lake_build(root, modules)
+    _write_lake_build(
+        root,
+        modules,
+        synthetic=synthetic,
+        synthetic_modules=synthetic_modules,
+    )
     return root, modules
 
 
@@ -1711,6 +1788,397 @@ class GuardMutationB1AdversarialTests(unittest.TestCase):
             self.assertEqual(human.returncode, 0, human.stdout + human.stderr)
             self.assertIn("MIR guard-mutation summary (guard, cold-build): 1/1 killed", human.stdout)
             self.assertNotIn("MIR guard-mutation summary", res.stdout)
+
+
+class GuardMutationA1AdversarialTests(unittest.TestCase):
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+
+    def _classify(self, rc: int, out: str) -> str:
+        return gmut.classify_refutation_failure(rc, out, self.FIXTURE, self.SPAN)[0]
+
+    # -- Lake v4.34 `"synthetic": true` (`$LAKE_CACHE_DIR`) traces ------
+
+    def test_lake_module_dep_hash_matches_real_v434_sequence_trace(self) -> None:
+        # Ground truth from a real Lake v4.34.1 `$LAKE_CACHE_DIR` restore on the
+        # 128-vCPU host: `.lake/build/lib/lean/Trusted/Sequence.trace` records
+        # `"synthetic": true`, `"inputs": []`, `"depHash": "c6d95c0a123d5a26"`.
+        seq_bytes = (ANNEAL_ROOT / "trusted/lean/Trusted/Sequence.lean").read_bytes()
+        pkg_name, err = gmut._read_lakefile_trusted_pkg_name(ANNEAL_ROOT)
+        self.assertEqual((pkg_name, err), ("Anneal", ""))
+        dep_hash, legacy_trans = gmut.lake_module_dep_hash(
+            module="Trusted/Sequence",
+            src_bytes=seq_bytes,
+            direct_imports=[],
+            all_arts_hashes={},
+            legacy_trans_hashes={},
+            lean_githash=TEST_LEAN_V434_GITHASH,
+            pkg_name="Anneal",
+        )
+        self.assertEqual(legacy_trans, gmut._LAKE_HASH_NIL)
+        self.assertEqual(dep_hash, "c6d95c0a123d5a26")
+
+    def test_synthetic_lake_trace_verification_and_mixed_trees(self) -> None:
+        # Pure synthetic tree: accepted even when sources are newer than
+        # `.olean`s AND `.trace` mtimes are reversed (parallel cache restore).
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-syn-test-") as tmp:
+            root, mods = _make_tiny_lake_root(Path(tmp), synthetic=True)
+            lib = root / ".lake/build/lib/lean"
+            for mod in mods:
+                os.utime(root / "trusted/lean" / f"{mod}.lean", (3e9, 3e9))
+            os.utime(lib / "Trusted/A.trace", (2_900_000_000, 2_900_000_000))
+            os.utime(lib / "Trusted/B.trace", (2_500_000_000, 2_500_000_000))
+            os.utime(lib / "Trusted/C.trace", (2_100_000_000, 2_100_000_000))
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(
+                    root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+                ),
+                (True, "lake-trace-verified (synthetic)"),
+            )
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(
+                    root,
+                    mods,
+                    verify_olean_bytes=True,
+                    lean_githash=TEST_LEAN_V434_GITHASH,
+                ),
+                (True, "lake-trace-verified (synthetic)"),
+            )
+
+            # Without lean_githash or lean_bin, synthetic traces fail closed.
+            ok, why = gmut._lake_olean_reuse_decision(root, mods)
+            self.assertFalse(ok)
+            self.assertIn("requires active Lean githash", why)
+
+            # Wrong githash fails closed.
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash="0" * 40
+            )
+            self.assertFalse(ok)
+            self.assertIn("depHash mismatch", why)
+
+            # Edited source with OLD mtime breaks `depHash`.
+            src_c = root / "trusted/lean/Trusted/C.lean"
+            orig_c = src_c.read_bytes()
+            src_c.write_bytes(orig_c + b"-- stale\n")
+            os.utime(src_c, (1000, 1000))
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("Trusted/C: synthetic Lake trace depHash mismatch", why)
+            src_c.write_bytes(orig_c)
+
+            # Transitive rebuild of `A` (updating `A`'s `.olean`, `.hash`, and
+            # `A.trace` self-consistently, but leaving `B` and `C` untouched)
+            # breaks `B`'s `depHash`!
+            new_a_bytes = b"olean:Trusted/A rebuilt"
+            new_a_hash = gmut.lake_hash_of_bytes(new_a_bytes)
+            (lib / "Trusted/A.olean").write_bytes(new_a_bytes)
+            (lib / "Trusted/A.olean.hash").write_text(new_a_hash, encoding="utf-8")
+            trace_a = json.loads((lib / "Trusted/A.trace").read_text(encoding="utf-8"))
+            trace_a["outputs"]["o"] = [f"{new_a_hash}.olean"]
+            (lib / "Trusted/A.trace").write_text(json.dumps(trace_a), encoding="utf-8")
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("Trusted/B: synthetic Lake trace depHash mismatch", why)
+
+        # Mixed trees: non-synthetic A + synthetic B + non-synthetic C, AND
+        # synthetic A + non-synthetic B + synthetic C both verify cleanly.
+        for syn_set in ({"Trusted/B"}, {"Trusted/A", "Trusted/C"}):
+            with tempfile.TemporaryDirectory(prefix="anneal-gmut-mix-test-") as tmp:
+                root, mods = _make_tiny_lake_root(
+                    Path(tmp), synthetic_modules=syn_set
+                )
+                self.assertEqual(
+                    gmut._lake_olean_reuse_decision(
+                        root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+                    ),
+                    (True, "lake-trace-verified (synthetic)"),
+                    syn_set,
+                )
+
+        # Fail-closed checks for lakefile.toml, outputs.m, non-bool synthetic,
+        # `module` headers, and non-Trusted imports.
+        lakefile_bad_cases = (
+            ("missing lakefile.toml", lambda r: (r / "lakefile.toml").unlink(), "cannot read lakefile.toml"),
+            ("lakefile.lean present", lambda r: (r / "lakefile.lean").write_text("-- lean\n", encoding="utf-8"), "lakefile.lean is unsupported"),
+            ("root leanOptions", lambda r: (r / "lakefile.toml").write_text(TINY_LAKEFILE_TOML.replace('name = "Anneal"\n', 'name = "Anneal"\n[leanOptions]\nautoImplicit = false\n'), encoding="utf-8"), "unsupported root key"),
+            ("Trusted moreLeanArgs", lambda r: (r / "lakefile.toml").write_text(TINY_LAKEFILE_TOML + 'moreLeanArgs = ["-DautoImplicit=false"]\n', encoding="utf-8"), "Trusted` lean_lib sets unsupported key"),
+            ("wrong srcDir", lambda r: (r / "lakefile.toml").write_text(TINY_LAKEFILE_TOML.replace("trusted/lean", "other/lean"), encoding="utf-8"), "srcDir"),
+        )
+        for label, mutator, expected_msg in lakefile_bad_cases:
+            with tempfile.TemporaryDirectory(prefix="anneal-gmut-syn-bad-") as tmp:
+                root, mods = _make_tiny_lake_root(Path(tmp), synthetic=True)
+                mutator(root)
+                ok, why = gmut._lake_olean_reuse_decision(
+                    root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+                )
+                self.assertFalse(ok, label)
+                self.assertIn(expected_msg, why, label)
+
+        # `outputs.m == true`, non-bool `synthetic`, `module` header, and
+        # non-Trusted imports all fail closed.
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-syn-bad2-") as tmp:
+            root, mods = _make_tiny_lake_root(Path(tmp), synthetic=True)
+            lib = root / ".lake/build/lib/lean"
+            tr_path = lib / "Trusted/A.trace"
+            orig_tr = json.loads(tr_path.read_text(encoding="utf-8"))
+
+            bad_m = {**orig_tr, "outputs": {**orig_tr["outputs"], "m": True}}
+            tr_path.write_text(json.dumps(bad_m), encoding="utf-8")
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("module-system", why)
+
+            bad_syn = {**orig_tr, "synthetic": "yes"}
+            tr_path.write_text(json.dumps(bad_syn), encoding="utf-8")
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("unrecognized `synthetic`", why)
+
+            tr_path.write_text(json.dumps(orig_tr), encoding="utf-8")
+            (root / "trusted/lean/Trusted/A.lean").write_text(
+                "module\ndef a : Nat := 1\n", encoding="utf-8"
+            )
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("`module` files are unsupported", why)
+
+            (root / "trusted/lean/Trusted/A.lean").write_text(
+                "import Lean\ndef a : Nat := 1\n", encoding="utf-8"
+            )
+            ok, why = gmut._lake_olean_reuse_decision(
+                root, mods, lean_githash=TEST_LEAN_V434_GITHASH
+            )
+            self.assertFalse(ok)
+            self.assertIn("non-Trusted import", why)
+
+    def test_synthetic_lake_trace_cli_end_to_end_reuses_cache(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-syn-cli-") as tmp:
+            tmp_path = Path(tmp)
+            root = _make_tcb_copy_root(tmp_path)
+            _write_lake_build(root, ALL_TCB_MODULES, synthetic=True)
+            lib = root / ".lake/build/lib/lean"
+            before = {
+                mod: (lib / f"{mod}.olean").read_bytes() for mod in ALL_TCB_MODULES
+            }
+            fake = tmp_path / "fake_lean"
+            _write_fake_lean_sh(
+                fake, KILL_ALL_FAKE_SH, version_str=TEST_LEAN_V434_VERSION
+            )
+            res = _run_cli(
+                [
+                    "--anneal-root", str(root), "--lean", str(fake),
+                    "--guard", "div_by_zero", "--json",
+                ]
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            report = json.loads(res.stdout)
+            self.assertTrue(report["used_lake_cache"])
+            self.assertEqual(
+                report["lake_cache_detail"], "lake-trace-verified (synthetic)"
+            )
+            self.assertEqual(report["killed"], 1)
+            for mod in ALL_TCB_MODULES:
+                olean = lib / f"{mod}.olean"
+                self.assertEqual(olean.read_bytes(), before[mod], mod)
+                self.assertEqual(olean.stat().st_nlink, 1, mod)
+
+            # A Lean binary whose `--version` disagrees with `lean-toolchain`
+            # fails closed and falls back to a cold build.
+            wrong_fake = tmp_path / "wrong_lean"
+            _write_fake_lean_sh(
+                wrong_fake,
+                KILL_ALL_FAKE_SH,
+                version_str=(
+                    "Lean (version 4.33.0, x86_64-unknown-linux-gnu, "
+                    f"commit {TEST_LEAN_V434_GITHASH}, Release)"
+                ),
+            )
+            res2 = _run_cli(
+                [
+                    "--anneal-root", str(root), "--lean", str(wrong_fake),
+                    "--guard", "div_by_zero", "--json",
+                ]
+            )
+            self.assertEqual(res2.returncode, 0, res2.stdout + res2.stderr)
+            report2 = json.loads(res2.stdout)
+            self.assertFalse(report2["used_lake_cache"])
+            self.assertIn("active Lean binary is 4.33.0, expected 4.34.1", report2["lake_cache_detail"])
+
+    # -- refutation classification & sorry boundary ---------------------
+
+    def test_classify_indented_error_body_vs_unlocated_errors(self) -> None:
+        # Indented continuation lines inside a located fixture error may
+        # contain `error:` prose without turning a genuine kill into ERROR.
+        kill_with_indented = (
+            "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n"
+            "  rfl\n"
+            "  note: type error: expected .ub\n"
+            "has type\n"
+            "  ?m.1 = ?m.1\n"
+        )
+        self.assertEqual(self._classify(1, kill_with_indented), "KILLED")
+
+        # Indented error BEFORE any diagnostic header is still unlocated -> ERROR.
+        self.assertEqual(
+            self._classify(1, "  error: wrapper boom\n" + kill_with_indented),
+            "ERROR",
+        )
+        # Column-0 unlocated error AFTER the fixture diagnostic -> ERROR.
+        self.assertEqual(
+            self._classify(1, kill_with_indented + "error: post-elaboration failure\n"),
+            "ERROR",
+        )
+        # Indented error inside a FOREIGN file's diagnostic -> ERROR.
+        foreign_warn = "/t/Other.lean:1:0: warning: w\n  error: leaked\n"
+        self.assertEqual(
+            self._classify(1, foreign_warn + kill_with_indented),
+            "ERROR",
+        )
+
+    def test_sorry_warning_word_boundary(self) -> None:
+        self.assertFalse(
+            gmut._has_sorry_warning("X.lean:3:8: warning: unused variable `sorry_helper`")
+        )
+        self.assertFalse(
+            gmut._has_sorry_warning("/tmp/sorry_dir/X.lean:1:0: warning: unused variable")
+        )
+        for text in (
+            "X.lean:3:8: warning: declaration uses `sorry`",
+            "X.lean:3:8: warning: declaration uses 'sorry'",
+            "X.lean:3:8: warning: declaration uses sorry",
+            "X.lean:3:8: warning: declaration uses `sorryAx`",
+        ):
+            self.assertTrue(gmut._has_sorry_warning(text), text)
+
+    # -- header parsing & comment-aware fixture validation --------------
+
+    def test_lean_header_parser_and_comment_aware_fixture_validation(self) -> None:
+        src = textwrap.dedent(
+            """\
+            -- import Trusted.CommentedLine
+            /- nested /- import Trusted.NestedComment -/
+               import Trusted.BlockComment -/
+            prelude
+            public meta import all Trusted.A -- trailing comment
+            import Trusted.B
+            namespace Foo
+            -- After namespace, import is not a header directive:
+            import Trusted.NotHeader
+            """
+        )
+        self.assertEqual(
+            gmut._parse_lean_header(src),
+            (False, ["Trusted/A", "Trusted/B"]),
+        )
+        self.assertEqual(
+            gmut._parse_lean_header("module\nimport Trusted.A\nimport «Lean»\n"),
+            (True, ["Trusted/A", "«Lean»"]),
+        )
+
+        # Comments mentioning `theorem`/`example` and string literals with `--`
+        # do not cause false positives, while `macro_rules`, `elab_rules`,
+        # unclosed `/-`, and raw `sorry` in comments are rejected.
+        ok_fixture = textwrap.dedent(
+            """\
+            import Trusted.A
+            -- theorem note: example helper
+            def msg : String := "-- not a comment /- neither"
+            /- theorem fake : True := trivial -/
+            theorem t :
+                1 = 1 :=
+              rfl
+            """
+        )
+        self.assertEqual(gmut._fixture_shape_errors("refute", ok_fixture, "t"), [])
+        self.assertEqual(gmut.find_theorem_line_span(ok_fixture, "t"), (5, 7))
+        for bad_tail in (
+            "macro_rules | `(foo) => `(1)\n",
+            "elab_rules : term | `(foo) => pure default\n",
+            "/- unclosed comment\n",
+            "-- TODO: remove sorry\n",
+        ):
+            self.assertNotEqual(
+                gmut._fixture_shape_errors("refute", ok_fixture + bad_tail, "t"),
+                [],
+                bad_tail,
+            )
+
+        # Non-Trusted imports (including guillemet-escaped) and `module`
+        # headers in fixtures are rejected by `validate_catalog_invariants`.
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        for prefix, needle in (
+            ("import Lean\n", "non-Trusted module"),
+            ("import «Lean»\n", "non-Trusted module"),
+            ("module\n", "must not use a `module` header"),
+        ):
+            with mock.patch.object(
+                gmut,
+                "MIR_SEMANTICS_GUARDS",
+                _replace_guard("div_by_zero", refute_source=prefix + guard.refute_source),
+            ):
+                errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+            self.assertTrue(any(needle in e for e in errors), (prefix, errors))
+
+    # -- atomic `_ABORT` / `_LIVE_PROCS` spawn race ---------------------
+
+    def test_run_lean_abort_during_popen_kills_child_immediately(self) -> None:
+        # Simulate `_abort_pending` firing in the exact window between
+        # `subprocess.Popen(...)` returning and `_run_lean` acquiring
+        # `_LIVE_PROCS_LOCK`. The child must be killed immediately (rc=130).
+        real_popen = gmut.subprocess.Popen
+        spawned_pids: list[int] = []
+
+        def racing_popen(*args: object, **kwargs: object) -> subprocess.Popen[str]:
+            proc = real_popen(*args, **kwargs)
+            spawned_pids.append(proc.pid)
+            gmut._ABORT.set()
+            return proc
+
+        gmut._ABORT.clear()
+        try:
+            with tempfile.TemporaryDirectory(prefix="anneal-gmut-race-") as tmp:
+                slow = Path(tmp) / "slow_lean"
+                _write_fake_lean_sh(slow, "sleep 60")
+                t0 = time.monotonic()
+                with mock.patch.object(gmut.subprocess, "Popen", side_effect=racing_popen):
+                    res = gmut._run_lean(
+                        slow,
+                        ["x.lean"],
+                        anneal_root=ANNEAL_ROOT,
+                        lean_path=[],
+                        timeout_sec=30,
+                        lean_run_wrapper=None,
+                    )
+                elapsed = time.monotonic() - t0
+            self.assertEqual(res.returncode, 130)
+            self.assertIn("aborted while Lean was starting", res.stderr)
+            self.assertLess(elapsed, 5.0)
+            self.assertEqual(len(spawned_pids), 1)
+            self.assertEqual(gmut._LIVE_PROCS, set())
+        finally:
+            gmut._ABORT.clear()
+
+    # -- expanded 14-guard catalog & strengthened return sanity ---------
+
+    def test_new_guards_and_strengthened_return_sanity(self) -> None:
+        self.assertGreaterEqual(len(gmut.MIR_SEMANTICS_GUARDS), 14)
+        by_id = {g.guard_id: g for g in gmut.MIR_SEMANTICS_GUARDS}
+        self.assertIn("shr_oob", by_id)
+        self.assertIn("storage_uninit_read", by_id)
+        ret_guard = by_id["tb_return_frame_dealloc_protector_conflict"]
+        self.assertIn("activeProtectors := 1 :: .nil", ret_guard.sanity_source)
+        self.assertIn("targetLocal := 1", ret_guard.sanity_source)
 
 
 if __name__ == "__main__":
