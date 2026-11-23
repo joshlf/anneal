@@ -3433,6 +3433,24 @@ theorem evalBlockTreeToCut_ofList_eq {BB : Type u} {State : Type v}
   evalBlockTreeToCut_eq_of_valid (valid_blockTree_ofList blocks) stepWith
     next? blockOf cuts fuel s
 
+/-- `0 Quot.sound` pointwise form of `evalBlockTreeToCut_eq_of_valid` for any
+pre-built `ValidBlockTree` and pointwise-congruent step function. -/
+theorem evalBlockTreeToCut_eq_of_valid_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} {blocks : List BB} {bt : BlockTree BB}
+    (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalBlockTreeToCut bt stepWith next? blockOf cuts fuel s =
+      runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runToCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
 /-- `0 Quot.sound` pointwise form of `evalBlockTreeToCut_ofList_eq` for any
 step function respecting pointwise-equal lookups. -/
 theorem evalBlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
@@ -3446,11 +3464,8 @@ theorem evalBlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
       fuel s =
       runToCut (stepWith (listGet? blocks)) next?
         (fun st => cuts.get (blockOf st)) fuel s :=
-  runToCut_congr
-    (fun st => hPointwise _ _ st (fun i =>
-      ((BlockTree.ofList blocks).lookupForced?_eq i).trans
-        (BlockTree.ofList_lookup_eq blocks i)))
-    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+  evalBlockTreeToCut_eq_of_valid_pointwise (valid_blockTree_ofList blocks)
+    stepWith hPointwise next? blockOf cuts fuel s
 
 /-- Stage execution from a cutpoint over a valid `BlockTree` is stage
 execution over the list it tabulates. -/
@@ -3481,6 +3496,23 @@ theorem evalBlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
   evalBlockTreeFromCut_eq_of_valid (valid_blockTree_ofList blocks) stepWith
     next? blockOf cuts fuel s
 
+/-- `0 Quot.sound` pointwise form of `evalBlockTreeFromCut_eq_of_valid`. -/
+theorem evalBlockTreeFromCut_eq_of_valid_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} {blocks : List BB} {bt : BlockTree BB}
+    (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalBlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runFromCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
 /-- `0 Quot.sound` pointwise form of `evalBlockTreeFromCut_ofList_eq`. -/
 theorem evalBlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
     {State : Type v} {Res : Type w} (blocks : List BB)
@@ -3493,11 +3525,8 @@ theorem evalBlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
       cuts fuel s =
       runFromCut (stepWith (listGet? blocks)) next?
         (fun st => cuts.get (blockOf st)) fuel s :=
-  runFromCut_congr
-    (fun st => hPointwise _ _ st (fun i =>
-      ((BlockTree.ofList blocks).lookupForced?_eq i).trans
-        (BlockTree.ofList_lookup_eq blocks i)))
-    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+  evalBlockTreeFromCut_eq_of_valid_pointwise (valid_blockTree_ofList blocks)
+    stepWith hPointwise next? blockOf cuts fuel s
 
 /-- Cut execution over a valid `Chunk8BlockTree` is cut execution over the
 list it tabulates. -/
@@ -3528,6 +3557,24 @@ theorem evalChunk8BlockTreeToCut_ofList_eq {BB : Type u} {State : Type v}
   evalChunk8BlockTreeToCut_eq_of_valid (valid_chunk8BlockTree_ofList blocks)
     stepWith next? blockOf cuts fuel s
 
+/-- `0 Quot.sound` pointwise form of
+`evalChunk8BlockTreeToCut_eq_of_valid`. -/
+theorem evalChunk8BlockTreeToCut_eq_of_valid_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} {blocks : List BB}
+    {bt : Chunk8BlockTree BB} (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeToCut bt stepWith next? blockOf cuts fuel s =
+      runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runToCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
 /-- `0 Quot.sound` pointwise form of `evalChunk8BlockTreeToCut_ofList_eq`. -/
 theorem evalChunk8BlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
     {State : Type v} {Res : Type w} (blocks : List BB)
@@ -3540,11 +3587,9 @@ theorem evalChunk8BlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
       blockOf cuts fuel s =
       runToCut (stepWith (listGet? blocks)) next?
         (fun st => cuts.get (blockOf st)) fuel s :=
-  runToCut_congr
-    (fun st => hPointwise _ _ st (fun i =>
-      ((Chunk8BlockTree.ofList blocks).lookupForced?_eq i).trans
-        (Chunk8BlockTree.ofList_lookup_eq blocks i)))
-    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+  evalChunk8BlockTreeToCut_eq_of_valid_pointwise
+    (valid_chunk8BlockTree_ofList blocks) stepWith hPointwise next? blockOf
+    cuts fuel s
 
 /-- Stage execution from a cutpoint over a valid `Chunk8BlockTree` is stage
 execution over the list it tabulates. -/
@@ -3576,6 +3621,24 @@ theorem evalChunk8BlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
     stepWith next? blockOf cuts fuel s
 
 /-- `0 Quot.sound` pointwise form of
+`evalChunk8BlockTreeFromCut_eq_of_valid`. -/
+theorem evalChunk8BlockTreeFromCut_eq_of_valid_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} {blocks : List BB}
+    {bt : Chunk8BlockTree BB} (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runFromCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
+/-- `0 Quot.sound` pointwise form of
 `evalChunk8BlockTreeFromCut_ofList_eq`. -/
 theorem evalChunk8BlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
     {State : Type v} {Res : Type w} (blocks : List BB)
@@ -3588,11 +3651,9 @@ theorem evalChunk8BlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
       blockOf cuts fuel s =
       runFromCut (stepWith (listGet? blocks)) next?
         (fun st => cuts.get (blockOf st)) fuel s :=
-  runFromCut_congr
-    (fun st => hPointwise _ _ st (fun i =>
-      ((Chunk8BlockTree.ofList blocks).lookupForced?_eq i).trans
-        (Chunk8BlockTree.ofList_lookup_eq blocks i)))
-    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+  evalChunk8BlockTreeFromCut_eq_of_valid_pointwise
+    (valid_chunk8BlockTree_ofList blocks) stepWith hPointwise next? blockOf
+    cuts fuel s
 
 /-- A cut execution that ends at a cutpoint ends at a marked block. -/
 theorem evalBlockTreeToCut_cut_marked {BB : Type u} {State : Type v}

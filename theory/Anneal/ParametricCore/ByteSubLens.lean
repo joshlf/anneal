@@ -2770,43 +2770,84 @@ theorem getChunks_set_disjoint {k : Nat} {L₁ L₂ : ByteSubLens Addr}
 
 end ByteSubLens
 
+/-- Replicates `x` `n` times (`@Nat.rec`, `0` `._unsafe_rec`). -/
+def listReplicate {α : Type u} (n : Nat) (x : α) : List α :=
+  @Nat.rec (fun _ => List α) [] (fun _ ih => x :: ih) n
+
+/-- Length of `listReplicate`. -/
+theorem listReplicate_length {α : Type u} (n : Nat) (x : α) :
+    (listReplicate n x).length = n := by
+  induction n with
+  | zero => rfl
+  | succ n ih => exact congrArg Nat.succ ih
+
 /-- Fixed-width typed slice codec encoding values of `α` into `len` byte
-slots `Byte` and decoding valid byte slices back to `α`. Supports arbitrary
-layout-driven MIR value codecs (for example `bool`, structs, tuples,
-`ScalarInt`, or `V2026_06_01` `encodeValueToBytes` / `decodeValueFromBytes`)
-in addition to little-endian bitvectors. -/
+slots `Byte` and decoding valid `len`-byte slices back to `α`. Supports
+arbitrary layout-driven MIR value codecs (for example `bool`, structs, tuples,
+padded layouts, `ScalarInt`, or `V2026_06_01` `encodeValueToBytes` /
+`decodeValueFromBytes`) in addition to little-endian bitvectors.
+
+Both `enc_length` and `dec_length` are enforced by the structure itself, so no
+`SliceCodec` can silently accept a short or over-long byte slice. -/
 structure SliceCodec (Byte : Type w) (α : Type a) (len : Nat) where
   /-- Encodes a value into exactly `len` byte slots. -/
   enc : α → List Byte
-  /-- Decodes a byte slice, failing closed on invalid bit patterns or
-  uninitialized bytes. -/
+  /-- Decodes a `len`-byte slice, failing closed on wrong width, invalid bit
+  patterns, or uninitialized bytes. -/
   dec : List Byte → Option α
   /-- Encoded slices always have width `len`. -/
   enc_length : ∀ x : α, (enc x).length = len
+  /-- Every accepted slice has width `len`. -/
+  dec_length : ∀ {bs : List Byte} {x : α}, dec bs = some x → bs.length = len
   /-- Decoding an encoded value recovers it. -/
   dec_enc : ∀ x : α, dec (enc x) = some x
 
-/-- A `SliceCodec` is exact when re-encoding any valid `len`-byte slice
-recovers the exact original byte slots (ruling out ignored padding or
-provenance). -/
+/-- A `SliceCodec` fails closed on every slice whose length differs from
+`len`. -/
+theorem SliceCodec.dec_none_of_length_ne {Byte : Type w} {α : Type a}
+    {len : Nat} (sc : SliceCodec Byte α len) {bs : List Byte}
+    (hNe : ¬ bs.length = len) : sc.dec bs = none := by
+  cases h : sc.dec bs with
+  | none => rfl
+  | some x => exact False.elim (hNe (sc.dec_length h))
+
+/-- A `SliceCodec` is exact when re-encoding any valid slice recovers the exact
+original byte slots (ruling out ignored padding or provenance). -/
 def SliceCodec.Exact {Byte : Type w} {α : Type a} {len : Nat}
     (sc : SliceCodec Byte α len) : Prop :=
-  ∀ (bs : List Byte) (x : α), bs.length = len → sc.dec bs = some x →
-    sc.enc x = bs
+  ∀ (bs : List Byte) (x : α), sc.dec bs = some x → sc.enc x = bs
 
-/-- Every `ByteCodec` induces an `n`-byte little-endian `BitVec (n * 8)`
-`SliceCodec`. -/
+/-- Every `ByteCodec` induces a width-checked `n`-byte little-endian
+`BitVec (n * 8)` `SliceCodec`. -/
 def SliceCodec.ofByteCodecLe {Byte : Type w} (c : ByteCodec Byte) (n : Nat) :
     SliceCodec Byte (BitVec (n * 8)) n where
   enc x := encodeBytes c (LeBytes.toLeBytes n x)
   dec bs :=
-    match decodeBytes c bs with
-    | none => none
-    | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))
+    match Nat.beq bs.length n with
+    | false => none
+    | true =>
+      match decodeBytes c bs with
+      | none => none
+      | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))
   enc_length x :=
     (encodeBytes_length c (LeBytes.toLeBytes n x)).trans
       (LeBytes.toLeBytes_length n x)
+  dec_length {bs x} h := by
+    cases hLenB : Nat.beq bs.length n with
+    | false =>
+      rw [hLenB] at h
+      cases h
+    | true => exact Nat.eq_of_beq_eq_true hLenB
   dec_enc x := by
+    have hLen : (encodeBytes c (LeBytes.toLeBytes n x)).length = n :=
+      (encodeBytes_length c (LeBytes.toLeBytes n x)).trans
+        (LeBytes.toLeBytes_length n x)
+    have hBeq : Nat.beq (encodeBytes c (LeBytes.toLeBytes n x)).length n =
+        true := by
+      rw [hLen]
+      exact Nat.beq_refl n
+    rw [hBeq]
+    dsimp only
     rw [decodeBytes_encodeBytes c (LeBytes.toLeBytes n x)]
     dsimp only
     rw [LeBytes.fromLeBytes_toLeBytes n x, bitVec_ofNat_toNat x]
@@ -2815,11 +2856,20 @@ def SliceCodec.ofByteCodecLe {Byte : Type w} (c : ByteCodec Byte) (n : Nat) :
 exact. -/
 theorem SliceCodec.ofByteCodecLe_exact {Byte : Type w} {c : ByteCodec Byte}
     (hE : c.Exact) (n : Nat) : (SliceCodec.ofByteCodecLe c n).Exact := by
-  intro bs x hLen hDec
-  change (match decodeBytes c bs with
-    | none => none
-    | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))) =
+  intro bs x hDec
+  have hLen : bs.length = n := (SliceCodec.ofByteCodecLe c n).dec_length hDec
+  have hBeq : Nat.beq bs.length n = true := by
+    rw [hLen]
+    exact Nat.beq_refl n
+  change (match Nat.beq bs.length n with
+    | false => none
+    | true =>
+      match decodeBytes c bs with
+      | none => none
+      | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))) =
     some x at hDec
+  rw [hBeq] at hDec
+  dsimp only at hDec
   cases hD : decodeBytes c bs with
   | none =>
     rw [hD] at hDec
@@ -2843,25 +2893,119 @@ theorem SliceCodec.ofByteCodecLe_exact {Byte : Type w} {c : ByteCodec Byte}
     rw [hRound]
     exact encodeBytes_decodeBytes_of_exact hE hD
 
+/-- Maps a `SliceCodec` across a retraction `to ∘ from_ = id`, adapting
+bitvector or tuple layouts to custom struct or integer types. -/
+def SliceCodec.map {Byte : Type w} {α : Type a} {β : Type b} {n : Nat}
+    (sc : SliceCodec Byte α n) (to : α → β) (from_ : β → α)
+    (hToFrom : ∀ y : β, to (from_ y) = y) : SliceCodec Byte β n where
+  enc y := sc.enc (from_ y)
+  dec bs :=
+    match sc.dec bs with
+    | none => none
+    | some a => some (to a)
+  enc_length y := sc.enc_length (from_ y)
+  dec_length {bs y} h := by
+    cases hD : sc.dec bs with
+    | none =>
+      rw [hD] at h
+      cases h
+    | some a => exact sc.dec_length hD
+  dec_enc y := by
+    rw [sc.dec_enc (from_ y)]
+    dsimp only
+    rw [hToFrom y]
+
+/-- `SliceCodec.map` preserves exactness when `to` and `from_` form a
+bijection. -/
+theorem SliceCodec.map_exact {Byte : Type w} {α : Type a} {β : Type b}
+    {n : Nat} {sc : SliceCodec Byte α n} {to : α → β} {from_ : β → α}
+    (hToFrom : ∀ y : β, to (from_ y) = y)
+    (hFromTo : ∀ x : α, from_ (to x) = x) (hE : sc.Exact) :
+    (sc.map to from_ hToFrom).Exact := by
+  intro bs y hDec
+  change (match sc.dec bs with
+    | none => none
+    | some a => some (to a)) = some y at hDec
+  cases hD : sc.dec bs with
+  | none =>
+    rw [hD] at hDec
+    cases hDec
+  | some a =>
+    rw [hD] at hDec
+    have hY : to a = y := Option.some.inj hDec
+    change sc.enc (from_ y) = bs
+    rw [← hY, hFromTo a]
+    exact hE bs a hD
+
+/-- Two-byte little-endian `UInt16` `SliceCodec`. -/
+def SliceCodec.uint16 {Byte : Type w} (c : ByteCodec Byte) :
+    SliceCodec Byte UInt16 2 :=
+  (SliceCodec.ofByteCodecLe c 2).map UInt16.ofBitVec UInt16.toBitVec
+    (fun _ => rfl)
+
+/-- Four-byte little-endian `UInt32` `SliceCodec`. -/
+def SliceCodec.uint32 {Byte : Type w} (c : ByteCodec Byte) :
+    SliceCodec Byte UInt32 4 :=
+  (SliceCodec.ofByteCodecLe c 4).map UInt32.ofBitVec UInt32.toBitVec
+    (fun _ => rfl)
+
+/-- Eight-byte little-endian `UInt64` `SliceCodec`. -/
+def SliceCodec.uint64 {Byte : Type w} (c : ByteCodec Byte) :
+    SliceCodec Byte UInt64 8 :=
+  (SliceCodec.ofByteCodecLe c 8).map UInt64.ofBitVec UInt64.toBitVec
+    (fun _ => rfl)
+
+/-- `SliceCodec.uint16` is exact over an exact byte codec. -/
+theorem SliceCodec.uint16_exact {Byte : Type w} {c : ByteCodec Byte}
+    (hE : c.Exact) : (SliceCodec.uint16 c).Exact :=
+  SliceCodec.map_exact (fun _ => rfl) (fun _ => rfl)
+    (SliceCodec.ofByteCodecLe_exact hE 2)
+
+/-- `SliceCodec.uint32` is exact over an exact byte codec. -/
+theorem SliceCodec.uint32_exact {Byte : Type w} {c : ByteCodec Byte}
+    (hE : c.Exact) : (SliceCodec.uint32 c).Exact :=
+  SliceCodec.map_exact (fun _ => rfl) (fun _ => rfl)
+    (SliceCodec.ofByteCodecLe_exact hE 4)
+
+/-- `SliceCodec.uint64` is exact over an exact byte codec. -/
+theorem SliceCodec.uint64_exact {Byte : Type w} {c : ByteCodec Byte}
+    (hE : c.Exact) : (SliceCodec.uint64 c).Exact :=
+  SliceCodec.map_exact (fun _ => rfl) (fun _ => rfl)
+    (SliceCodec.ofByteCodecLe_exact hE 8)
+
 /-- Layout of a pair: the `n₁` bytes of the first component followed by the
-`n₂` bytes of the second. Decoding reads the two components from the slices
-`[0, n₁)` and `[n₁, n₁ + n₂)`, which are the slices that the sub-lenses
-`L.zoom 0 n₁` and `L.zoom n₁ n₂` read (`ByteSubLens.getVal_pair`). Nesting
-`pair` gives the layout of any struct or tuple without padding. -/
+`n₂` bytes of the second. Decoding enforces exact width `n₁ + n₂` and reads
+the two components from `[0, n₁)` and `[n₁, n₁ + n₂)`, matching `L.zoom 0 n₁`
+and `L.zoom n₁ n₂` (`ByteSubLens.getVal_pair`). -/
 def SliceCodec.pair {Byte : Type w} {α : Type a} {β : Type b} {n₁ n₂ : Nat}
     (sc₁ : SliceCodec Byte α n₁) (sc₂ : SliceCodec Byte β n₂) :
     SliceCodec Byte (α × β) (n₁ + n₂) where
   enc x := sc₁.enc x.1 ++ sc₂.enc x.2
   dec bs :=
-    match sc₁.dec ((bs.drop 0).take n₁) with
-    | none => none
-    | some a =>
-      match sc₂.dec ((bs.drop n₁).take n₂) with
+    match Nat.beq bs.length (n₁ + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
       | none => none
-      | some b => some (a, b)
+      | some a =>
+        match sc₂.dec ((bs.drop n₁).take n₂) with
+        | none => none
+        | some b => some (a, b)
   enc_length x := by
     rw [List.length_append, sc₁.enc_length, sc₂.enc_length]
+  dec_length {bs x} h := by
+    cases hLenB : Nat.beq bs.length (n₁ + n₂) with
+    | false =>
+      rw [hLenB] at h
+      cases h
+    | true => exact Nat.eq_of_beq_eq_true hLenB
   dec_enc x := by
+    have hLen : (sc₁.enc x.1 ++ sc₂.enc x.2).length = n₁ + n₂ := by
+      rw [List.length_append, sc₁.enc_length, sc₂.enc_length]
+    have hBeq : Nat.beq (sc₁.enc x.1 ++ sc₂.enc x.2).length (n₁ + n₂) =
+        true := by
+      rw [hLen]
+      exact Nat.beq_refl (n₁ + n₂)
     have h₁ : ((sc₁.enc x.1 ++ sc₂.enc x.2).drop 0).take n₁ = sc₁.enc x.1 :=
       listTake_append_of_len n₁ _ _ (sc₁.enc_length x.1)
     have h₂ : ((sc₁.enc x.1 ++ sc₂.enc x.2).drop n₁).take n₂ =
@@ -2869,20 +3013,33 @@ def SliceCodec.pair {Byte : Type w} {α : Type a} {β : Type b} {n₁ n₂ : Nat
       rw [listDrop_append_of_len n₁ _ _ (sc₁.enc_length x.1)]
       exact (congrArg (fun k => (sc₂.enc x.2).take k)
         (sc₂.enc_length x.2).symm).trans (listTake_length_self _)
+    rw [hBeq]
+    dsimp only
     rw [h₁, h₂, sc₁.dec_enc, sc₂.dec_enc]
 
-/-- Inversion of a successful pair decode: both component slices decode. -/
+/-- Inversion of a successful pair decode: the slice has width `n₁ + n₂` and
+both component slices decode. -/
 theorem SliceCodec.pair_dec_inv {Byte : Type w} {α : Type a} {β : Type b}
     {n₁ n₂ : Nat} {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
     {bs : List Byte} {x : α × β} (h : (sc₁.pair sc₂).dec bs = some x) :
-    sc₁.dec ((bs.drop 0).take n₁) = some x.1 ∧
+    bs.length = n₁ + n₂ ∧
+      sc₁.dec ((bs.drop 0).take n₁) = some x.1 ∧
       sc₂.dec ((bs.drop n₁).take n₂) = some x.2 := by
-  change (match sc₁.dec ((bs.drop 0).take n₁) with
-    | none => none
-    | some a =>
-      match sc₂.dec ((bs.drop n₁).take n₂) with
+  have hLen : bs.length = n₁ + n₂ := (sc₁.pair sc₂).dec_length h
+  have hBeq : Nat.beq bs.length (n₁ + n₂) = true := by
+    rw [hLen]
+    exact Nat.beq_refl (n₁ + n₂)
+  change (match Nat.beq bs.length (n₁ + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
       | none => none
-      | some b => some (a, b)) = some x at h
+      | some a =>
+        match sc₂.dec ((bs.drop n₁).take n₂) with
+        | none => none
+        | some b => some (a, b)) = some x at h
+  rw [hBeq] at h
+  dsimp only at h
   cases hA : sc₁.dec ((bs.drop 0).take n₁) with
   | none =>
     rw [hA] at h
@@ -2898,21 +3055,30 @@ theorem SliceCodec.pair_dec_inv {Byte : Type w} {α : Type a} {β : Type b}
       rw [hB] at h
       have hX : (a, b) = x := Option.some.inj h
       rw [← hX]
-      exact ⟨rfl, rfl⟩
+      exact ⟨hLen, rfl, rfl⟩
 
-/-- A pair decodes when both component slices do. -/
+/-- A pair decodes when the slice has width `n₁ + n₂` and both component
+slices decode. -/
 theorem SliceCodec.pair_dec_of {Byte : Type w} {α : Type a} {β : Type b}
     {n₁ n₂ : Nat} {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
-    {bs : List Byte} {a : α} {b : β}
+    {bs : List Byte} {a : α} {b : β} (hLen : bs.length = n₁ + n₂)
     (hA : sc₁.dec ((bs.drop 0).take n₁) = some a)
     (hB : sc₂.dec ((bs.drop n₁).take n₂) = some b) :
     (sc₁.pair sc₂).dec bs = some (a, b) := by
-  change (match sc₁.dec ((bs.drop 0).take n₁) with
-    | none => none
-    | some a =>
-      match sc₂.dec ((bs.drop n₁).take n₂) with
+  have hBeq : Nat.beq bs.length (n₁ + n₂) = true := by
+    rw [hLen]
+    exact Nat.beq_refl (n₁ + n₂)
+  change (match Nat.beq bs.length (n₁ + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
       | none => none
-      | some b => some (a, b)) = some (a, b)
+      | some a =>
+        match sc₂.dec ((bs.drop n₁).take n₂) with
+        | none => none
+        | some b => some (a, b)) = some (a, b)
+  rw [hBeq]
+  dsimp only
   rw [hA]
   dsimp only
   rw [hB]
@@ -2921,15 +3087,10 @@ theorem SliceCodec.pair_dec_of {Byte : Type w} {α : Type a} {β : Type b}
 theorem SliceCodec.pair_exact {Byte : Type w} {α : Type a} {β : Type b}
     {n₁ n₂ : Nat} {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
     (h₁ : sc₁.Exact) (h₂ : sc₂.Exact) : (sc₁.pair sc₂).Exact := by
-  intro bs x hLen hDec
-  let ⟨hA, hB⟩ := SliceCodec.pair_dec_inv hDec
-  have hBound₁ : 0 + n₁ ≤ bs.length := by
-    rw [hLen, Nat.zero_add]
-    exact Nat.le_add_right n₁ n₂
-  have hE₁ : sc₁.enc x.1 = (bs.drop 0).take n₁ :=
-    h₁ _ _ (listSlice_length bs 0 n₁ hBound₁) hA
-  have hE₂ : sc₂.enc x.2 = (bs.drop n₁).take n₂ :=
-    h₂ _ _ (listSlice_length bs n₁ n₂ (Nat.le_of_eq hLen.symm)) hB
+  intro bs x hDec
+  let ⟨hLen, hA, hB⟩ := SliceCodec.pair_dec_inv hDec
+  have hE₁ : sc₁.enc x.1 = (bs.drop 0).take n₁ := h₁ _ _ hA
+  have hE₂ : sc₂.enc x.2 = (bs.drop n₁).take n₂ := h₂ _ _ hB
   have hDropLen : (bs.drop n₁).length = n₂ := by
     rw [listDrop_length, hLen]
     exact Nat.add_sub_cancel_left n₁ n₂
@@ -2939,6 +3100,181 @@ theorem SliceCodec.pair_exact {Byte : Type w} {α : Type a} {β : Type b}
   change sc₁.enc x.1 ++ sc₂.enc x.2 = bs
   rw [hE₁, hE₂, hTake]
   exact listTake_append_drop n₁ bs
+
+/-- Layout of a padded pair `(α, [pad], β)` of width `n₁ + pad + n₂` (for
+example Rust's `(u8, u32)` with 3 padding bytes): encoding fills the `pad`
+bytes with `padByte`, while decoding checks total width `n₁ + pad + n₂` and
+decodes `[0, n₁)` and `[n₁ + pad, n₁ + pad + n₂)` while ignoring the padding
+bytes (even when they are uninitialized). -/
+def SliceCodec.paddedPair {Byte : Type w} {α : Type a} {β : Type b}
+    {n₁ n₂ : Nat} (pad : Nat) (padByte : Byte)
+    (sc₁ : SliceCodec Byte α n₁) (sc₂ : SliceCodec Byte β n₂) :
+    SliceCodec Byte (α × β) (n₁ + pad + n₂) where
+  enc x := sc₁.enc x.1 ++ listReplicate pad padByte ++ sc₂.enc x.2
+  dec bs :=
+    match Nat.beq bs.length (n₁ + pad + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
+      | none => none
+      | some a =>
+        match sc₂.dec ((bs.drop (n₁ + pad)).take n₂) with
+        | none => none
+        | some b => some (a, b)
+  enc_length x := by
+    rw [List.length_append, List.length_append, sc₁.enc_length,
+      listReplicate_length, sc₂.enc_length]
+  dec_length {bs x} h := by
+    cases hLenB : Nat.beq bs.length (n₁ + pad + n₂) with
+    | false =>
+      rw [hLenB] at h
+      cases h
+    | true => exact Nat.eq_of_beq_eq_true hLenB
+  dec_enc x := by
+    have hPreLen : (sc₁.enc x.1 ++ listReplicate pad padByte).length =
+        n₁ + pad := by
+      rw [List.length_append, sc₁.enc_length, listReplicate_length]
+    have hLen : (sc₁.enc x.1 ++ listReplicate pad padByte ++
+        sc₂.enc x.2).length = n₁ + pad + n₂ := by
+      rw [List.length_append, hPreLen, sc₂.enc_length]
+    have hBeq : Nat.beq (sc₁.enc x.1 ++ listReplicate pad padByte ++
+        sc₂.enc x.2).length (n₁ + pad + n₂) = true := by
+      rw [hLen]
+      exact Nat.beq_refl (n₁ + pad + n₂)
+    have h₁ : ((sc₁.enc x.1 ++ listReplicate pad padByte ++
+        sc₂.enc x.2).drop 0).take n₁ = sc₁.enc x.1 := by
+      change (sc₁.enc x.1 ++ listReplicate pad padByte ++
+        sc₂.enc x.2).take n₁ = sc₁.enc x.1
+      rw [List.append_assoc]
+      exact listTake_append_of_len n₁ _ _ (sc₁.enc_length x.1)
+    have h₂ : ((sc₁.enc x.1 ++ listReplicate pad padByte ++
+        sc₂.enc x.2).drop (n₁ + pad)).take n₂ = sc₂.enc x.2 := by
+      rw [listDrop_append_of_len (n₁ + pad) _ _ hPreLen]
+      exact (congrArg (fun k => (sc₂.enc x.2).take k)
+        (sc₂.enc_length x.2).symm).trans (listTake_length_self _)
+    rw [hBeq]
+    dsimp only
+    rw [h₁, h₂, sc₁.dec_enc, sc₂.dec_enc]
+
+/-- Inversion of a successful padded-pair decode. -/
+theorem SliceCodec.paddedPair_dec_inv {Byte : Type w} {α : Type a}
+    {β : Type b} {n₁ n₂ : Nat} {pad : Nat} {padByte : Byte}
+    {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {bs : List Byte} {x : α × β}
+    (h : (SliceCodec.paddedPair pad padByte sc₁ sc₂).dec bs = some x) :
+    bs.length = n₁ + pad + n₂ ∧
+      sc₁.dec ((bs.drop 0).take n₁) = some x.1 ∧
+      sc₂.dec ((bs.drop (n₁ + pad)).take n₂) = some x.2 := by
+  have hLen : bs.length = n₁ + pad + n₂ :=
+    (SliceCodec.paddedPair pad padByte sc₁ sc₂).dec_length h
+  have hBeq : Nat.beq bs.length (n₁ + pad + n₂) = true := by
+    rw [hLen]
+    exact Nat.beq_refl (n₁ + pad + n₂)
+  change (match Nat.beq bs.length (n₁ + pad + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
+      | none => none
+      | some a =>
+        match sc₂.dec ((bs.drop (n₁ + pad)).take n₂) with
+        | none => none
+        | some b => some (a, b)) = some x at h
+  rw [hBeq] at h
+  dsimp only at h
+  cases hA : sc₁.dec ((bs.drop 0).take n₁) with
+  | none =>
+    rw [hA] at h
+    cases h
+  | some a =>
+    rw [hA] at h
+    dsimp only at h
+    cases hB : sc₂.dec ((bs.drop (n₁ + pad)).take n₂) with
+    | none =>
+      rw [hB] at h
+      cases h
+    | some b =>
+      rw [hB] at h
+      have hX : (a, b) = x := Option.some.inj h
+      rw [← hX]
+      exact ⟨hLen, rfl, rfl⟩
+
+/-- A padded pair decodes when the slice has width `n₁ + pad + n₂` and both
+field slices decode (regardless of the `pad` padding bytes). -/
+theorem SliceCodec.paddedPair_dec_of {Byte : Type w} {α : Type a}
+    {β : Type b} {n₁ n₂ : Nat} {pad : Nat} {padByte : Byte}
+    {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {bs : List Byte} {a : α} {b : β} (hLen : bs.length = n₁ + pad + n₂)
+    (hA : sc₁.dec ((bs.drop 0).take n₁) = some a)
+    (hB : sc₂.dec ((bs.drop (n₁ + pad)).take n₂) = some b) :
+    (SliceCodec.paddedPair pad padByte sc₁ sc₂).dec bs = some (a, b) := by
+  have hBeq : Nat.beq bs.length (n₁ + pad + n₂) = true := by
+    rw [hLen]
+    exact Nat.beq_refl (n₁ + pad + n₂)
+  change (match Nat.beq bs.length (n₁ + pad + n₂) with
+    | false => none
+    | true =>
+      match sc₁.dec ((bs.drop 0).take n₁) with
+      | none => none
+      | some a =>
+        match sc₂.dec ((bs.drop (n₁ + pad)).take n₂) with
+        | none => none
+        | some b => some (a, b)) = some (a, b)
+  rw [hBeq]
+  dsimp only
+  rw [hA]
+  dsimp only
+  rw [hB]
+
+/-- Padding boundary theorem (`FromBytes` vs `IntoBytes`): a padded pair with
+positive padding `0 < pad` is never `Exact` whenever the byte type has two
+distinct slots (such as `.uninit` vs an initialized byte) and both fields are
+inhabited. -/
+theorem SliceCodec.paddedPair_not_exact_of_distinct {Byte : Type w}
+    {α : Type a} {β : Type b} {n₁ n₂ pad : Nat} {padByte altByte : Byte}
+    (sc₁ : SliceCodec Byte α n₁) (sc₂ : SliceCodec Byte β n₂)
+    (hPad : 0 < pad) (hNe : padByte ≠ altByte) (a : α) (b : β) :
+    ¬ (SliceCodec.paddedPair pad padByte sc₁ sc₂).Exact := by
+  intro hExact
+  let bs : List Byte :=
+    sc₁.enc a ++ listReplicate pad altByte ++ sc₂.enc b
+  have hPreLen : (sc₁.enc a ++ listReplicate pad altByte).length =
+      n₁ + pad := by
+    rw [List.length_append, sc₁.enc_length, listReplicate_length]
+  have hLen : bs.length = n₁ + pad + n₂ := by
+    change (sc₁.enc a ++ listReplicate pad altByte ++ sc₂.enc b).length = _
+    rw [List.length_append, hPreLen, sc₂.enc_length]
+  have hA : sc₁.dec ((bs.drop 0).take n₁) = some a := by
+    have hSlice : (bs.drop 0).take n₁ = sc₁.enc a := by
+      change (sc₁.enc a ++ listReplicate pad altByte ++ sc₂.enc b).take n₁ =
+        sc₁.enc a
+      rw [List.append_assoc]
+      exact listTake_append_of_len n₁ _ _ (sc₁.enc_length a)
+    rw [hSlice]
+    exact sc₁.dec_enc a
+  have hB : sc₂.dec ((bs.drop (n₁ + pad)).take n₂) = some b := by
+    have hSlice : (bs.drop (n₁ + pad)).take n₂ = sc₂.enc b := by
+      change ((sc₁.enc a ++ listReplicate pad altByte ++ sc₂.enc b).drop
+        (n₁ + pad)).take n₂ = sc₂.enc b
+      rw [listDrop_append_of_len (n₁ + pad) _ _ hPreLen]
+      exact (congrArg (fun k => (sc₂.enc b).take k)
+        (sc₂.enc_length b).symm).trans (listTake_length_self _)
+    rw [hSlice]
+    exact sc₂.dec_enc b
+  have hEq :
+      sc₁.enc a ++ listReplicate pad padByte ++ sc₂.enc b =
+        sc₁.enc a ++ listReplicate pad altByte ++ sc₂.enc b :=
+    hExact bs (a, b) (SliceCodec.paddedPair_dec_of hLen hA hB)
+  have hDrop := congrArg (List.drop n₁) hEq
+  rw [List.append_assoc (sc₁.enc a), List.append_assoc (sc₁.enc a),
+    listDrop_append_of_len n₁ _ _ (sc₁.enc_length a),
+    listDrop_append_of_len n₁ _ _ (sc₁.enc_length a)] at hDrop
+  cases pad with
+  | zero => exact Nat.lt_irrefl 0 hPad
+  | succ k =>
+    change padByte :: (listReplicate k padByte ++ sc₂.enc b) =
+      altByte :: (listReplicate k altByte ++ sc₂.enc b) at hDrop
+    injection hDrop with hHead _
+    exact hNe hHead
 
 /-- One-byte codec of `Bool` over any byte codec: `false` is `0x00`, `true`
 is `0x01`, and every other bit pattern, like every slot without a value, is
@@ -2962,6 +3298,13 @@ def SliceCodec.bool {Byte : Type w} (c : ByteCodec Byte) :
         | _ => none
     | _ => none
   enc_length _ := rfl
+  dec_length {bs x} h := by
+    cases bs with
+    | nil => cases h
+    | cons _ tl =>
+      cases tl with
+      | nil => rfl
+      | cons _ _ => cases h
   dec_enc x := by
     cases x with
     | false =>
@@ -2988,7 +3331,7 @@ def SliceCodec.bool {Byte : Type w} (c : ByteCodec Byte) :
 /-- `SliceCodec.bool` is exact over an exact byte codec. -/
 theorem SliceCodec.bool_exact {Byte : Type w} {c : ByteCodec Byte}
     (hE : c.Exact) : (SliceCodec.bool c).Exact := by
-  intro bs x _ hDec
+  intro bs x hDec
   cases bs with
   | nil => cases hDec
   | cons b tl =>
@@ -3095,7 +3438,7 @@ theorem setVal_getVal {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
       rw [hGet] at h
       dsimp only at h
       unfold setVal
-      rw [hE bs x ((get_len hGet).trans hLen) h]
+      rw [hE bs x h]
       exact set_get hGet
 
 /-- Generic typed overwrite law for `SliceCodec`. -/
@@ -3169,7 +3512,7 @@ theorem getVal_pair {α : Type a} {β : Type b} {n₁ n₂ : Nat}
     (L.zoom 0 n₁).getVal sc₁ m = some x.1 ∧
       (L.zoom n₁ n₂).getVal sc₂ m = some x.2 := by
   let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
-  let ⟨hA, hB⟩ := SliceCodec.pair_dec_inv hDec
+  let ⟨_, hA, hB⟩ := SliceCodec.pair_dec_inv hDec
   have hSub₁ : 0 + n₁ ≤ L.len := by
     rw [hLen, Nat.zero_add]
     exact Nat.le_add_right n₁ n₂
@@ -3187,7 +3530,7 @@ theorem getVal_pair_setVal_fst {α : Type a} {β : Type b} {n₁ n₂ : Nat}
     (hSet : (L.zoom 0 n₁).setVal sc₁ m a' = some m') :
     L.getVal (sc₁.pair sc₂) m' = some (a', x.2) := by
   let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
-  let ⟨_, hB⟩ := SliceCodec.pair_dec_inv hDec
+  let ⟨hBsN, _, hB⟩ := SliceCodec.pair_dec_inv hDec
   have hBsLen : bs.length = L.len := get_len hGet
   have hEncLen : (sc₁.enc a').length = n₁ := sc₁.enc_length a'
   have hSub₁ : 0 + n₁ ≤ L.len := by
@@ -3199,7 +3542,9 @@ theorem getVal_pair_setVal_fst {α : Type a} {β : Type b} {n₁ n₂ : Nat}
   have hSet' : (L.zoom 0 n₁).set m (sc₁.enc a') = some m' := hSet
   have hGet' : L.get m' = some (listSplice bs 0 (sc₁.enc a')) :=
     get_zoom_set hGet hSub₁ hSet'
-  refine getVal_of hLen hGet' (SliceCodec.pair_dec_of ?_ ?_)
+  have hSpliceLen : (listSplice bs 0 (sc₁.enc a')).length = n₁ + n₂ :=
+    (listSplice_length bs 0 (sc₁.enc a') hBound).trans hBsN
+  refine getVal_of hLen hGet' (SliceCodec.pair_dec_of hSpliceLen ?_ ?_)
   · have hRead := listSplice_read_same bs 0 (sc₁.enc a') hBound
     rw [hEncLen] at hRead
     rw [hRead]
@@ -3221,7 +3566,7 @@ theorem getVal_pair_setVal_snd {α : Type a} {β : Type b} {n₁ n₂ : Nat}
     (hSet : (L.zoom n₁ n₂).setVal sc₂ m b' = some m') :
     L.getVal (sc₁.pair sc₂) m' = some (x.1, b') := by
   let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
-  let ⟨hA, _⟩ := SliceCodec.pair_dec_inv hDec
+  let ⟨hBsN, hA, _⟩ := SliceCodec.pair_dec_inv hDec
   have hBsLen : bs.length = L.len := get_len hGet
   have hEncLen : (sc₂.enc b').length = n₂ := sc₂.enc_length b'
   have hSub₂ : n₁ + n₂ ≤ L.len := Nat.le_of_eq hLen.symm
@@ -3231,11 +3576,108 @@ theorem getVal_pair_setVal_snd {α : Type a} {β : Type b} {n₁ n₂ : Nat}
   have hSet' : (L.zoom n₁ n₂).set m (sc₂.enc b') = some m' := hSet
   have hGet' : L.get m' = some (listSplice bs n₁ (sc₂.enc b')) :=
     get_zoom_set hGet hSub₂ hSet'
-  refine getVal_of hLen hGet' (SliceCodec.pair_dec_of ?_ ?_)
+  have hSpliceLen : (listSplice bs n₁ (sc₂.enc b')).length = n₁ + n₂ :=
+    (listSplice_length bs n₁ (sc₂.enc b') hBound).trans hBsN
+  refine getVal_of hLen hGet' (SliceCodec.pair_dec_of hSpliceLen ?_ ?_)
   · rw [listSplice_read_disjoint bs n₁ (sc₂.enc b') 0 n₁ hBound
       (Or.inr (Nat.le_of_eq (Nat.zero_add n₁)))]
     exact hA
   · have hRead := listSplice_read_same bs n₁ (sc₂.enc b') hBound
+    rw [hEncLen] at hRead
+    rw [hRead]
+    exact sc₂.dec_enc b'
+
+/-- Field projection of a padded-pair view: reads the two fields through
+`L.zoom 0 n₁` and `L.zoom (n₁ + pad) n₂`, ignoring the padding bytes. -/
+theorem getVal_paddedPair {α : Type a} {β : Type b} {n₁ n₂ pad : Nat}
+    {padByte : Byte} {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {L : ByteSubLens Addr} {m : Mem} {x : α × β}
+    (hPos₁ : 0 < n₁) (hPos₂ : 0 < n₂)
+    (h : L.getVal (SliceCodec.paddedPair pad padByte sc₁ sc₂) m = some x) :
+    (L.zoom 0 n₁).getVal sc₁ m = some x.1 ∧
+      (L.zoom (n₁ + pad) n₂).getVal sc₂ m = some x.2 := by
+  let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
+  let ⟨_, hA, hB⟩ := SliceCodec.paddedPair_dec_inv hDec
+  have hSub₁ : 0 + n₁ ≤ L.len := by
+    rw [hLen, Nat.zero_add]
+    exact Nat.le_trans (Nat.le_add_right n₁ pad)
+      (Nat.le_add_right (n₁ + pad) n₂)
+  have hSub₂ : (n₁ + pad) + n₂ ≤ L.len := Nat.le_of_eq hLen.symm
+  exact ⟨getVal_of rfl (zoom_get hGet hPos₁ hSub₁) hA,
+    getVal_of rfl (zoom_get hGet hPos₂ hSub₂) hB⟩
+
+/-- Field update of a padded-pair view, first component: writing the first
+field through `L.zoom 0 n₁` updates that field and preserves both the second
+field and the padding bytes. -/
+theorem getVal_paddedPair_setVal_fst {α : Type a} {β : Type b}
+    {n₁ n₂ pad : Nat} {padByte : Byte}
+    {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {L : ByteSubLens Addr} {m m' : Mem} {x : α × β} {a' : α}
+    (h : L.getVal (SliceCodec.paddedPair pad padByte sc₁ sc₂) m = some x)
+    (hSet : (L.zoom 0 n₁).setVal sc₁ m a' = some m') :
+    L.getVal (SliceCodec.paddedPair pad padByte sc₁ sc₂) m' =
+      some (a', x.2) := by
+  let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
+  let ⟨hBsN, _, hB⟩ := SliceCodec.paddedPair_dec_inv hDec
+  have hBsLen : bs.length = L.len := get_len hGet
+  have hEncLen : (sc₁.enc a').length = n₁ := sc₁.enc_length a'
+  have hSub₁ : 0 + n₁ ≤ L.len := by
+    rw [hLen, Nat.zero_add]
+    exact Nat.le_trans (Nat.le_add_right n₁ pad)
+      (Nat.le_add_right (n₁ + pad) n₂)
+  have hBound : 0 + (sc₁.enc a').length ≤ bs.length := by
+    rw [hEncLen, hBsLen]
+    exact hSub₁
+  have hSet' : (L.zoom 0 n₁).set m (sc₁.enc a') = some m' := hSet
+  have hGet' : L.get m' = some (listSplice bs 0 (sc₁.enc a')) :=
+    get_zoom_set hGet hSub₁ hSet'
+  have hSpliceLen : (listSplice bs 0 (sc₁.enc a')).length = n₁ + pad + n₂ :=
+    (listSplice_length bs 0 (sc₁.enc a') hBound).trans hBsN
+  refine getVal_of hLen hGet' (SliceCodec.paddedPair_dec_of hSpliceLen ?_ ?_)
+  · have hRead := listSplice_read_same bs 0 (sc₁.enc a') hBound
+    rw [hEncLen] at hRead
+    rw [hRead]
+    exact sc₁.dec_enc a'
+  · have hSep : 0 + (sc₁.enc a').length ≤ n₁ + pad := by
+      rw [hEncLen, Nat.zero_add]
+      exact Nat.le_add_right n₁ pad
+    rw [listSplice_read_disjoint bs 0 (sc₁.enc a') (n₁ + pad) n₂ hBound
+      (Or.inl hSep)]
+    exact hB
+
+/-- Field update of a padded-pair view, second component: writing the second
+field through `L.zoom (n₁ + pad) n₂` updates that field and preserves both the
+first field and the padding bytes. -/
+theorem getVal_paddedPair_setVal_snd {α : Type a} {β : Type b}
+    {n₁ n₂ pad : Nat} {padByte : Byte}
+    {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {L : ByteSubLens Addr} {m m' : Mem} {x : α × β} {b' : β}
+    (h : L.getVal (SliceCodec.paddedPair pad padByte sc₁ sc₂) m = some x)
+    (hSet : (L.zoom (n₁ + pad) n₂).setVal sc₂ m b' = some m') :
+    L.getVal (SliceCodec.paddedPair pad padByte sc₁ sc₂) m' =
+      some (x.1, b') := by
+  let ⟨hLen, bs, hGet, hDec⟩ := getVal_inv h
+  let ⟨hBsN, hA, _⟩ := SliceCodec.paddedPair_dec_inv hDec
+  have hBsLen : bs.length = L.len := get_len hGet
+  have hEncLen : (sc₂.enc b').length = n₂ := sc₂.enc_length b'
+  have hSub₂ : (n₁ + pad) + n₂ ≤ L.len := Nat.le_of_eq hLen.symm
+  have hBound : (n₁ + pad) + (sc₂.enc b').length ≤ bs.length := by
+    rw [hEncLen, hBsLen]
+    exact hSub₂
+  have hSet' : (L.zoom (n₁ + pad) n₂).set m (sc₂.enc b') = some m' := hSet
+  have hGet' : L.get m' = some (listSplice bs (n₁ + pad) (sc₂.enc b')) :=
+    get_zoom_set hGet hSub₂ hSet'
+  have hSpliceLen :
+      (listSplice bs (n₁ + pad) (sc₂.enc b')).length = n₁ + pad + n₂ :=
+    (listSplice_length bs (n₁ + pad) (sc₂.enc b') hBound).trans hBsN
+  refine getVal_of hLen hGet' (SliceCodec.paddedPair_dec_of hSpliceLen ?_ ?_)
+  · have hSep : 0 + n₁ ≤ n₁ + pad := by
+      rw [Nat.zero_add]
+      exact Nat.le_add_right n₁ pad
+    rw [listSplice_read_disjoint bs (n₁ + pad) (sc₂.enc b') 0 n₁ hBound
+      (Or.inr hSep)]
+    exact hA
+  · have hRead := listSplice_read_same bs (n₁ + pad) (sc₂.enc b') hBound
     rw [hEncLen] at hRead
     rw [hRead]
     exact sc₂.dec_enc b'
@@ -3416,6 +3858,62 @@ theorem execMutSummary_frame_getUInt64_disjoint {c : ByteCodec Byte}
     other.getUInt64 c m' = other.getUInt64 c m := by
   let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
   exact ByteSubLens.getUInt64_set_disjoint hDisj hSet
+
+/-- Builds a byte-level `MutSummary` directly from a typed `SliceCodec` and a
+typed state transformer `fn : α → Arg → Option (α × Ret)`, so callers never
+destructure raw byte lists when specifying typed field mutations. -/
+def MutSummary.ofSliceCodec {Byte : Type u} {α : Type x} {n : Nat}
+    {Arg : Type a} {Ret : Type b} (sc : SliceCodec Byte α n)
+    (fn : α → Arg → Option (α × Ret)) : MutSummary Byte Arg Ret where
+  len := n
+  summaryFn old arg :=
+    match sc.dec old with
+    | none => none
+    | some v =>
+      match fn v arg with
+      | none => none
+      | some (v', ret) => some (sc.enc v', ret)
+
+/-- Target post-view theorem for `MutSummary.ofSliceCodec`: executing a
+`SliceCodec`-backed summary directly yields the typed pre-value `v`, the
+typed step `fn v arg = some (v', ret)`, the typed write `L.setVal sc m v'`,
+and the typed post-view `L.getVal sc m' = some v'`, without exposing raw
+bytes. -/
+theorem execMutSummary_ofSliceCodec_target {α : Type x} {n : Nat}
+    {sc : SliceCodec Byte α n} {fn : α → Arg → Option (α × Ret)}
+    {L : ByteSubLens Addr} {m m' : Mem} {arg : Arg} {ret : Ret}
+    (h : execMutSummary (MutSummary.ofSliceCodec sc fn) L m arg =
+      some (m', ret)) :
+    ∃ v v' : α, L.getVal sc m = some v ∧ fn v arg = some (v', ret) ∧
+      L.setVal sc m v' = some m' ∧ L.getVal sc m' = some v' := by
+  let ⟨hLen, old, new, hGet, hSum, hSet⟩ := execMutSummary_inv h
+  unfold MutSummary.ofSliceCodec at hSum
+  dsimp only at hSum
+  cases hDec : sc.dec old with
+  | none =>
+    rw [hDec] at hSum
+    cases hSum
+  | some v =>
+    rw [hDec] at hSum
+    dsimp only at hSum
+    cases hFn : fn v arg with
+    | none =>
+      rw [hFn] at hSum
+      cases hSum
+    | some pair =>
+      rw [hFn] at hSum
+      cases pair with
+      | mk v' r =>
+        have hPair : (sc.enc v', r) = (new, ret) := Option.some.inj hSum
+        have hNew : sc.enc v' = new := congrArg Prod.fst hPair
+        have hR : r = ret := congrArg Prod.snd hPair
+        have hSetVal : L.setVal sc m v' = some m' := by
+          unfold ByteSubLens.setVal
+          rw [hNew]
+          exact hSet
+        rw [hR] at hFn
+        exact ⟨v, v', ByteSubLens.getVal_of hLen hGet hDec, hFn, hSetVal,
+          ByteSubLens.getVal_setVal hSetVal⟩
 
 /-- Commutation of two disjoint summary executions: executing `sum₁` on `L₁`
 and `sum₂` on a non-interfering lens `L₂` produces the same final memory and
@@ -4819,13 +5317,18 @@ theorem outcomeToy_panic_refutes_cut :
 
 /-- `SliceCodec` non-vacuity canary: little-endian `BitVec 32` through
 `SliceCodec.ofByteCodecLe` obeys exact read-after-write, write-after-read,
-and disjoint-window framing over `SliceStore (BitVec 8)`. -/
+disjoint-window framing, and rejects short (`[]`, 3-byte) and over-long
+(5-byte) slices by `rfl`. -/
 theorem sliceCodec_le_canary :
     let scLo := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 4
     let scHi := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 2
     let lo : ByteSubLens Nat := { addr := 3, offset := 0, len := 4 }
     let hi : ByteSubLens Nat := { addr := 3, offset := 4, len := 2 }
     let x : BitVec 32 := BitVec.ofNat 32 0x11223344
+    scLo.dec [] = none ∧
+    scLo.dec [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3] = none ∧
+    scLo.dec [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3,
+      BitVec.ofNat 8 4, BitVec.ofNat 8 5] = none ∧
     ∃ m', lo.setVal scLo canaryWordStore x = some m' ∧
       lo.getVal scLo m' = some x ∧
       lo.setVal scLo m' x = some m' ∧
@@ -4848,16 +5351,22 @@ theorem sliceCodec_le_canary :
       (ByteSubLens.separated_of_natLensSeparatedBool (L₁ := lo) (L₂ := hi) rfl)
   have hHi : hi.getVal scHi m' = some (BitVec.ofNat 16 0xBEEF) :=
     (ByteSubLens.getVal_set_disjoint hDisj hSet).trans rfl
-  exact ⟨m', hSet, hGet, ByteSubLens.setVal_getVal hExact hGet, hHi⟩
+  exact ⟨rfl, rfl, rfl, m', hSet, hGet, ByteSubLens.setVal_getVal hExact hGet,
+    hHi⟩
 
 /-- Struct-view canary: the canary word store read as the pair of a
-little-endian `u32` field and a `u16` field. The pair view is evaluated by
-`rfl`. A write of the `u16` field through its sub-lens then updates the pair
-view and keeps the `u32` field by `ByteSubLens.getVal_pair_setVal_snd`, and
-the `u32` field is recovered through its own sub-lens by
+little-endian `u32` field and a `u16` field, rejecting empty and over-long
+slices by `rfl`. A write of the `u16` field through its sub-lens updates the
+pair view and keeps the `u32` field by `ByteSubLens.getVal_pair_setVal_snd`,
+and the `u32` field is recovered through its own sub-lens by
 `ByteSubLens.getVal_pair`, without evaluating the write or looking at the
 bytes. -/
 theorem sliceCodec_pair_canary :
+    ((SliceCodec.ofByteCodecLe ByteCodec.bitVec8 4).pair
+      (SliceCodec.ofByteCodecLe ByteCodec.bitVec8 2)).dec [] = none ∧
+    ((SliceCodec.bool ByteCodec.bitVec8).pair
+      (SliceCodec.bool ByteCodec.bitVec8)).dec
+      [BitVec.ofNat 8 0, BitVec.ofNat 8 1, BitVec.ofNat 8 255] = none ∧
     (ByteSubLens.mk 3 0 6).getVal
         ((SliceCodec.ofByteCodecLe ByteCodec.bitVec8 4).pair
           (SliceCodec.ofByteCodecLe ByteCodec.bitVec8 2)) canaryWordStore =
@@ -4885,7 +5394,7 @@ theorem sliceCodec_pair_canary :
   have hPair' : L.getVal (scLo.pair scHi) m' =
       some (BitVec.ofNat 32 0x12345678, BitVec.ofNat 16 0xCAFE) :=
     ByteSubLens.getVal_pair_setVal_snd hPair hSet
-  exact ⟨hPair, m', hSet, hPair',
+  exact ⟨rfl, rfl, hPair, m', hSet, hPair',
     (ByteSubLens.getVal_pair (by decide) (by decide) hPair').1⟩
 
 /-- Validity-invariant canary: `SliceCodec.bool` decodes `0x00` and `0x01`,
@@ -4901,5 +5410,103 @@ theorem sliceCodec_bool_canary :
       canaryWordStore = none ∧
     (SliceCodec.bool ByteCodec.bitVec8).Exact :=
   ⟨rfl, rfl, rfl, rfl, rfl, SliceCodec.bool_exact ByteCodec.bitVec8_exact⟩
+
+/-- Padded-struct canary modeling Rust's `(Bool, u32)` layout (`1 + 3 + 4`
+bytes) over `SliceStore (Option UInt8)` with `none` (uninitialized) padding:
+decoding succeeds despite uninitialized padding, updating the `u32` field
+updates the pair view while preserving both the `Bool` field and the `none`
+padding bytes, and the padded codec is provably not `Exact`. -/
+theorem sliceCodec_paddedPair_canary :
+    let c := ByteCodec.option ByteCodec.uint8
+    let sc := SliceCodec.paddedPair 3 (none : Option UInt8)
+      (SliceCodec.bool c) (SliceCodec.uint32 c)
+    let st : SliceStore (Option UInt8) :=
+      { allocs :=
+          [{ allocId := 4,
+             bytes := [some 1, none, none, none,
+               some 0x78, some 0x56, some 0x34, some 0x12],
+             writable := true }] }
+    let L : ByteSubLens Nat := { addr := 4, offset := 0, len := 8 }
+    let padL : ByteSubLens Nat := L.zoom 1 3
+    L.getVal sc st = some (true, (0x12345678 : UInt32)) ∧
+    ¬ sc.Exact ∧
+    ∃ m', (L.zoom 4 4).setVal (SliceCodec.uint32 c) st (0xCAFEBABE : UInt32) =
+        some m' ∧
+      L.getVal sc m' = some (true, (0xCAFEBABE : UInt32)) ∧
+      padL.get m' = some [none, none, none] := by
+  let c := ByteCodec.option ByteCodec.uint8
+  let sc := SliceCodec.paddedPair 3 (none : Option UInt8)
+    (SliceCodec.bool c) (SliceCodec.uint32 c)
+  let st : SliceStore (Option UInt8) :=
+    { allocs :=
+        [{ allocId := 4,
+           bytes := [some 1, none, none, none,
+             some 0x78, some 0x56, some 0x34, some 0x12],
+           writable := true }] }
+  let L : ByteSubLens Nat := { addr := 4, offset := 0, len := 8 }
+  let padL : ByteSubLens Nat := L.zoom 1 3
+  have hInit : L.getVal sc st = some (true, (0x12345678 : UInt32)) := rfl
+  have hNotExact : ¬ sc.Exact :=
+    SliceCodec.paddedPair_not_exact_of_distinct (altByte := some (0 : UInt8))
+      (SliceCodec.bool c) (SliceCodec.uint32 c) (by decide)
+      (fun h => by cases h) false (0 : UInt32)
+  have hGet2 : (L.zoom 4 4).get st =
+      some [some 0x78, some 0x56, some 0x34, some 0x12] := rfl
+  let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get (L := L.zoom 4 4) (m := st)
+    ((SliceCodec.uint32 c).enc (0xCAFEBABE : UInt32)) hGet2
+    ((SliceCodec.uint32 c).enc_length _)
+  have hUpdated : L.getVal sc m' = some (true, (0xCAFEBABE : UInt32)) :=
+    ByteSubLens.getVal_paddedPair_setVal_snd hInit hSet
+  have hDisjPad : ByteSubLens.Disjoint (SliceStore (Option UInt8))
+      (L.zoom 4 4) padL :=
+    ByteSubLens.disjoint_of_separated
+      (ByteSubLens.separated_of_natLensSeparatedBool
+        (L₁ := L.zoom 4 4) (L₂ := padL) rfl)
+  have hPad : padL.get m' = some [none, none, none] :=
+    (ByteSubLens.get_set_disjoint hDisjPad hSet).trans rfl
+  exact ⟨hInit, hNotExact, m', hSet, hUpdated, hPad⟩
+
+/-- Typed summary canary exercising `MutSummary.ofSliceCodec` and
+`execMutSummary_ofSliceCodec_target`: mutating the `u32` field of
+`canaryWordStore` updates its `UInt32` view and frames the adjacent `UInt16`
+field without destructuring raw byte lists. -/
+theorem mutSummary_ofSliceCodec_canary :
+    let scU32 := SliceCodec.uint32 ByteCodec.bitVec8
+    let sum := MutSummary.ofSliceCodec scU32
+      (fun (v : UInt32) (d : UInt32) => some (v + d, v))
+    let lo : ByteSubLens Nat := { addr := 3, offset := 0, len := 4 }
+    let hi : ByteSubLens Nat := { addr := 3, offset := 4, len := 2 }
+    ∃ m', execMutSummary sum lo canaryWordStore (1 : UInt32) =
+        some (m', (0x12345678 : UInt32)) ∧
+      lo.getVal scU32 m' = some (0x12345679 : UInt32) ∧
+      hi.getUInt16 ByteCodec.bitVec8 m' = some (0xBEEF : UInt16) := by
+  let scU32 := SliceCodec.uint32 ByteCodec.bitVec8
+  let sum := MutSummary.ofSliceCodec scU32
+    (fun (v : UInt32) (d : UInt32) => some (v + d, v))
+  let lo : ByteSubLens Nat := { addr := 3, offset := 0, len := 4 }
+  let hi : ByteSubLens Nat := { addr := 3, offset := 4, len := 2 }
+  let m' : SliceStore (BitVec 8) :=
+    { allocs :=
+        [{ allocId := 3,
+           bytes := [BitVec.ofNat 8 0x79, BitVec.ofNat 8 0x56,
+             BitVec.ofNat 8 0x34, BitVec.ofNat 8 0x12, BitVec.ofNat 8 0xEF,
+             BitVec.ofNat 8 0xBE],
+           writable := true }] }
+  have hExec : execMutSummary sum lo canaryWordStore (1 : UInt32) =
+      some (m', (0x12345678 : UInt32)) := rfl
+  let ⟨v, v', hGet0, hFn, _, hPost⟩ :=
+    execMutSummary_ofSliceCodec_target hExec
+  have hV : v = (0x12345678 : UInt32) :=
+    Option.some.inj (hGet0.symm.trans rfl)
+  have hV' : v' = (0x12345679 : UInt32) := by
+    rw [hV] at hFn
+    exact (congrArg Prod.fst (Option.some.inj hFn)).symm
+  rw [hV'] at hPost
+  have hDisj : ByteSubLens.Disjoint (SliceStore (BitVec 8)) lo hi :=
+    ByteSubLens.disjoint_of_separated
+      (ByteSubLens.separated_of_natLensSeparatedBool (L₁ := lo) (L₂ := hi) rfl)
+  have hFrame : hi.getUInt16 ByteCodec.bitVec8 m' = some (0xBEEF : UInt16) :=
+    (execMutSummary_frame_getUInt16_disjoint hDisj hExec).trans rfl
+  exact ⟨m', hExec, hPost, hFrame⟩
 
 end Anneal.ParametricCore

@@ -330,6 +330,39 @@ theorem StepStageCut.to_wpOutcome_of_step {ops : MirWpOps S Out Fault}
     wpOutcome (ops := ops) onDone onFault s₀ :=
   StepStageCut.to_wpUntil_of_step hSim hCut h
 
+/-- Step-counted eliminator for `StepStageCut` (`0` axioms): transports a
+sealed stage cut into any external exact-step relation `R : S → Nat → S → Prop`
+(such as `PureLift`'s `StepPath`), yielding an exact step count `k ≤ fuel`
+without unsealing `StepStageCut`. -/
+theorem StepStageCut.induction {step : S → StepOutcome S Out Fault}
+    {R : S → Nat → S → Prop}
+    (hRefl : ∀ s, R s 0 s)
+    (hStep : ∀ s s' t k, step s = .step s' → R s' k t → R s (k + 1) t)
+    {fuel : Nat} {s₀ s₁ : S} (hCut : StepStageCut step fuel s₀ s₁) :
+    ∃ k, k ≤ fuel ∧ R s₀ k s₁ := by
+  induction fuel generalizing s₀ with
+  | zero =>
+    have hEq : s₀ = s₁ := reachStepIn_zero_iff.mp hCut
+    rw [hEq]
+    exact ⟨0, Nat.le_refl 0, hRefl s₁⟩
+  | succ fuel ih =>
+    cases reachStepIn_succ_iff.mp hCut with
+    | inl hEq =>
+      rw [hEq]
+      exact ⟨0, Nat.zero_le (fuel + 1), hRefl s₁⟩
+    | inr hSt =>
+      cases hEv : step s₀ with
+      | step st' =>
+        rw [hEv] at hSt
+        let ⟨k, hLe, hR⟩ := ih hSt
+        exact ⟨k + 1, Nat.succ_le_succ hLe, hStep s₀ st' s₁ k hEv hR⟩
+      | done _ =>
+        rw [hEv] at hSt
+        exact False.elim hSt
+      | fault _ =>
+        rw [hEv] at hSt
+        exact False.elim hSt
+
 /-- Kernel evaluation yields a `StepStageCut`: if `runToCut` over the
 successor function of `step` stops at the cutpoint state `s₁`, then `s₀`
 reaches `s₁` within the same budget. The hypothesis is closed by `rfl` on a
@@ -662,6 +695,99 @@ theorem stageCut_of_evalChunk8BlockTreeFromCut {BB : Type x}
   stageCut_of_chunk8BlockTree_forced blocks stepWith
     (stepStageCut_of_runFromCut_cut h)
 
+/-- `0 Quot.sound` pointwise stage cut from any pre-built `ValidBlockTree`,
+avoiding repeated `BlockTree.ofList` construction across stages. -/
+theorem stageCut_of_validBlockTreeToCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeToCut bt stepWith StepOutcome.next? blockOf cuts fuel
+      s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))).mp
+    (stepStageCut_of_runToCut_cut h)
+
+/-- `0 Quot.sound` pointwise `FromCut` stage cut from a pre-built
+`ValidBlockTree`. -/
+theorem stageCut_of_validBlockTreeFromCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut bt stepWith StepOutcome.next? blockOf cuts fuel
+      s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))).mp
+    (stepStageCut_of_runFromCut_cut h)
+
+/-- Stage cut from a pre-built `ValidBlockTree` via `evalBlockTreeToCut`. -/
+theorem stageCut_of_validBlockTreeToCut {BB : Type x} {blocks : List BB}
+    {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeToCut bt stepWith StepOutcome.next? blockOf cuts fuel
+      s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => congrArg (fun f => stepWith f st)
+      (BlockTree.lookupForced?_eq_fun hValid))).mp
+    (stepStageCut_of_runToCut_cut h)
+
+/-- Stage cut from a pre-built `ValidBlockTree` via
+`evalBlockTreeFromCut`. -/
+theorem stageCut_of_validBlockTreeFromCut {BB : Type x} {blocks : List BB}
+    {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut bt stepWith StepOutcome.next? blockOf cuts fuel
+      s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => congrArg (fun f => stepWith f st)
+      (BlockTree.lookupForced?_eq_fun hValid))).mp
+    (stepStageCut_of_runFromCut_cut h)
+
+/-- `0 Quot.sound` pointwise stage cut from a pre-built
+`ValidChunk8BlockTree`. -/
+theorem stageCut_of_validChunk8BlockTreeToCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeToCut bt stepWith StepOutcome.next? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))).mp
+    (stepStageCut_of_runToCut_cut h)
+
+/-- `0 Quot.sound` pointwise `FromCut` stage cut from a pre-built
+`ValidChunk8BlockTree`. -/
+theorem stageCut_of_validChunk8BlockTreeFromCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeFromCut bt stepWith StepOutcome.next? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => hPointwise _ _ st (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i)))).mp
+    (stepStageCut_of_runFromCut_cut h)
+
 /-- Bridge a `BlockTree`-evaluated stage directly into a checkpoint proof of
 the list-backed deterministic interface. -/
 theorem wpUntil_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
@@ -869,6 +995,41 @@ theorem stepFrameOn_ofDetStep_proj
     (ofDetStep step tag).StepFrameOn A (fun s => proj s = v) :=
   stepFrameOn_ofDetStep
     (fun s s' hA hF hS => (hFrame s s' hA hS).trans hF)
+
+/-- Frame of a `valid`-quantified interface: it suffices that every `.step`
+transition under an admissible choice from a region state preserves `F`. -/
+theorem stepFrameOn_ofChoiceStep (Choice : Type x)
+    (valid : State → Choice → Prop)
+    (step : Choice → State → StepOutcome State Out Fault)
+    (tag : State → Option Nat) {A F : State → Prop}
+    (hFrame : ∀ s c s', A s → F s → valid s c → step c s = .step s' → F s') :
+    (ofChoiceStep Choice valid step tag).StepFrameOn A F := by
+  intro s K Q R hA hF hStep
+  refine ⟨hStep.1, fun c hc => ?_⟩
+  have hWp : (step c s).wp K Q R := hStep.2 c hc
+  change (step c s).wp (fun s' => K s' ∧ F s') Q R
+  cases hS : step c s with
+  | step s' =>
+    rw [hS] at hWp
+    exact ⟨hWp, hFrame s c s' hA hF hc hS⟩
+  | done o =>
+    rw [hS] at hWp
+    exact hWp
+  | fault e =>
+    rw [hS] at hWp
+    exact hWp
+
+/-- Projection frame of a `valid`-quantified interface. -/
+theorem stepFrameOn_ofChoiceStep_proj (Choice : Type x)
+    (valid : State → Choice → Prop)
+    (step : Choice → State → StepOutcome State Out Fault)
+    (tag : State → Option Nat) {A : State → Prop} {V : Sort x}
+    {proj : State → V}
+    (hFrame : ∀ s c s', A s → valid s c → step c s = .step s' →
+      proj s' = proj s) (v : V) :
+    (ofChoiceStep Choice valid step tag).StepFrameOn A (fun s => proj s = v) :=
+  stepFrameOn_ofChoiceStep Choice valid step tag
+    (fun s c s' hA hF hc hS => (hFrame s c s' hA hc hS).trans hF)
 
 end MirWpOps
 
@@ -1175,6 +1336,100 @@ theorem wpReach_within_of_evalChunk8BlockTreeFromCut {BB : Type x}
     exact h
   exact wpReach_within_of_runFromCut hList
 
+/-- `0 Quot.sound` pointwise region-guarded evaluation over a pre-built
+`ValidBlockTree`, lifted directly into `wpReach` over `ops.within`. -/
+theorem wpReach_within_of_validBlockTreeToCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeToCut bt
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hGuardPw : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) →
+      guardStep region (stepWith f) s = guardStep region (stepWith g) s := by
+    intro f g s hEq
+    unfold guardStep
+    rw [hPointwise f g s hEq]
+  have hList :
+      runToCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalBlockTreeToCut_eq_of_valid_pointwise hValid
+      (fun look => guardStep region (stepWith look)) hGuardPw guardNext?
+      blockOf cuts fuel s₀]
+    exact h
+  exact wpReach_within_of_runToCut hList
+
+/-- `0 Quot.sound` pointwise `FromCut` region-guarded evaluation over a
+pre-built `ValidBlockTree`. -/
+theorem wpReach_within_of_validBlockTreeFromCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut bt
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hGuardPw : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) →
+      guardStep region (stepWith f) s = guardStep region (stepWith g) s := by
+    intro f g s hEq
+    unfold guardStep
+    rw [hPointwise f g s hEq]
+  have hList :
+      runFromCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalBlockTreeFromCut_eq_of_valid_pointwise hValid
+      (fun look => guardStep region (stepWith look)) hGuardPw guardNext?
+      blockOf cuts fuel s₀]
+    exact h
+  exact wpReach_within_of_runFromCut hList
+
+/-- `0 Quot.sound` pointwise region-guarded evaluation over a pre-built
+`ValidChunk8BlockTree`. -/
+theorem wpReach_within_of_validChunk8BlockTreeToCut_of_pointwise {BB : Type x}
+    {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeToCut bt
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hGuardPw : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) →
+      guardStep region (stepWith f) s = guardStep region (stepWith g) s := by
+    intro f g s hEq
+    unfold guardStep
+    rw [hPointwise f g s hEq]
+  have hList :
+      runToCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalChunk8BlockTreeToCut_eq_of_valid_pointwise hValid
+      (fun look => guardStep region (stepWith look)) hGuardPw guardNext?
+      blockOf cuts fuel s₀]
+    exact h
+  exact wpReach_within_of_runToCut hList
+
 end GuardedRun
 
 /-! ## Part IV: Fuel-Free Stage Cuts over `MirWpOps` (`StageCut`) -/
@@ -1212,6 +1467,16 @@ theorem StageCut.elim {entry cut : State → Prop} {onDone : Out → Prop}
     {onFault : Fault → Prop} (h : StageCut entry cut onDone onFault)
     {s : State} (hs : entry s) : wpUntil cut onDone onFault s :=
   h s hs
+
+/-- Seal a pure reachability family `wpReach` into a `StageCut` for arbitrary
+`onDone` and `onFault`. -/
+theorem StageCut.of_wpReach {entry cut : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (h : ∀ s, entry s → wpReach (ops := ops) cut s) :
+    StageCut entry cut onDone onFault :=
+  fun s hs =>
+    wpUntil_mono (fun _ hc => hc) (fun _ hf => False.elim hf)
+      (fun _ hf => False.elim hf) (h s hs)
 
 /-- A stage whose entry states are already cutpoint states. -/
 theorem stageCut_of_imp {entry cut : State → Prop} {onDone : Out → Prop}
@@ -1611,6 +1876,19 @@ theorem DetStageCut.to_stageCut_of_step {ops : MirWpOps S Out Fault}
   let ⟨_, h'⟩ := hCut
   exact StageCut.of_stepStageCut_of_step hSim h'
 
+/-- Step-counted eliminator for `DetStageCut` (`0` axioms): transports a
+fuel-free deterministic stage cut into any step-indexed path relation
+`R : S → Nat → S → Prop` (such as `PureLift`'s `StepPath`). -/
+theorem DetStageCut.induction {step : S → StepOutcome S Out Fault}
+    {R : S → Nat → S → Prop}
+    (hRefl : ∀ s, R s 0 s)
+    (hStep : ∀ s s' t k, step s = .step s' → R s' k t → R s (k + 1) t)
+    {s₀ s₁ : S} (hCut : DetStageCut step s₀ s₁) :
+    ∃ k, R s₀ k s₁ := by
+  let ⟨_, h'⟩ := hCut
+  let ⟨k, _, hR⟩ := StepStageCut.induction hRefl hStep h'
+  exact ⟨k, hR⟩
+
 end DetStageCutLaws
 
 attribute [irreducible] DetStageCut
@@ -1850,36 +2128,57 @@ block `6`. -/
 def diamondCuts : MaskTree :=
   MaskTree.ofList [false, false, false, true, false, false, true]
 
-/-- Stage 1, zero arm, evaluated through the `BlockTree` by `rfl` on a state
-whose `y` and `z` are symbolic. -/
+/-- Pre-built `BlockTree` for `diamondBlocks`, shared across all stages. -/
+def diamondBt : BlockTree DiamondBlock :=
+  BlockTree.ofList diamondBlocks
+
+/-- Validity of `diamondBt` with respect to `diamondBlocks`. -/
+theorem diamondBt_valid : ValidBlockTree diamondBlocks diamondBt :=
+  valid_blockTree_ofList diamondBlocks
+
+/-- `diamondStepWith` depends on its block lookup only pointwise (`0`
+`Quot.sound`). -/
+theorem diamondStepWith_pointwise (f g : Nat → Option DiamondBlock)
+    (s : DiamondState) (h : ∀ i, f i = g i) :
+    diamondStepWith f s = diamondStepWith g s := by
+  unfold diamondStepWith
+  rw [h s.block]
+
+/-- Stage 1, zero arm, evaluated through pre-built `diamondBt` by `rfl` on a
+state whose `y` and `z` are symbolic (`0 Quot.sound`). -/
 theorem diamond_stage1_zero (y z : Nat) :
     StepStageCut diamondStep 2 { block := 0, x := 0, y := y, z := z }
       { block := 3, x := 0, y := 10, z := z } :=
-  stageCut_of_evalBlockTreeToCut diamondBlocks diamondStepWith
-    (blockOf := fun s => s.block) (cuts := diamondCuts) rfl
+  stageCut_of_validBlockTreeToCut_of_pointwise diamondBt_valid diamondStepWith
+    diamondStepWith_pointwise (blockOf := fun s => s.block)
+    (cuts := diamondCuts) rfl
 
-/-- Stage 1, positive arm. -/
+/-- Stage 1, positive arm (`0 Quot.sound`). -/
 theorem diamond_stage1_pos (n y z : Nat) :
     StepStageCut diamondStep 2 { block := 0, x := n + 1, y := y, z := z }
       { block := 3, x := n + 1, y := 20, z := z } :=
-  stageCut_of_evalBlockTreeToCut diamondBlocks diamondStepWith
-    (blockOf := fun s => s.block) (cuts := diamondCuts) rfl
+  stageCut_of_validBlockTreeToCut_of_pointwise diamondBt_valid diamondStepWith
+    diamondStepWith_pointwise (blockOf := fun s => s.block)
+    (cuts := diamondCuts) rfl
 
 /-- Stage 2, zero arm: from the join block to the return block, evaluated
-directly through `evalBlockTreeFromCut` by `rfl`. -/
+directly through pre-built `diamondBt` and `evalBlockTreeFromCut` by `rfl`
+(`0 Quot.sound`). -/
 theorem diamond_stage2_zero (y z : Nat) :
     StepStageCut diamondStep 3 { block := 3, x := 0, y := y, z := z }
       { block := 6, x := 0, y := y, z := z + y } :=
-  stageCut_of_evalBlockTreeFromCut diamondBlocks diamondStepWith
-    (blockOf := fun s => s.block) (cuts := diamondCuts) (fuel := 2) rfl
+  stageCut_of_validBlockTreeFromCut_of_pointwise diamondBt_valid
+    diamondStepWith diamondStepWith_pointwise (blockOf := fun s => s.block)
+    (cuts := diamondCuts) (fuel := 2) rfl
 
-/-- Stage 2, positive arm, evaluated directly through `evalBlockTreeFromCut`
-by `rfl`. -/
+/-- Stage 2, positive arm, evaluated directly through `diamondBt` and
+`evalBlockTreeFromCut` by `rfl` (`0 Quot.sound`). -/
 theorem diamond_stage2_pos (n y z : Nat) :
     StepStageCut diamondStep 3 { block := 3, x := n + 1, y := y, z := z }
       { block := 6, x := n + 1, y := 1, z := z + 1 } :=
-  stageCut_of_evalBlockTreeFromCut diamondBlocks diamondStepWith
-    (blockOf := fun s => s.block) (cuts := diamondCuts) (fuel := 2) rfl
+  stageCut_of_validBlockTreeFromCut_of_pointwise diamondBt_valid
+    diamondStepWith diamondStepWith_pointwise (blockOf := fun s => s.block)
+    (cuts := diamondCuts) (fuel := 2) rfl
 
 /-- Amount the diamond program adds to `z`. -/
 def diamondDelta (x : Nat) : Nat :=
@@ -1943,16 +2242,16 @@ theorem diamond_stage2 (x z₀ : Nat) :
       exact StepStageCut.to_wpUntil_here (diamond_stage2_pos n y z)
         ⟨rfl, rfl⟩
 
-/-- Stage 1 stays inside blocks `0`, `1` and `2`: evaluated through the
-`BlockTree` with the region-guarded step function, both arms reach the join
-block without leaving the region. -/
+/-- Stage 1 stays inside blocks `0`, `1` and `2`: evaluated through pre-built
+`diamondBt` with the region-guarded step function (`0 Quot.sound`), both arms
+reach the join block without leaving the region. -/
 theorem diamond_stage1_within (x : Nat) :
     StageCut
       (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true))
       (fun s => s.block = 0 ∧ s.x = x)
       (fun s => s.block = 3 ∧ s.x = x ∧ s.y = diamondJoinY x)
       (fun _ => False) (fun _ => False) := by
-  refine StageCut.intro
+  refine StageCut.of_wpReach
     (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true)) ?_
   intro s hs
   cases s with
@@ -1965,7 +2264,8 @@ theorem diamond_stage1_within (x : Nat) :
     | zero =>
       refine wpUntil_mono_stop
         (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true)) ?_
-        (wpReach_within_of_evalBlockTreeToCut diamondBlocks diamondStepWith
+        (wpReach_within_of_validBlockTreeToCut_of_pointwise diamondBt_valid
+          diamondStepWith diamondStepWith_pointwise
           (region := fun s => Nat.blt s.block 3)
           (tag := fun s => some s.block) (blockOf := fun s => s.block)
           (cuts := diamondCuts) (fuel := 2)
@@ -1977,7 +2277,8 @@ theorem diamond_stage1_within (x : Nat) :
     | succ n =>
       refine wpUntil_mono_stop
         (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true)) ?_
-        (wpReach_within_of_evalBlockTreeToCut diamondBlocks diamondStepWith
+        (wpReach_within_of_validBlockTreeToCut_of_pointwise diamondBt_valid
+          diamondStepWith diamondStepWith_pointwise
           (region := fun s => Nat.blt s.block 3)
           (tag := fun s => some s.block) (blockOf := fun s => s.block)
           (cuts := diamondCuts) (fuel := 2)

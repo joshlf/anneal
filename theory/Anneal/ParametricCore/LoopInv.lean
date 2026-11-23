@@ -1942,6 +1942,49 @@ theorem wpLoop_early_return {α : Sort x} {r : α → α → Prop}
     | inl hN => exact hNorm s' hN
     | inr hE => exact hEarly s' hE
 
+/-- Ranked form of `wpLoop_early_return`: avoids manually supplying a
+well-foundedness proof when the variant is a `Nat`-valued rank. -/
+theorem wpLoop_early_return_rank {α : Sort x} (rank : α → Nat)
+    {Inv : α → State → Prop} {normalExit earlyClean : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hStep : ∀ a s, Inv a s →
+      normalExit s ∨ earlyClean s ∨
+        wpUntil
+          (fun s' => normalExit s' ∨ earlyClean s' ∨
+            ∃ a', rank a' < rank a ∧ Inv a' s')
+          onDone onFault s)
+    (hNorm : ∀ s, normalExit s → wpOutcome onDone onFault s)
+    (hEarly : ∀ s, earlyClean s → wpOutcome onDone onFault s)
+    (a₀ : α) (s₀ : State) (hInv : Inv a₀ s₀) :
+    wpOutcome onDone onFault s₀ :=
+  wpLoop_early_return (r := InvImage (fun m n : Nat => m < n) rank)
+    (InvImage.wf rank Nat.lt_wfRel.wf) hStep hNorm hEarly a₀ s₀ hInv
+
+/-- Strict-progress form of `wpLoop_early_return`: every continuing
+iteration must take at least one step (`wpStepUntil`), preventing stuttering
+obligations from discharging vacuously on a self-loop. -/
+theorem wpLoop_early_return_strict {α : Sort x} {r : α → α → Prop}
+    (hWf : WellFounded r)
+    {Inv : α → State → Prop} {normalExit earlyClean : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hStep : ∀ a s, Inv a s →
+      normalExit s ∨ earlyClean s ∨
+        wpStepUntil
+          (fun s' => normalExit s' ∨ earlyClean s' ∨
+            ∃ a', r a' a ∧ Inv a' s')
+          onDone onFault s)
+    (hNorm : ∀ s, normalExit s → wpOutcome onDone onFault s)
+    (hEarly : ∀ s, earlyClean s → wpOutcome onDone onFault s)
+    (a₀ : α) (s₀ : State) (hInv : Inv a₀ s₀) :
+    wpOutcome onDone onFault s₀ :=
+  wpLoop_early_return hWf
+    (fun a s hA =>
+      match hStep a s hA with
+      | Or.inl hN => Or.inl hN
+      | Or.inr (Or.inl hE) => Or.inr (Or.inl hE)
+      | Or.inr (Or.inr hSt) => Or.inr (Or.inr (wpUntil_of_wpStepUntil hSt)))
+    hNorm hEarly a₀ s₀ hInv
+
 /-- Loop-header rule over `blockTag?`: `wpLoop_inv_strict` for an invariant
 that is only required at the header block `header`. Each iteration starts at
 the header, executes at least one step, and comes back to the header with a
@@ -2454,7 +2497,7 @@ theorem earlyToy_spec (n : Nat) :
     wpStateOk
       (fun out => (n ≤ 5 ∧ out = .normal n) ∨ (5 < n ∧ out = .early 5))
       ({ block := 0, i := n, acc := 0 } : ToyState) := by
-  refine wpLoop_early_return (r := fun a b : Nat => a < b) Nat.lt_wfRel.wf
+  refine wpLoop_early_return_rank (α := Nat) (fun k => k)
     (Inv := fun k s => s.block = 0 ∧ s.i = k ∧ s.acc + k = n ∧ s.acc ≤ 5)
     (normalExit := fun s => s.block = 0 ∧ s.i = 0 ∧ s.acc = n ∧ n ≤ 5)
     (earlyClean := fun s => s.block = 2 ∧ s.acc = 5 ∧ 5 < n)
