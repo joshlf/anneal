@@ -4003,11 +4003,14 @@ MIRI_MUTATOR_ITEM_HEADER_PREFIXES = ("fn ", "impl ", "trait ", "struct ", "mod "
 MIRI_PREAMBLE_ITEM_HEADER_PREFIXES = (
     "pub ",
     "unsafe fn ",
+    "unsafe impl ",
     "macro_rules! ",
     "enum ",
     "union ",
     "const ",
     "static ",
+    "type ",
+    "use ",
 )
 _TAIL_WRAPPER_TOKEN_RE = re.compile(r"\b__tail___miri_[A-Za-z0-9_]+\b")
 
@@ -4155,6 +4158,11 @@ def _enclosing_miri_mutator_item_owner(
         if stripped.startswith(MIRI_MUTATOR_ITEM_HEADER_PREFIXES):
             return _indirect_mutator_for_item_header(stripped)
         if stripped.startswith(MIRI_PREAMBLE_ITEM_HEADER_PREFIXES):
+            return None
+        # A sibling-level `}` strictly before `line_no` closes an earlier item,
+        # so `line_no` (such as an attribute, doc comment, or unrecognized item
+        # between items) does not lie inside the earlier item.
+        if idx < line_no - 1 and stripped.startswith("}"):
             return None
     return None
 

@@ -1317,6 +1317,275 @@ fn stacked_miri_indirect_passes_keep_distinct_items_and_compile() {
     }
 }
 
+/// Rust mirrors of `scripts/run_diff_test_campaign.py`'s indirect-call item
+/// attribution constants, verified for exact cross-language parity in
+/// [`indirect_mutator_items_keep_the_campaign_attribution_layout`].
+const CAMPAIGN_ITEM_HEADER_PREFIXES: [&str; 5] = ["fn ", "impl ", "trait ", "struct ", "mod "];
+const CAMPAIGN_PREAMBLE_HEADER_PREFIXES: [&str; 10] = [
+    "pub ",
+    "unsafe fn ",
+    "unsafe impl ",
+    "macro_rules! ",
+    "enum ",
+    "union ",
+    "const ",
+    "static ",
+    "type ",
+    "use ",
+];
+const CAMPAIGN_VTABLE_TOKENS: [&str; 5] = [
+    "__miri_vt_",
+    "__anneal_vt_",
+    "__anneal_fnptr_",
+    "__AnnealVtable",
+    "__vt_",
+];
+const CAMPAIGN_CLOSURE_TOKENS: [&str; 4] = [
+    "__miri_clos_",
+    "__anneal_clos_",
+    "__anneal_wide_",
+    "__clos_",
+];
+
+/// Extracts the string elements of a top-level Python tuple constant
+/// `NAME = (...)` from `scripts/run_diff_test_campaign.py`.
+fn parse_python_string_tuple(script: &str, name: &str) -> Vec<String> {
+    let prefix = format!("{name} = (");
+    let mut lines = script.lines();
+    let Some(first) = lines.find(|line| line.starts_with(&prefix)) else {
+        panic!("missing `{prefix}` in scripts/run_diff_test_campaign.py");
+    };
+    let first_code = first[prefix.len()..].split('#').next().unwrap_or("");
+    let mut block = String::from(first_code);
+    if !block.contains(')') {
+        for line in lines {
+            let code = line.split('#').next().unwrap_or(line);
+            block.push('\n');
+            block.push_str(code);
+            if code.contains(')') {
+                break;
+            }
+        }
+    }
+    let body = block
+        .split_once(')')
+        .unwrap_or_else(|| panic!("unterminated tuple `{name}` in campaign script"))
+        .0;
+    let mut items = Vec::new();
+    let mut rest = body;
+    while let Some((_, after_open)) = rest.split_once('"') {
+        let (lit, after_close) = after_open
+            .split_once('"')
+            .unwrap_or_else(|| panic!("unterminated string in `{name}`"));
+        items.push(lit.to_string());
+        rest = after_close;
+    }
+    assert!(!items.is_empty(), "empty tuple `{name}` in campaign script");
+    items
+}
+
+/// Exact Rust counterpart of `scripts/run_diff_test_campaign.py`'s
+/// `_indirect_mutator_for_item_header`.
+fn campaign_indirect_owner_for_header(header: &str) -> Option<&'static str> {
+    if CAMPAIGN_VTABLE_TOKENS.iter().any(|tok| header.contains(tok)) {
+        return Some("VTableAndFnPtrMutator");
+    }
+    if CAMPAIGN_CLOSURE_TOKENS
+        .iter()
+        .any(|tok| header.contains(tok))
+    {
+        return Some("ClosureAndAddrEqMutator");
+    }
+    None
+}
+
+/// Exact Rust counterpart of `scripts/run_diff_test_campaign.py`'s
+/// `_enclosing_miri_mutator_item_owner`.
+fn campaign_enclosing_item_owner(
+    lines: &[&str],
+    line_no: usize,
+    cand_start: usize,
+) -> Option<&'static str> {
+    if line_no < 1 || line_no >= cand_start {
+        return None;
+    }
+    let cand_line = lines[cand_start - 1];
+    let cand_indent = cand_line.len() - cand_line.trim_start().len();
+    for idx in (0..line_no).rev() {
+        let raw = lines[idx];
+        let stripped = raw.trim_start();
+        if stripped.is_empty() {
+            continue;
+        }
+        let indent = raw.len() - stripped.len();
+        if indent > cand_indent {
+            continue;
+        }
+        if CAMPAIGN_ITEM_HEADER_PREFIXES
+            .iter()
+            .any(|p| stripped.starts_with(p))
+        {
+            return campaign_indirect_owner_for_header(stripped);
+        }
+        if CAMPAIGN_PREAMBLE_HEADER_PREFIXES
+            .iter()
+            .any(|p| stripped.starts_with(p))
+        {
+            return None;
+        }
+        if idx < line_no - 1 && stripped.starts_with('}') {
+            return None;
+        }
+    }
+    None
+}
+
+/// Verifies the full `_enclosing_miri_mutator_item_owner` contract line by line
+/// on a complete module body (`MIRI_CORPUS_MODULE_PREAMBLE` + emitted items +
+/// candidate function, optionally indented inside `pub mod c0 { ... }`):
+/// - every preamble line attributes to `None`;
+/// - every mutator item header starts at `cand_indent` with a prefix in
+///   `CAMPAIGN_ITEM_HEADER_PREFIXES` and carries an owning indirect-call token;
+/// - every body line inside each item (including nested `pub mod __ { ... }`
+///   items inside `mod __anneal_clos_*` and trait `impl` methods) resolves back
+///   to that item's exact owner;
+/// - every inter-item attribute/doc-comment line resolves to `None`.
+fn assert_stacked_campaign_attribution_layout(
+    label: &str,
+    fn_name: &str,
+    module_body: &str,
+    expected_owners: &BTreeSet<&str>,
+    preamble_line_count: usize,
+) {
+    let lines: Vec<&str> = module_body.lines().collect();
+    let fn_prefix = format!("pub fn {fn_name}(");
+    let unsafe_fn_prefix = format!("pub unsafe fn {fn_name}(");
+    let cand_start = lines
+        .iter()
+        .enumerate()
+        .skip(preamble_line_count)
+        .find_map(|(idx, line)| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with(&fn_prefix) || trimmed.starts_with(&unsafe_fn_prefix))
+                .then_some(idx + 1)
+        })
+        .unwrap_or_else(|| panic!("{label}: missing candidate `{fn_name}`:\n{module_body}"));
+    let cand_line = lines[cand_start - 1];
+    let cand_indent = cand_line.len() - cand_line.trim_start().len();
+
+    for line_no in 1..=preamble_line_count {
+        assert_eq!(
+            campaign_enclosing_item_owner(&lines, line_no, cand_start),
+            None,
+            "{label}: preamble line {line_no} (`{}`) was claimed by an indirect mutator",
+            lines[line_no - 1]
+        );
+    }
+
+    let mut in_item_owner: Option<&'static str> = None;
+    let mut seen_owners: BTreeSet<&str> = BTreeSet::new();
+    for line_no in (preamble_line_count + 1)..cand_start {
+        let raw = lines[line_no - 1];
+        let stripped = raw.trim_start();
+        if stripped.is_empty() {
+            continue;
+        }
+        let indent = raw.len() - stripped.len();
+        assert!(
+            indent >= cand_indent,
+            "{label}: line {line_no} (`{raw}`) is less indented than `{fn_name}`"
+        );
+        if indent > cand_indent {
+            assert!(
+                in_item_owner.is_some(),
+                "{label}: indented line {line_no} (`{raw}`) outside any mutator item"
+            );
+            assert_eq!(
+                campaign_enclosing_item_owner(&lines, line_no, cand_start),
+                in_item_owner,
+                "{label}: body line {line_no} (`{raw}`) resolved to wrong owner"
+            );
+            continue;
+        }
+        if stripped.starts_with('#') || stripped.starts_with("///") {
+            assert!(
+                in_item_owner.is_none(),
+                "{label}: sibling-level attribute/doc line {line_no} (`{raw}`) inside an open item"
+            );
+            assert_eq!(
+                campaign_enclosing_item_owner(&lines, line_no, cand_start),
+                None,
+                "{label}: inter-item attribute/doc line {line_no} (`{raw}`) bled into a prior item"
+            );
+            continue;
+        }
+        if stripped.starts_with('}') {
+            assert!(
+                in_item_owner.is_some(),
+                "{label}: stray closing brace at line {line_no} (`{raw}`)"
+            );
+            assert_eq!(
+                campaign_enclosing_item_owner(&lines, line_no, cand_start),
+                in_item_owner,
+                "{label}: closing brace line {line_no} resolved to wrong owner"
+            );
+            in_item_owner = None;
+            continue;
+        }
+        if stripped.starts_with(')') {
+            assert!(
+                in_item_owner.is_some(),
+                "{label}: stray wrapped-signature close at line {line_no} (`{raw}`)"
+            );
+            assert_eq!(
+                campaign_enclosing_item_owner(&lines, line_no, cand_start),
+                in_item_owner,
+                "{label}: wrapped-signature close line {line_no} resolved to wrong owner"
+            );
+            continue;
+        }
+        assert!(
+            in_item_owner.is_none(),
+            "{label}: item header at line {line_no} (`{raw}`) opened before closing prior item"
+        );
+        assert!(
+            CAMPAIGN_ITEM_HEADER_PREFIXES
+                .iter()
+                .any(|p| stripped.starts_with(p)),
+            "{label}: unexpected sibling-level line {line_no} ahead of `{fn_name}`: `{raw}`"
+        );
+        let owner = campaign_indirect_owner_for_header(stripped).unwrap_or_else(|| {
+            panic!("{label}: mutator item header at line {line_no} has no owner token: `{raw}`")
+        });
+        assert!(
+            expected_owners.contains(owner),
+            "{label}: header line {line_no} (`{raw}`) owned by unexpected mutator `{owner}` \
+             (expected one of {expected_owners:?})"
+        );
+        seen_owners.insert(owner);
+        assert_eq!(
+            campaign_enclosing_item_owner(&lines, line_no, cand_start),
+            Some(owner),
+            "{label}: header line {line_no} resolved to wrong owner"
+        );
+        if !stripped.ends_with('}') && !stripped.ends_with(';') {
+            in_item_owner = Some(owner);
+        }
+    }
+    assert!(
+        in_item_owner.is_none(),
+        "{label}: unclosed mutator item ahead of `{fn_name}`"
+    );
+    assert_eq!(
+        seen_owners, *expected_owners,
+        "{label}: observed item owners diverged from expected indirect mutators"
+    );
+    assert_eq!(
+        campaign_enclosing_item_owner(&lines, cand_start, cand_start),
+        None
+    );
+}
+
 /// Checks the source layout by which `scripts/run_diff_test_campaign.py`
 /// (`_enclosing_miri_mutator_item_owner`) attributes a fault inside an item
 /// that one pass of `mutator` puts ahead of the entry function.
@@ -1334,8 +1603,6 @@ fn assert_campaign_item_attribution_layout(
     foreign_tokens: &[&str],
     expected_kinds: &[&str],
 ) {
-    // `MIRI_MUTATOR_ITEM_HEADER_PREFIXES` of the campaign script.
-    const ITEM_KEYWORDS: [&str; 5] = ["fn ", "impl ", "trait ", "struct ", "mod "];
     const ENTRY: &str = "pub fn layout_seed(";
     let mut kinds: BTreeSet<&str> = BTreeSet::new();
     for mode in [
@@ -1361,7 +1628,7 @@ fn assert_campaign_item_attribution_layout(
                 if line.is_empty() || line.starts_with([' ', '#', '}', ')']) {
                     continue;
                 }
-                let kind = ITEM_KEYWORDS
+                let kind = CAMPAIGN_ITEM_HEADER_PREFIXES
                     .iter()
                     .copied()
                     .find(|keyword| line.starts_with(*keyword));
@@ -1397,36 +1664,201 @@ fn assert_campaign_item_attribution_layout(
     );
 }
 
-/// Every item of both Miri indirect-call mutators, in every mode, has the
-/// layout and the header tokens that the campaign script's fault attribution
-/// reads (`VTABLE_FNPTR_MUTATOR_TOKENS` and `CLOSURE_ADDR_EQ_MUTATOR_TOKENS`
-/// there).
+/// Every item of both Miri indirect-call mutators — in every mode on a single
+/// seed, in stacked multi-pass combinations (`VTable` + `Closure` +
+/// `TreeBorrowsRetagInterleaver` + `PerturbAst`, both unindented and inside
+/// `pub mod c0 { ... }`), and in scheduled corpus batches — satisfies the
+/// indentation and header-token contract of `scripts/run_diff_test_campaign.py`,
+/// whose token and header-prefix lists are pinned for cross-language parity.
 #[test]
 fn indirect_mutator_items_keep_the_campaign_attribution_layout() {
-    const VTABLE_TOKENS: [&str; 5] = [
-        "__miri_vt_",
-        "__anneal_vt_",
-        "__anneal_fnptr_",
-        "__AnnealVtable",
-        "__vt_",
-    ];
-    const CLOSURE_TOKENS: [&str; 4] = [
-        "__miri_clos_",
-        "__anneal_clos_",
-        "__anneal_wide_",
-        "__clos_",
-    ];
+    // 1. Pin exact cross-language parity with `scripts/run_diff_test_campaign.py`.
+    let campaign_script_path = repo_root().join("scripts/run_diff_test_campaign.py");
+    let campaign_script = fs::read_to_string(&campaign_script_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", campaign_script_path.display()));
+    for (py_name, rust_vals) in [
+        (
+            "MIRI_MUTATOR_ITEM_HEADER_PREFIXES",
+            CAMPAIGN_ITEM_HEADER_PREFIXES.as_slice(),
+        ),
+        (
+            "MIRI_PREAMBLE_ITEM_HEADER_PREFIXES",
+            CAMPAIGN_PREAMBLE_HEADER_PREFIXES.as_slice(),
+        ),
+        (
+            "VTABLE_FNPTR_MUTATOR_TOKENS",
+            CAMPAIGN_VTABLE_TOKENS.as_slice(),
+        ),
+        (
+            "CLOSURE_ADDR_EQ_MUTATOR_TOKENS",
+            CAMPAIGN_CLOSURE_TOKENS.as_slice(),
+        ),
+    ] {
+        let expected: Vec<String> = rust_vals.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            parse_python_string_tuple(&campaign_script, py_name),
+            expected,
+            "`{py_name}` in scripts/run_diff_test_campaign.py drifted from Rust test constants"
+        );
+    }
+
+    // 2. Every unindented item header of `MIRI_CORPUS_MODULE_PREAMBLE` must be
+    //    classified as a preamble item (never owned by an indirect-call mutator).
+    for line in MIRI_CORPUS_MODULE_PREAMBLE.lines() {
+        if line.is_empty() || line.starts_with([' ', '#', '}', ')']) || line.starts_with("///") {
+            continue;
+        }
+        assert!(
+            CAMPAIGN_PREAMBLE_HEADER_PREFIXES
+                .iter()
+                .any(|p| line.starts_with(p))
+                || (CAMPAIGN_ITEM_HEADER_PREFIXES
+                    .iter()
+                    .any(|p| line.starts_with(p))
+                    && campaign_indirect_owner_for_header(line).is_none()),
+            "unclassified MIRI_CORPUS_MODULE_PREAMBLE line: `{line}`"
+        );
+    }
+
+    // 3. Single-pass layout across all 4 modes and TEMPLATE_SCAN_SEEDS seeds.
     assert_campaign_item_attribution_layout(
         &VTableAndFnPtrMutator,
-        &VTABLE_TOKENS,
+        &CAMPAIGN_VTABLE_TOKENS,
         &[],
         &["fn ", "impl ", "struct ", "trait "],
     );
     assert_campaign_item_attribution_layout(
         &ClosureAndAddrEqMutator,
-        &CLOSURE_TOKENS,
-        &VTABLE_TOKENS,
+        &CAMPAIGN_CLOSURE_TOKENS,
+        &CAMPAIGN_VTABLE_TOKENS,
         &["fn ", "mod "],
+    );
+
+    // 4. Full line-by-line attribution check on stacked multi-pass candidates
+    //    (both indirect-call mutators, TreeBorrows stacks, PerturbAst faulting
+    //    seeds, a 3-pass combined stack at indent 0 and inside `pub mod c0`,
+    //    and scheduled multi-pass corpus batches).
+    let preamble_lines = MIRI_CORPUS_MODULE_PREAMBLE.lines().count();
+    for (_, cand) in stacked_miri_candidates(0)
+        .into_iter()
+        .chain(tb_stacked_miri_candidates(0))
+        .chain(perturb_fault_seed_miri_candidates(0))
+    {
+        let owners: BTreeSet<&str> = cand
+            .applied_mutators
+            .iter()
+            .map(String::as_str)
+            .filter(|m| is_indirect_miri_mutator(*m))
+            .collect();
+        assert!(!owners.is_empty(), "`{}` had no indirect owner", cand.fn_name);
+        assert_stacked_campaign_attribution_layout(
+            &cand.fn_name,
+            &cand.fn_name,
+            &cand.module_body_source(),
+            &owners,
+            preamble_lines,
+        );
+    }
+
+    // 3-pass stack combining `ClosureAndAddrEqMutator` (`PerturbAst`, emitting
+    // `mod __anneal_clos_* { pub mod __ { eval_once, eval, apply_keep } }`),
+    // `VTableAndFnPtrMutator` (`Pass`, `dyn_dispatch` emitting `trait`/`struct`/
+    // `impl`/`fn`), and `TreeBorrowsRetagInterleaver` (`Pass`), checked both at
+    // top-level indentation and indented inside `pub mod c0 { ... }`.
+    let singles = all_miri_template_candidates();
+    let seed_of = |label: &str| -> u64 {
+        singles
+            .iter()
+            .find(|(t, _)| t.label == label && t.mode == MutationMode::Pass)
+            .unwrap_or_else(|| panic!("no `Pass` template `{label}`"))
+            .1
+            .seed_u64
+    };
+    let mut tri_file = syn::parse_file(
+        "pub fn panic_tri_stack_layout() -> u32 {\n    let x: u32 = u32::MAX;\n    x + 1u32\n}\n",
+    )
+    .expect("parse tri-stack seed");
+    let mut locals = Vec::new();
+    ClosureAndAddrEqMutator.mutate_with_mode(
+        &mut tri_file,
+        &mut DetRng::new(seed_of("closure_by_unique_ref")),
+        MutationMode::PerturbAst,
+        &mut locals,
+    );
+    VTableAndFnPtrMutator.mutate_with_mode(
+        &mut tri_file,
+        &mut DetRng::new(seed_of("dyn_dispatch")),
+        MutationMode::Pass,
+        &mut locals,
+    );
+    let tb_seed = find_tb_arm0_seed(&tri_file);
+    TreeBorrowsRetagInterleaver.mutate_with_mode(
+        &mut tri_file,
+        &mut DetRng::new(tb_seed),
+        MutationMode::Pass,
+        &mut locals,
+    );
+    let tri_fn_source = prettyplease::unparse(&tri_file);
+    assert!(
+        tri_fn_source.contains("mod __anneal_clos_")
+            && tri_fn_source.contains("pub mod __")
+            && tri_fn_source.contains("impl __AnnealVtableTrait"),
+        "tri-stack candidate must include nested `mod __anneal_clos_*` and vtable `impl`:\n{tri_fn_source}"
+    );
+    let tri_module_body = format!("{MIRI_CORPUS_MODULE_PREAMBLE}\n{tri_fn_source}\n");
+    let both_owners = BTreeSet::from(["VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"]);
+    assert_stacked_campaign_attribution_layout(
+        "tri_stack_plain",
+        "panic_tri_stack_layout",
+        &tri_module_body,
+        &both_owners,
+        preamble_lines,
+    );
+    let indented_body = format!(
+        "pub mod c0 {{\n{}\n}}\n",
+        tri_module_body
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    String::new()
+                } else {
+                    format!("    {l}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_stacked_campaign_attribution_layout(
+        "tri_stack_indented_mod",
+        "panic_tri_stack_layout",
+        &indented_body,
+        &both_owners,
+        preamble_lines + 1,
+    );
+
+    let mut checked_scheduled = 0usize;
+    for cand in generate_miri_corpus_batch(128, 0x57AC_2000, 0) {
+        let owners: BTreeSet<&str> = cand
+            .applied_mutators
+            .iter()
+            .map(String::as_str)
+            .filter(|m| is_indirect_miri_mutator(*m))
+            .collect();
+        if owners.is_empty() {
+            continue;
+        }
+        assert_stacked_campaign_attribution_layout(
+            &format!("scheduled `{}` {:?}", cand.fn_name, cand.applied_mutators),
+            &cand.fn_name,
+            &cand.module_body_source(),
+            &owners,
+            preamble_lines,
+        );
+        checked_scheduled += 1;
+    }
+    assert!(
+        checked_scheduled >= 5,
+        "expected scheduled indirect-call candidates, got {checked_scheduled}"
     );
 }
 

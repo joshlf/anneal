@@ -1171,12 +1171,14 @@ enum EvalTy {
     Bool,
     Unit,
     Named(String),
-    /// `&T` (including `&[T]`): shared reference without trait-object erasure.
-    Ref,
+    /// `&...&T` (including `&[T]`): shared reference of the given reference
+    /// depth without trait-object erasure (`&u32` -> `1`, `&&u32` -> `2`).
+    Ref(usize),
     /// `&dyn Trait`: shared trait-object reference carrying vtable identity.
     DynRef(String),
-    /// `*const T`: safe raw pointer (never dereferenced in safe Rust).
-    ConstPtr,
+    /// `*const T`: safe raw pointer carrying pointer+reference depth (`*const u32`
+    /// -> `1`, `*const &u32` -> `2`; never dereferenced in safe Rust).
+    ConstPtr(usize),
     /// `fn(..) -> ..`: a function item or a closure that captures nothing.
     FnPtr,
     /// `[T; N]` with element type `T`.
@@ -1219,6 +1221,23 @@ fn is_trait_object_type(ty: &Type) -> bool {
     }
 }
 
+/// Counts leading shared-reference layers (`&...&T`) and returns `(depth, T)`.
+fn ref_target_and_depth(ty: &Type) -> (usize, &Type) {
+    let mut depth = 0usize;
+    let mut cur = ty;
+    loop {
+        match cur {
+            Type::Paren(p) => cur = &p.elem,
+            Type::Group(g) => cur = &g.elem,
+            Type::Reference(r) if r.mutability.is_none() => {
+                depth += 1;
+                cur = &r.elem;
+            }
+            _ => return (depth, cur),
+        }
+    }
+}
+
 fn eval_ty_of(ty: &Type) -> EvalTy {
     match ty {
         Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
@@ -1234,15 +1253,35 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         Type::Tuple(t) if t.elems.is_empty() => EvalTy::Unit,
         Type::Paren(p) => eval_ty_of(&p.elem),
         Type::Group(g) => eval_ty_of(&g.elem),
-        Type::Reference(r) if r.mutability.is_none() => match dyn_trait_name(&r.elem) {
-            Some(tr) => EvalTy::DynRef(tr),
-            // Reject multi-bound or qualified trait-object references (such as
-            // `&(dyn Trait + Send)`) rather than stripping `dyn` into `Ref` and
-            // mis-dispatching to an inherent method.
-            None if is_trait_object_type(&r.elem) => EvalTy::Named(quote!(#ty).to_string()),
-            None => EvalTy::Ref,
-        },
-        Type::Ptr(p) if p.mutability.is_none() => EvalTy::ConstPtr,
+        Type::Reference(r) if r.mutability.is_none() => {
+            let (depth, target) = ref_target_and_depth(ty);
+            // Reject `&mut` nested inside `&`, and reject multi-bound or
+            // qualified trait-object references (such as `&(dyn Trait + Send)`
+            // or `&&(dyn Trait + Send)`) rather than stripping `dyn` into `Ref`
+            // and mis-dispatching to an inherent method.
+            if matches!(target, Type::Reference(_)) {
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            if is_trait_object_type(target) {
+                if depth == 1
+                    && let Some(tr) = dyn_trait_name(target)
+                {
+                    return EvalTy::DynRef(tr);
+                }
+                if dyn_trait_name(target).is_some() {
+                    return EvalTy::Ref(depth);
+                }
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            EvalTy::Ref(depth)
+        }
+        Type::Ptr(p) if p.mutability.is_none() => {
+            let (inner_ref_depth, target) = ref_target_and_depth(&p.elem);
+            if matches!(target, Type::Reference(_)) {
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            EvalTy::ConstPtr(1 + inner_ref_depth)
+        }
         Type::BareFn(_) => EvalTy::FnPtr,
         Type::Array(a) => EvalTy::Array(Box::new(eval_ty_of(&a.elem))),
         other => EvalTy::Named(quote!(#other).to_string()),
@@ -1272,7 +1311,8 @@ enum EvalAddr {
 enum EvalValue {
     Int(u128, EvalIntTy),
     Bool(bool),
-    Struct(String, BTreeMap<String, EvalValue>),
+    /// `(AST ItemStruct identity, struct name, field values)`.
+    Struct(usize, String, BTreeMap<String, EvalValue>),
     Unit,
     /// `[T; N]` array, or the elements that a slice reference views.
     Array(Vec<EvalValue>),
@@ -1309,8 +1349,8 @@ struct EvalRef {
     /// compute).
     addr: Option<EvalAddr>,
     val: EvalValue,
-    /// Principal trait name when coerced or cast to `&dyn Trait`.
-    dyn_trait: Option<String>,
+    /// AST `ItemTrait` identity when coerced or cast to `&dyn Trait`.
+    dyn_trait: Option<usize>,
 }
 
 impl EvalRef {
@@ -1324,6 +1364,34 @@ impl EvalRef {
             }
         }
     }
+}
+
+/// Number of nested [`EvalValue::Ref`] layers starting at `r` (at least `1`).
+fn eval_ref_depth(r: &EvalRef) -> usize {
+    let mut depth = 1usize;
+    let mut cur = &r.val;
+    while let EvalValue::Ref(inner) = cur {
+        depth += 1;
+        cur = &inner.val;
+    }
+    depth
+}
+
+/// Deref-coerces `r` to `expected_depth` reference layers by peeling outer
+/// [`EvalValue::Ref`] layers (`&&T` -> `&T`). Fails closed if `r` has fewer
+/// than `expected_depth` layers.
+fn peel_ref_layers(mut r: Box<EvalRef>, expected_depth: usize) -> Result<Box<EvalRef>, EvalCtrl> {
+    let actual_depth = eval_ref_depth(&r);
+    if expected_depth == 0 || actual_depth < expected_depth {
+        return eval_unsupported("reference depth mismatch");
+    }
+    for _ in 0..(actual_depth - expected_depth) {
+        let EvalValue::Ref(inner) = r.val else {
+            return eval_unsupported("reference deref coercion failed");
+        };
+        r = inner;
+    }
+    Ok(r)
 }
 
 /// Auto-dereferenced value of `v` (the referent of any chain of references).
@@ -1365,7 +1433,7 @@ fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
         // 2021+ disjoint non-capturing `let _ = x;`).
         EvalValue::Unit | EvalValue::Closure { .. } => false,
         EvalValue::Array(elems) => elems.iter().any(eval_value_is_sized_nonzero),
-        EvalValue::Struct(_, fields) => fields.values().any(eval_value_is_sized_nonzero),
+        EvalValue::Struct(_, _, fields) => fields.values().any(eval_value_is_sized_nonzero),
     }
 }
 
@@ -1458,44 +1526,11 @@ fn eval_unsupported<T>(what: impl Into<String>) -> Result<T, EvalCtrl> {
     Err(EvalCtrl::Unsupported(what.into()))
 }
 
-fn eval_coerce(v: EvalValue, ty: &EvalTy) -> EvalRes {
-    match (v, ty) {
-        (v, EvalTy::Infer) => Ok(v),
-        (EvalValue::Int(x, EvalIntTy::Infer), EvalTy::Int(t)) => {
-            if x <= t.max() {
-                Ok(EvalValue::Int(x, *t))
-            } else {
-                eval_unsupported("integer literal out of range for its type")
-            }
-        }
-        (EvalValue::Int(x, s), EvalTy::Int(t)) if s == *t => Ok(EvalValue::Int(x, s)),
-        (EvalValue::Bool(b), EvalTy::Bool) => Ok(EvalValue::Bool(b)),
-        (EvalValue::Unit, EvalTy::Unit) => Ok(EvalValue::Unit),
-        (EvalValue::Struct(n, f), EvalTy::Named(m)) if n == *m => Ok(EvalValue::Struct(n, f)),
-        (v @ EvalValue::Ref(_), EvalTy::Ref) => Ok(v),
-        (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
-            let mut inner = r.autoderef();
-            inner.dyn_trait = Some(tr.clone());
-            Ok(EvalValue::Ref(Box::new(inner)))
-        }
-        (EvalValue::Ref(r), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
-            addr: r.addr,
-            nonzero: eval_value_is_sized_nonzero(&r.val),
-        }),
-        (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr) => Ok(v),
-        (v @ EvalValue::FnRef(_), EvalTy::FnPtr) => Ok(v),
-        (
-            v @ EvalValue::Closure {
-                captures: false, ..
-            },
-            EvalTy::FnPtr,
-        ) => Ok(v),
-        (EvalValue::Array(elems), EvalTy::Array(elem_ty)) => elems
-            .into_iter()
-            .map(|e| eval_coerce(e, elem_ty))
-            .collect::<Result<Vec<_>, _>>()
-            .map(EvalValue::Array),
-        (v, ty) => eval_unsupported(format!("value {v:?} does not have type {ty:?}")),
+fn coerce_inferred_int(x: u128, t: EvalIntTy) -> EvalRes {
+    if x <= t.max() {
+        Ok(EvalValue::Int(x, t))
+    } else {
+        eval_unsupported("integer literal out of range for its type")
     }
 }
 
@@ -1881,17 +1916,18 @@ impl<'ast> Visit<'ast> for ClosureFreeIdents {
     fn visit_item(&mut self, _node: &'ast Item) {}
 }
 
-/// Every trait method a candidate declares, wherever it declares it.
+/// Every trait and inherent method a candidate declares, wherever it declares it.
 ///
-/// A trait `impl` applies to its type wherever the item sits: at the top
-/// level, in a block the evaluator never enters or has already left, in the
-/// body of a function that is never called, or after an early `return`. A
+/// A trait or inherent `impl` applies to its type wherever the item sits: at
+/// the top level, in a block the evaluator never enters or has already left, in
+/// the body of a function that is never called, or after an early `return`. A
 /// reference that an `if` / `match` arm or an array element unsizes implicitly
 /// reaches a method call without a `&dyn Trait` marker (see
 /// `EvalRun::eval_method_call`), where native Rust still dispatches through the
-/// vtable. The methods visible from the caller's enclosing blocks therefore do
-/// not decide whether a trait method could be the callee; this census of the
-/// whole file does.
+/// vtable, and an inherent `impl` anywhere takes precedence over a trait
+/// `impl`. The methods visible from the caller's enclosing blocks therefore do
+/// not decide whether a trait or inherent method could be the callee; this
+/// census of the whole file does.
 #[derive(Debug, Default)]
 struct TraitMethodCensus {
     /// Names of the default methods of every trait, by trait name.
@@ -1900,8 +1936,12 @@ struct TraitMethodCensus {
     /// `Self` type name is `None` for a generic `impl` and for a `Self` type
     /// that is not a plain path, either of which may apply to any type.
     impls: Vec<(Option<String>, String, BTreeSet<String>)>,
+    /// `(Self type name, method names)` of every inherent `impl`. The `Self`
+    /// type name is `None` for a generic `impl` and for a `Self` type that is
+    /// not a plain path.
+    inherent_impls: Vec<(Option<String>, BTreeSet<String>)>,
     /// Whether the candidate invokes or defines a macro, whose expansion may
-    /// declare trait `impl`s that `syn::Visit` cannot inspect.
+    /// declare items, `use` aliases, or `impl`s that `syn::Visit` cannot inspect.
     has_macro: bool,
 }
 
@@ -1928,6 +1968,18 @@ impl TraitMethodCensus {
         }
         out
     }
+
+    /// Whether any inherent `impl` anywhere in the candidate gives a type
+    /// named `ty_name` a method named `method`.
+    fn has_inherent(&self, ty_name: &str, method: &str) -> bool {
+        self.inherent_impls.iter().any(|(self_name, methods)| {
+            let applies = match self_name {
+                Some(name) => name.as_str() == ty_name,
+                None => true,
+            };
+            applies && methods.contains(method)
+        })
+    }
 }
 
 impl<'ast> Visit<'ast> for TraitMethodCensus {
@@ -1944,24 +1996,27 @@ impl<'ast> Visit<'ast> for TraitMethodCensus {
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if let Some((_, trait_path, _)) = &node.trait_
-            && let Some(trait_seg) = trait_path.segments.last()
-        {
-            let self_name = match node.self_ty.as_ref() {
-                Type::Path(tp) if tp.qself.is_none() && node.generics.params.is_empty() => {
-                    tp.path.segments.last().map(|seg| seg.ident.to_string())
-                }
+        let self_name = match node.self_ty.as_ref() {
+            Type::Path(tp) if tp.qself.is_none() && node.generics.params.is_empty() => {
+                tp.path.segments.last().map(|seg| seg.ident.to_string())
+            }
+            _ => None,
+        };
+        let methods: BTreeSet<String> = node
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
                 _ => None,
-            };
-            let methods: BTreeSet<String> = node
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
-                    _ => None,
-                })
-                .collect();
-            self.impls.push((self_name, trait_seg.ident.to_string(), methods));
+            })
+            .collect();
+        if let Some((_, trait_path, _)) = &node.trait_ {
+            if let Some(trait_seg) = trait_path.segments.last() {
+                self.impls
+                    .push((self_name, trait_seg.ident.to_string(), methods));
+            }
+        } else {
+            self.inherent_impls.push((self_name, methods));
         }
         visit::visit_item_impl(self, node);
     }
@@ -1972,8 +2027,8 @@ impl<'ast> Visit<'ast> for TraitMethodCensus {
     }
 }
 
-/// Names of the `fn` and `struct` items that a candidate declares inside
-/// function bodies, at any depth.
+/// Names of the `fn`, `struct`, and `trait` items that a candidate declares
+/// inside function bodies, at any depth.
 ///
 /// The body of a nested `fn` or of a method sees the items of the blocks that
 /// enclose its own declaration, but the evaluator runs it in a fresh frame
@@ -1995,6 +2050,9 @@ impl<'ast> Visit<'ast> for NestedItemNames {
                 }
                 Stmt::Item(Item::Struct(st)) => {
                     self.names.insert(st.ident.to_string());
+                }
+                Stmt::Item(Item::Trait(tr)) => {
+                    self.names.insert(tr.ident.to_string());
                 }
                 _ => {}
             }
@@ -2094,7 +2152,15 @@ pub struct ItreeConcreteEvaluator {
     file: File,
     root_fn_name: String,
     fns: BTreeMap<String, usize>,
-    structs: BTreeMap<String, Vec<(String, EvalTy)>>,
+    /// Top-level struct declarations: `name -> Some((item_id, fields))` for
+    /// non-generic named-field structs, or `None` for unsupported structs.
+    structs: BTreeMap<String, Option<(usize, EvalStructDef)>>,
+    /// Top-level trait declarations: `name -> item_id`.
+    traits: BTreeMap<String, usize>,
+    /// First top-level item outside the supported subset (`use`, `mod`,
+    /// `const`, `static`, `type`, `enum`, `union`, `macro_rules!`, etc.),
+    /// rejected on [`Self::run`].
+    unsupported_top_item: Option<&'static str>,
     branch_sites: BTreeMap<usize, u32>,
     trait_census: TraitMethodCensus,
     /// See [`NestedItemNames`].
@@ -2107,21 +2173,16 @@ impl ItreeConcreteEvaluator {
     pub fn new(source: &str, root_fn_name: &str) -> Result<Self, String> {
         let file = syn::parse_str::<File>(source).map_err(|e| e.to_string())?;
         let mut fns = BTreeMap::new();
-        let mut structs = BTreeMap::new();
+        let mut unsupported_top_item = None;
         for (idx, item) in file.items.iter().enumerate() {
             match item {
                 Item::Fn(f) => {
                     fns.insert(f.sig.ident.to_string(), idx);
                 }
-                Item::Struct(s) => {
-                    let fields = s
-                        .fields
-                        .iter()
-                        .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
-                        .collect();
-                    structs.insert(s.ident.to_string(), fields);
+                Item::Struct(_) | Item::Trait(_) | Item::Impl(_) => {}
+                _ => {
+                    unsupported_top_item.get_or_insert("unsupported top-level item");
                 }
-                _ => {}
             }
         }
         let Some(&root_idx) = fns.get(root_fn_name) else {
@@ -2135,11 +2196,35 @@ impl ItreeConcreteEvaluator {
             file,
             root_fn_name: root_fn_name.to_string(),
             fns,
-            structs,
+            structs: BTreeMap::new(),
+            traits: BTreeMap::new(),
+            unsupported_top_item,
             branch_sites: BTreeMap::new(),
             trait_census,
             nested_item_names: nested_items.names,
         };
+        let mut structs = BTreeMap::new();
+        let mut traits = BTreeMap::new();
+        for item in &evaluator.file.items {
+            match item {
+                Item::Struct(s) => {
+                    let fields: EvalStructDef = s
+                        .fields
+                        .iter()
+                        .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
+                        .collect();
+                    let def = (s.generics.params.is_empty() && fields.len() == s.fields.len())
+                        .then_some((s as *const syn::ItemStruct as usize, fields));
+                    structs.insert(s.ident.to_string(), def);
+                }
+                Item::Trait(tr) => {
+                    traits.insert(tr.ident.to_string(), tr as *const syn::ItemTrait as usize);
+                }
+                _ => {}
+            }
+        }
+        evaluator.structs = structs;
+        evaluator.traits = traits;
         let mut collector = BranchSiteCollector::default();
         if let Item::Fn(root) = &evaluator.file.items[root_idx] {
             collector.visit_block(&root.block);
@@ -2210,6 +2295,12 @@ impl ItreeConcreteEvaluator {
         schedule: &EnvSchedule,
         callee_key_prefix: &str,
     ) -> Result<ItreeConcreteRun, String> {
+        if let Some(reason) = self.unsupported_top_item {
+            return Err(reason.to_string());
+        }
+        if self.trait_census.has_macro {
+            return Err("macro in candidate source".to_string());
+        }
         let root = self
             .top_fn(&self.root_fn_name)
             .ok_or_else(|| format!("root function `{}` not found", self.root_fn_name))?;
@@ -2281,8 +2372,9 @@ impl ItreeConcreteEvaluator {
 type EvalStructDef = Vec<(String, EvalTy)>;
 
 /// Methods of the `impl` items of one block, keyed by
-/// `(Self type, Option<Trait name>, method name)` (`None` for inherent `impl`s).
-type EvalMethodTable<'a> = BTreeMap<(String, Option<String>, String), &'a syn::ImplItemFn>;
+/// `(Self ItemStruct id, Option<ItemTrait id>, method name)` (`None` for
+/// inherent `impl`s).
+type EvalMethodTable<'a> = BTreeMap<(usize, Option<usize>, String), &'a syn::ImplItemFn>;
 
 struct EvalFrame<'a> {
     scopes: Vec<BTreeMap<String, EvalValue>>,
@@ -2299,7 +2391,11 @@ struct EvalFrame<'a> {
     /// then resolve to a different variable.
     bind_gen: BTreeMap<String, u64>,
     local_fns: Vec<BTreeMap<String, &'a syn::ItemFn>>,
-    local_structs: Vec<BTreeMap<String, EvalStructDef>>,
+    /// `Some((item_id, fields))` for supported nested structs, or `None` for
+    /// generic/tuple nested structs (so they still shadow outer structs).
+    local_structs: Vec<BTreeMap<String, Option<(usize, EvalStructDef)>>>,
+    /// Nested trait declarations visible in enclosing blocks (`name -> item_id`).
+    local_traits: Vec<BTreeMap<String, usize>>,
     local_methods: Vec<EvalMethodTable<'a>>,
     /// Identity of this function, method, or closure invocation.
     id: u64,
@@ -2317,6 +2413,7 @@ impl<'a> EvalFrame<'a> {
             bind_gen: BTreeMap::new(),
             local_fns: Vec::new(),
             local_structs: Vec::new(),
+            local_traits: Vec::new(),
             local_methods: Vec::new(),
             id,
             is_root,
@@ -2364,9 +2461,11 @@ struct EvalClosure<'a> {
     def_frame: u64,
     /// `EvalFrame::bind_gen` of every captured variable at creation.
     gens: Vec<(String, u64)>,
-    /// Lexical `fn` / `struct` / `impl` items visible where the closure was created.
+    /// Lexical `fn` / `struct` / `trait` / `impl` items visible where the
+    /// closure was created.
     local_fns: Vec<BTreeMap<String, &'a syn::ItemFn>>,
-    local_structs: Vec<BTreeMap<String, EvalStructDef>>,
+    local_structs: Vec<BTreeMap<String, Option<(usize, EvalStructDef)>>>,
+    local_traits: Vec<BTreeMap<String, usize>>,
     local_methods: Vec<EvalMethodTable<'a>>,
 }
 
@@ -2404,7 +2503,123 @@ impl<'a> EvalRun<'a> {
         }
     }
 
+    /// Resolve struct `name` in `frame`'s enclosing blocks, falling back to
+    /// top-level structs only when no nested item anywhere shares `name`.
+    fn resolve_struct(
+        &self,
+        frame: &EvalFrame<'a>,
+        name: &str,
+    ) -> Result<(usize, EvalStructDef), EvalCtrl> {
+        for structs in frame.local_structs.iter().rev() {
+            if let Some(entry) = structs.get(name) {
+                return match entry {
+                    Some(def) => Ok(def.clone()),
+                    None => eval_unsupported(format!("unsupported struct `{name}`")),
+                };
+            }
+        }
+        // This frame may not index the nested struct that `name` refers to
+        // (see `NestedItemNames`).
+        if self.ev.nested_item_names.contains(name) {
+            return eval_unsupported(format!("struct `{name}` is also a nested item"));
+        }
+        match self.ev.structs.get(name) {
+            Some(Some(def)) => Ok(def.clone()),
+            Some(None) => eval_unsupported(format!("unsupported struct `{name}`")),
+            None => eval_unsupported(format!("unknown struct `{name}`")),
+        }
+    }
+
+    /// Resolve trait `name` in `frame`'s enclosing blocks, falling back to
+    /// top-level traits only when no nested item anywhere shares `name`.
+    fn resolve_trait(&self, frame: &EvalFrame<'a>, name: &str) -> Result<usize, EvalCtrl> {
+        for traits in frame.local_traits.iter().rev() {
+            if let Some(&id) = traits.get(name) {
+                return Ok(id);
+            }
+        }
+        if self.ev.nested_item_names.contains(name) {
+            return eval_unsupported(format!("trait `{name}` is also a nested item"));
+        }
+        match self.ev.traits.get(name) {
+            Some(&id) => Ok(id),
+            None => eval_unsupported(format!("unknown trait `{name}`")),
+        }
+    }
+
+    fn eval_coerce(
+        &self,
+        frame: Option<&EvalFrame<'a>>,
+        v: EvalValue,
+        ty: &EvalTy,
+    ) -> EvalRes {
+        match (v, ty) {
+            (v, EvalTy::Infer) => Ok(v),
+            (EvalValue::Int(x, EvalIntTy::Infer), EvalTy::Int(t)) => coerce_inferred_int(x, *t),
+            (EvalValue::Int(x, s), EvalTy::Int(t)) if s == *t => Ok(EvalValue::Int(x, s)),
+            (EvalValue::Bool(b), EvalTy::Bool) => Ok(EvalValue::Bool(b)),
+            (EvalValue::Unit, EvalTy::Unit) => Ok(EvalValue::Unit),
+            (EvalValue::Struct(id, n, f), EvalTy::Named(m)) if n == *m => {
+                if let Some(frame) = frame {
+                    let (expected_id, _) = self.resolve_struct(frame, m)?;
+                    if id != expected_id {
+                        return eval_unsupported(format!(
+                            "struct `{n}` does not match `{m}` in scope"
+                        ));
+                    }
+                }
+                Ok(EvalValue::Struct(id, n, f))
+            }
+            (EvalValue::Ref(r), EvalTy::Ref(expected_depth)) => {
+                Ok(EvalValue::Ref(peel_ref_layers(r, *expected_depth)?))
+            }
+            (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                let trait_id = match frame {
+                    Some(frame) => self.resolve_trait(frame, tr)?,
+                    None => {
+                        if self.ev.nested_item_names.contains(tr) {
+                            return eval_unsupported(format!(
+                                "trait `{tr}` is also a nested item"
+                            ));
+                        }
+                        match self.ev.traits.get(tr) {
+                            Some(&id) => id,
+                            None => return eval_unsupported(format!("unknown trait `{tr}`")),
+                        }
+                    }
+                };
+                let mut inner = r.autoderef();
+                inner.dyn_trait = Some(trait_id);
+                Ok(EvalValue::Ref(Box::new(inner)))
+            }
+            (EvalValue::Ref(r), EvalTy::ConstPtr(expected_depth)) => {
+                let r = peel_ref_layers(r, *expected_depth)?;
+                Ok(EvalValue::ConstPtr {
+                    addr: r.addr,
+                    nonzero: eval_value_is_sized_nonzero(&r.val),
+                })
+            }
+            (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr(_)) => Ok(v),
+            (v @ EvalValue::FnRef(_), EvalTy::FnPtr) => Ok(v),
+            (
+                v @ EvalValue::Closure {
+                    captures: false, ..
+                },
+                EvalTy::FnPtr,
+            ) => Ok(v),
+            (EvalValue::Array(elems), EvalTy::Array(elem_ty)) => elems
+                .into_iter()
+                .map(|e| self.eval_coerce(frame, e, elem_ty))
+                .collect::<Result<Vec<_>, _>>()
+                .map(EvalValue::Array),
+            (v, ty) => eval_unsupported(format!("value {v:?} does not have type {ty:?}")),
+        }
+    }
+
     fn call_fn(&mut self, func: &'a syn::ItemFn, args: Vec<EvalValue>, is_root: bool) -> EvalRes {
+        if !func.sig.generics.params.is_empty() {
+            return eval_unsupported(format!("generic function `{}`", func.sig.ident));
+        }
         if func.sig.inputs.len() != args.len() {
             return eval_unsupported(format!("arity mismatch calling `{}`", func.sig.ident));
         }
@@ -2416,7 +2631,10 @@ impl<'a> EvalRun<'a> {
             let Pat::Ident(pi) = pt.pat.as_ref() else {
                 return eval_unsupported("parameter pattern");
             };
-            scope.insert(pi.ident.to_string(), eval_coerce(arg, &eval_ty_of(&pt.ty))?);
+            scope.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?,
+            );
         }
         let mut frame = EvalFrame::new(scope, self.fresh_frame_id(), is_root);
         let value = match self.eval_block(&mut frame, &func.block) {
@@ -2426,7 +2644,7 @@ impl<'a> EvalRun<'a> {
             }
             Err(e) => return Err(e),
         };
-        eval_coerce(value, &ret_ty_of(&func.sig.output))
+        self.eval_coerce(Some(&frame), value, &ret_ty_of(&func.sig.output))
     }
 
     fn fresh_frame_id(&mut self) -> u64 {
@@ -2443,6 +2661,9 @@ impl<'a> EvalRun<'a> {
         self_ref: EvalValue,
         args: Vec<EvalValue>,
     ) -> EvalRes {
+        if !method.sig.generics.params.is_empty() {
+            return eval_unsupported(format!("generic method `{}`", method.sig.ident));
+        }
         let mut inputs = method.sig.inputs.iter();
         match inputs.next() {
             Some(FnArg::Receiver(rcv))
@@ -2463,7 +2684,10 @@ impl<'a> EvalRun<'a> {
             let Pat::Ident(pi) = pt.pat.as_ref() else {
                 return eval_unsupported("parameter pattern");
             };
-            scope.insert(pi.ident.to_string(), eval_coerce(arg, &eval_ty_of(&pt.ty))?);
+            scope.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?,
+            );
         }
         let mut frame = EvalFrame::new(scope, self.fresh_frame_id(), false);
         let value = match self.eval_block(&mut frame, &method.block) {
@@ -2473,7 +2697,7 @@ impl<'a> EvalRun<'a> {
             }
             Err(e) => return Err(e),
         };
-        eval_coerce(value, &ret_ty_of(&method.sig.output))
+        self.eval_coerce(Some(&frame), value, &ret_ty_of(&method.sig.output))
     }
 
     /// Create the closure value of `expr`, capturing every free variable of
@@ -2512,6 +2736,7 @@ impl<'a> EvalRun<'a> {
             gens,
             local_fns: frame.local_fns.clone(),
             local_structs: frame.local_structs.clone(),
+            local_traits: frame.local_traits.clone(),
             local_methods: frame.local_methods.clone(),
         });
         Ok(EvalValue::Closure { id, captures })
@@ -2545,6 +2770,7 @@ impl<'a> EvalRun<'a> {
         let mut env = closure.env.clone();
         let local_fns = closure.local_fns.clone();
         let local_structs = closure.local_structs.clone();
+        let local_traits = closure.local_traits.clone();
         let local_methods = closure.local_methods.clone();
         if !closure.by_move && !live && !env.is_empty() {
             return eval_unsupported(
@@ -2583,6 +2809,19 @@ impl<'a> EvalRun<'a> {
         if expr.inputs.len() != args.len() {
             return eval_unsupported("arity mismatch calling a closure");
         }
+        let before = env.clone();
+        // A closure body is not instrumented, so it runs like a callee body.
+        let mut closure_frame = EvalFrame::new(env, self.fresh_frame_id(), false);
+        closure_frame.local_fns = local_fns;
+        closure_frame.local_structs = local_structs;
+        closure_frame.local_traits = local_traits;
+        closure_frame.local_methods = local_methods;
+        if !live_allocs.is_empty()
+            && let Some(allocs0) = closure_frame.allocs.first_mut()
+        {
+            *allocs0 = live_allocs;
+        }
+        closure_frame.unplaced = unplaced;
         let mut params = BTreeMap::new();
         for (input, arg) in expr.inputs.iter().zip(args) {
             let (pat, ty) = match input {
@@ -2595,20 +2834,11 @@ impl<'a> EvalRun<'a> {
             if pi.subpat.is_some() || pi.by_ref.is_some() {
                 return eval_unsupported("closure parameter pattern");
             }
-            params.insert(pi.ident.to_string(), eval_coerce(arg, &ty)?);
+            params.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(Some(&closure_frame), arg, &ty)?,
+            );
         }
-        let before = env.clone();
-        // A closure body is not instrumented, so it runs like a callee body.
-        let mut closure_frame = EvalFrame::new(env, self.fresh_frame_id(), false);
-        closure_frame.local_fns = local_fns;
-        closure_frame.local_structs = local_structs;
-        closure_frame.local_methods = local_methods;
-        if !live_allocs.is_empty()
-            && let Some(allocs0) = closure_frame.allocs.first_mut()
-        {
-            *allocs0 = live_allocs;
-        }
-        closure_frame.unplaced = unplaced;
         closure_frame.push_scope(params);
         let value = match self.eval_expr(&mut closure_frame, &expr.body) {
             Ok(v) | Err(EvalCtrl::Return(v)) => v,
@@ -2619,7 +2849,9 @@ impl<'a> EvalRun<'a> {
         };
         let value = match &expr.output {
             ReturnType::Default => value,
-            ReturnType::Type(_, ty) => eval_coerce(value, &eval_ty_of(ty))?,
+            ReturnType::Type(_, ty) => {
+                self.eval_coerce(Some(&closure_frame), value, &eval_ty_of(ty))?
+            }
         };
         let after = closure_frame.scopes.swap_remove(0);
         if after != before {
@@ -2637,8 +2869,8 @@ impl<'a> EvalRun<'a> {
 
     fn eval_block(&mut self, frame: &mut EvalFrame<'a>, block: &'a Block) -> EvalRes {
         let mut fns = BTreeMap::new();
-        let mut structs = BTreeMap::new();
-        let mut methods: EvalMethodTable<'a> = BTreeMap::new();
+        let mut structs: BTreeMap<String, Option<(usize, EvalStructDef)>> = BTreeMap::new();
+        let mut traits: BTreeMap<String, usize> = BTreeMap::new();
         for stmt in &block.stmts {
             match stmt {
                 Stmt::Item(Item::Fn(f)) => {
@@ -2651,56 +2883,70 @@ impl<'a> EvalRun<'a> {
                         .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
                         .collect();
                     // Only a non-generic struct whose fields are all named
-                    // is a struct the evaluator can build and read.
-                    if st.generics.params.is_empty() && fields.len() == st.fields.len() {
-                        structs.insert(st.ident.to_string(), fields);
-                    }
-                }
-                Stmt::Item(Item::Impl(im)) => {
-                    let self_ty = match im.self_ty.as_ref() {
-                        Type::Path(tp) if tp.qself.is_none() => tp.path.get_ident(),
-                        _ => None,
-                    };
-                    let trait_name = match &im.trait_ {
-                        None => Some(None),
-                        Some((None, path, _)) => path.get_ident().map(|id| Some(id.to_string())),
-                        Some((Some(_), _, _)) => None,
-                    };
-                    // A generic `impl`, negative `impl`, or one for a non-local
-                    // type/trait registers nothing, so calling it is rejected.
-                    if let Some(self_ty) = self_ty
-                        && let Some(trait_name) = trait_name
-                        && im.generics.params.is_empty()
-                    {
-                        for impl_item in &im.items {
-                            if let syn::ImplItem::Fn(m) = impl_item {
-                                let key = (
-                                    self_ty.to_string(),
-                                    trait_name.clone(),
-                                    m.sig.ident.to_string(),
-                                );
-                                methods.insert(key, m);
-                            }
-                        }
-                    }
+                    // is a struct the evaluator can build and read; insert
+                    // `None` otherwise so it still shadows any outer struct.
+                    let def = (st.generics.params.is_empty() && fields.len() == st.fields.len())
+                        .then_some((st as *const syn::ItemStruct as usize, fields));
+                    structs.insert(st.ident.to_string(), def);
                 }
                 // A trait declares signatures only; `TraitMethodCensus`
                 // accounts for the default methods it may also carry.
-                Stmt::Item(Item::Trait(_)) => {}
-                // Any other item (`use`, `const`, `static`, `mod`, ...) is
-                // in scope throughout the block, before its own statement
-                // and past an early `return` alike, so it is rejected when
-                // the block is entered rather than when it is reached.
+                Stmt::Item(Item::Trait(tr)) => {
+                    traits.insert(tr.ident.to_string(), tr as *const syn::ItemTrait as usize);
+                }
+                Stmt::Item(Item::Impl(_)) => {}
+                // Any other item (`use`, `const`, `static`, `mod`, ...) or
+                // macro statement is in scope throughout the block, before its
+                // own statement and past an early `return` alike, so it is
+                // rejected when the block is entered rather than when reached.
                 Stmt::Item(_) => return eval_unsupported("nested item"),
+                Stmt::Macro(_) => return eval_unsupported("macro statement"),
                 _ => {}
             }
         }
         frame.push_scope(BTreeMap::new());
         frame.local_fns.push(fns);
         frame.local_structs.push(structs);
+        frame.local_traits.push(traits);
+        let mut methods: EvalMethodTable<'a> = BTreeMap::new();
+        for stmt in &block.stmts {
+            let Stmt::Item(Item::Impl(im)) = stmt else {
+                continue;
+            };
+            let self_ty = match im.self_ty.as_ref() {
+                Type::Path(tp) if tp.qself.is_none() => tp.path.get_ident(),
+                _ => None,
+            };
+            let trait_name = match &im.trait_ {
+                None => Some(None),
+                Some((None, path, _)) => path.get_ident().map(|id| Some(id.to_string())),
+                Some((Some(_), _, _)) => None,
+            };
+            // A generic `impl`, negative `impl`, or one for a non-local
+            // type/trait registers nothing, so calling it is rejected.
+            if let Some(self_ty) = self_ty
+                && let Some(trait_name) = trait_name
+                && im.generics.params.is_empty()
+                && let Ok((self_id, _)) = self.resolve_struct(frame, &self_ty.to_string())
+            {
+                let trait_id = match trait_name {
+                    None => Some(None),
+                    Some(tr_name) => self.resolve_trait(frame, &tr_name).ok().map(Some),
+                };
+                if let Some(trait_id) = trait_id {
+                    for impl_item in &im.items {
+                        if let syn::ImplItem::Fn(m) = impl_item {
+                            let key = (self_id, trait_id, m.sig.ident.to_string());
+                            methods.insert(key, m);
+                        }
+                    }
+                }
+            }
+        }
         frame.local_methods.push(methods);
         let res = self.eval_stmts(frame, &block.stmts);
         frame.local_methods.pop();
+        frame.local_traits.pop();
         frame.local_structs.pop();
         frame.local_fns.pop();
         frame.pop_scope();
@@ -2763,7 +3009,7 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("`let ... else`");
         }
         let v = self.eval_expr(frame, &init.expr)?;
-        let v = eval_coerce(v, &ty)?;
+        let v = self.eval_coerce(Some(&*frame), v, &ty)?;
         if let Some(name) = name {
             frame.bind(name, v);
         }
@@ -2932,7 +3178,7 @@ impl<'a> EvalRun<'a> {
                     return eval_unsupported("field borrow");
                 };
                 match (base.autoderef().val, &f.member) {
-                    (EvalValue::Struct(_, fields), syn::Member::Named(id)) => {
+                    (EvalValue::Struct(_, _, fields), syn::Member::Named(id)) => {
                         match fields.get(&id.to_string()) {
                             Some(val) => unplaced(val.clone()),
                             None => eval_unsupported(format!("unknown field `{id}`")),
@@ -3006,7 +3252,7 @@ impl<'a> EvalRun<'a> {
             if let Some(slot) = scope.get_mut(name) {
                 let new = match (&*slot, v) {
                     (EvalValue::Int(_, t), EvalValue::Int(x, EvalIntTy::Infer)) => {
-                        eval_coerce(EvalValue::Int(x, EvalIntTy::Infer), &EvalTy::Int(*t))?
+                        coerce_inferred_int(x, *t)?
                     }
                     (_, v) => v,
                 };
@@ -3072,19 +3318,28 @@ impl<'a> EvalRun<'a> {
                 // Safe trait-object unsizing (`&T as &dyn Trait`): records the
                 // vtable's principal trait while preserving referent & address.
                 (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                    let trait_id = self.resolve_trait(frame, &tr)?;
                     let mut inner = r.autoderef();
-                    inner.dyn_trait = Some(tr);
+                    inner.dyn_trait = Some(trait_id);
                     Ok(EvalValue::Ref(Box::new(inner)))
                 }
                 // Safe cast between non-trait reference types (`&[T; N] as &[T]`).
-                (v @ EvalValue::Ref(_), EvalTy::Ref) => Ok(v),
+                (EvalValue::Ref(r), EvalTy::Ref(expected_depth))
+                    if eval_ref_depth(&r) == expected_depth =>
+                {
+                    Ok(EvalValue::Ref(r))
+                }
                 // Safe raw-pointer casts (`&T as *const T`, `fn(...) as *const ()`,
                 // `*const T as *const ()`).
-                (EvalValue::Ref(r), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
-                    addr: r.addr,
-                    nonzero: eval_value_is_sized_nonzero(&r.val),
-                }),
-                (EvalValue::FnRef(idx), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
+                (EvalValue::Ref(r), EvalTy::ConstPtr(expected_depth))
+                    if eval_ref_depth(&r) == expected_depth =>
+                {
+                    Ok(EvalValue::ConstPtr {
+                        addr: r.addr,
+                        nonzero: eval_value_is_sized_nonzero(&r.val),
+                    })
+                }
+                (EvalValue::FnRef(idx), EvalTy::ConstPtr(_)) => Ok(EvalValue::ConstPtr {
                     addr: Some(EvalAddr::FnItem(idx)),
                     nonzero: true,
                 }),
@@ -3093,12 +3348,12 @@ impl<'a> EvalRun<'a> {
                         id,
                         captures: false,
                     },
-                    EvalTy::ConstPtr,
+                    EvalTy::ConstPtr(_),
                 ) => Ok(EvalValue::ConstPtr {
                     addr: Some(EvalAddr::ClosureFn(id)),
                     nonzero: true,
                 }),
-                (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr) => Ok(v),
+                (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr(_)) => Ok(v),
                 _ => eval_unsupported("cast"),
             },
             Expr::If(i) => self.eval_if(frame, i),
@@ -3112,7 +3367,7 @@ impl<'a> EvalRun<'a> {
             Expr::Call(c) => self.eval_call(frame, c),
             Expr::Struct(s) => self.eval_struct_lit(frame, s),
             Expr::Field(f) => match (eval_autoderef(self.eval_expr(frame, &f.base)?), &f.member) {
-                (EvalValue::Struct(_, fields), syn::Member::Named(id)) => fields
+                (EvalValue::Struct(_, _, fields), syn::Member::Named(id)) => fields
                     .get(&id.to_string())
                     .cloned()
                     .map_or_else(|| eval_unsupported(format!("unknown field `{id}`")), Ok),
@@ -3245,20 +3500,7 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("struct literal path");
         };
         let name = id.to_string();
-        // A struct declared in an enclosing block shadows a top-level one.
-        let local_def = frame
-            .local_structs
-            .iter()
-            .rev()
-            .find_map(|structs| structs.get(&name).cloned());
-        // This frame may not index the nested struct that `name` refers to
-        // (see `NestedItemNames`).
-        if local_def.is_none() && self.ev.nested_item_names.contains(&name) {
-            return eval_unsupported(format!("struct `{name}` is also a nested item"));
-        }
-        let Some(def) = local_def.or_else(|| self.ev.structs.get(&name).cloned()) else {
-            return eval_unsupported(format!("unknown struct `{name}`"));
-        };
+        let (struct_id, def) = self.resolve_struct(frame, &name)?;
         let mut fields = BTreeMap::new();
         for fv in &s.fields {
             let syn::Member::Named(fid) = &fv.member else {
@@ -3270,12 +3512,12 @@ impl<'a> EvalRun<'a> {
             };
             let fty = fty.clone();
             let v = self.eval_expr(frame, &fv.expr)?;
-            fields.insert(fname, eval_coerce(v, &fty)?);
+            fields.insert(fname, self.eval_coerce(Some(&*frame), v, &fty)?);
         }
         if fields.len() != def.len() {
             return eval_unsupported("struct literal with missing fields");
         }
-        Ok(EvalValue::Struct(name, fields))
+        Ok(EvalValue::Struct(struct_id, name, fields))
     }
 
     fn eval_call(&mut self, frame: &mut EvalFrame<'a>, c: &'a syn::ExprCall) -> EvalRes {
@@ -3393,20 +3635,21 @@ impl<'a> EvalRun<'a> {
         let EvalValue::Ref(r) = self_ref else {
             return eval_unsupported("method receiver");
         };
-        let EvalValue::Struct(ty_name, _) = &r.val else {
+        let EvalValue::Struct(struct_id, ty_name, _) = &r.val else {
             return eval_unsupported("method call on a non-struct receiver");
         };
+        let struct_id = *struct_id;
         let method_name = mc.method.to_string();
         let census = &self.ev.trait_census;
-        let method = if let Some(ref tr) = r.dyn_trait {
-            let key = (ty_name.clone(), Some(tr.clone()), method_name.clone());
+        let method = if let Some(tr_id) = r.dyn_trait {
+            let key = (struct_id, Some(tr_id), method_name.clone());
             frame
                 .local_methods
                 .iter()
                 .rev()
                 .find_map(|methods| methods.get(&key).copied())
         } else {
-            let inherent_key = (ty_name.clone(), None, method_name.clone());
+            let inherent_key = (struct_id, None, method_name.clone());
             if let Some(m) = frame
                 .local_methods
                 .iter()
@@ -3433,8 +3676,8 @@ impl<'a> EvalRun<'a> {
                 let mut found: Option<&'a syn::ImplItemFn> = None;
                 let mut ambiguous = false;
                 for methods in frame.local_methods.iter().rev() {
-                    for ((s, tr, mn), &m) in methods {
-                        if s == ty_name && tr.is_some() && mn == &method_name {
+                    for ((s_id, tr_id, mn), &m) in methods {
+                        if *s_id == struct_id && tr_id.is_some() && mn == &method_name {
                             if found.is_some() {
                                 ambiguous = true;
                                 break;
@@ -3446,10 +3689,13 @@ impl<'a> EvalRun<'a> {
                         break;
                     }
                 }
-                // Likewise, a second trait that gives the type this method
-                // from outside the enclosing blocks may be the vtable that
-                // an implicitly unsized receiver dispatches through.
-                if ambiguous || census.providers(ty_name, &method_name).len() > 1 {
+                // Likewise, a macro, a second trait, or an inherent `impl`
+                // outside the enclosing blocks may supply the method instead.
+                if ambiguous
+                    || census.has_macro
+                    || census.providers(ty_name, &method_name).len() > 1
+                    || census.has_inherent(ty_name, &method_name)
+                {
                     None
                 } else {
                     found
@@ -3488,7 +3734,7 @@ impl<'a> EvalRun<'a> {
             let FnArg::Typed(pt) = input else {
                 return eval_unsupported("method receiver");
             };
-            let v = eval_coerce(arg, &eval_ty_of(&pt.ty))?;
+            let v = self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?;
             raw_args.push(eval_encode(&v)?);
             typed.push(v);
         }
@@ -5598,6 +5844,43 @@ mod tests {
                  };
                  (f(a) >> 1) + 1u32
              }",
+            // Deref coercion `&&u32 -> &u32` keeps the referent's address,
+            // while an explicit `&&u32` (or `*const &u32`) keeps the outer
+            // reference's stack address.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let r2: &u32 = &r1;
+                let rr: &&u32 = &r1;
+                let p1: *const u32 = r2;
+                let p2: *const &u32 = &r1;
+                let same_ref: bool = core::ptr::addr_eq(r1, r2);
+                let diff_ref: bool = core::ptr::addr_eq(r1, rr);
+                let same_ptr: bool = core::ptr::addr_eq(r1, p1);
+                let diff_ptr: bool = core::ptr::addr_eq(r1, p2);
+                if same_ref && !diff_ref && same_ptr && !diff_ptr {
+                    ((*r2) >> 1) + 1u32
+                } else {
+                    0u32
+                }
+            }",
+            // A `&dyn Left` created in an outer block keeps the outer trait's
+            // vtable even when an inner block declares a second `trait Left`
+            // and `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { (self.v >> 1) ^ 0x55u32 } }
+                let both = Both { v: a };
+                let r: &dyn Left = &both;
+                let inner_res: u32 = {
+                    trait Left { fn pick(&self) -> u32; }
+                    impl Left for Both { fn pick(&self) -> u32 { 999u32 } }
+                    let inner_r: &dyn Left = &both;
+                    r.pick() ^ inner_r.pick()
+                };
+                (inner_res >> 1) ^ (b & 0xFFu32)
+            }",
         ];
         let cands: Vec<GeneratedItreeCandidate> = modeled
             .iter()
@@ -5955,6 +6238,86 @@ mod tests {
                 let f = move || cap;
                 (core::mem::size_of_val(&f) as u32) ^ f() ^ b
             }",
+            // A value of a shadowed inner `struct Both` leaving its block must
+            // not dispatch to the outer `struct Both`'s inherent `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let inner = {
+                    struct Both { v: u32 }
+                    impl Both { fn pick(&self) -> u32 { self.v } }
+                    Both { v: a }
+                };
+                inner.pick() ^ b
+            }",
+            // An inherent `impl` inside an unentered block still overrides a
+            // trait `impl` on a concrete receiver in native Rust.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                if a == b {
+                    impl Both { fn pick(&self) -> u32 { 999u32 } }
+                }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // Likewise a top-level inherent `impl` on a top-level struct.
+            "pub struct Both { pub v: u32 }
+             impl Both { pub fn pick(&self) -> u32 { 999u32 } }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // A macro statement after an early `return` expands at compile time
+            // and can introduce a `use` alias that renames the callee before
+            // `return`, even when no method call runs.
+            "macro_rules! alias {
+                () => { use self::second as first; };
+             }
+             pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                return first(a) ^ b;
+                alias!();
+            }",
+            // A macro inside an inherent `impl` (`ImplItem::Macro`) may expand
+            // to an inherent method that shadows the trait `impl` in scope.
+            "macro_rules! gen_pick {
+                () => { fn pick(&self) -> u32 { 999u32 } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Shown { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { gen_pick!(); }
+                impl Shown for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // A macro inside a `trait` (`TraitItem::Macro`) may expand to a
+            // default method that an empty `impl` inherits.
+            "macro_rules! gen_default {
+                () => { fn pick(&self) -> u32 { 1u32 } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { gen_default!(); }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A top-level `use` alias is outside the supported subset.
+            "pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             use self::second as renamed;
+             pub fn probe(a: u32, b: u32) -> u32 {
+                renamed(a) ^ first(b)
+            }",
         ];
         for probe in rejected {
             let source = format!("{probe}\n{ROOT}");
@@ -6009,12 +6372,26 @@ mod tests {
         assert!(providers("Both", "own").is_empty());
         assert!(providers("Other", "pick").is_empty());
         assert!(providers("Other", "deep").is_empty());
+        // Inherent `impl`s are tracked separately so a trait-only receiver
+        // fails closed when an inherent method exists outside enclosing blocks.
+        assert!(census.has_inherent("Both", "own"));
+        assert!(!census.has_inherent("Other", "own"));
+        assert!(!census.has_inherent("Both", "pick"));
 
-        let with_macro: File = syn::parse_str("pub fn probe(a: u32) -> u32 { hide!(); a }")
-            .expect("parse macro source");
-        let mut macro_census = TraitMethodCensus::default();
-        macro_census.visit_file(&with_macro);
-        assert!(macro_census.has_macro);
+        for macro_src in [
+            "pub fn probe(a: u32) -> u32 { hide!(); a }",
+            "struct S; impl S { gen_pick!(); }",
+            "trait T { gen_default!(); }",
+            "gen_top_item!();",
+        ] {
+            let with_macro: File = syn::parse_str(macro_src).expect("parse macro source");
+            let mut macro_census = TraitMethodCensus::default();
+            macro_census.visit_file(&with_macro);
+            assert!(
+                macro_census.has_macro,
+                "expected `has_macro` on:\n{macro_src}"
+            );
+        }
     }
 
     #[test]

@@ -4677,6 +4677,106 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
         )
         self.assertTrue(all(campaign.quarantine_entry_harness(k) == "itree" for k in keys))
 
+    def test_enclosing_item_owner_handles_indented_mod_nested_helpers_and_inter_item_attrs(
+        self,
+    ) -> None:
+        """Inside a `pub mod c0 { ... }` multi-candidate crate, `_enclosing_miri_mutator_item_owner`
+        handles preamble `use` / `unsafe impl` lines, attributes/doc comments between sibling items
+        (without bleeding back into a closed prior item), and every helper inside nested
+        `mod __anneal_clos_* { pub mod __ { eval_once, eval, apply_keep } }` even after inner `}`s."""
+        src_lines = (
+            "pub mod c0 {",  # 1
+            "    use core::cell::UnsafeCell;",  # 2
+            "    unsafe impl Sync for FreezeAndCell {}",  # 3
+            "    mod __anneal_clos_5 {",  # 4
+            "        pub mod __ {",  # 5
+            "            pub fn eval_once<T, F: FnOnce() -> T>(f: F) -> T {",  # 6
+            "                f()",  # 7
+            "            }",  # 8
+            "",  # 9
+            "            pub fn eval<T, F: Fn() -> T>(f: F) -> T {",  # 10
+            "                f()",  # 11
+            "            }",  # 12
+            "",  # 13
+            "            pub fn apply_keep<T, U, F: Fn(U) -> (T, U)>(f: F, v: U) -> (T, U) {",  # 14
+            "                f(v)",  # 15
+            "            }",  # 16
+            "        }",  # 17
+            "    }",  # 18
+            "    #[inline(never)]",  # 19  (inter-item attr must not bleed into mod __anneal_clos_5)
+            "    fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {",  # 20
+            "        __vt_seed ^ __vt_bias",  # 21
+            "    }",  # 22
+            "    /// Doc comment on corpus seed.",  # 23 (must not bleed into fn __anneal_vt_driver_7)
+            "    pub fn pass_seed__b0_c0() -> u32 {",  # 24
+            "        let __miri_vt_7: u32 = __anneal_vt_driver_7(1u32, 2u32);",  # 25
+            "        __miri_vt_7",  # 26
+            "    }",  # 27
+            "}",  # 28
+        )
+        lines = list(src_lines)
+        cand_start = 24
+        for line_nos, owner in (
+            (range(1, 4), None),  # `pub mod c0`, `use`, `unsafe impl`
+            (range(4, 19), "ClosureAndAddrEqMutator"),  # all 3 nested helpers through outer `}`
+            ((19,), None),  # inter-item `#[inline(never)]` after closing `}`
+            (range(20, 23), "VTableAndFnPtrMutator"),  # `fn __anneal_vt_driver_7` through `}`
+            ((23,), None),  # doc comment ahead of candidate fn
+            (range(24, 29), None),  # candidate fn and closing `pub mod`
+        ):
+            for line_no in line_nos:
+                with self.subTest(line_no=line_no):
+                    self.assertEqual(
+                        campaign._enclosing_miri_mutator_item_owner(lines, line_no, cand_start),
+                        owner,
+                    )
+        # Fault inside `apply_keep` (line 15, after inner `}`s on lines 8 and 12)
+        # attributes cleanly to `ClosureAndAddrEqMutator` regardless of mutator order.
+        for mutators in (
+            ["VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"],
+            ["ClosureAndAddrEqMutator", "VTableAndFnPtrMutator"],
+        ):
+            finding = {
+                "seed_name": "pass_seed",
+                "fn_name": "pass_seed__b0_c0",
+                "applied_mutators": mutators,
+                "mutant_source": "\n".join(src_lines) + "\n",
+                "miri_pos": "src/lib.rs:15:17",
+            }
+            self.assertEqual(campaign.extract_fault_line_text(finding), src_lines[14])
+            self.assertEqual(campaign.infer_finding_cause(finding, set()), "ClosureAndAddrEqMutator")
+
+    def test_campaign_attribution_tokens_match_rust_layout_tests(self) -> None:
+        """Cross-language parity ratchet: the indirect-call token and item-header
+        prefix tuples in `scripts/run_diff_test_campaign.py` must match the exact
+        Rust constants checked by `vtable_fnptr_mutator_tests.rs`."""
+        rust_test_path = (
+            SCRIPT_DIR.parent
+            / "crates"
+            / "anneal-difftest"
+            / "tests"
+            / "vtable_fnptr_mutator_tests.rs"
+        )
+        rust_src = rust_test_path.read_text(encoding="utf-8")
+
+        def parse_rust_str_array(const_name: str) -> tuple[str, ...]:
+            m = re.search(
+                rf"const {const_name}: \[&str; \d+\] = \[(.*?)\];",
+                rust_src,
+                re.DOTALL,
+            )
+            self.assertIsNotNone(m, f"missing `{const_name}` in {rust_test_path}")
+            return tuple(re.findall(r'"([^"]*)"', m.group(1)))
+
+        for py_vals, rust_const in (
+            (campaign.MIRI_MUTATOR_ITEM_HEADER_PREFIXES, "CAMPAIGN_ITEM_HEADER_PREFIXES"),
+            (campaign.MIRI_PREAMBLE_ITEM_HEADER_PREFIXES, "CAMPAIGN_PREAMBLE_HEADER_PREFIXES"),
+            (campaign.VTABLE_FNPTR_MUTATOR_TOKENS, "CAMPAIGN_VTABLE_TOKENS"),
+            (campaign.CLOSURE_ADDR_EQ_MUTATOR_TOKENS, "CAMPAIGN_CLOSURE_TOKENS"),
+        ):
+            with self.subTest(rust_const=rust_const):
+                self.assertEqual(py_vals, parse_rust_str_array(rust_const))
+
 
 class GateProfileAndModeTest(unittest.TestCase):
     """`nightly` enables both gates by default (with `--no-*` opt-outs); other
