@@ -59,12 +59,18 @@ state when a panic may happen, when it must happen, and that every execution
 4. Adequacy of `DWLP` / `DWP` and of the bounded evaluators of
    `Anneal.Rustc.V2026_06_01.Lower` for these contracts.
 5. Panic call contracts (`PanicMirCallContract`), caller–callee composition
-   through `linkCalleeHandler` (`panicsOnlyIf_call_compose`), and the memory a
-   linked callee presents on unwind.
+   through `linkCalleeHandler` (`panicsOnlyIf_call_compose`) and through the
+   frame-restoring `linkCalleeWithCalleesHandler`, the memory a linked callee
+   presents on unwind, and finite counterexample traces of a linked system
+   (`ReachesLinkedFault`).
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
-   body.
-7. The syntactic call-boundary guard `CallBoundaryPreserved`.
+   body. The guard is established for initial states, used at each call
+   terminator, and carried across the resumption of an external call whose
+   contract has `withTraitsPreserved`. That the statements executed between two
+   calls leave `callees` and `traitImpls` unchanged is not proved here.
+7. The syntactic call-boundary guards `CallBoundaryPreserved`,
+   `CalleesCallBoundaryPreserved`, and the counted `CallSitesPreserved`.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
    `ExactPass`.
 -/
@@ -2803,6 +2809,25 @@ theorem outcomeToRestoredCallAns_abort (callerMem : Memory) :
     outcomeToRestoredCallAns callerMem .abort = .aborted :=
   rfl
 
+/--
+The lowered call contract of the frame-restored answer
+`outcomeToRestoredCallAns req.memory out`, as an outcome classifier on the
+isolated callee: a return is judged on the memory with the caller's frame
+restored, and a panic presents `req.memory`.
+-/
+theorem PanicMirCallContract.toPolicy_post_outcomeToRestoredCallAns_iff
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq) (req : MirCallReq)
+    (out : MirOutcome) :
+    (P.toPolicyMirCallContract policy).post req
+        (outcomeToRestoredCallAns req.memory out) ↔
+      PolicyOutcomeOk policy req
+        (fun r => P.post req r.1 (restoreCallerMemoryFrame req.memory r.2))
+        (P.panicCond req ∧ P.panicMemInv req req.memory) out := by
+  cases out with
+  | normal r => exact Iff.rfl
+  | panic => exact Iff.rfl
+  | abort => exact Iff.rfl
+
 section AnyAnswer
 
 variable {E : Effect.{u}} {R A B : Type u}
@@ -3240,6 +3265,75 @@ def mirExternalClosedCalleeTrees (calleeBody : CapturedMir)
     ITree.interp failUnlinkedCalls
       (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
 
+section ExternalClosedCallee
+
+variable {calleeBody : CapturedMir} {calleeCallees : List CapturedMir}
+  {pre : MirCallReq → Prop} {post : MirCallReq → MirReturn → Prop}
+  {panicCond : MirCallReq → Prop} {policy : AbortPolicy MirCallReq}
+
+/--
+`DWLP mirNoCallWP` on the isolated callee tree establishes the policy contract
+of the isolated closed callee trees.
+-/
+theorem mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp
+    (h : ∀ req, pre req →
+      DWLP mirNoCallWP (mirExternalCalleeTree calleeBody req.args req.memory calleeCallees)
+        (fun out _ => PolicyOutcomeOk policy req (post req) (panicCond req) out)
+        PUnit.unit) :
+    PanicsWithPolicyOnlyIf (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond policy :=
+  panicsWithPolicyOnlyIf_of_dwlp (ewp := mirClosedWP) fun req hPre =>
+    dwlp_interp failUnlinkedCalls failUnlinkedCalls_links_dwlp (h req hPre)
+
+/-- `wpMirNoCallBounded` establishes the policy contract of the isolated closed callee trees. -/
+theorem mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_wpMirNoCallBounded
+    (fuel : Nat)
+    (h : ∀ req, pre req →
+      wpMirNoCallBounded fuel calleeBody
+        (enterExternalCalleeState calleeBody req.args req.memory calleeCallees)
+        (PolicyOutcomeOk policy req (post req) (panicCond req))) :
+    PanicsWithPolicyOnlyIf (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond policy :=
+  mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp
+    fun req hPre => dwlp_cofix_of_wpCoalBounded (h req hPre)
+
+/-- `wpMirNoCallSym` establishes the policy contract of the isolated closed callee trees. -/
+theorem mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_wpMirNoCallSym
+    (fuel : Nat)
+    (h : ∀ req, pre req →
+      wpMirNoCallSym fuel calleeBody
+        (enterExternalCalleeState calleeBody req.args req.memory calleeCallees)
+        (PolicyOutcomeOk policy req (post req) (panicCond req))) :
+    PanicsWithPolicyOnlyIf (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond policy :=
+  mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_wpMirNoCallBounded fuel
+    fun req hPre => (wpMirNoCallSym_eq_wpMirNoCallBounded fuel calleeBody _ _) ▸ h req hPre
+
+/-- `wpMirNoCallBounded` establishes the only-if contract of the isolated closed callee trees. -/
+theorem mirExternalClosedCalleeTrees_panicsOnlyIf_of_wpMirNoCallBounded (fuel : Nat)
+    (h : ∀ req, pre req →
+      wpMirNoCallBounded fuel calleeBody
+        (enterExternalCalleeState calleeBody req.args req.memory calleeCallees)
+        (PanicOutcomeOk (post req) (panicCond req))) :
+    PanicsOnlyIf (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond :=
+  panicsOnlyIf_of_dwlp (ewp := mirClosedWP) fun req hPre =>
+    dwlp_interp failUnlinkedCalls failUnlinkedCalls_links_dwlp
+      (dwlp_cofix_of_wpCoalBounded (h req hPre))
+
+/-- `wpMirNoCallSym` establishes the only-if contract of the isolated closed callee trees. -/
+theorem mirExternalClosedCalleeTrees_panicsOnlyIf_of_wpMirNoCallSym (fuel : Nat)
+    (h : ∀ req, pre req →
+      wpMirNoCallSym fuel calleeBody
+        (enterExternalCalleeState calleeBody req.args req.memory calleeCallees)
+        (PanicOutcomeOk (post req) (panicCond req))) :
+    PanicsOnlyIf (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond :=
+  mirExternalClosedCalleeTrees_panicsOnlyIf_of_wpMirNoCallBounded fuel fun req hPre =>
+    (wpMirNoCallSym_eq_wpMirNoCallBounded fuel calleeBody _ _) ▸ h req hPre
+
+end ExternalClosedCallee
+
 /--
 A callee whose isolated closed trees satisfy the frame-restored policy contract
 of `P` induces a `linkCalleeWithCalleesHandler` implementing the lowered call
@@ -3519,6 +3613,273 @@ theorem panicsOnlyIf_call_compose_withCallees (P : PanicMirCallContract)
       calleeCallees fallback (panicsWithPolicyOnlyIf_forbidAbort_iff.2 hCallee) hFallback)
 
 end Compose
+
+/-! ### Refuting linked contracts -/
+
+section BindReach
+
+variable {E : Effect.{u}} [FaultEffect E] {A B : Type u}
+
+/-- Reachability is preserved by sequencing a continuation after the tree. -/
+theorem reaches_bind {t u : ITree E A} {tr : List (Event E)} (f : A → ITree E B)
+    (h : Reaches t tr u) : Reaches (t >>= f) tr (u >>= f) := by
+  induction h with
+  | refl x => exact .refl _
+  | @tau x x' _ _ hTau _ ih =>
+    have hx : x = ITree.tau x' :=
+      ITree.eq_of_observe_eq (hTau.trans (ITree.observe_tau _).symm)
+    rw [hx, tau_bind]
+    exact .tau (ITree.observe_tau _) ih
+  | @vis x _ i k _ hVis hnf o _ ih =>
+    have hx : x = ITree.vis i k :=
+      ITree.eq_of_observe_eq (hVis.trans (ITree.observe_vis _ _).symm)
+    rw [hx, vis_bind]
+    exact .vis (ITree.observe_vis _ _) hnf o ih
+
+/-- A completed execution of `t` with result `a` continues as `f a` in `t >>= f`. -/
+theorem reaches_bind_of_reachesRet {t : ITree E A} {tr : List (Event E)} {a : A}
+    (f : A → ITree E B) (h : ReachesRet t tr a) : Reaches (t >>= f) tr (f a) := by
+  obtain ⟨u, hr, hu⟩ := h
+  have hx : u = ITree.ret a :=
+    ITree.eq_of_observe_eq (hu.trans (ITree.observe_ret a).symm)
+  have hb := reaches_bind f hr
+  rwa [hx, ret_bind] at hb
+
+/-- A fault reached silently by `t` is reached silently by `t >>= f`. -/
+theorem faultNow_bind {t : ITree E A} (f : A → ITree E B) (h : FaultNow t) :
+    FaultNow (t >>= f) := by
+  obtain ⟨u, i, k, hTau, hObs, hF⟩ := h
+  have hu : u = ITree.vis i k :=
+    ITree.eq_of_observe_eq (hObs.trans (ITree.observe_vis _ _).symm)
+  refine ⟨u >>= f, i, fun o => k o >>= f, TauStar.bind f hTau, ?_, hF⟩
+  rw [hu, vis_bind, ITree.observe_vis]
+
+/-- Sequencing a continuation cannot repair a fault of the first tree. -/
+theorem not_treeSafe_bind {t : ITree E A} (f : A → ITree E B) (h : ¬ TreeSafe t) :
+    ¬ TreeSafe (t >>= f) := fun hs =>
+  h fun tr u hr hF => hs tr (u >>= f) (reaches_bind f hr) (faultNow_bind f hF)
+
+/-- A tree whose first step is silent is safe only if its residual is. -/
+theorem treeSafe_of_treeSafe_tau {t : ITree E A} (h : TreeSafe (ITree.tau t)) :
+    TreeSafe t :=
+  treeSafe_residual h (Reaches.tau (ITree.observe_tau t) (.refl t))
+
+end BindReach
+
+section InterpCofix
+
+variable {S : Type} {E₁ E₂ : Effect.{0}} {R : Type}
+
+private theorem interp_cofix_tau (H : (i : E₁.I) → ITree E₂ (E₁.O i))
+    {step : S → ITreeF E₁ R S} {st st' : S} (h : step st = .tau st') :
+    ITree.interp H (ITree.cofix step st) =
+      ITree.tau (ITree.interp H (ITree.cofix step st')) := by
+  have hEq : ITree.cofix step st = ITree.tau (ITree.cofix step st') := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, h, ITree.observe_tau]
+    rfl
+  rw [hEq, interp_tau]
+
+private theorem interp_cofix_vis (H : (i : E₁.I) → ITree E₂ (E₁.O i))
+    {step : S → ITreeF E₁ R S} {st : S} {i : E₁.I} {k : E₁.O i → S}
+    (h : step st = .vis i k) :
+    ITree.interp H (ITree.cofix step st) =
+      (H i >>= fun o => ITree.tau (ITree.interp H (ITree.cofix step (k o)))) := by
+  have hEq : ITree.cofix step st = ITree.vis i (fun o => ITree.cofix step (k o)) := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, h, ITree.observe_vis]
+    rfl
+  rw [hEq, interp_vis]
+
+end InterpCofix
+
+private theorem reachesRet_emit_mirClosed (obs : MirObs) :
+    ∃ tr, ReachesRet (ITree.emit (E := MirClosedEffect) obs) tr PUnit.unit := by
+  unfold ITree.emit ITree.triggerSub
+  exact ⟨_, _, .vis (ITree.observe_vis _ _) (fun hF => hF) PUnit.unit (.refl _),
+    ITree.observe_ret _⟩
+
+/--
+Residual of `body` from the execution state `st` with every external call
+answered by the handler `h`.
+-/
+def mirHandledFrom (body : CapturedMir) (h : ExternalCallHandler) (st : MirExecState) :
+    ITree MirClosedEffect MirOutcome :=
+  ITree.interp (handleMirExternalCalls h) (ITree.cofix (stepMirState body) st)
+
+/-- `mirHandledTrees` is the handled residual from the initial state. -/
+theorem mirHandledTrees_eq_mirHandledFrom (body : CapturedMir) (h : ExternalCallHandler)
+    (callees : List CapturedMir) (x : MirInput) :
+    mirHandledTrees body h callees x =
+      mirHandledFrom body h
+        (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) :=
+  rfl
+
+/--
+The linked execution of `body` from `st` under the handler `h` reaches a fault.
+Each constructor follows one step of `stepMirState`: a fault, a silent step, an
+observation, an external call answered by a completed execution of `h`, or an
+external call on which `h` itself is not fault-free.
+
+A derivation is a finite counterexample trace. It refutes every panic contract
+of the linked system on a precondition that contains the input, whatever the
+postcondition, the panic condition, and the abort policy.
+-/
+inductive ReachesLinkedFault (body : CapturedMir) (h : ExternalCallHandler) :
+    MirExecState → Prop where
+  /-- The next step is a fault request. -/
+  | fail {st : MirExecState} {f : FailReq FailureKind} {k : PEmpty → MirExecState} :
+      stepMirState body st = .vis (.inl f) k → ReachesLinkedFault body h st
+  /-- The next step is silent and the residual reaches a fault. -/
+  | tau {st st' : MirExecState} :
+      stepMirState body st = .tau st' → ReachesLinkedFault body h st' →
+      ReachesLinkedFault body h st
+  /-- The next step is an observation and the residual reaches a fault. -/
+  | obs {st : MirExecState} {ev : ObsReq MirObs} {k : PUnit → MirExecState} :
+      stepMirState body st = .vis (.inr (.inl ev)) k →
+      ReachesLinkedFault body h (k PUnit.unit) → ReachesLinkedFault body h st
+  /-- The next step is a call, `h` answers `ans`, and the resumed residual reaches a fault. -/
+  | call {st : MirExecState} {req : MirCallReq} {k : MirCallAns → MirExecState}
+      {tr : List (Event MirClosedEffect)} {ans : MirCallAns} :
+      stepMirState body st = MirStepNode.extCall req k →
+      ReachesRet (h req) tr ans → ReachesLinkedFault body h (k ans) →
+      ReachesLinkedFault body h st
+  /-- The next step is a call on which `h` is not fault-free. -/
+  | handler {st : MirExecState} {req : MirCallReq} {k : MirCallAns → MirExecState} :
+      stepMirState body st = MirStepNode.extCall req k → ¬ TreeSafe (h req) →
+      ReachesLinkedFault body h st
+
+/-- A linked fault makes the handled residual unsafe. -/
+theorem ReachesLinkedFault.not_treeSafe {body : CapturedMir} {h : ExternalCallHandler}
+    {st : MirExecState} (hF : ReachesLinkedFault body h st) :
+    ¬ TreeSafe (mirHandledFrom body h st) := by
+  induction hF with
+  | @fail st f k hStep =>
+    intro hs
+    unfold mirHandledFrom at hs
+    cases f with
+    | fail fk =>
+      rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+        (i := Sum.inl (FailReq.fail fk)) (k := k) hStep] at hs
+      exact hs [] _ (.refl _) (faultNow_bind _ (faultNow_fail fk))
+  | @tau st st' hStep _ ih =>
+    intro hs
+    unfold mirHandledFrom at hs
+    rw [interp_cofix_tau (handleMirExternalCalls h) hStep] at hs
+    exact ih (treeSafe_of_treeSafe_tau hs)
+  | @obs st ev k hStep _ ih =>
+    intro hs
+    unfold mirHandledFrom at hs
+    rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+      (i := Sum.inr (Sum.inl ev)) (k := k) hStep] at hs
+    cases ev with
+    | emit obsEv =>
+      obtain ⟨tr, hEmit⟩ := reachesRet_emit_mirClosed obsEv
+      exact ih (treeSafe_of_treeSafe_tau
+        (treeSafe_residual hs (reaches_bind_of_reachesRet _ hEmit)))
+  | @call st req k tr ans hStep hAns _ ih =>
+    intro hs
+    unfold mirHandledFrom at hs
+    rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+      (i := Sum.inr (Sum.inr (CallReq.call req))) (k := k) hStep] at hs
+    exact ih (treeSafe_of_treeSafe_tau
+      (treeSafe_residual hs (reaches_bind_of_reachesRet _ hAns)))
+  | @handler st req k hStep hBad =>
+    intro hs
+    unfold mirHandledFrom at hs
+    rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+      (i := Sum.inr (Sum.inr (CallReq.call req))) (k := k) hStep] at hs
+    exact not_treeSafe_bind _ hBad hs
+
+/--
+A fault found by the call-free bounded detector `reachesFaultExecBounded` is a
+linked fault under every handler: the detector follows silent steps and
+observations only, so no handler answer is involved.
+-/
+theorem ReachesLinkedFault.of_reachesFaultExecBounded {body : CapturedMir}
+    (h : ExternalCallHandler) (fuel : Nat) {st : MirExecState}
+    (hFault : reachesFaultExecBounded fuel body st = true) :
+    ReachesLinkedFault body h st := by
+  induction fuel generalizing st with
+  | zero => nomatch hFault
+  | succ fuel' ih =>
+    unfold reachesFaultExecBounded at hFault
+    rw [stepMirStatePeriodic_eq] at hFault
+    cases hStep : stepMirState body st with
+    | ret _ =>
+      simp only [hStep] at hFault
+      nomatch hFault
+    | tau st' =>
+      simp only [hStep] at hFault
+      exact .tau hStep (ih hFault)
+    | vis i k =>
+      rcases i with f | (e | c)
+      · exact .fail hStep
+      · simp only [hStep] at hFault
+        exact .obs hStep (ih hFault)
+      · simp only [hStep] at hFault
+        nomatch hFault
+
+section LinkedRefutation
+
+variable {body : CapturedMir} {h : ExternalCallHandler} {callees : List CapturedMir}
+  {pre : MirInput → Prop} {post : MirInput → MirReturn → Prop}
+  {panicCond : MirInput → Prop} {policy : AbortPolicy MirInput} {x : MirInput}
+
+/--
+A linked fault from the initial state of an input in `pre` refutes every policy
+contract of the linked system, for every `post`, `panicCond`, and `policy`.
+-/
+theorem not_panicsWithPolicyOnlyIf_of_reachesLinkedFault (hx : pre x)
+    (hF : ReachesLinkedFault body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees))) :
+    ¬ PanicsWithPolicyOnlyIf (mirHandledTrees body h callees) pre post panicCond policy :=
+  fun hC => hF.not_treeSafe (hC x hx).1
+
+/-- A linked fault from the initial state of an input in `pre` refutes `PanicsOnlyIf`. -/
+theorem not_panicsOnlyIf_of_reachesLinkedFault (hx : pre x)
+    (hF : ReachesLinkedFault body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees))) :
+    ¬ PanicsOnlyIf (mirHandledTrees body h callees) pre post panicCond :=
+  fun hC => hF.not_treeSafe (hC x hx).1
+
+/--
+A rely–guarantee policy contract is refuted by one handler that satisfies the
+rely and under which the linked execution of an input in `pre` reaches a fault.
+-/
+theorem not_mirModularPanicsWithPolicyOnlyIf_of_reachesLinkedFault
+    {envAssumed : ExternalCallHandler → Prop} (hEnv : envAssumed h) (hx : pre x)
+    (hF : ReachesLinkedFault body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees))) :
+    ¬ MirModularPanicsWithPolicyOnlyIf body envAssumed pre post panicCond policy callees :=
+  fun hC => not_panicsWithPolicyOnlyIf_of_reachesLinkedFault hx hF (hC h hEnv)
+
+/--
+A rely–guarantee only-if contract is refuted by one handler that satisfies the
+rely and under which the linked execution of an input in `pre` reaches a fault.
+-/
+theorem not_mirModularPanicsOnlyIf_of_reachesLinkedFault
+    {envAssumed : ExternalCallHandler → Prop} (hEnv : envAssumed h) (hx : pre x)
+    (hF : ReachesLinkedFault body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees))) :
+    ¬ MirModularPanicsOnlyIf body envAssumed pre post panicCond callees :=
+  fun hC => not_panicsOnlyIf_of_reachesLinkedFault hx hF (hC h hEnv)
+
+end LinkedRefutation
+
+/-- A handler that answers `answer req` immediately completes with that answer. -/
+theorem reachesRet_pure_handler (answer : MirCallAns) :
+    ReachesRet (pure answer : ITree MirClosedEffect MirCallAns) [] answer :=
+  ⟨_, .refl _, ITree.observe_ret answer⟩
+
+/--
+A handler that answers every request immediately implements every call contract
+its answers satisfy.
+-/
+theorem holdsOn_pure_handler (C : MirCallContract) (answer : MirCallReq → MirCallAns)
+    (h : ∀ req, C.pre req → C.post req (answer req)) :
+    C.holdsOn (fun req => pure (answer req)) :=
+  fun req hPre => dwlp_pure_adequacy (ewp := mirClosedWP) (DWLP.ret (h req hPre))
 
 /-! ### Unwind actions at an external call site -/
 
@@ -4911,6 +5272,92 @@ theorem not_bodyCallsDefPath_of_no_blocks (targetDefPath : DefPath) (body : Capt
   unfold bodyCallsDefPath
   rw [hNil]
   rfl
+
+/-! ### Call-site counts -/
+
+/-- Number of basic blocks of `body` that end in a direct call to `targetDefPath`. -/
+def bodyCallSiteCount (targetDefPath : DefPath) (body : CapturedMir) : Nat :=
+  body.basicBlocks.countP (fun bb => terminatorCallsDefPath targetDefPath bb.terminator)
+
+/-- A body calls the target exactly when it has at least one direct call site. -/
+theorem bodyCallsDefPath_iff_bodyCallSiteCount_pos (targetDefPath : DefPath)
+    (body : CapturedMir) :
+    bodyCallsDefPath targetDefPath body = true ↔
+      0 < bodyCallSiteCount targetDefPath body := by
+  unfold bodyCallsDefPath bodyCallSiteCount
+  rw [List.any_eq_true, List.countP_pos_iff]
+
+/--
+Capture-level call-boundary guard with a call-site count.
+`CallBoundaryPreserved` asks for one surviving direct call, so a caller with
+several calls to the target still satisfies it after all but one of them were
+inlined before capture. This guard pins the number of direct call sites to
+`expectedSites`, the number recorded for the caller before optimization.
+
+The count is syntactic, as `BodyCallsDefPath` is: it does not distinguish a
+reachable call from an unreachable decoy block.
+-/
+structure CallSitesPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) (expectedSites : Nat) : Prop where
+  /-- The captured caller has exactly `expectedSites` direct calls to the target. -/
+  siteCount : bodyCallSiteCount targetDefPath callerBody = expectedSites
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation of the caller or of a linked body dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `CallSitesPreserved`. -/
+def callSitesPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) (expectedSites : Nat) : Bool :=
+  Nat.beq (bodyCallSiteCount targetDefPath callerBody) expectedSites &&
+    ((findCallee? callees targetDefPath).isNone &&
+      !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+        targetDefPath)
+
+/-- The checker decides `CallSitesPreserved`. -/
+theorem callSitesPreserved_iff (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) (expectedSites : Nat) :
+    callSitesPreserved callerBody callees targetDefPath expectedSites = true ↔
+      CallSitesPreserved callerBody callees targetDefPath expectedSites := by
+  unfold callSitesPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none]
+  exact ⟨fun ⟨h₁, h₂, h₃⟩ => ⟨Nat.eq_of_beq_eq_true h₁, h₂, h₃⟩,
+    fun h => ⟨h.siteCount ▸ Nat.beq_refl _, h.notLinked, h.noTraitImpl⟩⟩
+
+/-- With at least one expected site, the counted guard implies `CallBoundaryPreserved`. -/
+theorem CallSitesPreserved.toCallBoundaryPreserved {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (h : CallSitesPreserved callerBody callees targetDefPath expectedSites)
+    (hPos : 0 < expectedSites) :
+    CallBoundaryPreserved callerBody callees targetDefPath :=
+  ⟨(bodyCallsDefPath_iff _ _).1
+      ((bodyCallsDefPath_iff_bodyCallSiteCount_pos _ _).2 (h.siteCount ▸ hPos)),
+    h.notLinked, h.noTraitImpl⟩
+
+/-- The counted guard rejects a caller whose number of direct call sites changed. -/
+theorem not_callSitesPreserved_of_count_ne {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (hNe : bodyCallSiteCount targetDefPath callerBody ≠ expectedSites) :
+    ¬ CallSitesPreserved callerBody callees targetDefPath expectedSites :=
+  fun h => hNe h.siteCount
+
+/--
+Scope limit of `CallBoundaryPreserved`: it holds for every positive number of
+surviving call sites, so it cannot tell a caller with all `n + 1` sites from one
+in which `n` of them were inlined.
+-/
+theorem callBoundaryPreserved_iff_exists_callSitesPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (targetDefPath : DefPath) :
+    CallBoundaryPreserved callerBody callees targetDefPath ↔
+      ∃ n, 0 < n ∧ CallSitesPreserved callerBody callees targetDefPath n :=
+  ⟨fun h =>
+      ⟨bodyCallSiteCount targetDefPath callerBody,
+        (bodyCallsDefPath_iff_bodyCallSiteCount_pos _ _).1
+          ((bodyCallsDefPath_iff _ _).2 h.callSite),
+        rfl, h.notLinked, h.noTraitImpl⟩,
+    fun ⟨_, hPos, h⟩ => h.toCallBoundaryPreserved hPos⟩
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 

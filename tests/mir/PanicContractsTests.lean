@@ -359,6 +359,24 @@ theorem checkedAddU8_not_neverPanics :
   obtain ⟨tr, hr⟩ := checkedAddU8_exact.2 _ hPre (by decide : (256 : Nat) ≤ 255 + 1)
   exact h.not_reaches_panic hPre hr
 
+/--
+Both sides of the dichotomy are inhabited on concrete inputs: `(255, 1)` reaches
+`.panic` and `(1, 2)` returns `3`, so neither trigger of the exact contract is
+vacuous.
+-/
+theorem checkedAddU8_ground_witnesses :
+    (∃ tr, ReachesRet (mirTrees checkedAddU8Mir [] (scalarArgs2 1 255 1)) tr .panic) ∧
+      (∃ tr mem, ReachesRet (mirTrees checkedAddU8Mir [] (scalarArgs2 1 1 2)) tr
+        (.normal (.scalar { bits := 3, sizeBytes := 1 }, mem))) := by
+  refine ⟨checkedAddU8_exact.2 _ ⟨255, 1, by decide, by decide, rfl⟩
+    (show (256 : Nat) ≤ 255 + 1 by decide), ?_⟩
+  obtain ⟨tr, r, hr⟩ := checkedAddU8_totalExact.returnsIf (scalarArgs2 1 1 2)
+    ⟨1, 2, by decide, by decide, rfl⟩ (show ¬ ((256 : Nat) ≤ 1 + 2) by decide)
+  have hPost := checkedAddU8_exact.1.post_of_returns ⟨1, 2, by decide, by decide, rfl⟩ hr
+  obtain ⟨v, mem⟩ := r
+  cases (show v = .scalar { bits := 3, sizeBytes := 1 } from hPost)
+  exact ⟨tr, mem, hr⟩
+
 /-! ## 2. Caller–Callee Composition -/
 
 def checkedAddU8Path : DefPath := "panic_tests::checked_add_u8"
@@ -1080,6 +1098,69 @@ theorem addCaller_calls (a b : Nat) :
   conv at h => whnf
   exact h
 
+/-! ### Partial inlining and call-site counts -/
+
+/--
+`fn two_sites(a: u8, b: u8) -> u8 { checked_add_u8(checked_add_u8(a, b), b) }`:
+`bb0: _3 = checked_add_u8(copy _1, copy _2) -> bb1`,
+`bb1: _0 = checked_add_u8(copy _3, copy _2) -> bb2`, `bb2: return`.
+-/
+def twoSiteCallerMir : CapturedMir :=
+  mkBody "panic_tests::two_sites" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .mut u8Ty ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 3) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := []
+        terminator :=
+          mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 3), .copy (local_ 2)]
+            (local_ 0) (.some 2) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/-- The same caller after pre-capture inlining of its first call only. -/
+def twoSiteHalfInlinedMir : CapturedMir :=
+  mkBody "panic_tests::two_sites" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .mut u8Ty
+    , mkDecl .mut u8CheckedTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 4)
+          , mkStmt (.assign (local_ 4)
+              (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))) ]
+        terminator :=
+          mkTerm (.assert
+            (.move { local_ := 4, projection := [.field 1 boolTy] }) false 1 .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign (local_ 3)
+              (.use (.move { local_ := 4, projection := [.field 0 u8Ty] }))) ]
+        terminator :=
+          mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 3), .copy (local_ 2)]
+            (local_ 0) (.some 2) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/-- Both call sites survive in the captured caller. -/
+theorem twoSiteCaller_callSitesPreserved :
+    CallSitesPreserved twoSiteCallerMir [] checkedAddU8Path 2 :=
+  (callSitesPreserved_iff _ _ _ _).1 rfl
+
+/--
+`CallBoundaryPreserved` accepts the half-inlined caller: the one remaining call
+site is all it asks for.
+-/
+theorem twoSiteHalfInlined_callBoundaryPreserved :
+    CallBoundaryPreserved twoSiteHalfInlinedMir [] checkedAddU8Path :=
+  (callBoundaryPreserved_iff _ _ _).1 rfl
+
+/-- The counted guard rejects the half-inlined caller: one of the two call sites is gone. -/
+theorem twoSiteHalfInlined_not_callSitesPreserved :
+    ¬ CallSitesPreserved twoSiteHalfInlinedMir [] checkedAddU8Path 2 :=
+  have hCount : bodyCallSiteCount checkedAddU8Path twoSiteHalfInlinedMir = 1 := rfl
+  not_callSitesPreserved_of_count_ne (fun h => absurd (hCount.symm.trans h) (by decide))
+
 /-! ### Trait injection between sequential calls -/
 
 def helperPath : DefPath := "panic_tests::helper"
@@ -1228,6 +1309,88 @@ theorem twoCall_second_call_emits_request (s : MachineState)
     (func := fnItemOp contractedPath [.uint .u8]) (argOps := []) (destination := local_ 0)
     (targetBb := 2) (unwind := .continue_) (targetDefPath := contractedPath)
     (argVals := []) rfl rfl rfl hExcl rfl rfl
+
+/--
+Contract of both callees of `two_calls`: each returns `0` and leaves `borrows`
+as it found them. It carries no frame condition of its own.
+-/
+def twoCallContract : PanicMirCallContract where
+  pre req := req.defPath = helperPath ∨ req.defPath = contractedPath
+  post req retVal memAfter :=
+    retVal = .scalar { bits := 0, sizeBytes := 1 } ∧ memAfter.borrows = req.memory.borrows
+
+/--
+A handler that answers every request at once and registers `injectedImpl` in the
+memory it hands back.
+-/
+def injectingHandler : ExternalCallHandler := fun req =>
+  pure (.returned (.scalar { bits := 0, sizeBytes := 1 })
+    { req.memory with traitImpls := [injectedImpl] })
+
+/-- The injecting handler implements the contract strengthened with `callFramePreserved` only. -/
+theorem injectingHandler_holdsOn_withFramePreserved :
+    twoCallContract.withFramePreserved.toMirCallContract.holdsOn injectingHandler :=
+  holdsOn_pure_handler _ _ (fun _ _ => ⟨⟨rfl, rfl⟩, rfl, rfl, rfl, rfl, [], rfl⟩)
+
+/--
+End-to-end refutation without trait preservation: against the frame-preserving
+contract alone, no rely–guarantee panic contract of the two-call caller holds,
+whatever `post`, `panicCond`, and `policy` are. The injecting handler satisfies
+the rely, its first answer redirects the second call into `evilImplMir`, and the
+linked execution reaches undefined behavior.
+-/
+theorem twoCall_frameOnly_not_modular (post : MirInput → MirReturn → Prop)
+    (panicCond : MirInput → Prop) (policy : AbortPolicy MirInput) :
+    ¬ MirModularPanicsWithPolicyOnlyIf twoCallCallerMir
+        twoCallContract.withFramePreserved.toMirCallContract.holdsOn
+        (fun x => x = ([], linkedMem)) post panicCond policy :=
+  not_mirModularPanicsWithPolicyOnlyIf_of_reachesLinkedFault
+    injectingHandler_holdsOn_withFramePreserved rfl
+    (.call rfl (reachesRet_pure_handler _) (.of_reachesFaultExecBounded _ 8 rfl))
+
+/--
+End-to-end verification with trait preservation: against every handler that
+implements the contract strengthened with `withTraitsPreserved`, the two-call
+caller is fault-free, never panics, and returns `0`. Both answers are arbitrary
+memories accepted by the contract, and the second call still leaves the machine
+as a request.
+-/
+theorem twoCall_traitsPreserved_modular_neverPanics :
+    MirModularNeverPanics twoCallCallerMir
+      twoCallContract.withTraitsPreserved.toMirCallContract.holdsOn
+      (fun x => x = ([], linkedMem))
+      (fun _ r => r.1 = .scalar { bits := 0, sizeBytes := 1 }) :=
+  mirModularNeverPanics_of_wpMirModularSym _ 8 (by
+    rintro _ rfl
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    refine ⟨Or.inl rfl, fun ans hPost => ?_⟩
+    cases ans with
+    | returned retVal memAfter =>
+      obtain ⟨⟨hVal, hB⟩, ⟨hC, hCS, hAC, hAP, -⟩, hT⟩ := hPost
+      subst hVal
+      cases memAfter with
+      | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
+          activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+        simp only at hB hC hCS hAC hAP hT
+        subst hB hC hCS hAC hAP hT
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        refine ⟨Or.inr rfl, fun ans2 hPost2 => ?_⟩
+        cases ans2 with
+        | returned retVal2 memAfter2 =>
+          obtain ⟨⟨hVal2, hB2⟩, ⟨hC2, hCS2, hAC2, hAP2, -⟩, hT2⟩ := hPost2
+          subst hVal2
+          cases memAfter2 with
+          | mk nextAllocId2 globals2 borrows2 nextTag2 callees2 callStack2 activeCallee2
+              traitImpls2 activeProtectors2 nextProtector2 callerLocals2 fnPtrs2
+              exposedAllocIds2 =>
+            simp only at hB2 hC2 hCS2 hAC2 hAP2 hT2
+            subst hB2 hC2 hCS2 hAC2 hAP2 hT2
+            (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+            exact ⟨_, rfl, rfl⟩
+        | panicked memAfter2 => exact False.elim hPost2.1
+        | aborted => exact False.elim hPost2
+    | panicked memAfter => exact False.elim hPost.1
+    | aborted => exact False.elim hPost)
 
 /-! ### `AbortPolicy` separation -/
 
@@ -2006,30 +2169,63 @@ theorem addCaller_generalMem_linked_totalExact (unwind : UnwindAction)
       exact addCaller_generalMem_unwinding_wp unwind hUnwind a b ha hb mem hB hC hCS hAC hAP)
 
 /--
-Frame-restoring general-memory composition via `linkCalleeWithCalleesHandler`:
-even when `req.memory` carries arbitrary `callees`, `traitImpls`, `callStack`,
-`activeCallee`, and `activeProtectors`, `enterExternalCalleeState` isolates the
-callee and `outcomeToRestoredCallAns` restores `callFrameAndTraitsPreserved`.
+Frame-general panic call contract for `checked_add_u8`: the request memory may
+carry any `callees`, `traitImpls`, `callStack`, `activeCallee`, and
+`activeProtectors`. Only `borrows` is pinned, so that the callee's frame
+teardown reduces symbolically.
 -/
-theorem checkedAddU8_withCallees_holdsTotallyOn (fallback : ExternalCallHandler) :
-    (checkedAddU8GeneralContract.withTraitsPreserved.toMirCallContract).holdsTotallyOn
+def checkedAddU8FrameGeneralContract : PanicMirCallContract where
+  pre req :=
+    req.defPath = checkedAddU8Path ∧ scalarPre2 1 req.args ∧ req.memory.borrows = .nil
+  post req retVal memAfter :=
+    retVal = .scalar { bits := argSum req.args, sizeBytes := 1 } ∧
+      ¬ overflows 1 req.args ∧ memAfter = req.memory
+  panicCond req := overflows 1 req.args
+  panicMemInv req memAfter := memAfter = req.memory
+
+def checkedAddU8FrameGeneralMirContract : MirCallContract :=
+  checkedAddU8FrameGeneralContract.withTraitsPreserved.toMirCallContract
+
+/--
+The isolated callee (`enterExternalCalleeState`) meets the frame-general
+contract on the frame-restored answer (`outcomeToRestoredCallAns`), for an
+arbitrary caller call frame.
+-/
+theorem checkedAddU8_frameGeneral_callee_wp (typeArgs : List RigidTy) (a b : Nat)
+    (mem : Memory) (hB : mem.borrows = .nil) :
+    wpMirNoCallSym 8 checkedAddU8Mir
+      (enterExternalCalleeState checkedAddU8Mir (scalarArgs2 1 a b) mem [])
+      (fun out =>
+        checkedAddU8FrameGeneralMirContract.post
+          { defPath := checkedAddU8Path, typeArgs := typeArgs, args := scalarArgs2 1 a b,
+            memory := mem }
+          (outcomeToRestoredCallAns mem out)) := by
+  cases mem with
+  | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
+      activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+    simp only at hB
+    subst hB
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    · rename_i heq
+      exact ⟨(nat_ble_eq_true_iff _ _).1 heq, rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+    · rename_i heq
+      have hlt : a + b < 256 := (nat_ble_eq_false_iff _ _).1 heq
+      exact ⟨⟨congrArg (fun n => Value.scalar { bits := n, sizeBytes := 1 })
+          (wrapScalarBits_of_lt hlt), Nat.not_le.2 hlt, rfl⟩,
+        ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+
+/--
+`checked_add_u8` linked through the frame-restoring
+`linkCalleeWithCalleesHandler` implements the frame-general contract totally:
+the request may come from a nested frame of a caller with linked callees.
+-/
+theorem checkedAddU8_frameGeneral_holdsTotallyOn (fallback : ExternalCallHandler) :
+    checkedAddU8FrameGeneralMirContract.holdsTotallyOn
       (linkCalleeWithCalleesHandler checkedAddU8Mir [] fallback) :=
   holdsTotallyOn_linkCalleeWithCalleesHandler_of_wpMirNoCallSym
-    checkedAddU8GeneralMirContract checkedAddU8Mir [] fallback 8 (fun _ h => h.1) (by
-      rintro ⟨_, typeArgs, _, mem⟩ ⟨rfl, ⟨a, b, -, -, rfl⟩, hB, hCS, hAC, hAP⟩
-      cases mem with
-      | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
-          activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
-        simp only at hB hCS hAC hAP
-        subst hB hCS hAC hAP
-        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-        · rename_i heq
-          exact ⟨(nat_ble_eq_true_iff _ _).1 heq, rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
-        · rename_i heq
-          have hlt : a + b < 256 := (nat_ble_eq_false_iff _ _).1 heq
-          exact ⟨⟨congrArg (fun n => Value.scalar { bits := n, sizeBytes := 1 })
-              (wrapScalarBits_of_lt hlt), Nat.not_le.2 hlt, rfl⟩,
-            ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩)
+    checkedAddU8FrameGeneralMirContract checkedAddU8Mir [] fallback 8 (fun _ h => h.1) (by
+      rintro ⟨_, typeArgs, _, mem⟩ ⟨rfl, ⟨a, b, -, -, rfl⟩, hB⟩
+      exact checkedAddU8_frameGeneral_callee_wp typeArgs a b mem hB)
 
 /--
 Contract-level total-exact composition exercising
@@ -2093,30 +2289,12 @@ theorem addCaller_linked_totalExact_via_callee_contract (fallback : ExternalCall
 
 /-! ### External-call `UnwindAction.unreachable` UB refutation & explicit panic entrypoints -/
 
-private theorem reaches_bind_of_reachesRet {E : Effect.{u}} [FaultEffect E] {A B : Type u}
-    {t u : ITree E A} {f : A → ITree E B} {tr : List (Event E)} {a : A}
-    (h : Reaches t tr u) (hu : u.observe = .ret a) :
-    Reaches (t >>= f) tr (f a) := by
-  induction h with
-  | refl x =>
-    have hx : x = ITree.ret a := ITree.eq_of_observe_eq (hu.trans (ITree.observe_ret a).symm)
-    subst hx
-    rw [ret_bind]
-    exact .refl (f a)
-  | tau hTau _ ih =>
-    have hx : _ = ITree.tau _ := ITree.eq_of_observe_eq (hTau.trans (ITree.observe_tau _).symm)
-    rw [hx, tau_bind]
-    exact .tau (ITree.observe_tau _) (ih hu)
-  | vis hVis hnf o _ ih =>
-    have hx : _ = ITree.vis _ _ := ITree.eq_of_observe_eq (hVis.trans (ITree.observe_vis _ _).symm)
-    rw [hx, vis_bind]
-    exact .vis (ITree.observe_vis _ _) hnf o (ih hu)
-
 /--
-UB on a *call's* unwind edge (`addCallerMir .unreachable` linked with
-`checkedAddU8Mir`): on overflowing input `(255, 1)`, the callee unwinds and
-`resumeExternalCall ... .unreachable` steps to `.faulted .ub`, refuting every
-panic contract (even with `panicCond := True` and `.waiveAbortUnchecked`).
+Undefined behavior on a call's unwind edge (`addCallerMir .unreachable` linked
+with `checkedAddU8Mir`): on the overflowing input `(255, 1)` the callee unwinds
+and `resumeExternalCall` with `UnwindAction.unreachable` faults with `.ub`. The
+`ReachesLinkedFault` trace refutes every panic contract of the linked system,
+whatever `post`, `panicCond`, and `policy` are.
 -/
 theorem addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf
     (fallback : ExternalCallHandler)
@@ -2125,89 +2303,17 @@ theorem addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf
     ¬ PanicsWithPolicyOnlyIf
       (mirHandledTrees (addCallerMir .unreachable) (linkCalleeHandler checkedAddU8Mir fallback))
       addCallerPre post panicCond policy := by
-  intro h
   have hPre : addCallerPre (scalarArgs2 1 255 1, emptyMemory) := ⟨overflowingArgs_pre, rfl⟩
-  have hSafe := (h _ hPre).1
-  let req : MirCallReq :=
+  have hTot := checkedAddU8_holdsTotallyOn fallback
     { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 255 1,
-      memory := emptyMemory }
-  have hPanics : ∃ tr u, Reaches (linkCalleeHandler checkedAddU8Mir fallback req) tr u ∧
-      u.observe = .ret (.panicked emptyMemory) := by
-    have hTot := checkedAddU8_holdsTotallyOn fallback req ⟨rfl, overflowingArgs_pre, rfl⟩
-    obtain ⟨tr, ans, ⟨u, hr, hu⟩, hPost⟩ :=
-      exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hTot
-    cases ans with
-    | returned _ _ => exact False.elim (hPost.1.2.1 (by decide : (256 : Nat) ≤ 255 + 1))
-    | panicked memAfter =>
-      have hEq : memAfter = emptyMemory := hPost.2.1
-      subst hEq
-      exact ⟨tr, u, hr, hu⟩
-    | aborted => exact False.elim hPost
-  obtain ⟨tr, u, hReachCallee, hu⟩ := hPanics
-  let initSt := initMachineStateWithMemory (addCallerMir .unreachable)
-    (scalarArgs2 1 255 1) emptyMemory
-  let kRaw : MirCallAns → ITree MirEffect MirOutcome :=
-    fun ans =>
-      ITree.cofix (stepMirState (addCallerMir .unreachable))
-        (resumeExternalCall initSt initSt.frame.locals (local_ 0) 1 .unreachable ans)
-  have hTreeEq :
-      mirStatefulTrees (addCallerMir .unreachable) [] (scalarArgs2 1 255 1, emptyMemory) =
-        ITree.vis (E := MirEffect) (Sum.inr (Sum.inr (CallReq.call req))) kRaw := by
-    apply ITree.eq_of_observe_eq
-    change (ITree.cofix (stepMirState (addCallerMir .unreachable)) (.running initSt)).observe = _
-    rw [ITree.observe_cofix]
-    exact (ITree.observe_vis (E := MirEffect) (Sum.inr (Sum.inr (CallReq.call req))) kRaw).symm
-  have hHandledEq :
-      mirHandledTrees (addCallerMir .unreachable)
-          (linkCalleeHandler checkedAddU8Mir fallback) [] (scalarArgs2 1 255 1, emptyMemory) =
-        (linkCalleeHandler checkedAddU8Mir fallback req >>= fun ans =>
-          ITree.tau
-            (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
-              (kRaw ans))) := by
-    rw [mirHandledTrees_apply, hTreeEq]
-    exact interp_vis (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
-      (Sum.inr (Sum.inr (CallReq.call req))) kRaw
-  rw [hHandledEq] at hSafe
-  have hReachCont := reaches_bind_of_reachesRet
-    (f := fun ans =>
-      ITree.tau
-        (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
-          (kRaw ans)))
-    hReachCallee hu
-  refine hSafe tr _ hReachCont ?_
-  have hFaultRaw : kRaw (.panicked emptyMemory) =
-      ITree.vis (E := MirEffect) (Sum.inl (FailReq.fail .ub) : MirEffect.I)
-        (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome)) := by
-    apply ITree.eq_of_observe_eq
-    change (ITree.cofix (stepMirState (addCallerMir .unreachable)) (.faulted .ub)).observe = _
-    rw [ITree.observe_cofix]
-    have hV := ITree.observe_vis (E := MirEffect) (Sum.inl (FailReq.fail .ub) : MirEffect.I)
-      (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome))
-    rw [hV]
-    dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
-    congr 1
-    funext o
-    exact PEmpty.elim o
-  have hFaultInterp :
-      (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
-        (kRaw (.panicked emptyMemory))).observe =
-        .vis (E := MirClosedEffect) (Sum.inl (FailReq.fail .ub) : MirClosedEffect.I)
-          (fun o => (PEmpty.elim o : ITree MirClosedEffect MirOutcome)) := by
-    rw [hFaultRaw]
-    have hIV := interp_vis
-      (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
-      (Sum.inl (FailReq.fail .ub) : MirEffect.I)
-      (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome))
-    rw [hIV]
-    dsimp only [handleMirExternalCalls]
-    unfold ITree.fail ITree.triggerSub
-    rw [bind_assoc, vis_bind, ITree.observe_vis]
-    dsimp only [Subeffect.injReq]
-    congr 1
-    funext o
-    exact PEmpty.elim o
-  exact ⟨_, (Sum.inl (FailReq.fail .ub) : MirClosedEffect.I), _,
-    .step (ITree.observe_tau _) (.refl _), hFaultInterp, trivial⟩
+      memory := emptyMemory } ⟨rfl, overflowingArgs_pre, rfl⟩
+  obtain ⟨tr, ans, hr, hPost⟩ :=
+    exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hTot
+  cases ans with
+  | returned _ _ => exact False.elim (hPost.1.2.1 (by decide : (256 : Nat) ≤ 255 + 1))
+  | panicked memAfter =>
+    exact not_panicsWithPolicyOnlyIf_of_reachesLinkedFault hPre (.call rfl hr (.fail rfl))
+  | aborted => exact False.elim hPost
 
 /--
 Explicit diverging call to `core::panicking::panic`:
@@ -2505,6 +2611,80 @@ theorem indirect_and_fnItem_local_boundary_probes (a b : Nat) :
         rfl rfl rfl rfl rfl rfl)
       rfl (calleeTableExcludes_of_callees_nil rfl) rfl (Or.inl rfl)
 
+/-! ### Transitive helper: frame-general contract through `linkCalleeWithCalleesHandler` -/
+
+/--
+Modular evaluation of `outerCallerMir` with `midHelperMir` linked in `callees`:
+the outer call steps into the helper, and the helper's call to `checked_add_u8`
+leaves the machine as a request from a nested frame (non-empty `callStack`,
+`activeCallee := some midHelperMir`, `callees := [midHelperMir]`). The
+frame-general contract applies there, and the callee's unwind propagates
+through both frames.
+-/
+theorem outerCaller_wp (a b : Nat) (ha : a < 256) (hb : b < 256) :
+    wpMirModularSym checkedAddU8FrameGeneralMirContract 16 outerCallerMir
+      (initMachineStateWithMemoryAndCallees outerCallerMir (scalarArgs2 1 a b)
+        emptyMemory [midHelperMir])
+      (ExactPanicOutcome
+        (fun r : MirReturn => r.1 = .scalar { bits := a + b, sizeBytes := 1 })
+        (256 ≤ a + b)) := by
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  refine ⟨⟨rfl, ⟨a, b, ha, hb, rfl⟩, rfl⟩, fun ans hPost => ?_⟩
+  cases ans with
+  | returned retVal memAfter =>
+    obtain ⟨⟨hVal, hFit, hMem⟩, _⟩ := hPost
+    subst hVal hMem
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    exact ⟨hFit, rfl⟩
+  | panicked memAfter =>
+    obtain ⟨hOver, hMem, _⟩ := hPost
+    subst hMem
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    exact hOver
+  | aborted => exact False.elim hPost
+
+/--
+Exact composition across a linked helper: the outer caller, the helper linked in
+`callees`, and `checked_add_u8` linked through the frame-restoring handler panic
+exactly on overflow and return the sum otherwise.
+-/
+theorem outerCaller_linked_totalExact (fallback : ExternalCallHandler) :
+    TotalExactPanicContract
+      (mirHandledTrees outerCallerMir
+        (linkCalleeWithCalleesHandler checkedAddU8Mir [] fallback) [midHelperMir])
+      addCallerPre addCallerPost addCallerOverflows :=
+  mirHandled_totalExactPanicContract_of_wpMirModularSym checkedAddU8FrameGeneralMirContract
+    (checkedAddU8_frameGeneral_holdsTotallyOn fallback) 16 (by
+      rintro ⟨_, _⟩ ⟨⟨a, b, ha, hb, rfl⟩, rfl⟩
+      exact outerCaller_wp a b ha hb)
+
+/--
+The same composition through `panicsOnlyIf_call_compose_withCallees`: the
+rely–guarantee contract of the outer caller and the only-if contract of the
+isolated callee trees (`mirExternalClosedCalleeTrees`) compose.
+-/
+theorem outerCaller_linked_panicsOnlyIf (fallback : ExternalCallHandler) :
+    PanicsOnlyIf
+      (mirHandledTrees outerCallerMir
+        (linkCalleeWithCalleesHandler checkedAddU8Mir [] fallback) [midHelperMir])
+      addCallerPre addCallerPost addCallerOverflows :=
+  panicsOnlyIf_call_compose_withCallees
+    checkedAddU8FrameGeneralContract.withTraitsPreserved []
+    (mirModularPanicsOnlyIf_of_dwlp checkedAddU8FrameGeneralMirContract (by
+      rintro ⟨_, _⟩ ⟨⟨a, b, ha, hb, rfl⟩, rfl⟩
+      exact DWLP.mono (fun _ _ h => h.toPanicOutcomeOk)
+        (dwp_of_wpMirModularSym (outerCaller_wp a b ha hb)).toDWLP))
+    (panicsWithPolicyOnlyIf_forbidAbort_iff.1
+      (mirExternalClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp (by
+        rintro ⟨_, typeArgs, _, mem⟩ ⟨⟨rfl, ⟨a, b, -, -, rfl⟩, hB⟩, -⟩
+        exact DWLP.mono
+          (fun out _ h =>
+            (checkedAddU8FrameGeneralContract.withTraitsPreserved
+              |>.toPolicy_post_outcomeToRestoredCallAns_iff .forbidAbort _ out).1 h)
+          (dwp_of_wpMirNoCallSym
+            (checkedAddU8_frameGeneral_callee_wp typeArgs a b mem hB)).toDWLP)))
+    (fun _ hPre hNe => False.elim (hNe hPre.1))
+
 /-! ### Concrete `ExactPolicy` mutual exclusion & `waiveAbortUnchecked` handler refutation -/
 
 /--
@@ -2529,12 +2709,81 @@ theorem checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked
   | panicked _ => exact False.elim (show ¬ ((256 : Nat) ≤ 0 + 0) by decide <| hPost.1)
   | aborted => exact False.elim hPost
 
-/-- Concrete mutual exclusion of `panicCond` and `abortCond` on closed linked caller–callee trees. -/
-theorem addCaller_terminate_conds_disjoint (fallback : ExternalCallHandler)
-    (x : MirInput) (hx : addCallerPre x) :
-    ¬ (False ∧ addCallerOverflows x) :=
-  mirClosed_exactPanicAbortContract_conds_disjoint
-    (addCaller_terminate_linked_exactPanicAbort fallback) hx
+/--
+A body with an unwinding and an aborting failure:
+`bb0: switchInt(copy _1) -> [0: bb1, 1: bb2, otherwise: bb3]`,
+`bb1: core::panicking::panic() -> unwind continue`, `bb2: terminate`,
+`bb3: _0 = copy _1; return`.
+-/
+def panicOrAbortMir : CapturedMir :=
+  mkBody "panic_tests::panic_or_abort" 1
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .mut neverTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.switchInt (.copy (local_ 1))
+            { branches := [(0, 1), (1, 2)], otherwise := 3 })
+        isCleanup := false }
+    , { statements := [ mkStmt (.storageLive 2) ]
+        terminator :=
+          mkTerm (.call (fnItemOp "core::panicking::panic") [] (local_ 2) .none .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .unwindTerminate, isCleanup := false }
+    , { statements := [ mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+theorem panicOrAbort_wp (x : Nat) :
+    wpMirNoCallSym 8 panicOrAbortMir
+      (initMachineStateWithCallees panicOrAbortMir [.scalar { bits := x, sizeBytes := 1 }] [])
+      (ExactPolicyOutcome (.abortOnlyIf (fun args : List Value => argBits args 0 = 1))
+        [.scalar { bits := x, sizeBytes := 1 }]
+        (fun r : MirReturn => r.1 = .scalar { bits := x, sizeBytes := 1 })
+        (x = 0)) := by
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  · rename_i heq
+    have hx : x = 0 := (nat_beq_eq_true_iff _ _).1 heq
+    exact ⟨hx, fun (h : x = 1) => absurd (hx.symm.trans h) (by decide)⟩
+  · rename_i heq0 _ heq1
+    exact ⟨(nat_beq_eq_true_iff _ _).1 heq1, (nat_beq_eq_false_iff _ _).1 heq0⟩
+  · rename_i heq0 _ heq1
+    exact ⟨(nat_beq_eq_false_iff _ _).1 heq0, (nat_beq_eq_false_iff _ _).1 heq1, rfl⟩
+
+/-- The body returns its argument. -/
+def panicOrAbortPost (args : List Value) (r : MirReturn) : Prop :=
+  r.1 = .scalar { bits := argBits args 0, sizeBytes := 1 }
+
+/-- The body panics exactly on `0`, aborts exactly on `1`, and returns otherwise. -/
+theorem panicOrAbort_totalExact :
+    TotalExactPolicyPanicContract (mirTrees panicOrAbortMir) scalarPre1 panicOrAbortPost
+      (fun args => argBits args 0 = 0) (.abortOnlyIf (fun args => argBits args 0 = 1)) :=
+  totalExactPolicyPanicContract_of_wpMirNoCallSym 8 (by
+    rintro _ ⟨x, -, rfl⟩
+    exact panicOrAbort_wp x)
+
+theorem panicOrAbort_exactPanicAbort :
+    ExactPanicAbortContract (mirTrees panicOrAbortMir) scalarPre1 panicOrAbortPost
+      (fun args => argBits args 0 = 0) (fun args => argBits args 0 = 1) :=
+  exactPolicyPanicContract_abortOnlyIf_iff.1 panicOrAbort_totalExact.exact
+
+/-- The call-free body has deterministic outcomes. -/
+theorem panicOrAbort_deterministicRet (x : Nat) :
+    DeterministicRet (mirTrees panicOrAbortMir [] [.scalar { bits := x, sizeBytes := 1 }]) :=
+  deterministicRet_of_dwlp_mirNoCallWP (dwp_of_wpMirNoCallSym (panicOrAbort_wp x)).toDWLP
+
+/--
+Mutual exclusion rejects an over-claimed abort condition: no exact contract can
+say that the input `0` both panics and aborts.
+-/
+theorem panicOrAbort_not_exactPanicAbort_overlapping :
+    ¬ ExactPanicAbortContract (mirTrees panicOrAbortMir) scalarPre1 panicOrAbortPost
+      (fun args => argBits args 0 = 0) (fun args => argBits args 0 ≤ 1) := fun h =>
+  h.conds_disjoint_of_deterministic (x := [.scalar { bits := 0, sizeBytes := 1 }])
+    ⟨0, by decide, rfl⟩ (panicOrAbort_deterministicRet 0) ⟨rfl, by decide⟩
+
+/-- The total exact policy contract makes its panic and abort conditions disjoint on `pre`. -/
+theorem panicOrAbort_conds_disjoint (args : List Value) (hPre : scalarPre1 args) :
+    ¬ (argBits args 0 = 0 ∧ argBits args 0 = 1) :=
+  panicOrAbort_totalExact.conds_disjoint hPre
 
 /-! ### Concrete `Anneal.Pass` variance instantiation (NOP insertion / elimination) -/
 
@@ -3141,18 +3390,19 @@ def muGlobalLocals : List LocalSlot :=
   [.uninit, .uninit, .uninit, .init muGlobalFatPtr]
 
 /--
-`Memory.globals`-backed `&[MaybeUninit<u8>]` slice asymmetry: metadata-only
-`Rvalue.len` succeeds (returning `4`), whereas reading a union-typed slice
-element or subslice faults in `decodeValueFromBytes` (not `.ok`).
+`Memory.globals`-backed `&[MaybeUninit<u8>]` slice asymmetry: the metadata-only
+`Rvalue.len` succeeds (returning `4`), whereas reading a union-typed element or
+subslice out of the fully initialized global bytes is reported as undefined
+behavior.
 -/
 theorem kani5219_global_alloc_slice_asymmetry :
     rvalueValue? (evalRvalue muGlobalLocals
         (.len { local_ := 3, projection := [.deref] }) muGlobalMem muDecls muLayouts) =
         some (.scalar { bits := 4, sizeBytes := 8 }) ∧
-      rvalueValue? (evalRvalue muGlobalLocals
-        (muSliceRead [.constantIndex 0 1 false]) muGlobalMem muDecls muLayouts) = none ∧
-      rvalueValue? (evalRvalue muGlobalLocals
-        (muSliceRead [.subslice 0 2 false]) muGlobalMem muDecls muLayouts) = none :=
+      rvalueIsUb (evalRvalue muGlobalLocals
+        (muSliceRead [.constantIndex 0 1 false]) muGlobalMem muDecls muLayouts) = true ∧
+      rvalueIsUb (evalRvalue muGlobalLocals
+        (muSliceRead [.subslice 0 2 false]) muGlobalMem muDecls muLayouts) = true :=
   ⟨rfl, rfl, rfl⟩
 
 /-! ## 7. Bundle -/
@@ -3179,6 +3429,7 @@ theorem all_panic_contracts_tests :
     (type_of% @checkedAddU8_verificationResult) ∧
     (type_of% @checkedAddU8_neverPanics_inRange) ∧
     (type_of% @checkedAddU8_not_neverPanics) ∧
+    (type_of% @checkedAddU8_ground_witnesses) ∧
     (type_of% @checkedAddU8_callee_wp) ∧
     (type_of% @checkedAddU8_holdsTotallyOn) ∧
     (type_of% @checkedAddU8_holdsOn) ∧
@@ -3228,6 +3479,9 @@ theorem all_panic_contracts_tests :
     (type_of% @addCallerInlinedDeadCall_callBoundaryPreserved) ∧
     (type_of% @addCallerInlinedDeadCall_never_calls) ∧
     (type_of% @addCaller_calls) ∧
+    (type_of% @twoSiteCaller_callSitesPreserved) ∧
+    (type_of% @twoSiteHalfInlined_callBoundaryPreserved) ∧
+    (type_of% @twoSiteHalfInlined_not_callSitesPreserved) ∧
     (type_of% @linkedMem_calleeTableExcludes) ∧
     (type_of% @twoCall_first_call_emits_request) ∧
     (type_of% @injectedMem_callFramePreserved) ∧
@@ -3239,6 +3493,9 @@ theorem all_panic_contracts_tests :
     (type_of% @helper_withTraitsPreserved_rejects_injection) ∧
     (type_of% @twoCall_guard_preserved) ∧
     (type_of% @twoCall_second_call_emits_request) ∧
+    (type_of% @injectingHandler_holdsOn_withFramePreserved) ∧
+    (type_of% @twoCall_frameOnly_not_modular) ∧
+    (type_of% @twoCall_traitsPreserved_modular_neverPanics) ∧
     (type_of% @alwaysAbort_totalExact) ∧
     (type_of% @alwaysAbort_reaches_abort) ∧
     (type_of% @alwaysAbort_waiveAbortUnchecked) ∧
@@ -3273,7 +3530,8 @@ theorem all_panic_contracts_tests :
     (type_of% @checkedAddU8_generalMem_holdsTotallyOn) ∧
     (type_of% @addCaller_generalMem_unwinding_wp) ∧
     (type_of% @addCaller_generalMem_linked_totalExact) ∧
-    (type_of% @checkedAddU8_withCallees_holdsTotallyOn) ∧
+    (type_of% @checkedAddU8_frameGeneral_callee_wp) ∧
+    (type_of% @checkedAddU8_frameGeneral_holdsTotallyOn) ∧
     (type_of% @checkedAddU8_closedCallee_totalExactPolicy) ∧
     (type_of% @addCaller_linked_totalExact_via_callee_contract) ∧
     (type_of% @addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf) ∧
@@ -3286,8 +3544,16 @@ theorem all_panic_contracts_tests :
     (type_of% @callBoundaryPreserved_emptyCallees_does_not_guard_prepopulated_mem) ∧
     (type_of% @twoCall_resumed_state_guard_preserved) ∧
     (type_of% @indirect_and_fnItem_local_boundary_probes) ∧
+    (type_of% @outerCaller_wp) ∧
+    (type_of% @outerCaller_linked_totalExact) ∧
+    (type_of% @outerCaller_linked_panicsOnlyIf) ∧
     (type_of% @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked) ∧
-    (type_of% @addCaller_terminate_conds_disjoint) ∧
+    (type_of% @panicOrAbort_wp) ∧
+    (type_of% @panicOrAbort_totalExact) ∧
+    (type_of% @panicOrAbort_exactPanicAbort) ∧
+    (type_of% @panicOrAbort_deterministicRet) ∧
+    (type_of% @panicOrAbort_not_exactPanicAbort_overlapping) ∧
+    (type_of% @panicOrAbort_conds_disjoint) ∧
     (type_of% @checkedAddU8_nop_eutt) ∧
     (type_of% @checkedAddU8_nop_exactPass) ∧
     (type_of% @checkedAddU8Nop_pass_variance_transfers) ∧
@@ -3311,6 +3577,7 @@ theorem all_panic_contracts_tests :
     @checkedAddU8_verificationResult,
     @checkedAddU8_neverPanics_inRange,
     @checkedAddU8_not_neverPanics,
+    @checkedAddU8_ground_witnesses,
     @checkedAddU8_callee_wp,
     @checkedAddU8_holdsTotallyOn,
     @checkedAddU8_holdsOn,
@@ -3360,6 +3627,9 @@ theorem all_panic_contracts_tests :
     @addCallerInlinedDeadCall_callBoundaryPreserved,
     @addCallerInlinedDeadCall_never_calls,
     @addCaller_calls,
+    @twoSiteCaller_callSitesPreserved,
+    @twoSiteHalfInlined_callBoundaryPreserved,
+    @twoSiteHalfInlined_not_callSitesPreserved,
     @linkedMem_calleeTableExcludes,
     @twoCall_first_call_emits_request,
     @injectedMem_callFramePreserved,
@@ -3371,6 +3641,9 @@ theorem all_panic_contracts_tests :
     @helper_withTraitsPreserved_rejects_injection,
     @twoCall_guard_preserved,
     @twoCall_second_call_emits_request,
+    @injectingHandler_holdsOn_withFramePreserved,
+    @twoCall_frameOnly_not_modular,
+    @twoCall_traitsPreserved_modular_neverPanics,
     @alwaysAbort_totalExact,
     @alwaysAbort_reaches_abort,
     @alwaysAbort_waiveAbortUnchecked,
@@ -3405,7 +3678,8 @@ theorem all_panic_contracts_tests :
     @checkedAddU8_generalMem_holdsTotallyOn,
     @addCaller_generalMem_unwinding_wp,
     @addCaller_generalMem_linked_totalExact,
-    @checkedAddU8_withCallees_holdsTotallyOn,
+    @checkedAddU8_frameGeneral_callee_wp,
+    @checkedAddU8_frameGeneral_holdsTotallyOn,
     @checkedAddU8_closedCallee_totalExactPolicy,
     @addCaller_linked_totalExact_via_callee_contract,
     @addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf,
@@ -3418,8 +3692,16 @@ theorem all_panic_contracts_tests :
     @callBoundaryPreserved_emptyCallees_does_not_guard_prepopulated_mem,
     @twoCall_resumed_state_guard_preserved,
     @indirect_and_fnItem_local_boundary_probes,
+    @outerCaller_wp,
+    @outerCaller_linked_totalExact,
+    @outerCaller_linked_panicsOnlyIf,
     @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked,
-    @addCaller_terminate_conds_disjoint,
+    @panicOrAbort_wp,
+    @panicOrAbort_totalExact,
+    @panicOrAbort_exactPanicAbort,
+    @panicOrAbort_deterministicRet,
+    @panicOrAbort_not_exactPanicAbort_overlapping,
+    @panicOrAbort_conds_disjoint,
     @checkedAddU8_nop_eutt,
     @checkedAddU8_nop_exactPass,
     @checkedAddU8Nop_pass_variance_transfers,
