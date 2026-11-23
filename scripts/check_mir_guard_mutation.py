@@ -47,9 +47,13 @@ Anti-false-kill and isolation invariants
 
 * A mutant only counts as `KILLED` when Lean exits `1` and every error
   diagnostic is located inside the guard's refutation theorem in the generated
-  fixture, with a proof/type-mismatch marker inside one of those diagnostics.
-  Errors in other files, errors without a source position, crash/timeout/parse
-  markers, and signal exit codes are `ERROR`, never a kill.
+  fixture, every one of those diagnostics carries a `Type mismatch` or
+  `Not a definitional equality` proof failure marker (the diagnostics Lean 4.34
+  emits for a failing `:= rfl` proof), and the output has no
+  crash/parse/timeout/elaboration-breakage marker. Errors in other files,
+  errors without a source position, crash/timeout/parse or statement-elaboration
+  markers (`Application type mismatch`, `Function expected`, `invalid field`,
+  `failed to synthesize`), and signal exit codes are `ERROR`, never a kill.
 * `.lake/build/lib/lean` `.olean`s are reused only when they are proven to
   correspond to the current sources: Lake's own `.trace` records are checked by
   content — both standard traces (source text hash, `.olean` hash, toolchain,
@@ -220,9 +224,10 @@ OLEAN_SUFFIXES: tuple[str, ...] = (
 )
 
 # Error substrings indicating compiler crash, syntax error, missing import,
-# toolchain mismatch, or resource exhaustion rather than a genuine proof
-# refutation failure. Any refutation failure containing one of these markers is
-# classified as `ERROR` rather than `KILLED`.
+# toolchain mismatch, resource exhaustion, or broken statement elaboration
+# (arity/field/typeclass/argument type errors) rather than a genuine `:= rfl`
+# proof refutation failure. Any refutation failure containing one of these
+# markers is classified as `ERROR` rather than `KILLED`.
 NON_KILL_ERROR_MARKERS: tuple[str, ...] = (
     "unknown identifier",
     "unknown constant",
@@ -244,21 +249,26 @@ NON_KILL_ERROR_MARKERS: tuple[str, ...] = (
     "unknown namespace",
     "unknown package",
     "object file",
-)
-
-# Diagnostic substrings emitted by Lean 4 when a refutation theorem fails to
-# type-check because the mutated semantics no longer produces UB.
-EXPECTED_PROOF_FAILURE_MARKERS: tuple[str, ...] = (
-    "Type mismatch",
-    "type mismatch",
-    "has type",
-    "rfl",
-    "unsolved goals",
     "Function expected",
     "Application type mismatch",
     "failed to synthesize",
     "invalid field",
     "is not a valid",
+)
+
+# Diagnostic substrings emitted by Lean 4 when a `:= rfl` refutation theorem
+# fails to type-check because the mutated semantics no longer reduces to UB.
+# Lean 4.34 emits a two-diagnostic pair inside the theorem span:
+# `Not a definitional equality: ... is not definitionally equal ...` followed
+# by `Type mismatch` on `rfl`. Every refutation fixture is statically pinned to
+# `:= rfl`, so broken statement/arity/field/typeclass diagnostics belong in
+# `NON_KILL_ERROR_MARKERS` rather than here.
+EXPECTED_PROOF_FAILURE_MARKERS: tuple[str, ...] = (
+    "Type mismatch",
+    "type mismatch",
+    "Not a definitional equality",
+    "not a definitional equality",
+    "is not definitionally equal",
 )
 
 # Lean 4 warns when a proof uses `sorry`. The pinned toolchain (v4.34.1) prints
@@ -1661,45 +1671,55 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "open Trusted.Rustc.V2026_06_01.MirAst\n"
             "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
             "\n"
-            "def srcBorrow : BorrowEntry :=\n"
-            "  { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "def fieldZero : ProjectionElem :=\n"
+            "  .field 0 { kind := .uint .u32, layoutIdx := 0 }\n"
             "\n"
-            "def dstBorrow : BorrowEntry :=\n"
-            "  { tag := 2, targetLocal := 1, targetProjection := .nil, perm := .unique }\n"
+            "def fieldOne : ProjectionElem :=\n"
+            "  .field 1 { kind := .uint .u32, layoutIdx := 0 }\n"
             "\n"
-            "def disjointMem : Memory :=\n"
-            "  { emptyMemory with borrows := srcBorrow :: dstBorrow :: .nil }\n"
+            "def fieldZeroBorrow : BorrowEntry :=\n"
+            "  { tag := 1, targetLocal := 0, targetProjection := fieldZero :: .nil, perm := .unique }\n"
             "\n"
-            "def disjointInitLocals : List LocalSlot :=\n"
-            "  .init (.scalar ⟨42, 4⟩) ::\n"
-            "  .init (.scalar ⟨99, 4⟩) ::\n"
+            "def fieldOneBorrow : BorrowEntry :=\n"
+            "  { tag := 2, targetLocal := 0, targetProjection := fieldOne :: .nil, perm := .unique }\n"
+            "\n"
+            "def fieldZeroDisabledBorrow : BorrowEntry :=\n"
+            "  { fieldZeroBorrow with perm := .disabled }\n"
+            "\n"
+            "def subplaceInitMem : Memory :=\n"
+            "  { emptyMemory with borrows := fieldZeroBorrow :: fieldOneBorrow :: .nil }\n"
+            "\n"
+            "def subplaceAfterMem : Memory :=\n"
+            "  { emptyMemory with borrows := fieldZeroDisabledBorrow :: fieldOneBorrow :: .nil }\n"
+            "\n"
+            "def subplaceInitLocals : List LocalSlot :=\n"
+            "  .init (.aggregate 0 (.scalar ⟨42, 4⟩ :: .scalar ⟨99, 4⟩ :: .nil)) ::\n"
             "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
             "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
             "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
             "\n"
-            "def disjointAfterLocals : List LocalSlot :=\n"
-            "  .init (.scalar ⟨42, 4⟩) ::\n"
-            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "def subplaceAfterLocals : List LocalSlot :=\n"
+            "  .init (.aggregate 0 (.scalar ⟨42, 4⟩ :: .scalar ⟨42, 4⟩ :: .nil)) ::\n"
             "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
             "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
             "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
             "\n"
-            "def disjointCopyStmt : Statement :=\n"
+            "def subplaceDisjointCopyStmt : Statement :=\n"
             "  { kind := .intrinsic\n"
             "      (.copyNonOverlapping\n"
+            "        (.copy { local_ := 1, projection := .nil })\n"
             "        (.copy { local_ := 2, projection := .nil })\n"
-            "        (.copy { local_ := 3, projection := .nil })\n"
-            "        (.copy { local_ := 4, projection := .nil }))\n"
+            "        (.copy { local_ := 3, projection := .nil }))\n"
             "    span := \"\" }\n"
             "\n"
             "theorem sanity_copy_nonoverlapping_subplace_overlap :\n"
             "    evalStmt\n"
-            "      { frame := { blockIdx := 0, stmtIdx := 0, locals := disjointInitLocals }\n"
-            "        memory := disjointMem }\n"
-            "      disjointCopyStmt =\n"
+            "      { frame := { blockIdx := 0, stmtIdx := 0, locals := subplaceInitLocals }\n"
+            "        memory := subplaceInitMem }\n"
+            "      subplaceDisjointCopyStmt =\n"
             "      MirStepNode.step\n"
-            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := disjointAfterLocals }\n"
-            "          memory := disjointMem } :=\n"
+            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := subplaceAfterLocals }\n"
+            "          memory := subplaceAfterMem } :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -2220,14 +2240,15 @@ def classify_refutation_failure(
     - `SURVIVED`: Lean accepted (`rc == 0`) the negative refutation even after
       the guard was disabled.
     - `KILLED`: Lean rejected (`rc == 1`), every error diagnostic is located in
-      `fixture_filename` inside the target theorem's line span, at least one of
-      those diagnostics carries a proof/type-mismatch marker, and the output
-      has no crash/parse/timeout marker.
+      `fixture_filename` inside the target theorem's line span, EVERY one of
+      those diagnostics carries a `Type mismatch` or
+      `Not a definitional equality` proof failure marker, and the output has no
+      crash/parse/timeout/elaboration-breakage marker.
     - `ERROR`: anything else (never counted as a kill): unexpected exit status
-      (signals, OOM, timeout), crash/parse/timeout marker, an error diagnostic
-      in another file or without a source position, an error outside the
-      target theorem span, or no proof-failure marker inside the target
-      theorem's own diagnostics.
+      (signals, OOM, timeout), crash/parse/timeout/elaboration-breakage marker,
+      an error diagnostic in another file or without a source position, an
+      error outside the target theorem span, or any diagnostic inside the
+      target theorem lacking a recognized `:= rfl` proof-failure marker.
     """
     if returncode == 0:
         return ("SURVIVED", "refutation theorem still compiled on mutant")
@@ -2330,14 +2351,13 @@ def classify_refutation_failure(
             f"no error diagnostic in target theorem lines {start}-{end} "
             f"(saw error lines: {error_lines})",
         )
-    if not any(
-        marker in body
+    if not all(
+        any(marker in body for marker in EXPECTED_PROOF_FAILURE_MARKERS)
         for _, body in error_diags
-        for marker in EXPECTED_PROOF_FAILURE_MARKERS
     ):
         return (
             "ERROR",
-            "Lean failed without a recognized proof/type mismatch diagnostic "
+            "Lean failed with an unrecognized non-proof diagnostic "
             f"inside target theorem lines {start}-{end}",
         )
     return (
@@ -2539,18 +2559,90 @@ _TRUSTED_INDUCTIVE_START_RE = re.compile(
 _TRUSTED_CTOR_LINE_RE = re.compile(r"^[ \t]*\|[ \t]+([A-Za-z_][A-Za-z0-9_']*)")
 
 
+# Fast O(N) comment stripper for large trusted TCB sources (such as the 848 KB
+# `Places.lean`), preserving newline counts and nested `/- ... -/` block
+# comments without letting stray `"` characters inside block comments hide `-/`
+# closers. Used by `_trusted_function_names` so comment-only text is never
+# allowlisted as a callable `MirSemantics` function.
+_FAST_CODE_EDGE_RE = re.compile(r'/-|--[^\n]*|"(?:\\.|[^"\\])*"')
+_FAST_BLOCK_EDGE_RE = re.compile(r"/-|-/")
+
+
+def _strip_lean_comments_fast(lean_source: str) -> str:
+    """Strip `--` and nested `/- ... -/` comments from `lean_source` in O(N)."""
+    out: list[str] = []
+    n = len(lean_source)
+    pos = 0
+    while pos < n:
+        match = _FAST_CODE_EDGE_RE.search(lean_source, pos)
+        if match is None:
+            out.append(lean_source[pos:])
+            break
+        out.append(lean_source[pos : match.start()])
+        tok = match.group(0)
+        if tok == "/-":
+            depth = 1
+            cur = match.end()
+            while cur < n and depth > 0:
+                edge = _FAST_BLOCK_EDGE_RE.search(lean_source, cur)
+                if edge is None:
+                    nl = lean_source.count("\n", cur, n)
+                    if nl:
+                        out.append("\n" * nl)
+                    cur = n
+                    break
+                nl = lean_source.count("\n", cur, edge.start())
+                if nl:
+                    out.append("\n" * nl)
+                depth += 1 if edge.group(0) == "/-" else -1
+                cur = edge.end()
+            pos = cur
+        elif tok.startswith("--"):
+            pos = match.end()
+        else:
+            out.append(tok)
+            pos = match.end()
+    return "".join(out)
+
+
 def _trusted_declaration_names(lean_source: str) -> set[str]:
     """Return the last name component of every declaration in a trusted file."""
     return {name.split(".")[-1] for _, name in _TRUSTED_DECL_RE.findall(lean_source)}
 
 
 def _trusted_function_names(lean_source: str) -> set[str]:
-    """Return the last name component of every function a trusted file defines."""
-    return {
-        name.split(".")[-1]
-        for kind, name in _TRUSTED_DECL_RE.findall(lean_source)
-        if kind in _TRUSTED_FUNCTION_KINDS
-    }
+    """Return unqualified callable function names defined in a trusted file.
+
+    Comments are stripped first so a `def` inside doc prose is never
+    allowlisted. Type-scoped dotted methods (`FloatPtrWidth.bits`) are skipped
+    because they cannot be invoked unqualified and their short names collide
+    with structure fields (`ScalarInt.bits`). Nullary non-arrow typed constants
+    and type aliases (`emptyLayoutTable : LayoutTable`, `defaultCodecFuel : Nat`,
+    `F32Bits : Type`) are also excluded so plain data constants cannot serve as
+    an LHS evaluator and remain usable as plain data in fixtures.
+    """
+    code = _strip_lean_comments_fast(lean_source)
+    names: set[str] = set()
+    for match in _TRUSTED_DECL_RE.finditer(code):
+        kind, name = match.group(1), match.group(2)
+        if kind not in _TRUSTED_FUNCTION_KINDS or "." in name:
+            continue
+        tail = code[match.end() : match.end() + 400]
+        stop = len(tail)
+        for sep in (":=", "\n  |", "\n|", " where"):
+            idx = tail.find(sep)
+            if idx != -1 and idx < stop:
+                stop = idx
+        header_sig = tail[:stop].strip()
+        if (
+            header_sig.startswith(":")
+            and "→" not in header_sig
+            and "->" not in header_sig
+            and "∀" not in header_sig
+        ):
+            continue
+        names.add(name)
+    return names
 
 
 def _trusted_constructor_names(lean_source: str) -> set[str]:
@@ -2610,14 +2702,105 @@ def _split_top_level_equality(stmt: str) -> list[int]:
     return positions
 
 
-# Term-level binders that could name the whole evaluation and then state
-# something trivial about that name (`let x := evalStmt s t; x = x`).
+# Term-level binders and control/lambda syntax that could name or discard the
+# semantics evaluation (`let x := evalStmt s t; x = x`, `evalStmt s t |> (·)`).
 _STATEMENT_BINDER_RE = re.compile(r"(?<![\w'])(?:let|fun|λ)(?![\w'])")
+_STATEMENT_CONTROL_RE = re.compile(r"(?<![\w'])(?:match|if)(?![\w'])|·")
 _STATEMENT_HEAD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*(?=\s|$)")
 _UB_IDENT_RE = re.compile(r"(?<![\w'])ub(?![\w'])")
 
+# Top-level operators forbidden at bracket depth 0 of a theorem LHS. A valid
+# LHS is a single direct application `<semantics_fn> <arg1> <arg2> ...`;
+# pipelines (`|>`, `<|`, `$`), boolean/comparison operators (`==`, `!=`, `&&`,
+# `||`), cons (`::`), or arithmetic at depth 0 could discard or self-compare
+# the semantics result (`evalStmt s stmt |> Function.const _ 0 = 0`).
+_LHS_TOP_LEVEL_OPS_2: tuple[str, ...] = (
+    "|>",
+    "<|",
+    "==",
+    "!=",
+    "&&",
+    "||",
+    "++",
+    "::",
+    "<=",
+    ">=",
+    ":=",
+    "=>",
+)
+_LHS_TOP_LEVEL_OPS_1: frozenset[str] = frozenset("$ ; ≠ ∧ ∨ ≤ ≥ + - * / % < > ,".split())
+
 # The only right-hand sides a refutation theorem may assert.
 REFUTE_UB_RHS: tuple[str, ...] = (".ub", "MirStepNode.fail .ub")
+
+
+def _blank_lean_string_literals(text: str) -> str:
+    """Replace contents of double-quoted string literals with spaces."""
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            out.append('"')
+            i += 1
+            while i < n:
+                c = text[i]
+                if c == "\\" and i + 1 < n:
+                    out.append("  ")
+                    i += 2
+                elif c == '"':
+                    out.append('"')
+                    i += 1
+                    break
+                else:
+                    out.append("\n" if c == "\n" else " ")
+                    i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _find_top_level_lhs_operators(lhs: str) -> list[str]:
+    """Return any top-level (depth-0, non-string) operators found in `lhs`."""
+    found: list[str] = []
+    depth = 0
+    i = 0
+    n = len(lhs)
+    while i < n:
+        ch = lhs[i]
+        if ch == '"':
+            i += 1
+            while i < n:
+                if lhs[i] == "\\" and i + 1 < n:
+                    i += 2
+                elif lhs[i] == '"':
+                    i += 1
+                    break
+                else:
+                    i += 1
+            continue
+        if ch in "([{⟨":
+            depth += 1
+            i += 1
+            continue
+        if ch in ")]}⟩" and depth > 0:
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0:
+            two = lhs[i : i + 2]
+            if two in _LHS_TOP_LEVEL_OPS_2:
+                found.append(two)
+                i += 2
+                continue
+            if ch in _LHS_TOP_LEVEL_OPS_1:
+                found.append(ch)
+                i += 1
+                continue
+        i += 1
+    return found
 
 
 def _fixture_statement_errors(
@@ -2626,20 +2809,24 @@ def _fixture_statement_errors(
     theorem_name: str,
     *,
     semantics_fn_names: frozenset[str] | set[str],
+    target_fn_names: frozenset[str] | set[str] | None = None,
 ) -> list[str]:
     """Reject a fixture theorem that does not test the trusted semantics.
 
     `_fixture_shape_errors` pins the proof to `rfl`; this pins the statement
-    to `<semantics function> <args> = <expected data>`:
+    to `<target semantics function> <arg1> ... = <expected data>`:
 
     - exactly one top-level `=`, written without enclosing parentheses, with
-      no `let`/`fun`/`λ` and with textually different sides;
-    - the LHS is an application whose head is a function defined in one of
-      `SEMANTICS_MODULES` (`semantics_fn_names`), written unqualified;
-    - no such function is named anywhere else in the fixture. Helper `def`s
-      and the RHS are therefore plain data, so the RHS cannot be an alias of
-      the very evaluation it is compared with (`def expected := evalStmt s t`
-      and then `evalStmt s t = expected`), which `rfl` proves on every mutant;
+      no `let`/`fun`/`λ`/`match`/`if`/`·` and with textually different sides;
+    - the LHS is a direct application (at least one argument, no depth-0
+      pipeline/infix/comparison/cons operators) whose head is a function
+      defined in the guard's rebuilt/mutated module(s) (`target_fn_names`,
+      defaulting to `semantics_fn_names`), written unqualified;
+    - no `MirSemantics` function (`semantics_fn_names`) is named anywhere else
+      in the fixture — neither in LHS arguments, nor in helper `def`s, nor on
+      the RHS. Helper `def`s and the RHS are therefore plain data, so the RHS
+      cannot alias the evaluation (`def expected := evalStmt s t`) and the LHS
+      cannot self-compare or discard it (`evalStmt s t |> Function.const _ 0`);
     - a refutation's RHS is literally UB (`REFUTE_UB_RHS`), and a positive
       sanity fixture never mentions `ub`, neither inline nor through a helper.
 
@@ -2648,6 +2835,9 @@ def _fixture_statement_errors(
     mutant and silently disables the check that a mutation left non-UB
     behavior intact. These checks are what protects that half of the gate.
     """
+    effective_target_fns = (
+        semantics_fn_names if target_fn_names is None else target_fn_names
+    )
     code_only, _, _ = _scan_lean_source(src_text)
     span_lines: list[str] = []
     try:
@@ -2665,12 +2855,18 @@ def _fixture_statement_errors(
     ):
         return [f"({kind}): cannot extract the statement of theorem {theorem_name!r}"]
     stmt = "\n".join(span_lines[1:-1]).rstrip()[: -len(":=")].strip()
+    stmt_no_strings = _blank_lean_string_literals(stmt)
 
     errors: list[str] = []
-    if _STATEMENT_BINDER_RE.search(stmt):
+    if _STATEMENT_BINDER_RE.search(stmt_no_strings):
         errors.append(
             f"({kind}): theorem {theorem_name!r} statement must not contain "
             "`let`, `fun` or `λ`"
+        )
+    if _STATEMENT_CONTROL_RE.search(stmt_no_strings):
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} statement must not contain "
+            "`match`, `if` or `·`"
         )
     eq_positions = _split_top_level_equality(stmt)
     if len(eq_positions) != 1:
@@ -2692,11 +2888,36 @@ def _fixture_statement_errors(
         )
 
     head = _STATEMENT_HEAD_RE.match(lhs)
-    if head is None or head.group(0) not in semantics_fn_names:
+    if (
+        head is None
+        or head.group(0) not in effective_target_fns
+        or not lhs[head.end() :].strip()
+    ):
         errors.append(
             f"({kind}): theorem {theorem_name!r} LHS must apply a trusted "
-            f"MirSemantics function, got {lhs.split()[0]!r}"
+            f"MirSemantics function from the mutated module, got {lhs.split()[0]!r}"
         )
+    else:
+        top_ops = _find_top_level_lhs_operators(lhs)
+        if top_ops:
+            errors.append(
+                f"({kind}): theorem {theorem_name!r} LHS must be a direct function "
+                f"application without top-level operator(s) {top_ops!r}"
+            )
+        lhs_args_no_strings = _blank_lean_string_literals(lhs[head.end() :])
+        nested_in_lhs = sorted(
+            {
+                name
+                for name in _LEAN_SIMPLE_IDENT_RE.findall(lhs_args_no_strings)
+                if name in semantics_fn_names
+            }
+        )
+        if nested_in_lhs:
+            errors.append(
+                f"({kind}): theorem {theorem_name!r} LHS arguments must not invoke "
+                f"additional MirSemantics function(s) {nested_in_lhs}"
+            )
+
     outside_lhs = Counter(_LEAN_SIMPLE_IDENT_RE.findall(code_only)) - Counter(
         _LEAN_SIMPLE_IDENT_RE.findall(lhs)
     )
@@ -2855,7 +3076,9 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
     trusted_decl_names: set[str] = set()
     trusted_ctor_names: set[str] = set()
     # Functions of the mutable semantics modules: the only things a fixture
-    # theorem may evaluate, and only on its LHS.
+    # theorem may evaluate, and only as the LHS head of a guard whose rebuild
+    # closure includes the defining module.
+    semantics_fns_by_module: dict[str, set[str]] = {}
     semantics_fn_names: set[str] = set()
     for mod in (*BASE_TRUSTED_MODULES, *SEMANTICS_MODULES):
         mod_path = trusted_lean_dir / f"{mod}.lean"
@@ -2866,7 +3089,9 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
         trusted_decl_names |= _trusted_declaration_names(mod_text)
         trusted_ctor_names |= _trusted_constructor_names(mod_text)
         if mod in SEMANTICS_MODULES:
-            semantics_fn_names |= _trusted_function_names(mod_text)
+            mod_fns = _trusted_function_names(mod_text)
+            semantics_fns_by_module[mod] = mod_fns
+            semantics_fn_names |= mod_fns
         if not _parse_lean_header_ex(mod_text)[2]:
             errors.append(f"cannot parse every import of trusted module {mod}")
         mod_imports = _extract_trusted_imports(mod_text)
@@ -2974,6 +3199,10 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
                 f"{guard.guard_id}: sanity and refutation fixtures are identical"
             )
 
+        target_fn_names: set[str] = set()
+        for mod in rebuild_mods:
+            target_fn_names |= semantics_fns_by_module.get(mod, set())
+
         for kind, src_text, thm_name in (
             ("sanity", guard.sanity_source, guard.sanity_theorem_name),
             ("refute", guard.refute_source, guard.theorem_name),
@@ -2983,7 +3212,11 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             ):
                 errors.append(f"{guard.guard_id}: {shape_error}")
             for stmt_error in _fixture_statement_errors(
-                kind, src_text, thm_name, semantics_fn_names=semantics_fn_names
+                kind,
+                src_text,
+                thm_name,
+                semantics_fn_names=semantics_fn_names,
+                target_fn_names=target_fn_names,
             ):
                 errors.append(f"{guard.guard_id}: {stmt_error}")
 
@@ -3988,26 +4221,26 @@ def _run_lean(
             stdout="",
             stderr=f"failed to execute Lean command {cmd[0]!r}: {exc}",
         )
-    aborted_during_spawn = False
-    with _LIVE_PROCS_LOCK:
-        if _ABORT.is_set():
-            aborted_during_spawn = True
-        else:
-            _LIVE_PROCS.add(proc)
-    if aborted_during_spawn:
-        _kill_process_group(proc)
-        try:
-            with proc:
-                proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=130,
-            stdout="",
-            stderr="run aborted while Lean was starting",
-        )
     try:
+        aborted_during_spawn = False
+        with _LIVE_PROCS_LOCK:
+            if _ABORT.is_set():
+                aborted_during_spawn = True
+            else:
+                _LIVE_PROCS.add(proc)
+        if aborted_during_spawn:
+            _kill_process_group(proc)
+            try:
+                with proc:
+                    proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=130,
+                stdout="",
+                stderr="run aborted while Lean was starting",
+            )
         with proc:
             try:
                 out, err = proc.communicate(timeout=timeout_sec)
@@ -4035,6 +4268,15 @@ def _run_lean(
                 stdout=out or "",
                 stderr=err or "",
             )
+    except BaseException:
+        _kill_process_group(proc)
+        if proc.poll() is None:
+            try:
+                with proc:
+                    proc.communicate(timeout=5)
+            except BaseException:
+                pass
+        raise
     finally:
         with _LIVE_PROCS_LOCK:
             _LIVE_PROCS.discard(proc)
@@ -4572,19 +4814,22 @@ def _termination_signals_as_interrupt() -> Iterator[None]:
 
     taken_over: list[int] = []
     try:
-        for name in ("SIGTERM", "SIGHUP"):
-            signum = getattr(signal, name, None)
-            if signum is not None and signal.getsignal(signum) is signal.SIG_DFL:
-                signal.signal(signum, _raise)
-                taken_over.append(signum)
-    except ValueError:
-        # Not the main thread: signal handling belongs to the embedding program.
-        pass
-    try:
+        try:
+            for name in ("SIGTERM", "SIGHUP"):
+                signum = getattr(signal, name, None)
+                if signum is not None and signal.getsignal(signum) is signal.SIG_DFL:
+                    signal.signal(signum, _raise)
+                    taken_over.append(signum)
+        except ValueError:
+            # Not the main thread: signal handling belongs to the embedding program.
+            pass
         yield
     finally:
         for signum in taken_over:
-            signal.signal(signum, signal.SIG_DFL)
+            try:
+                signal.signal(signum, signal.SIG_DFL)
+            except ValueError:
+                pass
 
 
 def _write_json_out(path: Path, report: dict[str, object]) -> None:
@@ -4807,8 +5052,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             _write_json_out(args.json_out, report)
         except OSError as exc:
-            print(f"ERROR: cannot write {args.json_out}: {exc}", file=sys.stderr)
-            return 1
+            unwritable, args.json_out = args.json_out, None
+            return _fail(f"cannot write {unwritable}: {exc}")
 
     if args.emit_json:
         print(json.dumps(report, indent=2))

@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from unittest import mock
@@ -3207,6 +3208,361 @@ class GuardMutationB3AdversarialTests(unittest.TestCase):
                 self.assertIs(signal.getsignal(sig), signal.SIG_DFL)
             finally:
                 signal.signal(sig, before)
+
+
+class GuardMutationA3AdversarialTests(unittest.TestCase):
+    """Round 3 A3 audit: subplace sanity, target-module/LHS/rfl tightening, signals."""
+
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+    HEADER = "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+
+    def _stmt_errors(
+        self,
+        kind: str,
+        body: str,
+        helpers: str = "",
+        *,
+        semantics_fn_names: set[str] | None = None,
+        target_fn_names: set[str] | None = None,
+    ) -> list[str]:
+        src = f"{self.HEADER}{helpers}theorem t :\n{body} :=\n  rfl\n"
+        return gmut._fixture_statement_errors(
+            kind,
+            src,
+            "t",
+            semantics_fn_names=semantics_fn_names or {"evalStmt", "evalOperand"},
+            target_fn_names=target_fn_names,
+        )
+
+    # -- same-local disjoint sub-field sanity for subplace overlap -----
+
+    def test_subplace_overlap_sanity_exercises_same_local_disjoint_fields(self) -> None:
+        guard = gmut.select_guards(
+            guard_filters=["copy_nonoverlapping_subplace_overlap"]
+        )[0]
+        # Both source and destination borrows target local 0 with distinct
+        # field projections (.field 0 vs .field 1), so the positive sanity
+        # proof genuinely traverses the `targetLocal == targetLocal ->
+        # projectionsOverlap` branch on both unmodified and mutated TCBs.
+        self.assertIn(".field 0 { kind := .uint .u32, layoutIdx := 0 }", guard.sanity_source)
+        self.assertIn(".field 1 { kind := .uint .u32, layoutIdx := 0 }", guard.sanity_source)
+        self.assertIn(
+            "tag := 1, targetLocal := 0, targetProjection := fieldZero :: .nil",
+            guard.sanity_source,
+        )
+        self.assertIn(
+            "tag := 2, targetLocal := 0, targetProjection := fieldOne :: .nil",
+            guard.sanity_source,
+        )
+        # Local 0 is a 2-field aggregate whose field 1 receives field 0's value,
+        # and whole-local `invalidateConflictingBorrows` disables tag 1.
+        self.assertIn(
+            ".init (.aggregate 0 (.scalar ⟨42, 4⟩ :: .scalar ⟨99, 4⟩ :: .nil))",
+            guard.sanity_source,
+        )
+        self.assertIn(
+            ".init (.aggregate 0 (.scalar ⟨42, 4⟩ :: .scalar ⟨42, 4⟩ :: .nil))",
+            guard.sanity_source,
+        )
+        self.assertIn("{ fieldZeroBorrow with perm := .disabled }", guard.sanity_source)
+        self.assertEqual(gmut.validate_catalog_invariants(ANNEAL_ROOT), [])
+
+    # -- _trusted_function_names & cross-module / LHS hardening --------
+
+    def test_trusted_function_names_ignores_comments_dotted_and_nullary_data(self) -> None:
+        sample = textwrap.dedent(
+            """\
+            -- def fakeLineComment (x : Nat) : Nat := x
+            /-!
+            Doc quote with stray " character:
+            def fakeBlockComment (x : Nat) : Nat := x
+            /- nested comment
+            def fakeNested (x : Nat) : Nat := x
+            -/
+            -/
+            def emptyLayoutTable : LayoutTable :=
+              { entries := .nil }
+            abbrev F32Bits : Type := BitVec 32
+            def defaultCodecFuel : Nat := 16
+            def FloatPtrWidth.bits : FloatPtrWidth → Nat
+              | .bits32 => 32
+            def realFn (x : Nat) : Nat := x
+            def realArrow : Nat → Nat
+              | n => n
+            abbrev realAlias := realFn
+            """
+        )
+        names = gmut._trusted_function_names(sample)
+        self.assertEqual(names, {"realFn", "realArrow", "realAlias"})
+
+        # Live Scalars.lean: `bits` (from `FloatPtrWidth.bits`) and
+        # `emptyLayoutTable` are NOT in `semantics_fn_names`, so record syntax
+        # `{ bits := 42, sizeBytes := 4 }` in a helper `def` is accepted.
+        scalars_text = (
+            ANNEAL_ROOT
+            / "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean"
+        ).read_text(encoding="utf-8")
+        scalars_fns = gmut._trusted_function_names(scalars_text)
+        self.assertIn("evalScalarBinOp", scalars_fns)
+        self.assertIn("evalUnaryNot", scalars_fns)
+        self.assertNotIn("bits", scalars_fns)
+        self.assertNotIn("emptyLayoutTable", scalars_fns)
+        self.assertNotIn("F32Bits", scalars_fns)
+
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        record_helper = guard.sanity_source.replace(
+            "theorem sanity_div_by_zero :",
+            "def fortyTwo : ScalarInt :=\n  { bits := 42, sizeBytes := 1 }\n\ntheorem sanity_div_by_zero :",
+        ).replace("⟨42, 1⟩", "fortyTwo")
+        with mock.patch.object(
+            gmut,
+            "MIR_SEMANTICS_GUARDS",
+            _replace_guard("div_by_zero", sanity_source=record_helper),
+        ):
+            self.assertEqual(gmut.validate_catalog_invariants(ANNEAL_ROOT), [])
+
+    def test_cross_module_sanity_bypass_is_rejected(self) -> None:
+        # A Terminators.lean guard whose sanity theorem calls `evalScalarBinOp`
+        # (from unmutated Scalars.lean) would pass on every broken Terminators
+        # mutant; target-module scoping must reject it statically.
+        div_guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        term_guard = gmut.select_guards(
+            guard_filters=["tb_drop_protector_conflict"]
+        )[0]
+        cross_sanity = div_guard.sanity_source.replace(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars",
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Terminators",
+        ).replace(div_guard.sanity_theorem_name, term_guard.sanity_theorem_name)
+        with mock.patch.object(
+            gmut,
+            "MIR_SEMANTICS_GUARDS",
+            _replace_guard("tb_drop_protector_conflict", sanity_source=cross_sanity),
+        ):
+            errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(
+            any("LHS must apply a trusted MirSemantics function from the mutated module" in e for e in errors),
+            errors,
+        )
+
+    def test_lhs_pipelines_operators_nested_calls_and_control_syntax_rejected(self) -> None:
+        # Pipelines, comparisons, cons, or arithmetic at depth 0 of LHS could
+        # discard or self-compare the semantics result (`rfl` proves `0 = 0`).
+        for bad_lhs in (
+            "evalStmt s stmt |> Function.const _ 0",
+            "evalStmt s stmt |>.isOk",
+            "evalStmt s stmt == evalStmt s stmt",
+            "evalStmt s stmt :: .nil",
+            "evalStmt s stmt $ x",
+            "evalStmt s stmt + 0",
+        ):
+            errs = self._stmt_errors("sanity", f"    {bad_lhs} = expected")
+            self.assertTrue(
+                any("without top-level operator(s)" in e for e in errs),
+                (bad_lhs, errs),
+            )
+
+        # Helper discard via pipeline is also blocked even when `fun` lives in a helper.
+        errs = self._stmt_errors(
+            "sanity",
+            "    evalStmt s stmt |> discard = 0",
+            helpers="def discard : MirStepNode → Nat := fun _ => 0\n\n",
+        )
+        self.assertTrue(any("without top-level operator(s)" in e for e in errs), errs)
+
+        # Bare 0-ary LHS (no arguments applied), qualified paths, and
+        # double-parenthesized applications all fail closed.
+        for bad_lhs in (
+            "evalStmt",
+            "((evalStmt s stmt))",
+            "Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt s stmt",
+        ):
+            errs = self._stmt_errors("refute", f"    {bad_lhs} = MirStepNode.fail .ub")
+            self.assertTrue(
+                any("LHS must apply a trusted MirSemantics function" in e for e in errs),
+                (bad_lhs, errs),
+            )
+
+        # Nested second MirSemantics function inside LHS arguments is rejected.
+        errs = self._stmt_errors(
+            "sanity", "    evalStmt (evalOperand xs op) stmt = MirStepNode.step s"
+        )
+        self.assertTrue(
+            any("LHS arguments must not invoke additional MirSemantics" in e for e in errs),
+            errs,
+        )
+
+        # `match`, `if`, and Lean 4 center-dot `·` anonymous lambda are blocked,
+        # while the same text inside a string literal is harmless data.
+        for bad_body in (
+            "    evalStmt (if true then s else s) stmt = MirStepNode.step s",
+            "    evalStmt (match s with | x => x) stmt = MirStepNode.step s",
+            "    evalStmt ((·) s) stmt = MirStepNode.step s",
+        ):
+            errs = self._stmt_errors("sanity", bad_body)
+            self.assertTrue(any("`match`, `if` or `·`" in e for e in errs), (bad_body, errs))
+
+        self.assertEqual(
+            self._stmt_errors(
+                "sanity",
+                '    evalStmt s { kind := .nop, span := "if let a |> b == c ·" } = MirStepNode.step s',
+            ),
+            [],
+        )
+
+    # -- tightened `:= rfl` proof-failure classification ---------------
+
+    def test_classify_rejects_statement_elaboration_errors_and_partial_kills(self) -> None:
+        # Broken statement elaboration errors (arity, field, typeclass, argument
+        # type mismatch) are NON_KILL_ERROR_MARKERS and never count as kills —
+        # including `Application type mismatch`, which contains `type mismatch`.
+        for broken in (
+            "/t/Refute_div_by_zero.lean:8:4: error: Application type mismatch\n  x\nhas type\n  Nat\n",
+            "/t/Refute_div_by_zero.lean:8:4: error: Function expected at\n  f\n",
+            "/t/Refute_div_by_zero.lean:8:4: error: invalid field 'foo', the environment does not contain 'Bar.foo'\n",
+            "/t/Refute_div_by_zero.lean:8:4: error: 'foo' is not a valid field\n",
+            "/t/Refute_div_by_zero.lean:8:4: error: failed to synthesize\n  Inhabited Foo\n",
+        ):
+            status, detail = gmut.classify_refutation_failure(
+                1, broken, self.FIXTURE, self.SPAN, stderr_output=""
+            )
+            self.assertEqual(status, "ERROR", (broken, detail))
+
+        # Arbitrary errors mentioning `rfl`, `has type`, or `unsolved goals`
+        # without `Type mismatch` / `type mismatch` are NOT `:= rfl` kills.
+        for non_rfl in (
+            "/t/Refute_div_by_zero.lean:9:2: error: unsolved goals\n  ⊢ False\n",
+            "/t/Refute_div_by_zero.lean:9:2: error: failed near rfl\n",
+            "/t/Refute_div_by_zero.lean:9:2: error: term has type Nat\n",
+        ):
+            status, detail = gmut.classify_refutation_failure(
+                1, non_rfl, self.FIXTURE, self.SPAN, stderr_output=""
+            )
+            self.assertEqual(status, "ERROR", (non_rfl, detail))
+
+        # Exact two-diagnostic Lean 4.34.1 `:= rfl` refutation failure
+        # (`Not a definitional equality` + `Type mismatch`) classifies as KILLED,
+        # while adding any NON_KILL_ERROR_MARKERS turns it into ERROR.
+        lean434_pair = (
+            "/t/Refute_div_by_zero.lean:7:0: error: Not a definitional equality: the left-hand side\n"
+            "  evalScalarBinOp Trusted.Rustc.V2026_06_01.MirAst.BinOp.div { bits := 5, sizeBytes := 4 } { bits := 1, sizeBytes := 4 }\n"
+            "    []\n"
+            "is not definitionally equal to the right-hand side\n"
+            "  RvalueEvalResult.ub\n"
+            "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n"
+            "  rfl\n"
+            "has type\n"
+            "  ?m.14 = ?m.14\n"
+            "but is expected to have type\n"
+            "  evalScalarBinOp .div ⟨7, 1⟩ ⟨0, 1⟩ .nil emptyMemory false = .ub\n"
+        )
+        status, detail = gmut.classify_refutation_failure(
+            1, lean434_pair, self.FIXTURE, self.SPAN, stderr_output=""
+        )
+        self.assertEqual(status, "KILLED", detail)
+        self.assertIn("[7, 9]", detail)
+        for marker in gmut.NON_KILL_ERROR_MARKERS:
+            bad_pair = lean434_pair + f"  {marker}\n"
+            status_bad, detail_bad = gmut.classify_refutation_failure(
+                1, bad_pair, self.FIXTURE, self.SPAN, stderr_output=""
+            )
+            self.assertEqual(status_bad, "ERROR", (marker, detail_bad))
+
+        # Every error diagnostic inside the theorem span must be a recognized
+        # `:= rfl` proof failure: a bizarre glitch alongside a Type mismatch is
+        # ERROR, not KILLED.
+        mixed = (
+            "/t/Refute_div_by_zero.lean:8:4: error: bizarre glitch\n"
+            "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\n"
+        )
+        status, _ = gmut.classify_refutation_failure(
+            1, mixed, self.FIXTURE, self.SPAN, stderr_output=""
+        )
+        self.assertEqual(status, "ERROR")
+
+    # -- signal handling in non-main threads & partial-install restore --
+
+    def test_termination_signals_non_main_thread_and_partial_install_restore(self) -> None:
+        # Entering `_termination_signals_as_interrupt` from a worker thread
+        # must not raise `ValueError: signal only works in main thread`.
+        worker_errors: list[BaseException] = []
+        entered = False
+
+        def _worker() -> None:
+            nonlocal entered
+            try:
+                with gmut._termination_signals_as_interrupt():
+                    entered = True
+            except BaseException as exc:  # noqa: BLE001
+                worker_errors.append(exc)
+
+        t = threading.Thread(target=_worker)
+        t.start()
+        t.join(timeout=5)
+        self.assertFalse(t.is_alive())
+        self.assertTrue(entered)
+        self.assertEqual(worker_errors, [])
+
+        # If SIGTERM is installed and installing SIGHUP is interrupted (or
+        # raises), SIGTERM must still be restored to SIG_DFL.
+        before_term = signal.getsignal(signal.SIGTERM)
+        before_hup = signal.getsignal(signal.SIGHUP)
+        real_signal = signal.signal
+        try:
+            real_signal(signal.SIGTERM, signal.SIG_DFL)
+            real_signal(signal.SIGHUP, signal.SIG_DFL)
+
+            def _flaky_signal(signum: int, handler: object) -> object:
+                if signum == signal.SIGHUP and handler is not signal.SIG_DFL:
+                    raise KeyboardInterrupt("SIGTERM")
+                return real_signal(signum, handler)  # type: ignore[arg-type]
+
+            with mock.patch.object(signal, "signal", side_effect=_flaky_signal):
+                with self.assertRaisesRegex(KeyboardInterrupt, "SIGTERM"):
+                    with gmut._termination_signals_as_interrupt():
+                        self.fail("body should not run when install is interrupted")
+            self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+        finally:
+            real_signal(signal.SIGTERM, before_term)
+            real_signal(signal.SIGHUP, before_hup)
+
+    def test_final_json_out_write_error_still_emits_fatal_json_to_stdout(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-a3-json-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, KILL_ALL_FAKE_SH)
+            out = Path(tmp) / "report.json"
+            writes = 0
+            real_write = gmut._write_json_out
+
+            def _fail_second_write(path: Path, report: dict[str, object]) -> None:
+                nonlocal writes
+                writes += 1
+                if writes >= 2:
+                    raise OSError("disk full")
+                real_write(path, report)
+
+            with (
+                mock.patch.object(gmut, "_write_json_out", side_effect=_fail_second_write),
+                mock.patch("sys.stdout", new_callable=lambda: __import__("io").StringIO()) as buf_out,
+                mock.patch("sys.stderr", new_callable=lambda: __import__("io").StringIO()) as buf_err,
+            ):
+                rc = gmut.main(
+                    [
+                        "--lean", str(fake),
+                        "--no-lake-cache",
+                        "--guard", "div_by_zero",
+                        "--json",
+                        "--json-out", str(out),
+                    ]
+                )
+            self.assertEqual(rc, 1)
+            self.assertIn("disk full", buf_err.getvalue())
+            emitted = json.loads(buf_out.getvalue())
+            self.assertFalse(emitted["ok"])
+            self.assertIn("disk full", emitted["fatal_error"])
+            # Pre-written fail-closed sentinel remains on disk.
+            on_disk = json.loads(out.read_text(encoding="utf-8"))
+            self.assertFalse(on_disk["ok"])
 
 
 if __name__ == "__main__":
