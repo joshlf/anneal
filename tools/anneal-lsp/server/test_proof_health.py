@@ -8028,5 +8028,214 @@ class TestNegationPrecedenceB3AdversarialFixes(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceA3AdversarialFixes(unittest.TestCase):
+    r"""`[adv A3]` regressions for bugs found in `[adv B3]` and earlier vacuity auditor passes:
+
+    1. Depth-0 `let` vs proof `:=`: closed `let x := 1 in ...`, parenthesised `(let x := 1 in x)`,
+       `do` `let x ← f`, and whitespace variants (`let\tx`, `let\n  x`) were mishandled by the
+       `rfind("let ")` heuristic, swallowing `:= rfl` / `:= h` into the statement.
+    2. `where` before pattern-matching `\n  | ... =>` field arms: `_PIPE_ARM_RE` cut at `|` before
+       checking for an earlier depth-0 `where`, leaving `A ∧ B where\n  left` and emitting a bogus
+       `stmt-cut`.
+    3. `Float` / `Float32` non-reflexivity symmetry & `_operand_may_be_float` precision:
+       - `Float32` binders were missed by `_float_vars_before` and `_hyp_atoms`;
+       - `tok != e` in `_operand_may_be_float` exempted `Nat` variables ending in `Float` inside
+         compound operands (`lenFloat + 1`, `f lenFloat`);
+       - Reflexive `x ≤ x` conclusions over `Float`/`Float32` (and `n.toFloat`) were falsely flagged
+         as `RULE_TRIVIAL_CONCLUSION` even though `NaN ≤ NaN` is false.
+    4. Implicit/instance parameter shift & multi-arg alignment in `_untyped_binders_inhabited_by_calls`:
+       - `_quantifier_context_before` counted `{α : Type}` / `⦃α : Type⦄` / `[DecidableEq Nat]`
+         domains as explicit positional slots, shifting an inhabited domain onto an empty `Fin 0`
+         argument (`R x s` with `R : {α : Type} → Nat → Fin 0 → Prop`);
+       - `@R` and named arguments `(a := 0)` similarly broke positional alignment;
+       - Numeral (`R 0 s`) and projection/subscript (`R xs.length s`, `R arr[0] s`) leading args
+         aborted the arg loop instead of advancing to the next positional slot;
+       - `_first_standalone_use` matched inside guillemet identifiers `«s»`.
+    5. Default-value / `autoParam` header binders `(x : T := v)` (also used in `ByteCodec.lean`):
+       trailing depth-0 `:= default` leaked into `b_type`, breaking `Nat`/`Float`/`False` detection
+       and `: False` refutation exemptions while nested `{ a := 1 }` and `let` stayed intact.
+    6. Dependent-arrow inhabited domains in hypotheses: `(h : (x : Nat) → False)` /
+       `(h : (x : Nat) → x < 0)` / `(h : (x : Nat) → P x ∧ ¬ P x)` were missed while `∀ x : Nat, ...`
+       was caught.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "lenFloat_plus_1_not_le": "theorem bad (lenFloat : Nat) (h : ¬ lenFloat + 1 ≤ lenFloat + 1) : x = 1 := by sorry\n",
+        "app_lenFloat_not_le": "theorem bad (lenFloat : Nat) (h : ¬ f lenFloat ≤ f lenFloat) : x = 1 := by sorry\n",
+        "nat_lenFloat_call_not_le": "theorem bad (lenFloat : Nat) (h : ¬ lenFloat 0 ≤ lenFloat 0) : x = 1 := by sorry\n",
+        "float32_other_nat_not_le": "theorem bad (x : Float32) (n : Nat) (h : ¬ n ≤ n) : y = 1 := by sorry\n",
+        "forall_float32_false": "theorem bad (h : ∀ x : Float32, False) : x = 1 := by sorry\n",
+        "untyped_two_arg_numeral": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 0 s ∧ False) : x = 1 := by sorry\n",
+        "untyped_two_arg_proj": "theorem bad (xs : List Nat) (R : Nat → Nat → Prop) (h : ∀ s, R xs.length s ∧ False) : x = 1 := by sorry\n",
+        "untyped_two_arg_index": "theorem bad (arr : Array Nat) (R : Nat → Nat → Prop) (h : ∀ s, R arr[0] s ∧ False) : x = 1 := by sorry\n",
+        "untyped_guillemet_before_use": "theorem bad (R : Nat → Prop) («s» : Nat) (h : ∀ s, «s» = 0 ∧ R s ∧ False) : x = 1 := by sorry\n",
+        "optparam_nat_lt_zero": "theorem bad (n : Nat := 0) (h : n < 0) : x = 1 := by sorry\n",
+        "autoparam_false_hyp": "theorem bad (h : False := by sorry) : x = 1 := by sorry\n",
+        "autoparam_zero_eq_one": "theorem bad (h : 0 = 1 := by sorry) : x = 1 := by sorry\n",
+        "forall_optparam_nat_lt_zero": "theorem bad : ∀ (n : Nat := 0) (h : n < 0), x = 1 := by sorry\n",
+        "dep_arrow_nat_false": "theorem bad (h : (x : Nat) → False) : x = 1 := by sorry\n",
+        "dep_arrow_nat_lt_zero": "theorem bad (h : (x : Nat) → x < 0) : x = 1 := by sorry\n",
+        "dep_arrow_scoped_pos_neg": "theorem bad (P : Nat → Prop) (h : (x : Nat) → P x ∧ ¬ P x) : y = 1 := by sorry\n",
+    }
+
+    TRIVIAL_CONCLUSION_ALL_SCOPE = {
+        "let_in_paren_refl": "theorem bad : (let x := 1 in x) = (let x := 1 in x) := rfl\n",
+        "let_tab_paren_refl": "theorem bad : (let\tx := 1; x) = (let\tx := 1; x) := rfl\n",
+        "where_pipe_field_trivial": "theorem bad : (∀ n : Nat, True) ∧ True where\n  left\n  | 0 => trivial\n  | _ + 1 => trivial\n  right := trivial\n",
+        "where_all_pipe_fields_trivial": "theorem bad : (∀ n : Nat, True) ∧ (∀ m : Nat, True) where\n  left\n  | _ => trivial\n  right\n  | _ => trivial\n",
+        "float_other_nat_le_conc": "theorem bad (x : Float) (n : Nat) : n ≤ n := Nat.le_refl n\n",
+        "float_rebound_nat_forall_le_conc": "theorem bad (x : Float) : ∀ x : Nat, x ≤ x := fun _ => Nat.le_refl _\n",
+        "lenFloat_plus_1_le_conc": "theorem bad (lenFloat : Nat) : lenFloat + 1 ≤ lenFloat + 1 := Nat.le_refl _\n",
+    }
+
+    TAUTOLOGY_ALL_SCOPE = {
+        "let_in_paren_taut": "theorem bad (h : (let x := 1 in x) = 1) : (let x := 1 in x) = 1 := h\n",
+        "where_pipe_field_taut": "theorem bad (h : (Nat → Prop) ∧ True) : (Nat → Prop) ∧ True where\n  left\n  | n => h.1 n\n  right := h.2\n",
+    }
+
+    CLEAN = {
+        "float32_binder_not_le": "theorem ok (x : Float32) (h : ¬ x ≤ x) : x.isNaN = true := by sorry\n",
+        "exists_float32_not_le": "theorem ok (h : ∃ x : Float32, ¬ x ≤ x) : P := by sorry\n",
+        "dep_arrow_float_not_le": "theorem ok (h : (x : Float) → ¬ x ≤ x) : P := by sorry\n",
+        "float_le_refl_conc": "theorem ok (x : Float) (h : ¬ x.isNaN) : x ≤ x := by sorry\n",
+        "float32_le_refl_conc": "theorem ok (x : Float32) (h : ¬ x.isNaN) : x ≤ x := by sorry\n",
+        "toFloat_le_refl_conc": "theorem ok (n : Nat) : n.toFloat ≤ n.toFloat := by sorry\n",
+        "float_le_conc_conj": "theorem ok (x : Float) (h : ¬ x.isNaN) : x ≤ x ∧ True := by sorry\n",
+        "float_le_conc_disj": "theorem ok (x : Float) (h : ¬ x.isNaN) : x ≤ x ∨ P := by sorry\n",
+        "forall_float_le_conc": "theorem ok : ∀ x : Float, x ≤ x := by sorry\n",
+        "forall_float32_le_conc": "theorem ok : ∀ x : Float32, x ≤ x := by sorry\n",
+        "implicit_domain_shift_guarded": "theorem ok (x : Nat) (R : {α : Type} → Nat → Fin 0 → Prop) (h : ∀ s, R x s ∧ False) : P := by sorry\n",
+        "instance_domain_shift_guarded": "theorem ok (x : Nat) (R : [DecidableEq Nat] → Nat → Fin 0 → Prop) (h : ∀ s, R x s ∧ False) : P := by sorry\n",
+        "strict_implicit_shift_guarded": "theorem ok (x : Nat) (R : ⦃α : Type⦄ → Nat → Fin 0 → Prop) (h : ∀ s, R x s ∧ False) : P := by sorry\n",
+        "explicit_at_call_guarded": "theorem ok (x : Nat) (R : Nat → Fin 0 → Prop) (h : ∀ s, @R x s ∧ False) : P := by sorry\n",
+        "named_arg_call_guarded": "theorem ok (R : Nat → Fin 0 → Prop) (h : ∀ s, R (a := 0) s ∧ False) : P := by sorry\n",
+        "optparam_float_not_le": "theorem ok (x : Float := Float.nan) (h : ¬ x ≤ x) : P := by sorry\n",
+        "optparam_false_elim": "theorem ok (n : Nat := 0) (h : false = true) : False := by cases h\n",
+        "struct_lit_in_binder_intact": "theorem ok (h : ({ a := 1 } : Foo).P) : Q := by sorry\n",
+        "let_in_binder_intact": "theorem ok (h : let x := 1; x = 2) : Q := by sorry\n",
+        "dep_arrow_empty_false": "theorem ok (h : (x : Empty) → False) : P := by sorry\n",
+        "dep_arrow_shadowed_nat_false": "theorem ok (Nat : Prop) (h : (x : Nat) → False) : P := by sorry\n",
+        "dep_arrow_iff_not_descended": "theorem ok (P : Prop) (h : (x : Nat) → False ↔ P) : Q := by sorry\n",
+        "dep_arrow_nat_false_refutation": "theorem ok (h : (x : Nat) → False) : False := h 0\n",
+        "where_pipe_nontrivial": "theorem ok (p q : Prop) (hp : p) (hq : q) : (Nat → p) ∧ q where\n  left\n  | _ => hp\n  right := hq\n",
+        "let_multiline_and_opt_param": "theorem ok : let\n  x := 5\n  x + 0 = 5 := by simp\n",
+        "let_fn_with_default_arg": "theorem ok : let f (x := 1) := 2\n  f = 2 := by simp\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_a3_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_a3_trivial_and_tautological_conclusions_flagged_in_all_scope(self) -> None:
+        for label, src in self.TRIVIAL_CONCLUSION_ALL_SCOPE.items():
+            self.assertIn(
+                audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), f"missed {label}"
+            )
+        for label, src in self.TAUTOLOGY_ALL_SCOPE.items():
+            self.assertIn(
+                audit.RULE_TAUTOLOGICAL_IMPLICATION, _rules(audit.scan_lean_text(src)), f"missed {label}"
+            )
+
+    def test_a3_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        for label, src in self.CLEAN.items():
+            self.assertEqual(audit.scan_lean_text(src), [], f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_a3_header_split_let_where_and_binder_defaults(self) -> None:
+        split = proof_health._split_lean_theorem_header
+        self.assertEqual(
+            split(" : let x := 1 in x = x := rfl\n", 0),
+            ([], "let x := 1 in x = x", []),
+        )
+        self.assertEqual(
+            split(" : (let x := 1 in x) = (let x := 1 in x) := rfl\n", 0),
+            ([], "(let x := 1 in x) = (let x := 1 in x)", []),
+        )
+        self.assertEqual(
+            split(" : let\tx := 1; x = x := rfl\n", 0),
+            ([], "let\tx := 1; x = x", []),
+        )
+        self.assertEqual(
+            split(" : let\n  x := 5\n  x + 0 = 5 := by simp\n", 0),
+            ([], "let\n  x := 5\n  x + 0 = 5", []),
+        )
+        self.assertEqual(
+            split(" : let f (x := 1) := 2\n  f = 2 := by simp\n", 0),
+            ([], "let f (x := 1) := 2\n  f = 2", []),
+        )
+        self.assertEqual(
+            split(" : do let x ← f; pure x = pure x := rfl\n", 0),
+            ([], "do let x ← f; pure x = pure x", []),
+        )
+        self.assertEqual(
+            split(" : (∀ n : Nat, True) ∧ True where\n  left\n  | 0 => trivial\n  right := trivial\n", 0),
+            ([], "(∀ n : Nat, True) ∧ True", []),
+        )
+        self.assertEqual(
+            split(" (n : Nat := 0) (h : m.ok = true := by rfl) : P n := by simp\n", 0),
+            ([("n", "Nat"), ("h", "m.ok = true")], "P n", []),
+        )
+        self.assertEqual(
+            split(" (h : ({ a := 1 } : Foo).P) : Q := by simp\n", 0),
+            ([("h", "({ a := 1 } : Foo).P")], "Q", []),
+        )
+        self.assertEqual(
+            split(" (h : let x := 1; x = 2) : Q := by simp\n", 0),
+            ([("h", "let x := 1; x = 2")], "Q", []),
+        )
+
+    def test_a3_helper_invariants(self) -> None:
+        may_float = proof_health._operand_may_be_float
+        none: frozenset[str] = frozenset()
+        for yes, fv in (
+            ("x", frozenset({"x"})),
+            ("Float32.nan", none),
+            ("n.toFloat", none),
+            ("x.toFloat32", none),
+            ("asFloat v", none),
+            ("asFloat (x + 1)", none),
+            ("1.0 + asFloat v", none),
+        ):
+            self.assertTrue(may_float(yes, fv), yes)
+        for no, fv, nv in (
+            ("lenFloat", none, none),
+            ("lenFloat + 1", none, none),
+            ("f lenFloat", none, none),
+            ("lenFloat 0", none, frozenset({"lenFloat"})),
+        ):
+            self.assertFalse(may_float(no, fv, nv), no)
+        self.assertEqual(proof_health._strip_binder_default("Nat := 0"), "Nat")
+        self.assertEqual(proof_health._strip_binder_default("({ a := 1 } : S).P"), "({ a := 1 } : S).P")
+        self.assertEqual(proof_health._strip_binder_default("let x := 1; x = 2"), "let x := 1; x = 2")
+        self.assertEqual(proof_health._first_standalone_use("«s» = 0 ∧ R s", "s"), 12)
+        self.assertEqual(
+            proof_health._split_dep_arrow_prefix("(x : Nat) → False"),
+            ("x", "Nat", " False"),
+        )
+        self.assertIsNone(proof_health._split_dep_arrow_prefix("{x : Nat // x < 0} → False"))
+        self.assertIsNone(proof_health._split_dep_arrow_prefix("(x : Nat) → False ↔ P"))
+
+    def test_check_trusted_agrees_on_every_a3_header(self) -> None:
+        ct = _load_check_trusted()
+        all_cases = {
+            **self.VACUOUS_BOTH_SCOPES,
+            **self.TRIVIAL_CONCLUSION_ALL_SCOPE,
+            **self.TAUTOLOGY_ALL_SCOPE,
+            **self.CLEAN,
+        }
+        for label, src in all_cases.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
