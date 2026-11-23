@@ -1353,6 +1353,23 @@ fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
     }
 }
 
+/// Whether `v` has a `Copy` type. A closure that is not `move` borrows such a
+/// capture however its body uses it, so the capture keeps its address inside
+/// the closure. A struct or a closure may instead be moved into the closure
+/// (when the body uses it by value), which the evaluator does not determine.
+fn eval_value_is_copy(v: &EvalValue) -> bool {
+    match v {
+        EvalValue::Int(..)
+        | EvalValue::Bool(_)
+        | EvalValue::Unit
+        | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
+        | EvalValue::FnRef(_) => true,
+        EvalValue::Array(elems) => elems.iter().all(eval_value_is_copy),
+        EvalValue::Struct(..) | EvalValue::Closure { .. } => false,
+    }
+}
+
 /// `core::ptr::addr_eq(a, b)` on two references or `*const` raw pointers.
 ///
 /// Two references into one binding are equal iff their byte offsets are
@@ -1361,6 +1378,11 @@ fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
 /// binding, and comparisons between two distinct functions are rejected rather
 /// than guessed (LLVM ICF may merge functions). Zero-sized referents and
 /// unmodeled addresses are likewise rejected.
+///
+/// A raw pointer, unlike a reference, may outlive the variable it points to,
+/// whose address a later variable or call may then reuse. The caller
+/// (`EvalRun::eval_call`) therefore passes a raw pointer into a variable only
+/// while that variable is in scope in the frame that compares it.
 fn eval_addr_eq(a: &EvalValue, b: &EvalValue) -> EvalRes {
     let extract = |v: &EvalValue| -> Result<(Option<EvalAddr>, bool), EvalCtrl> {
         match v {
@@ -2080,6 +2102,10 @@ struct EvalFrame<'a> {
     /// Binding identities (`EvalRef::addr`) of the variables of `scopes` that a
     /// reference was taken to; parallel to `scopes`.
     allocs: Vec<BTreeMap<String, u64>>,
+    /// Variables of the outermost scope whose address is not modeled: the
+    /// captures of a closure that may hold them either by reference or by
+    /// value (see `EvalRun::call_closure`).
+    unplaced: BTreeSet<String>,
     /// Number of bindings of each name made in this frame so far. A closure
     /// records the count of every variable it captures by reference and
     /// refuses to run once one of them was bound again, since the name would
@@ -2100,6 +2126,7 @@ impl<'a> EvalFrame<'a> {
         let mut frame = Self {
             scopes: Vec::new(),
             allocs: Vec::new(),
+            unplaced: BTreeSet::new(),
             bind_gen: BTreeMap::new(),
             local_fns: Vec::new(),
             local_structs: Vec::new(),
@@ -2298,11 +2325,15 @@ impl<'a> EvalRun<'a> {
     /// A closure that captures by reference and is called from the frame that
     /// created it reads its captured variables' current values (sharing their
     /// stack allocation identities for `addr_eq`) and writes any it assigns
-    /// back to them (a unique borrow). Every other call (a `move` closure, or a
-    /// closure that left its frame) runs on the values captured at creation,
-    /// which is exact for shared borrows and for copies; such a call must not
-    /// assign a captured variable, because the evaluator has no storage that
-    /// would carry the assignment to the next call.
+    /// back to them (a unique borrow). A captured struct or closure may be held
+    /// by reference or by value, so its address inside the closure is not
+    /// modeled. A `move` closure, or a closure that captures nothing, runs on
+    /// the values captured at creation; such a call must not assign a captured
+    /// variable, because the evaluator has no storage that would carry the
+    /// assignment to the next call. A closure that borrows its captures and is
+    /// called from any other frame (for example from the body of another
+    /// closure) is rejected: only the frame that created it can supply the
+    /// addresses of the variables it borrows.
     fn call_closure(
         &mut self,
         frame: &mut EvalFrame<'a>,
@@ -2315,6 +2346,11 @@ impl<'a> EvalRun<'a> {
         let expr = closure.expr;
         let live = !closure.by_move && closure.def_frame == frame.id;
         let mut env = closure.env.clone();
+        if !closure.by_move && !live && !env.is_empty() {
+            return eval_unsupported(
+                "by-reference closure called outside the frame that created it",
+            );
+        }
         if live {
             for (name, generation) in &closure.gens {
                 if frame.bind_gen.get(name).copied().unwrap_or(0) != *generation {
@@ -2325,6 +2361,8 @@ impl<'a> EvalRun<'a> {
             }
         }
         let mut live_allocs = BTreeMap::new();
+        // Captured variables whose address inside the closure is not modeled.
+        let mut unplaced = BTreeSet::new();
         if live {
             for (name, slot) in &mut env {
                 match Self::lookup(frame, name) {
@@ -2335,7 +2373,9 @@ impl<'a> EvalRun<'a> {
                         ));
                     }
                 }
-                if let Some(alloc) = self.alloc_id_of(frame, name) {
+                if !eval_value_is_copy(slot) {
+                    unplaced.insert(name.clone());
+                } else if let Some(alloc) = self.alloc_id_of(frame, name) {
                     live_allocs.insert(name.clone(), alloc);
                 }
             }
@@ -2365,6 +2405,7 @@ impl<'a> EvalRun<'a> {
         {
             *allocs0 = live_allocs;
         }
+        closure_frame.unplaced = unplaced;
         closure_frame.push_scope(params);
         let value = match self.eval_expr(&mut closure_frame, &expr.body) {
             Ok(v) | Err(EvalCtrl::Return(v)) => v,
@@ -2617,12 +2658,16 @@ impl<'a> EvalRun<'a> {
     }
 
     /// Identity of the variable `name` of `frame` (for `EvalRef::addr`),
-    /// assigned on first use.
+    /// assigned on first use; `None` for a variable whose address is not
+    /// modeled (`EvalFrame::unplaced`).
     fn alloc_id_of(&mut self, frame: &mut EvalFrame<'a>, name: &str) -> Option<u64> {
         let depth = frame
             .scopes
             .iter()
             .rposition(|scope| scope.contains_key(name))?;
+        if depth == 0 && frame.unplaced.contains(name) {
+            return None;
+        }
         if let Some(&id) = frame.allocs[depth].get(name) {
             return Some(id);
         }
@@ -3023,6 +3068,25 @@ impl<'a> EvalRun<'a> {
             }
             let lhs = self.eval_expr(frame, &c.args[0])?;
             let rhs = self.eval_expr(frame, &c.args[1])?;
+            // A raw pointer may dangle, and a dead variable's address may be
+            // reused (two calls of one function place their locals at one
+            // address): compare a raw pointer into a variable only while that
+            // variable is in scope in this frame.
+            for operand in [&lhs, &rhs] {
+                if let EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::Local(alloc, _)),
+                    ..
+                } = operand
+                    && !frame
+                        .allocs
+                        .iter()
+                        .any(|scope| scope.values().any(|id| id == alloc))
+                {
+                    return eval_unsupported(
+                        "`addr_eq` on a raw pointer whose referent may be out of scope",
+                    );
+                }
+            }
             return eval_addr_eq(&lhs, &rhs);
         }
         let Some(id) = p.path.get_ident() else {
@@ -5026,6 +5090,98 @@ mod tests {
         );
     }
 
+    /// `IndirectDispatchOutliner` stacked with each base mutator, in both
+    /// orders, on every ITree seed: the stack stays free of `unsafe`, keeps
+    /// every top-level function distinct, stages, is supported by the concrete
+    /// evaluator (which sees the indirect-dispatch helper called), and runs
+    /// natively as the evaluator predicts.
+    #[test]
+    fn indirect_dispatch_outliner_stacks_with_every_base_mutator_and_matches_native_rustc() {
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let indirect: &dyn ItreeAstMutator = &IndirectDispatchOutliner;
+        let mut cands: Vec<GeneratedItreeCandidate> = Vec::new();
+        for (seed_index, seed) in seeds.iter().enumerate() {
+            for &other in ITREE_AST_MUTATORS.iter().take(ITREE_BASE_MUTATOR_COUNT) {
+                for indirect_first in [true, false] {
+                    let id = cands.len();
+                    let s = 0x57AC_0000u64 + id as u64;
+                    let order: [&dyn ItreeAstMutator; 2] = if indirect_first {
+                        [indirect, other]
+                    } else {
+                        [other, indirect]
+                    };
+                    let mut file = parse_safe_itree_seed(seed).expect("parse ITree seed");
+                    let mut rng = DetRng::new(s);
+                    for mutator in order {
+                        mutator.mutate(&mut file, &mut rng);
+                    }
+                    let source = prettyplease::unparse(&file);
+                    let label = format!(
+                        "`{}` then `{}` on seed {seed_index}",
+                        order[0].name(),
+                        order[1].name()
+                    );
+                    assert!(!contains_unsafe_token(&source), "{label}:\n{source}");
+                    let parsed = syn::parse_file(&source).unwrap();
+                    let mut fn_names = BTreeSet::new();
+                    for item in &parsed.items {
+                        if let Item::Fn(f) = item {
+                            assert!(
+                                fn_names.insert(f.sig.ident.to_string()),
+                                "{label}: `{}` is defined twice:\n{source}",
+                                f.sig.ident
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        fn_names
+                            .iter()
+                            .filter(|n| n.starts_with("__anneal_itree_indirect_"))
+                            .count(),
+                        1,
+                        "{label}:\n{source}"
+                    );
+                    let staged = stage_itree_candidate_items(&source, "b0_c0__", "kernel_step")
+                        .unwrap_or_else(|e| panic!("{label}: staging failed: {e}"));
+                    assert!(syn::parse_file(&staged.staged_source).is_ok());
+                    let ev = ItreeConcreteEvaluator::new(&source, "kernel_step")
+                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+                    let mut helper_called = false;
+                    for (m, p) in ITREE_CONCOLIC_BASE_INPUTS {
+                        let run = ev
+                            .run_kernel_step(m, p, &EnvSchedule::new(), "")
+                            .unwrap_or_else(|e| {
+                                panic!("{label} unsupported on ({m:#x}, {p:#x}): {e}")
+                            });
+                        helper_called |= run.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                ItreeConcreteEvent::ExtCall { callee, .. }
+                                    if callee.starts_with("__anneal_itree_indirect_")
+                            )
+                        });
+                    }
+                    assert!(
+                        helper_called,
+                        "{label}: no base input calls the indirect-dispatch helper:\n{source}"
+                    );
+                    cands.push(GeneratedItreeCandidate {
+                        id,
+                        seed_index,
+                        seed_u64: s,
+                        applied_mutators: vec![
+                            order[0].name().to_string(),
+                            order[1].name().to_string(),
+                        ],
+                        source,
+                    });
+                }
+            }
+        }
+        assert_eq!(cands.len(), seeds.len() * ITREE_BASE_MUTATOR_COUNT * 2);
+        assert_evaluator_matches_native_rustc(&cands);
+    }
+
     /// The two PRNG draws of the base schedule also decide the indirect-dispatch
     /// redirect, so a candidate without a redirected pass draws exactly what the
     /// base schedule draws.
@@ -5203,6 +5359,51 @@ mod tests {
                 let p1: fn(u32) -> u32 = f1;
                 let p2: fn(u32) -> u32 = f2;
                 if core::ptr::addr_eq(p1 as *const (), p2 as *const ()) { a } else { b }
+            }",
+            // Dangling raw pointers: both calls of `leak` place `y` at one
+            // address, so the two pointers are equal natively although they
+            // name two variables.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn leak(v: u32) -> *const u32 {
+                    let y: u32 = v;
+                    &y as *const u32
+                }
+                let p: *const u32 = leak(a);
+                let q: *const u32 = leak(b);
+                if core::ptr::addr_eq(p, q) { a } else { b }
+            }",
+            // A raw pointer that left its referent's scope: the address may be
+            // reused for `z`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let p: *const u32 = {
+                    let y: u32 = a;
+                    &y as *const u32
+                };
+                let z: u32 = b;
+                if core::ptr::addr_eq(p, &z as *const u32) { a } else { b }
+            }",
+            // A closure that borrows `cap`, called from another closure's
+            // frame, still sees `cap` at its own address, which only the
+            // frame that created the closure knows.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a & 0xFFu32;
+                let cap_ref: &u32 = &cap;
+                let inner = |x: u32| if core::ptr::addr_eq(&cap, cap_ref) { x } else { 0u32 };
+                let outer = |x: u32| inner(x ^ b);
+                outer(1u32)
+            }",
+            // A struct that the closure body moves is captured by value, so it
+            // has a new address inside the closure.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Boxed { v: u32 }
+                let s = Boxed { v: a };
+                let p: *const Boxed = &s as *const Boxed;
+                let check = |x: u32| {
+                    let same: bool = core::ptr::addr_eq(&s as *const Boxed, p);
+                    let moved = s;
+                    if same { moved.v ^ x } else { x }
+                };
+                check(b)
             }",
             // A struct field's offset depends on a layout that is not computed.
             "pub fn probe(a: u32, b: u32) -> u32 {

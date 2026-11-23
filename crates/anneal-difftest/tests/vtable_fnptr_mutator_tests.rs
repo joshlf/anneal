@@ -39,16 +39,18 @@ use anneal_difftest::miri_eval::{
     MiriEvalOptions, evaluate_miri_batches_with_options, resolve_rustc_bin,
 };
 use anneal_difftest::mutators_itree::{
-    GeneratedItreeCandidate, ITREE_CONCOLIC_BASE_INPUTS, IndirectDispatchOutliner, ItreeAstMutator,
-    ItreeConcreteEvaluator, ItreeConcreteEvent, annotate_itree_external_callees,
-    contains_unsafe_token, generate_itree_batch, itree_candidate_replay_is_faithful,
-    reconstruct_itree_mutation_steps, stage_itree_candidate_items,
+    CallBoundaryOutliner, GeneratedItreeCandidate, ITREE_CONCOLIC_BASE_INPUTS,
+    IndirectDispatchOutliner, ItreeAstMutator, ItreeConcreteEvaluator, ItreeConcreteEvent,
+    annotate_itree_external_callees, contains_unsafe_token, generate_itree_batch,
+    itree_candidate_replay_is_faithful, reconstruct_itree_mutation_steps,
+    stage_itree_candidate_items,
 };
 use anneal_difftest::mutators_miri::{
     ClosureAndAddrEqMutator, DetRng, GeneratedMiriCandidate, MIRI_CORPUS_CRATE_HEADER,
-    MiriAstMutator, MutationMode, VTableAndFnPtrMutator, build_standalone_candidate_source,
-    generate_miri_corpus_batch, load_miri_diff_corpus_seeds, miri_candidate_replay_is_faithful,
-    reconstruct_miri_mutation_steps,
+    MiriAstMutator, MutationMode, RecordedMutationStep, VTableAndFnPtrMutator,
+    build_standalone_candidate_source, generate_miri_corpus_batch, load_miri_diff_corpus_seeds,
+    miri_candidate_replay_is_faithful, reconstruct_miri_mutation_steps,
+    replay_miri_mutation_steps,
 };
 use cargo_anneal::{ComparisonVerdict, DivergenceKind, MiriOutcome};
 
@@ -561,6 +563,82 @@ fn all_miri_template_candidates() -> Vec<(&'static MiriTemplate, GeneratedMiriCa
     out
 }
 
+/// What every candidate of [`stacked_miri_candidates`] must do: both of its
+/// passes are templates that agree on their own.
+const STACKED_TEMPLATES: &[MiriTemplate] = &[MiriTemplate {
+    label: "stacked_indirect_passes",
+    classes: &[FN_PTR, ADDR_EQ, CLOSURE],
+    mode: MutationMode::Pass,
+    has: &[],
+    lacks: "",
+    expect: Expect::Agree,
+}];
+
+/// The `Pass` templates (by label) that [`stacked_miri_candidates`] applies
+/// one after the other to one seed: both mutators in either order, one
+/// template twice (the second pass draws the tag of the first and must pick
+/// fresh item names), and two templates of one mutator.
+const STACKED_PAIRS: [(&str, &str); 4] = [
+    ("fn_ptr_chain", "closure_by_unique_ref"),
+    ("closure_by_shared_ref", "fn_ptr_chain"),
+    ("fn_ptr_chain", "fn_ptr_chain"),
+    ("wide_slices", "closure_by_value"),
+];
+
+/// One candidate per [`STACKED_PAIRS`] entry, named `stack<k>_<first>__<second>`,
+/// with ids from `first_id`. Each pass runs from the PRNG seed that produces
+/// its template on its own, which also produces it on a seed an earlier pass
+/// mutated (a pass draws its template before it reads the file).
+fn stacked_miri_candidates(
+    first_id: usize,
+) -> Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> {
+    let singles = all_miri_template_candidates();
+    let pass_of = |label: &str| -> (&'static dyn MiriAstMutator, u64) {
+        let (_, cand) = singles
+            .iter()
+            .find(|(t, _)| t.label == label && t.mode == MutationMode::Pass)
+            .unwrap_or_else(|| panic!("no `Pass` template `{label}`"));
+        let mutator: &'static dyn MiriAstMutator =
+            if cand.applied_mutators[0] == "VTableAndFnPtrMutator" {
+                &VTableAndFnPtrMutator
+            } else {
+                &ClosureAndAddrEqMutator
+            };
+        (mutator, cand.seed_u64)
+    };
+    let mut out: Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> = Vec::new();
+    for (k, &(first, second)) in STACKED_PAIRS.iter().enumerate() {
+        let fn_name = format!("stack{k}_{first}__{second}");
+        let seed = format!("pub fn {fn_name}() -> u32 {{\n    let x: u32 = 10u32;\n    x ^ 1u32\n}}\n");
+        let mut file = syn::parse_file(&seed).expect("parse seed");
+        let mut locals = Vec::new();
+        let mut applied_mutators = Vec::new();
+        for label in [first, second] {
+            let (mutator, s) = pass_of(label);
+            let mut rng = DetRng::new(s);
+            mutator.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+            applied_mutators.push(mutator.name().to_string());
+        }
+        let fn_source = prettyplease::unparse(&file);
+        let source = build_standalone_candidate_source(&fn_source);
+        out.push((
+            &STACKED_TEMPLATES[0],
+            GeneratedMiriCandidate {
+                id: first_id + out.len(),
+                seed_index: 0,
+                seed_name: "indirect_call_seed".to_string(),
+                fn_name,
+                seed_u64: pass_of(first).1,
+                applied_mutators,
+                tracked_locals: vec![("x".to_string(), "u32".to_string())],
+                fn_source,
+                source,
+            },
+        ));
+    }
+    out
+}
+
 /// The four `IndirectDispatchOutliner` templates: label, construct classes,
 /// and the substrings that identify the template.
 const ITREE_TEMPLATES: [(&str, &[&str], &[&str]); 4] = [
@@ -658,6 +736,45 @@ fn itree_template_candidates() -> Vec<(&'static str, GeneratedItreeCandidate)> {
                     seed_u64: s,
                     applied_mutators: vec!["IndirectDispatchOutliner".to_string()],
                     source,
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// On every ITree seed, `IndirectDispatchOutliner` stacked with
+/// `CallBoundaryOutliner` in both orders, with ids from `first_id`.
+fn stacked_itree_candidates(first_id: usize) -> Vec<(&'static str, GeneratedItreeCandidate)> {
+    let mut out: Vec<(&'static str, GeneratedItreeCandidate)> = Vec::new();
+    for seed_index in 0..ITREE_SAFE_SEEDS.len() {
+        for indirect_first in [true, false] {
+            let s = 0x57AC_1000u64 + out.len() as u64;
+            let mut file = syn::parse_file(ITREE_SAFE_SEEDS[seed_index]).expect("parse ITree seed");
+            let mut rng = DetRng::new(s);
+            let (label, applied) = if indirect_first {
+                IndirectDispatchOutliner.mutate(&mut file, &mut rng);
+                CallBoundaryOutliner.mutate(&mut file, &mut rng);
+                (
+                    "indirect_then_call_boundary",
+                    ["IndirectDispatchOutliner", "CallBoundaryOutliner"],
+                )
+            } else {
+                CallBoundaryOutliner.mutate(&mut file, &mut rng);
+                IndirectDispatchOutliner.mutate(&mut file, &mut rng);
+                (
+                    "call_boundary_then_indirect",
+                    ["CallBoundaryOutliner", "IndirectDispatchOutliner"],
+                )
+            };
+            out.push((
+                label,
+                GeneratedItreeCandidate {
+                    id: first_id + out.len(),
+                    seed_index,
+                    seed_u64: s,
+                    applied_mutators: applied.iter().map(|m| m.to_string()).collect(),
+                    source: prettyplease::unparse(&file),
                 },
             ));
         }
@@ -951,6 +1068,215 @@ fn scheduled_itree_batches_carry_indirect_dispatch_and_replay_faithfully() {
     }
 }
 
+/// Two indirect-call passes stacked on one seed: generation is deterministic,
+/// each pass adds one driver function and one call of it to the entry
+/// function (a second pass of one template picks fresh item names), and the
+/// candidate compiles without warnings at both optimization levels.
+#[test]
+fn stacked_miri_indirect_passes_keep_distinct_items_and_compile() {
+    let stacked = stacked_miri_candidates(0);
+    let again = stacked_miri_candidates(0);
+    assert_eq!(stacked.len(), STACKED_PAIRS.len());
+    for ((_, cand), (_, replay)) in stacked.iter().zip(&again) {
+        assert_eq!(cand, replay, "`{}` is not deterministic", cand.fn_name);
+        assert_eq!(cand.applied_mutators.len(), 2);
+        let drivers = cand.fn_source.matches("fn __anneal_vt_driver_").count()
+            + cand.fn_source.matches("fn __anneal_clos_driver_").count();
+        assert_eq!(drivers, 2, "`{}`:\n{}", cand.fn_name, cand.fn_source);
+        let entry = cand
+            .fn_source
+            .split_once(&format!("pub fn {}", cand.fn_name))
+            .expect("entry function")
+            .1;
+        assert_eq!(
+            entry.matches("__anneal_").count(),
+            2,
+            "`{}` must call each driver once from the entry function:\n{}",
+            cand.fn_name,
+            cand.fn_source
+        );
+        for opt_level in ["0", "2"] {
+            if let Err(stderr) = compile_with_lints(&cand.fn_name, "-D", opt_level, &cand.source) {
+                panic!(
+                    "`{}` failed at -C opt-level={opt_level}:\n{stderr}\n{}",
+                    cand.fn_name, cand.source
+                );
+            }
+        }
+    }
+}
+
+/// Whether `mutator` is one of the two Miri indirect-call mutators.
+fn is_indirect_miri_mutator(mutator: &str) -> bool {
+    mutator == "VTableAndFnPtrMutator" || mutator == "ClosureAndAddrEqMutator"
+}
+
+/// Scheduled corpus candidates whose chain stacks both indirect-call mutators,
+/// one of them twice, or one of them with `TreeBorrowsRetagInterleaver`: the
+/// recorded passes replay the candidate exactly, the candidate compiles at
+/// both optimization levels, and every sub-chain (which is what the
+/// mutator-chain shrinker replays) is deterministic and parses; a sub-chain of
+/// indirect-call passes alone also compiles.
+#[test]
+fn scheduled_miri_stacks_of_indirect_passes_replay_shrink_and_compile() {
+    const SHAPES: [&str; 3] = [
+        "both_indirect_mutators",
+        "one_indirect_mutator_twice",
+        "indirect_mutator_and_tree_borrows",
+    ];
+    // Candidates of each shape that are checked.
+    const PER_SHAPE: usize = 2;
+    let seeds = load_miri_diff_corpus_seeds();
+    let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
+    let mut checked: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for batch_idx in 0..64u64 {
+        if SHAPES
+            .iter()
+            .all(|shape| checked.get(shape).copied().unwrap_or(0) >= PER_SHAPE)
+        {
+            break;
+        }
+        for cand in generate_miri_corpus_batch(128, 0x57AC_2000 + batch_idx, 0) {
+            let names: Vec<&str> = cand.applied_mutators.iter().map(String::as_str).collect();
+            let indirect_passes = names
+                .iter()
+                .filter(|m| is_indirect_miri_mutator(**m))
+                .count();
+            let shape: &'static str = if names.contains(&"VTableAndFnPtrMutator")
+                && names.contains(&"ClosureAndAddrEqMutator")
+            {
+                SHAPES[0]
+            } else if indirect_passes >= 2 {
+                SHAPES[1]
+            } else if indirect_passes == 1 && names.contains(&"TreeBorrowsRetagInterleaver") {
+                SHAPES[2]
+            } else {
+                continue;
+            };
+            let seen = checked.entry(shape).or_insert(0);
+            if *seen >= PER_SHAPE {
+                continue;
+            }
+            *seen += 1;
+
+            let label = format!("`{}` {:?}", cand.fn_name, cand.applied_mutators);
+            let (base, steps) = reconstruct_miri_mutation_steps(&cand, &seed_refs)
+                .unwrap_or_else(|| panic!("no recorded passes for {label}"));
+            assert_eq!(steps.len(), names.len(), "{label}");
+            assert!(
+                miri_candidate_replay_is_faithful(&cand, &base, &steps),
+                "replay mismatch on {label}"
+            );
+            for opt_level in ["0", "2"] {
+                if let Err(stderr) = compile_at_opt_level("stacked", opt_level, &cand.source) {
+                    panic!(
+                        "{label} failed at -C opt-level={opt_level}:\n{stderr}\n{}",
+                        cand.source
+                    );
+                }
+            }
+            // Every non-empty proper sub-chain.
+            for mask in 1u32..(1u32 << steps.len()) - 1 {
+                let sub: Vec<RecordedMutationStep> = steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| (mask >> i) & 1 == 1)
+                    .map(|(_, step)| step.clone())
+                    .collect();
+                let replayed = replay_miri_mutation_steps(&cand, &base, &sub);
+                assert_eq!(
+                    replayed,
+                    replay_miri_mutation_steps(&cand, &base, &sub),
+                    "sub-chain {mask:#b} of {label} is not deterministic"
+                );
+                assert_eq!(replayed.applied_mutators.len(), sub.len(), "{label}");
+                assert!(
+                    syn::parse_file(&replayed.source).is_ok(),
+                    "sub-chain {mask:#b} of {label} does not parse:\n{}",
+                    replayed.source
+                );
+                if sub
+                    .iter()
+                    .all(|step| is_indirect_miri_mutator(step.mutator_name.as_str()))
+                    && let Err(stderr) = compile_at_opt_level("sub_chain", "0", &replayed.source)
+                {
+                    panic!(
+                        "sub-chain {mask:#b} of {label} failed to compile:\n{stderr}\n{}",
+                        replayed.source
+                    );
+                }
+            }
+        }
+    }
+    for shape in SHAPES {
+        assert!(
+            checked.get(shape).copied().unwrap_or(0) >= 1,
+            "no scheduled candidate has shape `{shape}`: {checked:?}"
+        );
+    }
+}
+
+/// `IndirectDispatchOutliner` stacked with `CallBoundaryOutliner` in both
+/// orders on every ITree seed: generation is deterministic and free of
+/// `unsafe`, both helpers are boundary callees of the root, the concrete
+/// evaluator supports every base input and sees the indirect-dispatch helper
+/// called, and the candidates compile warning-free under
+/// `#![forbid(unsafe_code)]` at both optimization levels.
+#[test]
+fn stacked_itree_indirect_dispatch_candidates_are_safe_supported_and_compile() {
+    let cands = stacked_itree_candidates(0);
+    assert_eq!(cands, stacked_itree_candidates(0));
+    assert_eq!(cands.len(), 2 * ITREE_SAFE_SEEDS.len());
+    let mut combined = String::from("#![forbid(unsafe_code)]\n");
+    for (i, (label, cand)) in cands.iter().enumerate() {
+        assert!(
+            !contains_unsafe_token(&cand.source),
+            "`{label}` contains `unsafe`:\n{}",
+            cand.source
+        );
+        let (annotated, callees) = annotate_itree_external_callees(&cand.source, "kernel_step")
+            .unwrap_or_else(|e| panic!("`{label}`: annotation failed: {e}"));
+        assert!(!contains_unsafe_token(&annotated));
+        for prefix in ["__anneal_itree_indirect_", "__anneal_itree_outlined_"] {
+            assert!(
+                callees.iter().any(|callee| callee.starts_with(prefix)),
+                "`{label}`: no boundary callee `{prefix}*`:\n{}",
+                cand.source
+            );
+        }
+        let ev = ItreeConcreteEvaluator::new(&cand.source, "kernel_step")
+            .unwrap_or_else(|e| panic!("`{label}`: {e}"));
+        let mut helper_called = false;
+        for (magic, payload_len) in ITREE_CONCOLIC_BASE_INPUTS {
+            let run = ev
+                .run_kernel_step(magic, payload_len, &EnvSchedule::new(), "")
+                .unwrap_or_else(|e| {
+                    panic!("`{label}` unsupported on ({magic:#x}, {payload_len:#x}): {e}")
+                });
+            helper_called |= run.events.iter().any(|event| {
+                matches!(
+                    event,
+                    ItreeConcreteEvent::ExtCall { callee, .. }
+                        if callee.starts_with("__anneal_itree_indirect_")
+                )
+            });
+        }
+        assert!(
+            helper_called,
+            "`{label}`: no base input calls the indirect-dispatch helper:\n{}",
+            cand.source
+        );
+        combined.push_str(&format!("pub mod c{i} {{\n{}\n}}\n", cand.source));
+    }
+    for opt_level in ["0", "2"] {
+        assert!(
+            compile_rust_strict_opt("stacked_indirect_dispatch", opt_level, &combined),
+            "stacked ITree indirect-dispatch candidates must compile warning-free at \
+             -C opt-level={opt_level}:\n{combined}"
+        );
+    }
+}
+
 /// Live Miri (`-Zmiri-tree-borrows`) + Anneal evaluation of every template.
 ///
 /// No template may end in a harness or extraction error, an `unsupported`
@@ -963,7 +1289,11 @@ fn indirect_call_templates_run_through_live_miri_and_anneal_oracles() {
     let _guard = LIVE_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = unique_temp_dir("miri_live");
     let root = repo_root();
-    let templates = all_miri_template_candidates();
+    // Every template on its own, then pairs of agreeing templates stacked on
+    // one seed.
+    let mut templates = all_miri_template_candidates();
+    let first_stacked_id = templates.len();
+    templates.extend(stacked_miri_candidates(first_stacked_id));
     let batch: Vec<GeneratedMiriCandidate> = templates.iter().map(|(_, c)| c.clone()).collect();
     let total = batch.len();
 
@@ -1087,7 +1417,11 @@ fn indirect_dispatch_templates_run_through_live_itree_oracle() {
     let _guard = LIVE_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = unique_temp_dir("itree_live");
     let root = repo_root();
-    let templates = itree_template_candidates();
+    // Every template on its own, then `IndirectDispatchOutliner` stacked with
+    // `CallBoundaryOutliner` in both orders.
+    let mut templates = itree_template_candidates();
+    let first_stacked_id = templates.len();
+    templates.extend(stacked_itree_candidates(first_stacked_id));
     let batch: Vec<GeneratedItreeCandidate> = templates.iter().map(|(_, c)| c.clone()).collect();
     let total = batch.len();
 
