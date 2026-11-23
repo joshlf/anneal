@@ -275,6 +275,61 @@ theorem StepStageCut.to_wpOutcomeFuel {step : S → StepOutcome S Out Fault}
   rw [hEq]
   exact h
 
+/-- Lift a `StepStageCut` into any `MirWpOps` interface (for example a
+coalgebraic `ITree` step or a `valid`-quantified interface) that simulates
+every `.step` transition of `step`. -/
+theorem StepStageCut.to_wpReach_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {fuel : Nat} {s₀ s₁ : S} (hCut : StepStageCut step fuel s₀ s₁) :
+    wpReach (ops := ops) (fun s => s = s₁) s₀ := by
+  induction fuel generalizing s₀ with
+  | zero => exact .here (reachStepIn_zero_iff.mp hCut)
+  | succ fuel ih =>
+    cases reachStepIn_succ_iff.mp hCut with
+    | inl hEq => exact .here hEq
+    | inr hSt =>
+      cases hEv : step s₀ with
+      | step st' =>
+        rw [hEv] at hSt
+        exact wpUntil_step (ops := ops)
+          (hSim s₀ st' _ (fun _ => False) (fun _ => False) hEv (ih hSt))
+      | done _ =>
+        rw [hEv] at hSt
+        exact False.elim hSt
+      | fault _ =>
+        rw [hEv] at hSt
+        exact False.elim hSt
+
+/-- Prepend a `StepStageCut` onto a checkpoint proof of any simulating
+`MirWpOps` interface. -/
+theorem StepStageCut.to_wpUntil_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {fuel : Nat} {s₀ s₁ : S} {stop : S → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} (hCut : StepStageCut step fuel s₀ s₁)
+    (h : wpUntil (ops := ops) stop onDone onFault s₁) :
+    wpUntil (ops := ops) stop onDone onFault s₀ :=
+  wpReach_bind (ops := ops) (StepStageCut.to_wpReach_of_step hSim hCut)
+    (fun s' hs => by
+      have hEq : s' = s₁ := hs
+      rw [hEq]
+      exact h)
+
+/-- Prepend a `StepStageCut` onto a whole-execution proof of any simulating
+`MirWpOps` interface. -/
+theorem StepStageCut.to_wpOutcome_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {fuel : Nat} {s₀ s₁ : S} {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : StepStageCut step fuel s₀ s₁)
+    (h : wpOutcome (ops := ops) onDone onFault s₁) :
+    wpOutcome (ops := ops) onDone onFault s₀ :=
+  StepStageCut.to_wpUntil_of_step hSim hCut h
+
 /-- Kernel evaluation yields a `StepStageCut`: if `runToCut` over the
 successor function of `step` stops at the cutpoint state `s₁`, then `s₀`
 reaches `s₁` within the same budget. The hypothesis is closed by `rfl` on a
@@ -1003,6 +1058,114 @@ theorem wpReach_within_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
     exact h
   exact wpReach_within_of_runToCut hList
 
+/-- Kernel evaluation from a cutpoint yields a bounded stage within a region:
+if `runFromCut` over the region-guarded step stops at `s₁`, then `s₀` reaches
+`s₁` in `fuel + 1` steps and every stepped state lies in the region. -/
+theorem wpUntilFuel_within_of_runFromCut {region : S → Bool}
+    {step : S → StepOutcome S Out Fault} {tag : S → Option Nat}
+    {isCut : S → Bool} {fuel : Nat} {s₀ s₁ : S}
+    (h : runFromCut (guardStep region step) guardNext? isCut fuel s₀ =
+      .cut s₁) :
+    wpUntilFuel
+      (ops := (MirWpOps.ofDetStep step tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) (fun _ => False) (fun _ => False) (fuel + 1) s₀ := by
+  cases hNext : guardNext? (guardStep region step s₀) with
+  | none =>
+    rw [runFromCut_of_halt hNext fuel] at h
+    cases h
+  | some st' =>
+    rw [runFromCut_of_next hNext fuel] at h
+    have hInfo := guardNext?_guardStep_eq_some hNext
+    refine Or.inr ⟨hInfo.1, ?_⟩
+    change (step s₀).wp _ (fun _ => False) (fun _ => False)
+    rw [hInfo.2]
+    exact wpUntilFuel_within_of_runToCut h
+
+/-- Fuel-free form of `wpUntilFuel_within_of_runFromCut`. -/
+theorem wpReach_within_of_runFromCut {region : S → Bool}
+    {step : S → StepOutcome S Out Fault} {tag : S → Option Nat}
+    {isCut : S → Bool} {fuel : Nat} {s₀ s₁ : S}
+    (h : runFromCut (guardStep region step) guardNext? isCut fuel s₀ =
+      .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep step tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ :=
+  wpUntil_of_wpUntilFuel
+    (ops := (MirWpOps.ofDetStep step tag).within (fun s => region s = true))
+    (wpUntilFuel_within_of_runFromCut h)
+
+/-- `BlockTree`-accelerated region-guarded stage evaluation starting at a
+cutpoint (`evalBlockTreeFromCut`), lifted directly into `wpReach` over
+`ops.within`. -/
+theorem wpReach_within_of_evalBlockTreeFromCut {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut (BlockTree.ofList blocks)
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hList :
+      runFromCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalBlockTreeFromCut_ofList_eq blocks
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀]
+    exact h
+  exact wpReach_within_of_runFromCut hList
+
+/-- `Chunk8BlockTree`-accelerated region-guarded stage evaluation lifted
+directly into `wpReach` over `ops.within`. -/
+theorem wpReach_within_of_evalChunk8BlockTreeToCut {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList blocks)
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hList :
+      runToCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalChunk8BlockTreeToCut_ofList_eq blocks
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀]
+    exact h
+  exact wpReach_within_of_runToCut hList
+
+/-- `Chunk8BlockTree`-accelerated region-guarded stage evaluation starting at a
+cutpoint (`evalChunk8BlockTreeFromCut`), lifted directly into `wpReach` over
+`ops.within`. -/
+theorem wpReach_within_of_evalChunk8BlockTreeFromCut {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks)
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hList :
+      runFromCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalChunk8BlockTreeFromCut_ofList_eq blocks
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀]
+    exact h
+  exact wpReach_within_of_runFromCut hList
+
 end GuardedRun
 
 /-! ## Part IV: Fuel-Free Stage Cuts over `MirWpOps` (`StageCut`) -/
@@ -1220,6 +1383,30 @@ theorem StageCut.of_stepStageCut_family {ι : Sort x}
   rw [hEq]
   exact StepStageCut.to_wpUntil_here (hCut i hP) ⟨i, hP, rfl⟩
 
+/-- Lift a `StageCut` along a same-state step-interface refinement. -/
+theorem StageCut.of_refines {ops₁ ops₂ : MirWpOps S Out Fault}
+    (hRef : ops₁.Refines ops₂) {entry cut : S → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
+    (h : StageCut (ops := ops₁) entry cut onDone onFault) :
+    StageCut (ops := ops₂) entry cut onDone onFault :=
+  fun s hs => wpUntil_of_refines hRef (h s hs)
+
+/-- A `StepStageCut` is a `StageCut` of any `MirWpOps` interface that
+simulates every `.step` transition of `step`. -/
+theorem StageCut.of_stepStageCut_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {fuel : Nat} {s₀ s₁ : S} {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : StepStageCut step fuel s₀ s₁) :
+    StageCut (ops := ops) (fun s => s = s₀) (fun s => s = s₁) onDone
+      onFault := by
+  intro s hs
+  have hEq : s = s₀ := hs
+  rw [hEq]
+  exact StepStageCut.to_wpUntil_of_step hSim hCut
+    (wpUntil_here (ops := ops) rfl)
+
 end DetStage
 
 attribute [irreducible] StageCut
@@ -1367,6 +1554,54 @@ theorem DetStageCut.of_blockTree {BB : Type x} (blocks : List BB)
     DetStageCut (stepWith (listGet? blocks)) s₀ s₁ :=
   (DetStageCut.congr_step (stepWith_blockTree_eq stepWith blocks)).mp hCut
 
+/-- Lift a `DetStageCut` into any simulating `MirWpOps` interface. -/
+theorem DetStageCut.to_wpReach_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {s₀ s₁ : S} (hCut : DetStageCut step s₀ s₁) :
+    wpReach (ops := ops) (fun s => s = s₁) s₀ := by
+  let ⟨_, h'⟩ := hCut
+  exact StepStageCut.to_wpReach_of_step hSim h'
+
+/-- Prepend a `DetStageCut` onto a checkpoint proof of any simulating
+`MirWpOps` interface. -/
+theorem DetStageCut.to_wpUntil_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {s₀ s₁ : S} {stop : S → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} (hCut : DetStageCut step s₀ s₁)
+    (h : wpUntil (ops := ops) stop onDone onFault s₁) :
+    wpUntil (ops := ops) stop onDone onFault s₀ := by
+  let ⟨_, h'⟩ := hCut
+  exact StepStageCut.to_wpUntil_of_step hSim h' h
+
+/-- Prepend a `DetStageCut` onto a whole-execution proof of any simulating
+`MirWpOps` interface. -/
+theorem DetStageCut.to_wpOutcome_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {s₀ s₁ : S} {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : DetStageCut step s₀ s₁)
+    (h : wpOutcome (ops := ops) onDone onFault s₁) :
+    wpOutcome (ops := ops) onDone onFault s₀ :=
+  DetStageCut.to_wpUntil_of_step hSim hCut h
+
+/-- A `DetStageCut` is a `StageCut` of any simulating `MirWpOps`
+interface. -/
+theorem DetStageCut.to_stageCut_of_step {ops : MirWpOps S Out Fault}
+    {step : S → StepOutcome S Out Fault}
+    (hSim : ∀ s s' (P : S → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {s₀ s₁ : S} {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : DetStageCut step s₀ s₁) :
+    StageCut (ops := ops) (fun s => s = s₀) (fun s => s = s₁) onDone
+      onFault := by
+  let ⟨_, h'⟩ := hCut
+  exact StageCut.of_stepStageCut_of_step hSim h'
+
 end DetStageCutLaws
 
 attribute [irreducible] DetStageCut
@@ -1430,6 +1665,39 @@ theorem wlpOutcome_of_wpOutcome {onDone : Out → Prop}
     {onFault : Fault → Prop} {s : State}
     (h : wpOutcome onDone onFault s) : wlpOutcome onDone onFault s :=
   ⟨wpOutcome onDone onFault, h, fun _ hs' => wpOutcome_unfold_iff.mp hs'⟩
+
+/-- Prepend a checkpoint derivation onto a partial-correctness proof: if every
+execution reaches `stop` (or terminates/faults as accepted) and every `stop`
+state satisfies `wlpOutcome`, then the start state satisfies `wlpOutcome`. -/
+theorem wlpOutcome_of_wpUntil {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
+    (h : wpUntil stop onDone onFault s)
+    (hK : ∀ s', stop s' → wlpOutcome onDone onFault s') :
+    wlpOutcome onDone onFault s :=
+  wpUntil_induction hK (fun _ hStep => wlpOutcome_unfold_iff.mpr hStep) h
+
+/-- Prepend a `StageCut` onto a `wlpOutcome` continuation. -/
+theorem StageCut.to_wlpOutcome {entry cut : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : StageCut entry cut onDone onFault)
+    (hK : ∀ s, cut s → wlpOutcome onDone onFault s)
+    {s : State} (hs : entry s) : wlpOutcome onDone onFault s :=
+  wlpOutcome_of_wpUntil (StageCut.elim hCut hs) hK
+
+omit ops in
+/-- Prepend a `StepStageCut` onto a `wlpOutcome` continuation. -/
+theorem StepStageCut.to_wlpOutcome {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} {fuel : Nat} {s₀ s₁ : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : StepStageCut step fuel s₀ s₁)
+    (h : wlpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s₁) :
+    wlpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s₀ :=
+  wlpOutcome_of_wpUntil (ops := MirWpOps.ofDetStep step tag)
+    (StepStageCut.to_wpUntil_here (stop := fun s => s = s₁) hCut rfl)
+    (fun s' hs => by
+      have hEq : s' = s₁ := hs
+      rw [hEq]
+      exact h)
 
 /-- Conjunctive split: total termination and safety (`wpOutcome`) combined
 with partial functional correctness (`wlpOutcome`) give conjunctive total
@@ -1803,5 +2071,111 @@ theorem diamond_spec_zero_exact (y z : Nat) :
   have hEq : z + 10 = z + 1 := hOut.1.symm.trans hOut.2
   have hNum : (10 : Nat) = 1 := Nat.add_left_cancel hEq
   cases hNum
+
+/-- Two-pass canary exercising `wlpOutcome_of_invariant` and
+`wpStateOk_of_wlp_and_safety`: pass 1 proves safety/termination once with a
+trivial postcondition (`fun _ => True`), pass 2 proves the functional
+postcondition via a coinductive invariant, and `wpStateOk_of_wlp_and_safety`
+combines them into exact total correctness. -/
+theorem diamond_spec_two_pass_canary (x y z : Nat) :
+    wpStateOk (ops := diamondOps) (fun out => out = z + diamondDelta x)
+      { block := 0, x := x, y := y, z := z } := by
+  have hSafe :
+      wpStateOk (ops := diamondOps) (fun _ => True)
+        { block := 0, x := x, y := y, z := z } :=
+    wpOutcome_mono (ops := diamondOps) (fun _ _ => True.intro)
+      (fun _ hf => hf) (diamond_spec x y z)
+  let I : DiamondState → Prop := fun s =>
+    s.x = x ∧
+    ((s.block = 0 ∧ s.z = z) ∨
+     (s.block = 1 ∧ s.x = 0 ∧ s.z = z) ∨
+     (s.block = 2 ∧ 0 < s.x ∧ s.z = z) ∨
+     (s.block = 3 ∧ s.y = diamondJoinY x ∧ s.z = z) ∨
+     (s.block = 4 ∧ s.y = diamondDelta x ∧ s.z = z) ∨
+     (s.block = 5 ∧ 0 < s.x ∧ s.z = z) ∨
+     (s.block = 6 ∧ s.z = z + diamondDelta x))
+  have hWlp :
+      wlpOutcome (ops := diamondOps) (fun out => out = z + diamondDelta x)
+        (fun _ => True) { block := 0, x := x, y := y, z := z } := by
+    refine wlpOutcome_of_invariant (ops := diamondOps) I ?_
+      ⟨rfl, Or.inl ⟨rfl, rfl⟩⟩
+    intro s hI
+    cases s with
+    | mk blk sx sy sz =>
+      have hX : sx = x := hI.1
+      subst hX
+      cases hI.2 with
+      | inl h0 =>
+        have hB : blk = 0 := h0.1
+        have hZ : sz = z := h0.2
+        subst hB; subst hZ
+        cases sx with
+        | zero => exact ⟨rfl, Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)⟩
+        | succ n =>
+          exact ⟨rfl, Or.inr (Or.inr (Or.inl ⟨rfl, Nat.succ_pos n, rfl⟩))⟩
+      | inr h1 =>
+        cases h1 with
+        | inl hB1 =>
+          have hB : blk = 1 := hB1.1
+          have hX0 : sx = 0 := hB1.2.1
+          have hZ : sz = z := hB1.2.2
+          subst hB; subst hX0; subst hZ
+          exact ⟨rfl, Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)))⟩
+        | inr h2 =>
+          cases h2 with
+          | inl hB2 =>
+            have hB : blk = 2 := hB2.1
+            have hZ : sz = z := hB2.2.2
+            subst hB; subst hZ
+            cases sx with
+            | zero => exact False.elim (Nat.lt_irrefl 0 hB2.2.1)
+            | succ _ =>
+              exact ⟨rfl, Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)))⟩
+          | inr h3 =>
+            cases h3 with
+            | inl hB3 =>
+              have hB : blk = 3 := hB3.1
+              have hY : sy = diamondJoinY sx := hB3.2.1
+              have hZ : sz = z := hB3.2.2
+              subst hB; subst hZ
+              cases sx with
+              | zero =>
+                exact ⟨rfl,
+                  Or.inr (Or.inr (Or.inr (Or.inr (Or.inl ⟨rfl, hY, rfl⟩))))⟩
+              | succ n =>
+                exact ⟨rfl,
+                  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+                    ⟨rfl, Nat.succ_pos n, rfl⟩)))))⟩
+            | inr h4 =>
+              cases h4 with
+              | inl hB4 =>
+                have hB : blk = 4 := hB4.1
+                have hY : sy = diamondDelta sx := hB4.2.1
+                have hZ : sz = z := hB4.2.2
+                subst hB; subst hZ
+                refine ⟨rfl,
+                  Or.inr (Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+                    ⟨rfl, ?_⟩)))))⟩
+                change sz + sy = sz + diamondDelta sx
+                rw [hY]
+              | inr h5 =>
+                cases h5 with
+                | inl hB5 =>
+                  have hB : blk = 5 := hB5.1
+                  have hZ : sz = z := hB5.2.2
+                  subst hB; subst hZ
+                  cases sx with
+                  | zero => exact False.elim (Nat.lt_irrefl 0 hB5.2.1)
+                  | succ _ =>
+                    exact ⟨rfl,
+                      Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+                        ⟨rfl, rfl, rfl⟩))))⟩
+                | inr hB6 =>
+                  have hB : blk = 6 := hB6.1
+                  subst hB
+                  exact hB6.2
+  exact wpStateOk_of_wlp_and_safety (ops := diamondOps)
+    (MirWpOps.ofDetStep_conjunctive diamondStep (fun s => some s.block))
+    hSafe hWlp
 
 end Anneal.ParametricCore

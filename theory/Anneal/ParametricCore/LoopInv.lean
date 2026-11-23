@@ -413,6 +413,49 @@ theorem ofChoiceStep_fuelContinuous_of_unique (Choice : Type x)
   let ⟨n, hn⟩ := StepOutcome.wp_exists_nat (h.2 c₀ hc₀)
   exact ⟨n, stepWp_of_detChoice hc₀ (fun c hc => hUniq s c c₀ hc hc₀) hn⟩
 
+/-- Same-state refinement between two step interfaces: every single-step
+obligation satisfied by `ops₁` is satisfied by `ops₂`. This lifts proofs
+established over a deterministic or pure fragment (such as
+`ofDetStep mirStep`) directly into a richer coalgebraic or choice-quantified
+interface over the same machine states. -/
+def Refines (ops₁ ops₂ : MirWpOps State Out Fault) : Prop :=
+  ∀ (s : State) (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+    ops₁.stepWp s P Q R → ops₂.stepWp s P Q R
+
+/-- Refinement is reflexive. -/
+theorem Refines.refl (ops : MirWpOps State Out Fault) : ops.Refines ops :=
+  fun _ _ _ _ h => h
+
+/-- Refinement is transitive. -/
+theorem Refines.trans {ops₁ ops₂ ops₃ : MirWpOps State Out Fault}
+    (h₁₂ : ops₁.Refines ops₂) (h₂₃ : ops₂.Refines ops₃) :
+    ops₁.Refines ops₃ :=
+  fun s P Q R h => h₂₃ s P Q R (h₁₂ s P Q R h)
+
+/-- A deterministic step interface refines any interface `ops` that simulates
+its `.step`, `.done` and `.fault` transitions. -/
+theorem ofDetStep_refines {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} {ops : MirWpOps State Out Fault}
+    (hStep : ∀ s s' (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    (hDone : ∀ s o (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .done o → Q o → ops.stepWp s P Q R)
+    (hFault : ∀ s f (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .fault f → R f → ops.stepWp s P Q R) :
+    (ofDetStep step tag).Refines ops := by
+  intro s P Q R hWp
+  have hW : (step s).wp P Q R := hWp
+  cases hEv : step s with
+  | step s' =>
+    rw [hEv] at hW
+    exact hStep s s' P Q R hEv hW
+  | done o =>
+    rw [hEv] at hW
+    exact hDone s o P Q R hEv hW
+  | fault f =>
+    rw [hEv] at hW
+    exact hFault s f P Q R hEv hW
+
 end ConstructorLaws
 
 end MirWpOps
@@ -785,6 +828,24 @@ theorem wpOutcome_map {S₁ : Type u} {Out₁ : Type v} {Fault₁ : Type w}
     wpOutcome onDone onFault (f s) :=
   wpUntil_map f g e hStep h
 
+/-- Lift a checkpoint proof along a same-state step-interface refinement. -/
+theorem wpUntil_of_refines {State : Type u} {Out : Type v} {Fault : Type w}
+    {ops₁ ops₂ : MirWpOps State Out Fault} (hRef : ops₁.Refines ops₂)
+    {stop : State → Prop} {onDone : Out → Prop} {onFault : Fault → Prop}
+    {s : State} (h : wpUntil (ops := ops₁) stop onDone onFault s) :
+    wpUntil (ops := ops₂) stop onDone onFault s :=
+  wpUntil_map (ops₁ := ops₁) (ops₂ := ops₂) (fun x => x) (fun x => x)
+    (fun x => x) hRef h
+
+/-- Lift a whole-execution proof along a same-state step-interface
+refinement. -/
+theorem wpOutcome_of_refines {State : Type u} {Out : Type v} {Fault : Type w}
+    {ops₁ ops₂ : MirWpOps State Out Fault} (hRef : ops₁.Refines ops₂)
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
+    (h : wpOutcome (ops := ops₁) onDone onFault s) :
+    wpOutcome (ops := ops₂) onDone onFault s :=
+  wpUntil_of_refines hRef h
+
 /-! ### Strict Checkpoints (`wpStepUntil`) -/
 
 /-- Strict checkpoint weakest precondition: take one step, then reach `stop`.
@@ -1135,7 +1196,96 @@ theorem wpLoop_countdown_fuel {Inv : Nat → State → Prop}
     | inl hCont => exact ih s' hCont
     | inr hExit => exact wpUntilFuel_here hExit
 
+/-- Exact fixed-budget upward counting loop rule (`(hi - i) * stepFuel`),
+giving a uniform fuel bound even over infinitely branching step interfaces
+that are not `FuelContinuous`. -/
+theorem wpLoop_nat_fuel {Inv : Nat → State → Prop} {exit : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {hi stepFuel : Nat}
+    (hDone : ∀ s, Inv hi s → exit s)
+    (hStep : ∀ i s, i < hi → Inv i s →
+      wpUntilFuel (fun s' => Inv (i + 1) s' ∨ exit s') onDone onFault
+        stepFuel s)
+    (i : Nat) (hLe : i ≤ hi) (s : State) (hInv : Inv i s) :
+    wpUntilFuel exit onDone onFault ((hi - i) * stepFuel) s := by
+  have hAux : ∀ (d i : Nat) (s : State), i + d = hi → Inv i s →
+      wpUntilFuel exit onDone onFault (d * stepFuel) s := by
+    intro d
+    induction d with
+    | zero =>
+      intro j t hEq hInvJ
+      rw [Nat.zero_mul]
+      have hJ : j = hi := by
+        rw [← hEq, Nat.add_zero]
+      rw [hJ] at hInvJ
+      exact wpUntilFuel_here (hDone t hInvJ)
+    | succ d ih =>
+      intro j t hEq hInvJ
+      have hLt : j < hi := by
+        rw [← hEq]
+        exact Nat.lt_add_of_pos_right (Nat.succ_pos d)
+      have hEq' : (j + 1) + d = hi := by
+        rw [Nat.add_assoc, Nat.add_comm 1 d]
+        exact hEq
+      rw [Nat.succ_mul, Nat.add_comm]
+      refine wpUntilFuel_bind (hStep j t hLt hInvJ) ?_
+      intro t' hMid
+      cases hMid with
+      | inl hCont => exact ih (j + 1) t' hEq' hCont
+      | inr hExit => exact wpUntilFuel_here hExit
+  exact hAux (hi - i) i s (Nat.add_sub_of_le hLe) hInv
+
+/-- Exact fixed-budget list-traversal loop rule (`xs.length * stepFuel`). -/
+theorem wpLoop_list_fuel {β : Type x} {Inv : List β → State → Prop}
+    {exit : State → Prop} {onDone : Out → Prop} {onFault : Fault → Prop}
+    {stepFuel : Nat}
+    (hBase : ∀ s, Inv [] s → exit s)
+    (hStep : ∀ y ys s, Inv (y :: ys) s →
+      wpUntilFuel (fun s' => Inv ys s' ∨ exit s') onDone onFault stepFuel s)
+    (xs : List β) (s : State) (hInv : Inv xs s) :
+    wpUntilFuel exit onDone onFault (xs.length * stepFuel) s := by
+  induction xs generalizing s with
+  | nil =>
+    rw [List.length_nil, Nat.zero_mul]
+    exact wpUntilFuel_here (hBase s hInv)
+  | cons y ys ih =>
+    rw [List.length_cons, Nat.succ_mul, Nat.add_comm]
+    refine wpUntilFuel_bind (hStep y ys s hInv) ?_
+    intro s' hMid
+    cases hMid with
+    | inl hCont => exact ih s' hCont
+    | inr hExit => exact wpUntilFuel_here hExit
+
 end Fuel
+
+/-- Lift a bounded checkpoint proof along a same-state refinement. -/
+theorem wpUntilFuel_of_refines {State : Type u} {Out : Type v}
+    {Fault : Type w} {ops₁ ops₂ : MirWpOps State Out Fault}
+    (hRef : ops₁.Refines ops₂) {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} :
+    ∀ {fuel : Nat} {s : State},
+      wpUntilFuel (ops := ops₁) stop onDone onFault fuel s →
+      wpUntilFuel (ops := ops₂) stop onDone onFault fuel s
+  | 0, _, h => h
+  | fuel + 1, s, h => by
+    cases (wpUntilFuel_succ_iff (ops := ops₁)).mp h with
+    | inl hStop => exact wpUntilFuel_here (ops := ops₂) hStop
+    | inr hStep =>
+      exact wpUntilFuel_step (ops := ops₂)
+        (hRef s _ onDone onFault
+          (ops₁.stepWp_mono
+            (fun _ h' => wpUntilFuel_of_refines hRef h')
+            (fun _ hq => hq) (fun _ hr => hr) hStep))
+
+/-- Lift a bounded whole-execution proof along a same-state refinement. -/
+theorem wpOutcomeFuel_of_refines {State : Type u} {Out : Type v}
+    {Fault : Type w} {ops₁ ops₂ : MirWpOps State Out Fault}
+    (hRef : ops₁.Refines ops₂) {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State}
+    (h : wpOutcomeFuel (ops := ops₁) onDone onFault fuel s) :
+    wpOutcomeFuel (ops := ops₂) onDone onFault fuel s :=
+  (wpOutcomeFuel_iff_wpUntilFuel_false (ops := ops₂)).mpr
+    (wpUntilFuel_of_refines hRef
+      ((wpOutcomeFuel_iff_wpUntilFuel_false (ops := ops₁)).mp h))
 
 /-! ### Deterministic Interfaces (`ofDetStep`) -/
 
@@ -2168,9 +2318,9 @@ inductive ToyOutcome where
   /-- Early return from inside the loop returning `v`. -/
   | early (v : Nat) : ToyOutcome
 
-/-- One step of a two-exit countdown machine: if `i = 0` it returns `.normal acc`,
-if `acc = 5` it takes an early return `.early acc`, otherwise it decrements `i`
-and increments `acc`. -/
+/-- One step of a two-exit countdown machine: if `i = 0` it returns
+`.normal acc`, if `acc = 5` it takes an early return `.early acc`, otherwise
+it decrements `i` and increments `acc`. -/
 def earlyToyStep (s : ToyState) : StepOutcome ToyState ToyOutcome Unit :=
   match s.block with
   | 0 =>

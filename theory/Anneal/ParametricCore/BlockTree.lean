@@ -51,7 +51,8 @@ total and LCNF-computable (`0` `noncomputable`, `0` `._unsafe_rec`).
 private theorem boolFalseNeTrue : ¬ (false = true) :=
   fun h => Bool.noConfusion h
 
-private theorem ite_bool_true {α : Type u} {b : Bool} {t e : α} (hb : b = true) :
+private theorem ite_bool_true {α : Type u} {b : Bool} {t e : α}
+    (hb : b = true) :
     (if b then t else e) = t := by
   subst hb
   rfl
@@ -177,6 +178,20 @@ theorem listGet?_eq_getElem? {α : Type u} :
   | _ :: _, 0 => rfl
   | _ :: tl, k + 1 => listGet?_eq_getElem? tl k
 
+/-- `listGet?` is the unique function satisfying its three structural
+equations (`[]`, `(x :: xs)` at `0`, and `(x :: xs)` at `idx + 1`), so any
+custom list lookup (such as a MIR dialect's `Sequence.get?`) matches `listGet?`
+with three `rfl` obligations. -/
+theorem listGet?_eq_of_rec {α : Type u} (get : List α → Nat → Option α)
+    (hNil : ∀ idx, get [] idx = none)
+    (hZero : ∀ x xs, get (x :: xs) 0 = some x)
+    (hSucc : ∀ x xs idx, get (x :: xs) (idx + 1) = get xs idx) :
+    ∀ (xs : List α) (idx : Nat), get xs idx = listGet? xs idx
+  | [], idx => hNil idx
+  | x :: xs, 0 => hZero x xs
+  | x :: xs, idx + 1 =>
+    (hSucc x xs idx).trans (listGet?_eq_of_rec get hNil hZero hSucc xs idx)
+
 /-- Out-of-bounds lookup fails. -/
 theorem listGet?_eq_none_of_le {α : Type u} :
     ∀ (xs : List α) (idx : Nat), xs.length ≤ idx → listGet? xs idx = none
@@ -277,6 +292,33 @@ theorem listGet?_listSet?_ne {α : Type u} {xs xs' : List α} {idx j : Nat}
     listGet? xs' j = listGet? xs j := by
   rw [(listSet?_lt_and_eq hSet).2]
   exact listGet?_set_ne xs idx j val hNe
+
+/-- Any custom functional list update matching `listSet?` on in-bounds and
+out-of-bounds indices equals `listSet?`. -/
+theorem listSet?_eq_of_rec {α : Type u}
+    (set : List α → Nat → α → Option (List α))
+    (hNil : ∀ idx v, set [] idx v = none)
+    (hZero : ∀ x xs v, set (x :: xs) 0 v = some (v :: xs))
+    (hSucc : ∀ x xs idx v, set (x :: xs) (idx + 1) v =
+      match set xs idx v with
+      | none => none
+      | some tl => some (x :: tl)) :
+    ∀ (xs : List α) (idx : Nat) (v : α), set xs idx v = listSet? xs idx v
+  | [], idx, v => by
+    rw [hNil idx v, listSet?_of_not_lt v (Nat.not_lt_zero idx)]
+  | x :: xs, 0, v => by
+    rw [hZero x xs v, listSet?_of_lt v (Nat.zero_lt_succ xs.length)]
+    rfl
+  | x :: xs, idx + 1, v => by
+    rw [hSucc x xs idx v, listSet?_eq_of_rec set hNil hZero hSucc xs idx v]
+    cases Nat.decLt idx xs.length with
+    | isTrue hLt =>
+      rw [listSet?_of_lt v hLt, listSet?_of_lt v (Nat.succ_lt_succ hLt)]
+      rfl
+    | isFalse hNot =>
+      have hNot' : ¬ idx + 1 < (x :: xs).length :=
+        fun h => hNot (Nat.lt_of_succ_lt_succ h)
+      rw [listSet?_of_not_lt v hNot, listSet?_of_not_lt v hNot']
 
 private theorem natEq_of_beq (a b : Nat) (h : Nat.beq a b = true) : a = b := by
   revert b
@@ -478,7 +520,8 @@ theorem ptreeGetAt_ptreeModifyAt_same {α : Type u}
       | true =>
         rw [ite_bool_true rfl]
         change (if Nat.beq (Nat.mod idx 2) 0 then
-            ptreeGetAt d (ptreeModifyAt d .empty (Nat.div idx 2) v) (Nat.div idx 2)
+            ptreeGetAt d (ptreeModifyAt d .empty (Nat.div idx 2) v)
+              (Nat.div idx 2)
           else ptreeGetAt d .empty (Nat.div idx 2)) = v
         rw [hpar, ite_bool_true rfl]
         exact ih .empty (Nat.div idx 2) hhalf
@@ -581,7 +624,8 @@ theorem ptreeGetAt_ptreeModifyAt_ne {α : Type u}
       | true =>
         rw [ite_bool_true rfl]
         change (if Nat.beq (Nat.mod j 2) 0 then
-            ptreeGetAt d (ptreeModifyAt d .empty (Nat.div idx 2) v) (Nat.div j 2)
+            ptreeGetAt d (ptreeModifyAt d .empty (Nat.div idx 2) v)
+              (Nat.div j 2)
           else ptreeGetAt d .empty (Nat.div j 2)) = none
         cases hpj : Nat.beq (Nat.mod j 2) 0 with
         | true =>
@@ -846,7 +890,8 @@ def BlockTree.lookup? {α : Type u} (bt : BlockTree α) (idx : Nat) : Option α 
   ptreeGetAt bt.depth bt.tree idx
 
 /-- Functionally updates index `idx` in `bt` in `O(bt.depth)` trie steps. -/
-def BlockTree.modify {α : Type u} (bt : BlockTree α) (idx : Nat) (v : Option α) :
+def BlockTree.modify {α : Type u} (bt : BlockTree α) (idx : Nat)
+    (v : Option α) :
     BlockTree α :=
   { depth := bt.depth, tree := ptreeModifyAt bt.depth bt.tree idx v }
 
@@ -963,7 +1008,8 @@ def Chunk8.get {α : Type u} (c : Chunk8 α) (r : Nat) : Option α :=
 Destructures `c` once into flat constructor fields instead of using record
 update projections so repeated updates do not build nested projection chains in
 kernel WHNF. -/
-def Chunk8.set {α : Type u} (c : Chunk8 α) (r : Nat) (v : Option α) : Chunk8 α :=
+def Chunk8.set {α : Type u} (c : Chunk8 α) (r : Nat) (v : Option α) :
+    Chunk8 α :=
   match c with
   | ⟨e0, e1, e2, e3, e4, e5, e6, e7⟩ =>
     match r with
@@ -1003,7 +1049,8 @@ theorem Chunk8.get_empty {α : Type u} (r : Nat) :
               | succ r7 =>
                 cases r7 <;> rfl
 
-private theorem nat_ge8_contra {r : Nat} (h : r + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 < 8) :
+private theorem nat_ge8_contra {r : Nat}
+    (h : r + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 < 8) :
     False :=
   Nat.not_lt_of_ge (Nat.le_add_left 8 r) h
 
@@ -1650,7 +1697,8 @@ private theorem getElem?_packChunk8Fuel {α : Type u} :
                   | cons x7 rest =>
                     have hRestBound : rest.length ≤ 8 * k := by
                       have hLen :
-                          (x :: x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: rest).length =
+                          (x :: x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 ::
+                              rest).length =
                             rest.length + 8 := rfl
                       rw [hLen, Nat.mul_succ] at hBound
                       exact Nat.le_of_add_le_add_right hBound
@@ -1662,7 +1710,8 @@ private theorem getElem?_packChunk8Fuel {α : Type u} :
                         | some c => c.get (Nat.mod idx 8)
                         | none => none) =
                       listGet?
-                        (x :: x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: rest) idx
+                        (x :: x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: rest)
+                        idx
                     have hStep8 :
                         listGet?
                           (x :: x1 :: x2 :: x3 :: x4 :: x5 :: x6 :: x7 :: rest)
@@ -1768,7 +1817,8 @@ def chunk8TreeLookupChunkAt {α : Type u} (depth : Nat) :
           (ih r (Nat.div chunkIdx 2)))
     depth
 
-private theorem chunk8TreeLookupChunkAt_empty {α : Type u} (depth chunkIdx : Nat) :
+private theorem chunk8TreeLookupChunkAt_empty {α : Type u}
+    (depth chunkIdx : Nat) :
     chunk8TreeLookupChunkAt depth (.empty : Chunk8Tree α) chunkIdx = none := by
   cases depth <;> rfl
 
@@ -1847,7 +1897,8 @@ def chunk8TreeModifyAt {α : Type u} (depth : Nat) :
   @Nat.rec (fun _ => Chunk8Tree α → Nat → Nat → Option α → Chunk8Tree α)
     (fun t chunkIdx rem v =>
       cond (Nat.beq chunkIdx 0)
-        (let c := match t with | .leaf c0 => c0 | .empty | .node _ _ => Chunk8.empty
+        (let c := match t with
+          | .leaf c0 => c0 | .empty | .node _ _ => Chunk8.empty
          .leaf (c.set rem v))
         t)
     (fun _ ih t chunkIdx rem v =>
@@ -1968,7 +2019,9 @@ private theorem chunk8TreeLookupChunkAt_modify_ne {α : Type u}
     intro t chunkIdx q hNe
     change chunk8TreeLookupChunkAt 0
         (cond (Nat.beq chunkIdx 0)
-          (.leaf ((match t with | .leaf c0 => c0 | .empty | .node _ _ => Chunk8.empty).set rem v))
+          (.leaf ((match t with
+            | .leaf c0 => c0
+            | .empty | .node _ _ => Chunk8.empty).set rem v))
           t) q =
       chunk8TreeLookupChunkAt 0 t q
     cases hIdx : Nat.beq chunkIdx 0 with
@@ -2184,14 +2237,16 @@ theorem valid_chunk8BlockTree_ofListAt {α : Type u} (xs : List α) (depth : Nat
 theorem valid_chunk8BlockTree_ofList {α : Type u} (xs : List α) :
     ValidChunk8BlockTree xs (Chunk8BlockTree.ofList xs) := by
   have hChunks :
-      (packChunk8 xs).length ≤ pow2 (compLog2Depth (compListLength (packChunk8 xs))) := by
+      (packChunk8 xs).length ≤
+        pow2 (compLog2Depth (compListLength (packChunk8 xs))) := by
     rw [compListLength_eq (packChunk8 xs)]
     exact le_pow2_compLog2Depth (packChunk8 xs).length
   exact valid_chunk8BlockTree_ofListAt xs
     (compLog2Depth (compListLength (packChunk8 xs))) hChunks
 
 /-- Premise-free lookup equivalence for `Chunk8BlockTree.ofList xs`. -/
-theorem Chunk8BlockTree.ofList_lookup_eq {α : Type u} (xs : List α) (idx : Nat) :
+theorem Chunk8BlockTree.ofList_lookup_eq {α : Type u} (xs : List α)
+    (idx : Nat) :
     (Chunk8BlockTree.ofList xs).lookup? idx =
       listGet? xs idx :=
   (valid_chunk8BlockTree_ofList xs).2 idx
@@ -2199,7 +2254,8 @@ theorem Chunk8BlockTree.ofList_lookup_eq {α : Type u} (xs : List α) (idx : Nat
 /-- Spine height bound for `Chunk8BlockTree.ofList xs`:
 `(Chunk8BlockTree.ofList xs).tree.heightAt fuel ≤ depth + 1` for every `fuel`.
 -/
-theorem Chunk8BlockTree.ofList_height_le {α : Type u} (xs : List α) (fuel : Nat) :
+theorem Chunk8BlockTree.ofList_height_le {α : Type u} (xs : List α)
+    (fuel : Nat) :
     (Chunk8BlockTree.ofList xs).tree.heightAt fuel ≤
       (Chunk8BlockTree.ofList xs).depth + 1 :=
   chunk8TreeFromChunksAt_height_le fuel _ (packChunk8 xs)
@@ -2324,7 +2380,8 @@ theorem Chunk8BlockTree.lookup_modify_ne {α : Type u}
               change cond (Nat.beq (Nat.mod ci 2) 0)
                   (chunk8TreeLookupChunkAt d' l (Nat.div ci 2))
                   (chunk8TreeLookupChunkAt d'
-                    (chunk8TreeModifyAt d' r0 (Nat.div ci 2) r v) (Nat.div ci 2)) = _
+                    (chunk8TreeModifyAt d' r0 (Nat.div ci 2) r v)
+                    (Nat.div ci 2)) = _
               rw [hpar]
               dsimp only [cond]
               exact ih r0 (Nat.div ci 2) r hhalf
@@ -2406,7 +2463,8 @@ private theorem compLog2DepthGo_le_of_le (n : Nat) :
         rw [pow2_succ] at hCap
         rw [Nat.mul_comm 2 cap, Nat.mul_assoc cap 2 (pow2 bound)]
         exact hCap
-      have hRec := compLog2DepthGo_le_of_le n k (depth + 1) (2 * cap) bound hCap'
+      have hRec :=
+        compLog2DepthGo_le_of_le n k (depth + 1) (2 * cap) bound hCap'
       rw [Nat.succ_add, ← Nat.add_succ] at hRec
       exact hRec
 
@@ -2650,7 +2708,8 @@ equals `depth + 1` (so `depth = 9` for `4,096` elements has height `10 ≤ 11`).
 -/
 theorem Chunk8BlockTree.tabulate_height {α : Type u} (depth : Nat)
     (f : Nat → Option α) :
-    (Chunk8BlockTree.tabulate depth f).tree.heightAt (depth + 1) = depth + 1 := by
+    (Chunk8BlockTree.tabulate depth f).tree.heightAt (depth + 1) =
+      depth + 1 := by
   unfold Chunk8BlockTree.tabulate
   dsimp only
   have hAt :
@@ -2663,7 +2722,8 @@ theorem Chunk8BlockTree.tabulate_height {α : Type u} (depth : Nat)
       intro off step
       change natMax2
           ((chunk8TreeTabulateAt d' off (2 * step) f).heightAt (d' + 1))
-          ((chunk8TreeTabulateAt d' (off + step) (2 * step) f).heightAt (d' + 1)) + 1 =
+          ((chunk8TreeTabulateAt d' (off + step) (2 * step) f).heightAt
+            (d' + 1)) + 1 =
         (d' + 1) + 1
       rw [ih off (2 * step), ih (off + step) (2 * step)]
       unfold natMax2
@@ -2677,7 +2737,8 @@ theorem chunk8BlockTree_scaling_canary :
     let bt256 := Chunk8BlockTree.tabulate 5 (fun i => some i)
     let bt4096 := Chunk8BlockTree.tabulate 9 (fun i => some i)
     let bt128 := Chunk8BlockTree.ofList (mkChunk8Range 128 0)
-    let mt := MaskTree.ofList [true, false, true, true, false, false, false, false, true]
+    let mt := MaskTree.ofList
+      [true, false, true, true, false, false, false, false, true]
     bt256.depth = 5 ∧
     bt256.lookup? 0 = some 0 ∧
     bt256.lookup? 127 = some 127 ∧
@@ -2982,7 +3043,7 @@ theorem stepWith_chunk8BlockTree_forced_eq {BB : Type u} {State : Sort v}
   rw [Chunk8BlockTree.lookupForced?_eq_fun
     (valid_chunk8BlockTree_ofList blocks)]
 
-/-! ## Fuel-Bounded Execution to a Cutpoint (`runToCut`, `evalBlockTreeToCut`) -/
+/-! ## Fuel-Bounded Cut Execution (`runToCut`, `evalBlockTreeToCut`) -/
 
 /-- Result of running a step function towards a cutpoint. -/
 inductive CutRun (State : Type u) (Res : Type v) : Type (max u v) where
@@ -3187,7 +3248,8 @@ theorem runToCut_congr {step₁ step₂ : State → Res}
     {isCut₁ isCut₂ : State → Bool}
     (hStep : ∀ s : State, step₁ s = step₂ s)
     (hCut : ∀ s : State, isCut₁ s = isCut₂ s) (fuel : Nat) (s : State) :
-    runToCut step₁ next? isCut₁ fuel s = runToCut step₂ next? isCut₂ fuel s := by
+    runToCut step₁ next? isCut₁ fuel s =
+      runToCut step₂ next? isCut₂ fuel s := by
   induction fuel generalizing s with
   | zero =>
     change (match isCut₁ s with
@@ -3390,6 +3452,21 @@ theorem evalBlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
         (BlockTree.ofList_lookup_eq blocks i)))
     (fun st => cuts.getForced_eq (blockOf st)) fuel s
 
+/-- Stage execution from a cutpoint over a valid `BlockTree` is stage
+execution over the list it tabulates. -/
+theorem evalBlockTreeFromCut_eq_of_valid {BB : Type u} {State : Type v}
+    {Res : Type w} {blocks : List BB} {bt : BlockTree BB}
+    (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalBlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s := by
+  unfold evalBlockTreeFromCut
+  rw [BlockTree.lookupForced?_eq_fun hValid,
+    MaskTree.getForced_comp_eq_fun cuts blockOf]
+
 /-- Stage execution from a cutpoint over `BlockTree.ofList blocks` is stage
 execution over `listGet? blocks`. -/
 theorem evalBlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
@@ -3400,10 +3477,9 @@ theorem evalBlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
     evalBlockTreeFromCut (BlockTree.ofList blocks) stepWith next? blockOf
       cuts fuel s =
       runFromCut (stepWith (listGet? blocks)) next?
-        (fun st => cuts.get (blockOf st)) fuel s := by
-  unfold evalBlockTreeFromCut
-  rw [BlockTree.lookupForced?_eq_fun (valid_blockTree_ofList blocks),
-    MaskTree.getForced_comp_eq_fun cuts blockOf]
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  evalBlockTreeFromCut_eq_of_valid (valid_blockTree_ofList blocks) stepWith
+    next? blockOf cuts fuel s
 
 /-- `0 Quot.sound` pointwise form of `evalBlockTreeFromCut_ofList_eq`. -/
 theorem evalBlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
@@ -3470,6 +3546,21 @@ theorem evalChunk8BlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
         (Chunk8BlockTree.ofList_lookup_eq blocks i)))
     (fun st => cuts.getForced_eq (blockOf st)) fuel s
 
+/-- Stage execution from a cutpoint over a valid `Chunk8BlockTree` is stage
+execution over the list it tabulates. -/
+theorem evalChunk8BlockTreeFromCut_eq_of_valid {BB : Type u} {State : Type v}
+    {Res : Type w} {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s := by
+  unfold evalChunk8BlockTreeFromCut
+  rw [Chunk8BlockTree.lookupForced?_eq_fun hValid,
+    MaskTree.getForced_comp_eq_fun cuts blockOf]
+
 /-- Stage execution from a cutpoint over `Chunk8BlockTree.ofList blocks` is
 stage execution over `listGet? blocks`. -/
 theorem evalChunk8BlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
@@ -3480,11 +3571,28 @@ theorem evalChunk8BlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
     evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks) stepWith next?
       blockOf cuts fuel s =
       runFromCut (stepWith (listGet? blocks)) next?
-        (fun st => cuts.get (blockOf st)) fuel s := by
-  unfold evalChunk8BlockTreeFromCut
-  rw [Chunk8BlockTree.lookupForced?_eq_fun
-      (valid_chunk8BlockTree_ofList blocks),
-    MaskTree.getForced_comp_eq_fun cuts blockOf]
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  evalChunk8BlockTreeFromCut_eq_of_valid (valid_chunk8BlockTree_ofList blocks)
+    stepWith next? blockOf cuts fuel s
+
+/-- `0 Quot.sound` pointwise form of
+`evalChunk8BlockTreeFromCut_ofList_eq`. -/
+theorem evalChunk8BlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks) stepWith next?
+      blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runFromCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      ((Chunk8BlockTree.ofList blocks).lookupForced?_eq i).trans
+        (Chunk8BlockTree.ofList_lookup_eq blocks i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
 
 /-- A cut execution that ends at a cutpoint ends at a marked block. -/
 theorem evalBlockTreeToCut_cut_marked {BB : Type u} {State : Type v}
@@ -3525,6 +3633,20 @@ theorem evalChunk8BlockTreeToCut_cut_marked {BB : Type u} {State : Type v}
     cuts.get (blockOf s') = true := by
   rw [← cuts.getForced_eq (blockOf s')]
   exact runToCut_cut_isCut
+    (isCut := fun st => cuts.getForced (blockOf st)) h
+
+/-- A `evalChunk8BlockTreeFromCut` run that ends at a cutpoint ends at a
+marked block. -/
+theorem evalChunk8BlockTreeFromCut_cut_marked {BB : Type u} {State : Type v}
+    {Res : Type w} {bt : Chunk8BlockTree BB}
+    {stepWith : (Nat → Option BB) → State → Res}
+    {next? : Res → Option State} {blockOf : State → Nat} {cuts : MaskTree}
+    {fuel : Nat} {s s' : State}
+    (h : evalChunk8BlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      .cut s') :
+    cuts.get (blockOf s') = true := by
+  rw [← cuts.getForced_eq (blockOf s')]
+  exact runFromCut_cut_isCut
     (isCut := fun st => cuts.getForced (blockOf st)) h
 
 /-- Cut-execution canary on a five-block chain `0 → 1 → 2 → 3 → 4 → 5`, where

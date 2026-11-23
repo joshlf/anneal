@@ -384,7 +384,8 @@ theorem listSplice_sub (xs : List α) (off len rel : Nat) (sub : List α)
   have hSub' : rel + sub.length ≤ ((xs.drop off).take len).length := by
     rw [hOldLen]
     exact hSub
-  have hSpliceLen : (listSplice ((xs.drop off).take len) rel sub).length = len :=
+  have hSpliceLen :
+      (listSplice ((xs.drop off).take len) rel sub).length = len :=
     (listSplice_length ((xs.drop off).take len) rel sub hSub').trans hOldLen
   have hTakeRel : ((xs.drop off).take len).take rel = (xs.drop off).take rel :=
     listTake_take_of_le rel len (xs.drop off)
@@ -569,6 +570,37 @@ theorem tableFind_eq_of_rec {view : AllocView A Byte}
   | a :: rest, id => by
     rw [hCons a rest id, tableFind_cons view id a rest,
       tableFind_eq_of_rec find hNil hCons rest id]
+
+/-- `tableReplace` on the empty table. -/
+theorem tableReplace_nil (view : AllocView A Byte) (aNew : A) :
+    tableReplace view aNew ([] : List A) = [] :=
+  rfl
+
+/-- Recursion equation of `tableReplace` on a non-empty table. -/
+theorem tableReplace_cons (view : AllocView A Byte) (aNew a : A)
+    (rest : List A) :
+    tableReplace view aNew (a :: rest) =
+      match Nat.beq (view.allocId a) (view.allocId aNew) with
+      | true => aNew :: rest
+      | false => a :: tableReplace view aNew rest :=
+  rfl
+
+/-- `tableReplace` is the unique function satisfying its two recursion
+equations, so any structurally recursive first-match table updater matches
+`tableReplace` with both hypotheses closed by `rfl`. -/
+theorem tableReplace_eq_of_rec {view : AllocView A Byte}
+    (replace : A → List A → List A)
+    (hNil : ∀ aNew, replace aNew [] = [])
+    (hCons : ∀ aNew a rest, replace aNew (a :: rest) =
+      match Nat.beq (view.allocId a) (view.allocId aNew) with
+      | true => aNew :: rest
+      | false => a :: replace aNew rest) :
+    ∀ (aNew : A) (allocs : List A),
+      replace aNew allocs = tableReplace view aNew allocs
+  | aNew, [] => hNil aNew
+  | aNew, a :: rest => by
+    rw [hCons aNew a rest, tableReplace_cons view aNew a rest,
+      tableReplace_eq_of_rec replace hNil hCons aNew rest]
 
 /-- `tableFind` on a table whose head has the requested identifier. -/
 theorem tableFind_cons_of_beq {view : AllocView A Byte} {id : Nat} {a : A}
@@ -1289,7 +1321,8 @@ A read through this interface is the read side of a byte lens, so it is
 expected to succeed exactly where a write of the same slice would: an object
 that cannot be written (dead, immutable) is not readable through it either
 (`LawfulByteStoreOps.write_read_same`). -/
-class ByteStoreOps (Mem : Type u) (Addr : Type v) (Byte : outParam (Type w)) where
+class ByteStoreOps (Mem : Type u) (Addr : Type v)
+    (Byte : outParam (Type w)) where
   /-- Reads `len` bytes at offset `off` of the object at `a`. -/
   readBytes? : Mem → Addr → Nat → Nat → Option (List Byte)
   /-- Overwrites `bs.length` bytes at offset `off` of the object at `a`. -/
@@ -1359,6 +1392,17 @@ class LawfulByteStoreOps (Mem : Type u) (Addr : Type v)
   addrDisjoint_of_separated : ∀ {a a' : Addr} {off len off' len' : Nat},
     (a ≠ a' ∨ off + len ≤ off' ∨ off' + len' ≤ off) →
     ops.addrDisjoint a off len a' off' len'
+  /-- Non-interference is symmetric. -/
+  addrDisjoint_symm : ∀ {a a' : Addr} {off len off' len' : Nat},
+    ops.addrDisjoint a off len a' off' len' →
+    ops.addrDisjoint a' off' len' a off len
+  /-- Non-interference is downward-closed under sub-range containment. -/
+  addrDisjoint_mono_sub :
+    ∀ {a a' : Addr} {off₁ len₁ off₂ len₂ off₁' len₁' off₂' len₂' : Nat},
+      off₁ ≤ off₂ → off₂ + len₂ ≤ off₁ + len₁ →
+      off₁' ≤ off₂' → off₂' + len₂' ≤ off₁' + len₁' →
+      ops.addrDisjoint a off₁ len₁ a' off₁' len₁' →
+      ops.addrDisjoint a off₂ len₂ a' off₂' len₂'
 
 /-- Byte store of any memory type that holds a first-match allocation table:
 `getTable` and `setTable` read and replace the table, and addresses are
@@ -1462,7 +1506,7 @@ theorem LawfulByteStoreOps.ofTable {Mem : Type u} {A : Type x}
     (ByteStoreOps.ofTable view getTable setTable) ?read_len ?read_sub
     ?write_sub ?read_write_same ?write_read_same ?write_of_read
     ?write_write_same ?read_write_disjoint ?write_write_comm
-    ?addrDisjoint_of_separated
+    ?addrDisjoint_of_separated ?addrDisjoint_symm ?addrDisjoint_mono_sub
   case read_len =>
     intro m a off len bs h
     exact tableRead_len h
@@ -1536,6 +1580,24 @@ theorem LawfulByteStoreOps.ofTable {Mem : Type u} {A : Type x}
   case addrDisjoint_of_separated =>
     intro a a' off len off' len' h
     exact h
+  case addrDisjoint_symm =>
+    intro a a' off len off' len' h
+    cases h with
+    | inl hNe => exact Or.inl (fun hEq => hNe hEq.symm)
+    | inr hR =>
+      cases hR with
+      | inl hL => exact Or.inr (Or.inr hL)
+      | inr hG => exact Or.inr (Or.inl hG)
+  case addrDisjoint_mono_sub =>
+    intro a a' off₁ len₁ off₂ len₂ off₁' len₁' off₂' len₂' hLo₁ hHi₁ hLo₂ hHi₂ h
+    cases h with
+    | inl hNe => exact Or.inl hNe
+    | inr hR =>
+      cases hR with
+      | inl hL =>
+        exact Or.inr (Or.inl (Nat.le_trans hHi₁ (Nat.le_trans hL hLo₂)))
+      | inr hG =>
+        exact Or.inr (Or.inr (Nat.le_trans hHi₂ (Nat.le_trans hG hLo₁)))
 
 /-- Allocation record of the canonical store: an identifier, a byte buffer and
 an access guard. -/
@@ -1647,7 +1709,8 @@ def ContainedIn (child parent : ByteSubLens Addr) : Prop :=
 def zoom (L : ByteSubLens Addr) (rel k : Nat) : ByteSubLens Addr :=
   { addr := L.addr, offset := L.offset + rel, len := k }
 
-/-- Computable range disjointness check `[off₁, off₁ + len₁) ∩ [off₂, off₂ + len₂) = ∅`. -/
+/-- Computable range disjointness check
+`[off₁, off₁ + len₁) ∩ [off₂, off₂ + len₂) = ∅`. -/
 def rangesDisjointBool (off₁ len₁ off₂ len₂ : Nat) : Bool :=
   Nat.ble (off₁ + len₁) off₂ || Nat.ble (off₂ + len₂) off₁
 
@@ -2006,6 +2069,25 @@ theorem disjoint_of_contained [ops : ByteStoreOps Mem Addr Byte]
     (hc₁ : c₁.ContainedIn p₁) (hc₂ : c₂.ContainedIn p₂)
     (h : p₁.Separated p₂) : Disjoint Mem c₁ c₂ :=
   disjoint_of_separated (separated_of_contained hc₁ hc₂ h)
+
+/-- Store-level non-interference is symmetric. -/
+theorem Disjoint.symm [ops : ByteStoreOps Mem Addr Byte]
+    [LawfulByteStoreOps Mem Addr Byte] {L₁ L₂ : ByteSubLens Addr}
+    (h : Disjoint Mem L₁ L₂) : Disjoint Mem L₂ L₁ :=
+  LawfulByteStoreOps.addrDisjoint_symm h
+
+/-- Store-level non-interference is inherited by sub-lenses even when the
+parent non-interference is abstract (not purely geometric separation). -/
+theorem disjoint_of_contained_disjoint [ops : ByteStoreOps Mem Addr Byte]
+    [LawfulByteStoreOps Mem Addr Byte] {c₁ p₁ c₂ p₂ : ByteSubLens Addr}
+    (hc₁ : c₁.ContainedIn p₁) (hc₂ : c₂.ContainedIn p₂)
+    (h : Disjoint Mem p₁ p₂) : Disjoint Mem c₁ c₂ := by
+  have hSub :=
+    LawfulByteStoreOps.addrDisjoint_mono_sub (ops := ops) hc₁.2.1 hc₁.2.2
+      hc₂.2.1 hc₂.2.2 h
+  unfold Disjoint
+  rw [hc₁.1, hc₂.1]
+  exact hSub
 
 /-- A sub-lens within the length of its parent is contained in it. -/
 theorem zoom_containedIn (L : ByteSubLens Addr) {rel k : Nat}
@@ -2605,6 +2687,36 @@ theorem getUInt64_setUInt64_disjoint {c : ByteCodec Byte}
   unfold getUInt64
   rw [hGet]
 
+/-- Raw-write `UInt16` frame law: any write through a disjoint lens preserves
+a `UInt16` read. -/
+theorem getUInt16_set_disjoint {c : ByteCodec Byte}
+    {L₁ L₂ : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (hDisj : Disjoint Mem L₁ L₂) (h : L₁.set m bs = some m') :
+    L₂.getUInt16 c m' = L₂.getUInt16 c m := by
+  have hGet : L₂.getU16 c m' = L₂.getU16 c m := getLe_set_disjoint hDisj h
+  unfold getUInt16
+  rw [hGet]
+
+/-- Raw-write `UInt32` frame law: any write through a disjoint lens preserves
+a `UInt32` read. -/
+theorem getUInt32_set_disjoint {c : ByteCodec Byte}
+    {L₁ L₂ : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (hDisj : Disjoint Mem L₁ L₂) (h : L₁.set m bs = some m') :
+    L₂.getUInt32 c m' = L₂.getUInt32 c m := by
+  have hGet : L₂.getU32 c m' = L₂.getU32 c m := getLe_set_disjoint hDisj h
+  unfold getUInt32
+  rw [hGet]
+
+/-- Raw-write `UInt64` frame law: any write through a disjoint lens preserves
+a `UInt64` read. -/
+theorem getUInt64_set_disjoint {c : ByteCodec Byte}
+    {L₁ L₂ : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (hDisj : Disjoint Mem L₁ L₂) (h : L₁.set m bs = some m') :
+    L₂.getUInt64 c m' = L₂.getUInt64 c m := by
+  have hGet : L₂.getU64 c m' = L₂.getU64 c m := getLe_set_disjoint hDisj h
+  unfold getUInt64
+  rw [hGet]
+
 /-- Chunked-array lens law: writing back the chunks that were read returns
 the same memory. -/
 theorem setChunks_getChunks {k : Nat} (hk : 0 < k) {L : ByteSubLens Addr}
@@ -2655,6 +2767,171 @@ theorem getChunks_set_disjoint {k : Nat} {L₁ L₂ : ByteSubLens Addr}
     (h : L₁.set m bs = some m') : L₂.getChunks k m' = L₂.getChunks k m := by
   unfold getChunks
   rw [get_set_disjoint hDisj h]
+
+end ByteSubLens
+
+/-- Fixed-width typed slice codec encoding values of `α` into `len` byte
+slots `Byte` and decoding valid byte slices back to `α`. Supports arbitrary
+layout-driven MIR value codecs (for example `bool`, structs, tuples,
+`ScalarInt`, or `V2026_06_01` `encodeValueToBytes` / `decodeValueFromBytes`)
+in addition to little-endian bitvectors. -/
+structure SliceCodec (Byte : Type w) (α : Type a) (len : Nat) where
+  /-- Encodes a value into exactly `len` byte slots. -/
+  enc : α → List Byte
+  /-- Decodes a byte slice, failing closed on invalid bit patterns or
+  uninitialized bytes. -/
+  dec : List Byte → Option α
+  /-- Encoded slices always have width `len`. -/
+  enc_length : ∀ x : α, (enc x).length = len
+  /-- Decoding an encoded value recovers it. -/
+  dec_enc : ∀ x : α, dec (enc x) = some x
+
+/-- A `SliceCodec` is exact when re-encoding any valid `len`-byte slice
+recovers the exact original byte slots (ruling out ignored padding or
+provenance). -/
+def SliceCodec.Exact {Byte : Type w} {α : Type a} {len : Nat}
+    (sc : SliceCodec Byte α len) : Prop :=
+  ∀ (bs : List Byte) (x : α), bs.length = len → sc.dec bs = some x →
+    sc.enc x = bs
+
+/-- Every `ByteCodec` induces an `n`-byte little-endian `BitVec (n * 8)`
+`SliceCodec`. -/
+def SliceCodec.ofByteCodecLe {Byte : Type w} (c : ByteCodec Byte) (n : Nat) :
+    SliceCodec Byte (BitVec (n * 8)) n where
+  enc x := encodeBytes c (LeBytes.toLeBytes n x)
+  dec bs :=
+    match decodeBytes c bs with
+    | none => none
+    | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))
+  enc_length x :=
+    (encodeBytes_length c (LeBytes.toLeBytes n x)).trans
+      (LeBytes.toLeBytes_length n x)
+  dec_enc x := by
+    rw [decodeBytes_encodeBytes c (LeBytes.toLeBytes n x)]
+    dsimp only
+    rw [LeBytes.fromLeBytes_toLeBytes n x, bitVec_ofNat_toNat x]
+
+/-- `SliceCodec.ofByteCodecLe` is exact whenever the underlying `ByteCodec` is
+exact. -/
+theorem SliceCodec.ofByteCodecLe_exact {Byte : Type w} {c : ByteCodec Byte}
+    (hE : c.Exact) (n : Nat) : (SliceCodec.ofByteCodecLe c n).Exact := by
+  intro bs x hLen hDec
+  change (match decodeBytes c bs with
+    | none => none
+    | some raw => some (BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw))) =
+    some x at hDec
+  cases hD : decodeBytes c bs with
+  | none =>
+    rw [hD] at hDec
+    cases hDec
+  | some raw =>
+    rw [hD] at hDec
+    dsimp only at hDec
+    have hX : BitVec.ofNat (n * 8) (LeBytes.fromLeBytes raw) = x :=
+      Option.some.inj hDec
+    have hRawLen : raw.length = n := (decodeBytes_length c hD).trans hLen
+    have hRound : LeBytes.toLeBytes n x = raw := by
+      apply LeBytes.fromLeBytes_injective
+      · exact (LeBytes.toLeBytes_length n x).trans hRawLen.symm
+      · rw [LeBytes.fromLeBytes_toLeBytes n x, ← hX]
+        have hLt : LeBytes.fromLeBytes raw < 2 ^ (n * 8) := by
+          rw [← hRawLen]
+          exact LeBytes.fromLeBytes_lt raw
+        exact (Anneal.BitVec.toNat_ofNat (n * 8)
+          (LeBytes.fromLeBytes raw)).trans (Nat.mod_eq_of_lt hLt)
+    change encodeBytes c (LeBytes.toLeBytes n x) = bs
+    rw [hRound]
+    exact encodeBytes_decodeBytes_of_exact hE hD
+
+namespace ByteSubLens
+
+variable {Mem : Type u} {Addr : Type v} {Byte : Type w}
+  [ops : ByteStoreOps Mem Addr Byte]
+
+/-- Reads a value of type `α` through an `n`-byte lens using `SliceCodec`.
+Fails closed on length mismatch, store read failure, or decode failure. -/
+def getVal {α : Type a} {n : Nat} (sc : SliceCodec Byte α n)
+    (L : ByteSubLens Addr) (m : Mem) : Option α :=
+  match Nat.beq L.len n with
+  | false => none
+  | true =>
+    match L.get m with
+    | none => none
+    | some bs => sc.dec bs
+
+/-- Writes a value of type `α` through an `n`-byte lens using `SliceCodec`.
+Fails closed when `L.len ≠ n` or the store write fails. -/
+def setVal {α : Type a} {n : Nat} (sc : SliceCodec Byte α n)
+    (L : ByteSubLens Addr) (m : Mem) (x : α) : Option Mem :=
+  L.set m (sc.enc x)
+
+/-- A successful `setVal` went through a lens of length `n`. -/
+theorem setVal_len {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
+    {L : ByteSubLens Addr} {m m' : Mem} {x : α}
+    (h : L.setVal sc m x = some m') : L.len = n :=
+  (set_inv h).2.1.symm.trans (sc.enc_length x)
+
+variable [LawfulByteStoreOps Mem Addr Byte]
+
+/-- Generic typed read-after-write lens law for `SliceCodec`. -/
+theorem getVal_setVal {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
+    {L : ByteSubLens Addr} {m m' : Mem} {x : α}
+    (h : L.setVal sc m x = some m') : L.getVal sc m' = some x := by
+  have hLen : L.len = n := setVal_len h
+  have hBeq : Nat.beq L.len n = true := by
+    rw [hLen]
+    exact Nat.beq_refl n
+  unfold getVal
+  rw [hBeq, get_set h]
+  exact sc.dec_enc x
+
+/-- Generic typed write-after-read lens law for an exact `SliceCodec`. -/
+theorem setVal_getVal {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
+    (hE : sc.Exact) {L : ByteSubLens Addr} {m : Mem} {x : α}
+    (h : L.getVal sc m = some x) : L.setVal sc m x = some m := by
+  unfold getVal at h
+  cases hLenB : Nat.beq L.len n with
+  | false =>
+    rw [hLenB] at h
+    cases h
+  | true =>
+    rw [hLenB] at h
+    dsimp only at h
+    have hLen : L.len = n := Nat.eq_of_beq_eq_true hLenB
+    cases hGet : L.get m with
+    | none =>
+      rw [hGet] at h
+      cases h
+    | some bs =>
+      rw [hGet] at h
+      dsimp only at h
+      unfold setVal
+      rw [hE bs x ((get_len hGet).trans hLen) h]
+      exact set_get hGet
+
+/-- Generic typed overwrite law for `SliceCodec`. -/
+theorem setVal_setVal {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
+    {L : ByteSubLens Addr} {m m₁ : Mem} {x₁ : α} (x₂ : α)
+    (h : L.setVal sc m x₁ = some m₁) : L.setVal sc m₁ x₂ = L.setVal sc m x₂ :=
+  set_set (sc.enc x₂) h
+
+/-- Generic typed frame law: any raw write through a disjoint lens preserves
+a `SliceCodec` read. -/
+theorem getVal_set_disjoint {α : Type a} {n : Nat} {sc : SliceCodec Byte α n}
+    {L₁ L₂ : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (hDisj : Disjoint Mem L₁ L₂) (h : L₁.set m bs = some m') :
+    L₂.getVal sc m' = L₂.getVal sc m := by
+  unfold getVal
+  rw [get_set_disjoint hDisj h]
+
+/-- Generic typed write commutation across disjoint lenses. -/
+theorem setVal_setVal_comm_disjoint {α : Type a} {β : Type b} {n₁ n₂ : Nat}
+    {sc₁ : SliceCodec Byte α n₁} {sc₂ : SliceCodec Byte β n₂}
+    {L₁ L₂ : ByteSubLens Addr} {m m₁ m₂ : Mem} {x₁ : α} {x₂ : β}
+    (hDisj : Disjoint Mem L₁ L₂) (h₁ : L₁.setVal sc₁ m x₁ = some m₁)
+    (h₂ : L₂.setVal sc₂ m x₂ = some m₂) :
+    ∃ m₃, L₂.setVal sc₂ m₁ x₂ = some m₃ ∧ L₁.setVal sc₁ m₂ x₁ = some m₃ :=
+  set_set_comm_disjoint hDisj h₁ h₂
 
 end ByteSubLens
 
@@ -2793,6 +3070,46 @@ theorem execMutSummary_frame_getLe_disjoint {sum : MutSummary Byte Arg Ret}
   let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
   exact ByteSubLens.getLe_set_disjoint hDisj hSet
 
+/-- Generic `SliceCodec` frame of one summary execution. -/
+theorem execMutSummary_frame_getVal_disjoint {α : Type x} {k : Nat}
+    {sc : SliceCodec Byte α k} {sum : MutSummary Byte Arg Ret}
+    {L other : ByteSubLens Addr} {m m' : Mem} {arg : Arg} {ret : Ret}
+    (hDisj : ByteSubLens.Disjoint Mem L other)
+    (h : execMutSummary sum L m arg = some (m', ret)) :
+    other.getVal sc m' = other.getVal sc m := by
+  let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
+  exact ByteSubLens.getVal_set_disjoint hDisj hSet
+
+/-- `UInt16` frame of one summary execution. -/
+theorem execMutSummary_frame_getUInt16_disjoint {c : ByteCodec Byte}
+    {sum : MutSummary Byte Arg Ret} {L other : ByteSubLens Addr}
+    {m m' : Mem} {arg : Arg} {ret : Ret}
+    (hDisj : ByteSubLens.Disjoint Mem L other)
+    (h : execMutSummary sum L m arg = some (m', ret)) :
+    other.getUInt16 c m' = other.getUInt16 c m := by
+  let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
+  exact ByteSubLens.getUInt16_set_disjoint hDisj hSet
+
+/-- `UInt32` frame of one summary execution. -/
+theorem execMutSummary_frame_getUInt32_disjoint {c : ByteCodec Byte}
+    {sum : MutSummary Byte Arg Ret} {L other : ByteSubLens Addr}
+    {m m' : Mem} {arg : Arg} {ret : Ret}
+    (hDisj : ByteSubLens.Disjoint Mem L other)
+    (h : execMutSummary sum L m arg = some (m', ret)) :
+    other.getUInt32 c m' = other.getUInt32 c m := by
+  let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
+  exact ByteSubLens.getUInt32_set_disjoint hDisj hSet
+
+/-- `UInt64` frame of one summary execution. -/
+theorem execMutSummary_frame_getUInt64_disjoint {c : ByteCodec Byte}
+    {sum : MutSummary Byte Arg Ret} {L other : ByteSubLens Addr}
+    {m m' : Mem} {arg : Arg} {ret : Ret}
+    (hDisj : ByteSubLens.Disjoint Mem L other)
+    (h : execMutSummary sum L m arg = some (m', ret)) :
+    other.getUInt64 c m' = other.getUInt64 c m := by
+  let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
+  exact ByteSubLens.getUInt64_set_disjoint hDisj hSet
+
 /-- Commutation of two disjoint summary executions: executing `sum₁` on `L₁`
 and `sum₂` on a non-interfering lens `L₂` produces the same final memory and
 return values in either order. -/
@@ -2800,8 +3117,7 @@ theorem execMutSummary_comm_disjoint {Arg₂ : Type a} {Ret₂ : Type b}
     {sum₁ : MutSummary Byte Arg Ret} {sum₂ : MutSummary Byte Arg₂ Ret₂}
     {L₁ L₂ : ByteSubLens Addr} {m m₁ m₂ : Mem}
     {arg₁ : Arg} {arg₂ : Arg₂} {ret₁ : Ret} {ret₂ : Ret₂}
-    (hDisj₁₂ : ByteSubLens.Disjoint Mem L₁ L₂)
-    (hDisj₂₁ : ByteSubLens.Disjoint Mem L₂ L₁)
+    (hDisj : ByteSubLens.Disjoint Mem L₁ L₂)
     (h₁ : execMutSummary sum₁ L₁ m arg₁ = some (m₁, ret₁))
     (h₂ : execMutSummary sum₂ L₂ m arg₂ = some (m₂, ret₂)) :
     ∃ m₃, execMutSummary sum₂ L₂ m₁ arg₂ = some (m₃, ret₂) ∧
@@ -2809,11 +3125,11 @@ theorem execMutSummary_comm_disjoint {Arg₂ : Type a} {Ret₂ : Type b}
   let ⟨hLen₁, old₁, new₁, hGet₁, hSum₁, hSet₁⟩ := execMutSummary_inv h₁
   let ⟨hLen₂, old₂, new₂, hGet₂, hSum₂, hSet₂⟩ := execMutSummary_inv h₂
   let ⟨m₃, hSet₁₂, hSet₂₁⟩ :=
-    ByteSubLens.set_set_comm_disjoint hDisj₁₂ hSet₁ hSet₂
+    ByteSubLens.set_set_comm_disjoint hDisj hSet₁ hSet₂
   have hGet₂' : L₂.get m₁ = some old₂ :=
-    (ByteSubLens.get_set_disjoint hDisj₁₂ hSet₁).trans hGet₂
+    (ByteSubLens.get_set_disjoint hDisj hSet₁).trans hGet₂
   have hGet₁' : L₁.get m₂ = some old₁ :=
-    (ByteSubLens.get_set_disjoint hDisj₂₁ hSet₂).trans hGet₁
+    (ByteSubLens.get_set_disjoint hDisj.symm hSet₂).trans hGet₁
   exact ⟨m₃, execMutSummary_of hLen₂ hGet₂' hSum₂ hSet₁₂,
     execMutSummary_of hLen₁ hGet₁' hSum₁ hSet₂₁⟩
 
@@ -2905,43 +3221,46 @@ theorem open_mutSummaryCut {memOf : State → Mem}
   h
 
 /-- Whole-execution form of `CalleeRealizesMutSummary`, for a callee that is
-its own machine: `entry L m arg` is its initial state, and `outMem` and
-`outRet` read the final memory and the return value off its outcome. -/
+its own machine: `entry L m arg` is its initial state, and the partial
+extractor `extractOut : Out → Option (Mem × Ret)` projects normal-return
+outcomes to `(memOut, retVal)` while returning `none` on non-normal outcomes
+(such as `.panic`, `.abort`, or `.unwound`), ruling them out automatically
+even when `Mem` or `Ret` is arbitrary. -/
 def CalleeRealizesMutSummaryOutcome
     (entry : ByteSubLens Addr → Mem → Arg → State)
-    (outMem : Out → Mem) (outRet : Out → Ret)
+    (extractOut : Out → Option (Mem × Ret))
     (sum : MutSummary Byte Arg Ret) : Prop :=
   ∀ (L : ByteSubLens Addr) (m : Mem) (arg : Arg) (old new : List Byte)
     (ret : Ret),
     L.len = sum.len → L.get m = some old →
     sum.summaryFn old arg = some (new, ret) →
     ∃ m', L.set m new = some m' ∧
-      wpStateOk (ops := wops) (fun out => outMem out = m' ∧ outRet out = ret)
+      wpStateOk (ops := wops) (fun out => extractOut out = some (m', ret))
         (entry L m arg)
 
 /-- Zero-`Prop`-argument cutpoint sealing a verified whole-execution callee
-summary (all four arguments are purely computational data). -/
+summary (all three arguments are purely computational data). -/
 def MutSummaryOutcomeCut (entry : ByteSubLens Addr → Mem → Arg → State)
-    (outMem : Out → Mem) (outRet : Out → Ret)
+    (extractOut : Out → Option (Mem × Ret))
     (sum : MutSummary Byte Arg Ret) : Prop :=
-  CalleeRealizesMutSummaryOutcome entry outMem outRet sum
+  CalleeRealizesMutSummaryOutcome entry extractOut sum
 
 /-- Seals a whole-execution callee realization proof. -/
 theorem seal_mutSummaryOutcomeCut
     {entry : ByteSubLens Addr → Mem → Arg → State}
-    {outMem : Out → Mem} {outRet : Out → Ret}
+    {extractOut : Out → Option (Mem × Ret)}
     {sum : MutSummary Byte Arg Ret}
-    (h : CalleeRealizesMutSummaryOutcome entry outMem outRet sum) :
-    MutSummaryOutcomeCut entry outMem outRet sum :=
+    (h : CalleeRealizesMutSummaryOutcome entry extractOut sum) :
+    MutSummaryOutcomeCut entry extractOut sum :=
   h
 
 /-- Opens a `MutSummaryOutcomeCut` back into the callee realization. -/
 theorem open_mutSummaryOutcomeCut
     {entry : ByteSubLens Addr → Mem → Arg → State}
-    {outMem : Out → Mem} {outRet : Out → Ret}
+    {extractOut : Out → Option (Mem × Ret)}
     {sum : MutSummary Byte Arg Ret}
-    (h : MutSummaryOutcomeCut entry outMem outRet sum) :
-    CalleeRealizesMutSummaryOutcome entry outMem outRet sum :=
+    (h : MutSummaryOutcomeCut entry extractOut sum) :
+    CalleeRealizesMutSummaryOutcome entry extractOut sum :=
   h
 
 end Realization
@@ -3011,17 +3330,17 @@ theorem apply_mutSummaryCut_wpUntil {memOf : State → Mem}
     (fun s' hs' => hCont s' hs'.1 hs'.2)
 
 /-- Caller composition rule for `MutSummaryOutcomeCut`: a successful
-`execMutSummary` gives a fault-free whole-execution proof of the callee with
-the summarized final memory and return value, the new bytes of the target
+`execMutSummary` gives a fault-free normal-return whole-execution proof of
+the callee (`extractOut out = some (m', ret)`), the new bytes of the target
 lens, and the frame of every non-interfering lens. -/
 theorem apply_mutSummaryOutcomeCut_sound
     {entry : ByteSubLens Addr → Mem → Arg → State}
-    {outMem : Out → Mem} {outRet : Out → Ret}
+    {extractOut : Out → Option (Mem × Ret)}
     {sum : MutSummary Byte Arg Ret}
-    (hCut : MutSummaryOutcomeCut entry outMem outRet sum)
+    (hCut : MutSummaryOutcomeCut entry extractOut sum)
     {L : ByteSubLens Addr} {arg : Arg} {m m' : Mem} {ret : Ret}
     (hExec : execMutSummary sum L m arg = some (m', ret)) :
-    wpStateOk (ops := wops) (fun out => outMem out = m' ∧ outRet out = ret)
+    wpStateOk (ops := wops) (fun out => extractOut out = some (m', ret))
       (entry L m arg) ∧
     (∃ old new : List Byte,
       L.get m = some old ∧ sum.summaryFn old arg = some (new, ret) ∧
@@ -3089,7 +3408,8 @@ def allCallsSeparatedBool (addrBeq : Addr → Addr → Bool)
     (other : ByteSubLens Addr)
     (calls : List (MutSummaryCall Byte Addr Arg Ret)) : Bool :=
   List.foldr
-    (fun call acc => ByteSubLens.lensSeparatedBool addrBeq call.lens other && acc)
+    (fun call acc =>
+      ByteSubLens.lensSeparatedBool addrBeq call.lens other && acc)
     true calls
 
 /-- Computable boolean separation check for `Nat`-addressed call chains (`rfl`
@@ -3213,6 +3533,56 @@ theorem execMutSummaryChain_frame_getLe_disjoint
   unfold ByteSubLens.getLe
   rw [execMutSummaryChain_frame_disjoint other calls hDisj h]
 
+/-- Generic `SliceCodec` frame theorem for chained summaries. -/
+theorem execMutSummaryChain_frame_getVal_disjoint
+    [LawfulByteStoreOps Mem Addr Byte] {α : Type x} {k : Nat}
+    {sc : SliceCodec Byte α k} (other : ByteSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret} (hDisj : AllCallsDisjoint Mem other calls)
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    other.getVal sc m' = other.getVal sc m := by
+  unfold ByteSubLens.getVal
+  rw [execMutSummaryChain_frame_disjoint other calls hDisj h]
+
+/-- `UInt16` frame theorem for chained summaries. -/
+theorem execMutSummaryChain_frame_getUInt16_disjoint
+    [LawfulByteStoreOps Mem Addr Byte] {c : ByteCodec Byte}
+    (other : ByteSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret} (hDisj : AllCallsDisjoint Mem other calls)
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    other.getUInt16 c m' = other.getUInt16 c m := by
+  have hGet : other.getU16 c m' = other.getU16 c m :=
+    execMutSummaryChain_frame_getLe_disjoint other calls hDisj h
+  unfold ByteSubLens.getUInt16
+  rw [hGet]
+
+/-- `UInt32` frame theorem for chained summaries. -/
+theorem execMutSummaryChain_frame_getUInt32_disjoint
+    [LawfulByteStoreOps Mem Addr Byte] {c : ByteCodec Byte}
+    (other : ByteSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret} (hDisj : AllCallsDisjoint Mem other calls)
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    other.getUInt32 c m' = other.getUInt32 c m := by
+  have hGet : other.getU32 c m' = other.getU32 c m :=
+    execMutSummaryChain_frame_getLe_disjoint other calls hDisj h
+  unfold ByteSubLens.getUInt32
+  rw [hGet]
+
+/-- `UInt64` frame theorem for chained summaries. -/
+theorem execMutSummaryChain_frame_getUInt64_disjoint
+    [LawfulByteStoreOps Mem Addr Byte] {c : ByteCodec Byte}
+    (other : ByteSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret} (hDisj : AllCallsDisjoint Mem other calls)
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    other.getUInt64 c m' = other.getUInt64 c m := by
+  have hGet : other.getU64 c m' = other.getU64 c m :=
+    execMutSummaryChain_frame_getLe_disjoint other calls hDisj h
+  unfold ByteSubLens.getUInt64
+  rw [hGet]
+
 end Chain
 
 /-- A summary chain preserves every projection that store writes preserve,
@@ -3263,16 +3633,15 @@ variable {State : Type x} {Out : Type y} {Fault : Type z}
   [LawfulByteStoreOps Mem Addr Byte] {Arg : Type a} {Ret : Type b}
 
 /-- One certified whole-execution call entry in a chain: pairs a callee entry
-constructor and outcome projections with a `MutSummaryCall`. -/
+constructor and partial normal-return extractor with a `MutSummaryCall`. -/
 structure MutSummaryOutcomeSpec (State : Type x) (Out : Type y)
     (Mem : Type u) (Byte : Type w) (Addr : Type v) (Arg : Type a)
     (Ret : Type b) where
   /-- Initial callee state builder for `(lens, mem, arg)`. -/
   entry : ByteSubLens Addr → Mem → Arg → State
-  /-- Extracts final memory from callee outcome. -/
-  outMem : Out → Mem
-  /-- Extracts return value from callee outcome. -/
-  outRet : Out → Ret
+  /-- Partial normal-return extractor (`none` on `.panic`, `.abort`,
+  `.unwound`). -/
+  extractOut : Out → Option (Mem × Ret)
   /-- Call site descriptor (`sum`, `lens`, `arg`). -/
   call : MutSummaryCall Byte Addr Arg Ret
 
@@ -3291,24 +3660,25 @@ def AllOutcomeSummaryCuts
   List.foldr
     (fun sp acc =>
       MutSummaryOutcomeCut (wops := wops) (ops := ops)
-        sp.entry sp.outMem sp.outRet sp.call.sum ∧ acc)
+        sp.entry sp.extractOut sp.call.sum ∧ acc)
     True specs
 
 /-- Inductive step-by-step operational trace certificate witnessing that every
 callee in `specs` executes via `wpStateOk` from `m0` through intermediate
-memories to `mFin`, producing `rets` (`#4120`'s `MirCalleeChainRunsTo`). -/
+memories to `mFin`, producing normal returns `rets` (`#4120`'s
+`MirCalleeChainRunsTo`). -/
 inductive MutSummaryOutcomeChainRunsTo :
     List (MutSummaryOutcomeSpec State Out Mem Byte Addr Arg Ret) →
       Mem → Mem → List Ret → Prop where
   /-- Empty chain leaves memory unchanged. -/
   | nil (m : Mem) : MutSummaryOutcomeChainRunsTo [] m m []
-  /-- First callee runs via `wpStateOk` to `(m₁, r)` and the tail runs from
-  `m₁` to `(mFin, rs)`. -/
+  /-- First callee runs via `wpStateOk` to normal return `(m₁, r)` and the tail
+  runs from `m₁` to `(mFin, rs)`. -/
   | cons {sp : MutSummaryOutcomeSpec State Out Mem Byte Addr Arg Ret}
       {rest : List (MutSummaryOutcomeSpec State Out Mem Byte Addr Arg Ret)}
       {m0 m1 mFin : Mem} {r : Ret} {rs : List Ret}
       (headRun : wpStateOk (ops := wops)
-        (fun out => sp.outMem out = m1 ∧ sp.outRet out = r)
+        (fun out => sp.extractOut out = some (m1, r))
         (sp.entry sp.call.lens m0 sp.call.arg))
       (tailRuns : MutSummaryOutcomeChainRunsTo rest m1 mFin rs) :
       MutSummaryOutcomeChainRunsTo (sp :: rest) m0 mFin (r :: rs)
@@ -3597,7 +3967,8 @@ writing through `canaryHeader` `[0, 4)` visibly mutates the overlapping lens
 theorem overlapping_lens_refutes_frame :
     ∃ m' : SliceStore Nat,
       canaryHeader.set canaryStore [90, 91, 92, 93] = some m' ∧
-      (ByteSubLens.mk 7 2 4).get m' ≠ (ByteSubLens.mk 7 2 4).get canaryStore := by
+      (ByteSubLens.mk 7 2 4).get m' ≠
+        (ByteSubLens.mk 7 2 4).get canaryStore := by
   refine ⟨{ allocs :=
       [{ allocId := 7, bytes := [90, 91, 92, 93, 5, 6, 7, 8, 9, 10, 11, 12],
          writable := true },
@@ -3979,5 +4350,197 @@ theorem summaryQueue_outcome_canary :
         subst hR
         exact wpOutcome_det_done_eq (step := summaryQueueStep)
           (out := [2, 1]) rfl rfl)
+
+/-- Three-constructor outcome type modeling MIR `normal` / `panic` / `abort`
+outcomes (mirroring `Trusted.Effect.Outcome`), where non-normal outcomes carry
+neither a final memory nor a return value. -/
+inductive OutcomeToyOut where
+  /-- Normal completion returning `(mem, ret)`. -/
+  | normal (mem : SliceStore Nat) (ret : Nat) : OutcomeToyOut
+  /-- Defined panic with no return value. -/
+  | panic : OutcomeToyOut
+  /-- Defined abort with no return value. -/
+  | abort : OutcomeToyOut
+
+/-- Partial normal-return extractor for `OutcomeToyOut`: returns `some` only
+on `.normal` and `none` on `.panic` / `.abort`. -/
+def outcomeToyExtract : OutcomeToyOut → Option (SliceStore Nat × Nat)
+  | .normal m r => some (m, r)
+  | .panic => none
+  | .abort => none
+
+/-- Entry state of a standalone whole-execution callee machine. -/
+structure OutcomeToyState where
+  /-- Target sub-lens. -/
+  lens : ByteSubLens Nat
+  /-- Memory. -/
+  mem : SliceStore Nat
+  /-- Increment argument. -/
+  arg : Nat
+
+/-- Standalone callee step performing `canaryIncSummary` and returning
+`.normal m' b`. -/
+def outcomeToyStep (s : OutcomeToyState) :
+    StepOutcome OutcomeToyState OutcomeToyOut Unit :=
+  match s.lens.get s.mem with
+  | some [b] =>
+    match s.lens.set s.mem [b + s.arg] with
+    | some m' => .done (.normal m' b)
+    | none => .fault ()
+  | _ => .fault ()
+
+/-- Deterministic step interface of the standalone outcome callee. -/
+@[reducible] def outcomeToyOps :
+    MirWpOps OutcomeToyState OutcomeToyOut Unit :=
+  MirWpOps.ofDetStep outcomeToyStep
+
+/-- The standalone outcome callee realizes `canaryIncSummary` via the partial
+extractor `outcomeToyExtract`. -/
+theorem outcomeToy_realizes :
+    CalleeRealizesMutSummaryOutcome (wops := outcomeToyOps)
+      (fun L m arg => { lens := L, mem := m, arg := arg })
+      outcomeToyExtract canaryIncSummary := by
+  intro L m arg old new ret hLen hGet hSum
+  cases old with
+  | nil => cases hSum
+  | cons b tl =>
+    cases tl with
+    | cons _ _ => cases hSum
+    | nil =>
+      have hPair : ([b + arg], b) = (new, ret) := Option.some.inj hSum
+      have hNew : [b + arg] = new := congrArg Prod.fst hPair
+      have hRet : b = ret := congrArg Prod.snd hPair
+      have hNewLen : new.length = L.len := by
+        rw [← hNew, hLen]
+        rfl
+      let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get (L := L) (m := m)
+        new hGet hNewLen
+      have hSet' : L.set m [b + arg] = some m' := by
+        rw [hNew]
+        exact hSet
+      refine ⟨m', hSet, ?_⟩
+      have hDone : outcomeToyStep { lens := L, mem := m, arg := arg } =
+          .done (.normal m' b) := by
+        unfold outcomeToyStep
+        dsimp only
+        rw [hGet]
+        dsimp only
+        rw [hSet']
+      exact wpOutcome_det_done_eq (step := outcomeToyStep) hDone
+        (congrArg some (congrArg (Prod.mk m') hRet))
+
+/-- Standalone outcome callee sealed behind the zero-`Prop`-argument
+`@[irreducible] MutSummaryOutcomeCut`. -/
+theorem outcomeToy_cut :
+    MutSummaryOutcomeCut (wops := outcomeToyOps)
+      (fun L m arg => { lens := L, mem := m, arg := arg })
+      outcomeToyExtract canaryIncSummary :=
+  seal_mutSummaryOutcomeCut (wops := outcomeToyOps) outcomeToy_realizes
+
+/-- End-to-end certified chain canary for `MutSummaryOutcomeCut` and
+`execMutSummaryChain_outcome_certified_sound`, discharging chain execution
+and disjointness by `rfl`. -/
+theorem outcomeToy_chain_certified_canary :
+    let sp₁ : MutSummaryOutcomeSpec OutcomeToyState OutcomeToyOut
+        (SliceStore Nat) Nat Nat Nat Nat :=
+      { entry := fun L m arg => { lens := L, mem := m, arg := arg },
+        extractOut := outcomeToyExtract,
+        call := MutSummaryCall.mk canaryIncSummary
+          (ByteSubLens.mk 7 0 1) 5 }
+    let sp₂ : MutSummaryOutcomeSpec OutcomeToyState OutcomeToyOut
+        (SliceStore Nat) Nat Nat Nat Nat :=
+      { entry := fun L m arg => { lens := L, mem := m, arg := arg },
+        extractOut := outcomeToyExtract,
+        call := MutSummaryCall.mk canaryIncSummary
+          (ByteSubLens.mk 7 1 1) 7 }
+    MutSummaryOutcomeChainRunsTo (wops := outcomeToyOps) [sp₁, sp₂]
+      canaryStore canaryStoreInc2 [1, 2] ∧
+    canaryPayload.get canaryStoreInc2 = some [5, 6, 7, 8, 9, 10, 11, 12] := by
+  let sp₁ : MutSummaryOutcomeSpec OutcomeToyState OutcomeToyOut
+      (SliceStore Nat) Nat Nat Nat Nat :=
+    { entry := fun L m arg => { lens := L, mem := m, arg := arg },
+      extractOut := outcomeToyExtract,
+      call := MutSummaryCall.mk canaryIncSummary
+        (ByteSubLens.mk 7 0 1) 5 }
+  let sp₂ : MutSummaryOutcomeSpec OutcomeToyState OutcomeToyOut
+      (SliceStore Nat) Nat Nat Nat Nat :=
+    { entry := fun L m arg => { lens := L, mem := m, arg := arg },
+      extractOut := outcomeToyExtract,
+      call := MutSummaryCall.mk canaryIncSummary
+        (ByteSubLens.mk 7 1 1) 7 }
+  have hCuts : AllOutcomeSummaryCuts (wops := outcomeToyOps) [sp₁, sp₂] :=
+    ⟨outcomeToy_cut, outcomeToy_cut, True.intro⟩
+  have hExec : execMutSummaryChain
+      (MutSummaryOutcomeSpec.calls [sp₁, sp₂]) canaryStore =
+      some (canaryStoreInc2, [1, 2]) := rfl
+  have hCert := execMutSummaryChain_outcome_certified_sound
+    (wops := outcomeToyOps) [sp₁, sp₂] hCuts hExec
+  have hDisj : AllCallsDisjoint (SliceStore Nat) canaryPayload
+      (MutSummaryOutcomeSpec.calls [sp₁, sp₂]) :=
+    allCallsDisjoint_of_natSeparatedBool canaryPayload
+      (MutSummaryOutcomeSpec.calls [sp₁, sp₂]) rfl
+  refine ⟨hCert.1, ?_⟩
+  rw [hCert.2 canaryPayload hDisj]
+  rfl
+
+/-- Negative anti-vacuity witness for `MutSummaryOutcomeCut`: a callee that
+terminates with `.panic` cannot satisfy `MutSummaryOutcomeCut` under the
+partial extractor `outcomeToyExtract`, because `outcomeToyExtract .panic =
+none ≠ some (m', ret)`. -/
+theorem outcomeToy_panic_refutes_cut :
+    ¬ MutSummaryOutcomeCut
+      (wops := MirWpOps.ofDetStep
+        (fun (_ : OutcomeToyState) =>
+          (StepOutcome.done OutcomeToyOut.panic :
+            StepOutcome OutcomeToyState OutcomeToyOut Unit)))
+      (fun L m arg => { lens := L, mem := m, arg := arg })
+      outcomeToyExtract canaryIncSummary := by
+  intro hCut
+  let hSound := apply_mutSummaryOutcomeCut_sound
+    (wops := MirWpOps.ofDetStep
+      (fun (_ : OutcomeToyState) =>
+        (StepOutcome.done OutcomeToyOut.panic :
+          StepOutcome OutcomeToyState OutcomeToyOut Unit)))
+    hCut (L := ByteSubLens.mk 7 0 1) (arg := 5) (m := canaryStore)
+    (m' := canaryStoreInc) (ret := 1) rfl
+  have hRes := wpOutcome_det_done_inv
+    (step := fun (_ : OutcomeToyState) =>
+      (StepOutcome.done OutcomeToyOut.panic :
+        StepOutcome OutcomeToyState OutcomeToyOut Unit))
+    rfl hSound.1
+  cases hRes
+
+/-- `SliceCodec` non-vacuity canary: little-endian `BitVec 32` through
+`SliceCodec.ofByteCodecLe` obeys exact read-after-write, write-after-read,
+and disjoint-window framing over `SliceStore (BitVec 8)`. -/
+theorem sliceCodec_le_canary :
+    let scLo := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 4
+    let scHi := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 2
+    let lo : ByteSubLens Nat := { addr := 3, offset := 0, len := 4 }
+    let hi : ByteSubLens Nat := { addr := 3, offset := 4, len := 2 }
+    let x : BitVec 32 := BitVec.ofNat 32 0x11223344
+    ∃ m', lo.setVal scLo canaryWordStore x = some m' ∧
+      lo.getVal scLo m' = some x ∧
+      lo.setVal scLo m' x = some m' ∧
+      hi.getVal scHi m' = some (BitVec.ofNat 16 0xBEEF) := by
+  let scLo := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 4
+  let scHi := SliceCodec.ofByteCodecLe ByteCodec.bitVec8 2
+  let lo : ByteSubLens Nat := { addr := 3, offset := 0, len := 4 }
+  let hi : ByteSubLens Nat := { addr := 3, offset := 4, len := 2 }
+  let x : BitVec 32 := BitVec.ofNat 32 0x11223344
+  have hGet0 : lo.get canaryWordStore =
+      some [BitVec.ofNat 8 0x78, BitVec.ofNat 8 0x56,
+        BitVec.ofNat 8 0x34, BitVec.ofNat 8 0x12] := rfl
+  let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get (L := lo)
+    (m := canaryWordStore) (scLo.enc x) hGet0 (scLo.enc_length x)
+  have hGet : lo.getVal scLo m' = some x := ByteSubLens.getVal_setVal hSet
+  have hExact : scLo.Exact :=
+    SliceCodec.ofByteCodecLe_exact ByteCodec.bitVec8_exact 4
+  have hDisj : ByteSubLens.Disjoint (SliceStore (BitVec 8)) lo hi :=
+    ByteSubLens.disjoint_of_separated
+      (ByteSubLens.separated_of_natLensSeparatedBool (L₁ := lo) (L₂ := hi) rfl)
+  have hHi : hi.getVal scHi m' = some (BitVec.ofNat 16 0xBEEF) :=
+    (ByteSubLens.getVal_set_disjoint hDisj hSet).trans rfl
+  exact ⟨m', hSet, hGet, ByteSubLens.setVal_getVal hExact hGet, hHi⟩
 
 end Anneal.ParametricCore
