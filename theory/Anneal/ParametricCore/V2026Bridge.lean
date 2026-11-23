@@ -1303,6 +1303,132 @@ theorem detStageCut_iff_exists_stepPath {body : CapturedMir}
         (Anneal.PureMirExec.mirStep body) s₀ k s₁ :=
   ⟨stepPath_of_detStageCut, fun ⟨_, hPath⟩ => detStageCut_of_stepPath hPath⟩
 
+/-- **Step-counted fault refutation on `mirDetWpOps`**: if a `StepStageCut`
+reaches a state where `PureMirExec.mirStep body` faults, then no postcondition
+can hold under `wpStateOk (ops := mirDetWpOps body)` from the entry state. -/
+theorem not_wpStateOk_of_stepStageCut_fault {body : CapturedMir} {fuel : Nat}
+    {s₀ s₁ : MachineState}
+    (hCut : StepStageCut (mirDetStep body) fuel s₀ s₁)
+    (hFault : Anneal.PureMirExec.mirStep body s₁ = .fault)
+    (post : MirOutcome → Prop) :
+    ¬ wpStateOk (ops := mirDetWpOps body) post s₀ := by
+  have hStep :
+      (Anneal.PureMirExec.mirStep body s₁ = .fault →
+        ¬ wpStateOk (ops := mirDetWpOps body) post s₀) := by
+    have hInd := StepStageCut.induction
+      (R := fun a _ b => Anneal.PureMirExec.mirStep body b = .fault →
+        ¬ wpStateOk (ops := mirDetWpOps body) post a)
+      (fun s hF hWp =>
+        wpOutcome_det_fault_inv (step := mirDetStep body) (onFault := fun _ => False)
+          (err := ()) (toStepOutcome_fault_iff.mpr hF) hWp)
+      (fun s s' _ _ hTr ih hF hWp =>
+        ih hF (wpUntil_det_step_inv (step := mirDetStep body) hTr (fun hf => hf) hWp))
+      hCut
+    rcases hInd with ⟨_, _, hRes⟩
+    exact hRes
+  exact hStep hFault
+
+/-- **Direct fail refutation on `MirWpConverges`**: if unmodified
+`Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn body s` immediately yields
+`MirStepNode.fail fk` (e.g., UB or Tree Borrows violation), then no
+postcondition can hold under `MirWpConverges body s post`. -/
+theorem not_mirWpConverges_of_fail {body : CapturedMir} {s : MachineState}
+    {fk : FailureKind} (hFail : stepMirFn body s = MirStepNode.fail fk)
+    (post : MirOutcome → Prop) :
+    ¬ MirWpConverges body s post := by
+  rintro ⟨fuel, hWp⟩
+  change wpMirExecSym fuel body (.running s) post at hWp
+  rw [wpMirExecSym_eq_wpCoalBounded] at hWp
+  cases fuel with
+  | zero => exact hWp
+  | succ fuel' =>
+    unfold wpCoalBounded at hWp
+    dsimp only [stepMirState] at hWp
+    rw [hFail] at hWp
+    exact hWp
+
+/-- **One-step deterministic inversion on `MirWpConverges`**: if
+`PureMirExec.mirStep body s = .cont s'` and `MirWpConverges body s post`, then
+`MirWpConverges body s' post`. -/
+theorem mirWpConverges_of_mirStep_cont_inv {body : CapturedMir} {s s' : MachineState}
+    {post : MirOutcome → Prop}
+    (hStep : Anneal.PureMirExec.mirStep body s = .cont s')
+    (hConv : MirWpConverges body s post) :
+    MirWpConverges body s' post := by
+  rcases hConv with ⟨fuel, hWp⟩
+  change wpMirExecSym fuel body (.running s) post at hWp
+  rw [wpMirExecSym_eq_wpCoalBounded] at hWp
+  cases fuel with
+  | zero => exact False.elim hWp
+  | succ fuel' =>
+    unfold wpCoalBounded at hWp
+    dsimp only [stepMirState] at hWp
+    rcases Anneal.PureMirExec.stepMirFn_of_mirStep_cont hStep with hTau | ⟨obs, k, hVis, hK⟩
+    · rw [hTau] at hWp
+      refine ⟨fuel', ?_⟩
+      change wpMirExecSym fuel' body (.running s') post
+      rw [wpMirExecSym_eq_wpCoalBounded]
+      exact hWp
+    · rw [hVis] at hWp
+      change wpCoalBounded fuel' mirDefaultWP (stepMirState body)
+        (fun out _ => post out) (k PUnit.unit) PUnit.unit at hWp
+      rw [hK] at hWp
+      refine ⟨fuel', ?_⟩
+      change wpMirExecSym fuel' body (.running s') post
+      rw [wpMirExecSym_eq_wpCoalBounded]
+      exact hWp
+
+/-- **Multi-step deterministic inversion via sealed `StepStageCut`**: if
+`StepStageCut (mirDetStep body) fuel s₀ s₁` and `MirWpConverges body s₀ post`,
+then `MirWpConverges body s₁ post`. -/
+theorem mirWpConverges_of_stepStageCut_inv {body : CapturedMir} {fuel : Nat}
+    {s₀ s₁ : MachineState} {post : MirOutcome → Prop}
+    (hCut : StepStageCut (mirDetStep body) fuel s₀ s₁)
+    (hConv : MirWpConverges body s₀ post) :
+    MirWpConverges body s₁ post := by
+  have hInd := StepStageCut.induction
+    (R := fun a _ b => MirWpConverges body a post → MirWpConverges body b post)
+    (fun _ h => h)
+    (fun _ _ _ _ hTr ih hC => ih (mirWpConverges_of_mirStep_cont_inv (mirDetStep_step_iff.mp hTr) hC))
+    hCut
+  rcases hInd with ⟨_, _, hRes⟩
+  exact hRes hConv
+
+/-- **Multi-step fault refutation on `MirWpConverges` via `StepStageCut`**:
+if a `StepStageCut` from `s₀` reaches `s₁` where unmodified `stepMirFn body s₁`
+emits `MirStepNode.fail fk`, then `MirWpConverges body s₀ post` is uninhabited
+for every `post`. -/
+theorem not_mirWpConverges_of_stepStageCut_fault {body : CapturedMir} {fuel : Nat}
+    {s₀ s₁ : MachineState} {fk : FailureKind}
+    (hCut : StepStageCut (mirDetStep body) fuel s₀ s₁)
+    (hFail : stepMirFn body s₁ = MirStepNode.fail fk)
+    (post : MirOutcome → Prop) :
+    ¬ MirWpConverges body s₀ post :=
+  fun hConv => not_mirWpConverges_of_fail hFail post
+    (mirWpConverges_of_stepStageCut_inv hCut hConv)
+
+/-- **Fuel-free multi-step fault refutation on `MirWpConverges` via
+`DetStageCut`**. -/
+theorem not_mirWpConverges_of_detStageCut_fault {body : CapturedMir}
+    {s₀ s₁ : MachineState} {fk : FailureKind}
+    (hCut : DetStageCut (mirDetStep body) s₀ s₁)
+    (hFail : stepMirFn body s₁ = MirStepNode.fail fk)
+    (post : MirOutcome → Prop) :
+    ¬ MirWpConverges body s₀ post := by
+  rcases DetStageCut.exists_fuel hCut with ⟨_, hStep⟩
+  exact not_mirWpConverges_of_stepStageCut_fault hStep hFail post
+
+/-- **Multi-step fault refutation on `MirWpConverges` via `PureLift`
+`StepPath`**. -/
+theorem not_mirWpConverges_of_stepPath_fault {body : CapturedMir} {k : Nat}
+    {s₀ s₁ : MachineState} {fk : FailureKind}
+    (hPath : Anneal.PureLift.MirLiftCoreInterop.StepPath
+      (Anneal.PureMirExec.mirStep body) s₀ k s₁)
+    (hFail : stepMirFn body s₁ = MirStepNode.fail fk)
+    (post : MirOutcome → Prop) :
+    ¬ MirWpConverges body s₀ post :=
+  not_mirWpConverges_of_stepStageCut_fault (stepStageCut_of_stepPath hPath) hFail post
+
 /-- **`mirOperationalAdapter` `ExecutesTo` from `StepStageCut`**: a sealed
 `StepStageCut` supplies the `ExecutesTo` step-path witness of
 `Anneal.PureLift.V2026_06_01Bridge.mirOperationalAdapter`. -/

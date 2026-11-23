@@ -589,6 +589,30 @@ theorem canary1b_findTarget_verificationResult : VerificationResult findTargetCl
     | panic | abort => exact False.elim hOut
     | normal p => exact ⟨n, target, rfl, hOut.1⟩
 
+def findTargetTotalClaim : TotalClaim where
+  body := findTargetMirBody
+  callees := []
+  pre args mem := mem = {} ∧ ∃ n target : Nat, n < 2 ^ 32 ∧ target < 2 ^ 32 ∧
+    args = [.scalar ⟨n, 4⟩, .scalar ⟨target, 4⟩]
+  post args mem ret mem' := mem' = mem ∧ ∃ n target : Nat,
+    args = [.scalar ⟨n, 4⟩, .scalar ⟨target, 4⟩] ∧
+    ret = .scalar ⟨findTargetSpec n target, 4⟩
+
+/-- **Trusted `TotalVerificationResult` for symbolic early-return
+`findTargetMirBody` (`∀ n, target < 2^32`)**, proving termination + exact
+return value + memory preservation without any fuel parameter. -/
+theorem canary1b_findTarget_totalVerificationResult :
+    TotalVerificationResult findTargetTotalClaim :=
+  verifyTotalMir_of_wpStateOk findTargetTotalClaim
+    fun args mem ⟨hMem, n, target, hN, hT, hArgs⟩ => by
+      subst hMem hArgs
+      refine wpOutcome_mono (ops := mirDetWpOps findTargetMirBody) ?_ (fun _ h => h)
+        (canary1b_findTarget_wpStateOk n target hN hT)
+      intro out hOut
+      cases out with
+      | panic | abort => exact False.elim hOut
+      | normal p => exact ⟨hOut.2, n, target, rfl, hOut.1⟩
+
 /-! ### 1C. Fuel-Free Symbolic Upward-Counting Loop (`wpLoop_nat`) -/
 
 /-- Real multi-block `V2026_06_01` `CapturedMir` counting upward (`for i in 0..n`):
@@ -1616,6 +1640,128 @@ theorem canary2_diamond_stageCut_then_pureLift (c1 c2 : Bool) (x z : Nat)
     diamondStage2PurePlan retExpr post (· = sEntry) (· = sCut) []
     hStage1Exact hSpec hCutInit hCutSim rfl
 
+/-- `PureLift` `FlowPlan` lifting Stage 1 (`bb0 -> (bb1|bb2) -> bb3`) of
+`diamond2StageMirBody`: locals `0..4` correspond to MIR `_1.._5` (`c1, c2, x, z, acc`). -/
+def diamondStage1PurePlan : Anneal.PureLift.FlowPlan Anneal.PureLift.StdVal :=
+  .branch (.use (.localSub 0 []))
+    (.act (.assign (.localSub 4 [])
+      (.unary (fun v => match v with | .nat n => some (.nat (n + 10)) | _ => none)
+        (.localSub 2 []))))
+    (.act (.assign (.localSub 4 [])
+      (.unary (fun v => match v with | .nat n => some (.nat (n + 20)) | _ => none)
+        (.localSub 2 []))))
+
+/-- Full 2-stage sequential `PureLift` `FlowPlan` for `diamond2StageMirBody`,
+composing Stage 1 and Stage 2 in `2 + 2` additive style. -/
+def diamondFullPurePlan : Anneal.PureLift.FlowPlan Anneal.PureLift.StdVal :=
+  .seq diamondStage1PurePlan diamondStage2PurePlan
+
+/-- **Canary 2 (Full 2-Stage `PureLift` via `V2026Bridge.mir_pure_lift_sound_of_stepStageCut`)**:
+Directly exercises `V2026Bridge.mir_pure_lift_sound_of_stepStageCut` from real
+`initMachineState diamond2StageMirBody [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩]`
+across BOTH stages using `StepStageCut.trans` (ZERO `2 × 2` path explosion on
+both the live MIR simulation AND the `PureLift` evaluation!) for ALL symbolic
+`(c1 c2 : Bool)` and `(x z : Nat)` (`x + 22 < 2^32`, `z < 2^32`). -/
+theorem canary2_diamond_full_pureLift_sound (c1 c2 : Bool) (x z : Nat)
+    (hX : x + 22 < 2 ^ 32) (hZ : z < 2 ^ 32) :
+    let acc1 := x + stage1Delta c1
+    let post : Anneal.PureLift.FuncOut Anneal.PureLift.StdVal → Prop :=
+      fun out => out.ret = .pair (.nat (acc1 + stage2Delta c2)) (.nat z)
+    MirWpConverges diamond2StageMirBody
+      (initMachineState diamond2StageMirBody
+        [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩])
+      (fun o => Anneal.PureLift.V2026_06_01Bridge.LiftedMirPost (fun lid => lid + 1) post o []) := by
+  intro acc1 post
+  let params : List (Anneal.PureLift.ParamInput Anneal.PureLift.StdVal) :=
+    [⟨.byVal, .bool c1⟩, ⟨.byVal, .bool c2⟩, ⟨.byVal, .nat x⟩, ⟨.byVal, .nat z⟩]
+  let retExpr : Anneal.PureLift.RvalOp Anneal.PureLift.StdVal :=
+    .binary (fun a b => some (.pair a b)) (.localSub 4 []) (.localSub 3 [])
+  let tagOf : Anneal.PureLift.LoanId → Nat := fun lid => lid + 1
+  let m0 := initMachineState diamond2StageMirBody
+    [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩]
+  let st0 : Anneal.PureLift.SymState Anneal.PureLift.StdVal :=
+    ⟨[⟨.bool c1, .unborrowed⟩, ⟨.bool c2, .unborrowed⟩, ⟨.nat x, .unborrowed⟩,
+      ⟨.nat z, .unborrowed⟩], [], [], [], [], 0⟩
+  let st1 : Anneal.PureLift.SymState Anneal.PureLift.StdVal :=
+    ⟨[⟨.bool c1, .unborrowed⟩, ⟨.bool c2, .unborrowed⟩, ⟨.nat x, .unborrowed⟩,
+      ⟨.nat z, .unborrowed⟩, ⟨.nat acc1, .unborrowed⟩], [], [], [], [], 0⟩
+  let st2 : Anneal.PureLift.SymState Anneal.PureLift.StdVal :=
+    ⟨[⟨.bool c1, .unborrowed⟩, ⟨.bool c2, .unborrowed⟩, ⟨.nat x, .unborrowed⟩,
+      ⟨.nat z, .unborrowed⟩, ⟨.nat (acc1 + stage2Delta c2), .unborrowed⟩], [], [], [], [], 0⟩
+  -- Additive 2 + 2 PureLift evaluation (never `cases c1 <;> cases c2`!)
+  have hStage1Pure :
+      Anneal.PureLift.evalPlan Anneal.PureLift.stdValAlg diamondStage1PurePlan st0 =
+        .ok (.continuing st1) := by
+    cases c1 <;> rfl
+  have hStage2Pure :
+      Anneal.PureLift.evalPlan Anneal.PureLift.stdValAlg diamondStage2PurePlan st1 =
+        .ok (.continuing st2) := by
+    cases c2 <;> rfl
+  have hEvalFull :
+      Anneal.PureLift.evalFnValue Anneal.PureLift.stdValAlg params diamondFullPurePlan retExpr =
+        .ok ⟨.pair (.nat (acc1 + stage2Delta c2)) (.nat z), []⟩ := by
+    unfold Anneal.PureLift.evalFnValue diamondFullPurePlan
+    have hInit0 : Anneal.PureLift.initFnState Anneal.PureLift.stdValAlg params = .ok st0 := rfl
+    rw [hInit0]
+    dsimp only
+    rw [Anneal.PureLift.evalPlan_seq Anneal.PureLift.stdValAlg
+      diamondStage1PurePlan diamondStage2PurePlan st0 (fun _ _ => rfl) (fun _ _ => rfl)]
+    rw [hStage1Pure]
+    dsimp only
+    rw [hStage2Pure]
+    rfl
+  have hInit : ∃ st,
+      Anneal.PureLift.initFnState Anneal.PureLift.stdValAlg params = .ok st ∧
+      Anneal.PureLift.V2026_06_01Bridge.mirStateRel tagOf [] st m0 := by
+    refine ⟨st0, rfl, ⟨trivial, trivial⟩,
+      Anneal.PureLift.V2026_06_01Bridge.mirLocalsRel_of_localsRefine ?_⟩
+    have hX4 : x < 256 ^ 4 := by omega
+    have hZ4 : z < 256 ^ 4 := by omega
+    exact ⟨fun _ => ⟨_, rfl, .bool c1⟩, fun _ => ⟨_, rfl, .bool c2⟩,
+      fun _ => ⟨_, rfl, .nat hX4⟩, fun _ => ⟨_, rfl, .nat hZ4⟩, trivial⟩
+  have hSpec : Anneal.PureLift.HoldsFnSpec
+      (Anneal.PureLift.evalFnValue Anneal.PureLift.stdValAlg params diamondFullPurePlan retExpr)
+      post := by
+    rw [hEvalFull]; rfl
+  refine mir_pure_lift_sound_of_stepStageCut tagOf diamond2StageMirBody [] params
+    diamondFullPurePlan retExpr post m0 [] hInit hSpec ?_
+  intro _ out _ _ hEv
+  rw [hEvalFull] at hEv; injection hEv with hOut; subst hOut
+  have hAcc1Lt : acc1 + 2 < 2 ^ 32 := by
+    cases c1 with
+    | false => change x + 20 + 2 < 2 ^ 32; omega
+    | true => change x + 10 + 2 < 2 ^ 32; omega
+  let zSlot : LocalSlot := .init (.scalar ⟨z, 4⟩)
+  let sBb6_0 := diamondState 6 0 .uninit (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot (.init (.scalar ⟨acc1 + stage2Delta c2, 4⟩))
+  let sBb6_1 := diamondState 6 1
+    (.init (.aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩]))
+    (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot (.init (.scalar ⟨acc1 + stage2Delta c2, 4⟩))
+  let sBb6_2 := diamondState 6 2
+    (.init (.aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩]))
+    (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot .dead
+  have hCut12 : StepStageCut (mirDetStep diamond2StageMirBody) 7 m0 sBb6_0 :=
+    (canary2_stage1_stepStageCut c1 x (by omega) (.init (boolScalar c2)) zSlot).trans
+      (canary2_stage2_stepStageCut c2 acc1 hAcc1Lt
+        (.init (boolScalar c1)) (.init (.scalar ⟨x, 4⟩)) zSlot)
+  have hCutFinal : StepStageCut (mirDetStep diamond2StageMirBody) 9 m0 sBb6_2 :=
+    hCut12.trans
+      (StepStageCut.step
+        (mirDetStep_step_iff.mpr (rfl : Anneal.PureMirExec.mirStep diamond2StageMirBody sBb6_0 = .cont sBb6_1))
+        (StepStageCut.step
+          (mirDetStep_step_iff.mpr (rfl : Anneal.PureMirExec.mirStep diamond2StageMirBody sBb6_1 = .cont sBb6_2))
+          (StepStageCut.refl _ 0 sBb6_2)))
+  refine ⟨9, sBb6_2, hCutFinal,
+    .aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩], {}, rfl, ?_, rfl⟩
+  have hFinalLt : acc1 + stage2Delta c2 < 256 ^ 4 := by
+    cases c2 with
+    | false => change acc1 + 2 < 256 ^ 4; omega
+    | true => change acc1 + 1 < 256 ^ 4; omega
+  have hZ4 : z < 256 ^ 4 := by omega
+  exact .pair (.nat hFinalLt) (.nat hZ4)
+
 /-! ## 3. Canary 3 — Disjoint `ByteSubLens`, `AlignedSubLens`, Tree Borrows & Certified `MutSummaryChain` -/
 
 /-! ### 3A. `Memory.globals` (`CapturedAllocation`), `AlignedSubLens`, `SliceCodec.paddedPair`, `decodeValueFromBytes`, `TypedAt`, Tree Borrows & Fail-Closed Rejections -/
@@ -2594,6 +2740,33 @@ private theorem writeSliceFatPtr_u8_whole (frameLocals : List LocalSlot)
       | none => ProjWriteResult.ub) = _
     rw [replaceSubslice_u8BytesToValues (b0 :: rest) bs off hBound]
 
+private theorem writeSliceFatPtr_u8_oob (frameLocals : List LocalSlot)
+    (b0 : UInt8) (rest : List UInt8) (newElems : List Value) (tag off : Nat)
+    (hOob : (b0 :: rest).length < off + newElems.length) :
+    writeSliceFatPtrTargetValue frameLocals (.aggregate 0 (u8BytesToValues (b0 :: rest))) []
+      ⟨tag, off⟩ 8 ⟨newElems.length, 8⟩ [] (.aggregate 0 newElems) = .ub := by
+  unfold writeSliceFatPtrTargetValue
+  have hRead : readSliceBackingAggregate? frameLocals (.aggregate 0 (u8BytesToValues (b0 :: rest)))
+      [] newElems.length = some ([], 0, u8BytesToValues (b0 :: rest)) := by
+    unfold readSliceBackingAggregate?
+    dsimp only [normalizeSubsliceProjections, stripTransparentProjections,
+      splitLastConstantIndex?, readProjectedValue, valueContainsUninit]
+    rw [valueListContainsUninit_u8BytesToValues (b0 :: rest)]; rfl
+  have hStride : inferElemListByteStride (u8BytesToValues (b0 :: rest)) = 1 := rfl
+  dsimp only
+  rw [hRead]
+  dsimp only
+  rw [hStride, byteOffsetToElemIdx?_one]
+  dsimp only
+  have hAdd0 : off.add 0 = off := Nat.add_zero off
+  have hLen : Trusted.Sequence.length (u8BytesToValues (b0 :: rest)) = (b0 :: rest).length :=
+    u8BytesToValues_length (b0 :: rest)
+  have hBle : (off.add newElems.length).ble (b0 :: rest).length = false := by
+    change Nat.ble (off + newElems.length) (b0 :: rest).length = false
+    exact natBle_false_of_not_le (by omega)
+  rw [hAdd0, hLen, hBle]
+  rfl
+
 private theorem borrowsDisjointPair_symm {e₁ e₂ : BorrowEntry}
     (h : borrowsDisjointPair e₁ e₂ = true) :
     borrowsDisjointPair e₂ e₁ = true := by
@@ -3223,6 +3396,226 @@ private theorem evalCallerSliceAssign_ok
       hFrame1 hDisj hMemE hPermE
   exact ⟨hPlaceUb, hCallerNe, hCallerWrite, hTreeUb, hBorInv⟩
 
+private def writeU32St10 (fatVal : Value) (v : UInt32) (stmt : Nat) (mem : Memory)
+    (l0 l3 l4 l5 l6 l7 l8 l9 : LocalSlot) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := stmt,
+               locals := [l0, .init fatVal, .init (.scalar ⟨v.toNat, 4⟩),
+                          l3, l4, l5, l6, l7, l8, l9] }
+    memory := mem }
+
+private def writeU32Stmt14State (fatVal : Value) (v : UInt32) (m : Memory) : MachineState :=
+  let b0 := wrapScalarBits v.toNat (scalarModulus 1)
+  let s1 := wrapScalarBits (shiftRightUnsignedBits v.toNat 8) (scalarModulus 4)
+  let b1 := wrapScalarBits s1 (scalarModulus 1)
+  let s2 := wrapScalarBits (shiftRightUnsignedBits v.toNat 16) (scalarModulus 4)
+  let b2 := wrapScalarBits s2 (scalarModulus 1)
+  let s3 := wrapScalarBits (shiftRightUnsignedBits v.toNat 24) (scalarModulus 4)
+  let b3 := wrapScalarBits s3 (scalarModulus 1)
+  writeU32St10 fatVal v 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+    (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+    (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))
+
+/-- Shared 14-step prefix of `writeU32SliceBody` (statements `0..13`: `shr` + `cast`
+to `u8`) sealed as a `StepStageCut` for ANY fat-pointer argument `fatVal`, ANY
+symbolic `v : UInt32`, and ANY flat-caller-borrow `m : Memory`. Reused by BOTH
+`writeU32Slice_mutSummaryOutcomeCut` (valid `.unique` writes) AND the symbolic
+entry-to-UB refutation canaries (frozen borrow & OOB slice). -/
+private theorem writeU32Slice_entry_to_stmt14 (fatVal : Value) (v : UInt32) (m : Memory)
+    (hAc : m.activeCallee = none) (hCs : m.callStack = [])
+    (hPr : m.activeProtectors = []) (hCa : m.callees = [])
+    (hFlat : ∀ e ∈ m.borrows, borrowFlatRoot e = true) :
+    StepStageCut (mirDetStep writeU32SliceBody) 14
+      (Trusted.VerificationResult.initMachineStateWithMemoryAndCallees writeU32SliceBody
+        [fatVal, .scalar ⟨v.toNat, 4⟩] m [])
+      (writeU32Stmt14State fatVal v m) := by
+  rcases m with ⟨mNextAlloc, mGlobals, mBorrows, mNextTag, mCallees, mTraitImpls,
+    mCallStack, mActiveCallee, mActiveProtectors, mNextProtector, mCallerLocals,
+    mFnPtrs, mExposed⟩
+  dsimp only at hAc hCs hPr hCa hFlat ⊢
+  subst hAc hCs hPr hCa
+  let m : Memory :=
+    { nextAllocId := mNextAlloc, globals := mGlobals, borrows := mBorrows,
+      nextTag := mNextTag, callees := [], traitImpls := mTraitImpls,
+      callStack := [], activeCallee := none, activeProtectors := [],
+      nextProtector := mNextProtector, callerLocals := mCallerLocals,
+      fnPtrs := mFnPtrs, exposedAllocIds := mExposed }
+  let b0 := wrapScalarBits v.toNat (scalarModulus 1)
+  let s1 := wrapScalarBits (shiftRightUnsignedBits v.toNat 8) (scalarModulus 4)
+  let b1 := wrapScalarBits s1 (scalarModulus 1)
+  let s2 := wrapScalarBits (shiftRightUnsignedBits v.toNat 16) (scalarModulus 4)
+  let b2 := wrapScalarBits s2 (scalarModulus 1)
+  let s3 := wrapScalarBits (shiftRightUnsignedBits v.toNat 24) (scalarModulus 4)
+  let b3 := wrapScalarBits s3 (scalarModulus 1)
+  have hBorEq : ∀ k < 12, invalidateConflictingBorrows mBorrows k none 0 = mBorrows :=
+    fun k hk => invalidateConflictingBorrows_of_lt12 k hk hFlat
+  have hDisEq : ∀ k < 12, disableLocalBorrows mBorrows k 0 = mBorrows :=
+    fun k hk => disableLocalBorrows_of_lt12 k hk hFlat
+  have hs0 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 0 m .uninit .dead .dead .dead .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 1
+      { m with borrows := disableLocalBorrows mBorrows 3 0 }
+      .uninit .uninit .dead .dead .dead .dead .dead .dead) = _
+    rw [hDisEq 3 (by decide)]
+  have hs1 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 2 m .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 2
+      { m with borrows := invalidateConflictingBorrows mBorrows 3 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) = _
+    rw [hBorEq 3 (by decide)]
+  have hs2 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 2 m .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 3 m .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 3
+      { m with borrows := disableLocalBorrows mBorrows 4 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) = _
+    rw [hDisEq 4 (by decide)]
+  have hs3 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 3 m .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 4 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        .dead .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 4
+      { m with borrows := invalidateConflictingBorrows mBorrows 4 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      .dead .dead .dead .dead .dead) = _
+    rw [hBorEq 4 (by decide)]
+  have hs4 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 4 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        .dead .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 5 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        .uninit .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 5
+      { m with borrows := disableLocalBorrows mBorrows 5 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      .uninit .dead .dead .dead .dead) = _
+    rw [hDisEq 5 (by decide)]
+  have hs5 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 5 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        .uninit .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 6 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 6
+      { m with borrows := invalidateConflictingBorrows mBorrows 5 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) = _
+    rw [hBorEq 5 (by decide)]
+  have hs6 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 6 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 7 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 7
+      { m with borrows := disableLocalBorrows mBorrows 6 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) = _
+    rw [hDisEq 6 (by decide)]
+  have hs7 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 7 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 8 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 8
+      { m with borrows := invalidateConflictingBorrows mBorrows 6 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) = _
+    rw [hBorEq 6 (by decide)]
+  have hs8 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 8 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) =
+      .cont (writeU32St10 fatVal v 9 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 9
+      { m with borrows := disableLocalBorrows mBorrows 7 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) = _
+    rw [hDisEq 7 (by decide)]
+  have hs9 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 9 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) =
+      .cont (writeU32St10 fatVal v 10 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) .dead .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 10
+      { m with borrows := invalidateConflictingBorrows mBorrows 7 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+      (.init (.scalar ⟨b2, 1⟩)) .dead .dead) = _
+    rw [hBorEq 7 (by decide)]
+  have hs10 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 10 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) .dead .dead) =
+      .cont (writeU32St10 fatVal v 11 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 11
+      { m with borrows := disableLocalBorrows mBorrows 8 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+      (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) = _
+    rw [hDisEq 8 (by decide)]
+  have hs11 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 11 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) =
+      .cont (writeU32St10 fatVal v 12 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 12
+      { m with borrows := invalidateConflictingBorrows mBorrows 8 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+      (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) = _
+    rw [hBorEq 8 (by decide)]
+  have hs12 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 12 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) =
+      .cont (writeU32St10 fatVal v 13 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 13
+      { m with borrows := disableLocalBorrows mBorrows 9 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+      (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) = _
+    rw [hDisEq 9 (by decide)]
+  have hs13 : Anneal.PureMirExec.mirStep writeU32SliceBody
+      (writeU32St10 fatVal v 13 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) =
+      .cont (writeU32St10 fatVal v 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+        (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) := by
+    change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 14
+      { m with borrows := invalidateConflictingBorrows mBorrows 9 none 0 }
+      .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+      (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
+      (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) = _
+    rw [hBorEq 9 (by decide)]
+  have hInitEq :
+      Trusted.VerificationResult.initMachineStateWithMemoryAndCallees writeU32SliceBody
+        [fatVal, .scalar ⟨v.toNat, 4⟩] m [] =
+      writeU32St10 fatVal v 0 m .uninit .dead .dead .dead .dead .dead .dead .dead := rfl
+  rw [hInitEq]
+  exact
+    StepStageCut.step (mirDetStep_step_iff.mpr hs0) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs1) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs2) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs3) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs4) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs5) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs6) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs7) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs8) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs9) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs10) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs11) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs12) <|
+    StepStageCut.step (mirDetStep_step_iff.mpr hs13) <|
+    StepStageCut.refl _ 0 _
+
 /-- **Sealed `@[irreducible] MutSummaryOutcomeCut` for real `writeU32SliceBody`**:
 Proved once, universally for ALL `L : ByteSubLens SliceCallAddr`, ALL raw
 `m : Memory`, and ALL symbolic `arg : SliceCalleeArg` directly over unmodified
@@ -3303,177 +3696,28 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
       let b2 := wrapScalarBits s2 (scalarModulus 1)
       let s3 := wrapScalarBits (shiftRightUnsignedBits v.toNat 24) (scalarModulus 4)
       let b3 := wrapScalarBits s3 (scalarModulus 1)
-      let mkSt10 (stmt : Nat) (mem : Memory)
-          (l0 l3 l4 l5 l6 l7 l8 l9 : LocalSlot) : MachineState :=
-        { frame := { blockIdx := 0, stmtIdx := stmt,
-                     locals := [l0, .init fatVal, .init (.scalar ⟨v.toNat, 4⟩),
-                                l3, l4, l5, l6, l7, l8, l9] }
-          memory := mem }
       have hEntryEq : writeU32Entry L m (.u32Arg v) =
-          mkSt10 0 m .uninit .dead .dead .dead .dead .dead .dead .dead := by
-        unfold writeU32Entry Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+          Trusted.VerificationResult.initMachineStateWithMemoryAndCallees writeU32SliceBody
+            [fatVal, .scalar ⟨v.toNat, 4⟩] m [] := by
+        unfold writeU32Entry
         dsimp only [m]
-        rw [hFindE, hL4]; rfl
+        rw [hFindE, hL4]
       rw [hEntryEq]
       have hBorEq : ∀ k < 12, invalidateConflictingBorrows mBorrows k none 0 = mBorrows :=
         fun k hk => invalidateConflictingBorrows_of_lt12 k hk hFlat
-      have hDisEq : ∀ k < 12, disableLocalBorrows mBorrows k 0 = mBorrows :=
-        fun k hk => disableLocalBorrows_of_lt12 k hk hFlat
-      -- Step 0..13: real MIR arithmetic (`shr`, `cast intToInt` to `u8`)
-      have hs0 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 0 m .uninit .dead .dead .dead .dead .dead .dead .dead) =
-          .cont (mkSt10 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 1
-          { m with borrows := disableLocalBorrows mBorrows 3 0 }
-          .uninit .uninit .dead .dead .dead .dead .dead .dead) = _
-        rw [hDisEq 3 (by decide)]
-      have hs1 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 1 m .uninit .uninit .dead .dead .dead .dead .dead .dead) =
-          .cont (mkSt10 2 m .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 2
-          { m with borrows := invalidateConflictingBorrows mBorrows 3 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) = _
-        rw [hBorEq 3 (by decide)]
-      have hs2 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 2 m .uninit (.init (.scalar ⟨b0, 1⟩)) .dead .dead .dead .dead .dead .dead) =
-          .cont (mkSt10 3 m .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 3
-          { m with borrows := disableLocalBorrows mBorrows 4 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) = _
-        rw [hDisEq 4 (by decide)]
-      have hs3 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 3 m .uninit (.init (.scalar ⟨b0, 1⟩)) .uninit .dead .dead .dead .dead .dead) =
-          .cont (mkSt10 4 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            .dead .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 4
-          { m with borrows := invalidateConflictingBorrows mBorrows 4 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          .dead .dead .dead .dead .dead) = _
-        rw [hBorEq 4 (by decide)]
-      have hs4 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 4 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            .dead .dead .dead .dead .dead) =
-          .cont (mkSt10 5 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            .uninit .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 5
-          { m with borrows := disableLocalBorrows mBorrows 5 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          .uninit .dead .dead .dead .dead) = _
-        rw [hDisEq 5 (by decide)]
-      have hs5 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 5 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            .uninit .dead .dead .dead .dead) =
-          .cont (mkSt10 6 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 6
-          { m with borrows := invalidateConflictingBorrows mBorrows 5 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) = _
-        rw [hBorEq 5 (by decide)]
-      have hs6 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 6 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) .dead .dead .dead .dead) =
-          .cont (mkSt10 7 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 7
-          { m with borrows := disableLocalBorrows mBorrows 6 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) = _
-        rw [hDisEq 6 (by decide)]
-      have hs7 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 7 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) .uninit .dead .dead .dead) =
-          .cont (mkSt10 8 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 8
-          { m with borrows := invalidateConflictingBorrows mBorrows 6 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) = _
-        rw [hBorEq 6 (by decide)]
-      have hs8 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 8 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .dead .dead .dead) =
-          .cont (mkSt10 9 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 9
-          { m with borrows := disableLocalBorrows mBorrows 7 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) = _
-        rw [hDisEq 7 (by decide)]
-      have hs9 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 9 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩)) .uninit .dead .dead) =
-          .cont (mkSt10 10 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) .dead .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 10
-          { m with borrows := invalidateConflictingBorrows mBorrows 7 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-          (.init (.scalar ⟨b2, 1⟩)) .dead .dead) = _
-        rw [hBorEq 7 (by decide)]
-      have hs10 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 10 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) .dead .dead) =
-          .cont (mkSt10 11 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 11
-          { m with borrows := disableLocalBorrows mBorrows 8 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-          (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) = _
-        rw [hDisEq 8 (by decide)]
-      have hs11 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 11 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) .uninit .dead) =
-          .cont (mkSt10 12 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 12
-          { m with borrows := invalidateConflictingBorrows mBorrows 8 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-          (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) = _
-        rw [hBorEq 8 (by decide)]
-      have hs12 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 12 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .dead) =
-          .cont (mkSt10 13 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 13
-          { m with borrows := disableLocalBorrows mBorrows 9 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-          (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) = _
-        rw [hDisEq 9 (by decide)]
-      have hs13 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 13 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) .uninit) =
-          .cont (mkSt10 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-            (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-            (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 14
-          { m with borrows := invalidateConflictingBorrows mBorrows 9 none 0 }
-          .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
-          (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
-          (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) = _
-        rw [hBorEq 9 (by decide)]
+      have hPrefix :=
+        (writeU32Slice_entry_to_stmt14 fatVal v m rfl rfl rfl rfl hFlat).to_wpReach
+          (tag := fun ms => some ms.frame.blockIdx)
       -- Step 14: live `&mut [u8]` slice write into `m.callerLocals` → `{ m with callerLocals := cl' }`!
       have hs14 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+          (writeU32St10 fatVal v 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
             (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
             (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) =
-          .cont (mkSt10 15 { m with callerLocals := cl' }
+          .cont (writeU32St10 fatVal v 15 { m with callerLocals := cl' }
             .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
             (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
             (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) := by
-        let locs14 := (mkSt10 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+        let locs14 := (writeU32St10 fatVal v 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
           (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
           (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))).frame.locals
         have hArrEq : [Value.scalar ⟨b0, 1⟩, Value.scalar ⟨b1, 1⟩,
@@ -3491,10 +3735,10 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
           (by rw [hLocE]; exact hGetSlot) hSlotBytes (by omega)
           (by rw [hEncLen, ← hL4]; exact hBound) (by rw [hLocE]; exact hSetCl)
         have hStep14 : stepMirFn writeU32SliceBody
-            (mkSt10 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
+            (writeU32St10 fatVal v 14 m .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
               (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
               (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) =
-            MirStepNode.step (mkSt10 15 { m with callerLocals := cl' }
+            MirStepNode.step (writeU32St10 fatVal v 15 { m with callerLocals := cl' }
               .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
               (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
               (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) := by
@@ -3515,7 +3759,7 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
                   match derefWriteTreeUB locs14 m.borrows (pl 1 [.deref]) with
                   | true => MirStepNode.fail .ub
                   | false =>
-                    MirStepNode.step (mkSt10 15
+                    MirStepNode.step (writeU32St10 fatVal v 15
                       { m with callerLocals := callerLocals',
                                borrows := invalidateDerefWriteBorrows locs14 m.borrows (pl 1 [.deref])
                                  [] m.callerLocals }
@@ -3535,15 +3779,15 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
         rw [hStep14]; rfl
       -- Step 15: `_0 = _2`, Step 16: `.return_` → `.normal (.scalar ⟨v.toNat, 4⟩, { m with callerLocals := cl' })`
       have hs15 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 15 { m with callerLocals := cl' }
+          (writeU32St10 fatVal v 15 { m with callerLocals := cl' }
             .uninit (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
             (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
             (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) =
-          .cont (mkSt10 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
+          .cont (writeU32St10 fatVal v 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
             (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
             (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
             (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) := by
-        change Anneal.PureMirExec.Step.cont (mkSt10 16
+        change Anneal.PureMirExec.Step.cont (writeU32St10 fatVal v 16
           { m with callerLocals := cl', borrows := invalidateConflictingBorrows mBorrows 0 none 0 }
           (.init (.scalar ⟨v.toNat, 4⟩))
           (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
@@ -3551,36 +3795,35 @@ theorem writeU32Slice_mutSummaryOutcomeCut :
           (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) = _
         rw [hBorEq 0 (by decide)]
       have hs16 : Anneal.PureMirExec.mirStep writeU32SliceBody
-          (mkSt10 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
+          (writeU32St10 fatVal v 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
             (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
             (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
             (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) =
           .done (.normal (.scalar ⟨v.toNat, 4⟩, { m with callerLocals := cl' })) := by
         have hStep16 : stepMirFn writeU32SliceBody
-            (mkSt10 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
+            (writeU32St10 fatVal v 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
               (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
               (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
               (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩))) =
             MirStepNode.retNormal (Value.scalar ⟨v.toNat, 4⟩) { m with callerLocals := cl' } := by
           change evalTerminator
-            (mkSt10 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
+            (writeU32St10 fatVal v 16 { m with callerLocals := cl' } (.init (.scalar ⟨v.toNat, 4⟩))
               (.init (.scalar ⟨b0, 1⟩)) (.init (.scalar ⟨s1, 4⟩))
               (.init (.scalar ⟨b1, 1⟩)) (.init (.scalar ⟨s2, 4⟩))
               (.init (.scalar ⟨b2, 1⟩)) (.init (.scalar ⟨s3, 4⟩)) (.init (.scalar ⟨b3, 1⟩)))
             (mkBb [] .return_).terminator (some writeU32SliceBody) = _
           unfold evalTerminator Trusted.Sequence.length
-          simp only [mkBb, mkSt10, m, Trusted.Sequence.get?, List.getElem?_cons_zero,
+          simp only [mkBb, writeU32St10, m, Trusted.Sequence.get?, List.getElem?_cons_zero,
             List.length_nil, List.length_cons, hasFrameDeallocProtectorConflict,
             disableFrameBorrows_of_le12 10 (by decide) hFlat]
         unfold Anneal.PureMirExec.mirStep
         rw [hStep16]; rfl
+      refine wpUntil_bind (ops := mirDetWpOps writeU32SliceBody)
+        (wpUntil_mono (ops := mirDetWpOps writeU32SliceBody)
+          (fun _ h => h) (fun _ hF => False.elim hF) (fun _ h => h) hPrefix) fun s14 hS14 => ?_
+      subst hS14
       exact
-        step_det_to _ hs0 <| step_det_to _ hs1 <| step_det_to _ hs2 <|
-        step_det_to _ hs3 <| step_det_to _ hs4 <| step_det_to _ hs5 <|
-        step_det_to _ hs6 <| step_det_to _ hs7 <| step_det_to _ hs8 <|
-        step_det_to _ hs9 <| step_det_to _ hs10 <| step_det_to _ hs11 <|
-        step_det_to _ hs12 <| step_det_to _ hs13 <| step_det_to _ hs14 <|
-        step_det_to _ hs15 <|
+        step_det_to _ hs14 <| step_det_to _ hs15 <|
         step_det_done (.normal (.scalar ⟨v.toNat, 4⟩, { m with callerLocals := cl' })) hs16
           (by dsimp [mirNormalOutcomeExtract]; rw [ofU32Value_u32]; rfl)
 
@@ -4357,47 +4600,136 @@ theorem canary3b_sliceCall_aligned_and_failClosed
     AlignedSubLens.set_none_of_unaligned calleeMisalignedU32 _ rfl,
     hOobGet, hOobSet, hFrozenGet, hFrozenSet⟩
 
-/-- **Live Tree Borrows UB Non-Vacuity on Unmodified `V2026_06_01.MirSemantics`**:
-When `writeU32SliceBody` executes statement 14 (`(*_1) = [b0, b1, b2, b3]`)
-through frozen borrow `tag 4` targeting the live initialized 4-byte buffer in
-`callerLocals[13]`, unmodified `PureMirExec.mirStep` genuinely faults (`.fault`, UB)
-strictly because `tag 4` has `perm = .frozen`! -/
-theorem canary3b_frozenBorrow_derefWrite_ub :
-    let m0 := mkCanaryCalleeMem 1 false 2 3
-    let st14 : MachineState :=
-      { frame :=
-          { blockIdx := 0, stmtIdx := 14,
-            locals :=
-              [.uninit,
-               .init (.aggregate 0 [.ptr ⟨4, 0⟩ 8, .scalar ⟨4, 8⟩]),
-               .init (.scalar ⟨42, 4⟩),
-               .init (.scalar ⟨42, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩)] }
-        memory := m0 }
-    Anneal.PureMirExec.mirStep writeU32SliceBody st14 = .fault := rfl
+private theorem mkCanaryCalleeMem_borrows_flat
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal : UInt32) :
+    ∀ e ∈ (mkCanaryCalleeMem initHdr initFlag initVal siblingVal).borrows,
+      borrowFlatRoot e = true := by
+  intro e hMem
+  simp only [mkCanaryCalleeMem, List.mem_cons, List.not_mem_nil, or_false] at hMem
+  rcases hMem with rfl | rfl | rfl | rfl <;> rfl
 
-/-- **Live Out-of-Bounds Slice UB Non-Vacuity on Unmodified `V2026_06_01.MirSemantics`**:
-When `writeU32SliceBody` executes statement 14 (`(*_1) = [b0, b1, b2, b3]`)
-through `.unique` borrow `tag 3` at an out-of-bounds offset (`offset = 14, len = 4`
-on the 16-byte buffer in `callerLocals[12]`), unmodified `PureMirExec.mirStep`
-genuinely faults (`.fault`, UB) inside `writeSliceFatPtrTargetValue`! -/
-theorem canary3b_oobSlice_derefWrite_ub :
-    let m0 := mkCanaryCalleeMem 1 false 2 3
-    let st14 : MachineState :=
-      { frame :=
-          { blockIdx := 0, stmtIdx := 14,
-            locals :=
-              [.uninit,
-               .init (.aggregate 0 [.ptr ⟨3, 14⟩ 8, .scalar ⟨4, 8⟩]),
-               .init (.scalar ⟨42, 4⟩),
-               .init (.scalar ⟨42, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
-               .init (.scalar ⟨0, 1⟩)] }
-        memory := m0 }
-    Anneal.PureMirExec.mirStep writeU32SliceBody st14 = .fault := rfl
+/-- **Symbolic Entry-to-UB Live Tree Borrows Non-Vacuity on Unmodified
+`V2026_06_01.MirSemantics`**:
+Starting from real `initMachineStateWithMemoryAndCallees writeU32SliceBody` with
+frozen borrow `tag 4` targeting the live initialized 4-byte buffer in
+`callerLocals[13]`, for ALL symbolic `(initHdr, initFlag, initVal, siblingVal, newVal)`:
+1. Real MIR execution steps 14 times (`StepStageCut`) to statement 14 (`(*_1) = [b0..b3]`).
+2. At statement 14, unmodified `stepMirFn writeU32SliceBody` emits `MirStepNode.fail .ub`
+   strictly because `tag 4` has `perm = .frozen`.
+3. Consequently, `MirWpConverges writeU32SliceBody st0 post` AND
+   `wpStateOk (ops := mirDetWpOps writeU32SliceBody) post st0` are uninhabited for
+   EVERY `post` (via `V2026Bridge.not_mirWpConverges_of_stepStageCut_fault`). -/
+theorem canary3b_frozenBorrow_derefWrite_ub
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal newVal : UInt32) :
+    let m0 := mkCanaryCalleeMem initHdr initFlag initVal siblingVal
+    let fatFrozen : Value := .aggregate 0 [.ptr ⟨4, 0⟩ 8, .scalar ⟨4, 8⟩]
+    let st0 := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees writeU32SliceBody
+      [fatFrozen, .scalar ⟨newVal.toNat, 4⟩] m0 []
+    (∃ st14,
+      StepStageCut (mirDetStep writeU32SliceBody) 14 st0 st14 ∧
+      stepMirFn writeU32SliceBody st14 = MirStepNode.fail .ub) ∧
+    (∀ post, ¬ MirWpConverges writeU32SliceBody st0 post) ∧
+    (∀ post, ¬ wpStateOk (ops := mirDetWpOps writeU32SliceBody) post st0) := by
+  intro m0 fatFrozen st0
+  have hCut14 :
+      StepStageCut (mirDetStep writeU32SliceBody) 14 st0
+        (writeU32Stmt14State fatFrozen newVal m0) :=
+    writeU32Slice_entry_to_stmt14 fatFrozen newVal m0 rfl rfl rfl rfl
+      (mkCanaryCalleeMem_borrows_flat initHdr initFlag initVal siblingVal)
+  have hFail14 :
+      stepMirFn writeU32SliceBody (writeU32Stmt14State fatFrozen newVal m0) =
+        MirStepNode.fail .ub := rfl
+  have hMirFault :
+      Anneal.PureMirExec.mirStep writeU32SliceBody (writeU32Stmt14State fatFrozen newVal m0) =
+        .fault := by
+    unfold Anneal.PureMirExec.mirStep
+    rw [hFail14]; rfl
+  exact ⟨⟨writeU32Stmt14State fatFrozen newVal m0, hCut14, hFail14⟩,
+    fun post => not_mirWpConverges_of_stepStageCut_fault hCut14 hFail14 post,
+    fun post => not_wpStateOk_of_stepStageCut_fault hCut14 hMirFault post⟩
+
+/-- **Symbolic Entry-to-UB Live Out-of-Bounds Slice Non-Vacuity on Unmodified
+`V2026_06_01.MirSemantics`**:
+Starting from real `initMachineStateWithMemoryAndCallees writeU32SliceBody` with
+`.unique` borrow `tag 3` at an out-of-bounds offset (`offset = 14, len = 4` on
+the 16-byte buffer in `callerLocals[12]`), for ALL symbolic
+`(initHdr, initFlag, initVal, siblingVal, newVal)`:
+1. Real MIR execution steps 14 times (`StepStageCut`) to statement 14 (`(*_1) = [b0..b3]`).
+2. At statement 14, unmodified `stepMirFn writeU32SliceBody` emits `MirStepNode.fail .ub`
+   inside `writeSliceFatPtrTargetValue` (bounds check `14 + 4 ≤ 16` fails).
+3. Consequently, `MirWpConverges writeU32SliceBody st0 post` AND
+   `wpStateOk (ops := mirDetWpOps writeU32SliceBody) post st0` are uninhabited for
+   EVERY `post`. -/
+theorem canary3b_oobSlice_derefWrite_ub
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal newVal : UInt32) :
+    let m0 := mkCanaryCalleeMem initHdr initFlag initVal siblingVal
+    let fatOob : Value := .aggregate 0 [.ptr ⟨3, 14⟩ 8, .scalar ⟨4, 8⟩]
+    let st0 := Trusted.VerificationResult.initMachineStateWithMemoryAndCallees writeU32SliceBody
+      [fatOob, .scalar ⟨newVal.toNat, 4⟩] m0 []
+    (∃ st14,
+      StepStageCut (mirDetStep writeU32SliceBody) 14 st0 st14 ∧
+      stepMirFn writeU32SliceBody st14 = MirStepNode.fail .ub) ∧
+    (∀ post, ¬ MirWpConverges writeU32SliceBody st0 post) ∧
+    (∀ post, ¬ wpStateOk (ops := mirDetWpOps writeU32SliceBody) post st0) := by
+  intro m0 fatOob st0
+  have hCut14 :
+      StepStageCut (mirDetStep writeU32SliceBody) 14 st0
+        (writeU32Stmt14State fatOob newVal m0) :=
+    writeU32Slice_entry_to_stmt14 fatOob newVal m0 rfl rfl rfl rfl
+      (mkCanaryCalleeMem_borrows_flat initHdr initFlag initVal siblingVal)
+  have hFail14 :
+      stepMirFn writeU32SliceBody (writeU32Stmt14State fatOob newVal m0) =
+        MirStepNode.fail .ub := by
+    let buf16 : List UInt8 :=
+      rawU32Codec.enc initHdr ++ rawPaddedPairCodec.enc (initFlag, initVal) ++
+        rawU32Codec.enc siblingVal
+    have hL1 := rawU32Codec.enc_length initHdr
+    have hL2 := rawPaddedPairCodec.enc_length (initFlag, initVal)
+    have hL3 := rawU32Codec.enc_length siblingVal
+    have hBufLen : buf16.length = 16 := by simp [buf16, hL1, hL2, hL3]
+    cases hCons : buf16 with
+    | nil => rw [hCons] at hBufLen; cases hBufLen
+    | cons b0 rest =>
+      rw [hCons] at hBufLen
+      let st14 := writeU32Stmt14State fatOob newVal m0
+      let newElems : List Value :=
+        [Value.scalar ⟨wrapScalarBits newVal.toNat (scalarModulus 1), 1⟩,
+         Value.scalar ⟨wrapScalarBits (wrapScalarBits (shiftRightUnsignedBits newVal.toNat 8) (scalarModulus 4)) (scalarModulus 1), 1⟩,
+         Value.scalar ⟨wrapScalarBits (wrapScalarBits (shiftRightUnsignedBits newVal.toNat 16) (scalarModulus 4)) (scalarModulus 1), 1⟩,
+         Value.scalar ⟨wrapScalarBits (wrapScalarBits (shiftRightUnsignedBits newVal.toNat 24) (scalarModulus 4)) (scalarModulus 1), 1⟩]
+      have hNewLen : newElems.length = 4 := rfl
+      have hOobWrite :
+          writeSliceFatPtrTargetValue st14.frame.locals
+            (.aggregate 0 (u8BytesToValues (b0 :: rest))) []
+            ⟨3, 14⟩ 8 ⟨4, 8⟩ [] (.aggregate 0 newElems) = .ub :=
+        writeSliceFatPtr_u8_oob st14.frame.locals b0 rest newElems 3 14 (by omega)
+      change (match writeSliceFatPtrTargetValue st14.frame.locals
+          (.aggregate 0 (u8BytesToValues buf16)) []
+          ⟨3, 14⟩ 8 ⟨4, 8⟩ [] (.aggregate 0 newElems) with
+        | .ok updated =>
+          match Trusted.Sequence.set? m0.callerLocals 12 (.init updated) with
+          | some cl' =>
+            match derefWriteTreeUB st14.frame.locals m0.borrows (pl 1 [.deref]) with
+            | true => MirStepNode.fail .ub
+            | false =>
+              MirStepNode.step { st14 with
+                frame := { st14.frame with stmtIdx := 15 }
+                memory := { m0 with
+                  callerLocals := cl'
+                  borrows := invalidateDerefWriteBorrows st14.frame.locals m0.borrows
+                    (pl 1 [.deref]) [] m0.callerLocals } }
+          | none => MirStepNode.fail .ub
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported) = MirStepNode.fail .ub
+      rw [hCons, hOobWrite]
+  have hMirFault :
+      Anneal.PureMirExec.mirStep writeU32SliceBody (writeU32Stmt14State fatOob newVal m0) =
+        .fault := by
+    unfold Anneal.PureMirExec.mirStep
+    rw [hFail14]; rfl
+  exact ⟨⟨writeU32Stmt14State fatOob newVal m0, hCut14, hFail14⟩,
+    fun post => not_mirWpConverges_of_stepStageCut_fault hCut14 hFail14 post,
+    fun post => not_wpStateOk_of_stepStageCut_fault hCut14 hMirFault post⟩
 
 /-- Raw caller-frame framing for any summary executed through
 `sliceCallByteStoreOps`: every caller-local slot other than the lens target is
@@ -4421,10 +4753,46 @@ private theorem sliceCall_execMutSummary_other_local {Arg Ret : Type}
     · cases hSet
     · exact memCaller_writeBytes_listGet?_ne hSet hj
 
+/-- Raw intra-local AND inter-local byte-range framing for any summary executed
+through `sliceCallByteStoreOps`: every disjoint `ByteSubLens CallerLocalAddr` on
+raw `memCallerByteStoreOps` — including unborrowed or frozen-borrowed byte
+windows inside the SAME caller local `L.addr.localIdx` — is bit-for-bit
+unchanged. -/
+private theorem sliceCall_execMutSummary_raw_disjoint {Arg Ret : Type}
+    {sum : MutSummary UInt8 Arg Ret} {L : ByteSubLens SliceCallAddr} {m m' : Memory}
+    {arg : Arg} {ret : Ret} (h : execMutSummary sum L m arg = some (m', ret))
+    {other : ByteSubLens CallerLocalAddr}
+    (hDisj : ByteSubLens.Disjoint Memory ⟨⟨L.addr.localIdx⟩, L.offset, L.len⟩ other) :
+    other.get (ops := memCallerByteStoreOps) m' = other.get (ops := memCallerByteStoreOps) m := by
+  rcases execMutSummary_inv h with ⟨_, _, new, _, _, hSet⟩
+  unfold ByteSubLens.set at hSet
+  split at hSet
+  · cases hSet
+  · rename_i hTrue
+    change (match sliceCallAbiReady m L.addr L.offset new.length with
+      | false => none
+      | true => memCallerByteStoreOps.writeBytes? m ⟨L.addr.localIdx⟩ L.offset new) =
+      some m' at hSet
+    split at hSet
+    · cases hSet
+    · have hRawSet :
+          (⟨⟨L.addr.localIdx⟩, L.offset, L.len⟩ : ByteSubLens CallerLocalAddr).set
+            (ops := memCallerByteStoreOps) m new = some m' := by
+        unfold ByteSubLens.set
+        split
+        · rename_i hFalse
+          change (Nat.blt 0 L.len && new.length.beq L.len) = false at hFalse
+          rw [hTrue] at hFalse
+          cases hFalse
+        · exact hSet
+      exact ByteSubLens.get_set_disjoint (ops := memCallerByteStoreOps) hDisj hRawSet
+
 /-- **Trusted `StatefulClaim` for real mutating callee `writeU32SliceBody`**,
 requiring a live covering `.unique` borrow on any valid `ByteSubLens SliceCallAddr`
-and guaranteeing exact return value, exact mutated `u32` bytes, and universal
-disjoint-lens framing of all other caller-frame slices. -/
+and guaranteeing exact return value, exact mutated `u32` bytes, raw intra-local
+and inter-local byte-range framing (covering even unborrowed or frozen bytes
+inside `L.addr.localIdx`), whole-slot framing of all other caller locals, and
+ABI-ready disjoint-lens framing. -/
 def writeU32SliceStatefulClaim : StatefulClaim where
   body := writeU32SliceBody
   callees := []
@@ -4441,6 +4809,10 @@ def writeU32SliceStatefulClaim : StatefulClaim where
       findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
       ret = .scalar ⟨newVal.toNat, 4⟩ ∧
       L.getVal rawU32Codec mem' = some newVal ∧
+      (∀ other : ByteSubLens CallerLocalAddr,
+        ByteSubLens.Disjoint Memory ⟨⟨L.addr.localIdx⟩, L.offset, L.len⟩ other →
+        other.get (ops := memCallerByteStoreOps) mem' =
+          other.get (ops := memCallerByteStoreOps) mem) ∧
       (∀ j, j ≠ L.addr.localIdx → listGet? mem'.callerLocals j = listGet? mem.callerLocals j) ∧
       (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
         other.get mem' = other.get mem) ∧
@@ -4496,6 +4868,7 @@ theorem canary3b_writeU32Slice_statefulVerificationResult :
   · unfold writeU32Entry; rw [hFind]; rfl
   · intro rv hOfVal hFrame
     exact ⟨L, e, newVal, rfl, hFind, ofU32Value_inv hOfVal, hPostVal,
+      fun _ hDisj => sliceCall_execMutSummary_raw_disjoint hExec hDisj,
       fun _ hj => sliceCall_execMutSummary_other_local hExec hj, hFrame,
       execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
       execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
@@ -4513,7 +4886,9 @@ theorem canary3b_writeU32SliceStatefulClaim_pre_satisfiable
       rangeOffset := 0, rangeLen := 4, targetFrameDepth := 0 },
     initHdr, newVal, rfl, mkCanaryCalleeMem_hdr_getVal initHdr initFlag initVal siblingVal, rfl⟩
 
-/-- **Trusted `StatefulClaim` for real mutating callee `writePaddedPairSliceBody`**. -/
+/-- **Trusted `StatefulClaim` for real mutating callee `writePaddedPairSliceBody`**,
+with full raw intra-local and inter-local byte framing plus whole-slot and
+ABI-ready disjoint-lens framing. -/
 def writePaddedPairSliceStatefulClaim : StatefulClaim where
   body := writePaddedPairSliceBody
   callees := []
@@ -4531,6 +4906,10 @@ def writePaddedPairSliceStatefulClaim : StatefulClaim where
       findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
       ret = .scalar ⟨newVal.toNat, 4⟩ ∧
       L.getVal rawPaddedPairCodec mem' = some (newFlag, newVal) ∧
+      (∀ other : ByteSubLens CallerLocalAddr,
+        ByteSubLens.Disjoint Memory ⟨⟨L.addr.localIdx⟩, L.offset, L.len⟩ other →
+        other.get (ops := memCallerByteStoreOps) mem' =
+          other.get (ops := memCallerByteStoreOps) mem) ∧
       (∀ j, j ≠ L.addr.localIdx → listGet? mem'.callerLocals j = listGet? mem.callerLocals j) ∧
       (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
         other.get mem' = other.get mem) ∧
@@ -4554,6 +4933,7 @@ theorem canary3b_writePaddedPairSlice_statefulVerificationResult :
   · unfold writePaddedPairEntry; rw [hFind]; rfl
   · intro rv hOfVal hFrame
     exact ⟨L, e, newFlag, newVal, rfl, hFind, ofU32Value_inv hOfVal, hPostVal,
+      fun _ hDisj => sliceCall_execMutSummary_raw_disjoint hExec hDisj,
       fun _ hj => sliceCall_execMutSummary_other_local hExec hj, hFrame,
       execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
       execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
@@ -4824,11 +5204,11 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_sliceCall_aligned_and_fa
 #guard_msgs in
 #print axioms canary3b_sliceCall_aligned_and_failClosed
 
-/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_frozenBorrow_derefWrite_ub' depends on axioms: [propext] -/
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_frozenBorrow_derefWrite_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms canary3b_frozenBorrow_derefWrite_ub
 
-/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_oobSlice_derefWrite_ub' depends on axioms: [propext] -/
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_oobSlice_derefWrite_ub' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms canary3b_oobSlice_derefWrite_ub
 
@@ -4863,5 +5243,20 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writePaddedPairSliceStat
 -/
 #guard_msgs in
 #print axioms canary3b_writePaddedPairSliceStatefulClaim_pre_satisfiable
+
+/-! ### Pass A2 guards: Canary 1B termination and Canary 2 full 2-stage
+`PureLift` soundness via `mir_pure_lift_sound_of_stepStageCut`. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1b_findTarget_totalVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1b_findTarget_totalVerificationResult
+
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_full_pureLift_sound' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms canary2_diamond_full_pureLift_sound
 
 end Anneal.ParametricLoopInvAndSubLensTests
