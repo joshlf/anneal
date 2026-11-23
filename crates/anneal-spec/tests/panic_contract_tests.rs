@@ -2812,6 +2812,247 @@ fn kani5095_disabled_cfg_inline_const_block_does_not_swallow_live_items() {
 }
 
 // ===========================================================================
+// 3e. `[adv ep2 A3]` Hardening: Disabled Control-Flow / Closure / Rooted-Macro
+//     Dead-Decoy Spoofs, Live Standalone Block Non-Swallowing, `#[r#unsafe]`
+//     Keyword-vs-Raw-Ident Classification & Fallible Typed Builders
+// ===========================================================================
+
+#[test]
+fn kani5095_disabled_cfg_statements_never_spoof_target_or_swallow_live_blocks() {
+    use InlineBoundaryVerdict::*;
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+    let wrap = |body: &str| {
+        format!("#[inline(never)] pub fn target() {{}}\nmod m {{ {body} }}\n")
+    };
+
+    // 1. Dead-decoy spoof prevention: every disabled Rust 2024 construct below
+    //    compiles out `target` completely, so without a live `target` it MUST
+    //    return `TargetFunctionNotFound` (never falsely `Verified`).
+    for dead_decoy in [
+        "#[cfg(any())] ::my_crate::make! { #[inline(never)] pub fn target() {} }",
+        "pub fn g() { #[cfg(any())] async move { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] 'a: { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] 'a: loop { #[inline(never)] fn target() {} break; } }",
+        "pub fn g() { #[cfg(any())] loop { #[inline(never)] fn target() {} break; } }",
+        "pub fn g() { #[cfg(any())] if true { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if true { } else if false { } else { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if { true } { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if unsafe { true } { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if let S { a: 1 } = s { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if let 0..=10 | S { a: 1 } = v { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] if if true { true } else { false } { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] while false { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] 'a: while let Some(_) = { None } { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] for _ in 0..1 { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] for S { a } in { items } { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] match 0 { _ => { #[inline(never)] fn target() {} } } }",
+        "pub fn g() { #[cfg(any())] match { 0 } { _ => { #[inline(never)] fn target() {} } } }",
+        "pub fn g() { #[cfg(any())] || { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] move || { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] async || { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] async move || { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] |x: u8| -> u8 { #[inline(never)] fn target() {} x }; }",
+        "pub fn g() { #[cfg(any())] || { #[inline(never)] fn target() {} } }",
+        "pub fn g() { #[cfg(any())] return { #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] ({ #[inline(never)] fn target() {} }); }",
+        "pub fn g() { #[cfg(any())] id({ #[inline(never)] fn target() {} }); }",
+    ] {
+        assert_eq!(v(dead_decoy), TargetFunctionNotFound, "{dead_decoy}");
+    }
+
+    // 2. Non-swallowing guarantee: a live un-annotated `fn target() {}` (both
+    //    direct and inside a following standalone `{ fn target() {} }` block)
+    //    MUST ALWAYS be caught (`MissingInlineNever`), even when immediately
+    //    preceded by any disabled statement with complex headers/patterns.
+    for live_after_disabled in [
+        "#[cfg(any())] ::my_crate::make! { } fn target() {}",
+        "fn g() { #[cfg(any())] async move { }; fn target() {} }",
+        "fn g() { #[cfg(any())] 'a: { } fn target() {} }",
+        "fn g() { #[cfg(any())] 'a: loop { break; } { fn target() {} } }",
+        "fn g() { #[cfg(any())] loop { break; } fn target() {} }",
+        "fn g() { #[cfg(any())] if true { } fn target() {} }",
+        "fn g() { #[cfg(any())] if true { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if true { } else { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if { true } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if true && { true } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if let Some(_) = { Some(1) } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if let S { a: 1 } = s { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if let 0..=10 | S { a: 1 } = v { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if t! { } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] if if true { true } else { false } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] while false { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] 'a: while false { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] for _ in 0.. { break; } { fn target() {} } }",
+        "fn g() { #[cfg(any())] for S { a } in { items } { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] match 0 { _ => {} } { fn target() {} } }",
+        "fn g() { #[cfg(any())] match { 0 } { _ => {} } { fn target() {} } }",
+        "fn g() { #[cfg(any())] match PhantomData::<u8> { _ => {} } { fn target() {} } }",
+        "fn g() { #[cfg(any())] move || { }; fn target() {} }",
+        "fn g() { #[cfg(any())] |x: u8| -> u8 { x }; fn target() {} }",
+        "fn g() { #[cfg(any())] return { () }; fn target() {} }",
+        "fn g() { #[cfg(any())] ({ 1 }); fn target() {} }",
+        "fn g() { #[cfg(any())] id({ 1 }); fn target() {} }",
+    ] {
+        assert_eq!(v(&wrap(live_after_disabled)), MissingInlineNever, "{live_after_disabled}");
+    }
+
+    // 3. `#[r#unsafe(no_mangle)]` is a raw-ident attribute macro in Rust 2024,
+    //    NOT the built-in `#[unsafe(...)]` keyword wrapper!
+    let no_macros = InlineScanOptions::strict().with_forbid_unknown_attributes(true);
+    assert_eq!(
+        verify_fn_inline_never_source_with_options(
+            "#[r#unsafe(no_mangle)]\n#[inline(never)] fn target() {}",
+            "target",
+            no_macros
+        ),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        verify_fn_inline_never_source_with_options(
+            "#[unsafe(no_mangle)]\n#[inline(never)] fn target() {}",
+            "target",
+            no_macros
+        ),
+        Verified
+    );
+}
+
+#[test]
+fn fallible_typed_builders_and_guard_mutants_fallible_parity() {
+    let cfg = PanicCheckConfig::default().with_max_trials(128);
+
+    let mutants = [
+        panic_guard_mutant_unwind!("dropped_guard", |&(a, b): &(u8, u8)| a.wrapping_add(b)),
+        panic_guard_mutant_unwind!("wrong_ret", |&(a, b): &(u8, u8)| {
+            checked_add_u8(a, b).wrapping_sub(1)
+        }),
+    ];
+    let exact_res = ExactPanicContract::new(
+        |&(_a, _b): &(u8, u8)| Ok(true),
+        |&(a, b): &(u8, u8)| Ok((a as u16) + (b as u16) > 255),
+        |&(a, b): &(u8, u8), &out: &u8| Ok(out == a + b),
+    )
+    .check_guard_mutants_fallible(
+        cfg,
+        panic_unwind_runner!(|&(a, b): &(u8, u8)| checked_add_u8(a, b)),
+        &mutants,
+    );
+    assert_eq!(exact_res.into_result().unwrap().guard_mutants_killed, 2);
+
+    let only_if_mutant = [panic_guard_mutant_unwind!("wrong_ret", |&x: &u8| x.wrapping_add(1))];
+    assert!(
+        PanicsOnlyIf::new(
+            |&x: &u8| Ok(x < 100),
+            |&x: &u8| Ok(x >= 80),
+            |&x: &u8, &r: &u8| Ok(r == x),
+        )
+        .check_guard_mutants_fallible(
+            cfg,
+            |&x: &u8| PanicExecOutcome::Returned(x),
+            &only_if_mutant,
+        )
+        .is_strong()
+    );
+
+    let if_mutant = [panic_guard_mutant_unwind!("no_panic", |&x: &u8| x)];
+    assert!(
+        PanicsIf::new(|&x: &u8| Ok(x < 100), |&x: &u8| Ok(x >= 50))
+            .check_guard_mutants_fallible(
+                cfg,
+                |&x: &u8| {
+                    if x >= 50 {
+                        PanicExecOutcome::Panicked
+                    } else {
+                        PanicExecOutcome::Returned(x)
+                    }
+                },
+                &if_mutant,
+            )
+            .is_strong()
+    );
+
+    let never_mutant = [panic_guard_mutant_unwind!("spurious_panic", |&x: &u8| {
+        assert!(x != 0);
+        x
+    })];
+    assert!(
+        NeverPanics::new(|&x: &u8| Ok(x < 100), |&x: &u8, &r: &u8| Ok(r == x))
+            .check_guard_mutants_fallible(
+                cfg,
+                |&x: &u8| PanicExecOutcome::Returned(x),
+                &never_mutant,
+            )
+            .is_strong()
+    );
+
+    // Stateful fallible builders work end-to-end with `.check_fallible` and
+    // `.check_guard_mutants_fallible`!
+    let st_mutants = [
+        stateful_panic_guard_mutant_unwind!("corrupt", |s: &mut BoundedStack, &v: &u8| {
+            s.push_corrupting(v)
+        }),
+        stateful_panic_guard_mutant_unwind!("wrong_ret", |s: &mut BoundedStack, &v: &u8| {
+            s.push_safe(v).wrapping_sub(1)
+        }),
+    ];
+    let st_exact = StatefulPanicContractSpec::exact_fallible::<BoundedStack, u8>(
+        |s: &BoundedStack, _v: &u8| Ok(s.__anneal_type_invariant_bounded_stack()),
+        |s: &BoundedStack, _v: &u8| Ok(s.len == 3),
+        |old_s: &BoundedStack, &v: &u8, new_s: &BoundedStack, &ret: &u8| {
+            Ok(new_s.__anneal_type_invariant_bounded_stack()
+                && new_s.len == old_s.len + 1
+                && ret == new_s.len
+                && new_s.slots[old_s.len as usize] == v)
+        },
+    )
+    .with_panic_state_inv(|old_s: &BoundedStack, post_s: &BoundedStack| Ok(post_s == old_s))
+    .check_guard_mutants_fallible(
+        cfg,
+        stateful_panic_unwind_runner!(|s: &mut BoundedStack, &v: &u8| s.push_safe(v)),
+        &st_mutants,
+    );
+    assert_eq!(st_exact.into_result().unwrap().guard_mutants_killed, 2);
+
+    assert!(
+        StatefulPanicContractSpec::only_if_fallible::<u8, ()>(
+            |&s: &u8, _: &()| Ok(s < 100),
+            |&s: &u8, _: &()| Ok(s >= 80),
+            |&old_s: &u8, _: &(), &new_s: &u8, &ret: &u8| Ok(new_s == old_s + 1 && ret == new_s),
+        )
+        .check_fallible(cfg, |s: &mut u8, _: &()| {
+            *s += 1;
+            PanicExecOutcome::Returned(*s)
+        })
+        .is_strong()
+    );
+    assert!(
+        StatefulPanicContractSpec::panics_if_fallible::<u8, (), ()>(
+            |&s: &u8, _: &()| Ok(s < 100),
+            |&s: &u8, _: &()| Ok(s >= 50),
+        )
+        .check_fallible(cfg, |s: &mut u8, _: &()| {
+            if *s >= 50 {
+                PanicExecOutcome::Panicked
+            } else {
+                PanicExecOutcome::Returned(())
+            }
+        })
+        .is_strong()
+    );
+    assert!(
+        StatefulPanicContractSpec::never_panics_fallible::<u8, ()>(
+            |&s: &u8, _: &()| Ok(s < 100),
+            |&old_s: &u8, _: &(), &new_s: &u8, &ret: &u8| Ok(new_s == old_s + 1 && ret == new_s),
+        )
+        .check_fallible(cfg, |s: &mut u8, _: &()| {
+            *s += 1;
+            PanicExecOutcome::Returned(*s)
+        })
+        .is_strong()
+    );
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 

@@ -3566,6 +3566,34 @@ impl<Pre, PanicCond, Post> PanicsOnlyIf<Pre, PanicCond, Post> {
     {
         self.into_spec::<I>().check_guard_mutants(config, body, mutants)
     }
+
+    /// Runs Stage P3b guard-mutant checking with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_guard_mutants_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+        mutants: &[PanicGuardMutant<'_, I, R>],
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_guard_mutants_fallible(
+            config,
+            PanicContractMode::OnlyIf,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+            mutants,
+        )
+    }
 }
 
 /// Typed `panics_if` contract builder (`Anneal.PanicContracts.PanicsIf`).
@@ -3684,6 +3712,33 @@ impl<Pre, PanicCond> PanicsIf<Pre, PanicCond> {
         self.into_spec::<I, R>()
             .check_guard_mutants(config, body, mutants)
     }
+
+    /// Runs Stage P3b guard-mutant checking with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_guard_mutants_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+        mutants: &[PanicGuardMutant<'_, I, R>],
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+    {
+        check_panic_guard_mutants_fallible(
+            config,
+            PanicContractMode::If,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            trivial_unused_post_fallible::<I, R>,
+            mutants,
+        )
+    }
 }
 
 /// Typed exact panic contract builder (`Anneal.PanicContracts.ExactPanicContract`).
@@ -3800,6 +3855,34 @@ impl<Pre, PanicCond, Post> ExactPanicContract<Pre, PanicCond, Post> {
         Post: FnMut(&I, &R) -> bool,
     {
         self.into_spec::<I>().check_guard_mutants(config, body, mutants)
+    }
+
+    /// Runs Stage P3b guard-mutant checking with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_guard_mutants_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+        mutants: &[PanicGuardMutant<'_, I, R>],
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_guard_mutants_fallible(
+            config,
+            PanicContractMode::Exact,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+            mutants,
+        )
     }
 }
 
@@ -3919,6 +4002,33 @@ impl<Pre, Post> NeverPanics<Pre, Post> {
     {
         self.into_spec::<I>().check_guard_mutants(config, body, mutants)
     }
+
+    /// Runs Stage P3b guard-mutant checking with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_guard_mutants_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+        mutants: &[PanicGuardMutant<'_, I, R>],
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_guard_mutants_fallible(
+            config,
+            PanicContractMode::NeverPanics,
+            self.pre,
+            false_panic_cond_fallible::<I>,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+            mutants,
+        )
+    }
 }
 
 /// Concrete stateful `&mut S` panic-contract descriptor uniting mode,
@@ -3938,8 +4048,21 @@ fn trivial_stateful_post<S, A, R>(_old_s: &S, _args: &A, _new_s: &S, _ret: &R) -
     true
 }
 
+fn trivial_stateful_post_fallible<S, A, R>(
+    _old_s: &S,
+    _args: &A,
+    _new_s: &S,
+    _ret: &R,
+) -> Result<bool, ()> {
+    Ok(true)
+}
+
 fn false_stateful_panic_cond<S, A>(_s: &S, _a: &A) -> bool {
     false
+}
+
+fn false_stateful_panic_cond_fallible<S, A>(_s: &S, _a: &A) -> Result<bool, ()> {
+    Ok(false)
 }
 
 impl<Pre, PanicCond, Post>
@@ -3969,6 +4092,31 @@ impl<Pre, PanicCond, Post>
         }
     }
 
+    /// Constructs a fallible stateful `Exact` panic contract defaulting to
+    /// [`AbortPolicy::ForbidAbort`] and no `panic_state_inv`, ready for
+    /// [`StatefulPanicContractSpec::check_fallible`] and
+    /// [`StatefulPanicContractSpec::check_guard_mutants_fallible`].
+    pub fn exact_fallible<S, A>(
+        pre: Pre,
+        panic_cond: PanicCond,
+        post: Post,
+    ) -> StatefulPanicContractSpec<
+        Pre,
+        PanicCond,
+        fn(&S, &A) -> Result<bool, ()>,
+        Post,
+        fn(&S, &S) -> Result<bool, ()>,
+    > {
+        StatefulPanicContractSpec {
+            mode: PanicContractMode::Exact,
+            pre,
+            panic_cond,
+            abort_policy: forbid_stateful_abort_fallible::<S, A>(),
+            post,
+            panic_state_inv: None,
+        }
+    }
+
     /// Constructs a stateful `OnlyIf` panic contract defaulting to
     /// [`AbortPolicy::ForbidAbort`] and no `panic_state_inv`.
     pub fn only_if<S, A>(
@@ -3982,6 +4130,29 @@ impl<Pre, PanicCond, Post>
             pre,
             panic_cond,
             abort_policy: forbid_stateful_abort::<S, A>(),
+            post,
+            panic_state_inv: None,
+        }
+    }
+
+    /// Constructs a fallible stateful `OnlyIf` panic contract defaulting to
+    /// [`AbortPolicy::ForbidAbort`] and no `panic_state_inv`.
+    pub fn only_if_fallible<S, A>(
+        pre: Pre,
+        panic_cond: PanicCond,
+        post: Post,
+    ) -> StatefulPanicContractSpec<
+        Pre,
+        PanicCond,
+        fn(&S, &A) -> Result<bool, ()>,
+        Post,
+        fn(&S, &S) -> Result<bool, ()>,
+    > {
+        StatefulPanicContractSpec {
+            mode: PanicContractMode::OnlyIf,
+            pre,
+            panic_cond,
+            abort_policy: forbid_stateful_abort_fallible::<S, A>(),
             post,
             panic_state_inv: None,
         }
@@ -4018,6 +4189,28 @@ impl<Pre, PanicCond>
             panic_state_inv: None,
         }
     }
+
+    /// Constructs a fallible stateful `If` (`panics_if`) contract defaulting to
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn panics_if_fallible<S, A, R>(
+        pre: Pre,
+        panic_cond: PanicCond,
+    ) -> StatefulPanicContractSpec<
+        Pre,
+        PanicCond,
+        fn(&S, &A) -> Result<bool, ()>,
+        fn(&S, &A, &S, &R) -> Result<bool, ()>,
+        fn(&S, &S) -> Result<bool, ()>,
+    > {
+        StatefulPanicContractSpec {
+            mode: PanicContractMode::If,
+            pre,
+            panic_cond,
+            abort_policy: forbid_stateful_abort_fallible::<S, A>(),
+            post: trivial_stateful_post_fallible::<S, A, R>,
+            panic_state_inv: None,
+        }
+    }
 }
 
 impl<Pre, Post>
@@ -4046,6 +4239,28 @@ impl<Pre, Post>
             pre,
             panic_cond: false_stateful_panic_cond::<S, A>,
             abort_policy: forbid_stateful_abort::<S, A>(),
+            post,
+            panic_state_inv: None,
+        }
+    }
+
+    /// Constructs a fallible stateful `NeverPanics` contract defaulting to
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn never_panics_fallible<S, A>(
+        pre: Pre,
+        post: Post,
+    ) -> StatefulPanicContractSpec<
+        Pre,
+        fn(&S, &A) -> Result<bool, ()>,
+        fn(&S, &A) -> Result<bool, ()>,
+        Post,
+        fn(&S, &S) -> Result<bool, ()>,
+    > {
+        StatefulPanicContractSpec {
+            mode: PanicContractMode::NeverPanics,
+            pre,
+            panic_cond: false_stateful_panic_cond_fallible::<S, A>,
+            abort_policy: forbid_stateful_abort_fallible::<S, A>(),
             post,
             panic_state_inv: None,
         }
@@ -4180,6 +4395,37 @@ impl<Pre, PanicCond, AbortCond, Post, PanicStateInv>
         PanicStateInv: FnMut(&S, &S) -> bool,
     {
         check_stateful_panic_guard_mutants(
+            config,
+            self.mode,
+            self.pre,
+            self.panic_cond,
+            self.abort_policy,
+            body,
+            self.post,
+            self.panic_state_inv,
+            mutants,
+        )
+    }
+
+    /// Runs Stage P3b [`check_stateful_panic_guard_mutants_fallible`].
+    pub fn check_guard_mutants_fallible<S, A, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+        mutants: &[StatefulPanicGuardMutant<'_, S, A, R>],
+    ) -> PanicCheckOutcome
+    where
+        S: SampleInput + ReturnMutants + Clone + PartialEq,
+        A: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&S, &A) -> Result<bool, ()>,
+        PanicCond: FnMut(&S, &A) -> Result<bool, ()>,
+        AbortCond: FnMut(&S, &A) -> Result<bool, ()>,
+        Body: FnMut(&mut S, &A) -> PanicExecOutcome<R>,
+        Post: FnMut(&S, &A, &S, &R) -> Result<bool, ()>,
+        PanicStateInv: FnMut(&S, &S) -> Result<bool, ()>,
+    {
+        check_stateful_panic_guard_mutants_fallible(
             config,
             self.mode,
             self.pre,
@@ -5749,6 +5995,12 @@ fn is_known_inert_single_attr(name: &str) -> bool {
 }
 
 fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
+    // Rust 2024's `#[unsafe(...)]` wrapper uses the keyword `unsafe`, NOT a
+    // raw identifier: rustc resolves `#[r#unsafe(...)]` as an attribute macro
+    // named `unsafe`, so only exact non-raw `["unsafe"]` is `UnsafeWrapper`.
+    if segments == ["unsafe"] {
+        return BuiltinAttrKind::UnsafeWrapper;
+    }
     let mut norm: [&str; 4] = [""; 4];
     let len = segments.len().min(norm.len());
     for (dst, src) in norm.iter_mut().zip(segments) {
@@ -5758,7 +6010,6 @@ fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
         ["inline"] => BuiltinAttrKind::Inline,
         ["cfg"] => BuiltinAttrKind::Cfg,
         ["cfg_attr"] => BuiltinAttrKind::CfgAttr,
-        ["unsafe"] => BuiltinAttrKind::UnsafeWrapper,
         ["core" | "std", "prelude", _, "inline"] => BuiltinAttrKind::Inline,
         ["core" | "std", "prelude", _, "cfg"] => BuiltinAttrKind::Cfg,
         ["core" | "std", "prelude", _, "cfg_attr"] => BuiltinAttrKind::CfgAttr,
@@ -6269,6 +6520,28 @@ fn evaluate_target_attrs(
     None
 }
 
+/// Applies an inner attribute `#![...]` (or `# ! [...]`) to the enclosing
+/// scope's `disabled` flag (or `root_disabled` at crate/slice root) if it
+/// carries a statically false `cfg(...)`, returning whether the enclosing
+/// scope is now disabled.
+fn apply_inner_attr_cfg(
+    inner: &str,
+    root_disabled: &mut bool,
+    cur_scope_disabled: Option<&mut bool>,
+) -> bool {
+    let mut inner_attr = InlineAttrSummary::default();
+    analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
+    if inner_attr.saw_disabled_cfg {
+        if let Some(scope_disabled) = cur_scope_disabled {
+            *scope_disabled = true;
+            return true;
+        }
+        *root_disabled = true;
+        return true;
+    }
+    *root_disabled || matches!(cur_scope_disabled, Some(d) if *d)
+}
+
 /// Structured item-level layer of
 /// [`verify_fn_inline_never_source_with_options`]. Counts item-position
 /// matches into `matched_count`.
@@ -6320,15 +6593,12 @@ fn structured_inline_scan(
                 let Ok(inner) = lex.consume_balanced_inner(b'[') else {
                     return InlineBoundaryVerdict::MalformedSource;
                 };
-                let mut inner_attr = InlineAttrSummary::default();
-                analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
-                if inner_attr.saw_disabled_cfg {
-                    if scope_len > 0 {
-                        scopes[scope_len - 1].disabled = true;
-                    } else {
-                        root_disabled = true;
-                    }
-                }
+                let cur_scope = if scope_len > 0 {
+                    Some(&mut scopes[scope_len - 1].disabled)
+                } else {
+                    None
+                };
+                let _ = apply_inner_attr_cfg(inner, &mut root_disabled, cur_scope);
             }
             // Outer attribute `#[...]` attaches to the immediately following item.
             // A spaced inner attribute `# ! [...]` (legal Rust token sequence)
@@ -6353,15 +6623,12 @@ fn structured_inline_scan(
                     return InlineBoundaryVerdict::MalformedSource;
                 };
                 if is_inner {
-                    let mut inner_attr = InlineAttrSummary::default();
-                    analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
-                    if inner_attr.saw_disabled_cfg {
-                        if scope_len > 0 {
-                            scopes[scope_len - 1].disabled = true;
-                        } else {
-                            root_disabled = true;
-                        }
-                    }
+                    let cur_scope = if scope_len > 0 {
+                        Some(&mut scopes[scope_len - 1].disabled)
+                    } else {
+                        None
+                    };
+                    let _ = apply_inner_attr_cfg(inner, &mut root_disabled, cur_scope);
                 } else {
                     analyze_attr_meta_list(inner, true, 0, &mut pending);
                 }
@@ -6810,17 +7077,13 @@ fn deep_scan_slice(
                     if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                         let _ = lex.next_token()?;
                         let inner = lex.consume_balanced_inner(b'[')?;
-                        let mut inner_attr = InlineAttrSummary::default();
-                        analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
-                        if inner_attr.saw_disabled_cfg {
-                            if cur_depth > 0 {
-                                stack[cur_depth - 1].disabled = true;
-                            } else {
-                                root_disabled = true;
-                            }
-                        }
+                        let cur_scope = if cur_depth > 0 {
+                            Some(&mut stack[cur_depth - 1].disabled)
+                        } else {
+                            None
+                        };
                         let now_disabled =
-                            root_disabled || (cur_depth > 0 && stack[cur_depth - 1].disabled);
+                            apply_inner_attr_cfg(inner, &mut root_disabled, cur_scope);
                         if !now_disabled {
                             deep_scan_slice(
                                 inner,
@@ -6840,17 +7103,13 @@ fn deep_scan_slice(
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                     let _ = lex.next_token()?;
                     let inner = lex.consume_balanced_inner(b'[')?;
-                    let mut inner_attr = InlineAttrSummary::default();
-                    analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
-                    if inner_attr.saw_disabled_cfg {
-                        if cur_depth > 0 {
-                            stack[cur_depth - 1].disabled = true;
-                        } else {
-                            root_disabled = true;
-                        }
-                    }
+                    let cur_scope = if cur_depth > 0 {
+                        Some(&mut stack[cur_depth - 1].disabled)
+                    } else {
+                        None
+                    };
                     let now_disabled =
-                        root_disabled || (cur_depth > 0 && stack[cur_depth - 1].disabled);
+                        apply_inner_attr_cfg(inner, &mut root_disabled, cur_scope);
                     if !now_disabled {
                         deep_scan_slice(
                             inner,
@@ -7071,11 +7330,109 @@ fn deep_scan_slice(
                     }
                 }
             }
-            TokenKind::Ident("static" | "use" | "type" | "let") => {
+            TokenKind::Ident("static" | "use" | "type" | "let" | "return" | "break" | "continue") => {
                 let disabled = pending.saw_disabled_cfg;
                 pending.reset();
                 if !cur_disabled && disabled {
                     skip_disabled_item_to_semicolon(&mut lex)?;
+                }
+            }
+            TokenKind::Ident("move") => {
+                // `#[cfg(any())] async move { ... }` / `move || { ... }`:
+                // preserve `pending` when `move` directly precedes `{` or `|`.
+                if !(pending.saw_disabled_cfg
+                    && matches!(lex.peek_token()?.kind, TokenKind::Punct(b'{' | b'|')))
+                {
+                    let disabled = pending.saw_disabled_cfg;
+                    pending.reset();
+                    if !cur_disabled && disabled {
+                        skip_disabled_item_to_semicolon(&mut lex)?;
+                    }
+                }
+            }
+            TokenKind::Ident("gen") => {
+                if !(pending.saw_disabled_cfg
+                    && matches!(
+                        lex.peek_token()?.kind,
+                        TokenKind::Punct(b'{') | TokenKind::Ident("move")
+                    ))
+                {
+                    let disabled = pending.saw_disabled_cfg;
+                    pending.reset();
+                    if !cur_disabled && disabled {
+                        skip_disabled_path_or_macro_item(&mut lex)?;
+                    }
+                }
+            }
+            TokenKind::Ident("loop") => {
+                // `#[cfg(any())] loop { ... }`: exact brace-matched disabled
+                // scope via the `{` arm.
+                if !(pending.saw_disabled_cfg
+                    && matches!(lex.peek_token()?.kind, TokenKind::Punct(b'{')))
+                {
+                    pending.reset();
+                }
+            }
+            TokenKind::Lifetime => {
+                // `#[cfg(any())] 'lbl: { ... }` / `'lbl: loop/while/for ...`:
+                // consume `:` and preserve `pending.saw_disabled_cfg` onto the
+                // labelled block/loop.
+                if pending.saw_disabled_cfg
+                    && matches!(lex.peek_token()?.kind, TokenKind::Punct(b':'))
+                {
+                    let _ = lex.next_token()?;
+                } else {
+                    pending.reset();
+                }
+            }
+            TokenKind::Ident("if") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_if_stmt(&mut lex, 0)?;
+                }
+            }
+            TokenKind::Ident("while") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_control_stmt(&mut lex, false, true, 0)?;
+                }
+            }
+            TokenKind::Ident("for") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_control_stmt(&mut lex, true, false, 0)?;
+                }
+            }
+            TokenKind::Ident("match") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_control_stmt(&mut lex, false, false, 0)?;
+                }
+            }
+            TokenKind::Punct(b'|') => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_closure(&mut lex)?;
+                }
+            }
+            TokenKind::Punct(b'(') => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    let _ = lex.consume_balanced_inner(b'(')?;
+                    skip_disabled_item_to_semicolon(&mut lex)?;
+                }
+            }
+            TokenKind::ColonColon => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_rooted_path_or_macro(&mut lex)?;
                 }
             }
             TokenKind::Ident("struct" | "enum" | "union") => {
@@ -7257,8 +7614,10 @@ fn skip_disabled_type_decl(lex: &mut RustLexer<'_>) -> Result<(), ()> {
     }
 }
 
-/// Leniently skips a statically disabled macro invocation (`m! { ... }`,
-/// `a::b!(...);`, `macro_rules! m { ... }`).
+/// Leniently skips a statically disabled path-led macro invocation
+/// (`m! { ... }`, `a::b!(...);`, `macro_rules! m { ... }`) or expression
+/// statement (`id({ ... });`, `x = { ... };`) without crossing enclosing
+/// closing delimiters or live top-level `fn <ident>` items.
 fn skip_disabled_path_or_macro_item(lex: &mut RustLexer<'_>) -> Result<(), ()> {
     loop {
         match lex.peek_token()?.kind {
@@ -7267,7 +7626,7 @@ fn skip_disabled_path_or_macro_item(lex: &mut RustLexer<'_>) -> Result<(), ()> {
                 if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
                     let _ = lex.next_token()?;
                 } else {
-                    return Ok(());
+                    return skip_disabled_item_to_semicolon(lex);
                 }
             }
             TokenKind::Punct(b'!') => {
@@ -7278,17 +7637,272 @@ fn skip_disabled_path_or_macro_item(lex: &mut RustLexer<'_>) -> Result<(), ()> {
                 if let TokenKind::Punct(p @ (b'(' | b'[' | b'{')) = lex.peek_token()?.kind {
                     let _ = lex.next_token()?;
                     let _ = lex.consume_balanced_inner(p)?;
-                    if p != b'{'
-                        && matches!(lex.peek_token()?.kind, TokenKind::Punct(b';'))
-                    {
+                    if matches!(lex.peek_token()?.kind, TokenKind::Punct(b';')) {
                         let _ = lex.next_token()?;
                     }
                 }
                 return Ok(());
             }
+            _ => return skip_disabled_item_to_semicolon(lex),
+        }
+    }
+}
+
+/// Leniently skips a statically disabled leading-`::` path or macro invocation
+/// (`::my_crate::make! { ... }`, `::core::compile_error!(...);`).
+fn skip_disabled_rooted_path_or_macro(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+        let _ = lex.next_token()?;
+        return skip_disabled_path_or_macro_item(lex);
+    }
+    Ok(())
+}
+
+/// Skips a statically disabled `if` / `while` / `for` / `match` header and its
+/// single body `{ ... }` without swallowing a following live statement or
+/// standalone `{ ... }` block.
+///
+/// Tracks:
+/// - `waiting_for_in` (`for <pat> in <iter> { body }`) and `in_let_pattern`
+///   (`if let <pat> = <expr> { body }`, including Rust 2024 let-chains and
+///   inclusive range patterns `..=`) so struct patterns `{ ... }` are never
+///   mistaken for the statement body;
+/// - `expecting_expr` so block expressions in condition/scrutinee/iterator
+///   position (`if { true } { body }`, `if unsafe { true } { body }`,
+///   `match { 0 } { ... }`, `if t! { } { body }`) are consumed as header
+///   expressions, while the body `{ ... }` stops immediately before any
+///   following standalone live `{ fn target() {} }` block.
+fn skip_disabled_control_stmt(
+    lex: &mut RustLexer<'_>,
+    mut waiting_for_in: bool,
+    allow_let_pattern: bool,
+    depth: usize,
+) -> Result<(), ()> {
+    if depth > 16 {
+        return Err(());
+    }
+    let mut in_let_pattern = false;
+    let mut expecting_expr = true;
+    let mut prev_was_dot = false;
+
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']') => return Ok(()),
+            TokenKind::Punct(b';') => {
+                let _ = lex.next_token()?;
+                return Ok(());
+            }
+            TokenKind::Punct(b'{') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(b'{')?;
+                prev_was_dot = false;
+                if waiting_for_in || in_let_pattern {
+                    // Struct pattern `{ ... }` before `in` or `=`.
+                } else if expecting_expr {
+                    // Block expression inside condition / scrutinee / iterator.
+                    expecting_expr = false;
+                } else {
+                    // Body block of `if` / `while` / `for` / `match`.
+                    return Ok(());
+                }
+            }
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::ColonColon => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_angle_inner()?;
+                    expecting_expr = false;
+                } else {
+                    expecting_expr = true;
+                }
+            }
+            TokenKind::Ident("in") if waiting_for_in => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                waiting_for_in = false;
+                expecting_expr = true;
+            }
+            TokenKind::Ident("let") if allow_let_pattern && !waiting_for_in => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                in_let_pattern = true;
+                expecting_expr = true;
+            }
+            TokenKind::Punct(b'=') if in_let_pattern && !prev_was_dot => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                in_let_pattern = false;
+                expecting_expr = true;
+            }
+            TokenKind::Lifetime => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b':')) {
+                    let _ = lex.next_token()?;
+                    expecting_expr = true;
+                } else {
+                    expecting_expr = false;
+                }
+            }
+            TokenKind::Ident("if") if !waiting_for_in && !in_let_pattern => {
+                let _ = lex.next_token()?;
+                skip_disabled_if_stmt(lex, depth + 1)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::Ident("match") if !waiting_for_in && !in_let_pattern => {
+                let _ = lex.next_token()?;
+                skip_disabled_control_stmt(lex, false, false, depth + 1)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::Ident("while") if !waiting_for_in && !in_let_pattern => {
+                let _ = lex.next_token()?;
+                skip_disabled_control_stmt(lex, false, true, depth + 1)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::Ident("for") if !waiting_for_in && !in_let_pattern => {
+                let _ = lex.next_token()?;
+                skip_disabled_control_stmt(lex, true, false, depth + 1)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::Ident(
+                "unsafe" | "const" | "async" | "move" | "loop" | "return" | "break" | "in"
+                | "as" | "else" | "gen",
+            ) => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                expecting_expr = true;
+            }
+            TokenKind::Ident(_) | TokenKind::Literal => {
+                skip_disabled_plain_token(lex)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            TokenKind::Punct(b'.') => {
+                let _ = lex.next_token()?;
+                prev_was_dot = true;
+                expecting_expr = false;
+            }
+            TokenKind::Punct(b'?') => {
+                let _ = lex.next_token()?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
+            _ => {
+                skip_disabled_plain_token(lex)?;
+                prev_was_dot = false;
+                expecting_expr = true;
+            }
+        }
+    }
+}
+
+/// Skips a statically disabled `if ... { ... } [else if ... { ... }]* [else { ... }]`
+/// chain cleanly without swallowing a following live statement or block.
+fn skip_disabled_if_stmt(lex: &mut RustLexer<'_>, depth: usize) -> Result<(), ()> {
+    if depth > 16 {
+        return Err(());
+    }
+    const MAX_ELSE_IF_CHAIN: usize = 64;
+    for _ in 0..MAX_ELSE_IF_CHAIN {
+        skip_disabled_control_stmt(lex, false, true, depth)?;
+        if !matches!(lex.peek_token()?.kind, TokenKind::Ident("else")) {
+            return Ok(());
+        }
+        let _ = lex.next_token()?; // consume `else`
+        match lex.peek_token()?.kind {
+            TokenKind::Ident("if") => {
+                let _ = lex.next_token()?;
+            }
+            TokenKind::Punct(b'{') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(b'{')?;
+                return Ok(());
+            }
             _ => return Ok(()),
         }
     }
+    Err(())
+}
+
+/// Skips a statically disabled closure statement (`|| { ... };`, `|x: T| -> R { ... }`,
+/// `|| expr;`) after its opening `|` has been consumed.
+fn skip_disabled_closure(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    // Consume parameter list up to closing `|`.
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']' | b';') => return Ok(()),
+            TokenKind::Punct(b'|') => {
+                let _ = lex.next_token()?;
+                break;
+            }
+            TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b'<') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_angle_inner()?;
+            }
+            _ => {
+                skip_disabled_plain_token(lex)?;
+            }
+        }
+    }
+
+    // Optional `-> RetTy` followed by `{ ... }` body.
+    if matches!(lex.peek_token()?.kind, TokenKind::Arrow) {
+        let _ = lex.next_token()?;
+        loop {
+            match lex.peek_token()?.kind {
+                TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']') => return Ok(()),
+                TokenKind::Punct(b';') => {
+                    let _ = lex.next_token()?;
+                    return Ok(());
+                }
+                TokenKind::Punct(b'{') => {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_balanced_inner(b'{')?;
+                    if matches!(lex.peek_token()?.kind, TokenKind::Punct(b';')) {
+                        let _ = lex.next_token()?;
+                    }
+                    return Ok(());
+                }
+                TokenKind::Punct(p @ (b'(' | b'[')) => {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_balanced_inner(p)?;
+                }
+                TokenKind::Punct(b'<') => {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_angle_inner()?;
+                }
+                _ => {
+                    skip_disabled_plain_token(lex)?;
+                }
+            }
+        }
+    }
+
+    if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'{')) {
+        let _ = lex.next_token()?;
+        let _ = lex.consume_balanced_inner(b'{')?;
+        if matches!(lex.peek_token()?.kind, TokenKind::Punct(b';')) {
+            let _ = lex.next_token()?;
+        }
+        return Ok(());
+    }
+
+    skip_disabled_item_to_semicolon(lex)
 }
 
 fn skip_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
