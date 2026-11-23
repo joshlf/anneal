@@ -7219,5 +7219,153 @@ class TestNegationPrecedenceB1AdversarialHardening(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceA1AdversarialFixes(unittest.TestCase):
+    """`[adv A1]` regressions for bugs found in `[adv B1]` and earlier vacuity auditor passes:
+
+    1. Negated hypothesis fall-through (`¬ x :: xs = []`) and non-top-level `List` constructor
+       checks (`(x :: xs).tail = []`, `[[], xs][0] = []`) plus depth-0 `<`/`>`/`=` splitting.
+    2. Telescope-ordered `nat_vars` shadowing (`(n : Nat) (n : Int) (h : n < 0)`, later `∀ (n : Nat)`)
+       and quantifier-typed `Nat` contradictions (`∃ n : Nat, n < 0`, `∀ n : Nat, n < 0`).
+    3. Quantifier domain inhabitation & shadowing (`(Nat : Prop) (h : ∀ n : Nat, False)`,
+       untyped `∀` over arbitrary `α` / `P : Prop` / `Fin n` / rebound `R` / non-head `Apply R s`,
+       `∃ (α : Type), ∀ (x : α), False`), telescope shadowing inside `∃` refutations
+       (`∃ (Nat : Prop) (hn : Nat), false = true`, `{α : Type} (h : ∃ (α : Prop) (hp : α), ...)`),
+       untyped `∃` binders in `: False` refutations (`∃ hp, (hp : P) ≠ (hp : P)`), same-scope
+       contradictory conjuncts inside quantifiers (`∃ x : Nat, P x ∧ ¬ P x`), and distinct
+       nested quantifier scopes staying clean.
+    4. Header parsing with bracket/arrow char literals (`'('`, `')'`, `'→'`), unnamed instances
+       carrying nested colons (`[Decidable (∃ x : Nat, x = n)]`, `[Decidable (c = ':')]`),
+       containers with parenthesised product/expression args (`List (Nat × Bool)`,
+       `BitVec (n + 1)`), `→` looser connectives (`↔`, `<|`, `$`) and ASCII `exists`,
+       parenthesised `→ (False)` negations, unary `!` / BitVec `#` simple refutation terms,
+       and symmetric/unspaced `=`/`≠` pairs.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "char_lparen_irrefl": "theorem bad (h : '(' ≠ '(') : x = 1 := by sorry\n",
+        "char_rparen_irrefl": "theorem bad (h : ')' ≠ ')') : x = 1 := by sorry\n",
+        "exists_typed_nat_lt_0": "theorem bad (h : ∃ n : Nat, n < 0) : x = 1 := by sorry\n",
+        "forall_typed_nat_lt_0": "theorem bad (h : ∀ n : Nat, n < 0) : x = 1 := by sorry\n",
+        "forall_multi_typed_nat_lt_0": "theorem bad (h : ∀ (x : Nat) (y : Int), x < 0) : x = 1 := by sorry\n",
+        "some_nested_eq_none": "theorem bad (a b : Nat) (h : some (a = b) = none) : x = 1 := by sorry\n",
+        "nested_lt_irrefl": "theorem bad (f : Prop → Nat) (a b : Nat) (h : f (a < b) < f (a < b)) : x = 1 := by sorry\n",
+        "nested_fun_gt_irrefl": "theorem bad (a : Nat) (h : (fun x => x) a > (fun x => x) a) : x = 1 := by sorry\n",
+        "paren_bool_eq": "theorem bad (h : (false) = (true)) : x = 1 := by sorry\n",
+        "exists_shadow_nat_refutation": "theorem bad (h : ∃ (Nat : Prop) (hn : Nat), false = true) : False := by sorry\n",
+        "exists_nested_shadow_nat_refutation": "theorem bad (h : ∃ (Nat : Prop), ∃ (hn : Nat), false = true) : False := by sorry\n",
+        "exists_shadow_typevar_refutation": "theorem bad {α : Type} (h : ∃ (α : Prop) (hp : α), false = true) : False := by sorry\n",
+        "exists_nested_shadow_typevar_refutation": "theorem bad {α : Type} (h : ∃ (α : Prop), ∃ (hp : α), false = true) : False := by sorry\n",
+        "exists_untyped_proof_binder_refutation": "theorem bad (P : Prop) (h : ∃ hp, (hp : P) ≠ (hp : P)) : False := by sorry\n",
+        "exists_untyped_global_f_refutation": "theorem bad (h : ∃ hp, f hp ≠ f hp) : False := by sorry\n",
+        "exists_untyped_paren_refutation": "theorem bad (h : ∃ (hp), false = true) : False := by sorry\n",
+        "exists_same_scope_pair": "theorem bad (P : Nat → Prop) (h : ∃ x : Nat, P x ∧ ¬ P x) : x = 1 := by sorry\n",
+        "exists_same_scope_eq_neq": "theorem bad (h : ∃ x : Nat, x = 0 ∧ x ≠ 0) : x = 1 := by sorry\n",
+        "exists_same_scope_symm_eq_neq": "theorem bad (h : ∃ x : Nat, x = 0 ∧ 0 ≠ x) : x = 1 := by sorry\n",
+        "exists_same_scope_arrow_false": "theorem bad (P : Nat → Prop) (h : ∃ x : Nat, P x ∧ (P x → False)) : x = 1 := by sorry\n",
+        "forall_same_scope_pair": "theorem bad (P : Nat → Prop) (h : ∀ x : Nat, P x ∧ ¬ P x) : x = 1 := by sorry\n",
+        "arrow_paren_false_pair": "theorem bad (P : Prop) (h1 : P) (h2 : P → (False)) : x = 1 := by sorry\n",
+        "arrow_paren_false_true": "theorem bad (h : True → (False)) : x = 1 := by sorry\n",
+        "symm_eq_neq_pair": "theorem bad (a b : Nat) (h1 : a = b) (h2 : b ≠ a) : x = 1 := by sorry\n",
+        "nospace_eq_neq_pair": "theorem bad (a b : Nat) (h1 : a=b) (h2 : a ≠ b) : x = 1 := by sorry\n",
+        "list_nonempty_bracket_char_lit": "theorem bad (h : [']'] = []) : x = 1 := by sorry\n",
+        "forall_two_arg_inhabited": "theorem bad (R : Nat → Bool → Prop) (h : ∀ a b, R a b ∧ False) : x = 1 := by sorry\n",
+    }
+
+    VACUOUS_ALL_SCOPE_ONLY = {
+        "char_arrow_anon_premise": "theorem bad : '→' ≠ '→' → x = 1 := by sorry\n",
+        "char_lparen_anon_premise": "theorem bad : '(' ≠ '(' → x = 1 := by sorry\n",
+    }
+
+    CLEAN = {
+        "shadowed_nat_to_int": "theorem ok (n : Nat) (n : Int) (h : n < 0) : n ≠ 0 := by omega\n",
+        "later_nat_binder_after_lt0": "theorem ok (h : n < 0) : ∀ (n : Nat), n = n := by intro; rfl\n",
+        "shadowed_nat_type_for_lt0": "theorem ok (Nat : Prop) (n : Nat) (h : n < 0) : True := trivial\n",
+        "not_cons_eq_nil": "theorem ok (x : Nat) (xs : List Nat) (h : ¬ x :: xs = []) : True := trivial\n",
+        "cons_eq_nil_arrow_false": "theorem ok (x : Nat) (xs : List Nat) (h : x :: xs = [] → False) : True := trivial\n",
+        "cons_tail_eq_nil": "theorem ok (x : Nat) (xs : List Nat) (h : (x :: xs).tail = []) : xs = [] := rfl\n",
+        "list_index_eq_nil": "theorem ok (xs : List (List Nat)) (h : [[], xs][0] = []) : True := trivial\n",
+        "rebound_nat_forall": "theorem ok (Nat : Prop) (h : ∀ n : Nat, False) : ¬ Nat := h\n",
+        "rebound_nat_fn_domain_forall": "theorem ok (Nat : Prop) (R : Nat → Prop) (h : ∀ s, R s ∧ False) : ¬ Nat := by sorry\n",
+        "forall_untyped_empty_alpha": "theorem ok {α : Type} (R : α → Prop) (h : ∀ a, R a ∧ False) : α → False := fun a => (h a).2\n",
+        "forall_untyped_prop_domain": "theorem ok (P : Prop) (R : P → Prop) (h : ∀ hp, R hp ∧ False) : ¬ P := fun hp => (h hp).2\n",
+        "forall_untyped_fin_domain": "theorem ok (n : Nat) (R : Fin n → Prop) (h : ∀ i, R i ∧ False) : n = 0 := by sorry\n",
+        "forall_untyped_mixed_domain": "theorem ok {α : Type} (R : Nat → α → Prop) (h : ∀ a b, R a b ∧ False) : α → False := by sorry\n",
+        "forall_untyped_non_head_arg": "theorem ok (R : Nat → Prop) (h : ∀ s, Apply R s ∧ False) : True := trivial\n",
+        "forall_untyped_inner_rebound_fn": "theorem ok (R : Nat → Prop) (h : ∀ s, (∀ R : Empty → Prop, R s) ∧ False) : True := trivial\n",
+        "forall_multi_typed_int_lt_0": "theorem ok (h : ∀ (x : Nat) (y : Int), y < 0) : x = 1 := by sorry\n",
+        "exists_empty_type_forall": "theorem ok (h : ∃ (α : Type), ∀ (x : α), False) : x = 1 := by sorry\n",
+        "exists_distinct_nested_scopes": "theorem ok (P : Nat → Nat → Prop) (h : ∃ x : Nat, (∃ y : Nat, P x y) ∧ (∃ y : Nat, ¬ P x y)) : x = 1 := by sorry\n",
+        "exists_two_hyps_distinct_witnesses": "theorem ok (P : Nat → Prop) (h1 : ∃ x : Nat, P x) (h2 : ∃ x : Nat, ¬ P x) : x = 1 := by sorry\n",
+        "exists_bitvec_paren_arg_refutation": "theorem ok (n : Nat) (h : ∃ b : BitVec (n + 1), b ≠ b) : False := by sorry\n",
+        "exists_list_prod_arg_refutation": "theorem ok (h : ∃ xs : List (Nat × Bool), xs ≠ xs) : False := by sorry\n",
+        "exists_new_typevar_refutation": "theorem ok (h : ∃ (α : Type) (x : α), x ≠ x) : False := by sorry\n",
+        "option_prod_binder_refutation": "theorem ok (o : Option (Nat × Bool)) (h : false = true) : False := by sorry\n",
+        "unnamed_decidable_exists_refutation": "theorem ok (n : Nat) [Decidable (∃ x : Nat, x = n)] (h : false = true) : False := by sorry\n",
+        "unnamed_decidable_char_colon": "theorem ok (c : Char) [Decidable (c = ':')] (h : false = true) : False := by sorry\n",
+        "unnamed_decidable_char_rparen": "theorem ok (c : Char) [Decidable (c = ')')] (h : false = true) : False := by sorry\n",
+        "bool_bang_refutation": "theorem ok (b : Bool) (h : !b ≠ !b) : False := by sorry\n",
+        "bitvec_lit_refutation": "theorem ok (h : 0#8 ≠ 0#8) : False := by sorry\n",
+        "pipe_left_arrow_false": "theorem ok (f : Prop → Prop) (P : Prop) (h1 : f <| P) (h2 : f <| P → False) : x = 1 := by sorry\n",
+        "dollar_arrow_false": "theorem ok (f : Prop → Prop) (P : Prop) (h1 : f $ P) (h2 : f $ P → False) : x = 1 := by sorry\n",
+        "arrow_false_iff_true": "theorem ok : false = true → False ↔ True := by simp\n",
+        "false_to_false_iff_true": "theorem ok : False → False ↔ True := by simp\n",
+        "ascii_exists_arrow": "theorem ok (P : Prop) : exists x : Nat, False → P := by sorry\n",
+        "exists_nat_lt_0_refutation": "theorem ok (h : ∃ n : Nat, n < 0) : False := by sorry\n",
+        "forall_nat_lt_0_refutation": "theorem ok (h : ∀ n : Nat, n < 0) : False := by sorry\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_a1_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_a1_vacuous_anonymous_headers_flagged_in_all_scope(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_ALL_SCOPE_ONLY.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertEqual(scan67(src), [], f"default-scope unexpectedly flagged anon {label}")
+
+    def test_a1_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.CLEAN.items():
+            self.assertNotIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_a1_helper_invariants(self) -> None:
+        self.assertEqual(proof_health._arrow_false_antecedent("P → (False)"), "P")
+        self.assertIsNone(proof_health._arrow_false_antecedent("f <| P → False"))
+        self.assertIsNone(proof_health._arrow_false_antecedent("f $ P → False"))
+        self.assertTrue(proof_health._has_top_level_looser_than_not("f <| P"))
+        self.assertTrue(proof_health._has_top_level_looser_than_not("f $ P"))
+        self.assertTrue(proof_health._is_non_prop_binder_type("List (Nat × Bool)", frozenset()))
+        self.assertFalse(
+            proof_health._is_non_prop_binder_type("Nat", frozenset(), shadowed=frozenset({"Nat"}))
+        )
+        self.assertTrue(proof_health._plain_quantifier_binders("x : List (Fin 0)"))
+        self.assertTrue(proof_health._plain_quantifier_binders("b : BitVec (n + 1)"))
+        self.assertFalse(proof_health._plain_quantifier_binders("(Nat : Prop) (hn : Nat)"))
+        self.assertFalse(
+            proof_health._plain_quantifier_binders("(α : Prop) (hp : α)", frozenset({"α"}))
+        )
+        self.assertFalse(proof_health._plain_quantifier_binders("hp", allow_untyped=False))
+        self.assertTrue(proof_health._is_simple_refutation_premise("!b ≠ !b"))
+        self.assertTrue(proof_health._is_simple_refutation_premise("0#8 ≠ 0#8"))
+
+    def test_check_trusted_agrees_on_every_a1_header(self) -> None:
+        ct = _load_check_trusted()
+        all_cases = {**self.VACUOUS_BOTH_SCOPES, **self.VACUOUS_ALL_SCOPE_ONLY, **self.CLEAN}
+        for label, src in all_cases.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
