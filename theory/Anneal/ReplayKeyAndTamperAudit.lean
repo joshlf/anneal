@@ -127,6 +127,11 @@ def kwConfig : List Char := ['c', 'o', 'n', 'f', 'i', 'g']
 def kwDecideConfig : List Char := ['D', 'e', 'c', 'i', 'd', 'e', 'C', 'o', 'n', 'f', 'i', 'g']
 def kwInit : List Char := ['i', 'n', 'i', 't']
 def kwAttribute : List Char := ['a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e']
+def kwModule : List Char := ['m', 'o', 'd', 'u', 'l', 'e']
+def kwImport : List Char := ['i', 'm', 'p', 'o', 'r', 't']
+def kwAll : List Char := ['a', 'l', 'l']
+def kwPublic : List Char := ['p', 'u', 'b', 'l', 'i', 'c']
+def kwPrivate : List Char := ['p', 'r', 'i', 'v', 'a', 't', 'e']
 def builtinPrefix : List Char := ['b', 'u', 'i', 'l', 't', 'i', 'n', '_']
 def parserSuffix : List Char := ['_', 'p', 'a', 'r', 's', 'e', 'r']
 def plusOneBracketTick : List Char := ['+', '1', ']', '\'']
@@ -373,6 +378,12 @@ def usedConstants : ExprSkeleton → List SymName
 /-- The conclusion of a function type: what remains under its leading binders. -/
 def piTarget : ExprSkeleton → ExprSkeleton
   | pi _ b => b.piTarget
+  | e => e
+
+/-- Strip leading `pi` and `lam` binders so neither premises nor unused lambda parameter
+domains can supply a fake local anchor. -/
+def stripBinders : ExprSkeleton → ExprSkeleton
+  | pi _ b | lam _ b => b.stripBinders
   | e => e
 
 /-- No bound variable escapes `k` enclosing binders. -/
@@ -1069,7 +1080,7 @@ def validateCtorOfInduct (inv : ModuleInventory) (ci : ConstantRecord) (ctor : S
     ensure (cc.kind = .ctorDecl ci.name)
       (.invalidMutualAll inv.moduleName ci.name "inductive lists a constructor of another type")
 
-/-- Constructors and inductives must point at each other within the module. -/
+/-- Constructors, inductives, and recursor rules must point consistently within the module. -/
 def validateKindLinks (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit :=
   match ci.kind with
   | .ctorDecl induct =>
@@ -1086,6 +1097,18 @@ def validateKindLinks (inv : ModuleInventory) (ci : ConstantRecord) : Except Aud
     ensureNodup ctors
       (fun _ => .invalidMutualAll inv.moduleName ci.name "duplicate constructor name")
     checkAll ctors (validateCtorOfInduct inv ci)
+  | .recDecl rules => do
+    ensureNodup (rules.map (·.ctor))
+      (fun _ => .invalidMutualAll inv.moduleName ci.name "duplicate recursor rule constructor")
+    checkAll rules (fun r =>
+      match findConstByName inv.constants r.ctor with
+      | none => .error (.invalidMutualAll inv.moduleName ci.name "recursor rule names a missing constructor")
+      | some cc =>
+        match cc.kind with
+        | .ctorDecl parent =>
+          ensure (parent ∈ ci.all)
+            (.invalidMutualAll inv.moduleName ci.name "recursor rule constructor outside recursor .all")
+        | _ => .error (.invalidMutualAll inv.moduleName ci.name "recursor rule target is not a constructor"))
   | _ => .ok ()
 
 def validateAllField (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit :=
@@ -1257,16 +1280,12 @@ theorem worklist_closed {α ε : Type} [DecidableEq α] {expand : α → Except 
   | zero =>
     intro pending visited result h
     cases pending with
-    | nil =>
-      simp only [worklist, Except.ok.injEq] at h; subst h
-      exact ⟨fun _ hv => hv, by simp, fun _ hn => Or.inl hn⟩
-    | cons p rest => simp [worklist] at h
+    | nil => simp only [worklist, Except.ok.injEq] at h; subst h; exact ⟨fun _ hv => hv, by simp, fun _ hn => Or.inl hn⟩
+    | cons _ _ => simp [worklist] at h
   | succ fuel ih =>
     intro pending visited result h
     cases pending with
-    | nil =>
-      simp only [worklist, Except.ok.injEq] at h; subst h
-      exact ⟨fun _ hv => hv, by simp, fun _ hn => Or.inl hn⟩
+    | nil => simp only [worklist, Except.ok.injEq] at h; subst h; exact ⟨fun _ hv => hv, by simp, fun _ hn => Or.inl hn⟩
     | cons p rest =>
       simp only [worklist] at h
       split at h
@@ -1305,16 +1324,12 @@ theorem worklist_origin {α ε : Type} [DecidableEq α] {expand : α → Except 
   | zero =>
     intro pending visited result h
     cases pending with
-    | nil =>
-      simp only [worklist, Except.ok.injEq] at h; subst h
-      exact fun _ hn => Or.inl hn
-    | cons p rest => simp [worklist] at h
+    | nil => simp only [worklist, Except.ok.injEq] at h; subst h; exact fun _ hn => Or.inl hn
+    | cons _ _ => simp [worklist] at h
   | succ fuel ih =>
     intro pending visited result h
     cases pending with
-    | nil =>
-      simp only [worklist, Except.ok.injEq] at h; subst h
-      exact fun _ hn => Or.inl hn
+    | nil => simp only [worklist, Except.ok.injEq] at h; subst h; exact fun _ hn => Or.inl hn
     | cons p rest =>
       simp only [worklist] at h
       split at h
@@ -1391,11 +1406,7 @@ theorem worklist_error_of_fuel {α ε : Type} [DecidableEq α] {expand : α → 
       ∃ a, expand a = .error e := by
   intro fuel
   induction fuel with
-  | zero =>
-    intro pending visited e hfuel h
-    cases pending with
-    | nil => simp [worklist] at h
-    | cons p rest => simp at hfuel
+  | zero => intro pending visited e hfuel h; cases pending with | nil => simp [worklist] at h | cons _ _ => simp at hfuel
   | succ fuel ih =>
     intro pending visited e hfuel h
     cases pending with
@@ -1732,25 +1743,15 @@ theorem evalIn_liftFrom (M : Model) (k : Nat) : ∀ (e : ExprSkeleton) (c : Nat)
   induction e with
   | bvar i =>
     intro c ρ; simp only [ExprSkeleton.liftFrom]
-    by_cases h : i < c
-    · simp [h, evalIn]
-    · simp [h, evalIn]
-  | sort l => intro c ρ; rfl
-  | const n => intro c ρ; rfl
+    by_cases h : i < c <;> simp [h, evalIn]
   | app f a ihf iha => intro c ρ; simp only [ExprSkeleton.liftFrom, evalIn, ihf, iha]
   | lam t b _ ihb =>
     intro c ρ; simp only [ExprSkeleton.liftFrom, evalIn]
-    congr 1
-    funext d
-    rw [ihb (c + 1), cons_lift]
+    congr 1; funext d; rw [ihb (c + 1), cons_lift]
   | pi t b iht ihb =>
     intro c ρ; simp only [ExprSkeleton.liftFrom, evalIn]; rw [iht c ρ]
-    congr 1
-    funext v
-    rw [ihb (c + 1), cons_lift]
-  | natLit n => intro c ρ; rfl
-  | strLit s => intro c ρ; rfl
-  | proj s i e _ => intro c ρ; rfl
+    congr 1; funext v; rw [ihb (c + 1), cons_lift]
+  | sort _ | const _ | natLit _ | strLit _ | proj _ _ _ => intro c ρ; rfl
 
 theorem cons_inst (M : Model) (a : ExprSkeleton) (v : SemVal) (ρ : Valuation) (c : Nat) :
     (fun i => if i < c + 1 then Valuation.cons v ρ i
@@ -1768,9 +1769,7 @@ theorem cons_inst (M : Model) (a : ExprSkeleton) (v : SemVal) (ρ : Valuation) (
     · rfl
     · split
       · rfl
-      · cases j with
-        | zero => omega
-        | succ j' => rfl
+      · cases j with | zero => omega | succ _ => rfl
 
 theorem evalIn_instAt (M : Model) (a : ExprSkeleton) :
     ∀ (e : ExprSkeleton) (c : Nat) (ρ : Valuation),
@@ -1784,36 +1783,22 @@ theorem evalIn_instAt (M : Model) (a : ExprSkeleton) :
     by_cases h1 : i < c
     · simp [h1, evalIn]
     · by_cases h2 : i = c
-      · subst h2
-        simp only [Nat.lt_irrefl, ↓reduceIte, evalIn]; rw [evalIn_liftFrom]
-        simp
+      · subst h2; simp only [Nat.lt_irrefl, ↓reduceIte, evalIn]; rw [evalIn_liftFrom]; simp
       · simp [h1, h2, evalIn]
-  | sort l => intro c ρ; rfl
-  | const n => intro c ρ; rfl
   | app f x ihf ihx => intro c ρ; simp only [ExprSkeleton.instAt, evalIn, ihf, ihx]
   | lam t b _ ihb =>
     intro c ρ; simp only [ExprSkeleton.instAt, evalIn]
-    congr 1
-    funext d
-    rw [ihb (c + 1), cons_inst]
+    congr 1; funext d; rw [ihb (c + 1), cons_inst]
   | pi t b iht ihb =>
     intro c ρ; simp only [ExprSkeleton.instAt, evalIn]; rw [iht c ρ]
-    congr 1
-    funext v
-    rw [ihb (c + 1), cons_inst]
-  | natLit n => intro c ρ; rfl
-  | strLit s => intro c ρ; rfl
-  | proj s i e _ => intro c ρ; rfl
+    congr 1; funext v; rw [ihb (c + 1), cons_inst]
+  | sort _ | const _ | natLit _ | strLit _ | proj _ _ _ => intro c ρ; rfl
 
 /-- Substitution lemma: instantiating the body is evaluating it with the argument's value. -/
 theorem evalIn_instantiate (M : Model) (b a : ExprSkeleton) (ρ : Valuation) :
     evalIn M ρ (b.instantiate a) = evalIn M (Valuation.cons (evalIn M ρ a) ρ) b := by
   unfold ExprSkeleton.instantiate; rw [evalIn_instAt]
-  congr 1
-  funext i
-  cases i with
-  | zero => simp [Valuation.cons]
-  | succ j => simp [Valuation.cons]
+  congr 1; funext i; cases i <;> simp [Valuation.cons]
 
 /-- The denotation depends on the model only at the constants the expression mentions. -/
 theorem evalIn_model_congr {M M' : Model} :
@@ -1821,26 +1806,18 @@ theorem evalIn_model_congr {M M' : Model} :
       evalIn M ρ e = evalIn M' ρ e := by
   intro e
   induction e with
-  | bvar i => intro ρ _; rfl
-  | sort l => intro ρ _; rfl
   | const n => intro ρ h; exact h n (by simp [ExprSkeleton.usedConstants])
   | app f a ihf iha =>
     intro ρ h; simp only [ExprSkeleton.usedConstants, List.mem_append] at h
     simp only [evalIn, ihf ρ (fun c hc => h c (Or.inl hc)), iha ρ (fun c hc => h c (Or.inr hc))]
   | lam t b _ ihb =>
     intro ρ h; simp only [ExprSkeleton.usedConstants, List.mem_append] at h; simp only [evalIn]
-    congr 1
-    funext d
-    exact ihb _ (fun c hc => h c (Or.inr hc))
+    congr 1; funext d; exact ihb _ (fun c hc => h c (Or.inr hc))
   | pi t b iht ihb =>
     intro ρ h; simp only [ExprSkeleton.usedConstants, List.mem_append] at h
     simp only [evalIn]; rw [iht ρ (fun c hc => h c (Or.inl hc))]
-    congr 1
-    funext v
-    exact ihb _ (fun c hc => h c (Or.inr hc))
-  | natLit n => intro ρ _; rfl
-  | strLit s => intro ρ _; rfl
-  | proj s i e _ => intro ρ _; rfl
+    congr 1; funext v; exact ihb _ (fun c hc => h c (Or.inr hc))
+  | bvar _ | sort _ | natLit _ | strLit _ | proj _ _ _ => intro ρ _; rfl
 
 /-- A closed expression denotes the same value under every valuation. -/
 theorem evalIn_closedBelow (M : Model) :
@@ -1850,32 +1827,21 @@ theorem evalIn_closedBelow (M : Model) :
   induction e with
   | bvar i =>
     intro k ρ ρ' hc h; simp only [ExprSkeleton.closedBelow, decide_eq_true_eq] at hc; exact h i hc
-  | sort l => intros; rfl
-  | const n => intros; rfl
   | app f a ihf iha =>
     intro k ρ ρ' hc h; simp only [ExprSkeleton.closedBelow, Bool.and_eq_true] at hc
     simp only [evalIn, ihf k ρ ρ' hc.1 h, iha k ρ ρ' hc.2 h]
   | lam t b _ ihb =>
-    intro k ρ ρ' hc h; simp only [ExprSkeleton.closedBelow, Bool.and_eq_true] at hc
-    simp only [evalIn]
-    congr 1
-    funext d
+    intro k ρ ρ' hc h; simp only [ExprSkeleton.closedBelow, Bool.and_eq_true] at hc; simp only [evalIn]
+    congr 1; funext d
     refine ihb (k + 1) _ _ hc.2 (fun i hi => ?_)
-    cases i with
-    | zero => rfl
-    | succ j => exact h j (by omega)
+    cases i with | zero => rfl | succ j => exact h j (by omega)
   | pi t b iht ihb =>
     intro k ρ ρ' hc h; simp only [ExprSkeleton.closedBelow, Bool.and_eq_true] at hc
     simp only [evalIn]; rw [iht k ρ ρ' hc.1 h]
-    congr 1
-    funext v
+    congr 1; funext v
     refine ihb (k + 1) _ _ hc.2 (fun i hi => ?_)
-    cases i with
-    | zero => rfl
-    | succ j => exact h j (by omega)
-  | natLit n => intros; rfl
-  | strLit s => intros; rfl
-  | proj s i e _ => intros; rfl
+    cases i with | zero => rfl | succ j => exact h j (by omega)
+  | sort _ | const _ | natLit _ | strLit _ | proj _ _ _ => intros; rfl
 
 theorem evalIn_closed (M : Model) {e : ExprSkeleton} (hc : e.closedBelow 0 = true)
     (ρ ρ' : Valuation) : evalIn M ρ e = evalIn M ρ' e :=
@@ -1932,49 +1898,30 @@ theorem whnf_sound {env : KernelEnv} {M : Model} (hs : EnvSound env M) :
           | natLit n => simp only [evalIn, applyVal]
           | strLit s => simp only [evalIn, applyVal]
           | _ => simp [ExprSkeleton.isLiteral] at hlit
-        · simp only [evalIn] at hf ⊢
-          rw [hf]
-      · simp only [evalIn]
-        rw [hf]
-    | bvar i => rfl
-    | sort l => rfl
-    | lam t b => rfl
-    | pi t b => rfl
-    | natLit n => rfl
-    | strLit s => rfl
-    | proj s i e => rfl
+        · simp only [evalIn] at hf ⊢; rw [hf]
+      · simp only [evalIn]; rw [hf]
+    | bvar _ | sort _ | lam _ _ | pi _ _ | natLit _ | strLit _ | proj _ _ _ => rfl
 
 theorem isDefEq_sound {env : KernelEnv} {M : Model} (hs : EnvSound env M) :
     ∀ (fuel : Nat) (a b : ExprSkeleton), isDefEq env fuel a b = true →
       ∀ ρ, evalIn M ρ a = evalIn M ρ b := by
   intro fuel
   induction fuel with
-  | zero =>
-    intro a b h ρ; simp only [isDefEq, decide_eq_true_eq] at h; rw [h]
+  | zero => intro a b h ρ; simp only [isDefEq, decide_eq_true_eq] at h; rw [h]
   | succ fuel ih =>
     intro a b h ρ; simp only [isDefEq, Bool.or_eq_true, decide_eq_true_eq] at h
     rcases h with rfl | h
     · rfl
     · rw [← whnf_sound hs fuel a ρ, ← whnf_sound hs fuel b ρ]
-      revert h
-      generalize whnf env fuel a = a'
-      generalize whnf env fuel b = b'
-      intro h
+      revert h; generalize whnf env fuel a = a'; generalize whnf env fuel b = b'; intro h
       split at h
       · simp only [Bool.and_eq_true] at h
         simp only [evalIn, ih _ _ h.1 ρ, ih _ _ h.2 ρ]
-      · simp only [Bool.and_eq_true] at h
-        simp only [evalIn]
-        congr 1
-        funext d
-        exact ih _ _ h.2 _
-      · simp only [Bool.and_eq_true] at h
-        simp only [evalIn]; rw [ih _ _ h.1 ρ]
-        congr 1
-        funext v
-        exact ih _ _ h.2 _
-      · simp only [decide_eq_true_eq] at h
-        rw [h]
+      · simp only [Bool.and_eq_true] at h; simp only [evalIn]
+        congr 1; funext d; exact ih _ _ h.2 _
+      · simp only [Bool.and_eq_true] at h; simp only [evalIn]; rw [ih _ _ h.1 ρ]
+        congr 1; funext v; exact ih _ _ h.2 _
+      · simp only [decide_eq_true_eq] at h; rw [h]
 
 theorem asSort_sound {env : KernelEnv} {M : Model} (hs : EnvSound env M) {fuel : Nat}
     {t : ExprSkeleton} {l : Nat} (h : asSort env fuel t = .ok l) (ρ : Valuation) :
@@ -2055,12 +2002,8 @@ theorem inferType_sound {env : KernelEnv} {M : Model} (hs : EnvSound env M) :
               simp only [semPiData, Mem] at h1 h2; obtain ⟨g, hg, hall⟩ := h1
               obtain ⟨d, hd, hcar⟩ := h2; rw [hg, hd]; simp only [applyVal]
               exact hall d ⟨d, rfl, hcar⟩
-            | junk => simp only [semPiData, Mem] at h1
-            | prop P => simp only [semPiData, Mem] at h1
-            | sort l => simp only [semPiData, Mem] at h1
-            | elem d => simp only [semPiData, Mem] at h1
-            | fn g => simp only [semPiData, Mem] at h1
-            | piTy A' B' => simp only [semPiData, Mem] at h1
+            | junk | prop _ | sort _ | elem _ | fn _ | piTy _ _ =>
+              simp only [semPiData, Mem] at h1
         · cases h
       · cases h
     | lam t b =>
@@ -2641,8 +2584,7 @@ theorem replayCleanEnv_preserves_sound {allow : ConstantRecord → Bool} :
       ∃ M', EnvSound env' M' := by
   intro decls
   induction decls with
-  | nil =>
-    intro env env' M hs _ h; simp only [replayCleanEnv, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
+  | nil => intro env env' M hs _ h; simp only [replayCleanEnv, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
   | cons ci rest ih =>
     intro env env' M hs hallow h; simp only [replayCleanEnv] at h
     split at h
@@ -2771,16 +2713,12 @@ theorem replayOrderedLoop_spec {allow : ConstantRecord → Bool} :
   | zero =>
     intro env env' pending h
     cases pending with
-    | nil =>
-      simp only [replayOrderedLoop, Except.ok.injEq] at h; subst h
-      exact ⟨fun _ _ hx => hx, by simp⟩
-    | cons ci rest => simp [replayOrderedLoop] at h
+    | nil => simp only [replayOrderedLoop, Except.ok.injEq] at h; subst h; exact ⟨fun _ _ hx => hx, by simp⟩
+    | cons _ _ => simp [replayOrderedLoop] at h
   | succ fuel ih =>
     intro env env' pending h
     cases pending with
-    | nil =>
-      simp only [replayOrderedLoop, Except.ok.injEq] at h; subst h
-      exact ⟨fun _ _ hx => hx, by simp⟩
+    | nil => simp only [replayOrderedLoop, Except.ok.injEq] at h; subst h; exact ⟨fun _ _ hx => hx, by simp⟩
     | cons ci rest =>
       simp only [replayOrderedLoop] at h
       split at h
@@ -2804,14 +2742,12 @@ theorem replayOrderedLoop_sound {allow : ConstantRecord → Bool} :
   | zero =>
     intro env env' pending M hs _ h
     cases pending with
-    | nil =>
-      simp only [replayOrderedLoop, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
-    | cons ci rest => simp [replayOrderedLoop] at h
+    | nil => simp only [replayOrderedLoop, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
+    | cons _ _ => simp [replayOrderedLoop] at h
   | succ fuel ih =>
     intro env env' pending M hs hallow h
     cases pending with
-    | nil =>
-      simp only [replayOrderedLoop, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
+    | nil => simp only [replayOrderedLoop, Except.ok.injEq] at h; exact ⟨M, h ▸ hs⟩
     | cons ci rest =>
       simp only [replayOrderedLoop] at h
       split at h
@@ -2854,8 +2790,7 @@ open SymName in
 def standardBaseDecls : List ConstantRecord := [
   baseDecl natName (.inductDecl [natZeroName, natSuccName]) (.sort 1) initPreludeModuleName,
   baseDecl natZeroName (.ctorDecl natName) (.const natName) initPreludeModuleName,
-  baseDecl natSuccName (.ctorDecl natName) (.pi (.const natName) (.const natName))
-    initPreludeModuleName,
+  baseDecl natSuccName (.ctorDecl natName) (.pi (.const natName) (.const natName)) initPreludeModuleName,
   baseDecl boolName (.inductDecl [boolFalseName, boolTrueName]) (.sort 1) initPreludeModuleName,
   baseDecl boolFalseName (.ctorDecl boolName) (.const boolName) initPreludeModuleName,
   baseDecl boolTrueName (.ctorDecl boolName) (.const boolName) initPreludeModuleName,
@@ -2863,19 +2798,12 @@ def standardBaseDecls : List ConstantRecord := [
   baseDecl trueName (.inductDecl [trueIntroName]) (.sort 0) initPreludeModuleName,
   baseDecl trueIntroName (.ctorDecl trueName) (.const trueName) initPreludeModuleName,
   baseDecl falseName (.inductDecl []) (.sort 0) initPreludeModuleName,
-  baseDecl eqName (.inductDecl [eqReflName])
-    (.pi (.const natName) (.pi (.const natName) (.sort 0))) initPreludeModuleName,
-  baseDecl eqReflName (.ctorDecl eqName)
-    (.pi (.const natName) (.app (.app (.const eqName) (.bvar 0)) (.bvar 0))) initPreludeModuleName,
-  baseDecl eqBoolName (.inductDecl [eqBoolReflName])
-    (.pi (.const boolName) (.pi (.const boolName) (.sort 0))) initPreludeModuleName,
-  baseDecl eqBoolReflName (.ctorDecl eqBoolName)
-    (.pi (.const boolName) (.app (.app (.const eqBoolName) (.bvar 0)) (.bvar 0)))
-    initPreludeModuleName,
-  baseDecl verificationResultName (.inductDecl [verificationResultIntroName])
-    (.pi (.const natName) (.sort 0)) trustedCoreModuleName,
-  baseDecl verificationResultIntroName (.ctorDecl verificationResultName)
-    (.pi (.const natName) (.app (.const verificationResultName) (.bvar 0))) trustedCoreModuleName,
+  baseDecl eqName (.inductDecl [eqReflName]) (.pi (.const natName) (.pi (.const natName) (.sort 0))) initPreludeModuleName,
+  baseDecl eqReflName (.ctorDecl eqName) (.pi (.const natName) (.app (.app (.const eqName) (.bvar 0)) (.bvar 0))) initPreludeModuleName,
+  baseDecl eqBoolName (.inductDecl [eqBoolReflName]) (.pi (.const boolName) (.pi (.const boolName) (.sort 0))) initPreludeModuleName,
+  baseDecl eqBoolReflName (.ctorDecl eqBoolName) (.pi (.const boolName) (.app (.app (.const eqBoolName) (.bvar 0)) (.bvar 0))) initPreludeModuleName,
+  baseDecl verificationResultName (.inductDecl [verificationResultIntroName]) (.pi (.const natName) (.sort 0)) trustedCoreModuleName,
+  baseDecl verificationResultIntroName (.ctorDecl verificationResultName) (.pi (.const natName) (.app (.const verificationResultName) (.bvar 0))) trustedCoreModuleName,
   baseDecl propextName .axiomDecl (.const trueName) initCoreModuleName,
   baseDecl choiceName .axiomDecl (.const trueName) initCoreModuleName,
   baseDecl quotSoundName .axiomDecl (.const trueName) initCoreModuleName,
@@ -2891,10 +2819,7 @@ open SymName in
 def standardBaseModel : Model := fun c =>
   if c = natName then .dataTy .nat
   else if c = natZeroName then .elem (.nat 0)
-  else if c = natSuccName then
-    .fn (fun d => match d with
-      | .nat n => .elem (.nat (n + 1))
-      | _ => .junk)
+  else if c = natSuccName then .fn (fun | .nat n => .elem (.nat (n + 1)) | _ => .junk)
   else if c = boolName then .dataTy (.enum boolName [boolFalseName, boolTrueName])
   else if c = boolFalseName then .elem (.enum boolName boolFalseName)
   else if c = boolTrueName then .elem (.enum boolName boolTrueName)
@@ -2909,26 +2834,18 @@ def standardBaseModel : Model := fun c =>
 
 theorem sbm_nat : standardBaseModel SymName.natName = .dataTy .nat := rfl
 theorem sbm_zero : standardBaseModel SymName.natZeroName = .elem (.nat 0) := rfl
-theorem sbm_succ : standardBaseModel SymName.natSuccName = .fn (fun d => match d with
-      | .nat n => .elem (.nat (n + 1))
-      | _ => .junk) := rfl
-theorem sbm_bool : standardBaseModel SymName.boolName =
-    .dataTy (.enum SymName.boolName [SymName.boolFalseName, SymName.boolTrueName]) := rfl
-theorem sbm_boolFalse : standardBaseModel SymName.boolFalseName =
-    .elem (.enum SymName.boolName SymName.boolFalseName) := rfl
-theorem sbm_boolTrue : standardBaseModel SymName.boolTrueName =
-    .elem (.enum SymName.boolName SymName.boolTrueName) := rfl
+theorem sbm_succ : standardBaseModel SymName.natSuccName =
+    .fn (fun | .nat n => .elem (.nat (n + 1)) | _ => .junk) := rfl
+theorem sbm_bool : standardBaseModel SymName.boolName = .dataTy (.enum SymName.boolName [SymName.boolFalseName, SymName.boolTrueName]) := rfl
+theorem sbm_boolFalse : standardBaseModel SymName.boolFalseName = .elem (.enum SymName.boolName SymName.boolFalseName) := rfl
+theorem sbm_boolTrue : standardBaseModel SymName.boolTrueName = .elem (.enum SymName.boolName SymName.boolTrueName) := rfl
 theorem sbm_string : standardBaseModel SymName.stringName = .dataTy .str := rfl
 theorem sbm_true : standardBaseModel SymName.trueName = .prop True := rfl
-theorem sbm_trueIntro : standardBaseModel SymName.trueIntroName =
-    .elem (.enum SymName.trueName SymName.trueIntroName) := rfl
+theorem sbm_trueIntro : standardBaseModel SymName.trueIntroName = .elem (.enum SymName.trueName SymName.trueIntroName) := rfl
 theorem sbm_false : standardBaseModel SymName.falseName = .prop False := rfl
-theorem sbm_eq : standardBaseModel SymName.eqName =
-    .fn (fun a => .fn (fun b => .prop (a = b))) := rfl
-theorem sbm_eqBool : standardBaseModel SymName.eqBoolName =
-    .fn (fun a => .fn (fun b => .prop (a = b))) := rfl
-theorem sbm_verificationResult : standardBaseModel SymName.verificationResultName =
-    .fn (fun _ => .prop True) := rfl
+theorem sbm_eq : standardBaseModel SymName.eqName = .fn (fun a => .fn (fun b => .prop (a = b))) := rfl
+theorem sbm_eqBool : standardBaseModel SymName.eqBoolName = .fn (fun a => .fn (fun b => .prop (a = b))) := rfl
+theorem sbm_verificationResult : standardBaseModel SymName.verificationResultName = .fn (fun _ => .prop True) := rfl
 
 theorem forall_lookup_base {P : SymName → ConstantRecord → Prop} {decls : List ConstantRecord}
     (h : ∀ ci ∈ decls, P ci.name ci) :
@@ -3462,7 +3379,7 @@ def forbiddenOptionTokens : List (List Char) :=
 /-- Banned in every mode: native-reduction primitives, code-generation hooks, `unsafe` and
 `partial`, and commands or tactics that run metaprograms or compile-time evaluation. -/
 def metaExecTokens : List (List Char) :=
-  [['b', 'y', '_', 'e', 'l', 'a', 'b'], ['r', 'u', 'n', '_', 't', 'a', 'c'], ['r', 'u', 'n', '_', 'c', 'm', 'd'], ['r', 'u', 'n', '_', 'm', 'e', 't', 'a'], ['r', 'u', 'n', '_', 'e', 'l', 'a', 'b'], ['#', 'e', 'v', 'a', 'l'], ['#', 'r', 'e', 'd', 'u', 'c', 'e']]
+  [['b', 'y', '_', 'e', 'l', 'a', 'b'], ['r', 'u', 'n', '_', 't', 'a', 'c'], ['r', 'u', 'n', '_', 'c', 'm', 'd'], ['r', 'u', 'n', '_', 'm', 'e', 't', 'a'], ['r', 'u', 'n', '_', 'e', 'l', 'a', 'b'], ['#', 'e', 'v', 'a', 'l'], ['#', 'r', 'e', 'd', 'u', 'c', 'e'], ['#', 'g', 'u', 'a', 'r', 'd'], ['#', 'g', 'u', 'a', 'r', 'd', '_', 'p', 'a', 'n', 'i', 'c'], ['#', 'g', 'u', 'a', 'r', 'd', '_', 'e', 'x', 'p', 'r'], ['m', 'e', 't', 'a']]
 
 /-- Commands and attributes that add syntax, tokens, or macros, even `local` ones. -/
 def syntaxExtensionTokens : List (List Char) :=
@@ -3493,6 +3410,22 @@ def initAttributeAux : Nat → List (List Char) → Option (List Char)
 
 def initAttribute? (toks : List (List Char)) : Option (List Char) :=
   initAttributeAux 0 toks
+
+/-- Reject `module` headers and explicit import modifiers (`import all`, `public import`,
+`private import`), mirroring `TrustedBoundary.inspectSource` without flagging ordinary
+identifiers such as `def module := 1` or `def all := 1`. -/
+def importModifierAux : List (List Char) → Option (List Char)
+  | t1 :: t2 :: rest =>
+    if tokenHasKeyword Chars.kwImport t1 ∧ tokenHasKeyword Chars.kwAll t2 then some Chars.kwAll
+    else if (tokenHasKeyword Chars.kwPublic t1 ∨ tokenHasKeyword Chars.kwPrivate t1) ∧
+        tokenHasKeyword Chars.kwImport t2 then some Chars.kwImport
+    else importModifierAux (t2 :: rest)
+  | _ => none
+def headerModifierViolation? : List (List Char) → Option (List Char)
+  | [] => none
+  | t :: rest =>
+    if tokenHasKeyword Chars.kwModule t then some Chars.kwModule
+    else importModifierAux (t :: rest)
 def stripLeadingDigits : List Char → List Char
   | c :: rest => if c.isDigit then stripLeadingDigits rest else c :: rest
   | [] => []
@@ -3535,8 +3468,8 @@ def checkTokens (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     match firstKeyword? forbiddenOptionTokens toks with
     | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
     | none =>
-      match (((firstKeyword? alwaysForbiddenTokens toks).or (builtinForbidden? toks)).or
-          (parserAttribute? toks)).or (initAttribute? toks) with
+      match ((((firstKeyword? alwaysForbiddenTokens toks).or (builtinForbidden? toks)).or
+          (parserAttribute? toks)).or (initAttribute? toks)).or (headerModifierViolation? toks) with
       | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
       | none =>
         if cfg.allowProvisionalNative = true ∧ role = .proof then .ok ()
@@ -3772,64 +3705,151 @@ def normInstanceExprOptIn (env : KernelEnv) : Nat → ExprSkeleton → Option Ex
 def instanceNormFuelIn (env : KernelEnv) (e : ExprSkeleton) : Nat :=
   64 + 4 * e.size + 2 * env.length + 2 * envBodySize env
 def normInstanceTargetOptIn (env : KernelEnv) (e : ExprSkeleton) : Option ExprSkeleton :=
-  (normInstanceExprOptIn env (instanceNormFuelIn env e) e).map ExprSkeleton.piTarget
+  (normInstanceExprOptIn env (instanceNormFuelIn env e) e).map ExprSkeleton.stripBinders
 def normInstanceExprOpt (inv : ModuleInventory) : Nat → ExprSkeleton → Option ExprSkeleton :=
   normInstanceExprOptIn (mkBaseKernelEnv inv.constants)
 def normInstanceTargetOpt (inv : ModuleInventory) (e : ExprSkeleton) : Option ExprSkeleton :=
   normInstanceTargetOptIn (mkBaseKernelEnv inv.constants) e
 
-/-- Non-definition local declaration without a reducibility attribute: cannot silently
-unfold to an imported type or class during instance synthesis. -/
+/-- Non-reductive local declaration without a reducibility attribute: cannot silently
+unfold or ι-reduce away to an imported type or class during instance synthesis. -/
 def isBaseInstanceAnchor (inv : ModuleInventory) (d : SymName) : Bool :=
   isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries) &&
     match findConstByName inv.constants d with
-    | some ci => decide (ci.kind ≠ .defnDecl)
+    | some ci => decide (ci.kind ≠ .defnDecl ∧ ci.kind.tag ≠ .recTag ∧ ci.kind ≠ .quotDecl)
     | none => false
+
+/-- An application head that is rigid in Lean's kernel (never unfolds or ι-reduces arguments). -/
+def isRigidAppHead (env : KernelEnv) (c : SymName) : Bool :=
+  match env.lookup c with
+  | some ci =>
+    match ci.kind with
+    | .inductDecl _ | .ctorDecl _ | .opaqueDecl | .axiomDecl => true
+    | _ => false
+  | none => false
+
+/-- A head that can unfold or ι-reduce away arguments (definitions, recursors, quotients). -/
+def isReductiveHead (env : KernelEnv) (c : SymName) : Bool :=
+  match env.lookup c with
+  | some ci => decide (ci.kind = .defnDecl ∨ ci.kind.tag = .recTag ∨ ci.kind = .quotDecl)
+  | none => false
+
+/-- Rigid structural anchoring: a local base anchor appears only at a head or under rigid
+constructors/types (never hidden inside `.proj`, `.recDecl`, `.quotDecl`, unknown reducers,
+or unused `.lam` binder domains). -/
+def hasRigidBaseAnchor (env : KernelEnv) (inv : ModuleInventory) : ExprSkeleton → Bool
+  | .const c => isBaseInstanceAnchor inv c
+  | .pi dom cod => hasRigidBaseAnchor env inv dom || hasRigidBaseAnchor env inv cod
+  | .lam _ body => hasRigidBaseAnchor env inv body
+  | .app f a =>
+    match (ExprSkeleton.app f a).getAppFn with
+    | .const head =>
+      isBaseInstanceAnchor inv head ||
+        (isRigidAppHead env head &&
+          ((match f with | .const _ => false | _ => hasRigidBaseAnchor env inv f) ||
+            hasRigidBaseAnchor env inv a))
+    | _ => false
+  | _ => false
+
+theorem getAppFn_const_mem {e : ExprSkeleton} {c : SymName}
+    (h : e.getAppFn = .const c) : c ∈ e.usedConstants := by
+  induction e with
+  | const n => simp [ExprSkeleton.getAppFn] at h; subst h; simp [ExprSkeleton.usedConstants]
+  | app f a ihf _ =>
+    simp only [ExprSkeleton.getAppFn] at h; exact List.mem_append_left _ (ihf h)
+  | _ => simp [ExprSkeleton.getAppFn] at h
+
+theorem hasRigidBaseAnchor_exists_base {env : KernelEnv} {inv : ModuleInventory} :
+    ∀ {e : ExprSkeleton}, hasRigidBaseAnchor env inv e = true →
+      ∃ anchor ∈ e.usedConstants, isBaseInstanceAnchor inv anchor = true := by
+  intro e
+  induction e with
+  | const c => intro h; exact ⟨c, List.mem_cons_self, h⟩
+  | pi dom cod ihd ihc =>
+    intro h; simp only [hasRigidBaseAnchor, Bool.or_eq_true] at h
+    rcases h with hd | hc
+    · obtain ⟨a, ha, hb⟩ := ihd hd; exact ⟨a, List.mem_append_left _ ha, hb⟩
+    · obtain ⟨a, ha, hb⟩ := ihc hc; exact ⟨a, List.mem_append_right _ ha, hb⟩
+  | lam _ body _ ihb =>
+    intro h; obtain ⟨a, ha, hb⟩ := ihb h; exact ⟨a, List.mem_append_right _ ha, hb⟩
+  | app f a ihf iha =>
+    intro h; simp only [hasRigidBaseAnchor] at h
+    split at h
+    · rename_i head hfn
+      simp only [Bool.or_eq_true, Bool.and_eq_true] at h
+      rcases h with hhead | ⟨_, hf | ha⟩
+      · exact ⟨head, getAppFn_const_mem hfn, hhead⟩
+      · split at hf
+        · cases hf
+        · obtain ⟨x, hx, hb⟩ := ihf hf; exact ⟨x, List.mem_append_left _ hx, hb⟩
+      · obtain ⟨x, hx, hb⟩ := iha ha; exact ⟨x, List.mem_append_right _ hx, hb⟩
+    · cases h
+  | bvar _ | sort _ | natLit _ | strLit _ | proj _ _ _ => intro h; cases h
+
 def outParamTake2Classes : List (List Char) := [['H', 'A', 'd', 'd'], ['H', 'S', 'u', 'b'], ['H', 'M', 'u', 'l'], ['H', 'D', 'i', 'v'], ['H', 'M', 'o', 'd'], ['H', 'P', 'o', 'w'], ['H', 'A', 'p', 'p', 'e', 'n', 'd'], ['H', 'A', 'n', 'd'], ['H', 'O', 'r'], ['H', 'X', 'o', 'r'], ['H', 'S', 'h', 'i', 'f', 't', 'L', 'e', 'f', 't'], ['H', 'S', 'h', 'i', 'f', 't', 'R', 'i', 'g', 'h', 't'], ['H', 'S', 'M', 'u', 'l'], ['H', 'A', 'n', 'd', 'T', 'h', 'e', 'n'], ['H', 'O', 'r', 'E', 'l', 's', 'e'], ['G', 'e', 't', 'E', 'l', 'e', 'm'], ['G', 'e', 't', 'E', 'l', 'e', 'm', '?'], ['F', 'o', 'r', 'I', 'n'], ['F', 'o', 'r', 'I', 'n', '\''], ['F', 'o', 'r', 'M']]
 def outParamTake1Classes : List (List Char) := [['C', 'o', 'e', 'O', 'u', 't'], ['C', 'o', 'e', 'F', 'u', 'n'], ['C', 'o', 'e', 'S', 'o', 'r', 't'], ['C', 'o', 'e', 'H', 'e', 'a', 'd']]
 def outParamDrop1Classes : List (List Char) := [['C', 'o', 'e'], ['C', 'o', 'e', 'T', 'a', 'i', 'l'], ['M', 'e', 'm', 'b', 'e', 'r', 's', 'h', 'i', 'p'], ['I', 'n', 's', 'e', 'r', 't'], ['S', 'i', 'n', 'g', 'l', 'e', 't', 'o', 'n'], ['S', 'e', 'p'], ['M', 'o', 'n', 'a', 'd', 'S', 't', 'a', 't', 'e'], ['M', 'o', 'n', 'a', 'd', 'S', 't', 'a', 't', 'e', 'O', 'f'], ['M', 'o', 'n', 'a', 'd', 'R', 'e', 'a', 'd', 'e', 'r'], ['M', 'o', 'n', 'a', 'd', 'R', 'e', 'a', 'd', 'e', 'r', 'O', 'f'], ['M', 'o', 'n', 'a', 'd', 'W', 'i', 't', 'h', 'R', 'e', 'a', 'd', 'e', 'r'], ['M', 'o', 'n', 'a', 'd', 'W', 'i', 't', 'h', 'R', 'e', 'a', 'd', 'e', 'r', 'O', 'f'], ['M', 'o', 'n', 'a', 'd', 'E', 'x', 'c', 'e', 'p', 't'], ['M', 'o', 'n', 'a', 'd', 'E', 'x', 'c', 'e', 'p', 't', 'O', 'f'], ['M', 'o', 'n', 'a', 'd', 'L', 'i', 'f', 't'], ['M', 'o', 'n', 'a', 'd', 'F', 'u', 'n', 'c', 't', 'o', 'r'], ['M', 'o', 'n', 'a', 'd', 'C', 'o', 'n', 't', 'r', 'o', 'l'], ['M', 'o', 'n', 'a', 'd', 'E', 'v', 'a', 'l'], ['L', 'a', 'w', 'f', 'u', 'l', 'M', 'o', 'n', 'a', 'd', 'L', 'i', 'f', 't'], ['S', 'T', 'W', 'o', 'r', 'l', 'd']]
 def outParamDrop1Multi : List (List (List Char)) := [[['E', 'S', 't', 'a', 't', 'e', 'M'], ['B', 'a', 'c', 'k', 't', 'r', 'a', 'c', 'k', 'a', 'b', 'l', 'e']], [['S', 't', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['B', 'V', 'D', 'e', 'c', 'i', 'd', 'e'], ['L', 'R', 'A', 'T'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['C', 'l', 'a', 'u', 's', 'e']]]
 def outParamDrop2Multi : List (List (List Char)) := [[['S', 't', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['B', 'V', 'D', 'e', 'c', 'i', 'd', 'e'], ['L', 'R', 'A', 'T'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['F', 'o', 'r', 'm', 'u', 'l', 'a']]]
-def outParamTake1Multi : List (List (List Char)) := [[['S', 't', 'd'], ['S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['T', 'o', 'S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['S', 'l', 'i', 'c', 'e'], ['S', 'e', 'l', 'f']], [['S', 't', 'd'], ['A', 's', 'y', 'n', 'c'], ['I', 'O'], ['A', 's', 'y', 'n', 'c', 'S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['D', 'o'], ['W', 'P']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['P', 'r', 'o', 'p', 'A', 's', 'S', 'P', 'r', 'e', 'd', 'T', 'a', 'u', 't', 'o', 'l', 'o', 'g', 'y']]]
-def outParamTake2Multi : List (List (List Char)) := [[['S', 't', 'r', 'i', 'n', 'g'], ['S', 'l', 'i', 'c', 'e'], ['P', 'a', 't', 't', 'e', 'r', 'n'], ['T', 'o', 'B', 'a', 'c', 'k', 'w', 'a', 'r', 'd', 'S', 'e', 'a', 'r', 'c', 'h', 'e', 'r']], [['S', 't', 'r', 'i', 'n', 'g'], ['S', 'l', 'i', 'c', 'e'], ['P', 'a', 't', 't', 'e', 'r', 'n'], ['T', 'o', 'F', 'o', 'r', 'w', 'a', 'r', 'd', 'S', 'e', 'a', 'r', 'c', 'h', 'e', 'r']], [['S', 't', 'd'], ['I', 't', 'e', 'r', 'a', 't', 'o', 'r']], [['S', 't', 'd'], ['T', 'o', 'I', 't', 'e', 'r', 'a', 't', 'o', 'r']], [['S', 't', 'd'], ['I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['L', 'a', 'w', 'f', 'u', 'l', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['H', 'a', 's', 'F', 'r', 'a', 'm', 'e']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['I', 's', 'A', 'n', 'd']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['I', 's', 'P', 'u', 'r', 'e']]]
+def outParamTake1Multi : List (List (List Char)) := [[['L', 'e', 'a', 'n'], ['G', 'r', 'i', 'n', 'd'], ['T', 'o', 'I', 'n', 't']], [['S', 't', 'd'], ['S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['T', 'o', 'S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['S', 'l', 'i', 'c', 'e'], ['S', 'e', 'l', 'f']], [['S', 't', 'd'], ['A', 's', 'y', 'n', 'c'], ['I', 'O'], ['A', 's', 'y', 'n', 'c', 'S', 't', 'r', 'e', 'a', 'm']], [['S', 't', 'd'], ['D', 'o'], ['W', 'P']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['P', 'r', 'o', 'p', 'A', 's', 'S', 'P', 'r', 'e', 'd', 'T', 'a', 'u', 't', 'o', 'l', 'o', 'g', 'y']]]
+def outParamTake2Multi : List (List (List Char)) := [[['L', 'e', 'a', 'n'], ['G', 'r', 'i', 'n', 'd'], ['I', 's', 'C', 'h', 'a', 'r', 'P']], [['L', 'e', 'a', 'n'], ['G', 'r', 'i', 'n', 'd'], ['P', 'o', 'w', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'r', 'i', 'n', 'g'], ['S', 'l', 'i', 'c', 'e'], ['P', 'a', 't', 't', 'e', 'r', 'n'], ['T', 'o', 'B', 'a', 'c', 'k', 'w', 'a', 'r', 'd', 'S', 'e', 'a', 'r', 'c', 'h', 'e', 'r']], [['S', 't', 'r', 'i', 'n', 'g'], ['S', 'l', 'i', 'c', 'e'], ['P', 'a', 't', 't', 'e', 'r', 'n'], ['T', 'o', 'F', 'o', 'r', 'w', 'a', 'r', 'd', 'S', 'e', 'a', 'r', 'c', 'h', 'e', 'r']], [['S', 't', 'd'], ['I', 't', 'e', 'r', 'a', 't', 'o', 'r']], [['S', 't', 'd'], ['T', 'o', 'I', 't', 'e', 'r', 'a', 't', 'o', 'r']], [['S', 't', 'd'], ['I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['L', 'a', 'w', 'f', 'u', 'l', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['H', 'a', 's', 'F', 'r', 'a', 'm', 'e']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['I', 's', 'A', 'n', 'd']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['I', 's', 'P', 'u', 'r', 'e']]]
 def outParamTake3Multi : List (List (List Char)) := [[['S', 't', 'd'], ['L', 'e', 'f', 't', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['R', 'i', 'g', 'h', 't', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['L', 'a', 'w', 'f', 'u', 'l', 'L', 'e', 'f', 't', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['L', 'a', 'w', 'f', 'u', 'l', 'R', 'i', 'g', 'h', 't', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['D', 'o'], ['S', 'P', 'r', 'e', 'd'], ['T', 'a', 'c', 't', 'i', 'c'], ['S', 'i', 'm', 'p', 'A', 'n', 'd']]]
 def outParamTake2Drop3Multi : List (List (List Char)) := [[['S', 't', 'd'], ['L', 'a', 'w', 'f', 'u', 'l', 'C', 'o', 'm', 'm', 'I', 'd', 'e', 'n', 't', 'i', 't', 'y']], [['S', 't', 'd'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['D', 'o'], ['A', 's', 's', 'e', 'r', 't', 'i', 'o', 'n'], ['N', 'o', 'n', 'd', 'e', 't', 'F', 'u', 'n']]]
 def outParamTake1Drop2Multi : List (List (List Char)) := [[['S', 't', 'd'], ['D', 'o'], ['W', 'P', 'M', 'o', 'n', 'a', 'd']], [['S', 't', 'd'], ['D', 'o'], ['W', 'P', 'S', 'o', 'u', 'n', 'd']]]
 def outParamTake1Drop3Multi : List (List (List Char)) := [[['S', 't', 'd'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['P', 'a', 'r', 's', 'e', 'c'], ['I', 'n', 'p', 'u', 't']], [['S', 't', 'd'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['D', 'o'], ['W', 'P', 'M', 'o', 'n', 'a', 'd']]]
 def outParamTake1Drop4Multi : List (List (List Char)) := [[['S', 't', 'd'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['D', 'o'], ['W', 'P']], [['S', 't', 'd'], ['I', 'n', 't', 'e', 'r', 'n', 'a', 'l'], ['D', 'o'], ['W', 'P', 'C', 'o', 'n', 'j', 'u', 'n', 'c', 't', 'i', 'v', 'e']]]
 
-/-- Input expressions of a normalized instance conclusion, excluding `outParam` and
-`semiOutParam` slots across all `Init` and `Std` typeclasses in Lean 4.34.1. -/
-def instanceInputExprs (target : ExprSkeleton) : List ExprSkeleton :=
+/-- Input expressions for all 100 public `Init` and `Std` typeclasses with `outParam` or
+`semiOutParam` slots in Lean 4.34.1 (including the 14 `Lean.Grind.*` classes in `Init.Grind`). -/
+def instanceInputExprsOpt (target : ExprSkeleton) : Option (List ExprSkeleton) :=
   match target.getAppFn with
   | .const cls =>
     let args := target.getAppArgs
     match cls.parts with
     | [seg] =>
-      if seg ∈ outParamTake2Classes then args.take 2
-      else if seg ∈ outParamTake1Classes then args.take 1
-      else if seg ∈ outParamDrop1Classes then args.drop 1
-      else if seg = ['T', 'r', 'a', 'n', 's'] then args.take 5
-      else if seg = ['L', 'a', 'w', 'f', 'u', 'l', 'G', 'e', 't', 'E', 'l', 'e', 'm'] then args.take 2 ++ args.drop 4
-      else [target]
+      if seg ∈ outParamTake2Classes then some (args.take 2)
+      else if seg ∈ outParamTake1Classes then some (args.take 1)
+      else if seg ∈ outParamDrop1Classes then some (args.drop 1)
+      else if seg = ['T', 'r', 'a', 'n', 's'] then some (args.take 5)
+      else if seg = ['L', 'a', 'w', 'f', 'u', 'l', 'G', 'e', 't', 'E', 'l', 'e', 'm'] then some (args.take 2 ++ args.drop 4)
+      else none
     | ps =>
-      if ps ∈ outParamDrop1Multi then args.drop 1
-      else if ps ∈ outParamDrop2Multi then args.drop 2
-      else if ps ∈ outParamTake1Multi then args.take 1
-      else if ps ∈ outParamTake2Multi then args.take 2
-      else if ps ∈ outParamTake3Multi then args.take 3
-      else if ps ∈ outParamTake2Drop3Multi then args.take 2 ++ args.drop 3
-      else if ps ∈ outParamTake1Drop2Multi then args.take 1 ++ args.drop 2
-      else if ps ∈ outParamTake1Drop3Multi then args.take 1 ++ args.drop 3
-      else if ps ∈ outParamTake1Drop4Multi then args.take 1 ++ args.drop 4
+      if ps ∈ outParamDrop1Multi then some (args.drop 1)
+      else if ps ∈ outParamDrop2Multi then some (args.drop 2)
+      else if ps ∈ outParamTake1Multi then some (args.take 1)
+      else if ps ∈ outParamTake2Multi then some (args.take 2)
+      else if ps ∈ outParamTake3Multi then some (args.take 3)
+      else if ps ∈ outParamTake2Drop3Multi then some (args.take 2 ++ args.drop 3)
+      else if ps ∈ outParamTake1Drop2Multi then some (args.take 1 ++ args.drop 2)
+      else if ps ∈ outParamTake1Drop3Multi then some (args.take 1 ++ args.drop 3)
+      else if ps ∈ outParamTake1Drop4Multi then some (args.take 1 ++ args.drop 4)
       else match ps with
-        | [r, _, l] => if r = Chars.std ∧ l = ['S', 'l', 'i', 'c', 'e', 'a', 'b', 'l', 'e'] then args.take 1 else [target]
-        | _ => [target]
-  | _ => [target]
+        | [r, _, l] => if r = Chars.std ∧ l = ['S', 'l', 'i', 'c', 'e', 'a', 'b', 'l', 'e'] then some (args.take 1) else none
+        | [r, g, ti, _] =>
+          if r = Chars.lean ∧ g = ['G', 'r', 'i', 'n', 'd'] ∧ ti = ['T', 'o', 'I', 'n', 't'] then
+            some (args.take 2 ++ args.drop 3)
+          else none
+        | _ => none
+  | _ => none
 
-/-- A local declaration that can own an instance or coercion in `env`: non-reducible, local,
-and either non-definitional or normalizing in `env` to non-`outParam` inputs naming a local
-base anchor. -/
+def instanceInputExprs (target : ExprSkeleton) : List ExprSkeleton :=
+  (instanceInputExprsOpt target).getD [target]
+
+/-- Input expressions of an instance of class `cls`, stripping `outParam` slots for known
+`Init`/`Std` classes and otherwise extracting arguments of non-reductive `cls`. -/
+def instanceInputExprsFor (env : KernelEnv) (cls : SymName) (target : ExprSkeleton) :
+    List ExprSkeleton :=
+  match instanceInputExprsOpt target with
+  | some xs => xs
+  | none =>
+    match target.getAppFn with
+    | .const head =>
+      if head = cls && !isReductiveHead env cls then target.getAppArgs else [target]
+    | _ => [target]
+
+/-- A local declaration that can own an instance or coercion in `env`: non-reductive, local,
+and either a base anchor or a definition normalizing in `env` to non-`outParam` inputs
+rigidly anchored on a local base declaration. -/
 def isInstanceAnchorIn (env : KernelEnv) (inv : ModuleInventory) (d : SymName) : Bool :=
   isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries) &&
     match findConstByName inv.constants d with
@@ -3838,17 +3858,22 @@ def isInstanceAnchorIn (env : KernelEnv) (inv : ModuleInventory) (d : SymName) :
         match ci.value? with
         | some v =>
           match normInstanceTargetOptIn env v with
-          | some target =>
-            (instanceInputExprs target).any (fun a => a.usedConstants.any (isBaseInstanceAnchor inv))
+          | some target => (instanceInputExprs target).any (hasRigidBaseAnchor env inv)
           | none => false
         | none => false
-      else true
+      else decide (ci.kind.tag ≠ .recTag ∧ ci.kind ≠ .quotDecl)
     | none => false
 
 def isInstanceAnchor (inv : ModuleInventory) (d : SymName) : Bool :=
   isInstanceAnchorIn (mkBaseKernelEnv inv.constants) inv d
 def isValidInstanceScope (ns : SymName) : Bool :=
-  ns.isWellFormed && !ns.isStdlibModule && !ns.isLeanCompilerModule && !ns.isTrustedModule
+  ns.isWellFormed && !ns.isStdlibModule && !ns.isLeanCompilerModule && !ns.isTrustedModule &&
+    !ns.hasRoot Chars.anneal && !ns.hasRoot Chars.verify && !ns.hasRoot Chars.crateVerify &&
+    !ns.hasRoot Chars.assumptions
+def isLocalInstanceScope (inv : ModuleInventory) (ns : SymName) : Bool :=
+  isValidInstanceScope ns &&
+    (inv.moduleName.parts.isPrefixOf ns.parts ||
+      inv.constNames.any (fun c => c.parts.isPrefixOf ns.parts))
 
 /-- Policy for one persisted extension entry in environment `env`. -/
 def validateSingleExtEntryIn (env : KernelEnv) (inv : ModuleInventory) (ext : EnvExtEntry) :
@@ -3881,8 +3906,7 @@ def validateSingleExtEntryIn (env : KernelEnv) (inv : ModuleInventory) (ext : En
       | some ci =>
         match normInstanceTargetOptIn env ci.type with
         | some target =>
-          ensure ((instanceInputExprs target).any
-              (fun a => a.usedConstants.any (isBaseInstanceAnchor inv)) = true)
+          ensure ((instanceInputExprsFor env cls target).any (hasRigidBaseAnchor env inv) = true)
             (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
         | none => .error (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
       | none => .error (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
@@ -3890,7 +3914,9 @@ def validateSingleExtEntryIn (env : KernelEnv) (inv : ModuleInventory) (ext : En
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
     ensure (isLocalExtDecl inv d = true ∧ isInstanceAnchorIn env inv cls = true)
       (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance_of_imported_target" d)
-    ensure (isValidInstanceScope ns = true)
+    ensure (isValidInstanceScope ns = true ∧
+        !env.any (fun p => p.2.originModule.isSome && decide (p.1 ∉ inv.constNames) &&
+          ns.parts.isPrefixOf p.1.parts))
       (.forbiddenInstanceOrCoe inv.moduleName "invalid_instance_scope" d)
   | .defaultInstanceEntry d cls => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
@@ -4433,6 +4459,11 @@ def auditExtReferences (pkg : PackageAuditInput) (inv : ModuleInventory) (ext : 
     (checkReference pkg inv (ext.referencedConstants.headD .anonymous))
   checkAll ext.referencedModules
     (checkScopeModule pkg inv (ext.referencedConstants.headD .anonymous))
+  match ext with
+  | .scopedInstanceEntry d _ ns =>
+    ensure (isLocalInstanceScope inv ns = true)
+      (.forbiddenInstanceOrCoe inv.moduleName "invalid_instance_scope" d)
+  | _ => .ok ()
 def auditExtReferenceImports (pkg : PackageAuditInput) (inv : ModuleInventory) :
     Except AuditFailure Unit :=
   checkAll inv.extEntries (auditExtReferences pkg inv)
@@ -4611,7 +4642,6 @@ def auditModuleSource (cfg : AuditConfig) (inv : ModuleInventory) : Except Audit
   | some src => SourceScanner.scanSourceChars cfg inv.moduleName inv.role src
 def auditModulePolicy (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
     (inv : ModuleInventory) : Except AuditFailure Unit := do
-  validateModuleExtensions inv
   validateModuleExtensionsIn env inv
   auditShadowing pkg inv
   validateImports pkg inv
@@ -4693,15 +4723,12 @@ theorem policy_facts {cfg : AuditConfig} {pkg : PackageAuditInput} {outcome : Po
 
 theorem auditModulePolicy_ok {cfg : AuditConfig} {pkg : PackageAuditInput} {env : KernelEnv}
     {inv : ModuleInventory} (h : auditModulePolicy cfg pkg env inv = .ok ()) :
-    validateModuleExtensions inv = .ok () ∧ auditShadowing pkg inv = .ok () ∧
+    validateModuleExtensionsIn env inv = .ok () ∧ auditShadowing pkg inv = .ok () ∧
     validateImports pkg inv = .ok () ∧ auditModuleSource cfg inv = .ok () ∧
     (∀ ci ∈ inv.constants, auditModuleDecl cfg pkg env inv ci = .ok ()) ∧
     auditReferenceImports pkg inv = .ok () ∧ auditExtReferenceImports pkg inv = .ok () ∧
-    (∀ ci ∈ inv.constants, auditReservedOrigin pkg inv ci = .ok ()) ∧
-    validateModuleExtensionsIn env inv = .ok () := by
-  simp only [auditModulePolicy, bindUnit_ok_iff, checkAll_ok_iff] at h
-  exact ⟨h.1, h.2.2.1, h.2.2.2.1, h.2.2.2.2.1, h.2.2.2.2.2.1, h.2.2.2.2.2.2.1,
-    h.2.2.2.2.2.2.2.1, h.2.2.2.2.2.2.2.2, h.2.1⟩
+    (∀ ci ∈ inv.constants, auditReservedOrigin pkg inv ci = .ok ()) := by
+  simpa only [auditModulePolicy, bindUnit_ok_iff, checkAll_ok_iff] using h
 
 /-- Everything a successful audit established, stage by stage. -/
 theorem auditAndReplayPackage_facts {cfg : AuditConfig} {pkg : PackageAuditInput}
@@ -4924,7 +4951,7 @@ theorem auditAndReplayPackage_ext_refs_within_imports {cfg : AuditConfig}
     fun inv' hinv' imp himp =>
       ((auditAndReplayPackage_imports_sound h inv' hinv').2.2.1 imp himp).2.2.2.2.2.2
   simp only [auditExtReferences, bindUnit_ok_iff, checkAll_ok_iff] at href
-  refine ⟨fun d hd => (validateSingleExtEntry_localDecl hval d hd).1, fun c hc target ht => ?_,
+  refine ⟨fun d hd => (validateSingleExtEntryIn_localDecl hval d hd).1, fun c hc target ht => ?_,
     fun ns hns target ht => ?_⟩
   · have h1 := href.1 c hc
     simp only [checkReference, ht, ensure_ok_iff] at h1
@@ -4935,7 +4962,7 @@ theorem auditAndReplayPackage_ext_refs_within_imports {cfg : AuditConfig}
       exact hrole
     · rw [← hrt]
       exact importReaches_statementSide himp hreach (hri ▸ hrole)
-  · have h1 := href.2 ns hns
+  · have h1 := href.2.1 ns hns
     simp only [checkScopeModule, ht, ensure_ok_iff] at h1
     have hvis : ns = inv.moduleName ∨ ImportReaches pkg inv.moduleName ns := by
       rcases h1 with h1 | h1
@@ -4962,7 +4989,7 @@ theorem auditAndReplayPackage_ext_decls_declared {cfg : AuditConfig} {pkg : Pack
   have hfacts := auditAndReplayPackage_facts h
   have hm := auditModulePolicy_ok (hfacts.2.1.modules inv hinv)
   have hval := checkAll_ok_iff.mp hm.1 ext hext
-  obtain ⟨hmem, hrep⟩ := validateSingleExtEntry_localDecl hval d hd
+  obtain ⟨hmem, hrep⟩ := validateSingleExtEntryIn_localDecl hval d hd
   obtain ⟨ci, hciRep, hname⟩ := List.mem_map.mp hrep
   have hci : ci ∈ inv.constants := (List.mem_filter.mp hciRep).1
   have hdecls := (replayCleanEnvOrdered_contains_decl hfacts.2.2.1).1
@@ -4980,7 +5007,7 @@ theorem auditAndReplayPackage_reserved_origins_within_imports {cfg : AuditConfig
         ∀ originMod, findModule? pkg o = some originMod → ImportReaches pkg inv.moduleName o := by
   intro inv hinv ci hci o ho hne
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
-  have h1 := hm.2.2.2.2.2.2.2.1 ci hci
+  have h1 := hm.2.2.2.2.2.2.2 ci hci
   simp only [auditReservedOrigin, ho, hne, ↓reduceIte, bindUnit_ok_iff, ensure_ok_iff] at h1
   refine ⟨h1.1.1, fun originMod hom => ?_⟩
   rcases h1.2 with h2 | h2
@@ -5073,7 +5100,8 @@ theorem auditAndReplayPackage_sources_covered {cfg : AuditConfig} {pkg : Package
 /-- No audited module registers an orphan instance of an imported class: an accepted
 instance of an imported class belongs to a `Defs` module, and its type normalizes across
 the whole package environment (`packageEnv pkg`) to a conclusion whose non-`outParam`
-inputs name a local replayed non-definition declaration with no reducibility attribute. -/
+inputs are rigidly anchored on a local replayed non-reductive declaration with no
+reducibility attribute. -/
 theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ d cls isPriv,
@@ -5082,13 +5110,14 @@ theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : Pac
       inv.role = .defsExempt ∧
         ∃ ci ∈ inv.constants, ci.name = d ∧
           ∃ target, normInstanceTargetOptIn (packageEnv pkg) ci.type = some target ∧
-            ∃ arg ∈ instanceInputExprs target,
+            ∃ arg ∈ instanceInputExprsFor (packageEnv pkg) cls target,
+              hasRigidBaseAnchor (packageEnv pkg) inv arg = true ∧
               ∃ anchor ∈ arg.usedConstants,
                 isLocalExtDecl inv anchor = true ∧
                 EnvExtEntry.reducibilityOverride anchor ∉ inv.extEntries := by
   intro inv hinv d cls isPriv hext hcls
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
-  have hval := checkAll_ok_iff.mp hm.2.2.2.2.2.2.2.2 _ hext
+  have hval := checkAll_ok_iff.mp hm.1 _ hext
   simp only [validateSingleExtEntryIn, bindUnit_ok_iff, ensure_ok_iff, hcls, Bool.false_eq_true,
     ↓reduceIte] at hval
   obtain ⟨_, hrole, hfind⟩ := hval
@@ -5097,17 +5126,17 @@ theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : Pac
     obtain ⟨hmem, hname⟩ := findConstByName_mem hci
     split at hfind
     · rename_i target htarget
-      obtain ⟨arg, harg, hused⟩ := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
-      obtain ⟨anchor, ha, hanchor⟩ := List.any_eq_true.mp hused
+      obtain ⟨arg, harg, hrig⟩ := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
+      obtain ⟨anchor, ha, hanchor⟩ := hasRigidBaseAnchor_exists_base hrig
       simp only [isBaseInstanceAnchor, Bool.and_eq_true, decide_eq_true_eq] at hanchor
-      exact ⟨hrole, ci, hmem, hname, target, htarget, arg, harg, anchor, ha, hanchor.1.1,
-        hanchor.1.2⟩
+      exact ⟨hrole, ci, hmem, hname, target, htarget, arg, harg, hrig, anchor, ha,
+        hanchor.1.1, hanchor.1.2⟩
     · cases hfind
   · cases hfind
 
 /-- Every accepted coercion belongs to a `Defs` module and involves at least one local
-package-normalized instance anchor, and every accepted scoped instance carries a valid
-well-formed non-stdlib scope namespace. -/
+package-normalized instance anchor, and every accepted scoped instance is scoped strictly
+within its own declaring module or one of its own declarations. -/
 theorem auditAndReplayPackage_coe_anchored {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     (∀ inv ∈ pkg.modules, ∀ d src tgt,
@@ -5117,16 +5146,18 @@ theorem auditAndReplayPackage_coe_anchored {cfg : AuditConfig} {pkg : PackageAud
          isInstanceAnchorIn (packageEnv pkg) inv tgt = true)) ∧
     (∀ inv ∈ pkg.modules, ∀ d cls ns,
       EnvExtEntry.scopedInstanceEntry d cls ns ∈ inv.extEntries →
-      inv.role = .defsExempt ∧ isValidInstanceScope ns = true) := by
+      inv.role = .defsExempt ∧ isLocalInstanceScope inv ns = true) := by
   refine ⟨fun inv hinv d src tgt hext => ?_, fun inv hinv d cls ns hext => ?_⟩
   · have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
-    have hval := checkAll_ok_iff.mp hm.2.2.2.2.2.2.2.2 _ hext
+    have hval := checkAll_ok_iff.mp hm.1 _ hext
     simp only [validateSingleExtEntryIn, bindUnit_ok_iff, ensure_ok_iff] at hval
     exact ⟨hval.1, hval.2.1, hval.2.2⟩
   · have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
-    have hval := checkAll_ok_iff.mp hm.2.2.2.2.2.2.2.2 _ hext
+    have hval := checkAll_ok_iff.mp hm.1 _ hext
+    have href := checkAll_ok_iff.mp hm.2.2.2.2.2.2.1 _ hext
     simp only [validateSingleExtEntryIn, bindUnit_ok_iff, ensure_ok_iff] at hval
-    exact ⟨hval.1, hval.2.2⟩
+    simp only [auditExtReferences, bindUnit_ok_iff, ensure_ok_iff] at href
+    exact ⟨hval.1, href.2.2⟩
 
 /-- Every declaration of a test module has a clean closure, and when
 `cfg.allowLocalTestAxioms = false`, every dependency satisfies `CleanDep` with no local
@@ -5322,7 +5353,7 @@ theorem auditAndReplayPackage_sound {cfg : AuditConfig} {pkg : PackageAuditInput
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     (∀ n ci, cert.importedEnv.lookup n = some ci → ci.name = n) ∧
     (∀ inv ∈ pkg.modules, validateReplayInventory inv = .ok () ∧
-      validateModuleExtensions inv = .ok () ∧ validateImports pkg inv = .ok () ∧
+      validateModuleExtensionsIn (packageEnv pkg) inv = .ok () ∧ validateImports pkg inv = .ok () ∧
       auditModuleSource cfg inv = .ok ()) ∧
     (cfg.admitsNoAxioms → ∀ M, EnvSound (mkBaseKernelEnv pkg.baseEnv) M →
       (∀ n ci, cert.replayedEnv.lookup n = some ci → ci.type ≠ .const SymName.falseName) ∧

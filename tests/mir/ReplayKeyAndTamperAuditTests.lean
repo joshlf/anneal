@@ -2257,6 +2257,215 @@ theorem passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected :
     isOk (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName defsMod])) = true := by
   decide +kernel
 
+/-! ## Pass `B4` hardening regressions -/
+
+def grindToIntName : SymName := sn! "Lean.Grind.ToInt"
+def grindToIntMkName : SymName := sn! "Lean.Grind.ToInt.mk"
+def grindIsCharPName : SymName := sn! "Lean.Grind.IsCharP"
+def grindIsCharPMkName : SymName := sn! "Lean.Grind.IsCharP.mk"
+def grindToIntAddName : SymName := sn! "Lean.Grind.ToInt.Add"
+def grindToIntAddMkName : SymName := sn! "Lean.Grind.ToInt.Add.mk"
+
+def mkQuadClassDecls (cls mk : SymName) : List ConstantRecord := [
+  baseDecl cls (.inductDecl [mk]) (.pi natE (.pi natE (.pi natE (.pi natE (.sort 0))))) initCore,
+  baseDecl mk (.ctorDecl cls)
+    (.pi natE (.pi natE (.pi natE (.pi natE
+      (.app (.app (.app (.app (.const cls) (.bvar 3)) (.bvar 2)) (.bvar 1)) (.bvar 0)))))) initCore]
+
+def b4ClassBaseDecls : List ConstantRecord :=
+  a3ClassBaseDecls ++
+    mkBinClassDecls grindToIntName grindToIntMkName ++
+    mkTriClassDecls grindIsCharPName grindIsCharPMkName ++
+    mkQuadClassDecls grindToIntAddName grindToIntAddMkName
+
+def b4InstPkg (cls : SymName) (ty val : ExprSkeleton) : PackageAuditInput :=
+  { baseEnv := b4ClassBaseDecls,
+    modules :=
+      [addExts (addConsts defsModule [localOutDecl, mkDef premInstName ty val])
+         [.instanceEntry premInstName cls false],
+       theoryModule, proofsModule, verifyModule],
+    verifyRoots := [verifiedName] }
+
+def commonIdNatName : SymName := sn! "Common.Defs.IdNat"
+def commonIdModule : ModuleInventory :=
+  mkModule commonDefsMod .defsExempt
+    [mkDef commonIdNatName (.pi natE natE) (.lam natE (.bvar 0))] [sn! "Init"]
+
+/-- Rigid-head instance anchoring rejects `.proj`, `.recDecl`, unused `.lam` binder domains,
+and unknown/reductive heads (each verified to hijack `Inhabited Nat` in Lean 4.34.1),
+excludes `outParam` slots of all 14 `Init.Grind.*` classes (`Lean.Grind.ToInt`, `IsCharP`,
+`ToInt.Add`, …), and accepts legitimate rigid base-constructor and cross-module alias
+instances. -/
+theorem passB4_rigid_anchor_and_grind_outparam_hardened :
+    let colorRecName : SymName := sn! "Topic.Defs.Color.rec"
+    let evilProjName : SymName := sn! "Topic.Defs.EvilNatProj"
+    let evilLamName : SymName := sn! "Topic.Defs.EvilCls"
+    let goodLamName : SymName := sn! "Topic.Defs.GoodCls"
+    let projExpr : ExprSkeleton :=
+      .proj (sn! "Prod") 0 (.app (.app (c! "Prod.mk") natE) (.const colorName))
+    let defsWithProj := addConsts defsModule
+      [mkDef evilProjName (.sort 1) projExpr, mkDef premInstName (.const evilProjName) (.natLit 0)]
+    let defsWithRec := addConsts defsModule
+      [mkDef premInstName (.app (.const colorRecName) (.const redName)) (.natLit 0)]
+    let defsWithUnknown := addConsts defsModule
+      [mkDef premInstName (.app (c! "UnknownReducer") (.const colorName)) (.natLit 0)]
+    let defsWithLamHAdd := addConsts defsModule
+      [localOutDecl,
+       mkDef evilLamName (.pi (.const colorName) (.sort 0))
+         (.lam (.const colorName) (haddApp (.natLit 0) (.natLit 0) (.const localOutName)))]
+    let defsWithGoodLam := addConsts defsModule
+      [mkDef goodLamName (.pi natE (.sort 1)) (.lam natE (.const colorName))]
+    -- `.proj` hiding local anchor `(Prod.mk Nat Color).1` (hijacks `Inhabited Nat` in Lean 4.34.1)
+    failsWith (validateModuleExtensionsIn (standardBaseEnv ++ mkBaseKernelEnv defsWithProj.constants)
+        (addExts defsWithProj [.instanceEntry premInstName (sn! "Inhabited") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- `.recDecl` (`Color.rec`) cannot anchor an instance or appear as a rigid head
+    isBaseInstanceAnchor defsModule colorRecName = false ∧
+    failsWith (validateModuleExtensionsIn (standardBaseEnv ++ mkBaseKernelEnv defsWithRec.constants)
+        (addExts defsWithRec [.instanceEntry premInstName (sn! "Inhabited") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- unknown / unmodeled reducer head (`UnknownReducer Color`) fails closed
+    failsWith (validateModuleExtensionsIn (standardBaseEnv ++ mkBaseKernelEnv defsWithUnknown.constants)
+        (addExts defsWithUnknown [.instanceEntry premInstName (sn! "Inhabited") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- unused `.lam` binder domain `fun (_ : Color) => Nat` rejected as class or coe anchor
+    failsWith (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef evilLamName (.pi (.const colorName) (.sort 1)) (.lam (.const colorName) natE),
+                 mkDef evilCoeName (.pi (.const colorName) boolE)
+                   (.lam (.const colorName) (c! "Bool.true"))])
+               [.coeEntry evilCoeName evilLamName SymName.boolName],
+             theoryModule, proofsModule, verifyModule] })
+      (.forbiddenInstanceOrCoe defsMod "coe_between_imported_types" evilCoeName) = true ∧
+    -- lambda-wrapped `outParam` class `fun (_ : Color) => HAdd 0 0 localOut` rejected
+    isInstanceAnchorIn (mkBaseKernelEnv haddBaseDecls ++ mkBaseKernelEnv defsWithLamHAdd.constants)
+      defsWithLamHAdd evilLamName = false ∧
+    -- `Init.Grind.*` `outParam` classes (`Lean.Grind.ToInt`, `IsCharP`, `ToInt.Add`)
+    failsWith (audit noSourceConfig (b4InstPkg grindToIntName
+        (.app (.app (.const grindToIntName) (.natLit 0)) (.const localOutName))
+        (.app (.app (.const grindToIntMkName) (.natLit 0)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (audit noSourceConfig (b4InstPkg grindToIntName
+        (.app (.app (.const grindToIntName) (.const localOutName)) (.natLit 0))
+        (.app (.app (.const grindToIntMkName) (.const localOutName)) (.natLit 0)))) = true ∧
+    failsWith (audit noSourceConfig (b4InstPkg grindIsCharPName
+        (.app (.app (.app (.const grindIsCharPName) (.natLit 0)) (.natLit 0)) (.const localOutName))
+        (.app (.app (.app (.const grindIsCharPMkName) (.natLit 0)) (.natLit 0)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    failsWith (audit noSourceConfig (b4InstPkg grindToIntAddName
+        (.app (.app (.app (.app (.const grindToIntAddName) (.natLit 0)) (.natLit 0)) (.const localOutName)) (.natLit 0))
+        (.app (.app (.app (.app (.const grindToIntAddMkName) (.natLit 0)) (.natLit 0)) (.const localOutName)) (.natLit 0))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (audit noSourceConfig (b4InstPkg grindToIntAddName
+        (.app (.app (.app (.app (.const grindToIntAddName) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.const localOutName))
+        (.app (.app (.app (.app (.const grindToIntAddMkName) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.const localOutName)))) = true ∧
+    -- positive: lambda whose body rigidly names `Color` (`fun (_ : Nat) => Color`) accepted
+    isInstanceAnchorIn (standardBaseEnv ++ mkBaseKernelEnv defsWithGoodLam.constants)
+      defsWithGoodLam goodLamName = true ∧
+    -- positive: rigid base-env type (`Eq localOut localOut`) and cross-module `Common.Defs.IdNat localOut`
+    isOk (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [localOutDecl,
+                 mkDef premInstName (eqNat (.const localOutName) (.const localOutName))
+                   (.app (c! "Eq.refl") (.const localOutName))])
+               [.instanceEntry premInstName (sn! "Inhabited") false],
+             theoryModule, proofsModule, verifyModule] }) = true ∧
+    (let crossIdTerm : ExprSkeleton := .app (.const commonIdNatName) (.const localOutName)
+     isOk (audit noSourceConfig
+        { baseEnv := standardBaseDecls,
+          modules :=
+            [commonIdModule,
+             addImports (addExts (addConsts defsModule
+               [localOutDecl,
+                mkDef premInstName (eqNat crossIdTerm crossIdTerm)
+                  (.app (.const SymName.eqReflName) crossIdTerm)])
+               [.instanceEntry premInstName (sn! "Inhabited") false])
+               [{ module := commonDefsMod }],
+             theoryModule, proofsModule, verifyModule],
+          verifyRoots := [verifiedName] })) = true := by
+  decide +kernel
+
+/-- Scoped instances may only target namespaces owned by the declaring module (never `Nat`,
+`Bool`, `List`, `IO`, `Anneal`, `Verify.*`, `Assumptions.*`, another module `Common.Defs`,
+or foreign roots), and `validateReplayInventory` validates `.recDecl` rule constructor links. -/
+theorem passB4_scoped_instance_ownership_and_rec_kind_links_rejected :
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName SymName.natName]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName SymName.boolName]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Classical")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "List")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "IO")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Anneal")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Verify.Topic")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Assumptions.Foo")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig
+        { baseEnv := standardBaseDecls,
+          modules :=
+            [commonDefsModule,
+             addImports (addExts defsModule [.scopedInstanceEntry instColorName colorName commonDefsMod])
+               [{ module := commonDefsMod }],
+             theoryModule, proofsModule, verifyModule],
+          verifyRoots := [verifiedName] })
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    -- positive: module sub-namespace and local declaration namespace remain accepted
+    isOk (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Topic.Defs.Sub")])) = true ∧
+    isOk (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName colorName])) = true ∧
+    -- malformed `.recDecl` rule constructors caught at inventory validation time
+    (let badDupRec : ConstantRecord :=
+      { name := sn! "Topic.Defs.Color.rec2",
+        kind := .recDecl [{ ctor := redName, nfields := 0, rhs := trueIntroE },
+                          { ctor := redName, nfields := 0, rhs := trueIntroE }],
+        type := canonicalRecType colorName [redName, blueName], all := [colorName] }
+     failsWith (validateReplayInventory (addConsts defsModule [badDupRec]))
+       (.invalidMutualAll defsMod (sn! "Topic.Defs.Color.rec2") "duplicate recursor rule constructor")) = true ∧
+    (let badMissRec : ConstantRecord :=
+      { name := sn! "Topic.Defs.Color.rec3",
+        kind := .recDecl [{ ctor := sn! "Topic.Defs.GhostCtor", nfields := 0, rhs := trueIntroE }],
+        type := canonicalRecType colorName [redName, blueName], all := [colorName] }
+     failsWith (validateReplayInventory (addConsts defsModule [badMissRec]))
+       (.invalidMutualAll defsMod (sn! "Topic.Defs.Color.rec3") "recursor rule names a missing constructor")) = true ∧
+    (let badNonCtorRec : ConstantRecord :=
+      { name := sn! "Topic.Defs.Color.rec4",
+        kind := .recDecl [{ ctor := sn! "Topic.Defs.claimIdx", nfields := 0, rhs := trueIntroE }],
+        type := canonicalRecType colorName [redName, blueName], all := [colorName] }
+     failsWith (validateReplayInventory (addConsts defsModule [badNonCtorRec]))
+       (.invalidMutualAll defsMod (sn! "Topic.Defs.Color.rec4") "recursor rule target is not a constructor")) = true := by
+  decide +kernel
+
+/-- Source scanner rejects compile-time `#guard`/`#guard_panic`/`#guard_expr` evaluators,
+`meta` declarations/sections/imports, `module` headers, and explicit `import all` /
+`public import` / `private import` modifiers without flagging ordinary `module`/`all`/`guard`
+identifiers. -/
+theorem passB4_sourceScanner_guard_meta_and_module_header_hardened :
+    flags (chars! "def sideEffect : Bool := true\n#guard sideEffect") "#guard" = true ∧
+    flags (chars! "#guard_panic in panic! \"boom\"") "#guard_panic" = true ∧
+    flags (chars! "#guard_expr 1 = 1") "#guard_expr" = true ∧
+    flags (chars! "def a := r#guard true") "#guard" = true ∧
+    flags (chars! "def s := s!\"{#guard true}\"") "#guard" = true ∧
+    flags (chars! "meta def evil : Nat := 42") "meta" = true ∧
+    flags (chars! "meta section\ndef evil : Nat := 42\nend") "meta" = true ∧
+    flags (chars! "module\nmeta import Init.Data.Nat.Basic") "meta" = true ∧
+    flags (chars! "def x := 0#meta") "meta" = true ∧
+    flags (chars! "module\nimport Init") "module" = true ∧
+    flags (chars! "/- doc -/ module\nimport Init") "module" = true ∧
+    flags (chars! "import all Init.Data.Nat.Basic") "all" = true ∧
+    flags (chars! "import /- c -/ all Init") "all" = true ∧
+    flags (chars! "public import Init") "import" = true ∧
+    flags (chars! "private import Init") "import" = true ∧
+    -- positive controls: ordinary identifiers and plain imports remain accepted
+    isOk (scan (chars! "import Init\nnamespace Topic\ndef module := 1\ndef all := 2\ndef guard := 3\ndef metadata := 4\nprivate def helper := 5\nend Topic")) = true := by
+  decide +kernel
+
+
 /-! ## End-to-end instantiation on the clean package -/
 
 /-- The semantic soundness theorem applied to the clean package over the standard base
@@ -2670,5 +2879,21 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.hasRigidBaseAnchor_exists_base' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms hasRigidBaseAnchor_exists_base
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB4_rigid_anchor_and_grind_outparam_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB4_rigid_anchor_and_grind_outparam_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB4_scoped_instance_ownership_and_rec_kind_links_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB4_scoped_instance_ownership_and_rec_kind_links_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB4_sourceScanner_guard_meta_and_module_header_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB4_sourceScanner_guard_meta_and_module_header_hardened
 
 end Anneal.ReplayKeyAndTamperAuditTests
