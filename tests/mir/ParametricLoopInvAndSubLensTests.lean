@@ -58,13 +58,31 @@ private def fatSliceLayout : TypeLayout :=
     backendRepr := .memory,
     fields := .arbitrary [] [], variants := .single 0, isUninhabited := false }
 
+/-- Rust `bool`: 1 byte, align 1, valid range `0..=1`. -/
+private def boolLayout : TypeLayout :=
+  { size := ⟨1⟩, align := ⟨1⟩,
+    backendRepr := .scalar (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+/-- Rust `(u32, bool)` (the result type of `AddWithOverflow` / `SubWithOverflow`
+on `u32`): size 8, align 4, fields at offsets `0` and `4`. -/
+private def u32BoolPairLayout : TypeLayout :=
+  { size := ⟨8⟩, align := ⟨4⟩,
+    backendRepr :=
+      .scalarPair (.initialized (.int 32 false) ⟨0, 4294967295⟩)
+        (.initialized (.int 8 false) ⟨0, 1⟩),
+    fields := .arbitrary [⟨0⟩, ⟨4⟩] [0, 1], variants := .single 0,
+    isUninhabited := false }
+
 private def testLayouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true,
-    entries := [u32Layout, u32PairLayout, u8Layout, fatSliceLayout] }
+    entries := [u32Layout, u32PairLayout, u8Layout, fatSliceLayout, boolLayout,
+      u32BoolPairLayout] }
 
 def u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
 def u8Ty : Ty := { kind := .uint .u8, layoutIdx := 2 }
-def boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+def boolTy : Ty := { kind := .bool, layoutIdx := 4 }
+private def u32BoolTy : Ty := { kind := .tuple [.uint .u32, .bool], layoutIdx := 5 }
 private def pairU32Ty : Ty := { kind := .tuple [.uint .u32, .uint .u32], layoutIdx := 1 }
 private def refMutSliceU8Ty : Ty := { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 3 }
 
@@ -714,6 +732,216 @@ theorem canary1c_countUp_mirWpConverges (n : Nat) (hLt : n < 2 ^ 32) :
       | normal p => exact hOut.1)
     (mirWpConverges_of_wpStateOk (canary1c_countUp_wpStateOk n hLt))
 
+/-! ### 1D. Fuel-Free Symbolic `countDown` with Debug-Mode Checked Arithmetic
+
+Rustc with `overflow-checks = on` (debug profile) lowers `i -= 1` and
+`acc += 1` to `SubWithOverflow` / `AddWithOverflow` producing a `(u32, bool)`
+pair followed by an `Assert` terminator on the overflow flag. Canary 1A uses the
+release-mode wrapping `Sub` / `Add`; this canary proves, for ALL `n < 2^32`
+with ZERO fuel, that neither overflow assertion can fire, so the debug-mode
+body never panics and returns `n`. -/
+
+/-- Real multi-block debug-mode `V2026_06_01` `CapturedMir`:
+```rust
+fn count_down_checked(n: u32) -> u32 {
+    let mut i: u32 = n;
+    let mut acc: u32 = 0;
+    while 0 < i {
+        i -= 1;   // SubWithOverflow + assert(!overflow)
+        acc += 1; // AddWithOverflow + assert(!overflow)
+    }
+    acc
+}
+```
+Locals: `_0: u32`, `_1: u32` (`n`), `_2: u32` (`i`), `_3: u32` (`acc`),
+`_4: bool`, `_5: (u32, bool)`, `_6: (u32, bool)`. -/
+def countDownCheckedMirBody : CapturedMir :=
+  mkBody "count_down_checked" 1
+    [decl .mut u32Ty, decl .not u32Ty, decl .mut u32Ty, decl .mut u32Ty,
+     decl .mut boolTy, decl .mut u32BoolTy, decl .mut u32BoolTy]
+    [mkBb
+       [mkSt (.storageLive 2),
+        mkSt (.assign (pl 2) (.use (.copy (pl 1)))),
+        mkSt (.storageLive 3),
+        mkSt (.assign (pl 3) (.use (u32C 0)))]
+       (.goto 1),
+     mkBb
+       [mkSt (.storageLive 4),
+        mkSt (.assign (pl 4) (.binaryOp .lt (u32C 0) (.copy (pl 2))))]
+       (.switchInt (.copy (pl 4)) ⟨[(0, 5)], 2⟩),
+     mkBb
+       [mkSt (.storageDead 4),
+        mkSt (.storageLive 5),
+        mkSt (.assign (pl 5) (.binaryOp .subWithOverflow (.copy (pl 2)) (u32C 1)))]
+       (.assert (.copy (pl 5 [.field 1 boolTy])) false 3 .continue_),
+     mkBb
+       [mkSt (.assign (pl 2) (.use (.copy (pl 5 [.field 0 u32Ty])))),
+        mkSt (.storageDead 5),
+        mkSt (.storageLive 6),
+        mkSt (.assign (pl 6) (.binaryOp .addWithOverflow (.copy (pl 3)) (u32C 1)))]
+       (.assert (.copy (pl 6 [.field 1 boolTy])) false 4 .continue_),
+     mkBb
+       [mkSt (.assign (pl 3) (.use (.copy (pl 6 [.field 0 u32Ty])))),
+        mkSt (.storageDead 6)]
+       (.goto 1),
+     mkBb
+       [mkSt (.storageDead 4),
+        mkSt (.assign (pl 0) (.use (.copy (pl 3)))),
+        mkSt (.storageDead 3),
+        mkSt (.storageDead 2)]
+       .return_]
+
+private def cdcState (bb stmt : Nat) (l0 l2 l3 l4 l5 l6 : LocalSlot) (n : Nat) :
+    MachineState :=
+  { frame := { blockIdx := bb, stmtIdx := stmt,
+               locals := [l0, .init (.scalar ⟨n, 4⟩), l2, l3, l4, l5, l6] }
+    memory := {} }
+
+private def u32S (v : Nat) : LocalSlot := .init (.scalar ⟨v, 4⟩)
+
+private def ovfPair (v bit : Nat) : LocalSlot :=
+  .init (.aggregate 0 [.scalar ⟨v, 4⟩, .scalar ⟨bit, 1⟩])
+
+/-- One checked loop iteration from the header: `(i + 1, acc) ↦ (i, acc + 1)`,
+discharging both overflow assertions symbolically. -/
+private theorem countDownChecked_step_iter (n i acc : Nat)
+    (hSum : i + 1 + acc = n) (hLt : n < 2 ^ 32) :
+    wpReach (ops := mirDetWpOps countDownCheckedMirBody)
+      (· = cdcState 1 0 .uninit (u32S i) (u32S (acc + 1)) .dead .dead .dead n)
+      (cdcState 1 0 .uninit (u32S (i + 1)) (u32S acc) .dead .dead .dead n) := by
+  have hSub : Anneal.PureMirExec.mirStep countDownCheckedMirBody
+      (cdcState 2 2 .uninit (u32S (i + 1)) (u32S acc) .dead .uninit .dead n) =
+      .cont (cdcState 2 3 .uninit (u32S (i + 1)) (u32S acc) .dead (ovfPair i 0) .dead n) := by
+    change Anneal.PureMirExec.Step.cont (cdcState 2 3 .uninit (u32S (i + 1)) (u32S acc) .dead
+      (ovfPair (wrapScalarBits i (scalarModulus 4)) 0) .dead n) = _
+    rw [wrapU32_of_lt (by omega)]
+  have hNoOvf : Nat.ble (scalarModulus 4) (acc + 1) = false := by
+    rw [Scalars.scalarModulus_eq_two_pow]
+    exact natBle_false_of_not_le (by omega)
+  have hAdd : Anneal.PureMirExec.mirStep countDownCheckedMirBody
+      (cdcState 3 3 .uninit (u32S i) (u32S acc) .dead .dead .uninit n) =
+      .cont (cdcState 3 4 .uninit (u32S i) (u32S acc) .dead .dead
+        (ovfPair (acc + 1) 0) n) := by
+    change Anneal.PureMirExec.Step.cont (cdcState 3 4 .uninit (u32S i) (u32S acc) .dead .dead
+      (.init (.aggregate 0 [.scalar ⟨wrapScalarBits (acc + 1) (scalarModulus 4), 4⟩,
+        .scalar ⟨match Nat.ble (scalarModulus 4) (acc + 1) with | true => 1 | false => 0, 1⟩]))
+      n) = _
+    rw [wrapU32_of_lt (by omega), hNoOvf]
+    rfl
+  exact
+    step_det_to (cdcState 1 1 .uninit (u32S (i + 1)) (u32S acc) .uninit .dead .dead n) rfl <|
+    step_det_to (cdcState 1 2 .uninit (u32S (i + 1)) (u32S acc)
+      (.init (.scalar ⟨1, 1⟩)) .dead .dead n) rfl <|
+    step_det_to (cdcState 2 0 .uninit (u32S (i + 1)) (u32S acc)
+      (.init (.scalar ⟨1, 1⟩)) .dead .dead n) rfl <|
+    step_det_to (cdcState 2 1 .uninit (u32S (i + 1)) (u32S acc) .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 2 2 .uninit (u32S (i + 1)) (u32S acc) .dead .uninit .dead n) rfl <|
+    step_det_to _ hSub <|
+    step_det_to (cdcState 3 0 .uninit (u32S (i + 1)) (u32S acc) .dead (ovfPair i 0) .dead n)
+      rfl <|
+    step_det_to (cdcState 3 1 .uninit (u32S i) (u32S acc) .dead (ovfPair i 0) .dead n) rfl <|
+    step_det_to (cdcState 3 2 .uninit (u32S i) (u32S acc) .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 3 3 .uninit (u32S i) (u32S acc) .dead .dead .uninit n) rfl <|
+    step_det_to _ hAdd <|
+    step_det_to (cdcState 4 0 .uninit (u32S i) (u32S acc) .dead .dead
+      (ovfPair (acc + 1) 0) n) rfl <|
+    step_det_to (cdcState 4 1 .uninit (u32S i) (u32S (acc + 1)) .dead .dead
+      (ovfPair (acc + 1) 0) n) rfl <|
+    step_det_to (cdcState 4 2 .uninit (u32S i) (u32S (acc + 1)) .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 1 0 .uninit (u32S i) (u32S (acc + 1)) .dead .dead .dead n) rfl <|
+    wpUntil_here (ops := mirDetWpOps countDownCheckedMirBody) rfl
+
+/-- **Canary 1D (Fuel-Free Symbolic Debug-Mode `countDown`, `∀ n < 2^32`)**:
+both `SubWithOverflow` and `AddWithOverflow` assertions are discharged inside
+the `wpLoop_countdown` invariant (`rem + acc = n`), so the body never panics. -/
+theorem canary1d_countDownChecked_wpStateOk (n : Nat) (hLt : n < 2 ^ 32) :
+    wpStateOk (ops := mirDetWpOps countDownCheckedMirBody)
+      (mirNormalPost (fun ret mem' => ret = .scalar ⟨n, 4⟩ ∧ mem' = {}))
+      (initMachineState countDownCheckedMirBody [.scalar ⟨n, 4⟩]) := by
+  let post : MirOutcome → Prop :=
+    mirNormalPost (fun ret mem' => ret = .scalar ⟨n, 4⟩ ∧ mem' = {})
+  let Inv : Nat → MachineState → Prop := fun rem s =>
+    ∃ acc, rem + acc = n ∧
+      s = cdcState 1 0 .uninit (u32S rem) (u32S acc) .dead .dead .dead n
+  let exitP : MachineState → Prop := fun s =>
+    s = cdcState 1 0 .uninit (u32S 0) (u32S n) .dead .dead .dead n
+  have hLoop : wpUntilOk (ops := mirDetWpOps countDownCheckedMirBody) exitP post
+      (cdcState 1 0 .uninit (u32S n) (u32S 0) .dead .dead .dead n) :=
+    wpLoop_countdown (ops := mirDetWpOps countDownCheckedMirBody) (Inv := Inv) (exit := exitP)
+      (onDone := post) (onFault := fun _ => False)
+      (fun _ ⟨acc, hSum, hEq⟩ => by
+        have hAcc : acc = n := by omega
+        subst hAcc
+        exact hEq)
+      (fun rem _ ⟨acc, hSum, hEq⟩ => by
+        subst hEq
+        refine wpUntil_mono (ops := mirDetWpOps countDownCheckedMirBody)
+          (fun _ hS' => Or.inl ⟨acc + 1, by omega, hS'⟩)
+          (fun _ hF => False.elim hF) (fun _ hF => False.elim hF) ?_
+        exact countDownChecked_step_iter n rem acc hSum hLt)
+      n _ ⟨0, by omega, rfl⟩
+  have hFromHeader : wpStateOk (ops := mirDetWpOps countDownCheckedMirBody) post
+      (cdcState 1 0 .uninit (u32S n) (u32S 0) .dead .dead .dead n) :=
+    wpUntil_bind (ops := mirDetWpOps countDownCheckedMirBody) hLoop fun _ hEq => by
+      subst hEq
+      exact
+        step_det_to (cdcState 1 1 .uninit (u32S 0) (u32S n) .uninit .dead .dead n) rfl <|
+        step_det_to (cdcState 1 2 .uninit (u32S 0) (u32S n)
+          (.init (.scalar ⟨0, 1⟩)) .dead .dead n) rfl <|
+        step_det_to (cdcState 5 0 .uninit (u32S 0) (u32S n)
+          (.init (.scalar ⟨0, 1⟩)) .dead .dead n) rfl <|
+        step_det_to (cdcState 5 1 .uninit (u32S 0) (u32S n) .dead .dead .dead n) rfl <|
+        step_det_to (cdcState 5 2 (u32S n) (u32S 0) (u32S n) .dead .dead .dead n) rfl <|
+        step_det_to (cdcState 5 3 (u32S n) (u32S 0) .dead .dead .dead .dead n) rfl <|
+        step_det_to (cdcState 5 4 (u32S n) .dead .dead .dead .dead .dead n) rfl <|
+        step_det_done (.normal (.scalar ⟨n, 4⟩, {})) rfl ⟨rfl, rfl⟩
+  exact
+    step_det_to (cdcState 0 1 .uninit .uninit .dead .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 0 2 .uninit (u32S n) .dead .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 0 3 .uninit (u32S n) .uninit .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 0 4 .uninit (u32S n) (u32S 0) .dead .dead .dead n) rfl <|
+    step_det_to (cdcState 1 0 .uninit (u32S n) (u32S 0) .dead .dead .dead n) rfl <|
+    hFromHeader
+
+/-- Fuel-free `MirWpConverges` for debug-mode `countDownCheckedMirBody`. -/
+theorem canary1d_countDownChecked_mirWpConverges (n : Nat) (hLt : n < 2 ^ 32) :
+    MirWpConverges countDownCheckedMirBody
+      (initMachineState countDownCheckedMirBody [.scalar ⟨n, 4⟩])
+      (mirNormalPost (fun ret _ => ret = .scalar ⟨n, 4⟩)) :=
+  MirWpConverges.mono
+    (fun out hOut => by
+      cases out with
+      | panic | abort => exact False.elim hOut
+      | normal p => exact hOut.1)
+    (mirWpConverges_of_wpStateOk (canary1d_countDownChecked_wpStateOk n hLt))
+
+def countDownCheckedClaim : Claim where
+  body := countDownCheckedMirBody
+  callees := []
+  pre args := ∃ n : Nat, n < 2 ^ 32 ∧ args = [.scalar ⟨n, 4⟩]
+  post args ret := ∃ n : Nat, args = [.scalar ⟨n, 4⟩] ∧ ret = .scalar ⟨n, 4⟩
+
+/-- **Trusted no-panic `VerificationResult` for debug-mode `countDownCheckedMirBody`**:
+the overflow `Assert`s are provably unreachable for every `n < 2^32`. -/
+theorem canary1d_countDownChecked_verificationResult :
+    VerificationResult countDownCheckedClaim :=
+  verifyMirNoPanic_of_wpStateOk countDownCheckedClaim fun args ⟨n, hLt, hArgs⟩ => by
+    subst hArgs
+    refine wpOutcome_mono (ops := mirDetWpOps countDownCheckedMirBody) ?_ (fun _ h => h)
+      (canary1d_countDownChecked_wpStateOk n hLt)
+    intro out hOut
+    cases out with
+    | panic | abort => exact False.elim hOut
+    | normal p => exact ⟨n, rfl, hOut.1⟩
+
+/-- Non-vacuity of the debug-mode overflow guards: if `_5` ever carried a set
+overflow flag, the real `Assert` terminator in `bb2` would `.panic`. The
+fuel-free proof above therefore genuinely discharges a live assertion. -/
+theorem canary1d_overflowAssert_live (n i acc : Nat) :
+    Anneal.PureMirExec.mirStep countDownCheckedMirBody
+      (cdcState 2 3 .uninit (u32S i) (u32S acc) .dead (ovfPair (2 ^ 32 - 1) 1) .dead n) =
+      .done .panic := rfl
+
 /-! ## 2. Canary 2 — 2-Stage Diamond CFG `StageCut` + `BlockTree` + Frame + `PureLift` -/
 
 /-- Real 7-block 2-stage diamond `V2026_06_01` `CapturedMir`:
@@ -1262,7 +1490,18 @@ def misalignedU64Lens : AlignedSubLens Nat := ⟨⟨7, 4, 8⟩, 3⟩
 def oobGlobalLens : ByteSubLens Nat := ⟨7, 18, 4⟩
 def immutableGlobalLens : ByteSubLens Nat := ⟨8, 0, 4⟩
 
-/-- Live sibling Tree Borrows entry on `allocId = 7`, `[16..20)`. -/
+/-- Live frozen Tree Borrows entry keyed on `targetLocal = 7`, `[16..20)`.
+
+Note on key spaces: `V2026_06_01` `BorrowEntry`s are keyed by
+`(targetFrameDepth, targetLocal)` -- the trusted semantics does NOT attach Tree
+Borrows state to `Memory.globals` allocations. This entry therefore lives in
+the same numeric key space as global `allocId = 7` only through the
+`Anneal.Memory.BorrowEntry.toByteRangePerm` view; Canary 3A uses it solely to
+exercise the key-agnostic range non-interference lemma
+(`borrowEntry_operational_non_interference_of_separated`) and to show that
+global-allocation writes leave `Memory.borrows` bit-for-bit unchanged. Genuine
+deref-write Tree Borrows interaction (`invalidateDerefWriteBorrows` over
+`&mut [u8]` tags on a caller local) is exercised by Canary 3B. -/
 def siblingGlobalBorrow : BorrowEntry :=
   { tag := 11, targetLocal := 7, targetProjection := [], perm := .frozen,
     rangeOffset := 16, rangeLen := 4, targetFrameDepth := 0 }
@@ -1430,7 +1669,8 @@ For ALL symbolic `(initHdr, initFlag, initVal, siblingVal, newHdr, newFlag, newV
    and `execMutSummaryChain_frame_disjoint` (ZERO raw byte-list destructuring!).
 4. Proves `Memory.borrows`, `CapturedAllocation.align`, `CapturedAllocation.mutability`,
    and `memGlobalsAlignedAt` invariance via `WritePreserves`.
-5. Proves operational Tree Borrows non-interference on `siblingGlobalBorrow`.
+5. Proves range-level Tree Borrows non-interference on `siblingGlobalBorrow`
+   (keyed on `targetLocal = 7`; see its docstring for the key-space caveat).
 6. Proves fail-closed rejection of misaligned, out-of-bounds, and immutable lenses. -/
 theorem canary3a_globalAlloc_aligned_chain_and_framing
     (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal newHdr : UInt32)
@@ -1464,7 +1704,7 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
       m2.borrows = m0.borrows ∧
       (lookupGlobalAlloc m2.globals 7).map (fun a => a.align) = some { bytes := 8 } ∧
       (lookupGlobalAlloc m2.globals 7).map (fun a => a.mutability) = some .mut ∧
-      -- 5. Tree Borrows operational non-interference for `siblingGlobalBorrow`
+      -- 5. Range-level Tree Borrows non-interference (`targetLocal = 7` key space)
       (updateBorrowPermAtProj siblingGlobalBorrow 7 none [] 0 4 0 = siblingGlobalBorrow ∧
        updateBorrowPermAtProj siblingGlobalBorrow 7 none [] 8 8 0 = siblingGlobalBorrow) ∧
       -- 6. Fail-closed rejections: misaligned, OOB, immutable
@@ -3954,5 +4194,95 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_realCallees_execMutSumma
 #guard_msgs in
 #print axioms canary3b_panickingCallee_rejected
 
-end Anneal.ParametricLoopInvAndSubLensTests
+/-! ### Additional guards: per-stage cuts, `BlockTree` validity, raw `wpStateOk`
+loop lemmas, and the debug-mode checked-arithmetic Canary 1D. -/
 
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1a_countDown_wpStateOk' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1a_countDown_wpStateOk
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1b_findTarget_wpStateOk' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1b_findTarget_wpStateOk
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1c_countUp_wpStateOk' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1c_countUp_wpStateOk
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_countDownChecked_wpStateOk' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1d_countDownChecked_wpStateOk
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_countDownChecked_mirWpConverges' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1d_countDownChecked_mirWpConverges
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_countDownChecked_verificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1d_countDownChecked_verificationResult
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_overflowAssert_live' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms canary1d_overflowAssert_live
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.diamondBlockTree_valid' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms diamondBlockTree_valid
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.diamondChunk8Tree_valid' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms diamondChunk8Tree_valid
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage1_stepStageCut' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_stage1_stepStageCut
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage1_within' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_stage1_within
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage2_stepStageCut' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_stage2_stepStageCut
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage2_within' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_stage2_within
+
+end Anneal.ParametricLoopInvAndSubLensTests
