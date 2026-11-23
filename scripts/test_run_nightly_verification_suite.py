@@ -31,6 +31,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import audit_mir_coverage_matrix as mir_audit  # noqa: E402
 import run_nightly_verification_suite as suite  # noqa: E402
 
 
@@ -579,20 +580,18 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertGreaterEqual(len(rels), 2, family)
             self.assertTrue(any(rel.endswith("MR.lean") for rel in rels), family)
             self.assertTrue(any(rel.endswith("LM.lean") for rel in rels), family)
-        for rel in all_checked_files:
+        def check_clean_lean_code(rel: str) -> str:
             path = REPO_ROOT / rel
             self.assertTrue(path.is_file(), rel)
-            code = suite._strip_lean_comments(path.read_text(encoding="utf-8"))
-            # Bridge files run self-tests that quote banned axiom names in string literals,
-            # so check the module files strictly and bridge files for top-level declarations.
-            if rel in MIR_BUNDLE_KERNEL_BRIDGES.values():
-                self.assertIsNone(re.search(r"(?m)^\s*sorry\b", code), f"{rel}: sorry")
-                self.assertIsNone(axiom_decl_re.search(code), f"{rel}: axiom")
-            else:
-                for banned in ("sorry", "native_decide"):
-                    self.assertIsNone(re.search(rf"\b{banned}\b", code), f"{rel}: {banned}")
-                self.assertIsNone(axiom_decl_re.search(code), f"{rel}: axiom")
-            proof_code[rel] = code
+            code, lex_errors = mir_audit.strip_lean_source(path.read_text(encoding="utf-8"), keep_strings=False)
+            self.assertEqual(lex_errors, [], f"{rel}: {lex_errors}")
+            for banned in ("sorry", "admit", "native_decide"):
+                self.assertIsNone(re.search(rf"\b{banned}\b", code), f"{rel}: {banned}")
+            self.assertIsNone(axiom_decl_re.search(code), f"{rel}: axiom")
+            return code
+
+        for rel in all_checked_files:
+            proof_code[rel] = check_clean_lean_code(rel)
         for key, families in MIR_PROMOTED_VARIANT_EVIDENCE.items():
             self.assertTrue(families, key)
             expected_files = {rel for family in families for rel in MIR_DUAL_AUTHORITY_MODULES[family]}
@@ -635,8 +634,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
                     f"{rel} missing bridge theorem {sym}",
                 )
-        # Float-cast correspondence modules cited in `MIR_AST_CATEGORIES` exist and carry
-        # their fail-closed MiniRust boundary and direct Miri step-simulation theorems.
+        # Float-cast correspondence modules cited in `MIR_AST_CATEGORIES` exist, pass hygiene,
+        # and carry their fail-closed MiniRust boundary and direct Miri step-simulation theorems.
+        float_umbrella = check_clean_lean_code("lean-miri/lean/LeanMiriSpec/FloatCastLM.lean")
+        self.assertIn("LeanMiriSpec.FloatCastLM.RealStepDirect", float_umbrella)
         for rel, required_theorems in (
             (
                 "minirust/lean/MiniRustSpec/FloatCastMR.lean",
@@ -646,10 +647,12 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "lean-miri/lean/LeanMiriSpec/FloatCastLM/RealStepDirect.lean",
                 ("step_cast_float_copy_simulation_mode", "step_cast_float_move_simulation_mode"),
             ),
+            (
+                "lean-miri/lean/LeanMiriSpec/WitFloatCastLM.lean",
+                ("wfcW5_promoted_raw_pipeline_end_to_end", "wfcW5_indirect_float_pipeline_end_to_end"),
+            ),
         ):
-            path = REPO_ROOT / rel
-            self.assertTrue(path.is_file(), rel)
-            code = suite._strip_lean_comments(path.read_text(encoding="utf-8"))
+            code = check_clean_lean_code(rel)
             for sym in required_theorems:
                 self.assertRegex(
                     code,
@@ -5815,8 +5818,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     )
                     self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
             self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
-            # At `>= 10 GiB` or unreadable (`None`) host ceiling, the wrapper IS still probed.
-            for host_mib in (10240, None):
+            # At `>= 10 GiB` or non-integer (`None` / `bool`) host ceiling, the wrapper IS still probed.
+            for host_mib in (10240, None, True):
                 argv_log.write_text("", encoding="utf-8")
                 with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=host_mib):
                     env = suite._build_step_env(
@@ -6211,6 +6214,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             ["--m", "file"],
             ["--mode", "bogus"],
             ["-W", "x"],
+            ["-W", "--ensure-slice"],
+            ["--mode", "-h"],
+            ["--timeout", "--ensure-slice"],
+            ["--", "--ensure-slice"],
             [],
             ["--json"],
             ["--ex"],
@@ -6247,7 +6254,14 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             make_host(262144, 200000, 96, 131072),
         ):
             for w_file in (None, 1, 2, 4):
-                for cli_opts in ([], ["--concurrency", "1"], ["-W2"], ["--conc=3"], ["--concurrency", "1", "--exclusive"]):
+                for cli_opts in (
+                    [],
+                    ["--concurrency", "1"],
+                    ["-W2"],
+                    ["--conc=3"],
+                    ["--concurrency", "1", "--exclusive"],
+                    ["--concurrency", "3", "--exclusive"],
+                ):
                     for inner in (["lake", "build", "MiniRustSpec"], ["lake", "env", "lean", "Foo.lean"]):
                         for extra in ([], ["--memory-max-mb", "9000"]):
                             cmd = [lr, *cli_opts, *extra, "--timeout", "900", "--", *inner]

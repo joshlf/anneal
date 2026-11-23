@@ -5651,7 +5651,11 @@ def _build_step_env(
                 wrapper_mib = (
                     _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None
                 )
-                ceilings = [mib for mib in (host_mib, wrapper_mib) if mib is not None]
+                ceilings = [
+                    mib
+                    for mib in (host_mib, wrapper_mib)
+                    if isinstance(mib, int) and not isinstance(mib, bool)
+                ]
                 ram_mib = min(ceilings) if ceilings else None
         else:
             ram_mib = effective_ram_mib
