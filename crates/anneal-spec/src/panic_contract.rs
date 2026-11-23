@@ -6890,9 +6890,14 @@ fn deep_scan_slice(
             }
             TokenKind::Ident("async" | "unsafe" | "default" | "safe" | "auto") => {}
             TokenKind::Ident("const") => {
+                // `const fn`-style qualifiers keep `pending`. An inline `const { .. }`
+                // block expression statement is block-like (no trailing `;`), so it
+                // must NOT be skipped "to the next `;`" (which would swallow the
+                // following live items): keep `pending` so the `{` handler opens an
+                // exactly brace-matched (possibly disabled) block scope instead.
                 if !matches!(
                     lex.peek_token()?.kind,
-                    TokenKind::Ident("fn" | "unsafe" | "extern" | "async")
+                    TokenKind::Ident("fn" | "unsafe" | "extern" | "async") | TokenKind::Punct(b'{')
                 ) {
                     let disabled = pending.saw_disabled_cfg;
                     pending.reset();
@@ -7155,6 +7160,21 @@ fn peek_fn_body_inner<'a>(lex: &RustLexer<'a>) -> Result<Option<&'a str>, ()> {
     }
 }
 
+/// Consumes one non-delimiter token inside a heuristically skipped disabled
+/// item, failing closed if it is a *top-level* `fn <ident>` item start. Real
+/// disabled `const`/`static`/`use`/`type`/`let`/`struct`/fn-signature tails
+/// never contain one (fn-pointer types are `fn(..)`), so seeing it means the
+/// skip has crossed into a following, possibly live, item.
+fn skip_disabled_plain_token(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    let tok = lex.next_token()?;
+    if tok.kind == TokenKind::Ident("fn")
+        && matches!(lex.peek_token()?.kind, TokenKind::Ident(_))
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 /// Skips a statically disabled (`#[cfg(any())]` / `#[cfg(false)]`) function's
 /// signature tail and `{ ... }` body (or `;`) without crossing enclosing
 /// delimiter boundaries (`}`, `)`, `]`, `=`).
@@ -7180,7 +7200,7 @@ fn skip_disabled_fn_tail(lex: &mut RustLexer<'_>) -> Result<(), ()> {
                 let _ = lex.consume_angle_inner()?;
             }
             _ => {
-                let _ = lex.next_token()?;
+                skip_disabled_plain_token(lex)?;
             }
         }
     }
@@ -7201,7 +7221,7 @@ fn skip_disabled_item_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
                 let _ = lex.consume_balanced_inner(p)?;
             }
             _ => {
-                let _ = lex.next_token()?;
+                skip_disabled_plain_token(lex)?;
             }
         }
     }
@@ -7231,7 +7251,7 @@ fn skip_disabled_type_decl(lex: &mut RustLexer<'_>) -> Result<(), ()> {
                 let _ = lex.consume_angle_inner()?;
             }
             _ => {
-                let _ = lex.next_token()?;
+                skip_disabled_plain_token(lex)?;
             }
         }
     }

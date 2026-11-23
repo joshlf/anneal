@@ -2773,6 +2773,45 @@ fn kani5095_verify_reachable_callees_rejects_trait_dispatched_expected_caller() 
 }
 
 // ===========================================================================
+// 3c. `[adv ep2 B3]` Disabled-cfg skipping must never swallow live items
+// ===========================================================================
+
+#[test]
+fn kani5095_disabled_cfg_inline_const_block_does_not_swallow_live_items() {
+    use InlineBoundaryVerdict::*;
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+    let wrap = |body: &str| {
+        format!("#[inline(never)] pub fn target() {{}}\nmod m {{ {body} }}\n")
+    };
+
+    // An inline `const { .. }` block statement is block-like (no trailing
+    // `;`). Skipping a disabled one "to the next `;`" swallowed the live,
+    // un-annotated `fn target` that follows. All of these compile with rustc.
+    for live_hidden in [
+        "fn g() { #[cfg(any())] const { } fn target() {} }",
+        "fn g() { #[cfg(any())] const { fn inner() {} } fn target() {} }",
+        "fn g() { #[cfg(false)] const { 1 }; fn target() {} }",
+        "fn g() { #[cfg(any())] unsafe { } #[cfg(any())] const { } fn target() {} }",
+        "fn g() { let _ = const { 1 }; #[cfg(any())] const { } fn target() {} }",
+        "fn g() { #[cfg(any())] const _: () = (); fn target() {} }",
+        "fn g() { const { fn target() {} } }",
+    ] {
+        assert_eq!(v(&wrap(live_hidden)), MissingInlineNever, "{live_hidden}");
+    }
+
+    // A genuinely disabled inline-const block is brace-matched exactly, so
+    // dead un-annotated decoys inside it are still ignored.
+    assert_eq!(
+        v(&wrap("fn g() { #[cfg(any())] const { fn target() {} } }")),
+        Verified
+    );
+    assert_eq!(
+        v(&wrap("fn g() { #[cfg(not(all()))] unsafe { fn target() {} } }")),
+        Verified
+    );
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 
