@@ -7529,5 +7529,178 @@ class TestNegationPrecedenceB2AdversarialFixes(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceA2AdversarialFixes(unittest.TestCase):
+    r"""`[adv A2]` regressions for bugs found in `[adv B2]` and earlier vacuity auditor passes:
+
+    1. Exponential ReDoS in `_BARE_BINDER_NAMES_RE` (`(?:[^\W\d][\w'!?]*\s*)+`): a single ~25-char
+       non-matching identifier (e.g. `∀ very_long_variable_name < n, ...`) took seconds / hours.
+    2. Strict-implicit `⦃...⦄` and bracket parity: nested `⦃...⦄` and `'⦄'` char literals inside
+       strict-implicit binders, `theorem name⦃...⦄` without space, `∀ ⦃x : Nat⦄, ...` inside
+       hypotheses, `_quantifier_bound_names` dropping binders after `⦃...⦄`, Hoare triples
+       `⦃P ∧ False ∧ Q⦄` / `⦃P ∨ True ∨ Q⦄` and `⟨P, Q ∨ True ∨ R⟩` split at inner `∧` / `∨` / `→`.
+    3. Dependent-arrow binders & negations: `{h : False} → P`, `⦃h : False⦄ → P`, `[h : False] → P`,
+       `{n : Nat} → (h : n < 0) → P`, `(hp : P) → False` / `(ht : True) → False` denials.
+    4. Header parser guards: fast-path `→` split through `if`/`match`/`let`/`fun`, `where` prefix
+       identifiers (`whereFoo`, `where_x`), and `:=` inside guillemets (`«a := b»`).
+    5. Coerced `Nat` subtraction (`↑a.length - ↑b.length < 0`, `↑a.length - 1 < 0`,
+       `Nat.cast a - Nat.cast b < 0`), high-precedence infix operators (`>>=`, `|>.`, `*>`, `>>>`,
+       `&&&`) on `Nat` / `Option` / `List` / `Sum` / `Except` operands, `↑xs.length < 0 : False`
+       refutation exemption, `Option.none = Option.some x`, and string-blanked `Except.error "msg"`.
+    6. Prefix-binder guard in `_record_pos_neg_atom` (`∀ x ∈ s, a = b` paired with `∀ x ∈ s, a ≠ b`),
+       `Float` `¬ x ≤ x` NaN reflexivity exemption, `Fin` shadowing in quantifiers, projection &
+       inner-rebinding guards in `_untyped_binders_inhabited_by_calls`, ancestor-descendant
+       quantifier contradiction pairs (respecting rebinding), and char-literal / guillemet
+       handling in conclusion triviality checks.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "nested_strict_implicit_false": "theorem bad ⦃h : ∀ ⦃y : Nat⦄, False⦄ : x = 1 := by sorry\n",
+        "strict_implicit_char_close_and_false": "theorem bad ⦃h : c = '⦄' ∧ False⦄ : x = 1 := by sorry\n",
+        "forall_strict_implicit_nat_lt0_hyp": "theorem bad (h : ∀ ⦃x : Nat⦄, x < 0) : x = 1 := by sorry\n",
+        "forall_strict_implicit_false_hyp": "theorem bad (h : ∀ ⦃x : Nat⦄, False) : x = 1 := by sorry\n",
+        "dep_arrow_implicit_false": "theorem bad : {h : False} → x = 1 := by sorry\n",
+        "dep_arrow_strict_implicit_false": "theorem bad : ⦃h : False⦄ → x = 1 := by sorry\n",
+        "dep_arrow_inst_false": "theorem bad : [h : False] → x = 1 := by sorry\n",
+        "dep_arrow_implicit_nat_lt0": "theorem bad : {n : Nat} → (h : n < 0) → x = 1 := by sorry\n",
+        "dep_arrow_strict_implicit_nat_lt0": "theorem bad : ⦃n : Nat⦄ → (h : n < 0) → x = 1 := by sorry\n",
+        "named_arrow_false_neg_pair": "theorem bad (P : Prop) (h1 : P) (h2 : (hp : P) → False) : x = 1 := by sorry\n",
+        "named_arrow_true_false": "theorem bad (h : (ht : True) → False) : x = 1 := by sorry\n",
+        "thm_name_no_space_strict_imp": "theorem bad⦃x : Nat⦄ (h : False) : x = 1 := by sorry\n",
+        "where_prefix_ident_with_lambda": "theorem bad : (fun x => x) = id → whereFoo = 0 → (h : False) → x = 1 := by sorry\n",
+        "bare_where_prefix_binder": "theorem bad where_x (h : False) : x = 1 := by sorry\n",
+        "hoare_eq_refl_neg": "theorem bad (h : ¬ (⦃a = b⦄ = ⦃a = b⦄)) : x = 1 := by sorry\n",
+        "nested_quant_ancestor_contradiction": "theorem bad (P : Nat → Prop) (h : ∃ x : Nat, P x ∧ ∃ y : Nat, ¬ P x) : x = 1 := by sorry\n",
+        "nested_quant_forall_ancestor_contradiction": "theorem bad (P : Nat → Prop) (h : ∀ x : Nat, P x ∧ ∃ y : Nat, ¬ P x) : x = 1 := by sorry\n",
+        "except_string_blanked_clash": 'theorem bad (h : Except.ok 1 = Except.error "boom") : x = 1 := by sorry\n',
+        "option_qualified_clash": "theorem bad (h : Option.none = Option.some x) : y = 1 := by sorry\n",
+        "float_shadowed_by_nat_in_quant": "theorem bad (x : Float) (h : ∀ x : Nat, ¬ x ≤ x) : y = 1 := by sorry\n",
+        "coerced_nat_plus_one_lt0": "theorem bad (xs : List Nat) (h : ↑xs.length + 1 < 0) : y = 1 := by sorry\n",
+        "cons_append_nil": "theorem bad (x : Nat) (xs ys : List Nat) (h : x :: xs ++ ys = []) : x = 0 := by sorry\n",
+    }
+
+    TRIVIAL_CONCLUSION_ALL_SCOPE = {
+        "char_lit_arrow_or_true": "theorem bad (c : Char) : c = '→' ∨ True := by sorry\n",
+        "char_lit_lparen_or_true": "theorem bad (c : Char) : c = '(' ∨ True := by sorry\n",
+        "guillemet_if_or_true": "theorem bad : «if» = 0 ∨ True := by sorry\n",
+        "guillemet_assign_in_stmt": "theorem bad : «a := b» = «a := b» := by sorry\n",
+        "forall_strict_implicit_comma_true": "theorem bad : ∀ ⦃h : ∀ a, P a⦄, True := by sorry\n",
+    }
+
+    CLEAN = {
+        "coerced_sub_len_lt_0": "theorem ok (a b : List Nat) (h : ↑a.length - ↑b.length < 0) : a.length < b.length := by sorry\n",
+        "coerced_sub_1_lt_0": "theorem ok (a : List Nat) (h : ↑a.length - 1 < 0) : a = [] := by sorry\n",
+        "one_minus_coerced_len_lt_0": "theorem ok (a : List Nat) (h : 1 - ↑a.length < 0) : a.length ≥ 2 := by sorry\n",
+        "nat_cast_sub_lt_0": "theorem ok (a b : Nat) (h : Nat.cast a - Nat.cast b < 0) : a < b := by sorry\n",
+        "sumSizes_pipe_dot_lt_0": "theorem ok (h : sumSizes xs |>.toInt < 0) : xs ≠ [] := by sorry\n",
+        "nat_prefix_pipe_dot_lt_0": "theorem ok (n : Nat) (h : Nat.succ n |>.toInt < 0) : n ≠ 0 := by sorry\n",
+        "sumSizes_band_lt_0": "theorem ok (y : Int64) (h : sumSizes xs &&& y < 0) : y < 0 := by sorry\n",
+        "shift_suffix_lt_0": "theorem ok (x : Int64) (xs : List Nat) (h : x>>>xs.length < 0) : x < 0 := by sorry\n",
+        "some_bind_none": "theorem ok (x : Nat) (f : Nat → Option Nat) (h : some x >>= f = none) : f x = none := by sorry\n",
+        "some_pipe_dot_none": "theorem ok (x : Nat) (f : Nat → Option Nat) (h : some x |>.bind f = none) : f x = none := by sorry\n",
+        "some_seqr_none": "theorem ok (x : Nat) (y : Option Nat) (h : some x *> y = none) : y = none := by sorry\n",
+        "except_bind_err": "theorem ok (x : Nat) (e : String) (f : Nat → Except String Nat) (h : Except.ok x >>= f = Except.error e) : f x = Except.error e := by sorry\n",
+        "sum_pipe_dot_swap": "theorem ok (x y : Nat) (h : Sum.inl x |>.swap = Sum.inr y) : x = y := by sorry\n",
+        "cons_pipe_dot_nil": "theorem ok (x : Nat) (xs : List Nat) (h : x :: xs |>.tail = []) : xs = [] := by sorry\n",
+        "cons_bind_nil": "theorem ok (x : Nat) (xs : List Nat) (f : Nat → List Nat) (h : x :: xs >>= f = []) : f x = [] := by sorry\n",
+        "forall_mem_eq_neq_pair": "theorem ok (s : List Nat) (a b : Nat) (h1 : ∀ x ∈ s, a = b) (h2 : ∀ x ∈ s, a ≠ b) : s = [] := by sorry\n",
+        "forall_prop_eq_neq_pair": "theorem ok (P : Prop) (a b : Nat) (h1 : ∀ hp : P, a = b) (h2 : ∀ hp : P, a ≠ b) : ¬ P := by sorry\n",
+        "if_else_eq_neq_pair": "theorem ok (c : Prop) [Decidable c] (a b : Nat) (h1 : if c then True else a = b) (h2 : if c then True else a ≠ b) : c := by sorry\n",
+        "hoare_conj_false": "theorem ok (h : ⦃P ∧ False ∧ Q⦄ t ⦃R⦄) : R = R → P := by sorry\n",
+        "hoare_disj_true_conc": "theorem ok : ⦃P ∨ True ∨ Q⦄ t ⦃R⦄ := by sorry\n",
+        "angle_disj_true_conc": "theorem ok (x : Prop × Prop) (P Q R : Prop) : ⟨P, Q ∨ True ∨ R⟩ = x := by sorry\n",
+        "if_arrow_true_fastpath": "theorem ok (c : Prop) [Decidable c] (P : Prop) : if c then P else P → True := by sorry\n",
+        "if_arrow_taut_fastpath": "theorem ok (c : Prop) [Decidable c] (P Q : Prop) (h : P) : if c then Q else Q → P := by sorry\n",
+        "fin_shadowed_in_quant": "theorem ok (Fin : Nat → Type) (h : ∃ x : Fin 1, x < 0) : x = 1 := by sorry\n",
+        "untyped_call_proj_fin0": "theorem ok (R : Nat → Prop) (P : Fin 0 → Prop) (h : ∀ s, P s ∧ R s.val ∧ False) : ∀ s : Fin 0, P s := by sorry\n",
+        "untyped_call_inner_rebind_exists": "theorem ok {α : Type} (P : α → Prop) (R : Nat → Prop) (h : ∀ s, P s ∧ (∃ s : Nat, R s) ∧ False) : α → False := by sorry\n",
+        "untyped_call_inner_rebind_arrow": "theorem ok {α : Type} (P : α → Prop) (R : Nat → Prop) (h : ∀ s, P s ∧ ((s : Nat) → R s) ∧ False) : α → False := by sorry\n",
+        "coerced_len_false_elim": "theorem ok (xs : List Nat) (h : ↑xs.length < 0) : False := by omega\n",
+        "float_not_le_refl": "theorem ok (x : Float) (h : ¬ x ≤ x) : x.isNaN = true := by sorry\n",
+        "float_not_ge_refl_quant": "theorem ok (h : ∃ x : Float, ¬ x ≥ x) : P := by sorry\n",
+        "float_nan_not_le_refl": "theorem ok (h : ¬ Float.nan ≤ Float.nan) : P := by sorry\n",
+        "strict_imp_exists_shadow": "theorem ok (h1 : ∃ ⦃x : Nat⦄ (y : Nat), y = 1) (h2 : ∃ ⦃x : Nat⦄ (y : Nat), y ≠ 1) : P := by sorry\n",
+        "nested_quant_rebind_shadow": "theorem ok (P : Nat → Prop) (h : ∃ x : Nat, P x ∧ ∃ x : Nat, ¬ P x) : Q := by sorry\n",
+        "set_builder_premise": "theorem ok : {x : Nat | x < 0} → False := by sorry\n",
+        "dep_arrow_named_true_false_refutation": "theorem ok : (h : (ht : True) → False) → False := fun h => h trivial\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_a2_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_a2_trivial_conclusions_flagged_in_all_scope(self) -> None:
+        rule = audit.RULE_TRIVIAL_CONCLUSION
+        for label, src in self.TRIVIAL_CONCLUSION_ALL_SCOPE.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+
+    def test_a2_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        for label, src in self.CLEAN.items():
+            self.assertEqual(audit.scan_lean_text(src), [], f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_a2_bare_binder_regex_linear_no_redos(self) -> None:
+        long_ident = "very_long_lean_identifier_name_" * 4
+        t0 = time.perf_counter()
+        self.assertIsNone(proof_health._BARE_BINDER_NAMES_RE.fullmatch(long_ident + " < 0"))
+        src = f"theorem ok (h : ∀ {long_ident} < n, P {long_ident}) : Q := by sorry\n"
+        self.assertEqual(audit.scan_lean_text(src), [])
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        self.assertLess(elapsed_ms, 50.0, f"ReDoS regression: took {elapsed_ms:.2f}ms")
+
+    def test_a2_helper_invariants(self) -> None:
+        prem = proof_health._arrow_premise_binder
+        self.assertEqual(prem("{h : False}"), ("h", "False"))
+        self.assertEqual(prem("⦃h : False⦄"), ("h", "False"))
+        self.assertEqual(prem("[h : False]"), ("h", "False"))
+        self.assertEqual(prem("{x : Nat | x < 5}"), ("", "{x : Nat | x < 5}"))
+        self.assertEqual(prem("{x : {y : Nat // y < 5}}"), ("x", "{y : Nat // y < 5}"))
+        self.assertEqual(prem("{h : a || b = true}"), ("h", "a || b = true"))
+        self.assertEqual(prem("⦃P⦄ t ⦃Q⦄"), ("", "⦃P⦄ t ⦃Q⦄"))
+
+        nat = proof_health._is_nat_like_operand
+        none: frozenset[str] = frozenset()
+        for yes, nv in (
+            ("↑xs.length + 1", none),
+            ("↑n", frozenset({"n"})),
+            ("↑(a - b)", frozenset({"a", "b"})),
+            ("Nat.cast a", frozenset({"a"})),
+            ("arr[i].length", none),
+        ):
+            self.assertTrue(nat(yes, nv), yes)
+        for no, nv in (
+            ("↑a.length - ↑b.length", none),
+            ("↑a.length - 1", none),
+            ("1 - ↑a.length", none),
+            ("Nat.cast a - Nat.cast b", frozenset({"a", "b"})),
+            ("a - b + ↑c", frozenset({"a", "b", "c"})),
+            ("sumSizes xs |>.toInt", none),
+            ("Nat.succ n |>.toInt", frozenset({"n"})),
+            ("x>>>xs.length", none),
+            ("(f)(xs).length", none),
+            ("↑x", none),
+        ):
+            self.assertFalse(nat(no, nv), no)
+
+        self.assertEqual(proof_health._arrow_false_antecedent("(hp : P) → False"), "P")
+        self.assertEqual(proof_health._arrow_false_antecedent("{ht : True} → False"), "True")
+        self.assertIsNone(proof_health._split_lean_theorem_header(" ⦃x : ⦃y : Nat⦄", 0))
+
+    def test_check_trusted_agrees_on_every_a2_header(self) -> None:
+        ct = _load_check_trusted()
+        all_cases = {**self.VACUOUS_BOTH_SCOPES, **self.TRIVIAL_CONCLUSION_ALL_SCOPE, **self.CLEAN}
+        for label, src in all_cases.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6762,7 +6762,7 @@ _3AXIS_LINE_RE = re.compile(
     r"^\s*(Kind|Witness|Assumes|Subject)\s*:\s*(.+?)\s*$", re.IGNORECASE
 )
 
-_LEAN_THM_NAME_RE = re.compile(r"[ \t\r\n]+([^ \t\r\n({\[:]+)")
+_LEAN_THM_NAME_RE = re.compile(r"[ \t\r\n]+([^ \t\r\n({\[:⦃]+)")
 
 
 def _iter_lean_theorem_headers(code_only: str) -> list[tuple[int, int, str]]:
@@ -6898,10 +6898,16 @@ _WS_RUN_RE = re.compile(r"[ \t\r\n]+")
 _STMT_END_SCAN_RE = re.compile(r"[(){}\[\]\n;]|:=|(?<![\w'!?.])let\b")
 _CHAR_LITERAL_RE = re.compile(r"(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'")
 _ARROW_SCAN_RE = re.compile(
-    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩]|↔|<->|<\|>|<\||\$|→|->|∀|∃|λ|"
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∀|∃|λ|"
     r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
 )
 _PIPE_ARM_RE = re.compile(r"\n[ \t]*\|")
+_WHERE_SCAN_RE = re.compile(
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|(?<![\w'.!?])where(?![\w'!?])"
+)
+_BRACE_SEP_SCAN_RE = re.compile(
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|//|(?<![|<])\|(?![|>])|,"
+)
 
 
 def _neutralize_char_literals(expr: str) -> str:
@@ -6930,19 +6936,19 @@ _BINDER_SCAN_RE = re.compile(r"[(){}\[\]]|:=|:")
 
 
 def _scan_binder_group(seg: str, p: int, limit: int | None = None) -> tuple[int, int]:
-    """For a bracket group opening at `seg[p]`, return `(offset past its matching close,
-    offset of its first depth-1 `:` that is not `:=`, or -1)` using C-level `str.find`."""
+    """For a bracket group opening at `seg[p]` (`(`, `{`, `[`, or `⦃`), return `(offset past its
+    matching close, offset of its first depth-1 ':' that is not ':=', or -1)` using C-level
+    `str.find`. Returns `(end_lim + 1, -1)` if the group is unclosed before `limit`."""
     end_lim = len(seg) if limit is None else limit
     ch = seg[p]
-    close_ch = ")" if ch == "(" else ("}" if ch == "{" else "]")
+    close_ch = ")" if ch == "(" else ("}" if ch == "{" else ("]" if ch == "[" else "⦄"))
     find = seg.find
     cur = p + 1
     depth = 1
     while depth > 0 and cur < end_lim:
         c_close = find(close_ch, cur, end_lim)
         if c_close == -1:
-            cur = end_lim
-            break
+            return end_lim + 1, -1
         c_open = find(ch, cur, c_close)
         target = c_open if c_open != -1 else c_close
         lit_end = _skip_char_literal_before(seg, cur, target, end_lim)
@@ -6955,6 +6961,8 @@ def _scan_binder_group(seg: str, p: int, limit: int | None = None) -> tuple[int,
         else:
             depth -= 1
             cur = c_close + 1
+    if depth > 0:
+        return end_lim + 1, -1
     # Find the binder's `:` before any nested bracket (and outside char literals)
     scan_end = cur - 1 if cur > p + 1 else cur
     col_scan = p + 1
@@ -6974,6 +6982,7 @@ def _scan_binder_group(seg: str, p: int, limit: int | None = None) -> tuple[int,
                 prefix.count("(") == prefix.count(")")
                 and prefix.count("{") == prefix.count("}")
                 and prefix.count("[") == prefix.count("]")
+                and prefix.count("⦃") == prefix.count("⦄")
             ):
                 return cur, col_idx
         break
@@ -7011,33 +7020,72 @@ def _is_outer_paren_wrapped(t: str) -> bool:
     return False
 
 
-def _typed_binder_parts(inner: str) -> tuple[str, str] | None:
-    """`(names, type)` for the inside of a `names : T` binder group; `None` when it is untyped
-    (`x y`) or its first `:` opens a `:=` default."""
-    b_n, col, b_t = inner.partition(":")
-    if not col or b_t.startswith("="):
-        return None
-    b_n = b_n.strip()
-    b_t = b_t.strip()
-    if not b_n or not b_t:
-        return None
-    return b_n, b_t
+def _has_depth0_brace_sep(expr: str) -> bool:
+    """`True` iff `expr` has `//`, `|`, or `,` at depth 0 outside brackets, `«...»`, and char
+    literals: distinguishes subtypes `{x : T // p}` and set-builders `{x : T | p}` from implicit
+    dependent-arrow binders `{x : T}`."""
+    if "//" not in expr and "|" not in expr and "," not in expr:
+        return False
+    depth = 0
+    for m in _BRACE_SEP_SCAN_RE.finditer(expr):
+        t = m.group(0)
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "({[⟨⦃":
+            depth += 1
+        elif t in ")}]⟩⦄":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            return True
+    return False
+
+
+def _find_depth0_where(seg: str, start: int, end: int) -> int:
+    """Return the offset of the first standalone depth-0 `where` keyword in `seg[start:end]`
+    (outside `()[]{}⟨⟩⦃⦄`, `«...»`, and char literals), or `-1`."""
+    if "where" not in seg[start:end]:
+        return -1
+    depth = 0
+    for m in _WHERE_SCAN_RE.finditer(seg, start, end):
+        t = m.group(0)
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "({[⟨⦃":
+            depth += 1
+        elif t in ")}]⟩⦄":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            return m.start()
+    return -1
 
 
 def _arrow_premise_binder(prem: str) -> tuple[str, str]:
-    """The hypothesis a `→` premise contributes. A premise that is exactly one `(names : T)` group
-    is a dependent-arrow binder (`(h : False) → P`, `(n : Nat) → n < 0 → P`): it binds `names`
-    like a header binder, so it is returned as `(names, T)`. Anything else -- including a subtype
-    or set-builder brace `{x : T // p}` -- is the anonymous premise `("", prem)`. `[adv B2]`:
-    A0-A1 kept `("", "(h : False)")`, whose text matches no contradiction and binds no `Nat`
-    variable, so the dependent-arrow spelling evaded every scope."""
-    if len(prem) >= 5 and prem[0] == "(" and prem[-1] == ")" and ":" in prem:
-        q, col = _scan_binder_group(prem, 0, len(prem))
-        if q == len(prem) and col != -1:
-            names = prem[1:col].strip()
-            b_type = prem[col + 1 : q - 1].strip()
-            if b_type and _BARE_BINDER_NAMES_RE.fullmatch(names) is not None:
-                return names, b_type
+    """The hypothesis a `→` premise contributes. A premise that is exactly one `(names : T)`,
+    `{names : T}` (not a subtype `{x : T // p}` or set-builder `{x : T | p}`), `⦃names : T⦄`, or
+    `[names : T]` binder group is a dependent-arrow binder (`(h : False) → P`, `{h : False} → P`,
+    `⦃n : Nat⦄ → n < 0 → P`): it binds `names` like a header binder, so it is returned as
+    `(names, T)`. Anything else is the anonymous premise `("", prem)`."""
+    if len(prem) >= 5 and ":" in prem:
+        c0 = prem[0]
+        c_end = prem[-1]
+        if (
+            (c0 == "(" and c_end == ")")
+            or (c0 == "{" and c_end == "}")
+            or (c0 == "⦃" and c_end == "⦄")
+            or (c0 == "[" and c_end == "]")
+        ):
+            q, col = _scan_binder_group(prem, 0, len(prem))
+            if q == len(prem) and col != -1:
+                names = prem[1:col].strip()
+                b_type = prem[col + 1 : q - 1].strip()
+                if (
+                    b_type
+                    and _BARE_BINDER_NAMES_RE.fullmatch(names) is not None
+                    and (c0 != "{" or not _has_depth0_brace_sep(b_type))
+                ):
+                    return names, b_type
     return "", prem
 
 
@@ -7079,18 +7127,25 @@ def _split_lean_theorem_header(
             colon_pos = p
             break
         if ch == "⦃":
-            # `[adv B2]` Strict-implicit binder `⦃x : T⦄`. A0-A1 read its inner `:` as the
-            # statement colon, so every later binder (`(h : False)`) fell into the "conclusion".
-            close_s = find("⦄", p + 1, n)
-            if close_s == -1:
+            # Strict-implicit binder `⦃x : T⦄`, using balanced scanning so nested `⦃...⦄`
+            # (e.g. `⦃h : ∀ ⦃y : Nat⦄, False⦄`) and `'⦄'` char literals stay intact.
+            q, col_s = _scan_binder_group(code_segment, p, n)
+            if q > n:
                 return None
-            inner = code_segment[p + 1 : close_s]
-            typed_s = _typed_binder_parts(inner)
-            if typed_s is not None:
-                binders.append(typed_s)
-            elif inner.strip():
-                extra_binders.append(f"untyped:{inner.strip()}")
-            p = close_s + 1
+            if col_s != -1:
+                b_n = code_segment[p + 1 : col_s].strip()
+                b_t = code_segment[col_s + 1 : q - 1].strip()
+                if b_n and b_t:
+                    binders.append((b_n, b_t))
+                else:
+                    inner = code_segment[p + 1 : q - 1].strip()
+                    if inner:
+                        extra_binders.append(f"untyped:{inner}")
+            else:
+                inner = code_segment[p + 1 : q - 1].strip() if q > p + 1 else ""
+                if inner:
+                    extra_binders.append(f"untyped:{inner}")
+            p = q
             continue
         if ch in "({[":
             close_ch = ")" if ch == "(" else ("}" if ch == "{" else "]")
@@ -7109,6 +7164,7 @@ def _split_lean_theorem_header(
                         prefix_b.count("(") == prefix_b.count(")")
                         and prefix_b.count("{") == prefix_b.count("}")
                         and prefix_b.count("[") == prefix_b.count("]")
+                        and prefix_b.count("⦃") == prefix_b.count("⦄")
                     ):
                         binders.append(
                             (
@@ -7127,6 +7183,8 @@ def _split_lean_theorem_header(
                 p = fast_close + 1
                 continue
             q, colon_in_binder = _scan_binder_group(code_segment, p, n)
+            if q > n:
+                return None
             if colon_in_binder != -1:
                 binders.append(
                     (
@@ -7140,7 +7198,11 @@ def _split_lean_theorem_header(
                     extra_binders.append(f"[{inner}]" if ch == "[" else f"untyped:{inner}")
             p = q
             continue
-        if ch == "w" and code_segment.startswith("where", p):
+        if (
+            ch == "w"
+            and code_segment.startswith("where", p)
+            and (p + 5 >= n or not _is_lean_ident_char(code_segment[p + 5]))
+        ):
             return None
         extra_binders.append("bare")
         p += 1
@@ -7163,6 +7225,9 @@ def _split_lean_theorem_header(
             bal_slice.count("(") == bal_slice.count(")")
             and bal_slice.count("{") == bal_slice.count("}")
             and bal_slice.count("[") == bal_slice.count("]")
+            and bal_slice.count("⟨") == bal_slice.count("⟩")
+            and bal_slice.count("⦃") == bal_slice.count("⦄")
+            and bal_slice.count("«") == bal_slice.count("»")
         ):
             if "let " in prefix_slice:
                 last_let = prefix_slice.rfind("let ")
@@ -7188,8 +7253,8 @@ def _split_lean_theorem_header(
             decl_end_bound = (
                 stmt_end if stmt_end != -1 else min(_find_lean_decl_end(code_segment, stmt_start), n)
             )
-            w_pos = find("where", stmt_start, decl_end_bound)
-            if w_pos != -1 and (w_pos == stmt_start or code_segment[w_pos - 1] in " \t\r\n"):
+            w_pos = _find_depth0_where(code_segment, stmt_start, decl_end_bound)
+            if w_pos != -1:
                 decl_end_bound = w_pos
         stmt = code_segment[stmt_start:decl_end_bound].strip()
     else:
@@ -7229,17 +7294,24 @@ def _split_lean_theorem_header(
                     idx_q += 1
                     continue
                 if c2 == "⦃":
-                    close_s = find_cur("⦄", idx_q + 1, n_cur)
-                    if close_s != -1:
+                    r_s, col_s = _scan_binder_group(cur_stmt, idx_q, n_cur)
+                    if r_s <= n_cur:
                         if not saw_q_bare_colon:
                             saw_q_group = True
-                            inner = cur_stmt[idx_q + 1 : close_s]
-                            typed_s = _typed_binder_parts(inner)
-                            if typed_s is not None:
-                                hyps.append(typed_s)
-                            elif inner.strip():
-                                extra_binders.append(f"untyped:{inner.strip()}")
-                        idx_q = close_s + 1
+                            if col_s != -1:
+                                b_n = cur_stmt[idx_q + 1 : col_s].strip()
+                                b_t = cur_stmt[col_s + 1 : r_s - 1].strip()
+                                if b_n and b_t:
+                                    hyps.append((b_n, b_t))
+                                else:
+                                    inner = cur_stmt[idx_q + 1 : r_s - 1].strip()
+                                    if inner:
+                                        extra_binders.append(f"untyped:{inner}")
+                            else:
+                                inner = cur_stmt[idx_q + 1 : r_s - 1].strip() if r_s > idx_q + 1 else ""
+                                if inner:
+                                    extra_binders.append(f"untyped:{inner}")
+                        idx_q = r_s
                         continue
                 if c2 in "({[":
                     if not saw_q_bare_colon:
@@ -7261,6 +7333,7 @@ def _split_lean_theorem_header(
                                     prefix_qb.count("(") == prefix_qb.count(")")
                                     and prefix_qb.count("{") == prefix_qb.count("}")
                                     and prefix_qb.count("[") == prefix_qb.count("]")
+                                    and prefix_qb.count("⦃") == prefix_qb.count("⦄")
                                 ):
                                     hyps.append(
                                         (
@@ -7283,6 +7356,8 @@ def _split_lean_theorem_header(
                         idx_q = fast_close + 1
                         continue
                     r, col_in = _scan_binder_group(cur_stmt, idx_q, n_cur)
+                    if r > n_cur:
+                        break
                     if not saw_q_bare_colon:
                         if col_in != -1:
                             hyps.append(
@@ -7333,15 +7408,12 @@ def _split_lean_theorem_header(
             and "'" not in cur_stmt
             and "«" not in cur_stmt
             and "⟨" not in cur_stmt
-            and "exists" not in cur_stmt
-            and not cur_stmt.startswith("∃")
+            and "⦃" not in cur_stmt
+            and _PREFIX_BINDER_HINT_SEARCH(cur_stmt) is None
         ):
             arrow_parts = cur_stmt.split("→")
             if all(
-                "∀" not in p_seg
-                and "∃" not in p_seg
-                and "forall" not in p_seg
-                and p_seg.count("(") == p_seg.count(")")
+                p_seg.count("(") == p_seg.count(")")
                 and p_seg.count("{") == p_seg.count("}")
                 and p_seg.count("[") == p_seg.count("]")
                 for p_seg in arrow_parts[:-1]
@@ -7349,11 +7421,7 @@ def _split_lean_theorem_header(
                 for p_seg in arrow_parts[:-1]:
                     hyps.append(_arrow_premise_binder(p_seg.strip()))
                 cur_stmt = arrow_parts[-1].strip()
-                if (
-                    cur_stmt.startswith("(")
-                    or cur_stmt.startswith("∀")
-                    or (cur_stmt.startswith("forall") and len(cur_stmt) > 6 and not _is_lean_ident_char(cur_stmt[6]))
-                ):
+                if cur_stmt.startswith("("):
                     continue
                 break
 
@@ -7368,9 +7436,9 @@ def _split_lean_theorem_header(
             t_a = m_a.group(0)
             if t_a[0] == "«" or t_a[0] == "'":
                 continue
-            if t_a in "({[⟨":
+            if t_a in "({[⟨⦃":
                 depth_a += 1
-            elif t_a in ")}]⟩":
+            elif t_a in ")}]⟩⦄":
                 if depth_a > 0:
                     depth_a -= 1
             elif depth_a == 0:
@@ -7472,12 +7540,12 @@ _TOP_SPLIT_RE_CACHE: dict[str, re.Pattern[str]] = {}
 
 
 def _split_top_level(expr: str, sep: str) -> list[str]:
-    """Split `expr` on `sep` occurrences outside `()`, `[]`, `{}`, `⟨⟩`, and `«...»` (C-level `finditer`)."""
+    """Split `expr` on `sep` occurrences outside `()`, `[]`, `{}`, `⟨⟩`, `⦃⦄`, and `«...»` (C-level `finditer`)."""
     if sep not in expr:
         return [_norm_expr(expr)]
     pat = _TOP_SPLIT_RE_CACHE.get(sep)
     if pat is None:
-        pat = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|" + re.escape(sep))
+        pat = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|" + re.escape(sep))
         _TOP_SPLIT_RE_CACHE[sep] = pat
     parts: list[str] = []
     depth = 0
@@ -7486,9 +7554,9 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7499,22 +7567,22 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
 
 
 _TOP_LEVEL_LOOSER_THAN_NOT_RE = re.compile(
-    r"«[^»]*»|[()\[\]{}⟨⟩]|↔|<->|<\|>|<\||\$|→|->|∨|\\/|∧|/\\|∀|∃|λ|"
+    r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∨|\\/|∧|/\\|∀|∃|λ|"
     r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
 )
-_CONJ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|∧|/\\")
+_CONJ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|∧|/\\")
 _CONJ_TOP_BOUND_RE = re.compile(
-    r"«[^»]*»|[()\[\]{}⟨⟩]|↔|<->|→|->|<\|>|<\||\|>|\$|∨|\\/|∀|∃|λ|"
+    r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|→|->|<\|>|<\||\|>|\$|∨|\\/|∀|∃|λ|"
     r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
 )
 
 
 def _arrow_false_antecedent(expr: str) -> str | None:
-    """If normalized `expr` is exactly `X → False` / `X -> False` (including `X → (False)`) --
-    one top-level implication whose whole consequent is `False`, the term `¬ X` unfolds to --
-    return normalized `X`, else `None`. `A → B → False` (`A → ¬ B`), `A ↔ B → False` (`↔`
-    governs), `f <| P → False` (`<|` governs) and `∀ x, P x → False` (the arrow belongs to the
-    binder body) are not negations of one proposition."""
+    """If normalized `expr` is exactly `X → False` / `X -> False` (including `X → (False)` and
+    dependent-arrow `(h : X) → False`) -- one top-level implication whose whole consequent is
+    `False`, the term `¬ X` unfolds to -- return normalized `X`, else `None`. `A → B → False`
+    (`A → ¬ B`), `A ↔ B → False` (`↔` governs), `f <| P → False` (`<|` governs) and
+    `∀ x, P x → False` (the arrow belongs to the binder body) are not negations of one proposition."""
     if "False" not in expr or ("→" not in expr and "->" not in expr):
         return None
     depth = 0
@@ -7522,16 +7590,20 @@ def _arrow_false_antecedent(expr: str) -> str | None:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
             if t == "→" or t == "->":
                 if _norm_expr(expr[m.end() :]) != "False":
                     return None
-                return _norm_expr(expr[: m.start()]) or None
+                raw_ant = expr[: m.start()].strip()
+                b_names, b_type = _arrow_premise_binder(raw_ant)
+                if b_names:
+                    return _norm_expr(b_type) or None
+                return _norm_expr(raw_ant) or None
             if t not in ("∧", "/\\", "∨", "\\/"):
                 return None
     return None
@@ -7551,7 +7623,7 @@ def _negated_operand(part: str) -> str | None:
 
 
 def _has_top_level_looser_than_not(expr: str) -> bool:
-    """`True` iff `expr` contains a top-level (depth-0 outside `()[]{}⟨⟩` and `«...»`)
+    """`True` iff `expr` contains a top-level (depth-0 outside `()[]{}⟨⟩⦃⦄` and `«...»`)
     connective with lower Lean 4 precedence than prefix `¬` (prec 40) — namely `∧`/`/\\` (35),
     `∨`/`\\/` (30), `→`/`->` (25), `↔`/`<->` (20), `<|`/`$` (10), or `<|>` (2) — before any
     depth-0 prefix binder.
@@ -7577,9 +7649,9 @@ def _has_top_level_looser_than_not(expr: str) -> bool:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7593,7 +7665,7 @@ _PREFIX_BINDER_HINT_SEARCH = re.compile(
 
 
 def _has_top_level_prefix_binder(expr: str) -> bool:
-    """`True` iff `expr` has a depth-0 (outside `()[]{}⟨⟩` and `«...»`) prefix binder or keyword
+    """`True` iff `expr` has a depth-0 (outside `()[]{}⟨⟩⦃⦄` and `«...»`) prefix binder or keyword
     (`∀`, `∃`, `λ`, `forall`, `exists`, `fun`, `if`, `match`, `let`, `have`, `show`, `by`), whose
     body runs to the end of `expr`. Such an expression is not one relation between two terms:
     in `∀ x ∈ s, x :: xs = []` or `if c then True else n < 0` the `=` / `<` belongs to the body,
@@ -7605,9 +7677,9 @@ def _has_top_level_prefix_binder(expr: str) -> bool:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0 and t not in (
@@ -7618,7 +7690,7 @@ def _has_top_level_prefix_binder(expr: str) -> bool:
 
 
 def _split_top_level_conjuncts(expr: str) -> list[str]:
-    """Split `expr` on top-level `∧` / `/\\` conjuncts outside `()[]{}⟨⟩` and `«...»`,
+    """Split `expr` on top-level `∧` / `/\\` conjuncts outside `()[]{}⟨⟩⦃⦄` and `«...»`,
     only when no looser connective (`↔`, `<->`, `→`, `->`, `∨`, `\\/`, `<|>`, `<|`, `|>`, `$`)
     governs `expr` at depth 0, recursively flattening parenthesized conjunctions."""
     if "∧" not in expr and "/\\" not in expr:
@@ -7629,9 +7701,9 @@ def _split_top_level_conjuncts(expr: str) -> list[str]:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7648,9 +7720,9 @@ def _split_top_level_conjuncts(expr: str) -> list[str]:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7671,8 +7743,10 @@ def _split_top_level_conjuncts(expr: str) -> list[str]:
     return out if out else [expr]
 
 
-_QUANT_COMMA_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|,")
-_BARE_BINDER_NAMES_RE = re.compile(r"(?:[^\W\d][\w'!?]*\s*)+")
+_QUANT_COMMA_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|,")
+# Strictly linear (no overlapping `\s*` inside `+` — avoids $O(2^n)$ backtracking on long
+# non-matching binder prefixes such as `∀ very_long_variable_name < n, ...`).
+_BARE_BINDER_NAMES_RE = re.compile(r"[^\W\d][\w'!?]*(?:\s+[^\W\d][\w'!?]*)*")
 _NO_BOUND_NAMES: frozenset[str] = frozenset()
 
 
@@ -7695,9 +7769,9 @@ def _split_quantifier_prefix(expr: str) -> tuple[str, str, str] | None:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7709,14 +7783,15 @@ def _parse_quantifier_binder_groups(binders: str) -> list[tuple[list[str], str |
     """Parse a quantifier's binder section into `[(names, type_or_None), ...]` in telescope order,
     returning `None` if it contains a binder predicate (`i < n`, `x ∈ s`), instance bracket
     (`[inst : C]`), pattern (`⟨a, b⟩`), or unrecognised syntax. Handles unparenthesised types with
-    parenthesised arguments (`x : List (Fin 0)`, `b : BitVec (n + 1)`)."""
+    parenthesised arguments (`x : List (Fin 0)`, `b : BitVec (n + 1)`), as well as `(x : T)`,
+    `{x : T}`, and strict-implicit `⦃x : T⦄` groups."""
     b = binders.strip()
     if not b:
         return None
     fullmatch = _BARE_BINDER_NAMES_RE.fullmatch
     if fullmatch(b) is not None:
         return [(b.split(), None)]
-    if b[0] not in "({[" and ":" in b:
+    if b[0] not in "({[⦃" and ":" in b:
         col = b.find(":")
         if (
             col != -1
@@ -7724,6 +7799,7 @@ def _parse_quantifier_binder_groups(binders: str) -> list[tuple[list[str], str |
             and "(" not in b[:col]
             and "{" not in b[:col]
             and "[" not in b[:col]
+            and "⦃" not in b[:col]
         ):
             names_raw = b[:col].strip()
             b_type = b[col + 1 :].strip()
@@ -7737,9 +7813,10 @@ def _parse_quantifier_binder_groups(binders: str) -> list[tuple[list[str], str |
         if ch in " \t\r\n":
             p += 1
             continue
-        if ch == "(" or ch == "{":
+        if ch in "({⦃":
+            close_ch = ")" if ch == "(" else ("}" if ch == "{" else "⦄")
             q, col = _scan_binder_group(b, p, n)
-            if q > n or b[q - 1] != (")" if ch == "(" else "}"):
+            if q > n or b[q - 1] != close_ch:
                 return None
             if col == -1:
                 inner = b[p + 1 : q - 1].strip()
@@ -7804,21 +7881,21 @@ def _plain_quantifier_binders(
     return True
 
 
-_BOUND_NAME_SCAN_RE = re.compile(r"[(\[{⟨]|[)\]}⟩]|:|[^\W\d][\w'!?]*")
+_BOUND_NAME_SCAN_RE = re.compile(r"[(\[{⟨⦃]|[)\]}⟩⦄]|:|[^\W\d][\w'!?]*")
 
 
 def _quantifier_bound_names(binders: str) -> frozenset[str]:
     """The variables a quantifier's binder section binds: every identifier outside a type
-    annotation (`x y : T`, `(x : T) {y : U}`, `⟨a, b⟩`). A binder predicate's operand
+    annotation (`x y : T`, `(x : T) {y : U} ⦃z : V⦄`, `⟨a, b⟩`). A binder predicate's operand
     (`x ∈ s`) is included too: over-approximating only makes the caller more conservative."""
     names: list[str] = []
     depth = 0
     skip_depth = -1
     for m in _BOUND_NAME_SCAN_RE.finditer(binders):
         t = m.group(0)
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
             if depth < skip_depth:
@@ -7834,6 +7911,38 @@ def _quantifier_bound_names(binders: str) -> frozenset[str]:
 _LEAN_EXPR_KW_STOP = frozenset(
     ("fun", "forall", "exists", "if", "then", "else", "match", "with", "let", "in", "have", "show", "by", "where")
 )
+_DEP_ARROW_BINDER_PREFIX_RE = re.compile(r"[({⦃]([^{}()⦃⦄:=]*):")
+
+
+def _body_may_rebind_name(body: str, name: str) -> bool:
+    """`True` iff `body` contains an inner binder (`∀`, `∃`, `λ`, `forall`, `exists`, `fun`,
+    `let`, `have`, `match` arm, or dependent-arrow `(name : T)`) that may rebind `name`."""
+    if name not in body:
+        return False
+    esc = re.escape(name)
+    if (
+        (
+            "∀" in body
+            or "∃" in body
+            or "λ" in body
+            or "forall" in body
+            or "exists" in body
+            or "fun" in body
+            or "let" in body
+            or "have" in body
+            or "match" in body
+        )
+        and re.search(
+            rf"(?:∀|∃|λ|\||(?<![\w'.!?])(?:forall|exists|fun|let|have)(?![\w'!?]))[^,=>;]*(?<![\w'.!?]){esc}(?![\w'!?])",
+            body,
+        )
+    ):
+        return True
+    if ":" in body and ("→" in body or "->" in body):
+        for m in _DEP_ARROW_BINDER_PREFIX_RE.finditer(body):
+            if name in m.group(1).split():
+                return True
+    return False
 
 
 def _top_level_arrow_domains(expr: str) -> list[str]:
@@ -7848,9 +7957,9 @@ def _top_level_arrow_domains(expr: str) -> list[str]:
         t = m.group(0)
         if t[0] == "«" or t[0] == "'":
             continue
-        if t in "({[⟨":
+        if t in "({[⟨⦃":
             depth += 1
-        elif t in ")}]⟩":
+        elif t in ")}]⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -7868,24 +7977,20 @@ def _untyped_binders_inhabited_by_calls(
     fn_domains: dict[str, tuple[bool, ...]],
     shadowed_fns: frozenset[str],
 ) -> bool:
-    """`True` iff every untyped `∀` binder name in `untyped_names` is passed as an argument to
-    some unshadowed outer function binder `f` in `fn_domains` at a parameter position whose domain
-    is unconditionally inhabited (e.g. `(R : Nat → Prop) (h : ∀ s, R s ∧ False)`)."""
+    """`True` iff every untyped `∀` binder name in `untyped_names` is passed directly as an
+    argument (not projected `s.val` or indexed `s[0]`, and not rebound by an inner binder) to some
+    unshadowed outer function binder `f` in `fn_domains` at a parameter position whose domain is
+    unconditionally inhabited (e.g. `(R : Nat → Prop) (h : ∀ s, R s ∧ False)`)."""
     if not untyped_names or not fn_domains:
         return False
     remaining = set(untyped_names)
+    rebound_cache: dict[str, bool] = {}
     n_body = len(body)
     for f_name, dom_flags in fn_domains.items():
         if f_name in shadowed_fns or not any(dom_flags) or f_name not in body:
             continue
         # Do not rely on `f_name` if an inner binder inside `body` rebinds it.
-        if (
-            ("∀" in body or "∃" in body or "λ" in body or "forall" in body or "exists" in body or "fun" in body)
-            and re.search(
-                rf"(?:∀|∃|λ|(?:forall|exists|fun)(?![\w'!?]))[^,=>]*(?<![\w'.!?]){re.escape(f_name)}(?![\w'!?])",
-                body,
-            )
-        ):
+        if _body_may_rebind_name(body, f_name):
             continue
         pos = 0
         f_len = len(f_name)
@@ -7904,7 +8009,7 @@ def _untyped_binders_inhabited_by_calls(
             while prev_i >= 0 and body[prev_i] in " \t\r\n":
                 prev_i -= 1
             if prev_i >= 0 and (
-                _is_lean_ident_char(body[prev_i]) or body[prev_i] in ")]}⟩"
+                _is_lean_ident_char(body[prev_i]) or body[prev_i] in ")]}⟩⦄"
             ):
                 continue
             # Parse up to `len(dom_flags)` atomic arguments right after `f_name`.
@@ -7915,8 +8020,8 @@ def _untyped_binders_inhabited_by_calls(
                 if arg_pos >= n_body:
                     break
                 ch = body[arg_pos]
-                if ch in "([{⟨":
-                    close_map = {"(": ")", "[": "]", "{": "}", "⟨": "⟩"}
+                if ch in "([{⟨⦃":
+                    close_map = {"(": ")", "[": "]", "{": "}", "⟨": "⟩", "⦃": "⦄"}
                     close_c = close_map[ch]
                     d = 1
                     q = arg_pos + 1
@@ -7934,9 +8039,19 @@ def _untyped_binders_inhabited_by_calls(
                 tok = m_id.group(0)
                 if tok in _LEAN_EXPR_KW_STOP:
                     break
+                end_tok = m_id.end()
+                if end_tok < n_body and body[end_tok] in ".[":
+                    # `s.val` / `s[0]` passes a projection/element of `s`, NOT `s` itself:
+                    # e.g. `s : Fin 0` has `s.val : Nat` even though `Fin 0` is empty.
+                    break
                 if is_inhab and tok in remaining:
-                    remaining.discard(tok)
-                arg_pos = m_id.end()
+                    rebound = rebound_cache.get(tok)
+                    if rebound is None:
+                        rebound = _body_may_rebind_name(body, tok)
+                        rebound_cache[tok] = rebound
+                    if not rebound:
+                        remaining.discard(tok)
+                arg_pos = end_tok
         if not remaining:
             return True
     return not remaining
@@ -7953,6 +8068,9 @@ def _hyp_atoms(
     shadowed: frozenset[str] = frozenset(),
     fn_domains: dict[str, tuple[bool, ...]] | None = None,
     scope_counter: list[int] | None = None,
+    scope_binds: dict[tuple[int, ...], frozenset[str]] | None = None,
+    q_float_vars_out: dict[tuple[int, ...], frozenset[str]] | None = None,
+    q_float_vars: frozenset[str] = frozenset(),
 ) -> None:
     """Append to `out` the atoms that must ALL hold for normalized hypothesis `expr` to hold, as
     `(atom, quantifier-bound names in scope, enclosing quantifier binder sections, quantifier-typed
@@ -7995,6 +8113,7 @@ def _hyp_atoms(
                     if can_descend:
                         q_bound = _quantifier_bound_names(binders)
                         next_nat = set(q_nat_vars) - q_bound
+                        next_float = set(q_float_vars) - q_bound
                         next_sh = set(shadowed)
                         if groups is not None:
                             for g_names, g_type in groups:
@@ -8006,23 +8125,36 @@ def _hyp_atoms(
                                         next_nat.update(g_names)
                                     else:
                                         next_nat.difference_update(g_names)
+                                    if bt == "Float" and "Float" not in next_sh:
+                                        next_float.update(g_names)
+                                    else:
+                                        next_float.difference_update(g_names)
                                 else:
                                     next_nat.difference_update(g_names)
+                                    next_float.difference_update(g_names)
                                 next_sh.update(g_names)
                         else:
                             next_sh.update(q_bound)
                         child_id = scope_counter[0]
                         scope_counter[0] = child_id + 1
+                        child_path = scope_path + (child_id,)
+                        if scope_binds is not None:
+                            scope_binds[child_path] = q_bound
+                        if q_float_vars_out is not None and next_float:
+                            q_float_vars_out[child_path] = frozenset(next_float)
                         _hyp_atoms(
                             body_n,
                             bound | q_bound,
                             q_chain + (binders,),
                             frozenset(next_nat),
-                            scope_path + (child_id,),
+                            child_path,
                             out,
                             shadowed=frozenset(next_sh),
                             fn_domains=fn_domains,
                             scope_counter=scope_counter,
+                            scope_binds=scope_binds,
+                            q_float_vars_out=q_float_vars_out,
+                            q_float_vars=frozenset(next_float),
                         )
                         continue
         out.append((part, bound, q_chain, q_nat_vars, scope_path))
@@ -8030,10 +8162,10 @@ def _hyp_atoms(
 
 _SIMPLE_TERM_TOKEN_RE = re.compile(
     r"\s+|«[^»]*»|(?<![\w'.!?])'[^'\n]*'|\.?[^\W\d][\w'!?]*(?:\.[^\W\d][\w'!?]*)*"
-    r"|\.?\d+(?:\.\d+)*|::|\+\+|[-+*/%^@#]|!(?!=)|([(\[⟨])|([)\]⟩])"
+    r"|\.?\d+(?:\.\d+)*|::|\+\+|[-+*/%^@#↑]|!(?!=)|([(\[⟨])|([)\]⟩])"
 )
 _SIMPLE_RELATION_RE = re.compile(
-    r"«[^»]*»|(?<![\w'.!?])'[^'\n]*'|[()\[\]{}⟨⟩]|≠|≤|≥|<|>|="
+    r"«[^»]*»|(?<![\w'.!?])'[^'\n]*'|[()\[\]{}⟨⟩⦃⦄]|≠|≤|≥|<|>|="
 )
 
 
@@ -8086,9 +8218,9 @@ def _is_simple_refutation_premise(part: str) -> bool:
         t = m.group(0)
         if t[0] == "«" or t[0] == "'":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8101,7 +8233,8 @@ def _is_simple_refutation_premise(part: str) -> bool:
 
 
 _TOP_BOUND_RE = re.compile(
-    r"[()\[\]{}]|↔|→|->|<\|>|<\||\|>|\$|∨|∃|∀|λ|"
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|"
+    r"↔|→|->|<\|>|<\||\|>|\$|∨|∃|∀|λ|"
     r"(?<![\w'.!?])(?:fun|forall|exists|if|match|let|have|show|by)(?![\w'!?])"
 )
 
@@ -8125,9 +8258,11 @@ def _find_top_level_bound(expr: str, *, allow_or: bool) -> int:
     depth = 0
     for m in _TOP_BOUND_RE.finditer(expr):
         t = m.group(0)
-        if t in "([{":
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8149,9 +8284,13 @@ def _all_conjuncts_trivial(expr: str) -> bool:
         return False
     first = expr[:idx]
     if (
-        first.count("(") == first.count(")")
+        "«" not in first
+        and "'" not in first
+        and first.count("(") == first.count(")")
         and first.count("[") == first.count("]")
         and first.count("{") == first.count("}")
+        and first.count("⟨") == first.count("⟩")
+        and first.count("⦃") == first.count("⦄")
         and not _is_trivially_true(first)
     ):
         return False
@@ -8160,16 +8299,18 @@ def _all_conjuncts_trivial(expr: str) -> bool:
         return False
     pat = _SPLIT_RE_CACHE.get("∧")
     if pat is None:
-        pat = re.compile(r"[()\[\]{}]|∧")
+        pat = re.compile(r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|∧")
         _SPLIT_RE_CACHE["∧"] = pat
     depth = 0
     start = 0
     count = 0
     for m in pat.finditer(expr, 0, bound):
         t = m.group(0)
-        if t in "([{":
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8189,7 +8330,7 @@ def _any_disjunct_trivial(expr: str) -> bool:
         return False
     pat = _SPLIT_RE_CACHE.get("∨")
     if pat is None:
-        pat = re.compile(r"[()\[\]{}]|∨")
+        pat = re.compile(r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|∨")
         _SPLIT_RE_CACHE["∨"] = pat
     depth = 0
     start = 0
@@ -8197,9 +8338,11 @@ def _any_disjunct_trivial(expr: str) -> bool:
     found_trivial = False
     for m in pat.finditer(expr, 0, bound):
         t = m.group(0)
-        if t in "([{":
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8212,11 +8355,11 @@ def _any_disjunct_trivial(expr: str) -> bool:
     return found_trivial or _is_trivially_true(expr[start:])
 
 
-_STANDALONE_EQ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|(?<![=!<>:])=(?!=)")
+_STANDALONE_EQ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![=!<>:])=(?!=)")
 
 
 def _split_top_level_eq(expr: str) -> list[str]:
-    """Split `expr` on top-level standalone `=` (excluding `==`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}⟨⟩` and `«...»`."""
+    """Split `expr` on top-level standalone `=` (excluding `==`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}⟨⟩⦃⦄` and `«...»`."""
     parts: list[str] = []
     depth = 0
     start = 0
@@ -8224,9 +8367,9 @@ def _split_top_level_eq(expr: str) -> list[str]:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8261,7 +8404,7 @@ def _is_trivially_true(conj: str) -> bool:
         n_c = len(c)
         while idx_q < n_c:
             ch = c[idx_q]
-            if ch in "({[":
+            if ch in "({[⦃":
                 idx_q, _ = _scan_binder_group(c, idx_q, n_c)
                 continue
             if ch == ",":
@@ -8276,12 +8419,14 @@ def _is_trivially_true(conj: str) -> bool:
         if op not in c:
             continue
         if op == "=":
-            if c.count("=") == 1 and ":=" not in c:
+            if c.count("=") == 1 and ":=" not in c and "«" not in c and "'" not in c:
                 lhs, _, rhs = c.partition("=")
                 if (
                     lhs.count("(") == lhs.count(")")
                     and lhs.count("[") == lhs.count("]")
                     and lhs.count("{") == lhs.count("}")
+                    and lhs.count("⟨") == lhs.count("⟩")
+                    and lhs.count("⦃") == lhs.count("⦄")
                 ):
                     nl = _norm_expr(lhs)
                     if nl and nl == _norm_expr(rhs):
@@ -8291,12 +8436,14 @@ def _is_trivially_true(conj: str) -> bool:
             if len(sides) == 2 and sides[0] and sides[0] == sides[1]:
                 return True
             continue
-        if c.count(op) == 1:
+        if c.count(op) == 1 and "«" not in c and "'" not in c:
             lhs, _, rhs = c.partition(op)
             if (
                 lhs.count("(") == lhs.count(")")
                 and lhs.count("[") == lhs.count("]")
                 and lhs.count("{") == lhs.count("}")
+                and lhs.count("⟨") == lhs.count("⟩")
+                and lhs.count("⦃") == lhs.count("⦄")
             ):
                 nl = _norm_expr(lhs)
                 if nl and nl == _norm_expr(rhs):
@@ -8340,70 +8487,177 @@ _NAT_VALUED_PREFIXES = (
     "Mir.PlaceAndRvalue.alignUp ",
     "PlaceAndRvalue.alignUp ",
 )
-_NAT_ARITH_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|[-+*/%^]")
+_NAT_ARITH_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|[-+*/%^]")
+_PROJ_SEG_RE = re.compile(r"[^\W\d][\w'!?]*|\d+")
+# Binary infix operators with Lean 4 precedence strictly tighter than `=` / `<` (50) and looser
+# than function application (1024): if one appears at depth 0, it governs the operand instead of
+# a leading constructor or `Nat`-valued function (`some x >>= f`, `Except.ok x *> y`,
+# `sumSizes xs |>.toInt`). Operators looser than `=` (`&&`, `×'`, bare `|>`) are intentionally
+# excluded so two-premise hypotheses such as `none = some s ×' Bad s` keep their existing reading.
+_HIGH_PREC_INFIX_RE = re.compile(
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|"
+    r"\|>\.|>>=|>>|<\*>|<\*|\*>|<\$>|<<<|>>>|&&&|\|\|\||\^\^\^|\+\+|[-+*/%^∘]"
+)
+_LOOSER_THAN_CONS_RE = re.compile(
+    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|"
+    r"\|>\.|>>=|>>|<\*>|<\*|\*>|&&&|\|\|\||\^\^\^"
+)
 
 
-def _has_depth0_space(e: str) -> bool:
-    """`True` iff normalized `e` has a space outside `()[]{}⟨⟩`: an application (`f xs.length`),
-    not one projection chain (`xs.length`, `(xs.map f).length`)."""
-    if " " not in e:
-        return False
+def _has_depth0_pattern(expr: str, pat: re.Pattern[str]) -> bool:
     depth = 0
-    for ch in e:
-        if ch in "([{⟨":
+    for m in pat.finditer(expr):
+        t = m.group(0)
+        if t[0] == "«" or t[0] == "'":
+            continue
+        if t in "([{⟨⦃":
             depth += 1
-        elif ch in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
-        elif ch == " " and depth == 0:
+        elif depth == 0:
             return True
     return False
 
 
-def _is_atomic_nat_like(e: str, nat_vars: frozenset[str]) -> bool:
-    """`e` (normalized, no depth-0 arithmetic operator) is a numeral, a `Nat`-like binder, an
-    application headed by a known `Nat`-valued function (`sumSizes xs`), or a single projection
-    chain ending in a known `Nat`-valued field (`xs.length`). `[adv B2]`: the suffix test alone
-    accepted `f xs.length` -- an application of an arbitrary `f : Nat → Int`."""
-    if e in nat_vars or _NUM_LIT_RE.match(e) is not None or e.startswith(_NAT_VALUED_PREFIXES):
-        return True
-    return e.endswith(_NAT_VALUED_SUFFIXES) and not _has_depth0_space(e)
+def _has_depth0_high_prec_infix(e: str) -> bool:
+    """`True` iff `e` contains a depth-0 binary operator tighter than `=`/`<` (e.g. `>>=`, `|>.`,
+    `*>`, `<*`, `<*>`, `&&&`, `>>>`, `+`), so `e` is NOT headed by a leading constructor/function."""
+    return _has_depth0_pattern(e, _HIGH_PREC_INFIX_RE)
 
 
-def _is_nat_like_operand(e: str, nat_vars: frozenset[str]) -> bool:
-    """`True` iff `e` is syntactically `Nat`-valued: a numeral, a binder declared `Nat`-like, a
-    known `Nat`-valued projection/function (`.length`, `.size`, `.toNat`, `.totalPad`, `.totalSize`,
-    `sumSizes ...`, etc.), or a depth-0 `+`/`-`/`*`/`/`/`%`/`^` combination whose operands are ALL
-    `Nat`-like (parenthesised operands recurse). Anything else (`f x`, an `Int` / `Real` binder, an
-    undeclared name) may be negative, so `e < 0` is NOT a syntactic contradiction for it.
+def _has_depth0_looser_than_cons(e: str) -> bool:
+    """`True` iff `e` contains a depth-0 operator tighter than `=` (50) and looser than `::` (67)
+    that can turn a non-empty list into `[]` (e.g. `x :: xs >>= f`, `x :: xs |>.tail`, `x :: xs *> []`)."""
+    return _has_depth0_pattern(e, _LOOSER_THAN_CONS_RE)
 
-    `[adv B2]`: A0-A1 applied the prefix / suffix tests to the whole operand and split on
-    operators at any depth, so `x - y.toNat`, `sumSizes xs - z` (`x z : Int`), `-↑xs.length`
-    and `g (a.size + b.size)` all read as `Nat`-valued."""
+
+def _is_single_projection_chain(e: str) -> bool:
+    """`True` iff normalized `e` is one projection/subscript chain (`xs.length`,
+    `(xs.map f).length`, `arr[i].size`), not an application (`f xs.length`, `(f)(xs).length`)
+    or infix expression (`x>>>xs.length`)."""
+    n = len(e)
+    if n == 0:
+        return False
+    p = 0
+    ch = e[0]
+    if ch in "([{⟨":
+        close_map = {"(": ")", "[": "]", "{": "}", "⟨": "⟩"}
+        close_c = close_map[ch]
+        depth = 1
+        p = 1
+        while p < n and depth > 0:
+            c = e[p]
+            if c == ch:
+                depth += 1
+            elif c == close_c:
+                depth -= 1
+            p += 1
+        if depth != 0:
+            return False
+    elif ch == "«":
+        end_g = e.find("»", 1)
+        if end_g == -1:
+            return False
+        p = end_g + 1
+    else:
+        m = _IDENT_EXTRACT_RE.match(e, 0)
+        if m is None:
+            return False
+        p = m.end()
+    while p < n:
+        c = e[p]
+        if c == ".":
+            p += 1
+            if p >= n:
+                return False
+            if e[p] == "«":
+                end_g = e.find("»", p + 1)
+                if end_g == -1:
+                    return False
+                p = end_g + 1
+            else:
+                m = _PROJ_SEG_RE.match(e, p)
+                if m is None:
+                    return False
+                p = m.end()
+        elif c == "[":
+            depth = 1
+            p += 1
+            while p < n and depth > 0:
+                if e[p] == "[":
+                    depth += 1
+                elif e[p] == "]":
+                    depth -= 1
+                p += 1
+            if depth != 0:
+                return False
+        else:
+            return False
+    return True
+
+
+def _nat_operand_kind(e: str, nat_vars: frozenset[str]) -> int:
+    """Classify normalized `e` for `< 0` / `0 > ...` vacuity checks:
+    - `2`: pure unsigned/`Nat`-valued (non-negative even under `-`, which saturates/wraps >= 0),
+    - `1`: coerced non-negative (`↑...` or `Nat.cast ...`, non-negative under `+`/`*`/`/`/`%`/`^`,
+           but NOT under `-`, since `↑a.length - ↑b.length < 0` and `↑a.length - 1 < 0` hold in `Int`),
+    - `0`: unknown (may be negative)."""
     e = _norm_expr(e)
     if not e:
-        return False
+        return 0
     parts: list[str] | None = None
+    has_sub = False
     depth = 0
     start = 0
     for m in _NAT_ARITH_SPLIT_RE.finditer(e):
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
             if parts is None:
                 parts = []
+            if t == "-":
+                has_sub = True
             parts.append(e[start : m.start()])
             start = m.end()
     if parts is not None:
         parts.append(e[start:])
-        return all(_is_nat_like_operand(p, nat_vars) for p in parts)
-    return _is_atomic_nat_like(e, nat_vars)
+        min_kind = 2
+        for p in parts:
+            k = _nat_operand_kind(p, nat_vars)
+            if k == 0:
+                return 0
+            if k < min_kind:
+                min_kind = k
+        if has_sub and min_kind < 2:
+            return 0
+        return min_kind
+    if e.startswith("↑"):
+        inner = e[1:].strip()
+        return 1 if _nat_operand_kind(inner, nat_vars) >= 1 else 0
+    if e.startswith("Nat.cast ") or e == "Nat.cast":
+        return 1 if not _has_depth0_high_prec_infix(e) else 0
+    if e in nat_vars or _NUM_LIT_RE.match(e) is not None:
+        return 2
+    if e.startswith(_NAT_VALUED_PREFIXES):
+        return 2 if not _has_depth0_high_prec_infix(e) else 0
+    if e.endswith(_NAT_VALUED_SUFFIXES) and _is_single_projection_chain(e):
+        return 2
+    return 0
+
+
+def _is_nat_like_operand(e: str, nat_vars: frozenset[str]) -> bool:
+    """`True` iff `e` is syntactically non-negative: a numeral, a binder declared `Nat`-like, a
+    known `Nat`-valued projection/function (`.length`, `.size`, `.toNat`, `sumSizes ...`, etc.),
+    a coercion `↑...` / `Nat.cast ...` of one, or a depth-0 `+`/`*`/`/`/`%`/`^` (and, on purely
+    unsigned/`Nat` operands only, `-`) combination of such operands."""
+    return _nat_operand_kind(e, nat_vars) >= 1
 
 
 _PURE_DATA_BASE_TYPES = frozenset(
@@ -8643,13 +8897,13 @@ def _is_single_premise_false_elim(
     return True
 
 
-_LT_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|(?<![<])<(?![<=|\-$*])")
-_GT_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|(?<![->=|*$])>(?![>=])")
-_LE_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|≤")
+_LT_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![<])<(?![<=|\-$*])")
+_GT_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![->=|*$])>(?![>=])")
+_LE_TOP_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|≤")
 
 
 def _split_top_level_pat(expr: str, pat: re.Pattern[str]) -> list[str]:
-    """Split `expr` at depth-0 matches of `pat` outside `()[]{}⟨⟩` and `«...»`."""
+    """Split `expr` at depth-0 matches of `pat` outside `()[]{}⟨⟩⦃⦄` and `«...»`."""
     parts: list[str] = []
     depth = 0
     start = 0
@@ -8657,9 +8911,9 @@ def _split_top_level_pat(expr: str, pat: re.Pattern[str]) -> list[str]:
         t = m.group(0)
         if t[0] == "«":
             continue
-        if t in "([{⟨":
+        if t in "([{⟨⦃":
             depth += 1
-        elif t in ")]}⟩":
+        elif t in ")]}⟩⦄":
             if depth > 0:
                 depth -= 1
         elif depth == 0:
@@ -8699,13 +8953,15 @@ _BOOL_CONTRADICTORY_PAIRS = frozenset(
 
 
 def _check_hypothesis_contradiction(
-    hyp_expr: str, nat_vars: frozenset[str] = frozenset()
+    hyp_expr: str,
+    nat_vars: frozenset[str] = frozenset(),
+    float_vars: frozenset[str] = frozenset(),
 ) -> str | None:
     """Return a description if `hyp_expr` is a syntactic contradiction, else `None`.
 
     `nat_vars` are binders of a `Nat`-like type; the vacuous `x < 0` / `0 > x` rule fires only for
-    `Nat`-valued operands (`_is_nat_like_operand`). A0-A1 fired for every operand not declared
-    `Int`, a false positive on `(x : Real) (h : x < 0)` or `(f : Nat → Int) (h : f 0 < 0)`."""
+    `Nat`-valued operands (`_is_nat_like_operand`). `float_vars` are binders of type `Float` (where
+    `NaN ≤ NaN` is false, so `¬ x ≤ x` / `¬ x ≥ x` are satisfiable)."""
     if (
         "=" not in hyp_expr
         and "≠" not in hyp_expr
@@ -8754,7 +9010,16 @@ def _check_hypothesis_contradiction(
             for le_op in ("≤", "≥"):
                 if le_op in inner:
                     le_sides = _split_top_level(inner, le_op)
-                    if len(le_sides) == 2 and le_sides[0] and le_sides[0] == le_sides[1]:
+                    if (
+                        len(le_sides) == 2
+                        and le_sides[0]
+                        and le_sides[0] == le_sides[1]
+                        and "Float" not in le_sides[0]
+                        and (
+                            not float_vars
+                            or float_vars.isdisjoint(_IDENT_EXTRACT_RE.findall(le_sides[0]))
+                        )
+                    ):
                         return f"negated reflexive `{le_op}` `{h}`"
         return None
 
@@ -8821,42 +9086,81 @@ def _check_hypothesis_contradiction(
                 return f"contradictory boolean equality `{nl} = {nr}`"
             if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) != int(nr):
                 return f"distinct numeric literal equality `{nl} = {nr}`"
-            if (nl == "none" and (nr == "some" or nr.startswith("some "))) or (
-                nr == "none" and (nl == "some" or nl.startswith("some "))
+            if (
+                nl in ("none", "Option.none")
+                and (nr in ("some", "Option.some") or nr.startswith(("some ", "Option.some ")))
+                and not _has_depth0_high_prec_infix(nr)
+            ) or (
+                nr in ("none", "Option.none")
+                and (nl in ("some", "Option.some") or nl.startswith(("some ", "Option.some ")))
+                and not _has_depth0_high_prec_infix(nl)
             ):
                 return f"disjoint `Option` constructor equality `{h}`"
             if (
                 nl == "[]"
                 and (
-                    ("::" in nr and len(_split_top_level(nr, "::")) >= 2)
+                    (
+                        "::" in nr
+                        and len(_split_top_level(nr, "::")) >= 2
+                        and not _has_depth0_looser_than_cons(nr)
+                    )
                     or _is_nonempty_list_literal(nr)
                 )
             ) or (
                 nr == "[]"
                 and (
-                    ("::" in nl and len(_split_top_level(nl, "::")) >= 2)
+                    (
+                        "::" in nl
+                        and len(_split_top_level(nl, "::")) >= 2
+                        and not _has_depth0_looser_than_cons(nl)
+                    )
                     or _is_nonempty_list_literal(nl)
                 )
             ):
                 return f"disjoint `List` constructor equality `{h}`"
             if (
-                (nl.startswith(".inl ") or nl.startswith("Sum.inl "))
-                and (nr.startswith(".inr ") or nr.startswith("Sum.inr "))
+                (nl in (".inl", "Sum.inl") or nl.startswith((".inl ", "Sum.inl ")))
+                and (nr in (".inr", "Sum.inr") or nr.startswith((".inr ", "Sum.inr ")))
+                and not _has_depth0_high_prec_infix(nl)
+                and not _has_depth0_high_prec_infix(nr)
             ) or (
-                (nr.startswith(".inl ") or nr.startswith("Sum.inl "))
-                and (nl.startswith(".inr ") or nl.startswith("Sum.inr "))
+                (nr in (".inl", "Sum.inl") or nr.startswith((".inl ", "Sum.inl ")))
+                and (nl in (".inr", "Sum.inr") or nl.startswith((".inr ", "Sum.inr ")))
+                and not _has_depth0_high_prec_infix(nl)
+                and not _has_depth0_high_prec_infix(nr)
             ):
                 return f"disjoint `Sum` constructor equality `{h}`"
             if (
-                (nl.startswith(".ok ") or nl.startswith("Except.ok "))
-                and (nr.startswith(".error ") or nr.startswith("Except.error "))
+                (nl in (".ok", "Except.ok") or nl.startswith((".ok ", "Except.ok ")))
+                and (nr in (".error", "Except.error") or nr.startswith((".error ", "Except.error ")))
+                and not _has_depth0_high_prec_infix(nl)
+                and not _has_depth0_high_prec_infix(nr)
             ) or (
-                (nr.startswith(".ok ") or nr.startswith("Except.ok "))
-                and (nl.startswith(".error ") or nl.startswith("Except.error "))
+                (nr in (".ok", "Except.ok") or nr.startswith((".ok ", "Except.ok ")))
+                and (nl in (".error", "Except.error") or nl.startswith((".error ", "Except.error ")))
+                and not _has_depth0_high_prec_infix(nl)
+                and not _has_depth0_high_prec_infix(nr)
             ):
                 return f"disjoint `Except` constructor equality `{h}`"
 
     return None
+
+
+def _float_vars_before(all_hyps: list[tuple[str, str]], limit_idx: int) -> frozenset[str]:
+    """Binders in `all_hyps[:limit_idx]` whose current unshadowed type in telescope order is `Float`."""
+    cur_float: set[str] = set()
+    shadowed: set[str] = set()
+    for b_names, b_type in all_hyps[:limit_idx]:
+        names = b_names.split()
+        if not names:
+            continue
+        bt = _norm_expr(b_type)
+        if bt == "Float" and "Float" not in shadowed:
+            cur_float.update(names)
+        else:
+            cur_float.difference_update(names)
+        shadowed.update(names)
+    return frozenset(cur_float)
 
 
 def _nat_vars_before(all_hyps: list[tuple[str, str]], limit_idx: int) -> frozenset[str]:
@@ -8884,8 +9188,8 @@ def _quantifier_context_before(
 ) -> tuple[frozenset[str], dict[str, tuple[bool, ...]]]:
     """Return `(shadowed_reserved, fn_domains)` in scope right before `all_hyps[limit_idx]`,
     tracked in telescope order: `shadowed_reserved` are reserved data/container/typeclass names
-    rebound by earlier binders; `fn_domains` maps each earlier arrow-typed binder to a tuple of
-    booleans recording whether each leading domain type is unconditionally inhabited."""
+    (and `Fin`) rebound by earlier binders; `fn_domains` maps each earlier arrow-typed binder to a
+    tuple of booleans recording whether each leading domain type is unconditionally inhabited."""
     shadowed: set[str] = set()
     fn_domains: dict[str, tuple[bool, ...]] = {}
     for b_names, b_type in all_hyps[:limit_idx]:
@@ -8903,28 +9207,41 @@ def _quantifier_context_before(
                 fn_domains[tok] = dom_flags
             else:
                 fn_domains.pop(tok, None)
-            if tok in _FALSE_ELIM_RESERVED_NAMES:
+            if tok in _FALSE_ELIM_RESERVED_NAMES or tok == "Fin":
                 shadowed.add(tok)
     return frozenset(shadowed), fn_domains
 
 
 def _record_pos_neg_atom(part: str, pos_set: set[str], neg_set: set[str]) -> None:
     """Record normalized `part` and any proposition it denies (`¬ X`, `X → False`, `a ≠ b`,
-    symmetric on `=`/`≠`) into `pos_set` / `neg_set`."""
+    symmetric on `=`/`≠`) into `pos_set` / `neg_set`. Never split on `=`/`≠` inside an expression
+    governed by a depth-0 prefix binder (`∀ x ∈ s, a = b`, `if c then True else a ≠ b`)."""
     denied = _negated_operand(part)
     if denied is not None:
         neg_set.add(denied)
-        if "=" in denied and not _has_top_level_looser_than_not(denied):
+        if (
+            "=" in denied
+            and not _has_top_level_looser_than_not(denied)
+            and not _has_top_level_prefix_binder(denied)
+        ):
             d_eq = _split_top_level_eq(denied)
             if len(d_eq) == 2 and d_eq[0] and d_eq[1]:
                 neg_set.add(f"{d_eq[0]} = {d_eq[1]}")
                 neg_set.add(f"{d_eq[1]} = {d_eq[0]}")
-    elif "≠" in part and not _has_top_level_looser_than_not(part):
+    elif (
+        "≠" in part
+        and not _has_top_level_looser_than_not(part)
+        and not _has_top_level_prefix_binder(part)
+    ):
         neq_sides = _split_top_level(part, "≠")
         if len(neq_sides) == 2 and neq_sides[0] and neq_sides[1]:
             neg_set.add(f"{neq_sides[0]} = {neq_sides[1]}")
             neg_set.add(f"{neq_sides[1]} = {neq_sides[0]}")
-    elif "=" in part and not _has_top_level_looser_than_not(part):
+    elif (
+        "=" in part
+        and not _has_top_level_looser_than_not(part)
+        and not _has_top_level_prefix_binder(part)
+    ):
         eq_sides = _split_top_level_eq(part)
         if len(eq_sides) == 2 and eq_sides[0] and eq_sides[1]:
             pos_set.add(f"{eq_sides[0]} = {eq_sides[1]}")
@@ -9141,6 +9458,7 @@ def _audit_lean_theorem(
     has_eq_in_all = "=" in all_hyps_text
     conc_head_in_all = bool(conc_head and conc_head in all_hyps_text)
 
+    has_float_in_all = "Float" in all_hyps_text
     if has_any_ineq_or_neg_in_all or has_eq_in_all or conc_head_in_all:
         for orig_idx, (_, t) in indexed_hyps:
             has_ineq_or_neg = (
@@ -9184,11 +9502,16 @@ def _audit_lean_theorem(
             atoms: list[
                 tuple[str, frozenset[str], tuple[str, ...], frozenset[str], tuple[int, ...]]
             ] = []
+            scope_binds: dict[tuple[int, ...], frozenset[str]] | None = None
+            q_float_vars_out: dict[tuple[int, ...], frozenset[str]] | None = None
             has_quant = (
                 "∃" in nh or "∀" in nh or "exists" in nh or "forall" in nh
             )
             if has_quant or "∧" in nh or "/\\" in nh:
                 if has_quant:
+                    scope_binds = {}
+                    if "Float" in nh:
+                        q_float_vars_out = {}
                     q_shadowed, fn_domains = _quantifier_context_before(all_hyps, orig_idx)
                     _hyp_atoms(
                         nh,
@@ -9199,12 +9522,15 @@ def _audit_lean_theorem(
                         atoms,
                         shadowed=q_shadowed,
                         fn_domains=fn_domains,
+                        scope_binds=scope_binds,
+                        q_float_vars_out=q_float_vars_out,
                     )
                 else:
                     _hyp_atoms(nh, _NO_BOUND_NAMES, (), _NO_BOUND_NAMES, (), atoms)
             else:
                 atoms.append((nh, _NO_BOUND_NAMES, (), _NO_BOUND_NAMES, ()))
             hyp_nat_vars: frozenset[str] | None = None
+            hyp_float_vars: frozenset[str] | None = None
             local_pos: dict[tuple[int, ...], set[str]] | None = None
             local_neg: dict[tuple[int, ...], set[str]] | None = None
             for part, bound, q_chain, q_nat_vars, scope_path in atoms:
@@ -9225,7 +9551,21 @@ def _audit_lean_theorem(
                         # A quantifier may rebind a `Nat` binder's name at another type, or bind
                         # its own `Nat`-typed variable (`∃ n : Nat, n < 0`).
                         part_nat_vars = (part_nat_vars - bound) | q_nat_vars
-                    reason = _check_hypothesis_contradiction(part, part_nat_vars)
+                    part_float_vars = _NO_BOUND_NAMES
+                    if has_float_in_all and ("≤" in part or "≥" in part) and (
+                        "¬" in part or ("False" in part and ("→" in part or "->" in part))
+                    ):
+                        if hyp_float_vars is None:
+                            hyp_float_vars = _float_vars_before(all_hyps, orig_idx)
+                        part_float_vars = hyp_float_vars
+                        if bound:
+                            q_fv = (
+                                q_float_vars_out.get(scope_path, _NO_BOUND_NAMES)
+                                if q_float_vars_out is not None
+                                else _NO_BOUND_NAMES
+                            )
+                            part_float_vars = (part_float_vars - bound) | q_fv
+                    reason = _check_hypothesis_contradiction(part, part_nat_vars, part_float_vars)
                     # A `: False` theorem whose only premise is one atomic contradiction states
                     # the negation of that premise: it is a refutation, not a vacuous claim.
                     if (
@@ -9254,8 +9594,9 @@ def _audit_lean_theorem(
                         )
                 if bound and not bound.isdisjoint(_IDENT_EXTRACT_RE.findall(part)):
                     # Mentions a quantified variable: not a fact about the theorem's own context,
-                    # but contradictory conjuncts in the exact same quantifier body (`∃ x, P x ∧ ¬ P x`)
-                    # share the same witness/value and still contradict each other.
+                    # but contradictory conjuncts in the same quantifier scope (or an outer
+                    # ancestor scope whose bound variables are not rebound along the path) share
+                    # the same witness/value and still contradict each other.
                     if scope_path:
                         if local_pos is None:
                             local_pos = {}
@@ -9268,6 +9609,21 @@ def _audit_lean_theorem(
             if local_pos is not None and local_neg is not None:
                 for sp, lp in local_pos.items():
                     scoped_contradictions.update(lp & local_neg[sp])
+                    if len(sp) > 1 and scope_binds:
+                        rebound: set[str] = set()
+                        for k in range(len(sp) - 1, 0, -1):
+                            rebound.update(scope_binds.get(sp[: k + 1], _NO_BOUND_NAMES))
+                            anc = sp[:k]
+                            anc_pos = local_pos.get(anc)
+                            if anc_pos:
+                                for atom in anc_pos & local_neg[sp]:
+                                    if rebound.isdisjoint(_IDENT_EXTRACT_RE.findall(atom)):
+                                        scoped_contradictions.add(atom)
+                            anc_neg = local_neg.get(anc)
+                            if anc_neg:
+                                for atom in anc_neg & lp:
+                                    if rebound.isdisjoint(_IDENT_EXTRACT_RE.findall(atom)):
+                                        scoped_contradictions.add(atom)
 
         contradictory_pairs = (seen_pos_hyps & seen_neg_hyps) | scoped_contradictions
         if contradictory_pairs:
@@ -9292,7 +9648,8 @@ def _audit_lean_theorem(
     #    conjunctions of trivial facts, or disjunctions with a trivial disjunct (`RULE_TRIVIAL_CONCLUSION`).
     #    `helper` lemmas and `negative` witnesses (whose point is a rejection) are exempt.
     if kind != "helper" and witness != "negative":
-        if "∧" in norm_conc and _all_conjuncts_trivial(norm_conc):
+        conc_check = _neutralize_char_literals(norm_conc) if "'" in norm_conc else norm_conc
+        if "∧" in conc_check and _all_conjuncts_trivial(conc_check):
             findings.append(
                 WaiverPinFinding(
                     rule=RULE_TRIVIAL_CONCLUSION,
@@ -9306,7 +9663,7 @@ def _audit_lean_theorem(
                     suggestion="State the actual semantic postcondition or codec/layout property in the conclusion.",
                 )
             )
-        elif "∨" in norm_conc and _any_disjunct_trivial(norm_conc):
+        elif "∨" in conc_check and _any_disjunct_trivial(conc_check):
             findings.append(
                 WaiverPinFinding(
                     rule=RULE_TRIVIAL_CONCLUSION,
@@ -9320,7 +9677,7 @@ def _audit_lean_theorem(
                     suggestion="Remove the trivial disjunct or replace `∨` with `∧`.",
                 )
             )
-        elif "∧" not in norm_conc and "∨" not in norm_conc and _is_trivially_true(norm_conc):
+        elif "∧" not in conc_check and "∨" not in conc_check and _is_trivially_true(conc_check):
             findings.append(
                 WaiverPinFinding(
                     rule=RULE_TRIVIAL_CONCLUSION,
