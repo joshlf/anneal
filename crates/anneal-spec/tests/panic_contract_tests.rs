@@ -3104,6 +3104,57 @@ fn kani5095_disabled_cast_to_generic_type_does_not_swallow_live_block() {
 }
 
 // ===========================================================================
+// 3f. `[adv ep2 A4]` Hardening: Qualified/HRTB/`Fn`-Trait/Never `as` Cast
+//     Types & Unary/Array Expression-Statement Dead-Decoy Spoofs
+// ===========================================================================
+
+#[test]
+fn kani5095_qualified_fn_ptr_hrtb_never_casts_and_unary_array_disabled_stmts() {
+    use InlineBoundaryVerdict::*;
+    const PRELUDE: &str = "pub trait Tr { type Out; } impl Tr for u8 { type Out = bool; } \
+                           pub type B<T> = <T as Tr>::Out; \
+                           pub trait LT<'a, T> {} impl<'a> LT<'a, u8> for u8 {}";
+    let wrap = |body: &str| {
+        format!("#[inline(never)] pub fn target() {{}}\nmod m {{ {PRELUDE} {body} }}\n")
+    };
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+
+    // 1. Live standalone `{ fn target() {} }` block MUST NOT be swallowed after
+    //    disabled control-flow headers ending in qualified fn-pointer casts,
+    //    HRTB `for<'a>` casts, `dyn Fn(...) -> B<u8>` casts, or never `!` casts.
+    for live_hidden in [
+        "fn g(f: unsafe fn() -> B<u8>) { #[cfg(any())] match f as unsafe fn() -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: extern \"C\" fn() -> B<u8>) { #[cfg(any())] match f as extern \"C\" fn() -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: unsafe extern \"C\" fn() -> B<u8>) { #[cfg(any())] match f as unsafe extern \"C\" fn() -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: extern \"C\" fn() -> B<u8>) { #[cfg(any())] match f as safe extern \"C\" fn() -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: for<'a> fn(&'a u8) -> B<u8>) { #[cfg(any())] match f as for<'a> fn(&'a u8) -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(x: &u8) { #[cfg(any())] match x as &dyn for<'a> LT<'a, u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: &dyn Fn(u8) -> B<u8>) { #[cfg(any())] match f as &dyn Fn(u8) -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(f: *const dyn FnMut() -> B<u8>) { #[cfg(any())] match f as *const dyn FnMut() -> B<u8> { _ => {} } { fn target() {} } }",
+        "fn g(x: core::convert::Infallible) { #[cfg(any())] match match x {} as ! { } { fn target() {} } }",
+        "fn g() { #[cfg(any())] !{ true }; fn target() {} }",
+        "fn g() { #[cfg(any())] &{ 1u8 }; fn target() {} }",
+        "fn g() { #[cfg(any())] *(&{ 1u8 }); fn target() {} }",
+        "fn g() { #[cfg(any())] -{ 1i32 }; fn target() {} }",
+        "fn g() { #[cfg(any())] [{ 1u8 }]; fn target() {} }",
+    ] {
+        assert_eq!(v(&wrap(live_hidden)), MissingInlineNever, "{live_hidden}");
+    }
+
+    // 2. Dead-decoy direction: unary prefix and array expression statements
+    //    compiled out by `#[cfg(any())]` MUST return `TargetFunctionNotFound`.
+    for dead_decoy in [
+        "pub fn g() { #[cfg(any())] !{ #[inline(never)] fn target() {} true }; }",
+        "pub fn g() { #[cfg(any())] &{ #[inline(never)] fn target() {} }; }",
+        "pub fn g() { #[cfg(any())] *(&{ #[inline(never)] fn target() {} }); }",
+        "pub fn g() { #[cfg(any())] -{ #[inline(never)] fn target() {} 1i32 }; }",
+        "pub fn g() { #[cfg(any())] [{ #[inline(never)] fn target() {} }]; }",
+    ] {
+        assert_eq!(v(dead_decoy), TargetFunctionNotFound, "{dead_decoy}");
+    }
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 

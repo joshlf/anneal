@@ -7420,11 +7420,21 @@ fn deep_scan_slice(
                     skip_disabled_closure(&mut lex)?;
                 }
             }
-            TokenKind::Punct(b'(') => {
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
                 let disabled = pending.saw_disabled_cfg;
                 pending.reset();
                 if !cur_disabled && disabled {
-                    let _ = lex.consume_balanced_inner(b'(')?;
+                    let _ = lex.consume_balanced_inner(p)?;
+                    skip_disabled_item_to_semicolon(&mut lex)?;
+                }
+            }
+            TokenKind::Punct(b'!' | b'&' | b'*' | b'-') => {
+                // Prefix unary expression statements (`#[cfg(any())] !{ ... };`,
+                // `&{ ... };`, `*(&{ ... });`, `-{ ... };`) cannot omit `;`
+                // before a following item and end at `;` or enclosing `}`.
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
                     skip_disabled_item_to_semicolon(&mut lex)?;
                 }
             }
@@ -7820,27 +7830,47 @@ fn skip_disabled_control_stmt(
 }
 
 /// Skips the target type of an `as` cast inside a disabled control-flow header:
-/// prefix modifiers (`&`, `&'a`, `&mut`, `*const`, `*mut`, `dyn`, `impl`),
-/// then a parenthesized/array/slice type group, an `fn(..) [-> T]` pointer
-/// type, or a (`::`-separated, optionally `<..>`-generic) path. Never consumes
-/// a `{`, `;`, or closing delimiter.
+/// prefix modifiers (`&`, `&'a`, `&mut`, `*const`, `*mut`, `dyn`, `impl`,
+/// `unsafe`, `safe`, `extern ["ABI"]`, `for<..>`), then a never type `!`, a
+/// parenthesized/array/slice type group, an `fn(..) [-> T]` pointer type, or a
+/// (`::`-separated, optionally `<..>`-generic or `(..) [-> T]` `Fn`-trait)
+/// path. Never consumes a `{`, `;`, or closing delimiter.
 fn skip_disabled_cast_type(lex: &mut RustLexer<'_>, depth: usize) -> Result<(), ()> {
     if depth > 16 {
         return Err(());
     }
-    // Prefix modifiers.
+    // Prefix modifiers (including HRTB `for<'a>` and fn-pointer qualifiers
+    // `unsafe`, `safe`, `extern "C"`).
     loop {
         match lex.peek_token()?.kind {
             TokenKind::Punct(b'&' | b'*') | TokenKind::Lifetime => {
                 let _ = lex.next_token()?;
             }
-            TokenKind::Ident("mut" | "const" | "dyn" | "impl") => {
+            TokenKind::Ident("mut" | "const" | "dyn" | "impl" | "unsafe" | "safe") => {
                 let _ = lex.next_token()?;
+            }
+            TokenKind::Ident("extern") => {
+                let _ = lex.next_token()?;
+                if matches!(lex.peek_token()?.kind, TokenKind::Literal) {
+                    let _ = lex.next_token()?;
+                }
+            }
+            TokenKind::Ident("for") => {
+                let _ = lex.next_token()?;
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_angle_inner()?;
+                }
             }
             _ => break,
         }
     }
     match lex.peek_token()?.kind {
+        TokenKind::Punct(b'!') => {
+            // Never type `!`.
+            let _ = lex.next_token()?;
+            return Ok(());
+        }
         TokenKind::Punct(p @ (b'(' | b'[')) => {
             let _ = lex.next_token()?;
             let _ = lex.consume_balanced_inner(p)?;
@@ -7866,7 +7896,7 @@ fn skip_disabled_cast_type(lex: &mut RustLexer<'_>, depth: usize) -> Result<(), 
         TokenKind::ColonColon | TokenKind::Ident(_) => {}
         _ => return Ok(()),
     }
-    // Path: [`::`] seg [`<..>`] (`::` [`<..>`] seg [`<..>`])*
+    // Path: [`::`] seg [`<..>` | `(..) [-> T]`] (`::` [`<..>`] seg [`<..>` | `(..) [-> T]`])*
     if matches!(lex.peek_token()?.kind, TokenKind::ColonColon) {
         let _ = lex.next_token()?;
     }
@@ -7877,6 +7907,15 @@ fn skip_disabled_cast_type(lex: &mut RustLexer<'_>, depth: usize) -> Result<(), 
         if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
             let _ = lex.next_token()?;
             let _ = lex.consume_angle_inner()?;
+        } else if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) {
+            // Parenthesized `Fn`-trait bound (`dyn Fn(u8) -> B<u8>`).
+            let _ = lex.next_token()?;
+            let _ = lex.consume_balanced_inner(b'(')?;
+            if matches!(lex.peek_token()?.kind, TokenKind::Arrow) {
+                let _ = lex.next_token()?;
+                skip_disabled_cast_type(lex, depth + 1)?;
+            }
+            return Ok(());
         }
         if !matches!(lex.peek_token()?.kind, TokenKind::ColonColon) {
             return Ok(());
