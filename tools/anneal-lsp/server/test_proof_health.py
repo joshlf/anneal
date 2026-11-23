@@ -7367,5 +7367,167 @@ class TestNegationPrecedenceA1AdversarialFixes(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceB2AdversarialFixes(unittest.TestCase):
+    """`[adv B2]` regressions for bugs found in `[adv A1]` and earlier vacuity auditor passes:
+
+    1. Binder-governed atoms read as one relation: `∀ x ∈ s, x :: xs = []`, `∀ x : α, xs.length < 0`,
+       `∀ hp : P, ...` and `if c then True else ...` hold vacuously (empty domain / other branch)
+       but were split at the `=` / `<` inside the binder body and flagged.
+    2. `Nat`-valued operand detection: the `.length` / `.toNat` suffix and `sumSizes ` prefix tests
+       ran on the whole operand and operators were split at any depth, so `f xs.length`,
+       `x - y.toNat`, `sumSizes xs - z`, `-↑xs.length` and `g (a.size + b.size)` (all possibly
+       negative) were flagged as `< 0` contradictions.
+    3. Header binders the parser dropped: dependent-arrow premises (`(h : False) → P`,
+       `(n : Nat) → n < 0 → P`) and strict-implicit binders (`⦃x : Nat⦄`, whose inner `:` was
+       read as the statement colon) hid contradictory hypotheses from every scope.
+    4. Relations never read: numeric `3 ≥ 5` and negated reflexive `¬ x ≤ x` / `¬ x ≥ x`.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "dep_arrow_false": "theorem bad : (h : False) → x = 1 := by sorry\n",
+        "dep_arrow_nat_lt_0": "theorem bad : (n : Nat) → (h : n < 0) → x = 1 := by sorry\n",
+        "dep_arrow_ascii_pair": "theorem bad (P : Prop) : (h1 : P) -> (h2 : ¬ P) -> x = 1 := by sorry\n",
+        "strict_implicit_nat_lt_0": "theorem bad ⦃x : Nat⦄ (h : x < 0) : x = 1 := by sorry\n",
+        "strict_implicit_then_false": "theorem bad ⦃x : Nat⦄ (h : False) : x = 1 := by sorry\n",
+        "strict_implicit_false": "theorem bad ⦃h : False⦄ : x = 1 := by sorry\n",
+        "forall_strict_implicit_nat_lt_0": "theorem bad : ∀ ⦃n : Nat⦄ (h : n < 0), x = 1 := by sorry\n",
+        "numeric_ge": "theorem bad (h : 3 ≥ 5) : x = 1 := by sorry\n",
+        "not_le_refl": "theorem bad (x : Nat) (h : ¬ x ≤ x) : x = 1 := by sorry\n",
+        "not_ge_refl_paren": "theorem bad (x : Nat) (h : ¬ (x ≥ x)) : x = 1 := by sorry\n",
+        "len_lt_0": "theorem bad (xs : List Nat) (h : xs.length < 0) : x = 1 := by sorry\n",
+        "paren_proj_len_lt_0": "theorem bad (xs : List Nat) (h : (xs.map f).length < 0) : x = 1 := by sorry\n",
+        "nat_sub_lt_0": "theorem bad (a b : Nat) (h : a - b < 0) : x = 1 := by sorry\n",
+        "nat_paren_arith_lt_0": "theorem bad (a b : Nat) (h : (a + b) * 2 < 0) : x = 1 := by sorry\n",
+        "toNat_sub_gt": "theorem bad (a b : Int) (h : 0 > a.toNat - b.toNat) : x = 1 := by sorry\n",
+        "prefix_fn_lt_0": "theorem bad (h : sumSizes xs < 0) : x = 1 := by sorry\n",
+        "exists_mem_false": "theorem bad (h : ∃ x ∈ s, False) : x = 1 := by sorry\n",
+        "exists_cons_nil": "theorem bad (xs : List Nat) (h : ∃ x : Nat, x :: xs = []) : x = 1 := by sorry\n",
+        "forall_nat_cons_nil": "theorem bad (xs : List Nat) (h : ∀ x : Nat, x :: xs = []) : x = 1 := by sorry\n",
+    }
+
+    CLEAN = {
+        "forall_empty_domain_len": "theorem ok {α : Type} (xs : List Nat) (h : ∀ x : α, xs.length < 0) : α → False := by sorry\n",
+        "forall_mem_len": "theorem ok (s xs : List Nat) (h : ∀ i ∈ s, xs.length < 0) : s = [] := by sorry\n",
+        "forall_empty_domain_cons_nil": "theorem ok {α : Type} (xs : List α) (h : ∀ x : α, x :: xs = []) : α → False := by sorry\n",
+        "forall_mem_cons_nil": "theorem ok (s xs : List Nat) (h : ∀ x ∈ s, x :: xs = []) : s = [] := by sorry\n",
+        "forall_proof_binder_len": "theorem ok (P : Prop) (xs : List Nat) (h : ∀ hp : P, xs.length < 0) : ¬ P := by sorry\n",
+        "if_else_cons_nil": "theorem ok (c : Prop) [Decidable c] (x : Nat) (xs : List Nat) (h : if c then True else x :: xs = []) : c := by sorry\n",
+        "if_else_len_lt_0": "theorem ok (c : Prop) [Decidable c] (xs : List Nat) (h : if c then True else xs.length < 0) : c := by sorry\n",
+        "fn_of_suffix_arg_lt_0": "theorem ok (f : Nat → Int) (xs : List Nat) (h : f xs.length < 0) : f xs.length ≠ 0 := by omega\n",
+        "fn_of_suffix_arg_gt": "theorem ok (f : Nat → Int) (xs : List Nat) (h : 0 > f xs.length) : f xs.length ≠ 0 := by omega\n",
+        "int_minus_toNat": "theorem ok (x y : Int) (h : x - y.toNat < 0) : x < y.toNat := by omega\n",
+        "prefix_fn_minus_int": "theorem ok (z : Int) (h : sumSizes xs - z < 0) : 0 < z := by sorry\n",
+        "neg_cast_len": "theorem ok (xs : List Nat) (h : -↑xs.length < 0) : xs ≠ [] := by sorry\n",
+        "fn_of_paren_arith": "theorem ok (g : Nat → Int) (a b : Array Nat) (h : g (a.size + b.size) < 0) : True := trivial\n",
+        "int_times_nat": "theorem ok (n : Nat) (z : Int) (h : n * z < 0) : z < 0 := by sorry\n",
+        "dep_arrow_data": "theorem ok : (n : Nat) → (h : n = 0) → n + 0 = 0 := by sorry\n",
+        "dep_arrow_int_lt_0": "theorem ok : (n : Int) → (h : n < 0) → n ≠ 0 := by sorry\n",
+        "subtype_premise": "theorem ok : {x : Nat // x < 0} → False := by sorry\n",
+        "strict_implicit_data": "theorem ok ⦃x : Nat⦄ (h : x = 0) : x + 0 = 0 := by simp [h]\n",
+        "strict_implicit_int_lt_0": "theorem ok ⦃x : Int⦄ (h : x < 0) : x ≠ 0 := by omega\n",
+        "hoare_triple_hyp": "theorem ok (h : ⦃P⦄ t ⦃Q⦄) : ⦃P⦄ ITree.tau t ⦃Q⦄ := by sorry\n",
+        "forall_strict_implicit_inj": "theorem ok (hInj : ∀ ⦃x y : α⦄, m.toValue x = m.toValue y → x = y) : inj m := by sorry\n",
+        "numeric_ge_true": "theorem ok (h : 5 ≥ 3) : x = 1 := by sorry\n",
+        "nat_ge_zero": "theorem ok (n : Nat) (h : n ≥ 0) : x = 1 := by sorry\n",
+        "not_le_distinct": "theorem ok (x y : Nat) (h : ¬ x ≤ y) : y < x := by omega\n",
+        "not_le_refl_refutation": "theorem ok (x : Nat) (h : ¬ x ≤ x) : False := by sorry\n",
+        "dep_arrow_refutation": "theorem ok : (h : false = true) → False := by sorry\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_b2_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_b2_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.CLEAN.items():
+            self.assertNotIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_b2_helper_invariants(self) -> None:
+        nat = proof_health._is_nat_like_operand
+        none: frozenset[str] = frozenset()
+        for yes, nv in (
+            ("xs.length", none),
+            ("(xs.map f).length", none),
+            ("a.toNat - b.toNat", none),
+            ("sumSizes xs", none),
+            ("(a + b) * 2", frozenset({"a", "b"})),
+            ("2 ^ n - 1", frozenset({"n"})),
+            ("↑xs.length", none),
+        ):
+            self.assertTrue(nat(yes, nv), yes)
+        for no, nv in (
+            ("f xs.length", none),
+            ("x - y.toNat", none),
+            ("sumSizes xs - z", none),
+            ("-↑xs.length", none),
+            ("-n", frozenset({"n"})),
+            ("g (a.size + b.size)", none),
+            ("n * z", frozenset({"n"})),
+            ("(n : Int) + 1", frozenset({"n"})),
+            ("", none),
+        ):
+            self.assertFalse(nat(no, nv), no)
+
+        binder = proof_health._has_top_level_prefix_binder
+        for yes in (
+            "∀ x ∈ s, x :: xs = []",
+            "forall x, x = 0",
+            "if c then True else n < 0",
+            "x = fun y => y",
+            "n < 0 ∧ ∃ y, P y",
+        ):
+            self.assertTrue(binder(yes), yes)
+        for no in (
+            "f (fun x => x) = 0",
+            "¬ (∀ x, P x)",
+            "List.exists p xs = true",
+            "«if» < 0",
+            "notify x < 0",
+            "n < 0 ∧ m = 1",
+        ):
+            self.assertFalse(binder(no), no)
+
+        prem = proof_health._arrow_premise_binder
+        self.assertEqual(prem("(h : False)"), ("h", "False"))
+        self.assertEqual(prem("(a b : Nat)"), ("a b", "Nat"))
+        self.assertEqual(prem("(a = b)"), ("", "(a = b)"))
+        self.assertEqual(prem("(x := 1)"), ("", "(x := 1)"))
+        self.assertEqual(prem("{x : Nat // x < 5}"), ("", "{x : Nat // x < 5}"))
+        self.assertEqual(prem("(x : Nat) × Fin x"), ("", "(x : Nat) × Fin x"))
+        self.assertEqual(prem("(f x : Nat)"), ("f x", "Nat"))
+        self.assertEqual(prem("((a, b) : Nat × Nat)"), ("", "((a, b) : Nat × Nat)"))
+
+        hyps, conc, extra = proof_health._split_lean_theorem_header(
+            " ⦃x : Nat⦄ ⦃y⦄ (h : x < 0) : x = 1 := by sorry", 0
+        )
+        self.assertEqual(hyps, [("x", "Nat"), ("h", "x < 0")])
+        self.assertEqual(conc, "x = 1")
+        self.assertEqual(extra, ["untyped:y"])
+        hyps, conc, _ = proof_health._split_lean_theorem_header(
+            " : (n : Nat) → n < 0 → ∀ ⦃m : Nat⦄, m = n := by sorry", 0
+        )
+        self.assertEqual(hyps, [("n", "Nat"), ("", "n < 0"), ("m", "Nat")])
+        self.assertEqual(conc, "m = n")
+        self.assertIsNone(proof_health._split_lean_theorem_header(" ⦃x : Nat (h : False) : P", 0))
+
+    def test_check_trusted_agrees_on_every_b2_header(self) -> None:
+        ct = _load_check_trusted()
+        all_cases = {**self.VACUOUS_BOTH_SCOPES, **self.CLEAN}
+        for label, src in all_cases.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

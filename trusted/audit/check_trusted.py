@@ -3196,6 +3196,36 @@ def _is_outer_paren_wrapped(t: str) -> bool:
     return False
 
 
+def _typed_binder_parts(inner: str) -> tuple[str, str] | None:
+    """`(names, type)` for the inside of a `names : T` binder group; `None` when it is untyped
+    (`x y`) or its first `:` opens a `:=` default."""
+    b_n, col, b_t = inner.partition(":")
+    if not col or b_t.startswith("="):
+        return None
+    b_n = b_n.strip()
+    b_t = b_t.strip()
+    if not b_n or not b_t:
+        return None
+    return b_n, b_t
+
+
+def _arrow_premise_binder(prem: str) -> tuple[str, str]:
+    """The hypothesis a `→` premise contributes. A premise that is exactly one `(names : T)` group
+    is a dependent-arrow binder (`(h : False) → P`, `(n : Nat) → n < 0 → P`): it binds `names`
+    like a header binder, so it is returned as `(names, T)`. Anything else -- including a subtype
+    or set-builder brace `{x : T // p}` -- is the anonymous premise `("", prem)`. `[adv B2]`:
+    A0-A1 kept `("", "(h : False)")`, whose text matches no contradiction and binds no `Nat`
+    variable, so the dependent-arrow spelling evaded every scope."""
+    if len(prem) >= 5 and prem[0] == "(" and prem[-1] == ")" and ":" in prem:
+        q, col = _scan_binder_group(prem, 0, len(prem))
+        if q == len(prem) and col != -1:
+            names = prem[1:col].strip()
+            b_type = prem[col + 1 : q - 1].strip()
+            if b_type and _BARE_BINDER_NAMES_RE.fullmatch(names) is not None:
+                return names, b_type
+    return "", prem
+
+
 def _split_lean_theorem_header(
     code_segment: str, after_name_pos: int, limit_end: int | None = None
 ) -> tuple[list[tuple[str, str]], str, list[str]] | None:
@@ -3233,6 +3263,20 @@ def _split_lean_theorem_header(
                 return None
             colon_pos = p
             break
+        if ch == "⦃":
+            # `[adv B2]` Strict-implicit binder `⦃x : T⦄`. A0-A1 read its inner `:` as the
+            # statement colon, so every later binder (`(h : False)`) fell into the "conclusion".
+            close_s = find("⦄", p + 1, n)
+            if close_s == -1:
+                return None
+            inner = code_segment[p + 1 : close_s]
+            typed_s = _typed_binder_parts(inner)
+            if typed_s is not None:
+                binders.append(typed_s)
+            elif inner.strip():
+                extra_binders.append(f"untyped:{inner.strip()}")
+            p = close_s + 1
+            continue
         if ch in "({[":
             close_ch = ")" if ch == "(" else ("}" if ch == "{" else "]")
             fast_close = find(close_ch, p + 1, n)
@@ -3369,6 +3413,19 @@ def _split_lean_theorem_header(
                 if c2 in " \t\r\n":
                     idx_q += 1
                     continue
+                if c2 == "⦃":
+                    close_s = find_cur("⦄", idx_q + 1, n_cur)
+                    if close_s != -1:
+                        if not saw_q_bare_colon:
+                            saw_q_group = True
+                            inner = cur_stmt[idx_q + 1 : close_s]
+                            typed_s = _typed_binder_parts(inner)
+                            if typed_s is not None:
+                                hyps.append(typed_s)
+                            elif inner.strip():
+                                extra_binders.append(f"untyped:{inner.strip()}")
+                        idx_q = close_s + 1
+                        continue
                 if c2 in "({[":
                     if not saw_q_bare_colon:
                         saw_q_group = True
@@ -3475,7 +3532,7 @@ def _split_lean_theorem_header(
                 for p_seg in arrow_parts[:-1]
             ):
                 for p_seg in arrow_parts[:-1]:
-                    hyps.append(("", p_seg.strip()))
+                    hyps.append(_arrow_premise_binder(p_seg.strip()))
                 cur_stmt = arrow_parts[-1].strip()
                 if (
                     cur_stmt.startswith("(")
@@ -3516,7 +3573,7 @@ def _split_lean_theorem_header(
             seg_start = 0
             n_cs = len(cur_stmt)
             for a_start, a_end in arrow_spans:
-                hyps.append(("", cur_stmt[seg_start:a_start].strip()))
+                hyps.append(_arrow_premise_binder(cur_stmt[seg_start:a_start].strip()))
                 seg_start = a_end
                 while seg_start < n_cs and cur_stmt[seg_start] in " \t\r\n":
                     seg_start += 1
@@ -3712,6 +3769,36 @@ def _has_top_level_looser_than_not(expr: str) -> bool:
                 depth -= 1
         elif depth == 0:
             return t in ("↔", "<->", "<|>", "<|", "$", "→", "->", "∨", "\\/", "∧", "/\\")
+    return False
+
+
+_PREFIX_BINDER_HINT_SEARCH = re.compile(
+    r"[∀∃λ]|(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+).search
+
+
+def _has_top_level_prefix_binder(expr: str) -> bool:
+    """`True` iff `expr` has a depth-0 (outside `()[]{}⟨⟩` and `«...»`) prefix binder or keyword
+    (`∀`, `∃`, `λ`, `forall`, `exists`, `fun`, `if`, `match`, `let`, `have`, `show`, `by`), whose
+    body runs to the end of `expr`. Such an expression is not one relation between two terms:
+    in `∀ x ∈ s, x :: xs = []` or `if c then True else n < 0` the `=` / `<` belongs to the body,
+    which holds vacuously over an empty domain or in the other branch."""
+    if _PREFIX_BINDER_HINT_SEARCH(expr) is None:
+        return False
+    depth = 0
+    for m in _TOP_LEVEL_LOOSER_THAN_NOT_RE.finditer(expr):
+        t = m.group(0)
+        if t[0] == "«":
+            continue
+        if t in "([{⟨":
+            depth += 1
+        elif t in ")]}⟩":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0 and t not in (
+            "↔", "<->", "<|>", "<|", "$", "→", "->", "∨", "\\/", "∧", "/\\"
+        ):
+            return True
     return False
 
 
@@ -4438,30 +4525,70 @@ _NAT_VALUED_PREFIXES = (
     "Mir.PlaceAndRvalue.alignUp ",
     "PlaceAndRvalue.alignUp ",
 )
-_NAT_ARITH_SPLIT_RE = re.compile(r"[+*/%^]")
+_NAT_ARITH_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩]|[-+*/%^]")
+
+
+def _has_depth0_space(e: str) -> bool:
+    """`True` iff normalized `e` has a space outside `()[]{}⟨⟩`: an application (`f xs.length`),
+    not one projection chain (`xs.length`, `(xs.map f).length`)."""
+    if " " not in e:
+        return False
+    depth = 0
+    for ch in e:
+        if ch in "([{⟨":
+            depth += 1
+        elif ch in ")]}⟩":
+            if depth > 0:
+                depth -= 1
+        elif ch == " " and depth == 0:
+            return True
+    return False
 
 
 def _is_atomic_nat_like(e: str, nat_vars: frozenset[str]) -> bool:
-    return (
-        e in nat_vars
-        or _NUM_LIT_RE.match(e) is not None
-        or e.endswith(_NAT_VALUED_SUFFIXES)
-        or e.startswith(_NAT_VALUED_PREFIXES)
-    )
+    """`e` (normalized, no depth-0 arithmetic operator) is a numeral, a `Nat`-like binder, an
+    application headed by a known `Nat`-valued function (`sumSizes xs`), or a single projection
+    chain ending in a known `Nat`-valued field (`xs.length`). `[adv B2]`: the suffix test alone
+    accepted `f xs.length` -- an application of an arbitrary `f : Nat → Int`."""
+    if e in nat_vars or _NUM_LIT_RE.match(e) is not None or e.startswith(_NAT_VALUED_PREFIXES):
+        return True
+    return e.endswith(_NAT_VALUED_SUFFIXES) and not _has_depth0_space(e)
 
 
 def _is_nat_like_operand(e: str, nat_vars: frozenset[str]) -> bool:
     """`True` iff `e` is syntactically `Nat`-valued: a numeral, a binder declared `Nat`-like, a
     known `Nat`-valued projection/function (`.length`, `.size`, `.toNat`, `.totalPad`, `.totalSize`,
-    `sumSizes ...`, etc.), or a `+`/`*`/`/`/`%`/`^` combination of `Nat`-like operands. Anything
-    else (`f x`, an `Int` / `Real` binder, an undeclared name) may be negative, so `e < 0` is NOT
-    a syntactic contradiction for it."""
-    if _is_atomic_nat_like(e, nat_vars):
-        return True
-    if any(op in e for op in ("+", "*", "/", "%", "^")):
-        atoms = [a.strip("() ") for a in _NAT_ARITH_SPLIT_RE.split(e)]
-        return bool(atoms) and all(a and _is_atomic_nat_like(a, nat_vars) for a in atoms)
-    return False
+    `sumSizes ...`, etc.), or a depth-0 `+`/`-`/`*`/`/`/`%`/`^` combination whose operands are ALL
+    `Nat`-like (parenthesised operands recurse). Anything else (`f x`, an `Int` / `Real` binder, an
+    undeclared name) may be negative, so `e < 0` is NOT a syntactic contradiction for it.
+
+    `[adv B2]`: A0-A1 applied the prefix / suffix tests to the whole operand and split on
+    operators at any depth, so `x - y.toNat`, `sumSizes xs - z` (`x z : Int`), `-↑xs.length`
+    and `g (a.size + b.size)` all read as `Nat`-valued."""
+    e = _norm_expr(e)
+    if not e:
+        return False
+    parts: list[str] | None = None
+    depth = 0
+    start = 0
+    for m in _NAT_ARITH_SPLIT_RE.finditer(e):
+        t = m.group(0)
+        if t[0] == "«":
+            continue
+        if t in "([{⟨":
+            depth += 1
+        elif t in ")]}⟩":
+            if depth > 0:
+                depth -= 1
+        elif depth == 0:
+            if parts is None:
+                parts = []
+            parts.append(e[start : m.start()])
+            start = m.end()
+    if parts is not None:
+        parts.append(e[start:])
+        return all(_is_nat_like_operand(p, nat_vars) for p in parts)
+    return _is_atomic_nat_like(e, nat_vars)
 
 
 _PURE_DATA_BASE_TYPES = frozenset(
@@ -4770,6 +4897,7 @@ def _check_hypothesis_contradiction(
         and "<" not in hyp_expr
         and "≤" not in hyp_expr
         and ">" not in hyp_expr
+        and "≥" not in hyp_expr
         and "False" not in hyp_expr
         and "¬" not in hyp_expr
     ):
@@ -4789,18 +4917,30 @@ def _check_hypothesis_contradiction(
         return None
     if h == "False":
         return "`False` hypothesis"
+    # `[adv B2]` An atom governed by a depth-0 prefix binder / keyword (`∀ x ∈ s, x :: xs = []`,
+    # `∀ hp : P, xs.length < 0`, `if c then True else n < 0`) is opaque: `_hyp_atoms` already
+    # descended through every quantifier whose domain it could prove inhabited, so what is left
+    # may hold vacuously, and the relation splits below would read a relation out of its body.
+    if _has_top_level_prefix_binder(h):
+        return None
 
     # Once `_has_top_level_looser_than_not(h)` is False, a leading `¬` governs the whole expression:
-    # check negated `True` / reflexive equality and return without falling through to positive
-    # relation checks (which would misread `¬ x :: xs = []` or `¬ x ≠ x`).
+    # check negated `True` / reflexive `=` / `≤` / `≥` and return without falling through to
+    # positive relation checks (which would misread `¬ x :: xs = []` or `¬ x ≠ x`).
     if h.startswith("¬"):
         inner = _norm_expr(h[1:])
         if inner == "True":
             return f"negated `True` hypothesis `{h}`"
-        if "=" in inner and not _has_top_level_looser_than_not(inner):
-            eq_sides = _split_top_level_eq(inner)
-            if len(eq_sides) == 2 and eq_sides[0] and eq_sides[0] == eq_sides[1]:
-                return f"negated reflexive equality `{h}`"
+        if not _has_top_level_looser_than_not(inner) and not _has_top_level_prefix_binder(inner):
+            if "=" in inner:
+                eq_sides = _split_top_level_eq(inner)
+                if len(eq_sides) == 2 and eq_sides[0] and eq_sides[0] == eq_sides[1]:
+                    return f"negated reflexive equality `{h}`"
+            for le_op in ("≤", "≥"):
+                if le_op in inner:
+                    le_sides = _split_top_level(inner, le_op)
+                    if len(le_sides) == 2 and le_sides[0] and le_sides[0] == le_sides[1]:
+                        return f"negated reflexive `{le_op}` `{h}`"
         return None
 
     if h in (
@@ -4836,6 +4976,14 @@ def _check_hypothesis_contradiction(
             nl, nr = le_sides
             if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) > int(nr):
                 return f"contradictory numeric inequality `{nl} ≤ {nr}`"
+
+    # Check `lhs ≥ rhs` for numeric `3 ≥ 5` (`[adv B2]`: the one relation A0-A1 never read)
+    if "≥" in h:
+        ge_sides = _split_top_level(h, "≥")
+        if len(ge_sides) == 2:
+            nl, nr = ge_sides
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) < int(nr):
+                return f"contradictory numeric inequality `{nl} ≥ {nr}`"
 
     # Check `lhs > rhs` for `x > x`, `0 > n`, or numeric `3 > 5`
     if ">" in h:
@@ -5172,6 +5320,7 @@ def _audit_lean_theorem(
         or "<" in all_hyps_text
         or "≤" in all_hyps_text
         or ">" in all_hyps_text
+        or "≥" in all_hyps_text
         or "False" in all_hyps_text
     )
     has_eq_in_all = "=" in all_hyps_text
@@ -5186,6 +5335,7 @@ def _audit_lean_theorem(
                     or "<" in t
                     or "≤" in t
                     or ">" in t
+                    or "≥" in t
                     or "False" in t
                     or "¬" in t
                 )
@@ -5249,6 +5399,7 @@ def _audit_lean_theorem(
                     or "<" in part
                     or "≤" in part
                     or ">" in part
+                    or "≥" in part
                     or "False" in part
                     or "¬" in part
                 ):
