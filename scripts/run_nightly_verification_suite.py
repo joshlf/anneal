@@ -289,12 +289,11 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("pointerCoercion", "proved_corresponding"),
             # UnwindSetDiscrAndFnPtr{MR,LM} (`C7`) and DropBinderAndSubtype{MR,LM,Bundle}.
             ("subtype", "proved_corresponding"),
-            # Float casts: evidence is the kernel-checked IEEE-754 reference-model
-            # agreement in `theory/Anneal/Mir/IeeeFloatCast.lean` (ties-to-even,
-            # saturating float->int, NaN quietization, subnormal single rounding) plus
-            # `tests/mir/CastStage1Tests.lean`; there is not yet a MiniRustSpec /
-            # LeanMiriSpec step-simulation theorem for `FloatToInt`/`IntToFloat`/
-            # `FloatToFloat` (LeanMiriSpec only translates the cast kinds).
+            # Float casts: kernel-checked IEEE-754 theory in `theory/Anneal/Mir/IeeeFloatCast.lean`
+            # and `tests/mir/CastStage1Tests.lean`, fail-closed MiniRustSpec translation boundary
+            # and bit-carrier transmutes in `minirust/lean/MiniRustSpec/FloatCastMR.lean` (pinned
+            # MiniRust has no float type or float-cast operator), and direct `Miri.Interpreter.Step.step`
+            # correspondence in `lean-miri/lean/LeanMiriSpec/FloatCastLM.lean` / `WitFloatCastLM.lean`.
             ("floatToInt", "proved_corresponding"),
             ("intToFloat", "proved_corresponding"),
             ("floatToFloat", "proved_corresponding"),
@@ -5053,6 +5052,15 @@ _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
         "--help",
     )
 )
+_LEAN_RUN_NON_EXEC_OPTS: frozenset[str] = frozenset(
+    (
+        "--probe",
+        "--print-limits",
+        "--ensure-slice",
+        "-h",
+        "--help",
+    )
+)
 _LEAN_RUN_LONG_OPTS: tuple[str, ...] = tuple(
     sorted(o for o in (_LEAN_RUN_VALUE_OPTS | _LEAN_RUN_BOOL_OPTS) if o.startswith("--"))
 )
@@ -5480,10 +5488,11 @@ def _probe_lean_run_memory_max_mib(
     """`MemoryMax` (MiB) that the `anneal-lean-run` wrapper of `cmd` plans for the
     scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
     --mode <resolved mode> --probe --json`, which never runs the command), or `None`
-    if `cmd` is not wrapped,
-    will pass through without creating a new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1`
-    without `--nested-ok`), or the probe fails. The suite process is outside that
-    scope, so its own cgroup hierarchy cannot show this cap."""
+    if `cmd` is not wrapped, carries a non-executing wrapper action (`--ensure-slice`,
+    `--probe`, `--print-limits`, `-h`, `--help`), will pass through without creating a
+    new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1` without `--nested-ok`), or the probe fails.
+    The suite process is outside that scope, so its own cgroup hierarchy cannot show
+    this cap."""
     if not _is_lean_run_wrapped(cmd, env):
         return None
     env_map = os.environ if env is None else env
@@ -5491,36 +5500,87 @@ def _probe_lean_run_memory_max_mib(
     if env_map.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not nested_ok:
         return None
     opts: list[str] = []
+    exclusive = False
     i, n = 1, len(cmd)
     while i < n:
         tok = cmd[i]
         if tok == "--" or tok == "-" or not tok.startswith("-"):
             break
+        opt = _resolve_lean_run_opt(tok.split("=", 1)[0] if "=" in tok else tok)
+        if opt in _LEAN_RUN_NON_EXEC_OPTS:
+            # Never forward `--ensure-slice` (which mutates systemd user units before
+            # `--probe` runs) or probe non-executing meta-invocations.
+            return None
+        if opt == "--exclusive":
+            exclusive = True
         opts.append(tok)
-        if "=" not in tok and _resolve_lean_run_opt(tok) in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
+        if "=" not in tok and opt in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
             opts.append(cmd[i + 1])
             i += 1
         i += 1
+
+    def run_probe(probe_args: list[str]) -> dict[str, Any] | None:
+        try:
+            out = subprocess.run(
+                [cmd[0], *probe_args],
+                cwd=None if cwd is None else str(cwd),
+                env=None if env is None else dict(env),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
+            parsed = json.loads(out.stdout) if out.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
     # The probe drops the wrapped command, so an `auto` mode would resolve to `build`
     # there even when the wrapper runs this command in `file` mode (`lean File.lean`,
     # `lake env lean ...`), whose `MemoryMax` is capped lower. Pin the mode the wrapper
     # resolves for the real command (the last `--mode` wins).
-    try:
-        out = subprocess.run(
-            [cmd[0], *opts, "--mode", mode, "--probe", "--json"],
-            cwd=None if cwd is None else str(cwd),
-            env=None if env is None else dict(env),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout_sec,
-            check=False,
-        )
-        limits = json.loads(out.stdout) if out.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
+    limits = run_probe([*opts, "--mode", mode, "--probe", "--json"])
+    if limits is None:
         return None
-    mem_max = limits.get("memory_max_mb") if isinstance(limits, dict) else None
+
+    # In `anneal-lean-run`'s `resolve_effective_concurrency`, `--probe` with an explicit
+    # `--concurrency` (`cli_concurrency`, such as `--concurrency 1` in `build_suite_steps`)
+    # evaluates at `cli_concurrency` even when the host's concurrency file (`build_slots`)
+    # is larger, whereas actual execution (`is_probe=False`) raises `w_eff` to
+    # `max(w_req, build_slots)` unless `--exclusive` is set. Re-probe at the runtime
+    # concurrency so multi-slot hosts do not overestimate `memory_max_mb` above 10 GiB.
+    w_eff = limits.get("w_eff")
+    build_slots = limits.get("build_slots")
+    if (
+        not exclusive
+        and isinstance(w_eff, int)
+        and not isinstance(w_eff, bool)
+        and isinstance(build_slots, int)
+        and not isinstance(build_slots, bool)
+        and 1 <= w_eff < build_slots
+    ):
+        limits = run_probe(
+            [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
+        )
+        if limits is None:
+            return None
+    elif (
+        exclusive
+        and isinstance(w_eff, int)
+        and not isinstance(w_eff, bool)
+        and w_eff > 1
+    ):
+        # Older fleet wrappers ignore `--exclusive` in `--probe` when `--concurrency`
+        # is also present, whereas execution forces `w_eff = 1`.
+        limits = run_probe(
+            [*opts, "--mode", mode, "--concurrency", "1", "--probe", "--json"]
+        )
+        if limits is None:
+            return None
+
+    mem_max = limits.get("memory_max_mb")
     if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
         return mem_max
     return None

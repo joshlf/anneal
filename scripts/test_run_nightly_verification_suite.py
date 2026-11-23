@@ -614,6 +614,48 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                             rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
                             f"{rel} missing theorem {sym} for {key}",
                         )
+        # Cross-root kernel bridge files declare concrete closing theorems.
+        for rel, bridge_theorems in (
+            (
+                MIR_BUNDLE_KERNEL_BRIDGES["DropBinderAndSubtype"],
+                ("ep2_all_8_variants_flip_verdict", "ep2_drop_mode_sensitivity_root"),
+            ),
+            (
+                MIR_BUNDLE_KERNEL_BRIDGES["NullaryAndPtrCoercion"],
+                (
+                    "np_all_4_variants_flip_verdict",
+                    "ep2_nullary_ptrcoercion_fnptr_unwrap_root_capstone",
+                ),
+            ),
+        ):
+            code = proof_code[rel]
+            for sym in bridge_theorems:
+                self.assertRegex(
+                    code,
+                    rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
+                    f"{rel} missing bridge theorem {sym}",
+                )
+        # Float-cast correspondence modules cited in `MIR_AST_CATEGORIES` exist and carry
+        # their fail-closed MiniRust boundary and direct Miri step-simulation theorems.
+        for rel, required_theorems in (
+            (
+                "minirust/lean/MiniRustSpec/FloatCastMR.lean",
+                ("fc_intTypeOf_float", "fc_translateTy_float"),
+            ),
+            (
+                "lean-miri/lean/LeanMiriSpec/FloatCastLM/RealStepDirect.lean",
+                ("step_cast_float_copy_simulation_mode", "step_cast_float_move_simulation_mode"),
+            ),
+        ):
+            path = REPO_ROOT / rel
+            self.assertTrue(path.is_file(), rel)
+            code = suite._strip_lean_comments(path.read_text(encoding="utf-8"))
+            for sym in required_theorems:
+                self.assertRegex(
+                    code,
+                    rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
+                    f"{rel} missing float-cast theorem {sym}",
+                )
 
         # The census and the Markdown-facing lists are derived from the same table.
         mir = suite.compute_stage_a_syntactic_completeness(REPO_ROOT)["anneal_mir_ast"]
@@ -5413,6 +5455,184 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     )
                 self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
                 self.assertEqual(out_file.read_text(encoding="utf-8"), expected)
+
+    def test_probe_lean_run_reconciles_multi_slot_concurrency_and_skips_non_exec_flags(self) -> None:
+        # 1. On a multi-slot host (`build_slots > cli_concurrency`), `anneal-lean-run --probe`
+        #    evaluates at `--concurrency 1` while actual execution raises `w_eff` to
+        #    `build_slots` (unless `--exclusive`). `_probe_lean_run_memory_max_mib` must
+        #    re-probe at `build_slots` so `< 10 GiB` per-slot caps still trigger
+        #    `LEAN_NUM_THREADS=1` for `LOW_RAM_SINGLE_THREAD_STEPS`.
+        # 2. Non-executing / mutating wrapper flags (`--ensure-slice`, `--ensure`, `--probe`,
+        #    `--print-limits`, `-h`, `--help`) must return `None` without spawning the wrapper.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "bin/anneal-lean-run"
+            argv_log = root / "argv.jsonl"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, os, sys
+                    args = sys.argv[1:]
+                    with open({str(argv_log)!r}, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(args) + "\\n")
+                    # Simulate a 3-slot host (~24 GiB live pool): w_eff=1 -> 21600 MiB (>= 10 GiB),
+                    # w_eff=3 -> 7200 MiB (< 10 GiB). Last `--concurrency` wins as in argparse.
+                    conc = 3
+                    i = 0
+                    while i < len(args):
+                        if args[i] == "--concurrency" and i + 1 < len(args):
+                            conc = int(args[i + 1])
+                            i += 2
+                            continue
+                        if args[i].startswith("--concurrency="):
+                            conc = int(args[i].split("=", 1)[1])
+                        i += 1
+                    if os.environ.get("FAIL_REPROBE") == "1" and conc == 3:
+                        sys.exit(2)
+                    sys.stdout.write(json.dumps({{
+                        "memory_max_mb": 21600 // conc,
+                        "w_eff": conc,
+                        "build_slots": 3,
+                    }}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            argv_log.write_text("", encoding="utf-8")
+
+            def probes() -> list[list[str]]:
+                return [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+
+            # Non-executing / mutating flags never spawn the wrapper.
+            for non_exec in (
+                [str(wrapper), "--ensure-slice"],
+                [str(wrapper), "--ensure", "--", "lake", "build"],
+                [str(wrapper), "--probe", "--json"],
+                [str(wrapper), "--print-limits"],
+                [str(wrapper), "-h"],
+                [str(wrapper), "--help"],
+            ):
+                self.assertIsNone(suite._probe_lean_run_memory_max_mib(non_exec), non_exec)
+            self.assertEqual(probes(), [])
+            # A `--help` after `--` belongs to the wrapped command, not the wrapper.
+            self.assertEqual(
+                suite._probe_lean_run_memory_max_mib(
+                    [str(wrapper), "--mode", "build", "--concurrency", "3", "--", "lake", "--help"]
+                ),
+                7200,
+            )
+            self.assertEqual(len(probes()), 1)
+
+            # `--concurrency 1` without `--exclusive` re-probes at `build_slots=3` -> 7200 MiB.
+            step_cmd = [
+                str(wrapper),
+                "--mode",
+                "build",
+                "--concurrency",
+                "1",
+                "--timeout",
+                "1800",
+                "--",
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec",
+            ]
+            before = len(probes())
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 7200)
+            new_probes = probes()[before:]
+            self.assertEqual(len(new_probes), 2)
+            self.assertEqual(new_probes[1][-4:], ["--concurrency", "3", "--probe", "--json"])
+
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=32768):
+                for step_name in ("lake_build_minirust_spec", "lake_build_lean_miri_spec"):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+                # Failed re-probe fails closed (`None`) instead of returning the inflated 21600 MiB cap.
+                self.assertIsNone(
+                    suite._probe_lean_run_memory_max_mib(step_cmd, env={"FAIL_REPROBE": "1"})
+                )
+                # With `--exclusive`, execution stays at `w_eff=1` (21600 MiB >= 10 GiB):
+                # even an older wrapper that reports `w_eff=3` on `--exclusive --concurrency 3`
+                # re-probes to `w_eff=1` (21600 MiB) and skips single-threading.
+                excl_cmd = [
+                    str(wrapper),
+                    "--mode",
+                    "build",
+                    "--exclusive",
+                    "--concurrency",
+                    "3",
+                    "--",
+                    "lake",
+                    "build",
+                    "MiniRustSpec",
+                ]
+                self.assertEqual(suite._probe_lean_run_memory_max_mib(excl_cmd), 21600)
+                excl_env = suite._build_step_env(
+                    "lake_build_minirust_spec", base_env={"PATH": "/usr/bin"}, cmd=excl_cmd, cwd=root
+                )
+                self.assertNotIn("LEAN_NUM_THREADS", excl_env)
+
+            # End-to-end against real `scripts/anneal-lean-run` on a synthetic 3-slot host
+            # (`w_file=3`, 24 GiB host RAM -> 18 GiB slice: w_eff=1 gives 16.2 GiB >= 10 GiB,
+            # while runtime w_eff=3 gives 5.4 GiB < 10 GiB).
+            xdg = root / "xdg"
+            (xdg / "anneal").mkdir(parents=True)
+            (xdg / "anneal/concurrency").write_text("3\n", encoding="utf-8")
+            meminfo = root / "meminfo"
+            meminfo.write_text(
+                f"MemTotal:       {24576 * 1024} kB\nMemAvailable:   {22528 * 1024} kB\n",
+                encoding="utf-8",
+            )
+            real_shim = root / "real_host_bin/anneal-lean-run"
+            real_shim.parent.mkdir()
+            real_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import importlib.machinery, importlib.util, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                f"loader = importlib.machinery.SourceFileLoader('alr_ms', {os.fspath(REPO_ROOT / 'scripts/anneal-lean-run')!r})\n"
+                "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(mod)\n"
+                "orig = mod.probe_host_envelope\n"
+                f"mod.probe_host_envelope = lambda *a, **kw: orig(*a, meminfo_path=pathlib.Path({os.fspath(meminfo)!r}), "
+                f"cgroup_root=pathlib.Path({os.fspath(root / 'no_cg')!r}), proc_cgroup_path=pathlib.Path({os.fspath(root / 'no_proc_cg')!r}), "
+                "user_systemd_active=False, cpu_cores=24, **kw)\n"
+                "sys.exit(mod.main(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            real_shim.chmod(0o755)
+            real_cmd = [
+                os.fspath(real_shim),
+                "--mode",
+                "build",
+                "--concurrency",
+                "1",
+                "--timeout",
+                "1800",
+                "--",
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec",
+            ]
+            real_env = {"PATH": "/usr/bin", "XDG_CONFIG_HOME": os.fspath(xdg)}
+            real_cap = suite._probe_lean_run_memory_max_mib(real_cmd, env=real_env, cwd=root)
+            self.assertIsNotNone(real_cap)
+            assert real_cap is not None
+            self.assertLess(real_cap, suite.LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB)
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=22528):
+                step_env = suite._build_step_env(
+                    "lake_build_lean_miri_spec", base_env=real_env, cmd=real_cmd, cwd=root
+                )
+            self.assertEqual(step_env.get("LEAN_NUM_THREADS"), "1")
 
     def test_resolve_anneal_lean_run_anchors_relative_candidates(self) -> None:
         # Steps run with `cwd=repo_root`; a relative `ANNEAL_LEAN_RUN` or `PATH` entry that

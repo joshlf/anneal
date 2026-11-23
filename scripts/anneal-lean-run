@@ -904,12 +904,12 @@ def resolve_effective_concurrency(
         w_req = max(1, int(w_file)) if w_file is not None else 1
 
     if is_probe and cli_concurrency is not None:
-        w_eff = min(w_req, s_safe) if is_cg_capped else w_req
+        w_eff = 1 if exclusive else (min(w_req, s_safe) if is_cg_capped else w_req)
         if w_file is not None:
             w_host = min(max(1, int(w_file)), s_safe) if is_cg_capped else max(1, int(w_file))
             build_slots = w_host
         else:
-            build_slots = w_eff
+            build_slots = min(w_req, s_safe) if is_cg_capped else w_req
         return w_eff, build_slots
 
     if w_file is not None:

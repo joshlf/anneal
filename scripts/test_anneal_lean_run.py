@@ -2455,6 +2455,60 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                 self.assertEqual(cap2["concurrency"], 2)
                 self.assertEqual(cap2["build_slots"], 2)
 
+    def test_exclusive_probe_matches_execution_w_eff_with_cli_concurrency(self) -> None:
+        """`--exclusive` forces `w_eff = 1` in `--probe` just as in execution, even when
+        `--concurrency` (`cli_concurrency`) is also supplied, while preserving `build_slots`."""
+        for is_cg_capped, s_heavy_safe, w_file, cli_c, want_slots in (
+            (False, 4, None, 4, 4),
+            (False, 4, 3, 2, 3),
+            (True, 2, None, 4, 2),
+            (True, 2, 4, 3, 2),
+        ):
+            probe_res = alr.resolve_effective_concurrency(
+                is_cg_capped=is_cg_capped,
+                s_heavy_safe=s_heavy_safe,
+                w_file=w_file,
+                cli_concurrency=cli_c,
+                env_concurrency=None,
+                exclusive=True,
+                is_probe=True,
+            )
+            exec_res = alr.resolve_effective_concurrency(
+                is_cg_capped=is_cg_capped,
+                s_heavy_safe=s_heavy_safe,
+                w_file=w_file,
+                cli_concurrency=cli_c,
+                env_concurrency=None,
+                exclusive=True,
+                is_probe=False,
+            )
+            self.assertEqual(probe_res, (1, want_slots))
+            self.assertEqual(probe_res, exec_res)
+
+        probe_env = alr.compute_workload_memory_envelope(
+            cpu_cores=16,
+            mem_total_mb=32768,
+            mem_avail_mb=28672,
+            w_file=4,
+            cli_concurrency=4,
+            exclusive=True,
+            is_probe=True,
+            mode="build",
+        )
+        exec_env = alr.compute_workload_memory_envelope(
+            cpu_cores=16,
+            mem_total_mb=32768,
+            mem_avail_mb=28672,
+            w_file=4,
+            cli_concurrency=4,
+            exclusive=True,
+            is_probe=False,
+            mode="build",
+        )
+        self.assertEqual(probe_env["w_eff"], 1)
+        self.assertEqual(probe_env["build_slots"], 4)
+        self.assertEqual(probe_env["memory_max_mb"], exec_env["memory_max_mb"])
+
     def test_oom_retry_guard_blocks_watchdog_and_timeout(self) -> None:
         common = dict(
             rc=137,
