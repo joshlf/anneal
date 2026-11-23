@@ -28,9 +28,10 @@ fixed MIR model. It imports only `Init.*` modules of the Pass-1 foundation
 lock, so every MIR dialect (`V2026_06_01`, `V2026_08_01`, the candidate
 `MirModel`) can instantiate it without adding to the trusted base.
 
-1. **Step interface (`StepOutcome`, `MirWpOps`):** `MirWpOps State` bundles the
-   outcome and fault types of a machine with a monotone single-step weakest
-   precondition `stepWp`. `MirWpOps.ofDetStep` and `MirWpOps.ofChoiceStep`
+1. **Step interface (`StepOutcome`, `MirWpOps`):** `MirWpOps State Out Fault`
+   gives a machine with states `State`, outcomes `Out` and faults `Fault` a
+   monotone single-step weakest precondition `stepWp`; `Out` and `Fault` are
+   determined by `State`. `MirWpOps.ofDetStep` and `MirWpOps.ofChoiceStep`
    build instances from a deterministic step function and from a
    `valid`-quantified nondeterministic one; any other monotone `stepWp` (for
    example a coalgebraic interaction-tree node) is an instance as well.
@@ -526,6 +527,36 @@ theorem wpUntil_idem_iff {stop : State → Prop} {onDone : Out → Prop}
       wpUntil stop onDone onFault s :=
   ⟨fun h => wpUntil_bind h (fun _ h' => h'), fun h => .here h⟩
 
+/-- Induction principle for `wpUntil` in least-fixed-point form: a predicate
+that contains every `stop` state and is closed under one backward step
+contains every state that satisfies `wpUntil stop`. It hides the intermediate
+predicate of the `step` constructor, so it is the eliminator to use when a
+checkpoint proof is transported into another notion of convergence. -/
+theorem wpUntil_induction {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {C : State → Prop}
+    (hStop : ∀ s, stop s → C s)
+    (hStep : ∀ s, ops.stepWp s C onDone onFault → C s)
+    {s : State} (h : wpUntil stop onDone onFault s) : C s := by
+  induction h with
+  | here hs => exact hStop _ hs
+  | step mid hMidStep _ ih =>
+    exact hStep _
+      (ops.stepWp_mono ih (fun _ hq => hq) (fun _ hr => hr) hMidStep)
+
+/-- `wpUntil stop` is exactly the least predicate that contains `stop` and is
+closed under one backward step. The `step` constructor quantifies over an
+intermediate predicate only to stay strictly positive; this characterization
+shows that the result is the least fixed point of the direct recursive form
+`stop s ∨ stepWp s (wpUntil stop ..) ..`. -/
+theorem wpUntil_iff_forall_closed {stop : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State} :
+    wpUntil stop onDone onFault s ↔
+      ∀ C : State → Prop, (∀ s', stop s' → C s') →
+        (∀ s', ops.stepWp s' C onDone onFault → C s') → C s :=
+  ⟨fun h _ hStop hStep => wpUntil_induction hStop hStep h,
+   fun h => h (wpUntil stop onDone onFault) (fun _ hs => .here hs)
+     (fun _ hs => wpUntil_step hs)⟩
+
 /-- If no state satisfies `stop`, the execution must end through `onDone` or
 `onFault`, so a checkpoint proof for `stop` is a checkpoint proof for every
 other checkpoint. -/
@@ -612,6 +643,14 @@ theorem wpOutcome_unfold_iff {onDone : Out → Prop}
   · intro h
     exact wpOutcome_step h
 
+/-- Induction principle for `wpOutcome`: a predicate closed under one backward
+step contains every state whose executions all terminate as required. -/
+theorem wpOutcome_induction {onDone : Out → Prop} {onFault : Fault → Prop}
+    {C : State → Prop}
+    (hStep : ∀ s, ops.stepWp s C onDone onFault → C s)
+    {s : State} (h : wpOutcome onDone onFault s) : C s :=
+  wpUntil_induction (fun _ hf => False.elim hf) hStep h
+
 /-- Rule of consequence for `wpOutcome`. -/
 theorem wpOutcome_mono {onDone₁ onDone₂ : Out → Prop}
     {onFault₁ onFault₂ : Fault → Prop}
@@ -644,6 +683,27 @@ theorem wpUntilOk_to_wpStateOk {stop : State → Prop}
     (hK : ∀ s', stop s' → wpStateOk onDone s') :
     wpStateOk onDone s :=
   wpUntil_to_wpOutcome h hK
+
+/-- A pure reachability proof composes with any continuation: `wpReach` never
+terminates or faults before `mid`, so it places no demand on `onDone` and
+`onFault`. -/
+theorem wpReach_bind {mid stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
+    (h : wpReach mid s)
+    (hK : ∀ s', mid s' → wpUntil stop onDone onFault s') :
+    wpUntil stop onDone onFault s :=
+  wpUntil_bind
+    (wpUntil_mono (fun _ hs => hs) (fun _ hf => False.elim hf)
+      (fun _ hf => False.elim hf) h)
+    hK
+
+/-- Hand a pure reachability proof over to `wpOutcome`. -/
+theorem wpReach_to_wpOutcome {mid : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
+    (h : wpReach mid s)
+    (hK : ∀ s', mid s' → wpOutcome onDone onFault s') :
+    wpOutcome onDone onFault s :=
+  wpReach_bind h hK
 
 /-- Pair a checkpoint proof with a whole-execution proof over a conjunctive
 interface: the checkpoint carries the whole-execution obligation forward. -/
@@ -1274,6 +1334,50 @@ theorem wpOutcome_det_fault_inv {step : State → StepOutcome State Out Fault}
     (wpOutcome_unfold_iff (ops := MirWpOps.ofDetStep step tag)).mp h
   rw [hStep] at hr
   exact hr
+
+/-- Induction principle for a deterministic checkpoint proof, by cases on the
+step function: a predicate that contains every `stop` state, is closed
+backwards under `.step` transitions, and contains every state whose step
+terminates or faults as accepted, contains every state that satisfies
+`wpUntil stop`. Instantiating `C` with an external convergence predicate
+turns its single-step rules into a bridge from `wpUntil`. -/
+theorem wpUntil_det_induction {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {C : State → Prop}
+    (hStop : ∀ s, stop s → C s)
+    (hStep : ∀ s s', step s = .step s' → C s' → C s)
+    (hDone : ∀ s out, step s = .done out → onDone out → C s)
+    (hFault : ∀ s err, step s = .fault err → onFault err → C s)
+    {s : State}
+    (h : wpUntil (ops := MirWpOps.ofDetStep step tag) stop onDone onFault
+      s) :
+    C s := by
+  refine wpUntil_induction (ops := MirWpOps.ofDetStep step tag) hStop ?_ h
+  intro t hWp
+  have hWp' : (step t).wp C onDone onFault := hWp
+  cases hEv : step t with
+  | step t' =>
+    rw [hEv] at hWp'
+    exact hStep t t' hEv hWp'
+  | done out =>
+    rw [hEv] at hWp'
+    exact hDone t out hEv hWp'
+  | fault err =>
+    rw [hEv] at hWp'
+    exact hFault t err hEv hWp'
+
+/-- Induction principle for a deterministic whole-execution proof, by cases on
+the step function. -/
+theorem wpOutcome_det_induction {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {C : State → Prop}
+    (hStep : ∀ s s', step s = .step s' → C s' → C s)
+    (hDone : ∀ s out, step s = .done out → onDone out → C s)
+    (hFault : ∀ s err, step s = .fault err → onFault err → C s)
+    {s : State}
+    (h : wpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s) :
+    C s :=
+  wpUntil_det_induction (fun _ hf => False.elim hf) hStep hDone hFault h
 
 /-- With a single admissible choice `c₀` at every state, the
 `valid`-quantified interface and the deterministic interface of `step c₀`
@@ -2087,27 +2191,37 @@ constructor dot-notation (`.normal` / `.early`) without any wrapper. -/
 local instance earlyToyOpsInst : MirWpOps ToyState ToyOutcome Unit :=
   MirWpOps.ofDetStep earlyToyStep (fun s => some s.block)
 
-/-- Regression canary exercising `wpLoop_early_return` (both normal exit and
-mid-loop early exit) and constructor dot-notation on `outParam` `Out`. -/
+/-- Regression canary exercising `wpLoop_early_return` and constructor
+dot-notation on the `outParam` `Out`. The outcome is exact for every `n`: a
+count of at most `5` (including the zero-trip loop `n = 0`) finishes normally
+with `n`, and every larger count takes the early return with `5`. The
+postcondition is not a bare disjunction, so a machine that took the wrong exit
+would not satisfy it. -/
 theorem earlyToy_spec (n : Nat) :
-    wpStateOk (fun out => out = .normal n ∨ out = .early 5)
+    wpStateOk
+      (fun out => (n ≤ 5 ∧ out = .normal n) ∨ (5 < n ∧ out = .early 5))
       ({ block := 0, i := n, acc := 0 } : ToyState) := by
   refine wpLoop_early_return (r := fun a b : Nat => a < b) Nat.lt_wfRel.wf
-    (Inv := fun k s => s.block = 0 ∧ s.i = k ∧ s.acc + k = n)
-    (normalExit := fun s => s.block = 0 ∧ s.i = 0 ∧ s.acc = n)
-    (earlyClean := fun s => s.block = 2 ∧ s.acc = 5)
+    (Inv := fun k s => s.block = 0 ∧ s.i = k ∧ s.acc + k = n ∧ s.acc ≤ 5)
+    (normalExit := fun s => s.block = 0 ∧ s.i = 0 ∧ s.acc = n ∧ n ≤ 5)
+    (earlyClean := fun s => s.block = 2 ∧ s.acc = 5 ∧ 5 < n)
     ?_ ?_ ?_ n ({ block := 0, i := n, acc := 0 } : ToyState)
-    ⟨rfl, rfl, Nat.zero_add n⟩
+    ⟨rfl, rfl, Nat.zero_add n, Nat.zero_le 5⟩
   · intro k s hInv
     cases s with
     | mk block i acc =>
       have hB : block = 0 := hInv.1
       have hI : i = k := hInv.2.1
-      have hSum : acc + k = n := hInv.2.2
+      have hSum : acc + k = n := hInv.2.2.1
+      have hLe : acc ≤ 5 := hInv.2.2.2
       subst hB
       subst hI
       cases i with
-      | zero => exact Or.inl ⟨rfl, rfl, hSum⟩
+      | zero =>
+        have hAcc : acc = n := hSum
+        refine Or.inl ⟨rfl, rfl, hAcc, ?_⟩
+        rw [← hAcc]
+        exact hLe
       | succ j =>
         refine Or.inr (Or.inr ?_)
         cases hEq : Nat.beq acc 5 with
@@ -2117,45 +2231,81 @@ theorem earlyToy_spec (n : Nat) :
               .step { block := 2, i := j + 1, acc := acc } := by
             unfold earlyToyStep
             change (match Nat.beq acc 5 with
-              | true => (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
+              | true =>
+                (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
                   StepOutcome ToyState ToyOutcome Unit)
-              | false => StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
+              | false =>
+                StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
             rw [hEq]
+          have hLt : 5 < n := by
+            rw [← hSum, hAcc5]
+            exact Nat.lt_add_of_pos_right (Nat.succ_pos j)
           exact wpUntil_det_step_eq (step := earlyToyStep) hStep
-            (wpUntil_here (Or.inr (Or.inl ⟨rfl, hAcc5⟩)))
+            (wpUntil_here (Or.inr (Or.inl ⟨rfl, hAcc5, hLt⟩)))
         | false =>
           have hStep1 : earlyToyStep { block := 0, i := j + 1, acc := acc } =
               .step { block := 1, i := j + 1, acc := acc } := by
             unfold earlyToyStep
             change (match Nat.beq acc 5 with
-              | true => (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
+              | true =>
+                (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
                   StepOutcome ToyState ToyOutcome Unit)
-              | false => StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
+              | false =>
+                StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
             rw [hEq]
-          refine wpUntil_det_step_eq (step := earlyToyStep) hStep1
+          have hLe' : acc + 1 ≤ 5 :=
+            Nat.lt_of_le_of_ne hLe (Nat.ne_of_beq_eq_false hEq)
+          have hSum' : acc + 1 + j = n := by
+            rw [Nat.add_assoc, Nat.add_comm 1 j]
+            exact hSum
+          exact wpUntil_det_step_eq (step := earlyToyStep) hStep1
             (wpUntil_det_step_eq (step := earlyToyStep)
               (s' := { block := 0, i := j, acc := acc + 1 }) rfl
-              (wpUntil_here (Or.inr (Or.inr ⟨j, Nat.lt_succ_self j, rfl, rfl, ?_⟩))))
-          rw [Nat.add_assoc, Nat.add_comm 1 j]
-          exact hSum
+              (wpUntil_here (Or.inr (Or.inr
+                ⟨j, Nat.lt_succ_self j, rfl, rfl, hSum', hLe'⟩))))
   · intro s hN
     cases s with
     | mk block i acc =>
       have hB : block = 0 := hN.1
       have hI : i = 0 := hN.2.1
-      have hA : acc = n := hN.2.2
+      have hA : acc = n := hN.2.2.1
       subst hB
       subst hI
-      exact wpOutcome_det_done_eq (step := earlyToyStep) (out := .normal acc) rfl
-        (Or.inl (congrArg ToyOutcome.normal hA))
+      exact wpOutcome_det_done_eq (step := earlyToyStep)
+        (out := .normal acc) rfl
+        (Or.inl ⟨hN.2.2.2, congrArg ToyOutcome.normal hA⟩)
   · intro s hE
     cases s with
     | mk block i acc =>
       have hB : block = 2 := hE.1
-      have hA : acc = 5 := hE.2
+      have hA : acc = 5 := hE.2.1
       subst hB
-      exact wpOutcome_det_done_eq (step := earlyToyStep) (out := .early acc) rfl
-        (Or.inr (congrArg ToyOutcome.early hA))
+      exact wpOutcome_det_done_eq (step := earlyToyStep)
+        (out := .early acc) rfl
+        (Or.inr ⟨hE.2.2, congrArg ToyOutcome.early hA⟩)
+
+/-- The two exits of the canary machine are distinguished by the exact
+outcome: the zero-trip loop and a three-trip loop finish normally, and a
+seven-trip loop takes the early return after five trips. -/
+theorem earlyToy_exits_canary :
+    wpStateOk (fun out => out = .normal 0)
+      ({ block := 0, i := 0, acc := 0 } : ToyState) ∧
+    wpStateOk (fun out => out = .normal 3)
+      ({ block := 0, i := 3, acc := 0 } : ToyState) ∧
+    wpStateOk (fun out => out = .early 5)
+      ({ block := 0, i := 7, acc := 0 } : ToyState) :=
+  ⟨wpOutcome_mono
+      (fun _ h => h.elim (fun hN => hN.2)
+        (fun hE => absurd hE.1 (Nat.not_lt_zero 5)))
+      (fun _ hf => hf) (earlyToy_spec 0),
+    wpOutcome_mono
+      (fun _ h => h.elim (fun hN => hN.2)
+        (fun hE => absurd hE.1 (by decide)))
+      (fun _ hf => hf) (earlyToy_spec 3),
+    wpOutcome_mono
+      (fun _ h => h.elim (fun hN => absurd hN.1 (by decide))
+        (fun hE => hE.2))
+      (fun _ hf => hf) (earlyToy_spec 7)⟩
 
 end EarlyToyCanary
 

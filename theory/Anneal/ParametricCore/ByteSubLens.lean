@@ -538,6 +538,38 @@ def tableReplace (view : AllocView A Byte) (aNew : A) (allocs : List A) :
         | false => a :: ih rest)
     allocs.length allocs
 
+/-- `tableFind` on the empty table. -/
+theorem tableFind_nil (view : AllocView A Byte) (id : Nat) :
+    tableFind view id ([] : List A) = none :=
+  rfl
+
+/-- Recursion equation of `tableFind` on a non-empty table. -/
+theorem tableFind_cons (view : AllocView A Byte) (id : Nat) (a : A)
+    (rest : List A) :
+    tableFind view id (a :: rest) =
+      match Nat.beq (view.allocId a) id with
+      | true => some a
+      | false => tableFind view id rest :=
+  rfl
+
+/-- `tableFind` is the only function that satisfies its two recursion
+equations. A first-match allocation lookup that a memory model defines by
+structural recursion (`find [] id = none`, and on `a :: rest` return `a` when
+`Nat.beq` matches its identifier and recurse otherwise) is therefore
+`tableFind`, with both hypotheses closed by `rfl`. -/
+theorem tableFind_eq_of_rec {view : AllocView A Byte}
+    (find : List A → Nat → Option A)
+    (hNil : ∀ id, find [] id = none)
+    (hCons : ∀ a rest id, find (a :: rest) id =
+      match Nat.beq (view.allocId a) id with
+      | true => some a
+      | false => find rest id) :
+    ∀ (allocs : List A) (id : Nat), find allocs id = tableFind view id allocs
+  | [], id => hNil id
+  | a :: rest, id => by
+    rw [hCons a rest id, tableFind_cons view id a rest,
+      tableFind_eq_of_rec find hNil hCons rest id]
+
 /-- `tableFind` on a table whose head has the requested identifier. -/
 theorem tableFind_cons_of_beq {view : AllocView A Byte} {id : Nat} {a : A}
     {rest : List A} (h : Nat.beq (view.allocId a) id = true) :
@@ -1378,18 +1410,41 @@ theorem ofTable_write_of {m : Mem} {id off : Nat} {bs : List Byte}
 
 /-- Auxiliary-field preservation for `ByteStoreOps.ofTable`: any projection
 `proj` untouched by `setTable` (for example a Tree Borrows table `borrows` or
-`activeProtectors`) is preserved across every store write. -/
+`activeProtectors`) is preserved across every store write. The write
+hypothesis comes before `hProj` so that it fixes `setTable` before `hProj` is
+elaborated (`fun _ _ => rfl` alone would not determine it). -/
 theorem ofTable_write_preserves_proj {V : Sort y} (proj : Mem → V)
-    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m)
     {m m' : Mem} {id off : Nat} {bs : List Byte}
     (h : (ByteStoreOps.ofTable view getTable setTable).writeBytes? m id off
-      bs = some m') :
+      bs = some m')
+    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
     proj m' = proj m := by
   let ⟨t, _, hM⟩ := ofTable_write_inv h
   rw [hM]
   exact hProj m t
 
 end OfTable
+
+/-- A projection `proj` of the memory is preserved by every successful write
+of the byte store: a write changes bytes and nothing that `proj` reads. This
+is how state that sits next to the bytes (a borrow table, a call stack, an
+allocation counter) is framed across lens writes, mutation summaries and
+summary chains, for any byte store. -/
+def ByteStoreOps.WritePreserves {Mem : Type u} {Addr : Type v}
+    {Byte : Type w} (ops : ByteStoreOps Mem Addr Byte) {V : Sort y}
+    (proj : Mem → V) : Prop :=
+  ∀ (m m' : Mem) (a : Addr) (off : Nat) (bs : List Byte),
+    ops.writeBytes? m a off bs = some m' → proj m' = proj m
+
+/-- A table-backed byte store preserves every projection that `setTable` does
+not change. -/
+theorem ByteStoreOps.ofTable_writePreserves {Mem : Type u} {A : Type x}
+    {Byte : Type w} {V : Sort y} (view : AllocView A Byte)
+    (getTable : Mem → List A) (setTable : Mem → List A → Mem)
+    (proj : Mem → V)
+    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
+    (ByteStoreOps.ofTable view getTable setTable).WritePreserves proj :=
+  fun _ _ _ _ _ h => ofTable_write_preserves_proj proj h hProj
 
 /-- `ByteStoreOps.ofTable` is lawful for every lawful allocation view and
 every lawful table lens `getTable` / `setTable`. Allocation identifiers need
@@ -1872,18 +1927,27 @@ theorem zoom_set_isSome_of_get {L : ByteSubLens Addr} {m : Mem}
 
 end Ops
 
+/-- A lens write preserves every projection that store writes preserve. -/
+theorem set_preserves [ops : ByteStoreOps Mem Addr Byte] {V : Sort y}
+    {proj : Mem → V} (hPres : ops.WritePreserves proj)
+    {L : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (h : L.set m bs = some m') : proj m' = proj m :=
+  hPres m m' L.addr L.offset bs (set_inv h).2.2
+
 /-- Auxiliary-field preservation for `ByteSubLens.set` over
-`ByteStoreOps.ofTable`. -/
+`ByteStoreOps.ofTable`. The write hypothesis comes before `hProj` so that it
+fixes `setTable` first. -/
 theorem ofTable_set_preserves_proj {A : Type x} {V : Sort y}
     {view : AllocView A Byte} {getTable : Mem → List A}
     {setTable : Mem → List A → Mem} (proj : Mem → V)
-    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m)
     {L : ByteSubLens Nat} {m m' : Mem} {bs : List Byte}
     (h : L.set (ops := ByteStoreOps.ofTable view getTable setTable) m bs =
-      some m') :
+      some m')
+    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
     proj m' = proj m :=
-  ofTable_write_preserves_proj proj hProj
+  ofTable_write_preserves_proj proj
     (set_inv (ops := ByteStoreOps.ofTable view getTable setTable) h).2.2
+    hProj
 
 /-- Separation is symmetric. -/
 theorem Separated.symm {L₁ L₂ : ByteSubLens Addr} (h : L₁.Separated L₂) :
@@ -2755,21 +2819,33 @@ theorem execMutSummary_comm_disjoint {Arg₂ : Type a} {Ret₂ : Type b}
 
 end Summary
 
+/-- A summary execution preserves every projection that store writes
+preserve. -/
+theorem execMutSummary_preserves {Mem : Type u} {Addr : Type v}
+    {Byte : Type w} [ops : ByteStoreOps Mem Addr Byte] {Arg : Type a}
+    {Ret : Type b} {V : Sort y} {proj : Mem → V}
+    (hPres : ops.WritePreserves proj) {sum : MutSummary Byte Arg Ret}
+    {L : ByteSubLens Addr} {m m' : Mem} {arg : Arg} {ret : Ret}
+    (h : execMutSummary sum L m arg = some (m', ret)) : proj m' = proj m := by
+  let ⟨_, _, _, _, _, hSet⟩ := execMutSummary_inv h
+  exact ByteSubLens.set_preserves hPres hSet
+
 /-- Auxiliary-field preservation for `execMutSummary` over
-`ByteStoreOps.ofTable`. -/
+`ByteStoreOps.ofTable`. The execution hypothesis comes before `hProj` so that
+it fixes `setTable` first. -/
 theorem ofTable_execMutSummary_preserves_proj {Mem : Type u} {A : Type x}
     {Byte : Type w} {Arg : Type a} {Ret : Type b} {V : Sort y}
     {view : AllocView A Byte} {getTable : Mem → List A}
     {setTable : Mem → List A → Mem} (proj : Mem → V)
-    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m)
     {sum : MutSummary Byte Arg Ret} {L : ByteSubLens Nat}
     {m m' : Mem} {arg : Arg} {ret : Ret}
     (h : execMutSummary (ops := ByteStoreOps.ofTable view getTable setTable)
-      sum L m arg = some (m', ret)) :
-    proj m' = proj m := by
-  let ⟨_, _, _, _, _, hSet⟩ :=
-    execMutSummary_inv (ops := ByteStoreOps.ofTable view getTable setTable) h
-  exact ByteSubLens.ofTable_set_preserves_proj proj hProj hSet
+      sum L m arg = some (m', ret))
+    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
+    proj m' = proj m :=
+  execMutSummary_preserves
+    (ops := ByteStoreOps.ofTable view getTable setTable)
+    (ByteStoreOps.ofTable_writePreserves view getTable setTable proj hProj) h
 
 section Realization
 
@@ -3139,19 +3215,15 @@ theorem execMutSummaryChain_frame_getLe_disjoint
 
 end Chain
 
-/-- Auxiliary-field preservation for `execMutSummaryChain` over
-`ByteStoreOps.ofTable` (for example preserving `Memory.borrows` across an
-entire `N`-call mutation chain). -/
-theorem ofTable_execMutSummaryChain_preserves_proj {Mem : Type u} {A : Type x}
-    {Byte : Type w} {Arg : Type a} {Ret : Type b} {V : Sort y}
-    {view : AllocView A Byte} {getTable : Mem → List A}
-    {setTable : Mem → List A → Mem} (proj : Mem → V)
-    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m)
-    (calls : List (MutSummaryCall Byte Nat Arg Ret)) {m m' : Mem}
+/-- A summary chain preserves every projection that store writes preserve,
+whatever lenses the `N` calls mutate. -/
+theorem execMutSummaryChain_preserves {Mem : Type u} {Addr : Type v}
+    {Byte : Type w} [ops : ByteStoreOps Mem Addr Byte] {Arg : Type a}
+    {Ret : Type b} {V : Sort y} {proj : Mem → V}
+    (hPres : ops.WritePreserves proj)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
     {rets : List Ret}
-    (h : execMutSummaryChain
-      (ops := ByteStoreOps.ofTable view getTable setTable) calls m =
-      some (m', rets)) :
+    (h : execMutSummaryChain calls m = some (m', rets)) :
     proj m' = proj m := by
   induction calls generalizing m rets with
   | nil =>
@@ -3159,11 +3231,28 @@ theorem ofTable_execMutSummaryChain_preserves_proj {Mem : Type u} {A : Type x}
     have hM : m = m' := congrArg Prod.fst hPair
     rw [← hM]
   | cons call rest ih =>
-    let ⟨m₁, r, rs, hStep, hRest, _⟩ :=
-      execMutSummaryChain_cons_inv
-        (ops := ByteStoreOps.ofTable view getTable setTable) h
-    exact (ih hRest).trans
-      (ofTable_execMutSummary_preserves_proj proj hProj hStep)
+    let ⟨m₁, r, rs, hStep, hRest, _⟩ := execMutSummaryChain_cons_inv h
+    exact (ih hRest).trans (execMutSummary_preserves hPres hStep)
+
+/-- Auxiliary-field preservation for `execMutSummaryChain` over
+`ByteStoreOps.ofTable` (for example preserving `Memory.borrows` across an
+entire `N`-call mutation chain). The chain hypothesis comes before `hProj` so
+that it fixes `setTable` first. -/
+theorem ofTable_execMutSummaryChain_preserves_proj {Mem : Type u} {A : Type x}
+    {Byte : Type w} {Arg : Type a} {Ret : Type b} {V : Sort y}
+    {view : AllocView A Byte} {getTable : Mem → List A}
+    {setTable : Mem → List A → Mem} (proj : Mem → V)
+    (calls : List (MutSummaryCall Byte Nat Arg Ret)) {m m' : Mem}
+    {rets : List Ret}
+    (h : execMutSummaryChain
+      (ops := ByteStoreOps.ofTable view getTable setTable) calls m =
+      some (m', rets))
+    (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
+    proj m' = proj m :=
+  execMutSummaryChain_preserves
+    (ops := ByteStoreOps.ofTable view getTable setTable)
+    (ByteStoreOps.ofTable_writePreserves view getTable setTable proj hProj)
+    calls h
 
 section CertifiedChain
 
@@ -3338,6 +3427,123 @@ theorem execMutSummaryChain_certified_sound
       rw [hMem]
       exact hHead
     exact (apply_mutSummaryCut_sound hAll.1 hEnt hHead').1
+
+/-- Linked precondition of a chain of in-machine calls (`List.foldr`, `0`
+`._unsafe_rec`): the state `s` is an entry state of the first call, and every
+exit state of a call is an entry state of the next one. After the last call
+`post` holds of the return values in call order and the final state.
+
+The continuation of each call may use the result `(m₁, r)` of the summary on
+the entry memory and that the exit state has memory `m₁`. -/
+def MutSummaryChainLinked (memOf : State → Mem)
+    (atEntry : ByteSubLens Addr → Arg → State → Prop)
+    (atExit : Ret → State → State → Prop)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) :
+    (List Ret → State → Prop) → State → Prop :=
+  List.foldr
+    (fun (call : MutSummaryCall Byte Addr Arg Ret)
+        (acc : (List Ret → State → Prop) → State → Prop)
+        (post : List Ret → State → Prop) (s : State) =>
+      atEntry call.lens call.arg s ∧
+        ∀ (m₁ : Mem) (r : Ret) (s' : State),
+          execMutSummary call.sum call.lens (memOf s) call.arg =
+            some (m₁, r) →
+          memOf s' = m₁ → atExit r s s' →
+          acc (fun rs => post (r :: rs)) s')
+    (fun post s => post [] s) calls
+
+omit [LawfulByteStoreOps Mem Addr Byte] in
+/-- The linked precondition of the empty chain is the postcondition. -/
+theorem mutSummaryChainLinked_nil_iff {memOf : State → Mem}
+    {atEntry : ByteSubLens Addr → Arg → State → Prop}
+    {atExit : Ret → State → State → Prop}
+    {post : List Ret → State → Prop} {s : State} :
+    MutSummaryChainLinked (ops := ops) memOf atEntry atExit
+      ([] : List (MutSummaryCall Byte Addr Arg Ret)) post s ↔ post [] s :=
+  Iff.rfl
+
+omit [LawfulByteStoreOps Mem Addr Byte] in
+/-- The linked precondition of a non-empty chain: entry of the first call and
+the linked precondition of the rest from every exit state. -/
+theorem mutSummaryChainLinked_cons_iff {memOf : State → Mem}
+    {atEntry : ByteSubLens Addr → Arg → State → Prop}
+    {atExit : Ret → State → State → Prop}
+    {call : MutSummaryCall Byte Addr Arg Ret}
+    {rest : List (MutSummaryCall Byte Addr Arg Ret)}
+    {post : List Ret → State → Prop} {s : State} :
+    MutSummaryChainLinked (ops := ops) memOf atEntry atExit (call :: rest)
+        post s ↔
+      (atEntry call.lens call.arg s ∧
+        ∀ (m₁ : Mem) (r : Ret) (s' : State),
+          execMutSummary call.sum call.lens (memOf s) call.arg =
+            some (m₁, r) →
+          memOf s' = m₁ → atExit r s s' →
+          MutSummaryChainLinked (ops := ops) memOf atEntry atExit rest
+            (fun rs => post (r :: rs)) s') :=
+  Iff.rfl
+
+/-- Sequential soundness of a chain of sealed `MutSummaryCut` calls inside one
+machine. If every call is backed by a cut, the calls are linked from `s`, and
+the computable `execMutSummaryChain` returns `some (mOut, rets)` on the entry
+memory (for example by `rfl`), then the machine runs from `s` through all `N`
+calls, one after the other, to a state with memory `mOut` satisfying `post` of
+the return values. This is a single `wpReach` for the whole chain; no callee
+is unfolded. -/
+theorem execMutSummaryChain_wpReach
+    {memOf : State → Mem}
+    {atEntry : ByteSubLens Addr → Arg → State → Prop}
+    {atExit : Ret → State → State → Prop}
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) :
+    ∀ {post : List Ret → State → Prop} {s : State} {mOut : Mem}
+      {rets : List Ret},
+      AllMutSummaryCuts (wops := wops) (ops := ops)
+        memOf atEntry atExit calls →
+      MutSummaryChainLinked (ops := ops) memOf atEntry atExit calls post s →
+      execMutSummaryChain calls (memOf s) = some (mOut, rets) →
+      wpReach (ops := wops) (fun s' => memOf s' = mOut ∧ post rets s') s := by
+  induction calls with
+  | nil =>
+    intro post s mOut rets _ hLinked hChain
+    have hPair : (memOf s, ([] : List Ret)) = (mOut, rets) :=
+      Option.some.inj hChain
+    have hM : memOf s = mOut := congrArg Prod.fst hPair
+    have hR : ([] : List Ret) = rets := congrArg Prod.snd hPair
+    rw [← hR]
+    exact wpUntil_here (ops := wops) ⟨hM, hLinked⟩
+  | cons call rest ih =>
+    intro post s mOut rets hAll hLinked hChain
+    let ⟨m₁, r, rs, hHead, hTail, hRets⟩ :=
+      execMutSummaryChain_cons_inv hChain
+    rw [hRets]
+    refine wpUntil_bind (ops := wops)
+      (apply_mutSummaryCut_sound hAll.1 hLinked.1 hHead).1 (fun s' hs' => ?_)
+    have hTail' : execMutSummaryChain rest (memOf s') = some (mOut, rs) := by
+      rw [hs'.1]
+      exact hTail
+    exact ih (post := fun rs => post (r :: rs)) (rets := rs) hAll.2
+      (hLinked.2 m₁ r s' hHead hs'.1 hs'.2) hTail'
+
+/-- Continuation form of `execMutSummaryChain_wpReach`: a caller that
+continues correctly from every state after the last call is correct from the
+entry state of the first call. -/
+theorem execMutSummaryChain_wpUntil
+    {memOf : State → Mem}
+    {atEntry : ByteSubLens Addr → Arg → State → Prop}
+    {atExit : Ret → State → State → Prop}
+    (calls : List (MutSummaryCall Byte Addr Arg Ret))
+    {post : List Ret → State → Prop} {s : State} {mOut : Mem}
+    {rets : List Ret} {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
+    (hAll : AllMutSummaryCuts (wops := wops) (ops := ops)
+      memOf atEntry atExit calls)
+    (hLinked : MutSummaryChainLinked (ops := ops) memOf atEntry atExit calls
+      post s)
+    (hChain : execMutSummaryChain calls (memOf s) = some (mOut, rets))
+    (hCont : ∀ s', memOf s' = mOut → post rets s' →
+      wpUntil stop onDone onFault s') :
+    wpUntil stop onDone onFault s :=
+  wpReach_bind (execMutSummaryChain_wpReach calls hAll hLinked hChain)
+    (fun s' hs' => hCont s' hs'.1 hs'.2)
 
 end CertifiedChain
 
@@ -3635,5 +3841,143 @@ theorem summaryToy_chain_certified_canary :
     allCallsDisjoint_of_natSeparatedBool canaryPayload calls rfl
   rw [hCert.2 canaryPayload hDisj]
   rfl
+
+/-- State of a toy caller that performs a queue of counter increments back to
+back inside one machine: the calls still to perform (lens and argument of
+each), the memory, and the return values so far, most recent first. -/
+structure SummaryQueueState where
+  /-- Calls still to perform. -/
+  pending : List (ByteSubLens Nat × Nat)
+  /-- Byte memory. -/
+  mem : SliceStore Nat
+  /-- Return values so far, most recent first. -/
+  rets : List Nat
+
+/-- One step of the queue machine: perform the first pending increment and
+record the old counter value, or finish with the return values when no call
+is pending. -/
+def summaryQueueStep (s : SummaryQueueState) :
+    StepOutcome SummaryQueueState (List Nat) Unit :=
+  match s.pending with
+  | [] => .done s.rets
+  | call :: rest =>
+    match call.1.get s.mem with
+    | some [b] =>
+      match call.1.set s.mem [b + call.2] with
+      | some m' => .step { pending := rest, mem := m', rets := b :: s.rets }
+      | none => .fault ()
+    | _ => .fault ()
+
+/-- Deterministic step interface of the queue machine. -/
+@[reducible] def summaryQueueOps :
+    MirWpOps SummaryQueueState (List Nat) Unit :=
+  MirWpOps.ofDetStep summaryQueueStep
+
+/-- Every pending call of the queue machine realizes `canaryIncSummary`: the
+exit state of a call has popped that call and pushed its return value, so it
+is the entry state of the next pending call. -/
+theorem summaryQueue_realizes :
+    CalleeRealizesMutSummary (wops := summaryQueueOps)
+      (fun s : SummaryQueueState => s.mem)
+      (fun L arg s => ∃ rest, s.pending = (L, arg) :: rest)
+      (fun ret s s' => s'.pending = s.pending.tail ∧ s'.rets = ret :: s.rets)
+      canaryIncSummary := by
+  intro L arg s old new ret hLen hEntry hGet hSum
+  cases s with
+  | mk pending mem rets =>
+    let ⟨rest, hPending⟩ := hEntry
+    have hP : pending = (L, arg) :: rest := hPending
+    subst hP
+    cases old with
+    | nil => cases hSum
+    | cons b tl =>
+      cases tl with
+      | cons _ _ => cases hSum
+      | nil =>
+        have hPair : ([b + arg], b) = (new, ret) := Option.some.inj hSum
+        have hNew : [b + arg] = new := congrArg Prod.fst hPair
+        have hRet : b = ret := congrArg Prod.snd hPair
+        have hNewLen : new.length = L.len := by
+          rw [← hNew, hLen]
+          rfl
+        let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get (L := L) (m := mem)
+          new hGet hNewLen
+        have hSet' : L.set mem [b + arg] = some m' := by
+          rw [hNew]
+          exact hSet
+        refine ⟨m', hSet, ?_⟩
+        have hStep : summaryQueueStep
+            { pending := (L, arg) :: rest, mem := mem, rets := rets } =
+            .step { pending := rest, mem := m', rets := b :: rets } := by
+          unfold summaryQueueStep
+          dsimp only
+          rw [hGet]
+          dsimp only
+          rw [hSet']
+        exact wpUntil_det_step_eq (step := summaryQueueStep) hStep
+          (wpUntil_here (ops := summaryQueueOps)
+            ⟨rfl, rfl, congrArg (fun r => r :: rets) hRet⟩)
+
+/-- The queue machine's calls sealed behind a `MutSummaryCut`. -/
+theorem summaryQueue_cut :
+    MutSummaryCut (wops := summaryQueueOps)
+      (fun s : SummaryQueueState => s.mem)
+      (fun L arg s => ∃ rest, s.pending = (L, arg) :: rest)
+      (fun ret s s' => s'.pending = s.pending.tail ∧ s'.rets = ret :: s.rets)
+      canaryIncSummary :=
+  seal_mutSummaryCut (wops := summaryQueueOps) summaryQueue_realizes
+
+/-- End-to-end sequential chain canary: one machine performs two sealed calls
+back to back. `execMutSummaryChain_wpReach` turns the chain evaluated by `rfl`
+into a single run from the first entry state to the state after the second
+call, with the twice-incremented store and both return values, without
+unfolding either call. -/
+theorem summaryQueue_chain_canary :
+    wpReach (ops := summaryQueueOps)
+      (fun s' => s'.mem = canaryStoreInc2 ∧ s'.pending = [] ∧
+        s'.rets = [2, 1])
+      { pending := [(ByteSubLens.mk 7 0 1, 5), (ByteSubLens.mk 7 1 1, 7)],
+        mem := canaryStore, rets := [] } := by
+  let calls : List (MutSummaryCall Nat Nat Nat Nat) :=
+    [{ sum := canaryIncSummary, lens := ByteSubLens.mk 7 0 1, arg := 5 },
+     { sum := canaryIncSummary, lens := ByteSubLens.mk 7 1 1, arg := 7 }]
+  have hCuts : AllMutSummaryCuts (wops := summaryQueueOps)
+      (fun s : SummaryQueueState => s.mem)
+      (fun L arg s => ∃ rest, s.pending = (L, arg) :: rest)
+      (fun ret s s' => s'.pending = s.pending.tail ∧ s'.rets = ret :: s.rets)
+      calls :=
+    ⟨summaryQueue_cut, summaryQueue_cut, True.intro⟩
+  have hExec : execMutSummaryChain calls canaryStore =
+      some (canaryStoreInc2, [1, 2]) := rfl
+  have hLinked : MutSummaryChainLinked
+      (fun s : SummaryQueueState => s.mem)
+      (fun L arg s => ∃ rest, s.pending = (L, arg) :: rest)
+      (fun ret s s' => s'.pending = s.pending.tail ∧ s'.rets = ret :: s.rets)
+      calls (fun rs s => s.pending = [] ∧ s.rets = rs.reverse)
+      { pending := [(ByteSubLens.mk 7 0 1, 5), (ByteSubLens.mk 7 1 1, 7)],
+        mem := canaryStore, rets := [] } :=
+    ⟨⟨_, rfl⟩, fun _ r₁ _ _ _ hExit₁ =>
+      ⟨⟨[], hExit₁.1⟩, fun _ r₂ _ _ _ hExit₂ =>
+        ⟨hExit₂.1.trans (congrArg List.tail hExit₁.1),
+          hExit₂.2.trans (congrArg (fun l => r₂ :: l) hExit₁.2)⟩⟩⟩
+  exact execMutSummaryChain_wpReach (wops := summaryQueueOps) calls hCuts
+    hLinked hExec
+
+/-- The queue machine then terminates with both return values: the chain run
+composes with the remaining execution through `wpReach_to_wpOutcome`. -/
+theorem summaryQueue_outcome_canary :
+    wpStateOk (ops := summaryQueueOps) (fun out => out = [2, 1])
+      { pending := [(ByteSubLens.mk 7 0 1, 5), (ByteSubLens.mk 7 1 1, 7)],
+        mem := canaryStore, rets := [] } :=
+  wpReach_to_wpOutcome (ops := summaryQueueOps) summaryQueue_chain_canary
+    (fun s' hs' => by
+      cases s' with
+      | mk pending mem rets =>
+        have hP : pending = [] := hs'.2.1
+        have hR : rets = [2, 1] := hs'.2.2
+        subst hP
+        subst hR
+        exact wpOutcome_det_done_eq (step := summaryQueueStep)
+          (out := [2, 1]) rfl rfl)
 
 end Anneal.ParametricCore

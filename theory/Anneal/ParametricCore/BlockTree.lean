@@ -2858,13 +2858,27 @@ theorem stepAt_chunk8BlockTree_eq {BB : Type u} {State : Sort v}
 `ptreeGetAt` and the `Chunk8` spine index with `Nat.div` and `Nat.mod`. The
 kernel evaluates these on numerals, but the elaborator's definitional
 unfolding only folds them when the argument is a closed numeral term: an index
-such as the block field of a state record that also holds symbolic values—or
-an incremented field `s.block + 1` produced across successive symbolic steps—is
-left stuck, and a `rfl` proof about a symbolic state fails before the kernel
-ever sees it. `natForceN layers` peels up to `layers` constructor steps of
-`Nat.succ` in `O(layers)` time (`O(1)` at `layers = 8`, so large indices such
-as `4096` never exhaust recursion depth while nested symbolic-record
-increments still normalize to closed numerals) before invoking `k`. -/
+such as the block field of a state record that also holds symbolic values, or
+an incremented field `s.block + 1` produced across successive symbolic steps,
+is left stuck, and a `rfl` proof about a symbolic state fails before the
+kernel ever sees it.
+
+`natForceN layers` peels up to `layers` `Nat.succ` constructors off the index
+by pattern matching, which is the only way to make the elaborator reduce such
+a term, and hands the rebuilt index to the lookup. Peeling a numeral leaves a
+numeral, so one layer is enough for an index that reduces to a literal (a jump
+target stored in the program). Every `+ 1` applied to a still-unreduced index
+costs one more layer: a run of `j` consecutive increment-only steps needs
+`j + 1` layers. The bound is what keeps the cost independent of the size of
+the index: peeling a literal such as `4096` all the way down would take `4096`
+steps per lookup.
+
+`natForce` fixes `layers = 64`. It therefore evaluates by `rfl` through up to
+`63` nested symbolic increments (`evalBlockTreeToCut_increment_chain_canary`)
+at a cost of at most `64` peeling steps per lookup, whatever the index. A
+longer run of increment-only steps on a symbolic state leaves the lookup
+stuck; it stays correct (`natForce_eq`), but the stage has to be split at an
+intermediate cutpoint or proved by `StepStageCut.step`. -/
 
 /-- Peels up to `layers` `Nat.succ` constructors off `n` in `O(layers)` steps
 and passes the reconstructed index to `k` (`0` `noncomputable`, `0`
@@ -2891,18 +2905,18 @@ theorem natForceN_eq {α : Sort u} (layers : Nat) :
     | zero => rfl
     | succ m => exact ih m (fun r => k (r + 1))
 
-/-- Reduces `n` through up to `8` `Nat.succ` layers to a numeral and passes it
-to `k`. Propositionally it is `k n` (`natForce_eq`); its purpose is to make
-`k` see a closed numeral during elaborator-level evaluation even across
-symbolic record projections and successive `+ 1` increments while staying
-`O(1)` on large literals (`≥ 4096`). -/
+/-- Reduces `n` through up to `64` `Nat.succ` layers to a numeral and passes
+it to `k`. Propositionally it is `k n` (`natForce_eq`); its purpose is to make
+`k` see a closed numeral during elaborator-level evaluation across symbolic
+record projections and up to `63` nested `+ 1` increments, at a cost bounded
+by `64` peeling steps even on large literals (`≥ 4096`). -/
 def natForce {α : Sort u} (n : Nat) (k : Nat → α) : α :=
-  natForceN 8 n k
+  natForceN 64 n k
 
 /-- `natForce n k` is `k n` (`0` axioms). -/
 theorem natForce_eq {α : Sort u} (n : Nat) (k : Nat → α) :
     natForce n k = k n :=
-  natForceN_eq 8 n k
+  natForceN_eq 64 n k
 
 /-- `BlockTree` lookup that forces its index to a numeral first. -/
 def BlockTree.lookupForced? {α : Type u} (bt : BlockTree α) (idx : Nat) :
@@ -3535,7 +3549,7 @@ theorem evalBlockTreeToCut_canary :
       stepWith (fun r => r) (fun s => s) cuts 8 3 = .halt 5 none :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- Symbolic-record increment canary: `natForce` (`natForceN 8`) reduces
+/-- Symbolic-record increment canary: `natForce` (`natForceN 64`) reduces
 successive `{ block := s.block + 1, payload := s.payload }` transitions and
 large indices (`4096`) by `rfl` even when the state record carries a symbolic
 field `x`. -/
@@ -3550,6 +3564,31 @@ theorem evalBlockTreeToCut_symbolic_increment_canary (x : Nat) :
       .cut (4, x) ∧
     (Chunk8BlockTree.tabulate 10 (fun i => some i)).lookupForced?
       ((4092, x).1 + 1 + 1 + 1 + 1) = some 4096 :=
+  ⟨rfl, rfl⟩
+
+/-- Increment-chain canary: a straight-line run of twelve increment-only
+steps on a state with a symbolic field evaluates by `rfl`. After `j` steps the
+block index is the unreduced term `(0, x).1 + 1 + ... + 1` with `j`
+increments, so the lookup of step `j` needs `j + 1` forcing layers; eight
+layers stop at the eighth step, `natForce` covers `63`. The last conjunct
+looks up an index carrying `40` nested increments. -/
+theorem evalBlockTreeToCut_increment_chain_canary (x : Nat) :
+    let bt := BlockTree.ofList
+      [true, true, true, true, true, true, true, true, true, true, true, true,
+        false]
+    let stepWith := fun (look : Nat → Option Bool) (s : Nat × Nat) =>
+      match look s.1 with
+      | some true => some (s.1 + 1, s.2)
+      | _ => none
+    let cuts := MaskTree.ofList
+      [false, false, false, false, false, false, false, false, false, false,
+        false, false, true]
+    evalBlockTreeToCut bt stepWith (fun r => r) Prod.fst cuts 20 (0, x) =
+      .cut (12, x) ∧
+    (Chunk8BlockTree.tabulate 10 (fun i => some i)).lookupForced?
+      ((0, x).1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+        + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+        + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1) = some 40 :=
   ⟨rfl, rfl⟩
 
 end Anneal.ParametricCore
