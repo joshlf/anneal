@@ -1115,11 +1115,15 @@ def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
 def hasNativeDecideTokens (toks : List String) : Bool :=
   hasNativeDecideTokensChars (toks.map String.toList)
 
-/-- Metaprogramming execution keywords banned unconditionally (`TrustedBoundary.inspectSyntax` L108). -/
+/--
+Metaprogramming execution keywords banned unconditionally. `TrustedBoundary.inspectSyntax` L108
+bans the term `by_elab` and the tactic `run_tac` by syntax kind; the three commands `run_cmd`,
+`run_elab`, `run_meta` (`Init/Notation.lean` lines 750, 756, 764) are outside its command allow-list.
+-/
 def metaExecTokens : List (List Char) :=
-  ["by_elab".toList, "run_tac".toList, "run_cmd".toList, "run_meta".toList]
+  ["by_elab".toList, "run_tac".toList, "run_cmd".toList, "run_elab".toList, "run_meta".toList]
 
-/-- True iff `toks` invokes metaprogramming execution (`by_elab`, `run_tac`, `run_cmd`, `run_meta`). -/
+/-- True iff `toks` invokes metaprogramming execution (`by_elab`, `run_tac`, `run_cmd`, `run_elab`, `run_meta`). -/
 def hasMetaExecTokensChars (toks : List (List Char)) : Bool :=
   toks.any fun t => metaExecTokens.any fun kw => tokenHasKeyword kw t
 
@@ -6503,9 +6507,11 @@ def buildVerifyItemReports (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv
       | .ok tl => .ok (classifyVerifyItem pkg allEnv root axs :: tl)
 
 /--
-Check closure of a `.test` module declaration matching `TrustedBoundary.downstreamAudit` lines 420–442:
-bans `sorryAx`, native-reduction/compiler-trust axioms, `unsafe`/`partial` declarations, and any
-axiom outside foundational axioms and same-module file-local test axioms.
+Check closure of a `.test` module declaration, following `TrustedBoundary.downstreamAudit` lines
+420–442: bans `sorryAx`, `unsafe`/`partial` declarations, and any axiom outside foundational axioms
+and same-module file-local test axioms. It is STRICTER than the live code in one respect: it also
+bans native-reduction / compiler-trust axioms, whereas lines 436–440 accept every same-file axiom
+(the documented file-local-axioms policy), a same-file `_native` axiom included.
 -/
 def checkTestVisitedClosure (pkg : PackageAuditInput) (allEnv : KernelEnv)
     (modName rootName : SymName) : List SymName → Except AuditFailure Unit
@@ -11918,5 +11924,46 @@ theorem passA3_requireSources_and_meta_exec_scanner_hardened :
       .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") ∧
     scanProofSource "def run_command_name : Nat := 0" = .ok () := by
   refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Section 9.12: Pass-`B4` Regression Witnesses (`run_elab`, Source Withholding Under the Default Configuration) -/
+
+/--
+Regression (`run_elab`): `Init/Notation.lean` declares three sibling commands that run arbitrary
+elaborator code — `run_cmd` (line 750), `run_elab` (line 756), `run_meta` (line 764). Pass `A3`
+listed the first and the third.
+-/
+theorem sourceScanner_run_elab_rejected :
+    scanProofSource "run_elab do pure ()" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") ∧
+    scanProofSource "theorem t : True := trivial\nrun_elab\n  pure ()" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") ∧
+    scanProofSource "def run_elaborate : Nat := 0" = .ok () := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/-- A `.proof` module whose source text switches macro hygiene off. -/
+def sourceCarryingPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (sourceText? := some "set_option hygiene false\ntheorem cleanLemma : True := trivial"))
+
+/-- The same inventory with the source text simply left out. -/
+def sourceWithheldPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+
+/--
+Source withholding: `requireSources` is opt-in and `defaultUnconditionalConfig` leaves it off, so
+under the configuration used by the `V01`–`V18` suite an inventory that omits `sourceText?` skips
+the scanner altogether. The package rejected for `hygiene false` is ACCEPTED once its source is
+withheld, and is refused only when `requireSources` is switched on. Options that leave no
+extension, axiom, or kernel footprint (`hygiene false`, `quotPrecheck false`,
+`backward.privateInPublic`) are therefore checked only in that stricter mode; a production audit
+must not offer the permissive mode.
+-/
+theorem source_withholding_needs_requireSources :
+    auditAndReplayPackage defaultUnconditionalConfig sourceCarryingPkg =
+      .error (.forbiddenSourceOption topicProofModName "hygiene false") ∧
+    (auditAndReplayPackage defaultUnconditionalConfig sourceWithheldPkg).isOk = true ∧
+    auditAndReplayPackage requireSourcesConfig sourceWithheldPkg =
+      .error (.missingSourceText topicDefsModName) := by
+  refine ⟨rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditPrototype

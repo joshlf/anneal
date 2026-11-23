@@ -1374,4 +1374,40 @@ theorem passA3_extra_edges :
       .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
+/-! ## Section 10: Pass-`B4` Regression Suite (`run_elab`, Source Withholding Under the Default Configuration) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.sourceScanner_run_elab_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms sourceScanner_run_elab_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.source_withholding_needs_requireSources' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms source_withholding_needs_requireSources
+
+example := sourceScanner_run_elab_rejected
+example := source_withholding_needs_requireSources
+
+/--
+All five metaprogramming execution keywords are rejected in every role, including under
+`--provisional` in a `.proof` module; identifiers that merely start with them are not.
+-/
+theorem sourceScanner_meta_exec_edges :
+    SourceScanner.scanSourceDefenseInDepth provisionalConfig topicProofModName .proof
+        "run_elab pure ()" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") ∧
+    SourceScanner.scanSourceDefenseInDepth defaultUnconditionalConfig topicSpecModName .spec
+        "run_cmd pure ()" =
+      .error (.forbiddenSourceOption topicSpecModName "by_elab/run_tac/run_cmd") ∧
+    scanProofSource "-- run_elab in a comment\ndef s := \"run_meta in a string\"" = .ok () ∧
+    scanProofSource "def run_elab_count : Nat := 0" = .ok () ∧
+    scanProofSource "def x := Nat.run_elab" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") :=
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.ReplayKeyAndTamperAuditProtoTests
