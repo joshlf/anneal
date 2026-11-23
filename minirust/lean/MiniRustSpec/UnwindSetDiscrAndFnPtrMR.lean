@@ -67,6 +67,25 @@ Operational correspondence between Anneal's trusted MIR semantics
     multi-capture scalar/pointer closures relating Trusted `.aggregate 0 vals`
     to MiniRust `ValueExpr.Tuple` on `Mach` and `MachTB`, including
     left-to-right operand evaluation and dead/uninit upvar UB propagation.
+
+Next to the indirect call through a function pointer of `C8`,
+`dynDispatch_call_mach_and_machTB_witness` runs MiniRust's dynamic dispatch
+(`Terminator::Call` on `VTableMethodLookup(GetMetadata(self))`) end to end on
+`Mach` and `MachTB`, together with the UB of a receiver whose vtable-pointer
+metadata is invalid, and `dynPtr_memory_roundtrip_and_misaligned_place_witness`
+round-trips `*const dyn Trait` and `PtrType::VTablePtr` pointers through
+memory and shows the alignment UB of a trait-object place whose data pointer
+is misaligned for its vtable. `dynDispatch_safe_ref_receiver_call_return_witness`
+dispatches on a safe `&dyn Trait` receiver that is also passed to the callee,
+validated there at function entry, and released again on `Return`.
+`dynDispatch_same_trait_two_impls_polymorphism_witness` registers two
+implementations of one trait (different size, alignment, and methods) and runs
+one caller body on receivers that differ only in their vtable pointer.
+`dynDispatch_protector_conflict_and_mut_box_witness`,
+`dynDispatch_return_dynRef_valid_and_ub_witness`, and
+`dynDispatch_same_trait_vtable_cells_interior_mutability_witness` cover Tree
+Borrows protector conflicts, `&mut dyn`/`Box<dyn>` dynamic deallocation,
+returning `&dyn Trait`, and same-trait `vtable.cells` interior mutability.
 -/
 namespace MiniRustSpec.UnwindSetDiscrAndFnPtrMR
 set_option Elab.async false
@@ -3090,6 +3109,947 @@ theorem c8_capturing_closure_wide_and_unknown_tag_witness :
    eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel), eq_some_scalar_of_valAsScalar (by decide +kernel),
    ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel), rfl, ok_of_map_toOption (by decide +kernel), ok_stepTB_wfLive (by decide +kernel),
    rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ### Dynamic Dispatch: `Terminator::Call` on
+`VTableMethodLookup(GetMetadata(self))` (`Mach` & `MachTB`)
+
+MiniRust represents a dynamic call as a `Terminator::Call` whose callee is the
+value expression `VTableMethodLookup(GetMetadata(self))`
+(`spec/lang/syntax.md`, `spec/lang/step/operators.md`). Loading the receiver,
+a `*const dyn Trait` wide pointer, validates its vtable-pointer metadata with
+`Machine::vtable_from_ptr` and the trait check of `check_ptr`
+(`check_ptr_metadata`); `UnOp::GetMetadata` extracts the vtable pointer,
+`UnOp::VTableMethodLookup` resolves the method to a function pointer, and
+`Machine::fn_from_ptr` resolves that pointer to the callee. -/
+
+/-- Build a `BasicMemory` vtable allocation at `addr` (size 0, align 1), the
+allocation that `Machine::new` creates for each vtable. -/
+def mkVTableAlloc (addr : Int) : Gen.Allocation :=
+  { addr, data := [], align := ⟨1⟩, kind := .VTable, live := true, extra := () }
+
+/-- The trait method that `dynDispatchVTable` implements. -/
+@[reducible] def dynDispatchMethod : Gen.TraitMethodName := ⟨⟨0⟩⟩
+
+/-- A vtable for trait `0` (size `4`, alignment `4`) that implements
+`dynDispatchMethod` with function `1`. -/
+def dynDispatchVTable : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- The callee of the dynamic call: it writes `77` to its `u32` return local. -/
+def dynDispatchCallee : Gen.Function := mkMrFn [(localName 0, u32MrTy)] [] (localName 0)
+  [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int 77) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller: local `1` holds the receiver, a `*const dyn Trait` wide pointer
+for trait `ptrTrait`, and the callee of its call is
+`VTableMethodLookup(GetMetadata(self))` on that receiver. -/
+def dynDispatchCaller (ptrTrait : Nat) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, wideDynPtrMrTy ptrTrait)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [] (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run the dynamic call. Allocation `0` is
+function `1` (at `4096`), `1` the caller's `u32` return local, `2` the receiver
+local, which holds the data pointer `128` and the vtable pointer `vtAddr`, and
+`3` the vtable of trait `0`, which is registered at `8192`. -/
+def dynDispatchMach (vtAddr ptrTrait : Nat) : Mach :=
+  let caller := dynDispatchCaller ptrTrait
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, dynDispatchCallee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 128 (some (⟨1⟩, ())) ++ ptrBytes vtAddr (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Concrete dynamic-dispatch witness on `Mach` and `MachTB`. With the
+registered vtable pointer as receiver metadata, the three steps `Call`, the
+callee's assignment, and `Return` run the vtable's method: the callee's `77`
+arrives in the caller's return local (and `MachTB.wfLive` is preserved). A
+receiver whose metadata is not the address of a vtable (`9000`), or is the
+vtable of another trait (the receiver type names trait `1`), is UB as soon as
+the receiver is loaded (`Machine::vtable_from_ptr`, respectively the trait
+check of `check_ptr`). -/
+theorem dynDispatch_call_mach_and_machTB_witness :
+    (∃ m3, Interp.steps 3 (dynDispatchMach 8192 0) = .ok m3 ∧
+      m3.mem.memory.allocations[1]?.map (·.data) = some (scalarBytes u32 77)) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB (dynDispatchMach 8192 0)) = .ok m3 ∧ MachTB.wfLive m3 ∧
+      m3.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 77).map (projByteTB ∘ liftByteTB))) ∧
+    Interp.steps 1 (dynDispatchMach 9000 0) = .error (.ub "invalid pointer for vtable lookup") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynDispatchMach 9000 0)) =
+      .error (.ub "invalid pointer for vtable lookup") ∧
+    Interp.steps 1 (dynDispatchMach 8192 1) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynDispatchMach 8192 1)) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Trait-Object Pointers in Memory and Dynamically Aligned Places
+(`Mach` & `MachTB`)
+
+`Machine::typed_load` and `Machine::typed_store` (`Type::decode` and
+`Type::encode`) round-trip a wide `*const dyn Trait` pointer and a thin
+`PtrType::VTablePtr` pointer through memory, keeping the provenance of the
+data pointer and of the vtable pointer. `PlaceExpr::Deref` at
+`Type::TraitObject` computes the `aligned` flag of its place from the
+alignment recorded in the vtable (`Machine::compute_align`), so loading from a
+place whose data pointer is misaligned for that vtable is UB. -/
+
+/-- A function that runs `stmts` over two `*const dyn Trait` locals (`0` and
+`1`) and two `PtrType::VTablePtr` locals (`2` and `3`), all for trait `0`. -/
+def dynPlaceFn (stmts : List Gen.Statement) : Gen.Function :=
+  mkMrFn [(localName 0, wideDynPtrMrTy 0), (localName 1, wideDynPtrMrTy 0),
+      (localName 2, .Ptr (.VTablePtr (traitNameOf 0))),
+      (localName 3, .Ptr (.VTablePtr (traitNameOf 0)))]
+    [] (localName 0) [(bbName 0, ⟨stmts, .Return, .Regular⟩)]
+
+/-- The bytes of a `*const dyn Trait` pointer whose data pointer has address
+`dataAddr` (with the provenance of allocation `0`) and whose metadata is the
+registered vtable pointer (`8192`, allocation `4`). -/
+def dynPlaceWideBytes (dataAddr : Nat) : List Byte :=
+  ptrBytes dataAddr (some (⟨0⟩, ())) ++ ptrBytes 8192 (some (⟨4⟩, ()))
+
+/-- A `BasicMemory` machine about to run `stmts` in `dynPlaceFn`. Allocations
+`0` to `3` are the locals (local `1` holds `dynPlaceWideBytes dataAddr`), and
+`4` is the vtable of trait `0` (`dynDispatchVTable`: size `4`, alignment `4`),
+registered at `8192`. -/
+def dynPlaceMach (stmts : List Gen.Statement) (dataAddr : Nat) : Mach :=
+  let fn := dynPlaceFn stmts
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, fn)]⟩, start := fnName 0, globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨4⟩, ()) }
+  let base := mkMrMach prog
+    [mkStackAlloc 128 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 256 (dynPlaceWideBytes dataAddr) 8,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8, mkStackAlloc 512 (List.replicate 8 .Uninit) 8,
+     mkVTableAlloc 8192]
+    [mkRootFrame fn [(localName 0, { addr := 128, provenance := some (⟨0⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨1⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨2⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨3⟩, ()) })]]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Copy the wide pointer (`0 := load 1`), store the metadata of the copy as a
+thin vtable pointer (`2 := GetMetadata(load 0)`), and copy that
+(`3 := load 2`). -/
+def dynPlaceRoundTripStmts : List Gen.Statement :=
+  [.Assign (.Local (localName 0)) (.Load (.Local (localName 1))),
+   .Assign (.Local (localName 2)) (.UnOp .GetMetadata (.Load (.Local (localName 0)))),
+   .Assign (.Local (localName 3)) (.Load (.Local (localName 2)))]
+
+/-- Load from the trait-object place behind the wide pointer in local `1`. -/
+def dynPlaceDerefLoadStmts : List Gen.Statement :=
+  [.Assign (.Local (localName 0))
+     (.Load (.Deref (.Load (.Local (localName 1))) (.TraitObject (traitNameOf 0))))]
+
+/-- Concrete memory witness for trait-object pointers on `Mach` and `MachTB`.
+Three steps copy a `*const dyn Trait` pointer between locals, read the copy
+back, and store and copy its vtable pointer at `PtrType::VTablePtr`: the bytes
+written are exactly the encoding of the data pointer followed by the vtable
+pointer, each with its own provenance (and `MachTB.wfLive` is preserved). With
+a data pointer at `130`, which is misaligned for the vtable's alignment `4`,
+`PlaceExpr::Deref` at `Type::TraitObject` yields an unaligned place, and the
+load from it is UB. -/
+theorem dynPtr_memory_roundtrip_and_misaligned_place_witness :
+    (∃ m3, Interp.steps 3 (dynPlaceMach dynPlaceRoundTripStmts 128) = .ok m3 ∧
+      ([0, 2, 3].map (fun i => m3.mem.memory.allocations[i]?.map (·.data))) =
+        [some (dynPlaceWideBytes 128), some (ptrBytes 8192 (some (⟨4⟩, ()))),
+         some (ptrBytes 8192 (some (⟨4⟩, ())))]) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB (dynPlaceMach dynPlaceRoundTripStmts 128)) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
+      ([0, 2, 3].map (fun i =>
+          m3.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((dynPlaceWideBytes 128).map (projByteTB ∘ liftByteTB)),
+         some ((ptrBytes 8192 (some (⟨4⟩, ()))).map (projByteTB ∘ liftByteTB)),
+         some ((ptrBytes 8192 (some (⟨4⟩, ()))).map (projByteTB ∘ liftByteTB))]) ∧
+    Interp.steps 1 (dynPlaceMach dynPlaceDerefLoadStmts 130) =
+      .error (.ub "loading from a place based on a misaligned pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPlaceMach dynPlaceDerefLoadStmts 130)) =
+      .error (.ub "loading from a place based on a misaligned pointer") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Dynamic Dispatch on a Safe `&dyn Trait` Receiver (`Mach` & `MachTB`)
+
+The receiver of the dynamic call is a safe `&dyn Trait` reference, which the
+call also passes to the callee by value. Loading it runs the trait-object
+checks of `check_ptr` (vtable, dynamic size and alignment, and
+`Memory::dereferenceable`). The callee validates its argument with
+`Statement::Validate` at function entry, which under Tree Borrows retags the
+reference with a protector, and `Terminator::Return` ends the call
+(`Memory::end_call`), which releases that protector. -/
+
+/-- `&dyn Trait` for trait `0`: an inhabited, freeze, unpin pointee whose layout
+and `UnsafeCell` ranges come from the vtable. -/
+@[reducible] def dynRefMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable ⟨.TraitObject (traitNameOf 0), true, .TraitObject, true, true⟩)
+
+/-- The callee: it validates its `&dyn Trait` argument at function entry and
+writes `77` to its `u32` return local. -/
+def dynRefCallee : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true,
+        .Assign (.Local (localName 0)) (.Constant (.Int 77) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller: local `1` holds the `&dyn Trait` receiver; the call dispatches
+through the receiver's vtable and passes the receiver by value. -/
+def dynRefCaller : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run the call. Allocation `0` is function
+`1`, `1` the caller's return local, `2` the receiver local (data pointer
+`dataAddr` with the provenance of allocation `4`, vtable pointer `8192`), `3`
+the vtable of trait `0` (size `4`, alignment `4`), and `4` the live 4-byte
+object at `640` that a valid receiver refers to. -/
+def dynRefCallMach (dataAddr : Nat) : Mach :=
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynRefCaller), (fnName 1, dynRefCallee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes dataAddr (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkStackAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame dynRefCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Concrete witness for dynamic dispatch on a safe `&dyn Trait` receiver, on
+`Mach` and `MachTB`. The four steps `Call` (receiver loaded and checked twice,
+as callee and as argument), the callee's `Validate` at function entry, its
+assignment, and `Return` deliver the callee's `77` to the caller's return
+local (and `MachTB.wfLive` is preserved across the protector's lifetime). A
+receiver whose data pointer (`700`) lies outside the object it has provenance
+for is not dereferenceable for the vtable's size, which is UB as soon as the
+call loads it. -/
+theorem dynDispatch_safe_ref_receiver_call_return_witness :
+    (∃ m4, Interp.steps 4 (dynRefCallMach 640) = .ok m4 ∧
+      m4.mem.memory.allocations[1]?.map (·.data) = some (scalarBytes u32 77)) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB (dynRefCallMach 640)) = .ok m4 ∧ MachTB.wfLive m4 ∧
+      m4.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 77).map (projByteTB ∘ liftByteTB))) ∧
+    Interp.steps 1 (dynRefCallMach 700) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynRefCallMach 700)) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Dynamic Dispatch Protector Mode Sensitivity (`&dyn` / `&mut dyn` / `Box<dyn>`)
+and Returning `&dyn Trait` Across `Terminator::Return` (`Mach` & `MachTB`)
+
+Exercises genuine `Mach` (`BasicMemory`) vs `MachTB` (`TreeBorrowsMemory`) mode
+sensitivity during dynamically-dispatched trait method calls:
+1. Writing through an aliasing raw pointer while a callee holds a function-entry
+   protected `&dyn Trait` or `&mut dyn Trait` succeeds on `Mach` and faults UB
+   on `MachTB` (`Protected::Strong` foreign write).
+2. Mutating through `&mut dyn Trait` itself succeeds on both `Mach` and `MachTB`
+   (preserving `MachTB.wfLive` across `Validate(fn_entry)` and `Return`).
+3. Deallocating the backing heap object inside a dynamic call via
+   `Terminator::Intrinsic .Deallocate` (with dynamic `ComputeSize` and
+   `ComputeAlign` from the vtable) succeeds on both `Mach` and `MachTB` for
+   `Box<dyn Trait>` (`Protected::Weak`, with `end_call` releasing the protector
+   on the now-dead allocation cleanly) while faulting UB on `MachTB` for
+   `&mut dyn Trait` (`Protected::Strong`).
+4. Returning `&dyn Trait` across `Terminator::Return`: valid round-trip +
+   caller `Validate` retag, invalid/wrong-trait/dangling return UB caught at
+   `Terminator::Return`'s `typed_load`, ABI-compatible `*const dyn Trait`
+   returning a pointer to the callee's popped stack frame caught by the caller's
+   `Validate`, and incompatible-trait return rejected by Call ABI checking. -/
+
+/-- `&mut dyn Trait` for trait `0`. -/
+@[reducible] def dynMutMrTy : Gen.Type :=
+  .Ptr (.Ref .Mutable ⟨.TraitObject (traitNameOf 0), true, .TraitObject, true, true⟩)
+
+/-- `Box<dyn Trait>` for trait `0`. -/
+@[reducible] def dynBoxMrTy : Gen.Type :=
+  .Ptr (.Box ⟨.TraitObject (traitNameOf 0), true, .TraitObject, true, true⟩)
+
+/-- MiniRust unit type `()`. -/
+@[reducible] def unitMrTy : Gen.Type :=
+  .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none
+
+/-- MiniRust thin raw pointer `*const ()` / `*mut ()`. -/
+@[reducible] def thinRawPtrMrTy : Gen.Type :=
+  .Ptr (.Raw .None)
+
+/-- Raw 16-byte pair `(*const (), *const ())` matching the in-memory layout of
+a wide trait-object pointer. -/
+@[reducible] def rawDynPairMrTy : Gen.Type :=
+  .Tuple [(⟨0⟩, thinRawPtrMrTy), (⟨8⟩, thinRawPtrMrTy)] ⟨⟨16⟩, ⟨8⟩, none⟩ none
+
+/-- Build a `BasicMemory` heap allocation at `addr` with bytes `data`. -/
+def mkHeapAlloc (addr : Int) (data : List Byte) (align : Nat := 8) : Gen.Allocation :=
+  { addr, data, align := ⟨align⟩, kind := .Heap, live := true, extra := () }
+
+/-- Callee that validates its `recvTy` receiver at function entry (`fn_entry = true`),
+then writes `99` through an aliasing thin raw pointer passed in local `2`
+(a foreign write against the receiver's protector under Tree Borrows). -/
+def dynAliasWriteCallee (recvTy : Gen.Type) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, recvTy), (localName 2, thinRawPtrMrTy)]
+    [localName 1, localName 2] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true,
+        .Assign (.Deref (.Load (.Local (localName 2))) u32MrTy) (.Constant (.Int 99) u32MrTy),
+        .Assign (.Local (localName 0)) (.Constant (.Int 77) u32MrTy)], .Return, .Regular⟩)]
+
+/-- Caller that dynamically dispatches on `recvTy` (local `1`) and passes both
+the receiver and a raw alias (local `2`) by value. -/
+def dynAliasWriteCaller (recvTy : Gen.Type) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, recvTy), (localName 2, thinRawPtrMrTy)] []
+    (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1))), .ByValue (.Load (.Local (localName 2)))]
+        (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynAliasWriteCaller` -> `dynAliasWriteCallee`: allocation `4`
+is the 4-byte heap object at `640`, aliased by both receiver local `1` and raw
+pointer local `2`. -/
+def dynAliasWriteMach (recvTy : Gen.Type) : Mach :=
+  let caller := dynAliasWriteCaller recvTy
+  let callee := dynAliasWriteCallee recvTy
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, callee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkHeapAlloc 640 (scalarBytes u32 5) 4,
+     mkStackAlloc 768 (ptrBytes 640 (some (⟨4⟩, ()))) 8]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) }),
+       (localName 2, { addr := 768, provenance := some (⟨5⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Callee that validates `&mut dyn Trait` at function entry, writes `88`
+through the receiver's own tag, reads `88` back, and returns it. -/
+def dynMutWriteCallee : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynMutMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true,
+        .Assign (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy)
+          (.Constant (.Int 88) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy))],
+        .Return, .Regular⟩)]
+
+/-- Caller that dynamically dispatches on `&mut dyn Trait` and passes it by
+value. -/
+def dynMutWriteCaller : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynMutMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynMutWriteCaller` -> `dynMutWriteCallee`. -/
+def dynMutWriteMach : Mach :=
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynMutWriteCaller), (fnName 1, dynMutWriteCallee)]⟩,
+      start := fnName 0, globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkHeapAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame dynMutWriteCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+/-- Callee modeling `drop(Box<dyn Trait>)`: validates `recvTy` at function
+entry, deallocates the heap pointee with dynamic size/alignment computed from
+the vtable (`GetThinPointer`, `ComputeSize`, `ComputeAlign`), and returns `()`. -/
+def dynDeallocCallee (recvTy : Gen.Type) : Gen.Function :=
+  mkMrFn [(localName 0, unitMrTy), (localName 1, recvTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) true],
+        .Intrinsic .Deallocate
+          [.UnOp .GetThinPointer (.Load (.Local (localName 1))),
+           .UnOp (.ComputeSize (.TraitObject (traitNameOf 0)))
+             (.UnOp .GetMetadata (.Load (.Local (localName 1)))),
+           .UnOp (.ComputeAlign (.TraitObject (traitNameOf 0)))
+             (.UnOp .GetMetadata (.Load (.Local (localName 1))))]
+          (.Local (localName 0)) (some (bbName 1)), .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Caller that dynamically dispatches to `dynDeallocCallee recvTy` returning
+`()`. -/
+def dynDeallocCaller (recvTy : Gen.Type) : Gen.Function :=
+  mkMrFn [(localName 0, unitMrTy), (localName 1, recvTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynDeallocCaller recvTy` -> `dynDeallocCallee recvTy` on heap
+allocation `4` (4 bytes at `640`). -/
+def dynDeallocMach (recvTy : Gen.Type) : Mach :=
+  let caller := dynDeallocCaller recvTy
+  let callee := dynDeallocCallee recvTy
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, callee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable)]⟩ }
+  let vtPtr : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 [] 1,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkHeapAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtPtr)]⟩ }
+
+set_option maxRecDepth 8192 in
+/-- **Dynamic-dispatch protector mode sensitivity (`Mach` vs `MachTB`) and
+`&mut dyn Trait` / `Box<dyn Trait>` call-return witness**:
+1. `&dyn Trait` + foreign raw-alias write: `Mach` completes all 5 steps
+   (returning `77` and mutating alloc `4` to `99`), while `MachTB` completes
+   `Call` + `Validate(fn_entry)` (step 2, `MachTB.wfLive`) and faults UB at
+   step 3 (`"Tree Borrows: foreign write of protected Frozen reference which had a local read"`).
+2. `&mut dyn Trait`: mutating through the receiver's own tag succeeds across all
+   5 steps on both `Mach` and `MachTB` (delivering `88`, preserving
+   `MachTB.wfLive`), whereas writing through a foreign raw alias succeeds on
+   `Mach` and faults UB at step 3 on `MachTB`
+   (`"Tree Borrows: foreign read of protected Unique reference"`).
+3. In-callee `Terminator::Intrinsic .Deallocate` with dynamic vtable
+   size/align: `Box<dyn Trait>` (`Protected::Weak`) deallocates alloc `4` and
+   returns cleanly on both `Mach` and `MachTB` (with `end_call` preserving
+   `MachTB.wfLive`), whereas `&mut dyn Trait` (`Protected::Strong`) deallocates
+   on `Mach` and faults UB at step 3 on `MachTB`
+   (`"Tree Borrows: deallocating strongly protected allocation"`). -/
+theorem dynDispatch_protector_conflict_and_mut_box_witness :
+    -- 1. `&dyn Trait` + foreign alias write: `Mach` ok vs `MachTB` protector UB
+    (∃ m5, Interp.steps 5 (dynAliasWriteMach dynRefMrTy) = .ok m5 ∧
+      ([1, 4].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 77), some (scalarBytes u32 99)]) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB (dynAliasWriteMach dynRefMrTy)) = .ok m2 ∧
+      MachTB.wfLive m2 ∧ m2.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some true) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynAliasWriteMach dynRefMrTy)) =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    -- 2. `&mut dyn Trait`: local write ok on both; foreign alias write `Mach` ok vs `MachTB` UB
+    (∃ m5, Interp.steps 5 dynMutWriteMach = .ok m5 ∧
+      ([1, 4].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 88), some (scalarBytes u32 88)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB dynMutWriteMach) = .ok m5 ∧ MachTB.wfLive m5 ∧
+      ([1, 4].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 88).map (projByteTB ∘ liftByteTB))]) ∧
+    (∃ m5, Interp.steps 5 (dynAliasWriteMach dynMutMrTy) = .ok m5 ∧
+      ([1, 4].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 77), some (scalarBytes u32 99)]) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynAliasWriteMach dynMutMrTy)) =
+      .error (.ub "Tree Borrows: foreign read of protected Unique reference") ∧
+    -- 3. `Box<dyn Trait>` (`Weak`) vs `&mut dyn Trait` (`Strong`) in-callee `Deallocate`
+    (∃ m4, Interp.steps 4 (dynDeallocMach dynBoxMrTy) = .ok m4 ∧
+      m4.mem.memory.allocations[4]?.map (·.live) = some false) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB (dynDeallocMach dynBoxMrTy)) = .ok m4 ∧
+      MachTB.wfLive m4 ∧
+      m4.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some false) ∧
+    (∃ m4, Interp.steps 4 (dynDeallocMach dynMutMrTy) = .ok m4 ∧
+      m4.mem.memory.allocations[4]?.map (·.live) = some false) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynDeallocMach dynMutMrTy)) =
+      .error (.ub "Tree Borrows: deallocating strongly protected allocation") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-- Second vtable for trait `1` (size `4`, alignment `4`, no methods) for
+wrong-trait return-value witnesses. -/
+def dynDispatchVTable1 : Gen.VTable :=
+  { trait_name := traitNameOf 1, size := ⟨4⟩, align := ⟨4⟩, cells := [], methods := ⟨[]⟩ }
+
+/-- Caller expecting a `&dyn Trait0` return value in local `0`, followed by
+`Validate` in `bbName 1` (upstream `spec/lang/step/terminators.md`). -/
+def dynRetCaller : Gen.Function :=
+  mkMrFn [(localName 0, dynRefMrTy), (localName 1, dynRefMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[.Validate (.Local (localName 0)) false], .Return, .Regular⟩)]
+
+/-- Callee returning its valid `&dyn Trait0` argument. -/
+def dynRetOkCallee : Gen.Function :=
+  mkMrFn [(localName 0, dynRefMrTy), (localName 1, dynRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Load (.Local (localName 1)))],
+        .Return, .Regular⟩)]
+
+/-- Callee writing raw wide-pointer bytes `(dataExpr, vtExpr)` into its
+`&dyn Trait0` return local `0` via a raw pointer cast before `Terminator::Return`,
+so the invalid pointer is first checked by `Return`'s `typed_load`. -/
+def dynRetRawPairCallee (dataExpr vtExpr : Gen.ValueExpr) : Gen.Function :=
+  mkMrFn [(localName 0, dynRefMrTy), (localName 1, dynRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Deref (.AddrOf (.Local (localName 0)) (.Raw .None)) rawDynPairMrTy)
+        (.Tuple [dataExpr, vtExpr] rawDynPairMrTy)], .Return, .Regular⟩)]
+
+/-- ABI-compatible callee returning `*const dyn Trait0` pointing to its own
+stack local `2`: `Return` pops and deallocates local `2` while storing the raw
+pointer into the caller's `&dyn Trait0` slot, so the caller's `Validate` catches
+the dangling safe pointer. -/
+def dynRetLocalDangleCallee : Gen.Function :=
+  mkMrFn [(localName 0, wideDynPtrMrTy 0), (localName 1, dynRefMrTy), (localName 2, u32MrTy)]
+    [localName 1] (localName 0)
+    [(bbName 0, ⟨[.StorageLive (localName 2),
+        .Assign (.Deref (.AddrOf (.Local (localName 0)) (.Raw .None)) rawDynPairMrTy)
+          (.Tuple [.AddrOf (.Local (localName 2)) (.Raw .None),
+            .UnOp .GetThinPointer
+              (.Constant (.VTablePointer ⟨⟨0⟩⟩) (.Ptr (.VTablePtr (traitNameOf 0))))]
+            rawDynPairMrTy)], .Return, .Regular⟩)]
+
+/-- Callee returning `&dyn Trait1` (ABI-incompatible with caller's
+`&dyn Trait0` return slot). -/
+def dynRetTrait1Callee : Gen.Function :=
+  let dynRef1 : Gen.Type :=
+    .Ptr (.Ref .Immutable ⟨.TraitObject (traitNameOf 1), true, .TraitObject, true, true⟩)
+  mkMrFn [(localName 0, dynRef1), (localName 1, dynRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynRetCaller` calling `callee`, with vtable `0` (trait `0`) at
+`8192` (alloc `3`) and vtable `1` (trait `1`) at `8200` (alloc `5`). -/
+def dynRetMach (callee : Gen.Function) : Mach :=
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynRetCaller), (fnName 1, callee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩), (traitNameOf 1, ⟨[]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynDispatchVTable), (⟨⟨1⟩⟩, dynDispatchVTable1)]⟩ }
+  let vt0 : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let vt1 : Ptr := { addr := 8200, provenance := some (⟨5⟩, ()) }
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))) 8,
+     mkVTableAlloc 8192, mkHeapAlloc 640 (scalarBytes u32 5) 4, mkVTableAlloc 8200]
+    [mkRootFrame dynRetCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt0), (⟨⟨1⟩⟩, vt1)]⟩ }
+
+/-- Expected 16-byte encoding of a valid `&dyn Trait0` (data `640` at alloc `4`,
+vtable `8192` at alloc `3`). -/
+def dynRetExpectedBytes : List Byte :=
+  ptrBytes 640 (some (⟨4⟩, ())) ++ ptrBytes 8192 (some (⟨3⟩, ()))
+
+/-- Machine whose callee writes a trait-`1` vtable pointer into its `&dyn Trait0`
+return local before `Terminator::Return`. -/
+def dynRetWrongTraitMach : Mach :=
+  let liveDataExpr : Gen.ValueExpr := .UnOp .GetThinPointer (.Load (.Local (localName 1)))
+  let vt1Expr : Gen.ValueExpr :=
+    .UnOp .GetThinPointer (.Constant (.VTablePointer ⟨⟨1⟩⟩) (.Ptr (.VTablePtr (traitNameOf 1))))
+  dynRetMach (dynRetRawPairCallee liveDataExpr vt1Expr)
+
+/-- Machine whose callee writes an unmapped vtable pointer (`9000`) into its
+`&dyn Trait0` return local before `Terminator::Return`. -/
+def dynRetUnmappedVtMach : Mach :=
+  let liveDataExpr : Gen.ValueExpr := .UnOp .GetThinPointer (.Load (.Local (localName 1)))
+  dynRetMach
+    (dynRetRawPairCallee liveDataExpr (.Constant (.PointerWithoutProvenance 9000) thinRawPtrMrTy))
+
+/-- Machine whose callee writes a provenance-free data pointer (`640`) with
+valid trait-`0` vtable into its `&dyn Trait0` return local before
+`Terminator::Return`. -/
+def dynRetNoProvDataMach : Mach :=
+  let vt0Expr : Gen.ValueExpr :=
+    .UnOp .GetThinPointer (.Constant (.VTablePointer ⟨⟨0⟩⟩) (.Ptr (.VTablePtr (traitNameOf 0))))
+  dynRetMach
+    (dynRetRawPairCallee (.Constant (.PointerWithoutProvenance 640) thinRawPtrMrTy) vt0Expr)
+
+/-- Machine whose ABI-compatible `*const dyn Trait0` callee returns a pointer to
+its own popped stack local `2`. -/
+def dynRetLocalDangleMach : Mach :=
+  dynRetMach dynRetLocalDangleCallee
+
+set_option maxRecDepth 8192 in
+/-- **Returning `&dyn Trait` across `Terminator::Return` (`Mach` & `MachTB`)**:
+1. Valid `&dyn Trait0` round-trips across `Call` -> `Assign` -> `Return`
+   (step 3) and passes caller's `Validate` (step 4), preserving `MachTB.wfLive`
+   and retagging the returned data pointer to child `[0]` while preserving
+   vtable provenance `[]`.
+2. Wrong-trait vtable, unmapped vtable address, and provenance-free dangling
+   data pointer written into the callee's `&dyn Trait0` return local succeed at
+   step 2 (`Assign`) and fault with exact UB at step 3 (`Terminator::Return`'s
+   `typed_load`) on both `Mach` and `MachTB`.
+3. An ABI-compatible `*const dyn Trait0` callee returning a pointer to its own
+   popped stack local completes `Return` at step 4 (preserving `MachTB.wfLive`),
+   and the caller's `Validate` at step 5 catches
+   `"Value::Ptr: non-dereferenceable safe pointer"` on both `Mach` and `MachTB`.
+4. Returning `&dyn Trait1` into a `&dyn Trait0` return slot faults at step 1
+   with `"call ABI violation: return types are not compatible"`. -/
+theorem dynDispatch_return_dynRef_valid_and_ub_witness :
+    -- 1. Valid `&dyn Trait0` return + caller `Validate` retag
+    (∃ m4, Interp.steps 4 (dynRetMach dynRetOkCallee) = .ok m4 ∧
+      m4.mem.memory.allocations[1]?.map (·.data) = some dynRetExpectedBytes) ∧
+    (∃ m3, Interp.stepsTB 3 (liftMachToTB (dynRetMach dynRetOkCallee)) = .ok m3 ∧
+      MachTB.wfLive m3 ∧
+      m3.mem.memory.mem.allocations[1]?.map (fun a => a.data.map projByteTB) =
+        some (dynRetExpectedBytes.map (projByteTB ∘ liftByteTB))) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB (dynRetMach dynRetOkCallee)) = .ok m4 ∧
+      MachTB.wfLive m4 ∧
+      m4.mem.memory.mem.allocations[1]?.bind (fun a =>
+        match a.data[0]?, a.data[8]? with
+        | some b0, some b8 => some (projByteTB b0, projByteTB b8)
+        | _, _ => none) =
+        some (.initProv 0x80 4 [0] 0, .initProv 0x00 3 [] 0)) ∧
+    -- 2a. Wrong-trait vtable UB at `Terminator::Return` (step 3; step 2 succeeds)
+    (∃ m2, Interp.steps 2 dynRetWrongTraitMach = .ok m2 ∧
+      m2.mem.memory.allocations[4]?.map (·.live) = some true) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB dynRetWrongTraitMach) = .ok m2 ∧ MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some true) ∧
+    Interp.steps 3 dynRetWrongTraitMach = .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    Interp.stepsTB 3 (liftMachToTB dynRetWrongTraitMach) =
+      .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+    -- 2b. Unmapped vtable UB at `Terminator::Return` (step 3; step 2 succeeds)
+    (∃ m2, Interp.steps 2 dynRetUnmappedVtMach = .ok m2 ∧
+      m2.mem.memory.allocations[4]?.map (·.live) = some true) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB dynRetUnmappedVtMach) = .ok m2 ∧ MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some true) ∧
+    Interp.steps 3 dynRetUnmappedVtMach = .error (.ub "invalid pointer for vtable lookup") ∧
+    Interp.stepsTB 3 (liftMachToTB dynRetUnmappedVtMach) =
+      .error (.ub "invalid pointer for vtable lookup") ∧
+    -- 2c. Provenance-free dangling data ptr UB at `Terminator::Return` (step 3; step 2 succeeds)
+    (∃ m2, Interp.steps 2 dynRetNoProvDataMach = .ok m2 ∧
+      m2.mem.memory.allocations[4]?.map (·.live) = some true) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB dynRetNoProvDataMach) = .ok m2 ∧ MachTB.wfLive m2 ∧
+      m2.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some true) ∧
+    Interp.steps 3 dynRetNoProvDataMach = .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 3 (liftMachToTB dynRetNoProvDataMach) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    -- 3. Callee returns `*const dyn Trait0` to its own popped local -> caller `Validate` UB (step 5)
+    (∃ m4, Interp.steps 4 dynRetLocalDangleMach = .ok m4 ∧
+      m4.mem.memory.allocations[4]?.map (·.live) = some true) ∧
+    (∃ m4, Interp.stepsTB 4 (liftMachToTB dynRetLocalDangleMach) = .ok m4 ∧ MachTB.wfLive m4 ∧
+      m4.mem.memory.mem.allocations[4]?.map Gen.Allocation.live = some true) ∧
+    Interp.steps 5 dynRetLocalDangleMach = .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 5 (liftMachToTB dynRetLocalDangleMach) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    -- 4. ABI-incompatible return trait `&dyn Trait1` vs `&dyn Trait0` (step 1)
+    Interp.steps 1 (dynRetMach dynRetTrait1Callee) =
+      .error (.ub "call ABI violation: return types are not compatible") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynRetMach dynRetTrait1Callee)) =
+      .error (.ub "call ABI violation: return types are not compatible") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
+
+/-! ### Runtime Polymorphism: Two Implementations of One Trait (`Mach` & `MachTB`)
+
+Two vtables for the *same* trait are registered at once: a small
+implementation (size `4`, alignment `4`) and a large one (size `16`,
+alignment `8`), each with its own functions for the trait's two methods. One
+caller body reads the dynamic size and alignment
+(`ComputeSize(GetMetadata(self))`, `ComputeAlign(GetMetadata(self))`) and
+calls `VTableMethodLookup(GetMetadata(self))`. Which callee runs, which size
+and alignment are read, and whether the `&dyn Trait` receiver is valid at all
+depend only on the vtable pointer in the receiver's metadata: the trait check
+of `check_ptr` passes for both vtables, so pairing the small object with the
+large vtable is caught by the dynamic size (`Memory::dereferenceable`) or
+alignment check instead. -/
+
+/-- The small implementation's vtable for trait `0`: size `4`, alignment `4`,
+method `0` is function `1` and method `1` is function `2`. -/
+def dynPolyVTableSmall : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(⟨⟨0⟩⟩, fnName 1), (⟨⟨1⟩⟩, fnName 2)]⟩ }
+
+/-- The large implementation's vtable for the same trait `0`: size `16`,
+alignment `8`, method `0` is function `3` and method `1` is function `4`. -/
+def dynPolyVTableLarge : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨16⟩, align := ⟨8⟩, cells := [],
+    methods := ⟨[(⟨⟨0⟩⟩, fnName 3), (⟨⟨1⟩⟩, fnName 4)]⟩ }
+
+/-- A method implementation: it writes `k` to its `u32` return local. -/
+def dynPolyCallee (k : Int) : Gen.Function := mkMrFn [(localName 0, u32MrTy)] [] (localName 0)
+  [(bbName 0, ⟨[.Assign (.Local (localName 0)) (.Constant (.Int k) u32MrTy)], .Return, .Regular⟩)]
+
+/-- The caller body, the same for every receiver: store the dynamic size and
+alignment of the `&dyn Trait` receiver in local `1` to locals `2` and `3`,
+then call method `meth` through the receiver's vtable. -/
+def dynPolyCaller (meth : Nat) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynRefMrTy), (localName 2, usizeMrTy),
+      (localName 3, usizeMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[.Assign (.Local (localName 2)) (.UnOp (.ComputeSize (.TraitObject (traitNameOf 0)))
+          (.UnOp .GetMetadata (.Load (.Local (localName 1))))),
+        .Assign (.Local (localName 3)) (.UnOp (.ComputeAlign (.TraitObject (traitNameOf 0)))
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))],
+       .Call (.UnOp (.VTableMethodLookup ⟨⟨meth⟩⟩)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [] (.Local (localName 0)) (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- A `BasicMemory` machine about to run `dynPolyCaller meth`. Allocations `0`
+to `3` are functions `1` to `4`, `4` to `7` the caller's locals, `8` and `9`
+the small and the large vtable (at `8192` and `8200`), `10` a 4-byte object
+at `640`, `11` a 16-byte object at `768`, and `12` a 4-byte object at `900`
+(aligned to `4` but not to `8`). The receiver in local `1` has the data
+pointer `dataAddr` with the provenance of allocation `dataAlloc`, and the
+vtable pointer of the large implementation if `vtLarge`, else of the small
+one. -/
+def dynPolyMach (vtLarge : Bool) (dataAddr : Nat) (dataAlloc : Int) (meth : Nat) : Mach :=
+  let caller := dynPolyCaller meth
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, caller), (fnName 1, dynPolyCallee 11), (fnName 2, dynPolyCallee 12),
+        (fnName 3, dynPolyCallee 31), (fnName 4, dynPolyCallee 32)]⟩,
+      start := fnName 0, globals := ⟨[]⟩,
+      traits := ⟨[(traitNameOf 0, ⟨[⟨⟨0⟩⟩, ⟨⟨1⟩⟩]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynPolyVTableSmall), (⟨⟨1⟩⟩, dynPolyVTableLarge)]⟩ }
+  let vtSmall : Ptr := { addr := 8192, provenance := some (⟨8⟩, ()) }
+  let vtLargePtr : Ptr := { addr := 8200, provenance := some (⟨9⟩, ()) }
+  let recvBytes : List Byte := ptrBytes dataAddr (some (⟨dataAlloc⟩, ())) ++
+    (if vtLarge then ptrBytes 8200 (some (⟨9⟩, ())) else ptrBytes 8192 (some (⟨8⟩, ())))
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkFnAlloc 4104, mkFnAlloc 4112, mkFnAlloc 4120,
+     mkStackAlloc 128 (List.replicate 4 .Uninit) 4, mkStackAlloc 256 recvBytes 8,
+     mkStackAlloc 384 (List.replicate 8 .Uninit) 8, mkStackAlloc 512 (List.replicate 8 .Uninit) 8,
+     mkVTableAlloc 8192, mkVTableAlloc 8200,
+     mkStackAlloc 640 (scalarBytes u32 5) 4, mkStackAlloc 768 (List.replicate 16 .Uninit) 8,
+     mkStackAlloc 900 (scalarBytes u32 6) 4]
+    [mkRootFrame caller [(localName 0, { addr := 128, provenance := some (⟨4⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨5⟩, ()) }),
+       (localName 2, { addr := 384, provenance := some (⟨6⟩, ()) }),
+       (localName 3, { addr := 512, provenance := some (⟨7⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) }),
+     (fnName 2, { addr := 4104, provenance := some (⟨1⟩, ()) }),
+     (fnName 3, { addr := 4112, provenance := some (⟨2⟩, ()) }),
+     (fnName 4, { addr := 4120, provenance := some (⟨3⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtSmall), (⟨⟨1⟩⟩, vtLargePtr)]⟩ }
+
+/-- Concrete runtime-polymorphism witness on `Mach` and `MachTB`: two
+implementations of the same trait, selected only by the receiver's vtable
+pointer.
+1. With the small vtable and the 4-byte object, the five steps (two
+   assignments, `Call`, the callee's assignment, `Return`) store the callee
+   result `11`, size `4`, and alignment `4`.
+2. The same caller body with the large vtable and the 16-byte object stores
+   `31`, size `16`, and alignment `8`.
+3. Method `1` reaches the other function of each implementation (`12` and
+   `32`).
+4. The large vtable with the 4-byte object at `640` passes the trait check
+   (both vtables are for trait `0`) and the alignment check, but the object
+   is too small for the vtable's size: UB when the receiver is first loaded.
+5. The large vtable with the 4-byte object at `900` is UB for the vtable's
+   alignment `8`, although the small vtable accepts the same object.
+6. A method that the vtable does not have (`99`) is the spec panic of
+   `vtable.methods[method]` at the call, after both assignments ran. -/
+theorem dynDispatch_same_trait_two_impls_polymorphism_witness :
+    -- 1. the small implementation
+    (∃ m5, Interp.steps 5 (dynPolyMach false 640 10 0) = .ok m5 ∧
+      ([4, 6, 7].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 11), some (scalarBytes IntType.usize_ty 4),
+         some (scalarBytes IntType.usize_ty 4)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach false 640 10 0)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([4, 6, 7].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 11).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 4).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 4).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 2. the large implementation, same caller body
+    (∃ m5, Interp.steps 5 (dynPolyMach true 768 11 0) = .ok m5 ∧
+      ([4, 6, 7].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 31), some (scalarBytes IntType.usize_ty 16),
+         some (scalarBytes IntType.usize_ty 8)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach true 768 11 0)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([4, 6, 7].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 31).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 16).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes IntType.usize_ty 8).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 3. method `1` of each implementation
+    (∃ m5, Interp.steps 5 (dynPolyMach false 640 10 1) = .ok m5 ∧
+      m5.mem.memory.allocations[4]?.map (·.data) = some (scalarBytes u32 12)) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynPolyMach true 768 11 1)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      m5.mem.memory.mem.allocations[4]?.map (fun a => a.data.map projByteTB) =
+        some ((scalarBytes u32 32).map (projByteTB ∘ liftByteTB))) ∧
+    -- 4. large vtable, small object: too small for the vtable's size
+    Interp.steps 1 (dynPolyMach true 640 10 0) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPolyMach true 640 10 0)) =
+      .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+    -- 5. the object at `900`: fine for the small vtable, unaligned for the large one
+    (∃ m5, Interp.steps 5 (dynPolyMach false 900 12 0) = .ok m5 ∧
+      m5.mem.memory.allocations[4]?.map (·.data) = some (scalarBytes u32 11)) ∧
+    Interp.steps 1 (dynPolyMach true 900 12 0) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    Interp.stepsTB 1 (liftMachToTB (dynPolyMach true 900 12 0)) =
+      .error (.ub "Value::Ptr: unaligned safe pointer") ∧
+    -- 6. a method missing from the vtable
+    Interp.steps 3 (dynPolyMach false 640 10 99) =
+      .error (.specPanic "map index: missing key (vtable.methods[method])") ∧
+    Interp.stepsTB 3 (liftMachToTB (dynPolyMach false 640 10 99)) =
+      .error (.specPanic "map index: missing key (vtable.methods[method])") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel),
+   eq_error_specPanic_of_interpSpecPanic (by decide +kernel)⟩
+
+/-! ### Same-Trait Multi-Impl `vtable.cells` (`UnsafeCell` vs `Freeze`) Interior
+Mutability During Dynamic Dispatch (`Mach` & `MachTB`)
+
+Two implementations of the *same* trait `0` share the same size (`4`),
+alignment (`4`), and callee body, differing **only** in `vtable.cells`:
+* `ImplCell` (`Cell<u32>`): `cells = [(⟨0⟩, ⟨4⟩)]` (interior mutable);
+* `ImplFrozen` (`u32`): `cells = []` (frozen).
+One caller dispatches on `&dyn Trait0` with `PointeeInfo.freeze = false` and
+`unsafe_cells = .TraitObject` (`dynNonFreezeRefMrTy`). Inside the callee,
+`Statement::Validate` computes the inside freeze mask dynamically from
+`vtable.cells` (`UnsafeCellStrategy::TraitObject::freeze_mask`). Writing `42`
+through the receiver's own tag succeeds on both `Mach` and `MachTB` for
+`ImplCell` (preserving `MachTB.wfLive` across both `fn_entry = true` and
+`fn_entry = false`), while for `ImplFrozen` it succeeds on `Mach` and faults UB
+on `MachTB` (`Protected::Strong` or unprotected `Frozen` write conflict). -/
+
+/-- `&dyn Trait0` with `PointeeInfo.freeze = false` (Rust's `dyn Trait`
+reference whose interior mutability is determined dynamically by
+`vtable.cells`). -/
+@[reducible] def dynNonFreezeRefMrTy : Gen.Type :=
+  .Ptr (.Ref .Immutable ⟨.TraitObject (traitNameOf 0), true, .TraitObject, false, true⟩)
+
+/-- `ImplCell` (`Cell<u32>`) vtable for trait `0`: `cells = [(0, 4)]`. -/
+def dynCellVTableCell : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [(⟨0⟩, ⟨4⟩)],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- `ImplFrozen` (`u32`) vtable for the same trait `0`: `cells = []`. -/
+def dynCellVTableFrozen : Gen.VTable :=
+  { trait_name := traitNameOf 0, size := ⟨4⟩, align := ⟨4⟩, cells := [],
+    methods := ⟨[(dynDispatchMethod, fnName 1)]⟩ }
+
+/-- Shared callee body for both `ImplCell` and `ImplFrozen`: validates
+`&dyn Trait0` (with `fn_entry := fnEntry`), writes `42` through the receiver's
+own tag (`GetThinPointer`), reads `42` back, and returns it. -/
+def dynCellWriteCallee (fnEntry : Bool) : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynNonFreezeRefMrTy)] [localName 1] (localName 0)
+    [(bbName 0, ⟨[.Validate (.Local (localName 1)) fnEntry,
+        .Assign (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy)
+          (.Constant (.Int 42) u32MrTy),
+        .Assign (.Local (localName 0))
+          (.Load (.Deref (.UnOp .GetThinPointer (.Load (.Local (localName 1)))) u32MrTy))],
+        .Return, .Regular⟩)]
+
+/-- Caller dispatching dynamically on `&dyn Trait0` (`dynNonFreezeRefMrTy`) and
+passing it by value. -/
+def dynCellCaller : Gen.Function :=
+  mkMrFn [(localName 0, u32MrTy), (localName 1, dynNonFreezeRefMrTy)] [] (localName 0)
+    [(bbName 0, ⟨[], .Call (.UnOp (.VTableMethodLookup dynDispatchMethod)
+          (.UnOp .GetMetadata (.Load (.Local (localName 1)))))
+        .Rust [.ByValue (.Load (.Local (localName 1)))] (.Local (localName 0))
+        (some (bbName 1)) none, .Regular⟩),
+     (bbName 1, ⟨[], .Return, .Regular⟩)]
+
+/-- Machine for `dynCellCaller` -> `dynCellWriteCallee fnEntry` selecting
+`ImplCell` (`useFrozen = false`, vtable at `8192` alloc `3`) or `ImplFrozen`
+(`useFrozen = true`, vtable at `8200` alloc `4`) over heap object alloc `5`. -/
+def dynCellMach (useFrozen fnEntry : Bool) : Mach :=
+  let callee := dynCellWriteCallee fnEntry
+  let prog : Gen.Program :=
+    { functions := ⟨[(fnName 0, dynCellCaller), (fnName 1, callee)]⟩, start := fnName 0,
+      globals := ⟨[]⟩, traits := ⟨[(traitNameOf 0, ⟨[dynDispatchMethod]⟩)]⟩,
+      vtables := ⟨[(⟨⟨0⟩⟩, dynCellVTableCell), (⟨⟨1⟩⟩, dynCellVTableFrozen)]⟩ }
+  let vtCell : Ptr := { addr := 8192, provenance := some (⟨3⟩, ()) }
+  let vtFrozen : Ptr := { addr := 8200, provenance := some (⟨4⟩, ()) }
+  let vtBytes : List Byte :=
+    if useFrozen then ptrBytes 8200 (some (⟨4⟩, ())) else ptrBytes 8192 (some (⟨3⟩, ()))
+  let base := mkMrMach prog
+    [mkFnAlloc 4096, mkStackAlloc 128 (List.replicate 4 .Uninit) 4,
+     mkStackAlloc 256 (ptrBytes 640 (some (⟨5⟩, ())) ++ vtBytes) 8,
+     mkVTableAlloc 8192, mkVTableAlloc 8200, mkHeapAlloc 640 (scalarBytes u32 5) 4]
+    [mkRootFrame dynCellCaller [(localName 0, { addr := 128, provenance := some (⟨1⟩, ()) }),
+       (localName 1, { addr := 256, provenance := some (⟨2⟩, ()) })]]
+    [(fnName 1, { addr := 4096, provenance := some (⟨0⟩, ()) })]
+  { base with vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtCell), (⟨⟨1⟩⟩, vtFrozen)]⟩ }
+
+set_option maxRecDepth 8192 in
+/-- **Same-trait multi-impl `vtable.cells` interior-mutability witness**
+(`Mach` & `MachTB`):
+1. `ImplCell` (`vtable.cells = [(0, 4)]`): interior mutation through `&dyn Trait0`
+   succeeds across all 5 steps on both `Mach` and `MachTB` (returning `42`,
+   mutating alloc `5` to `42`, and preserving `MachTB.wfLive` across both
+   protected `fn_entry = true` and unprotected `fn_entry = false`).
+2. `ImplFrozen` (`vtable.cells = []`): the identical caller and callee succeed
+   on `Mach` (returning `42`), while `MachTB` completes `Call` + `Validate`
+   (step 2, `MachTB.wfLive`) and faults UB at step 3 with
+   `"Tree Borrows: local write to protected Frozen reference"` (`fn_entry = true`)
+   and `"Tree Borrows: local write of Frozen reference"` (`fn_entry = false`). -/
+theorem dynDispatch_same_trait_vtable_cells_interior_mutability_witness :
+    -- 1. `ImplCell` (`fn_entry = true` and `false`): ok on both `Mach` and `MachTB`
+    (∃ m5, Interp.steps 5 (dynCellMach false true) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynCellMach false true)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([1, 5].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))]) ∧
+    (∃ m5, Interp.stepsTB 5 (liftMachToTB (dynCellMach false false)) = .ok m5 ∧
+      MachTB.wfLive m5 ∧
+      ([1, 5].map (fun i =>
+          m5.mem.memory.mem.allocations[i]?.map (fun a => a.data.map projByteTB))) =
+        [some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB)),
+         some ((scalarBytes u32 42).map (projByteTB ∘ liftByteTB))]) ∧
+    -- 2. `ImplFrozen` (`fn_entry = true`): `Mach` ok vs `MachTB` protected Frozen write UB
+    (∃ m5, Interp.steps 5 (dynCellMach true true) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    (∃ m2, Interp.stepsTB 2 (liftMachToTB (dynCellMach true true)) = .ok m2 ∧
+      MachTB.wfLive m2 ∧ m2.mem.memory.mem.allocations[5]?.map Gen.Allocation.live = some true) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynCellMach true true)) =
+      .error (.ub "Tree Borrows: local write to protected Frozen reference") ∧
+    -- 3. `ImplFrozen` (`fn_entry = false`): `Mach` ok vs `MachTB` unprotected Frozen write UB
+    (∃ m5, Interp.steps 5 (dynCellMach true false) = .ok m5 ∧
+      ([1, 5].map (fun i => m5.mem.memory.allocations[i]?.map (·.data))) =
+        [some (scalarBytes u32 42), some (scalarBytes u32 42)]) ∧
+    Interp.stepsTB 3 (liftMachToTB (dynCellMach true false)) =
+      .error (.ub "Tree Borrows: local write of Frozen reference") :=
+  ⟨ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   ok_stepsTB_wfLive (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), ok_stepsTB_wfLive (by decide +kernel),
+   eq_error_ub_of_interpUbMsg (by decide +kernel),
+   ok_of_map_toOption (by decide +kernel), eq_error_ub_of_interpUbMsg (by decide +kernel)⟩
 
 /-! ## §9 (`C9`): `ProjectionElem.unwrapUnsafeBinder` (`Mach` & `MachTB`) -/
 /-- **C9 Fragment Boundary (`translatePlace_unwrapUnsafeBinder_none`)**:

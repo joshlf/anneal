@@ -159,7 +159,8 @@ and `IntType::with_overflow`, returning `(Value::Int(res_wrapped), Value::Bool(r
 variants, through `Machine::eval_rel_op`) on integers, Booleans, and thin
 pointers (`comparePtr`, which compares addresses),
 `Constant::{Int, Bool, FnPointer, GlobalPointer, VTablePointer,
-PointerWithoutProvenance}` and `Machine::fn_from_ptr`,
+PointerWithoutProvenance}`, `Machine::fn_from_ptr`, and
+`Machine::vtable_from_ptr`,
 `Terminator::{Goto, Switch, Call, Return, Unreachable, Intrinsic}` (including
 `check_abi_compatibility` across all 7 `Type` variants,
 `Machine::prepare_for_inplace_passing`, `Machine::eval_argument` for `ByValue`
@@ -185,10 +186,15 @@ types, `Type::layout` across all 9 `Type` variants (with
 For raw pointers (MR-3.1) and references (MR-3.2) it adds `Type::Ptr` with
 `PtrType::Raw`, `PtrType::Ref`, and `PtrType::Box` (layout, `decode_ptr` /
 `encode_ptr` with per-byte provenance fragments, wide pointers with
-`PointerMetaKind::ElementCount` metadata, and `check_value` / `check_ptr` —
-including safe-pointer non-null, pointee-alignment, inhabitedness, and
-`ConcurrentMemory::dereferenceable` checks via the machine's live allocations;
-`PointerMetaKind::VTablePointer` metadata remains `unsupported`),
+`PointerMetaKind::ElementCount` and `PointerMetaKind::VTablePointer` metadata,
+and `check_value` / `check_ptr` — including safe-pointer non-null,
+pointee-alignment, inhabitedness, and `ConcurrentMemory::dereferenceable`
+checks via the machine's live allocations, and the vtable-pointer checks of
+`PtrType::VTablePtr` and of trait objects (`&dyn Trait`, `Box<dyn Trait>`,
+whose size and alignment come from the vtable) through
+`Machine::vtable_from_ptr` on both `Mach` and `MachTB`; the vtable checks read
+the machine's vtables, so a `check_ptr` called without a machine reports
+`unsupported` on them),
 `ValueExpr::AddrOf` (with `BasicMemory`'s identity `retag_ptr`),
 `Statement::Validate` (`Machine::retag_val` across `Ptr`, `Tuple`, `Array`, and
 scalar values), the full 6-module Tree Borrows memory model
@@ -201,8 +207,12 @@ scalar values), the full 6-module Tree Borrows memory model
 polymorphic `BasicMemory<x86_64, ProvExtra, AllocExtra>`),
 `PlaceExpr::Deref` (whose `aligned` flag makes a load or store through a
 misaligned pointer UB), `UnOp::GetThinPointer`, `UnOp::{GetMetadata, ComputeSize,
-ComputeAlign}` for thin and `ElementCount` metadata (vtable metadata and
-`UnOp::VTableMethodLookup` report `Stop.unsupported`), `BinOp::PtrOffset` with both
+ComputeAlign}` for thin, `ElementCount`, and vtable metadata, and
+`UnOp::VTableMethodLookup` (the vtable cases read the machine's vtables on
+`Mach` and `MachTB`, so a dynamic call, `Terminator::Call` on
+`VTableMethodLookup(GetMetadata(self))`, runs end to end:
+`dynDispatch_call_mach_and_machTB_witness`; evaluated without a machine they
+report `Stop.unsupported`), `BinOp::PtrOffset` with both
 `inbounds: true` (`Machine::ptr_offset_inbounds`) and `inbounds: false`
 (`ptr_offset_wrapping`), `BinOp::PtrOffsetFrom`,
 `Constant::PointerWithoutProvenance`, and `Terminator::Intrinsic` for

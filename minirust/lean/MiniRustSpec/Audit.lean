@@ -6583,9 +6583,9 @@ example (thin : Ptr) (len : Nat) (m : Option Mach)
   WideSliceDst.checkPtr_rawSlice_ok thin len m hAddr hLen
 
 example (thin vptr : Ptr) (thinTB vptrTB : ThinPointer TreeBorrowsProvenance)
-    (elemTy ty : Gen.Type) (elemSz elemAlign len : Nat)
+    (elemTy : Gen.Type) (elemSz elemAlign len : Nat)
     (traitName : Gen.TraitName) (meth : Gen.TraitMethodName)
-    (v : Val) (m : Option Mach) (vTB : Gen.Value TBM) (mTB : Option MachTB)
+    (m : Option Mach) (mTB : Option MachTB) (mach : Mach) (machTB : MachTB)
     (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
     (hLen : IntType.can_represent IntType.usize_ty (Int.ofNat len) = true) :
     evalUnOp .GetMetadata (.Ptr (ThinPointer.widen thin none), .Ptr (.Raw .None)) m =
@@ -6604,16 +6604,35 @@ example (thin vptr : Ptr) (thinTB vptrTB : ThinPointer TreeBorrowsProvenance)
       .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
     evalUnOp .GetMetadata
         (.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))),
-         .Ptr (.Raw (.VTablePointer traitName))) m =
+         .Ptr (.Raw (.VTablePointer traitName))) none =
       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
     evalUnOp (.ComputeSize (.TraitObject traitName))
-        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
     evalUnOp (.ComputeAlign (.TraitObject traitName))
-        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
-    evalUnOp (.VTableMethodLookup meth) (v, ty) m =
+    evalUnOp (.VTableMethodLookup meth)
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+    (checkPtr (ThinPointer.widen vptr none) (.VTablePtr traitName) (some mach) = .ok () →
+      evalUnOp .GetMetadata
+          (.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))),
+           .Ptr (.Raw (.VTablePointer traitName))) (some mach) =
+        .ok (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName))) ∧
+    (∀ vt, vtableLookup mach vptr = .ok vt →
+      evalUnOp (.ComputeSize (.TraitObject traitName))
+          (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) (some mach) =
+        .ok (.Int (vt.size.bytes : Int), .Int IntType.usize_ty) ∧
+      evalUnOp (.ComputeAlign (.TraitObject traitName))
+          (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) (some mach) =
+        .ok (.Int (vt.align.bytes : Int), .Int IntType.usize_ty)) ∧
+    (∀ vt fnName fnThin, vtableLookup mach vptr = .ok vt →
+      mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName →
+      mapIndex mach.fn_ptrs fnName "self.fn_ptrs[fn_name]" = .ok fnThin →
+      evalUnOp (.VTableMethodLookup meth)
+          (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) (some mach) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) ∧
     evalUnOpM (M := TBM) .GetMetadata
         (.Ptr (ThinPointer.widen thinTB none), .Ptr (.Raw .None)) mTB =
       .ok (.Tuple [], unitType) ∧
@@ -6633,18 +6652,38 @@ example (thin vptr : Ptr) (thinTB vptrTB : ThinPointer TreeBorrowsProvenance)
       .ok (.Int (elemAlign : Int), .Int IntType.usize_ty) ∧
     evalUnOpM (M := TBM) .GetMetadata
         (.Ptr (ThinPointer.widen thinTB (some (.VTablePointer vptrTB))),
-         .Ptr (.Raw (.VTablePointer traitName))) mTB =
+         .Ptr (.Raw (.VTablePointer traitName))) none =
       unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata" ∧
     evalUnOpM (M := TBM) (.ComputeSize (.TraitObject traitName))
-        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
     evalUnOpM (M := TBM) (.ComputeAlign (.TraitObject traitName))
-        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) mTB =
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
-    evalUnOpM (M := TBM) (.VTableMethodLookup meth) (vTB, ty) mTB =
-      unsupported "eval_un_op for UnOp::VTableMethodLookup" :=
+    evalUnOpM (M := TBM) (.VTableMethodLookup meth)
+        (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) none =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+    (checkPtrM (M := TBM) (ThinPointer.widen vptrTB none) (.VTablePtr traitName) (some machTB) =
+        .ok () →
+      evalUnOpM (M := TBM) .GetMetadata
+          (.Ptr (ThinPointer.widen thinTB (some (.VTablePointer vptrTB))),
+           .Ptr (.Raw (.VTablePointer traitName))) (some machTB) =
+        .ok (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName))) ∧
+    (∀ vt, vtableLookupM machTB vptrTB = .ok vt →
+      evalUnOpM (M := TBM) (.ComputeSize (.TraitObject traitName))
+          (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) (some machTB) =
+        .ok (.Int (vt.size.bytes : Int), .Int IntType.usize_ty) ∧
+      evalUnOpM (M := TBM) (.ComputeAlign (.TraitObject traitName))
+          (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) (some machTB) =
+        .ok (.Int (vt.align.bytes : Int), .Int IntType.usize_ty)) ∧
+    (∀ vt fnName fnThin, vtableLookupM machTB vptrTB = .ok vt →
+      mapIndex vt.methods meth "vtable.methods[method]" = .ok fnName →
+      mapIndex machTB.fn_ptrs fnName "self.fn_ptrs[fn_name]" = .ok fnThin →
+      evalUnOpM (M := TBM) (.VTableMethodLookup meth)
+          (.Ptr (ThinPointer.widen vptrTB none), .Ptr (.VTablePtr traitName)) (some machTB) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)) :=
   minirust_interp_metadata_unops_exec_and_vtable_unsupported
-    thin vptr thinTB vptrTB elemTy ty elemSz elemAlign len traitName meth v m vTB mTB
+    thin vptr thinTB vptrTB elemTy elemSz elemAlign len traitName meth m mTB mach machTB
     hElemLayout hLen
 
 example :
@@ -7301,12 +7340,32 @@ private theorem ep1_compute_size_and_align_nonVTable_indep {P : Type}
     unfold LayoutStrategy.compute_size_and_align
     rw [ep1_compute_size_and_align_nonVTable_indep vt1 vt2 tail (some pm) h]
 
+private theorem ep1_decode_valueM_nonVTable {M : Type} [Gen.Memory M]
+    (ty : Gen.Type) (v : Gen.Value M)
+    (hnv : ∀ t, Type.meta_kind ty ≠ .VTablePointer t)
+    (pm : Option (Gen.PointerMeta (Gen.Memory.Provenance M)))
+    (hdv : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) v = .ok pm) :
+    ∀ p, pm ≠ some (.VTablePointer p) := by
+  intro p hEq
+  subst hEq
+  cases hk : Type.meta_kind ty with
+  | VTablePointer t => exact absurd hk (hnv t)
+  | None =>
+    rw [hk] at hdv; unfold PointerMetaKind.decode_valueM at hdv
+    split at hdv <;> simp_all [pure, Except.pure, specPanic]
+  | ElementCount =>
+    rw [hk] at hdv; unfold PointerMetaKind.decode_valueM at hdv
+    split at hdv <;> simp_all [pure, Except.pure, specPanic]
+
 /-- Non-vtable `ComputeSize` and `ComputeAlign` never invoke `vtableLookupM`, so
 evaluating them with `some mach` and with `none` agree identically on every
-`Memory` `M` (and on `Mach` via `evalUnOpM_bm_eq`). -/
+`Memory` `M` (and on `Mach` via `evalUnOpM_bm_eq`). On a trait-object type
+(`Type.meta_kind ty = .VTablePointer _`) the two differ: `some mach` reads the
+machine's vtables, while `none` fails closed. -/
 theorem ep1_evalUnOpM_computeSize_computeAlign_mach_indep
     {M : Type} [Gen.Memory M] [MemoryOps M]
-    (ty opTy : Gen.Type) (v : Gen.Value M) (mach : Gen.Machine M) :
+    (ty opTy : Gen.Type) (v : Gen.Value M) (mach : Gen.Machine M)
+    (hNonVT : ∀ t, Type.meta_kind ty ≠ .VTablePointer t) :
     evalUnOpM (.ComputeSize ty) (v, opTy) (some mach) =
       evalUnOpM (.ComputeSize ty) (v, opTy) none ∧
     evalUnOpM (.ComputeAlign ty) (v, opTy) (some mach) =
@@ -7317,65 +7376,38 @@ theorem ep1_evalUnOpM_computeSize_computeAlign_mach_indep
     | error _ => rfl
     | ok pm =>
       dsimp only
-      cases pm with
-      | none =>
-        dsimp only
-        cases hlay : Type.layout ty with
-        | error _ => rfl
-        | ok lay =>
-          simp only [computeSizeM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
-          rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
-            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
-            lay none (fun _ h => by cases h)]
-      | some mval =>
-        cases mval with
-        | VTablePointer _ => rfl
-        | ElementCount c =>
-          dsimp only
-          cases hlay : Type.layout ty with
-          | error _ => rfl
-          | ok lay =>
-            simp only [computeSizeM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
-            rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
-              (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
-              lay (some (.ElementCount c)) (fun _ h => by cases h)]
+      cases hlay : Type.layout ty with
+      | error _ => rfl
+      | ok lay =>
+        simp only [computeSizeM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+        rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+          (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+          lay pm (ep1_decode_valueM_nonVTable ty v hNonVT pm hdv)]
   · unfold evalUnOpM; dsimp only; simp only [bind, Except.bind]
     cases hdv : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) v with
     | error _ => rfl
     | ok pm =>
       dsimp only
-      cases pm with
-      | none =>
-        dsimp only
-        cases hlay : Type.layout ty with
-        | error _ => rfl
-        | ok lay =>
-          simp only [computeAlignM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
-          rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
-            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
-            lay none (fun _ h => by cases h)]
-      | some mval =>
-        cases mval with
-        | VTablePointer _ => rfl
-        | ElementCount c =>
-          dsimp only
-          cases hlay : Type.layout ty with
-          | error _ => rfl
-          | ok lay =>
-            simp only [computeAlignM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
-            rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
-              (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
-              lay (some (.ElementCount c)) (fun _ h => by cases h)]
+      cases hlay : Type.layout ty with
+      | error _ => rfl
+      | ok lay =>
+        simp only [computeAlignM, Functor.map, Except.map, bind, Except.bind, pure, Except.pure]
+        rw [ep1_compute_size_and_align_nonVTable_indep (vtableLookupM mach)
+          (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+          lay pm (ep1_decode_valueM_nonVTable ty v hNonVT pm hdv)]
 
 /-- Universal specification of `evalUnOpM` on `GetMetadata`, `ComputeSize`,
-`ComputeAlign` (including unsized structs with a slice tail), and fail-closed
-vtable boundaries (`VTablePointer` metadata and `VTableMethodLookup`). -/
+`ComputeAlign` (including unsized structs with a slice tail), the machine-free
+(`m = none`) fail-closed vtable boundaries (`VTablePointer` metadata and
+`VTableMethodLookup` on a pointer operand), and upstream's
+`panic!("vtable lookup on non-pointer")` on a non-pointer operand (with or
+without a machine). -/
 theorem ep1_evalUnOpM_meta_unops_spec {M : Type} [Gen.Memory M] [MemoryOps M]
     (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
     (fields : List (Gen.Offset × Gen.Type)) (head : Gen.TupleHeadLayout)
     (elemTy opTy : Gen.Type) (elemSz elemAlign len : Nat)
     (badCount : Int) (traitName : Gen.TraitName) (meth : Gen.TraitMethodName)
-    (v : Gen.Value M) (m : Option (Gen.Machine M))
+    (m : Option (Gen.Machine M))
     (hElemLayout : Type.layout elemTy = .ok (.Sized ⟨elemSz⟩ ⟨elemAlign⟩))
     (hBadCount : IntType.can_represent IntType.usize_ty badCount = false) :
     let dstTy : Gen.Type := .Tuple fields head (some (.Slice elemTy))
@@ -7392,18 +7424,21 @@ theorem ep1_evalUnOpM_meta_unops_spec {M : Type} [Gen.Memory M] [MemoryOps M]
     evalUnOpM (M := M) (.ComputeAlign dstTy) (.Int (Int.ofNat len), .Int IntType.usize_ty) m =
       .ok (.Int (dstPair.2.bytes : Int), .Int IntType.usize_ty) ∧
     evalUnOpM (M := M) (.ComputeSize (.Tuple fields head (some (.TraitObject traitName))))
-        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata" ∧
     evalUnOpM (M := M) (.ComputeAlign (.Tuple fields head (some (.TraitObject traitName))))
-        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) m =
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
       unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata" ∧
-    evalUnOpM (M := M) (.VTableMethodLookup meth) (v, opTy) m =
-      unsupported "eval_un_op for UnOp::VTableMethodLookup" := by
+    evalUnOpM (M := M) (.VTableMethodLookup meth)
+        (.Ptr (ThinPointer.widen vptr none), .Ptr (.VTablePtr traitName)) none =
+      unsupported "eval_un_op for UnOp::VTableMethodLookup" ∧
+    evalUnOpM (M := M) (.VTableMethodLookup meth) (.Int 0, opTy) m =
+      specPanic "vtable lookup on non-pointer" := by
   have hDstLayout : Type.layout (.Tuple fields head (some (.Slice elemTy))) =
       .ok (.Tuple head (.Slice ⟨elemSz⟩ ⟨elemAlign⟩)) := by
     simp [Type.layout, hElemLayout, LayoutStrategy.expect_size, LayoutStrategy.expect_align,
       bind, Except.bind, pure, Except.pure]
-  refine ⟨?_, rfl, rfl, ?_, ?_, rfl, rfl, rfl⟩
+  refine ⟨?_, rfl, rfl, ?_, ?_, rfl, rfl, rfl, rfl⟩
   · simp [evalUnOpM, ThinPointer.widen, PtrType.meta_kind, PointerMetaKind.encode_as_valueM,
       PointerMetaKind.ty, checkValueM, ensureElseUb, hBadCount, ub, bind, Except.bind, pure,
       Except.pure]
@@ -8212,9 +8247,14 @@ metadata, on every `Memory` `M` and with or without a machine:
 * `ElementCount` kind + element count `c` returns `Value::Int(c)` at `usize` exactly when
   `c` fits in a `usize`, and otherwise is upstream's failed O(1) sanity check
   (`check_value(..).expect(..)`, a spec panic — never UB);
-* `VTablePointer` kind + vtable metadata is fail-closed `unsupported`;
+* `VTablePointer` kind + vtable metadata is fail-closed `unsupported` without a machine
+  (`m = none`); with a machine it returns the vtable pointer at
+  `Type::Ptr(PtrType::VTablePtr(trait_name))` exactly when that pointer passes
+  `check_ptr` (`Machine::vtable_from_ptr` and the trait check), turns UB from
+  `check_ptr` into upstream's `.expect(..)` spec panic, and propagates any
+  internal spec panic (such as a missing `prog.vtables` entry) directly;
 * every kind/metadata mismatch (all five) is upstream's `encode_as_value` panic, which
-  therefore takes precedence over the vtable fail-closed stop. -/
+  therefore takes precedence over the machine-free vtable fail-closed stop. -/
 theorem ep1_evalUnOpM_getMetadata_complete_spec {M : Type} [Gen.Memory M] [MemoryOps M]
     (thin : Gen.ThinPointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
     (m : Option (Gen.Machine M)) :
@@ -8226,7 +8266,7 @@ theorem ep1_evalUnOpM_getMetadata_complete_spec {M : Type} [Gen.Memory M] [Memor
         | true => .ok (.Int c, .Int IntType.usize_ty)
         | false => specPanic "GetMetadata: sanity check, returned meta is well-formed") ∧
     (∀ t p, PtrType.meta_kind ptrTy = .VTablePointer t →
-      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.VTablePointer p)⟩, .Ptr ptrTy) m =
+      evalUnOpM (M := M) .GetMetadata (.Ptr ⟨thin, some (.VTablePointer p)⟩, .Ptr ptrTy) none =
         unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata") ∧
     (∀ pm, PtrType.meta_kind ptrTy = .None →
       evalUnOpM .GetMetadata (.Ptr ⟨thin, some pm⟩, .Ptr ptrTy) m =
@@ -8242,8 +8282,14 @@ theorem ep1_evalUnOpM_getMetadata_complete_spec {M : Type} [Gen.Memory M] [Memor
         specPanic "PointerMeta::encode_as_value called with invalid value") ∧
     (∀ t c, PtrType.meta_kind ptrTy = .VTablePointer t →
       evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.ElementCount c)⟩, .Ptr ptrTy) m =
-        specPanic "PointerMeta::encode_as_value called with invalid value") := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+        specPanic "PointerMeta::encode_as_value called with invalid value") ∧
+    (∀ t p mach, PtrType.meta_kind ptrTy = .VTablePointer t →
+      evalUnOpM .GetMetadata (.Ptr ⟨thin, some (.VTablePointer p)⟩, .Ptr ptrTy) (some mach) =
+        match checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) with
+        | .ok () => .ok (.Ptr ⟨p, none⟩, .Ptr (.VTablePtr t))
+        | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error e => .error e) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro hk
     have hCheck : checkValueM (M := M) (.Tuple []) unitType m = .ok () := by
       rw [unitType, checkValueM]; rfl
@@ -8277,6 +8323,17 @@ theorem ep1_evalUnOpM_getMetadata_complete_spec {M : Type} [Gen.Memory M] [Memor
     simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
   · intro t c hk
     simp [evalUnOpM, hk, PointerMetaKind.encode_as_valueM, specPanic, bind, Except.bind]
+  · intro t p mach hk
+    have hcv : checkValueM (M := M) (.Ptr ⟨p, none⟩) (.Ptr (.VTablePtr t)) (some mach) =
+        checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) := by
+      rw [checkValueM]
+    rw [evalUnOpM]
+    simp only [hk, PointerMetaKind.encode_as_valueM, PointerMetaKind.ty, bind, Except.bind,
+      pure, Except.pure]
+    rw [hcv]
+    cases checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) with
+    | ok u => cases u; rfl
+    | error e => cases e <;> rfl
 
 private theorem ep1_bind_error {α β : Type} {x : Interp α} {f : α → Interp β} {e : Stop}
     (h : (x >>= f) = .error e) : x = .error e ∨ ∃ a, x = .ok a ∧ f a = .error e := by
@@ -8409,12 +8466,244 @@ private theorem ep1_meta_layout_tail_error_is_specPanic {M : Type} [Gen.Memory M
         (ep1_map_error hc)
     · simp [pure, Except.pure] at hp
 
+private theorem ep1_mapIndex_error_is_specPanic {K V : Type} [DecidableEq K]
+    {mp : Map K V} {k : K} {what : String} {e : Stop}
+    (h : mapIndex mp k what = .error e) : ∃ msg, e = .specPanic msg := by
+  unfold mapIndex at h
+  split at h
+  · simp [pure, Except.pure] at h
+  · simp [specPanic] at h; exact ⟨_, h.symm⟩
+
+/-- `Machine::vtable_lookup` fails only by a spec panic (its `unwrap()` and its map
+index): it has no `throw_ub!`. -/
+private theorem ep1_vtableLookupM_error_is_specPanic {M : Type} [Gen.Memory M] [MemoryOps M]
+    (mach : Gen.Machine M) (p : Gen.ThinPointer (Gen.Memory.Provenance M)) (e : Stop)
+    (h : vtableLookupM mach p = .error e) : ∃ msg, e = .specPanic msg := by
+  unfold vtableLookupM at h
+  split at h
+  · exact ep1_mapIndex_error_is_specPanic h
+  · simp [specPanic] at h; exact ⟨_, h.symm⟩
+
+/-- `LayoutStrategy::compute_size_and_align` fails only by a spec panic or by a failure
+of its vtable lookup `vt`: every failure satisfies `Q` as soon as spec panics and the
+failures of `vt` do. -/
+private theorem ep1_compute_size_and_align_error_of_lookup {P : Type}
+    (vt : Gen.ThinPointer P → Interp Gen.VTable) (Q : Stop → Prop)
+    (hSpec : ∀ msg, Q (.specPanic msg)) (hvt : ∀ p e, vt p = .error e → Q e) :
+    ∀ (lay : Gen.LayoutStrategy) (pm : Option (Gen.PointerMeta P)) (e : Stop),
+      LayoutStrategy.compute_size_and_align vt lay pm = .error e → Q e
+  | .Sized _ _, none, e, h => by
+    simp [LayoutStrategy.compute_size_and_align, pure, Except.pure] at h
+  | .Sized _ _, some _, e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .Slice _ _, none, e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .Slice elemSize _, some (.ElementCount count), e, h => by
+    unfold LayoutStrategy.compute_size_and_align at h
+    dsimp only at h
+    split at h
+    · simp [pure, Except.pure] at h
+    · simp [specPanic] at h; subst h; exact hSpec _
+  | .Slice _ _, some (.VTablePointer _), e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .TraitObject _, none, e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .TraitObject _, some (.ElementCount _), e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .TraitObject _, some (.VTablePointer p), e, h => by
+    unfold LayoutStrategy.compute_size_and_align at h
+    rcases ep1_bind_error h with hv | ⟨_, _, hp⟩
+    · exact hvt p e hv
+    · simp [pure, Except.pure] at hp
+  | .Tuple _ _, none, e, h => by
+    simp [LayoutStrategy.compute_size_and_align, specPanic] at h; subst h; exact hSpec _
+  | .Tuple head tail, some pm, e, h => by
+    unfold LayoutStrategy.compute_size_and_align at h
+    rcases ep1_bind_error h with ht | ⟨r, _, hp⟩
+    · exact ep1_compute_size_and_align_error_of_lookup vt Q hSpec hvt tail (some pm) e ht
+    · simp [pure, Except.pure] at hp
+
+/-- `Machine::vtable_from_ptr` fails only by UB (unmapped vtable pointer) or by
+a `prog.vtables` map-index spec panic. -/
+private theorem ep1_vtableFromPtrM_error_is_ub_or_specPanic {M : Type} [Gen.Memory M]
+    [MemoryOps M] (mach : Gen.Machine M) (p : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (e : Stop) (h : vtableFromPtrM mach p = .error e) :
+    (∃ msg, e = .ub msg) ∨ (∃ msg, e = .specPanic msg) := by
+  unfold vtableFromPtrM at h
+  split at h
+  · exact Or.inr (ep1_mapIndex_error_is_specPanic h)
+  · simp [ub] at h; exact Or.inl ⟨_, h.symm⟩
+
+/-- `check_ptr` at `PtrType::VTablePtr` with a machine (`some mach`) fails only
+by UB or a `prog.vtables` map-index spec panic — never `unsupported`. -/
+private theorem ep1_checkPtrM_vtablePtr_error_is_ub_or_specPanic {M : Type} [Gen.Memory M]
+    [MemoryOps M] (mach : Gen.Machine M) (p : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (t : Gen.TraitName) (e : Stop)
+    (h : checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) = .error e) :
+    (∃ msg, e = .ub msg) ∨ (∃ msg, e = .specPanic msg) := by
+  unfold checkPtrM at h
+  dsimp only [PtrType.meta_kind, PtrType.safe_pointee] at h
+  rcases ep1_bind_error h with h1 | ⟨_, _, h⟩
+  · unfold ensureElseUb at h1
+    split at h1
+    · simp [ub] at h1; exact Or.inl ⟨_, h1.symm⟩
+    · simp [pure, Except.pure] at h1
+  · rw [checkPtrMetadataM_none] at h
+    dsimp only [bind, Except.bind] at h
+    rcases ep1_bind_error h with h2 | ⟨vt, _, h3⟩
+    · exact ep1_vtableFromPtrM_error_is_ub_or_specPanic mach p e h2
+    · unfold ensureElseUb at h3
+      split at h3
+      · simp [ub] at h3; exact Or.inl ⟨_, h3.symm⟩
+      · simp [pure, Except.pure] at h3
+
+/-- **Strict machine-supplied panic totality across all four metadata/vtable
+unary operators**: when a machine `some mach` is supplied, every failure of
+`UnOp::{GetMetadata, ComputeSize, ComputeAlign, VTableMethodLookup}` on any
+`Memory` `M`, any type (including `TraitObject` and unsized structs with a
+trait-object tail), and any operand is strictly `Stop.specPanic` — never
+`unsupported` and never `Stop.ub`. -/
+theorem ep1_evalUnOpM_meta_unops_some_mach_error_is_specPanic
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (ty : Gen.Type) (meth : Gen.TraitMethodName) (arg : Gen.Value M × Gen.Type)
+    (mach : Gen.Machine M) (e : Stop) :
+    (evalUnOpM .GetMetadata arg (some mach) = .error e ∨
+     evalUnOpM (.ComputeSize ty) arg (some mach) = .error e ∨
+     evalUnOpM (.ComputeAlign ty) arg (some mach) = .error e ∨
+     evalUnOpM (.VTableMethodLookup meth) arg (some mach) = .error e) →
+    ∃ msg, e = .specPanic msg := by
+  obtain ⟨v, opTy⟩ := arg
+  have hDecode : ∀ (k : Gen.PointerMetaKind) (e' : Stop),
+      PointerMetaKind.decode_valueM (M := M) k v = .error e' → ∃ msg, e' = .specPanic msg := by
+    intro k e' h
+    unfold PointerMetaKind.decode_valueM at h
+    split at h <;> simp [specPanic, pure, Except.pure] at h
+    exact ⟨_, h.symm⟩
+  have hSpecQ : ∀ (msg : String), ∃ msg', Stop.specPanic msg = .specPanic msg' :=
+    fun msg => ⟨msg, rfl⟩
+  have hLookupSome : ∀ (p : Gen.ThinPointer (Gen.Memory.Provenance M)) (e' : Stop),
+      vtableLookupM mach p = .error e' → ∃ msg, e' = .specPanic msg :=
+    ep1_vtableLookupM_error_is_specPanic mach
+  rintro (h | h | h | h)
+  · -- GetMetadata
+    have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
+        x = specPanic "non-pointer GetMetadata" → x = .error e →
+        ∃ msg, e = .specPanic msg := by
+      intro x hx hxe
+      rw [hx] at hxe
+      simp [specPanic] at hxe
+      exact ⟨_, hxe.symm⟩
+    cases v with
+    | Ptr ptr =>
+      cases opTy with
+      | Ptr ptrTy =>
+        unfold evalUnOpM at h
+        dsimp only at h
+        rcases ep1_bind_error h with hd | ⟨mv, hmv, h⟩
+        · unfold PointerMetaKind.encode_as_valueM at hd
+          split at hd <;> simp [specPanic, pure, Except.pure] at hd
+          exact ⟨_, hd.symm⟩
+        · cases hk : PtrType.meta_kind ptrTy with
+          | VTablePointer t =>
+            rw [hk] at h hmv
+            cases hpm : ptr.metadata with
+            | none => simp [hpm, PointerMetaKind.encode_as_valueM, specPanic] at hmv
+            | some pm =>
+              cases pm with
+              | ElementCount _ => simp [hpm, PointerMetaKind.encode_as_valueM, specPanic] at hmv
+              | VTablePointer p =>
+                simp only [hpm, PointerMetaKind.encode_as_valueM, pure, Except.pure,
+                  Except.ok.injEq] at hmv
+                subst hmv
+                have hcv : checkValueM (M := M) (.Ptr ⟨p, none⟩)
+                    (PointerMetaKind.ty (.VTablePointer t)) (some mach) =
+                    checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) := by
+                  rw [PointerMetaKind.ty, checkValueM]
+                dsimp only at h
+                rw [hcv] at h
+                cases hchk : checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) with
+                | ok u =>
+                  cases u
+                  rw [hchk] at h
+                  simp [pure, Except.pure] at h
+                | error e' =>
+                  rw [hchk] at h
+                  rcases ep1_checkPtrM_vtablePtr_error_is_ub_or_specPanic mach p t e' hchk with
+                    ⟨msg, rfl⟩ | ⟨msg, rfl⟩
+                  · simp [specPanic] at h; exact ⟨_, h.symm⟩
+                  · dsimp only at h; simp only [Except.error.injEq] at h; exact ⟨msg, h.symm⟩
+          | None =>
+            rw [hk] at h
+            dsimp only at h
+            split at h
+            · simp [pure, Except.pure] at h
+            · simp [specPanic] at h; exact ⟨_, h.symm⟩
+          | ElementCount =>
+            rw [hk] at h
+            dsimp only at h
+            split at h
+            · simp [pure, Except.pure] at h
+            · simp [specPanic] at h; exact ⟨_, h.symm⟩
+      | _ => exact hPanic _ rfl h
+    | _ => exact hPanic _ rfl h
+  · -- ComputeSize
+    unfold evalUnOpM at h
+    dsimp only at h
+    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+    · exact hDecode _ _ hd
+    · rcases ep1_bind_error h with hl | ⟨lay, _, h⟩
+      · exact ep1_Type_layout_error_is_specPanic ty e hl
+      · rcases ep1_bind_error h with hc | ⟨x, _, hp⟩
+        · unfold computeSizeM at hc
+          rcases ep1_bind_error hc with hcsa | ⟨⟨_, _⟩, _, hp⟩
+          · exact ep1_compute_size_and_align_error_of_lookup _ _ hSpecQ hLookupSome lay pm e hcsa
+          · simp [pure, Except.pure] at hp
+        · simp [pure, Except.pure] at hp
+  · -- ComputeAlign
+    unfold evalUnOpM at h
+    dsimp only at h
+    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+    · exact hDecode _ _ hd
+    · rcases ep1_bind_error h with hl | ⟨lay, _, h⟩
+      · exact ep1_Type_layout_error_is_specPanic ty e hl
+      · rcases ep1_bind_error h with hc | ⟨x, _, hp⟩
+        · unfold computeAlignM at hc
+          rcases ep1_bind_error hc with hcsa | ⟨⟨_, _⟩, _, hp⟩
+          · exact ep1_compute_size_and_align_error_of_lookup _ _ hSpecQ hLookupSome lay pm e hcsa
+          · simp [pure, Except.pure] at hp
+        · simp [pure, Except.pure] at hp
+  · -- VTableMethodLookup
+    have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
+        x = specPanic "vtable lookup on non-pointer" → x = .error e →
+        ∃ msg, e = .specPanic msg := by
+      intro x hx hxe
+      rw [hx] at hxe
+      simp [specPanic] at hxe
+      exact ⟨_, hxe.symm⟩
+    cases v with
+    | Ptr ptr =>
+      cases opTy with
+      | Ptr ptrTy =>
+        unfold evalUnOpM at h
+        dsimp only at h
+        rcases ep1_bind_error h with hv | ⟨vt, _, h⟩
+        · exact ep1_vtableLookupM_error_is_specPanic mach _ e hv
+        · rcases ep1_bind_error h with hf | ⟨fnName, _, h⟩
+          · exact ep1_mapIndex_error_is_specPanic hf
+          · rcases ep1_bind_error h with hp | ⟨fnThin, _, hp⟩
+            · exact ep1_mapIndex_error_is_specPanic hp
+            · simp [pure, Except.pure] at hp
+      | _ => exact hPanic _ rfl h
+    | _ => exact hPanic _ rfl h
+
 /-- **No fabricated UB in the metadata operators.** Upstream's `eval_un_op` arms for
-`GetMetadata`, `ComputeSize`, and `ComputeAlign` contain no `throw_ub!` (only `panic!`s
-and `.expect(..)`), and `VTableMethodLookup` is outside the fragment. Accordingly, on
+`GetMetadata`, `ComputeSize`, `ComputeAlign`, and `VTableMethodLookup` contain no
+`throw_ub!` (only `panic!`s, `.expect(..)`, `unwrap()`s, and map indexing; the
+`check_value` failure in `GetMetadata` is caught by `.expect(..)`). Accordingly, on
 every `Memory` `M`, every operand, and with or without a machine, each of these four
-operators either succeeds or stops with `Stop.specPanic` or `Stop.unsupported` — never
-`Stop.ub` (nor `abort`, `deadlock`, `machineStop`, or `memoryLeak`). -/
+operators either succeeds or stops with `Stop.specPanic` or (machine-free vtable cases
+only) with the `unsupported` stop — never `Stop.ub` (nor `abort`, `deadlock`,
+`machineStop`, or `memoryLeak`). -/
 theorem ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported
     {M : Type} [Gen.Memory M] [MemoryOps M]
     (ty : Gen.Type) (meth : Gen.TraitMethodName) (arg : Gen.Value M × Gen.Type)
@@ -8424,97 +8713,104 @@ theorem ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported
      evalUnOpM (.ComputeAlign ty) arg m = .error e ∨
      evalUnOpM (.VTableMethodLookup meth) arg m = .error e) →
     (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
-  obtain ⟨v, opTy⟩ := arg
-  have hDecode : ∀ (k : Gen.PointerMetaKind) (e' : Stop),
-      PointerMetaKind.decode_valueM (M := M) k v = .error e' → ∃ msg, e' = .specPanic msg := by
-    intro k e' h
-    unfold PointerMetaKind.decode_valueM at h
-    split at h <;> simp [specPanic, pure, Except.pure] at h
-    exact ⟨_, h.symm⟩
-  have hSize : ∀ (e' : Stop), evalUnOpM (.ComputeSize ty) (v, opTy) none = .error e' →
-      (∃ msg, e' = .specPanic msg) ∨ (∃ msg, e' = .unsupported msg) := by
-    intro e' h
-    unfold evalUnOpM at h
-    dsimp only at h
-    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
-    · exact Or.inl (hDecode _ _ hd)
-    · cases pm with
-      | none =>
-        exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty none
-          (fun _ hx => by cases hx) e' h)
-      | some mval =>
-        cases mval with
-        | VTablePointer p => cases h; exact Or.inr ⟨_, rfl⟩
-        | ElementCount c =>
-          exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty
-            (some (.ElementCount c)) (fun _ hx => by cases hx) e' h)
-  have hAlign : ∀ (e' : Stop), evalUnOpM (.ComputeAlign ty) (v, opTy) none = .error e' →
-      (∃ msg, e' = .specPanic msg) ∨ (∃ msg, e' = .unsupported msg) := by
-    intro e' h
-    unfold evalUnOpM at h
-    dsimp only at h
-    rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
-    · exact Or.inl (hDecode _ _ hd)
-    · cases pm with
-      | none =>
-        exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty none
-          (fun _ hx => by cases hx) e' h)
-      | some mval =>
-        cases mval with
-        | VTablePointer p => cases h; exact Or.inr ⟨_, rfl⟩
-        | ElementCount c =>
-          exact Or.inl (ep1_meta_layout_tail_error_is_specPanic _ _ _ ty
-            (some (.ElementCount c)) (fun _ hx => by cases hx) e' h)
-  rintro (h | h | h | h)
-  · -- GetMetadata
-    have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
-        x = specPanic "non-pointer GetMetadata" → x = .error e →
-        (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
-      intro x hx hxe
-      rw [hx] at hxe
-      simp [specPanic] at hxe
-      exact Or.inl ⟨_, hxe.symm⟩
-    cases v with
-    | Ptr ptr =>
-      cases opTy with
-      | Ptr ptrTy =>
-        unfold evalUnOpM at h
-        dsimp only at h
-        rcases ep1_bind_error h with hd | ⟨mv, _, h⟩
-        · unfold PointerMetaKind.encode_as_valueM at hd
-          split at hd <;> simp [specPanic, pure, Except.pure] at hd
-          exact Or.inl ⟨_, hd.symm⟩
-        · cases hk : PtrType.meta_kind ptrTy with
-          | VTablePointer t =>
-            rw [hk] at h
-            cases h
-            exact Or.inr ⟨_, rfl⟩
-          | None =>
-            rw [hk] at h
-            dsimp only at h
-            split at h
-            · simp [pure, Except.pure] at h
-            · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
-          | ElementCount =>
-            rw [hk] at h
-            dsimp only at h
-            split at h
-            · simp [pure, Except.pure] at h
-            · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
+  cases m with
+  | some mach =>
+    intro h
+    exact Or.inl (ep1_evalUnOpM_meta_unops_some_mach_error_is_specPanic ty meth arg mach e h)
+  | none =>
+    obtain ⟨v, opTy⟩ := arg
+    have hDecode : ∀ (k : Gen.PointerMetaKind) (e' : Stop),
+        PointerMetaKind.decode_valueM (M := M) k v = .error e' → ∃ msg, e' = .specPanic msg := by
+      intro k e' h
+      unfold PointerMetaKind.decode_valueM at h
+      split at h <;> simp [specPanic, pure, Except.pure] at h
+      exact ⟨_, h.symm⟩
+    have hSpecQ : ∀ (msg : String),
+        (∃ msg', Stop.specPanic msg = .specPanic msg') ∨
+          (∃ msg', Stop.specPanic msg = .unsupported msg') :=
+      fun msg => Or.inl ⟨msg, rfl⟩
+    have hLookupNone : ∀ (what : String) (e' : Stop),
+        (unsupported what : Interp Gen.VTable) = .error e' →
+        (∃ msg, e' = .specPanic msg) ∨ (∃ msg, e' = .unsupported msg) := by
+      intro what e' h
+      simp [unsupported] at h
+      exact Or.inr ⟨_, h.symm⟩
+    rintro (h | h | h | h)
+    · -- GetMetadata (`m = none`)
+      have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
+          x = specPanic "non-pointer GetMetadata" → x = .error e →
+          (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
+        intro x hx hxe
+        rw [hx] at hxe
+        simp [specPanic] at hxe
+        exact Or.inl ⟨_, hxe.symm⟩
+      cases v with
+      | Ptr ptr =>
+        cases opTy with
+        | Ptr ptrTy =>
+          unfold evalUnOpM at h
+          dsimp only at h
+          rcases ep1_bind_error h with hd | ⟨mv, _, h⟩
+          · unfold PointerMetaKind.encode_as_valueM at hd
+            split at hd <;> simp [specPanic, pure, Except.pure] at hd
+            exact Or.inl ⟨_, hd.symm⟩
+          · cases hk : PtrType.meta_kind ptrTy with
+            | VTablePointer t =>
+              rw [hk] at h
+              cases h
+              exact Or.inr ⟨_, rfl⟩
+            | None =>
+              rw [hk] at h
+              dsimp only at h
+              split at h
+              · simp [pure, Except.pure] at h
+              · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
+            | ElementCount =>
+              rw [hk] at h
+              dsimp only at h
+              split at h
+              · simp [pure, Except.pure] at h
+              · simp [specPanic] at h; exact Or.inl ⟨_, h.symm⟩
+        | _ => exact hPanic _ rfl h
       | _ => exact hPanic _ rfl h
-    | _ => exact hPanic _ rfl h
-  · cases m with
-    | none => exact hSize e h
-    | some mach =>
-      rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).1] at h
-      exact hSize e h
-  · cases m with
-    | none => exact hAlign e h
-    | some mach =>
-      rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).2] at h
-      exact hAlign e h
-  · simp [evalUnOpM, unsupported] at h
-    exact Or.inr ⟨_, h.symm⟩
+    · -- ComputeSize (`m = none`)
+      unfold evalUnOpM at h
+      dsimp only at h
+      rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+      · exact Or.inl (hDecode _ _ hd)
+      · rcases ep1_bind_error h with hl | ⟨lay, _, h⟩
+        · exact Or.inl (ep1_Type_layout_error_is_specPanic ty e hl)
+        · rcases ep1_bind_error h with hc | ⟨x, _, hp⟩
+          · exact ep1_compute_size_and_align_error_of_lookup _ _ hSpecQ
+              (fun _ e' hx => hLookupNone _ e' hx) lay pm e (ep1_map_error hc)
+          · simp [pure, Except.pure] at hp
+    · -- ComputeAlign (`m = none`)
+      unfold evalUnOpM at h
+      dsimp only at h
+      rcases ep1_bind_error h with hd | ⟨pm, _, h⟩
+      · exact Or.inl (hDecode _ _ hd)
+      · rcases ep1_bind_error h with hl | ⟨lay, _, h⟩
+        · exact Or.inl (ep1_Type_layout_error_is_specPanic ty e hl)
+        · rcases ep1_bind_error h with hc | ⟨x, _, hp⟩
+          · exact ep1_compute_size_and_align_error_of_lookup _ _ hSpecQ
+              (fun _ e' hx => hLookupNone _ e' hx) lay pm e (ep1_map_error hc)
+          · simp [pure, Except.pure] at hp
+    · -- VTableMethodLookup (`m = none`)
+      have hPanic : ∀ (x : Interp (Gen.Value M × Gen.Type)),
+          x = specPanic "vtable lookup on non-pointer" → x = .error e →
+          (∃ msg, e = .specPanic msg) ∨ (∃ msg, e = .unsupported msg) := by
+        intro x hx hxe
+        rw [hx] at hxe
+        simp [specPanic] at hxe
+        exact Or.inl ⟨_, hxe.symm⟩
+      cases v with
+      | Ptr ptr =>
+        cases opTy with
+        | Ptr ptrTy =>
+          simp [evalUnOpM, unsupported] at h
+          exact Or.inr ⟨_, h.symm⟩
+        | _ => exact hPanic _ rfl h
+      | _ => exact hPanic _ rfl h
 
 /-! ### `[adv B1]` Concrete edge-case witnesses -/
 
@@ -8757,6 +9053,1845 @@ theorem ep1_meta_unops_end_to_end_evalValue_witness :
       ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_, ep1_ok_of_map_fst ?_⟩,
     ⟨?_, ?_, ?_, ?_, ?_, ?_⟩⟩
   all_goals ep1_kernel_rfl
+
+/-! ### Vtable pointers, trait-object safe pointers, and vtable unary operators with a machine
+
+Concrete kernel-checked witnesses, on both `Mach` (`BasicMemory`) and `MachTB` (Tree
+Borrows), for `Machine::vtable_from_ptr`, `check_ptr` at `PtrType::VTablePtr` and on
+trait-object safe pointers (`&dyn Trait`, `Box<dyn Trait>`), and the vtable cases of
+`UnOp::{GetMetadata, ComputeSize, ComputeAlign, VTableMethodLookup}`. The universal
+statements are in `MiniRustSpec.Correspondence.Pointers` (`checkPtr_traitObject_ok`,
+`checkPtr_vtablePtr_wrong_trait_ub`, ...). -/
+
+private def ep1VtTrait0 : Gen.TraitName := ⟨⟨0⟩⟩
+private def ep1VtTrait1 : Gen.TraitName := ⟨⟨1⟩⟩
+private def ep1VtMeth0 : Gen.TraitMethodName := ⟨⟨0⟩⟩
+private def ep1VtMeth1 : Gen.TraitMethodName := ⟨⟨1⟩⟩
+
+/-- A vtable for trait `0`: size `8`, alignment `8`, and method `0` implemented by
+function `1`. -/
+private def ep1VTable0 : Gen.VTable :=
+  { trait_name := ep1VtTrait0, size := ⟨8⟩, align := ⟨8⟩, cells := [],
+    methods := ⟨[(ep1VtMeth0, ⟨⟨1⟩⟩)]⟩ }
+
+/-- A vtable for trait `1`: size `4`, alignment `4`, no methods. -/
+private def ep1VTable1 : Gen.VTable :=
+  { trait_name := ep1VtTrait1, size := ⟨4⟩, align := ⟨4⟩, cells := [], methods := ⟨[]⟩ }
+
+private def ep1VtProg : Gen.Program :=
+  { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+    traits := ⟨[(ep1VtTrait0, ⟨[ep1VtMeth0]⟩), (ep1VtTrait1, ⟨[]⟩)]⟩,
+    vtables := ⟨[(⟨⟨0⟩⟩, ep1VTable0), (⟨⟨1⟩⟩, ep1VTable1)]⟩ }
+
+/-- Allocations of `ep1VtMachBM`: `0` is a live 8-byte object at `0x1000`, `1` a live
+4-byte object at `0x2000`, `2` a dead 8-byte object at `0x3000`, `3` and `4` the vtables
+for traits `0` and `1` at `0x4000` and `0x4008`, and `5` function `1` at `0x5000`. -/
+private def ep1VtAllocsBM : List (Gen.Allocation Unit Unit) :=
+  [{ data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩, kind := .Heap,
+     live := true, extra := () },
+   { data := List.replicate 4 (.Init 0 none), addr := 0x2000, align := ⟨8⟩, kind := .Heap,
+     live := true, extra := () },
+   { data := List.replicate 8 (.Init 0 none), addr := 0x3000, align := ⟨8⟩, kind := .Heap,
+     live := false, extra := () },
+   { data := [], addr := 0x4000, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+   { data := [], addr := 0x4008, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+   { data := [], addr := 0x5000, align := ⟨1⟩, kind := .Function, live := true, extra := () }]
+
+/-- A `BasicMemory` machine with two vtables and one function pointer. -/
+private def ep1VtMachBM : Mach :=
+  { prog := ep1VtProg
+    mem := { memory := { allocations := ep1VtAllocsBM, _phantom := ⟨⟩ }, accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := []
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(⟨⟨1⟩⟩, ⟨0x5000, some (⟨5⟩, ())⟩)]⟩
+    vtable_ptrs := ⟨[(⟨⟨0⟩⟩, ⟨0x4000, some (⟨3⟩, ())⟩), (⟨⟨1⟩⟩, ⟨0x4008, some (⟨4⟩, ())⟩)]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+private def ep1VtAllocTB (addr : Int) (al n : Nat) (kind : Gen.AllocationKind) (live : Bool) :
+    Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra :=
+  { data := List.replicate n (.Init 0 none), addr := addr, align := ⟨al⟩, kind := kind,
+    live := live,
+    extra := { root := { children := [], permissions := List.replicate n (.Unprot .Unique),
+                         «protected» := .No } } }
+
+/-- The Tree Borrows allocations corresponding to `ep1VtAllocsBM`. -/
+private def ep1VtAllocsTB : List (Gen.Allocation Gen.Path Gen.TreeBorrowsAllocationExtra) :=
+  [ep1VtAllocTB 0x1000 8 8 .Heap true, ep1VtAllocTB 0x2000 8 4 .Heap true,
+   ep1VtAllocTB 0x3000 8 8 .Heap false, ep1VtAllocTB 0x4000 1 0 .VTable true,
+   ep1VtAllocTB 0x4008 1 0 .VTable true, ep1VtAllocTB 0x5000 1 0 .Function true]
+
+/-- The Tree Borrows machine with the same allocations, vtables, and function pointer as
+`ep1VtMachBM` (root provenance `[]`). -/
+private def ep1VtMachTB : MachTB :=
+  { prog := ep1VtProg
+    mem := { memory := { params := { implicit_writes := false },
+                         mem := { allocations := ep1VtAllocsTB, _phantom := ⟨⟩ } },
+             accesses := [] }
+    intptrcast := ⟨⟨[]⟩⟩
+    threads := []
+    active_thread := 0
+    synchronized_threads := ⟨[]⟩
+    locks := []
+    global_ptrs := ⟨[]⟩
+    fn_ptrs := ⟨[(⟨⟨1⟩⟩, ⟨0x5000, some (⟨5⟩, [])⟩)]⟩
+    vtable_ptrs := ⟨[(⟨⟨0⟩⟩, ⟨0x4000, some (⟨3⟩, [])⟩), (⟨⟨1⟩⟩, ⟨0x4008, some (⟨4⟩, [])⟩)]⟩
+    stdout := ⟨[]⟩
+    stderr := ⟨[]⟩ }
+
+/-- `PointeeInfo` of `dyn Trait` for the given trait. -/
+private def ep1DynPointee (t : Gen.TraitName) : Gen.PointeeInfo :=
+  { layout := .TraitObject t, inhabited := true, unsafe_cells := .TraitObject, freeze := true,
+    unpin := true }
+
+/-- **Positive witness: vtable pointers, `&dyn Trait` / `Box<dyn Trait>` validity, and the
+vtable unary operators with a machine**, on both `Mach` and `MachTB`. For the data
+pointer `0x1000` (a live 8-byte, 8-aligned object) with the vtable pointer `0x4000` of
+trait `0` (dynamic size `8`, alignment `8`):
+1. `Machine::vtable_from_ptr` finds the vtable, and `check_ptr` accepts the stand-alone
+   vtable pointer at `PtrType::VTablePtr` and the trait objects `&dyn Trait` and
+   `Box<dyn Trait>` (vtable lookup, trait match, dynamic size and alignment, and
+   `Memory::dereferenceable`);
+2. `UnOp::GetMetadata` extracts the vtable pointer at `Type::Ptr(PtrType::VTablePtr(..))`;
+3. `UnOp::ComputeSize` / `UnOp::ComputeAlign` on `Type::TraitObject` return the vtable's
+   size `8` and alignment `8`;
+4. `UnOp::VTableMethodLookup` resolves method `0` to the function pointer of function
+   `1` at `Type::Ptr(PtrType::FnPtr)`, and chaining `GetMetadata` into
+   `VTableMethodLookup` yields exactly the value of `Constant::FnPointer` for function
+   `1`, the callee value that `Terminator::Call` resolves with `Machine::fn_from_ptr`
+   (dynamic dispatch; `dynDispatch_call_mach_and_machTB_witness` in
+   `MiniRustSpec.UnwindSetDiscrAndFnPtrMR` runs the call itself). -/
+theorem ep1_vtable_dyn_safe_ptr_and_unops_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let dynBox : Gen.PtrType := .Box (ep1DynPointee ep1VtTrait0)
+    let vtTy : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let usize : Gen.Type := .Int IntType.usize_ty
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let fn1 : Ptr := ⟨0x5000, some (⟨5⟩, ())⟩
+    let wide : Gen.Pointer Prov := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt0)⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let fn1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x5000, some (⟨5⟩, [])⟩
+    let wideTB : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt0TB)⟩
+    -- 1. `Mach`: vtable lookup and pointer validity
+    (vtableFromPtr ep1VtMachBM vt0 = .ok ep1VTable0 ∧
+     checkPtr (ThinPointer.widen vt0 none) (.VTablePtr ep1VtTrait0) (some ep1VtMachBM) = .ok () ∧
+     checkPtr wide dynRef (some ep1VtMachBM) = .ok () ∧
+     checkPtr wide dynBox (some ep1VtMachBM) = .ok () ∧
+     checkValue (.Ptr wide) (.Ptr dynRef) (some ep1VtMachBM) = .ok ()) ∧
+    -- 2.-4. `Mach`: vtable unary operators and the callee value of `Terminator::Call`
+    (evalUnOp .GetMetadata (.Ptr wide, .Ptr dynRef) (some ep1VtMachBM) =
+       .ok (.Ptr (ThinPointer.widen vt0 none), vtTy) ∧
+     evalUnOp (.ComputeSize (.TraitObject ep1VtTrait0)) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = .ok (.Int 8, usize) ∧
+     evalUnOp (.ComputeAlign (.TraitObject ep1VtTrait0)) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = .ok (.Int 8, usize) ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = .ok (.Ptr (ThinPointer.widen fn1 none), .Ptr .FnPtr) ∧
+     (do
+        let (metaVal, metaTy) ← evalUnOp .GetMetadata (.Ptr wide, .Ptr dynRef) (some ep1VtMachBM)
+        let (fnVal, _) ← evalUnOp (.VTableMethodLookup ep1VtMeth0) (metaVal, metaTy)
+          (some ep1VtMachBM)
+        pure fnVal) =
+       evalConstant ep1VtMachBM (.FnPointer ⟨⟨1⟩⟩)) ∧
+    -- 1. `MachTB`: vtable lookup and pointer validity
+    (vtableFromPtrM ep1VtMachTB vt0TB = .ok ep1VTable0 ∧
+     checkPtrM (M := TBM) (ThinPointer.widen vt0TB none) (.VTablePtr ep1VtTrait0)
+         (some ep1VtMachTB) = .ok () ∧
+     checkPtrM (M := TBM) wideTB dynRef (some ep1VtMachTB) = .ok () ∧
+     checkPtrM (M := TBM) wideTB dynBox (some ep1VtMachTB) = .ok () ∧
+     checkValueM (M := TBM) (.Ptr wideTB) (.Ptr dynRef) (some ep1VtMachTB) = .ok ()) ∧
+    -- 2.-4. `MachTB`: vtable unary operators and the callee value of `Terminator::Call`
+    (evalUnOpM (M := TBM) .GetMetadata (.Ptr wideTB, .Ptr dynRef) (some ep1VtMachTB) =
+       .ok (.Ptr (ThinPointer.widen vt0TB none), vtTy) ∧
+     evalUnOpM (M := TBM) (.ComputeSize (.TraitObject ep1VtTrait0))
+         (.Ptr (ThinPointer.widen vt0TB none), vtTy) (some ep1VtMachTB) = .ok (.Int 8, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign (.TraitObject ep1VtTrait0))
+         (.Ptr (ThinPointer.widen vt0TB none), vtTy) (some ep1VtMachTB) = .ok (.Int 8, usize) ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen vt0TB none), vtTy) (some ep1VtMachTB) =
+       .ok (.Ptr (ThinPointer.widen fn1TB none), .Ptr .FnPtr) ∧
+     (do
+        let (metaVal, metaTy) ← evalUnOpM (M := TBM) .GetMetadata (.Ptr wideTB, .Ptr dynRef)
+          (some ep1VtMachTB)
+        let (fnVal, _) ← evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0) (metaVal, metaTy)
+          (some ep1VtMachTB)
+        pure fnVal) =
+       evalConstantM ep1VtMachTB (.FnPointer ⟨⟨1⟩⟩)) := by
+  intro dynRef dynBox vtTy usize vt0 fn1 wide vt0TB fn1TB wideTB
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-- **Negative witness: UB and panics of vtable pointers and trait-object safe pointers**,
+on both `Mach` and `MachTB` (`ucg#516`: the vtable of a `dyn Trait` wide pointer must be
+a vtable for that trait):
+1. a null, dangling, or unmapped (data) pointer used as a vtable pointer is UB
+   (`"invalid pointer for vtable lookup"`), stand-alone and as trait-object metadata;
+2. a valid vtable pointer for the wrong trait is UB
+   (`"Value::Ptr: invalid vtable in metadata"`);
+3. a `&dyn Trait` with valid vtable metadata whose data pointer is not aligned to the
+   vtable's alignment `8` is UB (`"Value::Ptr: unaligned safe pointer"`);
+4. a `&dyn Trait` with valid vtable metadata whose data allocation is smaller than the
+   vtable's size `8`, or dead, is UB (`"Value::Ptr: non-dereferenceable safe pointer"`);
+5. the corresponding sanity check of `UnOp::GetMetadata` and the `unwrap()`s and map
+   indices of `UnOp::VTableMethodLookup` are spec panics, never UB. -/
+theorem ep1_vtable_dyn_safe_ptr_ub_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let vtTy : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let invalidVt := "invalid pointer for vtable lookup"
+    let wrongTrait := "Value::Ptr: invalid vtable in metadata"
+    let unaligned := "Value::Ptr: unaligned safe pointer"
+    let nonDeref := "Value::Ptr: non-dereferenceable safe pointer"
+    let lookupPanic := "ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr).unwrap()"
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt1 : Ptr := ⟨0x4008, some (⟨4⟩, ())⟩
+    let obj : Ptr := ⟨0x1000, some (⟨0⟩, ())⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let vt1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨4⟩, [])⟩
+    let objTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, some (⟨0⟩, [])⟩
+    -- `Mach`
+    (-- 1. null, dangling, and unmapped vtable pointers
+     checkPtr (ThinPointer.widen ⟨0, none⟩ none) (.VTablePtr ep1VtTrait0) (some ep1VtMachBM) =
+       .error (.ub invalidVt) ∧
+     checkPtr ⟨obj, some (.VTablePointer ⟨0, none⟩)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub invalidVt) ∧
+     checkPtr ⟨obj, some (.VTablePointer ⟨0x4000, none⟩)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub invalidVt) ∧
+     checkPtr ⟨obj, some (.VTablePointer obj)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub invalidVt) ∧
+     -- 2. vtable for the wrong trait
+     checkPtr (ThinPointer.widen vt1 none) (.VTablePtr ep1VtTrait0) (some ep1VtMachBM) =
+       .error (.ub wrongTrait) ∧
+     checkPtr ⟨obj, some (.VTablePointer vt1)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub wrongTrait) ∧
+     -- 3. data pointer not aligned to the vtable's alignment
+     checkPtr ⟨⟨0x1004, some (⟨0⟩, ())⟩, some (.VTablePointer vt0)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub unaligned) ∧
+     -- 4. data allocation smaller than the vtable's size, or dead
+     checkPtr ⟨⟨0x2000, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub nonDeref) ∧
+     checkPtr ⟨⟨0x3000, some (⟨2⟩, ())⟩, some (.VTablePointer vt0)⟩ dynRef (some ep1VtMachBM) =
+       .error (.ub nonDeref) ∧
+     -- 5. spec panics of the unary operators
+     evalUnOp .GetMetadata (.Ptr ⟨obj, some (.VTablePointer vt1)⟩, .Ptr dynRef)
+         (some ep1VtMachBM) =
+       specPanic "GetMetadata: sanity check, returned meta is well-formed" ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen obj none), vtTy)
+         (some ep1VtMachBM) = specPanic lookupPanic ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth1) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = specPanic "map index: missing key (vtable.methods[method])" ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Int 0, vtTy) (some ep1VtMachBM) =
+       specPanic "vtable lookup on non-pointer") ∧
+    -- `MachTB`
+    (checkPtrM (M := TBM) (ThinPointer.widen ⟨0, none⟩ none) (.VTablePtr ep1VtTrait0)
+         (some ep1VtMachTB) = .error (.ub invalidVt) ∧
+     checkPtrM (M := TBM) ⟨objTB, some (.VTablePointer ⟨0, none⟩)⟩ dynRef (some ep1VtMachTB) =
+       .error (.ub invalidVt) ∧
+     checkPtrM (M := TBM) ⟨objTB, some (.VTablePointer ⟨0x4000, none⟩)⟩ dynRef
+         (some ep1VtMachTB) = .error (.ub invalidVt) ∧
+     checkPtrM (M := TBM) ⟨objTB, some (.VTablePointer objTB)⟩ dynRef (some ep1VtMachTB) =
+       .error (.ub invalidVt) ∧
+     checkPtrM (M := TBM) (ThinPointer.widen vt1TB none) (.VTablePtr ep1VtTrait0)
+         (some ep1VtMachTB) = .error (.ub wrongTrait) ∧
+     checkPtrM (M := TBM) ⟨objTB, some (.VTablePointer vt1TB)⟩ dynRef (some ep1VtMachTB) =
+       .error (.ub wrongTrait) ∧
+     checkPtrM (M := TBM) ⟨⟨0x1004, some (⟨0⟩, [])⟩, some (.VTablePointer vt0TB)⟩ dynRef
+         (some ep1VtMachTB) = .error (.ub unaligned) ∧
+     checkPtrM (M := TBM) ⟨⟨0x2000, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩ dynRef
+         (some ep1VtMachTB) = .error (.ub nonDeref) ∧
+     checkPtrM (M := TBM) ⟨⟨0x3000, some (⟨2⟩, [])⟩, some (.VTablePointer vt0TB)⟩ dynRef
+         (some ep1VtMachTB) = .error (.ub nonDeref) ∧
+     evalUnOpM (M := TBM) .GetMetadata (.Ptr ⟨objTB, some (.VTablePointer vt1TB)⟩, .Ptr dynRef)
+         (some ep1VtMachTB) =
+       specPanic "GetMetadata: sanity check, returned meta is well-formed" ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen objTB none), vtTy) (some ep1VtMachTB) = specPanic lookupPanic ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth1)
+         (.Ptr (ThinPointer.widen vt0TB none), vtTy) (some ep1VtMachTB) =
+       specPanic "map index: missing key (vtable.methods[method])" ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0) (.Int 0, vtTy) (some ep1VtMachTB) =
+       specPanic "vtable lookup on non-pointer") := by
+  intro dynRef vtTy invalidVt wrongTrait unaligned nonDeref lookupPanic vt0 vt1 obj vt0TB vt1TB
+    objTB
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-- **Error-kind, raw `*const dyn Trait` (`ucg#516`), corrupt-table panic
+precedence, and check-order witness**, on both `Mach` and `MachTB`:
+1. out-of-bounds vtable addresses (`-1`, `2^64`) are UB (`pointer out-of-bounds`)
+   in `check_ptr` and trigger the `.expect(..)` spec panic in `GetMetadata`;
+2. non-empty metadata on `PtrType::VTablePtr` is UB (`invalid metadata`);
+3. raw `*const dyn Trait` accepts null/unaligned/no-provenance data pointers
+   when the vtable metadata is valid, and rejects invalid or wrong-trait vtable
+   pointers with UB;
+4. when `vtable_ptrs` maps a pointer to a `VTableName` absent from `prog.vtables`,
+   `vtable_from_ptr`, `check_ptr`, and `GetMetadata` all propagate the exact
+   `self.prog.vtables[vtable_name]` map-index spec panic (upstream `.expect(..)`
+   does not mask an inner panic), while `ComputeSize` reports `vtables[name]`,
+   a missing `fn_ptrs` entry in `VTableMethodLookup` reports `self.fn_ptrs[fn_name]`,
+   and a pointer value with a non-pointer type reports `vtable lookup on non-pointer`;
+5. `check_ptr` precedence: out-of-bounds thin address precedes invalid vtable,
+   wrong trait precedes null safe pointer, and `isize::MAX` overflow precedes
+   null/uninhabited checks. -/
+theorem ep1_vtable_error_precedence_and_corrupt_table_witness :
+    let vtMissingFn : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨8⟩, align := ⟨8⟩, cells := [],
+        methods := ⟨[(ep1VtMeth0, ⟨⟨9⟩⟩)]⟩ }
+    let vtTooBig : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨9223372036854775808⟩, align := ⟨8⟩, cells := [],
+        methods := ⟨[]⟩ }
+    let corruptProg : Gen.Program :=
+      { ep1VtProg with
+        vtables := ⟨[(⟨⟨0⟩⟩, ep1VTable0), (⟨⟨1⟩⟩, ep1VTable1),
+          (⟨⟨2⟩⟩, vtMissingFn), (⟨⟨3⟩⟩, vtTooBig)]⟩ }
+    let corruptAllocs : List (Gen.Allocation Unit Unit) :=
+      ep1VtAllocsBM ++
+        [{ data := [], addr := 0x4010, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+         { data := [], addr := 0x4018, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+         { data := [], addr := 0x4020, align := ⟨1⟩, kind := .VTable, live := true, extra := () }]
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt1 : Ptr := ⟨0x4008, some (⟨4⟩, ())⟩
+    let vtMissing : Ptr := ⟨0x4010, some (⟨6⟩, ())⟩
+    let vtMissingFnPtr : Ptr := ⟨0x4018, some (⟨7⟩, ())⟩
+    let vtTooBigPtr : Ptr := ⟨0x4020, some (⟨8⟩, ())⟩
+    let obj : Ptr := ⟨0x1000, some (⟨0⟩, ())⟩
+    let corruptBM : Mach :=
+      { ep1VtMachBM with
+        prog := corruptProg
+        mem := { memory := { allocations := corruptAllocs, _phantom := ⟨⟩ }, accesses := [] }
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt0), (⟨⟨1⟩⟩, vt1), (⟨⟨9⟩⟩, vtMissing),
+          (⟨⟨2⟩⟩, vtMissingFnPtr), (⟨⟨3⟩⟩, vtTooBigPtr)]⟩ }
+    let corruptTB : MachTB := liftMachToTB corruptBM
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let vt1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨4⟩, [])⟩
+    let vtMissingTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4010, some (⟨6⟩, [])⟩
+    let vtMissingFnTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4018, some (⟨7⟩, [])⟩
+    let vtTooBigTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4020, some (⟨8⟩, [])⟩
+    let objTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, some (⟨0⟩, [])⟩
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let dynUninhab : Gen.PtrType :=
+      .Ref .Immutable { ep1DynPointee ep1VtTrait0 with inhabited := false }
+    let rawDyn : Gen.PtrType := .Raw (.VTablePointer ep1VtTrait0)
+    let vtTy : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let oobPtr := "Value::Ptr: pointer out-of-bounds"
+    let invalidMeta := "Value::Ptr: invalid metadata"
+    let invalidVt := "invalid pointer for vtable lookup"
+    let wrongTrait := "Value::Ptr: invalid vtable in metadata"
+    let sizeOverflow := "Value::Ptr: total size exeeds isize::MAX"
+    let sanityPanic := "GetMetadata: sanity check, returned meta is well-formed"
+    let missingProgVt := "map index: missing key (self.prog.vtables[vtable_name])"
+    let missingLookupVt := "map index: missing key (vtables[name])"
+    let missingFnPtr := "map index: missing key (self.fn_ptrs[fn_name])"
+    let nonPtrLookup := "vtable lookup on non-pointer"
+    -- `Mach`
+    (checkPtr (ThinPointer.widen ⟨-1, none⟩ none) (.VTablePtr ep1VtTrait0) (some corruptBM) =
+       .error (.ub oobPtr) ∧
+     checkPtr (ThinPointer.widen ⟨18446744073709551616, none⟩ none) (.VTablePtr ep1VtTrait0)
+         (some corruptBM) = .error (.ub oobPtr) ∧
+     evalUnOp .GetMetadata (.Ptr ⟨obj, some (.VTablePointer ⟨-1, none⟩)⟩, .Ptr dynRef)
+         (some corruptBM) = specPanic sanityPanic ∧
+     checkPtr (ThinPointer.widen vt0 (some (.ElementCount 0))) (.VTablePtr ep1VtTrait0)
+         (some corruptBM) = .error (.ub invalidMeta) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vt0)⟩ rawDyn (some corruptBM) = .ok () ∧
+     checkPtr ⟨⟨0x1003, none⟩, some (.VTablePointer vt0)⟩ rawDyn (some corruptBM) = .ok () ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer ⟨0, none⟩)⟩ rawDyn (some corruptBM) =
+       .error (.ub invalidVt) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vt1)⟩ rawDyn (some corruptBM) =
+       .error (.ub wrongTrait) ∧
+     vtableFromPtr corruptBM vtMissing = specPanic missingProgVt ∧
+     checkPtr (ThinPointer.widen vtMissing none) (.VTablePtr ep1VtTrait0) (some corruptBM) =
+       specPanic missingProgVt ∧
+     evalUnOp .GetMetadata (.Ptr ⟨obj, some (.VTablePointer vtMissing)⟩, .Ptr dynRef)
+         (some corruptBM) = specPanic missingProgVt ∧
+     evalUnOp (.ComputeSize (.TraitObject ep1VtTrait0))
+         (.Ptr (ThinPointer.widen vtMissing none), vtTy) (some corruptBM) =
+       specPanic missingLookupVt ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen vtMissingFnPtr none), vtTy) (some corruptBM) =
+       specPanic missingFnPtr ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen vt0 none), .Int ep1U32) (some corruptBM) =
+       specPanic nonPtrLookup ∧
+     checkPtr ⟨⟨-1, none⟩, some (.VTablePointer ⟨0, none⟩)⟩ dynRef (some corruptBM) =
+       .error (.ub oobPtr) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vt1)⟩ dynRef (some corruptBM) =
+       .error (.ub wrongTrait) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vtTooBigPtr)⟩ dynUninhab (some corruptBM) =
+       .error (.ub sizeOverflow)) ∧
+    -- `MachTB`
+    (checkPtrM (M := TBM) (ThinPointer.widen ⟨-1, none⟩ none) (.VTablePtr ep1VtTrait0)
+         (some corruptTB) = .error (.ub oobPtr) ∧
+     checkPtrM (M := TBM) (ThinPointer.widen ⟨18446744073709551616, none⟩ none)
+         (.VTablePtr ep1VtTrait0) (some corruptTB) = .error (.ub oobPtr) ∧
+     evalUnOpM (M := TBM) .GetMetadata
+         (.Ptr ⟨objTB, some (.VTablePointer ⟨-1, none⟩)⟩, .Ptr dynRef) (some corruptTB) =
+       specPanic sanityPanic ∧
+     checkPtrM (M := TBM) (ThinPointer.widen vt0TB (some (.ElementCount 0)))
+         (.VTablePtr ep1VtTrait0) (some corruptTB) = .error (.ub invalidMeta) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vt0TB)⟩ rawDyn (some corruptTB) =
+       .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x1003, none⟩, some (.VTablePointer vt0TB)⟩ rawDyn (some corruptTB) =
+       .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer ⟨0, none⟩)⟩ rawDyn (some corruptTB) =
+       .error (.ub invalidVt) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vt1TB)⟩ rawDyn (some corruptTB) =
+       .error (.ub wrongTrait) ∧
+     vtableFromPtrM corruptTB vtMissingTB = specPanic missingProgVt ∧
+     checkPtrM (M := TBM) (ThinPointer.widen vtMissingTB none) (.VTablePtr ep1VtTrait0)
+         (some corruptTB) = specPanic missingProgVt ∧
+     evalUnOpM (M := TBM) .GetMetadata
+         (.Ptr ⟨objTB, some (.VTablePointer vtMissingTB)⟩, .Ptr dynRef) (some corruptTB) =
+       specPanic missingProgVt ∧
+     evalUnOpM (M := TBM) (.ComputeSize (.TraitObject ep1VtTrait0))
+         (.Ptr (ThinPointer.widen vtMissingTB none), vtTy) (some corruptTB) =
+       specPanic missingLookupVt ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen vtMissingFnTB none), vtTy) (some corruptTB) =
+       specPanic missingFnPtr ∧
+     evalUnOpM (M := TBM) (.VTableMethodLookup ep1VtMeth0)
+         (.Ptr (ThinPointer.widen vt0TB none), .Int ep1U32) (some corruptTB) =
+       specPanic nonPtrLookup ∧
+     checkPtrM (M := TBM) ⟨⟨-1, none⟩, some (.VTablePointer ⟨0, none⟩)⟩ dynRef (some corruptTB) =
+       .error (.ub oobPtr) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vt1TB)⟩ dynRef (some corruptTB) =
+       .error (.ub wrongTrait) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vtTooBigTB)⟩ dynUninhab
+         (some corruptTB) = .error (.ub sizeOverflow)) := by
+  intro vtMissingFn vtTooBig corruptProg corruptAllocs vt0 vt1 vtMissing vtMissingFnPtr
+    vtTooBigPtr obj corruptBM corruptTB vt0TB vt1TB vtMissingTB vtMissingFnTB vtTooBigTB objTB
+    dynRef dynUninhab rawDyn vtTy oobPtr invalidMeta invalidVt wrongTrait sizeOverflow sanityPanic
+    missingProgVt missingLookupVt missingFnPtr nonPtrLookup
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+set_option maxRecDepth 8192 in
+/-- **Unsized structs with `dyn Trait` tails: `head`/`packed_align` layout,
+`isize::MAX` overflow, and `PlaceExpr::Field` tail projection**, on both `Mach`
+and `MachTB` (with `MachTB.wfLive` preservation):
+1. unpacked `#[repr(C)] struct { tag: u8, body: dyn Trait0 }` (`head = ⟨1, 1, none⟩`,
+   vtable `(8, 8)` -> `tail_offset = 8`, `size = 16`, `align = 8`): `GetMetadata`,
+   `ComputeSize = 16`, `ComputeAlign = 8`, `check_ptr` accepts a 16-byte 8-aligned
+   object and rejects 4-aligned or 8-byte allocations, and `PlaceExpr::Field 1`
+   advances the address by `tail_offset = 8` while preserving vtable metadata and
+   `MachTB.wfLive`;
+2. `#[repr(C, packed(2))]` (`packed_align = some 2`, vtable `(8, 8)` ->
+   `capped_tail_align = 2`, `align = 2`, `tail_offset = 2`, `size = 10`):
+   `ComputeSize = 10`, `ComputeAlign = 2`, `check_ptr` accepts 2-aligned `0x6002`
+   and rejects 1-aligned `0x6001`;
+3. head-dominated alignment (`head = ⟨8, 16, none⟩`, vtable `(4, 4)` ->
+   `align = 16`, `size = 16`): `check_ptr` rejects 8-aligned `0x6008` even though
+   the vtable's alignment `4` divides it;
+4. `isize::MAX` overflow on `head + vtable.size`: with `vtable.size = 2^63 - 8`
+   (which alone fits in `isize::MAX`, so bare `&dyn Trait0` reaches the null check),
+   `head = ⟨8, 8, none⟩` yields total size `2^63`: `ComputeSize` stays total, while
+   `check_ptr` raises `"Value::Ptr: total size exeeds isize::MAX"`. -/
+theorem ep1_vtable_unsized_struct_tail_packed_and_overflow_witness :
+    let vtNearMax : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨9223372036854775800⟩, align := ⟨8⟩, cells := [],
+        methods := ⟨[]⟩ }
+    let headPair : Gen.TupleHeadLayout := ⟨⟨1⟩, ⟨1⟩, none⟩
+    let headPacked : Gen.TupleHeadLayout := ⟨⟨1⟩, ⟨1⟩, some ⟨2⟩⟩
+    let headDom : Gen.TupleHeadLayout := ⟨⟨8⟩, ⟨16⟩, none⟩
+    let head8 : Gen.TupleHeadLayout := ⟨⟨8⟩, ⟨8⟩, none⟩
+    let pairTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U8)] headPair (some (.TraitObject ep1VtTrait0))
+    let packedTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U8)] headPacked (some (.TraitObject ep1VtTrait0))
+    let domTy : Gen.Type := .Tuple [] headDom (some (.TraitObject ep1VtTrait1))
+    let head8Ty : Gen.Type := .Tuple [] head8 (some (.TraitObject ep1VtTrait0))
+    let mkStructPointee (h : Gen.TupleHeadLayout) (t : Gen.TraitName) : Gen.PointeeInfo :=
+      { layout := .Tuple h (.TraitObject t), inhabited := true,
+        unsafe_cells := .Tuple [] .TraitObject, freeze := true, unpin := true }
+    let pairPointee := mkStructPointee headPair ep1VtTrait0
+    let pairRef : Gen.PtrType := .Ref .Immutable pairPointee
+    let pairBox : Gen.PtrType := .Box pairPointee
+    let packedRef : Gen.PtrType := .Ref .Immutable (mkStructPointee headPacked ep1VtTrait0)
+    let domRef : Gen.PtrType := .Ref .Immutable (mkStructPointee headDom ep1VtTrait1)
+    let head8Ref : Gen.PtrType := .Ref .Immutable (mkStructPointee head8 ep1VtTrait0)
+    let dynRef0 : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let vtTy0 : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let vtTy1 : Gen.Type := .Ptr (.VTablePtr ep1VtTrait1)
+    let usize : Gen.Type := .Int IntType.usize_ty
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt1 : Ptr := ⟨0x4008, some (⟨4⟩, ())⟩
+    let vtNear : Ptr := ⟨0x4010, some (⟨5⟩, ())⟩
+    let widePair : Gen.Pointer Prov := ⟨⟨0x6000, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩
+    let widePairBytes : List Byte :=
+      encodePtrBytes (some (⟨1⟩, ())) 0 [0x00, 0x60, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨3⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let structProg : Gen.Program :=
+      { ep1VtProg with
+        vtables := ⟨[(⟨⟨0⟩⟩, ep1VTable0), (⟨⟨1⟩⟩, ep1VTable1), (⟨⟨2⟩⟩, vtNearMax)]⟩ }
+    let structBM : Mach :=
+      { ep1MachBM
+          [{ data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := true, extra := () },
+           { data := List.replicate 16 (.Init 0 none), addr := 0x6000, align := ⟨16⟩,
+             kind := .Heap, live := true, extra := () },
+           { data := widePairBytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+           { data := [], addr := 0x4008, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+           { data := [], addr := 0x4010, align := ⟨1⟩, kind := .VTable, live := true, extra := () }]
+          [(⟨⟨0⟩⟩, ⟨0x2000, some (⟨2⟩, ())⟩)]
+          [(⟨⟨0⟩⟩, .Ptr pairRef)] with
+        prog := structProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt0), (⟨⟨1⟩⟩, vt1), (⟨⟨2⟩⟩, vtNear)]⟩ }
+    let structTB : MachTB := liftMachToTB structBM
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let vt1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨4⟩, [])⟩
+    let vtNearTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4010, some (⟨5⟩, [])⟩
+    let widePairTB : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ⟨⟨0x6000, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩
+    let fieldTailExpr : Gen.PlaceExpr := .Field (.Deref (.Load (.Local ⟨⟨0⟩⟩)) pairTy) 1
+    let unaligned := "Value::Ptr: unaligned safe pointer"
+    let nonDeref := "Value::Ptr: non-dereferenceable safe pointer"
+    let nullPtr := "Value::Ptr: null safe pointer"
+    let sizeOverflow := "Value::Ptr: total size exeeds isize::MAX"
+    -- `Mach`
+    (evalUnOp .GetMetadata (.Ptr widePair, .Ptr pairRef) (some structBM) =
+       .ok (.Ptr (ThinPointer.widen vt0 none), vtTy0) ∧
+     evalUnOp (.ComputeSize pairTy) (.Ptr (ThinPointer.widen vt0 none), vtTy0) (some structBM) =
+       .ok (.Int 16, usize) ∧
+     evalUnOp (.ComputeAlign pairTy) (.Ptr (ThinPointer.widen vt0 none), vtTy0) (some structBM) =
+       .ok (.Int 8, usize) ∧
+     checkPtr widePair pairRef (some structBM) = .ok () ∧
+     checkPtr widePair pairBox (some structBM) = .ok () ∧
+     checkPtr ⟨⟨0x6004, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩ pairRef (some structBM) =
+       .error (.ub unaligned) ∧
+     checkPtr ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt0)⟩ pairRef (some structBM) =
+       .error (.ub nonDeref) ∧
+     evalUnOp (.ComputeSize packedTy) (.Ptr (ThinPointer.widen vt0 none), vtTy0) (some structBM) =
+       .ok (.Int 10, usize) ∧
+     evalUnOp (.ComputeAlign packedTy) (.Ptr (ThinPointer.widen vt0 none), vtTy0) (some structBM) =
+       .ok (.Int 2, usize) ∧
+     checkPtr ⟨⟨0x6002, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩ packedRef (some structBM) =
+       .ok () ∧
+     checkPtr ⟨⟨0x6001, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩ packedRef (some structBM) =
+       .error (.ub unaligned) ∧
+     evalUnOp (.ComputeSize domTy) (.Ptr (ThinPointer.widen vt1 none), vtTy1) (some structBM) =
+       .ok (.Int 16, usize) ∧
+     evalUnOp (.ComputeAlign domTy) (.Ptr (ThinPointer.widen vt1 none), vtTy1) (some structBM) =
+       .ok (.Int 16, usize) ∧
+     checkPtr ⟨⟨0x6008, some (⟨1⟩, ())⟩, some (.VTablePointer vt1)⟩ domRef (some structBM) =
+       .error (.ub unaligned) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vtNear)⟩ dynRef0 (some structBM) =
+       .error (.ub nullPtr) ∧
+     evalUnOp (.ComputeSize head8Ty) (.Ptr (ThinPointer.widen vtNear none), vtTy0)
+         (some structBM) = .ok (.Int 9223372036854775808, usize) ∧
+     checkPtr ⟨⟨0, none⟩, some (.VTablePointer vtNear)⟩ head8Ref (some structBM) =
+       .error (.ub sizeOverflow) ∧
+     (∃ m1, evalPlace structBM fieldTailExpr =
+       .ok (({ ptr := ⟨⟨0x6008, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1))) ∧
+    -- `MachTB` (+ `MachTB.wfLive`)
+    (evalUnOpM (M := TBM) .GetMetadata (.Ptr widePairTB, .Ptr pairRef) (some structTB) =
+       .ok (.Ptr (ThinPointer.widen vt0TB none), vtTy0) ∧
+     evalUnOpM (M := TBM) (.ComputeSize pairTy) (.Ptr (ThinPointer.widen vt0TB none), vtTy0)
+         (some structTB) = .ok (.Int 16, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign pairTy) (.Ptr (ThinPointer.widen vt0TB none), vtTy0)
+         (some structTB) = .ok (.Int 8, usize) ∧
+     checkPtrM (M := TBM) widePairTB pairRef (some structTB) = .ok () ∧
+     checkPtrM (M := TBM) widePairTB pairBox (some structTB) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x6004, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩ pairRef
+         (some structTB) = .error (.ub unaligned) ∧
+     checkPtrM (M := TBM) ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt0TB)⟩ pairRef
+         (some structTB) = .error (.ub nonDeref) ∧
+     evalUnOpM (M := TBM) (.ComputeSize packedTy) (.Ptr (ThinPointer.widen vt0TB none), vtTy0)
+         (some structTB) = .ok (.Int 10, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign packedTy) (.Ptr (ThinPointer.widen vt0TB none), vtTy0)
+         (some structTB) = .ok (.Int 2, usize) ∧
+     checkPtrM (M := TBM) ⟨⟨0x6002, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩ packedRef
+         (some structTB) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x6001, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩ packedRef
+         (some structTB) = .error (.ub unaligned) ∧
+     evalUnOpM (M := TBM) (.ComputeSize domTy) (.Ptr (ThinPointer.widen vt1TB none), vtTy1)
+         (some structTB) = .ok (.Int 16, usize) ∧
+     evalUnOpM (M := TBM) (.ComputeAlign domTy) (.Ptr (ThinPointer.widen vt1TB none), vtTy1)
+         (some structTB) = .ok (.Int 16, usize) ∧
+     checkPtrM (M := TBM) ⟨⟨0x6008, some (⟨1⟩, [])⟩, some (.VTablePointer vt1TB)⟩ domRef
+         (some structTB) = .error (.ub unaligned) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vtNearTB)⟩ dynRef0 (some structTB) =
+       .error (.ub nullPtr) ∧
+     evalUnOpM (M := TBM) (.ComputeSize head8Ty) (.Ptr (ThinPointer.widen vtNearTB none), vtTy0)
+         (some structTB) = .ok (.Int 9223372036854775808, usize) ∧
+     checkPtrM (M := TBM) ⟨⟨0, none⟩, some (.VTablePointer vtNearTB)⟩ head8Ref (some structTB) =
+       .error (.ub sizeOverflow) ∧
+     (∃ m1, evalPlaceM structTB fieldTailExpr =
+       .ok (({ ptr := ⟨⟨0x6008, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1) ∧ MachTB.wfLive m1)) := by
+  intro vtNearMax headPair headPacked headDom head8 pairTy packedTy domTy head8Ty mkStructPointee
+    pairPointee pairRef pairBox packedRef domRef head8Ref dynRef0 vtTy0 vtTy1 usize vt0 vt1 vtNear
+    widePair widePairBytes structProg structBM structTB vt0TB vt1TB vtNearTB widePairTB
+    fieldTailExpr unaligned nonDeref nullPtr sizeOverflow
+  have hFull : TupleHeadLayout.full_size_and_align head8 vtNearMax.size vtNearMax.align =
+      (⟨9223372036854775808⟩, ⟨8⟩) := by
+    dsimp only [head8, vtNearMax, TupleHeadLayout.full_size_and_align,
+      TupleHeadLayout.capped_tail_align, TupleHeadLayout.tail_offset, Size.align_to]
+    exact Prod.ext (congrArg Size.mk (by simp only [Nat.max_self])) rfl
+  have hOv : inBounds ((TupleHeadLayout.full_size_and_align head8 vtNearMax.size
+      vtNearMax.align).1.bytes : Int) .Signed x86_64.PTR_SIZE = false := by
+    rw [hFull]
+    ep1_kernel_rfl
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have hvt : vtableLookup structBM vtNear = .ok vtNearMax := by ep1_kernel_rfl
+    have h := (evalUnOp_tuple_traitObject_size_align structBM vtNear [] head8 ep1VtTrait0 vtTy0
+      vtNearMax hvt).1
+    rw [hFull] at h
+    exact h
+  · have hvt : vtableFromPtr structBM vtNear = .ok vtNearMax := by ep1_kernel_rfl
+    exact checkPtr_tuple_traitObject_size_overflow_ub ⟨0, none⟩ vtNear
+      (Gen.PtrType.Ref .Immutable) (mkStructPointee head8 ep1VtTrait0) head8 ep1VtTrait0
+      structBM vtNearMax (Or.inl ⟨.Immutable, rfl⟩) rfl (by ep1_kernel_rfl) (by ep1_kernel_rfl)
+      hvt rfl hOv
+  · have hBM : Prod.fst <$> evalPlace structBM fieldTailExpr =
+        .ok ({ ptr := ⟨⟨0x6008, some (⟨1⟩, ())⟩, some (.VTablePointer vt0)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    exact ep1_ok_of_map_fst hBM
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have hvt : vtableLookupM structTB vtNearTB = .ok vtNearMax := by ep1_kernel_rfl
+    have h := (evalUnOpM_tuple_traitObject_size_align (M := TBM) structTB vtNearTB [] head8
+      ep1VtTrait0 vtTy0 vtNearMax hvt).1
+    rw [hFull] at h
+    exact h
+  · have hvt : vtableFromPtrM structTB vtNearTB = .ok vtNearMax := by ep1_kernel_rfl
+    exact checkPtrM_tuple_traitObject_size_overflow_ub (M := TBM) ⟨0, none⟩ vtNearTB
+      (Gen.PtrType.Ref .Immutable) (mkStructPointee head8 ep1VtTrait0) head8 ep1VtTrait0
+      structTB vtNearMax (Or.inl ⟨.Immutable, rfl⟩) rfl (by ep1_kernel_rfl) (by ep1_kernel_rfl)
+      hvt rfl hOv
+  · have hTB : Prod.fst <$> evalPlaceM structTB fieldTailExpr =
+        .ok ({ ptr := ⟨⟨0x6008, some (⟨1⟩, [])⟩, some (.VTablePointer vt0TB)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1⟩ := ep1_ok_of_map_fst hTB
+    exact ⟨m1, hm1, evalPlaceM_tb_wfLive _ (liftMachToTB_wfLive structBM) hm1⟩
+
+set_option maxRecDepth 8192 in
+/-- **Tree Borrows (`MachTB`) safe-pointer retag, `vtable.cells` (`UnsafeCell`),
+`Disabled` vs `dereferenceable`, and Strong/Weak protectors on `&dyn Trait`,
+`&mut dyn Trait`, and `Box<dyn Trait>`** (with `MachTB.wfLive` preservation):
+1. `&dyn Trait0` with `vtable.cells = [(0, 4)]` inside an 8-byte object:
+   `Statement::Validate` retags via `ReborrowSettings::new` and
+   `UnsafeCellStrategy::freeze_mask` into `[Cell × 4, Frozen × 4]`; writing to
+   bytes `[0..4)` (`UnsafeCell`) succeeds on `MachTB` (preserving `MachTB.wfLive`),
+   while writing to bytes `[4..8)` raises `"Tree Borrows: local write of Frozen reference"`
+   (whereas `Mach` / `BasicMemory` allows both writes);
+2. unprotected `&mut dyn Trait0`: a foreign write through root `[]` to `[4..8)`
+   disables child `[0]` on `[4..8)` while keeping `[0..4)` `ReservedIm`;
+   `checkPtrM` (`TreeBorrowsMemory::dereferenceable`, which checks bounds/liveness
+   only) still returns `.ok ()` and reading `[0..4)` succeeds, whereas reading
+   `[4..8)` or re-running `Statement::Validate` raises
+   `"Tree Borrows: local read of Disabled reference"`;
+3. `fn_entry = true` active protectors: `&mut dyn Trait0` installs
+   `Protected::Strong` (blocking both foreign writes and `deallocate` with
+   `"Tree Borrows: deallocating strongly protected allocation"`), whereas
+   `Box<dyn Trait0>` installs `Protected::Weak` (still blocking foreign writes,
+   while permitting self-deallocation and `end_call` protector release with
+   `TreeBorrowsMemory.wfLive` preserved). -/
+theorem ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness :
+    let vtCells : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨8⟩, align := ⟨8⟩, cells := [(⟨0⟩, ⟨4⟩)],
+        methods := ⟨[]⟩ }
+    let vtProg : Gen.Program :=
+      { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+        traits := ⟨[(ep1VtTrait0, ⟨[]⟩)]⟩, vtables := ⟨[(⟨⟨0⟩⟩, vtCells)]⟩ }
+    let dynPointee := ep1DynPointee ep1VtTrait0
+    let dynRef : Gen.PtrType := .Ref .Immutable dynPointee
+    let dynMut : Gen.PtrType := .Ref .Mutable dynPointee
+    let dynBox : Gen.PtrType := .Box dynPointee
+    let u32PairTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U32), (⟨4⟩, .Int ep1U32)] ⟨⟨8⟩, ⟨4⟩, none⟩ none
+    let dataPtrBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x10, 0, 0, 0, 0, 0, 0]
+    let vtPtrBytes : List Byte :=
+      encodePtrBytes (some (⟨3⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let wideBytes : List Byte := dataPtrBytes ++ vtPtrBytes
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let mkBM (ptrTy : Gen.PtrType) : Mach :=
+      { ep1MachBM
+          [{ data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := true, extra := () },
+           { data := wideBytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := dataPtrBytes, addr := 0x2100, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩,
+             kind := .VTable, live := true, extra := () }]
+          [(⟨⟨1⟩⟩, ⟨0x2000, some (⟨1⟩, ())⟩), (⟨⟨2⟩⟩, ⟨0x2100, some (⟨2⟩, ())⟩)]
+          [(⟨⟨0⟩⟩, .Int ep1U32), (⟨⟨1⟩⟩, .Ptr ptrTy), (⟨⟨2⟩⟩, .Ptr (.Raw .None))] with
+        prog := vtProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt0)]⟩ }
+    let mkTB (ptrTy : Gen.PtrType) : MachTB := liftMachToTB (mkBM ptrTy)
+    let dynFieldPlace (idx : Int) : Gen.PlaceExpr :=
+      .Field (.Deref (.UnOp .GetThinPointer (.Load (.Local ⟨⟨1⟩⟩))) u32PairTy) idx
+    let rootFieldPlace (idx : Int) : Gen.PlaceExpr :=
+      .Field (.Deref (.Load (.Local ⟨⟨2⟩⟩)) u32PairTy) idx
+    let stmtWriteCell : Gen.Statement :=
+      .Assign (dynFieldPlace 0) (.Constant (.Int 42) (.Int ep1U32))
+    let stmtWriteFrozen : Gen.Statement :=
+      .Assign (dynFieldPlace 1) (.Constant (.Int 99) (.Int ep1U32))
+    let stmtForeignWrite1 : Gen.Statement :=
+      .Assign (rootFieldPlace 1) (.Constant (.Int 7) (.Int ep1U32))
+    -- 1. `&dyn Trait0` with `vtable.cells = [(0, 4)]`: `MachTB` vs `Mach`
+    (∃ m1 m2,
+      evalStatementM (mkTB dynRef) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+      evalStatementM m1 stmtWriteCell = .ok m2 ∧
+      MachTB.wfLive m2 ∧
+      evalStatementM m2 stmtWriteFrozen =
+        .error (.ub "Tree Borrows: local write of Frozen reference")) ∧
+    (∃ m1 m2 m3,
+      evalStatement (mkBM dynRef) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+      evalStatement m1 stmtWriteCell = .ok m2 ∧
+      evalStatement m2 stmtWriteFrozen = .ok m3) ∧
+    -- 2. unprotected `&mut dyn Trait0`: `Disabled` vs `dereferenceable`
+    (∃ m1 m2 m3,
+      evalStatementM (mkTB dynMut) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+      evalStatementM m1 stmtForeignWrite1 = .ok m2 ∧
+      MachTB.wfLive m2 ∧
+      checkPtrM (M := TBM)
+        ⟨⟨0x1000, some (⟨0⟩, [0])⟩, some (.VTablePointer vt0TB)⟩ dynMut (some m2) = .ok () ∧
+      evalValueM m2 (.Load (dynFieldPlace 0)) = .ok ((.Int 0, .Int ep1U32), m3) ∧
+      MachTB.wfLive m3 ∧
+      evalValueM m2 (.Load (dynFieldPlace 1)) =
+        .error (.ub "Tree Borrows: local read of Disabled reference") ∧
+      evalStatementM m2 (.Validate (.Local ⟨⟨1⟩⟩) false) =
+        .error (.ub "Tree Borrows: local read of Disabled reference")) ∧
+    -- 3a. `&mut dyn Trait0` (`fn_entry = true`, `Protected::Strong`)
+    (∃ m1,
+      evalStatementM (mkTB dynMut) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+      MachTB.wfLive m1 ∧
+      evalStatementM m1 stmtForeignWrite1 =
+        .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+      TreeBorrowsMemory.deallocate m1.mem.memory ⟨0x1000, some (⟨0⟩, [0])⟩ .Heap ⟨8⟩ ⟨8⟩ =
+        .error (.ub "Tree Borrows: deallocating strongly protected allocation")) ∧
+    -- 3b. `Box<dyn Trait0>` (`fn_entry = true`, `Protected::Weak`)
+    (∃ m1 tbm2 tbm3,
+      evalStatementM (mkTB dynBox) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+      MachTB.wfLive m1 ∧
+      evalStatementM m1 stmtForeignWrite1 =
+        .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") ∧
+      TreeBorrowsMemory.deallocate m1.mem.memory ⟨0x1000, some (⟨0⟩, [0])⟩ .Heap ⟨8⟩ ⟨8⟩ =
+        .ok tbm2 ∧
+      TreeBorrowsMemory.wfLive tbm2 ∧
+      tbm2.mem.allocations[0]?.map Gen.Allocation.live = some false ∧
+      TreeBorrowsMemory.end_call tbm2 { protectors := [(⟨0⟩, [0])] } = .ok tbm3 ∧
+      TreeBorrowsMemory.wfLive tbm3) := by
+  intro vtCells vtProg dynPointee dynRef dynMut dynBox u32PairTy dataPtrBytes vtPtrBytes wideBytes
+    vt0 vt0TB mkBM mkTB dynFieldPlace rootFieldPlace stmtWriteCell stmtWriteFrozen
+    stmtForeignWrite1
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynRef) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 stmtWriteCell
+          pure (evalStatementM m2 stmtWriteFrozen)) =
+          .ok (.error (.ub "Tree Borrows: local write of Frozen reference")) := by
+      ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    have hfrozen := ep1_pure_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    exact ⟨m1, m2, hm1, hm2, hwf2, hfrozen⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynRef) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 stmtWriteCell
+          let _m3 ← evalStatement m2 stmtWriteFrozen
+          pure ()) = .ok () := by
+      ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m3, hm3, _⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, m3, hm1, hm2, hm3⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynMut) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 stmtForeignWrite1
+          let (v0, _m3) ← evalValueM m2 (.Load (dynFieldPlace 0))
+          pure (v0,
+            checkPtrM (M := TBM)
+              ⟨⟨0x1000, some (⟨0⟩, [0])⟩, some (.VTablePointer vt0TB)⟩ dynMut (some m2),
+            evalValueM m2 (.Load (dynFieldPlace 1)),
+            evalStatementM m2 (.Validate (.Local ⟨⟨1⟩⟩) false))) =
+          .ok ((.Int 0, .Int ep1U32), .ok (),
+            .error (.ub "Tree Borrows: local read of Disabled reference"),
+            .error (.ub "Tree Borrows: local read of Disabled reference")) := by
+      ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨⟨v0, m3⟩, hm3, hseq⟩ := ep1_bind_ok hseq
+    have hp := ep1_pure_ok hseq
+    obtain ⟨hv0, hrest⟩ := Prod.mk.inj hp
+    obtain ⟨hchk, hrest⟩ := Prod.mk.inj hrest
+    obtain ⟨hload1, hval2⟩ := Prod.mk.inj hrest
+    rw [hv0] at hm3
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    have hwf3 := evalValueM_tb_wfLive _ hwf2 hm3
+    exact ⟨m1, m2, m3, hm1, hm2, hwf2, hchk, hm3, hwf3, hload1, hval2⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynMut) (.Validate (.Local ⟨⟨1⟩⟩) true)
+          pure (evalStatementM m1 stmtForeignWrite1,
+            TreeBorrowsMemory.deallocate m1.mem.memory ⟨0x1000, some (⟨0⟩, [0])⟩ .Heap ⟨8⟩ ⟨8⟩)) =
+          .ok (.error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read"),
+            .error (.ub "Tree Borrows: deallocating strongly protected allocation")) := by
+      ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hfw, hdealloc⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut)) hm1
+    exact ⟨m1, hm1, hwf1, hfw, hdealloc⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynBox) (.Validate (.Local ⟨⟨1⟩⟩) true)
+          let tbm2 ← TreeBorrowsMemory.deallocate m1.mem.memory
+            ⟨0x1000, some (⟨0⟩, [0])⟩ .Heap ⟨8⟩ ⟨8⟩
+          let _tbm3 ← TreeBorrowsMemory.end_call tbm2 { protectors := [(⟨0⟩, [0])] }
+          pure (evalStatementM m1 stmtForeignWrite1,
+            tbm2.mem.allocations[0]?.map Gen.Allocation.live)) =
+          .ok (.error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read"),
+            some false) := by
+      ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨tbm2, htbm2, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨tbm3, htbm3, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hfw, hdead⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynBox)) hm1
+    have hwf2 := TreeBorrowsMemory.deallocate_wfLive hwf1 htbm2
+    have hwf3 := TreeBorrowsMemory.end_call_wfLive hwf2 htbm3
+    exact ⟨m1, tbm2, tbm3, hm1, hwf1, hfw, htbm2, hwf2, hdead, htbm3, hwf3⟩
+
+set_option maxRecDepth 8192 in
+/-- **ZST `dyn Trait` (`vtable.size = 0`, `vtable.align = 8`), uninhabited
+`PointeeInfo.inhabited = false` precedence, and safe `&dyn Trait`
+`PlaceExpr::Deref`** on both `Mach` and `MachTB` (with `MachTB.wfLive`):
+1. ZST `dyn Trait0` (`size = 0`, `align = 8`, `cells = []`) across `&dyn Trait0`,
+   `&mut dyn Trait0`, and `Box<dyn Trait0>` with a dead data allocation:
+   * dangling provenance-free aligned `⟨0x8, none⟩` passes `checkPtr[M]`,
+     `Statement::Validate` (`fn_entry = false` and `true`, preserving
+     `MachTB.wfLive` and pushing zero Tree Borrows protectors), and safe
+     `PlaceExpr::Deref` (`aligned = true`);
+   * null `⟨0x0, none⟩` raises `"Value::Ptr: null safe pointer"`;
+   * misaligned `⟨0x4, none⟩` raises `"Value::Ptr: unaligned safe pointer"`;
+2. `PointeeInfo.inhabited = false` precedence across `&dyn Trait0`,
+   `&mut dyn Trait0`, and `Box<dyn Trait0>`:
+   * aligned non-null ZST `⟨0x8, none⟩` raises
+     `"Value::Ptr: safe pointer to uninhabited type"`;
+   * misaligned `⟨0x4, none⟩` raises `"Value::Ptr: unaligned safe pointer"`
+     (alignment precedes inhabitedness) and `⟨0x0, none⟩` raises
+     `"Value::Ptr: null safe pointer"` (non-null precedes alignment);
+   * non-ZST (`size = 8`) non-dereferenceable `⟨0x1000, none⟩` still raises
+     `"Value::Ptr: safe pointer to uninhabited type"` (inhabitedness precedes
+     `Memory::dereferenceable`);
+3. `PlaceExpr::Deref` on non-ZST safe `&dyn Trait0` (`size = 8`, `align = 8`):
+   succeeds with `aligned = true` (and `MachTB.wfLive`) on a live 8-byte
+   allocation, and raises `"Value::Ptr: non-dereferenceable safe pointer"` when
+   the backing allocation is dead. -/
+theorem ep1_vtable_zst_uninhabited_and_deref_witness :
+    let vtZst : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨0⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ }
+    let vtSize8 : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨8⟩, align := ⟨8⟩, cells := [], methods := ⟨[]⟩ }
+    let zstProg : Gen.Program :=
+      { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+        traits := ⟨[(ep1VtTrait0, ⟨[]⟩)]⟩,
+        vtables := ⟨[(⟨⟨0⟩⟩, vtZst), (⟨⟨1⟩⟩, vtSize8)]⟩ }
+    let dynPointee := ep1DynPointee ep1VtTrait0
+    let uninhPointee : Gen.PointeeInfo := { dynPointee with inhabited := false }
+    let dynRef : Gen.PtrType := .Ref .Immutable dynPointee
+    let dynMut : Gen.PtrType := .Ref .Mutable dynPointee
+    let dynBox : Gen.PtrType := .Box dynPointee
+    let uninhRef : Gen.PtrType := .Ref .Immutable uninhPointee
+    let uninhMut : Gen.PtrType := .Ref .Mutable uninhPointee
+    let uninhBox : Gen.PtrType := .Box uninhPointee
+    let vtZstPtr : Ptr := ⟨0x4000, some (⟨2⟩, ())⟩
+    let vt8Ptr : Ptr := ⟨0x4008, some (⟨3⟩, ())⟩
+    let vtZstTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨2⟩, [])⟩
+    let vt8TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨3⟩, [])⟩
+    let zstWideBytes : List Byte :=
+      encodePtrBytes none 0 [0x08, 0, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let liveWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨3⟩, ())) 0 [0x08, 0x40, 0, 0, 0, 0, 0, 0]
+    let mkBM (ptrTy : Gen.PtrType) (dataLive : Bool) (local1Bytes : List Byte) : Mach :=
+      { ep1MachBM
+          [{ data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := dataLive, extra := () },
+           { data := local1Bytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩, kind := .VTable, live := true, extra := () },
+           { data := [], addr := 0x4008, align := ⟨1⟩, kind := .VTable, live := true, extra := () }]
+          [(⟨⟨1⟩⟩, ⟨0x2000, some (⟨1⟩, ())⟩)]
+          [(⟨⟨1⟩⟩, .Ptr ptrTy)] with
+        prog := zstProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vtZstPtr), (⟨⟨1⟩⟩, vt8Ptr)]⟩ }
+    let mkTB (ptrTy : Gen.PtrType) (dataLive : Bool) (local1Bytes : List Byte) : MachTB :=
+      liftMachToTB (mkBM ptrTy dataLive local1Bytes)
+    let bmZst := mkBM dynRef false zstWideBytes
+    let tbZst := mkTB dynRef false zstWideBytes
+    let derefExpr : Gen.PlaceExpr := .Deref (.Load (.Local ⟨⟨1⟩⟩)) (.TraitObject ep1VtTrait0)
+    let nullUb := "Value::Ptr: null safe pointer"
+    let alignUb := "Value::Ptr: unaligned safe pointer"
+    let uninhUb := "Value::Ptr: safe pointer to uninhabited type"
+    let nonDerefUb := "Value::Ptr: non-dereferenceable safe pointer"
+    -- 1a. `Mach`: ZST `checkPtr`, `Validate`, and `PlaceExpr::Deref`
+    (checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .ok () ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynRef (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynMut (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ dynBox (some bmZst) = .error (.ub alignUb) ∧
+     (∃ m1, evalStatement (mkBM dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalStatement (mkBM dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalStatement (mkBM dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1) ∧
+     (∃ m1, evalPlace bmZst derefExpr =
+       .ok (({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1))) ∧
+    -- 1b. `MachTB`: ZST `checkPtrM`, `Validate` (`fn_entry = false/true`, 0 protectors), `Deref`
+    (checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) = .ok () ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynRef (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynMut (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ dynBox (some tbZst) =
+       .error (.ub alignUb) ∧
+     (∃ m1, evalStatementM (mkTB dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalStatementM (mkTB dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       MachTB.wfLive m1) ∧
+     (∃ m1, evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+         t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)) = some []) ∧
+     (∃ m1, evalPlaceM tbZst derefExpr =
+       .ok (({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1) ∧ MachTB.wfLive m1)) ∧
+    -- 2. Uninhabited (`PointeeInfo.inhabited = false`) & error precedence (`Mach` & `MachTB`)
+    (checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhMut (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhBox (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtr ⟨⟨0x4, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub alignUb) ∧
+     checkPtr ⟨⟨0x0, none⟩, some (.VTablePointer vtZstPtr)⟩ uninhRef (some bmZst) = .error (.ub nullUb) ∧
+     checkPtr ⟨⟨0x1000, none⟩, some (.VTablePointer vt8Ptr)⟩ uninhRef (some bmZst) = .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhMut (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩ uninhBox (some tbZst) =
+       .error (.ub uninhUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x4, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub alignUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x0, none⟩, some (.VTablePointer vtZstTB)⟩ uninhRef (some tbZst) =
+       .error (.ub nullUb) ∧
+     checkPtrM (M := TBM) ⟨⟨0x1000, none⟩, some (.VTablePointer vt8TB)⟩ uninhRef (some tbZst) =
+       .error (.ub uninhUb)) ∧
+    -- 3. `PlaceExpr::Deref` on non-ZST safe `&dyn Trait0` (live ok vs dead UB)
+    ((∃ m1, evalPlace (mkBM dynRef true liveWideBytes) derefExpr =
+       .ok (({ ptr := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt8Ptr)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1)) ∧
+     evalPlace (mkBM dynRef false liveWideBytes) derefExpr = .error (.ub nonDerefUb) ∧
+     (∃ m1, evalPlaceM (mkTB dynRef true liveWideBytes) derefExpr =
+       .ok (({ ptr := ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt8TB)⟩, aligned := true },
+         .TraitObject ep1VtTrait0), m1) ∧ MachTB.wfLive m1) ∧
+     evalPlaceM (mkTB dynRef false liveWideBytes) derefExpr = .error (.ub nonDerefUb)) := by
+  intro vtZst vtSize8 zstProg dynPointee uninhPointee dynRef dynMut dynBox uninhRef uninhMut
+    uninhBox vtZstPtr vt8Ptr vtZstTB vt8TB zstWideBytes liveWideBytes mkBM mkTB bmZst tbZst
+    derefExpr nullUb alignUb uninhUb nonDerefUb
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_⟩⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : (do
+        let _ ← evalStatement (mkBM dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : (do
+        let _ ← evalStatement (mkBM dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : (do
+        let _ ← evalStatement (mkBM dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h; exact ⟨m1, hm1⟩
+  · have h : Prod.fst <$> evalPlace bmZst derefExpr =
+        .ok ({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstPtr)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    exact ep1_ok_of_map_fst h
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynRef false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynMut false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : (do
+        let _ ← evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+        pure ()) = .ok () := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, _⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynBox false zstWideBytes)) hm1⟩
+  · have h : (do
+        let m1 ← evalStatementM (mkTB dynBox false zstWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) true)
+        pure (m1.threads[0]?.bind (fun t : Gen.Thread TBM =>
+          t.stack.getLast?.map (fun f : Gen.StackFrame TBM => f.extra.protectors)))) =
+        .ok (some []) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, h⟩ := ep1_bind_ok h
+    exact ⟨m1, hm1, evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynBox false zstWideBytes)) hm1,
+      ep1_pure_ok h⟩
+  · have h : Prod.fst <$> evalPlaceM tbZst derefExpr =
+        .ok ({ ptr := ⟨⟨0x8, none⟩, some (.VTablePointer vtZstTB)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1⟩ := ep1_ok_of_map_fst h
+    exact ⟨m1, hm1, evalPlaceM_tb_wfLive _ (liftMachToTB_wfLive bmZst) hm1⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have h : Prod.fst <$> evalPlace (mkBM dynRef true liveWideBytes) derefExpr =
+        .ok ({ ptr := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt8Ptr)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    exact ep1_ok_of_map_fst h
+  · ep1_kernel_rfl
+  · have h : Prod.fst <$> evalPlaceM (mkTB dynRef true liveWideBytes) derefExpr =
+        .ok ({ ptr := ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt8TB)⟩, aligned := true },
+          .TraitObject ep1VtTrait0) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1⟩ := ep1_ok_of_map_fst h
+    exact ⟨m1, hm1, evalPlaceM_tb_wfLive _ (liftMachToTB_wfLive (mkBM dynRef true liveWideBytes)) hm1⟩
+  · ep1_kernel_rfl
+
+/-- **`BinOp::ConstructWidePointer` fail-closed boundary and `VTablePointer`
+decode + check witness**, on both `Mach` and `MachTB`:
+1. `evalBinOp[M]` and `evalValue[M]` on `BinOp::ConstructWidePointer` evaluate
+   both operands first (propagating dead-local UB from either operand) and then
+   fail closed with `unsupported`;
+2. `PointerMetaKind::decode_value[M]` + `checkValue[M]` on `dyn Trait0` wide
+   pointers accepts a valid thin vtable pointer for trait `0`, rejects wrong
+   trait (`"Value::Ptr: invalid vtable in metadata"`) and unmapped vtable
+   pointers (`"invalid pointer for vtable lookup"`), and panics with
+   `"PointerMeta::decode_value called with invalid value"` on non-pointer or
+   wide-pointer metadata inputs. -/
+theorem ep1_vtable_constructWidePointer_boundary_and_decode_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let rawDyn : Gen.PtrType := .Raw (.VTablePointer ep1VtTrait0)
+    let vtTy0 : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let cwpBM : Mach :=
+      { ep1MachBM ep1VtAllocsBM [] [(⟨⟨0⟩⟩, .Ptr (.Raw .None))] with
+        prog := ep1VtProg
+        fn_ptrs := ep1VtMachBM.fn_ptrs
+        vtable_ptrs := ep1VtMachBM.vtable_ptrs }
+    let cwpTB : MachTB := liftMachToTB cwpBM
+    let thinExpr : Gen.ValueExpr :=
+      .Constant (.PointerWithoutProvenance 0x1000) (.Ptr (.Raw .None))
+    let vtExpr : Gen.ValueExpr := .Constant (.VTablePointer ⟨⟨0⟩⟩) vtTy0
+    let deadExpr : Gen.ValueExpr := .Load (.Local ⟨⟨0⟩⟩)
+    let unsupMsg :=
+      "eval_bin_op for an operator outside BinOp::Int, BinOp::IntWithOverflow, and BinOp::Rel"
+    let decodePanic := "PointerMeta::decode_value called with invalid value"
+    let obj : Ptr := ⟨0x1000, some (⟨0⟩, ())⟩
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let vt1 : Ptr := ⟨0x4008, some (⟨4⟩, ())⟩
+    let objTB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x1000, some (⟨0⟩, [])⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let vt1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4008, some (⟨4⟩, [])⟩
+    -- 1. `ConstructWidePointer` fail-closed boundary & operand UB precedence (`Mach` & `MachTB`)
+    (evalBinOp (.ConstructWidePointer dynRef)
+        (.Ptr (ThinPointer.widen obj none), .Ptr (.Raw .None))
+        (.Ptr (ThinPointer.widen vt0 none), vtTy0) = .error (.unsupported unsupMsg) ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) thinExpr vtExpr) =
+       .error (.unsupported unsupMsg) ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) deadExpr vtExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalValue cwpBM (.BinOp (.ConstructWidePointer dynRef) thinExpr deadExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalBinOpM (M := TBM) (.ConstructWidePointer dynRef)
+        (.Ptr (ThinPointer.widen objTB none), .Ptr (.Raw .None))
+        (.Ptr (ThinPointer.widen vt0TB none), vtTy0) = .error (.unsupported unsupMsg) ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) thinExpr vtExpr) =
+       .error (.unsupported unsupMsg) ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) deadExpr vtExpr) =
+       .error (.ub "access to a dead local") ∧
+     evalValueM cwpTB (.BinOp (.ConstructWidePointer dynRef) thinExpr deadExpr) =
+       .error (.ub "access to a dead local")) ∧
+    -- 2. `decode_value[M]` + `checkValue[M]` for `dyn Trait0` (`Mach` & `MachTB`)
+    ((do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen vt0 none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr dynRef) (some cwpBM)) = .ok () ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind rawDyn)
+          (.Ptr (ThinPointer.widen vt1 none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr rawDyn) (some cwpBM)) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_value (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen ⟨0, none⟩ none))
+        checkValue (.Ptr (ThinPointer.widen obj ptrMeta)) (.Ptr dynRef) (some cwpBM)) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     PointerMetaKind.decode_value (.VTablePointer ep1VtTrait0) (.Int 0) = specPanic decodePanic ∧
+     PointerMetaKind.decode_value (.VTablePointer ep1VtTrait0)
+       (.Ptr ⟨vt0, some (.VTablePointer vt0)⟩) = specPanic decodePanic ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen vt0TB none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr dynRef) (some cwpTB)) = .ok () ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind rawDyn)
+          (.Ptr (ThinPointer.widen vt1TB none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr rawDyn) (some cwpTB)) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     (do
+        let ptrMeta ← PointerMetaKind.decode_valueM (M := TBM) (PtrType.meta_kind dynRef)
+          (.Ptr (ThinPointer.widen ⟨0, none⟩ none))
+        checkValueM (.Ptr (ThinPointer.widen objTB ptrMeta)) (.Ptr dynRef) (some cwpTB)) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     PointerMetaKind.decode_valueM (M := TBM) (.VTablePointer ep1VtTrait0) (.Int 0) =
+       specPanic decodePanic ∧
+     PointerMetaKind.decode_valueM (M := TBM) (.VTablePointer ep1VtTrait0)
+       (.Ptr ⟨vt0TB, some (.VTablePointer vt0TB)⟩) = specPanic decodePanic) := by
+  intro dynRef rawDyn vtTy0 cwpBM cwpTB thinExpr vtExpr deadExpr unsupMsg decodePanic
+    obj vt0 vt1 objTB vt0TB vt1TB
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  all_goals ep1_kernel_rfl
+
+/-- **Exactness and non-vacuity of machine-congruence hypotheses**
+(`checkPtr_congr_vtables`, `checkPtrM_congr_mach`, `evalUnOp_congr_vtables`,
+`evalUnOpM_congr_mach`), on both `Mach` and `MachTB`:
+1. Changing non-`vtables` `Program` fields (`start`, `traits`, so `M'.prog ≠ M.prog`
+   while `M'.prog.vtables = M.prog.vtables`) leaves both `checkPtr[M]` and
+   `evalUnOp[M]` unchanged;
+2. Perturbing **any single** required field alone — `mem` (killing alloc `0`),
+   `vtable_ptrs` (clearing the table), `prog.vtables` (changing the vtable's
+   `trait_name`), or `fn_ptrs` (clearing function pointers, while `checkPtr[M]`
+   remains invariant!) — strictly changes the result of `checkPtr[M]` or
+   `evalUnOp[M] (.VTableMethodLookup _)`. -/
+theorem ep1_vtable_congr_mach_hypotheses_necessary_witness :
+    let dynRef : Gen.PtrType := .Ref .Immutable (ep1DynPointee ep1VtTrait0)
+    let vtTy : Gen.Type := .Ptr (.VTablePtr ep1VtTrait0)
+    let vt0 : Ptr := ⟨0x4000, some (⟨3⟩, ())⟩
+    let fn1 : Ptr := ⟨0x5000, some (⟨5⟩, ())⟩
+    let wide : Gen.Pointer Prov := ⟨⟨0x1000, some (⟨0⟩, ())⟩, some (.VTablePointer vt0)⟩
+    let vt0TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x4000, some (⟨3⟩, [])⟩
+    let fn1TB : Gen.ThinPointer Gen.TreeBorrowsProvenance := ⟨0x5000, some (⟨5⟩, [])⟩
+    let wideTB : Gen.Pointer Gen.TreeBorrowsProvenance :=
+      ⟨⟨0x1000, some (⟨0⟩, [])⟩, some (.VTablePointer vt0TB)⟩
+    let mProgOtherBM : Mach :=
+      { ep1VtMachBM with prog := { ep1VtMachBM.prog with start := ⟨⟨99⟩⟩, traits := ⟨[]⟩ } }
+    let mProgOtherTB : MachTB :=
+      { ep1VtMachTB with prog := { ep1VtMachTB.prog with start := ⟨⟨99⟩⟩, traits := ⟨[]⟩ } }
+    let deadAlloc0BM : Gen.Allocation Unit Unit :=
+      { data := List.replicate 8 (.Init 0 none), addr := 0x1000, align := ⟨8⟩,
+        kind := .Heap, live := false, extra := () }
+    let mDeadMemBM : Mach :=
+      { ep1VtMachBM with
+        mem := { ep1VtMachBM.mem with
+          memory := { ep1VtMachBM.mem.memory with
+            allocations := deadAlloc0BM :: ep1VtAllocsBM.drop 1 } } }
+    let mDeadMemTB : MachTB :=
+      { ep1VtMachTB with
+        mem := { ep1VtMachTB.mem with
+          memory := { ep1VtMachTB.mem.memory with
+            mem := { ep1VtMachTB.mem.memory.mem with
+              allocations := ep1VtAllocTB 0x1000 8 8 .Heap false :: ep1VtAllocsTB.drop 1 } } } }
+    let mNoVtPtrsBM : Mach := { ep1VtMachBM with vtable_ptrs := ⟨[]⟩ }
+    let mNoVtPtrsTB : MachTB := { ep1VtMachTB with vtable_ptrs := ⟨[]⟩ }
+    let mWrongVtsBM : Mach :=
+      { ep1VtMachBM with
+        prog := { ep1VtMachBM.prog with
+          vtables := ⟨[(⟨⟨0⟩⟩, { ep1VTable0 with trait_name := ep1VtTrait1 })]⟩ } }
+    let mWrongVtsTB : MachTB :=
+      { ep1VtMachTB with
+        prog := { ep1VtMachTB.prog with
+          vtables := ⟨[(⟨⟨0⟩⟩, { ep1VTable0 with trait_name := ep1VtTrait1 })]⟩ } }
+    let mNoFnPtrsBM : Mach := { ep1VtMachBM with fn_ptrs := ⟨[]⟩ }
+    let mNoFnPtrsTB : MachTB := { ep1VtMachTB with fn_ptrs := ⟨[]⟩ }
+    let missingFnPanic := "map index: missing key (self.fn_ptrs[fn_name])"
+    -- 1. Non-`vtables` `Program` fields are irrelevant (`Mach` & `MachTB`)
+    (mProgOtherBM.prog ≠ ep1VtMachBM.prog ∧
+     checkPtr wide dynRef (some mProgOtherBM) = checkPtr wide dynRef (some ep1VtMachBM) ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some mProgOtherBM) =
+       evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) ∧
+     mProgOtherTB.prog ≠ ep1VtMachTB.prog ∧
+     checkPtrM wideTB dynRef (some mProgOtherTB) = checkPtrM wideTB dynRef (some ep1VtMachTB) ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some mProgOtherTB) =
+       evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some ep1VtMachTB)) ∧
+    -- 2. Necessity of `hmem`, `hvt`, `hvts`, and `hfn` (`Mach`)
+    (checkPtr wide dynRef (some ep1VtMachBM) = .ok () ∧
+     checkPtr wide dynRef (some mDeadMemBM) =
+       .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+     checkPtr wide dynRef (some mNoVtPtrsBM) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     checkPtr wide dynRef (some mWrongVtsBM) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     checkPtr wide dynRef (some mNoFnPtrsBM) = .ok () ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some ep1VtMachBM) = .ok (.Ptr (ThinPointer.widen fn1 none), .Ptr .FnPtr) ∧
+     evalUnOp (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0 none), vtTy)
+         (some mNoFnPtrsBM) = specPanic missingFnPanic) ∧
+    -- 3. Necessity of `hmem`, `hvt`, `hvts`, and `hfn` (`MachTB`)
+    (checkPtrM wideTB dynRef (some ep1VtMachTB) = .ok () ∧
+     checkPtrM wideTB dynRef (some mDeadMemTB) =
+       .error (.ub "Value::Ptr: non-dereferenceable safe pointer") ∧
+     checkPtrM wideTB dynRef (some mNoVtPtrsTB) =
+       .error (.ub "invalid pointer for vtable lookup") ∧
+     checkPtrM wideTB dynRef (some mWrongVtsTB) =
+       .error (.ub "Value::Ptr: invalid vtable in metadata") ∧
+     checkPtrM wideTB dynRef (some mNoFnPtrsTB) = .ok () ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some ep1VtMachTB) = .ok (.Ptr (ThinPointer.widen fn1TB none), .Ptr .FnPtr) ∧
+     evalUnOpM (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+         (some mNoFnPtrsTB) = specPanic missingFnPanic) := by
+  intro dynRef vtTy vt0 fn1 wide vt0TB fn1TB wideTB mProgOtherBM mProgOtherTB deadAlloc0BM
+    mDeadMemBM mDeadMemTB mNoVtPtrsBM mNoVtPtrsTB mWrongVtsBM mWrongVtsTB mNoFnPtrsBM
+    mNoFnPtrsTB missingFnPanic
+  refine ⟨⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩⟩
+  · intro h; have hs := congrArg Gen.Program.start h
+    simp [mProgOtherBM, ep1VtMachBM, ep1VtProg] at hs
+  · exact checkPtr_congr_vtables rfl rfl rfl wide dynRef
+  · exact evalUnOp_congr_vtables rfl rfl rfl rfl (.VTableMethodLookup ep1VtMeth0)
+      (.Ptr (ThinPointer.widen vt0 none), vtTy)
+  · intro h; have hs := congrArg Gen.Program.start h
+    simp [mProgOtherTB, ep1VtMachTB, ep1VtProg] at hs
+  · exact checkPtrM_congr_mach (M1 := mProgOtherTB) (M2 := ep1VtMachTB) rfl rfl rfl wideTB dynRef
+  · exact evalUnOpM_congr_mach (M1 := mProgOtherTB) (M2 := ep1VtMachTB) rfl rfl rfl rfl
+      (.VTableMethodLookup ep1VtMeth0) (.Ptr (ThinPointer.widen vt0TB none), vtTy)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · exact (checkPtr_congr_vtables (M1 := mNoFnPtrsBM) (M2 := ep1VtMachBM) rfl rfl rfl wide
+      dynRef).trans (by ep1_kernel_rfl)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · exact (checkPtrM_congr_mach (M1 := mNoFnPtrsTB) (M2 := ep1VtMachTB) rfl rfl rfl wideTB
+      dynRef).trans (by ep1_kernel_rfl)
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+
+/-- **`Statement::Deinit` on an unsized `Type::TraitObject` place (`Mach`)**
+follows upstream `spec/lang/step/statements.md` verbatim: a misaligned place
+raises UB (`"de-initializing a place based on a misaligned pointer"`) first,
+while an aligned `Type::TraitObject` place hits
+`LayoutStrategy::expect_size("WF ensures deinits are sized")` (a spec panic,
+never dynamic-size deinit). -/
+theorem ep1_evalStatement_deinit_traitObject_spec (m m1 : Mach) (place : Gen.PlaceExpr)
+    (p : Gen.Place BM) (traitName : Gen.TraitName)
+    (hPl : evalPlace m place = .ok ((p, .TraitObject traitName), m1)) :
+    (p.aligned = false →
+      evalStatement m (.Deinit place) =
+        .error (.ub "de-initializing a place based on a misaligned pointer")) ∧
+    (p.aligned = true →
+      evalStatement m (.Deinit place) =
+        specPanic "expect_size called on unsized type: WF ensures deinits are sized") := by
+  refine ⟨fun hAl => ?_, fun hAl => ?_⟩
+  · unfold evalStatement
+    simp only [hPl, ok_bind, hAl, Bool.not_false, ↓reduceIte, ub]
+  · unfold evalStatement
+    simp only [hPl, ok_bind, hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+
+/-- Polymorphic `ep1_evalStatement_deinit_traitObject_spec`, across every
+`Memory` `M` (in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem ep1_evalStatementM_deinit_traitObject_spec {M : Type} [Gen.Memory M] [MemoryOps M]
+    (m m1 : Gen.Machine M) (place : Gen.PlaceExpr)
+    (p : Gen.Place M) (traitName : Gen.TraitName)
+    (hPl : evalPlaceM m place = .ok ((p, .TraitObject traitName), m1)) :
+    (p.aligned = false →
+      evalStatementM m (.Deinit place) =
+        .error (.ub "de-initializing a place based on a misaligned pointer")) ∧
+    (p.aligned = true →
+      evalStatementM m (.Deinit place) =
+        specPanic "expect_size called on unsized type: WF ensures deinits are sized") := by
+  refine ⟨fun hAl => ?_, fun hAl => ?_⟩
+  · unfold evalStatementM
+    simp only [hPl, ok_bind, hAl, Bool.not_false, ↓reduceIte, ub]
+  · unfold evalStatementM
+    simp only [hPl, ok_bind, hAl, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+    rfl
+
+set_option maxRecDepth 8192 in
+/-- **Trait-object `Statement::Deinit` semantics, sized view/head deinit, and
+Tree Borrows write-access mode sensitivity** (`Mach` & `MachTB`, with
+`MachTB.wfLive`):
+1. Direct `Statement::Deinit` on `*p : Type::TraitObject` raises
+   `specPanic "expect_size called on unsized type: WF ensures deinits are sized"`
+   when aligned, and UB `"de-initializing a place based on a misaligned pointer"`
+   when misaligned for `vtable.align = 4` (upstream
+   `spec/lang/step/statements.md`);
+2. Sized 4-byte `Statement::Deinit` through `&mut dyn Trait0` (via
+   `GetThinPointer`) and through `Field 0` of `&mut { head: u32, tail: dyn Trait0 }`
+   turns bytes `[0..4)` to `.Uninit` while preserving bytes `[4..8)` intact on
+   both `Mach` and `MachTB` (preserving `MachTB.wfLive`);
+3. `Statement::Deinit` through validated `&dyn Trait0` succeeds on `Mach` and
+   faults `"Tree Borrows: local write of Frozen reference"` on `MachTB`;
+4. `Statement::Deinit` on a 16-byte `&dyn Trait0` local itself wipes all 16
+   bytes to `.Uninit`, so reloading it raises
+   `"load at type but the data in memory violates the language invariant"`. -/
+theorem ep1_vtable_deinit_traitObject_and_sized_view_witness :
+    let vt4 : Gen.VTable :=
+      { trait_name := ep1VtTrait0, size := ⟨4⟩, align := ⟨4⟩, cells := [], methods := ⟨[]⟩ }
+    let deinitProg : Gen.Program :=
+      { functions := ⟨[]⟩, start := ⟨⟨0⟩⟩, globals := ⟨[]⟩,
+        traits := ⟨[(ep1VtTrait0, ⟨[]⟩)]⟩, vtables := ⟨[(⟨⟨0⟩⟩, vt4)]⟩ }
+    let dynPointee := ep1DynPointee ep1VtTrait0
+    let dynRef : Gen.PtrType := .Ref .Immutable dynPointee
+    let dynMut : Gen.PtrType := .Ref .Mutable dynPointee
+    let rawDyn : Gen.PtrType := .Raw (.VTablePointer ep1VtTrait0)
+    let head4 : Gen.TupleHeadLayout := ⟨⟨4⟩, ⟨4⟩, none⟩
+    let structTy : Gen.Type :=
+      .Tuple [(⟨0⟩, .Int ep1U32)] head4 (some (.TraitObject ep1VtTrait0))
+    let structPointee : Gen.PointeeInfo :=
+      { layout := .Tuple head4 (.TraitObject ep1VtTrait0), inhabited := true,
+        unsafe_cells := .Tuple [] .TraitObject, freeze := true, unpin := true }
+    let structMut : Gen.PtrType := .Ref .Mutable structPointee
+    let initBuf : List Byte :=
+      [.Init 1 none, .Init 2 none, .Init 3 none, .Init 4 none,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let afterDeinit4 : List Byte :=
+      [.Uninit, .Uninit, .Uninit, .Uninit,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let afterDeinit4TB : List (Gen.AbstractByte Gen.TreeBorrowsProvenance) :=
+      [.Uninit, .Uninit, .Uninit, .Uninit,
+       .Init 5 none, .Init 6 none, .Init 7 none, .Init 8 none]
+    let vt4Ptr : Ptr := ⟨0x4000, some (⟨2⟩, ())⟩
+    let alignedWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x00, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let misalignedWideBytes : List Byte :=
+      encodePtrBytes (some (⟨0⟩, ())) 0 [0x02, 0x10, 0, 0, 0, 0, 0, 0] ++
+      encodePtrBytes (some (⟨2⟩, ())) 0 [0x00, 0x40, 0, 0, 0, 0, 0, 0]
+    let mkBM (ptrTy : Gen.PtrType) (local1Bytes : List Byte) : Mach :=
+      { ep1MachBM
+          [{ data := initBuf, addr := 0x1000, align := ⟨8⟩,
+             kind := .Heap, live := true, extra := () },
+           { data := local1Bytes, addr := 0x2000, align := ⟨8⟩,
+             kind := .Stack, live := true, extra := () },
+           { data := [], addr := 0x4000, align := ⟨1⟩,
+             kind := .VTable, live := true, extra := () }]
+          [(⟨⟨1⟩⟩, ⟨0x2000, some (⟨1⟩, ())⟩)]
+          [(⟨⟨1⟩⟩, .Ptr ptrTy)] with
+        prog := deinitProg
+        vtable_ptrs := ⟨[(⟨⟨0⟩⟩, vt4Ptr)]⟩ }
+    let mkTB (ptrTy : Gen.PtrType) (local1Bytes : List Byte) : MachTB :=
+      liftMachToTB (mkBM ptrTy local1Bytes)
+    let deinitDynPlace : Gen.Statement :=
+      .Deinit (.Deref (.Load (.Local ⟨⟨1⟩⟩)) (.TraitObject ep1VtTrait0))
+    let deinitView4 : Gen.Statement :=
+      .Deinit (.Deref (.UnOp .GetThinPointer (.Load (.Local ⟨⟨1⟩⟩))) (.Int ep1U32))
+    let deinitHead4 : Gen.Statement :=
+      .Deinit (.Field (.Deref (.Load (.Local ⟨⟨1⟩⟩)) structTy) 0)
+    let deinitWideLocal : Gen.Statement := .Deinit (.Local ⟨⟨1⟩⟩)
+    let unsizedPanic := "expect_size called on unsized type: WF ensures deinits are sized"
+    let misalignedUb := "de-initializing a place based on a misaligned pointer"
+    let frozenUb := "Tree Borrows: local write of Frozen reference"
+    let loadInvUb := "load at type but the data in memory violates the language invariant"
+    -- 1. Direct `Statement::Deinit` on `Type::TraitObject`: aligned panic vs misaligned UB
+    (evalStatement (mkBM dynMut alignedWideBytes) deinitDynPlace = specPanic unsizedPanic ∧
+     evalStatementM (mkTB dynMut alignedWideBytes) deinitDynPlace = specPanic unsizedPanic ∧
+     evalStatement (mkBM rawDyn misalignedWideBytes) deinitDynPlace = .error (.ub misalignedUb) ∧
+     evalStatementM (mkTB rawDyn misalignedWideBytes) deinitDynPlace = .error (.ub misalignedUb)) ∧
+    -- 2. Sized 4-byte `Deinit` via `&mut dyn Trait0` and via `Field 0` of unsized struct
+    ((∃ m1 m2,
+       evalStatement (mkBM dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitView4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1 m2,
+       evalStatementM (mkTB dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatementM m1 deinitView4 = .ok m2 ∧
+       MachTB.wfLive m2 ∧
+       m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data = some afterDeinit4TB) ∧
+     (∃ m1 m2,
+       evalStatement (mkBM structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitHead4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1 m2,
+       evalStatementM (mkTB structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatementM m1 deinitHead4 = .ok m2 ∧
+       MachTB.wfLive m2 ∧
+       m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data = some afterDeinit4TB)) ∧
+    -- 3. Tree Borrows mode sensitivity of `Deinit` on validated `&dyn Trait0`
+    ((∃ m1 m2,
+       evalStatement (mkBM dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       evalStatement m1 deinitView4 = .ok m2 ∧
+       m2.mem.memory.allocations[0]?.map Gen.Allocation.data = some afterDeinit4) ∧
+     (∃ m1,
+       evalStatementM (mkTB dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false) = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       evalStatementM m1 deinitView4 = .error (.ub frozenUb))) ∧
+    -- 4. `Deinit` on the 16-byte `&dyn Trait0` local itself
+    ((∃ m1,
+       evalStatement (mkBM dynRef alignedWideBytes) deinitWideLocal = .ok m1 ∧
+       m1.mem.memory.allocations[1]?.map Gen.Allocation.data = some (List.replicate 16 .Uninit) ∧
+       evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadInvUb)) ∧
+     (∃ m1,
+       evalStatementM (mkTB dynRef alignedWideBytes) deinitWideLocal = .ok m1 ∧
+       MachTB.wfLive m1 ∧
+       m1.mem.memory.mem.allocations[1]?.map Gen.Allocation.data =
+         some (List.replicate 16 .Uninit) ∧
+       evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)) = .error (.ub loadInvUb))) := by
+  intro vt4 deinitProg dynPointee dynRef dynMut rawDyn head4 structTy structPointee structMut
+    initBuf afterDeinit4 afterDeinit4TB vt4Ptr alignedWideBytes misalignedWideBytes mkBM mkTB
+    deinitDynPlace deinitView4 deinitHead4 deinitWideLocal unsizedPanic misalignedUb frozenUb
+    loadInvUb
+  refine ⟨⟨?_, ?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_⟩⟩
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · ep1_kernel_rfl
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitView4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 deinitView4
+          pure (m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4TB) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynMut alignedWideBytes)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    exact ⟨m1, m2, hm1, hm2, hwf2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitHead4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB structMut alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatementM m1 deinitHead4
+          pure (m2.mem.memory.mem.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4TB) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive
+      (liftMachToTB_wfLive (mkBM structMut alignedWideBytes)) hm1
+    have hwf2 := evalStatementM_tb_wfLive hwf1 hm2
+    exact ⟨m1, m2, hm1, hm2, hwf2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          let m2 ← evalStatement m1 deinitView4
+          pure (m2.mem.memory.allocations[0]?.map Gen.Allocation.data)) =
+        .ok (some afterDeinit4) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨m2, hm2, hseq⟩ := ep1_bind_ok hseq
+    exact ⟨m1, m2, hm1, hm2, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynRef alignedWideBytes) (.Validate (.Local ⟨⟨1⟩⟩) false)
+          pure (evalStatementM m1 deinitView4)) =
+        .ok (.error (.ub frozenUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef alignedWideBytes)) hm1
+    exact ⟨m1, hm1, hwf1, ep1_pure_ok hseq⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatement (mkBM dynRef alignedWideBytes) deinitWideLocal
+          pure (m1.mem.memory.allocations[1]?.map Gen.Allocation.data,
+            evalValue m1 (.Load (.Local ⟨⟨1⟩⟩)))) =
+        .ok (some (List.replicate 16 .Uninit), .error (.ub loadInvUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hdata, hload⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    exact ⟨m1, hm1, hdata, hload⟩
+  · have hseq :
+        (do
+          let m1 ← evalStatementM (mkTB dynRef alignedWideBytes) deinitWideLocal
+          pure (m1.mem.memory.mem.allocations[1]?.map Gen.Allocation.data,
+            evalValueM m1 (.Load (.Local ⟨⟨1⟩⟩)))) =
+        .ok (some (List.replicate 16 .Uninit), .error (.ub loadInvUb)) := by ep1_kernel_rfl
+    obtain ⟨m1, hm1, hseq⟩ := ep1_bind_ok hseq
+    obtain ⟨hdata, hload⟩ := Prod.mk.inj (ep1_pure_ok hseq)
+    have hwf1 := evalStatementM_tb_wfLive (liftMachToTB_wfLive (mkBM dynRef alignedWideBytes)) hm1
+    exact ⟨m1, hm1, hwf1, hdata, hload⟩
+
+/-- **Misaligned safe trait-object pointer in `PlaceExpr::Deref` (`Mach`)**:
+when the operand of `PlaceExpr::Deref` evaluates to a `&dyn Trait`,
+`&mut dyn Trait`, or `Box<dyn Trait>` whose address is not aligned to the
+vtable's alignment `vt.align`, `evalPlace` hits upstream's internal alignment
+assertion (`spec/lang/step/expressions.md:254`) and raises a `specPanic`
+before calling `Memory::dereferenceable` (for every destination type `ty`). -/
+theorem ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic (m m1 : Mach)
+    (operand : Gen.ValueExpr) (ty : Gen.Type) (thin vptr : Ptr)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hOp : evalValue m operand =
+      .ok ((.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))), .Ptr (mk pointee)), m1))
+    (hvt : vtableLookup m1 vptr = .ok vt)
+    (hMis : Align.is_aligned vt.align thin.addr = false) :
+    evalPlace m (.Deref operand ty) =
+      specPanic
+        "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)" := by
+  have hca : computeAlign m1 (.TraitObject traitName) (some (.VTablePointer vptr)) =
+      .ok vt.align := by
+    unfold computeAlign
+    rw [compute_size_and_align_traitObject, hvt]
+    rfl
+  unfold evalPlace
+  rw [hOp, ok_bind]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+
+/-- Polymorphic `ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic`,
+across every `Memory` `M` (in particular `MachTB` / `TreeBorrowsMemory`). -/
+theorem ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic {M : Type}
+    [Gen.Memory M] [MemoryOps M] (m m1 : Gen.Machine M)
+    (operand : Gen.ValueExpr) (ty : Gen.Type)
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hOp : evalValueM m operand =
+      .ok ((.Ptr (ThinPointer.widen thin (some (.VTablePointer vptr))), .Ptr (mk pointee)), m1))
+    (hvt : vtableLookupM m1 vptr = .ok vt)
+    (hMis : Align.is_aligned vt.align thin.addr = false) :
+    evalPlaceM m (.Deref operand ty) =
+      specPanic
+        "assertion failed: self.compute_align(pointee.layout, ptr.metadata).is_aligned(ptr.thin_pointer.addr)" := by
+  have hca : computeAlignM m1 (.TraitObject traitName) (some (.VTablePointer vptr)) =
+      .ok vt.align := by
+    unfold computeAlignM
+    rw [compute_size_and_align_traitObject, hvt]
+    rfl
+  unfold evalPlaceM
+  rw [hOp, ok_bind]
+  rcases hMk with ⟨mutbl, rfl⟩ | rfl
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+  · dsimp only [ThinPointer.widen, PtrType.safe_pointee]
+    rw [hLayout, hca, ok_bind, hMis]
+    simp only [Bool.not_false, ↓reduceIte, specPanic, error_bind]
+
+private theorem ep1_cellsToFreezeMaskLoop_zero_step (rest : List (Gen.Offset × Size))
+    (mask : List Bool) :
+    cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) ((⟨0⟩, ⟨0⟩) :: rest) mask =
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) rest mask := by
+  have h : cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) ((⟨0⟩, ⟨0⟩) :: rest) mask =
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) rest (mask ++ [] ++ []) := rfl
+  rw [h, List.append_nil, List.append_nil]
+
+private theorem ep1_cellsToFreezeMaskLoop_zero_all :
+    ∀ (xs : List (Gen.Offset × Size)) (mask : List Bool),
+      (∀ c ∈ xs, c = (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) (xs ++ [(⟨0⟩, ⟨0⟩)]) mask = .ok mask
+  | [], mask, _ => by
+    rw [List.nil_append, ep1_cellsToFreezeMaskLoop_zero_step]
+    rfl
+  | c :: rest, mask, hall => by
+    have hc : c = (⟨0⟩, ⟨0⟩) := hall c List.mem_cons_self
+    subst hc
+    rw [List.cons_append, ep1_cellsToFreezeMaskLoop_zero_step]
+    exact ep1_cellsToFreezeMaskLoop_zero_all rest mask
+      (fun x hx => hall x (List.mem_cons_of_mem _ hx))
+
+private theorem ep1_cellsToFreezeMaskLoop_pos_panic :
+    ∀ (xs : List (Gen.Offset × Size)) (cur : Gen.Offset × Size) (mask : List Bool),
+      0 < cur.1.bytes + cur.2.bytes →
+      cellsToFreezeMaskLoop cur (xs ++ [(⟨0⟩, ⟨0⟩)]) mask =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"
+  | [], cur, mask, hpos => by
+    rw [List.nil_append]
+    unfold cellsToFreezeMaskLoop
+    have hlt : ((0 : Nat) : Int) - ((cur.1.bytes + cur.2.bytes : Nat) : Int) < 0 := by omega
+    dsimp only
+    simp only [hlt, ↓reduceIte]
+  | next :: rest, cur, mask, hpos => by
+    rw [List.cons_append]
+    unfold cellsToFreezeMaskLoop
+    by_cases hlt : (next.1.bytes : Int) - ((cur.1.bytes + cur.2.bytes : Nat) : Int) < 0
+    · simp only [hlt, ↓reduceIte]
+    · simp only [hlt, ↓reduceIte]
+      exact ep1_cellsToFreezeMaskLoop_pos_panic rest next _ (by omega)
+
+private theorem ep1_cellsToFreezeMaskLoop_bad_panic :
+    ∀ (xs : List (Gen.Offset × Size)) (mask : List Bool),
+      (∃ c ∈ xs, c ≠ (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMaskLoop (⟨0⟩, ⟨0⟩) (xs ++ [(⟨0⟩, ⟨0⟩)]) mask =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"
+  | [], _, ⟨_, hmem, _⟩ => nomatch hmem
+  | c :: rest, mask, ⟨bad, hmem, hne⟩ => by
+    by_cases hc : c = (⟨0⟩, ⟨0⟩)
+    · subst hc
+      rw [List.cons_append, ep1_cellsToFreezeMaskLoop_zero_step]
+      have hrest : ∃ b ∈ rest, b ≠ (⟨0⟩, ⟨0⟩) := by
+        rcases List.mem_cons.mp hmem with rfl | hmem'
+        · exact absurd rfl hne
+        · exact ⟨bad, hmem', hne⟩
+      exact ep1_cellsToFreezeMaskLoop_bad_panic rest mask hrest
+    · have hpos : 0 < c.1.bytes + c.2.bytes := by
+        rcases c with ⟨⟨o⟩, ⟨s⟩⟩
+        dsimp only
+        by_cases h0 : o = 0 ∧ s = 0
+        · rcases h0 with ⟨rfl, rfl⟩; exact absurd rfl hc
+        · omega
+      rw [List.cons_append]
+      unfold cellsToFreezeMaskLoop
+      dsimp only
+      split
+      · rfl
+      · exact ep1_cellsToFreezeMaskLoop_pos_panic rest c _ hpos
+
+/-- **Complete dichotomy for `cellsToFreezeMask cells ⟨0⟩`** (arbitrary
+`UnsafeCell` ranges on a zero-sized type):
+1. if every cell is `(⟨0⟩, ⟨0⟩)` (empty list or zero-sized `UnsafeCell<()>` at
+   offset `0`), `cellsToFreezeMask cells ⟨0⟩ = .ok []`;
+2. if any cell has non-zero offset or non-zero size, `cellsToFreezeMask`
+   panics with `"cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges"`. -/
+theorem ep1_cellsToFreezeMask_zero_dichotomy (cells : List (Gen.Offset × Size)) :
+    ((∀ c ∈ cells, c = (⟨0⟩, ⟨0⟩)) → cellsToFreezeMask cells ⟨0⟩ = .ok []) ∧
+    ((∃ c ∈ cells, c ≠ (⟨0⟩, ⟨0⟩)) →
+      cellsToFreezeMask cells ⟨0⟩ =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges") := by
+  refine ⟨fun hall => ?_, fun hbad => ?_⟩
+  · unfold cellsToFreezeMask
+    rw [ep1_cellsToFreezeMaskLoop_zero_all cells [] hall, ok_bind]
+    rfl
+  · unfold cellsToFreezeMask
+    rw [ep1_cellsToFreezeMaskLoop_bad_panic cells [] hbad]
+    unfold specPanic
+    rw [error_bind]
+
+/-- **General ZST `TreeBorrowsMemory.retag_ptr` dichotomy for arbitrary
+`vt.cells`** on a provenance-free trait-object pointer (`vt.size = 0`,
+`thin.provenance = none`), lifting the `vt.cells = []` restriction of
+`retag_ptr_traitObject_zst_noProv`:
+1. whenever every entry in `vt.cells` is `(⟨0⟩, ⟨0⟩)` (including `[]` and
+   zero-sized `UnsafeCell<()>` fields at offset `0`), `retag_ptr` is the
+   identity `(ptr, tbm, frameExtra)` for `&dyn`, `&mut dyn`, and `Box<dyn>` at
+   every `fnEntry`, `fnImplicitWrites`, `freeze`, and `unpin`;
+2. if `vt.cells` contains any cell `≠ (⟨0⟩, ⟨0⟩)`, then:
+   * when retagging runs (`&dyn Trait`, or `&mut dyn Trait` / `Box<dyn Trait>`
+     with `pointee.unpin = true`), `retag_ptr` propagates the `cellsToFreezeMask`
+     `specPanic`;
+   * for pinned `!pointee.unpin` `&mut dyn Trait` / `Box<dyn Trait>`,
+     `ReborrowSettings::new` returns `none` before calling `freeze_mask`, so
+     `retag_ptr` remains the identity. -/
+theorem ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+    (tbm : Gen.TreeBorrowsMemory Gen.x86_64) (frameExtra : Gen.TreeBorrowsFrameExtra)
+    (thin vptr : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (mk : Gen.PointeeInfo → Gen.PtrType) (pointee : Gen.PointeeInfo)
+    (traitName : Gen.TraitName) (fnEntry fnImplicitWrites : Bool)
+    (vtableLookup : Gen.ThinPointer Gen.TreeBorrowsProvenance → Interp Gen.VTable)
+    (vt : Gen.VTable)
+    (hMk : (∃ mutbl, mk = Gen.PtrType.Ref mutbl) ∨ mk = Gen.PtrType.Box)
+    (hLayout : pointee.layout = .TraitObject traitName)
+    (hCells : pointee.unsafe_cells = .TraitObject)
+    (hvt : vtableLookup vptr = .ok vt)
+    (hSize : vt.size = ⟨0⟩)
+    (hProv : thin.provenance = none) :
+    let ptr := ThinPointer.widen thin (some (.VTablePointer vptr))
+    ((∀ c ∈ vt.cells, c = (⟨0⟩, ⟨0⟩)) →
+      TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+          vtableLookup = .ok (ptr, tbm, frameExtra)) ∧
+    ((∃ c ∈ vt.cells, c ≠ (⟨0⟩, ⟨0⟩)) →
+      ((mk = Gen.PtrType.Ref .Immutable ∨ pointee.unpin = true) →
+        TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+            vtableLookup =
+          specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges") ∧
+      (((mk = Gen.PtrType.Ref .Mutable ∨ mk = Gen.PtrType.Box) ∧ pointee.unpin = false) →
+        TreeBorrowsMemory.retag_ptr tbm frameExtra ptr (mk pointee) fnEntry fnImplicitWrites
+            vtableLookup = .ok (ptr, tbm, frameExtra))) := by
+  intro ptr
+  have hReb : ∀ (outside : Gen.Permission) (prot : Gen.Protected),
+      TreeBorrowsMemory.reborrow tbm thin
+        { inside := [], outside := outside, «protected» := prot } frameExtra =
+        .ok (thin, tbm, frameExtra) := by
+    intro outside prot
+    unfold TreeBorrowsMemory.reborrow
+    have hchk : BasicMemory.check_ptr tbm.mem thin ⟨0⟩ = .ok none := rfl
+    dsimp only [List.length]
+    rw [hchk, ok_bind, hProv]
+    rfl
+  obtain ⟨layout, inhabited, cells, freeze, unpin⟩ := pointee
+  dsimp only at hLayout hCells
+  subst hLayout; subst hCells
+  refine ⟨fun hall => ?_, fun hbad => ?_⟩
+  · have hFreeze : UnsafeCellStrategy.freeze_mask vtableLookup .TraitObject
+        (.TraitObject traitName) (some (.VTablePointer vptr)) = .ok [] := by
+      unfold UnsafeCellStrategy.freeze_mask
+      rw [hvt, ok_bind, hSize, (ep1_cellsToFreezeMask_zero_dichotomy vt.cells).1 hall]
+    rcases hMk with ⟨mutbl, rfl⟩ | rfl
+    · cases mutbl with
+      | Immutable =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.false_eq_true, ↓reduceIte,
+          hFreeze, ok_bind, List.mapM_nil, pure_ok, ReborrowSettings.perm]
+        cases freeze <;> simp only [Bool.false_eq_true, ↓reduceIte, ok_bind, hReb]
+      | Mutable =>
+        cases unpin with
+        | false =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+            pure_ok, ok_bind]
+        | true =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte, hFreeze, ok_bind, List.mapM_nil, pure_ok,
+            ReborrowSettings.perm, Bool.and_false, hReb]
+    · cases unpin with
+      | false =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
+      | true =>
+        unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+          Bool.false_eq_true, ↓reduceIte, hFreeze, ok_bind, List.mapM_nil, pure_ok,
+          ReborrowSettings.perm, Bool.and_false, hReb]
+  · have hFreezeBad : UnsafeCellStrategy.freeze_mask vtableLookup .TraitObject
+        (.TraitObject traitName) (some (.VTablePointer vptr)) =
+        specPanic "cells_to_freeze_mask: overlapping or out-of-order UnsafeCell ranges" := by
+      unfold UnsafeCellStrategy.freeze_mask
+      rw [hvt, ok_bind, hSize, (ep1_cellsToFreezeMask_zero_dichotomy vt.cells).2 hbad]
+    refine ⟨fun hActive => ?_, fun ⟨hMutOrBox, hUnpin⟩ => ?_⟩
+    · rcases hMk with ⟨mutbl, rfl⟩ | rfl
+      · cases mutbl with
+        | Immutable =>
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.false_eq_true, ↓reduceIte,
+            hFreezeBad, specPanic, error_bind]
+        | Mutable =>
+          rcases hActive with hEq | hUnpin
+          · exfalso
+            have h0 := congrArg (fun f => f ⟨.TraitObject traitName, inhabited, .TraitObject, freeze, unpin⟩) hEq
+            injection h0 with hmut
+            cases hmut
+          · subst hUnpin
+            unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+            simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+              Bool.false_eq_true, ↓reduceIte, hFreezeBad, specPanic, error_bind]
+      · rcases hActive with hEq | hUnpin
+        · exfalso
+          have h0 := congrArg (fun f => f ⟨.TraitObject traitName, inhabited, .TraitObject, freeze, unpin⟩) hEq
+          cases h0
+        · subst hUnpin
+          unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+          simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_true,
+            Bool.false_eq_true, ↓reduceIte, hFreezeBad, specPanic, error_bind]
+    · subst hUnpin
+      rcases hMutOrBox with rfl | rfl
+      · unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
+      · unfold TreeBorrowsMemory.retag_ptr ReborrowSettings.new
+        simp only [ptr, ThinPointer.widen, PtrType.safe_pointee, Bool.not_false, ↓reduceIte,
+          pure_ok, ok_bind]
 
 /-- **Ill-formed `ValueExpr::Variant` / `ValueExpr::Union` ASTs are spec panics, not UB**, on
 both `Mach` and `MachTB`:
@@ -10222,9 +12357,10 @@ private theorem ep1_vtable_layout_total :
 /-- **Strict non-vtable panic totality and `Type::layout` totality on vtable types:**
 strengthening `ep1_evalUnOpM_meta_unops_error_is_specPanic_or_unsupported` on every `Memory` `M`:
 1. whenever `Type.meta_kind ty = .VTablePointer t`, `Type.layout ty` is total (succeeds with
-   a layout of kind `.VTablePointer t`), proving that the interpreter's fail-closed vtable
-   guard before `Type.layout` in `ComputeSize`/`ComputeAlign` can never mask a `Type.layout`
-   spec panic;
+   a layout of kind `.VTablePointer t`), so on a trait-object type `ComputeSize` /
+   `ComputeAlign` always reach the vtable lookup of
+   `LayoutStrategy::compute_size_and_align` (the machine's `Machine::vtable_lookup`, or the
+   machine-free fail-closed stop) and never stop at a `Type.layout` spec panic;
 2. for any non-vtable pointer type (`PtrType.meta_kind ptrTy ≠ .VTablePointer _`), any failure
    of `GetMetadata` is strictly `Stop.specPanic` (never `unsupported` and never `ub`);
 3. for any non-vtable pointee type (`Type.meta_kind ty ≠ .VTablePointer _`), any failure of
@@ -10377,21 +12513,24 @@ theorem ep1_meta_unops_nonVTable_never_unsupported_and_vtable_layout_total
     · cases m with
       | none => exact hRun true hS
       | some mach =>
-        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).1] at hS
+        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach hnv).1] at hS
         exact hRun true hS
     · cases m with
       | none => exact hRun false hA
       | some mach =>
-        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach).2] at hA
+        rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty opTy v mach hnv).2] at hA
         exact hRun false hA
 
 /-- **Algebraic composition law `GetMetadata` → `ComputeSize` / `ComputeAlign`:**
 whenever `evalUnOpM .GetMetadata (.Ptr ptr, .Ptr ptrTy) m = .ok (metaVal, metaTy)` and `ty`
 has matching `Type.meta_kind ty = PtrType.meta_kind ptrTy` and `Type.layout ty = .ok lay`:
 1. `PointerMetaKind.decode_valueM (Type.meta_kind ty) metaVal = .ok ptr.metadata` (exact
-   encode/decode roundtrip on the live non-vtable domain);
+   encode/decode roundtrip, including vtable metadata, which `GetMetadata` returns only
+   with a machine);
 2. whenever `LayoutStrategy.compute_size_and_align vt lay ptr.metadata = .ok (sz, al)`,
-   feeding `(metaVal, metaTy)` directly into `ComputeSize ty` and `ComputeAlign ty` returns
+   where `vt` is arbitrary for non-vtable metadata and is the machine's
+   `Machine::vtable_lookup` (`vtableLookupM`) for vtable metadata, feeding
+   `(metaVal, metaTy)` directly into `ComputeSize ty` and `ComputeAlign ty` returns
    `(.Int sz.bytes, usize)` and `(.Int al.bytes, usize)` respectively. -/
 theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
     {M : Type} [Gen.Memory M] [MemoryOps M]
@@ -10404,6 +12543,8 @@ theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
     PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) metaVal = .ok ptr.metadata ∧
     (∀ (sz : Size) (al : Align)
         (vt : Gen.ThinPointer (Gen.Memory.Provenance M) → Interp Gen.VTable),
+      ((∀ p, ptr.metadata ≠ some (.VTablePointer p)) ∨
+        (∃ mach, m = some mach ∧ vt = vtableLookupM mach)) →
       LayoutStrategy.compute_size_and_align vt lay ptr.metadata = .ok (sz, al) →
       evalUnOpM (.ComputeSize ty) (metaVal, metaTy) m = .ok (.Int (sz.bytes : Int), .Int IntType.usize_ty) ∧
       evalUnOpM (.ComputeAlign ty) (metaVal, metaTy) m = .ok (.Int (al.bytes : Int), .Int IntType.usize_ty)) := by
@@ -10435,8 +12576,7 @@ theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
         unfold LayoutStrategy.compute_size_and_align
         rw [ih (some mv) hnv]
   rcases ptr with ⟨thin, metaOpt⟩
-  have hPrep : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) metaVal = .ok metaOpt ∧
-      (∀ p, metaOpt ≠ some (.VTablePointer p)) := by
+  have hDec : PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) metaVal = .ok metaOpt := by
     rw [hKind]
     cases hk : PtrType.meta_kind ptrTy with
     | VTablePointer t =>
@@ -10447,18 +12587,33 @@ theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
       | some mv =>
         cases mv with
         | ElementCount c =>
-          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.2.2 t c hk] at hGet
+          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.2.2.1 t c hk] at hGet
           cases hGet
         | VTablePointer p =>
-          rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.1 t p hk] at hGet
-          cases hGet
+          cases m with
+          | none =>
+            rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy none).2.2.1 t p hk] at hGet
+            cases hGet
+          | some mach =>
+            rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy (some mach)).2.2.2.2.2.2.2.2
+              t p mach hk] at hGet
+            cases hchk : checkPtrM (M := M) ⟨p, none⟩ (.VTablePtr t) (some mach) with
+            | error e =>
+              rw [hchk] at hGet
+              cases e <;> cases hGet
+            | ok u =>
+              cases u
+              rw [hchk] at hGet
+              simp only [Except.ok.injEq, Prod.mk.injEq] at hGet
+              rcases hGet with ⟨rfl, _⟩
+              rfl
     | None =>
       cases metaOpt with
       | none =>
         rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).1 hk] at hGet
         simp only [Except.ok.injEq, Prod.mk.injEq] at hGet
         rcases hGet with ⟨rfl, _⟩
-        exact ⟨rfl, fun _ h => by cases h⟩
+        rfl
       | some mv =>
         rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.1 mv hk] at hGet
         cases hGet
@@ -10473,36 +12628,93 @@ theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
           rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.1 c hk] at hGet
           cases hc : IntType.can_represent IntType.usize_ty c <;> simp [hc, specPanic] at hGet
           rcases hGet with ⟨rfl, _⟩
-          exact ⟨rfl, fun _ h => by cases h⟩
+          rfl
         | VTablePointer p =>
           rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy m).2.2.2.2.2.1 p hk] at hGet
           cases hGet
-  obtain ⟨hDec, hNotVT⟩ := hPrep
   refine ⟨hDec, ?_⟩
-  intro sz al vt hCsa
-  have hEvalNone :
-      evalUnOpM (.ComputeSize ty) (metaVal, metaTy) none = .ok (.Int (sz.bytes : Int), .Int IntType.usize_ty) ∧
-      evalUnOpM (.ComputeAlign ty) (metaVal, metaTy) none = .ok (.Int (al.bytes : Int), .Int IntType.usize_ty) := by
+  intro sz al vt hSel hCsa
+  cases m with
+  | none =>
+    have hNotVT : ∀ p, metaOpt ≠ some (.VTablePointer p) := by
+      rcases hSel with hNot | ⟨mach, hm, _⟩
+      · exact hNot
+      · cases hm
     have h1 := hCsaIndep (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata") vt lay metaOpt hNotVT
     have h2 := hCsaIndep (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata") vt lay metaOpt hNotVT
-    cases metaOpt with
-    | none =>
-      constructor
-      · unfold evalUnOpM; simp only [hDec, hLay, h1, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
-      · unfold evalUnOpM; simp only [hDec, hLay, h2, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
-    | some mv =>
-      cases mv with
-      | VTablePointer p => exact absurd rfl (hNotVT p)
-      | ElementCount c =>
-        constructor
-        · unfold evalUnOpM; simp only [hDec, hLay, h1, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
-        · unfold evalUnOpM; simp only [hDec, hLay, h2, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
-  cases m with
-  | none => exact hEvalNone
+    constructor
+    · unfold evalUnOpM; simp only [hDec, hLay, h1, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
+    · unfold evalUnOpM; simp only [hDec, hLay, h2, hCsa, bind, Except.bind, Functor.map, Except.map, pure, Except.pure]
   | some mach =>
-    rw [(ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty metaTy metaVal mach).1,
-        (ep1_evalUnOpM_computeSize_computeAlign_mach_indep ty metaTy metaVal mach).2]
-    exact hEvalNone
+    have hCsaM : LayoutStrategy.compute_size_and_align (vtableLookupM mach) lay metaOpt =
+        .ok (sz, al) := by
+      rcases hSel with hNot | ⟨mach', hm, hvt⟩
+      · rw [hCsaIndep (vtableLookupM mach) vt lay metaOpt hNot]
+        exact hCsa
+      · cases hm
+        rw [← hvt]
+        exact hCsa
+    constructor
+    · unfold evalUnOpM; simp only [hDec, hLay, computeSizeM, hCsaM, bind, Except.bind, pure, Except.pure]
+    · unfold evalUnOpM; simp only [hDec, hLay, computeAlignM, hCsaM, bind, Except.bind, pure, Except.pure]
+
+/-- **Sharp `dyn Trait` instance of the composition law `GetMetadata` →
+`ComputeSize` / `ComputeAlign`, with a machine.** For every pointer type with
+vtable-pointer metadata (`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`,
+`*const dyn Trait`, and pointers to unsized structs with a `dyn Trait` tail)
+and every pointer whose metadata `vptr` is in bounds and is the address of a
+vtable `vt` for the trait (the metadata part of `check_ptr`), on every memory
+model:
+1. `GetMetadata` returns `vptr` at `Type::Ptr(PtrType::VTablePtr(trait_name))`;
+2. feeding that result to `ComputeSize` / `ComputeAlign` at `Type::TraitObject`
+   returns exactly `vt.size` and `vt.align`;
+3. feeding it to `ComputeSize` / `ComputeAlign` at an unsized tuple with a
+   `dyn Trait` tail returns exactly the full size and alignment that
+   `TupleHeadLayout::full_size_and_align` computes from `vt.size` and
+   `vt.align`.
+None of the five operator applications errors. -/
+theorem ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+    {M : Type} [Gen.Memory M] [MemoryOps M]
+    (thin vptr : Gen.ThinPointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (t : Gen.TraitName) (mach : Gen.Machine M) (vt : Gen.VTable)
+    (fields : List (Gen.Offset × Gen.Type)) (head : Gen.TupleHeadLayout)
+    (hKind : PtrType.meta_kind ptrTy = .VTablePointer t)
+    (hAddr : inBounds vptr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : vtableLookupM mach vptr = .ok vt) (hTrait : vt.trait_name = t) :
+    evalUnOpM (M := M) .GetMetadata (.Ptr ⟨thin, some (.VTablePointer vptr)⟩, .Ptr ptrTy)
+        (some mach) = .ok (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) ∧
+    evalUnOpM (M := M) (.ComputeSize (.TraitObject t)) (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t))
+        (some mach) = .ok (.Int (vt.size.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeAlign (.TraitObject t)) (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t))
+        (some mach) = .ok (.Int (vt.align.bytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeSize (.Tuple fields head (some (.TraitObject t))))
+        (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) (some mach) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).1.bytes : Int),
+        .Int IntType.usize_ty) ∧
+    evalUnOpM (M := M) (.ComputeAlign (.Tuple fields head (some (.TraitObject t))))
+        (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) (some mach) =
+      .ok (.Int ((TupleHeadLayout.full_size_and_align head vt.size vt.align).2.bytes : Int),
+        .Int IntType.usize_ty) := by
+  have hChk : checkPtrM (M := M) ⟨vptr, none⟩ (.VTablePtr t) (some mach) = .ok () :=
+    checkPtrM_vtablePtr_ok vptr t mach vt hAddr
+      ((vtableFromPtrM_ok_iff_vtableLookupM_ok mach vptr vt).mpr hvt) hTrait
+  have hGet : evalUnOpM (M := M) .GetMetadata
+      (.Ptr ⟨thin, some (.VTablePointer vptr)⟩, .Ptr ptrTy) (some mach) =
+      .ok (.Ptr ⟨vptr, none⟩, .Ptr (.VTablePtr t)) := by
+    rw [(ep1_evalUnOpM_getMetadata_complete_spec thin ptrTy (some mach)).2.2.2.2.2.2.2.2
+      t vptr mach hKind, hChk]
+  have hKindTy : Type.meta_kind (.TraitObject t) = PtrType.meta_kind ptrTy := by
+    rw [hKind]; rfl
+  have hCsa : LayoutStrategy.compute_size_and_align (vtableLookupM mach) (.TraitObject t)
+      (some (.VTablePointer vptr)) = .ok (vt.size, vt.align) := by
+    rw [compute_size_and_align_traitObject, hvt]; rfl
+  have hBare := (ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign
+    ⟨thin, some (.VTablePointer vptr)⟩ ptrTy (.TraitObject t) (.TraitObject t)
+    (.Ptr ⟨vptr, none⟩) (.Ptr (.VTablePtr t)) (some mach) hGet hKindTy rfl).2
+    vt.size vt.align (vtableLookupM mach) (Or.inr ⟨mach, rfl, rfl⟩) hCsa
+  have hTuple := evalUnOpM_tuple_traitObject_size_align mach vptr fields head t
+    (.Ptr (.VTablePtr t)) vt hvt
+  exact ⟨hGet, hBare.1, hBare.2, hTuple.1, hTuple.2⟩
 
 private def ep1KnownOnlyEnumTy : Gen.Type :=
   let unitVar : Gen.Type := .Tuple [] ⟨⟨4⟩, ⟨4⟩, none⟩ none
@@ -16607,6 +18819,74 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
     have hwf3 : MachTB.wfLive t3 := evalValueM_tb_wfLive _ hwf2 ht3
     exact ⟨t1, t2, t3, ht1, ht2, hmem2, ht3, hwf3⟩
 
+/-- **Episode 1 capstone: vtables and trait-object safe pointers.** A single
+entry point to the universal laws and the concrete `Mach` / `MachTB` witnesses
+of the four construct groups. Every conjunct is the statement of the theorem
+named at the same position of the proof term, and each universal law comes
+once for `Mach` and once for the polymorphic `Machine M` (so for `MachTB`).
+1. `Machine::vtable_from_ptr` and `check_ptr_metadata`: `vtable_from_ptr`
+   agrees with `Machine::vtable_lookup` on success, is UB for a pointer that
+   is not the address of a vtable, and the vtable case of `check_ptr_metadata`
+   is `check_ptr` at `PtrType::VTablePtr`.
+2. `check_ptr` at `PtrType::VTablePtr` and on trait-object safe pointers
+   (`&dyn Trait`, `&mut dyn Trait`, `Box<dyn Trait>`): the characterization of
+   a stand-alone vtable pointer, wrong-trait UB, validity at the vtable's
+   dynamic size and alignment with `Memory::dereferenceable`, and the
+   unaligned and non-dereferenceable UB cases.
+3. `UnOp::{GetMetadata, ComputeSize, ComputeAlign}` on vtable metadata: the
+   single sanity check of `GetMetadata`, its complete characterization, and
+   its composition into `ComputeSize` / `ComputeAlign` with the exact dynamic
+   size and alignment.
+4. `UnOp::VTableMethodLookup`: the looked-up function pointer is the value of
+   `Constant::FnPointer`, the callee of a dynamic call.
+5. Concrete positive and UB witnesses on both `Mach` and `MachTB`. The
+   `steps` / `stepsTB` executions of dynamic dispatch are in
+   `MiniRustSpec.UnwindSetDiscrAndFnPtrMR`
+   (`dynDispatch_call_mach_and_machTB_witness` and the witnesses after it),
+   which this module does not import. -/
+theorem ep1_minirust_vtable_and_safeptr_capstone :
+    -- 1. `Machine::vtable_from_ptr` and `check_ptr_metadata`
+    (type_of% @vtableFromPtr_ok_iff_vtableLookup_ok) ∧
+    (type_of% @vtableFromPtrM_ok_iff_vtableLookupM_ok) ∧
+    (type_of% @vtableFromPtr_ub_of_not_mem) ∧
+    (type_of% @vtableFromPtrM_ub_of_not_mem) ∧
+    (type_of% @checkPtrMetadata_vtable_eq_checkPtr) ∧
+    (type_of% @checkPtrMetadataM_vtable_eq_checkPtrM) ∧
+    -- 2. `check_ptr` at `PtrType::VTablePtr` and on trait-object safe pointers
+    (type_of% @checkPtr_vtablePtr_eq) ∧
+    (type_of% @checkPtrM_vtablePtr_eq) ∧
+    (type_of% @checkPtr_vtablePtr_wrong_trait_ub) ∧
+    (type_of% @checkPtrM_vtablePtr_wrong_trait_ub) ∧
+    (type_of% @checkPtr_traitObject_ok) ∧
+    (type_of% @checkPtrM_traitObject_ok) ∧
+    (type_of% @checkPtr_traitObject_unaligned_ub) ∧
+    (type_of% @checkPtrM_traitObject_unaligned_ub) ∧
+    (type_of% @checkPtr_traitObject_nonDereferenceable_ub) ∧
+    (type_of% @checkPtrM_traitObject_nonDereferenceable_ub) ∧
+    -- 3. `UnOp::{GetMetadata, ComputeSize, ComputeAlign}` on vtable metadata
+    (type_of% @evalUnOp_getMetadata_eq_sanity) ∧
+    (type_of% @evalUnOpM_getMetadata_eq_sanity) ∧
+    (type_of% @ep1_evalUnOpM_getMetadata_complete_spec) ∧
+    (type_of% @ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn) ∧
+    -- 4. `UnOp::VTableMethodLookup`
+    (type_of% @evalUnOp_vtableMethodLookup_eq_fnPointer) ∧
+    (type_of% @evalUnOpM_vtableMethodLookup_eq_fnPointer) ∧
+    -- 5. concrete witnesses on `Mach` and `MachTB`
+    (type_of% @ep1_vtable_dyn_safe_ptr_and_unops_witness) ∧
+    (type_of% @ep1_vtable_dyn_safe_ptr_ub_witness) :=
+  ⟨@vtableFromPtr_ok_iff_vtableLookup_ok, @vtableFromPtrM_ok_iff_vtableLookupM_ok,
+   @vtableFromPtr_ub_of_not_mem, @vtableFromPtrM_ub_of_not_mem,
+   @checkPtrMetadata_vtable_eq_checkPtr, @checkPtrMetadataM_vtable_eq_checkPtrM,
+   @checkPtr_vtablePtr_eq, @checkPtrM_vtablePtr_eq, @checkPtr_vtablePtr_wrong_trait_ub,
+   @checkPtrM_vtablePtr_wrong_trait_ub, @checkPtr_traitObject_ok, @checkPtrM_traitObject_ok,
+   @checkPtr_traitObject_unaligned_ub, @checkPtrM_traitObject_unaligned_ub,
+   @checkPtr_traitObject_nonDereferenceable_ub, @checkPtrM_traitObject_nonDereferenceable_ub,
+   @evalUnOp_getMetadata_eq_sanity, @evalUnOpM_getMetadata_eq_sanity,
+   @ep1_evalUnOpM_getMetadata_complete_spec,
+   @ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn,
+   @evalUnOp_vtableMethodLookup_eq_fnPointer, @evalUnOpM_vtableMethodLookup_eq_fnPointer,
+   @ep1_vtable_dyn_safe_ptr_and_unops_witness, @ep1_vtable_dyn_safe_ptr_ub_witness⟩
+
 #check_theorem_deps "[EP1-EXPR-AUDIT]"
   ep1_type_meta_kind_eq_layout_meta_kind
   ep1_evalUnOpM_computeSize_computeAlign_mach_indep
@@ -16664,6 +18944,118 @@ theorem ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witne
   ep1_assign_variant_then_getDiscriminant_bm
   ep1_union_decode_encode_galois_and_idempotent
   ep1_union_overlapping_checkValue_not_roundtrip_and_multitag_assign_witness
+  ep1_vtable_dyn_safe_ptr_and_unops_witness
+  ep1_vtable_dyn_safe_ptr_ub_witness
+  ep1_evalUnOpM_meta_unops_some_mach_error_is_specPanic
+  ep1_vtable_error_precedence_and_corrupt_table_witness
+  ep1_vtable_unsized_struct_tail_packed_and_overflow_witness
+  ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness
+  ep1_vtable_zst_uninhabited_and_deref_witness
+  ep1_vtable_constructWidePointer_boundary_and_decode_witness
+  ep1_vtable_congr_mach_hypotheses_necessary_witness
+  ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+  ep1_evalStatement_deinit_traitObject_spec
+  ep1_evalStatementM_deinit_traitObject_spec
+  ep1_vtable_deinit_traitObject_and_sized_view_witness
+  ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic
+  ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
+  ep1_cellsToFreezeMask_zero_dichotomy
+  ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+  ep1_minirust_vtable_and_safeptr_capstone
+
+#assert_standard_axioms
+  vtableFromPtrM_bm_eq
+  vtableFromPtr_ok_iff_vtableLookup_ok
+  vtableFromPtrM_ok_iff_vtableLookupM_ok
+  vtableFromPtr_ub_of_not_mem
+  vtableFromPtrM_ub_of_not_mem
+  vtableFromPtr_eq_mapIndex_of_find
+  vtableFromPtrM_eq_mapIndex_of_find
+  checkPtrMetadata_none
+  checkPtrMetadataM_none
+  checkPtrMetadata_vtable_eq_checkPtr
+  checkPtrMetadataM_vtable_eq_checkPtrM
+  compute_size_and_align_traitObject
+  compute_size_and_align_tuple_traitObject
+  checkPtr_vtablePtr_eq
+  checkPtrM_vtablePtr_eq
+  checkPtr_vtablePtr_ok
+  checkPtrM_vtablePtr_ok
+  checkPtr_vtablePtr_invalid_ptr_ub
+  checkPtrM_vtablePtr_invalid_ptr_ub
+  checkPtr_vtablePtr_wrong_trait_ub
+  checkPtrM_vtablePtr_wrong_trait_ub
+  checkPtr_vtablePtr_outOfBounds_ub
+  checkPtrM_vtablePtr_outOfBounds_ub
+  checkPtr_vtablePtr_nonNone_meta_ub
+  checkPtrM_vtablePtr_nonNone_meta_ub
+  checkPtr_rawTraitObject_eq_vtablePtr
+  checkPtrM_rawTraitObject_eq_vtablePtr
+  checkPtr_traitObject_metadata_error
+  checkPtrM_traitObject_metadata_error
+  checkPtr_traitObject_eq_sized
+  checkPtrM_traitObject_eq_sized
+  checkPtr_traitObject_ok
+  checkPtrM_traitObject_ok
+  checkPtr_traitObject_unaligned_ub
+  checkPtrM_traitObject_unaligned_ub
+  checkPtr_traitObject_nonDereferenceable_ub
+  checkPtrM_traitObject_nonDereferenceable_ub
+  checkPtr_traitObject_null_ub
+  checkPtrM_traitObject_null_ub
+  checkPtr_traitObject_uninhabited_ub
+  checkPtrM_traitObject_uninhabited_ub
+  checkPtr_traitObject_zst_ok
+  checkPtrM_traitObject_zst_tb_ok
+  retag_ptr_traitObject_zst_noProv
+  evalPlace_deref_safe_traitObject
+  evalPlaceM_deref_safe_traitObject
+  evalBinOp_constructWidePointer_unsupported
+  evalBinOpM_constructWidePointer_unsupported
+  evalValue_constructWidePointer_ok_operands_unsupported
+  evalValueM_constructWidePointer_ok_operands_unsupported
+  decode_vtablePointer_and_checkValue_dyn
+  decode_vtablePointer_and_checkValueM_dyn
+  checkPtr_congr_vtables
+  checkValue_congr_vtables
+  evalUnOp_congr_vtables
+  checkPtrM_congr_mach
+  checkValueM_congr_mach
+  evalUnOpM_congr_mach
+  checkPtr_tuple_traitObject_metadata_error
+  checkPtrM_tuple_traitObject_metadata_error
+  checkPtr_tuple_traitObject_eq_sized
+  checkPtrM_tuple_traitObject_eq_sized
+  checkPtr_tuple_traitObject_size_overflow_ub
+  checkPtrM_tuple_traitObject_size_overflow_ub
+  evalUnOp_tuple_traitObject_size_align
+  evalUnOpM_tuple_traitObject_size_align
+  getMetadataSanity
+  checkValue_nonVTable_meta_ok_or_ub
+  checkValueM_nonVTable_meta_ok_or_ub
+  evalUnOp_getMetadata_eq_sanity
+  evalUnOpM_getMetadata_eq_sanity
+  evalUnOpM_getMetadata_nonVTable_ok_or_specPanic
+  evalUnOp_vtableMethodLookup_eq_fnPointer
+  evalUnOpM_vtableMethodLookup_eq_fnPointer
+  ep1_evalUnOpM_meta_unops_some_mach_error_is_specPanic
+  ep1_vtable_dyn_safe_ptr_and_unops_witness
+  ep1_vtable_dyn_safe_ptr_ub_witness
+  ep1_vtable_error_precedence_and_corrupt_table_witness
+  ep1_vtable_unsized_struct_tail_packed_and_overflow_witness
+  ep1_vtable_dyn_tree_borrows_retag_protector_and_cells_witness
+  ep1_vtable_zst_uninhabited_and_deref_witness
+  ep1_vtable_constructWidePointer_boundary_and_decode_witness
+  ep1_vtable_congr_mach_hypotheses_necessary_witness
+  ep1_evalUnOpM_getMetadata_then_computeSize_computeAlign_dyn
+  ep1_evalStatement_deinit_traitObject_spec
+  ep1_evalStatementM_deinit_traitObject_spec
+  ep1_vtable_deinit_traitObject_and_sized_view_witness
+  ep1_evalPlace_deref_safe_traitObject_misaligned_specPanic
+  ep1_evalPlaceM_deref_safe_traitObject_misaligned_specPanic
+  ep1_cellsToFreezeMask_zero_dichotomy
+  ep1_retag_ptr_traitObject_zst_noProv_cells_dichotomy
+  ep1_minirust_vtable_and_safeptr_capstone
 
 /-- Verify that every newly added or modified executable `Interp` definition in
 Episode 1 is strictly computable (`Classical.choice`-free, `sorryAx`-free, and
@@ -16674,6 +19066,12 @@ elab "#assert_ep1_interp_no_choice" : command => do
     ``MiniRustSpec.Interp.PointerMetaKind.ty,
     ``MiniRustSpec.Interp.evalUnOp,
     ``MiniRustSpec.Interp.evalUnOpM,
+    ``MiniRustSpec.Interp.vtableFromPtr,
+    ``MiniRustSpec.Interp.vtableFromPtrM,
+    ``MiniRustSpec.Interp.checkPtrMetadata,
+    ``MiniRustSpec.Interp.checkPtrMetadataM,
+    ``MiniRustSpec.Interp.checkPtr,
+    ``MiniRustSpec.Interp.checkPtrM,
     ``MiniRustSpec.Interp.evalPlace,
     ``MiniRustSpec.Interp.evalPlaceM,
     ``MiniRustSpec.Interp.evalValue,

@@ -35,7 +35,7 @@ here.
 * `Machine::step` for a machine whose enabled threads are exactly one thread
   (`spec/lang/machine.md`). The daemonic thread choice `pick(..)` then has a
   unique solution; with more than one enabled thread we report
-  `Stop.unsupported` instead of resolving the choice.
+  `unsupported` instead of resolving the choice.
 * All seven `Statement` variants: `Statement::Assign`,
   `Statement::PlaceMention`, `Statement::SetDiscriminant` (which writes the
   tags of the chosen variant straight into memory through
@@ -55,8 +55,9 @@ here.
   `PtrType::safe_pointee` (`spec/mem/pointer.md`), `Memory::dereferenceable`
   and `Memory::signed_dereferenceable` (`spec/mem/basic.md`,
   `spec/mem/concurrent.md`, `spec/mem/interface.md`), and
-  `Machine::vtable_lookup`, `Machine::compute_size`, and
-  `Machine::compute_align` (`spec/lang/machine.md`).
+  `Machine::vtable_lookup`, `Machine::vtable_from_ptr`,
+  `Machine::compute_size`, and `Machine::compute_align`
+  (`spec/lang/machine.md`).
 * All nine `ValueExpr` variants: `ValueExpr::Constant` (all `Constant` variants:
   `Int`, `Bool`, `GlobalPointer`, `FnPointer`, `VTablePointer`, and
   `PointerWithoutProvenance`), `ValueExpr::Tuple`, `ValueExpr::Union`,
@@ -69,11 +70,14 @@ here.
   `CountOnes`), `UnOp::Cast` (both `CastOp` variants: `IntToInt` and
   `Transmute`, the latter through `Machine::transmute`, i.e. `encode` at the
   old type followed by `decode` and `check_value` at the new type),
-  `UnOp::GetThinPointer`, `UnOp::GetMetadata` (for thin and slice/DST
-  `ElementCount` pointers; `VTablePointer` metadata reports `unsupported`),
-  `UnOp::ComputeSize`, and `UnOp::ComputeAlign` (for sized and slice/DST
-  layouts; `VTablePointer` metadata and `UnOp::VTableMethodLookup` report
-  `unsupported`), and
+  `UnOp::GetThinPointer`, `UnOp::GetMetadata` (for thin pointers, slice/DST
+  `ElementCount` pointers, and the `VTablePointer` metadata of trait
+  objects), `UnOp::ComputeSize` and `UnOp::ComputeAlign` (for sized,
+  slice/DST, and trait-object layouts, the latter through
+  `Machine::vtable_lookup`), and `UnOp::VTableMethodLookup` (dynamic dispatch
+  through `Machine::vtable_lookup` and `fn_ptrs`); the vtable cases read the
+  machine's vtables, so they report `unsupported` only when no machine is
+  supplied (`m = none`), and
   `ValueExpr::BinOp` with `BinOp::Int` (all `IntBinOp` variants: `Add`,
   `AddUnchecked`, `Sub`, `SubUnchecked`, `Mul`, `MulUnchecked`, `Div`,
   `DivExact`, `Rem`, `Shl`, `Shr`, `ShlUnchecked`, `ShrUnchecked`, `BitAnd`,
@@ -119,8 +123,12 @@ here.
   (`Type.encodeUnionChunks`), `Type::Enum` (including `decode_discriminant`
   and `encode_discriminant`), `Type::Slice`, and `Type::TraitObject`, and
   `Machine::check_value` (with `ensure_else_ub`, `checkUnionChunks`, and
-  `check_ptr` / `check_ptr_metadata` for raw pointers and safe pointers
-  `PtrType::Ref` / `PtrType::Box`) for
+  `check_ptr` / `check_ptr_metadata` for raw pointers, stand-alone vtable
+  pointers `PtrType::VTablePtr` and `VTablePointer` metadata (through
+  `Machine::vtable_from_ptr`), and safe pointers `PtrType::Ref` /
+  `PtrType::Box`, including the trait objects `&dyn Trait` and
+  `Box<dyn Trait>` with their dynamic size, alignment, and
+  `Memory::dereferenceable` checks) for
   those types (`spec/lang/representation.md`); `Type::{layout, meta_kind}`
   across all nine `Type` variants together with `LayoutStrategy::meta_kind`,
   `PointerMetaKind::ty`, and `PtrType::{safe_pointee, meta_kind}`
@@ -143,10 +151,15 @@ here.
   `stepsTB`). Both interpretations cover the same statements, places, values,
   and terminators, including `Terminator::Call` and every intrinsic above.
 
-Everything else returns `Stop.unsupported`, so the interpretation is partial
-but never silently wrong. In particular, `check_ptr` for vtable pointers
-(`PtrType::VTablePtr`) and for safe pointers with provenance when no machine is
-supplied (`m = none` on non-ZST pointees) returns `Stop.unsupported`.
+Everything else reports `unsupported`, so the interpretation is partial but
+never silently wrong. In particular, the checks and operators that read the
+machine report `unsupported` when no machine is supplied (`m = none`):
+`check_ptr` for vtable pointers (`PtrType::VTablePtr` and `VTablePointer`
+metadata) and for safe pointers with provenance to non-ZST pointees, and the
+vtable cases of `UnOp::{GetMetadata, ComputeSize, ComputeAlign,
+VTableMethodLookup}`. With a machine (`m = some _`, which is what
+`Machine::step` supplies), all of them are interpreted on both `Mach` and
+`MachTB`.
 
 ## Effects
 
@@ -1736,12 +1749,12 @@ def firstFitAddr (mem : BM) (size : Size) (align : Align) : Nat → Nat → Opti
 >  };"
 Unlike the thread choice in `Machine::step` (`pickActiveThread`), this choice
 never has a unique solution, so the interpretation commits to one valid
-resolution instead of reporting `Stop.unsupported`: the first of the
+resolution instead of reporting `unsupported`: the first of the
 candidates `allocCandidate 0`, `allocCandidate 1`, .., that is, of the
 `2^32 - 1` multiples of `2^32` in `[2^32, 2^64)`, that satisfies the `pick`
 predicate (`BM.allocAddrOk`). An address returned here therefore satisfies
 every test of the upstream predicate; when no candidate does, `BM.allocate`
-reports `Stop.unsupported` rather than inventing an address. Results about
+reports `unsupported` rather than inventing an address. Results about
 this interpretation hold for this resolution of the choice. A program can
 observe addresses through pointer-to-integer casts
 (`PointerExposeProvenance`), pointer comparisons (`comparePtr`), and the
@@ -2464,6 +2477,22 @@ def fnFromPtr (m : Mach) (ptr : Val) : Interp Function :=
       | none => ub "invalid pointer for function lookup"
   | _ => ub "trying to look up a function based on a non-pointer value"
 
+/-- `Machine::vtable_from_ptr` (`spec/lang/machine.md`):
+> "fn vtable_from_ptr(&self, ptr: ThinPointer<M::Provenance>) -> Result<VTable> {
+>     let Some((vtable_name, _)) = self.vtable_ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr) else {
+>         throw_ub!(\"invalid pointer for vtable lookup\");
+>     };
+>     ret(self.prog.vtables[vtable_name])
+> }"
+Unlike `Machine::vtable_lookup` (`vtableLookup`), which unwraps the search
+result, a pointer that is not the address of a vtable is UB here and not a
+spec panic. `check_ptr` (`checkPtr` and `checkPtrMetadata`) uses it to
+validate vtable pointers. -/
+def vtableFromPtr (m : Mach) (ptr : Ptr) : Interp VTable := do
+  match m.vtable_ptrs.entries.find? (fun (_, (vtablePtr : Ptr)) => decide (vtablePtr = ptr)) with
+  | some (vtableName, _) => mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]"
+  | none => ub "invalid pointer for vtable lookup"
+
 /-- `Machine::vtable_lookup` (`spec/lang/machine.md`):
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
 >     // This copies the data to return a static closure, as it is used in mutate functions, which mutably borrow self.
@@ -2518,15 +2547,31 @@ def computeAlign (m : Mach) (layout : LayoutStrategy) (metadata : Option (Pointe
 > }"
 The integer check is `check_value` at `Type::Int`, inlined (it is
 `ensure_else_ub(int_ty.can_represent(i), ..)`, see `checkValue`). Checking a
-vtable pointer needs the machine's vtables (`Machine::vtable_from_ptr`), so it
-is outside the fragment. -/
-def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKind) : Interp Unit :=
+vtable pointer reads the machine's vtables (`Machine::vtable_from_ptr`,
+`vtableFromPtr`). With a machine (`m = some mach`), the recursive call
+`self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))` is unrolled
+here, so that `checkPtrMetadata` and `checkPtr` stay non-recursive and the
+kernel evaluates them: the address check, the metadata check of a thin
+pointer (`(None, PointerMetaKind::None) => {}`, which always passes), and the
+vtable lookup and trait check of `check_ptr` at `PtrType::VTablePtr`
+(`MiniRustSpec.Correspondence.checkPtrMetadata_vtable_eq_checkPtr` proves that
+this branch equals that `checkPtr` call). Without a machine (`m = none`) the
+vtable case reports `unsupported`. -/
+def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKind)
+    (m : Option Mach := none) : Interp Unit :=
   match ptrMeta, kind with
   | none, .None => pure ()
   | some (.ElementCount num), .ElementCount =>
     ensureElseUb (IntType.can_represent IntType.usize_ty num) "Value::Int: invalid integer value"
-  | some (.VTablePointer _), .VTablePointer _ =>
-    unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
+  | some (.VTablePointer vptr), .VTablePointer traitName =>
+    match m with
+    | some mach => do
+      ensureElseUb (inBounds vptr.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds"
+      let vtable ← vtableFromPtr mach vptr
+      ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata"
+    | none =>
+      unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
   | _, _ => ub "Value::Ptr: invalid metadata"
 
 /-- `Machine::check_ptr` (`spec/lang/representation.md`):
@@ -2555,7 +2600,10 @@ def checkPtrMetadata (ptrMeta : Option (PointerMeta Prov)) (kind : PointerMetaKi
 >
 >         // However, we do not care about the data stored wherever this pointer points to.
 >     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
->         ..
+>         // This is a \"stand-alone\" vtable pointer, something that does not exist
+>         // in surface Rust. Ensure that it points to an allocated vtable for the correct trait.
+>         let vtable = self.vtable_from_ptr(ptr.thin_pointer)?;
+>         ensure_else_ub(vtable.trait_name == trait_name, \"Value::Ptr: invalid vtable in metadata\")?;
 >     }
 >
 >     Ok(())
@@ -2565,11 +2613,17 @@ metadata is well formed; nothing is required of its provenance or of the
 memory it points to. A safe pointer (`PtrType::Ref` or `PtrType::Box`) must
 also have a pointee size fitting in `isize::MAX`, a non-null aligned address,
 an inhabited pointee, and dereferenceable memory (`CM.dereferenceable` when a
-machine `m` is supplied). -/
+machine `m` is supplied). For a trait object (`&dyn Trait`, `Box<dyn Trait>`)
+the metadata check validates the vtable pointer first
+(`Machine::vtable_from_ptr` and the trait check), so the size and alignment
+that `Machine::vtable_lookup` then reads from that vtable are those of a
+vtable for the pointee's trait. A stand-alone vtable pointer
+(`PtrType::VTablePtr`) must point to a vtable of the given trait. Both read
+the machine's vtables and report `unsupported` without a machine. -/
 def checkPtr (ptr : Pointer Prov) (ptrTy : PtrType) (m : Option Mach := none) : Interp Unit := do
   ensureElseUb (inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE)
     "Value::Ptr: pointer out-of-bounds"
-  checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy)
+  checkPtrMetadata ptr.metadata (PtrType.meta_kind ptrTy) m
   match PtrType.safe_pointee ptrTy with
   | some pointee => do
     let lookup : Ptr → Interp VTable := match m with
@@ -2598,7 +2652,13 @@ def checkPtr (ptr : Pointer Prov) (ptrTy : PtrType) (m : Option Mach := none) : 
         | some _ => unsupported "check_ptr for a safe pointer (Memory::dereferenceable)"
   | none =>
     match ptrTy with
-    | .VTablePtr _ => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
+    | .VTablePtr traitName =>
+      match m with
+      | some mach => do
+        let vtable ← vtableFromPtr mach ptr.thin_pointer
+        ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata"
+      | none =>
+        unsupported "check_ptr for a vtable pointer without a machine (Machine::vtable_from_ptr)"
     | _ => pure ()
 
 mutual
@@ -2898,8 +2958,9 @@ def evalCastOp (castOp : CastOp) (arg : Val × «Type») (m : Option Mach := non
       let val ← transmute operand oldTy newTy m
       pure (val, newTy)
 
-/-- `Machine::eval_un_op` for `UnOp::Int`, `UnOp::Cast`, `UnOp::GetThinPointer`,
-`UnOp::GetMetadata`, `UnOp::ComputeSize`, and `UnOp::ComputeAlign`
+/-- `Machine::eval_un_op` for all seven `UnOp` variants: `UnOp::Int`,
+`UnOp::Cast`, `UnOp::GetThinPointer`, `UnOp::GetMetadata`, `UnOp::ComputeSize`,
+`UnOp::ComputeAlign`, and `UnOp::VTableMethodLookup`
 (`spec/lang/step/operators.md`):
 > "fn eval_un_op(&self, UnOp::Int(op): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
 >     let Type::Int(int_ty) = op_ty else { panic!(\"non-integer input to integer operation\") };
@@ -2949,9 +3010,38 @@ and dynamic size and alignment computation (`ComputeSize` and `ComputeAlign`):
 >     let align = self.compute_align(ty.layout::<M::T>(), meta);
 >     ret((Value::Int(align.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
 > }"
+and vtable lookups (`VTableMethodLookup`):
+> "fn eval_un_op(&self, UnOp::VTableMethodLookup(method): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let (Value::Ptr(ptr), Type::Ptr(_ptr_ty)) = (operand, op_ty) else {
+>         panic!(\"vtable lookup on non-pointer\");
+>     };
+>     // It is checked in check_value that the vtable is always valid.
+>     let vtable = self.vtable_lookup()(ptr.thin_pointer);
+>     // Well-formedness of values ensures `ptr` points to a vtable of the right trait,
+>     // and hence the method exists.
+>     let fn_name = vtable.methods[method];
+>     let fn_ptr = Value::Ptr(self.fn_ptrs[fn_name].widen(None));
+>     ret((fn_ptr, Type::Ptr(PtrType::FnPtr)))
+> }"
 Vtable metadata (`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer`)
-and `UnOp::VTableMethodLookup` remain outside the fragment and fail closed with
-`Stop.unsupported`. -/
+and `UnOp::VTableMethodLookup` read the machine's vtables
+(`Machine::vtable_from_ptr` in the `GetMetadata` sanity check,
+`Machine::vtable_lookup` in the other three operators) and its `fn_ptrs`.
+With a machine (`m = some mach`) they are interpreted as upstream; in
+`GetMetadata` on vtable metadata, upstream's `.expect(..)` catches UB from
+`check_value` while letting an internal spec panic (such as a missing
+`prog.vtables` entry) propagate directly. The branch for the other metadata
+kinds maps every error of the check to the sanity-check panic; that is the
+same function, because `check_value` of the unit and `usize` metadata values
+succeeds or is UB
+(`MiniRustSpec.Correspondence.evalUnOp_getMetadata_eq_sanity`). Without a
+machine (`m = none`) they
+fail closed with `unsupported`: `GetMetadata` before its sanity check (which is
+the same `check_value` call in both branches of the match on the metadata kind),
+so that the result does not depend on the address of the vtable pointer,
+`ComputeSize` and `ComputeAlign` at the vtable lookup of
+`LayoutStrategy::compute_size_and_align`, and `VTableMethodLookup` after the
+operand shape check. -/
 def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
     Interp (Val × «Type») :=
   match op, arg with
@@ -2972,7 +3062,14 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
     let metaValue ← PointerMetaKind.encode_as_value metaKind ptr.metadata
     match metaKind with
     | .VTablePointer _ =>
-      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
+      match m with
+      | some _ =>
+        let metaTy := PointerMetaKind.ty metaKind
+        match checkValue metaValue metaTy m with
+        | .ok () => pure (metaValue, metaTy)
+        | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error e => .error e
+      | none => unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
     | _ =>
       let metaTy := PointerMetaKind.ty metaKind
       match checkValue metaValue metaTy m with
@@ -2981,34 +3078,33 @@ def evalUnOp (op : UnOp) (arg : Val × «Type») (m : Option Mach := none) :
   | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
   | .ComputeSize ty, (operand, _) => do
     let ptrMeta ← PointerMetaKind.decode_value (Type.meta_kind ty) operand
-    match ptrMeta with
-    | some (.VTablePointer _) =>
-      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata"
-    | _ => do
-      let layout ← Type.layout ty
-      let size ← match m with
-        | some mach => computeSize mach layout ptrMeta
-        | none =>
-          (·.1) <$> LayoutStrategy.compute_size_and_align
-            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
-            layout ptrMeta
-      pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
+    let layout ← Type.layout ty
+    let size ← match m with
+      | some mach => computeSize mach layout ptrMeta
+      | none =>
+        (·.1) <$> LayoutStrategy.compute_size_and_align
+          (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+          layout ptrMeta
+    pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
   | .ComputeAlign ty, (operand, _) => do
     let ptrMeta ← PointerMetaKind.decode_value (Type.meta_kind ty) operand
-    match ptrMeta with
-    | some (.VTablePointer _) =>
-      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata"
-    | _ => do
-      let layout ← Type.layout ty
-      let align ← match m with
-        | some mach => computeAlign mach layout ptrMeta
-        | none =>
-          (·.2) <$> LayoutStrategy.compute_size_and_align
-            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
-            layout ptrMeta
-      pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
-  | .VTableMethodLookup _, _ =>
-    unsupported "eval_un_op for UnOp::VTableMethodLookup"
+    let layout ← Type.layout ty
+    let align ← match m with
+      | some mach => computeAlign mach layout ptrMeta
+      | none =>
+        (·.2) <$> LayoutStrategy.compute_size_and_align
+          (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+          layout ptrMeta
+    pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
+  | .VTableMethodLookup method, (.Ptr ptr, .Ptr _) =>
+    match m with
+    | some mach => do
+      let vtable ← vtableLookup mach ptr.thin_pointer
+      let fnName ← mapIndex vtable.methods method "vtable.methods[method]"
+      let fnThin ← mapIndex mach.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+      pure (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)
+    | none => unsupported "eval_un_op for UnOp::VTableMethodLookup"
+  | .VTableMethodLookup _, _ => specPanic "vtable lookup on non-pointer"
 
 /-- `Machine::eval_int_bin_op` across all `IntBinOp` variants
 (`spec/lang/step/operators.md`):
@@ -3797,8 +3893,10 @@ aliasing model retag it (`retagPtrBM`, the identity for `BasicMemory`):
 >     ret((Value::Ptr(ptr), Type::Ptr(ptr_ty)))
 > }"
 `eval_un_op` threads `some m` (after evaluating `operand`) into `evalUnOp` so
-`CastOp::Transmute` checks safe-pointer dereferenceability against `m.mem` and
-`ComputeSize` / `ComputeAlign` call `computeSize` / `computeAlign`.
+`CastOp::Transmute` checks safe-pointer dereferenceability against `m.mem`,
+`ComputeSize` / `ComputeAlign` call `computeSize` / `computeAlign`, and the
+vtable cases of `GetMetadata`, `ComputeSize`, `ComputeAlign`, and
+`VTableMethodLookup` read the machine's vtables and `fn_ptrs`.
 `eval_bin_op` for `BinOp::PtrOffset` and `BinOp::PtrOffsetFrom` reads the
 machine's memory, so those operators are evaluated by `evalPtrOffset` and
 `evalPtrOffsetFrom` on the machine after both operands, and all others by the
@@ -5335,7 +5433,7 @@ every continuation where `None` succeeds):
 * if `exposed` contains two or more provenances, `int2ptrCandidates` selects the
   live exposed allocations whose range `[addr_a, addr_a + size_a]` contains
   `addr`: a unique candidate `[p]` resolves to `Some(p)`, while zero or multiple
-  in-bounds candidates stop with `Stop.unsupported` rather than fabricating UB
+  in-bounds candidates stop with `unsupported` rather than fabricating UB
   by guessing `None` or choosing arbitrarily between adjacent allocations.
 
 Every provenance returned is admissible (`None` or in `exposed`), so any run
@@ -7548,6 +7646,21 @@ def tryMutateCurFrameM {M : Type} [Memory M] (m : Machine M)
 def jumpToBlockM {M : Type} [Memory M] (m : Machine M) (b : BbName) : Interp (Machine M) :=
   mutateCurFrameM m (fun fr => { fr with next_block := b, next_stmt := 0 })
 
+/-- Polymorphic `Machine::vtable_from_ptr` (`spec/lang/machine.md`); see
+`vtableFromPtr`:
+> "fn vtable_from_ptr(&self, ptr: ThinPointer<M::Provenance>) -> Result<VTable> {
+>     let Some((vtable_name, _)) = self.vtable_ptrs.iter().find(|(_, vtable_ptr)| *vtable_ptr == ptr) else {
+>         throw_ub!(\"invalid pointer for vtable lookup\");
+>     };
+>     ret(self.prog.vtables[vtable_name])
+> }" -/
+def vtableFromPtrM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) : Interp VTable := do
+  match m.vtable_ptrs.entries.find?
+      (fun (_, (vtablePtr : ThinPointer (Memory.Provenance M))) => decide (vtablePtr = ptr)) with
+  | some (vtableName, _) => mapIndex m.prog.vtables vtableName "self.prog.vtables[vtable_name]"
+  | none => ub "invalid pointer for vtable lookup"
+
 /-- Polymorphic `Machine::vtable_lookup` (`spec/lang/machine.md`); see `vtableLookup`:
 > "fn vtable_lookup(&self) -> impl Fn(ThinPointer<M::Provenance>) -> VTable + 'static {
 >     // This copies the data to return a static closure, as it is used in mutate functions, which mutably borrow self.
@@ -7600,15 +7713,29 @@ see `checkPtrMetadata`:
 >     };
 >
 >     Ok(())
-> }" -/
+> }"
+This check is stated over an arbitrary provenance type, so the machine enters
+only through `vtableFromPtr?`, the machine's `Machine::vtable_from_ptr`
+(`checkPtrM` passes `vtableFromPtrM` of its machine, if any). With a lookup,
+the vtable case unrolls
+`self.check_ptr(ptr.widen(None), PtrType::VTablePtr(trait_name))` as in
+`checkPtrMetadata`; without one it reports `unsupported`. -/
 def checkPtrMetadataM {Provenance : Type} (ptrMeta : Option (PointerMeta Provenance))
-    (kind : PointerMetaKind) : Interp Unit :=
+    (kind : PointerMetaKind)
+    (vtableFromPtr? : Option (ThinPointer Provenance → Interp VTable) := none) : Interp Unit :=
   match ptrMeta, kind with
   | none, .None => pure ()
   | some (.ElementCount num), .ElementCount =>
     ensureElseUb (IntType.can_represent IntType.usize_ty num) "Value::Int: invalid integer value"
-  | some (.VTablePointer _), .VTablePointer _ =>
-    unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
+  | some (.VTablePointer vptr), .VTablePointer traitName =>
+    match vtableFromPtr? with
+    | some lookup => do
+      ensureElseUb (inBounds vptr.addr .Unsigned x86_64.PTR_SIZE)
+        "Value::Ptr: pointer out-of-bounds"
+      let vtable ← lookup vptr
+      ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata"
+    | none =>
+      unsupported "check_ptr_metadata for vtable pointer metadata (Machine::vtable_from_ptr)"
   | _, _ => ub "Value::Ptr: invalid metadata"
 
 /-- Polymorphic `Machine::check_ptr` (`spec/lang/representation.md`); see `checkPtr`:
@@ -7637,7 +7764,10 @@ def checkPtrMetadataM {Provenance : Type} (ptrMeta : Option (PointerMeta Provena
 >
 >         // However, we do not care about the data stored wherever this pointer points to.
 >     } else if let PtrType::VTablePtr(trait_name) = ptr_ty {
->         ..
+>         // This is a \"stand-alone\" vtable pointer, something that does not exist
+>         // in surface Rust. Ensure that it points to an allocated vtable for the correct trait.
+>         let vtable = self.vtable_from_ptr(ptr.thin_pointer)?;
+>         ensure_else_ub(vtable.trait_name == trait_name, \"Value::Ptr: invalid vtable in metadata\")?;
 >     }
 >
 >     Ok(())
@@ -7646,7 +7776,7 @@ def checkPtrM {M : Type} [Memory M] [MemoryOps M] (ptr : Pointer (Memory.Provena
     (ptrTy : PtrType) (m : Option (Machine M) := none) : Interp Unit := do
   ensureElseUb (inBounds ptr.thin_pointer.addr .Unsigned x86_64.PTR_SIZE)
     "Value::Ptr: pointer out-of-bounds"
-  checkPtrMetadataM ptr.metadata (PtrType.meta_kind ptrTy)
+  checkPtrMetadataM ptr.metadata (PtrType.meta_kind ptrTy) (m.map (vtableFromPtrM ·))
   match PtrType.safe_pointee ptrTy with
   | some pointee => do
     let lookup : ThinPointer (Memory.Provenance M) → Interp VTable := match m with
@@ -7675,7 +7805,13 @@ def checkPtrM {M : Type} [Memory M] [MemoryOps M] (ptr : Pointer (Memory.Provena
         | some _ => unsupported "check_ptr for a safe pointer (Memory::dereferenceable)"
   | none =>
     match ptrTy with
-    | .VTablePtr _ => unsupported "check_ptr for a vtable pointer (Machine::vtable_from_ptr)"
+    | .VTablePtr traitName =>
+      match m with
+      | some mach => do
+        let vtable ← vtableFromPtrM mach ptr.thin_pointer
+        ensureElseUb (vtable.trait_name == traitName) "Value::Ptr: invalid vtable in metadata"
+      | none =>
+        unsupported "check_ptr for a vtable pointer without a machine (Machine::vtable_from_ptr)"
     | _ => pure ()
 
 mutual
@@ -7960,9 +8096,22 @@ and dynamic size and alignment computation (`ComputeSize` and `ComputeAlign`):
 >     let align = self.compute_align(ty.layout::<M::T>(), meta);
 >     ret((Value::Int(align.bytes()), Type::Int(IntType::usize_ty::<M::T>())))
 > }"
-Vtable metadata (`PointerMetaKind::VTablePointer` / `PointerMeta::VTablePointer`)
-and `UnOp::VTableMethodLookup` remain outside the fragment and fail closed with
-`Stop.unsupported`. -/
+and vtable lookups (`VTableMethodLookup`):
+> "fn eval_un_op(&self, UnOp::VTableMethodLookup(method): UnOp, (operand, op_ty): (Value<M>, Type)) -> Result<(Value<M>, Type)> {
+>     let (Value::Ptr(ptr), Type::Ptr(_ptr_ty)) = (operand, op_ty) else {
+>         panic!(\"vtable lookup on non-pointer\");
+>     };
+>     // It is checked in check_value that the vtable is always valid.
+>     let vtable = self.vtable_lookup()(ptr.thin_pointer);
+>     // Well-formedness of values ensures `ptr` points to a vtable of the right trait,
+>     // and hence the method exists.
+>     let fn_name = vtable.methods[method];
+>     let fn_ptr = Value::Ptr(self.fn_ptrs[fn_name].widen(None));
+>     ret((fn_ptr, Type::Ptr(PtrType::FnPtr)))
+> }"
+As in `evalUnOp`, vtable metadata and `UnOp::VTableMethodLookup` are
+interpreted with a machine (`m = some mach`) and fail closed with
+`unsupported` without one (`m = none`). -/
 def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × «Type»)
     (m : Option (Machine M) := none) : Interp (Value M × «Type») :=
   match op, arg with
@@ -7983,7 +8132,14 @@ def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × 
     let metaValue ← PointerMetaKind.encode_as_valueM (M := M) metaKind ptr.metadata
     match metaKind with
     | .VTablePointer _ =>
-      unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
+      match m with
+      | some _ =>
+        let metaTy := PointerMetaKind.ty metaKind
+        match checkValueM metaValue metaTy m with
+        | .ok () => pure (metaValue, metaTy)
+        | .error (.ub _) => specPanic "GetMetadata: sanity check, returned meta is well-formed"
+        | .error e => .error e
+      | none => unsupported "eval_un_op UnOp::GetMetadata for vtable pointer metadata"
     | _ =>
       let metaTy := PointerMetaKind.ty metaKind
       match checkValueM metaValue metaTy m with
@@ -7992,34 +8148,33 @@ def evalUnOpM {M : Type} [Memory M] [MemoryOps M] (op : UnOp) (arg : Value M × 
   | .GetMetadata, _ => specPanic "non-pointer GetMetadata"
   | .ComputeSize ty, (operand, _) => do
     let ptrMeta ← PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) operand
-    match ptrMeta with
-    | some (.VTablePointer _) =>
-      unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata"
-    | _ => do
-      let layout ← Type.layout ty
-      let size ← match m with
-        | some mach => computeSizeM mach layout ptrMeta
-        | none =>
-          (·.1) <$> LayoutStrategy.compute_size_and_align
-            (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
-            layout ptrMeta
-      pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
+    let layout ← Type.layout ty
+    let size ← match m with
+      | some mach => computeSizeM mach layout ptrMeta
+      | none =>
+        (·.1) <$> LayoutStrategy.compute_size_and_align
+          (fun _ => unsupported "eval_un_op UnOp::ComputeSize for vtable pointer metadata")
+          layout ptrMeta
+    pure (.Int (size.bytes : Int), .Int IntType.usize_ty)
   | .ComputeAlign ty, (operand, _) => do
     let ptrMeta ← PointerMetaKind.decode_valueM (M := M) (Type.meta_kind ty) operand
-    match ptrMeta with
-    | some (.VTablePointer _) =>
-      unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata"
-    | _ => do
-      let layout ← Type.layout ty
-      let align ← match m with
-        | some mach => computeAlignM mach layout ptrMeta
-        | none =>
-          (·.2) <$> LayoutStrategy.compute_size_and_align
-            (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
-            layout ptrMeta
-      pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
-  | .VTableMethodLookup _, _ =>
-    unsupported "eval_un_op for UnOp::VTableMethodLookup"
+    let layout ← Type.layout ty
+    let align ← match m with
+      | some mach => computeAlignM mach layout ptrMeta
+      | none =>
+        (·.2) <$> LayoutStrategy.compute_size_and_align
+          (fun _ => unsupported "eval_un_op UnOp::ComputeAlign for vtable pointer metadata")
+          layout ptrMeta
+    pure (.Int (align.bytes : Int), .Int IntType.usize_ty)
+  | .VTableMethodLookup method, (.Ptr ptr, .Ptr _) =>
+    match m with
+    | some mach => do
+      let vtable ← vtableLookupM mach ptr.thin_pointer
+      let fnName ← mapIndex vtable.methods method "vtable.methods[method]"
+      let fnThin ← mapIndex mach.fn_ptrs fnName "self.fn_ptrs[fn_name]"
+      pure (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr)
+    | none => unsupported "eval_un_op for UnOp::VTableMethodLookup"
+  | .VTableMethodLookup _, _ => specPanic "vtable lookup on non-pointer"
 
 /-- Polymorphic `Machine::eval_rel_op` (`spec/lang/step/operators.md`); see `evalRelOp`:
 > "fn eval_rel_op(rel: RelOp, ord: std::cmp::Ordering) -> (Value<M>, Type) {
