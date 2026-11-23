@@ -37,11 +37,11 @@ FORBIDDEN_PUBLIC_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 DECL_RE = re.compile(
-    r"^(?:private\s+|protected\s+|noncomputable\s+|partial\s+|@\[[^\]]+\]\s*)*"
+    r"^(?:public\s+|private\s+|protected\s+|noncomputable\s+|partial\s+|@\[[^\]]+\]\s*)*"
     r"(inductive|structure|class|def|abbrev|theorem|instance)\s+([A-Za-z_][A-Za-z0-9_.']*)",
     re.MULTILINE,
 )
-IMPORT_RE = re.compile(r"^\s*import\s+([A-Za-z0-9_.']+)", re.MULTILINE)
+IMPORT_RE = re.compile(r"^\s*(?:public\s+)?import\s+(?:all\s+)?([A-Za-z0-9_.']+)", re.MULTILINE)
 DOC_BLOCK_RE = re.compile(r"/-\!\s*(.*?)\s*-/", re.DOTALL)
 FLAG_RE = re.compile(r'add_argument\(\s*"(--[a-z0-9-]+)"')
 

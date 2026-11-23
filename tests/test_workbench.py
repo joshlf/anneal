@@ -37,6 +37,29 @@ class ProofHealthScanTests(unittest.TestCase):
             findings = proof_health_scan.scan_file(p, force_pass1=True, allow_import_prefixes=())
             self.assertEqual(findings, [])
 
+    def test_module_syntax_pass1_and_public_import_check(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ok_p = pathlib.Path(tmp) / "ModOk.lean"
+            ok_p.write_text(
+                "module\nprelude\npublic import Init.Core\npublic section\n"
+                "public theorem t (n : Nat) : n = n := by rfl\nend\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                proof_health_scan.scan_file(ok_p, force_pass1=True, allow_import_prefixes=()),
+                [],
+            )
+            bad_p = pathlib.Path(tmp) / "ModBad.lean"
+            bad_p.write_text(
+                "module\nprelude\npublic import Std\n",
+                encoding="utf-8",
+            )
+            codes = {
+                f["code"]
+                for f in proof_health_scan.scan_file(bad_p, force_pass1=True, allow_import_prefixes=())
+            }
+            self.assertIn("DISALLOWED_IMPORT", codes)
+
     def test_catches_banned_pass1_constructs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             p = pathlib.Path(tmp) / "Bad.lean"

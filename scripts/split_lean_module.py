@@ -18,7 +18,7 @@ import sys
 from typing import Any
 
 DECL_START_RE = re.compile(
-    r"^(?:private\s+|protected\s+|noncomputable\s+|partial\s+|@\[[^\]]+\]\s*)*"
+    r"^(?:public\s+|private\s+|protected\s+|noncomputable\s+|partial\s+|@\[[^\]]+\]\s*)*"
     r"(inductive|structure|class|def|abbrev|theorem|instance)\s+([A-Za-z_][A-Za-z0-9_.']*)"
 )
 IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_.']*\b")

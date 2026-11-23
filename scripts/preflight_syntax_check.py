@@ -26,7 +26,8 @@ LEAN_SYNTAX_CHECKER = r"""import Lean
 open Lean Parser
 
 def allowedHeaderKinds : List Name := [
-  ``Parser.Module.header, ``Parser.Module.prelude, ``Parser.Module.import]
+  ``Parser.Module.header, ``Parser.Module.moduleTk, ``Parser.Module.prelude,
+  ``Parser.Module.import, ``Parser.Module.public, ``Parser.Module.all]
 
 def allowedCommandKinds : List Name := [
   ``Parser.Command.declaration, ``Parser.Command.namespace,
@@ -47,7 +48,8 @@ def allowedCommandSyntaxKinds : List Name := [
   ``Parser.Command.declValSimple, ``Parser.Command.declValEqns,
   ``Parser.Command.whereStructInst, ``Parser.Command.docComment,
   ``Parser.Command.private, ``Parser.Command.protected,
-  ``Parser.Command.noncomputable, ``Parser.Command.openSimple,
+  ``Parser.Command.public, ``Parser.Command.noncomputable,
+  ``Parser.Command.openSimple,
   ``Parser.Command.sectionHeader, ``Parser.Command.eraseAttr,
   ``Parser.Command.ctor, ``Parser.Command.optDeriving,
   ``Parser.Command.optDefDeriving, ``Parser.Command.classTk,
@@ -129,7 +131,7 @@ def allowedTheorySyntaxKinds : NameSet :=
   allowedTrustedSyntaxKinds ++ .ofList allowedTheoryTacticKinds
 
 def allowedAttributeNames : List Name :=
-  [`simp, `instance, `reducible, `semireducible, `irreducible]
+  [`simp, `instance, `reducible, `semireducible, `irreducible, `expose]
 
 def isValidSourceIdent (id : Name) : Bool :=
   id.isAnonymous ||
@@ -161,13 +163,25 @@ def pushUnique (acc : Array Violation) (v : Violation) : Array Violation :=
   if acc.any (fun x => x.line == v.line && x.message == v.message) then acc
   else acc.push v
 
+def isValidSectionHeaderSlot (child : Syntax) : Bool :=
+  child.isOfKind nullKind &&
+    (child.getArgs.isEmpty ||
+      (child.getArgs.size == 1 &&
+        match child.getArgs[0]! with
+        | .atom _ "public" => true
+        | _ => false) ||
+      (child.getArgs.size == 3 &&
+        match child.getArgs[0]!, child.getArgs[1]!, child.getArgs[2]! with
+        | .atom _ "@[", .atom _ "expose", .atom _ "]" => true
+        | _, _, _ => false))
+
 def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax) : Array String := Id.run do
   let mut errs : Array String := #[]
   if k == ``Parser.Module.header then
     if (args[1]?.map Syntax.getArgs |>.getD #[]).isEmpty then
       errs := errs.push "explicit prelude is required"
   else if k == ``Parser.Command.sectionHeader then
-    if !args.all (·.getArgs.isEmpty) then
+    if !args.all isValidSectionHeaderSlot then
       errs := errs.push "section/namespace modifiers are unsupported"
   else if k == ``Parser.Command.declaration then
     let declKind := args[1]?.map Syntax.getKind |>.getD .anonymous

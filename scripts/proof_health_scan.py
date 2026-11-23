@@ -234,13 +234,13 @@ def scan_file(
         })
 
     if pass1:
-        m_first = re.search(r"\S+", masked)
-        if not m_first or m_first.group(0) != "prelude":
+        if not re.match(r"\s*(?:module\s+)?prelude\b", masked):
+            m_first = re.search(r"\S+", masked)
             ln, col = line_col(masked, m_first.start()) if m_first else (1, 1)
             add("error", "MISSING_PRELUDE", ln, col,
-                "Pass-1 module must begin with `prelude` before imports.")
+                "Pass-1 module must begin with `prelude` (or `module` then `prelude`) before imports.")
 
-        for m in re.finditer(r"(?m)^\s*import\s+([A-Za-z0-9_.']+)", masked):
+        for m in re.finditer(r"(?m)^\s*(?:public\s+)?import\s+(?:all\s+)?([A-Za-z0-9_.']+)", masked):
             mod = m.group(1)
             if mod in LOCKED_INIT_MODULES:
                 continue
