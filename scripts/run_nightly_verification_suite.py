@@ -5479,14 +5479,15 @@ def _probe_lean_run_memory_max_mib(
 ) -> int | None:
     """`MemoryMax` (MiB) that the `anneal-lean-run` wrapper of `cmd` plans for the
     scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
-    --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped,
+    --mode <resolved mode> --probe --json`, which never runs the command), or `None`
+    if `cmd` is not wrapped,
     will pass through without creating a new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1`
     without `--nested-ok`), or the probe fails. The suite process is outside that
     scope, so its own cgroup hierarchy cannot show this cap."""
     if not _is_lean_run_wrapped(cmd, env):
         return None
     env_map = os.environ if env is None else env
-    _mode, _timeout, _slot_lock, _saw_timeout, _oom_retry, nested_ok = _parse_lean_run_wrapper(cmd)
+    mode, _timeout, _slot_lock, _saw_timeout, _oom_retry, nested_ok = _parse_lean_run_wrapper(cmd)
     if env_map.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not nested_ok:
         return None
     opts: list[str] = []
@@ -5500,9 +5501,13 @@ def _probe_lean_run_memory_max_mib(
             opts.append(cmd[i + 1])
             i += 1
         i += 1
+    # The probe drops the wrapped command, so an `auto` mode would resolve to `build`
+    # there even when the wrapper runs this command in `file` mode (`lean File.lean`,
+    # `lake env lean ...`), whose `MemoryMax` is capped lower. Pin the mode the wrapper
+    # resolves for the real command (the last `--mode` wins).
     try:
         out = subprocess.run(
-            [cmd[0], *opts, "--probe", "--json"],
+            [cmd[0], *opts, "--mode", mode, "--probe", "--json"],
             cwd=None if cwd is None else str(cwd),
             env=None if env is None else dict(env),
             stdin=subprocess.DEVNULL,

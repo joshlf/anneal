@@ -5284,17 +5284,54 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "build",
                 "LeanMiriSpec",
             ]
-            # The probe forwards exactly the wrapper's own options and never the command.
+            # The probe forwards exactly the wrapper's own options, pins the mode the wrapper
+            # resolves for the real command, and never forwards the command itself.
             reply.write_text(json.dumps({"memory_max_mb": 5712, "threads": 8}), encoding="utf-8")
             self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 5712)
             self.assertEqual(
-                probes(), [["--mode", "build", "--concurrency", "1", "--timeout", "1800", "--probe", "--json"]]
+                probes(),
+                [
+                    [
+                        "--mode",
+                        "build",
+                        "--concurrency",
+                        "1",
+                        "--timeout",
+                        "1800",
+                        "--mode",
+                        "build",
+                        "--probe",
+                        "--json",
+                    ]
+                ],
             )
             joined = [str(wrapper), "--mode=build", "--time", "60", "--no-slot-lock", "lake", "build"]
             self.assertEqual(suite._probe_lean_run_memory_max_mib(joined), 5712)
             self.assertEqual(
-                probes()[-1], ["--mode=build", "--time", "60", "--no-slot-lock", "--probe", "--json"]
+                probes()[-1],
+                ["--mode=build", "--time", "60", "--no-slot-lock", "--mode", "build", "--probe", "--json"],
             )
+            # Without the command, the wrapper's `auto` mode resolves to `build`: a wrapper
+            # that will run its command in `file` mode (lower `MemoryMax`) must be probed
+            # in `file` mode, whether `--mode` is omitted, `auto`, or abbreviated.
+            for wrapper_opts, inner, want_mode in (
+                ([], ["lake", "env", "lean", "tests/mir/X.lean"], "file"),
+                (["--mode", "auto"], ["lean", "X.lean"], "file"),
+                (
+                    ["--mode=auto", "--timeout", "300"],
+                    ["--", "lake", "--dir", "examples", "env", "lean", "X.lean"],
+                    "file",
+                ),
+                (["--mod", "auto"], ["lake", "env", "lean", "--run", "X.lean"], "build"),
+                ([], ["lake", "build", "MiniRustSpec"], "build"),
+                (["--mode", "file"], ["lake", "build", "MiniRustSpec"], "file"),
+                (["--mode", "build"], ["lean", "X.lean"], "build"),
+            ):
+                auto_cmd = [str(wrapper), *wrapper_opts, *inner]
+                self.assertEqual(suite._probe_lean_run_memory_max_mib(auto_cmd), 5712, auto_cmd)
+                self.assertEqual(
+                    probes()[-1], [*wrapper_opts, "--mode", want_mode, "--probe", "--json"], auto_cmd
+                )
             # Anything but a positive integer `memory_max_mb` from a successful probe is no answer.
             for bad in (
                 "exit:3",

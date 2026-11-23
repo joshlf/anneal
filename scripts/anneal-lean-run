@@ -2138,20 +2138,32 @@ _THREAD_ENV_VARS: tuple[str, ...] = (
 )
 
 
+# Most significant digits of a thread count `_parse_positive_thread_count` accepts:
+# every accepted count is below 10**9, so it is representable as a signed 32-bit
+# integer (Cargo's `build.jobs` type).
+_MAX_THREAD_COUNT_DIGITS = 9
+
+
 def _parse_positive_thread_count(raw: object) -> int | None:
     """Parse an ASCII base-10 positive integer thread count, or `None`.
 
     Rejects blank strings, zero/negative values, floats, unary signs, Python
     underscore literals (`1_2`), and non-ASCII Unicode digits so Lean, Lake,
-    Cargo, and Rayon never see values their parsers reject.
+    Cargo, and Rayon never see values their parsers reject. A count with more than
+    `_MAX_THREAD_COUNT_DIGITS` significant digits (leading zeros are not significant)
+    is rejected too: no host has that many threads, such a value may not fit a tool's
+    integer job count, and past `sys.get_int_max_str_digits()` digits `int()` itself
+    raises `ValueError`.
     """
     if not isinstance(raw, str):
         return None
     stripped = raw.strip()
     if not stripped or not (stripped.isascii() and stripped.isdigit()):
         return None
-    val = int(stripped)
-    return val if val > 0 else None
+    significant = stripped.lstrip("0")
+    if not significant or len(significant) > _MAX_THREAD_COUNT_DIGITS:
+        return None
+    return int(significant)
 
 
 def _resolve_thread_env(

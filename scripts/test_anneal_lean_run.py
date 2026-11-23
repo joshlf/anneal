@@ -1263,6 +1263,42 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
                 rc = alr.main(argv)
         return rc, err_buf.getvalue(), child_envs
 
+    def test_oversized_thread_counts_fall_back_to_the_budget_without_raising(self) -> None:
+        parse = alr._parse_positive_thread_count
+        limit = alr._MAX_THREAD_COUNT_DIGITS
+        self.assertEqual(limit, 9)
+        # Up to `limit` significant digits parse; leading zeros are not significant.
+        self.assertEqual(parse("9" * limit), 10**limit - 1)
+        self.assertEqual(parse("0" * 5000 + "8"), 8)
+        self.assertEqual(parse(" 007 "), 7)
+        # All-zero strings of any length are not positive.
+        for zeros in ("0", "000", "0" * 5000):
+            self.assertIsNone(parse(zeros), len(zeros))
+        # One digit more overflows the tools' 32-bit job counts, and past
+        # `sys.get_int_max_str_digits()` (4300) digits `int()` raises `ValueError`.
+        oversized = ("1" + "0" * limit, "9" * 4300, "9" * 4301, "9" * 20000, "0" * 3 + "9" * 5000)
+        for raw in oversized:
+            self.assertIsNone(parse(raw), len(raw))
+        for capped in (False, True):
+            for raw in oversized:
+                env = dict.fromkeys(self.THREAD_VARS, raw)
+                self.assertEqual(
+                    alr._resolve_thread_env(3, capped, env),
+                    dict.fromkeys(self.THREAD_VARS, 3),
+                    (capped, len(raw)),
+                )
+                self.assertEqual(alr.format_threads_diagnostic(3, env), "threads=3", (capped, len(raw)))
+        # The child environment never carries the oversized value through.
+        with mock.patch.dict(os.environ, dict.fromkeys(self.THREAD_VARS, "9" * 5000)):
+            child = alr._build_child_env(
+                threads=4,
+                lean_m_mb=1024,
+                is_cg_capped=False,
+                runtime_base=Path("/tmp"),
+                user_systemd_sock_alive=False,
+            )
+        self.assertEqual({var: child[var] for var in self.THREAD_VARS}, dict.fromkeys(self.THREAD_VARS, "4"))
+
     def test_resolve_thread_env_keeps_lower_positive_caller_values(self) -> None:
         resolve = alr._resolve_thread_env
         self.assertEqual(alr._THREAD_ENV_VARS, self.THREAD_VARS)
