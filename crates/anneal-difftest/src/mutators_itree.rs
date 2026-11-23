@@ -526,33 +526,65 @@ impl ItreeAstMutator for IndirectDispatchOutliner {
                 pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
                     trait AnnealDynProbe {
                         fn probe(&self, x: u32) -> u32;
+                        fn stamp(&self) -> u32;
                     }
                     trait AnnealDynAlt {
                         fn alt(&self) -> u32;
                     }
-                    struct AnnealDynHolder {
+                    struct AnnealDynHolderA {
                         bias: u32,
                     }
-                    impl AnnealDynProbe for AnnealDynHolder {
+                    struct AnnealDynHolderB {
+                        pad: u32,
+                        bias: u32,
+                    }
+                    impl AnnealDynProbe for AnnealDynHolderA {
                         fn probe(&self, x: u32) -> u32 {
                             (x >> 1) ^ (self.bias & 0xFFFFu32)
                         }
+                        fn stamp(&self) -> u32 {
+                            (self.bias & 0x3Fu32) ^ 0x15u32
+                        }
                     }
-                    impl AnnealDynAlt for AnnealDynHolder {
+                    impl AnnealDynProbe for AnnealDynHolderB {
+                        fn probe(&self, x: u32) -> u32 {
+                            ((x >> 2) ^ self.pad) ^ (self.bias & 0xFFFFu32)
+                        }
+                        fn stamp(&self) -> u32 {
+                            ((self.pad ^ self.bias) & 0x3Fu32) ^ 0x2Au32
+                        }
+                    }
+                    impl AnnealDynAlt for AnnealDynHolderA {
                         fn alt(&self) -> u32 {
                             (self.bias >> 3) & 0x7Fu32
                         }
                     }
-                    let holder = AnnealDynHolder { bias: delta ^ #k_const };
+                    let holder = AnnealDynHolderA { bias: delta ^ #k_const };
+                    let other = AnnealDynHolderB {
+                        pad: (seed & 0xFFu32) ^ #k_const,
+                        bias: (delta >> 1) ^ #k_const,
+                    };
                     let as_probe: &dyn AnnealDynProbe = &holder as &dyn AnnealDynProbe;
+                    let other_probe: &dyn AnnealDynProbe = &other as &dyn AnnealDynProbe;
                     let as_alt: &dyn AnnealDynAlt = &holder as &dyn AnnealDynAlt;
-                    let dispatched: u32 = as_probe.probe(seed);
+                    let picked: &dyn AnnealDynProbe = if (seed & 1u32) == 0u32 {
+                        as_probe
+                    } else {
+                        other_probe
+                    };
+                    let dispatched: u32 = picked.probe(seed) ^ picked.stamp();
                     let alt_bits: u32 = as_alt.alt();
-                    let mix: u32 = if core::ptr::addr_eq(as_probe, as_alt) {
-                        dispatched ^ alt_bits
+                    let same_bit: u32 = if core::ptr::addr_eq(as_probe, as_alt) {
+                        2u32
                     } else {
                         0u32
                     };
+                    let diff_bit: u32 = if core::ptr::addr_eq(as_probe, other_probe) {
+                        0u32
+                    } else {
+                        4u32
+                    };
+                    let mix: u32 = (dispatched << 3) ^ (alt_bits << 3) ^ same_bit ^ diff_bit;
                     (mix >> 1) + #k_const
                 }
             },
@@ -571,20 +603,47 @@ impl ItreeAstMutator for IndirectDispatchOutliner {
                         anneal_fnptr_fold
                     };
                     let lifted: fn(u32, u32) -> u32 = |a: u32, b: u32| (a ^ b) >> 1;
+                    let raw_op: *const () = op as *const ();
+                    let raw_lifted: *const () = lifted as *const ();
+                    let raw_seed: *const u32 = &seed as *const u32;
+                    let same_op: u32 = if core::ptr::addr_eq(raw_op, op as *const ()) {
+                        2u32
+                    } else {
+                        0u32
+                    };
+                    let same_lifted: u32 = if core::ptr::addr_eq(raw_lifted, lifted as *const ()) {
+                        4u32
+                    } else {
+                        0u32
+                    };
+                    let diff_stack: u32 = if core::ptr::addr_eq(raw_op, raw_seed) {
+                        0u32
+                    } else {
+                        8u32
+                    };
                     let first: u32 = op(seed, delta);
                     let second: u32 = lifted(first, #k_const);
-                    (second >> 1) + #k_const
+                    let combined: u32 = (second << 4) ^ same_op ^ same_lifted ^ diff_stack;
+                    (combined >> 1) + #k_const
                 }
             },
             2 => syn::parse_quote! {
                 #[inline(never)]
                 pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
                     let bias: u32 = (delta & 0xFFFFu32) ^ #k_const;
-                    let by_ref = |x: u32| (x >> 1) ^ bias;
+                    let bias_ref: &u32 = &bias;
+                    let by_ref = |x: u32| {
+                        let same: u32 = if core::ptr::addr_eq(&bias, bias_ref) {
+                            8u32
+                        } else {
+                            0u32
+                        };
+                        ((x >> 1) ^ (*bias_ref)) ^ same
+                    };
                     let by_val = move |x: u32| (x & 0xFFFF_FFFEu32) ^ (bias >> 2);
                     let first: u32 = by_ref(seed);
                     let second: u32 = by_val(first);
-                    let mut acc: u32 = second;
+                    let mut acc: u32 = second ^ (*bias_ref & 0xFFu32);
                     let mut bump = |d: u32| {
                         acc = (acc >> 1) ^ d;
                     };
@@ -602,16 +661,18 @@ impl ItreeAstMutator for IndirectDispatchOutliner {
                     let short: &[u32] = lead;
                     let [_, tail @ ..] = &arr;
                     let shifted: &[u32] = tail;
-                    let picked: u32 = if core::ptr::addr_eq(whole, short) {
-                        arr[0] >> 1
+                    let same_bit: u32 = if core::ptr::addr_eq(whole, short) {
+                        2u32
                     } else {
                         0u32
                     };
-                    let masked: u32 = if core::ptr::addr_eq(whole, shifted) {
+                    let diff_bit: u32 = if core::ptr::addr_eq(whole, shifted) {
                         0u32
                     } else {
-                        arr[1] & 0xFFFFu32
+                        4u32
                     };
+                    let picked: u32 = (arr[0] >> 1) & 0xFFFF_FFF8u32;
+                    let masked: u32 = (arr[1] & 0xFFF8u32) ^ same_bit ^ diff_bit;
                     ((picked ^ masked) >> 1) + #k_const
                 }
             },
@@ -1110,14 +1171,43 @@ enum EvalTy {
     Bool,
     Unit,
     Named(String),
-    /// `&T` (including `&[T]` and `&dyn Trait`): any reference value.
+    /// `&T` (including `&[T]`): shared reference without trait-object erasure.
     Ref,
+    /// `&dyn Trait`: shared trait-object reference carrying vtable identity.
+    DynRef(String),
+    /// `*const T`: safe raw pointer (never dereferenced in safe Rust).
+    ConstPtr,
     /// `fn(..) -> ..`: a function item or a closure that captures nothing.
     FnPtr,
     /// `[T; N]` with element type `T`.
     Array(Box<EvalTy>),
     /// No annotation (`let x = ...`).
     Infer,
+}
+
+fn dyn_trait_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Paren(p) => dyn_trait_name(&p.elem),
+        Type::Group(g) => dyn_trait_name(&g.elem),
+        Type::TraitObject(o) => {
+            let mut principal: Option<String> = None;
+            for bound in &o.bounds {
+                match bound {
+                    syn::TypeParamBound::Trait(tb) => {
+                        let id = tb.path.get_ident()?;
+                        if principal.is_some() {
+                            return None;
+                        }
+                        principal = Some(id.to_string());
+                    }
+                    syn::TypeParamBound::Lifetime(_) => {}
+                    _ => return None,
+                }
+            }
+            principal
+        }
+        _ => None,
+    }
 }
 
 fn eval_ty_of(ty: &Type) -> EvalTy {
@@ -1134,7 +1224,11 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         }
         Type::Tuple(t) if t.elems.is_empty() => EvalTy::Unit,
         Type::Paren(p) => eval_ty_of(&p.elem),
-        Type::Reference(r) if r.mutability.is_none() => EvalTy::Ref,
+        Type::Reference(r) if r.mutability.is_none() => match dyn_trait_name(&r.elem) {
+            Some(tr) => EvalTy::DynRef(tr),
+            None => EvalTy::Ref,
+        },
+        Type::Ptr(p) if p.mutability.is_none() => EvalTy::ConstPtr,
         Type::BareFn(_) => EvalTy::FnPtr,
         Type::Array(a) => EvalTy::Array(Box::new(eval_ty_of(&a.elem))),
         other => EvalTy::Named(quote!(#other).to_string()),
@@ -1148,6 +1242,18 @@ fn ret_ty_of(output: &ReturnType) -> EvalTy {
     }
 }
 
+/// Abstract address identity modeled by [`ItreeConcreteEvaluator`] for
+/// `core::ptr::addr_eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalAddr {
+    /// `(binding identity, byte offset within that binding)`.
+    Local(u64, u64),
+    /// Function item in `EvalRun::fn_table`.
+    FnItem(usize),
+    /// Capture-free closure in `EvalRun::closures`.
+    ClosureFn(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvalValue {
     Int(u128, EvalIntTy),
@@ -1158,6 +1264,11 @@ enum EvalValue {
     Array(Vec<EvalValue>),
     /// Shared reference.
     Ref(Box<EvalRef>),
+    /// Safe `*const T` raw pointer (never dereferenced; used for `addr_eq`).
+    ConstPtr {
+        addr: Option<EvalAddr>,
+        nonzero: bool,
+    },
     /// Function item or function pointer (index into `EvalRun::fn_table`).
     FnRef(usize),
     /// Closure (index into `EvalRun::closures`); `captures` records whether it
@@ -1170,7 +1281,7 @@ enum EvalValue {
 }
 
 /// A shared reference: the referent's value and, when the evaluator can place
-/// it, its address.
+/// it, its address (plus optional `&dyn Trait` vtable identity).
 ///
 /// Safe Rust cannot mutate a referent while a shared reference to it is live
 /// (the evaluator's subset has no interior mutability), so the snapshot `val`
@@ -1178,13 +1289,14 @@ enum EvalValue {
 /// as the reference is usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EvalRef {
-    /// `(binding identity, byte offset within that binding)` of the referent:
-    /// two references have equal addresses iff both components are equal.
-    /// `None` when the address is not modeled (a temporary, whose address the
-    /// compiler may share with another constant's, or a place whose byte
-    /// offset depends on a layout the evaluator does not compute).
-    addr: Option<(u64, u64)>,
+    /// Address of the referent, or `None` when the address is not modeled (a
+    /// temporary, whose address the compiler may share with another constant's,
+    /// or a place whose byte offset depends on a layout the evaluator does not
+    /// compute).
+    addr: Option<EvalAddr>,
     val: EvalValue,
+    /// Principal trait name when coerced or cast to `&dyn Trait`.
+    dyn_trait: Option<String>,
 }
 
 impl EvalRef {
@@ -1229,7 +1341,11 @@ fn eval_value_size(v: &EvalValue) -> Option<u64> {
 /// Whether `v` certainly occupies at least one byte.
 fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
     match v {
-        EvalValue::Int(..) | EvalValue::Bool(_) | EvalValue::Ref(_) | EvalValue::FnRef(_) => true,
+        EvalValue::Int(..)
+        | EvalValue::Bool(_)
+        | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
+        | EvalValue::FnRef(_) => true,
         EvalValue::Unit => false,
         EvalValue::Closure { captures, .. } => *captures,
         EvalValue::Array(elems) => elems.iter().any(eval_value_is_sized_nonzero),
@@ -1237,27 +1353,42 @@ fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
     }
 }
 
-/// `core::ptr::addr_eq(a, b)` on two references.
+/// `core::ptr::addr_eq(a, b)` on two references or `*const` raw pointers.
 ///
 /// Two references into one binding are equal iff their byte offsets are
-/// equal, and references into two live bindings are never equal, provided
-/// neither referent is zero-sized (a zero-sized referent may share its address
-/// with anything). Any operand whose address the evaluator does not model is
-/// rejected rather than guessed.
+/// equal, references into two live bindings are never equal, a function
+/// pointer is equal to itself and never equal to a live non-ZST stack
+/// binding, and comparisons between two distinct functions are rejected rather
+/// than guessed (LLVM ICF may merge functions). Zero-sized referents and
+/// unmodeled addresses are likewise rejected.
 fn eval_addr_eq(a: &EvalValue, b: &EvalValue) -> EvalRes {
-    let (EvalValue::Ref(ra), EvalValue::Ref(rb)) = (a, b) else {
-        return eval_unsupported("`addr_eq` on a non-reference operand");
-    };
-    for r in [ra, rb] {
-        if !eval_value_is_sized_nonzero(&r.val) {
-            return eval_unsupported("`addr_eq` on a possibly zero-sized referent");
+    let extract = |v: &EvalValue| -> Result<(Option<EvalAddr>, bool), EvalCtrl> {
+        match v {
+            EvalValue::Ref(r) => Ok((r.addr, eval_value_is_sized_nonzero(&r.val))),
+            EvalValue::ConstPtr { addr, nonzero } => Ok((*addr, *nonzero)),
+            _ => eval_unsupported("`addr_eq` on a non-pointer operand"),
         }
+    };
+    let (addr_a, nz_a) = extract(a)?;
+    let (addr_b, nz_b) = extract(b)?;
+    if !nz_a || !nz_b {
+        return eval_unsupported("`addr_eq` on a possibly zero-sized referent");
     }
-    match (ra.addr, rb.addr) {
-        (Some((alloc_a, off_a)), Some((alloc_b, off_b))) => {
+    match (addr_a, addr_b) {
+        (Some(EvalAddr::Local(alloc_a, off_a)), Some(EvalAddr::Local(alloc_b, off_b))) => {
             Ok(EvalValue::Bool(alloc_a == alloc_b && off_a == off_b))
         }
-        _ => eval_unsupported("`addr_eq` on a referent at an unmodeled address"),
+        (Some(EvalAddr::FnItem(i)), Some(EvalAddr::FnItem(j))) if i == j => {
+            Ok(EvalValue::Bool(true))
+        }
+        (Some(EvalAddr::ClosureFn(i)), Some(EvalAddr::ClosureFn(j))) if i == j => {
+            Ok(EvalValue::Bool(true))
+        }
+        (Some(EvalAddr::FnItem(_) | EvalAddr::ClosureFn(_)), Some(EvalAddr::Local(..)))
+        | (Some(EvalAddr::Local(..)), Some(EvalAddr::FnItem(_) | EvalAddr::ClosureFn(_))) => {
+            Ok(EvalValue::Bool(false))
+        }
+        _ => eval_unsupported("`addr_eq` on a referent at an unmodeled or ICF-sensitive address"),
     }
 }
 
@@ -1304,6 +1435,16 @@ fn eval_coerce(v: EvalValue, ty: &EvalTy) -> EvalRes {
         (EvalValue::Unit, EvalTy::Unit) => Ok(EvalValue::Unit),
         (EvalValue::Struct(n, f), EvalTy::Named(m)) if n == *m => Ok(EvalValue::Struct(n, f)),
         (v @ EvalValue::Ref(_), EvalTy::Ref) => Ok(v),
+        (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+            let mut inner = r.autoderef();
+            inner.dyn_trait = Some(tr.clone());
+            Ok(EvalValue::Ref(Box::new(inner)))
+        }
+        (EvalValue::Ref(r), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
+            addr: r.addr,
+            nonzero: eval_value_is_sized_nonzero(&r.val),
+        }),
+        (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr) => Ok(v),
         (v @ EvalValue::FnRef(_), EvalTy::FnPtr) => Ok(v),
         (
             v @ EvalValue::Closure {
@@ -1329,6 +1470,7 @@ fn eval_encode(v: &EvalValue) -> Result<Vec<u8>, EvalCtrl> {
         EvalValue::Struct(..) => eval_unsupported("struct value at a boundary"),
         EvalValue::Array(_)
         | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
         | EvalValue::FnRef(_)
         | EvalValue::Closure { .. } => eval_unsupported("non-scalar value at a boundary"),
     }
@@ -1554,19 +1696,106 @@ impl<'ast> Visit<'ast> for BranchSiteCollector {
     fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
 }
 
-/// Single-identifier path expressions of a closure body: the names it may
-/// capture from the enclosing function.
+/// Collect all identifier bindings introduced by pattern `pat`.
+fn collect_pat_idents(pat: &Pat, out: &mut BTreeSet<String>) {
+    match pat {
+        Pat::Ident(pi) => {
+            out.insert(pi.ident.to_string());
+            if let Some((_, sub)) = &pi.subpat {
+                collect_pat_idents(sub, out);
+            }
+        }
+        Pat::Type(pt) => collect_pat_idents(&pt.pat, out),
+        Pat::Paren(pp) => collect_pat_idents(&pp.pat, out),
+        Pat::Reference(pr) => collect_pat_idents(&pr.pat, out),
+        Pat::Slice(ps) => {
+            for e in &ps.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        Pat::Tuple(pt) => {
+            for e in &pt.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        Pat::Or(po) => {
+            for c in &po.cases {
+                collect_pat_idents(c, out);
+            }
+        }
+        Pat::Struct(ps) => {
+            for f in &ps.fields {
+                collect_pat_idents(&f.pat, out);
+            }
+        }
+        Pat::TupleStruct(pt) => {
+            for e in &pt.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Free single-identifier path expressions of a closure body (respecting
+/// local `let` bindings, `match` arm patterns, and nested closure parameters):
+/// the names the closure may capture from the enclosing function.
 #[derive(Default)]
 struct ClosureFreeIdents {
     names: BTreeSet<String>,
+    bound: Vec<BTreeSet<String>>,
 }
 
 impl<'ast> Visit<'ast> for ClosureFreeIdents {
+    fn visit_block(&mut self, node: &'ast Block) {
+        self.bound.push(BTreeSet::new());
+        for stmt in &node.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.bound.pop();
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(init) = &node.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        if let Some(scope) = self.bound.last_mut() {
+            collect_pat_idents(&node.pat, scope);
+        }
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        let mut scope = BTreeSet::new();
+        collect_pat_idents(&node.pat, &mut scope);
+        self.bound.push(scope);
+        if let Some((_, guard)) = &node.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let mut scope = BTreeSet::new();
+        for input in &node.inputs {
+            collect_pat_idents(input, &mut scope);
+        }
+        self.bound.push(scope);
+        self.visit_expr(&node.body);
+        self.bound.pop();
+    }
+
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
         if node.qself.is_none()
             && let Some(id) = node.path.get_ident()
         {
-            self.names.insert(id.to_string());
+            let name = id.to_string();
+            if !self.bound.iter().any(|s| s.contains(&name)) {
+                self.names.insert(name);
+            }
         }
     }
 
@@ -1842,10 +2071,9 @@ impl ItreeConcreteEvaluator {
 /// Fields of a struct declared by an item statement, in declaration order.
 type EvalStructDef = Vec<(String, EvalTy)>;
 
-/// Methods of the `impl` items of one block, keyed by `(Self type, method)`.
-/// `None` marks a name that two `impl` blocks of one type define (for two
-/// traits), which the evaluator cannot tell apart at a call.
-type EvalMethodTable<'a> = BTreeMap<(String, String), Option<&'a syn::ImplItemFn>>;
+/// Methods of the `impl` items of one block, keyed by
+/// `(Self type, Option<Trait name>, method name)` (`None` for inherent `impl`s).
+type EvalMethodTable<'a> = BTreeMap<(String, Option<String>, String), &'a syn::ImplItemFn>;
 
 struct EvalFrame<'a> {
     scopes: Vec<BTreeMap<String, EvalValue>>,
@@ -2030,8 +2258,8 @@ impl<'a> EvalRun<'a> {
         eval_coerce(value, &ret_ty_of(&method.sig.output))
     }
 
-    /// Create the closure value of `expr`, capturing every variable of `frame`
-    /// that its body names.
+    /// Create the closure value of `expr`, capturing every free variable of
+    /// `frame` that its body names.
     fn make_closure(&mut self, frame: &EvalFrame<'a>, expr: &'a syn::ExprClosure) -> EvalRes {
         if expr.asyncness.is_some()
             || expr.constness.is_some()
@@ -2041,7 +2269,7 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("closure qualifier");
         }
         let mut free = ClosureFreeIdents::default();
-        free.visit_expr(&expr.body);
+        free.visit_expr_closure(expr);
         let mut env = BTreeMap::new();
         let mut gens = Vec::new();
         for name in free.names {
@@ -2051,18 +2279,6 @@ impl<'a> EvalRun<'a> {
                     frame.bind_gen.get(&name).copied().unwrap_or(0),
                 ));
                 env.insert(name, v);
-            }
-        }
-        // A parameter shadows a captured variable of the same name.
-        for input in &expr.inputs {
-            let pat = match input {
-                Pat::Type(pt) => pt.pat.as_ref(),
-                other => other,
-            };
-            if let Pat::Ident(pi) = pat {
-                let name = pi.ident.to_string();
-                env.remove(&name);
-                gens.retain(|(n, _)| *n != name);
             }
         }
         let id = self.closures.len();
@@ -2080,12 +2296,13 @@ impl<'a> EvalRun<'a> {
     /// Call closure `id` from `frame`.
     ///
     /// A closure that captures by reference and is called from the frame that
-    /// created it reads its captured variables' current values and writes any
-    /// it assigns back to them (a unique borrow). Every other call (a `move`
-    /// closure, or a closure that left its frame) runs on the values captured
-    /// at creation, which is exact for shared borrows and for copies; such a
-    /// call must not assign a captured variable, because the evaluator has no
-    /// storage that would carry the assignment to the next call.
+    /// created it reads its captured variables' current values (sharing their
+    /// stack allocation identities for `addr_eq`) and writes any it assigns
+    /// back to them (a unique borrow). Every other call (a `move` closure, or a
+    /// closure that left its frame) runs on the values captured at creation,
+    /// which is exact for shared borrows and for copies; such a call must not
+    /// assign a captured variable, because the evaluator has no storage that
+    /// would carry the assignment to the next call.
     fn call_closure(
         &mut self,
         frame: &mut EvalFrame<'a>,
@@ -2106,6 +2323,9 @@ impl<'a> EvalRun<'a> {
                     ));
                 }
             }
+        }
+        let mut live_allocs = BTreeMap::new();
+        if live {
             for (name, slot) in &mut env {
                 match Self::lookup(frame, name) {
                     Some(v) => *slot = v,
@@ -2114,6 +2334,9 @@ impl<'a> EvalRun<'a> {
                             "closure-captured variable `{name}` left scope"
                         ));
                     }
+                }
+                if let Some(alloc) = self.alloc_id_of(frame, name) {
+                    live_allocs.insert(name.clone(), alloc);
                 }
             }
         }
@@ -2137,6 +2360,11 @@ impl<'a> EvalRun<'a> {
         let before = env.clone();
         // A closure body is not instrumented, so it runs like a callee body.
         let mut closure_frame = EvalFrame::new(env, self.fresh_frame_id(), false);
+        if !live_allocs.is_empty()
+            && let Some(allocs0) = closure_frame.allocs.first_mut()
+        {
+            *allocs0 = live_allocs;
+        }
         closure_frame.push_scope(params);
         let value = match self.eval_expr(&mut closure_frame, &expr.body) {
             Ok(v) | Err(EvalCtrl::Return(v)) => v,
@@ -2189,20 +2417,25 @@ impl<'a> EvalRun<'a> {
                         Type::Path(tp) if tp.qself.is_none() => tp.path.get_ident(),
                         _ => None,
                     };
-                    // A generic `impl` or one for a non-local type registers
-                    // nothing, so a call of one of its methods is rejected.
+                    let trait_name = match &im.trait_ {
+                        None => Some(None),
+                        Some((None, path, _)) => path.get_ident().map(|id| Some(id.to_string())),
+                        Some((Some(_), _, _)) => None,
+                    };
+                    // A generic `impl`, negative `impl`, or one for a non-local
+                    // type/trait registers nothing, so calling it is rejected.
                     if let Some(self_ty) = self_ty
+                        && let Some(trait_name) = trait_name
                         && im.generics.params.is_empty()
                     {
                         for impl_item in &im.items {
                             if let syn::ImplItem::Fn(m) = impl_item {
-                                let key = (self_ty.to_string(), m.sig.ident.to_string());
-                                let entry = if methods.contains_key(&key) {
-                                    None
-                                } else {
-                                    Some(m)
-                                };
-                                methods.insert(key, entry);
+                                let key = (
+                                    self_ty.to_string(),
+                                    trait_name.clone(),
+                                    m.sig.ident.to_string(),
+                                );
+                                methods.insert(key, m);
                             }
                         }
                     }
@@ -2262,10 +2495,12 @@ impl<'a> EvalRun<'a> {
             return Self::bind_slice_pattern(frame, ps, v);
         }
         let (name, ty) = match &loc.pat {
-            Pat::Ident(pi) if pi.subpat.is_none() => (Some(pi.ident.to_string()), EvalTy::Infer),
+            Pat::Ident(pi) if pi.subpat.is_none() && pi.by_ref.is_none() => {
+                (Some(pi.ident.to_string()), EvalTy::Infer)
+            }
             Pat::Wild(_) => (None, EvalTy::Infer),
             Pat::Type(pt) => match pt.pat.as_ref() {
-                Pat::Ident(pi) if pi.subpat.is_none() => {
+                Pat::Ident(pi) if pi.subpat.is_none() && pi.by_ref.is_none() => {
                     (Some(pi.ident.to_string()), eval_ty_of(&pt.ty))
                 }
                 Pat::Wild(_) => (None, eval_ty_of(&pt.ty)),
@@ -2300,8 +2535,12 @@ impl<'a> EvalRun<'a> {
             EvalValue::Array(elems) => (elems, None, false),
             EvalValue::Ref(r) => {
                 let r = r.autoderef();
+                let local_addr = match r.addr {
+                    Some(EvalAddr::Local(alloc, off)) => Some((alloc, off)),
+                    _ => None,
+                };
                 match r.val {
-                    EvalValue::Array(elems) => (elems, r.addr, true),
+                    EvalValue::Array(elems) => (elems, local_addr, true),
                     _ => return eval_unsupported("array pattern on a non-array"),
                 }
             }
@@ -2351,12 +2590,16 @@ impl<'a> EvalRun<'a> {
             };
             let bound = if by_ref {
                 let addr = match (base_addr, offset_of(start)) {
-                    (Some((alloc, base_off)), Some(off)) => {
-                        base_off.checked_add(off).map(|total| (alloc, total))
-                    }
+                    (Some((alloc, base_off)), Some(off)) => base_off
+                        .checked_add(off)
+                        .map(|total| EvalAddr::Local(alloc, total)),
                     _ => None,
                 };
-                EvalValue::Ref(Box::new(EvalRef { addr, val: covered }))
+                EvalValue::Ref(Box::new(EvalRef {
+                    addr,
+                    val: covered,
+                    dyn_trait: None,
+                }))
             } else {
                 covered
             };
@@ -2396,7 +2639,13 @@ impl<'a> EvalRun<'a> {
     /// depends on a layout the evaluator does not compute, and a temporary's
     /// may be shared with another constant's, so neither is modeled.
     fn eval_borrow(&mut self, frame: &mut EvalFrame<'a>, place: &'a Expr) -> EvalRes {
-        let unplaced = |val: EvalValue| Ok(EvalValue::Ref(Box::new(EvalRef { addr: None, val })));
+        let unplaced = |val: EvalValue| {
+            Ok(EvalValue::Ref(Box::new(EvalRef {
+                addr: None,
+                val,
+                dyn_trait: None,
+            })))
+        };
         match place {
             Expr::Paren(p) => self.eval_borrow(frame, &p.expr),
             Expr::Group(g) => self.eval_borrow(frame, &g.expr),
@@ -2411,8 +2660,14 @@ impl<'a> EvalRun<'a> {
                     let val = self.eval_expr(frame, place)?;
                     return unplaced(val);
                 };
-                let addr = self.alloc_id_of(frame, &name).map(|alloc| (alloc, 0));
-                Ok(EvalValue::Ref(Box::new(EvalRef { addr, val })))
+                let addr = self
+                    .alloc_id_of(frame, &name)
+                    .map(|alloc| EvalAddr::Local(alloc, 0));
+                Ok(EvalValue::Ref(Box::new(EvalRef {
+                    addr,
+                    val,
+                    dyn_trait: None,
+                })))
             }
             Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
                 match self.eval_expr(frame, &u.expr)? {
@@ -2443,7 +2698,10 @@ impl<'a> EvalRun<'a> {
                     return eval_unsupported("index of a non-array");
                 };
                 let idx = self.eval_index(frame, &ix.index, elems.len())?;
-                let mut addr = base.addr;
+                let mut addr = match base.addr {
+                    Some(EvalAddr::Local(alloc, off)) => Some((alloc, off)),
+                    _ => None,
+                };
                 for e in &elems[..idx] {
                     addr = match (addr, eval_value_size(e)) {
                         (Some((alloc, off)), Some(sz)) => off.checked_add(sz).map(|o| (alloc, o)),
@@ -2451,8 +2709,9 @@ impl<'a> EvalRun<'a> {
                     };
                 }
                 Ok(EvalValue::Ref(Box::new(EvalRef {
-                    addr,
+                    addr: addr.map(|(alloc, off)| EvalAddr::Local(alloc, off)),
                     val: elems[idx].clone(),
+                    dyn_trait: None,
                 })))
             }
             _ => {
@@ -2550,9 +2809,36 @@ impl<'a> EvalRun<'a> {
                 (EvalValue::Bool(b), EvalTy::Int(t)) if t != EvalIntTy::Infer => {
                     Ok(EvalValue::Int(u128::from(b), t))
                 }
-                // A safe cast between reference types (`&[T; N] as &[T]`,
-                // `&T as &dyn Trait`) keeps the referent and its address.
+                // Safe trait-object unsizing (`&T as &dyn Trait`): records the
+                // vtable's principal trait while preserving referent & address.
+                (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                    let mut inner = r.autoderef();
+                    inner.dyn_trait = Some(tr);
+                    Ok(EvalValue::Ref(Box::new(inner)))
+                }
+                // Safe cast between non-trait reference types (`&[T; N] as &[T]`).
                 (v @ EvalValue::Ref(_), EvalTy::Ref) => Ok(v),
+                // Safe raw-pointer casts (`&T as *const T`, `fn(...) as *const ()`,
+                // `*const T as *const ()`).
+                (EvalValue::Ref(r), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
+                    addr: r.addr,
+                    nonzero: eval_value_is_sized_nonzero(&r.val),
+                }),
+                (EvalValue::FnRef(idx), EvalTy::ConstPtr) => Ok(EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::FnItem(idx)),
+                    nonzero: true,
+                }),
+                (
+                    EvalValue::Closure {
+                        id,
+                        captures: false,
+                    },
+                    EvalTy::ConstPtr,
+                ) => Ok(EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::ClosureFn(id)),
+                    nonzero: true,
+                }),
+                (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr) => Ok(v),
                 _ => eval_unsupported("cast"),
             },
             Expr::If(i) => self.eval_if(frame, i),
@@ -2790,9 +3076,10 @@ impl<'a> EvalRun<'a> {
     }
 
     /// Call `receiver.method(args)` on a struct declared in an enclosing block
-    /// (directly, or behind a reference such as a `&dyn Trait`): the method
-    /// that the struct's `impl` items define under that name, which is also
-    /// what a virtual call through the struct's vtable runs.
+    /// (directly, or behind a reference such as a `&dyn Trait`): a `&dyn Trait`
+    /// receiver dispatches strictly to `(Self, Some(Trait), method)`; a concrete
+    /// receiver prefers an inherent `impl` and otherwise requires a unique
+    /// matching trait `impl` in scope.
     fn eval_method_call(
         &mut self,
         frame: &mut EvalFrame<'a>,
@@ -2806,28 +3093,70 @@ impl<'a> EvalRun<'a> {
         // auto-referenced receiver is left unmodeled.)
         let self_ref = match self.eval_expr(frame, &mc.receiver)? {
             EvalValue::Ref(r) => EvalValue::Ref(Box::new(r.autoderef())),
-            val => EvalValue::Ref(Box::new(EvalRef { addr: None, val })),
+            val => EvalValue::Ref(Box::new(EvalRef {
+                addr: None,
+                val,
+                dyn_trait: None,
+            })),
         };
-        let EvalValue::Ref(r) = &self_ref else {
+        let EvalValue::Ref(r) = self_ref else {
             return eval_unsupported("method receiver");
         };
         let EvalValue::Struct(ty_name, _) = &r.val else {
             return eval_unsupported("method call on a non-struct receiver");
         };
-        let key = (ty_name.clone(), mc.method.to_string());
-        let method = frame
-            .local_methods
-            .iter()
-            .rev()
-            .find_map(|methods| methods.get(&key).copied());
-        let Some(Some(method)) = method else {
+        let method_name = mc.method.to_string();
+        let method = if let Some(ref tr) = r.dyn_trait {
+            let key = (ty_name.clone(), Some(tr.clone()), method_name.clone());
+            frame
+                .local_methods
+                .iter()
+                .rev()
+                .find_map(|methods| methods.get(&key).copied())
+        } else {
+            let inherent_key = (ty_name.clone(), None, method_name.clone());
+            if let Some(m) = frame
+                .local_methods
+                .iter()
+                .rev()
+                .find_map(|methods| methods.get(&inherent_key).copied())
+            {
+                Some(m)
+            } else {
+                let mut found: Option<&'a syn::ImplItemFn> = None;
+                let mut ambiguous = false;
+                for methods in frame.local_methods.iter().rev() {
+                    for ((s, tr, mn), &m) in methods {
+                        if s == ty_name && tr.is_some() && mn == &method_name {
+                            if found.is_some() {
+                                ambiguous = true;
+                                break;
+                            }
+                            found = Some(m);
+                        }
+                    }
+                    if ambiguous {
+                        break;
+                    }
+                }
+                if ambiguous { None } else { found }
+            }
+        };
+        let Some(method) = method else {
             return eval_unsupported(format!("unknown or ambiguous method `{}`", mc.method));
         };
         let mut args = Vec::with_capacity(mc.args.len());
         for a in &mc.args {
             args.push(self.eval_expr(frame, a)?);
         }
-        self.call_method(method, self_ref, args)
+        // Inside an `impl` body, `self` has the concrete `&Self` type rather
+        // than `&dyn Trait`.
+        let concrete_self = EvalValue::Ref(Box::new(EvalRef {
+            addr: r.addr,
+            val: r.val,
+            dyn_trait: None,
+        }));
+        self.call_method(method, concrete_self, args)
     }
 
     fn external_call(
@@ -4791,8 +5120,9 @@ mod tests {
                 let r: u32 = pair.mix(picked) ^ (*head);
                 if same && !diff { (r >> 1) + 1u32 } else { 0u32 }
             }",
-            // Function pointers and a capture-free closure passed to, and
-            // called from, another function.
+            // Function pointers, capture-free closures (including one whose
+            // body shadows an outer variable with a local `let`), and safe
+            // `FnPtrToPtr` `addr_eq` checks.
             "pub fn probe(a: u32, b: u32) -> u32 {
                 fn twice(f: fn(u32) -> u32, v: u32) -> u32 {
                     f(f(v))
@@ -4800,9 +5130,38 @@ mod tests {
                 fn halve(v: u32) -> u32 {
                     v >> 1
                 }
-                let lifted: fn(u32) -> u32 = |v: u32| v ^ 0x33u32;
+                let x: u32 = a ^ b;
+                let lifted: fn(u32) -> u32 = |v: u32| {
+                    let x: u32 = v ^ 0x33u32;
+                    x
+                };
                 let chosen: fn(u32) -> u32 = if a > b { halve } else { lifted };
-                (twice(chosen, a ^ b) >> 1) + 1u32
+                let raw: *const () = chosen as *const ();
+                let same: bool = core::ptr::addr_eq(raw, chosen as *const ());
+                let diff: bool = core::ptr::addr_eq(raw, &x as *const u32);
+                let base: u32 = twice(chosen, x);
+                if same && !diff { (base >> 1) + 1u32 } else { 0u32 }
+            }",
+            // Vtable-keyed `&dyn Trait` dispatch when two traits define the
+            // same method name on one concrete struct, plus by-ref closure
+            // capture address identity (`addr_eq(&captured, outer_ref)`).
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                trait Right { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v & 0xFFFFu32 } }
+                impl Right for Both { fn pick(&self) -> u32 { 7u32 } }
+                let both = Both { v: a };
+                let left: &dyn Left = &both;
+                let right: &dyn Right = &both;
+                let same_obj: bool = core::ptr::addr_eq(left, right);
+                let cap: u32 = b & 0xFFu32;
+                let cap_ref: &u32 = &cap;
+                let check = |x: u32| {
+                    if core::ptr::addr_eq(&cap, cap_ref) { x ^ (*cap_ref) } else { 0u32 }
+                };
+                let res: u32 = check(left.pick() ^ right.pick());
+                if same_obj { (res >> 1) + 1u32 } else { 0u32 }
             }",
         ];
         let cands: Vec<GeneratedItreeCandidate> = modeled
@@ -4831,9 +5190,20 @@ mod tests {
         let rejected = [
             // A unique borrow: the evaluator's references are read-only.
             "pub fn probe(a: u32, b: u32) -> u32 { let mut x: u32 = a; let r = &mut x; b }",
+            // A `let ref` binding must not be silently bound by value.
+            "pub fn probe(a: u32, b: u32) -> u32 { let ref r = a; (*r) ^ b }",
             // A pointer to a boundary function bypasses its instrumentation.
             "pub fn ext(v: u32) -> u32 { v }
              pub fn probe(a: u32, b: u32) -> u32 { let f: fn(u32) -> u32 = ext; f(a ^ b) }",
+            // Two distinct functions may be merged by ICF, so their address
+            // inequality is not assumed.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn f1(v: u32) -> u32 { v ^ 1u32 }
+                fn f2(v: u32) -> u32 { v ^ 2u32 }
+                let p1: fn(u32) -> u32 = f1;
+                let p2: fn(u32) -> u32 = f2;
+                if core::ptr::addr_eq(p1 as *const (), p2 as *const ()) { a } else { b }
+            }",
             // A struct field's offset depends on a layout that is not computed.
             "pub fn probe(a: u32, b: u32) -> u32 {
                 struct Pair { lo: u32, hi: u32 }
@@ -4871,7 +5241,8 @@ mod tests {
                 let u = Unit { v: a };
                 u.twice() ^ u.v ^ b
             }",
-            // One method name defined by two traits for one type.
+            // Ambiguous direct method call on a concrete value when two traits
+            // define the same method name without an inherent `impl`.
             "pub fn probe(a: u32, b: u32) -> u32 {
                 trait Left { fn pick(&self) -> u32; }
                 trait Right { fn pick(&self) -> u32; }
@@ -4879,8 +5250,7 @@ mod tests {
                 impl Left for Both { fn pick(&self) -> u32 { self.v } }
                 impl Right for Both { fn pick(&self) -> u32 { 7 } }
                 let both = Both { v: a };
-                let left: &dyn Left = &both;
-                left.pick() ^ b
+                both.pick() ^ b
             }",
         ];
         for probe in rejected {

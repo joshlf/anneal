@@ -5411,15 +5411,18 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
         let probe_ident = format_ident!("__miri_vt_{tag}");
         let driver_ident = format_ident!("__anneal_vt_driver_{tag}");
         let callee_ident = format_ident!("__anneal_fnptr_callee_{tag}");
+        let callee_alt_ident = format_ident!("__anneal_fnptr_alt_{tag}");
         let k0: u32 = [3u32, 9u32, 17u32, 33u32][rng.gen_range(4)];
         let k1: u32 = [5u32, 12u32, 24u32, 48u32][rng.gen_range(4)];
         let seed_arg = indirect_seed_arg(&locals, k0);
 
         let new_items: File = match mode {
             MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(8) {
-                // Reify, coerce to `unsafe fn`, cast both pointers to
-                // `*const ()`, and call through both, passing the second call
-                // a value read through a `*mut u32` coerced to `*const u32`.
+                // Reify two distinct callees into `fn(u32) -> u32` pointers
+                // chosen at run time, coerce to `unsafe fn`, cast both pointers
+                // to `*const ()` (positive self-equality and negative equality
+                // against a live stack pointer), coerce `*mut u32` to
+                // `*const u32`, and call through both pointers.
                 0..=4 => syn::parse_quote! {
                     #[inline(never)]
                     fn #callee_ident(__vt_v: u32) -> u32 {
@@ -5427,8 +5430,22 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                     }
 
                     #[inline(never)]
+                    fn #callee_alt_ident(__vt_v: u32) -> u32 {
+                        ((__vt_v >> 1u32) ^ #k0 ^ 0x5Au32) & 0xFFFFu32
+                    }
+
+                    #[inline(never)]
                     fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
-                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
+                            #callee_ident
+                        } else {
+                            #callee_alt_ident
+                        };
+                        let __vt_other_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
+                            #callee_alt_ident
+                        } else {
+                            #callee_ident
+                        };
                         let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
                         let __vt_raw_a: *const () = __vt_fp as *const ();
                         let __vt_raw_b: *const () = __vt_ufp as *const ();
@@ -5436,21 +5453,37 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                         let __vt_mut_ptr: *mut u32 = &raw mut __vt_slot;
                         let __vt_const_ptr: *const u32 = __vt_mut_ptr;
                         let __vt_second: u32 = unsafe { __vt_ufp((*__vt_const_ptr) ^ __vt_bias) };
+                        let __vt_alt_res: u32 = __vt_other_fp(__vt_second ^ __vt_bias);
                         let __vt_same: u32 = if __vt_raw_a == __vt_raw_b { 1u32 } else { 0u32 };
-                        __vt_slot ^ (__vt_second << 1u32) ^ __vt_same
+                        let __vt_not_stack: u32 = if __vt_raw_a == (__vt_const_ptr as *const ()) {
+                            0u32
+                        } else {
+                            2u32
+                        };
+                        __vt_slot
+                            ^ (__vt_second << 2u32)
+                            ^ (__vt_alt_res << 4u32)
+                            ^ __vt_same
+                            ^ __vt_not_stack
                     }
                 },
-                // Unsize one receiver to two trait objects, dispatch through
-                // both vtables, and compare the wide pointers by address.
+                // Unsize two distinct concrete receivers (the second with a
+                // non-zero field offset) to `&dyn Trait` with two trait methods
+                // and a second trait on the first receiver, dispatch dynamically
+                // across both impls and vtables, and check both positive
+                // (one pointee, two vtables) and negative (two distinct
+                // receivers) wide-pointer `core::ptr::addr_eq`.
                 5 | 6 => {
                     // No `_` before the tag: the type names stay upper camel
                     // case, so the candidate compiles under `-D warnings`.
                     let trait_ident = format_ident!("__AnnealVtableTrait{tag}");
                     let alt_ident = format_ident!("__AnnealVtableAlt{tag}");
                     let rec_ident = format_ident!("__AnnealVtableReceiver{tag}");
+                    let rec_alt_ident = format_ident!("__AnnealVtableAltReceiver{tag}");
                     syn::parse_quote! {
                         trait #trait_ident {
                             fn eval_vt(&self, x: u32) -> u32;
+                            fn tag_vt(&self) -> u32;
                         }
 
                         trait #alt_ident {
@@ -5462,9 +5495,29 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                             pub bias: u32,
                         }
 
+                        #[repr(C)]
+                        struct #rec_alt_ident {
+                            pub pad: u32,
+                            pub bias: u32,
+                        }
+
                         impl #trait_ident for #rec_ident {
                             fn eval_vt(&self, x: u32) -> u32 {
                                 (x ^ self.bias) & 0xFFFFu32
+                            }
+
+                            fn tag_vt(&self) -> u32 {
+                                (self.bias & 0x3Fu32) ^ 0x15u32
+                            }
+                        }
+
+                        impl #trait_ident for #rec_alt_ident {
+                            fn eval_vt(&self, x: u32) -> u32 {
+                                ((x >> 1u32) ^ self.pad ^ self.bias) & 0xFFFFu32
+                            }
+
+                            fn tag_vt(&self) -> u32 {
+                                ((self.pad ^ self.bias) & 0x3Fu32) ^ 0x2Au32
                             }
                         }
 
@@ -5477,32 +5530,52 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                         #[inline(never)]
                         fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
                             let __vt_rec: #rec_ident = #rec_ident { bias: __vt_bias ^ #k0 };
-                            let __vt_dyn: &dyn #trait_ident = &__vt_rec as &dyn #trait_ident;
+                            let __vt_other: #rec_alt_ident = #rec_alt_ident {
+                                pad: (__vt_seed & 0xFFu32) ^ #k0,
+                                bias: (__vt_bias >> 1u32) ^ #k0,
+                            };
+                            let __vt_rec_dyn: &dyn #trait_ident = &__vt_rec as &dyn #trait_ident;
+                            let __vt_other_dyn: &dyn #trait_ident = &__vt_other as &dyn #trait_ident;
+                            let __vt_dyn: &dyn #trait_ident = if (__vt_seed & 1u32) == 0u32 {
+                                __vt_rec_dyn
+                            } else {
+                                __vt_other_dyn
+                            };
                             let __vt_dyn_alt: &dyn #alt_ident = &__vt_rec as &dyn #alt_ident;
-                            let __vt_virtual: u32 = __vt_dyn.eval_vt(__vt_seed);
+                            let __vt_virtual: u32 = __vt_dyn.eval_vt(__vt_seed) ^ __vt_dyn.tag_vt();
                             let __vt_alt_bits: u32 = __vt_dyn_alt.eval_alt();
-                            let __vt_same_obj: u32 = if core::ptr::addr_eq(__vt_dyn, __vt_dyn_alt) {
+                            let __vt_same_obj: u32 = if core::ptr::addr_eq(__vt_rec_dyn, __vt_dyn_alt) {
                                 1u32
                             } else {
                                 0u32
                             };
-                            __vt_virtual ^ (__vt_alt_bits << 1u32) ^ __vt_same_obj
+                            let __vt_diff_obj: u32 = if core::ptr::addr_eq(__vt_rec_dyn, __vt_other_dyn) {
+                                0u32
+                            } else {
+                                2u32
+                            };
+                            __vt_virtual ^ (__vt_alt_bits << 2u32) ^ __vt_same_obj ^ __vt_diff_obj
                         }
                     }
                 }
-                // Coerce a non-capturing closure to a function pointer and call
-                // it through the safe and the `unsafe fn` pointer.
+                // Coerce non-capturing closures to both safe `fn` and direct
+                // `unsafe fn` pointers (`ClosureFnPointer(Safe)` and
+                // `ClosureFnPointer(Unsafe)`), coerce the safe pointer via
+                // `UnsafeFnPointer`, cast to `*const ()` (`FnPtrToPtr`), and
+                // call through all three pointers.
                 _ => syn::parse_quote! {
                     #[inline(never)]
                     fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
                         let __vt_cfp: fn(u32) -> u32 = |__vt_z: u32| wrapping_add(__vt_z, #k0);
                         let __vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp;
+                        let __vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32| __vt_z ^ #k0;
                         let __vt_raw_c: *const () = __vt_cfp as *const ();
                         let __vt_raw_d: *const () = __vt_cufp as *const ();
                         let __vt_first: u32 = __vt_cfp(__vt_seed);
                         let __vt_second: u32 = unsafe { __vt_cufp(__vt_first ^ __vt_bias) };
+                        let __vt_third: u32 = unsafe { __vt_cufp_direct(__vt_second ^ #k1) };
                         let __vt_same: u32 = if __vt_raw_c == __vt_raw_d { 1u32 } else { 0u32 };
-                        __vt_first ^ (__vt_second << 1u32) ^ __vt_same
+                        __vt_first ^ (__vt_second << 1u32) ^ (__vt_third << 2u32) ^ __vt_same
                     }
                 },
             },
@@ -5670,21 +5743,34 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
             let __clos_arr: [u32; 3] = [__clos_seed, __clos_bias, #k0];
             let __clos_full: *const [u32; 3] = &raw const __clos_arr;
             let __clos_head: *const [u32; 1] = __clos_full as *const [u32; 1];
+            let __clos_tail_elem: *const u32 = unsafe { offset(__clos_full as *const u32, 1isize) };
+            let __clos_tail_arr: *const [u32; 2] = __clos_tail_elem as *const [u32; 2];
             let __clos_long: *const [u32] = __clos_full;
             let __clos_short: *const [u32] = __clos_head;
+            let __clos_tail: *const [u32] = __clos_tail_arr;
             let __clos_long_bytes: usize = unsafe { size_of_val(__clos_long) };
             let __clos_short_bytes: usize = unsafe { size_of_val(__clos_short) };
+            let __clos_tail_bytes: usize = unsafe { size_of_val(__clos_tail) };
             let __clos_same: u32 = if #wide_eq_ident(__clos_long, __clos_short) { 1u32 } else { 0u32 };
             let __clos_inline_same: u32 = if (__clos_long as *const ()) == (__clos_short as *const ()) {
                 2u32
             } else {
                 0u32
             };
+            let __clos_diff: u32 = if #wide_eq_ident(__clos_long, __clos_tail) { 0u32 } else { 4u32 };
+            let __clos_inline_diff: u32 = if (__clos_long as *const ()) == (__clos_tail as *const ()) {
+                0u32
+            } else {
+                8u32
+            };
             let __clos_wide_acc: u32 = __clos_arr[0]
+                ^ ((__clos_tail_bytes as u32) << 12u32)
                 ^ ((__clos_long_bytes as u32) << 8u32)
                 ^ ((__clos_short_bytes as u32) << 4u32)
                 ^ __clos_same
-                ^ __clos_inline_same;
+                ^ __clos_inline_same
+                ^ __clos_diff
+                ^ __clos_inline_diff;
         };
         let construct_stmts: Vec<Stmt> = match construct {
             0 => syn::parse_quote! {
@@ -5695,8 +5781,11 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
                 #(#wide_stmts)*
                 let __clos_cap: u32 = __clos_wide_acc & 0xFFu32;
                 let __clos_agg = |__clos_u: u32| wrapping_add(__clos_cap, __clos_u);
+                let __clos_agg_bytes: usize = unsafe { size_of_val(&raw const __clos_agg) };
                 let __clos_keep: &u32 = &__clos_cap;
-                let __clos_acc: u32 = __clos_wide_acc ^ ((*__clos_keep) << 16u32);
+                let __clos_acc: u32 = __clos_wide_acc
+                    ^ ((*__clos_keep) << 16u32)
+                    ^ ((__clos_agg_bytes as u32) << 24u32);
             },
             2 => syn::parse_quote! {
                 let __clos_cap: u32 = __clos_seed & 0xFFFFu32;
@@ -9543,7 +9632,13 @@ pub fn indirect_seed() -> u32 {
         const VT_PASS: &[Template] = &[
             (
                 "fn_ptr_chain",
-                &["__vt_mut_ptr", "as *const ()", "unsafe fn(u32) -> u32"],
+                &[
+                    "__anneal_fnptr_alt_",
+                    "__vt_mut_ptr",
+                    "as *const ()",
+                    "unsafe fn(u32) -> u32",
+                    "__vt_not_stack",
+                ],
                 "dyn",
             ),
             (
@@ -9551,14 +9646,20 @@ pub fn indirect_seed() -> u32 {
                 &[
                     "as &dyn __AnnealVtableTrait",
                     "as &dyn __AnnealVtableAlt",
+                    "__AnnealVtableAltReceiver",
                     "__vt_dyn.eval_vt(__vt_seed)",
-                    "core::ptr::addr_eq(__vt_dyn, __vt_dyn_alt)",
+                    "__vt_dyn.tag_vt()",
+                    "core::ptr::addr_eq(__vt_rec_dyn, __vt_dyn_alt)",
+                    "core::ptr::addr_eq(__vt_rec_dyn, __vt_other_dyn)",
                 ],
                 "__vt_fp",
             ),
             (
                 "closure_fn_ptr",
-                &["__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|"],
+                &[
+                    "__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|",
+                    "__vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32|",
+                ],
                 "dyn",
             ),
         ];
@@ -9588,13 +9689,20 @@ pub fn indirect_seed() -> u32 {
                 &[
                     "__anneal_wide_slice_addr_eq_",
                     "__clos_full as *const [u32; 1]",
+                    "__clos_tail_elem as *const [u32; 2]",
                     "size_of_val(__clos_short)",
+                    "size_of_val(__clos_tail)",
+                    "__clos_diff: u32",
                 ],
                 "__clos_agg",
             ),
             (
                 "wide_slices_uncalled_closure",
-                &["__anneal_wide_slice_addr_eq_", "__clos_agg = |"],
+                &[
+                    "__anneal_wide_slice_addr_eq_",
+                    "__clos_agg = |",
+                    "size_of_val(&raw const __clos_agg)",
+                ],
                 "::__::",
             ),
             (

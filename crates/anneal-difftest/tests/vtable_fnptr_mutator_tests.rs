@@ -27,7 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anneal_difftest::instrument::EnvSchedule;
@@ -93,6 +93,49 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
+fn rustc_is_nightly(rustc_bin: &str, repo: &Path) -> bool {
+    Command::new(rustc_bin)
+        .arg("--version")
+        .current_dir(repo)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| {
+            let v = String::from_utf8_lossy(&o.stdout);
+            v.contains("nightly") || v.contains("-dev")
+        })
+        .unwrap_or(false)
+}
+
+/// Resolve a nightly `rustc` for compiling `#![feature(core_intrinsics)]` Miri
+/// candidates. Honors any explicit nightly `RUSTC` override; when `cargo test`
+/// was invoked from outside the repo under a stable default `rustup` toolchain
+/// (exporting a stable `RUSTC`), asks `rustup which rustc` inside `repo_root()`
+/// so the repo's `rust-toolchain.toml` is picked up automatically.
+fn test_nightly_rustc_bin() -> &'static str {
+    static NIGHTLY_RUSTC: OnceLock<String> = OnceLock::new();
+    NIGHTLY_RUSTC.get_or_init(|| {
+        let repo = repo_root();
+        let candidate = resolve_rustc_bin();
+        if rustc_is_nightly(&candidate, &repo) {
+            return candidate;
+        }
+        if let Ok(out) = Command::new("rustup")
+            .args(["which", "rustc"])
+            .current_dir(&repo)
+            .env_remove("RUSTUP_TOOLCHAIN")
+            .output()
+            && out.status.success()
+        {
+            let resolved = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !resolved.is_empty() && rustc_is_nightly(&resolved, &repo) {
+                return resolved;
+            }
+        }
+        candidate
+    })
+}
+
 /// Compiles `source` with `rustc --edition=2024 --crate-type=lib -A warnings
 /// -C opt-level=<opt_level>`, returning `rustc`'s stderr on failure.
 fn compile_at_opt_level(label: &str, opt_level: &str, source: &str) -> Result<(), String> {
@@ -109,7 +152,8 @@ fn compile_with_lints(
     source: &str,
 ) -> Result<(), String> {
     let dir = unique_temp_dir(&format!("rustc_{label}_o{opt_level}"));
-    let mut child = Command::new(resolve_rustc_bin())
+    let mut child = Command::new(test_nightly_rustc_bin())
+        .current_dir(repo_root())
         .args([
             "--edition=2024",
             "--crate-type=lib",
@@ -177,15 +221,21 @@ const VTABLE_TEMPLATES: &[MiriTemplate] = &[
         classes: &[FN_PTR],
         mode: MutationMode::Pass,
         has: &[
-            // `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr` (from both
-            // pointer types), `MutToConstPointer`, and both indirect calls.
-            "__vt_fp: fn(u32) -> u32 = __anneal_fnptr_callee_",
+            // Multi-callee `ReifyFnPointer`, `UnsafeFnPointer`, `FnPtrToPtr`
+            // (positive self-equality + negative stack-pointer inequality),
+            // `MutToConstPointer`, and indirect calls through all pointers.
+            "__anneal_fnptr_callee_",
+            "__anneal_fnptr_alt_",
+            "__vt_fp: fn(u32) -> u32 = if",
+            "__vt_other_fp: fn(u32) -> u32 = if",
             "__vt_ufp: unsafe fn(u32) -> u32 = __vt_fp",
             "__vt_fp as *const ()",
             "__vt_ufp as *const ()",
+            "__vt_raw_a == (__vt_const_ptr as *const ())",
             "__vt_const_ptr: *const u32 = __vt_mut_ptr",
             "__vt_fp(__vt_seed)",
             "unsafe { __vt_ufp(",
+            "__vt_other_fp(",
         ],
         lacks: "__AnnealVtable",
         expect: Expect::Agree,
@@ -195,14 +245,19 @@ const VTABLE_TEMPLATES: &[MiriTemplate] = &[
         classes: &[DYN, ADDR_EQ],
         mode: MutationMode::Pass,
         has: &[
-            "__vt_dyn: &dyn __AnnealVtableTrait",
+            "__AnnealVtableReceiver",
+            "__AnnealVtableAltReceiver",
+            "__vt_rec_dyn: &dyn __AnnealVtableTrait",
             "as &dyn __AnnealVtableTrait",
             "__vt_dyn_alt: &dyn __AnnealVtableAlt",
             "as &dyn __AnnealVtableAlt",
             "__vt_dyn.eval_vt(__vt_seed)",
+            "__vt_dyn.tag_vt()",
             "__vt_dyn_alt.eval_alt()",
-            // One data address, two vtables.
-            "core::ptr::addr_eq(__vt_dyn, __vt_dyn_alt)",
+            // Positive (one data address, two vtables) and negative (two
+            // distinct concrete receivers) wide-pointer `addr_eq`.
+            "core::ptr::addr_eq(__vt_rec_dyn, __vt_dyn_alt)",
+            "core::ptr::addr_eq(__vt_rec_dyn, __vt_other_dyn)",
         ],
         lacks: "__vt_fp",
         expect: Expect::AgreeOrFalsePositiveUb,
@@ -212,11 +267,14 @@ const VTABLE_TEMPLATES: &[MiriTemplate] = &[
         classes: &[FN_PTR],
         mode: MutationMode::Pass,
         has: &[
-            // `ClosureFnPointer`, then `UnsafeFnPointer` and `FnPtrToPtr`.
+            // `ClosureFnPointer(Safe)`, `ClosureFnPointer(Unsafe)`,
+            // `UnsafeFnPointer`, and `FnPtrToPtr`.
             "__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|",
             "__vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp",
+            "__vt_cufp_direct: unsafe fn(u32) -> u32 = |__vt_z: u32|",
             "__vt_cfp as *const ()",
             "__vt_cfp(__vt_seed)",
+            "unsafe { __vt_cufp_direct(",
         ],
         lacks: "__AnnealVtable",
         expect: Expect::AgreeOrFalsePositiveUb,
@@ -273,15 +331,20 @@ const CLOSURE_TEMPLATES: &[MiriTemplate] = &[
         classes: &[ADDR_EQ],
         mode: MutationMode::Pass,
         has: &[
-            // Lengths 3 and 1 at one data address.
+            // Lengths 3 and 1 at one data address plus length 2 at element 1
+            // (positive + negative wide-pointer `addr_eq`).
             "__clos_full: *const [u32; 3] = &raw const __clos_arr",
             "__clos_head: *const [u32; 1] = __clos_full as *const [u32; 1]",
+            "__clos_tail_arr: *const [u32; 2] = __clos_tail_elem as *const [u32; 2]",
             "__clos_long: *const [u32] = __clos_full",
             "__clos_short: *const [u32] = __clos_head",
+            "__clos_tail: *const [u32] = __clos_tail_arr",
             "size_of_val(__clos_long)",
             "size_of_val(__clos_short)",
+            "size_of_val(__clos_tail)",
             "__anneal_wide_slice_addr_eq_",
             "(__clos_p as *const ()) == (__clos_q as *const ())",
+            "(__clos_long as *const ()) == (__clos_tail as *const ())",
         ],
         lacks: "__clos_agg",
         expect: Expect::Agree,
@@ -292,9 +355,10 @@ const CLOSURE_TEMPLATES: &[MiriTemplate] = &[
         mode: MutationMode::Pass,
         has: &[
             "__anneal_wide_slice_addr_eq_",
-            // An `AggregateKind::Closure` that captures `&__clos_cap` while
-            // `__clos_cap` is also borrowed directly.
+            // A live `AggregateKind::Closure` (`size_of_val` folded into the
+            // return value) capturing `&__clos_cap` alongside a direct borrow.
             "__clos_agg = |__clos_u: u32| wrapping_add(__clos_cap, __clos_u)",
+            "size_of_val(&raw const __clos_agg)",
             "__clos_keep: &u32 = &__clos_cap",
         ],
         lacks: "::__::",
@@ -504,11 +568,16 @@ const ITREE_TEMPLATES: [(&str, &[&str], &[&str]); 4] = [
         "dyn_dispatch",
         &[DYN, ADDR_EQ],
         &[
+            "struct AnnealDynHolderA",
+            "struct AnnealDynHolderB",
             "&holder as &dyn AnnealDynProbe",
+            "&other as &dyn AnnealDynProbe",
             "&holder as &dyn AnnealDynAlt",
-            "as_probe.probe(seed)",
+            "picked.probe(seed)",
+            "picked.stamp()",
             "as_alt.alt()",
             "core::ptr::addr_eq(as_probe, as_alt)",
+            "core::ptr::addr_eq(as_probe, other_probe)",
         ],
     ),
     (
@@ -517,6 +586,10 @@ const ITREE_TEMPLATES: [(&str, &[&str], &[&str]); 4] = [
         &[
             "op: fn(u32, u32) -> u32 = if",
             "lifted: fn(u32, u32) -> u32 = |a: u32, b: u32|",
+            "raw_op: *const () = op as *const ()",
+            "raw_lifted: *const () = lifted as *const ()",
+            "core::ptr::addr_eq(raw_op, op as *const ())",
+            "core::ptr::addr_eq(raw_op, raw_seed)",
             "op(seed, delta)",
             "lifted(first,",
         ],
@@ -525,7 +598,8 @@ const ITREE_TEMPLATES: [(&str, &[&str], &[&str]); 4] = [
         "closures",
         &[CLOSURE],
         &[
-            "by_ref = |x: u32| (x >> 1) ^ bias",
+            "bias_ref: &u32 = &bias",
+            "core::ptr::addr_eq(&bias, bias_ref)",
             "by_val = move |x: u32|",
             "let mut bump = |d: u32|",
             "acc = (acc >> 1) ^ d",
@@ -1061,4 +1135,119 @@ fn indirect_dispatch_templates_run_through_live_itree_oracle() {
         "{context}"
     );
     assert!(report.distinct_traces_checked >= total, "{context}");
+}
+
+/// Anti-vacuity check: verify that every `IndirectDispatchOutliner` template's
+/// multi-impl vtable dispatch, multi-callee function-pointer dispatch, and
+/// positive/negative `addr_eq` checks genuinely influence the boundary helper's
+/// returned `u32` (even on zero inputs `(0, 0)`).
+#[test]
+fn indirect_dispatch_outliner_outputs_depend_on_vtable_fnptr_and_addr_eq() {
+    let cands: Vec<(&str, GeneratedItreeCandidate)> = itree_template_candidates()
+        .into_iter()
+        .filter(|(_, c)| c.seed_index == 0)
+        .collect();
+    assert_eq!(cands.len(), ITREE_TEMPLATES.len());
+
+    let helper_ret = |source: &str, magic: u32, payload_len: u32| -> Vec<u8> {
+        let ev = ItreeConcreteEvaluator::new(source, "kernel_step")
+            .unwrap_or_else(|e| panic!("evaluator init failed: {e}\n{source}"));
+        let run = ev
+            .run_kernel_step(magic, payload_len, &EnvSchedule::new(), "")
+            .unwrap_or_else(|e| panic!("evaluator run failed: {e}\n{source}"));
+        match run.events.first() {
+            Some(ItreeConcreteEvent::ExtCall { ret, .. }) => ret.clone(),
+            other => panic!("expected first ExtCall event, got {other:?}"),
+        }
+    };
+
+    for (label, cand) in &cands {
+        let base_zero = helper_ret(&cand.source, 0, 0);
+        match *label {
+            "dyn_dispatch" => {
+                // Even vs odd `seed` dispatches `AnnealDynHolderA` vs `AnnealDynHolderB`.
+                let base_odd = helper_ret(&cand.source, 1, 0);
+                assert_ne!(
+                    base_zero, base_odd,
+                    "`dyn_dispatch` must distinguish HolderA vs HolderB"
+                );
+                // Flipping either positive or negative `addr_eq` must change the return.
+                for (needle, flipped) in [
+                    ("core::ptr::addr_eq(as_probe, as_alt)", "false"),
+                    ("core::ptr::addr_eq(as_probe, other_probe)", "true"),
+                ] {
+                    assert!(
+                        cand.source.contains(needle),
+                        "missing `{needle}`:\n{}",
+                        cand.source
+                    );
+                    let perturbed = cand.source.replacen(needle, flipped, 1);
+                    assert_ne!(
+                        base_zero,
+                        helper_ret(&perturbed, 0, 0),
+                        "`dyn_dispatch` return did not change when flipping `{needle}`"
+                    );
+                }
+            }
+            "fn_pointer" => {
+                // Even vs odd `seed` dispatches `anneal_fnptr_mix` vs `anneal_fnptr_fold`.
+                let even_ret = helper_ret(&cand.source, 0x200, 0x44);
+                let odd_ret = helper_ret(&cand.source, 0x201, 0x44);
+                assert_ne!(
+                    even_ret, odd_ret,
+                    "`fn_pointer` must distinguish `anneal_fnptr_mix` vs `anneal_fnptr_fold`"
+                );
+                for (needle, flipped) in [
+                    ("core::ptr::addr_eq(raw_op, op as *const ())", "false"),
+                    ("core::ptr::addr_eq(raw_lifted, lifted as *const ())", "false"),
+                    ("core::ptr::addr_eq(raw_op, raw_seed)", "true"),
+                ] {
+                    assert!(
+                        cand.source.contains(needle),
+                        "missing `{needle}`:\n{}",
+                        cand.source
+                    );
+                    let perturbed = cand.source.replacen(needle, flipped, 1);
+                    assert_ne!(
+                        base_zero,
+                        helper_ret(&perturbed, 0, 0),
+                        "`fn_pointer` return did not change when flipping `{needle}`"
+                    );
+                }
+            }
+            "closures" => {
+                let needle = "core::ptr::addr_eq(&bias, bias_ref)";
+                assert!(
+                    cand.source.contains(needle),
+                    "missing `{needle}`:\n{}",
+                    cand.source
+                );
+                let perturbed = cand.source.replacen(needle, "false", 1);
+                assert_ne!(
+                    base_zero,
+                    helper_ret(&perturbed, 0, 0),
+                    "`closures` return did not change when flipping `{needle}`"
+                );
+            }
+            "slice_addr_eq" => {
+                for (needle, flipped) in [
+                    ("core::ptr::addr_eq(whole, short)", "false"),
+                    ("core::ptr::addr_eq(whole, shifted)", "true"),
+                ] {
+                    assert!(
+                        cand.source.contains(needle),
+                        "missing `{needle}`:\n{}",
+                        cand.source
+                    );
+                    let perturbed = cand.source.replacen(needle, flipped, 1);
+                    assert_ne!(
+                        base_zero,
+                        helper_ret(&perturbed, 0, 0),
+                        "`slice_addr_eq` return did not change when flipping `{needle}`"
+                    );
+                }
+            }
+            other => panic!("unexpected ITree template `{other}`"),
+        }
+    }
 }
