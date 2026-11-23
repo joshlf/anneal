@@ -5458,7 +5458,13 @@ def _lex_spec_tokens(s: str) -> tuple[list[tuple[str, Any]], str]:
             i += 1
             while i < n and _is_ascii_digit(s[i]):
                 i += 1
-            val_int = int(s[start:i])
+            # `[adv B3]` `int()` raises `ValueError` past `sys.get_int_max_str_digits()` (4300)
+            # digits, so one long numeral crashed the scan instead of being rejected: `u128::MAX`
+            # has 39 significant digits (leading zeros do not count, as in `u128::from_str`).
+            sig_digits = s[start:i].lstrip("0")
+            if len(sig_digits) > 39:
+                return [], f"integer `{s[start:i]}` too large"
+            val_int = int(sig_digits) if sig_digits else 0
             if val_int > _U128_MAX:
                 return [], f"integer `{s[start:i]}` too large"
             out.append(("Int", val_int))
@@ -6896,11 +6902,65 @@ def _parse_3axis_metadata(comment_text: str) -> dict[str, str]:
 _PAREN_ONLY_RE = re.compile(r"[()]")
 _WS_RUN_RE = re.compile(r"[ \t\r\n]+")
 _STMT_END_SCAN_RE = re.compile(r"[(){}\[\]\n;]|:=|(?<![\w'!?.])let\b")
-_CHAR_LITERAL_RE = re.compile(r"(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'")
-_ARROW_SCAN_RE = re.compile(
-    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∀|∃|λ|"
-    r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+# `[adv B3]` The opening `'` leads the pattern and the "no identifier char / `'` / `.` / `!` / `?`
+# before it" lookbehind follows it (`(?<![\w'.!?]')`, the same assertion one char later), so
+# `re` scans for the literal `'` at C speed instead of running a lookbehind at every offset:
+# identifier primes (`h'`, `x''`) used to cost a full regex pass over each statement.
+_SCAN_CHAR_LIT_ALT = r"'(?<![\w'.!?]')(?:\\[^\n]{1,8}?|[^\\'\n])'"
+_CHAR_LITERAL_RE = re.compile(_SCAN_CHAR_LIT_ALT)
+# `[adv B3]` Depth-0 scanners are built from literal-first alternatives (`\(|\)|...` rather than
+# `[(){}...]`, and the char literal in its `'`-first form), so `re` can skip straight to the next
+# candidate character; the binder-keyword alternative needs a lookbehind at every offset and
+# defeats that. Each scanner therefore has a `_NOKW` twin without the keyword alternative, used
+# whenever `_has_binder_keyword` shows no standalone keyword occurs anywhere in the scanned text:
+# the keyword alternative could not match there, so both regexes yield the same token stream.
+_SCAN_BRACKET_ALTS = r"\(|\)|\{|\}|\[|\]|⟨|⟩|⦃|⦄"
+_BINDER_KEYWORD_ALT = r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+# One literal-prefixed regex per keyword (`by(?<![\w'.!?]by)(?![\w'!?])` is the keyword alternative
+# restricted to `by`, with the lookbehind moved behind the literal), tried only when the keyword
+# occurs as a substring at all.
+(
+    _KW_BY_SEARCH,
+    _KW_IF_SEARCH,
+    _KW_FUN_SEARCH,
+    _KW_LET_SEARCH,
+    _KW_MATCH_SEARCH,
+    _KW_HAVE_SEARCH,
+    _KW_SHOW_SEARCH,
+    _KW_FORALL_SEARCH,
+    _KW_EXISTS_SEARCH,
+) = (
+    re.compile(kw + r"(?<![\w'.!?]" + kw + r")(?![\w'!?])").search
+    for kw in ("by", "if", "fun", "let", "match", "have", "show", "forall", "exists")
 )
+
+
+def _has_binder_keyword(expr: str) -> bool:
+    """`True` iff a standalone prefix-binder keyword (`forall`, `exists`, `fun`, `if`, `match`,
+    `let`, `have`, `show`, `by`) occurs in `expr`: exactly `re.search(_BINDER_KEYWORD_ALT, expr)`,
+    at C-level substring speed for the usual text that has none."""
+    return (
+        ("by" in expr and _KW_BY_SEARCH(expr) is not None)
+        or ("if" in expr and _KW_IF_SEARCH(expr) is not None)
+        or ("fun" in expr and _KW_FUN_SEARCH(expr) is not None)
+        or ("let" in expr and _KW_LET_SEARCH(expr) is not None)
+        or ("match" in expr and _KW_MATCH_SEARCH(expr) is not None)
+        or ("have" in expr and _KW_HAVE_SEARCH(expr) is not None)
+        or ("show" in expr and _KW_SHOW_SEARCH(expr) is not None)
+        or ("forall" in expr and _KW_FORALL_SEARCH(expr) is not None)
+        or ("exists" in expr and _KW_EXISTS_SEARCH(expr) is not None)
+    )
+
+
+def _has_prefix_binder_hint(expr: str) -> bool:
+    """`True` iff `expr` contains `∀`, `∃`, `λ` or a standalone binder keyword anywhere."""
+    return "∀" in expr or "∃" in expr or "λ" in expr or _has_binder_keyword(expr)
+
+
+_ARROW_SCAN_NOKW_RE = re.compile(
+    r"«[^»]*»|" + _SCAN_CHAR_LIT_ALT + "|" + _SCAN_BRACKET_ALTS + r"|↔|<->|<\|>|<\||\$|→|->|∀|∃|λ"
+)
+_ARROW_SCAN_RE = re.compile(_ARROW_SCAN_NOKW_RE.pattern + "|" + _BINDER_KEYWORD_ALT)
 _PIPE_ARM_RE = re.compile(r"\n[ \t]*\|")
 _WHERE_SCAN_RE = re.compile(
     r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|(?<![\w'.!?])where(?![\w'!?])"
@@ -6951,10 +7011,11 @@ def _scan_binder_group(seg: str, p: int, limit: int | None = None) -> tuple[int,
             return end_lim + 1, -1
         c_open = find(ch, cur, c_close)
         target = c_open if c_open != -1 else c_close
-        lit_end = _skip_char_literal_before(seg, cur, target, end_lim)
-        if lit_end != -1:
-            cur = lit_end
-            continue
+        if find("'", cur, target) != -1:
+            lit_end = _skip_char_literal_before(seg, cur, target, end_lim)
+            if lit_end != -1:
+                cur = lit_end
+                continue
         if c_open != -1:
             depth += 1
             cur = c_open + 1
@@ -7089,6 +7150,19 @@ def _arrow_premise_binder(prem: str) -> tuple[str, str]:
     return "", prem
 
 
+# `[adv B3]` One C-level match for the overwhelmingly common header binder `(names : T)` /
+# `{names : T}` / `[names : T]`: no bracket, `:` or `'` in `names`, the `:` is not `:=`, and `T`
+# holds no bracket of the group's own kind and no `'` -- so the first same-kind close bracket
+# closes the group, the first `:` is the binder colon, and the delimiter-parity check on `names`
+# holds trivially. Trailing ` \t\r\n` is consumed too. Anything else (nested or mixed brackets,
+# char literals, `:=` defaults, untyped groups) does not match and takes the general path.
+_SIMPLE_BINDER_MATCH = {
+    "(": re.compile(r"\(([^(){}\[\]⦃⦄:']*):(?!=)([^()']*)\)[ \t\r\n]*").match,
+    "{": re.compile(r"\{([^(){}\[\]⦃⦄:']*):(?!=)([^{}']*)\}[ \t\r\n]*").match,
+    "[": re.compile(r"\[([^(){}\[\]⦃⦄:']*):(?!=)([^\[\]']*)\][ \t\r\n]*").match,
+}
+
+
 def _split_lean_theorem_header(
     code_segment: str, after_name_pos: int, limit_end: int | None = None
 ) -> tuple[list[tuple[str, str]], str, list[str]] | None:
@@ -7148,6 +7222,14 @@ def _split_lean_theorem_header(
             p = q
             continue
         if ch in "({[":
+            m_b = _SIMPLE_BINDER_MATCH[ch](code_segment, p, n)
+            if m_b is not None:
+                # `(names : T)` with no bracket or `'` before the `:` and no same-kind bracket or
+                # `'` in `T`: exactly the group the `find`-based path below accepts as a binder.
+                b_names, b_type = m_b.group(1, 2)
+                binders.append((b_names.strip(), b_type.strip()))
+                p = m_b.end()
+                continue
             close_ch = ")" if ch == "(" else ("}" if ch == "{" else "]")
             fast_close = find(close_ch, p + 1, n)
             if (
@@ -7225,13 +7307,31 @@ def _split_lean_theorem_header(
             bal_slice.count("(") == bal_slice.count(")")
             and bal_slice.count("{") == bal_slice.count("}")
             and bal_slice.count("[") == bal_slice.count("]")
-            and bal_slice.count("⟨") == bal_slice.count("⟩")
-            and bal_slice.count("⦃") == bal_slice.count("⦄")
-            and bal_slice.count("«") == bal_slice.count("»")
+            and (
+                bal_slice.isascii()  # O(1): no `⟨⟩⦃⦄«»` to count in pure-ASCII text
+                or (
+                    bal_slice.count("⟨") == bal_slice.count("⟩")
+                    and bal_slice.count("⦃") == bal_slice.count("⦄")
+                    and bal_slice.count("«") == bal_slice.count("»")
+                )
+            )
         ):
             if "let " in prefix_slice:
+                # `[adv B3]` Only the `let` keyword opens a `let x := v` whose `:=` is not the
+                # statement's. An identifier that merely ends in `let` (`droplet = droplet := rfl`,
+                # `isOutlet x`, a field `s.let`) used to swallow the proof into the statement, which
+                # hid a reflexive / tautological conclusion from every conclusion check.
                 last_let = prefix_slice.rfind("let ")
-                if "\n" not in prefix_slice[last_let:] and ";" not in prefix_slice[last_let:]:
+                while last_let > 0 and (
+                    _is_lean_ident_char(prefix_slice[last_let - 1])
+                    or prefix_slice[last_let - 1] == "."
+                ):
+                    last_let = prefix_slice.rfind("let ", 0, last_let)
+                if (
+                    last_let != -1
+                    and "\n" not in prefix_slice[last_let:]
+                    and ";" not in prefix_slice[last_let:]
+                ):
                     search_eq = eq_pos + 2
                     continue
             stmt_end = eq_pos
@@ -7258,6 +7358,13 @@ def _split_lean_theorem_header(
                 decl_end_bound = w_pos
         stmt = code_segment[stmt_start:decl_end_bound].strip()
     else:
+        if "where" in prefix_slice:
+            # `[adv B3]` `theorem t : A ∧ B where left := ..; right := ..`: the first `:=` belongs to
+            # a structure-instance field, and the statement ends at the depth-0 `where` before it
+            # (it used to read `A ∧ B where left`, never a trivial or tautological conclusion).
+            w_pos = _find_depth0_where(code_segment, stmt_start, stmt_end)
+            if w_pos != -1:
+                prefix_slice = code_segment[stmt_start:w_pos]
         stmt = prefix_slice.strip()
     if not stmt:
         return None
@@ -7409,7 +7516,7 @@ def _split_lean_theorem_header(
             and "«" not in cur_stmt
             and "⟨" not in cur_stmt
             and "⦃" not in cur_stmt
-            and _PREFIX_BINDER_HINT_SEARCH(cur_stmt) is None
+            and not _has_prefix_binder_hint(cur_stmt)
         ):
             arrow_parts = cur_stmt.split("→")
             if all(
@@ -7432,7 +7539,8 @@ def _split_lean_theorem_header(
         arrow_spans: list[tuple[int, int]] = []
         looser_hit = False
         re_loop = False
-        for m_a in _ARROW_SCAN_RE.finditer(cur_stmt):
+        arrow_scan_re = _ARROW_SCAN_RE if _has_binder_keyword(cur_stmt) else _ARROW_SCAN_NOKW_RE
+        for m_a in arrow_scan_re.finditer(cur_stmt):
             t_a = m_a.group(0)
             if t_a[0] == "«" or t_a[0] == "'":
                 continue
@@ -7495,7 +7603,8 @@ def _norm_expr(s: str) -> str:
 
 
 def _norm_expr_uncached(s: str) -> str:
-    if "\n" not in s and "  " not in s and "\t" not in s and "\r" not in s:
+    # `str.isprintable` rules out `\n` / `\t` / `\r` in one C pass (`[adv B3]`).
+    if "  " not in s and (s.isprintable() or ("\n" not in s and "\t" not in s and "\r" not in s)):
         t = s.strip()
     else:
         t = " ".join(s.split())
@@ -7566,15 +7675,17 @@ def _split_top_level(expr: str, sep: str) -> list[str]:
     return [_norm_expr(p) for p in parts]
 
 
+_TOP_LEVEL_LOOSER_THAN_NOT_NOKW_RE = re.compile(
+    r"«[^»]*»|" + _SCAN_BRACKET_ALTS + r"|↔|<->|<\|>|<\||\$|→|->|∨|\\/|∧|/\\|∀|∃|λ"
+)
 _TOP_LEVEL_LOOSER_THAN_NOT_RE = re.compile(
-    r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∨|\\/|∧|/\\|∀|∃|λ|"
-    r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+    _TOP_LEVEL_LOOSER_THAN_NOT_NOKW_RE.pattern + "|" + _BINDER_KEYWORD_ALT
 )
 _CONJ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|∧|/\\")
-_CONJ_TOP_BOUND_RE = re.compile(
-    r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|→|->|<\|>|<\||\|>|\$|∨|\\/|∀|∃|λ|"
-    r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+_CONJ_TOP_BOUND_NOKW_RE = re.compile(
+    r"«[^»]*»|" + _SCAN_BRACKET_ALTS + r"|↔|<->|→|->|<\|>|<\||\|>|\$|∨|\\/|∀|∃|λ"
 )
+_CONJ_TOP_BOUND_RE = re.compile(_CONJ_TOP_BOUND_NOKW_RE.pattern + "|" + _BINDER_KEYWORD_ALT)
 
 
 def _arrow_false_antecedent(expr: str) -> str | None:
@@ -7645,7 +7756,12 @@ def _has_top_level_looser_than_not(expr: str) -> bool:
     ):
         return False
     depth = 0
-    for m in _TOP_LEVEL_LOOSER_THAN_NOT_RE.finditer(expr):
+    scan_re = (
+        _TOP_LEVEL_LOOSER_THAN_NOT_RE
+        if _has_binder_keyword(expr)
+        else _TOP_LEVEL_LOOSER_THAN_NOT_NOKW_RE
+    )
+    for m in scan_re.finditer(expr):
         t = m.group(0)
         if t[0] == "«":
             continue
@@ -7659,18 +7775,13 @@ def _has_top_level_looser_than_not(expr: str) -> bool:
     return False
 
 
-_PREFIX_BINDER_HINT_SEARCH = re.compile(
-    r"[∀∃λ]|(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
-).search
-
-
 def _has_top_level_prefix_binder(expr: str) -> bool:
     """`True` iff `expr` has a depth-0 (outside `()[]{}⟨⟩⦃⦄` and `«...»`) prefix binder or keyword
     (`∀`, `∃`, `λ`, `forall`, `exists`, `fun`, `if`, `match`, `let`, `have`, `show`, `by`), whose
     body runs to the end of `expr`. Such an expression is not one relation between two terms:
     in `∀ x ∈ s, x :: xs = []` or `if c then True else n < 0` the `=` / `<` belongs to the body,
     which holds vacuously over an empty domain or in the other branch."""
-    if _PREFIX_BINDER_HINT_SEARCH(expr) is None:
+    if not _has_prefix_binder_hint(expr):
         return False
     depth = 0
     for m in _TOP_LEVEL_LOOSER_THAN_NOT_RE.finditer(expr):
@@ -7697,7 +7808,9 @@ def _split_top_level_conjuncts(expr: str) -> list[str]:
         return [expr]
     bound = len(expr)
     depth = 0
-    for m in _CONJ_TOP_BOUND_RE.finditer(expr):
+    for m in (
+        _CONJ_TOP_BOUND_RE if _has_binder_keyword(expr) else _CONJ_TOP_BOUND_NOKW_RE
+    ).finditer(expr):
         t = m.group(0)
         if t[0] == "«":
             continue
@@ -7846,15 +7959,18 @@ def _plain_quantifier_binders(
     shadowed: frozenset[str] = frozenset(),
     allow_untyped: bool = True,
     allow_new_type_vars: bool = False,
+    groups: list[tuple[list[str], str | None]] | None | bool = False,
 ) -> bool:
     """`True` iff a quantifier's binder section only introduces variables that range over data in
     telescope order: optionally bare/untyped names (`x y`, when `allow_untyped=True`), `names : T`,
     or `(names : T)` / `{names : T}` groups with `T` accepted by `_is_non_prop_binder_type`
     (respecting shadowing of both `type_vars` and reserved base/container names). A binder
     predicate (`x > 0`, `x ∈ s`), an instance bracket, a proof binder (`h : P`) or an
-    unrecognised domain (`Fin n`) restricts the quantifier and is not plain."""
-    groups = _parse_quantifier_binder_groups(binders)
-    if groups is None:
+    unrecognised domain (`Fin n`) restricts the quantifier and is not plain. `groups` may carry
+    the caller's `_parse_quantifier_binder_groups(binders)` result (`False`: not parsed yet)."""
+    if groups is False:
+        groups = _parse_quantifier_binder_groups(binders)
+    if groups is None or groups is True:
         return False
     tv = set(type_vars)
     sh = set(shadowed)
@@ -7953,7 +8069,7 @@ def _top_level_arrow_domains(expr: str) -> list[str]:
     domains: list[str] = []
     depth = 0
     seg_start = 0
-    for m in _ARROW_SCAN_RE.finditer(ne):
+    for m in (_ARROW_SCAN_RE if _has_binder_keyword(ne) else _ARROW_SCAN_NOKW_RE).finditer(ne):
         t = m.group(0)
         if t[0] == "«" or t[0] == "'":
             continue
@@ -7971,6 +8087,23 @@ def _top_level_arrow_domains(expr: str) -> list[str]:
     return domains
 
 
+def _first_standalone_use(body: str, name: str) -> int:
+    """Offset of the first occurrence of identifier `name` in `body` that is a whole identifier and
+    not a field name (`x.name`), or `-1`."""
+    pos = 0
+    n_body = len(body)
+    while True:
+        idx = body.find(name, pos)
+        if idx == -1:
+            return -1
+        pos = idx + len(name)
+        if idx > 0 and (_is_lean_ident_char(body[idx - 1]) or body[idx - 1] == "."):
+            continue
+        if pos < n_body and _is_lean_ident_char(body[pos]):
+            continue
+        return idx
+
+
 def _untyped_binders_inhabited_by_calls(
     untyped_names: set[str],
     body: str,
@@ -7986,6 +8119,11 @@ def _untyped_binders_inhabited_by_calls(
     remaining = set(untyped_names)
     rebound_cache: dict[str, bool] = {}
     n_body = len(body)
+    # `[adv B3]` Lean fixes an untyped binder's type at its first use, so only that occurrence
+    # counts: in `∀ s, E s ∧ R s ∧ False` with `E : Fin 0 → Prop` (or `Fin.elim0 s`, or
+    # `(s : Fin 0) = s`) `s` ranges over an empty type -- `R s` merely coerces it -- and the
+    # hypothesis holds vacuously instead of being contradictory.
+    first_use = {nm: _first_standalone_use(body, nm) for nm in untyped_names}
     for f_name, dom_flags in fn_domains.items():
         if f_name in shadowed_fns or not any(dom_flags) or f_name not in body:
             continue
@@ -8044,7 +8182,7 @@ def _untyped_binders_inhabited_by_calls(
                     # `s.val` / `s[0]` passes a projection/element of `s`, NOT `s` itself:
                     # e.g. `s : Fin 0` has `s.val : Nat` even though `Fin 0` is empty.
                     break
-                if is_inhab and tok in remaining:
+                if is_inhab and tok in remaining and first_use[tok] == arg_pos:
                     rebound = rebound_cache.get(tok)
                     if rebound is None:
                         rebound = _body_may_rebind_name(body, tok)
@@ -8093,14 +8231,14 @@ def _hyp_atoms(
                     can_descend = quantifier == "∃"
                     if not can_descend:
                         if _plain_quantifier_binders(
-                            binders, shadowed=shadowed, allow_untyped=False
+                            binders, shadowed=shadowed, allow_untyped=False, groups=groups
                         ):
                             can_descend = True
                         elif (
                             groups is not None
                             and fn_domains
                             and _plain_quantifier_binders(
-                                binders, shadowed=shadowed, allow_untyped=True
+                                binders, shadowed=shadowed, allow_untyped=True, groups=groups
                             )
                         ):
                             untyped_names = {
@@ -8232,11 +8370,11 @@ def _is_simple_refutation_premise(part: str) -> bool:
     return _is_simple_term(h[: rel.start()].strip()) and _is_simple_term(h[rel.end() :].strip())
 
 
-_TOP_BOUND_RE = re.compile(
-    r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|"
-    r"↔|→|->|<\|>|<\||\|>|\$|∨|∃|∀|λ|"
-    r"(?<![\w'.!?])(?:fun|forall|exists|if|match|let|have|show|by)(?![\w'!?])"
+_TOP_BOUND_NOKW_RE = re.compile(
+    r"«[^»]*»|" + _SCAN_CHAR_LIT_ALT + "|" + _SCAN_BRACKET_ALTS + r"|"
+    r"↔|→|->|<\|>|<\||\|>|\$|∨|∃|∀|λ"
 )
+_TOP_BOUND_RE = re.compile(_TOP_BOUND_NOKW_RE.pattern + "|" + _BINDER_KEYWORD_ALT)
 
 
 def _find_top_level_bound(expr: str, *, allow_or: bool) -> int:
@@ -8256,7 +8394,7 @@ def _find_top_level_bound(expr: str, *, allow_or: bool) -> int:
       and `expr[op_end:]` (containing the prefix binder) is the right-hand disjunct!
     """
     depth = 0
-    for m in _TOP_BOUND_RE.finditer(expr):
+    for m in (_TOP_BOUND_RE if _has_binder_keyword(expr) else _TOP_BOUND_NOKW_RE).finditer(expr):
         t = m.group(0)
         if t[0] == "«" or t[0] == "'":
             continue
@@ -8356,10 +8494,43 @@ def _any_disjunct_trivial(expr: str) -> bool:
 
 
 _STANDALONE_EQ_SPLIT_RE = re.compile(r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|(?<![=!<>:])=(?!=)")
+# `[adv B3]` A prefix that is only non-bracket text and balanced bracket groups nested at most two
+# deep, with no `«`: the depth-0 scanners (which count every bracket kind alike and skip `«...»`)
+# are at depth 0 right after it. Unrolled (`run (group run)*`, each group opening on a character
+# the runs cannot match), so a failing match backtracks linearly.
+_DEPTH0_PREFIX_FULLMATCH = re.compile(
+    r"[^()\[\]{}⟨⟩⦃⦄«]*(?:[(\[{⟨⦃][^()\[\]{}⟨⟩⦃⦄«]*"
+    r"(?:[(\[{⟨⦃][^()\[\]{}⟨⟩⦃⦄«]*[)\]}⟩⦄][^()\[\]{}⟨⟩⦃⦄«]*)*"
+    r"[)\]}⟩⦄][^()\[\]{}⟨⟩⦃⦄«]*)*"
+).fullmatch
+
+
+def _split_single_depth0_op(
+    expr: str, op: str, not_before: str, not_after: str
+) -> list[str] | None:
+    """C-level shortcut for the depth-0 split scans on a one-character relation `op` that is not
+    an operator when preceded by a `not_before` or followed by a `not_after` character. Returns
+    exactly what the scan returns when that can be decided without it -- `[expr]` when `op` does
+    not occur or its only occurrence is excluded by a neighbour, `[lhs, rhs]` when its only
+    occurrence follows a provably depth-0 prefix (`_DEPTH0_PREFIX_FULLMATCH`) -- and `None`
+    (run the scan) otherwise: several occurrences, deeper nesting, `«...»`, stray brackets."""
+    i = expr.find(op)
+    if i == -1:
+        return [_norm_expr(expr)]
+    if expr.find(op, i + 1) != -1:
+        return None
+    if (i > 0 and expr[i - 1] in not_before) or (i + 1 < len(expr) and expr[i + 1] in not_after):
+        return [_norm_expr(expr)]
+    if _DEPTH0_PREFIX_FULLMATCH(expr, 0, i) is None:
+        return None
+    return [_norm_expr(expr[:i]), _norm_expr(expr[i + 1 :])]
 
 
 def _split_top_level_eq(expr: str) -> list[str]:
     """Split `expr` on top-level standalone `=` (excluding `==`, `:=`, `!=`, `<=`, `>=`) outside `()[]{}⟨⟩⦃⦄` and `«...»`."""
+    fast = _split_single_depth0_op(expr, "=", "=!<>:", "=")
+    if fast is not None:
+        return fast
     parts: list[str] = []
     depth = 0
     start = 0
@@ -8421,6 +8592,12 @@ def _is_trivially_true(conj: str) -> bool:
         if op == "=":
             if c.count("=") == 1 and ":=" not in c and "«" not in c and "'" not in c:
                 lhs, _, rhs = c.partition("=")
+                # `[adv B3]` Normalizing only strips whitespace and outer parentheses, so two sides
+                # that start with different non-`(` characters cannot normalize to the same text.
+                l0 = lhs[:1]
+                r0 = rhs.lstrip()[:1]
+                if l0 != r0 and l0 != "(" and r0 != "(":
+                    continue
                 if (
                     lhs.count("(") == lhs.count(")")
                     and lhs.count("[") == lhs.count("]")
@@ -8438,6 +8615,10 @@ def _is_trivially_true(conj: str) -> bool:
             continue
         if c.count(op) == 1 and "«" not in c and "'" not in c:
             lhs, _, rhs = c.partition(op)
+            l0 = lhs[:1]
+            r0 = rhs.lstrip()[:1]
+            if l0 != r0 and l0 != "(" and r0 != "(":
+                continue
             if (
                 lhs.count("(") == lhs.count(")")
                 and lhs.count("[") == lhs.count("]")
@@ -8952,6 +9133,38 @@ _BOOL_CONTRADICTORY_PAIRS = frozenset(
 )
 
 
+def _num_lit_key(lit: str) -> tuple[int, str]:
+    """Order-preserving comparison key of a decimal numeral (`_NUM_LIT_RE`) of any length:
+    `(significant digit count, significant digits)`. `[adv B3]` `int(lit)` raises `ValueError`
+    past `sys.get_int_max_str_digits()` (4300) digits, so `(h : 99...9 = 1)` with a long enough
+    literal crashed the scan of its whole file instead of being flagged."""
+    if not lit.isascii():
+        lit = "".join(str(int(ch)) for ch in lit)
+    digits = lit.lstrip("0")
+    return len(digits), digits
+
+
+_FLOAT_TYPE_NAMES = frozenset(("Float", "Float32"))
+
+
+def _operand_may_be_float(e: str, float_vars: frozenset[str]) -> bool:
+    """`True` iff normalized operand `e` may denote a `Float` (whose `≤` / `≥` are not reflexive:
+    `NaN ≤ NaN` is false): it mentions a `Float` binder, the type / namespace `Float` itself
+    (`Float.nan`, `(x : Float)`), or applies a `...Float` conversion or accessor to something
+    (`n.toFloat`, `asFloat x`). A lone identifier that merely contains `Float` (`numFloats`,
+    `FloatCount`, a `Nat` binder named `lenFloat`) is not one: `[adv A2]` exempted every operand
+    with the substring `Float`, so naming a variable was enough to hide `¬ n ≤ n`."""
+    if not float_vars and "Float" not in e:
+        return False
+    toks = _IDENT_EXTRACT_RE.findall(e)
+    for tok in toks:
+        if tok in float_vars or tok in _FLOAT_TYPE_NAMES:
+            return True
+        if tok != e and (tok.endswith("Float") or tok.endswith("Float32")):
+            return True
+    return False
+
+
 def _check_hypothesis_contradiction(
     hyp_expr: str,
     nat_vars: frozenset[str] = frozenset(),
@@ -8992,9 +9205,21 @@ def _check_hypothesis_contradiction(
     # `∀ hp : P, xs.length < 0`, `if c then True else n < 0`) is opaque: `_hyp_atoms` already
     # descended through every quantifier whose domain it could prove inhabited, so what is left
     # may hold vacuously, and the relation splits below would read a relation out of its body.
-    if _has_top_level_prefix_binder(h):
+    # `[adv B3]` The relation checks are pure, so they run first and the prefix-binder scan (a
+    # keyword regex over all of `h`) runs only for the rare atom they would flag: same verdict
+    # as testing the binder first, without scanning every ordinary hypothesis for keywords.
+    reason = _relation_contradiction(h, nat_vars, float_vars)
+    if reason is not None and _has_top_level_prefix_binder(h):
         return None
+    return reason
 
+
+def _relation_contradiction(
+    h: str, nat_vars: frozenset[str], float_vars: frozenset[str]
+) -> str | None:
+    """The relation checks of `_check_hypothesis_contradiction` on normalized `h`, which that
+    function has already shown has no depth-0 connective looser than `¬` and is not `False`. The
+    caller discards the verdict when a depth-0 prefix binder governs `h`."""
     # Once `_has_top_level_looser_than_not(h)` is False, a leading `¬` governs the whole expression:
     # check negated `True` / reflexive `=` / `≤` / `≥` and return without falling through to
     # positive relation checks (which would misread `¬ x :: xs = []` or `¬ x ≠ x`).
@@ -9014,11 +9239,7 @@ def _check_hypothesis_contradiction(
                         len(le_sides) == 2
                         and le_sides[0]
                         and le_sides[0] == le_sides[1]
-                        and "Float" not in le_sides[0]
-                        and (
-                            not float_vars
-                            or float_vars.isdisjoint(_IDENT_EXTRACT_RE.findall(le_sides[0]))
-                        )
+                        and not _operand_may_be_float(le_sides[0], float_vars)
                     ):
                         return f"negated reflexive `{le_op}` `{h}`"
         return None
@@ -9039,22 +9260,26 @@ def _check_hypothesis_contradiction(
 
     # Check `lhs < rhs` for `x < x`, `< 0`, or numeric `5 < 3`
     if "<" in h:
-        lt_sides = _split_top_level_pat(h, _LT_TOP_SPLIT_RE)
+        lt_sides = _split_single_depth0_op(h, "<", "<", "<=|-$*") or _split_top_level_pat(
+            h, _LT_TOP_SPLIT_RE
+        )
         if len(lt_sides) == 2:
             nl, nr = lt_sides
             if nl and nl == nr:
                 return f"irreflexive strict inequality `{h}`"
             if nr == "0" and _is_nat_like_operand(nl, nat_vars):
                 return f"vacuous `< 0` bound `{h}`"
-            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) >= int(nr):
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and _num_lit_key(nl) >= _num_lit_key(nr):
                 return f"contradictory numeric inequality `{nl} < {nr}`"
 
     # Check `lhs ≤ rhs` for numeric `5 ≤ 3`
     if "≤" in h:
-        le_sides = _split_top_level_pat(h, _LE_TOP_SPLIT_RE)
+        le_sides = _split_single_depth0_op(h, "≤", "", "") or _split_top_level_pat(
+            h, _LE_TOP_SPLIT_RE
+        )
         if len(le_sides) == 2:
             nl, nr = le_sides
-            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) > int(nr):
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and _num_lit_key(nl) > _num_lit_key(nr):
                 return f"contradictory numeric inequality `{nl} ≤ {nr}`"
 
     # Check `lhs ≥ rhs` for numeric `3 ≥ 5` (`[adv B2]`: the one relation A0-A1 never read)
@@ -9062,29 +9287,40 @@ def _check_hypothesis_contradiction(
         ge_sides = _split_top_level(h, "≥")
         if len(ge_sides) == 2:
             nl, nr = ge_sides
-            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) < int(nr):
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and _num_lit_key(nl) < _num_lit_key(nr):
                 return f"contradictory numeric inequality `{nl} ≥ {nr}`"
 
     # Check `lhs > rhs` for `x > x`, `0 > n`, or numeric `3 > 5`
     if ">" in h:
-        gt_sides = _split_top_level_pat(h, _GT_TOP_SPLIT_RE)
+        gt_sides = _split_single_depth0_op(h, ">", "->=|*$", ">=") or _split_top_level_pat(
+            h, _GT_TOP_SPLIT_RE
+        )
         if len(gt_sides) == 2:
             nl, nr = gt_sides
             if nl and nl == nr:
                 return f"irreflexive strict inequality `{h}`"
             if nl == "0" and _is_nat_like_operand(nr, nat_vars):
                 return f"vacuous `0 > ...` bound `{h}`"
-            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) <= int(nr):
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and _num_lit_key(nl) <= _num_lit_key(nr):
                 return f"contradictory numeric inequality `{nl} > {nr}`"
 
-    # Check `lhs = rhs`
-    if "=" in h:
+    # Check `lhs = rhs`. `[adv B3]` Every clash below needs a `none`, `[]`, `.inl` or `.ok` operand,
+    # both boolean literals, or numerals on both sides (so `h` starts with a digit or `(` and ends
+    # with a digit or `)`): an equation with none of these is not split at all.
+    if "=" in h and (
+        "none" in h
+        or "[]" in h
+        or ".inl" in h
+        or ".ok" in h
+        or ("true" in h and "false" in h)
+        or ((h[0] == "(" or h[0].isdecimal()) and (h[-1] == ")" or h[-1].isdecimal()))
+    ):
         eq_sides = _split_top_level_eq(h)
         if len(eq_sides) == 2:
             nl, nr = eq_sides
             if (nl, nr) in _BOOL_CONTRADICTORY_PAIRS:
                 return f"contradictory boolean equality `{nl} = {nr}`"
-            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and int(nl) != int(nr):
+            if _NUM_LIT_RE.match(nl) and _NUM_LIT_RE.match(nr) and _num_lit_key(nl) != _num_lit_key(nr):
                 return f"distinct numeric literal equality `{nl} = {nr}`"
             if (
                 nl in ("none", "Option.none")
@@ -9184,19 +9420,24 @@ def _nat_vars_before(all_hyps: list[tuple[str, str]], limit_idx: int) -> frozens
 
 
 def _quantifier_context_before(
-    all_hyps: list[tuple[str, str]], limit_idx: int
+    all_hyps: list[tuple[str, str]], limit_idx: int, need_fn_domains: bool = True
 ) -> tuple[frozenset[str], dict[str, tuple[bool, ...]]]:
     """Return `(shadowed_reserved, fn_domains)` in scope right before `all_hyps[limit_idx]`,
     tracked in telescope order: `shadowed_reserved` are reserved data/container/typeclass names
     (and `Fin`) rebound by earlier binders; `fn_domains` maps each earlier arrow-typed binder to a
-    tuple of booleans recording whether each leading domain type is unconditionally inhabited."""
+    tuple of booleans recording whether each leading domain type is unconditionally inhabited
+    (left empty when `need_fn_domains` is false: only a `∀` descent ever reads it)."""
     shadowed: set[str] = set()
     fn_domains: dict[str, tuple[bool, ...]] = {}
     for b_names, b_type in all_hyps[:limit_idx]:
         names = b_names.split()
         if not names:
             continue
-        doms = _top_level_arrow_domains(b_type) if ("→" in b_type or "->" in b_type) else []
+        doms = (
+            _top_level_arrow_domains(b_type)
+            if need_fn_domains and ("→" in b_type or "->" in b_type)
+            else []
+        )
         dom_flags = (
             tuple(_is_non_prop_binder_type(d, _NO_BOUND_NAMES, shadowed=frozenset(shadowed)) for d in doms)
             if doms
@@ -9271,7 +9512,7 @@ def _audit_lean_theorem(
         indexed_hyps = [(idx, h) for idx, h in enumerate(all_hyps) if h[0]]
         hyps = [h for _, h in indexed_hyps]
     else:
-        indexed_hyps = list(enumerate(all_hyps))
+        indexed_hyps = enumerate(all_hyps)  # consumed once, by the contradiction loop below
     findings: list[WaiverPinFinding] = []
     norm_conc = "" if contradiction_only else _norm_expr(conclusion)
     is_false_conc = (
@@ -9435,7 +9676,8 @@ def _audit_lean_theorem(
             )
 
     # 2. Check hypotheses for syntactic contradiction (`RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS`)
-    conc_head = norm_conc.split(" ", 1)[0].lstrip("(¬") if norm_conc else ""
+    conc_sp = norm_conc.find(" ")
+    conc_head = (norm_conc if conc_sp == -1 else norm_conc[:conc_sp]).lstrip("(¬")
     # `X → False` denies `X` exactly as `¬ X` does, so an arrow into `False` counts as a negation.
     has_non_eq_neg = "¬" in all_hyps_text or (
         "False" in all_hyps_text and ("→" in all_hyps_text or "->" in all_hyps_text)
@@ -9512,7 +9754,9 @@ def _audit_lean_theorem(
                     scope_binds = {}
                     if "Float" in nh:
                         q_float_vars_out = {}
-                    q_shadowed, fn_domains = _quantifier_context_before(all_hyps, orig_idx)
+                    q_shadowed, fn_domains = _quantifier_context_before(
+                        all_hyps, orig_idx, "∀" in nh or "forall" in nh
+                    )
                     _hyp_atoms(
                         nh,
                         _NO_BOUND_NAMES,
@@ -9544,7 +9788,11 @@ def _audit_lean_theorem(
                     or "False" in part
                     or "¬" in part
                 ):
-                    if hyp_nat_vars is None and "0" in part and ("<" in part or ">" in part):
+                    # `[adv B3]` `Nat` binders matter only to `... < 0` (the atom ends with `0`
+                    # or a `)` closing `(0)`) and `0 > ...` (it starts with `0` or `(`).
+                    if hyp_nat_vars is None and (
+                        ("<" in part and part[-1] in "0)") or (">" in part and part[0] in "0(")
+                    ):
                         hyp_nat_vars = _nat_vars_before(all_hyps, orig_idx)
                     part_nat_vars = hyp_nat_vars or _NO_BOUND_NAMES
                     if bound:
@@ -9592,6 +9840,10 @@ def _audit_lean_theorem(
                                 suggestion="Remove the contradictory hypothesis and prove the theorem over inhabited premises.",
                             )
                         )
+                if not any_neg:
+                    # `[adv B3]` No `¬`, `≠` or `→ False` in any hypothesis: nothing can ever be
+                    # recorded as denied, so every pos/neg intersection below is empty.
+                    continue
                 if bound and not bound.isdisjoint(_IDENT_EXTRACT_RE.findall(part)):
                     # Mentions a quantified variable: not a fact about the theorem's own context,
                     # but contradictory conjuncts in the same quantifier scope (or an outer

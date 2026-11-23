@@ -7702,5 +7702,331 @@ class TestNegationPrecedenceA2AdversarialFixes(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceB3AdversarialFixes(unittest.TestCase):
+    r"""`[adv B3]` regressions for bugs found in `[adv A2]` and earlier vacuity auditor passes:
+
+    1. Cold-scan throughput (`test_sub_5ms_runtime_benchmark` failed by 0.05 us/line after A2):
+       the C-level fast paths added here (`_SIMPLE_BINDER_MATCH`, `'`-first `_CHAR_LITERAL_RE`,
+       keyword-free `_NOKW` scanners behind `_has_binder_keyword`, `_split_single_depth0_op`) must
+       return exactly what the scans they shortcut return.
+    2. `let ` substring in the statement / proof split: an identifier ending in `let`
+       (`droplet = droplet := rfl`, `isOutlet x`, a field `s.let`) was read as a `let x := v`
+       binding, so the proof was swallowed into the statement and no conclusion check could fire.
+    3. `theorem t : A ∧ B where left := ..`: the statement ran through the depth-0 `where` to the
+       first field's `:=` (`A ∧ B where left`), hiding trivial and tautological conclusions.
+    4. `Float` NaN exemption keyed on the substring `Float`: naming a `Nat` binder `numFloats`
+       hid `¬ numFloats ≤ numFloats`.
+    5. `_untyped_binders_inhabited_by_calls` trusted any direct call: in `∀ s, E s ∧ R s ∧ False`
+       with `E : Fin 0 → Prop` the first use fixes `s : Fin 0`, so the hypothesis holds vacuously.
+    6. `int()` on source numerals: a literal longer than `sys.get_int_max_str_digits()` (4300
+       digits) raised `ValueError` out of `audit_lean_text` (`(h : 99...9 = 1)`) and out of the
+       `anneal:` directive lexer, aborting the scan of the whole file.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "nat_named_numFloats_not_le": "theorem bad (numFloats : Nat) (h : ¬ numFloats ≤ numFloats) : x = 1 := by sorry\n",
+        "nat_named_FloatCount_not_ge": "theorem bad (FloatCount : Nat) (h : ¬ FloatCount ≥ FloatCount) : x = 1 := by sorry\n",
+        "nat_binder_lenFloat_not_le": "theorem bad (lenFloat : Nat) (h : ¬ lenFloat ≤ lenFloat) : x = 1 := by sorry\n",
+        "float_binder_other_operand": "theorem bad (x : Float) (n : Nat) (h : ¬ n ≤ n) : y = 1 := by sorry\n",
+        "where_instance_false_hyp": "theorem bad (h : False) : P ∧ Q where\n  left := h.elim\n  right := h.elim\n",
+        "where_instance_dep_arrow_false": "theorem bad : (h : False) → P ∧ Q where\n  left := h.elim\n  right := h.elim\n",
+        "let_suffix_ident_false_hyp": "theorem bad (droplet : Nat) (h : False) : droplet = 1 := by sorry\n",
+        "untyped_first_use_inhabited": "theorem bad (E : Fin 0 → Prop) (R : Nat → Prop) (h : ∀ s, R s ∧ E s ∧ False) : x = 1 := by sorry\n",
+        "untyped_two_names_in_order": "theorem bad (R : Nat → Bool → Prop) (h : ∀ s t, R s t ∧ False) : x = 1 := by sorry\n",
+    }
+
+    TRIVIAL_CONCLUSION_ALL_SCOPE = {
+        "let_suffix_ident_refl": "theorem bad (droplet : Nat) : droplet = droplet := rfl\n",
+        "let_suffix_app_refl": "theorem bad (x : Nat) : isOutlet x = isOutlet x := rfl\n",
+        "let_field_refl": "theorem bad (s : S) : s.let = s.let := rfl\n",
+        "let_suffix_true": "theorem bad (outlet : Nat) : True := trivial\n",
+        "where_instance_true_and_true": "theorem bad : True ∧ True where\n  left := trivial\n  right := trivial\n",
+        "where_instance_iff_refl": "theorem bad (p : Prop) : p ↔ p where\n  mp := id\n  mpr := id\n",
+        "where_same_line_refl_and": "theorem bad (a : Nat) : a = a ∧ True where left := rfl; right := trivial\n",
+    }
+
+    TAUTOLOGY_ALL_SCOPE = {
+        "let_suffix_taut": "theorem bad (droplet P : Prop) (h : droplet ∧ P) : droplet ∧ P := h\n",
+        "where_instance_taut": "theorem bad (A B : Prop) (h : A ∧ B) : A ∧ B where\n  left := h.1\n  right := h.2\n",
+    }
+
+    CLEAN = {
+        "float_binder_not_le": "theorem ok (x : Float) (h : ¬ x ≤ x) : x.isNaN = true := by sorry\n",
+        "float_toFloat_not_le": "theorem ok (n : Nat) (h : ¬ n.toFloat ≤ n.toFloat) : P n := by sorry\n",
+        "float_namespace_nan_not_ge": "theorem ok (h : ¬ Float.nan ≥ Float.nan) : P := by sorry\n",
+        "float_accessor_app_not_le": "theorem ok (v : Vec) (h : ¬ asFloat v ≤ asFloat v) : P v := by sorry\n",
+        "float_ascription_not_le": "theorem ok (h : ¬ (0.0 / 0.0 : Float) ≤ (0.0 / 0.0 : Float)) : P := by sorry\n",
+        "untyped_first_use_empty_binder_dom": "theorem ok (E : Fin 0 → Prop) (R : Nat → Prop) (h : ∀ s, E s ∧ R s ∧ False) : P := by sorry\n",
+        "untyped_first_use_global_fn": "theorem ok (R : Nat → Prop) (h : ∀ s, Fin.elim0 s ∧ R s ∧ False) : P := by sorry\n",
+        "untyped_first_use_typevar_dom": "theorem ok (α : Type) (E : α → Prop) (R : Nat → Prop) (h : ∀ s, E s ∧ R s ∧ False) : P := by sorry\n",
+        "untyped_first_use_ascription": "theorem ok (R : Nat → Prop) (h : ∀ s, (s : Fin 0) = s ∧ R s ∧ False) : P := by sorry\n",
+        "untyped_first_use_projection": "theorem ok (R : Nat → Prop) (h : ∀ s, s.isLt ∧ R s ∧ False) : P := by sorry\n",
+        "real_let_binding_in_statement": "theorem ok : let x := 5\n  x + 0 = 5 := by simp\n",
+        "real_let_semicolon_in_statement": "theorem ok (n : Nat) : let m := n + 1; n < m := by simp\n",
+        "where_after_proof_body": "theorem ok (n : Nat) : n + 0 = n := by\n  exact aux n\nwhere\n  aux (m : Nat) : m + 0 = m := rfl\n",
+        "where_instance_nontrivial": "theorem ok (p q : Prop) (hp : p) (hq : q) : p ∧ q where\n  left := hp\n  right := hq\n",
+        "where_prefix_ident": "theorem ok (whereabouts n : Nat) (h : whereabouts = n) : n = whereabouts := h.symm\n",
+        "guillemet_where_name": "theorem ok («where» n : Nat) (h : «where» = n) : n = «where» := h.symm\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_b3_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_b3_trivial_and_tautological_conclusions_flagged_in_all_scope(self) -> None:
+        for label, src in self.TRIVIAL_CONCLUSION_ALL_SCOPE.items():
+            self.assertIn(
+                audit.RULE_TRIVIAL_CONCLUSION, _rules(audit.scan_lean_text(src)), f"missed {label}"
+            )
+        for label, src in self.TAUTOLOGY_ALL_SCOPE.items():
+            self.assertIn(
+                audit.RULE_TAUTOLOGICAL_IMPLICATION, _rules(audit.scan_lean_text(src)), f"missed {label}"
+            )
+
+    def test_b3_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        for label, src in self.CLEAN.items():
+            self.assertEqual(audit.scan_lean_text(src), [], f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_b3_statement_ends_at_where_and_ignores_let_suffixes(self) -> None:
+        split = proof_health._split_lean_theorem_header
+        self.assertEqual(
+            split(" : True ∧ True where\n  left := trivial\n  right := trivial\n", 0),
+            ([], "True ∧ True", []),
+        )
+        self.assertEqual(
+            split(" (h : A) : B ∧ (C where_x) where\n  left := f (x := 1)\n", 0),
+            ([("h", "A")], "B ∧ (C where_x)", []),
+        )
+        self.assertEqual(split(" (droplet : Nat) : droplet = droplet := rfl\n", 0)[1], "droplet = droplet")
+        self.assertEqual(split(" : isOutlet x = y := by simp [h := 1]\n", 0)[1], "isOutlet x = y")
+        self.assertEqual(split(" : s.let = t := rfl\n", 0)[1], "s.let = t")
+        self.assertEqual(split(" : let' = t := rfl\n", 0)[1], "let' = t")
+        # A real `let` binding still keeps its own `:=` inside the statement.
+        self.assertEqual(split(" : let x := 5\n  x + 0 = 5 := by simp\n", 0)[1], "let x := 5\n  x + 0 = 5")
+        self.assertEqual(split(" : droplet = (let y := 1; y) := rfl\n", 0)[1], "droplet = (let y := 1; y)")
+
+    def test_b3_helper_invariants(self) -> None:
+        may_float = proof_health._operand_may_be_float
+        none: frozenset[str] = frozenset()
+        for yes, fv in (
+            ("x", frozenset({"x"})),
+            ("x + 1", frozenset({"x"})),
+            ("Float.nan", none),
+            ("n.toFloat", none),
+            ("asFloat v", none),
+            ("x.toFloat32", none),
+            ("0.0 / 0.0 : Float", none),
+        ):
+            self.assertTrue(may_float(yes, fv), yes)
+        for no, fv in (
+            ("numFloats", none),
+            ("FloatCount", none),
+            ("lenFloat", none),
+            ("n", frozenset({"x"})),
+            ("xs.length", none),
+            ("isFloatLike n", none),
+        ):
+            self.assertFalse(may_float(no, fv), no)
+
+        first = proof_health._first_standalone_use
+        self.assertEqual(first("R s ∧ E s", "s"), 2)
+        self.assertEqual(first("xs.s ∧ s' ∧ ss ∧ R s", "s"), 19)
+        self.assertEqual(first("s.val < 1 ∧ R s", "s"), 0)
+        self.assertEqual(first("R t", "s"), -1)
+
+        inhab = proof_health._untyped_binders_inhabited_by_calls
+        doms = {"R": (True,), "E": (False,)}
+        self.assertTrue(inhab({"s"}, "R s ∧ E s ∧ False", doms, frozenset({"s"})))
+        self.assertFalse(inhab({"s"}, "E s ∧ R s ∧ False", doms, frozenset({"s"})))
+        self.assertFalse(inhab({"s"}, "g s ∧ R s ∧ False", doms, frozenset({"s"})))
+        self.assertFalse(inhab({"s", "t"}, "R s ∧ E t ∧ R t ∧ False", doms, frozenset({"s", "t"})))
+
+    def test_b3_fast_paths_agree_with_the_scans_they_shortcut(self) -> None:
+        import re
+
+        ph = proof_health
+        texts = [
+            "decodeScalar sz bs = some (v, rest) → rest.length < bs.length → (∀ x, ok x = true) → enc v ++ rest = bs",
+            "bs.length = n + List.length (encode x) → ∃ y, decode bs = some y",
+            "(∀ i < n, f i = g i) → if c then a else b",
+            "x' = y'' → c = 'a' → f «weird := name» → ⟨a, b⟩ = p → show P by simp",
+            "shift_left has_bytes fun_ext letters matched iff exists! forall? by' x.by h.if _fun funx 1by ∀by",
+            "c = '(' ∧ d = ')' ∧ e = '\\'' ∧ f = '→' ∨ g = h' ↔ k'' = 'x'",
+            "f <| g $ h <|> k |> m ↔ a <-> b -> c ∧ d ∨ e /\\ f \\/ g",
+            "by", "(by simp)", "a.fun b", "fun", "if", "'match", "show.", "have\n", "λfun", "let", "outlet let'",
+            "exists", "forall", "?by", "!if c", "x.let", "match x with | _ => y", "",
+        ]
+        kw_alt = re.compile(ph._BINDER_KEYWORD_ALT)
+        old_char_lit = re.compile(r"(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'")
+        old_kw = r"(?<![\w'.!?])(?:forall|exists|fun|if|match|let|have|show|by)(?![\w'!?])"
+        old_scanners = (
+            (
+                ph._ARROW_SCAN_RE,
+                ph._ARROW_SCAN_NOKW_RE,
+                r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[(){}\[\]⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∀|∃|λ|" + old_kw,
+            ),
+            (
+                ph._TOP_LEVEL_LOOSER_THAN_NOT_RE,
+                ph._TOP_LEVEL_LOOSER_THAN_NOT_NOKW_RE,
+                r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|<\|>|<\||\$|→|->|∨|\\/|∧|/\\|∀|∃|λ|" + old_kw,
+            ),
+            (
+                ph._CONJ_TOP_BOUND_RE,
+                ph._CONJ_TOP_BOUND_NOKW_RE,
+                r"«[^»]*»|[()\[\]{}⟨⟩⦃⦄]|↔|<->|→|->|<\|>|<\||\|>|\$|∨|\\/|∀|∃|λ|" + old_kw,
+            ),
+            (
+                ph._TOP_BOUND_RE,
+                ph._TOP_BOUND_NOKW_RE,
+                r"«[^»]*»|(?<![\w'.!?])'(?:\\[^\n]{1,8}?|[^\\'\n])'|[()\[\]{}⟨⟩⦃⦄]|"
+                r"↔|→|->|<\|>|<\||\|>|\$|∨|∃|∀|λ|"
+                r"(?<![\w'.!?])(?:fun|forall|exists|if|match|let|have|show|by)(?![\w'!?])",
+            ),
+        )
+
+        def tokens(pat: "re.Pattern[str]", text: str) -> list[tuple[int, str]]:
+            return [(m.start(), m.group(0)) for m in pat.finditer(text)]
+
+        for text in texts:
+            has_kw = kw_alt.search(text) is not None
+            self.assertEqual(ph._has_binder_keyword(text), has_kw, text)
+            self.assertEqual(
+                ph._has_prefix_binder_hint(text), has_kw or any(c in text for c in "∀∃λ"), text
+            )
+            self.assertEqual(
+                [m.span() for m in ph._CHAR_LITERAL_RE.finditer(text)],
+                [m.span() for m in old_char_lit.finditer(text)],
+                text,
+            )
+            for q in range(len(text)):
+                self.assertEqual(
+                    ph._CHAR_LITERAL_RE.match(text, q) is None, old_char_lit.match(text, q) is None, (text, q)
+                )
+            for full, nokw, old_src in old_scanners:
+                self.assertEqual(tokens(full, text), tokens(re.compile(old_src), text), text)
+                if not has_kw:
+                    self.assertEqual(tokens(nokw, text), tokens(full, text), text)
+
+        exprs = [
+            "a = b", "f (g x) (h (k y)) = z", "f (g (h (k x))) = z", "a ) ( = b", "(a = b", "a] = [b",
+            "«x = y» = z", "f «a(b» = c", "a == b", "a != b", "x := 1", "a <= b", "a >= b", "a = b = c",
+            "(a = b) = c", "a = (b = c)", "f ⟨a, b⟩ {c} [d] ⦃e⦄ = g", "xs.length < 0", "a << b", "a <| b",
+            "a <- b", "a <$> b", "a <*> b", "f (x < y) < z", "a < b < c", "0 > n", "a -> b", "a >= b",
+            "a >> b", "a => b", "a |> f", "a *> b", "a $> b", "f (a > b) > c", "a ≤ b", "f (a ≤ b) ≤ c",
+            "a ≤ b ≤ c", "", "=", "<", ">", "≤", "= a", "a =", "(((a))) = (b)", "a = b)", "a\n  = b",
+        ]
+        for e in exprs:
+            self.assertEqual(ph._split_top_level_eq(e), ph._split_top_level_pat(e, ph._STANDALONE_EQ_SPLIT_RE), e)
+            for op, not_before, not_after, pat in (
+                ("=", "=!<>:", "=", ph._STANDALONE_EQ_SPLIT_RE),
+                ("<", "<", "<=|-$*", ph._LT_TOP_SPLIT_RE),
+                ("≤", "", "", ph._LE_TOP_SPLIT_RE),
+                (">", "->=|*$", ">=", ph._GT_TOP_SPLIT_RE),
+            ):
+                fast = ph._split_single_depth0_op(e, op, not_before, not_after)
+                if fast is not None:
+                    self.assertEqual(fast, ph._split_top_level_pat(e, pat), (op, e))
+
+        headers = [
+            " (x : Nat) {y : Int} [inst : Foo α] (h : x = 1) : P x := by simp",
+            " (x y : Nat)(h : f (g x) = y) {z : Fin (n + 1)} : P := by simp",
+            " {f (a : Nat) : T} (x := 5) (h : c = ')') [Foo] (g : (a : Nat) → T) bare : P := rfl",
+            " ( : T) (x : ) (a b\n  : List Nat)\n  (h :\n    a = b)\n  : P := rfl",
+            " (x] : Nat) {y) : Nat} [z} : Nat] (w ⦃ : Nat) (h' : P) (k : c = 'a') : Q := rfl",
+            " (x : A ∧ {y // p y}) {z : B → [C]} [w : D (E)] ⦃v : F⦄ (u :: U) (t :=: T) : Q := rfl",
+            " (x : Nat",
+        ]
+        never = {key: (lambda *args: None) for key in ph._SIMPLE_BINDER_MATCH}
+        for header in headers:
+            fast_parse = ph._split_lean_theorem_header(header, 0)
+            with patch.dict(ph._SIMPLE_BINDER_MATCH, never):
+                self.assertEqual(ph._split_lean_theorem_header(header, 0), fast_parse, header)
+
+    def test_b3_long_numerals_are_compared_not_crashed_on(self) -> None:
+        # `int()` raises past 4300 digits: one long literal used to abort the whole file's scan.
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        big = "9" * 5000
+        for label, hyp in (
+            ("eq", f"{big} = 1"),
+            ("eq_leading_zeros", f"{'0' * 5000}1 = 2"),
+            ("lt", f"{big} < 1"),
+            ("lt_equal", f"{big} < {big}0".replace(f"{big}0", big)),
+            ("le", f"{big}0 ≤ {big}"),
+            ("ge", f"1 ≥ {big}"),
+            ("gt", f"1 > {big}"),
+        ):
+            src = f"theorem bad (h : {hyp}) : x = 1 := by sorry\n"
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+        for label, hyp in (
+            ("eq_same_value", f"{'0' * 5000}7 = 7"),
+            ("lt_true", f"1 < {big}"),
+            ("le_true", f"{big} ≤ {big}0"),
+            ("ge_true", f"{big}0 ≥ {big}"),
+            ("gt_true", f"{big} > 1"),
+        ):
+            src = f"theorem ok (h : {hyp}) : P := by sorry\n"
+            self.assertEqual(audit.scan_lean_text(src), [], f"flagged {label}")
+        key = proof_health._num_lit_key
+        self.assertEqual(key("0007"), key("7"))
+        self.assertEqual(key("000"), key("0"))
+        self.assertLess(key("9"), key("10"))
+        self.assertLess(key("٣"), key("12"))  # `\d` admits non-ASCII decimal digits, as `int()` does
+        self.assertEqual(key("٣٤"), key("34"))
+        # The `anneal:` directive lexer rejects an out-of-range integer instead of raising.
+        toks, err = proof_health._lex_spec_tokens(f"width == {big}")
+        self.assertEqual(toks, [])
+        self.assertIn("too large", err)
+        toks, err = proof_health._lex_spec_tokens(f"width == {'0' * 5000}42")
+        self.assertEqual(err, "")
+        self.assertEqual(toks[-1], ("Int", 42))
+        self.assertIn("too large", proof_health._lex_spec_tokens("width == 340282366920938463463374607431768211456")[1])
+        self.assertEqual(
+            proof_health._lex_spec_tokens("width == 340282366920938463463374607431768211455")[0][-1],
+            ("Int", (1 << 128) - 1),
+        )
+
+    def test_b3_fast_path_regexes_stay_linear(self) -> None:
+        n = 40000
+        hostile = (
+            "(" * n + " = x",
+            "(a" * n + " = x",
+            ")(" * n + " = x",
+            "(a (b" * (n // 2) + ")" + " < 0",
+            "x" * n + " = " + "(" * n,
+        )
+        t0 = time.process_time()
+        for expr in hostile:
+            proof_health._split_top_level_eq(expr)
+            proof_health._split_single_depth0_op(expr, "<", "<", "<=|-$*")
+            proof_health._has_binder_keyword("by" * n + expr)
+            self.assertIsNone(proof_health._SIMPLE_BINDER_MATCH["("]("(" + "a b " * n, 0))
+            self.assertEqual(audit.scan_lean_text(f"theorem ok (h : {expr}) : P := by sorry\n"), [])
+        elapsed = time.process_time() - t0
+        self.assertLess(elapsed, 3.0, f"fast-path regex blow-up: {elapsed:.2f}s")
+
+    def test_check_trusted_agrees_on_every_b3_header(self) -> None:
+        ct = _load_check_trusted()
+        all_cases = {
+            **self.VACUOUS_BOTH_SCOPES,
+            **self.TRIVIAL_CONCLUSION_ALL_SCOPE,
+            **self.TAUTOLOGY_ALL_SCOPE,
+            **self.CLEAN,
+        }
+        for label, src in all_cases.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
