@@ -1238,6 +1238,32 @@ fn ref_target_and_depth(ty: &Type) -> (usize, &Type) {
     }
 }
 
+/// Whether `target`, a type that [`ref_target_and_depth`] stripped of its
+/// leading shared references, certainly is not a reference type itself, so
+/// that the depth counted in front of it is the depth of the whole type.
+///
+/// `_`, `impl Trait`, an associated type (`Self::Out`, `<T as Trait>::Out`),
+/// and a macro can each stand for a reference type: `let rr: &_ = &r1;` with
+/// `r1: &u32` declares a `&&u32` that holds the address of `r1`, whereas a
+/// deref coercion to `&u32` would hold the address of `r1`'s referent. A
+/// single-segment path names a primitive, a struct, or the `Self` of a
+/// struct's `impl`; the type aliases and generic parameters that could also
+/// hide a reference are rejected with the items that declare them (`type`
+/// items, and generic functions, methods, and `impl`s).
+fn ref_depth_is_exact(target: &Type) -> bool {
+    match target {
+        Type::Path(tp) => tp.qself.is_none() && tp.path.segments.len() == 1,
+        Type::Array(_)
+        | Type::BareFn(_)
+        | Type::Never(_)
+        | Type::Ptr(_)
+        | Type::Slice(_)
+        | Type::TraitObject(_)
+        | Type::Tuple(_) => true,
+        _ => false,
+    }
+}
+
 fn eval_ty_of(ty: &Type) -> EvalTy {
     match ty {
         Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
@@ -1255,13 +1281,16 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         Type::Group(g) => eval_ty_of(&g.elem),
         Type::Reference(r) if r.mutability.is_none() => {
             let (depth, target) = ref_target_and_depth(ty);
-            // Reject `&mut` nested inside `&`, and reject multi-bound or
-            // qualified trait-object references (such as `&(dyn Trait + Send)`
-            // or `&&(dyn Trait + Send)`) rather than stripping `dyn` into `Ref`
-            // and mis-dispatching to an inherent method.
-            if matches!(target, Type::Reference(_)) {
+            // Reject `&mut` nested inside `&`, and a target that may itself
+            // be a reference (`&_`, `&impl Trait`, `&Self::Out`): its depth is
+            // unknown, so whether a deeper value deref-coerces to it is too.
+            if !ref_depth_is_exact(target) {
                 return EvalTy::Named(quote!(#ty).to_string());
             }
+            // Reject multi-bound or qualified trait-object references (such
+            // as `&(dyn Trait + Send)` or `&&(dyn Trait + Send)`) rather than
+            // stripping `dyn` into `Ref` and mis-dispatching to an inherent
+            // method.
             if is_trait_object_type(target) {
                 if depth == 1
                     && let Some(tr) = dyn_trait_name(target)
@@ -1277,7 +1306,9 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         }
         Type::Ptr(p) if p.mutability.is_none() => {
             let (inner_ref_depth, target) = ref_target_and_depth(&p.elem);
-            if matches!(target, Type::Reference(_)) {
+            // Likewise `*const &mut T` and a pointee of unknown depth
+            // (`*const _`).
+            if !ref_depth_is_exact(target) {
                 return EvalTy::Named(quote!(#ty).to_string());
             }
             EvalTy::ConstPtr(1 + inner_ref_depth)
@@ -2147,7 +2178,9 @@ impl ItreeConcreteRun {
 /// (`#[anneal_trace::external]`) callees with their little-endian arguments and
 /// returns, honoring an [`EnvSchedule`] exactly like `EnvSchedule::next_action`
 /// (FIFO responses, defaults, `PanicOnCall`, pass-through). Constructs outside
-/// the subset make [`Self::run`] return `Err` rather than guess.
+/// the subset make [`Self::run`] return `Err` rather than guess, except for a
+/// deref or reference-to-raw-pointer coercion at a site without a type
+/// annotation, which the evaluator cannot see (`EvalRun::eval_coerce`).
 pub struct ItreeConcreteEvaluator {
     file: File,
     root_fn_name: String,
@@ -2547,6 +2580,19 @@ impl<'a> EvalRun<'a> {
         }
     }
 
+    /// Coerce `v` to `ty`, the declared type of a `let`, parameter, struct
+    /// field, array element, or return value, resolving the struct and trait
+    /// names of `ty` in `frame` (at the top level when `frame` is `None`).
+    ///
+    /// Only these annotated sites coerce. Rust also coerces where no
+    /// annotation says to what: at an assignment, where the arms of an `if` /
+    /// `match` or the elements of an array literal unify, and at a closure
+    /// whose signature comes from its expected type. [`TraitMethodCensus`]
+    /// accounts for a reference that such a site unsizes to `&dyn Trait`. A
+    /// deref coercion (`&&T` to `&T`) or a reference-to-raw-pointer coercion
+    /// at such a site is neither modeled nor detected, so a candidate has to
+    /// give a nested reference or a raw pointer its type at a `let`,
+    /// parameter, field, return, or `as` cast.
     fn eval_coerce(
         &self,
         frame: Option<&EvalFrame<'a>>,
@@ -2574,6 +2620,13 @@ impl<'a> EvalRun<'a> {
                 Ok(EvalValue::Ref(peel_ref_layers(r, *expected_depth)?))
             }
             (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                // `&&T` unsizes to `&dyn Trait` only through an
+                // `impl Trait for &T`, whose vtable the evaluator does not
+                // index, so a nested reference is rejected rather than
+                // auto-dereferenced to `T`'s vtable.
+                if eval_ref_depth(&r) != 1 {
+                    return eval_unsupported("trait-object coercion of a nested reference");
+                }
                 let trait_id = match frame {
                     Some(frame) => self.resolve_trait(frame, tr)?,
                     None => {
@@ -3318,6 +3371,11 @@ impl<'a> EvalRun<'a> {
                 // Safe trait-object unsizing (`&T as &dyn Trait`): records the
                 // vtable's principal trait while preserving referent & address.
                 (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                    // A nested reference has no modeled vtable (see
+                    // `eval_coerce`).
+                    if eval_ref_depth(&r) != 1 {
+                        return eval_unsupported("trait-object cast of a nested reference");
+                    }
                     let trait_id = self.resolve_trait(frame, &tr)?;
                     let mut inner = r.autoderef();
                     inner.dyn_trait = Some(trait_id);
@@ -6318,6 +6376,53 @@ mod tests {
              pub fn probe(a: u32, b: u32) -> u32 {
                 renamed(a) ^ first(b)
             }",
+            // `&_` is inferred as `&&u32`, so `rr` holds the address of `r1`
+            // (the comparison is false natively): no deref coercion shortens
+            // it to the address of `x`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let rr: &_ = &r1;
+                if core::ptr::addr_eq(rr, r1) { 1u32 } else { 2u32 }
+            }",
+            // Likewise `*const _` is inferred as `*const &u32`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let p: *const _ = &r1;
+                if core::ptr::addr_eq(p, r1) { 1u32 } else { 2u32 }
+            }",
+            // Likewise `&impl Sized` stands for `&&u32` in this call.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn same(o: &impl Sized, p: &u32) -> bool { core::ptr::addr_eq(o, p) }
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                if same(&r1, r1) { 1u32 } else { 2u32 }
+            }",
+            // `&&Both` unsizes to `&dyn Left` through `impl Left for &Both`
+            // (native Rust calls `<&Both as Left>::pick`), a vtable that the
+            // evaluator does not index, so it must not auto-dereference the
+            // nested reference to the vtable of `Both`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                impl Left for &Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let r: &Both = &both;
+                let nested: &dyn Left = &r;
+                nested.pick() ^ b
+            }",
+            // The same unsizing through an `as` cast.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                impl Left for &Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let r: &Both = &both;
+                (&r as &dyn Left).pick() ^ b
+            }",
         ];
         for probe in rejected {
             let source = format!("{probe}\n{ROOT}");
@@ -6325,6 +6430,47 @@ mod tests {
             assert!(
                 ev.run_kernel_step(0x414E_4E4C, 2048, &empty, "").is_err(),
                 "evaluator must reject:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_ty_of_counts_reference_depth_only_in_front_of_a_known_target() {
+        let ty_of = |src: &str| -> EvalTy {
+            let ty: Type = syn::parse_str(src).expect("parse type");
+            eval_ty_of(&ty)
+        };
+        // The depth that `eval_coerce` deref-coerces a deeper reference to.
+        assert_eq!(ty_of("&u32"), EvalTy::Ref(1));
+        assert_eq!(ty_of("&&u32"), EvalTy::Ref(2));
+        assert_eq!(ty_of("&[u32]"), EvalTy::Ref(1));
+        assert_eq!(ty_of("&(&u32)"), EvalTy::Ref(2));
+        assert_eq!(ty_of("&dyn Left"), EvalTy::DynRef("Left".to_string()));
+        assert_eq!(ty_of("&&dyn Left"), EvalTy::Ref(2));
+        assert_eq!(ty_of("*const u32"), EvalTy::ConstPtr(1));
+        assert_eq!(ty_of("*const &u32"), EvalTy::ConstPtr(2));
+        assert_eq!(ty_of("*const ()"), EvalTy::ConstPtr(1));
+        assert_eq!(ty_of("*const [u32]"), EvalTy::ConstPtr(1));
+        // A target that may itself be a reference has no known depth, and
+        // neither `&mut` nor a multi-bound trait object is modeled.
+        for unknown in [
+            "&_",
+            "&&_",
+            "*const _",
+            "*const &_",
+            "&impl Sized",
+            "*const impl Sized",
+            "&Self::Out",
+            "&<Unit as Carrier>::Out",
+            "*const Self::Out",
+            "&mut u32",
+            "&&mut u32",
+            "*const &mut u32",
+            "&(dyn Left + Send)",
+        ] {
+            assert!(
+                matches!(ty_of(unknown), EvalTy::Named(_)),
+                "`{unknown}` must not be given a reference depth"
             );
         }
     }
