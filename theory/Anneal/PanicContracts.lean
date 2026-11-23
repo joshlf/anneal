@@ -98,7 +98,9 @@ state when a panic may happen, when it must happen, and that every execution
    `ReachableCalleesCallSitesPreserved`, the single-hop helper-chain guard
    `HelperChainCallBoundaryPreserved`, and the arbitrary-length chain guard
    `CallChainCallBoundaryPreserved`. The `Callees*` guards inspect `callees`
-   only and do not look at the caller.
+   only and do not look at the caller. The chain guards follow hops through
+   `findCallee?`, so they hold as intended only with
+   `ChainHopsNotTraitDispatched`.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
    `ExactPass`, plus cross-effect value-outcome `ExactPass` adequacy
    (`exactPass_erase_of_same_unique_outcome`).
@@ -8682,6 +8684,11 @@ Arbitrary-length CFG-reachable call-chain boundary guard: generalizes both
 `callerBody -> h₁ -> ... -> hₖ -> targetDefPath`, requiring every intermediate
 hop to be CFG-reachable and linked in `callees` while excluding `targetDefPath`
 from both `callees` and `traitImpls`.
+
+Each hop is followed through `findCallee?`. At run time `lookupCallee` consults
+the trait-implementation table first for a call with type arguments, so a hop
+dispatched by a `TraitImplEntry` may run a different body from the one checked
+here. Pair this guard with `ChainHopsNotTraitDispatched`.
 -/
 structure CallChainCallBoundaryPreserved (callerBody : CapturedMir)
     (callees : List CapturedMir) (helperChain : List DefPath)
@@ -8794,6 +8801,35 @@ theorem not_callChainCallBoundaryPreserved_of_missing_hop
   obtain ⟨_, hF, _⟩ := h.chain.2
   rw [hMiss] at hF
   nomatch hF
+
+/--
+No hop of `helperChain` is dispatched by a trait implementation of the caller or
+of a linked body, so `lookupCallee` cannot redirect a hop to a body other than
+the one `ReachableCallChain` follows.
+-/
+def ChainHopsNotTraitDispatched (callerBody : CapturedMir) (callees : List CapturedMir)
+    (helperChain : List DefPath) : Prop :=
+  ∀ hPath, hPath ∈ helperChain →
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees) hPath = false
+
+/-- Checker for `ChainHopsNotTraitDispatched`. -/
+def chainHopsNotTraitDispatched (callerBody : CapturedMir) (callees : List CapturedMir)
+    (helperChain : List DefPath) : Bool :=
+  helperChain.all fun hPath =>
+    !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees) hPath
+
+/-- The checker decides `ChainHopsNotTraitDispatched`. -/
+theorem chainHopsNotTraitDispatched_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperChain : List DefPath) :
+    chainHopsNotTraitDispatched callerBody callees helperChain = true ↔
+      ChainHopsNotTraitDispatched callerBody callees helperChain := by
+  unfold chainHopsNotTraitDispatched ChainHopsNotTraitDispatched
+  simp only [List.all_eq_true, Bool.not_eq_true']
+
+/-- An empty chain has no hop to dispatch. -/
+theorem chainHopsNotTraitDispatched_nil (callerBody : CapturedMir)
+    (callees : List CapturedMir) : ChainHopsNotTraitDispatched callerBody callees [] :=
+  fun _ hMem => nomatch hMem
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 

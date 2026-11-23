@@ -5613,6 +5613,74 @@ theorem alwaysPanic_panicsIf_infiniteLoop_not_panicsIf :
     rw [infiniteLoopMir_eq_spin []] at hr
     exact not_reachesRet_spin tr (.panic : MirOutcome) hr
 
+/-! ### Trait-dispatched hops in a call chain -/
+
+def dispatchHelperPath : DefPath := "panic_tests::Dispatch::helper"
+def dispatchEvilPath : DefPath := "panic_tests::dispatch_evil_impl"
+
+/-- The helper the chain guard checks: it calls `checked_add_u8`. -/
+def dispatchHelperMir : CapturedMir :=
+  mkBody dispatchHelperPath 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/-- The body the trait implementation dispatches to: `checked_add_u8` inlined. -/
+def dispatchEvilMir : CapturedMir :=
+  checkedAddMir dispatchEvilPath u8Ty u8CheckedTy .continue_
+
+/-- A trait implementation that dispatches the helper path to `dispatchEvilMir`. -/
+def dispatchImpl : TraitImplEntry :=
+  { traitRef := { defPath := dispatchHelperPath, args := [.uint .u8] },
+    implPath := dispatchEvilPath }
+
+/-- A caller that calls the helper with a type argument and carries `dispatchImpl`. -/
+def dispatchCallerMir : CapturedMir :=
+  { mkBody "panic_tests::dispatch_caller" 2
+      [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty ]
+      [ { statements := []
+          terminator :=
+            mkTerm (.call (fnItemOp dispatchHelperPath [.uint .u8])
+              [.copy (local_ 1), .copy (local_ 2)] (local_ 0) (.some 1) .continue_)
+          isCleanup := false }
+      , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+    with traitImpls := [dispatchImpl] }
+
+def dispatchCallees : List CapturedMir := [dispatchHelperMir, dispatchEvilMir]
+
+/--
+`CallChainCallBoundaryPreserved` follows the helper path through `findCallee?`
+to `dispatchHelperMir`, which calls `checked_add_u8`, and accepts the chain. At
+run time `lookupCallee` dispatches the same path through `dispatchImpl` to
+`dispatchEvilMir`, where `checked_add_u8` is inlined, so the boundary is gone.
+`ChainHopsNotTraitDispatched` rejects the chain.
+-/
+theorem dispatchCaller_chain_guard_vs_runtime (args : List Value) :
+    CallChainCallBoundaryPreserved dispatchCallerMir dispatchCallees [dispatchHelperPath]
+        checkedAddU8Path ∧
+      findCallee? dispatchCallees dispatchHelperPath = .some dispatchHelperMir ∧
+      lookupCallee (initMachineStateWithCallees dispatchCallerMir args dispatchCallees).memory.callees
+          emptyLayoutTable dispatchHelperPath [.uint .u8]
+          (initMachineStateWithCallees dispatchCallerMir args dispatchCallees).memory.traitImpls =
+        .some dispatchEvilMir ∧
+      bodyCallsDefPath checkedAddU8Path dispatchEvilMir = false ∧
+      ¬ ChainHopsNotTraitDispatched dispatchCallerMir dispatchCallees [dispatchHelperPath] := by
+  refine ⟨(callChainCallBoundaryPreserved_iff _ _ _ _).1 rfl, rfl, rfl, rfl, fun h => ?_⟩
+  have hT := (chainHopsNotTraitDispatched_iff _ _ _).2 h
+  rw [show chainHopsNotTraitDispatched dispatchCallerMir dispatchCallees [dispatchHelperPath] =
+    false from rfl] at hT
+  nomatch hT
+
+/-- On a chain without trait dispatch both guards hold. -/
+theorem outerCaller_chain_not_traitDispatched :
+    ChainHopsNotTraitDispatched outerCallerMir [midHelperMir] [midHelperPath] :=
+  (chainHopsNotTraitDispatched_iff _ _ _).1 rfl
+
+
 /-! ## 7. Bundle -/
 
 /--
@@ -5817,7 +5885,9 @@ theorem all_panic_contracts_tests :
     (type_of% @ubOnTwo_to_definedOnTwo_not_exactPass) ∧
     (type_of% @ubOnTwo_nonExact_pass_variance_transfers) ∧
     (type_of% @alwaysPanic_to_infiniteLoop_compilerPass) ∧
-    (type_of% @alwaysPanic_panicsIf_infiniteLoop_not_panicsIf) :=
+    (type_of% @alwaysPanic_panicsIf_infiniteLoop_not_panicsIf) ∧
+    (type_of% @dispatchCaller_chain_guard_vs_runtime) ∧
+    (type_of% @outerCaller_chain_not_traitDispatched) :=
   ⟨@checkedAddU8_wp,
     @checkedAddU32_wp,
     @checkedDivU8_wp,
@@ -6014,7 +6084,9 @@ theorem all_panic_contracts_tests :
     @ubOnTwo_to_definedOnTwo_not_exactPass,
     @ubOnTwo_nonExact_pass_variance_transfers,
     @alwaysPanic_to_infiniteLoop_compilerPass,
-    @alwaysPanic_panicsIf_infiniteLoop_not_panicsIf⟩
+    @alwaysPanic_panicsIf_infiniteLoop_not_panicsIf,
+    @dispatchCaller_chain_guard_vs_runtime,
+    @outerCaller_chain_not_traitDispatched⟩
 
 /--
 info: 'Anneal.PanicContractsTests.all_panic_contracts_tests' depends on axioms: [propext, Classical.choice, Quot.sound]
