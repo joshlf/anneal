@@ -184,8 +184,13 @@ def natZeroName : SymName := ofList ["Nat", "zero"]
 def natSuccName : SymName := ofList ["Nat", "succ"]
 def natAddName : SymName := ofList ["Nat", "add"]
 def stringName : SymName := mkSimple "String"
+def boolName : SymName := mkSimple "Bool"
+def boolFalseName : SymName := ofList ["Bool", "false"]
+def boolTrueName : SymName := ofList ["Bool", "true"]
 def eqName : SymName := mkSimple "Eq"
 def eqReflName : SymName := ofList ["Eq", "refl"]
+def eqBoolName : SymName := mkSimple "EqBool"
+def eqBoolReflName : SymName := ofList ["EqBool", "refl"]
 def verificationResultName : SymName :=
   ofList ["Trusted", "VerificationResult", "VerificationResult"]
 
@@ -299,6 +304,11 @@ inductive AuditFailure where
   | privateFlagMismatch (modName ciName : SymName)
   | closureFuelExhausted (rootName pendingName : SymName)
   | unsupportedSourceLexing (modName : SymName) (detail : String)
+  | duplicateModuleName (modName : SymName)
+  | cyclicDependency (ciName dep : SymName)
+  | invalidNativeAxiomType (rootName axName : SymName)
+  | testModuleForeignAxiom (modName rootName axName axOrigin : SymName)
+  | reservedOriginMissingSibling (modName ciName claimedOrigin : SymName)
   deriving DecidableEq, Repr
 
 namespace ExprSkeleton
@@ -623,6 +633,7 @@ structure ModuleInventory where
 structure AuditConfig where
   allowAssumptions : Bool := false
   allowProvisionalNative : Bool := false
+  allowLocalTestAxioms : Bool := false
   enforceStrictProofs : Bool := true
   kernelFuel : Nat := 128
   deriving DecidableEq, Repr, Inhabited
@@ -705,6 +716,7 @@ inductive ScanState where
   | sawDash
   | sawSlash
   | sawLt
+  | sawBacktick
   | sawR
   | sawRHash (hashes : Nat)
   | inLine
@@ -714,7 +726,7 @@ inductive ScanState where
   | inBlockDash (depth : Nat)
   | inString
   | inStringEsc
-  | inHole (depth : Nat)
+  | inHole (depth : Nat) (prevIdent : Bool)
   | inHoleDash (depth : Nat)
   | inHoleSlash (depth : Nat)
   | inRaw (hashes : Nat)
@@ -729,12 +741,14 @@ inductive ScanState where
 /--
 Code-mode transition. `prevIdent` records whether the previous character belongs to an identifier:
 only then is `'` an identifier character (otherwise it opens a char literal), and only at a token
-start can `r` open a raw string.
+start can `r` open a raw string. Backtick opens a Lean `Name` literal (`Lean/Parser/Basic.lean`
+line 1036 `nameLitAux`), so `` `r `` is an identifier, not a raw-string prefix.
 -/
 def stepCode (prevIdent : Bool) (rev : List Char) (c : Char) : ScanState × List Char :=
   if c == '-' then (.sawDash, rev)
   else if c == '/' then (.sawSlash, rev)
   else if c == '<' then (.sawLt, rev)
+  else if c == '`' then (.sawBacktick, rev)
   else if c == '"' then (.inString, ' ' :: rev)
   else if c == '«' then (.inGuillemet, ' ' :: rev)
   else if c == '\'' then
@@ -756,16 +770,22 @@ def stepBlock (depth : Nat) (rev : List Char) (c : Char) : ScanState × List Cha
 
 /--
 Interpolation-hole transition. Hole contents are code, so they are kept visible; a hole containing
-a quote, backslash, or comment opener could desynchronise the string boundary and fails closed.
+a quote, backslash, guillemet (`«`/`»`), or comment opener could desynchronise the string boundary
+and fails closed. A prime continuing an identifier inside a hole (`s!"{x'}"`) stays in identifier
+mode rather than failing closed as a char literal.
 -/
-def stepHole (depth : Nat) (rev : List Char) (c : Char) : ScanState × List Char :=
-  if c == '{' then (.inHole (depth + 1), ' ' :: rev)
+def stepHole (depth : Nat) (prevIdent : Bool) (rev : List Char) (c : Char) : ScanState × List Char :=
+  if c == '{' then (.inHole (depth + 1) false, ' ' :: rev)
   else if c == '}' then
-    if Nat.ble depth 1 then (.inString, ' ' :: rev) else (.inHole (depth - 1), ' ' :: rev)
-  else if c == '"' || c == '\'' || c == '\\' then (.lexError, rev)
+    if Nat.ble depth 1 then (.inString, ' ' :: rev) else (.inHole (depth - 1) false, ' ' :: rev)
+  else if c == '"' || c == '\\' || c == '«' || c == '»' then (.lexError, rev)
+  else if c == '\'' then
+    if prevIdent then (.inHole depth true, c :: rev) else (.lexError, rev)
   else if c == '-' then (.inHoleDash depth, rev)
   else if c == '/' then (.inHoleSlash depth, rev)
-  else (.inHole depth, c :: rev)
+  else
+    let nextIdent := if prevIdent then isIdRestChar c else isIdFirstChar c
+    (.inHole depth nextIdent, c :: rev)
 
 /-- Advance the stripper by one character (accumulating reversed output). -/
 def stripStepOne (acc : ScanState × List Char) (c : Char) : ScanState × List Char :=
@@ -787,6 +807,10 @@ def stripStepOne (acc : ScanState × List Char) (c : Char) : ScanState × List C
     if c == '-' then (.blockOpen, ' ' :: ' ' :: rev) else stepCode false ('/' :: rev) c
   | .sawLt =>
     if c == '-' then (.normal, '-' :: '<' :: rev) else stepCode false ('<' :: rev) c
+  | .sawBacktick =>
+    if c == '«' then (.inGuillemet, '`' :: rev)
+    else if isIdFirstChar c then (.inIdent, c :: '`' :: rev)
+    else stepCode false ('`' :: rev) c
   | .sawR =>
     if c == '"' then (.inRaw 0, ' ' :: ' ' :: rev)
     else if c == '#' then (.sawRHash 1, rev)
@@ -809,15 +833,15 @@ def stripStepOne (acc : ScanState × List Char) (c : Char) : ScanState × List C
   | .inString =>
     if c == '\\' then (.inStringEsc, ' ' :: rev)
     else if c == '"' then (.normal, ' ' :: rev)
-    else if c == '{' then (.inHole 1, ' ' :: rev)
+    else if c == '{' then (.inHole 1 false, ' ' :: rev)
     else if c == '\n' then (.inString, '\n' :: rev)
     else (.inString, ' ' :: rev)
   | .inStringEsc => (.inString, ' ' :: rev)
-  | .inHole depth => stepHole depth rev c
+  | .inHole depth prevIdent => stepHole depth prevIdent rev c
   | .inHoleDash depth =>
-    if c == '-' then (.lexError, rev) else stepHole depth ('-' :: rev) c
+    if c == '-' then (.lexError, rev) else stepHole depth false ('-' :: rev) c
   | .inHoleSlash depth =>
-    if c == '-' then (.lexError, rev) else stepHole depth ('/' :: rev) c
+    if c == '-' then (.lexError, rev) else stepHole depth false ('/' :: rev) c
   | .inRaw n =>
     if c == '"' then
       if n == 0 then (.normal, ' ' :: rev) else (.rawClose n 0, ' ' :: rev)
@@ -853,14 +877,15 @@ def flushPending (st : ScanState) (rev : List Char) : List Char :=
   | .sawDash => '-' :: rev
   | .sawSlash => '/' :: rev
   | .sawLt => '<' :: rev
+  | .sawBacktick => '`' :: rev
   | .sawR => 'r' :: rev
   | .sawRHash n => List.replicate n '#' ++ ('r' :: rev)
   | _ => rev
 
 /-- True iff the input ended in code or a line comment (every literal and block comment closed). -/
 def lexTerminalOk : ScanState → Bool
-  | .normal | .inIdent | .identDot | .afterGuillemet | .sawDash | .sawSlash | .sawLt | .sawR
-  | .sawRHash _ | .inLine => true
+  | .normal | .inIdent | .identDot | .afterGuillemet | .sawDash | .sawSlash | .sawLt
+  | .sawBacktick | .sawR | .sawRHash _ | .inLine => true
   | _ => false
 
 /-- Diagnostic for a rejected end-of-input lexer state. -/
@@ -914,6 +939,24 @@ def hasAdjacentPairChars (a b : List Char) : List (List Char) → Bool
 def hasAdjacentPair (a b : String) (toks : List String) : Bool :=
   hasAdjacentPairChars a.toList b.toList (toks.map String.toList)
 
+/-- Extract the last dot-separated segment of a character-list token (e.g. `_root_.Lean.ofReduceBool` ↦ `ofReduceBool`). -/
+def lastDotSegment (tok : List Char) : List Char :=
+  (tok.foldl (fun cur c => if c == '.' then [] else c :: cur) []).reverse
+
+/--
+Deprecated in-kernel reduction and compiler-trust symbols that are ALWAYS forbidden in source
+text (even under `--provisional`), matched by final dot-separated segment so `_root_.Lean.*`
+qualifications cannot evade detection.
+-/
+def alwaysForbiddenNativeLeafTokens : List (List Char) := [
+  "ofReduceBool".toList,
+  "ofReduceNat".toList,
+  "trustCompiler".toList,
+  "reduceBool".toList,
+  "reduceNat".toList,
+  "nativeEqTrue".toList
+]
+
 /-- Tokens that by themselves select native evaluation or the deprecated in-kernel reduction axioms. -/
 def nativeTokens : List (List Char) := [
   "native_decide".toList, "bv_decide".toList,
@@ -924,15 +967,25 @@ def nativeTokens : List (List Char) := [
   "Lean.reduceNat".toList, "reduceNat".toList
 ]
 
+/-- True iff `toks` directly references a deprecated in-kernel reduction or compiler-trust symbol. -/
+def hasAlwaysForbiddenNativeChars (toks : List (List Char)) : Bool :=
+  toks.any fun t => alwaysForbiddenNativeLeafTokens.contains (lastDotSegment t)
+
 /--
-Scan stripped tokens for native evaluation: any `nativeTokens` entry, or a `decide` tactic together
-with a `native` token anywhere in the file (`decide +native`, `decide+native`, a `native := true`
-field arbitrarily deep in a `config` record, or a config record defined before the tactic).
+Scan stripped tokens for native evaluation: any `alwaysForbiddenNativeLeafTokens` suffix, any
+`native_decide` / `bv_decide` tactic, or a `decide` tactic together with a `native` token anywhere
+in the file (`decide +native`, `decide+native`, a `native := true` field arbitrarily deep in a
+`config` record, or a config record defined before the tactic).
 -/
 def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
-  toks.any (fun t => nativeTokens.contains t) ||
-  (toks.any (fun t => t == "decide".toList || t == "decide!".toList) &&
-    toks.contains "native".toList)
+  hasAlwaysForbiddenNativeChars toks ||
+  toks.any (fun t =>
+    let leaf := lastDotSegment t
+    leaf == "native_decide".toList || leaf == "bv_decide".toList) ||
+  (toks.any (fun t =>
+      let leaf := lastDotSegment t
+      leaf == "decide".toList || leaf == "decide!".toList) &&
+    toks.any (fun t => lastDotSegment t == "native".toList))
 
 /-- Scan stripped source tokens for native evaluation (see `hasNativeDecideTokensChars`). -/
 def hasNativeDecideTokens (toks : List String) : Bool :=
@@ -955,6 +1008,8 @@ def scanSourceChars (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     throw (.forbiddenSourceOption modName "hygiene false")
   if hasAdjacentPairChars "quotPrecheck".toList "false".toList toks then
     throw (.forbiddenSourceOption modName "quotPrecheck false")
+  if hasAlwaysForbiddenNativeChars toks then
+    throw (.forbiddenSourceOption modName "native_decide/decide +native")
   let allowModProvisional := cfg.allowProvisionalNative && role == .proof
   if !allowModProvisional && hasNativeDecideTokensChars toks then
     throw (.forbiddenSourceOption modName "native_decide/decide +native")
@@ -3907,6 +3962,294 @@ theorem replayCleanEnv_contains_decl {env env' : KernelEnv} {fuel : Nat} {allowA
         | tail _ htl =>
           exact hrest ci htl
 
+/--
+True iff every constant directly required to kernel-check `ci` is already present in `env`.
+Used by `replayCleanEnvOrdered` to replay real `.olean` inventories listed in arbitrary hash-map
+order rather than source/topological order.
+-/
+def declDepsReady (env : KernelEnv) (ci : ConstantRecord) : Bool :=
+  let typeOk := ci.type.usedConstants.all env.contains
+  let valOk := match ci.value? with
+    | some v => v.usedConstants.all env.contains
+    | none => true
+  let kindOk := match ci.kind with
+    | .ctorDecl p => env.contains p
+    | .recDecl rules =>
+      ci.all.all env.contains &&
+      rules.all fun r => env.contains r.ctor && r.rhs.usedConstants.all env.contains
+    | .quotDecl =>
+      if ci.name == SymName.quotName then env.contains SymName.natName
+      else if ci.name == SymName.quotMkName then
+        env.contains SymName.quotName && env.contains SymName.natName
+      else if ci.name == SymName.quotLiftName || ci.name == SymName.quotIndName then
+        env.contains SymName.quotName && env.contains SymName.eqName
+      else true
+    | _ => true
+  typeOk && valOk && kindOk
+
+/--
+One pass of dependency-ordered clean-environment replay: kernel-check every ready declaration in
+`pending` via `kernelCheckDecl`, deferring declarations whose dependencies have not yet been added.
+-/
+def replayReadyPass (fuel : Nat) (allowAxiom : ConstantRecord → Bool) :
+    KernelEnv → List ConstantRecord → List ConstantRecord → Bool →
+    Except AuditFailure (KernelEnv × List ConstantRecord × Bool)
+  | env, [], deferred, progressed => .ok (env, deferred.reverse, progressed)
+  | env, d :: rest, deferred, progressed =>
+    if declDepsReady env d then
+      match kernelCheckDecl env fuel (allowAxiom d) d with
+      | .error e => .error e
+      | .ok env' => replayReadyPass fuel allowAxiom env' rest deferred true
+    else
+      replayReadyPass fuel allowAxiom env rest (d :: deferred) progressed
+
+/-- Diagnose why no remaining declaration in `remaining` could make progress (missing dep vs. cycle). -/
+def diagnoseReplayStuck (env : KernelEnv) (remaining : List ConstantRecord) : AuditFailure :=
+  match remaining with
+  | [] => .kernelReplayMissingDep .anonymous .anonymous
+  | d :: _ =>
+    let remNames := remaining.map ConstantRecord.name
+    let directDeps :=
+      d.type.usedConstants ++
+      (match d.value? with | some v => v.usedConstants | none => []) ++
+      (match d.kind with
+       | .ctorDecl p => [p]
+       | .recDecl rules => d.all ++ rules.flatMap (fun r => r.ctor :: r.rhs.usedConstants)
+       | .quotDecl =>
+         if d.name == SymName.quotName then [SymName.natName]
+         else if d.name == SymName.quotMkName then [SymName.quotName, SymName.natName]
+         else if d.name == SymName.quotLiftName || d.name == SymName.quotIndName then
+           [SymName.quotName, SymName.eqName]
+         else []
+       | _ => [])
+    match directDeps.find? (fun c => !env.contains c) with
+    | some m =>
+      if remNames.contains m then .cyclicDependency d.name m
+      else .unknownConstant m
+    | none => .cyclicDependency d.name d.name
+
+/-- Iterated fixpoint loop for dependency-ordered clean-environment replay. -/
+def replayOrderedLoop (kFuel : Nat) (allowAxiom : ConstantRecord → Bool) :
+    Nat → KernelEnv → List ConstantRecord → Except AuditFailure KernelEnv
+  | _, env, [] => .ok env
+  | 0, env, remaining => .error (diagnoseReplayStuck env remaining)
+  | rounds + 1, env, pending =>
+    match replayReadyPass kFuel allowAxiom env pending [] false with
+    | .error e => .error e
+    | .ok (env', remaining, progressed) =>
+      if remaining.isEmpty then .ok env'
+      else if !progressed then .error (diagnoseReplayStuck env' remaining)
+      else replayOrderedLoop kFuel allowAxiom rounds env' remaining
+
+/--
+Dependency-ordered clean-environment kernel replay (`replayCleanEnvOrdered`):
+replays `decls` in any valid topological order (matching Lean `.olean` hash-map serialization),
+enforcing a per-declaration `allowAxiom` predicate and rejecting cyclic or missing dependencies.
+-/
+def replayCleanEnvOrdered (env : KernelEnv) (kFuel : Nat)
+    (allowAxiom : ConstantRecord → Bool) (decls : List ConstantRecord) :
+    Except AuditFailure KernelEnv :=
+  replayOrderedLoop kFuel allowAxiom (decls.length + 1) env decls
+
+/-- `replayReadyPass` preserves `EnvSound` whenever `allowAxiom` admits no axioms. -/
+theorem replayReadyPass_preserves_sound {kFuel : Nat} :
+    ∀ (pending deferred : List ConstantRecord) (prog : Bool)
+      {env env' : KernelEnv} {M : SymName → SemVal} {rem : List ConstantRecord} {prog' : Bool},
+      EnvSound env M →
+      replayReadyPass kFuel (fun _ => false) env pending deferred prog = .ok (env', rem, prog') →
+      ∃ M' : SymName → SemVal, EnvSound env' M' := by
+  intro pending
+  induction pending with
+  | nil =>
+    intro deferred prog env env' M rem prog' henv hpass
+    simp only [replayReadyPass, Except.ok.injEq, Prod.mk.injEq] at hpass
+    rcases hpass with ⟨rfl, _, _⟩
+    exact ⟨M, henv⟩
+  | cons d rest ih =>
+    intro deferred prog env env' M rem prog' henv hpass
+    simp only [replayReadyPass] at hpass
+    cases hready : declDepsReady env d with
+    | false =>
+      rw [hready] at hpass
+      simp only [Bool.false_eq_true, ↓reduceIte] at hpass
+      exact ih (d :: deferred) prog henv hpass
+    | true =>
+      rw [hready] at hpass
+      simp only [↓reduceIte] at hpass
+      cases hk : kernelCheckDecl env kFuel false d with
+      | error _ => rw [hk] at hpass; cases hpass
+      | ok env1 =>
+        rw [hk] at hpass
+        rcases kernelCheckDecl_preserves_sound henv kFuel d hk with ⟨M1, hM1⟩
+        exact ih deferred true hM1 hpass
+
+/-- `replayOrderedLoop` preserves `EnvSound` whenever `allowAxiom` admits no axioms. -/
+theorem replayOrderedLoop_preserves_sound {kFuel : Nat} :
+    ∀ (rounds : Nat) {env env' : KernelEnv} {M : SymName → SemVal} {pending : List ConstantRecord},
+      EnvSound env M →
+      replayOrderedLoop kFuel (fun _ => false) rounds env pending = .ok env' →
+      ∃ M' : SymName → SemVal, EnvSound env' M' := by
+  intro rounds
+  induction rounds with
+  | zero =>
+    intro env env' M pending henv hloop
+    cases pending with
+    | nil =>
+      simp only [replayOrderedLoop, Except.ok.injEq] at hloop
+      subst hloop; exact ⟨M, henv⟩
+    | cons _ _ =>
+      simp only [replayOrderedLoop] at hloop; cases hloop
+  | succ r ih =>
+    intro env env' M pending henv hloop
+    cases pending with
+    | nil =>
+      simp only [replayOrderedLoop, Except.ok.injEq] at hloop
+      subst hloop; exact ⟨M, henv⟩
+    | cons d rest =>
+      simp only [replayOrderedLoop] at hloop
+      cases hpass : replayReadyPass kFuel (fun _ => false) env (d :: rest) [] false with
+      | error _ => rw [hpass] at hloop; cases hloop
+      | ok triple =>
+        rcases triple with ⟨env1, rem, prog⟩
+        rw [hpass] at hloop
+        dsimp only at hloop
+        rcases replayReadyPass_preserves_sound (d :: rest) [] false henv hpass with ⟨M1, hM1⟩
+        split at hloop
+        · injection hloop with heq; subst heq; exact ⟨M1, hM1⟩
+        · split at hloop
+          · cases hloop
+          · exact ih hM1 hloop
+
+/-- Dependency-ordered clean-env replay preserves semantic soundness (`EnvSound`). -/
+theorem replayCleanEnvOrdered_preserves_sound {env env' : KernelEnv} {M : SymName → SemVal}
+    (henv : EnvSound env M) (kFuel : Nat) (decls : List ConstantRecord)
+    (hrep : replayCleanEnvOrdered env kFuel (fun _ => false) decls = .ok env') :
+    ∃ M' : SymName → SemVal, EnvSound env' M' :=
+  replayOrderedLoop_preserves_sound (decls.length + 1) henv hrep
+
+/-- Monotonicity and partition completeness of `replayReadyPass`. -/
+theorem replayReadyPass_contains_decl {kFuel : Nat} {allowAxiom : ConstantRecord → Bool} :
+    ∀ (pending deferred : List ConstantRecord) (prog : Bool)
+      {env env' : KernelEnv} {rem : List ConstantRecord} {prog' : Bool},
+      replayReadyPass kFuel allowAxiom env pending deferred prog = .ok (env', rem, prog') →
+      (∀ n ci, env.lookup n = some ci → env'.lookup n = some ci) ∧
+      (∀ ci ∈ deferred, ci ∈ rem) ∧
+      (∀ ci ∈ pending, env'.lookup ci.name = some ci ∨ ci ∈ rem) := by
+  intro pending
+  induction pending with
+  | nil =>
+    intro deferred prog env env' rem prog' hpass
+    simp only [replayReadyPass, Except.ok.injEq, Prod.mk.injEq] at hpass
+    rcases hpass with ⟨rfl, rfl, _⟩
+    exact ⟨fun _ _ h => h, fun ci hci => List.mem_reverse.mpr hci, fun _ h => by cases h⟩
+  | cons d rest ih =>
+    intro deferred prog env env' rem prog' hpass
+    simp only [replayReadyPass] at hpass
+    cases hready : declDepsReady env d with
+    | false =>
+      rw [hready] at hpass
+      simp only [Bool.false_eq_true, ↓reduceIte] at hpass
+      obtain ⟨hmono, hdef, hrest⟩ := ih (d :: deferred) prog hpass
+      refine ⟨hmono, fun ci hci => hdef ci (List.mem_cons_of_mem _ hci), ?_⟩
+      intro ci hci
+      cases hci with
+      | head => exact Or.inr (hdef d List.mem_cons_self)
+      | tail _ htl => exact hrest ci htl
+    | true =>
+      rw [hready] at hpass
+      simp only [↓reduceIte] at hpass
+      cases hk : kernelCheckDecl env kFuel (allowAxiom d) d with
+      | error _ => rw [hk] at hpass; cases hpass
+      | ok env1 =>
+        rw [hk] at hpass
+        have ⟨henv1, hfresh⟩ := kernelCheckDecl_env_eq hk
+        obtain ⟨hmono, hdef, hrest⟩ := ih deferred true hpass
+        refine ⟨?_, hdef, ?_⟩
+        · intro n ci hlu
+          apply hmono
+          rw [henv1]
+          have hne : d.name ≠ n := by
+            intro heq; subst heq
+            simp [KernelEnv.contains, hlu] at hfresh
+          rw [KernelEnv.lookup_insert_ne _ _ _ _ hne]
+          exact hlu
+        · intro ci hci
+          cases hci with
+          | head =>
+            exact Or.inl (hmono d.name d (by rw [henv1, KernelEnv.lookup_insert_self]))
+          | tail _ htl => exact hrest ci htl
+
+/-- Every declaration submitted to `replayOrderedLoop` resides in the output environment at `ci.name`. -/
+theorem replayOrderedLoop_contains_decl {kFuel : Nat} {allowAxiom : ConstantRecord → Bool} :
+    ∀ (rounds : Nat) {env env' : KernelEnv} {pending : List ConstantRecord},
+      replayOrderedLoop kFuel allowAxiom rounds env pending = .ok env' →
+      (∀ n ci, env.lookup n = some ci → env'.lookup n = some ci) ∧
+      (∀ ci ∈ pending, env'.lookup ci.name = some ci) := by
+  intro rounds
+  induction rounds with
+  | zero =>
+    intro env env' pending hloop
+    cases pending with
+    | nil =>
+      simp only [replayOrderedLoop, Except.ok.injEq] at hloop
+      subst hloop
+      exact ⟨fun _ _ h => h, fun _ hc => by cases hc⟩
+    | cons _ _ => simp only [replayOrderedLoop] at hloop; cases hloop
+  | succ r ih =>
+    intro env env' pending hloop
+    cases pending with
+    | nil =>
+      simp only [replayOrderedLoop, Except.ok.injEq] at hloop
+      subst hloop
+      exact ⟨fun _ _ h => h, fun _ hc => by cases hc⟩
+    | cons d rest =>
+      simp only [replayOrderedLoop] at hloop
+      cases hpass : replayReadyPass kFuel allowAxiom env (d :: rest) [] false with
+      | error _ => rw [hpass] at hloop; cases hloop
+      | ok triple =>
+        rcases triple with ⟨env1, rem, prog⟩
+        rw [hpass] at hloop; dsimp only at hloop
+        obtain ⟨hmono1, _, hpart⟩ := replayReadyPass_contains_decl (d :: rest) [] false hpass
+        split at hloop
+        · rename_i hremEmpty
+          injection hloop with heq; subst heq
+          have hremNil : rem = [] := by
+            cases rem with
+            | nil => rfl
+            | cons _ _ => simp at hremEmpty
+          subst hremNil
+          refine ⟨hmono1, fun ci hci => ?_⟩
+          rcases hpart ci hci with h1 | h2
+          · exact h1
+          · cases h2
+        · split at hloop
+          · cases hloop
+          · obtain ⟨hmono2, hrem⟩ := ih hloop
+            refine ⟨fun n ci hlu => hmono2 n ci (hmono1 n ci hlu), fun ci hci => ?_⟩
+            rcases hpart ci hci with h1 | h2
+            · exact hmono2 ci.name ci h1
+            · exact hrem ci h2
+
+/-- Every declaration added during `replayCleanEnvOrdered` is present in `env'` at its own name. -/
+theorem replayCleanEnvOrdered_contains_decl {env env' : KernelEnv} {kFuel : Nat}
+    {allowAxiom : ConstantRecord → Bool} {decls : List ConstantRecord}
+    (hrep : replayCleanEnvOrdered env kFuel allowAxiom decls = .ok env') :
+    (∀ n ci, env.lookup n = some ci → env'.lookup n = some ci) ∧
+    (∀ ci ∈ decls, env'.lookup ci.name = some ci) :=
+  replayOrderedLoop_contains_decl (decls.length + 1) hrep
+
+/--
+Structural type-shape check for compiler-generated `._native.*` evaluation axioms
+(`Lean/Meta/Native.lean` line 75: `@Eq Bool e Bool.true` with closed `e`).
+Prevents `--provisional` from admitting an arbitrary `axiom Proof.X._native.ax_1 : False`.
+-/
+def isValidNativeAxiomType (ty : ExprSkeleton) : Bool :=
+  match ty with
+  | .app (.app (.const eqNm) lhs) (.const rhsNm) =>
+    eqNm == SymName.eqBoolName && rhsNm == SymName.boolTrueName &&
+    !ExprSkeleton.hasOpenVars lhs
+  | _ => false
+
 /-- Core Semantic Consistency Corollary: no constant in a sound `KernelEnv` can have type `False`. -/
 theorem kernelEnv_no_false {env : KernelEnv} {M : SymName → SemVal}
     (henv : EnvSound env M) :
@@ -3982,6 +4325,28 @@ def baseStringDecl : ConstantRecord := {
   originModule := SymName.ofList ["Init", "Prelude"]
 }
 
+def baseBoolDecl : ConstantRecord := {
+  name := SymName.boolName
+  kind := .inductDecl [SymName.boolFalseName, SymName.boolTrueName]
+  type := .sort 1
+  all := [SymName.boolName]
+  originModule := SymName.ofList ["Init", "Prelude"]
+}
+
+def baseBoolFalseDecl : ConstantRecord := {
+  name := SymName.boolFalseName
+  kind := .ctorDecl SymName.boolName
+  type := .const SymName.boolName
+  originModule := SymName.ofList ["Init", "Prelude"]
+}
+
+def baseBoolTrueDecl : ConstantRecord := {
+  name := SymName.boolTrueName
+  kind := .ctorDecl SymName.boolName
+  type := .const SymName.boolName
+  originModule := SymName.ofList ["Init", "Prelude"]
+}
+
 def baseEqDecl : ConstantRecord := {
   name := SymName.eqName
   kind := .inductDecl [SymName.eqReflName]
@@ -3995,6 +4360,22 @@ def baseEqReflDecl : ConstantRecord := {
   name := SymName.eqReflName
   kind := .ctorDecl SymName.eqName
   type := .forallE (.const SymName.natName) (.app (.app (.const SymName.eqName) (.bvar 0)) (.bvar 0))
+  originModule := SymName.ofList ["Init", "Prelude"]
+}
+
+def baseEqBoolDecl : ConstantRecord := {
+  name := SymName.eqBoolName
+  kind := .inductDecl [SymName.eqBoolReflName]
+  type := ExprSkeleton.arrow (.const SymName.boolName)
+    (ExprSkeleton.arrow (.const SymName.boolName) (.sort 0))
+  all := [SymName.eqBoolName]
+  originModule := SymName.ofList ["Init", "Prelude"]
+}
+
+def baseEqBoolReflDecl : ConstantRecord := {
+  name := SymName.eqBoolReflName
+  kind := .ctorDecl SymName.eqBoolName
+  type := .forallE (.const SymName.boolName) (.app (.app (.const SymName.eqBoolName) (.bvar 0)) (.bvar 0))
   originModule := SymName.ofList ["Init", "Prelude"]
 }
 
@@ -4051,8 +4432,13 @@ def standardBaseDecls : List ConstantRecord := [
   baseNatSuccDecl,
   baseNatAddDecl,
   baseStringDecl,
+  baseBoolDecl,
+  baseBoolFalseDecl,
+  baseBoolTrueDecl,
   baseEqDecl,
   baseEqReflDecl,
+  baseEqBoolDecl,
+  baseEqBoolReflDecl,
   basePropextDecl,
   baseQuotSoundDecl,
   baseClassicalChoiceDecl,
@@ -4080,10 +4466,17 @@ noncomputable def standardBaseModel (n : SymName) : SemVal :=
     semLam (.ty Nat (fun k => .base SymName.natName k))
       (fun (_ : Nat) => semLam (.ty Nat (fun k => .base SymName.natName k)) (fun (m : Nat) => .base SymName.natName m))
   else if n == SymName.stringName then .ty String (fun s => .strVal s)
+  else if n == SymName.boolName then .ty (Fin 2) (fun i => .base SymName.boolName i.val)
+  else if n == SymName.boolFalseName then .base SymName.boolName 0
+  else if n == SymName.boolTrueName then .base SymName.boolName 1
   else if n == SymName.eqName then
     semLam (.ty Nat (fun k => .base SymName.natName k))
       (fun (a : Nat) => semLam (.ty Nat (fun k => .base SymName.natName k)) (fun (b : Nat) => .prop (a = b)))
   else if n == SymName.eqReflName then .prf
+  else if n == SymName.eqBoolName then
+    semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val))
+      (fun (a : Fin 2) => semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun (b : Fin 2) => .prop (a = b)))
+  else if n == SymName.eqBoolReflName then .prf
   else if n == SymName.propextName then .prf
   else if n == SymName.quotSoundName then .prf
   else if n == SymName.classicalChoiceName then .prf
@@ -4104,6 +4497,20 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName, SymName.natAddName,
       SymName.mkSimple, SymName.ofList]
   have hStrInj : Function.Injective SemVal.strVal := by intro a b h; cases h; rfl
+  have hBoolTy : standardBaseModel SymName.boolName = .ty (Fin 2) (fun i => .base SymName.boolName i.val) := by
+    simp [standardBaseModel, SymName.boolName, SymName.stringName, SymName.falseName, SymName.trueName,
+      SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName, SymName.natAddName,
+      SymName.mkSimple, SymName.ofList]
+  have hBoolInj : Function.Injective (fun i : Fin 2 => SemVal.base SymName.boolName i.val) := by
+    intro a b h; injection h with _ hv; exact Fin.ext hv
+  have hBoolFalse : standardBaseModel SymName.boolFalseName = .base SymName.boolName 0 := by
+    simp [standardBaseModel, SymName.boolFalseName, SymName.boolName, SymName.stringName, SymName.falseName,
+      SymName.trueName, SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
+      SymName.natAddName, SymName.mkSimple, SymName.ofList]
+  have hBoolTrue : standardBaseModel SymName.boolTrueName = .base SymName.boolName 1 := by
+    simp [standardBaseModel, SymName.boolTrueName, SymName.boolFalseName, SymName.boolName, SymName.stringName,
+      SymName.falseName, SymName.trueName, SymName.trueIntroName, SymName.natName, SymName.natZeroName,
+      SymName.natSuccName, SymName.natAddName, SymName.mkSimple, SymName.ofList]
   have hFalseTy : standardBaseModel SymName.falseName = .prop False := by
     simp [standardBaseModel]
   have hTrueTy : standardBaseModel SymName.trueName = .prop True := by
@@ -4129,38 +4536,58 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
         (fun (a : Nat) => semLam (.ty Nat (fun k => .base SymName.natName k)) (fun (b : Nat) => .prop (a = b))) := by
     simp [standardBaseModel, SymName.eqName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.mkSimple, SymName.ofList]
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.mkSimple, SymName.ofList]
   have hEqRefl : standardBaseModel SymName.eqReflName = .prf := by
     simp [standardBaseModel, SymName.eqReflName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.eqName, SymName.mkSimple, SymName.ofList]
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.mkSimple, SymName.ofList]
+  have hEqBoolVal : standardBaseModel SymName.eqBoolName =
+      semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val))
+        (fun (a : Fin 2) => semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun (b : Fin 2) => .prop (a = b))) := by
+    simp [standardBaseModel, SymName.eqBoolName, SymName.falseName, SymName.trueName,
+      SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.mkSimple, SymName.ofList]
+  have hEqBoolRefl : standardBaseModel SymName.eqBoolReflName = .prf := by
+    simp [standardBaseModel, SymName.eqBoolReflName, SymName.eqBoolName, SymName.falseName, SymName.trueName,
+      SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.mkSimple, SymName.ofList]
   have hPropext : standardBaseModel SymName.propextName = .prf := by
     simp [standardBaseModel, SymName.propextName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.eqName, SymName.eqReflName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.eqBoolName, SymName.eqBoolReflName,
       SymName.mkSimple, SymName.ofList]
   have hQuotSound : standardBaseModel SymName.quotSoundName = .prf := by
     simp [standardBaseModel, SymName.quotSoundName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.eqName, SymName.eqReflName, SymName.propextName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.eqBoolName, SymName.eqBoolReflName, SymName.propextName,
       SymName.mkSimple, SymName.ofList]
   have hChoice : standardBaseModel SymName.classicalChoiceName = .prf := by
     simp [standardBaseModel, SymName.classicalChoiceName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.eqName, SymName.eqReflName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.eqBoolName, SymName.eqBoolReflName,
       SymName.propextName, SymName.quotSoundName, SymName.mkSimple, SymName.ofList]
   have hVR : standardBaseModel SymName.verificationResultName =
       semLam (.ty Nat (fun k => .base SymName.natName k)) (fun (_ : Nat) => .prop True) := by
     simp [standardBaseModel, SymName.verificationResultName, SymName.falseName, SymName.trueName,
       SymName.trueIntroName, SymName.natName, SymName.natZeroName, SymName.natSuccName,
-      SymName.natAddName, SymName.stringName, SymName.eqName, SymName.eqReflName,
+      SymName.natAddName, SymName.stringName, SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.eqBoolName, SymName.eqBoolReflName,
       SymName.propextName, SymName.quotSoundName, SymName.classicalChoiceName,
       SymName.mkSimple, SymName.ofList]
   have hVRMk : standardBaseModel verificationResultMkName = .prf := by
     simp [standardBaseModel, verificationResultMkName, SymName.verificationResultName,
       SymName.falseName, SymName.trueName, SymName.trueIntroName, SymName.natName,
       SymName.natZeroName, SymName.natSuccName, SymName.natAddName, SymName.stringName,
-      SymName.eqName, SymName.eqReflName, SymName.propextName, SymName.quotSoundName,
+      SymName.boolName, SymName.boolFalseName, SymName.boolTrueName,
+      SymName.eqName, SymName.eqReflName, SymName.eqBoolName, SymName.eqBoolReflName,
+      SymName.propextName, SymName.quotSoundName,
       SymName.classicalChoiceName, SymName.mkSimple, SymName.ofList]
   have hLookupCases : ∀ n ci, standardBaseEnv.lookup n = some ci →
       (n = SymName.falseName ∧ ci = baseFalseDecl) ∨
@@ -4171,8 +4598,13 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
       (n = SymName.natSuccName ∧ ci = baseNatSuccDecl) ∨
       (n = SymName.natAddName ∧ ci = baseNatAddDecl) ∨
       (n = SymName.stringName ∧ ci = baseStringDecl) ∨
+      (n = SymName.boolName ∧ ci = baseBoolDecl) ∨
+      (n = SymName.boolFalseName ∧ ci = baseBoolFalseDecl) ∨
+      (n = SymName.boolTrueName ∧ ci = baseBoolTrueDecl) ∨
       (n = SymName.eqName ∧ ci = baseEqDecl) ∨
       (n = SymName.eqReflName ∧ ci = baseEqReflDecl) ∨
+      (n = SymName.eqBoolName ∧ ci = baseEqBoolDecl) ∨
+      (n = SymName.eqBoolReflName ∧ ci = baseEqBoolReflDecl) ∨
       (n = SymName.propextName ∧ ci = basePropextDecl) ∨
       (n = SymName.quotSoundName ∧ ci = baseQuotSoundDecl) ∨
       (n = SymName.classicalChoiceName ∧ ci = baseClassicalChoiceDecl) ∨
@@ -4195,6 +4627,7 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
     const_sound := by
       intro n ci hlu
       rcases hLookupCases n ci hlu with
+        ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
@@ -4225,6 +4658,12 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
           exact semLam_inhabits_semPi (fun _ => hNatInj) (fun m => ⟨m, rfl⟩)
       · refine ⟨rfl, by decide, by intro c hc; simp [baseStringDecl, ExprSkeleton.usedConstants] at hc, ?_⟩
         simp only [baseStringDecl, evalExpr, hStrTy, Inhabits]; exact Or.inr (Or.inr ⟨String, _, hStrInj, rfl⟩)
+      · refine ⟨rfl, by decide, by intro c hc; simp [baseBoolDecl, ExprSkeleton.usedConstants] at hc, ?_⟩
+        simp only [baseBoolDecl, evalExpr, hBoolTy, Inhabits]; exact Or.inr (Or.inr ⟨Fin 2, _, hBoolInj, rfl⟩)
+      · refine ⟨rfl, by decide, by intro c hc; simp [baseBoolFalseDecl, ExprSkeleton.usedConstants] at hc; subst hc; decide, ?_⟩
+        simp only [baseBoolFalseDecl, evalExpr, hBoolFalse, hBoolTy, Inhabits]; exact ⟨⟨0, by decide⟩, rfl⟩
+      · refine ⟨rfl, by decide, by intro c hc; simp [baseBoolTrueDecl, ExprSkeleton.usedConstants] at hc; subst hc; decide, ?_⟩
+        simp only [baseBoolTrueDecl, evalExpr, hBoolTrue, hBoolTy, Inhabits]; exact ⟨⟨1, by decide⟩, rfl⟩
       · refine ⟨rfl, by decide, by intro c hc; simp [baseEqDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, ExprSkeleton.usedConstants] at hc; rcases hc with rfl | rfl <;> decide, ?_⟩
         simp only [baseEqDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, evalExpr, hEqVal]
         apply semLam_inhabits_semPi
@@ -4262,6 +4701,43 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
           rfl
         simp only [baseEqReflDecl, evalExpr, hEqRefl, hEqVal]
         exact hEqBody (standardBaseModel SymName.natName) hNatTy
+      · refine ⟨rfl, by decide, by intro c hc; simp [baseEqBoolDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, ExprSkeleton.usedConstants] at hc; rcases hc with rfl | rfl <;> decide, ?_⟩
+        simp only [baseEqBoolDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, evalExpr, hEqBoolVal]
+        apply semLam_inhabits_semPi
+        · intro _
+          have hpi := semPi_inhabits_sort (u := 1) (v := 1)
+            (domV := .ty (Fin 2) (fun i => .base SymName.boolName i.val))
+            (bodyFn := fun _ => .propSort)
+            (Or.inr (Or.inr ⟨Fin 2, _, hBoolInj, rfl⟩))
+            (fun _ => Or.inl rfl)
+          exact inhabits_sort_implies_isSemType (u := 1) hpi
+        · intro a
+          exact semLam_inhabits_semPi (fun _ => trivial) (fun b => ⟨a = b, rfl⟩)
+      · refine ⟨rfl, by decide, by intro c hc; simp [baseEqBoolReflDecl, ExprSkeleton.usedConstants] at hc; rcases hc with rfl | rfl <;> decide, ?_⟩
+        have hEqBBody : ∀ (bt : SemVal), bt = .ty (Fin 2) (fun i => .base SymName.boolName i.val) →
+            Inhabits .prf
+              (semPi bt (fun a =>
+                semApp (semApp (semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val))
+                  (fun (x : Fin 2) => semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun (y : Fin 2) => .prop (x = y))))
+                  (bt.decode a)) (bt.decode a))) := by
+          intro bt hbt; subst hbt
+          dsimp only [SemVal.decode]
+          have hstep : ∀ a : Fin 2,
+              semApp (semApp (semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val))
+                (fun (x : Fin 2) => semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun (y : Fin 2) => .prop (x = y))))
+                (.base SymName.boolName a.val)) (.base SymName.boolName a.val) = .prop (a = a) := by
+            intro a
+            have h1 := semApp_semLam (domV := .ty (Fin 2) (fun i => .base SymName.boolName i.val)) hBoolInj
+              (fun (x : Fin 2) => semLam (.ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun (y : Fin 2) => .prop (x = y))) a
+            have h2 := semApp_semLam (domV := .ty (Fin 2) (fun i => .base SymName.boolName i.val)) hBoolInj
+              (fun (y : Fin 2) => .prop (a = y)) a
+            exact (congrArg (fun fn => semApp fn (.base SymName.boolName a.val)) h1).trans h2
+          rw [semPi_eq_prop (domV := .ty (Fin 2) (fun i => .base SymName.boolName i.val)) (fun a => ⟨a = a, hstep a⟩)]
+          refine ⟨rfl, fun a => ?_⟩
+          rw [hstep a]
+          rfl
+        simp only [baseEqBoolReflDecl, evalExpr, hEqBoolRefl, hEqBoolVal]
+        exact hEqBBody (standardBaseModel SymName.boolName) hBoolTy
       · refine ⟨rfl, by decide, by intro c hc; simp [basePropextDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, ExprSkeleton.usedConstants] at hc; subst hc; decide, ?_⟩
         simp only [basePropextDecl, ExprSkeleton.arrow, ExprSkeleton.liftBVar, evalExpr, hPropext, hTrueTy]
         rw [semPi_eq_prop (fun P => ⟨_, by
@@ -4318,10 +4794,12 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
       rcases hLookupCases n ci hlu with
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
+        ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ <;> cases hk
     induct_sound := by
       intro n ci ctors hlu hk
       rcases hLookupCases n ci hlu with
+        ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
@@ -4336,6 +4814,9 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
         intro _ hnb; simp [isBuiltinCarrierName] at hnb
       · refine ⟨List.nodup_nil, (fun h => by cases h), ?_⟩
         intro _ hnb; simp [isBuiltinCarrierName] at hnb
+      · refine ⟨by simp [SymName.boolFalseName, SymName.boolTrueName, SymName.ofList], (fun h => by cases h), ?_⟩
+        intro _ _; exact hBoolTy
+      · exact ⟨by simp, (fun h => by cases h), (fun h => by cases h)⟩
       · exact ⟨by simp, (fun h => by cases h), (fun h => by cases h)⟩
       · exact ⟨by simp, (fun h => by cases h), (fun h => by cases h)⟩
     ctor_sound := by
@@ -4343,16 +4824,36 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
       rcases hLookupCases n ci hlu with
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
+        ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
         ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
       all_goals try cases hk
-      · rcases hLookupCases SymName.trueName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
+      · rcases hLookupCases SymName.trueName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
         all_goals try (rcases h with ⟨heq, _⟩; exact absurd heq (by decide))
         rcases h with ⟨_, rfl⟩
         exact ⟨(fun _ => hTrueIntro), (fun h => by cases h)⟩
-      · rcases hLookupCases SymName.natName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
+      · rcases hLookupCases SymName.natName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
         all_goals try (rcases h with ⟨heq, _⟩; exact absurd heq (by decide))
         rcases h with ⟨_, rfl⟩
         exact ⟨(fun h => by cases h), (fun _ hnb => by simp [isBuiltinCarrierName] at hnb)⟩
+      · cases hty
+      · rcases hLookupCases SymName.boolName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
+        all_goals try (rcases h with ⟨heq, _⟩; exact absurd heq (by decide))
+        rcases h with ⟨_, rfl⟩
+        cases hkP
+        refine ⟨(fun h => by cases h), fun _ _ idx hidx => ?_⟩
+        rcases idx with ⟨v, hv⟩
+        match v, hv with
+        | 0, _ => exact hBoolFalse
+        | 1, _ => simp [SymName.boolFalseName, SymName.boolTrueName, SymName.ofList] at hidx
+      · rcases hLookupCases SymName.boolName indCi hluP with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h
+        all_goals try (rcases h with ⟨heq, _⟩; exact absurd heq (by decide))
+        rcases h with ⟨_, rfl⟩
+        cases hkP
+        refine ⟨(fun h => by cases h), fun _ _ idx hidx => ?_⟩
+        rcases idx with ⟨v, hv⟩
+        match v, hv with
+        | 0, _ => simp [SymName.boolFalseName, SymName.boolTrueName, SymName.ofList] at hidx
+        | 1, _ => exact hBoolTrue
       · cases hty
       · cases hty
       · cases hty
@@ -4364,6 +4865,7 @@ theorem standardBaseEnv_sound : EnvSound standardBaseEnv standardBaseModel := by
         | none => rfl
         | some indCi =>
           rcases hLookupCases structName indCi hluS with
+            ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
             ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
             ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ |
             ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
@@ -4711,6 +5213,239 @@ def closureExpand (_ : SymName) (ci : ConstantRecord) : Except AuditFailure (Lis
 abbrev DepReaches (env : KernelEnv) (a b : SymName) : Prop :=
   GraphReaches env closureExpand a b
 
+/-- Remaining budget potential over unvisited entries in `env` for proving `closureFuel` sufficiency. -/
+def unvisitedBudget (visited : List SymName) : KernelEnv → Nat
+  | [] => 0
+  | (k, ci) :: rest =>
+    (if visited.contains k then 0 else edgeCount ci + 1) + unvisitedBudget visited rest
+
+theorem unvisitedBudget_nil_add_two (env : KernelEnv) :
+    unvisitedBudget [] env + 2 = closureFuel env := by
+  induction env with
+  | nil => rfl
+  | cons p rest ih =>
+    rcases p with ⟨k, ci⟩
+    simp only [unvisitedBudget, List.contains_nil, Bool.false_eq_true, ↓reduceIte, closureFuel]
+    omega
+
+theorem unvisitedBudget_mono (n : SymName) (visited : List SymName) (env : KernelEnv) :
+    unvisitedBudget (n :: visited) env ≤ unvisitedBudget visited env := by
+  induction env with
+  | nil => exact Nat.le_refl 0
+  | cons p rest ih =>
+    rcases p with ⟨k, ci⟩
+    simp only [unvisitedBudget, List.contains_cons]
+    cases hv : visited.contains k with
+    | true =>
+      simp only [Bool.or_true, ↓reduceIte, Nat.zero_add]
+      exact ih
+    | false =>
+      cases hkn : (k == n) with
+      | true =>
+        simp only [Bool.true_or, ↓reduceIte, Nat.zero_add]
+        omega
+      | false =>
+        simp only [Bool.false_or, Bool.false_eq_true, ↓reduceIte]
+        omega
+
+theorem unvisitedBudget_cons_le (env : KernelEnv) (visited : List SymName)
+    (n : SymName) (ci : ConstantRecord)
+    (hl : env.lookup n = some ci) (hnot : visited.contains n = false) :
+    unvisitedBudget (n :: visited) env + (edgeCount ci + 1) ≤ unvisitedBudget visited env := by
+  induction env with
+  | nil => simp [KernelEnv.lookup] at hl
+  | cons p rest ih =>
+    rcases p with ⟨k, ci'⟩
+    simp only [KernelEnv.lookup] at hl
+    cases hkn : (k == n) with
+    | true =>
+      rw [hkn] at hl
+      simp only [↓reduceIte, Option.some.injEq] at hl
+      subst hl
+      have hkEq : k = n := beq_iff_eq.mp hkn
+      subst hkEq
+      have hmono := unvisitedBudget_mono k visited rest
+      simp only [unvisitedBudget, List.contains_cons, beq_self_eq_true, Bool.true_or,
+        ↓reduceIte, hnot, Bool.false_eq_true, Nat.zero_add]
+      omega
+    | false =>
+      rw [hkn] at hl
+      simp only [Bool.false_eq_true, ↓reduceIte] at hl
+      have htail := ih hl
+      simp only [unvisitedBudget, List.contains_cons, hkn, Bool.false_or]
+      cases visited.contains k <;> simp <;> omega
+
+/--
+Liveness Theorem (`closureFuel` Sufficiency — closes Report §5 item 3):
+Whenever `expand` produces at most `edgeCount ci` edges per declaration and never itself throws
+`closureFuelExhausted`, `walkGraph` with budget `fuel ≥ pending.length + unvisitedBudget visited env`
+NEVER fails with `.closureFuelExhausted`.
+-/
+theorem walkGraph_never_exhausts_fuel {env : KernelEnv} {rootName : SymName}
+    {expand : SymName → ConstantRecord → Except AuditFailure (List SymName)}
+    (hBound : ∀ n ci edges, env.lookup n = some ci → expand n ci = .ok edges →
+      edges.length ≤ edgeCount ci)
+    (hNoExh : ∀ n ci r p, expand n ci ≠ .error (.closureFuelExhausted r p)) :
+    ∀ (fuel : Nat) (pending visited : List SymName),
+      pending.length + unvisitedBudget visited env ≤ fuel →
+      ∀ r p, walkGraph env rootName expand fuel pending visited ≠
+        .error (.closureFuelExhausted r p) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro pending visited hle r p
+    cases pending with
+    | nil => simp [walkGraph]
+    | cons _ _ => simp at hle
+  | succ fuel ih =>
+    intro pending visited hle r p
+    cases pending with
+    | nil => simp [walkGraph]
+    | cons n tl =>
+      simp only [walkGraph]
+      cases hv : visited.contains n with
+      | true =>
+        simp only [↓reduceIte]
+        apply ih tl visited _ r p
+        simp only [List.length_cons] at hle
+        omega
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        cases hl : env.lookup n with
+        | none =>
+          dsimp only
+          intro hc; cases hc
+        | some ci =>
+          dsimp only
+          cases he : expand n ci with
+          | error e =>
+            dsimp only
+            intro hc
+            injection hc with heq
+            subst heq
+            exact hNoExh n ci r p he
+          | ok edges =>
+            dsimp only
+            apply ih (edges ++ tl) (n :: visited) _ r p
+            have heb := hBound n ci edges hl he
+            have hdec := unvisitedBudget_cons_le env visited n ci hl hv
+            simp only [List.length_append, List.length_cons] at hle ⊢
+            omega
+
+theorem recRuleEdges_ne_closureFuelExhausted (ctxName : SymName) (rs : List RecRule) :
+    ∀ acc r p, ConstantRecord.recRuleEdges ctxName rs acc ≠ .error (.closureFuelExhausted r p) := by
+  induction rs with
+  | nil => intro acc r p h; simp [ConstantRecord.recRuleEdges] at h
+  | cons hd tl ih =>
+    intro acc r p h
+    simp only [ConstantRecord.recRuleEdges, bind, Except.bind] at h
+    cases he : ExprSkeleton.expressionEdges ctxName hd.rhs with
+    | error e =>
+      rw [he] at h; injection h with heq; subst heq
+      unfold ExprSkeleton.expressionEdges at he
+      split at he
+      · injection he with h1; cases h1
+      · cases he
+    | ok es =>
+      rw [he] at h
+      exact ih _ r p h
+
+theorem declarationEdges_ne_closureFuelExhausted (ci : ConstantRecord) (r p : SymName) :
+    ConstantRecord.declarationEdges ci ≠ .error (.closureFuelExhausted r p) := by
+  intro h
+  unfold ConstantRecord.declarationEdges at h
+  dsimp only [bind, Except.bind, pure, Except.pure] at h
+  cases ht : ExprSkeleton.expressionEdges ci.name ci.type with
+  | error e =>
+    rw [ht] at h; injection h with heq; subst heq
+    unfold ExprSkeleton.expressionEdges at ht
+    split at ht
+    · injection ht with h1; cases h1
+    · cases ht
+  | ok te =>
+    rw [ht] at h; dsimp only at h
+    cases hv : ci.value? with
+    | none =>
+      rw [hv] at h; dsimp only at h
+      cases hk : ci.kind <;> rw [hk] at h
+      all_goals try cases h
+      exact recRuleEdges_ne_closureFuelExhausted ci.name _ _ r p h
+    | some val =>
+      rw [hv] at h; dsimp only at h
+      cases hve : ExprSkeleton.expressionEdges ci.name val with
+      | error e =>
+        rw [hve] at h; injection h with heq; subst heq
+        unfold ExprSkeleton.expressionEdges at hve
+        split at hve
+        · injection hve with h1; cases h1
+        · cases hve
+      | ok ve =>
+        rw [hve] at h; dsimp only at h
+        cases hk : ci.kind <;> rw [hk] at h
+        all_goals try cases h
+        exact recRuleEdges_ne_closureFuelExhausted ci.name _ _ r p h
+
+/-- `walkGraph` with `closureExpand` and `closureFuel env` NEVER returns `.closureFuelExhausted`. -/
+theorem closureExpand_never_exhausts_fuel (env : KernelEnv) (root : SymName) (r p : SymName) :
+    walkGraph env root closureExpand (closureFuel env) [root] [] ≠
+      .error (.closureFuelExhausted r p) := by
+  apply walkGraph_never_exhausts_fuel
+  · intro n ci edges _ he
+    unfold closureExpand at he
+    unfold edgeCount
+    rw [he]
+    exact Nat.le_refl _
+  · intro n ci r' p'
+    exact declarationEdges_ne_closureFuelExhausted ci r' p'
+  · have hcf := unvisitedBudget_nil_add_two env
+    simp only [List.length_singleton]
+    omega
+
+/--
+Faithful operational model of Lean 4.34.1 `Lean/Environment.lean` `subsumesInfo` (lines 2268–2283)
+and `finalizeImport` (lines 2334–2345):
+- Two theorems with matching `(name, type, all)` subsume each other REGARDLESS of their proof bodies.
+- On a duplicate key where `subsumesInfo newCi oldCi`, `constants` is REPLACED by `newCi` (later
+  module wins!), while `const2ModIdx.insertIfNew` pins `originMap` to the FIRST module!
+-/
+def lean434SubsumesInfo (newCi oldCi : ConstantRecord) : Bool :=
+  match newCi.kind, oldCi.kind with
+  | .thmDecl, .thmDecl =>
+    newCi.name == oldCi.name && newCi.type == oldCi.type && newCi.all == oldCi.all
+  | _, _ => newCi == oldCi
+
+/-- Output of Lean 4.34.1 `finalizeImport`: constant map (`constants`) + first-origin table (`origins`). -/
+structure FinalizedImport434 where
+  constants : KernelEnv
+  origins : List (SymName × SymName)
+  deriving DecidableEq, Repr
+
+/-- Lookup first-recorded module origin in `const2ModIdx`. -/
+def lookupOrigin (origins : List (SymName × SymName)) (n : SymName) : Option SymName :=
+  match origins with
+  | [] => none
+  | (k, m) :: rest => if k == n then some m else lookupOrigin rest n
+
+/-- Faithful operational model of Lean 4.34.1 `finalizeImport` (`Environment.lean` lines 2334–2345). -/
+def finalizeImport434 (mods : List ModuleInventory) : Except AuditFailure FinalizedImport434 := do
+  let mut consts : KernelEnv := []
+  let mut origins : List (SymName × SymName) := []
+  for inv in mods do
+    -- Parallel zip silently truncates to the shorter array and does NOT check `k == ci.name`!
+    for (k, ci) in inv.constNames.zip inv.constants do
+      match consts.lookup k with
+      | none =>
+        consts := consts.insertOverwrite k ci
+        if (lookupOrigin origins k).isNone then
+          origins := origins ++ [(k, inv.moduleName)]
+      | some prevCi =>
+        if lean434SubsumesInfo ci prevCi then
+          -- Later module REPLACES the constant record, while `const2ModIdx.insertIfNew` keeps FIRST origin!
+          consts := consts.insertOverwrite k ci
+        else if !lean434SubsumesInfo prevCi ci then
+          throw (.duplicateConstName inv.moduleName k)
+  return { constants := consts, origins := origins }
+
 /--
 Faithful operational model of pre-fix `TrustedBoundary.lean` `downstreamAudit` (line 408) and
 `verifyAudit` (line 607):
@@ -4836,16 +5571,20 @@ provisional native evaluation, and relabelling an `Anneal.*` theory module as `s
 from statement-origin separation. Reserved roots accept exactly their own role.
 -/
 def roleMatchesModuleName (role : ModuleRole) (m : SymName) : Bool :=
-  match role with
-  | .foundation => SymName.isStdlibModule m
-  | .trusted => m.getRoot == some "Trusted"
-  | .theory => m.getRoot == some "Anneal"
-  | .assumptions => SymName.isAssumptionsModule m
-  | .verify => SymName.isVerifyModuleName m
-  | .defsExempt => SymName.isStrictExemptModuleName m && !m.hasReservedRoleRoot
-  | .proof => SymName.isProofModuleName m && !m.hasReservedRoleRoot
-  | .spec => !m.hasReservedRoleRoot && !m.isTestModuleName
-  | .test => m.isTestModuleName && !m.hasReservedRoleRoot
+  if m.isAnonymous then false
+  else
+    match role with
+    | .foundation => SymName.isStdlibModule m
+    | .trusted => m.getRoot == some "Trusted"
+    | .theory => m.getRoot == some "Anneal"
+    | .assumptions => SymName.isAssumptionsModule m
+    | .verify => SymName.isVerifyModuleName m
+    | .defsExempt => SymName.isStrictExemptModuleName m && !m.hasReservedRoleRoot
+    | .proof => SymName.isProofModuleName m && !m.hasReservedRoleRoot
+    | .spec =>
+      !m.hasReservedRoleRoot && !m.isTestModuleName &&
+      !m.isProofModuleName && !SymName.isStrictExemptModuleName m
+    | .test => m.isTestModuleName && !m.hasReservedRoleRoot
 
 /--
 Validate module role against canonical naming rules (`V15`: reject `Topic.Proofs.Defs` spoofing, and
@@ -4873,11 +5612,24 @@ def validateMutualPeer (inv : ModuleInventory) (ci : ConstantRecord) (peerName :
     if peerCi.all != ci.all then
       throw (.invalidMutualAll inv.moduleName ci.name "asymmetric mutual .all membership")
 
+/-- Validate a single inductive target listed in a recursor's `.all`. -/
+def validateRecAllTarget (inv : ModuleInventory) (ci : ConstantRecord) (indName : SymName) :
+    Except AuditFailure Unit :=
+  match findConstByName inv.constants indName with
+  | none =>
+    throw (.invalidMutualAll inv.moduleName ci.name "missing inductive target for recursor .all")
+  | some indCi =>
+    if indCi.kind.tag != .inductTag then
+      throw (.invalidMutualAll inv.moduleName ci.name "recursor .all target is not an inductive")
+    else
+      pure ()
+
 /--
 Validate mutual `.all` group invariants (`lowmem_lean` `cl/1027843093`):
 - Accepts valid multi-element mutual blocks on `thmDecl`, `opaqueDecl`, `defnDecl`, `inductDecl`.
 - Rejects empty `.all`, duplicates in `.all`, `anonymous ∈ .all`, `ci.name ∉ .all`, missing peers,
-  incompatible peer `DeclKind` tag, asymmetric peer `.all`, and open expressions in `declarationEdges`.
+  incompatible peer `DeclKind` tag, asymmetric peer `.all`, missing/non-inductive targets in
+  `recDecl.all`, and open expressions in `declarationEdges`.
 -/
 def validateMutualAll (inv : ModuleInventory) : Except AuditFailure Unit :=
   checkEach inv.constants fun ci => do
@@ -4890,7 +5642,7 @@ def validateMutualAll (inv : ModuleInventory) : Except AuditFailure Unit :=
         throw (.invalidMutualAll inv.moduleName ci.name "anonymous name in .all")
       match ci.kind with
       | .recDecl _ =>
-        pure ()
+        checkEach ci.all (validateRecAllTarget inv ci)
       | _ =>
         if !ci.all.contains ci.name then
           throw (.invalidMutualAll inv.moduleName ci.name "ci.name missing from .all")
@@ -4899,10 +5651,11 @@ def validateMutualAll (inv : ModuleInventory) : Except AuditFailure Unit :=
 
 /--
 Check whether `ci` is a legitimate Lean equation-compiler `_unsafe_rec` companion for a safe
-parent definition in the same module with matching type (hardened over `TrustedBoundary.lean` lines 255–260).
+parent definition in the same module with matching type and `.defnDecl` kind (hardened over
+`TrustedBoundary.lean` lines 255–260).
 -/
 def isCodegenUnsafeRecInMod (inv : ModuleInventory) (ci : ConstantRecord) : Bool :=
-  if ci.safety != .partialDecl then false
+  if ci.safety != .partialDecl || ci.kind != .defnDecl then false
   else
     match ci.name.unsafeRecParent? with
     | none => false
@@ -4910,6 +5663,7 @@ def isCodegenUnsafeRecInMod (inv : ModuleInventory) (ci : ConstantRecord) : Bool
       match findConstByName inv.constants parent with
       | none => false
       | some parentCi =>
+        parentCi.kind == .defnDecl &&
         parentCi.safety == .safe &&
         parentCi.originModule == inv.moduleName &&
         ci.type == parentCi.type
@@ -4959,11 +5713,17 @@ def isStrictExemptModule (inv : ModuleInventory) : Bool :=
 Audit persistent environment extension tables and public namespace suffix shadowing for a module
 (`V01`, `V02`, `V07`, `V08`, `V10`, `V11`, `V12`, `V13`, `V15`, `V16`).
 Explicitly ignores `.cachedExportedAxioms` (`V06`) so tampered caches can never mask axioms.
+For genuine `defsExempt` modules (`<Topic>.Defs`), local instances, `scoped_instance`,
+`default_instance`, and `coe` are permitted, while `V10` hooks (`initialize`, `meta initialize`,
+`implemented_by`, `extern`), macro/elab/delab/unexpander entries, foreign-target instances,
+foreign reducibility overrides, `export` aliases, and `Init`/cross-module suffix shadowing remain
+strictly forbidden!
 -/
 def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     (protectedNames : List SymName) : Except AuditFailure Unit := do
-  if !cfg.enforceStrictProofs || inv.role == .foundation || isStrictExemptModule inv then
+  if !cfg.enforceStrictProofs || inv.role == .foundation then
     return ()
+  let isDefs := isStrictExemptModule inv
   for ext in inv.extEntries do
     match ext with
     | .macroEntry d _ =>
@@ -4978,7 +5738,8 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     | .scopedMacroEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "scoped_macro" d)
     | .scopedInstanceEntry d _ _ =>
-      throw (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
+      if !isDefs then
+        throw (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
     | .termElabEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "term_elab" d)
     | .delabEntry d _ =>
@@ -4989,9 +5750,11 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
       if targetOrigin != inv.moduleName then
         throw (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
     | .defaultInstanceEntry d _ =>
-      throw (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
+      if !isDefs then
+        throw (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
     | .coeEntry d _ _ =>
-      throw (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
+      if !isDefs then
+        throw (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
     | .reducibilityOverride target targetOrigin _ =>
       if targetOrigin != inv.moduleName then
         throw (.forbiddenReducibilityOverride inv.moduleName target)
@@ -5012,10 +5775,13 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
   -- Only Lean's `_private` name encoding exempts a declaration (never the `isPrivate` flag), and
   -- only an internal SUFFIX is skipped: `Topic._x.Nat.add` still shadows `Nat.add` inside
   -- `namespace Topic._x`, whereas the suffix `_proof_1` of `Topic.foo._proof_1` shadows nothing.
+  let shadowTargets :=
+    if isDefs then protectedNames.filter (fun n => !inv.constNames.contains n)
+    else protectedNames
   for ci in inv.constants do
     if !ci.name.isPrivateName then
       for suf in ci.name.properSuffixes do
-        if !suf.hasInternalPart && protectedNames.contains suf then
+        if !suf.hasInternalPart && shadowTargets.contains suf then
           throw (.forbiddenShadowingOrExport inv.moduleName ci.name suf)
 
 /-- Find any private instance exposed in a module (used for `V14` `import all` leakage checks). -/
@@ -5025,7 +5791,7 @@ def findPrivateInstance? (inv : ModuleInventory) : Option SymName :=
       if isPrivateInst || d.isPrivateName then some d else none
     | _ => none
 
-/-- Audit import edges across the package (`V14`: forbid `import all` and catch private-instance leakage). -/
+/-- Audit import edges across the package (`V14`: forbid `import all`, `meta`, and non-exported private imports). -/
 def validateImports (pkg : PackageAuditInput) : Except AuditFailure Unit := do
   for inv in pkg.modules do
     if inv.role != .foundation then
@@ -5041,6 +5807,8 @@ def validateImports (pkg : PackageAuditInput) : Except AuditFailure Unit := do
           | none =>
             throw (.forbiddenImportAll inv.moduleName imp.module)
         if imp.isMeta && imp.module != SymName.mkSimple "Init" then
+          throw (.forbiddenImportAll inv.moduleName imp.module)
+        if !imp.isExported && imp.module != SymName.mkSimple "Init" then
           throw (.forbiddenImportAll inv.moduleName imp.module)
 
 /-- Lookup the `ModuleRole` of a module name in `pkg`. -/
@@ -5097,7 +5865,8 @@ def statementExpand (pkg : PackageAuditInput) (rootName : SymName) (n : SymName)
 /-- Fail-closed statement-origin walk from the constants of a root theorem's type. -/
 def walkStatementOrigins (pkg : PackageAuditInput) (allEnv : KernelEnv) (rootName : SymName)
     (typeEdges : List SymName) : Except AuditFailure (List SymName) :=
-  walkGraph allEnv rootName (statementExpand pkg rootName) (closureFuel allEnv) typeEdges []
+  walkGraph allEnv rootName (statementExpand pkg rootName)
+    (typeEdges.length + closureFuel allEnv) typeEdges []
 
 /-- Recursive checker over visited closure nodes (clean structural induction for soundness). -/
 def checkVisitedClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : KernelEnv)
@@ -5119,6 +5888,8 @@ def checkVisitedClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : 
             dep != SymName.trustCompilerName
           if !okProv then
             throw (.forbiddenNativeReductionAxiom rootName dep)
+          if !isValidNativeAxiomType depCi.type then
+            throw (.invalidNativeAxiomType rootName dep)
           checkVisitedClosure cfg pkg allEnv rootName rest (dep :: acc)
         else if SymName.isFoundationalAxiom dep && roleOfConst pkg dep depCi == .foundation then
           checkVisitedClosure cfg pkg allEnv rootName rest (dep :: acc)
@@ -5149,6 +5920,36 @@ def auditDirectClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : K
   | .error e => .error e
   | .ok visited => checkVisitedClosure cfg pkg allEnv rootName visited []
 
+/-- Per-verify-root classification mirroring `TrustedBoundary.verifyAudit` lines 674–689. -/
+inductive VerifyItemStatus where
+  | verifiedUnconditional
+  | verifiedConditional (assumptions : List SymName)
+  | provisionalNative (nativeAxioms : List SymName)
+  deriving DecidableEq, Repr
+
+/-- Per-verify-root audit report entry. -/
+structure VerifyItemReport where
+  root : SymName
+  status : VerifyItemStatus
+  reachedAxioms : List SymName
+  deriving DecidableEq, Repr
+
+/-- Classify a single verified root strictly from its own direct-closure `reachedAxioms`. -/
+def classifyVerifyItem (pkg : PackageAuditInput) (allEnv : KernelEnv) (root : SymName)
+    (reachedAxioms : List SymName) : VerifyItemReport :=
+  let nativeAxs := reachedAxioms.filter fun ax => SymName.isNativeReductionAxiom ax
+  let assumpAxs := reachedAxioms.filter fun ax =>
+    !SymName.isNativeReductionAxiom ax &&
+    !(SymName.isFoundationalAxiom ax &&
+      match allEnv.lookup ax with
+      | some ci => roleOfConst pkg ax ci == .foundation
+      | none => false)
+  let st :=
+    if !nativeAxs.isEmpty then .provisionalNative nativeAxs
+    else if !assumpAxs.isEmpty then .verifiedConditional assumpAxs
+    else .verifiedUnconditional
+  { root := root, status := st, reachedAxioms := reachedAxioms }
+
 /-- Certificate returned by `auditAndReplayPackage` upon passing all checks and clean-env replay. -/
 structure AuditCertificate where
   replayedEnv : KernelEnv
@@ -5156,6 +5957,7 @@ structure AuditCertificate where
   replayedCount : Nat
   verifiedRoots : List SymName
   reachedAxioms : List SymName
+  itemReports : List VerifyItemReport := []
   deriving DecidableEq, Repr
 
 /-- Collect the protected `Init`/`foundation`/`Defs` constant names for `V15` suffix-shadowing detection. -/
@@ -5169,6 +5971,16 @@ def collectProtectedNames (pkg : PackageAuditInput) : List SymName :=
 def collectReplayDecls (pkg : PackageAuditInput) : List ConstantRecord :=
   pkg.modules.flatMap fun inv =>
     inv.constants.filter fun ci => !isCodegenUnsafeRecInMod inv ci
+
+/-- Per-declaration axiom admissibility predicate passed to `replayCleanEnvOrdered`. -/
+def allowReplayAxiom (cfg : AuditConfig) (pkg : PackageAuditInput) (ci : ConstantRecord) : Bool :=
+  if !cfg.allowAssumptions && !cfg.allowProvisionalNative then false
+  else
+    let role := roleOfConst pkg ci.name ci
+    (cfg.allowAssumptions && role == .assumptions) ||
+    (cfg.allowAssumptions && cfg.allowLocalTestAxioms && role == .test) ||
+    (cfg.allowProvisionalNative && role == .proof &&
+      SymName.hasNativeComponent ci.name && isValidNativeAxiomType ci.type)
 
 /-- Validate `extraConstNames` provenance across all modules. -/
 def auditExtraConstProvenance (pkg : PackageAuditInput) (allEnv : KernelEnv) :
@@ -5190,18 +6002,19 @@ def auditModuleDeclarations (cfg : AuditConfig) (pkg : PackageAuditInput) :
           if ci.name == SymName.sorryAxName then
             throw (.forbiddenAxiom ci.name ci.name inv.moduleName)
           else if SymName.isNativeReductionAxiom ci.name then
-            -- Only compiler-generated `._native.*` evaluation axioms may be DECLARED by a module:
-            -- `Lean.ofReduceBool` / `Lean.ofReduceNat` / `Lean.trustCompiler` are `Init` names, so a
-            -- workspace axiom reusing one of them is a custom axiom in disguise.
+            -- Only compiler-generated `._native.*` evaluation axioms of shape `@Eq Bool e Bool.true`
+            -- may be DECLARED by a `Proof.*` module under `--provisional`.
             let okProv := cfg.allowProvisionalNative &&
               inv.role == .proof && SymName.hasNativeComponent ci.name
             if !okProv then
               throw (.forbiddenNativeReductionAxiom ci.name ci.name)
+            if !isValidNativeAxiomType ci.type then
+              throw (.invalidNativeAxiomType ci.name ci.name)
           else if inv.role == .foundation && SymName.isFoundationalAxiom ci.name then
             pure ()
           else if inv.role == .assumptions && cfg.allowAssumptions then
             pure ()
-          else if inv.role == .test then
+          else if inv.role == .test && cfg.allowAssumptions && cfg.allowLocalTestAxioms then
             pure ()
           else
             throw (.forbiddenAxiom ci.name ci.name inv.moduleName)
@@ -5305,6 +6118,80 @@ def auditPackageClosures (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv :
       | .error e => .error e
       | .ok claimAxioms => .ok (moduleAxioms ++ verifyAxioms ++ claimAxioms)
 
+/-- Build per-verify-root `VerifyItemReport` list (matching `TrustedBoundary.verifyAudit` lines 674–689). -/
+def buildVerifyItemReports (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : KernelEnv) :
+    List SymName → Except AuditFailure (List VerifyItemReport)
+  | [] => .ok []
+  | root :: rest =>
+    match auditVerifyRoot cfg pkg allEnv root with
+    | .error e => .error e
+    | .ok axs =>
+      match buildVerifyItemReports cfg pkg allEnv rest with
+      | .error e => .error e
+      | .ok tl => .ok (classifyVerifyItem pkg allEnv root axs :: tl)
+
+/--
+Check closure of a `.test` module declaration matching `TrustedBoundary.downstreamAudit` lines 420–442:
+bans `sorryAx`, native-reduction/compiler-trust axioms, `unsafe`/`partial` declarations, and any
+axiom outside foundational axioms and same-module file-local test axioms.
+-/
+def checkTestVisitedClosure (pkg : PackageAuditInput) (allEnv : KernelEnv)
+    (modName rootName : SymName) : List SymName → Except AuditFailure Unit
+  | [] => .ok ()
+  | dep :: rest => do
+    match allEnv.lookup dep with
+    | none => throw (.unknownConstant dep)
+    | some depCi =>
+      if depCi.isUnsafe || depCi.isPartial then
+        throw (.unsafeOrPartialDecl (declaringModuleName pkg dep depCi) dep)
+      if depCi.isAxiom then
+        if dep == SymName.sorryAxName then
+          throw (.forbiddenAxiom rootName dep (declaringModuleName pkg dep depCi))
+        else if SymName.isNativeReductionAxiom dep then
+          throw (.forbiddenNativeReductionAxiom rootName dep)
+        else if SymName.isFoundationalAxiom dep && roleOfConst pkg dep depCi == .foundation then
+          checkTestVisitedClosure pkg allEnv modName rootName rest
+        else if declaringModuleName pkg dep depCi == modName then
+          checkTestVisitedClosure pkg allEnv modName rootName rest
+        else
+          throw (.testModuleForeignAxiom modName rootName dep (declaringModuleName pkg dep depCi))
+      else
+        checkTestVisitedClosure pkg allEnv modName rootName rest
+
+/-- Audit all `.test` module closures (`TrustedBoundary.downstreamAudit` lines 420–442). -/
+def auditTestModuleClosures (pkg : PackageAuditInput) (allEnv : KernelEnv) :
+    Except AuditFailure Unit :=
+  checkEach pkg.modules fun inv =>
+    if inv.role == .test then
+      checkEach inv.constants fun ci => do
+        if !isCodegenUnsafeRecInMod inv ci then
+          let visited ← walkGraph allEnv ci.name closureExpand (closureFuel allEnv) [ci.name] []
+          checkTestVisitedClosure pkg allEnv inv.moduleName ci.name visited
+    else
+      .ok ()
+
+/-- Return the first duplicated element of a list, if any. -/
+def firstDuplicate? [DecidableEq α] : List α → Option α
+  | [] => none
+  | x :: xs => if xs.contains x then some x else firstDuplicate? xs
+
+/-- Known module names across `pkg.modules` and `pkg.baseEnv` origins. -/
+def knownModuleNames (pkg : PackageAuditInput) : List SymName :=
+  pkg.modules.map ModuleInventory.moduleName ++ pkg.baseEnv.map ConstantRecord.originModule
+
+/--
+Fidelity check for reserved auxiliary names carrying a foreign `originModule` (Report §5 item 4):
+any constant whose `originModule != inv.moduleName` must reference an audited sibling/base module
+present in `knownModuleNames pkg`.
+-/
+def auditReservedOrigins (pkg : PackageAuditInput) : Except AuditFailure Unit :=
+  let knownMods := knownModuleNames pkg
+  checkEach pkg.modules fun inv =>
+    checkEach inv.constants fun ci => do
+      if ci.originModule != inv.moduleName then
+        if !knownMods.contains ci.originModule then
+          throw (.reservedOriginMissingSibling inv.moduleName ci.name ci.originModule)
+
 /-- Validate every module's replay inventory and source defense-in-depth scanner. -/
 def auditAllInventoriesAndSources (cfg : AuditConfig) (mods : List ModuleInventory) :
     Except AuditFailure Unit :=
@@ -5319,19 +6206,23 @@ def auditAllModuleExtensions (cfg : AuditConfig) (mods : List ModuleInventory)
   checkEach mods fun inv => validateModuleExtensions cfg inv protectedNames
 
 /--
-Complete hardened `.olean` replay-key, extension, source, axiom-closure, statement-origin, and
-clean-environment kernel replay pipeline (`auditAndReplayPackage`).
+Complete hardened `.olean` replay-key, extension, source, axiom-closure, test-closure,
+statement-origin, per-item classification, and dependency-ordered clean-environment kernel replay
+pipeline (`auditAndReplayPackage`).
 -/
 def auditAndReplayPackage (cfg : AuditConfig) (pkg : PackageAuditInput) :
     Except AuditFailure AuditCertificate := do
   -- 1. Validate every module's `.olean` parts, role, inventory bijection, mutual `.all`, and source scan
   auditAllInventoriesAndSources cfg pkg.modules
-  -- 2. Validate global uniqueness across baseEnv + all modules (zero shadowing / zero overwrites)
+  -- 2a. Validate module-name uniqueness across `pkg.modules` (prevents duplicate-module V14/role masking)
+  if let some dupMod := firstDuplicate? (pkg.modules.map ModuleInventory.moduleName) then
+    throw (.duplicateModuleName dupMod)
+  -- 2b. Validate global constant uniqueness across baseEnv + all modules (zero shadowing / zero overwrites)
   let baseNames := pkg.baseEnv.map ConstantRecord.name
   let allModNames := pkg.modules.flatMap ModuleInventory.constNames
   if hasDuplicates (baseNames ++ allModNames) then
     throw (.duplicateConstName .anonymous .anonymous)
-  -- 3. Validate imports (`V14`: forbid `import all` & private-instance leakage)
+  -- 3. Validate imports (`V14`: forbid `import all`, `meta`, non-exported imports, & private-instance leakage)
   validateImports pkg
   -- 4. Validate extension tables & suffix shadowing (`V01`, `V02`, `V07`, `V08`, `V10`–`V13`, `V15`, `V16`)
   let protectedNames := collectProtectedNames pkg
@@ -5341,20 +6232,27 @@ def auditAndReplayPackage (cfg : AuditConfig) (pkg : PackageAuditInput) :
   let importedEnv := KernelEnv.finalizeImportedEnv pkg.modules
   let allEnv := importedEnv ++ baseKernelEnv
   auditExtraConstProvenance pkg allEnv
-  -- 6. Module-wide declaration safety & axiom audit (defeating `V04_unref_axiom` & `pillar_1`)
+  -- 6. Module-wide declaration safety & axiom audit (defeating `V04_unref_axiom`, `pillar_1`, `.test` axiom smuggling)
   auditModuleDeclarations cfg pkg
-  -- 7. Direct constant-closure walk on all non-test declarations + verify/claim roots (`V05`, `V06`)
+  -- 7a. Direct constant-closure walk on all non-test declarations + verify/claim roots (`V05`, `V06`)
   let allReachedAxioms ← auditPackageClosures cfg pkg allEnv
-  -- 8. Clean-environment kernel replay (`V03`, `V09`, `lean4#16677`, `TrustedBoundary` overwrite)
+  -- 7b. Per-verify-root status classification (`VerifiedUnconditional` / `VerifiedConditional` / `ProvisionalNative`)
+  let itemReports ← buildVerifyItemReports cfg pkg allEnv pkg.verifyRoots
+  -- 7c. Test-module closure audit (`TrustedBoundary.downstreamAudit` lines 420–442: 0 sorryAx/native/foreign axioms)
+  auditTestModuleClosures pkg allEnv
+  -- 7d. Reserved-name foreign `originModule` sibling existence check
+  auditReservedOrigins pkg
+  -- 8. Dependency-ordered clean-environment kernel replay (`V03`, `V09`, `lean4#16677`, `TrustedBoundary` overwrite)
   let replayDecls := collectReplayDecls pkg
-  let allowAxiom := cfg.allowAssumptions || cfg.allowProvisionalNative
-  let replayedEnv ← replayCleanEnv baseKernelEnv cfg.kernelFuel allowAxiom replayDecls
+  let replayedEnv ← replayCleanEnvOrdered baseKernelEnv cfg.kernelFuel
+    (allowReplayAxiom cfg pkg) replayDecls
   return {
     replayedEnv := replayedEnv
     importedEnv := importedEnv
     replayedCount := replayDecls.length
     verifiedRoots := pkg.verifyRoots
     reachedAxioms := allReachedAxioms
+    itemReports := itemReports
   }
 
 /-! ### Section 8.1: Core Section 3.3 Inventory, Mutual `.all`, Closure, & End-to-End Soundness Theorems -/
@@ -5770,6 +6668,413 @@ theorem finalizeImportedEnv_mem_exists_mod (mods : List ModuleInventory) (p : Sy
   · exact hex
 
 /--
+Recursor `.all` Target Integrity: every inductive name listed in a `recDecl`'s `.all` inside a
+validated inventory exists in `inv.constants` with `induct` declaration kind.
+-/
+theorem validInventory_rec_all_targets_induct {inv : ModuleInventory}
+    (h : validateReplayInventory inv = .ok ()) :
+    ∀ ci ∈ inv.constants, ∀ rules, ci.kind = .recDecl rules →
+      ∀ indName ∈ ci.all,
+        ∃ indCi, findConstByName inv.constants indName = some indCi ∧ indCi.kind.tag = .inductTag := by
+  have hmut := (validateReplayInventory_elim h).2.2.2.2.2.2
+  unfold validateMutualAll at hmut
+  have hmem := checkEach_ok_mem hmut
+  intro ci hci rules hk indName hindMem
+  have hstep := hmem ci hci
+  dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hstep
+  have hcarries : ci.kind.carriesMutualAll = true := by rw [hk]; rfl
+  simp only [hcarries, ↓reduceIte] at hstep
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
+  split at hstep; · cases hstep
+  rw [hk] at hstep; dsimp only at hstep
+  cases hrloop : checkEach ci.all (validateRecAllTarget inv ci) with
+  | error _ => rw [hrloop] at hstep; cases hstep
+  | ok _ =>
+    have ht := checkEach_ok_mem hrloop indName hindMem
+    unfold validateRecAllTarget at ht
+    cases hfind : findConstByName inv.constants indName with
+    | none => rw [hfind] at ht; cases ht
+    | some indCi =>
+      rw [hfind] at ht; dsimp only at ht
+      split at ht; · cases ht
+      rename_i htagNot
+      refine ⟨indCi, rfl, ?_⟩
+      by_cases he : indCi.kind.tag = .inductTag
+      · exact he
+      · exfalso; apply htagNot; simp [he]
+
+/--
+Liveness for `walkStatementOrigins`: with budget `typeEdges.length + closureFuel allEnv`,
+`walkStatementOrigins` NEVER fails with `.closureFuelExhausted`.
+-/
+theorem walkStatementOrigins_never_exhausts_fuel (pkg : PackageAuditInput) (allEnv : KernelEnv)
+    (rootName : SymName) (typeEdges : List SymName) (r p : SymName) :
+    walkStatementOrigins pkg allEnv rootName typeEdges ≠ .error (.closureFuelExhausted r p) := by
+  unfold walkStatementOrigins
+  apply walkGraph_never_exhausts_fuel
+  · intro n ci edges _ he
+    unfold statementExpand at he
+    split at he
+    · cases he
+    · split at he
+      · injection he with hnil; subst hnil; simp
+      · unfold edgeCount; rw [he]; exact Nat.le_refl _
+  · intro n ci r' p' he
+    unfold statementExpand at he
+    split at he
+    · cases he
+    · split at he
+      · cases he
+      · exact declarationEdges_ne_closureFuelExhausted ci r' p' he
+  · have hcf := unvisitedBudget_nil_add_two allEnv
+    omega
+
+/-- Helper: `checkVisitedClosure` preserves every already-accumulated axiom in `acc`. -/
+theorem checkVisitedClosure_acc_subset {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {allEnv : KernelEnv} {rootName : SymName} :
+    ∀ (xs acc res : List SymName),
+      checkVisitedClosure cfg pkg allEnv rootName xs acc = .ok res →
+      ∀ a ∈ acc, a ∈ res := by
+  intro xs
+  induction xs with
+  | nil =>
+    intro acc res hr a ha
+    simp only [checkVisitedClosure, Except.ok.injEq] at hr
+    subst hr; exact ha
+  | cons d tl ih =>
+    intro acc res hr a ha
+    unfold checkVisitedClosure at hr
+    dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hr
+    cases hlu : allEnv.lookup d with
+    | none => rw [hlu] at hr; cases hr
+    | some dCi =>
+      rw [hlu] at hr; dsimp only at hr
+      split at hr; · cases hr
+      split at hr
+      · split at hr; · cases hr
+        split at hr
+        · split at hr; · cases hr
+          split at hr; · cases hr
+          exact ih (d :: acc) res hr a (List.mem_cons_of_mem _ ha)
+        · split at hr
+          · exact ih (d :: acc) res hr a (List.mem_cons_of_mem _ ha)
+          · split at hr
+            · exact ih (d :: acc) res hr a (List.mem_cons_of_mem _ ha)
+            · cases hr
+      · exact ih acc res hr a ha
+
+/-- General loop invariant of `checkVisitedClosure` for arbitrary `cfg` (including conditional/provisional). -/
+theorem checkVisitedClosure_general {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {allEnv : KernelEnv} {rootName : SymName} :
+    ∀ (xs acc res : List SymName),
+      checkVisitedClosure cfg pkg allEnv rootName xs acc = .ok res →
+      ∀ dep ∈ xs,
+        CleanDep pkg allEnv dep ∨
+        ∃ depCi, allEnv.lookup dep = some depCi ∧ depCi.isAxiom = true ∧ dep ∈ res ∧
+          (SymName.isNativeReductionAxiom dep = true ∨
+            ¬ (SymName.isFoundationalAxiom dep = true ∧ roleOfConst pkg dep depCi = .foundation)) := by
+  intro xs
+  induction xs with
+  | nil => intro _ _ _ _ hm; cases hm
+  | cons d tl ih =>
+    intro acc res hr dep hmem
+    unfold checkVisitedClosure at hr
+    dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hr
+    cases hlu : allEnv.lookup d with
+    | none => rw [hlu] at hr; cases hr
+    | some dCi =>
+      rw [hlu] at hr; dsimp only at hr
+      split at hr; · cases hr
+      rename_i hnotUP
+      have hsafe : dCi.isUnsafe = false ∧ dCi.isPartial = false := by
+        cases hu : dCi.isUnsafe <;> cases hp : dCi.isPartial
+        · exact ⟨rfl, rfl⟩
+        · exfalso; apply hnotUP; simp [hp]
+        · exfalso; apply hnotUP; simp [hu]
+        · exfalso; apply hnotUP; simp [hu]
+      split at hr
+      · rename_i hax
+        split at hr; · cases hr
+        rename_i hnotSorry
+        split at hr
+        · rename_i hnat
+          split at hr; · cases hr
+          split at hr; · cases hr
+          cases hmem with
+          | head =>
+            exact Or.inr ⟨dCi, hlu, hax, checkVisitedClosure_acc_subset tl (d :: acc) res hr d List.mem_cons_self, Or.inl hnat⟩
+          | tail _ htl => exact ih (d :: acc) res hr dep htl
+        · rename_i hnotNat
+          split at hr
+          · rename_i hfound
+            simp only [Bool.and_eq_true, beq_iff_eq] at hfound
+            cases hmem with
+            | head =>
+              left
+              refine ⟨dCi, hlu, hsafe.1, hsafe.2, fun _ => ?_⟩
+              refine ⟨fun hs => hnotSorry (by simp [hs]), ?_, hfound.1, hfound.2⟩
+              cases hn : SymName.isNativeReductionAxiom d
+              · rfl
+              · exact absurd hn hnotNat
+            | tail _ htl => exact ih (d :: acc) res hr dep htl
+          · rename_i hnotFound
+            split at hr
+            · cases hmem with
+              | head =>
+                refine Or.inr ⟨dCi, hlu, hax,
+                  checkVisitedClosure_acc_subset tl (d :: acc) res hr d List.mem_cons_self,
+                  Or.inr fun ⟨hf, hr0⟩ => hnotFound (by simp [hf, hr0])⟩
+              | tail _ htl => exact ih (d :: acc) res hr dep htl
+            · cases hr
+      · rename_i hnotAx
+        cases hmem with
+        | head =>
+          exact Or.inl ⟨dCi, hlu, hsafe.1, hsafe.2, fun ha => absurd ha hnotAx⟩
+        | tail _ htl => exact ih acc res hr dep htl
+
+/-- Helper: `firstDuplicate? xs = none` implies `xs.Nodup`. -/
+theorem firstDuplicate?_eq_none_iff_nodup [DecidableEq α] (xs : List α) :
+    firstDuplicate? xs = none ↔ xs.Nodup := by
+  induction xs with
+  | nil => simp [firstDuplicate?]
+  | cons x tl ih =>
+    simp only [firstDuplicate?, List.nodup_cons]
+    cases hc : tl.contains x with
+    | true =>
+      have hmem : x ∈ tl := by simpa using hc
+      simp [hmem]
+    | false =>
+      have hnot : x ∉ tl := by simpa using hc
+      simp [hnot, ih]
+
+/-- Helper: every element of `buildVerifyItemReports` corresponds to a root in `roots` that passed `auditVerifyRoot`. -/
+theorem buildVerifyItemReports_ok_mem {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {allEnv : KernelEnv} {roots : List SymName} {reps : List VerifyItemReport}
+    (h : buildVerifyItemReports cfg pkg allEnv roots = .ok reps) :
+    ∀ rep ∈ reps, ∃ axs, rep.root ∈ roots ∧
+      auditVerifyRoot cfg pkg allEnv rep.root = .ok axs ∧
+      rep = classifyVerifyItem pkg allEnv rep.root axs := by
+  induction roots generalizing reps with
+  | nil =>
+    simp only [buildVerifyItemReports, Except.ok.injEq] at h
+    subst h; intro _ hm; cases hm
+  | cons r tl ih =>
+    simp only [buildVerifyItemReports] at h
+    cases hr : auditVerifyRoot cfg pkg allEnv r with
+    | error _ => rw [hr] at h; cases h
+    | ok axs =>
+      rw [hr] at h; dsimp only at h
+      cases htl : buildVerifyItemReports cfg pkg allEnv tl with
+      | error _ => rw [htl] at h; cases h
+      | ok tlReps =>
+        rw [htl] at h
+        injection h with hEq; subst hEq
+        intro rep hmem
+        cases hmem with
+        | head => exact ⟨axs, List.mem_cons_self, hr, rfl⟩
+        | tail _ htlMem =>
+          obtain ⟨axs', hmem', ha', hcl'⟩ := ih htl rep htlMem
+          exact ⟨axs', List.mem_cons_of_mem _ hmem', ha', hcl'⟩
+
+/-- Per-declaration verdict of the `.test` module closure audit (`TrustedBoundary.downstreamAudit` L420–442). -/
+def CleanTestDep (pkg : PackageAuditInput) (allEnv : KernelEnv) (modName dep : SymName) : Prop :=
+  ∃ depCi, allEnv.lookup dep = some depCi ∧
+    depCi.isUnsafe = false ∧ depCi.isPartial = false ∧
+    (depCi.isAxiom = true →
+      dep ≠ SymName.sorryAxName ∧
+      SymName.isNativeReductionAxiom dep = false ∧
+      ((SymName.isFoundationalAxiom dep = true ∧ roleOfConst pkg dep depCi = .foundation) ∨
+        declaringModuleName pkg dep depCi = modName))
+
+theorem checkTestVisitedClosure_clean {pkg : PackageAuditInput} {allEnv : KernelEnv}
+    {modName rootName : SymName} :
+    ∀ (xs : List SymName),
+      checkTestVisitedClosure pkg allEnv modName rootName xs = .ok () →
+      ∀ dep ∈ xs, CleanTestDep pkg allEnv modName dep := by
+  intro xs
+  induction xs with
+  | nil => intro _ _ hm; cases hm
+  | cons d tl ih =>
+    intro hr dep hmem
+    unfold checkTestVisitedClosure at hr
+    dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hr
+    cases hlu : allEnv.lookup d with
+    | none => rw [hlu] at hr; cases hr
+    | some dCi =>
+      rw [hlu] at hr; dsimp only at hr
+      split at hr; · cases hr
+      rename_i hnotUP
+      have hsafe : dCi.isUnsafe = false ∧ dCi.isPartial = false := by
+        cases hu : dCi.isUnsafe <;> cases hp : dCi.isPartial
+        · exact ⟨rfl, rfl⟩
+        · exfalso; apply hnotUP; simp [hp]
+        · exfalso; apply hnotUP; simp [hu]
+        · exfalso; apply hnotUP; simp [hu]
+      split at hr
+      · rename_i hax
+        split at hr; · cases hr
+        rename_i hnotSorry
+        split at hr; · cases hr
+        rename_i hnotNat
+        have hnatF : SymName.isNativeReductionAxiom d = false := by
+          cases hn : SymName.isNativeReductionAxiom d
+          · rfl
+          · exact absurd hn hnotNat
+        split at hr
+        · rename_i hfound
+          simp only [Bool.and_eq_true, beq_iff_eq] at hfound
+          cases hmem with
+          | head =>
+            exact ⟨dCi, hlu, hsafe.1, hsafe.2, fun _ =>
+              ⟨fun hs => hnotSorry (by simp [hs]), hnatF, Or.inl hfound⟩⟩
+          | tail _ htl => exact ih hr dep htl
+        · split at hr
+          · rename_i hsame
+            cases hmem with
+            | head =>
+              exact ⟨dCi, hlu, hsafe.1, hsafe.2, fun _ =>
+                ⟨fun hs => hnotSorry (by simp [hs]), hnatF, Or.inr (beq_iff_eq.mp hsame)⟩⟩
+            | tail _ htl => exact ih hr dep htl
+          · cases hr
+      · rename_i hnotAx
+        cases hmem with
+        | head => exact ⟨dCi, hlu, hsafe.1, hsafe.2, fun ha => absurd ha hnotAx⟩
+        | tail _ htl => exact ih hr dep htl
+
+/-- The full audited environment: every module's zipped inventory layered over the base environment. -/
+def packageEnv (pkg : PackageAuditInput) : KernelEnv :=
+  KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv
+
+/-- Helper: every step of `auditAndReplayPackage` succeeded when the pipeline returned a certificate. -/
+theorem auditAndReplayPackage_elim {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    auditAllInventoriesAndSources cfg pkg.modules = .ok () ∧
+    firstDuplicate? (pkg.modules.map ModuleInventory.moduleName) = none ∧
+    hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
+      pkg.modules.flatMap ModuleInventory.constNames) = false ∧
+    validateImports pkg = .ok () ∧
+    auditAllModuleExtensions cfg pkg.modules (collectProtectedNames pkg) = .ok () ∧
+    auditExtraConstProvenance pkg (packageEnv pkg) = .ok () ∧
+    auditModuleDeclarations cfg pkg = .ok () ∧
+    auditPackageClosures cfg pkg (packageEnv pkg) = .ok cert.reachedAxioms ∧
+    buildVerifyItemReports cfg pkg (packageEnv pkg) pkg.verifyRoots = .ok cert.itemReports ∧
+    auditTestModuleClosures pkg (packageEnv pkg) = .ok () ∧
+    auditReservedOrigins pkg = .ok () ∧
+    replayCleanEnvOrdered (mkBaseKernelEnv pkg.baseEnv) cfg.kernelFuel
+      (allowReplayAxiom cfg pkg) (collectReplayDecls pkg) = .ok cert.replayedEnv ∧
+    cert.importedEnv = KernelEnv.finalizeImportedEnv pkg.modules := by
+  unfold auditAndReplayPackage at hAudit
+  dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hAudit
+  cases hstep1 : auditAllInventoriesAndSources cfg pkg.modules with
+  | error _ => rw [hstep1] at hAudit; cases hAudit
+  | ok u1 =>
+    cases u1; rw [hstep1] at hAudit; dsimp only at hAudit
+    cases hstep2a : firstDuplicate? (pkg.modules.map ModuleInventory.moduleName) with
+    | some _ => rw [hstep2a] at hAudit; cases hAudit
+    | none =>
+      rw [hstep2a] at hAudit; dsimp only at hAudit
+      split at hAudit; · cases hAudit
+      rename_i hdupNot
+      have hdup : hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
+          pkg.modules.flatMap ModuleInventory.constNames) = false := by
+        cases hd : hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
+            pkg.modules.flatMap ModuleInventory.constNames)
+        · rfl
+        · exact absurd hd hdupNot
+      cases hstep3 : validateImports pkg with
+      | error _ => rw [hstep3] at hAudit; cases hAudit
+      | ok u3 =>
+        cases u3; rw [hstep3] at hAudit; dsimp only at hAudit
+        cases hstep4 : auditAllModuleExtensions cfg pkg.modules (collectProtectedNames pkg) with
+        | error _ => rw [hstep4] at hAudit; cases hAudit
+        | ok u4 =>
+          cases u4; rw [hstep4] at hAudit; dsimp only at hAudit
+          cases hstep5 : auditExtraConstProvenance pkg
+              (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
+          | error _ => rw [hstep5] at hAudit; cases hAudit
+          | ok u5 =>
+            cases u5; rw [hstep5] at hAudit; dsimp only at hAudit
+            cases hstep6 : auditModuleDeclarations cfg pkg with
+            | error _ => rw [hstep6] at hAudit; cases hAudit
+            | ok u6 =>
+              cases u6; rw [hstep6] at hAudit; dsimp only at hAudit
+              cases hstep7a : auditPackageClosures cfg pkg
+                  (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
+              | error _ => rw [hstep7a] at hAudit; cases hAudit
+              | ok axs =>
+                rw [hstep7a] at hAudit; dsimp only at hAudit
+                cases hstep7b : buildVerifyItemReports cfg pkg
+                    (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv)
+                    pkg.verifyRoots with
+                | error _ => rw [hstep7b] at hAudit; cases hAudit
+                | ok reps =>
+                  rw [hstep7b] at hAudit; dsimp only at hAudit
+                  cases hstep7c : auditTestModuleClosures pkg
+                      (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
+                  | error _ => rw [hstep7c] at hAudit; cases hAudit
+                  | ok u7c =>
+                    cases u7c; rw [hstep7c] at hAudit; dsimp only at hAudit
+                    cases hstep7d : auditReservedOrigins pkg with
+                    | error _ => rw [hstep7d] at hAudit; cases hAudit
+                    | ok u7d =>
+                      cases u7d; rw [hstep7d] at hAudit; dsimp only at hAudit
+                      cases hstep8 : replayCleanEnvOrdered (mkBaseKernelEnv pkg.baseEnv)
+                          cfg.kernelFuel (allowReplayAxiom cfg pkg) (collectReplayDecls pkg) with
+                      | error _ => rw [hstep8] at hAudit; cases hAudit
+                      | ok repEnv =>
+                        rw [hstep8] at hAudit
+                        injection hAudit with hcert
+                        subst hcert
+                        exact ⟨rfl, rfl, hdup, rfl, rfl, hstep5, rfl, hstep7a, hstep7b, hstep7c,
+                          rfl, rfl, rfl⟩
+
+/-- Helper: every constant served by `cert.importedEnv` has the same type as a declaration that passed
+clean-env dependency-ordered kernel replay (itself, or its safe `.defnDecl` parent for `_unsafe_rec`). -/
+theorem importedEnv_type_replayed {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ n ci, cert.importedEnv.lookup n = some ci →
+      ∃ ci', cert.replayedEnv.lookup ci'.name = some ci' ∧ ci'.type = ci.type := by
+  obtain ⟨_, _, _, _, _, _, _, _, _, _, _, hrep, himp⟩ := auditAndReplayPackage_elim hAudit
+  intro n ci hlu
+  rw [himp] at hlu
+  have hmem := KernelEnv.lookup_mem hlu
+  rcases finalizeImportedEnv_mem_exists_mod pkg.modules (n, ci) hmem with ⟨inv, hinv, hzip⟩
+  have hciInInv : ci ∈ inv.constants := (List.of_mem_zip hzip).2
+  have ⟨_, hcontRep⟩ := replayCleanEnvOrdered_contains_decl hrep
+  by_cases hrec : isCodegenUnsafeRecInMod inv ci = true
+  · unfold isCodegenUnsafeRecInMod at hrec
+    split at hrec; · cases hrec
+    cases hpar : ci.name.unsafeRecParent? with
+    | none => rw [hpar] at hrec; cases hrec
+    | some parent =>
+      rw [hpar] at hrec; dsimp only at hrec
+      cases hfind : findConstByName inv.constants parent with
+      | none => rw [hfind] at hrec; cases hrec
+      | some parentCi =>
+        rw [hfind] at hrec
+        simp only [Bool.and_eq_true, beq_iff_eq] at hrec
+        rcases hrec with ⟨⟨⟨_, hpSafe⟩, _⟩, htypeEq⟩
+        have hpMem : parentCi ∈ inv.constants := List.mem_of_find?_eq_some hfind
+        have hpNotRec : isCodegenUnsafeRecInMod inv parentCi = false := by
+          unfold isCodegenUnsafeRecInMod
+          simp [hpSafe]
+        have hpInCollect : parentCi ∈ collectReplayDecls pkg := by
+          unfold collectReplayDecls
+          exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hpMem, by simp [hpNotRec]⟩⟩
+        exact ⟨parentCi, hcontRep parentCi hpInCollect, htypeEq.symm⟩
+  · have hrecF : isCodegenUnsafeRecInMod inv ci = false := by
+      cases hc : isCodegenUnsafeRecInMod inv ci
+      · rfl
+      · exact absurd hc hrec
+    have hciInCollect : ci ∈ collectReplayDecls pkg := by
+      unfold collectReplayDecls
+      exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hciInInv, by simp [hrecF]⟩⟩
+    exact ⟨ci, hcontRep ci hciInCollect, rfl⟩
+
+/--
 Theorem 3.3.4 (End-to-End Clean-Env Kernel Replay Soundness Theorem):
 If `auditAndReplayPackage cfg pkg = .ok cert`, then:
 1. Every module in `pkg.modules` satisfies `validateReplayInventory`, intact `.olean` parts,
@@ -5803,183 +7108,51 @@ theorem auditAndReplayPackage_sound {cfg : AuditConfig} {pkg : PackageAuditInput
        (∃ M' : SymName → SemVal, EnvSound cert.replayedEnv M') ∧
        (∀ n ci, cert.replayedEnv.lookup n = some ci → ci.type ≠ .const SymName.falseName) ∧
        (∀ n ci, cert.importedEnv.lookup n = some ci → ci.type ≠ .const SymName.falseName)) := by
-  unfold auditAndReplayPackage at hAudit
-  dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hAudit
-  cases hstep1 : auditAllInventoriesAndSources cfg pkg.modules with
-  | error _ => rw [hstep1] at hAudit; cases hAudit
-  | ok u1 =>
-    cases u1; rw [hstep1] at hAudit; dsimp only at hAudit
-    unfold auditAllInventoriesAndSources at hstep1
-    have hmod1 := checkEach_ok_mem hstep1
-    have hinvValid : ∀ inv ∈ pkg.modules,
-        validateReplayInventory inv = .ok () ∧
-        (∀ src, inv.sourceText? = some src →
-          SourceScanner.scanSourceDefenseInDepth cfg inv.moduleName inv.role src = .ok ()) := by
-      intro inv hinv
-      have h1 := hmod1 inv hinv
-      dsimp only [bind, Except.bind, pure, Except.pure] at h1
-      cases hv : validateReplayInventory inv with
-      | error _ => rw [hv] at h1; cases h1
-      | ok uv =>
-        cases uv; rw [hv] at h1; dsimp only at h1
-        refine ⟨rfl, fun src hsrc => ?_⟩
-        rw [hsrc] at h1; exact h1
-    split at hAudit; · cases hAudit
-    cases hstep3 : validateImports pkg with
-    | error _ => rw [hstep3] at hAudit; cases hAudit
-    | ok u3 =>
-      cases u3; rw [hstep3] at hAudit; dsimp only at hAudit
-      cases hstep4 : auditAllModuleExtensions cfg pkg.modules (collectProtectedNames pkg) with
-      | error _ => rw [hstep4] at hAudit; cases hAudit
-      | ok u4 =>
-        cases u4; rw [hstep4] at hAudit; dsimp only at hAudit
-        unfold auditAllModuleExtensions at hstep4
-        have hmodExt := checkEach_ok_mem hstep4
-        cases hstep5 : auditExtraConstProvenance pkg
-            (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
-        | error _ => rw [hstep5] at hAudit; cases hAudit
-        | ok u5 =>
-          cases u5; rw [hstep5] at hAudit; dsimp only at hAudit
-          cases hstep6 : auditModuleDeclarations cfg pkg with
-          | error _ => rw [hstep6] at hAudit; cases hAudit
-          | ok u6 =>
-            cases u6; rw [hstep6] at hAudit; dsimp only at hAudit
-            cases hstep7 : auditPackageClosures cfg pkg
-                (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
-            | error _ => rw [hstep7] at hAudit; cases hAudit
-            | ok axs =>
-              rw [hstep7] at hAudit; dsimp only at hAudit
-              cases hstep8 : replayCleanEnv (mkBaseKernelEnv pkg.baseEnv) cfg.kernelFuel
-                  (cfg.allowAssumptions || cfg.allowProvisionalNative)
-                  (collectReplayDecls pkg) with
-              | error _ => rw [hstep8] at hAudit; cases hAudit
-              | ok repEnv =>
-                rw [hstep8] at hAudit
-                injection hAudit with hcert
-                subst hcert
-                refine ⟨?_, rfl, ?_, ?_⟩
-                · intro inv hinv
-                  have ⟨hv, hsrc⟩ := hinvValid inv hinv
-                  have ⟨ho, hr, _, _, _, _, _⟩ := validateReplayInventory_elim hv
-                  exact ⟨hv, ho, hr, hsrc, hmodExt inv hinv⟩
-                · intro n ci hlu
-                  have hmem := KernelEnv.lookup_mem hlu
-                  rcases finalizeImportedEnv_mem_exists_mod pkg.modules (n, ci) hmem with ⟨inv, hinv, hzip⟩
-                  have hv := (hinvValid inv hinv).1
-                  have ⟨_, hmap⟩ := validInventory_length_eq hv
-                  have ⟨hkey, _⟩ := validInventory_key_eq_ci_name hv
-                  rw [← hmap] at hzip
-                  exact (hkey (n, ci) hzip).symm
-                · intro hNoA hNoP M hBaseM
-                  have hrep := hstep8
-                  simp only [hNoA, hNoP, Bool.or_self] at hrep
-                  rcases replayCleanEnv_preserves_sound hBaseM cfg.kernelFuel _ hrep with ⟨M', hM'⟩
-                  have hnoFalseRep := kernelEnv_no_false hM'
-                  refine ⟨⟨M', hM'⟩, hnoFalseRep, ?_⟩
-                  intro n ci hlu hty
-                  have hmem := KernelEnv.lookup_mem hlu
-                  rcases finalizeImportedEnv_mem_exists_mod pkg.modules (n, ci) hmem with ⟨inv, hinv, hzip⟩
-                  have hciInInv : ci ∈ inv.constants := List.of_mem_zip hzip |>.2
-                  have ⟨_, hcontRep⟩ := replayCleanEnv_contains_decl hrep
-                  by_cases hrec : isCodegenUnsafeRecInMod inv ci = true
-                  · unfold isCodegenUnsafeRecInMod at hrec
-                    split at hrec; · cases hrec
-                    cases hpar : ci.name.unsafeRecParent? with
-                    | none => rw [hpar] at hrec; cases hrec
-                    | some parent =>
-                      rw [hpar] at hrec; dsimp only at hrec
-                      cases hfind : findConstByName inv.constants parent with
-                      | none => rw [hfind] at hrec; cases hrec
-                      | some parentCi =>
-                        rw [hfind] at hrec
-                        simp only [Bool.and_eq_true, beq_iff_eq] at hrec
-                        rcases hrec with ⟨⟨hpSafe, _⟩, htypeEq⟩
-                        have hpMem : parentCi ∈ inv.constants := List.mem_of_find?_eq_some hfind
-                        have hpNotRec : isCodegenUnsafeRecInMod inv parentCi = false := by
-                          unfold isCodegenUnsafeRecInMod
-                          simp [hpSafe]
-                        have hpInCollect : parentCi ∈ collectReplayDecls pkg := by
-                          unfold collectReplayDecls
-                          exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hpMem, by simp [hpNotRec]⟩⟩
-                        have hpInRep := hcontRep parentCi hpInCollect
-                        exact hnoFalseRep parentCi.name parentCi hpInRep (htypeEq.symm.trans hty)
-                  · have hrecF : isCodegenUnsafeRecInMod inv ci = false := by
-                      cases hc : isCodegenUnsafeRecInMod inv ci
-                      · rfl
-                      · exact absurd hc hrec
-                    have hciInCollect : ci ∈ collectReplayDecls pkg := by
-                      unfold collectReplayDecls
-                      exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hciInInv, by simp [hrecF]⟩⟩
-                    have hciInRep := hcontRep ci hciInCollect
-                    exact hnoFalseRep ci.name ci hciInRep hty
+  obtain ⟨hstep1, _, _, hstep3, hstep4, _, _, _, _, _, _, hstep8, himp⟩ :=
+    auditAndReplayPackage_elim hAudit
+  unfold auditAllInventoriesAndSources at hstep1
+  have hmod1 := checkEach_ok_mem hstep1
+  have hinvValid : ∀ inv ∈ pkg.modules,
+      validateReplayInventory inv = .ok () ∧
+      (∀ src, inv.sourceText? = some src →
+        SourceScanner.scanSourceDefenseInDepth cfg inv.moduleName inv.role src = .ok ()) := by
+    intro inv hinv
+    have h1 := hmod1 inv hinv
+    dsimp only [bind, Except.bind, pure, Except.pure] at h1
+    cases hv : validateReplayInventory inv with
+    | error _ => rw [hv] at h1; cases h1
+    | ok uv =>
+      cases uv; rw [hv] at h1; dsimp only at h1
+      refine ⟨rfl, fun src hsrc => ?_⟩
+      rw [hsrc] at h1; exact h1
+  unfold auditAllModuleExtensions at hstep4
+  have hmodExt := checkEach_ok_mem hstep4
+  refine ⟨?_, hstep3, ?_, ?_⟩
+  · intro inv hinv
+    have ⟨hv, hsrc⟩ := hinvValid inv hinv
+    have ⟨ho, hr, _, _, _, _, _⟩ := validateReplayInventory_elim hv
+    exact ⟨hv, ho, hr, hsrc, hmodExt inv hinv⟩
+  · intro n ci hlu
+    rw [himp] at hlu
+    have hmem := KernelEnv.lookup_mem hlu
+    rcases finalizeImportedEnv_mem_exists_mod pkg.modules (n, ci) hmem with ⟨inv, hinv, hzip⟩
+    have hv := (hinvValid inv hinv).1
+    have ⟨_, hmap⟩ := validInventory_length_eq hv
+    have ⟨hkey, _⟩ := validInventory_key_eq_ci_name hv
+    rw [← hmap] at hzip
+    exact (hkey (n, ci) hzip).symm
+  · intro hNoA hNoP M hBaseM
+    have hallowEq : allowReplayAxiom cfg pkg = fun _ => false := by
+      funext _; simp [allowReplayAxiom, hNoA, hNoP]
+    rw [hallowEq] at hstep8
+    rcases replayCleanEnvOrdered_preserves_sound hBaseM cfg.kernelFuel _ hstep8 with ⟨M', hM'⟩
+    have hnoFalseRep := kernelEnv_no_false hM'
+    refine ⟨⟨M', hM'⟩, hnoFalseRep, ?_⟩
+    intro n ci hlu hty
+    obtain ⟨ci', hlu', hty'⟩ := importedEnv_type_replayed hAudit n ci hlu
+    exact hnoFalseRep ci'.name ci' hlu' (hty'.trans hty)
 
-/-! ### Section 8.2: Pipeline-Level Closure, Statement-Origin, Uniqueness, & Semantic Theorems -/
-
-/-- The full audited environment: every module's zipped inventory layered over the base environment. -/
-def packageEnv (pkg : PackageAuditInput) : KernelEnv :=
-  KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv
-
-/-- Helper: every step of `auditAndReplayPackage` succeeded when the pipeline returned a certificate. -/
-theorem auditAndReplayPackage_elim {cfg : AuditConfig} {pkg : PackageAuditInput}
-    {cert : AuditCertificate}
-    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
-    auditAllInventoriesAndSources cfg pkg.modules = .ok () ∧
-    hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
-      pkg.modules.flatMap ModuleInventory.constNames) = false ∧
-    validateImports pkg = .ok () ∧
-    auditAllModuleExtensions cfg pkg.modules (collectProtectedNames pkg) = .ok () ∧
-    auditExtraConstProvenance pkg (packageEnv pkg) = .ok () ∧
-    auditModuleDeclarations cfg pkg = .ok () ∧
-    auditPackageClosures cfg pkg (packageEnv pkg) = .ok cert.reachedAxioms ∧
-    replayCleanEnv (mkBaseKernelEnv pkg.baseEnv) cfg.kernelFuel
-      (cfg.allowAssumptions || cfg.allowProvisionalNative) (collectReplayDecls pkg) =
-      .ok cert.replayedEnv ∧
-    cert.importedEnv = KernelEnv.finalizeImportedEnv pkg.modules := by
-  unfold auditAndReplayPackage at hAudit
-  dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hAudit
-  cases hstep1 : auditAllInventoriesAndSources cfg pkg.modules with
-  | error _ => rw [hstep1] at hAudit; cases hAudit
-  | ok u1 =>
-    cases u1; rw [hstep1] at hAudit; dsimp only at hAudit
-    split at hAudit; · cases hAudit
-    rename_i hdupNot
-    have hdup : hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
-        pkg.modules.flatMap ModuleInventory.constNames) = false := by
-      cases hd : hasDuplicates (pkg.baseEnv.map ConstantRecord.name ++
-          pkg.modules.flatMap ModuleInventory.constNames)
-      · rfl
-      · exact absurd hd hdupNot
-    cases hstep3 : validateImports pkg with
-    | error _ => rw [hstep3] at hAudit; cases hAudit
-    | ok u3 =>
-      cases u3; rw [hstep3] at hAudit; dsimp only at hAudit
-      cases hstep4 : auditAllModuleExtensions cfg pkg.modules (collectProtectedNames pkg) with
-      | error _ => rw [hstep4] at hAudit; cases hAudit
-      | ok u4 =>
-        cases u4; rw [hstep4] at hAudit; dsimp only at hAudit
-        cases hstep5 : auditExtraConstProvenance pkg
-            (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
-        | error _ => rw [hstep5] at hAudit; cases hAudit
-        | ok u5 =>
-          cases u5; rw [hstep5] at hAudit; dsimp only at hAudit
-          cases hstep6 : auditModuleDeclarations cfg pkg with
-          | error _ => rw [hstep6] at hAudit; cases hAudit
-          | ok u6 =>
-            cases u6; rw [hstep6] at hAudit; dsimp only at hAudit
-            cases hstep7 : auditPackageClosures cfg pkg
-                (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv) with
-            | error _ => rw [hstep7] at hAudit; cases hAudit
-            | ok axs =>
-              rw [hstep7] at hAudit; dsimp only at hAudit
-              cases hstep8 : replayCleanEnv (mkBaseKernelEnv pkg.baseEnv) cfg.kernelFuel
-                  (cfg.allowAssumptions || cfg.allowProvisionalNative)
-                  (collectReplayDecls pkg) with
-              | error _ => rw [hstep8] at hAudit; cases hAudit
-              | ok repEnv =>
-                rw [hstep8] at hAudit
-                injection hAudit with hcert
-                subst hcert
-                exact ⟨rfl, hdup, rfl, rfl, hstep5, rfl, hstep7, rfl, rfl⟩
+/-! ### Section 8.2: Pipeline-Level Closure, Statement-Origin, Uniqueness, Per-Item, Test, & Semantic Theorems -/
 
 /--
 Theorem 3.3.1e (Package-Wide Global Name Uniqueness): an audited package has no constant name
@@ -5990,7 +7163,14 @@ theorem auditAndReplayPackage_global_names_nodup {cfg : AuditConfig} {pkg : Pack
     (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
     (pkg.baseEnv.map ConstantRecord.name ++
       pkg.modules.flatMap ModuleInventory.constNames).Nodup :=
-  (hasDuplicates_eq_false_iff_nodup _).mp (auditAndReplayPackage_elim hAudit).2.1
+  (hasDuplicates_eq_false_iff_nodup _).mp (auditAndReplayPackage_elim hAudit).2.2.1
+
+/-- Module-name uniqueness across `pkg.modules`: zero duplicate module inventories. -/
+theorem auditAndReplayPackage_modules_nodup {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    (pkg.modules.map ModuleInventory.moduleName).Nodup :=
+  (firstDuplicate?_eq_none_iff_nodup _).mp (auditAndReplayPackage_elim hAudit).2.1
 
 /-- Helper: every invariant established by a successful `auditVerifyRoot`. -/
 theorem auditVerifyRoot_elim {cfg : AuditConfig} {pkg : PackageAuditInput} {allEnv : KernelEnv}
@@ -6128,7 +7308,7 @@ theorem auditAndReplayPackage_closure_sound {cfg : AuditConfig} {pkg : PackageAu
       (root ∈ closureRootsOfPackage pkg ∨ root ∈ pkg.verifyRoots ∨ root ∈ pkg.claimRoots) →
       ∀ dep, DepReaches (packageEnv pkg) root dep → CleanDep pkg (packageEnv pkg) dep := by
   obtain ⟨hmods, hverify, hclaim⟩ :=
-    auditPackageClosures_elim (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.1
+    auditPackageClosures_elim (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.1
   intro root hroot dep hreach
   rcases hroot with hr | hr | hr
   · obtain ⟨a, ha⟩ := hmods root hr
@@ -6139,6 +7319,122 @@ theorem auditAndReplayPackage_closure_sound {cfg : AuditConfig} {pkg : PackageAu
   · obtain ⟨a, ha⟩ := hclaim root hr
     obtain ⟨_, _, _, _, hdc⟩ := auditClaimRoot_elim ha
     exact validPackage_axiom_closure_sound hNoAssump hNoProv hdc dep hreach
+
+/--
+Per-Root Status Classification Soundness (holds for ANY `cfg`, including mixed packages where
+`allowAssumptions = true` or `allowProvisionalNative = true`!):
+If a verified root's `VerifyItemReport` in `cert.itemReports` has `status = .verifiedUnconditional`,
+then EVERY declaration reachable from `rep.root` via `DepReaches` is a `CleanDep` (zero assumptions,
+zero `._native.*` axioms, zero `sorryAx`, zero `unsafe`/`partial`).
+-/
+theorem auditAndReplayPackage_item_status_sound {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ rep ∈ cert.itemReports,
+      rep.status = .verifiedUnconditional →
+      ∀ dep, DepReaches (packageEnv pkg) rep.root dep → CleanDep pkg (packageEnv pkg) dep := by
+  have hreps := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.1
+  intro rep hrepMem hUncond dep hreach
+  obtain ⟨axs, _, hvOk, hrepEq⟩ := buildVerifyItemReports_ok_mem hreps rep hrepMem
+  obtain ⟨_, _, _, _, _, _, hdc⟩ := auditVerifyRoot_elim hvOk
+  unfold auditDirectClosure at hdc
+  cases hwalk : walkGraph (packageEnv pkg) rep.root closureExpand
+      (closureFuel (packageEnv pkg)) [rep.root] [] with
+  | error _ => rw [hwalk] at hdc; cases hdc
+  | ok visited =>
+    rw [hwalk] at hdc; dsimp only at hdc
+    have hdepMem : dep ∈ visited :=
+      (walkGraph_reaches_subset hwalk).1 rep.root List.mem_cons_self dep hreach
+    rcases checkVisitedClosure_general visited [] axs hdc dep hdepMem with hClean | ⟨dCi, hlu, _, hInAxs, hBad⟩
+    · exact hClean
+    · exfalso
+      have hst : (classifyVerifyItem pkg (packageEnv pkg) rep.root axs).status = .verifiedUnconditional := by
+        rw [← hrepEq]; exact hUncond
+      unfold classifyVerifyItem at hst
+      dsimp only at hst
+      split at hst
+      · cases hst
+      · rename_i hNatEmptyNot
+        split at hst
+        · cases hst
+        · rename_i hAssumpEmptyNot
+          have hNatEmpty : (axs.filter fun ax => SymName.isNativeReductionAxiom ax) = [] := by
+            cases hne : (axs.filter fun ax => SymName.isNativeReductionAxiom ax)
+            · rfl
+            · exfalso; apply hNatEmptyNot; rw [hne]; rfl
+          have hAssumpEmpty : (axs.filter fun ax =>
+              !SymName.isNativeReductionAxiom ax &&
+              !(SymName.isFoundationalAxiom ax &&
+                match (packageEnv pkg).lookup ax with
+                | some ci => roleOfConst pkg ax ci == .foundation
+                | none => false)) = [] := by
+            cases hae : (axs.filter fun ax =>
+                !SymName.isNativeReductionAxiom ax &&
+                !(SymName.isFoundationalAxiom ax &&
+                  match (packageEnv pkg).lookup ax with
+                  | some ci => roleOfConst pkg ax ci == .foundation
+                  | none => false))
+            · rfl
+            · exfalso; apply hAssumpEmptyNot; rw [hae]; rfl
+          rcases hBad with hNatTrue | hNotFound
+          · have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
+              List.mem_filter.mpr ⟨hInAxs, hNatTrue⟩
+            rw [hNatEmpty] at hmemF; cases hmemF
+          · cases hnatD : SymName.isNativeReductionAxiom dep with
+            | true =>
+              have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
+                List.mem_filter.mpr ⟨hInAxs, hnatD⟩
+              rw [hNatEmpty] at hmemF; cases hmemF
+            | false =>
+              have hpred : (!SymName.isNativeReductionAxiom dep &&
+                  !(SymName.isFoundationalAxiom dep &&
+                    match (packageEnv pkg).lookup dep with
+                    | some ci => roleOfConst pkg dep ci == .foundation
+                    | none => false)) = true := by
+                rw [hnatD, hlu]
+                simp only [Bool.not_false, Bool.true_and, Bool.not_eq_true']
+                cases hf : SymName.isFoundationalAxiom dep
+                · rfl
+                · cases hr : (roleOfConst pkg dep dCi == ModuleRole.foundation)
+                  · rfl
+                  · exact absurd ⟨hf, beq_iff_eq.mp hr⟩ hNotFound
+              have hmemA : dep ∈ axs.filter (fun ax =>
+                  !SymName.isNativeReductionAxiom ax &&
+                  !(SymName.isFoundationalAxiom ax &&
+                    match (packageEnv pkg).lookup ax with
+                    | some ci => roleOfConst pkg ax ci == .foundation
+                    | none => false)) :=
+                List.mem_filter.mpr ⟨hInAxs, hpred⟩
+              rw [hAssumpEmpty] at hmemA; cases hmemA
+
+/--
+Test-Module Closure Soundness (`TrustedBoundary.downstreamAudit` lines 420–442):
+Every non-`_unsafe_rec` declaration in every `.test` module of an audited package has its ENTIRE
+`DepReaches` closure satisfy `CleanTestDep` (zero `sorryAx`, zero native-reduction/compiler-trust
+axioms, zero `unsafe`/`partial`, and zero foreign non-foundational axioms).
+-/
+theorem auditAndReplayPackage_test_closures_clean {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, inv.role = .test →
+      ∀ ci ∈ inv.constants, isCodegenUnsafeRecInMod inv ci = false →
+        ∀ dep, DepReaches (packageEnv pkg) ci.name dep →
+          CleanTestDep pkg (packageEnv pkg) inv.moduleName dep := by
+  have htests := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.2.1
+  unfold auditTestModuleClosures at htests
+  intro inv hinv hrole ci hci hnotRec dep hreach
+  have hmod := checkEach_ok_mem htests inv hinv
+  simp only [hrole, beq_self_eq_true, ↓reduceIte] at hmod
+  have hdecl := checkEach_ok_mem hmod ci hci
+  dsimp only [bind, Except.bind, pure, Except.pure] at hdecl
+  simp only [hnotRec, Bool.not_false, ↓reduceIte] at hdecl
+  cases hwalk : walkGraph (packageEnv pkg) ci.name closureExpand
+      (closureFuel (packageEnv pkg)) [ci.name] [] with
+  | error _ => rw [hwalk] at hdecl; cases hdecl
+  | ok visited =>
+    rw [hwalk] at hdecl; dsimp only at hdecl
+    exact checkTestVisitedClosure_clean visited hdecl dep
+      ((walkGraph_reaches_subset hwalk).1 ci.name List.mem_cons_self dep hreach)
 
 /--
 Theorem 3.3.3-Stmt (Pipeline-Level Verify-Root Header & Statement-Origin Soundness): every verify
@@ -6158,7 +7454,7 @@ theorem auditAndReplayPackage_verifyRoots_sound {cfg : AuditConfig} {pkg : Packa
         GraphReaches (packageEnv pkg) (statementExpand pkg root) r d →
         ∃ dCi, (packageEnv pkg).lookup d = some dCi ∧ roleOfConst pkg d dCi ≠ .theory) := by
   obtain ⟨_, hverify, _⟩ :=
-    auditPackageClosures_elim (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.1
+    auditPackageClosures_elim (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.1
   intro root hr
   obtain ⟨a, ha⟩ := hverify root hr
   obtain ⟨ci, hl, hk, hhead, hloc, ⟨visited, hw⟩, _⟩ := auditVerifyRoot_elim ha
@@ -6179,52 +7475,6 @@ theorem kernelEnv_prop_types_true {env : KernelEnv} {M : SymName → SemVal}
   exact hinh.2
 
 /--
-Helper: every constant served by `cert.importedEnv` has the same type as a declaration that passed
-clean-env kernel replay (itself, or its safe parent when it is a verified `_unsafe_rec` companion).
--/
-theorem importedEnv_type_replayed {cfg : AuditConfig} {pkg : PackageAuditInput}
-    {cert : AuditCertificate}
-    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
-    ∀ n ci, cert.importedEnv.lookup n = some ci →
-      ∃ ci', cert.replayedEnv.lookup ci'.name = some ci' ∧ ci'.type = ci.type := by
-  obtain ⟨_, _, _, _, _, _, _, hrep, himp⟩ := auditAndReplayPackage_elim hAudit
-  intro n ci hlu
-  rw [himp] at hlu
-  have hmem := KernelEnv.lookup_mem hlu
-  rcases finalizeImportedEnv_mem_exists_mod pkg.modules (n, ci) hmem with ⟨inv, hinv, hzip⟩
-  have hciInInv : ci ∈ inv.constants := (List.of_mem_zip hzip).2
-  have ⟨_, hcontRep⟩ := replayCleanEnv_contains_decl hrep
-  by_cases hrec : isCodegenUnsafeRecInMod inv ci = true
-  · unfold isCodegenUnsafeRecInMod at hrec
-    split at hrec; · cases hrec
-    cases hpar : ci.name.unsafeRecParent? with
-    | none => rw [hpar] at hrec; cases hrec
-    | some parent =>
-      rw [hpar] at hrec; dsimp only at hrec
-      cases hfind : findConstByName inv.constants parent with
-      | none => rw [hfind] at hrec; cases hrec
-      | some parentCi =>
-        rw [hfind] at hrec
-        simp only [Bool.and_eq_true, beq_iff_eq] at hrec
-        rcases hrec with ⟨⟨hpSafe, _⟩, htypeEq⟩
-        have hpMem : parentCi ∈ inv.constants := List.mem_of_find?_eq_some hfind
-        have hpNotRec : isCodegenUnsafeRecInMod inv parentCi = false := by
-          unfold isCodegenUnsafeRecInMod
-          simp [hpSafe]
-        have hpInCollect : parentCi ∈ collectReplayDecls pkg := by
-          unfold collectReplayDecls
-          exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hpMem, by simp [hpNotRec]⟩⟩
-        exact ⟨parentCi, hcontRep parentCi hpInCollect, htypeEq.symm⟩
-  · have hrecF : isCodegenUnsafeRecInMod inv ci = false := by
-      cases hc : isCodegenUnsafeRecInMod inv ci
-      · rfl
-      · exact absurd hc hrec
-    have hciInCollect : ci ∈ collectReplayDecls pkg := by
-      unfold collectReplayDecls
-      exact List.mem_flatMap.mpr ⟨inv, hinv, List.mem_filter.mpr ⟨hciInInv, by simp [hrecF]⟩⟩
-    exact ⟨ci, hcontRep ci hciInCollect, rfl⟩
-
-/--
 Theorem 3.3.4-Sem (End-to-End SEMANTIC Soundness): under the unconditional configuration and any
 sound model of the base environment, the replayed environment has a sound model `M'` in which
 every constant of `cert.replayedEnv` AND every constant served by `cert.importedEnv` whose type
@@ -6243,9 +7493,11 @@ theorem auditAndReplayPackage_semantic_sound {cfg : AuditConfig} {pkg : PackageA
         ∀ P : Prop, evalExpr M' [] ci.type = .prop P → P) ∧
       (∀ n ci, cert.importedEnv.lookup n = some ci →
         ∀ P : Prop, evalExpr M' [] ci.type = .prop P → P) := by
-  have hrep := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.1
-  simp only [hNoAssump, hNoProv, Bool.or_self] at hrep
-  rcases replayCleanEnv_preserves_sound hBase cfg.kernelFuel _ hrep with ⟨M', hM'⟩
+  have hrep := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.2.2.2.1
+  have hallowEq : allowReplayAxiom cfg pkg = fun _ => false := by
+    funext _; simp [allowReplayAxiom, hNoAssump, hNoProv]
+  rw [hallowEq] at hrep
+  rcases replayCleanEnvOrdered_preserves_sound hBase cfg.kernelFuel _ hrep with ⟨M', hM'⟩
   refine ⟨M', hM', kernelEnv_prop_types_true hM', ?_⟩
   intro n ci hlu P hP
   obtain ⟨ci', hlu', hty⟩ := importedEnv_type_replayed hAudit n ci hlu
@@ -7761,18 +9013,22 @@ theorem sourceScanner_hardened_lexer_no_false_positive :
 def provisionalNativeAxName : SymName :=
   SymName.ofList ["Proof", "Native", "usesNative", "_native", "native_decide", "ax_1"]
 
+/-- Canonical `@Eq Bool Bool.true Bool.true` type matching `Lean/Meta/Native.lean` line 75. -/
+def validNativeAxiomTypeExpr : ExprSkeleton :=
+  .app (.app (.const SymName.eqBoolName) (.const SymName.boolTrueName)) (.const SymName.boolTrueName)
+
 /-- A compiler-style `._native.*` evaluation axiom (Lean 4.34.1 `Lean/Meta/Native.lean` line 75). -/
 def provisionalNativeAxDecl : ConstantRecord := {
   name := provisionalNativeAxName
   kind := .axiomDecl
-  type := .const SymName.trueName
+  type := validNativeAxiomTypeExpr
   originModule := pillarProofMod
 }
 
 def provisionalNativeThmDecl : ConstantRecord := {
   name := pillarThmName
   kind := .thmDecl
-  type := .const SymName.trueName
+  type := validNativeAxiomTypeExpr
   value? := some (.const provisionalNativeAxName)
   hasValue := true
   all := [pillarThmName]
@@ -7803,9 +9059,8 @@ def specNativeAxPkg : PackageAuditInput := {
 
 /--
 `pillar_1` provisional scoping:
-1. Under `--provisional`, a `._native.*` evaluation axiom declared by a `Proof.*` module is admitted,
-   and the certificate RECORDS it in `reachedAxioms` (so the item can never be reported as
-   unconditional).
+1. Under `--provisional`, a `._native.*` evaluation axiom of valid `@Eq Bool e Bool.true` shape
+   declared by a `Proof.*` module is admitted and recorded in `reachedAxioms`.
 2. The same package is rejected under the unconditional configuration.
 3. Even under `--provisional`, a proof-module axiom that reuses the name `Lean.ofReduceBool` (here
    with type `False`) is rejected: only compiler-generated `._native.*` names may be declared.
@@ -7821,5 +9076,439 @@ theorem pillar1_provisional_scoping :
     auditAndReplayPackage provisionalConfig specNativeAxPkg =
       .error (.forbiddenNativeReductionAxiom specNativeAxName specNativeAxName) := by
   refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ### Section 9.7: Pass-`A1` Hardening Regressions (Lexer Desyncs, `Defs` Hooks, `.test` Closures, Native Type Shape, Dependency-Ordered Replay, Per-Root Classification, `subsumesInfo`) -/
+
+/--
+Regression (Pass-`A1` lexer & token-qualification fixes):
+1. Guillemet `«}"»` inside an interpolation hole (`s!"{«}"»}"`, valid Lean 4.34.1) previously
+   desynchronised `B1`'s 27-state lexer and swallowed `set_option debug.skipKernelTC true`; now
+   fails closed with `.unsupportedSourceLexing`.
+2. Backtick name literal `` `r `` immediately before a string (`g `r"\""`) previously entered raw
+   string mode in `B1`'s lexer and swallowed `debug.skipKernelTC`; now `sawBacktick` matches
+   `Lean/Parser/Basic.lean` line 1036 and exposes `debug.skipKernelTC`.
+3. `_root_.Lean.ofReduceBool` and `_root_.Lean.trustCompiler` previously evaded exact-token
+   `nativeTokens` matching; now dot-suffix matching catches them unconditionally (even under
+   `provisionalConfig`!).
+4. Primed identifier inside an interpolation hole (`s!"{x'}"`) no longer false-positives!
+-/
+theorem passA1_lexer_and_root_qualification_hardened :
+    scanProofChars ("def s := s!\"{".toList ++ ['«'] ++ "}\"".toList ++ ['»'] ++
+      "}\"\nset_option debug.skipKernelTC true\n-- \"".toList) =
+      .error (.unsupportedSourceLexing topicProofModName
+        "ambiguous char literal or string-interpolation hole") ∧
+    scanProofSource "def x := g `r\"\\\"\"\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "theorem t := _root_.Lean.ofReduceBool true true rfl" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    SourceScanner.scanSourceDefenseInDepth provisionalConfig topicProofModName .proof
+      "theorem t : True := _root_.Lean.trustCompiler" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "def s (x' : Nat) := s!\"v={x'}\"" = .ok () := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `Topic.Defs` (`.defsExempt`) carrying `V10` `initialize` hook, `V01` hijack macro, `V13` reducibility override, or `V15` `Init` shadow is now REJECTED! -/
+def defsV10InitPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.regularInitHook (SymName.ofList ["Topic", "Defs", "evilInit"])])
+  ]
+}
+
+def defsV01MacroPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.macroEntry (SymName.ofList ["Topic", "Defs", "hijack"])
+        (SymName.ofList ["Lean", "Parser", "Command", "audit"])])
+  ]
+}
+
+def defsV13ReducPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.reducibilityOverride SymName.natAddName (SymName.ofList ["Init", "Prelude"]) "reducible"])
+  ]
+}
+
+def defsV15ShadowInitName : SymName := SymName.ofList ["Topic", "Defs", "Nat", "add"]
+def defsV15ShadowInitPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [
+      { defsBeforeDecl with name := defsV15ShadowInitName, all := [defsV15ShadowInitName] }
+    ]
+  ]
+}
+
+def defsBenignCoeAndInstPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [
+        .instanceEntry topicDefsLocalInstName defsBeforeName topicDefsModName false,
+        .coeEntry (SymName.ofList ["Topic", "Defs", "coeBefore"]) defsBeforeName SymName.natName,
+        .defaultInstanceEntry (SymName.ofList ["Topic", "Defs", "defInstBefore"]) defsBeforeName
+      ])
+  ]
+}
+
+theorem passA1_defsExempt_cannot_bypass_hooks_macros_reducibility_or_init_shadow :
+    auditAndReplayPackage defaultUnconditionalConfig defsV10InitPkg =
+      .error (.forbiddenInitOrCodegenHook topicDefsModName "initialize"
+        (SymName.ofList ["Topic", "Defs", "evilInit"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsV01MacroPkg =
+      .error (.forbiddenMacroOrElab topicDefsModName "macro"
+        (SymName.ofList ["Topic", "Defs", "hijack"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsV13ReducPkg =
+      .error (.forbiddenReducibilityOverride topicDefsModName SymName.natAddName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsV15ShadowInitPkg =
+      .error (.forbiddenShadowingOrExport topicDefsModName defsV15ShadowInitName SymName.natAddName) ∧
+    (auditAndReplayPackage defaultUnconditionalConfig defsBenignCoeAndInstPkg).isOk = true := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `.test` module closure & axiom hardening (`TrustedBoundary.downstreamAudit` lines 420–442). -/
+def topicTestsModName : SymName := SymName.ofList ["Topic", "Tests"]
+def testSorryThmName : SymName := SymName.ofList ["Topic", "Tests", "usesSorry"]
+def testEvilAxName : SymName := SymName.ofList ["Topic", "Tests", "evilAx"]
+def assumpModName : SymName := SymName.ofList ["Assumptions", "Hw"]
+def assumpAxName : SymName := SymName.ofList ["Assumptions", "Hw", "mmioOk"]
+
+def testSorryPkg : PackageAuditInput := {
+  baseEnv := sorryAxDecl :: standardBaseDecls
+  modules := [
+    mkAlignedModule topicTestsModName .test [
+      { name := testSorryThmName, kind := .thmDecl, type := .const SymName.trueName,
+        value? := some (.app (.lam (.const SymName.falseName) (.const SymName.trueIntroName))
+          (.const SymName.sorryAxName)),
+        hasValue := true, all := [testSorryThmName], originModule := topicTestsModName }
+    ]
+  ]
+}
+
+def testEvilAxDecl : ConstantRecord := {
+  name := testEvilAxName
+  kind := .axiomDecl
+  type := .const SymName.falseName
+  originModule := topicTestsModName
+}
+
+def testAxiomPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicTestsModName .test [testEvilAxDecl]]
+}
+
+def assumptionsOnlyConfig : AuditConfig := {
+  allowAssumptions := true
+  allowProvisionalNative := false
+  allowLocalTestAxioms := false
+  enforceStrictProofs := true
+  kernelFuel := 16
+}
+
+def localTestAxiomConfig : AuditConfig := {
+  allowAssumptions := true
+  allowProvisionalNative := false
+  allowLocalTestAxioms := true
+  enforceStrictProofs := true
+  kernelFuel := 16
+}
+
+def testForeignAxPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule assumpModName .assumptions [
+      { name := assumpAxName, kind := .axiomDecl, type := .const SymName.trueName,
+        originModule := assumpModName }
+    ],
+    mkAlignedModule topicTestsModName .test [
+      { name := testSorryThmName, kind := .thmDecl, type := .const SymName.trueName,
+        value? := some (.const assumpAxName), hasValue := true,
+        all := [testSorryThmName], originModule := topicTestsModName }
+    ]
+  ]
+}
+
+theorem passA1_test_module_closures_and_axioms_hardened :
+    auditAndReplayPackage defaultUnconditionalConfig testSorryPkg =
+      .error (.forbiddenAxiom testSorryThmName SymName.sorryAxName (SymName.ofList ["Init", "Prelude"])) ∧
+    auditAndReplayPackage assumptionsOnlyConfig testAxiomPkg =
+      .error (.forbiddenAxiom testEvilAxName testEvilAxName topicTestsModName) ∧
+    auditAndReplayPackage localTestAxiomConfig testForeignAxPkg =
+      .error (.testModuleForeignAxiom topicTestsModName testSorryThmName assumpAxName assumpModName) ∧
+    (auditAndReplayPackage localTestAxiomConfig testAxiomPkg).isOk = true := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Even under `--provisional`, a `._native.*` axiom with type `False` (not `@Eq Bool e Bool.true`) is REJECTED! -/
+def provFalseAxName : SymName :=
+  SymName.ofList ["Proof", "Native", "f", "_native", "decide", "ax_1"]
+
+def provFalseAxiomPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule pillarProofMod .proof [
+      { name := provFalseAxName, kind := .axiomDecl, type := .const SymName.falseName,
+        originModule := pillarProofMod }
+    ]
+  ]
+}
+
+theorem passA1_provisional_native_rejects_false_type :
+    auditAndReplayPackage provisionalConfig provFalseAxiomPkg =
+      .error (.invalidNativeAxiomType provFalseAxName provFalseAxName) := rfl
+
+/--
+Dependency-ordered clean-env replay (`replayCleanEnvOrdered`):
+1. Accepts a valid out-of-order `.olean` inventory (`[usesHelper, helper]`, matching real hash-map order).
+2. Accepts a valid reverse-ordered inductive bundle (`[T.rec, T.mk, T]`).
+3. Rejects cyclic mutual definitions (`a` depends on `b`, `b` depends on `a`) with `.cyclicDependency`.
+-/
+def oooHelperName : SymName := SymName.ofList ["Topic", "Proofs", "helper"]
+def oooUsesName : SymName := SymName.ofList ["Topic", "Proofs", "usesHelper"]
+
+def oooValidPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [
+      { name := oooUsesName, kind := .thmDecl, type := .const SymName.trueName,
+        value? := some (.const oooHelperName), hasValue := true,
+        all := [oooUsesName], originModule := topicProofModName },
+      { name := oooHelperName, kind := .thmDecl, type := .const SymName.trueName,
+        value? := some (.const SymName.trueIntroName), hasValue := true,
+        all := [oooHelperName], originModule := topicProofModName }
+    ]
+  ]
+}
+
+def oooReverseIndPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule demoModName .proof [demoRecDecl, demoCtorDecl, demoIndDecl]
+  ]
+}
+
+def cycAName : SymName := SymName.ofList ["Topic", "Proofs", "cycA"]
+def cycBName : SymName := SymName.ofList ["Topic", "Proofs", "cycB"]
+
+def cyclicDefsPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [
+      { name := cycAName, kind := .defnDecl, type := .const SymName.natName,
+        value? := some (.const cycBName), hasValue := true,
+        all := [cycAName, cycBName], originModule := topicProofModName },
+      { name := cycBName, kind := .defnDecl, type := .const SymName.natName,
+        value? := some (.const cycAName), hasValue := true,
+        all := [cycAName, cycBName], originModule := topicProofModName }
+    ]
+  ]
+}
+
+theorem passA1_dependency_ordered_replay_accepts_ooo_and_rejects_cycles :
+    (auditAndReplayPackage defaultUnconditionalConfig oooValidPkg).isOk = true ∧
+    (auditAndReplayPackage defaultUnconditionalConfig oooReverseIndPkg).isOk = true ∧
+    auditAndReplayPackage defaultUnconditionalConfig cyclicDefsPkg =
+      .error (.cyclicDependency cycAName cycBName) := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/--
+Per-root verification status classification in a mixed package (`allowAssumptions = true`):
+- `Verify.CleanItem.verified` reaches zero assumptions and is classified `.verifiedUnconditional`.
+- `Verify.CondItem.verified` reaches `Assumptions.Hw.mmioOk` and is classified `.verifiedConditional [mmioOk]`.
+- Instantiating `auditAndReplayPackage_item_status_sound` certifies that `Verify.CleanItem.verified`'s
+  ENTIRE `DepReaches` closure is `CleanDep` even though `allowAssumptions = true`!
+-/
+def verifyCleanMod : SymName := SymName.ofList ["Verify", "CleanItem"]
+def verifyCleanRoot : SymName := SymName.ofList ["Verify", "CleanItem", "verified"]
+def verifyCondMod : SymName := SymName.ofList ["Verify", "CondItem"]
+def verifyCondRoot : SymName := SymName.ofList ["Verify", "CondItem", "verified"]
+
+def mixedStatusPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule assumpModName .assumptions [
+      { name := assumpAxName, kind := .axiomDecl, type := .const SymName.trueName,
+        originModule := assumpModName }
+    ],
+    mkAlignedModule verifyCleanMod .verify [
+      { name := verifyCleanRoot, kind := .thmDecl,
+        type := .app (.const SymName.verificationResultName) (.natLit 0),
+        value? := some (.app (.app (.const verificationResultMkName) (.natLit 0))
+          (.const SymName.trueIntroName)),
+        hasValue := true, all := [verifyCleanRoot], originModule := verifyCleanMod }
+    ],
+    mkAlignedModule verifyCondMod .verify [
+      { name := verifyCondRoot, kind := .thmDecl,
+        type := .app (.const SymName.verificationResultName) (.natLit 1),
+        value? := some (.app (.app (.const verificationResultMkName) (.natLit 1))
+          (.const assumpAxName)),
+        hasValue := true, all := [verifyCondRoot], originModule := verifyCondMod }
+    ]
+  ]
+  verifyRoots := [verifyCleanRoot, verifyCondRoot]
+}
+
+theorem passA1_mixed_package_per_item_status_and_isolation :
+    (auditAndReplayPackage assumptionsOnlyConfig mixedStatusPkg).map
+      (fun cert => cert.itemReports.map fun r => (r.root, r.status)) =
+      .ok [
+        (verifyCleanRoot, .verifiedUnconditional),
+        (verifyCondRoot, .verifiedConditional [assumpAxName])
+      ] ∧
+    (∀ dep, DepReaches (packageEnv mixedStatusPkg) verifyCleanRoot dep →
+      CleanDep mixedStatusPkg (packageEnv mixedStatusPkg) dep) := by
+  refine ⟨rfl, ?_⟩
+  cases h : auditAndReplayPackage assumptionsOnlyConfig mixedStatusPkg with
+  | error e =>
+    have hok : (auditAndReplayPackage assumptionsOnlyConfig mixedStatusPkg).isOk = true := rfl
+    rw [h] at hok; cases hok
+  | ok cert =>
+    have hrep : (cert.itemReports.map fun r => (r.root, r.status)) =
+        [(verifyCleanRoot, .verifiedUnconditional),
+         (verifyCondRoot, .verifiedConditional [assumpAxName])] := by
+      have hm : (auditAndReplayPackage assumptionsOnlyConfig mixedStatusPkg).map
+          (fun c => c.itemReports.map fun r => (r.root, r.status)) =
+          .ok [(verifyCleanRoot, .verifiedUnconditional),
+               (verifyCondRoot, .verifiedConditional [assumpAxName])] := rfl
+      rw [h] at hm
+      injection hm
+    cases hr : cert.itemReports with
+    | nil => rw [hr] at hrep; cases hrep
+    | cons r0 rrest =>
+      rw [hr] at hrep
+      injection hrep with h0 _
+      have hrootEq : r0.root = verifyCleanRoot := congrArg Prod.fst h0
+      have hstEq : r0.status = .verifiedUnconditional := congrArg Prod.snd h0
+      have hclean := auditAndReplayPackage_item_status_sound h r0 (by rw [hr]; exact List.mem_cons_self) hstEq
+      rw [hrootEq] at hclean
+      exact hclean
+
+/--
+Regression (Pass-`A1` structural gaps):
+1. Duplicate `moduleName` in `pkg.modules` is rejected (`duplicateModuleName`).
+2. Anonymous `moduleName` with role `.spec` is rejected (`moduleRoleMismatch`).
+3. `Topic.Proofs` relabelled `.spec` is rejected (`moduleRoleMismatch`).
+4. Non-exported `private import` (`isExported := false`) is rejected (`forbiddenImportAll`).
+5. `_unsafe_rec` forged with `kind := .axiomDecl` is NOT excused as a codegen companion.
+6. `.recDecl` listing a non-existent inductive target in `.all` is rejected (`invalidMutualAll`).
+7. Reserved-name declaration claiming a non-existent ghost `originModule` is rejected (`reservedOriginMissingSibling`).
+-/
+def dupModNamePkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [],
+    mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+  ]
+}
+
+def anonModSpecPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule .anonymous .spec []]
+}
+
+def proofRelabeledSpecPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicProofModName .spec [cleanProofThmDecl]]
+}
+
+def privateImportModPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := topicDefsModName, importAll := false, isExported := false }]))
+
+def unsafeRecAxiomKindPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [
+    safeRecFnDecl,
+    { safeRecUnsafeCompanionDecl with kind := .axiomDecl, value? := none, hasValue := false }
+  ])
+
+def badRecTargetMod : ModuleInventory :=
+  mkAlignedModule demoModName .proof [
+    { demoRecDecl with all := [SymName.ofList ["Ghost", "Ind"]] }
+  ]
+
+def ghostOriginModName : SymName := SymName.ofList ["Ghost", "NonExistent"]
+def ghostReservedDeclName : SymName := SymName.ofList ["Topic", "Proofs", "fn", "eq_1"]
+def ghostReservedOriginPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [
+      { name := ghostReservedDeclName, kind := .thmDecl, type := .const SymName.trueName,
+        value? := some (.const SymName.trueIntroName), hasValue := true,
+        all := [ghostReservedDeclName], originModule := ghostOriginModName }
+    ]
+  ]
+}
+
+theorem passA1_structural_validation_gaps_closed :
+    auditAndReplayPackage defaultUnconditionalConfig dupModNamePkg =
+      .error (.duplicateModuleName topicProofModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig anonModSpecPkg =
+      .error (.moduleRoleMismatch .anonymous "spec") ∧
+    auditAndReplayPackage defaultUnconditionalConfig proofRelabeledSpecPkg =
+      .error (.moduleRoleMismatch topicProofModName "spec") ∧
+    auditAndReplayPackage defaultUnconditionalConfig privateImportModPkg =
+      .error (.forbiddenImportAll topicProofModName topicDefsModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig unsafeRecAxiomKindPkg =
+      .error (.unsafeOrPartialDecl topicProofModName (SymName.str safeRecFnName "_unsafe_rec")) ∧
+    validateReplayInventory badRecTargetMod =
+      .error (.invalidMutualAll demoModName demoRecName "missing inductive target for recursor .all") ∧
+    auditAndReplayPackage defaultUnconditionalConfig ghostReservedOriginPkg =
+      .error (.reservedOriginMissingSibling topicProofModName ghostReservedDeclName ghostOriginModName) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+Lean 4.34.1 `finalizeImport` `subsumesInfo` Body-Swap Exploit (`Environment.lean` lines 2268–2345):
+- `Proof.A` defines clean theorem `Shared.thm : True := True.intro` (first-recorded origin = `Proof.A`).
+- `Proof.B` defines the SAME header `Shared.thm : True` with a `sorryAx`-tainted proof body!
+- Under Lean 4.34.1 `finalizeImport434`, `subsumesInfo` returns `true` (ignoring theorem bodies!),
+  so `constants` is REPLACED with `Proof.B`'s `sorryAx` record while `origins` STILL pins
+  `Shared.thm` to `Proof.A`!
+- Meanwhile `auditAndReplayPackage` rejects the cross-module duplicate!
+-/
+def subsumesModA : SymName := SymName.ofList ["Proof", "ModA"]
+def subsumesModB : SymName := SymName.ofList ["Proof", "ModB"]
+def subsumesThmName : SymName := SymName.ofList ["Shared", "thm"]
+
+def subsumesCleanDecl : ConstantRecord := {
+  name := subsumesThmName
+  kind := .thmDecl
+  type := .const SymName.trueName
+  value? := some (.const SymName.trueIntroName)
+  hasValue := true
+  all := [subsumesThmName]
+  originModule := subsumesModA
+}
+
+def subsumesSorryDecl : ConstantRecord := {
+  name := subsumesThmName
+  kind := .thmDecl
+  type := .const SymName.trueName
+  value? := some (.app (.lam (.const SymName.falseName) (.const SymName.trueIntroName))
+    (.const SymName.sorryAxName))
+  hasValue := true
+  all := [subsumesThmName]
+  originModule := subsumesModB
+}
+
+def subsumesSwapMods : List ModuleInventory := [
+  mkAlignedModule subsumesModA .proof [subsumesCleanDecl],
+  mkAlignedModule subsumesModB .proof [subsumesSorryDecl]
+]
+
+def subsumesSwapPkg : PackageAuditInput := {
+  baseEnv := sorryAxDecl :: standardBaseDecls
+  modules := subsumesSwapMods
+}
+
+theorem finalizeImport_subsumes_body_swap_bypass :
+    (finalizeImport434 subsumesSwapMods).map (fun fi => fi.constants.lookup subsumesThmName) =
+      .ok (some subsumesSorryDecl) ∧
+    (finalizeImport434 subsumesSwapMods).map (fun fi => lookupOrigin fi.origins subsumesThmName) =
+      .ok (some subsumesModA) ∧
+    auditAndReplayPackage defaultUnconditionalConfig subsumesSwapPkg =
+      .error (.duplicateConstName .anonymous .anonymous) := by
+  refine ⟨rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditPrototype

@@ -17,6 +17,12 @@ Exercises:
    theorems instantiated on the baseline package, role/origin/flag spoofing, the inductive and
    quotient replay bypasses (including key-ALIGNED ones), provisional native scoping, and lexer
    desynchronisation / token gluing in the source scanner.
+5. Pass-`A1` regressions: guillemet-in-hole & backtick raw-string lexer desyncs, `_root_.`-qualified
+   native reduction tokens (unconditional even under `--provisional`), `Defs` extension hardening,
+   `.test` module closure & foreign-axiom enforcement, provisional `._native.*` `@Eq Bool` type-shape
+   enforcement, dependency-ordered clean-env replay (`replayCleanEnvOrdered`) & cycle rejection,
+   per-root `VerifyItemStatus` isolation in mixed packages, `closureFuel` liveness proofs, structural
+   validation gaps, and Lean 4.34.1 `finalizeImport` `subsumesInfo` theorem body-swap model.
 -/
 
 namespace Anneal.ReplayKeyAndTamperAuditProtoTests
@@ -239,6 +245,112 @@ info: 'Anneal.ReplayKeyAndTamperAuditPrototype.pillar1_provisional_scoping' depe
  Quot.sound]
 -/
 #guard_msgs in #print axioms pillar1_provisional_scoping
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.replayCleanEnvOrdered_preserves_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms replayCleanEnvOrdered_preserves_sound
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.replayCleanEnvOrdered_contains_decl' depends on axioms: [propext] -/
+#guard_msgs in #print axioms replayCleanEnvOrdered_contains_decl
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.walkGraph_never_exhausts_fuel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms walkGraph_never_exhausts_fuel
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.closureExpand_never_exhausts_fuel' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in #print axioms closureExpand_never_exhausts_fuel
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.walkStatementOrigins_never_exhausts_fuel' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms walkStatementOrigins_never_exhausts_fuel
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.validInventory_rec_all_targets_induct' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms validInventory_rec_all_targets_induct
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_modules_nodup' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_modules_nodup
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_item_status_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_item_status_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_test_closures_clean' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_test_closures_clean
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_lexer_and_root_qualification_hardened' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_lexer_and_root_qualification_hardened
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_defsExempt_cannot_bypass_hooks_macros_reducibility_or_init_shadow' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_defsExempt_cannot_bypass_hooks_macros_reducibility_or_init_shadow
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_test_module_closures_and_axioms_hardened' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_test_module_closures_and_axioms_hardened
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_provisional_native_rejects_false_type' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_provisional_native_rejects_false_type
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_dependency_ordered_replay_accepts_ooo_and_rejects_cycles' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_dependency_ordered_replay_accepts_ooo_and_rejects_cycles
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_mixed_package_per_item_status_and_isolation' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_mixed_package_per_item_status_and_isolation
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA1_structural_validation_gaps_closed' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA1_structural_validation_gaps_closed
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.finalizeImport_subsumes_body_swap_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms finalizeImport_subsumes_body_swap_bypass
 
 /-! ## Section 2: Direct Verification of All Vulnerability Exploits & 18 Tamper Vectors -/
 
@@ -582,5 +694,104 @@ theorem sourceScanner_more_lexer_edges :
       .error (.unsupportedSourceLexing topicProofModName
         "unterminated string, char literal, block comment, or escaped identifier") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## Section 5: Pass-`A1` Regression Suite (Lexer, `Defs` Hooks, `.test` Closures, Native Shape, Ordered Replay, Per-Item Status, Liveness) -/
+
+example := passA1_lexer_and_root_qualification_hardened
+example := passA1_defsExempt_cannot_bypass_hooks_macros_reducibility_or_init_shadow
+example := passA1_test_module_closures_and_axioms_hardened
+example := passA1_provisional_native_rejects_false_type
+example := passA1_dependency_ordered_replay_accepts_ooo_and_rejects_cycles
+example := passA1_mixed_package_per_item_status_and_isolation
+example := passA1_structural_validation_gaps_closed
+example := finalizeImport_subsumes_body_swap_bypass
+example := @walkGraph_never_exhausts_fuel
+example := closureExpand_never_exhausts_fuel
+example := walkStatementOrigins_never_exhausts_fuel
+
+/-- Tightened `roleMatchesModuleName`: rejects `.anonymous`, `Topic.Proofs`, and `Topic.Defs` as `.spec`. -/
+theorem roleMatchesModuleName_passA1_tightened :
+    roleMatchesModuleName .spec .anonymous = false ∧
+    roleMatchesModuleName .spec topicProofModName = false ∧
+    roleMatchesModuleName .spec topicDefsModName = false ∧
+    roleMatchesModuleName .spec topicSpecModName = true :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `Topic.Defs` rejects foreign-target instances (`V12`), `meta initialize` (`V10`), and `export` (`V15`). -/
+def defsForeignInstPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.instanceEntry (SymName.ofList ["Topic", "Defs", "badInst"])
+        SymName.natName (SymName.ofList ["Init", "Prelude"]) false])
+  ]
+}
+
+def defsMetaInitPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.metaInitHook (SymName.ofList ["Topic", "Defs", "badMetaInit"])])
+  ]
+}
+
+def defsExportAliasPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.exportAlias (SymName.ofList ["Topic", "Defs", "expNatAdd"])
+        SymName.natAddName (SymName.ofList ["Init", "Prelude"])])
+  ]
+}
+
+theorem defsExempt_extra_vectors_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig defsForeignInstPkg =
+      .error (.forbiddenInstanceOrCoe topicDefsModName "imported_instance"
+        (SymName.ofList ["Topic", "Defs", "badInst"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsMetaInitPkg =
+      .error (.forbiddenInitOrCodegenHook topicDefsModName "meta_initialize"
+        (SymName.ofList ["Topic", "Defs", "badMetaInit"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsExportAliasPkg =
+      .error (.forbiddenShadowingOrExport topicDefsModName
+        (SymName.ofList ["Topic", "Defs", "expNatAdd"]) SymName.natAddName) :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Per-item `provisionalNative` status classification when a verify root reaches a valid `Proof.*._native.*` axiom. -/
+def verifyProvMod : SymName := SymName.ofList ["Verify", "ProvItem"]
+def verifyProvRoot : SymName := SymName.ofList ["Verify", "ProvItem", "verified"]
+
+def provisionalVerifyPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule pillarProofMod .proof [provisionalNativeAxDecl, provisionalNativeThmDecl],
+    mkAlignedModule verifyProvMod .verify [
+      { name := verifyProvRoot, kind := .thmDecl,
+        type := .app (.const SymName.verificationResultName) (.natLit 2),
+        value? := some (.app (.app (.const verificationResultMkName) (.natLit 2))
+          (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
+            (.const pillarThmName))),
+        hasValue := true, all := [verifyProvRoot], originModule := verifyProvMod }
+    ]
+  ]
+  verifyRoots := [verifyProvRoot]
+}
+
+theorem provisionalVerifyItem_classified_provisionalNative :
+    (auditAndReplayPackage provisionalConfig provisionalVerifyPkg).map
+      (fun cert => cert.itemReports.map fun r => (r.root, r.status)) =
+      .ok [(verifyProvRoot, .provisionalNative [provisionalNativeAxName])] :=
+  rfl
+
+/-- Extra Pass-`A1` lexer checks: `_root_.Lean.ofReduceNat`, `_root_.Lean.reduceBool`, and `s!"{«a»}"`. -/
+theorem sourceScanner_passA1_extra_edges :
+    scanProofSource "def t := _root_.Lean.ofReduceNat 0 0 rfl" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    SourceScanner.scanSourceDefenseInDepth provisionalConfig topicProofModName .proof
+      "def t := _root_.Lean.reduceBool true" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofChars ("def s := s!\"{".toList ++ ['«', 'a', '»'] ++ "}\"".toList) =
+      .error (.unsupportedSourceLexing topicProofModName
+        "ambiguous char literal or string-interpolation hole") :=
+  ⟨rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditProtoTests
