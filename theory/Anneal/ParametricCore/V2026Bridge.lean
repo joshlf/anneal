@@ -1867,15 +1867,36 @@ abbrev optUInt8ByteCodec : ByteCodec (Option UInt8) :=
 theorem optUInt8ByteCodec_exact : optUInt8ByteCodec.Exact :=
   ByteCodec.option_exact ByteCodec.uint8_exact
 
-/-- `ByteCodec` for provenance-free initialized `AbstractByte`s. -/
+/-- Strict `ByteCodec` for provenance-free initialized `AbstractByte`s.
+Fails closed (`= none`) on `.uninit` AND on any byte carrying pointer
+provenance (`.init _ (some _)`), so `abstractByteCodec` is `Exact` and can
+never silently strip or launder pointer provenance during lens read/write
+round-trips. -/
 def abstractByteCodec : ByteCodec AbstractByte where
   enc b := .init (UInt8.ofBitVec b) none
   dec
+    | .init u none => some u.toBitVec
+    | .init _ (some _) => none
     | .uninit => none
-    | .init u _ => some u.toBitVec
   dec_enc b := by
     show some (UInt8.ofBitVec b).toBitVec = some b
     rfl
+
+theorem abstractByteCodec_exact : abstractByteCodec.Exact := by
+  intro b u h
+  cases b with
+  | uninit => cases h
+  | init v prov =>
+    cases prov with
+    | some _ => cases h
+    | none =>
+      injection h with hEq
+      subst hEq
+      show AbstractByte.init (UInt8.ofBitVec v.toBitVec) none = AbstractByte.init v none
+      rfl
+
+theorem abstractByteCodec_dec_prov_none (u : UInt8) (p : Nat × Nat) :
+    abstractByteCodec.dec (.init u (some p)) = none := rfl
 
 /-- Lift any `Anneal.SepLogicLenses.ByteLensCodec α n` into a `ParametricCore`
 `SliceCodec AbstractByte α n` via `SliceCodec.ofGuarded`, with zero extra
@@ -2147,7 +2168,14 @@ theorem byteMem_getVal_of_sliceTypedAt {α : Type} {n : Nat}
   (byteMem_getVal_iff_typedAt c hPos bm _ rfl xs[i]).mpr (hSlice.getElem_typedAt' hi)
 
 /-- **`ByteSubLens.getVal` ↔ trusted `decodeValueFromBytes` via
-`PureLift.V2026_06_01Bridge.MirTypedByteCodec`**. -/
+`PureLift.V2026_06_01Bridge.MirTypedByteCodec`**.
+
+Provenance semantics: integer/bool `MirTypedByteCodec`s match trusted
+`decodeValueFromBytes` (which discards provenance on integer/bool loads, as in
+Rust's bytewise integer reads) and encode strictly provenance-free bytes
+(`m.encode_provenanceFree`). For a lens that must fail closed on ANY byte
+carrying pointer provenance (`.init _ (some _)`), use `abstractByteCodec`
+(`abstractByteCodec_exact` / `abstractByteCodec_dec_prov_none`). -/
 theorem byteMem_getVal_mirTypedByteCodec_iff_decode {layouts : LayoutTable}
     {ty : Ty} {α : Type} {n : Nat}
     (m : Anneal.PureLift.V2026_06_01Bridge.MirTypedByteCodec layouts ty α n)
@@ -2176,8 +2204,10 @@ theorem byteMem_getVal_mirTypedByteCodec_iff_decode {layouts : LayoutTable}
       exact ByteSubLens.getVal_of hLen hR hC
 
 /-- Writing a value through `ByteSubLens.setVal` with a `MirTypedByteCodec`
-establishes `SepLogicLenses.TypedAt` and writes the exact bytes produced by
-trusted `encodeValueToBytes`. -/
+establishes `SepLogicLenses.TypedAt`, writes the exact bytes produced by
+trusted `encodeValueToBytes`, and guarantees the written window is strictly
+provenance-free (`provenanceFree = true`, so a `MirTypedByteCodec` write can
+never forge `none → some p` provenance). -/
 theorem byteMem_setVal_mirTypedByteCodec_typedAt {layouts : LayoutTable}
     {ty : Ty} {α : Type} {n : Nat}
     (m : Anneal.PureLift.V2026_06_01Bridge.MirTypedByteCodec layouts ty α n)
@@ -2196,6 +2226,24 @@ theorem byteMem_setVal_mirTypedByteCodec_typedAt {layouts : LayoutTable}
       some ((sliceCodecOfMirTypedByteCodec m).enc x) :=
     sliceCodecOfMirTypedByteCodec_enc_eq m x
   exact ⟨hTyped, hGet.trans hEnc.symm⟩
+
+/-- Every `ByteSubLens.setVal` through a `MirTypedByteCodec` writes strictly
+provenance-free bytes (`Anneal.PureLift.MirLiftCoreInterop.provenanceFree = true`),
+so it can never forge pointer provenance (`init b none ↦ init b (some p)`),
+while every disjoint `ByteSubLens Unit` retains its exact `AbstractByte`s
+(including any pointer provenance `some p` on sibling slots). -/
+theorem byteMem_setVal_mirTypedByteCodec_provenanceFree {layouts : LayoutTable}
+    {ty : Ty} {α : Type} {n : Nat}
+    (m : Anneal.PureLift.V2026_06_01Bridge.MirTypedByteCodec layouts ty α n)
+    {bm bm' : Anneal.SepLogicLenses.ByteMem} {L : ByteSubLens Unit} {x : α}
+    (hSet : L.setVal (sliceCodecOfMirTypedByteCodec m) bm x = some bm') :
+    (∃ bs, L.get bm' = some bs ∧
+      Anneal.PureLift.MirLiftCoreInterop.provenanceFree bs = true) ∧
+    (∀ other : ByteSubLens Unit, ByteSubLens.Disjoint Anneal.SepLogicLenses.ByteMem L other →
+      other.get bm' = other.get bm) :=
+  ⟨⟨(sliceCodecOfMirTypedByteCodec m).enc x, ByteSubLens.get_set hSet,
+      m.encode_provenanceFree x⟩,
+   fun _ hDisj => ByteSubLens.get_set_disjoint hDisj hSet⟩
 
 /-! ### Global `CapturedAllocation` ↔ `AbstractByte`, `encodeValueToBytes`, & `decodeValueFromBytes` -/
 
@@ -2224,16 +2272,42 @@ theorem globalAllocBytesAux_noRelocs (bytes : List (Option UInt8)) :
     rw [hSlice, List.map_cons]
     cases bytes[off] <;> rfl
 
-/-- For a provenance-free mutable `CapturedAllocation`, `ByteSubLens.get` on
-`memGlobalsByteStoreOps` agrees directly with trusted
-`globalAllocSliceToAbstractBytes` (mapped through `optUInt8ToAbstractByte`). -/
+/-- Inversion of `ByteSubLens.get` on `memGlobalsByteStoreOps`: because
+`capturedAllocView.writable` fails closed on immutable and relocated
+allocations, any successful lens read already certifies `alloc.mutability = .mut`
+and `alloc.relocations = []`. -/
+theorem memGlobals_get_inv_mut_noRelocs {m : Memory}
+    {L : ByteSubLens Nat} {alloc : CapturedAllocation} {bs : List (Option UInt8)}
+    (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
+    (hGet : L.get m = some bs) :
+    alloc.mutability = .mut ∧ alloc.relocations = [] := by
+  rcases ByteSubLens.get_inv hGet with ⟨_, hRead⟩
+  change tableRead capturedAllocView m.globals L.addr L.offset L.len = some bs at hRead
+  rw [lookupGlobalAlloc_eq_tableFind] at hFind
+  rcases tableRead_inv hRead with ⟨a', hFind', hWr, _, _⟩
+  rw [hFind] at hFind'
+  injection hFind' with hA
+  subst hA
+  dsimp only [capturedAllocView] at hWr
+  cases hMut : alloc.mutability with
+  | not => rw [hMut] at hWr; cases hWr
+  | «mut» =>
+    rw [hMut] at hWr
+    cases hRel : alloc.relocations with
+    | nil => exact ⟨rfl, rfl⟩
+    | cons _ _ => rw [hRel] at hWr; cases hWr
+
+/-- For any global `CapturedAllocation` accessible through `memGlobalsByteStoreOps`,
+`ByteSubLens.get` agrees unconditionally with trusted
+`globalAllocSliceToAbstractBytes` (mapped through `optUInt8ToAbstractByte`),
+with `alloc.relocations = []` discharged automatically by `capturedAllocView.writable`. -/
 theorem memGlobals_get_eq_globalAllocSliceToAbstractBytes {m : Memory}
     {L : ByteSubLens Nat} {alloc : CapturedAllocation} {bs : List (Option UInt8)}
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
-    (hRelocs : alloc.relocations = [])
     (hGet : L.get m = some bs) :
     globalAllocSliceToAbstractBytes alloc L.offset L.len =
       some (bs.map optUInt8ToAbstractByte) := by
+  have hRelocs : alloc.relocations = [] := (memGlobals_get_inv_mut_noRelocs hFind hGet).2
   rcases ByteSubLens.get_inv hGet with ⟨_, hRead⟩
   change tableRead capturedAllocView m.globals L.addr L.offset L.len = some bs at hRead
   rw [lookupGlobalAlloc_eq_tableFind] at hFind
@@ -2307,11 +2381,11 @@ theorem encodeValueToBytes_u64_eq_sliceCodec (layouts : LayoutTable)
   congrArg some (toLeBytesAux_eq_encodeLittleEndianBytes 8 v.toNat).symm
 
 /-- Decoding the `AbstractByte` image of `SliceCodec.uint32 optUInt8ByteCodec`
-through trusted `decodeValueFromBytes` recovers `Value.scalar ⟨v.toNat, 4⟩`. -/
+through trusted `decodeValueFromBytes` recovers `Value.scalar ⟨v.toNat, 4⟩`
+without needing an external `relocations = []` assumption. -/
 theorem decodeValueFromBytes_u32_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt32} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
-    (hRelocs : alloc.relocations = [])
     (hVal : L.getVal (SliceCodec.uint32 optUInt8ByteCodec) m = some v)
     (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
@@ -2320,7 +2394,7 @@ theorem decodeValueFromBytes_u32_of_getVal {m : Memory} {L : ByteSubLens Nat}
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint32 optUInt8ByteCodec).enc v :=
     ((SliceCodec.uint32_exact optUInt8ByteCodec_exact) raw v hDec).symm
-  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hRelocs hGet
+  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hGet
   refine ⟨raw.map optUInt8ToAbstractByte, hGlob, ?_⟩
   rw [hRaw, sliceCodec_uint32_optUInt8_encode_eq v]
   let x : {n : Nat // n < 256 ^ 4} := ⟨v.toNat, v.toBitVec.isLt⟩
@@ -2333,7 +2407,6 @@ through trusted `decodeValueFromBytes` recovers `Value.scalar ⟨if b then 1 els
 theorem decodeValueFromBytes_bool_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {b : Bool} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
-    (hRelocs : alloc.relocations = [])
     (hVal : L.getVal (SliceCodec.bool optUInt8ByteCodec) m = some b)
     (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
@@ -2342,7 +2415,7 @@ theorem decodeValueFromBytes_bool_of_getVal {m : Memory} {L : ByteSubLens Nat}
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.bool optUInt8ByteCodec).enc b :=
     ((SliceCodec.bool_exact optUInt8ByteCodec_exact) raw b hDec).symm
-  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hRelocs hGet
+  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hGet
   refine ⟨raw.map optUInt8ToAbstractByte, hGlob, ?_⟩
   rw [hRaw]
   cases b <;> rfl
@@ -2352,7 +2425,6 @@ at `u16`. -/
 theorem decodeValueFromBytes_u16_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt16} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
-    (hRelocs : alloc.relocations = [])
     (hVal : L.getVal (SliceCodec.uint16 optUInt8ByteCodec) m = some v)
     (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
@@ -2361,7 +2433,7 @@ theorem decodeValueFromBytes_u16_of_getVal {m : Memory} {L : ByteSubLens Nat}
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint16 optUInt8ByteCodec).enc v :=
     ((SliceCodec.uint16_exact optUInt8ByteCodec_exact) raw v hDec).symm
-  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hRelocs hGet
+  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hGet
   refine ⟨raw.map optUInt8ToAbstractByte, hGlob, ?_⟩
   have hEnc : raw.map optUInt8ToAbstractByte = encodeLittleEndianBytes v.toNat 2 none := by
     rw [hRaw]
@@ -2377,7 +2449,6 @@ at `u64`. -/
 theorem decodeValueFromBytes_u64_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt64} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
-    (hRelocs : alloc.relocations = [])
     (hVal : L.getVal (SliceCodec.uint64 optUInt8ByteCodec) m = some v)
     (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
@@ -2386,7 +2457,7 @@ theorem decodeValueFromBytes_u64_of_getVal {m : Memory} {L : ByteSubLens Nat}
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint64 optUInt8ByteCodec).enc v :=
     ((SliceCodec.uint64_exact optUInt8ByteCodec_exact) raw v hDec).symm
-  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hRelocs hGet
+  have hGlob := memGlobals_get_eq_globalAllocSliceToAbstractBytes hFind hGet
   refine ⟨raw.map optUInt8ToAbstractByte, hGlob, ?_⟩
   have hEnc : raw.map optUInt8ToAbstractByte = encodeLittleEndianBytes v.toNat 8 none := by
     rw [hRaw]

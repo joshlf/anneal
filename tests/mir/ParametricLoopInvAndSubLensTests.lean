@@ -395,6 +395,33 @@ theorem canary1a_countDown_totalVerificationResult :
     | panic | abort => exact False.elim hOut
     | normal p => exact ⟨hOut.2, n, rfl, hOut.1⟩
 
+/-- **Canary 1A (Deterministic → Coalgebraic `MirWpOps.Refines` + `DWP` + `DWLP`)**:
+Lifts the fuel-free deterministic loop proof `canary1a_countDown_wpStateOk`
+along the `MirWpOps.Refines` chain (`mirDetWpOps ↔ mirStrictDetWpOps ≤
+mirNoCallCoalWpOps ≤ mirCoalWpOps`) into coalgebraic `MirWpConverges`, total
+`DWP mirDefaultWP`, and partial `DWLP mirDefaultWP` (`wlpOutcome_of_wpOutcome`
++ `dwlp_of_coalWlpOutcome`) for ALL symbolic `n < 2^32`. -/
+theorem canary1a_countDown_coalWp_refines_dwp_dwlp (n : Nat) (hLt : n < 2 ^ 32) :
+    let post : MirOutcome → Prop :=
+      mirNormalPost (fun ret mem' => ret = .scalar ⟨n, 4⟩ ∧ mem' = {})
+    let s0 := initMachineState countDownMirBody [.scalar ⟨n, 4⟩]
+    wpStateOk (ops := mirNoCallCoalWpOps countDownMirBody) post s0 ∧
+    wpStateOk (ops := mirCoalWpOps countDownMirBody) post s0 ∧
+    MirWpConverges countDownMirBody s0 post ∧
+    DWP mirDefaultWP (mirTree countDownMirBody s0) (fun out _ => post out) PUnit.unit ∧
+    DWLP mirDefaultWP (mirTree countDownMirBody s0) (fun out _ => post out) PUnit.unit := by
+  intro post s0
+  have hStrict : wpStateOk (ops := mirStrictDetWpOps countDownMirBody) post s0 :=
+    wpStateOk_mirDet_iff_strictDet.mp (canary1a_countDown_wpStateOk n hLt)
+  have hNoCall : wpStateOk (ops := mirNoCallCoalWpOps countDownMirBody) post s0 :=
+    wpOutcome_of_refines (mirStrictDetWpOps_refines_mirNoCallCoalWpOps countDownMirBody) hStrict
+  have hCoal : wpStateOk (ops := mirCoalWpOps countDownMirBody) post s0 :=
+    wpOutcome_of_refines (mirNoCallCoalWpOps_refines_mirCoalWpOps countDownMirBody) hNoCall
+  exact ⟨hNoCall, hCoal,
+    mirWpConverges_of_noCallCoalWpStateOk hNoCall,
+    dwp_of_coalWpStateOk hCoal,
+    dwlp_of_coalWlpOutcome (wlpOutcome_of_wpOutcome (ops := mirCoalWpOps countDownMirBody) hCoal)⟩
+
 /-! ### 1B. Fuel-Free Symbolic Early-Return Loop (`wpLoop_early_return_rank`) -/
 
 /-- Real multi-block `V2026_06_01` `CapturedMir` with genuine mid-loop early return:
@@ -1309,6 +1336,28 @@ theorem canary2_stage1_stepStageCut (c1 : Bool) (x : Nat) (hX : x + 20 < 2 ^ 32)
       (.init (.scalar ⟨wrapScalarBits (x + 10) (scalarModulus 4), 4⟩))) = _
     rw [wrapU32_of_lt (by omega)]; rfl
 
+/-- **Stage 1 opaque `StepStageCut` via `ValidChunk8BlockTree`**
+(`V2026Bridge.stepStageCut_of_validChunk8BlockTreeToCut`), exercising the
+8-way chunked basic-block lookup accelerator on `diamond2StageMirBody`. -/
+theorem canary2_stage1_chunk8BlockTree_stepStageCut (c1 : Bool) (x : Nat)
+    (hX : x + 20 < 2 ^ 32) (l2 l4 : LocalSlot) :
+    StepStageCut (mirDetStep diamond2StageMirBody) 4
+      (diamondState 0 0 .uninit (.init (boolScalar c1)) l2 (.init (.scalar ⟨x, 4⟩)) l4 .dead)
+      (diamondState 3 0 .uninit (.init (boolScalar c1)) l2 (.init (.scalar ⟨x, 4⟩)) l4
+        (.init (.scalar ⟨x + stage1Delta c1, 4⟩))) := by
+  refine stepStageCut_of_validChunk8BlockTreeToCut diamondChunk8Tree_valid (cuts := cutAtBb3) ?_
+  cases c1 with
+  | false =>
+    change CutRun.cut (diamondState 3 0 .uninit (.init (boolScalar false)) l2
+      (.init (.scalar ⟨x, 4⟩)) l4
+      (.init (.scalar ⟨wrapScalarBits (x + 20) (scalarModulus 4), 4⟩))) = _
+    rw [wrapU32_of_lt (by omega)]; rfl
+  | true =>
+    change CutRun.cut (diamondState 3 0 .uninit (.init (boolScalar true)) l2
+      (.init (.scalar ⟨x, 4⟩)) l4
+      (.init (.scalar ⟨wrapScalarBits (x + 10) (scalarModulus 4), 4⟩))) = _
+    rw [wrapU32_of_lt (by omega)]; rfl
+
 /-- **Stage 1 region-guarded `StageCut` (`bb0 ↝ bb3`, ignoring `_4 = z`)** proved
 directly from `ValidBlockTree` via `wpReach_within_of_validBlockTreeToCut`. -/
 theorem canary2_stage1_within (c1 : Bool) (x : Nat) (hX : x + 20 < 2 ^ 32)
@@ -2099,17 +2148,13 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
   have hMutPres : (lookupGlobalAlloc m2.globals 7).map (fun a => a.mutability) = some .mut := by
     rw [execMutSummaryChain_preserves (memGlobals_writePreserves_mutability 7) calls hChain,
       mkCanaryGlobalMem_lookup7]; rfl
-  have hRelocsPres : (lookupGlobalAlloc m2.globals 7).map (fun a => a.relocations) = some [] := by
-    rw [execMutSummaryChain_preserves (memGlobals_writePreserves_relocations 7) calls hChain,
-      mkCanaryGlobalMem_lookup7]; rfl
-  -- Extract post-state `alloc2` for `decodeValueFromBytes` bridges
-  have hAlloc2 : ∃ alloc2, lookupGlobalAlloc m2.globals 7 = some alloc2 ∧ alloc2.relocations = [] := by
+  -- Extract post-state `alloc2` for `decodeValueFromBytes` bridges (no external
+  -- `relocations = []` assumption needed; `capturedAllocView.writable` enforces it!)
+  have hAlloc2 : ∃ alloc2, lookupGlobalAlloc m2.globals 7 = some alloc2 := by
     cases hF : lookupGlobalAlloc m2.globals 7 with
-    | none => rw [hF] at hRelocsPres; cases hRelocsPres
-    | some a =>
-      rw [hF] at hRelocsPres; injection hRelocsPres with hR
-      exact ⟨a, rfl, hR⟩
-  rcases hAlloc2 with ⟨alloc2, hFind2, hRel2⟩
+    | none => rw [hF] at hMutPres; cases hMutPres
+    | some a => exact ⟨a, rfl⟩
+  rcases hAlloc2 with ⟨alloc2, hFind2⟩
   -- Zoom into `payloadAligned.lens` (`bool` at +0, `u32` at +4) without raw byte destructuring
   have hPayZoom := ByteSubLens.getVal_paddedPair (by decide) (by decide) hPay2_get
   have hFlag2_get : (payloadAligned.lens.zoom 0 1).getVal globalBoolCodec m2 = some newFlag :=
@@ -2198,10 +2243,10 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     (ByteSubLens.getValIf_of_ok globalPaddedPairCodec payloadAligned.lens hPayOk2).trans hPay2_get,
     (ByteSubLens.getValIf_of_ok globalU32Codec siblingAligned.lens hSibOk2).trans hSib2_get,
     ⟨alloc2, hFind2,
-      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hHdr2_get,
-      decodeValueFromBytes_bool_of_getVal testLayouts hFind2 hRel2 hFlag2_get boolTy.layoutIdx,
-      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hVal2_get,
-      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hSib2_get⟩,
+      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hHdr2_get,
+      decodeValueFromBytes_bool_of_getVal testLayouts hFind2 hFlag2_get boolTy.layoutIdx,
+      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hVal2_get,
+      decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hSib2_get⟩,
     hBorrows, hAlignPres, hMutPres, ⟨hTbHdr, hTbPay⟩,
     AlignedSubLens.get_none_of_unaligned misalignedU32Lens hMisU32,
     AlignedSubLens.set_none_of_unaligned misalignedU32Lens _ hMisU32,
@@ -2283,6 +2328,171 @@ theorem canary3a_byteMem_typedAt_and_mirTypedByteCodec
     (byteMem_getVal_mirTypedByteCodec_iff_decode mCodec bm L rfl v).mp hGetVal,
     ⟨bm', hSet, hPostSet.1, hPostSet.2⟩,
     encodeValueToBytes_u32_eq_sliceCodec testLayouts (UInt32.ofNat v.val)⟩
+
+/-- **Canary 3A (`ByteMem` Provenance Non-Laundering + `SliceTypedAt` Bridge)**:
+Audits BOTH `abstractByteCodec` and `MirTypedByteCodec` on `byteMemByteStoreOps`
+for ALL symbolic `(ptrLo : UInt32)`, `(prov : Nat × Nat)`, and
+`(oldVal newVal e0 e1 : { n : Nat // n < 256 ^ 4 })`:
+1. On a 12-byte `ByteMem` holding an 8-byte pointer `[0..8)` tagged with
+   provenance `some prov` followed by a provenance-free `u32` at `[8..12)`:
+   - Strict `SliceCodec.uint32 abstractByteCodec` **fails closed (`= none`)** on
+     the provenance-carrying pointer window `[0..4)` (so it can NEVER strip
+     provenance or launder `init b (some p) ↦ init b none`), while succeeding
+     and round-tripping (`Exact`) on the provenance-free window `[8..12)`.
+   - Writing `[8..12)` through `sliceCodecOfMirTypedByteCodec (u32MirCodec testLayouts)`
+     writes strictly provenance-free bytes (`provenanceFree = true`, never
+     forging `none → some p`) AND preserves `[0..8)`'s `.init b (some prov)`
+     bytes bit-for-bit via `byteMem_setVal_mirTypedByteCodec_provenanceFree`.
+   - Reading `[0..4)` through `u32MirCodec` matches trusted `decodeValueFromBytes`
+     at `u32` (which intentionally drops provenance on integer loads per Rust
+     semantics).
+2. On a live 2-element `SepLogicLenses.SliceTypedAt` buffer `[e0, e1]`,
+   `V2026Bridge.byteMem_getVal_of_sliceTypedAt` zooms cleanly to both element `0`
+   and element `1`. -/
+theorem canary3a_byteMem_provenance_and_sliceTypedAt
+    (ptrLo : UInt32) (prov : Nat × Nat)
+    (oldVal newVal e0 e1 : { n : Nat // n < 256 ^ 4 }) :
+    let mCodec := Anneal.PureLift.V2026_06_01Bridge.u32MirCodec testLayouts
+    let ptrBytes : List AbstractByte := encodeLittleEndianBytes ptrLo.toNat 8 (some prov)
+    let bm : Anneal.SepLogicLenses.ByteMem := ptrBytes ++ mCodec.codec.encode oldVal
+    let ptrLens8 : ByteSubLens Unit := ⟨(), 0, 8⟩
+    let ptrLens4 : ByteSubLens Unit := ⟨(), 0, 4⟩
+    let intLens : ByteSubLens Unit := ⟨(), 8, 4⟩
+    let strictU32 := SliceCodec.uint32 abstractByteCodec
+    -- 1. Strict `abstractByteCodec` fails closed on provenance-carrying bytes
+    ptrLens4.getVal strictU32 bm = none ∧
+    -- 2. Strict `abstractByteCodec` succeeds on provenance-free `[8..12)`
+    intLens.getVal strictU32 bm = some (UInt32.ofNat oldVal.val) ∧
+    -- 3. `MirTypedByteCodec` write on `[8..12)` is provenance-free & frames `[0..8)` provenance
+    (∃ bm',
+      intLens.setVal (sliceCodecOfMirTypedByteCodec mCodec) bm newVal = some bm' ∧
+      (∃ bs, intLens.get bm' = some bs ∧
+        Anneal.PureLift.MirLiftCoreInterop.provenanceFree bs = true) ∧
+      ptrLens8.get bm' = some ptrBytes) ∧
+    -- 4. `MirTypedByteCodec` read on `[0..4)` agrees with trusted `decodeValueFromBytes .u32`
+    (∃ x : { n : Nat // n < 256 ^ 4 },
+      ptrLens4.getVal (sliceCodecOfMirTypedByteCodec mCodec) bm = some x ∧
+      ∃ bs, ptrLens4.get bm = some bs ∧
+        decodeValueFromBytes defaultCodecFuel testLayouts u32Ty bs =
+          some (.scalar ⟨x.val, 4⟩)) ∧
+    -- 5. `SliceTypedAt` zoom bridge (`byteMem_getVal_of_sliceTypedAt`)
+    (let sliceBm : Anneal.SepLogicLenses.ByteMem :=
+       mCodec.codec.encode e0 ++ mCodec.codec.encode e1
+     let sliceLens : ByteSubLens Unit := ⟨(), 0, 2 * 4⟩
+     (sliceLens.zoom (0 * 4) 4).getVal (sliceCodecOfByteLensCodec mCodec.codec) sliceBm = some e0 ∧
+     (sliceLens.zoom (1 * 4) 4).getVal (sliceCodecOfByteLensCodec mCodec.codec) sliceBm = some e1) := by
+  intro mCodec ptrBytes bm ptrLens8 ptrLens4 intLens strictU32
+  have hPtrLen : ptrBytes.length = 8 := rfl
+  have hOldLen : (mCodec.codec.encode oldVal).length = 4 := mCodec.codec.encode_len oldVal
+  have hBmLen : bm.length = 12 := by simp [bm, hPtrLen, hOldLen]
+  -- 1. `ptrLens4.getVal strictU32 bm = none` because byte 0 carries `some prov`
+  have hPtr4Get : ptrLens4.get bm = some (encodeLittleEndianBytes ptrLo.toNat 4 (some prov)) := by
+    rw [ByteSubLens.get_of_pos bm (by decide)]
+    dsimp only [ByteStoreOps.readBytes?, ptrLens4]
+    rw [hBmLen]
+    rfl
+  have hStrictFail : ptrLens4.getVal strictU32 bm = none := by
+    unfold ByteSubLens.getVal
+    rw [hPtr4Get]
+    rfl
+  -- 2. `intLens.getVal strictU32 bm = some (UInt32.ofNat oldVal.val)`
+  have hIntGet : intLens.get bm = some (mCodec.codec.encode oldVal) := by
+    rw [ByteSubLens.get_of_pos bm (by decide)]
+    dsimp only [ByteStoreOps.readBytes?, intLens]
+    rw [hBmLen]
+    change some ((bm.drop 8).take 4) = some (mCodec.codec.encode oldVal)
+    have hSlice : (bm.drop 8).take 4 = mCodec.codec.encode oldVal := by
+      dsimp only [bm]
+      rw [List.drop_left' hPtrLen, List.take_of_length_le (by omega)]
+    rw [hSlice]
+  have hOldValEncEq : mCodec.codec.encode oldVal = strictU32.enc (UInt32.ofNat oldVal.val) := by
+    have hLt : oldVal.val < 2 ^ 32 := oldVal.property
+    have hMod : (UInt32.ofNat oldVal.val).toNat = oldVal.val := Nat.mod_eq_of_lt hLt
+    show encodeLittleEndianBytes oldVal.val 4 none =
+      [abstractByteCodec.enc (BitVec.ofNat 8 (UInt32.ofNat oldVal.val).toNat),
+       abstractByteCodec.enc (BitVec.ofNat 8 ((UInt32.ofNat oldVal.val).toNat / 256)),
+       abstractByteCodec.enc (BitVec.ofNat 8 ((UInt32.ofNat oldVal.val).toNat / 256 / 256)),
+       abstractByteCodec.enc (BitVec.ofNat 8 ((UInt32.ofNat oldVal.val).toNat / 256 / 256 / 256))]
+    rw [hMod]
+    rfl
+  have hStrictOk : intLens.getVal strictU32 bm = some (UInt32.ofNat oldVal.val) := by
+    refine ByteSubLens.getVal_of rfl hIntGet ?_
+    rw [hOldValEncEq]
+    exact strictU32.dec_enc (UInt32.ofNat oldVal.val)
+  -- 3. `MirTypedByteCodec` write on `[8..12)` + provenance-free + `[0..8)` framing
+  have hPtr8Get : ptrLens8.get bm = some ptrBytes := by
+    rw [ByteSubLens.get_of_pos bm (by decide)]
+    dsimp only [ByteStoreOps.readBytes?, ptrLens8]
+    rw [hBmLen]
+    change some ((bm.drop 0).take 8) = some ptrBytes
+    have hSlice : (bm.drop 0).take 8 = ptrBytes := by
+      dsimp only [bm]
+      rw [List.drop_zero, List.take_append_of_le_length (by omega),
+        List.take_of_length_le (by omega)]
+    rw [hSlice]
+  rcases ByteSubLens.set_isSome_of_get ((sliceCodecOfMirTypedByteCodec mCodec).enc newVal)
+      hIntGet ((sliceCodecOfMirTypedByteCodec mCodec).enc_length newVal) with ⟨bm', hSet⟩
+  have hProvFree := byteMem_setVal_mirTypedByteCodec_provenanceFree mCodec hSet
+  have hDisj : ByteSubLens.Disjoint Anneal.SepLogicLenses.ByteMem intLens ptrLens8 :=
+    ByteSubLens.disjoint_of_separated (Or.inr (Or.inr (by decide)))
+  have hPtr8Pres : ptrLens8.get bm' = some ptrBytes :=
+    (hProvFree.2 ptrLens8 hDisj).trans hPtr8Get
+  -- 4. Trusted `decodeValueFromBytes .u32` agreement on `[0..4)`
+  have hPtr4Val : ptrLens4.getVal (sliceCodecOfMirTypedByteCodec mCodec) bm =
+      some ⟨ptrLo.toNat, ptrLo.toBitVec.isLt⟩ := by
+    refine ByteSubLens.getVal_of rfl hPtr4Get ?_
+    rw [sliceCodecOfMirTypedByteCodec,
+      sliceCodecOfByteLensCodec_dec_of_length mCodec.codec rfl]
+    change (match decodeLittleEndianBytes (encodeLittleEndianBytes ptrLo.toNat 4 (some prov)) with
+      | some (v, _) =>
+        if h : v < 256 ^ 4 then some (⟨v, h⟩ : { n : Nat // n < 256 ^ 4 }) else none
+      | none => none) = some (⟨ptrLo.toNat, ptrLo.toBitVec.isLt⟩ : { n : Nat // n < 256 ^ 4 })
+    have hDecLe := Anneal.SepLogicLenses.ByteLensCodec.decodeLE_encodeLE 4 ptrLo.toNat (some prov)
+      ptrLo.toBitVec.isLt
+    cases hD : decodeLittleEndianBytes (encodeLittleEndianBytes ptrLo.toNat 4 (some prov)) with
+    | none => rw [hD] at hDecLe; cases hDecLe
+    | some pair =>
+      rcases pair with ⟨w, rp⟩
+      rw [hD] at hDecLe
+      have hW : w = ptrLo.toNat := Option.some.inj hDecLe
+      subst hW
+      dsimp only
+      have hLt256 : ptrLo.toNat < 256 ^ 4 := ptrLo.toBitVec.isLt
+      rw [dite_eq_left hLt256]
+  have hPtr4Trusted :=
+    (byteMem_getVal_mirTypedByteCodec_iff_decode mCodec bm ptrLens4 rfl
+      ⟨ptrLo.toNat, ptrLo.toBitVec.isLt⟩).mp hPtr4Val
+  -- 5. `SliceTypedAt` zoom bridge on `[e0, e1]`
+  let sliceBm : Anneal.SepLogicLenses.ByteMem :=
+    mCodec.codec.encode e0 ++ mCodec.codec.encode e1
+  have hE0Len : (mCodec.codec.encode e0).length = 4 := mCodec.codec.encode_len e0
+  have hE1Len : (mCodec.codec.encode e1).length = 4 := mCodec.codec.encode_len e1
+  have hSliceTyped :
+      Anneal.SepLogicLenses.SliceTypedAt mCodec.codec
+        (Anneal.SepLogicLenses.WidePtrVal.mk ⟨7, 0⟩ 2) [e0, e1] sliceBm := by
+    refine ⟨rfl, by simp [sliceBm, hE0Len, hE1Len], ?_⟩
+    intro i hi
+    match i, hi with
+    | 0, _ =>
+      rw [Anneal.SepLogicLenses.typedAt_iff]
+      refine ⟨by simp [sliceBm, hE0Len, hE1Len], ?_⟩
+      have hSl : (sliceBm.drop 0).take 4 = mCodec.codec.encode e0 := by
+        dsimp only [sliceBm]
+        rw [List.drop_zero, List.take_append_of_le_length (by omega),
+          List.take_of_length_le (by omega)]
+      rw [hSl]; exact mCodec.codec.decode_encode e0
+    | 1, _ =>
+      rw [Anneal.SepLogicLenses.typedAt_iff]
+      refine ⟨by simp [sliceBm, hE0Len, hE1Len], ?_⟩
+      have hSl : (sliceBm.drop 4).take 4 = mCodec.codec.encode e1 := by
+        dsimp only [sliceBm]
+        rw [List.drop_left' hE0Len, List.take_of_length_le (by omega)]
+      rw [hSl]; exact mCodec.codec.decode_encode e1
+  exact ⟨hStrictFail, hStrictOk,
+    ⟨bm', hSet, hProvFree.1, hPtr8Pres⟩,
+    ⟨⟨ptrLo.toNat, ptrLo.toBitVec.isLt⟩, hPtr4Val, hPtr4Trusted⟩,
+    ⟨byteMem_getVal_of_sliceTypedAt (by decide) hSliceTyped (i := 0) (by simp),
+     byteMem_getVal_of_sliceTypedAt (by decide) hSliceTyped (i := 1) (by simp)⟩⟩
 
 /-! ### 3B. Real Mutating `V2026_06_01` `CapturedMir` Callees Behind `@[irreducible] MutSummaryOutcomeCut` + Multi-Call `execMutSummaryChain` → `MirWpConverges` -/
 
@@ -5299,5 +5509,30 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3a_provenance_failClosed' d
 -/
 #guard_msgs in
 #print axioms canary3a_provenance_failClosed
+
+/-! ### Pass A3 guards: coalgebraic `Refines` + `DWLP`, `ValidChunk8BlockTree`
+stage-cut, and `ByteMem` provenance non-laundering + `SliceTypedAt`. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1a_countDown_coalWp_refines_dwp_dwlp' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1a_countDown_coalWp_refines_dwp_dwlp
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage1_chunk8BlockTree_stepStageCut' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_stage1_chunk8BlockTree_stepStageCut
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3a_byteMem_provenance_and_sliceTypedAt' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3a_byteMem_provenance_and_sliceTypedAt
 
 end Anneal.ParametricLoopInvAndSubLensTests
