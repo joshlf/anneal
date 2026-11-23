@@ -26,6 +26,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
+import re
 import shutil
 import stat
 import subprocess
@@ -905,6 +907,7 @@ def _write_lake_build(
     synthetic_modules: set[str] | None = None,
     lean_githash: str = TEST_LEAN_V434_GITHASH,
     pkg_name: str = "Anneal",
+    olean_bytes: dict[str, bytes] | None = None,
 ) -> None:
     """Write a fake `.lake/build/lib/lean` tree shaped like Lake's own output.
 
@@ -923,7 +926,7 @@ def _write_lake_build(
         stamp = base_time + idx * 10
         olean = lib / f"{mod}.olean"
         olean.parent.mkdir(parents=True, exist_ok=True)
-        olean.write_bytes(f"olean:{mod}".encode())
+        olean.write_bytes((olean_bytes or {}).get(mod, f"olean:{mod}".encode()))
         os.utime(olean, (stamp, stamp))
         if not traces:
             continue
@@ -960,12 +963,20 @@ def _write_lake_build(
                 "depHash": dep_hash,
             }
         else:
+            # Lake records two entries per import, in source order.
             imports_node: object = [
-                [
-                    f"{imp.replace('/', '.')}:importAllArts",
-                    gmut.lake_import_arts_hash(olean_hashes[imp]),
-                ]
+                entry
                 for imp in imports
+                for entry in (
+                    [
+                        f"{imp.replace('/', '.')} transitive imports (legacy)",
+                        f"{legacy_trans_hashes[imp]:016x}",
+                    ],
+                    [
+                        f"{imp.replace('/', '.')}:importAllArts",
+                        gmut.lake_import_arts_hash(olean_hashes[imp]),
+                    ],
+                )
             ] or "00000000000006bb"
             trace = {
                 "synthetic": False,
@@ -980,6 +991,7 @@ def _write_lake_build(
                         gmut.lake_hash_of_text(src_bytes),
                     ],
                     ["options", "00000000000006bb"],
+                    ["Module.leanArgs: #[]", "00000000000006bb"],
                 ],
                 "depHash": dep_hash,
             }
@@ -1297,12 +1309,16 @@ class GuardMutationB1AdversarialTests(unittest.TestCase):
             ok, why = gmut._lake_olean_reuse_decision(root, mods)
             self.assertFalse(ok)
             self.assertIn("bytes do not match", why)
-            # Same clobber with an OLD mtime needs the explicit byte check.
+            # Same clobber with an OLD mtime: still caught, because every
+            # reused `.olean` is re-hashed by default. Only the explicit
+            # mtime-trust mode misses it.
             os.utime(olean_a, (1000, 1000))
-            self.assertTrue(gmut._lake_olean_reuse_decision(root, mods)[0])
-            ok, why = gmut._lake_olean_reuse_decision(root, mods, verify_olean_bytes=True)
+            ok, why = gmut._lake_olean_reuse_decision(root, mods)
             self.assertFalse(ok)
             self.assertIn("bytes do not match", why)
+            self.assertTrue(
+                gmut._lake_olean_reuse_decision(root, mods, verify_olean_bytes=False)[0]
+            )
 
         # `A` was rebuilt (self-consistently) but its importers were not.
         with tempfile.TemporaryDirectory(prefix="anneal-gmut-lake-test-") as tmp:
@@ -1320,13 +1336,14 @@ class GuardMutationB1AdversarialTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("built against a different Trusted/A.olean", why)
 
-        # Importer recorded before its import was last rebuilt.
+        # Record mtimes play no part: a consistent build whose records were
+        # copied in an arbitrary order (`cp -r`) is still reusable.
         with tempfile.TemporaryDirectory(prefix="anneal-gmut-lake-test-") as tmp:
             root, mods, lib = fresh(tmp)
             os.utime(lib / "Trusted/A.trace", (2_900_000_000, 2_900_000_000))
-            ok, why = gmut._lake_olean_reuse_decision(root, mods)
-            self.assertFalse(ok)
-            self.assertIn("predates the rebuild of its import Trusted/A", why)
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(root, mods), (True, "lake-trace-verified")
+            )
 
         # Structural problems all fail closed.
         def mutate_trace(lib: Path, mod: str, fn: object) -> None:
@@ -2179,6 +2196,437 @@ class GuardMutationA1AdversarialTests(unittest.TestCase):
         ret_guard = by_id["tb_return_frame_dealloc_protector_conflict"]
         self.assertIn("activeProtectors := 1 :: .nil", ret_guard.sanity_source)
         self.assertIn("targetLocal := 1", ret_guard.sanity_source)
+
+
+# ----------------------------------------------------------------------
+# Round B2 adversarial regression tests
+# ----------------------------------------------------------------------
+
+
+class GuardMutationB2AdversarialTests(unittest.TestCase):
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+    KILL = "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\n"
+
+    def _classify(self, rc: int, out: str, stderr: str | None = None) -> str:
+        return gmut.classify_refutation_failure(
+            rc, out, self.FIXTURE, self.SPAN, stderr_output=stderr
+        )[0]
+
+    # -- comment scanner vs strings it cannot lex -----------------------
+
+    def test_scanner_refuses_sources_it_cannot_lex_exactly(self) -> None:
+        theorem = "theorem t :\n    1 = 1 :=\n  rfl\n"
+        hidden = 'axiom cheat : False\ndef b : String := "-/"\n'
+        # In each case Lean sees a complete string and then compiles the
+        # `axiom`; the scanner instead believes a block comment started.
+        smuggles = {
+            "interpolation": 'def a : String := s!"{"/-"}"\n',
+            "interpolation ": 'def a : Nat := dbg_trace "{"/-"}"; 0\n',
+            "backslash inside a string": 'def a : String := r"\\"\ndef c : String := "/-"\n',
+            "raw string literal": 'def a : String := r#"x"/-"#\n',
+        }
+        for needle, opener in smuggles.items():
+            src = "import Trusted.A\n" + opener + hidden + theorem
+            code, _ = gmut._strip_lean_comments(src)
+            self.assertNotIn("axiom", code, opener)  # the scanner IS fooled
+            errors = gmut._fixture_shape_errors("sanity", src, "t")
+            self.assertTrue(
+                any("unsupported lexical construct" in e and needle.strip() in e for e in errors),
+                (opener, errors),
+            )
+
+        # Constructs that are refused even though they smuggle nothing here.
+        for needle, line in (
+            ("character literal", "def c : Char := 'x'\n"),
+            ("character literal", "def c : Char := '\\x41'\n"),
+            ("guillemet-quoted identifier", "def «odd name» : Nat := 0\n"),
+            ("backslash outside a string literal", "def d : Nat := 1 \\ 2\n"),
+            ("unterminated string literal", 'def e : String := "abc\n'),
+        ):
+            src = "import Trusted.A\n" + line + theorem
+            errors = gmut._fixture_shape_errors("sanity", src, "t")
+            self.assertTrue(
+                any("unsupported lexical construct" in e and needle in e for e in errors),
+                (line, errors),
+            )
+
+        # Plain strings (even ones containing comment delimiters) and
+        # identifier primes are lexed exactly and stay accepted.
+        fine = (
+            "import Trusted.A\n"
+            'def msg : String := "-- not a comment /- neither -/"\n'
+            "def x' : Nat := 1\n" + theorem
+        )
+        code, unclosed, hazards = gmut._scan_lean_source(fine)
+        self.assertEqual((unclosed, hazards), (False, []))
+        self.assertIn("-- not a comment", code)
+        self.assertEqual(gmut._fixture_shape_errors("sanity", fine, "t"), [])
+        # Hazards carry 1-based line numbers.
+        self.assertEqual(
+            gmut._scan_lean_source("def a := 1\ndef c := 'x'\n")[2],
+            ["line 2: character literal"],
+        )
+
+    # -- fixture shape --------------------------------------------------
+
+    def test_fixture_must_be_one_binderless_rfl_theorem(self) -> None:
+        head = "import Trusted.A\ndef helper : Nat := 1\n"
+        good = head + "theorem t :\n    helper = 1 :=\n  rfl\n"
+        reserved = {"evalOperand", "emptyMemory"}
+        self.assertEqual(
+            gmut._fixture_shape_errors("sanity", good, "t", reserved_names=reserved), []
+        )
+        bad = {
+            # A hypothesis makes the statement vacuous.
+            "theorem header must be exactly": head + "theorem t (h : False) :\n    1 = 2 :=\n  rfl\n",
+            "theorem header must be exactly ": head + "private theorem t :\n    1 = 1 :=\n  rfl\n",
+            "must be proved by": head + "theorem t :\n    1 = 1 :=\n  by decide\n",
+            "must be proved by ": head + "theorem t :\n    1 = 1 := rfl\n",
+            "must be proved by  ": head + "theorem t :\n    False → 1 = 2 :=\n  fun h => h.elim\n",
+            "unsupported top-level command 'section'": "section\n" + good,
+            "forbidden token 'variable'": head + "variable (h : 1 = 2)\n" + "theorem t :\n    1 = 2 :=\n  rfl\n",
+            "forbidden token 'abbrev'": head + "  abbrev Z := Nat\n" + "theorem t :\n    1 = 1 :=\n  rfl\n",
+            "forbidden token 'infix'": head + '  infix:50 " ≈ " => Eq\n' + "theorem t :\n    1 = 1 :=\n  rfl\n",
+            "forbidden token 'local'": head + "  local instance : Inhabited Nat := ⟨0⟩\n" + "theorem t :\n    1 = 1 :=\n  rfl\n",
+            # A local definition would win over the opened trusted one.
+            "`def evalOperand` in sanity_source shadows a trusted declaration": (
+                "import Trusted.A\ndef evalOperand : Nat := 1\n"
+                "theorem t :\n    evalOperand = 1 :=\n  rfl\n"
+            ),
+            "`def emptyMemory` in sanity_source shadows": (
+                "import Trusted.A\ndef helper : Nat :=\n  1\n  def emptyMemory : Nat := 2\n"
+                "theorem t :\n    1 = 1 :=\n  rfl\n"
+            ),
+            "must be a simple identifier": (
+                "import Trusted.A\ndef Foo.bar : Nat := 1\ntheorem t :\n    1 = 1 :=\n  rfl\n"
+            ),
+            # An import the header parser cannot read is not silently dropped.
+            "header parser recognized 1": (
+                "import Trusted.A\nimport Ünï.B\ntheorem t :\n    1 = 1 :=\n  rfl\n"
+            ),
+        }
+        for needle, src in bad.items():
+            errors = gmut._fixture_shape_errors("sanity", src, "t", reserved_names=reserved)
+            self.assertTrue(any(needle.strip() in e for e in errors), (needle, errors))
+
+        # The live catalog reserves the real trusted names.
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        shadowing = guard.sanity_source.replace(
+            "theorem sanity_div_by_zero",
+            "def evalScalarBinOp : Nat := 0\n\ntheorem sanity_div_by_zero",
+        )
+        with mock.patch.object(
+            gmut, "MIR_SEMANTICS_GUARDS", _replace_guard("div_by_zero", sanity_source=shadowing)
+        ):
+            errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(
+            any("`def evalScalarBinOp`" in e and "shadows a trusted declaration" in e for e in errors),
+            errors,
+        )
+        scalars = (
+            ANNEAL_ROOT / "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean"
+        ).read_text(encoding="utf-8")
+        names = gmut._trusted_declaration_names(scalars)
+        for expected in ("evalScalarBinOp", "evalSignedDiv", "evalUnaryNot", "scalarModulus"):
+            self.assertIn(expected, names)
+
+    # -- refutation classification: stdout vs stderr -------------------
+
+    def test_classify_keeps_stdout_and_stderr_apart(self) -> None:
+        self.assertEqual(self._classify(1, self.KILL, ""), "KILLED")
+        self.assertEqual(self._classify(1, self.KILL, "note: build finished\n"), "KILLED")
+        # Diagnostics that Lean prints on stderr still count.
+        self.assertEqual(self._classify(1, "", self.KILL), "KILLED")
+        self.assertEqual(
+            self._classify(1, "", self.KILL + "  note: type error: expected .ub\n"), "KILLED"
+        )
+
+        # An indented error on stderr is NOT a continuation of the stdout
+        # diagnostic, whether or not stdout ended with a newline.
+        for stdout in (self.KILL, self.KILL.rstrip("\n")):
+            for stderr in (
+                "  error: wrapper scope setup failed\n",
+                "\terror: toolchain missing\n",
+                "  lean: error: something\n",
+            ):
+                self.assertEqual(self._classify(1, stdout, stderr), "ERROR", (stdout, stderr))
+        # The same text in ONE stream is a diagnostic body (A1's rule).
+        self.assertEqual(
+            self._classify(1, self.KILL + "  error: wrapper scope setup failed\n"), "KILLED"
+        )
+
+        # stderr cannot supply the proof-failure marker for a stdout error.
+        odd = "/t/Refute_div_by_zero.lean:9:2: error: bizarre glitch\n"
+        self.assertEqual(self._classify(1, odd, "rfl has type Type mismatch\n"), "ERROR")
+        self.assertEqual(self._classify(1, odd + "rfl has type Type mismatch\n"), "KILLED")
+        # Non-kill markers and foreign errors on stderr still block a kill.
+        self.assertEqual(self._classify(1, self.KILL, "PANIC at Foo\n"), "ERROR")
+        self.assertEqual(
+            self._classify(1, self.KILL, "/t/Other.lean:1:0: error: boom\n"), "ERROR"
+        )
+
+    def test_synthetic_indented_stderr_error_is_not_a_kill(self) -> None:
+        fake_sh = (
+            'if [ "$IS_MUTANT" = "1" ] && [ "$BASENAME" = "Refute_div_by_zero.lean" ]; then\n'
+            "  printf '  error: wrapper scope setup failed\\n' >&2\n"
+            "fi\n" + KILL_ALL_FAKE_SH
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, fake_sh)
+            res = _run_cli(
+                [
+                    "--lean", str(fake), "--no-lake-cache", "--json",
+                    "--guard", "div_by_zero", "--guard", "rem_by_zero",
+                ]
+            )
+        self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+        by_id = {r["guard_id"]: r for r in json.loads(res.stdout)["results"]}
+        self.assertEqual(by_id["div_by_zero"]["status"], "ERROR")
+        self.assertIn("wrapper scope setup failed", by_id["div_by_zero"]["detail"])
+        self.assertEqual(by_id["rem_by_zero"]["status"], "KILLED")
+
+    # -- Lake reuse -----------------------------------------------------
+
+    def test_lake_reuse_pins_transitive_imports_by_content(self) -> None:
+        # `A`; `B` imports `A`; `D` imports ONLY `B`.
+        sources = {
+            "Trusted/A": "def a : Nat := 1\n",
+            "Trusted/B": "import Trusted.A\ndef b : Nat := a\n",
+            "Trusted/D": "import Trusted.B\ndef d : Nat := b\n",
+        }
+        mods = tuple(sources)
+
+        def build(tmp: Path, name: str, olean_bytes: dict[str, bytes] | None = None) -> Path:
+            root = tmp / name
+            for mod, text in sources.items():
+                src = root / "trusted/lean" / f"{mod}.lean"
+                src.parent.mkdir(parents=True, exist_ok=True)
+                src.write_text(text, encoding="utf-8")
+            (root / "lean-toolchain").write_text("leanprover/lean4:v4.34.1\n", encoding="utf-8")
+            (root / "lakefile.toml").write_text(TINY_LAKEFILE_TOML, encoding="utf-8")
+            _write_lake_build(root, mods, olean_bytes=olean_bytes)
+            return root
+
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-lake-test-") as tmp:
+            tmp_path = Path(tmp)
+            root = build(tmp_path, "current")
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(root, mods), (True, "lake-trace-verified")
+            )
+            # `A` is rebuilt with different output and `B` is re-recorded
+            # against it. `B.olean` happens to be byte-identical, and `D` is
+            # NOT rebuilt. Every file keeps a plausible mtime (records of
+            # importers are newer than records of their imports).
+            rebuilt = build(tmp_path, "rebuilt", {"Trusted/A": b"olean:Trusted/A v2"})
+            lib, new_lib = (r / ".lake/build/lib/lean" for r in (root, rebuilt))
+            for rel in ("Trusted/A.olean", "Trusted/A.olean.hash", "Trusted/A.trace", "Trusted/B.trace"):
+                shutil.copy2(new_lib / rel, lib / rel)
+            self.assertEqual(
+                (lib / "Trusted/B.olean").read_bytes(), (new_lib / "Trusted/B.olean").read_bytes()
+            )
+            self.assertLess(
+                (lib / "Trusted/B.trace").stat().st_mtime_ns,
+                (lib / "Trusted/D.trace").stat().st_mtime_ns,
+            )
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(root, mods),
+                (False, "Trusted/D: built against different transitive imports of Trusted/B"),
+            )
+            # `A` and `B` on their own are a consistent build.
+            self.assertTrue(gmut._lake_olean_reuse_decision(root, mods[:2])[0])
+
+        # A build made with non-default options or arguments is not reused,
+        # because mutants are compiled by plain `lean`.
+        for mutate in (
+            lambda t: t["inputs"].__setitem__(3, ["options", "1" * 16]),
+            lambda t: t["inputs"].__setitem__(4, ["Module.leanArgs: #[-DautoImplicit=true]", "2" * 16]),
+            lambda t: t["inputs"].pop(4),
+        ):
+            with tempfile.TemporaryDirectory(prefix="anneal-gmut-lake-test-") as tmp:
+                root = build(Path(tmp), "opts")
+                trace_path = root / ".lake/build/lib/lean/Trusted/B.trace"
+                trace = json.loads(trace_path.read_text(encoding="utf-8"))
+                mutate(trace)
+                trace_path.write_text(json.dumps(trace), encoding="utf-8")
+                self.assertEqual(
+                    gmut._lake_olean_reuse_decision(root, mods),
+                    (False, "Trusted/B: built with non-default Lean options or arguments"),
+                )
+
+    def test_replaced_olean_with_intact_hash_and_trace_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            tmp_path = Path(tmp)
+            root = _make_tcb_copy_root(tmp_path)
+            _write_lake_build(root, ALL_TCB_MODULES)
+            fake = tmp_path / "fake_lean"
+            _write_fake_lean_sh(fake, KILL_ALL_FAKE_SH)
+            base = ["--anneal-root", str(root), "--lean", str(fake), "--guard", "div_by_zero", "--json"]
+
+            res = _run_cli(base)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertTrue(json.loads(res.stdout)["used_lake_cache"])
+
+            # Swap in a different `.olean` that is OLDER than its `.hash`
+            # file (a rename, `cp -p`, or a bad artifact restored from the
+            # Lake cache). `.olean.hash` and `.trace` are untouched.
+            state = root / ".lake/build/lib/lean/Trusted/Rustc/V2026_06_01/MirSemantics/State.olean"
+            state.write_bytes(b"some other olean")
+            os.utime(state, (1000, 1000))
+
+            res = _run_cli(base)
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            report = json.loads(res.stdout)
+            self.assertFalse(report["used_lake_cache"])
+            self.assertIn("State: `.olean` bytes do not match", report["lake_cache_detail"])
+
+            # The explicit opt-out restores the mtime-only trust rule.
+            res = _run_cli([*base, "--trust-lake-olean-hash-files"])
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertTrue(json.loads(res.stdout)["used_lake_cache"])
+
+            res = _run_cli([*base, "--trust-lake-olean-hash-files", "--verify-lake-olean-bytes"])
+            self.assertEqual(res.returncode, 2)
+
+    def test_bulk_murmur_matches_the_block_by_block_hash(self) -> None:
+        rng = random.Random(20261123)
+        sizes = [0, 1, 7, 8, 9, 63, 64, 4095, 4096, 4097, 4103, 8192, 12345]
+        # Force several bulk chunks, including a short final chunk and a
+        # chunk boundary that falls exactly on the end of the data.
+        with (
+            mock.patch.object(gmut, "_MURMUR_BULK_MIN_BLOCKS", 1),
+            mock.patch.object(gmut, "_MURMUR_BULK_BLOCKS", 7),
+        ):
+            for size in [*sizes, 7 * 8, 7 * 8 * 3, 7 * 8 * 3 + 5]:
+                data = rng.randbytes(size)
+                for seed in (11, 0, 2**64 - 1):
+                    self.assertEqual(
+                        gmut._lean_murmur_hash64a(data, seed),
+                        gmut._lean_murmur_hash64a_simple(data, seed),
+                        (size, seed),
+                    )
+        # Default thresholds: one byte either side of where the bulk path
+        # starts, and data spanning more than one default chunk.
+        edge = gmut._MURMUR_BULK_MIN_BLOCKS * 8
+        chunk = gmut._MURMUR_BULK_BLOCKS * 8
+        for size in (edge - 1, edge, edge + 1, chunk + 13, 2 * chunk):
+            data = rng.randbytes(size)
+            self.assertEqual(
+                gmut._lean_murmur_hash64a(data), gmut._lean_murmur_hash64a_simple(data), size
+            )
+        # Worst case for lane arithmetic: every block is all ones.
+        ones = b"\xff" * (edge + 24)
+        self.assertEqual(
+            gmut._lean_murmur_hash64a(ones), gmut._lean_murmur_hash64a_simple(ones)
+        )
+        # The Lake-recorded ground truth still holds through the public API.
+        self.assertEqual(
+            gmut.lake_hash_of_text(b"5045d0056413266e57c625dcd7c365b10e377c52"),
+            "e9f3658beb070375",
+        )
+
+    def test_lakefile_must_be_default_for_any_lake_reuse(self) -> None:
+        # Lake does not record weak arguments in its traces at all, so the
+        # lakefile itself must be the modelled default, synthetic trace or not.
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-lake-test-") as tmp:
+            root, mods = _make_tiny_lake_root(Path(tmp))
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(root, mods), (True, "lake-trace-verified")
+            )
+            (root / "lakefile.toml").write_text(
+                TINY_LAKEFILE_TOML + 'weakLeanArgs = ["-DautoImplicit=true"]\n', encoding="utf-8"
+            )
+            ok, why = gmut._lake_olean_reuse_decision(root, mods)
+            self.assertFalse(ok)
+            self.assertIn("unsupported key(s)", why)
+            self.assertIn("weakLeanArgs", why)
+
+            (root / "lakefile.toml").write_text(TINY_LAKEFILE_TOML, encoding="utf-8")
+            with mock.patch.object(gmut, "tomllib", None):
+                ok, why = gmut._lake_olean_reuse_decision(root, mods)
+            self.assertFalse(ok)
+            self.assertIn("tomllib", why)
+
+            (root / "lakefile.toml").unlink()
+            ok, why = gmut._lake_olean_reuse_decision(root, mods)
+            self.assertFalse(ok)
+            self.assertIn("cannot read lakefile.toml", why)
+
+    # -- header parser completeness -------------------------------------
+
+    def test_header_parser_reports_imports_it_cannot_read(self) -> None:
+        self.assertEqual(
+            gmut._parse_lean_header_ex("import Trusted.A\nimport Trusted.B\ndef x := 1\n"),
+            (False, ["Trusted/A", "Trusted/B"], True),
+        )
+        self.assertEqual(
+            gmut._parse_lean_header_ex(
+                "import Trusted.A -- note\n/- c -/ import Trusted.B/- c -/\nnamespace X\n"
+            ),
+            (False, ["Trusted/A", "Trusted/B"], True),
+        )
+        # Lean accepts every one of these headers in full; the parser cannot
+        # read one name and would silently drop the imports after it.
+        for src in (
+            "import Trusted.A\nimport Ünï.B\nimport Trusted.C\n",
+            "import Trusted.Ünï\nimport Trusted.C\n",
+            "import Trusted.A\npublic import all Ünï\nimport Trusted.C\n",
+            "import Trusted.A?\nimport Trusted.C\n",
+        ):
+            _, imports, complete = gmut._parse_lean_header_ex(src)
+            self.assertFalse(complete, src)
+            self.assertNotIn("Trusted/C", imports, src)
+
+        # Nothing that relies on a trusted file's import list accepts it.
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            root = _make_tcb_copy_root(Path(tmp))
+            _write_lake_build(root, ALL_TCB_MODULES)
+            self.assertEqual(gmut.validate_catalog_invariants(root), [])
+            self.assertTrue(gmut._lake_olean_reuse_decision(root, ALL_TCB_MODULES)[0])
+            seq = root / "trusted/lean/Trusted/Sequence.lean"
+            seq.write_text(
+                "import Ünï.Hidden\n" + seq.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            errors = gmut.validate_catalog_invariants(root)
+            self.assertTrue(
+                any("cannot parse every import of trusted module Trusted/Sequence" in e for e in errors),
+                errors,
+            )
+            self.assertEqual(
+                gmut._lake_olean_reuse_decision(root, ALL_TCB_MODULES),
+                (False, "Trusted/Sequence: cannot parse every import of the source"),
+            )
+
+    # -- catalog boundary tightness ------------------------------------
+
+    def test_shift_guards_are_refuted_exactly_at_the_boundary(self) -> None:
+        by_id = {g.guard_id: g for g in gmut.MIR_SEMANTICS_GUARDS}
+        operands = re.compile(r"Unchecked ⟨(\d+), (\d+)⟩ ⟨(\d+), (\d+)⟩")
+
+        def shift_and_bits(source: str) -> tuple[int, int]:
+            match = operands.search(source)
+            assert match is not None, source
+            return (int(match.group(3)), 8 * int(match.group(2)))
+
+        for full, edge in (("shift_oob", "shl_oob_off_by_one"), ("shr_oob", "shr_oob_off_by_one")):
+            # The boundary mutant weakens `numBits <= b` to `numBits < b`.
+            self.assertEqual(by_id[edge].anchor, by_id[full].anchor)
+            self.assertIn("Nat.ble numBits b", by_id[edge].anchor)
+            self.assertEqual(
+                by_id[edge].replacement,
+                by_id[edge].anchor.replace("Nat.ble numBits b", "Nat.blt numBits b"),
+            )
+            for guard_id in (full, edge):
+                shift, bits = shift_and_bits(by_id[guard_id].refute_source)
+                # `b == numBits`: the smallest UB shift. `b > numBits` would
+                # let the `<` mutant survive.
+                self.assertEqual(shift, bits, guard_id)
+                shift, bits = shift_and_bits(by_id[guard_id].sanity_source)
+                self.assertLess(shift, bits, guard_id)
+            # The boundary mutant's sanity sits on the last defined shift.
+            shift, bits = shift_and_bits(by_id[edge].sanity_source)
+            self.assertEqual(shift, bits - 1, edge)
 
 
 if __name__ == "__main__":
