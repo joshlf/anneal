@@ -38,42 +38,64 @@ MiniRust-side facts only (the `BasicMemory` codec equivalences and
   preserve (`evalIntrinsicM_atomic_preserves`), in particular `MachTB.wfLive`
   (`evalIntrinsicM_atomic_tb_wfLive`), and records only atomic accesses
   (`evalIntrinsicM_atomic_accesses`).
-* **§3** Every `throw_ub!` and specification panic of the four intrinsics, for
-  all machines of all memory models: arity, non-thin first argument, unsized,
-  non-power-of-two and oversized types, type mismatches, non-integer types,
-  misalignment, the arithmetic UB of `eval_int_bin_op`, and the laws that
-  reduce each well-shaped intrinsic to `typed_load` / `typed_store`
-  (`atomicStore_eq_typedStoreM`, `atomicLoad_eq_typedLoadM`,
-  `atomicCompareExchange_eq`, `atomicFetchAndOp_eq`).
+* **§3** Complete bidirectional (`iff`) characterizations of both `.ok` and
+  `.error` (UB and specification panic, in exact upstream check order) for all
+  four atomic intrinsics in every memory model (`atomicStore_{ok,error}_iff`,
+  `atomicLoad_{ok,error}_iff`, `atomicCompareExchange_{ok,error}_iff`,
+  `atomicFetchAndOp_{ok,error}_iff`), individual guard/UB/panic laws (arity,
+  non-thin first argument, unsized, zero-sized, non-power-of-two, wide-pointer
+  and oversized types, type mismatches, non-integer types, misalignment,
+  complete `eval_int_bin_op` UB and overflow coverage), and the
+  `ConcurrentMemory` data-race interaction laws (`Access::races`,
+  `ConcurrentMemory::check_data_races`, `atomic_atomic_no_data_race`,
+  `atomicStore_nonAtomicLoad_data_race`,
+  `atomicCompareExchange_failure_nonAtomicLoad_no_data_race`,
+  `atomicCompareExchange_success_nonAtomicLoad_data_race`,
+  `atomicFetchAndOp_nonAtomicLoad_data_race`).
 * **§4** Kernel-evaluated witnesses on concrete `Mach` and `MachTB` machines:
   round trips across integer widths, `bool`, and thin raw pointers;
-  compare-exchange success and failure with their access logs; fetch-and-op;
-  dangling, out-of-bounds, misaligned, and uninitialized accesses; the Tree
-  Borrows `Frozen` witness; and `Terminator::Intrinsic` end to end through
-  `step` / `steps` and `stepTB` / `stepsTB`.
-* **§5** Instances showing that the conditional laws are not vacuous, and the
-  axiom and import audit.
+  compare-exchange success and failure with their access logs; fetch-and-op
+  (including `AddUnchecked`/`SubUnchecked`/`DivExact`/`Shl` vs `Add` overflow);
+  dangling, out-of-bounds, misaligned, and uninitialized accesses; `CM` and
+  `ConcurrentMemory` data-race witnesses (atomic vs atomic, atomic write vs
+  non-atomic load, synchronized threads, disjoint byte ranges, and failing vs
+  succeeding compare-exchange against a non-atomic load); the Tree Borrows
+  `Frozen` witness; and `Terminator::Intrinsic` end to end through `step` /
+  `steps` and `stepTB` / `stepsTB`.
+* **§5** Instances showing that the conditional laws (including the data-race
+  laws) are not vacuous, and the axiom and import audit.
 
 ## What the laws say about upstream MiniRust `d821c6e3`
 
 1. **`AtomicFetchAndOp` does not bring its result in bounds.** It stores the
    result of `eval_int_bin_op` as is, whereas `eval_bin_op` for `BinOp::Int`
    applies `int_ty.bring_in_bounds`. A result outside the integer type
-   (`255u8 + 1`) fails the `assert!` of `Machine::typed_store`, a
-   specification panic, where Rust's `fetch_add` wraps
+   (`255u8 + 1` or `128u8 << 1`) fails the `assert!` of `Machine::typed_store`,
+   a specification panic, where Rust's `fetch_add` wraps — in contrast to
+   `AddUnchecked`, which throws UB `"overflow in unchecked add"`
    (`atomicFetchAndOp_out_of_range_specPanic`,
-   `atomicFetchAndOp_add_u8_overflow_bm`).
+   `atomicFetchAndOp_addUnchecked_overflow_ub`,
+   `atomicFetchAndOp_add_u8_overflow_bm`,
+   `atomicFetchAndOp_unchecked_and_shift_bm`).
 2. **A failing `AtomicCompareExchange` is a read.** It performs no store, so
-   it logs only an atomic `Load` (`atomicCompareExchange_failure_accesses`)
-   and, under Tree Borrows, succeeds through a `Frozen` shared reference
-   through which a succeeding one is UB (`atomic_frozen_tb`).
+   it logs only an atomic `Load` (`atomicCompareExchange_failure_accesses`),
+   never races with a non-atomic load on an unsynchronized thread
+   (`atomicCompareExchange_failure_nonAtomicLoad_no_data_race`, contrasting
+   with `atomicCompareExchange_success_nonAtomicLoad_data_race`), and, under
+   Tree Borrows, succeeds through a `Frozen` shared reference through which a
+   succeeding one is UB (`atomic_frozen_tb`).
 3. **Unsized types: UB for `AtomicStore`, a specification panic for
    `AtomicLoad`.** `AtomicStore` matches on `LayoutStrategy::Sized` and throws
    UB otherwise; `AtomicLoad` calls `expect_size` (`atomic_slice_u8_unsized`).
 4. **The `Align::from_bytes(size.bytes()).unwrap()` of `AtomicCompareExchange`
-   and `AtomicFetchAndOp` cannot be what panics**: for an integer type whose
-   size is not a power of two, `Type::layout` (`IntType::align`) panics first
-   (`atomicCompareExchange_ill_formed_int_specPanic`).
+   and `AtomicFetchAndOp`, and the `previous` `unreachable!()` of
+   `AtomicFetchAndOp`, cannot be what panics**: for an integer type whose size
+   is not a power of two, `Type::layout` (`IntType::align`) panics first
+   (`atomicCompareExchange_ill_formed_int_specPanic`,
+   `atomicFetchAndOp_ill_formed_int_specPanic`), and `typed_load` at
+   `Type::Int` only ever returns `Value::Int` (`typedLoadM_int_returns_int`),
+   so neither dead branch appears in `atomicCompareExchange_error_iff` or
+   `atomicFetchAndOp_error_iff`.
 5. The UB message of `AtomicCompareExchange` at a non-integer type reads
    `Intrinis::AtomicCompareExchange` upstream; the interpretation and
    `atomicCompareExchange_non_int_ub` keep the typo.
@@ -126,6 +148,28 @@ theorem interp_bind_congr {α β : Type} {x y : Interp α} {f g : α → Interp 
   cases x with
   | error _ => rfl
   | ok a => exact hfg a
+
+/-- Inversion of a stopping `?` chain. -/
+theorem interp_bind_eq_error {α β : Type} {x : Interp α} {f : α → Interp β} {e : Stop}
+    (h : (x >>= f) = .error e) : x = .error e ∨ ∃ a, x = .ok a ∧ f a = .error e := by
+  cases x with
+  | error s =>
+    cases h
+    exact Or.inl rfl
+  | ok a => exact Or.inr ⟨a, rfl, h⟩
+
+/-- `List.any` is `false` iff every element satisfies `p x = false`. -/
+theorem list_any_eq_false_iff {α : Type} {l : List α} {p : α → Bool} :
+    l.any p = false ↔ ∀ x ∈ l, p x = false := by
+  rw [List.any_eq_false]
+  constructor
+  · intro h x hx
+    cases hpx : p x with
+    | false => rfl
+    | true => exact absurd hpx (h x hx)
+  · intro h x hx hpx
+    rw [h x hx] at hpx
+    cases hpx
 
 /-- The four atomic memory intrinsics of `spec/lang/step/intrinsics.md`. -/
 def isAtomicOp : IntrinsicOp → Bool
@@ -873,6 +917,93 @@ theorem layout_int_ill_formed {t : IntType} (h : alignFromBytes t.size.bytes = n
   simp only [Type.layout, IntType.align, h]
   rfl
 
+/-- Comparing any type against an integer type with `typeEq` is propositional
+equality. -/
+theorem typeEq_int_right_iff (ty : «Type») (t : IntType) :
+    typeEq ty (.Int t) = true ↔ ty = .Int t := by
+  cases ty with
+  | Int t' =>
+    constructor
+    · intro h
+      simp only [typeEq] at h
+      have ht : t' = t := beq_iff_eq.mp h
+      subst ht
+      rfl
+    · intro h
+      cases h
+      simp only [typeEq, beq_self_eq_true]
+  | _ =>
+    constructor
+    · intro h
+      simp only [typeEq] at h
+      cases h
+    · intro h
+      cases h
+
+/-- `Align::from_bytes(n)` succeeds only for positive byte counts. -/
+theorem alignFromBytes_pos {n : Nat} {al : Align} (h : alignFromBytes n = some al) :
+    0 < n := by
+  unfold alignFromBytes at h
+  split at h
+  · rename_i hc
+    exact Nat.pos_of_ne_zero hc.1
+  · cases h
+
+/-- A successful `typed_load` at an integer type always yields a `Value::Int`,
+in every memory model. In particular, the second `unreachable!()` of
+`AtomicFetchAndOp` (`let Value::Int(previous_int) = previous else { unreachable!() }`)
+cannot be reached. -/
+theorem typedLoadM_int_returns_int {m m' : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} {t : IntType} {align : Align}
+    {atomicity : Atomicity} {val : Value M}
+    (h : typedLoadM m ptr (.Int t) align atomicity = .ok (val, m')) :
+    ∃ i, val = .Int i := by
+  unfold typedLoadM at h
+  obtain ⟨_, _, h⟩ := interp_bind_eq_ok h
+  obtain ⟨_, _, h⟩ := interp_bind_eq_ok h
+  obtain ⟨⟨bytes, cm⟩, _, h⟩ := interp_bind_eq_ok h
+  dsimp only at h
+  obtain ⟨opt, hdec, h⟩ := interp_bind_eq_ok h
+  cases opt with
+  | none => cases h
+  | some v =>
+    obtain ⟨_, _, h⟩ := interp_bind_eq_ok h
+    obtain ⟨rfl, _⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+    cases t with
+    | mk signed size =>
+      dsimp only [Type.decodeM, Type.decodeIntM] at hdec
+      split at hdec
+      · dsimp only [specPanic] at hdec; cases hdec
+      · split at hdec
+        · have hsome := interp_pure_eq_ok hdec
+          cases hsome
+          exact ⟨_, rfl⟩
+        · have hnone := interp_pure_eq_ok hdec
+          cases hnone
+
+omit [MemoryOps M] in
+/-- Encoding any value at an integer type produces exactly `t.size.bytes` bytes. -/
+theorem encodeM_int_length {t : IntType} {val : Value M}
+    {bytes : List (AbstractByte (Memory.Provenance M))}
+    (h : Type.encodeM (M := M) (.Int t) val = .ok bytes) :
+    bytes.length = t.size.bytes := by
+  cases t with
+  | mk signed size =>
+    cases val with
+    | Int i =>
+      dsimp only [Type.encodeM, Type.encodeIntM, Endianness.encode, x86_64.ENDIANNESS] at h
+      cases hin : inBounds i signed size with
+      | true =>
+        simp only [hin, ↓reduceIte] at h
+        obtain rfl := interp_pure_eq_ok h
+        rw [List.length_map, MiniRustSpec.Correspondence.leBytes_length]
+      | false =>
+        simp only [hin, Bool.false_eq_true, ↓reduceIte, specPanic] at h
+        cases h
+    | _ =>
+      dsimp only [Type.encodeM, Type.encodeIntM, specPanic] at h
+      cases h
+
 /-! ### `AtomicStore` -/
 
 /-- `AtomicStore` at an unsized type is UB. -/
@@ -935,6 +1066,165 @@ theorem atomicStore_eq_typedStoreM (m : Machine M) (ptr : ThinPointer (Memory.Pr
   have hn : ¬ (size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes) := Nat.not_lt.mpr hsz
   simp only [evalIntrinsicM, unitType, hl, interp_ok_bind, ha, hn, ↓reduceIte]
 
+/-- Complete characterization of a successful `AtomicStore` in every memory model. -/
+theorem atomicStore_ok_iff {m m' : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {val : Value M} :
+    evalIntrinsicM m .AtomicStore args retTy = .ok (val, m') ↔
+      ∃ ptr pty v ty size a align,
+        args = [(.Ptr ⟨ptr, none⟩, pty), (v, ty)] ∧
+        Type.layout ty = .ok (.Sized size a) ∧
+        alignFromBytes size.bytes = some align ∧
+        size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+        retTy = unitType ∧
+        val = unitValueM ∧
+        typedStoreM m ptr v ty align .Atomic = .ok m' := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨v, ty⟩, _ | ⟨_, _⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      all_goals try (dsimp only [evalIntrinsicM, ub] at h; cases h)
+      dsimp only [evalIntrinsicM] at h
+      obtain ⟨layout, hl, h⟩ := interp_bind_eq_ok h
+      cases layout with
+      | Sized size a =>
+        dsimp only at h
+        rw [alignFromBytesInt_natCast] at h
+        cases ha : alignFromBytes size.bytes with
+        | none =>
+          simp only [ha, ub] at h; cases h
+        | some align =>
+          simp only [ha] at h
+          by_cases hbig : size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+          · simp only [hbig, ↓reduceIte, ub] at h; cases h
+          · simp only [hbig, ↓reduceIte] at h
+            by_cases hret : retTy = unitType
+            · subst hret
+              dsimp only [unitType] at h
+              obtain ⟨m1, hs, h⟩ := interp_bind_eq_ok h
+              obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+              exact ⟨ptr, pty, v, ty, size, a, align, rfl, hl, ha,
+                Nat.not_lt.mp hbig, rfl, rfl, hs⟩
+            · split at h
+              · exact absurd rfl hret
+              · dsimp only [ub] at h; cases h
+      | _ => dsimp only [ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+  · rintro ⟨ptr, pty, v, ty, size, a, align, rfl, hl, ha, hsz, rfl, rfl, hs⟩
+    have ha' : alignFromBytesInt size.bytes = some align := by
+      rw [alignFromBytesInt_natCast]; exact ha
+    rw [atomicStore_eq_typedStoreM m ptr pty v ty hl ha' hsz, hs]
+    rfl
+
+/-- Complete characterization of every stopping outcome (UB or spec panic, in
+exact upstream check order) of `AtomicStore` in every memory model. -/
+theorem atomicStore_error_iff {m : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {e : Stop} :
+    evalIntrinsicM m .AtomicStore args retTy = .error e ↔
+      (args.length ≠ 2 ∧ e = .ub "invalid number of arguments for `AtomicStore` intrinsic") ∨
+      (∃ ptrV pty v ty, args = [(ptrV, pty), (v, ty)] ∧
+        (∀ p, ptrV ≠ .Ptr ⟨p, none⟩) ∧
+        e = .ub "invalid first argument to `AtomicStore` intrinsic: not a thin pointer") ∨
+      (∃ ptr pty v ty, args = [(.Ptr ⟨ptr, none⟩, pty), (v, ty)] ∧
+        (Type.layout ty = .error e ∨
+         (∃ l, Type.layout ty = .ok l ∧ LayoutStrategy.is_sized l = false ∧
+           e = .ub "invalid second argument to `AtomicStore` intrinsic: unsized type") ∨
+         (∃ size a, Type.layout ty = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = none ∧
+           e = .ub "invalid second argument to `AtomicStore` intrinsic: size not power of two") ∨
+         (∃ size a align, Type.layout ty = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = some align ∧
+           size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes ∧
+           e = .ub "invalid second argument to `AtomicStore` intrinsic: size too big") ∨
+         (∃ size a align, Type.layout ty = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = some align ∧
+           size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+           retTy ≠ unitType ∧
+           e = .ub "invalid return type for `AtomicStore` intrinsic") ∨
+         (∃ size a align, Type.layout ty = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = some align ∧
+           size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+           retTy = unitType ∧
+           typedStoreM m ptr v ty align .Atomic = .error e))) := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨v, ty⟩, _ | ⟨_, _⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 0 ≠ 2; decide, rfl⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 1 ≠ 2; decide, rfl⟩
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM] at h
+        refine Or.inr (Or.inr ⟨ptr, pty, v, ty, rfl, ?_⟩)
+        rcases interp_bind_eq_error h with hlay | ⟨layout, hl, h⟩
+        · exact Or.inl hlay
+        · cases layout with
+          | Sized size a =>
+            dsimp only at h
+            rw [alignFromBytesInt_natCast] at h
+            cases ha : alignFromBytes size.bytes with
+            | none =>
+              simp only [ha, ub] at h; cases h
+              exact Or.inr (Or.inr (Or.inl ⟨size, a, hl, ha, rfl⟩))
+            | some align =>
+              simp only [ha] at h
+              by_cases hbig : size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+              · simp only [hbig, ↓reduceIte, ub] at h; cases h
+                exact Or.inr (Or.inr (Or.inr (Or.inl ⟨size, a, align, hl, ha, hbig, rfl⟩)))
+              · simp only [hbig, ↓reduceIte] at h
+                by_cases hret : retTy = unitType
+                · subst hret
+                  dsimp only [unitType] at h
+                  rcases interp_bind_eq_error h with hs | ⟨_, _, h⟩
+                  · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+                      ⟨size, a, align, hl, ha, Nat.not_lt.mp hbig, rfl, hs⟩))))
+                  · cases h
+                · split at h
+                  · exact absurd rfl hret
+                  · dsimp only [ub] at h; cases h
+                    exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+                      ⟨size, a, align, hl, ha, Nat.not_lt.mp hbig, hret, rfl⟩))))
+          | Slice _ _ =>
+            dsimp only [ub] at h; cases h
+            exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+          | TraitObject _ =>
+            dsimp only [ub] at h; cases h
+            exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+          | Tuple _ _ =>
+            dsimp only [ub] at h; cases h
+            exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl,
+          (fun _ hc => by cases (Pointer.mk.inj (Value.Ptr.inj hc)).2), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, v, ty, rfl, (fun _ hc => by cases hc), rfl⟩)
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+      exact Or.inl ⟨by simp only [List.length_cons]; omega, rfl⟩
+  · rintro (⟨hlen, rfl⟩ | ⟨ptrV, pty, v, ty, rfl, hnt, rfl⟩ | ⟨ptr, pty, v, ty, rfl, hcase⟩)
+    · exact atomicStore_arity_ub m args retTy hlen
+    · exact atomicStore_not_thin_ptr_ub m ptrV pty v ty retTy hnt
+    · rcases hcase with hlay | ⟨l, hl, hu, rfl⟩ | ⟨size, a, hl, ha, rfl⟩ |
+        ⟨size, a, align, hl, ha, hbig, rfl⟩ | ⟨size, a, align, hl, ha, hsz, hret, rfl⟩ |
+        ⟨size, a, align, hl, ha, hsz, rfl, hs⟩
+      · simp only [evalIntrinsicM, hlay, interp_error_bind]
+      · exact atomicStore_unsized_ub m ptr pty v ty retTy hl hu
+      · exact atomicStore_size_not_pow2_ub m ptr pty v ty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha)
+      · exact atomicStore_size_too_big_ub m ptr pty v ty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha) hbig
+      · exact atomicStore_ret_not_unit_ub m ptr pty v ty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha) hsz hret
+      · rw [atomicStore_eq_typedStoreM m ptr pty v ty hl
+          (by rw [alignFromBytesInt_natCast]; exact ha) hsz, hs]
+        rfl
+
 /-! ### `AtomicLoad` -/
 
 /-- `AtomicLoad` at an unsized return type is a spec panic, not UB: unlike
@@ -984,6 +1274,141 @@ theorem atomicLoad_eq_typedLoadM (m : Machine M) (ptr : ThinPointer (Memory.Prov
   have hn : ¬ (size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes) := Nat.not_lt.mpr hsz
   simp only [evalIntrinsicM, hl, interp_ok_bind, LayoutStrategy.expect_size, interp_pure_bind, ha,
     hn, ↓reduceIte]
+
+/-- Complete characterization of a successful `AtomicLoad` in every memory model. -/
+theorem atomicLoad_ok_iff {m m' : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {val : Value M} :
+    evalIntrinsicM m .AtomicLoad args retTy = .ok (val, m') ↔
+      ∃ ptr pty size a align,
+        args = [(.Ptr ⟨ptr, none⟩, pty)] ∧
+        Type.layout retTy = .ok (.Sized size a) ∧
+        alignFromBytes size.bytes = some align ∧
+        size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+        typedLoadM m ptr retTy align .Atomic = .ok (val, m') := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨_, _⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      all_goals try (dsimp only [evalIntrinsicM, ub] at h; cases h)
+      dsimp only [evalIntrinsicM] at h
+      obtain ⟨layout, hl, h1⟩ := interp_bind_eq_ok h
+      obtain ⟨size, hexp, h2⟩ := interp_bind_eq_ok h1
+      cases layout with
+      | Sized sz a =>
+        have hszEq : sz = size := interp_pure_eq_ok hexp
+        rw [← hszEq] at h2
+        rw [alignFromBytesInt_natCast] at h2
+        cases ha : alignFromBytes sz.bytes with
+        | none =>
+          simp only [ha, ub] at h2; cases h2
+        | some align =>
+          simp only [ha] at h2
+          by_cases hbig : sz.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+          · simp only [hbig, ↓reduceIte, ub] at h2; cases h2
+          · simp only [hbig, ↓reduceIte] at h2
+            exact ⟨ptr, pty, sz, a, align, rfl, hl, ha, Nat.not_lt.mp hbig, h2⟩
+      | _ => dsimp only [LayoutStrategy.expect_size, specPanic] at hexp; cases hexp
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+  · rintro ⟨ptr, pty, size, a, align, rfl, hl, ha, hsz, hload⟩
+    have ha' : alignFromBytesInt size.bytes = some align := by
+      rw [alignFromBytesInt_natCast]; exact ha
+    rw [atomicLoad_eq_typedLoadM m ptr pty retTy hl ha' hsz]
+    exact hload
+
+/-- Complete characterization of every stopping outcome (UB or spec panic, in
+exact upstream check order) of `AtomicLoad` in every memory model. -/
+theorem atomicLoad_error_iff {m : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {e : Stop} :
+    evalIntrinsicM m .AtomicLoad args retTy = .error e ↔
+      (args.length ≠ 1 ∧ e = .ub "invalid number of arguments for `AtomicLoad` intrinsic") ∨
+      (∃ ptrV pty, args = [(ptrV, pty)] ∧
+        (∀ p, ptrV ≠ .Ptr ⟨p, none⟩) ∧
+        e = .ub "invalid first argument to `AtomicLoad` intrinsic: not a thin pointer") ∨
+      (∃ ptr pty, args = [(.Ptr ⟨ptr, none⟩, pty)] ∧
+        (Type.layout retTy = .error e ∨
+         (∃ l, Type.layout retTy = .ok l ∧ LayoutStrategy.is_sized l = false ∧
+           e = .specPanic
+             "expect_size called on unsized type: WF ensures intrinsic return types are sized") ∨
+         (∃ size a, Type.layout retTy = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = none ∧
+           e = .ub "invalid return type for `AtomicLoad` intrinsic: size not power of two") ∨
+         (∃ size a align, Type.layout retTy = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = some align ∧
+           size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes ∧
+           e = .ub "invalid return type for `AtomicLoad` intrinsic: size too big") ∨
+         (∃ size a align, Type.layout retTy = .ok (.Sized size a) ∧
+           alignFromBytes size.bytes = some align ∧
+           size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+           typedLoadM m ptr retTy align .Atomic = .error e))) := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨_, _⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 0 ≠ 1; decide, rfl⟩
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM] at h
+        refine Or.inr (Or.inr ⟨ptr, pty, rfl, ?_⟩)
+        rcases interp_bind_eq_error h with hlay | ⟨layout, hl, h1⟩
+        · exact Or.inl hlay
+        · rcases interp_bind_eq_error h1 with hexp | ⟨size, hexp, h2⟩
+          · cases layout with
+            | Sized _ _ => dsimp only [LayoutStrategy.expect_size] at hexp; cases hexp
+            | Slice _ _ =>
+              dsimp only [LayoutStrategy.expect_size, specPanic] at hexp; cases hexp
+              exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+            | TraitObject _ =>
+              dsimp only [LayoutStrategy.expect_size, specPanic] at hexp; cases hexp
+              exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+            | Tuple _ _ =>
+              dsimp only [LayoutStrategy.expect_size, specPanic] at hexp; cases hexp
+              exact Or.inr (Or.inl ⟨_, hl, rfl, rfl⟩)
+          · cases layout with
+            | Sized sz a =>
+              have hszEq : sz = size := interp_pure_eq_ok hexp
+              rw [← hszEq] at h2
+              rw [alignFromBytesInt_natCast] at h2
+              cases ha : alignFromBytes sz.bytes with
+              | none =>
+                simp only [ha, ub] at h2; cases h2
+                exact Or.inr (Or.inr (Or.inl ⟨sz, a, hl, ha, rfl⟩))
+              | some align =>
+                simp only [ha] at h2
+                by_cases hbig : sz.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+                · simp only [hbig, ↓reduceIte, ub] at h2; cases h2
+                  exact Or.inr (Or.inr (Or.inr (Or.inl ⟨sz, a, align, hl, ha, hbig, rfl⟩)))
+                · simp only [hbig, ↓reduceIte] at h2
+                  exact Or.inr (Or.inr (Or.inr (Or.inr
+                    ⟨sz, a, align, hl, ha, Nat.not_lt.mp hbig, h2⟩)))
+            | _ => dsimp only [LayoutStrategy.expect_size, specPanic] at hexp; cases hexp
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl,
+          (fun _ hc => by cases (Pointer.mk.inj (Value.Ptr.inj hc)).2), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, rfl, (fun _ hc => by cases hc), rfl⟩)
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+      exact Or.inl ⟨by simp only [List.length_cons]; omega, rfl⟩
+  · rintro (⟨hlen, rfl⟩ | ⟨ptrV, pty, rfl, hnt, rfl⟩ | ⟨ptr, pty, rfl, hcase⟩)
+    · exact atomicLoad_arity_ub m args retTy hlen
+    · exact atomicLoad_not_thin_ptr_ub m ptrV pty retTy hnt
+    · rcases hcase with hlay | ⟨l, hl, hu, rfl⟩ | ⟨size, a, hl, ha, rfl⟩ |
+        ⟨size, a, align, hl, ha, hbig, rfl⟩ | ⟨size, a, align, hl, ha, hsz, hload⟩
+      · simp only [evalIntrinsicM, hlay, interp_error_bind]
+      · exact atomicLoad_unsized_specPanic m ptr pty retTy hl hu
+      · exact atomicLoad_size_not_pow2_ub m ptr pty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha)
+      · exact atomicLoad_size_too_big_ub m ptr pty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha) hbig
+      · rw [atomicLoad_eq_typedLoadM m ptr pty retTy hl
+          (by rw [alignFromBytesInt_natCast]; exact ha) hsz]
+        exact hload
 
 /-! ### `AtomicCompareExchange` -/
 
@@ -1201,6 +1626,201 @@ theorem atomicCompareExchange_success_accesses {m m' : Machine M}
     rw [valueEqM_refl] at hv
     cases hv
 
+/-- Complete characterization of a successful `AtomicCompareExchange` in every
+memory model: it returns the loaded value `before` and performs an atomic store
+of `next` iff `current = before`. -/
+theorem atomicCompareExchange_ok_iff {m m' : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {val : Value M} :
+    evalIntrinsicM m .AtomicCompareExchange args retTy = .ok (val, m') ↔
+      ∃ ptr pty cur next t al m1,
+        args = [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] ∧
+        retTy = .Int t ∧
+        alignFromBytes t.size.bytes = some al ∧
+        t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+        typedLoadM m ptr (.Int t) al .Atomic = .ok (val, m1) ∧
+        ((cur = val ∧ typedStoreM m1 ptr next (.Int t) al .Atomic = .ok m') ∨
+         (cur ≠ val ∧ m' = m1)) := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨cur, currTy⟩, _ | ⟨⟨next, nextTy⟩, _ | ⟨_, _⟩⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      all_goals try (dsimp only [evalIntrinsicM, ub] at h; cases h)
+      dsimp only [evalIntrinsicM] at h
+      cases hc1 : typeEq currTy retTy with
+      | false => simp only [hc1, Bool.not_false, ↓reduceIte, ub] at h; cases h
+      | true =>
+        simp only [hc1, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        cases hc2 : typeEq nextTy retTy with
+        | false => simp only [hc2, Bool.not_false, ↓reduceIte, ub] at h; cases h
+        | true =>
+          simp only [hc2, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+          cases retTy with
+          | Int t =>
+            obtain rfl := (typeEq_int_right_iff currTy t).mp hc1
+            obtain rfl := (typeEq_int_right_iff nextTy t).mp hc2
+            cases hal : alignFromBytes t.size.bytes with
+            | none =>
+              simp only [layout_int_ill_formed hal, interp_error_bind] at h; cases h
+            | some al =>
+              have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+                rw [alignFromBytesInt_natCast]; exact hal
+              simp only [layout_int hal, interp_ok_bind, LayoutStrategy.expect_size,
+                interp_pure_bind, ha] at h
+              by_cases hbig : t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+              · simp only [hbig, ↓reduceIte, ub] at h; cases h
+              · simp only [hbig, ↓reduceIte] at h
+                obtain ⟨⟨before, m1⟩, hload, h⟩ := interp_bind_eq_ok h
+                dsimp only at h
+                cases hv : valueEqM cur before with
+                | true =>
+                  simp only [hv, ↓reduceIte] at h
+                  have hcb : cur = before := (valueEqM_eq_true_iff cur before).mp hv
+                  obtain ⟨m2, hstore, h⟩ := interp_bind_eq_ok h
+                  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+                  exact ⟨ptr, pty, cur, next, t, al, m1, rfl, rfl, hal, Nat.not_lt.mp hbig,
+                    hload, Or.inl ⟨hcb, hstore⟩⟩
+                | false =>
+                  simp only [hv, Bool.false_eq_true, ↓reduceIte] at h
+                  have hne : cur ≠ before := (valueEqM_eq_false_iff cur before).mp hv
+                  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+                  exact ⟨ptr, pty, cur, next, t, al, m1, rfl, rfl, hal, Nat.not_lt.mp hbig,
+                    hload, Or.inr ⟨hne, rfl⟩⟩
+          | _ => dsimp only [ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+  · rintro ⟨ptr, pty, cur, next, t, al, m1, rfl, rfl, hal, hsz, hload, ⟨rfl, hstore⟩ | ⟨hne, rfl⟩⟩
+    · exact atomicCompareExchange_success pty hal hsz hload hstore
+    · exact atomicCompareExchange_failure pty next hal hsz hload hne
+
+/-- Complete characterization of every stopping outcome (UB or spec panic, in
+exact upstream check order) of `AtomicCompareExchange` in every memory model.
+Notice that the intrinsic's own `Align::from_bytes(size.bytes()).unwrap()`
+panic does not appear: `Type::layout` (`IntType::align`) always panics first
+when `t.size.bytes` is not a power of two. -/
+theorem atomicCompareExchange_error_iff {m : Machine M} {args : List (Value M × «Type»)}
+    {retTy : «Type»} {e : Stop} :
+    evalIntrinsicM m .AtomicCompareExchange args retTy = .error e ↔
+      (args.length ≠ 3 ∧
+        e = .ub "invalid number of arguments for `AtomicCompareExchange` intrinsic") ∨
+      (∃ ptrV pty cur currTy next nextTy,
+        args = [(ptrV, pty), (cur, currTy), (next, nextTy)] ∧
+        (∀ p, ptrV ≠ .Ptr ⟨p, none⟩) ∧
+        e = .ub
+          "invalid first argument to `AtomicCompareExchange` intrinsic: not a thin pointer") ∨
+      (∃ ptr pty cur currTy next nextTy,
+        args = [(.Ptr ⟨ptr, none⟩, pty), (cur, currTy), (next, nextTy)] ∧
+        ((typeEq currTy retTy = false ∧
+          e = .ub "invalid second argument to `AtomicCompareExchange` intrinsic: not same type as return value") ∨
+         (typeEq currTy retTy = true ∧ typeEq nextTy retTy = false ∧
+          e = .ub "invalid third argument to `AtomicCompareExchange` intrinsic: not same type as return value") ∨
+         (typeEq currTy retTy = true ∧ typeEq nextTy retTy = true ∧ (∀ t, retTy ≠ .Int t) ∧
+          e = .ub "invalid return type for `Intrinis::AtomicCompareExchange`: only works with integers") ∨
+         (∃ t, currTy = .Int t ∧ nextTy = .Int t ∧ retTy = .Int t ∧
+           ((alignFromBytes t.size.bytes = none ∧
+             e = .specPanic "Align::from_bytes(size).unwrap()") ∨
+            (∃ al, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              e = .ub "invalid return type for `AtomicCompareExchange` intrinsic: size too big") ∨
+            (∃ al, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .error e) ∨
+            (∃ al m1, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .ok (cur, m1) ∧
+              typedStoreM m1 ptr next (.Int t) al .Atomic = .error e))))) := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨cur, currTy⟩, _ | ⟨⟨next, nextTy⟩, _ | ⟨_, _⟩⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 0 ≠ 3; decide, rfl⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 1 ≠ 3; decide, rfl⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 2 ≠ 3; decide, rfl⟩
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM] at h
+        refine Or.inr (Or.inr ⟨ptr, pty, cur, currTy, next, nextTy, rfl, ?_⟩)
+        cases hc1 : typeEq currTy retTy with
+        | false =>
+          simp only [hc1, Bool.not_false, ↓reduceIte, ub] at h; cases h
+          exact Or.inl ⟨rfl, rfl⟩
+        | true =>
+          simp only [hc1, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+          cases hc2 : typeEq nextTy retTy with
+          | false =>
+            simp only [hc2, Bool.not_false, ↓reduceIte, ub] at h; cases h
+            exact Or.inr (Or.inl ⟨rfl, rfl, rfl⟩)
+          | true =>
+            simp only [hc2, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+            cases retTy with
+            | Int t =>
+              have hct := (typeEq_int_right_iff currTy t).mp hc1
+              have hnt := (typeEq_int_right_iff nextTy t).mp hc2
+              refine Or.inr (Or.inr (Or.inr ⟨t, hct, hnt, rfl, ?_⟩))
+              cases hal : alignFromBytes t.size.bytes with
+              | none =>
+                simp only [layout_int_ill_formed hal, interp_error_bind] at h; cases h
+                exact Or.inl ⟨rfl, rfl⟩
+              | some al =>
+                have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+                  rw [alignFromBytesInt_natCast]; exact hal
+                simp only [layout_int hal, interp_ok_bind, LayoutStrategy.expect_size,
+                  interp_pure_bind, ha] at h
+                by_cases hbig : t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+                · simp only [hbig, ↓reduceIte, ub] at h; cases h
+                  exact Or.inr (Or.inl ⟨al, rfl, hbig, rfl⟩)
+                · simp only [hbig, ↓reduceIte] at h
+                  rcases interp_bind_eq_error h with hload | ⟨⟨before, m1⟩, hload, h⟩
+                  · exact Or.inr (Or.inr (Or.inl ⟨al, rfl, Nat.not_lt.mp hbig, hload⟩))
+                  · dsimp only at h
+                    cases hv : valueEqM cur before with
+                    | false =>
+                      simp only [hv, Bool.false_eq_true, ↓reduceIte] at h; cases h
+                    | true =>
+                      simp only [hv, ↓reduceIte] at h
+                      rw [← (valueEqM_eq_true_iff cur before).mp hv] at hload
+                      rcases interp_bind_eq_error h with hstore | ⟨_, _, h⟩
+                      · exact Or.inr (Or.inr (Or.inr
+                          ⟨al, m1, rfl, Nat.not_lt.mp hbig, hload, hstore⟩))
+                      · cases h
+            | _ =>
+              dsimp only [ub] at h; cases h
+              exact Or.inr (Or.inr (Or.inl ⟨rfl, rfl, (fun _ hc => by cases hc), rfl⟩))
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases (Pointer.mk.inj (Value.Ptr.inj hc)).2), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, cur, currTy, next, nextTy, rfl,
+          (fun _ hc => by cases hc), rfl⟩)
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+      exact Or.inl ⟨by simp only [List.length_cons]; omega, rfl⟩
+  · rintro (⟨hlen, rfl⟩ | ⟨ptrV, pty, cur, currTy, next, nextTy, rfl, hnt, rfl⟩ |
+      ⟨ptr, pty, cur, currTy, next, nextTy, rfl, hcase⟩)
+    · exact atomicCompareExchange_arity_ub m args retTy hlen
+    · exact atomicCompareExchange_not_thin_ptr_ub m ptrV pty cur next currTy nextTy retTy hnt
+    · rcases hcase with ⟨hc1, rfl⟩ | ⟨hc1, hc2, rfl⟩ | ⟨hc1, hc2, hni, rfl⟩ |
+        ⟨t, rfl, rfl, rfl, hinner⟩
+      · exact atomicCompareExchange_current_type_ub m ptr pty cur next currTy nextTy retTy hc1
+      · exact atomicCompareExchange_next_type_ub m ptr pty cur next currTy nextTy retTy hc1 hc2
+      · exact atomicCompareExchange_non_int_ub m ptr pty cur next currTy nextTy retTy hc1 hc2 hni
+      · rcases hinner with ⟨hal, rfl⟩ | ⟨al, hal, hbig, rfl⟩ | ⟨al, hal, hsz, hload⟩ |
+          ⟨al, m1, hal, hsz, hload, hstore⟩
+        · exact atomicCompareExchange_ill_formed_int_specPanic m ptr pty cur next t hal
+        · exact atomicCompareExchange_size_too_big_ub m ptr pty cur next t hal hbig
+        · exact atomicCompareExchange_load_error pty cur next hal hsz hload
+        · exact atomicCompareExchange_store_error pty hal hsz hload hstore
+
 /-! ### `AtomicFetchAndOp` -/
 
 /-- `AtomicFetchAndOp` whose operand has another type than the return type is
@@ -1241,6 +1861,20 @@ theorem atomicFetchAndOp_size_too_big_ub (m : Machine M) (binOp : IntBinOp)
   simp only [evalIntrinsicM, hte, Bool.not_true, Bool.false_eq_true, ↓reduceIte, layout_int hal,
     interp_ok_bind, LayoutStrategy.expect_size, interp_pure_bind, ha, hbig]
   rfl
+
+/-- `AtomicFetchAndOp` at an integer type whose size is not a power of two is a
+spec panic already in `Type::layout` (`IntType::align`), so the
+`Align::from_bytes(size.bytes()).unwrap()` of the intrinsic itself is never the
+one that panics. -/
+theorem atomicFetchAndOp_ill_formed_int_specPanic (m : Machine M) (binOp : IntBinOp)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (other : Value M)
+    (t : IntType) (hal : alignFromBytes t.size.bytes = none) :
+    evalIntrinsicM m (.AtomicFetchAndOp binOp)
+        [(.Ptr ⟨ptr, none⟩, pty), (other, .Int t)] (.Int t) =
+      .error (.specPanic "Align::from_bytes(size).unwrap()") := by
+  have hte : typeEq (.Int t) (.Int t) = true := by simp only [typeEq, beq_self_eq_true]
+  simp only [evalIntrinsicM, hte, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    layout_int_ill_formed hal, interp_error_bind]
 
 /-- A well-shaped `AtomicFetchAndOp` is an atomic `typed_load`, then
 `eval_int_bin_op` on the loaded and the given integer, then an atomic
@@ -1343,6 +1977,197 @@ theorem atomicFetchAndOp_other_not_int_specPanic {m : Machine M} (binOp : IntBin
   | Int i => exact absurd rfl (hother i)
   | _ => rfl
 
+/-- Complete characterization of a successful `AtomicFetchAndOp` in every memory
+model: it loads an integer `prevInt`, applies `eval_int_bin_op` to `prevInt`
+and `otherInt`, stores `nextInt` *as is* with `Atomicity::Atomic`, and returns
+`prevInt`. -/
+theorem atomicFetchAndOp_ok_iff {m m' : Machine M} {binOp : IntBinOp}
+    {args : List (Value M × «Type»)} {retTy : «Type»} {val : Value M} :
+    evalIntrinsicM m (.AtomicFetchAndOp binOp) args retTy = .ok (val, m') ↔
+      ∃ ptr pty prevInt otherInt nextInt t al m1,
+        args = [(.Ptr ⟨ptr, none⟩, pty), (.Int otherInt, .Int t)] ∧
+        retTy = .Int t ∧
+        val = .Int prevInt ∧
+        alignFromBytes t.size.bytes = some al ∧
+        t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+        typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int prevInt, m1) ∧
+        evalIntBinOp binOp prevInt otherInt t = .ok nextInt ∧
+        typedStoreM m1 ptr (.Int nextInt) (.Int t) al .Atomic = .ok m' := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨other, otherTy⟩, _ | ⟨_, _⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      all_goals try (dsimp only [evalIntrinsicM, ub] at h; cases h)
+      dsimp only [evalIntrinsicM] at h
+      cases hc : typeEq otherTy retTy with
+      | false => simp only [hc, Bool.not_false, ↓reduceIte, ub] at h; cases h
+      | true =>
+        simp only [hc, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+        cases retTy with
+        | Int t =>
+          obtain rfl := (typeEq_int_right_iff otherTy t).mp hc
+          cases hal : alignFromBytes t.size.bytes with
+          | none =>
+            simp only [layout_int_ill_formed hal, interp_error_bind] at h; cases h
+          | some al =>
+            have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+              rw [alignFromBytesInt_natCast]; exact hal
+            simp only [layout_int hal, interp_ok_bind, LayoutStrategy.expect_size,
+              interp_pure_bind, ha] at h
+            by_cases hbig : t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+            · simp only [hbig, ↓reduceIte, ub] at h; cases h
+            · simp only [hbig, ↓reduceIte] at h
+              obtain ⟨⟨previous, m1⟩, hload, h⟩ := interp_bind_eq_ok h
+              dsimp only at h
+              cases other with
+              | Int otherInt =>
+                cases previous with
+                | Int prevInt =>
+                  obtain ⟨nextInt, hop, h⟩ := interp_bind_eq_ok h
+                  obtain ⟨m2, hstore, h⟩ := interp_bind_eq_ok h
+                  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok h)
+                  exact ⟨ptr, pty, prevInt, otherInt, nextInt, t, al, m1, rfl, rfl, rfl, hal,
+                    Nat.not_lt.mp hbig, hload, hop, hstore⟩
+                | _ => dsimp only [specPanic] at h; cases h
+              | _ => dsimp only [specPanic] at h; cases h
+        | _ => dsimp only [ub] at h; cases h
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+  · rintro ⟨ptr, pty, prevInt, otherInt, nextInt, t, al, m1, rfl, rfl, rfl, hal, hsz, hload,
+      hop, hstore⟩
+    exact atomicFetchAndOp_ok binOp pty hal hsz hload hop hstore
+
+/-- Complete characterization of every stopping outcome (UB or spec panic, in
+exact upstream check order) of `AtomicFetchAndOp` in every memory model.
+Neither the intrinsic's own `Align::from_bytes(size.bytes()).unwrap()` panic
+nor the `unreachable!()` on `previous` can occur (`Type::layout` panics first
+for non-power-of-two integer sizes, and `typed_load` at `Type::Int` only ever
+returns `Value::Int`). -/
+theorem atomicFetchAndOp_error_iff {m : Machine M} {binOp : IntBinOp}
+    {args : List (Value M × «Type»)} {retTy : «Type»} {e : Stop} :
+    evalIntrinsicM m (.AtomicFetchAndOp binOp) args retTy = .error e ↔
+      (args.length ≠ 2 ∧
+        e = .ub "invalid number of arguments for `AtomicFetchAndOp` intrinsic") ∨
+      (∃ ptrV pty other otherTy, args = [(ptrV, pty), (other, otherTy)] ∧
+        (∀ p, ptrV ≠ .Ptr ⟨p, none⟩) ∧
+        e = .ub "invalid first argument to `AtomicFetchAndOp` intrinsic: not a thin pointer") ∨
+      (∃ ptr pty other otherTy, args = [(.Ptr ⟨ptr, none⟩, pty), (other, otherTy)] ∧
+        ((typeEq otherTy retTy = false ∧
+          e = .ub "invalid second argument to `AtomicFetchAndOp` intrinsic: not same type as return value") ∨
+         (typeEq otherTy retTy = true ∧ (∀ t, retTy ≠ .Int t) ∧
+          e = .ub "invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers") ∨
+         (∃ t, otherTy = .Int t ∧ retTy = .Int t ∧
+           ((alignFromBytes t.size.bytes = none ∧
+             e = .specPanic "Align::from_bytes(size).unwrap()") ∨
+            (∃ al, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              e = .ub "invalid return type for `AtomicFetchAndOp` intrinsic: size too big") ∨
+            (∃ al, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .error e) ∨
+            (∃ al r, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .ok r ∧
+              (∀ i, other ≠ .Int i) ∧
+              e = .specPanic "unreachable: AtomicFetchAndOp other not Value::Int") ∨
+            (∃ al prevInt otherInt m1, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              other = .Int otherInt ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int prevInt, m1) ∧
+              evalIntBinOp binOp prevInt otherInt t = .error e) ∨
+            (∃ al prevInt otherInt nextInt m1, alignFromBytes t.size.bytes = some al ∧
+              t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes ∧
+              other = .Int otherInt ∧
+              typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int prevInt, m1) ∧
+              evalIntBinOp binOp prevInt otherInt t = .ok nextInt ∧
+              typedStoreM m1 ptr (.Int nextInt) (.Int t) al .Atomic = .error e))))) := by
+  constructor
+  · intro h
+    rcases args with _ | ⟨⟨ptrV, pty⟩, _ | ⟨⟨other, otherTy⟩, _ | ⟨_, _⟩⟩⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 0 ≠ 2; decide, rfl⟩
+    · dsimp only [evalIntrinsicM, ub] at h; cases h; exact Or.inl ⟨by show 1 ≠ 2; decide, rfl⟩
+    · rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ | _
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM] at h
+        refine Or.inr (Or.inr ⟨ptr, pty, other, otherTy, rfl, ?_⟩)
+        cases hc : typeEq otherTy retTy with
+        | false =>
+          simp only [hc, Bool.not_false, ↓reduceIte, ub] at h; cases h
+          exact Or.inl ⟨rfl, rfl⟩
+        | true =>
+          simp only [hc, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+          cases retTy with
+          | Int t =>
+            have hot := (typeEq_int_right_iff otherTy t).mp hc
+            refine Or.inr (Or.inr ⟨t, hot, rfl, ?_⟩)
+            cases hal : alignFromBytes t.size.bytes with
+            | none =>
+              simp only [layout_int_ill_formed hal, interp_error_bind] at h; cases h
+              exact Or.inl ⟨rfl, rfl⟩
+            | some al =>
+              have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+                rw [alignFromBytesInt_natCast]; exact hal
+              simp only [layout_int hal, interp_ok_bind, LayoutStrategy.expect_size,
+                interp_pure_bind, ha] at h
+              by_cases hbig : t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+              · simp only [hbig, ↓reduceIte, ub] at h; cases h
+                exact Or.inr (Or.inl ⟨al, rfl, hbig, rfl⟩)
+              · simp only [hbig, ↓reduceIte] at h
+                rcases interp_bind_eq_error h with hload | ⟨⟨previous, m1⟩, hload, h⟩
+                · exact Or.inr (Or.inr (Or.inl ⟨al, rfl, Nat.not_lt.mp hbig, hload⟩))
+                · obtain ⟨prevInt, rfl⟩ := typedLoadM_int_returns_int hload
+                  dsimp only at h
+                  cases other with
+                  | Int otherInt =>
+                    rcases interp_bind_eq_error h with hop | ⟨nextInt, hop, h⟩
+                    · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl
+                        ⟨al, prevInt, otherInt, m1, rfl, Nat.not_lt.mp hbig, rfl, hload, hop⟩))))
+                    · rcases interp_bind_eq_error h with hstore | ⟨_, _, h⟩
+                      · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+                          ⟨al, prevInt, otherInt, nextInt, m1, rfl, Nat.not_lt.mp hbig, rfl,
+                            hload, hop, hstore⟩))))
+                      · cases h
+                  | _ =>
+                    dsimp only [specPanic] at h; cases h
+                    exact Or.inr (Or.inr (Or.inr (Or.inl
+                      ⟨al, (.Int prevInt, m1), rfl, Nat.not_lt.mp hbig, hload,
+                        (fun _ hc => by cases hc), rfl⟩)))
+          | _ =>
+            dsimp only [ub] at h; cases h
+            exact Or.inr (Or.inl ⟨rfl, (fun _ hc' => by cases hc'), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl,
+          (fun _ hc => by cases (Pointer.mk.inj (Value.Ptr.inj hc)).2), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl, (fun _ hc => by cases hc), rfl⟩)
+      · dsimp only [evalIntrinsicM, ub] at h; cases h
+        exact Or.inr (Or.inl ⟨_, pty, other, otherTy, rfl, (fun _ hc => by cases hc), rfl⟩)
+    · dsimp only [evalIntrinsicM, ub] at h; cases h
+      exact Or.inl ⟨by simp only [List.length_cons]; omega, rfl⟩
+  · rintro (⟨hlen, rfl⟩ | ⟨ptrV, pty, other, otherTy, rfl, hnt, rfl⟩ |
+      ⟨ptr, pty, other, otherTy, rfl, hcase⟩)
+    · exact atomicFetchAndOp_arity_ub m binOp args retTy hlen
+    · exact atomicFetchAndOp_not_thin_ptr_ub m binOp ptrV pty other otherTy retTy hnt
+    · rcases hcase with ⟨hc, rfl⟩ | ⟨hc, hni, rfl⟩ | ⟨t, rfl, rfl, hinner⟩
+      · exact atomicFetchAndOp_other_type_ub m binOp ptr pty other otherTy retTy hc
+      · exact atomicFetchAndOp_non_int_ub m binOp ptr pty other otherTy retTy hc hni
+      · rcases hinner with ⟨hal, rfl⟩ | ⟨al, hal, hbig, rfl⟩ | ⟨al, hal, hsz, hload⟩ |
+          ⟨al, r, hal, hsz, hload, hni, rfl⟩ |
+          ⟨al, prevInt, otherInt, m1, hal, hsz, rfl, hload, hop⟩ |
+          ⟨al, prevInt, otherInt, nextInt, m1, hal, hsz, rfl, hload, hop, hstore⟩
+        · exact atomicFetchAndOp_ill_formed_int_specPanic m binOp ptr pty other t hal
+        · exact atomicFetchAndOp_size_too_big_ub m binOp ptr pty other t hal hbig
+        · exact atomicFetchAndOp_load_error binOp pty other hal hsz hload
+        · exact atomicFetchAndOp_other_not_int_specPanic binOp pty hal hsz hload hni
+        · exact atomicFetchAndOp_binop_error binOp pty hal hsz hload hop
+        · exact atomicFetchAndOp_store_error binOp pty hal hsz hload hop hstore
+
 /-! ### `eval_int_bin_op` as used by `AtomicFetchAndOp` -/
 
 /-- `Add`, `Sub`, `Mul`, `BitAnd`, `BitOr`, and `BitXor` never fail and never
@@ -1392,6 +2217,54 @@ theorem evalIntBinOp_shrUnchecked_oob (l : Int) {r : Int} {t : IntType}
     (h : r < 0 ∨ r ≥ (Size.bits t.size : Int)) :
     evalIntBinOp .ShrUnchecked l r t = .error (.ub "overflow in unchecked shift") := by
   simp only [evalIntBinOp, h, ↓reduceIte]
+  rfl
+
+/-- `Shl` and `Shr` reduce the shift count modulo the bit width and never fail
+in `eval_int_bin_op` (like `Add`/`Sub`/`Mul`, `Shl` does not bring its result
+back in bounds). -/
+theorem evalIntBinOp_shl_shr (l r : Int) (t : IntType) :
+    evalIntBinOp .Shl l r t = .ok (l * (2 : Int) ^ (r % (Size.bits t.size : Int)).toNat) ∧
+    evalIntBinOp .Shr l r t = .ok (l / (2 : Int) ^ (r % (Size.bits t.size : Int)).toNat) :=
+  ⟨rfl, rfl⟩
+
+/-- An unchecked addition whose sum is outside the integer type is UB. -/
+theorem evalIntBinOp_addUnchecked_overflow {l r : Int} {t : IntType}
+    (hov : IntType.can_represent t (l + r) = false) :
+    evalIntBinOp .AddUnchecked l r t = .error (.ub "overflow in unchecked add") := by
+  simp only [evalIntBinOp, hov, Bool.not_false, ↓reduceIte]
+  rfl
+
+/-- An unchecked subtraction whose difference is outside the integer type is UB. -/
+theorem evalIntBinOp_subUnchecked_overflow {l r : Int} {t : IntType}
+    (hov : IntType.can_represent t (l - r) = false) :
+    evalIntBinOp .SubUnchecked l r t = .error (.ub "overflow in unchecked sub") := by
+  simp only [evalIntBinOp, hov, Bool.not_false, ↓reduceIte]
+  rfl
+
+/-- An unchecked multiplication whose product is outside the integer type is UB. -/
+theorem evalIntBinOp_mulUnchecked_overflow {l r : Int} {t : IntType}
+    (hov : IntType.can_represent t (l * r) = false) :
+    evalIntBinOp .MulUnchecked l r t = .error (.ub "overflow in unchecked mul") := by
+  simp only [evalIntBinOp, hov, Bool.not_false, ↓reduceIte]
+  rfl
+
+/-- Exact division by zero is UB. -/
+theorem evalIntBinOp_divExact_zero (l : Int) (t : IntType) :
+    evalIntBinOp .DivExact l 0 t = .error (.ub "division by zero") := rfl
+
+/-- Exact division whose quotient is outside the integer type (`INT_MIN / -1`) is UB. -/
+theorem evalIntBinOp_divExact_overflow {l r : Int} {t : IntType} (hr : r ≠ 0)
+    (hov : IntType.can_represent t (Int.tdiv l r) = false) :
+    evalIntBinOp .DivExact l r t = .error (.ub "overflow in division") := by
+  simp only [evalIntBinOp, hr, ↓reduceIte, hov, Bool.not_false]
+  rfl
+
+/-- Exact division with a non-zero remainder is UB. -/
+theorem evalIntBinOp_divExact_rem_nonzero {l r : Int} {t : IntType} (hr : r ≠ 0)
+    (hin : IntType.can_represent t (Int.tdiv l r) = true) (hrem : Int.tmod l r ≠ 0) :
+    evalIntBinOp .DivExact l r t = .error (.ub "non-zero remainder in exact division") := by
+  simp only [evalIntBinOp, hr, hin, Bool.not_true, Bool.false_eq_true, ↓reduceIte]
+  rw [if_pos hrem]
   rfl
 
 /-- `i32::MIN / -1` and `i32::MIN % -1` are UB. -/
@@ -1446,8 +2319,8 @@ theorem typedStoreM_int_store_error {m : Machine M} {ptr : ThinPointer (Memory.P
 /-! ### Arithmetic UB of `AtomicFetchAndOp`, and the missing `bring_in_bounds`
 
 Upstream MiniRust `d821c6e3` (`spec/lang/step/intrinsics.md`):
-> "let next = self.eval_int_bin_op(op, previous, other, int_ty)?;
->  let next = Value::Int(next);
+> "let next_int = Self::eval_int_bin_op(op, previous_int, other_int, int_ty)?;
+>  let next = Value::Int(next_int);
 >  self.typed_store(ptr, next, ret_ty, align, Atomicity::Atomic)?;"
 `eval_bin_op` for `BinOp::Int` brings the result of `eval_int_bin_op` in bounds
 (`int_ty.bring_in_bounds(result)`) before it builds the `Value::Int`;
@@ -1554,6 +2427,91 @@ theorem atomicFetchAndOp_add_ok {m m1 m2 : Machine M}
         [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
       .ok (.Int p, m2) :=
   atomicFetchAndOp_ok .Add pty hal hsz hload rfl hstore
+
+/-- `AtomicFetchAndOp(Rem)` whose quotient leaves the integer type
+(`INT_MIN % -1`) is UB. -/
+theorem atomicFetchAndOp_rem_overflow_ub {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {p o : Int} {t : IntType}
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int p, m1))
+    (ho : o ≠ 0) (hov : IntType.can_represent t (Int.tdiv p o) = false) :
+    evalIntrinsicM m (.AtomicFetchAndOp .Rem)
+        [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
+      .error (.ub "overflow in remainder") :=
+  atomicFetchAndOp_binop_error .Rem pty hal hsz hload (evalIntBinOp_rem_overflow ho hov)
+
+/-- `AtomicFetchAndOp(AddUnchecked)` whose sum overflows the integer type is
+UB (in contrast to `AtomicFetchAndOp(Add)`, which is a spec panic in
+`typed_store`). -/
+theorem atomicFetchAndOp_addUnchecked_overflow_ub {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {p o : Int} {t : IntType}
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int p, m1))
+    (hov : IntType.can_represent t (p + o) = false) :
+    evalIntrinsicM m (.AtomicFetchAndOp .AddUnchecked)
+        [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
+      .error (.ub "overflow in unchecked add") :=
+  atomicFetchAndOp_binop_error .AddUnchecked pty hal hsz hload
+    (evalIntBinOp_addUnchecked_overflow hov)
+
+/-- `AtomicFetchAndOp(SubUnchecked)` whose difference overflows the integer
+type is UB. -/
+theorem atomicFetchAndOp_subUnchecked_overflow_ub {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {p o : Int} {t : IntType}
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int p, m1))
+    (hov : IntType.can_represent t (p - o) = false) :
+    evalIntrinsicM m (.AtomicFetchAndOp .SubUnchecked)
+        [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
+      .error (.ub "overflow in unchecked sub") :=
+  atomicFetchAndOp_binop_error .SubUnchecked pty hal hsz hload
+    (evalIntBinOp_subUnchecked_overflow hov)
+
+/-- `AtomicFetchAndOp(MulUnchecked)` whose product overflows the integer type
+is UB. -/
+theorem atomicFetchAndOp_mulUnchecked_overflow_ub {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {p o : Int} {t : IntType}
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int p, m1))
+    (hov : IntType.can_represent t (p * o) = false) :
+    evalIntrinsicM m (.AtomicFetchAndOp .MulUnchecked)
+        [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
+      .error (.ub "overflow in unchecked mul") :=
+  atomicFetchAndOp_binop_error .MulUnchecked pty hal hsz hload
+    (evalIntBinOp_mulUnchecked_overflow hov)
+
+/-- `AtomicFetchAndOp(DivExact)` with a non-zero remainder is UB. -/
+theorem atomicFetchAndOp_divExact_rem_nonzero_ub {m m1 : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} (pty : «Type») {p o : Int} {t : IntType}
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int p, m1))
+    (ho : o ≠ 0) (hin : IntType.can_represent t (Int.tdiv p o) = true)
+    (hrem : Int.tmod p o ≠ 0) :
+    evalIntrinsicM m (.AtomicFetchAndOp .DivExact)
+        [(.Ptr ⟨ptr, none⟩, pty), (.Int o, .Int t)] (.Int t) =
+      .error (.ub "non-zero remainder in exact division") :=
+  atomicFetchAndOp_binop_error .DivExact pty hal hsz hload
+    (evalIntBinOp_divExact_rem_nonzero ho hin hrem)
+
+/-- `AtomicStore` of an out-of-range integer is a specification panic of
+`typed_store` (before any memory access or alignment check). -/
+theorem atomicStore_int_out_of_range_specPanic (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (n : Int) (t : IntType)
+    {al : Align} (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hn : IntType.can_represent t n = false) :
+    evalIntrinsicM m .AtomicStore [(.Ptr ⟨ptr, none⟩, pty), (.Int n, .Int t)] unitType =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") := by
+  have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+    rw [alignFromBytesInt_natCast]; exact hal
+  rw [atomicStore_eq_typedStoreM m ptr pty (.Int n) (.Int t) (layout_int hal) ha hsz,
+    typedStoreM_int_out_of_range m ptr n t al .Atomic hn]
+  rfl
 
 /-! ### Alignment: an atomic access must be aligned to its own size -/
 
@@ -1795,7 +2753,410 @@ theorem atomic_type_mismatch_ub (m : Machine M) (ptr : ThinPointer (Memory.Prove
       .error (.ub "invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers") := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
+/-- Zero-sized `()` has size 0, which is not a power of two: `AtomicStore`
+and `AtomicLoad` are UB at `()`. A wide raw pointer (`*const [u8]`) has size
+16, twice `x86_64::MAX_ATOMIC_SIZE`: `AtomicStore` and `AtomicLoad` are UB
+with `size too big`. -/
+theorem atomic_zst_and_wide_ptr_ub (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (v : Value M) (retTy : «Type») :
+    evalIntrinsicM m .AtomicStore [(.Ptr ⟨ptr, none⟩, pty), (v, unitType)] retTy =
+      .error (.ub
+        "invalid second argument to `AtomicStore` intrinsic: size not power of two") ∧
+    evalIntrinsicM m .AtomicLoad [(.Ptr ⟨ptr, none⟩, pty)] unitType =
+      .error (.ub "invalid return type for `AtomicLoad` intrinsic: size not power of two") ∧
+    evalIntrinsicM m .AtomicStore
+        [(.Ptr ⟨ptr, none⟩, pty), (v, .Ptr (.Raw .ElementCount))] retTy =
+      .error (.ub "invalid second argument to `AtomicStore` intrinsic: size too big") ∧
+    evalIntrinsicM m .AtomicLoad [(.Ptr ⟨ptr, none⟩, pty)] (.Ptr (.Raw .ElementCount)) =
+      .error (.ub "invalid return type for `AtomicLoad` intrinsic: size too big") := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
 end ConcreteTypes
+
+/-! ### Data-race interaction in `ConcurrentMemory`
+
+Upstream MiniRust (`spec/mem/concurrent.md`):
+> "fn races(self, other: Self) -> bool {
+>      // At least one access modifies the data.
+>      if self.ty == AccessType::Load && other.ty == AccessType::Load { return false; }
+>
+>      // At least one access is non atomic
+>      if self.atomicity == Atomicity::Atomic && other.atomicity == Atomicity::Atomic { return false; }
+>
+>      // The accesses overlap.
+>      let end_addr = self.addr + self.len.bytes();
+>      let other_end_addr = other.addr + other.len.bytes();
+>      end_addr > other.addr && other_end_addr > self.addr
+>  }"
+The laws below connect the atomic access logs of §2 directly to `Access::races`
+and `ConcurrentMemory::check_data_races` (and `CM.check_data_races` on `BM`):
+* Any two atomic accesses never race (`access_races_atomic_atomic_false`), so
+  any two atomic intrinsics on unsynchronized threads never trigger a data race
+  (`atomic_atomic_no_data_race`).
+* An atomic store and a non-atomic load (or vice versa) on unsynchronized
+  threads at overlapping addresses *do* trigger UB `"Data race"`
+  (`atomicStore_nonAtomicLoad_data_race`,
+  `atomicFetchAndOp_nonAtomicLoad_data_race`).
+* Upstream's `AtomicCompareExchange` note: a *failing* compare-exchange logs
+  only an atomic `Load`, so it never races with a non-atomic load on an
+  unsynchronized thread (`atomicCompareExchange_failure_nonAtomicLoad_no_data_race`),
+  whereas a *succeeding* compare-exchange logs an atomic `Store` and therefore
+  *does* race with a non-atomic load at an overlapping address
+  (`atomicCompareExchange_success_nonAtomicLoad_data_race`). -/
+
+/-- Exact characterization of `Access::races`. -/
+theorem access_races_iff (a b : Access) :
+    Access.races a b = true ↔
+      ¬(a.ty = .Load ∧ b.ty = .Load) ∧
+      ¬(a.atomicity = .Atomic ∧ b.atomicity = .Atomic) ∧
+      a.addr + a.len.bytes > b.addr ∧
+      b.addr + b.len.bytes > a.addr := by
+  unfold Access.races
+  split
+  · rename_i hll
+    exact ⟨fun h => Bool.noConfusion h, fun ⟨hn, _⟩ => absurd hll hn⟩
+  · rename_i hll
+    split
+    · rename_i haa
+      exact ⟨fun h => Bool.noConfusion h, fun ⟨_, hn, _⟩ => absurd haa hn⟩
+    · rename_i haa
+      rw [Bool.and_eq_true, decide_eq_true_eq, decide_eq_true_eq]
+      exact ⟨fun ⟨h1, h2⟩ => ⟨hll, haa, h1, h2⟩, fun ⟨_, _, h1, h2⟩ => ⟨h1, h2⟩⟩
+
+/-- `Access::races` is symmetric. -/
+theorem access_races_symm (a b : Access) : Access.races a b = Access.races b a := by
+  cases hab : Access.races a b with
+  | true =>
+    have ⟨hll, haa, h1, h2⟩ := (access_races_iff a b).mp hab
+    exact ((access_races_iff b a).mpr
+      ⟨fun ⟨hb, ha⟩ => hll ⟨ha, hb⟩, fun ⟨hb, ha⟩ => haa ⟨ha, hb⟩, h2, h1⟩).symm
+  | false =>
+    cases hba : Access.races b a with
+    | false => rfl
+    | true =>
+      have ⟨hll, haa, h1, h2⟩ := (access_races_iff b a).mp hba
+      have h := (access_races_iff a b).mpr
+        ⟨fun ⟨ha, hb⟩ => hll ⟨hb, ha⟩, fun ⟨ha, hb⟩ => haa ⟨hb, ha⟩, h2, h1⟩
+      rw [hab] at h
+      cases h
+
+/-- Two atomic accesses never race with each other, regardless of whether they
+are loads or stores and regardless of address overlap. -/
+theorem access_races_atomic_atomic_false {a b : Access}
+    (ha : a.atomicity = .Atomic) (hb : b.atomicity = .Atomic) :
+    Access.races a b = false := by
+  unfold Access.races
+  split
+  · rfl
+  · rw [if_pos ⟨ha, hb⟩]
+
+/-- Two loads never race with each other, regardless of atomicity. -/
+theorem access_races_load_load_false {a b : Access}
+    (ha : a.ty = .Load) (hb : b.ty = .Load) :
+    Access.races a b = false := by
+  unfold Access.races
+  rw [if_pos ⟨ha, hb⟩]
+
+/-- An atomic store and a non-atomic load at overlapping byte ranges race. -/
+theorem access_races_atomic_store_non_atomic_load (addr1 addr2 : Address) (len1 len2 : Size)
+    (h1 : addr1 + len1.bytes > addr2) (h2 : addr2 + len2.bytes > addr1) :
+    Access.races ⟨.Store, .Atomic, addr1, len1⟩ ⟨.Load, .None, addr2, len2⟩ = true :=
+  (access_races_iff _ _).mpr ⟨(fun ⟨h, _⟩ => by cases h), (fun ⟨_, h⟩ => by cases h), h1, h2⟩
+
+/-- A non-atomic store and an atomic load at overlapping byte ranges race. -/
+theorem access_races_non_atomic_store_atomic_load (addr1 addr2 : Address) (len1 len2 : Size)
+    (h1 : addr1 + len1.bytes > addr2) (h2 : addr2 + len2.bytes > addr1) :
+    Access.races ⟨.Store, .None, addr1, len1⟩ ⟨.Load, .Atomic, addr2, len2⟩ = true :=
+  (access_races_iff _ _).mpr ⟨(fun ⟨h, _⟩ => by cases h), (fun ⟨h, _⟩ => by cases h), h1, h2⟩
+
+/-- `ConcurrentMemory.check_data_races` at `M = BasicMemory<x86_64>` is
+`CM.check_data_races`. -/
+theorem check_data_races_bm_eq (cm : ConcurrentMemory BM) (tid : ThreadId)
+    (prev : Set ThreadId × List Access) :
+    ConcurrentMemory.check_data_races cm tid prev = CM.check_data_races cm tid prev := rfl
+
+section DataRaces
+
+variable {M : Type} [Memory M] [MemoryOps M]
+
+omit [MemoryOps M] in
+/-- Complete characterization of when `ConcurrentMemory::check_data_races`
+reports UB `"Data race"`. -/
+theorem check_data_races_ub_iff (cm : ConcurrentMemory M) (tid : ThreadId)
+    (sync : Set ThreadId) (prev : List Access) :
+    ConcurrentMemory.check_data_races cm tid (sync, prev) = .error (.ub "Data race") ↔
+      setContains sync tid = false ∧
+      ∃ a ∈ cm.accesses, ∃ p ∈ prev, Access.races a p = true := by
+  unfold ConcurrentMemory.check_data_races
+  dsimp only
+  split
+  · rename_i hsync
+    constructor
+    · intro h; cases h
+    · rintro ⟨hf, _⟩
+      rw [hf] at hsync
+      cases hsync
+  · rename_i hsync
+    have hfalse : setContains sync tid = false := by
+      cases hb : setContains sync tid with
+      | false => rfl
+      | true => exact absurd hb hsync
+    split
+    · rename_i hany
+      obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp hany
+      obtain ⟨p, hp_mem, hr⟩ := List.any_eq_true.mp hp
+      exact ⟨fun _ => ⟨hfalse, a, ha, p, hp_mem, hr⟩, fun _ => rfl⟩
+    · rename_i hany
+      have hanyF : cm.accesses.any (fun a => prev.any (fun p => Access.races a p)) = false := by
+        cases hb : cm.accesses.any (fun a => prev.any (fun p => Access.races a p)) with
+        | false => rfl
+        | true => exact absurd hb hany
+      constructor
+      · intro h; cases h
+      · rintro ⟨_, a, ha, p, hp_mem, hr⟩
+        have h1 := list_any_eq_false_iff.mp hanyF a ha
+        have h2 := list_any_eq_false_iff.mp h1 p hp_mem
+        rw [h2] at hr
+        cases hr
+
+omit [MemoryOps M] in
+/-- Complete characterization of when `ConcurrentMemory::check_data_races`
+succeeds. -/
+theorem check_data_races_ok_iff (cm : ConcurrentMemory M) (tid : ThreadId)
+    (sync : Set ThreadId) (prev : List Access) :
+    ConcurrentMemory.check_data_races cm tid (sync, prev) = .ok () ↔
+      setContains sync tid = true ∨
+      ∀ a ∈ cm.accesses, ∀ p ∈ prev, Access.races a p = false := by
+  unfold ConcurrentMemory.check_data_races
+  dsimp only
+  split
+  · rename_i hsync
+    exact ⟨fun _ => Or.inl hsync, fun _ => rfl⟩
+  · rename_i hsync
+    split
+    · rename_i hany
+      constructor
+      · intro h; dsimp only [ub] at h; cases h
+      · rintro (ht | hall)
+        · exact absurd ht hsync
+        · obtain ⟨a, ha, hp⟩ := List.any_eq_true.mp hany
+          obtain ⟨p, hp_mem, hr⟩ := List.any_eq_true.mp hp
+          rw [hall a ha p hp_mem] at hr
+          cases hr
+    · rename_i hany
+      have hanyF : cm.accesses.any (fun a => prev.any (fun p => Access.races a p)) = false := by
+        cases hb : cm.accesses.any (fun a => prev.any (fun p => Access.races a p)) with
+        | false => rfl
+        | true => exact absurd hb hany
+      constructor
+      · intro _
+        exact Or.inr fun a ha p hp =>
+          list_any_eq_false_iff.mp (list_any_eq_false_iff.mp hanyF a ha) p hp
+      · intro _; rfl
+
+/-- Any two successful atomic intrinsics on two steps (each starting from a
+fresh access log, as after `reset_data_race_tracking`) never data-race in
+`ConcurrentMemory::check_data_races`, even on unsynchronized threads accessing
+the same address. -/
+theorem atomic_atomic_no_data_race {m0 m1 m2 m3 : Machine M} {op1 op2 : IntrinsicOp}
+    {args1 args2 : List (Value M × «Type»)} {retTy1 retTy2 : «Type»} {v1 v2 : Value M}
+    (hop1 : isAtomicOp op1 = true) (hop2 : isAtomicOp op2 = true)
+    (hemp0 : m0.mem.accesses = []) (hemp2 : m2.mem.accesses = [])
+    (h1 : evalIntrinsicM m0 op1 args1 retTy1 = .ok (v1, m1))
+    (h2 : evalIntrinsicM m2 op2 args2 retTy2 = .ok (v2, m3))
+    (tid : ThreadId) (sync : Set ThreadId) :
+    ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) = .ok () := by
+  obtain ⟨_, log1, hacc1, _, _, hall1⟩ := evalIntrinsicM_atomic_accesses hop1 h1
+  obtain ⟨_, log2, hacc2, _, _, hall2⟩ := evalIntrinsicM_atomic_accesses hop2 h2
+  rw [hemp0, List.nil_append] at hacc1
+  rw [hemp2, List.nil_append] at hacc2
+  refine (check_data_races_ok_iff m3.mem tid sync m1.mem.accesses).mpr (Or.inr fun a ha p hp => ?_)
+  rw [hacc2] at ha
+  rw [hacc1] at hp
+  exact access_races_atomic_atomic_false (hall2 a ha).1 (hall1 p hp).1
+
+/-- An `AtomicStore` of an integer and a non-atomic `typed_load` on
+unsynchronized threads at overlapping byte ranges trigger UB `"Data race"` in
+`ConcurrentMemory::check_data_races` (in both interleaving orders). -/
+theorem atomicStore_nonAtomicLoad_data_race {m0 m1 m2 m3 : Machine M}
+    {ptr1 ptr2 : ThinPointer (Memory.Provenance M)} {pty : «Type»} {v1 v2 : Value M}
+    {t1 : IntType} {ty2 : «Type»} {size2 : Size} {a2 al2 : Align}
+    (h1 : evalIntrinsicM m0 .AtomicStore [(.Ptr ⟨ptr1, none⟩, pty), (v1, .Int t1)] unitType =
+      .ok (unitValueM, m1))
+    (h2 : typedLoadM m2 ptr2 ty2 al2 .None = .ok (v2, m3))
+    (hl2 : Type.layout ty2 = .ok (.Sized size2 a2))
+    (hov1 : ptr1.addr + t1.size.bytes > ptr2.addr)
+    (hov2 : ptr2.addr + size2.bytes > ptr1.addr)
+    {tid : ThreadId} {sync : Set ThreadId} (hunsync : setContains sync tid = false) :
+    ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+      .error (.ub "Data race") := by
+  obtain ⟨ptr, _, v, ty, _, _, align, hargs, _, _, _, _, _, hs⟩ := atomicStore_ok_iff.mp h1
+  have h1a := (List.cons.inj hargs).1
+  have h1b := (List.cons.inj (List.cons.inj hargs).2).1
+  have hptr : ptr1 = ptr := (Pointer.mk.inj (Value.Ptr.inj (Prod.mk.inj h1a).1)).1
+  have hv : v1 = v := (Prod.mk.inj h1b).1
+  have hty : .Int t1 = ty := (Prod.mk.inj h1b).2
+  rw [← hptr, ← hv, ← hty] at hs
+  obtain ⟨bytes, henc, hacc1⟩ := typedStoreM_ok_accesses hs
+  have hlen : bytes.length = t1.size.bytes := encodeM_int_length henc
+  obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses h2
+  have hsz2 : sz2 = size2 := by
+    rw [hl2] at hl2'
+    cases hl2'
+    rfl
+  rw [hsz2] at hacc2
+  have hmem1 : ⟨.Store, .Atomic, ptr1.addr, t1.size⟩ ∈ m1.mem.accesses := by
+    rw [hacc1, hlen]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hmem2 : ⟨.Load, .None, ptr2.addr, size2⟩ ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hrace : Access.races ⟨.Store, .Atomic, ptr1.addr, t1.size⟩
+      ⟨.Load, .None, ptr2.addr, size2⟩ = true :=
+    access_races_atomic_store_non_atomic_load ptr1.addr ptr2.addr t1.size size2 hov1 hov2
+  refine ⟨(check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem2, _, hmem1, ?_⟩,
+          (check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem1, _, hmem2, hrace⟩⟩
+  rw [access_races_symm]
+  exact hrace
+
+/-- Upstream (`spec/lang/step/intrinsics.md`): "We do *not* do a store on a
+failing AtomicCompareExchange. This means that races between a non-atomic load
+and a failing AtomicCompareExchange are not considered UB!"
+In every memory model, a failing `AtomicCompareExchange` and a non-atomic
+`typed_load` on unsynchronized threads (each starting from an empty access log)
+never trigger a data race in `ConcurrentMemory::check_data_races`, in either
+order, even at the exact same address. -/
+theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race
+    {m0 m1 m2 m3 : Machine M} {ptr1 ptr2 : ThinPointer (Memory.Provenance M)}
+    {pty : «Type»} {cur next before v2 : Value M} {t1 : IntType} {ty2 : «Type»}
+    {al1 al2 : Align}
+    (hal1 : alignFromBytes t1.size.bytes = some al1)
+    (hsz1 : t1.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hemp0 : m0.mem.accesses = []) (hemp2 : m2.mem.accesses = [])
+    (hcas : evalIntrinsicM m0 .AtomicCompareExchange
+        [(.Ptr ⟨ptr1, none⟩, pty), (cur, .Int t1), (next, .Int t1)] (.Int t1) =
+      .ok (before, m1))
+    (hne : cur ≠ before)
+    (hload : typedLoadM m2 ptr2 ty2 al2 .None = .ok (v2, m3))
+    (tid : ThreadId) (sync : Set ThreadId) :
+    ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) = .ok () ∧
+    ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) = .ok () := by
+  have hacc1 := atomicCompareExchange_failure_accesses hal1 hsz1 hcas hne
+  obtain ⟨sz2, _, _, hacc2⟩ := typedLoadM_ok_accesses hload
+  rw [hemp0, List.nil_append] at hacc1
+  rw [hemp2, List.nil_append] at hacc2
+  constructor
+  · refine (check_data_races_ok_iff _ _ _ _).mpr (Or.inr fun a ha p hp => ?_)
+    rw [hacc2] at ha; rw [hacc1] at hp
+    cases ha with
+    | head =>
+      cases hp with
+      | head => exact access_races_load_load_false rfl rfl
+      | tail _ hp => cases hp
+    | tail _ ha => cases ha
+  · refine (check_data_races_ok_iff _ _ _ _).mpr (Or.inr fun a ha p hp => ?_)
+    rw [hacc1] at ha; rw [hacc2] at hp
+    cases ha with
+    | head =>
+      cases hp with
+      | head => exact access_races_load_load_false rfl rfl
+      | tail _ hp => cases hp
+    | tail _ ha => cases ha
+
+/-- In contrast to `atomicCompareExchange_failure_nonAtomicLoad_no_data_race`, a
+*succeeding* `AtomicCompareExchange` performs an atomic store and therefore
+triggers UB `"Data race"` against a non-atomic `typed_load` on an unsynchronized
+thread at an overlapping byte range (in both interleaving orders). -/
+theorem atomicCompareExchange_success_nonAtomicLoad_data_race
+    {m0 m1 m2 m3 : Machine M} {ptr1 ptr2 : ThinPointer (Memory.Provenance M)}
+    {pty : «Type»} {cur next v2 : Value M} {t1 : IntType} {ty2 : «Type»}
+    {size2 : Size} {a2 al1 al2 : Align}
+    (hal1 : alignFromBytes t1.size.bytes = some al1)
+    (hsz1 : t1.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hcas : evalIntrinsicM m0 .AtomicCompareExchange
+        [(.Ptr ⟨ptr1, none⟩, pty), (cur, .Int t1), (next, .Int t1)] (.Int t1) =
+      .ok (cur, m1))
+    (hload : typedLoadM m2 ptr2 ty2 al2 .None = .ok (v2, m3))
+    (hl2 : Type.layout ty2 = .ok (.Sized size2 a2))
+    (hov1 : ptr1.addr + t1.size.bytes > ptr2.addr)
+    (hov2 : ptr2.addr + size2.bytes > ptr1.addr)
+    {tid : ThreadId} {sync : Set ThreadId} (hunsync : setContains sync tid = false) :
+    ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+      .error (.ub "Data race") := by
+  obtain ⟨bytes, henc, hacc1⟩ := atomicCompareExchange_success_accesses hal1 hsz1 hcas
+  have hlen : bytes.length = t1.size.bytes := encodeM_int_length henc
+  obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses hload
+  have hsz2 : sz2 = size2 := by
+    rw [hl2] at hl2'
+    cases hl2'
+    rfl
+  rw [hsz2] at hacc2
+  have hmem1 : ⟨.Store, .Atomic, ptr1.addr, t1.size⟩ ∈ m1.mem.accesses := by
+    rw [hacc1, hlen]
+    exact List.mem_append_right _ (List.Mem.tail _ (List.Mem.head _))
+  have hmem2 : ⟨.Load, .None, ptr2.addr, size2⟩ ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hrace : Access.races ⟨.Store, .Atomic, ptr1.addr, t1.size⟩
+      ⟨.Load, .None, ptr2.addr, size2⟩ = true :=
+    access_races_atomic_store_non_atomic_load ptr1.addr ptr2.addr t1.size size2 hov1 hov2
+  refine ⟨(check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem2, _, hmem1, ?_⟩,
+          (check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem1, _, hmem2, hrace⟩⟩
+  rw [access_races_symm]
+  exact hrace
+
+/-- A successful `AtomicFetchAndOp` performs an atomic store and therefore
+triggers UB `"Data race"` against a non-atomic `typed_load` on an unsynchronized
+thread at an overlapping byte range (in both interleaving orders). -/
+theorem atomicFetchAndOp_nonAtomicLoad_data_race
+    {m0 m1 m2 m3 : Machine M} {binOp : IntBinOp}
+    {ptr1 ptr2 : ThinPointer (Memory.Provenance M)} {pty : «Type»}
+    {other res v2 : Value M} {t1 : IntType} {ty2 : «Type»}
+    {size2 : Size} {a2 al2 : Align}
+    (hrmw : evalIntrinsicM m0 (.AtomicFetchAndOp binOp)
+        [(.Ptr ⟨ptr1, none⟩, pty), (other, .Int t1)] (.Int t1) = .ok (res, m1))
+    (hload : typedLoadM m2 ptr2 ty2 al2 .None = .ok (v2, m3))
+    (hl2 : Type.layout ty2 = .ok (.Sized size2 a2))
+    (hov1 : ptr1.addr + t1.size.bytes > ptr2.addr)
+    (hov2 : ptr2.addr + size2.bytes > ptr1.addr)
+    {tid : ThreadId} {sync : Set ThreadId} (hunsync : setContains sync tid = false) :
+    ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
+      .error (.ub "Data race") := by
+  obtain ⟨ptr, _, _, _, _, t, _, _, hargs, hret, _, _, _, _, _, hstore⟩ :=
+    atomicFetchAndOp_ok_iff.mp hrmw
+  have h1a := (List.cons.inj hargs).1
+  have hptr : ptr1 = ptr := (Pointer.mk.inj (Value.Ptr.inj (Prod.mk.inj h1a).1)).1
+  have ht : t1 = t := by cases hret; rfl
+  rw [← hptr, ← ht] at hstore
+  obtain ⟨bytes, henc, hacc1⟩ := typedStoreM_ok_accesses hstore
+  have hlen : bytes.length = t1.size.bytes := encodeM_int_length henc
+  obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses hload
+  have hsz2 : sz2 = size2 := by
+    rw [hl2] at hl2'
+    cases hl2'
+    rfl
+  rw [hsz2] at hacc2
+  have hmem1 : ⟨.Store, .Atomic, ptr1.addr, t1.size⟩ ∈ m1.mem.accesses := by
+    rw [hacc1, hlen]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hmem2 : ⟨.Load, .None, ptr2.addr, size2⟩ ∈ m3.mem.accesses := by
+    rw [hacc2]
+    exact List.mem_append_right _ (List.Mem.head _)
+  have hrace : Access.races ⟨.Store, .Atomic, ptr1.addr, t1.size⟩
+      ⟨.Load, .None, ptr2.addr, size2⟩ = true :=
+    access_races_atomic_store_non_atomic_load ptr1.addr ptr2.addr t1.size size2 hov1 hov2
+  refine ⟨(check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem2, _, hmem1, ?_⟩,
+          (check_data_races_ub_iff _ _ _ _).mpr ⟨hunsync, _, hmem1, _, hmem2, hrace⟩⟩
+  rw [access_races_symm]
+  exact hrace
+
+end DataRaces
 
 /-! ## §4. Concrete machines: operational laws, round trips, and mode sensitivity
 
@@ -2034,6 +3395,29 @@ theorem atomicFetchAndOp_add_u8_overflow_bm :
   · kernel_rfl
   · decide +kernel
 
+/-- `AddUnchecked` on `255u8 + 1` is UB (`overflow in unchecked add`), whereas
+`Add` on the same operands is a spec panic (missing `bring_in_bounds`);
+`SubUnchecked` on `0u8 - 1` and `DivExact` on `5u32 / 2` are UB; and `Shl`
+wraps the shift count modulo 8 (`1u8 << 8 = 1u8`) while overflowing `128u8 << 1`
+is a spec panic. -/
+theorem atomicFetchAndOp_unchecked_and_shift_bm :
+    bmRmw bmU8Max bmPtr .AddUnchecked 1 itU8 =
+      .error (.ub "overflow in unchecked add") ∧
+    bmRmw (bmWith (initBytes [0])) bmPtr .SubUnchecked 1 itU8 =
+      .error (.ub "overflow in unchecked sub") ∧
+    bmRmw bmFive bmPtr .DivExact 2 itU32 =
+      .error (.ub "non-zero remainder in exact division") ∧
+    bmObs (bmRmw (bmWith (initBytes [1])) bmPtr .Shl 8 itU8) =
+      some ⟨.Int 1, [initBytes [1] ++ uninitBytes 7], [aLoad 1, aStore 1]⟩ ∧
+    bmRmw (bmWith (initBytes [128])) bmPtr .Shl 1 itU8 =
+      .error (.specPanic "trying to store a value which is ill-formed for its type") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · kernel_rfl
+  · kernel_rfl
+  · kernel_rfl
+  · decide +kernel
+  · kernel_rfl
+
 /-- Alignment UB on `Mach` inside a live allocation: a `u32` atomic at
 `cellAddr + 1`, and a `u64` atomic at `cellAddr + 4` (aligned for `u32`, not
 for `u64`). -/
@@ -2101,6 +3485,50 @@ theorem atomic_uninit_ub_bm :
     bmLoad (bmWith (initBytes [2])) bmPtr .Bool =
       .error (.ub "load at type but the data in memory violates the language invariant") := by
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Non-atomic `typed_load` of `u32` on `Mach`. -/
+def bmNonAtomicLoad (m : Mach) (ptr : Ptr) : Interp (Val × Mach) :=
+  typedLoad m ptr (.Int itU32) ⟨4⟩ .None
+
+/-- Run `step1`, collect its accesses via `resetDataRaceTracking` (recording
+thread `0` as active with synchronization set `sync`), run `step2`, and check
+`CM.check_data_races` for thread `tid`. -/
+def bmRaceCheck (step1 : Interp (Val × Mach)) (step2 : Mach → Interp (Val × Mach))
+    (tid : ThreadId) (sync : Set ThreadId := ⟨[]⟩) : Interp Unit := do
+  let (_, m1) ← step1
+  let (prev, m1') :=
+    resetDataRaceTracking { m1 with active_thread := 0, synchronized_threads := sync }
+  let (_, m2) ← step2 m1'
+  CM.check_data_races m2.mem tid prev
+
+/-- Data-race witnesses on `Mach` through `resetDataRaceTracking` and
+`CM.check_data_races`:
+1. Unsynchronized `AtomicStore` + `AtomicLoad` at `cellAddr`: no race.
+2. Unsynchronized `AtomicStore` + non-atomic `typed_load` at `cellAddr`: UB `"Data race"`.
+3. Synchronized (`1 ∈ sync`) `AtomicStore` + non-atomic `typed_load`: no race.
+4. Same thread (`tid = 0`) `AtomicStore` + non-atomic `typed_load`: no race.
+5. Unsynchronized failing `AtomicCompareExchange` + non-atomic `typed_load`: no race.
+6. Unsynchronized succeeding `AtomicCompareExchange` + non-atomic `typed_load`: UB `"Data race"`.
+7. Unsynchronized `AtomicFetchAndOp` + non-atomic `typed_load`: UB `"Data race"`.
+8. Unsynchronized `AtomicStore` at `[0..4)` + non-atomic `typed_load` at `[4..8)`: no race. -/
+theorem atomic_data_races_bm :
+    bmRaceCheck (bmStore bmFive bmPtr (.Int 9) (.Int itU32))
+        (fun m => bmLoad m bmPtr (.Int itU32)) 1 = .ok () ∧
+    bmRaceCheck (bmStore bmFive bmPtr (.Int 9) (.Int itU32))
+        (fun m => bmNonAtomicLoad m bmPtr) 1 = .error (.ub "Data race") ∧
+    bmRaceCheck (bmStore bmFive bmPtr (.Int 9) (.Int itU32))
+        (fun m => bmNonAtomicLoad m bmPtr) 1 ⟨[1]⟩ = .ok () ∧
+    bmRaceCheck (bmStore bmFive bmPtr (.Int 9) (.Int itU32))
+        (fun m => bmNonAtomicLoad m bmPtr) 0 = .ok () ∧
+    bmRaceCheck (bmCas bmFive bmPtr 6 9 itU32)
+        (fun m => bmNonAtomicLoad m bmPtr) 1 = .ok () ∧
+    bmRaceCheck (bmCas bmFive bmPtr 5 9 itU32)
+        (fun m => bmNonAtomicLoad m bmPtr) 1 = .error (.ub "Data race") ∧
+    bmRaceCheck (bmRmw bmFive bmPtr .Add 1 itU32)
+        (fun m => bmNonAtomicLoad m bmPtr) 1 = .error (.ub "Data race") ∧
+    bmRaceCheck (bmStore (bmWith (u32Bytes 5 ++ u32Bytes 7)) bmPtr (.Int 9) (.Int itU32))
+        (fun m => bmNonAtomicLoad m (bmPtr 4)) 1 = .ok () := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-! ### `Machine<TreeBorrowsMemory<x86_64>>` (`MachTB`) -/
 
@@ -2310,6 +3738,44 @@ theorem atomic_memory_ub_tb :
       .error (.ub "dereferencing pointer without provenance") ∧
     tbLoad (tbWith []) tbPtr (.Int itU32) =
       .error (.ub "load at type but the data in memory violates the language invariant") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
+
+/-- Non-atomic `typed_load` of `u32` on `MachTB`. -/
+def tbNonAtomicLoad (m : MachTB) (ptr : ThinPointer TreeBorrowsProvenance) :
+    Interp (Value TBM × MachTB) :=
+  typedLoadM m ptr (.Int itU32) ⟨4⟩ .None
+
+/-- Run `step1`, collect its accesses via `resetDataRaceTrackingM` (recording
+thread `0` as active with synchronization set `sync`), run `step2`, and check
+`ConcurrentMemory.check_data_races` for thread `tid`. -/
+def tbRaceCheck (step1 : Interp (Value TBM × MachTB))
+    (step2 : MachTB → Interp (Value TBM × MachTB))
+    (tid : ThreadId) (sync : Set ThreadId := ⟨[]⟩) : Interp Unit := do
+  let (_, m1) ← step1
+  let (prev, m1') :=
+    resetDataRaceTrackingM { m1 with active_thread := 0, synchronized_threads := sync }
+  let (_, m2) ← step2 m1'
+  ConcurrentMemory.check_data_races m2.mem tid prev
+
+/-- Data-race witnesses on `MachTB` through `resetDataRaceTrackingM` and
+`ConcurrentMemory.check_data_races`: atomic vs atomic succeeds, atomic store /
+succeeding CAS / RMW vs non-atomic load is UB `"Data race"`, and failing CAS
+or disjoint byte ranges vs non-atomic load succeed. -/
+theorem atomic_data_races_tb :
+    tbRaceCheck (tbStore tbFive tbPtr (.Int 9) (.Int itU32))
+        (fun m => tbLoad m tbPtr (.Int itU32)) 1 = .ok () ∧
+    tbRaceCheck (tbStore tbFive tbPtr (.Int 9) (.Int itU32))
+        (fun m => tbNonAtomicLoad m tbPtr) 1 = .error (.ub "Data race") ∧
+    tbRaceCheck (tbCas tbFive tbPtr 6 9 itU32)
+        (fun m => tbNonAtomicLoad m tbPtr) 1 = .ok () ∧
+    tbRaceCheck (tbCas tbFive tbPtr 5 9 itU32)
+        (fun m => tbNonAtomicLoad m tbPtr) 1 = .error (.ub "Data race") ∧
+    tbRaceCheck (tbRmw tbFive tbPtr .Add 1 itU32)
+        (fun m => tbNonAtomicLoad m tbPtr) 1 = .error (.ub "Data race") ∧
+    tbRaceCheck (tbRmw tbFive tbPtr .Add 1 itU32)
+        (fun m => tbLoad m tbPtr (.Int itU32)) 1 = .ok () ∧
+    tbRaceCheck (tbStore (tbWith (u32Bytes 5 ++ u32Bytes 7)) tbPtr (.Int 9) (.Int itU32))
+        (fun m => tbNonAtomicLoad m (tbPtr 4)) 1 = .ok () := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> kernel_rfl
 
 /-! ### Tree Borrows `Frozen` permission: a failing compare-exchange is a read
@@ -2716,6 +4182,85 @@ theorem atomicFetchAndOp_add_overflow_instance :
     (by decide) typedLoadM_bmU8Max (by decide)
   exact ⟨h, (evalIntrinsicM_bm_eq_atomic bmU8Max _ _ _ rfl).symm.trans h⟩
 
+/-- The non-atomic `typed_load` of `5u32` on `tbFive`, with the resulting
+machine written out. -/
+theorem typedLoadM_nonAtomic_tbFive :
+    typedLoadM tbFive tbPtr (.Int itU32) ⟨4⟩ .None =
+      .ok (.Int 5, tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
+        [⟨.Load, .None, cellAddr, ⟨4⟩⟩]) := by
+  kernel_rfl
+
+/-- `atomic_atomic_no_data_race` is not vacuous: an `AtomicStore` followed by
+an `AtomicLoad` on unsynchronized threads at `cellAddr` passes
+`ConcurrentMemory.check_data_races`. -/
+theorem atomic_atomic_no_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]).mem.accesses) =
+      .ok () := by
+  have hload : evalIntrinsicM tbFive .AtomicLoad [tbArg tbPtr] (.Int itU32) =
+      .ok (.Int 5, tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]) := by
+    kernel_rfl
+  exact atomic_atomic_no_data_race (op1 := .AtomicStore) (op2 := .AtomicLoad)
+    rfl rfl rfl rfl atomicStore_tb_wfLive_witness.2.1 hload 1 ⟨[]⟩
+
+/-- `atomicStore_nonAtomicLoad_data_race` is not vacuous: an `AtomicStore` and
+a non-atomic `typed_load` on unsynchronized threads at `cellAddr` trigger UB
+`"Data race"` in both orders. -/
+theorem atomicStore_nonAtomicLoad_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]).mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
+        [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
+      .error (.ub "Data race") := by
+  have hstore : evalIntrinsicM (tbWith []) .AtomicStore
+      [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int 7, .Int itU32)] unitType =
+      .ok (unitValueM, tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]) :=
+    atomicStore_tb_wfLive_witness.2.1
+  have hl2 : Type.layout (.Int itU32) = .ok (.Sized itU32.size ⟨4⟩) := by kernel_rfl
+  exact atomicStore_nonAtomicLoad_data_race hstore
+    typedLoadM_nonAtomic_tbFive hl2 (by decide) (by decide) rfl
+
+/-- `atomicCompareExchange_failure_nonAtomicLoad_no_data_race` is not vacuous:
+a failing `AtomicCompareExchange` and a non-atomic `typed_load` on
+unsynchronized threads at `cellAddr` do not race, in either order. -/
+theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem.accesses) =
+      .ok () ∧
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
+        [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
+      .ok () :=
+  atomicCompareExchange_failure_nonAtomicLoad_no_data_race (al1 := ⟨4⟩) rfl (by decide) rfl rfl
+    atomicCompareExchange_failure_instance (fun h => absurd (Value.Int.inj h) (by decide))
+    typedLoadM_nonAtomic_tbFive 1 ⟨[]⟩
+
+/-- `atomicCompareExchange_success_nonAtomicLoad_data_race` is not vacuous: a
+succeeding `AtomicCompareExchange` and a non-atomic `typed_load` on
+unsynchronized threads at `cellAddr` trigger UB `"Data race"` in both orders. -/
+theorem atomicCompareExchange_success_nonAtomicLoad_data_race_instance :
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 9 ++ uninitBytes 4)]
+        [aLoad 4, aStore 4]).mem.accesses) =
+      .error (.ub "Data race") ∧
+    ConcurrentMemory.check_data_races
+      (tbMach [tbCell (u32Bytes 9 ++ uninitBytes 4)] [aLoad 4, aStore 4]).mem
+      1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)]
+        [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem.accesses) =
+      .error (.ub "Data race") := by
+  have hl2 : Type.layout (.Int itU32) = .ok (.Sized itU32.size ⟨4⟩) := by kernel_rfl
+  exact atomicCompareExchange_success_nonAtomicLoad_data_race (al1 := ⟨4⟩) rfl (by decide)
+    atomicCompareExchange_success_instance typedLoadM_nonAtomic_tbFive hl2
+    (by decide) (by decide) rfl
+
 /-! ### Axiom and import audit -/
 
 section AxiomAudit
@@ -2746,7 +4291,7 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.AtomicIntrinsicsMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 100 then
+  if theorems < 140 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.AtomicIntrinsicsMR seen"
   logInfo m!"MiniRustSpec.AtomicIntrinsicsMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
