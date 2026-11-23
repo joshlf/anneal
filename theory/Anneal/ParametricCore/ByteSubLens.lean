@@ -31,7 +31,7 @@ namespace Anneal.ParametricCore
 
 This module restates the sub-allocation byte lenses and `&mut` call summaries
 of `Anneal.ByteSubLens.{Lens,MutSummary}` (`#4120`) over a thin byte-store
-interface, `ByteStoreOps Mem Addr`, instead of one fixed memory model.
+interface, `ByteStoreOps Mem Addr Byte`, instead of one fixed memory model.
 
 1. **Byte-store interface (`ByteStoreOps`, `LawfulByteStoreOps`):** slice
    reads and writes over an abstract memory, address and byte type, with the
@@ -46,13 +46,18 @@ interface, `ByteStoreOps Mem Addr`, instead of one fixed memory model.
    (`zoom`), split-borrow disjointness, and fail-closed rejection of
    zero-length, wrong-length and out-of-bounds accesses.
 4. **Typed views:** little-endian `BitVec`, `UInt16`, `UInt32` and `UInt64`
-   views through a byte codec (`Anneal.LeBytes`, `Anneal.BitVec`), and a
-   chunked array view (`Anneal.ListChunks`).
-5. **Mutation summaries (`MutSummary`, `MutSummaryCut`):** a computable
+   views through a byte codec (`Anneal.LeBytes`, `Anneal.BitVec`), a chunked
+   array view (`Anneal.ListChunks`), and fixed-width `SliceCodec` views
+   (`getVal`, `setVal`) with pair, padded-pair, `Bool` and mapped layouts
+   whose fields are read and written through `zoom` sub-lenses.
+5. **Guarded lenses (`getIf`, `setIf`, `AlignedSubLens`):** lenses under an
+   access check that every write preserves, with the alignment-checked lens
+   of `#4120` as the instance for an alignment oracle.
+6. **Mutation summaries (`MutSummary`, `MutSummaryCut`):** a computable
    summary of a callee that mutates one sub-lens, its realization over a
    `MirWpOps` step interface, a zero-`Prop`-argument `@[irreducible]` cut
-   sealing the realization proof, and chained summaries with a frame theorem
-   for every disjoint lens.
+   sealing the realization proof, typed summaries over a `SliceCodec`, and
+   chained summaries with a frame theorem for every disjoint lens.
 -/
 
 /-! ## Part I: `Nat`, `Bool` and `List` Slice Helpers -/
@@ -937,6 +942,38 @@ theorem tableRead_none_of_missing {view : AllocView A Byte}
   unfold tableRead
   rw [hFind]
 
+/-- A table write preserves every attribute of the allocations that
+`setBytes` does not change: for every identifier `id₂`, the attribute `f` of
+its first-match allocation is the same before and after the write. Alignment,
+mutability, liveness and size metadata of a table-backed memory are such
+attributes. -/
+theorem tableWrite_find_map {view : AllocView A Byte} (hLaw : view.Lawful)
+    {V : Type w} (f : A → V)
+    (hF : ∀ (a : A) (bs : List Byte), f (view.setBytes a bs) = f a)
+    {allocs allocs' : List A} {id off : Nat} {bs : List Byte}
+    (h : tableWrite view allocs id off bs = some allocs') (id₂ : Nat) :
+    (tableFind view id₂ allocs').map f = (tableFind view id₂ allocs).map f := by
+  let ⟨a, hFind, _, _, hEq⟩ := tableWrite_inv h
+  have hId : view.allocId a = id := tableFind_allocId hFind
+  have hSameId : view.allocId
+      (view.setBytes a (listSplice (view.bytes a) off bs)) =
+      view.allocId a :=
+    hLaw.allocId_setBytes a _
+  rw [hEq]
+  cases hB : Nat.beq
+      (view.allocId (view.setBytes a (listSplice (view.bytes a) off bs)))
+      id₂ with
+  | false => rw [tableFind_replace_ne hB]
+  | true =>
+    have hId₂ : view.allocId a = id₂ :=
+      hSameId.symm.trans (Nat.eq_of_beq_eq_true hB)
+    have hFind' : tableFind view (view.allocId a) allocs = some a := by
+      rw [hId]
+      exact hFind
+    have hNew := tableFind_replace_same hFind' hSameId
+    rw [← hId₂, hNew, hFind']
+    exact congrArg some (hF a _)
+
 /-- A write to a missing allocation fails closed. -/
 theorem tableWrite_none_of_missing {view : AllocView A Byte}
     {allocs : List A} {id : Nat} (off : Nat) (bs : List Byte)
@@ -1480,6 +1517,14 @@ def ByteStoreOps.WritePreserves {Mem : Type u} {Addr : Type v}
   ∀ (m m' : Mem) (a : Addr) (off : Nat) (bs : List Byte),
     ops.writeBytes? m a off bs = some m' → proj m' = proj m
 
+/-- Anything computed from a write-invariant projection is write-invariant:
+an access check computed from preserved metadata is preserved. -/
+theorem ByteStoreOps.WritePreserves.comp {Mem : Type u} {Addr : Type v}
+    {Byte : Type w} {ops : ByteStoreOps Mem Addr Byte} {V : Sort y}
+    {W : Sort z} {proj : Mem → V} (h : ops.WritePreserves proj) (g : V → W) :
+    ops.WritePreserves (fun m => g (proj m)) :=
+  fun m m' a off bs hW => congrArg g (h m m' a off bs hW)
+
 /-- A table-backed byte store preserves every projection that `setTable` does
 not change. -/
 theorem ByteStoreOps.ofTable_writePreserves {Mem : Type u} {A : Type x}
@@ -1489,6 +1534,29 @@ theorem ByteStoreOps.ofTable_writePreserves {Mem : Type u} {A : Type x}
     (hProj : ∀ (m : Mem) (t : List A), proj (setTable m t) = proj m) :
     (ByteStoreOps.ofTable view getTable setTable).WritePreserves proj :=
   fun _ _ _ _ _ h => ofTable_write_preserves_proj proj h hProj
+
+/-- A table-backed byte store preserves every attribute of its allocations
+that `setBytes` does not change, looked up by identifier. This is the
+write-invariance that an access check reading allocation metadata needs
+(`ByteSubLens.getIf`, `AlignedSubLens`): the alignment, mutability or
+liveness recorded for an object is not affected by writes to any object. -/
+theorem ByteStoreOps.ofTable_writePreserves_find {Mem : Type u} {A : Type x}
+    {Byte : Type w} {V : Type y} {view : AllocView A Byte}
+    (hLaw : view.Lawful) (getTable : Mem → List A)
+    (setTable : Mem → List A → Mem)
+    (hGetSet : ∀ (m : Mem) (t : List A), getTable (setTable m t) = t)
+    (f : A → V)
+    (hF : ∀ (a : A) (bs : List Byte), f (view.setBytes a bs) = f a)
+    (id : Nat) :
+    (ByteStoreOps.ofTable view getTable setTable).WritePreserves
+      (fun m => (tableFind view id (getTable m)).map f) := by
+  intro m m' a off bs h
+  let ⟨t, hWrite, hM⟩ := ofTable_write_inv h
+  rw [hM]
+  change (tableFind view id (getTable (setTable m t))).map f =
+    (tableFind view id (getTable m)).map f
+  rw [hGetSet m t]
+  exact tableWrite_find_map hLaw f hF hWrite id
 
 /-- `ByteStoreOps.ofTable` is lawful for every lawful allocation view and
 every lawful table lens `getTable` / `setTable`. Allocation identifiers need
@@ -2817,6 +2885,65 @@ def SliceCodec.Exact {Byte : Type w} {α : Type a} {len : Nat}
     (sc : SliceCodec Byte α len) : Prop :=
   ∀ (bs : List Byte) (x : α), sc.dec bs = some x → sc.enc x = bs
 
+/-- Builds a `SliceCodec` from an encoder and a decoder that round-trip, by
+adding the width check to the decoder. A decoder that does not check the
+width of its input itself (one that reads a prefix, or a `len`-indexed codec
+of another library that only states `enc_length` and `dec_enc`) becomes a
+`SliceCodec` without a proof of `dec_length`. -/
+def SliceCodec.ofGuarded {Byte : Type w} {α : Type a} (len : Nat)
+    (enc : α → List Byte) (dec : List Byte → Option α)
+    (enc_length : ∀ x : α, (enc x).length = len)
+    (dec_enc : ∀ x : α, dec (enc x) = some x) : SliceCodec Byte α len where
+  enc := enc
+  dec bs :=
+    match Nat.beq bs.length len with
+    | false => none
+    | true => dec bs
+  enc_length := enc_length
+  dec_length {bs x} h := by
+    cases hLenB : Nat.beq bs.length len with
+    | false =>
+      rw [hLenB] at h
+      cases h
+    | true => exact Nat.eq_of_beq_eq_true hLenB
+  dec_enc x := by
+    have hBeq : Nat.beq (enc x).length len = true := by
+      rw [enc_length x]
+      exact Nat.beq_refl len
+    rw [hBeq]
+    exact dec_enc x
+
+/-- On a slice of the right width `SliceCodec.ofGuarded` decodes as the
+decoder it was built from. -/
+theorem SliceCodec.ofGuarded_dec_of_length {Byte : Type w} {α : Type a}
+    {len : Nat} {enc : α → List Byte} {dec : List Byte → Option α}
+    {enc_length : ∀ x : α, (enc x).length = len}
+    {dec_enc : ∀ x : α, dec (enc x) = some x} {bs : List Byte}
+    (hLen : bs.length = len) :
+    (SliceCodec.ofGuarded len enc dec enc_length dec_enc).dec bs = dec bs := by
+  have hBeq : Nat.beq bs.length len = true := by
+    rw [hLen]
+    exact Nat.beq_refl len
+  change (match Nat.beq bs.length len with
+    | false => none
+    | true => dec bs) = dec bs
+  rw [hBeq]
+
+/-- `SliceCodec.ofGuarded` is exact when the decoder it was built from is
+exact on slices of the right width. -/
+theorem SliceCodec.ofGuarded_exact {Byte : Type w} {α : Type a}
+    {len : Nat} {enc : α → List Byte} {dec : List Byte → Option α}
+    {enc_length : ∀ x : α, (enc x).length = len}
+    {dec_enc : ∀ x : α, dec (enc x) = some x}
+    (hE : ∀ (bs : List Byte) (x : α), bs.length = len → dec bs = some x →
+      enc x = bs) :
+    (SliceCodec.ofGuarded len enc dec enc_length dec_enc).Exact := by
+  intro bs x hDec
+  have hLen : bs.length = len :=
+    (SliceCodec.ofGuarded len enc dec enc_length dec_enc).dec_length hDec
+  rw [SliceCodec.ofGuarded_dec_of_length hLen] at hDec
+  exact hE bs x hLen hDec
+
 /-- Every `ByteCodec` induces a width-checked `n`-byte little-endian
 `BitVec (n * 8)` `SliceCodec`. -/
 def SliceCodec.ofByteCodecLe {Byte : Type w} (c : ByteCodec Byte) (n : Nat) :
@@ -3684,6 +3811,256 @@ theorem getVal_paddedPair_setVal_snd {α : Type a} {β : Type b}
 
 end ByteSubLens
 
+/-! ### Guarded Lenses: Alignment and Other Write-Invariant Access Checks
+
+`#4120`'s lens carries an alignment exponent and rejects a misaligned slice.
+An alignment requirement cannot be made part of the address of a lawful byte
+store: two addresses that differ only in the alignment they ask for would
+count as separated (`LawfulByteStoreOps.addrDisjoint_of_separated`) although
+they read the same bytes. It is instead a check `ok : Mem → Bool` on the
+memory that every write preserves (`ByteStoreOps.WritePreserves ok`), like
+the liveness of the object or a permission. `getIf` and `setIf` guard a lens
+by such a check and keep the lens laws. Since the check is write-invariant,
+it is discharged once: where it holds, the guarded lens is the plain lens
+(`getIf_of_ok`, `setIf_of_ok`), and it still holds after any lens write,
+summary or summary chain (`set_preserves`, `execMutSummary_preserves`,
+`execMutSummaryChain_preserves`). -/
+
+namespace ByteSubLens
+
+variable {Mem : Type u} {Addr : Type v} {Byte : Type w}
+  [ops : ByteStoreOps Mem Addr Byte]
+
+/-- Reads a lens under the access check `ok`; fails closed when the check
+fails. -/
+def getIf (ok : Mem → Bool) (L : ByteSubLens Addr) (m : Mem) :
+    Option (List Byte) :=
+  match ok m with
+  | false => none
+  | true => L.get m
+
+/-- Writes a lens under the access check `ok`; fails closed when the check
+fails. -/
+def setIf (ok : Mem → Bool) (L : ByteSubLens Addr) (m : Mem)
+    (bs : List Byte) : Option Mem :=
+  match ok m with
+  | false => none
+  | true => L.set m bs
+
+/-- A guarded read is rejected when the check fails. -/
+theorem getIf_none_of_not_ok {ok : Mem → Bool} (L : ByteSubLens Addr)
+    {m : Mem} (hOk : ok m = false) :
+    (L.getIf ok m : Option (List Byte)) = none := by
+  unfold getIf
+  rw [hOk]
+
+/-- A guarded write is rejected when the check fails. -/
+theorem setIf_none_of_not_ok {ok : Mem → Bool} (L : ByteSubLens Addr)
+    {m : Mem} (bs : List Byte) (hOk : ok m = false) :
+    L.setIf ok m bs = none := by
+  unfold setIf
+  rw [hOk]
+
+/-- Where the check holds, a guarded read is the plain read. -/
+theorem getIf_of_ok {ok : Mem → Bool} (L : ByteSubLens Addr) {m : Mem}
+    (hOk : ok m = true) : L.getIf ok m = L.get m := by
+  unfold getIf
+  rw [hOk]
+
+/-- Where the check holds, a guarded write is the plain write. -/
+theorem setIf_of_ok {ok : Mem → Bool} (L : ByteSubLens Addr) {m : Mem}
+    (bs : List Byte) (hOk : ok m = true) : L.setIf ok m bs = L.set m bs := by
+  unfold setIf
+  rw [hOk]
+
+/-- Inversion of a successful guarded read. -/
+theorem getIf_inv {ok : Mem → Bool} {L : ByteSubLens Addr} {m : Mem}
+    {bs : List Byte} (h : L.getIf ok m = some bs) :
+    ok m = true ∧ L.get m = some bs := by
+  cases hOk : ok m with
+  | false =>
+    rw [getIf_none_of_not_ok L hOk] at h
+    cases h
+  | true =>
+    rw [getIf_of_ok L hOk] at h
+    exact ⟨rfl, h⟩
+
+/-- Inversion of a successful guarded write. -/
+theorem setIf_inv {ok : Mem → Bool} {L : ByteSubLens Addr} {m m' : Mem}
+    {bs : List Byte} (h : L.setIf ok m bs = some m') :
+    ok m = true ∧ L.set m bs = some m' := by
+  cases hOk : ok m with
+  | false =>
+    rw [setIf_none_of_not_ok L bs hOk] at h
+    cases h
+  | true =>
+    rw [setIf_of_ok L bs hOk] at h
+    exact ⟨rfl, h⟩
+
+/-- A write-invariant check still holds after a guarded write. -/
+theorem ok_of_setIf {ok : Mem → Bool} (hPres : ops.WritePreserves ok)
+    {L : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (h : L.setIf ok m bs = some m') : ok m' = true :=
+  let ⟨hOk, hSet⟩ := setIf_inv h
+  (set_preserves hPres hSet).trans hOk
+
+variable [LawfulByteStoreOps Mem Addr Byte]
+
+/-- Guarded lens law `get_set`. -/
+theorem getIf_setIf {ok : Mem → Bool} (hPres : ops.WritePreserves ok)
+    {L : ByteSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (h : L.setIf ok m bs = some m') : L.getIf ok m' = some bs := by
+  rw [getIf_of_ok L (ok_of_setIf hPres h)]
+  exact get_set (setIf_inv h).2
+
+/-- Guarded lens law `set_get`. -/
+theorem setIf_getIf {ok : Mem → Bool} {L : ByteSubLens Addr} {m : Mem}
+    {bs : List Byte} (h : L.getIf ok m = some bs) :
+    L.setIf ok m bs = some m := by
+  let ⟨hOk, hGet⟩ := getIf_inv h
+  rw [setIf_of_ok L bs hOk]
+  exact set_get hGet
+
+/-- Guarded lens law `set_set`. -/
+theorem setIf_setIf {ok : Mem → Bool} (hPres : ops.WritePreserves ok)
+    {L : ByteSubLens Addr} {m m₁ : Mem} {bs₁ : List Byte} (bs₂ : List Byte)
+    (h : L.setIf ok m bs₁ = some m₁) :
+    L.setIf ok m₁ bs₂ = L.setIf ok m bs₂ := by
+  let ⟨hOk, hSet⟩ := setIf_inv h
+  rw [setIf_of_ok L bs₂ (ok_of_setIf hPres h), setIf_of_ok L bs₂ hOk]
+  exact set_set bs₂ hSet
+
+/-- Guarded frame law: a guarded write leaves every non-interfering guarded
+lens unchanged, including whether its own check holds. -/
+theorem getIf_setIf_disjoint {ok₁ ok₂ : Mem → Bool}
+    (hPres₂ : ops.WritePreserves ok₂) {L₁ L₂ : ByteSubLens Addr}
+    {m m' : Mem} {bs : List Byte} (hDisj : Disjoint Mem L₁ L₂)
+    (h : L₁.setIf ok₁ m bs = some m') : L₂.getIf ok₂ m' = L₂.getIf ok₂ m := by
+  have hSet : L₁.set m bs = some m' := (setIf_inv h).2
+  unfold getIf
+  rw [set_preserves hPres₂ hSet, get_set_disjoint hDisj hSet]
+
+/-- Guarded commutation law: guarded writes through non-interfering lenses
+commute. -/
+theorem setIf_setIf_comm_disjoint {ok₁ ok₂ : Mem → Bool}
+    (hPres₁ : ops.WritePreserves ok₁) (hPres₂ : ops.WritePreserves ok₂)
+    {L₁ L₂ : ByteSubLens Addr} {m m₁ m₂ : Mem} {b₁ b₂ : List Byte}
+    (hDisj : Disjoint Mem L₁ L₂) (h₁ : L₁.setIf ok₁ m b₁ = some m₁)
+    (h₂ : L₂.setIf ok₂ m b₂ = some m₂) :
+    ∃ m₃, L₂.setIf ok₂ m₁ b₂ = some m₃ ∧ L₁.setIf ok₁ m₂ b₁ = some m₃ := by
+  let ⟨hOk₁, hSet₁⟩ := setIf_inv h₁
+  let ⟨hOk₂, hSet₂⟩ := setIf_inv h₂
+  let ⟨m₃, hA, hB⟩ := set_set_comm_disjoint hDisj hSet₁ hSet₂
+  have hOk₂' : ok₂ m₁ = true := (set_preserves hPres₂ hSet₁).trans hOk₂
+  have hOk₁' : ok₁ m₂ = true := (set_preserves hPres₁ hSet₂).trans hOk₁
+  refine ⟨m₃, ?_, ?_⟩
+  · rw [setIf_of_ok L₂ b₂ hOk₂']
+    exact hA
+  · rw [setIf_of_ok L₁ b₁ hOk₁']
+    exact hB
+
+end ByteSubLens
+
+/-- Alignment-checked lens, as in `#4120`: a lens together with the alignment
+exponent required of its first byte. -/
+structure AlignedSubLens (Addr : Type v) where
+  /-- The byte range. -/
+  lens : ByteSubLens Addr
+  /-- Required alignment is `2 ^ alignLog2`. -/
+  alignLog2 : Nat
+
+namespace AlignedSubLens
+
+variable {Mem : Type u} {Addr : Type v} {Byte : Type w}
+  [ops : ByteStoreOps Mem Addr Byte]
+
+/-- Alignment check of an aligned lens against the alignment oracle
+`alignedAt m a off k` of a memory model (is offset `off` of the object at `a`
+aligned to `2 ^ k` in `m`). -/
+def ok (alignedAt : Mem → Addr → Nat → Nat → Bool) (A : AlignedSubLens Addr)
+    (m : Mem) : Bool :=
+  alignedAt m A.lens.addr A.lens.offset A.alignLog2
+
+/-- Alignment-checked read. -/
+def get (alignedAt : Mem → Addr → Nat → Nat → Bool) (A : AlignedSubLens Addr)
+    (m : Mem) : Option (List Byte) :=
+  A.lens.getIf (A.ok alignedAt) m
+
+/-- Alignment-checked write. -/
+def set (alignedAt : Mem → Addr → Nat → Nat → Bool) (A : AlignedSubLens Addr)
+    (m : Mem) (bs : List Byte) : Option Mem :=
+  A.lens.setIf (A.ok alignedAt) m bs
+
+/-- A misaligned slice is rejected by the read (`#4120`'s
+`unalignedByteLensRejected`). -/
+theorem get_none_of_unaligned {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (A : AlignedSubLens Addr) {m : Mem}
+    (h : alignedAt m A.lens.addr A.lens.offset A.alignLog2 = false) :
+    (A.get alignedAt m : Option (List Byte)) = none :=
+  ByteSubLens.getIf_none_of_not_ok A.lens h
+
+/-- A misaligned slice is rejected by the write. -/
+theorem set_none_of_unaligned {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (A : AlignedSubLens Addr) {m : Mem} (bs : List Byte)
+    (h : alignedAt m A.lens.addr A.lens.offset A.alignLog2 = false) :
+    A.set alignedAt m bs = none :=
+  ByteSubLens.setIf_none_of_not_ok A.lens bs h
+
+/-- On an aligned slice the checked read is the plain lens read, so every
+typed view, summary and frame law of the plain lens applies. -/
+theorem get_eq_of_aligned {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (A : AlignedSubLens Addr) {m : Mem}
+    (h : alignedAt m A.lens.addr A.lens.offset A.alignLog2 = true) :
+    A.get alignedAt m = A.lens.get m :=
+  ByteSubLens.getIf_of_ok A.lens h
+
+/-- On an aligned slice the checked write is the plain lens write. -/
+theorem set_eq_of_aligned {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (A : AlignedSubLens Addr) {m : Mem} (bs : List Byte)
+    (h : alignedAt m A.lens.addr A.lens.offset A.alignLog2 = true) :
+    A.set alignedAt m bs = A.lens.set m bs :=
+  ByteSubLens.setIf_of_ok A.lens bs h
+
+variable [LawfulByteStoreOps Mem Addr Byte]
+
+/-- Aligned lens law `get_set`, for an alignment oracle that writes
+preserve. -/
+theorem get_set {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (hPres : ∀ (a : Addr) (off k : Nat),
+      ops.WritePreserves (fun m => alignedAt m a off k))
+    {A : AlignedSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (h : A.set alignedAt m bs = some m') : A.get alignedAt m' = some bs :=
+  ByteSubLens.getIf_setIf (hPres A.lens.addr A.lens.offset A.alignLog2) h
+
+/-- Aligned lens law `set_get`. -/
+theorem set_get {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    {A : AlignedSubLens Addr} {m : Mem} {bs : List Byte}
+    (h : A.get alignedAt m = some bs) : A.set alignedAt m bs = some m :=
+  ByteSubLens.setIf_getIf h
+
+/-- Aligned lens law `set_set`. -/
+theorem set_set {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (hPres : ∀ (a : Addr) (off k : Nat),
+      ops.WritePreserves (fun m => alignedAt m a off k))
+    {A : AlignedSubLens Addr} {m m₁ : Mem} {bs₁ : List Byte}
+    (bs₂ : List Byte) (h : A.set alignedAt m bs₁ = some m₁) :
+    A.set alignedAt m₁ bs₂ = A.set alignedAt m bs₂ :=
+  ByteSubLens.setIf_setIf (hPres A.lens.addr A.lens.offset A.alignLog2) bs₂ h
+
+/-- Aligned frame law: a checked write leaves every non-interfering aligned
+lens unchanged. -/
+theorem get_set_disjoint {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (hPres : ∀ (a : Addr) (off k : Nat),
+      ops.WritePreserves (fun m => alignedAt m a off k))
+    {A₁ A₂ : AlignedSubLens Addr} {m m' : Mem} {bs : List Byte}
+    (hDisj : ByteSubLens.Disjoint Mem A₁.lens A₂.lens)
+    (h : A₁.set alignedAt m bs = some m') :
+    A₂.get alignedAt m' = A₂.get alignedAt m :=
+  ByteSubLens.getIf_setIf_disjoint
+    (hPres A₂.lens.addr A₂.lens.offset A₂.alignLog2) hDisj h
+
+end AlignedSubLens
+
 /-! ## Part VI: Mutation Summaries and `@[irreducible]` Summary Cuts -/
 
 /-- Computable summary of a callee that mutates one byte sub-lens: from the
@@ -3914,6 +4291,33 @@ theorem execMutSummary_ofSliceCodec_target {α : Type x} {n : Nat}
         rw [hR] at hFn
         exact ⟨v, v', ByteSubLens.getVal_of hLen hGet hDec, hFn, hSetVal,
           ByteSubLens.getVal_setVal hSetVal⟩
+
+/-- Introduction rule for `MutSummary.ofSliceCodec`: from the typed pre-view
+`L.getVal sc m = some v` and the typed step `fn v arg = some (v', ret)`, the
+summary executes, and its result is the typed write of `v'` with typed
+post-view `v'`. No byte is inspected and nothing is evaluated, so `m`, `v` and
+`arg` may be symbolic; `execMutSummary_ofSliceCodec_target` is the converse
+inversion. -/
+theorem execMutSummary_ofSliceCodec_of {α : Type x} {n : Nat}
+    {sc : SliceCodec Byte α n} {fn : α → Arg → Option (α × Ret)}
+    {L : ByteSubLens Addr} {m : Mem} {arg : Arg} {ret : Ret} {v v' : α}
+    (hGet : L.getVal sc m = some v) (hFn : fn v arg = some (v', ret)) :
+    ∃ m', execMutSummary (MutSummary.ofSliceCodec sc fn) L m arg =
+        some (m', ret) ∧
+      L.setVal sc m v' = some m' ∧ L.getVal sc m' = some v' := by
+  let ⟨hLen, bs, hGetBs, hDec⟩ := ByteSubLens.getVal_inv hGet
+  let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get (sc.enc v') hGetBs
+    ((sc.enc_length v').trans hLen.symm)
+  have hSum : (MutSummary.ofSliceCodec sc fn).summaryFn bs arg =
+      some (sc.enc v', ret) := by
+    unfold MutSummary.ofSliceCodec
+    dsimp only
+    rw [hDec]
+    dsimp only
+    rw [hFn]
+  have hSetVal : L.setVal sc m v' = some m' := hSet
+  exact ⟨m', execMutSummary_of hLen hGetBs hSum hSet, hSetVal,
+    ByteSubLens.getVal_setVal hSetVal⟩
 
 /-- Commutation of two disjoint summary executions: executing `sum₁` on `L₁`
 and `sum₂` on a non-interfering lens `L₂` produces the same final memory and
@@ -5508,5 +5912,108 @@ theorem mutSummary_ofSliceCodec_canary :
   have hFrame : hi.getUInt16 ByteCodec.bitVec8 m' = some (0xBEEF : UInt16) :=
     (execMutSummary_frame_getUInt16_disjoint hDisj hExec).trans rfl
   exact ⟨m', hExec, hPost, hFrame⟩
+
+/-- Symbolic typed-summary canary for `execMutSummary_ofSliceCodec_of`: for
+every store `m` whose `u32` view of the lens reads `v`, and every increment
+`d`, the incrementing summary executes, returns `v`, leaves the `u32` view at
+`v + d` and frames the adjacent `u16` view. Neither the store nor the values
+are concrete, and no byte list appears in the statement or the proof. -/
+theorem mutSummary_ofSliceCodec_symbolic_canary (m : SliceStore (BitVec 8))
+    (v d : UInt32)
+    (hGet : (ByteSubLens.mk 3 0 4).getVal
+      (SliceCodec.uint32 ByteCodec.bitVec8) m = some v) :
+    ∃ m', execMutSummary
+        (MutSummary.ofSliceCodec (SliceCodec.uint32 ByteCodec.bitVec8)
+          (fun (x : UInt32) (y : UInt32) => some (x + y, x)))
+        (ByteSubLens.mk 3 0 4) m d = some (m', v) ∧
+      (ByteSubLens.mk 3 0 4).getVal (SliceCodec.uint32 ByteCodec.bitVec8) m' =
+        some (v + d) ∧
+      (ByteSubLens.mk 3 4 2).getUInt16 ByteCodec.bitVec8 m' =
+        (ByteSubLens.mk 3 4 2).getUInt16 ByteCodec.bitVec8 m := by
+  let ⟨m', hExec, _, hPost⟩ := execMutSummary_ofSliceCodec_of
+    (fn := fun (x : UInt32) (y : UInt32) => some (x + y, x)) (arg := d)
+    hGet rfl
+  have hDisj : ByteSubLens.Disjoint (SliceStore (BitVec 8))
+      (ByteSubLens.mk 3 0 4) (ByteSubLens.mk 3 4 2) :=
+    ByteSubLens.disjoint_of_separated
+      (ByteSubLens.separated_of_natLensSeparatedBool rfl)
+  exact ⟨m', hExec, hPost,
+    execMutSummary_frame_getUInt16_disjoint hDisj hExec⟩
+
+/-- Alignment oracle of the canary stores: every object starts at a maximally
+aligned address, so offset `off` is aligned to `2 ^ k` exactly when `2 ^ k`
+divides it. It does not depend on the bytes, so every write preserves it. -/
+def canaryAlignedAt {Byte : Type u} (_ : SliceStore Byte) (_ : Nat)
+    (off k : Nat) : Bool :=
+  Nat.beq (off % 2 ^ k) 0
+
+/-- Alignment canary (`#4120`'s `unalignedByteLensRejected`): a `u32` lens at
+offset `0` with alignment `4` reads; a `u16` lens at offset `1` with alignment
+`2` is rejected for reading and for writing although the plain lens reads the
+same bytes, and the same range with alignment `1` reads. After a checked write
+of the `u32`, the checked read returns the written bytes and the aligned `u16`
+neighbor at offset `4` is framed. -/
+theorem alignedSubLens_canary :
+    (AlignedSubLens.mk (ByteSubLens.mk 3 0 4) 2).get canaryAlignedAt
+        canaryWordStore =
+      some [BitVec.ofNat 8 0x78, BitVec.ofNat 8 0x56, BitVec.ofNat 8 0x34,
+        BitVec.ofNat 8 0x12] ∧
+    (AlignedSubLens.mk (ByteSubLens.mk 3 1 2) 1).get canaryAlignedAt
+        canaryWordStore = none ∧
+    (AlignedSubLens.mk (ByteSubLens.mk 3 1 2) 1).set canaryAlignedAt
+        canaryWordStore [BitVec.ofNat 8 0, BitVec.ofNat 8 0] = none ∧
+    (ByteSubLens.mk 3 1 2).get canaryWordStore =
+      some [BitVec.ofNat 8 0x56, BitVec.ofNat 8 0x34] ∧
+    (AlignedSubLens.mk (ByteSubLens.mk 3 1 2) 0).get canaryAlignedAt
+        canaryWordStore =
+      some [BitVec.ofNat 8 0x56, BitVec.ofNat 8 0x34] ∧
+    ∃ m', (AlignedSubLens.mk (ByteSubLens.mk 3 0 4) 2).set canaryAlignedAt
+        canaryWordStore
+        [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3,
+          BitVec.ofNat 8 4] = some m' ∧
+      (AlignedSubLens.mk (ByteSubLens.mk 3 0 4) 2).get canaryAlignedAt m' =
+        some [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3,
+          BitVec.ofNat 8 4] ∧
+      (AlignedSubLens.mk (ByteSubLens.mk 3 4 2) 1).get canaryAlignedAt m' =
+        some [BitVec.ofNat 8 0xEF, BitVec.ofNat 8 0xBE] := by
+  have hPres : ∀ (a : Nat) (off k : Nat),
+      (SliceStore.instByteStoreOps (BitVec 8)).WritePreserves
+        (fun m => canaryAlignedAt m a off k) :=
+    fun _ _ _ _ _ _ _ _ _ => rfl
+  have hGetA : (ByteSubLens.mk 3 0 4).get canaryWordStore =
+      some [BitVec.ofNat 8 0x78, BitVec.ofNat 8 0x56, BitVec.ofNat 8 0x34,
+        BitVec.ofNat 8 0x12] := rfl
+  let ⟨m', hSetPlain⟩ := ByteSubLens.set_isSome_of_get
+    (L := ByteSubLens.mk 3 0 4) (m := canaryWordStore)
+    [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3, BitVec.ofNat 8 4]
+    hGetA rfl
+  have hSet : (AlignedSubLens.mk (ByteSubLens.mk 3 0 4) 2).set canaryAlignedAt
+      canaryWordStore
+      [BitVec.ofNat 8 1, BitVec.ofNat 8 2, BitVec.ofNat 8 3,
+        BitVec.ofNat 8 4] = some m' :=
+    (AlignedSubLens.set_eq_of_aligned
+      (AlignedSubLens.mk (ByteSubLens.mk 3 0 4) 2) _ rfl).trans hSetPlain
+  have hDisj : ByteSubLens.Disjoint (SliceStore (BitVec 8))
+      (ByteSubLens.mk 3 0 4) (ByteSubLens.mk 3 4 2) :=
+    ByteSubLens.disjoint_of_separated
+      (ByteSubLens.separated_of_natLensSeparatedBool rfl)
+  exact ⟨rfl, rfl, rfl, rfl, rfl, m', hSet,
+    AlignedSubLens.get_set hPres hSet,
+    (AlignedSubLens.get_set_disjoint
+      (A₂ := AlignedSubLens.mk (ByteSubLens.mk 3 4 2) 1) hPres hDisj
+      hSet).trans rfl⟩
+
+/-- Metadata write-invariance canary: on `SliceStore` the `writable` flag of
+the first-match allocation of every identifier is preserved by every write,
+by `ByteStoreOps.ofTable_writePreserves_find`. An access check that reads
+this flag is therefore a valid guard for `ByteSubLens.getIf` and `setIf`, and
+a guarded write keeps it. -/
+theorem sliceStore_writable_preserved_canary (Byte : Type u) (id : Nat) :
+    (SliceStore.instByteStoreOps Byte).WritePreserves
+      (fun m => (tableFind (SliceAlloc.view Byte) id m.allocs).map
+        (fun a => a.writable)) :=
+  ByteStoreOps.ofTable_writePreserves_find (SliceAlloc.view_lawful Byte)
+    SliceStore.allocs (fun _ t => { allocs := t }) (fun _ _ => rfl)
+    (fun a => a.writable) (fun _ _ => rfl) id
 
 end Anneal.ParametricCore

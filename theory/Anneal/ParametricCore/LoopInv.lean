@@ -1960,9 +1960,12 @@ theorem wpLoop_early_return_rank {α : Sort x} (rank : α → Nat)
   wpLoop_early_return (r := InvImage (fun m n : Nat => m < n) rank)
     (InvImage.wf rank Nat.lt_wfRel.wf) hStep hNorm hEarly a₀ s₀ hInv
 
-/-- Strict-progress form of `wpLoop_early_return`: every continuing
-iteration must take at least one step (`wpStepUntil`), preventing stuttering
-obligations from discharging vacuously on a self-loop. -/
+/-- Strict-progress form of `wpLoop_early_return`: the continuing case of an
+iteration is given as a `wpStepUntil`, which takes at least one step. This is
+a convenience for iteration proofs that are already in strict form; it proves
+nothing that `wpLoop_early_return` does not, because the well-founded descent
+of the ghost value already rules out an unbounded run of zero-step
+iterations. -/
 theorem wpLoop_early_return_strict {α : Sort x} {r : α → α → Prop}
     (hWf : WellFounded r)
     {Inv : α → State → Prop} {normalExit earlyClean : State → Prop}
