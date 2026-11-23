@@ -1221,4 +1221,157 @@ theorem validBaselinePackage_statement_side_dependencies :
   | ok cert =>
     exact auditAndReplayPackage_statement_side_dependencies h
 
+/-! ## Section 9: Pass-`A3` Regression Suite (Extension Import-Closure & Prefix-Collision Hijack, Duplicate Roots, Bare `Verify` & Role Uniqueness, `Lean.*` Non-Foundation, Opaque-Wrapped Provisional Refutation, `requireSources`, & `by_elab`/`run_tac`/`run_cmd`) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.roleMatchesModuleName_unique' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms roleMatchesModuleName_unique
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_no_lean_modules' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_no_lean_modules
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_roots_nodup' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_roots_nodup
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_sources_covered' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_sources_covered
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_ext_refs_within_imports' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_ext_refs_within_imports
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_reserved_origins_within_imports' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_reserved_origins_within_imports
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA3_ext_entry_import_closure_and_prefix_collision_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA3_ext_entry_import_closure_and_prefix_collision_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA3_duplicate_roots_and_bare_verify_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA3_duplicate_roots_and_bare_verify_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA3_role_uniqueness_and_lean_not_foundation' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms passA3_role_uniqueness_and_lean_not_foundation
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA3_opaque_wrapped_native_axiom_refuted' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA3_opaque_wrapped_native_axiom_refuted
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA3_requireSources_and_meta_exec_scanner_hardened' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA3_requireSources_and_meta_exec_scanner_hardened
+
+example := passA3_ext_entry_import_closure_and_prefix_collision_rejected
+example := passA3_duplicate_roots_and_bare_verify_rejected
+example := passA3_role_uniqueness_and_lean_not_foundation
+example := passA3_opaque_wrapped_native_axiom_refuted
+example := passA3_requireSources_and_meta_exec_scanner_hardened
+
+/-- Instantiation on `validBaselinePackage`: roots are duplicate-free, no `Lean.*` modules exist,
+and every extension entry respects local ownership and statement-side stratification. -/
+theorem validBaselinePackage_passA3_guarantees :
+    validBaselinePackage.verifyRoots.Nodup ∧
+    validBaselinePackage.claimRoots.Nodup ∧
+    (∀ inv ∈ validBaselinePackage.modules, ¬ SymName.isLeanCompilerModule inv.moduleName) ∧
+    (∀ inv ∈ validBaselinePackage.modules, ∀ ext ∈ inv.extEntries,
+      ∀ dep ∈ ext.referencedConstants, ∀ target, moduleOfConst? validBaselinePackage dep = some target →
+        isStatementSideRole inv.role = true → isStatementSideRole target.role = true) := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    obtain ⟨hvr, hcr⟩ := auditAndReplayPackage_roots_nodup h
+    refine ⟨hvr, hcr, auditAndReplayPackage_no_lean_modules h, ?_⟩
+    intro inv hinv ext hext dep hdep target htarget hst
+    exact ((auditAndReplayPackage_ext_refs_within_imports h inv hinv ext hext).2.1
+      dep hdep target htarget).2 hst
+
+/-- Instantiation of `auditAndReplayPackage_sources_covered` on `validBaselinePackageWithSources`. -/
+theorem validBaselinePackageWithSources_all_scanned :
+    ∀ inv ∈ validBaselinePackageWithSources.modules, ∃ src, inv.sourceText? = some src ∧
+      SourceScanner.scanSourceDefenseInDepth requireSourcesConfig inv.moduleName inv.role src = .ok () := by
+  cases h : auditAndReplayPackage requireSourcesConfig validBaselinePackageWithSources with
+  | error e =>
+    have hok := passA3_requireSources_and_meta_exec_scanner_hardened.2.1
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    exact auditAndReplayPackage_sources_covered h rfl
+
+/-- Opaque lambda applied to opaque `Bool.false` is refuted by `whnfAllowOpaque` β-reduction! -/
+def opaqueBoolIdName : SymName := SymName.ofList ["Proof", "Native", "opaqueBoolId"]
+def opaqueBoolIdDecl : ConstantRecord := {
+  name := opaqueBoolIdName, kind := .opaqueDecl,
+  type := .forallE (.const SymName.boolName) (.const SymName.boolName),
+  value? := some (.lam (.const SymName.boolName) (.bvar 0)), hasValue := true,
+  all := [opaqueBoolIdName], originModule := pillarProofMod
+}
+def opaqueBetaRefutedAxName : SymName :=
+  SymName.ofList ["Proof", "Native", "bad", "_native", "decide", "ax_opaque_beta"]
+def opaqueBetaRefutedPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule pillarProofMod .proof [
+    opaqueFalseBoolDecl,
+    opaqueBoolIdDecl,
+    { name := opaqueBetaRefutedAxName, kind := .axiomDecl,
+      type := .app (.app (.const SymName.eqBoolName)
+        (.app (.const opaqueBoolIdName) (.const opaqueFalseBoolName)))
+        (.const SymName.boolTrueName),
+      originModule := pillarProofMod }
+  ])
+
+/-- Additional Pass-`A3` edges: opaque β-reduction refutation, hybrid roles, and glued/guillemet `by_elab`/`run_tac`. -/
+theorem passA3_extra_edges :
+    auditAndReplayPackage provisionalConfig opaqueBetaRefutedPkg =
+      .error (.invalidNativeAxiomType opaqueBetaRefutedAxName opaqueBetaRefutedAxName) ∧
+    roleMatchesModuleName .proof (SymName.ofList ["Tests", "Proofs"]) = false ∧
+    roleMatchesModuleName .test (SymName.ofList ["Tests", "Proofs"]) = false ∧
+    roleMatchesModuleName .defsExempt (SymName.ofList ["Topic", "Tests", "Defs"]) = false ∧
+    roleMatchesModuleName .test (SymName.ofList ["Topic", "Tests", "Defs"]) = true ∧
+    roleMatchesModuleName .proof (SymName.ofList ["Topic", "Proofs", "Defs"]) = true ∧
+    roleMatchesModuleName .defsExempt (SymName.ofList ["Topic", "Proofs", "Defs"]) = false ∧
+    scanProofSource "theorem t : True := by iterate 1run_tac pure ()" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") ∧
+    scanProofSource "theorem t : True := «by_elab» return mkConst ``True.intro" =
+      .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
 end Anneal.ReplayKeyAndTamperAuditProtoTests
