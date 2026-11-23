@@ -456,6 +456,29 @@ theorem ofDetStep_refines {step : State → StepOutcome State Out Fault}
     rw [hEv] at hW
     exact hFault s f P Q R hEv hW
 
+/-- A `valid`-quantified interface refines the deterministic interface of any
+choice `c₀` that is admissible at every state: a proof about all admissible
+choices is in particular a proof about `c₀`. -/
+theorem ofChoiceStep_refines_ofDetStep (Choice : Type x)
+    (valid : State → Choice → Prop)
+    (step : Choice → State → StepOutcome State Out Fault)
+    (tag : State → Option Nat) {c₀ : Choice} (hValid : ∀ s, valid s c₀) :
+    (ofChoiceStep Choice valid step tag).Refines (ofDetStep (step c₀) tag) :=
+  fun s _ _ _ h => h.2 c₀ (hValid s)
+
+/-- The deterministic interface of `step c₀` refines the `valid`-quantified
+interface when `c₀` is the only admissible choice at every state. Without
+uniqueness the converse of `ofChoiceStep_refines_ofDetStep` fails
+(`ofDetStep_not_refines_ofChoiceStep_canary`). `valid` and `step` are explicit
+because proofs such as `fun _ => rfl` do not determine them. -/
+theorem ofDetStep_refines_ofChoiceStep (Choice : Type x)
+    (valid : State → Choice → Prop)
+    (step : Choice → State → StepOutcome State Out Fault)
+    (tag : State → Option Nat) {c₀ : Choice} (hValid : ∀ s, valid s c₀)
+    (hUniq : ∀ s c, valid s c → c = c₀) :
+    (ofDetStep (step c₀) tag).Refines (ofChoiceStep Choice valid step tag) :=
+  fun s _ _ _ h => stepWp_of_detChoice (hValid s) (hUniq s) h
+
 end ConstructorLaws
 
 end MirWpOps
@@ -1936,6 +1959,49 @@ theorem wpLoop_header {α : Sort x} {r : α → α → Prop} (hWf : WellFounded 
     (Inv := fun a s => ops.atBlock header s ∧ Inv a s)
     (fun a s h => hStep a s h.1 h.2) a₀ s₀ ⟨hAt, hInv⟩
 
+/-- Termination by a state measure, one step at a time. If every `Inv` state
+takes a step whose successors satisfy `Inv` at a strictly smaller `rank`, or
+terminates or faults as accepted, then every execution from an `Inv` state
+terminates as required.
+
+The obligation is a single `stepWp` per state and needs no functional
+invariant, so this is the rule for the safety-and-termination pass of a
+two-pass proof (`wpStateOk_of_wlp_and_safety`): `Inv` only has to keep the
+machine inside the program, and `rank` is a distance to the exit. -/
+theorem wpOutcome_of_rank (rank : State → Nat) {Inv : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hStep : ∀ s, Inv s →
+      ops.stepWp s (fun s' => Inv s' ∧ rank s' < rank s) onDone onFault)
+    {s : State} (hInv : Inv s) : wpOutcome onDone onFault s := by
+  have hAux : ∀ (n : Nat) (t : State), rank t < n → Inv t →
+      wpOutcome onDone onFault t := by
+    intro n
+    induction n with
+    | zero =>
+      intro t hLt _
+      exact False.elim (Nat.not_lt_zero _ hLt)
+    | succ n ih =>
+      intro t hLt hInvT
+      exact wpOutcome_step
+        (ops.stepWp_mono
+          (fun t' h' =>
+            ih t' (Nat.lt_of_lt_of_le h'.2 (Nat.le_of_lt_succ hLt)) h'.1)
+          (fun _ hq => hq) (fun _ hr => hr) (hStep t hInvT))
+  exact hAux (rank s + 1) s (Nat.lt_succ_self _) hInv
+
+omit ops in
+/-- `wpOutcome_of_rank` for a deterministic step function: on a concrete
+state the obligation reduces by `rfl` to the successor's `Inv` and rank
+bound, to `onDone` of the outcome, or to `onFault` of the error. -/
+theorem wpOutcome_det_of_rank {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} (rank : State → Nat) {Inv : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hStep : ∀ s, Inv s →
+      (step s).wp (fun s' => Inv s' ∧ rank s' < rank s) onDone onFault)
+    {s : State} (hInv : Inv s) :
+    wpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s :=
+  wpOutcome_of_rank (ops := MirWpOps.ofDetStep step tag) rank hStep hInv
+
 end Loops
 
 /-! ## Part V: Simulation Combinators -/
@@ -2310,6 +2376,43 @@ theorem toy_fault_wpOutcome (block i acc : Nat) (post : Nat → Prop) :
     wpOutcome (ops := toyOps) post (fun err => err = ())
       { block := block + 2, i := i, acc := acc } :=
   wpOutcome_det_fault_eq (step := toyStep) (err := ()) rfl rfl
+
+/-- A `valid`-quantified variant of the toy machine: the choice `true` runs
+`toyStep` and the choice `false` faults, and only `true` is admissible. -/
+def toyChoiceStep (c : Bool) (s : ToyState) : StepOutcome ToyState Nat Unit :=
+  match c with
+  | true => toyStep s
+  | false => .fault ()
+
+/-- Refinement canary: the countdown specification proved over the
+deterministic interface transfers to the `valid`-quantified interface through
+`MirWpOps.ofDetStep_refines_ofChoiceStep` and `wpOutcome_of_refines`, without
+re-running the loop argument. The inadmissible faulting choice is never
+taken. -/
+theorem countDownToy_choice_spec (n : Nat) :
+    wpStateOk
+      (ops := MirWpOps.ofChoiceStep Bool (fun _ c => c = true) toyChoiceStep
+        (fun s => some s.block))
+      (fun out => out = n) { block := 0, i := n, acc := 0 } :=
+  wpOutcome_of_refines
+    (MirWpOps.ofDetStep_refines_ofChoiceStep Bool (fun _ c => c = true)
+      toyChoiceStep (fun s => some s.block) (c₀ := true) (fun _ => rfl)
+      (fun _ _ hc => hc))
+    (countDownToy_spec n)
+
+/-- Refinement is not symmetric: with two admissible choices that end
+differently, the deterministic interface of one choice does not refine the
+`valid`-quantified interface, which also has to account for the other. -/
+theorem ofDetStep_not_refines_ofChoiceStep_canary :
+    ¬ (MirWpOps.ofDetStep
+        (fun _ : Unit => (StepOutcome.done true : StepOutcome Unit Bool Unit))
+      ).Refines
+      (MirWpOps.ofChoiceStep Bool (fun _ _ => True)
+        (fun c _ => (StepOutcome.done c : StepOutcome Unit Bool Unit))) := by
+  intro hRef
+  have h := hRef () (fun _ => False) (fun o => o = true) (fun _ => False) rfl
+  have hEq : false = true := h.2 false True.intro
+  cases hEq
 
 /-- Outcome type for a dot-notation and early-return regression canary. -/
 inductive ToyOutcome where

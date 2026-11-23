@@ -886,6 +886,15 @@ theorem wpUntil_of_within {A : State → Prop} {stop : State → Prop}
   | here hs => exact wpUntil.here (ops := ops) hs
   | step mid hStep _ ih => exact wpUntil.step (ops := ops) mid hStep.2 ih
 
+omit ops in
+/-- The restriction of a step interface to a region refines the interface:
+`MirWpOps.within` only adds an obligation to every step. Together with
+`wpUntil_of_refines`, `wpOutcome_of_refines` and `StageCut.of_refines` this
+forgets the region of any proof. -/
+theorem MirWpOps.within_refines (ops : MirWpOps State Out Fault)
+    (A : State → Prop) : (ops.within A).Refines ops :=
+  fun _ _ _ _ h => h.2
+
 /-- A checkpoint proof is within any region that contains every state. -/
 theorem wpUntil_within_of_forall {A : State → Prop} (hA : ∀ s, A s)
     {stop : State → Prop} {onDone : Out → Prop}
@@ -2072,19 +2081,93 @@ theorem diamond_spec_zero_exact (y z : Nat) :
   have hNum : (10 : Nat) = 1 := Nat.add_left_cancel hEq
   cases hNum
 
+/-- Distance from a block of the diamond program to its return block, along
+the longest path. Every step of the program strictly decreases it. -/
+def diamondRank (s : DiamondState) : Nat :=
+  match s.block with
+  | 0 => 5
+  | 1 => 4
+  | 2 => 4
+  | 3 => 3
+  | 4 => 1
+  | 5 => 2
+  | _ => 0
+
+/-- Safety-and-termination pass of the diamond program, proved on its own by
+`wpOutcome_det_of_rank`: from every state at one of the seven blocks the
+program terminates without a fault. The proof inspects one step per block,
+uses the block index as the only invariant and never mentions `y`, `z` or the
+value that the program computes. -/
+theorem diamond_safe (s : DiamondState) (hBlock : s.block < 7) :
+    wpStateOk (ops := diamondOps) (fun _ => True) s := by
+  refine wpOutcome_det_of_rank (step := diamondStep) diamondRank
+    (Inv := fun t => t.block < 7) ?_ hBlock
+  intro t hT
+  cases t with
+  | mk blk tx ty tz =>
+    have hB : blk < 7 := hT
+    cases blk with
+    | zero =>
+      cases tx with
+      | zero =>
+        exact And.intro (show (1 : Nat) < 7 by decide)
+          (show (4 : Nat) < 5 by decide)
+      | succ _ =>
+        exact And.intro (show (2 : Nat) < 7 by decide)
+          (show (4 : Nat) < 5 by decide)
+    | succ b₁ =>
+      cases b₁ with
+      | zero =>
+        exact And.intro (show (3 : Nat) < 7 by decide)
+          (show (3 : Nat) < 4 by decide)
+      | succ b₂ =>
+        cases b₂ with
+        | zero =>
+          exact And.intro (show (3 : Nat) < 7 by decide)
+            (show (3 : Nat) < 4 by decide)
+        | succ b₃ =>
+          cases b₃ with
+          | zero =>
+            cases tx with
+            | zero =>
+              exact And.intro (show (4 : Nat) < 7 by decide)
+                (show (1 : Nat) < 3 by decide)
+            | succ _ =>
+              exact And.intro (show (5 : Nat) < 7 by decide)
+                (show (2 : Nat) < 3 by decide)
+          | succ b₄ =>
+            cases b₄ with
+            | zero =>
+              exact And.intro (show (6 : Nat) < 7 by decide)
+                (show (0 : Nat) < 1 by decide)
+            | succ b₅ =>
+              cases b₅ with
+              | zero =>
+                exact And.intro (show (4 : Nat) < 7 by decide)
+                  (show (1 : Nat) < 2 by decide)
+              | succ b₆ =>
+                cases b₆ with
+                | zero => exact True.intro
+                | succ b₇ =>
+                  exact False.elim
+                    (Nat.not_lt_of_le (Nat.le_add_left 7 b₇) hB)
+
 /-- Two-pass canary exercising `wlpOutcome_of_invariant` and
-`wpStateOk_of_wlp_and_safety`: pass 1 proves safety/termination once with a
-trivial postcondition (`fun _ => True`), pass 2 proves the functional
-postcondition via a coinductive invariant, and `wpStateOk_of_wlp_and_safety`
-combines them into exact total correctness. -/
+`wpStateOk_of_wlp_and_safety`. Pass 1 is `diamond_safe`: safety and
+termination with the trivial postcondition, proved by a block-distance
+measure with no functional reasoning. Pass 2 proves the functional
+postcondition as a step-closed invariant with no termination argument.
+`wpStateOk_of_wlp_and_safety` combines them into exact total correctness.
+Neither pass uses `diamond_spec`, so this is an independent second proof of
+it. -/
 theorem diamond_spec_two_pass_canary (x y z : Nat) :
     wpStateOk (ops := diamondOps) (fun out => out = z + diamondDelta x)
       { block := 0, x := x, y := y, z := z } := by
   have hSafe :
       wpStateOk (ops := diamondOps) (fun _ => True)
         { block := 0, x := x, y := y, z := z } :=
-    wpOutcome_mono (ops := diamondOps) (fun _ _ => True.intro)
-      (fun _ hf => hf) (diamond_spec x y z)
+    diamond_safe { block := 0, x := x, y := y, z := z }
+      (show (0 : Nat) < 7 by decide)
   let I : DiamondState → Prop := fun s =>
     s.x = x ∧
     ((s.block = 0 ∧ s.z = z) ∨
