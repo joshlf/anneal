@@ -2853,30 +2853,56 @@ theorem stepAt_chunk8BlockTree_eq {BB : Type u} {State : Sort v}
       stepAt (listGet? blocks (blockOf s)) s := by
   rw [Chunk8BlockTree.ofList_lookup_eq]
 
-/-! ## Numeral Forcing for Elaborator-Level Evaluation (`natForce`)
+/-! ## Numeral Forcing for Elaborator-Level Evaluation (`natForceN`, `natForce`)
 
 `ptreeGetAt` and the `Chunk8` spine index with `Nat.div` and `Nat.mod`. The
 kernel evaluates these on numerals, but the elaborator's definitional
 unfolding only folds them when the argument is a closed numeral term: an index
-such as the block field of a state record that also holds symbolic values is
+such as the block field of a state record that also holds symbolic values—or
+an incremented field `s.block + 1` produced across successive symbolic steps—is
 left stuck, and a `rfl` proof about a symbolic state fails before the kernel
-ever sees it. `natForce` pattern-matches on the index first, which reduces it
-to a numeral, and only then hands it to the lookup. -/
+ever sees it. `natForceN layers` peels up to `layers` constructor steps of
+`Nat.succ` in `O(layers)` time (`O(1)` at `layers = 8`, so large indices such
+as `4096` never exhaust recursion depth while nested symbolic-record
+increments still normalize to closed numerals) before invoking `k`. -/
 
-/-- Reduces `n` to a numeral and passes it to `k`. Propositionally it is
-`k n` (`natForce_eq`); its purpose is to make `k` see a closed numeral during
-elaborator-level evaluation. -/
+/-- Peels up to `layers` `Nat.succ` constructors off `n` in `O(layers)` steps
+and passes the reconstructed index to `k` (`0` `noncomputable`, `0`
+`._unsafe_rec`). Propositionally it is `k n` (`natForceN_eq`). -/
+def natForceN {α : Sort u} (layers n : Nat) (k : Nat → α) : α :=
+  @Nat.rec (fun _ => Nat → (Nat → α) → α)
+    (fun m f => f m)
+    (fun _ ih m f =>
+      match m with
+      | 0 => f 0
+      | m' + 1 => ih m' (fun r => f (r + 1)))
+    layers n k
+
+/-- `natForceN layers n k` is `k n` (`0` axioms). -/
+theorem natForceN_eq {α : Sort u} (layers : Nat) :
+    ∀ (n : Nat) (k : Nat → α), natForceN layers n k = k n := by
+  induction layers with
+  | zero =>
+    intro n k
+    rfl
+  | succ l ih =>
+    intro n k
+    cases n with
+    | zero => rfl
+    | succ m => exact ih m (fun r => k (r + 1))
+
+/-- Reduces `n` through up to `8` `Nat.succ` layers to a numeral and passes it
+to `k`. Propositionally it is `k n` (`natForce_eq`); its purpose is to make
+`k` see a closed numeral during elaborator-level evaluation even across
+symbolic record projections and successive `+ 1` increments while staying
+`O(1)` on large literals (`≥ 4096`). -/
 def natForce {α : Sort u} (n : Nat) (k : Nat → α) : α :=
-  match n with
-  | 0 => k 0
-  | m + 1 => k (m + 1)
+  natForceN 8 n k
 
-/-- `natForce n k` is `k n`. -/
+/-- `natForce n k` is `k n` (`0` axioms). -/
 theorem natForce_eq {α : Sort u} (n : Nat) (k : Nat → α) :
-    natForce n k = k n := by
-  cases n with
-  | zero => rfl
-  | succ m => rfl
+    natForce n k = k n :=
+  natForceN_eq 8 n k
 
 /-- `BlockTree` lookup that forces its index to a numeral first. -/
 def BlockTree.lookupForced? {α : Type u} (bt : BlockTree α) (idx : Nat) :
@@ -2956,8 +2982,8 @@ inductive CutRun (State : Type u) (Res : Type v) : Type (max u v) where
 
 /-- Runs `step` from `s` until a state satisfies `isCut`, for at most `fuel`
 steps (`0` `noncomputable`, `0` `._unsafe_rec`). `next?` extracts the successor
-state of a step result. A state that already satisfies `isCut` is returned
-without stepping. -/
+state of a step result, evaluating `step st` once per step. A state that
+already satisfies `isCut` is returned without stepping. -/
 def runToCut {State : Type u} {Res : Type v} (step : State → Res)
     (next? : Res → Option State) (isCut : State → Bool) (fuel : Nat)
     (s : State) : CutRun State Res :=
@@ -2970,19 +2996,22 @@ def runToCut {State : Type u} {Res : Type v} (step : State → Res)
       match isCut st with
       | true => .cut st
       | false =>
-        match next? (step st) with
+        let r := step st
+        match next? r with
         | some st' => ih st'
-        | none => .halt st (step st))
+        | none => .halt st r)
     fuel s
 
-/-- Takes one step from `s` and then runs to a cutpoint. This is the form for
-a stage that starts at a cutpoint, such as a loop header. -/
+/-- Takes one step from `s` and then runs to a cutpoint, evaluating `step s`
+once. This is the form for a stage that starts at a cutpoint, such as a loop
+header. -/
 def runFromCut {State : Type u} {Res : Type v} (step : State → Res)
     (next? : Res → Option State) (isCut : State → Bool) (fuel : Nat)
     (s : State) : CutRun State Res :=
-  match next? (step s) with
+  let r := step s
+  match next? r with
   | some s' => runToCut step next? isCut fuel s'
-  | none => .halt s (step s)
+  | none => .halt s r
 
 section RunToCut
 
@@ -3002,9 +3031,10 @@ theorem runToCut_of_isCut {s : State} (h : isCut s = true) (fuel : Nat) :
     change (match isCut s with
       | true => CutRun.cut s
       | false =>
-        match next? (step s) with
+        let r := step s
+        match next? r with
         | some st' => runToCut step next? isCut fuel st'
-        | none => CutRun.halt s (step s)) = CutRun.cut s
+        | none => CutRun.halt s r) = CutRun.cut s
     rw [h]
 
 /-- With no budget left, a state outside the cutpoints times out. -/
@@ -3104,33 +3134,151 @@ theorem runToCut_cut_fuel_mono {f₁ f₂ : Nat} {s s' : State} (hLe : f₁ ≤ 
           rw [runToCut_succ_of_next hCut hNext f₂]
           exact ih (Nat.le_of_succ_le_succ hLe) h
 
-/-- Pointwise congruence in the step function, without function
-extensionality. -/
-theorem runToCut_congr_step {step₁ step₂ : State → Res}
-    (hEq : ∀ s : State, step₁ s = step₂ s) (fuel : Nat) (s : State) :
-    runToCut step₁ next? isCut fuel s = runToCut step₂ next? isCut fuel s := by
+/-- Fuel monotonicity for halts: a run that halts within `f₁` steps halts at
+the same state and result within any larger budget. -/
+theorem runToCut_halt_fuel_mono {f₁ f₂ : Nat} {s s' : State} {r : Res}
+    (hLe : f₁ ≤ f₂) (h : runToCut step next? isCut f₁ s = .halt s' r) :
+    runToCut step next? isCut f₂ s = .halt s' r := by
+  induction f₁ generalizing f₂ s with
+  | zero =>
+    cases hCut : isCut s with
+    | true =>
+      rw [runToCut_of_isCut hCut 0] at h
+      cases h
+    | false =>
+      rw [runToCut_zero_of_not_isCut hCut] at h
+      cases h
+  | succ f₁ ih =>
+    cases f₂ with
+    | zero => exact False.elim (Nat.not_succ_le_zero f₁ hLe)
+    | succ f₂ =>
+      cases hCut : isCut s with
+      | true =>
+        rw [runToCut_of_isCut hCut (f₁ + 1)] at h
+        cases h
+      | false =>
+        cases hNext : next? (step s) with
+        | none =>
+          rw [runToCut_succ_of_halt hCut hNext f₁] at h
+          rw [runToCut_succ_of_halt hCut hNext f₂]
+          exact h
+        | some st' =>
+          rw [runToCut_succ_of_next hCut hNext f₁] at h
+          rw [runToCut_succ_of_next hCut hNext f₂]
+          exact ih (Nat.le_of_succ_le_succ hLe) h
+
+/-- Pointwise congruence in both the step function and the cutpoint predicate,
+without function extensionality (`0` axioms). -/
+theorem runToCut_congr {step₁ step₂ : State → Res}
+    {isCut₁ isCut₂ : State → Bool}
+    (hStep : ∀ s : State, step₁ s = step₂ s)
+    (hCut : ∀ s : State, isCut₁ s = isCut₂ s) (fuel : Nat) (s : State) :
+    runToCut step₁ next? isCut₁ fuel s = runToCut step₂ next? isCut₂ fuel s := by
   induction fuel generalizing s with
-  | zero => rfl
+  | zero =>
+    change (match isCut₁ s with
+      | true => CutRun.cut s
+      | false => CutRun.timeout s) =
+      (match isCut₂ s with
+      | true => CutRun.cut s
+      | false => CutRun.timeout s)
+    rw [hCut s]
   | succ fuel ih =>
-    change (match isCut s with
+    change (match isCut₁ s with
       | true => CutRun.cut s
       | false =>
         match next? (step₁ s) with
-        | some st' => runToCut step₁ next? isCut fuel st'
+        | some st' => runToCut step₁ next? isCut₁ fuel st'
         | none => CutRun.halt s (step₁ s)) =
-      (match isCut s with
+      (match isCut₂ s with
       | true => CutRun.cut s
       | false =>
         match next? (step₂ s) with
-        | some st' => runToCut step₂ next? isCut fuel st'
+        | some st' => runToCut step₂ next? isCut₂ fuel st'
         | none => CutRun.halt s (step₂ s))
-    rw [hEq s]
-    cases isCut s with
+    rw [hCut s, hStep s]
+    cases isCut₂ s with
     | true => rfl
     | false =>
       cases next? (step₂ s) with
       | none => rfl
       | some st' => exact ih st'
+
+/-- Pointwise congruence in the step function, without function
+extensionality. -/
+theorem runToCut_congr_step {step₁ step₂ : State → Res}
+    (hEq : ∀ s : State, step₁ s = step₂ s) (fuel : Nat) (s : State) :
+    runToCut step₁ next? isCut fuel s = runToCut step₂ next? isCut fuel s :=
+  runToCut_congr hEq (fun _ => rfl) fuel s
+
+/-- `runFromCut` with a successor `s'` continues via `runToCut`. -/
+theorem runFromCut_of_next {s s' : State}
+    (hNext : next? (step s) = some s') (fuel : Nat) :
+    runFromCut step next? isCut fuel s = runToCut step next? isCut fuel s' := by
+  unfold runFromCut
+  dsimp only
+  rw [hNext]
+
+/-- `runFromCut` without a successor halts at once. -/
+theorem runFromCut_of_halt {s : State}
+    (hNext : next? (step s) = none) (fuel : Nat) :
+    runFromCut step next? isCut fuel s = .halt s (step s) := by
+  unfold runFromCut
+  dsimp only
+  rw [hNext]
+
+/-- A `runFromCut` ending at a cutpoint ends in a state satisfying `isCut`. -/
+theorem runFromCut_cut_isCut {fuel : Nat} {s s' : State}
+    (h : runFromCut step next? isCut fuel s = .cut s') : isCut s' = true := by
+  cases hNext : next? (step s) with
+  | none =>
+    rw [runFromCut_of_halt hNext fuel] at h
+    cases h
+  | some st' =>
+    rw [runFromCut_of_next hNext fuel] at h
+    exact runToCut_cut_isCut h
+
+/-- Fuel monotonicity for `runFromCut` cutpoint runs. -/
+theorem runFromCut_cut_fuel_mono {f₁ f₂ : Nat} {s s' : State} (hLe : f₁ ≤ f₂)
+    (h : runFromCut step next? isCut f₁ s = .cut s') :
+    runFromCut step next? isCut f₂ s = .cut s' := by
+  cases hNext : next? (step s) with
+  | none =>
+    rw [runFromCut_of_halt hNext f₁] at h
+    cases h
+  | some st' =>
+    rw [runFromCut_of_next hNext f₁] at h
+    rw [runFromCut_of_next hNext f₂]
+    exact runToCut_cut_fuel_mono hLe h
+
+/-- Fuel monotonicity for `runFromCut` halting runs. -/
+theorem runFromCut_halt_fuel_mono {f₁ f₂ : Nat} {s s' : State} {r : Res}
+    (hLe : f₁ ≤ f₂) (h : runFromCut step next? isCut f₁ s = .halt s' r) :
+    runFromCut step next? isCut f₂ s = .halt s' r := by
+  cases hNext : next? (step s) with
+  | none =>
+    rw [runFromCut_of_halt hNext f₁] at h
+    rw [runFromCut_of_halt hNext f₂]
+    exact h
+  | some st' =>
+    rw [runFromCut_of_next hNext f₁] at h
+    rw [runFromCut_of_next hNext f₂]
+    exact runToCut_halt_fuel_mono hLe h
+
+/-- Pointwise congruence for `runFromCut` in both `step` and `isCut` (`0`
+axioms). -/
+theorem runFromCut_congr {step₁ step₂ : State → Res}
+    {isCut₁ isCut₂ : State → Bool}
+    (hStep : ∀ s : State, step₁ s = step₂ s)
+    (hCut : ∀ s : State, isCut₁ s = isCut₂ s) (fuel : Nat) (s : State) :
+    runFromCut step₁ next? isCut₁ fuel s =
+      runFromCut step₂ next? isCut₂ fuel s := by
+  unfold runFromCut
+  dsimp only
+  rw [hStep s]
+  cases next? (step₂ s) with
+  | none => rfl
+  | some st' => exact runToCut_congr hStep hCut fuel st'
 
 end RunToCut
 
@@ -3162,6 +3310,15 @@ def evalChunk8BlockTreeToCut {BB : Type u} {State : Type v} {Res : Type w}
     (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
     (fuel : Nat) (s : State) : CutRun State Res :=
   runToCut (stepWith bt.lookupForced?) next?
+    (fun st => cuts.getForced (blockOf st)) fuel s
+
+/-- `evalChunk8BlockTreeToCut` after one mandatory step, for a stage that
+starts at a cutpoint block. -/
+def evalChunk8BlockTreeFromCut {BB : Type u} {State : Type v} {Res : Type w}
+    (bt : Chunk8BlockTree BB) (stepWith : (Nat → Option BB) → State → Res)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) : CutRun State Res :=
+  runFromCut (stepWith bt.lookupForced?) next?
     (fun st => cuts.getForced (blockOf st)) fuel s
 
 /-- The forcing cutpoint test is the plain cutpoint test. -/
@@ -3200,6 +3357,25 @@ theorem evalBlockTreeToCut_ofList_eq {BB : Type u} {State : Type v}
   evalBlockTreeToCut_eq_of_valid (valid_blockTree_ofList blocks) stepWith
     next? blockOf cuts fuel s
 
+/-- `0 Quot.sound` pointwise form of `evalBlockTreeToCut_ofList_eq` for any
+step function respecting pointwise-equal lookups. -/
+theorem evalBlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalBlockTreeToCut (BlockTree.ofList blocks) stepWith next? blockOf cuts
+      fuel s =
+      runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runToCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      ((BlockTree.ofList blocks).lookupForced?_eq i).trans
+        (BlockTree.ofList_lookup_eq blocks i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
 /-- Stage execution from a cutpoint over `BlockTree.ofList blocks` is stage
 execution over `listGet? blocks`. -/
 theorem evalBlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
@@ -3215,6 +3391,39 @@ theorem evalBlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
   rw [BlockTree.lookupForced?_eq_fun (valid_blockTree_ofList blocks),
     MaskTree.getForced_comp_eq_fun cuts blockOf]
 
+/-- `0 Quot.sound` pointwise form of `evalBlockTreeFromCut_ofList_eq`. -/
+theorem evalBlockTreeFromCut_ofList_eq_of_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalBlockTreeFromCut (BlockTree.ofList blocks) stepWith next? blockOf
+      cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runFromCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      ((BlockTree.ofList blocks).lookupForced?_eq i).trans
+        (BlockTree.ofList_lookup_eq blocks i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
+/-- Cut execution over a valid `Chunk8BlockTree` is cut execution over the
+list it tabulates. -/
+theorem evalChunk8BlockTreeToCut_eq_of_valid {BB : Type u} {State : Type v}
+    {Res : Type w} {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeToCut bt stepWith next? blockOf cuts fuel s =
+      runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s := by
+  unfold evalChunk8BlockTreeToCut
+  rw [Chunk8BlockTree.lookupForced?_eq_fun hValid,
+    MaskTree.getForced_comp_eq_fun cuts blockOf]
+
 /-- Cut execution over `Chunk8BlockTree.ofList blocks` is cut execution over
 `listGet? blocks`. -/
 theorem evalChunk8BlockTreeToCut_ofList_eq {BB : Type u} {State : Type v}
@@ -3225,8 +3434,40 @@ theorem evalChunk8BlockTreeToCut_ofList_eq {BB : Type u} {State : Type v}
     evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList blocks) stepWith next?
       blockOf cuts fuel s =
       runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  evalChunk8BlockTreeToCut_eq_of_valid (valid_chunk8BlockTree_ofList blocks)
+    stepWith next? blockOf cuts fuel s
+
+/-- `0 Quot.sound` pointwise form of `evalChunk8BlockTreeToCut_ofList_eq`. -/
+theorem evalChunk8BlockTreeToCut_ofList_eq_of_pointwise {BB : Type u}
+    {State : Type v} {Res : Type w} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList blocks) stepWith next?
+      blockOf cuts fuel s =
+      runToCut (stepWith (listGet? blocks)) next?
+        (fun st => cuts.get (blockOf st)) fuel s :=
+  runToCut_congr
+    (fun st => hPointwise _ _ st (fun i =>
+      ((Chunk8BlockTree.ofList blocks).lookupForced?_eq i).trans
+        (Chunk8BlockTree.ofList_lookup_eq blocks i)))
+    (fun st => cuts.getForced_eq (blockOf st)) fuel s
+
+/-- Stage execution from a cutpoint over `Chunk8BlockTree.ofList blocks` is
+stage execution over `listGet? blocks`. -/
+theorem evalChunk8BlockTreeFromCut_ofList_eq {BB : Type u} {State : Type v}
+    {Res : Type w} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → State → Res)
+    (next? : Res → Option State) (blockOf : State → Nat) (cuts : MaskTree)
+    (fuel : Nat) (s : State) :
+    evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks) stepWith next?
+      blockOf cuts fuel s =
+      runFromCut (stepWith (listGet? blocks)) next?
         (fun st => cuts.get (blockOf st)) fuel s := by
-  unfold evalChunk8BlockTreeToCut
+  unfold evalChunk8BlockTreeFromCut
   rw [Chunk8BlockTree.lookupForced?_eq_fun
       (valid_chunk8BlockTree_ofList blocks),
     MaskTree.getForced_comp_eq_fun cuts blockOf]
@@ -3238,6 +3479,34 @@ theorem evalBlockTreeToCut_cut_marked {BB : Type u} {State : Type v}
     {next? : Res → Option State} {blockOf : State → Nat} {cuts : MaskTree}
     {fuel : Nat} {s s' : State}
     (h : evalBlockTreeToCut bt stepWith next? blockOf cuts fuel s =
+      .cut s') :
+    cuts.get (blockOf s') = true := by
+  rw [← cuts.getForced_eq (blockOf s')]
+  exact runToCut_cut_isCut
+    (isCut := fun st => cuts.getForced (blockOf st)) h
+
+/-- A `evalBlockTreeFromCut` run that ends at a cutpoint ends at a marked
+block. -/
+theorem evalBlockTreeFromCut_cut_marked {BB : Type u} {State : Type v}
+    {Res : Type w} {bt : BlockTree BB}
+    {stepWith : (Nat → Option BB) → State → Res}
+    {next? : Res → Option State} {blockOf : State → Nat} {cuts : MaskTree}
+    {fuel : Nat} {s s' : State}
+    (h : evalBlockTreeFromCut bt stepWith next? blockOf cuts fuel s =
+      .cut s') :
+    cuts.get (blockOf s') = true := by
+  rw [← cuts.getForced_eq (blockOf s')]
+  exact runFromCut_cut_isCut
+    (isCut := fun st => cuts.getForced (blockOf st)) h
+
+/-- A `evalChunk8BlockTreeToCut` run that ends at a cutpoint ends at a marked
+block. -/
+theorem evalChunk8BlockTreeToCut_cut_marked {BB : Type u} {State : Type v}
+    {Res : Type w} {bt : Chunk8BlockTree BB}
+    {stepWith : (Nat → Option BB) → State → Res}
+    {next? : Res → Option State} {blockOf : State → Nat} {cuts : MaskTree}
+    {fuel : Nat} {s s' : State}
+    (h : evalChunk8BlockTreeToCut bt stepWith next? blockOf cuts fuel s =
       .cut s') :
     cuts.get (blockOf s') = true := by
   rw [← cuts.getForced_eq (blockOf s')]
@@ -3261,7 +3530,26 @@ theorem evalBlockTreeToCut_canary :
     evalBlockTreeToCut bt stepWith (fun r => r) (fun s => s) cuts 2 0 =
       .timeout 2 ∧
     evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList [1, 2, 3, 4, 5])
-      stepWith (fun r => r) (fun s => s) cuts 8 0 = .cut 3 :=
-  ⟨rfl, rfl, rfl, rfl, rfl⟩
+      stepWith (fun r => r) (fun s => s) cuts 8 0 = .cut 3 ∧
+    evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList [1, 2, 3, 4, 5])
+      stepWith (fun r => r) (fun s => s) cuts 8 3 = .halt 5 none :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Symbolic-record increment canary: `natForce` (`natForceN 8`) reduces
+successive `{ block := s.block + 1, payload := s.payload }` transitions and
+large indices (`4096`) by `rfl` even when the state record carries a symbolic
+field `x`. -/
+theorem evalBlockTreeToCut_symbolic_increment_canary (x : Nat) :
+    let bt := BlockTree.ofList [true, true, true, true, false]
+    let stepWith := fun (look : Nat → Option Bool) (s : Nat × Nat) =>
+      match look s.1 with
+      | some true => some (s.1 + 1, s.2)
+      | _ => none
+    let cuts := MaskTree.ofList [false, false, false, false, true]
+    evalBlockTreeToCut bt stepWith (fun r => r) Prod.fst cuts 6 (0, x) =
+      .cut (4, x) ∧
+    (Chunk8BlockTree.tabulate 10 (fun i => some i)).lookupForced?
+      ((4092, x).1 + 1 + 1 + 1 + 1) = some 4096 :=
+  ⟨rfl, rfl⟩
 
 end Anneal.ParametricCore

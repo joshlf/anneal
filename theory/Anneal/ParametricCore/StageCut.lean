@@ -339,6 +339,85 @@ theorem stepStageCut_of_runToCut_timeout
         exact StepStageCut.step (StepOutcome.next?_eq_some_iff.mp hNext)
           (ih h)
 
+/-- Kernel evaluation yields a `StepStageCut` from a stage starting at a
+cutpoint: if `runFromCut` stops at `s₁` within `fuel` remaining steps after its
+first mandatory step, then `s₀` reaches `s₁` within `fuel + 1` steps. -/
+theorem stepStageCut_of_runFromCut_cut {step : S → StepOutcome S Out Fault}
+    {isCut : S → Bool} {fuel : Nat} {s₀ s₁ : S}
+    (h : runFromCut step StepOutcome.next? isCut fuel s₀ = .cut s₁) :
+    StepStageCut step (fuel + 1) s₀ s₁ := by
+  cases hNext : (step s₀).next? with
+  | none =>
+    rw [runFromCut_of_halt hNext fuel] at h
+    cases h
+  | some st' =>
+    rw [runFromCut_of_next hNext fuel] at h
+    exact StepStageCut.step (StepOutcome.next?_eq_some_iff.mp hNext)
+      (stepStageCut_of_runToCut_cut h)
+
+/-- Constructive equivalence between bounded deterministic reachability
+(`wpUntilFuel` with `onDone := False`, `onFault := False`) and existential
+witness reachability over `StepStageCut` (`#4069`'s
+`wpUntilCutStep_iff_exists_stepStageCut`, `0` axioms). -/
+theorem wpUntilFuel_det_iff_exists_stepStageCut
+    {step : S → StepOutcome S Out Fault} {tag : S → Option Nat}
+    {cut : S → Prop} :
+    ∀ {fuel : Nat} {s₀ : S},
+      wpUntilFuel (ops := MirWpOps.ofDetStep step tag) cut
+        (fun _ => False) (fun _ => False) fuel s₀ ↔
+      ∃ s₁ : S, StepStageCut step fuel s₀ s₁ ∧ cut s₁
+  | 0, s₀ =>
+    ⟨fun h => ⟨s₀, StepStageCut.refl step 0 s₀, h⟩,
+     fun h => by
+       let ⟨s₁, hCut, hC⟩ := h
+       have hEq : s₀ = s₁ := reachStepIn_zero_iff.mp hCut
+       rw [hEq]
+       exact hC⟩
+  | fuel + 1, s₀ => by
+    constructor
+    · intro h
+      cases (wpUntilFuel_succ_iff (ops := MirWpOps.ofDetStep step tag)).mp h
+          with
+      | inl hC => exact ⟨s₀, StepStageCut.refl step (fuel + 1) s₀, hC⟩
+      | inr hSt =>
+        have hWp : (step s₀).wp
+            (wpUntilFuel (ops := MirWpOps.ofDetStep step tag) cut
+              (fun _ => False) (fun _ => False) fuel)
+            (fun _ => False) (fun _ => False) := hSt
+        cases hEv : step s₀ with
+        | step st' =>
+          rw [hEv] at hWp
+          let ⟨s₁, hCut, hC⟩ :=
+            (wpUntilFuel_det_iff_exists_stepStageCut (tag := tag)
+              (fuel := fuel)).mp hWp
+          exact ⟨s₁, StepStageCut.step hEv hCut, hC⟩
+        | done _ =>
+          rw [hEv] at hWp
+          exact False.elim hWp
+        | fault _ =>
+          rw [hEv] at hWp
+          exact False.elim hWp
+    · intro hEx
+      let ⟨s₁, hCut, hC⟩ := hEx
+      cases reachStepIn_succ_iff.mp hCut with
+      | inl hEq =>
+        rw [hEq]
+        exact wpUntilFuel_here (ops := MirWpOps.ofDetStep step tag) hC
+      | inr hSt =>
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep step tag) ?_
+        change (step s₀).wp _ (fun _ => False) (fun _ => False)
+        cases hEv : step s₀ with
+        | step st' =>
+          rw [hEv] at hSt
+          exact (wpUntilFuel_det_iff_exists_stepStageCut (tag := tag)
+            (fuel := fuel)).mpr ⟨s₁, hSt, hC⟩
+        | done _ =>
+          rw [hEv] at hSt
+          exact False.elim hSt
+        | fault _ =>
+          rw [hEv] at hSt
+          exact False.elim hSt
+
 /-- Move a stage from `BlockTree`-backed block lookup to list-backed lookup:
 a stage of a block-indexed step function evaluated over
 `BlockTree.ofList blocks` is a stage of the same step function over
@@ -351,6 +430,18 @@ theorem stageCut_of_blockTree {BB : Type x} (blocks : List BB)
       s₀ s₁) :
     StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
   (StepStageCut.congr_step (stepWith_blockTree_eq stepWith blocks)).mp hCut
+
+/-- `0 Quot.sound` pointwise form of `stageCut_of_blockTree`. -/
+theorem stageCut_of_blockTree_of_pointwise {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {fuel : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut (stepWith (BlockTree.ofList blocks).lookup?) fuel
+      s₀ s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (stepWith_blockTree_eq_of_pointwise stepWith hPointwise blocks)).mp hCut
 
 /-- Move a stage from `Chunk8BlockTree`-backed block lookup to list-backed
 lookup. -/
@@ -374,6 +465,32 @@ theorem stageCut_of_blockTree_forced {BB : Type x} (blocks : List BB)
     StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
   (StepStageCut.congr_step
     (stepWith_blockTree_forced_eq stepWith blocks)).mp hCut
+
+/-- `0 Quot.sound` pointwise form of `stageCut_of_blockTree_forced`. -/
+theorem stageCut_of_blockTree_forced_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {fuel : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut (stepWith (BlockTree.ofList blocks).lookupForced?)
+      fuel s₀ s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (fun st => hPointwise _ _ st (fun i =>
+      ((BlockTree.ofList blocks).lookupForced?_eq i).trans
+        (BlockTree.ofList_lookup_eq blocks i)))).mp hCut
+
+/-- Move a stage from the index-forcing `Chunk8BlockTree` lookup to
+list-backed lookup. -/
+theorem stageCut_of_chunk8BlockTree_forced {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {fuel : Nat} {s₀ s₁ : S}
+    (hCut : StepStageCut
+      (stepWith (Chunk8BlockTree.ofList blocks).lookupForced?) fuel s₀ s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  (StepStageCut.congr_step
+    (stepWith_chunk8BlockTree_forced_eq stepWith blocks)).mp hCut
 
 /-- Stage cut of a block-indexed step function evaluated over
 `BlockTree.ofList blocks` with the index-forcing lookup, so each `.step` of
@@ -428,6 +545,67 @@ theorem stageCut_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
     StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
   stageCut_of_blockTree_forced blocks stepWith
     (stepStageCut_of_runToCut_cut h)
+
+/-- `0 Quot.sound` pointwise form of `stageCut_of_evalBlockTreeToCut`. -/
+theorem stageCut_of_evalBlockTreeToCut_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeToCut (BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  stageCut_of_blockTree_forced_of_pointwise blocks stepWith hPointwise
+    (stepStageCut_of_runToCut_cut h)
+
+/-- Evaluate a stage starting at a cutpoint on `BlockTree.ofList blocks` via
+`evalBlockTreeFromCut` and lift it directly to the list-backed step function
+at budget `fuel + 1`. -/
+theorem stageCut_of_evalBlockTreeFromCut {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut (BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  stageCut_of_blockTree_forced blocks stepWith
+    (stepStageCut_of_runFromCut_cut h)
+
+/-- `0 Quot.sound` pointwise form of `stageCut_of_evalBlockTreeFromCut`. -/
+theorem stageCut_of_evalBlockTreeFromCut_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeFromCut (BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  stageCut_of_blockTree_forced_of_pointwise blocks stepWith hPointwise
+    (stepStageCut_of_runFromCut_cut h)
+
+/-- Evaluate a stage on `Chunk8BlockTree.ofList blocks` and obtain it for the
+list-backed step function. -/
+theorem stageCut_of_evalChunk8BlockTreeToCut {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  stageCut_of_chunk8BlockTree_forced blocks stepWith
+    (stepStageCut_of_runToCut_cut h)
+
+/-- Evaluate a stage starting at a cutpoint on `Chunk8BlockTree.ofList blocks`
+and obtain it for the list-backed step function at budget `fuel + 1`. -/
+theorem stageCut_of_evalChunk8BlockTreeFromCut {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  stageCut_of_chunk8BlockTree_forced blocks stepWith
+    (stepStageCut_of_runFromCut_cut h)
 
 /-- Bridge a `BlockTree`-evaluated stage directly into a checkpoint proof of
 the list-backed deterministic interface. -/
@@ -563,16 +741,14 @@ theorem boolCertCut_roundtrip_canary (a b c d : Nat)
 
 namespace MirWpOps
 
-variable {State : Type u}
+variable {State : Type u} {Out : Type v} {Fault : Type w}
 
 /-- Restriction of a step interface to a region `A`: a step is only allowed
 from a state in `A`. A checkpoint proof over `ops.within A` is a checkpoint
 proof over `ops` all of whose stepped states lie in `A`, which is the shape a
 frame rule for one stage needs. -/
-@[reducible] def within (ops : MirWpOps.{u, v, w} State) (A : State → Prop) :
-    MirWpOps.{u, v, w} State where
-  Out := ops.Out
-  Fault := ops.Fault
+@[reducible] def within (ops : MirWpOps State Out Fault) (A : State → Prop) :
+    MirWpOps State Out Fault where
   stepWp s onStep onDone onFault := A s ∧ ops.stepWp s onStep onDone onFault
   stepWp_mono := fun hP hQ hR h => ⟨h.1, ops.stepWp_mono hP hQ hR h.2⟩
   blockTag? := ops.blockTag?
@@ -580,25 +756,25 @@ frame rule for one stage needs. -/
 /-- `F` is preserved by every step that `ops` takes from a state in the region
 `A`: a step from an `A` state that satisfies `F` leads only to states that
 satisfy `F`. -/
-def StepFrameOn (ops : MirWpOps.{u, v, w} State) (A F : State → Prop) :
+def StepFrameOn (ops : MirWpOps State Out Fault) (A F : State → Prop) :
     Prop :=
-  ∀ (s : State) (K : State → Prop) (Q : ops.Out → Prop)
-    (R : ops.Fault → Prop),
+  ∀ (s : State) (K : State → Prop) (Q : Out → Prop)
+    (R : Fault → Prop),
     A s → F s → ops.stepWp s K Q R →
     ops.stepWp s (fun s' => K s' ∧ F s') Q R
 
 /-- `F` is preserved by every step of `ops`. -/
-def StepFrame (ops : MirWpOps.{u, v, w} State) (F : State → Prop) : Prop :=
+def StepFrame (ops : MirWpOps State Out Fault) (F : State → Prop) : Prop :=
   ops.StepFrameOn (fun _ => True) F
 
 /-- A frame on a region is a frame on every smaller region. -/
-theorem StepFrameOn.mono_region {ops : MirWpOps.{u, v, w} State}
+theorem StepFrameOn.mono_region {ops : MirWpOps State Out Fault}
     {A A' F : State → Prop} (h : ops.StepFrameOn A F)
     (hSub : ∀ s, A' s → A s) : ops.StepFrameOn A' F :=
   fun s K Q R hA hF hStep => h s K Q R (hSub s hA) hF hStep
 
 /-- Frames on the same region combine. -/
-theorem StepFrameOn.and {ops : MirWpOps.{u, v, w} State}
+theorem StepFrameOn.and {ops : MirWpOps State Out Fault}
     {A F₁ F₂ : State → Prop} (h₁ : ops.StepFrameOn A F₁)
     (h₂ : ops.StepFrameOn A F₂) :
     ops.StepFrameOn A (fun s => F₁ s ∧ F₂ s) := by
@@ -610,7 +786,7 @@ theorem StepFrameOn.and {ops : MirWpOps.{u, v, w} State}
 
 /-- Frame of a deterministic interface: it suffices that every `.step`
 transition from a region state preserves `F`. -/
-theorem stepFrameOn_ofDetStep {Out : Type v} {Fault : Type w}
+theorem stepFrameOn_ofDetStep
     {step : State → StepOutcome State Out Fault} {tag : State → Option Nat}
     {A F : State → Prop}
     (hFrame : ∀ s s', A s → F s → step s = .step s' → F s') :
@@ -631,7 +807,7 @@ theorem stepFrameOn_ofDetStep {Out : Type v} {Fault : Type w}
 
 /-- Projection frame of a deterministic interface: if no `.step` transition
 from a region state changes `proj`, then `proj s = v` is framed. -/
-theorem stepFrameOn_ofDetStep_proj {Out : Type v} {Fault : Type w}
+theorem stepFrameOn_ofDetStep_proj
     {step : State → StepOutcome State Out Fault} {tag : State → Option Nat}
     {A : State → Prop} {V : Sort x} {proj : State → V}
     (hFrame : ∀ s s', A s → step s = .step s' → proj s' = proj s) (v : V) :
@@ -643,11 +819,12 @@ end MirWpOps
 
 section Within
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- Forget the region: a checkpoint proof within `A` is a checkpoint proof. -/
 theorem wpUntil_of_within {A : State → Prop} {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpUntil (ops := ops.within A) stop onDone onFault s) :
     wpUntil (ops := ops) stop onDone onFault s := by
   induction h with
@@ -656,8 +833,8 @@ theorem wpUntil_of_within {A : State → Prop} {stop : State → Prop}
 
 /-- A checkpoint proof is within any region that contains every state. -/
 theorem wpUntil_within_of_forall {A : State → Prop} (hA : ∀ s, A s)
-    {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : wpUntil (ops := ops) stop onDone onFault s) :
     wpUntil (ops := ops.within A) stop onDone onFault s := by
   induction h with
@@ -667,8 +844,8 @@ theorem wpUntil_within_of_forall {A : State → Prop} (hA : ∀ s, A s)
 
 /-- Enlarge the region of a checkpoint proof. -/
 theorem wpUntil_within_mono {A A' : State → Prop} (hSub : ∀ s, A s → A' s)
-    {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : wpUntil (ops := ops.within A) stop onDone onFault s) :
     wpUntil (ops := ops.within A') stop onDone onFault s := by
   induction h with
@@ -677,27 +854,39 @@ theorem wpUntil_within_mono {A A' : State → Prop} (hSub : ∀ s, A s → A' s)
     exact wpUntil.step (ops := ops.within A') mid
       ⟨hSub _ hStep.1, hStep.2⟩ ih
 
+/-- Region-preserving frame rule for checkpoints: carries `F` from entry to
+checkpoint while retaining `ops.within A`, so multiple frames can be stacked
+and composed inside `A` before forgetting the region. -/
+theorem wpUntil_frame_within_keep {A F : State → Prop}
+    (hFrame : ops.StepFrameOn A F)
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} (hF : F s)
+    (h : wpUntil (ops := ops.within A) stop onDone onFault s) :
+    wpUntil (ops := ops.within A) (fun s' => stop s' ∧ F s') onDone onFault
+      s := by
+  induction h with
+  | here hs => exact wpUntil.here (ops := ops.within A) ⟨hs, hF⟩
+  | step mid hStep _ ih =>
+    exact wpUntil.step (ops := ops.within A) (fun s' => mid s' ∧ F s')
+      ⟨hStep.1, hFrame _ mid onDone onFault hStep.1 hF hStep.2⟩
+      (fun s' hs' => ih s' hs'.1 hs'.2)
+
 /-- Frame rule for checkpoints: a checkpoint proof within the region `A`
 carries every `A`-frame `F` from its start to its checkpoint. `F` is
 established once at the start and never re-proved, however the execution
 branches and joins in between. -/
 theorem wpUntil_frame_within {A F : State → Prop}
     (hFrame : ops.StepFrameOn A F)
-    {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} (hF : F s)
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} (hF : F s)
     (h : wpUntil (ops := ops.within A) stop onDone onFault s) :
-    wpUntil (ops := ops) (fun s' => stop s' ∧ F s') onDone onFault s := by
-  induction h with
-  | here hs => exact wpUntil.here (ops := ops) ⟨hs, hF⟩
-  | step mid hStep _ ih =>
-    exact wpUntil.step (ops := ops) (fun s' => mid s' ∧ F s')
-      (hFrame _ mid onDone onFault hStep.1 hF hStep.2)
-      (fun s' hs' => ih s' hs'.1 hs'.2)
+    wpUntil (ops := ops) (fun s' => stop s' ∧ F s') onDone onFault s :=
+  wpUntil_of_within (wpUntil_frame_within_keep hFrame hF h)
 
 /-- Frame rule for checkpoints and a global step invariant. -/
 theorem wpUntil_frame {F : State → Prop} (hFrame : ops.StepFrame F)
-    {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} (hF : F s)
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} (hF : F s)
     (h : wpUntil (ops := ops) stop onDone onFault s) :
     wpUntil (ops := ops) (fun s' => stop s' ∧ F s') onDone onFault s :=
   wpUntil_frame_within hFrame hF
@@ -790,6 +979,30 @@ theorem wpReach_within_of_runToCut {region : S → Bool}
     (ops := (MirWpOps.ofDetStep step tag).within (fun s => region s = true))
     (wpUntilFuel_within_of_runToCut h)
 
+/-- `BlockTree`-accelerated region-guarded cut evaluation lifted directly into
+`wpReach` over `(MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within`,
+so stages evaluated by `rfl` through `BlockTree.ofList blocks` can be framed
+directly with `stageCut_frame` without falling back to list lookup. -/
+theorem wpReach_within_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalBlockTreeToCut (BlockTree.ofList blocks)
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hList :
+      runToCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalBlockTreeToCut_ofList_eq blocks
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀]
+    exact h
+  exact wpReach_within_of_runToCut hList
+
 end GuardedRun
 
 /-! ## Part IV: Fuel-Free Stage Cuts over `MirWpOps` (`StageCut`) -/
@@ -799,53 +1012,56 @@ end GuardedRun
 terminates with an outcome satisfying `onDone` or faults with an error
 satisfying `onFault`.
 
-All four arguments are predicates over machine data; none is a proposition.
-`StageCut` is sealed `@[irreducible]` after its laws, so the `wpUntil`
-derivation of a stage, with all its intermediate states, never appears in a
-goal that only composes stages. -/
-def StageCut {State : Type u} [ops : MirWpOps.{u, v, w} State]
-    (entry cut : State → Prop) (onDone : ops.Out → Prop)
-    (onFault : ops.Fault → Prop) : Prop :=
+`StageCut` carries the entry/cut/outcome/fault predicate interface and seals
+the underlying `wpUntil` derivation (and all intermediate symbolic states)
+behind `@[irreducible]`; when a completely data-only barrier with zero `Prop`
+or predicate arguments is required, use `StepStageCut`, `BoolCertCut`, or
+`DetStageCut`. -/
+def StageCut {State : Type u} {Out : Type v} {Fault : Type w}
+    [ops : MirWpOps State Out Fault]
+    (entry cut : State → Prop) (onDone : Out → Prop)
+    (onFault : Fault → Prop) : Prop :=
   ∀ s, entry s → wpUntil cut onDone onFault s
 
 section StageCutLaws
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- Seal a family of checkpoint proofs as a `StageCut`. -/
-theorem StageCut.intro {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+theorem StageCut.intro {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (h : ∀ s, entry s → wpUntil cut onDone onFault s) :
     StageCut entry cut onDone onFault :=
   h
 
 /-- Unseal a `StageCut` at an entry state. -/
-theorem StageCut.elim {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} (h : StageCut entry cut onDone onFault)
+theorem StageCut.elim {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} (h : StageCut entry cut onDone onFault)
     {s : State} (hs : entry s) : wpUntil cut onDone onFault s :=
   h s hs
 
 /-- A stage whose entry states are already cutpoint states. -/
-theorem stageCut_of_imp {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} (hImp : ∀ s, entry s → cut s) :
+theorem stageCut_of_imp {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} (hImp : ∀ s, entry s → cut s) :
     StageCut entry cut onDone onFault :=
   fun s hs => .here (hImp s hs)
 
 /-- Reflexivity: the empty stage from a predicate to itself. -/
-theorem stageCut_refl (entry : State → Prop) (onDone : ops.Out → Prop)
-    (onFault : ops.Fault → Prop) : StageCut entry entry onDone onFault :=
+theorem stageCut_refl (entry : State → Prop) (onDone : Out → Prop)
+    (onFault : Fault → Prop) : StageCut entry entry onDone onFault :=
   stageCut_of_imp (fun _ hs => hs)
 
 /-- A single step is a stage. -/
-theorem stageCut_step {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+theorem stageCut_step {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (hStep : ∀ s, entry s → ops.stepWp s cut onDone onFault) :
     StageCut entry cut onDone onFault :=
   fun s hs => .step cut (hStep s hs) (fun _ h' => .here h')
 
 /-- Prepend a single step onto a stage. -/
 theorem stageCut_step_compose {entry mid cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ s, entry s → ops.stepWp s mid onDone onFault)
     (hRest : StageCut mid cut onDone onFault) :
     StageCut entry cut onDone onFault :=
@@ -856,7 +1072,7 @@ and a stage from `mid` to `cut` give a stage from `entry` to `cut`. There is
 no budget to add, and the first stage may reach `mid` along any number of
 branches. -/
 theorem stageCut_compose {entry mid cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (h₁ : StageCut entry mid onDone onFault)
     (h₂ : StageCut mid cut onDone onFault) :
     StageCut entry cut onDone onFault :=
@@ -865,7 +1081,7 @@ theorem stageCut_compose {entry mid cut : State → Prop}
 /-- Rule of consequence for stages: strengthen the entry predicate and weaken
 the cutpoint, terminal and fault predicates. -/
 theorem stageCut_weaken {entry entry' cut cut' : State → Prop}
-    {onDone onDone' : ops.Out → Prop} {onFault onFault' : ops.Fault → Prop}
+    {onDone onDone' : Out → Prop} {onFault onFault' : Fault → Prop}
     (hEntry : ∀ s, entry' s → entry s) (hCut : ∀ s, cut s → cut' s)
     (hDone : ∀ o, onDone o → onDone' o)
     (hFault : ∀ f, onFault f → onFault' f)
@@ -876,7 +1092,7 @@ theorem stageCut_weaken {entry entry' cut cut' : State → Prop}
 /-- Diamond join: stages from two entry predicates to the same cutpoint give a
 stage from their disjunction. -/
 theorem stageCut_join {entry₁ entry₂ cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (h₁ : StageCut entry₁ cut onDone onFault)
     (h₂ : StageCut entry₂ cut onDone onFault) :
     StageCut (fun s => entry₁ s ∨ entry₂ s) cut onDone onFault := by
@@ -888,7 +1104,7 @@ theorem stageCut_join {entry₁ entry₂ cut : State → Prop}
 /-- Case split at a stage entry: if every entry state satisfies one of two
 predicates and each has a stage to the cutpoint, so does the entry. -/
 theorem stageCut_cases {entry entry₁ entry₂ cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hSplit : ∀ s, entry s → entry₁ s ∨ entry₂ s)
     (h₁ : StageCut entry₁ cut onDone onFault)
     (h₂ : StageCut entry₂ cut onDone onFault) :
@@ -900,8 +1116,8 @@ theorem stageCut_cases {entry entry₁ entry₂ cut : State → Prop}
 their union. This carries ghost values (for example the value of a variable
 that the stage does not touch) across the stage. -/
 theorem stageCut_exists {ι : Sort x} {entry : ι → State → Prop}
-    {cut : ι → State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {cut : ι → State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (h : ∀ i, StageCut (entry i) (cut i) onDone onFault) :
     StageCut (fun s => ∃ i, entry i s) (fun s => ∃ i, cut i s) onDone
       onFault := by
@@ -909,13 +1125,25 @@ theorem stageCut_exists {ι : Sort x} {entry : ι → State → Prop}
   let ⟨i, hi⟩ := hs
   exact wpUntil_mono_stop (fun _ hc => ⟨i, hc⟩) (h i s hi)
 
+/-- Region-preserving frame rule for stages: frames `F` across a stage while
+retaining `ops.within A`, so additional frames or stages inside `A` can be
+composed before dropping `within A`. -/
+theorem stageCut_frame_within {A F : State → Prop}
+    (hFrame : ops.StepFrameOn A F)
+    {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
+    (h : StageCut (ops := ops.within A) entry cut onDone onFault) :
+    StageCut (ops := ops.within A) (fun s => entry s ∧ F s)
+      (fun s => cut s ∧ F s) onDone onFault :=
+  fun s hs => wpUntil_frame_within_keep hFrame hs.2 (h s hs.1)
+
 /-- Frame rule for stages: a stage within the region `A` carries every
 `A`-frame `F` from the stage entry to the stage cutpoint, so `P ∧ F` at entry
 becomes `Q ∧ F` at the cutpoint without re-proving `F` along the branches and
 joins of the stage. -/
 theorem stageCut_frame {A F : State → Prop} (hFrame : ops.StepFrameOn A F)
-    {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (h : StageCut (ops := ops.within A) entry cut onDone onFault) :
     StageCut (ops := ops) (fun s => entry s ∧ F s) (fun s => cut s ∧ F s)
       onDone onFault :=
@@ -923,8 +1151,8 @@ theorem stageCut_frame {A F : State → Prop} (hFrame : ops.StepFrameOn A F)
 
 /-- Frame rule for stages and a global step invariant. -/
 theorem stageCut_frame_global {F : State → Prop} (hFrame : ops.StepFrame F)
-    {entry cut : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {entry cut : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (h : StageCut (ops := ops) entry cut onDone onFault) :
     StageCut (ops := ops) (fun s => entry s ∧ F s) (fun s => cut s ∧ F s)
       onDone onFault :=
@@ -932,7 +1160,7 @@ theorem stageCut_frame_global {F : State → Prop} (hFrame : ops.StepFrame F)
 
 /-- Forget the region of a stage. -/
 theorem stageCut_of_within {A : State → Prop} {entry cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (h : StageCut (ops := ops.within A) entry cut onDone onFault) :
     StageCut (ops := ops) entry cut onDone onFault :=
   fun s hs => wpUntil_of_within (h s hs)
@@ -940,7 +1168,7 @@ theorem stageCut_of_within {A : State → Prop} {entry cut : State → Prop}
 /-- Hand a stage over to a whole-execution proof: if every cutpoint state
 terminates as required, so does every entry state. -/
 theorem stageCut_to_wpOutcome {entry cut : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (h : StageCut entry cut onDone onFault)
     (hK : ∀ s, cut s → wpOutcome onDone onFault s)
     {s : State} (hs : entry s) : wpOutcome onDone onFault s :=
@@ -951,7 +1179,7 @@ theorem stageCut_to_wpOutcome {entry cut : State → Prop}
 `Inv a` to `exit`. -/
 theorem stageCut_loop {α : Sort x} {r : α → α → Prop} (hWf : WellFounded r)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hIter : ∀ a, StageCut (Inv a)
       (fun s' => exit s' ∨ ∃ a', r a' a ∧ Inv a' s') onDone onFault)
     (a : α) : StageCut (Inv a) exit onDone onFault :=
@@ -1066,6 +1294,40 @@ theorem detStageCut_iff_wpReach {step : S → StepOutcome S Out Fault}
       (wpUntil_det_iff_exists_fuel (step := step) (tag := tag)).mp h
     exact ⟨fuel, stepStageCut_iff_wpUntilFuel.mpr hFuel⟩
 
+/-- Fuel-free constructive equivalence between predicate-level deterministic
+reachability and existential `DetStageCut` reachability. -/
+theorem wpReach_det_iff_exists_detStageCut
+    {step : S → StepOutcome S Out Fault} {tag : S → Option Nat}
+    {cut : S → Prop} {s₀ : S} :
+    wpReach (ops := MirWpOps.ofDetStep step tag) cut s₀ ↔
+      ∃ s₁ : S, DetStageCut step s₀ s₁ ∧ cut s₁ := by
+  constructor
+  · intro h
+    let ⟨fuel, hFuel⟩ :=
+      (wpUntil_det_iff_exists_fuel (step := step) (tag := tag)).mp h
+    let ⟨s₁, hCut, hC⟩ :=
+      (wpUntilFuel_det_iff_exists_stepStageCut (tag := tag)).mp hFuel
+    exact ⟨s₁, ⟨fuel, hCut⟩, hC⟩
+  · intro h
+    let ⟨s₁, ⟨fuel, hCut⟩, hC⟩ := h
+    exact StepStageCut.to_wpUntil_here hCut hC
+
+/-- Stage frame for a fuel-free `DetStageCut`. -/
+theorem DetStageCut.frame {step : S → StepOutcome S Out Fault}
+    {F : S → Prop}
+    (hFrame : ∀ s s', F s → step s = .step s' → F s')
+    {s₀ s₁ : S} (hCut : DetStageCut step s₀ s₁) (hF : F s₀) : F s₁ := by
+  let ⟨_, h'⟩ := hCut
+  exact StepStageCut.frame hFrame h' hF
+
+/-- Projection frame for a fuel-free `DetStageCut`. -/
+theorem DetStageCut.frame_proj {step : S → StepOutcome S Out Fault}
+    {V : Sort x} {proj : S → V}
+    (hFrame : ∀ s s', step s = .step s' → proj s' = proj s)
+    {s₀ s₁ : S} (hCut : DetStageCut step s₀ s₁) : proj s₁ = proj s₀ := by
+  let ⟨_, h'⟩ := hCut
+  exact StepStageCut.frame_proj hFrame h'
+
 /-- Prepend a `DetStageCut` prefix onto a fuel-free checkpoint proof. -/
 theorem DetStageCut.to_wpUntil {step : S → StepOutcome S Out Fault}
     {tag : S → Option Nat} {s₀ s₁ : S} {stop : S → Prop}
@@ -1113,28 +1375,29 @@ attribute [irreducible] DetStageCut
 
 section Liberal
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- Fuel-free weakest liberal precondition of a whole execution: every
 terminating path satisfies `onDone` and every faulting path satisfies
 `onFault`, while divergence is allowed. It is the greatest predicate closed
 under one step, given by an invariant `I` that holds at `s` and is preserved
 by `stepWp`. -/
-def wlpOutcome (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
+def wlpOutcome (onDone : Out → Prop) (onFault : Fault → Prop)
     (s : State) : Prop :=
   ∃ I : State → Prop, I s ∧ ∀ s', I s' → ops.stepWp s' I onDone onFault
 
 /-- Coinduction principle for `wlpOutcome`: any step-closed invariant is
 contained in it. -/
-theorem wlpOutcome_of_invariant {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} (I : State → Prop)
+theorem wlpOutcome_of_invariant {onDone : Out → Prop}
+    {onFault : Fault → Prop} (I : State → Prop)
     (hClosed : ∀ s', I s' → ops.stepWp s' I onDone onFault)
     {s : State} (hs : I s) : wlpOutcome onDone onFault s :=
   ⟨I, hs, hClosed⟩
 
 /-- Unfold `wlpOutcome` by one step. -/
-theorem wlpOutcome_unfold_iff {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wlpOutcome_unfold_iff {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wlpOutcome onDone onFault s ↔
       ops.stepWp s (wlpOutcome onDone onFault) onDone onFault := by
   have hFwd : ∀ t, wlpOutcome onDone onFault t →
@@ -1152,8 +1415,8 @@ theorem wlpOutcome_unfold_iff {onDone : ops.Out → Prop}
     exact ops.stepWp_mono hFwd (fun _ hq => hq) (fun _ hr => hr) hs'
 
 /-- Rule of consequence for `wlpOutcome`. -/
-theorem wlpOutcome_mono {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+theorem wlpOutcome_mono {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
     {s : State} (h : wlpOutcome onDone₁ onFault₁ s) :
@@ -1163,8 +1426,8 @@ theorem wlpOutcome_mono {onDone₁ onDone₂ : ops.Out → Prop}
     ops.stepWp_mono (fun _ hi => hi) hDone hFault (hClosed s' hs')⟩
 
 /-- Total correctness implies partial correctness. -/
-theorem wlpOutcome_of_wpOutcome {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+theorem wlpOutcome_of_wpOutcome {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : wpOutcome onDone onFault s) : wlpOutcome onDone onFault s :=
   ⟨wpOutcome onDone onFault, h, fun _ hs' => wpOutcome_unfold_iff.mp hs'⟩
 
@@ -1172,8 +1435,8 @@ theorem wlpOutcome_of_wpOutcome {onDone : ops.Out → Prop}
 with partial functional correctness (`wlpOutcome`) give conjunctive total
 correctness, without re-proving termination or fault absence. -/
 theorem wpOutcome_conj_of_wlp (hConj : ops.Conjunctive)
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop} {s : State}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop} {s : State}
     (hSafe : wpOutcome onDone₁ onFault₁ s)
     (hWlp : wlpOutcome onDone₂ onFault₂ s) :
     wpOutcome (fun o => onDone₁ o ∧ onDone₂ o)
@@ -1188,7 +1451,7 @@ theorem wpOutcome_conj_of_wlp (hConj : ops.Conjunctive)
 /-- Two-pass combination: a fault-free termination proof with an arbitrary
 outcome and a liberal proof of `post` give a fault-free proof of `post`. -/
 theorem wpStateOk_of_wlp_and_safety (hConj : ops.Conjunctive)
-    {post : ops.Out → Prop} {s : State}
+    {post : Out → Prop} {s : State}
     (hSafe : wpStateOk (ops := ops) (fun _ => True) s)
     (hWlp : wlpOutcome post (fun _ => True) s) :
     wpStateOk post s :=
@@ -1198,7 +1461,7 @@ theorem wpStateOk_of_wlp_and_safety (hConj : ops.Conjunctive)
 /-- Fuel-bounded weakest liberal precondition: running out of fuel is
 accepted, while every path that terminates or faults within `fuel` steps must
 satisfy `onDone` or `onFault`. -/
-def wlpOutcomeFuel (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
+def wlpOutcomeFuel (onDone : Out → Prop) (onFault : Fault → Prop)
     (fuel : Nat) (s : State) : Prop :=
   @Nat.rec (fun _ => State → Prop)
     (fun _ => True)
@@ -1206,15 +1469,15 @@ def wlpOutcomeFuel (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
     fuel s
 
 /-- Unfold `wlpOutcomeFuel` at fuel `fuel + 1`. -/
-theorem wlpOutcomeFuel_succ_iff {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State} :
+theorem wlpOutcomeFuel_succ_iff {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State} :
     wlpOutcomeFuel onDone onFault (fuel + 1) s ↔
       ops.stepWp s (wlpOutcomeFuel onDone onFault fuel) onDone onFault :=
   Iff.rfl
 
 /-- A fuel-free liberal proof is a liberal proof at every budget. -/
-theorem wlpOutcomeFuel_of_wlpOutcome {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+theorem wlpOutcomeFuel_of_wlpOutcome {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : wlpOutcome onDone onFault s) (fuel : Nat) :
     wlpOutcomeFuel onDone onFault fuel s := by
   induction fuel generalizing s with
@@ -1226,8 +1489,8 @@ theorem wlpOutcomeFuel_of_wlpOutcome {onDone : ops.Out → Prop}
 
 /-- Fuel-bounded conjunctive split at a common budget. -/
 theorem wpOutcomeFuel_conj_of_wlpFuel (hConj : ops.Conjunctive)
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop} {fuel : Nat} {s : State}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop} {fuel : Nat} {s : State}
     (hSafe : wpOutcomeFuel onDone₁ onFault₁ fuel s)
     (hWlp : wlpOutcomeFuel onDone₂ onFault₂ fuel s) :
     wpOutcomeFuel (fun o => onDone₁ o ∧ onDone₂ o)
@@ -1302,7 +1565,7 @@ abbrev diamondStep : DiamondState → StepOutcome DiamondState Nat Unit :=
   diamondStepWith (listGet? diamondBlocks)
 
 /-- List-backed deterministic interface of the diamond program. -/
-@[reducible] def diamondOps : MirWpOps DiamondState :=
+@[reducible] def diamondOps : MirWpOps DiamondState Nat Unit :=
   MirWpOps.ofDetStep diamondStep (fun s => some s.block)
 
 /-- Cutpoint blocks of the diamond program: the join block `3` and the return
@@ -1325,23 +1588,21 @@ theorem diamond_stage1_pos (n y z : Nat) :
   stageCut_of_evalBlockTreeToCut diamondBlocks diamondStepWith
     (blockOf := fun s => s.block) (cuts := diamondCuts) rfl
 
-/-- Stage 2, zero arm: from the join block to the return block. The entry
-block is itself a cutpoint, so the stage is evaluated after one mandatory
-step. -/
+/-- Stage 2, zero arm: from the join block to the return block, evaluated
+directly through `evalBlockTreeFromCut` by `rfl`. -/
 theorem diamond_stage2_zero (y z : Nat) :
     StepStageCut diamondStep 3 { block := 3, x := 0, y := y, z := z }
       { block := 6, x := 0, y := y, z := z + y } :=
-  StepStageCut.step (s₁ := { block := 4, x := 0, y := y, z := z }) rfl
-    (stageCut_of_evalBlockTreeToCut diamondBlocks diamondStepWith
-      (blockOf := fun s => s.block) (cuts := diamondCuts) rfl)
+  stageCut_of_evalBlockTreeFromCut diamondBlocks diamondStepWith
+    (blockOf := fun s => s.block) (cuts := diamondCuts) (fuel := 2) rfl
 
-/-- Stage 2, positive arm. -/
+/-- Stage 2, positive arm, evaluated directly through `evalBlockTreeFromCut`
+by `rfl`. -/
 theorem diamond_stage2_pos (n y z : Nat) :
     StepStageCut diamondStep 3 { block := 3, x := n + 1, y := y, z := z }
       { block := 6, x := n + 1, y := 1, z := z + 1 } :=
-  StepStageCut.step (s₁ := { block := 5, x := n + 1, y := y, z := z }) rfl
-    (stageCut_of_evalBlockTreeToCut diamondBlocks diamondStepWith
-      (blockOf := fun s => s.block) (cuts := diamondCuts) rfl)
+  stageCut_of_evalBlockTreeFromCut diamondBlocks diamondStepWith
+    (blockOf := fun s => s.block) (cuts := diamondCuts) (fuel := 2) rfl
 
 /-- Amount the diamond program adds to `z`. -/
 def diamondDelta (x : Nat) : Nat :=
@@ -1405,9 +1666,9 @@ theorem diamond_stage2 (x z₀ : Nat) :
       exact StepStageCut.to_wpUntil_here (diamond_stage2_pos n y z)
         ⟨rfl, rfl⟩
 
-/-- Stage 1 stays inside blocks `0`, `1` and `2`: evaluated with the
-region-guarded step function, both arms reach the join block without leaving
-the region. -/
+/-- Stage 1 stays inside blocks `0`, `1` and `2`: evaluated through the
+`BlockTree` with the region-guarded step function, both arms reach the join
+block without leaving the region. -/
 theorem diamond_stage1_within (x : Nat) :
     StageCut
       (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true))
@@ -1427,9 +1688,10 @@ theorem diamond_stage1_within (x : Nat) :
     | zero =>
       refine wpUntil_mono_stop
         (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true)) ?_
-        (wpReach_within_of_runToCut (region := fun s => Nat.blt s.block 3)
-          (step := diamondStep) (tag := fun s => some s.block)
-          (isCut := fun s => Nat.beq s.block 3) (fuel := 2)
+        (wpReach_within_of_evalBlockTreeToCut diamondBlocks diamondStepWith
+          (region := fun s => Nat.blt s.block 3)
+          (tag := fun s => some s.block) (blockOf := fun s => s.block)
+          (cuts := diamondCuts) (fuel := 2)
           (s₁ := { block := 3, x := 0, y := 10, z := z }) rfl)
       intro s' hs'
       have hEq : s' = { block := 3, x := 0, y := 10, z := z } := hs'
@@ -1438,9 +1700,10 @@ theorem diamond_stage1_within (x : Nat) :
     | succ n =>
       refine wpUntil_mono_stop
         (ops := diamondOps.within (fun s => Nat.blt s.block 3 = true)) ?_
-        (wpReach_within_of_runToCut (region := fun s => Nat.blt s.block 3)
-          (step := diamondStep) (tag := fun s => some s.block)
-          (isCut := fun s => Nat.beq s.block 3) (fuel := 2)
+        (wpReach_within_of_evalBlockTreeToCut diamondBlocks diamondStepWith
+          (region := fun s => Nat.blt s.block 3)
+          (tag := fun s => some s.block) (blockOf := fun s => s.block)
+          (cuts := diamondCuts) (fuel := 2)
           (s₁ := { block := 3, x := n + 1, y := 20, z := z }) rfl)
       intro s' hs'
       have hEq : s' = { block := 3, x := n + 1, y := 20, z := z } := hs'

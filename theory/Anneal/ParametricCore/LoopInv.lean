@@ -14,7 +14,7 @@ import Init.Data.List.Basic
 import Init.Data.Option.Basic
 import Init.WF
 
-universe u v w x
+universe u v w x y z
 
 namespace Anneal.ParametricCore
 
@@ -176,15 +176,14 @@ The only law is monotonicity, so the interface covers deterministic step
 functions, `valid`-quantified nondeterministic ones, and coalgebraic steps
 whose effects are interpreted by an effect weakest precondition.
 
-`Out` and `Fault` are bundled so a statement names them as `ops.Out` and
-`ops.Fault`. `blockTag?` optionally exposes the basic block a state is at, for
+`Out` and `Fault` are `outParam` class parameters, so typeclass resolution
+synthesizes them as concrete types (allowing dot-notation on outcome
+constructors and arithmetic/pattern matching without type-spelled wrappers).
+`blockTag?` optionally exposes the basic block a state is at, for
 loop-header and stage cutpoints; it defaults to `none` for machines without a
 control-flow graph. -/
-class MirWpOps (State : Type u) where
-  /-- Terminal outcomes of the machine. -/
-  Out : Type v
-  /-- Fault kinds of the machine. -/
-  Fault : Type w
+class MirWpOps (State : Type u) (Out : outParam (Type v))
+    (Fault : outParam (Type w)) where
   /-- Single-step weakest precondition. -/
   stepWp : State → (State → Prop) → (Out → Prop) → (Fault → Prop) → Prop
   /-- `stepWp` is monotone in the continuation, terminal and fault
@@ -203,9 +202,7 @@ namespace MirWpOps
 @[reducible] def ofDetStep {State : Type u} {Out : Type v} {Fault : Type w}
     (step : State → StepOutcome State Out Fault)
     (blockTag? : State → Option Nat := fun _ => none) :
-    MirWpOps.{u, v, w} State where
-  Out := Out
-  Fault := Fault
+    MirWpOps State Out Fault where
   stepWp s onStep onDone onFault := (step s).wp onStep onDone onFault
   stepWp_mono := fun hP hQ hR h => StepOutcome.wp_mono hP hQ hR h
   blockTag? := blockTag?
@@ -218,9 +215,7 @@ the `ValidChoice`-quantified shape of `#4059`. -/
     {Fault : Type w} (Choice : Type x) (valid : State → Choice → Prop)
     (step : Choice → State → StepOutcome State Out Fault)
     (blockTag? : State → Option Nat := fun _ => none) :
-    MirWpOps.{u, v, w} State where
-  Out := Out
-  Fault := Fault
+    MirWpOps State Out Fault where
   stepWp s onStep onDone onFault :=
     (∃ c₀ : Choice, valid s c₀) ∧
       ∀ c : Choice, valid s c → (step c s).wp onStep onDone onFault
@@ -294,20 +289,20 @@ theorem stepWp_detChoice_iff {Choice : Type x}
 
 end Constructors
 
-variable {State : Type u}
+variable {State : Type u} {Out : Type v} {Fault : Type w}
 
 /-- States whose basic-block tag is `tag`. -/
-def atBlock (ops : MirWpOps.{u, v, w} State) (tag : Nat) (s : State) :
+def atBlock (ops : MirWpOps State Out Fault) (tag : Nat) (s : State) :
     Prop :=
   ops.blockTag? s = some tag
 
 /-- A state is at block `tag` exactly when `blockTag?` reports `tag`. -/
-theorem atBlock_iff {ops : MirWpOps.{u, v, w} State} {tag : Nat}
+theorem atBlock_iff {ops : MirWpOps State Out Fault} {tag : Nat}
     {s : State} : ops.atBlock tag s ↔ ops.blockTag? s = some tag :=
   Iff.rfl
 
 /-- A state is at no more than one block. -/
-theorem atBlock_unique {ops : MirWpOps.{u, v, w} State} {t₁ t₂ : Nat}
+theorem atBlock_unique {ops : MirWpOps State Out Fault} {t₁ t₂ : Nat}
     {s : State} (h₁ : ops.atBlock t₁ s) (h₂ : ops.atBlock t₂ s) :
     t₁ = t₂ := by
   have hEq : some t₁ = some t₂ := h₁.symm.trans h₂
@@ -316,9 +311,9 @@ theorem atBlock_unique {ops : MirWpOps.{u, v, w} State} {t₁ t₂ : Nat}
 /-- A step interface is conjunctive when two step proofs for the same state
 combine into one for the conjoined predicates. Deterministic and
 `valid`-quantified interfaces are conjunctive. -/
-def Conjunctive (ops : MirWpOps.{u, v, w} State) : Prop :=
-  ∀ (s : State) (P₁ P₂ : State → Prop) (Q₁ Q₂ : ops.Out → Prop)
-    (R₁ R₂ : ops.Fault → Prop),
+def Conjunctive (ops : MirWpOps State Out Fault) : Prop :=
+  ∀ (s : State) (P₁ P₂ : State → Prop) (Q₁ Q₂ : Out → Prop)
+    (R₁ R₂ : Fault → Prop),
     ops.stepWp s P₁ Q₁ R₁ → ops.stepWp s P₂ Q₂ R₂ →
     ops.stepWp s (fun s' => P₁ s' ∧ P₂ s') (fun o => Q₁ o ∧ Q₂ o)
       (fun f => R₁ f ∧ R₂ f)
@@ -329,9 +324,9 @@ This is what makes a fuel-free proof yield a finite step budget. Deterministic
 interfaces are fuel-continuous; an interface that quantifies over infinitely
 many successors (for example over the answers of an external call) need not
 be. -/
-def FuelContinuous (ops : MirWpOps.{u, v, w} State) : Prop :=
-  ∀ (s : State) (P : Nat → State → Prop) (Q : ops.Out → Prop)
-    (R : ops.Fault → Prop),
+def FuelContinuous (ops : MirWpOps State Out Fault) : Prop :=
+  ∀ (s : State) (P : Nat → State → Prop) (Q : Out → Prop)
+    (R : Fault → Prop),
     (∀ n s', P n s' → P (n + 1) s') →
     ops.stepWp s (fun s' => ∃ n, P n s') Q R →
     ∃ n, ops.stepWp s (P n) Q R
@@ -339,13 +334,11 @@ def FuelContinuous (ops : MirWpOps.{u, v, w} State) : Prop :=
 /-- A step interface is strict when no state can step with all three
 predicates empty, so a weakest precondition can never be discharged
 vacuously. -/
-def Strict (ops : MirWpOps.{u, v, w} State) : Prop :=
+def Strict (ops : MirWpOps State Out Fault) : Prop :=
   ∀ (s : State),
     ¬ ops.stepWp s (fun _ => False) (fun _ => False) (fun _ => False)
 
 section ConstructorLaws
-
-variable {Out : Type v} {Fault : Type w}
 
 /-- Deterministic interfaces are conjunctive. -/
 theorem ofDetStep_conjunctive (step : State → StepOutcome State Out Fault)
@@ -439,9 +432,10 @@ not strictly positive, because `stepWp` is an abstract field of the interface,
 and the kernel rejects it. Quantifying over `mid` gives the same predicate:
 `wpUntil_step` and `wpUntil_unfold_iff` recover the direct form from
 `stepWp_mono`. -/
-inductive wpUntil {State : Type u} [ops : MirWpOps.{u, v, w} State]
-    (stop : State → Prop) (onDone : ops.Out → Prop)
-    (onFault : ops.Fault → Prop) : State → Prop where
+inductive wpUntil {State : Type u} {Out : Type v} {Fault : Type w}
+    [ops : MirWpOps State Out Fault]
+    (stop : State → Prop) (onDone : Out → Prop)
+    (onFault : Fault → Prop) : State → Prop where
   /-- The current state already satisfies the checkpoint. -/
   | here {s : State} (h : stop s) : wpUntil stop onDone onFault s
   /-- One step leads into `mid`, and every `mid` state reaches the
@@ -453,26 +447,27 @@ inductive wpUntil {State : Type u} [ops : MirWpOps.{u, v, w} State]
 
 section Checkpoint
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- A state that satisfies `stop` satisfies `wpUntil`. -/
-theorem wpUntil_here {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} (h : stop s) :
+theorem wpUntil_here {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} (h : stop s) :
     wpUntil stop onDone onFault s :=
   .here h
 
 /-- Single-step introduction rule for `wpUntil` in its direct recursive
 form. -/
-theorem wpUntil_step {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+theorem wpUntil_step {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : ops.stepWp s (wpUntil stop onDone onFault) onDone onFault) :
     wpUntil stop onDone onFault s :=
   .step (wpUntil stop onDone onFault) h (fun _ h' => h')
 
 /-- Unfold `wpUntil` by one step: either the current state satisfies `stop`,
 or one step leads into states that satisfy `wpUntil`. -/
-theorem wpUntil_unfold_iff {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wpUntil_unfold_iff {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wpUntil stop onDone onFault s ↔
       (stop s ∨
         ops.stepWp s (wpUntil stop onDone onFault) onDone onFault) := by
@@ -491,8 +486,8 @@ theorem wpUntil_unfold_iff {stop : State → Prop} {onDone : ops.Out → Prop}
 /-- Rule of consequence for `wpUntil`: weaken the checkpoint, the terminal
 predicate and the set of accepted faults. -/
 theorem wpUntil_mono {stop₁ stop₂ : State → Prop}
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hStop : ∀ s, stop₁ s → stop₂ s)
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
@@ -506,7 +501,7 @@ theorem wpUntil_mono {stop₁ stop₂ : State → Prop}
 
 /-- Weaken only the checkpoint of `wpUntil`. -/
 theorem wpUntil_mono_stop {stop₁ stop₂ : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStop : ∀ s, stop₁ s → stop₂ s)
     {s : State} (h : wpUntil stop₁ onDone onFault s) :
     wpUntil stop₂ onDone onFault s :=
@@ -514,8 +509,8 @@ theorem wpUntil_mono_stop {stop₁ stop₂ : State → Prop}
 
 /-- Sequential composition of checkpoints: if `s` reaches `mid` and every
 `mid` state reaches `stop`, then `s` reaches `stop`. -/
-theorem wpUntil_bind {mid stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+theorem wpUntil_bind {mid stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : wpUntil mid onDone onFault s)
     (hK : ∀ s', mid s' → wpUntil stop onDone onFault s') :
     wpUntil stop onDone onFault s := by
@@ -525,8 +520,8 @@ theorem wpUntil_bind {mid stop : State → Prop} {onDone : ops.Out → Prop}
 
 /-- Checkpoints are idempotent: reaching states that reach `stop` is the same
 as reaching `stop`. -/
-theorem wpUntil_idem_iff {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wpUntil_idem_iff {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wpUntil (wpUntil stop onDone onFault) onDone onFault s ↔
       wpUntil stop onDone onFault s :=
   ⟨fun h => wpUntil_bind h (fun _ h' => h'), fun h => .here h⟩
@@ -535,13 +530,33 @@ theorem wpUntil_idem_iff {stop : State → Prop} {onDone : ops.Out → Prop}
 `onFault`, so a checkpoint proof for `stop` is a checkpoint proof for every
 other checkpoint. -/
 theorem wpUntil_of_stop_empty {stop stop' : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (hEmpty : ∀ s', ¬ stop s') (h : wpUntil stop onDone onFault s) :
     wpUntil stop' onDone onFault s :=
   wpUntil_mono_stop (fun s' hs => False.elim (hEmpty s' hs)) h
 
+/-- Constructive conjunction rule for `wpUntil` at a common checkpoint over a
+conjunctive interface (`0` axioms). -/
+theorem wpUntil_conj (hConj : ops.Conjunctive)
+    {stop : State → Prop}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop} {s : State}
+    (h₁ : wpUntil stop onDone₁ onFault₁ s)
+    (h₂ : wpUntil stop onDone₂ onFault₂ s) :
+    wpUntil stop (fun o => onDone₁ o ∧ onDone₂ o)
+      (fun f => onFault₁ f ∧ onFault₂ f) s := by
+  induction h₁ with
+  | here hs => exact .here hs
+  | step mid hStep _ ih =>
+    cases wpUntil_unfold_iff.mp h₂ with
+    | inl hs => exact .here hs
+    | inr hStep₂ =>
+      have hBoth := hConj _ _ _ _ _ _ _ hStep hStep₂
+      exact .step (fun s' => mid s' ∧ wpUntil stop onDone₂ onFault₂ s') hBoth
+        (fun s' hs' => ih s' hs'.1 hs'.2)
+
 /-- Checkpoint weakest precondition that forbids every fault. -/
-abbrev wpUntilOk (stop : State → Prop) (onDone : ops.Out → Prop)
+abbrev wpUntilOk (stop : State → Prop) (onDone : Out → Prop)
     (s : State) : Prop :=
   wpUntil stop onDone (fun _ => False) s
 
@@ -553,40 +568,40 @@ abbrev wpReach (stop : State → Prop) (s : State) : Prop :=
 /-- Fuel-free weakest precondition of a whole execution: every execution from
 `s` terminates with an outcome satisfying `onDone` or faults with an error
 satisfying `onFault`. It is `wpUntil` with an unreachable checkpoint. -/
-def wpOutcome (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
+def wpOutcome (onDone : Out → Prop) (onFault : Fault → Prop)
     (s : State) : Prop :=
   wpUntil (fun _ => False) onDone onFault s
 
 /-- Fuel-free weakest precondition of a whole execution that forbids every
 fault. -/
-abbrev wpStateOk (onDone : ops.Out → Prop) (s : State) : Prop :=
+abbrev wpStateOk (onDone : Out → Prop) (s : State) : Prop :=
   wpOutcome onDone (fun _ => False) s
 
 /-- `wpOutcome` is `wpUntil` with a checkpoint that no state satisfies. -/
-theorem wpOutcome_iff_wpUntil_false {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wpOutcome_iff_wpUntil_false {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wpOutcome onDone onFault s ↔
       wpUntil (fun _ => False) onDone onFault s :=
   Iff.rfl
 
 /-- `wpOutcome` is `wpUntil` for any checkpoint that no state satisfies. -/
 theorem wpOutcome_iff_wpUntil_of_stop_empty {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (hEmpty : ∀ s', ¬ stop s') :
     wpOutcome onDone onFault s ↔ wpUntil stop onDone onFault s :=
   ⟨fun h => wpUntil_mono_stop (fun _ hf => False.elim hf) h,
    fun h => wpUntil_of_stop_empty hEmpty h⟩
 
 /-- Single-step introduction rule for `wpOutcome`. -/
-theorem wpOutcome_step {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State}
+theorem wpOutcome_step {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State}
     (h : ops.stepWp s (wpOutcome onDone onFault) onDone onFault) :
     wpOutcome onDone onFault s :=
   wpUntil_step h
 
 /-- Unfold `wpOutcome` by one step. -/
-theorem wpOutcome_unfold_iff {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wpOutcome_unfold_iff {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wpOutcome onDone onFault s ↔
       ops.stepWp s (wpOutcome onDone onFault) onDone onFault := by
   constructor
@@ -598,8 +613,8 @@ theorem wpOutcome_unfold_iff {onDone : ops.Out → Prop}
     exact wpOutcome_step h
 
 /-- Rule of consequence for `wpOutcome`. -/
-theorem wpOutcome_mono {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+theorem wpOutcome_mono {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
     {s : State} (h : wpOutcome onDone₁ onFault₁ s) :
@@ -609,7 +624,7 @@ theorem wpOutcome_mono {onDone₁ onDone₂ : ops.Out → Prop}
 /-- Hand a checkpoint proof over to `wpOutcome`: if `s` reaches `stop` and
 every `stop` state terminates as required, then so does `s`. -/
 theorem wpUntil_to_wpOutcome {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpUntil stop onDone onFault s)
     (hK : ∀ s', stop s' → wpOutcome onDone onFault s') :
     wpOutcome onDone onFault s :=
@@ -618,33 +633,46 @@ theorem wpUntil_to_wpOutcome {stop : State → Prop}
 /-- A terminating execution satisfies every checkpoint proof: `wpOutcome`
 implies `wpUntil` for any `stop`. -/
 theorem wpUntil_of_wpOutcome {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpOutcome onDone onFault s) : wpUntil stop onDone onFault s :=
   wpUntil_mono_stop (fun _ hf => False.elim hf) h
 
 /-- Hand a fault-free checkpoint proof over to `wpStateOk`. -/
 theorem wpUntilOk_to_wpStateOk {stop : State → Prop}
-    {onDone : ops.Out → Prop} {s : State}
+    {onDone : Out → Prop} {s : State}
     (h : wpUntilOk stop onDone s)
     (hK : ∀ s', stop s' → wpStateOk onDone s') :
     wpStateOk onDone s :=
   wpUntil_to_wpOutcome h hK
 
-/-- Conjunction rule for `wpOutcome` over a conjunctive interface: two proofs
-about the same execution combine without re-proving termination. -/
-theorem wpOutcome_conj (hConj : ops.Conjunctive)
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop} {s : State}
-    (h₁ : wpOutcome onDone₁ onFault₁ s)
+/-- Pair a checkpoint proof with a whole-execution proof over a conjunctive
+interface: the checkpoint carries the whole-execution obligation forward. -/
+theorem wpUntil_conj_wpOutcome (hConj : ops.Conjunctive)
+    {stop : State → Prop}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop} {s : State}
+    (h₁ : wpUntil stop onDone₁ onFault₁ s)
     (h₂ : wpOutcome onDone₂ onFault₂ s) :
-    wpOutcome (fun o => onDone₁ o ∧ onDone₂ o)
+    wpUntil (fun s' => stop s' ∧ wpOutcome onDone₂ onFault₂ s')
+      (fun o => onDone₁ o ∧ onDone₂ o)
       (fun f => onFault₁ f ∧ onFault₂ f) s := by
   induction h₁ with
-  | here hf => exact False.elim hf
+  | here hs => exact .here ⟨hs, h₂⟩
   | step mid hStep _ ih =>
     have hBoth := hConj _ _ _ _ _ _ _ hStep (wpOutcome_unfold_iff.mp h₂)
     exact .step (fun s' => mid s' ∧ wpOutcome onDone₂ onFault₂ s') hBoth
       (fun s' hs' => ih s' hs'.1 hs'.2)
+
+/-- Conjunction rule for `wpOutcome` over a conjunctive interface: two proofs
+about the same execution combine without re-proving termination. -/
+theorem wpOutcome_conj (hConj : ops.Conjunctive)
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop} {s : State}
+    (h₁ : wpOutcome onDone₁ onFault₁ s)
+    (h₂ : wpOutcome onDone₂ onFault₂ s) :
+    wpOutcome (fun o => onDone₁ o ∧ onDone₂ o)
+      (fun f => onFault₁ f ∧ onFault₂ f) s :=
+  wpUntil_conj hConj h₁ h₂
 
 /-- Excluded miracle for `wpOutcome` over a strict interface: no execution
 satisfies the empty postcondition. -/
@@ -658,19 +686,21 @@ theorem wpOutcome_not_false (hStrict : ops.Strict) {s : State} :
       (ops.stepWp_mono (fun s' hm => ih s' hm) (fun _ hq => hq)
         (fun _ hr => hr) hStep)
 
-/-- Transfer a checkpoint proof along a morphism of step interfaces. `f` maps
-states, `g` outcomes and `e` faults of `ops₁` to those of `ops₂`, and every
-step of `ops₁` is matched by a step of `ops₂` at the image state. -/
-theorem wpUntil_map {S₁ : Type u} {S₂ : Type x}
-    [ops₁ : MirWpOps.{u, v, w} S₁] [ops₂ : MirWpOps.{x, v, w} S₂]
-    (f : S₁ → S₂) (g : ops₁.Out → ops₂.Out) (e : ops₁.Fault → ops₂.Fault)
-    (hStep : ∀ (s : S₁) (P : S₂ → Prop) (Q : ops₂.Out → Prop)
-      (R : ops₂.Fault → Prop),
+/-- Transfer a checkpoint proof along a morphism of step interfaces across
+arbitrary independent state, outcome and fault universes. `f` maps states, `g`
+outcomes and `e` faults of `ops₁` to those of `ops₂`, and every step of `ops₁`
+is matched by a step of `ops₂` at the image state. -/
+theorem wpUntil_map {S₁ : Type u} {Out₁ : Type v} {Fault₁ : Type w}
+    {S₂ : Type x} {Out₂ : Type y} {Fault₂ : Type z}
+    [ops₁ : MirWpOps S₁ Out₁ Fault₁] [ops₂ : MirWpOps S₂ Out₂ Fault₂]
+    (f : S₁ → S₂) (g : Out₁ → Out₂) (e : Fault₁ → Fault₂)
+    (hStep : ∀ (s : S₁) (P : S₂ → Prop) (Q : Out₂ → Prop)
+      (R : Fault₂ → Prop),
       ops₁.stepWp s (fun s' => P (f s')) (fun o => Q (g o))
         (fun k => R (e k)) →
       ops₂.stepWp (f s) P Q R)
-    {stop : S₂ → Prop} {onDone : ops₂.Out → Prop}
-    {onFault : ops₂.Fault → Prop} {s : S₁}
+    {stop : S₂ → Prop} {onDone : Out₂ → Prop}
+    {onFault : Fault₂ → Prop} {s : S₁}
     (h : wpUntil (fun s' => stop (f s')) (fun o => onDone (g o))
       (fun k => onFault (e k)) s) :
     wpUntil stop onDone onFault (f s) := by
@@ -681,15 +711,16 @@ theorem wpUntil_map {S₁ : Type u} {S₂ : Type x}
     exact ops₁.stepWp_mono ih (fun _ hq => hq) (fun _ hr => hr) hMidStep
 
 /-- Transfer a whole-execution proof along a morphism of step interfaces. -/
-theorem wpOutcome_map {S₁ : Type u} {S₂ : Type x}
-    [ops₁ : MirWpOps.{u, v, w} S₁] [ops₂ : MirWpOps.{x, v, w} S₂]
-    (f : S₁ → S₂) (g : ops₁.Out → ops₂.Out) (e : ops₁.Fault → ops₂.Fault)
-    (hStep : ∀ (s : S₁) (P : S₂ → Prop) (Q : ops₂.Out → Prop)
-      (R : ops₂.Fault → Prop),
+theorem wpOutcome_map {S₁ : Type u} {Out₁ : Type v} {Fault₁ : Type w}
+    {S₂ : Type x} {Out₂ : Type y} {Fault₂ : Type z}
+    [ops₁ : MirWpOps S₁ Out₁ Fault₁] [ops₂ : MirWpOps S₂ Out₂ Fault₂]
+    (f : S₁ → S₂) (g : Out₁ → Out₂) (e : Fault₁ → Fault₂)
+    (hStep : ∀ (s : S₁) (P : S₂ → Prop) (Q : Out₂ → Prop)
+      (R : Fault₂ → Prop),
       ops₁.stepWp s (fun s' => P (f s')) (fun o => Q (g o))
         (fun k => R (e k)) →
       ops₂.stepWp (f s) P Q R)
-    {onDone : ops₂.Out → Prop} {onFault : ops₂.Fault → Prop} {s : S₁}
+    {onDone : Out₂ → Prop} {onFault : Fault₂ → Prop} {s : S₁}
     (h : wpOutcome (fun o => onDone (g o)) (fun k => onFault (e k)) s) :
     wpOutcome onDone onFault (f s) :=
   wpUntil_map f g e hStep h
@@ -699,27 +730,27 @@ theorem wpOutcome_map {S₁ : Type u} {S₂ : Type x}
 /-- Strict checkpoint weakest precondition: take one step, then reach `stop`.
 Unlike `wpUntil`, it cannot be discharged at a state that already satisfies
 `stop`, which is what a loop header that is its own cutpoint needs. -/
-def wpStepUntil (stop : State → Prop) (onDone : ops.Out → Prop)
-    (onFault : ops.Fault → Prop) (s : State) : Prop :=
+def wpStepUntil (stop : State → Prop) (onDone : Out → Prop)
+    (onFault : Fault → Prop) (s : State) : Prop :=
   ops.stepWp s (wpUntil stop onDone onFault) onDone onFault
 
 /-- A strict checkpoint proof is a checkpoint proof. -/
 theorem wpUntil_of_wpStepUntil {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpStepUntil stop onDone onFault s) :
     wpUntil stop onDone onFault s :=
   wpUntil_step h
 
 /-- A checkpoint proof either holds at once or is a strict one. -/
 theorem wpUntil_iff_stop_or_wpStepUntil {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State} :
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State} :
     wpUntil stop onDone onFault s ↔
       (stop s ∨ wpStepUntil stop onDone onFault s) :=
   wpUntil_unfold_iff
 
 /-- A checkpoint proof from a state outside `stop` makes at least one step. -/
 theorem wpStepUntil_of_wpUntil_of_not_stop {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpUntil stop onDone onFault s) (hNot : ¬ stop s) :
     wpStepUntil stop onDone onFault s := by
   cases wpUntil_unfold_iff.mp h with
@@ -728,8 +759,8 @@ theorem wpStepUntil_of_wpUntil_of_not_stop {stop : State → Prop}
 
 /-- Rule of consequence for `wpStepUntil`. -/
 theorem wpStepUntil_mono {stop₁ stop₂ : State → Prop}
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hStop : ∀ s, stop₁ s → stop₂ s)
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
@@ -740,7 +771,7 @@ theorem wpStepUntil_mono {stop₁ stop₂ : State → Prop}
 
 /-- Sequential composition of a strict checkpoint with a checkpoint. -/
 theorem wpStepUntil_bind {mid stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpStepUntil mid onDone onFault s)
     (hK : ∀ s', mid s' → wpUntil stop onDone onFault s') :
     wpStepUntil stop onDone onFault s :=
@@ -750,7 +781,7 @@ theorem wpStepUntil_bind {mid stop : State → Prop}
 /-- Sequential composition of a checkpoint with a strict checkpoint: the
 composite makes at least the step of the second segment. -/
 theorem wpUntil_bind_wpStepUntil {mid stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State}
     (h : wpUntil mid onDone onFault s)
     (hK : ∀ s', mid s' → wpStepUntil stop onDone onFault s') :
     wpStepUntil stop onDone onFault s := by
@@ -767,14 +798,15 @@ end Checkpoint
 
 section Fuel
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- Fuel-bounded weakest precondition up to a checkpoint: as `wpUntil`, but
 the checkpoint must be reached within `fuel` steps. Running out of fuel is
 accepted only in a state that satisfies `stop`. Defined by `@Nat.rec` into
 `Prop`, so it unfolds by `rfl` at every literal budget. -/
-def wpUntilFuel (stop : State → Prop) (onDone : ops.Out → Prop)
-    (onFault : ops.Fault → Prop) (fuel : Nat) (s : State) : Prop :=
+def wpUntilFuel (stop : State → Prop) (onDone : Out → Prop)
+    (onFault : Fault → Prop) (fuel : Nat) (s : State) : Prop :=
   @Nat.rec (fun _ => State → Prop)
     (fun st => stop st)
     (fun _ ih st => stop st ∨ ops.stepWp st ih onDone onFault)
@@ -783,7 +815,7 @@ def wpUntilFuel (stop : State → Prop) (onDone : ops.Out → Prop)
 /-- Fuel-bounded weakest precondition of a whole execution: the execution
 must terminate or fault as required within `fuel` steps, and running out of
 fuel is never accepted. -/
-def wpOutcomeFuel (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
+def wpOutcomeFuel (onDone : Out → Prop) (onFault : Fault → Prop)
     (fuel : Nat) (s : State) : Prop :=
   @Nat.rec (fun _ => State → Prop)
     (fun _ => False)
@@ -793,13 +825,13 @@ def wpOutcomeFuel (onDone : ops.Out → Prop) (onFault : ops.Fault → Prop)
 /-- Unfold `wpUntilFuel` at fuel `0`: the current state must satisfy
 `stop`. -/
 theorem wpUntilFuel_zero_iff {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State} :
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State} :
     wpUntilFuel stop onDone onFault 0 s ↔ stop s :=
   Iff.rfl
 
 /-- Unfold `wpUntilFuel` at fuel `fuel + 1`. -/
 theorem wpUntilFuel_succ_iff {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {fuel : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {fuel : Nat}
     {s : State} :
     wpUntilFuel stop onDone onFault (fuel + 1) s ↔
       (stop s ∨
@@ -808,29 +840,29 @@ theorem wpUntilFuel_succ_iff {stop : State → Prop}
   Iff.rfl
 
 /-- `wpOutcomeFuel` never holds at fuel `0`. -/
-theorem wpOutcomeFuel_zero_elim {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+theorem wpOutcomeFuel_zero_elim {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     ¬ wpOutcomeFuel onDone onFault 0 s :=
   fun h => h
 
 /-- Unfold `wpOutcomeFuel` at fuel `fuel + 1`. -/
-theorem wpOutcomeFuel_succ_iff {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State} :
+theorem wpOutcomeFuel_succ_iff {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State} :
     wpOutcomeFuel onDone onFault (fuel + 1) s ↔
       ops.stepWp s (wpOutcomeFuel onDone onFault fuel) onDone onFault :=
   Iff.rfl
 
 /-- A state that satisfies `stop` satisfies `wpUntilFuel` at every fuel. -/
-theorem wpUntilFuel_here {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State} (h : stop s) :
+theorem wpUntilFuel_here {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State} (h : stop s) :
     wpUntilFuel stop onDone onFault fuel s := by
   cases fuel with
   | zero => exact wpUntilFuel_zero_iff.mpr h
   | succ fuel => exact wpUntilFuel_succ_iff.mpr (Or.inl h)
 
 /-- Single-step introduction rule for `wpUntilFuel`. -/
-theorem wpUntilFuel_step {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State}
+theorem wpUntilFuel_step {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State}
     (h : ops.stepWp s (wpUntilFuel stop onDone onFault fuel)
       onDone onFault) :
     wpUntilFuel stop onDone onFault (fuel + 1) s :=
@@ -839,8 +871,8 @@ theorem wpUntilFuel_step {stop : State → Prop} {onDone : ops.Out → Prop}
 /-- Fuel monotonicity for `wpUntilFuel`: a checkpoint reached within `f₁`
 steps is reached within any larger budget `f₂`. At fuel `0` the checkpoint
 holds, which every larger budget accepts. -/
-theorem wpUntilFuel_mono {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {f₁ f₂ : Nat} {s : State}
+theorem wpUntilFuel_mono {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {f₁ f₂ : Nat} {s : State}
     (hLe : f₁ ≤ f₂) (h : wpUntilFuel stop onDone onFault f₁ s) :
     wpUntilFuel stop onDone onFault f₂ s := by
   induction f₁ generalizing f₂ s with
@@ -859,8 +891,8 @@ theorem wpUntilFuel_mono {stop : State → Prop} {onDone : ops.Out → Prop}
 
 /-- Fuel monotonicity for `wpOutcomeFuel`. At fuel `0` the premise is
 `False`, so there is no base case to weaken. -/
-theorem wpOutcomeFuel_mono {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {f₁ f₂ : Nat} {s : State}
+theorem wpOutcomeFuel_mono {onDone : Out → Prop}
+    {onFault : Fault → Prop} {f₁ f₂ : Nat} {s : State}
     (hLe : f₁ ≤ f₂) (h : wpOutcomeFuel onDone onFault f₁ s) :
     wpOutcomeFuel onDone onFault f₂ s := by
   induction f₁ generalizing f₂ s with
@@ -876,8 +908,8 @@ theorem wpOutcomeFuel_mono {onDone : ops.Out → Prop}
 
 /-- Rule of consequence for `wpUntilFuel` at a fixed budget. -/
 theorem wpUntilFuel_weaken {stop₁ stop₂ : State → Prop}
-    {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+    {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hStop : ∀ s, stop₁ s → stop₂ s)
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
@@ -894,8 +926,8 @@ theorem wpUntilFuel_weaken {stop₁ stop₂ : State → Prop}
         (ops.stepWp_mono (fun _ h' => ih h') hDone hFault hr)
 
 /-- Rule of consequence for `wpOutcomeFuel` at a fixed budget. -/
-theorem wpOutcomeFuel_weaken {onDone₁ onDone₂ : ops.Out → Prop}
-    {onFault₁ onFault₂ : ops.Fault → Prop}
+theorem wpOutcomeFuel_weaken {onDone₁ onDone₂ : Out → Prop}
+    {onFault₁ onFault₂ : Fault → Prop}
     (hDone : ∀ o, onDone₁ o → onDone₂ o)
     (hFault : ∀ f, onFault₁ f → onFault₂ f)
     {fuel : Nat} {s : State}
@@ -910,8 +942,8 @@ theorem wpOutcomeFuel_weaken {onDone₁ onDone₂ : ops.Out → Prop}
 
 /-- `wpOutcomeFuel` is `wpUntilFuel` with a checkpoint that no state
 satisfies. -/
-theorem wpOutcomeFuel_iff_wpUntilFuel_false {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State} :
+theorem wpOutcomeFuel_iff_wpUntilFuel_false {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State} :
     wpOutcomeFuel onDone onFault fuel s ↔
       wpUntilFuel (fun _ => False) onDone onFault fuel s := by
   induction fuel generalizing s with
@@ -932,7 +964,7 @@ theorem wpOutcomeFuel_iff_wpUntilFuel_false {onDone : ops.Out → Prop}
 
 /-- Every bounded checkpoint derivation is a fuel-free one. -/
 theorem wpUntil_of_wpUntilFuel {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {fuel : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {fuel : Nat}
     {s : State} (h : wpUntilFuel stop onDone onFault fuel s) :
     wpUntil stop onDone onFault s := by
   induction fuel generalizing s with
@@ -945,8 +977,8 @@ theorem wpUntil_of_wpUntilFuel {stop : State → Prop}
         (fun _ h' => ih h')
 
 /-- Every bounded whole-execution derivation is a fuel-free one. -/
-theorem wpOutcome_of_wpOutcomeFuel {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {fuel : Nat} {s : State}
+theorem wpOutcome_of_wpOutcomeFuel {onDone : Out → Prop}
+    {onFault : Fault → Prop} {fuel : Nat} {s : State}
     (h : wpOutcomeFuel onDone onFault fuel s) :
     wpOutcome onDone onFault s :=
   wpUntil_of_wpUntilFuel (wpOutcomeFuel_iff_wpUntilFuel_false.mp h)
@@ -954,8 +986,8 @@ theorem wpOutcome_of_wpOutcomeFuel {onDone : ops.Out → Prop}
 /-- Over a fuel-continuous interface, a fuel-free checkpoint proof has a
 finite step budget, so `wpUntil` is exactly `∃ fuel, wpUntilFuel`. -/
 theorem wpUntil_iff_exists_fuel (hCont : ops.FuelContinuous)
-    {stop : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop} {s : State} :
+    {stop : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop} {s : State} :
     wpUntil stop onDone onFault s ↔
       ∃ fuel, wpUntilFuel stop onDone onFault fuel s := by
   constructor
@@ -978,7 +1010,7 @@ theorem wpUntil_iff_exists_fuel (hCont : ops.FuelContinuous)
 /-- Over a fuel-continuous interface, `wpOutcome` is exactly
 `∃ fuel, wpOutcomeFuel`. -/
 theorem wpOutcome_iff_exists_fuel (hCont : ops.FuelContinuous)
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {s : State} :
+    {onDone : Out → Prop} {onFault : Fault → Prop} {s : State} :
     wpOutcome onDone onFault s ↔
       ∃ fuel, wpOutcomeFuel onDone onFault fuel s := by
   constructor
@@ -991,7 +1023,7 @@ theorem wpOutcome_iff_exists_fuel (hCont : ops.FuelContinuous)
 
 /-- Sequential composition of bounded checkpoints: budgets add. -/
 theorem wpUntilFuel_bind {mid stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {f₁ f₂ : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {f₁ f₂ : Nat}
     {s : State} (h : wpUntilFuel mid onDone onFault f₁ s)
     (hK : ∀ s', mid s' → wpUntilFuel stop onDone onFault f₂ s') :
     wpUntilFuel stop onDone onFault (f₁ + f₂) s := by
@@ -1011,13 +1043,37 @@ theorem wpUntilFuel_bind {mid stop : State → Prop}
 
 /-- Hand a bounded checkpoint proof over to `wpOutcomeFuel`: budgets add. -/
 theorem wpUntilFuel_to_wpOutcomeFuel {stop : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {f₁ f₂ : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {f₁ f₂ : Nat}
     {s : State} (h : wpUntilFuel stop onDone onFault f₁ s)
     (hK : ∀ s', stop s' → wpOutcomeFuel onDone onFault f₂ s') :
     wpOutcomeFuel onDone onFault (f₁ + f₂) s :=
   wpOutcomeFuel_iff_wpUntilFuel_false.mpr
     (wpUntilFuel_bind h
       (fun s' hs => wpOutcomeFuel_iff_wpUntilFuel_false.mp (hK s' hs)))
+
+/-- Exact fixed-budget countdown loop rule (`n * stepFuel`, matching `#4059`):
+if `Inv 0` implies `exit` and one iteration from `Inv (n + 1)` reaches
+`Inv n ∨ exit` within `stepFuel` steps, then `Inv n` reaches `exit` within
+`n * stepFuel` steps. -/
+theorem wpLoop_countdown_fuel {Inv : Nat → State → Prop}
+    {exit : State → Prop} {onDone : Out → Prop} {onFault : Fault → Prop}
+    {stepFuel : Nat}
+    (hBase : ∀ s, Inv 0 s → exit s)
+    (hStep : ∀ n s, Inv (n + 1) s →
+      wpUntilFuel (fun s' => Inv n s' ∨ exit s') onDone onFault stepFuel s)
+    (n : Nat) (s : State) (hInv : Inv n s) :
+    wpUntilFuel exit onDone onFault (n * stepFuel) s := by
+  induction n generalizing s with
+  | zero =>
+    rw [Nat.zero_mul]
+    exact wpUntilFuel_here (hBase s hInv)
+  | succ n ih =>
+    rw [Nat.succ_mul, Nat.add_comm]
+    refine wpUntilFuel_bind (hStep n s hInv) ?_
+    intro s' hMid
+    cases hMid with
+    | inl hCont => exact ih s' hCont
+    | inr hExit => exact wpUntilFuel_here hExit
 
 end Fuel
 
@@ -1255,7 +1311,8 @@ end Deterministic
 
 section Loops
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- General well-founded loop rule.
 
@@ -1267,7 +1324,7 @@ execution through `onDone` (an early `return` inside the loop) or through an
 accepted fault. -/
 theorem wpLoop_inv {α : Sort x} {r : α → α → Prop} (hWf : WellFounded r)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, Inv a s →
       exit s ∨
         wpUntil (fun s' => exit s' ∨ ∃ a', r a' a ∧ Inv a' s')
@@ -1293,7 +1350,7 @@ theorem wpLoop_inv {α : Sort x} {r : α → α → Prop} (hWf : WellFounded r)
 `Nat`-valued rank on ghost values that strictly decreases every iteration. -/
 theorem wpLoop_inv_rank {α : Sort x} (rank : α → Nat)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, Inv a s →
       exit s ∨
         wpUntil (fun s' => exit s' ∨ ∃ a', rank a' < rank a ∧ Inv a' s')
@@ -1312,7 +1369,7 @@ well: the loop makes progress before it reaches `exit`. -/
 theorem wpLoop_inv_strict {α : Sort x} {r : α → α → Prop}
     (hWf : WellFounded r)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, Inv a s →
       wpStepUntil (fun s' => exit s' ∨ ∃ a', r a' a ∧ Inv a' s')
         onDone onFault s)
@@ -1331,7 +1388,7 @@ theorem wpLoop_inv_strict {α : Sort x} {r : α → α → Prop}
 /-- Strict ranked loop rule: `wpLoop_inv_strict` for a `Nat`-valued rank. -/
 theorem wpLoop_inv_rank_strict {α : Sort x} (rank : α → Nat)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, Inv a s →
       wpStepUntil (fun s' => exit s' ∨ ∃ a', rank a' < rank a ∧ Inv a' s')
         onDone onFault s)
@@ -1346,7 +1403,7 @@ to `exit`. -/
 theorem wpLoop_inv_progress {α : Sort x} {r : α → α → Prop}
     (hWf : WellFounded r)
     {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, Inv a s →
       exit s ∨
         wpUntil (fun s' => exit s' ∨ ∃ a', r a' a ∧ Inv a' s')
@@ -1360,7 +1417,7 @@ theorem wpLoop_inv_progress {α : Sort x} {r : α → α → Prop}
 loop head with counter `i ≤ hi`; one iteration from `i < hi` reaches `exit` or
 an `Inv j` state with `i < j ≤ hi`; and `Inv hi` implies `exit`. -/
 theorem wpLoop_nat_exists {Inv : Nat → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {hi : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {hi : Nat}
     (hDone : ∀ s, Inv hi s → exit s)
     (hStep : ∀ i s, i < hi → Inv i s →
       wpUntil (fun s' => exit s' ∨ ∃ j, i < j ∧ j ≤ hi ∧ Inv j s')
@@ -1389,7 +1446,7 @@ theorem wpLoop_nat_exists {Inv : Nat → State → Prop} {exit : State → Prop}
 from `i < hi` reaches `exit` or `Inv (i + 1)`, and `Inv hi` implies `exit`.
 The loop runs zero times when `i = hi`. -/
 theorem wpLoop_nat {Inv : Nat → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop} {hi : Nat}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {hi : Nat}
     (hDone : ∀ s, Inv hi s → exit s)
     (hStep : ∀ i s, i < hi → Inv i s →
       wpUntil (fun s' => exit s' ∨ Inv (i + 1) s') onDone onFault s)
@@ -1408,7 +1465,7 @@ theorem wpLoop_nat {Inv : Nat → State → Prop} {exit : State → Prop}
 remain: `Inv 0` implies `exit`, and one iteration from `Inv (n + 1)` reaches
 `Inv n` or `exit`. -/
 theorem wpLoop_countdown {Inv : Nat → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hBase : ∀ s, Inv 0 s → exit s)
     (hStep : ∀ n s, Inv (n + 1) s →
       wpUntil (fun s' => Inv n s' ∨ exit s') onDone onFault s)
@@ -1427,8 +1484,8 @@ theorem wpLoop_countdown {Inv : Nat → State → Prop} {exit : State → Prop}
 processed: `Inv []` implies `exit`, and one iteration from `Inv (y :: ys)`
 reaches `Inv ys` or `exit`. -/
 theorem wpLoop_list {β : Type x} {Inv : List β → State → Prop}
-    {exit : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {exit : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (hBase : ∀ s, Inv [] s → exit s)
     (hStep : ∀ y ys s, Inv (y :: ys) s →
       wpUntil (fun s' => Inv ys s' ∨ exit s') onDone onFault s)
@@ -1460,8 +1517,8 @@ theorem length_lt_append_of_ne_nil {β : Type x} (pre rest : List β)
 /-- List loop rule by length: each iteration from a non-empty `Inv xs` state
 reaches an `Inv ys` state for some strictly shorter list `ys`, or `exit`. -/
 theorem wpLoop_list_measure {β : Type x} {Inv : List β → State → Prop}
-    {exit : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {exit : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (hBase : ∀ s, Inv [] s → exit s)
     (hStep : ∀ xs s, Inv xs s → xs ≠ [] →
       wpUntil
@@ -1489,8 +1546,8 @@ theorem wpLoop_list_measure {β : Type x} {Inv : List β → State → Prop}
 reaches `Inv rest`, or reaches `exit`. This covers loops that process a
 variable number of elements per iteration. -/
 theorem wpLoop_list_split {β : Type x} {Inv : List β → State → Prop}
-    {exit : State → Prop} {onDone : ops.Out → Prop}
-    {onFault : ops.Fault → Prop}
+    {exit : State → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
     (hBase : ∀ s, Inv [] s → exit s)
     (hStep : ∀ xs s, Inv xs s → xs ≠ [] →
       wpUntil
@@ -1516,7 +1573,7 @@ theorem wpLoop_list_split {β : Type x} {Inv : List β → State → Prop}
 state. From every `Inv` state that is not an `exit` state, one iteration
 reaches `exit` or an `Inv` state of strictly smaller rank. -/
 theorem wpLoop_state {Inv exit : State → Prop} {rank : State → Nat}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ s, Inv s →
       exit s ∨
         wpUntil (fun s' => exit s' ∨ (Inv s' ∧ rank s' < rank s))
@@ -1543,7 +1600,7 @@ theorem wpLoop_state {Inv exit : State → Prop} {rank : State → Nat}
 a terminating continuation from every `exit` state, terminates. An iteration
 may also end the execution directly through `onDone`. -/
 theorem wpLoop_nat_or_done {Inv exit : State → Prop} {rank : State → Nat}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ s, Inv s →
       exit s ∨
         wpUntil (fun s' => exit s' ∨ (Inv s' ∧ rank s' < rank s))
@@ -1557,7 +1614,7 @@ theorem wpLoop_nat_or_done {Inv exit : State → Prop} {rank : State → Nat}
 read directly off the state, no iteration may fault, and every `exit` state
 terminates with an outcome satisfying `post`. -/
 theorem wpLoop_state_exists {Inv exit : State → Prop} {rank : State → Nat}
-    {post : ops.Out → Prop}
+    {post : Out → Prop}
     (hStep : ∀ s, Inv s →
       exit s ∨
         wpUntilOk (fun s' => exit s' ∨ (Inv s' ∧ rank s' < rank s))
@@ -1567,13 +1624,54 @@ theorem wpLoop_state_exists {Inv exit : State → Prop} {rank : State → Nat}
     wpStateOk post s :=
   wpLoop_nat_or_done hStep hExit s hInv
 
+/-- Fuel-free two-exit loop rule for loops with both normal termination
+(`normalExit`) and mid-loop early-return / `?` / `break` cleanup
+(`earlyClean`), generalizing `#4069`'s `wpOutcomeState_loop_early_return_sound`
+without fixed step budgets. -/
+theorem wpLoop_early_return {α : Sort x} {r : α → α → Prop}
+    (hWf : WellFounded r)
+    {Inv : α → State → Prop} {normalExit earlyClean : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hStep : ∀ a s, Inv a s →
+      normalExit s ∨ earlyClean s ∨
+        wpUntil
+          (fun s' => normalExit s' ∨ earlyClean s' ∨
+            ∃ a', r a' a ∧ Inv a' s')
+          onDone onFault s)
+    (hNorm : ∀ s, normalExit s → wpOutcome onDone onFault s)
+    (hEarly : ∀ s, earlyClean s → wpOutcome onDone onFault s)
+    (a₀ : α) (s₀ : State) (hInv : Inv a₀ s₀) :
+    wpOutcome onDone onFault s₀ := by
+  refine wpUntil_to_wpOutcome
+    (wpLoop_inv hWf (exit := fun s => normalExit s ∨ earlyClean s)
+      ?_ a₀ s₀ hInv) ?_
+  · intro a s hA
+    cases hStep a s hA with
+    | inl hN => exact Or.inl (Or.inl hN)
+    | inr hRest =>
+      cases hRest with
+      | inl hE => exact Or.inl (Or.inr hE)
+      | inr hWp =>
+        refine Or.inr (wpUntil_mono_stop ?_ hWp)
+        intro s' hMid
+        cases hMid with
+        | inl hN => exact Or.inl (Or.inl hN)
+        | inr hRest' =>
+          cases hRest' with
+          | inl hE => exact Or.inl (Or.inr hE)
+          | inr hNext => exact Or.inr hNext
+  · intro s' hEx
+    cases hEx with
+    | inl hN => exact hNorm s' hN
+    | inr hE => exact hEarly s' hE
+
 /-- Loop-header rule over `blockTag?`: `wpLoop_inv_strict` for an invariant
 that is only required at the header block `header`. Each iteration starts at
 the header, executes at least one step, and comes back to the header with a
 smaller ghost value or reaches `exit`. -/
 theorem wpLoop_header {α : Sort x} {r : α → α → Prop} (hWf : WellFounded r)
     (header : Nat) {Inv : α → State → Prop} {exit : State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     (hStep : ∀ a s, ops.atBlock header s → Inv a s →
       wpStepUntil
         (fun s' => exit s' ∨ ∃ a', r a' a ∧ ops.atBlock header s' ∧ Inv a' s')
@@ -1648,7 +1746,8 @@ theorem runAbsFuel_of_none {α : Type x} {stepAbs : α → Option α} {a : α}
 
 section Simulation
 
-variable {State : Type u} [ops : MirWpOps.{u, v, w} State]
+variable {State : Type u} {Out : Type v} {Fault : Type w}
+  [ops : MirWpOps State Out Fault]
 
 /-- Relational simulation rule. `R` relates abstract states to machine states
 and `rank` decreases along abstract steps. If every related pair is either
@@ -1657,7 +1756,7 @@ machine reaches again in relation `R`, then the machine reaches an `Exit`
 state for some finished abstract state reachable from the initial one. -/
 theorem wpSim_rel {α : Type x} {StepAbs : α → α → Prop}
     {DoneAbs : α → Prop} {R : α → State → Prop} {Exit : α → State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     {rank : α → Nat}
     (hSim : ∀ a s, R a s →
       (DoneAbs a ∧ Exit a s) ∨
@@ -1688,7 +1787,7 @@ reaches a state related to `runAbsFuel stepAbs k a` for some `k ≤ rank a` at
 which the abstract machine has halted. -/
 theorem wpSim_det_run {α : Type x} {stepAbs : α → Option α}
     {R : α → State → Prop} {Exit : α → State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     {rank : α → Nat}
     (hSim : ∀ a s, R a s →
       (stepAbs a = none → Exit a s) ∧
@@ -1751,7 +1850,7 @@ theorem wpSim_det_run {α : Type x} {stepAbs : α → Option α}
 the machine reaches a state related to some halted abstract state. -/
 theorem wpSim_det {α : Type x} {stepAbs : α → Option α}
     {R : α → State → Prop} {Exit : α → State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     {rank : α → Nat}
     (hSim : ∀ a s, R a s →
       (stepAbs a = none → Exit a s) ∧
@@ -1773,7 +1872,7 @@ machine step (`stepWp` into the relation at the abstract successor). The
 conclusion is that of `wpSim_det_run`. -/
 theorem wpSim_step {α : Type x} {stepAbs : α → Option α}
     {R : α → State → Prop} {Exit : α → State → Prop}
-    {onDone : ops.Out → Prop} {onFault : ops.Fault → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
     {rank : α → Nat}
     (hSim : ∀ a s, R a s →
       (stepAbs a = none → Exit a s) ∧
@@ -1824,7 +1923,7 @@ def toyStep (s : ToyState) : StepOutcome ToyState Nat Unit :=
 
 /-- Deterministic step interface of the toy countdown machine, exposing the
 current block as its tag. -/
-@[reducible] def toyOps : MirWpOps ToyState :=
+@[reducible] def toyOps : MirWpOps ToyState Nat Unit :=
   MirWpOps.ofDetStep toyStep (fun s => some s.block)
 
 /-- One loop iteration of the toy machine: from the header with `n + 1`
@@ -1957,5 +2056,107 @@ theorem toy_fault_wpOutcome (block i acc : Nat) (post : Nat → Prop) :
     wpOutcome (ops := toyOps) post (fun err => err = ())
       { block := block + 2, i := i, acc := acc } :=
   wpOutcome_det_fault_eq (step := toyStep) (err := ()) rfl rfl
+
+/-- Outcome type for a dot-notation and early-return regression canary. -/
+inductive ToyOutcome where
+  /-- Normal loop completion returning `v`. -/
+  | normal (v : Nat) : ToyOutcome
+  /-- Early return from inside the loop returning `v`. -/
+  | early (v : Nat) : ToyOutcome
+
+/-- One step of a two-exit countdown machine: if `i = 0` it returns `.normal acc`,
+if `acc = 5` it takes an early return `.early acc`, otherwise it decrements `i`
+and increments `acc`. -/
+def earlyToyStep (s : ToyState) : StepOutcome ToyState ToyOutcome Unit :=
+  match s.block with
+  | 0 =>
+    match s.i with
+    | 0 => .done (.normal s.acc)
+    | _ + 1 =>
+      match Nat.beq s.acc 5 with
+      | true => .step { block := 2, i := s.i, acc := s.acc }
+      | false => .step { block := 1, i := s.i, acc := s.acc }
+  | 1 => .step { block := 0, i := Nat.pred s.i, acc := s.acc + 1 }
+  | 2 => .done (.early s.acc)
+  | _ => .fault ()
+
+section EarlyToyCanary
+
+/-- Non-reducible local `MirWpOps` instance verifying that `outParam` resolves
+constructor dot-notation (`.normal` / `.early`) without any wrapper. -/
+local instance earlyToyOpsInst : MirWpOps ToyState ToyOutcome Unit :=
+  MirWpOps.ofDetStep earlyToyStep (fun s => some s.block)
+
+/-- Regression canary exercising `wpLoop_early_return` (both normal exit and
+mid-loop early exit) and constructor dot-notation on `outParam` `Out`. -/
+theorem earlyToy_spec (n : Nat) :
+    wpStateOk (fun out => out = .normal n ∨ out = .early 5)
+      ({ block := 0, i := n, acc := 0 } : ToyState) := by
+  refine wpLoop_early_return (r := fun a b : Nat => a < b) Nat.lt_wfRel.wf
+    (Inv := fun k s => s.block = 0 ∧ s.i = k ∧ s.acc + k = n)
+    (normalExit := fun s => s.block = 0 ∧ s.i = 0 ∧ s.acc = n)
+    (earlyClean := fun s => s.block = 2 ∧ s.acc = 5)
+    ?_ ?_ ?_ n ({ block := 0, i := n, acc := 0 } : ToyState)
+    ⟨rfl, rfl, Nat.zero_add n⟩
+  · intro k s hInv
+    cases s with
+    | mk block i acc =>
+      have hB : block = 0 := hInv.1
+      have hI : i = k := hInv.2.1
+      have hSum : acc + k = n := hInv.2.2
+      subst hB
+      subst hI
+      cases i with
+      | zero => exact Or.inl ⟨rfl, rfl, hSum⟩
+      | succ j =>
+        refine Or.inr (Or.inr ?_)
+        cases hEq : Nat.beq acc 5 with
+        | true =>
+          have hAcc5 : acc = 5 := Nat.eq_of_beq_eq_true hEq
+          have hStep : earlyToyStep { block := 0, i := j + 1, acc := acc } =
+              .step { block := 2, i := j + 1, acc := acc } := by
+            unfold earlyToyStep
+            change (match Nat.beq acc 5 with
+              | true => (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
+                  StepOutcome ToyState ToyOutcome Unit)
+              | false => StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
+            rw [hEq]
+          exact wpUntil_det_step_eq (step := earlyToyStep) hStep
+            (wpUntil_here (Or.inr (Or.inl ⟨rfl, hAcc5⟩)))
+        | false =>
+          have hStep1 : earlyToyStep { block := 0, i := j + 1, acc := acc } =
+              .step { block := 1, i := j + 1, acc := acc } := by
+            unfold earlyToyStep
+            change (match Nat.beq acc 5 with
+              | true => (StepOutcome.step { block := 2, i := j + 1, acc := acc } :
+                  StepOutcome ToyState ToyOutcome Unit)
+              | false => StepOutcome.step { block := 1, i := j + 1, acc := acc }) = _
+            rw [hEq]
+          refine wpUntil_det_step_eq (step := earlyToyStep) hStep1
+            (wpUntil_det_step_eq (step := earlyToyStep)
+              (s' := { block := 0, i := j, acc := acc + 1 }) rfl
+              (wpUntil_here (Or.inr (Or.inr ⟨j, Nat.lt_succ_self j, rfl, rfl, ?_⟩))))
+          rw [Nat.add_assoc, Nat.add_comm 1 j]
+          exact hSum
+  · intro s hN
+    cases s with
+    | mk block i acc =>
+      have hB : block = 0 := hN.1
+      have hI : i = 0 := hN.2.1
+      have hA : acc = n := hN.2.2
+      subst hB
+      subst hI
+      exact wpOutcome_det_done_eq (step := earlyToyStep) (out := .normal acc) rfl
+        (Or.inl (congrArg ToyOutcome.normal hA))
+  · intro s hE
+    cases s with
+    | mk block i acc =>
+      have hB : block = 2 := hE.1
+      have hA : acc = 5 := hE.2
+      subst hB
+      exact wpOutcome_det_done_eq (step := earlyToyStep) (out := .early acc) rfl
+        (Or.inr (congrArg ToyOutcome.early hA))
+
+end EarlyToyCanary
 
 end Anneal.ParametricCore
