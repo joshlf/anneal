@@ -4085,7 +4085,7 @@ theorem linkCallee_depth0_borrow_collision_divergence (fallback : ExternalCallHa
    borrowCaller_linked_handler_ub fallback _ _ _,
    borrowCaller_linked_withCallees_ub fallback _ _ _⟩
 
-/-! ### `linkCalleeBorrowIsolatedHandler` (resolving Gaps #8 & #9) & Gap #10 (caller-stack reference aliasing) -/
+/-! ### `linkCalleeBorrowIsolatedHandler` (avoiding Gaps #8 & #9) & Gap #10 (caller-stack reference aliasing) -/
 
 /--
 Unrestricted panic call contract for `checked_add_u8` under borrow-isolated
@@ -4138,7 +4138,7 @@ theorem checkedAddU8_borrowIsolated_holdsTotallyOn (fallback : ExternalCallHandl
       exact checkedAddU8_borrowIsolated_callee_wp typeArgs a b mem)
 
 /--
-Gap #8 resolved for value-passing callees: `borrowCallerMir` (which faults `.ub`
+Gap #8 avoided for value-passing callees: `borrowCallerMir` (which faults `.ub`
 under both `linkCalleeHandler` and `linkCalleeWithCalleesHandler`) satisfies
 `TotalExactPanicContract` and `NeverPanics` and returns `5` under
 `linkCalleeBorrowIsolatedHandler`.
@@ -4188,7 +4188,7 @@ theorem borrowCaller_borrowIsolated_neverPanics_and_totalExact (fallback : Exter
   exact ⟨hTot, hTot.exact.1⟩
 
 /--
-Gap #9 also resolved: `outerCallerMir` with linked helper `[midHelperMir]`
+Gap #9 also avoided: `outerCallerMir` with linked helper `[midHelperMir]`
 satisfies `TotalExactPanicContract` under `linkCalleeBorrowIsolatedHandler`.
 -/
 theorem outerCaller_borrowIsolated_totalExact (fallback : ExternalCallHandler) :
@@ -4655,6 +4655,66 @@ theorem outerTwoSiteCaller_reachableCalleesCallSitesPreserved
       [(twoSiteMidHelperPath, 2)] checkedAddU8Path :=
     (reachableCalleesCallSitesPreserved_iff _ _ _ _).1 rfl
   ⟨h, h.calleeTableExcludes_initStateful_of_ne_nil (by simp) args mem⟩
+
+/-! ### Helper chains: the caller must still call the helper -/
+
+/--
+`outer_caller` after pre-capture inlining of both its call to `mid_helper` and
+`mid_helper`'s call to `checked_add_u8`: the checked addition sits directly in
+the caller, and no call to either path remains.
+-/
+def outerCallerFullyInlinedMir : CapturedMir :=
+  checkedAddMir "panic_tests::outer_caller" u8Ty u8CheckedTy .continue_
+
+/--
+The four guards over `callees` accept the fully inlined caller, because the
+linked helper still contains its call to `checked_add_u8`. The helper-chain guard
+rejects it: the caller no longer calls the helper, and it has no call to the
+target either.
+-/
+theorem outerCallerFullyInlined_fools_callees_guards :
+    CalleesCallBoundaryPreserved outerCallerFullyInlinedMir [midHelperMir] [midHelperPath]
+        checkedAddU8Path ∧
+      CalleesCallSitesPreserved outerCallerFullyInlinedMir [midHelperMir] [(midHelperPath, 1)]
+        checkedAddU8Path ∧
+      ReachableCalleesCallBoundaryPreserved outerCallerFullyInlinedMir [midHelperMir]
+        [midHelperPath] checkedAddU8Path ∧
+      ReachableCalleesCallSitesPreserved outerCallerFullyInlinedMir [midHelperMir]
+        [(midHelperPath, 1)] checkedAddU8Path ∧
+      ¬ HelperChainCallBoundaryPreserved outerCallerFullyInlinedMir [midHelperMir]
+        midHelperPath checkedAddU8Path ∧
+      ¬ BodyCallsDefPath checkedAddU8Path outerCallerFullyInlinedMir := by
+  refine ⟨(calleesCallBoundaryPreserved_iff _ _ _ _).1 rfl,
+    (calleesCallSitesPreserved_iff _ _ _ _).1 rfl,
+    (reachableCalleesCallBoundaryPreserved_iff _ _ _ _).1 rfl,
+    (reachableCalleesCallSitesPreserved_iff _ _ _ _).1 rfl,
+    not_helperChainCallBoundaryPreserved_of_not_callsHelper rfl, fun h => ?_⟩
+  have hT := (bodyCallsDefPath_iff _ _).2 h
+  rw [show bodyCallsDefPath checkedAddU8Path outerCallerFullyInlinedMir = false from rfl] at hT
+  nomatch hT
+
+/-- The helper-chain guard accepts the caller that keeps both calls, and yields the runtime guard. -/
+theorem outerCaller_helperChainCallBoundaryPreserved :
+    HelperChainCallBoundaryPreserved outerCallerMir [midHelperMir] midHelperPath
+        checkedAddU8Path ∧
+      ∀ args, CalleeTableExcludes
+        (initMachineStateWithCallees outerCallerMir args [midHelperMir]).memory
+        checkedAddU8Path :=
+  have h : HelperChainCallBoundaryPreserved outerCallerMir [midHelperMir] midHelperPath
+      checkedAddU8Path := (helperChainCallBoundaryPreserved_iff _ _ _ _).1 rfl
+  ⟨h, h.calleeTableExcludes_init⟩
+
+/--
+The guard rejects a chain whose helper was inlined: with `midHelperInlinedMir`
+linked, the helper has no call to the target.
+-/
+theorem outerCaller_inlinedHelper_not_helperChain :
+    ¬ HelperChainCallBoundaryPreserved outerCallerMir [midHelperInlinedMir] midHelperPath
+      checkedAddU8Path := fun h => by
+  have hT := (helperChainCallBoundaryPreserved_iff _ _ _ _).2 h
+  rw [show helperChainCallBoundaryPreserved outerCallerMir [midHelperInlinedMir] midHelperPath
+    checkedAddU8Path = false from rfl] at hT
+  nomatch hT
 
 /-! ### `ReachesLinkedOutcome` fault-free refutations & `withCallees` contract-level exact compose -/
 
@@ -5472,6 +5532,9 @@ theorem all_panic_contracts_tests :
     (type_of% @outerTwoSiteHalfInlined_calleesCallBoundary_not_callSites) ∧
     (type_of% @outerCaller_deadDecoyHelper_passes_syntactic_rejected_by_reachable) ∧
     (type_of% @outerTwoSiteCaller_reachableCalleesCallSitesPreserved) ∧
+    (type_of% @outerCallerFullyInlined_fools_callees_guards) ∧
+    (type_of% @outerCaller_helperChainCallBoundaryPreserved) ∧
+    (type_of% @outerCaller_inlinedHelper_not_helperChain) ∧
     (type_of% @addCaller_wrongAnswer_treeSafe_not_panicsOnlyIf) ∧
     (type_of% @addCaller_unexpectedAbort_treeSafe_not_panicsOnlyIf) ∧
     (type_of% @checkedAddU8_externalClosedCallee_totalExactPolicy) ∧
@@ -5660,6 +5723,9 @@ theorem all_panic_contracts_tests :
     @outerTwoSiteHalfInlined_calleesCallBoundary_not_callSites,
     @outerCaller_deadDecoyHelper_passes_syntactic_rejected_by_reachable,
     @outerTwoSiteCaller_reachableCalleesCallSitesPreserved,
+    @outerCallerFullyInlined_fools_callees_guards,
+    @outerCaller_helperChainCallBoundaryPreserved,
+    @outerCaller_inlinedHelper_not_helperChain,
     @addCaller_wrongAnswer_treeSafe_not_panicsOnlyIf,
     @addCaller_unexpectedAbort_treeSafe_not_panicsOnlyIf,
     @checkedAddU8_externalClosedCallee_totalExactPolicy,

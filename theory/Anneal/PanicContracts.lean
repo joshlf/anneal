@@ -72,9 +72,11 @@ state when a panic may happen, when it must happen, and that every execution
    caller's borrows without the caller's `StackFrame.locals`, so (a) callee
    teardown disables live depth-0 caller borrows (Gap #8) and (b) dereferencing
    a caller stack reference aliases into the callee's own local frame (Gap #10).
-   `linkCalleeBorrowIsolatedHandler` resolves Gap #8 and Gap #9 for
-   value-passing / global-memory callees while failing closed (`.ub`) on
-   attempts to dereference caller stack borrows.
+   `linkCalleeBorrowIsolatedHandler` avoids Gap #8 and Gap #9 for
+   value-passing / global-memory callees and faults (`.ub`) when the callee
+   dereferences a caller stack reference. It is a handler of this file, not part
+   of the trusted linking semantics, and no theorem here relates it to inlined
+   execution.
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
    body. The guard is established for initial states, used at each call
@@ -92,7 +94,9 @@ state when a panic may happen, when it must happen, and that every execution
    `CalleesCallSitesPreserved`, and the CFG-reachable guards
    `ReachableCallBoundaryPreserved`, `ReachableCallSitesPreserved`,
    `ReachableCalleesCallBoundaryPreserved`, and
-   `ReachableCalleesCallSitesPreserved`.
+   `ReachableCalleesCallSitesPreserved`, and the helper-chain guard
+   `HelperChainCallBoundaryPreserved`. The `Callees*` guards inspect `callees`
+   only and do not look at the caller.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
    `ExactPass`.
 -/
@@ -3771,9 +3775,20 @@ def closeMirTreeBorrowIsolated
 
 /--
 Borrow-isolated, frame-restoring `ExternalCallHandler`: executes `calleeBody`
-from `enterBorrowIsolatedCalleeState` (resolving both depth-0 caller-borrow
-collision and nested-frame `activeCallee` confusion) and restores the caller's
-frame fields, `traitImpls`, and `borrows` on normal return.
+from `enterBorrowIsolatedCalleeState`, which avoids both the depth-0 caller-borrow
+collision and the nested-frame `activeCallee` confusion, and restores the
+caller's frame fields, `traitImpls`, and `borrows` on normal return.
+
+This handler is a modeling choice of this file, not part of the trusted linking
+semantics, and no theorem here relates it to inlined execution. A contract
+proved for `mirHandledTrees body (linkCalleeBorrowIsolatedHandler …)` is a fact
+about that linked system. In particular:
+
+* the callee cannot dereference a reference to a caller local (it faults, so
+  such callees cannot be linked this way at all);
+* the borrow entries the callee creates are discarded on return; and
+* on unwind the caller receives the request memory, as for every handler built
+  on `outcomeToCallAns` (pre-panic writes are rolled back).
 -/
 def linkCalleeBorrowIsolatedHandler
     (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
@@ -8466,6 +8481,90 @@ theorem not_reachableCalleesCallSitesPreserved_of_count_ne
     (hNe : bodyReachableCallSiteCount targetDefPath body ≠ p.2) :
     ¬ ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath :=
   fun h => hNe (h.callerReachableSiteCounts body p hBodyMem hp hPath)
+
+/-! ### Helper chains -/
+
+/--
+Call-boundary guard for a contracted callee reached through a linked helper.
+
+`CalleesCallBoundaryPreserved`, `CalleesCallSitesPreserved`, and their
+CFG-reachable variants inspect only the bodies in `callees`; none of them looks
+at `callerBody`. A caller from which the call to the helper was inlined away,
+together with the helper's own call to the target, still satisfies all four,
+although no call to the target is left on any path from the caller.
+
+This guard checks the whole chain: the caller has a CFG-reachable direct call to
+`helperPath`, that path is linked to a body with a CFG-reachable direct call to
+`targetDefPath`, and the target itself is neither linked nor dispatched by a
+trait implementation. Longer chains are checked one hop at a time.
+-/
+structure HelperChainCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperPath targetDefPath : DefPath) : Prop where
+  /-- The caller has a CFG-reachable direct call to the helper. -/
+  callerCallsHelper : BodyReachableCallsDefPath helperPath callerBody
+  /-- The helper is linked and has a CFG-reachable direct call to the target. -/
+  helperLinked : ∃ helper, findCallee? callees helperPath = .some helper ∧
+    BodyReachableCallsDefPath targetDefPath helper
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation of the caller or of a linked body dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `HelperChainCallBoundaryPreserved`. -/
+def helperChainCallBoundaryPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (helperPath targetDefPath : DefPath) : Bool :=
+  bodyReachableCallsDefPath helperPath callerBody &&
+    ((match findCallee? callees helperPath with
+      | .some helper => bodyReachableCallsDefPath targetDefPath helper
+      | .none => false) &&
+      ((findCallee? callees targetDefPath).isNone &&
+        !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+          targetDefPath))
+
+/-- The checker decides `HelperChainCallBoundaryPreserved`. -/
+theorem helperChainCallBoundaryPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperPath targetDefPath : DefPath) :
+    helperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath = true ↔
+      HelperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath := by
+  unfold helperChainCallBoundaryPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none]
+  constructor
+  · rintro ⟨h₁, h₂, h₃, h₄⟩
+    refine ⟨(bodyReachableCallsDefPath_iff _ _).1 h₁, ?_, h₃, h₄⟩
+    cases hF : findCallee? callees helperPath with
+    | none => rw [hF] at h₂; nomatch h₂
+    | some helper =>
+      rw [hF] at h₂
+      exact ⟨helper, rfl, (bodyReachableCallsDefPath_iff _ _).1 h₂⟩
+  · intro h
+    obtain ⟨helper, hF, hCalls⟩ := h.helperLinked
+    refine ⟨(bodyReachableCallsDefPath_iff _ _).2 h.callerCallsHelper, ?_, h.notLinked,
+      h.noTraitImpl⟩
+    rw [hF]
+    exact (bodyReachableCallsDefPath_iff _ _).2 hCalls
+
+/-- A caller without a reachable call to the helper fails the chain guard. -/
+theorem not_helperChainCallBoundaryPreserved_of_not_callsHelper {callerBody : CapturedMir}
+    {callees : List CapturedMir} {helperPath targetDefPath : DefPath}
+    (hNo : bodyReachableCallsDefPath helperPath callerBody = false) :
+    ¬ HelperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath := by
+  intro h
+  have hT := (bodyReachableCallsDefPath_iff _ _).2 h.callerCallsHelper
+  rw [hNo] at hT
+  nomatch hT
+
+/-- The chain guard establishes the runtime guard in the initial state. -/
+theorem HelperChainCallBoundaryPreserved.calleeTableExcludes_init {callerBody : CapturedMir}
+    {callees : List CapturedMir} {helperPath targetDefPath : DefPath}
+    (h : HelperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 
