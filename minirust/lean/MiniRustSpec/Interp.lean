@@ -108,13 +108,16 @@ here.
   (`BottomOfStack` and `BackToCaller`), and `Terminator::Intrinsic`
   (`spec/lang/step/terminators.md`) with `unit_value`, `unit_type`, and
   `Machine::eval_intrinsic` for `IntrinsicOp::{Abort, Assume, Exit,
-  PrintStdout, PrintStderr, Allocate, Deallocate, RawEq,
+  PrintStdout, PrintStderr, Allocate, Deallocate, RawEq, AtomicStore,
+  AtomicLoad, AtomicCompareExchange, AtomicFetchAndOp,
   PointerExposeProvenance, PointerWithExposedProvenance, GetUnwindPayload}`
   (with `Machine::exit`, `Machine::eval_print`, `Machine::load_raw_data`,
   `IntPtrCast::expose`, `IntPtrCast::int2ptr`, and `BasicMemory::leak_check`;
   `spec/lang/step/intrinsics.md`, `spec/mem/intptrcast.md`,
-  `spec/mem/basic.md`). The thread, lock, and atomic intrinsics report
-  `unsupported`.
+  `spec/mem/basic.md`). The atomic intrinsics go through
+  `Machine::typed_load` / `Machine::typed_store` with `Atomicity::Atomic`
+  and the target's `MAX_ATOMIC_SIZE` (`spec/prelude/target.md`). The thread
+  (`Spawn`, `Join`) and `Lock` intrinsics report `unsupported`.
 * The representation relation (`Type::{decode, encode}`) for `Type::Int`,
   `Type::Bool`, `Type::Ptr` (thin pointers through `decode_ptr` and
   `encode_ptr`, which carry provenance in `AbstractByte::Init`, and wide
@@ -559,6 +562,9 @@ def x86_64.INT_MAX_ALIGN : Align := ⟨16⟩
 /-- `x86_64::ENDIANNESS`:
 > "const ENDIANNESS: Endianness = LittleEndian;" -/
 def x86_64.ENDIANNESS : Endianness := .LittleEndian
+/-- `x86_64::MAX_ATOMIC_SIZE` = 64 bits:
+> "const MAX_ATOMIC_SIZE: Size = Size::from_bits_const(64).unwrap();" -/
+def x86_64.MAX_ATOMIC_SIZE : Size := ⟨8⟩
 
 /-- `x86_64::valid_size` (`spec/prelude/target.md`):
 > "fn valid_size(size: Size) -> bool {
@@ -6175,6 +6181,53 @@ def typeVariantsEq (seen : List Int) : List (Int × Variant) → Map Int Variant
 
 end
 
+mutual
+
+/-- Structural equality `current == before` on MiniRust values, used by
+`IntrinsicOp::AtomicCompareExchange` (`spec/lang/step/intrinsics.md`):
+> "if current == before {
+>      self.typed_store(ptr, next, ret_ty, align, Atomicity::Atomic)?;
+>  }"
+specr-lang data types compare structurally, and the generated `Value` has no
+derived decidable equality (it is nested through `List (Value M)`), so the
+comparison is spelled out constructor by constructor. `Value::Ptr` and the
+bytes of `Value::Union` compare provenance with the decidable equality `decEq`
+of `M::Provenance`, the only thing the comparison needs from the memory model;
+`valueEq` and `valueEqM` instantiate it. -/
+def valueEqWith {M : Type} [Memory M] (decEq : DecidableEq (Memory.Provenance M)) :
+    Value M → Value M → Bool
+  | .Int i1, .Int i2 => i1 == i2
+  | .Bool b1, .Bool b2 => b1 == b2
+  | .Ptr p1, .Ptr p2 => decide (p1 = p2)
+  | .Tuple vs1, .Tuple vs2 => valueListEqWith decEq vs1 vs2
+  | .Variant d1 v1, .Variant d2 v2 => d1 == d2 && valueEqWith decEq v1 v2
+  | .Union c1, .Union c2 => decide (c1 = c2)
+  | _, _ => false
+
+/-- Element-wise comparison of the fields of two `Value::Tuple`s in
+`valueEqWith` (`spec/lang/step/intrinsics.md`):
+> "if current == before {" -/
+def valueListEqWith {M : Type} [Memory M] (decEq : DecidableEq (Memory.Provenance M)) :
+    List (Value M) → List (Value M) → Bool
+  | [], [] => true
+  | v1 :: r1, v2 :: r2 => valueEqWith decEq v1 v2 && valueListEqWith decEq r1 r2
+  | _, _ => false
+
+end
+
+/-- `current == before` on `Value<BasicMemory<x86_64>>` in
+`IntrinsicOp::AtomicCompareExchange` (`spec/lang/step/intrinsics.md`):
+> "if current == before {" -/
+def valueEq : Val → Val → Bool :=
+  valueEqWith (M := BM) (inferInstance : DecidableEq Prov)
+
+/-- Polymorphic `current == before` on `Value<M>` in
+`IntrinsicOp::AtomicCompareExchange` (`spec/lang/step/intrinsics.md`); see
+`valueEq`, which it is by definition at `M = BasicMemory<x86_64>`:
+> "if current == before {" -/
+def valueEqM {M : Type} [Memory M] [MemoryOps M] : Value M → Value M → Bool :=
+  valueEqWith (M := M) MemoryOps.decEqProv
+
 /-- `Machine::load_raw_data` (`spec/lang/step/intrinsics.md`):
 > "fn load_raw_data(&mut self, ptr : Pointer<<M as Memory>::Provenance>, ptr_ty : PtrType) -> Result<List<u8>> {
 >      let PtrType::Ref { pointee, .. } = ptr_ty else {
@@ -6207,6 +6260,7 @@ def loadRawData (m : Mach) (ptr : Pointer Prov) (ptrTy : PtrType) :
 /-- `Machine::eval_intrinsic` (`spec/lang/step/intrinsics.md`) for
 `PointerExposeProvenance`, `PointerWithExposedProvenance`, `Exit`, `Abort`,
 `Assume`, `PrintStdout`, `PrintStderr`, `Allocate`, `Deallocate`, `RawEq`,
+`AtomicStore`, `AtomicLoad`, `AtomicCompareExchange`, `AtomicFetchAndOp`,
 and `GetUnwindPayload`:
 > "fn eval_intrinsic(&mut self,
 >      IntrinsicOp::PointerExposeProvenance: IntrinsicOp,
@@ -6426,6 +6480,163 @@ and `GetUnwindPayload`:
 >  }"
 > "fn eval_intrinsic(
 >      &mut self,
+>      IntrinsicOp::AtomicStore: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 2 {
+>          throw_ub!(\"invalid number of arguments for `AtomicStore` intrinsic\");
+>      }
+>
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `AtomicStore` intrinsic: not a thin pointer\");
+>      };
+>
+>      let (val, ty) = arguments[1];
+>      let LayoutStrategy::Sized(size, _) = ty.layout::<M::T>() else {
+>          throw_ub!(\"invalid second argument to `AtomicStore` intrinsic: unsized type\");
+>      };
+>      let Some(align) = Align::from_bytes(size.bytes()) else {
+>          throw_ub!(\"invalid second argument to `AtomicStore` intrinsic: size not power of two\");
+>      };
+>      if size > M::T::MAX_ATOMIC_SIZE {
+>          throw_ub!(\"invalid second argument to `AtomicStore` intrinsic: size too big\");
+>      }
+>
+>      if ret_ty != unit_type() {
+>          throw_ub!(\"invalid return type for `AtomicStore` intrinsic\")
+>      }
+>
+>      self.typed_store(ptr, val, ty, align, Atomicity::Atomic)?;
+>      ret(unit_value())
+>  }
+>
+>  fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::AtomicLoad: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 1 {
+>          throw_ub!(\"invalid number of arguments for `AtomicLoad` intrinsic\");
+>      }
+>
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `AtomicLoad` intrinsic: not a thin pointer\");
+>      };
+>
+>      let size = ret_ty.layout::<M::T>().expect_size(\"WF ensures intrinsic return types are sized\");
+>      let Some(align) = Align::from_bytes(size.bytes()) else {
+>          throw_ub!(\"invalid return type for `AtomicLoad` intrinsic: size not power of two\");
+>      };
+>      if size > M::T::MAX_ATOMIC_SIZE {
+>          throw_ub!(\"invalid return type for `AtomicLoad` intrinsic: size too big\");
+>      }
+>
+>      // `ret_ty` is ensured to be sized above.
+>      let val = self.typed_load(ptr, ret_ty, align, Atomicity::Atomic)?;
+>      ret(val)
+>  }
+>
+>  fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::AtomicCompareExchange: IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 3 {
+>          throw_ub!(\"invalid number of arguments for `AtomicCompareExchange` intrinsic\");
+>      }
+>
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `AtomicCompareExchange` intrinsic: not a thin pointer\");
+>      };
+>
+>      let (current, curr_ty) = arguments[1];
+>      if curr_ty != ret_ty {
+>          throw_ub!(\"invalid second argument to `AtomicCompareExchange` intrinsic: not same type as return value\");
+>      }
+>
+>      let (next, next_ty) = arguments[2];
+>      if next_ty != ret_ty {
+>          throw_ub!(\"invalid third argument to `AtomicCompareExchange` intrinsic: not same type as return value\");
+>      }
+>
+>      if !matches!(ret_ty, Type::Int(_)) {
+>          throw_ub!(\"invalid return type for `Intrinis::AtomicCompareExchange`: only works with integers\");
+>      }
+>
+>      // All integers are sized with a power of two size.
+>      let size = ret_ty.layout::<M::T>().expect_size(\"`ret_ty` is an integer\");
+>      let align = Align::from_bytes(size.bytes()).unwrap();
+>      if size > M::T::MAX_ATOMIC_SIZE {
+>          throw_ub!(\"invalid return type for `AtomicCompareExchange` intrinsic: size too big\");
+>      }
+>
+>      // The value at the location right now.
+>      let before = self.typed_load(ptr, ret_ty, align, Atomicity::Atomic)?;
+>
+>      // This is the central part of the operation. If the expected before value at ptr is the current value,
+>      // then we exchange it for the next value.
+>      // FIXME: The memory model might have to know that this is a compare-exchange.
+>      if current == before {
+>          self.typed_store(ptr, next, ret_ty, align, Atomicity::Atomic)?;
+>      } else {
+>          // We do *not* do a store on a failing AtomicCompareExchange. This means that races between
+>          // a non-atomic load and a failing AtomicCompareExchange are not considered UB!
+>      }
+>
+>      ret(before)
+>  }
+>
+>  fn eval_intrinsic(
+>      &mut self,
+>      IntrinsicOp::AtomicFetchAndOp(op): IntrinsicOp,
+>      arguments: List<(Value<M>, Type)>,
+>      ret_ty: Type,
+>  ) -> NdResult<Value<M>> {
+>      if arguments.len() != 2 {
+>          throw_ub!(\"invalid number of arguments for `AtomicFetchAndOp` intrinsic\");
+>      }
+>
+>      let Value::Ptr(Pointer { thin_pointer: ptr, metadata: None }) = arguments[0].0 else {
+>          throw_ub!(\"invalid first argument to `AtomicFetchAndOp` intrinsic: not a thin pointer\");
+>      };
+>
+>      let (other, other_ty) = arguments[1];
+>      if other_ty != ret_ty {
+>          throw_ub!(\"invalid second argument to `AtomicFetchAndOp` intrinsic: not same type as return value\");
+>      }
+>
+>      let Type::Int(int_ty) = ret_ty else {
+>          throw_ub!(\"invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers\");
+>      };
+>
+>      // All integers are sized with a power of two size.
+>      let size = ret_ty.layout::<M::T>().expect_size(\"`ret_ty` is an integer\");
+>      let align = Align::from_bytes(size.bytes()).unwrap();
+>      if size > M::T::MAX_ATOMIC_SIZE {
+>          throw_ub!(\"invalid return type for `AtomicFetchAndOp` intrinsic: size too big\");
+>      }
+>
+>      // The value at the location right now.
+>      let previous = self.typed_load(ptr, ret_ty, align, Atomicity::Atomic)?;
+>
+>      // Convert to integers
+>      let Value::Int(other_int) = other else { unreachable!() };
+>      let Value::Int(previous_int) = previous else { unreachable!() };
+>
+>      // Perform operation.
+>      let next_int = Self::eval_int_bin_op(op, previous_int, other_int, int_ty)?;
+>      let next = Value::Int(next_int);
+>
+>      // Store it again.
+>      self.typed_store(ptr, next, ret_ty, align, Atomicity::Atomic)?;
+>
+>      ret(previous)
+>  }"
+> "fn eval_intrinsic(
+>      &mut self,
 >      IntrinsicOp::GetUnwindPayload: IntrinsicOp,
 >      arguments: List<(Value<M>, Type)>,
 >      ret_ty: Type,
@@ -6455,9 +6666,17 @@ unit_type()` and `ret_ty != Type::Bool` match on the exact `unitType` and
 Type::Int(IntType { signed: Unsigned, size: M::T::PTR_SIZE })` in
 `PointerExposeProvenance` matches on `usize` (`⟨.Unsigned, ⟨8⟩⟩`).
 `PointerWithExposedProvenance` resolves the angelic `predict` choice of
-`IntPtrCast::int2ptr` through `IntPtrCast.int2ptr` (see `int2ptrProvenance`),
-and the thread (`Spawn`, `Join`), lock, and atomic intrinsics report
-`unsupported`. -/
+`IntPtrCast::int2ptr` through `IntPtrCast.int2ptr` (see `int2ptrProvenance`).
+In the atomic intrinsics, `size > M::T::MAX_ATOMIC_SIZE` compares byte counts
+against `x86_64.MAX_ATOMIC_SIZE`; `curr_ty != ret_ty`, `next_ty != ret_ty`,
+and `other_ty != ret_ty` use `typeEq`; `current == before` is `valueEq`; the
+`unwrap` of `Align::from_bytes(size.bytes())` and the two `unreachable!()`s
+of `AtomicFetchAndOp` are spec panics; and `AtomicFetchAndOp` stores the
+result of `eval_int_bin_op` as is. Upstream does not bring that result in
+bounds (unlike `eval_bin_op` for `BinOp::Int`), so a result outside the
+integer type fails the `assert!` of `Machine::typed_store` (`typedStore`),
+which is a spec panic here as well. Only the thread (`Spawn`, `Join`) and
+`Lock` intrinsics report `unsupported`. -/
 def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type»))
     (retTy : «Type») : Interp (Val × Mach) :=
   match op with
@@ -6585,6 +6804,106 @@ def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type
           | _ => ub "invalid first argument to `RawEq` intrinsic: not a pointer"
       | _ => ub "invalid return type for `RawEq` intrinsic"
     | _ => ub "invalid number of arguments for `RawEq` intrinsic"
+  | .AtomicStore =>
+    match arguments with
+    | [(ptrV, _), (val, ty)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ => do
+        let layout ← Type.layout ty
+        match layout with
+        | .Sized size _ =>
+          match alignFromBytesInt size.bytes with
+          | some align =>
+            if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+              ub "invalid second argument to `AtomicStore` intrinsic: size too big"
+            else
+              match retTy with
+              | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+                let m ← typedStore m ptr val ty align .Atomic
+                pure (unitValue, m)
+              | _ => ub "invalid return type for `AtomicStore` intrinsic"
+          | none =>
+            ub "invalid second argument to `AtomicStore` intrinsic: size not power of two"
+        | _ => ub "invalid second argument to `AtomicStore` intrinsic: unsized type"
+      | _ => ub "invalid first argument to `AtomicStore` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicStore` intrinsic"
+  | .AtomicLoad =>
+    match arguments with
+    | [(ptrV, _)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ => do
+        let size ← LayoutStrategy.expect_size (← Type.layout retTy)
+          "WF ensures intrinsic return types are sized"
+        match alignFromBytesInt size.bytes with
+        | some align =>
+          if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+            ub "invalid return type for `AtomicLoad` intrinsic: size too big"
+          else
+            typedLoad m ptr retTy align .Atomic
+        | none => ub "invalid return type for `AtomicLoad` intrinsic: size not power of two"
+      | _ => ub "invalid first argument to `AtomicLoad` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicLoad` intrinsic"
+  | .AtomicCompareExchange =>
+    match arguments with
+    | [(ptrV, _), (current, currTy), (next, nextTy)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        if !typeEq currTy retTy then
+          ub "invalid second argument to `AtomicCompareExchange` intrinsic: not same type as return value"
+        else if !typeEq nextTy retTy then
+          ub "invalid third argument to `AtomicCompareExchange` intrinsic: not same type as return value"
+        else
+          match retTy with
+          | .Int _ => do
+            let size ← LayoutStrategy.expect_size (← Type.layout retTy) "`ret_ty` is an integer"
+            match alignFromBytesInt size.bytes with
+            | some align =>
+              if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+                ub "invalid return type for `AtomicCompareExchange` intrinsic: size too big"
+              else do
+                let (before, m) ← typedLoad m ptr retTy align .Atomic
+                if valueEq current before then do
+                  let m ← typedStore m ptr next retTy align .Atomic
+                  pure (before, m)
+                else
+                  pure (before, m)
+            | none => specPanic "Align::from_bytes(size.bytes()).unwrap()"
+          | _ =>
+            ub "invalid return type for `Intrinis::AtomicCompareExchange`: only works with integers"
+      | _ =>
+        ub "invalid first argument to `AtomicCompareExchange` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicCompareExchange` intrinsic"
+  | .AtomicFetchAndOp binOp =>
+    match arguments with
+    | [(ptrV, _), (other, otherTy)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        if !typeEq otherTy retTy then
+          ub "invalid second argument to `AtomicFetchAndOp` intrinsic: not same type as return value"
+        else
+          match retTy with
+          | .Int intTy => do
+            let size ← LayoutStrategy.expect_size (← Type.layout retTy) "`ret_ty` is an integer"
+            match alignFromBytesInt size.bytes with
+            | some align =>
+              if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+                ub "invalid return type for `AtomicFetchAndOp` intrinsic: size too big"
+              else do
+                let (previous, m) ← typedLoad m ptr retTy align .Atomic
+                match other with
+                | .Int otherInt =>
+                  match previous with
+                  | .Int previousInt => do
+                    let nextInt ← evalIntBinOp binOp previousInt otherInt intTy
+                    let m ← typedStore m ptr (.Int nextInt) retTy align .Atomic
+                    pure (previous, m)
+                  | _ => specPanic "unreachable: AtomicFetchAndOp previous not Value::Int"
+                | _ => specPanic "unreachable: AtomicFetchAndOp other not Value::Int"
+            | none => specPanic "Align::from_bytes(size.bytes()).unwrap()"
+          | _ =>
+            ub "invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers"
+      | _ => ub "invalid first argument to `AtomicFetchAndOp` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicFetchAndOp` intrinsic"
   | .GetUnwindPayload =>
     if !arguments.isEmpty then
       ub "invalid number of arguments for `GetUnwindPayload` intrinsic"
@@ -6600,8 +6919,8 @@ def evalIntrinsic (m : Mach) (op : IntrinsicOp) (arguments : List (Val × «Type
         else
           ub "invalid return type for `GetUnwindPayload` intrinsic"
       | _ => ub "invalid return type for `GetUnwindPayload` intrinsic"
-  | _ =>
-    unsupported "eval_intrinsic for a thread, lock, or atomic intrinsic"
+  | .Spawn | .Join | .Lock _ =>
+    unsupported "eval_intrinsic for a thread or lock intrinsic"
 
 /-- `Machine::eval_terminator` for every `Terminator`; for `Goto`, `Switch`,
 `Unreachable`, and `Call` (`spec/lang/step/terminators.md`):
@@ -9010,6 +9329,106 @@ def evalIntrinsicM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
           | _ => ub "invalid first argument to `RawEq` intrinsic: not a pointer"
       | _ => ub "invalid return type for `RawEq` intrinsic"
     | _ => ub "invalid number of arguments for `RawEq` intrinsic"
+  | .AtomicStore =>
+    match arguments with
+    | [(ptrV, _), (val, ty)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ => do
+        let layout ← Type.layout ty
+        match layout with
+        | .Sized size _ =>
+          match alignFromBytesInt size.bytes with
+          | some align =>
+            if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+              ub "invalid second argument to `AtomicStore` intrinsic: size too big"
+            else
+              match retTy with
+              | .Tuple [] ⟨⟨0⟩, ⟨1⟩, none⟩ none => do
+                let m ← typedStoreM m ptr val ty align .Atomic
+                pure (unitValueM, m)
+              | _ => ub "invalid return type for `AtomicStore` intrinsic"
+          | none =>
+            ub "invalid second argument to `AtomicStore` intrinsic: size not power of two"
+        | _ => ub "invalid second argument to `AtomicStore` intrinsic: unsized type"
+      | _ => ub "invalid first argument to `AtomicStore` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicStore` intrinsic"
+  | .AtomicLoad =>
+    match arguments with
+    | [(ptrV, _)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ => do
+        let size ← LayoutStrategy.expect_size (← Type.layout retTy)
+          "WF ensures intrinsic return types are sized"
+        match alignFromBytesInt size.bytes with
+        | some align =>
+          if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+            ub "invalid return type for `AtomicLoad` intrinsic: size too big"
+          else
+            typedLoadM m ptr retTy align .Atomic
+        | none => ub "invalid return type for `AtomicLoad` intrinsic: size not power of two"
+      | _ => ub "invalid first argument to `AtomicLoad` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicLoad` intrinsic"
+  | .AtomicCompareExchange =>
+    match arguments with
+    | [(ptrV, _), (current, currTy), (next, nextTy)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        if !typeEq currTy retTy then
+          ub "invalid second argument to `AtomicCompareExchange` intrinsic: not same type as return value"
+        else if !typeEq nextTy retTy then
+          ub "invalid third argument to `AtomicCompareExchange` intrinsic: not same type as return value"
+        else
+          match retTy with
+          | .Int _ => do
+            let size ← LayoutStrategy.expect_size (← Type.layout retTy) "`ret_ty` is an integer"
+            match alignFromBytesInt size.bytes with
+            | some align =>
+              if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+                ub "invalid return type for `AtomicCompareExchange` intrinsic: size too big"
+              else do
+                let (before, m) ← typedLoadM m ptr retTy align .Atomic
+                if valueEqM current before then do
+                  let m ← typedStoreM m ptr next retTy align .Atomic
+                  pure (before, m)
+                else
+                  pure (before, m)
+            | none => specPanic "Align::from_bytes(size.bytes()).unwrap()"
+          | _ =>
+            ub "invalid return type for `Intrinis::AtomicCompareExchange`: only works with integers"
+      | _ =>
+        ub "invalid first argument to `AtomicCompareExchange` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicCompareExchange` intrinsic"
+  | .AtomicFetchAndOp binOp =>
+    match arguments with
+    | [(ptrV, _), (other, otherTy)] =>
+      match ptrV with
+      | .Ptr ⟨ptr, none⟩ =>
+        if !typeEq otherTy retTy then
+          ub "invalid second argument to `AtomicFetchAndOp` intrinsic: not same type as return value"
+        else
+          match retTy with
+          | .Int intTy => do
+            let size ← LayoutStrategy.expect_size (← Type.layout retTy) "`ret_ty` is an integer"
+            match alignFromBytesInt size.bytes with
+            | some align =>
+              if size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes then
+                ub "invalid return type for `AtomicFetchAndOp` intrinsic: size too big"
+              else do
+                let (previous, m) ← typedLoadM m ptr retTy align .Atomic
+                match other with
+                | .Int otherInt =>
+                  match previous with
+                  | .Int previousInt => do
+                    let nextInt ← evalIntBinOp binOp previousInt otherInt intTy
+                    let m ← typedStoreM m ptr (.Int nextInt) retTy align .Atomic
+                    pure (previous, m)
+                  | _ => specPanic "unreachable: AtomicFetchAndOp previous not Value::Int"
+                | _ => specPanic "unreachable: AtomicFetchAndOp other not Value::Int"
+            | none => specPanic "Align::from_bytes(size.bytes()).unwrap()"
+          | _ =>
+            ub "invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers"
+      | _ => ub "invalid first argument to `AtomicFetchAndOp` intrinsic: not a thin pointer"
+    | _ => ub "invalid number of arguments for `AtomicFetchAndOp` intrinsic"
   | .GetUnwindPayload =>
     if !arguments.isEmpty then
       ub "invalid number of arguments for `GetUnwindPayload` intrinsic"
@@ -9025,8 +9444,8 @@ def evalIntrinsicM {M : Type} [Memory M] [MemoryOps M] (m : Machine M)
         else
           ub "invalid return type for `GetUnwindPayload` intrinsic"
       | _ => ub "invalid return type for `GetUnwindPayload` intrinsic"
-  | _ =>
-    unsupported "eval_intrinsic for a thread, lock, or atomic intrinsic"
+  | .Spawn | .Join | .Lock _ =>
+    unsupported "eval_intrinsic for a thread or lock intrinsic"
 
 /-- Polymorphic argument loop of `Terminator::Intrinsic` (`spec/lang/step/terminators.md`);
 see `evalArgs`:
