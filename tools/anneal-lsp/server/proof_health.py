@@ -7702,16 +7702,16 @@ _NORM_CACHE: dict[str, str] = {}
 def _norm_expr(s: str) -> str:
     """Normalize whitespace and strip redundant outer parentheses of a Lean expression.
 
-    Results are memoized in `_NORM_CACHE`, which `audit_lean_text` clears at the start of every
-    scan (deduplication within one file only; no state survives across scans)."""
+    An expression already in normal form (one line, single-spaced, no surrounding whitespace, not
+    starting with `(`) is returned as is. Every other result is memoized in `_NORM_CACHE`, which
+    `audit_lean_text` clears at the start of every scan (deduplication within one file only; no
+    state survives across scans)."""
     hit = _NORM_CACHE.get(s)
     if hit is not None:
         return hit
     if not s:
         return ""
-    # `[adv A3]` Already-normalized single-line expressions (no leading/trailing ASCII ws, no `(`,
-    # no double spaces, no `\n`/`\t`/`\r`, using SIMD `memchr` rather than per-codepoint
-    # `isprintable()`) return verbatim without hashing into `_NORM_CACHE`.
+    # `[adv A3]` These substring tests are C-level scans, cheaper than hashing `s` into the memo.
     if (
         s[0] not in " \t\r\n("
         and s[-1] not in " \t\r\n"
@@ -7721,19 +7721,15 @@ def _norm_expr(s: str) -> str:
         and "\r" not in s
     ):
         return s
-    if "  " not in s and "\n" not in s and "\t" not in s and "\r" not in s:
-        t = s.strip()
-    else:
-        t = " ".join(s.split())
-    while len(t) >= 2 and t[0] == "(" and t[-1] == ")" and _is_outer_paren_wrapped(t):
-        t = t[1:-1].strip()
+    t = _norm_expr_uncached(s)
     _NORM_CACHE[s] = t
     return t
 
 
 def _norm_expr_uncached(s: str) -> str:
-    # `str.isprintable` rules out `\n` / `\t` / `\r` in one C pass (`[adv B3]`).
-    if "  " not in s and (s.isprintable() or ("\n" not in s and "\t" not in s and "\r" not in s)):
+    """The normal form itself. `[adv B4]` This is its only definition: `_norm_expr` adds the
+    already-normal fast path and the memo on top, and must agree with it on every input."""
+    if "  " not in s and "\n" not in s and "\t" not in s and "\r" not in s:
         t = s.strip()
     else:
         t = " ".join(s.split())
@@ -7773,7 +7769,6 @@ _DATA_TYPE_WORDS = frozenset(
 )
 
 
-_SPLIT_RE_CACHE: dict[str, re.Pattern[str]] = {}
 _CONJ_TRIV_SPLIT_RE = re.compile(r"«[^»]*»|" + _SCAN_CHAR_LIT_ALT + "|" + _SCAN_BRACKET_ALTS + r"|∧")
 _DISJ_TRIV_SPLIT_RE = re.compile(r"«[^»]*»|" + _SCAN_CHAR_LIT_ALT + "|" + _SCAN_BRACKET_ALTS + r"|∨")
 _TOP_SPLIT_RE_CACHE: dict[str, re.Pattern[str]] = {
@@ -8256,6 +8251,13 @@ def _first_standalone_use(body: str, name: str) -> int:
         return idx
 
 
+# `[adv B4]` One whole Lean numeric literal: `0xFF` / `0b11` / `0o17`, or decimal digits with an
+# optional fraction and exponent (`12`, `1.5`, `1e5`, `1.5e-3`).
+_NUM_ARG_RE = re.compile(
+    r"0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|\d+(?:\.\d+)?(?:[eE][-+]?\d+)?"
+)
+
+
 def _skip_atomic_proj_chain(body: str, pos: int, n_body: int) -> int:
     """Advance past trailing `.field` projections and `[...]` subscripts on an atomic argument."""
     while pos < n_body:
@@ -8358,9 +8360,19 @@ def _untyped_binders_inhabited_by_calls(
                     continue
                 if ch.isdecimal():
                     # `[adv A3]` Numeral argument (`R 0 s`): consume this slot and advance.
-                    q = arg_pos + 1
-                    while q < n_body and body[q].isdecimal():
-                        q += 1
+                    # `[adv B4]` The whole literal is one slot. Reading only the leading digits
+                    # split `0xFF` / `0b11` / `1e5` into a numeral and an identifier (`xFF`), which
+                    # moved every later argument one slot to the right: with
+                    # `R : Nat → Fin 0 → Nat → Prop`, the `s` of `∀ s, R 0xFF s ∧ False` was read
+                    # at the inhabited third slot instead of the empty `Fin 0`, and a hypothesis
+                    # that holds vacuously was reported as a contradiction.
+                    m_num = _NUM_ARG_RE.match(body, arg_pos)
+                    if m_num is None:
+                        break
+                    q = m_num.end()
+                    if q < n_body and _is_lean_ident_char(body[q]):
+                        # Not a literal this scan can delimit: stop rather than misalign.
+                        break
                     arg_pos = _skip_atomic_proj_chain(body, q, n_body)
                     continue
                 m_id = _IDENT_EXTRACT_RE.match(body, arg_pos)
@@ -9487,10 +9499,20 @@ def _operand_may_be_float(
 ) -> bool:
     """`True` iff normalized operand `e` may denote a `Float` / `Float32` (whose `≤` / `≥` are not
     reflexive: `NaN ≤ NaN` is false): it mentions a `Float`/`Float32` binder, the type / namespace
-    `Float`/`Float32` itself (`Float.nan`, `(x : Float)`), a `.toFloat` / `.toFloat32` projection
-    (`n.toFloat`), or a `...Float` / `...Float32` function applied in call-head position
-    (`asFloat v`, `toFloat (x + 1)`). A variable merely containing or ending in `Float`
-    (`numFloats`, `FloatCount`, `lenFloat`, `lenFloat + 1`, `f lenFloat`) is not one."""
+    `Float`/`Float32` itself (`Float.nan`, `(x : Float)`), or a `...Float` / `...Float32` name that
+    is not a `nat_vars` binder and is used as a function:
+
+    - projected: `n.toFloat`, `x.toFloat32`, `x |>.toFloat`;
+    - applied in head position: `asFloat v`, `toFloat (x + 1)`, `toFloat ↑n`, `toFloat .zero`,
+      `toFloat.{u} n`, `if c then toFloat n else 0`;
+    - piped or composed: `toFloat <| n`, `toFloat $ n`, `toFloat <$> o`, `n |> toFloat`,
+      `o <&> toFloat`, `toFloat ∘ f`, `f ∘ toFloat`;
+    - any of these with the name in parentheses: `(toFloat) n`.
+
+    A `...Float` name that is an infix operand or an argument (`lenFloat`, `lenFloat + 1`,
+    `f lenFloat`, `if isFloat then a else b`) reads as a variable, and so does a name that merely
+    contains `Float` (`numFloats`, `FloatCount`). The header cannot tell a variable argument from a
+    function argument, so `o.map toFloat` reads as a variable too."""
     if not float_vars and "Float" not in e:
         return False
     n_e = len(e)
@@ -9498,27 +9520,62 @@ def _operand_may_be_float(
         tok = m.group(0)
         if tok in float_vars or tok in _FLOAT_TYPE_NAMES:
             return True
-        if tok not in nat_vars and (tok.endswith("Float") or tok.endswith("Float32")):
-            s_idx = m.start()
-            # Projection/method form (`n.toFloat`, `x.toFloat32`).
-            if s_idx > 0 and e[s_idx - 1] == ".":
-                return True
-            # Call-head form (`asFloat v`, `asFloat (x + 1)`): NOT preceded by an identifier or
-            # closing bracket (which makes `tok` an argument, e.g. `f lenFloat`), and followed by
-            # whitespace + an argument start (NOT an infix operator, e.g. `lenFloat + 1`).
-            prev_i = s_idx - 1
-            while prev_i >= 0 and e[prev_i] in " \t\r\n":
-                prev_i -= 1
-            if prev_i >= 0 and (_is_lean_ident_char(e[prev_i]) or e[prev_i] in ")]}⟩⦄"):
+        if tok in nat_vars or not (tok.endswith("Float") or tok.endswith("Float32")):
+            continue
+        lo = m.start()
+        hi = m.end()
+        if lo > 0 and e[lo - 1] == ".":
+            return True
+        if e.startswith(".{", hi):
+            u_end = e.find("}", hi)
+            if u_end != -1:
+                hi = u_end + 1
+        # `p` / `q`: the nearest non-blank characters around the name, outside any parentheses
+        # that hold nothing but the name.
+        while True:
+            p = lo - 1
+            while p >= 0 and e[p] in " \t\r\n":
+                p -= 1
+            q = hi
+            while q < n_e and e[q] in " \t\r\n":
+                q += 1
+            if p < 0 or q >= n_e or e[p] != "(" or e[q] != ")":
+                break
+            lo = p
+            hi = q + 1
+        # `[adv B4]` `[adv A3]` accepted only `name arg` with nothing but an operator or an opening
+        # bracket before the name, so `toFloat <| n`, `n |> toFloat`, `toFloat ∘ f`, `(toFloat) n`,
+        # `toFloat ↑n` and `if c then toFloat n else 0` lost their `Float` reading, and `¬ e ≤ e`
+        # over them (true of `NaN`) was reported as a contradiction.
+        if p >= 0 and (e[p] == "∘" or (e[p] == ">" and p > 0 and e[p - 1] in "|&")):
+            return True
+        if q >= n_e:
+            continue
+        nc = e[q]
+        if nc in "∘$" or e.startswith("<|", q) or e.startswith("<$>", q):
+            return True
+        if p >= 0 and (_is_lean_ident_char(e[p]) or e[p] in ")]}⟩⦄"):
+            # After an identifier or a closing bracket the name is an argument (`f lenFloat y`),
+            # unless that identifier is a keyword (`then toFloat n`).
+            w = p + 1
+            while w > 0 and _is_lean_ident_char(e[w - 1]):
+                w -= 1
+            if e[w : p + 1] not in _LEAN_EXPR_KW_STOP:
                 continue
-            nxt = m.end()
-            if nxt < n_e and e[nxt] in " \t\r\n":
-                while nxt < n_e and e[nxt] in " \t\r\n":
-                    nxt += 1
-                if nxt < n_e:
-                    nc = e[nxt]
-                    if _is_lean_ident_char(nc) or nc.isdecimal() or nc in "([{⟨⦃«'":
-                        return True
+        if nc == "(":
+            return True
+        if q == hi:
+            # No blank after the name: an operator or a subscript (`lenFloat+1`, `lenFloat[0]`).
+            continue
+        if nc in "[{⟨⦃«↑@#`" or (nc == "." and q + 1 < n_e and _is_lean_ident_char(e[q + 1])):
+            return True
+        m_arg = _IDENT_EXTRACT_RE.match(e, q)
+        if m_arg is not None:
+            if m_arg.group(0) not in _LEAN_EXPR_KW_STOP:
+                return True
+        elif _is_lean_ident_char(nc):
+            # A numeral or a char literal (`toFloat 3`, `toFloat 'a'`).
+            return True
     return False
 
 
@@ -11348,7 +11405,6 @@ def clear_in_process_caches() -> None:
     _THM_AUDIT_CACHE.clear()
     _META_CACHE.clear()
     _NORM_CACHE.clear()
-    _SPLIT_RE_CACHE.clear()
 
 
 # Directories never descended into when a CLI path is a directory.

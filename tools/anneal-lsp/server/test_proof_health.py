@@ -8237,5 +8237,183 @@ class TestNegationPrecedenceA3AdversarialFixes(unittest.TestCase):
                 )
 
 
+class TestNegationPrecedenceB4AdversarialFixes(unittest.TestCase):
+    r"""`[adv B4]` regressions for bugs found in `[adv A3]`:
+
+    1. Numeric-literal arguments in `_untyped_binders_inhabited_by_calls`: only the leading decimal
+       digits were read, so `0xFF` / `0b11` / `1e5` became a numeral plus an identifier (`xFF`) and
+       every later argument moved one positional slot to the right. An untyped `∀ s` passed at an
+       empty `Fin 0` slot was read at the next, inhabited slot (false contradiction), and one
+       passed at the last inhabited slot was never read at all (missed contradiction).
+    2. `_operand_may_be_float` recognised a `...Float` function only as `name arg` with nothing but
+       an operator or an opening bracket before it. Pipelines (`toFloat <| n`, `n |> toFloat`,
+       `toFloat $ n`), composition (`toFloat ∘ f`), `<$>`, a parenthesized name (`(toFloat) n`),
+       `↑n` / `.ctor` / universe-instantiated arguments, and a call after a keyword
+       (`if c then toFloat n else 0`) lost the `Float` reading `[adv B3]` gave them, so `¬ e ≤ e`
+       (true of `NaN`) was reported as a contradiction and `e ≤ e` as a trivial conclusion.
+    3. `_norm_expr` carried a second copy of the normal form next to a now-unused
+       `_norm_expr_uncached`, and `_SPLIT_RE_CACHE` was still declared and cleared with no reader.
+    """
+
+    VACUOUS_BOTH_SCOPES = {
+        "hex_arg_inhabited_slot": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 0xFF s ∧ False) : x = 1 := by sorry\n",
+        "bin_arg_inhabited_slot": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 0b11 s ∧ False) : x = 1 := by sorry\n",
+        "oct_arg_inhabited_slot": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 0o17 s ∧ False) : x = 1 := by sorry\n",
+        "sci_arg_inhabited_slot": "theorem bad (R : Float → Nat → Prop) (h : ∀ s, R 1.5e3 s ∧ False) : x = 1 := by sorry\n",
+        "fraction_arg_inhabited_slot": "theorem bad (R : Float → Nat → Prop) (h : ∀ s, R 1.5 s ∧ False) : x = 1 := by sorry\n",
+        "numeral_projection_arg": "theorem bad (R : Nat → Nat → Prop) (h : ∀ s, R 2.succ s ∧ False) : x = 1 := by sorry\n",
+        "isFloat_condition_not_le": "theorem bad (isFloat : Bool) (a b : Nat) (h : ¬ (if isFloat then a else b) ≤ (if isFloat then a else b)) : x = 1 := by sorry\n",
+        "lenFloat_mid_argument_not_le": "theorem bad (lenFloat : Nat) (h : ¬ f lenFloat y ≤ f lenFloat y) : x = 1 := by sorry\n",
+        "lenFloat_infix_minus_not_le": "theorem bad (n : Nat) (h : ¬ lenFloat -n ≤ lenFloat -n) : x = 1 := by sorry\n",
+        "lenFloat_parenthesized_operand_not_le": "theorem bad (n : Nat) (h : ¬ (lenFloat) + n ≤ (lenFloat) + n) : x = 1 := by sorry\n",
+    }
+
+    CLEAN = {
+        "hex_arg_keeps_empty_slot": "theorem ok (R : Nat → Fin 0 → Nat → Prop) (h : ∀ s, R 0xFF s ∧ False) : P := by sorry\n",
+        "bin_arg_keeps_empty_slot": "theorem ok (R : Nat → Fin 0 → Nat → Prop) (h : ∀ s, R 0b11 s ∧ False) : P := by sorry\n",
+        "sci_arg_keeps_empty_slot": "theorem ok (R : Float → Fin 0 → Nat → Prop) (h : ∀ s, R 1e5 s ∧ False) : P := by sorry\n",
+        "sci_fraction_arg_keeps_empty_slot": "theorem ok (R : Float → Fin 0 → Nat → Prop) (h : ∀ s, R 1.5e-3 s ∧ False) : P := by sorry\n",
+        "undelimited_numeral_stops_scan": "theorem ok (R : Nat → Nat → Prop) (h : ∀ s, R 5abc s ∧ False) : P := by sorry\n",
+        "float_fn_pipe_left": "theorem ok (n : Nat) (h : ¬ (toFloat <| n) ≤ (toFloat <| n)) : P := by sorry\n",
+        "float_fn_dollar": "theorem ok (n : Nat) (h : ¬ (toFloat $ n) ≤ (toFloat $ n)) : P := by sorry\n",
+        "float_fn_pipe_right": "theorem ok (n : Nat) (h : ¬ (n |> toFloat) ≤ (n |> toFloat)) : P := by sorry\n",
+        "float_fn_compose_left": "theorem ok (n : Nat) (h : ¬ (toFloat ∘ f) n ≤ (toFloat ∘ f) n) : P := by sorry\n",
+        "float_fn_compose_right": "theorem ok (n : Nat) (h : ¬ (f ∘ toFloat) n ≤ (f ∘ toFloat) n) : P := by sorry\n",
+        "float_fn_functor_map": "theorem ok (o : Option Nat) (h : ¬ (toFloat <$> o) ≤ (toFloat <$> o)) : P := by sorry\n",
+        "float_fn_parenthesized": "theorem ok (n : Nat) (h : ¬ (toFloat) n ≤ (toFloat) n) : P := by sorry\n",
+        "float_fn_coe_arg": "theorem ok (n : Nat) (h : ¬ toFloat ↑n ≤ toFloat ↑n) : P := by sorry\n",
+        "float_fn_dot_ctor_arg": "theorem ok (h : ¬ toFloat .zero ≤ toFloat .zero) : P := by sorry\n",
+        "float_fn_universe_arg": "theorem ok (n : Nat) (h : ¬ toFloat.{u} n ≤ toFloat.{u} n) : P := by sorry\n",
+        "float_fn_after_then": "theorem ok (n : Nat) (h : ¬ (if c then toFloat n else 0) ≤ (if c then toFloat n else 0)) : P := by sorry\n",
+        "float_fn_pipe_left_conc": "theorem ok (n : Nat) : (toFloat <| n) ≤ (toFloat <| n) := by sorry\n",
+        "float_fn_parenthesized_conc": "theorem ok (n : Nat) : (toFloat) n ≤ (toFloat) n := by sorry\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_b4_vacuous_headers_flagged_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.VACUOUS_BOTH_SCOPES.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_b4_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        for label, src in self.CLEAN.items():
+            self.assertEqual(audit.scan_lean_text(src), [], f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_b4_float_function_positions(self) -> None:
+        may_float = proof_health._operand_may_be_float
+        none: frozenset[str] = frozenset()
+        for yes in (
+            "toFloat <| n",
+            "toFloat $ n",
+            "toFloat <$> o",
+            "n |> toFloat",
+            "o <&> toFloat",
+            "toFloat ∘ f",
+            "f ∘ toFloat",
+            "(toFloat) n",
+            "((toFloat)) n",
+            "f ∘ (toFloat)",
+            "toFloat(n)",
+            "toFloat ↑n",
+            "toFloat .zero",
+            "toFloat @id",
+            "toFloat #[n]",
+            "toFloat `n",
+            "toFloat 3",
+            "toFloat 'a'",
+            "toFloat.{u} n",
+            "if c then toFloat n else 0",
+            "x |>.toFloat",
+        ):
+            self.assertTrue(may_float(yes, none), yes)
+        for no in (
+            "lenFloat",
+            "(lenFloat)",
+            "lenFloat + 1",
+            "(lenFloat) + 1",
+            "lenFloat -n",
+            "lenFloat+1",
+            "lenFloat[0]",
+            "lenFloat.succ",
+            "f lenFloat",
+            "f (lenFloat)",
+            "f lenFloat y",
+            "f x <$> lenFloat",
+            "if isFloat then a else b",
+            "match lenFloat with",
+            "numFloats n",
+        ):
+            self.assertFalse(may_float(no, none), no)
+        # A `Nat` binder is a variable wherever it stands; a `Float` binder is one everywhere too.
+        self.assertFalse(may_float("lenFloat <| n", none, frozenset({"lenFloat"})))
+        self.assertTrue(may_float("f lenFloat", frozenset({"lenFloat"})))
+
+    def test_b4_numeric_literal_is_one_argument(self) -> None:
+        num = proof_health._NUM_ARG_RE
+        for lit in ("0", "12", "0xFF", "0Xff", "0b101", "0o17", "1.5", "1e5", "1E5", "1.5e-3", "2e+7"):
+            m = num.match(lit)
+            self.assertIsNotNone(m, lit)
+            self.assertEqual(m.group(0), lit)
+        # A projection is not part of the literal: `2.succ` is the numeral `2`, then `.succ`.
+        self.assertEqual(num.match("2.succ").group(0), "2")
+        inhabited = proof_health._untyped_binders_inhabited_by_calls
+        for arg in ("0", "0xFF", "0b11", "0o17", "1e5", "1.5e-3", "2.succ", "xs.length", "(f 0x1F)"):
+            self.assertTrue(
+                inhabited({"s"}, f"R {arg} s ∧ False", {"R": (True, True)}, frozenset()), arg
+            )
+            self.assertFalse(
+                inhabited({"s"}, f"R {arg} s ∧ False", {"R": (True, False, True)}, frozenset()), arg
+            )
+        self.assertFalse(inhabited({"s"}, "R 5abc s ∧ False", {"R": (True, True)}, frozenset()))
+
+    def test_b4_norm_expr_has_one_definition(self) -> None:
+        norm = proof_health._norm_expr
+        uncached = proof_health._norm_expr_uncached
+        for s in (
+            "",
+            "x = 1",
+            "x = 1 ",
+            " x = 1",
+            "x  =  1",
+            "x =\n    1",
+            "x =\t1",
+            "x =\r\n1",
+            "(x = 1)",
+            "((x = 1))",
+            "( x = 1 )",
+            "(a) = (b)",
+            "(a) + b",
+            "a + (b)",
+            "f (x)",
+            "()",
+            "(",
+            ")",
+            "«a  b» = 1",
+            "¬ (P)",
+            "(P ∧ Q) ",
+        ):
+            proof_health.clear_in_process_caches()
+            self.assertEqual(norm(s), uncached(s), repr(s))
+            # Memoized and unmemoized reads agree, and normalizing is idempotent.
+            self.assertEqual(norm(s), uncached(s), repr(s))
+            self.assertEqual(norm(norm(s)), norm(s), repr(s))
+        self.assertFalse(hasattr(proof_health, "_SPLIT_RE_CACHE"))
+
+    def test_check_trusted_agrees_on_every_b4_header(self) -> None:
+        ct = _load_check_trusted()
+        self.assertFalse(hasattr(ct, "_SPLIT_RE_CACHE"))
+        for label, src in {**self.VACUOUS_BOTH_SCOPES, **self.CLEAN}.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
