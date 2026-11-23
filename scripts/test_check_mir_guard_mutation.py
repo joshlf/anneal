@@ -3835,5 +3835,220 @@ class GuardMutationB4AdversarialTests(unittest.TestCase):
             self.assertEqual(g.effective_rebuild_modules, (g.target_module,), g.guard_id)
 
 
+class GuardMutationA4ConvergenceTests(unittest.TestCase):
+    """Round 4 A4 convergence ratchets for B4's `rfl` classifier and token checks."""
+
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+    PATH = "/t/Refute_div_by_zero.lean"
+
+    def test_rfl_type_mismatch_named_codes_crlf_indentation_and_stream_isolation(
+        self,
+    ) -> None:
+        # Named error codes + Windows CRLF + varying horizontal indentation on
+        # `rfl` (2 spaces, 4 spaces, tab, trailing whitespace) all count as KILLED,
+        # alone or paired with a named `@[defeq]` companion.
+        named_defeq_crlf = (
+            f"{self.PATH}:7:0: error(lean.defeq): Not a definitional equality: "
+            "the left-hand side\r\n"
+            "  evalScalarBinOp .div ⟨7, 1⟩ ⟨0, 1⟩ .nil emptyMemory false\r\n"
+            "is not definitionally equal to the right-hand side\r\n"
+            "  .ub\r\n"
+        )
+        for indent in ("  ", "    ", "\t"):
+            named_rfl_crlf = (
+                f"{self.PATH}:9:2: error(lean.typeMismatch): Type mismatch \r\n"
+                f"{indent}rfl  \r\n"
+                "has type\r\n"
+                "  ?m.14 = ?m.14\r\n"
+                "but is expected to have type\r\n"
+                "  f x = .ub\r\n"
+            )
+            for out in (named_rfl_crlf, named_defeq_crlf + named_rfl_crlf):
+                status, detail = gmut.classify_refutation_failure(
+                    1, out, self.FIXTURE, self.SPAN, stderr_output=""
+                )
+                self.assertEqual(status, "KILLED", (indent, detail))
+
+        # Named error code on a statement-level mismatch or a lone named defeq
+        # diagnostic must remain ERROR.
+        named_stmt = (
+            f"{self.PATH}:8:4: error(lean.typeMismatch): Type mismatch\r\n"
+            "  Bool\r\nhas type\r\n  Type\r\n"
+        )
+        valid_rfl = f"{self.PATH}:9:2: error(lean.typeMismatch): Type mismatch\n  rfl\n"
+        for bad in (named_stmt, named_stmt + valid_rfl, named_defeq_crlf):
+            status, detail = gmut.classify_refutation_failure(
+                1, bad, self.FIXTURE, self.SPAN, stderr_output=""
+            )
+            self.assertEqual(status, "ERROR", (bad, detail))
+
+        # A `Not a definitional equality` diagnostic truncated on stdout cannot
+        # borrow its second line from stderr, even when a valid `rfl` mismatch
+        # also appears on stderr.
+        stdout_half = (
+            f"{self.PATH}:7:0: error: Not a definitional equality: the left-hand side\n"
+            "  f x\n"
+        )
+        stderr_rest = (
+            "is not definitionally equal to the right-hand side\n  .ub\n" + valid_rfl
+        )
+        status, detail = gmut.classify_refutation_failure(
+            1, stdout_half, self.FIXTURE, self.SPAN, stderr_output=stderr_rest
+        )
+        self.assertEqual(status, "ERROR", detail)
+
+    def test_single_rfl_token_check_handles_block_comments_strings_and_smuggling(
+        self,
+    ) -> None:
+        head = "import Trusted.A\n"
+        theorem = "theorem t :\n    f 1 = 2 :=\n  rfl\n"
+
+        # `rfl` inside block comments, nested block comments, comments holding
+        # stray quotes, or a string literal inside the theorem statement must
+        # not trip the single-`rfl` token check.
+        harmless = (
+            head
+            + "/- rfl -/\n"
+            + "/- outer /- rfl -/ \"rfl -/\n"
+            + "-- \"rfl\n"
+            + 'def tag : String := "-- rfl /- rfl"\n'
+            + 'theorem t :\n    f "rfl" = 2 :=\n  rfl\n'
+        )
+        self.assertEqual(gmut._fixture_shape_errors("refute", harmless, "t"), [])
+
+        # Strings containing `--` or `/-` must NOT mask a real `rfl` that
+        # follows on the next line, and `rfl!`/`rfl?` or zero `rfl`s fail closed.
+        for bad, expected_count in (
+            (
+                head + 'def s : String := "-- rfl"\ndef h : 1 = 1 := rfl\n' + theorem,
+                2,
+            ),
+            (
+                head + 'def s : String := "/- rfl"\ndef h : 1 = 1 := rfl\n' + theorem,
+                2,
+            ),
+            (
+                head + "theorem t :\n    f rfl! = 2 :=\n  rfl\n",
+                2,
+            ),
+            (
+                head + "theorem t :\n    f rfl? = 2 :=\n  rfl\n",
+                2,
+            ),
+            (
+                head + "theorem t :\n    f 1 = 2 :=\n  Eq.refl _\n",
+                0,
+            ),
+        ):
+            errors = gmut._fixture_shape_errors("refute", bad, "t")
+            self.assertTrue(
+                any(
+                    f"exactly one `rfl` (the theorem's proof), found {expected_count}"
+                    in e
+                    for e in errors
+                ),
+                (bad, errors),
+            )
+
+    def test_end_to_end_named_type_mismatch_and_lone_defeq_cli_verdicts(self) -> None:
+        named_kill_sh = textwrap.dedent(
+            """\
+            if [ -n "$OUT" ]; then
+              mkdir -p "$(dirname "$OUT")"
+              printf 'fake-olean:%s' "$BASENAME" > "$OUT"
+            fi
+            if [ "$IS_MUTANT" = "1" ]; then
+              case "$BASENAME" in
+                Refute_*)
+                  LINE="$(grep -n '^theorem ' "$SRC" | head -n 1 | cut -d: -f1)"
+                  printf '%s:%s:0: error(lean.defeq): Not a definitional equality: the left-hand side\\r\\n  lhs\\r\\nis not definitionally equal to the right-hand side\\r\\n  .ub\\r\\n' "$SRC" "$LINE"
+                  printf '%s:%s:2: error(lean.typeMismatch): Type mismatch\\r\\n  rfl\\r\\nhas type\\r\\n  ?m = ?m\\r\\n' "$SRC" "$((LINE + 2))"
+                  exit 1
+                  ;;
+              esac
+            fi
+            exit 0
+            """
+        )
+        lone_defeq_sh = textwrap.dedent(
+            """\
+            if [ -n "$OUT" ]; then
+              mkdir -p "$(dirname "$OUT")"
+              printf 'fake-olean:%s' "$BASENAME" > "$OUT"
+            fi
+            if [ "$IS_MUTANT" = "1" ]; then
+              case "$BASENAME" in
+                Refute_*)
+                  LINE="$(grep -n '^theorem ' "$SRC" | head -n 1 | cut -d: -f1)"
+                  printf '%s:%s:0: error: Not a definitional equality: the left-hand side\\n  lhs\\nis not definitionally equal to the right-hand side\\n  .ub\\n' "$SRC" "$LINE"
+                  exit 1
+                  ;;
+              esac
+            fi
+            exit 0
+            """
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-a4-e2e-") as tmp:
+            tmp_path = Path(tmp)
+            fake_kill = tmp_path / "fake_lean_kill"
+            fake_defeq = tmp_path / "fake_lean_defeq"
+            json_out = tmp_path / "report.json"
+            _write_fake_lean_sh(fake_kill, named_kill_sh)
+            _write_fake_lean_sh(fake_defeq, lone_defeq_sh)
+
+            kill_proc = _run_cli(
+                [
+                    "--lean", str(fake_kill),
+                    "--no-lake-cache",
+                    "--guard", "div_by_zero",
+                    "--json",
+                    "--json-out", str(json_out),
+                ]
+            )
+            self.assertEqual(kill_proc.returncode, 0, kill_proc.stderr)
+            kill_report = json.loads(kill_proc.stdout)
+            self.assertEqual(
+                (
+                    kill_report["ok"],
+                    kill_report["killed"],
+                    kill_report["survived"],
+                    kill_report["errors"],
+                ),
+                (True, 1, 0, 0),
+            )
+            self.assertEqual(
+                json.loads(json_out.read_text(encoding="utf-8")), kill_report
+            )
+
+            defeq_proc = _run_cli(
+                [
+                    "--lean", str(fake_defeq),
+                    "--no-lake-cache",
+                    "--guard", "div_by_zero",
+                    "--json",
+                    "--json-out", str(json_out),
+                ]
+            )
+            self.assertEqual(defeq_proc.returncode, 1, defeq_proc.stderr)
+            defeq_report = json.loads(defeq_proc.stdout)
+            self.assertEqual(
+                (
+                    defeq_report["ok"],
+                    defeq_report["killed"],
+                    defeq_report["survived"],
+                    defeq_report["errors"],
+                ),
+                (False, 0, 0, 1),
+            )
+            self.assertIn(
+                "no `Type mismatch` on the `rfl` proof",
+                defeq_report["results"][0]["detail"],
+            )
+            self.assertEqual(
+                json.loads(json_out.read_text(encoding="utf-8")), defeq_report
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
