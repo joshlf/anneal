@@ -1488,6 +1488,135 @@ theorem canary2_diamond_mirWpConverges (c1 c2 : Bool) (x z : Nat)
     step_det_done (.normal (.aggregate 0
       [.scalar ⟨x + stage1Delta c1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩], {})) rfl rfl
 
+/-! ### 2W. Canary 2 for ALL `u32` inputs (wrapping `Add`, no `x + 22 < 2^32` guard)
+
+`diamond2StageMirBody` uses release-mode wrapping `Add`, so it is total for
+every input. The canaries above restrict `x + 22 < 2^32` to state the result as
+plain `Nat` addition; here each stage is re-proved behind the same framed
+`StageCut` / `stageCut_compose` pipeline for ALL `x z`, with the result stated
+through the trusted `wrapScalarBits` and then identified with
+`(x + Δ₁ + Δ₂) % 2^32`. -/
+
+/-- `u32` wrapping as performed by trusted `MirSemantics` scalar `Add`. -/
+private abbrev wrapU32 (v : Nat) : Nat := wrapScalarBits v (scalarModulus 4)
+
+theorem canary2_stage1_within_wrap (c1 : Bool) (x : Nat) (l2 : LocalSlot) :
+    StageCut (ops := (mirDetWpOps diamond2StageMirBody).within (fun s => stage1Region s = true))
+      (fun s => ∃ l4, s = diamondState 0 0 .uninit (.init (boolScalar c1)) l2
+        (.init (.scalar ⟨x, 4⟩)) l4 .dead)
+      (fun s => ∃ l4, s = diamondState 3 0 .uninit (.init (boolScalar c1)) l2
+        (.init (.scalar ⟨x, 4⟩)) l4 (.init (.scalar ⟨wrapU32 (x + stage1Delta c1), 4⟩)))
+      (fun _ => False) (fun _ => False) :=
+  StageCut.intro (ops := (mirDetWpOps diamond2StageMirBody).within (fun s => stage1Region s = true))
+    fun s ⟨l4, hEq⟩ => by
+  subst hEq
+  refine wpUntil_mono_stop (ops := (mirDetWpOps diamond2StageMirBody).within
+      (fun s => stage1Region s = true))
+    (fun s' hS' => ⟨l4, hS'⟩) ?_
+  refine wpReach_within_of_validBlockTreeToCut diamondBlockTree_valid
+    (region := stage1Region) (cuts := cutAtBb3) (fuel := 4) ?_
+  cases c1 <;> rfl
+
+theorem canary2_stage2_within_wrap (c2 : Bool) (acc : Nat) (l1 l3 : LocalSlot) :
+    StageCut (ops := (mirDetWpOps diamond2StageMirBody).within (fun s => stage2Region s = true))
+      (fun s => ∃ l4, s = diamondState 3 0 .uninit l1 (.init (boolScalar c2)) l3 l4
+        (.init (.scalar ⟨acc, 4⟩)))
+      (fun s => ∃ l4, s = diamondState 6 0 .uninit l1 (.init (boolScalar c2)) l3 l4
+        (.init (.scalar ⟨wrapU32 (acc + stage2Delta c2), 4⟩)))
+      (fun _ => False) (fun _ => False) :=
+  StageCut.intro (ops := (mirDetWpOps diamond2StageMirBody).within (fun s => stage2Region s = true))
+    fun s ⟨l4, hEq⟩ => by
+  subst hEq
+  refine wpUntil_mono_stop (ops := (mirDetWpOps diamond2StageMirBody).within
+      (fun s => stage2Region s = true))
+    (fun s' hS' => ⟨l4, hS'⟩) ?_
+  refine wpReach_within_of_validBlockTreeFromCut diamondBlockTree_valid
+    (region := stage2Region) (cuts := cutAtBb6) (fuel := 2) ?_
+  cases c2 <;> rfl
+
+/-- **Canary 2W (Modular 2-Stage Composition, ALL Inputs)**: framed Stage 1 +
+Stage 2 composed via `stageCut_frame` / `stageCut_compose` with zero `2 × 2`
+blowup and NO input-range precondition; the returned accumulator is
+`(x + Δ₁(c1) + Δ₂(c2)) mod 2^32` and `_4 = z` is framed untouched. -/
+theorem canary2_diamond_mirWpConverges_wrap (c1 c2 : Bool) (x z : Nat) :
+    MirWpConverges diamond2StageMirBody
+      (initMachineState diamond2StageMirBody
+        [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩])
+      (mirNormalPost (fun ret _ =>
+        ret = .aggregate 0
+          [.scalar ⟨(x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32, 4⟩, .scalar ⟨z, 4⟩])) := by
+  let zSlot : LocalSlot := .init (.scalar ⟨z, 4⟩)
+  let acc1 := wrapU32 (x + stage1Delta c1)
+  let acc2 := wrapU32 (acc1 + stage2Delta c2)
+  have hAcc2 : acc2 = (x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32 := by
+    simp only [acc2, acc1, Scalars.wrapScalarBits_eq_mod_modulus,
+      Scalars.scalarModulus_eq_two_pow]
+    omega
+  have hStage1Framed :=
+    stageCut_frame (ops := mirDetWpOps diamond2StageMirBody) (diamond_stage1_stepFrame zSlot)
+      (canary2_stage1_within_wrap c1 x (.init (boolScalar c2)))
+  have hStage2Framed :=
+    stageCut_frame (ops := mirDetWpOps diamond2StageMirBody) (diamond_stage2_stepFrame zSlot)
+      (canary2_stage2_within_wrap c2 acc1 (.init (boolScalar c1)) (.init (.scalar ⟨x, 4⟩)))
+  let post : MirOutcome → Prop :=
+    mirNormalPost (fun ret _ =>
+      ret = .aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩])
+  have hComposed :=
+    stageCut_weaken (ops := mirDetWpOps diamond2StageMirBody) (onDone' := post)
+      (fun _ h => h) (fun _ h => h)
+      (fun _ hF => False.elim hF) (fun _ h => h)
+      (stageCut_compose (ops := mirDetWpOps diamond2StageMirBody) hStage1Framed hStage2Framed)
+  rw [← hAcc2]
+  refine mirWpConverges_of_stageCut hComposed ?_ ⟨⟨zSlot, rfl⟩, rfl, rfl⟩
+  intro s ⟨⟨l4, hEq⟩, hLoc4, _⟩
+  subst hEq
+  change some l4 = some zSlot at hLoc4
+  injection hLoc4 with hL4
+  subst hL4
+  refine mirWpConverges_of_wpStateOk ?_
+  exact
+    step_det_to (diamondState 6 1
+      (.init (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩]))
+      (.init (boolScalar c1)) (.init (boolScalar c2)) (.init (.scalar ⟨x, 4⟩))
+      zSlot (.init (.scalar ⟨acc2, 4⟩))) rfl <|
+    step_det_to (diamondState 6 2
+      (.init (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩]))
+      (.init (boolScalar c1)) (.init (boolScalar c2)) (.init (.scalar ⟨x, 4⟩))
+      zSlot .dead) rfl <|
+    step_det_done (.normal (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩], {})) rfl rfl
+
+def diamond2StageWrapClaim : Claim where
+  body := diamond2StageMirBody
+  callees := []
+  pre args := ∃ (c1 c2 : Bool) (x z : Nat),
+    args = [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩]
+  post args ret := ∃ (c1 c2 : Bool) (x z : Nat),
+    args = [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩] ∧
+    ret = .aggregate 0
+      [.scalar ⟨(x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32, 4⟩, .scalar ⟨z, 4⟩]
+
+/-- **Trusted no-panic `VerificationResult` for `diamond2StageMirBody` over ALL inputs**,
+including `u32` overflow (wrapping) cases excluded by `diamond2StageClaim`. -/
+theorem canary2_diamond_wrap_verificationResult : VerificationResult diamond2StageWrapClaim :=
+  verifyMirNoPanic_of_wpConverges diamond2StageWrapClaim fun args ⟨c1, c2, x, z, hArgs⟩ => by
+    subst hArgs
+    exact MirWpConverges.mono
+      (fun out hOut => by
+        cases out with
+        | panic | abort => exact False.elim hOut
+        | normal p => exact ⟨c1, c2, x, z, rfl, hOut⟩)
+      (canary2_diamond_mirWpConverges_wrap c1 c2 x z)
+
+/-- Non-vacuity of the overflow regime: at `x = 2^32 - 1`, `c1 = c2 = false`
+the canary genuinely wraps (`(2^32 - 1 + 22) % 2^32 = 21`). -/
+theorem canary2_diamond_wrap_overflow_instance (z : Nat) :
+    MirWpConverges diamond2StageMirBody
+      (initMachineState diamond2StageMirBody
+        [boolScalar false, boolScalar false, .scalar ⟨2 ^ 32 - 1, 4⟩, .scalar ⟨z, 4⟩])
+      (mirNormalPost (fun ret _ =>
+        ret = .aggregate 0 [.scalar ⟨21, 4⟩, .scalar ⟨z, 4⟩])) :=
+  canary2_diamond_mirWpConverges_wrap false false (2 ^ 32 - 1) z
+
 /-- **Canary 2 (`PureLift` `StepPath` & `mirOperationalAdapter` bridge)**:
 Composes the opaque `StepStageCut`s for Stage 1 and Stage 2 via `StepStageCut.trans`
 and transports directly to `PureLift.MirLiftCoreInterop.StepPath` and
@@ -5534,5 +5663,41 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3a_byteMem_provenance_and_s
 -/
 #guard_msgs in
 #print axioms canary3a_byteMem_provenance_and_sliceTypedAt
+
+/-! ### Pass B4 guards: all-input wrapping Canary 2W. -/
+
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage1_within_wrap' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms canary2_stage1_within_wrap
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage2_within_wrap' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms canary2_stage2_within_wrap
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_mirWpConverges_wrap' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_diamond_mirWpConverges_wrap
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_wrap_verificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_diamond_wrap_verificationResult
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_wrap_overflow_instance' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_diamond_wrap_overflow_instance
 
 end Anneal.ParametricLoopInvAndSubLensTests
