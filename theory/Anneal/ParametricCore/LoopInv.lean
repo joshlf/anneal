@@ -1278,6 +1278,52 @@ theorem wpLoop_list_fuel {β : Type x} {Inv : List β → State → Prop}
     | inl hCont => exact ih s' hCont
     | inr hExit => exact wpUntilFuel_here hExit
 
+/-- Uniform-budget rank-descending loop rule (`(rank a₀ + 1) * stepFuel`):
+works for arbitrary stride (e.g. halving, variable decrements) and early exit
+without requiring `ops.FuelContinuous`, producing a uniform fuel bound directly
+usable by fuel-bounded coalgebraic evaluators. -/
+theorem wpLoop_rank_fuel {α : Sort x} (rank : α → Nat)
+    {Inv : α → State → Prop} {exit : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop} {stepFuel : Nat}
+    (hStep : ∀ a s, Inv a s → exit s ∨
+      wpUntilFuel
+        (fun s' => exit s' ∨ ∃ a', rank a' < rank a ∧ Inv a' s')
+        onDone onFault stepFuel s)
+    (a₀ : α) (s₀ : State) (hInv : Inv a₀ s₀) :
+    wpUntilFuel exit onDone onFault ((rank a₀ + 1) * stepFuel) s₀ := by
+  have hAux : ∀ (k : Nat) (a : α) (s : State), rank a ≤ k → Inv a s →
+      wpUntilFuel exit onDone onFault ((k + 1) * stepFuel) s := by
+    intro k
+    induction k with
+    | zero =>
+      intro a s hLe hI
+      cases hStep a s hI with
+      | inl hEx => exact wpUntilFuel_here hEx
+      | inr hU =>
+        rw [Nat.zero_add, Nat.one_mul]
+        refine wpUntilFuel_weaken ?_ (fun _ hq => hq) (fun _ hr => hr) hU
+        intro s' hMid
+        cases hMid with
+        | inl hEx => exact hEx
+        | inr hNext =>
+          let ⟨a', hLt, _⟩ := hNext
+          exact False.elim
+            (Nat.not_lt_zero (rank a') (Nat.lt_of_lt_of_le hLt hLe))
+    | succ k ih =>
+      intro a s hLe hI
+      cases hStep a s hI with
+      | inl hEx => exact wpUntilFuel_here hEx
+      | inr hU =>
+        rw [Nat.succ_mul, Nat.add_comm]
+        refine wpUntilFuel_bind hU ?_
+        intro s' hMid
+        cases hMid with
+        | inl hEx => exact wpUntilFuel_here hEx
+        | inr hNext =>
+          let ⟨a', hLt, hI'⟩ := hNext
+          exact ih a' s' (Nat.le_of_lt_succ (Nat.lt_of_lt_of_le hLt hLe)) hI'
+  exact hAux (rank a₀) a₀ s₀ (Nat.le_refl (rank a₀)) hInv
+
 end Fuel
 
 /-- Lift a bounded checkpoint proof along a same-state refinement. -/

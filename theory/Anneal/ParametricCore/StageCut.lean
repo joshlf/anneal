@@ -788,6 +788,34 @@ theorem stageCut_of_validChunk8BlockTreeFromCut_of_pointwise {BB : Type x}
       (bt.lookupForced?_eq i).trans (hValid.2 i)))).mp
     (stepStageCut_of_runFromCut_cut h)
 
+/-- `0 Quot.sound` pointwise stage cut from `Chunk8BlockTree.ofList blocks`
+via `evalChunk8BlockTreeToCut`. -/
+theorem stageCut_of_evalChunk8BlockTreeToCut_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeToCut (Chunk8BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) fuel s₀ s₁ :=
+  stageCut_of_validChunk8BlockTreeToCut_of_pointwise
+    (valid_chunk8BlockTree_ofList blocks) stepWith hPointwise h
+
+/-- `0 Quot.sound` pointwise `FromCut` stage cut from
+`Chunk8BlockTree.ofList blocks` via `evalChunk8BlockTreeFromCut`. -/
+theorem stageCut_of_evalChunk8BlockTreeFromCut_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {blockOf : S → Nat} {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeFromCut (Chunk8BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁) :
+    StepStageCut (stepWith (listGet? blocks)) (fuel + 1) s₀ s₁ :=
+  stageCut_of_validChunk8BlockTreeFromCut_of_pointwise
+    (valid_chunk8BlockTree_ofList blocks) stepWith hPointwise h
+
 /-- Bridge a `BlockTree`-evaluated stage directly into a checkpoint proof of
 the list-backed deterministic interface. -/
 theorem wpUntil_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
@@ -803,6 +831,27 @@ theorem wpUntil_of_evalBlockTreeToCut {BB : Type x} (blocks : List BB)
     wpUntil (ops := MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag)
       stop onDone onFault s₀ :=
   StepStageCut.to_wpUntil (stageCut_of_evalBlockTreeToCut blocks stepWith h)
+    hRest
+
+/-- `0 Quot.sound` pointwise bridge from a `BlockTree`-evaluated stage into a
+checkpoint proof of the list-backed deterministic interface. -/
+theorem wpUntil_of_evalBlockTreeToCut_of_pointwise {BB : Type x}
+    (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {tag : S → Option Nat} {blockOf : S → Nat} {cuts : MaskTree}
+    {fuel : Nat} {s₀ s₁ : S} {stop : S → Prop} {onDone : Out → Prop}
+    {onFault : Fault → Prop}
+    (h : evalBlockTreeToCut (BlockTree.ofList blocks) stepWith
+      StepOutcome.next? blockOf cuts fuel s₀ = .cut s₁)
+    (hRest : wpUntil
+      (ops := MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag) stop
+      onDone onFault s₁) :
+    wpUntil (ops := MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag)
+      stop onDone onFault s₀ :=
+  StepStageCut.to_wpUntil
+    (stageCut_of_evalBlockTreeToCut_of_pointwise blocks stepWith hPointwise h)
     hRest
 
 end StepStage
@@ -1430,6 +1479,38 @@ theorem wpReach_within_of_validChunk8BlockTreeToCut_of_pointwise {BB : Type x}
     exact h
   exact wpReach_within_of_runToCut hList
 
+/-- `0 Quot.sound` pointwise `FromCut` region-guarded evaluation over a
+pre-built `ValidChunk8BlockTree`. -/
+theorem wpReach_within_of_validChunk8BlockTreeFromCut_of_pointwise
+    {BB : Type x} {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {region : S → Bool} {tag : S → Option Nat} {blockOf : S → Nat}
+    {cuts : MaskTree} {fuel : Nat} {s₀ s₁ : S}
+    (h : evalChunk8BlockTreeFromCut bt
+      (fun look => guardStep region (stepWith look)) guardNext? blockOf cuts
+      fuel s₀ = .cut s₁) :
+    wpReach
+      (ops := (MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag).within
+        (fun s => region s = true))
+      (fun s => s = s₁) s₀ := by
+  have hGuardPw : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) →
+      guardStep region (stepWith f) s = guardStep region (stepWith g) s := by
+    intro f g s hEq
+    unfold guardStep
+    rw [hPointwise f g s hEq]
+  have hList :
+      runFromCut (guardStep region (stepWith (listGet? blocks))) guardNext?
+        (fun st => cuts.get (blockOf st)) fuel s₀ = .cut s₁ := by
+    rw [← evalChunk8BlockTreeFromCut_eq_of_valid_pointwise hValid
+      (fun look => guardStep region (stepWith look)) hGuardPw guardNext?
+      blockOf cuts fuel s₀]
+    exact h
+  exact wpReach_within_of_runFromCut hList
+
 end GuardedRun
 
 /-! ## Part IV: Fuel-Free Stage Cuts over `MirWpOps` (`StageCut`) -/
@@ -1828,6 +1909,18 @@ theorem DetStageCut.of_blockTree {BB : Type x} (blocks : List BB)
     DetStageCut (stepWith (listGet? blocks)) s₀ s₁ :=
   (DetStageCut.congr_step (stepWith_blockTree_eq stepWith blocks)).mp hCut
 
+/-- `0 Quot.sound` pointwise variant of `DetStageCut.of_blockTree`. -/
+theorem DetStageCut.of_blockTree_of_pointwise {BB : Type x} (blocks : List BB)
+    (stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {s₀ s₁ : S}
+    (hCut : DetStageCut (stepWith (BlockTree.ofList blocks).lookup?) s₀
+      s₁) :
+    DetStageCut (stepWith (listGet? blocks)) s₀ s₁ :=
+  (DetStageCut.congr_step
+    (stepWith_blockTree_eq_of_pointwise stepWith hPointwise blocks)).mp hCut
+
 /-- Lift a `DetStageCut` into any simulating `MirWpOps` interface. -/
 theorem DetStageCut.to_wpReach_of_step {ops : MirWpOps S Out Fault}
     {step : S → StepOutcome S Out Fault}
@@ -1947,6 +2040,39 @@ theorem wlpOutcome_mono {onDone₁ onDone₂ : Out → Prop}
   exact ⟨I, hI, fun s' hs' =>
     ops.stepWp_mono (fun _ hi => hi) hDone hFault (hClosed s' hs')⟩
 
+/-- Take one step into `wlpOutcome`. -/
+theorem wlpOutcome_step {onDone : Out → Prop} {onFault : Fault → Prop}
+    {s : State}
+    (h : ops.stepWp s (wlpOutcome onDone onFault) onDone onFault) :
+    wlpOutcome onDone onFault s :=
+  wlpOutcome_unfold_iff.mpr h
+
+/-- Conjunction of two `wlpOutcome` proofs over a conjunctive step interface:
+combines two partial-correctness invariants before intersecting with
+termination. -/
+theorem wlpOutcome_conj (hConj : ops.Conjunctive)
+    {onDone₁ onDone₂ : Out → Prop} {onFault₁ onFault₂ : Fault → Prop}
+    {s : State}
+    (h₁ : wlpOutcome onDone₁ onFault₁ s)
+    (h₂ : wlpOutcome onDone₂ onFault₂ s) :
+    wlpOutcome (fun o => onDone₁ o ∧ onDone₂ o)
+      (fun f => onFault₁ f ∧ onFault₂ f) s := by
+  refine wlpOutcome_of_invariant
+    (fun t => wlpOutcome onDone₁ onFault₁ t ∧ wlpOutcome onDone₂ onFault₂ t)
+    ?_ ⟨h₁, h₂⟩
+  intro t ht
+  exact hConj t _ _ _ _ _ _
+    (wlpOutcome_unfold_iff.mp ht.1) (wlpOutcome_unfold_iff.mp ht.2)
+
+omit ops in
+/-- Lift a `wlpOutcome` proof along a same-state refinement. -/
+theorem wlpOutcome_of_refines {ops₁ ops₂ : MirWpOps State Out Fault}
+    (hRef : ops₁.Refines ops₂) {onDone : Out → Prop} {onFault : Fault → Prop}
+    {s : State} (h : wlpOutcome (ops := ops₁) onDone onFault s) :
+    wlpOutcome (ops := ops₂) onDone onFault s := by
+  let ⟨I, hI, hClosed⟩ := h
+  exact ⟨I, hI, fun s' hs' => hRef s' I onDone onFault (hClosed s' hs')⟩
+
 /-- Total correctness implies partial correctness. -/
 theorem wlpOutcome_of_wpOutcome {onDone : Out → Prop}
     {onFault : Fault → Prop} {s : State}
@@ -1962,6 +2088,49 @@ theorem wlpOutcome_of_wpUntil {stop : State → Prop} {onDone : Out → Prop}
     (hK : ∀ s', stop s' → wlpOutcome onDone onFault s') :
     wlpOutcome onDone onFault s :=
   wpUntil_induction hK (fun _ hStep => wlpOutcome_unfold_iff.mpr hStep) h
+
+/-- Rank-free coinductive loop rule for `wlpOutcome`: proves partial
+correctness of a loop without supplying a termination measure (for the
+functional-correctness pass of a two-pass split with
+`wpStateOk_of_wlp_and_safety`). Each continuing iteration must take at least
+one real step (`wpStepUntil`), which is soundness-critical here because no
+well-founded relation forbids a zero-step self-loop. -/
+theorem wlpLoop_inv {Inv : State → Prop} {exit : State → Prop}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hIter : ∀ s, Inv s → exit s ∨
+      wpStepUntil (fun s' => Inv s' ∨ exit s') onDone onFault s)
+    (hExit : ∀ s, exit s → wlpOutcome onDone onFault s)
+    {s₀ : State} (hInv : Inv s₀) :
+    wlpOutcome onDone onFault s₀ := by
+  let J : State → Prop := fun t =>
+    wpUntil (fun u => Inv u ∨ exit u) onDone onFault t ∨
+      wlpOutcome onDone onFault t
+  refine wlpOutcome_of_invariant J ?_ (Or.inl (wpUntil_here (Or.inl hInv)))
+  intro t ht
+  cases ht with
+  | inr hWlp =>
+    exact ops.stepWp_mono (fun _ h' => Or.inr h')
+      (fun _ hq => hq) (fun _ hr => hr) (wlpOutcome_unfold_iff.mp hWlp)
+  | inl hU =>
+    induction hU with
+    | here hBase =>
+      cases hBase with
+      | inr hEx =>
+        exact ops.stepWp_mono (fun _ h' => Or.inr h')
+          (fun _ hq => hq) (fun _ hr => hr)
+          (wlpOutcome_unfold_iff.mp (hExit _ hEx))
+      | inl hI =>
+        cases hIter _ hI with
+        | inl hEx =>
+          exact ops.stepWp_mono (fun _ h' => Or.inr h')
+            (fun _ hq => hq) (fun _ hr => hr)
+            (wlpOutcome_unfold_iff.mp (hExit _ hEx))
+        | inr hStep =>
+          exact ops.stepWp_mono (fun _ h' => Or.inl h')
+            (fun _ hq => hq) (fun _ hr => hr) hStep
+    | step mid hStep hCont _ =>
+      exact ops.stepWp_mono (fun s' hm => Or.inl (hCont s' hm))
+        (fun _ hq => hq) (fun _ hr => hr) hStep
 
 /-- Prepend a `StageCut` onto a `wlpOutcome` continuation. -/
 theorem StageCut.to_wlpOutcome {entry cut : State → Prop}
@@ -1981,6 +2150,60 @@ theorem StepStageCut.to_wlpOutcome {step : State → StepOutcome State Out Fault
     wlpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s₀ :=
   wlpOutcome_of_wpUntil (ops := MirWpOps.ofDetStep step tag)
     (StepStageCut.to_wpUntil_here (stop := fun s => s = s₁) hCut rfl)
+    (fun s' hs => by
+      have hEq : s' = s₁ := hs
+      rw [hEq]
+      exact h)
+
+/-- Prepend a `StepStageCut` onto a `wlpOutcome` continuation of any
+simulating `MirWpOps` interface. -/
+theorem StepStageCut.to_wlpOutcome_of_step
+    {step : State → StepOutcome State Out Fault}
+    (hSim : ∀ s s' (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {fuel : Nat} {s₀ s₁ : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : StepStageCut step fuel s₀ s₁)
+    (h : wlpOutcome (ops := ops) onDone onFault s₁) :
+    wlpOutcome (ops := ops) onDone onFault s₀ :=
+  wlpOutcome_of_wpUntil
+    (StepStageCut.to_wpUntil_of_step hSim hCut
+      (wpUntil_here (stop := fun s => s = s₁) rfl))
+    (fun s' hs => by
+      have hEq : s' = s₁ := hs
+      rw [hEq]
+      exact h)
+
+omit ops in
+/-- Prepend a `DetStageCut` onto a `wlpOutcome` continuation. -/
+theorem DetStageCut.to_wlpOutcome {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat} {s₀ s₁ : State}
+    {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : DetStageCut step s₀ s₁)
+    (h : wlpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s₁) :
+    wlpOutcome (ops := MirWpOps.ofDetStep step tag) onDone onFault s₀ :=
+  wlpOutcome_of_wpUntil (ops := MirWpOps.ofDetStep step tag)
+    (DetStageCut.to_wpUntil hCut
+      (wpUntil_here (ops := MirWpOps.ofDetStep step tag)
+        (stop := fun s => s = s₁) rfl))
+    (fun s' hs => by
+      have hEq : s' = s₁ := hs
+      rw [hEq]
+      exact h)
+
+/-- Prepend a `DetStageCut` onto a `wlpOutcome` continuation of any
+simulating `MirWpOps` interface. -/
+theorem DetStageCut.to_wlpOutcome_of_step
+    {step : State → StepOutcome State Out Fault}
+    (hSim : ∀ s s' (P : State → Prop) (Q : Out → Prop) (R : Fault → Prop),
+      step s = .step s' → P s' → ops.stepWp s P Q R)
+    {s₀ s₁ : State} {onDone : Out → Prop} {onFault : Fault → Prop}
+    (hCut : DetStageCut step s₀ s₁)
+    (h : wlpOutcome (ops := ops) onDone onFault s₁) :
+    wlpOutcome (ops := ops) onDone onFault s₀ :=
+  wlpOutcome_of_wpUntil
+    (DetStageCut.to_wpUntil_of_step hSim hCut
+      (wpUntil_here (stop := fun s => s = s₁) rfl))
     (fun s' hs => by
       have hEq : s' = s₁ := hs
       rw [hEq]
@@ -2561,5 +2784,90 @@ theorem diamond_spec_two_pass_canary (x y z : Nat) :
   exact wpStateOk_of_wlp_and_safety (ops := diamondOps)
     (MirWpOps.ofDetStep_conjunctive diamondStep (fun s => some s.block))
     hSafe hWlp
+
+/-- Two-pass loop canary using `wlpLoop_inv`: on `LoopInv`'s `ToyState`
+countdown loop, Pass 1 proves fault-free termination for all `n` by a simple
+state-only rank (`wpOutcome_of_rank`, ignoring `acc`), Pass 2 proves the
+functional postcondition `out = n` via the rank-free coinductive loop rule
+`wlpLoop_inv`, and `wpStateOk_of_wlp_and_safety` combines them. -/
+theorem wlpLoop_inv_two_pass_canary (n : Nat) :
+    let ops := MirWpOps.ofDetStep toyStep (fun s => some s.block)
+    wpStateOk (ops := ops) (fun out => out = n)
+      { block := 0, i := n, acc := 0 } := by
+  let ops := MirWpOps.ofDetStep toyStep (fun s => some s.block)
+  let rank : ToyState → Nat := fun s =>
+    match s.block with
+    | 0 => 2 * s.i + 1
+    | _ => 2 * s.i
+  have hSafe : wpStateOk (ops := ops) (fun _ => True)
+      { block := 0, i := n, acc := 0 } := by
+    refine wpOutcome_of_rank (ops := ops)
+      (Inv := fun s => s.block = 0 ∨ (s.block = 1 ∧ 0 < s.i)) rank ?_
+      (Or.inl rfl)
+    intro s hI
+    cases s with
+    | mk blk i acc =>
+      cases hI with
+      | inl h0 =>
+        subst h0
+        cases i with
+        | zero => exact True.intro
+        | succ k =>
+          exact ⟨Or.inr ⟨rfl, Nat.succ_pos k⟩, Nat.lt_succ_self (2 * (k + 1))⟩
+      | inr h1 =>
+        have hB : blk = 1 := h1.1
+        subst hB
+        cases i with
+        | zero => exact False.elim (Nat.lt_irrefl 0 h1.2)
+        | succ k =>
+          refine ⟨Or.inl rfl, ?_⟩
+          change 2 * k + 1 < 2 * (k + 1)
+          rw [Nat.mul_succ, Nat.add_succ, Nat.add_succ, Nat.add_zero]
+          exact Nat.lt_succ_self (2 * k + 1)
+  have hWlp : wlpOutcome (ops := ops) (fun out => out = n) (fun _ => True)
+      { block := 0, i := n, acc := 0 } := by
+    refine wlpLoop_inv (ops := ops)
+      (Inv := fun s => s.block = 0 ∧ s.acc + s.i = n)
+      (exit := fun s => s.block = 0 ∧ s.i = 0 ∧ s.acc = n)
+      ?_ ?_ ⟨rfl, Nat.zero_add n⟩
+    · intro s hI
+      cases s with
+      | mk blk i acc =>
+        have hB : blk = 0 := hI.1
+        have hAcc : acc + i = n := hI.2
+        subst hB
+        cases i with
+        | zero => exact Or.inl ⟨rfl, rfl, hAcc⟩
+        | succ k =>
+          refine Or.inr
+            (wpStepUntil_det_step_eq (step := toyStep)
+              (s' := { block := 1, i := k + 1, acc := acc }) rfl
+              (wpUntil_det_step_eq (step := toyStep)
+                (s' := { block := 0, i := k, acc := acc + 1 }) rfl
+                (wpUntil_here (ops := ops) (Or.inl ⟨rfl, ?_⟩))))
+          change (acc + 1) + k = n
+          rw [Nat.add_assoc, Nat.add_comm 1 k]
+          exact hAcc
+    · intro s hEx
+      cases s with
+      | mk blk i acc =>
+        have hB : blk = 0 := hEx.1
+        have hI0 : i = 0 := hEx.2.1
+        have hAcc : acc = n := hEx.2.2
+        subst hB; subst hI0
+        exact wlpOutcome_step (ops := ops) hAcc
+  exact wpStateOk_of_wlp_and_safety (ops := ops)
+    (MirWpOps.ofDetStep_conjunctive toyStep (fun s => some s.block))
+    hSafe hWlp
+
+/-- Negative soundness canary for `wlpOutcome`: although `wlpOutcome` accepts
+non-faulting divergence, it still rejects a faulting state when `onFault` is
+`False`. -/
+theorem wlpOutcome_fault_refutes_canary (i acc : Nat) :
+    let ops := MirWpOps.ofDetStep toyStep (fun s => some s.block)
+    ¬ wlpOutcome (ops := ops) (fun _ => True) (fun _ => False)
+      { block := 2, i := i, acc := acc } := by
+  intro ops h
+  exact (wlpOutcome_unfold_iff (ops := ops)).mp h
 
 end Anneal.ParametricCore
