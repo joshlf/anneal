@@ -29,6 +29,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -386,7 +387,7 @@ class GuardMutationUnitTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory(prefix="anneal-gmut-cache-test-") as tmp:
             root = Path(tmp)
-            self.assertFalse(gmut._can_reuse_lake_oleans(root, modules))
+            self.assertFalse(gmut._lake_olean_reuse_decision(root, modules)[0])
 
             for mod in modules:
                 src = root / "trusted/lean" / f"{mod}.lean"
@@ -399,7 +400,7 @@ class GuardMutationUnitTests(unittest.TestCase):
                 olean.write_bytes(b"olean")
                 os.utime(olean, (2000.0, 2000.0))
 
-            self.assertTrue(gmut._can_reuse_lake_oleans(root, modules))
+            self.assertTrue(gmut._lake_olean_reuse_decision(root, modules)[0])
 
             # Direct source newer than `.olean` -> False.
             scalars_src = (
@@ -407,9 +408,9 @@ class GuardMutationUnitTests(unittest.TestCase):
                 / "trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean"
             )
             os.utime(scalars_src, (3000.0, 3000.0))
-            self.assertFalse(gmut._can_reuse_lake_oleans(root, modules))
+            self.assertFalse(gmut._lake_olean_reuse_decision(root, modules)[0])
             os.utime(scalars_src, (1000.0, 1000.0))
-            self.assertTrue(gmut._can_reuse_lake_oleans(root, modules))
+            self.assertTrue(gmut._lake_olean_reuse_decision(root, modules)[0])
 
             # Transitive upstream dependency (`State.lean`) newer than `Scalars.olean` -> False.
             state_src = (
@@ -422,7 +423,7 @@ class GuardMutationUnitTests(unittest.TestCase):
             )
             os.utime(state_src, (2500.0, 2500.0))
             os.utime(state_olean, (2600.0, 2600.0))
-            self.assertFalse(gmut._can_reuse_lake_oleans(root, modules))
+            self.assertFalse(gmut._lake_olean_reuse_decision(root, modules)[0])
 
     def test_run_lean_timeout_returns_124_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="anneal-gmut-timeout-") as tmp:
@@ -1277,7 +1278,7 @@ class GuardMutationB1AdversarialTests(unittest.TestCase):
                 gmut._lake_olean_reuse_decision(root, mods, verify_olean_bytes=True),
                 (True, "lake-trace-verified"),
             )
-            self.assertTrue(gmut._can_reuse_lake_oleans(root, mods))
+            self.assertTrue(gmut._lake_olean_reuse_decision(root, mods)[0])
 
             # Source content diverged while its mtime looks OLDER than the
             # `.olean` (the case an mtime check wrongly accepts).
@@ -2497,8 +2498,11 @@ class GuardMutationB2AdversarialTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
             self.assertTrue(json.loads(res.stdout)["used_lake_cache"])
 
-            res = _run_cli([*base, "--trust-lake-olean-hash-files", "--verify-lake-olean-bytes"])
-            self.assertEqual(res.returncode, 2)
+            # Re-hashing is the only default: there is no flag to ask for it,
+            # and flags cannot be abbreviated.
+            for bad_flag in ("--verify-lake-olean-bytes", "--trust-lake"):
+                res = _run_cli([*base, bad_flag])
+                self.assertEqual(res.returncode, 2, bad_flag)
 
     def test_bulk_murmur_matches_the_block_by_block_hash(self) -> None:
         rng = random.Random(20261123)
@@ -2648,7 +2652,7 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
 
     def test_vacuous_and_swapped_fixture_statements_are_rejected(self) -> None:
         guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
-        trusted = {"evalScalarBinOp", "emptyMemory"}
+        semantics_fns = {"evalScalarBinOp"}
 
         # Syntactically reflexive `X = X := rfl` is rejected.
         refl_src = guard.sanity_source.replace(
@@ -2656,11 +2660,11 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
             "evalScalarBinOp .div ⟨42, 1⟩ ⟨6, 1⟩ .nil emptyMemory false",
         )
         errs = gmut._fixture_statement_errors(
-            "sanity", refl_src, guard.sanity_theorem_name, trusted_decl_names=trusted
+            "sanity", refl_src, guard.sanity_theorem_name, semantics_fn_names=semantics_fns
         )
         self.assertTrue(any("syntactically reflexive" in e for e in errs), errs)
 
-        # Arithmetic-only `1 + 1 = 2 := rfl` with no trusted call on LHS is rejected.
+        # Arithmetic-only `1 + 1 = 2 := rfl` with no semantics call on LHS is rejected.
         no_tcb = (
             "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
             "theorem sanity_div_by_zero :\n"
@@ -2668,9 +2672,9 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
             "  rfl\n"
         )
         errs = gmut._fixture_statement_errors(
-            "sanity", no_tcb, "sanity_div_by_zero", trusted_decl_names=trusted
+            "sanity", no_tcb, "sanity_div_by_zero", semantics_fn_names=semantics_fns
         )
-        self.assertTrue(any("does not reference any trusted declaration" in e for e in errs), errs)
+        self.assertTrue(any("LHS must apply a trusted MirSemantics function" in e for e in errs), errs)
 
         # `let` / `fun` inside theorem statement is rejected.
         let_src = (
@@ -2681,9 +2685,9 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
             "  rfl\n"
         )
         errs = gmut._fixture_statement_errors(
-            "sanity", let_src, "sanity_div_by_zero", trusted_decl_names=trusted
+            "sanity", let_src, "sanity_div_by_zero", semantics_fn_names=semantics_fns
         )
-        self.assertTrue(any("must not contain `let` or `fun`" in e for e in errs), errs)
+        self.assertTrue(any("must not contain `let`, `fun` or `λ`" in e for e in errs), errs)
 
         # Swapped outcomes: refute NOT asserting UB, or sanity asserting UB.
         swapped_refute = guard.sanity_source.replace(
@@ -2706,7 +2710,7 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
             _replace_guard("div_by_zero", sanity_source=swapped_sanity),
         ):
             cat_errs = gmut.validate_catalog_invariants(ANNEAL_ROOT)
-        self.assertTrue(any("RHS must not assert UB" in e for e in cat_errs), cat_errs)
+        self.assertTrue(any("must not mention `ub`" in e for e in cat_errs), cat_errs)
 
     # -- constructor & core-name shadowing -----------------------------
 
@@ -2859,6 +2863,350 @@ class GuardMutationA2AdversarialTests(unittest.TestCase):
         self.assertIn("Nat.beq srcPtr.tag dstPtr.tag", by_id["copy_nonoverlapping_place_overlap"].replacement)
         self.assertIn("tag := 1, targetLocal := 0", by_id["copy_nonoverlapping_place_overlap"].refute_source)
         self.assertIn("tag := 2, targetLocal := 0", by_id["copy_nonoverlapping_place_overlap"].refute_source)
+
+
+class GuardMutationB3AdversarialTests(unittest.TestCase):
+    """Round 3: statement shape, classifier bodies, CLI selectors, interrupts."""
+
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+    HEADER = "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+
+    def _stmt_errors(self, kind: str, body: str, helpers: str = "") -> list[str]:
+        src = f"{self.HEADER}{helpers}theorem t :\n{body} :=\n  rfl\n"
+        return gmut._fixture_statement_errors(
+            kind, src, "t", semantics_fn_names={"evalStmt", "evalOperand"}
+        )
+
+    # -- the statement must evaluate the semantics, on the LHS only ----
+
+    def test_statement_evaluates_semantics_on_lhs_and_compares_with_data(self) -> None:
+        # Valid shapes: multi-line, nested structure instances, `=` inside a
+        # string, brackets or a compound operator.
+        self.assertEqual(
+            self._stmt_errors("refute", "    evalStmt s stmt = MirStepNode.fail .ub"), []
+        )
+        self.assertEqual(
+            self._stmt_errors(
+                "sanity",
+                '    evalStmt\n      { frame := f, memory := m }\n'
+                '      { kind := .nop, span := "a = b" } =\n'
+                "      MirStepNode.step { frame := g (x == y), memory := m }",
+            ),
+            [],
+        )
+
+        # Helper-alias reflexivity: the RHS is the evaluation under another
+        # name, so `rfl` would prove it on every mutant.
+        alias = self._stmt_errors(
+            "sanity",
+            "    evalStmt s stmt = expected",
+            helpers="def expected : MirStepNode :=\n  evalStmt s stmt\n\n",
+        )
+        self.assertTrue(any("outside the theorem LHS" in e for e in alias), alias)
+        # ... also through `open ... renaming`, or inline on the RHS.
+        renamed = self._stmt_errors(
+            "sanity",
+            "    evalStmt s stmt = run s stmt",
+            helpers="open Trusted.Rustc.V2026_06_01.MirSemantics renaming evalStmt → run\n",
+        )
+        self.assertTrue(any("outside the theorem LHS" in e for e in renamed), renamed)
+        inline = self._stmt_errors("sanity", "    evalStmt s stmt = id (evalStmt s stmt)")
+        self.assertTrue(any("outside the theorem LHS" in e for e in inline), inline)
+
+        # The LHS head must be a semantics function, not merely mention one or
+        # a trusted type (`MirStepNode`), and must be written unqualified.
+        for lhs in (
+            "Prod.fst (MirStepNode.fail .ub, evalStmt s stmt)",
+            "id (MirStepNode.fail .ub)",
+            "(evalStmt s stmt)",
+            "MirSemantics.evalStmt s stmt",
+            "evalStmt.helper s stmt",
+            "helperValue",
+        ):
+            errs = self._stmt_errors("refute", f"    {lhs} = MirStepNode.fail .ub")
+            self.assertTrue(
+                any("LHS must apply a trusted MirSemantics function" in e for e in errs),
+                (lhs, errs),
+            )
+
+        # Not a single unparenthesized top-level equality.
+        for body in (
+            "    Eq (evalStmt s stmt) (MirStepNode.fail .ub)",
+            "    evalStmt s stmt ≠ MirStepNode.unsupported",
+            "    True",
+            "    (evalStmt s stmt = MirStepNode.fail .ub)",
+            "    evalStmt s stmt = MirStepNode.fail .ub ∨ 1 = 1",
+            "    evalStmt s stmt == MirStepNode.fail .ub",
+        ):
+            errs = self._stmt_errors("refute", body)
+            self.assertTrue(any("exactly one top-level `=`" in e for e in errs), (body, errs))
+        self.assertTrue(
+            any("empty LHS or RHS" in e for e in self._stmt_errors("refute", "    = .ub"))
+        )
+        errs = self._stmt_errors("sanity", "    evalStmt ((λ x => x) s) stmt = MirStepNode.step s")
+        self.assertTrue(any("`let`, `fun` or `λ`" in e for e in errs), errs)
+
+        # A statement that cannot be extracted is an error, never a pass.
+        one_line = f"{self.HEADER}theorem t : evalStmt s stmt = .ub := rfl\n"
+        for src, name in ((one_line, "t"), (one_line, "missing")):
+            errs = gmut._fixture_statement_errors(
+                "refute", src, name, semantics_fn_names={"evalStmt"}
+            )
+            self.assertEqual(len(errs), 1, errs)
+            self.assertIn("cannot extract the statement", errs[0])
+
+    def test_sanity_cannot_assert_ub_in_any_spelling(self) -> None:
+        for rhs in (".ub", "(.ub)", "MirStepNode.fail (.ub)", ".fail .ub", "MirStepNode.fail MirError.ub"):
+            errs = self._stmt_errors("sanity", f"    evalStmt s stmt = {rhs}")
+            self.assertTrue(any("must not mention `ub`" in e for e in errs), (rhs, errs))
+        # ... nor through a data helper.
+        errs = self._stmt_errors(
+            "sanity",
+            "    evalStmt s stmt = expected",
+            helpers="def expected : MirStepNode :=\n  MirStepNode.fail .ub\n\n",
+        )
+        self.assertTrue(any("must not mention `ub`" in e for e in errs), errs)
+        # A refutation accepts only the literal UB spellings.
+        for rhs in ("(.ub)", "expected", "MirStepNode.unsupported"):
+            errs = self._stmt_errors("refute", f"    evalStmt s stmt = {rhs}")
+            self.assertTrue(any("RHS must assert UB" in e for e in errs), (rhs, errs))
+        # Identifiers that merely contain `ub` are not UB.
+        self.assertEqual(
+            self._stmt_errors("sanity", "    evalStmt s stmt = MirStepNode.step subState"), []
+        )
+
+    def test_live_catalog_rejects_alias_sanity_and_passes_as_is(self) -> None:
+        self.assertEqual(gmut.validate_catalog_invariants(ANNEAL_ROOT), [])
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        call = "evalScalarBinOp .div ⟨42, 1⟩ ⟨6, 1⟩ .nil emptyMemory false"
+        self.assertIn(call, guard.sanity_source)
+        alias_src = guard.sanity_source.replace(
+            "theorem sanity_div_by_zero",
+            f"def expected :=\n  {call}\n\ntheorem sanity_div_by_zero",
+        ).replace(".ok (.scalar ⟨7, 1⟩) .nil emptyMemory", "expected")
+        with mock.patch.object(
+            gmut,
+            "MIR_SEMANTICS_GUARDS",
+            _replace_guard("div_by_zero", sanity_source=alias_src),
+        ):
+            errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(
+            any("['evalScalarBinOp'] outside the theorem LHS" in e for e in errors), errors
+        )
+
+    # -- classifier: `error:` text inside a pretty-printed goal --------
+
+    def test_classify_error_text_inside_goal_terms_is_still_a_kill(self) -> None:
+        head = "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\nhas type\n"
+        for body_line in (
+            '  evalStmt s { kind := .nop, span := "error: boom" } = MirStepNode.fail .ub\n',
+            '  "error: boom"\n',
+            '    span := "lexer error: unexpected character" }\n',
+            "  error : Nat\n",
+            "  errorCode: 3\n",
+        ):
+            self.assertEqual(
+                gmut.classify_refutation_failure(
+                    1, head + body_line, self.FIXTURE, self.SPAN, stderr_output=""
+                )[0],
+                "KILLED",
+                body_line,
+            )
+        # A bare `error:` that opens a line is an unlocated error wherever it
+        # sits, indented or not. Lean never prints a goal line like this (a
+        # string is quoted, a binder is `error : T`), so this fails closed.
+        for body_line in ("  error: boom\n", "error: boom\n", "lean: error: boom\n"):
+            self.assertEqual(
+                gmut.classify_refutation_failure(
+                    1, head + body_line, self.FIXTURE, self.SPAN, stderr_output=""
+                )[0],
+                "ERROR",
+                body_line,
+            )
+
+    # -- CLI: selectors, report schema, fail-closed sink, interrupts ---
+
+    def test_guard_selectors_accept_comma_lists_and_fail_closed(self) -> None:
+        ids = [
+            g.guard_id
+            for g in gmut.select_guards(guard_filters=["shift_oob, signed_", "shift_oob"])
+        ]
+        self.assertEqual(ids, ["signed_div_overflow", "signed_rem_overflow", "shift_oob"])
+        for bad, needle in (
+            (["div_by_zero,"], "must be non-empty"),
+            ([",,"], "must be non-empty"),
+            (["div_by_zero,no_such_guard"], "no cataloged guard matched --guard 'no_such_guard'"),
+        ):
+            with self.assertRaisesRegex(ValueError, re.escape(needle)):
+                gmut.select_guards(guard_filters=bad)
+        # All three `assume` guards mutate the same line in different ways.
+        assume = gmut.select_guards(guard_filters=["intrinsic_assume"])
+        self.assertEqual(len(assume), 3)
+        self.assertEqual(len({g.anchor for g in assume}), 1)
+        self.assertEqual(len({g.replacement for g in assume}), 3)
+        size_guard = next(g for g in assume if g.guard_id == "intrinsic_assume_non_bool_size")
+        self.assertNotIn("sc.sizeBytes", size_guard.replacement)
+        self.assertIn("match Nat.beq sc.bits 1 with", size_guard.replacement)
+        # Bit pattern 1 in a 4-byte scalar: only the size check makes it UB.
+        self.assertIn(".init (.scalar ⟨1, 4⟩)", size_guard.refute_source)
+
+        # Likewise the two place-overlap guards of `evalCopySingleDirect`: one
+        # drops the same-local check, the other keeps it for whole locals only.
+        place, subplace = gmut.select_guards(
+            guard_filters=["copy_nonoverlapping_place_overlap,copy_nonoverlapping_subplace_overlap"]
+        )
+        self.assertEqual(place.anchor, subplace.anchor)
+        self.assertNotEqual(place.replacement, subplace.replacement)
+        self.assertNotIn("projectionsOverlap", subplace.replacement)
+        self.assertIn("        | .nil, .nil => true\n        | _, _ => false\n", subplace.replacement)
+        # Source borrows field 0 of local 0, destination borrows all of it.
+        self.assertIn("targetProjection := fieldZero :: .nil", subplace.refute_source)
+        self.assertIn("tag := 2, targetLocal := 0, targetProjection := .nil", subplace.refute_source)
+        self.assertEqual(len(gmut.MIR_SEMANTICS_GUARDS), 20)
+
+    def test_report_schema_is_the_same_for_finished_and_fatal_runs(self) -> None:
+        fatal_keys = set(gmut._fatal_report("all", "boom"))
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, KILL_ALL_FAKE_SH)
+            base = ["--lean", str(fake), "--no-lake-cache", "--json"]
+            green = _run_cli([*base, "--guard", "div_by_zero,rem_by_zero"])
+            fatal = _run_cli([*base, "--guard", "no_such_guard_xyz"])
+            survivor_fake = Path(tmp) / "fake_lean_survivor"
+            _write_fake_lean_sh(
+                survivor_fake,
+                'if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; printf x > "$OUT"; fi\nexit 0',
+            )
+            red = _run_cli(
+                ["--lean", str(survivor_fake), "--no-lake-cache", "--json", "--guard", "div_by_zero"]
+            )
+        green_report = json.loads(green.stdout)
+        fatal_report = json.loads(fatal.stdout)
+        red_report = json.loads(red.stdout)
+        self.assertEqual(set(green_report), fatal_keys)
+        self.assertEqual(set(fatal_report), fatal_keys)
+        self.assertEqual(
+            (green.returncode, green_report["ok"], green_report["fatal_error"], green_report["total"]),
+            (0, True, None, 2),
+        )
+        self.assertEqual((fatal.returncode, fatal_report["ok"]), (1, False))
+        self.assertIn("no cataloged guard matched", fatal_report["fatal_error"])
+        self.assertEqual(
+            (red.returncode, red_report["ok"], red_report["fatal_error"], red_report["survived"]),
+            (1, False, None, 1),
+        )
+
+    def test_json_out_holds_a_failing_report_until_the_run_reports(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, KILL_ALL_FAKE_SH)
+            out = Path(tmp) / "report.json"
+            argv = [
+                "--lean", str(fake), "--no-lake-cache",
+                "--guard", "div_by_zero", "--json-out", str(out),
+            ]
+            # A stale green report from an earlier run ...
+            out.write_text(json.dumps({"ok": True, "killed": 1, "total": 1}), encoding="utf-8")
+            # ... must not survive a run that dies without reporting.
+            with mock.patch.object(
+                gmut, "run_guard_mutation_suite", side_effect=KeyError("boom")
+            ):
+                with self.assertRaises(KeyError):
+                    gmut.main(argv)
+            report = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual((report["ok"], report["errors"]), (False, 1))
+            self.assertEqual(report["fatal_error"], "run did not complete")
+
+            # An unwritable sink is fatal before any Lean runs.
+            res = _run_cli(
+                [*argv[:-1], str(Path(tmp) / "fake_lean" / "report.json"), "--json"]
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertEqual(res.stderr.count("cannot write"), 1, res.stderr)
+            self.assertIn("cannot write", json.loads(res.stdout)["fatal_error"])
+
+    def test_sigterm_and_sigint_kill_lean_and_remove_temp_dirs(self) -> None:
+        fake_sh = (
+            'if [ -n "$OUT" ]; then mkdir -p "$(dirname "$OUT")"; printf x > "$OUT"; fi\n'
+            'if [ "$IS_MUTANT" = "1" ]; then\n'
+            '  echo "$$" > "$GMUT_TEST_PIDFILE"\n'
+            "  sleep 60\n"
+            "fi\n"
+            "exit 0"
+        )
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with tempfile.TemporaryDirectory(prefix="b3-interrupt-") as tmp:
+                tmp_path = Path(tmp)
+                fake = tmp_path / "fake_lean"
+                _write_fake_lean_sh(fake, fake_sh)
+                tmp_root = tmp_path / "tmp"
+                tmp_root.mkdir()
+                pidfile = tmp_path / "lean.pid"
+                out = tmp_path / "report.json"
+                out.write_text(json.dumps({"ok": True}), encoding="utf-8")
+                env = os.environ.copy()
+                env.update({"TMPDIR": str(tmp_root), "GMUT_TEST_PIDFILE": str(pidfile)})
+                proc = subprocess.Popen(
+                    [
+                        sys.executable, "-B", str(SCRIPT),
+                        "--lean", str(fake), "--no-lake-cache",
+                        "--guard", "div_by_zero", "--json-out", str(out),
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 30
+                    while not (pidfile.is_file() and pidfile.read_text().strip()):
+                        self.assertIsNone(proc.poll(), "CLI exited before the mutant compile")
+                        self.assertLess(time.monotonic(), deadline, "fake Lean never started")
+                        time.sleep(0.01)
+                    lean_pid = int(pidfile.read_text().strip())
+                    self.assertTrue(_list_gmut_temp_dirs(tmp_root))
+                    proc.send_signal(sig)
+                    _, stderr = proc.communicate(timeout=30)
+                finally:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.communicate()
+                self.assertEqual(proc.returncode, gmut.EXIT_INTERRUPTED, stderr)
+                self.assertIn(f"interrupted by {sig.name}", stderr)
+                self.assertNotIn("Traceback", stderr)
+                report = json.loads(out.read_text(encoding="utf-8"))
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["fatal_error"], f"interrupted by {sig.name}")
+                # Nothing leaked: no temp dir, and the sleeping Lean is gone.
+                self.assertEqual(_list_gmut_temp_dirs(tmp_root), set())
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        os.kill(lean_pid, 0)
+                    except ProcessLookupError:
+                        break
+                    self.assertLess(time.monotonic(), deadline, "Lean survived the interrupt")
+                    time.sleep(0.01)
+
+    def test_termination_signals_are_only_taken_over_when_default(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGHUP):
+            before = signal.getsignal(sig)
+            try:
+                # `nohup` / an embedding program: an ignored signal stays ignored.
+                signal.signal(sig, signal.SIG_IGN)
+                with gmut._termination_signals_as_interrupt():
+                    self.assertIs(signal.getsignal(sig), signal.SIG_IGN)
+                self.assertIs(signal.getsignal(sig), signal.SIG_IGN)
+                # A default action is replaced for the duration only.
+                signal.signal(sig, signal.SIG_DFL)
+                with self.assertRaisesRegex(KeyboardInterrupt, sig.name):
+                    with gmut._termination_signals_as_interrupt():
+                        os.kill(os.getpid(), sig)
+                        time.sleep(5)  # the handler interrupts this sleep
+                self.assertIs(signal.getsignal(sig), signal.SIG_DFL)
+            finally:
+                signal.signal(sig, before)
 
 
 if __name__ == "__main__":

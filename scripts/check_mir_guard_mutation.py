@@ -64,11 +64,27 @@ Anti-false-kill and isolation invariants
 * Fixtures are checked statically before Lean runs: one `rfl` theorem with no
   binders, helper `def`s that shadow no trusted declaration, an allowlist of
   top-level commands, and no construct the comment scanner cannot lex exactly
-  (interpolated or raw strings, character literals, backslashes).
+  (interpolated or raw strings, character literals, backslashes). The theorem
+  must read `<MirSemantics function> <args> = <expected data>`: no other part
+  of the fixture may name a MirSemantics function, a refutation must expect
+  UB literally, and a positive sanity fixture must not mention `ub` at all.
 * `.olean`s are shared by hardlink, so no Lean invocation may ever write
   through one: destinations are unlinked before every link and every compile,
   stale downstream modules are never seeded into a mutant overlay, and the
   reused Lake artifacts are re-checked after the run.
+
+Exit status and JSON report
+---------------------------
+
+`0`: every selected guard was killed. `1`: a survivor, an error, or a fatal
+failure before any result. `2`: bad command line. `130`: interrupted by
+SIGINT, SIGTERM or SIGHUP, after killing every Lean process group and removing
+every temporary directory.
+
+`--json` and `--json-out` carry the same keys whether the run finished or
+failed fatally; `ok` is the verdict and `fatal_error` is `null` unless the run
+produced no results. A `--json-out` file is overwritten with a failing report
+before the run starts, so it can never show a stale pass.
 
 How to add a new guard
 ----------------------
@@ -91,8 +107,10 @@ from __future__ import annotations
 
 import argparse
 import array
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+import contextlib
 from dataclasses import asdict, dataclass
 import json
 import os
@@ -243,16 +261,9 @@ EXPECTED_PROOF_FAILURE_MARKERS: tuple[str, ...] = (
     "is not a valid",
 )
 
-# Warning substrings emitted by Lean 4 when a proof uses `sorry`. The pinned
-# toolchain (v4.34.1) prints "declaration uses `sorry`" with backticks; older
-# toolchains printed single quotes. These literals are documentation only:
-# detection goes through `SORRY_OUTPUT_RE`, which matches every quoting style
-# as well as `sorryAx`.
-SORRY_OUTPUT_MARKERS: tuple[str, ...] = (
-    "declaration uses `sorry`",
-    "declaration uses 'sorry'",
-    "sorryAx",
-)
+# Lean 4 warns when a proof uses `sorry`. The pinned toolchain (v4.34.1) prints
+# "declaration uses `sorry`" with backticks, older ones used single quotes, and
+# `#print axioms` names `sorryAx`. One pattern matches every spelling.
 SORRY_OUTPUT_RE = re.compile(r"\bsorry(?:Ax)?\b")
 
 # Tokens forbidden inside generated sanity and refutation Lean fixtures (and in
@@ -1068,7 +1079,7 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
         ),
     ),
     # ------------------------------------------------------------------
-    # Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean (4 UB guards)
+    # Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean (6 UB guards)
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="intrinsic_assume_false",
@@ -1248,6 +1259,97 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "\n"
             "theorem refute_intrinsic_assume_invalid_bool :\n"
             "    evalStmt invalidBoolState assumeStmt = MirStepNode.fail .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
+        guard_id="intrinsic_assume_non_bool_size",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
+        description="evalStmt .intrinsic (.assume op) rejects a scalar that is not 1 byte wide as UB",
+        anchor=(
+            "  | .intrinsic (.assume op) =>\n"
+            "    match\n"
+            "      evalOperand\n"
+            "        s.frame.locals\n"
+            "        op\n"
+            "        s.memory.borrows\n"
+            "        s.memory.globals\n"
+            "        layouts\n"
+            "        s.memory.callerLocals\n"
+            "        localDecls\n"
+            "        s.memory.callStack\n"
+            "    with\n"
+            "    | .ok (.scalar sc) locals' =>\n"
+            "      match Bool.and (Nat.beq sc.sizeBytes 1) (Nat.beq sc.bits 1) with\n"
+            "      | true => MirStepNode.step (advanceStmt s locals')\n"
+            "      | false => MirStepNode.fail .ub"
+        ),
+        replacement=(
+            "  | .intrinsic (.assume op) =>\n"
+            "    match\n"
+            "      evalOperand\n"
+            "        s.frame.locals\n"
+            "        op\n"
+            "        s.memory.borrows\n"
+            "        s.memory.globals\n"
+            "        layouts\n"
+            "        s.memory.callerLocals\n"
+            "        localDecls\n"
+            "        s.memory.callStack\n"
+            "    with\n"
+            "    | .ok (.scalar sc) locals' =>\n"
+            "      match Nat.beq sc.bits 1 with\n"
+            "      | true => MirStepNode.step (advanceStmt s locals')\n"
+            "      | false => MirStepNode.fail .ub"
+        ),
+        sanity_theorem_name="sanity_intrinsic_assume_non_bool_size",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def trueState : MachineState :=\n"
+            "  { frame := { blockIdx := 0, stmtIdx := 0, locals := .init (.scalar ⟨1, 1⟩) :: .nil }\n"
+            "    memory := emptyMemory }\n"
+            "\n"
+            "def assumeStmt : Statement :=\n"
+            "  { kind := .intrinsic (.assume (.copy { local_ := 0, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem sanity_intrinsic_assume_non_bool_size :\n"
+            "    evalStmt trueState assumeStmt =\n"
+            "      MirStepNode.step\n"
+            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := .init (.scalar ⟨1, 1⟩) :: .nil }\n"
+            "          memory := emptyMemory } :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_intrinsic_assume_non_bool_size",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def wideOneState : MachineState :=\n"
+            "  { frame := { blockIdx := 0, stmtIdx := 0, locals := .init (.scalar ⟨1, 4⟩) :: .nil }\n"
+            "    memory := emptyMemory }\n"
+            "\n"
+            "def assumeStmt : Statement :=\n"
+            "  { kind := .intrinsic (.assume (.copy { local_ := 0, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem refute_intrinsic_assume_non_bool_size :\n"
+            "    evalStmt wideOneState assumeStmt = MirStepNode.fail .ub :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -1504,6 +1606,143 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "\n"
             "theorem refute_copy_nonoverlapping_place_overlap :\n"
             "    evalStmt aliasState aliasCopyStmt = MirStepNode.fail .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
+        guard_id="copy_nonoverlapping_subplace_overlap",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Statements.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Statements",
+        description="evalCopySingleDirect rejects a sub-place (field of a local vs the whole local) overlap as UB",
+        anchor=(
+            "  let overlaps :=\n"
+            "    match Nat.beq srcPtr.tag dstPtr.tag with\n"
+            "    | true => true\n"
+            "    | false =>\n"
+            "      match\n"
+            "        Nat.beq srcEntry.targetLocal dstEntry.targetLocal\n"
+            "      with\n"
+            "      | false => false\n"
+            "      | true =>\n"
+            "        projectionsOverlap\n"
+            "          srcEntry.targetProjection\n"
+            "          dstEntry.targetProjection\n"
+            "  match overlaps with\n"
+            "  | true => MirStepNode.fail .ub\n"
+            "  | false =>\n"
+            "    let srcRootSlot : Option LocalSlot :="
+        ),
+        replacement=(
+            "  let overlaps :=\n"
+            "    match Nat.beq srcPtr.tag dstPtr.tag with\n"
+            "    | true => true\n"
+            "    | false =>\n"
+            "      match\n"
+            "        Nat.beq srcEntry.targetLocal dstEntry.targetLocal\n"
+            "      with\n"
+            "      | false => false\n"
+            "      | true =>\n"
+            "        match srcEntry.targetProjection, dstEntry.targetProjection with\n"
+            "        | .nil, .nil => true\n"
+            "        | _, _ => false\n"
+            "  match overlaps with\n"
+            "  | true => MirStepNode.fail .ub\n"
+            "  | false =>\n"
+            "    let srcRootSlot : Option LocalSlot :="
+        ),
+        sanity_theorem_name="sanity_copy_nonoverlapping_subplace_overlap",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def srcBorrow : BorrowEntry :=\n"
+            "  { tag := 1, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def dstBorrow : BorrowEntry :=\n"
+            "  { tag := 2, targetLocal := 1, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def disjointMem : Memory :=\n"
+            "  { emptyMemory with borrows := srcBorrow :: dstBorrow :: .nil }\n"
+            "\n"
+            "def disjointInitLocals : List LocalSlot :=\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.scalar ⟨99, 4⟩) ::\n"
+            "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
+            "\n"
+            "def disjointAfterLocals : List LocalSlot :=\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.scalar ⟨42, 4⟩) ::\n"
+            "  .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "  .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "  .init (.scalar ⟨1, 8⟩) :: .nil\n"
+            "\n"
+            "def disjointCopyStmt : Statement :=\n"
+            "  { kind := .intrinsic\n"
+            "      (.copyNonOverlapping\n"
+            "        (.copy { local_ := 2, projection := .nil })\n"
+            "        (.copy { local_ := 3, projection := .nil })\n"
+            "        (.copy { local_ := 4, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem sanity_copy_nonoverlapping_subplace_overlap :\n"
+            "    evalStmt\n"
+            "      { frame := { blockIdx := 0, stmtIdx := 0, locals := disjointInitLocals }\n"
+            "        memory := disjointMem }\n"
+            "      disjointCopyStmt =\n"
+            "      MirStepNode.step\n"
+            "        { frame := { blockIdx := 0, stmtIdx := 1, locals := disjointAfterLocals }\n"
+            "          memory := disjointMem } :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_copy_nonoverlapping_subplace_overlap",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Statements\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Effect\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "def fieldZero : ProjectionElem :=\n"
+            "  .field 0 { kind := .uint .u32, layoutIdx := 0 }\n"
+            "\n"
+            "def fieldSrcBorrow : BorrowEntry :=\n"
+            "  { tag := 1, targetLocal := 0, targetProjection := fieldZero :: .nil, perm := .unique }\n"
+            "\n"
+            "def wholeDstBorrow : BorrowEntry :=\n"
+            "  { tag := 2, targetLocal := 0, targetProjection := .nil, perm := .unique }\n"
+            "\n"
+            "def subplaceState : MachineState :=\n"
+            "  { frame :=\n"
+            "      { blockIdx := 0\n"
+            "        stmtIdx := 0\n"
+            "        locals :=\n"
+            "          .init (.scalar ⟨42, 4⟩) ::\n"
+            "          .init (.ptr ⟨1, 0⟩ 8) ::\n"
+            "          .init (.ptr ⟨2, 0⟩ 8) ::\n"
+            "          .init (.scalar ⟨1, 8⟩) :: .nil }\n"
+            "    memory := { emptyMemory with borrows := fieldSrcBorrow :: wholeDstBorrow :: .nil } }\n"
+            "\n"
+            "def subplaceCopyStmt : Statement :=\n"
+            "  { kind := .intrinsic\n"
+            "      (.copyNonOverlapping\n"
+            "        (.copy { local_ := 1, projection := .nil })\n"
+            "        (.copy { local_ := 2, projection := .nil })\n"
+            "        (.copy { local_ := 3, projection := .nil }))\n"
+            "    span := \"\" }\n"
+            "\n"
+            "theorem refute_copy_nonoverlapping_subplace_overlap :\n"
+            "    evalStmt subplaceState subplaceCopyStmt = MirStepNode.fail .ub :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -2251,13 +2490,17 @@ _LEAN_SIMPLE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*")
 
 # Declarations in a trusted source file, matched on raw text (a name that only
 # appears in a comment is reserved too, which errs on the safe side).
-_TRUSTED_DECL_NAME_RE = re.compile(
+_TRUSTED_DECL_RE = re.compile(
     r"^[ \t]*(?:@\[[^\]\n]*\][ \t]*)*"
     r"(?:(?:private|protected|noncomputable|unsafe|partial|nonrec)[ \t]+)*"
-    r"(?:def|theorem|abbrev|structure|inductive|class|opaque|axiom)[ \t]+"
+    r"(def|theorem|abbrev|structure|inductive|class|opaque|axiom)[ \t]+"
     r"([^\s:({\[]+)",
     re.MULTILINE,
 )
+
+# Declaration keywords that introduce something a fixture could CALL to
+# evaluate the semantics (as opposed to a type or a proof).
+_TRUSTED_FUNCTION_KINDS: frozenset[str] = frozenset({"def", "abbrev", "opaque"})
 
 
 # Lean prelude primitives and trusted root namespace components that a fixture
@@ -2298,7 +2541,16 @@ _TRUSTED_CTOR_LINE_RE = re.compile(r"^[ \t]*\|[ \t]+([A-Za-z_][A-Za-z0-9_']*)")
 
 def _trusted_declaration_names(lean_source: str) -> set[str]:
     """Return the last name component of every declaration in a trusted file."""
-    return {name.split(".")[-1] for name in _TRUSTED_DECL_NAME_RE.findall(lean_source)}
+    return {name.split(".")[-1] for _, name in _TRUSTED_DECL_RE.findall(lean_source)}
+
+
+def _trusted_function_names(lean_source: str) -> set[str]:
+    """Return the last name component of every function a trusted file defines."""
+    return {
+        name.split(".")[-1]
+        for kind, name in _TRUSTED_DECL_RE.findall(lean_source)
+        if kind in _TRUSTED_FUNCTION_KINDS
+    }
 
 
 def _trusted_constructor_names(lean_source: str) -> set[str]:
@@ -2347,13 +2599,25 @@ def _split_top_level_equality(stmt: str) -> list[int]:
             depth += 1
         elif ch in ")]}⟩" and depth > 0:
             depth -= 1
-        elif ch == "=" and depth == 0:
-            prev_ch = stmt[i - 1] if i > 0 else ""
-            next_ch = stmt[i + 1] if i + 1 < n else ""
-            if prev_ch not in ":<>!=" and next_ch not in "=>":
-                positions.append(i)
+        elif (
+            ch == "="
+            and depth == 0
+            and stmt[max(i - 1, 0) : i] not in (":", "<", ">", "!", "=")
+            and stmt[i + 1 : i + 2] not in ("=", ">")
+        ):
+            positions.append(i)
         i += 1
     return positions
+
+
+# Term-level binders that could name the whole evaluation and then state
+# something trivial about that name (`let x := evalStmt s t; x = x`).
+_STATEMENT_BINDER_RE = re.compile(r"(?<![\w'])(?:let|fun|λ)(?![\w'])")
+_STATEMENT_HEAD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_']*(?=\s|$)")
+_UB_IDENT_RE = re.compile(r"(?<![\w'])ub(?![\w'])")
+
+# The only right-hand sides a refutation theorem may assert.
+REFUTE_UB_RHS: tuple[str, ...] = (".ub", "MirStepNode.fail .ub")
 
 
 def _fixture_statement_errors(
@@ -2361,31 +2625,52 @@ def _fixture_statement_errors(
     src_text: str,
     theorem_name: str,
     *,
-    trusted_decl_names: frozenset[str] | set[str],
+    semantics_fn_names: frozenset[str] | set[str],
 ) -> list[str]:
-    """Reject vacuous (`X = X`, `1 = 1`, `let ...`) or outcome-swapped theorems.
+    """Reject a fixture theorem that does not test the trusted semantics.
 
-    Enforces that every cataloged sanity/refutation theorem:
-    - contains no `let` or `fun` inside the theorem statement itself,
-    - states a single top-level equality `lhs = rhs` with `lhs != rhs`,
-    - invokes at least one trusted declaration from `trusted_decl_names` on `lhs`,
-    - targets UB (`.ub` or `MirStepNode.fail .ub`) on `rhs` iff `kind == "refute"`.
+    `_fixture_shape_errors` pins the proof to `rfl`; this pins the statement
+    to `<semantics function> <args> = <expected data>`:
+
+    - exactly one top-level `=`, written without enclosing parentheses, with
+      no `let`/`fun`/`λ` and with textually different sides;
+    - the LHS is an application whose head is a function defined in one of
+      `SEMANTICS_MODULES` (`semantics_fn_names`), written unqualified;
+    - no such function is named anywhere else in the fixture. Helper `def`s
+      and the RHS are therefore plain data, so the RHS cannot be an alias of
+      the very evaluation it is compared with (`def expected := evalStmt s t`
+      and then `evalStmt s t = expected`), which `rfl` proves on every mutant;
+    - a refutation's RHS is literally UB (`REFUTE_UB_RHS`), and a positive
+      sanity fixture never mentions `ub`, neither inline nor through a helper.
+
+    A vacuous REFUTATION at least fails the gate at run time, because its
+    mutant survives. A vacuous SANITY theorem does not: it passes on every
+    mutant and silently disables the check that a mutation left non-UB
+    behavior intact. These checks are what protects that half of the gate.
     """
-    errors: list[str] = []
     code_only, _, _ = _scan_lean_source(src_text)
-    code_lines = code_only.splitlines()
+    span_lines: list[str] = []
     try:
         start, end = find_theorem_line_span(src_text, theorem_name)
     except ValueError:
-        return errors
-    span_lines = [ln for ln in code_lines[start - 1 : end] if ln.strip()]
-    if len(span_lines) < 3 or not span_lines[-2].rstrip().endswith(":="):
-        return errors
-    stmt = "\n".join(span_lines[1:-1]).rstrip()
-    stmt = stmt[:-2].strip()
-    if re.search(r"\b(?:let|fun)\b", stmt):
+        pass
+    else:
+        span_lines = [
+            ln for ln in code_only.splitlines()[start - 1 : end] if ln.strip()
+        ]
+    if (
+        len(span_lines) < 3
+        or span_lines[0].rstrip() != f"theorem {theorem_name} :"
+        or not span_lines[-2].rstrip().endswith(":=")
+    ):
+        return [f"({kind}): cannot extract the statement of theorem {theorem_name!r}"]
+    stmt = "\n".join(span_lines[1:-1]).rstrip()[: -len(":=")].strip()
+
+    errors: list[str] = []
+    if _STATEMENT_BINDER_RE.search(stmt):
         errors.append(
-            f"({kind}): theorem {theorem_name!r} statement must not contain `let` or `fun`"
+            f"({kind}): theorem {theorem_name!r} statement must not contain "
+            "`let`, `fun` or `λ`"
         )
     eq_positions = _split_top_level_equality(stmt)
     if len(eq_positions) != 1:
@@ -2394,36 +2679,45 @@ def _fixture_statement_errors(
             f"top-level `=`, found {len(eq_positions)}"
         )
         return errors
-    eq_idx = eq_positions[0]
-    lhs = stmt[:eq_idx].strip()
-    rhs = stmt[eq_idx + 1 :].strip()
-    lhs_norm = " ".join(lhs.split())
-    rhs_norm = " ".join(rhs.split())
-    if not lhs_norm or not rhs_norm:
+    lhs = stmt[: eq_positions[0]].strip()
+    rhs = " ".join(stmt[eq_positions[0] + 1 :].split())
+    if not lhs or not rhs:
         errors.append(
             f"({kind}): theorem {theorem_name!r} has empty LHS or RHS around `=`"
         )
         return errors
-    if lhs_norm == rhs_norm:
+    if " ".join(lhs.split()) == rhs:
         errors.append(
             f"({kind}): theorem {theorem_name!r} is syntactically reflexive (`lhs = lhs`)"
         )
-    if trusted_decl_names:
-        lhs_idents = set(_LEAN_SIMPLE_IDENT_RE.findall(lhs))
-        if not (lhs_idents & trusted_decl_names):
-            errors.append(
-                f"({kind}): theorem {theorem_name!r} LHS does not reference any "
-                "trusted declaration"
-            )
-    rhs_is_ub = rhs_norm in (".ub", "MirStepNode.fail .ub")
-    if kind == "refute" and not rhs_is_ub:
+
+    head = _STATEMENT_HEAD_RE.match(lhs)
+    if head is None or head.group(0) not in semantics_fn_names:
         errors.append(
-            f"({kind}): refutation theorem {theorem_name!r} RHS must assert UB "
-            f"(`.ub` or `MirStepNode.fail .ub`), got {rhs_norm!r}"
+            f"({kind}): theorem {theorem_name!r} LHS must apply a trusted "
+            f"MirSemantics function, got {lhs.split()[0]!r}"
         )
-    if kind == "sanity" and rhs_is_ub:
+    outside_lhs = Counter(_LEAN_SIMPLE_IDENT_RE.findall(code_only)) - Counter(
+        _LEAN_SIMPLE_IDENT_RE.findall(lhs)
+    )
+    leaked = sorted(name for name in outside_lhs if name in semantics_fn_names)
+    if leaked:
         errors.append(
-            f"({kind}): positive sanity theorem {theorem_name!r} RHS must not assert UB"
+            f"({kind}): {kind}_source names trusted MirSemantics function(s) "
+            f"{leaked} outside the theorem LHS (helper `def`s and the expected "
+            "value must be plain data)"
+        )
+
+    if kind == "refute":
+        if rhs not in REFUTE_UB_RHS:
+            errors.append(
+                f"({kind}): refutation theorem {theorem_name!r} RHS must assert UB "
+                f"(one of {REFUTE_UB_RHS!r}), got {rhs!r}"
+            )
+    elif _UB_IDENT_RE.search(code_only):
+        errors.append(
+            f"({kind}): positive sanity fixture must not mention `ub` "
+            f"(theorem {theorem_name!r} must assert a non-UB outcome)"
         )
     return errors
 
@@ -2560,6 +2854,9 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
     # `open`ed trusted/core declaration, detaching the theorem from the TCB.
     trusted_decl_names: set[str] = set()
     trusted_ctor_names: set[str] = set()
+    # Functions of the mutable semantics modules: the only things a fixture
+    # theorem may evaluate, and only on its LHS.
+    semantics_fn_names: set[str] = set()
     for mod in (*BASE_TRUSTED_MODULES, *SEMANTICS_MODULES):
         mod_path = trusted_lean_dir / f"{mod}.lean"
         if not mod_path.is_file():
@@ -2568,6 +2865,8 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
         mod_text = mod_path.read_text(encoding="utf-8")
         trusted_decl_names |= _trusted_declaration_names(mod_text)
         trusted_ctor_names |= _trusted_constructor_names(mod_text)
+        if mod in SEMANTICS_MODULES:
+            semantics_fn_names |= _trusted_function_names(mod_text)
         if not _parse_lean_header_ex(mod_text)[2]:
             errors.append(f"cannot parse every import of trusted module {mod}")
         mod_imports = _extract_trusted_imports(mod_text)
@@ -2684,7 +2983,7 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             ):
                 errors.append(f"{guard.guard_id}: {shape_error}")
             for stmt_error in _fixture_statement_errors(
-                kind, src_text, thm_name, trusted_decl_names=trusted_decl_names
+                kind, src_text, thm_name, semantics_fn_names=semantics_fn_names
             ):
                 errors.append(f"{guard.guard_id}: {stmt_error}")
 
@@ -2747,21 +3046,26 @@ def select_guards(
         return [g for g in MIR_SEMANTICS_GUARDS if g.quick]
     if guard_filters:
         selected_ids: set[str] = set()
+        # Each `--guard` value is one selector or a comma-separated list. Every
+        # selector must match: an exact guard_id wins over a substring match.
         for raw_pattern in guard_filters:
-            pattern = raw_pattern.strip()
-            if not pattern:
-                raise ValueError("--guard filter must be non-empty")
-            exact = [g for g in MIR_SEMANTICS_GUARDS if g.guard_id == pattern]
-            matched = (
-                exact
-                if exact
-                else [g for g in MIR_SEMANTICS_GUARDS if pattern in g.guard_id]
-            )
-            if not matched:
-                raise ValueError(
-                    f"no cataloged guard matched --guard {raw_pattern!r}"
+            for part in raw_pattern.split(","):
+                pattern = part.strip()
+                if not pattern:
+                    raise ValueError(
+                        f"--guard filter must be non-empty, got {raw_pattern!r}"
+                    )
+                exact = [g for g in MIR_SEMANTICS_GUARDS if g.guard_id == pattern]
+                matched = (
+                    exact
+                    if exact
+                    else [g for g in MIR_SEMANTICS_GUARDS if pattern in g.guard_id]
                 )
-            selected_ids.update(g.guard_id for g in matched)
+                if not matched:
+                    raise ValueError(
+                        f"no cataloged guard matched --guard {pattern!r}"
+                    )
+                selected_ids.update(g.guard_id for g in matched)
         return [g for g in MIR_SEMANTICS_GUARDS if g.guard_id in selected_ids]
     return list(MIR_SEMANTICS_GUARDS)
 
@@ -3542,19 +3846,6 @@ def _lake_olean_reuse_decision(
     )
 
 
-def _can_reuse_lake_oleans(
-    anneal_root: Path,
-    modules: Sequence[str],
-    *,
-    lean_bin: Path | None = None,
-    lean_githash: str | None = None,
-) -> bool:
-    """Return True if `.lake/build/lib/lean` `.olean`s for `modules` are reusable."""
-    return _lake_olean_reuse_decision(
-        anneal_root, modules, lean_bin=lean_bin, lean_githash=lean_githash
-    )[0]
-
-
 def _olean_fingerprints(
     olean_dir: Path,
     modules: Sequence[str],
@@ -4163,6 +4454,8 @@ def _run_guard_mutation_suite(
     survived = sum(1 for r in results if r.status == "SURVIVED")
     errors = sum(1 for r in results if r.status == "ERROR")
     return {
+        "ok": total > 0 and killed == total and survived == 0 and errors == 0,
+        "fatal_error": None,
         "mode": mode_label,
         "used_lake_cache": used_lake_cache,
         "lake_cache_detail": lake_cache_detail,
@@ -4233,17 +4526,65 @@ def _format_summary(report: dict[str, object]) -> str:
 
 
 def _fatal_report(mode_label: str, message: str) -> dict[str, object]:
-    """Report for a run that failed before producing per-guard results."""
+    """Report for a run that failed before producing per-guard results.
+
+    Carries exactly the keys of a finished run's report, so a consumer never
+    has to special-case a missing key: `ok` is the verdict either way.
+    """
     return {
-        "mode": mode_label,
+        "ok": False,
         "fatal_error": message,
+        "mode": mode_label,
+        "used_lake_cache": False,
+        "lake_cache_detail": "",
+        "lean_bin": None,
+        "lean_run_wrapper": None,
         "total": 0,
         "killed": 0,
         "survived": 0,
         "errors": 1,
         "kill_rate_pct": 0.0,
+        "baseline_sec": 0.0,
+        "total_sec": 0.0,
         "results": [],
     }
+
+
+# Exit status of a run cut short by SIGINT, SIGTERM or SIGHUP.
+EXIT_INTERRUPTED = 130
+
+
+@contextlib.contextmanager
+def _termination_signals_as_interrupt() -> Iterator[None]:
+    """Deliver SIGTERM and SIGHUP as `KeyboardInterrupt`, exactly like SIGINT.
+
+    Python's default action for both kills the interpreter on the spot. No
+    `finally` or `with` exit runs, so every `anneal-gmut-*` directory leaks,
+    and each Lean child keeps compiling: it runs in its own session, where a
+    signal sent to this process's group (CI cancel, `timeout`) cannot reach it.
+
+    Only a signal still at its default action is taken over, so `nohup` (which
+    ignores SIGHUP) and an embedding program's own handlers keep working.
+    """
+
+    def _raise(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(signal.Signals(signum).name)
+
+    taken_over: list[int] = []
+    try:
+        for name in ("SIGTERM", "SIGHUP"):
+            signum = getattr(signal, name, None)
+            if signum is not None and signal.getsignal(signum) is signal.SIG_DFL:
+                signal.signal(signum, _raise)
+                taken_over.append(signum)
+    except ValueError:
+        # Not the main thread: signal handling belongs to the embedding program.
+        pass
+    try:
+        yield
+    finally:
+        for signum in taken_over:
+            signal.signal(signum, signal.SIG_DFL)
 
 
 def _write_json_out(path: Path, report: dict[str, object]) -> None:
@@ -4256,7 +4597,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         description=(
             "Single-guard mutation testing gate for Anneal's "
             "Trusted.Rustc.V2026_06_01.MirSemantics."
-        )
+        ),
+        # A gate's flags must be spelled out: no silent `--tr` -> `--trust-...`.
+        allow_abbrev=False,
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -4274,7 +4617,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         dest="guards",
         action="append",
         default=None,
-        help="Run only guard(s) matching this exact guard_id or substring (repeatable).",
+        help=(
+            "Run only guard(s) matching this exact guard_id or substring "
+            "(repeatable; each value may be a comma-separated list)."
+        ),
     )
     parser.add_argument(
         "--list",
@@ -4324,22 +4670,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="Do not reuse `.lake/build/lib/lean` `.olean`s for baseline seeding.",
     )
-    olean_bytes_group = parser.add_mutually_exclusive_group()
-    olean_bytes_group.add_argument(
-        "--verify-lake-olean-bytes",
-        action="store_true",
-        help=(
-            "Re-hash every reused `.lake/build/lib/lean` `.olean` against its "
-            "recorded hash. This is the default; the flag is kept for compatibility."
-        ),
-    )
-    olean_bytes_group.add_argument(
+    parser.add_argument(
         "--trust-lake-olean-hash-files",
         action="store_true",
         help=(
             "Faster, weaker: trust an `.olean.hash` file that is at least as new "
-            "as its `.olean` instead of re-hashing the `.olean`. Does not notice "
-            "an `.olean` replaced by an older file."
+            "as its `.olean` instead of re-hashing every reused `.olean` (the "
+            "default). Does not notice an `.olean` replaced by an older file."
         ),
     )
     parser.add_argument(
@@ -4404,12 +4741,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Total cataloged guards: {len(selected)}")
         return 0
 
-    def _fail(message: str) -> int:
-        """Report a fatal error on stderr AND in every requested JSON sink.
-
-        A stale `--json-out` file from an earlier green run must never survive
-        a run that failed before producing results.
-        """
+    def _fail(message: str, exit_code: int = 1) -> int:
+        """Report a fatal error on stderr AND in every requested JSON sink."""
         print(f"ERROR: {message}", file=sys.stderr)
         report = _fatal_report(mode_label, message)
         if args.json_out is not None:
@@ -4419,7 +4752,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"ERROR: cannot write {args.json_out}: {exc}", file=sys.stderr)
         if args.emit_json:
             print(json.dumps(report, indent=2))
-        return 1
+        return exit_code
+
+    # Fail-closed sink: a `--json-out` file left by an earlier green run must
+    # not outlive a run that never reports, however it dies (crash, OOM kill,
+    # SIGKILL). It holds a failing report until the real one replaces it.
+    if args.json_out is not None:
+        try:
+            _write_json_out(
+                args.json_out, _fatal_report(mode_label, "run did not complete")
+            )
+        except OSError as exc:
+            unwritable, args.json_out = args.json_out, None
+            return _fail(f"cannot write {unwritable}: {exc}")
 
     try:
         lean_bin = _resolve_lean_binary(args.lean)
@@ -4438,17 +4783,23 @@ def main(argv: Sequence[str] | None = None) -> int:
         lean_run_wrapper = _resolve_lean_run_wrapper(anneal_root)
 
     try:
-        report = run_guard_mutation_suite(
-            anneal_root=anneal_root,
-            lean_bin=lean_bin,
-            quick=args.quick,
-            guard_filters=args.guards,
-            jobs=args.jobs,
-            timeout_sec=args.timeout_sec,
-            lean_run_wrapper=lean_run_wrapper,
-            reuse_lake_cache=not args.no_lake_cache,
-            verify_lake_olean_bytes=not args.trust_lake_olean_hash_files,
-        )
+        with _termination_signals_as_interrupt():
+            report = run_guard_mutation_suite(
+                anneal_root=anneal_root,
+                lean_bin=lean_bin,
+                quick=args.quick,
+                guard_filters=args.guards,
+                jobs=args.jobs,
+                timeout_sec=args.timeout_sec,
+                lean_run_wrapper=lean_run_wrapper,
+                reuse_lake_cache=not args.no_lake_cache,
+                verify_lake_olean_bytes=not args.trust_lake_olean_hash_files,
+            )
+    except KeyboardInterrupt as exc:
+        # The suite has already killed every Lean process group and removed
+        # its temporary directories on the way out.
+        signal_name = exc.args[0] if exc.args else "SIGINT"
+        return _fail(f"interrupted by {signal_name}", EXIT_INTERRUPTED)
     except (RuntimeError, ValueError, OSError) as exc:
         return _fail(str(exc))
 
@@ -4464,14 +4815,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         print(_format_summary(report))
 
-    if (
-        report["total"] == 0
-        or report["survived"] != 0
-        or report["errors"] != 0
-        or report["killed"] != report["total"]
-    ):
-        return 1
-    return 0
+    return 0 if report["ok"] else 1
 
 
 if __name__ == "__main__":
