@@ -180,6 +180,36 @@ def kwSymDSimproc : List Char := ['s', 'y', 'm', '_', 'd', 's', 'i', 'm', 'p', '
 def kwSymDischarger : List Char := ['s', 'y', 'm', '_', 'd', 'i', 's', 'c', 'h', 'a', 'r', 'g', 'e', 'r']
 def kwRunParserAttrHooks : List Char := ['r', 'u', 'n', '_', 'p', 'a', 'r', 's', 'e', 'r', '_', 'a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e', '_', 'h', 'o', 'o', 'k', 's']
 def kwRunBuiltinParserAttrHooks : List Char := ['r', 'u', 'n', '_', 'b', 'u', 'i', 'l', 't', 'i', 'n', '_', 'p', 'a', 'r', 's', 'e', 'r', '_', 'a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e', '_', 'h', 'o', 'o', 'k', 's']
+def kwInit : List Char := ['i', 'n', 'i', 't']
+def kwAttribute : List Char := ['a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e']
+def kwHashEval : List Char := ['#', 'e', 'v', 'a', 'l']
+def kwHashReduce : List Char := ['#', 'r', 'e', 'd', 'u', 'c', 'e']
+def kwCbvEval : List Char := ['c', 'b', 'v', '_', 'e', 'v', 'a', 'l']
+def kwCbvOpaque : List Char := ['c', 'b', 'v', '_', 'o', 'p', 'a', 'q', 'u', 'e']
+def kwCoinductive : List Char := ['c', 'o', 'i', 'n', 'd', 'u', 'c', 't', 'i', 'v', 'e']
+def clsHAdd : List Char := ['H', 'A', 'd', 'd']
+def clsHSub : List Char := ['H', 'S', 'u', 'b']
+def clsHMul : List Char := ['H', 'M', 'u', 'l']
+def clsHDiv : List Char := ['H', 'D', 'i', 'v']
+def clsHMod : List Char := ['H', 'M', 'o', 'd']
+def clsHPow : List Char := ['H', 'P', 'o', 'w']
+def clsHAppend : List Char := ['H', 'A', 'p', 'p', 'e', 'n', 'd']
+def clsHAnd : List Char := ['H', 'A', 'n', 'd']
+def clsHOr : List Char := ['H', 'O', 'r']
+def clsHXor : List Char := ['H', 'X', 'o', 'r']
+def clsHShiftLeft : List Char := ['H', 'S', 'h', 'i', 'f', 't', 'L', 'e', 'f', 't']
+def clsHShiftRight : List Char := ['H', 'S', 'h', 'i', 'f', 't', 'R', 'i', 'g', 'h', 't']
+def clsHSMul : List Char := ['H', 'S', 'M', 'u', 'l']
+def clsHAndThen : List Char := ['H', 'A', 'n', 'd', 'T', 'h', 'e', 'n']
+def clsHOrElse : List Char := ['H', 'O', 'r', 'E', 'l', 's', 'e']
+def clsGetElem : List Char := ['G', 'e', 't', 'E', 'l', 'e', 'm']
+def clsGetElemQ : List Char := ['G', 'e', 't', 'E', 'l', 'e', 'm', '?']
+def clsTrans : List Char := ['T', 'r', 'a', 'n', 's']
+def clsCoeOut : List Char := ['C', 'o', 'e', 'O', 'u', 't']
+def clsCoeTail : List Char := ['C', 'o', 'e', 'T', 'a', 'i', 'l']
+def clsCoeFun : List Char := ['C', 'o', 'e', 'F', 'u', 'n']
+def clsCoeSort : List Char := ['C', 'o', 'e', 'S', 'o', 'r', 't']
+def clsCoeHead : List Char := ['C', 'o', 'e', 'H', 'e', 'a', 'd']
 def builtinPrefix : List Char := ['b', 'u', 'i', 'l', 't', 'i', 'n', '_']
 def parserSuffix : List Char := ['_', 'p', 'a', 'r', 's', 'e', 'r']
 def plusOneBracketTick : List Char := ['+', '1', ']', '\'']
@@ -500,6 +530,13 @@ def instantiate (body arg : ExprSkeleton) : ExprSkeleton := instAt 0 arg body
 def getAppFn : ExprSkeleton → ExprSkeleton
   | app f _ => getAppFn f
   | e => e
+
+def getAppArgsRev : ExprSkeleton → List ExprSkeleton
+  | app f a => a :: getAppArgsRev f
+  | _ => []
+
+def getAppArgs (e : ExprSkeleton) : List ExprSkeleton :=
+  (getAppArgsRev e).reverse
 
 def isLiteral : ExprSkeleton → Bool
   | natLit _ => true
@@ -3602,13 +3639,18 @@ def Radix.isDigit : Radix → Char → Bool
   | .oct, c => decide ('0' ≤ c) && decide (c ≤ '7')
   | .hex, c => isHexDigit c
 
+/-- What precedes the current character inside a string interpolation hole. -/
+inductive HolePrev where
+  | other | ident | num | quoteTok
+  deriving DecidableEq
+
 inductive ScanState where
   | code (prev : Prev)
   | dash | slash | slashAmb | lt | ltDash | bslash | dotR | lineComment
   | blockStart (depth : Nat) | block (depth : Nat) | blockDash (depth : Nat)
   | blockSlash (depth : Nat)
   | str | strEsc
-  | hole (depth : Nat) (prevIdent : Bool) | holeDash (depth : Nat) | holeSlash (depth : Nat)
+  | hole (depth : Nat) (prev : HolePrev) | holeDash (depth : Nat) | holeSlash (depth : Nat)
   | chrOpen | chrEsc | chrEscN (remaining : Nat) | chrEnd
   | rawR | rawHash (hashes : Nat) | raw (hashes : Nat) | rawEnd (hashes seen : Nat)
   | guillemet
@@ -3650,8 +3692,12 @@ def stepCode (prev : Prev) (c : Char) : StepResult :=
   else if c = '/' then .ok (.slash, [' '])
   else if c = '<' then .ok (.lt, [' '])
   else if c = '\\' then .ok (.bslash, [' '])
-  else if c = ']' ∨ c = '×' ∨ c = 'Σ' ∨ c = '⊕' then .ok (.code .quoteTok, [' '])
-  else if c = '#' ∨ c = '~' then .ok (.code .sym, [' '])
+  else if c = '@' then .ok (.code .other, [' ', '@', ' '])
+  else if c = '[' then .ok (.code .other, [' ', '[', ' '])
+  else if c = ']' then .ok (.code .quoteTok, [' ', ']', ' '])
+  else if c = '×' ∨ c = 'Σ' ∨ c = '⊕' then .ok (.code .quoteTok, [' '])
+  else if c = '#' then .ok (.code .sym, [' ', '#'])
+  else if c = '~' then .ok (.code .sym, [' '])
   else .ok (.code .other, [' '])
 
 /-- A character inside a block comment at nesting `depth`. -/
@@ -3659,20 +3705,30 @@ def stepBlock (depth : Nat) (c : Char) : ScanState :=
   if c = '-' then .blockDash depth else if c = '/' then .blockSlash depth else .block depth
 
 /-- A character inside an interpolation hole. -/
-def stepHole (depth : Nat) (prevIdent : Bool) (c : Char) : StepResult :=
-  if c = '{' then .ok (.hole (depth + 1) false, [' '])
+def stepHole (depth : Nat) (prev : HolePrev) (c : Char) : StepResult :=
+  if c = '{' then .ok (.hole (depth + 1) .other, [' '])
   else if c = '}' then
-    if depth ≤ 1 then .ok (.str, [' ']) else .ok (.hole (depth - 1) false, [' '])
+    if depth ≤ 1 then .ok (.str, [' ']) else .ok (.hole (depth - 1) .other, [' '])
   else if c = '"' ∨ c = '\\' ∨ c = '«' ∨ c = '»' then
     .error "literal or escape inside an interpolation hole"
   else if c = '\'' then
-    if prevIdent then .ok (.hole depth true, ['\''])
+    if prev = .ident then .ok (.hole depth .ident, ['\''])
+    else if prev = .quoteTok then .ok (.hole depth .other, [' '])
     else .error "character literal inside an interpolation hole"
   else if c = '-' then .ok (.holeDash depth, [' '])
   else if c = '/' then .ok (.holeSlash depth, [' '])
-  else if isIdRest c then .ok (.hole depth (prevIdent || isIdFirst c), [visible c])
-  else if c = '.' then .ok (.hole depth false, ['.'])
-  else .ok (.hole depth false, [' '])
+  else if c = '@' then .ok (.hole depth .other, [' ', '@', ' '])
+  else if c = '[' then .ok (.hole depth .other, [' ', '[', ' '])
+  else if c = ']' then .ok (.hole depth .quoteTok, [' ', ']', ' '])
+  else if c = '×' ∨ c = 'Σ' ∨ c = '⊕' then .ok (.hole depth .quoteTok, [' '])
+  else if c = '#' then .ok (.hole depth .other, [' ', '#'])
+  else if c.isDigit then
+    .ok (.hole depth (if prev = .ident then .ident else .num), [c])
+  else if isIdFirst c then
+    .ok (.hole depth (if prev = .num then .num else .ident), [visible c])
+  else if isIdRest c then .ok (.hole depth prev, [visible c])
+  else if c = '.' then .ok (.hole depth .other, ['.'])
+  else .ok (.hole depth .other, [' '])
 
 def stepOne (st : ScanState) (c : Char) : StepResult :=
   match st with
@@ -3708,14 +3764,14 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
   | .str =>
     if c = '"' then .ok (.code .other, [])
     else if c = '\\' then .ok (.strEsc, [])
-    else if c = '{' then .ok (.hole 1 false, [' '])
+    else if c = '{' then .ok (.hole 1 .other, [' '])
     else .ok (.str, [])
   | .strEsc => .ok (.str, [])
   | .hole d p => stepHole d p c
   | .holeDash d =>
-    if c = '-' then .error "comment inside an interpolation hole" else stepHole d false c
+    if c = '-' then .error "comment inside an interpolation hole" else stepHole d .other c
   | .holeSlash d =>
-    if c = '-' then .error "comment inside an interpolation hole" else stepHole d false c
+    if c = '-' then .error "comment inside an interpolation hole" else stepHole d .other c
   | .chrOpen =>
     if c = '\\' then .ok (.chrEsc, [])
     else if c = '\'' then .error "empty character literal"
@@ -3734,7 +3790,7 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
   | .rawHash n =>
     if c = '#' then .ok (.rawHash (n + 1), [])
     else if c = '"' then .ok (.raw n, [' '])
-    else (stepCode .sym c).map (fun r => (r.1, 'r' :: ' ' :: r.2))
+    else (stepCode .sym c).map (fun r => (r.1, 'r' :: ' ' :: '#' :: r.2))
   | .raw n =>
     if c = '"' then (if n = 0 then .ok (.code .other, []) else .ok (.rawEnd n 0, []))
     else .ok (.raw n, [])
@@ -3872,9 +3928,10 @@ def forbiddenOptionTokens : List (List Char) :=
    Chars.kwQuotPrecheck, Chars.kwHygiene]
 
 /-- Banned in every mode: native-reduction primitives, code-generation hooks, `unsafe` and
-`partial`, and commands or tactics that run metaprograms. -/
+`partial`, and commands or tactics that run metaprograms or compile-time evaluation. -/
 def metaExecTokens : List (List Char) :=
-  [Chars.kwByElab, Chars.kwRunTac, Chars.kwRunCmd, Chars.kwRunMeta, Chars.kwRunElab]
+  [Chars.kwByElab, Chars.kwRunTac, Chars.kwRunCmd, Chars.kwRunMeta, Chars.kwRunElab,
+   Chars.kwHashEval, Chars.kwHashReduce]
 
 /-- Commands and attributes that add syntax, tokens, or macros, even `local` ones that
 leave no extension entry: the lexer rules above hold only for the core token table. -/
@@ -3885,22 +3942,41 @@ def syntaxExtensionTokens : List (List Char) :=
    Chars.kwDeclareSimpLikeTactic]
 
 /-- Extension-hook commands and attributes (initializers, elaborators, delaborators,
-unexpanders, simprocs, unification hints, compiler passes/rewrites, and `export` aliases),
-banned in every mode as defense in depth behind the `.olean` extension audit. -/
+unexpanders, simprocs, unification hints, compiler passes/rewrites, `cbv_eval`,
+`coinductive`, and `export` aliases), banned in every mode as defense in depth behind
+the `.olean` extension audit. -/
 def extHookTokens : List (List Char) :=
   [Chars.kwInitialize, Chars.kwBuiltinInit, Chars.kwCommandElab, Chars.kwTermElab,
    Chars.kwTacticElab, Chars.kwDoElemElab, Chars.kwInductiveElab, Chars.kwDelab,
    Chars.kwAppUnexpander, Chars.kwSimproc, Chars.kwDSimproc, Chars.kwCbvSimproc,
    Chars.kwSimprocDecl, Chars.kwDSimprocDecl, Chars.kwCbvSimprocDecl, Chars.kwUnifHint,
-   Chars.kwUnificationHint, Chars.kwExport, Chars.kwCsimp, Chars.kwCpass,
-   Chars.kwBuiltinTactic, Chars.kwGrindTactic, Chars.kwTryTactic, Chars.kwSymSimproc,
-   Chars.kwSymDSimproc, Chars.kwSymDischarger, Chars.kwRunParserAttrHooks,
-   Chars.kwRunBuiltinParserAttrHooks]
+   Chars.kwUnificationHint, Chars.kwExport, Chars.kwCsimp, Chars.kwCpass, Chars.kwCbvEval,
+   Chars.kwCbvOpaque, Chars.kwCoinductive, Chars.kwBuiltinTactic, Chars.kwGrindTactic,
+   Chars.kwTryTactic, Chars.kwSymSimproc, Chars.kwSymDSimproc, Chars.kwSymDischarger,
+   Chars.kwRunParserAttrHooks, Chars.kwRunBuiltinParserAttrHooks]
 
 def alwaysForbiddenTokens : List (List Char) :=
   [Chars.ofReduceBool, Chars.ofReduceNat, Chars.trustCompiler, Chars.reduceBool,
    Chars.reduceNat, Chars.kwNativeEqTrue, Chars.kwImplementedBy, Chars.kwExtern,
    Chars.kwUnsafe, Chars.kwPartial] ++ metaExecTokens ++ syntaxExtensionTokens ++ extHookTokens
+
+/-- Detect `init` inside an attribute block (`@[... init ...]` or `attribute [... init ...]`)
+without flagging ordinary identifiers such as `def init := 0` or list literals `[init]`. -/
+def initAttributeAux : Nat → List (List Char) → Option (List Char)
+  | _, [] => none
+  | 0, t1 :: t2 :: rest =>
+    if (t1 = ['@'] ∨ tokenHasKeyword Chars.kwAttribute t1) ∧ t2 = ['['] then
+      initAttributeAux 1 rest
+    else initAttributeAux 0 (t2 :: rest)
+  | 0, [_] => none
+  | depth + 1, t :: rest =>
+    if t = ['['] then initAttributeAux (depth + 2) rest
+    else if t = [']'] then initAttributeAux depth rest
+    else if tokenHasKeyword Chars.kwInit t then some Chars.kwInit
+    else initAttributeAux (depth + 1) rest
+
+def initAttribute? (toks : List (List Char)) : Option (List Char) :=
+  initAttributeAux 0 toks
 
 def stripLeadingDigits : List Char → List Char
   | c :: rest => if c.isDigit then stripLeadingDigits rest else c :: rest
@@ -3947,8 +4023,8 @@ def checkTokens (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     match firstKeyword? forbiddenOptionTokens toks with
     | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
     | none =>
-      match ((firstKeyword? alwaysForbiddenTokens toks).or (builtinForbidden? toks)).or
-          (parserAttribute? toks) with
+      match (((firstKeyword? alwaysForbiddenTokens toks).or (builtinForbidden? toks)).or
+          (parserAttribute? toks)).or (initAttribute? toks) with
       | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
       | none =>
         if cfg.allowProvisionalNative = true ∧ role = .proof then .ok ()
@@ -4123,9 +4199,9 @@ theorem validatePackageStructure_ok {pkg : PackageAuditInput}
 /-! ## Codegen `_unsafe_rec` companions -/
 
 /-- The equation compiler's `parent._unsafe_rec` companion of a safe definition of the
-same module: a `partial` definition with the parent's type. -/
+same module: a `partial` definition with a stored body and the parent's type. -/
 def isCodegenUnsafeRecInMod (inv : ModuleInventory) (ci : ConstantRecord) : Bool :=
-  decide (ci.safety = .partialDecl ∧ ci.kind = .defnDecl) &&
+  decide (ci.safety = .partialDecl ∧ ci.kind = .defnDecl ∧ ci.value?.isSome = true) &&
   match ci.name.unsafeRecParent? with
   | some p =>
     match findConstByName inv.constants p with
@@ -4158,23 +4234,119 @@ un-replayed `partial` `_unsafe_rec` companion). -/
 def isLocalExtDecl (inv : ModuleInventory) (d : SymName) : Bool :=
   decide (d ∈ inv.constNames) && decide (d ∈ (replayableConstants inv).map (·.name))
 
-/-- A local declaration that can own an instance: a local class, or the local name that
-ties an instance of an imported class to this module. It may not carry a reducibility
-attribute, because instance resolution unfolds a reducible alias: after `abbrev N := Nat`,
-`instance : OfNat N 0` is an instance for `Nat`, and after `abbrev C := OfNat Nat 0` so is
-`instance : C`. -/
+/-- Full β-reduction and local-definition unfolding used to normalize instance and alias
+types before checking local anchoring. Returns `none` on fuel exhaustion (fail-closed). -/
+def normInstanceExprOpt (inv : ModuleInventory) : Nat → ExprSkeleton → Option ExprSkeleton
+  | 0, _ => none
+  | fuel + 1, .const c =>
+    match findConstByName inv.constants c with
+    | some ci =>
+      if ci.kind = .defnDecl then
+        match ci.value? with
+        | some v => normInstanceExprOpt inv fuel v
+        | none => none
+      else some (.const c)
+    | none => some (.const c)
+  | fuel + 1, .app f a =>
+    match normInstanceExprOpt inv fuel f with
+    | none => none
+    | some (.lam _ b) =>
+      match normInstanceExprOpt inv fuel a with
+      | none => none
+      | some a' => normInstanceExprOpt inv fuel (b.instantiate a')
+    | some f' =>
+      match normInstanceExprOpt inv fuel a with
+      | none => none
+      | some a' => some (.app f' a')
+  | fuel + 1, .lam t b =>
+    match normInstanceExprOpt inv fuel t, normInstanceExprOpt inv fuel b with
+    | some t', some b' => some (.lam t' b')
+    | _, _ => none
+  | fuel + 1, .pi t b =>
+    match normInstanceExprOpt inv fuel t, normInstanceExprOpt inv fuel b with
+    | some t', some b' => some (.pi t' b')
+    | _, _ => none
+  | fuel + 1, .proj s i e =>
+    match normInstanceExprOpt inv fuel e with
+    | some e' => some (.proj s i e')
+    | none => none
+  | _ + 1, e => some e
+
+def invDefnBodySize (inv : ModuleInventory) : Nat :=
+  (inv.constants.map (fun ci =>
+    if ci.kind = .defnDecl then (ci.value?.map ExprSkeleton.size).getD 0 else 0)).sum
+
+def instanceNormFuel (inv : ModuleInventory) (e : ExprSkeleton) : Nat :=
+  64 + 4 * e.size + 2 * inv.constants.length + 2 * invDefnBodySize inv
+
+/-- Normalize an instance or alias type under β-reduction and local-definition unfolding,
+then extract the conclusion under all leading `pi` binders (even binders revealed only
+after β/δ-reduction). -/
+def normInstanceTargetOpt (inv : ModuleInventory) (e : ExprSkeleton) : Option ExprSkeleton :=
+  (normInstanceExprOpt inv (instanceNormFuel inv e) e).map ExprSkeleton.piTarget
+
+/-- Non-definition local declaration without a reducibility attribute: cannot silently
+unfold to an imported type or class during instance synthesis. -/
+def isBaseInstanceAnchor (inv : ModuleInventory) (d : SymName) : Bool :=
+  isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries) &&
+    match findConstByName inv.constants d with
+    | some ci => decide (ci.kind ≠ .defnDecl)
+    | none => false
+
+/-- Core `Init` typeclasses whose trailing arguments are `outParam`s: anchoring solely in an
+`outParam` (e.g. `HAdd Nat Nat Color`) still matches every imported-type query (`Nat + Nat`). -/
+def outParamAfter2Classes : List (List Char) :=
+  [Chars.clsHAdd, Chars.clsHSub, Chars.clsHMul, Chars.clsHDiv, Chars.clsHMod, Chars.clsHPow,
+   Chars.clsHAppend, Chars.clsHAnd, Chars.clsHOr, Chars.clsHXor, Chars.clsHShiftLeft,
+   Chars.clsHShiftRight, Chars.clsHSMul, Chars.clsHAndThen, Chars.clsHOrElse,
+   Chars.clsGetElem, Chars.clsGetElemQ, Chars.clsTrans]
+
+def outParamAfter1Classes : List (List Char) :=
+  [Chars.clsCoeOut, Chars.clsCoeTail, Chars.clsCoeFun, Chars.clsCoeSort]
+
+/-- Input expressions of a normalized instance conclusion, excluding `outParam` slots of
+known `Init` classes so an instance cannot anchor solely on an output parameter. -/
+def instanceInputExprs (target : ExprSkeleton) : List ExprSkeleton :=
+  match target.getAppFn with
+  | .const cls =>
+    match cls.parts with
+    | [seg] =>
+      let args := target.getAppArgs
+      if seg ∈ outParamAfter2Classes then args.take 2
+      else if seg ∈ outParamAfter1Classes then args.take 1
+      else if seg = Chars.clsCoeHead then args.drop 1
+      else [target]
+    | _ => [target]
+  | _ => [target]
+
+/-- A local declaration that can own an instance or coercion: a non-reducible local
+declaration that is either non-definitional (`inductive`/`opaque`/...) or a non-reducible
+definition whose normalized conclusion still names a non-reducible local base anchor
+(closing both `abbrev N := Nat` and un-annotated `def N := Nat` / `def C := OfNat Nat 0`). -/
 def isInstanceAnchor (inv : ModuleInventory) (d : SymName) : Bool :=
-  isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries)
+  isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries) &&
+    match findConstByName inv.constants d with
+    | some ci =>
+      if ci.kind = .defnDecl then
+        match ci.value? with
+        | some v =>
+          match normInstanceTargetOpt inv v with
+          | some target =>
+            (instanceInputExprs target).any (fun a => a.usedConstants.any (isBaseInstanceAnchor inv))
+          | none => false
+        | none => false
+      else true
+    | none => false
 
 /-- Policy for one persisted extension entry. An entry found in a persisted table is
 persisted, whatever scope it was declared with. No audited module may register macros,
 syntax, elaborators, delaborators, unexpanders, initializers, `implemented_by` / `extern`
 hooks, or `export` aliases. A reducibility attribute must target a local declaration. An
-instance must be a local declaration of a local class that is not a reducible alias
-(`isInstanceAnchor`), except that a definitions module may instantiate any other class
-when the conclusion of the instance's type names such an anchor (a local name among the
-premises alone does not count), and may also register scoped and default instances of
-its own classes and coercions that involve one of its own types. -/
+instance must be a local declaration of a local anchor class (`isInstanceAnchor`), except
+that a definitions module may instantiate an imported class when the β/δ-normalized
+conclusion's non-`outParam` input expressions name a local base anchor, and may also
+register scoped/default instances of local anchor classes and coercions involving a local
+anchor type. -/
 def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except AuditFailure Unit :=
   match ext with
   | .macroEntry d => .error (.forbiddenMacroOrElab inv.moduleName "macro" d)
@@ -4203,8 +4375,13 @@ def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except 
         (.forbiddenInstanceOrCoe inv.moduleName "instance_of_imported_class" d)
       match findConstByName inv.constants d with
       | some ci =>
-        ensure (ci.type.piTarget.usedConstants.any (isInstanceAnchor inv) = true)
-          (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
+        match normInstanceTargetOpt inv ci.type with
+        | some target =>
+          ensure ((instanceInputExprs target).any
+              (fun a => a.usedConstants.any (isBaseInstanceAnchor inv)) = true)
+            (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
+        | none =>
+          .error (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
       | none =>
         .error (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
   | .scopedInstanceEntry d cls _ => do
@@ -4218,7 +4395,7 @@ def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except 
   | .coeEntry d src tgt => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
     ensure (isLocalExtDecl inv d = true ∧
-        (isLocalExtDecl inv src = true ∨ isLocalExtDecl inv tgt = true))
+        (isInstanceAnchor inv src = true ∨ isInstanceAnchor inv tgt = true))
       (.forbiddenInstanceOrCoe inv.moduleName "coe_between_imported_types" d)
   | .reducibilityOverride t =>
     ensure (isLocalExtDecl inv t = true) (.forbiddenReducibilityOverride inv.moduleName t)
@@ -5433,8 +5610,10 @@ theorem auditAndReplayPackage_sources_covered {cfg : AuditConfig} {pkg : Package
     exact ⟨src, hsrc, h1⟩
 
 /-- No audited module registers an orphan instance of an imported class: an accepted
-instance of an imported class belongs to a `Defs` module, and the conclusion of its type
-names a replayed declaration of that module that has no reducibility attribute. -/
+instance of an imported class belongs to a `Defs` module, its type normalizes under
+β-reduction and local-definition unfolding to a conclusion whose non-`outParam` input
+expressions name a local replayed non-definition declaration with no reducibility
+attribute. -/
 theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ d cls isPriv,
@@ -5442,8 +5621,11 @@ theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : Pac
       isInstanceAnchor inv cls = false →
       inv.role = .defsExempt ∧
         ∃ ci ∈ inv.constants, ci.name = d ∧
-          ∃ anchor ∈ ci.type.piTarget.usedConstants, isLocalExtDecl inv anchor = true ∧
-            EnvExtEntry.reducibilityOverride anchor ∉ inv.extEntries := by
+          ∃ target, normInstanceTargetOpt inv ci.type = some target ∧
+            ∃ arg ∈ instanceInputExprs target,
+              ∃ anchor ∈ arg.usedConstants,
+                isLocalExtDecl inv anchor = true ∧
+                EnvExtEntry.reducibilityOverride anchor ∉ inv.extEntries := by
   intro inv hinv d cls isPriv hext hcls
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
   have hval := checkAll_ok_iff.mp hm.1 _ hext
@@ -5453,10 +5635,29 @@ theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : Pac
   split at hfind
   · rename_i ci hci
     obtain ⟨hmem, hname⟩ := findConstByName_mem hci
-    obtain ⟨anchor, ha, hanchor⟩ := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
-    simp only [isInstanceAnchor, Bool.and_eq_true, decide_eq_true_eq] at hanchor
-    exact ⟨hrole, ci, hmem, hname, anchor, ha, hanchor⟩
+    split at hfind
+    · rename_i target htarget
+      obtain ⟨arg, harg, hused⟩ := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
+      obtain ⟨anchor, ha, hanchor⟩ := List.any_eq_true.mp hused
+      simp only [isBaseInstanceAnchor, Bool.and_eq_true, decide_eq_true_eq] at hanchor
+      exact ⟨hrole, ci, hmem, hname, target, htarget, arg, harg, anchor, ha, hanchor.1.1,
+        hanchor.1.2⟩
+    · cases hfind
   · cases hfind
+
+/-- Every accepted coercion belongs to a `Defs` module and involves at least one local
+instance anchor (blocking reducible or transparent aliases such as `abbrev N' := Nat`). -/
+theorem auditAndReplayPackage_coe_anchored {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, ∀ d src tgt,
+      EnvExtEntry.coeEntry d src tgt ∈ inv.extEntries →
+      inv.role = .defsExempt ∧ isLocalExtDecl inv d = true ∧
+        (isInstanceAnchor inv src = true ∨ isInstanceAnchor inv tgt = true) := by
+  intro inv hinv d src tgt hext
+  have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
+  have hval := checkAll_ok_iff.mp hm.1 _ hext
+  simp only [validateSingleExtEntry, bindUnit_ok_iff, ensure_ok_iff] at hval
+  exact ⟨hval.1, hval.2.1, hval.2.2⟩
 
 /-- Every declaration of a test module has a clean closure, and when
 `cfg.allowLocalTestAxioms = false`, every dependency satisfies `CleanDep` with no local

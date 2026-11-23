@@ -1701,7 +1701,7 @@ theorem passA1_syntax_extension_commands_rejected :
 
 /-- No false positives from the new rules on ordinary code. -/
 theorem passA1_no_false_positive :
-    isOk (scan (chars! "#check Nat.succ\n#print axioms foo'\n#guard_msgs in\n#eval! f x\ndef v := #[1, 2] ++ #v[3].toArray")) = true ∧
+    isOk (scan (chars! "#check Nat.succ\n#print axioms foo'\n#guard_msgs in\n#check! f x\ndef v := #[1, 2] ++ #v[3].toArray")) = true ∧
     isOk (scan (chars! "def a := x <<< 2 + (y >>> 1) - z\ndef f := do let x <- g; let y ← h x; pure (x, y) -- done")) = true ∧
     isOk (scan (chars! "theorem t : (a <-> b) /\\ (c \\/ d) /\\ { x : Nat // x < 2 } = T := h -- note")) = true ∧
     isOk (scan (chars! "def a := x.r + p.1.r + (· + ·) 1 2 + ~~~m + 5#8 + s \\ t + a / b /- c -/ + `Nat.succ")) = true ∧
@@ -1907,6 +1907,160 @@ theorem passA2_instance_anchor_in_conclusion_and_not_reducible :
     -- premises do not hide a local name in the conclusion
     isOk (audit noSourceConfig (defsInstPkg (.pi natE (.const colorName))
         (.lam natE (.const redName)))) = true := by
+  decide +kernel
+
+/-! ## Pass `B3` hardening regressions -/
+
+def haddName : SymName := sn! "HAdd"
+def haddMkName : SymName := sn! "HAdd.mk"
+def haddBaseDecls : List ConstantRecord :=
+  standardBaseDecls ++ [
+    baseDecl haddName (.inductDecl [haddMkName])
+      (.pi natE (.pi natE (.pi natE (.sort 0)))) initCore,
+    baseDecl haddMkName (.ctorDecl haddName)
+      (.pi natE (.pi natE (.pi natE (.app (.app (.app (.const haddName) (.bvar 2)) (.bvar 1)) (.bvar 0)))))
+      initCore]
+
+def haddApp (a b c : ExprSkeleton) : ExprSkeleton :=
+  .app (.app (.app (.const haddName) a) b) c
+
+def haddMkApp (a b c : ExprSkeleton) : ExprSkeleton :=
+  .app (.app (.app (.const haddMkName) a) b) c
+
+def localOutName : SymName := sn! "Topic.Defs.localOut"
+def localOutDecl : ConstantRecord := mkOpaque localOutName natE (.natLit 0)
+def aliasPremName : SymName := sn! "Topic.Defs.AliasPrem"
+def aliasNatName : SymName := sn! "Topic.Defs.AliasNat"
+def aliasColorName : SymName := sn! "Topic.Defs.AliasColor"
+def evilCoeName : SymName := sn! "Topic.Defs.evilCoe"
+
+/-- Instance anchor checks β/δ-normalize instance types before extracting the conclusion,
+exclude `outParam` slots of core `Init` classes (`HAdd Nat Nat Color`), and require
+`isInstanceAnchor` on `coeEntry` endpoints (closing `abbrev N' := Nat` coercions as well as
+un-annotated `def` aliases). -/
+theorem passB3_instance_beta_alias_and_outparam_rejected :
+    -- β-redex hiding a premise `(fun _ : Nat => Color → True) 0` (rc=0 hijack in Lean 4.34.1)
+    failsWith (audit noSourceConfig (defsInstPkg
+        (.app (.lam natE (.pi (.const colorName) trueE)) (.natLit 0))
+        (.lam (.const colorName) trueIntroE)))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- dead β-redex `(fun _ : Color => True) Color.red` in conclusion
+    failsWith (validateModuleExtensions (addExts (addConsts defsModule
+        [mkDef premInstName (.app (.lam (.const colorName) trueE) (.const redName)) trueIntroE])
+        [.instanceEntry premInstName (sn! "OfNat") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- inner β-redex `Eq ((fun _ : Color => 0) Color.red) 0`
+    failsWith (validateModuleExtensions (addExts (addConsts defsModule
+        [mkDef premInstName
+          (eqNat (.app (.lam (.const colorName) (.natLit 0)) (.const redName)) (.natLit 0))
+          (.app (c! "Eq.refl") (.natLit 0))])
+        [.instanceEntry premInstName (sn! "OfNat") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- un-annotated `def AliasPrem := Color → True` hiding premise (no reducibilityOverride)
+    failsWith (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef aliasPremName (.sort 0) (.pi (.const colorName) trueE),
+                 mkDef premInstName (.const aliasPremName) (.lam (.const colorName) trueIntroE)])
+               [.instanceEntry premInstName (sn! "OfNat") false],
+             theoryModule, proofsModule, verifyModule] })
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- un-annotated `def AliasNat := Nat` used as instance anchor (no reducibilityOverride)
+    failsWith (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef aliasNatName (.sort 1) natE,
+                 mkDef premInstName (.const aliasNatName) (.natLit 0)])
+               [.instanceEntry premInstName (sn! "OfNat") false],
+             theoryModule, proofsModule, verifyModule] })
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- `coeEntry` with reducible alias `abbrev AliasNat := Nat` (rc=0 hijack in Lean 4.34.1)
+    failsWith (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef aliasNatName (.sort 1) natE,
+                 mkDef evilCoeName (.pi (.const aliasNatName) boolE)
+                   (.lam (.const aliasNatName) (c! "Bool.true"))])
+               [.reducibilityOverride aliasNatName,
+                .coeEntry evilCoeName aliasNatName SymName.boolName],
+             theoryModule, proofsModule, verifyModule] })
+      (.forbiddenInstanceOrCoe defsMod "coe_between_imported_types" evilCoeName) = true ∧
+    -- `coeEntry` with un-annotated `def AliasNat := Nat`
+    failsWith (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef aliasNatName (.sort 1) natE,
+                 mkDef evilCoeName (.pi (.const aliasNatName) boolE)
+                   (.lam (.const aliasNatName) (c! "Bool.true"))])
+               [.coeEntry evilCoeName aliasNatName SymName.boolName],
+             theoryModule, proofsModule, verifyModule] })
+      (.forbiddenInstanceOrCoe defsMod "coe_between_imported_types" evilCoeName) = true ∧
+    -- `outParam` hijack: `HAdd 0 0 localOut` anchors only in trailing `outParam` (rejected)
+    failsWith (audit noSourceConfig
+        { baseEnv := haddBaseDecls,
+          modules :=
+            [addExts (addConsts defsModule
+                [localOutDecl,
+                 mkDef premInstName (haddApp (.natLit 0) (.natLit 0) (.const localOutName))
+                   (haddMkApp (.natLit 0) (.natLit 0) (.const localOutName))])
+               [.instanceEntry premInstName haddName false],
+             theoryModule, proofsModule, verifyModule],
+          verifyRoots := [verifiedName] })
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- positive: `HAdd localOut 0 0` anchors in input param 1 (accepted)
+    isOk (audit noSourceConfig
+        { baseEnv := haddBaseDecls,
+          modules :=
+            [addExts (addConsts defsModule
+                [localOutDecl,
+                 mkDef premInstName (haddApp (.const localOutName) (.natLit 0) (.natLit 0))
+                   (haddMkApp (.const localOutName) (.natLit 0) (.natLit 0))])
+               [.instanceEntry premInstName haddName false],
+             theoryModule, proofsModule, verifyModule],
+          verifyRoots := [verifiedName] }) = true ∧
+    -- positive: non-reducible `def AliasColor := Color` still anchors on local `Color`
+    isOk (audit noSourceConfig
+        { corePkg with modules :=
+            [addExts (addConsts defsModule
+                [mkDef aliasColorName (.sort 1) (.const colorName),
+                 mkDef premInstName (.const aliasColorName) (.const redName)])
+               [.instanceEntry premInstName (sn! "Inhabited") false],
+             theoryModule, proofsModule, verifyModule] }) = true := by decide +kernel
+
+/-- A bodyless `.defnDecl` `_unsafe_rec` companion (`value? := none`) is never excused from
+kernel replay. -/
+theorem passB3_bodyless_unsafeRec_rejected :
+    let bodyless : ConstantRecord :=
+      { name := recName, kind := .defnDecl, type := natE, value? := none,
+        safety := .partialDecl, all := [recName] }
+    isCodegenUnsafeRecInMod proofsModule bodyless = false ∧
+    failsWith (audit noSourceConfig (recPkg bodyless))
+      (.unsafeOrPartialDecl proofsMod recName) = true := by decide +kernel
+
+/-- Source scanner rejects `#eval`/`#eval!`/`#reduce` (compile-time IO/reduction),
+`@[init ...]`/`attribute [init ...]` attribute forms, `@[cbv_eval]`/`@[cbv_opaque]`,
+`coinductive`, and hex/sci-literal quotes inside interpolation holes, while accepting
+`s!"{xs[0]'h}"`, `def eval := 0`, `def init := 0`, and `[init]`. -/
+theorem passB3_sourceScanner_eval_init_and_hole_hardened :
+    flags (chars! "#eval IO.println \"pwned\"") "#eval" = true ∧
+    flags (chars! "#eval! f x") "#eval" = true ∧
+    flags (chars! "#reduce (1 + 1)") "#reduce" = true ∧
+    flags (chars! "def a := r#eval 1") "#eval" = true ∧
+    flags (chars! "def s := s!\"{#eval 1}\"") "#eval" = true ∧
+    flags (chars! "def myInit : IO Unit := pure ()\n@[init myInit] def x : Unit := ()") "init" = true ∧
+    flags (chars! "@[simp, local init myInit] def x : Unit := ()") "init" = true ∧
+    flags (chars! "attribute [init myInit] x") "init" = true ∧
+    flags (chars! "local attribute [init myInit] x") "init" = true ∧
+    flags (chars! "attribute [simp, «init» myInit] x") "init" = true ∧
+    flags (chars! "@[cbv_eval] theorem f_eq : f = g := rfl") "cbv_eval" = true ∧
+    flags (chars! "@[cbv_opaque] def f := 0") "cbv_opaque" = true ∧
+    flags (chars! "coinductive Stream' (α : Type) where") "coinductive" = true ∧
+    lexFails (chars! "def s := s!\"{0x1'a'}\"") = true ∧
+    lexFails (chars! "def s := s!\"{1e0'a'}\"") = true ∧
+    -- no false positives on valid Lean 4 array indexing in holes or ordinary identifiers
+    isOk (scan (chars! "def f (xs : Array Nat) (h : 0 < xs.size) := s!\"{xs[0]'h} and {xs[0]'(by exact h)}\"")) = true ∧
+    isOk (scan (chars! "def s := s!\"{x1'}\"")) = true ∧
+    isOk (scan (chars! "def eval := 0\ndef reduce := 1\ndef init := 2\ndef xs := [init]\n@[simp] def init2 := 3\nattribute [simp] init")) = true := by
   decide +kernel
 
 /-! ## End-to-end instantiation on the clean package -/
@@ -2294,5 +2448,21 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA2_instance_anchor_in_conclusion_and_not_reducible' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passA2_instance_anchor_in_conclusion_and_not_reducible
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_coe_anchored' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms auditAndReplayPackage_coe_anchored
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB3_instance_beta_alias_and_outparam_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB3_instance_beta_alias_and_outparam_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB3_bodyless_unsafeRec_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB3_bodyless_unsafeRec_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB3_sourceScanner_eval_init_and_hole_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB3_sourceScanner_eval_init_and_hole_hardened
 
 end Anneal.ReplayKeyAndTamperAuditTests
