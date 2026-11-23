@@ -6770,5 +6770,215 @@ class TestEpisode2ProjectionAndRewriteOrderHazards(unittest.TestCase):
         self.assertEqual(lx.match_balanced_attribute(as_pat, 0), len(as_pat))
 
 
+class TestNegationPrecedenceAndFalseElimExemption(unittest.TestCase):
+    """Regression and adversarial tests for:
+    1. Lean 4 precedence of prefix `¬` vs looser connectives (`→`, `->`, `↔`, `<->`, `∨`, `\\/`, `∧`, `/\\`)
+       and top-level `≠` inside implications (fixing `dite` false positives without weakening
+       `¬ (P → α)` / `P → α` detection).
+    2. Narrow single-premise `False`-elimination (`noConfusion`) exemption (fixing `boolFalseNeTrue`
+       / `boolTrueNeFalse` without weakening non-`False` or multi-premise vacuity detection).
+    3. Exact `proof_health.audit_lean_text` vs `check_trusted.audit_lean_text` parity.
+    """
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_has_top_level_arrow_delimiters_and_binders(self) -> None:
+        fn = proof_health._has_top_level_arrow
+        for yes in (
+            "¬ P → α",
+            "¬ P -> α",
+            "¬ (P) → α",
+            "¬ f ⟨a, b⟩ → c",
+            "¬ (∀ x, P x) → Q",
+            "¬ P → ∀ x, Q x",
+            "¬ a = b → c",
+        ):
+            self.assertTrue(fn(yes), yes)
+        for no in (
+            "¬ (P → α)",
+            "¬ (P -> α)",
+            "¬ f [P → α]",
+            "¬ { x : Nat // x → y }",
+            "¬ ⟨a → b, c⟩",
+            "¬ «a → b»",
+            "¬ P ↔ Q",
+            "¬ P <-> Q",
+            "¬ ∀ x, P x → Q x",
+            "¬ ∃ x, P x → Q x",
+            "¬ True",
+        ):
+            self.assertFalse(fn(no), no)
+
+    def test_negation_precedence_dite_and_implication_false_positives_fixed(self) -> None:
+        clean_cases = [
+            (
+                "dite_unicode_true",
+                "private theorem dite_prop_true {α : Type} {P : Prop} {inst : Decidable P}\n"
+                "    {t : P → α} {e : ¬ P → α} (h : P) : (@dite α P inst t e) = t h := by sorry\n",
+            ),
+            (
+                "dite_unicode_false",
+                "private theorem dite_prop_false {α : Type} {P : Prop} {inst : Decidable P}\n"
+                "    {t : P → α} {e : ¬ P → α} (h : ¬ P) : (@dite α P inst t e) = e h := by sorry\n",
+            ),
+            (
+                "dite_ascii_arrow",
+                "theorem dite_ascii {α : Type} {P : Prop} {t : P -> α} {e : ¬ P -> α} (h : P) : t h = t h := rfl\n",
+            ),
+            (
+                "dite_no_space_not",
+                "theorem dite_nospace {α : Type} {P : Prop} {t : P → α} {e : ¬P → α} (h : P) : P := h\n",
+            ),
+            (
+                "dite_eq_neq_arrows",
+                "theorem dite_eq {α : Type} {a b : Nat} {t : a = b → α} {e : a ≠ b → α} (h : a = b) : t h = t h := rfl\n",
+            ),
+            (
+                "not_true_arrow_fn",
+                "theorem not_true_fn {α : Type} (f : ¬ True → α) (g : ¬ (x = x) → α) : x = y := by sorry\n",
+            ),
+            (
+                "not_true_ascii_arrow_fn",
+                "theorem not_true_ascii {α : Type} (f : ¬ True -> α) (g : ¬ x = x -> α) : x = y := by sorry\n",
+            ),
+            (
+                "not_or_satisfiable",
+                "theorem not_or_sat (P Q : Prop) (h1 : ¬ P ∨ Q) (h2 : P ∨ Q) : Q := by sorry\n",
+            ),
+            (
+                "not_true_or_satisfiable",
+                "theorem not_true_or_sat (P : Prop) (h : ¬ True ∨ P) : P := by sorry\n",
+            ),
+            (
+                "double_neg_arrow_branches",
+                "theorem dbl_neg_arrow {α : Type} {P : Prop} (t : ¬ P → α) (e : ¬ ¬ P → α) : x = y := by sorry\n",
+            ),
+            (
+                "conj_antecedent_arrow",
+                "theorem conj_ant {α : Type} {P : Prop} (f : false = true ∧ P → α) : x = y := by sorry\n",
+            ),
+            (
+                "disjoint_ctor_arrow",
+                "theorem ctor_ant {α : Type} (x : Nat) (xs : List Nat) (f : none = some x → α) (g : [] = x :: xs → α) : x = 0 := by sorry\n",
+            ),
+        ]
+        for label, src in clean_cases:
+            self.assertNotIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                label,
+            )
+            self.assertEqual(scan67(src), [], label)
+
+    def test_parenthesized_negated_implication_and_quantified_contradictions_still_flagged(self) -> None:
+        bad_cases = [
+            ("paren_not_imp", "theorem bad (P : Prop) (α : Type) (h1 : ¬ (P → α)) (h2 : P → α) : x = 1 := by sorry\n"),
+            ("paren_not_imp_nospace", "theorem bad (P : Prop) (α : Type) (h1 : ¬(P → α)) (h2 : P → α) : x = 1 := by sorry\n"),
+            ("paren_not_imp_ascii", "theorem bad (P : Prop) (α : Type) (h1 : ¬ (P -> α)) (h2 : P -> α) : x = 1 := by sorry\n"),
+            ("paren_not_or", "theorem bad (P Q : Prop) (h1 : ¬ (P ∨ Q)) (h2 : P ∨ Q) : x = 1 := by sorry\n"),
+            ("paren_not_and", "theorem bad (P Q : Prop) (h1 : ¬ (P ∧ Q)) (h2 : P ∧ Q) : x = 1 := by sorry\n"),
+            ("paren_not_neg_imp", "theorem bad (P : Prop) (α : Type) (h1 : ¬ (¬ P → α)) (h2 : ¬ P → α) : x = 1 := by sorry\n"),
+            ("not_forall_imp", "theorem bad (P Q : Nat → Prop) (h1 : ¬ ∀ x, P x → Q x) (h2 : ∀ x, P x → Q x) : 0 = 1 := by sorry\n"),
+            ("double_neg_pair", "theorem bad (P : Prop) (h1 : ¬ P) (h2 : ¬ ¬ P) : 0 = 1 := by sorry\n"),
+            ("not_true_direct", "theorem bad (h : ¬ True) : 0 = 1 := by sorry\n"),
+            ("not_refl_eq_direct", "theorem bad (x : Nat) (h : ¬ (x = x)) : 0 = 1 := by sorry\n"),
+            ("not_refl_arrow_eq", "theorem bad (P : Prop) (α : Type) (h : ¬ ((P → α) = (P → α))) : 0 = 1 := by sorry\n"),
+        ]
+        for label, src in bad_cases:
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                label,
+            )
+            self.assertIn(
+                (R7, audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, 1),
+                scan67(src),
+                label,
+            )
+
+    def test_single_premise_false_elim_exemptions_and_strict_rejections(self) -> None:
+        # Legitimate single-premise `False`-elimination (`noConfusion` / refutation) lemmas -> clean.
+        exempt_cases = [
+            ("bool_false_ne_true", "private theorem boolFalseNeTrue (h : false = true) : False := Bool.noConfusion h\n"),
+            ("bool_true_ne_false", "private theorem boolTrueNeFalse (h : true = false) : False := Bool.noConfusion h\n"),
+            ("bool_qual", "theorem boolQual (h : Bool.false = Bool.true) : False := Bool.noConfusion h\n"),
+            ("with_data_binder", "theorem withBool {a : Bool} (h : false = true) : False := Bool.noConfusion h\n"),
+            ("nat_lt_zero", "theorem natLtZero (n : Nat) (h : n < 0) : False := Nat.not_lt_zero n h\n"),
+            ("opt_none_some", "theorem optNe {α : Type u} (x : α) (h : none = some x) : False := by nomatch h\n"),
+            ("list_nil_cons", "theorem listNe {α : Type} (x : α) (xs : List α) (h : [] = x :: xs) : False := by nomatch h\n"),
+            ("safe_decidable_inst", "theorem withDec {P : Prop} [Decidable P] (h : false = true) : False := Bool.noConfusion h\n"),
+            ("safe_decidable_named", "theorem withDecN {a b : Nat} [d : Decidable (a = b)] (h : false = true) : False := Bool.noConfusion h\n"),
+            ("forall_anon_all_scope", "theorem forallLtZero : ∀ n : Nat, n < 0 → False := fun _ h => Nat.not_lt_zero _ h\n"),
+        ]
+        for label, src in exempt_cases:
+            self.assertEqual(audit.scan_lean_text(src), [], label)
+            self.assertEqual(scan67(src), [], label)
+
+        # Non-`False` conclusion, multi-premise, conjunctive, or unsafe/untyped binder -> MUST still flag!
+        must_flag_cases = [
+            ("non_false_eq", "theorem bad (h : false = true) : 1 = 2 := Bool.noConfusion h\n"),
+            ("non_false_true", "theorem bad (h : false = true) : True := trivial\n"),
+            ("non_false_not_true", "theorem bad (h : false = true) : ¬ True := Bool.noConfusion h\n"),
+            ("non_false_and", "theorem bad (h : false = true) : False ∧ False := Bool.noConfusion h\n"),
+            ("multi_premise_eq", "theorem bad2 (h : false = true) (x : Nat) (hx : x = 0) : False := Bool.noConfusion h\n"),
+            ("conjunctive_hyp", "theorem bad_conj (x : Nat) (h : false = true ∧ x = 0) : False := Bool.noConfusion h.1\n"),
+            ("conjunctive_ascii", "theorem bad_conj_ascii (x : Nat) (h : false = true /\\ x = 0) : False := Bool.noConfusion h.1\n"),
+            ("conjunctive_nested", "theorem bad_conj_nest (x y : Nat) (h : (false = true ∧ x = 0) ∧ y = 1) : False := Bool.noConfusion h.1.1\n"),
+            ("contradictory_pair_false", "theorem bad_pair (P : Prop) (h1 : P) (h2 : ¬ P) : False := h2 h1\n"),
+            ("two_names_one_binder", "theorem bad_dup (h1 h2 : false = true) : False := Bool.noConfusion h1\n"),
+            ("predicate_binder", "theorem bad_pred (x : Nat) (hx : IsGood x) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("prop_var_premise", "theorem bad_prop (P : Prop) (hp : P) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("shadowed_prop_then_type", "theorem bad_shadow (P : Prop) (hp : P) (P : Type) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("shadowed_type_then_prop", "theorem bad_shadow2 (α : Type) (α : Prop) (hp : α) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("sort_u_binder", "theorem bad_sort {α : Sort u} (x : α) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("empty_binder", "theorem bad_empty (x : Empty) (h : false = true) : False := Empty.elim x\n"),
+            ("fin0_binder", "theorem bad_fin0 (x : Fin 0) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("subtype_binder", "theorem bad_sub (s : { x : Nat // x < 0 }) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("anon_prop_arrow", "theorem bad_anon (P : Prop) (h : false = true) : P → False := fun _ => Bool.noConfusion h\n"),
+            ("anon_nat_arrow", "theorem bad_anon_nat (h : false = true) : Nat → False := fun _ => Bool.noConfusion h\n"),
+            ("fact_inst", "theorem bad_fact (P : Prop) [Fact P] (h : false = true) : False := Bool.noConfusion h\n"),
+            ("fact_named_inst", "theorem bad_fact_n (P : Prop) [hf : Fact P] (h : false = true) : False := Bool.noConfusion h\n"),
+            ("untyped_paren", "theorem bad_untyped (hp) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("untyped_brace", "theorem bad_untyped_b {hp} (h : false = true) : False := Bool.noConfusion h\n"),
+            ("bare_binder", "theorem bad_bare hp (h : false = true) : False := Bool.noConfusion h\n"),
+            ("forall_untyped", "theorem bad_fa (h : false = true) : ∀ hp, False := fun _ => Bool.noConfusion h\n"),
+            ("decidable_prod_empty", "theorem bad_dec_prod (d : Decidable (0 = 1) × Empty) (h : false = true) : False := Bool.noConfusion h\n"),
+            ("two_contradictions", "theorem bad_two (h1 : false = true) (h2 : true = false) : False := Bool.noConfusion h1\n"),
+        ]
+        for label, src in must_flag_cases:
+            self.assertIn(
+                audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS,
+                _rules(audit.scan_lean_text(src)),
+                f"all-scope failed to flag {label}",
+            )
+            self.assertIn(
+                (R7, audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS, 1),
+                scan67(src),
+                f"default-scope failed to flag {label}",
+            )
+
+    def test_check_trusted_parity_on_precedence_and_false_elim_cases(self) -> None:
+        ct = _load_check_trusted()
+        samples = [
+            "private theorem dite_prop_true {α : Type} {P : Prop} {inst : Decidable P} {t : P → α} {e : ¬ P → α} (h : P) : (@dite α P inst t e) = t h := by sorry\n",
+            "theorem bad_paren (P : Prop) (α : Type) (h1 : ¬ (P → α)) (h2 : P → α) : x = 1 := by sorry\n",
+            "private theorem boolFalseNeTrue (h : false = true) : False := Bool.noConfusion h\n",
+            "theorem bad_nonfalse (h : false = true) : 1 = 2 := Bool.noConfusion h\n",
+            "theorem bad_multi (h : false = true) (x : Nat) (hx : x = 0) : False := Bool.noConfusion h\n",
+            "theorem bad_conj (x : Nat) (h : false = true ∧ x = 0) : False := Bool.noConfusion h.1\n",
+            "theorem bad_pair (P : Prop) (h1 : P) (h2 : ¬ P) : False := h2 h1\n",
+            "theorem bad_anon (P : Prop) (h : false = true) : P → False := fun _ => Bool.noConfusion h\n",
+            "theorem bad_fact (P : Prop) [Fact P] (h : false = true) : False := Bool.noConfusion h\n",
+        ]
+        for src in samples:
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, src),
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
