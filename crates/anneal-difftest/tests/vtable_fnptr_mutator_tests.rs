@@ -1696,6 +1696,51 @@ fn perturb_ast_indirect_passes_place_probes_on_every_corpus_seed() {
         .count();
     assert!(n_pass >= 2, "expected `Pass` templates of both mutators");
 
+    // 0. Ratchet the naming convention relied on by `entry_fn_is_faulting_seed`
+    //    and `collect_non_fault_seed_indices`: every corpus seed in
+    //    `tests/miri-diff/manifest.toml` must carry a `panic_` / `ub_` prefix
+    //    iff its manifest verdict is non-passing.
+    let manifest_path = repo_root().join("tests/miri-diff/manifest.toml");
+    let manifest = fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest_path.display()));
+    let mut manifest_verdicts: BTreeMap<String, String> = BTreeMap::new();
+    let mut cur_name: Option<String> = None;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+        if line == "[[tests]]" {
+            cur_name = None;
+        } else if let Some(rest) = line.strip_prefix("name = \"")
+            && let Some(name) = rest.strip_suffix('"')
+        {
+            cur_name = Some(name.to_string());
+        } else if let Some(rest) = line.strip_prefix("miri_verdict = \"")
+            && let Some(verdict) = rest.strip_suffix('"')
+            && let Some(name) = &cur_name
+        {
+            manifest_verdicts.insert(name.clone(), verdict.to_string());
+        }
+    }
+    assert_eq!(
+        manifest_verdicts.len(),
+        seeds.len(),
+        "manifest test count ({}) diverged from loaded corpus seeds ({})",
+        manifest_verdicts.len(),
+        seeds.len()
+    );
+    for seed in &seeds {
+        let verdict = manifest_verdicts
+            .get(&seed.name)
+            .unwrap_or_else(|| panic!("corpus seed `{}` missing from manifest.toml", seed.name));
+        let prefix_faults = seed.name.starts_with("panic_") || seed.name.starts_with("ub_");
+        let manifest_faults = !verdict.starts_with("pass:");
+        assert_eq!(
+            prefix_faults, manifest_faults,
+            "corpus seed `{}` has manifest verdict `{verdict}` which disagrees with \
+             `entry_fn_is_faulting_seed` (`panic_*` / `ub_*`)",
+            seed.name
+        );
+    }
+
     // 1. Every corpus seed, exactly as `load_miri_diff_corpus_seeds` returns it.
     let mut faulting = 0usize;
     let mut live = 0usize;
@@ -1771,6 +1816,139 @@ fn perturb_ast_indirect_passes_place_probes_on_every_corpus_seed() {
     if let Err(stderr) = compile_at_opt_level("perturb_all_seeds", "0", &combined) {
         panic!(
             "`PerturbAst` mutants of {modules} closed corpus seeds failed to compile:\n{stderr}"
+        );
+    }
+}
+
+/// Scheduled Miri (`generate_miri_corpus_batch`) and ITree
+/// (`generate_itree_batch`) batches must emit all four construct classes
+/// (`&T as &dyn Trait` + vtable dispatch, indirect `fn(...)` + `FnPtrToPtr` /
+/// `PointerCoercion`, wide-pointer `addr_eq`, and capturing closures) at
+/// non-zero, healthy, and bounded rates.
+#[test]
+fn scheduled_miri_and_itree_batches_emit_all_four_construct_classes_at_healthy_rates() {
+    // 1. Scheduled Miri corpus batch.
+    const MIRI_N: usize = 1024;
+    let miri_batch = generate_miri_corpus_batch(MIRI_N, 0xD157_2026_0004, 0);
+    assert_eq!(miri_batch.len(), MIRI_N);
+
+    let mut miri_indirect_cands = 0usize;
+    let mut miri_dyn = 0usize;
+    let mut miri_fn_ptr_chain = 0usize;
+    let mut miri_closure_fn_ptr = 0usize;
+    let mut miri_wide_slices = 0usize;
+    let mut miri_clos_by_val = 0usize;
+    let mut miri_clos_by_shared_ref = 0usize;
+    let mut miri_clos_by_unique_ref = 0usize;
+    let mut miri_classes: BTreeSet<&'static str> = BTreeSet::new();
+
+    for cand in &miri_batch {
+        if !cand
+            .applied_mutators
+            .iter()
+            .any(|m| is_indirect_miri_mutator(m.as_str()))
+        {
+            continue;
+        }
+        miri_indirect_cands += 1;
+        let src = &cand.fn_source;
+        if VTABLE_TEMPLATES[1].has.iter().all(|m| has_marker(src, m)) {
+            miri_dyn += 1;
+            miri_classes.extend(VTABLE_TEMPLATES[1].classes.iter().copied());
+        }
+        if VTABLE_TEMPLATES[0].has.iter().all(|m| has_marker(src, m)) {
+            miri_fn_ptr_chain += 1;
+            miri_classes.extend(VTABLE_TEMPLATES[0].classes.iter().copied());
+        }
+        if VTABLE_TEMPLATES[2].has.iter().all(|m| has_marker(src, m)) {
+            miri_closure_fn_ptr += 1;
+            miri_classes.extend(VTABLE_TEMPLATES[2].classes.iter().copied());
+        }
+        if has_marker(src, "__anneal_wide_slice_addr_eq_") {
+            miri_wide_slices += 1;
+            miri_classes.insert(ADDR_EQ);
+        }
+        if has_marker(src, "::__::apply_keep(") {
+            miri_clos_by_val += 1;
+            miri_classes.insert(CLOSURE);
+        }
+        if has_marker(src, "__clos_shared: &u32 = &__clos_base") {
+            miri_clos_by_shared_ref += 1;
+            miri_classes.insert(CLOSURE);
+        }
+        if has_marker(src, "::__::eval_once(move ||") {
+            miri_clos_by_unique_ref += 1;
+            miri_classes.insert(CLOSURE);
+        }
+    }
+    assert_eq!(
+        miri_classes,
+        BTreeSet::from([DYN, FN_PTR, ADDR_EQ, CLOSURE]),
+        "scheduled Miri batch missed construct classes"
+    );
+    assert!(
+        (50..=MIRI_N / 4).contains(&miri_indirect_cands),
+        "scheduled Miri batch had {miri_indirect_cands}/{MIRI_N} indirect candidates"
+    );
+    assert!(
+        miri_dyn >= 3
+            && miri_fn_ptr_chain >= 5
+            && miri_closure_fn_ptr >= 3
+            && miri_wide_slices >= 10
+            && miri_clos_by_val >= 10
+            && miri_clos_by_shared_ref >= 4
+            && miri_clos_by_unique_ref >= 1,
+        "scheduled Miri construct counts too low: dyn={miri_dyn}, fn_ptr={miri_fn_ptr_chain}, \
+         closure_fn_ptr={miri_closure_fn_ptr}, wide_slices={miri_wide_slices}, \
+         by_val={miri_clos_by_val}, by_shared_ref={miri_clos_by_shared_ref}, \
+         by_unique_ref={miri_clos_by_unique_ref}"
+    );
+
+    // 2. Scheduled ITree batch.
+    const ITREE_N: usize = 512;
+    let itree_batch = generate_itree_batch(ITREE_SAFE_SEEDS, ITREE_N, 0xD157_2026_1733);
+    assert_eq!(itree_batch.len(), ITREE_N);
+
+    let mut itree_indirect_cands = 0usize;
+    let mut itree_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut itree_classes: BTreeSet<&'static str> = BTreeSet::new();
+
+    for cand in &itree_batch {
+        assert!(
+            !contains_unsafe_token(&cand.source),
+            "scheduled ITree candidate {} emitted `unsafe`:\n{}",
+            cand.id,
+            cand.source
+        );
+        if !cand
+            .applied_mutators
+            .iter()
+            .any(|m| m == "IndirectDispatchOutliner")
+        {
+            continue;
+        }
+        itree_indirect_cands += 1;
+        for (label, classes, markers) in ITREE_TEMPLATES {
+            if markers.iter().all(|m| has_marker(&cand.source, m)) {
+                *itree_counts.entry(label).or_insert(0) += 1;
+                itree_classes.extend(classes.iter().copied());
+            }
+        }
+    }
+    assert_eq!(
+        itree_classes,
+        BTreeSet::from([DYN, FN_PTR, ADDR_EQ, CLOSURE]),
+        "scheduled ITree batch missed construct classes: {itree_counts:?}"
+    );
+    assert!(
+        (24..=ITREE_N / 4).contains(&itree_indirect_cands),
+        "scheduled ITree batch had {itree_indirect_cands}/{ITREE_N} indirect candidates"
+    );
+    for (label, _, _) in ITREE_TEMPLATES {
+        let count = itree_counts.get(label).copied().unwrap_or(0);
+        assert!(
+            count >= 5,
+            "scheduled ITree batch emitted `{label}` only {count} time(s): {itree_counts:?}"
         );
     }
 }

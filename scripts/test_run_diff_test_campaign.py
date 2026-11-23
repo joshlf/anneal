@@ -4377,20 +4377,27 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
         "fn __anneal_wide_slice_addr_eq_5(__clos_p: *const [u32], __clos_q: *const [u32]) -> bool {",  # 29
         "    (__clos_p as *const ()) == (__clos_q as *const ())",  # 30
         "}",  # 31
-        "#[inline(never)]",  # 32
-        "fn __anneal_clos_driver_5(__clos_seed: u32, __clos_bias: u32) -> u32 {",  # 33
-        "    let __clos_oob_arr: [u32; 3] = [__clos_seed, __clos_bias, 7u32];",  # 34
-        "    let __clos_oob_idx: usize = 3usize + ((__clos_seed & 1u32) as usize);",  # 35
-        "    __clos_oob_arr[__clos_oob_idx]",  # 36
-        "}",  # 37
-        "pub fn panic_unwind_seed__b0_c0() -> u32 {",  # 38
-        "    let __miri_clos_5: u32 = __anneal_clos_driver_5(7u32, 6u32);",  # 39
-        "    let base: u32 = u32::MAX;",  # 40
-        "    let __tail___miri_clos_5: u32 = helper_unwind_guarded(base, 1u32);",  # 41
-        "    let __tail___miri_vt_7: u32 = __tail___miri_clos_5 ^ (__miri_clos_5 as u32);",  # 42
-        "    let __miri_vt_7: u32 = __anneal_vt_driver_7((base as u32) & 0xFFFFu32, 5u32);",  # 43
-        "    __tail___miri_vt_7 ^ (__miri_vt_7 as u32)",  # 44
-        "}",  # 45
+        "mod __anneal_clos_5 {",  # 32
+        "    pub mod __ {",  # 33
+        "        pub fn eval_once<T, F: FnOnce() -> T>(f: F) -> T {",  # 34
+        "            f()",  # 35
+        "        }",  # 36
+        "    }",  # 37
+        "}",  # 38
+        "#[inline(never)]",  # 39
+        "fn __anneal_clos_driver_5(__clos_seed: u32, __clos_bias: u32) -> u32 {",  # 40
+        "    let __clos_oob_arr: [u32; 3] = [__clos_seed, __clos_bias, 7u32];",  # 41
+        "    let __clos_oob_idx: usize = 3usize + ((__clos_seed & 1u32) as usize);",  # 42
+        "    __clos_oob_arr[__clos_oob_idx]",  # 43
+        "}",  # 44
+        "pub fn panic_unwind_seed__b0_c0() -> u32 {",  # 45
+        "    let __miri_clos_5: u32 = __anneal_clos_driver_5(7u32, 6u32);",  # 46
+        "    let base: u32 = u32::MAX;",  # 47
+        "    let __tail___miri_clos_5: u32 = helper_unwind_guarded(base, 1u32);",  # 48
+        "    let __tail___miri_vt_7: u32 = __tail___miri_clos_5 ^ (__miri_clos_5 as u32);",  # 49
+        "    let __miri_vt_7: u32 = __anneal_vt_driver_7((base as u32) & 0xFFFFu32, 5u32);",  # 50
+        "    __tail___miri_vt_7 ^ (__miri_vt_7 as u32)",  # 51
+        "}",  # 52
     )
 
     def _indirect_mutant_finding(self, line_no: int, mutators: list[str]) -> dict[str, object]:
@@ -4405,46 +4412,80 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
     def test_indirect_call_driver_item_faults_attribute_to_their_mutator(self) -> None:
         """A fault inside a private item that `VTableAndFnPtrMutator` or
         `ClosureAndAddrEqMutator` put ahead of the candidate function is attributed by
-        the tokens on its own line, or to the mutator whose item encloses it, even
-        though the candidate function calls the preamble helper that precedes those
-        items; a fault inside that preamble helper still maps to its call site."""
+        the tokens on its own line, or to the mutator whose item encloses it (even for
+        tokenless lines inside trait `impl` methods or `mod __anneal_clos_*` helpers
+        regardless of mutator order or known-bug status); a fault inside the preamble
+        helper still maps to its call site and is not misattributed through the
+        synthetic `__tail___miri_*` binding."""
         chain = ["ClosureAndAddrEqMutator", "VTableAndFnPtrMutator"]
+        rev_chain = ["VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"]
         lines = self.INDIRECT_MUTANT_LINES
         for line_no, mutator in (
             (9, "VTableAndFnPtrMutator"),  # overflow inside the reified callee
             (15, "VTableAndFnPtrMutator"),  # indirect call in the driver
-            (36, "ClosureAndAddrEqMutator"),  # out-of-bounds index in the driver
+            (25, "VTableAndFnPtrMutator"),  # tokenless trait `impl` method body
             (30, "ClosureAndAddrEqMutator"),  # wide-slice address helper
-            (39, "ClosureAndAddrEqMutator"),  # `PerturbAst` prefix driver call
-            (43, "VTableAndFnPtrMutator"),  # `Pass` driver call after the seed body
+            (35, "ClosureAndAddrEqMutator"),  # tokenless `f()` inside `mod __anneal_clos_*`
+            (43, "ClosureAndAddrEqMutator"),  # out-of-bounds index in the driver
+            (46, "ClosureAndAddrEqMutator"),  # `PerturbAst` prefix driver call
+            (49, "ClosureAndAddrEqMutator"),  # real RHS use of `__miri_clos_5` under `__tail___miri_vt_7`
+            (50, "VTableAndFnPtrMutator"),  # `Pass` driver call after the seed body
+            (51, "VTableAndFnPtrMutator"),  # real RHS use of `__miri_vt_7`
         ):
-            for known in (set(), {"panic_unwind_seed"}):
-                with self.subTest(line_no=line_no, known=sorted(known)):
-                    finding = self._indirect_mutant_finding(line_no, chain)
-                    self.assertEqual(
-                        campaign.extract_fault_line_text(finding), lines[line_no - 1]
-                    )
-                    self.assertEqual(campaign.infer_finding_cause(finding, known), mutator)
-                    fp, keys = campaign.quarantine_match_keys_for_miri_finding(
-                        {**finding, "divergence_class": "false_positive_ub", "anneal_lean_tag": "MirDiffTag.ub"},
-                        known,
-                    )
-                    self.assertTrue(fp.startswith(f"{mutator}:false_positive_ub:"), fp)
-                    self.assertIn(mutator, keys)
-                    self.assertEqual(campaign.quarantine_entry_harness(fp), "miri")
+            for mutators in (chain, rev_chain):
+                for known in (set(), {"panic_unwind_seed"}):
+                    with self.subTest(line_no=line_no, mutators=mutators, known=sorted(known)):
+                        finding = self._indirect_mutant_finding(line_no, mutators)
+                        self.assertEqual(
+                            campaign.extract_fault_line_text(finding), lines[line_no - 1]
+                        )
+                        self.assertEqual(campaign.infer_finding_cause(finding, known), mutator)
+                        fp, keys = campaign.quarantine_match_keys_for_miri_finding(
+                            {**finding, "divergence_class": "false_positive_ub", "anneal_lean_tag": "MirDiffTag.ub"},
+                            known,
+                        )
+                        self.assertTrue(fp.startswith(f"{mutator}:false_positive_ub:"), fp)
+                        self.assertIn(mutator, keys)
+                        self.assertEqual(campaign.quarantine_entry_harness(fp), "miri")
 
-        # A trait `impl` method body carries no mutator token of its own: the fault
-        # stays on its line (it is not mapped into the candidate function), and the
-        # finding falls back to the candidate's first mutator.
-        finding = self._indirect_mutant_finding(25, ["VTableAndFnPtrMutator"])
-        self.assertEqual(campaign.extract_fault_line_text(finding), lines[24])
-        self.assertEqual(campaign.infer_finding_cause(finding, set()), "VTableAndFnPtrMutator")
-
-        # A fault inside the preamble helper itself is still the seed's call of it.
+        # A fault inside the preamble helper itself maps to the seed's call of it,
+        # and the synthetic `__tail___miri_clos_5` wrapper does NOT hijack the fault
+        # onto `ClosureAndAddrEqMutator` when the seed is a known corpus bug.
         for line_no in (2, 5):
             with self.subTest(preamble_line=line_no):
                 finding = self._indirect_mutant_finding(line_no, chain)
-                self.assertEqual(campaign.extract_fault_line_text(finding), lines[40])
+                self.assertEqual(campaign.extract_fault_line_text(finding), lines[47])
+                self.assertEqual(
+                    campaign.infer_finding_cause(finding, {"panic_unwind_seed"}),
+                    "panic_unwind_seed",
+                )
+
+    def test_tail_wrapper_does_not_attribute_seed_tail_fault_to_appended_mutator(self) -> None:
+        """`inject_live_probe` wraps a non-faulting seed's tail expression in
+        `let __tail___miri_<mut>_<tag>: <ty> = <seed_expr>;` ahead of the appended
+        probe. A fault on that seed expression must attribute to `seed_name` even
+        when `seed_name` is not in `known_corpus_bug_seeds`."""
+        src_lines = (
+            "#[inline(never)]",  # 1
+            "fn __anneal_vt_driver_9(__vt_seed: u32, __vt_bias: u32) -> u32 {",  # 2
+            "    __vt_seed ^ __vt_bias",  # 3
+            "}",  # 4
+            "pub fn pass_seed_tail_bug__b0_c1() -> u32 {",  # 5
+            "    let a: u32 = 10u32;",  # 6
+            "    let __tail___miri_vt_9: u32 = a + 1u32;",  # 7
+            "    let __miri_vt_9: u32 = __anneal_vt_driver_9(a, 5u32);",  # 8
+            "    __tail___miri_vt_9 ^ (__miri_vt_9 as u32)",  # 9
+            "}",  # 10
+        )
+        finding = {
+            "seed_name": "pass_seed_tail_bug",
+            "fn_name": "pass_seed_tail_bug__b0_c1",
+            "applied_mutators": ["VTableAndFnPtrMutator"],
+            "mutant_source": "\n".join(src_lines) + "\n",
+            "miri_pos": "src/lib.rs:7:35",
+        }
+        self.assertEqual(campaign.extract_fault_line_text(finding), src_lines[6])
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "pass_seed_tail_bug")
 
     def test_perturb_ast_prefix_probe_keeps_seed_fault_attribution(self) -> None:
         """A `PerturbAst` pass of an indirect-call mutator runs its driver as the

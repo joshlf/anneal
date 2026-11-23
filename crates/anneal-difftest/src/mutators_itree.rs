@@ -1360,8 +1360,10 @@ fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
         | EvalValue::Ref(_)
         | EvalValue::ConstPtr { .. }
         | EvalValue::FnRef(_) => true,
-        EvalValue::Unit => false,
-        EvalValue::Closure { captures, .. } => *captures,
+        // A closure's runtime size can be 0 even when `ClosureFreeIdents`
+        // saw a free local (e.g., moving a ZST like `[u32; 0]`, or Rust
+        // 2021+ disjoint non-capturing `let _ = x;`).
+        EvalValue::Unit | EvalValue::Closure { .. } => false,
         EvalValue::Array(elems) => elems.iter().any(eval_value_is_sized_nonzero),
         EvalValue::Struct(_, fields) => fields.values().any(eval_value_is_sized_nonzero),
     }
@@ -1780,6 +1782,9 @@ fn collect_pat_idents(pat: &Pat, out: &mut BTreeSet<String>) {
 struct ClosureFreeIdents {
     names: BTreeSet<String>,
     bound: Vec<BTreeSet<String>>,
+    /// Set when the closure body contains any macro invocation whose token
+    /// stream `syn::Visit` cannot inspect for captured identifiers.
+    has_macro: bool,
 }
 
 impl<'ast> Visit<'ast> for ClosureFreeIdents {
@@ -1866,6 +1871,10 @@ impl<'ast> Visit<'ast> for ClosureFreeIdents {
                 self.names.insert(name);
             }
         }
+    }
+
+    fn visit_macro(&mut self, _node: &'ast syn::Macro) {
+        self.has_macro = true;
     }
 
     // Items declared inside the closure body cannot capture.
@@ -2224,6 +2233,10 @@ struct EvalClosure<'a> {
     def_frame: u64,
     /// `EvalFrame::bind_gen` of every captured variable at creation.
     gens: Vec<(String, u64)>,
+    /// Lexical `fn` / `struct` / `impl` items visible where the closure was created.
+    local_fns: Vec<BTreeMap<String, &'a syn::ItemFn>>,
+    local_structs: Vec<BTreeMap<String, EvalStructDef>>,
+    local_methods: Vec<EvalMethodTable<'a>>,
 }
 
 struct EvalRun<'a> {
@@ -2344,6 +2357,9 @@ impl<'a> EvalRun<'a> {
         }
         let mut free = ClosureFreeIdents::default();
         free.visit_expr_closure(expr);
+        if free.has_macro {
+            return eval_unsupported("macro in closure body");
+        }
         let mut env = BTreeMap::new();
         let mut gens = Vec::new();
         for name in free.names {
@@ -2363,6 +2379,9 @@ impl<'a> EvalRun<'a> {
             by_move: expr.capture.is_some(),
             def_frame: frame.id,
             gens,
+            local_fns: frame.local_fns.clone(),
+            local_structs: frame.local_structs.clone(),
+            local_methods: frame.local_methods.clone(),
         });
         Ok(EvalValue::Closure { id, captures })
     }
@@ -2393,6 +2412,9 @@ impl<'a> EvalRun<'a> {
         let expr = closure.expr;
         let live = !closure.by_move && closure.def_frame == frame.id;
         let mut env = closure.env.clone();
+        let local_fns = closure.local_fns.clone();
+        let local_structs = closure.local_structs.clone();
+        let local_methods = closure.local_methods.clone();
         if !closure.by_move && !live && !env.is_empty() {
             return eval_unsupported(
                 "by-reference closure called outside the frame that created it",
@@ -2447,6 +2469,9 @@ impl<'a> EvalRun<'a> {
         let before = env.clone();
         // A closure body is not instrumented, so it runs like a callee body.
         let mut closure_frame = EvalFrame::new(env, self.fresh_frame_id(), false);
+        closure_frame.local_fns = local_fns;
+        closure_frame.local_structs = local_structs;
+        closure_frame.local_methods = local_methods;
         if !live_allocs.is_empty()
             && let Some(allocs0) = closure_frame.allocs.first_mut()
         {
@@ -2549,11 +2574,19 @@ impl<'a> EvalRun<'a> {
             last = EvalValue::Unit;
             match stmt {
                 Stmt::Local(loc) => self.eval_local(frame, loc)?,
-                // Declarations that `eval_block` indexed; a trait declares
-                // only signatures the evaluator never needs (a call of a
-                // trait's default method finds no `impl` method and is
-                // rejected).
-                Stmt::Item(Item::Fn(_) | Item::Struct(_) | Item::Impl(_) | Item::Trait(_)) => {}
+                // Declarations that `eval_block` indexed; a trait without default
+                // methods declares only signatures. Reject traits carrying default
+                // method bodies up front so an empty `impl Trait for T {}` cannot
+                // hide a trait method from `eval_method_call`'s inherent-vs-trait
+                // ambiguity check.
+                Stmt::Item(Item::Fn(_) | Item::Struct(_) | Item::Impl(_)) => {}
+                Stmt::Item(Item::Trait(tr)) => {
+                    if tr.items.iter().any(|item| {
+                        matches!(item, syn::TraitItem::Fn(f) if f.default.is_some())
+                    }) {
+                        return eval_unsupported("trait with a default method");
+                    }
+                }
                 Stmt::Item(_) => return eval_unsupported("nested item"),
                 Stmt::Expr(e, semi) => {
                     let v = self.eval_expr(frame, e)?;
@@ -5409,6 +5442,19 @@ mod tests {
                 let res: u32 = check(left.pick() ^ right.pick());
                 if same_obj { (res >> 1) + 1u32 } else { 0u32 }
             }",
+            // A closure body sees enclosing local `fn`, `struct`, and `impl`
+            // items (shadowing any top-level `fn` of the same name).
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                 fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                 struct Tag { k: u32 }
+                 impl Tag { fn mix(&self, x: u32) -> u32 { self.k ^ x } }
+                 let f = |x: u32| {
+                     let t = Tag { k: b & 0xFFu32 };
+                     t.mix(helper(x))
+                 };
+                 (f(a) >> 1) + 1u32
+             }",
         ];
         let cands: Vec<GeneratedItreeCandidate> = modeled
             .iter()
@@ -5598,6 +5644,50 @@ mod tests {
                 }
                 out
             }",
+            // A macro inside a closure body (even on an untaken branch) may
+            // capture outer locals that `syn::Visit` cannot inspect.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = |x: u32| {
+                    if x == 0u32 {
+                        let _ = matches!(cap, 1u32);
+                    }
+                    x ^ b
+                };
+                f(1u32)
+            }",
+            // A closure moving a zero-sized value is itself zero-sized, so `&f`
+            // may share an address with another local.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let empty: [u32; 0] = [];
+                let f = move || empty;
+                let y: u32 = a;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { b }
+            }",
+            // Under Rust 2021+ disjoint captures, `let _ = x;` does not capture
+            // `x`, so `f` is zero-sized even though `ClosureFreeIdents` sees `x`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a;
+                let f = || {
+                    let _ = x;
+                    1u32
+                };
+                let y: u32 = b;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { b }
+            }",
+            // A trait with a default method and an empty `impl Left for Both {}`
+            // must fail closed rather than letting an implicitly unsized `else`
+            // branch dispatch to an inherent `impl` of the same method name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32 { 1u32 } }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
         ];
         for probe in rejected {
             let source = format!("{probe}\n{ROOT}");
@@ -5651,5 +5741,17 @@ mod tests {
             free_of("|a: u32| { let Some(x) = opt else { return a; }; x ^ a }"),
             BTreeSet::from(["opt".to_string()])
         );
+        // Macros inside closure bodies flag `has_macro` so `make_closure` fails closed.
+        let has_macro_of = |expr_src: &str| -> bool {
+            let clos: syn::ExprClosure = syn::parse_str(expr_src).expect("parse closure");
+            let mut free = ClosureFreeIdents::default();
+            free.visit_expr_closure(&clos);
+            free.has_macro
+        };
+        assert!(!has_macro_of("|a: u32| a ^ b"));
+        assert!(has_macro_of(
+            "|a: u32| { if a == 0u32 { let _ = matches!(cap, 1u32); } a }"
+        ));
+        assert!(has_macro_of("|a: u32| { assert_eq!(cap, a); a }"));
     }
 }

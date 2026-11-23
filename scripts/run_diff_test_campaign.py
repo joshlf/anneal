@@ -3991,15 +3991,28 @@ CLOSURE_ADDR_EQ_MUTATOR_TOKENS = (
 )
 
 # Prefixes of the headers of the private items that `VTableAndFnPtrMutator` and
-# `ClosureAndAddrEqMutator` put ahead of the candidate function. A header line that
-# starts with one of these and carries one of the two mutators' tokens opens such an
-# item (`fn __anneal_vt_driver_7(`, `impl __AnnealVtableTrait7 for ...`,
-# `mod __anneal_clos_7 {`), never a `MIRI_CORPUS_MODULE_PREAMBLE` helper.
+# `ClosureAndAddrEqMutator` put ahead of the candidate function. A sibling-level
+# header line starting with one of these and carrying one of the two mutators'
+# tokens opens such an item (`fn __anneal_vt_driver_7(`,
+# `impl __AnnealVtableTrait7 for ...`, `mod __anneal_clos_7 {`), never a
+# `MIRI_CORPUS_MODULE_PREAMBLE` helper.
 MIRI_MUTATOR_ITEM_HEADER_PREFIXES = ("fn ", "impl ", "trait ", "struct ", "mod ")
 MIRI_MUTATOR_ITEM_TOKENS = (
     *VTABLE_FNPTR_MUTATOR_TOKENS,
     *CLOSURE_ADDR_EQ_MUTATOR_TOKENS,
 )
+_TAIL_WRAPPER_TOKEN_RE = re.compile(r"\b__tail___miri_[A-Za-z0-9_]+\b")
+
+
+def _strip_tail_wrapper_tokens(text: str) -> str:
+    """Replaces synthetic `inject_live_probe` / `inject_prefix_probe` wrapper
+    identifiers (`__tail___miri_<mut>_<tag>`) so a seed's own tail expression
+    bound as `let __tail___miri_vt_7: u32 = <seed_expr>;` is not misattributed
+    to the mutator that wrapped it, while leaving real RHS uses of `__miri_*`
+    intact."""
+    if "__tail___miri_" not in text:
+        return text
+    return _TAIL_WRAPPER_TOKEN_RE.sub("__tail_probe", text)
 
 ALL_MIRI_MUTATOR_TOKENS = (
     *RAW_PTR_OFFSET_MUTATOR_TOKENS,
@@ -4085,6 +4098,43 @@ def _candidate_fn_start_line_no(src_lines: list[str], finding: dict[str, Any]) -
     return last_cand_line
 
 
+def _enclosing_miri_mutator_item_owner(
+    src_lines: list[str], line_no: int, cand_fn_start_line: int
+) -> str | None:
+    """Returns the owning indirect-call mutator when `line_no` (`< cand_fn_start_line`)
+    lies inside a private sibling-level item emitted ahead of the candidate function
+    (such as a driver `fn`, a trait `impl` method whose body carries no mutator token,
+    or `mod __anneal_clos_* { pub mod __ { pub fn eval_once... } }`), or `None` when
+    `line_no` lies inside a `MIRI_CORPUS_MODULE_PREAMBLE` item."""
+    if line_no < 1 or line_no >= cand_fn_start_line:
+        return None
+    cand_line = src_lines[cand_fn_start_line - 1]
+    cand_indent = len(cand_line) - len(cand_line.lstrip())
+    for idx in range(line_no - 1, -1, -1):
+        raw_line = src_lines[idx]
+        stripped = raw_line.lstrip()
+        if not stripped:
+            continue
+        indent = len(raw_line) - len(stripped)
+        if indent > cand_indent:
+            continue
+        if stripped.startswith(MIRI_MUTATOR_ITEM_HEADER_PREFIXES):
+            return _mutator_for_fault_line(stripped)
+        if stripped.startswith(
+            (
+                "pub ",
+                "unsafe fn ",
+                "macro_rules! ",
+                "enum ",
+                "union ",
+                "const ",
+                "static ",
+            )
+        ):
+            return None
+    return None
+
+
 def _resolve_preamble_fault_line_no(
     src_lines: list[str], line_no: int, cand_fn_start_line: int
 ) -> int:
@@ -4093,20 +4143,19 @@ def _resolve_preamble_fault_line_no(
     when the candidate calls that helper or macro.
 
     A fault line inside a private item that an indirect-call mutator put ahead of
-    the candidate function (a driver `fn`, its callee, or a trait `impl` method) is
-    not a preamble helper's: it stays where it is, so that the mutator tokens on the
-    line itself attribute it, however the candidate function calls the last
+    the candidate function (a driver `fn`, its callee, a trait `impl` method, or
+    a `mod __anneal_clos_*` closure helper) is not a preamble helper's: it stays
+    where it is, so that the mutator tokens on the line itself or its enclosing
+    item header attribute it, however the candidate function calls the last
     `pub fn` helper of the preamble."""
     if line_no >= cand_fn_start_line:
+        return line_no
+    if _enclosing_miri_mutator_item_owner(src_lines, line_no, cand_fn_start_line) is not None:
         return line_no
     call_targets: tuple[str, ...] = ()
     always_faults = False
     for idx in range(line_no - 1, -1, -1):
         stripped = src_lines[idx].lstrip()
-        if stripped.startswith(MIRI_MUTATOR_ITEM_HEADER_PREFIXES) and any(
-            tok in stripped for tok in MIRI_MUTATOR_ITEM_TOKENS
-        ):
-            return line_no
         if stripped.startswith("macro_rules! write_bytes"):
             call_targets = ("write_bytes!(",)
             break
@@ -4138,7 +4187,7 @@ def _resolve_preamble_fault_line_no(
                 return cand_idx + 1
             if first_call_line is None:
                 first_call_line = cand_idx + 1
-            if any(tok in text for tok in ALL_MIRI_MUTATOR_TOKENS):
+            if any(tok in _strip_tail_wrapper_tokens(text) for tok in ALL_MIRI_MUTATOR_TOKENS):
                 return cand_idx + 1
     return first_call_line if first_call_line is not None else line_no
 
@@ -4147,6 +4196,7 @@ def _mutator_for_fault_line(fault_text: str) -> str | None:
     """Returns the mutator that owns a token on `fault_text`, or `None`."""
     if not fault_text:
         return None
+    fault_text = _strip_tail_wrapper_tokens(fault_text)
     for probe_prefix, mutator_name in (
         ("__miri_ptr_", "RawPtrOffsetMutator"),
         ("__miri_tb_", "TreeBorrowsRetagInterleaver"),
@@ -4243,16 +4293,27 @@ def infer_finding_cause(
             resolved_earliest = _resolve_preamble_fault_line_no(
                 src_lines, earliest_line_no, cand_start
             )
+            item_owner = _enclosing_miri_mutator_item_owner(
+                src_lines, resolved_earliest, cand_start
+            )
+            if item_owner is not None:
+                return item_owner
             if resolved_earliest >= cand_start:
-                prefix_text = "\n".join(src_lines[cand_start - 1 : resolved_earliest])
-                suffix_text = "\n".join(src_lines[resolved_earliest:])
+                prefix_text = _strip_tail_wrapper_tokens(
+                    "\n".join(src_lines[cand_start - 1 : resolved_earliest])
+                )
+                suffix_text = _strip_tail_wrapper_tokens(
+                    "\n".join(src_lines[resolved_earliest:])
+                )
                 if not any(tok in prefix_text for tok in ALL_MIRI_MUTATOR_TOKENS) and any(
                     tok in suffix_text for tok in ALL_MIRI_MUTATOR_TOKENS
                 ):
                     return seed_name
             for raw_ln in _extract_src_lib_fault_line_nos(finding, len(src_lines)):
                 resolved_ln = _resolve_preamble_fault_line_no(src_lines, raw_ln, cand_start)
-                other_hit = _mutator_for_fault_line(src_lines[resolved_ln - 1])
+                other_hit = _mutator_for_fault_line(
+                    src_lines[resolved_ln - 1]
+                ) or _enclosing_miri_mutator_item_owner(src_lines, resolved_ln, cand_start)
                 if other_hit is not None:
                     return other_hit
 
