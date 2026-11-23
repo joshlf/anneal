@@ -1394,6 +1394,30 @@ theorem twoCall_traitsPreserved_modular_neverPanics :
     | panicked memAfter => exact False.elim hPost.1
     | aborted => exact False.elim hPost)
 
+/--
+`handlerPreservesTables_of_withTraitsPreserved` asks the contract's
+precondition to hold of every request. That is false for `twoCallContract`, as
+for every contract that names its callees.
+-/
+theorem twoCallContract_pre_not_universal : ¬ ∀ req, twoCallContract.pre req := fun h =>
+  match h { defPath := "", typeArgs := [], args := [], memory := emptyMemory } with
+  | .inl hEq => nomatch hEq
+  | .inr hEq => nomatch hEq
+
+/--
+The relativized guard needs no such condition: against every handler that
+implements the `withTraitsPreserved` contract, every state reachable through
+calls in the contract's precondition keeps the contracted callee excluded.
+-/
+theorem twoCall_reachableOn_guard (h : ExternalCallHandler)
+    (hHolds : twoCallContract.withTraitsPreserved.toMirCallContract.holdsOn h)
+    (s' : MachineState)
+    (hReach : ReachableExecStateOn twoCallCallerMir h twoCallContract.pre
+      (.running twoCallInit) (.running s')) :
+    CalleeTableExcludes s'.memory contractedPath :=
+  ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved twoCallContract .forbidAbort
+    hHolds hReach linkedMem_calleeTableExcludes
+
 /-! ### `AbortPolicy` separation -/
 
 /-- A body that aborts immediately: `bb0: terminate`. -/
@@ -2687,6 +2711,44 @@ theorem outerCaller_linked_panicsOnlyIf (fallback : ExternalCallHandler) :
             (checkedAddU8_frameGeneral_callee_wp typeArgs a b mem hB)).toDWLP)))
     (fun _ hPre hNe => False.elim (hNe hPre.1))
 
+/--
+`linkCalleeHandler` from a nested frame: the request for `checked_add_u8` comes
+from inside `midHelperMir` (`activeCallee := some midHelperMir`), and
+`linkCalleeHandler` runs the callee from the request memory unchanged. The
+machine therefore steps `midHelperMir`'s code (`stepMirFn_eq_of_activeCallee_some`)
+on the callee's locals, whose call to `checked_add_u8` is unlinked inside the
+handler and faults. No panic contract of this linked system holds, whereas the
+frame-resetting `linkCalleeWithCalleesHandler` gives the total exact contract
+(`outerCaller_linked_totalExact`).
+-/
+theorem outerCaller_linkCalleeHandler_not_panicsWithPolicyOnlyIf
+    (fallback : ExternalCallHandler)
+    (post : MirInput → MirReturn → Prop) (panicCond : MirInput → Prop)
+    (policy : AbortPolicy MirInput) :
+    ¬ PanicsWithPolicyOnlyIf
+      (mirHandledTrees outerCallerMir (linkCalleeHandler checkedAddU8Mir fallback) [midHelperMir])
+      addCallerPre post panicCond policy := by
+  have hPre : addCallerPre (scalarArgs2 1 1 2, emptyMemory) :=
+    ⟨⟨1, 2, by decide, by decide, rfl⟩, rfl⟩
+  refine not_panicsWithPolicyOnlyIf_of_reachesLinkedFault hPre ?_
+  repeat (first | refine .handler rfl ?_ | refine .tau rfl ?_)
+  refine not_treeSafe_linkCalleeHandler_of_reachesLinkedFault fallback rfl ?_
+  repeat (first | exact .handler rfl (not_treeSafe_failAllCalls _) | refine .tau rfl ?_)
+
+/-- The two handlers disagree on the same caller, helper, and callee. -/
+theorem outerCaller_linkCalleeHandler_vs_withCallees (fallback : ExternalCallHandler) :
+    TotalExactPanicContract
+        (mirHandledTrees outerCallerMir
+          (linkCalleeWithCalleesHandler checkedAddU8Mir [] fallback) [midHelperMir])
+        addCallerPre addCallerPost addCallerOverflows ∧
+      ¬ PanicsOnlyIf
+        (mirHandledTrees outerCallerMir (linkCalleeHandler checkedAddU8Mir fallback)
+          [midHelperMir])
+        addCallerPre addCallerPost addCallerOverflows :=
+  ⟨outerCaller_linked_totalExact fallback, fun h =>
+    outerCaller_linkCalleeHandler_not_panicsWithPolicyOnlyIf fallback addCallerPost
+      addCallerOverflows .forbidAbort (panicsWithPolicyOnlyIf_forbidAbort_iff.2 h)⟩
+
 /-! ### Concrete `ExactPolicy` mutual exclusion & `waiveAbortUnchecked` handler refutation -/
 
 /--
@@ -3534,6 +3596,21 @@ theorem multiStepCaller_reachable_preserves_calleeTableExcludes
       (func := fnItemOp contractedPath [.uint .u8]) (argOps := []) (destination := local_ 0)
       (targetBb := 4) (unwind := .continue_) (targetDefPath := contractedPath)
       (argVals := []) rfl rfl rfl hExcl rfl rfl⟩
+
+/--
+A concrete handler meets the hypothesis of
+`multiStepCaller_reachable_preserves_calleeTableExcludes`: `checked_add_u8`
+linked through `linkCalleeWithCalleesHandler`, with every other call failing.
+-/
+theorem multiStepCaller_concrete_handler_guard (a b : Nat) (s' : MachineState)
+    (hReach : ReachableExecState multiStepCallerMir
+      (linkCalleeWithCalleesHandler checkedAddU8Mir [] failAllCalls)
+      (.running (initMachineStateWithMemory multiStepCallerMir (scalarArgs2 1 a b) linkedMem))
+      (.running s')) :
+    CalleeTableExcludes s'.memory contractedPath :=
+  (multiStepCaller_reachable_preserves_calleeTableExcludes _
+    (handlerPreservesTables_linkCalleeWithCalleesHandler _ _ _
+      handlerPreservesTables_failAllCalls)).1 a b s' hReach
 
 /-! ### Non-empty disjoint borrows & Lowering Boundary Gap #8 (depth-0 borrow collision) -/
 
@@ -4734,6 +4811,8 @@ theorem all_panic_contracts_tests :
     (type_of% @injectingHandler_holdsOn_withFramePreserved) ∧
     (type_of% @twoCall_frameOnly_not_modular) ∧
     (type_of% @twoCall_traitsPreserved_modular_neverPanics) ∧
+    (type_of% @twoCallContract_pre_not_universal) ∧
+    (type_of% @twoCall_reachableOn_guard) ∧
     (type_of% @alwaysAbort_totalExact) ∧
     (type_of% @alwaysAbort_reaches_abort) ∧
     (type_of% @alwaysAbort_waiveAbortUnchecked) ∧
@@ -4785,6 +4864,8 @@ theorem all_panic_contracts_tests :
     (type_of% @outerCaller_wp) ∧
     (type_of% @outerCaller_linked_totalExact) ∧
     (type_of% @outerCaller_linked_panicsOnlyIf) ∧
+    (type_of% @outerCaller_linkCalleeHandler_not_panicsWithPolicyOnlyIf) ∧
+    (type_of% @outerCaller_linkCalleeHandler_vs_withCallees) ∧
     (type_of% @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked) ∧
     (type_of% @panicOrAbort_wp) ∧
     (type_of% @panicOrAbort_totalExact) ∧
@@ -4800,6 +4881,7 @@ theorem all_panic_contracts_tests :
     (type_of% @kani5219_borrow_backed_reborrow_and_write_contagion) ∧
     (type_of% @kani5219_global_alloc_slice_asymmetry) ∧
     (type_of% @multiStepCaller_reachable_preserves_calleeTableExcludes) ∧
+    (type_of% @multiStepCaller_concrete_handler_guard) ∧
     (type_of% @checkedAddU8_disjointBorrows_callee_wp) ∧
     (type_of% @checkedAddU8_disjointBorrows_holdsTotallyOn) ∧
     (type_of% @checkedAddU8_disjointBorrows_nonEmpty_witness) ∧
@@ -4904,6 +4986,8 @@ theorem all_panic_contracts_tests :
     @injectingHandler_holdsOn_withFramePreserved,
     @twoCall_frameOnly_not_modular,
     @twoCall_traitsPreserved_modular_neverPanics,
+    @twoCallContract_pre_not_universal,
+    @twoCall_reachableOn_guard,
     @alwaysAbort_totalExact,
     @alwaysAbort_reaches_abort,
     @alwaysAbort_waiveAbortUnchecked,
@@ -4955,6 +5039,8 @@ theorem all_panic_contracts_tests :
     @outerCaller_wp,
     @outerCaller_linked_totalExact,
     @outerCaller_linked_panicsOnlyIf,
+    @outerCaller_linkCalleeHandler_not_panicsWithPolicyOnlyIf,
+    @outerCaller_linkCalleeHandler_vs_withCallees,
     @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked,
     @panicOrAbort_wp,
     @panicOrAbort_totalExact,
@@ -4970,6 +5056,7 @@ theorem all_panic_contracts_tests :
     @kani5219_borrow_backed_reborrow_and_write_contagion,
     @kani5219_global_alloc_slice_asymmetry,
     @multiStepCaller_reachable_preserves_calleeTableExcludes,
+    @multiStepCaller_concrete_handler_guard,
     @checkedAddU8_disjointBorrows_callee_wp,
     @checkedAddU8_disjointBorrows_holdsTotallyOn,
     @checkedAddU8_disjointBorrows_nonEmpty_witness,

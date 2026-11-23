@@ -62,14 +62,20 @@ state when a panic may happen, when it must happen, and that every execution
    through `linkCalleeHandler` (`panicsOnlyIf_call_compose`) and through the
    frame-restoring `linkCalleeWithCalleesHandler`, the memory a linked callee
    presents on unwind, and finite counterexample / witness traces of a linked
-   system (`ReachesLinkedFault`, `ReachesLinkedOutcome`).
+   system (`ReachesLinkedFault`, `ReachesLinkedOutcome`). `linkCalleeHandler`
+   runs the callee from the request memory unchanged, so it is meaningful only
+   for requests from the root frame: from a nested frame the machine steps the
+   body named by `activeCallee` (`stepMirFn_eq_of_activeCallee_some`).
+   Both handlers run the callee at call depth `0` on the caller's borrows.
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
    body. The guard is established for initial states, used at each call
    terminator, and preserved across **every** step of `stepMirState`
    (statements, rvalues, intrinsics, internal helper calls, unwinds, and
    resumption of external calls whose contract carries `withTraitsPreserved`),
-   yielding a multi-step execution invariant (`ReachableExecState.calleeTableExcludes`).
+   yielding a multi-step execution invariant (`ReachableExecState.calleeTableExcludes`)
+   and its relativization to calls in a contract's precondition
+   (`ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved`).
 7. The syntactic call-boundary guards `CallBoundaryPreserved`,
    `CalleesCallBoundaryPreserved`, the counted `CallSitesPreserved` and
    `CalleesCallSitesPreserved`, and the CFG-reachable guards
@@ -3896,6 +3902,61 @@ theorem ReachesLinkedFault.of_reachesFaultExecBounded {body : CapturedMir}
       · simp only [hStep] at hFault
         nomatch hFault
 
+/-- The handler that answers no request: every call faults with `.unsupported`. -/
+def failAllCalls : ExternalCallHandler := fun _ =>
+  ITree.fail (E := MirClosedEffect) FailureKind.unsupported
+
+/-- `failUnlinkedCalls`, which closes a callee tree, handles calls as `failAllCalls`. -/
+theorem failUnlinkedCalls_eq_handleMirExternalCalls :
+    failUnlinkedCalls = handleMirExternalCalls failAllCalls := by
+  funext i
+  rcases i with ⟨fk⟩ | ⟨⟨obs⟩⟩ | ⟨⟨req⟩⟩ <;> rfl
+
+/-- `failAllCalls` is not fault-free on any request. -/
+theorem not_treeSafe_failAllCalls (req : MirCallReq) : ¬ TreeSafe (failAllCalls req) :=
+  fun hs => hs [] _ (.refl _) (faultNow_fail FailureKind.unsupported)
+
+/-- The closed callee trees are handled residuals under `failAllCalls`. -/
+theorem mirClosedCalleeTrees_eq_mirHandledFrom (calleeBody : CapturedMir) (req : MirCallReq) :
+    mirClosedCalleeTrees calleeBody req =
+      mirHandledFrom calleeBody failAllCalls
+        (.running (initMachineStateWithMemory calleeBody req.args req.memory)) := by
+  unfold mirClosedCalleeTrees mirHandledFrom
+  rw [failUnlinkedCalls_eq_handleMirExternalCalls]
+  rfl
+
+/--
+A fault of the callee run from the request memory, with nested calls failing
+closed, makes `linkCalleeHandler` itself unsafe on that request.
+-/
+theorem not_treeSafe_linkCalleeHandler_of_reachesLinkedFault {calleeBody : CapturedMir}
+    (fallback : ExternalCallHandler) {req : MirCallReq}
+    (hEq : req.defPath = calleeBody.defPath)
+    (hF : ReachesLinkedFault calleeBody failAllCalls
+      (.running (initMachineStateWithMemory calleeBody req.args req.memory))) :
+    ¬ TreeSafe (linkCalleeHandler calleeBody fallback req) := by
+  rw [linkCalleeHandler_of_defPath_eq calleeBody fallback hEq]
+  unfold closeMirTreeAsCallAns
+  refine not_treeSafe_bind _ ?_
+  have hT := hF.not_treeSafe
+  unfold mirHandledFrom at hT
+  rw [← failUnlinkedCalls_eq_handleMirExternalCalls] at hT
+  exact hT
+
+/--
+Scope limit of `linkCalleeHandler` for requests from a nested frame: the machine
+steps the body named by `activeCallee`, so with `activeCallee = some b` the
+linked `calleeBody` does not execute at all; `b`'s code runs on the callee's
+locals instead. `linkCalleeWithCalleesHandler` resets `activeCallee` through
+`enterExternalCalleeState`.
+-/
+theorem stepMirFn_eq_of_activeCallee_some (body₁ body₂ : CapturedMir) {s : MachineState}
+    {b : CapturedMir} (hActive : s.memory.activeCallee = some b) :
+    stepMirFn body₁ s = stepMirFn body₂ s := by
+  unfold stepMirFn
+  rw [hActive]
+  rfl
+
 section LinkedRefutation
 
 variable {body : CapturedMir} {h : ExternalCallHandler} {callees : List CapturedMir}
@@ -5793,6 +5854,154 @@ theorem ReachableExecState.runtimeCallBoundaryGuarded {body : CapturedMir}
     (hGuard : RuntimeCallBoundaryGuarded s₁.memory targets) :
     RuntimeCallBoundaryGuarded s₂.memory targets :=
   fun target hMem => hReach.calleeTableExcludes hH (hGuard target hMem)
+
+/-! #### Handlers that preserve the tables only on the requests a contract admits -/
+
+/--
+`h` preserves `callees` and `traitImpls` on every answer to a request that
+satisfies `callPre`. A handler that implements a `withTraitsPreserved`
+contract has this property for `callPre := P.pre`, without any condition on
+requests outside the contract.
+-/
+def HandlerPreservesTablesOn (callPre : MirCallReq → Prop) (h : ExternalCallHandler) :
+    Prop :=
+  ∀ req, callPre req → ∀ tr ans, ReachesRet (h req) tr ans →
+    CallAnsPreservesTables req.memory ans
+
+/-- `HandlerPreservesTables` is the case of an unconstrained request set. -/
+theorem handlerPreservesTablesOn_iff (h : ExternalCallHandler) :
+    HandlerPreservesTablesOn (fun _ => True) h ↔ HandlerPreservesTables h :=
+  ⟨fun hOn req tr ans hRet => hOn req trivial tr ans hRet,
+    fun hAll req _ tr ans hRet => hAll req tr ans hRet⟩
+
+/--
+A handler implementing a `withTraitsPreserved` policy contract preserves the
+tables on every request in the contract's precondition.
+-/
+theorem handlerPreservesTablesOn_of_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq) {h : ExternalCallHandler}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h) :
+    HandlerPreservesTablesOn P.pre h := by
+  intro req hPre tr ans hRet
+  have hPost := (hHolds req hPre).2 tr ans hRet
+  cases ans with
+  | returned retVal memAfter => exact ⟨hPost.2.1.1, hPost.2.2⟩
+  | panicked memAfter => exact ⟨hPost.2.2.1.1, hPost.2.2.2⟩
+  | aborted => exact trivial
+
+/--
+Multi-step reachability in which every external call answered along the way
+satisfies `callPre`. A modularly verified caller only issues requests in the
+contract's precondition, so `callPre := C.pre` describes its executions.
+-/
+inductive ReachableExecStateOn (body : CapturedMir) (h : ExternalCallHandler)
+    (callPre : MirCallReq → Prop) : MirExecState → MirExecState → Prop where
+  /-- Zero steps. -/
+  | refl (st : MirExecState) : ReachableExecStateOn body h callPre st st
+  /-- One silent step followed by zero or more steps. -/
+  | tau {st st₁ st₂ : MirExecState} :
+      stepMirState body st = .tau st₁ →
+      ReachableExecStateOn body h callPre st₁ st₂ →
+      ReachableExecStateOn body h callPre st st₂
+  /-- One visible observation followed by zero or more steps. -/
+  | obs {st st₂ : MirExecState} {ev : ObsReq MirObs} {k : PUnit → MirExecState} :
+      stepMirState body st = .vis (.inr (.inl ev)) k →
+      ReachableExecStateOn body h callPre (k PUnit.unit) st₂ →
+      ReachableExecStateOn body h callPre st st₂
+  /-- One external call in `callPre`, answered by `h`, followed by zero or more steps. -/
+  | call {st st₂ : MirExecState} {req : MirCallReq} {k : MirCallAns → MirExecState}
+      {tr : List (Event MirClosedEffect)} {ans : MirCallAns} :
+      stepMirState body st = MirStepNode.extCall req k → callPre req →
+      ReachesRet (h req) tr ans →
+      ReachableExecStateOn body h callPre (k ans) st₂ →
+      ReachableExecStateOn body h callPre st st₂
+
+open Classical in
+/-- `h` on the requests in `callPre`, and a fault on every other request. -/
+noncomputable def restrictHandler (callPre : MirCallReq → Prop) (h : ExternalCallHandler) :
+    ExternalCallHandler := fun req =>
+  if callPre req then h req else ITree.fail (E := MirClosedEffect) FailureKind.unsupported
+
+private theorem not_reachesRet_fail_mirClosed {R : Type} {tr : List (Event MirClosedEffect)}
+    {r : R} : ¬ ReachesRet (ITree.fail (E := MirClosedEffect) (R := R)
+      FailureKind.unsupported) tr r := by
+  rintro ⟨u, hr, hu⟩
+  generalize hT : (ITree.fail (E := MirClosedEffect) (R := R) FailureKind.unsupported) = t
+    at hr
+  cases hr with
+  | refl =>
+    subst hT
+    unfold ITree.fail ITree.triggerSub at hu
+    rw [vis_bind, ITree.observe_vis] at hu
+    nomatch hu
+  | tau hTau _ =>
+    subst hT
+    unfold ITree.fail ITree.triggerSub at hTau
+    rw [vis_bind, ITree.observe_vis] at hTau
+    nomatch hTau
+  | vis hVis hnf _ _ =>
+    subst hT
+    unfold ITree.fail ITree.triggerSub at hVis
+    rw [vis_bind, ITree.observe_vis] at hVis
+    injection hVis with hi
+    subst hi
+    exact hnf trivial
+
+theorem handlerPreservesTables_restrictHandler {callPre : MirCallReq → Prop}
+    {h : ExternalCallHandler} (hOn : HandlerPreservesTablesOn callPre h) :
+    HandlerPreservesTables (restrictHandler callPre h) := by
+  intro req tr ans hRet
+  by_cases hPre : callPre req
+  · simp only [restrictHandler, hPre, ↓reduceIte] at hRet
+    exact hOn req hPre tr ans hRet
+  · simp only [restrictHandler, hPre, ↓reduceIte] at hRet
+    exact False.elim (not_reachesRet_fail_mirClosed hRet)
+
+/-- `failAllCalls` never answers, so it preserves the tables vacuously. -/
+theorem handlerPreservesTables_failAllCalls : HandlerPreservesTables failAllCalls :=
+  fun _ _ _ hRet => False.elim (not_reachesRet_fail_mirClosed hRet)
+
+theorem ReachableExecStateOn.toReachableExecState {body : CapturedMir}
+    {h : ExternalCallHandler} {callPre : MirCallReq → Prop} {st₁ st₂ : MirExecState}
+    (hReach : ReachableExecStateOn body h callPre st₁ st₂) :
+    ReachableExecState body (restrictHandler callPre h) st₁ st₂ := by
+  induction hReach with
+  | refl st => exact .refl st
+  | tau hStep _ ih => exact .tau hStep ih
+  | obs hStep _ ih => exact .obs hStep ih
+  | @call st st₂ req k tr ans hStep hPre hAns _ ih =>
+    refine .call (tr := tr) hStep ?_ ih
+    simp only [restrictHandler, hPre, ↓reduceIte]
+    exact hAns
+
+/--
+Relativized multi-step table invariance: along every execution whose external
+calls satisfy `callPre`, against a handler that preserves the tables on
+`callPre`, every reachable running state has the tables of the start state.
+-/
+theorem ReachableExecStateOn.preserves_tables {body : CapturedMir}
+    {h : ExternalCallHandler} {callPre : MirCallReq → Prop}
+    (hOn : HandlerPreservesTablesOn callPre h) {s₁ s₂ : MachineState}
+    (hReach : ReachableExecStateOn body h callPre (.running s₁) (.running s₂)) :
+    TablesPreserved s₁.memory s₂.memory :=
+  hReach.toReachableExecState.preserves_tables (handlerPreservesTables_restrictHandler hOn)
+    s₁ s₂ rfl rfl
+
+/--
+Relativized runtime guard: a handler implementing a `withTraitsPreserved`
+contract keeps `CalleeTableExcludes` along every execution whose calls satisfy
+the contract's precondition.
+-/
+theorem ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {targetDefPath : DefPath}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hReach : ReachableExecStateOn body h P.pre (.running s₁) (.running s₂))
+    (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
+    CalleeTableExcludes s₂.memory targetDefPath :=
+  hExcl.of_tablesPreserved
+    (hReach.preserves_tables (handlerPreservesTablesOn_of_withTraitsPreserved P policy hHolds))
 
 end StepTablesPreservation
 
