@@ -61,16 +61,19 @@ state when a panic may happen, when it must happen, and that every execution
 5. Panic call contracts (`PanicMirCallContract`), caller–callee composition
    through `linkCalleeHandler` (`panicsOnlyIf_call_compose`) and through the
    frame-restoring `linkCalleeWithCalleesHandler`, the memory a linked callee
-   presents on unwind, and finite counterexample traces of a linked system
-   (`ReachesLinkedFault`).
+   presents on unwind, and finite counterexample / witness traces of a linked
+   system (`ReachesLinkedFault`, `ReachesLinkedOutcome`).
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
    body. The guard is established for initial states, used at each call
-   terminator, and carried across the resumption of an external call whose
-   contract has `withTraitsPreserved`. That the statements executed between two
-   calls leave `callees` and `traitImpls` unchanged is not proved here.
+   terminator, and preserved across **every** step of `stepMirState`
+   (statements, rvalues, intrinsics, internal helper calls, unwinds, and
+   resumption of external calls whose contract carries `withTraitsPreserved`),
+   yielding a multi-step execution invariant (`ReachableExecState.calleeTableExcludes`).
 7. The syntactic call-boundary guards `CallBoundaryPreserved`,
-   `CalleesCallBoundaryPreserved`, and the counted `CallSitesPreserved`.
+   `CalleesCallBoundaryPreserved`, the counted `CallSitesPreserved` and
+   `CalleesCallSitesPreserved`, and the CFG-reachable guards
+   `ReachableCallBoundaryPreserved` and `ReachableCallSitesPreserved`.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
    `ExactPass`.
 -/
@@ -3612,6 +3615,79 @@ theorem panicsOnlyIf_call_compose_withCallees (P : PanicMirCallContract)
     (holdsOn_linkCalleeWithCalleesHandler_of_panicsWithPolicyOnlyIf P .forbidAbort calleeBody
       calleeCallees fallback (panicsWithPolicyOnlyIf_forbidAbort_iff.2 hCallee) hFallback)
 
+/--
+Contract-level total handler linking for `linkCalleeWithCalleesHandler`: a callee
+whose isolated closed trees satisfy `TotalExactPolicyPanicContract` on the
+frame-restored postcondition induces a `linkCalleeWithCalleesHandler`
+implementing `P.toExactPolicyMirCallContract calleePolicy` totally.
+-/
+theorem holdsTotallyOn_linkCalleeWithCalleesHandler_of_totalExactPolicy
+    (P : PanicMirCallContract) (calleePolicy : AbortPolicy MirCallReq)
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : TotalExactPolicyPanicContract (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrame req.memory r.2))
+      P.panicCond calleePolicy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      DWP mirClosedWP (fallback req)
+        (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans) PUnit.unit) :
+    (P.toExactPolicyMirCallContract calleePolicy).holdsTotallyOn
+      (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback) := by
+  intro req hPre
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeWithCalleesHandler_of_defPath_eq calleeBody calleeCallees fallback hEq]
+    unfold closeMirTreeRestoringFrame
+    apply DWP.bind
+    obtain ⟨tr, out, hRet, hEx⟩ := hCallee.reaches_outcome ⟨hPre, hEq⟩
+    exact dwp_mirClosedWP_of_reachesRet
+      (Q := fun out' =>
+        DWP mirClosedWP (pure (outcomeToRestoredCallAns req.memory out'))
+          (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans) PUnit.unit)
+      hRet (by
+        apply DWP.ret
+        cases out with
+        | normal r => exact hEx
+        | panic => exact ⟨hEx, hPanicInv req hPre hEq hEx.1⟩
+        | abort => exact hEx)
+  · rw [linkCalleeWithCalleesHandler_of_defPath_ne calleeBody calleeCallees fallback hEq]
+    exact hFallback req hPre hEq
+
+/--
+Contract-level exact horizontal composition via `linkCalleeWithCalleesHandler`:
+links a modularly verified caller directly against a callee's
+`TotalExactPolicyPanicContract` on `mirExternalClosedCalleeTrees`.
+-/
+theorem totalExactPolicyPanicContract_call_compose_withCallees_of_callee_contract
+    (P : PanicMirCallContract) (calleePolicy : AbortPolicy MirCallReq)
+    (calleeCallees : List CapturedMir)
+    (hCaller : ∀ x, pre x →
+      DWP (mirModularWP (P.toExactPolicyMirCallContract calleePolicy).toCallContract)
+        (mirStatefulTrees callerBody callees x)
+        (fun out _ => ExactPolicyOutcome policy x (post x) (panicCond x) out)
+        PUnit.unit)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : TotalExactPolicyPanicContract (mirExternalClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrame req.memory r.2))
+      P.panicCond calleePolicy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      DWP mirClosedWP (fallback req)
+        (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans)
+        PUnit.unit) :
+    TotalExactPolicyPanicContract
+      (mirHandledTrees callerBody
+        (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback) callees)
+      pre post panicCond policy :=
+  mirHandled_totalExactPolicyPanicContract_of_dwp
+    (P.toExactPolicyMirCallContract calleePolicy)
+    (holdsTotallyOn_linkCalleeWithCalleesHandler_of_totalExactPolicy P calleePolicy calleeBody
+      calleeCallees fallback hPanicInv hCallee hFallback)
+    hCaller
+
 end Compose
 
 /-! ### Refuting linked contracts -/
@@ -3880,6 +3956,169 @@ theorem holdsOn_pure_handler (C : MirCallContract) (answer : MirCallReq → MirC
     (h : ∀ req, C.pre req → C.post req (answer req)) :
     C.holdsOn (fun req => pure (answer req)) :=
   fun req hPre => dwlp_pure_adequacy (ewp := mirClosedWP) (DWLP.ret (h req hPre))
+
+/--
+The linked execution of `body` from `st` under the handler `h` reaches the
+terminal outcome `out`. Mirrors `ReachesLinkedFault` for fault-free executions,
+yielding both finite outcome-violation counterexamples (spurious panic,
+disallowed abort, or wrong return value) and positive trigger witnesses
+(`PanicsIf`, `AbortsIf`).
+-/
+inductive ReachesLinkedOutcome (body : CapturedMir) (h : ExternalCallHandler) :
+    MirExecState → MirOutcome → Prop where
+  /-- The next step returns `out`. -/
+  | ret {st : MirExecState} {out : MirOutcome} :
+      stepMirState body st = .ret out → ReachesLinkedOutcome body h st out
+  /-- The next step is silent and the residual reaches `out`. -/
+  | tau {st st' : MirExecState} {out : MirOutcome} :
+      stepMirState body st = .tau st' → ReachesLinkedOutcome body h st' out →
+      ReachesLinkedOutcome body h st out
+  /-- The next step is an observation and the residual reaches `out`. -/
+  | obs {st : MirExecState} {ev : ObsReq MirObs} {k : PUnit → MirExecState} {out : MirOutcome} :
+      stepMirState body st = .vis (.inr (.inl ev)) k →
+      ReachesLinkedOutcome body h (k PUnit.unit) out →
+      ReachesLinkedOutcome body h st out
+  /-- The next step is a call, `h` answers `ans`, and the resumed residual reaches `out`. -/
+  | call {st : MirExecState} {req : MirCallReq} {k : MirCallAns → MirExecState}
+      {tr : List (Event MirClosedEffect)} {ans : MirCallAns} {out : MirOutcome} :
+      stepMirState body st = MirStepNode.extCall req k →
+      ReachesRet (h req) tr ans → ReachesLinkedOutcome body h (k ans) out →
+      ReachesLinkedOutcome body h st out
+
+private theorem interp_cofix_ret {S : Type} {E₁ E₂ : Effect.{0}} {R : Type}
+    (H : (i : E₁.I) → ITree E₂ (E₁.O i))
+    {step : S → ITreeF E₁ R S} {st : S} {r : R}
+    (h : step st = .ret r) :
+    ITree.interp H (ITree.cofix step st) = ITree.ret r := by
+  have hEq : ITree.cofix step st = ITree.ret r := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, h, ITree.observe_ret]
+    rfl
+  rw [hEq, interp_ret]
+
+/-- A linked-outcome derivation yields an existential `ReachesRet` witness on `mirHandledFrom`. -/
+theorem ReachesLinkedOutcome.exists_reachesRet {body : CapturedMir} {h : ExternalCallHandler}
+    {st : MirExecState} {out : MirOutcome} (hO : ReachesLinkedOutcome body h st out) :
+    ∃ tr, ReachesRet (mirHandledFrom body h st) tr out := by
+  induction hO with
+  | @ret st out hStep =>
+    refine ⟨[], ITree.ret out, ?_, ITree.observe_ret out⟩
+    unfold mirHandledFrom
+    rw [interp_cofix_ret (handleMirExternalCalls h) hStep]
+    exact .refl _
+  | @tau st st' out hStep _ ih =>
+    obtain ⟨tr, u, hr, hu⟩ := ih
+    refine ⟨tr, u, ?_, hu⟩
+    unfold mirHandledFrom
+    rw [interp_cofix_tau (handleMirExternalCalls h) hStep]
+    exact .tau (ITree.observe_tau _) hr
+  | @obs st ev k out hStep _ ih =>
+    obtain ⟨tr₂, u, hr₂, hu⟩ := ih
+    cases ev with
+    | emit obsEv =>
+      obtain ⟨tr₁, hEmit⟩ := reachesRet_emit_mirClosed obsEv
+      refine ⟨tr₁ ++ tr₂, u, ?_, hu⟩
+      unfold mirHandledFrom
+      rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+        (i := Sum.inr (Sum.inl (ObsReq.emit obsEv))) (k := k) hStep]
+      exact reaches_trans (reaches_bind_of_reachesRet _ hEmit) (.tau (ITree.observe_tau _) hr₂)
+  | @call st req k tr₁ ans out hStep hAns _ ih =>
+    obtain ⟨tr₂, u, hr₂, hu⟩ := ih
+    refine ⟨tr₁ ++ tr₂, u, ?_, hu⟩
+    unfold mirHandledFrom
+    rw [interp_cofix_vis (E₁ := MirEffect) (handleMirExternalCalls h)
+      (i := Sum.inr (Sum.inr (CallReq.call req))) (k := k) hStep]
+    exact reaches_trans (reaches_bind_of_reachesRet _ hAns) (.tau (ITree.observe_tau _) hr₂)
+
+section LinkedOutcomeRefutation
+
+variable {body : CapturedMir} {h : ExternalCallHandler} {callees : List CapturedMir}
+  {pre : MirInput → Prop} {post : MirInput → MirReturn → Prop}
+  {panicCond : MirInput → Prop} {policy : AbortPolicy MirInput} {x : MirInput}
+  {out : MirOutcome}
+
+/-- Reaching a disallowed outcome from an input in `pre` refutes `PanicsWithPolicyOnlyIf`. -/
+theorem not_panicsWithPolicyOnlyIf_of_reachesLinkedOutcome (hx : pre x)
+    (hO : ReachesLinkedOutcome body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) out)
+    (hBad : ¬ PolicyOutcomeOk policy x (post x) (panicCond x) out) :
+    ¬ PanicsWithPolicyOnlyIf (mirHandledTrees body h callees) pre post panicCond policy := by
+  intro hC
+  obtain ⟨tr, hr⟩ := hO.exists_reachesRet
+  exact hBad ((hC x hx).2 tr out hr)
+
+/-- Reaching a disallowed outcome from an input in `pre` refutes `PanicsOnlyIf`. -/
+theorem not_panicsOnlyIf_of_reachesLinkedOutcome (hx : pre x)
+    (hO : ReachesLinkedOutcome body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) out)
+    (hBad : ¬ PanicOutcomeOk (post x) (panicCond x) out) :
+    ¬ PanicsOnlyIf (mirHandledTrees body h callees) pre post panicCond := by
+  intro hC
+  obtain ⟨tr, hr⟩ := hO.exists_reachesRet
+  exact hBad ((hC x hx).2 tr out hr)
+
+/-- Reaching `.panic` on an input in `pre` refutes `NeverPanics`. -/
+theorem not_neverPanics_of_reachesLinkedPanic (hx : pre x)
+    (hO : ReachesLinkedOutcome body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) .panic) :
+    ¬ NeverPanics (mirHandledTrees body h callees) pre post :=
+  not_panicsOnlyIf_of_reachesLinkedOutcome hx hO (fun hF => hF)
+
+/-- One handler reaching a disallowed outcome refutes `MirModularPanicsWithPolicyOnlyIf`. -/
+theorem not_mirModularPanicsWithPolicyOnlyIf_of_reachesLinkedOutcome
+    {envAssumed : ExternalCallHandler → Prop} (hEnv : envAssumed h) (hx : pre x)
+    (hO : ReachesLinkedOutcome body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) out)
+    (hBad : ¬ PolicyOutcomeOk policy x (post x) (panicCond x) out) :
+    ¬ MirModularPanicsWithPolicyOnlyIf body envAssumed pre post panicCond policy callees :=
+  fun hC => not_panicsWithPolicyOnlyIf_of_reachesLinkedOutcome hx hO hBad (hC h hEnv)
+
+/-- One handler reaching a disallowed outcome refutes `MirModularPanicsOnlyIf`. -/
+theorem not_mirModularPanicsOnlyIf_of_reachesLinkedOutcome
+    {envAssumed : ExternalCallHandler → Prop} (hEnv : envAssumed h) (hx : pre x)
+    (hO : ReachesLinkedOutcome body h
+      (.running (initMachineStateWithMemoryAndCallees body x.1 x.2 callees)) out)
+    (hBad : ¬ PanicOutcomeOk (post x) (panicCond x) out) :
+    ¬ MirModularPanicsOnlyIf body envAssumed pre post panicCond callees :=
+  fun hC => not_panicsOnlyIf_of_reachesLinkedOutcome hx hO hBad (hC h hEnv)
+
+end LinkedOutcomeRefutation
+
+/--
+`disableFrameBorrows` leaves `borrows` unchanged whenever no entry targets a
+local `< nLocals` in frame `depth`.
+-/
+theorem disableFrameBorrows_eq_self :
+    ∀ (borrows : List BorrowEntry) (depth nLocals : Nat),
+      (∀ b, b ∈ borrows → b.targetFrameDepth ≠ depth ∨ nLocals ≤ b.targetLocal) →
+      disableFrameBorrows borrows depth nLocals = borrows
+  | .nil, _, _, _ => rfl
+  | entry :: rest, depth, nLocals, h => by
+    unfold disableFrameBorrows
+    have hHead : entry.targetFrameDepth ≠ depth ∨ nLocals ≤ entry.targetLocal :=
+      h entry (List.mem_cons_self)
+    have hCond : Bool.and (Nat.beq entry.targetFrameDepth depth)
+        (Nat.blt entry.targetLocal nLocals) = false := by
+      rcases hHead with hNe | hGe
+      · have hEqF : Nat.beq entry.targetFrameDepth depth = false := by
+          cases hB : Nat.beq entry.targetFrameDepth depth with
+          | false => rfl
+          | true => exact False.elim (hNe (Nat.eq_of_beq_eq_true hB))
+        rw [hEqF]
+        rfl
+      · have hLtF : Nat.blt entry.targetLocal nLocals = false := by
+          cases hB : Nat.blt entry.targetLocal nLocals with
+          | false => rfl
+          | true =>
+            have hLt : entry.targetLocal < nLocals := by
+              unfold Nat.blt at hB
+              exact Nat.le_of_ble_eq_true hB
+            exact False.elim ((Nat.not_lt.2 hGe) hLt)
+        rw [hLtF, Bool.and_false]
+    rw [hCond]
+    exact congrArg (entry :: ·)
+      (disableFrameBorrows_eq_self rest depth nLocals
+        (fun b hb => h b (List.mem_cons_of_mem entry hb)))
 
 /-! ### Unwind actions at an external call site -/
 
@@ -4362,6 +4601,1200 @@ theorem CalleeTableExcludes.with_borrows {mem : Memory} {targetDefPath : DefPath
     (borrows : List BorrowEntry) (h : CalleeTableExcludes mem targetDefPath) :
     CalleeTableExcludes { mem with borrows := borrows } targetDefPath :=
   h.of_tables_eq rfl rfl
+
+/-! ### Full-step and multi-step preservation of `callees` and `traitImpls` -/
+
+section StepTablesPreservation
+
+/-- Two memories agree on both `callees` and `traitImpls`. -/
+def TablesPreserved (m₁ m₂ : Memory) : Prop :=
+  m₂.callees = m₁.callees ∧ m₂.traitImpls = m₁.traitImpls
+
+theorem TablesPreserved.trans {m₁ m₂ m₃ : Memory}
+    (h₁ : TablesPreserved m₁ m₂) (h₂ : TablesPreserved m₂ m₃) :
+    TablesPreserved m₁ m₃ :=
+  ⟨h₂.1.trans h₁.1, h₂.2.trans h₁.2⟩
+
+theorem CalleeTableExcludes.of_tablesPreserved {m₁ m₂ : Memory} {targetDefPath : DefPath}
+    (hTab : TablesPreserved m₁ m₂) (h : CalleeTableExcludes m₁ targetDefPath) :
+    CalleeTableExcludes m₂ targetDefPath :=
+  h.of_tables_eq hTab.1 hTab.2
+
+/-- An `RvalueEvalResult` preserves `mem`'s callee and trait-impl tables if it succeeds. -/
+def RvaluePreservesTables (mem : Memory) : RvalueEvalResult → Prop
+  | .ok _ _ mem' => TablesPreserved mem mem'
+  | .ub | .unsupported => True
+
+/-- A `MirExecState` preserves `mem`'s callee and trait-impl tables if it is `.running`. -/
+def ExecStatePreservesTables (mem : Memory) : MirExecState → Prop
+  | .running s' => TablesPreserved mem s'.memory
+  | .halted _ | .faulted _ => True
+
+/-- A `MirCallAns` preserves `reqMem`'s callee and trait-impl tables on return/unwind. -/
+def CallAnsPreservesTables (reqMem : Memory) : MirCallAns → Prop
+  | .returned _ m | .panicked m => TablesPreserved reqMem m
+  | .aborted => True
+
+/--
+A one-step `MirStepNode` preserves `mem`'s callee and trait-impl tables across
+silent transitions, visible observations, and external calls (carrying `mem`'s
+tables into the emitted `MirCallReq` and, for every table-preserving answer,
+into the resumed `MirExecState`).
+-/
+def StepNodePreservesTables (mem : Memory) : MirStepNode → Prop
+  | .ret _ => True
+  | .tau st' => ExecStatePreservesTables mem st'
+  | .vis (.inl _) _ => True
+  | .vis (.inr (.inl _)) k => ExecStatePreservesTables mem (k PUnit.unit)
+  | .vis (.inr (.inr (.call req))) k =>
+    TablesPreserved mem req.memory ∧
+      ∀ ans, CallAnsPreservesTables req.memory ans → ExecStatePreservesTables mem (k ans)
+
+/-- Optional step node (e.g. `evalDirectRustIntrinsic?`) preserves tables when `.some`. -/
+def OptStepNodePreservesTables (mem : Memory) : Option MirStepNode → Prop
+  | .none => True
+  | .some node => StepNodePreservesTables mem node
+
+private theorem OptStepNodePreservesTables.some_of {mem : Memory} {node : MirStepNode}
+    (h : StepNodePreservesTables mem node) : OptStepNodePreservesTables mem (.some node) :=
+  h
+
+private theorem StepNodePreservesTables.extCall_of {mem : Memory} {req : MirCallReq}
+    {k : MirCallAns → MirExecState}
+    (hReq : TablesPreserved mem req.memory)
+    (hK : ∀ ans, CallAnsPreservesTables req.memory ans → ExecStatePreservesTables mem (k ans)) :
+    StepNodePreservesTables mem (MirStepNode.extCall req k) :=
+  ⟨hReq, hK⟩
+
+private theorem StepNodePreservesTables.emitStep {mem : Memory} {obs : MirObs}
+    {s' : MachineState} (h : TablesPreserved mem s'.memory) :
+    StepNodePreservesTables mem (MirStepNode.emitStep obs s') := by
+  cases obs <;> exact h
+
+private theorem StepNodePreservesTables.mono {m₁ m₂ : Memory} {node : MirStepNode}
+    (h : TablesPreserved m₁ m₂) (hn : StepNodePreservesTables m₂ node) :
+    StepNodePreservesTables m₁ node := by
+  cases node with
+  | ret _ => trivial
+  | tau st' =>
+    cases st' with
+    | running s' => exact h.trans hn
+    | halted _ | faulted _ => trivial
+  | vis i k =>
+    rcases i with f | (e | ⟨req⟩)
+    · trivial
+    · cases hK : k PUnit.unit with
+      | running s' =>
+        simp only [StepNodePreservesTables, hK, ExecStatePreservesTables] at hn ⊢
+        exact h.trans hn
+      | halted _ | faulted _ =>
+        simp only [StepNodePreservesTables, hK, ExecStatePreservesTables]
+    · refine ⟨h.trans hn.1, fun ans hAns => ?_⟩
+      have hK := hn.2 ans hAns
+      cases hk : k ans with
+      | running s' =>
+        simp only [hk, ExecStatePreservesTables] at hK ⊢
+        exact h.trans hK
+      | halted _ | faulted _ =>
+        simp only [ExecStatePreservesTables]
+
+private theorem internFnPtr_preserves_tables (mem : Memory) (defPath : DefPath)
+    (typeArgs : List RigidTy) (fnSig : Option RigidTy) :
+    TablesPreserved mem (internFnPtr mem defPath typeArgs fnSig).2 := by
+  unfold internFnPtr; try dsimp only
+  split <;> exact ⟨rfl, rfl⟩
+
+private theorem evalUnaryNot_preserves_tables (sc : ScalarInt) (optTy : Option Ty)
+    (locals : List LocalSlot) (mem : Memory) :
+    RvaluePreservesTables mem (evalUnaryNot sc optTy locals mem) := by
+  unfold evalUnaryNot; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalSignedDiv_preserves_tables (a b sz : Nat) (locals : List LocalSlot)
+    (mem : Memory) :
+    RvaluePreservesTables mem (evalSignedDiv a b sz locals mem) := by
+  unfold evalSignedDiv; try dsimp only
+  split <;> first | exact trivial | exact ⟨rfl, rfl⟩
+
+private theorem evalSignedRem_preserves_tables (a b sz : Nat) (locals : List LocalSlot)
+    (mem : Memory) :
+    RvaluePreservesTables mem (evalSignedRem a b sz locals mem) := by
+  unfold evalSignedRem; try dsimp only
+  split <;> first | exact trivial | exact ⟨rfl, rfl⟩
+
+private theorem evalScalarBinOp_preserves_tables (op : BinOp) (lhs rhs : ScalarInt)
+    (locals : List LocalSlot) (mem : Memory) (isSigned : Bool) :
+    RvaluePreservesTables mem (evalScalarBinOp op lhs rhs locals mem isSigned) := by
+  unfold evalScalarBinOp; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalSignedDiv_preserves_tables _ _ _ _ _
+    | exact evalSignedRem_preserves_tables _ _ _ _ _
+    | split)
+
+private theorem evalByteCast_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalByteCast locals op targetTy mem localDecls layouts) := by
+  unfold evalByteCast; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalUnsafeFnPointer_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalUnsafeFnPointer locals op targetTy mem localDecls layouts) := by
+  unfold evalUnsafeFnPointer; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem deriveStackElemThinPtr_preserves_tables (locals : List LocalSlot) (mem : Memory)
+    (ptrVal : ProvenancePtr) (parentEntry : BorrowEntry) (elemCountOpt : Option Nat)
+    (ptrBytes : Nat) :
+    RvaluePreservesTables mem
+      (deriveStackElemThinPtr locals mem ptrVal parentEntry elemCountOpt ptrBytes) := by
+  unfold deriveStackElemThinPtr; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalUnsizeCoercion_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalUnsizeCoercion locals op targetTy mem localDecls layouts) := by
+  unfold evalUnsizeCoercion; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact deriveStackElemThinPtr_preserves_tables _ _ _ _ _ _
+    | split)
+
+private theorem evalReifyFnPointer_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (coercionKind : String) :
+    RvaluePreservesTables mem
+      (evalReifyFnPointer locals op targetTy mem localDecls layouts coercionKind) := by
+  unfold evalReifyFnPointer; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalUnsizeCoercion_preserves_tables _ _ _ _ _ _
+    | exact evalUnsafeFnPointer_preserves_tables _ _ _ _ _ _
+    | exact deriveStackElemThinPtr_preserves_tables _ _ _ _ _ _
+    | (have hI := internFnPtr_preserves_tables mem _ _ _; split; exact hI)
+    | split)
+
+private theorem evalFnPtrToPtr_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalFnPtrToPtr locals op targetTy mem localDecls layouts) := by
+  unfold evalFnPtrToPtr; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalPlaceLen_preserves_tables (locals : List LocalSlot) (place : Place)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalPlaceLen locals place mem localDecls layouts) := by
+  unfold evalPlaceLen; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalWidePtrRelBinOp_preserves_tables (op : BinOp)
+    (lhsThin lhsMeta rhsThin rhsMeta : Value) (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ptrBytes : Nat) :
+    RvaluePreservesTables mem
+      (evalWidePtrRelBinOp op lhsThin lhsMeta rhsThin rhsMeta locals₂ mem localDecls layouts
+        ptrBytes) := by
+  unfold evalWidePtrRelBinOp; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalScalarBinOp_preserves_tables _ _ _ _ _ _
+    | split)
+
+private theorem evalWidePtrAggregateRelBinOp_preserves_tables (op : BinOp) (lhsOp : Operand)
+    (lhsVar : Nat) (lhsFields : List Value) (rhsVar : Nat) (rhsFields : List Value)
+    (locals₂ : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalWidePtrAggregateRelBinOp op lhsOp lhsVar lhsFields rhsVar rhsFields locals₂ mem
+        localDecls layouts) := by
+  unfold evalWidePtrAggregateRelBinOp; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalWidePtrRelBinOp_preserves_tables _ _ _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalScalarPtrOffsetBinOp_preserves_tables (locals₂ : List LocalSlot)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsOp : Operand)
+    (lhs rhs : ScalarInt) :
+    RvaluePreservesTables mem
+      (evalScalarPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp lhs rhs) := by
+  unfold evalScalarPtrOffsetBinOp; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalPtrOffsetBinOp_preserves_tables (locals₂ : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (lhsOp : Operand)
+    (ptrVal : ProvenancePtr) (sz : Nat) (offsetSc : ScalarInt) :
+    RvaluePreservesTables mem
+      (evalPtrOffsetBinOp locals₂ mem localDecls layouts lhsOp ptrVal sz offsetSc) := by
+  unfold evalPtrOffsetBinOp; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalSliceFatPtrDerefBorrow_preserves_tables
+    (locals : List LocalSlot) (mem : Memory) (parentPtr : ProvenancePtr) (ptrSz : Nat)
+    (lenSc : ScalarInt) (restProj : List ProjectionElem) (perm : TreeBorrowPerm)
+    (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable)
+    (checkPerm : Bool) (localDecls : List LocalDecl)
+    (accessedTyOpt : Option Ty) (checkResultRefAlign : Bool) :
+    RvaluePreservesTables mem
+      (evalSliceFatPtrDerefBorrow locals mem parentPtr ptrSz lenSc restProj perm
+        isMut pointeeTyOpt layouts checkPerm localDecls accessedTyOpt checkResultRefAlign) := by
+  unfold evalSliceFatPtrDerefBorrow; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalGlobalThinPtrDerefBorrow_preserves_tables
+    (locals : List LocalSlot) (mem : Memory) (alloc : CapturedAllocation)
+    (parentPtr : ProvenancePtr) (ptrSz : Nat) (restProj : List ProjectionElem)
+    (isMut : Bool) (pointeeTyOpt : Option Ty) (layouts : LayoutTable)
+    (localDecls : List LocalDecl) (rawPtrMode : Bool) (accessedTyOpt : Option Ty) :
+    RvaluePreservesTables mem
+      (evalGlobalThinPtrDerefBorrow locals mem alloc parentPtr ptrSz restProj isMut
+        pointeeTyOpt layouts localDecls rawPtrMode accessedTyOpt) := by
+  unfold evalGlobalThinPtrDerefBorrow; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalScalarSliceFatPtrDerefRaw_preserves_tables
+    (locals : List LocalSlot) (mem : Memory) (addrSc lenSc : ScalarInt)
+    (restProj : List ProjectionElem) (pointeeTyOpt : Option Ty)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalScalarSliceFatPtrDerefRaw locals mem addrSc lenSc restProj pointeeTyOpt
+        localDecls layouts) := by
+  unfold evalScalarSliceFatPtrDerefRaw; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalPlaceDiscriminant_preserves_tables (val : Value) (locals' : List LocalSlot)
+    (mem : Memory) (place : Place) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalPlaceDiscriminant val locals' mem place localDecls layouts) := by
+  unfold evalPlaceDiscriminant; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalRvalueRefDeref_preserves_tables (locals : List LocalSlot)
+    (borrowKind : BorrowKind) (place : Place) (restProj : List ProjectionElem)
+    (perm : TreeBorrowPerm) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalRvalueRefDeref locals borrowKind place restProj perm mem localDecls layouts) := by
+  unfold evalRvalueRefDeref; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalSliceFatPtrDerefBorrow_preserves_tables _ _ _ _ _ _ _ _ _ _ _ _ _ _
+    | exact evalGlobalThinPtrDerefBorrow_preserves_tables _ _ _ _ _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalRvalueRawPtr_preserves_tables (locals : List LocalSlot)
+    (mutability : Mutability) (place : Place) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalRvalueRawPtr locals mutability place mem localDecls layouts) := by
+  unfold evalRvalueRawPtr; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalSliceFatPtrDerefBorrow_preserves_tables _ _ _ _ _ _ _ _ _ _ _ _ _ _
+    | exact evalGlobalThinPtrDerefBorrow_preserves_tables _ _ _ _ _ _ _ _ _ _ _ _
+    | exact evalScalarSliceFatPtrDerefRaw_preserves_tables _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalCastPtrToPtr_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalCastPtrToPtr locals op targetTy mem localDecls layouts) := by
+  unfold evalCastPtrToPtr; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact deriveStackElemThinPtr_preserves_tables _ _ _ _ _ _
+    | split)
+
+private theorem evalPointerExposeProvenance_preserves_tables (locals : List LocalSlot)
+    (op : Operand) (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalPointerExposeProvenance locals op targetTy mem localDecls layouts) := by
+  unfold evalPointerExposeProvenance; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalPointerWithExposedProvenance_preserves_tables (locals : List LocalSlot)
+    (op : Operand) (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalPointerWithExposedProvenance locals op targetTy mem localDecls layouts) := by
+  unfold evalPointerWithExposedProvenance; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalAggregateRawPtr_preserves_tables (locals : List LocalSlot) (pointeeTy : Ty)
+    (ops : List Operand) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalAggregateRawPtr locals pointeeTy ops mem localDecls layouts) := by
+  unfold evalAggregateRawPtr; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalUnaryPtrMetadata_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalUnaryPtrMetadata locals op mem localDecls layouts) := by
+  unfold evalUnaryPtrMetadata; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalAggregateAdt_preserves_tables (locals : List LocalSlot) (defPath : DefPath)
+    (variantIdx : VariantIdx) (activeField : Option FieldIdx) (ops : List Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalAggregateAdt locals defPath variantIdx activeField ops mem localDecls layouts) := by
+  unfold evalAggregateAdt; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalFloatCastRvalue_preserves_tables (locals : List LocalSlot) (kind : CastKind)
+    (op : Operand) (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalFloatCastRvalue locals kind op targetTy mem localDecls layouts) := by
+  unfold evalFloatCastRvalue; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalNullaryOp_preserves_tables (locals : List LocalSlot) (op : NullOp)
+    (argTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalNullaryOp locals op argTy mem localDecls layouts) := by
+  unfold evalNullaryOp; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalUseRvalue_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalUseRvalue locals op mem localDecls layouts) := by
+  unfold evalUseRvalue; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalShallowInitBox_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (contentTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalShallowInitBox locals op contentTy mem localDecls layouts) := by
+  have hUse := evalUseRvalue_preserves_tables locals op mem localDecls layouts
+  unfold evalShallowInitBox; try dsimp only
+  cases h : evalUseRvalue locals op mem localDecls layouts with
+  | ok v l' m' =>
+    rw [h] at hUse
+    dsimp only
+    repeat' (first | exact trivial | exact hUse | split)
+  | ub | unsupported =>
+    dsimp only
+    repeat' (first | exact trivial | split)
+
+private theorem evalWrapUnsafeBinder_preserves_tables (locals : List LocalSlot) (op : Operand)
+    (targetTy : Ty) (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem
+      (evalWrapUnsafeBinder locals op targetTy mem localDecls layouts) := by
+  have hUse := evalUseRvalue_preserves_tables locals op mem localDecls layouts
+  unfold evalWrapUnsafeBinder; try dsimp only
+  cases h : evalUseRvalue locals op mem localDecls layouts with
+  | ok v l' m' =>
+    rw [h] at hUse
+    dsimp only
+    repeat' (first | exact trivial | exact hUse | split)
+  | ub | unsupported =>
+    dsimp only
+    repeat' (first | exact trivial | split)
+
+/-- Every `Rvalue` evaluation preserves `mem.callees` and `mem.traitImpls`. -/
+theorem evalRvalue_preserves_tables (locals : List LocalSlot) (rv : Rvalue) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    RvaluePreservesTables mem (evalRvalue locals rv mem localDecls layouts) := by
+  unfold evalRvalue; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalUnaryNot_preserves_tables _ _ _ _
+    | exact evalScalarBinOp_preserves_tables _ _ _ _ _ _
+    | exact evalByteCast_preserves_tables _ _ _ _ _ _
+    | exact evalUnsafeFnPointer_preserves_tables _ _ _ _ _ _
+    | exact evalUnsizeCoercion_preserves_tables _ _ _ _ _ _
+    | exact evalReifyFnPointer_preserves_tables _ _ _ _ _ _ _
+    | exact evalFnPtrToPtr_preserves_tables _ _ _ _ _ _
+    | exact evalPlaceLen_preserves_tables _ _ _ _ _
+    | exact evalWidePtrAggregateRelBinOp_preserves_tables _ _ _ _ _ _ _ _ _ _
+    | exact evalScalarPtrOffsetBinOp_preserves_tables _ _ _ _ _ _ _
+    | exact evalPtrOffsetBinOp_preserves_tables _ _ _ _ _ _ _ _
+    | exact evalPlaceDiscriminant_preserves_tables _ _ _ _ _ _
+    | exact evalRvalueRefDeref_preserves_tables _ _ _ _ _ _ _ _
+    | exact evalRvalueRawPtr_preserves_tables _ _ _ _ _ _
+    | exact evalCastPtrToPtr_preserves_tables _ _ _ _ _ _
+    | exact evalPointerExposeProvenance_preserves_tables _ _ _ _ _ _
+    | exact evalPointerWithExposedProvenance_preserves_tables _ _ _ _ _ _
+    | exact evalAggregateRawPtr_preserves_tables _ _ _ _ _ _
+    | exact evalUnaryPtrMetadata_preserves_tables _ _ _ _ _
+    | exact evalAggregateAdt_preserves_tables _ _ _ _ _ _ _ _
+    | exact evalFloatCastRvalue_preserves_tables _ _ _ _ _ _ _
+    | exact evalNullaryOp_preserves_tables _ _ _ _ _ _
+    | exact evalUseRvalue_preserves_tables _ _ _ _ _
+    | exact evalShallowInitBox_preserves_tables _ _ _ _ _ _
+    | exact evalWrapUnsafeBinder_preserves_tables _ _ _ _ _ _
+    | split)
+
+private theorem commitCopyDstPlaceWrite_preserves_tables (s : MachineState) (dstPlace : Place)
+    (dstTargetLocal : LocalIdx) (dstTag : Nat) (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    StepNodePreservesTables s.memory
+      (commitCopyDstPlaceWrite s dstPlace dstTargetLocal dstTag locals₃ newVal localDecls
+        layouts) := by
+  unfold commitCopyDstPlaceWrite; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalCopySingleDirect_preserves_tables (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (locals₃ : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        locals₃) := by
+  unfold evalCopySingleDirect; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact commitCopyDstPlaceWrite_preserves_tables _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalCopyUnionBytes_preserves_tables (s : MachineState) (src dst : Operand)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (srcUnionOpt dstUnionOpt : Option UnionPlaceInfo) (n : Nat)
+    (locals₃ : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalCopyUnionBytes s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        srcUnionOpt dstUnionOpt n locals₃) := by
+  unfold evalCopyUnionBytes; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact commitCopyDstPlaceWrite_preserves_tables _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalCopyNonOverlappingPermOk_preserves_tables (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalCopyNonOverlappingPermOk s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        countBits locals₃) := by
+  unfold evalCopyNonOverlappingPermOk; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalCopySingleDirect_preserves_tables _ _ _ _ _ _ _ _ _ _
+    | exact evalCopyUnionBytes_preserves_tables _ _ _ _ _ _ _ _ _ _ _ _ _
+    | exact commitCopyDstPlaceWrite_preserves_tables _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalForeignFrameCopySingleDirect_preserves_tables (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat) (locals₃ : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalForeignFrameCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry
+        dstEntry countBits locals₃) := by
+  unfold evalForeignFrameCopySingleDirect; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | (rename_i hC; exact commitForeignFrameLocals_preserves_tables hC)
+    | split)
+
+private theorem evalCopyNonOverlappingWithCount_preserves_tables (s : MachineState)
+    (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcVal dstVal : Value) (countBits : Nat) (locals₃ : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalCopyNonOverlappingWithCount s src dst localDecls layouts srcVal dstVal countBits
+        locals₃) := by
+  unfold evalCopyNonOverlappingWithCount; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalCopyNonOverlappingPermOk_preserves_tables _ _ _ _ _ _ _ _ _ _ _
+    | exact evalForeignFrameCopySingleDirect_preserves_tables _ _ _ _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalCopyNonOverlapping_preserves_tables (s : MachineState)
+    (src dst count : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    StepNodePreservesTables s.memory
+      (evalCopyNonOverlapping s src dst count localDecls layouts) := by
+  unfold evalCopyNonOverlapping; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalCopyNonOverlappingWithCount_preserves_tables _ _ _ _ _ _ _ _ _
+    | split)
+
+private theorem evalFnEntryRetag_preserves_tables (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (ptrVal : ProvenancePtr) (sz : Nat) (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalFnEntryRetag s localDecls layouts place ptrVal sz parentEntry locals') := by
+  unfold evalFnEntryRetag; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalNonFnEntryRetag_preserves_tables (retagKind : RetagKind) (s : MachineState)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (place : Place)
+    (ptrVal : ProvenancePtr) (sz : Nat) (parentEntry : BorrowEntry)
+    (locals' : List LocalSlot) :
+    StepNodePreservesTables s.memory
+      (evalNonFnEntryRetag retagKind s localDecls layouts place ptrVal sz parentEntry
+        locals') := by
+  unfold evalNonFnEntryRetag; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalSetDiscriminantLocal_preserves_tables (s : MachineState) (loc : Local)
+    (variantIdx : Nat) (fields : List Value) :
+    StepNodePreservesTables s.memory
+      (evalSetDiscriminantLocal s loc variantIdx fields) := by
+  unfold evalSetDiscriminantLocal; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalForeignFrameDerefWrite_preserves_tables (s : MachineState)
+    (locals₁ : List LocalSlot) (mem₁ : Memory) (dst : Place)
+    (restProj : List ProjectionElem) (val : Value) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (hM : TablesPreserved s.memory mem₁) :
+    StepNodePreservesTables s.memory
+      (evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts) := by
+  unfold evalForeignFrameDerefWrite; try dsimp only
+  cases h : foreignFrameDerefWrite locals₁ mem₁ dst restProj val localDecls layouts with
+  | ub => exact trivial
+  | unsupported => exact trivial
+  | ok _ m' => exact hM.trans (foreignFrameDerefWrite_preserves_tables h)
+
+private theorem evalSetDiscriminantDerefWrite_preserves_tables (s : MachineState)
+    (locals₁ : List LocalSlot) (p : Place) (rest : List ProjectionElem) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    StepNodePreservesTables s.memory
+      (evalSetDiscriminantDerefWrite s locals₁ p rest newVal localDecls layouts) := by
+  unfold evalSetDiscriminantDerefWrite; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact evalForeignFrameDerefWrite_preserves_tables _ _ _ _ _ _ _ _ ⟨rfl, rfl⟩
+    | split)
+
+/-- Every MIR statement preserves `s.memory.callees` and `s.memory.traitImpls`. -/
+theorem evalStmt_preserves_tables (s : MachineState) (stmt : Statement)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    StepNodePreservesTables s.memory (evalStmt s stmt localDecls layouts) := by
+  cases stmt with
+  | mk kind span =>
+    cases kind with
+    | assign dst rv =>
+      have hRv := evalRvalue_preserves_tables s.frame.locals rv s.memory localDecls layouts
+      unfold evalStmt; try dsimp only
+      cases hR : evalRvalue s.frame.locals rv s.memory localDecls layouts with
+      | ub => dsimp only; exact trivial
+      | unsupported => dsimp only; exact trivial
+      | ok val locals₁ mem₁ =>
+        rw [hR] at hRv
+        dsimp only
+        repeat' (first
+          | exact trivial
+          | exact hRv
+          | exact evalForeignFrameDerefWrite_preserves_tables _ _ _ _ _ _ _ _ hRv
+          | split)
+    | setDiscriminant place variantIdx =>
+      unfold evalStmt; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | exact evalSetDiscriminantLocal_preserves_tables _ _ _ _
+        | exact evalSetDiscriminantDerefWrite_preserves_tables _ _ _ _ _ _ _
+        | split)
+    | storageLive loc =>
+      unfold evalStmt; try dsimp only
+      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+    | storageDead loc =>
+      unfold evalStmt; try dsimp only
+      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+    | retag retagKind place =>
+      unfold evalStmt; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | exact evalFnEntryRetag_preserves_tables _ _ _ _ _ _ _ _
+        | exact evalNonFnEntryRetag_preserves_tables _ _ _ _ _ _ _ _ _
+        | split)
+    | intrinsic intr =>
+      cases intr with
+      | assume op =>
+        simp only [evalStmt]
+        repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+      | copyNonOverlapping src dst count =>
+        simp only [evalStmt]
+        exact evalCopyNonOverlapping_preserves_tables s src dst count localDecls layouts
+    | deinit place =>
+      simp only [evalStmt]
+      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+    | placeMention _ =>
+      simp only [evalStmt]
+      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+    | nop | backwardIncompatibleDropHint _ | constEvalCounter | coverage =>
+      simp only [evalStmt]
+      exact ⟨rfl, rfl⟩
+
+private theorem invalidateDirectDestWriteBorrows_preserves_tables (mem : Memory)
+    (locals : List LocalSlot) (dst : Place) :
+    TablesPreserved mem (invalidateDirectDestWriteBorrows mem locals dst) := by
+  unfold invalidateDirectDestWriteBorrows; try dsimp only
+  repeat' (first | exact ⟨rfl, rfl⟩ | split)
+
+private theorem writeIntrinsicReturn_preserves_tables (s : MachineState)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (retVal : Value) :
+    StepNodePreservesTables s.memory
+      (writeIntrinsicReturn s locals' destination targetBb retVal) := by
+  unfold writeIntrinsicReturn; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact invalidateDirectDestWriteBorrows_preserves_tables _ _ _
+    | (rename_i hF; exact foreignFrameDerefWrite_preserves_tables hF)
+    | split)
+
+private theorem writeIntrinsicScalarResult_preserves_tables (s : MachineState)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (resOpt : Option ScalarInt) :
+    StepNodePreservesTables s.memory
+      (writeIntrinsicScalarResult s locals' destination targetBb resOpt) := by
+  unfold writeIntrinsicScalarResult; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact writeIntrinsicReturn_preserves_tables _ _ _ _ _
+    | split)
+
+private theorem intrinsicUnresolvedLayoutStep_preserves_tables (mem : Memory) (ty : RigidTy) :
+    StepNodePreservesTables mem (intrinsicUnresolvedLayoutStep ty) := by
+  unfold intrinsicUnresolvedLayoutStep; split <;> exact trivial
+
+private theorem intrinsicWidePointeeStep_preserves_tables (mem : Memory) (ty : RigidTy) :
+    StepNodePreservesTables mem (intrinsicWidePointeeStep ty) := by
+  unfold intrinsicWidePointeeStep; split <;> exact trivial
+
+private theorem intrinsicMissingPointeeStep_preserves_tables (mem : Memory)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand) :
+    StepNodePreservesTables mem
+      (intrinsicMissingPointeeStep bodyLocalDecls bodyLayouts argOps) := by
+  unfold intrinsicMissingPointeeStep; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact intrinsicWidePointeeStep_preserves_tables _ _
+    | split)
+
+private theorem evalNonSelectIntrinsicCall_preserves_tables (kind : RustIntrinsicKind)
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (argVals : List Value)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx) :
+    StepNodePreservesTables s.memory
+      (evalNonSelectIntrinsicCall kind s target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb) := by
+  unfold evalNonSelectIntrinsicCall; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact writeIntrinsicReturn_preserves_tables _ _ _ _ _
+    | exact writeIntrinsicScalarResult_preserves_tables _ _ _ _ _
+    | exact intrinsicUnresolvedLayoutStep_preserves_tables _ _
+    | exact intrinsicWidePointeeStep_preserves_tables _ _
+    | exact intrinsicMissingPointeeStep_preserves_tables _ _ _ _
+    | split)
+
+private theorem finishMemIntrinsicCall_preserves_tables (s : MachineState) (node : MirStepNode)
+    (destination : Place) (targetBb : BasicBlockIdx)
+    (hNode : StepNodePreservesTables s.memory node) :
+    StepNodePreservesTables s.memory
+      (finishMemIntrinsicCall s node destination targetBb) := by
+  unfold finishMemIntrinsicCall
+  cases node with
+  | tau st' =>
+    cases st' with
+    | running s' =>
+      exact StepNodePreservesTables.mono hNode
+        (writeIntrinsicReturn_preserves_tables s' s'.frame.locals destination targetBb .unit)
+    | halted _ | faulted _ => exact trivial
+  | ret _ => exact trivial
+  | vis i k =>
+    rcases i with f | (e | ⟨req⟩)
+    · exact trivial
+    · exact hNode
+    · exact hNode
+
+private theorem evalCopyNonOverlappingCall_preserves_tables (s : MachineState)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) :
+    StepNodePreservesTables s.memory
+      (evalCopyNonOverlappingCall s bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalCopyNonOverlappingCall; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact finishMemIntrinsicCall_preserves_tables _ _ _ _
+        (evalCopyNonOverlappingWithCount_preserves_tables _ _ _ _ _ _ _ _ _)
+    | split)
+
+private theorem commitWriteBytesDstPlaceWrite_preserves_tables (s : MachineState)
+    (dstPlace : Place) (dstTag : Nat) (locals₃ : List LocalSlot) (newVal : Value)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    StepNodePreservesTables s.memory
+      (commitWriteBytesDstPlaceWrite s dstPlace dstTag locals₃ newVal localDecls layouts) := by
+  unfold commitWriteBytesDstPlaceWrite; try dsimp only
+  repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | split)
+
+private theorem evalWriteBytesCall_preserves_tables (s : MachineState)
+    (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable)
+    (argOps : List Operand) (argVals : List Value) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    StepNodePreservesTables s.memory
+      (evalWriteBytesCall s target bodyLocalDecls bodyLayouts argOps argVals locals'
+        destination targetBb) := by
+  unfold evalWriteBytesCall; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact writeIntrinsicReturn_preserves_tables _ _ _ _ _
+    | exact finishMemIntrinsicCall_preserves_tables _ _ _ _
+        (commitWriteBytesDstPlaceWrite_preserves_tables _ _ _ _ _ _ _)
+    | split)
+
+private theorem pushCalleeFrame_preserves_tables (s : MachineState) (callerBody : CapturedMir)
+    (localsAfterArgs : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (calleeBody : CapturedMir) (argVals : List Value) (unwind : UnwindAction) :
+    TablesPreserved s.memory
+      (pushCalleeFrame s callerBody localsAfterArgs destination targetBb calleeBody argVals
+        unwind).memory := by
+  unfold pushCalleeFrame; try dsimp only
+  exact ⟨rfl, rfl⟩
+
+private theorem pushDivergingCalleeFrame_preserves_tables (s : MachineState)
+    (callerBody : CapturedMir) (localsAfterArgs : List LocalSlot) (destination : Place)
+    (unwind : UnwindAction) (calleeBody : CapturedMir) (argVals : List Value) :
+    TablesPreserved s.memory
+      (pushDivergingCalleeFrame s callerBody localsAfterArgs destination unwind calleeBody
+        argVals).memory := by
+  unfold pushDivergingCalleeFrame; try dsimp only
+  exact ⟨rfl, rfl⟩
+
+private theorem enterTailCalleeFrame_preserves_tables (mem : Memory) (calleeBody : CapturedMir)
+    (argVals : List Value) :
+    TablesPreserved mem (enterTailCalleeFrame mem calleeBody argVals).memory := by
+  unfold enterTailCalleeFrame; try dsimp only
+  exact ⟨rfl, rfl⟩
+
+private theorem resumeExternalCall_exec_preserves_tables (s : MachineState)
+    (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)
+    (unwind : UnwindAction) (ans : MirCallAns)
+    (hAns : CallAnsPreservesTables s.memory ans) :
+    ExecStatePreservesTables s.memory
+      (resumeExternalCall s locals' destination targetBb unwind ans) := by
+  cases ans with
+  | returned retVal memAfter =>
+    cases hR : resumeExternalCall s locals' destination targetBb unwind
+        (.returned retVal memAfter) with
+    | running s' =>
+      exact hAns.trans (resumeExternalCall_returned_preserves_tables s locals' destination
+        targetBb memAfter unwind hR)
+    | halted _ | faulted _ => exact trivial
+  | panicked memAfter =>
+    cases hR : resumeExternalCall s locals' destination targetBb unwind
+        (.panicked memAfter) with
+    | running s' =>
+      exact hAns.trans (resumeExternalCall_panicked_preserves_tables s locals' destination
+        targetBb memAfter unwind hR)
+    | halted _ | faulted _ => exact trivial
+  | aborted => exact trivial
+
+private theorem resumeExternalDivergingCall_exec_preserves_tables (s : MachineState)
+    (locals' : List LocalSlot) (unwind : UnwindAction) (ans : MirCallAns)
+    (hAns : CallAnsPreservesTables s.memory ans) :
+    ExecStatePreservesTables s.memory (resumeExternalDivergingCall s locals' unwind ans) := by
+  cases ans with
+  | returned _ _ => exact trivial
+  | panicked memAfter =>
+    cases hR : resumeExternalDivergingCall s locals' unwind (.panicked memAfter) with
+    | running s' =>
+      exact hAns.trans
+        (resumeExternalDivergingCall_panicked_preserves_tables s locals' memAfter unwind hR)
+    | halted _ | faulted _ => exact trivial
+  | aborted => exact trivial
+
+private theorem resumeExternalTailCall_exec_preserves_tables (mem : Memory) (ans : MirCallAns)
+    (hAns : CallAnsPreservesTables mem ans) :
+    ExecStatePreservesTables mem (resumeExternalTailCall ans) := by
+  cases ans with
+  | returned retVal memAfter =>
+    cases hR : resumeExternalTailCall (.returned retVal memAfter) with
+    | running s' =>
+      exact hAns.trans (resumeExternalTailCall_returned_preserves_tables memAfter hR)
+    | halted _ | faulted _ => exact trivial
+  | panicked memAfter =>
+    cases hR : resumeExternalTailCall (.panicked memAfter) with
+    | running s' =>
+      exact hAns.trans (resumeExternalTailCall_panicked_preserves_tables memAfter hR)
+    | halted _ | faulted _ => exact trivial
+  | aborted => exact trivial
+
+private theorem evalDirectRustIntrinsic_preserves_tables (s : MachineState)
+    (currentBody : Option CapturedMir) (target : ResolvedCallTarget)
+    (bodyLocalDecls : List LocalDecl) (bodyLayouts : LayoutTable) (argOps : List Operand)
+    (argVals : List Value) (locals' : List LocalSlot) (destination : Place)
+    (targetBb : BasicBlockIdx) (unwind : UnwindAction) :
+    OptStepNodePreservesTables s.memory
+      (evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
+        locals' destination targetBb unwind) := by
+  unfold evalDirectRustIntrinsic?; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact pushCalleeFrame_preserves_tables _ _ _ _ _ _ _ _
+    | exact writeIntrinsicReturn_preserves_tables _ _ _ _ _
+    | exact OptStepNodePreservesTables.some_of
+        (writeIntrinsicScalarResult_preserves_tables _ _ _ _ _)
+    | exact evalNonSelectIntrinsicCall_preserves_tables _ _ _ _ _ _ _ _ _ _
+    | exact evalCopyNonOverlappingCall_preserves_tables _ _ _ _ _ _ _ _
+    | exact evalWriteBytesCall_preserves_tables _ _ _ _ _ _ _ _ _
+    | exact OptStepNodePreservesTables.some_of
+        (StepNodePreservesTables.extCall_of ⟨rfl, rfl⟩
+          (fun ans hAns => resumeExternalCall_exec_preserves_tables _ _ _ _ _ ans hAns))
+    | (rename_i hA; exact applyUnwindAction_preserves_tables _ _ _ _ hA)
+    | split)
+
+private theorem evalDirectRustIntrinsic_some_preserves_tables {s : MachineState}
+    {currentBody : Option CapturedMir} {target : ResolvedCallTarget}
+    {bodyLocalDecls : List LocalDecl} {bodyLayouts : LayoutTable} {argOps : List Operand}
+    {argVals : List Value} {locals' : List LocalSlot} {destination : Place}
+    {targetBb : BasicBlockIdx} {unwind : UnwindAction} {node : MirStepNode}
+    (h : evalDirectRustIntrinsic? s currentBody target bodyLocalDecls bodyLayouts argOps argVals
+      locals' destination targetBb unwind = .some node) :
+    StepNodePreservesTables s.memory node := by
+  have hD := evalDirectRustIntrinsic_preserves_tables s currentBody target bodyLocalDecls
+    bodyLayouts argOps argVals locals' destination targetBb unwind
+  rw [h] at hD
+  exact hD
+
+private theorem evalTailCallTerminator_preserves_tables (s : MachineState) (func : Operand)
+    (argOps : List Operand) (currentBody : Option CapturedMir) :
+    StepNodePreservesTables s.memory
+      (evalTailCallTerminator s func argOps currentBody) := by
+  unfold evalTailCallTerminator; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact ⟨rfl, rfl⟩
+    | exact enterTailCalleeFrame_preserves_tables _ _ _
+    | (refine ⟨⟨rfl, rfl⟩, fun ans hAns => ?_⟩
+       exact resumeExternalTailCall_exec_preserves_tables _ ans hAns)
+    | split)
+
+/-- Every MIR terminator preserves `s.memory.callees` and `s.memory.traitImpls`. -/
+theorem evalTerminator_preserves_tables (s : MachineState) (term : Terminator)
+    (currentBody : Option CapturedMir) :
+    StepNodePreservesTables s.memory (evalTerminator s term currentBody) := by
+  cases term with
+  | mk kind span =>
+    cases kind with
+    | goto target =>
+      unfold evalTerminator; exact ⟨rfl, rfl⟩
+    | switchInt discr targets =>
+      unfold evalTerminator; try dsimp only
+      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | exact StepNodePreservesTables.emitStep ⟨rfl, rfl⟩ | split)
+    | unwindResume =>
+      unfold evalTerminator; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | (rename_i hU; exact unwindFromCallStack_preserves_tables _ _ _ hU)
+        | split)
+    | unwindTerminate | unreachable | inlineAsm _ _ _ =>
+      unfold evalTerminator; exact trivial
+    | return_ =>
+      unfold evalTerminator; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | (rename_i hW; have hTab := writeReturnDestination_preserves_tables hW; exact hTab)
+        | split)
+    | drop place target unwind =>
+      unfold evalTerminator; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | (rename_i hU; exact applyUnwindAction_preserves_tables _ _ _ _ hU)
+        | split)
+    | call func argOps destination target unwind =>
+      cases target with
+      | some targetBb =>
+        unfold evalTerminator; try dsimp only
+        repeat' (first
+          | exact trivial
+          | exact ⟨rfl, rfl⟩
+          | exact writeIntrinsicReturn_preserves_tables _ _ _ _ _
+          | exact pushCalleeFrame_preserves_tables _ _ _ _ _ _ _ _
+          | exact StepNodePreservesTables.extCall_of ⟨rfl, rfl⟩
+              (fun ans hAns => resumeExternalCall_exec_preserves_tables _ _ _ _ _ ans hAns)
+          | (rename_i hU; exact applyUnwindAction_preserves_tables _ _ _ _ hU)
+          | (rename_i hI; exact evalDirectRustIntrinsic_some_preserves_tables hI)
+          | split)
+      | none =>
+        unfold evalTerminator; try dsimp only
+        repeat' (first
+          | exact trivial
+          | exact ⟨rfl, rfl⟩
+          | exact pushDivergingCalleeFrame_preserves_tables _ _ _ _ _ _ _
+          | exact StepNodePreservesTables.extCall_of ⟨rfl, rfl⟩
+              (fun ans hAns => resumeExternalDivergingCall_exec_preserves_tables _ _ _ ans hAns)
+          | (rename_i hU; exact applyUnwindAction_preserves_tables _ _ _ _ hU)
+          | split)
+    | tailCall func argOps =>
+      unfold evalTerminator; dsimp only
+      exact evalTailCallTerminator_preserves_tables s func argOps currentBody
+    | assert cond expected target unwind =>
+      unfold evalTerminator; try dsimp only
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | (rename_i hU; exact applyUnwindAction_preserves_tables _ _ _ _ hU)
+        | split)
+
+/-- Every single-step transition of `stepMirFn` preserves `callees` and `traitImpls`. -/
+theorem stepMirFn_preserves_tables (body : CapturedMir) (s : MachineState) :
+    StepNodePreservesTables s.memory (stepMirFn body s) := by
+  unfold stepMirFn; try dsimp only
+  repeat' (first
+    | exact trivial
+    | exact evalStmt_preserves_tables _ _ _ _
+    | exact evalTerminator_preserves_tables _ _ _
+    | split)
+
+/-- Every single-step transition of `stepMirState` preserves `callees` and `traitImpls`. -/
+theorem stepMirState_preserves_tables (body : CapturedMir) (s : MachineState) :
+    StepNodePreservesTables s.memory (stepMirState body (.running s)) :=
+  stepMirFn_preserves_tables body s
+
+/-- A silent `stepMirState` transition preserves `callees` and `traitImpls`. -/
+theorem stepMirState_tau_preserves_tables {body : CapturedMir} {s s' : MachineState}
+    (h : stepMirState body (.running s) = .tau (.running s')) :
+    TablesPreserved s.memory s'.memory := by
+  have hS := stepMirState_preserves_tables body s
+  rw [h] at hS
+  exact hS
+
+/-- An observable `stepMirState` transition preserves `callees` and `traitImpls`. -/
+theorem stepMirState_obs_preserves_tables {body : CapturedMir} {s s' : MachineState}
+    {ev : ObsReq MirObs} {k : PUnit → MirExecState}
+    (h : stepMirState body (.running s) = .vis (.inr (.inl ev)) k)
+    (hk : k PUnit.unit = .running s') :
+    TablesPreserved s.memory s'.memory := by
+  have hS := stepMirState_preserves_tables body s
+  rw [h] at hS
+  simp only [StepNodePreservesTables, hk, ExecStatePreservesTables] at hS
+  exact hS
+
+/--
+An external-call `stepMirState` transition carries `s.memory`'s `callees` and
+`traitImpls` into `req.memory`, and preserves them into any resumed running
+state whenever the answer preserves `req.memory`'s tables.
+-/
+theorem stepMirState_extCall_preserves_tables {body : CapturedMir} {s : MachineState}
+    {req : MirCallReq} {k : MirCallAns → MirExecState}
+    (h : stepMirState body (.running s) = MirStepNode.extCall req k) :
+    TablesPreserved s.memory req.memory ∧
+      ∀ ans s', CallAnsPreservesTables req.memory ans →
+        k ans = .running s' →
+        TablesPreserved s.memory s'.memory := by
+  have hS := stepMirState_preserves_tables body s
+  rw [h] at hS
+  refine ⟨hS.1, fun ans s' hAns hk => ?_⟩
+  have hK := hS.2 ans hAns
+  rw [hk] at hK
+  exact hK
+
+/--
+An external-call handler preserves `callees` and `traitImpls` on every returned
+or panicked answer it can produce.
+-/
+def HandlerPreservesTables (h : ExternalCallHandler) : Prop :=
+  ∀ req tr ans, ReachesRet (h req) tr ans → CallAnsPreservesTables req.memory ans
+
+/--
+Any handler satisfying a `withTraitsPreserved` contract on every request it
+answers preserves `callees` and `traitImpls`.
+-/
+theorem handlerPreservesTables_of_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq) (h : ExternalCallHandler)
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hAllPre : ∀ req, P.pre req) :
+    HandlerPreservesTables h := by
+  intro req tr ans hRet
+  have hPost := (hHolds req (hAllPre req)).2 tr ans hRet
+  cases ans with
+  | returned retVal memAfter =>
+    exact ⟨hPost.2.1.1, hPost.2.2⟩
+  | panicked memAfter =>
+    exact ⟨hPost.2.2.1.1, hPost.2.2.2⟩
+  | aborted => exact trivial
+
+/--
+`linkCalleeWithCalleesHandler` preserves `callees` and `traitImpls` whenever
+`fallback` does, regardless of what the linked callee body executes.
+-/
+theorem handlerPreservesTables_linkCalleeWithCalleesHandler
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hFallback : HandlerPreservesTables fallback) :
+    HandlerPreservesTables (linkCalleeWithCalleesHandler calleeBody calleeCallees fallback) := by
+  intro req tr ans hRet
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeWithCalleesHandler_of_defPath_eq calleeBody calleeCallees fallback hEq] at hRet
+    obtain ⟨out, hAnsEq⟩ := closeMirTreeRestoringFrame_reachesRet_eq hRet
+    subst hAnsEq
+    cases out with
+    | normal r => exact ⟨rfl, rfl⟩
+    | panic => exact ⟨rfl, rfl⟩
+    | abort => exact trivial
+  · rw [linkCalleeWithCalleesHandler_of_defPath_ne calleeBody calleeCallees fallback hEq] at hRet
+    exact hFallback req tr ans hRet
+
+/--
+Multi-step execution reachability of `body` under external-call handler `h`,
+stepping through arbitrary silent steps (statements, expressions, intrinsics,
+internal helper calls, unwinds), visible observations, and external calls
+answered by `h`.
+-/
+inductive ReachableExecState (body : CapturedMir) (h : ExternalCallHandler) :
+    MirExecState → MirExecState → Prop where
+  /-- Zero steps. -/
+  | refl (st : MirExecState) : ReachableExecState body h st st
+  /-- One silent step followed by zero or more steps. -/
+  | tau {st st₁ st₂ : MirExecState} :
+      stepMirState body st = .tau st₁ →
+      ReachableExecState body h st₁ st₂ →
+      ReachableExecState body h st st₂
+  /-- One visible observation followed by zero or more steps. -/
+  | obs {st st₂ : MirExecState} {ev : ObsReq MirObs} {k : PUnit → MirExecState} :
+      stepMirState body st = .vis (.inr (.inl ev)) k →
+      ReachableExecState body h (k PUnit.unit) st₂ →
+      ReachableExecState body h st st₂
+  /-- One external call answered by `h`, followed by zero or more steps. -/
+  | call {st st₂ : MirExecState} {req : MirCallReq} {k : MirCallAns → MirExecState}
+      {tr : List (Event MirClosedEffect)} {ans : MirCallAns} :
+      stepMirState body st = MirStepNode.extCall req k →
+      ReachesRet (h req) tr ans →
+      ReachableExecState body h (k ans) st₂ →
+      ReachableExecState body h st st₂
+
+/--
+Multi-step table invariance: starting from any `.running s`, every `.running s'`
+reachable through any sequence of MIR statements, intrinsics, internal helper
+calls, unwinds, observations, and table-preserving external calls has the exact
+same `callees` and `traitImpls` tables as `s`.
+-/
+theorem ReachableExecState.preserves_tables {body : CapturedMir} {h : ExternalCallHandler}
+    (hH : HandlerPreservesTables h) {st₁ st₂ : MirExecState}
+    (hReach : ReachableExecState body h st₁ st₂) :
+    ∀ s₁ s₂, st₁ = .running s₁ → st₂ = .running s₂ →
+      TablesPreserved s₁.memory s₂.memory := by
+  induction hReach with
+  | refl st =>
+    intro s₁ s₂ h₁ h₂
+    rw [h₁] at h₂
+    injection h₂ with hEq
+    subst hEq
+    exact ⟨rfl, rfl⟩
+  | @tau st st₁ st₂ hStep _ ih =>
+    intro s₁ s₂ h₁ h₂
+    subst h₁
+    cases st₁ with
+    | running sMid =>
+      exact (stepMirState_tau_preserves_tables hStep).trans (ih sMid s₂ rfl h₂)
+    | halted out =>
+      -- `.halted out` steps to `.ret out` only, so it can never reach `.running s₂`.
+      rename_i hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState] at hC; nomatch hC
+    | faulted fk =>
+      rename_i hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState, MirStepNode.fail] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState, MirStepNode.fail] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState, MirStepNode.fail] at hC; nomatch hC
+  | @obs st st₂ ev k hStep _ ih =>
+    intro s₁ s₂ h₁ h₂
+    subst h₁
+    cases hK : k PUnit.unit with
+    | running sMid =>
+      exact (stepMirState_obs_preserves_tables hStep hK).trans (ih sMid s₂ hK h₂)
+    | halted out =>
+      rename_i hRest
+      rw [hK] at hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState] at hC; nomatch hC
+    | faulted fk =>
+      rename_i hRest
+      rw [hK] at hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState, MirStepNode.fail] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState, MirStepNode.fail] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState, MirStepNode.fail] at hC; nomatch hC
+  | @call st st₂ req k tr ans hStep hAns hRest ih =>
+    intro s₁ s₂ h₁ h₂
+    subst h₁
+    have ⟨_, hRes⟩ := stepMirState_extCall_preserves_tables hStep
+    cases hK : k ans with
+    | running sMid =>
+      exact (hRes ans sMid (hH req tr ans hAns) hK).trans (ih sMid s₂ hK h₂)
+    | halted out =>
+      rw [hK] at hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState] at hC; nomatch hC
+    | faulted fk =>
+      rw [hK] at hRest
+      cases hRest with
+      | refl => nomatch h₂
+      | tau hT _ => simp only [stepMirState, MirStepNode.fail] at hT; nomatch hT
+      | obs hO _ => simp only [stepMirState, MirStepNode.fail] at hO; nomatch hO
+      | call hC _ _ => simp only [stepMirState, MirStepNode.fail] at hC; nomatch hC
+
+/--
+Global multi-step runtime call-boundary invariance: if `CalleeTableExcludes`
+holds initially and every external-call handler preserves `callees` and
+`traitImpls`, then `CalleeTableExcludes` holds at **every** reachable
+`MachineState` along every execution trace (across all statements, expressions,
+intrinsics, internal helper calls, unwinds, and external calls).
+-/
+theorem ReachableExecState.calleeTableExcludes {body : CapturedMir} {h : ExternalCallHandler}
+    {s₁ s₂ : MachineState} {targetDefPath : DefPath}
+    (hH : HandlerPreservesTables h)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
+    CalleeTableExcludes s₂.memory targetDefPath :=
+  hExcl.of_tablesPreserved (hReach.preserves_tables hH s₁ s₂ rfl rfl)
+
+/-- Multi-step preservation of `RuntimeCallBoundaryGuarded` for a list of targets. -/
+theorem ReachableExecState.runtimeCallBoundaryGuarded {body : CapturedMir}
+    {h : ExternalCallHandler} {s₁ s₂ : MachineState} {targets : List DefPath}
+    (hH : HandlerPreservesTables h)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hGuard : RuntimeCallBoundaryGuarded s₁.memory targets) :
+    RuntimeCallBoundaryGuarded s₂.memory targets :=
+  fun target hMem => hReach.calleeTableExcludes hH (hGuard target hMem)
+
+end StepTablesPreservation
 
 private theorem collectMatchingTraitImpls_of_no_trait (callees : List CapturedMir)
     (defPath : DefPath) (typeArgs : List RigidTy) :
@@ -5358,6 +6791,685 @@ theorem callBoundaryPreserved_iff_exists_callSitesPreserved (callerBody : Captur
           ((bodyCallsDefPath_iff _ _).2 h.callSite),
         rfl, h.notLinked, h.noTraitImpl⟩,
     fun ⟨_, hPos, h⟩ => h.toCallBoundaryPreserved hPos⟩
+
+/--
+The counted guard implies the runtime guard on the initial stateless machine
+state, even when `expectedSites = 0`.
+-/
+theorem CallSitesPreserved.calleeTableExcludes_init {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (h : CallSitesPreserved callerBody callees targetDefPath expectedSites) (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+/--
+The counted guard implies the runtime guard on the initial stateful machine
+state whenever `callees` is non-empty, even when `expectedSites = 0`.
+-/
+theorem CallSitesPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir} {targetDefPath : DefPath}
+    {expectedSites : Nat}
+    (h : CallSitesPreserved callerBody callees targetDefPath expectedSites)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+/--
+Counted capture-level call-boundary guard for transitive helpers linked into
+`callees`: pins the exact direct call-site count for every `(callerPath, count)`
+pair in `expectedCallerCounts`, requires every expected helper to be present in
+`callees`, and excludes `targetDefPath` from both `callees` and `traitImpls`.
+-/
+structure CalleesCallSitesPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) : Prop where
+  /-- Every `(callerPath, _)` expected helper is present in `callees`. -/
+  expectedPresent :
+    ∀ p, p ∈ expectedCallerCounts → ∃ body, body ∈ callees ∧ body.defPath = p.1
+  /-- Every linked body matching an expected `(callerPath, expectedSites)` has exact count. -/
+  callerSiteCounts :
+    ∀ body p, body ∈ callees → p ∈ expectedCallerCounts → body.defPath = p.1 →
+      bodyCallSiteCount targetDefPath body = p.2
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation on `callerBody` or `callees` dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `CalleesCallSitesPreserved`. -/
+def calleesCallSitesPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) : Bool :=
+  expectedCallerCounts.all (fun p =>
+      callees.any (fun body => stringEq body.defPath p.1)) &&
+    (callees.all (fun body =>
+        expectedCallerCounts.all (fun p =>
+          !stringEq body.defPath p.1 ||
+            Nat.beq (bodyCallSiteCount targetDefPath body) p.2)) &&
+      ((findCallee? callees targetDefPath).isNone &&
+        !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+          targetDefPath))
+
+/-- The checker decides `CalleesCallSitesPreserved`. -/
+theorem calleesCallSitesPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) :
+    calleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath = true ↔
+      CalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath := by
+  unfold calleesCallSitesPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none,
+    List.all_eq_true, List.any_eq_true]
+  constructor
+  · rintro ⟨hPres, hCounts, hNotLinked, hNoTrait⟩
+    refine ⟨?_, ?_, hNotLinked, hNoTrait⟩
+    · intro p hp
+      obtain ⟨body, hMem, hEq⟩ := hPres p hp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).1 hEq⟩
+    · intro body p hBodyMem hp hEq
+      have hOr := hCounts body hBodyMem p hp
+      rw [Bool.or_eq_true] at hOr
+      rcases hOr with hNot | hBeq
+      · have hStr : stringEq body.defPath p.1 = true := (stringEq_eq_true_iff _ _).2 hEq
+        rw [hStr] at hNot
+        nomatch hNot
+      · exact Nat.eq_of_beq_eq_true hBeq
+  · intro h
+    refine ⟨?_, ?_, h.notLinked, h.noTraitImpl⟩
+    · intro p hp
+      obtain ⟨body, hMem, hEq⟩ := h.expectedPresent p hp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).2 hEq⟩
+    · intro body hBodyMem p hp
+      rw [Bool.or_eq_true]
+      cases hStr : stringEq body.defPath p.1 with
+      | false => exact Or.inl rfl
+      | true =>
+        have hEq := (stringEq_eq_true_iff _ _).1 hStr
+        exact Or.inr (h.callerSiteCounts body p hBodyMem hp hEq ▸ Nat.beq_refl _)
+
+/-- When every expected helper count is positive, `CalleesCallSitesPreserved` implies `CalleesCallBoundaryPreserved`. -/
+theorem CalleesCallSitesPreserved.toCalleesCallBoundaryPreserved {callerBody : CapturedMir}
+    {callees : List CapturedMir} {expectedCallerCounts : List (DefPath × Nat)}
+    {targetDefPath : DefPath}
+    (h : CalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (hPos : ∀ p, p ∈ expectedCallerCounts → 0 < p.2) :
+    CalleesCallBoundaryPreserved callerBody callees (expectedCallerCounts.map Prod.fst)
+      targetDefPath := by
+  refine ⟨?_, ?_, h.notLinked, h.noTraitImpl⟩
+  · intro callerPath hMem
+    obtain ⟨p, hp, rfl⟩ := List.mem_map.1 hMem
+    exact h.expectedPresent p hp
+  · intro body hBodyMem hCaller
+    obtain ⟨p, hp, hEq⟩ := List.mem_map.1 hCaller
+    have hCount := h.callerSiteCounts body p hBodyMem hp hEq.symm
+    exact (bodyCallsDefPath_iff _ _).1
+      ((bodyCallsDefPath_iff_bodyCallSiteCount_pos _ _).2 (hCount ▸ hPos p hp))
+
+theorem CalleesCallSitesPreserved.calleeTableExcludes_init {callerBody : CapturedMir}
+    {callees : List CapturedMir} {expectedCallerCounts : List (DefPath × Nat)}
+    {targetDefPath : DefPath}
+    (h : CalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem CalleesCallSitesPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallerCounts : List (DefPath × Nat)} {targetDefPath : DefPath}
+    (h : CalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem not_calleesCallSitesPreserved_of_count_ne {callerBody : CapturedMir}
+    {callees : List CapturedMir} {expectedCallerCounts : List (DefPath × Nat)}
+    {targetDefPath : DefPath} {body : CapturedMir} {p : DefPath × Nat}
+    (hBodyMem : body ∈ callees) (hp : p ∈ expectedCallerCounts) (hPath : body.defPath = p.1)
+    (hNe : bodyCallSiteCount targetDefPath body ≠ p.2) :
+    ¬ CalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath :=
+  fun h => hNe (h.callerSiteCounts body p hBodyMem hp hPath)
+
+/-! ### CFG-reachable call-site guards -/
+
+/-- Basic-block successor introduced by an `UnwindAction`, if any. -/
+def unwindSuccessors : UnwindAction → List BasicBlockIdx
+  | .cleanup bb => [bb]
+  | _ => []
+
+/-- Static CFG successor block indices of a MIR `Terminator`. -/
+def terminatorSuccessors (term : Terminator) : List BasicBlockIdx :=
+  match term.kind with
+  | .goto bb => [bb]
+  | .switchInt _ targets => targets.otherwise :: targets.branches.map Prod.snd
+  | .unwindResume | .unwindTerminate | .return_ | .unreachable | .tailCall _ _ => []
+  | .drop _ target unwind => target :: unwindSuccessors unwind
+  | .call _ _ _ (.some target) unwind => target :: unwindSuccessors unwind
+  | .call _ _ _ .none unwind => unwindSuccessors unwind
+  | .assert _ _ target unwind => target :: unwindSuccessors unwind
+  | .inlineAsm _ targets unwind => targets ++ unwindSuccessors unwind
+
+/-- In-bounds CFG successors of basic block `bb` in `body`. -/
+def blockSuccessors (body : CapturedMir) (bb : BasicBlockIdx) : List BasicBlockIdx :=
+  match Trusted.Sequence.get? body.basicBlocks bb with
+  | .none => []
+  | .some block =>
+    (terminatorSuccessors block.terminator).filter (fun next =>
+      Nat.blt next body.basicBlocks.length)
+
+/-- Inductive CFG reachability of basic block index `bb` from the entry block `0`. -/
+inductive ReachableBlock (body : CapturedMir) : BasicBlockIdx → Prop where
+  /-- The entry block `0` is reachable whenever `body.basicBlocks` is non-empty. -/
+  | entry : 0 < body.basicBlocks.length → ReachableBlock body 0
+  /-- Any in-bounds static CFG successor of a reachable block is reachable. -/
+  | step {u v : BasicBlockIdx} :
+      ReachableBlock body u → v ∈ blockSuccessors body u → ReachableBlock body v
+
+private def addUniqueNat (xs : List Nat) (x : Nat) : List Nat :=
+  if xs.any (Nat.beq x) then xs else x :: xs
+
+private def unionUniqueNat (xs ys : List Nat) : List Nat :=
+  ys.foldl addUniqueNat xs
+
+private def reachableStep (body : CapturedMir) (visited : List BasicBlockIdx) :
+    List BasicBlockIdx :=
+  visited.foldl (fun acc bb => unionUniqueNat acc (blockSuccessors body bb)) visited
+
+private def reachableBlocksAux (body : CapturedMir) :
+    Nat → List BasicBlockIdx → List BasicBlockIdx
+  | 0, visited => visited
+  | n + 1, visited =>
+    let next := reachableStep body visited
+    if Nat.beq next.length visited.length then visited else reachableBlocksAux body n next
+
+/-- Computable list of basic block indices CFG-reachable from block `0`. -/
+def reachableBlocks (body : CapturedMir) : List BasicBlockIdx :=
+  match body.basicBlocks with
+  | [] => []
+  | _ :: _ => reachableBlocksAux body body.basicBlocks.length [0]
+
+private theorem mem_addUniqueNat_iff (xs : List Nat) (x y : Nat) :
+    y ∈ addUniqueNat xs x ↔ y = x ∨ y ∈ xs := by
+  unfold addUniqueNat
+  cases hAny : xs.any (Nat.beq x) with
+  | true =>
+    simp only [↓reduceIte]
+    obtain ⟨z, hz, hBeq⟩ := List.any_eq_true.1 hAny
+    have hx : x = z := Nat.eq_of_beq_eq_true hBeq
+    exact ⟨Or.inr, fun h => h.elim (fun hy => hy ▸ hx ▸ hz) id⟩
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte, List.mem_cons]
+
+private theorem addUniqueNat_nodup {xs : List Nat} (hNd : xs.Nodup) (x : Nat) :
+    (addUniqueNat xs x).Nodup := by
+  unfold addUniqueNat
+  cases hAny : xs.any (Nat.beq x) with
+  | true => simp only [↓reduceIte]; exact hNd
+  | false =>
+    simp only [Bool.false_eq_true, ↓reduceIte, List.nodup_cons]
+    refine ⟨fun hx => ?_, hNd⟩
+    have hT : xs.any (Nat.beq x) = true := List.any_eq_true.2 ⟨x, hx, Nat.beq_refl x⟩
+    rw [hT] at hAny
+    nomatch hAny
+
+private theorem addUniqueNat_length_ge (xs : List Nat) (x : Nat) :
+    xs.length ≤ (addUniqueNat xs x).length := by
+  unfold addUniqueNat
+  cases xs.any (Nat.beq x) <;> simp
+
+private theorem mem_unionUniqueNat_iff :
+    ∀ (ys xs : List Nat) (z : Nat), z ∈ unionUniqueNat xs ys ↔ z ∈ xs ∨ z ∈ ys
+  | [], xs, z => by simp [unionUniqueNat]
+  | y :: ys, xs, z => by
+    unfold unionUniqueNat
+    simp only [List.foldl_cons]
+    rw [show ys.foldl addUniqueNat (addUniqueNat xs y) = unionUniqueNat (addUniqueNat xs y) ys from rfl]
+    rw [mem_unionUniqueNat_iff ys (addUniqueNat xs y) z, mem_addUniqueNat_iff, List.mem_cons]
+    constructor
+    · rintro ((rfl | hxs) | hys)
+      · exact Or.inr (Or.inl rfl)
+      · exact Or.inl hxs
+      · exact Or.inr (Or.inr hys)
+    · rintro (hxs | (rfl | hys))
+      · exact Or.inl (Or.inr hxs)
+      · exact Or.inl (Or.inl rfl)
+      · exact Or.inr hys
+
+private theorem unionUniqueNat_nodup :
+    ∀ (ys xs : List Nat), xs.Nodup → (unionUniqueNat xs ys).Nodup
+  | [], _, h => h
+  | y :: ys, xs, h => unionUniqueNat_nodup ys (addUniqueNat xs y) (addUniqueNat_nodup h y)
+
+private theorem unionUniqueNat_length_ge :
+    ∀ (ys xs : List Nat), xs.length ≤ (unionUniqueNat xs ys).length
+  | [], _ => Nat.le_refl _
+  | y :: ys, xs =>
+    Nat.le_trans (addUniqueNat_length_ge xs y) (unionUniqueNat_length_ge ys (addUniqueNat xs y))
+
+private theorem mem_reachableStep_fold (body : CapturedMir) :
+    ∀ (work acc : List BasicBlockIdx) (z : BasicBlockIdx),
+      z ∈ work.foldl (fun a bb => unionUniqueNat a (blockSuccessors body bb)) acc ↔
+        z ∈ acc ∨ ∃ u, u ∈ work ∧ z ∈ blockSuccessors body u
+  | [], acc, z => by simp
+  | w :: ws, acc, z => by
+    simp only [List.foldl_cons]
+    rw [mem_reachableStep_fold body ws (unionUniqueNat acc (blockSuccessors body w)) z,
+      mem_unionUniqueNat_iff]
+    constructor
+    · rintro ((hz | hSucc) | ⟨u, hu, hSucc⟩)
+      · exact Or.inl hz
+      · exact Or.inr ⟨w, List.mem_cons_self, hSucc⟩
+      · exact Or.inr ⟨u, List.mem_cons_of_mem w hu, hSucc⟩
+    · rintro (hz | ⟨u, hu, hSucc⟩)
+      · exact Or.inl (Or.inl hz)
+      · rcases List.mem_cons.1 hu with rfl | hu'
+        · exact Or.inl (Or.inr hSucc)
+        · exact Or.inr ⟨u, hu', hSucc⟩
+
+private theorem reachableStep_fold_nodup (body : CapturedMir) :
+    ∀ (work acc : List BasicBlockIdx),
+      acc.Nodup → (work.foldl (fun a bb => unionUniqueNat a (blockSuccessors body bb)) acc).Nodup
+  | [], _, h => h
+  | _ :: ws, acc, h =>
+    reachableStep_fold_nodup body ws _ (unionUniqueNat_nodup _ acc h)
+
+private theorem reachableStep_fold_length_ge (body : CapturedMir) :
+    ∀ (work acc : List BasicBlockIdx),
+      acc.length ≤ (work.foldl (fun a bb => unionUniqueNat a (blockSuccessors body bb)) acc).length
+  | [], _ => Nat.le_refl _
+  | _ :: ws, acc =>
+    Nat.le_trans (unionUniqueNat_length_ge _ acc) (reachableStep_fold_length_ge body ws _)
+
+private theorem mem_reachableStep_iff (body : CapturedMir) (visited : List BasicBlockIdx)
+    (z : BasicBlockIdx) :
+    z ∈ reachableStep body visited ↔
+      z ∈ visited ∨ ∃ u, u ∈ visited ∧ z ∈ blockSuccessors body u :=
+  mem_reachableStep_fold body visited visited z
+
+private theorem blockSuccessors_lt (body : CapturedMir) {u v : BasicBlockIdx}
+    (h : v ∈ blockSuccessors body u) : v < body.basicBlocks.length := by
+  unfold blockSuccessors at h
+  cases hG : Trusted.Sequence.get? body.basicBlocks u with
+  | none => rw [hG] at h; nomatch h
+  | some block =>
+    rw [hG] at h
+    have hF := (List.mem_filter.1 h).2
+    unfold Nat.blt at hF
+    exact Nat.le_of_ble_eq_true hF
+
+private theorem nodup_length_le_of_lt :
+    ∀ (N : Nat) (l : List Nat), l.Nodup → (∀ x, x ∈ l → x < N) → l.length ≤ N
+  | 0, [], _, _ => Nat.le_refl 0
+  | 0, x :: _, _, hLt => False.elim (Nat.not_lt_zero x (hLt x List.mem_cons_self))
+  | N + 1, l, hNd, hLt => by
+    by_cases hMem : N ∈ l
+    · have hEraseNd : (l.erase N).Nodup := hNd.erase N
+      have hEraseLt : ∀ x, x ∈ l.erase N → x < N := by
+        intro x hx
+        have hSub : x ∈ l := List.mem_of_mem_erase hx
+        have hNe : x ≠ N := fun hEq => by
+          subst hEq
+          exact (List.Nodup.not_mem_erase hNd) hx
+        exact Nat.lt_of_le_of_ne (Nat.le_of_lt_succ (hLt x hSub)) hNe
+      have hIH := nodup_length_le_of_lt N (l.erase N) hEraseNd hEraseLt
+      have hLen : (l.erase N).length + 1 = l.length := by
+        rw [List.length_erase_of_mem hMem]
+        exact Nat.sub_add_cancel (List.length_pos_of_mem hMem)
+      omega
+    · have hLtN : ∀ x, x ∈ l → x < N := fun x hx =>
+        Nat.lt_of_le_of_ne (Nat.le_of_lt_succ (hLt x hx)) (fun hEq => hMem (hEq ▸ hx))
+      exact Nat.le_trans (nodup_length_le_of_lt N l hNd hLtN) (Nat.le_succ N)
+
+private theorem list_subset_eq_length_mem :
+    ∀ (xs ys : List Nat), xs.Nodup → ys.Nodup →
+      (∀ x, x ∈ xs → x ∈ ys) → ys.length ≤ xs.length → ∀ y, y ∈ ys → y ∈ xs := by
+  intro xs ys hNdX hNdY hSub hLen y hy
+  by_cases hIn : y ∈ xs
+  · exact hIn
+  · exfalso
+    have hSub' : ∀ x, x ∈ xs → x ∈ ys.erase y := fun x hx =>
+      (List.mem_erase_of_ne (fun hEq => by subst hEq; exact hIn hx)).2 (hSub x hx)
+    have hLe : xs.length ≤ (ys.erase y).length := by
+      have hCard : ∀ (a b : List Nat), a.Nodup → (∀ x, x ∈ a → x ∈ b) → a.length ≤ b.length := by
+        intro a
+        induction a with
+        | nil => intro _ _ _; exact Nat.zero_le _
+        | cons hd tl ih =>
+          intro b hNdA hSubA
+          have ⟨hNotTl, hNdTl⟩ := List.nodup_cons.1 hNdA
+          have hHdB : hd ∈ b := hSubA hd List.mem_cons_self
+          have hTlSub : ∀ x, x ∈ tl → x ∈ b.erase hd := fun x hx =>
+            (List.mem_erase_of_ne (fun hEq => by subst hEq; exact hNotTl hx)).2
+              (hSubA x (List.mem_cons_of_mem hd hx))
+          have hTlLe := ih (b.erase hd) hNdTl hTlSub
+          have hBLen : (b.erase hd).length + 1 = b.length := by
+            rw [List.length_erase_of_mem hHdB]
+            exact Nat.sub_add_cancel (List.length_pos_of_mem hHdB)
+          simp only [List.length_cons]
+          omega
+      exact hCard xs (ys.erase y) hNdX hSub'
+    have hYLen : (ys.erase y).length + 1 = ys.length := by
+      rw [List.length_erase_of_mem hy]
+      exact Nat.sub_add_cancel (List.length_pos_of_mem hy)
+    omega
+
+private theorem reachableBlocksAux_sound (body : CapturedMir) :
+    ∀ (fuel : Nat) (visited : List BasicBlockIdx),
+      (∀ bb, bb ∈ visited → ReachableBlock body bb) →
+      ∀ bb, bb ∈ reachableBlocksAux body fuel visited → ReachableBlock body bb
+  | 0, visited, hVis, bb, hMem => hVis bb hMem
+  | n + 1, visited, hVis, bb, hMem => by
+    unfold reachableBlocksAux at hMem
+    dsimp only at hMem
+    split at hMem
+    · exact hVis bb hMem
+    · refine reachableBlocksAux_sound body n (reachableStep body visited) (fun x hx => ?_) bb hMem
+      rcases (mem_reachableStep_iff body visited x).1 hx with hOld | ⟨u, hu, hSucc⟩
+      · exact hVis x hOld
+      · exact .step (hVis u hu) hSucc
+
+private theorem reachableBlocksAux_closed (body : CapturedMir) :
+    ∀ (fuel : Nat) (visited : List BasicBlockIdx),
+      visited.Nodup →
+      (∀ x, x ∈ visited → x < body.basicBlocks.length) →
+      body.basicBlocks.length ≤ visited.length + fuel →
+      (∀ x, x ∈ visited → x ∈ reachableBlocksAux body fuel visited) ∧
+        (∀ u v, u ∈ reachableBlocksAux body fuel visited → v ∈ blockSuccessors body u →
+          v ∈ reachableBlocksAux body fuel visited)
+  | 0, visited, hNd, hLt, hFuel => by
+    refine ⟨fun x hx => hx, fun u v hu hSucc => ?_⟩
+    have hNextNd : (reachableStep body visited).Nodup :=
+      reachableStep_fold_nodup body visited visited hNd
+    have hNextLt : ∀ x, x ∈ reachableStep body visited → x < body.basicBlocks.length := by
+      intro x hx
+      rcases (mem_reachableStep_iff body visited x).1 hx with hOld | ⟨w, _, hS⟩
+      · exact hLt x hOld
+      · exact blockSuccessors_lt body hS
+    have hNextLe : (reachableStep body visited).length ≤ visited.length :=
+      Nat.le_trans (nodup_length_le_of_lt _ _ hNextNd hNextLt) (by omega)
+    have hVInNext : v ∈ reachableStep body visited :=
+      (mem_reachableStep_iff body visited v).2 (Or.inr ⟨u, hu, hSucc⟩)
+    exact list_subset_eq_length_mem visited (reachableStep body visited) hNd hNextNd
+      (fun x hx => (mem_reachableStep_iff body visited x).2 (Or.inl hx)) hNextLe v hVInNext
+  | n + 1, visited, hNd, hLt, hFuel => by
+    unfold reachableBlocksAux
+    dsimp only
+    have hNextNd : (reachableStep body visited).Nodup :=
+      reachableStep_fold_nodup body visited visited hNd
+    have hNextLt : ∀ x, x ∈ reachableStep body visited → x < body.basicBlocks.length := by
+      intro x hx
+      rcases (mem_reachableStep_iff body visited x).1 hx with hOld | ⟨w, _, hS⟩
+      · exact hLt x hOld
+      · exact blockSuccessors_lt body hS
+    have hNextGe : visited.length ≤ (reachableStep body visited).length :=
+      reachableStep_fold_length_ge body visited visited
+    cases hEq : Nat.beq (reachableStep body visited).length visited.length with
+    | true =>
+      simp only [↓reduceIte]
+      have hLenEq : (reachableStep body visited).length = visited.length :=
+        Nat.eq_of_beq_eq_true hEq
+      refine ⟨fun x hx => hx, fun u v hu hSucc => ?_⟩
+      have hVInNext : v ∈ reachableStep body visited :=
+        (mem_reachableStep_iff body visited v).2 (Or.inr ⟨u, hu, hSucc⟩)
+      exact list_subset_eq_length_mem visited (reachableStep body visited) hNd hNextNd
+        (fun x hx => (mem_reachableStep_iff body visited x).2 (Or.inl hx))
+        (Nat.le_of_eq hLenEq) v hVInNext
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      have hLenNe : (reachableStep body visited).length ≠ visited.length := fun hE => by
+        rw [hE, Nat.beq_refl] at hEq
+        nomatch hEq
+      have hStrict : visited.length + 1 ≤ (reachableStep body visited).length := by omega
+      have ⟨hSub, hCl⟩ := reachableBlocksAux_closed body n (reachableStep body visited)
+        hNextNd hNextLt (by omega)
+      exact ⟨fun x hx => hSub x ((mem_reachableStep_iff body visited x).2 (Or.inl hx)), hCl⟩
+
+/-- `reachableBlocks` decides inductive CFG reachability from block `0`. -/
+theorem mem_reachableBlocks_iff (body : CapturedMir) (bb : BasicBlockIdx) :
+    bb ∈ reachableBlocks body ↔ ReachableBlock body bb := by
+  unfold reachableBlocks
+  cases hBlocks : body.basicBlocks with
+  | nil =>
+    dsimp only
+    constructor
+    · intro h; nomatch h
+    · intro h
+      induction h with
+      | entry hPos => rw [hBlocks] at hPos; exact False.elim (Nat.not_lt_zero _ hPos)
+      | step _ _ ih => nomatch ih
+  | cons b0 rest =>
+    dsimp only
+    rw [← hBlocks]
+    have hLenPos : 0 < body.basicBlocks.length := by rw [hBlocks]; exact Nat.zero_lt_succ _
+    constructor
+    · intro hMem
+      refine reachableBlocksAux_sound body body.basicBlocks.length [0] (fun x hx => ?_) bb hMem
+      rcases List.mem_singleton.1 hx with rfl
+      exact .entry hLenPos
+    · intro hReach
+      have ⟨hSub, hCl⟩ := reachableBlocksAux_closed body body.basicBlocks.length [0]
+        (by simp)
+        (fun x hx => by rcases List.mem_singleton.1 hx with rfl; exact hLenPos)
+        (by omega)
+      induction hReach with
+      | entry _ => exact hSub 0 List.mem_cons_self
+      | step _ hSucc ih => exact hCl _ _ ih hSucc
+
+/-- Number of CFG-reachable basic blocks of `body` ending in a direct call to `targetDefPath`. -/
+def bodyReachableCallSiteCount (targetDefPath : DefPath) (body : CapturedMir) : Nat :=
+  (reachableBlocks body).countP (fun bb =>
+    match Trusted.Sequence.get? body.basicBlocks bb with
+    | .some block => terminatorCallsDefPath targetDefPath block.terminator
+    | .none => false)
+
+/-- Boolean check: `body` contains at least one CFG-reachable direct call to `targetDefPath`. -/
+def bodyReachableCallsDefPath (targetDefPath : DefPath) (body : CapturedMir) : Bool :=
+  (reachableBlocks body).any (fun bb =>
+    match Trusted.Sequence.get? body.basicBlocks bb with
+    | .some block => terminatorCallsDefPath targetDefPath block.terminator
+    | .none => false)
+
+/-- Propositional specification: `body` has a CFG-reachable direct call to `targetDefPath`. -/
+def BodyReachableCallsDefPath (targetDefPath : DefPath) (body : CapturedMir) : Prop :=
+  ∃ bb block, ReachableBlock body bb ∧
+    Trusted.Sequence.get? body.basicBlocks bb = .some block ∧
+    TerminatorCallsDefPath targetDefPath block.terminator
+
+/-- `bodyReachableCallsDefPath` decides `BodyReachableCallsDefPath`. -/
+theorem bodyReachableCallsDefPath_iff (targetDefPath : DefPath) (body : CapturedMir) :
+    bodyReachableCallsDefPath targetDefPath body = true ↔
+      BodyReachableCallsDefPath targetDefPath body := by
+  unfold bodyReachableCallsDefPath BodyReachableCallsDefPath
+  rw [List.any_eq_true]
+  constructor
+  · rintro ⟨bb, hMem, hCall⟩
+    cases hGet : Trusted.Sequence.get? body.basicBlocks bb with
+    | none => rw [hGet] at hCall; nomatch hCall
+    | some block =>
+      rw [hGet] at hCall
+      exact ⟨bb, block, (mem_reachableBlocks_iff body bb).1 hMem, hGet,
+        (terminatorCallsDefPath_iff _ _).1 hCall⟩
+  · rintro ⟨bb, block, hReach, hGet, hTerm⟩
+    refine ⟨bb, (mem_reachableBlocks_iff body bb).2 hReach, ?_⟩
+    rw [hGet]
+    exact (terminatorCallsDefPath_iff _ _).2 hTerm
+
+/-- A body has a reachable direct call iff its reachable call-site count is positive. -/
+theorem bodyReachableCallsDefPath_iff_count_pos (targetDefPath : DefPath) (body : CapturedMir) :
+    bodyReachableCallsDefPath targetDefPath body = true ↔
+      0 < bodyReachableCallSiteCount targetDefPath body := by
+  unfold bodyReachableCallsDefPath bodyReachableCallSiteCount
+  rw [List.any_eq_true, List.countP_pos_iff]
+
+private theorem mem_of_seq_get?_eq_some {α : Type} :
+    ∀ (xs : List α) (i : Nat) (a : α), Trusted.Sequence.get? xs i = .some a → a ∈ xs
+  | [], _, _, h => nomatch h
+  | x :: _, 0, a, h => by injection h with hEq; subst hEq; exact List.mem_cons_self
+  | x :: xs, i + 1, a, h => List.mem_cons_of_mem x (mem_of_seq_get?_eq_some xs i a h)
+
+/-- Any CFG-reachable direct call site is in particular a syntactic direct call site. -/
+theorem BodyReachableCallsDefPath.toBodyCallsDefPath {targetDefPath : DefPath}
+    {body : CapturedMir} (h : BodyReachableCallsDefPath targetDefPath body) :
+    BodyCallsDefPath targetDefPath body := by
+  obtain ⟨bb, block, _, hGet, hTerm⟩ := h
+  exact ⟨block, mem_of_seq_get?_eq_some body.basicBlocks bb block hGet, hTerm⟩
+
+/--
+CFG-reachable capture-level call-boundary guard: strengthens
+`CallBoundaryPreserved` by requiring at least one direct call to `targetDefPath`
+in a block CFG-reachable from `bb0` (defeating unreachable dead decoy blocks).
+-/
+structure ReachableCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (targetDefPath : DefPath) : Prop where
+  /-- The caller has at least one CFG-reachable direct call to the target. -/
+  reachableCallSite : BodyReachableCallsDefPath targetDefPath callerBody
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation of the caller or of a linked body dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `ReachableCallBoundaryPreserved`. -/
+def reachableCallBoundaryPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) : Bool :=
+  bodyReachableCallsDefPath targetDefPath callerBody &&
+    ((findCallee? callees targetDefPath).isNone &&
+      !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+        targetDefPath)
+
+/-- The checker decides `ReachableCallBoundaryPreserved`. -/
+theorem reachableCallBoundaryPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (targetDefPath : DefPath) :
+    reachableCallBoundaryPreserved callerBody callees targetDefPath = true ↔
+      ReachableCallBoundaryPreserved callerBody callees targetDefPath := by
+  unfold reachableCallBoundaryPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none]
+  exact ⟨fun ⟨h₁, h₂, h₃⟩ => ⟨(bodyReachableCallsDefPath_iff _ _).1 h₁, h₂, h₃⟩,
+    fun h => ⟨(bodyReachableCallsDefPath_iff _ _).2 h.reachableCallSite, h.notLinked,
+      h.noTraitImpl⟩⟩
+
+/-- `ReachableCallBoundaryPreserved` refines `CallBoundaryPreserved`. -/
+theorem ReachableCallBoundaryPreserved.toCallBoundaryPreserved {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath}
+    (h : ReachableCallBoundaryPreserved callerBody callees targetDefPath) :
+    CallBoundaryPreserved callerBody callees targetDefPath :=
+  ⟨h.reachableCallSite.toBodyCallsDefPath, h.notLinked, h.noTraitImpl⟩
+
+theorem ReachableCallBoundaryPreserved.calleeTableExcludes_init {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath}
+    (h : ReachableCallBoundaryPreserved callerBody callees targetDefPath) (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath :=
+  h.toCallBoundaryPreserved.calleeTableExcludes_init args
+
+theorem ReachableCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir} {targetDefPath : DefPath}
+    (h : ReachableCallBoundaryPreserved callerBody callees targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath :=
+  h.toCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil hNe args mem
+
+theorem not_reachableCallBoundaryPreserved_of_zero_reachable_sites {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath}
+    (hZero : bodyReachableCallSiteCount targetDefPath callerBody = 0) :
+    ¬ ReachableCallBoundaryPreserved callerBody callees targetDefPath := by
+  intro h
+  have hPos := (bodyReachableCallsDefPath_iff_count_pos _ _).1
+    ((bodyReachableCallsDefPath_iff _ _).2 h.reachableCallSite)
+  rw [hZero] at hPos
+  exact Nat.not_lt_zero 0 hPos
+
+/--
+Counted CFG-reachable capture-level call-boundary guard: pins the exact number
+of CFG-reachable direct call sites to `expectedSites`, defeating both partial
+inlining and unreachable dead-block decoys.
+-/
+structure ReachableCallSitesPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) (expectedSites : Nat) : Prop where
+  /-- Exact number of CFG-reachable direct call sites. -/
+  reachableSiteCount : bodyReachableCallSiteCount targetDefPath callerBody = expectedSites
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation of the caller or of a linked body dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `ReachableCallSitesPreserved`. -/
+def reachableCallSitesPreserved (callerBody : CapturedMir) (callees : List CapturedMir)
+    (targetDefPath : DefPath) (expectedSites : Nat) : Bool :=
+  Nat.beq (bodyReachableCallSiteCount targetDefPath callerBody) expectedSites &&
+    ((findCallee? callees targetDefPath).isNone &&
+      !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+        targetDefPath)
+
+/-- The checker decides `ReachableCallSitesPreserved`. -/
+theorem reachableCallSitesPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (targetDefPath : DefPath) (expectedSites : Nat) :
+    reachableCallSitesPreserved callerBody callees targetDefPath expectedSites = true ↔
+      ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites := by
+  unfold reachableCallSitesPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none]
+  exact ⟨fun ⟨h₁, h₂, h₃⟩ => ⟨Nat.eq_of_beq_eq_true h₁, h₂, h₃⟩,
+    fun h => ⟨h.reachableSiteCount ▸ Nat.beq_refl _, h.notLinked, h.noTraitImpl⟩⟩
+
+theorem ReachableCallSitesPreserved.toReachableCallBoundaryPreserved {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (h : ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites)
+    (hPos : 0 < expectedSites) :
+    ReachableCallBoundaryPreserved callerBody callees targetDefPath :=
+  ⟨(bodyReachableCallsDefPath_iff _ _).1
+      ((bodyReachableCallsDefPath_iff_count_pos _ _).2 (h.reachableSiteCount ▸ hPos)),
+    h.notLinked, h.noTraitImpl⟩
+
+theorem ReachableCallSitesPreserved.calleeTableExcludes_init {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (h : ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem ReachableCallSitesPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir} {targetDefPath : DefPath}
+    {expectedSites : Nat}
+    (h : ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem not_reachableCallSitesPreserved_of_count_ne {callerBody : CapturedMir}
+    {callees : List CapturedMir} {targetDefPath : DefPath} {expectedSites : Nat}
+    (hNe : bodyReachableCallSiteCount targetDefPath callerBody ≠ expectedSites) :
+    ¬ ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites :=
+  fun h => hNe h.reachableSiteCount
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 
