@@ -2063,6 +2063,200 @@ theorem passB3_sourceScanner_eval_init_and_hole_hardened :
     isOk (scan (chars! "def eval := 0\ndef reduce := 1\ndef init := 2\ndef xs := [init]\n@[simp] def init2 := 3\nattribute [simp] init")) = true := by
   decide +kernel
 
+/-! ## Pass `A3` hardening regressions -/
+
+def coeTailName : SymName := sn! "CoeTail"
+def coeTailMkName : SymName := sn! "CoeTail.mk"
+def coeHeadName : SymName := sn! "CoeHead"
+def coeHeadMkName : SymName := sn! "CoeHead.mk"
+def coeClsName : SymName := sn! "Coe"
+def coeClsMkName : SymName := sn! "Coe.mk"
+def memClsName : SymName := sn! "Membership"
+def memClsMkName : SymName := sn! "Membership.mk"
+def stdStreamName : SymName := sn! "Std.Stream"
+def stdStreamMkName : SymName := sn! "Std.Stream.mk"
+def stdSliceableName : SymName := sn! "Std.Rcc.Sliceable"
+def stdSliceableMkName : SymName := sn! "Std.Rcc.Sliceable.mk"
+def transClsName : SymName := sn! "Trans"
+def transClsMkName : SymName := sn! "Trans.mk"
+
+def mkBinClassDecls (cls mk : SymName) : List ConstantRecord := [
+  baseDecl cls (.inductDecl [mk]) (.pi natE (.pi natE (.sort 0))) initCore,
+  baseDecl mk (.ctorDecl cls)
+    (.pi natE (.pi natE (.app (.app (.const cls) (.bvar 1)) (.bvar 0)))) initCore]
+
+def mkTriClassDecls (cls mk : SymName) : List ConstantRecord := [
+  baseDecl cls (.inductDecl [mk]) (.pi natE (.pi natE (.pi natE (.sort 0)))) initCore,
+  baseDecl mk (.ctorDecl cls)
+    (.pi natE (.pi natE (.pi natE
+      (.app (.app (.app (.const cls) (.bvar 2)) (.bvar 1)) (.bvar 0))))) initCore]
+
+def mkSixClassDecls (cls mk : SymName) : List ConstantRecord := [
+  baseDecl cls (.inductDecl [mk])
+    (.pi natE (.pi natE (.pi natE (.pi natE (.pi natE (.pi natE (.sort 0))))))) initCore,
+  baseDecl mk (.ctorDecl cls)
+    (.pi natE (.pi natE (.pi natE (.pi natE (.pi natE (.pi natE
+      (.app (.app (.app (.app (.app (.app (.const cls)
+        (.bvar 5)) (.bvar 4)) (.bvar 3)) (.bvar 2)) (.bvar 1)) (.bvar 0)))))))) initCore]
+
+def a3ClassBaseDecls : List ConstantRecord :=
+  standardBaseDecls ++
+    mkBinClassDecls coeTailName coeTailMkName ++
+    mkBinClassDecls coeHeadName coeHeadMkName ++
+    mkBinClassDecls coeClsName coeClsMkName ++
+    mkBinClassDecls memClsName memClsMkName ++
+    mkBinClassDecls stdStreamName stdStreamMkName ++
+    mkTriClassDecls stdSliceableName stdSliceableMkName ++
+    mkSixClassDecls transClsName transClsMkName
+
+def a3InstPkg (cls : SymName) (ty val : ExprSkeleton) : PackageAuditInput :=
+  { baseEnv := a3ClassBaseDecls,
+    modules :=
+      [addExts (addConsts defsModule [localOutDecl, mkDef premInstName ty val])
+         [.instanceEntry premInstName cls false],
+       theoryModule, proofsModule, verifyModule],
+    verifyRoots := [verifiedName] }
+
+def commonDefsMod : SymName := sn! "Common.Defs"
+def constZeroName : SymName := sn! "Common.Defs.ConstZero"
+def commonAliasNatName : SymName := sn! "Common.Defs.AliasNat"
+def commonDefsModule : ModuleInventory :=
+  mkModule commonDefsMod .defsExempt
+    [mkDef constZeroName (.pi natE natE) (.lam natE (.natLit 0)),
+     mkDef commonAliasNatName (.sort 1) natE]
+    [sn! "Init"]
+
+/-- Exact `Init` and `Std` `outParam` / `semiOutParam` exclusion (`CoeTail` `0:SEMI,1:in`,
+`CoeHead` `0:in,1:SEMI`, `Coe`, `Membership`, `Trans` 6-ary `0..4:in,5:OUT`, multi-part
+`Std.Stream` and `Std.Rcc.Sliceable`) and environment-wide cross-module `.defnDecl`
+normalization (`Common.Defs.ConstZero localOut` and cross-module `coe` alias). -/
+theorem passA3_outparam_classes_and_cross_module_alias_hardened :
+    -- `CoeTail` (`0:SEMI, 1:in`): anchoring only in slot 0 rejected; anchoring in slot 1 accepted
+    failsWith (audit noSourceConfig (a3InstPkg coeTailName
+        (.app (.app (.const coeTailName) (.const localOutName)) (.natLit 0))
+        (.app (.app (.const coeTailMkName) (.const localOutName)) (.natLit 0))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (audit noSourceConfig (a3InstPkg coeTailName
+        (.app (.app (.const coeTailName) (.natLit 0)) (.const localOutName))
+        (.app (.app (.const coeTailMkName) (.natLit 0)) (.const localOutName)))) = true ∧
+    -- `CoeHead` (`0:in, 1:SEMI`): anchoring only in slot 1 rejected; anchoring in slot 0 accepted
+    failsWith (audit noSourceConfig (a3InstPkg coeHeadName
+        (.app (.app (.const coeHeadName) (.natLit 0)) (.const localOutName))
+        (.app (.app (.const coeHeadMkName) (.natLit 0)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (audit noSourceConfig (a3InstPkg coeHeadName
+        (.app (.app (.const coeHeadName) (.const localOutName)) (.natLit 0))
+        (.app (.app (.const coeHeadMkName) (.const localOutName)) (.natLit 0)))) = true ∧
+    -- `Coe` (`0:SEMI, 1:in`) and `Membership` (`0:OUT, 1:in`): slot 0 alone rejected
+    failsWith (audit noSourceConfig (a3InstPkg coeClsName
+        (.app (.app (.const coeClsName) (.const localOutName)) (.natLit 0))
+        (.app (.app (.const coeClsMkName) (.const localOutName)) (.natLit 0))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    failsWith (audit noSourceConfig (a3InstPkg memClsName
+        (.app (.app (.const memClsName) (.const localOutName)) (.natLit 0))
+        (.app (.app (.const memClsMkName) (.const localOutName)) (.natLit 0))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- multi-part `Std.Stream` (`0:in, 1:OUT`) and `Std.Rcc.Sliceable` (`0:in, 1..2:OUT`)
+    failsWith (audit noSourceConfig (a3InstPkg stdStreamName
+        (.app (.app (.const stdStreamName) (.natLit 0)) (.const localOutName))
+        (.app (.app (.const stdStreamMkName) (.natLit 0)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    failsWith (audit noSourceConfig (a3InstPkg stdSliceableName
+        (.app (.app (.app (.const stdSliceableName) (.natLit 0)) (.const localOutName)) (.const localOutName))
+        (.app (.app (.app (.const stdSliceableMkName) (.natLit 0)) (.const localOutName)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- `Trans` (`0..4:in, 5:OUT`): slot 5 alone rejected, slot 2 (`γ`) accepted
+    failsWith (audit noSourceConfig (a3InstPkg transClsName
+        (.app (.app (.app (.app (.app (.app (.const transClsName)
+          (.natLit 0)) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.const localOutName))
+        (.app (.app (.app (.app (.app (.app (.const transClsMkName)
+          (.natLit 0)) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.natLit 0)) (.const localOutName))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (audit noSourceConfig (a3InstPkg transClsName
+        (.app (.app (.app (.app (.app (.app (.const transClsName)
+          (.natLit 0)) (.natLit 0)) (.const localOutName)) (.natLit 0)) (.natLit 0)) (.natLit 0))
+        (.app (.app (.app (.app (.app (.app (.const transClsMkName)
+          (.natLit 0)) (.natLit 0)) (.const localOutName)) (.natLit 0)) (.natLit 0)) (.natLit 0))))
+      = true ∧
+    -- Cross-module `Common.Defs.ConstZero localOut` erasing local anchor upon unfolding
+    (let evilTerm : ExprSkeleton := .app (.const constZeroName) (.const localOutName)
+     failsWith (audit noSourceConfig
+         { baseEnv := standardBaseDecls,
+           modules :=
+             [commonDefsModule,
+              addImports (addExts (addConsts defsModule
+                [localOutDecl,
+                 mkDef premInstName (eqNat evilTerm evilTerm)
+                   (.app (.const SymName.eqReflName) evilTerm)])
+                [.instanceEntry premInstName (sn! "OfNat") false])
+                [{ module := commonDefsMod }],
+              theoryModule, proofsModule, verifyModule],
+           verifyRoots := [verifiedName] })
+       (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName)) = true ∧
+    -- Cross-module `def LocalAlias := Common.Defs.AliasNat` in `coeEntry`
+    failsWith (audit noSourceConfig
+        { baseEnv := standardBaseDecls,
+          modules :=
+            [commonDefsModule,
+             addImports (addExts (addConsts defsModule
+               [mkDef aliasNatName (.sort 1) (.const commonAliasNatName),
+                mkDef evilCoeName (.pi (.const aliasNatName) boolE)
+                  (.lam (.const aliasNatName) (c! "Bool.true"))])
+               [.coeEntry evilCoeName aliasNatName SymName.boolName])
+               [{ module := commonDefsMod }],
+             theoryModule, proofsModule, verifyModule],
+          verifyRoots := [verifiedName] })
+      (.forbiddenInstanceOrCoe defsMod "coe_between_imported_types" evilCoeName) = true := by
+  decide +kernel
+
+/-- Source scanner rejects `#`-glued forbidden keywords/identifiers (`0#ofReduceBool`,
+`0#trustCompiler`, `0#unsafe`, `#native_decide`, `#set_option`, `#[#builtin_term_elab]`)
+and fails closed on scoped symbol-ident quotes inside interpolation holes (`a ~m'}'`,
+`#check'}'`). -/
+theorem passA3_sourceScanner_hash_glue_and_hole_tilde_hardened :
+    flags (chars! "open Lean\ntheorem bad : True := by\n  first | exact absurd (0#ofReduceBool) | trivial")
+      "ofReduceBool" = true ∧
+    flags (chars! "open Lean\ndef sneak : Nat := (0#trustCompiler).toNat") "trustCompiler" = true ∧
+    flags (chars! "def x := 0#unsafe (0 : Nat)") "unsafe" = true ∧
+    flags (chars! "def s := s!\"{0#unsafe 0}\"") "unsafe" = true ∧
+    flags (chars! "theorem t : True := by #native_decide") "native_decide" = true ∧
+    flags (chars! "#set_option debug.skipKernelTC true") "debug.skipKernelTC" = true ∧
+    flags (chars! "@[#builtin_term_elab foo] def p := 0") "#builtin_term_elab" = true ∧
+    flags (chars! "@[#term_parser] def p := 0") "#term_parser" = true ∧
+    lexFails (chars! "import Std\nopen Std.HashMap\ndef sneak (a : Nat) : String := s!\"{(by first | exact absurd (a ~m'}') | exact (unsafe (0 : Nat)))}\"") = true ∧
+    lexFails (chars! "def sneak : String := s!\"{#check'}'}\"") = true ∧
+    lexFails (chars! "def sneak : String := s!\"{#eval2}\"") = true ∧
+    -- positive controls: `#check`, `#print`, `def eval`, `~~~x` in holes remain accepted
+    isOk (scan (chars! "#check Nat.succ\n#print axioms foo\ndef eval := 0\ndef reduce := 1\ndef f (x : Nat) (xs : Array Nat) (h : 0 < xs.size) := s!\"{~~~x + xs[0]'h}\"")) = true := by
+  decide +kernel
+
+/-- Malformed stdlib-rooted import names (`⟨["Std", ""]⟩`, `⟨["Init", "Foo.Bar"]⟩`),
+malformed `baseEnv` `originModule` claims, and anonymous or stdlib/core `scopedInstanceEntry`
+scopes are rejected. -/
+theorem passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected :
+    failsWith (audit noSourceConfig (pkgWithProofs
+        (addImports proofsModule [{ module := SymName.mk [chars! "Std", []] }])))
+      (.foreignImport proofsMod (SymName.mk [chars! "Std", []])) = true ∧
+    failsWith (audit noSourceConfig (pkgWithProofs
+        (addImports proofsModule [{ module := SymName.mk [chars! "Init", chars! "Foo.Bar"] }])))
+      (.foreignImport proofsMod (SymName.mk [chars! "Init", chars! "Foo.Bar"])) = true ∧
+    failsWith (audit noSourceConfig
+        { corePkg with baseEnv := standardBaseDecls ++
+            [baseDecl (sn! "BaseGhost") .axiomDecl trueE (SymName.mk [chars! "Init.Core"])] })
+      (.anonymousConstantName .anonymous) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName .anonymous]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (SymName.mk [[]])]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Init")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Std.HashMap")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName (sn! "Trusted.Core")]))
+      (.forbiddenInstanceOrCoe defsMod "invalid_instance_scope" instColorName) = true ∧
+    isOk (audit noSourceConfig (defsPkg [.scopedInstanceEntry instColorName colorName defsMod])) = true := by
+  decide +kernel
+
 /-! ## End-to-end instantiation on the clean package -/
 
 /-- The semantic soundness theorem applied to the clean package over the standard base
@@ -2464,5 +2658,17 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB3_sourceScanner_eval_init_and_hole_hardened' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passB3_sourceScanner_eval_init_and_hole_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA3_outparam_classes_and_cross_module_alias_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA3_outparam_classes_and_cross_module_alias_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA3_sourceScanner_hash_glue_and_hole_tilde_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA3_sourceScanner_hash_glue_and_hole_tilde_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA3_malformed_stdlib_import_and_scoped_instance_hygiene_rejected
 
 end Anneal.ReplayKeyAndTamperAuditTests
