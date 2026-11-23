@@ -3995,11 +3995,19 @@ CLOSURE_ADDR_EQ_MUTATOR_TOKENS = (
 # header line starting with one of these and carrying one of the two mutators'
 # tokens opens such an item (`fn __anneal_vt_driver_7(`,
 # `impl __AnnealVtableTrait7 for ...`, `mod __anneal_clos_7 {`), never a
-# `MIRI_CORPUS_MODULE_PREAMBLE` helper.
+# `MIRI_CORPUS_MODULE_PREAMBLE` helper. The other mutators add no items, so
+# their tokens never claim one (see `_indirect_mutator_for_item_header`).
 MIRI_MUTATOR_ITEM_HEADER_PREFIXES = ("fn ", "impl ", "trait ", "struct ", "mod ")
-MIRI_MUTATOR_ITEM_TOKENS = (
-    *VTABLE_FNPTR_MUTATOR_TOKENS,
-    *CLOSURE_ADDR_EQ_MUTATOR_TOKENS,
+# Prefixes of the sibling-level lines that open a `MIRI_CORPUS_MODULE_PREAMBLE`
+# item which is never an indirect-call mutator's (those are all private).
+MIRI_PREAMBLE_ITEM_HEADER_PREFIXES = (
+    "pub ",
+    "unsafe fn ",
+    "macro_rules! ",
+    "enum ",
+    "union ",
+    "const ",
+    "static ",
 )
 _TAIL_WRAPPER_TOKEN_RE = re.compile(r"\b__tail___miri_[A-Za-z0-9_]+\b")
 
@@ -4013,6 +4021,7 @@ def _strip_tail_wrapper_tokens(text: str) -> str:
     if "__tail___miri_" not in text:
         return text
     return _TAIL_WRAPPER_TOKEN_RE.sub("__tail_probe", text)
+
 
 ALL_MIRI_MUTATOR_TOKENS = (
     *RAW_PTR_OFFSET_MUTATOR_TOKENS,
@@ -4098,6 +4107,23 @@ def _candidate_fn_start_line_no(src_lines: list[str], finding: dict[str, Any]) -
     return last_cand_line
 
 
+def _indirect_mutator_for_item_header(header: str) -> str | None:
+    """Returns the indirect-call mutator whose private item `header` opens, or
+    `None` for any other item.
+
+    Only `VTableAndFnPtrMutator` and `ClosureAndAddrEqMutator` put items ahead of
+    the candidate function, so a header is matched against their tokens alone: a
+    token of another mutator on a private item's header (say `fn seed__sz_probe(`)
+    does not make that mutator, which may not even have run, the item's owner."""
+    for mutator_name, tokens in (
+        ("VTableAndFnPtrMutator", VTABLE_FNPTR_MUTATOR_TOKENS),
+        ("ClosureAndAddrEqMutator", CLOSURE_ADDR_EQ_MUTATOR_TOKENS),
+    ):
+        if any(tok in header for tok in tokens):
+            return mutator_name
+    return None
+
+
 def _enclosing_miri_mutator_item_owner(
     src_lines: list[str], line_no: int, cand_fn_start_line: int
 ) -> str | None:
@@ -4105,7 +4131,15 @@ def _enclosing_miri_mutator_item_owner(
     lies inside a private sibling-level item emitted ahead of the candidate function
     (such as a driver `fn`, a trait `impl` method whose body carries no mutator token,
     or `mod __anneal_clos_* { pub mod __ { pub fn eval_once... } }`), or `None` when
-    `line_no` lies inside a `MIRI_CORPUS_MODULE_PREAMBLE` item."""
+    `line_no` lies inside a `MIRI_CORPUS_MODULE_PREAMBLE` item.
+
+    The enclosing item is found by indentation, not by counting braces: a candidate
+    is `MIRI_CORPUS_MODULE_PREAMBLE` followed by `prettyplease` output, in which an
+    item's header (and the lines that close it or its wrapped signature) sits at the
+    candidate function's indentation and every line of its body is indented deeper.
+    A `{` or `}` inside a string, character literal, or comment therefore cannot
+    move the item boundary; `vtable_fnptr_mutator_tests.rs` ratchets this layout
+    for every item the two mutators emit."""
     if line_no < 1 or line_no >= cand_fn_start_line:
         return None
     cand_line = src_lines[cand_fn_start_line - 1]
@@ -4119,18 +4153,8 @@ def _enclosing_miri_mutator_item_owner(
         if indent > cand_indent:
             continue
         if stripped.startswith(MIRI_MUTATOR_ITEM_HEADER_PREFIXES):
-            return _mutator_for_fault_line(stripped)
-        if stripped.startswith(
-            (
-                "pub ",
-                "unsafe fn ",
-                "macro_rules! ",
-                "enum ",
-                "union ",
-                "const ",
-                "static ",
-            )
-        ):
+            return _indirect_mutator_for_item_header(stripped)
+        if stripped.startswith(MIRI_PREAMBLE_ITEM_HEADER_PREFIXES):
             return None
     return None
 

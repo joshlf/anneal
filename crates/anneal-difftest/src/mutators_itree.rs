@@ -1881,6 +1881,128 @@ impl<'ast> Visit<'ast> for ClosureFreeIdents {
     fn visit_item(&mut self, _node: &'ast Item) {}
 }
 
+/// Every trait method a candidate declares, wherever it declares it.
+///
+/// A trait `impl` applies to its type wherever the item sits: at the top
+/// level, in a block the evaluator never enters or has already left, in the
+/// body of a function that is never called, or after an early `return`. A
+/// reference that an `if` / `match` arm or an array element unsizes implicitly
+/// reaches a method call without a `&dyn Trait` marker (see
+/// `EvalRun::eval_method_call`), where native Rust still dispatches through the
+/// vtable. The methods visible from the caller's enclosing blocks therefore do
+/// not decide whether a trait method could be the callee; this census of the
+/// whole file does.
+#[derive(Debug, Default)]
+struct TraitMethodCensus {
+    /// Names of the default methods of every trait, by trait name.
+    defaults: BTreeMap<String, BTreeSet<String>>,
+    /// `(Self type name, trait name, method names)` of every trait `impl`. The
+    /// `Self` type name is `None` for a generic `impl` and for a `Self` type
+    /// that is not a plain path, either of which may apply to any type.
+    impls: Vec<(Option<String>, String, BTreeSet<String>)>,
+    /// Whether the candidate invokes or defines a macro, whose expansion may
+    /// declare trait `impl`s that `syn::Visit` cannot inspect.
+    has_macro: bool,
+}
+
+impl TraitMethodCensus {
+    /// Names of the traits that give a type named `ty_name` a method named
+    /// `method`, through a method of a trait `impl` or through a default
+    /// method of the implemented trait. Types and traits are matched by name,
+    /// so a name that two scopes declare counts for both.
+    fn providers(&self, ty_name: &str, method: &str) -> BTreeSet<&str> {
+        let mut out = BTreeSet::new();
+        for (self_name, trait_name, methods) in &self.impls {
+            let applies = match self_name {
+                Some(name) => name.as_str() == ty_name,
+                None => true,
+            };
+            let provides = methods.contains(method)
+                || self
+                    .defaults
+                    .get(trait_name)
+                    .is_some_and(|names| names.contains(method));
+            if applies && provides {
+                out.insert(trait_name.as_str());
+            }
+        }
+        out
+    }
+}
+
+impl<'ast> Visit<'ast> for TraitMethodCensus {
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let names = self.defaults.entry(node.ident.to_string()).or_default();
+        for item in &node.items {
+            if let syn::TraitItem::Fn(f) = item
+                && f.default.is_some()
+            {
+                names.insert(f.sig.ident.to_string());
+            }
+        }
+        visit::visit_item_trait(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if let Some((_, trait_path, _)) = &node.trait_
+            && let Some(trait_seg) = trait_path.segments.last()
+        {
+            let self_name = match node.self_ty.as_ref() {
+                Type::Path(tp) if tp.qself.is_none() && node.generics.params.is_empty() => {
+                    tp.path.segments.last().map(|seg| seg.ident.to_string())
+                }
+                _ => None,
+            };
+            let methods: BTreeSet<String> = node
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                    _ => None,
+                })
+                .collect();
+            self.impls.push((self_name, trait_seg.ident.to_string(), methods));
+        }
+        visit::visit_item_impl(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.has_macro = true;
+        visit::visit_macro(self, node);
+    }
+}
+
+/// Names of the `fn` and `struct` items that a candidate declares inside
+/// function bodies, at any depth.
+///
+/// The body of a nested `fn` or of a method sees the items of the blocks that
+/// enclose its own declaration, but the evaluator runs it in a fresh frame
+/// that indexes only the blocks of the body itself (a closure body, by
+/// contrast, runs with the items of the frame that created the closure). A
+/// name that such a frame resolves to a top-level item may therefore name a
+/// nested item instead whenever a nested item of that name exists.
+#[derive(Debug, Default)]
+struct NestedItemNames {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for NestedItemNames {
+    fn visit_block(&mut self, node: &'ast Block) {
+        for stmt in &node.stmts {
+            match stmt {
+                Stmt::Item(Item::Fn(f)) => {
+                    self.names.insert(f.sig.ident.to_string());
+                }
+                Stmt::Item(Item::Struct(st)) => {
+                    self.names.insert(st.ident.to_string());
+                }
+                _ => {}
+            }
+        }
+        visit::visit_block(self, node);
+    }
+}
+
 /// Root-function event predicted by [`ItreeConcreteEvaluator`], the evaluator-side
 /// analogue of the native harness's `RecordedEvent` (boundary calls carry the same
 /// little-endian `raw_args` / `raw_ret` encoding).
@@ -1974,6 +2096,9 @@ pub struct ItreeConcreteEvaluator {
     fns: BTreeMap<String, usize>,
     structs: BTreeMap<String, Vec<(String, EvalTy)>>,
     branch_sites: BTreeMap<usize, u32>,
+    trait_census: TraitMethodCensus,
+    /// See [`NestedItemNames`].
+    nested_item_names: BTreeSet<String>,
 }
 
 impl ItreeConcreteEvaluator {
@@ -2002,12 +2127,18 @@ impl ItreeConcreteEvaluator {
         let Some(&root_idx) = fns.get(root_fn_name) else {
             return Err(format!("root function `{root_fn_name}` not found"));
         };
+        let mut trait_census = TraitMethodCensus::default();
+        trait_census.visit_file(&file);
+        let mut nested_items = NestedItemNames::default();
+        nested_items.visit_file(&file);
         let mut evaluator = Self {
             file,
             root_fn_name: root_fn_name.to_string(),
             fns,
             structs,
             branch_sites: BTreeMap::new(),
+            trait_census,
+            nested_item_names: nested_items.names,
         };
         let mut collector = BranchSiteCollector::default();
         if let Item::Fn(root) = &evaluator.file.items[root_idx] {
@@ -2553,6 +2684,14 @@ impl<'a> EvalRun<'a> {
                         }
                     }
                 }
+                // A trait declares signatures only; `TraitMethodCensus`
+                // accounts for the default methods it may also carry.
+                Stmt::Item(Item::Trait(_)) => {}
+                // Any other item (`use`, `const`, `static`, `mod`, ...) is
+                // in scope throughout the block, before its own statement
+                // and past an early `return` alike, so it is rejected when
+                // the block is entered rather than when it is reached.
+                Stmt::Item(_) => return eval_unsupported("nested item"),
                 _ => {}
             }
         }
@@ -2574,20 +2713,8 @@ impl<'a> EvalRun<'a> {
             last = EvalValue::Unit;
             match stmt {
                 Stmt::Local(loc) => self.eval_local(frame, loc)?,
-                // Declarations that `eval_block` indexed; a trait without default
-                // methods declares only signatures. Reject traits carrying default
-                // method bodies up front so an empty `impl Trait for T {}` cannot
-                // hide a trait method from `eval_method_call`'s inherent-vs-trait
-                // ambiguity check.
-                Stmt::Item(Item::Fn(_) | Item::Struct(_) | Item::Impl(_)) => {}
-                Stmt::Item(Item::Trait(tr)) => {
-                    if tr.items.iter().any(|item| {
-                        matches!(item, syn::TraitItem::Fn(f) if f.default.is_some())
-                    }) {
-                        return eval_unsupported("trait with a default method");
-                    }
-                }
-                Stmt::Item(_) => return eval_unsupported("nested item"),
+                // Declarations that `eval_block` checked and indexed on entry.
+                Stmt::Item(_) => {}
                 Stmt::Expr(e, semi) => {
                     let v = self.eval_expr(frame, e)?;
                     if semi.is_none() && i + 1 == stmts.len() {
@@ -3124,6 +3251,11 @@ impl<'a> EvalRun<'a> {
             .iter()
             .rev()
             .find_map(|structs| structs.get(&name).cloned());
+        // This frame may not index the nested struct that `name` refers to
+        // (see `NestedItemNames`).
+        if local_def.is_none() && self.ev.nested_item_names.contains(&name) {
+            return eval_unsupported(format!("struct `{name}` is also a nested item"));
+        }
         let Some(def) = local_def.or_else(|| self.ev.structs.get(&name).cloned()) else {
             return eval_unsupported(format!("unknown struct `{name}`"));
         };
@@ -3207,6 +3339,11 @@ impl<'a> EvalRun<'a> {
         let Some(f) = ev.top_fn(&name) else {
             return eval_unsupported(format!("unknown callee `{name}`"));
         };
+        // This frame may not index the nested function that `name` refers to
+        // (see `NestedItemNames`).
+        if ev.nested_item_names.contains(&name) {
+            return eval_unsupported(format!("callee `{name}` is also a nested item"));
+        }
         if name == ev.root_fn_name {
             return eval_unsupported("recursive call of the root function");
         }
@@ -3231,7 +3368,9 @@ impl<'a> EvalRun<'a> {
     /// (directly, or behind a reference such as a `&dyn Trait`): a `&dyn Trait`
     /// receiver dispatches strictly to `(Self, Some(Trait), method)`; a concrete
     /// receiver prefers an inherent `impl` and otherwise requires a unique
-    /// matching trait `impl` in scope.
+    /// matching trait `impl` in scope, and is rejected when
+    /// [`TraitMethodCensus`] shows that a trait declared anywhere in the
+    /// candidate could be the callee instead.
     fn eval_method_call(
         &mut self,
         frame: &mut EvalFrame<'a>,
@@ -3258,6 +3397,7 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("method call on a non-struct receiver");
         };
         let method_name = mc.method.to_string();
+        let census = &self.ev.trait_census;
         let method = if let Some(ref tr) = r.dyn_trait {
             let key = (ty_name.clone(), Some(tr.clone()), method_name.clone());
             frame
@@ -3278,15 +3418,11 @@ impl<'a> EvalRun<'a> {
                 // value, and an `as` cast). A reference that an `if` / `match`
                 // arm or an array element unsizes implicitly reaches here
                 // without `dyn_trait`, where native Rust dispatches through
-                // the vtable to the trait `impl`. When a trait `impl` of the
-                // receiver's type also defines this method, the inherent
-                // `impl` is therefore not known to be the callee.
-                let trait_also_defines = frame.local_methods.iter().any(|methods| {
-                    methods
-                        .keys()
-                        .any(|(s, tr, mn)| s == ty_name && tr.is_some() && mn == &method_name)
-                });
-                if trait_also_defines {
+                // the vtable to the trait `impl`. When any trait gives the
+                // receiver's type this method (through an `impl` anywhere in
+                // the candidate, a default method, or possibly a macro), the
+                // inherent `impl` is therefore not known to be the callee.
+                if census.has_macro || !census.providers(ty_name, &method_name).is_empty() {
                     return eval_unsupported(format!(
                         "method `{}` defined by both an inherent and a trait `impl`",
                         mc.method
@@ -3310,7 +3446,14 @@ impl<'a> EvalRun<'a> {
                         break;
                     }
                 }
-                if ambiguous { None } else { found }
+                // Likewise, a second trait that gives the type this method
+                // from outside the enclosing blocks may be the vtable that
+                // an implicitly unsized receiver dispatches through.
+                if ambiguous || census.providers(ty_name, &method_name).len() > 1 {
+                    None
+                } else {
+                    found
+                }
             }
         };
         let Some(method) = method else {
@@ -5688,6 +5831,130 @@ mod tests {
                 let left = if a < b { &both as &dyn Left } else { &other };
                 left.pick() ^ b
             }",
+            // The same default method when the trait is declared after an
+            // early `return`: an item is in scope throughout its block, so a
+            // statement that evaluation never reaches still decides the callee.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                return left.pick() ^ b;
+                trait Left { fn pick(&self) -> u32 { 1u32 } }
+            }",
+            // The same default method when the trait is a top-level item.
+            "pub trait Left { fn pick(&self) -> u32 { 1u32 } }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A trait `impl` applies to its type from inside a block that is
+            // never entered, where the evaluator indexes no method.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                if a == b {
+                    impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A generic `impl` gives every type the trait method, although it
+            // registers no method under the receiver's type name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                impl<T> Left for T { fn pick(&self) -> u32 { 1u32 } }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A macro may expand to such an `impl`, here after an early `return`
+            // that keeps the macro statement itself from being reached.
+            "macro_rules! hide {
+                () => { impl Left for Both { fn pick(&self) -> u32 { 1u32 } } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                return left.pick() ^ b;
+                hide!();
+            }",
+            // Without an inherent `impl`: the trait object that leaves the
+            // inner block dispatches to `Hidden::pick`, not to the one trait
+            // `impl` (`Shown`) that is still in scope at the call.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Shown { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Shown for Both { fn pick(&self) -> u32 { 7u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = {
+                    trait Hidden { fn pick(&self) -> u32; }
+                    impl Hidden for Both { fn pick(&self) -> u32 { self.v } }
+                    if a < b { &both as &dyn Hidden } else { &other }
+                };
+                left.pick() ^ b
+            }",
+            // A `use` after an early `return` still renames the callee of the
+            // call before it (`first(a)` runs `second`).
+            "pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                return first(a) ^ b;
+                use self::second as first;
+            }",
+            // The body of a nested function sees the items of the block that
+            // declares it: `outer` calls the nested `helper`, not the top-level
+            // one, which is all that the fresh frame of `outer` can find.
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                fn outer(v: u32) -> u32 { helper(v) }
+                outer(a) ^ b
+            }",
+            // Likewise the body of a method.
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                struct Tag { k: u32 }
+                impl Tag { fn mix(&self, x: u32) -> u32 { self.k ^ helper(x) } }
+                let t = Tag { k: b & 0xFFu32 };
+                t.mix(a)
+            }",
+            // A closure that captures a `u32` by value is four bytes, but the
+            // evaluator computes no closure layout (a closure whose captures
+            // are all zero-sized is itself zero-sized), so the address of any
+            // closure is rejected rather than assumed distinct.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = move || cap;
+                let y: u32 = b;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { f() }
+            }",
+            // Nor does it report a closure's size: `size_of_val` is outside
+            // the subset, so a capturing closure is never said to be 0 bytes.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = move || cap;
+                (core::mem::size_of_val(&f) as u32) ^ f() ^ b
+            }",
         ];
         for probe in rejected {
             let source = format!("{probe}\n{ROOT}");
@@ -5697,6 +5964,57 @@ mod tests {
                 "evaluator must reject:\n{source}"
             );
         }
+    }
+
+    #[test]
+    fn trait_method_census_counts_trait_methods_at_any_depth() {
+        let file: File = syn::parse_str(
+            "pub trait Top { fn pick(&self) -> u32 { 1u32 } fn solid(&self) -> u32; }
+             pub fn probe(a: u32) -> u32 {
+                 struct Both { v: u32 }
+                 impl Both { fn own(&self) -> u32 { self.v } }
+                 impl Top for Both { fn solid(&self) -> u32 { 2u32 } }
+                 if a == 0u32 {
+                     trait Inner { fn deep(&self) -> u32; }
+                     impl Inner for Both { fn deep(&self) -> u32 { 3u32 } }
+                 }
+                 fn never() {
+                     trait Wide { fn any(&self) -> u32; }
+                     impl<T> Wide for T { fn any(&self) -> u32 { 4u32 } }
+                 }
+                 a
+             }",
+        )
+        .expect("parse census source");
+        let mut census = TraitMethodCensus::default();
+        census.visit_file(&file);
+        assert!(!census.has_macro);
+        let providers = |ty: &str, method: &str| -> Vec<String> {
+            census
+                .providers(ty, method)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        // A default method counts for every type that implements its trait.
+        assert_eq!(providers("Both", "pick"), ["Top"]);
+        assert_eq!(providers("Both", "solid"), ["Top"]);
+        // An `impl` in a block that may never be entered counts.
+        assert_eq!(providers("Both", "deep"), ["Inner"]);
+        // A generic `impl` in a function that is never called counts for
+        // every type.
+        assert_eq!(providers("Both", "any"), ["Wide"]);
+        assert_eq!(providers("Other", "any"), ["Wide"]);
+        // Inherent methods and the trait methods of other types do not.
+        assert!(providers("Both", "own").is_empty());
+        assert!(providers("Other", "pick").is_empty());
+        assert!(providers("Other", "deep").is_empty());
+
+        let with_macro: File = syn::parse_str("pub fn probe(a: u32) -> u32 { hide!(); a }")
+            .expect("parse macro source");
+        let mut macro_census = TraitMethodCensus::default();
+        macro_census.visit_file(&with_macro);
+        assert!(macro_census.has_macro);
     }
 
     #[test]

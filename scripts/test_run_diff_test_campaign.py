@@ -4487,6 +4487,129 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
         self.assertEqual(campaign.extract_fault_line_text(finding), src_lines[6])
         self.assertEqual(campaign.infer_finding_cause(finding, set()), "pass_seed_tail_bug")
 
+    def test_enclosing_item_owner_ignores_braces_in_literals_and_wrapped_headers(self) -> None:
+        """`_enclosing_miri_mutator_item_owner` finds the enclosing item by
+        indentation, so a `{` or `}` inside a string, raw string, character literal,
+        or comment of an item body moves no item boundary, and a signature that
+        `prettyplease` wraps over several lines (whose closing `) -> bool {` line
+        starts no item) still leads to its `fn` header."""
+        src_lines = (
+            "pub fn helper_add_ten() -> u32 {",  # 1
+            "    10",  # 2
+            "}",  # 3
+            "impl Drop for UnwindCleanupGuard {",  # 4
+            "    fn drop(&mut self) {}",  # 5
+            "}",  # 6
+            "#[inline(never)]",  # 7
+            "fn __anneal_wide_slice_addr_eq_5(",  # 8
+            "    __clos_p: *const [u32],",  # 9
+            "    __clos_q: *const [u32],",  # 10
+            ") -> bool {",  # 11
+            '    let _text: &str = "}} fn { pub fn";',  # 12
+            "    let _open: char = '{';",  # 13
+            '    let _raw: &str = r#"} pub fn helper() {"#;',  # 14
+            "    // } pub fn commented_out() {",  # 15
+            "    (__clos_p as *const ()) == (__clos_q as *const ())",  # 16
+            "}",  # 17
+            "trait __AnnealVtableTrait7 {",  # 18
+            "    fn eval_vt(&self, x: u32) -> u32;",  # 19
+            "}",  # 20
+            "#[repr(C)]",  # 21
+            "struct __AnnealVtableReceiver7 {",  # 22
+            "    pub bias: u32,",  # 23
+            "}",  # 24
+            "impl __AnnealVtableTrait7 for __AnnealVtableReceiver7 {",  # 25
+            "    fn eval_vt(&self, x: u32) -> u32 {",  # 26
+            "        let _close: char = '}';",  # 27
+            "        x + 1u32",  # 28
+            "    }",  # 29
+            "}",  # 30
+            "pub fn pass_seed__b0_c0() -> u32 {",  # 31
+            "    let a: u32 = 10u32;",  # 32
+            "    let __tail___miri_vt_7: u32 = a + helper_add_ten();",  # 33
+            "    let __miri_vt_7: u32 = __anneal_vt_driver_7(a, 5u32);",  # 34
+            "    __tail___miri_vt_7 ^ (__miri_vt_7 as u32)",  # 35
+            "}",  # 36
+        )
+        lines = list(src_lines)
+        cand_start = 31
+        for line_nos, owner in (
+            (range(1, 7), None),  # `MIRI_CORPUS_MODULE_PREAMBLE` items
+            (range(8, 18), "ClosureAndAddrEqMutator"),  # wrapped header through `}`
+            (range(18, 21), "VTableAndFnPtrMutator"),  # `trait`
+            (range(22, 31), "VTableAndFnPtrMutator"),  # `struct` and `impl`
+            (range(31, 37), None),  # the candidate function itself
+        ):
+            for line_no in line_nos:
+                with self.subTest(line_no=line_no):
+                    self.assertEqual(
+                        campaign._enclosing_miri_mutator_item_owner(lines, line_no, cand_start),
+                        owner,
+                    )
+        # Tokenless body lines (one of them a lone `{` literal) reach their owner
+        # through the enclosing item whichever mutator ran first.
+        for line_no, owner in ((13, "ClosureAndAddrEqMutator"), (28, "VTableAndFnPtrMutator")):
+            for mutators in (
+                ["VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"],
+                ["ClosureAndAddrEqMutator", "VTableAndFnPtrMutator"],
+            ):
+                with self.subTest(line_no=line_no, mutators=mutators):
+                    finding = {
+                        "seed_name": "pass_seed",
+                        "fn_name": "pass_seed__b0_c0",
+                        "applied_mutators": mutators,
+                        "mutant_source": "\n".join(src_lines) + "\n",
+                        "miri_pos": f"src/lib.rs:{line_no}:9",
+                    }
+                    self.assertEqual(
+                        campaign.extract_fault_line_text(finding), src_lines[line_no - 1]
+                    )
+                    self.assertEqual(campaign.infer_finding_cause(finding, set()), owner)
+
+    def test_item_header_token_of_a_mutator_that_adds_no_items_claims_no_item(self) -> None:
+        """Only the two indirect-call mutators put items ahead of the candidate
+        function. A private item whose header happens to carry another mutator's
+        token (`__sz` is `ArithmeticCastMutator`'s) is nobody's mutator item: a
+        fault inside it is not attributed to a mutator that never ran."""
+        src_lines = (
+            "fn seed_layout__sz(x: u32) -> u32 {",  # 1
+            "    x + 1u32",  # 2
+            "}",  # 3
+            "pub fn pass_seed__b0_c0() -> u32 {",  # 4
+            "    let a: u32 = u32::MAX;",  # 5
+            "    let __miri_vt_7: u32 = __anneal_vt_driver_7(a, 5u32);",  # 6
+            "    a ^ (__miri_vt_7 as u32)",  # 7
+            "}",  # 8
+        )
+        self.assertIsNone(campaign._indirect_mutator_for_item_header(src_lines[0]))
+        self.assertIsNone(campaign._enclosing_miri_mutator_item_owner(list(src_lines), 2, 4))
+        for header, owner in (
+            ("fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {", "VTableAndFnPtrMutator"),
+            ("fn __anneal_fnptr_callee_7(__vt_v: u32) -> u32 {", "VTableAndFnPtrMutator"),
+            ("fn __anneal_fnptr_alt_7(__vt_v: u32) -> u32 {", "VTableAndFnPtrMutator"),
+            ("trait __AnnealVtableAlt7 {", "VTableAndFnPtrMutator"),
+            ("struct __AnnealVtableAltReceiver7 {", "VTableAndFnPtrMutator"),
+            ("impl __AnnealVtableAlt7 for __AnnealVtableReceiver7 {", "VTableAndFnPtrMutator"),
+            ("fn __anneal_clos_driver_5(__clos_seed: u32, __clos_bias: u32) -> u32 {", "ClosureAndAddrEqMutator"),
+            ("fn __anneal_wide_slice_addr_eq_5(", "ClosureAndAddrEqMutator"),
+            ("mod __anneal_clos_5 {", "ClosureAndAddrEqMutator"),
+            ("impl Drop for UnwindCleanupGuard {", None),
+        ):
+            with self.subTest(header=header):
+                self.assertTrue(header.startswith(campaign.MIRI_MUTATOR_ITEM_HEADER_PREFIXES))
+                self.assertFalse(header.startswith(campaign.MIRI_PREAMBLE_ITEM_HEADER_PREFIXES))
+                self.assertEqual(campaign._indirect_mutator_for_item_header(header), owner)
+        finding = {
+            "seed_name": "pass_seed",
+            "fn_name": "pass_seed__b0_c0",
+            "applied_mutators": ["VTableAndFnPtrMutator"],
+            "mutant_source": "\n".join(src_lines) + "\n",
+            "miri_pos": "src/lib.rs:2:5",
+        }
+        self.assertEqual(campaign.extract_fault_line_text(finding), src_lines[1])
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "VTableAndFnPtrMutator")
+        self.assertEqual(campaign.infer_finding_cause(finding, {"pass_seed"}), "pass_seed")
+
     def test_perturb_ast_prefix_probe_keeps_seed_fault_attribution(self) -> None:
         """A `PerturbAst` pass of an indirect-call mutator runs its driver as the
         first statement of an already-faulting seed. The seed's own fault after that

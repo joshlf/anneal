@@ -1317,6 +1317,119 @@ fn stacked_miri_indirect_passes_keep_distinct_items_and_compile() {
     }
 }
 
+/// Checks the source layout by which `scripts/run_diff_test_campaign.py`
+/// (`_enclosing_miri_mutator_item_owner`) attributes a fault inside an item
+/// that one pass of `mutator` puts ahead of the entry function.
+///
+/// The script finds the enclosing item by indentation. So every such item must
+/// be private, its header must start an unindented line with one of the five
+/// item keywords and carry a token of `own_tokens` (and none of
+/// `foreign_tokens`, which the script tests first), and every other unindented
+/// line ahead of the entry function must be an attribute or close an item or a
+/// wrapped signature. `expected_kinds` are the item keywords that the scanned
+/// PRNG seeds produce between them.
+fn assert_campaign_item_attribution_layout(
+    mutator: &dyn MiriAstMutator,
+    own_tokens: &[&str],
+    foreign_tokens: &[&str],
+    expected_kinds: &[&str],
+) {
+    // `MIRI_MUTATOR_ITEM_HEADER_PREFIXES` of the campaign script.
+    const ITEM_KEYWORDS: [&str; 5] = ["fn ", "impl ", "trait ", "struct ", "mod "];
+    const ENTRY: &str = "pub fn layout_seed(";
+    let mut kinds: BTreeSet<&str> = BTreeSet::new();
+    for mode in [
+        MutationMode::Pass,
+        MutationMode::Panic,
+        MutationMode::Ub,
+        MutationMode::PerturbAst,
+    ] {
+        for s in 0..TEMPLATE_SCAN_SEEDS {
+            let fn_source = miri_mutant_fn_source(mutator, mode, "layout_seed", s);
+            assert!(
+                fn_source.lines().any(|line| line.starts_with(ENTRY)),
+                "`{}` {mode:?} PRNG seed {s} lost the entry function:\n{fn_source}",
+                mutator.name()
+            );
+            let mut headers = 0usize;
+            for line in fn_source
+                .lines()
+                .take_while(|line| !line.starts_with(ENTRY))
+            {
+                // Blank lines, item bodies, attributes, and the lines that
+                // close an item or a wrapped signature.
+                if line.is_empty() || line.starts_with([' ', '#', '}', ')']) {
+                    continue;
+                }
+                let kind = ITEM_KEYWORDS
+                    .iter()
+                    .copied()
+                    .find(|keyword| line.starts_with(*keyword));
+                let Some(kind) = kind else {
+                    panic!(
+                        "`{}` {mode:?} PRNG seed {s} put a line that opens no private item \
+                         ahead of the entry function: `{line}`\n{fn_source}",
+                        mutator.name()
+                    );
+                };
+                assert!(
+                    own_tokens.iter().any(|tok| line.contains(*tok))
+                        && !foreign_tokens.iter().any(|tok| line.contains(*tok)),
+                    "`{}` {mode:?} PRNG seed {s}: the campaign script cannot attribute the \
+                     item header `{line}`\n{fn_source}",
+                    mutator.name()
+                );
+                kinds.insert(kind);
+                headers += 1;
+            }
+            assert!(
+                headers >= 1,
+                "`{}` {mode:?} PRNG seed {s} added no item:\n{fn_source}",
+                mutator.name()
+            );
+        }
+    }
+    assert_eq!(
+        kinds,
+        expected_kinds.iter().copied().collect::<BTreeSet<&str>>(),
+        "item kinds of `{}`",
+        mutator.name()
+    );
+}
+
+/// Every item of both Miri indirect-call mutators, in every mode, has the
+/// layout and the header tokens that the campaign script's fault attribution
+/// reads (`VTABLE_FNPTR_MUTATOR_TOKENS` and `CLOSURE_ADDR_EQ_MUTATOR_TOKENS`
+/// there).
+#[test]
+fn indirect_mutator_items_keep_the_campaign_attribution_layout() {
+    const VTABLE_TOKENS: [&str; 5] = [
+        "__miri_vt_",
+        "__anneal_vt_",
+        "__anneal_fnptr_",
+        "__AnnealVtable",
+        "__vt_",
+    ];
+    const CLOSURE_TOKENS: [&str; 4] = [
+        "__miri_clos_",
+        "__anneal_clos_",
+        "__anneal_wide_",
+        "__clos_",
+    ];
+    assert_campaign_item_attribution_layout(
+        &VTableAndFnPtrMutator,
+        &VTABLE_TOKENS,
+        &[],
+        &["fn ", "impl ", "struct ", "trait "],
+    );
+    assert_campaign_item_attribution_layout(
+        &ClosureAndAddrEqMutator,
+        &CLOSURE_TOKENS,
+        &VTABLE_TOKENS,
+        &["fn ", "mod "],
+    );
+}
+
 /// Whether `mutator` is one of the two Miri indirect-call mutators.
 fn is_indirect_miri_mutator(mutator: &str) -> bool {
     mutator == "VTableAndFnPtrMutator" || mutator == "ClosureAndAddrEqMutator"
