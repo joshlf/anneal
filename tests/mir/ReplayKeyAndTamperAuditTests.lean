@@ -967,8 +967,6 @@ theorem sourceScanner_lexer_desync_rejected :
     -- the documentation-comment opener consumes three characters
     flags (chars! "/--/ -/-- x\nset_option debug.skipKernelTC true in\ntheorem t : True := trivial\n-- -/\n")
       "debug.skipKernelTC" = true ∧
-    -- `<-` is one token
-    flags (chars! "def f := x <-- set_option debug.skipKernelTC true\n") "debug.skipKernelTC" = true ∧
     -- escaped identifier components
     flags (chars! "set_option «debug».skipKernelTC true in\ndef a := 1") "debug.skipKernelTC" = true ∧
     -- a backtick name literal is not a raw-string prefix
@@ -982,11 +980,6 @@ theorem sourceScanner_lexer_desync_rejected :
       "debug.skipKernelTC" = true ∧
     -- non-ASCII identifier characters carry primes too
     flags (chars! "def β' := 1\ndef s := β'\"\"\nset_option debug.skipKernelTC true in\ndef b := 1 --\"")
-      "debug.skipKernelTC" = true ∧
-    -- the tokens `//` and `\/` swallow the slash of a would-be block comment
-    flags (chars! "def T := { x : Int //-2 < x }\nset_option debug.skipKernelTC true in\ndef b := 1 -- -/")
-      "debug.skipKernelTC" = true ∧
-    flags (chars! "theorem t : a \\/- b\nset_option debug.skipKernelTC true in\ndef b := 1 -- -/")
       "debug.skipKernelTC" = true := by decide +kernel
 
 /-- Numeric literals and field indices end a token: a raw string or character literal may
@@ -1527,8 +1520,8 @@ theorem kernel_model_edges :
 
 /-! ## Pass `B1` hardening regressions -/
 
-/-- Core token `/\` before a block comment, token boundaries around `«...»` escaped
-identifiers, and dot-identifier `.r` before `"\""` (not a raw string). -/
+/-- Core token `/\` before a block comment and token boundaries around `«...»` escaped
+identifiers. (`.r` before a string moved to `passA1_token_boundary_desync_fails_closed`.) -/
 theorem passB1_lexer_and_guillemet_desync_rejected :
     flags (chars! "theorem t : True/\\/- \" -/True := ⟨trivial, trivial⟩\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
       "debug.skipKernelTC" = true ∧
@@ -1542,12 +1535,6 @@ theorem passB1_lexer_and_guillemet_desync_rejected :
       "run_cmd" = true ∧
     flags (chars! "def a := f«unsafe»") "unsafe" = true ∧
     flags (chars! "def a := r«unsafe»") "unsafe" = true ∧
-    flags (chars! "def x := .r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
-      "debug.skipKernelTC" = true ∧
-    flags (chars! "def f (s : S) := (s).r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
-      "debug.skipKernelTC" = true ∧
-    flags (chars! "def f (p : S × Nat) := p.1.r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
-      "debug.skipKernelTC" = true ∧
     flags (chars! "set_option «debug».«skipKernelTC» true in\ntheorem bad : False := trivial")
       "debug.skipKernelTC" = true ∧
     isOk (scan (chars! "theorem t : True/\\/- comment -/True := ⟨trivial, trivial⟩")) = true ∧
@@ -1652,6 +1639,74 @@ theorem passB1_provisional_native_fuel_and_interior_name_hardened :
       = false ∧
     allowReplayAxiom provisionalNoSource corePkg
       (mkAxiom (sn! "_native") (eqBoolTrue (c! "Bool.true"))) = false := by decide +kernel
+
+/-! ## Pass `A1` hardening regressions -/
+
+/-- Token boundaries the scanner cannot decide are errors. Every source that hides
+`set_option debug.skipKernelTC true` here was accepted by the scanner before this pass, and
+Lean 4.34.1 compiles the declaration after it as live code. `=` and `!=` never absorb a
+slash, so there the block comment is real and the option stays visible. -/
+theorem passA1_token_boundary_desync_fails_closed :
+    -- `<<<` or `=<<` and then a line comment, against `<`, `<-`, `-`: Lean 4.34.1 accepts both
+    lexFails (chars! "def f (a b : Nat) : Nat := a <<<-- \"\n  b\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def h (f : Nat → Option Nat) (x : Option Nat) : Option Nat := f =<<-- \"\n  x\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def f := x <-- set_option debug.skipKernelTC true\n") = true ∧
+    lexFails (chars! "def T := { x : Int //-2 < x }\nset_option debug.skipKernelTC true in\ndef b := 1 -- -/") = true ∧
+    lexFails (chars! "theorem t : a \\/- b\nset_option debug.skipKernelTC true in\ndef b := 1 -- -/") = true ∧
+    -- `#check` ends without a boundary, so a raw string or character literal may follow
+    lexFails (chars! "#checkr\"\\\" \nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "#check'\"'\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "#checkr#\"x\"#") = true ∧
+    lexFails (chars! "#eval2 + 2") = true ∧
+    lexFails (chars! "def r := 1\ndef a := r#check'\"'\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    -- scoped tokens of opened core namespaces: `#'`, `/.`, `~m`, `+1]`, `\math`, three backticks
+    lexFails (chars! "open BitVec\ntheorem t1 : True := by first | exact absurd (3#'\"' \") | trivial\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "open Rat\ntheorem t1 : True := by first | exact absurd (1 /.r\"\\\") | trivial\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "import Std\nopen Std.HashMap\ntheorem t1 : True := by first | exact absurd (a ~mr\"\\\") | trivial\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "open Int\ndef a := -[0+1]'x'") = true ∧
+    lexFails (chars! "def a := s \\math") = true ∧
+    lexFails (chars! "def a := ```x") = true ∧
+    -- after a dot, `r"` is raw (`1...r"…"`) or not (`(.r"…")`) depending on the parser
+    lexFails (chars! "theorem t1 : True := by first | exact absurd (1...r\"\\\") | trivial\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def x := .r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def f (s : S) := (s).r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def f (p : S × Nat) := p.1.r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") = true ∧
+    lexFails (chars! "def x := .r#\"x\"#") = true ∧
+    lexFails (chars! "def x := y //.r") = true ∧
+    flags (chars! "def k (a b : Nat) : Prop := a =/- \" -/ b\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"")
+      "debug.skipKernelTC" = true ∧
+    flags (chars! "def k (a b : Nat) : Bool := a !=/- \" -/ b\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"")
+      "debug.skipKernelTC" = true := by decide +kernel
+
+/-- Commands and attributes that add syntax, tokens, or macros are rejected even when
+`local`: `local notation "x\""` leaves no extension entry, yet makes `x"` a token, so the
+string that seems to follow it hides live code from the scanner. -/
+theorem passA1_syntax_extension_commands_rejected :
+    flags (chars! "local notation \"x\\\"\" => (0 : Nat)\ndef a : Nat := x\"\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- \"") "notation" = true ∧
+    flags (chars! "local infixl:65 \" +/- \" => Nat.add\ndef b : Nat := 1 +/- 2\nset_option debug.skipKernelTC true in\ntheorem bad : True := trivial -- -/") "infixl" = true ∧
+    flags (chars! "infix:50 \" ≈≈ \" => Eq") "infix" = true ∧
+    flags (chars! "scoped infixr:67 \" ::: \" => List.cons") "infixr" = true ∧
+    flags (chars! "prefix:max \"√\" => id") "prefix" = true ∧
+    flags (chars! "postfix:max \"!!\" => id") "postfix" = true ∧
+    flags (chars! "local syntax \"quux\" : term") "syntax" = true ∧
+    flags (chars! "local macro \"quux\" : term => `(0)") "macro" = true ∧
+    flags (chars! "macro_rules | `(quux) => `(0)") "macro_rules" = true ∧
+    flags (chars! "elab \"quux\" : term => pure x") "elab" = true ∧
+    flags (chars! "elab_rules : term | `(quux) => pure x") "elab_rules" = true ∧
+    flags (chars! "declare_syntax_cat quux") "declare_syntax_cat" = true ∧
+    flags (chars! "binder_predicate x \" ≺ \" y:term => `($x ≺ $y)") "binder_predicate" = true ∧
+    flags (chars! "@[local term_parser] def p := q") "term_parser" = true ∧
+    flags (chars! "attribute [local builtin_command_parser] p") "builtin_command_parser" = true ∧
+    flags (chars! "@[local macro k] def m := n") "macro" = true := by decide +kernel
+
+/-- No false positives from the new rules on ordinary code. -/
+theorem passA1_no_false_positive :
+    isOk (scan (chars! "#check Nat.succ\n#print axioms foo'\n#guard_msgs in\n#eval! f x\ndef v := #[1, 2] ++ #v[3].toArray")) = true ∧
+    isOk (scan (chars! "def a := x <<< 2 + (y >>> 1) - z\ndef f := do let x <- g; let y ← h x; pure (x, y) -- done")) = true ∧
+    isOk (scan (chars! "theorem t : (a <-> b) /\\ (c \\/ d) /\\ { x : Nat // x < 2 } = T := h -- note")) = true ∧
+    isOk (scan (chars! "def a := x.r + p.1.r + (· + ·) 1 2 + ~~~m + 5#8 + s \\ t + a / b /- c -/ + `Nat.succ")) = true ∧
+    isOk (scan (chars! "def prefixLen := 1\ndef x := xs.isPrefixOf ys && macroScopes.notations.syntaxTree.parser_state")) = true := by
+  decide +kernel
 
 /-! ## End-to-end instantiation on the clean package -/
 
@@ -1987,5 +2042,16 @@ axiom beyond the same three. -/
 #guard_msgs (whitespace := lax) in
 #print axioms passB1_provisional_native_fuel_and_interior_name_hardened
 
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA1_token_boundary_desync_fails_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA1_token_boundary_desync_fails_closed
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA1_syntax_extension_commands_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA1_syntax_extension_commands_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA1_no_false_positive' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA1_no_false_positive
 
 end Anneal.ReplayKeyAndTamperAuditTests

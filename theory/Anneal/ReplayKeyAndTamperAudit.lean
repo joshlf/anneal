@@ -138,6 +138,21 @@ def kwDecide : List Char := ['d', 'e', 'c', 'i', 'd', 'e']
 def kwNative : List Char := ['n', 'a', 't', 'i', 'v', 'e']
 def kwConfig : List Char := ['c', 'o', 'n', 'f', 'i', 'g']
 def kwDecideConfig : List Char := ['D', 'e', 'c', 'i', 'd', 'e', 'C', 'o', 'n', 'f', 'i', 'g']
+def kwNotation : List Char := ['n', 'o', 't', 'a', 't', 'i', 'o', 'n']
+def kwInfix : List Char := ['i', 'n', 'f', 'i', 'x']
+def kwInfixl : List Char := ['i', 'n', 'f', 'i', 'x', 'l']
+def kwInfixr : List Char := ['i', 'n', 'f', 'i', 'x', 'r']
+def kwPrefix : List Char := ['p', 'r', 'e', 'f', 'i', 'x']
+def kwPostfix : List Char := ['p', 'o', 's', 't', 'f', 'i', 'x']
+def kwSyntax : List Char := ['s', 'y', 'n', 't', 'a', 'x']
+def kwMacro : List Char := ['m', 'a', 'c', 'r', 'o']
+def kwMacroRules : List Char := ['m', 'a', 'c', 'r', 'o', '_', 'r', 'u', 'l', 'e', 's']
+def kwElab : List Char := ['e', 'l', 'a', 'b']
+def kwElabRules : List Char := ['e', 'l', 'a', 'b', '_', 'r', 'u', 'l', 'e', 's']
+def kwDeclareSyntaxCat : List Char := ['d', 'e', 'c', 'l', 'a', 'r', 'e', '_', 's', 'y', 'n', 't', 'a', 'x', '_', 'c', 'a', 't']
+def kwBinderPredicate : List Char := ['b', 'i', 'n', 'd', 'e', 'r', '_', 'p', 'r', 'e', 'd', 'i', 'c', 'a', 't', 'e']
+def parserSuffix : List Char := ['_', 'p', 'a', 'r', 's', 'e', 'r']
+def plusOneBracketTick : List Char := ['+', '1', ']', '\'']
 
 end Chars
 
@@ -3368,12 +3383,19 @@ forbidden options and keywords among the remaining tokens. The lexer rules it fo
 
 * A line comment (two dashes) or block comment (slash, dash) starts only at a token
   boundary; the documentation-comment openers (slash, dash, then a dash or `!`) consume
-  three characters; block comments nest. The core tokens `<-`, `//`, `/\`, and `\/`
-  swallow the character that would otherwise start a comment or another slash token.
+  three characters; block comments nest. Only the tokens `<-`, `//`, and `\/` end in the
+  first character of a comment opener, and whether one of them is the token there depends
+  on the tokens before it (`<<<` then a comment, but `<` `<-` `-`), so a comment opener
+  glued to `<`, `//`, or `\/` is an error.
 * `'` continues an identifier, belongs to the tokens `]'`, `×'`, `Σ'`, `⊕'`, or opens a
   character literal `'c'` / `'\…'`.
-* `r"…"` and `r#"…"#` are raw strings only at a token start: not inside an identifier,
-  after `.` (a dot-identifier uses `rawIdentFn`), or after a name-literal backtick.
+* `r"…"` and `r#"…"#` are raw strings only at a token start: not inside an identifier or
+  after a name-literal backtick. After `.` it depends on the parser (`x...r"…"` is raw,
+  `(.r"…")` is not), so that is an error.
+* A token that starts with a symbol may continue with letters and end without a boundary
+  (`#check`, and in an opened core namespace `~m`, `#'`, `/.`, `\math`, `+1]`): letters
+  glued to `#` or `~` may not contain `'` or a digit or touch a string, and `#'`, `/.`,
+  `+1]'`, a letter glued to `\`, and a doubled backtick are errors.
 * Numeric literals (`0x`, `0b`, `0o`, decimal, `_` separators, fractions, exponents) and
   field indices (`x.1`) end a token, so a raw string or character literal may follow.
 * `«…»` is an identifier component: delimiters dropped, content kept, and token
@@ -3382,8 +3404,10 @@ forbidden options and keywords among the remaining tokens. The lexer rules it fo
   scan, and anything there that could open another literal or comment is rejected.
 
 Whatever cannot be delimited with certainty is an error, never a pass, and so is input
-that ends inside a literal or block comment. The scanner assumes the core token table: a
-package that adds its own tokens is rejected by the extension audit instead. -/
+that ends inside a literal or block comment. The scanner assumes the token table of
+`Init`, `Std`, and `Lean` with any of their namespaces opened: commands and attributes
+that add tokens or macros, even locally, are rejected by the token scan, and persisted
+ones by the extension audit as well. -/
 
 namespace SourceScanner
 
@@ -3424,13 +3448,7 @@ def isHexDigit (c : Char) : Bool :=
 
 /-- What precedes the current character in code. -/
 inductive Prev where
-  | other
-  | ident
-  | identDot
-  | dot
-  | tick
-  | escIdent
-  | quoteTok
+  | other | ident | identDot | dot | tick | escIdent | quoteTok | sym | symIdent
   deriving DecidableEq
 
 inductive Radix where
@@ -3446,38 +3464,16 @@ def Radix.isDigit : Radix → Char → Bool
 
 inductive ScanState where
   | code (prev : Prev)
-  | dash
-  | slash
-  | lt
-  | bslash
-  | lineComment
-  | blockStart (depth : Nat)
-  | block (depth : Nat)
-  | blockDash (depth : Nat)
+  | dash | slash | slashAmb | lt | ltDash | bslash | dotR | lineComment
+  | blockStart (depth : Nat) | block (depth : Nat) | blockDash (depth : Nat)
   | blockSlash (depth : Nat)
-  | str
-  | strEsc
-  | hole (depth : Nat) (prevIdent : Bool)
-  | holeDash (depth : Nat)
-  | holeSlash (depth : Nat)
-  | chrOpen
-  | chrEsc
-  | chrEscN (remaining : Nat)
-  | chrEnd
-  | rawR
-  | rawHash (hashes : Nat)
-  | raw (hashes : Nat)
-  | rawEnd (hashes seen : Nat)
+  | str | strEsc
+  | hole (depth : Nat) (prevIdent : Bool) | holeDash (depth : Nat) | holeSlash (depth : Nat)
+  | chrOpen | chrEsc | chrEscN (remaining : Nat) | chrEnd
+  | rawR | rawHash (hashes : Nat) | raw (hashes : Nat) | rawEnd (hashes seen : Nat)
   | guillemet
-  | numZero
-  | numRadix (r : Radix)
-  | numDec
-  | numDot
-  | numFrac
-  | numExpStart
-  | numExpSign
-  | numExp
-  | fieldIdx
+  | numZero | numRadix (r : Radix) | numDec | numDot | numFrac | numExpStart | numExpSign
+  | numExp | fieldIdx
   deriving DecidableEq
 
 /-- One lexer step: the next state and the characters it makes visible. -/
@@ -3487,17 +3483,18 @@ abbrev StepResult := Except String (ScanState × List Char)
 def stepCode (prev : Prev) (c : Char) : StepResult :=
   let sep : List Char := if prev = .escIdent then [' '] else []
   if prev = .ident && isIdRest c then .ok (.code .ident, [visible c])
+  else if prev = .symIdent ∧ (isIdRest c ∨ c = '"' ∨ c = '#') then
+    if c = '\'' ∨ c = '"' ∨ c = '#' ∨ c.isDigit then .error "literal glued to a symbol keyword"
+    else .ok (.code .symIdent, [visible c])
+  else if prev = .sym ∧ c = '\'' then .error "quote glued to a symbol that may absorb it"
   else if isIdFirst c then
-    if c = 'r' ∧ (prev = .other ∨ prev = .escIdent ∨ prev = .quoteTok) then
+    if prev = .sym then .ok (.code .symIdent, [visible c])
+    else if c = 'r' ∧ (prev = .other ∨ prev = .escIdent ∨ prev = .quoteTok) then
       .ok (.rawR, sep)
+    else if c = 'r' ∧ prev = .dot then .ok (.dotR, [])
     else .ok (.code .ident, sep ++ [visible c])
   else if c = '.' then
-    .ok (.code (match prev with
-      | .ident => .identDot
-      | .escIdent => .identDot
-      | .other => .dot
-      | .quoteTok => .dot
-      | _ => .other), ['.'])
+    .ok (.code (if prev = .ident ∨ prev = .escIdent then .identDot else .dot), ['.'])
   else if c.isDigit then
     if prev = .identDot ∨ prev = .dot then .ok (.fieldIdx, [c])
     else if c = '0' then .ok (.numZero, sep ++ [c])
@@ -3505,7 +3502,8 @@ def stepCode (prev : Prev) (c : Char) : StepResult :=
   else if c = '"' then .ok (.str, [' '])
   else if c = '\'' then
     if prev = .quoteTok then .ok (.code .other, [' ']) else .ok (.chrOpen, [' '])
-  else if c = '`' then .ok (.code .tick, [' '])
+  else if c = '`' then
+    if prev = .tick then .error "doubled backtick" else .ok (.code .tick, [' '])
   else if c = '«' then .ok (.guillemet, if prev = .identDot ∨ prev = .dot then [] else [' '])
   else if c = '»' then .error "unmatched identifier escape"
   else if c = '-' then .ok (.dash, [' '])
@@ -3513,6 +3511,7 @@ def stepCode (prev : Prev) (c : Char) : StepResult :=
   else if c = '<' then .ok (.lt, [' '])
   else if c = '\\' then .ok (.bslash, [' '])
   else if c = ']' ∨ c = '×' ∨ c = 'Σ' ∨ c = '⊕' then .ok (.code .quoteTok, [' '])
+  else if c = '#' ∨ c = '~' then .ok (.code .sym, [' '])
   else .ok (.code .other, [' '])
 
 /-- A character inside a block comment at nesting `depth`. -/
@@ -3541,10 +3540,24 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
   | .dash => if c = '-' then .ok (.lineComment, []) else stepCode .other c
   | .slash =>
     if c = '-' then .ok (.blockStart 1, [])
-    else if c = '/' ∨ c = '\\' then .ok (.code .other, [])
+    else if c = '/' then .ok (.slashAmb, [])
+    else if c = '\\' then .ok (.code .other, [])
+    else if c = '.' then .error "slash glued to a dot"
     else stepCode .other c
-  | .lt => if c = '-' then .ok (.code .other, []) else stepCode .other c
-  | .bslash => if c = '/' then .ok (.code .other, []) else stepCode .other c
+  | .slashAmb =>
+    if c = '-' ∨ c = '.' then .error "comment opener or dot glued to a slash token"
+    else if c = '/' then .ok (.slashAmb, [])
+    else stepCode .other c
+  | .lt => if c = '-' then .ok (.ltDash, []) else stepCode .other c
+  | .ltDash =>
+    if c = '-' then .error "line comment opener glued to a left arrow" else stepCode .other c
+  | .bslash =>
+    if c = '/' then .ok (.slashAmb, [])
+    else if isIdFirst c then .error "identifier glued to a backslash"
+    else stepCode .other c
+  | .dotR =>
+    if c = '"' ∨ c = '#' then .error "raw string prefix after a dot"
+    else (stepCode .ident c).map (fun r => (r.1, 'r' :: r.2))
   | .lineComment => if c = '\n' then .ok (.code .other, []) else .ok (.lineComment, [])
   | .blockStart d => if c = '-' ∨ c = '!' then .ok (.block d, []) else .ok (stepBlock d c, [])
   | .block d => .ok (stepBlock d c, [])
@@ -3581,7 +3594,7 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
   | .rawHash n =>
     if c = '#' then .ok (.rawHash (n + 1), [])
     else if c = '"' then .ok (.raw n, [' '])
-    else (stepCode .other c).map (fun r => (r.1, 'r' :: ' ' :: r.2))
+    else (stepCode .sym c).map (fun r => (r.1, 'r' :: ' ' :: r.2))
   | .raw n =>
     if c = '"' then (if n = 0 then .ok (.code .other, []) else .ok (.rawEnd n 0, []))
     else .ok (.raw n, [])
@@ -3632,27 +3645,14 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
 
 /-- May the input end in this state? Never inside a literal, block comment, or escape. -/
 def lexTerminalOk : ScanState → Bool
-  | .code _ => true
-  | .dash => true
-  | .slash => true
-  | .lt => true
-  | .bslash => true
-  | .lineComment => true
-  | .rawR => true
-  | .rawHash _ => true
-  | .numZero => true
-  | .numRadix _ => true
-  | .numDec => true
-  | .numDot => true
-  | .numFrac => true
-  | .numExp => true
+  | .code _ | .dash | .slash | .slashAmb | .lt | .ltDash | .bslash | .dotR | .lineComment
+  | .rawR | .rawHash _ | .numZero | .numRadix _ | .numDec | .numDot | .numFrac | .numExp
   | .fieldIdx => true
   | _ => false
 
 /-- States that hold back an `r` not yet known to start a raw string. -/
 def holdsPendingR : ScanState → Bool
-  | .rawR => true
-  | .rawHash _ => true
+  | .rawR | .dotR | .rawHash _ => true
   | _ => false
 
 /-- Run the lexer; `acc` holds the visible code in reverse. -/
@@ -3666,8 +3666,15 @@ def lexAux : ScanState → List Char → List Char → Except String (List Char)
     | .error msg => .error msg
     | .ok (st', out) => lexAux st' rest (out.reverse ++ acc)
 
+/-- `pat` occurs somewhere in the text. -/
+def hasInfix (pat : List Char) : List Char → Bool
+  | [] => pat.isEmpty
+  | c :: rest => pat.isPrefixOf (c :: rest) || hasInfix pat rest
+
 /-- The code of a source text with comments and literal contents blanked out. -/
-def lexSource (src : List Char) : Except String (List Char) := lexAux (.code .other) src []
+def lexSource (src : List Char) : Except String (List Char) :=
+  if hasInfix Chars.plusOneBracketTick src then .error "quote glued to a successor bracket"
+  else lexAux (.code .other) src []
 
 def stripChars (src : List Char) : Except String (List Char) := lexSource src
 
@@ -3729,10 +3736,21 @@ def forbiddenOptionTokens : List (List Char) :=
 def metaExecTokens : List (List Char) :=
   [Chars.kwByElab, Chars.kwRunTac, Chars.kwRunCmd, Chars.kwRunMeta, Chars.kwRunElab]
 
+/-- Commands and attributes that add syntax, tokens, or macros, even `local` ones that
+leave no extension entry: the lexer rules above hold only for the core token table. -/
+def syntaxExtensionTokens : List (List Char) :=
+  [Chars.kwNotation, Chars.kwInfix, Chars.kwInfixl, Chars.kwInfixr, Chars.kwPrefix,
+   Chars.kwPostfix, Chars.kwSyntax, Chars.kwMacro, Chars.kwMacroRules, Chars.kwElab,
+   Chars.kwElabRules, Chars.kwDeclareSyntaxCat, Chars.kwBinderPredicate]
+
 def alwaysForbiddenTokens : List (List Char) :=
   [Chars.ofReduceBool, Chars.ofReduceNat, Chars.trustCompiler, Chars.reduceBool,
    Chars.reduceNat, Chars.kwNativeEqTrue, Chars.kwImplementedBy, Chars.kwExtern,
-   Chars.kwUnsafe, Chars.kwPartial] ++ metaExecTokens
+   Chars.kwUnsafe, Chars.kwPartial] ++ metaExecTokens ++ syntaxExtensionTokens
+
+/-- A token naming a parser attribute (`term_parser`, `builtin_command_parser`, …). -/
+def parserAttribute? (toks : List (List Char)) : Option (List Char) :=
+  toks.find? (fun t => (dotSegments t).any (fun seg => Chars.parserSuffix.isSuffixOf seg))
 
 /-- Tactics that add a `_native` axiom. -/
 def nativeTacticTokens : List (List Char) :=
@@ -3763,7 +3781,7 @@ def checkTokens (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     match firstKeyword? forbiddenOptionTokens toks with
     | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
     | none =>
-      match firstKeyword? alwaysForbiddenTokens toks with
+      match (firstKeyword? alwaysForbiddenTokens toks).or (parserAttribute? toks) with
       | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
       | none =>
         if cfg.allowProvisionalNative = true ∧ role = .proof then .ok ()
