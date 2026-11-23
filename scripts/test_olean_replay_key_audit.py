@@ -293,6 +293,40 @@ class TestFailClosedFilesystemStat(unittest.TestCase):
                 with self.assertRaises(audit.AuditOperationalError):
                     audit.stat_regular_fail_closed(p)
 
+    def test_symlink_or_fifo_ir_parts_raise_operational_error(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            proof_dir = p / "Proof"
+            proof_dir.mkdir()
+            (proof_dir / "WithIr.olean").write_bytes(b"placeholder")
+            real_ir = p / "real.ir"
+            real_ir.write_bytes(b"ir-bytes")
+            os.symlink(real_ir, proof_dir / "WithIr.ir.sig")
+            _, sysroot = audit.resolve_lean_toolchain()
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.precheck_olean_dirs_and_locate_modules(
+                    ["Proof.WithIr"], [p], sysroot, None
+                )
+            os.remove(proof_dir / "WithIr.ir.sig")
+            os.mkfifo(proof_dir / "WithIr.ir")
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.precheck_olean_dirs_and_locate_modules(
+                    ["Proof.WithIr"], [p], sysroot, None
+                )
+
+    def test_duplicate_target_module_rejected_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            proof_dir = p / "Proof"
+            proof_dir.mkdir()
+            (proof_dir / "Dup.olean").write_bytes(b"placeholder")
+            _, sysroot = audit.resolve_lean_toolchain()
+            with self.assertRaises(audit.AuditPolicyError) as ctx:
+                audit.precheck_olean_dirs_and_locate_modules(
+                    ["Proof.Dup", "Proof.Dup"], [p], sysroot, None
+                )
+            self.assertEqual(ctx.exception.category, "duplicateModuleName")
+
 
 class TestSourceScannerDefenseInDepth(unittest.TestCase):
     """Tests Episode 1-equivalent lexer desync, token glue, and header/option rules."""
@@ -327,11 +361,27 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ("private import Topic.Defs", "forbiddenImportModifier"),
             ('def s := s!"{«}"»}"', "unsupportedSourceLexing"),
             ('def x := xs[i+1]\'"proof"', "unsupportedSourceLexing"),
+            ('def s := s! "{show Nat from by native_decide}"', "forbiddenSourceOption"),
+            ('def s := s! /- comment -/ "{show Nat from by set_option debug.skipKernelTC true in exact 0}"', "forbiddenSourceOption"),
+            ('def s := «s!» "{show Nat from by native_decide}"', "forbiddenSourceOption"),
         ]
         for sample, expected_cat in bad_samples:
             with self.assertRaises(audit.AuditPolicyError, msg=sample) as ctx:
                 audit.scan_source_defense_in_depth("Proof.Bad", sample)
             self.assertEqual(ctx.exception.category, expected_cat)
+
+    def test_axiom_source_gating_for_assumptions_and_test_roles(self) -> None:
+        ax_src = "namespace Assumptions.Hw\naxiom mmioOk : True\nend Assumptions.Hw\n"
+        with self.assertRaises(audit.AuditPolicyError) as ctx:
+            audit.scan_source_defense_in_depth("Assumptions.Hw", ax_src, allow_assumptions=False)
+        self.assertEqual(ctx.exception.category, "forbiddenAxiom")
+        audit.scan_source_defense_in_depth("Assumptions.Hw", ax_src, allow_assumptions=True)
+
+        test_src = "namespace Topic.Tests\naxiom localOnly : True\nend Topic.Tests\n"
+        with self.assertRaises(audit.AuditPolicyError) as ctx2:
+            audit.scan_source_defense_in_depth("Topic.Tests", test_src, allow_local_test_axioms=False)
+        self.assertEqual(ctx2.exception.category, "forbiddenAxiom")
+        audit.scan_source_defense_in_depth("Topic.Tests", test_src, allow_local_test_axioms=True)
 
 
 class TestPatchSpecAndFixtureManifest(unittest.TestCase):
@@ -422,6 +472,103 @@ class TestPatchSpecAndFixtureManifest(unittest.TestCase):
         self.assertEqual(report["violations"], [])
         self.assertGreater(report["summary"]["replayed_declarations"], 3000)
         self.assertEqual(report["summary"]["reached_axioms"], [])
+
+
+class TestPassB1AdversarialRegressions(unittest.TestCase):
+    """Compiled Lean 4.34.1 `.olean` regressions for Pass B1 adversarial bypasses."""
+
+    def test_verify_binders_unlisted_multi_item_extensions_shadowing_and_source_dir(self) -> None:
+        lean_bin, sysroot = audit.resolve_lean_toolchain()
+        repo_olean = REPO_ROOT / ".lake" / "build" / "lib" / "lean"
+        with tempfile.TemporaryDirectory(prefix="anneal-b1-reg-") as td:
+            tmp = Path(td)
+            insp = audit.compile_lean_helper_binary(
+                lean_bin, audit.INSPECTOR_LEAN_SOURCE, "OleanReplayInspector", tmp, sysroot=sysroot
+            )
+            self.assertIsNotNone(insp)
+
+            jobs: list[tuple[Path, Path, Path, list[Path]]] = []
+            b1_dir = tmp / "b1_ext"
+            for rel, code in (
+                ("Proof/B1UnsafeTerm", "namespace Proof.B1UnsafeTerm\ndef sneaky : Nat := unsafe (0 : Nat)\nend Proof.B1UnsafeTerm\n"),
+                ("Proof/B1CbvEval", "namespace Proof.B1CbvEval\ndef f (x : Nat) : Nat := x\n@[cbv_eval] theorem f_eq (x : Nat) : f x = x := rfl\nend Proof.B1CbvEval\n"),
+                ("Proof/B1CbvOpaque", "namespace Proof.B1CbvOpaque\n@[cbv_opaque] def h (x : Nat) : Nat := x\nend Proof.B1CbvOpaque\n"),
+                ("Proof/Sub/B1ShadowNat", "namespace Proof.Sub.B1ShadowNat\ndef Nat : Type := Unit\nend Proof.Sub.B1ShadowNat\n"),
+                ("Topic/Proofs/Defs", "namespace Topic.Proofs.Defs\ntheorem spoof : True := True.intro\nend Topic.Proofs.Defs\n"),
+                ("Topic/B1Coe/Defs", "namespace Topic.B1Coe.Defs\ninductive DummyLocal | mk\n@[coe] def evilCoe (_ : DummyLocal) (n : Nat) : Bool := false\nend Topic.B1Coe.Defs\n"),
+            ):
+                s = b1_dir / f"{rel}.lean"
+                s.parent.mkdir(parents=True, exist_ok=True)
+                s.write_text(code, encoding="utf-8")
+                jobs.append((b1_dir, s, b1_dir / f"{rel}.olean", []))
+
+            pkg_pub15 = tmp / "pkg_pub15"
+            for rel, code in (
+                ("Topic/Defs", "module\nnamespace Topic.Defs\npublic inductive PubTag | mk\npublic instance pubInst : Inhabited PubTag := ⟨.mk⟩\nend Topic.Defs\n"),
+                ("Proof/ImpAllPub", "module\npublic import Topic.Defs\nimport all Topic.Defs\nnamespace Proof.ImpAllPub\npublic def x : Topic.Defs.PubTag := default\nend Proof.ImpAllPub\n"),
+            ):
+                s = pkg_pub15 / f"{rel}.lean"
+                s.parent.mkdir(parents=True, exist_ok=True)
+                s.write_text(code, encoding="utf-8")
+                jobs.append((pkg_pub15, s, pkg_pub15 / f"{rel}.olean", [pkg_pub15]))
+
+            pkg_v = tmp / "pkg_verify"
+            import shutil
+
+            shutil.copytree(audit.FIXTURES_DIR / "00_clean_positive_pkg", pkg_v)
+            v_deps = [pkg_v] + ([repo_olean] if repo_olean.is_dir() else [])
+            for rel in ("Topic/Defs", "Anneal/TheoryHelper", "Topic/Proofs", "Verify/Topic"):
+                jobs.append((pkg_v, pkg_v / f"{rel}.lean", pkg_v / f"{rel}.olean", v_deps))
+            for rel, code in (
+                ("Proof/B1ShadowTrusted", "import Trusted.VerificationResult\nnamespace Proof.B1ShadowTrusted\ndef VerificationResult.VerificationResult : Prop := True\nend Proof.B1ShadowTrusted\n"),
+                ("Verify/EvilForall", 'import Trusted.VerificationResult\nnamespace Verify.EvilForall\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "evil", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified (_ : False) :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "evil", mirDialect := "V1", items := [{ identity := id1, certificate := False }] } :=\n  False.elim ‹False›\nend Verify.EvilForall\n'),
+                ("Verify/OuterGood", 'import Trusted.VerificationResult\nimport Verify.Topic\nnamespace Verify.OuterGood\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "og", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "og", mirDialect := "V1", items := [{ identity := id1, certificate := True }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 True.intro\nend Verify.OuterGood\n'),
+                ("Proof/ProvHelper", "namespace Proof.ProvHelper\ntheorem provEq : 1 + 1 = 2 := by native_decide\nend Proof.ProvHelper\n"),
+                ("Verify/ItemProv", 'import Trusted.VerificationResult\nimport Proof.ProvHelper\nnamespace Verify.ItemProv\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "ip", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "ip", mirDialect := "V1", items := [{ identity := id1, certificate := 1 + 1 = 2 }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 Proof.ProvHelper.provEq\nend Verify.ItemProv\n'),
+            ):
+                s = pkg_v / f"{rel}.lean"
+                s.parent.mkdir(parents=True, exist_ok=True)
+                s.write_text(code, encoding="utf-8")
+                jobs.append((pkg_v, s, pkg_v / f"{rel}.olean", v_deps))
+
+            audit._compile_lean_jobs(lean_bin, tmp, jobs)
+
+            cases: list[tuple[str, bool, str | None, dict[str, object]]] = [
+                ("unsafe_term_only", False, "forbiddenInitOrCodegenHook", {"target_modules": ["Proof.B1UnsafeTerm"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("cbv_eval", False, "forbiddenMacroOrElab", {"target_modules": ["Proof.B1CbvEval"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("cbv_opaque", False, "forbiddenMacroOrElab", {"target_modules": ["Proof.B1CbvOpaque"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("len4_nat_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.Sub.B1ShadowNat"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("spoofed_defs", False, "spoofedExemptModule", {"target_modules": ["Topic.Proofs.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("coe_unused_binder", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B1Coe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
+                ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
+                ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
+                ("verify_unlisted_transitive", False, "invalidVerifyRoot", {"target_modules": ["Verify.OuterGood"], "olean_dirs": [pkg_v], "strict_proofs": True}),
+                ("verify_multi_item_isolated", True, None, {
+                    "target_modules": ["Verify.ItemProv", "Verify.Topic"],
+                    "olean_dirs": [pkg_v],
+                    "source_map_dir": pkg_v,
+                    "require_sources": True,
+                    "allow_provisional_native": True,
+                    "strict_proofs": True,
+                }),
+            ]
+            reps = audit.batch_audit_modules(
+                [c for (_, _, _, c) in cases],
+                lean_bin=lean_bin,
+                sysroot=sysroot,
+                stage_dir=tmp,
+                compiled_inspector=insp,
+                chunk_size=5,
+            )
+            for (cid, exp_ok, exp_cat, _), rep in zip(cases, reps):
+                self.assertEqual(rep["ok"], exp_ok, f"{cid}: {rep}")
+                if exp_cat is not None:
+                    self.assertEqual(rep["violations"][0]["category"], exp_cat, f"{cid}: {rep}")
+                elif cid == "verify_multi_item_isolated":
+                    by_mod = {it["module"]: it for it in rep["summary"]["items"]}
+                    self.assertEqual(by_mod["Verify.ItemProv"]["status"], "ProvisionalNative")
+                    self.assertEqual(by_mod["Verify.Topic"]["status"], "VerifiedUnconditional")
 
 
 if __name__ == "__main__":

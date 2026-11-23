@@ -89,10 +89,10 @@
       "id": "09_skip_kernel_tc",
       "file": "09_skip_kernel_tc.lean",
       "module": "Proof.Tamper09",
-      "mode": "compile",
+      "mode": "forge_skip_kernel_tc_ill_typed",
       "strict_proofs": true,
       "expected_ok": false,
-      "expected_category": "forbiddenSourceOption"
+      "expected_category": "kernelTypeError"
     },
     {
       "id": "10_implemented_by",

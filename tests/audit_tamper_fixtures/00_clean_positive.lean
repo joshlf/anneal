@@ -33,4 +33,9 @@ theorem mutualCleanA : True := True.intro
 theorem mutualCleanB : countdown 3 = 0 := rfl
 end
 
+mutual
+opaque mutualOpaqueA : Nat := 1
+opaque mutualOpaqueB : Nat := mutualOpaqueA
+end
+
 end Proof.CleanPositive

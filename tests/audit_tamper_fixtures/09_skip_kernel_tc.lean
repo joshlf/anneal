@@ -9,7 +9,7 @@
 -- @fixture_id: 09_skip_kernel_tc
 -- @module_name: Proof.Tamper09
 -- @expected_ok: false
--- @expected_category: forbiddenSourceOption
+-- @expected_category: kernelTypeError
 -- @tamper_mode: forge_module_data:skip_kernel_tc_and_ill_typed
 
 namespace Proof.Tamper09
