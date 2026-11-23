@@ -2410,6 +2410,81 @@ fn stateful_unwind_macros_with_explicit_abort_policy_and_fallible_wrappers() {
     );
 }
 
+#[test]
+fn kani5095_raw_ident_attrs_fn_body_inner_attrs_and_attribute_macro_args() {
+    use InlineBoundaryVerdict::*;
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+
+    // rustc resolves raw-identifier attribute paths to the same builtin
+    // (`#[r#inline(always)]` IS `#[inline(always)]`; the FIRST of duplicate
+    // inline attributes wins), so these must not slip past the scanner.
+    assert_eq!(
+        v("#[r#inline(always)]\n#[inline(never)] fn target() {}"),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(
+        v("#[r#cfg_attr(r#all(), inline(always))]\n#[inline(never)] fn target() {}"),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(
+        v("#[r#core::r#prelude::v1::r#inline(always)] #[inline(never)] fn target() {}"),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(v("#[r#inline]\nfn target() {}"), ForbiddenInlineHint);
+    assert_eq!(v("#[r#inline(r#never)] fn target() {}"), Verified);
+    assert_eq!(v("#[cfg_attr(r#all(), inline(never))] fn target() {}"), Verified);
+
+    // Inner attributes at the start of a function body apply to the function.
+    assert_eq!(
+        v("#[inline(never)] fn target() { #![inline(always)] }"),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(
+        v("#[inline(never)] fn target() -> u8 { #![allow(unused)] #![inline] 3 }"),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(v("fn target() -> u8 { #![inline(never)] 3 }"), Verified);
+    assert_eq!(
+        v("fn target() where [(); { 1 }]: Sized { # ! [cfg_attr(all(), inline(never))] }"),
+        Verified
+    );
+    assert_eq!(
+        v("fn target() { #![cfg_attr(test, inline(never))] }"),
+        ConditionalInlineNever
+    );
+    // Only *leading* inner attributes count; statement attributes do not.
+    assert_eq!(v("fn target() { #[inline(never)] let _x = 1; }"), MissingInlineNever);
+    assert_eq!(
+        v("fn g() { fn target() { #![inline(always)] } }\n#[inline(never)] fn target() {}"),
+        ForbiddenInlineHint
+    );
+    assert_eq!(
+        verify_fn_inline_never_source_with_options(
+            "#[inline] fn target() { #![inline(always)] }",
+            "target",
+            InlineScanOptions {
+                require_inline_never: false,
+                ..InlineScanOptions::default()
+            },
+        ),
+        ForbiddenInlineHint
+    );
+
+    // Attribute-macro arguments are token trees that may expand to items.
+    assert_eq!(
+        v("#[inline(never)] fn target() {}\n#[gen_items { fn target() {} }] struct S;"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("#![gen_items(fn target() {})]\n#[inline(never)] fn target() {}"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("#[gen_items { #[inline(never)] fn target() {} }] struct S;"),
+        Verified
+    );
+}
+
 // ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================

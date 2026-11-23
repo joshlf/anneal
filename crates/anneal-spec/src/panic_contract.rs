@@ -5497,7 +5497,7 @@ fn is_unconditional_cfg_pred(pred: &str) -> bool {
     let Ok(t0) = lex.next_token() else {
         return false;
     };
-    if t0.kind != TokenKind::Ident("all") {
+    if !matches!(t0.kind, TokenKind::Ident(id) if unraw(id) == "all") {
         return false;
     }
     let Ok(t1) = lex.next_token() else {
@@ -5529,8 +5529,20 @@ enum BuiltinAttrKind {
     Other,
 }
 
+/// Strips a raw-identifier `r#` prefix. Raw identifiers denote the same
+/// symbol, so rustc treats `#[r#inline(always)]` exactly like
+/// `#[inline(always)]` (and `#[inline(r#never)]` like `#[inline(never)]`).
+fn unraw(ident: &str) -> &str {
+    ident.strip_prefix("r#").unwrap_or(ident)
+}
+
 fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
-    match segments {
+    let mut norm: [&str; 4] = [""; 4];
+    let len = segments.len().min(norm.len());
+    for (dst, src) in norm.iter_mut().zip(segments) {
+        *dst = unraw(src);
+    }
+    match &norm[..len] {
         ["inline"] => BuiltinAttrKind::Inline,
         ["cfg_attr"] => BuiltinAttrKind::CfgAttr,
         ["core" | "std", "prelude", _, "inline"] => BuiltinAttrKind::Inline,
@@ -5654,15 +5666,19 @@ fn analyze_attr_meta_list(
                         if a1.kind != TokenKind::Eof {
                             summary.saw_forbidden_inline = true;
                         } else {
-                            match a0.kind {
-                                TokenKind::Ident("never") => {
+                            let arg = match a0.kind {
+                                TokenKind::Ident(id) => unraw(id),
+                                _ => "",
+                            };
+                            match arg {
+                                "never" => {
                                     if unconditional {
                                         summary.saw_unconditional_never = true;
                                     } else {
                                         summary.saw_conditional_never = true;
                                     }
                                 }
-                                TokenKind::Ident("always") => {
+                                "always" => {
                                     summary.saw_forbidden_inline = true;
                                 }
                                 _ => {
@@ -5862,6 +5878,12 @@ pub fn verify_fn_inline_never_source(source: &str, fn_name: &str) -> InlineBound
 ///
 /// A leading `#!` shebang line (not followed by `[`) is ignored, matching the
 /// Rust lexer.
+///
+/// Both layers treat leading inner attributes of a matched function's body
+/// (`fn target() { #![inline(always)] }`) as attributes of that function,
+/// resolve raw-identifier attribute paths (`#[r#inline(always)]`) like rustc
+/// does, and the deep layer also scans attribute-macro argument token trees
+/// (`#[gen { fn target() {} }]`).
 pub fn verify_fn_inline_never_source_with_options(
     source: &str,
     fn_name: &str,
@@ -6122,12 +6144,16 @@ fn structured_inline_scan(
 
                 // Advance past optional `-> RetTy` and `where ...` clause until
                 // body `{ ... }` or terminating `;`.
-                if skip_fn_signature_tail_and_body(&mut lex).is_err() {
-                    return InlineBoundaryVerdict::MalformedSource;
-                }
+                let body_inner = match skip_fn_signature_tail_and_body(&mut lex) {
+                    Ok(body) => body,
+                    Err(()) => return InlineBoundaryVerdict::MalformedSource,
+                };
 
                 if fn_ident_matches(ident, fn_name) {
                     *matched_count += 1;
+                    if let Some(body) = body_inner {
+                        merge_leading_inner_attrs(body, &mut pending);
+                    }
 
                     let in_trait = scope_len > 0 && scopes[scope_len - 1] == ScopeKind::Trait;
                     let in_generic_impl = scope_len > 0
@@ -6381,12 +6407,16 @@ fn deep_scan_slice(
                     let _ = lex.next_token()?;
                     let inner = lex.consume_balanced_inner(b'[')?;
                     analyze_attr_meta_list(inner, true, 0, &mut pending);
+                    // Attribute-macro arguments are arbitrary token trees that
+                    // may expand to items (`#[gen { fn target() {} }]`).
+                    deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
                 }
                 TokenKind::Punct(b'!') => {
                     let _ = lex.next_token()?;
                     if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                         let _ = lex.next_token()?;
-                        let _ = lex.consume_balanced_inner(b'[')?;
+                        let inner = lex.consume_balanced_inner(b'[')?;
+                        deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
                     }
                 }
                 // e.g. `quote! { #name }` interpolation inside a macro body.
@@ -6395,7 +6425,8 @@ fn deep_scan_slice(
             TokenKind::HashBang => {
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                     let _ = lex.next_token()?;
-                    let _ = lex.consume_balanced_inner(b'[')?;
+                    let inner = lex.consume_balanced_inner(b'[')?;
+                    deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
                 }
             }
             TokenKind::Punct(b'{') => {
@@ -6487,6 +6518,9 @@ fn deep_scan_slice(
                 }
                 if fn_ident_matches(name, fn_name) {
                     *occurrences += 1;
+                    if let Some(body) = peek_fn_body_inner(&lex)? {
+                        merge_leading_inner_attrs(body, &mut pending);
+                    }
                     let enclosing = if cur_depth > 0 {
                         stack[cur_depth - 1]
                     } else {
@@ -6527,6 +6561,64 @@ fn deep_scan_slice(
     }
 
     Ok(())
+}
+
+/// Merges inner attributes at the very start of a function body
+/// (`fn f() { #![inline(always)] ... }`) into `summary`. Rust applies such
+/// inner attributes to the function item itself, so they participate in the
+/// same missing / forbidden / conflicting `#[inline]` analysis as outer ones.
+fn merge_leading_inner_attrs(body_inner: &str, summary: &mut InlineAttrSummary) {
+    let mut lex = RustLexer::new(body_inner);
+    loop {
+        let Ok(tok) = lex.next_token() else {
+            summary.saw_malformed = true;
+            return;
+        };
+        let is_inner = match tok.kind {
+            TokenKind::HashBang => true,
+            TokenKind::Punct(b'#') => {
+                matches!(lex.next_token(), Ok(Token { kind: TokenKind::Punct(b'!'), .. }))
+            }
+            _ => false,
+        };
+        if !is_inner || !matches!(lex.next_token(), Ok(Token { kind: TokenKind::Punct(b'['), .. }))
+        {
+            return;
+        }
+        match lex.consume_balanced_inner(b'[') {
+            Ok(inner) => analyze_attr_meta_list(inner, true, 0, summary),
+            Err(()) => {
+                summary.saw_malformed = true;
+                return;
+            }
+        }
+    }
+}
+
+/// Non-consuming lookahead from just after a function's parameter list to
+/// its body: skips `-> Ret` / `where` tails (consuming nested `(..)`, `[..]`,
+/// `<..>` groups) and returns the body's inner slice, or `None` on `;`, `}`,
+/// or end of input (lenient inside macro token trees).
+fn peek_fn_body_inner<'a>(lex: &RustLexer<'a>) -> Result<Option<&'a str>, ()> {
+    let mut look = RustLexer {
+        src: lex.src,
+        bytes: lex.bytes,
+        pos: lex.pos,
+    };
+    loop {
+        let tok = look.next_token()?;
+        match tok.kind {
+            TokenKind::Eof | TokenKind::Punct(b';' | b'}') => return Ok(None),
+            TokenKind::Punct(b'{') => return look.consume_balanced_inner(b'{').map(Some),
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
+                let _ = look.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b'<') => {
+                let _ = look.consume_angle_inner()?;
+            }
+            _ => {}
+        }
+    }
 }
 
 fn skip_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
@@ -6581,15 +6673,18 @@ fn skip_type_decl(lex: &mut RustLexer<'_>) -> Result<(), ()> {
     }
 }
 
-fn skip_fn_signature_tail_and_body(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+/// Skips a function signature tail (`-> Ret`, `where ...`) and its body,
+/// returning the body's inner source slice (`None` for a `;`-terminated
+/// declaration).
+fn skip_fn_signature_tail_and_body<'a>(lex: &mut RustLexer<'a>) -> Result<Option<&'a str>, ()> {
     loop {
         let tok = lex.next_token()?;
         match tok.kind {
             TokenKind::Eof => return Err(()),
-            TokenKind::Punct(b';') => return Ok(()),
+            TokenKind::Punct(b';') => return Ok(None),
             TokenKind::Punct(b'{') => {
-                let _ = lex.consume_balanced_inner(b'{')?;
-                return Ok(());
+                let body = lex.consume_balanced_inner(b'{')?;
+                return Ok(Some(body));
             }
             TokenKind::Punct(p @ (b'(' | b'[')) => {
                 let _ = lex.consume_balanced_inner(p)?;
