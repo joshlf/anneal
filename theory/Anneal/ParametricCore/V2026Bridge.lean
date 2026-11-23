@@ -1392,7 +1392,15 @@ theorem mirWpConverges_stageCut_then_pureLift
 
 /-! ## 5. `ByteStoreOps` for `V2026_06_01` `Memory` & `SepLogicLenses.ByteMem` -/
 
-/-! ### 5A. `Memory.globals : List CapturedAllocation` (`Option UInt8`) -/
+/-! ### 5A. `Memory.globals : List CapturedAllocation` (`Option UInt8`)
+
+Architectural note on unmodified `V2026_06_01.MirSemantics`: the trusted
+operational semantics models read-only dereferences of global allocations
+(`evalGlobalDerefRead`) and does not mutate `Memory.globals` inside `stepMirFn`;
+live MIR mutable `&mut [u8]` slice writes target `Memory.callerLocals` via
+`evalCallerPlaceWrite` (Section 5C). `memGlobalsByteStoreOps` models mutable
+`CapturedAllocation` tables cleanly for `AlignedSubLens`, codec, and
+`WritePreserves` reasoning without introducing any shadow operational steps. -/
 
 /-- `AllocView` of a `V2026_06_01` `CapturedAllocation`: writable iff
 `mutability = .mut` (failing closed on immutable `static` allocations). -/
@@ -1983,7 +1991,29 @@ theorem byteMem_getVal_mirTypedByteCodec_iff_decode {layouts : LayoutTable}
       subst hEq
       exact ByteSubLens.getVal_of hLen hR hC
 
-/-! ### Global `CapturedAllocation` ↔ `AbstractByte` & `decodeValueFromBytes` -/
+/-- Writing a value through `ByteSubLens.setVal` with a `MirTypedByteCodec`
+establishes `SepLogicLenses.TypedAt` and writes the exact bytes produced by
+trusted `encodeValueToBytes`. -/
+theorem byteMem_setVal_mirTypedByteCodec_typedAt {layouts : LayoutTable}
+    {ty : Ty} {α : Type} {n : Nat}
+    (m : Anneal.PureLift.V2026_06_01Bridge.MirTypedByteCodec layouts ty α n)
+    (hPos : 0 < n) (bm bm' : Anneal.SepLogicLenses.ByteMem)
+    (L : ByteSubLens Unit) (hLen : L.len = n) (x : α)
+    (hSet : L.setVal (sliceCodecOfMirTypedByteCodec m) bm x = some bm') :
+    Anneal.SepLogicLenses.TypedAt m.codec L.offset x bm' ∧
+    L.get bm' = encodeValueToBytes defaultCodecFuel layouts ty (m.toValue x) := by
+  have hGetVal : L.getVal (sliceCodecOfMirTypedByteCodec m) bm' = some x :=
+    ByteSubLens.getVal_setVal hSet
+  have hTyped : Anneal.SepLogicLenses.TypedAt m.codec L.offset x bm' :=
+    (byteMem_getVal_iff_typedAt m.codec hPos bm' L hLen x).mp hGetVal
+  have hGet : L.get bm' = some ((sliceCodecOfMirTypedByteCodec m).enc x) :=
+    ByteSubLens.get_set hSet
+  have hEnc : encodeValueToBytes defaultCodecFuel layouts ty (m.toValue x) =
+      some ((sliceCodecOfMirTypedByteCodec m).enc x) :=
+    sliceCodecOfMirTypedByteCodec_enc_eq m x
+  exact ⟨hTyped, hGet.trans hEnc.symm⟩
+
+/-! ### Global `CapturedAllocation` ↔ `AbstractByte`, `encodeValueToBytes`, & `decodeValueFromBytes` -/
 
 /-- Convert a provenance-free `Option UInt8` byte to an `AbstractByte`. -/
 @[reducible] def optUInt8ToAbstractByte : Option UInt8 → AbstractByte
@@ -2060,15 +2090,48 @@ theorem sliceCodec_uint32_optUInt8_encode_eq (v : UInt32) :
       encodeLittleEndianBytes v.toNat 4 none :=
   toLeBytesAux_eq_encodeLittleEndianBytes 4 v.toNat
 
+/-- Trusted `encodeValueToBytes` at `u32` agrees with `SliceCodec.uint32`. -/
+theorem encodeValueToBytes_u32_eq_sliceCodec (layouts : LayoutTable)
+    (v : UInt32) (layoutIdx : Nat := 0) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .uint .u32, layoutIdx }
+        (.scalar ⟨v.toNat, 4⟩) =
+      some (((SliceCodec.uint32 optUInt8ByteCodec).enc v).map optUInt8ToAbstractByte) :=
+  congrArg some (sliceCodec_uint32_optUInt8_encode_eq v).symm
+
+/-- Trusted `encodeValueToBytes` at `bool` agrees with `SliceCodec.bool`. -/
+theorem encodeValueToBytes_bool_eq_sliceCodec (layouts : LayoutTable)
+    (b : Bool) (layoutIdx : Nat := 0) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .bool, layoutIdx }
+        (.scalar ⟨if b then 1 else 0, 1⟩) =
+      some (((SliceCodec.bool optUInt8ByteCodec).enc b).map optUInt8ToAbstractByte) := by
+  cases b <;> rfl
+
+/-- Trusted `encodeValueToBytes` at `u16` agrees with `SliceCodec.uint16`. -/
+theorem encodeValueToBytes_u16_eq_sliceCodec (layouts : LayoutTable)
+    (v : UInt16) (layoutIdx : Nat := 0) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .uint .u16, layoutIdx }
+        (.scalar ⟨v.toNat, 2⟩) =
+      some (((SliceCodec.uint16 optUInt8ByteCodec).enc v).map optUInt8ToAbstractByte) :=
+  congrArg some (toLeBytesAux_eq_encodeLittleEndianBytes 2 v.toNat).symm
+
+/-- Trusted `encodeValueToBytes` at `u64` agrees with `SliceCodec.uint64`. -/
+theorem encodeValueToBytes_u64_eq_sliceCodec (layouts : LayoutTable)
+    (v : UInt64) (layoutIdx : Nat := 0) :
+    encodeValueToBytes defaultCodecFuel layouts { kind := .uint .u64, layoutIdx }
+        (.scalar ⟨v.toNat, 8⟩) =
+      some (((SliceCodec.uint64 optUInt8ByteCodec).enc v).map optUInt8ToAbstractByte) :=
+  congrArg some (toLeBytesAux_eq_encodeLittleEndianBytes 8 v.toNat).symm
+
 /-- Decoding the `AbstractByte` image of `SliceCodec.uint32 optUInt8ByteCodec`
 through trusted `decodeValueFromBytes` recovers `Value.scalar ⟨v.toNat, 4⟩`. -/
 theorem decodeValueFromBytes_u32_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt32} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
     (hRelocs : alloc.relocations = [])
-    (hVal : L.getVal (SliceCodec.uint32 optUInt8ByteCodec) m = some v) :
+    (hVal : L.getVal (SliceCodec.uint32 optUInt8ByteCodec) m = some v)
+    (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
-      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u32, layoutIdx := 0 } bs =
+      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u32, layoutIdx } bs =
         some (.scalar ⟨v.toNat, 4⟩) := by
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint32 optUInt8ByteCodec).enc v :=
@@ -2087,9 +2150,10 @@ theorem decodeValueFromBytes_bool_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {b : Bool} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
     (hRelocs : alloc.relocations = [])
-    (hVal : L.getVal (SliceCodec.bool optUInt8ByteCodec) m = some b) :
+    (hVal : L.getVal (SliceCodec.bool optUInt8ByteCodec) m = some b)
+    (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
-      decodeValueFromBytes defaultCodecFuel layouts { kind := .bool, layoutIdx := 0 } bs =
+      decodeValueFromBytes defaultCodecFuel layouts { kind := .bool, layoutIdx } bs =
         some (.scalar ⟨if b then 1 else 0, 1⟩) := by
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.bool optUInt8ByteCodec).enc b :=
@@ -2105,9 +2169,10 @@ theorem decodeValueFromBytes_u16_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt16} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
     (hRelocs : alloc.relocations = [])
-    (hVal : L.getVal (SliceCodec.uint16 optUInt8ByteCodec) m = some v) :
+    (hVal : L.getVal (SliceCodec.uint16 optUInt8ByteCodec) m = some v)
+    (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
-      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u16, layoutIdx := 0 } bs =
+      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u16, layoutIdx } bs =
         some (.scalar ⟨v.toNat, 2⟩) := by
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint16 optUInt8ByteCodec).enc v :=
@@ -2129,9 +2194,10 @@ theorem decodeValueFromBytes_u64_of_getVal {m : Memory} {L : ByteSubLens Nat}
     {alloc : CapturedAllocation} {v : UInt64} (layouts : LayoutTable)
     (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
     (hRelocs : alloc.relocations = [])
-    (hVal : L.getVal (SliceCodec.uint64 optUInt8ByteCodec) m = some v) :
+    (hVal : L.getVal (SliceCodec.uint64 optUInt8ByteCodec) m = some v)
+    (layoutIdx : Nat := 0) :
     ∃ bs, globalAllocSliceToAbstractBytes alloc L.offset L.len = some bs ∧
-      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u64, layoutIdx := 0 } bs =
+      decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u64, layoutIdx } bs =
         some (.scalar ⟨v.toNat, 8⟩) := by
   rcases ByteSubLens.getVal_inv hVal with ⟨_, raw, hGet, hDec⟩
   have hRaw : raw = (SliceCodec.uint64 optUInt8ByteCodec).enc v :=
@@ -2652,6 +2718,41 @@ theorem mirWpConverges_of_mutSummaryOutcomeCut_ofSliceCodec
   refine MirWpConverges.mono (fun out hOut => ?_) (mirWpConverges_of_wpStateOk hWp)
   rcases mirNormalOutcomeExtract_eq_some_iff.mp hOut with ⟨rv, rfl, hV⟩
   exact ⟨hV, rfl⟩
+
+/-- **Sealed `MutSummaryOutcomeCut` → `Trusted.StatefulVerificationResult`**:
+discharges a panic-forbidding stateful verification certificate directly from a
+sealed `@[irreducible] MutSummaryOutcomeCut`, exposing both the exact mutated
+post-memory `m'` and universal disjoint-lens framing without re-stepping
+`c.body`. -/
+theorem verifyStatefulMirNoPanic_of_mutSummaryOutcomeCut {Addr Byte Arg Ret : Type}
+    [ops : ByteStoreOps Memory Addr Byte] [LawfulByteStoreOps Memory Addr Byte]
+    (c : StatefulClaim)
+    {entry : ByteSubLens Addr → Memory → Arg → MachineState}
+    {ofVal : Value → Option Ret} {sum : MutSummary Byte Arg Ret}
+    (hCut : MutSummaryOutcomeCut (wops := mirDetWpOps c.body) entry
+      (mirNormalOutcomeExtract ofVal) sum)
+    (hPre : ∀ (args : List Value) (mem : Memory), c.pre args mem →
+      ∃ L arg m' ret,
+        entry L mem arg =
+          Trusted.VerificationResult.initMachineStateWithMemoryAndCallees
+            c.body args mem c.callees ∧
+        execMutSummary sum L mem arg = some (m', ret) ∧
+        (∀ v, ofVal v = some ret →
+          (∀ other : ByteSubLens Addr, ByteSubLens.Disjoint Memory L other →
+            other.get m' = other.get mem) →
+          c.post args mem v m')) :
+    StatefulVerificationResult c := by
+  refine verifyStatefulMirNoPanic_of_wpConverges c fun args mem hP => ?_
+  rcases hPre args mem hP with ⟨L, arg, m', ret, hEntry, hExec, hPost⟩
+  rcases mirWpConverges_of_mutSummaryOutcomeCut hCut hExec with ⟨hConv, hFrame⟩
+  rw [← hEntry]
+  refine MirWpConverges.mono (fun out hOut => ?_) hConv
+  cases out with
+  | panic | abort => exact False.elim hOut
+  | normal p =>
+    rcases hOut with ⟨hV, hMem⟩
+    subst hMem
+    exact hPost p.1 hV hFrame
 
 /-- **Operational `MutSummaryCut` → `MirStepsConverges` / `MirWpConverges` bridge**:
 applies a relational `MutSummaryCut` sealed over `mirDetWpOps body`. -/

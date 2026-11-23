@@ -934,12 +934,38 @@ theorem canary1d_countDownChecked_verificationResult :
     | panic | abort => exact False.elim hOut
     | normal p => exact ⟨n, rfl, hOut.1⟩
 
-/-- Non-vacuity of the debug-mode overflow guards: if `_5` ever carried a set
-overflow flag, the real `Assert` terminator in `bb2` would `.panic`. The
-fuel-free proof above therefore genuinely discharges a live assertion. -/
+def countDownCheckedTotalClaim : TotalClaim where
+  body := countDownCheckedMirBody
+  callees := []
+  pre args mem := ∃ n : Nat, n < 2 ^ 32 ∧ args = [.scalar ⟨n, 4⟩] ∧ mem = {}
+  post args _ ret mem' := ∃ n : Nat, args = [.scalar ⟨n, 4⟩] ∧ ret = .scalar ⟨n, 4⟩ ∧ mem' = {}
+
+/-- **Trusted `TotalVerificationResult` (fuel-free termination + no-panic) for
+debug-mode `countDownCheckedMirBody`**, discharging both `SubWithOverflow` and
+`AddWithOverflow` guards for every `n < 2^32`. -/
+theorem canary1d_countDownChecked_totalVerificationResult :
+    TotalVerificationResult countDownCheckedTotalClaim :=
+  verifyTotalMir_of_wpStateOk countDownCheckedTotalClaim fun args mem ⟨n, hLt, hArgs, hMem⟩ => by
+    subst hArgs hMem
+    refine wpOutcome_mono (ops := mirDetWpOps countDownCheckedMirBody) ?_ (fun _ h => h)
+      (canary1d_countDownChecked_wpStateOk n hLt)
+    intro out hOut
+    cases out with
+    | panic | abort => exact False.elim hOut
+    | normal p => exact ⟨n, rfl, hOut.1, hOut.2⟩
+
+/-- Non-vacuity of the debug-mode `SubWithOverflow` guard: if `_5` ever carried
+a set overflow flag, the real `Assert` terminator in `bb2` would `.panic`. -/
 theorem canary1d_overflowAssert_live (n i acc : Nat) :
     Anneal.PureMirExec.mirStep countDownCheckedMirBody
       (cdcState 2 3 .uninit (u32S i) (u32S acc) .dead (ovfPair (2 ^ 32 - 1) 1) .dead n) =
+      .done .panic := rfl
+
+/-- Non-vacuity of the debug-mode `AddWithOverflow` guard: if `_6` ever carried
+a set overflow flag, the real `Assert` terminator in `bb3` would `.panic`. -/
+theorem canary1d_addOverflowAssert_live (n i acc : Nat) :
+    Anneal.PureMirExec.mirStep countDownCheckedMirBody
+      (cdcState 3 4 .uninit (u32S i) (u32S acc) .dead .dead (ovfPair 0 1) n) =
       .done .panic := rfl
 
 /-! ## 2. Canary 2 — 2-Stage Diamond CFG `StageCut` + `BlockTree` + Frame + `PureLift` -/
@@ -1458,6 +1484,138 @@ theorem canary2_diamond_verificationResult : VerificationResult diamond2StageCla
         | normal p => exact ⟨c1, c2, x, z, rfl, hOut⟩)
       (canary2_diamond_mirWpConverges c1 c2 x z hX)
 
+/-- `PureLift` `FlowPlan` lifting Stage 2 (`bb3 -> (bb4|bb5) -> bb6`) of
+`diamond2StageMirBody`: locals `0..4` correspond to MIR `_1.._5` (`c1, c2, x, z, acc`). -/
+def diamondStage2PurePlan : Anneal.PureLift.FlowPlan Anneal.PureLift.StdVal :=
+  .branch (.use (.localSub 1 []))
+    (.act (.assign (.localSub 4 [])
+      (.unary (fun v => match v with | .nat n => some (.nat (n + 1)) | _ => none)
+        (.localSub 4 []))))
+    (.act (.assign (.localSub 4 [])
+      (.unary (fun v => match v with | .nat n => some (.nat (n + 2)) | _ => none)
+        (.localSub 4 []))))
+
+/-- **Canary 2 (End-to-End `ParametricCore.StageCut` + `PureLift` Composition)**:
+Composes framed Stage 1 (`bb0 ↝ bb3`, sealed behind `@[irreducible] StageCut`
+with `_4 = z` framed via `stageCut_frame`) directly with Stage 2 (`bb3 ↝ bb6`)
+certified via real `PureLift` (`FlowPlan`, `evalFnValue`, `mirStateRel`,
+`MirReturnRel`, `LiftedMirPost`) through `V2026Bridge.mirWpConverges_stageCut_then_pureLift`
+for ALL symbolic `(c1 c2 : Bool)` and `(x z : Nat)` (`x + 22 < 2^32`, `z < 2^32`). -/
+theorem canary2_diamond_stageCut_then_pureLift (c1 c2 : Bool) (x z : Nat)
+    (hX : x + 22 < 2 ^ 32) (hZ : z < 2 ^ 32) :
+    let acc1 := x + stage1Delta c1
+    let post : Anneal.PureLift.FuncOut Anneal.PureLift.StdVal → Prop :=
+      fun out => out.ret = .pair (.nat (acc1 + stage2Delta c2)) (.nat z)
+    MirWpConverges diamond2StageMirBody
+      (initMachineState diamond2StageMirBody
+        [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩])
+      (fun o => Anneal.PureLift.V2026_06_01Bridge.LiftedMirPost (fun lid => lid + 1) post o []) := by
+  intro acc1 post
+  let params : List (Anneal.PureLift.ParamInput Anneal.PureLift.StdVal) :=
+    [⟨.byVal, .bool c1⟩, ⟨.byVal, .bool c2⟩, ⟨.byVal, .nat x⟩,
+     ⟨.byVal, .nat z⟩, ⟨.byVal, .nat acc1⟩]
+  let retExpr : Anneal.PureLift.RvalOp Anneal.PureLift.StdVal :=
+    .binary (fun a b => some (.pair a b)) (.localSub 4 []) (.localSub 3 [])
+  let tagOf : Anneal.PureLift.LoanId → Nat := fun lid => lid + 1
+  let postMir : MirOutcome → Prop :=
+    fun o => Anneal.PureLift.V2026_06_01Bridge.LiftedMirPost tagOf post o []
+  let zSlot : LocalSlot := .init (.scalar ⟨z, 4⟩)
+  let sEntry := initMachineState diamond2StageMirBody
+    [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩]
+  let sCut := diamondState 3 0 .uninit (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot (.init (.scalar ⟨acc1, 4⟩))
+  let sBb6_0 := diamondState 6 0 .uninit (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot
+    (.init (.scalar ⟨acc1 + stage2Delta c2, 4⟩))
+  let sBb6_1 := diamondState 6 1
+    (.init (.aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩]))
+    (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot
+    (.init (.scalar ⟨acc1 + stage2Delta c2, 4⟩))
+  let sBb6_2 := diamondState 6 2
+    (.init (.aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩]))
+    (.init (boolScalar c1)) (.init (boolScalar c2))
+    (.init (.scalar ⟨x, 4⟩)) zSlot .dead
+  -- Stage 1 framed behind `@[irreducible] StageCut` (zero touching of `_4 = z`)
+  have hStage1Framed :=
+    stageCut_frame (ops := mirDetWpOps diamond2StageMirBody) (diamond_stage1_stepFrame zSlot)
+      (canary2_stage1_within c1 x (by omega) (.init (boolScalar c2)))
+  have hStage1Exact :
+      StageCut (ops := mirDetWpOps diamond2StageMirBody)
+        (· = sEntry) (· = sCut) postMir (fun _ => False) :=
+    stageCut_weaken (ops := mirDetWpOps diamond2StageMirBody) (onDone' := postMir)
+      (fun _ hEq => by subst hEq; exact ⟨⟨zSlot, rfl⟩, rfl, rfl⟩)
+      (fun _ ⟨⟨l4, hEq⟩, hLoc4, _⟩ => by
+        subst hEq
+        change some l4 = some zSlot at hLoc4
+        injection hLoc4 with hL4Eq
+        subst hL4Eq; rfl)
+      (fun _ hF => False.elim hF) (fun _ h => h) hStage1Framed
+  -- PureLift evaluation of Stage 2 from cutpoint `bb3`
+  have hEvalPure :
+      Anneal.PureLift.evalFnValue Anneal.PureLift.stdValAlg params diamondStage2PurePlan retExpr =
+        .ok ⟨.pair (.nat (acc1 + stage2Delta c2)) (.nat z), []⟩ := by
+    cases c2 <;> rfl
+  have hSpec : Anneal.PureLift.HoldsFnSpec
+      (Anneal.PureLift.evalFnValue Anneal.PureLift.stdValAlg params diamondStage2PurePlan retExpr)
+      post := by
+    rw [hEvalPure]; rfl
+  let stCut : Anneal.PureLift.SymState Anneal.PureLift.StdVal :=
+    ⟨[⟨.bool c1, .unborrowed⟩, ⟨.bool c2, .unborrowed⟩, ⟨.nat x, .unborrowed⟩,
+      ⟨.nat z, .unborrowed⟩, ⟨.nat acc1, .unborrowed⟩], [], [], [], [], 0⟩
+  have hCutInit : ∀ mc, mc = sCut →
+      ∃ st0,
+        Anneal.PureLift.initFnState Anneal.PureLift.stdValAlg params = .ok st0 ∧
+        Anneal.PureLift.V2026_06_01Bridge.mirStateRel tagOf [] st0 mc := by
+    intro mc hMc; subst hMc
+    refine ⟨stCut, rfl, ⟨trivial, trivial⟩,
+      Anneal.PureLift.V2026_06_01Bridge.mirLocalsRel_of_localsRefine ?_⟩
+    have hX4 : x < 256 ^ 4 := by omega
+    have hZ4 : z < 256 ^ 4 := by omega
+    have hAcc1 : acc1 < 256 ^ 4 := by
+      cases c1 with
+      | false => change x + 20 < 256 ^ 4; omega
+      | true => change x + 10 < 256 ^ 4; omega
+    exact ⟨fun _ => ⟨_, rfl, .bool c1⟩, fun _ => ⟨_, rfl, .bool c2⟩,
+      fun _ => ⟨_, rfl, .nat hX4⟩, fun _ => ⟨_, rfl, .nat hZ4⟩,
+      fun _ => ⟨_, rfl, .nat hAcc1⟩, trivial⟩
+  have hCutSim : ∀ mc st0 out, mc = sCut →
+      Anneal.PureLift.initFnState Anneal.PureLift.stdValAlg params = .ok st0 →
+      Anneal.PureLift.V2026_06_01Bridge.mirStateRel tagOf [] st0 mc →
+      Anneal.PureLift.evalFnValue Anneal.PureLift.stdValAlg params diamondStage2PurePlan retExpr =
+        .ok out →
+      ∃ mFinal,
+        DetStageCut (mirDetStep diamond2StageMirBody) mc mFinal ∧
+        Anneal.PureLift.V2026_06_01Bridge.MirReturnRel tagOf diamond2StageMirBody out mFinal [] := by
+    intro mc st0 out hMc _ _ hEv
+    subst hMc
+    rw [hEvalPure] at hEv; injection hEv with hOut; subst hOut
+    have hAcc1Lt : acc1 + 2 < 2 ^ 32 := by
+      cases c1 with
+      | false => change x + 20 + 2 < 2 ^ 32; omega
+      | true => change x + 10 + 2 < 2 ^ 32; omega
+    have hStepToBb6_0 : StepStageCut (mirDetStep diamond2StageMirBody) 3 sCut sBb6_0 :=
+      canary2_stage2_stepStageCut c2 acc1 hAcc1Lt
+        (.init (boolScalar c1)) (.init (.scalar ⟨x, 4⟩)) (.init (.scalar ⟨z, 4⟩))
+    have hStepToBb6_2 : StepStageCut (mirDetStep diamond2StageMirBody) 5 sCut sBb6_2 :=
+      hStepToBb6_0.trans
+        (StepStageCut.step
+          (mirDetStep_step_iff.mpr (rfl : Anneal.PureMirExec.mirStep diamond2StageMirBody sBb6_0 = .cont sBb6_1))
+          (StepStageCut.step
+            (mirDetStep_step_iff.mpr (rfl : Anneal.PureMirExec.mirStep diamond2StageMirBody sBb6_1 = .cont sBb6_2))
+            (StepStageCut.refl _ 0 sBb6_2)))
+    refine ⟨sBb6_2, DetStageCut.of_stepStageCut hStepToBb6_2,
+      .aggregate 0 [.scalar ⟨acc1 + stage2Delta c2, 4⟩, .scalar ⟨z, 4⟩], {}, rfl, ?_, rfl⟩
+    have hFinalLt : acc1 + stage2Delta c2 < 256 ^ 4 := by
+      cases c2 with
+      | false => change acc1 + 2 < 256 ^ 4; omega
+      | true => change acc1 + 1 < 256 ^ 4; omega
+    have hZ4 : z < 256 ^ 4 := by omega
+    exact .pair (.nat hFinalLt) (.nat hZ4)
+  exact mirWpConverges_stageCut_then_pureLift tagOf diamond2StageMirBody [] params
+    diamondStage2PurePlan retExpr post (· = sEntry) (· = sCut) []
+    hStage1Exact hSpec hCutInit hCutSim rfl
+
 /-! ## 3. Canary 3 — Disjoint `ByteSubLens`, `AlignedSubLens`, Tree Borrows & Certified `MutSummaryChain` -/
 
 /-! ### 3A. `Memory.globals` (`CapturedAllocation`), `AlignedSubLens`, `SliceCodec.paddedPair`, `decodeValueFromBytes`, `TypedAt`, Tree Borrows & Fail-Closed Rejections -/
@@ -1894,7 +2052,7 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     (ByteSubLens.getValIf_of_ok globalU32Codec siblingAligned.lens hSibOk2).trans hSib2_get,
     ⟨alloc2, hFind2,
       decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hHdr2_get,
-      decodeValueFromBytes_bool_of_getVal testLayouts hFind2 hRel2 hFlag2_get,
+      decodeValueFromBytes_bool_of_getVal testLayouts hFind2 hRel2 hFlag2_get boolTy.layoutIdx,
       decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hVal2_get,
       decodeValueFromBytes_u32_of_getVal testLayouts hFind2 hRel2 hSib2_get⟩,
     hBorrows, hAlignPres, hMutPres, ⟨hTbHdr, hTbPay⟩,
@@ -1905,19 +2063,26 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     memGlobals_get_none_of_immutable hFind8' hImm8,
     memGlobals_set_none_of_immutable hFind8' hImm8⟩
 
-/-- **Canary 3A (`SepLogicLenses.TypedAt` & `MirTypedByteCodec` bridge)**:
-Connects `ByteSubLens.getVal` on `ByteMem` (`List AbstractByte`) directly to
-`SepLogicLenses.TypedAt` and `PureLift.V2026_06_01Bridge.MirTypedByteCodec`
-(`decodeValueFromBytes`) for any symbolic `v : { n : Nat // n < 256 ^ 4 }`. -/
+/-- **Canary 3A (`SepLogicLenses.TypedAt`, `MirTypedByteCodec`, & `encodeValueToBytes` bridge)**:
+Connects `ByteSubLens.getVal` and `ByteSubLens.setVal` on `ByteMem`
+(`List AbstractByte`) directly to `SepLogicLenses.TypedAt`,
+`PureLift.V2026_06_01Bridge.MirTypedByteCodec`, trusted `decodeValueFromBytes`,
+and trusted `encodeValueToBytes` for any symbolic `v v' : { n : Nat // n < 256 ^ 4 }`. -/
 theorem canary3a_byteMem_typedAt_and_mirTypedByteCodec
-    (v : { n : Nat // n < 256 ^ 4 }) (suffix : Anneal.SepLogicLenses.ByteMem) :
+    (v v' : { n : Nat // n < 256 ^ 4 }) (suffix : Anneal.SepLogicLenses.ByteMem) :
     let mCodec := Anneal.PureLift.V2026_06_01Bridge.u32MirCodec testLayouts
     let bm : Anneal.SepLogicLenses.ByteMem := mCodec.codec.encode v ++ suffix
     let L : ByteSubLens Unit := ⟨(), 0, 4⟩
     Anneal.SepLogicLenses.TypedAt mCodec.codec 0 v bm ∧
     (∃ bs, L.get bm = some bs ∧
       decodeValueFromBytes defaultCodecFuel testLayouts u32Ty bs =
-        some (.scalar ⟨v.val, 4⟩)) := by
+        some (.scalar ⟨v.val, 4⟩)) ∧
+    (∃ bm', L.setVal (sliceCodecOfMirTypedByteCodec mCodec) bm v' = some bm' ∧
+      Anneal.SepLogicLenses.TypedAt mCodec.codec 0 v' bm' ∧
+      L.get bm' = encodeValueToBytes defaultCodecFuel testLayouts u32Ty (.scalar ⟨v'.val, 4⟩)) ∧
+    encodeValueToBytes defaultCodecFuel testLayouts u32Ty (.scalar ⟨(UInt32.ofNat v.val).toNat, 4⟩) =
+      some (((SliceCodec.uint32 optUInt8ByteCodec).enc (UInt32.ofNat v.val)).map
+        optUInt8ToAbstractByte) := by
   intro mCodec bm L
   have hEncLen : (mCodec.codec.encode v).length = 4 := mCodec.codec.encode_len v
   have hTyped : Anneal.SepLogicLenses.TypedAt mCodec.codec 0 v bm := by
@@ -1931,7 +2096,14 @@ theorem canary3a_byteMem_typedAt_and_mirTypedByteCodec
   have hGetVal :
       L.getVal (sliceCodecOfMirTypedByteCodec mCodec) bm = some v :=
     (byteMem_getVal_iff_typedAt mCodec.codec (by decide) bm L rfl v).mpr hTyped
-  exact ⟨hTyped, (byteMem_getVal_mirTypedByteCodec_iff_decode mCodec bm L rfl v).mp hGetVal⟩
+  rcases ByteSubLens.getVal_inv hGetVal with ⟨_, _, hGetRaw, _⟩
+  rcases ByteSubLens.set_isSome_of_get ((sliceCodecOfMirTypedByteCodec mCodec).enc v') hGetRaw
+    ((sliceCodecOfMirTypedByteCodec mCodec).enc_length v') with ⟨bm', hSet⟩
+  have hPostSet := byteMem_setVal_mirTypedByteCodec_typedAt mCodec (by decide) bm bm' L rfl v' hSet
+  exact ⟨hTyped,
+    (byteMem_getVal_mirTypedByteCodec_iff_decode mCodec bm L rfl v).mp hGetVal,
+    ⟨bm', hSet, hPostSet.1, hPostSet.2⟩,
+    encodeValueToBytes_u32_eq_sliceCodec testLayouts (UInt32.ofNat v.val)⟩
 
 /-! ### 3B. Real Mutating `V2026_06_01` `CapturedMir` Callees Behind `@[irreducible] MutSummaryOutcomeCut` + Multi-Call `execMutSummaryChain` → `MirWpConverges` -/
 
@@ -3883,7 +4055,8 @@ def mkCanaryCalleeMem (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal :
          rangeOffset := 12, rangeLen := 4, targetFrameDepth := 0 },
        { tag := 4, targetLocal := 13, targetProjection := [], perm := .frozen,
          rangeOffset := 0, rangeLen := 4, targetFrameDepth := 0 }]
-    callerLocals := List.replicate 12 LocalSlot.dead ++ [u8BytesToSlot buf16]
+    callerLocals := List.replicate 12 LocalSlot.dead ++
+      [u8BytesToSlot buf16, u8BytesToSlot (rawU32Codec.enc siblingVal)]
     nextAllocId := 9
     nextTag := 5 }
 
@@ -4070,6 +4243,273 @@ theorem canary3b_panickingCallee_rejected :
       (panickingEntry calleeHdrLens m0 (.u32Arg 99)) :=
     step_det_done .panic rfl rfl
   exact not_mutSummaryOutcomeCut_of_nonNormal hExec rfl hPanicRun
+
+/-- Alignment oracle for caller-frame `[u8; N]` referent slices (`SliceCallAddr`):
+requires `2^k ∣ off` (modelling 4-byte-aligned caller buffer bases, independent of
+byte contents so write-invariant across all `sliceCallByteStoreOps` writes). -/
+def sliceCallAlignedAt (_m : Memory) (_a : SliceCallAddr) (off k : Nat) : Bool :=
+  Nat.beq (off % (2 ^ k)) 0
+
+theorem sliceCall_writePreserves_alignedAt (a : SliceCallAddr) (off k : Nat) :
+    sliceCallByteStoreOps.WritePreserves (fun m : Memory => sliceCallAlignedAt m a off k) :=
+  fun _ _ _ _ _ _ => rfl
+
+/-- Aligned 4-byte lenses (`alignLog2 = 2`) and fail-closed misaligned, OOB, and
+frozen-borrow lenses over `SliceCallAddr`. -/
+def calleeHdrAligned : AlignedSubLens SliceCallAddr := ⟨calleeHdrLens, 2⟩
+def calleePayAligned : AlignedSubLens SliceCallAddr := ⟨calleePayLens, 2⟩
+def calleeSibAligned : AlignedSubLens SliceCallAddr := ⟨calleeSibLens, 2⟩
+def calleeMisalignedU32 : AlignedSubLens SliceCallAddr := ⟨⟨⟨12⟩, 2, 4⟩, 2⟩
+def calleeOobLens : ByteSubLens SliceCallAddr := ⟨⟨12⟩, 14, 4⟩
+def calleeFrozenLens : ByteSubLens SliceCallAddr := ⟨⟨13⟩, 0, 4⟩
+
+/-- **Canary 3B (`AlignedSubLens` framing + fail-closed misaligned, OOB, and
+frozen-borrow rejection on `SliceCallAddr`)**:
+For ALL symbolic `(initHdr, initFlag, initVal, siblingVal, newHdr, newFlag, newVal)`:
+1. Alignment-checked post-reads (`AlignedSubLens.getVal`) succeed on header,
+   payload, and untouched sibling (via `AlignedSubLens.get_execMutSummaryChain_disjoint`).
+2. Misaligned `SliceCallAddr` (`offset = 2`, `alignLog2 = 2`) fails closed (`= none`)
+   on both `get` and `set`.
+3. Out-of-bounds `SliceCallAddr` (`offset = 14, len = 4` on 16-byte buffer) fails
+   closed (`= none`) on both `get` and `set`.
+4. Frozen-borrow `SliceCallAddr` (`callerLocals[13]`, live initialized 4-byte
+   buffer covered only by `.frozen` `tag 4`) fails closed (`= none`) on `get` and `set`. -/
+theorem canary3b_sliceCall_aligned_and_failClosed
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal newHdr : UInt32)
+    (newFlag : Bool) (newVal : UInt32) :
+    let m0 := mkCanaryCalleeMem initHdr initFlag initVal siblingVal
+    let calls : List (MutSummaryCall UInt8 SliceCallAddr SliceCalleeArg UInt32) :=
+      [⟨writeU32SliceSum, calleeHdrLens, .u32Arg newHdr⟩,
+       ⟨writePaddedPairSliceSum, calleePayLens, .paddedPairArg newFlag newVal⟩]
+    ∃ m2,
+      execMutSummaryChain calls m0 = some (m2, [newHdr, newVal]) ∧
+      calleeHdrAligned.getVal sliceCallAlignedAt rawU32Codec m2 = some newHdr ∧
+      calleePayAligned.getVal sliceCallAlignedAt rawPaddedPairCodec m2 = some (newFlag, newVal) ∧
+      calleeSibAligned.getVal sliceCallAlignedAt rawU32Codec m2 = some siblingVal ∧
+      calleeMisalignedU32.get sliceCallAlignedAt m2 = none ∧
+      calleeMisalignedU32.set sliceCallAlignedAt m2 (rawU32Codec.enc newHdr) = none ∧
+      calleeOobLens.get m2 = none ∧
+      calleeOobLens.set m2 (rawU32Codec.enc newHdr) = none ∧
+      calleeFrozenLens.get m2 = none ∧
+      calleeFrozenLens.set m2 (rawU32Codec.enc newHdr) = none := by
+  intro m0 calls
+  rcases canary3b_realCallees_execMutSummaryChain_and_framing
+      initHdr initFlag initVal siblingVal newHdr newFlag newVal with
+    ⟨m2, hChain, _, hHdr2, hPay2, _, hBor2, _⟩
+  have hAllDisjSib : AllCallsDisjoint Memory calleeSibLens calls := by
+    dsimp only [calls]
+    exact ⟨ByteSubLens.disjoint_of_separated (Or.inr (Or.inl (by dsimp only; decide))),
+     ByteSubLens.disjoint_of_separated (Or.inr (Or.inl (by dsimp only; decide))), trivial⟩
+  have hSibAlignedEq :
+      calleeSibAligned.get sliceCallAlignedAt m2 =
+      calleeSibAligned.get sliceCallAlignedAt m0 :=
+    AlignedSubLens.get_execMutSummaryChain_disjoint
+      (fun a off k => sliceCall_writePreserves_alignedAt a off k)
+      calleeSibAligned calls hAllDisjSib hChain
+  have hSib2Aligned :
+      calleeSibAligned.getVal sliceCallAlignedAt rawU32Codec m2 = some siblingVal := by
+    have hGet2 : calleeSibLens.get m2 = calleeSibLens.get m0 :=
+      execMutSummaryChain_frame_disjoint calleeSibLens calls hAllDisjSib hChain
+    exact (ByteSubLens.getValIf_of_ok rawU32Codec calleeSibLens rfl).trans
+      (by unfold ByteSubLens.getVal; rw [hGet2]; exact mkCanaryCalleeMem_sib_getVal initHdr initFlag initVal siblingVal)
+  have hNotReadyOob : sliceCallAbiReady m2 ⟨12⟩ 14 4 = false := by
+    unfold sliceCallAbiReady
+    rw [hBor2]
+    have hFindNone : (findCoveringUniqueBorrow m0.borrows 12 14 4).isSome = false := by
+      dsimp only [m0, mkCanaryCalleeMem]; decide
+    rw [hFindNone, Bool.and_false]
+  have hNotReadyFrozen : sliceCallAbiReady m2 ⟨13⟩ 0 4 = false := by
+    unfold sliceCallAbiReady
+    rw [hBor2]
+    have hFindNone : (findCoveringUniqueBorrow m0.borrows 13 0 4).isSome = false := by
+      dsimp only [m0, mkCanaryCalleeMem]; decide
+    rw [hFindNone, Bool.and_false]
+  have hOobGet : calleeOobLens.get m2 = none := by
+    rw [ByteSubLens.get_of_pos m2 (by decide)]
+    change (match sliceCallAbiReady m2 ⟨12⟩ 14 4 with | false => none | true => _) = none
+    rw [hNotReadyOob]
+  have hOobSet : calleeOobLens.set m2 (rawU32Codec.enc newHdr) = none := by
+    rw [ByteSubLens.set_of_pos m2 (by decide) (rawU32Codec.enc_length newHdr)]
+    change (match sliceCallAbiReady m2 ⟨12⟩ 14 (rawU32Codec.enc newHdr).length with
+      | false => none | true => _) = none
+    rw [rawU32Codec.enc_length newHdr, hNotReadyOob]
+  have hFrozenGet : calleeFrozenLens.get m2 = none := by
+    rw [ByteSubLens.get_of_pos m2 (by decide)]
+    change (match sliceCallAbiReady m2 ⟨13⟩ 0 4 with | false => none | true => _) = none
+    rw [hNotReadyFrozen]
+  have hFrozenSet : calleeFrozenLens.set m2 (rawU32Codec.enc newHdr) = none := by
+    rw [ByteSubLens.set_of_pos m2 (by decide) (rawU32Codec.enc_length newHdr)]
+    change (match sliceCallAbiReady m2 ⟨13⟩ 0 (rawU32Codec.enc newHdr).length with
+      | false => none | true => _) = none
+    rw [rawU32Codec.enc_length newHdr, hNotReadyFrozen]
+  have _ := hSibAlignedEq
+  exact ⟨m2, hChain,
+    (ByteSubLens.getValIf_of_ok rawU32Codec calleeHdrLens rfl).trans hHdr2,
+    (ByteSubLens.getValIf_of_ok rawPaddedPairCodec calleePayLens rfl).trans hPay2,
+    hSib2Aligned,
+    AlignedSubLens.get_none_of_unaligned calleeMisalignedU32 rfl,
+    AlignedSubLens.set_none_of_unaligned calleeMisalignedU32 _ rfl,
+    hOobGet, hOobSet, hFrozenGet, hFrozenSet⟩
+
+/-- **Live Tree Borrows UB Non-Vacuity on Unmodified `V2026_06_01.MirSemantics`**:
+When `writeU32SliceBody` executes statement 14 (`(*_1) = [b0, b1, b2, b3]`)
+through frozen borrow `tag 4` targeting the live initialized 4-byte buffer in
+`callerLocals[13]`, unmodified `PureMirExec.mirStep` genuinely faults (`.fault`, UB)
+strictly because `tag 4` has `perm = .frozen`! -/
+theorem canary3b_frozenBorrow_derefWrite_ub :
+    let m0 := mkCanaryCalleeMem 1 false 2 3
+    let st14 : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 14,
+            locals :=
+              [.uninit,
+               .init (.aggregate 0 [.ptr ⟨4, 0⟩ 8, .scalar ⟨4, 8⟩]),
+               .init (.scalar ⟨42, 4⟩),
+               .init (.scalar ⟨42, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩)] }
+        memory := m0 }
+    Anneal.PureMirExec.mirStep writeU32SliceBody st14 = .fault := rfl
+
+/-- **Live Out-of-Bounds Slice UB Non-Vacuity on Unmodified `V2026_06_01.MirSemantics`**:
+When `writeU32SliceBody` executes statement 14 (`(*_1) = [b0, b1, b2, b3]`)
+through `.unique` borrow `tag 3` at an out-of-bounds offset (`offset = 14, len = 4`
+on the 16-byte buffer in `callerLocals[12]`), unmodified `PureMirExec.mirStep`
+genuinely faults (`.fault`, UB) inside `writeSliceFatPtrTargetValue`! -/
+theorem canary3b_oobSlice_derefWrite_ub :
+    let m0 := mkCanaryCalleeMem 1 false 2 3
+    let st14 : MachineState :=
+      { frame :=
+          { blockIdx := 0, stmtIdx := 14,
+            locals :=
+              [.uninit,
+               .init (.aggregate 0 [.ptr ⟨3, 14⟩ 8, .scalar ⟨4, 8⟩]),
+               .init (.scalar ⟨42, 4⟩),
+               .init (.scalar ⟨42, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩), .init (.scalar ⟨0, 4⟩),
+               .init (.scalar ⟨0, 1⟩)] }
+        memory := m0 }
+    Anneal.PureMirExec.mirStep writeU32SliceBody st14 = .fault := rfl
+
+/-- **Trusted `StatefulClaim` for real mutating callee `writeU32SliceBody`**,
+requiring a live covering `.unique` borrow on any valid `ByteSubLens SliceCallAddr`
+and guaranteeing exact return value, exact mutated `u32` bytes, and universal
+disjoint-lens framing of all other caller-frame slices. -/
+def writeU32SliceStatefulClaim : StatefulClaim where
+  body := writeU32SliceBody
+  callees := []
+  pre args mem :=
+    ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (oldVal newVal : UInt32),
+      findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
+      L.getVal rawU32Codec mem = some oldVal ∧
+      args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
+              .scalar ⟨newVal.toNat, 4⟩]
+  post args mem ret mem' :=
+    ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (newVal : UInt32),
+      args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
+              .scalar ⟨newVal.toNat, 4⟩] ∧
+      ret = .scalar ⟨newVal.toNat, 4⟩ ∧
+      L.getVal rawU32Codec mem' = some newVal ∧
+      (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
+        other.get mem' = other.get mem) ∧
+      mem'.borrows = mem.borrows ∧
+      mem'.globals = mem.globals
+
+private theorem ofU32Value_inv {rv : Value} {v : UInt32}
+    (h : ofU32Value rv = some v) : rv = .scalar ⟨v.toNat, 4⟩ := by
+  cases rv with
+  | scalar sc =>
+    cases sc with
+    | mk bits sz =>
+      cases sz with
+      | zero => cases h
+      | succ s1 =>
+        cases s1 with
+        | zero => cases h
+        | succ s2 =>
+          cases s2 with
+          | zero => cases h
+          | succ s3 =>
+            cases s3 with
+            | zero => cases h
+            | succ s4 =>
+              cases s4 with
+              | succ _ => cases h
+              | zero =>
+                change (if bits < 2 ^ 32 then some (UInt32.ofNat bits) else none) = some v at h
+                split at h
+                · rename_i hLt
+                  injection h with hEq
+                  subst hEq
+                  have hBits : (UInt32.ofNat bits).toNat = bits := by
+                    simp [Nat.mod_eq_of_lt hLt]
+                  rw [hBits]
+                · cases h
+  | _ => cases h
+
+/-- **Trusted `StatefulVerificationResult` for real `writeU32SliceBody`**,
+discharged directly from the sealed `@[irreducible] MutSummaryOutcomeCut` via
+`V2026Bridge.verifyStatefulMirNoPanic_of_mutSummaryOutcomeCut` (zero re-stepping!). -/
+theorem canary3b_writeU32Slice_statefulVerificationResult :
+    StatefulVerificationResult writeU32SliceStatefulClaim := by
+  refine verifyStatefulMirNoPanic_of_mutSummaryOutcomeCut writeU32SliceStatefulClaim
+    writeU32Slice_mutSummaryOutcomeCut ?_
+  rintro args mem ⟨L, e, oldVal, newVal, hFind, hGet, hArgs⟩
+  subst hArgs
+  rcases execMutSummary_ofSliceCodec_of (sc := rawU32Codec)
+      (fn := fun _ arg => match arg with | SliceCalleeArg.u32Arg v => some (v, v) | _ => none)
+      (arg := SliceCalleeArg.u32Arg newVal)
+      hGet (v' := newVal) (ret := newVal) rfl with ⟨m', hExec, _, hPostVal⟩
+  refine ⟨L, .u32Arg newVal, m', newVal, ?_, hExec, ?_⟩
+  · unfold writeU32Entry; rw [hFind]; rfl
+  · intro rv hOfVal hFrame
+    exact ⟨L, e, newVal, rfl, ofU32Value_inv hOfVal, hPostVal, hFrame,
+      execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
+      execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
+
+/-- **Trusted `StatefulClaim` for real mutating callee `writePaddedPairSliceBody`**. -/
+def writePaddedPairSliceStatefulClaim : StatefulClaim where
+  body := writePaddedPairSliceBody
+  callees := []
+  pre args mem :=
+    ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (oldPair : Bool × UInt32)
+        (newFlag : Bool) (newVal : UInt32),
+      findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
+      L.getVal rawPaddedPairCodec mem = some oldPair ∧
+      args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
+              boolScalar newFlag, .scalar ⟨newVal.toNat, 4⟩]
+  post args mem ret mem' :=
+    ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (newFlag : Bool) (newVal : UInt32),
+      args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
+              boolScalar newFlag, .scalar ⟨newVal.toNat, 4⟩] ∧
+      ret = .scalar ⟨newVal.toNat, 4⟩ ∧
+      L.getVal rawPaddedPairCodec mem' = some (newFlag, newVal) ∧
+      (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
+        other.get mem' = other.get mem) ∧
+      mem'.borrows = mem.borrows ∧
+      mem'.globals = mem.globals
+
+/-- **Trusted `StatefulVerificationResult` for real `writePaddedPairSliceBody`**,
+discharged directly from `writePaddedPairSlice_mutSummaryOutcomeCut` via
+`V2026Bridge.verifyStatefulMirNoPanic_of_mutSummaryOutcomeCut` (zero re-stepping!). -/
+theorem canary3b_writePaddedPairSlice_statefulVerificationResult :
+    StatefulVerificationResult writePaddedPairSliceStatefulClaim := by
+  refine verifyStatefulMirNoPanic_of_mutSummaryOutcomeCut writePaddedPairSliceStatefulClaim
+    writePaddedPairSlice_mutSummaryOutcomeCut ?_
+  rintro args mem ⟨L, e, oldPair, newFlag, newVal, hFind, hGet, hArgs⟩
+  subst hArgs
+  rcases execMutSummary_ofSliceCodec_of (sc := rawPaddedPairCodec)
+      (fn := fun _ arg => match arg with | SliceCalleeArg.paddedPairArg b v => some ((b, v), v) | _ => none)
+      (arg := SliceCalleeArg.paddedPairArg newFlag newVal)
+      hGet (v' := (newFlag, newVal)) (ret := newVal) rfl with ⟨m', hExec, _, hPostVal⟩
+  refine ⟨L, .paddedPairArg newFlag newVal, m', newVal, ?_, hExec, ?_⟩
+  · unfold writePaddedPairEntry; rw [hFind]; rfl
+  · intro rv hOfVal hFrame
+    exact ⟨L, e, newFlag, newVal, rfl, ofU32Value_inv hOfVal, hPostVal, hFrame,
+      execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
+      execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
 
 /-! ## 4. Kernel Axiom Guardrails (`#guard_msgs` + `#print axioms`) -/
 
@@ -4284,5 +4724,66 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage2_within' depends on
 -/
 #guard_msgs in
 #print axioms canary2_stage2_within
+
+/-! ### Pass A1 guards: Canary 1D termination + add-overflow liveness, Canary 2
+`StageCut` + `PureLift` composition, and Canary 3B alignment / fail-closed /
+live UB / `StatefulVerificationResult` certificates. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_countDownChecked_totalVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1d_countDownChecked_totalVerificationResult
+
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1d_addOverflowAssert_live' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms canary1d_addOverflowAssert_live
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_stageCut_then_pureLift' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_diamond_stageCut_then_pureLift
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.sliceCall_writePreserves_alignedAt' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms sliceCall_writePreserves_alignedAt
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_sliceCall_aligned_and_failClosed' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3b_sliceCall_aligned_and_failClosed
+
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_frozenBorrow_derefWrite_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms canary3b_frozenBorrow_derefWrite_ub
+
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_oobSlice_derefWrite_ub' depends on axioms: [propext] -/
+#guard_msgs in
+#print axioms canary3b_oobSlice_derefWrite_ub
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writeU32Slice_statefulVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3b_writeU32Slice_statefulVerificationResult
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writePaddedPairSlice_statefulVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3b_writePaddedPairSlice_statefulVerificationResult
 
 end Anneal.ParametricLoopInvAndSubLensTests
