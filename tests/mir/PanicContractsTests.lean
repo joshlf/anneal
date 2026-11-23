@@ -974,7 +974,7 @@ theorem addCaller_calleeTableExcludes (unwind : UnwindAction) (args : List Value
 
 /-- The empty memory excludes the callee. -/
 theorem emptyMemory_calleeTableExcludes : CalleeTableExcludes emptyMemory checkedAddU8Path :=
-  calleeTableExcludes_of_callees_nil rfl rfl
+  calleeTableExcludes_of_callees_nil rfl
 
 /--
 Under the guard the caller's call terminator emits the `MirCallE` request for
@@ -1790,7 +1790,7 @@ def tailArgs : List Value := [.scalar { bits := 3, sizeBytes := 1 }]
 
 theorem tailUnprotectedMem_calleeTableExcludes :
     CalleeTableExcludes tailUnprotectedMem tailTargetPath :=
-  calleeTableExcludes_of_callees_nil rfl rfl
+  calleeTableExcludes_of_callees_nil rfl
 
 /--
 Under the guard and without a protector conflict, the tail call tears down the
@@ -1842,6 +1842,1318 @@ theorem tailCall_step_probes :
         (.running (initMachineStateWithMemory tailCallerMir tailArgs tailProtectedMem)) =
         MirStepNode.fail .ub :=
   ⟨⟨_, rfl⟩, rfl⟩
+
+/--
+Unlike `TerminatorKind.call`, `TerminatorKind.tailCall` performs no inline
+intrinsic or panic-entrypoint intercept: targeting `panic_nounwind` or
+`core::intrinsics::exact_div` still emits `MirCallE` after frame teardown.
+-/
+theorem tailCall_no_inline_intercept_panic_and_exactDiv :
+    evalTerminator (initMachineStateWithMemory tailCallerMir tailArgs tailUnprotectedMem)
+        (mkTerm (.tailCall (fnItemOp "core::panicking::panic_nounwind") [.copy (local_ 1)]))
+        (.some tailCallerMir) =
+      MirStepNode.extCall
+        { defPath := "core::panicking::panic_nounwind", typeArgs := [], args := tailArgs
+          memory :=
+            { tailUnprotectedMem with borrows := [probeBorrow 1 1 .disabled true] } }
+        resumeExternalTailCall ∧
+      evalTerminator (initMachineStateWithMemory tailCallerMir tailArgs tailUnprotectedMem)
+        (mkTerm (.tailCall (fnItemOp "core::intrinsics::exact_div") [.copy (local_ 1)]))
+        (.some tailCallerMir) =
+      MirStepNode.extCall
+        { defPath := "core::intrinsics::exact_div", typeArgs := [], args := tailArgs
+          memory :=
+            { tailUnprotectedMem with borrows := [probeBorrow 1 1 .disabled true] } }
+        resumeExternalTailCall :=
+  ⟨evalTerminator_tailCall_extCall_of_call_site
+      (s := initMachineStateWithMemory tailCallerMir tailArgs tailUnprotectedMem)
+      (func := fnItemOp "core::panicking::panic_nounwind") (argOps := [.copy (local_ 1)])
+      (targetDefPath := "core::panicking::panic_nounwind") (argVals := tailArgs)
+      rfl rfl rfl rfl (calleeTableExcludes_of_callees_nil rfl),
+   evalTerminator_tailCall_extCall_of_call_site
+      (s := initMachineStateWithMemory tailCallerMir tailArgs tailUnprotectedMem)
+      (func := fnItemOp "core::intrinsics::exact_div") (argOps := [.copy (local_ 1)])
+      (targetDefPath := "core::intrinsics::exact_div") (argVals := tailArgs)
+      rfl rfl rfl rfl (calleeTableExcludes_of_callees_nil rfl)⟩
+
+/-- Root-frame tail-call resumption for normal return, panic, and abort answers. -/
+theorem tailCall_resume_outcomes (retVal : Value) :
+    resumeExternalTailCall (.returned retVal emptyMemory) =
+        .halted (.normal (retVal, emptyMemory)) ∧
+      resumeExternalTailCall (.panicked emptyMemory) = .halted .panic ∧
+      resumeExternalTailCall .aborted = .halted .abort :=
+  ⟨resumeExternalTailCall_returned_root emptyMemory retVal rfl,
+   resumeExternalTailCall_panicked_root emptyMemory rfl,
+   resumeExternalTailCall_aborted⟩
+
+/-! ## 6b. Hardening & Extended Coverage (General Memory, Call Boundaries, Pass Variance, Parity) -/
+
+/-! ### General-memory caller–callee composition & contract-level exact composition -/
+
+/--
+General-memory precondition for composition: arbitrary `nextAllocId`, `globals`,
+`nextTag`, `traitImpls`, `nextProtector`, `callerLocals`, `fnPtrs`, and
+`exposedAllocIds`, with empty borrows/callStack/callees/protectors and no
+pre-active callee.
+-/
+def generalMemPre (x : MirInput) : Prop :=
+  scalarPre2 1 x.1 ∧
+    x.2.borrows = .nil ∧
+    x.2.callees = .nil ∧
+    x.2.callStack = .nil ∧
+    x.2.activeCallee = .none ∧
+    x.2.activeProtectors = .nil
+
+/-- General-memory panic call contract for `checked_add_u8` (not pinned to `emptyMemory`). -/
+def checkedAddU8GeneralContract : PanicMirCallContract where
+  pre req :=
+    req.defPath = checkedAddU8Path ∧
+      scalarPre2 1 req.args ∧
+      req.memory.borrows = .nil ∧
+      req.memory.callStack = .nil ∧
+      req.memory.activeCallee = .none ∧
+      req.memory.activeProtectors = .nil
+  post req retVal memAfter :=
+    retVal = .scalar { bits := argSum req.args, sizeBytes := 1 } ∧
+      ¬ overflows 1 req.args ∧ memAfter = req.memory
+  panicCond req := overflows 1 req.args
+  panicMemInv req memAfter := memAfter = req.memory
+
+def checkedAddU8GeneralMirContract : MirCallContract :=
+  checkedAddU8GeneralContract.withTraitsPreserved.toMirCallContract
+
+theorem checkedAddU8_generalMem_callee_wp (typeArgs : List RigidTy) (a b : Nat)
+    (mem : Memory) (hB : mem.borrows = .nil) (hCS : mem.callStack = .nil)
+    (hAC : mem.activeCallee = .none) (hAP : mem.activeProtectors = .nil) :
+    wpMirNoCallSym 8 checkedAddU8Mir
+      (initMachineStateWithMemory checkedAddU8Mir (scalarArgs2 1 a b) mem)
+      (fun out =>
+        checkedAddU8GeneralMirContract.post
+          { defPath := checkedAddU8Path, typeArgs := typeArgs, args := scalarArgs2 1 a b,
+            memory := mem }
+          (outcomeToCallAns mem out)) := by
+  cases mem with
+  | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
+      activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+    simp only at hB hCS hAC hAP
+    subst hB hCS hAC hAP
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    · rename_i heq
+      exact ⟨(nat_ble_eq_true_iff _ _).1 heq, rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+    · rename_i heq
+      have hlt : a + b < 256 := (nat_ble_eq_false_iff _ _).1 heq
+      exact ⟨⟨congrArg (fun n => Value.scalar { bits := n, sizeBytes := 1 })
+          (wrapScalarBits_of_lt hlt), Nat.not_le.2 hlt, rfl⟩,
+        ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+
+/-- `checked_add_u8` implements its general-memory trait-preserving contract totally. -/
+theorem checkedAddU8_generalMem_holdsTotallyOn (fallback : ExternalCallHandler) :
+    checkedAddU8GeneralMirContract.holdsTotallyOn (linkCalleeHandler checkedAddU8Mir fallback) :=
+  holdsTotallyOn_linkCalleeHandler_of_wpMirNoCallSym checkedAddU8GeneralMirContract
+    checkedAddU8Mir fallback 8 (fun _ h => h.1) (by
+      rintro ⟨_, typeArgs, _, mem⟩ ⟨rfl, ⟨a, b, -, -, rfl⟩, hB, hCS, hAC, hAP⟩
+      exact checkedAddU8_generalMem_callee_wp typeArgs a b mem hB hCS hAC hAP)
+
+/--
+General-memory modular caller verification: symbolic over arbitrary caller
+`globals`, `callerLocals`, `traitImpls`, `fnPtrs`, and counters.
+-/
+theorem addCaller_generalMem_unwinding_wp (unwind : UnwindAction)
+    (hUnwind : unwind = .continue_ ∨ unwind = .cleanup 2) (a b : Nat)
+    (ha : a < 256) (hb : b < 256) (mem : Memory)
+    (hB : mem.borrows = .nil) (hC : mem.callees = .nil) (hCS : mem.callStack = .nil)
+    (hAC : mem.activeCallee = .none) (hAP : mem.activeProtectors = .nil) :
+    wpMirModularSym checkedAddU8GeneralMirContract 8 (addCallerMir unwind)
+      (initMachineStateWithMemoryAndCallees (addCallerMir unwind) (scalarArgs2 1 a b)
+        mem [])
+      (ExactPanicOutcome
+        (fun r : MirReturn => r.1 = .scalar { bits := a + b, sizeBytes := 1 })
+        (256 ≤ a + b)) := by
+  cases mem with
+  | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
+      activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+    simp only at hB hC hCS hAC hAP
+    subst hB hC hCS hAC hAP
+    rcases hUnwind with rfl | rfl <;>
+    · (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+      refine ⟨⟨rfl, ⟨a, b, ha, hb, rfl⟩, rfl, rfl, rfl, rfl⟩, fun ans hPost => ?_⟩
+      cases ans with
+      | returned retVal memAfter =>
+        obtain ⟨⟨hVal, hFit, hMem⟩, _⟩ := hPost
+        subst hVal hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact ⟨hFit, rfl⟩
+      | panicked memAfter =>
+        obtain ⟨hOver, hMem, _⟩ := hPost
+        subst hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact hOver
+      | aborted => exact False.elim hPost
+
+/--
+General-memory exact horizontal composition: works across arbitrary `globals`,
+`callerLocals`, `traitImpls`, and `fnPtrs`, without pinning `emptyMemory`.
+-/
+theorem addCaller_generalMem_linked_totalExact (unwind : UnwindAction)
+    (hUnwind : unwind = .continue_ ∨ unwind = .cleanup 2)
+    (fallback : ExternalCallHandler) :
+    TotalExactPanicContract
+      (mirHandledTrees (addCallerMir unwind) (linkCalleeHandler checkedAddU8Mir fallback))
+      generalMemPre addCallerPost addCallerOverflows :=
+  mirHandled_totalExactPanicContract_of_wpMirModularSym checkedAddU8GeneralMirContract
+    (checkedAddU8_generalMem_holdsTotallyOn fallback) 8 (by
+      rintro ⟨_, mem⟩ ⟨⟨a, b, ha, hb, rfl⟩, hB, hC, hCS, hAC, hAP⟩
+      exact addCaller_generalMem_unwinding_wp unwind hUnwind a b ha hb mem hB hC hCS hAC hAP)
+
+/--
+Frame-restoring general-memory composition via `linkCalleeWithCalleesHandler`:
+even when `req.memory` carries arbitrary `callees`, `traitImpls`, `callStack`,
+`activeCallee`, and `activeProtectors`, `enterExternalCalleeState` isolates the
+callee and `outcomeToRestoredCallAns` restores `callFrameAndTraitsPreserved`.
+-/
+theorem checkedAddU8_withCallees_holdsTotallyOn (fallback : ExternalCallHandler) :
+    (checkedAddU8GeneralContract.withTraitsPreserved.toMirCallContract).holdsTotallyOn
+      (linkCalleeWithCalleesHandler checkedAddU8Mir [] fallback) :=
+  holdsTotallyOn_linkCalleeWithCalleesHandler_of_wpMirNoCallSym
+    checkedAddU8GeneralMirContract checkedAddU8Mir [] fallback 8 (fun _ h => h.1) (by
+      rintro ⟨_, typeArgs, _, mem⟩ ⟨rfl, ⟨a, b, -, -, rfl⟩, hB, hCS, hAC, hAP⟩
+      cases mem with
+      | mk nextAllocId globals borrows nextTag callees callStack activeCallee traitImpls
+          activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+        simp only at hB hCS hAC hAP
+        subst hB hCS hAC hAP
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        · rename_i heq
+          exact ⟨(nat_ble_eq_true_iff _ _).1 heq, rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+        · rename_i heq
+          have hlt : a + b < 256 := (nat_ble_eq_false_iff _ _).1 heq
+          exact ⟨⟨congrArg (fun n => Value.scalar { bits := n, sizeBytes := 1 })
+              (wrapScalarBits_of_lt hlt), Nat.not_le.2 hlt, rfl⟩,
+            ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩)
+
+/--
+Contract-level total-exact composition exercising
+`totalExactPolicyPanicContract_call_compose_of_callee_contract`: composes a
+caller directly against a callee's `TotalExactPolicyPanicContract` on its closed
+trees rather than raw `DWP mirNoCallWP`.
+-/
+theorem checkedAddU8_closedCallee_totalExactPolicy :
+    TotalExactPolicyPanicContract (mirClosedCalleeTrees checkedAddU8Mir)
+      (fun req =>
+        checkedAddU8Contract.withTraitsPreserved.pre req ∧
+          req.defPath = checkedAddU8Mir.defPath)
+      (fun req r => checkedAddU8Contract.withTraitsPreserved.post req r.1 r.2)
+      checkedAddU8Contract.withTraitsPreserved.panicCond .forbidAbort :=
+  totalExactPolicyPanicContract_of_dwp (ewp := mirClosedWP)
+    mirClosedEffect_nonFault_nonempty (by
+      rintro ⟨_, typeArgs, _, _⟩ ⟨⟨rfl, ⟨a, b, -, -, rfl⟩, rfl⟩, -⟩
+      refine dwp_interp failUnlinkedCalls
+        (fun i Q u hwp => by
+          cases i with
+          | inl _ => exact False.elim hwp
+          | inr i' =>
+            cases i' with
+            | inl obs => cases obs; exact DWP.vis (DWP.ret hwp)
+            | inr _ => exact False.elim hwp)
+        (DWP.mono (fun out _ h => ?_)
+          (dwp_of_wpMirNoCallSym (checkedAddU8_callee_wp typeArgs a b)))
+      cases out with
+      | normal r => exact ⟨h.1.2.1, fun ha => ha, h⟩
+      | panic => exact ⟨h.1, fun ha => ha⟩
+      | abort => exact False.elim h)
+
+theorem addCaller_linked_totalExact_via_callee_contract (fallback : ExternalCallHandler) :
+    TotalExactPolicyPanicContract
+      (mirHandledTrees (addCallerMir .continue_) (linkCalleeHandler checkedAddU8Mir fallback))
+      addCallerPre addCallerPost addCallerOverflows .forbidAbort :=
+  totalExactPolicyPanicContract_call_compose_of_callee_contract
+    checkedAddU8Contract.withTraitsPreserved .forbidAbort
+    (by
+      rintro ⟨_, _⟩ ⟨⟨a, b, ha, hb, rfl⟩, rfl⟩
+      refine DWP.mono
+        (fun out _ h => (exactPolicyOutcome_forbidAbort_iff _ _ _ out).2 h)
+        (dwp_of_wpMirModularSym (C := checkedAddU8Contract.withTraitsPreserved.toExactPolicyMirCallContract .forbidAbort) (fuel := 8) ?_)
+      (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+      refine ⟨⟨rfl, ⟨a, b, ha, hb, rfl⟩, rfl⟩, fun ans hPost => ?_⟩
+      cases ans with
+      | returned retVal memAfter =>
+        obtain ⟨_, _, ⟨hVal, hFit, hMem⟩, _⟩ := hPost
+        subst hVal hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact ⟨hFit, rfl⟩
+      | panicked memAfter =>
+        obtain ⟨⟨hOver, _⟩, hMem, _⟩ := hPost
+        subst hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact hOver
+      | aborted => exact False.elim hPost.1)
+    (fun _ _ _ _ => ⟨rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩)
+    checkedAddU8_closedCallee_totalExactPolicy
+    (fun _ hPre hNe => False.elim (hNe hPre.1))
+
+/-! ### External-call `UnwindAction.unreachable` UB refutation & explicit panic entrypoints -/
+
+private theorem reaches_bind_of_reachesRet {E : Effect.{u}} [FaultEffect E] {A B : Type u}
+    {t u : ITree E A} {f : A → ITree E B} {tr : List (Event E)} {a : A}
+    (h : Reaches t tr u) (hu : u.observe = .ret a) :
+    Reaches (t >>= f) tr (f a) := by
+  induction h with
+  | refl x =>
+    have hx : x = ITree.ret a := ITree.eq_of_observe_eq (hu.trans (ITree.observe_ret a).symm)
+    subst hx
+    rw [ret_bind]
+    exact .refl (f a)
+  | tau hTau _ ih =>
+    have hx : _ = ITree.tau _ := ITree.eq_of_observe_eq (hTau.trans (ITree.observe_tau _).symm)
+    rw [hx, tau_bind]
+    exact .tau (ITree.observe_tau _) (ih hu)
+  | vis hVis hnf o _ ih =>
+    have hx : _ = ITree.vis _ _ := ITree.eq_of_observe_eq (hVis.trans (ITree.observe_vis _ _).symm)
+    rw [hx, vis_bind]
+    exact .vis (ITree.observe_vis _ _) hnf o (ih hu)
+
+/--
+UB on a *call's* unwind edge (`addCallerMir .unreachable` linked with
+`checkedAddU8Mir`): on overflowing input `(255, 1)`, the callee unwinds and
+`resumeExternalCall ... .unreachable` steps to `.faulted .ub`, refuting every
+panic contract (even with `panicCond := True` and `.waiveAbortUnchecked`).
+-/
+theorem addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf
+    (fallback : ExternalCallHandler)
+    (post : MirInput → MirReturn → Prop) (panicCond : MirInput → Prop)
+    (policy : AbortPolicy MirInput) :
+    ¬ PanicsWithPolicyOnlyIf
+      (mirHandledTrees (addCallerMir .unreachable) (linkCalleeHandler checkedAddU8Mir fallback))
+      addCallerPre post panicCond policy := by
+  intro h
+  have hPre : addCallerPre (scalarArgs2 1 255 1, emptyMemory) := ⟨overflowingArgs_pre, rfl⟩
+  have hSafe := (h _ hPre).1
+  let req : MirCallReq :=
+    { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 255 1,
+      memory := emptyMemory }
+  have hPanics : ∃ tr u, Reaches (linkCalleeHandler checkedAddU8Mir fallback req) tr u ∧
+      u.observe = .ret (.panicked emptyMemory) := by
+    have hTot := checkedAddU8_holdsTotallyOn fallback req ⟨rfl, overflowingArgs_pre, rfl⟩
+    obtain ⟨tr, ans, ⟨u, hr, hu⟩, hPost⟩ :=
+      exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hTot
+    cases ans with
+    | returned _ _ => exact False.elim (hPost.1.2.1 (by decide : (256 : Nat) ≤ 255 + 1))
+    | panicked memAfter =>
+      have hEq : memAfter = emptyMemory := hPost.2.1
+      subst hEq
+      exact ⟨tr, u, hr, hu⟩
+    | aborted => exact False.elim hPost
+  obtain ⟨tr, u, hReachCallee, hu⟩ := hPanics
+  let initSt := initMachineStateWithMemory (addCallerMir .unreachable)
+    (scalarArgs2 1 255 1) emptyMemory
+  let kRaw : MirCallAns → ITree MirEffect MirOutcome :=
+    fun ans =>
+      ITree.cofix (stepMirState (addCallerMir .unreachable))
+        (resumeExternalCall initSt initSt.frame.locals (local_ 0) 1 .unreachable ans)
+  have hTreeEq :
+      mirStatefulTrees (addCallerMir .unreachable) [] (scalarArgs2 1 255 1, emptyMemory) =
+        ITree.vis (E := MirEffect) (Sum.inr (Sum.inr (CallReq.call req))) kRaw := by
+    apply ITree.eq_of_observe_eq
+    change (ITree.cofix (stepMirState (addCallerMir .unreachable)) (.running initSt)).observe = _
+    rw [ITree.observe_cofix]
+    exact (ITree.observe_vis (E := MirEffect) (Sum.inr (Sum.inr (CallReq.call req))) kRaw).symm
+  have hHandledEq :
+      mirHandledTrees (addCallerMir .unreachable)
+          (linkCalleeHandler checkedAddU8Mir fallback) [] (scalarArgs2 1 255 1, emptyMemory) =
+        (linkCalleeHandler checkedAddU8Mir fallback req >>= fun ans =>
+          ITree.tau
+            (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
+              (kRaw ans))) := by
+    rw [mirHandledTrees_apply, hTreeEq]
+    exact interp_vis (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
+      (Sum.inr (Sum.inr (CallReq.call req))) kRaw
+  rw [hHandledEq] at hSafe
+  have hReachCont := reaches_bind_of_reachesRet
+    (f := fun ans =>
+      ITree.tau
+        (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
+          (kRaw ans)))
+    hReachCallee hu
+  refine hSafe tr _ hReachCont ?_
+  have hFaultRaw : kRaw (.panicked emptyMemory) =
+      ITree.vis (E := MirEffect) (Sum.inl (FailReq.fail .ub) : MirEffect.I)
+        (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome)) := by
+    apply ITree.eq_of_observe_eq
+    change (ITree.cofix (stepMirState (addCallerMir .unreachable)) (.faulted .ub)).observe = _
+    rw [ITree.observe_cofix]
+    have hV := ITree.observe_vis (E := MirEffect) (Sum.inl (FailReq.fail .ub) : MirEffect.I)
+      (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome))
+    rw [hV]
+    dsimp only [stepMirState, MirStepNode.fail, ITreeF.map]
+    congr 1
+    funext o
+    exact PEmpty.elim o
+  have hFaultInterp :
+      (ITree.interp (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
+        (kRaw (.panicked emptyMemory))).observe =
+        .vis (E := MirClosedEffect) (Sum.inl (FailReq.fail .ub) : MirClosedEffect.I)
+          (fun o => (PEmpty.elim o : ITree MirClosedEffect MirOutcome)) := by
+    rw [hFaultRaw]
+    have hIV := interp_vis
+      (handleMirExternalCalls (linkCalleeHandler checkedAddU8Mir fallback))
+      (Sum.inl (FailReq.fail .ub) : MirEffect.I)
+      (fun o => (PEmpty.elim o : ITree MirEffect MirOutcome))
+    rw [hIV]
+    dsimp only [handleMirExternalCalls]
+    unfold ITree.fail ITree.triggerSub
+    rw [bind_assoc, vis_bind, ITree.observe_vis]
+    dsimp only [Subeffect.injReq]
+    congr 1
+    funext o
+    exact PEmpty.elim o
+  exact ⟨_, (Sum.inl (FailReq.fail .ub) : MirClosedEffect.I), _,
+    .step (ITree.observe_tau _) (.refl _), hFaultInterp, trivial⟩
+
+/--
+Explicit diverging call to `core::panicking::panic`:
+`bb0: switchInt(copy _1) -> [0: bb1, otherwise: bb2]`,
+`bb1: _2 = core::panicking::panic() -> unwind`, `bb2: _0 = copy _1; return`.
+-/
+def explicitPanicMir (unwind : UnwindAction) : CapturedMir :=
+  mkBody "panic_tests::explicit_panic" 1
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .mut neverTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.switchInt (.copy (local_ 1)) { branches := [(0, 1)], otherwise := 2 })
+        isCleanup := false }
+    , { statements := [ mkStmt (.storageLive 2) ]
+        terminator :=
+          mkTerm (.call (fnItemOp "core::panicking::panic") [] (local_ 2) .none unwind)
+        isCleanup := false }
+    , { statements := [ mkStmt (.assign (local_ 0) (.use (.copy (local_ 1)))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/-- Direct diverging `core::panicking::panic` with `.continue_` satisfies `TotalExactPanicContract`. -/
+theorem explicitPanic_continue_totalExact :
+    TotalExactPanicContract (mirTrees (explicitPanicMir .continue_)) scalarPre1
+      (fun args r => r.1 = .scalar { bits := argBits args 0, sizeBytes := 1 })
+      (fun args => argBits args 0 = 0) :=
+  totalExactPanicContract_of_wpMirSym 8 (by
+    rintro _ ⟨x, -, rfl⟩
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    · rename_i heq; exact (nat_beq_eq_true_iff _ _).1 heq
+    · rename_i heq; exact ⟨(nat_beq_eq_false_iff _ _).1 heq, rfl⟩)
+
+/-- Direct diverging `core::panicking::panic` with `.terminate` aborts cleanly on `x = 0`. -/
+theorem explicitPanic_terminate_totalExact :
+    TotalExactPolicyPanicContract (mirTrees (explicitPanicMir .terminate)) scalarPre1
+      (fun args r => r.1 = .scalar { bits := argBits args 0, sizeBytes := 1 })
+      (fun _ => False) (.abortOnlyIf (fun args => argBits args 0 = 0)) :=
+  totalExactPolicyPanicContract_of_wpMirSym 8 (by
+    rintro _ ⟨x, -, rfl⟩
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    · rename_i heq; exact ⟨(nat_beq_eq_true_iff _ _).1 heq, fun h => h⟩
+    · rename_i heq; exact ⟨fun h => h, (nat_beq_eq_false_iff _ _).1 heq, rfl⟩)
+
+/-- Direct diverging `core::panicking::panic` with `.unreachable` faults `.ub` on `x = 0`. -/
+theorem explicitPanic_unreachable_not_panicsWithPolicyOnlyIf
+    (post : List Value → MirReturn → Prop) (panicCond : List Value → Prop)
+    (policy : AbortPolicy (List Value)) :
+    ¬ PanicsWithPolicyOnlyIf (mirTrees (explicitPanicMir .unreachable)) scalarPre1
+      post panicCond policy :=
+  fun h =>
+    reachesFaultBounded_not_treeSafe 8 (explicitPanicMir .unreachable)
+      (initMachineStateWithCallees (explicitPanicMir .unreachable)
+        [.scalar { bits := 0, sizeBytes := 1 }] []) rfl
+      (h _ ⟨0, by decide, rfl⟩).1
+
+/-! ### `TotalVerificationResult` vs `TotalExactPanicContract` separation -/
+
+/--
+`reactiveSwitchLoopMir` satisfies `Trusted.VerificationResult.TotalVerificationResult`
+(it is `TreeSafe`, `Productive`, `¬ MayDiverge`, and has no `ReachesRet`), yet it
+refutes `TotalExactPanicContract ... (fun _ => False)` because `TotalExactPanicContract`
+demands a completed normal return (`ReturnsIf`).
+-/
+theorem reactiveSwitchLoopMir_totalVerificationResult_not_totalExact :
+    TotalVerificationResult
+        { body := reactiveSwitchLoopMir
+          pre := fun args mem => args = [] ∧ mem = emptyMemory
+          post := fun _ _ _ _ => False } ∧
+      ¬ TotalExactPanicContract (mirStatefulTrees reactiveSwitchLoopMir)
+        (fun x => x.1 = [] ∧ x.2 = emptyMemory) (fun _ _ => False) (fun _ => False) := by
+  have hStep :
+      stepMirState reactiveSwitchLoopMir
+          (.running (initMachineStateWithMemoryAndCallees reactiveSwitchLoopMir [] emptyMemory [])) =
+        .vis (.inr (.inl (.emit (.event 0))))
+          (fun _ => .running
+            (initMachineStateWithMemoryAndCallees reactiveSwitchLoopMir [] emptyMemory [])) :=
+    rfl
+  refine ⟨?_, ?_⟩
+  · refine (totalVerificationResult_iff_neverPanics _).2 ⟨?_, ?_⟩
+    · refine neverPanics_iff.2 ?_
+      rintro ⟨_, _⟩ ⟨rfl, rfl⟩
+      refine ⟨fun tr u hr hFault => ?_, fun tr out hr =>
+        False.elim (not_reachesRet_cofix_selfLoop hStep tr out hr)⟩
+      have hu := reaches_cofix_selfLoop hStep hr
+      subst hu
+      obtain ⟨u', i, k, hTau, hObs, hF⟩ := hFault
+      have hu' := reaches_cofix_selfLoop hStep (Reaches.of_tauStar hTau (.refl u'))
+      subst hu'
+      rw [ITree.observe_cofix, hStep] at hObs
+      injection hObs with hi _
+      subst hi
+      exact hF
+    · rintro ⟨_, _⟩ ⟨rfl, rfl⟩
+      exact ⟨productive_cofix_selfLoop hStep, not_mayDiverge_cofix_selfLoop hStep⟩
+  · intro hTot
+    obtain ⟨tr, r, hr⟩ := hTot.returnsIf ([], emptyMemory) ⟨rfl, rfl⟩ (fun h => h)
+    exact not_reachesRet_cofix_selfLoop hStep tr (.normal r) hr
+
+/-! ### `CalleesCallBoundaryPreserved`, stateful init boundary, and indirect/fn-item calls -/
+
+def midHelperPath : DefPath := "panic_tests::mid_helper"
+
+/-- Transitive helper that calls `checked_add_u8`. -/
+def midHelperMir : CapturedMir :=
+  mkBody midHelperPath 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/-- Inlined mutant of `midHelperMir` where `checked_add_u8` was erased. -/
+def midHelperInlinedMir : CapturedMir :=
+  checkedAddMir midHelperPath u8Ty u8CheckedTy .continue_
+
+/-- Outer caller that calls `mid_helper` (not `checked_add_u8` directly). -/
+def outerCallerMir : CapturedMir :=
+  mkBody "panic_tests::outer_caller" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (fnItemOp midHelperPath) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/-- Positive transitive guard: `midHelperMir` is linked, calls `checked_add_u8`, and `checked_add_u8` is unlinked. -/
+theorem outerCaller_calleesCallBoundaryPreserved :
+    CalleesCallBoundaryPreserved outerCallerMir [midHelperMir] [midHelperPath] checkedAddU8Path ∧
+      (∀ args, CalleeTableExcludes
+        (initMachineStateWithCallees outerCallerMir args [midHelperMir]).memory checkedAddU8Path) ∧
+      (∀ args mem, CalleeTableExcludes
+        (initMachineStateWithMemoryAndCallees outerCallerMir args mem [midHelperMir]).memory
+        checkedAddU8Path) :=
+  have hPres :
+      CalleesCallBoundaryPreserved outerCallerMir [midHelperMir] [midHelperPath] checkedAddU8Path :=
+    (calleesCallBoundaryPreserved_iff _ _ _ _).1 rfl
+  ⟨hPres, fun args => hPres.calleeTableExcludes_init args,
+   fun args mem => hPres.calleeTableExcludes_initStateful_of_ne_nil (by decide) args mem⟩
+
+/-- Negative transitive guard cases: inlined helper, missing helper (non-vacuity), and linked target (soundness). -/
+theorem outerCaller_calleesCallBoundaryPreserved_refutations :
+    ¬ CalleesCallBoundaryPreserved outerCallerMir [midHelperInlinedMir] [midHelperPath]
+        checkedAddU8Path ∧
+      ¬ CalleesCallBoundaryPreserved outerCallerMir [] [midHelperPath] checkedAddU8Path ∧
+      ¬ CalleesCallBoundaryPreserved outerCallerMir [midHelperMir, checkedAddU8Mir]
+        [midHelperPath] checkedAddU8Path := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro h
+    have hCheck := (calleesCallBoundaryPreserved_iff _ _ _ _).2 h
+    have hFalse :
+        calleesCallBoundaryPreserved outerCallerMir [midHelperInlinedMir] [midHelperPath]
+          checkedAddU8Path = false := rfl
+    rw [hFalse] at hCheck; nomatch hCheck
+  · exact not_calleesCallBoundaryPreserved_of_missing_caller
+      (List.mem_singleton.2 rfl) (fun _ hMem => nomatch hMem)
+  · exact not_calleesCallBoundaryPreserved_of_linked_target (targetBody := checkedAddU8Mir) rfl
+
+/--
+Boundary warning for `mirStatefulTrees ... []`: `CallBoundaryPreserved callerBody [] target`
+holds, yet `initMachineStateWithMemoryAndCallees callerBody args mem []` keeps
+pre-populated `mem.callees`, so `CalleeTableExcludes` fails if `target` is already
+in `mem.callees`.
+-/
+theorem callBoundaryPreserved_emptyCallees_does_not_guard_prepopulated_mem :
+    CallBoundaryPreserved (addCallerMir .continue_) [] checkedAddU8Path ∧
+      ¬ CalleeTableExcludes
+        (initMachineStateWithMemoryAndCallees (addCallerMir .continue_)
+          (scalarArgs2 1 1 2) { emptyMemory with callees := [checkedAddU8Mir] } []).memory
+        checkedAddU8Path := by
+  refine ⟨addCaller_callBoundaryPreserved .continue_, ?_⟩
+  intro h
+  have hNone := h emptyLayoutTable []
+  change lookupCallee [checkedAddU8Mir] emptyLayoutTable checkedAddU8Path [] [] = none at hNone
+  have hSome :
+      lookupCallee [checkedAddU8Mir] emptyLayoutTable checkedAddU8Path [] [] =
+        .some checkedAddU8Mir := rfl
+  rw [hSome] at hNone
+  nomatch hNone
+
+/-- End-to-end call-resumption guard preservation on `twoCallCallerMir`. -/
+theorem twoCall_resumed_state_guard_preserved (retVal : Value) (memAfter : Memory)
+    (nextState : MachineState)
+    (hPost : helperContract.withTraitsPreserved.toMirCallContract.post helperReq
+      (.returned retVal memAfter))
+    (hRes : resumeExternalCall twoCallInit twoCallInit.frame.locals (local_ 0) 1 .continue_
+      (.returned retVal memAfter) = .running nextState) :
+    CalleeTableExcludes nextState.memory contractedPath :=
+  CalleeTableExcludes.of_resumeExternalCall_withTraitsPreserved helperContract .forbidAbort
+    hPost hRes linkedMem_calleeTableExcludes
+
+def fnItemTy : Ty := { kind := .fnDef checkedAddU8Path [], layoutIdx := 0 }
+def fnPtrSig : RigidTy := .fnPtr [.uint .u8, .uint .u8] (.uint .u8) .safe .rust
+def fnPtrTy : Ty := { kind := fnPtrSig, layoutIdx := 0 }
+
+def fnItemLocalMir : CapturedMir :=
+  mkBody "panic_tests::fn_item_local_caller" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .not fnItemTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (.copy (local_ 3)) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+def fnPtrCallerMir : CapturedMir :=
+  mkBody "panic_tests::fn_ptr_caller" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .not fnPtrTy ]
+    [ { statements := []
+        terminator :=
+          mkTerm (.call (.move (local_ 3)) [.copy (local_ 1), .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+def fnPtrEntry : FnPtrEntry :=
+  { allocId := 99, defPath := checkedAddU8Path, typeArgs := [], fnSig := .some fnPtrSig }
+
+def fnPtrMem : Memory :=
+  { emptyMemory with fnPtrs := [fnPtrEntry] }
+
+/--
+Runtime guard covers local ZST `fnDef` calls (both `.unit` and `.aggregate 0 []`)
+and indirect `mem.fnPtrs` calls, even though the syntactic checker returns `false`
+on `Operand.copy`/`Operand.move`.
+-/
+theorem indirect_and_fnItem_local_boundary_probes (a b : Nat) :
+    let sUnit : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0,
+                   locals := [.uninit, .init (.scalar { bits := a, sizeBytes := 1 }),
+                              .init (.scalar { bits := b, sizeBytes := 1 }), .init .unit] }
+        memory := emptyMemory }
+    let sAgg : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0,
+                   locals := [.uninit, .init (.scalar { bits := a, sizeBytes := 1 }),
+                              .init (.scalar { bits := b, sizeBytes := 1 }),
+                              .init (.aggregate 0 [])] }
+        memory := emptyMemory }
+    let sPtr : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0,
+                   locals := [.uninit, .init (.scalar { bits := a, sizeBytes := 1 }),
+                              .init (.scalar { bits := b, sizeBytes := 1 }),
+                              .init (.ptr { allocId := 99, offsetBytes := 0 } 8)] }
+        memory := fnPtrMem }
+    let termCopy :=
+      mkTerm (.call (.copy (local_ 3)) [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (.some 1) .continue_)
+    let termMove :=
+      mkTerm (.call (.move (local_ 3)) [.copy (local_ 1), .copy (local_ 2)]
+        (local_ 0) (.some 1) .continue_)
+    evalTerminator sUnit termCopy (.some fnItemLocalMir) =
+        MirStepNode.extCall
+          { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 a b,
+            memory := emptyMemory }
+          (resumeExternalCall sUnit sUnit.frame.locals (local_ 0) 1 .continue_) ∧
+      evalTerminator sAgg termCopy (.some fnItemLocalMir) =
+        MirStepNode.extCall
+          { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 a b,
+            memory := emptyMemory }
+          (resumeExternalCall sAgg sAgg.frame.locals (local_ 0) 1 .continue_) ∧
+      evalTerminator sPtr termMove (.some fnPtrCallerMir) =
+        MirStepNode.extCall
+          { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 a b,
+            memory := fnPtrMem }
+          (resumeExternalCall sPtr
+            [.uninit, .init (.scalar { bits := a, sizeBytes := 1 }),
+             .init (.scalar { bits := b, sizeBytes := 1 }), .uninit]
+            (local_ 0) 1 .continue_) ∧
+      terminatorCallsDefPath checkedAddU8Path termCopy = false ∧
+      terminatorCallsDefPath checkedAddU8Path termMove = false := by
+  intro sUnit sAgg sPtr termCopy termMove
+  refine ⟨?_, ?_, ?_, rfl, rfl⟩
+  · exact evalTerminator_call_extCall_of_calleeTableExcludes
+      (target := { defPath := checkedAddU8Path, typeArgs := [], fnSig := .none, isIndirect := false })
+      rfl
+      (resolveCallTarget_fnItem_local sUnit (.copy (local_ 3)) checkedAddU8Path [] 2
+        fnItemLocalMir.localDecls fnItemLocalMir.layouts sUnit.frame.locals rfl rfl rfl)
+      rfl emptyMemory_calleeTableExcludes rfl (Or.inr rfl)
+  · exact evalTerminator_call_extCall_of_calleeTableExcludes
+      (target := { defPath := checkedAddU8Path, typeArgs := [], fnSig := .none, isIndirect := false })
+      rfl
+      (resolveCallTarget_fnItem_local_aggregate sAgg (.copy (local_ 3)) checkedAddU8Path [] 2
+        fnItemLocalMir.localDecls fnItemLocalMir.layouts sAgg.frame.locals rfl rfl rfl)
+      rfl emptyMemory_calleeTableExcludes rfl (Or.inr rfl)
+  · exact evalTerminator_call_extCall_of_calleeTableExcludes
+      (target := { defPath := checkedAddU8Path, typeArgs := [], fnSig := .some fnPtrSig,
+                   isIndirect := true })
+      rfl
+      (resolveCallTarget_fnPtr sPtr (.move (local_ 3)) 2 fnPtrCallerMir.localDecls
+        fnPtrCallerMir.layouts { allocId := 99, offsetBytes := 0 } fnPtrEntry
+        [.uninit, .init (.scalar { bits := a, sizeBytes := 1 }),
+         .init (.scalar { bits := b, sizeBytes := 1 }), .uninit]
+        rfl rfl rfl rfl rfl rfl)
+      rfl (calleeTableExcludes_of_callees_nil rfl) rfl (Or.inl rfl)
+
+/-! ### Concrete `ExactPolicy` mutual exclusion & `waiveAbortUnchecked` handler refutation -/
+
+/--
+Concrete handler refutation: `checkedAddU8Mir` linked via `linkCalleeHandler`
+returns normally on `(0, 0)`, so it refutes
+`(checkedAddU8Contract.toExactPolicyMirCallContract .waiveAbortUnchecked).holdsOn`.
+-/
+theorem checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked
+    (fallback : ExternalCallHandler) :
+    ¬ (checkedAddU8Contract.toExactPolicyMirCallContract .waiveAbortUnchecked).holdsOn
+      (linkCalleeHandler checkedAddU8Mir fallback) := by
+  have hReq : checkedAddU8Contract.pre
+      { defPath := checkedAddU8Path, typeArgs := [], args := scalarArgs2 1 0 0,
+        memory := emptyMemory } :=
+    ⟨rfl, zeroArgs_pre, rfl⟩
+  have hTot := checkedAddU8_holdsTotallyOn fallback _ hReq
+  obtain ⟨tr, ans, hr, hPost⟩ := exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hTot
+  cases ans with
+  | returned retVal memAfter =>
+    exact PanicMirCallContract.not_holdsOn_toExactPolicy_waiveAbortUnchecked_of_returns
+      hReq hr
+  | panicked _ => exact False.elim (show ¬ ((256 : Nat) ≤ 0 + 0) by decide <| hPost.1)
+  | aborted => exact False.elim hPost
+
+/-- Concrete mutual exclusion of `panicCond` and `abortCond` on closed linked caller–callee trees. -/
+theorem addCaller_terminate_conds_disjoint (fallback : ExternalCallHandler)
+    (x : MirInput) (hx : addCallerPre x) :
+    ¬ (False ∧ addCallerOverflows x) :=
+  mirClosed_exactPanicAbortContract_conds_disjoint
+    (addCaller_terminate_linked_exactPanicAbort fallback) hx
+
+/-! ### Concrete `Anneal.Pass` variance instantiation (NOP insertion / elimination) -/
+
+/--
+NOP-inserted variant of `checkedAddU8Mir`: prepends `StatementKind.nop` to
+`bb0`, adding one extra silent `.tau` step before executing the identical
+overflow check and return.
+-/
+def checkedAddU8NopMir : CapturedMir :=
+  mkBody "panic_tests::checked_add_u8_nop" 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .mut u8CheckedTy ]
+    [ { statements :=
+          [ mkStmt .nop
+          , mkStmt (.storageLive 3)
+          , mkStmt (.assign (local_ 3)
+              (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))) ]
+        terminator :=
+          mkTerm (.assert
+            (.move { local_ := 3, projection := [.field 1 boolTy] }) false 1 .continue_)
+        isCleanup := false }
+    , { statements :=
+          [ mkStmt (.assign (local_ 0)
+              (.use (.move { local_ := 3, projection := [.field 0 u8Ty] }))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+private theorem cofix_eq_of_step_ret {step : MirExecState → MirStepNode} {st : MirExecState}
+    {out : MirOutcome} (h : step st = .ret out) :
+    ITree.cofix step st = .ret out := by
+  apply ITree.eq_of_observe_eq
+  rw [ITree.observe_cofix, h, ITree.observe_ret]
+  rfl
+
+private theorem cofix_eq_of_step_tau {step : MirExecState → MirStepNode} {st st' : MirExecState}
+    (h : step st = .tau st') :
+    ITree.cofix step st = .tau (ITree.cofix step st') := by
+  apply ITree.eq_of_observe_eq
+  rw [ITree.observe_cofix, h, ITree.observe_tau]
+  rfl
+
+private theorem cofix_eq_of_step_fail {step : MirExecState → MirStepNode} {st : MirExecState}
+    {fk : FailureKind} (h : step st = MirStepNode.fail fk) :
+    ITree.cofix step st = ITree.fail (E := MirEffect) fk := by
+  apply ITree.eq_of_observe_eq
+  rw [ITree.observe_cofix, h]
+  unfold ITree.fail ITree.triggerSub
+  rw [vis_bind, ITree.observe_vis]
+  dsimp only [MirStepNode.fail, ITreeF.map, Subeffect.injReq]
+  congr 1
+  funext o
+  exact PEmpty.elim o
+
+private theorem evalScalarBinOp_addWithOverflow_mem {lhs rhs : ScalarInt}
+    {locals locals' : List LocalSlot} {mem mem' : Memory} {isSigned : Bool} {val : Value}
+    (h : evalScalarBinOp .addWithOverflow lhs rhs locals mem isSigned = .ok val locals' mem') :
+    mem' = mem := by
+  unfold evalScalarBinOp at h
+  simp only [] at h
+  split at h
+  · contradiction
+  · split at h
+    · contradiction
+    · cases isSigned <;> (simp only [] at h; injection h with _ _ hMem; exact hMem.symm)
+
+private theorem evalRvalue_addWithOverflow_mem {locals : List LocalSlot}
+    {lhs rhs : Operand} {mem mem' : Memory} {decls : List LocalDecl}
+    {layouts : LayoutTable} {val : Value} {locals' : List LocalSlot}
+    (h : evalRvalue locals (.binaryOp .addWithOverflow lhs rhs) mem decls layouts =
+      .ok val locals' mem') :
+    mem' = mem := by
+  unfold evalRvalue at h
+  simp only [] at h
+  cases hL : evalOperand locals lhs mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack with
+  | ub => simp only [hL] at h; nomatch h
+  | unsupported => simp only [hL] at h; nomatch h
+  | ok lv l1 =>
+    simp only [hL] at h
+    cases hR : evalOperand l1 rhs mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack with
+    | ub => simp only [hR] at h; nomatch h
+    | unsupported => simp only [hR] at h; nomatch h
+    | ok rv l2 =>
+      simp only [hR] at h
+      cases lv with
+      | scalar ls =>
+        cases rv with
+        | scalar rs => exact evalScalarBinOp_addWithOverflow_mem h
+        | ptr _ _ => nomatch h
+        | _ => nomatch h
+      | ptr _ _ =>
+        cases rv with
+        | scalar _ => nomatch h
+        | ptr _ _ => nomatch h
+        | _ => nomatch h
+      | aggregate _ _ =>
+        cases rv with
+        | aggregate _ _ =>
+          simp only [evalWidePtrAggregateRelBinOp, isRelationalBinOp] at h
+          split at h <;> nomatch h
+        | _ => nomatch h
+      | _ => nomatch h
+
+private theorem evalRvalue_use_move_local_mem {locals : List LocalSlot}
+    {loc : Local} {proj : List ProjectionElem} {mem mem' : Memory}
+    {decls : List LocalDecl} {layouts : LayoutTable} {val : Value}
+    {locals' : List LocalSlot}
+    (hNoDeref : ∀ p rest, proj = p :: rest → p ≠ .deref)
+    (h : evalRvalue locals (.use (.move { local_ := loc, projection := proj })) mem decls layouts =
+      .ok val locals' mem') :
+    mem' = mem := by
+  unfold evalRvalue at h
+  simp only [] at h
+  cases hEval : evalOperand locals (.move { local_ := loc, projection := proj })
+      mem.borrows mem.globals layouts mem.callerLocals decls mem.callStack with
+  | ub => simp only [hEval] at h; nomatch h
+  | unsupported => simp only [hEval] at h; nomatch h
+  | ok v l' =>
+    simp only [hEval] at h
+    cases hVal : validateLoadedValue layouts decls
+        (.move { local_ := loc, projection := proj }) v with
+    | false => simp only [hVal] at h; nomatch h
+    | true =>
+      simp only [hVal] at h
+      cases proj with
+      | nil => injection h with _ _ hMem; exact hMem.symm
+      | cons p rest =>
+        have hNe := hNoDeref p rest rfl
+        cases p with
+        | deref => exact False.elim (hNe rfl)
+        | _ => injection h with _ _ hMem; exact hMem.symm
+
+private theorem eutt_tau_tau {E : Effect.{u}} {R : Type u} {t u : ITree E R}
+    (h : Eutt t u) : Eutt (.tau t) (.tau u) := by
+  rw [Eutt.eq_def]
+  exact Or.inr (Or.inr ⟨t, u, ITree.observe_tau t, ITree.observe_tau u, h⟩)
+
+private theorem eutt_tau_right_of {E : Effect.{u}} {R : Type u} {t u : ITree E R}
+    (h : Eutt t u) : Eutt t (.tau u) := by
+  refine Eutt.coinduct (fun a b => Eutt a b ∨ ∃ b', b.observe = .tau b' ∧ Eutt a b') ?_ t (.tau u)
+    (Or.inr ⟨u, ITree.observe_tau u, h⟩)
+  intro a b hab
+  rcases hab with hEq | ⟨b', hb', hEq⟩
+  · rw [Eutt.eq_def] at hEq
+    rcases hEq with ⟨a', b', r, ha, hb, har, hbr⟩ |
+      ⟨a', b', i, k₁, k₂, ha, hb, hav, hbv, hk⟩ | ⟨a', b', ha, hb, h'⟩
+    · exact Or.inl ⟨a', b', r, ha, hb, har, hbr⟩
+    · exact Or.inr (Or.inl ⟨a', b', i, k₁, k₂, ha, hb, hav, hbv, fun o => Or.inl (hk o)⟩)
+    · exact Or.inr (Or.inr ⟨a', b', ha, hb, Or.inl h'⟩)
+  · rw [Eutt.eq_def] at hEq
+    rcases hEq with ⟨a', c', r, ha, hb, har, hbr⟩ |
+      ⟨a', c', i, k₁, k₂, ha, hb, hav, hbv, hk⟩ | ⟨a', c', ha, hb, h'⟩
+    · exact Or.inl ⟨a', c', r, ha, .step hb' hb, har, hbr⟩
+    · exact Or.inr (Or.inl ⟨a', c', i, k₁, k₂, ha, .step hb' hb, hav, hbv, fun o => Or.inl (hk o)⟩)
+    · exact Or.inr (Or.inr ⟨a', b', ha, hb', Or.inr ⟨c', hb, h'⟩⟩)
+
+private theorem checkedAddU8_bb1_eutt (locals : List LocalSlot) :
+    Eutt
+      (ITree.cofix (stepMirState checkedAddU8Mir)
+        (.running { frame := { blockIdx := 1, stmtIdx := 0, locals := locals },
+                    memory := emptyMemory }))
+      (ITree.cofix (stepMirState checkedAddU8NopMir)
+        (.running { frame := { blockIdx := 1, stmtIdx := 0, locals := locals },
+                    memory := emptyMemory })) := by
+  let s : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0, locals := locals }, memory := emptyMemory }
+  have hStep1 :
+      stepMirState checkedAddU8Mir (.running s) =
+        evalStmt s (mkStmt (.assign (local_ 0)
+            (.use (.move { local_ := 3, projection := [.field 0 u8Ty] }))))
+          checkedAddU8Mir.localDecls checkedAddU8Mir.layouts := rfl
+  have hStep2 :
+      stepMirState checkedAddU8NopMir (.running s) =
+        evalStmt s (mkStmt (.assign (local_ 0)
+            (.use (.move { local_ := 3, projection := [.field 0 u8Ty] }))))
+          checkedAddU8Mir.localDecls checkedAddU8Mir.layouts := rfl
+  cases hRv : evalRvalue locals (.use (.move { local_ := 3, projection := [.field 0 u8Ty] }))
+      emptyMemory checkedAddU8Mir.localDecls checkedAddU8Mir.layouts with
+  | ub =>
+    rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+          (by rw [hStep1]; simp only [evalStmt, mkStmt, s, hRv]),
+        cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+          (by rw [hStep2]; simp only [evalStmt, mkStmt, s, hRv])]
+    exact Eutt.refl _
+  | unsupported =>
+    rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .unsupported)
+          (by rw [hStep1]; simp only [evalStmt, mkStmt, s, hRv]; rfl),
+        cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .unsupported)
+          (by rw [hStep2]; simp only [evalStmt, mkStmt, s, hRv]; rfl)]
+    exact Eutt.refl _
+  | ok val locals₁ mem₁ =>
+    have hMemEq : mem₁ = emptyMemory :=
+      evalRvalue_use_move_local_mem (fun _ _ hEq => by injection hEq with hp; subst hp; intro h; nomatch h) hRv
+    subst hMemEq
+    cases hGet : Trusted.Sequence.get? locals₁ 0 with
+    | none =>
+      rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+            (by rw [hStep1]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet]),
+          cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+            (by rw [hStep2]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet])]
+      exact Eutt.refl _
+    | some slot =>
+      cases slot with
+      | dead =>
+        rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+              (by rw [hStep1]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet]),
+            cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+              (by rw [hStep2]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet])]
+        exact Eutt.refl _
+      | uninit | init _ =>
+        cases hSet : Trusted.Sequence.set? locals₁ 0 (.init val) with
+        | none =>
+          rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                (by rw [hStep1]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet, hSet]),
+              cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                (by rw [hStep2]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet, hSet])]
+          exact Eutt.refl _
+        | some locals₂ =>
+          let sNext : MachineState :=
+            { frame := { blockIdx := 1, stmtIdx := 1, locals := locals₂ }, memory := emptyMemory }
+          rw [cofix_eq_of_step_tau (step := stepMirState checkedAddU8Mir) (st' := .running sNext)
+                (by rw [hStep1]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet, hSet]; rfl),
+              cofix_eq_of_step_tau (step := stepMirState checkedAddU8NopMir) (st' := .running sNext)
+                (by rw [hStep2]; simp only [evalStmt, mkStmt, local_, s, hRv, hGet, hSet]; rfl)]
+          apply eutt_tau_tau
+          have hRet1 : stepMirState checkedAddU8Mir (.running sNext) =
+              evalTerminator sNext (mkTerm .return_) (.some checkedAddU8Mir) := rfl
+          have hRet2 : stepMirState checkedAddU8NopMir (.running sNext) =
+              evalTerminator sNext (mkTerm .return_) (.some checkedAddU8Mir) := rfl
+          cases hNode : evalTerminator sNext (mkTerm .return_) (.some checkedAddU8Mir) with
+          | ret out =>
+            rw [cofix_eq_of_step_ret (step := stepMirState checkedAddU8Mir) (hRet1.trans hNode),
+                cofix_eq_of_step_ret (step := stepMirState checkedAddU8NopMir) (hRet2.trans hNode)]
+            exact Eutt.refl _
+          | tau st' =>
+            simp only [evalTerminator, mkTerm, sNext] at hNode
+            repeat (split at hNode <;> try contradiction)
+          | vis i k =>
+            have hFk : ∃ fk, evalTerminator sNext (mkTerm .return_) (.some checkedAddU8Mir) =
+                MirStepNode.fail fk := by
+              simp only [evalTerminator, mkTerm, sNext] at hNode ⊢
+              repeat (split at hNode <;> try contradiction)
+              all_goals (try exact ⟨.ub, rfl⟩)
+            obtain ⟨fk, hF⟩ := hFk
+            rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (hRet1.trans hF),
+                cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (hRet2.trans hF)]
+            exact Eutt.refl _
+
+/-- Every `args : List Value` gives an `Eutt`-equivalent tree under NOP insertion. -/
+theorem checkedAddU8_nop_eutt (args : List Value) :
+    Eutt (mirTrees checkedAddU8Mir [] args) (mirTrees checkedAddU8NopMir [] args) := by
+  let s₀ : MachineState := initMachineStateWithCallees checkedAddU8Mir args []
+  -- Step 0 of `checkedAddU8NopMir`: `.nop` advances `stmtIdx` from `0` to `1`.
+  have hNop0 :
+      mirTrees checkedAddU8NopMir [] args =
+        .tau (ITree.cofix (stepMirState checkedAddU8NopMir)
+          (.running { s₀ with frame := { s₀.frame with stmtIdx := 1 } })) :=
+    cofix_eq_of_step_tau (step := stepMirState checkedAddU8NopMir)
+      (st := .running s₀) (st' := .running { s₀ with frame := { s₀.frame with stmtIdx := 1 } }) rfl
+  rw [hNop0]
+  apply eutt_tau_right_of
+  -- Step 1 (`storageLive 3`): identical locals update in both bodies.
+  have hLiveStepA :
+      stepMirState checkedAddU8Mir (.running s₀) =
+        evalStmt s₀ (mkStmt (.storageLive 3)) checkedAddU8Mir.localDecls
+          checkedAddU8Mir.layouts := rfl
+  have hLiveStepB :
+      stepMirState checkedAddU8NopMir
+          (.running { s₀ with frame := { s₀.frame with stmtIdx := 1 } }) =
+        evalStmt { s₀ with frame := { s₀.frame with stmtIdx := 1 } }
+          (mkStmt (.storageLive 3)) checkedAddU8Mir.localDecls
+          checkedAddU8Mir.layouts := rfl
+  cases hGet3 : Trusted.Sequence.get? s₀.frame.locals 3 with
+  | none =>
+    change Eutt (ITree.cofix (stepMirState checkedAddU8Mir) (.running s₀)) _
+    rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+          (by rw [hLiveStepA]; simp only [evalStmt, mkStmt, hGet3]),
+        cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+          (by rw [hLiveStepB]; simp only [evalStmt, mkStmt, hGet3])]
+    exact Eutt.refl _
+  | some slot3 =>
+    cases hSet3 : Trusted.Sequence.set? s₀.frame.locals 3 .uninit with
+    | none =>
+      change Eutt (ITree.cofix (stepMirState checkedAddU8Mir) (.running s₀)) _
+      rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+            (by rw [hLiveStepA]; simp only [evalStmt, mkStmt, hGet3, hSet3]),
+          cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+            (by rw [hLiveStepB]; simp only [evalStmt, mkStmt, hGet3, hSet3])]
+      exact Eutt.refl _
+    | some locals₁ =>
+      let s₁A : MachineState :=
+        { frame := { blockIdx := 0, stmtIdx := 1, locals := locals₁ }, memory := emptyMemory }
+      let s₁B : MachineState :=
+        { frame := { blockIdx := 0, stmtIdx := 2, locals := locals₁ }, memory := emptyMemory }
+      have hLiveA :
+          mirTrees checkedAddU8Mir [] args =
+            .tau (ITree.cofix (stepMirState checkedAddU8Mir) (.running s₁A)) :=
+        cofix_eq_of_step_tau (step := stepMirState checkedAddU8Mir) (by
+          rw [hLiveStepA]; simp only [evalStmt, mkStmt, hGet3, hSet3]; rfl)
+      have hLiveB :
+          ITree.cofix (stepMirState checkedAddU8NopMir)
+              (.running { s₀ with frame := { s₀.frame with stmtIdx := 1 } }) =
+            .tau (ITree.cofix (stepMirState checkedAddU8NopMir) (.running s₁B)) :=
+        cofix_eq_of_step_tau (step := stepMirState checkedAddU8NopMir) (by
+          rw [hLiveStepB]; simp only [evalStmt, mkStmt, hGet3, hSet3]; rfl)
+      rw [hLiveA, hLiveB]
+      apply eutt_tau_tau
+      -- Step 2 (`assign _3 = AddWithOverflow(_1, _2)`): same `evalRvalue` in both bodies.
+      have hAsgnA :
+          stepMirState checkedAddU8Mir (.running s₁A) =
+            evalStmt s₁A (mkStmt (.assign (local_ 3)
+                (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))))
+              checkedAddU8Mir.localDecls checkedAddU8Mir.layouts := rfl
+      have hAsgnB :
+          stepMirState checkedAddU8NopMir (.running s₁B) =
+            evalStmt s₁B (mkStmt (.assign (local_ 3)
+                (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))))
+              checkedAddU8Mir.localDecls checkedAddU8Mir.layouts := rfl
+      cases hRv : evalRvalue locals₁
+          (.binaryOp .addWithOverflow (.copy (local_ 1)) (.copy (local_ 2)))
+          emptyMemory checkedAddU8Mir.localDecls checkedAddU8Mir.layouts with
+      | ub =>
+        rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+              (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]),
+            cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+              (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv])]
+        exact Eutt.refl _
+      | unsupported =>
+        rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .unsupported)
+              (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]; rfl),
+            cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .unsupported)
+              (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv]; rfl)]
+        exact Eutt.refl _
+      | ok val locals₂ mem₂ =>
+        have hMemEq : mem₂ = emptyMemory := evalRvalue_addWithOverflow_mem hRv
+        subst hMemEq
+        cases hGet : Trusted.Sequence.get? locals₂ 3 with
+        | none =>
+          rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]; simp only [local_, hGet]),
+              cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv]; simp only [local_, hGet])]
+          exact Eutt.refl _
+        | some slot =>
+          cases slot with
+          | dead =>
+            rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                  (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]; simp only [local_, hGet]),
+                cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                  (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv]; simp only [local_, hGet])]
+            exact Eutt.refl _
+          | uninit | init _ =>
+            cases hSet : Trusted.Sequence.set? locals₂ 3 (.init val) with
+            | none =>
+              rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                    (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]; simp only [local_, hGet, hSet]),
+                  cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                    (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv]; simp only [local_, hGet, hSet])]
+              exact Eutt.refl _
+            | some locals₃ =>
+              let s₂A : MachineState :=
+                { frame := { blockIdx := 0, stmtIdx := 2, locals := locals₃ }, memory := emptyMemory }
+              let s₂B : MachineState :=
+                { frame := { blockIdx := 0, stmtIdx := 3, locals := locals₃ }, memory := emptyMemory }
+              rw [cofix_eq_of_step_tau (step := stepMirState checkedAddU8Mir) (st' := .running s₂A)
+                    (by rw [hAsgnA]; simp only [evalStmt, mkStmt, s₁A, hRv]; simp only [local_, hGet, hSet]; rfl),
+                  cofix_eq_of_step_tau (step := stepMirState checkedAddU8NopMir) (st' := .running s₂B)
+                    (by rw [hAsgnB]; simp only [evalStmt, mkStmt, s₁B, hRv]; simp only [local_, hGet, hSet]; rfl)]
+              apply eutt_tau_tau
+              -- Step 3 (`assert !(_3.1) -> bb1`): converges to identical `bb1` state or `.panic`/`.ub`.
+              have hTermA :
+                  stepMirState checkedAddU8Mir (.running s₂A) =
+                    evalTerminator s₂A
+                      (mkTerm (.assert (.move { local_ := 3, projection := [.field 1 boolTy] })
+                        false 1 .continue_))
+                      (.some checkedAddU8Mir) := rfl
+              have hTermB :
+                  stepMirState checkedAddU8NopMir (.running s₂B) =
+                    evalTerminator s₂B
+                      (mkTerm (.assert (.move { local_ := 3, projection := [.field 1 boolTy] })
+                        false 1 .continue_))
+                      (.some checkedAddU8NopMir) := rfl
+              have hLay : checkedAddU8NopMir.layouts = checkedAddU8Mir.layouts := rfl
+              cases hOp : evalOperand locals₃
+                  (.move { local_ := 3, projection := [.field 1 boolTy] })
+                  emptyMemory.borrows emptyMemory.globals checkedAddU8Mir.layouts
+                  emptyMemory.callerLocals [] emptyMemory.callStack with
+              | ub =>
+                rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                      (by rw [hTermA]; simp only [evalTerminator, mkTerm, s₂A, hOp]),
+                    cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                      (by rw [hTermB]; simp only [evalTerminator, mkTerm, s₂B, hLay, hOp])]
+                exact Eutt.refl _
+              | unsupported =>
+                rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .unsupported)
+                      (by rw [hTermA]; simp only [evalTerminator, mkTerm, s₂A, hOp]; rfl),
+                    cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .unsupported)
+                      (by rw [hTermB]; simp only [evalTerminator, mkTerm, s₂B, hLay, hOp]; rfl)]
+                exact Eutt.refl _
+              | ok condVal locals₄ =>
+                cases condVal with
+                | scalar sc =>
+                  cases hBit : Nat.beq sc.bits 0 with
+                  | true =>
+                    let s₃ : MachineState :=
+                      { frame := { blockIdx := 1, stmtIdx := 0, locals := locals₄ },
+                        memory := emptyMemory }
+                    rw [cofix_eq_of_step_tau (step := stepMirState checkedAddU8Mir) (st' := .running s₃)
+                          (by rw [hTermA]; simp only [evalTerminator, mkTerm, s₂A, hOp, hBit]; rfl),
+                        cofix_eq_of_step_tau (step := stepMirState checkedAddU8NopMir) (st' := .running s₃)
+                          (by rw [hTermB]; simp only [evalTerminator, mkTerm, s₂B, hLay, hOp, hBit]; rfl)]
+                    exact eutt_tau_tau (checkedAddU8_bb1_eutt locals₄)
+                  | false =>
+                    rw [cofix_eq_of_step_ret (step := stepMirState checkedAddU8Mir) (out := .panic)
+                          (by rw [hTermA]; simp only [evalTerminator, mkTerm, s₂A, hOp, hBit]; rfl),
+                        cofix_eq_of_step_ret (step := stepMirState checkedAddU8NopMir) (out := .panic)
+                          (by rw [hTermB]; simp only [evalTerminator, mkTerm, s₂B, hLay, hOp, hBit]; rfl)]
+                    exact Eutt.refl _
+                | _ =>
+                  rw [cofix_eq_of_step_fail (step := stepMirState checkedAddU8Mir) (fk := .ub)
+                        (by rw [hTermA]; simp only [evalTerminator, mkTerm, s₂A, hOp]),
+                      cofix_eq_of_step_fail (step := stepMirState checkedAddU8NopMir) (fk := .ub)
+                        (by rw [hTermB]; simp only [evalTerminator, mkTerm, s₂B, hLay, hOp])]
+                  exact Eutt.refl _
+
+private def mirArgsMachine (args : List Value) :
+    ITreeMachine CapturedMir MirExecState MirEffect MirOutcome where
+  init body := .running (initMachineStateWithCallees body args [])
+  step := stepMirState
+
+/--
+Concrete `ExactPass` between `checkedAddU8Mir` and its `.tau`-inserting NOP
+variant `checkedAddU8NopMir` over stateless `mirTrees`.
+-/
+theorem checkedAddU8_nop_exactPass :
+    ExactPass
+      (panicSemantics (EffectObs.erase MirEffect PUnit) (fun b => mirTrees b []))
+      (panicSemantics (EffectObs.erase MirEffect PUnit) (fun b => mirTrees b []))
+      id id checkedAddU8Mir checkedAddU8NopMir where
+  up_refines _ args :=
+    (exactPass_of_eutt (mirArgsMachine args) (mirArgsMachine args)
+      (EffectObs.erase MirEffect PUnit) (checkedAddU8_nop_eutt args)).up_refines trivial
+  down_refines _ args :=
+    (exactPass_of_eutt (mirArgsMachine args) (mirArgsMachine args)
+      (EffectObs.erase MirEffect PUnit) (checkedAddU8_nop_eutt args)).down_refines trivial
+
+/--
+Concrete `Anneal.Pass` variance transfers:
+1. `PanicsOnlyIf` transfers forward via `CompilerPass`,
+2. `PanicsIf` transfers backward via `CompilerPass`,
+3. `ExactPanicContract` transfers bidirectionally via `ExactPass`, and
+4. `TotalExactPanicContract` transfers forward via `ExactPass` plus target termination.
+-/
+theorem checkedAddU8Nop_pass_variance_transfers :
+    PanicsOnlyIf (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1) (overflows 1) ∧
+      ExactPanicContract (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1) (overflows 1) ∧
+      PanicsIf (mirTrees checkedAddU8Mir) (scalarPre2 1) (overflows 1) ∧
+      TotalExactPanicContract (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1)
+        (overflows 1) := by
+  have hOnly :
+      PanicsOnlyIf (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1) (overflows 1) :=
+    PanicsOnlyIf.compilerPass_forward
+      (sem₁ := fun b => mirTrees b []) (sem₂ := fun b => mirTrees b [])
+      (checkedAddU8_nop_exactPass.toCompilerPass Spec.top)
+      trivial checkedAddU8_exact.1
+  have hExact :
+      ExactPanicContract (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1) (overflows 1) :=
+    (exactPanicContract_exactPass_iff
+      (sem₁ := fun b => mirTrees b []) (sem₂ := fun b => mirTrees b [])
+      checkedAddU8_nop_exactPass).1 checkedAddU8_exact
+  have hIfBack :
+      PanicsIf (mirTrees checkedAddU8Mir) (scalarPre2 1) (overflows 1) :=
+    PanicsIf.compilerPass_backward
+      (sem₁ := fun b => mirTrees b []) (sem₂ := fun b => mirTrees b [])
+      (checkedAddU8_nop_exactPass.toCompilerPass Spec.top)
+      trivial (fun x hx => (checkedAddU8_exact.1 x hx).1) hExact.2
+  have hTermNop : TerminatesOn (mirTrees checkedAddU8NopMir) (scalarPre2 1) :=
+    terminatesOn_of_dwp (ewp := mirDefaultWP) (Q := fun _ _ => True) (by
+      rintro _ ⟨a, b, -, -, rfl⟩
+      refine dwp_cofix_of_wpCoalBounded 10 ?_
+      change wpMirBounded 10 checkedAddU8NopMir _ _
+      rw [← wpMirSym_eq_wpMirBounded]
+      (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+      all_goals trivial)
+  have hTot :
+      TotalExactPanicContract (mirTrees checkedAddU8NopMir) (scalarPre2 1) (sumPost 1)
+        (overflows 1) :=
+    TotalExactPanicContract.exactPass_forward
+      (sem₁ := fun b => mirTrees b []) (sem₂ := fun b => mirTrees b [])
+      checkedAddU8_nop_exactPass hTermNop checkedAddU8_totalExact
+  exact ⟨hOnly, hExact, hIfBack, hTot⟩
+
+/-! ### Extended `kani#5202` alignment-blindness & machine-level `arith_offset` probes -/
+
+def ptrConstU32Ty : Ty := { kind := .rawPtr .not (.uint .u32), layoutIdx := 0 }
+
+/--
+Neither `BinOp.offset` nor `arith_offset` consults pointee alignment: on a
+misaligned scalar `*const u32` pointer (`addr = 1`, `count = 0`), `BinOp.offset`
+succeeds while `arith_offset` faults `.ub` (because it rejects all `Value.scalar`).
+-/
+theorem kani5202_misaligned_u32_scalar_ptr_alignment_blindness
+    (s : MachineState) (target : ResolvedCallTarget) (bodyLocalDecls : List LocalDecl)
+    (bodyLayouts : LayoutTable) (argOps : List Operand) (locals' : List LocalSlot)
+    (destination : Place) (targetBb : BasicBlockIdx) :
+    rvalueValue? (evalRvalue (offsetLocals (addrPtr 1) 0) offsetRv emptyMemory
+        (offsetDecls ptrConstU32Ty)) = some (addrPtr 1) ∧
+      evalNonSelectIntrinsicCall .arithOffset s target bodyLocalDecls bodyLayouts argOps
+        [addrPtr 1, .scalar { bits := 0, sizeBytes := 8 }] locals' destination targetBb =
+        MirStepNode.fail .ub :=
+  ⟨rfl, rfl⟩
+
+/--
+Full machine-level `evalNonSelectIntrinsicCall .arithOffset` on a dangling
+`Value.ptr` succeeds in both `memFreedTag42` (`allocDead := true`) and
+`memLiveZeroByteAlloc42` (live zero-byte allocation), while `BinOp.offset` with
+the same non-zero count `1` faults `.ub`.
+-/
+theorem kani5202_arith_offset_intrinsic_dangling_ptr_succeeds :
+    let target : ResolvedCallTarget :=
+      { defPath := "core::intrinsics::arith_offset", typeArgs := [.uint .u8],
+        fnSig := .none, isIndirect := false }
+    let sFreed : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := offsetLocals (.ptr danglingPtr 8) 1 }
+        memory := memFreedTag42 }
+    let sZero : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0, locals := zstLocals 1 }
+        memory := memLiveZeroByteAlloc42 }
+    let argOps : List Operand := [.copy (local_ 1), .copy (local_ 2)]
+    let argVals : List Value := [.ptr danglingPtr 8, .scalar { bits := 1, sizeBytes := 8 }]
+    evalNonSelectIntrinsicCall .arithOffset sFreed target (offsetDecls ptrConstU8Ty)
+        emptyLayoutTable argOps argVals sFreed.frame.locals (local_ 0) 1 =
+      MirStepNode.step
+        { frame := { blockIdx := 1, stmtIdx := 0,
+                     locals := [.init (.ptr { danglingPtr with offsetBytes := 1 } 8),
+                                .init (.ptr danglingPtr 8),
+                                .init (.scalar { bits := 1, sizeBytes := 8 })] }
+          memory := memFreedTag42 } ∧
+    evalNonSelectIntrinsicCall .arithOffset sZero target zstDecls
+        emptyLayoutTable argOps argVals sZero.frame.locals (local_ 0) 1 =
+      MirStepNode.step
+        { frame := { blockIdx := 1, stmtIdx := 0,
+                     locals := [.init (.ptr { danglingPtr with offsetBytes := 1 } 8),
+                                .init (.ptr danglingPtr 8),
+                                .init (.scalar { bits := 1, sizeBytes := 8 }),
+                                .init .unit] }
+          memory := memLiveZeroByteAlloc42 } :=
+  ⟨rfl, rfl⟩
+
+/-! ### Extended `kani#5219` borrow-backed reborrow/write contagion & global-alloc slices -/
+
+def muMutSliceRefTy : Ty := { kind := .ref .mut (.slice muKind), layoutIdx := 5 }
+
+def muMutDecls : List LocalDecl :=
+  muDecls ++ [mkDecl .mut muMutSliceRefTy]
+
+def muMutSliceMem : Memory :=
+  { emptyMemory with
+    borrows := [probeBorrow 5 1 .unique false]
+    nextTag := 6 }
+
+def muMutSliceLocals (arr : Value) : List LocalSlot :=
+  [.uninit, .init arr, .uninit, .init muFatPtr, .init muFatPtr]
+
+/--
+Reborrow and write contagion on borrow-backed `&[MaybeUninit<u8>]` /
+`&mut [MaybeUninit<u8>]`: with union-slot elements both reborrowing
+`&(*_3)[0..2]` and writing `(*_4)[0] = MaybeUninit::new(42)` succeed, whereas
+a single raw `.uninit` element at index `3` makes both fault `.ub`.
+-/
+theorem kani5219_borrow_backed_reborrow_and_write_contagion :
+    let reborrowRv : Rvalue :=
+      .ref .shared { local_ := 3, projection := [.deref, .subslice 0 2 false] }
+    let writeStmt : Statement :=
+      mkStmt (.assign { local_ := 4, projection := [.deref, .constantIndex 0 1 false] }
+        (.use (.constant { ty := muTy, val := .zeroSized })))
+    (∃ v, rvalueValue? (evalRvalue (muSliceLocals muSlotArr) reborrowRv muSliceMem
+        muDecls muLayouts) = some v) ∧
+      rvalueIsUb (evalRvalue (muSliceLocals muPartArr) reborrowRv muSliceMem
+        muDecls muLayouts) = true ∧
+      (∃ st, evalStmt
+          { frame := { blockIdx := 0, stmtIdx := 0, locals := muMutSliceLocals muSlotArr }
+            memory := muMutSliceMem }
+          writeStmt muMutDecls muLayouts = MirStepNode.step st) ∧
+      evalStmt
+          { frame := { blockIdx := 0, stmtIdx := 0, locals := muMutSliceLocals muPartArr }
+            memory := muMutSliceMem }
+          writeStmt muMutDecls muLayouts = MirStepNode.fail .ub :=
+  ⟨⟨_, rfl⟩, rfl, ⟨_, rfl⟩, rfl⟩
+
+/-- Global static allocation backing `[MaybeUninit<u8>; 4]` (4 initialized bytes). -/
+def muGlobalAlloc : CapturedAllocation :=
+  { allocId := 10
+    bytes := [.some 7, .some 8, .some 9, .some 10]
+    relocations := []
+    align := { bytes := 1 }
+    mutability := .not }
+
+def muGlobalMem : Memory :=
+  { emptyMemory with globals := [muGlobalAlloc], nextAllocId := 11 }
+
+def muGlobalFatPtr : Value :=
+  .aggregate 0 [.ptr { allocId := 10, offsetBytes := 0 } 8, .scalar { bits := 4, sizeBytes := 8 }]
+
+def muGlobalLocals : List LocalSlot :=
+  [.uninit, .uninit, .uninit, .init muGlobalFatPtr]
+
+/--
+`Memory.globals`-backed `&[MaybeUninit<u8>]` slice asymmetry: metadata-only
+`Rvalue.len` succeeds (returning `4`), whereas reading a union-typed slice
+element or subslice faults in `decodeValueFromBytes` (not `.ok`).
+-/
+theorem kani5219_global_alloc_slice_asymmetry :
+    rvalueValue? (evalRvalue muGlobalLocals
+        (.len { local_ := 3, projection := [.deref] }) muGlobalMem muDecls muLayouts) =
+        some (.scalar { bits := 4, sizeBytes := 8 }) ∧
+      rvalueValue? (evalRvalue muGlobalLocals
+        (muSliceRead [.constantIndex 0 1 false]) muGlobalMem muDecls muLayouts) = none ∧
+      rvalueValue? (evalRvalue muGlobalLocals
+        (muSliceRead [.subslice 0 2 false]) muGlobalMem muDecls muLayouts) = none :=
+  ⟨rfl, rfl, rfl⟩
 
 /-! ## 7. Bundle -/
 
@@ -1954,7 +3266,35 @@ theorem all_panic_contracts_tests :
     (type_of% @tailUnprotectedMem_calleeTableExcludes) ∧
     (type_of% @tailCall_emits_request_after_teardown) ∧
     (type_of% @tailCall_protectorConflict_ub) ∧
-    (type_of% @tailCall_step_probes) :=
+    (type_of% @tailCall_step_probes) ∧
+    (type_of% @tailCall_no_inline_intercept_panic_and_exactDiv) ∧
+    (type_of% @tailCall_resume_outcomes) ∧
+    (type_of% @checkedAddU8_generalMem_callee_wp) ∧
+    (type_of% @checkedAddU8_generalMem_holdsTotallyOn) ∧
+    (type_of% @addCaller_generalMem_unwinding_wp) ∧
+    (type_of% @addCaller_generalMem_linked_totalExact) ∧
+    (type_of% @checkedAddU8_withCallees_holdsTotallyOn) ∧
+    (type_of% @checkedAddU8_closedCallee_totalExactPolicy) ∧
+    (type_of% @addCaller_linked_totalExact_via_callee_contract) ∧
+    (type_of% @addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf) ∧
+    (type_of% @explicitPanic_continue_totalExact) ∧
+    (type_of% @explicitPanic_terminate_totalExact) ∧
+    (type_of% @explicitPanic_unreachable_not_panicsWithPolicyOnlyIf) ∧
+    (type_of% @reactiveSwitchLoopMir_totalVerificationResult_not_totalExact) ∧
+    (type_of% @outerCaller_calleesCallBoundaryPreserved) ∧
+    (type_of% @outerCaller_calleesCallBoundaryPreserved_refutations) ∧
+    (type_of% @callBoundaryPreserved_emptyCallees_does_not_guard_prepopulated_mem) ∧
+    (type_of% @twoCall_resumed_state_guard_preserved) ∧
+    (type_of% @indirect_and_fnItem_local_boundary_probes) ∧
+    (type_of% @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked) ∧
+    (type_of% @addCaller_terminate_conds_disjoint) ∧
+    (type_of% @checkedAddU8_nop_eutt) ∧
+    (type_of% @checkedAddU8_nop_exactPass) ∧
+    (type_of% @checkedAddU8Nop_pass_variance_transfers) ∧
+    (type_of% @kani5202_misaligned_u32_scalar_ptr_alignment_blindness) ∧
+    (type_of% @kani5202_arith_offset_intrinsic_dangling_ptr_succeeds) ∧
+    (type_of% @kani5219_borrow_backed_reborrow_and_write_contagion) ∧
+    (type_of% @kani5219_global_alloc_slice_asymmetry) :=
   ⟨@checkedAddU8_wp,
     @checkedAddU32_wp,
     @checkedDivU8_wp,
@@ -2058,7 +3398,35 @@ theorem all_panic_contracts_tests :
     @tailUnprotectedMem_calleeTableExcludes,
     @tailCall_emits_request_after_teardown,
     @tailCall_protectorConflict_ub,
-    @tailCall_step_probes⟩
+    @tailCall_step_probes,
+    @tailCall_no_inline_intercept_panic_and_exactDiv,
+    @tailCall_resume_outcomes,
+    @checkedAddU8_generalMem_callee_wp,
+    @checkedAddU8_generalMem_holdsTotallyOn,
+    @addCaller_generalMem_unwinding_wp,
+    @addCaller_generalMem_linked_totalExact,
+    @checkedAddU8_withCallees_holdsTotallyOn,
+    @checkedAddU8_closedCallee_totalExactPolicy,
+    @addCaller_linked_totalExact_via_callee_contract,
+    @addCallerUnreachable_linked_not_panicsWithPolicyOnlyIf,
+    @explicitPanic_continue_totalExact,
+    @explicitPanic_terminate_totalExact,
+    @explicitPanic_unreachable_not_panicsWithPolicyOnlyIf,
+    @reactiveSwitchLoopMir_totalVerificationResult_not_totalExact,
+    @outerCaller_calleesCallBoundaryPreserved,
+    @outerCaller_calleesCallBoundaryPreserved_refutations,
+    @callBoundaryPreserved_emptyCallees_does_not_guard_prepopulated_mem,
+    @twoCall_resumed_state_guard_preserved,
+    @indirect_and_fnItem_local_boundary_probes,
+    @checkedAddU8_not_holdsOn_toExactPolicy_waiveAbortUnchecked,
+    @addCaller_terminate_conds_disjoint,
+    @checkedAddU8_nop_eutt,
+    @checkedAddU8_nop_exactPass,
+    @checkedAddU8Nop_pass_variance_transfers,
+    @kani5202_misaligned_u32_scalar_ptr_alignment_blindness,
+    @kani5202_arith_offset_intrinsic_dangling_ptr_succeeds,
+    @kani5219_borrow_backed_reborrow_and_write_contagion,
+    @kani5219_global_alloc_slice_asymmetry⟩
 
 /--
 info: 'Anneal.PanicContractsTests.all_panic_contracts_tests' depends on axioms: [propext, Classical.choice, Quot.sound]
