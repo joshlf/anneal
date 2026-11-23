@@ -13,6 +13,10 @@ Exercises:
 3. Edge-case tests for comment/string/char-literal source stripping, open expressions,
    `expressionEdges` literal/projection edges, `extraConstNames` provenance, `_unsafe_rec` spoofing,
    and statement-vs-proof origin separation.
+4. Pass-`B1` regressions: closure-walk truncation, the transitive-closure and semantic soundness
+   theorems instantiated on the baseline package, role/origin/flag spoofing, the inductive and
+   quotient replay bypasses (including key-ALIGNED ones), provisional native scoping, and lexer
+   desynchronisation / token gluing in the source scanner.
 -/
 
 namespace Anneal.ReplayKeyAndTamperAuditProtoTests
@@ -135,6 +139,106 @@ info: 'Anneal.ReplayKeyAndTamperAuditPrototype.V09_replay_only_isolated_rejectio
  Quot.sound]
 -/
 #guard_msgs in #print axioms V09_replay_only_isolated_rejection
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.walkGraph_sound' depends on axioms: [propext] -/
+#guard_msgs in #print axioms walkGraph_sound
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.walkGraph_reaches_subset' depends on axioms: [propext] -/
+#guard_msgs in #print axioms walkGraph_reaches_subset
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditPrototype.statementOrigins_sound' depends on axioms: [propext] -/
+#guard_msgs in #print axioms statementOrigins_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_global_names_nodup' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_global_names_nodup
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_closure_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_closure_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_verifyRoots_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_verifyRoots_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.kernelEnv_prop_types_true' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms kernelEnv_prop_types_true
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_semantic_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_semantic_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.legacyClosureWalk_truncation_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms legacyClosureWalk_truncation_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.issue16675_induct_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms issue16675_induct_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.issue16675_induct_all_aligned_key_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms issue16675_induct_all_aligned_key_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.issue16675_quot_aligned_key_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms issue16675_quot_aligned_key_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.roleSpoof_labels_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms roleSpoof_labels_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.statementOrigin_laundering_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms statementOrigin_laundering_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.sourceScanner_lexer_desync_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms sourceScanner_lexer_desync_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.pillar1_provisional_scoping' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms pillar1_provisional_scoping
 
 /-! ## Section 2: Direct Verification of All Vulnerability Exploits & 18 Tamper Vectors -/
 
@@ -316,5 +420,167 @@ theorem duplicate_names_local_and_global_rejected :
     auditAndReplayPackage defaultUnconditionalConfig dupCrossModPkg =
       .error (.duplicateConstName .anonymous .anonymous) :=
   ⟨rfl, rfl⟩
+
+/-! ## Section 4: Pass-`B1` Regression Suite (Closure Truncation, Roles, Origins, Replay Fidelity, Lexer) -/
+
+example := legacyClosureWalk_truncation_bypass
+example := walkGraph_fuel_exhaustion_fails_closed
+example := issue16675_induct_bypass
+example := issue16675_induct_all_aligned_key_bypass
+example := issue16675_quot_aligned_key_bypass
+example := roleSpoof_labels_rejected
+example := statementOrigin_laundering_rejected
+example := v14_v15_flag_shortcuts_rejected
+example := sourceScanner_lexer_desync_rejected
+example := sourceScanner_token_glue_and_native_rejected
+example := sourceScanner_ambiguous_lexing_fails_closed
+example := sourceScanner_hardened_lexer_no_false_positive
+example := pillar1_provisional_scoping
+
+/--
+End-to-end instantiation of the TRANSITIVE closure theorem on `validBaselinePackage`: everything
+reachable from `Verify.Topic.verified` through `declarationEdges` is a `CleanDep`.
+-/
+theorem validBaselinePackage_verifyRoot_closure_clean :
+    ∀ dep, DepReaches (packageEnv validBaselinePackage) validVerifyThmName dep →
+      CleanDep validBaselinePackage (packageEnv validBaselinePackage) dep := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    exact auditAndReplayPackage_closure_sound h rfl rfl validVerifyThmName
+      (Or.inr (Or.inl List.mem_cons_self))
+
+/--
+End-to-end instantiation of the SEMANTIC soundness theorem on `validBaselinePackage`: there is a
+sound model of the replayed environment in which every proposition-typed constant of the replayed
+and imported environments is true.
+-/
+theorem validBaselinePackage_semantic_sound :
+    ∃ cert M',
+      auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage = .ok cert ∧
+      EnvSound cert.replayedEnv M' ∧
+      (∀ n ci, cert.importedEnv.lookup n = some ci →
+        ∀ P : Prop, evalExpr M' [] ci.type = .prop P → P) := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    obtain ⟨M', hM', _, himp⟩ :=
+      auditAndReplayPackage_semantic_sound h rfl rfl standardBaseEnv_sound
+    exact ⟨cert, M', rfl, hM', himp⟩
+
+/-- A definitional alias of `False` does not let an ill-typed proof through clean-env replay. -/
+def aliasFalseName : SymName := SymName.ofList ["Topic", "Proofs", "MyFalse"]
+def aliasFalseThmName : SymName := SymName.ofList ["Topic", "Proofs", "aliasBad"]
+
+def aliasFalsePkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [
+    { name := aliasFalseName, kind := .defnDecl, type := .sort 0,
+      value? := some (.const SymName.falseName), hasValue := true,
+      all := [aliasFalseName], originModule := topicProofModName },
+    { name := aliasFalseThmName, kind := .thmDecl, type := .const aliasFalseName,
+      value? := some (.const SymName.trueIntroName), hasValue := true,
+      all := [aliasFalseThmName], originModule := topicProofModName }
+  ])
+
+theorem aliasedFalse_rejected_by_replay :
+    auditAndReplayPackage defaultUnconditionalConfig aliasFalsePkg =
+      .error (.kernelTypeError aliasFalseThmName "theorem proof term type mismatch") :=
+  rfl
+
+/-- Role labels are justified by module names in both directions (reserved roots accept only their own role). -/
+theorem roleMatchesModuleName_table :
+    roleMatchesModuleName .foundation (SymName.ofList ["Init", "Prelude"]) = true ∧
+    roleMatchesModuleName .foundation topicProofModName = false ∧
+    roleMatchesModuleName .proof (SymName.ofList ["Init", "Proofs"]) = false ∧
+    roleMatchesModuleName .theory topicTheoryModName = true ∧
+    roleMatchesModuleName .spec topicTheoryModName = false ∧
+    roleMatchesModuleName .proof topicTheoryModName = false ∧
+    roleMatchesModuleName .test topicTheoryModName = false ∧
+    roleMatchesModuleName .defsExempt topicDefsModName = true ∧
+    roleMatchesModuleName .defsExempt (SymName.ofList ["Anneal", "Defs"]) = false ∧
+    roleMatchesModuleName .verify topicVerifyModName = true ∧
+    roleMatchesModuleName .spec topicVerifyModName = false ∧
+    roleMatchesModuleName .assumptions (SymName.ofList ["Assumptions", "Hw"]) = true ∧
+    roleMatchesModuleName .assumptions topicSpecModName = false ∧
+    roleMatchesModuleName .test (SymName.ofList ["Topic", "Tests"]) = true ∧
+    roleMatchesModuleName .test topicProofModName = false ∧
+    roleMatchesModuleName .spec (SymName.ofList ["Topic", "Tests"]) = false ∧
+    roleMatchesModuleName .proof topicSpecModName = false :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Verify-root header checks: a non-theorem root and a root without a `VerificationResult` head are rejected. -/
+def nonTheoremVerifyRootPkg : PackageAuditInput :=
+  mkSingleProofPkg
+    (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [
+      mkAlignedModule topicVerifyModName .verify
+        [{ validVerifyThmDecl with kind := .defnDecl }]
+    ])
+    (verifyRoots := [validVerifyThmName])
+
+def wrongHeadVerifyRootPkg : PackageAuditInput :=
+  mkSingleProofPkg
+    (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [
+      mkAlignedModule topicVerifyModName .verify
+        [{ validVerifyThmDecl with
+            type := .const SymName.trueName, value? := some (.const SymName.trueIntroName) }]
+    ])
+    (verifyRoots := [validVerifyThmName])
+
+theorem verifyRoot_header_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig nonTheoremVerifyRootPkg =
+      .error (.invalidVerifyRoot validVerifyThmName "verify root must be a theorem") ∧
+    auditAndReplayPackage defaultUnconditionalConfig wrongHeadVerifyRootPkg =
+      .error (.invalidVerifyRoot validVerifyThmName
+        "verify root must have VerificationResult type") :=
+  ⟨rfl, rfl⟩
+
+/-- A theory dependency hidden two aliases deep (`Spec` alias of a `Defs` alias) is still found. -/
+def specAliasName : SymName := SymName.ofList ["Topic", "Spec", "claimAlias2"]
+
+def deepAliasLeakPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicTheoryModName .theory [theoryClaimTypeDecl],
+    mkAlignedModule topicDefsModName .defsExempt [defsAliasDecl],
+    mkAlignedModule topicSpecModName .spec
+      [{ defsAliasDecl with
+          name := specAliasName, value? := some (.const defsAliasName),
+          all := [specAliasName], originModule := topicSpecModName }],
+    mkAlignedModule topicVerifyModName .verify
+      [{ aliasLeakVerifyDecl with
+          type := .app (.const SymName.verificationResultName) (.const specAliasName)
+          value? := some (.app (.app (.const verificationResultMkName) (.const specAliasName))
+            (.const SymName.trueIntroName)) }]
+  ]
+  verifyRoots := [validVerifyThmName]
+}
+
+theorem deepAlias_statementLeak_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig deepAliasLeakPkg =
+      .error (.statementTheoryLeak validVerifyThmName theoryClaimTypeName topicTheoryModName) :=
+  rfl
+
+/-- More lexer edge cases: nested block comments, a doc-comment opener, `''` tokens, and string gaps. -/
+theorem sourceScanner_more_lexer_edges :
+    scanProofSource "/- a /- b -/ debug.skipKernelTC -/ theorem t : True := trivial" = .ok () ∧
+    scanProofSource "/- a /- b -/ -/ set_option debug.skipKernelTC true" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "def s := \"a\\\\\"\nset_option debug.skipKernelTC true" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "def x' := 1 -- it's \"quoted\ntheorem t : True := trivial" = .ok () ∧
+    scanProofSource "theorem t : True := by\n  first\n  | native_decide\n  | trivial" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "/- unterminated" =
+      .error (.unsupportedSourceLexing topicProofModName
+        "unterminated string, char literal, block comment, or escaped identifier") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditProtoTests
