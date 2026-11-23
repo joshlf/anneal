@@ -45,14 +45,17 @@ modifying the repository working tree:
 Anti-false-kill and isolation invariants
 ----------------------------------------
 
-* A mutant only counts as `KILLED` when Lean exits `1` and every error
-  diagnostic is located inside the guard's refutation theorem in the generated
-  fixture, every one of those diagnostics carries a `Type mismatch` or
-  `Not a definitional equality` proof failure marker (the diagnostics Lean 4.34
-  emits for a failing `:= rfl` proof), and the output has no
-  crash/parse/timeout/elaboration-breakage marker. Errors in other files,
-  errors without a source position, crash/timeout/parse or statement-elaboration
-  markers (`Application type mismatch`, `Function expected`, `invalid field`,
+* A mutant only counts as `KILLED` when Lean exits `1`, every error diagnostic
+  is located inside the guard's refutation theorem in the generated fixture,
+  at least one of them is a `Type mismatch` whose mismatched term is the `rfl`
+  proof itself, every other one is the `Not a definitional equality` companion
+  Lean 4.34 prints for a `:= rfl` theorem, and the output has no
+  crash/parse/timeout/elaboration-breakage marker. A `Type mismatch` about any
+  other term (a statement that stopped elaborating on the mutant), a lone
+  `Not a definitional equality` (Lean prints it even for a theorem whose `rfl`
+  it accepted), errors in other files, errors without a source position,
+  crash/timeout/parse or statement-elaboration markers
+  (`Application type mismatch`, `Function expected`, `invalid field`,
   `failed to synthesize`), and signal exit codes are `ERROR`, never a kill.
 * `.lake/build/lib/lean` `.olean`s are reused only when they are proven to
   correspond to the current sources: Lake's own `.trace` records are checked by
@@ -66,16 +69,51 @@ Anti-false-kill and isolation invariants
   that have no Lake traces at all, where a source newer than its `.olean`
   forces a cold build.
 * Fixtures are checked statically before Lean runs: one `rfl` theorem with no
-  binders, helper `def`s that shadow no trusted declaration, an allowlist of
-  top-level commands, and no construct the comment scanner cannot lex exactly
-  (interpolated or raw strings, character literals, backslashes). The theorem
-  must read `<MirSemantics function> <args> = <expected data>`: no other part
-  of the fixture may name a MirSemantics function, a refutation must expect
-  UB literally, and a positive sanity fixture must not mention `ub` at all.
+  binders (its proof is the fixture's only `rfl`), helper `def`s that shadow
+  no trusted declaration, an allowlist of top-level commands, and no construct
+  the comment scanner cannot lex exactly (interpolated or raw strings,
+  character literals, backslashes). The theorem must read
+  `<MirSemantics function> <args> = <expected data>`, where the function is
+  defined in a module the guard's mutant rebuilds: no other part of the
+  fixture may name a MirSemantics function, a refutation must expect UB
+  literally, and a positive sanity fixture must not mention `ub` at all.
 * `.olean`s are shared by hardlink, so no Lean invocation may ever write
   through one: destinations are unlinked before every link and every compile,
   stale downstream modules are never seeded into a mutant overlay, and the
   reused Lake artifacts are re-checked after the run.
+
+Catalog and command line
+------------------------
+
+`MIR_SEMANTICS_GUARDS` holds 20 guards: 9 in `Scalars.lean`, 3 in
+`Places.lean`, 6 in `Statements.lean` and 2 in `Terminators.lean`. Each
+fixture imports only its guard's target module, so a mutant recompiles that
+one module and nothing downstream of it.
+
+  --quick             Run the 3-guard smoke subset (one guard each in
+                      `Scalars.lean`, `Statements.lean`, `Terminators.lean`).
+  --all               Run the whole catalog. This is the default.
+  --guard SELECTOR    Run the guards whose id equals SELECTOR or, failing
+                      that, contains it. Repeatable, and each value may be a
+                      comma-separated list. A selector that matches no guard
+                      fails the run.
+  --list              Validate every static catalog invariant against the live
+                      sources, print the selected guards, and run no Lean.
+  --json              Print the JSON report on stdout, and nothing else.
+  --json-out PATH     Write the JSON report to PATH.
+  --anneal-root PATH  Repository root (default: this script's parent).
+  --lean PATH         The `lean` to run (default: `ANNEAL_LEAN`, `PATH`, or
+                      `~/.elan/bin/lean`).
+  --use-lean-run      Wrap every Lean call in `anneal-lean-run --mode file --`.
+  --no-lean-run       Never wrap. With neither flag, only a `lean` that was
+                      resolved by default (no `--lean`) is wrapped, when
+                      `anneal-lean-run` is installed.
+  --no-lake-cache     Compile the baseline `.olean`s from source instead of
+                      reusing `.lake/build/lib/lean`.
+  --trust-lake-olean-hash-files
+                      Faster, weaker: do not re-hash each reused `.olean`.
+  --jobs N            Worker threads (default: `min(4, CPU count)`).
+  --timeout-sec SEC   Timeout of each Lean invocation (default: 120).
 
 Exit status and JSON report
 ---------------------------
@@ -256,19 +294,35 @@ NON_KILL_ERROR_MARKERS: tuple[str, ...] = (
     "is not a valid",
 )
 
-# Diagnostic substrings emitted by Lean 4 when a `:= rfl` refutation theorem
-# fails to type-check because the mutated semantics no longer reduces to UB.
-# Lean 4.34 emits a two-diagnostic pair inside the theorem span:
-# `Not a definitional equality: ... is not definitionally equal ...` followed
-# by `Type mismatch` on `rfl`. Every refutation fixture is statically pinned to
-# `:= rfl`, so broken statement/arity/field/typeclass diagnostics belong in
-# `NON_KILL_ERROR_MARKERS` rather than here.
+# Headings of the only two error diagnostics Lean 4.34 prints when a
+# `theorem ... := rfl` refutation no longer holds on a mutant. Every error
+# inside the refutation theorem must OPEN with one of them, and must then have
+# the exact shape `_rfl_failure_kind` recognizes:
+#
+# * `Type mismatch` whose mismatched term, printed alone on the next line, is
+#   `rfl` itself (`Lean.Elab.Term.throwTypeMismatchError`). This is the
+#   elaborator rejecting the proof, and the only evidence of a kill. A
+#   `Type mismatch` about any other term, such as the `Bool` of
+#   `theorem t : (1 : Nat) = Bool := rfl`, is a STATEMENT that no longer
+#   elaborates on the mutant, not a refuted proof.
+# * `Not a definitional equality: the left-hand side ... is not definitionally
+#   equal to the right-hand side ...`, from the `@[defeq]` validation Lean
+#   applies to every theorem whose body is syntactically `:= rfl`
+#   (`Lean.validateDefEqAttr`). It inspects only the statement and is reported
+#   even when the `rfl` proof itself was ACCEPTED, so it may accompany the
+#   `rfl` mismatch but never replaces it.
+#
+# Broken statement/arity/field/typeclass diagnostics belong in
+# `NON_KILL_ERROR_MARKERS`, not here.
 EXPECTED_PROOF_FAILURE_MARKERS: tuple[str, ...] = (
     "Type mismatch",
     "type mismatch",
     "Not a definitional equality",
-    "not a definitional equality",
-    "is not definitionally equal",
+)
+_RFL_TYPE_MISMATCH_RE = re.compile(r"[Tt]ype mismatch[ \t]*\n[ \t]+rfl[ \t]*(?:\n|\Z)")
+_NOT_DEFEQ_RE = re.compile(
+    r"Not a definitional equality: the left-hand side[ \t]*\n"
+    r"(?:.*\n)*?is not definitionally equal to the right-hand side[ \t]*(?:\n|\Z)"
 )
 
 # Lean 4 warns when a proof uses `sorry`. The pinned toolchain (v4.34.1) prints
@@ -2220,6 +2274,24 @@ def _split_lf_lines_keepends(text: str) -> list[str]:
     return lines
 
 
+def _rfl_failure_kind(diag_text: str) -> str | None:
+    """Classify the text of one error diagnostic of a `:= rfl` theorem.
+
+    `diag_text` is everything after the `error:` header. Returns `"rfl"` for a
+    `Type mismatch` on the `rfl` proof term, `"defeq"` for the
+    `Not a definitional equality` companion, and `None` for anything else
+    (see `EXPECTED_PROOF_FAILURE_MARKERS`).
+    """
+    text = diag_text.lstrip(" \t")
+    if not text.startswith(EXPECTED_PROOF_FAILURE_MARKERS):
+        return None
+    if _RFL_TYPE_MISMATCH_RE.match(text):
+        return "rfl"
+    if _NOT_DEFEQ_RE.match(text):
+        return "defeq"
+    return None
+
+
 def classify_refutation_failure(
     returncode: int,
     combined_output: str,
@@ -2240,15 +2312,19 @@ def classify_refutation_failure(
     - `SURVIVED`: Lean accepted (`rc == 0`) the negative refutation even after
       the guard was disabled.
     - `KILLED`: Lean rejected (`rc == 1`), every error diagnostic is located in
-      `fixture_filename` inside the target theorem's line span, EVERY one of
-      those diagnostics carries a `Type mismatch` or
-      `Not a definitional equality` proof failure marker, and the output has no
+      `fixture_filename` inside the target theorem's line span, at least one of
+      them is a `Type mismatch` on the `rfl` proof term itself, every other one
+      is the `Not a definitional equality` companion Lean prints for a
+      `:= rfl` theorem, and the output has no
       crash/parse/timeout/elaboration-breakage marker.
     - `ERROR`: anything else (never counted as a kill): unexpected exit status
       (signals, OOM, timeout), crash/parse/timeout/elaboration-breakage marker,
       an error diagnostic in another file or without a source position, an
-      error outside the target theorem span, or any diagnostic inside the
-      target theorem lacking a recognized `:= rfl` proof-failure marker.
+      error outside the target theorem span, a `Type mismatch` about any term
+      other than `rfl` (the statement stopped elaborating), any other
+      diagnostic inside the target theorem, or a
+      `Not a definitional equality` with no `Type mismatch` on `rfl` (Lean
+      prints it for a theorem whose `rfl` proof it accepted, too).
     """
     if returncode == 0:
         return ("SURVIVED", "refutation theorem still compiled on mutant")
@@ -2351,14 +2427,20 @@ def classify_refutation_failure(
             f"no error diagnostic in target theorem lines {start}-{end} "
             f"(saw error lines: {error_lines})",
         )
-    if not all(
-        any(marker in body for marker in EXPECTED_PROOF_FAILURE_MARKERS)
-        for _, body in error_diags
-    ):
+    kinds = [_rfl_failure_kind(body) for _, body in error_diags]
+    if None in kinds:
         return (
             "ERROR",
-            "Lean failed with an unrecognized non-proof diagnostic "
-            f"inside target theorem lines {start}-{end}",
+            "Lean failed with an unrecognized non-proof diagnostic (neither a "
+            "`Type mismatch` on `rfl` nor its `Not a definitional equality` "
+            f"companion) inside target theorem lines {start}-{end}",
+        )
+    if "rfl" not in kinds:
+        return (
+            "ERROR",
+            "Lean reported no `Type mismatch` on the `rfl` proof inside target "
+            f"theorem lines {start}-{end}; `Not a definitional equality` alone "
+            "does not show that the proof was rejected",
         )
     return (
         "KILLED",
@@ -2614,12 +2696,18 @@ def _trusted_function_names(lean_source: str) -> set[str]:
     """Return unqualified callable function names defined in a trusted file.
 
     Comments are stripped first so a `def` inside doc prose is never
-    allowlisted. Type-scoped dotted methods (`FloatPtrWidth.bits`) are skipped
-    because they cannot be invoked unqualified and their short names collide
-    with structure fields (`ScalarInt.bits`). Nullary non-arrow typed constants
-    and type aliases (`emptyLayoutTable : LayoutTable`, `defaultCodecFuel : Nat`,
-    `F32Bits : Type`) are also excluded so plain data constants cannot serve as
-    an LHS evaluator and remain usable as plain data in fixtures.
+    allowlisted. Two kinds of definition are left out, so that fixtures can
+    write them as plain data and none of them can head a theorem LHS:
+
+    - Dotted, type-scoped definitions (`FloatPtrWidth.bits`). A LHS head is an
+      unqualified name, and their last components collide with structure
+      fields a fixture spells out (`{ bits := 42, sizeBytes := 4 }`). Every
+      one in today's semantics modules is a small accessor on an enum or a
+      byte. They stay reachable from a helper through `open` or dot notation,
+      so a dotted EVALUATOR added to a semantics module must be reserved here.
+    - Nullary constants and type aliases without an arrow in their signature
+      (`emptyLayoutTable : LayoutTable`, `defaultCodecFuel : Nat`,
+      `F32Bits : Type`).
     """
     code = _strip_lean_comments_fast(lean_source)
     names: set[str] = set()
@@ -2988,6 +3076,18 @@ def _fixture_shape_errors(
     if theorem_count != 1:
         errors.append(
             f"{kind}_source must declare exactly one theorem, found {theorem_count}"
+        )
+    # `classify_refutation_failure` tells a refuted proof from a statement that
+    # stopped elaborating by the term Lean's `Type mismatch` names (`rfl`), so
+    # the proof must be the fixture's ONLY `rfl`: none in the statement, none
+    # in a helper `def`.
+    rfl_count = len(
+        re.findall(r"(?<![\w'])rfl(?![\w'])", _blank_lean_string_literals(code_only))
+    )
+    if rfl_count != 1:
+        errors.append(
+            f"{kind}_source must contain exactly one `rfl` (the theorem's proof), "
+            f"found {rfl_count}"
         )
 
     # Every `import` Lean sees must be one the header parser recognized;
@@ -4818,8 +4918,11 @@ def _termination_signals_as_interrupt() -> Iterator[None]:
             for name in ("SIGTERM", "SIGHUP"):
                 signum = getattr(signal, name, None)
                 if signum is not None and signal.getsignal(signum) is signal.SIG_DFL:
-                    signal.signal(signum, _raise)
+                    # Recorded BEFORE it is installed: the signal may arrive
+                    # (and `_raise` may fire) the instant the handler is in
+                    # place, and it must still be restored on the way out.
                     taken_over.append(signum)
+                    signal.signal(signum, _raise)
         except ValueError:
             # Not the main thread: signal handling belongs to the embedding program.
             pass

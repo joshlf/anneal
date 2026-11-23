@@ -1123,13 +1123,23 @@ class GuardMutationB1AdversarialTests(unittest.TestCase):
         self.assertEqual(self._classify(1, windows), "KILLED")
         bare = "Refute_div_by_zero.lean:8:4-9:5: error: Type mismatch\n  rfl\n"
         self.assertEqual(self._classify(1, bare), "KILLED")
+        # Lean 4.34 reports a failing `:= rfl` theorem twice: the `@[defeq]`
+        # check at the declaration and the `Type mismatch` at `rfl`.
         two = (
-            "/t/Refute_div_by_zero.lean:7:8: error: type mismatch\n  x\n"
+            "/t/Refute_div_by_zero.lean:7:0: error: Not a definitional equality: "
+            "the left-hand side\n  f x\n"
+            "is not definitionally equal to the right-hand side\n  y\n"
             "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\nhas type\n"
         )
         status, detail = gmut.classify_refutation_failure(1, two, self.FIXTURE, self.SPAN)
         self.assertEqual(status, "KILLED")
         self.assertIn("[7, 9]", detail)
+        # A second error about a term of the STATEMENT is not a refuted proof.
+        broken_statement = (
+            "/t/Refute_div_by_zero.lean:7:8: error: type mismatch\n  x\n"
+            "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n  rfl\nhas type\n"
+        )
+        self.assertEqual(self._classify(1, broken_statement), "ERROR")
         for rc in (-9, -11, -15, 2, 124, 127, 134, 137, 139):
             self.assertEqual(self._classify(rc, windows), "ERROR", rc)
         for marker in ("(deterministic) timeout", "Stack overflow", "out of memory"):
@@ -2369,10 +2379,15 @@ class GuardMutationB2AdversarialTests(unittest.TestCase):
             "ERROR",
         )
 
-        # stderr cannot supply the proof-failure marker for a stdout error.
+        # stderr cannot complete a stdout error into a `Type mismatch` on `rfl`.
+        cut = "/t/Refute_div_by_zero.lean:9:2: error: Type mismatch\n"
+        self.assertEqual(self._classify(1, cut, "  rfl\nhas type\n"), "ERROR")
+        self.assertEqual(self._classify(1, cut + "  rfl\nhas type\n"), "KILLED")
+        # Marker words elsewhere in another error's text are not a kill, in
+        # either stream.
         odd = "/t/Refute_div_by_zero.lean:9:2: error: bizarre glitch\n"
         self.assertEqual(self._classify(1, odd, "rfl has type Type mismatch\n"), "ERROR")
-        self.assertEqual(self._classify(1, odd + "rfl has type Type mismatch\n"), "KILLED")
+        self.assertEqual(self._classify(1, odd + "rfl has type Type mismatch\n"), "ERROR")
         # Non-kill markers and foreign errors on stderr still block a kill.
         self.assertEqual(self._classify(1, self.KILL, "PANIC at Foo\n"), "ERROR")
         self.assertEqual(
@@ -3563,6 +3578,261 @@ class GuardMutationA3AdversarialTests(unittest.TestCase):
             # Pre-written fail-closed sentinel remains on disk.
             on_disk = json.loads(out.read_text(encoding="utf-8"))
             self.assertFalse(on_disk["ok"])
+
+
+class GuardMutationB4AdversarialTests(unittest.TestCase):
+    """Round 4 B4 audit: only a `Type mismatch` on the `rfl` proof is a kill."""
+
+    FIXTURE = "Refute_div_by_zero.lean"
+    SPAN = (7, 9)
+    PATH = "/t/Refute_div_by_zero.lean"
+    RFL = f"{PATH}:9:2: error: Type mismatch\n  rfl\nhas type\n  ?m.14 = ?m.14\nbut is expected to have type\n  f x = y\n"
+    DEFEQ = (
+        f"{PATH}:7:0: error: Not a definitional equality: the left-hand side\n"
+        "  f x\n"
+        "is not definitionally equal to the right-hand side\n"
+        "  y\n"
+    )
+
+    def _classify(self, out: str) -> tuple[str, str]:
+        return gmut.classify_refutation_failure(
+            1, out, self.FIXTURE, self.SPAN, stderr_output=""
+        )
+
+    def test_statement_type_mismatch_is_not_a_kill(self) -> None:
+        # What Lean prints for `theorem t : (1 : Nat) = Bool := rfl`: the
+        # STATEMENT fails to elaborate, on a line inside the theorem span, and
+        # `rfl` is never reached. A mutant that breaks a refutation's statement
+        # this way must not pass for a refuted proof.
+        statement = (
+            f"{self.PATH}:8:15: error: Type mismatch\n  Bool\nhas type\n  Type\n"
+            "but is expected to have type\n  Nat\n"
+        )
+        status, detail = self._classify(statement)
+        self.assertEqual(status, "ERROR", detail)
+        self.assertIn("unrecognized non-proof diagnostic", detail)
+        # ... not even next to a genuine `rfl` mismatch or its companion.
+        for extra in (self.RFL, self.DEFEQ, self.DEFEQ + self.RFL):
+            self.assertEqual(self._classify(statement + extra)[0], "ERROR", extra)
+            self.assertEqual(self._classify(extra + statement)[0], "ERROR", extra)
+
+        # Every other `Type mismatch` Lean can print is about something else
+        # than the `rfl` proof term.
+        for text in (
+            "type mismatch\n  x\nhas type\n  Nat\n",
+            "Type mismatch\n  rfl.symm\nhas type\n",
+            "Type mismatch\n  rfl x\nhas type\n",
+            "Type mismatch\n  @rfl Nat 1\nhas type\n",
+            "Type mismatch\n  rflect\nhas type\n",
+            "Type mismatch\n  Eq.refl ?a\nhas type\n",
+            "Type mismatch\nrfl\nhas type\n",
+            "Type mismatch rfl has type\n",
+            "Type mismatch\n",
+            "Type mismatch: target is\n  rfl\n",
+            "Type mismatch in pattern: Pattern\n  rfl\n",
+            "Type mismatch. The `do` element has monadic result type\n  rfl\n",
+            "bizarre glitch\n  Type mismatch\n  rfl\nhas type\n",
+            "rfl\n  Type mismatch\n",
+        ):
+            out = f"{self.PATH}:9:2: error: {text}"
+            self.assertEqual(self._classify(out)[0], "ERROR", text)
+            self.assertEqual(self._classify(self.RFL + out)[0], "ERROR", text)
+
+    def test_rfl_type_mismatch_is_the_kill_and_defeq_only_accompanies_it(self) -> None:
+        # The proof itself was rejected: alone, or with Lean 4.34's `@[defeq]`
+        # companion in either order.
+        for out in (self.RFL, self.DEFEQ + self.RFL, self.RFL + self.DEFEQ):
+            status, detail = self._classify(out)
+            self.assertEqual(status, "KILLED", (out, detail))
+        self.assertIn("[7, 9]", self._classify(self.DEFEQ + self.RFL)[1])
+        # Older toolchains spell the heading in lower case and add sorts.
+        legacy = f"{self.PATH}:9:2: error: type mismatch\n  rfl\nhas type\n  f x = f x : Prop\n"
+        self.assertEqual(self._classify(legacy)[0], "KILLED")
+        named = f"{self.PATH}:9:2: error(lean.typeMismatch): Type mismatch\n  rfl\nhas type\n"
+        self.assertEqual(self._classify(named)[0], "KILLED")
+
+        # `Not a definitional equality` comes from validating the `@[defeq]`
+        # attribute of a `:= rfl` theorem. It looks at the statement only and
+        # is printed for a theorem whose `rfl` Lean ACCEPTED as well, so alone
+        # it is an exit status 1 without a rejected proof.
+        status, detail = self._classify(self.DEFEQ)
+        self.assertEqual(status, "ERROR")
+        self.assertIn("no `Type mismatch` on the `rfl` proof", detail)
+        self.assertEqual(self._classify(self.DEFEQ + self.DEFEQ)[0], "ERROR")
+
+        # Only the exact left-hand/right-hand side form is the companion.
+        for text in (
+            "Not a definitional equality: the conclusion should be an equality, but is\n  True\n",
+            "Not a definitional equality: the left-hand side\n  f x\n",
+            "Not a definitional equality\n",
+            "not a definitional equality: the left-hand side\n  f x\n"
+            "is not definitionally equal to the right-hand side\n  y\n",
+            "f x is not definitionally equal to the right-hand side\n  y\n",
+        ):
+            out = f"{self.PATH}:7:0: error: {text}"
+            self.assertEqual(self._classify(out + self.RFL)[0], "ERROR", text)
+
+        # Each recognized diagnostic opens with one of the documented headings.
+        self.assertEqual(gmut._rfl_failure_kind(" Type mismatch\n  rfl\n"), "rfl")
+        self.assertEqual(gmut._rfl_failure_kind(self.DEFEQ.split("error:")[1]), "defeq")
+        self.assertIsNone(gmut._rfl_failure_kind(" Type mismatch\n  Bool\n"))
+        for text in (self.RFL, self.DEFEQ):
+            self.assertTrue(
+                text.split("error: ")[1].startswith(gmut.EXPECTED_PROOF_FAILURE_MARKERS)
+            )
+
+    def test_proof_is_the_only_rfl_of_a_fixture(self) -> None:
+        # The classifier recognizes the proof by the term Lean names, so no
+        # other `rfl` may sit in the statement or in a helper.
+        head = "import Trusted.A\n"
+        theorem = "theorem t :\n    f 1 = 2 :=\n  rfl\n"
+        self.assertEqual(gmut._fixture_shape_errors("refute", head + theorem, "t"), [])
+        for src in (
+            head + "theorem t :\n    f ⟨1, rfl⟩ = 2 :=\n  rfl\n",
+            head + "theorem t :\n    f (h := _root_.rfl) = 2 :=\n  rfl\n",
+            head + "def h : 1 = 1 :=\n  rfl\n" + theorem,
+            head + "def h : 1 = 1 := Eq.rfl\n" + theorem,
+        ):
+            errors = gmut._fixture_shape_errors("refute", src, "t")
+            self.assertTrue(
+                any("exactly one `rfl` (the theorem's proof), found 2" in e for e in errors),
+                (src, errors),
+            )
+        # `rfl` as text in a string or a comment, or inside a longer name, is
+        # not the term.
+        harmless = (
+            head
+            + 'def msg : String := "rfl"\n'
+            + "def rfl' : Nat := 1\n"
+            + "def my_rfl : Nat := 2 -- rfl\n"
+            + theorem
+        )
+        self.assertEqual(gmut._fixture_shape_errors("refute", harmless, "t"), [])
+
+        # The live catalog obeys it, and rejects a guard that does not.
+        guard = gmut.select_guards(guard_filters=["div_by_zero"])[0]
+        self.assertEqual(guard.refute_source.count("rfl"), 1)
+        smuggled = guard.refute_source.replace(
+            "theorem refute_div_by_zero :",
+            "def same : 1 = 1 :=\n  rfl\n\ntheorem refute_div_by_zero :",
+        )
+        self.assertNotEqual(smuggled, guard.refute_source)
+        with mock.patch.object(
+            gmut, "MIR_SEMANTICS_GUARDS", _replace_guard("div_by_zero", refute_source=smuggled)
+        ):
+            errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+        self.assertTrue(
+            any("div_by_zero" in e and "exactly one `rfl`" in e for e in errors), errors
+        )
+
+    def test_synthetic_statement_type_mismatch_on_mutant_is_error(self) -> None:
+        # End to end: the mutant makes the refutation's statement ill-typed.
+        # Lean exits 1 with a `Type mismatch` inside the theorem, on a
+        # statement line, and the gate must report ERROR, not a kill.
+        body = textwrap.dedent(
+            """\
+            if [ -n "$OUT" ]; then
+              mkdir -p "$(dirname "$OUT")"
+              printf 'fake-olean:%s' "$BASENAME" > "$OUT"
+            fi
+            if [ "$IS_MUTANT" = "1" ]; then
+              case "$BASENAME" in
+                Refute_*)
+                  LINE="$(grep -n '^theorem ' "$SRC" | head -n 1 | cut -d: -f1)"
+                  printf '%s:%s:4: error: Type mismatch\\n  RvalueEvalResult.ub\\nhas type\\n  RvalueEvalResult\\nbut is expected to have type\\n  Nat\\n' "$SRC" "$((LINE + 1))"
+                  exit 1
+                  ;;
+              esac
+            fi
+            exit 0
+            """
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-b4-stmt-") as tmp:
+            fake = Path(tmp) / "fake_lean"
+            _write_fake_lean_sh(fake, body)
+            proc = _run_cli(
+                ["--lean", str(fake), "--no-lake-cache", "--guard", "div_by_zero", "--json"]
+            )
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            report = json.loads(proc.stdout)
+            self.assertEqual(
+                (report["killed"], report["survived"], report["errors"]), (0, 0, 1)
+            )
+            self.assertIn("unrecognized non-proof diagnostic", report["results"][0]["detail"])
+
+    def test_signal_arriving_as_soon_as_its_handler_is_installed_is_restored(self) -> None:
+        # SIGHUP is delivered the instant its handler is in place, before the
+        # context manager could do anything else: both signals must still go
+        # back to their default action.
+        before_term = signal.getsignal(signal.SIGTERM)
+        before_hup = signal.getsignal(signal.SIGHUP)
+        real_signal = signal.signal
+        try:
+            real_signal(signal.SIGTERM, signal.SIG_DFL)
+            real_signal(signal.SIGHUP, signal.SIG_DFL)
+
+            def _install_then_deliver(signum: int, handler: object) -> object:
+                previous = real_signal(signum, handler)  # type: ignore[arg-type]
+                if signum == signal.SIGHUP and callable(handler):
+                    handler(signum, None)
+                return previous
+
+            with mock.patch.object(signal, "signal", side_effect=_install_then_deliver):
+                with self.assertRaisesRegex(KeyboardInterrupt, "SIGHUP"):
+                    with gmut._termination_signals_as_interrupt():
+                        self.fail("body must not run when a signal interrupts setup")
+            self.assertIs(signal.getsignal(signal.SIGTERM), signal.SIG_DFL)
+            self.assertIs(signal.getsignal(signal.SIGHUP), signal.SIG_DFL)
+        finally:
+            real_signal(signal.SIGTERM, before_term)
+            real_signal(signal.SIGHUP, before_hup)
+
+    def test_module_docstring_matches_the_cli_and_the_catalog(self) -> None:
+        doc = gmut.__doc__ or ""
+        # Every command-line flag is documented.
+        flags: set[str] = set()
+        for node in ast.walk(ast.parse(SCRIPT.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "add_argument"
+            ):
+                flags.update(
+                    arg.value
+                    for arg in node.args
+                    if isinstance(arg, ast.Constant)
+                    and isinstance(arg.value, str)
+                    and arg.value.startswith("--")
+                )
+        self.assertGreaterEqual(len(flags), 13, flags)
+        for flag in sorted(flags):
+            self.assertRegex(doc, rf"(?m)^  {re.escape(flag)}(?:\s|$)", flag)
+
+        # The catalog summary is the live catalog.
+        guards = gmut.MIR_SEMANTICS_GUARDS
+        per_file = {
+            name: sum(1 for g in guards if g.target_file.endswith(f"/{name}.lean"))
+            for name in ("Scalars", "Places", "Statements", "Terminators")
+        }
+        self.assertEqual(sum(per_file.values()), len(guards))
+        summary = " ".join(doc.split())
+        self.assertIn(
+            f"`MIR_SEMANTICS_GUARDS` holds {len(guards)} guards: "
+            f"{per_file['Scalars']} in `Scalars.lean`, "
+            f"{per_file['Places']} in `Places.lean`, "
+            f"{per_file['Statements']} in `Statements.lean` and "
+            f"{per_file['Terminators']} in `Terminators.lean`.",
+            summary,
+        )
+        quick = [g for g in guards if g.quick]
+        self.assertIn(f"Run the {len(quick)}-guard smoke subset", summary)
+        self.assertEqual(
+            sorted(Path(g.target_file).stem for g in quick),
+            ["Scalars", "Statements", "Terminators"],
+        )
+        # "Each fixture imports only its guard's target module".
+        for g in guards:
+            self.assertEqual(g.effective_rebuild_modules, (g.target_module,), g.guard_id)
 
 
 if __name__ == "__main__":
