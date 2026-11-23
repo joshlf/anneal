@@ -5498,7 +5498,9 @@ def _probe_lean_run_memory_max_mib(
     it is repeated at the execution concurrency. If only the repeat fails, the answer
     is a lower bound on the execution cap derived from the first probe, never `None`:
     callers single-thread below a threshold, so an unknown cap must not read as "no
-    cap"."""
+    cap". If the repeat itself still reports fewer than its `build_slots` (the host's
+    concurrency file grew between the two probes), its cap is scaled down to the same
+    kind of lower bound instead of probing a third time."""
     if not _is_lean_run_wrapped(cmd, env):
         return None
     env_map = os.environ if env is None else env

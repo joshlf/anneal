@@ -6105,6 +6105,184 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertEqual(suite._lean_run_wrapper_flags([lr, "--", *inner])[0], expected, inner)
             self.assertEqual(suite._lean_run_wrapper_flags([lr, *inner])[0], expected, inner)
 
+    def test_wrapper_option_tables_and_memory_probe_match_the_in_repo_wrapper(self) -> None:
+        # `_LEAN_RUN_VALUE_OPTS` / `_LEAN_RUN_BOOL_OPTS` / `_LEAN_RUN_NON_EXEC_OPTS` are a copy of
+        # the wrapper's `build_parser()`, and the two-probe protocol of
+        # `_probe_lean_run_memory_max_mib` mirrors its `resolve_effective_concurrency`. The other
+        # probe tests answer from a hand-written table, which encodes what the suite assumes
+        # about the wrapper. Here the in-repo wrapper's own parser and memory envelope answer
+        # (in process, no subprocess), so neither copy can drift silently.
+        loader = importlib.machinery.SourceFileLoader(
+            "anneal_lean_run_probe_under_test", os.fspath(REPO_ROOT / "scripts/anneal-lean-run")
+        )
+        wrapper = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        with mock.patch.object(sys, "dont_write_bytecode", True):
+            loader.exec_module(wrapper)
+        # `build_parser` reads `ANNEAL_LEAN_MEMORY_MAX_MB` / `ANNEAL_LEAN_TIMEOUT_SEC` defaults.
+        with mock.patch.dict(os.environ, clear=True):
+            parser = wrapper.build_parser()
+
+        # 1. Option tables: every wrapper option, split by whether it takes a value, and the
+        #    ones after which the wrapper never runs the wrapped command.
+        actions = parser._option_string_actions
+        self.assertEqual({o for o, a in actions.items() if a.nargs != 0}, set(suite._LEAN_RUN_VALUE_OPTS))
+        self.assertEqual({o for o, a in actions.items() if a.nargs == 0}, set(suite._LEAN_RUN_BOOL_OPTS))
+        self.assertEqual(
+            {o for o, a in actions.items() if a.dest in ("help", "probe", "ensure_slice")},
+            set(suite._LEAN_RUN_NON_EXEC_OPTS),
+        )
+
+        def parse(argv: list[str]):
+            """The wrapper's parsed arguments, or its `SystemExit` code (help: 0, usage error: 2)."""
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    return parser.parse_args(argv)
+            except SystemExit as exc:
+                return int(exc.code or 0)
+
+        def make_host(mem_total: int, mem_avail: int, cores: int, c_high: int | None) -> dict:
+            ancestors = (
+                []
+                if c_high is None
+                else [
+                    {
+                        "path": "/sys/fs/cgroup/user.slice",
+                        "name": "user.slice",
+                        "c_high_mb": c_high,
+                        "w_mb": 512,
+                        "is_shared_user_slice": False,
+                    }
+                ]
+            )
+            return dict(cpu_cores=cores, mem_total_mb=mem_total, mem_avail_mb=mem_avail, ancestors=ancestors)
+
+        def plan(host: dict, w_file: int | None, args, mode: str, is_probe: bool) -> dict:
+            return wrapper.compute_workload_memory_envelope(
+                **host,
+                w_file=w_file,
+                cli_concurrency=args.concurrency,
+                exclusive=args.exclusive,
+                is_probe=is_probe,
+                mode=mode,
+                override_mem_mb=args.memory_max_mb,
+                override_timeout_sec=args.timeout,
+                unsafe_ignore_cgroup=args.unsafe_ignore_cgroup,
+            )
+
+        # What the fake `subprocess.run` answers: `w_files[k]` is the host's concurrency file
+        # at the k-th probe (the last entry repeats), and probes from `fail_from` on exit 1.
+        state: dict = {"host": make_host(65536, 60000, 32, None), "w_files": [None], "fail_from": None}
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(list(argv))
+            if state["fail_from"] is not None and len(calls) >= state["fail_from"]:
+                return subprocess.CompletedProcess(argv, 1, "", "probe failed")
+            args = parse(list(argv[1:]))
+            if isinstance(args, int):
+                return subprocess.CompletedProcess(argv, args, "usage: anneal-lean-run", "")
+            # Every probe the suite spawns is a pure `--probe --json` with no wrapped command.
+            self.assertTrue(args.probe and args.json and not args.ensure_slice and not args.cmd, argv)
+            w_file = state["w_files"][min(len(calls), len(state["w_files"])) - 1]
+            limits = plan(state["host"], w_file, args, wrapper.detect_mode([], args.mode), True)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(limits), "")
+
+        def probe(cmd: list[str]) -> int | None:
+            calls.clear()
+            with mock.patch.object(suite.subprocess, "run", side_effect=fake_run):
+                return suite._probe_lean_run_memory_max_mib(cmd, env={})
+
+        lr = "/opt/bin/anneal-lean-run"
+
+        # 2. The suite reports a cap exactly when the wrapper would run the wrapped command, and
+        #    never spawns it for help / `--probe` / `--ensure-slice` (which mutates systemd units).
+        for opts in (
+            ["-h"],
+            ["-hW1"],
+            ["--he"],
+            ["--probe"],
+            ["--pro"],
+            ["--print"],
+            ["--ensure"],
+            ["--ens", "--json"],
+            ["--pr"],  # Ambiguous abbreviations and bad values: the wrapper exits 2.
+            ["--e"],
+            ["--no"],
+            ["--m", "file"],
+            ["--mode", "bogus"],
+            ["-W", "x"],
+            [],
+            ["--json"],
+            ["--ex"],
+            ["-W", "2"],
+            ["-W2"],
+            ["-W=2"],
+            ["--conc=2"],
+            ["--mode=file"],
+            ["--nested", "--no-s", "--no-o"],
+            ["--t", "5", "--me", "9000", "--u"],
+        ):
+            for tail in (["--", "lake", "build"], ["lake", "build"], ["--"], []):
+                parsed = parse([*opts, *tail])
+                executes = (
+                    not isinstance(parsed, int)
+                    and not parsed.probe
+                    and not parsed.ensure_slice
+                    and bool(parsed.cmd[1:] if parsed.cmd[:1] == ["--"] else parsed.cmd)
+                )
+                got = probe([lr, *opts, *tail])
+                self.assertEqual(got is not None, executes, (opts, tail))
+                if parsed == 0 or (not isinstance(parsed, int) and not executes):
+                    self.assertEqual(calls, [], (opts, tail))
+
+        # 3. The cap the suite derives is the `MemoryMax` the wrapper executes with, in at most
+        #    two probes. When only the re-probe fails, or the host's concurrency file changes
+        #    between the two probes, it is still at most that `MemoryMax` (fail-closed: callers
+        #    single-thread below a threshold).
+        reprobed = clamped = 0
+        for host in (
+            make_host(16384, 14000, 8, None),
+            make_host(65536, 60000, 32, None),
+            make_host(65536, 60000, 32, 49152),
+            make_host(262144, 200000, 96, 131072),
+        ):
+            for w_file in (None, 1, 2, 4):
+                for cli_opts in ([], ["--concurrency", "1"], ["-W2"], ["--conc=3"], ["--concurrency", "1", "--exclusive"]):
+                    for inner in (["lake", "build", "MiniRustSpec"], ["lake", "env", "lean", "Foo.lean"]):
+                        for extra in ([], ["--memory-max-mb", "9000"]):
+                            cmd = [lr, *cli_opts, *extra, "--timeout", "900", "--", *inner]
+                            case = (host["mem_total_mb"], bool(host["ancestors"]), w_file, cli_opts, inner[1], extra)
+                            args = parse(cmd[1:])
+                            mode = wrapper.detect_mode(inner, args.mode)
+
+                            def executed_cap(w_file_at_exec: int | None) -> int:
+                                return plan(host, w_file_at_exec, args, mode, False)["memory_max_mb"]
+
+                            want = executed_cap(w_file)
+                            self.assertGreater(want, 0, case)
+                            state.update(host=host, w_files=[w_file], fail_from=None)
+                            self.assertEqual(probe(cmd), want, case)
+                            self.assertLessEqual(len(calls), 2, case)
+                            if len(calls) < 2:
+                                continue
+                            reprobed += 1
+                            self.assertIsNotNone(w_file, case)
+
+                            state.update(fail_from=2)
+                            low = probe(cmd)
+                            self.assertIsNotNone(low, case)
+                            self.assertTrue(1 <= low <= want, (case, low, want))
+
+                            for drifted in (w_file + 2, max(1, w_file - 1)):
+                                state.update(w_files=[w_file, drifted], fail_from=None)
+                                got = probe(cmd)
+                                self.assertEqual(len(calls), 2, case)
+                                self.assertIsNotNone(got, case)
+                                self.assertLessEqual(got, executed_cap(drifted), (case, drifted))
+                                clamped += executed_cap(drifted) < want and got < want
+        self.assertGreater(reprobed, 0)
+        self.assertGreater(clamped, 0)
+
     def test_run_step_survives_real_wrapper_slot_contention_exceeding_step_budget(self) -> None:
         # End-to-end verification under real `flock` build-slot contention using the actual
         # `scripts/anneal-lean-run` implementation (isolated to a temp runtime dir so it never
