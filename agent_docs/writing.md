@@ -14,7 +14,7 @@ upstream directory names; two differ from the names in their skill metadata.
 | Package | Apply it to | Full instructions |
 | --- | --- | --- |
 | `reader-oriented-explanation` | Content in all documentation, code comments, and commit messages | [`skills/reader-oriented-explanation/SKILL.md`](../skills/reader-oriented-explanation/SKILL.md) |
-| `williams-style` | Style in all documentation, code comments, and commit messages | [`skills/williams-style/SKILL.md`](../skills/williams-style/SKILL.md) |
+| `clear-writing` | Style in all documentation, code comments, and commit messages | [`skills/clear-writing/SKILL.md`](../skills/clear-writing/SKILL.md) |
 | `comment_guidelines` | Explanatory implementation comments and caller-facing documentation comments | [`skills/comment-guidelines/SKILL.md`](../skills/comment-guidelines/SKILL.md) |
 | `authorship_disclosure` | Git commit authorship and disclosure; separately published prose such as PR descriptions | [`skills/authorship-disclosure/SKILL.md`](../skills/authorship-disclosure/SKILL.md) |
 | `commit-message` | Git commit subjects and bodies | [`skills/commit-message/SKILL.md`](../skills/commit-message/SKILL.md) |
