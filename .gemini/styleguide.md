@@ -35,13 +35,14 @@ never proves defect absence or substitutes for CI or merge gates.
   archives, governing docs (`META_PRINCIPLES.md`, `PRINCIPLES.md`,
   `THREAT_MODEL.md`, `docs/trust-model.md`), policy files (`AGENTS.md`,
   `CLAUDE.md`, `.gemini/styleguide.md`, `skills/`, `docs/codex-review.md`,
-  `docs/review-policy-design.md`), and editor or agent configs. Every PR
-  description (or branch-only handoff) must open with a `Human review surface`
-  block listing every changed surface and intentional policy relaxation (or
-  `none`), completed before marking ready for review. Relevant commit bodies
-  (or squash message) must explain what changed, why, and any rule relaxation
-  or tightening; any omission, mischaracterization, or unsound relaxation
-  blocks merge or ready-for-review.
+  `docs/review-policy-design.md`), and editor or agent configs. Every PR's
+  Review Receipt comment (or branch-only handoff) must include a `Human review
+  surface` block listing every changed surface and intentional policy relaxation
+  (or `none`), completed before marking ready for review; PR descriptions reuse
+  the commit (or squash) message verbatim (unwrapped for Markdown). Relevant
+  commit bodies (or squash message) must explain what changed, why, and any
+  rule relaxation or tightening; any omission, mischaracterization, or unsound
+  relaxation blocks merge or ready-for-review.
 - **Comparison, diff integrity, and coverage:** Record
   `(target_base, merge_base, head)` (plus dirty or untracked files if
   unpublished). Enumerate every path, mode, dotfile, and companion artifact
@@ -86,9 +87,10 @@ never proves defect absence or substitutes for CI or merge gates.
     (such as nested `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.agents/`,
     `.claude/`, `.gemini/`, `.codex/`, `.cursor/`, `.cursorrules`,
     `.windsurfrules`, `.clinerules`, `.mcp.json`, `.vscode/`, `.devcontainer/`,
-    `.idea/`, `.zed/`) unless listed in the `Human review surface` block and
-    trust-reviewed (when the host permits summary prose, record "pending human
-    approval (Gate 5)" as a merge condition, not a review block).
+    `.idea/`, `.zed/`) unless disclosed in the Review Receipt's `Human review
+    surface` block (or commit/PR body) and trust-reviewed (when the host
+    permits summary prose, record "pending human approval (Gate 5)" as a merge
+    condition, not a review block).
   - *No unchecked build code outside TCB/CI:* Outside `trusted/`, `ci/`,
     `.github/`, and pinned root manifests, reject any new Rust crate,
     `build.rs`, proc-macro, `Makefile`, `GNUmakefile`, `Justfile`, `lakefile*`,
@@ -153,8 +155,9 @@ never proves defect absence or substitutes for CI or merge gates.
     during lower stack PRs or pre-capture `candidate:<feature>` bring-up, every
     declaration must trace to the declared `Trusted.Crate` /
     `Trusted.CrateTheorem` interface (or planned top-of-stack root in
-    `Human review surface`) with zero dead code (move proof-only helpers to
-    `theory/`). Audit `trusted/`-to-`theory/` seams for vacuous assumptions.
+    `Human review surface` or commit body) with zero dead code (move proof-only
+    helpers to `theory/`). Audit `trusted/`-to-`theory/` seams for vacuous
+    assumptions.
   - *`trusted/rustc-capture/`:* Direct 1:1 `Runtime(PostCleanup)` MIR capture
     with no semantic normalization. Fail closed on compiler errors
     (`tcx.dcx().has_errors()`) and every unsupported MIR statement, terminator,
@@ -263,5 +266,10 @@ never proves defect absence or substitutes for CI or merge gates.
   checks, or base access, use the host's failure/abstention path—else retain
   the limitation for the next authorized handoff without fabricating a finding.
   Never treat an aborted or empty findings-only run as completion or approval
-  without separate completion evidence.
+  without separate completion evidence. Automated Gate 2 reviewers must run in
+  a distinct model family from the author, post `COMMENT` (never `APPROVE`,
+  reserved for Gate 5), and—outside legacy Codex summaries—emit one
+  `<!-- anneal-gate2-review:v1 {...} -->` footer binding `base_sha`,
+  `head_sha`, `tree_sha`, `reviewer_family`, `author_family`, `verdict`, and
+  `findings[]`.
 <!-- code-review-rules:end -->

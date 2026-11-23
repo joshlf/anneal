@@ -1,7 +1,7 @@
 ---
 name: change-review
 description: >-
-  Review Anneal changes, orchestrate local and hosted reviews, size refinement
+  Review Anneal changes, orchestrate local and Gate 2 reviews, size refinement
   effort to risk, pipeline stacked PRs, adjudicate findings, and write review
   receipts. Not permission to edit, publish, or merge. Use when reviewing a
   diff (Part I only for delegated reviewers) or preparing, refining, or
@@ -87,19 +87,20 @@ integration, publication, and stack locking or rebasing.
   conventions CI does not enforce (Fuchsia copyright headers on all new code
   and non-`SKILL.md` Markdown files, 80-column wrapping, relative links, and
   heading anchors). Check the **Human review surface** in
-  [`AGENTS.md`](../../AGENTS.md#code-review-rules): verify that the PR
-  description's `Human review surface` block (or branch-only task handoff)
+  [`AGENTS.md`](../../AGENTS.md#code-review-rules): verify that the Review
+  Receipt comment's `Human review surface` block (or branch-only task handoff)
   accurately lists every changed surface (including indirect helpers,
   predicates, constants, types, or trait impls a stated spec transitively
   depends on) and intentional policy relaxation (or `none` when untouched,
-  completed before marking a draft PR ready for review), that relevant commit
-  bodies (or the squash message) explain what changed, why, and any intentional
-  rule relaxation or tightening, and that every relaxation justification is
-  sound. Any omission, mischaracterization, or unsound relaxation blocks merge
-  or ready-for-review. When a change edits governing docs, skills, review
-  rules, or `AGENTS.md`, judge it against the base rules (for example via
-  `git show <target_base>:AGENTS.md`) and audit for contradictory duties,
-  missing routing, unintended authority expansion, or weakened checks.
+  completed before marking a draft PR ready for review), that PR descriptions
+  reuse the commit (or squash) message verbatim (unwrapped for Markdown), that
+  relevant commit bodies (or the squash message) explain what changed, why, and
+  any intentional rule relaxation or tightening, and that every relaxation
+  justification is sound. Any omission, mischaracterization, or unsound
+  relaxation blocks merge or ready-for-review. For edits to governing docs,
+  skills, review rules, or `AGENTS.md`, judge against the base rules (e.g. via
+  `git show <target_base>:AGENTS.md`) for conflicts, missing routing,
+  unintended authority expansion, or weakened checks.
 - **Documentation review:**
   <!-- docs-reviewer -->
   Check affected docs, examples, and links against each PR's diff. Flag stale
@@ -177,6 +178,12 @@ integration, publication, and stack locking or rebasing.
 - **Render to the host's output schema without dropping assessment:**
   - *Rich output hosts (local reviews, PR comments):* Report the full coverage
     accounting, findings, open questions, and explicit probe disclosure.
+  - *Gate 2 cross-family `COMMENT` reviews:* Run in a distinct model family from
+    the author, post `COMMENT` (never `APPROVE`, reserved for Gate 5), attach
+    inline findings, and append `<!-- anneal-gate2-review:v1 {...} -->`
+    binding `base_sha`, `head_sha`, `tree_sha`, `reviewer_family`,
+    `author_family`, `verdict`, and `findings[]` per
+    [`docs/codex-review.md`](../../docs/codex-review.md#merge-gates).
   - *Single-turn hosts with a summary channel:* Report blocked paths, checks
     not re-executed, and un-anchored open questions in the summary alongside
     inline findings.
@@ -190,7 +197,8 @@ integration, publication, and stack locking or rebasing.
     hiding them behind abstention); if the host offers no failure or abstention
     path, retain the limitation for the next authorized handoff without
     fabricating a finding. Never treat bare `[]` on a findings-only host as
-    completion or approval without separate completion evidence.
+    completion or approval without separate completion evidence, setting
+    `anneal-gate2-review:v1` `verdict` to `"incomplete"` (never `"clean"`).
 
 **Part I ends here.** Delegated reviewers stop now and return their report. Do
 not enter Part II, edit files, integrate worker branches, push, or delegate
@@ -225,11 +233,11 @@ change:
 
 | Change since last verified state | Reusable evidence | What must be redone |
 |---|---|---|
-| Identity-preserving rewrite of a one-commit PR (unchanged parent tree, tree, and commit message, such as rebasing an upper stack PR onto its lower PR's squash commit) | Review verdicts and review-gate evidence (Gates 1, 2, and 5) recorded on that PR for that identity, subject to the Gate 5 rule on later edits to the `Human review surface` block; never deterministic preflight or Gate 3 CI, which bind to each SHA | Confirm the identity is unchanged, then rerun deterministic preflight (including authorship and trailer checks, which the identity omits) and CI on new `head` (GitHub reports checks per commit SHA) |
-| Commit-message-only amend (identical `head^{tree}`) | Tree-only builds, tests, and probes | Commit-message and trailer check, `./ci/check_todo.sh`, range invariants, fresh hosted review, CI, and merge gates on new `head` |
-| Clean rebase that changes the identity (`git range-diff` shows no patch edits and no interface changes in rebased-over commits; identity-preserving rewrites use the row above) | Unchanged patch-level semantic analysis | Post-rebase checks in [`source-control`](../source-control/SKILL.md#lock-and-rebase-a-stack), deterministic preflight, fresh hosted review, CI, and merge gates on new `head` |
-| Verified non-policy prose, wrapping, or non-directive comment edit (zero behavioral diff; excludes any Pass 2 trigger, Human review surface, `-- anneal-trust-tier:`, `#[anneal::*]`, spec attributes, task-marker directives, and Rust doctests) | Earlier behavioral and semantic verdicts | Deterministic lints, scoped Pass 1 hygiene and diff review (grammar, wrapping, counts, paths, unchanged semantics), fresh hosted review, CI, and merge gates on new `head` |
-| Any behavioral, TCB, policy, specification, tier-directive, manifest, or interface edit | None for affected surfaces | Full fresh-context review on affected surfaces, preflight, hosted review, CI, and merge gates |
+| Identity-preserving rewrite of a one-commit PR (unchanged parent tree, tree, and commit message, such as rebasing an upper stack PR onto its lower PR's squash commit) | Review verdicts and review-gate evidence (Gates 1, 2, and 5) recorded on that PR for that identity, subject to the Gate 5 rule on later edits to the Review Receipt comment's `Human review surface` block; never deterministic preflight or Gate 3 CI, which bind to each SHA | Confirm the identity is unchanged, then rerun deterministic preflight (including authorship and trailer checks, which the identity omits) and CI on new `head` (GitHub reports checks per commit SHA) |
+| Commit-message-only amend (identical `head^{tree}`) | Tree-only builds, tests, and probes | Commit-message and trailer check, `./ci/check_todo.sh`, range invariants, fresh Gate 2 review, CI, and merge gates on new `head` |
+| Clean rebase that changes the identity (`git range-diff` shows no patch edits and no interface changes in rebased-over commits; identity-preserving rewrites use the row above) | Unchanged patch-level semantic analysis | Post-rebase checks in [`source-control`](../source-control/SKILL.md#lock-and-rebase-a-stack), deterministic preflight, fresh Gate 2 review, CI, and merge gates on new `head` |
+| Verified non-policy prose, wrapping, or non-directive comment edit (zero behavioral diff; excludes any Pass 2 trigger, Human review surface, `-- anneal-trust-tier:`, `#[anneal::*]`, spec attributes, task-marker directives, and Rust doctests) | Earlier behavioral and semantic verdicts | Deterministic lints, scoped Pass 1 hygiene and diff review (grammar, wrapping, counts, paths, unchanged semantics), fresh Gate 2 review, CI, and merge gates on new `head` |
+| Any behavioral, TCB, policy, specification, tier-directive, manifest, or interface edit | None for affected surfaces | Full fresh-context review on affected surfaces, preflight, Gate 2 review, CI, and merge gates |
 
 ### Size review effort to risk
 
@@ -242,27 +250,26 @@ trivial edits incur zero needless ceremony:
    Human review surface, directives, and Rust doctests):**
    - *TCB, CI, or semantic Human-review-surface change* (any Pass 2 trigger in
      [`trust-review`](../trust-review/SKILL.md#map-every-path-to-a-surface) or
-     any semantic edit to the **Human review surface** defined in
-     [`AGENTS.md`](../../AGENTS.md#code-review-rules)): assign the strongest
-     available reviewer capability to `trust-review`; use independent reviewers
-     from distinct model families when available within authorized compute; use
-     bounded slice-sharding on large multi-subsystem diffs; use isolated
-     holdout probes only for semantic, compiler, or auditor logic (not
-     mechanical pin or workflow bumps); and write a structured receipt. If no
-     fresh-context reviewer is available on the host, fail closed rather than
-     self-approving Gate 1 unless a human maintainer explicitly accepts a
-     disclosed trust-first self-review; if holdout tooling is unavailable,
-     record `none` with the reason in Receipt field 4.
-   - *Standard surface* (any other non-trivial change—including `theory/`, Rust
-     or Lean tests, Rust doctests, tooling, substantive documentation, or
-     verified zero-semantic typo/wrapping edits to policy and governing files):
-     run one independent fresh-context reviewer covering both passes (plus
-     drift checks for policy files; adding cross-family review when complexity
-     warrants it) and write a compact receipt. If no fresh-context reviewer is
-     available on the host, perform the same passes as a dedicated, trust-first
-     self-review and disclose that fallback explicitly (never labeling it
-     independent or fabricating separate agents; note single-model error
-     correlation).
+     semantic edit to the **Human review surface** in
+     [`AGENTS.md`](../../AGENTS.md#code-review-rules)): run one mandatory
+     pre-push `trust-review` over cumulative `main..<head>` using the strongest
+     available reviewer (independent when available; fail closed unless a
+     human accepts a disclosed trust-first self-review). Shard large diffs, run
+     isolated holdouts only for semantic/compiler/auditor logic not covered by
+     post-push Gate 2 falsification (`none` in field 4 when omitted), write a
+     receipt, and push to draft so cold cross-family Gate 2 runs unprimed probes
+     ([`docs/codex-review.md`](../../docs/codex-review.md#merge-gates)).
+   - *Standard surface* (other non-trivial edits—`theory/`, tests, doctests,
+     tooling, substantive docs, or zero-semantic policy typos/wrapping): when
+     cold post-push cross-family Gate 2 applies
+     ([`docs/codex-review.md`](../../docs/codex-review.md#merge-gates)) and no
+     CI-executed or semantic Human-review-surface path changes, run at most one
+     fast Pass 1 and specification/seam check (single subagent or disclosed
+     self-review; skip multi-round local critic ping-pong and holdouts) plus
+     policy drift checks, write a compact receipt, and delegate deep
+     cross-family falsification to Gate 2; else run one independent
+     fresh-context reviewer covering both passes (or a disclosed trust-first
+     self-review fallback, noting single-model error correlation).
    - *Verified trivial edit* (typo, formatting, or non-directive prose/comment
      edit strictly outside all Pass 2 triggers, the Human review surface,
      `-- anneal-trust-tier:`, `#[anneal::*]`, spec attributes, task-marker
@@ -274,17 +281,13 @@ trivial edits incur zero needless ceremony:
      when explicitly disclosed as self-review in the receipt—or apply the reuse
      table above when amending a verified commit, and write a compact 3–5
      bullet receipt).
-2. **Change structure and conceptual refinement:**
-   Weigh four questions before running conceptual refinement
-   ([`model-refinement`](../model-refinement/SKILL.md) or
-   [`swarm-model-refinement`](../swarm-model-refinement/SKILL.md)):
-   - Does complexity or security criticality justify conceptual refinement at
-     all?
-   - Should refinement start across the whole stack or within conceptual
-     buckets?
+2. **Change structure and conceptual refinement:** Weigh four questions before
+   running [`model-refinement`](../model-refinement/SKILL.md) or
+   [`swarm-model-refinement`](../swarm-model-refinement/SKILL.md):
+   - Does complexity or security criticality justify conceptual refinement?
+   - Refine across the whole stack or within conceptual buckets?
    - Which individual PRs warrant dedicated refinement?
-   - Does ambiguity or cross-cutting coupling repay multi-agent refinement over
-     single-agent refinement?
+   - Does ambiguity or coupling repay multi-agent over single-agent refinement?
 
    Use this optional four-step stack baseline as an upper-bound reference and
    weaken any step that complexity does not justify (singleton 1-PR changes
@@ -306,16 +309,21 @@ trivial edits incur zero needless ceremony:
   `<target_base>` worktree or neutral directory—never inside an unaudited
   candidate-head checkout. Pass fresh confirmation reviewers only the governing
   contract, exact comparison tuple, relevant requirements or design decisions,
-  drafted PR `Human review surface` block and relevant commit messages (as
+  drafted `Human review surface` block and relevant commit messages (as
   untrusted claims to verify), reference preflight receipt, and source—never
   prior review transcripts, prior findings, author self-defense, or an expected
   verdict (verify closure of prior findings in a separate warm check or
   coordinator adjudication, keeping fresh confirmation unanchored). Assign the
   strongest available reviewer capability to `trust-review` and complex diffs.
   Use distinct model families across authoring, review, `Audit Critic`, and
-  `Fresh Critic` roles when available within authorized compute, and cross-check
-  any accepted repair that implements a reviewer's concrete design on a
-  different model family when available.
+  `Fresh Critic` roles when available within authorized compute; enforce a
+  distinct reviewer family from the author for automated Gate 2 in an isolated
+  harness without Gate 1 or author transcripts; and cross-check concrete
+  reviewer-designed fixes on a different family when available. Under
+  [`docs/codex-review.md`](../../docs/codex-review.md#merge-gates), cold Gate 2
+  is the canonical unprimed confirmation pass unless running pre-publication
+  `swarm-model-refinement` or covering CI-executed, Pass 2, or semantic
+  `Human review surface` changes.
 - **Bounded read-only slice-sharding:** For large multi-subsystem diffs
   (especially touching `trusted/`, `ci/`, or `.github/`), only the coordinator
   may partition the inventory into one level of disjoint read-only domain
@@ -373,7 +381,7 @@ than serializing independent work, while keeping coordinator compute lean:
   - If `main..<head>` touches **no CI-executed surfaces**, when authorized,
     publish a draft PR per
     [`source-control`](../source-control/SKILL.md#publish-branches-and-stacked-pull-requests)
-    and overlap hosted review, CI, local `trust-review`, local `change-review`,
+    and overlap Gate 2 review, CI, local `trust-review`, local `change-review`,
     and probes in parallel.
   - If `main..<head>` touches any **Pass 2 trigger**, converge local **Pass 2
     `trust-review`** across all affected commits in `main..<head>` **before**
@@ -382,14 +390,14 @@ than serializing independent work, while keeping coordinator compute lean:
     `build.rs`, proc-macros, editor/agent/toolchain configs, or allowlisted
     worker paths), converge local **Pass 1 `trust-review`** of those paths
     **before** pushing that branch (or any branch stacked above it).
-  After parallel checks return, batch concurrent local and hosted findings into
+  After parallel checks return, batch concurrent local and Gate 2 findings into
   one **coalesced repair batch** (one push per round) of focused repair commits
   routed to their owning PR/commit under
   [`source-control`](../source-control/SKILL.md#structure-and-size-commits-for-review),
   never folding a `trusted/` soundness fix together with unrelated edits.
 - **Cross-stage stack pipelining:** In a multi-PR stack, apply the cumulative
   cut bottom-up so converged lower PRs push individually to draft and start CI
-  and hosted review while upper PRs finish refinement or rebasing; never push
+  and Gate 2 review while upper PRs finish refinement or rebasing; never push
   an upper PR—or run `gh stack push`—while any lower branch in `main..<head>`
   has unconverged CI-executed surfaces, and avoid pushing unstable upper PRs
   until their lower base interfaces settle. Lock converged lower prefixes and
@@ -405,7 +413,7 @@ than serializing independent work, while keeping coordinator compute lean:
 
 Merge gates in [`docs/codex-review.md`](../../docs/codex-review.md#merge-gates)
 are non-adjudicable by an acting agent: never relax a stopping rule or waive a
-gate unilaterally to obtain approval. Adjudicate every local and hosted finding
+gate unilaterally to obtain approval. Adjudicate every local and Gate 2 finding
 in order of authority:
 
 1. [`META_PRINCIPLES.md`](../../META_PRINCIPLES.md),
@@ -425,7 +433,7 @@ in order of authority:
   as moving semantic normalization into `trusted/` for cleanliness), weaken
   specs, tests, or checks, misdiagnose deliberate roadmap prose under a stale
   base, or repeat a closed local critic-vs.-critic style oscillation without new
-  falsifiable evidence. If a hosted Codex finding is demonstrably refuted,
+  falsifiable evidence. If a Gate 2 (or legacy Codex) finding is refuted,
   follow [`docs/codex-review.md`](../../docs/codex-review.md#merge-gates).
 - **Post-repair verification and convergence pause:** After any repair, verify
   prose grammar (especially after 80-column re-wrapping), companion manifests
@@ -436,20 +444,21 @@ in order of authority:
 
 ### Record the receipt and converge
 
-Place a short **Human review surface** block at the top of every PR description
-(or in the task handoff for an authorized branch-only push) listing any changes
-to the **Human review surface** defined in
+Keep the PR description verbatim the unwrapped commit (or squash) message per
+[`source-control`](../source-control/SKILL.md#publish-branches-and-stacked-pull-requests);
+never place `Human review surface`, `Gate 2 finding dispositions`, or
+verification logs in the PR description. Post the **Review Receipt** in a PR
+comment (or task handoff for a branch-only push) so round updates never mutate
+the PR description. Open the Review Receipt comment with a **Human review
+surface** block listing any changes to the **Human review surface** defined in
 [`AGENTS.md`](../../AGENTS.md#code-review-rules) and any intentional policy
-relaxation (or `none`). When a Codex finding cannot be fixed, add it to a
-`Codex finding dispositions` list in that block with a clearly labeled
-proposed disposition and the supporting evidence; the maintainer's Gate 5
-approval decides it (see
-[`docs/codex-review.md`](../../docs/codex-review.md#merge-gates)). Post
-the **Review Receipt** in a PR comment (or in the task handoff for a
-branch-only push) so updating receipts across rounds does not mutate the PR
-description. Follow the privacy rule in
-[`AGENTS.md`](../../AGENTS.md#standing-rules) across the PR description and
-Review Receipt. For narrow or trivial changes, condense all six fields below
+relaxation (or `none`). When a Gate 2 finding cannot be fixed, list it under
+`Gate 2 finding dispositions` (or legacy `Codex finding dispositions`) in that
+block with a proposed disposition and supporting evidence; Gate 5 maintainer
+approval decides it
+([`docs/codex-review.md`](../../docs/codex-review.md#merge-gates)).
+Follow the privacy rule in [`AGENTS.md`](../../AGENTS.md#standing-rules) across
+both surfaces. For narrow or trivial changes, condense all six fields below
 into 3–5 compact bullets; for complex or TCB changes, keep one structured
 bullet per field:
 
@@ -460,16 +469,16 @@ bullet per field:
 3. **Grouped coverage:** inspected, inapplicable, or blocked status per changed
    path or single-surface group.
 4. **Realized capability and isolation:** public, generic model-family labels
-   (for example "two distinct model families", "single-family fallback",
-   "disclosed trust-first self-review", or "author self-check on verified
-   trivial edit"), holdout mode (`sealed-file` [cooperative same-UID envelope],
-   `private-subagent`, or `none`) and exposed cases, plus any fallbacks or
-   un-re-executed checks.
+   (e.g. `author_family: <family|human>`, "two distinct model families",
+   "single-family fallback", "disclosed trust-first self-review", or "author
+   self-check on verified trivial edit"), holdout mode (`sealed-file`
+   [cooperative same-UID envelope], `private-subagent`, or `none`) and exposed
+   cases, plus any fallbacks or un-re-executed checks.
 5. **Checks and probes:** deterministic reference preflight receipt and
    executable probes run (and which checks were validly reused).
-6. **Findings and blockers:** dispositions for every local, hosted, and
-   pre-existing finding, plus open trust questions, "pending human approval
-   (Gate 5)" items, or merge blockers.
+6. **Findings and blockers:** dispositions for every local, Gate 2 (including
+   legacy Codex), and pre-existing finding, plus open trust questions, "pending
+   human approval (Gate 5)" items, or merge blockers.
 
 Before merge, confirm every gate in
 [`docs/codex-review.md`](../../docs/codex-review.md#merge-gates) for the PR's

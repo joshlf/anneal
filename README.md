@@ -82,7 +82,7 @@ that as well.)
 
 ## Repository checks
 
-See [the Codex review policy and diagnostics guide](docs/codex-review.md) for
+See [the Gate 2 review policy and diagnostics guide](docs/codex-review.md) for
 the manual merge gates, live ruleset state, read-only diagnostics, and evaluator
 tests.
 
