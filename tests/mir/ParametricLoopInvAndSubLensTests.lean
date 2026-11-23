@@ -2176,7 +2176,8 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     rw [← lookupGlobalAlloc_eq_tableFind, hFind2]
     dsimp only [capturedAllocView]
     rw [hAllocLen2]
-    change (match (match alloc2.mutability with | .mut => true | .not => false) && false with
+    change (match (match alloc2.mutability with
+        | .mut => alloc2.relocations.isEmpty | .not => false) && false with
       | true => _ | false => none) = none
     rw [Bool.and_false]
   have hOobSet : oobGlobalLens.set m2 (globalU32Codec.enc newHdr) = none := by
@@ -2186,7 +2187,7 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     rw [← lookupGlobalAlloc_eq_tableFind, hFind2]
     dsimp only [capturedAllocView]
     rw [globalU32_enc_len newHdr, hAllocLen2]
-    cases alloc2.mutability <;> rfl
+    cases alloc2.mutability <;> cases alloc2.relocations.isEmpty <;> rfl
   -- Operational Tree Borrows non-interference on `siblingGlobalBorrow`
   have hTbHdr := (borrowEntry_operational_non_interference_of_separated
     siblingGlobalBorrow [] hdrAligned.lens [] rfl rfl (Or.inr (Or.inr (by decide)))).2
@@ -2208,6 +2209,38 @@ theorem canary3a_globalAlloc_aligned_chain_and_framing
     hOobGet, hOobSet,
     memGlobals_get_none_of_immutable hFind8' hImm8,
     memGlobals_set_none_of_immutable hFind8' hImm8⟩
+
+/-- Mutable 16-byte global `allocId = 9` whose bytes `[0..8)` hold a pointer to
+global `allocId = 7` (one relocation at offset 0) and whose bytes `[8..16)` are
+plain integers. -/
+def provGlobalAlloc : CapturedAllocation :=
+  { allocId := 9, bytes := List.replicate 16 (some 0),
+    relocations := [(0, { allocId := 7, offsetBytes := 0 })],
+    align := { bytes := 8 }, mutability := .mut }
+
+def provGlobalMem : Memory := { globals := [provGlobalAlloc] }
+
+/-- **Canary 3A (Provenance-Aware vs Raw `AbstractByte` Edge, Fail-Closed)**:
+1. Trusted `globalAllocSliceToAbstractBytes` tags the pointer bytes `[0..4)` with
+   provenance `some (7, _)`, but leaves `[8..12)` provenance-free.
+2. Even so, the raw `Option UInt8` lens view refuses to read or write ANY window
+   of the relocation-carrying allocation (including the provenance-free one), so
+   no lens read can strip provenance and no lens write can leave a stale
+   relocation table that desynchronises the view from trusted semantics. -/
+theorem canary3a_provenance_failClosed :
+    (∃ bs, globalAllocSliceToAbstractBytes provGlobalAlloc 0 4 = some bs ∧
+      bs.all (fun b => match b with | .init _ (some (7, _)) => true | _ => false) = true) ∧
+    globalAllocSliceToAbstractBytes provGlobalAlloc 8 4 =
+      some (List.replicate 4 (.init 0 none)) ∧
+    (⟨9, 0, 4⟩ : ByteSubLens Nat).get provGlobalMem = none ∧
+    (⟨9, 8, 4⟩ : ByteSubLens Nat).get provGlobalMem = none ∧
+    (⟨9, 0, 8⟩ : ByteSubLens Nat).set provGlobalMem (List.replicate 8 (some 0)) = none ∧
+    (⟨9, 8, 4⟩ : ByteSubLens Nat).set provGlobalMem (globalU32Codec.enc 5) = none :=
+  ⟨⟨_, rfl, rfl⟩, rfl,
+    memGlobals_get_none_of_relocated rfl (List.cons_ne_nil _ _),
+    memGlobals_get_none_of_relocated rfl (List.cons_ne_nil _ _),
+    memGlobals_set_none_of_relocated rfl (List.cons_ne_nil _ _),
+    memGlobals_set_none_of_relocated rfl (List.cons_ne_nil _ _)⟩
 
 /-- **Canary 3A (`SepLogicLenses.TypedAt`, `MirTypedByteCodec`, & `encodeValueToBytes` bridge)**:
 Connects `ByteSubLens.getVal` and `ByteSubLens.setVal` on `ByteMem`
@@ -5258,5 +5291,13 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1b_findTarget_totalVerifica
 /-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_full_pureLift_sound' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs in
 #print axioms canary2_diamond_full_pureLift_sound
+
+/-! ### Pass B3 guards: provenance fail-closed edge. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3a_provenance_failClosed' depends on axioms: [propext]
+-/
+#guard_msgs in
+#print axioms canary3a_provenance_failClosed
 
 end Anneal.ParametricLoopInvAndSubLensTests

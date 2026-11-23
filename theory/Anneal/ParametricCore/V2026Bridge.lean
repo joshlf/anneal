@@ -1528,13 +1528,22 @@ live MIR mutable `&mut [u8]` slice writes target `Memory.callerLocals` via
 `CapturedAllocation` tables cleanly for `AlignedSubLens`, codec, and
 `WritePreserves` reasoning without introducing any shadow operational steps. -/
 
-/-- `AllocView` of a `V2026_06_01` `CapturedAllocation`: writable iff
-`mutability = .mut` (failing closed on immutable `static` allocations). -/
+/-- `AllocView` of a `V2026_06_01` `CapturedAllocation`: accessible iff
+`mutability = .mut` AND `relocations = []`.
+
+The raw `Option UInt8` view is provenance-UNAWARE: trusted
+`globalAllocSliceToAbstractBytes` tags every byte covered by a relocation with
+`AbstractByte.init b (some (allocId, tag))`, whereas this view would expose the
+same byte as a bare integer, and a write would leave the stale relocation table
+in place (so the trusted semantics would still decode the overwritten bytes as
+pointer fragments). The view therefore fails closed on immutable `static`
+allocations AND on any allocation carrying pointer provenance; see
+`memGlobals_get_none_of_relocated` / `memGlobals_set_none_of_relocated`. -/
 def capturedAllocView : AllocView CapturedAllocation (Option UInt8) where
   allocId a := a.allocId
   bytes a := a.bytes
   setBytes a bs := { a with bytes := bs }
-  writable a := match a.mutability with | .mut => true | .not => false
+  writable a := match a.mutability with | .mut => a.relocations.isEmpty | .not => false
 
 theorem capturedAllocView_lawful : capturedAllocView.Lawful where
   allocId_setBytes _ _ := rfl
@@ -1611,6 +1620,55 @@ theorem memGlobals_set_none_of_immutable {m : Memory} {L : ByteSubLens Nat}
       rw [lookupGlobalAlloc_eq_tableFind] at hFind
       rw [tableWrite_none_of_not_writable L.offset bs hFind
         (by dsimp [capturedAllocView]; rw [hImm])]
+      rfl
+
+private theorem capturedAllocView_not_writable_of_relocated {alloc : CapturedAllocation}
+    (hRel : alloc.relocations ≠ []) : capturedAllocView.writable alloc = false := by
+  dsimp only [capturedAllocView]
+  cases alloc.mutability
+  all_goals first
+    | rfl
+    | (cases h : alloc.relocations with
+        | nil => exact absurd h hRel
+        | cons _ _ => rfl)
+
+/-- Provenance fail-closed rejection: a `CapturedAllocation` carrying ANY
+relocation (pointer provenance) cannot be read through the raw `Option UInt8`
+`ByteSubLens` view, so lens reads never silently strip provenance. -/
+theorem memGlobals_get_none_of_relocated {m : Memory} {L : ByteSubLens Nat}
+    {alloc : CapturedAllocation}
+    (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
+    (hRel : alloc.relocations ≠ []) :
+    L.get m = none := by
+  unfold ByteSubLens.get
+  cases Nat.blt 0 L.len with
+  | false => rfl
+  | true =>
+    change tableRead capturedAllocView m.globals L.addr L.offset L.len = none
+    rw [lookupGlobalAlloc_eq_tableFind] at hFind
+    exact tableRead_none_of_not_writable L.offset L.len hFind
+      (capturedAllocView_not_writable_of_relocated hRel)
+
+/-- Provenance fail-closed rejection for writes: overwriting bytes of a
+relocation-carrying allocation (which would leave a stale relocation table and
+desynchronise the lens view from trusted `globalAllocSliceToAbstractBytes`)
+is rejected. -/
+theorem memGlobals_set_none_of_relocated {m : Memory} {L : ByteSubLens Nat}
+    {bs : List (Option UInt8)} {alloc : CapturedAllocation}
+    (hFind : lookupGlobalAlloc m.globals L.addr = some alloc)
+    (hRel : alloc.relocations ≠ []) :
+    L.set m bs = none := by
+  unfold ByteSubLens.set
+  cases Nat.blt 0 L.len with
+  | false => rfl
+  | true =>
+    cases Nat.beq bs.length L.len with
+    | false => rfl
+    | true =>
+      dsimp only [ByteStoreOps.writeBytes?, ByteStoreOps.ofTable]
+      rw [lookupGlobalAlloc_eq_tableFind] at hFind
+      rw [tableWrite_none_of_not_writable L.offset bs hFind
+        (capturedAllocView_not_writable_of_relocated hRel)]
       rfl
 
 /-- Canonical alignment oracle on `Memory.globals` built via `tableAlignedAt`,
