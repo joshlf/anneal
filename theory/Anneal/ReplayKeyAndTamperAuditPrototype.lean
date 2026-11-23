@@ -209,11 +209,21 @@ def isNativeReductionAxiom (n : SymName) : Bool :=
   n == ofReduceBoolName || n == ofReduceNatName || n == trustCompilerName ||
   hasNativeComponent n
 
-/-- True iff the module belongs to the Lean standard library (`Init`, `Init.*`, `Std`, `Std.*`). -/
+/-- True iff the module belongs to the Lean standard library or compiler (`Init`, `Std`, `Lean`). -/
 def isStdlibModule (m : SymName) : Bool :=
   match m.getRoot with
-  | some "Init" | some "Std" => true
+  | some "Init" | some "Std" | some "Lean" => true
   | _ => false
+
+/-- True iff the module is under the pinned `Trusted` TCB namespace (`Trusted`, `Trusted.*`). -/
+def isTrustedModule (m : SymName) : Bool :=
+  m.getRoot == some "Trusted"
+
+/-- True iff `n` sits inside `modName`'s public or `_private.<modName>` namespace. -/
+def belongsToModuleNamespace (modName n : SymName) : Bool :=
+  !modName.isAnonymous &&
+  (hasPrefix modName n ||
+   hasPrefix (ofParts (.str "_private" :: modName.toParts)) n)
 
 /-- True iff the module is under `Assumptions.*`. -/
 def isAssumptionsModule (m : SymName) : Bool :=
@@ -310,7 +320,10 @@ inductive AuditFailure where
   | testModuleForeignAxiom (modName rootName axName axOrigin : SymName)
   | reservedOriginMissingSibling (modName ciName claimedOrigin : SymName)
   | stdlibNamedPackageModule (modName : SymName)
+  | trustedNamedPackageModule (modName : SymName)
   | foreignImport (modName importedMod : SymName)
+  | importCycle (modName targetMod : SymName)
+  | forbiddenImportDirection (modName : SymName) (fromRole : String) (importedMod : SymName) (toRole : String)
   deriving DecidableEq, Repr
 
 namespace ExprSkeleton
@@ -679,6 +692,15 @@ def isAsciiAlphaNat (n : Nat) : Bool :=
 def isAsciiDigitNat (n : Nat) : Bool :=
   Nat.ble 48 n && Nat.ble n 57
 
+def isHexDigitNat (n : Nat) : Bool :=
+  isAsciiDigitNat n || (Nat.ble 65 n && Nat.ble n 70) || (Nat.ble 97 n && Nat.ble n 102)
+
+def isOctDigitNat (n : Nat) : Bool :=
+  Nat.ble 48 n && Nat.ble n 55
+
+def isBinDigitNat (n : Nat) : Bool :=
+  n == 48 || n == 49
+
 /-- Mirrors Lean 4.34.1 `Lean.isLetterLike` (`Init/Meta/Defs.lean` lines 101–109). -/
 def isLetterLikeNat (n : Nat) : Bool :=
   (Nat.ble 0x3b1 n && Nat.ble n 0x3c9 && n != 0x3bb) ||
@@ -737,6 +759,14 @@ inductive ScanState where
   | charBody
   | charEsc
   | charEscBody
+  | sawZero
+  | inDec
+  | inHex
+  | inBin
+  | inOct
+  | inSciExpStart
+  | inSciExpSign
+  | inSciExp
   | lexError
   deriving DecidableEq, Repr
 
@@ -744,7 +774,10 @@ inductive ScanState where
 Code-mode transition. `prevIdent` records whether the previous character belongs to an identifier:
 only then is `'` an identifier character (otherwise it opens a char literal), and only at a token
 start can `r` open a raw string. Backtick opens a Lean `Name` literal (`Lean/Parser/Basic.lean`
-line 1036 `nameLitAux`), so `` `r `` is an identifier, not a raw-string prefix.
+line 1036 `nameLitAux`), so `` `r `` is an identifier, not a raw-string prefix. Leading ASCII digits
+enter Lean 4.34.1 numeric-literal states (`Lean/Parser/Basic.lean` lines 820–918) so `0x1r"\"`,
+`0b1r"\"`, `0o7r"\"`, `1_0r"\"`, `1e0r"\"`, and `0x1'"'` do not mistakenly enter `.inIdent` on
+`x`/`b`/`o`/`_`/`e` and swallow subsequent code.
 -/
 def stepCode (prevIdent : Bool) (rev : List Char) (c : Char) : ScanState × List Char :=
   if c == '-' then (.sawDash, rev)
@@ -761,6 +794,8 @@ def stepCode (prevIdent : Bool) (rev : List Char) (c : Char) : ScanState × List
     else (.normal, c :: rev)
   else if c == 'r' then (.sawR, rev)
   else if isIdFirstChar c then (.inIdent, c :: rev)
+  else if c == '0' then (.sawZero, c :: rev)
+  else if isAsciiDigitNat c.toNat then (.inDec, c :: rev)
   else (.normal, c :: rev)
 
 /-- Block-comment body transition (Lean 4.34.1 `finishCommentBlock`), blanking every character. -/
@@ -867,6 +902,36 @@ def stripStepOne (acc : ScanState × List Char) (c : Char) : ScanState × List C
     if c == '\'' then (.normal, ' ' :: rev)
     else if c == '\n' then (.lexError, rev)
     else (.charEscBody, ' ' :: rev)
+  | .sawZero =>
+    if c == 'x' || c == 'X' then (.inHex, c :: rev)
+    else if c == 'b' || c == 'B' then (.inBin, c :: rev)
+    else if c == 'o' || c == 'O' then (.inOct, c :: rev)
+    else if isAsciiDigitNat c.toNat || c == '_' then (.inDec, c :: rev)
+    else if c == 'e' || c == 'E' then (.inSciExpStart, c :: rev)
+    else stepCode false rev c
+  | .inDec =>
+    if isAsciiDigitNat c.toNat || c == '_' then (.inDec, c :: rev)
+    else if c == 'e' || c == 'E' then (.inSciExpStart, c :: rev)
+    else stepCode false rev c
+  | .inHex =>
+    if isHexDigitNat c.toNat || c == '_' then (.inHex, c :: rev)
+    else stepCode false rev c
+  | .inBin =>
+    if isBinDigitNat c.toNat || c == '_' then (.inBin, c :: rev)
+    else stepCode false rev c
+  | .inOct =>
+    if isOctDigitNat c.toNat || c == '_' then (.inOct, c :: rev)
+    else stepCode false rev c
+  | .inSciExpStart =>
+    if c == '+' || c == '-' then (.inSciExpSign, c :: rev)
+    else if isAsciiDigitNat c.toNat then (.inSciExp, c :: rev)
+    else stepCode false rev c
+  | .inSciExpSign =>
+    if isAsciiDigitNat c.toNat then (.inSciExp, c :: rev)
+    else stepCode false rev c
+  | .inSciExp =>
+    if isAsciiDigitNat c.toNat || c == '_' then (.inSciExp, c :: rev)
+    else stepCode false rev c
   | .lexError => (.lexError, rev)
 
 /-- Run the stripper over a whole character stream. -/
@@ -887,7 +952,8 @@ def flushPending (st : ScanState) (rev : List Char) : List Char :=
 /-- True iff the input ended in code or a line comment (every literal and block comment closed). -/
 def lexTerminalOk : ScanState → Bool
   | .normal | .inIdent | .identDot | .afterGuillemet | .sawDash | .sawSlash | .sawLt
-  | .sawBacktick | .sawR | .sawRHash _ | .inLine => true
+  | .sawBacktick | .sawR | .sawRHash _ | .inLine
+  | .sawZero | .inDec | .inHex | .inBin | .inOct | .inSciExpStart | .inSciExpSign | .inSciExp => true
   | _ => false
 
 /-- Diagnostic for a rejected end-of-input lexer state. -/
@@ -1003,9 +1069,10 @@ def hasAlwaysForbiddenNativeChars (toks : List (List Char)) : Bool :=
 
 /--
 Scan stripped tokens for native evaluation: any `alwaysForbiddenNativeLeafTokens` suffix, any
-`native_decide` / `bv_decide` tactic, or a `decide` tactic together with a `native` token anywhere
-in the file (`decide +native`, `decide+native`, a `native := true` field arbitrarily deep in a
-`config` record, or a config record defined before the tactic).
+`native_decide` / `bv_decide` tactic, or a `decide` tactic together with a `native`, `config`, or
+`DecideConfig` token anywhere in the file (catching `decide +native`, `decide+native`,
+`decide (config := ⟨false, true, true, false⟩)`, `decide (config := .mk false true true false)`,
+and `decide (config := myCfg)` where the word `native` never appears!).
 -/
 def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
   hasAlwaysForbiddenNativeChars toks ||
@@ -1013,7 +1080,10 @@ def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
     tokenHasKeyword "native_decide".toList t || tokenHasKeyword "bv_decide".toList t) ||
   (toks.any (fun t =>
       tokenHasKeyword "decide".toList t || tokenHasKeyword "decide!".toList t) &&
-    toks.any (fun t => tokenHasKeyword "native".toList t))
+    toks.any (fun t =>
+      tokenHasKeyword "native".toList t ||
+      tokenHasKeyword "config".toList t ||
+      tokenHasKeyword "DecideConfig".toList t))
 
 /-- Scan stripped source tokens for native evaluation (see `hasNativeDecideTokensChars`). -/
 def hasNativeDecideTokens (toks : List String) : Bool :=
@@ -5534,6 +5604,69 @@ def naiveStdlibNameTrustAudit (pkg : PackageAuditInput) (kernelFuel : Nat := 64)
     kernelFuel false (audited.flatMap ModuleInventory.constants)
 
 /--
+Operational model of `TrustedBoundary.verifyAudit` lines 564–592 & 732–734 trusting a workspace-
+supplied `Trusted.*` module purely by name: `Trusted.Evil` is pushed into `baseMods` without
+replay or provenance verification AND `stopsStatementUnfolding .trusted` lets it launder `.theory`
+constants into `Verify.*.verified` statement types!
+-/
+def naiveTrustedNameTrustAudit (pkg : PackageAuditInput) (kernelFuel : Nat := 64) :
+    Except AuditFailure KernelEnv :=
+  let trustedByName := pkg.modules.filter fun inv =>
+    SymName.isStdlibModule inv.moduleName || SymName.isTrustedModule inv.moduleName
+  let audited := pkg.modules.filter fun inv =>
+    !(SymName.isStdlibModule inv.moduleName || SymName.isTrustedModule inv.moduleName)
+  replayCleanEnv
+    (KernelEnv.finalizeImportedEnv trustedByName ++ mkBaseKernelEnv pkg.baseEnv)
+    kernelFuel false (audited.flatMap ModuleInventory.constants)
+
+/--
+Operational model of live `TrustedBoundary.verifyAudit` lines 609 & 644–670 `cleanNonWorkspace`
+cross-item cache poisoning: when `Item1` visits a non-workspace node `n` (e.g., an `Anneal.*`
+helper) whose subgraph reaches a provisional native axiom, `verifyAudit` adds `n` to
+`visitedNonWorkspace` (and then `cleanNonWorkspace`) unconditionally; `Item2` then skips `n` at
+`!cleanNonWorkspace.contains n` and is FALSELY certified `.verifiedUnconditional`!
+-/
+def naiveCachedWalkItem (pkg : PackageAuditInput) (allEnv : KernelEnv) (cleanNonWs : List SymName) :
+    Nat → List SymName → List SymName → List SymName → List SymName →
+    (List SymName × List SymName)
+  | 0, _, _, visitedNonWs, reachedProv => (visitedNonWs, reachedProv)
+  | _ + 1, [], _, visitedNonWs, reachedProv => (visitedNonWs, reachedProv)
+  | fuel + 1, n :: rest, visited, visitedNonWs, reachedProv =>
+    if visited.contains n || cleanNonWs.contains n then
+      naiveCachedWalkItem pkg allEnv cleanNonWs fuel rest visited visitedNonWs reachedProv
+    else
+      match allEnv.lookup n with
+      | none =>
+        naiveCachedWalkItem pkg allEnv cleanNonWs fuel rest (n :: visited) visitedNonWs reachedProv
+      | some ci =>
+        let isWs := match pkg.modules.find? (fun m => m.constNames.contains n) with
+          | some inv => inv.role == .proof || inv.role == .spec || inv.role == .verify ||
+                        inv.role == .assumptions || inv.role == .defsExempt
+          | none => false
+        let visitedNonWs' :=
+          if !isWs && !SymName.isNativeReductionAxiom n then n :: visitedNonWs else visitedNonWs
+        let reachedProv' :=
+          if ci.isAxiom && SymName.isNativeReductionAxiom n then n :: reachedProv else reachedProv
+        let edges := match ConstantRecord.declarationEdges ci with
+          | .ok es => es
+          | .error _ => []
+        naiveCachedWalkItem pkg allEnv cleanNonWs fuel (edges ++ rest) (n :: visited)
+          visitedNonWs' reachedProv'
+
+/-- Multi-item `verifyAudit` loop reproducing the live `cleanNonWorkspace` cache poisoning bug. -/
+def naiveCachedClosureMultiItemAudit (pkg : PackageAuditInput) :
+    List (SymName × String) :=
+  let allEnv := KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv
+  let fuel := allEnv.length * 4 + 16
+  let rec go (cleanNonWs : List SymName) : List SymName → List (SymName × String)
+    | [] => []
+    | root :: rest =>
+      let (newNonWs, provs) := naiveCachedWalkItem pkg allEnv cleanNonWs fuel [root] [] [] []
+      let status := if provs.isEmpty then "VerifiedUnconditional" else "ProvisionalNative"
+      (root, status) :: go (newNonWs ++ cleanNonWs) rest
+  go [] pkg.verifyRoots
+
+/--
 Naive pre-`lowmem_lean` (`cl/1027843093`) validator that falsely rejects valid multi-element
 mutual `.all` blocks on `thmDecl` and `opaqueDecl`.
 -/
@@ -5586,12 +5719,13 @@ def SymName.isTestModuleName (m : SymName) : Bool :=
     | _ => false
 
 /--
-True iff the module root is reserved for a name-derived role (`Init`/`Std` foundation, `Trusted`,
-`Anneal` theory, `Assumptions`, `Verify`/`CrateVerify`), mirroring `verifyAudit` lines 563–575.
+True iff the module root is reserved for a name-derived role (`Init`/`Std`/`Lean` foundation,
+`Trusted`, `Anneal` theory, `Assumptions`, `Verify`/`CrateVerify`), mirroring `verifyAudit` lines
+563–575 and §4 Patch 8.
 -/
 def SymName.hasReservedRoleRoot (m : SymName) : Bool :=
   match m.getRoot with
-  | some "Init" | some "Std" | some "Trusted" | some "Anneal" | some "Assumptions"
+  | some "Init" | some "Std" | some "Lean" | some "Trusted" | some "Anneal" | some "Assumptions"
   | some "Verify" | some "CrateVerify" => true
   | _ => false
 
@@ -5635,11 +5769,14 @@ Validate module role against canonical naming rules (`V15`: reject `Topic.Proofs
 reject every role label that the module name does not justify).
 -/
 def validateModuleRole (inv : ModuleInventory) : Except AuditFailure Unit := do
-  -- The standard library is the pinned base (`pkg.baseEnv`), never an audited artifact: a package
-  -- module NAMED `Init.*` / `Std.*` would inherit foundation privileges purely from its name
-  -- (`TrustedBoundary.isStdlibMod`), so it is rejected outright (`stdlibName_baseTrust_bypass`).
+  -- The standard library / compiler (`Init`/`Std`/`Lean`) and pinned TCB (`Trusted`) live in
+  -- `pkg.baseEnv`, never as audited package artifacts: a package module NAMED `Init.*`/`Std.*`/
+  -- `Lean.*` or `Trusted.*` would inherit foundation or `stopsStatementUnfolding` privileges purely
+  -- from its name (`stdlibName_baseTrust_bypass`, `trustedName_baseTrust_bypass`), so reject both.
   if SymName.isStdlibModule inv.moduleName then
     throw (.stdlibNamedPackageModule inv.moduleName)
+  if SymName.isTrustedModule inv.moduleName then
+    throw (.trustedNamedPackageModule inv.moduleName)
   if inv.role == .defsExempt && !SymName.isStrictExemptModuleName inv.moduleName then
     throw (.spoofedExemptModule inv.moduleName)
   if !roleMatchesModuleName inv.role inv.moduleName then
@@ -5758,15 +5895,20 @@ def validateReplayInventory (inv : ModuleInventory) : Except AuditFailure Unit :
 def isStrictExemptModule (inv : ModuleInventory) : Bool :=
   inv.role == .defsExempt && SymName.isStrictExemptModuleName inv.moduleName
 
+/-- True iff extension declaration `d` genuinely belongs to `inv` (never a foreign/protected decl). -/
+def isLocalExtDecl (inv : ModuleInventory) (protectedNames : List SymName) (d : SymName) : Bool :=
+  inv.constNames.contains d ||
+  (!protectedNames.contains d && SymName.belongsToModuleNamespace inv.moduleName d)
+
 /--
 Audit persistent environment extension tables and public namespace suffix shadowing for a module
 (`V01`, `V02`, `V07`, `V08`, `V10`, `V11`, `V12`, `V13`, `V15`, `V16`).
 Explicitly ignores `.cachedExportedAxioms` (`V06`) so tampered caches can never mask axioms.
 For genuine `defsExempt` modules (`<Topic>.Defs`), local instances, `scoped_instance`,
-`default_instance`, and `coe` are permitted, while `V10` hooks (`initialize`, `meta initialize`,
-`implemented_by`, `extern`), macro/elab/delab/unexpander entries, foreign-target instances,
-foreign reducibility overrides, `export` aliases, and `Init`/cross-module suffix shadowing remain
-strictly forbidden!
+`default_instance`, and `coe` (with local target & local decl) are permitted, while `V10` hooks
+(`initialize`, `meta initialize`, `implemented_by`, `extern`), macro/elab/delab/unexpander entries,
+foreign-target instances/coes, foreign reducibility overrides, `export` aliases, and `Init`/cross-module
+suffix shadowing remain strictly forbidden!
 -/
 def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     (protectedNames : List SymName) : Except AuditFailure Unit := do
@@ -5790,8 +5932,9 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
       throw (.forbiddenMacroOrElab inv.moduleName "scoped_elab" d)
     | .scopedMacroEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "scoped_macro" d)
-    | .scopedInstanceEntry d _ _ =>
-      if !isDefs then
+    | .scopedInstanceEntry d _ targetClass =>
+      -- Even in `Defs`, `scoped instance` must target a class declared locally in `Defs` and use a local decl.
+      if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
         throw (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
     | .termElabEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "term_elab" d)
@@ -5800,15 +5943,18 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     | .appUnexpanderEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "app_unexpander" d)
     | .instanceEntry d target targetOrigin _ =>
-      -- `targetOrigin` is extension-table data: the target must ACTUALLY be declared by this
-      -- module's inventory, not merely be claimed to originate here.
-      if targetOrigin != inv.moduleName || !inv.constNames.contains target then
+      -- Both `target` AND the instance declaration `d` must belong to `inv` (never foreign/imported).
+      if targetOrigin != inv.moduleName || !inv.constNames.contains target ||
+          !isLocalExtDecl inv protectedNames d then
         throw (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
-    | .defaultInstanceEntry d _ =>
-      if !isDefs then
+    | .defaultInstanceEntry d targetClass =>
+      -- Even in `Defs`, `default_instance` cannot override an imported `Init`/foreign class!
+      if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
         throw (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
-    | .coeEntry d _ _ =>
-      if !isDefs then
+    | .coeEntry d srcTy tgtTy =>
+      -- Even in `Defs`, a coercion must touch a type declared locally in `Defs` (never `Nat → Bool`!).
+      if !isDefs || !(inv.constNames.contains srcTy || inv.constNames.contains tgtTy) ||
+          !isLocalExtDecl inv protectedNames d then
         throw (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
     | .reducibilityOverride target targetOrigin _ =>
       if targetOrigin != inv.moduleName || !inv.constNames.contains target then
@@ -5846,32 +5992,6 @@ def findPrivateInstance? (inv : ModuleInventory) : Option SymName :=
       if isPrivateInst || d.isPrivateName then some d else none
     | _ => none
 
-/-- Audit import edges across the package (`V14`: forbid `import all`, `meta`, and non-exported private imports). -/
-def validateImports (pkg : PackageAuditInput) : Except AuditFailure Unit := do
-  for inv in pkg.modules do
-    if inv.role != .foundation then
-      for imp in inv.imports do
-        if imp.importAll then
-          match pkg.modules.find? (fun m => m.moduleName == imp.module) with
-          | some targetMod =>
-            match findPrivateInstance? targetMod with
-            | some instName =>
-              throw (.privateInstanceLeakViaImportAll inv.moduleName imp.module instName)
-            | none =>
-              throw (.forbiddenImportAll inv.moduleName imp.module)
-          | none =>
-            throw (.forbiddenImportAll inv.moduleName imp.module)
-        if imp.isMeta && imp.module != SymName.mkSimple "Init" then
-          throw (.forbiddenImportAll inv.moduleName imp.module)
-        if !imp.isExported && imp.module != SymName.mkSimple "Init" then
-          throw (.forbiddenImportAll inv.moduleName imp.module)
-        -- Every import must resolve to an audited package module, a module of the pinned base
-        -- environment, or the standard library (`TrustedBoundary` "foreign module" rule).
-        if !(pkg.modules.any (fun m => m.moduleName == imp.module) ||
-            pkg.baseEnv.any (fun ci => ci.originModule == imp.module) ||
-            SymName.isStdlibModule imp.module) then
-          throw (.foreignImport inv.moduleName imp.module)
-
 /-- Lookup the `ModuleRole` of a module name in `pkg`. -/
 def roleOfModule (pkg : PackageAuditInput) (modName : SymName) : ModuleRole :=
   match pkg.modules.find? (fun m => m.moduleName == modName) with
@@ -5882,6 +6002,90 @@ def roleOfModule (pkg : PackageAuditInput) (modName : SymName) : ModuleRole :=
     else if SymName.hasPrefix (SymName.mkSimple "Trusted") modName then .trusted
     else if SymName.hasPrefix (SymName.mkSimple "Anneal") modName then .theory
     else .spec
+
+/--
+Role-stratification import policy (closes Report §5 item 10):
+- `.foundation` / `.trusted` import only `.foundation` / `.trusted`.
+- `.theory` imports only `.foundation` / `.trusted` / `.theory` (never workspace proofs/specs/tests).
+- `.defsExempt` imports only `.foundation` / `.trusted` / `.defsExempt`.
+- `.spec` / `.assumptions` import `.foundation` / `.trusted` / `.defsExempt` / `.spec` / `.assumptions`
+  (never `.theory`, `.proof`, `.verify`, or `.test`).
+- `.proof` imports anything except `.verify` and `.test`.
+- `.verify` imports anything except `.test`.
+- `.test` may import any role.
+-/
+def importRoleAllowed (fromRole toRole : ModuleRole) : Bool :=
+  match fromRole with
+  | .foundation | .trusted => toRole == .foundation || toRole == .trusted
+  | .theory => toRole == .foundation || toRole == .trusted || toRole == .theory
+  | .defsExempt => toRole == .foundation || toRole == .trusted || toRole == .defsExempt
+  | .spec | .assumptions =>
+    toRole == .foundation || toRole == .trusted || toRole == .defsExempt ||
+    toRole == .spec || toRole == .assumptions
+  | .proof =>
+    toRole == .foundation || toRole == .trusted || toRole == .theory ||
+    toRole == .defsExempt || toRole == .spec || toRole == .assumptions || toRole == .proof
+  | .verify => toRole != .test
+  | .test => true
+
+/-- Direct imported module names of `modName` among `pkg.modules`. -/
+def directImportsOf (pkg : PackageAuditInput) (modName : SymName) : List SymName :=
+  match pkg.modules.find? (fun m => m.moduleName == modName) with
+  | some inv => inv.imports.map ImportSpec.module
+  | none => []
+
+/-- True iff `target` is reachable from `pending` via module import edges within `fuel` steps. -/
+def importReachesAux (pkg : PackageAuditInput) (target : SymName) :
+    Nat → List SymName → List SymName → Bool
+  | 0, _, _ => false
+  | _ + 1, [], _ => false
+  | fuel + 1, m :: rest, visited =>
+    if m == target then true
+    else if visited.contains m then importReachesAux pkg target fuel rest visited
+    else importReachesAux pkg target fuel (directImportsOf pkg m ++ rest) (m :: visited)
+
+/-- Fuel budget guaranteed to cover every module import edge in `pkg.modules`. -/
+def importGraphFuel (pkg : PackageAuditInput) : Nat :=
+  (pkg.modules.foldl (fun acc m => acc + m.imports.length + 1) 0) + 2
+
+/-- Single-import edge check (`V14`, `private import Init`, foreign import, role direction, acyclicity). -/
+def validateSingleImport (pkg : PackageAuditInput) (inv : ModuleInventory) (imp : ImportSpec) :
+    Except AuditFailure Unit := do
+  if imp.importAll then
+    match pkg.modules.find? (fun m => m.moduleName == imp.module) with
+    | some targetMod =>
+      match findPrivateInstance? targetMod with
+      | some instName =>
+        throw (.privateInstanceLeakViaImportAll inv.moduleName imp.module instName)
+      | none =>
+        throw (.forbiddenImportAll inv.moduleName imp.module)
+    | none =>
+      throw (.forbiddenImportAll inv.moduleName imp.module)
+  -- Mirrors `TrustedBoundary.inspectSource` lines 162–164: only exported implicit `meta import Init`
+  -- is excused; non-exported (`private import`) is ALWAYS rejected, even for `Init`.
+  if imp.isMeta && !(imp.module == SymName.mkSimple "Init" && imp.isExported) then
+    throw (.forbiddenImportAll inv.moduleName imp.module)
+  if !imp.isExported then
+    throw (.forbiddenImportAll inv.moduleName imp.module)
+  -- Every import must resolve to an audited package module, a module of the pinned base
+  -- environment, or the standard library (`TrustedBoundary` "foreign module" rule).
+  if !(pkg.modules.any (fun m => m.moduleName == imp.module) ||
+      pkg.baseEnv.any (fun ci => ci.originModule == imp.module) ||
+      SymName.isStdlibModule imp.module) then
+    throw (.foreignImport inv.moduleName imp.module)
+  let targetRole := roleOfModule pkg imp.module
+  if !importRoleAllowed inv.role targetRole then
+    throw (.forbiddenImportDirection inv.moduleName inv.role.label imp.module targetRole.label)
+  if importReachesAux pkg inv.moduleName (importGraphFuel pkg) [imp.module] [] then
+    throw (.importCycle inv.moduleName imp.module)
+
+/-- Audit import edges across the package (`V14`, foreign imports, role stratification, acyclicity). -/
+def validateImports (pkg : PackageAuditInput) : Except AuditFailure Unit :=
+  checkEach pkg.modules fun inv =>
+    if inv.role != .foundation then
+      checkEach inv.imports (validateSingleImport pkg inv)
+    else
+      .ok ()
 
 /-- The module whose inventory actually declares key `n` (modeling `const2ModIdx`), if any. -/
 def moduleOfConst? (pkg : PackageAuditInput) (n : SymName) : Option ModuleInventory :=
@@ -5938,10 +6142,10 @@ def checkVisitedClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : 
     | none => throw (.unknownConstant dep)
     | some depCi =>
       if depCi.isUnsafe || depCi.isPartial then
-        throw (.unsafeOrPartialDecl depCi.originModule dep)
+        throw (.unsafeOrPartialDecl (declaringModuleName pkg dep depCi) dep)
       if depCi.isAxiom then
         if dep == SymName.sorryAxName then
-          throw (.forbiddenAxiom rootName dep depCi.originModule)
+          throw (.forbiddenAxiom rootName dep (declaringModuleName pkg dep depCi))
         else if SymName.isNativeReductionAxiom dep then
           let okProv := cfg.allowProvisionalNative &&
             roleOfConst pkg dep depCi == .proof &&
@@ -5957,7 +6161,7 @@ def checkVisitedClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : 
         else if cfg.allowAssumptions && roleOfConst pkg dep depCi == .assumptions then
           checkVisitedClosure cfg pkg allEnv rootName rest (dep :: acc)
         else
-          throw (.forbiddenAxiom rootName dep depCi.originModule)
+          throw (.forbiddenAxiom rootName dep (declaringModuleName pkg dep depCi))
       else
         checkVisitedClosure cfg pkg allEnv rootName rest acc
 
@@ -5981,11 +6185,13 @@ def auditDirectClosure (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : K
   | .error e => .error e
   | .ok visited => checkVisitedClosure cfg pkg allEnv rootName visited []
 
-/-- Per-verify-root classification mirroring `TrustedBoundary.verifyAudit` lines 674–689. -/
+/-- Per-verify-root classification mirroring `TrustedBoundary.verifyAudit` lines 674–689 (preserving
+both provisional native axioms AND assumptions when a single item depends on both). -/
 inductive VerifyItemStatus where
   | verifiedUnconditional
   | verifiedConditional (assumptions : List SymName)
   | provisionalNative (nativeAxioms : List SymName)
+  | provisionalNativeConditional (nativeAxioms assumptions : List SymName)
   deriving DecidableEq, Repr
 
 /-- Per-verify-root audit report entry. -/
@@ -5993,6 +6199,8 @@ structure VerifyItemReport where
   root : SymName
   status : VerifyItemStatus
   reachedAxioms : List SymName
+  reachedProvisional : List SymName := []
+  reachedAssumptions : List SymName := []
   deriving DecidableEq, Repr
 
 /-- Classify a single verified root strictly from its own direct-closure `reachedAxioms`. -/
@@ -6006,10 +6214,13 @@ def classifyVerifyItem (pkg : PackageAuditInput) (allEnv : KernelEnv) (root : Sy
       | some ci => roleOfConst pkg ax ci == .foundation
       | none => false)
   let st :=
-    if !nativeAxs.isEmpty then .provisionalNative nativeAxs
+    if !nativeAxs.isEmpty && !assumpAxs.isEmpty then
+      .provisionalNativeConditional nativeAxs assumpAxs
+    else if !nativeAxs.isEmpty then .provisionalNative nativeAxs
     else if !assumpAxs.isEmpty then .verifiedConditional assumpAxs
     else .verifiedUnconditional
-  { root := root, status := st, reachedAxioms := reachedAxioms }
+  { root := root, status := st, reachedAxioms := reachedAxioms,
+    reachedProvisional := nativeAxs, reachedAssumptions := assumpAxs }
 
 /-- Certificate returned by `auditAndReplayPackage` upon passing all checks and clean-env replay. -/
 structure AuditCertificate where
@@ -6166,7 +6377,7 @@ def auditVerifyRoot (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : Kern
         | .error e => .error e
         | .ok _ => auditDirectClosure cfg pkg allEnv root
 
-/-- Audit one claim root: theorem header, statement origins, and direct closure. -/
+/-- Audit one claim root: theorem header, non-theory/non-test origin, statement origins, and direct closure. -/
 def auditClaimRoot (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : KernelEnv)
     (root : SymName) : Except AuditFailure (List SymName) :=
   match allEnv.lookup root with
@@ -6174,6 +6385,8 @@ def auditClaimRoot (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : Kerne
   | some ci =>
     if ci.kind != .thmDecl then
       .error (.invalidVerifyRoot root "claim root must be a theorem")
+    else if roleOfConst pkg root ci == .theory || roleOfConst pkg root ci == .test then
+      .error (.invalidVerifyRoot root "claim root cannot reside in theory or test module")
     else
       match ExprSkeleton.expressionEdges root ci.type with
       | .error e => .error e
@@ -7313,6 +7526,7 @@ theorem auditClaimRoot_elim {cfg : AuditConfig} {pkg : PackageAuditInput} {allEn
     rw [hl] at h; dsimp only at h
     split at h; · cases h
     rename_i hk
+    split at h; · cases h
     cases he : ExprSkeleton.expressionEdges root ci.type with
     | error _ => rw [he] at h; cases h
     | ok typeEdges =>
@@ -7431,58 +7645,60 @@ theorem auditAndReplayPackage_item_status_sound {cfg : AuditConfig} {pkg : Packa
       dsimp only at hst
       split at hst
       · cases hst
-      · rename_i hNatEmptyNot
-        split at hst
+      · split at hst
         · cases hst
-        · rename_i hAssumpEmptyNot
-          have hNatEmpty : (axs.filter fun ax => SymName.isNativeReductionAxiom ax) = [] := by
-            cases hne : (axs.filter fun ax => SymName.isNativeReductionAxiom ax)
-            · rfl
-            · exfalso; apply hNatEmptyNot; rw [hne]; rfl
-          have hAssumpEmpty : (axs.filter fun ax =>
-              !SymName.isNativeReductionAxiom ax &&
-              !(SymName.isFoundationalAxiom ax &&
-                match (packageEnv pkg).lookup ax with
-                | some ci => roleOfConst pkg ax ci == .foundation
-                | none => false)) = [] := by
-            cases hae : (axs.filter fun ax =>
+        · rename_i hNatEmptyNot
+          split at hst
+          · cases hst
+          · rename_i hAssumpEmptyNot
+            have hNatEmpty : (axs.filter fun ax => SymName.isNativeReductionAxiom ax) = [] := by
+              cases hne : (axs.filter fun ax => SymName.isNativeReductionAxiom ax)
+              · rfl
+              · exfalso; apply hNatEmptyNot; rw [hne]; rfl
+            have hAssumpEmpty : (axs.filter fun ax =>
                 !SymName.isNativeReductionAxiom ax &&
                 !(SymName.isFoundationalAxiom ax &&
                   match (packageEnv pkg).lookup ax with
                   | some ci => roleOfConst pkg ax ci == .foundation
-                  | none => false))
-            · rfl
-            · exfalso; apply hAssumpEmptyNot; rw [hae]; rfl
-          rcases hBad with hNatTrue | hNotFound
-          · have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
-              List.mem_filter.mpr ⟨hInAxs, hNatTrue⟩
-            rw [hNatEmpty] at hmemF; cases hmemF
-          · cases hnatD : SymName.isNativeReductionAxiom dep with
-            | true =>
-              have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
-                List.mem_filter.mpr ⟨hInAxs, hnatD⟩
-              rw [hNatEmpty] at hmemF; cases hmemF
-            | false =>
-              have hpred : (!SymName.isNativeReductionAxiom dep &&
-                  !(SymName.isFoundationalAxiom dep &&
-                    match (packageEnv pkg).lookup dep with
-                    | some ci => roleOfConst pkg dep ci == .foundation
-                    | none => false)) = true := by
-                rw [hnatD, hlu]
-                simp only [Bool.not_false, Bool.true_and, Bool.not_eq_true']
-                cases hf : SymName.isFoundationalAxiom dep
-                · rfl
-                · cases hr : (roleOfConst pkg dep dCi == ModuleRole.foundation)
-                  · rfl
-                  · exact absurd ⟨hf, beq_iff_eq.mp hr⟩ hNotFound
-              have hmemA : dep ∈ axs.filter (fun ax =>
+                  | none => false)) = [] := by
+              cases hae : (axs.filter fun ax =>
                   !SymName.isNativeReductionAxiom ax &&
                   !(SymName.isFoundationalAxiom ax &&
                     match (packageEnv pkg).lookup ax with
                     | some ci => roleOfConst pkg ax ci == .foundation
-                    | none => false)) :=
-                List.mem_filter.mpr ⟨hInAxs, hpred⟩
-              rw [hAssumpEmpty] at hmemA; cases hmemA
+                    | none => false))
+              · rfl
+              · exfalso; apply hAssumpEmptyNot; rw [hae]; rfl
+            rcases hBad with hNatTrue | hNotFound
+            · have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
+                List.mem_filter.mpr ⟨hInAxs, hNatTrue⟩
+              rw [hNatEmpty] at hmemF; cases hmemF
+            · cases hnatD : SymName.isNativeReductionAxiom dep with
+              | true =>
+                have hmemF : dep ∈ axs.filter (fun ax => SymName.isNativeReductionAxiom ax) :=
+                  List.mem_filter.mpr ⟨hInAxs, hnatD⟩
+                rw [hNatEmpty] at hmemF; cases hmemF
+              | false =>
+                have hpred : (!SymName.isNativeReductionAxiom dep &&
+                    !(SymName.isFoundationalAxiom dep &&
+                      match (packageEnv pkg).lookup dep with
+                      | some ci => roleOfConst pkg dep ci == .foundation
+                      | none => false)) = true := by
+                  rw [hnatD, hlu]
+                  simp only [Bool.not_false, Bool.true_and, Bool.not_eq_true']
+                  cases hf : SymName.isFoundationalAxiom dep
+                  · rfl
+                  · cases hr : (roleOfConst pkg dep dCi == ModuleRole.foundation)
+                    · rfl
+                    · exact absurd ⟨hf, beq_iff_eq.mp hr⟩ hNotFound
+                have hmemA : dep ∈ axs.filter (fun ax =>
+                    !SymName.isNativeReductionAxiom ax &&
+                    !(SymName.isFoundationalAxiom ax &&
+                      match (packageEnv pkg).lookup ax with
+                      | some ci => roleOfConst pkg ax ci == .foundation
+                      | none => false)) :=
+                  List.mem_filter.mpr ⟨hInAxs, hpred⟩
+                rw [hAssumpEmpty] at hmemA; cases hmemA
 
 /--
 Test-Module Closure Soundness (`TrustedBoundary.downstreamAudit` lines 420–442):
@@ -7623,6 +7839,392 @@ theorem auditAndReplayPackage_itemReports_cover_roots {cfg : AuditConfig}
     cert.itemReports.map VerifyItemReport.root = pkg.verifyRoots :=
   buildVerifyItemReports_roots pkg.verifyRoots cert.itemReports
     (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.1
+
+/--
+Per-Root Status Classification Completeness (holds for ANY `cfg`, including mixed packages where
+both `allowAssumptions = true` AND `allowProvisionalNative = true`):
+For EVERY `rep ∈ cert.itemReports` and EVERY `dep` reachable from `rep.root` via `DepReaches`,
+either `dep` is a `CleanDep`, OR `dep` is explicitly recorded in `rep.reachedProvisional` or
+`rep.reachedAssumptions` AND `rep.status ≠ .verifiedUnconditional` (defeating both dropped
+assumptions in mixed items and cross-item `cleanNonWorkspace` cache poisoning!).
+-/
+theorem auditAndReplayPackage_item_status_complete {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ rep ∈ cert.itemReports,
+      ∀ dep, DepReaches (packageEnv pkg) rep.root dep →
+        CleanDep pkg (packageEnv pkg) dep ∨
+        ((dep ∈ rep.reachedProvisional ∨ dep ∈ rep.reachedAssumptions) ∧
+          rep.status ≠ .verifiedUnconditional) := by
+  have hreps := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.1
+  intro rep hrepMem dep hreach
+  obtain ⟨axs, _, hvOk, hrepEq⟩ := buildVerifyItemReports_ok_mem hreps rep hrepMem
+  obtain ⟨_, _, _, _, _, _, hdc⟩ := auditVerifyRoot_elim hvOk
+  unfold auditDirectClosure at hdc
+  cases hwalk : walkGraph (packageEnv pkg) rep.root closureExpand
+      (closureFuel (packageEnv pkg)) [rep.root] [] with
+  | error _ => rw [hwalk] at hdc; cases hdc
+  | ok visited =>
+    rw [hwalk] at hdc; dsimp only at hdc
+    have hdepMem : dep ∈ visited :=
+      (walkGraph_reaches_subset hwalk).1 rep.root List.mem_cons_self dep hreach
+    rcases checkVisitedClosure_general visited [] axs hdc dep hdepMem with hClean | ⟨dCi, hlu, hax, hInAxs, hBad⟩
+    · exact Or.inl hClean
+    · right
+      have hneUncond : rep.status ≠ .verifiedUnconditional := by
+        intro huncond
+        have hClean2 := auditAndReplayPackage_item_status_sound hAudit rep hrepMem huncond dep hreach
+        obtain ⟨dCi2, hlu2, _, _, hax2⟩ := hClean2
+        rw [hlu] at hlu2; injection hlu2 with heq; subst heq
+        rcases hBad with hNatTrue | hNotFound
+        · rcases hax2 hax with ⟨_, hnatF, _⟩
+          rw [hNatTrue] at hnatF; cases hnatF
+        · rcases hax2 hax with ⟨_, _, hfound⟩
+          exact hNotFound hfound
+      refine ⟨?_, hneUncond⟩
+      rw [hrepEq]; unfold classifyVerifyItem; dsimp only
+      rcases hBad with hNatTrue | hNotFound
+      · exact Or.inl (List.mem_filter.mpr ⟨hInAxs, hNatTrue⟩)
+      · cases hnatD : SymName.isNativeReductionAxiom dep with
+        | true => exact Or.inl (List.mem_filter.mpr ⟨hInAxs, hnatD⟩)
+        | false =>
+          right
+          refine List.mem_filter.mpr ⟨hInAxs, ?_⟩
+          rw [hnatD, hlu]
+          simp only [Bool.not_false, Bool.true_and, Bool.not_eq_true']
+          cases hf : SymName.isFoundationalAxiom dep
+          · rfl
+          · cases hr : (roleOfConst pkg dep dCi == ModuleRole.foundation)
+            · rfl
+            · exact absurd ⟨hf, beq_iff_eq.mp hr⟩ hNotFound
+
+/-- Transitive reachability along module import edges in `pkg.modules`. -/
+inductive ImportReaches (pkg : PackageAuditInput) : SymName → SymName → Prop where
+  | direct {a b : SymName} : b ∈ directImportsOf pkg a → ImportReaches pkg a b
+  | trans {a b c : SymName} : b ∈ directImportsOf pkg a → ImportReaches pkg b c → ImportReaches pkg a c
+
+/-- Remaining import-graph traversal budget over modules not yet in `visited`. -/
+def unvisitedImportBudget (visited : List SymName) : List ModuleInventory → Nat
+  | [] => 0
+  | m :: rest =>
+    (if visited.contains m.moduleName then 0 else m.imports.length + 1) +
+    unvisitedImportBudget visited rest
+
+theorem unvisitedImportBudget_cons_le_gen (visited : List SymName) (m : SymName)
+    (mods : List ModuleInventory) :
+    unvisitedImportBudget (m :: visited) mods ≤ unvisitedImportBudget visited mods := by
+  induction mods with
+  | nil => exact Nat.le_refl 0
+  | cons hd tl ih =>
+    unfold unvisitedImportBudget
+    cases hv : visited.contains hd.moduleName with
+    | true =>
+      have hv' : (m :: visited).contains hd.moduleName = true := by
+        simp only [List.contains_cons, hv, Bool.or_true]
+      rw [hv']; simp only [↓reduceIte]; omega
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      split <;> omega
+
+theorem unvisitedImportBudget_cons_strict (visited : List SymName) (m : SymName)
+    (inv : ModuleInventory) (mods : List ModuleInventory)
+    (hfind : mods.find? (fun x => x.moduleName == m) = some inv)
+    (hv : visited.contains m = false) :
+    unvisitedImportBudget (m :: visited) mods + inv.imports.length + 1 ≤
+      unvisitedImportBudget visited mods := by
+  induction mods with
+  | nil => simp at hfind
+  | cons hd tl ih =>
+    simp only [List.find?] at hfind
+    cases heq : (hd.moduleName == m) with
+    | true =>
+      rw [heq] at hfind; injection hfind with hinv; subst hinv
+      have hname : hd.moduleName = m := beq_iff_eq.mp heq
+      unfold unvisitedImportBudget
+      rw [hname, hv]
+      have hmem : (m :: visited).contains m = true := by simp
+      rw [hmem]; simp only [↓reduceIte, Bool.false_eq_true]
+      have htl := unvisitedImportBudget_cons_le_gen visited m tl
+      omega
+    | false =>
+      rw [heq] at hfind
+      unfold unvisitedImportBudget
+      have htl := ih hfind
+      cases hvh : visited.contains hd.moduleName with
+      | true =>
+        have hvh' : (m :: visited).contains hd.moduleName = true := by
+          simp only [List.contains_cons, hvh, Bool.or_true]
+        rw [hvh']; simp only [↓reduceIte]; omega
+      | false =>
+        simp only [Bool.false_eq_true, ↓reduceIte]
+        split <;> omega
+
+theorem unvisitedImportBudget_nil_eq_foldl (mods : List ModuleInventory) :
+    ∀ acc, mods.foldl (fun a m => a + m.imports.length + 1) acc =
+      acc + unvisitedImportBudget [] mods := by
+  induction mods with
+  | nil => intro acc; simp [unvisitedImportBudget]
+  | cons hd tl ih =>
+    intro acc
+    simp only [List.foldl_cons, unvisitedImportBudget, List.contains_nil,
+      Bool.false_eq_true, ↓reduceIte]
+    rw [ih]
+    omega
+
+theorem importReachesAux_false_closed (pkg : PackageAuditInput) (target : SymName) :
+    ∀ (fuel : Nat) (pending visited : List SymName),
+      pending.length + unvisitedImportBudget visited pkg.modules ≤ fuel →
+      (∀ x ∈ visited, x ≠ target ∧ ∀ y ∈ directImportsOf pkg x, y ∈ visited ∨ y ∈ pending) →
+      importReachesAux pkg target fuel pending visited = false →
+      ∃ res : List SymName,
+        (∀ x ∈ pending, x ∈ res) ∧
+        (∀ x ∈ visited, x ∈ res) ∧
+        (∀ x ∈ res, x ≠ target ∧ ∀ y ∈ directImportsOf pkg x, y ∈ res) := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro pending visited hle hinv _
+    cases pending with
+    | nil =>
+      refine ⟨visited, (fun _ h => by cases h), (fun _ h => h), fun x hx => ?_⟩
+      refine ⟨(hinv x hx).1, fun y hy => ?_⟩
+      rcases (hinv x hx).2 y hy with h1 | h2
+      · exact h1
+      · cases h2
+    | cons _ _ => simp at hle
+  | succ fuel ih =>
+    intro pending visited hle hinv hf
+    cases pending with
+    | nil =>
+      refine ⟨visited, (fun _ h => by cases h), (fun _ h => h), fun x hx => ?_⟩
+      refine ⟨(hinv x hx).1, fun y hy => ?_⟩
+      rcases (hinv x hx).2 y hy with h1 | h2
+      · exact h1
+      · cases h2
+    | cons m rest =>
+      simp only [importReachesAux] at hf
+      cases heq : (m == target) with
+      | true => rw [heq] at hf; simp at hf
+      | false =>
+        rw [heq] at hf; simp only [Bool.false_eq_true, ↓reduceIte] at hf
+        have hne : m ≠ target := fun h => by simp [h] at heq
+        cases hv : visited.contains m with
+        | true =>
+          rw [hv] at hf; simp only [↓reduceIte] at hf
+          have hmVis : m ∈ visited := by simpa using hv
+          have hinv' : ∀ x ∈ visited, x ≠ target ∧ ∀ y ∈ directImportsOf pkg x, y ∈ visited ∨ y ∈ rest := by
+            intro x hx
+            refine ⟨(hinv x hx).1, fun y hy => ?_⟩
+            rcases (hinv x hx).2 y hy with h1 | h2
+            · exact Or.inl h1
+            · cases h2 with
+              | head => exact Or.inl hmVis
+              | tail _ htl => exact Or.inr htl
+          have hle' : rest.length + unvisitedImportBudget visited pkg.modules ≤ fuel := by
+            simp only [List.length_cons] at hle; omega
+          obtain ⟨res, hrest, hvis, hcl⟩ := ih rest visited hle' hinv' hf
+          refine ⟨res, fun x hx => ?_, hvis, hcl⟩
+          cases hx with
+          | head => exact hvis m hmVis
+          | tail _ htl => exact hrest x htl
+        | false =>
+          rw [hv] at hf; simp only [Bool.false_eq_true, ↓reduceIte] at hf
+          have hinv' : ∀ x ∈ (m :: visited), x ≠ target ∧
+              ∀ y ∈ directImportsOf pkg x, y ∈ (m :: visited) ∨ y ∈ (directImportsOf pkg m ++ rest) := by
+            intro x hx
+            cases hx with
+            | head => exact ⟨hne, fun y hy => Or.inr (List.mem_append_left _ hy)⟩
+            | tail _ hx' =>
+              refine ⟨(hinv x hx').1, fun y hy => ?_⟩
+              rcases (hinv x hx').2 y hy with h1 | h2
+              · exact Or.inl (List.mem_cons_of_mem _ h1)
+              · cases h2 with
+                | head => exact Or.inl List.mem_cons_self
+                | tail _ htl => exact Or.inr (List.mem_append_right _ htl)
+          have hle' : (directImportsOf pkg m ++ rest).length +
+              unvisitedImportBudget (m :: visited) pkg.modules ≤ fuel := by
+            simp only [List.length_append, List.length_cons] at hle ⊢
+            unfold directImportsOf
+            cases hfind : pkg.modules.find? (fun x => x.moduleName == m) with
+            | none =>
+              simp only [List.length_nil]
+              have hdec := unvisitedImportBudget_cons_le_gen visited m pkg.modules
+              omega
+            | some inv =>
+              simp only [List.length_map]
+              have hdec := unvisitedImportBudget_cons_strict visited m inv pkg.modules hfind hv
+              omega
+          obtain ⟨res, hpend, hvis, hcl⟩ := ih (directImportsOf pkg m ++ rest) (m :: visited) hle' hinv' hf
+          refine ⟨res, fun x hx => ?_, fun x hx => hvis x (List.mem_cons_of_mem _ hx), hcl⟩
+          cases hx with
+          | head => exact hvis m List.mem_cons_self
+          | tail _ htl => exact hpend x (List.mem_append_right _ htl)
+
+theorem importReaches_mem_of_closed {pkg : PackageAuditInput} {res : List SymName}
+    (hcl : ∀ x ∈ res, ∀ y ∈ directImportsOf pkg x, y ∈ res) :
+    ∀ {a b : SymName}, ImportReaches pkg a b → a ∈ res → b ∈ res := by
+  intro a b h
+  induction h with
+  | direct hab => intro ha; exact hcl _ ha _ hab
+  | trans hab _ ih => intro ha; exact ih (hcl _ ha _ hab)
+
+/--
+Package-Level Module Provenance, Import Stratification, & Acyclicity Theorem:
+If `auditAndReplayPackage cfg pkg = .ok cert`, then:
+1. No package module has a stdlib/compiler (`Init`/`Std`/`Lean`) or pinned TCB (`Trusted`) name.
+2. Every import edge of every package module is non-`import all`, exported (`isExported = true`),
+   non-`meta` (except `Init`), resolves to an audited/base/stdlib module, and obeys role
+   stratification (`importRoleAllowed`).
+3. The package module import graph is strictly acyclic: no module can transitively import itself
+   (`¬ ImportReaches pkg inv.moduleName inv.moduleName`).
+-/
+theorem auditAndReplayPackage_imports_sound {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules,
+      ¬ SymName.isStdlibModule inv.moduleName ∧
+      ¬ SymName.isTrustedModule inv.moduleName ∧
+      (∀ imp ∈ inv.imports,
+        imp.importAll = false ∧
+        imp.isExported = true ∧
+        (imp.isMeta = false ∨ imp.module = SymName.mkSimple "Init") ∧
+        importRoleAllowed inv.role (roleOfModule pkg imp.module) = true) ∧
+      ¬ ImportReaches pkg inv.moduleName inv.moduleName := by
+  have hsound := auditAndReplayPackage_sound hAudit
+  have hnodup := auditAndReplayPackage_modules_nodup hAudit
+  intro inv hinv
+  have hroleOk := (hsound.1 inv hinv).2.2.1
+  unfold validateModuleRole at hroleOk
+  dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hroleOk
+  split at hroleOk; · cases hroleOk
+  rename_i hnotStd
+  split at hroleOk; · cases hroleOk
+  rename_i hnotTrusted
+  have hnotStd' : ¬ SymName.isStdlibModule inv.moduleName := fun h => hnotStd h
+  have hnotTrusted' : ¬ SymName.isTrustedModule inv.moduleName := fun h => hnotTrusted h
+  have hnotFoundRole : inv.role ≠ .foundation := by
+    intro hrf
+    split at hroleOk; · cases hroleOk
+    split at hroleOk; · cases hroleOk
+    rename_i hrm
+    have hmatch : roleMatchesModuleName inv.role inv.moduleName = true := by
+      cases h : roleMatchesModuleName inv.role inv.moduleName
+      · exfalso; apply hrm; simp [h]
+      · rfl
+    rw [hrf] at hmatch
+    unfold roleMatchesModuleName at hmatch
+    split at hmatch
+    · cases hmatch
+    · exact hnotStd' hmatch
+  have himps := hsound.2.1
+  unfold validateImports at himps
+  have hmodImp := checkEach_ok_mem himps inv hinv
+  have hrfNe : (inv.role != .foundation) = true := by
+    cases hr : inv.role <;> simp_all
+  simp only [hrfNe, ↓reduceIte] at hmodImp
+  have hsingle : ∀ imp ∈ inv.imports,
+      imp.importAll = false ∧
+      imp.isExported = true ∧
+      (imp.isMeta = false ∨ imp.module = SymName.mkSimple "Init") ∧
+      importRoleAllowed inv.role (roleOfModule pkg imp.module) = true ∧
+      importReachesAux pkg inv.moduleName (importGraphFuel pkg) [imp.module] [] = false := by
+    intro imp himp
+    have hs := checkEach_ok_mem hmodImp imp himp
+    unfold validateSingleImport at hs
+    dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hs
+    split at hs
+    · cases hfind : pkg.modules.find? (fun m => m.moduleName == imp.module) with
+      | none => rw [hfind] at hs; cases hs
+      | some targetMod =>
+        rw [hfind] at hs; dsimp only at hs
+        cases hpriv : findPrivateInstance? targetMod with
+        | none => rw [hpriv] at hs; cases hs
+        | some _ => rw [hpriv] at hs; cases hs
+    rename_i hnotAll
+    split at hs; · cases hs
+    rename_i hnotMeta
+    split at hs; · cases hs
+    rename_i hnotUnexp
+    split at hs; · cases hs
+    split at hs; · cases hs
+    rename_i hnotDir
+    split at hs; · cases hs
+    rename_i hnotCyc
+    have hAllF : imp.importAll = false := by
+      cases h : imp.importAll
+      · rfl
+      · exact absurd h hnotAll
+    have hExpT : imp.isExported = true := by
+      cases h : imp.isExported
+      · exfalso; apply hnotUnexp; simp [h]
+      · rfl
+    have hMeta : imp.isMeta = false ∨ imp.module = SymName.mkSimple "Init" := by
+      cases hm : imp.isMeta
+      · exact Or.inl rfl
+      · right
+        by_cases hmeq : imp.module = SymName.mkSimple "Init"
+        · exact hmeq
+        · exfalso
+          apply hnotMeta
+          simp [hm, hExpT, hmeq]
+    have hDirT : importRoleAllowed inv.role (roleOfModule pkg imp.module) = true := by
+      cases h : importRoleAllowed inv.role (roleOfModule pkg imp.module)
+      · exfalso; apply hnotDir; simp [h]
+      · rfl
+    have hCycF : importReachesAux pkg inv.moduleName (importGraphFuel pkg) [imp.module] [] = false := by
+      cases h : importReachesAux pkg inv.moduleName (importGraphFuel pkg) [imp.module] []
+      · rfl
+      · exact absurd h hnotCyc
+    exact ⟨hAllF, hExpT, hMeta, hDirT, hCycF⟩
+  refine ⟨hnotStd', hnotTrusted', fun imp himp => ?_, ?_⟩
+  · obtain ⟨h1, h2, h3, h4, _⟩ := hsingle imp himp
+    exact ⟨h1, h2, h3, h4⟩
+  · intro hcyc
+    have hfindMod : ∀ (mods : List ModuleInventory),
+        (mods.map ModuleInventory.moduleName).Nodup → inv ∈ mods →
+        mods.find? (fun m => m.moduleName == inv.moduleName) = some inv := by
+      intro mods hnd hm
+      induction mods with
+      | nil => cases hm
+      | cons hd tl ih =>
+        simp only [List.map_cons, List.nodup_cons] at hnd
+        cases hm with
+        | head => simp [List.find?]
+        | tail _ htl =>
+          have hne : hd.moduleName ≠ inv.moduleName := fun heq =>
+            hnd.1 (List.mem_map.mpr ⟨inv, htl, heq.symm⟩)
+          have hbeq : (hd.moduleName == inv.moduleName) = false := beq_false_of_ne hne
+          simp only [List.find?, hbeq]
+          exact ih hnd.2 htl
+    have hfindSelf : pkg.modules.find? (fun m => m.moduleName == inv.moduleName) = some inv :=
+      hfindMod pkg.modules hnodup hinv
+    have hdirSelf : directImportsOf pkg inv.moduleName = inv.imports.map ImportSpec.module := by
+      unfold directImportsOf; rw [hfindSelf]
+    have hfuelLe : 1 + unvisitedImportBudget [] pkg.modules ≤ importGraphFuel pkg := by
+      unfold importGraphFuel
+      rw [unvisitedImportBudget_nil_eq_foldl pkg.modules 0]
+      omega
+    cases hcyc with
+    | direct hb =>
+      rw [hdirSelf] at hb
+      obtain ⟨imp, himp, hmodEq⟩ := List.mem_map.mp hb
+      have hcycf := (hsingle imp himp).2.2.2.2
+      rw [hmodEq] at hcycf
+      obtain ⟨res, hpend, _, hcl⟩ :=
+        importReachesAux_false_closed pkg inv.moduleName (importGraphFuel pkg) [inv.moduleName] []
+          (by simpa using hfuelLe) (fun _ h => by cases h) hcycf
+      exact (hcl inv.moduleName (hpend inv.moduleName List.mem_cons_self)).1 rfl
+    | trans hb hrest =>
+      rw [hdirSelf] at hb
+      obtain ⟨imp, himp, hmodEq⟩ := List.mem_map.mp hb
+      have hcycf := (hsingle imp himp).2.2.2.2
+      obtain ⟨res, hpend, _, hcl⟩ :=
+        importReachesAux_false_closed pkg inv.moduleName (importGraphFuel pkg) [imp.module] []
+          (by simpa using hfuelLe) (fun _ h => by cases h) hcycf
+      have hmemTarget : inv.moduleName ∈ res :=
+        importReaches_mem_of_closed (fun x hx => (hcl x hx).2) (hmodEq ▸ hrest)
+          (hpend imp.module List.mem_cons_self)
+      exact (hcl inv.moduleName hmemTarget).1 rfl
 
 /-! ## Section 9: Constructive Vulnerability Exploits, 18-Vector Tamper Suite (`V01`–`V18`), & Positive Witnesses -/
 
@@ -9792,5 +10394,307 @@ theorem pillar1_kernel_refuted_native_axiom_rejected :
     auditAndReplayPackage provisionalConfig refutedNativeUnfoldedPkg =
       .error (.invalidNativeAxiomType provisionalNativeAxName provisionalNativeAxName) := by
   refine ⟨rfl, rfl⟩
+
+/-! ### Section 9.9: Pass-`A2` Regression Witnesses (Numeric-Raw Lexer Desync, Positional `DecideConfig`, `Trusted.*`/`Lean.*` Trust, `Defs` Foreign Extensions, Import Cycles/Stratification, Mixed Status, `cleanNonWorkspace` Cache Poisoning) -/
+
+/--
+Regression (Pass-`A2` lexer & `DecideConfig` fixes — empirically verified against real Lean 4.34.1):
+1. `prefix:0x1r"\" => id`, `infixl:0b1r"\" => Nat.add`, `notation:0o7r"\" => 1`, and
+   `prefix:1_0r"\" => id` are all 100% valid Lean 4.34.1 (`Lean/Parser/Basic.lean` L820–918) and
+   previously desynchronised `B2`'s lexer on `x`/`b`/`o`/`_` (entering `.inIdent` so `r` failed to
+   open a raw string and `"` swallowed `set_option debug.skipKernelTC true`).
+2. `decide (config := ⟨false, true, true, false⟩)`, `decide (config := .mk false true true false)`,
+   and `decide (config := myCfg)` enable native evaluation in Lean 4.34.1 WITHOUT the token `native`,
+   bypassing both `B2`'s scanner and live `TrustedBoundary.inspectSyntax` line 130.
+3. Benign `by decide +kernel` and hex literals `def x := 0x1a` still pass without false positives.
+-/
+theorem passA2_numeric_raw_string_and_decide_config_hardened :
+    scanProofSource "prefix:0x1r\"\\\" => id\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "infixl:0b1r\"\\\" => Nat.add\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "notation:0o7r\"\\\" => 1\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "prefix:1_0r\"\\\" => id\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "def t := by decide (config := ⟨false, true, true, false⟩)" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "def t := by decide (config := .mk false true true false)" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "def t := by decide (config := myCfg)" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "def x := 0x1a\ntheorem t : True := by decide +kernel" = .ok () := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `Trusted.Evil` package module attempting to launder `.theory` through `stopsStatementUnfolding .trusted` or inject `False`. -/
+def trustedEvilModName : SymName := SymName.ofList ["Trusted", "Evil"]
+def trustedEvilOopsName : SymName := SymName.ofList ["Trusted", "Evil", "oops"]
+def usesTrustedEvilName : SymName := SymName.ofList ["Topic", "Proofs", "usesTrustedOops"]
+
+def trustedEvilOopsDecl : ConstantRecord := {
+  name := trustedEvilOopsName
+  kind := .thmDecl
+  type := .const SymName.falseName
+  value? := some (.const SymName.trueIntroName)
+  hasValue := true
+  all := [trustedEvilOopsName]
+  originModule := trustedEvilModName
+}
+
+def trustedEvilBaseTrustPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule trustedEvilModName .trusted [trustedEvilOopsDecl],
+    mkAlignedModule topicProofModName .proof [{
+      name := usesTrustedEvilName, kind := .thmDecl,
+      type := .const SymName.falseName, value? := some (.const trustedEvilOopsName),
+      hasValue := true, all := [usesTrustedEvilName], originModule := topicProofModName
+    }]
+  ]
+}
+
+def trustedLaunderName : SymName := SymName.ofList ["Trusted", "Evil", "launder"]
+def trustedLaunderPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicTheoryModName .theory [theoryClaimTypeDecl],
+    mkAlignedModule trustedEvilModName .trusted [{
+      name := trustedLaunderName, kind := .defnDecl, type := .const SymName.natName,
+      value? := some (.const theoryClaimTypeName), hasValue := true,
+      all := [trustedLaunderName], originModule := trustedEvilModName
+    }],
+    mkAlignedModule topicVerifyModName .verify [{
+      name := validVerifyThmName, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.const trustedLaunderName),
+      value? := some (.app (.app (.const verificationResultMkName) (.const trustedLaunderName))
+        (.const SymName.trueIntroName)),
+      hasValue := true, all := [validVerifyThmName], originModule := topicVerifyModName
+    }]
+  ]
+  verifyRoots := [validVerifyThmName]
+}
+
+def leanNamedPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule (SymName.ofList ["Lean", "Evil"]) .spec []]
+}
+
+/--
+Regression (name-only `Trusted.*` & `Lean.*` trust): `naiveTrustedNameTrustAudit` accepts an
+ill-typed `Trusted.Evil.oops : False` unchecked into the replay base, and pass-`B2` accepted
+`Trusted.Evil` laundering `.theory` past `stopsStatementUnfolding .trusted` as well as `Lean.Evil`.
+Hardened `validateModuleRole` rejects both (`trustedNamedPackageModule` / `stdlibNamedPackageModule`).
+-/
+theorem trustedName_baseTrust_bypass :
+    (naiveTrustedNameTrustAudit trustedEvilBaseTrustPkg 16).map
+      (fun env => (env.lookup usesTrustedEvilName).map ConstantRecord.type) =
+      .ok (some (.const SymName.falseName)) ∧
+    auditAndReplayPackage defaultUnconditionalConfig trustedEvilBaseTrustPkg =
+      .error (.trustedNamedPackageModule trustedEvilModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig trustedLaunderPkg =
+      .error (.trustedNamedPackageModule trustedEvilModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig leanNamedPkg =
+      .error (.stdlibNamedPackageModule (SymName.ofList ["Lean", "Evil"])) := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `Topic.Defs` foreign-target `default_instance`/`scoped_instance`/`coe` & foreign `instanceEntry` decl `d`. -/
+def defsForeignDefInstPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    (extEntries := [.defaultInstanceEntry (SymName.ofList ["Topic", "Defs", "evilDef"]) SymName.natName])]
+}
+
+def defsForeignScopedInstPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    (extEntries := [.scopedInstanceEntry (SymName.ofList ["Topic", "Defs", "evilSc"]) topicDefsModName SymName.natName])]
+}
+
+def defsForeignCoePkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    (extEntries := [.coeEntry (SymName.ofList ["Topic", "Defs", "evilCoe"]) SymName.natName SymName.boolName])]
+}
+
+def proofForeignDeclInstPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [.instanceEntry defsBeforeName cleanProofThmName topicProofModName false]))
+
+theorem passA2_defs_and_proof_ext_foreign_targets_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig defsForeignDefInstPkg =
+      .error (.forbiddenInstanceOrCoe topicDefsModName "default_instance"
+        (SymName.ofList ["Topic", "Defs", "evilDef"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsForeignScopedInstPkg =
+      .error (.forbiddenInstanceOrCoe topicDefsModName "scoped_instance"
+        (SymName.ofList ["Topic", "Defs", "evilSc"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsForeignCoePkg =
+      .error (.forbiddenInstanceOrCoe topicDefsModName "coe"
+        (SymName.ofList ["Topic", "Defs", "evilCoe"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig proofForeignDeclInstPkg =
+      .error (.forbiddenInstanceOrCoe topicProofModName "imported_instance" defsBeforeName) := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Import cycles, role-direction inversions, and `private import Init` (Report §5 item 10 closed). -/
+def selfImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := topicProofModName }]))
+
+def cycleModA : SymName := SymName.ofList ["Topic", "Proofs", "A"]
+def cycleModB : SymName := SymName.ofList ["Topic", "Proofs", "B"]
+
+def cycleImportPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule cycleModA .proof [] (imports := [{ module := cycleModB }]),
+    mkAlignedModule cycleModB .proof [] (imports := [{ module := cycleModA }])
+  ]
+}
+
+def theoryImportsProofPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [cleanProofThmDecl],
+    mkAlignedModule topicTheoryModName .theory [theoryClaimTypeDecl]
+      (imports := [{ module := topicProofModName }])
+  ]
+}
+
+def verifyImportsTestPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicTestsModName .test [],
+    mkAlignedModule topicVerifyModName .verify []
+      (imports := [{ module := topicTestsModName }])
+  ]
+}
+
+def privateImportInitPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := SymName.mkSimple "Init", isExported := false }]))
+
+theorem passA2_import_cycles_role_direction_and_private_init_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig selfImportPkg =
+      .error (.importCycle topicProofModName topicProofModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig cycleImportPkg =
+      .error (.importCycle cycleModA cycleModB) ∧
+    auditAndReplayPackage defaultUnconditionalConfig theoryImportsProofPkg =
+      .error (.forbiddenImportDirection topicTheoryModName "theory" topicProofModName "proof") ∧
+    auditAndReplayPackage defaultUnconditionalConfig verifyImportsTestPkg =
+      .error (.forbiddenImportDirection topicVerifyModName "verify" topicTestsModName "test") ∧
+    auditAndReplayPackage defaultUnconditionalConfig privateImportInitPkg =
+      .error (.forbiddenImportAll topicProofModName (SymName.mkSimple "Init")) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Mixed verify root depending on BOTH `Assumptions.Hw.mmioOk` and `._native.*` preserves BOTH in `status`! -/
+def mixedBothConfig : AuditConfig := {
+  allowAssumptions := true
+  allowProvisionalNative := true
+  enforceStrictProofs := true
+  kernelFuel := 16
+}
+
+def verifyBothMod : SymName := SymName.ofList ["Verify", "BothItem"]
+def verifyBothRoot : SymName := SymName.ofList ["Verify", "BothItem", "verified"]
+
+def mixedBothPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule assumpModName .assumptions [{
+      name := assumpAxName, kind := .axiomDecl, type := .const SymName.trueName,
+      originModule := assumpModName
+    }],
+    mkAlignedModule pillarProofMod .proof [provisionalNativeAxDecl, provisionalNativeThmDecl],
+    mkAlignedModule verifyBothMod .verify [{
+      name := verifyBothRoot, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.natLit 0),
+      value? := some (.app (.app (.const verificationResultMkName) (.natLit 0))
+        (.app (.lam validNativeAxiomTypeExpr (.const assumpAxName)) (.const pillarThmName))),
+      hasValue := true, all := [verifyBothRoot], originModule := verifyBothMod
+    }]
+  ]
+  verifyRoots := [verifyBothRoot]
+}
+
+theorem passA2_mixed_provisional_and_assumptions_preserved :
+    (auditAndReplayPackage mixedBothConfig mixedBothPkg).map
+      (fun cert => cert.itemReports.map fun r => (r.root, r.status)) =
+      .ok [(verifyBothRoot, .provisionalNativeConditional [provisionalNativeAxName] [assumpAxName])] :=
+  rfl
+
+/--
+Live `TrustedBoundary.verifyAudit` lines 609 & 644–670 `cleanNonWorkspace` cache poisoning witness:
+- `Anneal.TheoryHelper.usesProv` (non-workspace `.theory`!) references `Proof.Native.usesNative`
+  (which depends on `._native.native_decide.ax_1`).
+- `Verify.Item1.verified` and `Verify.Item2.verified` both use `Anneal.TheoryHelper.usesProv`.
+- `naiveCachedClosureMultiItemAudit` adds `Anneal.TheoryHelper.usesProv` to `cleanNonWorkspace`
+  while walking `Item1`, then skips it on `Item2` and FALSELY certifies `Item2` `"VerifiedUnconditional"`!
+- Meanwhile hardened `auditAndReplayPackage` accurately classifies BOTH `Item1` AND `Item2` as
+  `.provisionalNative [provisionalNativeAxName]` under `provisionalConfig` (and rejects unconditionally)!
+-/
+def theoryUsesProvName : SymName := SymName.ofList ["Anneal", "TheoryHelper", "usesProv"]
+def verifyCacheMod1 : SymName := SymName.ofList ["Verify", "Cache1"]
+def verifyCacheRoot1 : SymName := SymName.ofList ["Verify", "Cache1", "verified"]
+def verifyCacheMod2 : SymName := SymName.ofList ["Verify", "Cache2"]
+def verifyCacheRoot2 : SymName := SymName.ofList ["Verify", "Cache2", "verified"]
+
+def cachePoisonPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule pillarProofMod .proof [provisionalNativeAxDecl, provisionalNativeThmDecl],
+    mkAlignedModule topicTheoryModName .theory [{
+      name := theoryUsesProvName, kind := .thmDecl, type := validNativeAxiomTypeExpr,
+      value? := some (.const pillarThmName), hasValue := true,
+      all := [theoryUsesProvName], originModule := topicTheoryModName
+    }],
+    mkAlignedModule verifyCacheMod1 .verify [{
+      name := verifyCacheRoot1, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.natLit 1),
+      value? := some (.app (.app (.const verificationResultMkName) (.natLit 1))
+        (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
+          (.const theoryUsesProvName))),
+      hasValue := true, all := [verifyCacheRoot1], originModule := verifyCacheMod1
+    }],
+    mkAlignedModule verifyCacheMod2 .verify [{
+      name := verifyCacheRoot2, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.natLit 2),
+      value? := some (.app (.app (.const verificationResultMkName) (.natLit 2))
+        (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
+          (.const theoryUsesProvName))),
+      hasValue := true, all := [verifyCacheRoot2], originModule := verifyCacheMod2
+    }]
+  ]
+  verifyRoots := [verifyCacheRoot1, verifyCacheRoot2]
+}
+
+theorem cleanNonWorkspace_cache_poisoning_bypass :
+    naiveCachedClosureMultiItemAudit cachePoisonPkg =
+      [(verifyCacheRoot1, "ProvisionalNative"), (verifyCacheRoot2, "VerifiedUnconditional")] ∧
+    (auditAndReplayPackage provisionalConfig cachePoisonPkg).map
+      (fun cert => cert.itemReports.map fun r => (r.root, r.status)) =
+      .ok [
+        (verifyCacheRoot1, .provisionalNative [provisionalNativeAxName]),
+        (verifyCacheRoot2, .provisionalNative [provisionalNativeAxName])
+      ] ∧
+    auditAndReplayPackage defaultUnconditionalConfig cachePoisonPkg =
+      .error (.forbiddenNativeReductionAxiom provisionalNativeAxName provisionalNativeAxName) := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/-- Claim roots cannot reside in `.theory` or `.test` modules. -/
+def theoryClaimRootName : SymName := SymName.ofList ["Anneal", "TheoryHelper", "claimInTheory"]
+def theoryClaimRootPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicTheoryModName .theory [{
+    name := theoryClaimRootName, kind := .thmDecl, type := .const SymName.trueName,
+    value? := some (.const SymName.trueIntroName), hasValue := true,
+    all := [theoryClaimRootName], originModule := topicTheoryModName
+  }]]
+  claimRoots := [theoryClaimRootName]
+}
+
+theorem passA2_claim_root_in_theory_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig theoryClaimRootPkg =
+      .error (.invalidVerifyRoot theoryClaimRootName
+        "claim root cannot reside in theory or test module") :=
+  rfl
 
 end Anneal.ReplayKeyAndTamperAuditPrototype

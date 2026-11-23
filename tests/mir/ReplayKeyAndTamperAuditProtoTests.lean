@@ -23,6 +23,16 @@ Exercises:
    enforcement, dependency-ordered clean-env replay (`replayCleanEnvOrdered`) & cycle rejection,
    per-root `VerifyItemStatus` isolation in mixed packages, `closureFuel` liveness proofs, structural
    validation gaps, and Lean 4.34.1 `finalizeImport` `subsumesInfo` theorem body-swap model.
+6. Pass-`B2` regressions: name-only stdlib trust (`Std.*`/`Init.*`), claimed extension origins,
+   `localCommandElabEntry` flag bypass, numeric-prefix token glue, foreign imports, kernel-refuted
+   provisional native axioms, and `itemReports` root coverage.
+7. Pass-`A2` regressions: Lean 4.34.1 numeric-literal raw-string desyncs (`0x1r"\"`, `0b1r"\"`,
+   `0o7r"\"`, `1_0r"\"`, `1e+0r"\"`), positional `DecideConfig` bypasses without token `native`,
+   `Trusted.*` & `Lean.*` package-module trust, `Defs` foreign `default_instance`/`scoped_instance`/
+   `coe` targets & foreign `instanceEntry` decls, mathematical import acyclicity & role-direction
+   stratification (`auditAndReplayPackage_imports_sound`), `private import Init`, mixed
+   `provisionalNativeConditional` status preservation + completeness, `cleanNonWorkspace`
+   cross-item cache poisoning (`verifyAudit` L644–670), and `.theory`/`.test` claim-root bans.
 -/
 
 namespace Anneal.ReplayKeyAndTamperAuditProtoTests
@@ -880,5 +890,157 @@ def localTargetExtPkg : PackageAuditInput :=
 theorem extEntry_local_targets_accepted :
     (auditAndReplayPackage defaultUnconditionalConfig localTargetExtPkg).isOk = true :=
   rfl
+
+/-! ## Section 7: Pass-`A2` Regression Suite (Numeric-Raw Lexer, Positional `DecideConfig`, `Trusted.*`/`Lean.*`, `Defs` Foreign Targets, Import Acyclicity/Stratification, Mixed Status, `cleanNonWorkspace` Cache Poisoning) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_item_status_complete' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_item_status_complete
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_imports_sound' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_imports_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA2_numeric_raw_string_and_decide_config_hardened' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA2_numeric_raw_string_and_decide_config_hardened
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.trustedName_baseTrust_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms trustedName_baseTrust_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA2_defs_and_proof_ext_foreign_targets_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA2_defs_and_proof_ext_foreign_targets_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA2_import_cycles_role_direction_and_private_init_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA2_import_cycles_role_direction_and_private_init_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA2_mixed_provisional_and_assumptions_preserved' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA2_mixed_provisional_and_assumptions_preserved
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.cleanNonWorkspace_cache_poisoning_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms cleanNonWorkspace_cache_poisoning_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA2_claim_root_in_theory_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA2_claim_root_in_theory_rejected
+
+example := passA2_numeric_raw_string_and_decide_config_hardened
+example := trustedName_baseTrust_bypass
+example := passA2_defs_and_proof_ext_foreign_targets_rejected
+example := passA2_import_cycles_role_direction_and_private_init_rejected
+example := passA2_mixed_provisional_and_assumptions_preserved
+example := cleanNonWorkspace_cache_poisoning_bypass
+example := passA2_claim_root_in_theory_rejected
+
+/-- End-to-end instantiation of `auditAndReplayPackage_imports_sound` on `validBaselinePackage`:
+every module in the baseline package is non-stdlib, non-trusted, role-stratified, and strictly acyclic. -/
+theorem validBaselinePackage_imports_acyclic_and_stratified :
+    ∀ inv ∈ validBaselinePackage.modules,
+      ¬ SymName.isStdlibModule inv.moduleName ∧
+      ¬ SymName.isTrustedModule inv.moduleName ∧
+      ¬ ImportReaches validBaselinePackage inv.moduleName inv.moduleName := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok; cases hok
+  | ok cert =>
+    intro inv hinv
+    obtain ⟨h1, h2, _, h3⟩ := auditAndReplayPackage_imports_sound h inv hinv
+    exact ⟨h1, h2, h3⟩
+
+/-- 3-hop import cycle `A → B → C → A`, `.spec → .proof`, `.defsExempt → .theory`, and claim root in `.test`. -/
+def triModA : SymName := SymName.ofList ["Topic", "Proofs", "TriA"]
+def triModB : SymName := SymName.ofList ["Topic", "Proofs", "TriB"]
+def triModC : SymName := SymName.ofList ["Topic", "Proofs", "TriC"]
+
+def triCycleImportPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule triModA .proof [] (imports := [{ module := triModB }]),
+    mkAlignedModule triModB .proof [] (imports := [{ module := triModC }]),
+    mkAlignedModule triModC .proof [] (imports := [{ module := triModA }])
+  ]
+}
+
+def specImportsProofPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicProofModName .proof [cleanProofThmDecl],
+    mkAlignedModule topicSpecModName .spec [] (imports := [{ module := topicProofModName }])
+  ]
+}
+
+def defsImportsTheoryPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicTheoryModName .theory [theoryClaimTypeDecl],
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (imports := [{ module := topicTheoryModName }])
+  ]
+}
+
+def testClaimRootName : SymName := SymName.ofList ["Topic", "Tests", "claimInTest"]
+def testClaimRootPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule topicTestsModName .test [{
+    name := testClaimRootName, kind := .thmDecl, type := .const SymName.trueName,
+    value? := some (.const SymName.trueIntroName), hasValue := true,
+    all := [testClaimRootName], originModule := topicTestsModName
+  }]]
+  claimRoots := [testClaimRootName]
+}
+
+theorem passA2_extra_import_and_claim_regressions :
+    auditAndReplayPackage defaultUnconditionalConfig triCycleImportPkg =
+      .error (.importCycle triModA triModB) ∧
+    auditAndReplayPackage defaultUnconditionalConfig specImportsProofPkg =
+      .error (.forbiddenImportDirection topicSpecModName "spec" topicProofModName "proof") ∧
+    auditAndReplayPackage defaultUnconditionalConfig defsImportsTheoryPkg =
+      .error (.forbiddenImportDirection topicDefsModName "defsExempt" topicTheoryModName "theory") ∧
+    auditAndReplayPackage defaultUnconditionalConfig testClaimRootPkg =
+      .error (.invalidVerifyRoot testClaimRootName
+        "claim root cannot reside in theory or test module") :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Extra Pass-`A2` numeric-literal lexer edges: scientific notation `1e+0r"\"` & hex+char `0x1'"'`. -/
+theorem passA2_extra_lexer_edges :
+    scanProofSource "def x := 1e+0r\"\\\"\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "def x := 0x1'\"'\nset_option debug.skipKernelTC true\n-- \"" =
+      .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
+    scanProofSource "def x := 1e-2\ndef y := 0b101\ndef z := 0o755" = .ok () :=
+  ⟨rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditProtoTests
