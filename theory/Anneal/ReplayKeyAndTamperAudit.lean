@@ -151,6 +151,36 @@ def kwElab : List Char := ['e', 'l', 'a', 'b']
 def kwElabRules : List Char := ['e', 'l', 'a', 'b', '_', 'r', 'u', 'l', 'e', 's']
 def kwDeclareSyntaxCat : List Char := ['d', 'e', 'c', 'l', 'a', 'r', 'e', '_', 's', 'y', 'n', 't', 'a', 'x', '_', 'c', 'a', 't']
 def kwBinderPredicate : List Char := ['b', 'i', 'n', 'd', 'e', 'r', '_', 'p', 'r', 'e', 'd', 'i', 'c', 'a', 't', 'e']
+def kwInitialize : List Char := ['i', 'n', 'i', 't', 'i', 'a', 'l', 'i', 'z', 'e']
+def kwBuiltinInit : List Char := ['b', 'u', 'i', 'l', 't', 'i', 'n', '_', 'i', 'n', 'i', 't']
+def kwCommandElab : List Char := ['c', 'o', 'm', 'm', 'a', 'n', 'd', '_', 'e', 'l', 'a', 'b']
+def kwTermElab : List Char := ['t', 'e', 'r', 'm', '_', 'e', 'l', 'a', 'b']
+def kwTacticElab : List Char := ['t', 'a', 'c', 't', 'i', 'c', '_', 'e', 'l', 'a', 'b']
+def kwDelab : List Char := ['d', 'e', 'l', 'a', 'b']
+def kwAppUnexpander : List Char := ['a', 'p', 'p', '_', 'u', 'n', 'e', 'x', 'p', 'a', 'n', 'd', 'e', 'r']
+def kwSimproc : List Char := ['s', 'i', 'm', 'p', 'r', 'o', 'c']
+def kwDSimproc : List Char := ['d', 's', 'i', 'm', 'p', 'r', 'o', 'c']
+def kwCbvSimproc : List Char := ['c', 'b', 'v', '_', 's', 'i', 'm', 'p', 'r', 'o', 'c']
+def kwSimprocDecl : List Char := ['s', 'i', 'm', 'p', 'r', 'o', 'c', '_', 'd', 'e', 'c', 'l']
+def kwDSimprocDecl : List Char := ['d', 's', 'i', 'm', 'p', 'r', 'o', 'c', '_', 'd', 'e', 'c', 'l']
+def kwCbvSimprocDecl : List Char := ['c', 'b', 'v', '_', 's', 'i', 'm', 'p', 'r', 'o', 'c', '_', 'd', 'e', 'c', 'l']
+def kwUnifHint : List Char := ['u', 'n', 'i', 'f', '_', 'h', 'i', 'n', 't']
+def kwUnificationHint : List Char := ['u', 'n', 'i', 'f', 'i', 'c', 'a', 't', 'i', 'o', 'n', '_', 'h', 'i', 'n', 't']
+def kwExport : List Char := ['e', 'x', 'p', 'o', 'r', 't']
+def kwCsimp : List Char := ['c', 's', 'i', 'm', 'p']
+def kwCpass : List Char := ['c', 'p', 'a', 's', 's']
+def kwDeclareSimpLikeTactic : List Char := ['d', 'e', 'c', 'l', 'a', 'r', 'e', '_', 's', 'i', 'm', 'p', '_', 'l', 'i', 'k', 'e', '_', 't', 'a', 'c', 't', 'i', 'c']
+def kwDoElemElab : List Char := ['d', 'o', 'E', 'l', 'e', 'm', '_', 'e', 'l', 'a', 'b']
+def kwInductiveElab : List Char := ['i', 'n', 'd', 'u', 'c', 't', 'i', 'v', 'e', '_', 'e', 'l', 'a', 'b']
+def kwBuiltinTactic : List Char := ['b', 'u', 'i', 'l', 't', 'i', 'n', '_', 't', 'a', 'c', 't', 'i', 'c']
+def kwGrindTactic : List Char := ['g', 'r', 'i', 'n', 'd', '_', 't', 'a', 'c', 't', 'i', 'c']
+def kwTryTactic : List Char := ['t', 'r', 'y', '_', 't', 'a', 'c', 't', 'i', 'c']
+def kwSymSimproc : List Char := ['s', 'y', 'm', '_', 's', 'i', 'm', 'p', 'r', 'o', 'c']
+def kwSymDSimproc : List Char := ['s', 'y', 'm', '_', 'd', 's', 'i', 'm', 'p', 'r', 'o', 'c']
+def kwSymDischarger : List Char := ['s', 'y', 'm', '_', 'd', 'i', 's', 'c', 'h', 'a', 'r', 'g', 'e', 'r']
+def kwRunParserAttrHooks : List Char := ['r', 'u', 'n', '_', 'p', 'a', 'r', 's', 'e', 'r', '_', 'a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e', '_', 'h', 'o', 'o', 'k', 's']
+def kwRunBuiltinParserAttrHooks : List Char := ['r', 'u', 'n', '_', 'b', 'u', 'i', 'l', 't', 'i', 'n', '_', 'p', 'a', 'r', 's', 'e', 'r', '_', 'a', 't', 't', 'r', 'i', 'b', 'u', 't', 'e', '_', 'h', 'o', 'o', 'k', 's']
+def builtinPrefix : List Char := ['b', 'u', 'i', 'l', 't', 'i', 'n', '_']
 def parserSuffix : List Char := ['_', 'p', 'a', 'r', 's', 'e', 'r']
 def plusOneBracketTick : List Char := ['+', '1', ']', '\'']
 
@@ -170,6 +200,18 @@ def anonymous : SymName := ⟨[]⟩
 
 def isAnonymous (n : SymName) : Bool := n.parts.isEmpty
 
+/-- A name is well formed when it is non-anonymous, every component is non-empty, and no
+component contains a `.` (preventing dotted-string collisions and component-smuggling
+bypasses of root, suffix, private, or native checks). -/
+def isWellFormed (n : SymName) : Bool :=
+  !n.parts.isEmpty && n.parts.all (fun p => !p.isEmpty && decide ('.' ∉ p))
+
+theorem ne_anonymous_of_isWellFormed {n : SymName} (h : n.isWellFormed = true) :
+    n ≠ anonymous := by
+  intro heq
+  subst heq
+  simp [isWellFormed, anonymous] at h
+
 /-- Convenience constructors from `String`s, for drivers. The audit itself never uses them. -/
 def mkSimple (s : String) : SymName := ⟨[s.toList]⟩
 
@@ -184,6 +226,88 @@ def str (n : SymName) (s : String) : SymName := ⟨n.parts ++ [s.toList]⟩
 def child (n : SymName) (part : List Char) : SymName := ⟨n.parts ++ [part]⟩
 
 def toChars (n : SymName) : List Char := List.intercalate ['.'] n.parts
+
+theorem append_dot_inj {p q r s : List Char} (hp : '.' ∉ p) (hq : '.' ∉ q)
+    (h : p ++ '.' :: r = q ++ '.' :: s) : p = q ∧ r = s := by
+  induction p generalizing q with
+  | nil =>
+    cases q with
+    | nil => simp only [List.nil_append, List.cons.injEq] at h; exact ⟨rfl, h.2⟩
+    | cons b bs =>
+      simp only [List.nil_append, List.cons_append, List.cons.injEq] at h
+      exact absurd (h.1 ▸ List.mem_cons_self) hq
+  | cons a as ih =>
+    cases q with
+    | nil =>
+      simp only [List.nil_append, List.cons_append, List.cons.injEq] at h
+      exact absurd (h.1.symm ▸ List.mem_cons_self) hp
+    | cons b bs =>
+      simp only [List.cons_append, List.cons.injEq] at h
+      have hpa : '.' ∉ as := fun hm => hp (List.mem_cons_of_mem _ hm)
+      have hqb : '.' ∉ bs := fun hm => hq (List.mem_cons_of_mem _ hm)
+      obtain ⟨heq, hrs⟩ := ih hpa hqb h.2
+      exact ⟨by rw [h.1, heq], hrs⟩
+
+theorem intercalate_dot_inj : ∀ {ps qs : List (List Char)},
+    (∀ p ∈ ps, p ≠ [] ∧ '.' ∉ p) → (∀ q ∈ qs, q ≠ [] ∧ '.' ∉ q) →
+    List.intercalate ['.'] ps = List.intercalate ['.'] qs → ps = qs
+  | [], [], _, _, _ => rfl
+  | [], q :: qs, _, hq, heq => by
+    have hqne := (hq q List.mem_cons_self).1
+    cases qs with
+    | nil => simp [List.intercalate] at heq; exact absurd heq hqne
+    | cons q' qs' =>
+      simp [List.intercalate] at heq
+  | p :: ps, [], hp, _, heq => by
+    have hpne := (hp p List.mem_cons_self).1
+    cases ps with
+    | nil => simp [List.intercalate] at heq; exact absurd heq hpne
+    | cons p' ps' =>
+      simp [List.intercalate] at heq
+  | [p], [q], _, _, heq => by
+    simp [List.intercalate] at heq
+    rw [heq]
+  | [p], q :: q' :: qs, hp, _, heq => by
+    have h1 : List.intercalate ['.'] [p] = p := List.append_nil p
+    have h2 : List.intercalate ['.'] (q :: q' :: qs) =
+        q ++ '.' :: List.intercalate ['.'] (q' :: qs) := rfl
+    rw [h1, h2] at heq
+    have hdot : '.' ∈ p := by
+      rw [heq]
+      exact List.mem_append_right _ List.mem_cons_self
+    exact absurd hdot (hp p List.mem_cons_self).2
+  | p :: p' :: ps, [q], _, hq, heq => by
+    have h1 : List.intercalate ['.'] (p :: p' :: ps) =
+        p ++ '.' :: List.intercalate ['.'] (p' :: ps) := rfl
+    have h2 : List.intercalate ['.'] [q] = q := List.append_nil q
+    rw [h1, h2] at heq
+    have hdot : '.' ∈ q := by
+      rw [← heq]
+      exact List.mem_append_right _ List.mem_cons_self
+    exact absurd hdot (hq q List.mem_cons_self).2
+  | p :: p' :: ps, q :: q' :: qs, hp, hq, heq => by
+    have h1 : List.intercalate ['.'] (p :: p' :: ps) =
+        p ++ '.' :: List.intercalate ['.'] (p' :: ps) := rfl
+    have h2 : List.intercalate ['.'] (q :: q' :: qs) =
+        q ++ '.' :: List.intercalate ['.'] (q' :: qs) := rfl
+    rw [h1, h2] at heq
+    obtain ⟨hpq, hrest⟩ := append_dot_inj (hp p List.mem_cons_self).2
+      (hq q List.mem_cons_self).2 heq
+    have htail := intercalate_dot_inj
+      (fun x hx => hp x (List.mem_cons_of_mem _ hx))
+      (fun x hx => hq x (List.mem_cons_of_mem _ hx)) hrest
+    rw [hpq, htail]
+
+/-- Dotted character rendering is injective on well-formed names: distinct well-formed names
+always produce distinct dotted strings. -/
+theorem toChars_inj {n1 n2 : SymName} (h1 : n1.isWellFormed = true)
+    (h2 : n2.isWellFormed = true) (heq : n1.toChars = n2.toChars) : n1 = n2 := by
+  cases n1 with | mk ps =>
+  cases n2 with | mk qs =>
+  simp only [isWellFormed, Bool.and_eq_true, List.all_eq_true, Bool.not_eq_true',
+    List.isEmpty_eq_false_iff, decide_eq_true_eq] at h1 h2
+  congr 1
+  exact intercalate_dot_inj (fun p hp => h1.2 p hp) (fun q hq => h2.2 q hq) heq
 
 def hasRoot (n : SymName) (part : List Char) : Bool := decide (n.parts.head? = some part)
 
@@ -854,7 +978,7 @@ test segment justify none. Elsewhere a `Proof`/`Proofs` segment means proof, a
 `Test`/`Tests` segment means test, a final `Defs` means definitions, and anything
 else is a specification module. -/
 def classifyModuleName (m : SymName) : Option ModuleRole :=
-  if m.isAnonymous then none
+  if !m.isWellFormed then none
   else if m.isLeanCompilerModule then none
   else if m.isStdlibModule then some .foundation
   else if m.isTrustedModule then some .trusted
@@ -1053,27 +1177,31 @@ structure AuditCertificate where
 
 /-- The `lean4#16677` checks. Lean inserts `constants[i]` under `constNames[i]` and
 replays by record name; the two agree only if the arrays have equal length, the keys
-are distinct and non-anonymous, and every key equals its record's name. -/
+are distinct and well-formed (non-anonymous, non-empty dot-free components), and every
+key equals its record's name. -/
 def validateModuleDataKeys (inv : ModuleInventory) : Except ReplayKeyViolation Unit := do
   ensure (inv.constNames.length = inv.constants.length)
     (.lengthMismatch inv.moduleName inv.constNames.length inv.constants.length)
-  ensure (SymName.anonymous ∉ inv.constNames) (.anonymousConstantName inv.moduleName)
+  ensure (inv.constNames.all SymName.isWellFormed = true) (.anonymousConstantName inv.moduleName)
   ensureNodup inv.constNames (.duplicateConstName inv.moduleName)
   checkAll inv.replayMap
     (fun p => ensure (p.1 = p.2.name) (.keyNameMismatch inv.moduleName p.1 p.2.name))
 
 theorem validateModuleDataKeys_ok_iff {inv : ModuleInventory} :
     validateModuleDataKeys inv = .ok () ↔
-      inv.constNames.length = inv.constants.length ∧ SymName.anonymous ∉ inv.constNames ∧
+      inv.constNames.length = inv.constants.length ∧
+      (∀ n ∈ inv.constNames, n.isWellFormed = true) ∧
       inv.constNames.Nodup ∧ ∀ p ∈ inv.replayMap, p.1 = p.2.name := by
   simp only [validateModuleDataKeys, bindUnit_ok_iff, ensure_ok_iff, ensureNodup_ok_iff,
-    checkAll_ok_iff]
+    checkAll_ok_iff, List.all_eq_true]
 
 def validateAllHygiene (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit := do
   ensure (ci.all ≠ []) (.invalidMutualAll inv.moduleName ci.name "empty .all")
   ensureNodup ci.all (fun _ => .invalidMutualAll inv.moduleName ci.name "duplicate entry in .all")
   ensure (SymName.anonymous ∉ ci.all)
     (.invalidMutualAll inv.moduleName ci.name "anonymous entry in .all")
+  ensure (ci.all.all SymName.isWellFormed = true)
+    (.invalidMutualAll inv.moduleName ci.name "malformed entry in .all")
 
 def validateMutualPeer (inv : ModuleInventory) (ci : ConstantRecord) (peer : SymName) :
     Except AuditFailure Unit :=
@@ -1093,15 +1221,18 @@ def validateMutualBlock (inv : ModuleInventory) (ci : ConstantRecord) : Except A
   ensure (ci.name ∈ ci.all) (.invalidMutualAll inv.moduleName ci.name "ci.name missing from .all")
   checkAll ci.all (validateMutualPeer inv ci)
 
-/-- Every name in a recursor's `.all` is an inductive type of this module. -/
+/-- Every name in a recursor's `.all` is an inductive type of this module whose own `.all`
+matches the recursor's mutual block. -/
 def validateRecAllTarget (inv : ModuleInventory) (ci : ConstantRecord) (target : SymName) :
     Except AuditFailure Unit :=
   match findConstByName inv.constants target with
   | none =>
     .error (.invalidMutualAll inv.moduleName ci.name "missing inductive target of recursor .all")
-  | some ic =>
+  | some ic => do
     ensure (ic.kind.tag = .inductTag)
       (.invalidMutualAll inv.moduleName ci.name "recursor .all target is not an inductive")
+    ensure (ic.all = ci.all)
+      (.invalidMutualAll inv.moduleName ci.name "recursor .all differs from inductive .all")
 
 def validateNonBlockAll (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit :=
   match ci.kind with
@@ -1154,9 +1285,11 @@ def validateConstantRecord (inv : ModuleInventory) (ci : ConstantRecord) :
   validateMutualAll inv ci
 
 /-- `extraConstNames` extends the module's claim on names without storing records. The
-names must be non-anonymous and distinct from each other and from the declared names. -/
+names must be well-formed (non-anonymous, non-empty dot-free components) and distinct
+from each other and from the declared names. -/
 def validateExtraConstNames (inv : ModuleInventory) : Except AuditFailure Unit := do
-  ensure (SymName.anonymous ∉ inv.extraConstNames) (.anonymousConstantName inv.moduleName)
+  ensure (inv.extraConstNames.all SymName.isWellFormed = true)
+    (.anonymousConstantName inv.moduleName)
   ensureNodup (inv.constNames ++ inv.extraConstNames) (.duplicateConstName inv.moduleName)
 
 /-- Complete per-module inventory validation. -/
@@ -1257,18 +1390,19 @@ theorem validInventory_mutual_all_wf {inv : ModuleInventory}
   have hall := hrec.2.2.1
   simp only [validateAllField, hkind, ↓reduceIte, validateMutualBlock, validateAllHygiene,
     bindUnit_ok_iff, ensure_ok_iff, ensureNodup_ok_iff, checkAll_ok_iff] at hall
-  obtain ⟨⟨hne, hnd, hanon⟩, hself, hpeers⟩ := hall
+  obtain ⟨⟨hne, hnd, hanon, _⟩, hself, hpeers⟩ := hall
   refine ⟨hne, hnd, hanon, hself, fun peer hp => validateMutualPeer_ok (hpeers peer hp), ?_⟩
   intro edges hedges peer hp
   rw [(ConstantRecord.declarationEdges_ok hedges).1]
   exact ci.all_subset_edgeList peer hp
 
-/-- Every name in a recursor's `.all` resolves to an inductive type of the same module. -/
+/-- Every name in a recursor's `.all` resolves to an inductive type of the same module
+whose mutual `.all` block matches the recursor's `.all`. -/
 theorem validInventory_rec_all_targets_induct {inv : ModuleInventory}
     (h : validateReplayInventory inv = .ok ()) :
     ∀ ci ∈ inv.constants, ∀ rules, ci.kind = .recDecl rules →
       ∀ target ∈ ci.all, ∃ ic, findConstByName inv.constants target = some ic ∧
-        ic.kind.tag = .inductTag := by
+        ic.kind.tag = .inductTag ∧ ic.all = ci.all := by
   intro ci hci rules hkind target ht
   have hrec := (validateReplayInventory_ok h).2.2 ci hci
   simp only [validateConstantRecord, validateMutualAll, bindUnit_ok_iff] at hrec
@@ -1280,7 +1414,8 @@ theorem validInventory_rec_all_targets_induct {inv : ModuleInventory}
   split at htarget
   · cases htarget
   · rename_i ic hic
-    exact ⟨ic, hic, ensure_ok_iff.mp htarget⟩
+    simp only [bindUnit_ok_iff, ensure_ok_iff] at htarget
+    exact ⟨ic, hic, htarget.1, htarget.2⟩
 
 /-! ## Worklist closure -/
 
@@ -3741,12 +3876,38 @@ leave no extension entry: the lexer rules above hold only for the core token tab
 def syntaxExtensionTokens : List (List Char) :=
   [Chars.kwNotation, Chars.kwInfix, Chars.kwInfixl, Chars.kwInfixr, Chars.kwPrefix,
    Chars.kwPostfix, Chars.kwSyntax, Chars.kwMacro, Chars.kwMacroRules, Chars.kwElab,
-   Chars.kwElabRules, Chars.kwDeclareSyntaxCat, Chars.kwBinderPredicate]
+   Chars.kwElabRules, Chars.kwDeclareSyntaxCat, Chars.kwBinderPredicate,
+   Chars.kwDeclareSimpLikeTactic]
+
+/-- Extension-hook commands and attributes (initializers, elaborators, delaborators,
+unexpanders, simprocs, unification hints, compiler passes/rewrites, and `export` aliases),
+banned in every mode as defense in depth behind the `.olean` extension audit. -/
+def extHookTokens : List (List Char) :=
+  [Chars.kwInitialize, Chars.kwBuiltinInit, Chars.kwCommandElab, Chars.kwTermElab,
+   Chars.kwTacticElab, Chars.kwDoElemElab, Chars.kwInductiveElab, Chars.kwDelab,
+   Chars.kwAppUnexpander, Chars.kwSimproc, Chars.kwDSimproc, Chars.kwCbvSimproc,
+   Chars.kwSimprocDecl, Chars.kwDSimprocDecl, Chars.kwCbvSimprocDecl, Chars.kwUnifHint,
+   Chars.kwUnificationHint, Chars.kwExport, Chars.kwCsimp, Chars.kwCpass,
+   Chars.kwBuiltinTactic, Chars.kwGrindTactic, Chars.kwTryTactic, Chars.kwSymSimproc,
+   Chars.kwSymDSimproc, Chars.kwSymDischarger, Chars.kwRunParserAttrHooks,
+   Chars.kwRunBuiltinParserAttrHooks]
 
 def alwaysForbiddenTokens : List (List Char) :=
   [Chars.ofReduceBool, Chars.ofReduceNat, Chars.trustCompiler, Chars.reduceBool,
    Chars.reduceNat, Chars.kwNativeEqTrue, Chars.kwImplementedBy, Chars.kwExtern,
-   Chars.kwUnsafe, Chars.kwPartial] ++ metaExecTokens ++ syntaxExtensionTokens
+   Chars.kwUnsafe, Chars.kwPartial] ++ metaExecTokens ++ syntaxExtensionTokens ++ extHookTokens
+
+def stripLeadingDigits : List Char → List Char
+  | c :: rest => if c.isDigit then stripLeadingDigits rest else c :: rest
+  | [] => []
+
+/-- A token naming a `builtin_<kw>` variant of any always-forbidden keyword or attribute. -/
+def builtinForbidden? (toks : List (List Char)) : Option (List Char) :=
+  toks.find? (fun t =>
+    (dotSegments t).any (fun seg =>
+      let s := stripLeadingDigits (stripTacticSuffix seg)
+      Chars.builtinPrefix.isPrefixOf s &&
+        alwaysForbiddenTokens.any (fun kw => decide (s.drop Chars.builtinPrefix.length = kw))))
 
 /-- A token naming a parser attribute (`term_parser`, `builtin_command_parser`, …). -/
 def parserAttribute? (toks : List (List Char)) : Option (List Char) :=
@@ -3781,7 +3942,8 @@ def checkTokens (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     match firstKeyword? forbiddenOptionTokens toks with
     | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
     | none =>
-      match (firstKeyword? alwaysForbiddenTokens toks).or (parserAttribute? toks) with
+      match ((firstKeyword? alwaysForbiddenTokens toks).or (builtinForbidden? toks)).or
+          (parserAttribute? toks) with
       | some kw => .error (.forbiddenSourceOption modName (String.ofList kw))
       | none =>
         if cfg.allowProvisionalNative = true ∧ role = .proof then .ok ()
@@ -3915,12 +4077,17 @@ def allDeclaredNames (pkg : PackageAuditInput) : List SymName :=
 def allExtraConstNames (pkg : PackageAuditInput) : List SymName :=
   pkg.modules.flatMap (·.extraConstNames)
 
-/-- Module names are unique, every module is structurally valid, constant names are unique
-across the base environment and all modules, and `extraConstNames` are distinct across
-all modules and never claim a declared name. -/
+/-- Module names are unique (and disjoint from base-environment module origins), every
+base and package declaration name is well-formed, every module is structurally valid,
+constant names are unique across the base environment and all modules, and
+`extraConstNames` are distinct across all modules and never claim a declared name. -/
 def validatePackageStructure (pkg : PackageAuditInput) : Except AuditFailure Unit := do
   ensureNodup (pkg.modules.map (·.moduleName)) .duplicateModuleName
+  ensure (pkg.baseEnv.all (fun ci => ci.name.isWellFormed) = true)
+    (.anonymousConstantName .anonymous)
   checkAll pkg.modules validateModuleStructure
+  checkAll pkg.modules (fun inv =>
+    ensure (inv.moduleName ∉ baseModuleNames pkg) (.duplicateModuleName inv.moduleName))
   ensureNodup (allDeclaredNames pkg)
     (fun d => .duplicateConstName ((moduleOfConst? pkg d).map (·.moduleName) |>.getD .anonymous) d)
   checkAll pkg.modules (fun inv => checkAll inv.extraConstNames (fun n =>
@@ -3934,16 +4101,19 @@ def validatePackageStructure (pkg : PackageAuditInput) : Except AuditFailure Uni
 theorem validatePackageStructure_ok {pkg : PackageAuditInput}
     (h : validatePackageStructure pkg = .ok ()) :
     (pkg.modules.map (·.moduleName)).Nodup ∧
+    (∀ ci ∈ pkg.baseEnv, ci.name.isWellFormed = true) ∧
     (∀ inv ∈ pkg.modules, validateModuleRole inv = .ok () ∧ validateOleanParts inv = .ok () ∧
-      validateReplayInventory inv = .ok ()) ∧
+      validateReplayInventory inv = .ok () ∧ inv.moduleName ∉ baseModuleNames pkg) ∧
     (allDeclaredNames pkg).Nodup ∧
     (allExtraConstNames pkg).Nodup ∧
     (∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg) := by
   simp only [validatePackageStructure, bindUnit_ok_iff, ensureNodup_ok_iff, checkAll_ok_iff,
-    ensure_ok_iff] at h
-  refine ⟨h.1, fun inv hinv => ?_, h.2.2.1, h.2.2.2.2, h.2.2.2.1⟩
-  have h1 := h.2.1 inv hinv
-  simpa only [validateModuleStructure, bindUnit_ok_iff] using h1
+    ensure_ok_iff, List.all_eq_true] at h
+  refine ⟨h.1, h.2.1, fun inv hinv => ?_, h.2.2.2.2.1, h.2.2.2.2.2.2, h.2.2.2.2.2.1⟩
+  have h1 := h.2.2.1 inv hinv
+  have h2 := h.2.2.2.1 inv hinv
+  simp only [validateModuleStructure, bindUnit_ok_iff] at h1
+  exact ⟨h1.1, h1.2.1, h1.2.2, h2⟩
 
 /-! ## Codegen `_unsafe_rec` companions -/
 
@@ -4012,8 +4182,16 @@ def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except 
   | .instanceEntry d cls _ => do
     ensure (isLocalExtDecl inv d = true)
       (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
-    ensure (inv.role = .defsExempt ∨ isLocalExtDecl inv cls = true)
-      (.forbiddenInstanceOrCoe inv.moduleName "instance_of_imported_class" d)
+    if isLocalExtDecl inv cls then .ok ()
+    else do
+      ensure (inv.role = .defsExempt)
+        (.forbiddenInstanceOrCoe inv.moduleName "instance_of_imported_class" d)
+      match findConstByName inv.constants d with
+      | some ci =>
+        ensure (ci.type.usedConstants.any (isLocalExtDecl inv) = true)
+          (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
+      | none =>
+        .error (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
   | .scopedInstanceEntry d cls _ => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
     ensure (isLocalExtDecl inv d = true ∧ isLocalExtDecl inv cls = true)
@@ -4041,16 +4219,23 @@ theorem validateSingleExtEntry_localDecl {inv : ModuleInventory} {ext : EnvExtEn
     ∀ d, ext.localDecl? = some d →
       d ∈ inv.constNames ∧ d ∈ (replayableConstants inv).map (·.name) := by
   intro d hd
-  cases ext <;>
+  cases ext with
+  | instanceEntry d' cls isPriv =>
+    simp only [EnvExtEntry.localDecl?, Option.some.injEq] at hd
+    subst hd
+    simp only [validateSingleExtEntry, bindUnit_ok_iff, ensure_ok_iff] at h
+    simpa [isLocalExtDecl] using h.1
+  | _ =>
     simp_all [validateSingleExtEntry, EnvExtEntry.localDecl?, bindUnit_ok_iff, ensure_ok_iff,
       isLocalExtDecl]
 
 /-- Names a public declaration may not shadow by namespace suffix: everything in the base
-environment and everything declared by another definitions module. -/
+environment and everything declared by another statement-side module (`Defs`, `Spec`, or
+`Assumptions`). -/
 def protectedNames (pkg : PackageAuditInput) (inv : ModuleInventory) : List SymName :=
   pkg.baseEnv.map (·.name) ++
     (pkg.modules.filter (fun m =>
-      decide (m.role = .defsExempt ∧ m.moduleName ≠ inv.moduleName))).flatMap (·.constNames)
+      isStatementSideRole m.role && decide (m.moduleName ≠ inv.moduleName))).flatMap (·.constNames)
 
 /-- `Pkg.Nat.add` shadows `Nat.add` for any reader with `Pkg` open. Private names cannot
 be opened; a suffix with an internal component cannot be written by a user. -/
@@ -4254,30 +4439,47 @@ def isValidNativeAxiomType (t : ExprSkeleton) : Bool :=
   | _ => false
 
 /-- Evaluation as compiled code would do it: unfold definitions *and* opaque constants
-and β-reduce every redex. Used only to refute native axioms, never for conversion, so
-the kernel's soundness does not depend on it. -/
-def whnfAllowOpaque (env : KernelEnv) : Nat → ExprSkeleton → ExprSkeleton
-  | 0, e => e
+and β-reduce every redex. Returns `none` when fuel runs out so that native-axiom
+refutation fails closed instead of silently passing a deep or cyclic chain. -/
+def whnfAllowOpaqueOpt (env : KernelEnv) : Nat → ExprSkeleton → Option ExprSkeleton
+  | 0, _ => none
   | fuel + 1, .const c =>
     match env.lookup c with
     | some ci =>
       if ci.kind = .defnDecl ∨ ci.kind = .opaqueDecl then
         match ci.value? with
-        | some v => whnfAllowOpaque env fuel v
-        | none => .const c
-      else .const c
-    | none => .const c
+        | some v => whnfAllowOpaqueOpt env fuel v
+        | none => some (.const c)
+      else some (.const c)
+    | none => some (.const c)
   | fuel + 1, .app f a =>
-    match whnfAllowOpaque env fuel f with
-    | .lam _ b => whnfAllowOpaque env fuel (b.instantiate a)
-    | f' => .app f' a
-  | _, e => e
+    match whnfAllowOpaqueOpt env fuel f with
+    | none => none
+    | some (.lam _ b) => whnfAllowOpaqueOpt env fuel (b.instantiate a)
+    | some f' => some (.app f' a)
+  | _ + 1, e => some e
 
-/-- A native axiom whose left-hand side evaluates to `Bool.false` asserts a falsehood. -/
+/-- Total AST size of definition and opaque bodies in an environment, used to scale
+runtime-faithful reduction fuel across chained helper definitions. -/
+def envBodySize (env : KernelEnv) : Nat :=
+  (env.map (fun p =>
+    if p.2.kind = .defnDecl ∨ p.2.kind = .opaqueDecl then
+      (p.2.value?.map ExprSkeleton.size).getD 0
+    else 0)).sum
+
+/-- Total evaluation wrapper returning the weak head normal form, or `e` on fuel exhaustion. -/
+def whnfAllowOpaque (env : KernelEnv) (fuel : Nat) (e : ExprSkeleton) : ExprSkeleton :=
+  (whnfAllowOpaqueOpt env fuel e).getD e
+
+/-- A native axiom whose left-hand side evaluates to `Bool.false` — or fails to reach
+weak head normal form within the scaled budget — is rejected (fail-closed). -/
 def nativeAxiomRefutedByKernel (env : KernelEnv) (t : ExprSkeleton) : Bool :=
   match t with
   | .app (.app _ e) _ =>
-    decide (whnfAllowOpaque env (64 + 4 * e.size + 2 * env.length) e = .const SymName.boolFalseName)
+    match whnfAllowOpaqueOpt env (64 + 4 * e.size + 2 * env.length + 2 * envBodySize env) e with
+    | none => true
+    | some (.const b) => decide (b = SymName.boolFalseName)
+    | some _ => false
   | _ => false
 
 /-- `--provisional` admits a native axiom only if it has the strictly interior `._native.`
@@ -4707,9 +4909,10 @@ def CleanTestDep (pkg : PackageAuditInput) (env : KernelEnv) (testMod dep : SymN
       (dep.isFoundationalAxiom = true ∧ roleOfConst pkg dep ci = .foundation) ∨
       declaringModuleName pkg dep ci = testMod)
 
-/-- Stricter than `TrustedBoundary.downstreamAudit`: native axioms are refused in tests too. -/
-def checkTestDep (pkg : PackageAuditInput) (env : KernelEnv) (testMod user dep : SymName) :
-    Except AuditFailure Unit :=
+/-- Stricter than `TrustedBoundary.downstreamAudit`: native axioms are refused in tests too,
+and local test axioms are admitted only when `cfg.allowLocalTestAxioms = true`. -/
+def checkTestDep (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
+    (testMod user dep : SymName) : Except AuditFailure Unit :=
   match env.lookup dep with
   | none => .error (.unknownConstant dep)
   | some dci => do
@@ -4720,23 +4923,23 @@ def checkTestDep (pkg : PackageAuditInput) (env : KernelEnv) (testMod user dep :
       (.forbiddenNativeReductionAxiom user dep)
     ensure (dci.kind ≠ .axiomDecl ∨
         (dep.isFoundationalAxiom = true ∧ roleOfConst pkg dep dci = .foundation) ∨
-        declaringModuleName pkg dep dci = testMod)
+        (cfg.allowLocalTestAxioms = true ∧ declaringModuleName pkg dep dci = testMod))
       (.testModuleForeignAxiom testMod user dep)
 
-def auditTestDecl (pkg : PackageAuditInput) (env : KernelEnv) (inv : ModuleInventory)
-    (ci : ConstantRecord) : Except AuditFailure Unit :=
+def auditTestDecl (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
+    (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit :=
   match walkGraph env ci.name closureExpand (closureFuel env) [ci.name] [] with
   | .error e => .error e
-  | .ok visited => checkAll visited (checkTestDep pkg env inv.moduleName ci.name)
+  | .ok visited => checkAll visited (checkTestDep cfg pkg env inv.moduleName ci.name)
 
-def auditTestModule (pkg : PackageAuditInput) (env : KernelEnv) (inv : ModuleInventory) :
-    Except AuditFailure Unit :=
-  if inv.role = .test then checkAll (replayableConstants inv) (auditTestDecl pkg env inv)
+def auditTestModule (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
+    (inv : ModuleInventory) : Except AuditFailure Unit :=
+  if inv.role = .test then checkAll (replayableConstants inv) (auditTestDecl cfg pkg env inv)
   else .ok ()
 
-def auditTestModuleClosures (pkg : PackageAuditInput) (env : KernelEnv) :
+def auditTestModuleClosures (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv) :
     Except AuditFailure Unit :=
-  checkAll pkg.modules (auditTestModule pkg env)
+  checkAll pkg.modules (auditTestModule cfg pkg env)
 
 /-! ## The policy stage and the pipeline -/
 
@@ -4767,7 +4970,7 @@ def validateAxiomAndTamperPolicy (cfg : AuditConfig) (pkg : PackageAuditInput) :
   checkAll pkg.modules (auditModulePolicy cfg pkg (packageEnv pkg))
   auditVerifyModuleCoverage pkg
   let reached ← auditPackageClosures cfg pkg (packageEnv pkg)
-  auditTestModuleClosures pkg (packageEnv pkg)
+  auditTestModuleClosures cfg pkg (packageEnv pkg)
   checkAll pkg.verifyRoots (auditVerifyRoot pkg (packageEnv pkg))
   checkAll pkg.claimRoots (auditClaimRoot pkg (packageEnv pkg))
   let reports ← collectEach pkg.verifyRoots (buildVerifyItemReport cfg pkg (packageEnv pkg))
@@ -4808,7 +5011,7 @@ structure PolicyFacts (cfg : AuditConfig) (pkg : PackageAuditInput)
   coverage : auditVerifyModuleCoverage pkg = .ok ()
   closures : ∀ root ∈ closureRootsOfPackage pkg ++ pkg.verifyRoots ++ pkg.claimRoots,
     ∃ visited, auditDirectClosure cfg pkg (packageEnv pkg) root = .ok visited
-  tests : ∀ inv ∈ pkg.modules, auditTestModule pkg (packageEnv pkg) inv = .ok ()
+  tests : ∀ inv ∈ pkg.modules, auditTestModule cfg pkg (packageEnv pkg) inv = .ok ()
   verifyRoots : ∀ r ∈ pkg.verifyRoots, auditVerifyRoot pkg (packageEnv pkg) r = .ok ()
   claimRoots : ∀ r ∈ pkg.claimRoots, auditClaimRoot pkg (packageEnv pkg) r = .ok ()
   reports : collectEach pkg.verifyRoots (buildVerifyItemReport cfg pkg (packageEnv pkg)) =
@@ -4842,8 +5045,9 @@ theorem auditModulePolicy_ok {cfg : AuditConfig} {pkg : PackageAuditInput} {env 
 theorem auditAndReplayPackage_facts {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ((pkg.modules.map (·.moduleName)).Nodup ∧
+      (∀ ci ∈ pkg.baseEnv, ci.name.isWellFormed = true) ∧
       (∀ inv ∈ pkg.modules, validateModuleRole inv = .ok () ∧ validateOleanParts inv = .ok () ∧
-        validateReplayInventory inv = .ok ()) ∧
+        validateReplayInventory inv = .ok () ∧ inv.moduleName ∉ baseModuleNames pkg) ∧
       (allDeclaredNames pkg).Nodup ∧
       (allExtraConstNames pkg).Nodup ∧
       (∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg)) ∧
@@ -4867,14 +5071,46 @@ theorem auditAndReplayPackage_global_names_nodup {cfg : AuditConfig} {pkg : Pack
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     (pkg.baseEnv.map ConstantRecord.name ++
       pkg.modules.flatMap ModuleInventory.constNames).Nodup :=
-  (auditAndReplayPackage_facts h).1.2.2.1
+  (auditAndReplayPackage_facts h).1.2.2.2.1
+
+theorem nodup_map_on {α β : Type} {f : α → β} {l : List α}
+    (hnd : l.Nodup) (hinj : ∀ a ∈ l, ∀ b ∈ l, f a = f b → a = b) : (l.map f).Nodup := by
+  induction l with
+  | nil => exact List.nodup_nil
+  | cons x xs ih =>
+    simp only [List.nodup_cons] at hnd
+    simp only [List.map_cons, List.nodup_cons]
+    refine ⟨fun hm => ?_, ih hnd.2 (fun a ha b hb =>
+      hinj a (List.mem_cons_of_mem _ ha) b (List.mem_cons_of_mem _ hb))⟩
+    obtain ⟨y, hy, hfx⟩ := List.mem_map.mp hm
+    have hxy := hinj x List.mem_cons_self y (List.mem_cons_of_mem _ hy) hfx.symm
+    exact hnd.1 (hxy ▸ hy)
+
+/-- Rendered dotted names are globally duplicate-free across the base environment and all
+audited modules: no component-smuggling name can collide with another constant when
+serialized or looked up by string. -/
+theorem auditAndReplayPackage_global_toChars_nodup {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (h : auditAndReplayPackage cfg pkg = .ok cert) :
+    ((pkg.baseEnv.map ConstantRecord.name ++
+      pkg.modules.flatMap ModuleInventory.constNames).map SymName.toChars).Nodup := by
+  obtain ⟨_, hbaseWf, hmods, hnd, _, _⟩ := (auditAndReplayPackage_facts h).1
+  have hwf : ∀ n ∈ pkg.baseEnv.map ConstantRecord.name ++
+      pkg.modules.flatMap ModuleInventory.constNames, n.isWellFormed = true := by
+    intro n hn
+    rcases List.mem_append.mp hn with hb | hm
+    · obtain ⟨ci, hci, rfl⟩ := List.mem_map.mp hb
+      exact hbaseWf ci hci
+    · obtain ⟨inv, hinv, hni⟩ := List.mem_flatMap.mp hm
+      exact (validateModuleDataKeys_ok_iff.mp (validateReplayInventory_ok (hmods inv hinv).2.2.1).1).2.1 n hni
+  exact nodup_map_on hnd (fun a ha b hb heq => SymName.toChars_inj (hwf a ha) (hwf b hb) heq)
 
 /-- `extraConstNames` are distinct across all modules and disjoint from every declared constant. -/
 theorem auditAndReplayPackage_extraConstNames_nodup {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     (allExtraConstNames pkg).Nodup ∧
       ∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg :=
-  ⟨(auditAndReplayPackage_facts h).1.2.2.2.1, (auditAndReplayPackage_facts h).1.2.2.2.2⟩
+  ⟨(auditAndReplayPackage_facts h).1.2.2.2.2.1, (auditAndReplayPackage_facts h).1.2.2.2.2.2⟩
 
 theorem moduleRole_facts {inv : ModuleInventory} (h : validateModuleRole inv = .ok ()) :
     inv.moduleName.isStdlibModule = false ∧ inv.moduleName.isLeanCompilerModule = false ∧
@@ -4888,7 +5124,7 @@ theorem auditAndReplayPackage_no_lean_modules {cfg : AuditConfig} {pkg : Package
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ¬ SymName.isLeanCompilerModule inv.moduleName := by
   intro inv hinv
-  simp [(moduleRole_facts ((auditAndReplayPackage_facts h).1.2.1 inv hinv).1).2.1]
+  simp [(moduleRole_facts ((auditAndReplayPackage_facts h).1.2.2.1 inv hinv).1).2.1]
 
 /-- Verify roots and claim roots are listed once each. -/
 theorem auditAndReplayPackage_roots_nodup {cfg : AuditConfig} {pkg : PackageAuditInput}
@@ -4923,7 +5159,7 @@ theorem auditAndReplayPackage_imports_sound {cfg : AuditConfig} {pkg : PackageAu
       ¬ ImportReaches pkg inv.moduleName inv.moduleName := by
   intro inv hinv
   obtain ⟨hstruct, hpol, _, _⟩ := auditAndReplayPackage_facts h
-  have hr := moduleRole_facts (hstruct.2.1 inv hinv).1
+  have hr := moduleRole_facts (hstruct.2.2.1 inv hinv).1
   have hi := (auditModulePolicy_ok (hpol.modules inv hinv)).2.2.1
   simp only [validateImports, bindUnit_ok_iff, checkAll_ok_iff, ensure_ok_iff] at hi
   refine ⟨by simp [hr.1], by simp [hr.2.2.1], fun imp himp => ?_, fun hreach => ?_⟩
@@ -5181,13 +5417,40 @@ theorem auditAndReplayPackage_sources_covered {cfg : AuditConfig} {pkg : Package
   · rename_i src hsrc
     exact ⟨src, hsrc, h1⟩
 
-/-- Every declaration of a test module has a clean closure. -/
+/-- No audited module registers an orphan instance of an imported class: an accepted
+instance of an imported class must belong to a `Defs` module and its declaration's type
+must reference at least one local replayed declaration of that module. -/
+theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, ∀ d cls isPriv,
+      EnvExtEntry.instanceEntry d cls isPriv ∈ inv.extEntries →
+      isLocalExtDecl inv cls = false →
+      inv.role = .defsExempt ∧
+        ∃ ci ∈ inv.constants, ci.name = d ∧
+          ∃ localDep ∈ ci.type.usedConstants, isLocalExtDecl inv localDep = true := by
+  intro inv hinv d cls isPriv hext hcls
+  have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
+  have hval := checkAll_ok_iff.mp hm.1 _ hext
+  simp only [validateSingleExtEntry, bindUnit_ok_iff, ensure_ok_iff, hcls, Bool.false_eq_true,
+    ↓reduceIte] at hval
+  obtain ⟨_, hrole, hfind⟩ := hval
+  split at hfind
+  · rename_i ci hci
+    obtain ⟨hmem, hname⟩ := findConstByName_mem hci
+    have hany := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
+    exact ⟨hrole, ci, hmem, hname, hany⟩
+  · cases hfind
+
+/-- Every declaration of a test module has a clean closure, and when
+`cfg.allowLocalTestAxioms = false`, every dependency satisfies `CleanDep` with no local
+test axioms admitted. -/
 theorem auditAndReplayPackage_test_closures_clean {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, inv.role = .test → ∀ ci ∈ inv.constants,
       isCodegenUnsafeRecInMod inv ci = false → ∀ dep,
       DepReaches (packageEnv pkg) ci.name dep →
-      CleanTestDep pkg (packageEnv pkg) inv.moduleName dep := by
+      CleanTestDep pkg (packageEnv pkg) inv.moduleName dep ∧
+        (cfg.allowLocalTestAxioms = false → CleanDep pkg (packageEnv pkg) dep) := by
   intro inv hinv hrole ci hci hcomp dep hreach
   have ht := (auditAndReplayPackage_facts h).2.1.tests inv hinv
   simp only [auditTestModule, hrole, ↓reduceIte, checkAll_ok_iff] at ht
@@ -5203,10 +5466,17 @@ theorem auditAndReplayPackage_test_closures_clean {cfg : AuditConfig} {pkg : Pac
     · cases h2
     · rename_i dci hdci
       simp only [bindUnit_ok_iff, ensure_ok_iff] at h2
-      refine ⟨dci, hdci, h2.1, h2.2.1, h2.2.2.1.1, h2.2.2.1.2, fun hk => ?_⟩
-      rcases h2.2.2.2 with h3 | h3
-      · exact absurd hk h3
-      · exact h3
+      refine ⟨⟨dci, hdci, h2.1, h2.2.1, h2.2.2.1.1, h2.2.2.1.2, fun hk => ?_⟩, fun hno => ?_⟩
+      · rcases h2.2.2.2 with h3 | h3 | h3
+        · exact absurd hk h3
+        · exact Or.inl h3
+        · exact Or.inr h3.2
+      · refine ⟨dci, hdci, h2.1, h2.2.1, h2.2.2.1.1, h2.2.2.1.2, fun hk => ?_⟩
+        rcases h2.2.2.2 with h3 | h3 | h3
+        · exact absurd hk h3
+        · exact h3
+        · rw [hno] at h3
+          cases h3.1
 
 /-- Pipeline-level closure soundness: in unconditional mode the whole dependency closure
 of every declaration, verify root, and claim root is clean. -/
@@ -5330,7 +5600,7 @@ theorem imported_record_replayed {cfg : AuditConfig} {pkg : PackageAuditInput}
   | none =>
     simp only [hb, Option.none_or] at hl
     obtain ⟨inv, hinv, hmem⟩ := List.mem_flatMap.mp (KernelEnv.lookup_mem hl)
-    have hvalid := (hstruct.2.1 inv hinv).2.2
+    have hvalid := (hstruct.2.2.1 inv hinv).2.2.1
     have hkey := (validInventory_key_eq_ci_name hvalid).1 (n, ci) hmem
     have hci : ci ∈ inv.constants := (List.of_mem_zip hmem).2
     simp only at hkey
@@ -5388,7 +5658,7 @@ theorem auditAndReplayPackage_sound {cfg : AuditConfig} {pkg : PackageAuditInput
   refine ⟨fun n ci hl => (imported_record_replayed h n ci hl).1, fun inv hinv => ?_,
     fun hcfg M hbase => ?_⟩
   · have hm := auditModulePolicy_ok (hpol.modules inv hinv)
-    exact ⟨(hstruct.2.1 inv hinv).2.2, hm.1, hm.2.2.1, hm.2.2.2.1⟩
+    exact ⟨(hstruct.2.2.1 inv hinv).2.2.1, hm.1, hm.2.2.1, hm.2.2.2.1⟩
   · obtain ⟨M', hs⟩ := replayCleanEnvOrdered_preserves_sound hbase
       (fun ci _ => allowReplayAxiom_false hcfg pkg ci) hreplay
     refine ⟨fun n ci hl => kernelEnv_no_false hs hl, fun n ci hl => ?_⟩

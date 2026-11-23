@@ -1708,6 +1708,164 @@ theorem passA1_no_false_positive :
     isOk (scan (chars! "def prefixLen := 1\ndef x := xs.isPrefixOf ys && macroScopes.notations.syntaxTree.parser_state")) = true := by
   decide +kernel
 
+/-! ## Pass `B2` hardening regressions -/
+
+def smuggledStdMod : SymName := SymName.mk [chars! "Std.Evil"]
+def smuggledShadowNat : SymName := SymName.mk [chars! "Topic.Proofs.Nat.succ"]
+def emptyPartName : SymName := SymName.mk [[]]
+def smuggledA : SymName := SymName.mk [chars! "Topic.Proofs.a"]
+def normalA : SymName := sn! "Topic.Proofs.a"
+def smuggledBaseNat : SymName := SymName.mk [chars! "Nat.evil"]
+def smuggledExtra : SymName := SymName.mk [chars! "Topic.Proofs.x"]
+def smuggledPeer : SymName := SymName.mk [chars! "Proof.Exploit.b"]
+
+/-- Malformed `SymName` components (empty parts or embedded `.`) cannot spoof module roles,
+evade shadowing checks, collide under `toChars`, or smuggle into `baseEnv`, `.all`, or
+`extraConstNames`. -/
+theorem passB2_symname_component_smuggling_rejected :
+    smuggledA ≠ normalA ∧
+    smuggledA.toChars = normalA.toChars ∧
+    failsWith (audit noSourceConfig (plusModule (mkModule smuggledStdMod .spec [] [sn! "Init"])))
+      (.moduleRoleMismatch smuggledStdMod "spec") = true ∧
+    failsWith (audit noSourceConfig (withProofThm smuggledShadowNat trueE trueIntroE))
+      (.anonymousConstantName proofsMod) = true ∧
+    failsWith (audit noSourceConfig (withProofThm emptyPartName trueE trueIntroE))
+      (.anonymousConstantName proofsMod) = true ∧
+    failsWith (audit noSourceConfig
+        (pkgWithProofs (addConsts proofsModule
+          [mkThm normalA trueE trueIntroE, mkThm smuggledA trueE trueIntroE])))
+      (.anonymousConstantName proofsMod) = true ∧
+    failsWith (audit noSourceConfig
+        (pkgWithProofs { proofsModule with extraConstNames := [smuggledExtra] }))
+      (.anonymousConstantName proofsMod) = true ∧
+    failsWith (audit noSourceConfig
+        { corePkg with
+          baseEnv := corePkg.baseEnv ++ [baseDecl smuggledBaseNat .axiomDecl trueE initCore] })
+      (.anonymousConstantName .anonymous) = true ∧
+    failsWith (validateReplayInventory (allMod [thmA [mA, smuggledPeer]]))
+      (.invalidMutualAll exploitMod mA "malformed entry in .all") = true := by decide +kernel
+
+def uName : SymName := sn! "Proof.Exploit.U"
+def uMkName : SymName := sn! "Proof.Exploit.U.mk"
+def mutIndT : ConstantRecord := { tDecl with all := [tName, uName] }
+def mutIndU : ConstantRecord :=
+  { name := uName, kind := .inductDecl [uMkName], type := .sort 1, all := [tName, uName] }
+def mutIndUMk : ConstantRecord := { name := uMkName, kind := .ctorDecl uName, type := .const uName }
+
+/-- `Topic.Defs` may not register orphan instances of imported classes (whose type mentions
+zero local declarations), and a recursor's `.all` must match its mutual inductive's `.all`. -/
+theorem passB2_defs_orphan_instance_and_rec_all_mismatch_rejected :
+    failsWith (audit noSourceConfig
+        (defsPkg [.instanceEntry (sn! "Topic.Defs.claimIdx") (sn! "OfNat") false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class"
+        (sn! "Topic.Defs.claimIdx")) = true ∧
+    isOk (audit noSourceConfig corePkg) = true ∧
+    failsWith (validateReplayInventory (allMod [mutIndT, tMkDecl, mutIndU, mutIndUMk, tRecDecl]))
+      (.invalidMutualAll exploitMod tRecName "recursor .all differs from inductive .all") = true := by
+  decide +kernel
+
+def baseGhostAx : SymName := sn! "Topic.Tests.baseGhostAx"
+
+def baseCollisionPkg : PackageAuditInput :=
+  { baseEnv := standardBaseDecls ++ [baseDecl baseGhostAx .axiomDecl trueE testsMod],
+    modules := corePkg.modules ++
+      [mkModule testsMod .test [mkThm testThmName trueE (.const baseGhostAx)] [sn! "Init"]],
+    verifyRoots := [verifiedName] }
+
+/-- A `baseEnv` declaration cannot claim the module name of an audited package module, and
+`checkTestDep` independently enforces `cfg.allowLocalTestAxioms = true` before admitting any
+local test axiom. -/
+theorem passB2_baseEnv_module_collision_and_test_axiom_flag_rejected :
+    failsWith (audit noSourceConfig baseCollisionPkg) (.duplicateModuleName testsMod) = true ∧
+    failsWith (checkTestDep noSourceConfig baseCollisionPkg (packageEnv baseCollisionPkg)
+        testsMod testThmName baseGhostAx)
+      (.testModuleForeignAxiom testsMod testThmName baseGhostAx) = true ∧
+    isOk (checkTestDep testAxiomsConfig (testPkg [mkAxiom localAxName trueE])
+      (packageEnv (testPkg [mkAxiom localAxName trueE])) testsMod testThmName localAxName) = true := by
+  decide +kernel
+
+def specReqName : SymName := sn! "Topic.Spec.Req"
+def shadowSpec : SymName := sn! "Topic.Proofs.Topic.Spec.Req"
+def shadowAssump : SymName := sn! "Topic.Proofs.Assumptions.Hw.mmioOk"
+
+/-- `V15` namespace-suffix shadowing protects every statement-side module (`Defs`, `Spec`,
+and `Assumptions`), not only `Defs`. -/
+theorem passB2_v15_spec_and_assumptions_shadowing_rejected :
+    failsWith (audit noSourceConfig
+        { corePkg with
+          modules := [defsModule, theoryModule,
+            mkModule specMod .spec [mkDef specReqName natE (.natLit 0)] [sn! "Init"],
+            addConsts proofsModule [mkThm shadowSpec trueE trueIntroE],
+            verifyModule] })
+      (.forbiddenShadowingOrExport proofsMod "namespace_shadow" shadowSpec) = true ∧
+    failsWith (audit { noSourceConfig with allowAssumptions := true }
+        { corePkg with
+          modules := [defsModule, theoryModule,
+            mkModule hwMod .assumptions [mkAxiom mmioName trueE] [sn! "Init"],
+            addConsts proofsModule [mkThm shadowAssump trueE trueIntroE],
+            verifyModule] })
+      (.forbiddenShadowingOrExport proofsMod "namespace_shadow" shadowAssump) = true := by
+  decide +kernel
+
+def nestedBetaWrap : Nat → ExprSkeleton → ExprSkeleton
+  | 0, body => body
+  | n + 1, body => .app (.lam boolE (nestedBetaWrap n body)) (c! "Bool.true")
+
+def chainDefName (k : Nat) : SymName :=
+  SymName.mk [chars! "Topic", chars! "Proofs", ['d', Char.ofNat (48 + k)]]
+
+def chainedBoolDefs (leaf : ExprSkeleton) : Nat → List ConstantRecord
+  | 0 => [mkDef (chainDefName 0) boolE (nestedBetaWrap 15 leaf)]
+  | k + 1 =>
+    chainedBoolDefs leaf k ++
+      [mkDef (chainDefName (k + 1)) boolE (nestedBetaWrap 15 (.const (chainDefName k)))]
+
+def cycDef : ConstantRecord := mkDef (sn! "Topic.Proofs.cyc") boolE (c! "Topic.Proofs.cyc")
+
+/-- Chained helper definitions (tiny root `e.size = 1`, >150 total β+δ steps) still refute a
+false provisional native axiom, accept an honest true chain, and fail closed if reduction
+exhausts fuel (e.g. a cyclic definition). -/
+theorem passB2_provisional_native_chained_defs_refuted_and_fail_closed :
+    failsWith (audit provisionalNoSource
+        (nativeProofs (eqBoolTrue (.const (chainDefName 9))) (chainedBoolDefs (c! "Bool.false") 9)))
+      (.invalidNativeAxiomType provAx provAx) = true ∧
+    isOk (audit provisionalNoSource
+        (nativeProofs (eqBoolTrue (.const (chainDefName 9))) (chainedBoolDefs (c! "Bool.true") 9)))
+      = true ∧
+    nativeAxiomRefutedByKernel ((sn! "Topic.Proofs.cyc", cycDef) :: standardBaseEnv)
+      (eqBoolTrue (c! "Topic.Proofs.cyc")) = true := by decide +kernel
+
+/-- Source scanner catches initializers, elaborator/delaborator/unexpander/simproc/unif_hint/
+csimp/cpass/export hooks and all `builtin_*` variants, without false positives on ordinary
+identifiers like `init` or `builtin_helper`. -/
+theorem passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected :
+    flags (chars! "initialize pure ()") "initialize" = true ∧
+    flags (chars! "builtin_initialize pure ()") "builtin_initialize" = true ∧
+    flags (chars! "@[builtin_init myInit] def x : Unit := ()") "builtin_init" = true ∧
+    flags (chars! "@[command_elab myCmd] def e := 0") "command_elab" = true ∧
+    flags (chars! "@[builtin_command_elab myCmd] def e := 0") "builtin_command_elab" = true ∧
+    flags (chars! "@[term_elab myTerm] def e := 0") "term_elab" = true ∧
+    flags (chars! "@[tactic_elab myTac] def e := 0") "tactic_elab" = true ∧
+    flags (chars! "@[doElem_elab myDo] def e := 0") "doElem_elab" = true ∧
+    flags (chars! "@[inductive_elab myInd] def e := 0") "inductive_elab" = true ∧
+    flags (chars! "@[delab myApp] def d := 0") "delab" = true ∧
+    flags (chars! "@[app_unexpander myApp] def u := 0") "app_unexpander" = true ∧
+    flags (chars! "simproc mySimp (0) := f") "simproc" = true ∧
+    flags (chars! "dsimproc myDSimp (0) := f") "dsimproc" = true ∧
+    flags (chars! "cbv_simproc myCbv (0) := f") "cbv_simproc" = true ∧
+    flags (chars! "builtin_simproc mySimp (0) := f") "builtin_simproc" = true ∧
+    flags (chars! "simproc_decl mySimp (0)") "simproc_decl" = true ∧
+    flags (chars! "unif_hint (x : Nat) where x =?= x |- x =?= x") "unif_hint" = true ∧
+    flags (chars! "@[unification_hint] def h := 0") "unification_hint" = true ∧
+    flags (chars! "export Nat (add)") "export" = true ∧
+    flags (chars! "@[csimp] theorem fg : f = g := rfl") "csimp" = true ∧
+    flags (chars! "@[cpass] def p := 0") "cpass" = true ∧
+    flags (chars! "declare_simp_like_tactic my_simp") "declare_simp_like_tactic" = true ∧
+    flags (chars! "builtin_macro \"foo\" : term => 0") "builtin_macro" = true ∧
+    flags (chars! "builtin_syntax \"foo\" : term") "builtin_syntax" = true ∧
+    isOk (scan (chars! "def init := 0\ndef initial_value := 1\ndef builtin_helper := 2\ndef exported_flag := 3\ndef unif_helper := 4"))
+      = true := by decide +kernel
+
 /-! ## End-to-end instantiation on the clean package -/
 
 /-- The semantic soundness theorem applied to the clean package over the standard base
@@ -2053,5 +2211,41 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA1_no_false_positive' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passA1_no_false_positive
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.SymName.toChars_inj' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms SymName.toChars_inj
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_global_toChars_nodup' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms auditAndReplayPackage_global_toChars_nodup
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_no_orphan_instances' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms auditAndReplayPackage_no_orphan_instances
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_symname_component_smuggling_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_symname_component_smuggling_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_defs_orphan_instance_and_rec_all_mismatch_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_defs_orphan_instance_and_rec_all_mismatch_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_baseEnv_module_collision_and_test_axiom_flag_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_baseEnv_module_collision_and_test_axiom_flag_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_v15_spec_and_assumptions_shadowing_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_v15_spec_and_assumptions_shadowing_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_provisional_native_chained_defs_refuted_and_fail_closed' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_provisional_native_chained_defs_refuted_and_fail_closed
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected
 
 end Anneal.ReplayKeyAndTamperAuditTests
