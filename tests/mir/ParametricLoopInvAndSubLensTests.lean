@@ -4246,7 +4246,13 @@ theorem canary3b_panickingCallee_rejected :
 
 /-- Alignment oracle for caller-frame `[u8; N]` referent slices (`SliceCallAddr`):
 requires `2^k ∣ off` (modelling 4-byte-aligned caller buffer bases, independent of
-byte contents so write-invariant across all `sliceCallByteStoreOps` writes). -/
+byte contents so write-invariant across all `sliceCallByteStoreOps` writes).
+
+Caveat: this is a caller-side packing DISCIPLINE, not a Rust layout fact. A Rust
+`[u8; N]` has ABI alignment 1, and `V2026_06_01` `callerLocals` slots carry no
+layout/address metadata, so the trusted semantics never faults on an "unaligned"
+`&mut [u8]` write. Fail-closed rejection here is enforced only by the
+`AlignedSubLens` view, not by `stepMirFn`. -/
 def sliceCallAlignedAt (_m : Memory) (_a : SliceCallAddr) (off k : Nat) : Bool :=
   Nat.beq (off % (2 ^ k)) 0
 
@@ -4393,6 +4399,28 @@ theorem canary3b_oobSlice_derefWrite_ub :
         memory := m0 }
     Anneal.PureMirExec.mirStep writeU32SliceBody st14 = .fault := rfl
 
+/-- Raw caller-frame framing for any summary executed through
+`sliceCallByteStoreOps`: every caller-local slot other than the lens target is
+bit-for-bit unchanged. Unlike lens-level `get` framing (which only observes
+regions covered by a live `.unique` borrow), this also covers frozen-borrow
+slots such as `callerLocals[13]` and non-`[u8]` slots. -/
+private theorem sliceCall_execMutSummary_other_local {Arg Ret : Type}
+    {sum : MutSummary UInt8 Arg Ret} {L : ByteSubLens SliceCallAddr} {m m' : Memory}
+    {arg : Arg} {ret : Ret} (h : execMutSummary sum L m arg = some (m', ret))
+    {j : Nat} (hj : j ≠ L.addr.localIdx) :
+    listGet? m'.callerLocals j = listGet? m.callerLocals j := by
+  rcases execMutSummary_inv h with ⟨_, _, new, _, _, hSet⟩
+  unfold ByteSubLens.set at hSet
+  split at hSet
+  · cases hSet
+  · change (match sliceCallAbiReady m L.addr L.offset new.length with
+      | false => none
+      | true => memCallerByteStoreOps.writeBytes? m ⟨L.addr.localIdx⟩ L.offset new) =
+        some m' at hSet
+    split at hSet
+    · cases hSet
+    · exact memCaller_writeBytes_listGet?_ne hSet hj
+
 /-- **Trusted `StatefulClaim` for real mutating callee `writeU32SliceBody`**,
 requiring a live covering `.unique` borrow on any valid `ByteSubLens SliceCallAddr`
 and guaranteeing exact return value, exact mutated `u32` bytes, and universal
@@ -4410,8 +4438,10 @@ def writeU32SliceStatefulClaim : StatefulClaim where
     ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (newVal : UInt32),
       args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
               .scalar ⟨newVal.toNat, 4⟩] ∧
+      findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
       ret = .scalar ⟨newVal.toNat, 4⟩ ∧
       L.getVal rawU32Codec mem' = some newVal ∧
+      (∀ j, j ≠ L.addr.localIdx → listGet? mem'.callerLocals j = listGet? mem.callerLocals j) ∧
       (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
         other.get mem' = other.get mem) ∧
       mem'.borrows = mem.borrows ∧
@@ -4465,9 +4495,23 @@ theorem canary3b_writeU32Slice_statefulVerificationResult :
   refine ⟨L, .u32Arg newVal, m', newVal, ?_, hExec, ?_⟩
   · unfold writeU32Entry; rw [hFind]; rfl
   · intro rv hOfVal hFrame
-    exact ⟨L, e, newVal, rfl, ofU32Value_inv hOfVal, hPostVal, hFrame,
+    exact ⟨L, e, newVal, rfl, hFind, ofU32Value_inv hOfVal, hPostVal,
+      fun _ hj => sliceCall_execMutSummary_other_local hExec hj, hFrame,
       execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
       execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
+
+/-- Non-vacuity of `writeU32SliceStatefulClaim.pre`: the live canary memory
+satisfies it for every symbolic buffer content and new value (`tag 1`, `[0..4)`),
+so `canary3b_writeU32Slice_statefulVerificationResult` is not vacuous. -/
+theorem canary3b_writeU32SliceStatefulClaim_pre_satisfiable
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal newVal : UInt32) :
+    writeU32SliceStatefulClaim.pre
+      [.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨4, 8⟩], .scalar ⟨newVal.toNat, 4⟩]
+      (mkCanaryCalleeMem initHdr initFlag initVal siblingVal) :=
+  ⟨calleeHdrLens,
+    { tag := 1, targetLocal := 12, targetProjection := [], perm := .unique,
+      rangeOffset := 0, rangeLen := 4, targetFrameDepth := 0 },
+    initHdr, newVal, rfl, mkCanaryCalleeMem_hdr_getVal initHdr initFlag initVal siblingVal, rfl⟩
 
 /-- **Trusted `StatefulClaim` for real mutating callee `writePaddedPairSliceBody`**. -/
 def writePaddedPairSliceStatefulClaim : StatefulClaim where
@@ -4484,8 +4528,10 @@ def writePaddedPairSliceStatefulClaim : StatefulClaim where
     ∃ (L : ByteSubLens SliceCallAddr) (e : BorrowEntry) (newFlag : Bool) (newVal : UInt32),
       args = [.aggregate 0 [.ptr ⟨e.tag, L.offset⟩ 8, .scalar ⟨L.len, 8⟩],
               boolScalar newFlag, .scalar ⟨newVal.toNat, 4⟩] ∧
+      findCoveringUniqueBorrow mem.borrows L.addr.localIdx L.offset L.len = some e ∧
       ret = .scalar ⟨newVal.toNat, 4⟩ ∧
       L.getVal rawPaddedPairCodec mem' = some (newFlag, newVal) ∧
+      (∀ j, j ≠ L.addr.localIdx → listGet? mem'.callerLocals j = listGet? mem.callerLocals j) ∧
       (∀ other : ByteSubLens SliceCallAddr, ByteSubLens.Disjoint Memory L other →
         other.get mem' = other.get mem) ∧
       mem'.borrows = mem.borrows ∧
@@ -4507,9 +4553,25 @@ theorem canary3b_writePaddedPairSlice_statefulVerificationResult :
   refine ⟨L, .paddedPairArg newFlag newVal, m', newVal, ?_, hExec, ?_⟩
   · unfold writePaddedPairEntry; rw [hFind]; rfl
   · intro rv hOfVal hFrame
-    exact ⟨L, e, newFlag, newVal, rfl, ofU32Value_inv hOfVal, hPostVal, hFrame,
+    exact ⟨L, e, newFlag, newVal, rfl, hFind, ofU32Value_inv hOfVal, hPostVal,
+      fun _ hj => sliceCall_execMutSummary_other_local hExec hj, hFrame,
       execMutSummary_preserves sliceCall_writePreserves_borrows hExec,
       execMutSummary_preserves sliceCall_writePreserves_globals hExec⟩
+
+/-- Non-vacuity of `writePaddedPairSliceStatefulClaim.pre` on the live canary
+memory (`tag 2`, `[4..12)`). -/
+theorem canary3b_writePaddedPairSliceStatefulClaim_pre_satisfiable
+    (initHdr : UInt32) (initFlag : Bool) (initVal siblingVal : UInt32)
+    (newFlag : Bool) (newVal : UInt32) :
+    writePaddedPairSliceStatefulClaim.pre
+      [.aggregate 0 [.ptr ⟨2, 4⟩ 8, .scalar ⟨8, 8⟩], boolScalar newFlag,
+        .scalar ⟨newVal.toNat, 4⟩]
+      (mkCanaryCalleeMem initHdr initFlag initVal siblingVal) :=
+  ⟨calleePayLens,
+    { tag := 2, targetLocal := 12, targetProjection := [], perm := .unique,
+      rangeOffset := 4, rangeLen := 8, targetFrameDepth := 0 },
+    (initFlag, initVal), newFlag, newVal, rfl,
+    mkCanaryCalleeMem_pay_getVal initHdr initFlag initVal siblingVal, rfl⟩
 
 /-! ## 4. Kernel Axiom Guardrails (`#guard_msgs` + `#print axioms`) -/
 
@@ -4785,5 +4847,21 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writePaddedPairSlice_sta
 -/
 #guard_msgs in
 #print axioms canary3b_writePaddedPairSlice_statefulVerificationResult
+
+/-! ### Pass B2 guards: `StatefulClaim` precondition non-vacuity. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writeU32SliceStatefulClaim_pre_satisfiable' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3b_writeU32SliceStatefulClaim_pre_satisfiable
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3b_writePaddedPairSliceStatefulClaim_pre_satisfiable' depends on axioms: [propext,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary3b_writePaddedPairSliceStatefulClaim_pre_satisfiable
 
 end Anneal.ParametricLoopInvAndSubLensTests

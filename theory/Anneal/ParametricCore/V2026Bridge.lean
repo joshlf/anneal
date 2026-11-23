@@ -2375,6 +2375,18 @@ private theorem memCaller_write_inv {m m' : Memory} {a : CallerLocalAddr}
           injection hW with hEq
           exact ⟨slot, bytes, cl', rfl, hS, Nat.le_of_ble_eq_true hB, hSet, hEq.symm⟩
 
+/-- Raw frame for `Memory.callerLocals`: a successful byte write through
+`memCallerByteStoreOps` leaves every OTHER caller-local slot bit-for-bit
+unchanged (including slots that hold no `[u8]` referent, or that are covered
+only by non-unique borrows, which lens-level `get` framing cannot observe). -/
+theorem memCaller_writeBytes_listGet?_ne {m m' : Memory} {a : CallerLocalAddr}
+    {off : Nat} {bs : List UInt8}
+    (hW : memCallerByteStoreOps.writeBytes? m a off bs = some m')
+    {j : Nat} (hj : j ≠ a.localIdx) :
+    listGet? m'.callerLocals j = listGet? m.callerLocals j := by
+  rcases memCaller_write_inv hW with ⟨_, _, _, _, _, _, hSet, rfl⟩
+  exact listGet?_listSet?_ne hj hSet
+
 instance memCallerLawfulByteStoreOps :
     LawfulByteStoreOps Memory CallerLocalAddr UInt8 where
   read_len := by
