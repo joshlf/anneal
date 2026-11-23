@@ -2533,6 +2533,37 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
             # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 90/94
             #    MIR matrix in both JSON and Markdown outputs for `quick` (12) and `nightly` (29).
+            #    Stub Stage B corpus scanning and divergence discovery (covered by their own
+            #    end-to-end tests) so running both profiles stays fast while Stage A, step
+            #    planning, Markdown rendering, and JSON persistence remain real.
+            empty_layer = {
+                "fully_verifiable_fn_pct": 0.0,
+                "fully_verifiable_fns": 0,
+                "partially_covered_fn_pct": 0.0,
+                "partially_covered_fns": 0,
+                "within_blocked_fns_stmt_coverage_pct": 0.0,
+                "within_blocked_fns_cfg_prefix_pct": 0.0,
+                "total_stmt_coverage_pct": 0.0,
+                "blended_completeness_score_pct": 0.0,
+            }
+            stub_stage_b = {
+                "combined": {
+                    "total_fns": 0,
+                    "total_stmt_units": 0,
+                    "top_marginal_unlock_blockers": [],
+                    "layers": {
+                        layer: dict(empty_layer)
+                        for layer in (
+                            "trusted_mir",
+                            "anneal_proof_lifters",
+                            "minirust_correspondence",
+                            "lean_miri_correspondence",
+                        )
+                    },
+                },
+                "corpora": {},
+            }
+            stub_divs = {"actionable_anneal_bugs_count": 0, "actionable_anneal_bugs": []}
             for profile, expected_count, required_order in (
                 ("quick", 12, ("lake_build_core_theory", "lake_build_examples_trusted", "rust_workspace_unit_tests")),
                 (
@@ -2572,6 +2603,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     }
 
                 with (
+                    mock.patch.object(suite, "compute_stage_b_empirical_corpora", return_value=stub_stage_b),
+                    mock.patch.object(suite, "discover_correspondence_divergences", return_value=stub_divs),
                     mock.patch.object(suite, "_preflight_clean_stale_oleans", return_value=[]),
                     mock.patch.object(suite, "_run_step", side_effect=fake_run_step),
                 ):
@@ -5506,13 +5539,17 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             def probes() -> list[list[str]]:
                 return [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
 
-            # Non-executing / mutating flags never spawn the wrapper.
+            # Non-executing / mutating flags, `-h...` clusters, and empty inner commands never spawn the wrapper.
             for non_exec in (
+                [str(wrapper)],
+                [str(wrapper), "--mode", "build"],
+                [str(wrapper), "--mode", "build", "--"],
                 [str(wrapper), "--ensure-slice"],
                 [str(wrapper), "--ensure", "--", "lake", "build"],
                 [str(wrapper), "--probe", "--json"],
                 [str(wrapper), "--print-limits"],
                 [str(wrapper), "-h"],
+                [str(wrapper), "-hW1", "--", "lake", "build"],
                 [str(wrapper), "--help"],
             ):
                 self.assertIsNone(suite._probe_lean_run_memory_max_mib(non_exec), non_exec)
@@ -5760,6 +5797,33 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 )
                 self.assertNotIn("LEAN_NUM_THREADS", env)
                 self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
+
+            # 5. If `build_slots` grows between probe 1 and probe 2 (so the re-probe still
+            #    reports `w_eff < build_slots`), clamp fail-closed without a 3rd probe.
+            cap, calls = probe(["--concurrency", "1"], {"1": first(21600, 1, 2), "2": first(12000, 2, 4)})
+            self.assertEqual(cap, 6000)
+            self.assertEqual(len(calls), 2)
+
+            # 6. Short-circuit: when the host/cgroup ceiling is already `< 10 GiB`,
+            #    `_build_step_env` single-threads immediately without spawning the wrapper.
+            table.write_text(json.dumps({"1": first(21600, 1, 3), "3": first(7200, 3, 3)}), encoding="utf-8")
+            argv_log.write_text("", encoding="utf-8")
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=8192):
+                for step_name in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+            self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
+            # At `>= 10 GiB` or unreadable (`None`) host ceiling, the wrapper IS still probed.
+            for host_mib in (10240, None):
+                argv_log.write_text("", encoding="utf-8")
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=host_mib):
+                    env = suite._build_step_env(
+                        "lake_build_minirust_spec", base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", host_mib)
+                self.assertEqual(len(argv_log.read_text(encoding="utf-8").splitlines()), 2, host_mib)
 
     def test_resolve_anneal_lean_run_anchors_relative_candidates(self) -> None:
         # Steps run with `cwd=repo_root`; a relative `ANNEAL_LEAN_RUN` or `PATH` entry that

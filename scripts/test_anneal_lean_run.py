@@ -1305,10 +1305,24 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
         for capped in (False, True):
             for budget in (1, 3, 64):
                 at_budget = dict.fromkeys(self.THREAD_VARS, budget)
-                # Unset, blank, non-numeric, zero, negative, signed, underscore, or
-                # non-ASCII digit values: fall back to the envelope's budget.
+                # Unset, blank, non-numeric, zero, negative, signed, underscore, non-ASCII
+                # digit, or non-ASCII whitespace values: fall back to the envelope's budget.
                 self.assertEqual(resolve(budget, capped, {}), at_budget)
-                for raw in ("", "   ", "abc", "1.5", "0", "-2", "+1", "1_2", "\u0661"):
+                for raw in (
+                    "",
+                    "   ",
+                    "abc",
+                    "1.5",
+                    "0",
+                    "-2",
+                    "+1",
+                    "1_2",
+                    "\u0661",
+                    "\u00a01\u00a0",
+                    "\u20032",
+                    "\u30004",
+                    "\x851",
+                ):
                     env = dict.fromkeys(self.THREAD_VARS, raw)
                     self.assertEqual(resolve(budget, capped, env), at_budget, (capped, budget, raw))
                 # A positive value at or below the budget always wins, in both regimes.
@@ -1319,6 +1333,18 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
                         dict.fromkeys(self.THREAD_VARS, want),
                         (capped, budget, raw),
                     )
+        # Defensive clamp: a non-positive budget still yields at least 1 thread.
+        for bad_budget in (0, -3):
+            self.assertEqual(resolve(bad_budget, True, {}), dict.fromkeys(self.THREAD_VARS, 1))
+            self.assertEqual(
+                resolve(bad_budget, True, {"LEAN_NUM_THREADS": "4"}),
+                dict.fromkeys(self.THREAD_VARS, 1),
+            )
+            self.assertEqual(alr.format_threads_diagnostic(bad_budget, None), "threads=1")
+            self.assertEqual(
+                alr.format_threads_diagnostic(bad_budget, {"LEAN_NUM_THREADS": "4"}),
+                "threads=4, thread_budget=1",
+            )
         # A value above the budget is clamped on a memory-capped slice only.
         self.assertEqual(resolve(3, True, {"LEAN_NUM_THREADS": "64"})["LEAN_NUM_THREADS"], 3)
         self.assertEqual(resolve(3, False, {"LEAN_NUM_THREADS": "64"})["LEAN_NUM_THREADS"], 64)
@@ -1395,6 +1421,8 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
             {"LEAN_NUM_THREADS": "+1"},
             {"LEAN_NUM_THREADS": "1_2"},
             {"LEAN_NUM_THREADS": "\u0661"},
+            {"LEAN_NUM_THREADS": "\u00a01\u00a0"},
+            {"LEAN_NUM_THREADS": "\u20031"},
         ):
             self.assertEqual(alr.format_threads_diagnostic(3, child_env), "threads=3", child_env)
 

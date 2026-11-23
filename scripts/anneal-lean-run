@@ -2158,17 +2158,18 @@ def _parse_positive_thread_count(raw: object) -> int | None:
     """Parse an ASCII base-10 positive integer thread count, or `None`.
 
     Rejects blank strings, zero/negative values, floats, unary signs, Python
-    underscore literals (`1_2`), and non-ASCII Unicode digits so Lean, Lake,
-    Cargo, and Rayon never see values their parsers reject. A count with more than
+    underscore literals (`1_2`), and any non-ASCII characters (including Unicode
+    digits and non-ASCII whitespace like NBSP) so Lean, Lake, Cargo, and Rayon
+    never see values their parsers reject. A count with more than
     `_MAX_THREAD_COUNT_DIGITS` significant digits (leading zeros are not significant)
     is rejected too: no host has that many threads, such a value may not fit a tool's
     integer job count, and past `sys.get_int_max_str_digits()` digits `int()` itself
     raises `ValueError`.
     """
-    if not isinstance(raw, str):
+    if not isinstance(raw, str) or not raw.isascii():
         return None
     stripped = raw.strip()
-    if not stripped or not (stripped.isascii() and stripped.isdigit()):
+    if not stripped or not stripped.isdigit():
         return None
     significant = stripped.lstrip("0")
     if not significant or len(significant) > _MAX_THREAD_COUNT_DIGITS:
@@ -2183,20 +2184,22 @@ def _resolve_thread_env(
 ) -> dict[str, int]:
     """Thread count the bounded command runs with, for each `_THREAD_ENV_VARS` variable.
 
-    `threads` is the envelope's thread budget. A positive value the caller already
-    exported (in `base_env`, default `os.environ`) is kept when it is at most that
-    budget, so a caller can always ask for fewer threads (`LEAN_NUM_THREADS=1`). A
-    larger one is clamped to the budget on a memory-capped slice and kept otherwise.
-    Anything else (unset, blank, non-numeric, zero or negative) resolves to the budget.
+    `threads` is the envelope's thread budget (clamped to at least 1). A positive value
+    the caller already exported (in `base_env`, default `os.environ`) is kept when it is
+    at most that budget, so a caller can always ask for fewer threads
+    (`LEAN_NUM_THREADS=1`). A larger one is clamped to the budget on a memory-capped
+    slice and kept otherwise. Anything else (unset, blank, non-numeric, zero or
+    negative) resolves to the budget.
     """
+    budget = max(1, int(threads))
     env = os.environ if base_env is None else base_env
     resolved: dict[str, int] = {}
     for var in _THREAD_ENV_VARS:
         existing = _parse_positive_thread_count(env.get(var))
         if existing is not None:
-            resolved[var] = min(existing, threads) if is_cg_capped else existing
+            resolved[var] = min(existing, budget) if is_cg_capped else existing
         else:
-            resolved[var] = threads
+            resolved[var] = budget
     return resolved
 
 
@@ -2211,14 +2214,15 @@ def format_threads_diagnostic(
     ran single-threaded and is reported as `threads=1`. When the two differ, the
     budget (which `CPUQuota` still reflects) follows as `thread_budget=<threads>`.
     """
-    effective = threads
+    budget = max(1, int(threads))
+    effective = budget
     if child_env is not None:
         parsed = _parse_positive_thread_count(child_env.get("LEAN_NUM_THREADS"))
         if parsed is not None:
             effective = parsed
-    if effective == threads:
+    if effective == budget:
         return f"threads={effective}"
-    return f"threads={effective}, thread_budget={threads}"
+    return f"threads={effective}, thread_budget={budget}"
 
 
 def _build_child_env(

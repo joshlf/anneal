@@ -5489,10 +5489,10 @@ def _probe_lean_run_memory_max_mib(
     scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
     --mode <resolved mode> --probe --json`, which never runs the command), or `None`
     if `cmd` is not wrapped, carries a non-executing wrapper action (`--ensure-slice`,
-    `--probe`, `--print-limits`, `-h`, `--help`), will pass through without creating a
-    new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1` without `--nested-ok`), or the probe fails.
-    The suite process is outside that scope, so its own cgroup hierarchy cannot show
-    this cap.
+    `--probe`, `--print-limits`, `-h`/`-h...`, `--help`) or no wrapped command, will
+    pass through without creating a new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1` without
+    `--nested-ok`), or the probe fails. The suite process is outside that scope, so
+    its own cgroup hierarchy cannot show this cap.
 
     When that probe reports a concurrency other than the one the wrapper executes at,
     it is repeated at the execution concurrency. If only the repeat fails, the answer
@@ -5513,9 +5513,10 @@ def _probe_lean_run_memory_max_mib(
         if tok == "--" or tok == "-" or not tok.startswith("-"):
             break
         opt = _resolve_lean_run_opt(tok.split("=", 1)[0] if "=" in tok else tok)
-        if opt in _LEAN_RUN_NON_EXEC_OPTS:
+        if opt in _LEAN_RUN_NON_EXEC_OPTS or (tok.startswith("-h") and not tok.startswith("--")):
             # Never forward `--ensure-slice` (which mutates systemd user units before
-            # `--probe` runs) or probe non-executing meta-invocations.
+            # `--probe` runs) or probe non-executing meta-invocations (including `-h...`
+            # short-option clusters that argparse treats as `--help`).
             return None
         if opt == "--exclusive":
             exclusive = True
@@ -5524,6 +5525,10 @@ def _probe_lean_run_memory_max_mib(
             opts.append(cmd[i + 1])
             i += 1
         i += 1
+    inner_start = i + 1 if i < n and cmd[i] == "--" else i
+    if inner_start >= n:
+        # `anneal-lean-run` prints help and exits 2 when no wrapped command is given.
+        return None
 
     def run_probe(probe_args: list[str]) -> dict[str, Any] | None:
         try:
@@ -5553,6 +5558,9 @@ def _probe_lean_run_memory_max_mib(
             return mem_max
         return None
 
+    def pos_int(val: object) -> int | None:
+        return val if isinstance(val, int) and not isinstance(val, bool) and val >= 1 else None
+
     limits = run_probe([*opts, "--mode", mode, "--probe", "--json"])
     first_cap = planned_cap(limits)
     if limits is None or first_cap is None:
@@ -5564,22 +5572,20 @@ def _probe_lean_run_memory_max_mib(
     # is larger, whereas actual execution (`is_probe=False`) raises `w_eff` to
     # `max(w_req, build_slots)` unless `--exclusive` is set. Re-probe at the runtime
     # concurrency so multi-slot hosts do not overestimate `memory_max_mb` above 10 GiB.
-    w_eff = limits.get("w_eff")
-    build_slots = limits.get("build_slots")
-    if (
-        not exclusive
-        and isinstance(w_eff, int)
-        and not isinstance(w_eff, bool)
-        and isinstance(build_slots, int)
-        and not isinstance(build_slots, bool)
-        and 1 <= w_eff < build_slots
-    ):
-        runtime_cap = planned_cap(
-            run_probe(
-                [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
-            )
+    w_eff = pos_int(limits.get("w_eff"))
+    build_slots = pos_int(limits.get("build_slots"))
+    if not exclusive and w_eff is not None and build_slots is not None and w_eff < build_slots:
+        reprobed = run_probe(
+            [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
         )
+        runtime_cap = planned_cap(reprobed)
         if runtime_cap is not None:
+            # If the host's concurrency file grew between the two probes so the re-probe
+            # still evaluated below `build_slots`, clamp fail-closed without a third fork.
+            re_w = pos_int(reprobed.get("w_eff")) if reprobed is not None else None
+            re_slots = pos_int(reprobed.get("build_slots")) if reprobed is not None else None
+            if re_w is not None and re_slots is not None and re_w < re_slots:
+                return max(1, runtime_cap * re_w // re_slots)
             return runtime_cap
         # The re-probe failed, but the first answer is still known to be too high: the
         # wrapper divides its pool by `w_eff`, so execution at `build_slots` gets at
@@ -5587,7 +5593,7 @@ def _probe_lean_run_memory_max_mib(
         # lower bound rather than `None`, which `_build_step_env` would read as "no
         # wrapper cap" and leave the step multi-threaded on a host that looks large.
         return max(1, first_cap * w_eff // build_slots)
-    if exclusive and isinstance(w_eff, int) and not isinstance(w_eff, bool) and w_eff > 1:
+    if exclusive and w_eff is not None and w_eff > 1:
         # Older fleet wrappers ignore `--exclusive` in `--probe` when `--concurrency`
         # is also present, whereas execution forces `w_eff = 1`. If the re-probe fails,
         # `first_cap` (planned for `w_eff > 1`) is a lower bound on the `w_eff = 1` cap.
@@ -5629,16 +5635,22 @@ def _build_step_env(
         env_overrides is not None and "LEAN_NUM_THREADS" in env_overrides
     ):
         if effective_ram_mib is _RAM_UNSET:
-            probe_env = {**env, **env_overrides} if env_overrides else env
-            ceilings = [
-                mib
-                for mib in (
-                    _probe_effective_ram_ceiling_mib(),
-                    _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None,
+            host_mib = _probe_effective_ram_ceiling_mib()
+            if (
+                isinstance(host_mib, int)
+                and not isinstance(host_mib, bool)
+                and host_mib < LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB
+            ):
+                # The host/cgroup ceiling is already below the threshold, so the tightest
+                # ceiling cannot reach it: skip spawning the wrapper `--probe` subprocess.
+                ram_mib: int | None | object = host_mib
+            else:
+                probe_env = {**env, **env_overrides} if env_overrides else env
+                wrapper_mib = (
+                    _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None
                 )
-                if mib is not None
-            ]
-            ram_mib: int | None | object = min(ceilings) if ceilings else None
+                ceilings = [mib for mib in (host_mib, wrapper_mib) if mib is not None]
+                ram_mib = min(ceilings) if ceilings else None
         else:
             ram_mib = effective_ram_mib
         if (
