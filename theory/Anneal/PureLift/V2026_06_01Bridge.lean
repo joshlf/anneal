@@ -4974,8 +4974,8 @@ theorem reabsorbFromSpatialInState_ok_noUninit {Val : Type} {alg : ValAlgebra Va
             cases hUn : hasUninitCell blk.cells with
             | false => rfl
             | true =>
-              simp only [hUn, Bool.not_true, Bool.and_false, Bool.false_eq_true,
-                ↓reduceIte] at h
+              simp only [hUn, Bool.not_true, Bool.and_false, Bool.false_and,
+                Bool.false_eq_true, ↓reduceIte] at h
               exact nomatch h
       | activeShared => simp only [hP] at h; exact nomatch h
       | activeMut => simp only [hP] at h; exact nomatch h
@@ -5041,7 +5041,13 @@ theorem freezeToSpatialInState_ok_noUninit {Val : Type} {alg : ValAlgebra Val}
           refine ⟨e, hFind, ?_⟩
           cases hc : hasUninitCell (codec.encode e.cell.val) with
           | false => rfl
-          | true => exact absurd hc hUn
+          | true =>
+            exact absurd
+              (by simp only [hc, Bool.true_or] :
+                (hasUninitCell (codec.encode e.cell.val) ||
+                  !cellsAccountedByVal alg loans e.cell.val
+                    (codec.encode e.cell.val)) = true)
+              hUn
 
 /-- **Freeze is refused when the live window is not fully initialized**: for a
 MIR-typed codec, freezing a loan whose value embeds `x` while the live place
