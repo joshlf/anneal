@@ -59,27 +59,40 @@ state when a panic may happen, when it must happen, and that every execution
 4. Adequacy of `DWLP` / `DWP` and of the bounded evaluators of
    `Anneal.Rustc.V2026_06_01.Lower` for these contracts.
 5. Panic call contracts (`PanicMirCallContract`), caller–callee composition
-   through `linkCalleeHandler` (`panicsOnlyIf_call_compose`) and through the
-   frame-restoring `linkCalleeWithCalleesHandler`, the memory a linked callee
-   presents on unwind, and finite counterexample / witness traces of a linked
-   system (`ReachesLinkedFault`, `ReachesLinkedOutcome`). `linkCalleeHandler`
-   runs the callee from the request memory unchanged, so it is meaningful only
-   for requests from the root frame: from a nested frame the machine steps the
-   body named by `activeCallee` (`stepMirFn_eq_of_activeCallee_some`).
-   Both handlers run the callee at call depth `0` on the caller's borrows.
+   through `linkCalleeHandler` (`panicsOnlyIf_call_compose`), the
+   frame-restoring `linkCalleeWithCalleesHandler`, and the borrow-isolated
+   frame-restoring `linkCalleeBorrowIsolatedHandler`, the memory a linked
+   callee presents on unwind, and finite counterexample / witness traces of a
+   linked system (`ReachesLinkedFault`, `ReachesLinkedOutcome`).
+   `linkCalleeHandler` runs the callee from the request memory unchanged, so it
+   is meaningful only for requests from the root frame: from a nested frame the
+   machine steps the body named by `activeCallee`
+   (`stepMirFn_eq_of_activeCallee_some`). Both `linkCalleeHandler` and
+   `linkCalleeWithCalleesHandler` run the callee at call depth `0` on the
+   caller's borrows without the caller's `StackFrame.locals`, so (a) callee
+   teardown disables live depth-0 caller borrows (Gap #8) and (b) dereferencing
+   a caller stack reference aliases into the callee's own local frame (Gap #10).
+   `linkCalleeBorrowIsolatedHandler` resolves Gap #8 and Gap #9 for
+   value-passing / global-memory callees while failing closed (`.ub`) on
+   attempts to dereference caller stack borrows.
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
    body. The guard is established for initial states, used at each call
    terminator, and preserved across **every** step of `stepMirState`
    (statements, rvalues, intrinsics, internal helper calls, unwinds, and
    resumption of external calls whose contract carries `withTraitsPreserved`),
-   yielding a multi-step execution invariant (`ReachableExecState.calleeTableExcludes`)
-   and its relativization to calls in a contract's precondition
-   (`ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved`).
+   yielding a multi-step execution invariant (`ReachableExecState.calleeTableExcludes`),
+   its relativization to calls in a contract's precondition
+   (`ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved`), and
+   automatic upgrade from any modular `DWLP`/`DWP`/`wpMirModularSym` proof to
+   unconstrained `ReachableExecState`
+   (`ReachableExecState.calleeTableExcludes_of_dwlp_withTraitsPreserved`).
 7. The syntactic call-boundary guards `CallBoundaryPreserved`,
    `CalleesCallBoundaryPreserved`, the counted `CallSitesPreserved` and
    `CalleesCallSitesPreserved`, and the CFG-reachable guards
-   `ReachableCallBoundaryPreserved` and `ReachableCallSitesPreserved`.
+   `ReachableCallBoundaryPreserved`, `ReachableCallSitesPreserved`,
+   `ReachableCalleesCallBoundaryPreserved`, and
+   `ReachableCalleesCallSitesPreserved`.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
    `ExactPass`.
 -/
@@ -3694,6 +3707,352 @@ theorem totalExactPolicyPanicContract_call_compose_withCallees_of_callee_contrac
       calleeCallees fallback hPanicInv hCallee hFallback)
     hCaller
 
+/-! #### Borrow-isolated frame-restoring handler (`linkCalleeBorrowIsolatedHandler`) -/
+
+/--
+Enter `calleeBody` in an isolated external-call frame that clears `borrows`
+in addition to resetting `callees`, `callStack`, `activeCallee`, and
+`activeProtectors`.
+
+Unlike `enterExternalCalleeState`, running on `borrows := .nil` prevents the
+callee's depth-0 `storageLive` / `return_` teardown from disabling live depth-0
+borrows of the caller (Gap #8) and fails closed (`.ub`) if the callee attempts
+to dereference a caller stack reference whose referent `StackFrame.locals` is
+absent from `MirCallReq` (Gap #10).
+-/
+def enterBorrowIsolatedCalleeState
+    (calleeBody : CapturedMir) (args : List Value)
+    (callerMem : Memory) (calleeCallees : List CapturedMir := .nil) : MachineState :=
+  enterExternalCalleeState calleeBody args { callerMem with borrows := .nil } calleeCallees
+
+/-- Interaction tree for `calleeBody` in a borrow-isolated external-call frame. -/
+def mirBorrowIsolatedCalleeTree
+    (calleeBody : CapturedMir) (args : List Value)
+    (callerMem : Memory) (calleeCallees : List CapturedMir := .nil) :
+    ITree MirEffect MirOutcome :=
+  ITree.cofix (stepMirState calleeBody)
+    (.running (enterBorrowIsolatedCalleeState calleeBody args callerMem calleeCallees))
+
+/-- Closed borrow-isolated callee tree family indexed by `MirCallReq`. -/
+def mirBorrowIsolatedClosedCalleeTrees
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir := .nil) :
+    MirCallReq → ITree MirClosedEffect MirOutcome := fun req =>
+  ITree.interp failUnlinkedCalls
+    (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees)
+
+/--
+Restore both the caller's frame fields (`callees`, `traitImpls`, `callStack`,
+`activeCallee`, `activeProtectors`) and the caller's `borrows` table on normal
+return from a borrow-isolated callee.
+-/
+def restoreCallerMemoryFrameAndBorrows (before after : Memory) : Memory :=
+  { restoreCallerMemoryFrame before after with borrows := before.borrows }
+
+theorem callFrameAndTraitsPreserved_restoreCallerMemoryFrameAndBorrows
+    (before after : Memory) (fresh : List FnPtrEntry)
+    (h_fnPtrs : after.fnPtrs = List.append fresh before.fnPtrs) :
+    callFrameAndTraitsPreserved before (restoreCallerMemoryFrameAndBorrows before after) ∧
+      (restoreCallerMemoryFrameAndBorrows before after).borrows = before.borrows :=
+  ⟨⟨⟨rfl, rfl, rfl, rfl, fresh, h_fnPtrs⟩, rfl⟩, rfl⟩
+
+/-- Map a borrow-isolated callee outcome to `MirCallAns`, restoring frame and borrows. -/
+def outcomeToBorrowIsolatedCallAns (callerMem : Memory) : MirOutcome → MirCallAns
+  | .normal (retVal, mem') =>
+    .returned retVal (restoreCallerMemoryFrameAndBorrows callerMem mem')
+  | .panic => .panicked callerMem
+  | .abort => .aborted
+
+/-- Wrap a call-free borrow-isolated callee tree as an `ITree MirClosedEffect MirCallAns`. -/
+def closeMirTreeBorrowIsolated
+    (callerMem : Memory) (t : ITree MirEffect MirOutcome) :
+    ITree MirClosedEffect MirCallAns :=
+  ITree.interp failUnlinkedCalls t >>= fun out =>
+    pure (outcomeToBorrowIsolatedCallAns callerMem out)
+
+/--
+Borrow-isolated, frame-restoring `ExternalCallHandler`: executes `calleeBody`
+from `enterBorrowIsolatedCalleeState` (resolving both depth-0 caller-borrow
+collision and nested-frame `activeCallee` confusion) and restores the caller's
+frame fields, `traitImpls`, and `borrows` on normal return.
+-/
+def linkCalleeBorrowIsolatedHandler
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler) : ExternalCallHandler := fun req =>
+  if req.defPath = calleeBody.defPath then
+    closeMirTreeBorrowIsolated req.memory
+      (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees)
+  else
+    fallback req
+
+theorem closeMirTreeBorrowIsolated_reachesRet_eq {callerMem : Memory}
+    {t : ITree MirEffect MirOutcome} {tr : List (Event MirClosedEffect)}
+    {ans : MirCallAns}
+    (hr : ReachesRet (closeMirTreeBorrowIsolated callerMem t) tr ans) :
+    ∃ out, ans = outcomeToBorrowIsolatedCallAns callerMem out :=
+  exists_eq_of_reachesRet_bind_pure hr
+
+theorem closeMirTreeBorrowIsolated_panicked_memory_eq {callerMem : Memory}
+    {t : ITree MirEffect MirOutcome} {tr : List (Event MirClosedEffect)}
+    {memAfter : Memory}
+    (hr : ReachesRet (closeMirTreeBorrowIsolated callerMem t) tr (.panicked memAfter)) :
+    memAfter = callerMem := by
+  obtain ⟨out, hOut⟩ := closeMirTreeBorrowIsolated_reachesRet_eq hr
+  cases out with
+  | normal _ => nomatch hOut
+  | panic => injection hOut
+  | abort => nomatch hOut
+
+theorem linkCalleeBorrowIsolatedHandler_of_defPath_eq (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir) (fallback : ExternalCallHandler) {req : MirCallReq}
+    (hEq : req.defPath = calleeBody.defPath) :
+    linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback req =
+      closeMirTreeBorrowIsolated req.memory
+        (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees) := by
+  unfold linkCalleeBorrowIsolatedHandler
+  split
+  · rfl
+  · next hNe => exact False.elim (hNe hEq)
+
+theorem linkCalleeBorrowIsolatedHandler_of_defPath_ne (calleeBody : CapturedMir)
+    (calleeCallees : List CapturedMir) (fallback : ExternalCallHandler) {req : MirCallReq}
+    (hNe : req.defPath ≠ calleeBody.defPath) :
+    linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback req = fallback req := by
+  unfold linkCalleeBorrowIsolatedHandler
+  split
+  · next hEq => exact False.elim (hNe hEq)
+  · rfl
+
+theorem linkCalleeBorrowIsolatedHandler_panicked_memory_eq_request_memory
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler) {req : MirCallReq}
+    {tr : List (Event MirClosedEffect)} {memAfter : Memory}
+    (hEq : req.defPath = calleeBody.defPath)
+    (hr : ReachesRet (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback req)
+      tr (.panicked memAfter)) :
+    memAfter = req.memory := by
+  rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq calleeBody calleeCallees fallback hEq] at hr
+  exact closeMirTreeBorrowIsolated_panicked_memory_eq hr
+
+theorem dwlp_closeMirTreeBorrowIsolated {callerMem : Memory}
+    {t : ITree MirEffect MirOutcome} {Q : MirCallAns → PUnit → Prop}
+    (h : DWLP mirNoCallWP t
+      (fun out _ => Q (outcomeToBorrowIsolatedCallAns callerMem out) PUnit.unit) PUnit.unit) :
+    DWLP mirClosedWP (closeMirTreeBorrowIsolated callerMem t) Q PUnit.unit := by
+  unfold closeMirTreeBorrowIsolated
+  apply DWLP.bind
+  exact DWLP.mono (fun _ _ hq => DWLP.ret hq)
+    (dwlp_interp failUnlinkedCalls failUnlinkedCalls_links_dwlp h)
+
+theorem dwp_closeMirTreeBorrowIsolated {callerMem : Memory}
+    {t : ITree MirEffect MirOutcome} {Q : MirCallAns → PUnit → Prop}
+    (h : DWP mirNoCallWP t
+      (fun out _ => Q (outcomeToBorrowIsolatedCallAns callerMem out) PUnit.unit) PUnit.unit) :
+    DWP mirClosedWP (closeMirTreeBorrowIsolated callerMem t) Q PUnit.unit := by
+  unfold closeMirTreeBorrowIsolated
+  apply DWP.bind
+  exact DWP.mono (fun _ _ hq => DWP.ret hq)
+    (dwp_interp failUnlinkedCalls failUnlinkedCalls_links_dwp h)
+
+theorem mirBorrowIsolatedClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp
+    {calleeBody : CapturedMir} {calleeCallees : List CapturedMir}
+    {pre : MirCallReq → Prop} {post : MirCallReq → MirReturn → Prop}
+    {panicCond : MirCallReq → Prop} {policy : AbortPolicy MirCallReq}
+    (h : ∀ req, pre req →
+      DWLP mirNoCallWP
+        (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees)
+        (fun out _ => PolicyOutcomeOk policy req (post req) (panicCond req) out)
+        PUnit.unit) :
+    PanicsWithPolicyOnlyIf (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond policy := by
+  intro req hPre
+  exact dwlp_pure_adequacy (ewp := mirClosedWP)
+    (dwlp_interp failUnlinkedCalls failUnlinkedCalls_links_dwlp (h req hPre))
+
+theorem mirBorrowIsolatedClosedCalleeTrees_panicsWithPolicyOnlyIf_of_wpMirNoCallSym
+    {calleeBody : CapturedMir} {calleeCallees : List CapturedMir}
+    {pre : MirCallReq → Prop} {post : MirCallReq → MirReturn → Prop}
+    {panicCond : MirCallReq → Prop} {policy : AbortPolicy MirCallReq}
+    (fuel : Nat)
+    (h : ∀ req, pre req →
+      wpMirNoCallSym fuel calleeBody
+        (enterBorrowIsolatedCalleeState calleeBody req.args req.memory calleeCallees)
+        (PolicyOutcomeOk policy req (post req) (panicCond req))) :
+    PanicsWithPolicyOnlyIf (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      pre post panicCond policy :=
+  mirBorrowIsolatedClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp
+    fun req hPre => dwlp_cofix_of_wpCoalBounded
+      ((wpMirNoCallSym_eq_wpMirNoCallBounded fuel calleeBody _ _) ▸ h req hPre)
+
+theorem holdsOn_linkCalleeBorrowIsolatedHandler_of_panicsWithPolicyOnlyIf
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : PanicsWithPolicyOnlyIf (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrameAndBorrows req.memory r.2))
+      P.panicCond policy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans →
+          (P.toPolicyMirCallContract policy).post req ans) :
+    (P.toPolicyMirCallContract policy).holdsOn
+      (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) := by
+  intro req hPre
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq calleeBody calleeCallees fallback hEq]
+    have hDwlp :
+        DWLP mirClosedWP
+          (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees req)
+          (fun out _ => PolicyOutcomeOk policy req
+            (fun r => P.post req r.1 (restoreCallerMemoryFrameAndBorrows req.memory r.2))
+            (P.panicCond req) out)
+          PUnit.unit :=
+      (panicsWithPolicyOnlyIf_iff_dwlp_mirClosedWP.1 hCallee) req ⟨hPre, hEq⟩
+    have hBound :
+        DWLP mirClosedWP
+          (closeMirTreeBorrowIsolated req.memory
+            (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees))
+          (fun ans _ => (P.toPolicyMirCallContract policy).post req ans)
+          PUnit.unit := by
+      unfold closeMirTreeBorrowIsolated
+      apply DWLP.bind
+      refine DWLP.mono (fun out _ hOk => DWLP.ret ?_) hDwlp
+      cases out with
+      | normal r => exact hOk
+      | panic => exact ⟨hOk, hPanicInv req hPre hEq hOk⟩
+      | abort => exact hOk
+    exact dwlp_pure_adequacy (ewp := mirClosedWP) hBound
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_ne calleeBody calleeCallees fallback hEq]
+    exact hFallback req hPre hEq
+
+theorem holdsTotallyOn_linkCalleeBorrowIsolatedHandler (C : MirCallContract)
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hCallee : ∀ req, C.pre req → req.defPath = calleeBody.defPath →
+      DWP mirNoCallWP
+        (mirBorrowIsolatedCalleeTree calleeBody req.args req.memory calleeCallees)
+        (fun out _ => C.post req (outcomeToBorrowIsolatedCallAns req.memory out))
+        PUnit.unit)
+    (hFallback : ∀ req, C.pre req → req.defPath ≠ calleeBody.defPath →
+      DWP mirClosedWP (fallback req) (fun ans _ => C.post req ans) PUnit.unit) :
+    C.holdsTotallyOn (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) := by
+  intro req hPre
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq calleeBody calleeCallees fallback hEq]
+    exact dwp_closeMirTreeBorrowIsolated (hCallee req hPre hEq)
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_ne calleeBody calleeCallees fallback hEq]
+    exact hFallback req hPre hEq
+
+theorem holdsTotallyOn_linkCalleeBorrowIsolatedHandler_of_wpMirNoCallSym
+    (C : MirCallContract) (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler) (fuel : Nat)
+    (hTarget : ∀ req, C.pre req → req.defPath = calleeBody.defPath)
+    (hCallee : ∀ req, C.pre req →
+      wpMirNoCallSym fuel calleeBody
+        (enterBorrowIsolatedCalleeState calleeBody req.args req.memory calleeCallees)
+        (fun out => C.post req (outcomeToBorrowIsolatedCallAns req.memory out))) :
+    C.holdsTotallyOn (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) :=
+  holdsTotallyOn_linkCalleeBorrowIsolatedHandler C calleeBody calleeCallees fallback
+    (fun req hPre _ =>
+      dwp_cofix_of_wpCoalBounded fuel
+        (show wpMirNoCallBounded fuel calleeBody
+            (enterBorrowIsolatedCalleeState calleeBody req.args req.memory calleeCallees)
+            (fun out => C.post req (outcomeToBorrowIsolatedCallAns req.memory out)) from
+          (wpMirNoCallSym_eq_wpMirNoCallBounded fuel calleeBody _ _) ▸ hCallee req hPre))
+    (fun req hPre hNe => False.elim (hNe (hTarget req hPre)))
+
+theorem holdsTotallyOn_linkCalleeBorrowIsolatedHandler_of_totalExactPolicy
+    (P : PanicMirCallContract) (calleePolicy : AbortPolicy MirCallReq)
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : TotalExactPolicyPanicContract
+      (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrameAndBorrows req.memory r.2))
+      P.panicCond calleePolicy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      DWP mirClosedWP (fallback req)
+        (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans) PUnit.unit) :
+    (P.toExactPolicyMirCallContract calleePolicy).holdsTotallyOn
+      (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) := by
+  intro req hPre
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq calleeBody calleeCallees fallback hEq]
+    unfold closeMirTreeBorrowIsolated
+    apply DWP.bind
+    obtain ⟨tr, out, hRet, hEx⟩ := hCallee.reaches_outcome ⟨hPre, hEq⟩
+    exact dwp_mirClosedWP_of_reachesRet
+      (Q := fun out' =>
+        DWP mirClosedWP (pure (outcomeToBorrowIsolatedCallAns req.memory out'))
+          (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans) PUnit.unit)
+      hRet (by
+        apply DWP.ret
+        cases out with
+        | normal r => exact hEx
+        | panic => exact ⟨hEx, hPanicInv req hPre hEq hEx.1⟩
+        | abort => exact hEx)
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_ne calleeBody calleeCallees fallback hEq]
+    exact hFallback req hPre hEq
+
+/-- Horizontal only-if composition through `linkCalleeBorrowIsolatedHandler`. -/
+theorem panicsWithPolicyOnlyIf_call_compose_borrowIsolated
+    (P : PanicMirCallContract) (calleePolicy : AbortPolicy MirCallReq)
+    (calleeCallees : List CapturedMir)
+    (hCaller : MirModularPanicsWithPolicyOnlyIf callerBody
+      (P.toPolicyMirCallContract calleePolicy).holdsOn pre post panicCond policy callees)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : PanicsWithPolicyOnlyIf
+      (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrameAndBorrows req.memory r.2))
+      P.panicCond calleePolicy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      TreeSafe (fallback req) ∧
+        ∀ tr ans, ReachesRet (fallback req) tr ans →
+          (P.toPolicyMirCallContract calleePolicy).post req ans) :
+    PanicsWithPolicyOnlyIf
+      (mirHandledTrees callerBody
+        (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) callees)
+      pre post panicCond policy :=
+  hCaller (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback)
+    (holdsOn_linkCalleeBorrowIsolatedHandler_of_panicsWithPolicyOnlyIf P calleePolicy calleeBody
+      calleeCallees fallback hPanicInv hCallee hFallback)
+
+/-- Contract-level exact horizontal composition via `linkCalleeBorrowIsolatedHandler`. -/
+theorem totalExactPolicyPanicContract_call_compose_borrowIsolated_of_callee_contract
+    (P : PanicMirCallContract) (calleePolicy : AbortPolicy MirCallReq)
+    (calleeCallees : List CapturedMir)
+    (hCaller : ∀ x, pre x →
+      DWP (mirModularWP (P.toExactPolicyMirCallContract calleePolicy).toCallContract)
+        (mirStatefulTrees callerBody callees x)
+        (fun out _ => ExactPolicyOutcome policy x (post x) (panicCond x) out)
+        PUnit.unit)
+    (hPanicInv : ∀ req, P.pre req → req.defPath = calleeBody.defPath →
+      P.panicCond req → P.panicMemInv req req.memory)
+    (hCallee : TotalExactPolicyPanicContract
+      (mirBorrowIsolatedClosedCalleeTrees calleeBody calleeCallees)
+      (fun req => P.pre req ∧ req.defPath = calleeBody.defPath)
+      (fun req r => P.post req r.1 (restoreCallerMemoryFrameAndBorrows req.memory r.2))
+      P.panicCond calleePolicy)
+    (hFallback : ∀ req, P.pre req → req.defPath ≠ calleeBody.defPath →
+      DWP mirClosedWP (fallback req)
+        (fun ans _ => (P.toExactPolicyMirCallContract calleePolicy).post req ans)
+        PUnit.unit) :
+    TotalExactPolicyPanicContract
+      (mirHandledTrees callerBody
+        (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) callees)
+      pre post panicCond policy :=
+  mirHandled_totalExactPolicyPanicContract_of_dwp
+    (P.toExactPolicyMirCallContract calleePolicy)
+    (holdsTotallyOn_linkCalleeBorrowIsolatedHandler_of_totalExactPolicy P calleePolicy calleeBody
+      calleeCallees fallback hPanicInv hCallee hFallback)
+    hCaller
+
 end Compose
 
 /-! ### Refuting linked contracts -/
@@ -5721,6 +6080,28 @@ theorem handlerPreservesTables_linkCalleeWithCalleesHandler
     exact hFallback req tr ans hRet
 
 /--
+`linkCalleeBorrowIsolatedHandler` preserves `callees` and `traitImpls` whenever
+`fallback` does, regardless of what the linked callee body executes.
+-/
+theorem handlerPreservesTables_linkCalleeBorrowIsolatedHandler
+    (calleeBody : CapturedMir) (calleeCallees : List CapturedMir)
+    (fallback : ExternalCallHandler)
+    (hFallback : HandlerPreservesTables fallback) :
+    HandlerPreservesTables
+      (linkCalleeBorrowIsolatedHandler calleeBody calleeCallees fallback) := by
+  intro req tr ans hRet
+  by_cases hEq : req.defPath = calleeBody.defPath
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq calleeBody calleeCallees fallback hEq] at hRet
+    obtain ⟨out, hAnsEq⟩ := closeMirTreeBorrowIsolated_reachesRet_eq hRet
+    subst hAnsEq
+    cases out with
+    | normal _ => exact ⟨rfl, rfl⟩
+    | panic => exact ⟨rfl, rfl⟩
+    | abort => exact trivial
+  · rw [linkCalleeBorrowIsolatedHandler_of_defPath_ne calleeBody calleeCallees fallback hEq] at hRet
+    exact hFallback req tr ans hRet
+
+/--
 Multi-step execution reachability of `body` under external-call handler `h`,
 stepping through arbitrary silent steps (statements, expressions, intrinsics,
 internal helper calls, unwinds), visible observations, and external calls
@@ -6002,6 +6383,161 @@ theorem ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved
     CalleeTableExcludes s₂.memory targetDefPath :=
   hExcl.of_tablesPreserved
     (hReach.preserves_tables (handlerPreservesTablesOn_of_withTraitsPreserved P policy hHolds))
+
+/-! #### Automatic discharge of `ReachableExecStateOn` from a modular `DWLP` proof -/
+
+private theorem dwlp_cofix_step_tau {C : CallContract MirCallReq (fun _ => MirCallAns)}
+    {body : CapturedMir} {st st₁ : MirExecState} {Q : MirOutcome → PUnit → Prop}
+    (hStep : stepMirState body st = .tau st₁)
+    (hDwlp : DWLP (mirModularWP C) (ITree.cofix (stepMirState body) st) Q PUnit.unit) :
+    DWLP (mirModularWP C) (ITree.cofix (stepMirState body) st₁) Q PUnit.unit := by
+  have hEq : ITree.cofix (stepMirState body) st = .tau (ITree.cofix (stepMirState body) st₁) := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, hStep, ITree.observe_tau]
+    rfl
+  rw [hEq] at hDwlp
+  exact (DWLP.tau_iff _ _ _ _).1 hDwlp
+
+private theorem dwlp_cofix_step_obs {C : CallContract MirCallReq (fun _ => MirCallAns)}
+    {body : CapturedMir} {st : MirExecState} {ev : ObsReq MirObs}
+    {k : PUnit → MirExecState} {Q : MirOutcome → PUnit → Prop}
+    (hStep : stepMirState body st = .vis (.inr (.inl ev)) k)
+    (hDwlp : DWLP (mirModularWP C) (ITree.cofix (stepMirState body) st) Q PUnit.unit) :
+    DWLP (mirModularWP C) (ITree.cofix (stepMirState body) (k PUnit.unit)) Q PUnit.unit := by
+  have hEq :
+      ITree.cofix (stepMirState body) st =
+        .vis (E := MirEffect) (.inr (.inl ev)) (fun o => ITree.cofix (stepMirState body) (k o)) := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, hStep]
+    exact (ITree.observe_vis (E := MirEffect) (.inr (.inl ev)) _).symm
+  rw [hEq] at hDwlp
+  exact (DWLP.vis_iff _ _ _ _ _).1 hDwlp
+
+private theorem dwlp_cofix_step_call {C : CallContract MirCallReq (fun _ => MirCallAns)}
+    {body : CapturedMir} {st : MirExecState} {req : MirCallReq}
+    {k : MirCallAns → MirExecState} {Q : MirOutcome → PUnit → Prop}
+    (hStep : stepMirState body st = MirStepNode.extCall req k)
+    (hDwlp : DWLP (mirModularWP C) (ITree.cofix (stepMirState body) st) Q PUnit.unit) :
+    C.pre req ∧
+      ∀ ans, C.post req ans →
+        DWLP (mirModularWP C) (ITree.cofix (stepMirState body) (k ans)) Q PUnit.unit := by
+  have hEq :
+      ITree.cofix (stepMirState body) st =
+        .vis (E := MirEffect) (.inr (.inr (.call req)))
+          (fun ans => ITree.cofix (stepMirState body) (k ans)) := by
+    apply ITree.eq_of_observe_eq
+    rw [ITree.observe_cofix, hStep]
+    dsimp only [MirStepNode.extCall, ITreeF.map]
+    exact (ITree.observe_vis (E := MirEffect) (.inr (.inr (.call req))) _).symm
+  rw [hEq] at hDwlp
+  exact (DWLP.vis_iff _ _ _ _ _).1 hDwlp
+
+/--
+Every unconstrained multi-step execution `ReachableExecState` of a modularly
+verified caller (`DWLP (mirModularWP C.toCallContract)`) against a handler
+implementing `C` automatically satisfies the relativized reachability
+`ReachableExecStateOn body h C.pre`, and preserves the modular `DWLP` invariant
+at every reached state.
+-/
+theorem ReachableExecState.toReachableExecStateOn_of_dwlp
+    {C : MirCallContract} {body : CapturedMir} {h : ExternalCallHandler}
+    {st₁ st₂ : MirExecState} {Q : MirOutcome → PUnit → Prop}
+    (hHolds : C.holdsOn h)
+    (hDwlp : DWLP (mirModularWP C.toCallContract)
+      (ITree.cofix (stepMirState body) st₁) Q PUnit.unit)
+    (hReach : ReachableExecState body h st₁ st₂) :
+    ReachableExecStateOn body h C.pre st₁ st₂ ∧
+      DWLP (mirModularWP C.toCallContract)
+        (ITree.cofix (stepMirState body) st₂) Q PUnit.unit := by
+  induction hReach with
+  | refl st => exact ⟨.refl st, hDwlp⟩
+  | tau hStep _ ih =>
+    obtain ⟨hOn, hEnd⟩ := ih (dwlp_cofix_step_tau hStep hDwlp)
+    exact ⟨.tau hStep hOn, hEnd⟩
+  | obs hStep _ ih =>
+    obtain ⟨hOn, hEnd⟩ := ih (dwlp_cofix_step_obs hStep hDwlp)
+    exact ⟨.obs hStep hOn, hEnd⟩
+  | @call st st₂ req k tr ans hStep hAns _ ih =>
+    obtain ⟨hPre, hCont⟩ := dwlp_cofix_step_call hStep hDwlp
+    have hPost : C.post req ans := (hHolds req hPre).2 tr ans hAns
+    obtain ⟨hOn, hEnd⟩ := ih (hCont ans hPost)
+    exact ⟨.call hStep hPre hAns hOn, hEnd⟩
+
+/--
+Automatic unconstrained multi-step table invariance from a modular `DWLP` proof
+against a `withTraitsPreserved` contract: no manual `ReachableExecStateOn`
+hypothesis and no universal `∀ req, P.pre req` assumption are needed.
+-/
+theorem ReachableExecState.preserves_tables_of_dwlp_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {Q : MirOutcome → PUnit → Prop}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+      (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂)) :
+    TablesPreserved s₁.memory s₂.memory :=
+  (hReach.toReachableExecStateOn_of_dwlp hHolds hDwlp).1.preserves_tables
+    (handlerPreservesTablesOn_of_withTraitsPreserved P policy hHolds)
+
+/--
+Automatic unconstrained runtime call-boundary guard from a modular `DWLP` proof
+against a `withTraitsPreserved` contract: every reachable running state of the
+linked execution retains `CalleeTableExcludes`.
+-/
+theorem ReachableExecState.calleeTableExcludes_of_dwlp_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {targetDefPath : DefPath} {Q : MirOutcome → PUnit → Prop}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+      (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
+    CalleeTableExcludes s₂.memory targetDefPath :=
+  hExcl.of_tablesPreserved
+    (hReach.preserves_tables_of_dwlp_withTraitsPreserved P policy hHolds hDwlp)
+
+/-- Automatic multi-target runtime guard from a modular `DWLP` proof. -/
+theorem ReachableExecState.runtimeCallBoundaryGuarded_of_dwlp_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {targets : List DefPath} {Q : MirOutcome → PUnit → Prop}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+      (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hGuard : RuntimeCallBoundaryGuarded s₁.memory targets) :
+    RuntimeCallBoundaryGuarded s₂.memory targets :=
+  fun target hMem =>
+    hReach.calleeTableExcludes_of_dwlp_withTraitsPreserved P policy hHolds hDwlp
+      (hGuard target hMem)
+
+/-- Automatic unconstrained runtime guard from a modular `DWP` proof. -/
+theorem ReachableExecState.calleeTableExcludes_of_dwp_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {targetDefPath : DefPath} {Q : MirOutcome → PUnit → Prop}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hDwp : DWP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+      (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
+    CalleeTableExcludes s₂.memory targetDefPath :=
+  hReach.calleeTableExcludes_of_dwlp_withTraitsPreserved P policy hHolds hDwp.toDWLP hExcl
+
+/-- Automatic unconstrained runtime guard directly from `wpMirModularSym`. -/
+theorem ReachableExecState.calleeTableExcludes_of_wpMirModularSym_withTraitsPreserved
+    (P : PanicMirCallContract) (policy : AbortPolicy MirCallReq)
+    {fuel : Nat} {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
+    {targetDefPath : DefPath} {Q : MirOutcome → Prop}
+    (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
+    (hWp : wpMirModularSym (P.withTraitsPreserved.toPolicyMirCallContract policy) fuel body s₁ Q)
+    (hReach : ReachableExecState body h (.running s₁) (.running s₂))
+    (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
+    CalleeTableExcludes s₂.memory targetDefPath :=
+  hReach.calleeTableExcludes_of_dwp_withTraitsPreserved P policy hHolds
+    (dwp_of_wpMirModularSym hWp) hExcl
 
 end StepTablesPreservation
 
@@ -7679,6 +8215,257 @@ theorem not_reachableCallSitesPreserved_of_count_ne {callerBody : CapturedMir}
     (hNe : bodyReachableCallSiteCount targetDefPath callerBody ≠ expectedSites) :
     ¬ ReachableCallSitesPreserved callerBody callees targetDefPath expectedSites :=
   fun h => hNe h.reachableSiteCount
+
+/--
+CFG-reachable capture-level call-boundary guard for transitive helpers in
+`callees`: every expected helper path must be present in `callees`, every
+linked helper matching `expectedCallers` must retain at least one direct call
+to `targetDefPath` in a block reachable from its `bb0` (defeating unreachable
+dead-block decoy calls inside transitive helpers), and `targetDefPath` must be
+excluded from `callees` and `traitImpls`.
+-/
+structure ReachableCalleesCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallers : List DefPath)
+    (targetDefPath : DefPath) : Prop where
+  /-- Every expected helper path is present in `callees`. -/
+  expectedPresent :
+    ∀ callerPath, callerPath ∈ expectedCallers → ∃ body, body ∈ callees ∧ body.defPath = callerPath
+  /-- Every linked helper matching `expectedCallers` has a CFG-reachable direct call. -/
+  callersReachablyCallTarget :
+    ∀ body, body ∈ callees → body.defPath ∈ expectedCallers →
+      BodyReachableCallsDefPath targetDefPath body
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation on `callerBody` or `callees` dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `ReachableCalleesCallBoundaryPreserved`. -/
+def reachableCalleesCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallers : List DefPath)
+    (targetDefPath : DefPath) : Bool :=
+  expectedCallers.all (fun callerPath =>
+      callees.any (fun body => stringEq body.defPath callerPath)) &&
+    (callees.all (fun body =>
+        !(expectedCallers.any (fun p => stringEq body.defPath p)) ||
+          bodyReachableCallsDefPath targetDefPath body) &&
+      ((findCallee? callees targetDefPath).isNone &&
+        !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+          targetDefPath))
+
+/-- The checker decides `ReachableCalleesCallBoundaryPreserved`. -/
+theorem reachableCalleesCallBoundaryPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallers : List DefPath)
+    (targetDefPath : DefPath) :
+    reachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath = true ↔
+      ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath := by
+  unfold reachableCalleesCallBoundaryPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none,
+    List.all_eq_true, List.any_eq_true]
+  constructor
+  · rintro ⟨hPres, hCall, hNotLinked, hNoTrait⟩
+    refine ⟨?_, ?_, hNotLinked, hNoTrait⟩
+    · intro cp hcp
+      obtain ⟨body, hMem, hEq⟩ := hPres cp hcp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).1 hEq⟩
+    · intro body hBodyMem hInExp
+      have hOr := hCall body hBodyMem
+      rw [Bool.or_eq_true] at hOr
+      rcases hOr with hNot | hCalls
+      · have hAny : expectedCallers.any (fun p => stringEq body.defPath p) = true :=
+          List.any_eq_true.2 ⟨body.defPath, hInExp, (stringEq_eq_true_iff _ _).2 rfl⟩
+        rw [hAny] at hNot
+        nomatch hNot
+      · exact (bodyReachableCallsDefPath_iff _ _).1 hCalls
+  · intro h
+    refine ⟨?_, ?_, h.notLinked, h.noTraitImpl⟩
+    · intro cp hcp
+      obtain ⟨body, hMem, hEq⟩ := h.expectedPresent cp hcp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).2 hEq⟩
+    · intro body hBodyMem
+      rw [Bool.or_eq_true]
+      cases hAny : expectedCallers.any (fun p => stringEq body.defPath p) with
+      | false => exact Or.inl rfl
+      | true =>
+        obtain ⟨p, hp, hEq⟩ := List.any_eq_true.1 hAny
+        have hPath : body.defPath = p := (stringEq_eq_true_iff _ _).1 hEq
+        exact Or.inr ((bodyReachableCallsDefPath_iff _ _).2
+          (h.callersReachablyCallTarget body hBodyMem (hPath ▸ hp)))
+
+theorem ReachableCalleesCallBoundaryPreserved.toCalleesCallBoundaryPreserved
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallers : List DefPath} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath) :
+    CalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath :=
+  ⟨h.expectedPresent,
+   fun body hMem hIn => (h.callersReachablyCallTarget body hMem hIn).toBodyCallsDefPath,
+   h.notLinked, h.noTraitImpl⟩
+
+theorem ReachableCalleesCallBoundaryPreserved.calleeTableExcludes_init
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallers : List DefPath} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath :=
+  h.toCalleesCallBoundaryPreserved.calleeTableExcludes_init args
+
+theorem ReachableCalleesCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallers : List DefPath} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath :=
+  h.toCalleesCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil hNe args mem
+
+theorem not_reachableCalleesCallBoundaryPreserved_of_missing_caller
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallers : List DefPath} {targetDefPath : DefPath} {callerPath : DefPath}
+    (hExp : callerPath ∈ expectedCallers)
+    (hMissing : ∀ body, body ∈ callees → body.defPath ≠ callerPath) :
+    ¬ ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath :=
+  fun h =>
+    let ⟨body, hMem, hEq⟩ := h.expectedPresent callerPath hExp
+    hMissing body hMem hEq
+
+theorem not_reachableCalleesCallBoundaryPreserved_of_zero_reachable_sites
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallers : List DefPath} {targetDefPath : DefPath} {body : CapturedMir}
+    (hBodyMem : body ∈ callees) (hExp : body.defPath ∈ expectedCallers)
+    (hZero : bodyReachableCallSiteCount targetDefPath body = 0) :
+    ¬ ReachableCalleesCallBoundaryPreserved callerBody callees expectedCallers targetDefPath := by
+  intro h
+  have hPos := (bodyReachableCallsDefPath_iff_count_pos targetDefPath body).1
+    ((bodyReachableCallsDefPath_iff targetDefPath body).2
+      (h.callersReachablyCallTarget body hBodyMem hExp))
+  rw [hZero] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+/--
+Counted CFG-reachable capture-level call-boundary guard for transitive helpers
+in `callees`: pins the exact count of `bb0`-reachable direct call sites for
+every `(callerPath, count)` pair in `expectedCallerCounts`, defeating both
+partial inlining and unreachable dead-block call decoys inside linked helpers.
+-/
+structure ReachableCalleesCallSitesPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) : Prop where
+  /-- Every `(callerPath, _)` expected helper is present in `callees`. -/
+  expectedPresent :
+    ∀ p, p ∈ expectedCallerCounts → ∃ body, body ∈ callees ∧ body.defPath = p.1
+  /-- Every linked helper matching an expected `(callerPath, count)` has exact reachable count. -/
+  callerReachableSiteCounts :
+    ∀ body p, body ∈ callees → p ∈ expectedCallerCounts → body.defPath = p.1 →
+      bodyReachableCallSiteCount targetDefPath body = p.2
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation on `callerBody` or `callees` dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Checker for `ReachableCalleesCallSitesPreserved`. -/
+def reachableCalleesCallSitesPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) : Bool :=
+  expectedCallerCounts.all (fun p =>
+      callees.any (fun body => stringEq body.defPath p.1)) &&
+    (callees.all (fun body =>
+        expectedCallerCounts.all (fun p =>
+          !stringEq body.defPath p.1 ||
+            Nat.beq (bodyReachableCallSiteCount targetDefPath body) p.2)) &&
+      ((findCallee? callees targetDefPath).isNone &&
+        !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+          targetDefPath))
+
+/-- The checker decides `ReachableCalleesCallSitesPreserved`. -/
+theorem reachableCalleesCallSitesPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
+    (targetDefPath : DefPath) :
+    reachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath = true ↔
+      ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath := by
+  unfold reachableCalleesCallSitesPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none,
+    List.all_eq_true, List.any_eq_true]
+  constructor
+  · rintro ⟨hPres, hCounts, hNotLinked, hNoTrait⟩
+    refine ⟨?_, ?_, hNotLinked, hNoTrait⟩
+    · intro p hp
+      obtain ⟨body, hMem, hEq⟩ := hPres p hp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).1 hEq⟩
+    · intro body p hBodyMem hp hEq
+      have hOr := hCounts body hBodyMem p hp
+      rw [Bool.or_eq_true] at hOr
+      rcases hOr with hNot | hBeq
+      · have hStr : stringEq body.defPath p.1 = true := (stringEq_eq_true_iff _ _).2 hEq
+        rw [hStr] at hNot
+        nomatch hNot
+      · exact Nat.eq_of_beq_eq_true hBeq
+  · intro h
+    refine ⟨?_, ?_, h.notLinked, h.noTraitImpl⟩
+    · intro p hp
+      obtain ⟨body, hMem, hEq⟩ := h.expectedPresent p hp
+      exact ⟨body, hMem, (stringEq_eq_true_iff _ _).2 hEq⟩
+    · intro body hBodyMem p hp
+      rw [Bool.or_eq_true]
+      cases hStr : stringEq body.defPath p.1 with
+      | false => exact Or.inl rfl
+      | true =>
+        have hEq := (stringEq_eq_true_iff _ _).1 hStr
+        exact Or.inr (h.callerReachableSiteCounts body p hBodyMem hp hEq ▸ Nat.beq_refl _)
+
+theorem ReachableCalleesCallSitesPreserved.toReachableCalleesCallBoundaryPreserved
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallerCounts : List (DefPath × Nat)} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (hPos : ∀ p, p ∈ expectedCallerCounts → 0 < p.2) :
+    ReachableCalleesCallBoundaryPreserved callerBody callees
+      (expectedCallerCounts.map Prod.fst) targetDefPath := by
+  refine ⟨?_, ?_, h.notLinked, h.noTraitImpl⟩
+  · intro callerPath hMem
+    obtain ⟨p, hp, rfl⟩ := List.mem_map.1 hMem
+    exact h.expectedPresent p hp
+  · intro body hBodyMem hCaller
+    obtain ⟨p, hp, hEq⟩ := List.mem_map.1 hCaller
+    have hCount := h.callerReachableSiteCounts body p hBodyMem hp hEq.symm
+    exact (bodyReachableCallsDefPath_iff _ _).1
+      ((bodyReachableCallsDefPath_iff_count_pos _ _).2 (hCount ▸ hPos p hp))
+
+theorem ReachableCalleesCallSitesPreserved.calleeTableExcludes_init
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallerCounts : List (DefPath × Nat)} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem ReachableCalleesCallSitesPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallerCounts : List (DefPath × Nat)} {targetDefPath : DefPath}
+    (h : ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem not_reachableCalleesCallSitesPreserved_of_count_ne
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {expectedCallerCounts : List (DefPath × Nat)} {targetDefPath : DefPath}
+    {body : CapturedMir} {p : DefPath × Nat}
+    (hBodyMem : body ∈ callees) (hp : p ∈ expectedCallerCounts) (hPath : body.defPath = p.1)
+    (hNe : bodyReachableCallSiteCount targetDefPath body ≠ p.2) :
+    ¬ ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath :=
+  fun h => hNe (h.callerReachableSiteCounts body p hBodyMem hp hPath)
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 

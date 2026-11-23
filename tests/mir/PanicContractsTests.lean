@@ -1348,6 +1348,42 @@ theorem twoCall_frameOnly_not_modular (post : MirInput → MirReturn → Prop)
     injectingHandler_holdsOn_withFramePreserved rfl
     (.call rfl (reachesRet_pure_handler _) (.of_reachesFaultExecBounded _ 8 rfl))
 
+private theorem twoCall_traitsPreserved_wp :
+    wpMirModularSym twoCallContract.withTraitsPreserved.toMirCallContract 8
+      twoCallCallerMir twoCallInit
+      (fun out => ∃ r, out = .normal r ∧ r.1 = .scalar { bits := 0, sizeBytes := 1 }) := by
+  (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+  refine ⟨Or.inl rfl, fun ans hPost => ?_⟩
+  cases ans with
+  | returned retVal memAfter =>
+    obtain ⟨hVal, ⟨hC, hCS, hAC, hAP, -⟩, hT⟩ := hPost
+    subst hVal
+    cases memAfter with
+    | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+        activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+      simp only at hC hCS hAC hAP hT
+      subst hC hCS hAC hAP hT
+      cases borrows <;> (
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        refine ⟨Or.inr rfl, fun ans2 hPost2 => ?_⟩
+        cases ans2 with
+        | returned retVal2 memAfter2 =>
+          obtain ⟨hVal2, ⟨hC2, hCS2, hAC2, hAP2, -⟩, hT2⟩ := hPost2
+          subst hVal2
+          cases memAfter2 with
+          | mk nextAllocId2 globals2 borrows2 nextTag2 callees2 traitImpls2 callStack2
+              activeCallee2 activeProtectors2 nextProtector2 callerLocals2 fnPtrs2
+              exposedAllocIds2 =>
+            simp only at hC2 hCS2 hAC2 hAP2 hT2
+            subst hC2 hCS2 hAC2 hAP2 hT2
+            cases borrows2 <;> (
+              (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+              exact ⟨_, rfl, rfl⟩)
+        | panicked memAfter2 => exact False.elim hPost2.1
+        | aborted => exact False.elim hPost2)
+  | panicked memAfter => exact False.elim hPost.1
+  | aborted => exact False.elim hPost
+
 /--
 End-to-end verification with trait preservation: against every handler that
 implements the contract strengthened with `withTraitsPreserved`, the two-call
@@ -1362,37 +1398,7 @@ theorem twoCall_traitsPreserved_modular_neverPanics :
       (fun _ r => r.1 = .scalar { bits := 0, sizeBytes := 1 }) :=
   mirModularNeverPanics_of_wpMirModularSym _ 8 (by
     rintro _ rfl
-    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-    refine ⟨Or.inl rfl, fun ans hPost => ?_⟩
-    cases ans with
-    | returned retVal memAfter =>
-      obtain ⟨hVal, ⟨hC, hCS, hAC, hAP, -⟩, hT⟩ := hPost
-      subst hVal
-      cases memAfter with
-      | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
-          activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
-        simp only at hC hCS hAC hAP hT
-        subst hC hCS hAC hAP hT
-        cases borrows <;> (
-          (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-          refine ⟨Or.inr rfl, fun ans2 hPost2 => ?_⟩
-          cases ans2 with
-          | returned retVal2 memAfter2 =>
-            obtain ⟨hVal2, ⟨hC2, hCS2, hAC2, hAP2, -⟩, hT2⟩ := hPost2
-            subst hVal2
-            cases memAfter2 with
-            | mk nextAllocId2 globals2 borrows2 nextTag2 callees2 traitImpls2 callStack2
-                activeCallee2 activeProtectors2 nextProtector2 callerLocals2 fnPtrs2
-                exposedAllocIds2 =>
-              simp only at hC2 hCS2 hAC2 hAP2 hT2
-              subst hC2 hCS2 hAC2 hAP2 hT2
-              cases borrows2 <;> (
-                (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
-                exact ⟨_, rfl, rfl⟩)
-          | panicked memAfter2 => exact False.elim hPost2.1
-          | aborted => exact False.elim hPost2)
-    | panicked memAfter => exact False.elim hPost.1
-    | aborted => exact False.elim hPost)
+    exact twoCall_traitsPreserved_wp)
 
 /--
 `handlerPreservesTables_of_withTraitsPreserved` asks the contract's
@@ -1417,6 +1423,21 @@ theorem twoCall_reachableOn_guard (h : ExternalCallHandler)
     CalleeTableExcludes s'.memory contractedPath :=
   ReachableExecStateOn.calleeTableExcludes_of_withTraitsPreserved twoCallContract .forbidAbort
     hHolds hReach linkedMem_calleeTableExcludes
+
+/--
+Automatic unconstrained runtime guard from the modular proof: no manual
+`ReachableExecStateOn` assumption and no universal `∀ req, P.pre req` condition
+are needed. Every running state `s'` reachable under **any** handler
+implementing `twoCallContract.withTraitsPreserved` preserves `CalleeTableExcludes`.
+-/
+theorem twoCall_reachable_guard_of_modular_proof (h : ExternalCallHandler)
+    (hHolds : twoCallContract.withTraitsPreserved.toMirCallContract.holdsOn h)
+    (s' : MachineState)
+    (hReach : ReachableExecState twoCallCallerMir h (.running twoCallInit) (.running s')) :
+    CalleeTableExcludes s'.memory contractedPath :=
+  hReach.calleeTableExcludes_of_wpMirModularSym_withTraitsPreserved
+    twoCallContract .forbidAbort hHolds twoCall_traitsPreserved_wp
+    linkedMem_calleeTableExcludes
 
 /-! ### `AbortPolicy` separation -/
 
@@ -3612,6 +3633,89 @@ theorem multiStepCaller_concrete_handler_guard (a b : Nat) (s' : MachineState)
     (handlerPreservesTables_linkCalleeWithCalleesHandler _ _ _
       handlerPreservesTables_failAllCalls)).1 a b s' hReach
 
+/-- Concrete helper body for `helperPath` returning `1u8`. -/
+def helperReturnOneMir : CapturedMir :=
+  mkBody helperPath 0
+    [ mkDecl .mut u8Ty ]
+    [ { statements := [ mkStmt (.assign (local_ 0) (.use (u8Const 1))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+/--
+Non-vacuous concrete multi-step handler guard: unlike `failAllCalls` alone
+(which faults at `bb1` on `helperPath` and never reaches `bb2`/`bb3`), chaining
+`helperReturnOneMir` into `linkCalleeWithCalleesHandler` actually answers
+`helperPath` with `1`, preserves `CalleeTableExcludes` across **all** reachable
+states, **and** concretely reaches `bb3` where the call to `contractedPath`
+emits an external `MirCallE` request.
+-/
+theorem multiStepCaller_concrete_chained_handler_guard_reaches_bb3 :
+    let hConcrete : ExternalCallHandler :=
+      linkCalleeWithCalleesHandler helperReturnOneMir []
+        (linkCalleeWithCalleesHandler checkedAddU8Mir [] failAllCalls)
+    (∀ a b s',
+      ReachableExecState multiStepCallerMir hConcrete
+        (.running (initMachineStateWithMemory multiStepCallerMir (scalarArgs2 1 a b) linkedMem))
+        (.running s') →
+      CalleeTableExcludes s'.memory contractedPath) ∧
+    (∃ s3,
+      ReachableExecState multiStepCallerMir hConcrete
+        (.running (initMachineStateWithMemory multiStepCallerMir (scalarArgs2 1 1 2) linkedMem))
+        (.running s3) ∧
+      CalleeTableExcludes s3.memory contractedPath ∧
+      stepMirState multiStepCallerMir (.running s3) =
+        MirStepNode.extCall
+          { defPath := contractedPath, typeArgs := [.uint .u8], args := [],
+            memory := s3.memory }
+          (resumeExternalCall s3 s3.frame.locals (local_ 0) 4 .continue_)) := by
+  intro hConcrete
+  have hH : HandlerPreservesTables hConcrete :=
+    handlerPreservesTables_linkCalleeWithCalleesHandler _ _ _
+      (handlerPreservesTables_linkCalleeWithCalleesHandler _ _ _
+        handlerPreservesTables_failAllCalls)
+  have hMain := multiStepCaller_reachable_preserves_calleeTableExcludes hConcrete hH
+  have hAns :
+      ∃ tr, ReachesRet
+        (hConcrete { defPath := helperPath, typeArgs := [], args := [], memory := linkedMem })
+        tr (.returned (.scalar { bits := 1, sizeBytes := 1 }) linkedMem) := by
+    have hEq := linkCalleeWithCalleesHandler_of_defPath_eq helperReturnOneMir []
+      (linkCalleeWithCalleesHandler checkedAddU8Mir [] failAllCalls)
+      (req := { defPath := helperPath, typeArgs := [], args := [], memory := linkedMem }) rfl
+    change ∃ tr, ReachesRet
+      (linkCalleeWithCalleesHandler helperReturnOneMir []
+        (linkCalleeWithCalleesHandler checkedAddU8Mir [] failAllCalls)
+        { defPath := helperPath, typeArgs := [], args := [], memory := linkedMem })
+      tr _
+    rw [hEq]
+    have hDwp :
+        DWP mirClosedWP
+          (closeMirTreeRestoringFrame linkedMem
+            (mirExternalCalleeTree helperReturnOneMir [] linkedMem []))
+          (fun ans _ => ans = .returned (.scalar { bits := 1, sizeBytes := 1 }) linkedMem)
+          PUnit.unit := by
+      unfold closeMirTreeRestoringFrame
+      apply DWP.bind
+      refine DWP.mono (fun _ _ hEqAns => DWP.ret hEqAns)
+        (dwp_interp (ewp₁ := mirNoCallWP) failUnlinkedCalls
+          (fun i Q u hwp => by
+            cases i with
+            | inl _ => exact False.elim hwp
+            | inr i' =>
+              cases i' with
+              | inl obs => cases obs; exact DWP.vis (DWP.ret hwp)
+              | inr _ => exact False.elim hwp)
+          (dwp_cofix_of_wpCoalBounded 4 ?_))
+      change wpMirNoCallBounded 4 helperReturnOneMir _ _
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      conv => whnf
+      rfl
+    obtain ⟨tr, ans, hRet, hEqAns⟩ :=
+      exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hDwp
+    subst hEqAns
+    exact ⟨tr, hRet⟩
+  obtain ⟨tr, hRet⟩ := hAns
+  exact ⟨hMain.1, hMain.2 tr hRet⟩
+
 /-! ### Non-empty disjoint borrows & Lowering Boundary Gap #8 (depth-0 borrow collision) -/
 
 /--
@@ -3981,6 +4085,415 @@ theorem linkCallee_depth0_borrow_collision_divergence (fallback : ExternalCallHa
    borrowCaller_linked_handler_ub fallback _ _ _,
    borrowCaller_linked_withCallees_ub fallback _ _ _⟩
 
+/-! ### `linkCalleeBorrowIsolatedHandler` (resolving Gaps #8 & #9) & Gap #10 (caller-stack reference aliasing) -/
+
+/--
+Unrestricted panic call contract for `checked_add_u8` under borrow-isolated
+linking: no `borrows = .nil` or borrow-disjointness precondition is needed at all.
+-/
+def checkedAddU8BorrowIsolatedContract : PanicMirCallContract where
+  pre req := req.defPath = checkedAddU8Path ∧ scalarPre2 1 req.args
+  post req retVal memAfter :=
+    retVal = .scalar { bits := argSum req.args, sizeBytes := 1 } ∧
+      ¬ overflows 1 req.args ∧ memAfter = req.memory
+  panicCond req := overflows 1 req.args
+  panicMemInv req memAfter := memAfter = req.memory
+
+def checkedAddU8BorrowIsolatedMirContract : MirCallContract :=
+  checkedAddU8BorrowIsolatedContract.withTraitsPreserved.toMirCallContract
+
+/--
+Under `enterBorrowIsolatedCalleeState`, `checked_add_u8` meets its full
+frame-and-borrow-preserving contract symbolically for **completely arbitrary**
+caller `mem : Memory` (arbitrary `borrows`, `callees`, `traitImpls`, `callStack`,
+`activeCallee`, `activeProtectors`).
+-/
+theorem checkedAddU8_borrowIsolated_callee_wp (typeArgs : List RigidTy) (a b : Nat) (mem : Memory) :
+    wpMirNoCallSym 8 checkedAddU8Mir
+      (enterBorrowIsolatedCalleeState checkedAddU8Mir (scalarArgs2 1 a b) mem [])
+      (fun out =>
+        checkedAddU8BorrowIsolatedMirContract.post
+          { defPath := checkedAddU8Path, typeArgs := typeArgs, args := scalarArgs2 1 a b,
+            memory := mem }
+          (outcomeToBorrowIsolatedCallAns mem out)) := by
+  cases mem with
+  | mk nextAllocId globals borrows nextTag callees traitImpls callStack activeCallee
+      activeProtectors nextProtector callerLocals fnPtrs exposedAllocIds =>
+    (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+    · rename_i heq
+      exact ⟨(nat_ble_eq_true_iff _ _).1 heq, rfl, ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+    · rename_i heq
+      have hlt : a + b < 256 := (nat_ble_eq_false_iff _ _).1 heq
+      exact ⟨⟨congrArg (fun n => Value.scalar { bits := n, sizeBytes := 1 })
+          (wrapScalarBits_of_lt hlt), Nat.not_le.2 hlt, rfl⟩,
+        ⟨rfl, rfl, rfl, rfl, [], rfl⟩, rfl⟩
+
+/-- `linkCalleeBorrowIsolatedHandler` implements `checkedAddU8BorrowIsolatedMirContract` totally. -/
+theorem checkedAddU8_borrowIsolated_holdsTotallyOn (fallback : ExternalCallHandler) :
+    checkedAddU8BorrowIsolatedMirContract.holdsTotallyOn
+      (linkCalleeBorrowIsolatedHandler checkedAddU8Mir [] fallback) :=
+  holdsTotallyOn_linkCalleeBorrowIsolatedHandler_of_wpMirNoCallSym
+    checkedAddU8BorrowIsolatedMirContract checkedAddU8Mir [] fallback 8 (fun _ h => h.1) (by
+      rintro ⟨_, typeArgs, _, mem⟩ ⟨rfl, a, b, -, -, rfl⟩
+      exact checkedAddU8_borrowIsolated_callee_wp typeArgs a b mem)
+
+/--
+Gap #8 resolved for value-passing callees: `borrowCallerMir` (which faults `.ub`
+under both `linkCalleeHandler` and `linkCalleeWithCalleesHandler`) satisfies
+`TotalExactPanicContract` and `NeverPanics` and returns `5` under
+`linkCalleeBorrowIsolatedHandler`.
+-/
+theorem borrowCaller_borrowIsolated_neverPanics_and_totalExact (fallback : ExternalCallHandler) :
+    TotalExactPanicContract
+        (mirHandledTrees borrowCallerMir
+          (linkCalleeBorrowIsolatedHandler checkedAddU8Mir [] fallback))
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 })
+        (fun _ => False) ∧
+      NeverPanics
+        (mirHandledTrees borrowCallerMir
+          (linkCalleeBorrowIsolatedHandler checkedAddU8Mir [] fallback))
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 }) := by
+  have hTot :
+      TotalExactPanicContract
+        (mirHandledTrees borrowCallerMir
+          (linkCalleeBorrowIsolatedHandler checkedAddU8Mir [] fallback))
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 })
+        (fun _ => False) :=
+    mirHandled_totalExactPanicContract_of_wpMirModularSym checkedAddU8BorrowIsolatedMirContract
+      (checkedAddU8_borrowIsolated_holdsTotallyOn fallback) 8 (by
+        rintro _ rfl
+        let b0 : BorrowEntry :=
+          { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+            targetFrameDepth := 0 }
+        let memCall : Memory := { emptyMemory with borrows := [b0], nextTag := 2 }
+        let lCall : List LocalSlot :=
+          [ .uninit, .init (.scalar { bits := 5, sizeBytes := 1 })
+          , .init (.ptr { allocId := 1, offsetBytes := 0 } 8), .uninit ]
+        let sCall : MachineState :=
+          { frame := { blockIdx := 0, stmtIdx := 3, locals := lCall }, memory := memCall }
+        change wpMirModularSym checkedAddU8BorrowIsolatedMirContract 5 borrowCallerMir sCall _
+        conv => whnf
+        refine ⟨⟨rfl, ⟨5, 1, by decide, by decide, rfl⟩⟩, fun ans hPost => ?_⟩
+        cases ans with
+        | returned retVal memAfter =>
+          obtain ⟨⟨hVal, -, hMem⟩, _⟩ := hPost
+          subst hVal hMem
+          conv => whnf
+          exact ⟨fun h => h, rfl⟩
+        | panicked memAfter => exact absurd (show 256 ≤ 5 + 1 from hPost.1) (by decide)
+        | aborted => exact False.elim hPost)
+  exact ⟨hTot, hTot.exact.1⟩
+
+/--
+Gap #9 also resolved: `outerCallerMir` with linked helper `[midHelperMir]`
+satisfies `TotalExactPanicContract` under `linkCalleeBorrowIsolatedHandler`.
+-/
+theorem outerCaller_borrowIsolated_totalExact (fallback : ExternalCallHandler) :
+    TotalExactPanicContract
+      (mirHandledTrees outerCallerMir
+        (linkCalleeBorrowIsolatedHandler checkedAddU8Mir [] fallback) [midHelperMir])
+      addCallerPre addCallerPost addCallerOverflows :=
+  mirHandled_totalExactPanicContract_of_wpMirModularSym checkedAddU8BorrowIsolatedMirContract
+    (checkedAddU8_borrowIsolated_holdsTotallyOn fallback) 16 (by
+      rintro ⟨_, _⟩ ⟨⟨a, b, ha, hb, rfl⟩, rfl⟩
+      (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+      refine ⟨⟨rfl, ⟨a, b, ha, hb, rfl⟩⟩, fun ans hPost => ?_⟩
+      cases ans with
+      | returned retVal memAfter =>
+        obtain ⟨⟨hVal, hFit, hMem⟩, _⟩ := hPost
+        subst hVal hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact ⟨hFit, rfl⟩
+      | panicked memAfter =>
+        obtain ⟨hOver, hMem, _⟩ := hPost
+        subst hMem
+        (repeat' ((conv => whnf); split)); all_goals (conv => whnf)
+        exact hOver
+      | aborted => exact False.elim hPost)
+
+/--
+Lowering Boundary Gap #10 (caller-stack reference local-index aliasing due to
+`MirCallReq` omitting caller `StackFrame.locals`):
+- `fn read_ref(y: u8, r: &u8) -> u8 { *r }` (`_1: u8`, `_2: &u8`)
+- `fn ref_caller(x: u8) -> u8 { let r = &x; read_ref(99, r) }` (`_1: u8`, `_2: &u8`)
+-/
+def readRefPath : DefPath := "panic_tests::read_ref"
+
+def readRefMir : CapturedMir :=
+  mkBody readRefPath 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8SharedRefTy ]
+    [ { statements :=
+          [ mkStmt (.assign (local_ 0)
+              (.use (.copy { local_ := 2, projection := [.deref] }))) ]
+        terminator := mkTerm .return_
+        isCleanup := false } ]
+
+def refCallerMir : CapturedMir :=
+  mkBody "panic_tests::ref_caller" 1
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .mut u8SharedRefTy ]
+    [ { statements :=
+          [ mkStmt (.storageLive 2)
+          , mkStmt (.assign (local_ 2) (.ref .shared (local_ 1))) ]
+        terminator :=
+          mkTerm (.call (fnItemOp readRefPath) [u8Const 99, .copy (local_ 2)]
+            (local_ 0) (.some 1) .continue_)
+        isCleanup := false }
+    , { statements := [], terminator := mkTerm .return_, isCleanup := false } ]
+
+/--
+Under inlined execution (`callees := [readRefMir]`), `callStack` saves the
+caller's depth-0 frame, so `*_2` resolves via `foreignFrameSlot?` to the
+caller's `_1 = 5`, and `ref_caller(5)` returns `.scalar 5`.
+-/
+theorem refCaller_inlined_returns_5 :
+    NeverPanics (mirStatefulTrees refCallerMir [readRefMir])
+      (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+      (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 }) ∧
+      ∃ tr mem,
+        ReachesRet
+          (mirStatefulTrees refCallerMir [readRefMir]
+            ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+          tr (.normal (.scalar { bits := 5, sizeBytes := 1 }, mem)) := by
+  have hDwp :
+      DWP mirDefaultWP
+        (mirStatefulTrees refCallerMir [readRefMir]
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun out _ => ExactPanicOutcome
+          (fun r : MirReturn => r.1 = .scalar { bits := 5, sizeBytes := 1 }) False out)
+        PUnit.unit := by
+    refine dwp_cofix_of_wpCoalBounded 12 ?_
+    change wpMirBounded 12 refCallerMir _ _
+    rw [← wpMirSym_eq_wpMirBounded]
+    conv => whnf
+    exact ⟨fun h => h, rfl⟩
+  have hNever :
+      NeverPanics (mirStatefulTrees refCallerMir [readRefMir])
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 }) := by
+    rintro _ rfl
+    exact dwlp_pure_adequacy (ewp := mirDefaultWP)
+      (DWLP.mono (fun out _ h => h.toPanicOutcomeOk) hDwp.toDWLP)
+  obtain ⟨tr, out, hRet, hEx⟩ :=
+    exists_reachesRet_of_dwp mirEffect_nonFault_nonempty hDwp
+  cases out with
+  | normal r =>
+    obtain ⟨v, m⟩ := r
+    cases (show v = .scalar { bits := 5, sizeBytes := 1 } from hEx.2)
+    exact ⟨hNever, tr, m, hRet⟩
+  | panic => exact False.elim hEx
+  | abort => exact False.elim hEx
+
+/--
+Gap #10 under `linkCalleeHandler`: because `MirCallReq` omits the caller's
+`StackFrame.locals`, `read_ref` runs at `callStack = []` (`depth = 0`) with
+`callerMem.borrows`. When `read_ref` executes `*_2`, `activeFrameSlot?` matches
+`entry.targetLocal = 1` against the *callee's* own `u8` parameter `_1 = 99`
+(passing every typed dereference check in `evalStackThinPtrTypedDerefRead`), so
+`ref_caller(5)` **silently returns `99` instead of `5`** without faulting and
+refutes `PanicsOnlyIf` for `r.1 = .scalar 5`.
+-/
+theorem refCaller_linkCallee_silent_local_aliasing (fallback : ExternalCallHandler) :
+    (∃ tr mem,
+      ReachesRet
+        (mirHandledTrees refCallerMir (linkCalleeHandler readRefMir fallback) []
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        tr (.normal (.scalar { bits := 99, sizeBytes := 1 }, mem))) ∧
+      ¬ PanicsOnlyIf (mirHandledTrees refCallerMir (linkCalleeHandler readRefMir fallback))
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 })
+        (fun _ => False) := by
+  let b0 : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen, targetFrameDepth := 0 }
+  let memCall : Memory := { emptyMemory with borrows := [b0], nextTag := 2 }
+  let ptrVal : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+  let callArgs : List Value := [.scalar { bits := 99, sizeBytes := 1 }, ptrVal]
+  let req : MirCallReq :=
+    { defPath := readRefPath, typeArgs := [], args := callArgs, memory := memCall }
+  let memAfter : Memory :=
+    { emptyMemory with borrows := [{ b0 with perm := .disabled, allocDead := true }], nextTag := 2 }
+  have hAns :
+      ∃ tr, ReachesRet (linkCalleeHandler readRefMir fallback req) tr
+        (.returned (.scalar { bits := 99, sizeBytes := 1 }) memAfter) := by
+    rw [linkCalleeHandler_of_defPath_eq readRefMir fallback rfl]
+    have hDwp :
+        DWP mirClosedWP
+          (closeMirTreeAsCallAns memCall (mirStatefulTree readRefMir callArgs memCall))
+          (fun ans _ => ans = .returned (.scalar { bits := 99, sizeBytes := 1 }) memAfter)
+          PUnit.unit := by
+      unfold closeMirTreeAsCallAns
+      apply DWP.bind
+      refine DWP.mono (fun _ _ hEq => DWP.ret hEq)
+        (dwp_interp (ewp₁ := mirNoCallWP) failUnlinkedCalls
+          (fun i Q u hwp => by
+            cases i with
+            | inl _ => exact False.elim hwp
+            | inr i' =>
+              cases i' with
+              | inl obs => cases obs; exact DWP.vis (DWP.ret hwp)
+              | inr _ => exact False.elim hwp)
+          (dwp_cofix_of_wpCoalBounded 4 ?_))
+      change wpMirNoCallBounded 4 readRefMir _ _
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      conv => whnf
+      rfl
+    obtain ⟨tr, ans, hRet, hEq⟩ :=
+      exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hDwp
+    subst hEq
+    exact ⟨tr, hRet⟩
+  obtain ⟨tr, hAnsRet⟩ := hAns
+  have hOut :
+      ReachesLinkedOutcome refCallerMir (linkCalleeHandler readRefMir fallback)
+        (.running (initMachineStateWithMemoryAndCallees refCallerMir
+          [.scalar { bits := 5, sizeBytes := 1 }] emptyMemory []))
+        (.normal (.scalar { bits := 99, sizeBytes := 1 }, memAfter)) :=
+    .tau rfl (.tau rfl (.call rfl hAnsRet (.ret rfl)))
+  refine ⟨?_, ?_⟩
+  · obtain ⟨tr', hRet'⟩ := hOut.exists_reachesRet
+    exact ⟨tr', memAfter, hRet'⟩
+  · exact not_panicsOnlyIf_of_reachesLinkedOutcome rfl hOut (fun hEq => by
+      have hBits := congrArg (fun v => match v with | Value.scalar s => s.bits | _ => 0) hEq
+      exact absurd hBits (by decide))
+
+/--
+Gap #10 under `linkCalleeWithCalleesHandler`: the identical silent wrong-value
+return (`99` instead of `5`) occurs, because `enterExternalCalleeState` retains
+`callerMem.borrows` at `callStack = []`.
+-/
+theorem refCaller_linkCalleeWithCallees_silent_local_aliasing (fallback : ExternalCallHandler) :
+    (∃ tr mem,
+      ReachesRet
+        (mirHandledTrees refCallerMir (linkCalleeWithCalleesHandler readRefMir [] fallback) []
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        tr (.normal (.scalar { bits := 99, sizeBytes := 1 }, mem))) ∧
+      ¬ PanicsOnlyIf
+        (mirHandledTrees refCallerMir (linkCalleeWithCalleesHandler readRefMir [] fallback))
+        (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        (fun _ r => r.1 = .scalar { bits := 5, sizeBytes := 1 })
+        (fun _ => False) := by
+  let b0 : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen, targetFrameDepth := 0 }
+  let memCall : Memory := { emptyMemory with borrows := [b0], nextTag := 2 }
+  let ptrVal : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+  let callArgs : List Value := [.scalar { bits := 99, sizeBytes := 1 }, ptrVal]
+  let req : MirCallReq :=
+    { defPath := readRefPath, typeArgs := [], args := callArgs, memory := memCall }
+  let memAfter : Memory :=
+    { emptyMemory with borrows := [{ b0 with perm := .disabled, allocDead := true }], nextTag := 2 }
+  have hAns :
+      ∃ tr, ReachesRet (linkCalleeWithCalleesHandler readRefMir [] fallback req) tr
+        (.returned (.scalar { bits := 99, sizeBytes := 1 }) memAfter) := by
+    rw [linkCalleeWithCalleesHandler_of_defPath_eq readRefMir [] fallback rfl]
+    have hDwp :
+        DWP mirClosedWP
+          (closeMirTreeRestoringFrame memCall
+            (mirExternalCalleeTree readRefMir callArgs memCall []))
+          (fun ans _ => ans = .returned (.scalar { bits := 99, sizeBytes := 1 }) memAfter)
+          PUnit.unit := by
+      unfold closeMirTreeRestoringFrame
+      apply DWP.bind
+      refine DWP.mono (fun _ _ hEq => DWP.ret hEq)
+        (dwp_interp (ewp₁ := mirNoCallWP) failUnlinkedCalls
+          (fun i Q u hwp => by
+            cases i with
+            | inl _ => exact False.elim hwp
+            | inr i' =>
+              cases i' with
+              | inl obs => cases obs; exact DWP.vis (DWP.ret hwp)
+              | inr _ => exact False.elim hwp)
+          (dwp_cofix_of_wpCoalBounded 4 ?_))
+      change wpMirNoCallBounded 4 readRefMir _ _
+      rw [← wpMirNoCallSym_eq_wpMirNoCallBounded]
+      conv => whnf
+      rfl
+    obtain ⟨tr, ans, hRet, hEq⟩ :=
+      exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty hDwp
+    subst hEq
+    exact ⟨tr, hRet⟩
+  obtain ⟨tr, hAnsRet⟩ := hAns
+  have hOut :
+      ReachesLinkedOutcome refCallerMir (linkCalleeWithCalleesHandler readRefMir [] fallback)
+        (.running (initMachineStateWithMemoryAndCallees refCallerMir
+          [.scalar { bits := 5, sizeBytes := 1 }] emptyMemory []))
+        (.normal (.scalar { bits := 99, sizeBytes := 1 }, memAfter)) :=
+    .tau rfl (.tau rfl (.call rfl hAnsRet (.ret rfl)))
+  refine ⟨?_, ?_⟩
+  · obtain ⟨tr', hRet'⟩ := hOut.exists_reachesRet
+    exact ⟨tr', memAfter, hRet'⟩
+  · exact not_panicsOnlyIf_of_reachesLinkedOutcome rfl hOut (fun hEq => by
+      have hBits := congrArg (fun v => match v with | Value.scalar s => s.bits | _ => 0) hEq
+      exact absurd hBits (by decide))
+
+/--
+Under `linkCalleeBorrowIsolatedHandler`, dereferencing a caller stack reference
+**fails closed** (`.ub`) rather than silently reading the callee's own local
+frame, refuting every `PanicsWithPolicyOnlyIf` contract (even under
+`.waiveAbortUnchecked`).
+-/
+theorem refCaller_borrowIsolated_fails_closed_ub (fallback : ExternalCallHandler)
+    (post : MirInput → MirReturn → Prop) (panicCond : MirInput → Prop)
+    (policy : AbortPolicy MirInput) :
+    ¬ PanicsWithPolicyOnlyIf
+      (mirHandledTrees refCallerMir (linkCalleeBorrowIsolatedHandler readRefMir [] fallback))
+      (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+      post panicCond policy := by
+  let b0 : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen, targetFrameDepth := 0 }
+  let memCall : Memory := { emptyMemory with borrows := [b0], nextTag := 2 }
+  let ptrVal : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+  let callArgs : List Value := [.scalar { bits := 99, sizeBytes := 1 }, ptrVal]
+  let req : MirCallReq :=
+    { defPath := readRefPath, typeArgs := [], args := callArgs, memory := memCall }
+  have hNotSafe : ¬ TreeSafe (linkCalleeBorrowIsolatedHandler readRefMir [] fallback req) := by
+    rw [linkCalleeBorrowIsolatedHandler_of_defPath_eq readRefMir [] fallback rfl]
+    unfold closeMirTreeBorrowIsolated
+    refine not_treeSafe_bind _ ?_
+    have hF :
+        ReachesLinkedFault readRefMir failAllCalls
+          (.running (enterBorrowIsolatedCalleeState readRefMir callArgs memCall [])) :=
+      .of_reachesFaultExecBounded _ 4 rfl
+    have hT := hF.not_treeSafe
+    unfold mirHandledFrom at hT
+    rw [← failUnlinkedCalls_eq_handleMirExternalCalls] at hT
+    exact hT
+  exact not_panicsWithPolicyOnlyIf_of_reachesLinkedFault rfl
+    (.tau rfl (.tau rfl (.handler rfl hNotSafe)))
+
+/--
+Packaged three-way divergence theorem characterizing Lowering Boundary Gap #10
+(`MirCallReq` omitting caller `StackFrame.locals`):
+1. Inlined execution returns `.scalar 5`.
+2. `linkCalleeHandler` and `linkCalleeWithCalleesHandler` silently read the
+   callee's own `_1 = 99` and return `.scalar 99`.
+3. `linkCalleeBorrowIsolatedHandler` fails closed (`.ub`).
+-/
+theorem refCaller_threeWay_lowering_divergence (fallback : ExternalCallHandler) :
+    (∃ tr mem,
+      ReachesRet
+        (mirStatefulTrees refCallerMir [readRefMir]
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        tr (.normal (.scalar { bits := 5, sizeBytes := 1 }, mem))) ∧
+    (∃ tr mem,
+      ReachesRet
+        (mirHandledTrees refCallerMir (linkCalleeHandler readRefMir fallback) []
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        tr (.normal (.scalar { bits := 99, sizeBytes := 1 }, mem))) ∧
+    (∃ tr mem,
+      ReachesRet
+        (mirHandledTrees refCallerMir (linkCalleeWithCalleesHandler readRefMir [] fallback) []
+          ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+        tr (.normal (.scalar { bits := 99, sizeBytes := 1 }, mem))) ∧
+    (¬ PanicsWithPolicyOnlyIf
+      (mirHandledTrees refCallerMir (linkCalleeBorrowIsolatedHandler readRefMir [] fallback))
+      (fun x => x = ([.scalar { bits := 5, sizeBytes := 1 }], emptyMemory))
+      (fun _ _ => True) (fun _ => True) .waiveAbortUnchecked) :=
+  ⟨refCaller_inlined_returns_5.2,
+   (refCaller_linkCallee_silent_local_aliasing fallback).1,
+   (refCaller_linkCalleeWithCallees_silent_local_aliasing fallback).1,
+   refCaller_borrowIsolated_fails_closed_ub fallback _ _ _⟩
+
 /-! ### CFG-reachable & counted transitive call-boundary guards + path-feasibility limit -/
 
 /--
@@ -4089,6 +4602,59 @@ theorem outerTwoSiteHalfInlined_calleesCallBoundary_not_callSites :
    not_calleesCallSitesPreserved_of_count_ne
      (body := twoSiteMidHelperHalfInlinedMir) (p := (twoSiteMidHelperPath, 2))
      List.mem_cons_self List.mem_cons_self rfl (by decide)⟩
+
+/--
+Transitive helper with an unreachable dead-block call decoy: `bb0`/`bb1` inline
+`checked_add_u8` directly, while unreachable `bb2` carries a decoy call to
+`checked_add_u8`.
+-/
+def midHelperInlinedDeadCallMir : CapturedMir :=
+  mkBody midHelperPath 2
+    [ mkDecl .mut u8Ty, mkDecl .not u8Ty, mkDecl .not u8Ty, mkDecl .mut u8CheckedTy ]
+    (checkedAddBlocks u8Ty .continue_ ++
+      [ { statements := []
+          terminator :=
+            mkTerm (.call (fnItemOp checkedAddU8Path) [.copy (local_ 1), .copy (local_ 2)]
+              (local_ 0) (.some 1) .continue_)
+          isCleanup := false } ])
+
+/--
+Dead-block decoy inside a transitive helper: both syntactic transitive guards
+(`CalleesCallBoundaryPreserved` and `CalleesCallSitesPreserved`) are fooled by
+`midHelperInlinedDeadCallMir`, whereas both CFG-reachable transitive guards
+(`ReachableCalleesCallBoundaryPreserved` and `ReachableCalleesCallSitesPreserved`)
+reject it.
+-/
+theorem outerCaller_deadDecoyHelper_passes_syntactic_rejected_by_reachable :
+    CalleesCallBoundaryPreserved outerCallerMir [midHelperInlinedDeadCallMir]
+        [midHelperPath] checkedAddU8Path ∧
+      CalleesCallSitesPreserved outerCallerMir [midHelperInlinedDeadCallMir]
+        [(midHelperPath, 1)] checkedAddU8Path ∧
+      ¬ ReachableCalleesCallBoundaryPreserved outerCallerMir [midHelperInlinedDeadCallMir]
+        [midHelperPath] checkedAddU8Path ∧
+      ¬ ReachableCalleesCallSitesPreserved outerCallerMir [midHelperInlinedDeadCallMir]
+        [(midHelperPath, 1)] checkedAddU8Path :=
+  ⟨(calleesCallBoundaryPreserved_iff _ _ _ _).1 rfl,
+   (calleesCallSitesPreserved_iff _ _ _ _).1 rfl,
+   not_reachableCalleesCallBoundaryPreserved_of_zero_reachable_sites
+     (body := midHelperInlinedDeadCallMir) List.mem_cons_self List.mem_cons_self rfl,
+   not_reachableCalleesCallSitesPreserved_of_count_ne
+     (body := midHelperInlinedDeadCallMir) (p := (midHelperPath, 1))
+     List.mem_cons_self List.mem_cons_self rfl (by decide)⟩
+
+/-- Positive counted CFG-reachable transitive guard on `outerTwoSiteCallerMir`. -/
+theorem outerTwoSiteCaller_reachableCalleesCallSitesPreserved
+    (args : List Value) (mem : Memory) :
+    ReachableCalleesCallSitesPreserved outerTwoSiteCallerMir [twoSiteMidHelperMir]
+        [(twoSiteMidHelperPath, 2)] checkedAddU8Path ∧
+      CalleeTableExcludes
+        (initMachineStateWithMemoryAndCallees outerTwoSiteCallerMir args mem
+          [twoSiteMidHelperMir]).memory
+        checkedAddU8Path :=
+  let h : ReachableCalleesCallSitesPreserved outerTwoSiteCallerMir [twoSiteMidHelperMir]
+      [(twoSiteMidHelperPath, 2)] checkedAddU8Path :=
+    (reachableCalleesCallSitesPreserved_iff _ _ _ _).1 rfl
+  ⟨h, h.calleeTableExcludes_initStateful_of_ne_nil (by simp) args mem⟩
 
 /-! ### `ReachesLinkedOutcome` fault-free refutations & `withCallees` contract-level exact compose -/
 
@@ -4813,6 +5379,7 @@ theorem all_panic_contracts_tests :
     (type_of% @twoCall_traitsPreserved_modular_neverPanics) ∧
     (type_of% @twoCallContract_pre_not_universal) ∧
     (type_of% @twoCall_reachableOn_guard) ∧
+    (type_of% @twoCall_reachable_guard_of_modular_proof) ∧
     (type_of% @alwaysAbort_totalExact) ∧
     (type_of% @alwaysAbort_reaches_abort) ∧
     (type_of% @alwaysAbort_waiveAbortUnchecked) ∧
@@ -4882,6 +5449,7 @@ theorem all_panic_contracts_tests :
     (type_of% @kani5219_global_alloc_slice_asymmetry) ∧
     (type_of% @multiStepCaller_reachable_preserves_calleeTableExcludes) ∧
     (type_of% @multiStepCaller_concrete_handler_guard) ∧
+    (type_of% @multiStepCaller_concrete_chained_handler_guard_reaches_bb3) ∧
     (type_of% @checkedAddU8_disjointBorrows_callee_wp) ∧
     (type_of% @checkedAddU8_disjointBorrows_holdsTotallyOn) ∧
     (type_of% @checkedAddU8_disjointBorrows_nonEmpty_witness) ∧
@@ -4889,10 +5457,21 @@ theorem all_panic_contracts_tests :
     (type_of% @borrowCaller_linked_handler_ub) ∧
     (type_of% @borrowCaller_linked_withCallees_ub) ∧
     (type_of% @linkCallee_depth0_borrow_collision_divergence) ∧
+    (type_of% @checkedAddU8_borrowIsolated_callee_wp) ∧
+    (type_of% @checkedAddU8_borrowIsolated_holdsTotallyOn) ∧
+    (type_of% @borrowCaller_borrowIsolated_neverPanics_and_totalExact) ∧
+    (type_of% @outerCaller_borrowIsolated_totalExact) ∧
+    (type_of% @refCaller_inlined_returns_5) ∧
+    (type_of% @refCaller_linkCallee_silent_local_aliasing) ∧
+    (type_of% @refCaller_linkCalleeWithCallees_silent_local_aliasing) ∧
+    (type_of% @refCaller_borrowIsolated_fails_closed_ub) ∧
+    (type_of% @refCaller_threeWay_lowering_divergence) ∧
     (type_of% @addCallerInlinedDeadCall_rejected_by_reachableGuards) ∧
     (type_of% @addCallerInlinedFalseBranchDecoy_reachable_yet_never_calls) ∧
     (type_of% @outerTwoSiteCaller_calleesCallSitesPreserved) ∧
     (type_of% @outerTwoSiteHalfInlined_calleesCallBoundary_not_callSites) ∧
+    (type_of% @outerCaller_deadDecoyHelper_passes_syntactic_rejected_by_reachable) ∧
+    (type_of% @outerTwoSiteCaller_reachableCalleesCallSitesPreserved) ∧
     (type_of% @addCaller_wrongAnswer_treeSafe_not_panicsOnlyIf) ∧
     (type_of% @addCaller_unexpectedAbort_treeSafe_not_panicsOnlyIf) ∧
     (type_of% @checkedAddU8_externalClosedCallee_totalExactPolicy) ∧
@@ -4988,6 +5567,7 @@ theorem all_panic_contracts_tests :
     @twoCall_traitsPreserved_modular_neverPanics,
     @twoCallContract_pre_not_universal,
     @twoCall_reachableOn_guard,
+    @twoCall_reachable_guard_of_modular_proof,
     @alwaysAbort_totalExact,
     @alwaysAbort_reaches_abort,
     @alwaysAbort_waiveAbortUnchecked,
@@ -5057,6 +5637,7 @@ theorem all_panic_contracts_tests :
     @kani5219_global_alloc_slice_asymmetry,
     @multiStepCaller_reachable_preserves_calleeTableExcludes,
     @multiStepCaller_concrete_handler_guard,
+    @multiStepCaller_concrete_chained_handler_guard_reaches_bb3,
     @checkedAddU8_disjointBorrows_callee_wp,
     @checkedAddU8_disjointBorrows_holdsTotallyOn,
     @checkedAddU8_disjointBorrows_nonEmpty_witness,
@@ -5064,10 +5645,21 @@ theorem all_panic_contracts_tests :
     @borrowCaller_linked_handler_ub,
     @borrowCaller_linked_withCallees_ub,
     @linkCallee_depth0_borrow_collision_divergence,
+    @checkedAddU8_borrowIsolated_callee_wp,
+    @checkedAddU8_borrowIsolated_holdsTotallyOn,
+    @borrowCaller_borrowIsolated_neverPanics_and_totalExact,
+    @outerCaller_borrowIsolated_totalExact,
+    @refCaller_inlined_returns_5,
+    @refCaller_linkCallee_silent_local_aliasing,
+    @refCaller_linkCalleeWithCallees_silent_local_aliasing,
+    @refCaller_borrowIsolated_fails_closed_ub,
+    @refCaller_threeWay_lowering_divergence,
     @addCallerInlinedDeadCall_rejected_by_reachableGuards,
     @addCallerInlinedFalseBranchDecoy_reachable_yet_never_calls,
     @outerTwoSiteCaller_calleesCallSitesPreserved,
     @outerTwoSiteHalfInlined_calleesCallBoundary_not_callSites,
+    @outerCaller_deadDecoyHelper_passes_syntactic_rejected_by_reachable,
+    @outerTwoSiteCaller_reachableCalleesCallSitesPreserved,
     @addCaller_wrongAnswer_treeSafe_not_panicsOnlyIf,
     @addCaller_unexpectedAbort_treeSafe_not_panicsOnlyIf,
     @checkedAddU8_externalClosedCallee_totalExactPolicy,
