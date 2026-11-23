@@ -75,8 +75,9 @@ state when a panic may happen, when it must happen, and that every execution
    `linkCalleeBorrowIsolatedHandler` avoids Gap #8 and Gap #9 for
    value-passing / global-memory callees and faults (`.ub`) when the callee
    dereferences a caller stack reference. It is a handler of this file, not part
-   of the trusted linking semantics, and no theorem here relates it to inlined
-   execution.
+   of the trusted linking semantics; Section 8 provides a cross-effect
+   `ExactPass` bridge (`exactPass_erase_of_same_unique_outcome`) for concrete
+   value-passing programs whose inlined and linked value outcomes agree.
 6. The runtime call-boundary guard `CalleeTableExcludes`, under which
    `evalTerminator` emits a `MirCallE` request instead of entering a callee
    body. The guard is established for initial states, used at each call
@@ -91,14 +92,16 @@ state when a panic may happen, when it must happen, and that every execution
    (`ReachableExecState.calleeTableExcludes_of_dwlp_withTraitsPreserved`).
 7. The syntactic call-boundary guards `CallBoundaryPreserved`,
    `CalleesCallBoundaryPreserved`, the counted `CallSitesPreserved` and
-   `CalleesCallSitesPreserved`, and the CFG-reachable guards
+   `CalleesCallSitesPreserved`, the CFG-reachable guards
    `ReachableCallBoundaryPreserved`, `ReachableCallSitesPreserved`,
    `ReachableCalleesCallBoundaryPreserved`, and
-   `ReachableCalleesCallSitesPreserved`, and the helper-chain guard
-   `HelperChainCallBoundaryPreserved`. The `Callees*` guards inspect `callees`
+   `ReachableCalleesCallSitesPreserved`, the single-hop helper-chain guard
+   `HelperChainCallBoundaryPreserved`, and the arbitrary-length chain guard
+   `CallChainCallBoundaryPreserved`. The `Callees*` guards inspect `callees`
    only and do not look at the caller.
 8. Transfer of the contracts across `CompilerPass`, `VerifierPass`, and
-   `ExactPass`.
+   `ExactPass`, plus cross-effect value-outcome `ExactPass` adequacy
+   (`exactPass_erase_of_same_unique_outcome`).
 -/
 
 universe u w w'
@@ -408,7 +411,10 @@ theorem not_exactPolicyOutcome_forbidAbort_abort (ctx : Ctx) (post : Val → Pro
     ¬ ExactPolicyOutcome .forbidAbort ctx post panicCond (.abort : Outcome Val) :=
   fun h => h.1
 
-/-- An exact classifier with the unconditional waiver accepts neither a normal return nor a panic. -/
+/--
+An exact classifier with the unconditional waiver accepts neither a normal
+return nor a panic.
+-/
 theorem exactPolicyOutcome_waiveAbortUnchecked_iff (ctx : Ctx) (post : Val → Prop)
     (panicCond : Prop) (out : Outcome Val) :
     ExactPolicyOutcome .waiveAbortUnchecked ctx post panicCond out ↔
@@ -546,7 +552,10 @@ def PanicsIf (tree : Inp → ITree E (Outcome Val)) (pre panicCond : Inp → Pro
     Prop :=
   ∀ x, pre x → panicCond x → ∃ tr, ReachesRet (tree x) tr .panic
 
-/-- Abort trigger: every input satisfying `pre` and `abortCond` has an execution that reaches `.abort`. -/
+/--
+Abort trigger: every input satisfying `pre` and `abortCond` has an execution
+that reaches `.abort`.
+-/
 def AbortsIf (tree : Inp → ITree E (Outcome Val)) (pre abortCond : Inp → Prop) :
     Prop :=
   ∀ x, pre x → abortCond x → ∃ tr, ReachesRet (tree x) tr .abort
@@ -560,7 +569,10 @@ def FailsIf (tree : Inp → ITree E (Outcome Val)) (pre failCond : Inp → Prop)
   ∀ x, pre x → failCond x →
     ∃ tr, ReachesRet (tree x) tr .panic ∨ ReachesRet (tree x) tr .abort
 
-/-- Return trigger: every input satisfying `pre` and `retCond` has an execution that returns normally. -/
+/--
+Return trigger: every input satisfying `pre` and `retCond` has an execution
+that returns normally.
+-/
 def ReturnsIf (tree : Inp → ITree E (Outcome Val)) (pre retCond : Inp → Prop) :
     Prop :=
   ∀ x, pre x → retCond x → ∃ tr v, ReachesRet (tree x) tr (.normal v)
@@ -1676,7 +1688,10 @@ theorem totalVerificationResult_iff_neverPanics (c : TotalClaim) :
     obtain ⟨r, h_out, h_post⟩ := h_ret tr out hr
     exact ⟨r.1, r.2, h_out, h_post⟩
 
-/-- A total exact contract with an unsatisfiable panic condition yields the total-correctness certificate. -/
+/--
+A total exact contract with an unsatisfiable panic condition yields the
+total-correctness certificate.
+-/
 theorem TotalExactPanicContract.toTotalVerificationResult (c : TotalClaim)
     (h : TotalExactPanicContract (mirStatefulTrees c.body c.callees)
       (fun x => c.pre x.1 x.2) (fun x r => c.post x.1 x.2 r.1 r.2) (fun _ => False)) :
@@ -2213,7 +2228,10 @@ theorem exists_reachesRet_of_holdsTotallyOn {C : MirCallContract}
     ∃ tr ans, ReachesRet (hdl req) tr ans ∧ C.post req ans :=
   exists_reachesRet_of_dwp mirClosedEffect_nonFault_nonempty (h req hPre)
 
-/-- Handler link for total correctness: a total implementation of `C` discharges `mirModularWP C`. -/
+/--
+Handler link for total correctness: a total implementation of `C` discharges
+`mirModularWP C`.
+-/
 private theorem handleMirExternalCalls_links_dwp
     (C : MirCallContract) (hdl : ExternalCallHandler) (hTot : C.holdsTotallyOn hdl) :
     ∀ (i : MirEffect.I) (Q : MirEffect.O i → PUnit → Prop) (u : PUnit),
@@ -2647,7 +2665,10 @@ theorem toExactPolicy_post_of_withTraitsPreserved {req : MirCallReq} {ans : MirC
   | panicked memAfter => exact ⟨h.1, h.2.1⟩
   | aborted => exact h
 
-/-- A return accepted by a trait-preserving exact policy contract preserves frame and `traitImpls`. -/
+/--
+A return accepted by a trait-preserving exact policy contract preserves frame
+and `traitImpls`.
+-/
 theorem callFrameAndTraitsPreserved_of_toExactPolicy_returned {req : MirCallReq}
     {retVal : Value} {memAfter : Memory}
     (h : (P.withTraitsPreserved.toExactPolicyMirCallContract policy).post req
@@ -2655,7 +2676,10 @@ theorem callFrameAndTraitsPreserved_of_toExactPolicy_returned {req : MirCallReq}
     callFrameAndTraitsPreserved req.memory memAfter :=
   h.2.2.2
 
-/-- An unwind accepted by a trait-preserving exact policy contract preserves frame and `traitImpls`. -/
+/--
+An unwind accepted by a trait-preserving exact policy contract preserves frame
+and `traitImpls`.
+-/
 theorem callFrameAndTraitsPreserved_of_toExactPolicy_panicked {req : MirCallReq}
     {memAfter : Memory}
     (h : (P.withTraitsPreserved.toExactPolicyMirCallContract policy).post req
@@ -3091,7 +3115,10 @@ variable {calleeBody : CapturedMir} {pre : MirCallReq → Prop}
   {post : MirCallReq → MirReturn → Prop} {panicCond : MirCallReq → Prop}
   {policy : AbortPolicy MirCallReq}
 
-/-- `DWLP mirNoCallWP` on the open callee tree establishes the policy contract of the closed callee trees. -/
+/--
+`DWLP mirNoCallWP` on the open callee tree establishes the policy contract of
+the closed callee trees.
+-/
 theorem mirClosedCalleeTrees_panicsWithPolicyOnlyIf_of_dwlp
     (h : ∀ req, pre req →
       DWLP mirNoCallWP (mirStatefulTree calleeBody req.args req.memory)
@@ -5936,7 +5963,11 @@ theorem evalTerminator_preserves_tables (s : MachineState) (term : Terminator)
       unfold evalTerminator; exact ⟨rfl, rfl⟩
     | switchInt discr targets =>
       unfold evalTerminator; try dsimp only
-      repeat' (first | exact trivial | exact ⟨rfl, rfl⟩ | exact StepNodePreservesTables.emitStep ⟨rfl, rfl⟩ | split)
+      repeat' (first
+        | exact trivial
+        | exact ⟨rfl, rfl⟩
+        | exact StepNodePreservesTables.emitStep ⟨rfl, rfl⟩
+        | split)
     | unwindResume =>
       unfold evalTerminator; try dsimp only
       repeat' (first
@@ -6421,7 +6452,8 @@ private theorem dwlp_cofix_step_obs {C : CallContract MirCallReq (fun _ => MirCa
     DWLP (mirModularWP C) (ITree.cofix (stepMirState body) (k PUnit.unit)) Q PUnit.unit := by
   have hEq :
       ITree.cofix (stepMirState body) st =
-        .vis (E := MirEffect) (.inr (.inl ev)) (fun o => ITree.cofix (stepMirState body) (k o)) := by
+        .vis (E := MirEffect) (.inr (.inl ev))
+          (fun o => ITree.cofix (stepMirState body) (k o)) := by
     apply ITree.eq_of_observe_eq
     rw [ITree.observe_cofix, hStep]
     exact (ITree.observe_vis (E := MirEffect) (.inr (.inl ev)) _).symm
@@ -6488,7 +6520,8 @@ theorem ReachableExecState.preserves_tables_of_dwlp_withTraitsPreserved
     {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
     {Q : MirOutcome → PUnit → Prop}
     (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
-    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+    (hDwlp : DWLP
+      (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
       (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
     (hReach : ReachableExecState body h (.running s₁) (.running s₂)) :
     TablesPreserved s₁.memory s₂.memory :=
@@ -6505,7 +6538,8 @@ theorem ReachableExecState.calleeTableExcludes_of_dwlp_withTraitsPreserved
     {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
     {targetDefPath : DefPath} {Q : MirOutcome → PUnit → Prop}
     (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
-    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+    (hDwlp : DWLP
+      (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
       (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
     (hReach : ReachableExecState body h (.running s₁) (.running s₂))
     (hExcl : CalleeTableExcludes s₁.memory targetDefPath) :
@@ -6519,7 +6553,8 @@ theorem ReachableExecState.runtimeCallBoundaryGuarded_of_dwlp_withTraitsPreserve
     {body : CapturedMir} {h : ExternalCallHandler} {s₁ s₂ : MachineState}
     {targets : List DefPath} {Q : MirOutcome → PUnit → Prop}
     (hHolds : (P.withTraitsPreserved.toPolicyMirCallContract policy).holdsOn h)
-    (hDwlp : DWLP (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
+    (hDwlp : DWLP
+      (mirModularWP (P.withTraitsPreserved.toPolicyMirCallContract policy).toCallContract)
       (ITree.cofix (stepMirState body) (.running s₁)) Q PUnit.unit)
     (hReach : ReachableExecState body h (.running s₁) (.running s₂))
     (hGuard : RuntimeCallBoundaryGuarded s₁.memory targets) :
@@ -7217,7 +7252,10 @@ theorem calleesCallBoundaryPreserved_iff (callerBody : CapturedMir)
         have hPath : body.defPath = caller := (stringEq_eq_true_iff _ _).1 hEq
         exact Or.inr ((bodyCallsDefPath_iff _ _).2 (h.callerSites body hMem (hPath ▸ hCallerMem)))
 
-/-- Non-vacuity: omitting an expected helper from `callees` refutes `CalleesCallBoundaryPreserved`. -/
+/--
+Non-vacuity: omitting an expected helper from `callees` refutes
+`CalleesCallBoundaryPreserved`.
+-/
 theorem not_calleesCallBoundaryPreserved_of_missing_caller {callerBody : CapturedMir}
     {callees : List CapturedMir} {expectedCallers : List DefPath}
     {targetDefPath callerPath : DefPath}
@@ -7656,7 +7694,10 @@ theorem calleesCallSitesPreserved_iff (callerBody : CapturedMir)
         have hEq := (stringEq_eq_true_iff _ _).1 hStr
         exact Or.inr (h.callerSiteCounts body p hBodyMem hp hEq ▸ Nat.beq_refl _)
 
-/-- When every expected helper count is positive, `CalleesCallSitesPreserved` implies `CalleesCallBoundaryPreserved`. -/
+/--
+When every expected helper count is positive, `CalleesCallSitesPreserved`
+implies `CalleesCallBoundaryPreserved`.
+-/
 theorem CalleesCallSitesPreserved.toCalleesCallBoundaryPreserved {callerBody : CapturedMir}
     {callees : List CapturedMir} {expectedCallerCounts : List (DefPath × Nat)}
     {targetDefPath : DefPath}
@@ -7800,7 +7841,8 @@ private theorem mem_unionUniqueNat_iff :
   | y :: ys, xs, z => by
     unfold unionUniqueNat
     simp only [List.foldl_cons]
-    rw [show ys.foldl addUniqueNat (addUniqueNat xs y) = unionUniqueNat (addUniqueNat xs y) ys from rfl]
+    rw [show ys.foldl addUniqueNat (addUniqueNat xs y) =
+      unionUniqueNat (addUniqueNat xs y) ys from rfl]
     rw [mem_unionUniqueNat_iff ys (addUniqueNat xs y) z, mem_addUniqueNat_iff, List.mem_cons]
     constructor
     · rintro ((rfl | hxs) | hys)
@@ -8399,7 +8441,8 @@ def reachableCalleesCallSitesPreserved (callerBody : CapturedMir)
 theorem reachableCalleesCallSitesPreserved_iff (callerBody : CapturedMir)
     (callees : List CapturedMir) (expectedCallerCounts : List (DefPath × Nat))
     (targetDefPath : DefPath) :
-    reachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath = true ↔
+    reachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts
+        targetDefPath = true ↔
       ReachableCalleesCallSitesPreserved callerBody callees expectedCallerCounts targetDefPath := by
   unfold reachableCalleesCallSitesPreserved
   simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none,
@@ -8493,10 +8536,13 @@ at `callerBody`. A caller from which the call to the helper was inlined away,
 together with the helper's own call to the target, still satisfies all four,
 although no call to the target is left on any path from the caller.
 
-This guard checks the whole chain: the caller has a CFG-reachable direct call to
-`helperPath`, that path is linked to a body with a CFG-reachable direct call to
-`targetDefPath`, and the target itself is neither linked nor dispatched by a
-trait implementation. Longer chains are checked one hop at a time.
+This guard checks a single-hop chain: the caller has a CFG-reachable direct call
+to `helperPath`, that path is linked to a body with a CFG-reachable direct call
+to `targetDefPath`, and the target itself is neither linked nor dispatched by a
+trait implementation. Because `notLinked` forbids `targetDefPath` from appearing
+in `callees`, multi-hop chains (`caller -> h₁ -> ... -> hₖ -> target`) cannot be
+checked by applying this single-hop guard to intermediate linked hops; use
+`CallChainCallBoundaryPreserved` below for chains of arbitrary length.
 -/
 structure HelperChainCallBoundaryPreserved (callerBody : CapturedMir)
     (callees : List CapturedMir) (helperPath targetDefPath : DefPath) : Prop where
@@ -8565,6 +8611,189 @@ theorem HelperChainCallBoundaryPreserved.calleeTableExcludes_init {callerBody : 
   cases callees with
   | nil => exact calleeTableExcludes_of_callees_nil rfl
   | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+/-- The chain guard also establishes the runtime guard for stateful initial states. -/
+theorem HelperChainCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {helperPath targetDefPath : DefPath}
+    (h : HelperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+/--
+CFG-reachable direct call chain from `body` through every linked helper path in
+`helperChain` to `targetDefPath`:
+- `[]`: `body` has a `bb0`-reachable direct call to `targetDefPath`;
+- `hPath :: rest`: `body` has a `bb0`-reachable direct call to `hPath`, `hPath`
+  resolves in `callees` via `findCallee?` to a linked body `hBody`, and `hBody`
+  continues the reachable call chain through `rest` to `targetDefPath`.
+-/
+def ReachableCallChain (body : CapturedMir) (callees : List CapturedMir) :
+    List DefPath → DefPath → Prop
+  | .nil, targetDefPath => BodyReachableCallsDefPath targetDefPath body
+  | hPath :: rest, targetDefPath =>
+    BodyReachableCallsDefPath hPath body ∧
+      ∃ hBody, findCallee? callees hPath = .some hBody ∧
+        ReachableCallChain hBody callees rest targetDefPath
+
+/-- Computable checker for `ReachableCallChain`. -/
+def reachableCallChain (body : CapturedMir) (callees : List CapturedMir) :
+    List DefPath → DefPath → Bool
+  | .nil, targetDefPath => bodyReachableCallsDefPath targetDefPath body
+  | hPath :: rest, targetDefPath =>
+    bodyReachableCallsDefPath hPath body &&
+      match findCallee? callees hPath with
+      | .some hBody => reachableCallChain hBody callees rest targetDefPath
+      | .none => false
+
+/-- The checker decides `ReachableCallChain`. -/
+theorem reachableCallChain_iff (callees : List CapturedMir) (targetDefPath : DefPath) :
+    ∀ (helperChain : List DefPath) (body : CapturedMir),
+      reachableCallChain body callees helperChain targetDefPath = true ↔
+        ReachableCallChain body callees helperChain targetDefPath
+  | .nil, body => bodyReachableCallsDefPath_iff targetDefPath body
+  | hPath :: rest, body => by
+    unfold reachableCallChain ReachableCallChain
+    rw [Bool.and_eq_true]
+    constructor
+    · rintro ⟨hCalls, hMatch⟩
+      refine ⟨(bodyReachableCallsDefPath_iff _ _).1 hCalls, ?_⟩
+      cases hF : findCallee? callees hPath with
+      | none => rw [hF] at hMatch; nomatch hMatch
+      | some hBody =>
+        rw [hF] at hMatch
+        exact ⟨hBody, rfl, (reachableCallChain_iff callees targetDefPath rest hBody).1 hMatch⟩
+    · rintro ⟨hCalls, hBody, hF, hRest⟩
+      refine ⟨(bodyReachableCallsDefPath_iff _ _).2 hCalls, ?_⟩
+      rw [hF]
+      exact (reachableCallChain_iff callees targetDefPath rest hBody).2 hRest
+
+/--
+Arbitrary-length CFG-reachable call-chain boundary guard: generalizes both
+`ReachableCallBoundaryPreserved` (`helperChain = []`) and
+`HelperChainCallBoundaryPreserved` (`helperChain = [h]`) to chains of any depth
+`callerBody -> h₁ -> ... -> hₖ -> targetDefPath`, requiring every intermediate
+hop to be CFG-reachable and linked in `callees` while excluding `targetDefPath`
+from both `callees` and `traitImpls`.
+-/
+structure CallChainCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperChain : List DefPath)
+    (targetDefPath : DefPath) : Prop where
+  /-- CFG-reachable direct call chain from `callerBody` through `helperChain` to `targetDefPath`. -/
+  chain : ReachableCallChain callerBody callees helperChain targetDefPath
+  /-- No linked body has the target's path. -/
+  notLinked : findCallee? callees targetDefPath = .none
+  /-- No trait implementation on `callerBody` or `callees` dispatches the target. -/
+  noTraitImpl :
+    hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+      targetDefPath = false
+
+/-- Computable checker for `CallChainCallBoundaryPreserved`. -/
+def callChainCallBoundaryPreserved (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperChain : List DefPath)
+    (targetDefPath : DefPath) : Bool :=
+  reachableCallChain callerBody callees helperChain targetDefPath &&
+    ((findCallee? callees targetDefPath).isNone &&
+      !hasTraitImplForDefPath (callerBody.traitImpls ++ flatMapTraitImpls callees)
+        targetDefPath)
+
+/-- The checker decides `CallChainCallBoundaryPreserved`. -/
+theorem callChainCallBoundaryPreserved_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperChain : List DefPath)
+    (targetDefPath : DefPath) :
+    callChainCallBoundaryPreserved callerBody callees helperChain targetDefPath = true ↔
+      CallChainCallBoundaryPreserved callerBody callees helperChain targetDefPath := by
+  unfold callChainCallBoundaryPreserved
+  simp only [Bool.and_eq_true, Bool.not_eq_true', Option.isNone_iff_eq_none]
+  exact ⟨fun ⟨h₁, h₂, h₃⟩ =>
+      ⟨(reachableCallChain_iff callees targetDefPath helperChain callerBody).1 h₁, h₂, h₃⟩,
+    fun h =>
+      ⟨(reachableCallChain_iff callees targetDefPath helperChain callerBody).2 h.chain,
+       h.notLinked, h.noTraitImpl⟩⟩
+
+/--
+For an empty helper chain, `CallChainCallBoundaryPreserved` is
+`ReachableCallBoundaryPreserved`.
+-/
+theorem callChainCallBoundaryPreserved_nil_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (targetDefPath : DefPath) :
+    CallChainCallBoundaryPreserved callerBody callees [] targetDefPath ↔
+      ReachableCallBoundaryPreserved callerBody callees targetDefPath :=
+  ⟨fun h => ⟨h.chain, h.notLinked, h.noTraitImpl⟩,
+   fun h => ⟨h.reachableCallSite, h.notLinked, h.noTraitImpl⟩⟩
+
+/-- For a single helper, `CallChainCallBoundaryPreserved` is `HelperChainCallBoundaryPreserved`. -/
+theorem callChainCallBoundaryPreserved_singleton_iff (callerBody : CapturedMir)
+    (callees : List CapturedMir) (helperPath targetDefPath : DefPath) :
+    CallChainCallBoundaryPreserved callerBody callees [helperPath] targetDefPath ↔
+      HelperChainCallBoundaryPreserved callerBody callees helperPath targetDefPath :=
+  ⟨fun h => ⟨h.chain.1, h.chain.2, h.notLinked, h.noTraitImpl⟩,
+   fun h => ⟨⟨h.callerCallsHelper, h.helperLinked⟩, h.notLinked, h.noTraitImpl⟩⟩
+
+/-- Prepending a caller hop onto a verified call chain extends the chain guard by one hop. -/
+theorem CallChainCallBoundaryPreserved.cons {callerBody hBody : CapturedMir}
+    {callees : List CapturedMir} {hPath : DefPath} {rest : List DefPath}
+    {targetDefPath : DefPath}
+    (hCalls : BodyReachableCallsDefPath hPath callerBody)
+    (hLinked : findCallee? callees hPath = .some hBody)
+    (hRest : ReachableCallChain hBody callees rest targetDefPath)
+    (hNotLinked : findCallee? callees targetDefPath = .none)
+    (hNoTrait : hasTraitImplForDefPath
+      (callerBody.traitImpls ++ flatMapTraitImpls callees) targetDefPath = false) :
+    CallChainCallBoundaryPreserved callerBody callees (hPath :: rest) targetDefPath :=
+  ⟨⟨hCalls, hBody, hLinked, hRest⟩, hNotLinked, hNoTrait⟩
+
+theorem CallChainCallBoundaryPreserved.calleeTableExcludes_init
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {helperChain : List DefPath} {targetDefPath : DefPath}
+    (h : CallChainCallBoundaryPreserved callerBody callees helperChain targetDefPath)
+    (args : List Value) :
+    CalleeTableExcludes (initMachineStateWithCallees callerBody args callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact calleeTableExcludes_of_callees_nil rfl
+  | cons c cs => exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem CallChainCallBoundaryPreserved.calleeTableExcludes_initStateful_of_ne_nil
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {helperChain : List DefPath} {targetDefPath : DefPath}
+    (h : CallChainCallBoundaryPreserved callerBody callees helperChain targetDefPath)
+    (hNe : callees ≠ .nil) (args : List Value) (mem : Memory) :
+    CalleeTableExcludes (initMachineStateWithMemoryAndCallees callerBody args mem callees).memory
+      targetDefPath := by
+  cases callees with
+  | nil => exact False.elim (hNe rfl)
+  | cons c cs =>
+    change CalleeTableExcludes
+      { mem with callees := c :: cs, traitImpls := callerBody.traitImpls } targetDefPath
+    exact calleeTableExcludes_of_no_callee_no_traitImpl h.notLinked h.noTraitImpl
+
+theorem not_callChainCallBoundaryPreserved_of_not_callsHead
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {hPath : DefPath} {rest : List DefPath} {targetDefPath : DefPath}
+    (hNo : bodyReachableCallsDefPath hPath callerBody = false) :
+    ¬ CallChainCallBoundaryPreserved callerBody callees (hPath :: rest) targetDefPath := by
+  intro h
+  have hT := (bodyReachableCallsDefPath_iff _ _).2 h.chain.1
+  rw [hNo] at hT
+  nomatch hT
+
+theorem not_callChainCallBoundaryPreserved_of_missing_hop
+    {callerBody : CapturedMir} {callees : List CapturedMir}
+    {hPath : DefPath} {rest : List DefPath} {targetDefPath : DefPath}
+    (hMiss : findCallee? callees hPath = .none) :
+    ¬ CallChainCallBoundaryPreserved callerBody callees (hPath :: rest) targetDefPath := by
+  intro h
+  obtain ⟨_, hF, _⟩ := h.chain.2
+  rw [hMiss] at hF
+  nomatch hF
 
 /-! ## 8. Transfer Across `Anneal.Pass` Refinements -/
 
@@ -9103,7 +9332,10 @@ theorem TotalExactPanicContract.exactPass_forward
         (hSafe₁ x hx) hr
     exact h.noReturnIfPanics x hx hp tr' v hr'
 
-/-- An exact pass carries a total exact panic contract backward once the source terminates on `pre`. -/
+/--
+An exact pass carries a total exact panic contract backward once the source
+terminates on `pre`.
+-/
 theorem TotalExactPanicContract.exactPass_backward
     (hPass : ExactPass (panicSemantics proj₁ sem₁) (panicSemantics proj₂ sem₂) id id
       p₁ p₂)
@@ -9371,7 +9603,10 @@ theorem mir_exactPanicContract_exactPass_iff {callees₁ callees₂ : List Captu
   exactPanicContract_exactPass_iff (sem₁ := fun body => mirStatefulTrees body callees₁)
     (sem₂ := fun body => mirStatefulTrees body callees₂) hPass
 
-/-- An exact pass between captured MIR bodies transfers `TotalExactPanicContract` forward given target termination. -/
+/--
+An exact pass between captured MIR bodies transfers `TotalExactPanicContract`
+forward given target termination.
+-/
 theorem mir_totalExactPanicContract_exactPass_forward {callees₁ callees₂ : List CapturedMir}
     {src tgt : CapturedMir}
     {pre : MirInput → Prop} {post : MirInput → MirReturn → Prop}
@@ -9385,7 +9620,10 @@ theorem mir_totalExactPanicContract_exactPass_forward {callees₁ callees₂ : L
     (sem₁ := fun body => mirStatefulTrees body callees₁)
     (sem₂ := fun body => mirStatefulTrees body callees₂) hPass hTerm h
 
-/-- An exact pass between captured MIR bodies transfers `TotalExactPanicContract` backward given source termination. -/
+/--
+An exact pass between captured MIR bodies transfers `TotalExactPanicContract`
+backward given source termination.
+-/
 theorem mir_totalExactPanicContract_exactPass_backward {callees₁ callees₂ : List CapturedMir}
     {src tgt : CapturedMir}
     {pre : MirInput → Prop} {post : MirInput → MirReturn → Prop}
@@ -9398,5 +9636,137 @@ theorem mir_totalExactPanicContract_exactPass_backward {callees₁ callees₂ : 
   TotalExactPanicContract.exactPass_backward
     (sem₁ := fun body => mirStatefulTrees body callees₁)
     (sem₂ := fun body => mirStatefulTrees body callees₂) hPass hTerm h
+
+/-! ### Cross-effect value-outcome equivalence and `ExactPass` bridge -/
+
+/-- Project `MirOutcome` to its return value (forgetting final `Memory` internals). -/
+def mirOutcomeValue : MirOutcome → Outcome Value
+  | .normal (v, _) => .normal v
+  | .panic => .panic
+  | .abort => .abort
+
+/-- Value-projected interaction tree forgetting final `Memory` internals. -/
+def projectMirOutcomeValue {E : Effect.{0}} (t : ITree E MirOutcome) :
+    ITree E (Outcome Value) :=
+  t >>= fun out => pure (mirOutcomeValue out)
+
+private theorem filterMap_erase_eq_nil {E : Effect.{u}} (tr : List (Event E)) :
+    tr.filterMap (EffectObs.erase E PUnit).obsOf = [] := by
+  induction tr with
+  | nil => rfl
+  | cons e rest ih => exact ih
+
+private theorem ubClosedObsPrefixes_erase_iff_of_unique {E : Effect.{u}} [FaultEffect E]
+    {R : Type u} {t : ITree E R} {out : R}
+    (hSafe : TreeSafe t)
+    (hReach : ∃ tr, ReachesRet t tr out)
+    (hUniq : ∀ tr r, ReachesRet t tr r → r = out)
+    (p : ObsPrefix PUnit R) :
+    UBClosedObsPrefixes (EffectObs.erase E PUnit) t p ↔
+      p.trace = [] ∧ (p.outcome = .running ∨ p.outcome = .ret out) := by
+  constructor
+  · intro hp
+    rcases hp with hHas | ⟨trF, _, hF⟩
+    · cases p with
+      | mk tr o =>
+        cases o with
+        | running =>
+          obtain ⟨raw, _, _, hMap⟩ := hHas
+          rw [filterMap_erase_eq_nil] at hMap
+          exact ⟨hMap.symm, Or.inl rfl⟩
+        | ret r =>
+          obtain ⟨raw, hr, hMap⟩ := hHas
+          rw [filterMap_erase_eq_nil] at hMap
+          exact ⟨hMap.symm, Or.inr (congrArg TreePrefixOutcome.ret (hUniq raw r hr))⟩
+        | fault =>
+          obtain ⟨raw, u, hr, hf, _⟩ := hHas
+          exact False.elim (hSafe raw u hr hf)
+    · obtain ⟨raw, u, hr, hf, _⟩ := hF
+      exact False.elim (hSafe raw u hr hf)
+  · rintro ⟨hTr, hOut⟩
+    cases p with
+    | mk tr o =>
+      simp only at hTr hOut
+      subst hTr
+      refine Or.inl ?_
+      rcases hOut with rfl | rfl
+      · exact ⟨[], t, .refl t, rfl⟩
+      · obtain ⟨raw, hr⟩ := hReach
+        exact ⟨raw, hr, filterMap_erase_eq_nil raw⟩
+
+/--
+Cross-effect observational equivalence under `EffectObs.erase`: any two fault-free
+trees over arbitrary (possibly distinct) effects `E₁`, `E₂` that deterministically
+reach the same outcome `out` have identical `UBClosedObsPrefixes`.
+-/
+theorem ubClosedObsPrefixes_erase_eq_of_same_unique_outcome
+    {E₁ E₂ : Effect.{u}} [FaultEffect E₁] [FaultEffect E₂] {R : Type u}
+    {t₁ : ITree E₁ R} {t₂ : ITree E₂ R} {out : R}
+    (hSafe₁ : TreeSafe t₁) (hReach₁ : ∃ tr, ReachesRet t₁ tr out)
+    (hUniq₁ : ∀ tr r, ReachesRet t₁ tr r → r = out)
+    (hSafe₂ : TreeSafe t₂) (hReach₂ : ∃ tr, ReachesRet t₂ tr out)
+    (hUniq₂ : ∀ tr r, ReachesRet t₂ tr r → r = out) :
+    UBClosedObsPrefixes (EffectObs.erase E₁ PUnit) t₁ =
+      UBClosedObsPrefixes (EffectObs.erase E₂ PUnit) t₂ := by
+  funext p
+  exact propext
+    ((ubClosedObsPrefixes_erase_iff_of_unique hSafe₁ hReach₁ hUniq₁ p).trans
+      (ubClosedObsPrefixes_erase_iff_of_unique hSafe₂ hReach₂ hUniq₂ p).symm)
+
+/--
+Cross-effect `ExactPass` bridge: when two tree families (e.g., inlined `MirEffect`
+trees vs. `linkCalleeBorrowIsolatedHandler` `MirClosedEffect` trees) are
+fault-free and deterministically reach the same outcome on every input `x`, they
+are related by an `ExactPass` over `panicSemantics (EffectObs.erase _ PUnit)`.
+-/
+theorem exactPass_erase_of_same_unique_outcome
+    {Prog₁ : Type v₁} {Prog₂ : Type v₂} {E₁ E₂ : Effect.{u}}
+    [FaultEffect E₁] [FaultEffect E₂] {Val : Type u} {Inp : Type w}
+    {sem₁ : Prog₁ → Inp → ITree E₁ (Outcome Val)}
+    {sem₂ : Prog₂ → Inp → ITree E₂ (Outcome Val)}
+    {p₁ : Prog₁} {p₂ : Prog₂}
+    (hSame : ∀ x : Inp, ∃ out : Outcome Val,
+      TreeSafe (sem₁ p₁ x) ∧ (∃ tr, ReachesRet (sem₁ p₁ x) tr out) ∧
+        (∀ tr r, ReachesRet (sem₁ p₁ x) tr r → r = out) ∧
+      TreeSafe (sem₂ p₂ x) ∧ (∃ tr, ReachesRet (sem₂ p₂ x) tr out) ∧
+        (∀ tr r, ReachesRet (sem₂ p₂ x) tr r → r = out)) :
+    ExactPass
+      (panicSemantics (EffectObs.erase E₁ PUnit) sem₁)
+      (panicSemantics (EffectObs.erase E₂ PUnit) sem₂)
+      id id p₁ p₂ where
+  down_refines _ x := by
+    obtain ⟨out, hs₁, hr₁, hu₁, hs₂, hr₂, hu₂⟩ := hSame x
+    have hEq := ubClosedObsPrefixes_erase_eq_of_same_unique_outcome hs₁ hr₁ hu₁ hs₂ hr₂ hu₂
+    intro pref hp
+    change UBClosedObsPrefixes (EffectObs.erase E₂ PUnit) (sem₂ p₂ x) pref at hp
+    change UBClosedObsPrefixes (EffectObs.erase E₁ PUnit) (sem₁ p₁ x) pref
+    rwa [hEq]
+  up_refines _ x := by
+    obtain ⟨out, hs₁, hr₁, hu₁, hs₂, hr₂, hu₂⟩ := hSame x
+    have hEq := ubClosedObsPrefixes_erase_eq_of_same_unique_outcome hs₁ hr₁ hu₁ hs₂ hr₂ hu₂
+    intro pref hp
+    change UBClosedObsPrefixes (EffectObs.erase E₁ PUnit) (sem₁ p₁ x) pref at hp
+    change UBClosedObsPrefixes (EffectObs.erase E₂ PUnit) (sem₂ p₂ x) pref
+    rwa [← hEq]
+
+/--
+Lift a `DWP` proof pinning `mirOutcomeValue out = targetOut` to `TreeSafe`,
+existence, and uniqueness of `ReachesRet` on `projectMirOutcomeValue t`.
+-/
+theorem projectMirOutcomeValue_unique_of_dwp {E : Effect.{0}} [FaultEffect E]
+    {ewp : EffectWP E} [PureSoundWP ewp]
+    (hNonEmpty : ∀ i : E.I, ¬ FaultEffect.isFault i → Nonempty (E.O i))
+    {t : ITree E MirOutcome} {targetOut : Outcome Value}
+    (hDwp : DWP ewp t (fun out _ => mirOutcomeValue out = targetOut) PUnit.unit) :
+    TreeSafe (projectMirOutcomeValue t) ∧
+      (∃ tr, ReachesRet (projectMirOutcomeValue t) tr targetOut) ∧
+      (∀ tr r, ReachesRet (projectMirOutcomeValue t) tr r → r = targetOut) := by
+  have hProj : DWP ewp (projectMirOutcomeValue t) (fun r _ => r = targetOut) PUnit.unit := by
+    unfold projectMirOutcomeValue
+    exact DWP.bind (DWP.mono (fun _ _ hEq => DWP.ret hEq) hDwp)
+  have ⟨hSafe, hPost⟩ := dwlp_pure_adequacy (ewp := ewp) hProj.toDWLP
+  obtain ⟨tr, r, hr, hEq⟩ := exists_reachesRet_of_dwp hNonEmpty hProj
+  subst hEq
+  exact ⟨hSafe, ⟨tr, hr⟩, hPost⟩
 
 end Anneal.PanicContracts
