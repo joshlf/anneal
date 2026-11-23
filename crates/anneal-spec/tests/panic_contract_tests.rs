@@ -1955,6 +1955,462 @@ fn unwind_macros_accept_explicit_abort_policy() {
 }
 
 // ===========================================================================
+// 3c. `[adv ep2 A1]` Hardening: Deep Delimiter Scanning, Prelude Attrs,
+//     UTF-8 Escapes, CallBoundaryGuard Enforcement, WaiveAbort Domain Safety,
+//     Stateful Conjunctive Axis Probing & Stateful `abort_policy` Macros
+// ===========================================================================
+
+#[test]
+fn kani5095_deep_scanner_catches_targets_hidden_in_params_generics_and_macro_headers() {
+    use InlineBoundaryVerdict::*;
+    let strict = InlineScanOptions::strict();
+
+    // Hidden un-annotated `fn target` inside parameter const blocks, `impl`
+    // generic bounds, and `macro_rules!` arms starting with `impl` / `trait`.
+    for hidden in [
+        "#[inline(never)] fn target() {}\nfn sneaky(_: [u8; { fn target() {} 1 }]) {}",
+        "#[inline(never)] fn target() {}\nmacro_rules! mk { (impl $t:ty) => (fn target() {}); }",
+        "#[inline(never)] fn target() {}\nmacro_rules! mk { (trait $t:ident) => (fn target() {}); }",
+        "#[inline(never)] fn target() {}\nimpl Foo<[u8; { fn target() {} 1 }]> {}",
+        "#[inline(never)] fn target() {}\nimpl<const N: usize = { fn target() {} 1 }> Foo<N> {}",
+    ] {
+        assert_eq!(
+            verify_fn_inline_never_source(hidden, "target"),
+            MissingInlineNever,
+            "{hidden}"
+        );
+        assert_eq!(
+            verify_fn_inline_never_source_with_options(hidden, "target", strict),
+            MissingInlineNever,
+            "{hidden}"
+        );
+    }
+
+    // Prelude-qualified `inline` and `cfg_attr` attributes cannot bypass checks.
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "#[inline(never)]\n#[core::prelude::v1::inline(always)]\nfn target() {}",
+            "target"
+        ),
+        ConflictingInlineAttributes
+    );
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "#[::core::prelude::v1::inline(always)]\nfn target() {}",
+            "target"
+        ),
+        ForbiddenInlineHint
+    );
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "#[::std::prelude::rust_2024::inline(never)]\nfn target() {}",
+            "target"
+        ),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "#[core::prelude::v1::cfg_attr(all(), core::prelude::v1::inline(never))]\nfn target() {}",
+            "target"
+        ),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "#[core::prelude::v1::cfg_attr(test, inline(never))]\nfn target() {}",
+            "target"
+        ),
+        ConditionalInlineNever
+    );
+
+    // Symmetric raw-identifier normalization (`r#match` <-> `match`, `r#target` <-> `target`).
+    assert_eq!(
+        verify_fn_inline_never_source("#[inline(never)]\nfn r#match() {}", "match"),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source("#[inline(never)]\nfn r#match() {}", "r#match"),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source("#[inline(never)]\nfn target() {}", "r#target"),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source("#[inline(never)]\nfn target() {}", "r#"),
+        TargetFunctionNotFound
+    );
+
+    // Non-ASCII UTF-8 bytes immediately after backslash escapes never panic on
+    // UTF-8 char-boundary slicing!
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "const S: &str = \"\\🦀\";\n#[inline(never)]\nfn target() {}",
+            "target"
+        ),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source(
+            "const C: char = '\\🦀';\n#[inline(never)]\nfn target() {}",
+            "target"
+        ),
+        Verified
+    );
+    assert_eq!(
+        verify_fn_inline_never_source("const BAD: char = '\\x🦀'; fn target() {}", "target"),
+        MalformedSource
+    );
+
+    // Deeply nested parameter groups fail closed instead of overflowing the stack.
+    let mut deeply_nested = String::from("#[inline(never)] fn target(x: ");
+    for _ in 0..40 {
+        deeply_nested.push('(');
+    }
+    deeply_nested.push_str("u8");
+    for _ in 0..40 {
+        deeply_nested.push(')');
+    }
+    deeply_nested.push_str(") { let _ = x; }");
+    assert_eq!(
+        verify_fn_inline_never_source(&deeply_nested, "target"),
+        MalformedSource
+    );
+}
+
+#[test]
+fn kani5095_call_boundary_guard_and_syntactic_capacity_hardening() {
+    const CALLER: &str = "crate::api::safe_add";
+    const TARGET: &str = "crate::math::checked_add_u8";
+
+    // `require_inline_never = false` still checks existence, forbidden inline
+    // hints, malformed source, and `forbid_trait_dispatch`!
+    let relaxed = CallBoundaryGuard::new(CALLER, TARGET).with_require_inline_never(false);
+    assert_eq!(
+        relaxed.verify_target_source("fn other() {}", "checked_add_u8"),
+        InlineBoundaryVerdict::TargetFunctionNotFound
+    );
+    assert_eq!(
+        relaxed.verify_target_source("#[inline(always)] fn checked_add_u8() {}", "checked_add_u8"),
+        InlineBoundaryVerdict::ForbiddenInlineHint
+    );
+    assert_eq!(
+        relaxed.verify_target_source("fn checked_add_u8<T>(x: T) -> T { x }", "checked_add_u8"),
+        InlineBoundaryVerdict::ForbiddenPolymorphicOrTraitDefault
+    );
+    assert_eq!(
+        relaxed.verify_target_source("fn checked_add_u8() {}", "checked_add_u8"),
+        InlineBoundaryVerdict::Verified
+    );
+
+    // `CallBoundaryGuard::verify_caller_in_callees` enforces `caller_path`!
+    let guard = CallBoundaryGuard::new(CALLER, TARGET).with_expected_call_sites(2);
+    let caller_blocks = [
+        MirBlockSummary::call(TARGET, &[1]),
+        MirBlockSummary::call(TARGET, &[2]),
+        MirBlockSummary::ret(),
+    ];
+    let callees_ok = [CalleeEntry::new(CALLER, &caller_blocks)];
+    assert_eq!(
+        guard.verify_caller_in_callees(&callees_ok, &[]),
+        CallBoundaryVerdict::Preserved {
+            observed_call_sites: 2,
+            reachable_blocks: 3,
+        }
+    );
+    let wrong_caller = [CalleeEntry::new("crate::api::other_fn", &caller_blocks)];
+    assert_eq!(
+        guard.verify_caller_in_callees(&wrong_caller, &[]),
+        CallBoundaryVerdict::MissingExpectedCaller { caller_index: 0 }
+    );
+
+    // `CallBoundaryGuard::verify_call_chain` enforces `forbid_trait_dispatch`.
+    let hop_blocks = [MirBlockSummary::tail_call(TARGET)];
+    let root_blocks = [MirBlockSummary::call("crate::mid", &[1]), MirBlockSummary::ret()];
+    let chain_callees = [CalleeEntry::new("crate::mid", &hop_blocks)];
+    let hop_trait = [TraitImplBinding::new("crate::mid", "crate::evil_mid")];
+    assert_eq!(
+        guard.verify_call_chain(&root_blocks, &chain_callees, &hop_trait, &["crate::mid"]),
+        CallBoundaryVerdict::ChainHopTraitDispatched { hop_index: 0 }
+    );
+    assert!(
+        guard
+            .with_forbid_trait_dispatch(false)
+            .verify_call_chain(&root_blocks, &chain_callees, &hop_trait, &["crate::mid"])
+            .is_preserved()
+    );
+
+    // Syntactic checkers enforce `MAX_MIR_BLOCKS` and report `reachable_blocks: 0`.
+    assert_eq!(
+        verify_call_boundary(&caller_blocks, &[], &[], TARGET),
+        CallBoundaryVerdict::Preserved {
+            observed_call_sites: 2,
+            reachable_blocks: 0,
+        }
+    );
+    assert_eq!(
+        verify_counted_call_sites(&caller_blocks, &[], &[], TARGET, 2),
+        CallBoundaryVerdict::Preserved {
+            observed_call_sites: 2,
+            reachable_blocks: 0,
+        }
+    );
+    let oversized = [MirBlockSummary::call(TARGET, &[]); MAX_MIR_BLOCKS + 1];
+    assert_eq!(
+        verify_call_boundary(&oversized, &[], &[], TARGET),
+        CallBoundaryVerdict::CfgExceedsCapacity {
+            block_count: MAX_MIR_BLOCKS + 1,
+            max_blocks: MAX_MIR_BLOCKS,
+        }
+    );
+    assert_eq!(
+        verify_counted_call_sites(&oversized, &[], &[], TARGET, 1),
+        CallBoundaryVerdict::CfgExceedsCapacity {
+            block_count: MAX_MIR_BLOCKS + 1,
+            max_blocks: MAX_MIR_BLOCKS,
+        }
+    );
+}
+
+#[test]
+fn stage_p3a_waive_abort_domain_safety_and_stateful_conjunctive_axis_probe() {
+    let cfg = PanicCheckConfig::default()
+        .with_max_trials(128)
+        .with_probe_domain(ProbeDomain::PreconditionOnly);
+
+    // Under `OnlyIf` + `WaiveAbortUnchecked`, `x < 20` aborts. Even when
+    // `post` is vacuous (`true` on `20..80`) and triggers Stage P3a
+    // classification probes, `PreconditionOnly` MUST NOT pass unsampled
+    // potentially-aborting inputs (`x < 20`) to `post`!
+    let waived_probe = PanicsOnlyIf::new(
+        |&x: &u8| x < 100,
+        |&x: &u8| x >= 80,
+        |&x: &u8, &_r: &u8| {
+            assert!(x >= 20 && x < 80, "post called on aborting/panicking input {x}!");
+            true
+        },
+    )
+    .with_waive_abort_unchecked::<u8>()
+    .check(cfg, |&x: &u8| {
+        if x < 20 {
+            PanicExecOutcome::Aborted
+        } else if x >= 80 {
+            PanicExecOutcome::Panicked
+        } else {
+            PanicExecOutcome::Returned(x)
+        }
+    });
+    assert_eq!(
+        waived_probe.failure_class(),
+        Some(PanicFailureClass::TrivialNormalPostcondition)
+    );
+    match waived_probe.failure().unwrap().detail {
+        PanicFailureDetail::AllNormalMutantsSurvived {
+            probed_inputs,
+            out_of_normal_domain_probes,
+            skipped_out_of_normal_domain,
+            ..
+        } => {
+            assert_eq!(probed_inputs, 1); // anchor input only!
+            assert_eq!(out_of_normal_domain_probes, 0);
+            assert!(skipped_out_of_normal_domain > 0);
+        }
+        other => panic!("unexpected detail: {other:?}"),
+    }
+
+    // Stateful conjunctive postcondition where `ret` kills mutants on live hits
+    // (`old_s < 10`), while `new_s` is only constrained outside `old_s < 10`:
+    // `(ret == old_s.wrapping_add(1)) && (old_s < 10 || new_s == 2)`.
+    // On `old_s >= 10`, `anchor_ret == 1` never satisfies `ret == old_s + 1`, so
+    // `probe_stateful_normal_state_axis` MUST probe `anchor_ret` mutants (e.g.
+    // `probe_ret = 255` at `old_s = 254`) to discover `new_s` sensitivity and
+    // report `SurvivedAllNormalMutants` instead of `UnboundNormalReturnOutput`!
+    let conj_outcome = StatefulPanicContractSpec::exact::<u8, ()>(
+        |&s: &u8, _: &()| s < 20,
+        |&s: &u8, _: &()| s >= 10,
+        |&old_s: &u8, _: &(), &new_s: &u8, &ret: &u8| {
+            ret == old_s.wrapping_add(1) && (old_s < 10 || new_s == 2)
+        },
+    )
+    .check(
+        cfg.with_probe_domain(ProbeDomain::Unconstrained),
+        |s: &mut u8, _: &()| {
+            if *s >= 10 {
+                PanicExecOutcome::Panicked
+            } else {
+                *s += 1;
+                PanicExecOutcome::Returned(*s)
+            }
+        },
+    );
+    assert_eq!(
+        conj_outcome.failure_class(),
+        Some(PanicFailureClass::SurvivedAllNormalMutants)
+    );
+    assert!(matches!(
+        conj_outcome.failure().unwrap().detail,
+        PanicFailureDetail::StatefulNormalAxisUnconstrained {
+            state_mutants_killed: 0,
+            return_mutants_killed,
+            ..
+        } if return_mutants_killed > 0
+    ));
+
+    // Also verify mutant-chain flip reaches point predicate `new_s == 42` on
+    // the state axis when `ret` is satisfied by `anchor_ret`.
+    let chain_outcome = StatefulPanicContractSpec::exact::<u8, ()>(
+        |&s: &u8, _: &()| s < 20,
+        |&s: &u8, _: &()| s >= 10,
+        |&old_s: &u8, _: &(), &new_s: &u8, &ret: &u8| {
+            (ret <= 10) && (old_s < 10 || new_s == 42)
+        },
+    )
+    .check(
+        cfg.with_probe_domain(ProbeDomain::Unconstrained),
+        |s: &mut u8, _: &()| {
+            if *s >= 10 {
+                PanicExecOutcome::Panicked
+            } else {
+                *s += 1;
+                PanicExecOutcome::Returned(*s)
+            }
+        },
+    );
+    assert_eq!(
+        chain_outcome.failure_class(),
+        Some(PanicFailureClass::SurvivedAllNormalMutants)
+    );
+}
+
+#[test]
+fn stateful_unwind_macros_with_explicit_abort_policy_and_fallible_wrappers() {
+    let cfg = PanicCheckConfig::default().with_max_trials(256);
+
+    // Non-`Copy` struct with `check_panic_contract_unwind!` `abort_policy = ...`
+    // and unannotated closure parameter verifying HRTB inference.
+    let range_stats = assert_panic_contract_strong_unwind!(
+        cfg,
+        PanicContractMode::OnlyIf,
+        |pair: &RangePair| pair.__anneal_type_invariant_range_pair(),
+        |pair: &RangePair| pair.lo == pair.hi,
+        abort_policy = AbortPolicy::AbortOnlyIf(|pair: &RangePair| pair.lo == 0),
+        |pair: &RangePair| checked_range_span(pair),
+        |pair: &RangePair, &span: &u8| span == pair.hi - pair.lo && span > 0,
+    );
+    assert!(range_stats.abort_cond_hits > 0);
+    assert!(range_stats.observed_panics > 0);
+
+    // Stateful `assert_stateful_panic_contract_strong_unwind!` with
+    // `abort_policy = ...` both without and with `panic_state_inv`.
+    let st_stats = assert_stateful_panic_contract_strong_unwind!(
+        cfg,
+        PanicContractMode::OnlyIf,
+        |s: &BoundedStack, _v: &u8| s.__anneal_type_invariant_bounded_stack(),
+        |s: &BoundedStack, _v: &u8| s.len == 3,
+        abort_policy = AbortPolicy::AbortOnlyIf(|s: &BoundedStack, _v: &u8| s.len == 0),
+        |s: &mut BoundedStack, &v: &u8| s.push_safe(v),
+        |old_s: &BoundedStack, &v: &u8, new_s: &BoundedStack, &new_len: &u8| {
+            new_s.__anneal_type_invariant_bounded_stack()
+                && new_s.len == old_s.len + 1
+                && new_len == new_s.len
+                && new_s.slots[old_s.len as usize] == v
+        },
+        |old_s: &BoundedStack, post_s: &BoundedStack| post_s == old_s,
+    );
+    assert!(st_stats.abort_cond_hits > 0);
+    assert!(st_stats.panic_state_inv_checks > 0);
+
+    // Stateful `check_stateful_panic_contract_unwind!` without `panic_state_inv`
+    // catches a trapping `abort_cond` cleanly as `AbortConditionPanicked`.
+    let st_trapped = check_stateful_panic_contract_unwind!(
+        cfg,
+        PanicContractMode::OnlyIf,
+        |s: &BoundedStack, _v: &u8| s.__anneal_type_invariant_bounded_stack(),
+        |s: &BoundedStack, _v: &u8| s.len == 3,
+        abort_policy = AbortPolicy::AbortOnlyIf(|s: &BoundedStack, _v: &u8| {
+            assert!(s.len != 0, "stateful abort_cond trap");
+            false
+        }),
+        |s: &mut BoundedStack, &v: &u8| s.push_safe(v),
+        |old_s: &BoundedStack, &v: &u8, new_s: &BoundedStack, &new_len: &u8| {
+            new_s.len == old_s.len + 1 && new_len == new_s.len && new_s.slots[old_s.len as usize] == v
+        },
+    );
+    assert!(matches!(
+        st_trapped.failure().unwrap().detail,
+        PanicFailureDetail::PredicateTrapped {
+            trap: PanicTrapKind::AbortConditionPanicked,
+            ..
+        }
+    ));
+
+    // Typed wrapper `check_fallible` parity on `NeverPanics`, `PanicsOnlyIf`,
+    // `PanicsIf`, `ExactPanicContract`, and `StatefulPanicContractSpec::with_waive_abort_unchecked`.
+    assert!(
+        NeverPanics::new(
+            |&x: &u8| Ok(x < 100),
+            |&x: &u8, &r: &u8| Ok(r == x),
+        )
+        .check_fallible(cfg, |&x: &u8| PanicExecOutcome::Returned(x))
+        .is_strong()
+    );
+    assert!(
+        ExactPanicContract::new(
+            |&x: &u8| Ok(x < 100),
+            |&x: &u8| Ok(x >= 50),
+            |&x: &u8, &r: &u8| Ok(r == x),
+        )
+        .check_fallible(cfg, |&x: &u8| {
+            if x >= 50 {
+                PanicExecOutcome::Panicked
+            } else {
+                PanicExecOutcome::Returned(x)
+            }
+        })
+        .is_strong()
+    );
+    assert!(
+        PanicsOnlyIf::new(
+            |&x: &u8| Ok(x < 100),
+            |&x: &u8| Ok(x >= 50),
+            |&x: &u8, &r: &u8| Ok(r == x),
+        )
+        .check_fallible(cfg, |&x: &u8| PanicExecOutcome::Returned(x))
+        .is_strong()
+    );
+    assert!(
+        PanicsIf::new(|&x: &u8| Ok(x < 100), |&x: &u8| Ok(x >= 50))
+            .check_fallible(cfg, |&x: &u8| {
+                if x >= 50 {
+                    PanicExecOutcome::Panicked
+                } else {
+                    PanicExecOutcome::Returned(x)
+                }
+            })
+            .is_strong()
+    );
+    assert!(
+        StatefulPanicContractSpec::only_if::<u8, ()>(
+            |&s: &u8, _: &()| s < 100,
+            |&s: &u8, _: &()| s >= 80,
+            |&old_s: &u8, _: &(), &new_s: &u8, &r: &u8| new_s == old_s + 1 && r == new_s,
+        )
+        .with_waive_abort_unchecked()
+        .check(cfg, |s: &mut u8, _: &()| {
+            if *s == 0 {
+                PanicExecOutcome::Aborted
+            } else if *s >= 80 {
+                PanicExecOutcome::Panicked
+            } else {
+                *s += 1;
+                PanicExecOutcome::Returned(*s)
+            }
+        })
+        .is_strong()
+    );
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 

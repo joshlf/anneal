@@ -958,15 +958,21 @@ const fn hint_to_panic_class(hint: SyntacticBindingHint) -> PanicFailureClass {
 
 /// Evaluates normal-domain admissibility for a probe input:
 /// - `panic_cond` and `abort_cond` are NEVER called unless `pre` returned `Ok(true)`.
-/// - Returns `Some(true)` iff `pre && !panic_cond && !abort_cond`.
+/// - Returns `Some(true)` iff `pre && !panic_cond && !abort_cond` AND the
+///   abort policy does not permit arbitrary unguarded aborts
+///   ([`AbortPolicyKind::WaiveAbortUnchecked`]). Under `WaiveAbortUnchecked`,
+///   unsampled probe inputs may abort on execution, so under
+///   [`ProbeDomain::PreconditionOnly`] they are withheld from `post` (only the
+///   live `Returned` anchor input is guaranteed non-aborting).
 /// - Returns `Some(false)` under [`ProbeDomain::Unconstrained`] when outside
-///   the normal domain (with well-defined predicate outcomes).
-/// - Returns `None` under [`ProbeDomain::PreconditionOnly`] outside the normal
-///   domain, or whenever any gating predicate (`pre`, `panic_cond`, `abort_cond`)
-///   traps.
+///   the guaranteed normal domain (with well-defined predicate outcomes).
+/// - Returns `None` under [`ProbeDomain::PreconditionOnly`] outside the
+///   guaranteed normal domain, or whenever any gating predicate (`pre`,
+///   `panic_cond`, `abort_cond`) traps.
 fn normal_probe_admission<Pre, PanicCond, AbortCond>(
     domain: ProbeDomain,
     mode: PanicContractMode,
+    abort_kind: AbortPolicyKind,
     pre: Pre,
     panic_cond: PanicCond,
     abort_cond: Option<AbortCond>,
@@ -986,14 +992,18 @@ where
                     Err(()) => return None,
                 }
             };
-            let aborts = match abort_cond {
-                Some(f) => match f() {
-                    Ok(b) => b,
-                    Err(()) => return None,
+            let aborts_or_unbounded = match abort_kind {
+                AbortPolicyKind::ForbidAbort => false,
+                AbortPolicyKind::WaiveAbortUnchecked => true,
+                AbortPolicyKind::AbortOnlyIf => match abort_cond {
+                    Some(f) => match f() {
+                        Ok(b) => b,
+                        Err(()) => return None,
+                    },
+                    None => true,
                 },
-                None => false,
             };
-            if !panics && !aborts {
+            if !panics && !aborts_or_unbounded {
                 Some(true)
             } else {
                 match domain {
@@ -1196,10 +1206,12 @@ where
     if !evidence.saw_output_sensitivity {
         for idx in 0..probe_input_count {
             let x_probe = I::sample_at(idx, &mut probe_rng);
+            let abort_kind = abort_policy.kind();
             let admissible = match abort_policy {
                 AbortPolicy::AbortOnlyIf(abort_cond) => normal_probe_admission(
                     config.spec_config.probe_domain,
                     mode,
+                    abort_kind,
                     || pre(&x_probe),
                     || panic_cond(&x_probe),
                     Some(|| abort_cond(&x_probe)),
@@ -1208,6 +1220,7 @@ where
                     normal_probe_admission(
                         config.spec_config.probe_domain,
                         mode,
+                        abort_kind,
                         || pre(&x_probe),
                         || panic_cond(&x_probe),
                         None::<fn() -> Result<bool, ()>>,
@@ -2080,10 +2093,12 @@ where
         );
         for idx in 0..probe_input_count {
             let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
+            let abort_kind = abort_policy.kind();
             let admissible = match abort_policy {
                 AbortPolicy::AbortOnlyIf(abort_cond) => normal_probe_admission(
                     config.spec_config.probe_domain,
                     mode,
+                    abort_kind,
                     || pre(&old_s, &args),
                     || panic_cond(&old_s, &args),
                     Some(|| abort_cond(&old_s, &args)),
@@ -2092,6 +2107,7 @@ where
                     normal_probe_admission(
                         config.spec_config.probe_domain,
                         mode,
+                        abort_kind,
                         || pre(&old_s, &args),
                         || panic_cond(&old_s, &args),
                         None::<fn() -> Result<bool, ()>>,
@@ -2216,7 +2232,10 @@ where
     let mut state_probe_rng = probe_rng.fork();
     let mut ret_probe_rng = probe_rng.fork();
     let mut saw_sensitivity = false;
-    let mut rejected_witnesses: [Option<(S, A, S, bool)>; 4] = [None, None, None, None];
+    // Stratified witness slots indexed by `(admissible as usize) * 3 + kind`
+    // (`kind`: 0 = `anchor_new_s`/`old_s`, 1 = first mutant of `old_s`, 2 = second mutant)
+    // matching `spec_check::probe_stateful_return_axis`.
+    let mut rejected_witnesses: [Option<(S, A, S, bool)>; 6] = [None, None, None, None, None, None];
     let mut accepted_witnesses: [Option<(S, A, S, bool)>; 2] = [None, None];
 
     let probe_input_count = probe_input_budget(
@@ -2225,10 +2244,12 @@ where
     );
     for idx in 0..probe_input_count {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
+        let abort_kind = abort_policy.kind();
         let admissible = match abort_policy {
             AbortPolicy::AbortOnlyIf(abort_cond) => normal_probe_admission(
                 config.spec_config.probe_domain,
                 mode,
+                abort_kind,
                 || pre(&old_s, &args),
                 || panic_cond(&old_s, &args),
                 Some(|| abort_cond(&old_s, &args)),
@@ -2236,6 +2257,7 @@ where
             AbortPolicy::ForbidAbort | AbortPolicy::WaiveAbortUnchecked => normal_probe_admission(
                 config.spec_config.probe_domain,
                 mode,
+                abort_kind,
                 || pre(&old_s, &args),
                 || panic_cond(&old_s, &args),
                 None::<fn() -> Result<bool, ()>>,
@@ -2245,17 +2267,20 @@ where
             continue;
         };
 
-        let mut state_cands: [Option<(S, usize)>; 4] = [
-            Some((anchor_new_s.clone(), 0)),
-            Some((old_s.clone(), 0)),
-            None,
-            None,
-        ];
+        let mut state_cands: [Option<(S, usize)>; 5] = [None, None, None, None, None];
+        if idx % 2 == 0 {
+            state_cands[0] = Some((anchor_new_s.clone(), 0));
+            state_cands[1] = Some((old_s.clone(), 0));
+        } else {
+            state_cands[0] = Some((old_s.clone(), 0));
+            state_cands[1] = Some((anchor_new_s.clone(), 0));
+        }
         if !S::IS_SUBSINGLETON {
             let mut slot = 2usize;
             old_s.visit_mutants(&mut state_probe_rng, |cand_s| {
                 if slot < state_cands.len() && cand_s != old_s {
-                    state_cands[slot] = Some((cand_s, 1));
+                    let kind = if slot == 2 { 1 } else { 2 };
+                    state_cands[slot] = Some((cand_s, kind));
                     slot += 1;
                 }
             });
@@ -2288,8 +2313,12 @@ where
                 break;
             }
             if base == ProbeVerdict::Rejected {
-                let rej_slot = acc_slot * 2 + kind;
-                if rejected_witnesses[rej_slot].is_none() && best_rej.is_none() {
+                let rej_slot = acc_slot * 3 + kind;
+                let prefer = match &best_rej {
+                    None => true,
+                    Some((prev_slot, _)) => *prev_slot < rej_slot,
+                };
+                if rejected_witnesses[rej_slot].is_none() && prefer {
                     best_rej = Some((rej_slot, probe_new_s));
                 }
             } else if base == ProbeVerdict::Accepted
@@ -2370,9 +2399,12 @@ where
 
     let mut probe_rng = SplitMix64::new(config.spec_config.seed ^ 0x51A7_E002_C3C3_3C3C);
     let mut state_probe_rng = probe_rng.fork();
+    let mut ret_probe_rng = probe_rng.fork();
     let mut saw_sensitivity = false;
-    let mut rejected_witnesses: [Option<(S, A, bool)>; 2] = [None, None];
-    let mut accepted_witnesses: [Option<(S, A, bool)>; 2] = [None, None];
+    // Stratified witness slots indexed by `(admissible as usize) * 2 + (mutated_ret as usize)`
+    // (`None` borrows `&anchor_ret`, avoiding `R: Clone`), matching `spec_check::probe_stateful_state_axis`.
+    let mut rejected_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
+    let mut accepted_witnesses: [Option<(S, A, Option<R>, bool)>; 4] = [None, None, None, None];
 
     let probe_input_count = probe_input_budget(
         <(S, A) as SampleInput>::BOUNDARY_COUNT,
@@ -2380,10 +2412,12 @@ where
     );
     for idx in 0..probe_input_count {
         let (old_s, args) = <(S, A) as SampleInput>::sample_at(idx, &mut probe_rng);
+        let abort_kind = abort_policy.kind();
         let admissible = match abort_policy {
             AbortPolicy::AbortOnlyIf(abort_cond) => normal_probe_admission(
                 config.spec_config.probe_domain,
                 mode,
+                abort_kind,
                 || pre(&old_s, &args),
                 || panic_cond(&old_s, &args),
                 Some(|| abort_cond(&old_s, &args)),
@@ -2391,6 +2425,7 @@ where
             AbortPolicy::ForbidAbort | AbortPolicy::WaiveAbortUnchecked => normal_probe_admission(
                 config.spec_config.probe_domain,
                 mode,
+                abort_kind,
                 || pre(&old_s, &args),
                 || panic_cond(&old_s, &args),
                 None::<fn() -> Result<bool, ()>>,
@@ -2400,33 +2435,97 @@ where
             continue;
         };
 
+        let acc_slot = usize::from(admissible);
+        let mut base_anchor = ProbeVerdict::Undefined;
+
         let base = probe_verdict(post(&old_s, &args, &anchor_new_s, &anchor_ret), admissible);
-        if base == ProbeVerdict::Undefined {
-            continue;
-        }
-        let rev = probe_verdict(post(&old_s, &args, &old_s, &anchor_ret), admissible);
-        let mut varied = rev != ProbeVerdict::Undefined && rev != base;
-        if !varied {
-            anchor_new_s.visit_mutants(&mut state_probe_rng, |cand_s| {
-                if varied {
-                    return;
-                }
-                let v = probe_verdict(post(&old_s, &args, &cand_s, &anchor_ret), admissible);
-                if v != ProbeVerdict::Undefined && v != base {
-                    varied = true;
-                }
-            });
-        }
-        if varied {
-            saw_sensitivity = true;
-            break;
+        if base != ProbeVerdict::Undefined {
+            base_anchor = base;
+            let rev = probe_verdict(post(&old_s, &args, &old_s, &anchor_ret), admissible);
+            let mut varied = rev != ProbeVerdict::Undefined && rev != base;
+            if !varied {
+                anchor_new_s.visit_mutants(&mut state_probe_rng, |cand_s| {
+                    if varied {
+                        return;
+                    }
+                    let v = probe_verdict(post(&old_s, &args, &cand_s, &anchor_ret), admissible);
+                    if v != ProbeVerdict::Undefined && v != base {
+                        varied = true;
+                    }
+                });
+            }
+            if varied {
+                saw_sensitivity = true;
+                break;
+            }
         }
 
-        let slot = usize::from(admissible);
-        if base == ProbeVerdict::Rejected && rejected_witnesses[slot].is_none() {
-            rejected_witnesses[slot] = Some((old_s, args, admissible));
-        } else if base == ProbeVerdict::Accepted && accepted_witnesses[slot].is_none() {
-            accepted_witnesses[slot] = Some((old_s, args, admissible));
+        // Also probe up to 5 mutants of `anchor_ret` (holding each fixed while
+        // varying `new_s`) so conjunctive postconditions pairing `ret` with
+        // `old_s` do not hide state-axis sensitivity.
+        let mut best_rej_mut: Option<R> = None;
+        let mut best_acc_mut: Option<R> = None;
+        if !R::IS_SUBSINGLETON {
+            let mut ret_cands: [Option<R>; 5] = [None, None, None, None, None];
+            let mut r_slot = 0usize;
+            anchor_ret.visit_mutants(&mut ret_probe_rng, |cand_r| {
+                if r_slot < ret_cands.len() && cand_r != anchor_ret {
+                    ret_cands[r_slot] = Some(cand_r);
+                    r_slot += 1;
+                }
+            });
+
+            for probe_ret in ret_cands.into_iter().flatten() {
+                let b = probe_verdict(post(&old_s, &args, &anchor_new_s, &probe_ret), admissible);
+                if b == ProbeVerdict::Undefined {
+                    continue;
+                }
+                let rev = probe_verdict(post(&old_s, &args, &old_s, &probe_ret), admissible);
+                let mut varied = rev != ProbeVerdict::Undefined && rev != b;
+                if !varied {
+                    anchor_new_s.visit_mutants(&mut state_probe_rng, |cand_s| {
+                        if varied {
+                            return;
+                        }
+                        let v = probe_verdict(post(&old_s, &args, &cand_s, &probe_ret), admissible);
+                        if v != ProbeVerdict::Undefined && v != b {
+                            varied = true;
+                        }
+                    });
+                }
+                if varied {
+                    saw_sensitivity = true;
+                    break;
+                }
+                if b == ProbeVerdict::Rejected
+                    && rejected_witnesses[acc_slot * 2 + 1].is_none()
+                    && best_rej_mut.is_none()
+                {
+                    best_rej_mut = Some(probe_ret);
+                } else if b == ProbeVerdict::Accepted
+                    && accepted_witnesses[acc_slot * 2 + 1].is_none()
+                    && best_acc_mut.is_none()
+                {
+                    best_acc_mut = Some(probe_ret);
+                }
+            }
+            if saw_sensitivity {
+                break;
+            }
+        }
+
+        if let Some(probe_ret) = best_rej_mut {
+            rejected_witnesses[acc_slot * 2 + 1] = Some((old_s, args, Some(probe_ret), admissible));
+        } else if base_anchor == ProbeVerdict::Rejected
+            && rejected_witnesses[acc_slot * 2].is_none()
+        {
+            rejected_witnesses[acc_slot * 2] = Some((old_s, args, None, admissible));
+        } else if let Some(probe_ret) = best_acc_mut {
+            accepted_witnesses[acc_slot * 2 + 1] = Some((old_s, args, Some(probe_ret), admissible));
+        } else if base_anchor == ProbeVerdict::Accepted
+            && accepted_witnesses[acc_slot * 2].is_none()
+        {
+            accepted_witnesses[acc_slot * 2] = Some((old_s, args, None, admissible));
         }
     }
 
@@ -2439,16 +2538,16 @@ where
             {
                 return true;
             }
-            for (os, a, admissible) in accepted_witnesses.iter().flatten() {
-                if probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
-                    == ProbeVerdict::Rejected
+            for (os, a, opt_r, admissible) in accepted_witnesses.iter().flatten() {
+                let r_ref = opt_r.as_ref().unwrap_or(&anchor_ret);
+                if probe_verdict(post(os, a, cand_s, r_ref), *admissible) == ProbeVerdict::Rejected
                 {
                     return true;
                 }
             }
-            for (os, a, admissible) in rejected_witnesses.iter().flatten() {
-                if probe_verdict(post(os, a, cand_s, &anchor_ret), *admissible)
-                    == ProbeVerdict::Accepted
+            for (os, a, opt_r, admissible) in rejected_witnesses.iter().flatten() {
+                let r_ref = opt_r.as_ref().unwrap_or(&anchor_ret);
+                if probe_verdict(post(os, a, cand_s, r_ref), *admissible) == ProbeVerdict::Accepted
                 {
                     return true;
                 }
@@ -3424,6 +3523,32 @@ impl<Pre, PanicCond, Post> PanicsOnlyIf<Pre, PanicCond, Post> {
         self.into_spec::<I>().check(config, body)
     }
 
+    /// Checks this `PanicsOnlyIf` contract with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_contract_fallible(
+            config,
+            PanicContractMode::OnlyIf,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+        )
+    }
+
     /// Runs Stage P3b guard-mutant checking under [`AbortPolicy::ForbidAbort`].
     pub fn check_guard_mutants<I, R, Body>(
         self,
@@ -3452,6 +3577,10 @@ pub struct PanicsIf<Pre, PanicCond> {
 
 fn trivial_unused_post<I, R>(_input: &I, _ret: &R) -> bool {
     true
+}
+
+fn trivial_unused_post_fallible<I, R>(_input: &I, _ret: &R) -> Result<bool, ()> {
+    Ok(true)
 }
 
 impl<Pre, PanicCond> PanicsIf<Pre, PanicCond> {
@@ -3487,6 +3616,20 @@ impl<Pre, PanicCond> PanicsIf<Pre, PanicCond> {
         }
     }
 
+    /// Attaches [`AbortPolicy::WaiveAbortUnchecked`] and returns a
+    /// [`PanicContractSpec`].
+    pub fn with_waive_abort_unchecked<I, R>(
+        self,
+    ) -> PanicContractSpec<Pre, PanicCond, fn(&I) -> bool, fn(&I, &R) -> bool> {
+        PanicContractSpec {
+            mode: PanicContractMode::If,
+            pre: self.pre,
+            panic_cond: self.panic_cond,
+            abort_policy: waive_abort_unchecked::<I>(),
+            post: trivial_unused_post::<I, R>,
+        }
+    }
+
     /// Checks this `PanicsIf` contract under [`AbortPolicy::ForbidAbort`].
     pub fn check<I, R, Body>(self, config: PanicCheckConfig, body: Body) -> PanicCheckOutcome
     where
@@ -3497,6 +3640,31 @@ impl<Pre, PanicCond> PanicsIf<Pre, PanicCond> {
         Body: FnMut(&I) -> PanicExecOutcome<R>,
     {
         self.into_spec::<I, R>().check(config, body)
+    }
+
+    /// Checks this `PanicsIf` contract with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+    {
+        check_panic_contract_fallible(
+            config,
+            PanicContractMode::If,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            trivial_unused_post_fallible::<I, R>,
+        )
     }
 
     /// Runs Stage P3b guard-mutant checking under [`AbortPolicy::ForbidAbort`].
@@ -3590,6 +3758,32 @@ impl<Pre, PanicCond, Post> ExactPanicContract<Pre, PanicCond, Post> {
         self.into_spec::<I>().check(config, body)
     }
 
+    /// Checks this `ExactPanicContract` with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        PanicCond: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_contract_fallible(
+            config,
+            PanicContractMode::Exact,
+            self.pre,
+            self.panic_cond,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+        )
+    }
+
     /// Runs Stage P3b guard-mutant checking under [`AbortPolicy::ForbidAbort`].
     pub fn check_guard_mutants<I, R, Body>(
         self,
@@ -3621,6 +3815,10 @@ fn false_panic_cond<I>(_input: &I) -> bool {
     false
 }
 
+fn false_panic_cond_fallible<I>(_input: &I) -> Result<bool, ()> {
+    Ok(false)
+}
+
 impl<Pre, Post> NeverPanics<Pre, Post> {
     /// Creates a `NeverPanics` contract defaulting to [`AbortPolicy::ForbidAbort`].
     pub const fn new(pre: Pre, post: Post) -> Self {
@@ -3640,6 +3838,34 @@ impl<Pre, Post> NeverPanics<Pre, Post> {
         }
     }
 
+    /// Attaches [`AbortPolicy::AbortOnlyIf`] and returns a [`PanicContractSpec`].
+    pub fn with_abort_only_if<I, AbortCond>(
+        self,
+        abort_cond: AbortCond,
+    ) -> PanicContractSpec<Pre, fn(&I) -> bool, AbortCond, Post> {
+        PanicContractSpec {
+            mode: PanicContractMode::NeverPanics,
+            pre: self.pre,
+            panic_cond: false_panic_cond::<I>,
+            abort_policy: AbortPolicy::AbortOnlyIf(abort_cond),
+            post: self.post,
+        }
+    }
+
+    /// Attaches [`AbortPolicy::WaiveAbortUnchecked`] and returns a
+    /// [`PanicContractSpec`].
+    pub fn with_waive_abort_unchecked<I>(
+        self,
+    ) -> PanicContractSpec<Pre, fn(&I) -> bool, fn(&I) -> bool, Post> {
+        PanicContractSpec {
+            mode: PanicContractMode::NeverPanics,
+            pre: self.pre,
+            panic_cond: false_panic_cond::<I>,
+            abort_policy: waive_abort_unchecked::<I>(),
+            post: self.post,
+        }
+    }
+
     /// Checks this `NeverPanics` contract under [`AbortPolicy::ForbidAbort`].
     pub fn check<I, R, Body>(self, config: PanicCheckConfig, body: Body) -> PanicCheckOutcome
     where
@@ -3650,6 +3876,31 @@ impl<Pre, Post> NeverPanics<Pre, Post> {
         Post: FnMut(&I, &R) -> bool,
     {
         self.into_spec::<I>().check(config, body)
+    }
+
+    /// Checks this `NeverPanics` contract with fallible predicates under
+    /// [`AbortPolicy::ForbidAbort`].
+    pub fn check_fallible<I, R, Body>(
+        self,
+        config: PanicCheckConfig,
+        body: Body,
+    ) -> PanicCheckOutcome
+    where
+        I: SampleInput,
+        R: ReturnMutants + PartialEq,
+        Pre: FnMut(&I) -> Result<bool, ()>,
+        Body: FnMut(&I) -> PanicExecOutcome<R>,
+        Post: FnMut(&I, &R) -> Result<bool, ()>,
+    {
+        check_panic_contract_fallible(
+            config,
+            PanicContractMode::NeverPanics,
+            self.pre,
+            false_panic_cond_fallible::<I>,
+            forbid_abort_fallible::<I>(),
+            body,
+            self.post,
+        )
     }
 
     /// Runs Stage P3b guard-mutant checking under [`AbortPolicy::ForbidAbort`].
@@ -3825,6 +4076,20 @@ impl<Pre, PanicCond, AbortCond, Post, PanicStateInv>
         abort_cond: AC2,
     ) -> StatefulPanicContractSpec<Pre, PanicCond, AC2, Post, PanicStateInv> {
         self.with_abort_policy(AbortPolicy::AbortOnlyIf(abort_cond))
+    }
+
+    /// Explicitly opts into [`AbortPolicy::WaiveAbortUnchecked`].
+    pub fn with_waive_abort_unchecked(
+        self,
+    ) -> StatefulPanicContractSpec<Pre, PanicCond, AbortCond, Post, PanicStateInv> {
+        StatefulPanicContractSpec {
+            mode: self.mode,
+            pre: self.pre,
+            panic_cond: self.panic_cond,
+            abort_policy: AbortPolicy::WaiveAbortUnchecked,
+            post: self.post,
+            panic_state_inv: self.panic_state_inv,
+        }
     }
 
     /// Attaches a `panic_state_inv(&initial_state, &panicked_post_state)` guard.
@@ -4050,18 +4315,24 @@ macro_rules! check_panic_contract_unwind {
         $body:expr,
         $post:expr $(,)?
     ) => {{
+        fn __anneal_constrain_abort_cond<I, F>(f: F) -> F
+        where
+            F: ::core::ops::FnMut(&I) -> ::core::result::Result<bool, ()>,
+        {
+            f
+        }
         let mut __anneal_pre = $pre;
         let mut __anneal_panic_cond = $panic_cond;
         let mut __anneal_post = $post;
         let __anneal_abort_policy = $crate::panic_contract::AbortPolicy::map_cond(
             $abort_policy,
             |mut __anneal_abort_cond| {
-                move |input: &_| {
+                __anneal_constrain_abort_cond(move |input| {
                     ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
                         __anneal_abort_cond(input)
                     }))
                     .map_err(|_| ())
-                }
+                })
             },
         );
         $crate::panic_contract::check_panic_contract_fallible(
@@ -4118,9 +4389,129 @@ macro_rules! check_panic_contract_unwind {
 
 /// Executes [`check_stateful_panic_contract_fallible`](crate::panic_contract::check_stateful_panic_contract_fallible)
 /// with `::std::panic::catch_unwind` guarding `pre`, `panic_cond`, `body`,
-/// `post`, and optional `panic_state_inv` at the caller's test site.
+/// `post`, optional `abort_policy = <policy>`, and optional `panic_state_inv`
+/// at the caller's test site.
 #[macro_export]
 macro_rules! check_stateful_panic_contract_unwind {
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr $(,)?
+    ) => {{
+        fn __anneal_constrain_stateful_abort_cond<S, A, F>(f: F) -> F
+        where
+            F: ::core::ops::FnMut(&S, &A) -> ::core::result::Result<bool, ()>,
+        {
+            f
+        }
+        let mut __anneal_pre = $pre;
+        let mut __anneal_panic_cond = $panic_cond;
+        let mut __anneal_post = $post;
+        let __anneal_abort_policy = $crate::panic_contract::AbortPolicy::map_cond(
+            $abort_policy,
+            |mut __anneal_abort_cond| {
+                __anneal_constrain_stateful_abort_cond(move |s, a| {
+                    ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                        __anneal_abort_cond(s, a)
+                    }))
+                    .map_err(|_| ())
+                })
+            },
+        );
+        $crate::panic_contract::check_stateful_panic_contract_fallible(
+            $config,
+            $mode,
+            move |s, a| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| __anneal_pre(s, a)))
+                    .map_err(|_| ())
+            },
+            move |s, a| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_panic_cond(s, a)
+                }))
+                .map_err(|_| ())
+            },
+            __anneal_abort_policy,
+            $crate::stateful_panic_unwind_runner!($body),
+            move |old_s, args, new_s, ret| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_post(old_s, args, new_s, ret)
+                }))
+                .map_err(|_| ())
+            },
+            ::core::option::Option::<fn(&_, &_) -> ::core::result::Result<bool, ()>>::None,
+        )
+    }};
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr,
+        $panic_state_inv:expr $(,)?
+    ) => {{
+        fn __anneal_constrain_stateful_abort_cond<S, A, F>(f: F) -> F
+        where
+            F: ::core::ops::FnMut(&S, &A) -> ::core::result::Result<bool, ()>,
+        {
+            f
+        }
+        fn __anneal_constrain_panic_inv<S, F>(f: F) -> ::core::option::Option<F>
+        where
+            F: ::core::ops::FnMut(&S, &S) -> ::core::result::Result<bool, ()>,
+        {
+            ::core::option::Option::Some(f)
+        }
+        let mut __anneal_pre = $pre;
+        let mut __anneal_panic_cond = $panic_cond;
+        let mut __anneal_post = $post;
+        let mut __anneal_panic_inv = $panic_state_inv;
+        let __anneal_abort_policy = $crate::panic_contract::AbortPolicy::map_cond(
+            $abort_policy,
+            |mut __anneal_abort_cond| {
+                __anneal_constrain_stateful_abort_cond(move |s, a| {
+                    ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                        __anneal_abort_cond(s, a)
+                    }))
+                    .map_err(|_| ())
+                })
+            },
+        );
+        $crate::panic_contract::check_stateful_panic_contract_fallible(
+            $config,
+            $mode,
+            move |s, a| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| __anneal_pre(s, a)))
+                    .map_err(|_| ())
+            },
+            move |s, a| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_panic_cond(s, a)
+                }))
+                .map_err(|_| ())
+            },
+            __anneal_abort_policy,
+            $crate::stateful_panic_unwind_runner!($body),
+            move |old_s, args, new_s, ret| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_post(old_s, args, new_s, ret)
+                }))
+                .map_err(|_| ())
+            },
+            __anneal_constrain_panic_inv(move |old_s, post_s| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_panic_inv(old_s, post_s)
+                }))
+                .map_err(|_| ())
+            }),
+        )
+    }};
     ($config:expr, $mode:expr, $pre:expr, $panic_cond:expr, $body:expr, $post:expr $(,)?) => {{
         let mut __anneal_pre = $pre;
         let mut __anneal_panic_cond = $panic_cond;
@@ -4260,6 +4651,64 @@ macro_rules! assert_panic_contract_strong_unwind {
 /// success.
 #[macro_export]
 macro_rules! assert_stateful_panic_contract_strong_unwind {
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr $(,)?
+    ) => {{
+        match $crate::check_stateful_panic_contract_unwind!(
+            $config,
+            $mode,
+            $pre,
+            $panic_cond,
+            abort_policy = $abort_policy,
+            $body,
+            $post
+        ) {
+            $crate::panic_contract::PanicCheckOutcome::Strong(stats) => stats,
+            $crate::panic_contract::PanicCheckOutcome::Failed(failure) => {
+                ::core::panic!(
+                    "stateful panic contract failed dynamic unwind strength check ({}): {:?}",
+                    failure.class.canonical_name(),
+                    failure
+                );
+            }
+        }
+    }};
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr,
+        $panic_state_inv:expr $(,)?
+    ) => {{
+        match $crate::check_stateful_panic_contract_unwind!(
+            $config,
+            $mode,
+            $pre,
+            $panic_cond,
+            abort_policy = $abort_policy,
+            $body,
+            $post,
+            $panic_state_inv
+        ) {
+            $crate::panic_contract::PanicCheckOutcome::Strong(stats) => stats,
+            $crate::panic_contract::PanicCheckOutcome::Failed(failure) => {
+                ::core::panic!(
+                    "stateful panic contract failed dynamic unwind strength check ({}): {:?}",
+                    failure.class.canonical_name(),
+                    failure
+                );
+            }
+        }
+    }};
     ($config:expr, $mode:expr, $pre:expr, $panic_cond:expr, $body:expr, $post:expr $(,)?) => {{
         match $crate::check_stateful_panic_contract_unwind!(
             $config,
@@ -4363,15 +4812,17 @@ impl CallBoundaryGuard {
     }
 
     /// Verifies that `fn_name` in `source` satisfies this guard's source-level
-    /// `#[inline(never)]` requirement.
+    /// requirements: target existence (`TargetFunctionNotFound`), absence of
+    /// forbidden/conflicting inline hints (`#[inline]`, `#[inline(always)]`),
+    /// explicit `#[inline(never)]` when `self.require_inline_never` is `true`,
+    /// and monomorphism/non-trait-default when `self.forbid_trait_dispatch` is
+    /// `true`.
     pub fn verify_target_source(&self, source: &str, fn_name: &str) -> InlineBoundaryVerdict {
-        if !self.require_inline_never {
-            return InlineBoundaryVerdict::Verified;
-        }
         verify_fn_inline_never_source_with_options(
             source,
             fn_name,
             InlineScanOptions {
+                require_inline_never: self.require_inline_never,
                 forbid_polymorphic_or_trait_default: self.forbid_trait_dispatch,
             },
         )
@@ -4404,6 +4855,44 @@ impl CallBoundaryGuard {
             caller_trait_impls,
             self.target_path,
             self.expected_call_sites,
+        )
+    }
+
+    /// Verifies transitive `ReachableCalleesCallSitesPreserved` for this
+    /// guard's `caller_path` inside `callees`, requiring `expected_call_sites`
+    /// `bb0`-reachable calls to `self.target_path` and honoring
+    /// `self.forbid_trait_dispatch`.
+    pub fn verify_caller_in_callees(
+        &self,
+        callees: &[CalleeEntry<'_>],
+        caller_trait_impls: &[TraitImplBinding<'_>],
+    ) -> CallBoundaryVerdict {
+        verify_reachable_callees_call_sites_inner(
+            callees,
+            caller_trait_impls,
+            &[(self.caller_path, self.expected_call_sites)],
+            self.target_path,
+            self.forbid_trait_dispatch,
+        )
+    }
+
+    /// Verifies an arbitrary-length multi-hop call chain from `caller_blocks`
+    /// through `helper_chain` to `self.target_path`, honoring
+    /// `self.forbid_trait_dispatch`.
+    pub fn verify_call_chain(
+        &self,
+        caller_blocks: &[MirBlockSummary<'_>],
+        callees: &[CalleeEntry<'_>],
+        caller_trait_impls: &[TraitImplBinding<'_>],
+        helper_chain: &[&str],
+    ) -> CallBoundaryVerdict {
+        verify_call_chain_boundary_inner(
+            caller_blocks,
+            callees,
+            caller_trait_impls,
+            helper_chain,
+            self.target_path,
+            self.forbid_trait_dispatch,
         )
     }
 }
@@ -4439,12 +4928,27 @@ where
 // ===========================================================================
 
 /// Options controlling [`verify_fn_inline_never_source_with_options`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InlineScanOptions {
+    /// When `true` (default), requires every matching `fn <name>` to carry an
+    /// unconditional `#[inline(never)]`. When `false`, still verifies target
+    /// existence and rejects `#[inline]` / `#[inline(always)]` /
+    /// `ConflictingInlineAttributes` / `MalformedSource` (plus polymorphism if
+    /// `forbid_polymorphic_or_trait_default` is `true`).
+    pub require_inline_never: bool,
     /// When `true`, rejects generic functions (type/const generics or
     /// `impl Trait` parameters), methods inside generic `impl<T>` blocks, and
     /// trait methods / trait default methods.
     pub forbid_polymorphic_or_trait_default: bool,
+}
+
+impl Default for InlineScanOptions {
+    fn default() -> Self {
+        Self {
+            require_inline_never: true,
+            forbid_polymorphic_or_trait_default: false,
+        }
+    }
 }
 
 impl InlineScanOptions {
@@ -4452,6 +4956,7 @@ impl InlineScanOptions {
     /// methods in addition to requiring unconditional `#[inline(never)]`.
     pub const fn strict() -> Self {
         Self {
+            require_inline_never: true,
             forbid_polymorphic_or_trait_default: true,
         }
     }
@@ -4592,16 +5097,15 @@ impl<'a> RustLexer<'a> {
     }
 
     /// Consumes a normal quoted string `"..."` with `\` escapes (cursor starts
-    /// on opening `"`).
+    /// on opening `"`). Always advances on valid UTF-8 scalar boundaries.
     fn consume_quoted_string(&mut self) -> Result<(), ()> {
         self.pos += 1; // skip opening '"'
         while self.pos < self.bytes.len() {
             match self.bytes[self.pos] {
                 b'\\' => {
-                    if self.pos + 1 >= self.bytes.len() {
-                        return Err(());
-                    }
-                    self.pos += 2;
+                    self.pos += 1;
+                    let esc_ch = self.src.get(self.pos..).and_then(|s| s.chars().next()).ok_or(())?;
+                    self.pos += esc_ch.len_utf8();
                 }
                 b'"' => {
                     self.pos += 1;
@@ -4657,7 +5161,7 @@ impl<'a> RustLexer<'a> {
     }
 
     /// Consumes a char or byte literal after the opening `'` has been checked
-    /// (`self.pos` points to `'`).
+    /// (`self.pos` points to `'`). Always preserves UTF-8 scalar boundaries.
     fn consume_char_or_byte_literal(&mut self) -> Result<(), ()> {
         self.pos += 1; // skip opening '\''
         if self.pos >= self.bytes.len() {
@@ -4665,13 +5169,13 @@ impl<'a> RustLexer<'a> {
         }
         if self.bytes[self.pos] == b'\\' {
             self.pos += 1;
-            if self.pos >= self.bytes.len() {
-                return Err(());
-            }
-            // Skip escape body until closing '\''
-            let esc = self.bytes[self.pos];
-            self.pos += 1;
-            if esc == b'u' && self.peek_byte(0) == Some(b'{') {
+            let esc_ch = self
+                .src
+                .get(self.pos..)
+                .and_then(|s| s.chars().next())
+                .ok_or(())?;
+            self.pos += esc_ch.len_utf8();
+            if esc_ch == 'u' && self.peek_byte(0) == Some(b'{') {
                 while self.pos < self.bytes.len() && self.bytes[self.pos] != b'}' {
                     self.pos += 1;
                 }
@@ -4679,8 +5183,11 @@ impl<'a> RustLexer<'a> {
                     return Err(());
                 }
                 self.pos += 1; // '}'
-            } else if esc == b'x' {
-                if self.pos + 2 > self.bytes.len() {
+            } else if esc_ch == 'x' {
+                if self.pos + 2 > self.bytes.len()
+                    || !self.bytes[self.pos].is_ascii_hexdigit()
+                    || !self.bytes[self.pos + 1].is_ascii_hexdigit()
+                {
                     return Err(());
                 }
                 self.pos += 2;
@@ -5012,6 +5519,26 @@ fn is_unconditional_cfg_pred(pred: &str) -> bool {
     matches!(lex.next_token(), Ok(Token { kind: TokenKind::Eof, .. }))
 }
 
+/// Classifies a parsed attribute path (bare or prelude-qualified, e.g.
+/// `inline`, `core::prelude::v1::inline`, `::std::prelude::rust_2024::inline`,
+/// `cfg_attr`, `core::prelude::v1::cfg_attr`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BuiltinAttrKind {
+    Inline,
+    CfgAttr,
+    Other,
+}
+
+fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
+    match segments {
+        ["inline"] => BuiltinAttrKind::Inline,
+        ["cfg_attr"] => BuiltinAttrKind::CfgAttr,
+        ["core" | "std", "prelude", _, "inline"] => BuiltinAttrKind::Inline,
+        ["core" | "std", "prelude", _, "cfg_attr"] => BuiltinAttrKind::CfgAttr,
+        _ => BuiltinAttrKind::Other,
+    }
+}
+
 /// Parses a comma-separated list of meta items inside `#[...]` or the trailing
 /// attributes of `#[cfg_attr(pred, ...)]`.
 fn analyze_attr_meta_list(
@@ -5041,7 +5568,56 @@ fn analyze_attr_meta_list(
             continue;
         }
 
-        if let TokenKind::Ident(ident) = tok.kind {
+        // Collect a leading path (`[::] seg (:: seg)*`) up to 4 segments so
+        // prelude-qualified attributes like `#[core::prelude::v1::inline(always)]`
+        // cannot slip past the scanner.
+        let mut path_segs: [&str; 4] = [""; 4];
+        let mut path_overflow = false;
+        let first_ident = match tok.kind {
+            TokenKind::ColonColon => match lex.next_token() {
+                Ok(Token {
+                    kind: TokenKind::Ident(id),
+                    ..
+                }) => Some(id),
+                Ok(_) | Err(()) => {
+                    summary.saw_malformed = true;
+                    return;
+                }
+            },
+            TokenKind::Ident(id) => Some(id),
+            _ => None,
+        };
+
+        if let Some(id0) = first_ident {
+            path_segs[0] = id0;
+            let mut seg_count = 1usize;
+            while matches!(lex.peek_token(), Ok(Token { kind: TokenKind::ColonColon, .. })) {
+                let _ = lex.next_token();
+                match lex.next_token() {
+                    Ok(Token {
+                        kind: TokenKind::Ident(seg),
+                        ..
+                    }) => {
+                        if seg_count < path_segs.len() {
+                            path_segs[seg_count] = seg;
+                            seg_count += 1;
+                        } else {
+                            path_overflow = true;
+                        }
+                    }
+                    Ok(_) | Err(()) => {
+                        summary.saw_malformed = true;
+                        return;
+                    }
+                }
+            }
+
+            let attr_kind = if path_overflow {
+                BuiltinAttrKind::Other
+            } else {
+                classify_attr_path(&path_segs[..seg_count])
+            };
+
             let next = match lex.peek_token() {
                 Ok(t) => t,
                 Err(()) => {
@@ -5050,7 +5626,7 @@ fn analyze_attr_meta_list(
                 }
             };
 
-            if ident == "inline" && next.kind != TokenKind::ColonColon {
+            if attr_kind == BuiltinAttrKind::Inline {
                 match next.kind {
                     TokenKind::Eof | TokenKind::Punct(b',') => {
                         // Bare `#[inline]`
@@ -5100,7 +5676,8 @@ fn analyze_attr_meta_list(
                         summary.saw_forbidden_inline = true;
                     }
                 }
-            } else if ident == "cfg_attr" && next.kind == TokenKind::Punct(b'(') {
+            } else if attr_kind == BuiltinAttrKind::CfgAttr && next.kind == TokenKind::Punct(b'(')
+            {
                 let _ = lex.next_token(); // consume '('
                 let Ok(args) = lex.consume_balanced_inner(b'(') else {
                     summary.saw_malformed = true;
@@ -5210,9 +5787,19 @@ fn generic_params_contain_type_or_const(inner: &str) -> Result<bool, ()> {
     }
 }
 
+const MAX_PARAM_NESTING: usize = 32;
+
 /// Returns `true` iff a function parameter list `(...)` contains an `impl Trait`
-/// parameter type (syntactic sugar for a generic type parameter).
+/// parameter type (syntactic sugar for a generic type parameter). Fails closed
+/// (`Err(())`) on excessive nesting depth.
 fn params_contain_impl_trait(params_inner: &str) -> Result<bool, ()> {
+    params_contain_impl_trait_depth(params_inner, 0)
+}
+
+fn params_contain_impl_trait_depth(params_inner: &str, depth: usize) -> Result<bool, ()> {
+    if depth > MAX_PARAM_NESTING {
+        return Err(());
+    }
     let mut lex = RustLexer::new(params_inner);
     loop {
         let tok = lex.next_token()?;
@@ -5221,7 +5808,7 @@ fn params_contain_impl_trait(params_inner: &str) -> Result<bool, ()> {
             TokenKind::Ident("impl") => return Ok(true),
             TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
                 let sub = lex.consume_balanced_inner(p)?;
-                if params_contain_impl_trait(sub)? {
+                if params_contain_impl_trait_depth(sub, depth + 1)? {
                     return Ok(true);
                 }
             }
@@ -5231,7 +5818,9 @@ fn params_contain_impl_trait(params_inner: &str) -> Result<bool, ()> {
 }
 
 fn fn_ident_matches(ident: &str, target_name: &str) -> bool {
-    ident == target_name || ident.strip_prefix("r#") == Some(target_name)
+    let norm_ident = ident.strip_prefix("r#").unwrap_or(ident);
+    let norm_target = target_name.strip_prefix("r#").unwrap_or(target_name);
+    !norm_target.is_empty() && norm_ident == norm_target
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -5278,7 +5867,7 @@ pub fn verify_fn_inline_never_source_with_options(
     fn_name: &str,
     options: InlineScanOptions,
 ) -> InlineBoundaryVerdict {
-    if fn_name.is_empty() {
+    if fn_name.strip_prefix("r#").unwrap_or(fn_name).is_empty() {
         return InlineBoundaryVerdict::TargetFunctionNotFound;
     }
     let source = strip_shebang_line(source);
@@ -5343,7 +5932,7 @@ fn evaluate_target_attrs(
     if pending.saw_forbidden_inline {
         return Some(InlineBoundaryVerdict::ForbiddenInlineHint);
     }
-    if !pending.saw_unconditional_never {
+    if options.require_inline_never && !pending.saw_unconditional_never {
         if pending.saw_conditional_never {
             return Some(InlineBoundaryVerdict::ConditionalInlineNever);
         }
@@ -5674,12 +6263,25 @@ enum DeepScope {
 }
 
 const MAX_DEEP_SCOPE_DEPTH: usize = 128;
+const MAX_DEEP_RECURSION: usize = 32;
 
 /// Skips an `impl`/`trait` header up to (and including) its opening `{`,
 /// returning `Ok(true)`, or up to (and including) a terminating `;` (type
 /// position `impl Trait`, trait aliases), returning `Ok(false)`. Stops without
 /// consuming at `}` or end of input (lenient inside macro token trees).
-fn skip_header_to_brace_or_semicolon(lex: &mut RustLexer<'_>) -> Result<bool, ()> {
+///
+/// Any delimited groups (`(...)`, `[...]`, `<...>`) skipped inside the header
+/// are recursively scanned via [`deep_scan_slice`] so hidden `fn <fn_name>`
+/// items in const generic expressions or `macro_rules!` arms like
+/// `(impl $t:ty) => (fn target() {})` cannot slip through unseen.
+fn skip_header_to_brace_or_semicolon_scanning(
+    lex: &mut RustLexer<'_>,
+    fn_name: &str,
+    options: InlineScanOptions,
+    recursion: usize,
+    occurrences: &mut usize,
+    first_failure: &mut Option<InlineBoundaryVerdict>,
+) -> Result<bool, ()> {
     loop {
         let tok = lex.peek_token()?;
         match tok.kind {
@@ -5694,11 +6296,13 @@ fn skip_header_to_brace_or_semicolon(lex: &mut RustLexer<'_>) -> Result<bool, ()
             }
             TokenKind::Punct(p @ (b'(' | b'[')) => {
                 let _ = lex.next_token()?;
-                let _ = lex.consume_balanced_inner(p)?;
+                let inner = lex.consume_balanced_inner(p)?;
+                deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
             }
             TokenKind::Punct(b'<') => {
                 let _ = lex.next_token()?;
-                let _ = lex.consume_angle_inner()?;
+                let inner = lex.consume_angle_inner()?;
+                deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
             }
             _ => {
                 let _ = lex.next_token()?;
@@ -5710,15 +6314,17 @@ fn skip_header_to_brace_or_semicolon(lex: &mut RustLexer<'_>) -> Result<bool, ()
 /// Deep token-tree layer of [`verify_fn_inline_never_source_with_options`].
 ///
 /// Walks the entire token stream linearly — *including* function bodies,
-/// nested blocks, `const`/`static` initializers, macro invocation bodies, and
-/// `macro_rules!` templates, which the structured item-level layer skips — and
-/// validates every `fn <fn_name>` occurrence against its own preceding outer
-/// attributes. Nested items cannot capture outer generic parameters (E0401),
-/// so only the occurrence's own generics, `impl Trait` parameters, and its
-/// innermost enclosing `trait` / generic `impl` body determine polymorphism.
+/// parameter lists, generic parameter const defaults, nested blocks,
+/// `const`/`static` initializers, macro invocation bodies, and `macro_rules!`
+/// templates, which the structured item-level layer skips — and validates
+/// every `fn <fn_name>` occurrence against its own preceding outer attributes.
+/// Nested items cannot capture outer generic parameters (E0401), so only the
+/// occurrence's own generics, `impl Trait` parameters, and its innermost
+/// enclosing `trait` / generic `impl` body determine polymorphism.
 ///
 /// Structural oddities inside macro token trees (e.g. `quote! { #name }` or
-/// `mod $name`) are tolerated; only lexical errors and unbalanced braces fail.
+/// `mod $name`) are tolerated; only lexical errors, excessive recursion, and
+/// unbalanced braces fail.
 ///
 /// Returns `(occurrences, first_failure)`.
 fn deep_scan_target_occurrences(
@@ -5726,12 +6332,27 @@ fn deep_scan_target_occurrences(
     fn_name: &str,
     options: InlineScanOptions,
 ) -> Result<(usize, Option<InlineBoundaryVerdict>), ()> {
+    let mut occurrences = 0usize;
+    let mut first_failure: Option<InlineBoundaryVerdict> = None;
+    deep_scan_slice(source, fn_name, options, 0, &mut occurrences, &mut first_failure)?;
+    Ok((occurrences, first_failure))
+}
+
+fn deep_scan_slice(
+    source: &str,
+    fn_name: &str,
+    options: InlineScanOptions,
+    recursion: usize,
+    occurrences: &mut usize,
+    first_failure: &mut Option<InlineBoundaryVerdict>,
+) -> Result<(), ()> {
+    if recursion > MAX_DEEP_RECURSION {
+        return Err(());
+    }
     let mut lex = RustLexer::new(source);
     let mut stack = [DeepScope::Plain; MAX_DEEP_SCOPE_DEPTH];
     let mut cur_depth = 0usize;
     let mut pending = InlineAttrSummary::default();
-    let mut occurrences = 0usize;
-    let mut first_failure: Option<InlineBoundaryVerdict> = None;
 
     fn push(
         stack: &mut [DeepScope; MAX_DEEP_SCOPE_DEPTH],
@@ -5809,14 +6430,36 @@ fn deep_scan_target_occurrences(
                     // Unparseable generic lists (e.g. `impl<#generics>` in
                     // `quote!`) are conservatively treated as generic.
                     is_generic = generic_params_contain_type_or_const(inner).unwrap_or(true);
+                    deep_scan_slice(
+                        inner,
+                        fn_name,
+                        options,
+                        recursion + 1,
+                        occurrences,
+                        first_failure,
+                    )?;
                 }
-                if skip_header_to_brace_or_semicolon(&mut lex)? {
+                if skip_header_to_brace_or_semicolon_scanning(
+                    &mut lex,
+                    fn_name,
+                    options,
+                    recursion,
+                    occurrences,
+                    first_failure,
+                )? {
                     push(&mut stack, &mut cur_depth, DeepScope::Impl { is_generic })?;
                 }
             }
             TokenKind::Ident("trait") => {
                 pending.reset();
-                if skip_header_to_brace_or_semicolon(&mut lex)? {
+                if skip_header_to_brace_or_semicolon_scanning(
+                    &mut lex,
+                    fn_name,
+                    options,
+                    recursion,
+                    occurrences,
+                    first_failure,
+                )? {
                     push(&mut stack, &mut cur_depth, DeepScope::Trait)?;
                 }
             }
@@ -5828,18 +6471,22 @@ fn deep_scan_target_occurrences(
                 };
                 let _ = lex.next_token()?;
                 let mut polymorphic = false;
+                let mut gen_slice: Option<&str> = None;
+                let mut params_slice: Option<&str> = None;
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
                     let _ = lex.next_token()?;
                     let inner = lex.consume_angle_inner()?;
                     polymorphic |= generic_params_contain_type_or_const(inner).unwrap_or(true);
+                    gen_slice = Some(inner);
                 }
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) {
                     let _ = lex.next_token()?;
                     let params = lex.consume_balanced_inner(b'(')?;
                     polymorphic |= params_contain_impl_trait(params)?;
+                    params_slice = Some(params);
                 }
                 if fn_ident_matches(name, fn_name) {
-                    occurrences += 1;
+                    *occurrences += 1;
                     let enclosing = if cur_depth > 0 {
                         stack[cur_depth - 1]
                     } else {
@@ -5848,16 +6495,38 @@ fn deep_scan_target_occurrences(
                     polymorphic |=
                         matches!(enclosing, DeepScope::Trait | DeepScope::Impl { is_generic: true });
                     if first_failure.is_none() {
-                        first_failure = evaluate_target_attrs(&pending, polymorphic, options);
+                        *first_failure = evaluate_target_attrs(&pending, polymorphic, options);
                     }
                 }
                 pending.reset();
+                // Recursively scan skipped generic defaults and parameter type
+                // expressions (e.g. `fn f(_: [u8; { fn target() {} 1 }])`).
+                if let Some(inner) = gen_slice {
+                    deep_scan_slice(
+                        inner,
+                        fn_name,
+                        options,
+                        recursion + 1,
+                        occurrences,
+                        first_failure,
+                    )?;
+                }
+                if let Some(params) = params_slice {
+                    deep_scan_slice(
+                        params,
+                        fn_name,
+                        options,
+                        recursion + 1,
+                        occurrences,
+                        first_failure,
+                    )?;
+                }
             }
             _ => pending.reset(),
         }
     }
 
-    Ok((occurrences, first_failure))
+    Ok(())
 }
 
 fn skip_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
@@ -6299,9 +6968,11 @@ pub fn verify_callee_table_excludes(
 }
 
 /// Verifies `withTraitsPreserved` across sequential external calls: checks that
-/// `before_trait_impls == after_trait_impls` (preventing Call 1 from injecting
-/// a trait dispatch entry that silently inlines Call 2) and that
-/// [`verify_callee_table_excludes`] still holds for `target_path`.
+/// `before_trait_impls == after_trait_impls` (exact order-sensitive slice
+/// equality matching Lean's `memAfter.traitImpls = req.memory.traitImpls`,
+/// preventing Call 1 from injecting, modifying, or reordering trait dispatch
+/// entries before Call 2) and that [`verify_callee_table_excludes`] still holds
+/// for `target_path`.
 pub fn verify_traits_preserved(
     before_trait_impls: &[TraitImplBinding<'_>],
     after_trait_impls: &[TraitImplBinding<'_>],
@@ -6317,8 +6988,9 @@ pub fn verify_traits_preserved(
 /// Verifies the full `callFrameAndTraitsPreserved` frame condition used by
 /// Episode 1's `withTraitsPreserved` across a sequential external call:
 /// the linked `callees` table **and** the trait-implementation table are both
-/// unchanged (`before_* == after_*`), and [`verify_callee_table_excludes`]
-/// holds for `target_path` afterwards.
+/// unchanged (`before_* == after_*`, exact order-sensitive equality matching
+/// Lean's list equality), and [`verify_callee_table_excludes`] holds for
+/// `target_path` afterwards.
 ///
 /// [`verify_traits_preserved`] alone only compares trait tables, so Call 1
 /// injecting `target_path`'s body into `callees` is only caught when the
@@ -6339,6 +7011,10 @@ pub fn verify_call_frame_and_traits_preserved(
 /// Verifies syntactic `CallBoundaryPreserved`: at least one direct call site to
 /// `target_path` exists in `caller_blocks`, and `target_path` is excluded from
 /// `callees` and trait-dispatch tables.
+///
+/// Enforces [`MAX_MIR_BLOCKS`] capacity (fail-closed) and reports
+/// `reachable_blocks: 0` because this syntactic guard does not compute CFG
+/// reachability (use [`verify_reachable_call_boundary`] for reachability).
 pub fn verify_call_boundary(
     caller_blocks: &[MirBlockSummary<'_>],
     callees: &[CalleeEntry<'_>],
@@ -6348,13 +7024,19 @@ pub fn verify_call_boundary(
     if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, true) {
         return err;
     }
+    if caller_blocks.len() > MAX_MIR_BLOCKS {
+        return CallBoundaryVerdict::CfgExceedsCapacity {
+            block_count: caller_blocks.len(),
+            max_blocks: MAX_MIR_BLOCKS,
+        };
+    }
     let observed = count_syntactic_call_sites(caller_blocks, target_path);
     if observed == 0 {
         return CallBoundaryVerdict::MissingCallSite;
     }
     CallBoundaryVerdict::Preserved {
         observed_call_sites: observed,
-        reachable_blocks: caller_blocks.len(),
+        reachable_blocks: 0,
     }
 }
 
@@ -6363,6 +7045,10 @@ pub fn verify_call_boundary(
 /// partial 1-of-2 inlining) and `target_path` is excluded from `callees` and
 /// trait-dispatch tables. `expected_call_sites == 0` fails closed with
 /// [`CallBoundaryVerdict::ZeroExpectedCallSites`].
+///
+/// Enforces [`MAX_MIR_BLOCKS`] capacity (fail-closed) and reports
+/// `reachable_blocks: 0` because this syntactic guard does not compute CFG
+/// reachability (use [`verify_reachable_call_sites`] for reachability).
 pub fn verify_counted_call_sites(
     caller_blocks: &[MirBlockSummary<'_>],
     callees: &[CalleeEntry<'_>],
@@ -6376,6 +7062,12 @@ pub fn verify_counted_call_sites(
     if expected_call_sites == 0 {
         return CallBoundaryVerdict::ZeroExpectedCallSites;
     }
+    if caller_blocks.len() > MAX_MIR_BLOCKS {
+        return CallBoundaryVerdict::CfgExceedsCapacity {
+            block_count: caller_blocks.len(),
+            max_blocks: MAX_MIR_BLOCKS,
+        };
+    }
     let observed = count_syntactic_call_sites(caller_blocks, target_path);
     if observed != expected_call_sites {
         return CallBoundaryVerdict::CallSiteCountMismatch {
@@ -6385,7 +7077,7 @@ pub fn verify_counted_call_sites(
     }
     CallBoundaryVerdict::Preserved {
         observed_call_sites: observed,
-        reachable_blocks: caller_blocks.len(),
+        reachable_blocks: 0,
     }
 }
 
@@ -6476,23 +7168,15 @@ pub fn verify_reachable_call_sites(
     )
 }
 
-/// Verifies transitive `ReachableCalleesCallSitesPreserved` (Episode 1
-/// `reachableCalleesCallSitesPreserved`): for every `(caller_path, expected)`
-/// in `expected_caller_counts`, some body in `callees` has `def_path ==
-/// caller_path`, **every** such body has exactly `expected` `bb0`-reachable
-/// direct call sites to `target_path` (catching partial inlining or dead decoy
-/// calls *inside* linked helpers), and `target_path` is excluded from
-/// `callees` and all trait-dispatch tables.
-///
-/// Fails closed with [`CallBoundaryVerdict::ZeroExpectedCallSites`] on an
-/// empty expectation list or any `expected == 0` entry.
-pub fn verify_reachable_callees_call_sites(
+fn verify_reachable_callees_call_sites_inner(
     callees: &[CalleeEntry<'_>],
     caller_trait_impls: &[TraitImplBinding<'_>],
     expected_caller_counts: &[(&str, usize)],
     target_path: &str,
+    check_traits: bool,
 ) -> CallBoundaryVerdict {
-    if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, true) {
+    if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, check_traits)
+    {
         return err;
     }
     if expected_caller_counts.is_empty()
@@ -6533,33 +7217,51 @@ pub fn verify_reachable_callees_call_sites(
     }
 }
 
-/// Verifies arbitrary-length multi-hop helper call-chain boundary preservation
-/// (`caller -> helper_chain[0] -> ... -> helper_chain[k-1] -> target_path`),
-/// mirroring Episode 1's `CallChainCallBoundaryPreserved` **together with**
-/// `ChainHopsNotTraitDispatched`:
+/// Verifies transitive `ReachableCalleesCallSitesPreserved` (Episode 1
+/// `reachableCalleesCallSitesPreserved`): for every `(caller_path, expected)`
+/// in `expected_caller_counts`, some body in `callees` has `def_path ==
+/// caller_path`, **every** such body has exactly `expected` `bb0`-reachable
+/// direct call sites to `target_path` (catching partial inlining or dead decoy
+/// calls *inside* linked helpers), and `target_path` is excluded from
+/// `callees` and all trait-dispatch tables.
 ///
-/// 1. `target_path` is excluded from `callees` and all trait-dispatch tables.
-/// 2. No intermediate hop in `helper_chain` is overridden by any
-///    [`TraitImplBinding`] on the caller or on any linked callee.
-/// 3. Each step from `caller_blocks` through `helper_chain` to `target_path`
-///    has a `bb0`-reachable direct call site in its body and every intermediate
-///    hop resolves via `callees` (first match, mirroring Lean `findCallee?`).
-pub fn verify_call_chain_boundary(
+/// Fails closed with [`CallBoundaryVerdict::ZeroExpectedCallSites`] on an
+/// empty expectation list or any `expected == 0` entry.
+pub fn verify_reachable_callees_call_sites(
+    callees: &[CalleeEntry<'_>],
+    caller_trait_impls: &[TraitImplBinding<'_>],
+    expected_caller_counts: &[(&str, usize)],
+    target_path: &str,
+) -> CallBoundaryVerdict {
+    verify_reachable_callees_call_sites_inner(
+        callees,
+        caller_trait_impls,
+        expected_caller_counts,
+        target_path,
+        true,
+    )
+}
+
+fn verify_call_chain_boundary_inner(
     caller_blocks: &[MirBlockSummary<'_>],
     callees: &[CalleeEntry<'_>],
     caller_trait_impls: &[TraitImplBinding<'_>],
     helper_chain: &[&str],
     target_path: &str,
+    check_traits: bool,
 ) -> CallBoundaryVerdict {
-    if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, true) {
+    if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, check_traits)
+    {
         return err;
     }
 
     // `ChainHopsNotTraitDispatched`: reject any intermediate hop overridden in
     // `caller_trait_impls ++ flatMap(callees, c.trait_impls)`.
-    for (hop_index, &hop_path) in helper_chain.iter().enumerate() {
-        if has_trait_impl_for_path(caller_trait_impls, callees, hop_path) {
-            return CallBoundaryVerdict::ChainHopTraitDispatched { hop_index };
+    if check_traits {
+        for (hop_index, &hop_path) in helper_chain.iter().enumerate() {
+            if has_trait_impl_for_path(caller_trait_impls, callees, hop_path) {
+                return CallBoundaryVerdict::ChainHopTraitDispatched { hop_index };
+            }
         }
     }
 
@@ -6606,6 +7308,34 @@ pub fn verify_call_chain_boundary(
         observed_call_sites: terminal_sites,
         reachable_blocks: total_reachable_blocks,
     }
+}
+
+/// Verifies arbitrary-length multi-hop helper call-chain boundary preservation
+/// (`caller -> helper_chain[0] -> ... -> helper_chain[k-1] -> target_path`),
+/// mirroring Episode 1's `CallChainCallBoundaryPreserved` **together with**
+/// `ChainHopsNotTraitDispatched`:
+///
+/// 1. `target_path` is excluded from `callees` and all trait-dispatch tables.
+/// 2. No intermediate hop in `helper_chain` is overridden by any
+///    [`TraitImplBinding`] on the caller or on any linked callee.
+/// 3. Each step from `caller_blocks` through `helper_chain` to `target_path`
+///    has a `bb0`-reachable direct call site in its body and every intermediate
+///    hop resolves via `callees` (first match, mirroring Lean `findCallee?`).
+pub fn verify_call_chain_boundary(
+    caller_blocks: &[MirBlockSummary<'_>],
+    callees: &[CalleeEntry<'_>],
+    caller_trait_impls: &[TraitImplBinding<'_>],
+    helper_chain: &[&str],
+    target_path: &str,
+) -> CallBoundaryVerdict {
+    verify_call_chain_boundary_inner(
+        caller_blocks,
+        callees,
+        caller_trait_impls,
+        helper_chain,
+        target_path,
+        true,
+    )
 }
 
 // ===========================================================================
