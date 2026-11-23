@@ -255,8 +255,15 @@ def trustedCoreModuleName : SymName := ⟨[Chars.trusted, Chars.core]⟩
 def isFoundationalAxiom (n : SymName) : Bool :=
   decide (n = propextName) || decide (n = choiceName) || decide (n = quotSoundName)
 
-/-- The compiler-generated native axioms: the only ones `--provisional` can admit. -/
+/-- The compiler-generated native marker (`_native` anywhere in the name). -/
 def hasNativeMarker (n : SymName) : Bool := n.hasPart Chars.nativeMarker
+
+/-- Strictly interior `._native.` form `<decl>._native.<tactic>.ax_<n>` that
+`Lean.Meta.nativeEqTrue` emits: never bare `_native`, `_native.*`, or `*._native`. -/
+def isProvisionalNativeName (n : SymName) : Bool :=
+  n.hasNativeMarker && decide (3 ≤ n.parts.length) &&
+    decide (n.parts.head? ≠ some Chars.nativeMarker) &&
+    decide (n.parts.getLast? ≠ some Chars.nativeMarker)
 
 /-- Native-reduction trust: the deprecated `Lean.ofReduceBool` / `Lean.ofReduceNat` axioms,
 the `Lean.reduceBool` / `Lean.reduceNat` primitives they justify, and every name with a
@@ -2453,9 +2460,12 @@ def kernelCheckKind (env : KernelEnv) (allowAxiom : Bool) (ci : ConstantRecord) 
     match kernelSortOf env ci ci.type with
     | .ok _ => .ok ()
     | .error err => .error err
-  | .defnDecl =>
+  | .defnDecl => do
+    let _ ← kernelSortOf env ci ci.type
     checkDeclValue env ci "definition without a value" "definition value type mismatch"
-  | .opaqueDecl => checkDeclValue env ci "opaque without a value" "opaque value type mismatch"
+  | .opaqueDecl => do
+    let _ ← kernelSortOf env ci ci.type
+    checkDeclValue env ci "opaque without a value" "opaque value type mismatch"
   | .thmDecl =>
     match kernelSortOf env ci ci.type with
     | .error err => .error err
@@ -2780,11 +2790,15 @@ theorem kernelCheckKind_model {env : KernelEnv} {M : Model} {ci : ConstantRecord
   split at h
   · simp [bindUnit_ok_iff, ensure_ok_iff] at h
   · rename_i hk
-    obtain ⟨x, hx1, hx2⟩ := hval h
+    simp only [bind_ok_iff] at h
+    obtain ⟨_, _, hvalOk⟩ := h
+    obtain ⟨x, hx1, hx2⟩ := hval hvalOk
     exact ⟨x, hx1, fun _ => hx2, fun ctors hk' => (by rw [hk] at hk'; cases hk'),
       fun T hk' => (by rw [hk] at hk'; cases hk')⟩
   · rename_i hk
-    obtain ⟨x, hx1, _⟩ := hval h
+    simp only [bind_ok_iff] at h
+    obtain ⟨_, _, hvalOk⟩ := h
+    obtain ⟨x, hx1, _⟩ := hval hvalOk
     exact ⟨x, hx1, fun hk' => (by rw [hk] at hk'; cases hk'),
       fun ctors hk' => (by rw [hk] at hk'; cases hk'), fun T hk' => (by rw [hk] at hk'; cases hk')⟩
   · rename_i hk
@@ -3354,15 +3368,16 @@ forbidden options and keywords among the remaining tokens. The lexer rules it fo
 
 * A line comment (two dashes) or block comment (slash, dash) starts only at a token
   boundary; the documentation-comment openers (slash, dash, then a dash or `!`) consume
-  three characters; block comments nest. The core tokens `<-`, `//`, and `\/` swallow
-  the character that would otherwise start a comment.
+  three characters; block comments nest. The core tokens `<-`, `//`, `/\`, and `\/`
+  swallow the character that would otherwise start a comment or another slash token.
 * `'` continues an identifier, belongs to the tokens `]'`, `×'`, `Σ'`, `⊕'`, or opens a
   character literal `'c'` / `'\…'`.
 * `r"…"` and `r#"…"#` are raw strings only at a token start: not inside an identifier,
-  after `ident.`, or after a name-literal backtick.
+  after `.` (a dot-identifier uses `rawIdentFn`), or after a name-literal backtick.
 * Numeric literals (`0x`, `0b`, `0o`, decimal, `_` separators, fractions, exponents) and
   field indices (`x.1`) end a token, so a raw string or character literal may follow.
-* `«…»` is an identifier component: delimiters dropped, content kept.
+* `«…»` is an identifier component: delimiters dropped, content kept, and token
+  boundaries preserved on both sides unless adjacent to `.`.
 * A non-raw string may be interpolated. Text inside `{…}` stays visible to the token
   scan, and anything there that could open another literal or comment is rejected.
 
@@ -3470,11 +3485,12 @@ abbrev StepResult := Except String (ScanState × List Char)
 
 /-- A character at a position where a token may start or an identifier may continue. -/
 def stepCode (prev : Prev) (c : Char) : StepResult :=
+  let sep : List Char := if prev = .escIdent then [' '] else []
   if prev = .ident && isIdRest c then .ok (.code .ident, [visible c])
   else if isIdFirst c then
-    if c = 'r' ∧ (prev = .other ∨ prev = .dot ∨ prev = .escIdent ∨ prev = .quoteTok) then
-      .ok (.rawR, [])
-    else .ok (.code .ident, [visible c])
+    if c = 'r' ∧ (prev = .other ∨ prev = .escIdent ∨ prev = .quoteTok) then
+      .ok (.rawR, sep)
+    else .ok (.code .ident, sep ++ [visible c])
   else if c = '.' then
     .ok (.code (match prev with
       | .ident => .identDot
@@ -3484,13 +3500,13 @@ def stepCode (prev : Prev) (c : Char) : StepResult :=
       | _ => .other), ['.'])
   else if c.isDigit then
     if prev = .identDot ∨ prev = .dot then .ok (.fieldIdx, [c])
-    else if c = '0' then .ok (.numZero, [c])
-    else .ok (.numDec, [c])
+    else if c = '0' then .ok (.numZero, sep ++ [c])
+    else .ok (.numDec, sep ++ [c])
   else if c = '"' then .ok (.str, [' '])
   else if c = '\'' then
     if prev = .quoteTok then .ok (.code .other, [' ']) else .ok (.chrOpen, [' '])
   else if c = '`' then .ok (.code .tick, [' '])
-  else if c = '«' then .ok (.guillemet, [])
+  else if c = '«' then .ok (.guillemet, if prev = .identDot ∨ prev = .dot then [] else [' '])
   else if c = '»' then .error "unmatched identifier escape"
   else if c = '-' then .ok (.dash, [' '])
   else if c = '/' then .ok (.slash, [' '])
@@ -3525,7 +3541,7 @@ def stepOne (st : ScanState) (c : Char) : StepResult :=
   | .dash => if c = '-' then .ok (.lineComment, []) else stepCode .other c
   | .slash =>
     if c = '-' then .ok (.blockStart 1, [])
-    else if c = '/' then .ok (.code .other, [])
+    else if c = '/' ∨ c = '\\' then .ok (.code .other, [])
     else stepCode .other c
   | .lt => if c = '-' then .ok (.code .other, []) else stepCode .other c
   | .bslash => if c = '/' then .ok (.code .other, []) else stepCode .other c
@@ -3878,9 +3894,12 @@ def validateModuleStructure (inv : ModuleInventory) : Except AuditFailure Unit :
 def allDeclaredNames (pkg : PackageAuditInput) : List SymName :=
   pkg.baseEnv.map (·.name) ++ pkg.modules.flatMap (·.constNames)
 
+def allExtraConstNames (pkg : PackageAuditInput) : List SymName :=
+  pkg.modules.flatMap (·.extraConstNames)
+
 /-- Module names are unique, every module is structurally valid, constant names are unique
-across the base environment and all modules, and no `extraConstNames` entry claims a
-declared name. -/
+across the base environment and all modules, and `extraConstNames` are distinct across
+all modules and never claim a declared name. -/
 def validatePackageStructure (pkg : PackageAuditInput) : Except AuditFailure Unit := do
   ensureNodup (pkg.modules.map (·.moduleName)) .duplicateModuleName
   checkAll pkg.modules validateModuleStructure
@@ -3889,21 +3908,62 @@ def validatePackageStructure (pkg : PackageAuditInput) : Except AuditFailure Uni
   checkAll pkg.modules (fun inv => checkAll inv.extraConstNames (fun n =>
     ensure (n ∉ allDeclaredNames pkg)
       (.extraConstNameProvenance inv.moduleName n "claims a declared constant")))
+  ensureNodup (allExtraConstNames pkg)
+    (fun n =>
+      let owner := (pkg.modules.find? (fun m => decide (n ∈ m.extraConstNames))).map (·.moduleName)
+      .extraConstNameProvenance (owner.getD .anonymous) n "duplicate extraConstName across modules")
 
 theorem validatePackageStructure_ok {pkg : PackageAuditInput}
     (h : validatePackageStructure pkg = .ok ()) :
     (pkg.modules.map (·.moduleName)).Nodup ∧
     (∀ inv ∈ pkg.modules, validateModuleRole inv = .ok () ∧ validateOleanParts inv = .ok () ∧
       validateReplayInventory inv = .ok ()) ∧
-    (allDeclaredNames pkg).Nodup := by
-  simp only [validatePackageStructure, bindUnit_ok_iff, ensureNodup_ok_iff, checkAll_ok_iff] at h
-  refine ⟨h.1, fun inv hinv => ?_, h.2.2.1⟩
+    (allDeclaredNames pkg).Nodup ∧
+    (allExtraConstNames pkg).Nodup ∧
+    (∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg) := by
+  simp only [validatePackageStructure, bindUnit_ok_iff, ensureNodup_ok_iff, checkAll_ok_iff,
+    ensure_ok_iff] at h
+  refine ⟨h.1, fun inv hinv => ?_, h.2.2.1, h.2.2.2.2, h.2.2.2.1⟩
   have h1 := h.2.1 inv hinv
   simpa only [validateModuleStructure, bindUnit_ok_iff] using h1
 
+/-! ## Codegen `_unsafe_rec` companions -/
+
+/-- The equation compiler's `parent._unsafe_rec` companion of a safe definition of the
+same module: a `partial` definition with the parent's type. -/
+def isCodegenUnsafeRecInMod (inv : ModuleInventory) (ci : ConstantRecord) : Bool :=
+  decide (ci.safety = .partialDecl ∧ ci.kind = .defnDecl) &&
+  match ci.name.unsafeRecParent? with
+  | some p =>
+    match findConstByName inv.constants p with
+    | some pc => decide (pc.kind = .defnDecl ∧ pc.safety = .safe ∧ pc.type = ci.type)
+    | none => false
+  | none => false
+
+theorem isCodegenUnsafeRecInMod_parent {inv : ModuleInventory} {ci : ConstantRecord}
+    (h : isCodegenUnsafeRecInMod inv ci = true) :
+    ∃ pc ∈ inv.constants, pc.safety = .safe ∧ pc.type = ci.type := by
+  unfold isCodegenUnsafeRecInMod at h
+  simp only [Bool.and_eq_true] at h
+  obtain ⟨_, h⟩ := h
+  split at h
+  · split at h
+    · rename_i pc hpc
+      simp only [decide_eq_true_eq] at h
+      exact ⟨pc, (findConstByName_mem hpc).1, h.2.1, h.2.2⟩
+    · cases h
+  · cases h
+
+def replayableConstants (inv : ModuleInventory) : List ConstantRecord :=
+  inv.constants.filter (fun ci => !isCodegenUnsafeRecInMod inv ci)
+
 /-! ## Persistent environment extensions -/
 
-def isLocalExtDecl (inv : ModuleInventory) (d : SymName) : Bool := decide (d ∈ inv.constNames)
+/-- A declaration belongs locally to `inv` for extension purposes only if it is both
+declared in `inv` and kernel-replayed (never a dangling name, borrowed name, or
+un-replayed `partial` `_unsafe_rec` companion). -/
+def isLocalExtDecl (inv : ModuleInventory) (d : SymName) : Bool :=
+  decide (d ∈ inv.constNames) && decide (d ∈ (replayableConstants inv).map (·.name))
 
 /-- Policy for one persisted extension entry. An entry found in a persisted table is
 persisted, whatever scope it was declared with. No audited module may register macros,
@@ -3956,11 +4016,12 @@ def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except 
 def validateModuleExtensions (inv : ModuleInventory) : Except AuditFailure Unit :=
   checkAll inv.extEntries (validateSingleExtEntry inv)
 
-/-- An accepted entry owns its declaration: it is declared, hence audited and replayed,
+/-- An accepted entry owns its declaration: it is declared, audited, and kernel-replayed
 in the same module. -/
 theorem validateSingleExtEntry_localDecl {inv : ModuleInventory} {ext : EnvExtEntry}
     (h : validateSingleExtEntry inv ext = .ok ()) :
-    ∀ d, ext.localDecl? = some d → d ∈ inv.constNames := by
+    ∀ d, ext.localDecl? = some d →
+      d ∈ inv.constNames ∧ d ∈ (replayableConstants inv).map (·.name) := by
   intro d hd
   cases ext <;>
     simp_all [validateSingleExtEntry, EnvExtEntry.localDecl?, bindUnit_ok_iff, ensure_ok_iff,
@@ -4198,14 +4259,15 @@ def whnfAllowOpaque (env : KernelEnv) : Nat → ExprSkeleton → ExprSkeleton
 def nativeAxiomRefutedByKernel (env : KernelEnv) (t : ExprSkeleton) : Bool :=
   match t with
   | .app (.app _ e) _ =>
-    decide (whnfAllowOpaque env (64 + 2 * env.length) e = .const SymName.boolFalseName)
+    decide (whnfAllowOpaque env (64 + 4 * e.size + 2 * env.length) e = .const SymName.boolFalseName)
   | _ => false
 
-/-- `--provisional` admits a native axiom only if it is compiler-generated (`_native`
-component), an axiom of a proof module, of the right shape, and not refuted. -/
+/-- `--provisional` admits a native axiom only if it has the strictly interior `._native.`
+shape `<decl>._native.<tactic>.ax_<n>`, is an axiom of a proof module, has the closed
+`EqBool e Bool.true` type shape, and is not refuted by runtime-faithful reduction. -/
 def checkNativeDep (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
     (user dep : SymName) (dci : ConstantRecord) : Except AuditFailure Unit := do
-  ensure (cfg.allowProvisionalNative = true ∧ dep.hasNativeMarker = true ∧
+  ensure (cfg.allowProvisionalNative = true ∧ dep.isProvisionalNativeName = true ∧
       dci.kind = .axiomDecl ∧ roleOfConst pkg dep dci = .proof)
     (.forbiddenNativeReductionAxiom user dep)
   ensure (isValidNativeAxiomType dci.type = true ∧ nativeAxiomRefutedByKernel env dci.type = false)
@@ -4387,34 +4449,9 @@ theorem buildVerifyItemReport_ok {cfg : AuditConfig} {pkg : PackageAuditInput} {
 
 /-! ## Module declarations: `unsafe`, `partial`, `_unsafe_rec`, declared axioms -/
 
-/-- The equation compiler's `parent._unsafe_rec` companion of a safe definition of the
-same module: a `partial` definition with the parent's type. -/
-def isCodegenUnsafeRecInMod (inv : ModuleInventory) (ci : ConstantRecord) : Bool :=
-  decide (ci.safety = .partialDecl ∧ ci.kind = .defnDecl) &&
-  match ci.name.unsafeRecParent? with
-  | some p =>
-    match findConstByName inv.constants p with
-    | some pc => decide (pc.kind = .defnDecl ∧ pc.safety = .safe ∧ pc.type = ci.type)
-    | none => false
-  | none => false
-
-theorem isCodegenUnsafeRecInMod_parent {inv : ModuleInventory} {ci : ConstantRecord}
-    (h : isCodegenUnsafeRecInMod inv ci = true) :
-    ∃ pc ∈ inv.constants, pc.safety = .safe ∧ pc.type = ci.type := by
-  unfold isCodegenUnsafeRecInMod at h
-  simp only [Bool.and_eq_true] at h
-  obtain ⟨_, h⟩ := h
-  split at h
-  · split at h
-    · rename_i pc hpc
-      simp only [decide_eq_true_eq] at h
-      exact ⟨pc, (findConstByName_mem hpc).1, h.2.1, h.2.2⟩
-    · cases h
-  · cases h
-
-/-- A companion is excused from replay, not from the dependency rules: each of its edges
-must resolve, must not be `unsafe`, may be `partial` only if it is the companion itself,
-and obeys the same axiom policy as everything else. -/
+/-- An `_unsafe_rec` companion is excused from replay only: every declaration in its
+transitive dependency closure must resolve, must not be `unsafe`, may be `partial` only
+if it is the companion itself, and obeys the same axiom policy as everything else. -/
 def checkUnsafeRecEdge (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
     (user dep : SymName) : Except AuditFailure Unit :=
   match env.lookup dep with
@@ -4424,12 +4461,34 @@ def checkUnsafeRecEdge (cfg : AuditConfig) (pkg : PackageAuditInput) (env : Kern
       (.unsafeOrPartialDecl (declaringModuleName pkg dep dci) dep)
     checkDepPolicy cfg pkg env user dep dci
 
+/-- An `_unsafe_rec` companion in a `.test` module must additionally obey the test-module
+closure policy (no `sorryAx`, no native or compiler-trust axioms, no foreign assumptions). -/
+def checkUnsafeRecTestEdge (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
+    (testMod user dep : SymName) : Except AuditFailure Unit :=
+  match env.lookup dep with
+  | none => .error (.unknownConstant dep)
+  | some dci => do
+    ensure (dci.safety ≠ .unsafeDecl ∧ (dci.safety = .safe ∨ dep = user))
+      (.unsafeOrPartialDecl (declaringModuleName pkg dep dci) dep)
+    ensure (dep ≠ SymName.sorryAxName)
+      (.forbiddenAxiom user dep (declaringModuleName pkg dep dci))
+    ensure (dep.isCompilerTrustAxiom = false ∧ dep.isNativeReductionAxiom = false)
+      (.forbiddenNativeReductionAxiom user dep)
+    ensure (dci.kind ≠ .axiomDecl ∨
+        (dep.isFoundationalAxiom = true ∧ roleOfConst pkg dep dci = .foundation) ∨
+        (cfg.allowLocalTestAxioms = true ∧ declaringModuleName pkg dep dci = testMod))
+      (.testModuleForeignAxiom testMod user dep)
+
 def auditDeclSafety (cfg : AuditConfig) (pkg : PackageAuditInput) (env : KernelEnv)
     (inv : ModuleInventory) (ci : ConstantRecord) : Except AuditFailure Unit :=
   if isCodegenUnsafeRecInMod inv ci then
-    match ci.declarationEdges with
+    match walkGraph env ci.name closureExpand (closureFuel env) [ci.name] [] with
     | .error e => .error e
-    | .ok edges => checkAll edges (checkUnsafeRecEdge cfg pkg env ci.name)
+    | .ok visited =>
+      if inv.role = .test then
+        checkAll visited (checkUnsafeRecTestEdge cfg pkg env inv.moduleName ci.name)
+      else
+        checkAll visited (checkUnsafeRecEdge cfg pkg env ci.name)
   else ensure (ci.safety = .safe) (.unsafeOrPartialDecl inv.moduleName ci.name)
 
 /-- Every axiom a module declares is checked, referenced or not. A test module may keep
@@ -4601,9 +4660,6 @@ def auditClaimRoot (pkg : PackageAuditInput) (env : KernelEnv) (root : SymName) 
 
 /-! ## Closure roots and test modules -/
 
-def replayableConstants (inv : ModuleInventory) : List ConstantRecord :=
-  inv.constants.filter (fun ci => !isCodegenUnsafeRecInMod inv ci)
-
 /-- Every declaration of a non-test module is a closure root, referenced or not. -/
 def closureRootsOfModule (inv : ModuleInventory) : List SymName :=
   if inv.role = .test then [] else (replayableConstants inv).map (·.name)
@@ -4699,11 +4755,17 @@ def validateAxiomAndTamperPolicy (cfg : AuditConfig) (pkg : PackageAuditInput) :
   let reports ← collectEach pkg.verifyRoots (buildVerifyItemReport cfg pkg (packageEnv pkg))
   .ok { reachedAxioms := reached, itemReports := reports }
 
-/-- May replay admit this declaration if it is an axiom? Only what the policy admitted. -/
+/-- May replay admit this declaration if it is an axiom? Only what the policy admits
+(never `sorryAx`, never `Lean.trustCompiler`, and only strictly interior `._native.`
+names for provisional proof axioms). -/
 def allowReplayAxiom (cfg : AuditConfig) (pkg : PackageAuditInput) (ci : ConstantRecord) : Bool :=
-  (cfg.allowAssumptions && decide (roleOfConst pkg ci.name ci = .assumptions)) ||
-  (cfg.allowProvisionalNative && decide (roleOfConst pkg ci.name ci = .proof)) ||
-  (cfg.allowLocalTestAxioms && decide (roleOfConst pkg ci.name ci = .test))
+  decide (ci.name ≠ SymName.sorryAxName) && !ci.name.isCompilerTrustAxiom &&
+  ((cfg.allowAssumptions && !ci.name.isNativeReductionAxiom &&
+      decide (roleOfConst pkg ci.name ci = .assumptions)) ||
+   (cfg.allowProvisionalNative && ci.name.isProvisionalNativeName &&
+      decide (roleOfConst pkg ci.name ci = .proof)) ||
+   (cfg.allowLocalTestAxioms && !ci.name.isNativeReductionAxiom &&
+      decide (roleOfConst pkg ci.name ci = .test)))
 
 /-- Declarations to replay: everything except `_unsafe_rec` companions. -/
 def collectReplayDecls (pkg : PackageAuditInput) : List ConstantRecord :=
@@ -4764,7 +4826,9 @@ theorem auditAndReplayPackage_facts {cfg : AuditConfig} {pkg : PackageAuditInput
     ((pkg.modules.map (·.moduleName)).Nodup ∧
       (∀ inv ∈ pkg.modules, validateModuleRole inv = .ok () ∧ validateOleanParts inv = .ok () ∧
         validateReplayInventory inv = .ok ()) ∧
-      (allDeclaredNames pkg).Nodup) ∧
+      (allDeclaredNames pkg).Nodup ∧
+      (allExtraConstNames pkg).Nodup ∧
+      (∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg)) ∧
     PolicyFacts cfg pkg cert.itemReports ∧
     replayCleanEnvOrdered (allowReplayAxiom cfg pkg) (mkBaseKernelEnv pkg.baseEnv)
       (collectReplayDecls pkg) = .ok cert.replayedEnv ∧
@@ -4785,7 +4849,14 @@ theorem auditAndReplayPackage_global_names_nodup {cfg : AuditConfig} {pkg : Pack
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     (pkg.baseEnv.map ConstantRecord.name ++
       pkg.modules.flatMap ModuleInventory.constNames).Nodup :=
-  (auditAndReplayPackage_facts h).1.2.2
+  (auditAndReplayPackage_facts h).1.2.2.1
+
+/-- `extraConstNames` are distinct across all modules and disjoint from every declared constant. -/
+theorem auditAndReplayPackage_extraConstNames_nodup {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
+    (allExtraConstNames pkg).Nodup ∧
+      ∀ inv ∈ pkg.modules, ∀ n ∈ inv.extraConstNames, n ∉ allDeclaredNames pkg :=
+  ⟨(auditAndReplayPackage_facts h).1.2.2.2.1, (auditAndReplayPackage_facts h).1.2.2.2.2⟩
 
 theorem moduleRole_facts {inv : ModuleInventory} (h : validateModuleRole inv = .ok ()) :
     inv.moduleName.isStdlibModule = false ∧ inv.moduleName.isLeanCompilerModule = false ∧
@@ -4919,47 +4990,77 @@ theorem auditAndReplayPackage_statement_side_dependencies {cfg : AuditConfig}
         ((auditAndReplayPackage_imports_sound h inv' hinv').2.2.1 imp himp).2.2.2.2.2)
       hreach (hri ▸ hrole)
 
-/-- Every persisted extension entry owns its declaration, and every constant and scope it
-names lies inside the module's import closure. -/
+/-- Every persisted extension entry owns its declaration, every constant and scope it names
+lies inside the module's import closure, and statement-side modules only reference
+statement-side targets and scopes. -/
 theorem auditAndReplayPackage_ext_refs_within_imports {cfg : AuditConfig}
     {pkg : PackageAuditInput} {cert : AuditCertificate}
     (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ ext ∈ inv.extEntries,
       (∀ d, ext.localDecl? = some d → d ∈ inv.constNames) ∧
       (∀ c ∈ ext.referencedConstants, ∀ target, moduleOfConst? pkg c = some target →
-        target.moduleName = inv.moduleName ∨
+        (target.moduleName = inv.moduleName ∨
           ImportReaches pkg inv.moduleName target.moduleName) ∧
+        (isStatementSideRole inv.role = true → isStatementSideRole target.role = true)) ∧
       (∀ ns ∈ ext.referencedModules, ∀ target, findModule? pkg ns = some target →
-        ns = inv.moduleName ∨ ImportReaches pkg inv.moduleName ns) := by
+        (ns = inv.moduleName ∨ ImportReaches pkg inv.moduleName ns) ∧
+        (isStatementSideRole inv.role = true → isStatementSideRole target.role = true)) := by
   intro inv hinv ext hext
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
   have hval := checkAll_ok_iff.mp hm.1 ext hext
   have href := checkAll_ok_iff.mp hm.2.2.2.2.2.2.1 ext hext
+  have hnd := auditAndReplayPackage_modules_nodup h
+  have hri := roleOfModule_of_mem hnd hinv
+  have himp : ∀ inv' ∈ pkg.modules, ∀ imp ∈ inv'.imports,
+      importRoleAllowed inv'.role (roleOfModule pkg imp.module) = true :=
+    fun inv' hinv' imp himp =>
+      ((auditAndReplayPackage_imports_sound h inv' hinv').2.2.1 imp himp).2.2.2.2.2
   simp only [auditExtReferences, bindUnit_ok_iff, checkAll_ok_iff] at href
-  refine ⟨validateSingleExtEntry_localDecl hval, fun c hc target ht => ?_,
+  refine ⟨fun d hd => (validateSingleExtEntry_localDecl hval d hd).1, fun c hc target ht => ?_,
     fun ns hns target ht => ?_⟩
   · have h1 := href.1 c hc
     simp only [checkReference, ht, ensure_ok_iff] at h1
-    exact moduleVisibleFrom_iff.mp h1
+    have hvis := moduleVisibleFrom_iff.mp h1
+    refine ⟨hvis, fun hrole => ?_⟩
+    have hrt := roleOfModule_of_mem hnd (moduleOfConstIn_spec ht).1
+    rcases hvis with heq | hreach
+    · rw [← hrt, heq, hri]
+      exact hrole
+    · rw [← hrt]
+      exact importReaches_statementSide himp hreach (hri ▸ hrole)
   · have h1 := href.2 ns hns
     simp only [checkScopeModule, ht, ensure_ok_iff] at h1
-    rcases h1 with h1 | h1
-    · simp at h1
-    · exact moduleVisibleFrom_iff.mp h1
+    have hvis : ns = inv.moduleName ∨ ImportReaches pkg inv.moduleName ns := by
+      rcases h1 with h1 | h1
+      · simp at h1
+      · exact moduleVisibleFrom_iff.mp h1
+    refine ⟨hvis, fun hrole => ?_⟩
+    have hspec := findModuleIn_spec ht
+    have hrt := roleOfModule_of_mem hnd hspec.1
+    rcases hvis with heq | hreach
+    · rw [← hrt, hspec.2, heq, hri]
+      exact hrole
+    · rw [← hrt, hspec.2]
+      exact importReaches_statementSide himp hreach (hri ▸ hrole)
 
 /-- Every instance, coercion, and reducibility entry refers to a declaration that the same
-module declares with a record of that name: no dangling or borrowed entries. -/
+module declares, audits, and kernel-replays (never dangling, borrowed, or an un-replayed
+`_unsafe_rec` companion). -/
 theorem auditAndReplayPackage_ext_decls_declared {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ ext ∈ inv.extEntries, ∀ d, ext.localDecl? = some d →
-      d ∈ inv.constNames ∧ ∃ ci ∈ inv.constants, ci.name = d := by
+      d ∈ inv.constNames ∧
+        ∃ ci ∈ inv.constants, ci.name = d ∧ cert.replayedEnv.lookup d = some ci := by
   intro inv hinv ext hext d hd
-  have hmem := (auditAndReplayPackage_ext_refs_within_imports h inv hinv ext hext).1 d hd
-  have hk := (validInventory_key_eq_ci_name ((auditAndReplayPackage_facts h).1.2.1 inv hinv).2.2).2
-  refine ⟨hmem, ?_⟩
-  rw [hk] at hmem
-  obtain ⟨ci, hci, hname⟩ := List.mem_map.mp hmem
-  exact ⟨ci, hci, hname⟩
+  have hfacts := auditAndReplayPackage_facts h
+  have hm := auditModulePolicy_ok (hfacts.2.1.modules inv hinv)
+  have hval := checkAll_ok_iff.mp hm.1 ext hext
+  obtain ⟨hmem, hrep⟩ := validateSingleExtEntry_localDecl hval d hd
+  obtain ⟨ci, hciRep, hname⟩ := List.mem_map.mp hrep
+  have hci : ci ∈ inv.constants := (List.mem_filter.mp hciRep).1
+  have hdecls := (replayCleanEnvOrdered_contains_decl hfacts.2.2.1).1
+  have hlk := hdecls ci (List.mem_flatMap.mpr ⟨inv, hinv, hciRep⟩)
+  exact ⟨hmem, ci, hci, hname, hname ▸ hlk⟩
 
 /-- A record that claims a foreign origin is a reserved auxiliary declaration, and a
 package module it names is in the claiming module's import closure. -/
@@ -4981,41 +5082,70 @@ theorem auditAndReplayPackage_reserved_origins_within_imports {cfg : AuditConfig
     · exact absurd h3 hne
     · exact h3
 
-/-- `_unsafe_rec` companions are excused from replay only: each of their edges resolves,
-is not `unsafe`, is not `sorryAx` or `Lean.trustCompiler`, and in unconditional mode is
-not native reduction and is an axiom only if foundational. -/
+/-- `_unsafe_rec` companions are excused from replay only: every declaration in their
+entire transitive `DepReaches` closure resolves, is not `unsafe`, is not any other
+`partial` declaration, is not `sorryAx` or `Lean.trustCompiler`, obeys the test-module
+closure policy when declared in a `.test` module, and in unconditional mode for non-test
+modules is not native reduction and is an axiom only if foundational. -/
 theorem auditAndReplayPackage_unsafeRec_sanitized {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ ci ∈ inv.constants, isCodegenUnsafeRecInMod inv ci = true →
-      ∀ edges, ConstantRecord.declarationEdges ci = .ok edges → ∀ dep ∈ edges,
+      ∀ dep, DepReaches (packageEnv pkg) ci.name dep →
       ∃ dci, (packageEnv pkg).lookup dep = some dci ∧ dci.safety ≠ .unsafeDecl ∧
+        (dci.safety = .safe ∨ dep = ci.name) ∧
         dep ≠ SymName.sorryAxName ∧ dep.isCompilerTrustAxiom = false ∧
-        (cfg.allowAssumptions = false → cfg.allowProvisionalNative = false →
+        (inv.role = .test →
+          dep.isNativeReductionAxiom = false ∧
+          (dci.kind = .axiomDecl →
+            (dep.isFoundationalAxiom = true ∧ roleOfConst pkg dep dci = .foundation) ∨
+            (cfg.allowLocalTestAxioms = true ∧ declaringModuleName pkg dep dci = inv.moduleName))) ∧
+        (inv.role ≠ .test → cfg.allowAssumptions = false → cfg.allowProvisionalNative = false →
           dep.isNativeReductionAxiom = false ∧
           (dci.kind = .axiomDecl →
             dep.isFoundationalAxiom = true ∧ roleOfConst pkg dep dci = .foundation)) := by
-  intro inv hinv ci hci hcomp edges he dep hdep
+  intro inv hinv ci hci hcomp dep hreach
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
-  have h1 := hm.2.2.2.2.1 ci hci
-  simp only [auditModuleDecl, bindUnit_ok_iff, auditDeclSafety, hcomp, ↓reduceIte, he,
-    checkAll_ok_iff] at h1
-  have h2 := h1.1 dep hdep
-  unfold checkUnsafeRecEdge at h2
-  split at h2
-  · cases h2
-  · rename_i dci hdci
-    simp only [bindUnit_ok_iff, ensure_ok_iff] at h2
-    obtain ⟨p1, p2, p3, p4⟩ := checkDepPolicy_ok h2.2
-    refine ⟨dci, hdci, h2.1.1, p1, p2, fun ha hp => ?_⟩
-    have hn : dep.isNativeReductionAxiom = false := by
-      cases hn : dep.isNativeReductionAxiom with
-      | false => rfl
-      | true => rw [p3 hn] at hp; cases hp
-    refine ⟨hn, fun hk => ?_⟩
-    rcases p4 hn hk with hf | hf
-    · exact hf
-    · rw [ha] at hf
-      cases hf.1
+  have h1 := (hm.2.2.2.2.1 ci hci)
+  simp only [auditModuleDecl, bindUnit_ok_iff, auditDeclSafety, hcomp, ↓reduceIte] at h1
+  have hs := h1.1
+  split at hs
+  · cases hs
+  · rename_i visited hw
+    have hmem : dep ∈ visited :=
+      (walkGraph_reaches_subset hw).1 ci.name List.mem_cons_self dep hreach
+    split at hs
+    · rename_i htest
+      have h2 := checkAll_ok_iff.mp hs dep hmem
+      unfold checkUnsafeRecTestEdge at h2
+      split at h2
+      · cases h2
+      · rename_i dci hdci
+        simp only [bindUnit_ok_iff, ensure_ok_iff] at h2
+        refine ⟨dci, hdci, h2.1.1, h2.1.2, h2.2.1, h2.2.2.1.1, fun _ => ?_,
+          fun hne => absurd htest hne⟩
+        refine ⟨h2.2.2.1.2, fun hk => ?_⟩
+        rcases h2.2.2.2 with h3 | h3
+        · exact absurd hk h3
+        · exact h3
+    · rename_i hnotTest
+      have h2 := checkAll_ok_iff.mp hs dep hmem
+      unfold checkUnsafeRecEdge at h2
+      split at h2
+      · cases h2
+      · rename_i dci hdci
+        simp only [bindUnit_ok_iff, ensure_ok_iff] at h2
+        obtain ⟨p1, p2, p3, p4⟩ := checkDepPolicy_ok h2.2
+        refine ⟨dci, hdci, h2.1.1, h2.1.2, p1, p2, fun ht => absurd ht hnotTest,
+          fun _ ha hp => ?_⟩
+        have hn : dep.isNativeReductionAxiom = false := by
+          cases hn : dep.isNativeReductionAxiom with
+          | false => rfl
+          | true => rw [p3 hn] at hp; cases hp
+        refine ⟨hn, fun hk => ?_⟩
+        rcases p4 hn hk with hf | hf
+        · exact hf
+        · rw [ha] at hf
+          cases hf.1
 
 /-- With `requireSources`, every module supplied a source text and it passed the scanner. -/
 theorem auditAndReplayPackage_sources_covered {cfg : AuditConfig} {pkg : PackageAuditInput}
@@ -5358,14 +5488,21 @@ theorem collectViolations_nil {cfg : AuditConfig} {pkg : PackageAuditInput}
     exact absurd h (hne · )
 
 def renderAuditJsonChars (cfg : AuditConfig) (pkg : PackageAuditInput) : List Char :=
-  match collectViolations cfg pkg, auditAndReplayPackage cfg pkg with
-  | [], .ok cert =>
-    "{\"ok\":true,\"violations\":[],\"modules\":".toList ++ (toString pkg.modules.length).toList ++
-      ",\"replayed\":".toList ++ (toString (collectReplayDecls pkg).length).toList ++
-      ",\"reachedAxioms\":".toList ++ jsonNames cert.reachedAxioms ++
-      ",\"items\":".toList ++ jsonArray (cert.itemReports.map renderItemChars) ++ ['}']
-  | violations, _ =>
-    "{\"ok\":false,\"violations\":".toList ++ jsonArray (violations.map renderViolationChars) ++
+  match pkg.modules.filterMap (fun inv =>
+      match validateModuleStructure inv with
+      | .error e => some e
+      | .ok _ => none) with
+  | [] =>
+    match auditAndReplayPackage cfg pkg with
+    | .ok cert =>
+      "{\"ok\":true,\"violations\":[],\"modules\":".toList ++ (toString pkg.modules.length).toList ++
+        ",\"replayed\":".toList ++ (toString (collectReplayDecls pkg).length).toList ++
+        ",\"reachedAxioms\":".toList ++ jsonNames cert.reachedAxioms ++
+        ",\"items\":".toList ++ jsonArray (cert.itemReports.map renderItemChars) ++ ['}']
+    | .error e =>
+      "{\"ok\":false,\"violations\":".toList ++ jsonArray [renderViolationChars e] ++ ['}']
+  | structural =>
+    "{\"ok\":false,\"violations\":".toList ++ jsonArray (structural.map renderViolationChars) ++
       ['}']
 
 /-- Deterministic JSON for drivers: `{"ok": …, "violations": [...], ...}`. -/

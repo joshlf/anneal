@@ -1505,8 +1505,11 @@ theorem kernel_model_edges :
          mkThm kA (eqNat (.app (.const kF) (.natLit 3)) (.natLit 4)) (.app (c! "Eq.refl") (.natLit 3))])
       (.kernelTypeError kA "theorem proof term type mismatch") = true ∧
     failsWith (replayCleanEnv (fun _ => false) standardBaseEnv
-        [mkDef kF (.pi (.pi natE natE) natE) (.lam (.pi natE natE) (.natLit 0))])
+        [mkDef kF natE (.lam (.pi natE natE) (.natLit 0))])
       (.kernelTypeError kF "abstraction over a non-data binder must produce a proof") = true ∧
+    failsWith (replayCleanEnv (fun _ => false) standardBaseEnv
+        [mkDef kF (.pi (.pi natE natE) natE) (.lam (.pi natE natE) (.natLit 0))])
+      (.kernelTypeError kF "function type over a non-data domain must be a proposition") = true ∧
     failsWith (replayCleanEnv (fun _ => false) standardBaseEnv
         [mkThm kA (.pi (.pi natE natE) natE) trueIntroE])
       (.kernelTypeError kA "function type over a non-data domain must be a proposition") = true ∧
@@ -1521,6 +1524,134 @@ theorem kernel_model_edges :
     failsWith (replayCleanEnv (fun _ => false) standardBaseEnv [mkThm SymName.falseName trueE trueIntroE])
       (.kernelTypeError SymName.falseName "declaration already present in the replay environment")
       = true := by decide +kernel
+
+/-! ## Pass `B1` hardening regressions -/
+
+/-- Core token `/\` before a block comment, token boundaries around `«...»` escaped
+identifiers, and dot-identifier `.r` before `"\""` (not a raw string). -/
+theorem passB1_lexer_and_guillemet_desync_rejected :
+    flags (chars! "theorem t : True/\\/- \" -/True := ⟨trivial, trivial⟩\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
+      "debug.skipKernelTC" = true ∧
+    flags (chars! "section «Foo»set_option debug.byAsSorry true in\ntheorem bad : False := by skip\nend «Foo»")
+      "debug.byAsSorry" = true ∧
+    flags (chars! "namespace «Foo»unsafe def evil : Nat := 0\nend «Foo»")
+      "unsafe" = true ∧
+    flags (chars! "open «Nat»partial def loop (x : Nat) : Nat := loop x")
+      "partial" = true ∧
+    flags (chars! "section «Foo»run_cmd pure ()\nend «Foo»")
+      "run_cmd" = true ∧
+    flags (chars! "def a := f«unsafe»") "unsafe" = true ∧
+    flags (chars! "def a := r«unsafe»") "unsafe" = true ∧
+    flags (chars! "def x := .r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
+      "debug.skipKernelTC" = true ∧
+    flags (chars! "def f (s : S) := (s).r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
+      "debug.skipKernelTC" = true ∧
+    flags (chars! "def f (p : S × Nat) := p.1.r\"\\\"\"\nset_option debug.skipKernelTC true in\ntheorem bad : False := trivial -- \"")
+      "debug.skipKernelTC" = true ∧
+    flags (chars! "set_option «debug».«skipKernelTC» true in\ntheorem bad : False := trivial")
+      "debug.skipKernelTC" = true ∧
+    isOk (scan (chars! "theorem t : True/\\/- comment -/True := ⟨trivial, trivial⟩")) = true ∧
+    isOk (scan (chars! "set_option «pp».«all» true in\ndef x := 1")) = true ∧
+    isOk (scan (chars! "def a := «x»r\"\\\"\ndef b := 1")) = true := by decide +kernel
+
+/-- Definitions and opaque declarations must have a well-typed sort annotation (`kernelSortOf`),
+not merely a type whose β-reduction ignores an ill-typed binder domain. -/
+theorem passB1_kernel_defn_opaque_ill_typed_type_rejected :
+    let illType : ExprSkeleton := .app (.lam (.natLit 0) natE) (.natLit 0)
+    failsWith (audit noSourceConfig
+        (pkgWithProofs (addConsts proofsModule [mkDef (sn! "Topic.Proofs.badDef") illType (.natLit 0)])))
+      (.kernelTypeError (sn! "Topic.Proofs.badDef") "type expected") = true ∧
+    failsWith (audit noSourceConfig
+        (pkgWithProofs (addConsts proofsModule [mkOpaque (sn! "Topic.Proofs.badOp") illType (.natLit 0)])))
+      (.kernelTypeError (sn! "Topic.Proofs.badOp") "type expected") = true := by decide +kernel
+
+def testRecParentName : SymName := sn! "Topic.Tests.testRec"
+def testRecCompName : SymName := sn! "Topic.Tests.testRec._unsafe_rec"
+
+def testRecMod (val : ExprSkeleton) (imports : List SymName) (extra : List ConstantRecord := []) :
+    ModuleInventory :=
+  mkModule testsMod .test
+    (extra ++ [mkDef testRecParentName natE (.natLit 0),
+      { mkDef testRecCompName natE val with safety := .partialDecl }])
+    ([sn! "Init"] ++ imports)
+
+/-- `_unsafe_rec` companions are checked over their entire transitive `DepReaches` closure
+(catching `sorryAx` hidden behind a `baseEnv` helper) and obey the `.test`-module policy
+(blocking foreign `Assumptions.*` and `Proof.Native` axioms in test companions while still
+admitting local test axioms when `allowLocalTestAxioms = true`). -/
+theorem passB1_unsafeRec_transitive_and_test_policy_rejected :
+    let baseWithWrapper := standardBaseDecls ++ [
+      { name := sn! "Trusted.BaseHelper", kind := .defnDecl, type := natE,
+        value? := some (.app (.lam trueE (.natLit 0)) sorryE),
+        originModule := some (sn! "Trusted.Core") }]
+    failsWith (audit noSourceConfig
+        { corePkg with
+          baseEnv := baseWithWrapper,
+          modules := [defsModule, theoryModule,
+            { proofsModule with
+              constants := proofsModule.constants.dropLast ++
+                [recWith (c! "Trusted.BaseHelper")] },
+            verifyModule] })
+      (.forbiddenAxiom recName SymName.sorryAxName initPrelude) = true ∧
+    failsWith (audit { conditionalConfig with requireSources := false }
+        { baseEnv := standardBaseDecls,
+          modules := [mkModule hwMod .assumptions [mkAxiom mmioName trueE] [sn! "Init"],
+            testRecMod (viaProof trueE mmioName (.natLit 0)) [hwMod]] })
+      (.testModuleForeignAxiom testsMod testRecCompName mmioName) = true ∧
+    failsWith (audit provisionalNoSource
+        { baseEnv := standardBaseDecls,
+          modules := [nativeModule,
+            testRecMod (viaProof (eqBoolTrue (c! "Bool.true")) nativeAxName (.natLit 0))
+              [sn! "Proof.Native"]] })
+      (.forbiddenNativeReductionAxiom testRecCompName nativeAxName) = true ∧
+    isOk (audit testAxiomsConfig
+        { baseEnv := standardBaseDecls,
+          modules := [testRecMod (viaProof trueE localAxName (.natLit 0)) []
+            [mkAxiom localAxName trueE]] }) = true := by decide +kernel
+
+/-- Extension entries may not attach to an un-replayed `partial` `_unsafe_rec` companion,
+and `extraConstNames` must be distinct across modules. -/
+theorem passB1_unsafeRec_ext_target_and_cross_module_extraConstNames_rejected :
+    failsWith (audit noSourceConfig (extPkg (.instanceEntry recName mutAName false)))
+      (.forbiddenInstanceOrCoe proofsMod "imported_instance" recName) = true ∧
+    failsWith (audit noSourceConfig (extPkg (.reducibilityOverride recName)))
+      (.forbiddenReducibilityOverride proofsMod recName) = true ∧
+    failsWith (audit noSourceConfig
+        { corePkg with
+          modules := [{ defsModule with extraConstNames := [sn! "Shared._cstage1"] },
+            theoryModule,
+            { proofsModule with extraConstNames := [sn! "Shared._cstage1"] },
+            verifyModule] })
+      (.extraConstNameProvenance defsMod (sn! "Shared._cstage1")
+        "duplicate extraConstName across modules") = true := by decide +kernel
+
+def nestedBetaFalse : Nat → ExprSkeleton
+  | 0 => c! "Bool.false"
+  | n + 1 => .app (.lam boolE (nestedBetaFalse n)) (c! "Bool.true")
+
+/-- Provisional native refutation scales its fuel with the expression's size (refuting deep
+β-redex chains), provisional admission requires a strictly interior `._native.` name, and
+`allowReplayAxiom` enforces those same guards independently. -/
+theorem passB1_provisional_native_fuel_and_interior_name_hardened :
+    failsWith (audit provisionalNoSource (nativeProofs (eqBoolTrue (nestedBetaFalse 130))))
+      (.invalidNativeAxiomType provAx provAx) = true ∧
+    failsWith (audit provisionalNoSource
+        (pkgWithProofs (addConsts proofsModule
+          [mkAxiom (sn! "_native") (eqBoolTrue (c! "Bool.true"))])))
+      (.forbiddenNativeReductionAxiom (sn! "_native") (sn! "_native")) = true ∧
+    failsWith (audit provisionalNoSource
+        (pkgWithProofs (addConsts proofsModule
+          [mkAxiom (sn! "_native.ax") (eqBoolTrue (c! "Bool.true"))])))
+      (.forbiddenNativeReductionAxiom (sn! "_native.ax") (sn! "_native.ax")) = true ∧
+    failsWith (audit provisionalNoSource
+        (pkgWithProofs (addConsts proofsModule
+          [mkAxiom (sn! "Topic.Proofs._native") (eqBoolTrue (c! "Bool.true"))])))
+      (.forbiddenNativeReductionAxiom (sn! "Topic.Proofs._native") (sn! "Topic.Proofs._native"))
+      = true ∧
+    allowReplayAxiom provisionalNoSource corePkg (mkAxiom (sn! "Topic.Proofs.sneaky") trueE)
+      = false ∧
+    allowReplayAxiom provisionalNoSource corePkg
+      (mkAxiom (sn! "_native") (eqBoolTrue (c! "Bool.true"))) = false := by decide +kernel
 
 /-! ## End-to-end instantiation on the clean package -/
 
@@ -1637,6 +1768,10 @@ Every theorem of the module, pinned to its exact axiom footprint. All are within
 #guard_msgs (whitespace := lax) in
 #print axioms auditAndReplayPackage_global_names_nodup
 
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_extraConstNames_nodup' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms auditAndReplayPackage_extraConstNames_nodup
+
 /-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_no_lean_modules' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms auditAndReplayPackage_no_lean_modules
@@ -1669,7 +1804,7 @@ Every theorem of the module, pinned to its exact axiom footprint. All are within
 #guard_msgs (whitespace := lax) in
 #print axioms auditAndReplayPackage_reserved_origins_within_imports
 
-/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_ext_decls_declared' depends on axioms: [propext, Classical.choice, Quot.sound] -/
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.auditAndReplayPackage_ext_decls_declared' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms auditAndReplayPackage_ext_decls_declared
 
@@ -1831,6 +1966,26 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.validBaselinePackage_verifyRoot_closure_clean' depends on axioms: [propext, Quot.sound] -/
 #guard_msgs (whitespace := lax) in
 #print axioms validBaselinePackage_verifyRoot_closure_clean
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB1_lexer_and_guillemet_desync_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB1_lexer_and_guillemet_desync_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB1_kernel_defn_opaque_ill_typed_type_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB1_kernel_defn_opaque_ill_typed_type_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB1_unsafeRec_transitive_and_test_policy_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB1_unsafeRec_transitive_and_test_policy_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB1_unsafeRec_ext_target_and_cross_module_extraConstNames_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB1_unsafeRec_ext_target_and_cross_module_extraConstNames_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB1_provisional_native_fuel_and_interior_name_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passB1_provisional_native_fuel_and_interior_name_hardened
 
 
 end Anneal.ReplayKeyAndTamperAuditTests
