@@ -42,6 +42,25 @@ modifying the repository working tree:
 3. The gate exits `0` if and only if 100% of selected guards are genuinely
    killed with `0` survivors and `0` errors.
 
+Anti-false-kill and isolation invariants
+----------------------------------------
+
+* A mutant only counts as `KILLED` when Lean exits `1` and every error
+  diagnostic is located inside the guard's refutation theorem in the generated
+  fixture, with a proof/type-mismatch marker inside one of those diagnostics.
+  Errors in other files, errors without a source position, crash/timeout/parse
+  markers, and signal exit codes are `ERROR`, never a kill.
+* `.lake/build/lib/lean` `.olean`s are reused only when they are proven to
+  correspond to the current sources: Lake's own `.trace` records are checked by
+  content (source text hash, `.olean` hash, and the hash of every imported
+  `.olean`, reproduced here in pure Python). File mtimes are consulted only for
+  build trees that have no Lake traces at all, where a source newer than its
+  `.olean` forces a cold build.
+* `.olean`s are shared by hardlink, so no Lean invocation may ever write
+  through one: destinations are unlinked before every link and every compile,
+  stale downstream modules are never seeded into a mutant overlay, and the
+  reused Lake artifacts are re-checked after the run.
+
 How to add a new guard
 ----------------------
 
@@ -62,17 +81,20 @@ How to add a new guard
 from __future__ import annotations
 
 import argparse
+import array
 from collections.abc import Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 sys.dont_write_bytecode = True
@@ -182,6 +204,14 @@ NON_KILL_ERROR_MARKERS: tuple[str, ...] = (
     "internal exception",
     "invalid import",
     "incompatible header",
+    "(deterministic) timeout",
+    "stack overflow",
+    "Stack overflow",
+    "out of memory",
+    "uncaught exception",
+    "unknown namespace",
+    "unknown package",
+    "object file",
 )
 
 # Diagnostic substrings emitted by Lean 4 when a refutation theorem fails to
@@ -199,14 +229,34 @@ EXPECTED_PROOF_FAILURE_MARKERS: tuple[str, ...] = (
     "is not a valid",
 )
 
-# Warning substrings emitted by Lean 4 when a proof uses `sorry`.
+# Warning substrings emitted by Lean 4 when a proof uses `sorry`. The pinned
+# toolchain (v4.34.1) prints "declaration uses `sorry`" with backticks; older
+# toolchains printed single quotes. These literals are documentation only:
+# detection goes through `SORRY_OUTPUT_RE`, which matches every quoting style
+# as well as `sorryAx`.
 SORRY_OUTPUT_MARKERS: tuple[str, ...] = (
-    "uses 'sorry'",
+    "declaration uses `sorry`",
     "declaration uses 'sorry'",
+    "sorryAx",
+)
+SORRY_OUTPUT_RE = re.compile(r"\bsorry")
+
+# Tokens forbidden inside generated sanity and refutation Lean fixtures (and in
+# guard replacements). They either make a proof vacuous (`sorry`, `sorryAx`,
+# `admit`, `axiom`, `opaque`, `native_decide`, `implemented_by`, `extern`,
+# `unsafe`, `partial`), smuggle a second proof obligation into the fixture
+# (`example`, `lemma`, `instance`), or change how the fixture elaborates
+# (`set_option`, `attribute`, `macro`, `syntax`, `elab`, `notation`, `run_cmd`,
+# `initialize`, `#`-commands).
+FORBIDDEN_FIXTURE_TOKEN_RE = re.compile(
+    r"\bsorry\w*|#[A-Za-z_]\w*|"
+    r"\b(?:admit|axiom|opaque|native_decide|implemented_by|extern|unsafe|"
+    r"partial|example|lemma|instance|set_option|attribute|macro|syntax|elab|"
+    r"notation|run_cmd|initialize)\b"
 )
 
-# Tokens forbidden inside generated sanity and refutation Lean fixtures.
-FORBIDDEN_FIXTURE_TOKEN_RE = re.compile(r"\b(?:sorry|admit|axiom)\b")
+# Lake build trace schema versions whose layout `_verify_lake_traces` knows.
+LAKE_TRACE_SCHEMA_VERSIONS: tuple[str, ...] = ("2025-09-10",)
 
 # Valid guard_id pattern (also used as Lean module filename suffix).
 GUARD_ID_RE = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -259,7 +309,7 @@ class GuardResult:
 
 MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
     # ------------------------------------------------------------------
-    # Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean (5 UB guards)
+    # Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean (6 UB guards)
     # ------------------------------------------------------------------
     MirSemanticsGuard(
         guard_id="div_by_zero",
@@ -410,6 +460,61 @@ MIR_SEMANTICS_GUARDS: tuple[MirSemanticsGuard, ...] = (
             "\n"
             "theorem refute_signed_div_overflow :\n"
             "    evalScalarBinOp .div ⟨128, 1⟩ ⟨255, 1⟩ .nil emptyMemory true = .ub :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+    ),
+    MirSemanticsGuard(
+        guard_id="signed_rem_overflow",
+        target_file="trusted/lean/Trusted/Rustc/V2026_06_01/MirSemantics/Scalars.lean",
+        target_module="Trusted/Rustc/V2026_06_01/MirSemantics/Scalars",
+        description="evalSignedRem rejects signed MIN % -1 overflow as UB",
+        anchor=(
+            "  match Bool.and (Nat.beq ca minSigned) (Nat.beq cb minusOne) with\n"
+            "  | true => .ub\n"
+            "  | false =>\n"
+            "    let negA := isSignedNegative ca sz\n"
+            "    let negB := isSignedNegative cb sz\n"
+            "    let magA := match negA with | false => ca | true => Nat.sub modulus ca\n"
+            "    let magB := match negB with | false => cb | true => Nat.sub modulus cb\n"
+            "    let magR := Nat.mod magA magB"
+        ),
+        replacement=(
+            "  match false with\n"
+            "  | true => .ub\n"
+            "  | false =>\n"
+            "    let negA := isSignedNegative ca sz\n"
+            "    let negB := isSignedNegative cb sz\n"
+            "    let magA := match negA with | false => ca | true => Nat.sub modulus ca\n"
+            "    let magB := match negB with | false => cb | true => Nat.sub modulus cb\n"
+            "    let magR := Nat.mod magA magB"
+        ),
+        sanity_theorem_name="sanity_signed_rem_overflow",
+        sanity_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem sanity_signed_rem_overflow :\n"
+            "    evalScalarBinOp .rem ⟨246, 1⟩ ⟨3, 1⟩ .nil emptyMemory true =\n"
+            "      .ok (.scalar ⟨255, 1⟩) .nil emptyMemory :=\n"
+            "  rfl\n"
+            "\n"
+            "end GuardMutation\n"
+        ),
+        theorem_name="refute_signed_rem_overflow",
+        refute_source=(
+            "import Trusted.Rustc.V2026_06_01.MirSemantics.Scalars\n"
+            "\n"
+            "namespace GuardMutation\n"
+            "open Trusted.Rustc.V2026_06_01.MirAst\n"
+            "open Trusted.Rustc.V2026_06_01.MirSemantics\n"
+            "\n"
+            "theorem refute_signed_rem_overflow :\n"
+            "    evalScalarBinOp .rem ⟨128, 1⟩ ⟨255, 1⟩ .nil emptyMemory true = .ub :=\n"
             "  rfl\n"
             "\n"
             "end GuardMutation\n"
@@ -1179,26 +1284,51 @@ def find_theorem_line_span(
     Used to confirm that a Lean proof failure on a mutated semantics actually
     originated inside the guard's dedicated refutation theorem rather than in
     an unrelated declaration, helper definition, or file header.
+
+    The span starts at the column-0 `theorem <name>` header and covers only the
+    indented continuation lines that follow it. ANY later text at column 0
+    (`example`, `instance`, `#eval`, a comment, `end`, ...) ends the span, and
+    trailing blank lines are excluded, so a failure in whatever follows the
+    theorem can never be attributed to it.
     """
     lines = fixture_text.splitlines()
-    decl_re = re.compile(
-        r"^(?:(?:private|protected)\s+)?(?:theorem|lemma|def|noncomputable\s+def|end)\b"
-    )
     target_re = re.compile(
-        rf"^(?:(?:private|protected)\s+)?theorem\s+{re.escape(theorem_name)}\b"
+        rf"^(?:(?:private|protected)\s+)?theorem\s+{re.escape(theorem_name)}"
+        r"(?![\w'.!?])"
     )
-    start: int | None = None
-    for idx, line in enumerate(lines, start=1):
-        if start is None:
-            if target_re.match(line):
-                start = idx
-        elif decl_re.match(line):
-            return (start, idx - 1)
-    if start is None:
+    starts = [idx for idx, line in enumerate(lines, start=1) if target_re.match(line)]
+    if not starts:
         raise ValueError(
             f"theorem {theorem_name!r} not found in fixture source"
         )
-    return (start, len(lines))
+    if len(starts) > 1:
+        raise ValueError(
+            f"theorem {theorem_name!r} declared {len(starts)} times in fixture source"
+        )
+    start = starts[0]
+    end = start
+    for idx in range(start + 1, len(lines) + 1):
+        line = lines[idx - 1]
+        if not line.strip():
+            continue
+        if line[0] not in " \t":
+            break
+        end = idx
+    return (start, end)
+
+
+# `<path>:<line>:<col>[-<line>:<col>]: <severity>[(<name>)]:` diagnostic header,
+# as printed by `Lean.mkErrorStringWithPos`. Lean 4.34 prints named errors as
+# `error(lean.someName):`, which must count as errors too.
+_DIAG_HEADER_RE = re.compile(
+    r"^(?P<path>.+?):(?P<line>\d+):(?P<col>\d+)(?:-\d+:\d+)?:\s*"
+    r"(?P<sev>error|warning|info|information)(?:\([^)\n]*\))?:",
+    re.MULTILINE,
+)
+
+# Any line announcing an error, with or without a source position
+# (`error: toolchain ... is not installed`, `lean: error: ...`).
+_ERROR_TOKEN_RE = re.compile(r"(?:^|[\s:])error(?:\([^)\n]*\))?:")
 
 
 def classify_refutation_failure(
@@ -1212,12 +1342,15 @@ def classify_refutation_failure(
     Returns `(status, detail)` where `status` is:
     - `SURVIVED`: Lean accepted (`rc == 0`) the negative refutation even after
       the guard was disabled.
-    - `KILLED`: Lean rejected (`rc == 1`) with a genuine proof/type failure
-      localized strictly inside the target theorem's line span and with no
-      crash/parse/timeout markers.
-    - `ERROR`: Unexpected exit status, crash/parse/timeout marker, missing
-      proof-failure marker, or any error diagnostic outside the target theorem
-      span (never counted as a kill).
+    - `KILLED`: Lean rejected (`rc == 1`), every error diagnostic is located in
+      `fixture_filename` inside the target theorem's line span, at least one of
+      those diagnostics carries a proof/type-mismatch marker, and the output
+      has no crash/parse/timeout marker.
+    - `ERROR`: anything else (never counted as a kill): unexpected exit status
+      (signals, OOM, timeout), crash/parse/timeout marker, an error diagnostic
+      in another file or without a source position, an error outside the
+      target theorem span, or no proof-failure marker inside the target
+      theorem's own diagnostics.
     """
     if returncode == 0:
         return ("SURVIVED", "refutation theorem still compiled on mutant")
@@ -1232,20 +1365,43 @@ def classify_refutation_failure(
                 "ERROR",
                 f"non-proof failure marker {marker!r} in Lean output",
             )
-    if not any(m in combined_output for m in EXPECTED_PROOF_FAILURE_MARKERS):
-        return (
-            "ERROR",
-            "Lean failed without a recognized proof/type mismatch diagnostic",
+
+    # Split the output into diagnostics: each header owns the text up to the
+    # next header.
+    headers = list(_DIAG_HEADER_RE.finditer(combined_output))
+    header_by_start = {m.start(): m for m in headers}
+
+    def _is_fixture(match: re.Match[str]) -> bool:
+        return re.split(r"[/\\]", match.group("path"))[-1] == fixture_filename
+
+    # Every line that announces an error must be an error header located in the
+    # fixture itself. Errors in other files and errors without a position
+    # (toolchain, wrapper, import resolution) are never a kill.
+    pos = 0
+    for raw_line in combined_output.splitlines(keepends=True):
+        if _ERROR_TOKEN_RE.search(raw_line):
+            match = header_by_start.get(pos)
+            if match is None or match.group("sev") != "error" or not _is_fixture(match):
+                return (
+                    "ERROR",
+                    "error diagnostic not located in "
+                    f"{fixture_filename}: {raw_line.strip()[:200]!r}",
+                )
+        pos += len(raw_line)
+
+    error_diags: list[tuple[int, str]] = []
+    for idx, match in enumerate(headers):
+        if match.group("sev") != "error":
+            continue
+        body_end = (
+            headers[idx + 1].start() if idx + 1 < len(headers) else len(combined_output)
+        )
+        error_diags.append(
+            (int(match.group("line")), combined_output[match.end() : body_end])
         )
 
-    # Extract `<path>/<fixture_filename>:<line>:<col>: error:` diagnostics and
-    # require at least one error inside `theorem_span` and zero outside it.
-    diag_re = re.compile(
-        rf"(?:^|[/\\]){re.escape(fixture_filename)}:(\d+):\d+:\s*error:",
-        re.MULTILINE,
-    )
-    error_lines = [int(m.group(1)) for m in diag_re.finditer(combined_output)]
     start, end = theorem_span
+    error_lines = [ln for ln, _ in error_diags]
     outside = [ln for ln in error_lines if not (start <= ln <= end)]
     if outside:
         return (
@@ -1253,16 +1409,25 @@ def classify_refutation_failure(
             f"error diagnostic outside target theorem lines {start}-{end} "
             f"(outside lines: {outside}, all error lines: {error_lines})",
         )
-    matching = [ln for ln in error_lines if start <= ln <= end]
-    if not matching:
+    if not error_diags:
         return (
             "ERROR",
             f"no error diagnostic in target theorem lines {start}-{end} "
             f"(saw error lines: {error_lines})",
         )
+    if not any(
+        marker in body
+        for _, body in error_diags
+        for marker in EXPECTED_PROOF_FAILURE_MARKERS
+    ):
+        return (
+            "ERROR",
+            "Lean failed without a recognized proof/type mismatch diagnostic "
+            f"inside target theorem lines {start}-{end}",
+        )
     return (
         "KILLED",
-        f"proof failed inside target theorem at line(s) {matching}",
+        f"proof failed inside target theorem at line(s) {error_lines}",
     )
 
 
@@ -1279,7 +1444,44 @@ def _extract_trusted_imports(lean_source: str) -> list[str]:
 
 
 def _has_sorry_warning(combined_output: str) -> bool:
-    return any(marker in combined_output for marker in SORRY_OUTPUT_MARKERS)
+    """Return True if Lean output mentions `sorry` in any quoting style."""
+    return bool(SORRY_OUTPUT_RE.search(combined_output))
+
+
+def _fixture_shape_errors(
+    kind: str,
+    src_text: str,
+    theorem_name: str,
+) -> list[str]:
+    """Return static shape errors for one generated fixture source.
+
+    A fixture is one `theorem` (plus helper `def`s). Anything that could make
+    the proof vacuous, add a second proof obligation, or alter elaboration is
+    rejected before Lean ever runs.
+    """
+    errors: list[str] = []
+    forbidden = FORBIDDEN_FIXTURE_TOKEN_RE.search(src_text)
+    if forbidden:
+        errors.append(
+            f"forbidden token {forbidden.group(0)!r} in {kind}_source"
+        )
+    theorem_count = len(re.findall(r"\btheorem\b", src_text))
+    if theorem_count != 1:
+        errors.append(
+            f"{kind}_source must declare exactly one theorem, found {theorem_count}"
+        )
+    try:
+        start, end = find_theorem_line_span(src_text, theorem_name)
+    except ValueError as exc:
+        errors.append(f"({kind}): {exc}")
+        return errors
+    span_text = "\n".join(src_text.splitlines()[start - 1 : end])
+    if ":=" not in span_text:
+        errors.append(
+            f"({kind}): theorem {theorem_name!r} line span {start}-{end} "
+            "does not contain its proof (`:=`)"
+        )
+    return errors
 
 
 def validate_catalog_invariants(anneal_root: Path) -> list[str]:
@@ -1307,11 +1509,21 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
         if not mod_path.is_file():
             errors.append(f"missing trusted Lean module: {mod_path}")
             continue
-        for imp in _extract_trusted_imports(mod_path.read_text(encoding="utf-8")):
+        mod_imports = _extract_trusted_imports(mod_path.read_text(encoding="utf-8"))
+        for imp in mod_imports:
             if imp not in seen_mods:
                 errors.append(
                     f"topological/missing import in {mod}: {imp!r} not compiled before {mod!r}"
                 )
+        # `SEMANTICS_UPSTREAM` decides which `.olean`s are stale for a mutant,
+        # so it must cover every semantics module the live source imports.
+        if mod in SEMANTICS_UPSTREAM:
+            declared_upstream = set(SEMANTICS_UPSTREAM[mod])
+            for imp in mod_imports:
+                if imp in SEMANTICS_MODULES and imp not in declared_upstream:
+                    errors.append(
+                        f"SEMANTICS_UPSTREAM[{mod!r}] is missing live import {imp!r}"
+                    )
         seen_mods.add(mod)
 
     for guard in MIR_SEMANTICS_GUARDS:
@@ -1330,8 +1542,8 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             errors.append(
                 f"{guard.guard_id}: unknown target_module {guard.target_module!r}"
             )
-        else:
-            covered_modules.add(guard.target_module)
+            continue
+        covered_modules.add(guard.target_module)
 
         expected_rel_file = f"trusted/lean/{guard.target_module}.lean"
         if guard.target_file != expected_rel_file:
@@ -1350,6 +1562,31 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
                 errors.append(
                     f"{guard.guard_id}: unknown rebuild module {mod!r}"
                 )
+        known_rebuild = [m for m in rebuild_mods if m in SEMANTICS_MODULES]
+        if len(set(known_rebuild)) != len(known_rebuild) or known_rebuild != [
+            m for m in SEMANTICS_MODULES if m in known_rebuild
+        ]:
+            errors.append(
+                f"{guard.guard_id}: rebuild modules must be unique and in "
+                "topological order"
+            )
+        # A rebuilt module must never import a module that depends on the
+        # mutated target but is not itself rebuilt (its `.olean` is stale).
+        for mod in known_rebuild:
+            for dep in SEMANTICS_UPSTREAM.get(mod, ()):
+                if (
+                    guard.target_module in SEMANTICS_UPSTREAM.get(dep, ())
+                    and dep not in known_rebuild
+                ):
+                    errors.append(
+                        f"{guard.guard_id}: rebuild module {mod!r} depends on "
+                        f"stale un-rebuilt module {dep!r}"
+                    )
+
+        if FORBIDDEN_FIXTURE_TOKEN_RE.search(guard.replacement):
+            errors.append(
+                f"{guard.guard_id}: forbidden token in replacement"
+            )
 
         target_path = anneal_root / guard.target_file
         if not target_path.is_file():
@@ -1366,18 +1603,22 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
             except ValueError as exc:
                 errors.append(str(exc))
 
+        if guard.sanity_theorem_name == guard.theorem_name:
+            errors.append(
+                f"{guard.guard_id}: sanity and refutation theorems must have "
+                "distinct names"
+            )
+        if guard.sanity_source == guard.refute_source:
+            errors.append(
+                f"{guard.guard_id}: sanity and refutation fixtures are identical"
+            )
+
         for kind, src_text, thm_name in (
             ("sanity", guard.sanity_source, guard.sanity_theorem_name),
             ("refute", guard.refute_source, guard.theorem_name),
         ):
-            if FORBIDDEN_FIXTURE_TOKEN_RE.search(src_text):
-                errors.append(
-                    f"{guard.guard_id}: forbidden sorry/admit/axiom token in {kind}_source"
-                )
-            try:
-                find_theorem_line_span(src_text, thm_name)
-            except ValueError as exc:
-                errors.append(f"{guard.guard_id} ({kind}): {exc}")
+            for shape_error in _fixture_shape_errors(kind, src_text, thm_name):
+                errors.append(f"{guard.guard_id}: {shape_error}")
 
             imports = _extract_trusted_imports(src_text)
             if not imports:
@@ -1388,6 +1629,14 @@ def validate_catalog_invariants(anneal_root: Path) -> list[str]:
                 if imp not in all_known_modules:
                     errors.append(
                         f"{guard.guard_id} ({kind}): fixture imports unknown module {imp!r}"
+                    )
+                elif (
+                    imp not in rebuild_mods
+                    and guard.target_module in SEMANTICS_UPSTREAM.get(imp, ())
+                ):
+                    errors.append(
+                        f"{guard.guard_id} ({kind}): fixture imports {imp!r}, which "
+                        "depends on the mutated module but is not rebuilt (stale)"
                     )
             if not any(imp in rebuild_mods for imp in imports):
                 errors.append(
@@ -1451,6 +1700,23 @@ def _baseline_modules_for_guards(
     return (*BASE_TRUSTED_MODULES, *ordered_sem)
 
 
+def _stale_modules_for_guard(guard: MirSemanticsGuard) -> set[str]:
+    """Semantics modules whose baseline `.olean` is stale for `guard`'s mutant.
+
+    These depend on the mutated target but are not rebuilt, so they were
+    compiled against the UNMUTATED target. They are never seeded into the
+    mutant overlay: an accidental import then fails loudly instead of silently
+    mixing mutated and unmutated semantics.
+    """
+    rebuilt = set(guard.effective_rebuild_modules)
+    return {
+        mod
+        for mod in SEMANTICS_MODULES
+        if guard.target_module in SEMANTICS_UPSTREAM.get(mod, ())
+        and mod not in rebuilt
+    }
+
+
 def _resolve_lean_run_wrapper(anneal_root: Path) -> Path | None:
     """Locate `anneal-lean-run` on PATH, `~/.local/bin`, or `<repo>/scripts`."""
     candidates: list[Path] = []
@@ -1461,7 +1727,7 @@ def _resolve_lean_run_wrapper(anneal_root: Path) -> Path | None:
     candidates.append(anneal_root / "scripts/anneal-lean-run")
     for cand in candidates:
         if cand.is_file() and os.access(cand, os.X_OK):
-            return cand
+            return Path(os.path.abspath(cand))
     return None
 
 
@@ -1477,28 +1743,236 @@ def _build_lean_command(
     return [str(lean_bin), *args]
 
 
-def _can_reuse_lake_oleans(
+# ----------------------------------------------------------------------
+# `.lake/build/lib/lean` reuse: content validation against Lake's traces
+# ----------------------------------------------------------------------
+
+_MASK64 = (1 << 64) - 1
+_MURMUR_M = 0xC6A4A7935BD1E995
+_LAKE_HASH_NIL = 1723  # `Lake.Hash.nil`
+_LAKE_HASH_NIL_HEX = f"{_LAKE_HASH_NIL:016x}"
+_LAKE_OLEAN_OUTPUT_RE = re.compile(r"([0-9a-f]{16})\.olean")
+_LAKE_IMPORT_ARTS_SUFFIX = ":importAllArts"
+
+
+def _lean_murmur_hash64a(data: bytes, seed: int = 11) -> int:
+    """Lean runtime `hash_str` (MurmurHash64A), i.e. `String.hash`/`ByteArray.hash`."""
+    m = _MURMUR_M
+    mask = _MASK64
+    n = len(data)
+    h = (seed ^ (n * m)) & mask
+    n_block_bytes = (n // 8) * 8
+    if n_block_bytes:
+        words = array.array("Q")
+        if words.itemsize != 8:
+            raise RuntimeError("platform lacks an 8-byte unsigned array type")
+        words.frombytes(memoryview(data)[:n_block_bytes])
+        if sys.byteorder != "little":
+            words.byteswap()
+        for k in words:
+            k = (k * m) & mask
+            k ^= k >> 47
+            k = (k * m) & mask
+            h = ((h ^ k) * m) & mask
+    tail = data[n_block_bytes:]
+    if tail:
+        h ^= int.from_bytes(tail, "little")
+        h = (h * m) & mask
+    h ^= h >> 47
+    h = (h * m) & mask
+    h ^= h >> 47
+    return h
+
+
+def _lean_mix_hash(h: int, k: int) -> int:
+    """Lean runtime `lean_uint64_mix_hash` (`mixHash`)."""
+    m = _MURMUR_M
+    k = (k * m) & _MASK64
+    k ^= k >> 47
+    k ^= m
+    h ^= k
+    return (h * m) & _MASK64
+
+
+def lake_hash_of_bytes(data: bytes) -> str:
+    """`Lake.Hash.ofByteArray` as 16 lowercase hex digits (`.olean.hash` format)."""
+    return f"{_lean_mix_hash(_LAKE_HASH_NIL, _lean_murmur_hash64a(data)):016x}"
+
+
+def lake_hash_of_text(data: bytes) -> str:
+    """`Lake.Hash.ofText` (CRLF-normalized source text hash) as 16 hex digits."""
+    return lake_hash_of_bytes(data.replace(b"\r\n", b"\n"))
+
+
+def lake_import_arts_hash(olean_hash_hex: str) -> str:
+    """Hash Lake records for importing a non-`module` file with this `.olean`."""
+    return f"{_lean_mix_hash(_LAKE_HASH_NIL, int(olean_hash_hex, 16)):016x}"
+
+
+def _read_lean_toolchain_version(anneal_root: Path) -> str | None:
+    """Return `X.Y.Z[-suffix]` from `<anneal_root>/lean-toolchain`, if parseable."""
+    try:
+        text = (anneal_root / "lean-toolchain").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    match = re.search(r"v?(\d+\.\d+\.\d+(?:-[\w.]+)?)$", text)
+    return match.group(1) if match else None
+
+
+def _trace_pairs(node: object) -> list[tuple[str, object]]:
+    """Return the `[caption, value]` pairs of a Lake trace `inputs` list."""
+    if not isinstance(node, list):
+        return []
+    return [
+        (entry[0], entry[1])
+        for entry in node
+        if isinstance(entry, list) and len(entry) == 2 and isinstance(entry[0], str)
+    ]
+
+
+def _verify_lake_traces(
     anneal_root: Path,
     modules: Sequence[str],
-) -> bool:
-    """Return True if `.lake/build/lib/lean` has up-to-date `.olean`s for `modules`.
+    *,
+    verify_olean_bytes: bool = False,
+) -> tuple[bool, str]:
+    """Prove by content that Lake's `.olean`s for `modules` match the sources.
 
-    Verifies both direct freshness (`olean.mtime >= src.mtime`) and transitive
-    upstream freshness (every earlier module in `BASE_TRUSTED_MODULES` and
-    `SEMANTICS_UPSTREAM` has `src.mtime <= olean.mtime`).
+    For every module, Lake's `<Mod>.trace` must record (a) the hash of the
+    CURRENT source text, (b) the hash stored in `<Mod>.olean.hash`, (c) the
+    pinned toolchain version, and (d) for every `Trusted.*` import, the hash of
+    that import's CURRENT `.olean`; and (e) the module's trace must not be
+    older than the trace of any module it imports. Together these chain every
+    `.olean` back to the current sources, independent of source mtimes.
+
+    The `.olean` bytes are re-hashed when `verify_olean_bytes` is set, or when
+    the `.olean` is newer than its `.olean.hash` file (the same rule Lake uses
+    to decide whether a `.hash` file can be trusted). Any unreadable, missing,
+    or unrecognized record fails closed.
     """
     lake_lib_dir = anneal_root / ".lake/build/lib/lean"
     trusted_lean_dir = anneal_root / "trusted/lean"
-    if not lake_lib_dir.is_dir():
-        return False
+    toolchain_version = _read_lean_toolchain_version(anneal_root)
+    if toolchain_version is None:
+        return (False, "cannot determine pinned Lean version from lean-toolchain")
+
+    olean_hashes: dict[str, str] = {}
+    recorded_imports: dict[str, dict[str, str]] = {}
+    trace_mtimes: dict[str, int] = {}
+    for mod in modules:
+        olean = lake_lib_dir / f"{mod}.olean"
+        hash_path = lake_lib_dir / f"{mod}.olean.hash"
+        trace_path = lake_lib_dir / f"{mod}.trace"
+        try:
+            trace = json.loads(trace_path.read_text(encoding="utf-8"))
+            trace_mtimes[mod] = trace_path.stat().st_mtime_ns
+            hash_file_text = hash_path.read_text(encoding="utf-8").strip()
+            src_bytes = (trusted_lean_dir / f"{mod}.lean").read_bytes()
+            olean_stat = olean.stat()
+            hash_stat = hash_path.stat()
+        except (OSError, ValueError) as exc:
+            return (False, f"{mod}: unreadable Lake build record ({exc})")
+        if (
+            not isinstance(trace, dict)
+            or trace.get("schemaVersion") not in LAKE_TRACE_SCHEMA_VERSIONS
+        ):
+            return (False, f"{mod}: unsupported Lake trace schema")
+
+        outputs = trace.get("outputs")
+        olean_outputs = outputs.get("o") if isinstance(outputs, dict) else None
+        if isinstance(olean_outputs, str):
+            olean_outputs = [olean_outputs]
+        if not (
+            isinstance(olean_outputs, list)
+            and len(olean_outputs) == 1
+            and isinstance(olean_outputs[0], str)
+        ):
+            return (False, f"{mod}: unrecognized `.olean` outputs in Lake trace")
+        output_match = _LAKE_OLEAN_OUTPUT_RE.fullmatch(olean_outputs[0])
+        if output_match is None:
+            return (False, f"{mod}: unrecognized `.olean` outputs in Lake trace")
+        olean_hash = output_match.group(1)
+        if hash_file_text != olean_hash:
+            return (False, f"{mod}: `.olean.hash` disagrees with Lake trace")
+        if verify_olean_bytes or hash_stat.st_mtime_ns < olean_stat.st_mtime_ns:
+            try:
+                actual_olean_hash = lake_hash_of_bytes(olean.read_bytes())
+            except OSError as exc:
+                return (False, f"{mod}: unreadable `.olean` ({exc})")
+            if actual_olean_hash != olean_hash:
+                return (False, f"{mod}: `.olean` bytes do not match Lake trace")
+
+        inputs = _trace_pairs(trace.get("inputs"))
+        src_suffix = f"/trusted/lean/{mod}.lean"
+        src_hashes = [
+            value
+            for caption, value in inputs
+            if caption.replace("\\", "/").endswith(src_suffix)
+        ]
+        if len(src_hashes) != 1 or src_hashes[0] != lake_hash_of_text(src_bytes):
+            return (False, f"{mod}: source text differs from the Lake-built source")
+        toolchains = [caption for caption, _ in inputs if caption.startswith("Lean ")]
+        if len(toolchains) != 1 or not toolchains[0].startswith(
+            f"Lean {toolchain_version},"
+        ):
+            return (False, f"{mod}: built by a different Lean toolchain")
+
+        imports_node = dict(_trace_pairs(dict(inputs).get("deps"))).get("imports")
+        import_arts: dict[str, str] = {}
+        if isinstance(imports_node, list):
+            for caption, value in _trace_pairs(imports_node):
+                if caption.endswith(_LAKE_IMPORT_ARTS_SUFFIX) and isinstance(value, str):
+                    dep = caption[: -len(_LAKE_IMPORT_ARTS_SUFFIX)].replace(".", "/")
+                    if dep.startswith("Trusted/"):
+                        import_arts[dep] = value
+        elif imports_node != _LAKE_HASH_NIL_HEX:
+            return (False, f"{mod}: unrecognized imports record in Lake trace")
+        source_imports = set(
+            _extract_trusted_imports(src_bytes.decode("utf-8", errors="replace"))
+        )
+        if set(import_arts) != source_imports:
+            return (False, f"{mod}: Lake trace imports differ from source imports")
+
+        olean_hashes[mod] = olean_hash
+        recorded_imports[mod] = import_arts
+
+    for mod, import_arts in recorded_imports.items():
+        for dep, recorded in import_arts.items():
+            if dep not in olean_hashes:
+                return (False, f"{mod}: imports {dep}, which was not verified")
+            if recorded != lake_import_arts_hash(olean_hashes[dep]):
+                return (False, f"{mod}: built against a different {dep}.olean")
+            # A direct import's `.olean` hash does not pin that import's own
+            # imports. Lake always finishes (and records) an import before its
+            # importer, so an importer recorded BEFORE its import was last
+            # rebuilt may predate a change deeper in the import chain.
+            if trace_mtimes[mod] < trace_mtimes[dep]:
+                return (
+                    False,
+                    f"{mod}: Lake build record predates the rebuild of its "
+                    f"import {dep}",
+                )
+    return (True, "lake-trace-verified")
+
+
+def _legacy_mtime_fresh(
+    anneal_root: Path,
+    modules: Sequence[str],
+) -> bool:
+    """mtime freshness for build trees WITHOUT Lake traces.
+
+    Requires `olean.mtime >= src.mtime` for the module and for every upstream
+    module. This is conservative in one direction only (a touched source forces
+    a cold build); it cannot notice an `.olean` built from different content
+    with a newer mtime, which is why Lake-traced trees never use it.
+    """
+    lake_lib_dir = anneal_root / ".lake/build/lib/lean"
+    trusted_lean_dir = anneal_root / "trusted/lean"
 
     src_mtimes: dict[str, float] = {}
     for mod in modules:
-        src = trusted_lean_dir / f"{mod}.lean"
-        if not src.is_file():
-            return False
         try:
-            src_mtimes[mod] = src.stat().st_mtime
+            src_mtimes[mod] = (trusted_lean_dir / f"{mod}.lean").stat().st_mtime
         except OSError:
             return False
 
@@ -1508,11 +1982,8 @@ def _can_reuse_lake_oleans(
     )
 
     for idx, mod in enumerate(modules):
-        olean = lake_lib_dir / f"{mod}.olean"
-        if not olean.is_file():
-            return False
         try:
-            olean_mtime = olean.stat().st_mtime
+            olean_mtime = (lake_lib_dir / f"{mod}.olean").stat().st_mtime
         except OSError:
             return False
         if mod in SEMANTICS_UPSTREAM:
@@ -1525,16 +1996,89 @@ def _can_reuse_lake_oleans(
             req_mtime = max(src_mtimes[m] for m in modules[: idx + 1])
         if olean_mtime < req_mtime:
             return False
-
     return True
 
 
+def _lake_olean_reuse_decision(
+    anneal_root: Path,
+    modules: Sequence[str],
+    *,
+    verify_olean_bytes: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether `.lake/build/lib/lean` `.olean`s may seed the baseline.
+
+    Returns `(reusable, reason)`. Lake-traced trees are validated by content
+    (`_verify_lake_traces`) and mtimes play no part, so a fresh `git worktree`
+    with new source mtimes still reuses a matching build, and a build of
+    different sources is rejected even when its `.olean`s are newer. Trees with
+    no Lake traces at all fall back to `_legacy_mtime_fresh`. A tree with
+    traces for only some modules is rejected.
+    """
+    lake_lib_dir = anneal_root / ".lake/build/lib/lean"
+    trusted_lean_dir = anneal_root / "trusted/lean"
+    if not lake_lib_dir.is_dir():
+        return (False, "no .lake/build/lib/lean")
+    for mod in modules:
+        if not (trusted_lean_dir / f"{mod}.lean").is_file():
+            return (False, f"{mod}: missing source")
+        if not (lake_lib_dir / f"{mod}.olean").is_file():
+            return (False, f"{mod}: missing .olean")
+
+    traced = [(lake_lib_dir / f"{mod}.trace").is_file() for mod in modules]
+    if not any(traced):
+        if _legacy_mtime_fresh(anneal_root, modules):
+            return (True, "legacy-mtime")
+        return (False, "no Lake traces and a source is newer than its .olean")
+    if not all(traced):
+        return (False, "Lake traces present for only some modules")
+    return _verify_lake_traces(
+        anneal_root, modules, verify_olean_bytes=verify_olean_bytes
+    )
+
+
+def _can_reuse_lake_oleans(
+    anneal_root: Path,
+    modules: Sequence[str],
+) -> bool:
+    """Return True if `.lake/build/lib/lean` `.olean`s for `modules` are reusable."""
+    return _lake_olean_reuse_decision(anneal_root, modules)[0]
+
+
+def _olean_fingerprints(
+    olean_dir: Path,
+    modules: Sequence[str],
+) -> dict[str, tuple[int, int, int]]:
+    """Return `(inode, size, mtime_ns)` for every compiled artifact of `modules`."""
+    prints: dict[str, tuple[int, int, int]] = {}
+    for mod in modules:
+        for suffix in OLEAN_SUFFIXES:
+            art = olean_dir / f"{mod}{suffix}"
+            try:
+                st = art.stat()
+            except OSError:
+                continue
+            prints[f"{mod}{suffix}"] = (st.st_ino, st.st_size, st.st_mtime_ns)
+    return prints
+
+
 def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hardlink (or copy) `src` to `dst` without ever writing through `dst`.
+
+    An existing `dst` may itself be a hardlink into `.lake/build` or the
+    baseline tree, so it is unlinked first: both `os.link` and the copy
+    fallback then create a new directory entry instead of truncating a shared
+    inode in place.
+    """
     dst.parent.mkdir(parents=True, exist_ok=True)
+    real_src = os.path.realpath(src)
     try:
-        os.link(src, dst)
+        dst.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        os.link(real_src, dst)
     except OSError:
-        shutil.copy2(src, dst)
+        shutil.copy2(real_src, dst)
 
 
 def _seed_olean_tree(
@@ -1556,6 +2100,50 @@ def _seed_olean_tree(
                 _link_or_copy(src_art, dst_art)
 
 
+# Live Lean process groups, so an interrupt can stop them. Lean runs in its
+# own session (see `_run_lean`) and therefore does not receive the terminal's
+# Ctrl-C by itself.
+_LIVE_PROCS: set[subprocess.Popen[str]] = set()
+_LIVE_PROCS_LOCK = threading.Lock()
+
+# Set while a run is being torn down, so workers that are between two Lean
+# invocations do not start another one.
+_ABORT = threading.Event()
+
+
+def _kill_process_group(proc: subprocess.Popen[str]) -> None:
+    """SIGKILL `proc`'s whole process group (wrapper AND the Lean it spawned)."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _kill_live_lean_processes() -> None:
+    with _LIVE_PROCS_LOCK:
+        procs = list(_LIVE_PROCS)
+    for proc in procs:
+        _kill_process_group(proc)
+
+
+def _abort_pending(futures: Sequence[Future[object]]) -> None:
+    """Stop a failing or interrupted run promptly.
+
+    Called BEFORE the worker pool is joined: unstarted work is cancelled and
+    running Lean processes are killed, so the pool drains in milliseconds
+    instead of waiting out every in-flight compile (up to `--timeout-sec`
+    each) while holding the temporary directories open.
+    """
+    _ABORT.set()
+    for fut in futures:
+        fut.cancel()
+    _kill_live_lean_processes()
+
+
 def _run_lean(
     lean_bin: Path,
     args: Sequence[str],
@@ -1565,32 +2153,75 @@ def _run_lean(
     timeout_sec: int,
     lean_run_wrapper: Path | None,
 ) -> subprocess.CompletedProcess[str]:
-    """Execute Lean in `cwd=anneal_root` with explicit `LEAN_PATH`."""
+    """Execute Lean in `cwd=anneal_root` with explicit `LEAN_PATH`.
+
+    Never raises for a failed, missing, or hung Lean: a spawn failure returns
+    `rc=127` and a timeout returns `rc=124`, so callers classify them as
+    errors. Lean runs in its own process group; on timeout the WHOLE group is
+    killed, because killing only an `anneal-lean-run` wrapper would leave the
+    real `lean` running and still writing into a temporary directory that is
+    about to be deleted.
+    """
     cmd = _build_lean_command(lean_bin, args, lean_run_wrapper=lean_run_wrapper)
+    if _ABORT.is_set():
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=130, stdout="", stderr="run aborted before Lean started"
+        )
     env = os.environ.copy()
     env["LEAN_PATH"] = os.pathsep.join(str(p) for p in lean_path)
     try:
-        return subprocess.run(
+        proc = subprocess.Popen(
             cmd,
             cwd=str(anneal_root),
             env=env,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout_sec,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
         )
-    except subprocess.TimeoutExpired as exc:
-        out = exc.stdout if isinstance(exc.stdout, str) else (
-            exc.stdout.decode("utf-8", errors="replace") if exc.stdout else ""
-        )
-        err = exc.stderr if isinstance(exc.stderr, str) else (
-            exc.stderr.decode("utf-8", errors="replace") if exc.stderr else ""
-        )
+    except OSError as exc:
         return subprocess.CompletedProcess(
             args=cmd,
-            returncode=124,
-            stdout=out,
-            stderr=f"{err}\nLean invocation timed out after {timeout_sec}s".strip(),
+            returncode=127,
+            stdout="",
+            stderr=f"failed to execute Lean command {cmd[0]!r}: {exc}",
         )
+    with _LIVE_PROCS_LOCK:
+        _LIVE_PROCS.add(proc)
+    try:
+        with proc:
+            try:
+                out, err = proc.communicate(timeout=timeout_sec)
+            except subprocess.TimeoutExpired:
+                _kill_process_group(proc)
+                try:
+                    out, err = proc.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    out, err = "", ""
+                return subprocess.CompletedProcess(
+                    args=cmd,
+                    returncode=124,
+                    stdout=out or "",
+                    stderr=(
+                        f"{err or ''}\nLean invocation timed out after "
+                        f"{timeout_sec}s"
+                    ).strip(),
+                )
+            except BaseException:
+                _kill_process_group(proc)
+                raise
+            return subprocess.CompletedProcess(
+                args=cmd,
+                returncode=proc.returncode,
+                stdout=out or "",
+                stderr=err or "",
+            )
+    finally:
+        with _LIVE_PROCS_LOCK:
+            _LIVE_PROCS.discard(proc)
 
 
 def _compile_module(
@@ -1604,9 +2235,20 @@ def _compile_module(
     timeout_sec: int,
     lean_run_wrapper: Path | None,
 ) -> subprocess.CompletedProcess[str]:
+    """Compile `<root_dir>/<module>.lean` to `<out_dir>/<module>.olean`.
+
+    Any existing output artifact is unlinked first. `.olean`s in `out_dir` may
+    be hardlinks into the baseline tree or `.lake/build`, and Lean writes its
+    output in place, so compiling over one would rewrite the shared inode.
+    """
     src = root_dir / f"{module}.lean"
     olean = out_dir / f"{module}.olean"
     olean.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in OLEAN_SUFFIXES:
+        try:
+            (out_dir / f"{module}{suffix}").unlink()
+        except FileNotFoundError:
+            pass
     return _run_lean(
         lean_bin,
         ["-R", str(root_dir), "-o", str(olean), str(src)],
@@ -1665,6 +2307,18 @@ def _check_one_mir_guard(
 ) -> GuardResult:
     """Mutate a single guard in an isolated TemporaryDirectory and classify kill."""
     t0 = time.monotonic()
+
+    def _result(status: str, detail: str) -> GuardResult:
+        return GuardResult(
+            guard_id=guard.guard_id,
+            target_file=guard.target_file,
+            target_module=guard.target_module,
+            quick=guard.quick,
+            status=status,
+            duration_sec=round(time.monotonic() - t0, 3),
+            detail=detail,
+        )
+
     trusted_lean_dir = anneal_root / "trusted/lean"
     src_path = anneal_root / guard.target_file
     original_text = src_path.read_text(encoding="utf-8")
@@ -1676,15 +2330,7 @@ def _check_one_mir_guard(
             guard_id=guard.guard_id,
         )
     except ValueError as exc:
-        return GuardResult(
-            guard_id=guard.guard_id,
-            target_file=guard.target_file,
-            target_module=guard.target_module,
-            quick=guard.quick,
-            status="ERROR",
-            duration_sec=round(time.monotonic() - t0, 3),
-            detail=str(exc),
-        )
+        return _result("ERROR", str(exc))
 
     theorem_span = find_theorem_line_span(guard.refute_source, guard.theorem_name)
     rebuild_mods = guard.effective_rebuild_modules
@@ -1706,14 +2352,15 @@ def _check_one_mir_guard(
         mut_target_path.parent.mkdir(parents=True, exist_ok=True)
         mut_target_path.write_text(mutated_text, encoding="utf-8")
 
-        # Hardlink every unmodified TCB `.olean` from `base_olean_dir` into
+        # Hardlink every still-valid TCB `.olean` from `base_olean_dir` into
         # `mut_olean_dir` so Lean 4 sees a complete `Trusted.*` root namespace
-        # in a single `LEAN_PATH` directory.
+        # in a single `LEAN_PATH` directory. Modules that will be recompiled
+        # here, and modules left stale by the mutation, are NOT seeded.
         _seed_olean_tree(
             base_olean_dir,
             mut_olean_dir,
             baseline_modules,
-            skip_modules=set(rebuild_mods),
+            skip_modules=set(rebuild_mods) | _stale_modules_for_guard(guard),
         )
 
         lean_path = [mut_olean_dir]
@@ -1732,18 +2379,25 @@ def _check_one_mir_guard(
                 lean_run_wrapper=lean_run_wrapper,
             )
             if res.returncode != 0:
-                return GuardResult(
-                    guard_id=guard.guard_id,
-                    target_file=guard.target_file,
-                    target_module=guard.target_module,
-                    quick=guard.quick,
-                    status="ERROR",
-                    duration_sec=round(time.monotonic() - t0, 3),
-                    detail=(
-                        f"mutated semantics module {mod} failed to compile "
-                        f"(rc={res.returncode}): "
-                        f"{(res.stdout + res.stderr).strip()[:300]}"
-                    ),
+                return _result(
+                    "ERROR",
+                    f"mutated semantics module {mod} failed to compile "
+                    f"(rc={res.returncode}): "
+                    f"{(res.stdout + res.stderr).strip()[:300]}",
+                )
+            mut_olean = mut_olean_dir / f"{mod}.olean"
+            base_olean = base_olean_dir / f"{mod}.olean"
+            if not mut_olean.is_file():
+                return _result(
+                    "ERROR",
+                    f"mutated semantics module {mod} compiled (rc=0) but "
+                    "produced no .olean",
+                )
+            if base_olean.exists() and os.path.samefile(mut_olean, base_olean):
+                return _result(
+                    "ERROR",
+                    f"mutated {mod}.olean shares an inode with the baseline "
+                    ".olean (hardlink write-through)",
                 )
 
         # 2. Positive sanity theorem MUST still compile cleanly with 0 sorrys.
@@ -1761,17 +2415,10 @@ def _check_one_mir_guard(
         )
         sanity_combined = (sanity_res.stdout + "\n" + sanity_res.stderr).strip()
         if sanity_res.returncode != 0 or _has_sorry_warning(sanity_combined):
-            return GuardResult(
-                guard_id=guard.guard_id,
-                target_file=guard.target_file,
-                target_module=guard.target_module,
-                quick=guard.quick,
-                status="ERROR",
-                duration_sec=round(time.monotonic() - t0, 3),
-                detail=(
-                    f"positive sanity {guard.sanity_module} broke on mutant "
-                    f"(rc={sanity_res.returncode}): {sanity_combined[:300]}"
-                ),
+            return _result(
+                "ERROR",
+                f"positive sanity {guard.sanity_module} broke on mutant "
+                f"(rc={sanity_res.returncode}): {sanity_combined[:300]}",
             )
 
         # 3. Negative refutation theorem MUST fail with a localized proof error.
@@ -1794,14 +2441,30 @@ def _check_one_mir_guard(
             f"{guard.refute_module}.lean",
             theorem_span,
         )
+        return _result(status, detail)
+
+
+def _check_one_mir_guard_safe(
+    guard: MirSemanticsGuard,
+    **kwargs: object,
+) -> GuardResult:
+    """Run `_check_one_mir_guard`, turning an unexpected exception into `ERROR`.
+
+    One guard's I/O failure must not abort the worker pool and discard every
+    other guard's result.
+    """
+    t0 = time.monotonic()
+    try:
+        return _check_one_mir_guard(guard, **kwargs)  # type: ignore[arg-type]
+    except Exception as exc:  # noqa: BLE001 - reported as a per-guard ERROR
         return GuardResult(
             guard_id=guard.guard_id,
             target_file=guard.target_file,
             target_module=guard.target_module,
             quick=guard.quick,
-            status=status,
+            status="ERROR",
             duration_sec=round(time.monotonic() - t0, 3),
-            detail=detail,
+            detail=f"internal error: {type(exc).__name__}: {exc}",
         )
 
 
@@ -1815,8 +2478,38 @@ def run_guard_mutation_suite(
     timeout_sec: int = 120,
     lean_run_wrapper: Path | None = None,
     reuse_lake_cache: bool = True,
+    verify_lake_olean_bytes: bool = False,
 ) -> dict[str, object]:
     """Run baseline verification and all selected single-guard mutations."""
+    _ABORT.clear()
+    try:
+        return _run_guard_mutation_suite(
+            anneal_root=anneal_root,
+            lean_bin=lean_bin,
+            quick=quick,
+            guard_filters=guard_filters,
+            jobs=jobs,
+            timeout_sec=timeout_sec,
+            lean_run_wrapper=lean_run_wrapper,
+            reuse_lake_cache=reuse_lake_cache,
+            verify_lake_olean_bytes=verify_lake_olean_bytes,
+        )
+    finally:
+        _ABORT.clear()
+
+
+def _run_guard_mutation_suite(
+    *,
+    anneal_root: Path,
+    lean_bin: Path,
+    quick: bool,
+    guard_filters: Sequence[str] | None,
+    jobs: int,
+    timeout_sec: int,
+    lean_run_wrapper: Path | None,
+    reuse_lake_cache: bool,
+    verify_lake_olean_bytes: bool,
+) -> dict[str, object]:
     t_start = time.monotonic()
     catalog_errors = validate_catalog_invariants(anneal_root)
     if catalog_errors:
@@ -1832,8 +2525,11 @@ def run_guard_mutation_suite(
     mode_label = "quick" if quick else ("guard" if guard_filters else "all")
     baseline_modules = _baseline_modules_for_guards(selected_guards)
     trusted_lean_dir = anneal_root / "trusted/lean"
+    lake_lib_dir = anneal_root / ".lake/build/lib/lean"
     worker_count = max(1, min(jobs, len(selected_guards)))
     used_lake_cache = False
+    lake_cache_detail = "disabled by --no-lake-cache"
+    lake_prints: dict[str, tuple[int, int, int]] = {}
     baseline_sec = 0.0
     results: list[GuardResult] = []
 
@@ -1847,15 +2543,15 @@ def run_guard_mutation_suite(
         fixture_olean_dir.mkdir()
 
         t_base = time.monotonic()
-        if reuse_lake_cache and _can_reuse_lake_oleans(
-            anneal_root, baseline_modules
-        ):
-            _seed_olean_tree(
-                anneal_root / ".lake/build/lib/lean",
-                base_olean_dir,
+        if reuse_lake_cache:
+            used_lake_cache, lake_cache_detail = _lake_olean_reuse_decision(
+                anneal_root,
                 baseline_modules,
+                verify_olean_bytes=verify_lake_olean_bytes,
             )
-            used_lake_cache = True
+        if used_lake_cache:
+            lake_prints = _olean_fingerprints(lake_lib_dir, baseline_modules)
+            _seed_olean_tree(lake_lib_dir, base_olean_dir, baseline_modules)
         else:
             for mod in baseline_modules:
                 res = _compile_module(
@@ -1891,8 +2587,12 @@ def run_guard_mutation_suite(
                 )
                 for guard in selected_guards
             ]
-            for fut in as_completed(base_futs):
-                fut.result()
+            try:
+                for fut in as_completed(base_futs):
+                    fut.result()
+            except BaseException:
+                _abort_pending(base_futs)
+                raise
 
         baseline_sec = time.monotonic() - t_base
 
@@ -1900,7 +2600,7 @@ def run_guard_mutation_suite(
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             future_map = {
                 pool.submit(
-                    _check_one_mir_guard,
+                    _check_one_mir_guard_safe,
                     guard,
                     anneal_root=anneal_root,
                     lean_bin=lean_bin,
@@ -1912,10 +2612,24 @@ def run_guard_mutation_suite(
                 for guard in selected_guards
             }
             by_id: dict[str, GuardResult] = {}
-            for fut in as_completed(future_map):
-                res = fut.result()
-                by_id[res.guard_id] = res
+            try:
+                for fut in as_completed(future_map):
+                    res = fut.result()
+                    by_id[res.guard_id] = res
+            except BaseException:
+                _abort_pending(list(future_map))
+                raise
         results.extend(by_id[g.guard_id] for g in selected_guards)
+
+        # The reused Lake artifacts are shared by hardlink. Prove that nothing
+        # in this run wrote through one.
+        if used_lake_cache and _olean_fingerprints(
+            lake_lib_dir, baseline_modules
+        ) != lake_prints:
+            raise RuntimeError(
+                ".lake/build/lib/lean artifacts changed during the run "
+                "(hardlink write-through or concurrent build); results discarded"
+            )
 
     total = len(results)
     killed = sum(1 for r in results if r.status == "KILLED")
@@ -1924,6 +2638,7 @@ def run_guard_mutation_suite(
     return {
         "mode": mode_label,
         "used_lake_cache": used_lake_cache,
+        "lake_cache_detail": lake_cache_detail,
         "lean_bin": str(lean_bin),
         "lean_run_wrapper": str(lean_run_wrapper) if lean_run_wrapper else None,
         "total": total,
@@ -1942,18 +2657,25 @@ def _default_anneal_root() -> Path:
 
 
 def _resolve_lean_binary(explicit: Path | None) -> Path:
+    """Resolve the Lean executable to an ABSOLUTE path.
+
+    Lean always runs with `cwd=<anneal_root>`, so a relative path would stop
+    resolving. The path is made absolute without following symlinks:
+    `~/.elan/bin/lean` is a symlink to the `elan` proxy, which picks the tool
+    from the name it was invoked as.
+    """
     if explicit is not None:
         if not explicit.is_file():
             raise SystemExit(f"Lean binary not found: {explicit}")
-        return explicit
+        return Path(os.path.abspath(explicit))
     env_lean = os.environ.get("ANNEAL_LEAN")
     if env_lean:
         cand = Path(env_lean)
         if cand.is_file():
-            return cand
+            return Path(os.path.abspath(cand))
     found = shutil.which("lean")
     if found:
-        return Path(found)
+        return Path(os.path.abspath(found))
     elan_lean = Path.home() / ".elan/bin/lean"
     if elan_lean.is_file():
         return elan_lean
@@ -1972,6 +2694,7 @@ def _format_summary(report: dict[str, object]) -> str:
             f"{entry['detail']}"
         )
     cache_note = "lake-cache" if report["used_lake_cache"] else "cold-build"
+    lines.append(f"Baseline .olean source: {cache_note} ({report['lake_cache_detail']})")
     lines.append(
         f"MIR guard-mutation summary ({report['mode']}, {cache_note}): "
         f"{report['killed']}/{report['total']} killed "
@@ -1980,6 +2703,25 @@ def _format_summary(report: dict[str, object]) -> str:
         f"(baseline {report['baseline_sec']:.2f}s, total {report['total_sec']:.2f}s)"
     )
     return "\n".join(lines)
+
+
+def _fatal_report(mode_label: str, message: str) -> dict[str, object]:
+    """Report for a run that failed before producing per-guard results."""
+    return {
+        "mode": mode_label,
+        "fatal_error": message,
+        "total": 0,
+        "killed": 0,
+        "survived": 0,
+        "errors": 1,
+        "kill_rate_pct": 0.0,
+        "results": [],
+    }
+
+
+def _write_json_out(path: Path, report: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -2016,7 +2758,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--json",
         dest="emit_json",
         action="store_true",
-        help="Emit the structured JSON report to stdout.",
+        help="Emit the structured JSON report to stdout (and nothing else).",
     )
     parser.add_argument(
         "--json-out",
@@ -2056,6 +2798,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Do not reuse `.lake/build/lib/lean` `.olean`s for baseline seeding.",
     )
     parser.add_argument(
+        "--verify-lake-olean-bytes",
+        action="store_true",
+        help=(
+            "Re-hash every reused `.lake/build/lib/lean` `.olean` instead of "
+            "trusting an `.olean.hash` file that is at least as new as its `.olean`."
+        ),
+    )
+    parser.add_argument(
         "--jobs",
         type=int,
         default=min(4, os.cpu_count() or 1),
@@ -2075,9 +2825,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--timeout-sec must be >= 1")
     if args.guards and (args.quick or args.all):
         parser.error("--guard cannot be combined with --quick or --all")
+    if args.list and args.json_out is not None:
+        parser.error("--json-out cannot be combined with --list")
+
+    # Lean always runs with `cwd=<anneal_root>`; relative paths must not shift.
+    anneal_root = Path(os.path.abspath(args.anneal_root))
+    mode_label = "quick" if args.quick else ("guard" if args.guards else "all")
 
     if args.list:
-        errors = validate_catalog_invariants(args.anneal_root)
+        errors = validate_catalog_invariants(anneal_root)
         if errors:
             for err in errors:
                 print(f"ERROR: {err}", file=sys.stderr)
@@ -2111,26 +2867,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"Total cataloged guards: {len(selected)}")
         return 0
 
-    lean_bin = _resolve_lean_binary(args.lean)
+    def _fail(message: str) -> int:
+        """Report a fatal error on stderr AND in every requested JSON sink.
+
+        A stale `--json-out` file from an earlier green run must never survive
+        a run that failed before producing results.
+        """
+        print(f"ERROR: {message}", file=sys.stderr)
+        report = _fatal_report(mode_label, message)
+        if args.json_out is not None:
+            try:
+                _write_json_out(args.json_out, report)
+            except OSError as exc:
+                print(f"ERROR: cannot write {args.json_out}: {exc}", file=sys.stderr)
+        if args.emit_json:
+            print(json.dumps(report, indent=2))
+        return 1
+
+    try:
+        lean_bin = _resolve_lean_binary(args.lean)
+    except SystemExit as exc:
+        return _fail(str(exc))
 
     # Wrap auto-resolved real `lean` calls through `anneal-lean-run --mode file --`
     # when available; invoke explicit custom `--lean` directly unless
     # `--use-lean-run` is explicitly requested.
     lean_run_wrapper: Path | None = None
     if args.use_lean_run is True:
-        lean_run_wrapper = _resolve_lean_run_wrapper(args.anneal_root)
+        lean_run_wrapper = _resolve_lean_run_wrapper(anneal_root)
         if lean_run_wrapper is None:
-            print(
-                "ERROR: --use-lean-run specified, but anneal-lean-run was not found",
-                file=sys.stderr,
-            )
-            return 1
+            return _fail("--use-lean-run specified, but anneal-lean-run was not found")
     elif args.use_lean_run is None and args.lean is None:
-        lean_run_wrapper = _resolve_lean_run_wrapper(args.anneal_root)
+        lean_run_wrapper = _resolve_lean_run_wrapper(anneal_root)
 
     try:
         report = run_guard_mutation_suite(
-            anneal_root=args.anneal_root,
+            anneal_root=anneal_root,
             lean_bin=lean_bin,
             quick=args.quick,
             guard_filters=args.guards,
@@ -2138,16 +2910,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             timeout_sec=args.timeout_sec,
             lean_run_wrapper=lean_run_wrapper,
             reuse_lake_cache=not args.no_lake_cache,
+            verify_lake_olean_bytes=args.verify_lake_olean_bytes,
         )
-    except (RuntimeError, ValueError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    except (RuntimeError, ValueError, OSError) as exc:
+        return _fail(str(exc))
 
     if args.json_out is not None:
-        args.json_out.parent.mkdir(parents=True, exist_ok=True)
-        args.json_out.write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
-        )
+        try:
+            _write_json_out(args.json_out, report)
+        except OSError as exc:
+            print(f"ERROR: cannot write {args.json_out}: {exc}", file=sys.stderr)
+            return 1
 
     if args.emit_json:
         print(json.dumps(report, indent=2))
