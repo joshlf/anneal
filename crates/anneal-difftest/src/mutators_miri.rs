@@ -2011,6 +2011,40 @@ fn inject_live_probe(func: &mut ItemFn, mut setup_stmts: Vec<Stmt>, probe_ident:
     func.block.stmts.append(&mut setup_stmts);
 }
 
+/// Insert `setup_stmts` at the START of `func` so the probe executes even when
+/// `func` is a faulting (`panic_*` / `ub_*`) seed whose body diverges before
+/// reaching a trailing expression. For integer-returning functions with a
+/// trailing expression, folds `probe_ident` into the returned value; otherwise
+/// binds a live sink right after `setup_stmts`.
+fn inject_prefix_probe(func: &mut ItemFn, setup_stmts: Vec<Stmt>, probe_ident: &syn::Ident) {
+    let prefix_len = setup_stmts.len();
+    func.block.stmts.splice(0..0, setup_stmts);
+    if let ReturnType::Type(_, ret_ty_box) = &func.sig.output {
+        let ret_ty: Type = (**ret_ty_box).clone();
+        let ret_ty_name = ret_ty.to_token_stream().to_string().replace(' ', "");
+        if is_integer_type_name(&ret_ty_name)
+            && func.block.stmts.len() > prefix_len
+            && let Some(Stmt::Expr(tail_expr, None)) = func.block.stmts.last().cloned()
+        {
+            func.block.stmts.pop();
+            let tail_ident = format_ident!("__tail_{probe_ident}");
+            let tail_stmt: Stmt = syn::parse_quote! {
+                let #tail_ident: #ret_ty = #tail_expr;
+            };
+            let combined: Expr = syn::parse_quote! {
+                #tail_ident ^ (#probe_ident as #ret_ty)
+            };
+            func.block.stmts.push(tail_stmt);
+            func.block.stmts.push(Stmt::Expr(combined, None));
+            return;
+        }
+    }
+    let sink_stmt: Stmt = syn::parse_quote! {
+        let mut __miri_sink: u32 = #probe_ident;
+    };
+    func.block.stmts.insert(prefix_len, sink_stmt);
+}
+
 /// Trait implemented by all Miri-strength AST mutators.
 pub trait MiriAstMutator {
     /// Canonical human-readable name of this mutator pass.
@@ -5352,6 +5386,23 @@ fn splice_items_and_inject_probe(
     }
 }
 
+/// Like [`splice_items_and_inject_probe`], but injects `call_stmts` at the
+/// start of the entry function (`PerturbAst` on faulting seeds) so the driver
+/// executes before the seed's own panic or UB.
+fn splice_items_and_inject_prefix_probe(
+    file: &mut File,
+    target_idx: usize,
+    new_items: Vec<Item>,
+    call_stmts: Vec<Stmt>,
+    probe_ident: &syn::Ident,
+) {
+    let entry_idx = target_idx + new_items.len();
+    file.items.splice(target_idx..target_idx, new_items);
+    if let Some(Item::Fn(func)) = file.items.get_mut(entry_idx) {
+        inject_prefix_probe(func, call_stmts, probe_ident);
+    }
+}
+
 /// 6. Calls a fresh private driver function that exercises function pointers
 ///    and trait objects, and folds its result into the entry function:
 ///    - reifying a function item into a `fn(u32) -> u32` pointer
@@ -5416,57 +5467,61 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
         let k1: u32 = [5u32, 12u32, 24u32, 48u32][rng.gen_range(4)];
         let seed_arg = indirect_seed_arg(&locals, k0);
 
+        let fn_ptr_chain = || -> File {
+            syn::parse_quote! {
+                #[inline(never)]
+                fn #callee_ident(__vt_v: u32) -> u32 {
+                    (__vt_v ^ #k0) & 0xFFFFu32
+                }
+
+                #[inline(never)]
+                fn #callee_alt_ident(__vt_v: u32) -> u32 {
+                    ((__vt_v >> 1u32) ^ #k0 ^ 0x5Au32) & 0xFFFFu32
+                }
+
+                #[inline(never)]
+                fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                    let __vt_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
+                        #callee_ident
+                    } else {
+                        #callee_alt_ident
+                    };
+                    let __vt_other_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
+                        #callee_alt_ident
+                    } else {
+                        #callee_ident
+                    };
+                    let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
+                    let __vt_raw_a: *const () = __vt_fp as *const ();
+                    let __vt_raw_b: *const () = __vt_ufp as *const ();
+                    let mut __vt_slot: u32 = __vt_fp(__vt_seed);
+                    let __vt_mut_ptr: *mut u32 = &raw mut __vt_slot;
+                    let __vt_const_ptr: *const u32 = __vt_mut_ptr;
+                    let __vt_second: u32 = unsafe { __vt_ufp((*__vt_const_ptr) ^ __vt_bias) };
+                    let __vt_alt_res: u32 = __vt_other_fp(__vt_second ^ __vt_bias);
+                    let __vt_same: u32 = if __vt_raw_a == __vt_raw_b { 1u32 } else { 0u32 };
+                    let __vt_not_stack: u32 = if __vt_raw_a == (__vt_const_ptr as *const ()) {
+                        0u32
+                    } else {
+                        2u32
+                    };
+                    __vt_slot
+                        ^ (__vt_second << 2u32)
+                        ^ (__vt_alt_res << 4u32)
+                        ^ __vt_same
+                        ^ __vt_not_stack
+                }
+            }
+        };
+
         let new_items: File = match mode {
-            MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(8) {
+            MutationMode::Pass => match rng.gen_range(8) {
                 // Reify two distinct callees into `fn(u32) -> u32` pointers
                 // chosen at run time, coerce to `unsafe fn`, cast both pointers
                 // to `*const ()` (positive self-equality and negative equality
                 // against a live stack pointer), coerce `*mut u32` to
                 // `*const u32`, and call through both pointers.
-                0..=4 => syn::parse_quote! {
-                    #[inline(never)]
-                    fn #callee_ident(__vt_v: u32) -> u32 {
-                        (__vt_v ^ #k0) & 0xFFFFu32
-                    }
-
-                    #[inline(never)]
-                    fn #callee_alt_ident(__vt_v: u32) -> u32 {
-                        ((__vt_v >> 1u32) ^ #k0 ^ 0x5Au32) & 0xFFFFu32
-                    }
-
-                    #[inline(never)]
-                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
-                        let __vt_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
-                            #callee_ident
-                        } else {
-                            #callee_alt_ident
-                        };
-                        let __vt_other_fp: fn(u32) -> u32 = if (__vt_seed & 1u32) == 0u32 {
-                            #callee_alt_ident
-                        } else {
-                            #callee_ident
-                        };
-                        let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
-                        let __vt_raw_a: *const () = __vt_fp as *const ();
-                        let __vt_raw_b: *const () = __vt_ufp as *const ();
-                        let mut __vt_slot: u32 = __vt_fp(__vt_seed);
-                        let __vt_mut_ptr: *mut u32 = &raw mut __vt_slot;
-                        let __vt_const_ptr: *const u32 = __vt_mut_ptr;
-                        let __vt_second: u32 = unsafe { __vt_ufp((*__vt_const_ptr) ^ __vt_bias) };
-                        let __vt_alt_res: u32 = __vt_other_fp(__vt_second ^ __vt_bias);
-                        let __vt_same: u32 = if __vt_raw_a == __vt_raw_b { 1u32 } else { 0u32 };
-                        let __vt_not_stack: u32 = if __vt_raw_a == (__vt_const_ptr as *const ()) {
-                            0u32
-                        } else {
-                            2u32
-                        };
-                        __vt_slot
-                            ^ (__vt_second << 2u32)
-                            ^ (__vt_alt_res << 4u32)
-                            ^ __vt_same
-                            ^ __vt_not_stack
-                    }
-                },
+                0..=4 => fn_ptr_chain(),
                 // Unsize two distinct concrete receivers (the second with a
                 // non-zero field offset) to `&dyn Trait` with two trait methods
                 // and a second trait on the first receiver, dispatch dynamically
@@ -5579,6 +5634,16 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                     }
                 },
             },
+            // `PerturbAst` runs as pass 0 on already-faulting (`panic_*` /
+            // `ub_*`) seeds and injects its driver as a prefix before the
+            // seed's fault; emit only the 100%-`Agree` `fn_ptr_chain` driver so
+            // it never faults early with conservative `FalsePositiveUb` before
+            // the seed's own panic/UB. Preserve the `gen_range(8)` draw so PRNG
+            // consumption stays identical to `Pass`.
+            MutationMode::PerturbAst => {
+                let _ = rng.gen_range(8);
+                fn_ptr_chain()
+            }
             MutationMode::Panic => match rng.gen_range(2) {
                 // Overflow inside the callee, reached through the `unsafe fn`
                 // pointer, so the panic unwinds through an indirect call.
@@ -5654,10 +5719,29 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                 },
             },
         };
-        let call_stmts: Vec<Stmt> = syn::parse_quote! {
-            let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
-        };
-        splice_items_and_inject_probe(file, target_idx, new_items.items, call_stmts, &probe_ident);
+        if mode == MutationMode::PerturbAst {
+            let call_stmts: Vec<Stmt> = syn::parse_quote! {
+                let #probe_ident: u32 = #driver_ident(#k0, #k1);
+            };
+            splice_items_and_inject_prefix_probe(
+                file,
+                target_idx,
+                new_items.items,
+                call_stmts,
+                &probe_ident,
+            );
+        } else {
+            let call_stmts: Vec<Stmt> = syn::parse_quote! {
+                let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
+            };
+            splice_items_and_inject_probe(
+                file,
+                target_idx,
+                new_items.items,
+                call_stmts,
+                &probe_ident,
+            );
+        }
     }
 }
 
@@ -5867,10 +5951,23 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
         };
         let mut new_items = support_items.items;
         new_items.push(driver_item);
-        let call_stmts: Vec<Stmt> = syn::parse_quote! {
-            let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
-        };
-        splice_items_and_inject_probe(file, target_idx, new_items, call_stmts, &probe_ident);
+        if mode == MutationMode::PerturbAst {
+            let call_stmts: Vec<Stmt> = syn::parse_quote! {
+                let #probe_ident: u32 = #driver_ident(#k0, #k1);
+            };
+            splice_items_and_inject_prefix_probe(
+                file,
+                target_idx,
+                new_items,
+                call_stmts,
+                &probe_ident,
+            );
+        } else {
+            let call_stmts: Vec<Stmt> = syn::parse_quote! {
+                let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
+            };
+            splice_items_and_inject_probe(file, target_idx, new_items, call_stmts, &probe_ident);
+        }
     }
 }
 
@@ -9766,7 +9863,11 @@ pub fn indirect_seed() -> u32 {
         let clos: &dyn MiriAstMutator = &ClosureAndAddrEqMutator;
         let cases: [(&dyn MiriAstMutator, MutationMode, &[Template]); 8] = [
             (vt, Pass, VT_PASS),
-            (vt, PerturbAst, VT_PASS),
+            // `PerturbAst` injects as a prefix before a faulting seed's body,
+            // so `VTableAndFnPtrMutator` emits only the 100%-`Agree`
+            // `fn_ptr_chain` driver (never conservative-UB `dyn_dispatch` or
+            // `closure_fn_ptr`).
+            (vt, PerturbAst, &VT_PASS[..1]),
             (vt, Panic, VT_PANIC),
             (vt, Ub, VT_UB),
             (clos, Pass, CLOS_PASS),
@@ -9795,6 +9896,15 @@ pub fn indirect_seed() -> u32 {
                     1,
                     "entry function must gain exactly one driver call:\n{fn_source}"
                 );
+                if mode == PerturbAst {
+                    let call_pos = entry.find("__anneal_").expect("driver call");
+                    let seed_pos = entry.find("let x: u32").expect("seed local");
+                    assert!(
+                        call_pos < seed_pos,
+                        "`{}` PerturbAst must place its driver call before the seed body:\n{fn_source}",
+                        mutator.name()
+                    );
+                }
                 let matching: Vec<&str> = templates
                     .iter()
                     .filter(|(_, has, lacks)| {
@@ -9826,7 +9936,7 @@ pub fn indirect_seed() -> u32 {
                 compiled += 1;
             }
         }
-        assert_eq!(compiled, 2 * 3 + 2 + 2 + 2 * 5 + 2 + 2);
+        assert_eq!(compiled, 3 + 1 + 2 + 2 + 2 * 5 + 2 + 2);
     }
 
     #[test]

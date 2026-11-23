@@ -47,10 +47,10 @@ use anneal_difftest::mutators_itree::{
 };
 use anneal_difftest::mutators_miri::{
     ClosureAndAddrEqMutator, DetRng, GeneratedMiriCandidate, MIRI_CORPUS_CRATE_HEADER,
-    MiriAstMutator, MutationMode, RecordedMutationStep, VTableAndFnPtrMutator,
-    build_standalone_candidate_source, generate_miri_corpus_batch, load_miri_diff_corpus_seeds,
-    miri_candidate_replay_is_faithful, reconstruct_miri_mutation_steps,
-    replay_miri_mutation_steps,
+    MiriAstMutator, MutationMode, RecordedMutationStep, TreeBorrowsRetagInterleaver,
+    VTableAndFnPtrMutator, build_standalone_candidate_source, generate_miri_corpus_batch,
+    load_miri_diff_corpus_seeds, miri_candidate_replay_is_faithful,
+    reconstruct_miri_mutation_steps, replay_miri_mutation_steps,
 };
 use cargo_anneal::{ComparisonVerdict, DivergenceKind, MiriOutcome};
 
@@ -631,6 +631,215 @@ fn stacked_miri_candidates(
                 seed_u64: pass_of(first).1,
                 applied_mutators,
                 tracked_locals: vec![("x".to_string(), "u32".to_string())],
+                fn_source,
+                source,
+            },
+        ));
+    }
+    out
+}
+
+/// Expectations for [`tb_stacked_miri_candidates`] (`TreeBorrowsRetagInterleaver`
+/// stacked with an indirect-call mutator in either order).
+const TB_STACKED_TEMPLATES: &[MiriTemplate] = &[MiriTemplate {
+    label: "tb_stacked_indirect_passes",
+    classes: &[FN_PTR, CLOSURE],
+    mode: MutationMode::Pass,
+    has: &[],
+    lacks: "",
+    expect: Expect::Agree,
+}];
+
+/// Expectations for [`perturb_fault_seed_miri_candidates`]: `PerturbAst` prefix
+/// probes run ahead of a faulting (`panic_*` / `ub_*`) seed body and must agree
+/// with Miri on the seed's own fault without introducing conservative UB first.
+const PERTURB_FAULT_TEMPLATES: &[MiriTemplate] = &[
+    MiriTemplate {
+        label: "perturb_fault_panic",
+        classes: &[FN_PTR, CLOSURE],
+        mode: MutationMode::Panic,
+        has: &[],
+        lacks: "",
+        expect: Expect::Agree,
+    },
+    MiriTemplate {
+        label: "perturb_fault_ub",
+        classes: &[FN_PTR, ADDR_EQ, CLOSURE],
+        mode: MutationMode::Ub,
+        has: &[],
+        lacks: "",
+        expect: Expect::Agree,
+    },
+];
+
+/// First PRNG seed in `0..TEMPLATE_SCAN_SEEDS` on which
+/// `TreeBorrowsRetagInterleaver` (`Pass`) selects its self-contained arm 0
+/// (Reserved `&mut` coexisting with a parent raw read, marked by
+/// `__tb_parent_read`) when applied to `file`.
+fn find_tb_arm0_seed(file: &syn::File) -> u64 {
+    (0..TEMPLATE_SCAN_SEEDS)
+        .find(|&s| {
+            let mut probe = file.clone();
+            let mut rng = DetRng::new(s);
+            let mut locals = Vec::new();
+            TreeBorrowsRetagInterleaver.mutate_with_mode(
+                &mut probe,
+                &mut rng,
+                MutationMode::Pass,
+                &mut locals,
+            );
+            prettyplease::unparse(&probe).contains("__tb_parent_read")
+        })
+        .expect("TreeBorrowsRetagInterleaver must select arm 0 within TEMPLATE_SCAN_SEEDS")
+}
+
+/// Candidates stacking `TreeBorrowsRetagInterleaver` with
+/// `ClosureAndAddrEqMutator` and `VTableAndFnPtrMutator` in both orders so
+/// live Miri (`-Zmiri-tree-borrows`) + Anneal checks their interaction.
+fn tb_stacked_miri_candidates(
+    first_id: usize,
+) -> Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> {
+    let singles = all_miri_template_candidates();
+    let pass_of = |label: &str| -> (&'static dyn MiriAstMutator, u64) {
+        let (_, cand) = singles
+            .iter()
+            .find(|(t, _)| t.label == label && t.mode == MutationMode::Pass)
+            .unwrap_or_else(|| panic!("no `Pass` template `{label}`"));
+        let mutator: &'static dyn MiriAstMutator =
+            if cand.applied_mutators[0] == "VTableAndFnPtrMutator" {
+                &VTableAndFnPtrMutator
+            } else {
+                &ClosureAndAddrEqMutator
+            };
+        (mutator, cand.seed_u64)
+    };
+    let cases: [(&str, Option<&str>, Option<&str>); 4] = [
+        (
+            "tb_stack0_tb__closure_by_unique_ref",
+            None,
+            Some("closure_by_unique_ref"),
+        ),
+        (
+            "tb_stack1_closure_by_shared_ref__tb",
+            Some("closure_by_shared_ref"),
+            None,
+        ),
+        ("tb_stack2_tb__fn_ptr_chain", None, Some("fn_ptr_chain")),
+        ("tb_stack3_fn_ptr_chain__tb", Some("fn_ptr_chain"), None),
+    ];
+    let mut out: Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> = Vec::new();
+    for (fn_name, first_indirect, second_indirect) in cases {
+        let seed = format!("pub fn {fn_name}() -> u32 {{\n    let x: u32 = 10u32;\n    x ^ 1u32\n}}\n");
+        let mut file = syn::parse_file(&seed).expect("parse seed");
+        let mut locals = Vec::new();
+        let mut applied_mutators = Vec::new();
+        let mut first_seed = 0u64;
+        for (step_idx, indirect_opt) in [first_indirect, second_indirect].into_iter().enumerate() {
+            let (mutator, s): (&dyn MiriAstMutator, u64) = match indirect_opt {
+                Some(label) => pass_of(label),
+                None => (&TreeBorrowsRetagInterleaver, find_tb_arm0_seed(&file)),
+            };
+            if step_idx == 0 {
+                first_seed = s;
+            }
+            let mut rng = DetRng::new(s);
+            mutator.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+            applied_mutators.push(mutator.name().to_string());
+        }
+        let fn_source = prettyplease::unparse(&file);
+        let source = build_standalone_candidate_source(&fn_source);
+        out.push((
+            &TB_STACKED_TEMPLATES[0],
+            GeneratedMiriCandidate {
+                id: first_id + out.len(),
+                seed_index: 0,
+                seed_name: "indirect_call_tb_stack_seed".to_string(),
+                fn_name: fn_name.to_string(),
+                seed_u64: first_seed,
+                applied_mutators,
+                tracked_locals: vec![("x".to_string(), "u32".to_string())],
+                fn_source,
+                source,
+            },
+        ));
+    }
+    out
+}
+
+/// Real faulting (`panic_*` / `ub_*`) corpus seeds mutated under
+/// `MutationMode::PerturbAst`.
+///
+/// The `VTableAndFnPtrMutator` cases deliberately reuse the PRNG seeds of
+/// `dyn_dispatch` and `closure_fn_ptr` to prove that `PerturbAst` never emits
+/// a conservative-UB template ahead of the seed's own fault, and
+/// `perturb_clos_unit_ub` exercises the `()` return-type prefix-sink path.
+fn perturb_fault_seed_miri_candidates(
+    first_id: usize,
+) -> Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> {
+    let singles = all_miri_template_candidates();
+    let seed_of = |label: &str| -> u64 {
+        singles
+            .iter()
+            .find(|(t, _)| t.label == label && t.mode == MutationMode::Pass)
+            .unwrap_or_else(|| panic!("no `Pass` template `{label}`"))
+            .1
+            .seed_u64
+    };
+    let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 5] = [
+        (
+            "perturb_vt_panic",
+            "pub fn perturb_vt_panic() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            &VTableAndFnPtrMutator,
+            seed_of("dyn_dispatch"),
+            &PERTURB_FAULT_TEMPLATES[0],
+        ),
+        (
+            "perturb_clos_panic",
+            "pub fn perturb_clos_panic() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("closure_by_unique_ref"),
+            &PERTURB_FAULT_TEMPLATES[0],
+        ),
+        (
+            "perturb_vt_ub",
+            "pub fn perturb_vt_ub() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
+            &VTableAndFnPtrMutator,
+            seed_of("closure_fn_ptr"),
+            &PERTURB_FAULT_TEMPLATES[1],
+        ),
+        (
+            "perturb_clos_ub",
+            "pub fn perturb_clos_ub() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("wide_slices"),
+            &PERTURB_FAULT_TEMPLATES[1],
+        ),
+        (
+            "perturb_clos_unit_ub",
+            "pub fn perturb_clos_unit_ub() {\n    let p: *mut u32 = 0usize as *mut u32;\n    unsafe {\n        *p = 42;\n    }\n}\n",
+            &ClosureAndAddrEqMutator,
+            seed_of("closure_by_shared_ref"),
+            &PERTURB_FAULT_TEMPLATES[1],
+        ),
+    ];
+    let mut out: Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> = Vec::new();
+    for (fn_name, seed, mutator, s, template) in cases {
+        let mut file = syn::parse_file(seed).expect("parse faulting seed");
+        let mut rng = DetRng::new(s);
+        let mut locals = Vec::new();
+        mutator.mutate_with_mode(&mut file, &mut rng, MutationMode::PerturbAst, &mut locals);
+        let fn_source = prettyplease::unparse(&file);
+        let source = build_standalone_candidate_source(&fn_source);
+        out.push((
+            template,
+            GeneratedMiriCandidate {
+                id: first_id + out.len(),
+                seed_index: 0,
+                seed_name: fn_name.to_string(),
+                fn_name: fn_name.to_string(),
+                seed_u64: s,
+                applied_mutators: vec![mutator.name().to_string()],
+                tracked_locals: locals,
                 fn_source,
                 source,
             },
@@ -1277,6 +1486,106 @@ fn stacked_itree_indirect_dispatch_candidates_are_safe_supported_and_compile() {
     }
 }
 
+/// `TreeBorrowsRetagInterleaver` stacked with the indirect-call mutators in
+/// both orders, plus `PerturbAst` prefix probes on real faulting (`panic_*` /
+/// `ub_*`) corpus seeds: generation is deterministic, every candidate compiles
+/// warning-free at `-O0` and `-O2`, and every `PerturbAst` probe executes
+/// strictly ahead of the seed's fault without emitting a conservative-UB arm.
+#[test]
+fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
+    let tb_cands = tb_stacked_miri_candidates(0);
+    let tb_replay = tb_stacked_miri_candidates(0);
+    assert_eq!(tb_cands.len(), 4);
+    assert_eq!(tb_cands.len(), tb_replay.len());
+    for ((_, cand), (_, replay)) in tb_cands.iter().zip(&tb_replay) {
+        assert_eq!(cand, replay, "`{}` is not deterministic", cand.fn_name);
+        assert!(
+            cand.fn_source.contains("__miri_tb_") && cand.fn_source.contains("__tb_parent_read"),
+            "`{}` missing TreeBorrows arm 0:\n{}",
+            cand.fn_name,
+            cand.fn_source
+        );
+        assert!(
+            cand.fn_source.contains("__anneal_vt_driver_")
+                || cand.fn_source.contains("__anneal_clos_driver_"),
+            "`{}` missing indirect-call driver:\n{}",
+            cand.fn_name,
+            cand.fn_source
+        );
+        for opt_level in ["0", "2"] {
+            if let Err(stderr) = compile_with_lints(&cand.fn_name, "-D", opt_level, &cand.source) {
+                panic!(
+                    "`{}` failed at -C opt-level={opt_level}:\n{stderr}\n{}",
+                    cand.fn_name, cand.source
+                );
+            }
+        }
+    }
+
+    let perturb_cands = perturb_fault_seed_miri_candidates(tb_cands.len());
+    let perturb_replay = perturb_fault_seed_miri_candidates(tb_cands.len());
+    assert_eq!(perturb_cands.len(), 5);
+    assert_eq!(perturb_cands.len(), perturb_replay.len());
+    for ((_, cand), (_, replay)) in perturb_cands.iter().zip(&perturb_replay) {
+        assert_eq!(cand, replay, "`{}` is not deterministic", cand.fn_name);
+        let entry_hdr = format!("pub fn {}()", cand.fn_name);
+        let entry_pos = cand
+            .fn_source
+            .find(&entry_hdr)
+            .unwrap_or_else(|| panic!("`{}` missing entry header:\n{}", cand.fn_name, cand.fn_source));
+        let entry_body = &cand.fn_source[entry_pos..];
+        let driver_marker = if cand.applied_mutators[0] == "VTableAndFnPtrMutator" {
+            assert!(
+                cand.fn_source.contains("__anneal_fnptr_callee_")
+                    && !cand.fn_source.contains("__AnnealVtable")
+                    && !cand.fn_source.contains("__vt_cfp"),
+                "`{}` PerturbAst must emit the 100%-Agree fn_ptr_chain arm:\n{}",
+                cand.fn_name,
+                cand.fn_source
+            );
+            "__anneal_vt_driver_"
+        } else {
+            "__anneal_clos_driver_"
+        };
+        let fault_marker = if cand.fn_name.ends_with("_panic") {
+            "x + y"
+        } else if cand.fn_name.ends_with("_unit_ub") {
+            "*p = 42"
+        } else {
+            "unchecked_add"
+        };
+        let probe_pos = entry_body.find(driver_marker).unwrap_or_else(|| {
+            panic!("`{}` missing `{driver_marker}` in entry:\n{entry_body}", cand.fn_name)
+        });
+        let fault_pos = entry_body.find(fault_marker).unwrap_or_else(|| {
+            panic!("`{}` missing `{fault_marker}` in entry:\n{entry_body}", cand.fn_name)
+        });
+        assert!(
+            probe_pos < fault_pos,
+            "`{}` must place PerturbAst driver call before fault:\n{entry_body}",
+            cand.fn_name
+        );
+        if cand.fn_name.ends_with("_unit_ub") {
+            let sink_pos = entry_body.find("let mut __miri_sink: u32 =").unwrap_or_else(|| {
+                panic!("`{}` missing unit-return sink:\n{entry_body}", cand.fn_name)
+            });
+            assert!(
+                probe_pos < sink_pos && sink_pos < fault_pos,
+                "`{}` must bind `__miri_sink` between prefix call and fault:\n{entry_body}",
+                cand.fn_name
+            );
+        }
+        for opt_level in ["0", "2"] {
+            if let Err(stderr) = compile_with_lints(&cand.fn_name, "-D", opt_level, &cand.source) {
+                panic!(
+                    "`{}` failed at -C opt-level={opt_level}:\n{stderr}\n{}",
+                    cand.fn_name, cand.source
+                );
+            }
+        }
+    }
+}
+
 /// Live Miri (`-Zmiri-tree-borrows`) + Anneal evaluation of every template.
 ///
 /// No template may end in a harness or extraction error, an `unsupported`
@@ -1289,11 +1598,16 @@ fn indirect_call_templates_run_through_live_miri_and_anneal_oracles() {
     let _guard = LIVE_ORACLE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = unique_temp_dir("miri_live");
     let root = repo_root();
-    // Every template on its own, then pairs of agreeing templates stacked on
-    // one seed.
+    // Every template on its own, pairs of agreeing indirect-call templates,
+    // `TreeBorrowsRetagInterleaver` stacked with indirect-call passes in both
+    // orders, and `PerturbAst` prefix probes on real faulting corpus seeds.
     let mut templates = all_miri_template_candidates();
     let first_stacked_id = templates.len();
     templates.extend(stacked_miri_candidates(first_stacked_id));
+    let first_tb_id = templates.len();
+    templates.extend(tb_stacked_miri_candidates(first_tb_id));
+    let first_perturb_id = templates.len();
+    templates.extend(perturb_fault_seed_miri_candidates(first_perturb_id));
     let batch: Vec<GeneratedMiriCandidate> = templates.iter().map(|(_, c)| c.clone()).collect();
     let total = batch.len();
 

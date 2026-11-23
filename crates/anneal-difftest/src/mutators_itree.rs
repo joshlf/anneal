@@ -1210,6 +1210,15 @@ fn dyn_trait_name(ty: &Type) -> Option<String> {
     }
 }
 
+fn is_trait_object_type(ty: &Type) -> bool {
+    match ty {
+        Type::Paren(p) => is_trait_object_type(&p.elem),
+        Type::Group(g) => is_trait_object_type(&g.elem),
+        Type::TraitObject(_) => true,
+        _ => false,
+    }
+}
+
 fn eval_ty_of(ty: &Type) -> EvalTy {
     match ty {
         Type::Path(tp) if tp.qself.is_none() && tp.path.segments.len() == 1 => {
@@ -1224,8 +1233,13 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         }
         Type::Tuple(t) if t.elems.is_empty() => EvalTy::Unit,
         Type::Paren(p) => eval_ty_of(&p.elem),
+        Type::Group(g) => eval_ty_of(&g.elem),
         Type::Reference(r) if r.mutability.is_none() => match dyn_trait_name(&r.elem) {
             Some(tr) => EvalTy::DynRef(tr),
+            // Reject multi-bound or qualified trait-object references (such as
+            // `&(dyn Trait + Send)`) rather than stripping `dyn` into `Ref` and
+            // mis-dispatching to an inherent method.
+            None if is_trait_object_type(&r.elem) => EvalTy::Named(quote!(#ty).to_string()),
             None => EvalTy::Ref,
         },
         Type::Ptr(p) if p.mutability.is_none() => EvalTy::ConstPtr,
@@ -1808,6 +1822,39 @@ impl<'ast> Visit<'ast> for ClosureFreeIdents {
         self.bound.push(scope);
         self.visit_expr(&node.body);
         self.bound.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_expr(&node.expr);
+        let mut scope = BTreeSet::new();
+        collect_pat_idents(&node.pat, &mut scope);
+        self.bound.push(scope);
+        self.visit_block(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.bound.push(BTreeSet::new());
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.then_branch);
+        self.bound.pop();
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.bound.push(BTreeSet::new());
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        self.visit_expr(&node.expr);
+        if let Some(scope) = self.bound.last_mut() {
+            collect_pat_idents(&node.pat, scope);
+        }
     }
 
     fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
@@ -2839,7 +2886,15 @@ impl<'a> EvalRun<'a> {
             Expr::Group(g) => self.eval_expr(frame, &g.expr),
             Expr::Block(b) if b.label.is_none() => self.eval_block(frame, &b.block),
             Expr::Unary(u) => match (&u.op, self.eval_expr(frame, &u.expr)?) {
-                (syn::UnOp::Deref(_), EvalValue::Ref(r)) => Ok(r.val),
+                (syn::UnOp::Deref(_), EvalValue::Ref(r)) => {
+                    // Dereferencing `&dyn Trait` yields an unsized trait object
+                    // place; returning `r.val` would drop `dyn_trait` and let
+                    // `(*r).method()` dispatch to an inherent `impl`.
+                    if r.dyn_trait.is_some() {
+                        return eval_unsupported("dereference of a trait object");
+                    }
+                    Ok(r.val)
+                }
                 (syn::UnOp::Not(_), EvalValue::Bool(b)) => Ok(EvalValue::Bool(!b)),
                 (syn::UnOp::Not(_), EvalValue::Int(x, t)) if t != EvalIntTy::Infer => {
                     Ok(EvalValue::Int(!x & t.max(), t))
@@ -4280,6 +4335,13 @@ mod tests {
     /// compare each run on the base inputs and on the synthesized concolic
     /// inputs against the evaluator's prediction.
     fn assert_evaluator_matches_native_rustc(cands: &[GeneratedItreeCandidate]) {
+        assert_evaluator_matches_native_rustc_at_opt_levels(cands, &["0"]);
+    }
+
+    fn assert_evaluator_matches_native_rustc_at_opt_levels(
+        cands: &[GeneratedItreeCandidate],
+        opt_levels: &[&str],
+    ) {
         use std::fmt::Write as _;
         let mut program = String::from(
             "#![allow(dead_code, unused_parens, non_snake_case, non_camel_case_types)]\n\
@@ -4403,41 +4465,50 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let src_path = dir.join("native_check.rs");
-        let bin_path = dir.join("native_check");
         std::fs::write(&src_path, &program).unwrap();
-        let compile = std::process::Command::new(crate::miri_eval::resolve_rustc_bin())
-            .args([
-                "--edition=2024",
-                "-C",
-                "opt-level=0",
-                "-C",
-                "overflow-checks=on",
-                "-A",
-                "warnings",
-            ])
-            .arg(&src_path)
-            .arg("-o")
-            .arg(&bin_path)
-            .output()
-            .expect("invoke rustc");
-        assert!(
-            compile.status.success(),
-            "rustc failed:\n{}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
-        let out = std::process::Command::new(&bin_path)
-            .output()
-            .expect("run native check");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.status.success(), "native check binary failed");
-        let native: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(native.len(), expected.len());
-        for (n, e) in native.iter().zip(&expected) {
-            assert_eq!(n, e, "evaluator prediction diverges from native execution");
+        for &opt_level in opt_levels {
+            let bin_path = dir.join(format!("native_check_o{opt_level}"));
+            let opt_flag = format!("opt-level={opt_level}");
+            let compile = std::process::Command::new(crate::miri_eval::resolve_rustc_bin())
+                .args([
+                    "--edition=2024",
+                    "-C",
+                    &opt_flag,
+                    "-C",
+                    "overflow-checks=on",
+                    "-A",
+                    "warnings",
+                ])
+                .arg(&src_path)
+                .arg("-o")
+                .arg(&bin_path)
+                .output()
+                .expect("invoke rustc");
+            assert!(
+                compile.status.success(),
+                "rustc (-C {opt_flag}) failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let out = std::process::Command::new(&bin_path)
+                .output()
+                .expect("run native check");
+            assert!(
+                out.status.success(),
+                "native check binary (-C {opt_flag}) failed"
+            );
+            let native: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(native.len(), expected.len());
+            for (n, e) in native.iter().zip(&expected) {
+                assert_eq!(
+                    n, e,
+                    "evaluator prediction diverges from native execution at -C {opt_flag}"
+                );
+            }
         }
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(expected.len() >= cands.len() * ITREE_CONCOLIC_BASE_INPUTS.len());
     }
 
@@ -5057,7 +5128,7 @@ mod tests {
             );
         }
         let cands: Vec<GeneratedItreeCandidate> = cands.into_iter().map(|(_, c)| c).collect();
-        assert_evaluator_matches_native_rustc(&cands);
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
 
         // Scheduled batches carry the mutator and replay faithfully.
         let mut scheduled = 0usize;
@@ -5179,7 +5250,7 @@ mod tests {
             }
         }
         assert_eq!(cands.len(), seeds.len() * ITREE_BASE_MUTATOR_COUNT * 2);
-        assert_evaluator_matches_native_rustc(&cands);
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
     }
 
     /// The two PRNG draws of the base schedule also decide the indirect-dispatch
@@ -5340,7 +5411,7 @@ mod tests {
             run.events[..],
             [ItreeConcreteEvent::ExtCallPanic { .. }]
         ));
-        assert_evaluator_matches_native_rustc(&cands);
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
 
         // 2. Constructs whose result the evaluator cannot determine are rejected.
         let rejected = [
@@ -5453,6 +5524,47 @@ mod tests {
                 let both = Both { v: a };
                 both.pick() ^ b
             }",
+            // Multi-bound trait object `&(dyn Left + Send)` must fail closed
+            // rather than stripping `dyn` into `Ref` and dispatching to an
+            // inherent `impl` of the same name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let left: &(dyn Left + Send) = &both;
+                left.pick() ^ b
+            }",
+            // Explicit dereference of `&dyn Left` (`(*left).pick()`) must fail
+            // closed rather than dropping `dyn_trait` and dispatching to an
+            // inherent `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let left: &dyn Left = &both;
+                (*left).pick() ^ b
+            }",
+            // A raw pointer captured in one loop iteration dangles in the next
+            // iteration, where native Rust reuses the same stack slot for `y`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let mut p: *const u32 = &a as *const u32;
+                let mut out: u32 = b;
+                let mut i: u32 = 0u32;
+                while i < 2u32 {
+                    let y: u32 = a ^ i;
+                    if i == 0u32 {
+                        p = &y as *const u32;
+                    } else if core::ptr::addr_eq(p, &y as *const u32) {
+                        out = a ^ 1u32;
+                    }
+                    i = i + 1u32;
+                }
+                out
+            }",
         ];
         for probe in rejected {
             let source = format!("{probe}\n{ROOT}");
@@ -5462,5 +5574,49 @@ mod tests {
                 "evaluator must reject:\n{source}"
             );
         }
+    }
+
+    #[test]
+    fn closure_free_idents_respects_loop_and_let_chain_binders() {
+        let free_of = |expr_src: &str| -> BTreeSet<String> {
+            let clos: syn::ExprClosure = syn::parse_str(expr_src).expect("parse closure");
+            let mut free = ClosureFreeIdents::default();
+            free.visit_expr_closure(&clos);
+            free.names
+        };
+        // `for` binder shadows `i` inside the loop body, while `iter_src` is free.
+        assert_eq!(
+            free_of("|n: u32| { let mut s = n; for i in iter_src { s = s ^ i; } s }"),
+            BTreeSet::from(["iter_src".to_string()])
+        );
+        // `for i in i { ... }`: RHS `i` is evaluated before the loop binder!
+        assert_eq!(
+            free_of("|n: u32| { let mut s = n; for i in i { s = s ^ i; } s }"),
+            BTreeSet::from(["i".to_string()])
+        );
+        // `if let` chain: `x` bound in first `let` is in scope in second `let`
+        // and `then` branch, but NOT in `else` branch.
+        assert_eq!(
+            free_of("|a: u32| if let Some(x) = opt && let Some(y) = x { y ^ a } else { x }"),
+            BTreeSet::from(["opt".to_string(), "x".to_string()])
+        );
+        assert_eq!(
+            free_of("|a: u32| if let Some(x) = opt && let Some(y) = x { y ^ a } else { a }"),
+            BTreeSet::from(["opt".to_string()])
+        );
+        // `while let` binds `x` inside the loop body; RHS `src` is free.
+        assert_eq!(
+            free_of("|a: u32| { let mut acc = a; while let Some(x) = src { acc = acc ^ x; } acc }"),
+            BTreeSet::from(["src".to_string()])
+        );
+        // `let ... else`: `x` is NOT bound in `else { ... }`, only after `let`.
+        assert_eq!(
+            free_of("|a: u32| { let Some(x) = opt else { return x; }; x ^ a }"),
+            BTreeSet::from(["opt".to_string(), "x".to_string()])
+        );
+        assert_eq!(
+            free_of("|a: u32| { let Some(x) = opt else { return a; }; x ^ a }"),
+            BTreeSet::from(["opt".to_string()])
+        );
     }
 }
