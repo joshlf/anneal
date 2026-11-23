@@ -5554,10 +5554,21 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                         step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
                     )
                     self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
-                # Failed re-probe fails closed (`None`) instead of returning the inflated 21600 MiB cap.
-                self.assertIsNone(
-                    suite._probe_lean_run_memory_max_mib(step_cmd, env={"FAIL_REPROBE": "1"})
+                # A failed re-probe fails closed: neither the inflated 21600 MiB cap of the
+                # first probe nor `None` (which would leave only the 32 GiB host ceiling and
+                # keep the step multi-threaded), but the per-slot lower bound 21600 * 1 // 3.
+                self.assertEqual(
+                    suite._probe_lean_run_memory_max_mib(step_cmd, env={"FAIL_REPROBE": "1"}),
+                    7200,
                 )
+                for step_name in ("lake_build_minirust_spec", "lake_build_lean_miri_spec"):
+                    env = suite._build_step_env(
+                        step_name,
+                        base_env={"PATH": "/usr/bin", "FAIL_REPROBE": "1"},
+                        cmd=step_cmd,
+                        cwd=root,
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
                 # With `--exclusive`, execution stays at `w_eff=1` (21600 MiB >= 10 GiB):
                 # even an older wrapper that reports `w_eff=3` on `--exclusive --concurrency 3`
                 # re-probes to `w_eff=1` (21600 MiB) and skips single-threading.
@@ -5633,6 +5644,122 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     "lake_build_lean_miri_spec", base_env=real_env, cmd=real_cmd, cwd=root
                 )
             self.assertEqual(step_env.get("LEAN_NUM_THREADS"), "1")
+
+    def test_probe_lean_run_failed_reprobe_reports_lower_bound_never_none(self) -> None:
+        # `_build_step_env` reads a `None` wrapper cap as "no wrapper cap". Once the first
+        # probe has shown that the wrapper executes at another concurrency, a failed or
+        # unusable re-probe must therefore still answer with a lower bound on the cap the
+        # command will really get, so a low-RAM step is never left multi-threaded.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "bin/anneal-lean-run"
+            table = root / "replies.json"
+            argv_log = root / "argv.jsonl"
+            wrapper.parent.mkdir()
+            # Replies are keyed by the last `--concurrency` / `-W` on the command line
+            # (argparse's last-wins rule); `"exit:<n>"` makes that probe fail.
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, sys
+                    args = sys.argv[1:]
+                    with open({str(argv_log)!r}, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(args) + "\\n")
+                    conc = "unset"
+                    for i, arg in enumerate(args):
+                        if arg in ("--concurrency", "-W") and i + 1 < len(args):
+                            conc = args[i + 1]
+                        elif arg.startswith("--concurrency="):
+                            conc = arg.split("=", 1)[1]
+                    with open({str(table)!r}, encoding="utf-8") as fh:
+                        reply = json.load(fh)[conc]
+                    if isinstance(reply, str) and reply.startswith("exit:"):
+                        sys.exit(int(reply[5:]))
+                    sys.stdout.write(reply if isinstance(reply, str) else json.dumps(reply))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+
+            def probe(wrapper_opts: list[str], replies: dict[str, object]) -> tuple[int | None, list[list[str]]]:
+                table.write_text(json.dumps(replies), encoding="utf-8")
+                argv_log.write_text("", encoding="utf-8")
+                cmd = [str(wrapper), "--mode", "build", *wrapper_opts, "--", "lake", "build", "MiniRustSpec"]
+                cap = suite._probe_lean_run_memory_max_mib(cmd)
+                calls = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+                return cap, calls
+
+            def first(mem: int, w_eff: int, slots: int) -> dict[str, int]:
+                return {"memory_max_mb": mem, "w_eff": w_eff, "build_slots": slots}
+
+            # 1. Non-exclusive: execution runs at `build_slots`, so the pool is split
+            #    `build_slots / w_eff` ways further than the first probe planned.
+            for spelling in (["--concurrency", "1"], ["--concurrency=1"], ["-W", "1"]):
+                for bad_reprobe in (
+                    "exit:2",
+                    "not json",
+                    "[]",
+                    {"w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": 0, "w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": True, "w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": "7200", "w_eff": 3, "build_slots": 3},
+                ):
+                    cap, calls = probe(spelling, {"1": first(21600, 1, 3), "3": bad_reprobe})
+                    self.assertEqual(cap, 7200, (spelling, bad_reprobe))
+                    self.assertEqual(len(calls), 2, (spelling, bad_reprobe))
+                    self.assertEqual(calls[1][-4:], ["--concurrency", "3", "--probe", "--json"])
+                # A usable re-probe is still taken verbatim, above or below that bound.
+                for runtime_mem in (6100, 7200, 9000):
+                    cap, _calls = probe(spelling, {"1": first(21600, 1, 3), "3": first(runtime_mem, 3, 3)})
+                    self.assertEqual(cap, runtime_mem, spelling)
+            # The bound scales by `w_eff / build_slots`, rounds down, and stays positive.
+            cap, _calls = probe(["--concurrency", "2"], {"2": first(20001, 2, 3), "3": "exit:1"})
+            self.assertEqual(cap, 13334)
+            cap, _calls = probe(["--concurrency", "1"], {"1": first(2, 1, 4), "4": "exit:1"})
+            self.assertEqual(cap, 1)
+
+            # 2. `--exclusive` on an older wrapper whose probe ignored it: execution runs at
+            #    `w_eff = 1`, so the first cap (planned for 3 slots) is already a lower bound.
+            cap, calls = probe(["--exclusive", "--concurrency", "3"], {"3": first(7200, 3, 3), "1": "exit:2"})
+            self.assertEqual(cap, 7200)
+            self.assertEqual(calls[1][-4:], ["--concurrency", "1", "--probe", "--json"])
+            cap, _calls = probe(
+                ["--exclusive", "--concurrency", "3"], {"3": first(7200, 3, 3), "1": {"w_eff": 1}}
+            )
+            self.assertEqual(cap, 7200)
+
+            # 3. A first probe without a usable cap is no answer, and is not re-probed.
+            for unusable in ({"w_eff": 1, "build_slots": 3}, {"memory_max_mb": 0, "w_eff": 1, "build_slots": 3}):
+                cap, calls = probe(["--concurrency", "1"], {"1": unusable, "3": first(7200, 3, 3)})
+                self.assertIsNone(cap, unusable)
+                self.assertEqual(len(calls), 1, unusable)
+            # Nor is a consistent one (`w_eff >= build_slots`, or no concurrency fields).
+            for consistent in (first(7200, 3, 3), first(5400, 4, 3), {"memory_max_mb": 7200}):
+                cap, calls = probe(["--concurrency", "1"], {"1": consistent})
+                self.assertEqual(cap, consistent["memory_max_mb"], consistent)
+                self.assertEqual(len(calls), 1, consistent)
+
+            # 4. The regression itself: a 9000 MiB first answer is already below 10 GiB, so
+            #    the cap at two slots is too. With the re-probe failing, both low-RAM steps
+            #    must stay single-threaded on a host whose own ceiling is 32 GiB.
+            table.write_text(json.dumps({"1": first(9000, 1, 2), "2": "exit:2"}), encoding="utf-8")
+            step_cmd = [str(wrapper), "--mode", "build", "--concurrency", "1", "--", "lake", "build", "MiniRustSpec"]
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 4500)
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=32768):
+                for step_name in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+                # The vendored `Miri` build is not a low-RAM step and never asks the wrapper.
+                argv_log.write_text("", encoding="utf-8")
+                env = suite._build_step_env(
+                    "lake_build_examples_miri_vendor", base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                )
+                self.assertNotIn("LEAN_NUM_THREADS", env)
+                self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
 
     def test_resolve_anneal_lean_run_anchors_relative_candidates(self) -> None:
         # Steps run with `cwd=repo_root`; a relative `ANNEAL_LEAN_RUN` or `PATH` entry that

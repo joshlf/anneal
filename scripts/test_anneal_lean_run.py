@@ -2509,6 +2509,83 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
         self.assertEqual(probe_env["build_slots"], 4)
         self.assertEqual(probe_env["memory_max_mb"], exec_env["memory_max_mb"])
 
+    def test_probe_cap_brackets_execution_cap_on_multi_slot_hosts(self) -> None:
+        """Contract `run_nightly_verification_suite._probe_lean_run_memory_max_mib` relies on.
+
+        A non-exclusive `--probe --concurrency w` plans for `w` slots, while execution
+        runs at `build_slots` when the host's concurrency file asks for more. Then
+        `--probe --concurrency <build_slots>` reproduces the execution plan, and the
+        execution `memory_max_mb` lies in `[probe * w // build_slots, probe]`.
+        """
+        reprobed = 0
+        for mem_total, mem_avail, cores in (
+            (16384, 14000, 8),
+            (32768, 28672, 16),
+            (65536, 60000, 32),
+            (262144, 200000, 96),
+        ):
+            for c_high in (None, mem_total // 2, (3 * mem_total) // 4):
+                ancestors = (
+                    []
+                    if c_high is None
+                    else [
+                        {
+                            "path": "/sys/fs/cgroup/user.slice",
+                            "name": "user.slice",
+                            "c_high_mb": c_high,
+                            "w_mb": 512,
+                            "is_shared_user_slice": False,
+                        }
+                    ]
+                )
+                for w_file in (2, 3, 4):
+                    for cli_c in (1, 2, 3):
+                        for mode in ("build", "file"):
+                            for l_ws, w_cg in ((0, 0), (1500, 2500)):
+
+                                def plan(concurrency: int, is_probe: bool) -> dict:
+                                    return alr.compute_workload_memory_envelope(
+                                        cpu_cores=cores,
+                                        mem_total_mb=mem_total,
+                                        mem_avail_mb=mem_avail,
+                                        ancestors=ancestors,
+                                        w_cg_mb=w_cg,
+                                        w_cg_nonrecl_mb=w_cg,
+                                        l_ws_mb=l_ws,
+                                        w_file=w_file,
+                                        cli_concurrency=concurrency,
+                                        is_probe=is_probe,
+                                        mode=mode,
+                                    )
+
+                                case = (mem_total, c_high, w_file, cli_c, mode, l_ws)
+                                probe, execd = plan(cli_c, True), plan(cli_c, False)
+                                slots = probe["build_slots"]
+                                self.assertEqual(slots, execd["build_slots"], case)
+                                if probe["w_eff"] >= slots:
+                                    # Nothing to reconcile: the probe already is the plan.
+                                    self.assertEqual(probe["w_eff"], execd["w_eff"], case)
+                                    self.assertEqual(
+                                        probe["memory_max_mb"], execd["memory_max_mb"], case
+                                    )
+                                    continue
+                                reprobed += 1
+                                self.assertEqual(execd["w_eff"], slots, case)
+                                again = plan(slots, True)
+                                self.assertEqual(again["w_eff"], slots, case)
+                                self.assertEqual(
+                                    again["memory_max_mb"], execd["memory_max_mb"], case
+                                )
+                                self.assertLessEqual(
+                                    execd["memory_max_mb"], probe["memory_max_mb"], case
+                                )
+                                self.assertGreaterEqual(
+                                    execd["memory_max_mb"],
+                                    probe["memory_max_mb"] * probe["w_eff"] // slots,
+                                    case,
+                                )
+        self.assertGreater(reprobed, 0)
+
     def test_oom_retry_guard_blocks_watchdog_and_timeout(self) -> None:
         common = dict(
             rc=137,

@@ -894,7 +894,17 @@ def resolve_effective_concurrency(
     exclusive: bool = False,
     is_probe: bool = False,
 ) -> tuple[int, int]:
-    """Resolves `(w_eff, build_slots)` with heterogeneous-safe host-bounded precedence."""
+    """Resolves `(w_eff, build_slots)` with heterogeneous-safe host-bounded precedence.
+
+    `build_slots` is the number of host build locks and never depends on `is_probe`.
+    `w_eff` divides the memory pool. Execution raises it to at least the host's
+    concurrency file (`w_file`); `--probe` with an explicit `--concurrency` instead
+    answers "what if" for exactly that concurrency, so it can report `w_eff <
+    build_slots` and a larger `memory_max_mb` than execution gets. A caller that wants
+    the execution plan re-probes with `--concurrency <build_slots>`
+    (`scripts/run_nightly_verification_suite.py`). `--exclusive` holds every slot and
+    resolves `w_eff = 1` in both.
+    """
     s_safe = max(1, int(s_heavy_safe))
     if cli_concurrency is not None:
         w_req = max(1, int(cli_concurrency))

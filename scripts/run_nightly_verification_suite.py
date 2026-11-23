@@ -5492,7 +5492,13 @@ def _probe_lean_run_memory_max_mib(
     `--probe`, `--print-limits`, `-h`, `--help`), will pass through without creating a
     new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1` without `--nested-ok`), or the probe fails.
     The suite process is outside that scope, so its own cgroup hierarchy cannot show
-    this cap."""
+    this cap.
+
+    When that probe reports a concurrency other than the one the wrapper executes at,
+    it is repeated at the execution concurrency. If only the repeat fails, the answer
+    is a lower bound on the execution cap derived from the first probe, never `None`:
+    callers single-thread below a threshold, so an unknown cap must not read as "no
+    cap"."""
     if not _is_lean_run_wrapped(cmd, env):
         return None
     env_map = os.environ if env is None else env
@@ -5541,8 +5547,15 @@ def _probe_lean_run_memory_max_mib(
     # there even when the wrapper runs this command in `file` mode (`lean File.lean`,
     # `lake env lean ...`), whose `MemoryMax` is capped lower. Pin the mode the wrapper
     # resolves for the real command (the last `--mode` wins).
+    def planned_cap(probed: dict[str, Any] | None) -> int | None:
+        mem_max = None if probed is None else probed.get("memory_max_mb")
+        if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
+            return mem_max
+        return None
+
     limits = run_probe([*opts, "--mode", mode, "--probe", "--json"])
-    if limits is None:
+    first_cap = planned_cap(limits)
+    if limits is None or first_cap is None:
         return None
 
     # In `anneal-lean-run`'s `resolve_effective_concurrency`, `--probe` with an explicit
@@ -5561,29 +5574,29 @@ def _probe_lean_run_memory_max_mib(
         and not isinstance(build_slots, bool)
         and 1 <= w_eff < build_slots
     ):
-        limits = run_probe(
-            [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
+        runtime_cap = planned_cap(
+            run_probe(
+                [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
+            )
         )
-        if limits is None:
-            return None
-    elif (
-        exclusive
-        and isinstance(w_eff, int)
-        and not isinstance(w_eff, bool)
-        and w_eff > 1
-    ):
+        if runtime_cap is not None:
+            return runtime_cap
+        # The re-probe failed, but the first answer is still known to be too high: the
+        # wrapper divides its pool by `w_eff`, so execution at `build_slots` gets at
+        # least `first_cap * w_eff // build_slots` and at most `first_cap`. Report that
+        # lower bound rather than `None`, which `_build_step_env` would read as "no
+        # wrapper cap" and leave the step multi-threaded on a host that looks large.
+        return max(1, first_cap * w_eff // build_slots)
+    if exclusive and isinstance(w_eff, int) and not isinstance(w_eff, bool) and w_eff > 1:
         # Older fleet wrappers ignore `--exclusive` in `--probe` when `--concurrency`
-        # is also present, whereas execution forces `w_eff = 1`.
-        limits = run_probe(
-            [*opts, "--mode", mode, "--concurrency", "1", "--probe", "--json"]
+        # is also present, whereas execution forces `w_eff = 1`. If the re-probe fails,
+        # `first_cap` (planned for `w_eff > 1`) is a lower bound on the `w_eff = 1` cap.
+        runtime_cap = planned_cap(
+            run_probe([*opts, "--mode", mode, "--concurrency", "1", "--probe", "--json"])
         )
-        if limits is None:
-            return None
+        return first_cap if runtime_cap is None else runtime_cap
 
-    mem_max = limits.get("memory_max_mb")
-    if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
-        return mem_max
-    return None
+    return first_cap
 
 
 def _build_step_env(
