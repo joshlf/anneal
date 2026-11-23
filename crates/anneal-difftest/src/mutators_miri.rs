@@ -13,7 +13,8 @@
 //! that use primitive operators, casts, projections, raw pointers, and core
 //! intrinsics rather than standard-library method calls. The mutators
 //! (`ArithmeticCastMutator`, `PlaceProjectionWrapper`, `RawPtrOffsetMutator`,
-//! `TreeBorrowsRetagInterleaver`, and `BitValidityTransmuteMutator`) produce
+//! `TreeBorrowsRetagInterleaver`, `BitValidityTransmuteMutator`,
+//! `VTableAndFnPtrMutator`, and `ClosureAndAddrEqMutator`) produce
 //! closed zero-argument mutants suitable for direct execution by both Miri and
 //! Anneal's helper-linked MIR-in-Lean oracle (`crate::miri_eval`).
 
@@ -1871,9 +1872,40 @@ fn seeded_scalar_expr(ty_str: &str, rng: &mut DetRng) -> Expr {
 
 struct MethodCallNormalizer;
 
+/// Whether `path` names `core::ptr::addr_eq` (`core::ptr::addr_eq`,
+/// `std::ptr::addr_eq`, or `ptr::addr_eq`, with or without a turbofish).
+fn is_ptr_addr_eq_path(path: &syn::Path) -> bool {
+    let segs: Vec<String> = path.segments.iter().map(|s| s.ident.to_string()).collect();
+    match segs.as_slice() {
+        [krate, module, name] => {
+            (krate == "core" || krate == "std") && module == "ptr" && name == "addr_eq"
+        }
+        [module, name] => module == "ptr" && name == "addr_eq",
+        _ => false,
+    }
+}
+
 impl VisitMut for MethodCallNormalizer {
     fn visit_expr_mut(&mut self, expr: &mut Expr) {
         syn::visit_mut::visit_expr_mut(self, expr);
+        // `core::ptr::addr_eq(p, q)` is `(p as *const ()) == (q as *const ())`.
+        // Anneal cannot instantiate the generic body for an unsized pointee
+        // (it has no layout for `[T]` or `dyn Trait`), so compare the thin
+        // data pointers directly; `as *const _` first turns a reference or a
+        // `*mut` pointer into the `*const` pointer `addr_eq` coerces it to.
+        if let Expr::Call(call) = expr
+            && call.args.len() == 2
+            && let Expr::Path(ep) = &*call.func
+            && ep.qself.is_none()
+            && is_ptr_addr_eq_path(&ep.path)
+        {
+            let lhs = &call.args[0];
+            let rhs = &call.args[1];
+            *expr = syn::parse_quote! {
+                (((#lhs) as *const _ as *const ()) == ((#rhs) as *const _ as *const ()))
+            };
+            return;
+        }
         if let Expr::MethodCall(mc) = expr {
             let method = mc.method.to_string();
             let recv = &mc.receiver;
@@ -5266,6 +5298,493 @@ impl MiriAstMutator for BitValidityTransmuteMutator {
     }
 }
 
+/// The 16-bit tag that suffixes every top-level item one indirect-call mutation
+/// pass adds to `file`: the first tag at or after `raw_tag & 0xFFFF` (wrapping)
+/// that no `__anneal_*_<tag>` item of `file` already carries, so that two passes
+/// drawing the same tag never define an item twice. Every such pass adds an
+/// `__anneal_*_driver_<tag>` function, so its tag is always found here.
+/// Consumes no PRNG draw.
+fn fresh_indirect_item_tag(file: &File, raw_tag: u64) -> u64 {
+    let names: std::collections::BTreeSet<String> = file
+        .items
+        .iter()
+        .flat_map(aux_item_namespace_keys)
+        .filter_map(|key| key.split_once(':').map(|(_, name)| name.to_string()))
+        .filter(|name| name.starts_with("__anneal_"))
+        .collect();
+    let mut tag = raw_tag & 0xFFFF;
+    for _ in 0..=0xFFFFu32 {
+        let suffix = format!("_{tag}");
+        if !names.iter().any(|name| name.ends_with(&suffix)) {
+            break;
+        }
+        tag = (tag + 1) & 0xFFFF;
+    }
+    tag
+}
+
+/// The `u32` seed argument an indirect-call mutation pass hands its driver
+/// function: the low 16 bits of the entry function's first initialized integer
+/// local, or `fallback` when it has none.
+fn indirect_seed_arg(locals: &[TrackedLocal], fallback: u32) -> Expr {
+    if let Some(int_loc) = locals.iter().find(|l| is_integer_type_name(&l.ty)) {
+        let id = format_ident!("{}", int_loc.name);
+        syn::parse_quote!((#id as u32) & 0xFFFFu32)
+    } else {
+        syn::parse_quote!(#fallback)
+    }
+}
+
+/// Insert `new_items` ahead of the entry function at `target_idx` (which stays
+/// the last zero-argument `pub fn`, so later passes still target it) and fold
+/// the result of `call_stmts` into its return path as a live probe.
+fn splice_items_and_inject_probe(
+    file: &mut File,
+    target_idx: usize,
+    new_items: Vec<Item>,
+    call_stmts: Vec<Stmt>,
+    probe_ident: &syn::Ident,
+) {
+    let entry_idx = target_idx + new_items.len();
+    file.items.splice(target_idx..target_idx, new_items);
+    if let Some(Item::Fn(func)) = file.items.get_mut(entry_idx) {
+        inject_live_probe(func, call_stmts, probe_ident);
+    }
+}
+
+/// 6. Calls a fresh private driver function that exercises function pointers
+///    and trait objects, and folds its result into the entry function:
+///    - reifying a function item into a `fn(u32) -> u32` pointer
+///      (`ReifyFnPointer`), coercing it to an `unsafe fn` pointer
+///      (`UnsafeFnPointer`), casting both to `*const ()` (`FnPtrToPtr`),
+///      coercing a `*mut u32` to a `*const u32` (`MutToConstPointer`), and
+///      calling through both pointers;
+///    - unsizing `&T` to `&dyn Trait` for two traits, dispatching a method
+///      through each vtable, and comparing the two wide pointers with
+///      `core::ptr::addr_eq` (equal data address, different vtables);
+///    - coercing a non-capturing closure to a function pointer
+///      (`ClosureFnPointer`) and calling it.
+///
+/// In `Panic` and `Ub` modes the driver uses only the function-pointer
+/// templates, and the fault is an overflowing `+` or `unchecked_add` either
+/// inside the callee reached through the pointer or in the driver after the
+/// call returns.
+///
+/// Every statement the mutator adds to the entry function is the one driver
+/// call, so later passes that perturb or reorder the entry function's
+/// statements never rewrite a template.
+///
+/// Anneal's `evalUnsizeCoercion` models only array-to-slice unsizing and
+/// `extractReifyCoercionTarget?` accepts only a closure type without type
+/// arguments, so Anneal is expected to reject the trait-object and
+/// closure-pointer templates with a (sound, conservative) false-positive UB at
+/// the coercion, before any virtual call. Those two templates are therefore
+/// drawn less often than the function-pointer template and never carry a
+/// fault.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VTableAndFnPtrMutator;
+
+impl MiriAstMutator for VTableAndFnPtrMutator {
+    fn name(&self) -> &'static str {
+        "VTableAndFnPtrMutator"
+    }
+
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        let Some(Item::Fn(func)) = file.items.get(target_idx) else {
+            return;
+        };
+        let locals = collect_initialized_locals(func);
+        for loc in &locals {
+            locals_log.push((loc.name.clone(), loc.ty.clone()));
+        }
+        let tag = fresh_indirect_item_tag(file, rng.next_u64());
+        let probe_ident = format_ident!("__miri_vt_{tag}");
+        let driver_ident = format_ident!("__anneal_vt_driver_{tag}");
+        let callee_ident = format_ident!("__anneal_fnptr_callee_{tag}");
+        let k0: u32 = [3u32, 9u32, 17u32, 33u32][rng.gen_range(4)];
+        let k1: u32 = [5u32, 12u32, 24u32, 48u32][rng.gen_range(4)];
+        let seed_arg = indirect_seed_arg(&locals, k0);
+
+        let new_items: File = match mode {
+            MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(8) {
+                // Reify, coerce to `unsafe fn`, cast both pointers to
+                // `*const ()`, and call through both, passing the second call
+                // a value read through a `*mut u32` coerced to `*const u32`.
+                0..=4 => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #callee_ident(__vt_v: u32) -> u32 {
+                        (__vt_v ^ #k0) & 0xFFFFu32
+                    }
+
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
+                        let __vt_raw_a: *const () = __vt_fp as *const ();
+                        let __vt_raw_b: *const () = __vt_ufp as *const ();
+                        let mut __vt_slot: u32 = __vt_fp(__vt_seed);
+                        let __vt_mut_ptr: *mut u32 = &raw mut __vt_slot;
+                        let __vt_const_ptr: *const u32 = __vt_mut_ptr;
+                        let __vt_second: u32 = unsafe { __vt_ufp((*__vt_const_ptr) ^ __vt_bias) };
+                        let __vt_same: u32 = if __vt_raw_a == __vt_raw_b { 1u32 } else { 0u32 };
+                        __vt_slot ^ (__vt_second << 1u32) ^ __vt_same
+                    }
+                },
+                // Unsize one receiver to two trait objects, dispatch through
+                // both vtables, and compare the wide pointers by address.
+                5 | 6 => {
+                    // No `_` before the tag: the type names stay upper camel
+                    // case, so the candidate compiles under `-D warnings`.
+                    let trait_ident = format_ident!("__AnnealVtableTrait{tag}");
+                    let alt_ident = format_ident!("__AnnealVtableAlt{tag}");
+                    let rec_ident = format_ident!("__AnnealVtableReceiver{tag}");
+                    syn::parse_quote! {
+                        trait #trait_ident {
+                            fn eval_vt(&self, x: u32) -> u32;
+                        }
+
+                        trait #alt_ident {
+                            fn eval_alt(&self) -> u32;
+                        }
+
+                        #[repr(C)]
+                        struct #rec_ident {
+                            pub bias: u32,
+                        }
+
+                        impl #trait_ident for #rec_ident {
+                            fn eval_vt(&self, x: u32) -> u32 {
+                                (x ^ self.bias) & 0xFFFFu32
+                            }
+                        }
+
+                        impl #alt_ident for #rec_ident {
+                            fn eval_alt(&self) -> u32 {
+                                self.bias >> 1u32
+                            }
+                        }
+
+                        #[inline(never)]
+                        fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                            let __vt_rec: #rec_ident = #rec_ident { bias: __vt_bias ^ #k0 };
+                            let __vt_dyn: &dyn #trait_ident = &__vt_rec as &dyn #trait_ident;
+                            let __vt_dyn_alt: &dyn #alt_ident = &__vt_rec as &dyn #alt_ident;
+                            let __vt_virtual: u32 = __vt_dyn.eval_vt(__vt_seed);
+                            let __vt_alt_bits: u32 = __vt_dyn_alt.eval_alt();
+                            let __vt_same_obj: u32 = if core::ptr::addr_eq(__vt_dyn, __vt_dyn_alt) {
+                                1u32
+                            } else {
+                                0u32
+                            };
+                            __vt_virtual ^ (__vt_alt_bits << 1u32) ^ __vt_same_obj
+                        }
+                    }
+                }
+                // Coerce a non-capturing closure to a function pointer and call
+                // it through the safe and the `unsafe fn` pointer.
+                _ => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_cfp: fn(u32) -> u32 = |__vt_z: u32| wrapping_add(__vt_z, #k0);
+                        let __vt_cufp: unsafe fn(u32) -> u32 = __vt_cfp;
+                        let __vt_raw_c: *const () = __vt_cfp as *const ();
+                        let __vt_raw_d: *const () = __vt_cufp as *const ();
+                        let __vt_first: u32 = __vt_cfp(__vt_seed);
+                        let __vt_second: u32 = unsafe { __vt_cufp(__vt_first ^ __vt_bias) };
+                        let __vt_same: u32 = if __vt_raw_c == __vt_raw_d { 1u32 } else { 0u32 };
+                        __vt_first ^ (__vt_second << 1u32) ^ __vt_same
+                    }
+                },
+            },
+            MutationMode::Panic => match rng.gen_range(2) {
+                // Overflow inside the callee, reached through the `unsafe fn`
+                // pointer, so the panic unwinds through an indirect call.
+                0 => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #callee_ident(__vt_v: u32) -> u32 {
+                        let __vt_ovf_sum: u32 = __vt_v + #k0;
+                        __vt_ovf_sum
+                    }
+
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
+                        let __vt_near_max: u32 = u32::MAX - (__vt_seed & 1u32);
+                        let __vt_trip: u32 = unsafe { __vt_ufp(__vt_near_max) };
+                        __vt_trip ^ __vt_bias
+                    }
+                },
+                // Overflow in the driver after the indirect call returns.
+                _ => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #callee_ident(__vt_v: u32) -> u32 {
+                        (__vt_v ^ #k0) & 0xFFFFu32
+                    }
+
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_pass: u32 = __vt_fp(__vt_seed ^ __vt_bias);
+                        let __vt_ovf_base: u32 = u32::MAX;
+                        let __vt_ovf_step: u32 = 1u32 + (__vt_pass & 1u32);
+                        let __vt_trip: u32 = __vt_ovf_base + __vt_ovf_step;
+                        __vt_trip
+                    }
+                },
+            },
+            MutationMode::Ub => match rng.gen_range(2) {
+                // `unchecked_add` overflow inside the callee, reached through
+                // the `unsafe fn` pointer.
+                0 => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #callee_ident(__vt_v: u32) -> u32 {
+                        let __vt_ub_sum: u32 = unsafe { unchecked_add(__vt_v, #k0) };
+                        __vt_ub_sum
+                    }
+
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_ufp: unsafe fn(u32) -> u32 = __vt_fp;
+                        let __vt_near_max: u32 = u32::MAX - (__vt_seed & 1u32);
+                        let __vt_trip: u32 = unsafe { __vt_ufp(__vt_near_max) };
+                        __vt_trip ^ __vt_bias
+                    }
+                },
+                // `unchecked_add` overflow in the driver after the indirect
+                // call returns.
+                _ => syn::parse_quote! {
+                    #[inline(never)]
+                    fn #callee_ident(__vt_v: u32) -> u32 {
+                        (__vt_v ^ #k0) & 0xFFFFu32
+                    }
+
+                    #[inline(never)]
+                    fn #driver_ident(__vt_seed: u32, __vt_bias: u32) -> u32 {
+                        let __vt_fp: fn(u32) -> u32 = #callee_ident;
+                        let __vt_pass: u32 = __vt_fp(__vt_seed ^ __vt_bias);
+                        let __vt_ub_step: u32 = 1u32 + (__vt_pass & 1u32);
+                        let __vt_trip: u32 = unsafe { unchecked_add(u32::MAX, __vt_ub_step) };
+                        __vt_trip
+                    }
+                },
+            },
+        };
+        let call_stmts: Vec<Stmt> = syn::parse_quote! {
+            let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
+        };
+        splice_items_and_inject_probe(file, target_idx, new_items.items, call_stmts, &probe_ident);
+    }
+}
+
+/// 7. Calls a fresh private driver function that exercises wide raw slice
+///    pointers and capturing closures, and folds its result into the entry
+///    function:
+///    - two `*const [u32]` pointers to one array that share a data address but
+///      carry lengths 3 and 1 (unsized from `*const [u32; 3]` and from its
+///      `*const [u32; 1]` cast), compared by address through a monomorphic
+///      `__anneal_wide_slice_addr_eq_<tag>` helper and inline, with their
+///      `size_of_val` metadata read back;
+///    - the same, next to a capturing closure that is built
+///      (`AggregateKind::Closure`) but never called, while its captured local
+///      is also borrowed directly;
+///    - a `move` closure capturing a `u32` by value, and a one-argument closure
+///      that returns its argument alongside its result;
+///    - a closure capturing a `&u32` by reference, while a `*const u32` derived
+///      from that reference is read after the call;
+///    - an `FnOnce` closure that owns a `NonCopyU32` and a `&mut u32` reborrowed
+///      from a `*mut u32`, writes through the reborrow, and whose parent
+///      pointer is read after the call.
+///
+/// Anneal's Lean semantics does not model a call of `Fn::call` or
+/// `FnOnce::call_once` on a closure, but `anneal-rustc-capture` inlines a
+/// closure passed to a function whose path ends in `::__::eval`,
+/// `::__::eval_once`, or `::__::apply_keep`. The closure templates therefore
+/// call their closures through a fresh `mod __anneal_clos_<tag> { pub mod __ }`
+/// whose `eval` takes an `Fn` closure (whose body receives `&self`) and whose
+/// `eval_once` takes the one closure that is `FnOnce` only (whose body receives
+/// `self` by value), matching what the inliner assigns to the closure body's
+/// first argument.
+///
+/// That inliner also strips every `StorageLive` and `StorageDead` from a
+/// function it inlines a closure into. All templates live in the driver
+/// function rather than the entry function, so the entry function keeps its
+/// storage markers, and no template or fault of this mutator depends on a
+/// local's storage ending.
+///
+/// The `Panic` and `Ub` faults (an out-of-bounds array index and an
+/// `unchecked_add` overflow) run in the driver after the wide-pointer or the
+/// by-value closure template, outside any closure body.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClosureAndAddrEqMutator;
+
+impl MiriAstMutator for ClosureAndAddrEqMutator {
+    fn name(&self) -> &'static str {
+        "ClosureAndAddrEqMutator"
+    }
+
+    fn mutate_with_mode(
+        &self,
+        file: &mut File,
+        rng: &mut DetRng,
+        mode: MutationMode,
+        locals_log: &mut Vec<(String, String)>,
+    ) {
+        let local_models = model_marked_names_in_file(file);
+        let Some(target_idx) = target_entry_fn_index(file, &local_models) else {
+            return;
+        };
+        let Some(Item::Fn(func)) = file.items.get(target_idx) else {
+            return;
+        };
+        let locals = collect_initialized_locals(func);
+        for loc in &locals {
+            locals_log.push((loc.name.clone(), loc.ty.clone()));
+        }
+        let tag = fresh_indirect_item_tag(file, rng.next_u64());
+        let probe_ident = format_ident!("__miri_clos_{tag}");
+        let driver_ident = format_ident!("__anneal_clos_driver_{tag}");
+        let clos_mod = format_ident!("__anneal_clos_{tag}");
+        let wide_eq_ident = format_ident!("__anneal_wide_slice_addr_eq_{tag}");
+        let k0: u32 = [7u32, 11u32, 19u32, 37u32][rng.gen_range(4)];
+        let k1: u32 = [6u32, 13u32, 26u32, 52u32][rng.gen_range(4)];
+        let seed_arg = indirect_seed_arg(&locals, k0);
+        let construct = match mode {
+            MutationMode::Pass | MutationMode::PerturbAst => rng.gen_range(5),
+            MutationMode::Panic | MutationMode::Ub => [0usize, 2usize][rng.gen_range(2)],
+        };
+
+        // Statements of the driver body; each construct binds `__clos_acc`.
+        let wide_stmts: Vec<Stmt> = syn::parse_quote! {
+            let __clos_arr: [u32; 3] = [__clos_seed, __clos_bias, #k0];
+            let __clos_full: *const [u32; 3] = &raw const __clos_arr;
+            let __clos_head: *const [u32; 1] = __clos_full as *const [u32; 1];
+            let __clos_long: *const [u32] = __clos_full;
+            let __clos_short: *const [u32] = __clos_head;
+            let __clos_long_bytes: usize = unsafe { size_of_val(__clos_long) };
+            let __clos_short_bytes: usize = unsafe { size_of_val(__clos_short) };
+            let __clos_same: u32 = if #wide_eq_ident(__clos_long, __clos_short) { 1u32 } else { 0u32 };
+            let __clos_inline_same: u32 = if (__clos_long as *const ()) == (__clos_short as *const ()) {
+                2u32
+            } else {
+                0u32
+            };
+            let __clos_wide_acc: u32 = __clos_arr[0]
+                ^ ((__clos_long_bytes as u32) << 8u32)
+                ^ ((__clos_short_bytes as u32) << 4u32)
+                ^ __clos_same
+                ^ __clos_inline_same;
+        };
+        let construct_stmts: Vec<Stmt> = match construct {
+            0 => syn::parse_quote! {
+                #(#wide_stmts)*
+                let __clos_acc: u32 = __clos_wide_acc;
+            },
+            1 => syn::parse_quote! {
+                #(#wide_stmts)*
+                let __clos_cap: u32 = __clos_wide_acc & 0xFFu32;
+                let __clos_agg = |__clos_u: u32| wrapping_add(__clos_cap, __clos_u);
+                let __clos_keep: &u32 = &__clos_cap;
+                let __clos_acc: u32 = __clos_wide_acc ^ ((*__clos_keep) << 16u32);
+            },
+            2 => syn::parse_quote! {
+                let __clos_cap: u32 = __clos_seed & 0xFFFFu32;
+                let __clos_by_val: u32 = #clos_mod::__::eval(move || wrapping_add(__clos_cap, #k0));
+                let (__clos_mixed, __clos_kept): (u32, u32) = #clos_mod::__::apply_keep(
+                    move |__clos_v: u32| (__clos_v ^ __clos_cap, __clos_v),
+                    __clos_bias,
+                );
+                let __clos_acc: u32 = __clos_by_val ^ (__clos_mixed << 1u32) ^ __clos_kept;
+            },
+            3 => syn::parse_quote! {
+                let __clos_base: u32 = __clos_seed ^ #k0;
+                let __clos_shared: &u32 = &__clos_base;
+                let __clos_raw: *const u32 = &raw const *__clos_shared;
+                let __clos_by_ref: u32 = #clos_mod::__::eval(|| (*__clos_shared) ^ __clos_bias);
+                let __clos_after: u32 = unsafe { *__clos_raw };
+                let __clos_acc: u32 = __clos_by_ref ^ (__clos_after << 1u32);
+            },
+            _ => syn::parse_quote! {
+                let mut __clos_slot: u32 = __clos_seed;
+                let __clos_root: *mut u32 = &raw mut __clos_slot;
+                let __clos_child: &mut u32 = unsafe { &mut *__clos_root };
+                let __clos_guard: NonCopyU32 = NonCopyU32(__clos_bias ^ #k0);
+                let __clos_written: u32 = #clos_mod::__::eval_once(move || {
+                    let __clos_owned: NonCopyU32 = __clos_guard;
+                    *__clos_child = (*__clos_child) ^ __clos_owned.0;
+                    *__clos_child
+                });
+                let __clos_parent: u32 = unsafe { *__clos_root };
+                let __clos_acc: u32 = __clos_written ^ (__clos_parent << 1u32);
+            },
+        };
+        let tail_stmts: Vec<Stmt> = match mode {
+            MutationMode::Pass | MutationMode::PerturbAst => syn::parse_quote! {
+                __clos_acc
+            },
+            MutationMode::Panic => syn::parse_quote! {
+                let __clos_oob_arr: [u32; 3] = [__clos_acc, __clos_bias, #k0];
+                let __clos_oob_idx: usize = 3usize + ((__clos_acc & 1u32) as usize);
+                __clos_oob_arr[__clos_oob_idx]
+            },
+            MutationMode::Ub => syn::parse_quote! {
+                let __clos_ub_step: u32 = 1u32 + (__clos_acc & 1u32);
+                unsafe { unchecked_add(u32::MAX, __clos_ub_step) }
+            },
+        };
+        let support_items: File = if construct <= 1 {
+            syn::parse_quote! {
+                #[inline(never)]
+                fn #wide_eq_ident(__clos_p: *const [u32], __clos_q: *const [u32]) -> bool {
+                    (__clos_p as *const ()) == (__clos_q as *const ())
+                }
+            }
+        } else {
+            syn::parse_quote! {
+                mod #clos_mod {
+                    pub mod __ {
+                        pub fn eval_once<T, F: FnOnce() -> T>(f: F) -> T {
+                            f()
+                        }
+
+                        pub fn eval<T, F: Fn() -> T>(f: F) -> T {
+                            f()
+                        }
+
+                        pub fn apply_keep<T, U, F: Fn(U) -> (T, U)>(f: F, v: U) -> (T, U) {
+                            f(v)
+                        }
+                    }
+                }
+            }
+        };
+        let driver_item: Item = syn::parse_quote! {
+            #[inline(never)]
+            fn #driver_ident(__clos_seed: u32, __clos_bias: u32) -> u32 {
+                #(#construct_stmts)*
+                #(#tail_stmts)*
+            }
+        };
+        let mut new_items = support_items.items;
+        new_items.push(driver_item);
+        let call_stmts: Vec<Stmt> = syn::parse_quote! {
+            let #probe_ident: u32 = #driver_ident(#seed_arg, #k1);
+        };
+        splice_items_and_inject_probe(file, target_idx, new_items, call_stmts, &probe_ident);
+    }
+}
+
 /// Generate the 89-candidate identity batch directly from
 /// `tests/miri-diff/corpus/src/lib.rs` with zero mutations applied.
 pub fn generate_miri_identity_batch() -> Vec<GeneratedMiriCandidate> {
@@ -5356,14 +5875,50 @@ pub fn collect_non_fault_seed_indices(seeds: &[&str]) -> Vec<usize> {
 }
 
 /// The Miri AST mutators, in the order in which [`generate_miri_batch`] indexes
-/// them when it draws a pass's mutator.
-pub const MIRI_AST_MUTATORS: [&dyn MiriAstMutator; 5] = [
+/// them when it draws a pass's mutator: the [`MIRI_BASE_MUTATOR_COUNT`] base
+/// mutators, then the indirect-call mutators (see
+/// [`draw_miri_mutator_index`]).
+pub const MIRI_AST_MUTATORS: [&dyn MiriAstMutator; 7] = [
     &ArithmeticCastMutator,
     &PlaceProjectionWrapper,
     &RawPtrOffsetMutator,
     &TreeBorrowsRetagInterleaver,
     &BitValidityTransmuteMutator,
+    &VTableAndFnPtrMutator,
+    &ClosureAndAddrEqMutator,
 ];
+
+/// Number of leading [`MIRI_AST_MUTATORS`] entries that a pass draws uniformly.
+const MIRI_BASE_MUTATOR_COUNT: usize = 5;
+
+/// One pass in `MIRI_INDIRECT_PASS_DENOMINATOR` runs an indirect-call mutator
+/// (a [`MIRI_AST_MUTATORS`] entry at or after [`MIRI_BASE_MUTATOR_COUNT`])
+/// instead of a base mutator.
+const MIRI_INDIRECT_PASS_DENOMINATOR: usize = 16;
+
+/// Draw the [`MIRI_AST_MUTATORS`] index of candidate `id`'s pass `pass` from a
+/// single PRNG draw.
+///
+/// The draw's remainder modulo [`MIRI_BASE_MUTATOR_COUNT`] is exactly the
+/// `gen_range(MIRI_BASE_MUTATOR_COUNT)` draw of the base schedule (the first
+/// pass's base mutator also rotates with `id`), and its quotient redirects one
+/// pass in [`MIRI_INDIRECT_PASS_DENOMINATOR`] to an indirect-call mutator. The
+/// redirect therefore consumes no extra draw, and a candidate none of whose
+/// passes is redirected keeps the PRNG stream, and so the program, that the
+/// base schedule alone would give it.
+fn draw_miri_mutator_index(cand_rng: &mut DetRng, id: usize, pass: usize) -> usize {
+    let draw = cand_rng.next_u64() as usize;
+    let base = draw % MIRI_BASE_MUTATOR_COUNT;
+    let quotient = draw / MIRI_BASE_MUTATOR_COUNT;
+    let indirect_count = MIRI_AST_MUTATORS.len() - MIRI_BASE_MUTATOR_COUNT;
+    if indirect_count > 0 && quotient % MIRI_INDIRECT_PASS_DENOMINATOR == 0 {
+        MIRI_BASE_MUTATOR_COUNT + (quotient / MIRI_INDIRECT_PASS_DENOMINATOR) % indirect_count
+    } else if pass == 0 {
+        (id + base) % MIRI_BASE_MUTATOR_COUNT
+    } else {
+        base
+    }
+}
 
 fn miri_mutator_by_name(name: &str) -> Option<&'static dyn MiriAstMutator> {
     MIRI_AST_MUTATORS.into_iter().find(|m| m.name() == name)
@@ -5871,11 +6426,7 @@ fn apply_miri_mutation_passes(
     let num_passes = 1 + cand_rng.gen_range(3);
     let mut steps = Vec::with_capacity(num_passes);
     for pass in 0..num_passes {
-        let m_idx = if pass == 0 {
-            (id + cand_rng.gen_range(MIRI_AST_MUTATORS.len())) % MIRI_AST_MUTATORS.len()
-        } else {
-            cand_rng.gen_range(MIRI_AST_MUTATORS.len())
-        };
+        let m_idx = draw_miri_mutator_index(cand_rng, id, pass);
         let pass_mode = if pass == 0 && !seed_already_faults {
             primary_mode
         } else if pass == 0 && seed_already_faults {
@@ -8944,6 +9495,422 @@ pub fn probe_freeze_cell(
                 "replay mismatch on Category 11 candidate `{}`",
                 cand.fn_name
             );
+        }
+    }
+
+    /// Closed seed with one initialized integer local for the indirect-call
+    /// mutators to feed their driver.
+    const INDIRECT_SEED: &str = "\
+pub fn indirect_seed() -> u32 {
+    let x: u32 = 10u32;
+    x ^ 1u32
+}
+";
+
+    /// `INDIRECT_SEED` after one `mode` pass of `mutator` from PRNG seed `s`.
+    fn indirect_mutant(mutator: &dyn MiriAstMutator, mode: MutationMode, s: u64) -> String {
+        let mut file = syn::parse_file(INDIRECT_SEED).unwrap();
+        let mut rng = DetRng::new(s);
+        let mut locals = Vec::new();
+        mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals);
+        assert_eq!(locals, vec![("x".to_string(), "u32".to_string())]);
+        // The entry function stays the last item and the mutation target, and
+        // every item added ahead of it is private.
+        let models = model_marked_names_in_file(&file);
+        assert_eq!(
+            target_entry_fn_index(&file, &models),
+            Some(file.items.len() - 1)
+        );
+        for item in &file.items[..file.items.len() - 1] {
+            let vis = match item {
+                Item::Fn(f) => &f.vis,
+                Item::Struct(st) => &st.vis,
+                Item::Trait(tr) => &tr.vis,
+                Item::Mod(m) => &m.vis,
+                Item::Impl(_) => continue,
+                other => panic!("unexpected item {}", other.to_token_stream()),
+            };
+            assert!(matches!(vis, syn::Visibility::Inherited));
+        }
+        prettyplease::unparse(&file)
+    }
+
+    #[test]
+    fn indirect_mutators_emit_every_template_in_every_mode_and_compile() {
+        use MutationMode::{Panic, Pass, PerturbAst, Ub};
+        // `(label, substrings the template has, substring it lacks)`.
+        type Template = (&'static str, &'static [&'static str], &'static str);
+        const VT_PASS: &[Template] = &[
+            (
+                "fn_ptr_chain",
+                &["__vt_mut_ptr", "as *const ()", "unsafe fn(u32) -> u32"],
+                "dyn",
+            ),
+            (
+                "dyn_dispatch",
+                &[
+                    "as &dyn __AnnealVtableTrait",
+                    "as &dyn __AnnealVtableAlt",
+                    "__vt_dyn.eval_vt(__vt_seed)",
+                    "core::ptr::addr_eq(__vt_dyn, __vt_dyn_alt)",
+                ],
+                "__vt_fp",
+            ),
+            (
+                "closure_fn_ptr",
+                &["__vt_cfp: fn(u32) -> u32 = |__vt_z: u32|"],
+                "dyn",
+            ),
+        ];
+        const VT_PANIC: &[Template] = &[
+            (
+                "callee_overflow",
+                &["__vt_ovf_sum: u32 = __vt_v +", "__vt_ufp(__vt_near_max)"],
+                "dyn",
+            ),
+            ("driver_overflow", &["__vt_ovf_base + __vt_ovf_step"], "dyn"),
+        ];
+        const VT_UB: &[Template] = &[
+            (
+                "callee_unchecked",
+                &["__vt_ub_sum: u32 = unsafe { unchecked_add(__vt_v,"],
+                "dyn",
+            ),
+            (
+                "driver_unchecked",
+                &["unchecked_add(u32::MAX, __vt_ub_step)"],
+                "dyn",
+            ),
+        ];
+        const CLOS_PASS: &[Template] = &[
+            (
+                "wide_slices",
+                &[
+                    "__anneal_wide_slice_addr_eq_",
+                    "__clos_full as *const [u32; 1]",
+                    "size_of_val(__clos_short)",
+                ],
+                "__clos_agg",
+            ),
+            (
+                "wide_slices_uncalled_closure",
+                &["__anneal_wide_slice_addr_eq_", "__clos_agg = |"],
+                "::__::",
+            ),
+            (
+                "by_value",
+                &["::__::eval(move ||", "::__::apply_keep("],
+                "::__::eval_once(",
+            ),
+            (
+                "by_shared_ref",
+                &[
+                    "::__::eval(||",
+                    "(*__clos_shared) ^ __clos_bias",
+                    "&raw const *__clos_shared",
+                ],
+                "move",
+            ),
+            (
+                "by_unique_ref",
+                &[
+                    "::__::eval_once(move ||",
+                    "*__clos_child = ",
+                    "&mut *__clos_root",
+                ],
+                "::__::apply_keep(",
+            ),
+        ];
+        const CLOS_PANIC: &[Template] = &[
+            (
+                "wide_slices_oob",
+                &[
+                    "__anneal_wide_slice_addr_eq_",
+                    "__clos_oob_arr[__clos_oob_idx]",
+                ],
+                "::__::",
+            ),
+            (
+                "by_value_oob",
+                &["::__::apply_keep(", "__clos_oob_arr[__clos_oob_idx]"],
+                "addr_eq",
+            ),
+        ];
+        const CLOS_UB: &[Template] = &[
+            (
+                "wide_slices_unchecked",
+                &[
+                    "__anneal_wide_slice_addr_eq_",
+                    "unchecked_add(u32::MAX, __clos_ub_step)",
+                ],
+                "::__::",
+            ),
+            (
+                "by_value_unchecked",
+                &[
+                    "::__::apply_keep(",
+                    "unchecked_add(u32::MAX, __clos_ub_step)",
+                ],
+                "addr_eq",
+            ),
+        ];
+        let vt: &dyn MiriAstMutator = &VTableAndFnPtrMutator;
+        let clos: &dyn MiriAstMutator = &ClosureAndAddrEqMutator;
+        let cases: [(&dyn MiriAstMutator, MutationMode, &[Template]); 8] = [
+            (vt, Pass, VT_PASS),
+            (vt, PerturbAst, VT_PASS),
+            (vt, Panic, VT_PANIC),
+            (vt, Ub, VT_UB),
+            (clos, Pass, CLOS_PASS),
+            (clos, PerturbAst, CLOS_PASS),
+            (clos, Panic, CLOS_PANIC),
+            (clos, Ub, CLOS_UB),
+        ];
+        let mut compiled = 0usize;
+        for (mutator, mode, templates) in cases {
+            let mut seen: BTreeMap<&str, String> = BTreeMap::new();
+            for s in 0..96u64 {
+                let fn_source = indirect_mutant(mutator, mode, s);
+                assert_eq!(
+                    fn_source,
+                    indirect_mutant(mutator, mode, s),
+                    "`{}` must be deterministic",
+                    mutator.name()
+                );
+                // The entry function gains only the driver call.
+                let entry = fn_source
+                    .split_once("pub fn indirect_seed")
+                    .expect("entry function")
+                    .1;
+                assert_eq!(
+                    entry.matches("__anneal_").count(),
+                    1,
+                    "entry function must gain exactly one driver call:\n{fn_source}"
+                );
+                let matching: Vec<&str> = templates
+                    .iter()
+                    .filter(|(_, has, lacks)| {
+                        has.iter().all(|m| fn_source.contains(m)) && !fn_source.contains(lacks)
+                    })
+                    .map(|(label, _, _)| *label)
+                    .collect();
+                assert_eq!(
+                    matching.len(),
+                    1,
+                    "`{}` {mode:?} seed {s} matches templates {matching:?}:\n{fn_source}",
+                    mutator.name()
+                );
+                seen.entry(matching[0]).or_insert(fn_source);
+            }
+            for (label, _, _) in templates {
+                let fn_source = seen.get(label).unwrap_or_else(|| {
+                    panic!(
+                        "`{}` never emitted `{label}` under {mode:?}",
+                        mutator.name()
+                    )
+                });
+                let source = build_standalone_candidate_source(fn_source);
+                assert!(
+                    crate::miri_eval::compile_rust_snippet("indirect_template", &source),
+                    "`{}` {mode:?} template `{label}` failed rustc typecheck:\n{source}",
+                    mutator.name()
+                );
+                compiled += 1;
+            }
+        }
+        assert_eq!(compiled, 2 * 3 + 2 + 2 + 2 * 5 + 2 + 2);
+    }
+
+    #[test]
+    fn indirect_mutators_stack_with_fresh_item_tags_and_base_passes_leave_drivers_intact() {
+        let vt: &dyn MiriAstMutator = &VTableAndFnPtrMutator;
+        let clos: &dyn MiriAstMutator = &ClosureAndAddrEqMutator;
+        for s in 0..8u64 {
+            let mut file = syn::parse_file(INDIRECT_SEED).unwrap();
+            let mut locals = Vec::new();
+            // Each mutator twice from one PRNG seed: both passes of a mutator
+            // draw the same raw tag, which must not define an item twice.
+            for mutator in [vt, vt, clos, clos] {
+                let mut rng = DetRng::new(s);
+                let mut probe = DetRng::new(s);
+                mutator.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+                mutator.mutate_with_mode(
+                    &mut syn::parse_file(INDIRECT_SEED).unwrap(),
+                    &mut probe,
+                    MutationMode::Pass,
+                    &mut Vec::new(),
+                );
+                assert_eq!(
+                    rng.next_u64(),
+                    probe.next_u64(),
+                    "tag disambiguation must not consume PRNG draws"
+                );
+            }
+            let mut keys = BTreeSet::new();
+            for item in &file.items {
+                for key in aux_item_namespace_keys(item) {
+                    assert!(
+                        keys.insert(key.clone()),
+                        "duplicate item `{key}` (seed {s})"
+                    );
+                }
+            }
+            let drivers_before: Vec<String> = file.items[..file.items.len() - 1]
+                .iter()
+                .map(|item| item.to_token_stream().to_string())
+                .collect();
+            assert!(drivers_before.len() >= 4);
+
+            // Later passes of every base mutator rewrite only the entry function.
+            for (i, mutator) in MIRI_AST_MUTATORS[..MIRI_BASE_MUTATOR_COUNT]
+                .iter()
+                .enumerate()
+            {
+                let mut rng = DetRng::new(s ^ ((i as u64 + 1) << 8));
+                mutator.mutate_with_mode(&mut file, &mut rng, MutationMode::Pass, &mut locals);
+            }
+            let drivers_after: Vec<String> = file.items[..file.items.len() - 1]
+                .iter()
+                .map(|item| item.to_token_stream().to_string())
+                .collect();
+            assert_eq!(drivers_before, drivers_after);
+            let source = build_standalone_candidate_source(&prettyplease::unparse(&file));
+            assert!(
+                crate::miri_eval::compile_rust_snippet("indirect_stacked", &source),
+                "stacked indirect-call candidate (seed {s}) failed rustc typecheck:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn indirect_passes_cost_no_extra_draw_and_scheduled_candidates_replay_and_compile() {
+        // 1. `draw_miri_mutator_index` consumes exactly one draw, redirects one
+        //    draw in `MIRI_INDIRECT_PASS_DENOMINATOR`, and otherwise returns the
+        //    index that `gen_range(MIRI_BASE_MUTATOR_COUNT)` gives the base
+        //    schedule from that same draw.
+        let mut redirected = [0usize; 2];
+        for s in 0..8192u64 {
+            let (id, pass) = ((s % 7) as usize, (s % 3) as usize);
+            let mut rng = DetRng::new(s);
+            let mut base_rng = rng.clone();
+            let idx = draw_miri_mutator_index(&mut rng, id, pass);
+            let base = base_rng.gen_range(MIRI_BASE_MUTATOR_COUNT);
+            assert_eq!(rng.next_u64(), base_rng.next_u64());
+            if idx >= MIRI_BASE_MUTATOR_COUNT {
+                redirected[idx - MIRI_BASE_MUTATOR_COUNT] += 1;
+            } else if pass == 0 {
+                assert_eq!(idx, (id + base) % MIRI_BASE_MUTATOR_COUNT);
+            } else {
+                assert_eq!(idx, base);
+            }
+        }
+        let expected = 8192 / MIRI_INDIRECT_PASS_DENOMINATOR / 2;
+        for count in redirected {
+            assert!(
+                (expected * 3 / 4..=expected * 5 / 4).contains(&count),
+                "indirect passes {redirected:?} are not near {expected} each"
+            );
+        }
+
+        // 2. Corpus batches schedule both indirect-call mutators; every candidate
+        //    that carries one replays byte for byte and compiles.
+        let seeds = load_miri_diff_corpus_seeds();
+        let seed_refs: Vec<&str> = seeds.iter().map(|sd| sd.fn_source.as_str()).collect();
+        let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+        for (count, batch_seed) in [
+            (20usize, 0xCAFE_BABE_1234_5678u64),
+            (20, 0xDEAD_BEEF_0000_0001),
+            (40, 0xE1A0_2026),
+        ] {
+            for cand in generate_miri_corpus_batch(count, batch_seed, 0) {
+                let indirect: Vec<&String> = cand
+                    .applied_mutators
+                    .iter()
+                    .filter(|m| {
+                        MIRI_AST_MUTATORS[MIRI_BASE_MUTATOR_COUNT..]
+                            .iter()
+                            .any(|ind| ind.name() == m.as_str())
+                    })
+                    .collect();
+                if indirect.is_empty() {
+                    continue;
+                }
+                for name in indirect {
+                    *seen.entry(name.clone()).or_insert(0) += 1;
+                }
+                let (base, steps) = reconstruct_miri_mutation_steps(&cand, &seed_refs)
+                    .expect("reconstruct indirect-call candidate passes");
+                assert!(
+                    miri_candidate_replay_is_faithful(&cand, &base, &steps),
+                    "replay mismatch on `{}`",
+                    cand.fn_name
+                );
+                assert!(
+                    crate::miri_eval::compile_rust_snippet("indirect_scheduled", &cand.source),
+                    "`{}` ({:?}) failed rustc typecheck:\n{}",
+                    cand.fn_name,
+                    cand.applied_mutators,
+                    cand.source
+                );
+            }
+        }
+        assert!(
+            seen.get("VTableAndFnPtrMutator").is_some_and(|&n| n >= 2)
+                && seen.get("ClosureAndAddrEqMutator").is_some_and(|&n| n >= 2),
+            "corpus batches must schedule both indirect-call mutators: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn closing_a_seed_rewrites_ptr_addr_eq_into_a_thin_pointer_comparison() {
+        let seed = "\
+use core::ptr;
+pub fn addr_eq_seed(flag: bool) -> u32 {
+    let arr: [u32; 3] = [1u32, 2u32, 3u32];
+    let whole: *const [u32] = &raw const arr;
+    let first: &u32 = &arr[0];
+    let same: bool = core::ptr::addr_eq(whole, first);
+    let other: bool = ptr::addr_eq::<u32, u32>(&arr[1], first) || flag;
+    let third: bool = ::std::ptr::addr_eq(&raw const arr[2], whole);
+    (same as u32) ^ ((other as u32) << 1u32) ^ ((third as u32) << 2u32)
+}
+";
+        let batch = generate_miri_batch(&[seed], 3, 0xADD2_E900);
+        assert_eq!(batch.len(), 3);
+        for cand in &batch {
+            // The entry function alone: a mutation pass may add a driver that
+            // calls `core::ptr::addr_eq` on purpose.
+            let entry = cand
+                .fn_source
+                .split_once(&format!("pub fn {}", cand.fn_name))
+                .expect("entry function")
+                .1;
+            assert!(
+                !entry.contains("addr_eq("),
+                "closed seed still calls `addr_eq`:\n{entry}"
+            );
+            assert_eq!(
+                entry.matches("as *const _ as *const ()").count(),
+                6,
+                "{entry}"
+            );
+            assert!(
+                crate::miri_eval::compile_rust_snippet("addr_eq_closed", &cand.source),
+                "closed `addr_eq` candidate failed rustc typecheck:\n{}",
+                cand.source
+            );
+        }
+        // Only `ptr::addr_eq` paths are rewritten.
+        for (path, expected) in [
+            ("core::ptr::addr_eq", true),
+            ("std::ptr::addr_eq", true),
+            ("ptr::addr_eq", true),
+            ("addr_eq", false),
+            ("core::ptr::eq", false),
+            ("my::ptr::addr_eq", false),
+        ] {
+            let parsed: syn::Path = syn::parse_str(path).unwrap();
+            assert_eq!(is_ptr_addr_eq_path(&parsed), expected, "{path}");
         }
     }
 }

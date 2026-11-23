@@ -3023,15 +3023,18 @@ QUARANTINE_METADATA_KEYS: tuple[str, ...] = (
 MIRI_MUTATOR_NAMES: tuple[str, ...] = (
     "ArithmeticCastMutator",
     "BitValidityTransmuteMutator",
+    "ClosureAndAddrEqMutator",
     "PlaceProjectionWrapper",
     "RawPtrOffsetMutator",
     "TreeBorrowsRetagInterleaver",
+    "VTableAndFnPtrMutator",
 )
 
 ITREE_MUTATOR_NAMES: tuple[str, ...] = (
     "BranchLoopWeaver",
     "CallBoundaryOutliner",
     "ExtOracleInjector",
+    "IndirectDispatchOutliner",
     "LayoutPaddingPerturber",
 )
 
@@ -3968,6 +3971,24 @@ PLACE_PROJECTION_MUTATOR_TOKENS = (
     "__oob_arr",
     "__oob_idx",
 )
+# `VTableAndFnPtrMutator` and `ClosureAndAddrEqMutator` add one driver call to the
+# candidate function and put everything else in private items ahead of it (a driver
+# `fn`, and the callee, traits, receiver struct, `mod`, or address-comparison helper
+# it uses), every local of which carries the mutator's prefix. A fault inside one of
+# those items is therefore attributed by the tokens on its own line.
+VTABLE_FNPTR_MUTATOR_TOKENS = (
+    "__miri_vt_",
+    "__anneal_vt_",
+    "__anneal_fnptr_",
+    "__AnnealVtable",
+    "__vt_",
+)
+CLOSURE_ADDR_EQ_MUTATOR_TOKENS = (
+    "__miri_clos_",
+    "__anneal_clos_",
+    "__anneal_wide_",
+    "__clos_",
+)
 
 ALL_MIRI_MUTATOR_TOKENS = (
     *RAW_PTR_OFFSET_MUTATOR_TOKENS,
@@ -3975,6 +3996,8 @@ ALL_MIRI_MUTATOR_TOKENS = (
     *BIT_VALIDITY_MUTATOR_TOKENS,
     *ARITHMETIC_CAST_MUTATOR_TOKENS,
     *PLACE_PROJECTION_MUTATOR_TOKENS,
+    *VTABLE_FNPTR_MUTATOR_TOKENS,
+    *CLOSURE_ADDR_EQ_MUTATOR_TOKENS,
 )
 
 def _is_src_lib_or_repro_file(file_str: str) -> bool:
@@ -4109,13 +4132,21 @@ def _mutator_for_fault_line(fault_text: str) -> str | None:
         ("__miri_valid_", "BitValidityTransmuteMutator"),
         ("__miri_arith_", "ArithmeticCastMutator"),
         ("__miri_proj_", "PlaceProjectionWrapper"),
+        ("__miri_vt_", "VTableAndFnPtrMutator"),
+        ("__miri_clos_", "ClosureAndAddrEqMutator"),
     ):
         if probe_prefix in fault_text:
             return mutator_name
     # Check `PlaceProjectionWrapper` (`__oob_arr` / `__oob_idx`) before
     # `RawPtrOffsetMutator`'s `__oob_` prefix, and `TreeBorrowsRetagInterleaver`
     # (`__ub_nc` / `__ub_prot_`) before `ArithmeticCastMutator`'s `__ub_` prefix.
+    # `VTableAndFnPtrMutator` (`__vt_*`) and `ClosureAndAddrEqMutator` (`__clos_*`)
+    # prefix every identifier, so check them before the mutators whose shorter
+    # tokens (`__ub_`, `__ovf_`, `__oob_`) name fault operands that the two reuse
+    # as suffixes (`__vt_ub_step`, `__clos_oob_idx`).
     for mutator_name, tokens in (
+        ("VTableAndFnPtrMutator", VTABLE_FNPTR_MUTATOR_TOKENS),
+        ("ClosureAndAddrEqMutator", CLOSURE_ADDR_EQ_MUTATOR_TOKENS),
         ("PlaceProjectionWrapper", PLACE_PROJECTION_MUTATOR_TOKENS),
         ("RawPtrOffsetMutator", RAW_PTR_OFFSET_MUTATOR_TOKENS),
         ("TreeBorrowsRetagInterleaver", TREE_BORROWS_MUTATOR_TOKENS),
