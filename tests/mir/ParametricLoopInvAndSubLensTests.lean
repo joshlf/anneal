@@ -422,6 +422,89 @@ theorem canary1a_countDown_coalWp_refines_dwp_dwlp (n : Nat) (hLt : n < 2 ^ 32) 
     dwp_of_coalWpStateOk hCoal,
     dwlp_of_coalWlpOutcome (wlpOutcome_of_wpOutcome (ops := mirCoalWpOps countDownMirBody) hCoal)⟩
 
+private theorem step_cfg_step {body : CapturedMir}
+    {cur : Option (Nat × Nat × List Statement × Terminator)} {s : MachineState}
+    {stop : Anneal.PureMirExec.CfgExecState → Prop} {post : MirOutcome → Prop}
+    (hNext : wpUntilOk (ops := mirCfgWpOps body) stop post
+      (Anneal.PureMirExec.stepCfgState body (.running true cur s))) :
+    wpUntilOk (ops := mirCfgWpOps body) stop post (.running true cur s) :=
+  wpUntil_step (ops := mirCfgWpOps body) hNext
+
+/-- **Canary 1A (Cursor-Cached `stepCfgState` / `mirCfgWpOps` Fuel-Free Loop,
+`∀ n < 2^32`)**:
+Proves `countDownMirBody` directly over `V2026Bridge.mirCfgWpOps`
+(`Anneal.PureMirExec.stepCfgState` + `wpLoop_countdown`) and transports the
+result into BOTH `MirNoCallWpConverges` and `MirWpConverges` via
+`mirNoCallWpConverges_of_cfgWpStateOk` / `mirWpConverges_of_cfgWpStateOk`. -/
+theorem canary1a_countDown_cfgWpStateOk_and_mirWpConverges (n : Nat) (hLt : n < 2 ^ 32) :
+    let post : MirOutcome → Prop :=
+      mirNormalPost (fun ret mem' => ret = .scalar ⟨n, 4⟩ ∧ mem' = {})
+    let s0 := initMachineState countDownMirBody [.scalar ⟨n, 4⟩]
+    wpStateOk (ops := mirCfgWpOps countDownMirBody) post (.running true none s0) ∧
+    MirNoCallWpConverges countDownMirBody s0 post ∧
+    MirWpConverges countDownMirBody s0 post := by
+  intro post s0
+  let Inv : Nat → Anneal.PureMirExec.CfgExecState → Prop := fun rem c =>
+    ∃ acc, rem + acc = n ∧
+      c = .running true none (countDownState 1 0 .uninit (.init (.scalar ⟨n, 4⟩))
+        (.init (.scalar ⟨rem, 4⟩)) (.init (.scalar ⟨acc, 4⟩)) .dead)
+  let exitP : Anneal.PureMirExec.CfgExecState → Prop := fun c =>
+    c = .running true none (countDownState 1 0 .uninit (.init (.scalar ⟨n, 4⟩))
+      (.init (.scalar ⟨0, 4⟩)) (.init (.scalar ⟨n, 4⟩)) .dead)
+  have hLoop : wpUntilOk (ops := mirCfgWpOps countDownMirBody) exitP post
+      (.running true none (countDownState 1 0 .uninit (.init (.scalar ⟨n, 4⟩))
+        (.init (.scalar ⟨n, 4⟩)) (.init (.scalar ⟨0, 4⟩)) .dead)) :=
+    wpLoop_countdown (ops := mirCfgWpOps countDownMirBody) (Inv := Inv) (exit := exitP)
+      (onDone := post) (onFault := fun _ => False)
+      (fun _ ⟨acc, hSum, hEq⟩ => by
+        have hAcc : acc = n := by omega
+        subst hAcc
+        exact hEq)
+      (fun rem _ ⟨acc, hSum, hEq⟩ => by
+        subst hEq
+        apply step_cfg_step
+        apply step_cfg_step
+        apply step_cfg_step
+        apply step_cfg_step
+        apply step_cfg_step
+        apply step_cfg_step
+        apply step_cfg_step
+        change wpUntilOk (ops := mirCfgWpOps countDownMirBody)
+          (fun s' => Inv rem s' ∨ exitP s') post
+          (.running true none (countDownState 1 0 .uninit (.init (.scalar ⟨n, 4⟩))
+            (.init (.scalar ⟨wrapScalarBits rem (scalarModulus 4), 4⟩))
+            (.init (.scalar ⟨wrapScalarBits (acc + 1) (scalarModulus 4), 4⟩)) .dead))
+        rw [wrapU32_of_lt (by omega), wrapU32_of_lt (by omega)]
+        exact wpUntil_here (ops := mirCfgWpOps countDownMirBody)
+          (Or.inl ⟨acc + 1, by omega, rfl⟩))
+      n _ ⟨0, by omega, rfl⟩
+  have hFromHeader : wpStateOk (ops := mirCfgWpOps countDownMirBody) post
+      (.running true none (countDownState 1 0 .uninit (.init (.scalar ⟨n, 4⟩))
+        (.init (.scalar ⟨n, 4⟩)) (.init (.scalar ⟨0, 4⟩)) .dead)) :=
+    wpUntil_bind (ops := mirCfgWpOps countDownMirBody) hLoop fun _ hEq => by
+      subst hEq
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      apply step_cfg_step
+      exact wpUntil_step (ops := mirCfgWpOps countDownMirBody) ⟨rfl, rfl⟩
+  have hCfgOk : wpStateOk (ops := mirCfgWpOps countDownMirBody) post (.running true none s0) := by
+    apply step_cfg_step
+    apply step_cfg_step
+    apply step_cfg_step
+    apply step_cfg_step
+    apply step_cfg_step
+    exact hFromHeader
+  have hValid : Anneal.PureMirExec.CfgValid countDownMirBody (.running true none s0) (.running s0) :=
+    ⟨rfl, trivial⟩
+  exact ⟨hCfgOk,
+    mirNoCallWpConverges_of_cfgWpStateOk rfl hValid hCfgOk,
+    mirWpConverges_of_cfgWpStateOk rfl hValid hCfgOk⟩
+
 /-! ### 1B. Fuel-Free Symbolic Early-Return Loop (`wpLoop_early_return_rank`) -/
 
 /-- Real multi-block `V2026_06_01` `CapturedMir` with genuine mid-loop early return:
@@ -782,6 +865,43 @@ theorem canary1c_countUp_mirWpConverges (n : Nat) (hLt : n < 2 ^ 32) :
       | panic | abort => exact False.elim hOut
       | normal p => exact hOut.1)
     (mirWpConverges_of_wpStateOk (canary1c_countUp_wpStateOk n hLt))
+
+def countUpClaim : Claim where
+  body := countUpMirBody
+  callees := []
+  pre args := ∃ n : Nat, n < 2 ^ 32 ∧ args = [.scalar ⟨n, 4⟩]
+  post args ret := ∃ n : Nat, args = [.scalar ⟨n, 4⟩] ∧ ret = .scalar ⟨n, 4⟩
+
+/-- **Trusted `VerificationResult` for symbolic upward-counting `countUpMirBody` (`∀ n < 2^32`)**. -/
+theorem canary1c_countUp_verificationResult : VerificationResult countUpClaim :=
+  verifyMirNoPanic_of_wpStateOk countUpClaim fun args ⟨n, hLt, hArgs⟩ => by
+    subst hArgs
+    refine wpOutcome_mono (ops := mirDetWpOps countUpMirBody) ?_ (fun _ h => h)
+      (canary1c_countUp_wpStateOk n hLt)
+    intro out hOut
+    cases out with
+    | panic | abort => exact False.elim hOut
+    | normal p => exact ⟨n, rfl, hOut.1⟩
+
+def countUpTotalClaim : TotalClaim where
+  body := countUpMirBody
+  callees := []
+  pre args mem := mem = {} ∧ ∃ n : Nat, n < 2 ^ 32 ∧ args = [.scalar ⟨n, 4⟩]
+  post args mem ret mem' :=
+    mem' = mem ∧ ∃ n : Nat, args = [.scalar ⟨n, 4⟩] ∧ ret = .scalar ⟨n, 4⟩
+
+/-- **Trusted `TotalVerificationResult` for symbolic upward-counting
+`countUpMirBody` (`∀ n < 2^32`)**. -/
+theorem canary1c_countUp_totalVerificationResult :
+    TotalVerificationResult countUpTotalClaim :=
+  verifyTotalMir_of_wpStateOk countUpTotalClaim fun args mem ⟨hMem, n, hLt, hArgs⟩ => by
+    subst hMem hArgs
+    refine wpOutcome_mono (ops := mirDetWpOps countUpMirBody) ?_ (fun _ h => h)
+      (canary1c_countUp_wpStateOk n hLt)
+    intro out hOut
+    cases out with
+    | panic | abort => exact False.elim hOut
+    | normal p => exact ⟨hOut.2, n, rfl, hOut.1⟩
 
 /-! ### 1D. Fuel-Free Symbolic `countDown` with Debug-Mode Checked Arithmetic
 
@@ -1616,6 +1736,86 @@ theorem canary2_diamond_wrap_overflow_instance (z : Nat) :
       (mirNormalPost (fun ret _ =>
         ret = .aggregate 0 [.scalar ⟨21, 4⟩, .scalar ⟨z, 4⟩])) :=
   canary2_diamond_mirWpConverges_wrap false false (2 ^ 32 - 1) z
+
+/-- **Canary 2W (Coalgebraic `StageCut` + Full Memory Preservation, ALL Inputs)**:
+Lifts the framed 2-stage composition into `mirNoCallCoalWpOps` via
+`V2026Bridge.coalStageCut_of_detStageCut` and discharges `MirWpConverges`
+(with exact wrapping return value AND `mem' = {}`) via
+`V2026Bridge.mirWpConverges_of_coalStageCut` for ALL `(c1 c2 : Bool)` and ALL
+`(x z : Nat)`. -/
+theorem canary2_diamond_wrap_coalStageCut (c1 c2 : Bool) (x z : Nat) :
+    MirWpConverges diamond2StageMirBody
+      (initMachineState diamond2StageMirBody
+        [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩])
+      (mirNormalPost (fun ret mem' =>
+        ret = .aggregate 0
+          [.scalar ⟨(x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32, 4⟩, .scalar ⟨z, 4⟩] ∧
+        mem' = {})) := by
+  let zSlot : LocalSlot := .init (.scalar ⟨z, 4⟩)
+  let acc1 := wrapU32 (x + stage1Delta c1)
+  let acc2 := wrapU32 (acc1 + stage2Delta c2)
+  have hAcc2 : acc2 = (x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32 := by
+    simp only [acc2, acc1, Scalars.wrapScalarBits_eq_mod_modulus,
+      Scalars.scalarModulus_eq_two_pow]
+    omega
+  have hStage1Framed :=
+    stageCut_frame (ops := mirDetWpOps diamond2StageMirBody) (diamond_stage1_stepFrame zSlot)
+      (canary2_stage1_within_wrap c1 x (.init (boolScalar c2)))
+  have hStage2Framed :=
+    stageCut_frame (ops := mirDetWpOps diamond2StageMirBody) (diamond_stage2_stepFrame zSlot)
+      (canary2_stage2_within_wrap c2 acc1 (.init (boolScalar c1)) (.init (.scalar ⟨x, 4⟩)))
+  let post : MirOutcome → Prop :=
+    mirNormalPost (fun ret mem' =>
+      ret = .aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩] ∧ mem' = {})
+  have hComposedDet :=
+    stageCut_weaken (ops := mirDetWpOps diamond2StageMirBody) (onDone' := post)
+      (fun _ h => h) (fun _ h => h)
+      (fun _ hF => False.elim hF) (fun _ h => h)
+      (stageCut_compose (ops := mirDetWpOps diamond2StageMirBody) hStage1Framed hStage2Framed)
+  have hComposedCoal := coalStageCut_of_detStageCut hComposedDet
+  rw [← hAcc2]
+  refine mirWpConverges_of_coalStageCut hComposedCoal ?_ ⟨⟨zSlot, rfl⟩, rfl, rfl⟩
+  intro s ⟨⟨l4, hEq⟩, hLoc4, _⟩
+  subst hEq
+  change some l4 = some zSlot at hLoc4
+  injection hLoc4 with hL4
+  subst hL4
+  refine mirWpConverges_of_wpStateOk ?_
+  exact
+    step_det_to (diamondState 6 1
+      (.init (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩]))
+      (.init (boolScalar c1)) (.init (boolScalar c2)) (.init (.scalar ⟨x, 4⟩))
+      zSlot (.init (.scalar ⟨acc2, 4⟩))) rfl <|
+    step_det_to (diamondState 6 2
+      (.init (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩]))
+      (.init (boolScalar c1)) (.init (boolScalar c2)) (.init (.scalar ⟨x, 4⟩))
+      zSlot .dead) rfl <|
+    step_det_done (.normal (.aggregate 0 [.scalar ⟨acc2, 4⟩, .scalar ⟨z, 4⟩], {})) rfl ⟨rfl, rfl⟩
+
+def diamond2StageWrapTotalClaim : TotalClaim where
+  body := diamond2StageMirBody
+  callees := []
+  pre args mem := mem = {} ∧ ∃ (c1 c2 : Bool) (x z : Nat),
+    args = [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩]
+  post args mem ret mem' := mem' = mem ∧ ∃ (c1 c2 : Bool) (x z : Nat),
+    args = [boolScalar c1, boolScalar c2, .scalar ⟨x, 4⟩, .scalar ⟨z, 4⟩] ∧
+    ret = .aggregate 0
+      [.scalar ⟨(x + stage1Delta c1 + stage2Delta c2) % 2 ^ 32, 4⟩, .scalar ⟨z, 4⟩]
+
+/-- **Trusted `TotalVerificationResult` for `diamond2StageMirBody` over ALL inputs**
+(termination + exact wrapping return + memory preservation, discharged from the
+coalgebraic `StageCut` certificate `canary2_diamond_wrap_coalStageCut`). -/
+theorem canary2_diamond_wrap_totalVerificationResult :
+    TotalVerificationResult diamond2StageWrapTotalClaim :=
+  verifyTotalMir_of_wpConverges diamond2StageWrapTotalClaim
+    fun args mem ⟨hMem, c1, c2, x, z, hArgs⟩ => by
+      subst hMem hArgs
+      exact MirWpConverges.mono
+        (fun out hOut => by
+          cases out with
+          | panic | abort => exact False.elim hOut
+          | normal p => exact ⟨hOut.2, c1, c2, x, z, rfl, hOut.1⟩)
+        (canary2_diamond_wrap_coalStageCut c1 c2 x z)
 
 /-- **Canary 2 (`PureLift` `StepPath` & `mirOperationalAdapter` bridge)**:
 Composes the opaque `StepStageCut`s for Stage 1 and Stage 2 via `StepStageCut.trans`
@@ -5666,7 +5866,6 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary3a_byteMem_provenance_and_s
 
 /-! ### Pass B4 guards: all-input wrapping Canary 2W. -/
 
-
 /--
 info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_stage1_within_wrap' depends on axioms: [propext]
 -/
@@ -5699,5 +5898,45 @@ info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_wrap_overflow_ins
 -/
 #guard_msgs in
 #print axioms canary2_diamond_wrap_overflow_instance
+
+/-! ### Pass A4 guards: `mirCfgWpOps` (`stepCfgState`), Canary 1C
+`VerificationResult`/`TotalVerificationResult`, and Canary 2W coalgebraic
+`StageCut` + all-input `TotalVerificationResult`. -/
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1a_countDown_cfgWpStateOk_and_mirWpConverges' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1a_countDown_cfgWpStateOk_and_mirWpConverges
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1c_countUp_verificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1c_countUp_verificationResult
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary1c_countUp_totalVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary1c_countUp_totalVerificationResult
+
+/-- info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_wrap_coalStageCut' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs in
+#print axioms canary2_diamond_wrap_coalStageCut
+
+/--
+info: 'Anneal.ParametricLoopInvAndSubLensTests.canary2_diamond_wrap_totalVerificationResult' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in
+#print axioms canary2_diamond_wrap_totalVerificationResult
 
 end Anneal.ParametricLoopInvAndSubLensTests

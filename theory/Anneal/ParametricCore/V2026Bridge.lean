@@ -1249,6 +1249,16 @@ theorem mirWpConverges_of_coalStageCut {body : CapturedMir}
     (mirStepsConverges_of_noCallCoalWpUntilOk
       (StageCut.elim (ops := mirNoCallCoalWpOps body) hCut hEntry)) hCont
 
+/-- Lift any fault-free `StageCut` on deterministic `mirDetWpOps body` into
+call-free coalgebraic `mirNoCallCoalWpOps body` via `MirWpOps.Refines`. -/
+theorem coalStageCut_of_detStageCut {body : CapturedMir}
+    {entry cut : MachineState → Prop} {post : MirOutcome → Prop}
+    (hCut : StageCut (ops := mirDetWpOps body) entry cut post (fun _ => False)) :
+    StageCut (ops := mirNoCallCoalWpOps body) entry cut post (fun _ => False) :=
+  StageCut.intro (ops := mirNoCallCoalWpOps body) fun _ hEntry =>
+    wpUntil_of_refines (mirStrictDetWpOps_refines_mirNoCallCoalWpOps body)
+      (wpUntilOk_mirDet_iff_strictDet.mp (StageCut.elim (ops := mirDetWpOps body) hCut hEntry))
+
 /-- **Step-counted `StepStageCut` → `PureLift.MirLiftCoreInterop.StepPath`**:
 transports a sealed `StepStageCut` into an exact-length `StepPath` over
 `PureMirExec.mirStep body` via `StepStageCut.induction`, without unsealing. -/
