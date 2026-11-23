@@ -309,6 +309,8 @@ inductive AuditFailure where
   | invalidNativeAxiomType (rootName axName : SymName)
   | testModuleForeignAxiom (modName rootName axName axOrigin : SymName)
   | reservedOriginMissingSibling (modName ciName claimedOrigin : SymName)
+  | stdlibNamedPackageModule (modName : SymName)
+  | foreignImport (modName importedMod : SymName)
   deriving DecidableEq, Repr
 
 namespace ExprSkeleton
@@ -967,9 +969,37 @@ def nativeTokens : List (List Char) := [
   "Lean.reduceNat".toList, "reduceNat".toList
 ]
 
+/-- Split a token into its dot-separated segments (`a.b.c` ↦ `[a, b, c]`). -/
+def dotSegments (tok : List Char) : List (List Char) :=
+  let folded := tok.foldl
+    (fun (acc : List Char × List (List Char)) c =>
+      if c == '.' then ([], acc.1.reverse :: acc.2) else (c :: acc.1, acc.2))
+    (([] : List Char), ([] : List (List Char)))
+  (folded.1.reverse :: folded.2).reverse
+
+/--
+True iff the segment `seg` denotes keyword `kw` to the Lean lexer: either it IS `kw`, or it starts
+with a digit and ends with `kw`. Lean 4.34.1 `decimalNumberFn` / `hexNumberFn`
+(`Lean/Parser/Basic.lean` lines 831–843, 900–914) end a numeric literal at the first non-digit
+without requiring a separator, so `iterate 1native_decide` lexes as `iterate`, `1`,
+`native_decide` although the scanner sees the single run `1native_decide`.
+-/
+def segmentIsKeyword (kw seg : List Char) : Bool :=
+  seg == kw ||
+  (match seg with
+   | c :: _ => isAsciiDigitNat c.toNat && SymName.charListStartsWith kw.reverse seg.reverse
+   | [] => false)
+
+/--
+True iff ANY dot-separated segment of `tok` denotes `kw` (so `_root_.Lean.ofReduceBool`, a
+trailing-dot `native_decide.`, and a number-glued `1native_decide` are all matched).
+-/
+def tokenHasKeyword (kw tok : List Char) : Bool :=
+  (dotSegments tok).any (segmentIsKeyword kw)
+
 /-- True iff `toks` directly references a deprecated in-kernel reduction or compiler-trust symbol. -/
 def hasAlwaysForbiddenNativeChars (toks : List (List Char)) : Bool :=
-  toks.any fun t => alwaysForbiddenNativeLeafTokens.contains (lastDotSegment t)
+  toks.any fun t => alwaysForbiddenNativeLeafTokens.any fun kw => tokenHasKeyword kw t
 
 /--
 Scan stripped tokens for native evaluation: any `alwaysForbiddenNativeLeafTokens` suffix, any
@@ -980,12 +1010,10 @@ in the file (`decide +native`, `decide+native`, a `native := true` field arbitra
 def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
   hasAlwaysForbiddenNativeChars toks ||
   toks.any (fun t =>
-    let leaf := lastDotSegment t
-    leaf == "native_decide".toList || leaf == "bv_decide".toList) ||
+    tokenHasKeyword "native_decide".toList t || tokenHasKeyword "bv_decide".toList t) ||
   (toks.any (fun t =>
-      let leaf := lastDotSegment t
-      leaf == "decide".toList || leaf == "decide!".toList) &&
-    toks.any (fun t => lastDotSegment t == "native".toList))
+      tokenHasKeyword "decide".toList t || tokenHasKeyword "decide!".toList t) &&
+    toks.any (fun t => tokenHasKeyword "native".toList t))
 
 /-- Scan stripped source tokens for native evaluation (see `hasNativeDecideTokensChars`). -/
 def hasNativeDecideTokens (toks : List String) : Bool :=
@@ -5490,6 +5518,22 @@ def naiveInsertByCiNameAudit (pkg : PackageAuditInput) (kernelFuel : Nat := 64) 
   replayCleanEnv baseEnv kernelFuel false (replayLocals.map Prod.snd)
 
 /--
+Operational model of `TrustedBoundary.verifyAudit` lines 563–592 and 732–734: a module is
+classified as foundation purely by NAME (`isStdlibMod`: `Init`, `Init.*`, `Std`, `Std.*`), pushed to
+`baseMods`, and its constants become the replay base WITHOUT inventory, closure, or kernel checks.
+Lean resolves a module through the first search-path root that contains its top-level directory,
+and `initSearchPath sysroot searchDirs` puts the workspace `searchDirs` BEFORE the sysroot, so a
+workspace that ships its own `Std/` (or `Init/`) tree supplies those "foundation" `.olean` files.
+-/
+def naiveStdlibNameTrustAudit (pkg : PackageAuditInput) (kernelFuel : Nat := 64) :
+    Except AuditFailure KernelEnv :=
+  let trustedByName := pkg.modules.filter fun inv => SymName.isStdlibModule inv.moduleName
+  let audited := pkg.modules.filter fun inv => !SymName.isStdlibModule inv.moduleName
+  replayCleanEnv
+    (KernelEnv.finalizeImportedEnv trustedByName ++ mkBaseKernelEnv pkg.baseEnv)
+    kernelFuel false (audited.flatMap ModuleInventory.constants)
+
+/--
 Naive pre-`lowmem_lean` (`cl/1027843093`) validator that falsely rejects valid multi-element
 mutual `.all` blocks on `thmDecl` and `opaqueDecl`.
 -/
@@ -5591,6 +5635,11 @@ Validate module role against canonical naming rules (`V15`: reject `Topic.Proofs
 reject every role label that the module name does not justify).
 -/
 def validateModuleRole (inv : ModuleInventory) : Except AuditFailure Unit := do
+  -- The standard library is the pinned base (`pkg.baseEnv`), never an audited artifact: a package
+  -- module NAMED `Init.*` / `Std.*` would inherit foundation privileges purely from its name
+  -- (`TrustedBoundary.isStdlibMod`), so it is rejected outright (`stdlibName_baseTrust_bypass`).
+  if SymName.isStdlibModule inv.moduleName then
+    throw (.stdlibNamedPackageModule inv.moduleName)
   if inv.role == .defsExempt && !SymName.isStrictExemptModuleName inv.moduleName then
     throw (.spoofedExemptModule inv.moduleName)
   if !roleMatchesModuleName inv.role inv.moduleName then
@@ -5731,8 +5780,12 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     | .commandElabEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "command_elab" d)
     | .localCommandElabEntry d _ persistedGlobal =>
+      -- An entry that is PRESENT in a persisted extension table is persisted, whatever its
+      -- `persistedGlobal` flag claims: a genuinely local `elab` leaves no entry at all.
       if persistedGlobal then
         throw (.forbiddenMacroOrElab inv.moduleName "local_command_elab_global" d)
+      else
+        throw (.forbiddenMacroOrElab inv.moduleName "local_command_elab" d)
     | .scopedElabEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "scoped_elab" d)
     | .scopedMacroEntry d _ =>
@@ -5746,8 +5799,10 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
       throw (.forbiddenMacroOrElab inv.moduleName "delab" d)
     | .appUnexpanderEntry d _ =>
       throw (.forbiddenMacroOrElab inv.moduleName "app_unexpander" d)
-    | .instanceEntry d _ targetOrigin _ =>
-      if targetOrigin != inv.moduleName then
+    | .instanceEntry d target targetOrigin _ =>
+      -- `targetOrigin` is extension-table data: the target must ACTUALLY be declared by this
+      -- module's inventory, not merely be claimed to originate here.
+      if targetOrigin != inv.moduleName || !inv.constNames.contains target then
         throw (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
     | .defaultInstanceEntry d _ =>
       if !isDefs then
@@ -5756,7 +5811,7 @@ def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
       if !isDefs then
         throw (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
     | .reducibilityOverride target targetOrigin _ =>
-      if targetOrigin != inv.moduleName then
+      if targetOrigin != inv.moduleName || !inv.constNames.contains target then
         throw (.forbiddenReducibilityOverride inv.moduleName target)
     | .exportAlias aliasName target _ =>
       throw (.forbiddenShadowingOrExport inv.moduleName aliasName target)
@@ -5810,6 +5865,12 @@ def validateImports (pkg : PackageAuditInput) : Except AuditFailure Unit := do
           throw (.forbiddenImportAll inv.moduleName imp.module)
         if !imp.isExported && imp.module != SymName.mkSimple "Init" then
           throw (.forbiddenImportAll inv.moduleName imp.module)
+        -- Every import must resolve to an audited package module, a module of the pinned base
+        -- environment, or the standard library (`TrustedBoundary` "foreign module" rule).
+        if !(pkg.modules.any (fun m => m.moduleName == imp.module) ||
+            pkg.baseEnv.any (fun ci => ci.originModule == imp.module) ||
+            SymName.isStdlibModule imp.module) then
+          throw (.foreignImport inv.moduleName imp.module)
 
 /-- Lookup the `ModuleRole` of a module name in `pkg`. -/
 def roleOfModule (pkg : PackageAuditInput) (modName : SymName) : ModuleRole :=
@@ -5990,6 +6051,18 @@ def auditExtraConstProvenance (pkg : PackageAuditInput) (allEnv : KernelEnv) :
       if allEnv.contains extra && !inv.constNames.contains extra then
         throw (.extraConstProvenanceMismatch inv.moduleName extra)
 
+/--
+True iff the kernel ITSELF already refutes a provisional native-evaluation axiom of shape
+`EqBool e Bool.true`: `e` weak-head-normalises (unfolding definitions of `env`) to `Bool.false`.
+The shape check alone cannot tell an honest native evaluation from a forged one; this catches the
+forgeries the kernel can see through, and leaves the rest as explicitly provisional trust.
+-/
+def nativeAxiomRefutedByKernel (env : KernelEnv) (fuel : Nat) (ty : ExprSkeleton) : Bool :=
+  match ty with
+  | .app (.app (.const _) lhs) (.const _) =>
+    whnf env fuel [] lhs == .const SymName.boolFalseName
+  | _ => false
+
 /-- Validate module-wide declaration safety and axiom admissibility (catching unreferenced axioms `V04`). -/
 def auditModuleDeclarations (cfg : AuditConfig) (pkg : PackageAuditInput) :
     Except AuditFailure Unit := do
@@ -6009,6 +6082,10 @@ def auditModuleDeclarations (cfg : AuditConfig) (pkg : PackageAuditInput) :
             if !okProv then
               throw (.forbiddenNativeReductionAxiom ci.name ci.name)
             if !isValidNativeAxiomType ci.type then
+              throw (.invalidNativeAxiomType ci.name ci.name)
+            if nativeAxiomRefutedByKernel
+                (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv)
+                cfg.kernelFuel ci.type then
               throw (.invalidNativeAxiomType ci.name ci.name)
           else if inv.role == .foundation && SymName.isFoundationalAxiom ci.name then
             pure ()
@@ -7502,6 +7579,50 @@ theorem auditAndReplayPackage_semantic_sound {cfg : AuditConfig} {pkg : PackageA
   intro n ci hlu P hP
   obtain ⟨ci', hlu', hty⟩ := importedEnv_type_replayed hAudit n ci hlu
   exact kernelEnv_prop_types_true hM' ci'.name ci' hlu' P (by rw [hty]; exact hP)
+
+/-- `buildVerifyItemReports` produces exactly one report per root, in order. -/
+theorem buildVerifyItemReports_roots {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {allEnv : KernelEnv} :
+    ∀ (roots : List SymName) (reps : List VerifyItemReport),
+      buildVerifyItemReports cfg pkg allEnv roots = .ok reps →
+      reps.map VerifyItemReport.root = roots := by
+  intro roots
+  induction roots with
+  | nil =>
+    intro reps h
+    simp only [buildVerifyItemReports, Except.ok.injEq] at h
+    subst h
+    rfl
+  | cons r rest ih =>
+    intro reps h
+    simp only [buildVerifyItemReports] at h
+    cases hv : auditVerifyRoot cfg pkg allEnv r with
+    | error _ => rw [hv] at h; cases h
+    | ok axs =>
+      rw [hv] at h
+      dsimp only at h
+      cases hr : buildVerifyItemReports cfg pkg allEnv rest with
+      | error _ => rw [hr] at h; cases h
+      | ok tl =>
+        rw [hr] at h
+        dsimp only at h
+        injection h with h'
+        subst h'
+        show (classifyVerifyItem pkg allEnv r axs).root :: tl.map VerifyItemReport.root = r :: rest
+        rw [ih tl hr]
+        rfl
+
+/--
+Per-Root Report Coverage: the certificate carries exactly one `VerifyItemReport` per verify root,
+in order. Together with `auditAndReplayPackage_item_status_sound` this means no verify root can be
+silently missing from the classification (a root without a report cannot pass as unconditional).
+-/
+theorem auditAndReplayPackage_itemReports_cover_roots {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    cert.itemReports.map VerifyItemReport.root = pkg.verifyRoots :=
+  buildVerifyItemReports_roots pkg.verifyRoots cert.itemReports
+    (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.1
 
 /-! ## Section 9: Constructive Vulnerability Exploits, 18-Vector Tamper Suite (`V01`–`V18`), & Positive Witnesses -/
 
@@ -9510,5 +9631,166 @@ theorem finalizeImport_subsumes_body_swap_bypass :
     auditAndReplayPackage defaultUnconditionalConfig subsumesSwapPkg =
       .error (.duplicateConstName .anonymous .anonymous) := by
   refine ⟨rfl, rfl, rfl⟩
+
+/-! ### Section 9.8: Pass-`B2` Regression Witnesses (Name-Only Stdlib Trust, Claimed Origins, Numeric Token Glue, Foreign Imports) -/
+
+def stdEvilModName : SymName := SymName.ofList ["Std", "Evil"]
+def stdEvilOopsName : SymName := SymName.ofList ["Std", "Evil", "oops"]
+def usesStdEvilName : SymName := SymName.ofList ["Topic", "Proofs", "usesOops"]
+
+/-- An ILL-TYPED theorem `Std.Evil.oops : False := True.intro` shipped in a workspace-supplied `Std/` tree. -/
+def stdEvilOopsDecl : ConstantRecord := {
+  name := stdEvilOopsName
+  kind := .thmDecl
+  type := .const SymName.falseName
+  value? := some (.const SymName.trueIntroName)
+  hasValue := true
+  all := [stdEvilOopsName]
+  originModule := stdEvilModName
+}
+
+/-- A well-typed workspace theorem `usesOops : False := Std.Evil.oops`. -/
+def usesStdEvilDecl : ConstantRecord := {
+  name := usesStdEvilName
+  kind := .thmDecl
+  type := .const SymName.falseName
+  value? := some (.const stdEvilOopsName)
+  hasValue := true
+  all := [usesStdEvilName]
+  originModule := topicProofModName
+}
+
+def stdEvilPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule stdEvilModName .foundation [stdEvilOopsDecl],
+    mkAlignedModule topicProofModName .proof [usesStdEvilDecl]
+  ]
+}
+
+/--
+Regression (name-only stdlib trust, `TrustedBoundary.verifyAudit` lines 563–592): a workspace
+module NAMED `Std.Evil` carrying the ill-typed `oops : False` is treated as foundation by the
+name-based model — never kernel-checked — so `Topic.Proofs.usesOops : False` replays cleanly on top
+of it. The hardened pipeline refuses any package module with a stdlib name.
+-/
+theorem stdlibName_baseTrust_bypass :
+    (kernelCheckDecl standardBaseEnv 16 false stdEvilOopsDecl).isOk = false ∧
+    (naiveStdlibNameTrustAudit stdEvilPkg 16).map
+      (fun env => (env.lookup usesStdEvilName).map ConstantRecord.type) =
+      .ok (some (.const SymName.falseName)) ∧
+    auditAndReplayPackage defaultUnconditionalConfig stdEvilPkg =
+      .error (.stdlibNamedPackageModule stdEvilModName) := by
+  refine ⟨rfl, rfl, rfl⟩
+
+def v12ClaimedLocalInstPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [.instanceEntry (SymName.ofList ["Topic", "Proofs", "badInst"])
+      defsBeforeName topicProofModName false]))
+
+def v13ClaimedLocalReducibilityPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [.reducibilityOverride SymName.natAddName topicProofModName "reducible"]))
+
+def v07UnpersistedFlagPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [.localCommandElabEntry (SymName.ofList ["Topic", "Proofs", "locElab"])
+      (SymName.ofList ["Lean", "Parser", "Command", "audit"]) false]))
+
+/--
+Regression (extension-entry claims): an instance attribute on the imported `Before` and a
+reducibility override on `Nat.add` both CLAIMED `targetOrigin := Topic.Proofs` and were accepted
+(`V12`/`V13` bypass); a persisted `local elab` entry flagged `persistedGlobal := false` was accepted
+(`V07` bypass). Origins are now computed from the inventory and the flag grants nothing.
+-/
+theorem extEntry_claimed_origin_and_flag_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig v12ClaimedLocalInstPkg =
+      .error (.forbiddenInstanceOrCoe topicProofModName "imported_instance"
+        (SymName.ofList ["Topic", "Proofs", "badInst"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig v13ClaimedLocalReducibilityPkg =
+      .error (.forbiddenReducibilityOverride topicProofModName SymName.natAddName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig v07UnpersistedFlagPkg =
+      .error (.forbiddenMacroOrElab topicProofModName "local_command_elab"
+        (SymName.ofList ["Topic", "Proofs", "locElab"])) := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/--
+Regression (numeric-literal token glue): Lean ends a numeric literal at the first non-digit, so
+`iterate 1native_decide`, `iterate 2decide (config := { native := true })`, and
+`iterate 0x1native_decide` run native evaluation although no whitespace separates the number from
+the tactic; the pass-`A1` tokenizer saw one unknown token. A plain `iterate 2 decide` is accepted.
+-/
+theorem sourceScanner_numeric_prefix_glue_rejected :
+    scanProofSource "theorem t : True := by iterate 1native_decide" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t : True := by iterate 2decide (config := { native := true })" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t : True := by iterate 0x1native_decide" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t : True := by iterate 2 decide" = .ok () := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+def foreignImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := SymName.ofList ["Evil", "Mod"] }]))
+
+def knownImportsPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := topicDefsModName },
+      { module := SymName.ofList ["Trusted", "VerificationResult"] },
+      { module := SymName.ofList ["Std", "Data", "HashMap"] }]))
+
+/--
+Regression (foreign imports): an import of a module that is neither an audited package module, a
+module of the pinned base environment, nor the standard library is rejected; imports of a sibling
+package module, a base module, and the standard library are accepted.
+-/
+theorem foreignImport_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig foreignImportPkg =
+      .error (.foreignImport topicProofModName (SymName.ofList ["Evil", "Mod"])) ∧
+    (auditAndReplayPackage defaultUnconditionalConfig knownImportsPkg).isOk = true := by
+  refine ⟨rfl, rfl⟩
+
+def refutedNativeFlagName : SymName := SymName.ofList ["Proof", "Native", "alwaysFalse"]
+
+/-- A workspace definition `alwaysFalse : Bool := Bool.false`. -/
+def refutedNativeFlagDecl : ConstantRecord := {
+  name := refutedNativeFlagName
+  kind := .defnDecl
+  type := .const SymName.boolName
+  value? := some (.const SymName.boolFalseName)
+  hasValue := true
+  all := [refutedNativeFlagName]
+  originModule := pillarProofMod
+}
+
+def refutedNativeLiteralPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule pillarProofMod .proof
+    [{ provisionalNativeAxDecl with
+        type := .app (.app (.const SymName.eqBoolName) (.const SymName.boolFalseName))
+          (.const SymName.boolTrueName) }]]
+}
+
+def refutedNativeUnfoldedPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [mkAlignedModule pillarProofMod .proof
+    [refutedNativeFlagDecl,
+      { provisionalNativeAxDecl with
+        type := .app (.app (.const SymName.eqBoolName) (.const refutedNativeFlagName))
+          (.const SymName.boolTrueName) }]]
+}
+
+/--
+Regression (kernel-refuted native axioms): under `--provisional`, a `._native.*` axiom of the right
+SHAPE asserting `EqBool Bool.false Bool.true` — literally, or through a definition that unfolds to
+`Bool.false` — was admitted by pass `A1`. The kernel can see both are false, so both are rejected.
+-/
+theorem pillar1_kernel_refuted_native_axiom_rejected :
+    auditAndReplayPackage provisionalConfig refutedNativeLiteralPkg =
+      .error (.invalidNativeAxiomType provisionalNativeAxName provisionalNativeAxName) ∧
+    auditAndReplayPackage provisionalConfig refutedNativeUnfoldedPkg =
+      .error (.invalidNativeAxiomType provisionalNativeAxName provisionalNativeAxName) := by
+  refine ⟨rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditPrototype

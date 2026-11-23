@@ -794,4 +794,91 @@ theorem sourceScanner_passA1_extra_edges :
         "ambiguous char literal or string-interpolation hole") :=
   ⟨rfl, rfl, rfl⟩
 
+/-! ## Section 6: Pass-`B2` Regression Suite (Name-Only Stdlib Trust, Claimed Origins, Numeric Token Glue, Foreign Imports, Report Coverage) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.stdlibName_baseTrust_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms stdlibName_baseTrust_bypass
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.extEntry_claimed_origin_and_flag_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms extEntry_claimed_origin_and_flag_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_itemReports_cover_roots' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_itemReports_cover_roots
+
+example := stdlibName_baseTrust_bypass
+example := extEntry_claimed_origin_and_flag_rejected
+example := sourceScanner_numeric_prefix_glue_rejected
+example := foreignImport_rejected
+example := pillar1_kernel_refuted_native_axiom_rejected
+
+/-- Coverage instantiation: the baseline certificate reports exactly its one verify root. -/
+theorem validBaselinePackage_itemReports_cover :
+    ∃ cert,
+      auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage = .ok cert ∧
+      cert.itemReports.map VerifyItemReport.root = [validVerifyThmName] := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    exact ⟨cert, rfl, auditAndReplayPackage_itemReports_cover_roots h⟩
+
+/-- A stdlib-named package module is refused whatever role it claims (`Init.*` as well as `Std.*`). -/
+def initNamedPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule (SymName.ofList ["Init", "Evil"]) .foundation []])
+
+def stdNamedProofRolePkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule (SymName.ofList ["Std", "Proofs"]) .proof []])
+
+theorem stdlibNamed_package_modules_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig initNamedPkg =
+      .error (.stdlibNamedPackageModule (SymName.ofList ["Init", "Evil"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig stdNamedProofRolePkg =
+      .error (.stdlibNamedPackageModule (SymName.ofList ["Std", "Proofs"])) :=
+  ⟨rfl, rfl⟩
+
+/--
+Segment and numeric-prefix keyword matching edges: any dot-separated segment is matched (so a
+trailing-dot or qualified form cannot hide a keyword), a digit-led run ending in a keyword is
+matched, and identifiers that merely CONTAIN a keyword (`native1`, `my_decide`) are not.
+-/
+theorem sourceScanner_segment_matching_edges :
+    SourceScanner.tokenHasKeyword "native_decide".toList "native_decide.".toList = true ∧
+    SourceScanner.tokenHasKeyword "native_decide".toList "Foo.native_decide.bar".toList = true ∧
+    SourceScanner.tokenHasKeyword "native_decide".toList "12native_decide".toList = true ∧
+    SourceScanner.tokenHasKeyword "native_decide".toList "my_native_decide".toList = false ∧
+    SourceScanner.tokenHasKeyword "native".toList "native1".toList = false ∧
+    scanProofSource "def native1 := 1\ntheorem t : True := by decide" = .ok () ∧
+    scanProofSource "def x := 3\ntheorem t : True := trivial" = .ok () ∧
+    scanProofSource "theorem t : True := by iterate 1bv_decide" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- A reducibility override or instance attribute on a genuinely LOCAL target is still accepted. -/
+def localTargetExtPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [
+      .instanceEntry (SymName.ofList ["Topic", "Proofs", "instLocal"]) cleanProofThmName
+        topicProofModName false,
+      .reducibilityOverride cleanProofThmName topicProofModName "irreducible"]))
+
+theorem extEntry_local_targets_accepted :
+    (auditAndReplayPackage defaultUnconditionalConfig localTargetExtPkg).isOk = true :=
+  rfl
+
 end Anneal.ReplayKeyAndTamperAuditProtoTests
