@@ -11,6 +11,10 @@
 
 #![no_std]
 
+#[cfg(test)]
+extern crate std;
+
+pub mod panic_contract;
 pub mod spec_check;
 
 pub use anneal_spec_macros::{
