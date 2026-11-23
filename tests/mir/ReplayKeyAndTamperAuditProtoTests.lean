@@ -781,7 +781,7 @@ def provisionalVerifyPkg : PackageAuditInput := {
           (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
             (.const pillarThmName))),
         hasValue := true, all := [verifyProvRoot], originModule := verifyProvMod }
-    ]
+    ] (imports := [{ module := pillarProofMod }])
   ]
   verifyRoots := [verifyProvRoot]
 }
@@ -1042,5 +1042,183 @@ theorem passA2_extra_lexer_edges :
       .error (.forbiddenSourceOption topicProofModName "debug.skipKernelTC") ∧
     scanProofSource "def x := 1e-2\ndef y := 0b101\ndef z := 0o755" = .ok () :=
   ⟨rfl, rfl, rfl⟩
+
+/-! ## Section 8: Pass-`B3` Regression Suite (Unlisted Verify Modules, `Lean.*` Imports, `bv_decide` Family, References Outside the Import Closure) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_verify_modules_covered' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_verify_modules_covered
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.importReachesAux_true_sound' depends on axioms: [propext]
+-/
+#guard_msgs in #print axioms importReachesAux_true_sound
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.importClosureCheck_exact' depends on axioms: [propext, Quot.sound]
+-/
+#guard_msgs in #print axioms importClosureCheck_exact
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_references_within_imports' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_references_within_imports
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.importReaches_statementSide' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms importReaches_statementSide
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_statement_side_dependencies' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_statement_side_dependencies
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.cleanNonWorkspace_cache_poisoning_bypass' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms cleanNonWorkspace_cache_poisoning_bypass
+
+example := unlistedVerifyModule_rejected
+example := leanMetaImport_rejected
+example := sourceScanner_bv_decide_family_rejected
+example := reference_outside_import_closure_rejected
+
+/-- Coverage instantiation: every `.verify` module of the baseline package has its root listed. -/
+theorem validBaselinePackage_verify_modules_covered :
+    ∀ inv ∈ validBaselinePackage.modules, inv.role = .verify →
+      SymName.str inv.moduleName "verified" ∈ validBaselinePackage.verifyRoots := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    exact auditAndReplayPackage_verify_modules_covered h
+
+/-- An unlisted `CrateVerify` rollup module is refused in the same way as an unlisted `Verify.*` module. -/
+def crateVerifyModName : SymName := SymName.mkSimple "CrateVerify"
+def crateVerifyRootName : SymName := SymName.ofList ["CrateVerify", "verified"]
+
+def unlistedCrateVerifyPkg : PackageAuditInput :=
+  mkSingleProofPkg
+    (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [
+      mkAlignedModule crateVerifyModName .verify
+        [{ validVerifyThmDecl with
+            name := crateVerifyRootName, all := [crateVerifyRootName],
+            originModule := crateVerifyModName }]
+        (imports := [{ module := topicProofModName }])
+    ])
+
+theorem unlistedCrateVerifyModule_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig unlistedCrateVerifyPkg =
+      .error (.invalidVerifyRoot crateVerifyRootName
+        "verify module root is not listed in verifyRoots") ∧
+    (auditAndReplayPackage defaultUnconditionalConfig
+      { unlistedCrateVerifyPkg with verifyRoots := [crateVerifyRootName] }).isOk = true :=
+  ⟨rfl, rfl⟩
+
+/-- `?` / `!` variant suffixes are matched as the base keyword; longer identifiers are not. -/
+theorem sourceScanner_variant_suffix_edges :
+    SourceScanner.tokenHasKeyword "bv_decide".toList "bv_decide?".toList = true ∧
+    SourceScanner.tokenHasKeyword "native_decide".toList "native_decide!".toList = true ∧
+    SourceScanner.tokenHasKeyword "decide".toList "decide?".toList = true ∧
+    SourceScanner.tokenHasKeyword "bv_check".toList "1bv_check".toList = true ∧
+    SourceScanner.tokenHasKeyword "decide".toList "decidable?".toList = false ∧
+    SourceScanner.tokenHasKeyword "bv_decide".toList "my_bv_decide?".toList = false ∧
+    scanProofSource "theorem t (b : Bool) : b = b := by cases b <;> rfl" = .ok () ∧
+    scanProofSource "theorem t : True := by grind => bv_decide" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/--
+The undeclared-import variant of the verify item: `Verify.Topic.verified` mentions
+`Topic.Proofs.cleanLemma`, and the package is accepted only when `Verify.Topic` declares the import.
+A `.theory` module mentioning a `.proof` lemma is refused whether or not it declares the edge.
+-/
+def verifyNoImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule topicVerifyModName .verify [validVerifyThmDecl]])
+    (verifyRoots := [validVerifyThmName])
+
+def verifyWithImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule topicVerifyModName .verify [validVerifyThmDecl]
+      (imports := [{ module := topicProofModName }])])
+    (verifyRoots := [validVerifyThmName])
+
+def theoryMentionsProofName : SymName := SymName.ofList ["Anneal", "TheoryHelper", "mentionsProof"]
+def theoryMentionsProofDecl : ConstantRecord := {
+  name := theoryMentionsProofName, kind := .thmDecl, type := .const SymName.trueName,
+  value? := some (.const cleanProofThmName), hasValue := true,
+  all := [theoryMentionsProofName], originModule := topicTheoryModName }
+
+def theoryMentionsProofPkg (declared : Bool) : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule topicTheoryModName .theory [theoryMentionsProofDecl]
+      (imports := if declared then [{ module := topicProofModName }] else [])])
+
+theorem reference_import_closure_extra_regressions :
+    auditAndReplayPackage defaultUnconditionalConfig verifyNoImportPkg =
+      .error (.referenceOutsideImportClosure topicVerifyModName validVerifyThmName
+        cleanProofThmName topicProofModName) ∧
+    (auditAndReplayPackage defaultUnconditionalConfig verifyWithImportPkg).isOk = true ∧
+    auditAndReplayPackage defaultUnconditionalConfig (theoryMentionsProofPkg false) =
+      .error (.referenceOutsideImportClosure topicTheoryModName theoryMentionsProofName
+        cleanProofThmName topicProofModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig (theoryMentionsProofPkg true) =
+      .error (.forbiddenImportDirection topicTheoryModName "theory" topicProofModName "proof") :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+Transitive imports are honoured: the baseline `Verify.Topic` imports only `Topic.Proofs`, which
+imports `Anneal.TheoryHelper`, and the search answers exactly per `importClosureCheck_exact`.
+-/
+theorem baseline_import_closure_search :
+    importReachesAux validBaselinePackage topicTheoryModName
+      (importGraphFuel validBaselinePackage + 1) [topicProofModName] [] = true ∧
+    importReachesAux validBaselinePackage topicVerifyModName
+      (importGraphFuel validBaselinePackage + 1) [topicProofModName] [] = false ∧
+    ¬ ImportReaches validBaselinePackage topicProofModName topicVerifyModName := by
+  refine ⟨rfl, rfl, fun hreach => ?_⟩
+  have hex : ∃ p ∈ [topicProofModName],
+      p = topicVerifyModName ∨ ImportReaches validBaselinePackage p topicVerifyModName :=
+    ⟨topicProofModName, List.mem_cons_self, Or.inr hreach⟩
+  have htrue := (importClosureCheck_exact validBaselinePackage topicVerifyModName
+    [topicProofModName]).mpr hex
+  have hfalse : importReachesAux validBaselinePackage topicVerifyModName
+      (importGraphFuel validBaselinePackage + [topicProofModName].length)
+      [topicProofModName] [] = false := rfl
+  rw [hfalse] at htrue
+  cases htrue
+
+/--
+Dependency stratification instantiated on an accepted package: `Topic.Defs` (`.defsExempt`) of the
+baseline never mentions a `.proof` / `.theory` / `.verify` / `.test` declaration.
+-/
+theorem validBaselinePackage_statement_side_dependencies :
+    ∀ inv ∈ validBaselinePackage.modules, isStatementSideRole inv.role = true →
+      ∀ ci ∈ inv.constants, ∀ edges, ConstantRecord.declarationEdges ci = .ok edges →
+        ∀ dep ∈ edges, ∀ target, moduleOfConst? validBaselinePackage dep = some target →
+          isStatementSideRole target.role = true := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    exact auditAndReplayPackage_statement_side_dependencies h
 
 end Anneal.ReplayKeyAndTamperAuditProtoTests

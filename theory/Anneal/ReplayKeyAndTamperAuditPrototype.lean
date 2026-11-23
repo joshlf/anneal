@@ -324,6 +324,7 @@ inductive AuditFailure where
   | foreignImport (modName importedMod : SymName)
   | importCycle (modName targetMod : SymName)
   | forbiddenImportDirection (modName : SymName) (fromRole : String) (importedMod : SymName) (toRole : String)
+  | referenceOutsideImportClosure (modName ciName depName depMod : SymName)
   deriving DecidableEq, Repr
 
 namespace ExprSkeleton
@@ -1044,16 +1045,30 @@ def dotSegments (tok : List Char) : List (List Char) :=
   (folded.1.reverse :: folded.2).reverse
 
 /--
-True iff the segment `seg` denotes keyword `kw` to the Lean lexer: either it IS `kw`, or it starts
-with a digit and ends with `kw`. Lean 4.34.1 `decimalNumberFn` / `hexNumberFn`
+Drop one trailing `?` or `!` from a segment. Lean spells tactic variants as separate keyword tokens
+with these suffixes (`bv_decide?` is `Lean.Parser.Tactic.bvTrace`, `Init/Tactics.lean` line 1929;
+`decide!`), and both are token characters, so the suffixed spelling is a different scanner token.
+-/
+def stripTacticSuffix (seg : List Char) : List Char :=
+  match seg.reverse with
+  | c :: rest => if c == '?' || c == '!' then rest.reverse else seg
+  | [] => seg
+
+/--
+True iff the segment `seg` denotes keyword `kw` to the Lean lexer: either it IS `kw` (optionally
+with a trailing `?` / `!` variant suffix), or it starts with a digit and ends with `kw`. Lean 4.34.1 `decimalNumberFn` / `hexNumberFn`
 (`Lean/Parser/Basic.lean` lines 831–843, 900–914) end a numeric literal at the first non-digit
 without requiring a separator, so `iterate 1native_decide` lexes as `iterate`, `1`,
 `native_decide` although the scanner sees the single run `1native_decide`.
 -/
 def segmentIsKeyword (kw seg : List Char) : Bool :=
-  seg == kw ||
+  let core := stripTacticSuffix seg
+  seg == kw || core == kw ||
   (match seg with
-   | c :: _ => isAsciiDigitNat c.toNat && SymName.charListStartsWith kw.reverse seg.reverse
+   | c :: _ =>
+     isAsciiDigitNat c.toNat &&
+       (SymName.charListStartsWith kw.reverse seg.reverse ||
+        SymName.charListStartsWith kw.reverse core.reverse)
    | [] => false)
 
 /--
@@ -1077,7 +1092,8 @@ and `decide (config := myCfg)` where the word `native` never appears!).
 def hasNativeDecideTokensChars (toks : List (List Char)) : Bool :=
   hasAlwaysForbiddenNativeChars toks ||
   toks.any (fun t =>
-    tokenHasKeyword "native_decide".toList t || tokenHasKeyword "bv_decide".toList t) ||
+    tokenHasKeyword "native_decide".toList t || tokenHasKeyword "bv_decide".toList t ||
+    tokenHasKeyword "bv_check".toList t) ||
   (toks.any (fun t =>
       tokenHasKeyword "decide".toList t || tokenHasKeyword "decide!".toList t) &&
     toks.any (fun t =>
@@ -6069,9 +6085,13 @@ def validateSingleImport (pkg : PackageAuditInput) (inv : ModuleInventory) (imp 
     throw (.forbiddenImportAll inv.moduleName imp.module)
   -- Every import must resolve to an audited package module, a module of the pinned base
   -- environment, or the standard library (`TrustedBoundary` "foreign module" rule).
-  if !(pkg.modules.any (fun m => m.moduleName == imp.module) ||
-      pkg.baseEnv.any (fun ci => ci.originModule == imp.module) ||
-      SymName.isStdlibModule imp.module) then
+  -- `Lean` / `Lean.*` is the compiler's metaprogramming API, not the standard library:
+  -- `TrustedBoundary.isStdlibMod` (lines 30–32) admits only `Init` / `Std`, so every `Lean.*` module
+  -- is a "foreign module" there. It is reserved as a package-module NAME, but never importable.
+  if imp.module.getRoot == some "Lean" ||
+      !(pkg.modules.any (fun m => m.moduleName == imp.module) ||
+        pkg.baseEnv.any (fun ci => ci.originModule == imp.module) ||
+        SymName.isStdlibModule imp.module) then
     throw (.foreignImport inv.moduleName imp.module)
   let targetRole := roleOfModule pkg imp.module
   if !importRoleAllowed inv.role targetRole then
@@ -6470,17 +6490,75 @@ def knownModuleNames (pkg : PackageAuditInput) : List SymName :=
   pkg.modules.map ModuleInventory.moduleName ++ pkg.baseEnv.map ConstantRecord.originModule
 
 /--
-Fidelity check for reserved auxiliary names carrying a foreign `originModule` (Report §5 item 4):
+Every `.verify` module must be audited as a verify item: its `<M>.verified` root has to be listed
+in `pkg.verifyRoots`. The roots are an input separate from the module list (as the `verifyModules`
+list is in `TrustedBoundary.verifyAudit`, lines 552 and 611–617), and an UNLISTED `Verify.*` module
+would otherwise ride along in an accepted package, with no item report, without its
+`VerificationResult` header or statement-origin separation ever being checked.
+-/
+def auditVerifyModuleCoverage (pkg : PackageAuditInput) : Except AuditFailure Unit :=
+  checkEach pkg.modules fun inv =>
+    if inv.role == .verify &&
+        !pkg.verifyRoots.contains (SymName.str inv.moduleName "verified") then
+      .error (.invalidVerifyRoot (SymName.str inv.moduleName "verified")
+        "verify module root is not listed in verifyRoots")
+    else
+      .ok ()
+
+/--
+True iff package module `target` is visible from `inv`: it is `inv` itself, or it is reachable from
+`inv`'s declared import edges. The budget `importGraphFuel pkg + inv.imports.length` always covers
+the search (`importClosureCheck_exact`).
+-/
+def moduleVisibleFrom (pkg : PackageAuditInput) (inv : ModuleInventory) (target : SymName) : Bool :=
+  target == inv.moduleName ||
+  importReachesAux pkg target (importGraphFuel pkg + (inv.imports.map ImportSpec.module).length)
+    (inv.imports.map ImportSpec.module) []
+
+/--
+References must stay inside the declared import closure. Role stratification (`importRoleAllowed`)
+and acyclicity are checked on the import edges a module DECLARES; a real Lean module can only
+mention constants of modules it transitively imports, but an inventory is plain data, and a `.spec`
+module could mention a `.proof` constant (or a `.proof` module a `.test` constant) while declaring
+no import edge at all. Every `declarationEdges` target that lives in another package module must
+therefore be reachable through the declared imports, which turns the import policy into a
+dependency policy. Targets outside `pkg.modules` are base-environment constants (or unknown names,
+which the closure walks reject).
+-/
+def auditReferenceImports (pkg : PackageAuditInput) : Except AuditFailure Unit :=
+  checkEach pkg.modules fun inv =>
+    checkEach inv.constants fun ci =>
+      match ConstantRecord.declarationEdges ci with
+      | .error e => .error e
+      | .ok edges =>
+        checkEach edges fun dep =>
+          match moduleOfConst? pkg dep with
+          | none => .ok ()
+          | some target =>
+            if moduleVisibleFrom pkg inv target.moduleName then .ok ()
+            else
+              .error (.referenceOutsideImportClosure inv.moduleName ci.name dep target.moduleName)
+
+/--
+Verify-module coverage (`auditVerifyModuleCoverage`), reference-vs-import consistency
+(`auditReferenceImports`), then the fidelity check for reserved
+auxiliary names carrying a foreign `originModule` (Report §5 item 4):
 any constant whose `originModule != inv.moduleName` must reference an audited sibling/base module
 present in `knownModuleNames pkg`.
 -/
 def auditReservedOrigins (pkg : PackageAuditInput) : Except AuditFailure Unit :=
-  let knownMods := knownModuleNames pkg
-  checkEach pkg.modules fun inv =>
-    checkEach inv.constants fun ci => do
-      if ci.originModule != inv.moduleName then
-        if !knownMods.contains ci.originModule then
-          throw (.reservedOriginMissingSibling inv.moduleName ci.name ci.originModule)
+  match auditVerifyModuleCoverage pkg with
+  | .error e => .error e
+  | .ok _ =>
+    match auditReferenceImports pkg with
+    | .error e => .error e
+    | .ok _ =>
+      let knownMods := knownModuleNames pkg
+      checkEach pkg.modules fun inv =>
+        checkEach inv.constants fun ci => do
+          if ci.originModule != inv.moduleName then
+            if !knownMods.contains ci.originModule then
+              throw (.reservedOriginMissingSibling inv.moduleName ci.name ci.originModule)
 
 /-- Validate every module's replay inventory and source defense-in-depth scanner. -/
 def auditAllInventoriesAndSources (cfg : AuditConfig) (mods : List ModuleInventory) :
@@ -8225,6 +8303,248 @@ theorem auditAndReplayPackage_imports_sound {cfg : AuditConfig} {pkg : PackageAu
         importReaches_mem_of_closed (fun x hx => (hcl x hx).2) (hmodEq ▸ hrest)
           (hpend imp.module List.mem_cons_self)
       exact (hcl inv.moduleName hmemTarget).1 rfl
+
+/--
+Verify-Module Coverage: in an audited package, EVERY `.verify` module has its `<M>.verified` root
+listed in `pkg.verifyRoots`. Combined with `auditAndReplayPackage_verifyRoots_sound` and
+`auditAndReplayPackage_itemReports_cover_roots`, no `Verify.*` module can be accepted without its
+header, statement origins, closure, and status classification having been audited.
+-/
+theorem auditAndReplayPackage_verify_modules_covered {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, inv.role = .verify →
+      SymName.str inv.moduleName "verified" ∈ pkg.verifyRoots := by
+  have horig := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.2.2.1
+  unfold auditReservedOrigins at horig
+  cases hcov : auditVerifyModuleCoverage pkg with
+  | error _ => rw [hcov] at horig; cases horig
+  | ok u =>
+    cases u
+    unfold auditVerifyModuleCoverage at hcov
+    intro inv hinv hrole
+    have hmod := checkEach_ok_mem hcov inv hinv
+    simpa [hrole] using hmod
+
+/-- A `true` answer of the import-graph search exhibits a pending module that is, or imports, the target. -/
+theorem importReachesAux_true_sound (pkg : PackageAuditInput) (target : SymName) :
+    ∀ (fuel : Nat) (pending visited : List SymName),
+      importReachesAux pkg target fuel pending visited = true →
+      ∃ p ∈ pending, p = target ∨ ImportReaches pkg p target := by
+  intro fuel
+  induction fuel with
+  | zero =>
+    intro pending visited h
+    simp [importReachesAux] at h
+  | succ fuel ih =>
+    intro pending visited h
+    cases pending with
+    | nil => simp [importReachesAux] at h
+    | cons m rest =>
+      simp only [importReachesAux] at h
+      cases heq : (m == target) with
+      | true => exact ⟨m, List.mem_cons_self, Or.inl (beq_iff_eq.mp heq)⟩
+      | false =>
+        rw [heq] at h; simp only [Bool.false_eq_true, ↓reduceIte] at h
+        cases hv : visited.contains m with
+        | true =>
+          rw [hv] at h; simp only [↓reduceIte] at h
+          obtain ⟨p, hp, hr⟩ := ih rest visited h
+          exact ⟨p, List.mem_cons_of_mem _ hp, hr⟩
+        | false =>
+          rw [hv] at h; simp only [Bool.false_eq_true, ↓reduceIte] at h
+          obtain ⟨p, hp, hr⟩ := ih (directImportsOf pkg m ++ rest) (m :: visited) h
+          rcases List.mem_append.mp hp with hd | hrst
+          · refine ⟨m, List.mem_cons_self, Or.inr ?_⟩
+            rcases hr with hpt | hreach
+            · rw [hpt] at hd
+              exact ImportReaches.direct hd
+            · exact ImportReaches.trans hd hreach
+          · exact ⟨p, List.mem_cons_of_mem _ hrst, hr⟩
+
+/--
+Exactness of the import-closure search at the budget used by `moduleVisibleFrom`: it answers `true`
+precisely when some pending module is the target or transitively imports it (no false rejection,
+no false acceptance).
+-/
+theorem importClosureCheck_exact (pkg : PackageAuditInput) (target : SymName)
+    (pending : List SymName) :
+    importReachesAux pkg target (importGraphFuel pkg + pending.length) pending [] = true ↔
+      ∃ p ∈ pending, p = target ∨ ImportReaches pkg p target := by
+  constructor
+  · exact importReachesAux_true_sound pkg target _ pending []
+  · intro hex
+    cases hres : importReachesAux pkg target (importGraphFuel pkg + pending.length) pending [] with
+    | true => rfl
+    | false =>
+      exfalso
+      have hfuelLe : pending.length + unvisitedImportBudget [] pkg.modules ≤
+          importGraphFuel pkg + pending.length := by
+        unfold importGraphFuel
+        rw [unvisitedImportBudget_nil_eq_foldl pkg.modules 0]
+        omega
+      obtain ⟨res, hpend, _, hcl⟩ :=
+        importReachesAux_false_closed pkg target _ pending [] hfuelLe
+          (fun _ hx => by cases hx) hres
+      obtain ⟨p, hp, hr⟩ := hex
+      rcases hr with hpt | hreach
+      · exact (hcl p (hpend p hp)).1 hpt
+      · have hmemTarget : target ∈ res :=
+          importReaches_mem_of_closed (fun x hx => (hcl x hx).2) hreach (hpend p hp)
+        exact (hcl target hmemTarget).1 rfl
+
+/-- With unique module names, looking a member module up by its own name returns that module. -/
+theorem find_module_of_names_nodup {inv : ModuleInventory} :
+    ∀ (mods : List ModuleInventory),
+      (mods.map ModuleInventory.moduleName).Nodup → inv ∈ mods →
+      mods.find? (fun m => m.moduleName == inv.moduleName) = some inv := by
+  intro mods hnd hm
+  induction mods with
+  | nil => cases hm
+  | cons hd tl ih =>
+    simp only [List.map_cons, List.nodup_cons] at hnd
+    cases hm with
+    | head => simp [List.find?]
+    | tail _ htl =>
+      have hne : hd.moduleName ≠ inv.moduleName := fun heq =>
+        hnd.1 (List.mem_map.mpr ⟨inv, htl, heq.symm⟩)
+      have hbeq : (hd.moduleName == inv.moduleName) = false := beq_false_of_ne hne
+      simp only [List.find?, hbeq]
+      exact ih hnd.2 htl
+
+/--
+Reference-Within-Imports Theorem: in an audited package, whenever a declaration of module `inv`
+mentions (through `declarationEdges`: type, value, `.all`, constructors, recursor rules) a constant
+declared by package module `target`, then `target` is `inv` itself or `inv` transitively imports it.
+Together with `auditAndReplayPackage_imports_sound` (every import edge obeys `importRoleAllowed`)
+this makes role stratification a statement about what declarations DEPEND on, not merely about
+which import edges an inventory chooses to declare.
+-/
+theorem auditAndReplayPackage_references_within_imports {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, ∀ ci ∈ inv.constants, ∀ edges,
+      ConstantRecord.declarationEdges ci = .ok edges →
+      ∀ dep ∈ edges, ∀ target, moduleOfConst? pkg dep = some target →
+        target.moduleName = inv.moduleName ∨
+        ImportReaches pkg inv.moduleName target.moduleName := by
+  have horig := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.2.2.2.2.1
+  have hnodup := auditAndReplayPackage_modules_nodup hAudit
+  unfold auditReservedOrigins at horig
+  cases hcov : auditVerifyModuleCoverage pkg with
+  | error _ => rw [hcov] at horig; cases horig
+  | ok _ =>
+    rw [hcov] at horig
+    dsimp only at horig
+    cases href : auditReferenceImports pkg with
+    | error _ => rw [href] at horig; cases horig
+    | ok u =>
+      cases u
+      unfold auditReferenceImports at href
+      intro inv hinv ci hci edges hedges dep hdep target htarget
+      have h1 := checkEach_ok_mem (checkEach_ok_mem href inv hinv) ci hci
+      rw [hedges] at h1
+      dsimp only at h1
+      have h2 := checkEach_ok_mem h1 dep hdep
+      rw [htarget] at h2
+      dsimp only at h2
+      cases hvis : moduleVisibleFrom pkg inv target.moduleName with
+      | false => rw [hvis] at h2; cases h2
+      | true =>
+        unfold moduleVisibleFrom at hvis
+        cases hsame : (target.moduleName == inv.moduleName) with
+        | true => exact Or.inl (beq_iff_eq.mp hsame)
+        | false =>
+          right
+          rw [hsame, Bool.false_or] at hvis
+          obtain ⟨p, hp, hr⟩ :=
+            (importClosureCheck_exact pkg target.moduleName
+              (inv.imports.map ImportSpec.module)).mp hvis
+          have hdirSelf : directImportsOf pkg inv.moduleName =
+              inv.imports.map ImportSpec.module := by
+            unfold directImportsOf
+            rw [find_module_of_names_nodup pkg.modules hnodup hinv]
+          rw [← hdirSelf] at hp
+          rcases hr with hpt | hreach
+          · rw [hpt] at hp
+            exact ImportReaches.direct hp
+          · exact ImportReaches.trans hp hreach
+
+/--
+Statement-side roles: the import policy (`importRoleAllowed`) can never lead from one of these to a
+`.theory`, `.proof`, `.verify`, or `.test` module.
+-/
+def isStatementSideRole (r : ModuleRole) : Bool :=
+  r == .foundation || r == .trusted || r == .defsExempt || r == .spec || r == .assumptions
+
+theorem importRoleAllowed_statementSide {a b : ModuleRole} :
+    isStatementSideRole a = true → importRoleAllowed a b = true →
+      isStatementSideRole b = true := by
+  cases a <;> cases b <;> decide
+
+/-- Statement-side roles are closed under transitive imports in an audited package. -/
+theorem importReaches_statementSide {cfg : AuditConfig} {pkg : PackageAuditInput}
+    {cert : AuditCertificate} (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ {a b : SymName}, ImportReaches pkg a b →
+      isStatementSideRole (roleOfModule pkg a) = true →
+      isStatementSideRole (roleOfModule pkg b) = true := by
+  have himp := auditAndReplayPackage_imports_sound hAudit
+  have step : ∀ {a b : SymName}, b ∈ directImportsOf pkg a →
+      isStatementSideRole (roleOfModule pkg a) = true →
+      isStatementSideRole (roleOfModule pkg b) = true := by
+    intro a b hb ha
+    unfold directImportsOf at hb
+    cases hfind : pkg.modules.find? (fun m => m.moduleName == a) with
+    | none => rw [hfind] at hb; cases hb
+    | some inv' =>
+      rw [hfind] at hb
+      obtain ⟨imp, himpMem, hmodEq⟩ := List.mem_map.mp hb
+      have hinv' : inv' ∈ pkg.modules := List.mem_of_find?_eq_some hfind
+      have hroleA : roleOfModule pkg a = inv'.role := by
+        unfold roleOfModule; rw [hfind]
+      rw [hroleA] at ha
+      have hallowed := ((himp inv' hinv').2.2.1 imp himpMem).2.2.2
+      rw [hmodEq] at hallowed
+      exact importRoleAllowed_statementSide ha hallowed
+  intro a b h
+  induction h with
+  | direct hab => exact step hab
+  | trans hab _ ih => intro ha; exact ih (step hab ha)
+
+/--
+Dependency Stratification Theorem: in an audited package, a declaration of a statement-side module
+(`.defsExempt`, `.spec`, `.assumptions`) only ever mentions package constants declared by
+statement-side modules. No `.spec` declaration depends on a `.proof`, `.theory`, `.verify`, or
+`.test` declaration, whatever import edges the inventories declare.
+-/
+theorem auditAndReplayPackage_statement_side_dependencies {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert) :
+    ∀ inv ∈ pkg.modules, isStatementSideRole inv.role = true →
+      ∀ ci ∈ inv.constants, ∀ edges, ConstantRecord.declarationEdges ci = .ok edges →
+        ∀ dep ∈ edges, ∀ target, moduleOfConst? pkg dep = some target →
+          isStatementSideRole target.role = true := by
+  have hnodup := auditAndReplayPackage_modules_nodup hAudit
+  intro inv hinv hrole ci hci edges hedges dep hdep target htarget
+  have htmem : target ∈ pkg.modules := by
+    unfold moduleOfConst? at htarget
+    exact List.mem_of_find?_eq_some htarget
+  have hroleOf : ∀ m ∈ pkg.modules, roleOfModule pkg m.moduleName = m.role := by
+    intro m hm
+    unfold roleOfModule
+    rw [find_module_of_names_nodup pkg.modules hnodup hm]
+  rcases auditAndReplayPackage_references_within_imports hAudit inv hinv ci hci edges hedges
+      dep hdep target htarget with hsame | hreach
+  · have h1 := find_module_of_names_nodup pkg.modules hnodup htmem
+    have h2 := find_module_of_names_nodup pkg.modules hnodup hinv
+    rw [hsame, h2] at h1
+    injection h1 with heq
+    rw [← heq]
+    exact hrole
+  · have hres := importReaches_statementSide hAudit hreach
+      (by rw [hroleOf inv hinv]; exact hrole)
+    rw [hroleOf target htmem] at hres
+    exact hres
 
 /-! ## Section 9: Constructive Vulnerability Exploits, 18-Vector Tamper Suite (`V01`–`V18`), & Positive Witnesses -/
 
@@ -10068,7 +10388,7 @@ def mixedStatusPkg : PackageAuditInput := {
         value? := some (.app (.app (.const verificationResultMkName) (.natLit 1))
           (.const assumpAxName)),
         hasValue := true, all := [verifyCondRoot], originModule := verifyCondMod }
-    ]
+    ] (imports := [{ module := assumpModName }])
   ]
   verifyRoots := [verifyCleanRoot, verifyCondRoot]
 }
@@ -10610,7 +10930,7 @@ def mixedBothPkg : PackageAuditInput := {
       value? := some (.app (.app (.const verificationResultMkName) (.natLit 0))
         (.app (.lam validNativeAxiomTypeExpr (.const assumpAxName)) (.const pillarThmName))),
       hasValue := true, all := [verifyBothRoot], originModule := verifyBothMod
-    }]
+    }] (imports := [{ module := assumpModName }, { module := pillarProofMod }])
   ]
   verifyRoots := [verifyBothRoot]
 }
@@ -10628,8 +10948,12 @@ Live `TrustedBoundary.verifyAudit` lines 609 & 644–670 `cleanNonWorkspace` cac
 - `Verify.Item1.verified` and `Verify.Item2.verified` both use `Anneal.TheoryHelper.usesProv`.
 - `naiveCachedClosureMultiItemAudit` adds `Anneal.TheoryHelper.usesProv` to `cleanNonWorkspace`
   while walking `Item1`, then skips it on `Item2` and FALSELY certifies `Item2` `"VerifiedUnconditional"`!
-- Meanwhile hardened `auditAndReplayPackage` accurately classifies BOTH `Item1` AND `Item2` as
-  `.provisionalNative [provisionalNativeAxName]` under `provisionalConfig` (and rejects unconditionally)!
+- The hardened pipeline has no cross-item cache. On the import-consistent variant
+  `cachePoisonDeclaredPkg` it classifies BOTH items as `.provisionalNative [provisionalNativeAxName]`
+  under `provisionalConfig`, and it rejects `cachePoisonPkg` unconditionally.
+- Pass `B3`: `cachePoisonPkg` itself only passed the hardened pipeline under `provisionalConfig`
+  because the `.theory` module mentions a `.proof` lemma WITHOUT declaring the import (which
+  `importRoleAllowed` forbids). It is now refused with `referenceOutsideImportClosure`.
 -/
 def theoryUsesProvName : SymName := SymName.ofList ["Anneal", "TheoryHelper", "usesProv"]
 def verifyCacheMod1 : SymName := SymName.ofList ["Verify", "Cache1"]
@@ -10666,10 +10990,41 @@ def cachePoisonPkg : PackageAuditInput := {
   verifyRoots := [verifyCacheRoot1, verifyCacheRoot2]
 }
 
+/--
+Import-consistent variant of `cachePoisonPkg`: both verify items mention the provisional lemma
+`Proof.Native.usesNative` directly and declare the import of `Proof.Native`.
+-/
+def cachePoisonDeclaredPkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule pillarProofMod .proof [provisionalNativeAxDecl, provisionalNativeThmDecl],
+    mkAlignedModule verifyCacheMod1 .verify [{
+      name := verifyCacheRoot1, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.natLit 1),
+      value? := some (.app (.app (.const verificationResultMkName) (.natLit 1))
+        (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
+          (.const pillarThmName))),
+      hasValue := true, all := [verifyCacheRoot1], originModule := verifyCacheMod1
+    }] (imports := [{ module := pillarProofMod }]),
+    mkAlignedModule verifyCacheMod2 .verify [{
+      name := verifyCacheRoot2, kind := .thmDecl,
+      type := .app (.const SymName.verificationResultName) (.natLit 2),
+      value? := some (.app (.app (.const verificationResultMkName) (.natLit 2))
+        (.app (.lam validNativeAxiomTypeExpr (.const SymName.trueIntroName))
+          (.const pillarThmName))),
+      hasValue := true, all := [verifyCacheRoot2], originModule := verifyCacheMod2
+    }] (imports := [{ module := pillarProofMod }])
+  ]
+  verifyRoots := [verifyCacheRoot1, verifyCacheRoot2]
+}
+
 theorem cleanNonWorkspace_cache_poisoning_bypass :
     naiveCachedClosureMultiItemAudit cachePoisonPkg =
       [(verifyCacheRoot1, "ProvisionalNative"), (verifyCacheRoot2, "VerifiedUnconditional")] ∧
-    (auditAndReplayPackage provisionalConfig cachePoisonPkg).map
+    auditAndReplayPackage provisionalConfig cachePoisonPkg =
+      .error (.referenceOutsideImportClosure topicTheoryModName theoryUsesProvName
+        pillarThmName pillarProofMod) ∧
+    (auditAndReplayPackage provisionalConfig cachePoisonDeclaredPkg).map
       (fun cert => cert.itemReports.map fun r => (r.root, r.status)) =
       .ok [
         (verifyCacheRoot1, .provisionalNative [provisionalNativeAxName]),
@@ -10677,7 +11032,7 @@ theorem cleanNonWorkspace_cache_poisoning_bypass :
       ] ∧
     auditAndReplayPackage defaultUnconditionalConfig cachePoisonPkg =
       .error (.forbiddenNativeReductionAxiom provisionalNativeAxName provisionalNativeAxName) := by
-  refine ⟨rfl, rfl, rfl⟩
+  refine ⟨rfl, rfl, rfl, rfl⟩
 
 /-- Claim roots cannot reside in `.theory` or `.test` modules. -/
 def theoryClaimRootName : SymName := SymName.ofList ["Anneal", "TheoryHelper", "claimInTheory"]
@@ -10696,5 +11051,123 @@ theorem passA2_claim_root_in_theory_rejected :
       .error (.invalidVerifyRoot theoryClaimRootName
         "claim root cannot reside in theory or test module") :=
   rfl
+
+/-! ### Section 9.10: Pass-`B3` Regression Witnesses (Unlisted Verify Modules, `Lean.*` Imports, `bv_decide?` / `bv_check`) -/
+
+/-- `statementLeakPkg` with its `Verify.Topic.verified` root simply NOT listed. -/
+def unlistedVerifyModulePkg : PackageAuditInput :=
+  { statementLeakPkg with verifyRoots := [] }
+
+/--
+Regression (unlisted Verify module): `Verify.Topic.verified` has a `.theory` constant in its
+statement. With the root listed the package is rejected for the leak; pass `A2` ACCEPTED the same
+package once the root was left out of `verifyRoots`, because header and statement-origin checks
+only ran for listed roots. A `.verify` module whose root is not listed is now rejected.
+-/
+theorem unlistedVerifyModule_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig statementLeakPkg =
+      .error (.statementTheoryLeak validVerifyThmName theoryClaimTypeName topicTheoryModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig unlistedVerifyModulePkg =
+      .error (.invalidVerifyRoot validVerifyThmName
+        "verify module root is not listed in verifyRoots") := by
+  refine ⟨rfl, rfl⟩
+
+def leanMetaImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := SymName.ofList ["Lean", "Elab", "Command"] }]))
+
+def leanRootImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := SymName.mkSimple "Lean" }]))
+
+def stdImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (imports := [{ module := SymName.ofList ["Std", "Data", "HashMap"] }]))
+
+/--
+Regression (`Lean.*` imports): pass `A2` added `Lean` to `isStdlibModule` so that `Lean`-named
+package modules are refused, which also made `import Lean.Elab.Command` and `import Lean` count as
+standard-library imports. `TrustedBoundary.isStdlibMod` admits only `Init` / `Std`; the
+metaprogramming API is a foreign module there and is rejected here, while `Std.*` stays importable.
+-/
+theorem leanMetaImport_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig leanMetaImportPkg =
+      .error (.foreignImport topicProofModName (SymName.ofList ["Lean", "Elab", "Command"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig leanRootImportPkg =
+      .error (.foreignImport topicProofModName (SymName.mkSimple "Lean")) ∧
+    (auditAndReplayPackage defaultUnconditionalConfig stdImportPkg).isOk = true := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/--
+Regression (`bv_decide` family): `bv_decide?` (`Lean.Parser.Tactic.bvTrace`) and `bv_check`
+(`Lean.Parser.Tactic.bvCheck`) are separate tactic keywords in `Init/Tactics.lean` (lines 1929 and
+1890) from the same family as `bv_decide`; the scanner matched only the bare `bv_decide` token.
+-/
+theorem sourceScanner_bv_decide_family_rejected :
+    scanProofSource "theorem t (x : BitVec 8) : x = x := by bv_decide?" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t (x : BitVec 8) : x = x := by bv_check \"t.lrat\"" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t : True := by decide? (config := c)" =
+      .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") ∧
+    scanProofSource "theorem t : True := by simp?" = .ok () := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+def specUsesProofName : SymName := SymName.ofList ["Topic", "Spec", "usesProof"]
+
+/-- A `.spec` theorem whose VALUE mentions the `.proof` lemma `Topic.Proofs.cleanLemma`. -/
+def specUsesProofDecl : ConstantRecord := {
+  name := specUsesProofName
+  kind := .thmDecl
+  type := .const SymName.trueName
+  value? := some (.const cleanProofThmName)
+  hasValue := true
+  all := [specUsesProofName]
+  originModule := topicSpecModName
+}
+
+/-- The `.spec` module mentions a `.proof` constant but declares NO import edge. -/
+def specUndeclaredImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule topicSpecModName .spec [specUsesProofDecl]])
+
+/-- Same module with the import edge declared honestly. -/
+def specDeclaredImportPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl])
+    (extraMods := [mkAlignedModule topicSpecModName .spec [specUsesProofDecl]
+      (imports := [{ module := topicProofModName }])])
+
+def testOnlyLemmaName : SymName := SymName.ofList ["Topic", "Tests", "helper"]
+def proofUsesTestName : SymName := SymName.ofList ["Topic", "Proofs", "usesTest"]
+
+/-- A `.proof` module mentioning a `.test` module lemma without importing it. -/
+def proofUsesTestPkg : PackageAuditInput :=
+  mkSingleProofPkg
+    (mkAlignedModule topicProofModName .proof [{
+      name := proofUsesTestName, kind := .thmDecl, type := .const SymName.trueName,
+      value? := some (.const testOnlyLemmaName), hasValue := true,
+      all := [proofUsesTestName], originModule := topicProofModName }])
+    (extraMods := [mkAlignedModule topicTestsModName .test [{
+      name := testOnlyLemmaName, kind := .thmDecl, type := .const SymName.trueName,
+      value? := some (.const SymName.trueIntroName), hasValue := true,
+      all := [testOnlyLemmaName], originModule := topicTestsModName }]])
+
+/--
+Regression (references outside the import closure): pass `A2` enforced role stratification only on
+DECLARED import edges, so a `.spec` module mentioning a `.proof` lemma was accepted as soon as its
+inventory declared no import, and a `.proof` module could mention a `.test` lemma the same way.
+Both are now rejected for the undeclared dependency, and declaring the edge honestly runs into the
+role policy, so the dependency is refused either way.
+-/
+theorem reference_outside_import_closure_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig specUndeclaredImportPkg =
+      .error (.referenceOutsideImportClosure topicSpecModName specUsesProofName
+        cleanProofThmName topicProofModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig specDeclaredImportPkg =
+      .error (.forbiddenImportDirection topicSpecModName "spec" topicProofModName "proof") ∧
+    auditAndReplayPackage defaultUnconditionalConfig proofUsesTestPkg =
+      .error (.referenceOutsideImportClosure topicProofModName proofUsesTestName
+        testOnlyLemmaName topicTestsModName) := by
+  refine ⟨rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditPrototype
