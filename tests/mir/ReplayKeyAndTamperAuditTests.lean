@@ -2465,6 +2465,107 @@ theorem passB4_sourceScanner_guard_meta_and_module_header_hardened :
     isOk (scan (chars! "import Init\nnamespace Topic\ndef module := 1\ndef all := 2\ndef guard := 3\ndef metadata := 4\nprivate def helper := 5\nend Topic")) = true := by
   decide +kernel
 
+/-! ## Pass `A4` hardening regressions -/
+
+def coeDepName : SymName := sn! "CoeDep"
+def finName : SymName := sn! "Fin"
+def finMkName : SymName := sn! "Fin.mk"
+def localWitnessName : SymName := sn! "Topic.Defs.localWitness"
+def localOpaqueName : SymName := sn! "Topic.Defs.localOpaqueWitness"
+
+def a4FinBaseDecls : List ConstantRecord :=
+  standardBaseDecls ++ [
+    baseDecl finName (.inductDecl [finMkName]) (.pi natE (.sort 1)) SymName.initPreludeModuleName,
+    baseDecl finMkName (.ctorDecl finName)
+      (.pi natE (.pi trueE (.app (.const finName) (.natLit 1)))) SymName.initPreludeModuleName,
+    baseDecl coeDepName (.inductDecl [])
+      (.pi (.app (.const finName) (.natLit 1))
+        (.pi (.app (.const finName) (.natLit 1)) (.pi boolE (.sort 0))))
+      SymName.initPreludeModuleName]
+
+/-- Proof-irrelevant `.thmDecl` witnesses (`theorem localWitness : True := True.intro` inside
+`CoeDep (Fin 1) (Fin.mk 0 localWitness) Bool`, verified `rc=0` hijack in Lean 4.34.1) cannot
+serve as base instance anchors, while rigid `.opaqueDecl` anchors and non-`outParam` 3/4-segment
+classes (`Std.NotARange.Sliceable`, `Lean.Grind.ToInt.Custom`) are handled accurately without
+wildcard over-reach. -/
+theorem passA4_proof_irrelevance_thm_anchor_and_wildcard_outparam_hardened :
+    let thmWitness : ConstantRecord := mkThm localWitnessName trueE trueIntroE
+    let opqWitness : ConstantRecord :=
+      { name := localOpaqueName, kind := .opaqueDecl, type := trueE, value? := some trueIntroE,
+        all := [localOpaqueName] }
+    let finTerm (w : SymName) : ExprSkeleton :=
+      .app (.app (.const finMkName) (.natLit 0)) (.const w)
+    let coeDepTy (w : SymName) : ExprSkeleton :=
+      .app (.app (.app (.const coeDepName) (.app (.const finName) (.natLit 1))) (finTerm w)) boolE
+    let defsWithThm := addConsts defsModule
+      [thmWitness, mkDef premInstName (coeDepTy localWitnessName) trueIntroE]
+    let defsWithOpq := addConsts defsModule
+      [opqWitness, mkDef premInstName (coeDepTy localOpaqueName) trueIntroE]
+    isBaseInstanceAnchor defsWithThm localWitnessName = false ∧
+    isBaseInstanceAnchor defsWithOpq localOpaqueName = true ∧
+    failsWith (validateModuleExtensionsIn (mkBaseKernelEnv a4FinBaseDecls ++ mkBaseKernelEnv defsWithThm.constants)
+        (addExts defsWithThm [.instanceEntry premInstName coeDepName false]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    isOk (validateModuleExtensionsIn (mkBaseKernelEnv a4FinBaseDecls ++ mkBaseKernelEnv defsWithOpq.constants)
+        (addExts defsWithOpq [.instanceEntry premInstName coeDepName false])) = true ∧
+    -- exact segment lists: known `ToInt.Zero` and `Std.Rco.Sliceable` strip `outParam`s,
+    -- while non-member `ToInt.Custom` and `Std.NotARange.Sliceable` return `none`
+    (instanceInputExprsOpt
+      (.app (.app (.app (.app (c! "Lean.Grind.ToInt.Zero") natE) natE) (.const colorName)) natE)).isSome = true ∧
+    (instanceInputExprsOpt
+      (.app (.app (.app (.app (c! "Lean.Grind.ToInt.Custom") natE) natE) (.const colorName)) natE)).isNone = true ∧
+    (instanceInputExprsOpt
+      (.app (.app (.app (c! "Std.Rco.Sliceable") natE) (.const colorName)) natE)).isSome = true ∧
+    (instanceInputExprsOpt
+      (.app (.app (.app (c! "Std.NotARange.Sliceable") natE) (.const colorName)) natE)).isNone = true := by
+  decide +kernel
+
+/-- Inventory validation rejects `.recDecl` records that omit rules for any constructor of
+their inductive block (`rules = []` or missing `Color.blue`). -/
+theorem passA4_rec_rules_complete_rejected :
+    let emptyRec : ConstantRecord :=
+      { name := sn! "Topic.Defs.Color.recEmpty",
+        kind := .recDecl [],
+        type := canonicalRecType colorName [redName, blueName], all := [colorName] }
+    let partialRec : ConstantRecord :=
+      { name := sn! "Topic.Defs.Color.recPartial",
+        kind := .recDecl [{ ctor := redName, nfields := 0, rhs := trueIntroE }],
+        type := canonicalRecType colorName [redName, blueName], all := [colorName] }
+    failsWith (validateReplayInventory (addConsts defsModule [emptyRec]))
+      (.invalidMutualAll defsMod (sn! "Topic.Defs.Color.recEmpty") "recursor missing constructor rule") = true ∧
+    failsWith (validateReplayInventory (addConsts defsModule [partialRec]))
+      (.invalidMutualAll defsMod (sn! "Topic.Defs.Color.recPartial") "recursor missing constructor rule") = true ∧
+    isOk (validateReplayInventory defsModule) = true := by
+  decide +kernel
+
+/-- Source scanner rejects `#exit`, `#with_exporting`, `#time`, `#synth`, `#check_tactic`,
+`#check_simp`, `#check_failure`, `#check_assertions`, `#version`, `#where`, diagnostic `#`
+commands, and `prelude` headers, while accepting valid dotted module imports (`import Topic.all`,
+`import Spec.all.Defs`) and benign `#check`/`#print`/`#guard_msgs` commands. -/
+theorem passA4_sourceScanner_exit_exporting_prelude_and_dotted_import_all_hardened :
+    flags (chars! "theorem ok : True := trivial\n#exit\n") "#exit" = true ∧
+    flags (chars! "#with_exporting\ntheorem ok : True := trivial\n") "#with_exporting" = true ∧
+    flags (chars! "#time theorem ok : True := trivial") "#time" = true ∧
+    flags (chars! "#synth Inhabited Nat") "#synth" = true ∧
+    flags (chars! "#check_tactic True ~> True by skip") "#check_tactic" = true ∧
+    flags (chars! "#check_tactic_failure False ~> True by skip") "#check_tactic_failure" = true ∧
+    flags (chars! "#check_simp 1 + 0 ~> 1") "#check_simp" = true ∧
+    flags (chars! "#check_failure (0 : Bool)") "#check_failure" = true ∧
+    flags (chars! "#check_assertions") "#check_assertions" = true ∧
+    flags (chars! "#version") "#version" = true ∧
+    flags (chars! "#where") "#where" = true ∧
+    flags (chars! "#discr_tree_key Nat") "#discr_tree_key" = true ∧
+    flags (chars! "#grind_lint check") "#grind_lint" = true ∧
+    flags (chars! "#info_trees in theorem t : True := trivial") "#info_trees" = true ∧
+    flags (chars! "#widget foo") "#widget" = true ∧
+    flags (chars! "def a := r#exit") "#exit" = true ∧
+    flags (chars! "def s := s!\"{#with_exporting}\"") "#with_exporting" = true ∧
+    flags (chars! "prelude\ndef False := True") "prelude" = true ∧
+    flags (chars! "/- header -/ prelude\n") "prelude" = true ∧
+    -- positive: `import Topic.all` / `import Spec.all.Defs` (falsely rejected in B4) now pass
+    isOk (scan (chars! "import Init\nimport Topic.all\nimport Spec.all.Defs\nnamespace Topic.module\ndef prelude := 1\ndef exit := 2\ndef synth := 3\n#check prelude\n#print exit\n#guard_msgs in #check synth\nend Topic.module\n")) = true := by
+  decide +kernel
+
 
 /-! ## End-to-end instantiation on the clean package -/
 
@@ -2895,5 +2996,21 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB4_sourceScanner_guard_meta_and_module_header_hardened' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passB4_sourceScanner_guard_meta_and_module_header_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAudit.validInventory_rec_rules_complete' depends on axioms: [propext, Quot.sound] -/
+#guard_msgs (whitespace := lax) in
+#print axioms validInventory_rec_rules_complete
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA4_proof_irrelevance_thm_anchor_and_wildcard_outparam_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA4_proof_irrelevance_thm_anchor_and_wildcard_outparam_hardened
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA4_rec_rules_complete_rejected' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA4_rec_rules_complete_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA4_sourceScanner_exit_exporting_prelude_and_dotted_import_all_hardened' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA4_sourceScanner_exit_exporting_prelude_and_dotted_import_all_hardened
 
 end Anneal.ReplayKeyAndTamperAuditTests
