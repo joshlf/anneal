@@ -25,7 +25,8 @@ use anneal_spec::panic_contract::{
     replay_stateful_panic_trial_input, verify_call_boundary, verify_call_chain_boundary,
     verify_callee_table_excludes, verify_counted_call_sites, verify_fn_inline_never_source,
     verify_fn_inline_never_source_with_options, verify_reachable_call_boundary,
-    verify_reachable_call_sites, verify_traits_preserved, waive_abort_unchecked,
+    verify_call_frame_and_traits_preserved, verify_reachable_call_sites,
+    verify_reachable_callees_call_sites, verify_traits_preserved, waive_abort_unchecked,
 };
 use anneal_spec::spec_check::{
     KILL_FREE_OVERSCAN, ProbeDomain, SpecCheckConfig, SplitMix64, SyntacticBindingHint,
@@ -1497,12 +1498,460 @@ fn kani5095_mir_cfg_and_multi_hop_call_boundary_verifiers() {
     // Capacity overflow fails closed.
     let huge = [MirBlockSummary::ret(); MAX_MIR_BLOCKS + 1];
     assert_eq!(
-        verify_reachable_call_sites(&huge, &[], &[], TARGET, 0),
+        verify_reachable_call_sites(&huge, &[], &[], TARGET, 1),
         CallBoundaryVerdict::CfgExceedsCapacity {
             block_count: MAX_MIR_BLOCKS + 1,
             max_blocks: MAX_MIR_BLOCKS,
         }
     );
+}
+
+// ===========================================================================
+// 3b. `[adv ep2 B1]` Hardening: Nested / Macro-Hidden Targets, Lexer Corner
+//     Cases, Vacuous Counted Guards, Callee-Table Frames & Transitive Guards
+// ===========================================================================
+
+#[test]
+fn kani5095_source_scanner_rejects_nested_and_macro_hidden_targets() {
+    use InlineBoundaryVerdict::*;
+    let strict = InlineScanOptions::strict();
+    let both = |src: &str| {
+        (
+            verify_fn_inline_never_source(src, "target"),
+            verify_fn_inline_never_source_with_options(src, "target", strict),
+        )
+    };
+
+    // An un-annotated duplicate nested in a function body, a `const` block,
+    // a closure, a macro invocation, or a `macro_rules!` template can no
+    // longer hide behind a correctly annotated item-level definition.
+    for hidden in [
+        "#[inline(never)] fn target() {}\nmod m { fn outer() { fn target() {} } }",
+        "#[inline(never)] fn target() {}\nmod m { const _: () = { fn target() {} }; }",
+        "#[inline(never)] fn target() {}\nfn g() { let c = || { fn target() {} }; }",
+        "#[inline(never)] fn target() {}\nmod m { make! { fn target() {} } }",
+        "macro_rules! m { () => { fn target() {} } }\n#[inline(never)] fn target() {}",
+        "fn outer() { fn target() {} }",
+    ] {
+        assert_eq!(both(hidden), (MissingInlineNever, MissingInlineNever), "{hidden}");
+    }
+    // Nested occurrences get the full attribute analysis too.
+    assert_eq!(
+        both("fn outer() { #[inline(never)] #[inline(always)] fn target() {} }"),
+        (ConflictingInlineAttributes, ConflictingInlineAttributes)
+    );
+    assert_eq!(
+        both("fn outer() { #[cfg_attr(test, inline(never))] fn target() {} }"),
+        (ConditionalInlineNever, ConditionalInlineNever)
+    );
+
+    // Annotated nested / macro-template occurrences are accepted.
+    assert_eq!(both("fn outer() { #[inline(never)] fn target() {} }"), (Verified, Verified));
+    assert_eq!(
+        both(
+            "macro_rules! m { () => { #[inline(never)] fn target() {} } }\n\
+             #[inline(never)] fn target() {}"
+        ),
+        (Verified, Verified)
+    );
+
+    // Polymorphism inside bodies: nested generic `impl` / `trait` scopes are
+    // tracked, while plain nested fns stay monomorphic (E0401).
+    assert_eq!(
+        both("fn g() { impl<T> Foo<T> { #[inline(never)] fn target(&self) {} } }"),
+        (Verified, ForbiddenPolymorphicOrTraitDefault)
+    );
+    assert_eq!(
+        both("fn g() { trait T { #[inline(never)] fn target(&self) {} } }"),
+        (Verified, ForbiddenPolymorphicOrTraitDefault)
+    );
+    assert_eq!(
+        both("fn g<T>() { #[inline(never)] fn target() {} }"),
+        (Verified, Verified)
+    );
+
+    // Rust 2024 `safe fn` in `unsafe extern` blocks is a real target item.
+    assert_eq!(
+        both("unsafe extern \"C\" { safe fn target(); }"),
+        (MissingInlineNever, MissingInlineNever)
+    );
+}
+
+#[test]
+fn kani5095_source_scanner_lexer_corner_cases_do_not_false_positive() {
+    use InlineBoundaryVerdict::*;
+    for ok in [
+        // Legal token sequences previously rejected as `MalformedSource`.
+        "auto trait Marker {}\n#[inline(never)] fn target() {}",
+        "# ! [allow(dead_code)]\n#[inline(never)] fn target() {}",
+        "#!/usr/bin/env run-cargo-script\n#[inline(never)] fn target() {}",
+        "#![allow(dead_code)]\n#[inline(never)] fn target() {}",
+        // Macro token trees with non-item structure.
+        "macro_rules! m { ($n:ident) => { mod $n {} } }\n#[inline(never)] fn target() {}",
+        "fn g() { quote! { impl<#generics> #name { fn #method() {} } } }\n\
+         #[inline(never)] fn target() {}",
+        // Lifetimes vs char literals, labels, raw byte strings with braces.
+        "fn g<'a>(x: &'a u8) -> char { let _ = '{'; let _ = b'}'; 'a' }\n\
+         #[inline(never)] fn target() {}",
+        "fn g() { 'outer: loop { break 'outer; } }\n#[inline(never)] fn target() {}",
+        "const S: &[u8] = br#\"} fn target() {\"#;\n#[inline(never)] fn target() {}",
+        // `impl Trait` in return / type-alias position and fn-pointer types.
+        "type X = impl Sized;\nfn g() -> impl Fn() { || {} }\n\
+         fn h() { let f: fn(u8) -> u8 = k; }\n#[inline(never)] fn target() {}",
+        "#[unsafe(no_mangle)]\n#[inline(never)] fn target() {}",
+    ] {
+        assert_eq!(verify_fn_inline_never_source(ok, "target"), Verified, "{ok}");
+    }
+
+    // Dogfooding on real, macro- and literal-heavy Rust sources.
+    assert_eq!(
+        verify_fn_inline_never_source(include_str!("panic_contract_tests.rs"), "checked_add_u8"),
+        Verified
+    );
+    let lib_src = include_str!("../src/panic_contract.rs");
+    assert_eq!(verify_fn_inline_never_source(lib_src, "invoke_boundary_guarded"), Verified);
+    assert_eq!(
+        verify_fn_inline_never_source_with_options(
+            lib_src,
+            "invoke_boundary_guarded",
+            InlineScanOptions::strict(),
+        ),
+        ForbiddenPolymorphicOrTraitDefault
+    );
+    assert_eq!(verify_fn_inline_never_source(lib_src, "check_panic_contract"), MissingInlineNever);
+}
+
+#[test]
+fn kani5095_vacuous_guards_callee_frames_and_transitive_callee_sites() {
+    const TARGET: &str = "crate::math::checked_add_u8";
+    let fully_inlined_caller = [MirBlockSummary::ret()];
+
+    // A counted guard expecting ZERO sites would accept a fully inlined caller.
+    assert_eq!(
+        verify_counted_call_sites(&fully_inlined_caller, &[], &[], TARGET, 0),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+    assert_eq!(
+        verify_reachable_call_sites(&fully_inlined_caller, &[], &[], TARGET, 0),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+    const ZERO_GUARD: CallBoundaryGuard =
+        CallBoundaryGuard::new("crate::caller", TARGET).with_expected_call_sites(0);
+    assert_eq!(
+        ZERO_GUARD.verify_reachable_sites(&fully_inlined_caller, &[], &[]),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+    assert_eq!(
+        ZERO_GUARD
+            .with_forbid_trait_dispatch(false)
+            .verify_reachable_sites(&fully_inlined_caller, &[], &[]),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+
+    // `callFrameAndTraitsPreserved`: Call 1 injecting the target's body into
+    // `callees` is caught even when the post-call trait table is unchanged.
+    let helper_blocks = [MirBlockSummary::call(TARGET, &[1]), MirBlockSummary::ret()];
+    let ret_only = [MirBlockSummary::ret()];
+    let before_callees = [CalleeEntry::new("crate::helper", &helper_blocks)];
+    let after_injected = [
+        CalleeEntry::new("crate::helper", &helper_blocks),
+        CalleeEntry::new(TARGET, &ret_only),
+    ];
+    assert!(
+        verify_call_frame_and_traits_preserved(&before_callees, &before_callees, &[], &[], TARGET)
+            .is_preserved()
+    );
+    assert_eq!(
+        verify_call_frame_and_traits_preserved(&before_callees, &after_injected, &[], &[], TARGET),
+        CallBoundaryVerdict::CalleeTableMutatedAcrossCall
+    );
+    // Even a body swap that keeps the same `def_path` is a frame violation.
+    let after_swapped = [CalleeEntry::new("crate::helper", &ret_only)];
+    assert_eq!(
+        verify_call_frame_and_traits_preserved(&before_callees, &after_swapped, &[], &[], TARGET),
+        CallBoundaryVerdict::CalleeTableMutatedAcrossCall
+    );
+    let injected_trait = [TraitImplBinding::new(TARGET, "crate::evil")];
+    assert_eq!(
+        verify_call_frame_and_traits_preserved(
+            &before_callees,
+            &before_callees,
+            &[],
+            &injected_trait,
+            TARGET
+        ),
+        CallBoundaryVerdict::TraitTableMutatedAcrossCall
+    );
+
+    // Transitive `ReachableCalleesCallSitesPreserved` inside linked helpers.
+    let two_site_helper = [
+        MirBlockSummary::call(TARGET, &[1]),
+        MirBlockSummary::call(TARGET, &[2]),
+        MirBlockSummary::ret(),
+    ];
+    let half_inlined_helper = [MirBlockSummary::call(TARGET, &[1]), MirBlockSummary::ret()];
+    let dead_decoy_helper = [MirBlockSummary::ret(), MirBlockSummary::call(TARGET, &[0])];
+    let callees = [
+        CalleeEntry::new("crate::outer_helper", &two_site_helper),
+        CalleeEntry::new("crate::inner_helper", &helper_blocks),
+    ];
+    assert_eq!(
+        verify_reachable_callees_call_sites(
+            &callees,
+            &[],
+            &[("crate::outer_helper", 2), ("crate::inner_helper", 1)],
+            TARGET
+        ),
+        CallBoundaryVerdict::Preserved {
+            observed_call_sites: 3,
+            reachable_blocks: 5,
+        }
+    );
+    let half = [CalleeEntry::new("crate::outer_helper", &half_inlined_helper)];
+    assert_eq!(
+        verify_reachable_callees_call_sites(&half, &[], &[("crate::outer_helper", 2)], TARGET),
+        CallBoundaryVerdict::CalleeReachableCallSiteCountMismatch {
+            caller_index: 0,
+            expected: 2,
+            observed: 1,
+        }
+    );
+    let decoy = [CalleeEntry::new("crate::outer_helper", &dead_decoy_helper)];
+    assert_eq!(
+        verify_reachable_callees_call_sites(&decoy, &[], &[("crate::outer_helper", 1)], TARGET),
+        CallBoundaryVerdict::CalleeReachableCallSiteCountMismatch {
+            caller_index: 0,
+            expected: 1,
+            observed: 0,
+        }
+    );
+    // Duplicate bodies for one path must ALL satisfy the expectation.
+    let dup = [
+        CalleeEntry::new("crate::outer_helper", &helper_blocks),
+        CalleeEntry::new("crate::outer_helper", &dead_decoy_helper),
+    ];
+    assert_eq!(
+        verify_reachable_callees_call_sites(&dup, &[], &[("crate::outer_helper", 1)], TARGET),
+        CallBoundaryVerdict::CalleeReachableCallSiteCountMismatch {
+            caller_index: 0,
+            expected: 1,
+            observed: 0,
+        }
+    );
+    assert_eq!(
+        verify_reachable_callees_call_sites(&callees, &[], &[("crate::missing", 1)], TARGET),
+        CallBoundaryVerdict::MissingExpectedCaller { caller_index: 0 }
+    );
+    assert_eq!(
+        verify_reachable_callees_call_sites(&callees, &[], &[], TARGET),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+    assert_eq!(
+        verify_reachable_callees_call_sites(&callees, &[], &[("crate::outer_helper", 0)], TARGET),
+        CallBoundaryVerdict::ZeroExpectedCallSites
+    );
+    assert_eq!(
+        verify_reachable_callees_call_sites(
+            &after_injected,
+            &[],
+            &[("crate::helper", 1)],
+            TARGET
+        ),
+        CallBoundaryVerdict::TargetInCalleeTable
+    );
+    assert_eq!(
+        verify_reachable_callees_call_sites(
+            &callees,
+            &injected_trait,
+            &[("crate::outer_helper", 2)],
+            TARGET
+        ),
+        CallBoundaryVerdict::TargetDispatchedByTraitImpl
+    );
+}
+
+#[test]
+fn panics_if_mode_triggers_abort_interplay_and_degenerate_config() {
+    let cfg = PanicCheckConfig::default().with_max_trials(256);
+    let pre = |_: &(u8, u8)| Ok(true);
+    let overflow = |&(a, b): &(u8, u8)| Ok((a as u16) + (b as u16) > 255);
+    let post = |_: &(u8, u8), _: &u8| Ok(true);
+
+    // `PanicsIf` tolerates extra panics outside `panic_cond`.
+    let over_panicky = |&(a, b): &(u8, u8)| {
+        if a > 200 || (a as u16) + (b as u16) > 255 {
+            PanicExecOutcome::Panicked
+        } else {
+            PanicExecOutcome::Returned(a.wrapping_add(b))
+        }
+    };
+    assert!(
+        check_panic_contract_fallible(
+            cfg,
+            PanicContractMode::If,
+            pre,
+            overflow,
+            forbid_abort_fallible(),
+            over_panicky,
+            post
+        )
+        .is_strong()
+    );
+
+    // Dropped guard: missed panic in `If` mode.
+    let dropped = |&(a, b): &(u8, u8)| PanicExecOutcome::Returned(a.wrapping_add(b));
+    assert_eq!(
+        check_panic_contract_fallible(
+            cfg,
+            PanicContractMode::If,
+            pre,
+            overflow,
+            forbid_abort_fallible(),
+            dropped,
+            post
+        )
+        .failure_class(),
+        Some(PanicFailureClass::MissedExpectedPanic)
+    );
+
+    // `WaiveAbortUnchecked` does not let an abort discharge a panic trigger.
+    let aborts_instead = |&(a, b): &(u8, u8)| {
+        if (a as u16) + (b as u16) > 255 {
+            PanicExecOutcome::Aborted
+        } else {
+            PanicExecOutcome::Returned(a.wrapping_add(b))
+        }
+    };
+    assert_eq!(
+        check_panic_contract_fallible(
+            cfg,
+            PanicContractMode::If,
+            pre,
+            overflow,
+            AbortPolicy::<fn(&(u8, u8)) -> Result<bool, ()>>::WaiveAbortUnchecked,
+            aborts_instead,
+            post
+        )
+        .failure_class(),
+        Some(PanicFailureClass::MissedExpectedPanic)
+    );
+
+    // Under `AbortOnlyIf`, panicking where an abort is required is rejected.
+    let zero_aborts = |&(a, _b): &(u8, u8)| Ok(a == 0);
+    let panics_on_zero = |&(a, b): &(u8, u8)| {
+        if a == 0 || (a as u16) + (b as u16) > 255 {
+            PanicExecOutcome::Panicked
+        } else {
+            PanicExecOutcome::Returned(a.wrapping_add(b))
+        }
+    };
+    assert_eq!(
+        check_panic_contract_fallible(
+            cfg,
+            PanicContractMode::If,
+            pre,
+            overflow,
+            AbortPolicy::AbortOnlyIf(zero_aborts),
+            panics_on_zero,
+            post
+        )
+        .failure_class(),
+        Some(PanicFailureClass::MissedExpectedAbort)
+    );
+
+    // `min_panic_hits == 0` in `If` mode is vacuous (no `post`, no trigger
+    // evidence) and fails closed before running any trial...
+    let outcome = check_panic_contract_fallible(
+        cfg.with_min_panic_hits(0),
+        PanicContractMode::If,
+        pre,
+        |_: &(u8, u8)| Ok(false),
+        forbid_abort_fallible(),
+        dropped,
+        post,
+    );
+    let failure = outcome.failure().expect("vacuous PanicsIf must fail closed");
+    assert_eq!(failure.class, PanicFailureClass::DeadPanicCondition);
+    assert_eq!(failure.detail, PanicFailureDetail::DegenerateConfig);
+    assert_eq!(failure.stats.trials_run, 0);
+
+    // ...unless an abort trigger still demands evidence.
+    let abort_only = |&(a, _b): &(u8, u8)| {
+        if a == 0 {
+            PanicExecOutcome::Aborted
+        } else {
+            PanicExecOutcome::Returned(a)
+        }
+    };
+    assert!(
+        check_panic_contract_fallible(
+            cfg.with_min_panic_hits(0),
+            PanicContractMode::If,
+            pre,
+            |_: &(u8, u8)| Ok(false),
+            AbortPolicy::AbortOnlyIf(zero_aborts),
+            abort_only,
+            post
+        )
+        .is_strong()
+    );
+}
+
+#[test]
+fn unwind_macros_accept_explicit_abort_policy() {
+    let cfg = PanicCheckConfig::default().with_max_trials(256);
+
+    // `OnlyIf` + `AbortOnlyIf` via the unwind macro (aborts permitted, not
+    // required, so an unwinding runner passes).
+    let stats = assert_panic_contract_strong_unwind!(
+        cfg,
+        PanicContractMode::OnlyIf,
+        |_: &(u8, u8)| true,
+        |&(a, b): &(u8, u8)| (a as u16) + (b as u16) > 255,
+        abort_policy = AbortPolicy::AbortOnlyIf(|&(a, _b): &(u8, u8)| a == 255),
+        |&(a, b): &(u8, u8)| checked_add_u8(a, b),
+        |&(a, b): &(u8, u8), &out: &u8| out == a + b,
+    );
+    assert!(stats.abort_cond_hits > 0);
+    assert_eq!(stats.observed_aborts, 0);
+
+    // A trapping `abort_cond` is reported as a predicate trap, not a crash.
+    let trapped = check_panic_contract_unwind!(
+        cfg,
+        PanicContractMode::OnlyIf,
+        |_: &(u8, u8)| true,
+        |&(a, b): &(u8, u8)| (a as u16) + (b as u16) > 255,
+        abort_policy = AbortPolicy::AbortOnlyIf(|&(a, _b): &(u8, u8)| {
+            assert!(a != 0, "abort_cond trap");
+            false
+        }),
+        |&(a, b): &(u8, u8)| checked_add_u8(a, b),
+        |&(a, b): &(u8, u8), &out: &u8| out == a + b,
+    );
+    let failure = trapped.failure().expect("trapping abort_cond must fail");
+    assert_eq!(failure.class, PanicFailureClass::UnexpectedPanic);
+    assert!(matches!(
+        failure.detail,
+        PanicFailureDetail::PredicateTrapped {
+            trap: PanicTrapKind::AbortConditionPanicked,
+            ..
+        }
+    ));
+    let idx = failure.counterexample_trial().unwrap();
+    assert_eq!(replay_panic_trial_input::<(u8, u8)>(cfg, idx).unwrap().0, 0);
+
+    // `Exact` + `AbortOnlyIf` cannot be discharged by an unwinding runner:
+    // `catch_unwind` never yields `Aborted`, so the abort trigger is missed.
+    let missed = check_panic_contract_unwind!(
+        cfg,
+        PanicContractMode::Exact,
+        |_: &(u8, u8)| true,
+        |&(a, b): &(u8, u8)| a != 255 && (a as u16) + (b as u16) > 255,
+        abort_policy = AbortPolicy::AbortOnlyIf(|&(a, _b): &(u8, u8)| a == 255),
+        |&(a, b): &(u8, u8)| if a == 255 { a } else { checked_add_u8(a, b) },
+        |&(a, b): &(u8, u8), &out: &u8| out == a + b,
+    );
+    assert_eq!(missed.failure_class(), Some(PanicFailureClass::MissedExpectedAbort));
 }
 
 // ===========================================================================

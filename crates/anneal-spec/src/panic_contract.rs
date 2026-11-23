@@ -65,13 +65,17 @@
 //!      [`verify_fn_inline_never_source_with_options`]) verifying explicit
 //!      `#[inline(never)]` on target functions without being fooled by comments,
 //!      raw/byte/C strings, char literals, lifetimes, inner attributes, or
-//!      macro bodies.
+//!      macro bodies, and without letting an un-annotated duplicate hide inside
+//!      a function body, `const` block, macro invocation, or `macro_rules!`
+//!      template.
 //!    - Pure-`core` stack-allocated MIR CFG & multi-hop call-chain verifiers
 //!      mirroring `Anneal.PanicContracts` §6–§7
 //!      ([`verify_callee_table_excludes`], [`verify_traits_preserved`],
-//!      [`verify_call_boundary`], [`verify_counted_call_sites`],
-//!      [`verify_reachable_call_boundary`], [`verify_reachable_call_sites`],
-//!      [`verify_call_chain_boundary`]).
+//!      [`verify_call_frame_and_traits_preserved`], [`verify_call_boundary`],
+//!      [`verify_counted_call_sites`], [`verify_reachable_call_boundary`],
+//!      [`verify_reachable_call_sites`], [`verify_reachable_callees_call_sites`],
+//!      [`verify_call_chain_boundary`]). Counted guards expecting zero call
+//!      sites fail closed ([`CallBoundaryVerdict::ZeroExpectedCallSites`]).
 
 use core::array;
 use core::fmt;
@@ -1315,6 +1319,21 @@ fn validate_panic_config(
     }
 
     if mode != PanicContractMode::NeverPanics && config.min_panic_hits > max_trials {
+        return Some(PanicCheckOutcome::Failed(PanicCheckFailure {
+            class: PanicFailureClass::DeadPanicCondition,
+            stats,
+            detail: PanicFailureDetail::DegenerateConfig,
+        }));
+    }
+
+    // `PanicsIf` checks neither `post` nor normal returns: its only obligations
+    // are the panic (and, under `AbortOnlyIf`, abort) triggers. With
+    // `min_panic_hits == 0` and no required abort hits, a contract whose
+    // trigger never fires would pass with zero evidence, so fail closed.
+    if mode == PanicContractMode::If
+        && config.min_panic_hits == 0
+        && !(abort_kind == AbortPolicyKind::AbortOnlyIf && config.min_abort_hits > 0)
+    {
         return Some(PanicCheckOutcome::Failed(PanicCheckFailure {
             class: PanicFailureClass::DeadPanicCondition,
             stats,
@@ -4015,8 +4034,59 @@ macro_rules! stateful_panic_guard_mutant_unwind {
 /// Executes [`check_panic_contract_fallible`](crate::panic_contract::check_panic_contract_fallible)
 /// with `::std::panic::catch_unwind` guarding `pre`, `panic_cond`, `body`, and
 /// `post` at the caller's test site (defaulting to `AbortPolicy::ForbidAbort`).
+///
+/// An explicit infallible [`AbortPolicy`](crate::panic_contract::AbortPolicy)
+/// may be supplied with `abort_policy = <policy>` after `panic_cond`; its
+/// `abort_cond` is likewise guarded by `catch_unwind` (a trapping `abort_cond`
+/// is reported as a predicate trap rather than crashing the test binary).
 #[macro_export]
 macro_rules! check_panic_contract_unwind {
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr $(,)?
+    ) => {{
+        let mut __anneal_pre = $pre;
+        let mut __anneal_panic_cond = $panic_cond;
+        let mut __anneal_post = $post;
+        let __anneal_abort_policy = $crate::panic_contract::AbortPolicy::map_cond(
+            $abort_policy,
+            |mut __anneal_abort_cond| {
+                move |input: &_| {
+                    ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                        __anneal_abort_cond(input)
+                    }))
+                    .map_err(|_| ())
+                }
+            },
+        );
+        $crate::panic_contract::check_panic_contract_fallible(
+            $config,
+            $mode,
+            move |input| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| __anneal_pre(input)))
+                    .map_err(|_| ())
+            },
+            move |input| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_panic_cond(input)
+                }))
+                .map_err(|_| ())
+            },
+            __anneal_abort_policy,
+            $crate::panic_unwind_runner!($body),
+            move |input, ret| {
+                ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                    __anneal_post(input, ret)
+                }))
+                .map_err(|_| ())
+            },
+        )
+    }};
     ($config:expr, $mode:expr, $pre:expr, $panic_cond:expr, $body:expr, $post:expr $(,)?) => {{
         let mut __anneal_pre = $pre;
         let mut __anneal_panic_cond = $panic_cond;
@@ -4135,6 +4205,34 @@ macro_rules! check_stateful_panic_contract_unwind {
 /// success.
 #[macro_export]
 macro_rules! assert_panic_contract_strong_unwind {
+    (
+        $config:expr,
+        $mode:expr,
+        $pre:expr,
+        $panic_cond:expr,
+        abort_policy = $abort_policy:expr,
+        $body:expr,
+        $post:expr $(,)?
+    ) => {{
+        match $crate::check_panic_contract_unwind!(
+            $config,
+            $mode,
+            $pre,
+            $panic_cond,
+            abort_policy = $abort_policy,
+            $body,
+            $post
+        ) {
+            $crate::panic_contract::PanicCheckOutcome::Strong(stats) => stats,
+            $crate::panic_contract::PanicCheckOutcome::Failed(failure) => {
+                ::core::panic!(
+                    "panic contract failed dynamic unwind strength check ({}): {:?}",
+                    failure.class.canonical_name(),
+                    failure
+                );
+            }
+        }
+    }};
     ($config:expr, $mode:expr, $pre:expr, $panic_cond:expr, $body:expr, $post:expr $(,)?) => {{
         match $crate::check_panic_contract_unwind!(
             $config,
@@ -5159,6 +5257,22 @@ pub fn verify_fn_inline_never_source(source: &str, fn_name: &str) -> InlineBound
 
 /// Pure-`core` (zero-allocation) Rust source scanner with configurable
 /// [`InlineScanOptions`].
+///
+/// Runs two independent layers, both of which must accept:
+///
+/// 1. A structured item-level pass tracking `mod` / `impl` / `trait` /
+///    `extern` scopes, which validates every item-position `fn <fn_name>`.
+/// 2. A deep token-tree pass (`deep_scan_target_occurrences`) that also
+///    descends into function bodies, `const`/`static` initializer blocks,
+///    macro invocation bodies, and `macro_rules!` templates. Every
+///    `fn <fn_name>` occurrence found there (e.g. a nested `fn target() {}`
+///    inside another function body or generated by `m! { fn target() {} }`)
+///    must carry its own unconditional `#[inline(never)]`, so an
+///    un-annotated nested or macro-generated duplicate can no longer hide
+///    behind a correctly annotated item-level definition.
+///
+/// A leading `#!` shebang line (not followed by `[`) is ignored, matching the
+/// Rust lexer.
 pub fn verify_fn_inline_never_source_with_options(
     source: &str,
     fn_name: &str,
@@ -5167,12 +5281,93 @@ pub fn verify_fn_inline_never_source_with_options(
     if fn_name.is_empty() {
         return InlineBoundaryVerdict::TargetFunctionNotFound;
     }
+    let source = strip_shebang_line(source);
 
+    let mut structured_matches = 0usize;
+    match structured_inline_scan(source, fn_name, options, &mut structured_matches) {
+        InlineBoundaryVerdict::Verified | InlineBoundaryVerdict::TargetFunctionNotFound => {}
+        failure => return failure,
+    }
+
+    let (deep_matches, deep_failure) =
+        match deep_scan_target_occurrences(source, fn_name, options) {
+            Ok(res) => res,
+            Err(()) => return InlineBoundaryVerdict::MalformedSource,
+        };
+    if let Some(failure) = deep_failure {
+        return failure;
+    }
+    // Every item-level match is also a token-level match; anything else means
+    // the two layers disagree on the token stream, so fail closed.
+    if deep_matches < structured_matches {
+        return InlineBoundaryVerdict::MalformedSource;
+    }
+    if deep_matches == 0 {
+        InlineBoundaryVerdict::TargetFunctionNotFound
+    } else {
+        InlineBoundaryVerdict::Verified
+    }
+}
+
+/// Strips a leading `#!` shebang line unless the `#!` begins an inner
+/// attribute `#![...]` (possibly separated by whitespace or comments).
+fn strip_shebang_line(source: &str) -> &str {
+    let Some(rest) = source.strip_prefix("#!") else {
+        return source;
+    };
+    let mut lex = RustLexer::new(rest);
+    if matches!(lex.next_token(), Ok(Token { kind: TokenKind::Punct(b'['), .. })) {
+        return source;
+    }
+    match rest.find('\n') {
+        Some(idx) => &rest[idx..],
+        None => "",
+    }
+}
+
+/// Shared verdict logic for one matched `fn <fn_name>` occurrence given its
+/// pending outer attributes and polymorphism context.
+fn evaluate_target_attrs(
+    pending: &InlineAttrSummary,
+    polymorphic_or_trait: bool,
+    options: InlineScanOptions,
+) -> Option<InlineBoundaryVerdict> {
+    if pending.saw_malformed {
+        return Some(InlineBoundaryVerdict::MalformedSource);
+    }
+    if pending.saw_forbidden_inline
+        && (pending.saw_unconditional_never || pending.saw_conditional_never)
+    {
+        return Some(InlineBoundaryVerdict::ConflictingInlineAttributes);
+    }
+    if pending.saw_forbidden_inline {
+        return Some(InlineBoundaryVerdict::ForbiddenInlineHint);
+    }
+    if !pending.saw_unconditional_never {
+        if pending.saw_conditional_never {
+            return Some(InlineBoundaryVerdict::ConditionalInlineNever);
+        }
+        return Some(InlineBoundaryVerdict::MissingInlineNever);
+    }
+    if options.forbid_polymorphic_or_trait_default && polymorphic_or_trait {
+        return Some(InlineBoundaryVerdict::ForbiddenPolymorphicOrTraitDefault);
+    }
+    None
+}
+
+/// Structured item-level layer of
+/// [`verify_fn_inline_never_source_with_options`]. Counts item-position
+/// matches into `matched_count`.
+fn structured_inline_scan(
+    source: &str,
+    fn_name: &str,
+    options: InlineScanOptions,
+    matched_count: &mut usize,
+) -> InlineBoundaryVerdict {
     let mut lex = RustLexer::new(source);
     let mut scopes: [ScopeKind; MAX_SCOPE_DEPTH] = [ScopeKind::Module; MAX_SCOPE_DEPTH];
     let mut scope_len = 0usize;
     let mut pending = InlineAttrSummary::default();
-    let mut matched_count = 0usize;
 
     loop {
         let tok = match lex.next_token() {
@@ -5207,17 +5402,30 @@ pub fn verify_fn_inline_never_source_with_options(
                 }
             }
             // Outer attribute `#[...]` attaches to the immediately following item.
+            // A spaced inner attribute `# ! [...]` (legal Rust token sequence)
+            // applies to the enclosing scope instead.
             TokenKind::Punct(b'#') => {
                 let Ok(next) = lex.next_token() else {
                     return InlineBoundaryVerdict::MalformedSource;
                 };
-                if next.kind != TokenKind::Punct(b'[') {
+                let is_inner = next.kind == TokenKind::Punct(b'!');
+                let open = if is_inner {
+                    match lex.next_token() {
+                        Ok(t) => t,
+                        Err(()) => return InlineBoundaryVerdict::MalformedSource,
+                    }
+                } else {
+                    next
+                };
+                if open.kind != TokenKind::Punct(b'[') {
                     return InlineBoundaryVerdict::MalformedSource;
                 }
                 let Ok(inner) = lex.consume_balanced_inner(b'[') else {
                     return InlineBoundaryVerdict::MalformedSource;
                 };
-                analyze_attr_meta_list(inner, true, 0, &mut pending);
+                if !is_inner {
+                    analyze_attr_meta_list(inner, true, 0, &mut pending);
+                }
             }
             // Visibility & function qualifiers preserve `pending` outer attributes.
             TokenKind::Ident("pub") => {
@@ -5228,8 +5436,10 @@ pub fn verify_fn_inline_never_source_with_options(
                     }
                 }
             }
-            TokenKind::Ident("default" | "async" | "unsafe") => {
+            TokenKind::Ident("default" | "async" | "unsafe" | "safe" | "auto") => {
                 // Keep `pending` for `fn`, `trait`, or `impl` (non-fn resets below).
+                // `safe fn` appears in Rust 2024 `unsafe extern` blocks and
+                // `auto trait` declares an auto trait.
             }
             TokenKind::Ident("const") => {
                 // `const fn`, `const unsafe ... fn`, `const extern ... fn` keep `pending`.
@@ -5328,37 +5538,15 @@ pub fn verify_fn_inline_never_source_with_options(
                 }
 
                 if fn_ident_matches(ident, fn_name) {
-                    matched_count += 1;
+                    *matched_count += 1;
 
-                    if pending.saw_malformed {
-                        return InlineBoundaryVerdict::MalformedSource;
-                    }
-                    if pending.saw_forbidden_inline
-                        && (pending.saw_unconditional_never || pending.saw_conditional_never)
-                    {
-                        return InlineBoundaryVerdict::ConflictingInlineAttributes;
-                    }
-                    if pending.saw_forbidden_inline {
-                        return InlineBoundaryVerdict::ForbiddenInlineHint;
-                    }
-                    if !pending.saw_unconditional_never {
-                        if pending.saw_conditional_never {
-                            return InlineBoundaryVerdict::ConditionalInlineNever;
-                        }
-                        return InlineBoundaryVerdict::MissingInlineNever;
-                    }
-
-                    if options.forbid_polymorphic_or_trait_default {
-                        let in_trait =
-                            scope_len > 0 && scopes[scope_len - 1] == ScopeKind::Trait;
-                        let in_generic_impl = scope_len > 0
-                            && matches!(
-                                scopes[scope_len - 1],
-                                ScopeKind::Impl { is_generic: true }
-                            );
-                        if in_trait || in_generic_impl || fn_is_generic || has_impl_trait_param {
-                            return InlineBoundaryVerdict::ForbiddenPolymorphicOrTraitDefault;
-                        }
+                    let in_trait = scope_len > 0 && scopes[scope_len - 1] == ScopeKind::Trait;
+                    let in_generic_impl = scope_len > 0
+                        && matches!(scopes[scope_len - 1], ScopeKind::Impl { is_generic: true });
+                    let polymorphic =
+                        in_trait || in_generic_impl || fn_is_generic || has_impl_trait_param;
+                    if let Some(failure) = evaluate_target_attrs(&pending, polymorphic, options) {
+                        return failure;
                     }
                 }
 
@@ -5466,11 +5654,210 @@ pub fn verify_fn_inline_never_source_with_options(
         }
     }
 
-    if matched_count == 0 {
+    if *matched_count == 0 {
         InlineBoundaryVerdict::TargetFunctionNotFound
     } else {
         InlineBoundaryVerdict::Verified
     }
+}
+
+/// Enclosing-scope classification used by [`deep_scan_target_occurrences`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeepScope {
+    /// Module, function body, block, macro body, struct body, or extern block.
+    Plain,
+    /// `trait ... { ... }` body.
+    Trait,
+    /// `impl ... { ... }` body (or a `-> impl Trait { ... }` function body,
+    /// which is harmlessly classified as a non-generic impl).
+    Impl { is_generic: bool },
+}
+
+const MAX_DEEP_SCOPE_DEPTH: usize = 128;
+
+/// Skips an `impl`/`trait` header up to (and including) its opening `{`,
+/// returning `Ok(true)`, or up to (and including) a terminating `;` (type
+/// position `impl Trait`, trait aliases), returning `Ok(false)`. Stops without
+/// consuming at `}` or end of input (lenient inside macro token trees).
+fn skip_header_to_brace_or_semicolon(lex: &mut RustLexer<'_>) -> Result<bool, ()> {
+    loop {
+        let tok = lex.peek_token()?;
+        match tok.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}') => return Ok(false),
+            TokenKind::Punct(b'{') => {
+                let _ = lex.next_token()?;
+                return Ok(true);
+            }
+            TokenKind::Punct(b';') => {
+                let _ = lex.next_token()?;
+                return Ok(false);
+            }
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b'<') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_angle_inner()?;
+            }
+            _ => {
+                let _ = lex.next_token()?;
+            }
+        }
+    }
+}
+
+/// Deep token-tree layer of [`verify_fn_inline_never_source_with_options`].
+///
+/// Walks the entire token stream linearly — *including* function bodies,
+/// nested blocks, `const`/`static` initializers, macro invocation bodies, and
+/// `macro_rules!` templates, which the structured item-level layer skips — and
+/// validates every `fn <fn_name>` occurrence against its own preceding outer
+/// attributes. Nested items cannot capture outer generic parameters (E0401),
+/// so only the occurrence's own generics, `impl Trait` parameters, and its
+/// innermost enclosing `trait` / generic `impl` body determine polymorphism.
+///
+/// Structural oddities inside macro token trees (e.g. `quote! { #name }` or
+/// `mod $name`) are tolerated; only lexical errors and unbalanced braces fail.
+///
+/// Returns `(occurrences, first_failure)`.
+fn deep_scan_target_occurrences(
+    source: &str,
+    fn_name: &str,
+    options: InlineScanOptions,
+) -> Result<(usize, Option<InlineBoundaryVerdict>), ()> {
+    let mut lex = RustLexer::new(source);
+    let mut stack = [DeepScope::Plain; MAX_DEEP_SCOPE_DEPTH];
+    let mut cur_depth = 0usize;
+    let mut pending = InlineAttrSummary::default();
+    let mut occurrences = 0usize;
+    let mut first_failure: Option<InlineBoundaryVerdict> = None;
+
+    fn push(
+        stack: &mut [DeepScope; MAX_DEEP_SCOPE_DEPTH],
+        depth: &mut usize,
+        scope: DeepScope,
+    ) -> Result<(), ()> {
+        if *depth >= MAX_DEEP_SCOPE_DEPTH {
+            return Err(());
+        }
+        stack[*depth] = scope;
+        *depth += 1;
+        Ok(())
+    }
+
+    loop {
+        let tok = lex.next_token()?;
+        match tok.kind {
+            TokenKind::Eof => {
+                if cur_depth != 0 {
+                    return Err(());
+                }
+                break;
+            }
+            TokenKind::Punct(b'#') => match lex.peek_token()?.kind {
+                TokenKind::Punct(b'[') => {
+                    let _ = lex.next_token()?;
+                    let inner = lex.consume_balanced_inner(b'[')?;
+                    analyze_attr_meta_list(inner, true, 0, &mut pending);
+                }
+                TokenKind::Punct(b'!') => {
+                    let _ = lex.next_token()?;
+                    if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
+                        let _ = lex.next_token()?;
+                        let _ = lex.consume_balanced_inner(b'[')?;
+                    }
+                }
+                // e.g. `quote! { #name }` interpolation inside a macro body.
+                _ => pending.reset(),
+            },
+            TokenKind::HashBang => {
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_balanced_inner(b'[')?;
+                }
+            }
+            TokenKind::Punct(b'{') => {
+                pending.reset();
+                push(&mut stack, &mut cur_depth, DeepScope::Plain)?;
+            }
+            TokenKind::Punct(b'}') => {
+                if cur_depth == 0 {
+                    return Err(());
+                }
+                cur_depth -= 1;
+                pending.reset();
+            }
+            TokenKind::Ident("pub") => {
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_balanced_inner(b'(')?;
+                }
+            }
+            TokenKind::Ident("const" | "async" | "unsafe" | "default" | "safe" | "auto") => {}
+            TokenKind::Ident("extern") => {
+                if matches!(lex.peek_token()?.kind, TokenKind::Literal) {
+                    let _ = lex.next_token()?;
+                }
+            }
+            TokenKind::Ident("impl") => {
+                pending.reset();
+                let mut is_generic = false;
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+                    let _ = lex.next_token()?;
+                    let inner = lex.consume_angle_inner()?;
+                    // Unparseable generic lists (e.g. `impl<#generics>` in
+                    // `quote!`) are conservatively treated as generic.
+                    is_generic = generic_params_contain_type_or_const(inner).unwrap_or(true);
+                }
+                if skip_header_to_brace_or_semicolon(&mut lex)? {
+                    push(&mut stack, &mut cur_depth, DeepScope::Impl { is_generic })?;
+                }
+            }
+            TokenKind::Ident("trait") => {
+                pending.reset();
+                if skip_header_to_brace_or_semicolon(&mut lex)? {
+                    push(&mut stack, &mut cur_depth, DeepScope::Trait)?;
+                }
+            }
+            TokenKind::Ident("fn") => {
+                let TokenKind::Ident(name) = lex.peek_token()?.kind else {
+                    // `fn(..)` pointer type or `fn $name` macro template.
+                    pending.reset();
+                    continue;
+                };
+                let _ = lex.next_token()?;
+                let mut polymorphic = false;
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+                    let _ = lex.next_token()?;
+                    let inner = lex.consume_angle_inner()?;
+                    polymorphic |= generic_params_contain_type_or_const(inner).unwrap_or(true);
+                }
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) {
+                    let _ = lex.next_token()?;
+                    let params = lex.consume_balanced_inner(b'(')?;
+                    polymorphic |= params_contain_impl_trait(params)?;
+                }
+                if fn_ident_matches(name, fn_name) {
+                    occurrences += 1;
+                    let enclosing = if cur_depth > 0 {
+                        stack[cur_depth - 1]
+                    } else {
+                        DeepScope::Plain
+                    };
+                    polymorphic |=
+                        matches!(enclosing, DeepScope::Trait | DeepScope::Impl { is_generic: true });
+                    if first_failure.is_none() {
+                        first_failure = evaluate_target_attrs(&pending, polymorphic, options);
+                    }
+                }
+                pending.reset();
+            }
+            _ => pending.reset(),
+        }
+    }
+
+    Ok((occurrences, first_failure))
 }
 
 fn skip_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
@@ -5760,6 +6147,27 @@ pub enum CallBoundaryVerdict {
     },
     /// Caller or hop CFG has zero basic blocks where a reachable call is needed.
     EmptyCfg,
+    /// A counted guard was asked to expect **zero** call sites (or was given an
+    /// empty expectation list). Such a guard is vacuous — a fully inlined
+    /// caller with no remaining call site would satisfy it — so it fails
+    /// closed. (Episode 1 relates `CallBoundaryPreserved` to
+    /// `∃ n, 0 < n ∧ CallSitesPreserved … n`.)
+    ZeroExpectedCallSites,
+    /// The linked/inlineable `callees` table changed across a sequential
+    /// external call (violating the `callFramePreserved` half of
+    /// `callFrameAndTraitsPreserved`, enabling Call 1 to inject the target's
+    /// body into `callees` and silently inline Call 2).
+    CalleeTableMutatedAcrossCall,
+    /// An expected transitive caller (`expected_caller_counts[caller_index]`)
+    /// has no body in `callees` (`ReachableCalleesCallSitesPreserved`).
+    MissingExpectedCaller { caller_index: usize },
+    /// A transitive caller body's `bb0`-reachable call-site count to the target
+    /// differs from `expected_caller_counts[caller_index]`.
+    CalleeReachableCallSiteCountMismatch {
+        caller_index: usize,
+        expected: usize,
+        observed: usize,
+    },
 }
 
 impl CallBoundaryVerdict {
@@ -5906,6 +6314,28 @@ pub fn verify_traits_preserved(
     verify_callee_table_excludes(callees, after_trait_impls, target_path)
 }
 
+/// Verifies the full `callFrameAndTraitsPreserved` frame condition used by
+/// Episode 1's `withTraitsPreserved` across a sequential external call:
+/// the linked `callees` table **and** the trait-implementation table are both
+/// unchanged (`before_* == after_*`), and [`verify_callee_table_excludes`]
+/// holds for `target_path` afterwards.
+///
+/// [`verify_traits_preserved`] alone only compares trait tables, so Call 1
+/// injecting `target_path`'s body into `callees` is only caught when the
+/// caller happens to pass the post-call table; this checker compares both.
+pub fn verify_call_frame_and_traits_preserved(
+    before_callees: &[CalleeEntry<'_>],
+    after_callees: &[CalleeEntry<'_>],
+    before_trait_impls: &[TraitImplBinding<'_>],
+    after_trait_impls: &[TraitImplBinding<'_>],
+    target_path: &str,
+) -> CallBoundaryVerdict {
+    if before_callees != after_callees {
+        return CallBoundaryVerdict::CalleeTableMutatedAcrossCall;
+    }
+    verify_traits_preserved(before_trait_impls, after_trait_impls, after_callees, target_path)
+}
+
 /// Verifies syntactic `CallBoundaryPreserved`: at least one direct call site to
 /// `target_path` exists in `caller_blocks`, and `target_path` is excluded from
 /// `callees` and trait-dispatch tables.
@@ -5931,7 +6361,8 @@ pub fn verify_call_boundary(
 /// Verifies counted syntactic `CallSitesPreserved`: `caller_blocks` contains
 /// **exact** `expected_call_sites` direct calls to `target_path` (catching
 /// partial 1-of-2 inlining) and `target_path` is excluded from `callees` and
-/// trait-dispatch tables.
+/// trait-dispatch tables. `expected_call_sites == 0` fails closed with
+/// [`CallBoundaryVerdict::ZeroExpectedCallSites`].
 pub fn verify_counted_call_sites(
     caller_blocks: &[MirBlockSummary<'_>],
     callees: &[CalleeEntry<'_>],
@@ -5941,6 +6372,9 @@ pub fn verify_counted_call_sites(
 ) -> CallBoundaryVerdict {
     if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, true) {
         return err;
+    }
+    if expected_call_sites == 0 {
+        return CallBoundaryVerdict::ZeroExpectedCallSites;
     }
     let observed = count_syntactic_call_sites(caller_blocks, target_path);
     if observed != expected_call_sites {
@@ -5999,6 +6433,9 @@ fn verify_reachable_call_sites_inner(
     {
         return err;
     }
+    if expected_call_sites == 0 {
+        return CallBoundaryVerdict::ZeroExpectedCallSites;
+    }
     let (visited, reachable_blocks) = match compute_reachable_bitset(caller_blocks) {
         Ok(res) => res,
         Err(err) => return err,
@@ -6020,6 +6457,8 @@ fn verify_reachable_call_sites_inner(
 /// Verifies `ReachableCallSitesPreserved`: exact `expected_call_sites`
 /// `bb0`-reachable direct call sites to `target_path` exist in `caller_blocks`,
 /// and `target_path` is excluded from `callees` and trait-dispatch tables.
+/// `expected_call_sites == 0` fails closed with
+/// [`CallBoundaryVerdict::ZeroExpectedCallSites`].
 pub fn verify_reachable_call_sites(
     caller_blocks: &[MirBlockSummary<'_>],
     callees: &[CalleeEntry<'_>],
@@ -6035,6 +6474,63 @@ pub fn verify_reachable_call_sites(
         expected_call_sites,
         true,
     )
+}
+
+/// Verifies transitive `ReachableCalleesCallSitesPreserved` (Episode 1
+/// `reachableCalleesCallSitesPreserved`): for every `(caller_path, expected)`
+/// in `expected_caller_counts`, some body in `callees` has `def_path ==
+/// caller_path`, **every** such body has exactly `expected` `bb0`-reachable
+/// direct call sites to `target_path` (catching partial inlining or dead decoy
+/// calls *inside* linked helpers), and `target_path` is excluded from
+/// `callees` and all trait-dispatch tables.
+///
+/// Fails closed with [`CallBoundaryVerdict::ZeroExpectedCallSites`] on an
+/// empty expectation list or any `expected == 0` entry.
+pub fn verify_reachable_callees_call_sites(
+    callees: &[CalleeEntry<'_>],
+    caller_trait_impls: &[TraitImplBinding<'_>],
+    expected_caller_counts: &[(&str, usize)],
+    target_path: &str,
+) -> CallBoundaryVerdict {
+    if let Some(err) = check_tables_exclude(callees, caller_trait_impls, target_path, true) {
+        return err;
+    }
+    if expected_caller_counts.is_empty()
+        || expected_caller_counts.iter().any(|&(_, expected)| expected == 0)
+    {
+        return CallBoundaryVerdict::ZeroExpectedCallSites;
+    }
+
+    let mut total_sites = 0usize;
+    let mut total_reachable_blocks = 0usize;
+    for (caller_index, &(caller_path, expected)) in expected_caller_counts.iter().enumerate() {
+        let mut found = false;
+        for body in callees.iter().filter(|c| c.def_path == caller_path) {
+            found = true;
+            let (visited, reachable_blocks) = match compute_reachable_bitset(body.blocks) {
+                Ok(res) => res,
+                Err(err) => return err,
+            };
+            let observed = count_reachable_call_sites(body.blocks, &visited, target_path);
+            if observed != expected {
+                return CallBoundaryVerdict::CalleeReachableCallSiteCountMismatch {
+                    caller_index,
+                    expected,
+                    observed,
+                };
+            }
+            total_sites = total_sites.saturating_add(observed);
+            total_reachable_blocks = total_reachable_blocks.saturating_add(reachable_blocks);
+        }
+        if !found {
+            return CallBoundaryVerdict::MissingExpectedCaller { caller_index };
+        }
+    }
+
+    CallBoundaryVerdict::Preserved {
+        observed_call_sites: total_sites,
+        reachable_blocks: total_reachable_blocks,
+    }
 }
 
 /// Verifies arbitrary-length multi-hop helper call-chain boundary preservation
