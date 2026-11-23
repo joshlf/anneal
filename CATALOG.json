@@ -1307,8 +1307,8 @@
       "module": "Workbench.Pass1.ModIntOrder",
       "path": "lean/Workbench/Pass1/ModIntOrder.lean",
       "badge": "pass1_portable",
-      "summary": "Pass-1-portable (`prelude` + 51 locked `Init.*` foundation modules only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) theorems eliminating repeated boilerplate across real-crate proofs (`zerocopy`, `byteorder`, `ryu`, `bytes`) where `Init.Data.Int.Order` and `Init.Data.Nat.ModLemmas` are outside `foundation-lock.json`:",
-      "line_count": 328,
+      "summary": "Pass-1-portable (`prelude` + 51 locked `Init.*` foundation modules only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) theorems eliminating repeated boilerplate across real-crate proofs (`zerocopy`, `byteorder`, `ryu`, `bytes`), `MirCorrespondence`, and MIR lowering proofs where `Init.Data.Int.Order`, `Init.Data.Nat.ModLemmas`, `Init.Data.BitVec.Lemmas`, and `Init.Data.UInt.Lemmas` are outside `foundation-lock.json`:",
+      "line_count": 520,
       "imports": [
         "Init.Core",
         "Init.NotationExtra",
@@ -1318,9 +1318,11 @@
         "Init.Data.Nat.Div.Basic",
         "Init.Data.Fin.Basic",
         "Init.Data.BitVec.BasicAux",
-        "Init.Data.Int.Basic"
+        "Init.Data.UInt.BasicAux",
+        "Init.Data.Int.Basic",
+        "Init.Data.List.Basic"
       ],
-      "declaration_count": 36,
+      "declaration_count": 71,
       "declarations": [
         {
           "kind": "theorem",
@@ -1465,6 +1467,146 @@
         {
           "kind": "theorem",
           "name": "bv_eq_of_toNat_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_add_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_add_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_lt_iff_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_le_iff_toNat_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_not_add_lt_left_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "bv_toNat_sub_of_le"
+        },
+        {
+          "kind": "theorem",
+          "name": "u8_eq_of_toNat_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "u16_eq_of_toNat_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "u32_eq_of_toNat_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "u64_eq_of_toNat_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "u8_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u16_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u32_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u64_toNat_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u8_toNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "u16_toNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "u32_toNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "u64_toNat_ofNat"
+        },
+        {
+          "kind": "theorem",
+          "name": "u8_toNat_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u16_toNat_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u32_toNat_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u64_toNat_ofNat_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "u8_ofNat_ne_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "u32_ofNat_ne_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "u64_ofNat_ne_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_and_left_local"
+        },
+        {
+          "kind": "theorem",
+          "name": "bool_and_right_local"
+        },
+        {
+          "kind": "theorem",
+          "name": "list_beq_refl"
+        },
+        {
+          "kind": "theorem",
+          "name": "list_eq_of_beq"
+        },
+        {
+          "kind": "theorem",
+          "name": "list_beq_iff"
         }
       ]
     },

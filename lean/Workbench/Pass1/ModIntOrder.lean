@@ -15,16 +15,19 @@ import Init.Data.Nat.Basic
 import Init.Data.Nat.Div.Basic
 import Init.Data.Fin.Basic
 import Init.Data.BitVec.BasicAux
+import Init.Data.UInt.BasicAux
 import Init.Data.Int.Basic
+import Init.Data.List.Basic
 
 /-!
-# Modular Arithmetic, Constructive `Int` Order, and `BitVec.toNat` Lemmas
+# Modular Arithmetic, Constructive `Int` Order, and `BitVec` / `UInt` Lemmas
 
 Pass-1-portable (`prelude` + 51 locked `Init.*` foundation modules only, zero
 `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`)
 theorems eliminating repeated boilerplate across real-crate proofs (`zerocopy`,
-`byteorder`, `ryu`, `bytes`) where `Init.Data.Int.Order` and
-`Init.Data.Nat.ModLemmas` are outside `foundation-lock.json`:
+`byteorder`, `ryu`, `bytes`), `MirCorrespondence`, and MIR lowering proofs where
+`Init.Data.Int.Order`, `Init.Data.Nat.ModLemmas`, `Init.Data.BitVec.Lemmas`, and
+`Init.Data.UInt.Lemmas` are outside `foundation-lock.json`:
 
 1. `Nat` power-of-two monotonicity (`nat_two_pow_lt_succ`,
    `nat_two_pow_lt_of_lt`, `nat_two_pow_le_of_le`) and modular arithmetic
@@ -36,8 +39,17 @@ theorems eliminating repeated boilerplate across real-crate proofs (`zerocopy`,
    `int_le_refl`, `int_le_trans`, `int_lt_of_lt_of_le`, `int_lt_of_le_of_lt`,
    `int_le_antisymm`, `int_not_lt_of_ge`, `int_not_le_of_gt`, `int_ofNat_sub`,
    `int_sub_ofNat_neg_swap`).
-3. Zero-axiom `BitVec` extensionality from `toNat` over `Init.Data.BitVec.BasicAux`
-   (`bv_eq_of_toNat_eq`).
+3. `BitVec` `toNat`/`ofNat`, non-wrapping `+`/`-`, and `<`/`≤` bridges over
+   `Init.Data.BitVec.BasicAux` (`bv_eq_of_toNat_eq`, `bv_toNat_lt`,
+   `bv_toNat_ofNat`, `bv_toNat_ofNat_of_lt`, `bv_toNat_add`,
+   `bv_toNat_add_of_lt`, `bv_add_ofNat_of_lt`, `bv_not_add_lt_left_of_lt`,
+   `bv_toNat_sub_of_le`).
+4. Fixed-width `UInt8`/`UInt16`/`UInt32`/`UInt64` extensionality and bounded
+   `ofNat`/`toNat` lemmas over `Init.Data.UInt.BasicAux` (`u8_eq_of_toNat_eq` ..
+   `u64_eq_of_toNat_eq`, `u8_toNat_ofNat_of_lt` .. `u64_toNat_ofNat_of_lt`,
+   `u64_ofNat_ne_zero`).
+5. Polymorphic `List.beq` equality reflection (`list_beq_refl`,
+   `list_eq_of_beq`, `list_beq_iff` for `[BEq α] [LawfulBEq α]`).
 -/
 
 namespace Workbench.Pass1.ModIntOrder
@@ -315,7 +327,7 @@ theorem int_sub_ofNat_neg_swap (a b : Nat) :
       rfl
     | succ _ => rfl
 
-/-! ## 3. `BitVec` Extensionality from `toNat` (`Init.Data.BitVec.BasicAux`) -/
+/-! ## 3. `BitVec` `toNat`, Non-Wrapping `+`/`-`, and Order (`Init.Data.BitVec.BasicAux`) -/
 
 theorem bv_eq_of_toNat_eq {w : Nat} {a b : BitVec w}
     (h : a.toNat = b.toNat) : a = b := by
@@ -324,5 +336,185 @@ theorem bv_eq_of_toNat_eq {w : Nat} {a b : BitVec w}
     cases b with
     | ofFin fb =>
       exact congrArg BitVec.ofFin (Fin.eq_of_val_eq h)
+
+theorem bv_toNat_lt {w : Nat} (x : BitVec w) : x.toNat < Nat.pow 2 w :=
+  x.toFin.isLt
+
+theorem bv_toNat_ofNat (w n : Nat) :
+    (BitVec.ofNat w n).toNat = Nat.mod n (Nat.pow 2 w) := rfl
+
+theorem bv_toNat_ofNat_of_lt {w n : Nat} (h : n < Nat.pow 2 w) :
+    (BitVec.ofNat w n).toNat = n :=
+  Nat.mod_eq_of_lt h
+
+theorem bv_toNat_zero (w : Nat) : (0 : BitVec w).toNat = 0 :=
+  Nat.mod_eq_of_lt (Nat.two_pow_pos w)
+
+theorem bv_toNat_add {w : Nat} (x y : BitVec w) :
+    (x + y).toNat = Nat.mod (x.toNat + y.toNat) (Nat.pow 2 w) := rfl
+
+theorem bv_toNat_add_of_lt {w : Nat} {x y : BitVec w}
+    (h : x.toNat + y.toNat < Nat.pow 2 w) :
+    (x + y).toNat = x.toNat + y.toNat :=
+  Nat.mod_eq_of_lt h
+
+theorem bv_add_ofNat_of_lt {w a b : Nat} (h : a + b < Nat.pow 2 w) :
+    BitVec.ofNat w a + BitVec.ofNat w b = BitVec.ofNat w (a + b) := by
+  apply bv_eq_of_toNat_eq
+  have ha : a < Nat.pow 2 w := Nat.lt_of_le_of_lt (Nat.le_add_right a b) h
+  have hb : b < Nat.pow 2 w := Nat.lt_of_le_of_lt (Nat.le_add_left b a) h
+  change Nat.mod ((BitVec.ofNat w a).toNat + (BitVec.ofNat w b).toNat) (Nat.pow 2 w) =
+    (BitVec.ofNat w (a + b)).toNat
+  rw [bv_toNat_ofNat_of_lt ha, bv_toNat_ofNat_of_lt hb, bv_toNat_ofNat_of_lt h]
+  exact Nat.mod_eq_of_lt h
+
+theorem bv_lt_iff_toNat_lt {w : Nat} (x y : BitVec w) :
+    (x < y) ↔ x.toNat < y.toNat := Iff.rfl
+
+theorem bv_le_iff_toNat_le {w : Nat} (x y : BitVec w) :
+    (x ≤ y) ↔ x.toNat ≤ y.toNat := Iff.rfl
+
+theorem bv_not_add_lt_left_of_lt {w : Nat} {x y : BitVec w}
+    (h : x.toNat + y.toNat < Nat.pow 2 w) : ¬ (x + y < x) := by
+  rw [bv_lt_iff_toNat_lt, bv_toNat_add_of_lt h]
+  exact Nat.not_lt_of_ge (Nat.le_add_right x.toNat y.toNat)
+
+theorem bv_toNat_sub_of_le {w : Nat} {x y : BitVec w} (h : y.toNat ≤ x.toNat) :
+    (x - y).toNat = x.toNat - y.toNat := by
+  change Nat.mod (Nat.pow 2 w - y.toNat + x.toNat) (Nat.pow 2 w) = x.toNat - y.toNat
+  have hyLt : y.toNat < Nat.pow 2 w := bv_toNat_lt y
+  have hyLe : y.toNat ≤ Nat.pow 2 w := Nat.le_of_lt hyLt
+  have hRearr : Nat.pow 2 w - y.toNat + x.toNat = (x.toNat - y.toNat) + Nat.pow 2 w * 1 := by
+    rw [Nat.mul_one, Nat.add_comm (x.toNat - y.toNat) (Nat.pow 2 w)]
+    have h1 : (Nat.pow 2 w - y.toNat + x.toNat) + y.toNat =
+        (Nat.pow 2 w + (x.toNat - y.toNat)) + y.toNat := by
+      rw [Nat.add_assoc (Nat.pow 2 w - y.toNat) x.toNat y.toNat,
+          Nat.add_comm x.toNat y.toNat,
+          ← Nat.add_assoc (Nat.pow 2 w - y.toNat) y.toNat x.toNat,
+          Nat.sub_add_cancel hyLe,
+          Nat.add_assoc (Nat.pow 2 w) (x.toNat - y.toNat) y.toNat,
+          Nat.sub_add_cancel h]
+    exact Nat.add_right_cancel h1
+  rw [hRearr, nat_add_mul_mod_self_left]
+  exact Nat.mod_eq_of_lt (Nat.lt_of_le_of_lt (Nat.sub_le x.toNat y.toNat) (bv_toNat_lt x))
+
+/-! ## 4. Fixed-Width `UInt8` / `UInt16` / `UInt32` / `UInt64` (`Init.Data.UInt.BasicAux`) -/
+
+theorem u8_eq_of_toNat_eq {x y : UInt8} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt8.ofBitVec (bv_eq_of_toNat_eq h)
+
+theorem u16_eq_of_toNat_eq {x y : UInt16} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt16.ofBitVec (bv_eq_of_toNat_eq h)
+
+theorem u32_eq_of_toNat_eq {x y : UInt32} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt32.ofBitVec (bv_eq_of_toNat_eq h)
+
+theorem u64_eq_of_toNat_eq {x y : UInt64} (h : x.toNat = y.toNat) : x = y := by
+  cases x with
+  | ofBitVec bx =>
+    cases y with
+    | ofBitVec by_ =>
+      exact congrArg UInt64.ofBitVec (bv_eq_of_toNat_eq h)
+
+theorem u8_toNat_lt (x : UInt8) : x.toNat < Nat.pow 2 8 := x.toBitVec.toFin.isLt
+theorem u16_toNat_lt (x : UInt16) : x.toNat < Nat.pow 2 16 := x.toBitVec.toFin.isLt
+theorem u32_toNat_lt (x : UInt32) : x.toNat < Nat.pow 2 32 := x.toBitVec.toFin.isLt
+theorem u64_toNat_lt (x : UInt64) : x.toNat < Nat.pow 2 64 := x.toBitVec.toFin.isLt
+
+theorem u8_toNat_ofNat (n : Nat) : (UInt8.ofNat n).toNat = Nat.mod n (Nat.pow 2 8) := rfl
+theorem u16_toNat_ofNat (n : Nat) : (UInt16.ofNat n).toNat = Nat.mod n (Nat.pow 2 16) := rfl
+theorem u32_toNat_ofNat (n : Nat) : (UInt32.ofNat n).toNat = Nat.mod n (Nat.pow 2 32) := rfl
+theorem u64_toNat_ofNat (n : Nat) : (UInt64.ofNat n).toNat = Nat.mod n (Nat.pow 2 64) := rfl
+
+theorem u8_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 8) :
+    (UInt8.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u16_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 16) :
+    (UInt16.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u32_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 32) :
+    (UInt32.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u64_toNat_ofNat_of_lt {n : Nat} (h : n < Nat.pow 2 64) :
+    (UInt64.ofNat n).toNat = n := Nat.mod_eq_of_lt h
+
+theorem u8_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 8) :
+    UInt8.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt8.ofNat n).toNat = (0 : UInt8).toNat := congrArg UInt8.toNat hEq
+  rw [u8_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+theorem u32_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 32) :
+    UInt32.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt32.ofNat n).toNat = (0 : UInt32).toNat := congrArg UInt32.toNat hEq
+  rw [u32_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+theorem u64_ofNat_ne_zero {n : Nat} (hPos : 0 < n) (hLt : n < Nat.pow 2 64) :
+    UInt64.ofNat n ≠ 0 := by
+  intro hEq
+  have h1 : (UInt64.ofNat n).toNat = (0 : UInt64).toNat := congrArg UInt64.toNat hEq
+  rw [u64_toNat_ofNat_of_lt hLt] at h1
+  change n = 0 at h1
+  rw [h1] at hPos
+  exact Nat.lt_irrefl 0 hPos
+
+/-! ## 5. Polymorphic `List.beq` Equality Reflection (`Init.Data.List.Basic`) -/
+
+private theorem bool_and_left_local {a b : Bool} (h : (a && b) = true) : a = true := by
+  cases a with
+  | false => cases b <;> nomatch h
+  | true => rfl
+
+private theorem bool_and_right_local {a b : Bool} (h : (a && b) = true) : b = true := by
+  cases a with
+  | false => cases b <;> nomatch h
+  | true => exact h
+
+theorem list_beq_refl {α : Type u} [BEq α] [LawfulBEq α] :
+    ∀ (xs : List α), List.beq xs xs = true
+  | [] => rfl
+  | x :: xs => by
+    change ((x == x) && List.beq xs xs) = true
+    rw [beq_self_eq_true x, list_beq_refl xs]
+    rfl
+
+theorem list_eq_of_beq {α : Type u} [BEq α] [LawfulBEq α] :
+    ∀ {xs ys : List α}, List.beq xs ys = true → xs = ys
+  | [], [], _ => rfl
+  | [], _ :: _, h => by nomatch h
+  | _ :: _, [], h => by nomatch h
+  | x :: xs, y :: ys, h => by
+    change ((x == y) && List.beq xs ys) = true at h
+    have hx : x = y := eq_of_beq (bool_and_left_local h)
+    have hxs : xs = ys := list_eq_of_beq (bool_and_right_local h)
+    rw [hx, hxs]
+
+theorem list_beq_iff {α : Type u} [BEq α] [LawfulBEq α] (xs ys : List α) :
+    List.beq xs ys = true ↔ xs = ys := by
+  constructor
+  · intro h
+    exact list_eq_of_beq h
+  · intro h
+    rw [h]
+    exact list_beq_refl ys
 
 end Workbench.Pass1.ModIntOrder
