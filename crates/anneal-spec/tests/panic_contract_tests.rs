@@ -3053,6 +3053,57 @@ fn fallible_typed_builders_and_guard_mutants_fallible_parity() {
 }
 
 // ===========================================================================
+// 3d. `[adv ep2 B4]` Disabled control-flow headers with generic cast types
+// ===========================================================================
+
+#[test]
+fn kani5095_disabled_cast_to_generic_type_does_not_swallow_live_block() {
+    use InlineBoundaryVerdict::*;
+    const PRELUDE: &str = "pub trait Tr { type Out; } impl Tr for u8 { type Out = bool; } \
+                           impl Tr for bool { type Out = u8; } \
+                           pub type B<T> = <T as Tr>::Out;";
+    let wrap = |body: &str| {
+        format!("#[inline(never)] pub fn target() {{}}\nmod m {{ {PRELUDE} {body} }}\n")
+    };
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+
+    // `x as B<u8> { .. }`: the `>` closes generic arguments of the cast
+    // type. Reading it as a comparison made the body look like a condition
+    // block, so the following live `{ fn target() {} }` was swallowed as the
+    // "body" and `Verified` was returned. All of these compile with rustc.
+    for live_hidden in [
+        "fn g() { let x = true; #[cfg(any())] if x as B<u8> {} { fn target() {} } let _ = x; }",
+        "fn g() { let x = true; #[cfg(any())] while x as B<u8> {} { fn target() {} } let _ = x; }",
+        "fn g() { let x = true; #[cfg(any())] match x as B<bool> { _ => {} } \
+         { fn target() {} } let _ = x; }",
+        "fn g() { let x = true; #[cfg(any())] if let true = x as B<u8> {} \
+         { fn target() {} } let _ = x; }",
+        "fn g() { let x = true; #[cfg(any())] if x as self::B<u8> {} { fn target() {} } let _ = x; }",
+        "fn g() { let x = true; #[cfg(any())] if x as <u8 as Tr>::Out {} \
+         { fn target() {} } let _ = x; }",
+        "fn g() { let x = 1u8; #[cfg(any())] if x as usize > 0 {} { fn target() {} } let _ = x; }",
+        "fn g() { let p = &1u8 as *const u8; #[cfg(any())] if p as *const u8 == p {} \
+         { fn target() {} } let _ = p; }",
+        "fn g() { let x = 1u8; #[cfg(any())] for _ in 0..x as usize {} { fn target() {} } let _ = x; }",
+    ] {
+        assert_eq!(v(&wrap(live_hidden)), MissingInlineNever, "{live_hidden}");
+    }
+
+    // Dead-decoy direction: the disabled body itself is still skipped exactly.
+    assert_eq!(
+        verify_fn_inline_never_source(
+            &format!(
+                "mod m {{ {PRELUDE} fn g() {{ let x = true; \
+                 #[cfg(any())] if x as B<u8> {{ #[inline(never)] fn target() {{}} }} \
+                 let _ = x; }} }}"
+            ),
+            "target"
+        ),
+        TargetFunctionNotFound
+    );
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 

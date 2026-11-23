@@ -7775,9 +7775,21 @@ fn skip_disabled_control_stmt(
                 prev_was_dot = false;
                 expecting_expr = false;
             }
+            // `expr as Type`: the cast type is a *type*, so a `<` after a path
+            // segment always opens generic arguments (`x as B<u8> { body }`).
+            // Treating `>` as a binary operator would leave `expecting_expr`
+            // set and misread the body `{ .. }` as a condition block, so the
+            // following live standalone `{ fn target() {} }` block would be
+            // swallowed as the "body".
+            TokenKind::Ident("as") => {
+                let _ = lex.next_token()?;
+                skip_disabled_cast_type(lex, 0)?;
+                prev_was_dot = false;
+                expecting_expr = false;
+            }
             TokenKind::Ident(
                 "unsafe" | "const" | "async" | "move" | "loop" | "return" | "break" | "in"
-                | "as" | "else" | "gen",
+                | "else" | "gen",
             ) => {
                 let _ = lex.next_token()?;
                 prev_was_dot = false;
@@ -7803,6 +7815,79 @@ fn skip_disabled_control_stmt(
                 prev_was_dot = false;
                 expecting_expr = true;
             }
+        }
+    }
+}
+
+/// Skips the target type of an `as` cast inside a disabled control-flow header:
+/// prefix modifiers (`&`, `&'a`, `&mut`, `*const`, `*mut`, `dyn`, `impl`),
+/// then a parenthesized/array/slice type group, an `fn(..) [-> T]` pointer
+/// type, or a (`::`-separated, optionally `<..>`-generic) path. Never consumes
+/// a `{`, `;`, or closing delimiter.
+fn skip_disabled_cast_type(lex: &mut RustLexer<'_>, depth: usize) -> Result<(), ()> {
+    if depth > 16 {
+        return Err(());
+    }
+    // Prefix modifiers.
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Punct(b'&' | b'*') | TokenKind::Lifetime => {
+                let _ = lex.next_token()?;
+            }
+            TokenKind::Ident("mut" | "const" | "dyn" | "impl") => {
+                let _ = lex.next_token()?;
+            }
+            _ => break,
+        }
+    }
+    match lex.peek_token()?.kind {
+        TokenKind::Punct(p @ (b'(' | b'[')) => {
+            let _ = lex.next_token()?;
+            let _ = lex.consume_balanced_inner(p)?;
+            return Ok(());
+        }
+        TokenKind::Ident("fn") => {
+            let _ = lex.next_token()?;
+            if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(b'(')?;
+            }
+            if matches!(lex.peek_token()?.kind, TokenKind::Arrow) {
+                let _ = lex.next_token()?;
+                skip_disabled_cast_type(lex, depth + 1)?;
+            }
+            return Ok(());
+        }
+        TokenKind::Punct(b'<') => {
+            // Qualified path `<T as Tr>::Assoc`.
+            let _ = lex.next_token()?;
+            let _ = lex.consume_angle_inner()?;
+        }
+        TokenKind::ColonColon | TokenKind::Ident(_) => {}
+        _ => return Ok(()),
+    }
+    // Path: [`::`] seg [`<..>`] (`::` [`<..>`] seg [`<..>`])*
+    if matches!(lex.peek_token()?.kind, TokenKind::ColonColon) {
+        let _ = lex.next_token()?;
+    }
+    loop {
+        if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+            skip_disabled_plain_token(lex)?;
+        }
+        if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+            let _ = lex.next_token()?;
+            let _ = lex.consume_angle_inner()?;
+        }
+        if !matches!(lex.peek_token()?.kind, TokenKind::ColonColon) {
+            return Ok(());
+        }
+        let _ = lex.next_token()?;
+        if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
+            let _ = lex.next_token()?;
+            let _ = lex.consume_angle_inner()?;
+        }
+        if !matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+            return Ok(());
         }
     }
 }
