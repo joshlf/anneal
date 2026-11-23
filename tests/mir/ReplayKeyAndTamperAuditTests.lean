@@ -1866,6 +1866,49 @@ theorem passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected :
     isOk (scan (chars! "def init := 0\ndef initial_value := 1\ndef builtin_helper := 2\ndef exported_flag := 3\ndef unif_helper := 4"))
       = true := by decide +kernel
 
+/-! ## Pass `A2` hardening regressions -/
+
+def premInstName : SymName := sn! "Topic.Defs.premInst"
+
+/-- `Topic.Defs` with one more instance declaration of the given type and value. -/
+def defsInstPkg (ty val : ExprSkeleton) : PackageAuditInput :=
+  { corePkg with modules :=
+      [addExts (addConsts defsModule [mkDef premInstName ty val])
+         [.instanceEntry premInstName (sn! "Inhabited") false],
+       theoryModule, proofsModule, verifyModule] }
+
+/-- What ties an instance to its module is a local name that is not a reducible alias: the
+class itself, or for an imported class a name in the conclusion of the instance's type.
+Lean 4.34.1 compiles `theorem hijacked : (0 : Nat) = 1 := rfl` after each rejected shape:
+`instance (priority := high) [Marker α] : OfNat α 0` beside a local `Marker Nat` instance,
+`abbrev N := Nat` with `instance : OfNat N 0`, and `abbrev C := OfNat Nat 0` with
+`instance : C`. -/
+theorem passA2_instance_anchor_in_conclusion_and_not_reducible :
+    -- a local name among the premises only
+    failsWith (audit noSourceConfig (defsInstPkg (.pi (.const colorName) natE)
+        (.lam (.const colorName) (.natLit 0))))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" premInstName) = true ∧
+    -- the only local name in the conclusion is a reducible alias
+    failsWith (audit noSourceConfig (defsPkg [.reducibilityOverride colorName]))
+      (.forbiddenInstanceOrCoe defsMod "orphan_instance_of_imported_class" instColorName) = true ∧
+    -- a reducible alias as the class, outside and inside a definitions module
+    failsWith (audit noSourceConfig (pkgWithProofs (addExts proofsModule
+        [.instanceEntry lemmaName mutAName false, .reducibilityOverride mutAName])))
+      (.forbiddenInstanceOrCoe proofsMod "instance_of_imported_class" lemmaName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.reducibilityOverride (sn! "Topic.Defs.claimIdx"),
+        .scopedInstanceEntry instColorName (sn! "Topic.Defs.claimIdx") defsMod]))
+      (.forbiddenInstanceOrCoe defsMod "scoped_instance_of_imported_target" instColorName) = true ∧
+    failsWith (audit noSourceConfig (defsPkg [.reducibilityOverride (sn! "Topic.Defs.claimIdx"),
+        .defaultInstanceEntry instColorName (sn! "Topic.Defs.claimIdx")]))
+      (.forbiddenInstanceOrCoe defsMod "default_instance_of_imported_target" instColorName) = true ∧
+    -- a reducibility attribute on the instance itself, as `instance` adds, changes nothing
+    isOk (audit noSourceConfig (defsPkg [.reducibilityOverride instColorName])) = true ∧
+    isOk (audit noSourceConfig (extPkg (.instanceEntry lemmaName mutAName false))) = true ∧
+    -- premises do not hide a local name in the conclusion
+    isOk (audit noSourceConfig (defsInstPkg (.pi natE (.const colorName))
+        (.lam natE (.const redName)))) = true := by
+  decide +kernel
+
 /-! ## End-to-end instantiation on the clean package -/
 
 /-- The semantic soundness theorem applied to the clean package over the standard base
@@ -2247,5 +2290,9 @@ axiom beyond the same three. -/
 /-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected' depends on axioms: [propext] -/
 #guard_msgs (whitespace := lax) in
 #print axioms passB2_sourceScanner_ext_hooks_and_builtin_variants_rejected
+
+/-- info: 'Anneal.ReplayKeyAndTamperAuditTests.passA2_instance_anchor_in_conclusion_and_not_reducible' depends on axioms: [propext] -/
+#guard_msgs (whitespace := lax) in
+#print axioms passA2_instance_anchor_in_conclusion_and_not_reducible
 
 end Anneal.ReplayKeyAndTamperAuditTests

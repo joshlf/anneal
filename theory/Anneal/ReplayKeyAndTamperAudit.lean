@@ -453,6 +453,11 @@ def usedConstants : ExprSkeleton → List SymName
   | strLit _ => [SymName.stringName]
   | proj s _ e => s :: e.usedConstants
 
+/-- The conclusion of a function type: what remains under its leading binders. -/
+def piTarget : ExprSkeleton → ExprSkeleton
+  | pi _ b => b.piTarget
+  | e => e
+
 /-- No bound variable escapes `k` enclosing binders. -/
 def closedBelow : Nat → ExprSkeleton → Bool
   | k, bvar i => decide (i < k)
@@ -4153,12 +4158,22 @@ un-replayed `partial` `_unsafe_rec` companion). -/
 def isLocalExtDecl (inv : ModuleInventory) (d : SymName) : Bool :=
   decide (d ∈ inv.constNames) && decide (d ∈ (replayableConstants inv).map (·.name))
 
+/-- A local declaration that can own an instance: a local class, or the local name that
+ties an instance of an imported class to this module. It may not carry a reducibility
+attribute, because instance resolution unfolds a reducible alias: after `abbrev N := Nat`,
+`instance : OfNat N 0` is an instance for `Nat`, and after `abbrev C := OfNat Nat 0` so is
+`instance : C`. -/
+def isInstanceAnchor (inv : ModuleInventory) (d : SymName) : Bool :=
+  isLocalExtDecl inv d && decide (EnvExtEntry.reducibilityOverride d ∉ inv.extEntries)
+
 /-- Policy for one persisted extension entry. An entry found in a persisted table is
 persisted, whatever scope it was declared with. No audited module may register macros,
 syntax, elaborators, delaborators, unexpanders, initializers, `implemented_by` / `extern`
 hooks, or `export` aliases. A reducibility attribute must target a local declaration. An
-instance must be a local declaration of a local class, except that a definitions module
-may instantiate imported classes and may also register scoped and default instances of
+instance must be a local declaration of a local class that is not a reducible alias
+(`isInstanceAnchor`), except that a definitions module may instantiate any other class
+when the conclusion of the instance's type names such an anchor (a local name among the
+premises alone does not count), and may also register scoped and default instances of
 its own classes and coercions that involve one of its own types. -/
 def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except AuditFailure Unit :=
   match ext with
@@ -4182,23 +4197,23 @@ def validateSingleExtEntry (inv : ModuleInventory) (ext : EnvExtEntry) : Except 
   | .instanceEntry d cls _ => do
     ensure (isLocalExtDecl inv d = true)
       (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
-    if isLocalExtDecl inv cls then .ok ()
+    if isInstanceAnchor inv cls then .ok ()
     else do
       ensure (inv.role = .defsExempt)
         (.forbiddenInstanceOrCoe inv.moduleName "instance_of_imported_class" d)
       match findConstByName inv.constants d with
       | some ci =>
-        ensure (ci.type.usedConstants.any (isLocalExtDecl inv) = true)
+        ensure (ci.type.piTarget.usedConstants.any (isInstanceAnchor inv) = true)
           (.forbiddenInstanceOrCoe inv.moduleName "orphan_instance_of_imported_class" d)
       | none =>
         .error (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
   | .scopedInstanceEntry d cls _ => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
-    ensure (isLocalExtDecl inv d = true ∧ isLocalExtDecl inv cls = true)
+    ensure (isLocalExtDecl inv d = true ∧ isInstanceAnchor inv cls = true)
       (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance_of_imported_target" d)
   | .defaultInstanceEntry d cls => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
-    ensure (isLocalExtDecl inv d = true ∧ isLocalExtDecl inv cls = true)
+    ensure (isLocalExtDecl inv d = true ∧ isInstanceAnchor inv cls = true)
       (.forbiddenInstanceOrCoe inv.moduleName "default_instance_of_imported_target" d)
   | .coeEntry d src tgt => do
     ensure (inv.role = .defsExempt) (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
@@ -5418,16 +5433,17 @@ theorem auditAndReplayPackage_sources_covered {cfg : AuditConfig} {pkg : Package
     exact ⟨src, hsrc, h1⟩
 
 /-- No audited module registers an orphan instance of an imported class: an accepted
-instance of an imported class must belong to a `Defs` module and its declaration's type
-must reference at least one local replayed declaration of that module. -/
+instance of an imported class belongs to a `Defs` module, and the conclusion of its type
+names a replayed declaration of that module that has no reducibility attribute. -/
 theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : PackageAuditInput}
     {cert : AuditCertificate} (h : auditAndReplayPackage cfg pkg = .ok cert) :
     ∀ inv ∈ pkg.modules, ∀ d cls isPriv,
       EnvExtEntry.instanceEntry d cls isPriv ∈ inv.extEntries →
-      isLocalExtDecl inv cls = false →
+      isInstanceAnchor inv cls = false →
       inv.role = .defsExempt ∧
         ∃ ci ∈ inv.constants, ci.name = d ∧
-          ∃ localDep ∈ ci.type.usedConstants, isLocalExtDecl inv localDep = true := by
+          ∃ anchor ∈ ci.type.piTarget.usedConstants, isLocalExtDecl inv anchor = true ∧
+            EnvExtEntry.reducibilityOverride anchor ∉ inv.extEntries := by
   intro inv hinv d cls isPriv hext hcls
   have hm := auditModulePolicy_ok ((auditAndReplayPackage_facts h).2.1.modules inv hinv)
   have hval := checkAll_ok_iff.mp hm.1 _ hext
@@ -5437,8 +5453,9 @@ theorem auditAndReplayPackage_no_orphan_instances {cfg : AuditConfig} {pkg : Pac
   split at hfind
   · rename_i ci hci
     obtain ⟨hmem, hname⟩ := findConstByName_mem hci
-    have hany := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
-    exact ⟨hrole, ci, hmem, hname, hany⟩
+    obtain ⟨anchor, ha, hanchor⟩ := List.any_eq_true.mp (ensure_ok_iff.mp hfind)
+    simp only [isInstanceAnchor, Bool.and_eq_true, decide_eq_true_eq] at hanchor
+    exact ⟨hrole, ci, hmem, hname, anchor, ha, hanchor⟩
   · cases hfind
 
 /-- Every declaration of a test module has a clean closure, and when
