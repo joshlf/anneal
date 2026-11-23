@@ -1,0 +1,179 @@
+{
+  "schema_version": 1,
+  "toolchain": "leanprover/lean4:v4.34.1",
+  "positive_fixtures": [
+    {
+      "id": "00_clean_positive",
+      "file": "00_clean_positive.lean",
+      "module": "Proof.CleanPositive",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": true,
+      "expected_category": null
+    }
+  ],
+  "negative_fixtures": [
+    {
+      "id": "01_lean4_16677_key_mismatch_recursor",
+      "file": "01_lean4_16677_key_mismatch_recursor.lean",
+      "module": "Proof.Tamper01",
+      "mode": "forge_recursor_key_mismatch",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "keyNameMismatch"
+    },
+    {
+      "id": "02_duplicate_const_names",
+      "file": "02_duplicate_const_names.lean",
+      "module": "Proof.Tamper02",
+      "mode": "forge_duplicate_const_names",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "duplicateConstName"
+    },
+    {
+      "id": "03_const_names_size_mismatch",
+      "file": "03_const_names_size_mismatch.lean",
+      "module": "Proof.Tamper03",
+      "mode": "forge_const_names_size_mismatch",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "constNamesSizeMismatch"
+    },
+    {
+      "id": "04_of_reduce_nat_axiom",
+      "file": "04_of_reduce_nat_axiom.lean",
+      "module": "Proof.Tamper04",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenNativeReductionAxiom"
+    },
+    {
+      "id": "05_of_reduce_bool_native_decide",
+      "file": "05_of_reduce_bool_native_decide.lean",
+      "module": "Proof.Tamper05",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenNativeReductionAxiom"
+    },
+    {
+      "id": "06_custom_decide_config",
+      "file": "06_custom_decide_config.lean",
+      "module": "Proof.Tamper06",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenNativeReductionAxiom"
+    },
+    {
+      "id": "07_sorry_ax",
+      "file": "07_sorry_ax.lean",
+      "module": "Proof.Tamper07",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenAxiom"
+    },
+    {
+      "id": "08_custom_axiom",
+      "file": "08_custom_axiom.lean",
+      "module": "Specs.Tamper08",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenAxiom"
+    },
+    {
+      "id": "09_skip_kernel_tc",
+      "file": "09_skip_kernel_tc.lean",
+      "module": "Proof.Tamper09",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenSourceOption"
+    },
+    {
+      "id": "10_implemented_by",
+      "file": "10_implemented_by.lean",
+      "module": "Proof.Tamper10",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenInitOrCodegenHook"
+    },
+    {
+      "id": "11_extern_override",
+      "file": "11_extern_override.lean",
+      "module": "Proof.Tamper11",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenInitOrCodegenHook"
+    },
+    {
+      "id": "12_unsafe_escape",
+      "file": "12_unsafe_escape.lean",
+      "module": "Proof.Tamper12",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "unsafeOrPartialDecl"
+    },
+    {
+      "id": "13_partial_nonterm",
+      "file": "13_partial_nonterm.lean",
+      "module": "Proof.Tamper13",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "unsafeOrPartialDecl"
+    },
+    {
+      "id": "14_macro_elaborator_hijack",
+      "file": "14_macro_elaborator_hijack.lean",
+      "module": "Proof.Tamper14",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenMacroOrElab"
+    },
+    {
+      "id": "15_import_all_leak",
+      "file": "15_import_all_leak.lean",
+      "module": "Proof.Tamper15",
+      "mode": "compile_module_pkg",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "privateInstanceLeakViaImportAll"
+    },
+    {
+      "id": "16_export_shadowing",
+      "file": "16_export_shadowing.lean",
+      "module": "Proof.Tamper16",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenShadowingOrExport"
+    },
+    {
+      "id": "17_reducibility_instance_override",
+      "file": "17_reducibility_instance_override.lean",
+      "module": "Proof.Tamper17",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenReducibilityOverride"
+    },
+    {
+      "id": "18_mutual_all_hidden_axiom",
+      "file": "18_mutual_all_hidden_axiom.lean",
+      "module": "Proof.Tamper18",
+      "mode": "compile",
+      "strict_proofs": true,
+      "expected_ok": false,
+      "expected_category": "forbiddenAxiom"
+    }
+  ]
+}
