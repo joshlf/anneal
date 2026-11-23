@@ -2870,4 +2870,31 @@ theorem wlpOutcome_fault_refutes_canary (i acc : Nat) :
   intro ops h
   exact (wlpOutcome_unfold_iff (ops := ops)).mp h
 
+/-- Liberal versus total canary: a machine that steps to itself forever
+satisfies `wlpOutcome` even for the unsatisfiable postconditions, because it
+never terminates or faults, and satisfies `wpOutcome` for no postcondition,
+not even the trivial ones. The liberal pass of a two-pass proof says nothing
+about termination, so `wpStateOk_of_wlp_and_safety` needs its safety pass. -/
+theorem wlpOutcome_diverge_canary :
+    wlpOutcome
+        (ops := MirWpOps.ofDetStep
+          (fun (_ : Unit) => (StepOutcome.step () : StepOutcome Unit Nat Unit)))
+        (fun _ => False) (fun _ => False) () ∧
+    ¬ wpOutcome
+        (ops := MirWpOps.ofDetStep
+          (fun (_ : Unit) => (StepOutcome.step () : StepOutcome Unit Nat Unit)))
+        (fun _ => True) (fun _ => True) () := by
+  refine ⟨wlpOutcome_of_invariant
+    (ops := MirWpOps.ofDetStep
+      (fun (_ : Unit) => (StepOutcome.step () : StepOutcome Unit Nat Unit)))
+    (fun _ => True) (fun _ _ => True.intro) True.intro, ?_⟩
+  intro h
+  exact wpOutcome_det_induction
+    (step := fun (_ : Unit) =>
+      (StepOutcome.step () : StepOutcome Unit Nat Unit))
+    (C := fun _ => False)
+    (fun _ _ _ hC => hC)
+    (fun _ _ hEv _ => by cases hEv)
+    (fun _ _ hEv _ => by cases hEv) h
+
 end Anneal.ParametricCore

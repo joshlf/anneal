@@ -5443,6 +5443,41 @@ theorem ofTable_execMutSummaryChain_preserves_proj {Mem : Type u} {A : Type x}
     (ByteStoreOps.ofTable_writePreserves view getTable setTable proj hProj)
     calls h
 
+/-- A summary chain does not change whether an aligned lens passes its
+alignment check, for an alignment oracle that writes preserve. The check is
+discharged once, before the first call, whatever lenses the calls mutate. -/
+theorem AlignedSubLens.ok_execMutSummaryChain {Mem : Type u} {Addr : Type v}
+    {Byte : Type w} [ops : ByteStoreOps Mem Addr Byte] {Arg : Type a}
+    {Ret : Type b} {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (hPres : ∀ (a : Addr) (off k : Nat),
+      ops.WritePreserves (fun m => alignedAt m a off k))
+    (A : AlignedSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret}
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    A.ok alignedAt m' = A.ok alignedAt m :=
+  execMutSummaryChain_preserves
+    (hPres A.lens.addr A.lens.offset A.alignLog2) calls h
+
+/-- Frame of an alignment-checked read across a summary chain: when no call
+of the chain interferes with the lens, the checked read is the same before
+and after the chain, including whether the alignment check passes. The calls
+themselves go through plain lenses. -/
+theorem AlignedSubLens.get_execMutSummaryChain_disjoint {Mem : Type u}
+    {Addr : Type v} {Byte : Type w} [ops : ByteStoreOps Mem Addr Byte]
+    [LawfulByteStoreOps Mem Addr Byte] {Arg : Type a} {Ret : Type b}
+    {alignedAt : Mem → Addr → Nat → Nat → Bool}
+    (hPres : ∀ (a : Addr) (off k : Nat),
+      ops.WritePreserves (fun m => alignedAt m a off k))
+    (A : AlignedSubLens Addr)
+    (calls : List (MutSummaryCall Byte Addr Arg Ret)) {m m' : Mem}
+    {rets : List Ret} (hDisj : AllCallsDisjoint Mem A.lens calls)
+    (h : execMutSummaryChain calls m = some (m', rets)) :
+    A.get alignedAt m' = A.get alignedAt m := by
+  unfold AlignedSubLens.get ByteSubLens.getIf
+  rw [AlignedSubLens.ok_execMutSummaryChain hPres A calls h,
+    execMutSummaryChain_frame_disjoint A.lens calls hDisj h]
+
 section CertifiedChain
 
 variable {State : Type x} {Out : Type y} {Fault : Type z}
@@ -6738,5 +6773,37 @@ theorem sliceStore_writable_preserved_canary (Byte : Type u) (id : Nat) :
   ByteStoreOps.ofTable_writePreserves_find (SliceAlloc.view_lawful Byte)
     SliceStore.allocs (fun _ t => { allocs := t }) (fun _ _ => rfl)
     (fun a => a.writable) (fun _ _ => rfl) id
+
+/-- Alignment across a symbolic summary chain: on any store `m`, after any
+successful two-call chain of typed `u32` increments on the fields at offsets
+`0` and `4`, the alignment-checked read of the `4`-aligned sibling at offset
+`8` is unchanged, under the table oracle that reads the alignment of the
+allocation. The alignment check is not re-established after the chain: it is
+carried by `AlignedSubLens.get_execMutSummaryChain_disjoint`. -/
+theorem alignedSubLens_chain_frame_canary (m m' : SliceStore (BitVec 8))
+    (d₁ d₂ : UInt32) (rets : List UInt32)
+    (h : execMutSummaryChain
+      [MutSummaryCall.mk
+          (MutSummary.ofSliceCodec (SliceCodec.uint32 ByteCodec.bitVec8)
+            (fun (x : UInt32) (y : UInt32) => some (x + y, x)))
+          (ByteSubLens.mk 3 0 4) d₁,
+        MutSummaryCall.mk
+          (MutSummary.ofSliceCodec (SliceCodec.uint32 ByteCodec.bitVec8)
+            (fun (x : UInt32) (y : UInt32) => some (x + y, x)))
+          (ByteSubLens.mk 3 4 4) d₂] m = some (m', rets)) :
+    (AlignedSubLens.mk (ByteSubLens.mk 3 8 4) 2).get
+        (tableAlignedAt (SliceAlloc.view (BitVec 8)) SliceStore.allocs
+          (fun _ => 4)) m' =
+      (AlignedSubLens.mk (ByteSubLens.mk 3 8 4) 2).get
+        (tableAlignedAt (SliceAlloc.view (BitVec 8)) SliceStore.allocs
+          (fun _ => 4)) m :=
+  AlignedSubLens.get_execMutSummaryChain_disjoint
+    (fun id off k =>
+      ByteStoreOps.ofTable_writePreserves_tableAlignedAt
+        (SliceAlloc.view_lawful (BitVec 8)) SliceStore.allocs
+        (fun _ t => { allocs := t }) (fun _ _ => rfl)
+        (fun _ => 4) (fun _ _ => rfl) id off k)
+    (AlignedSubLens.mk (ByteSubLens.mk 3 8 4) 2) _
+    (allCallsDisjoint_of_natSeparatedBool (ByteSubLens.mk 3 8 4) _ rfl) h
 
 end Anneal.ParametricCore
