@@ -937,10 +937,10 @@ class TestCliAndLimits(unittest.TestCase):
         self.assertTrue(kwargs.get("start_new_session"))
         self.assertEqual(kwargs["env"]["ANNEAL_LEAN_RUN_IN_SCOPE"], "1")
         self.assertEqual(kwargs["env"]["ANNEAL_LEAN_RUN_ACTIVE"], "1")
-        self.assertEqual(
-            kwargs["env"]["LEAN_NUM_THREADS"],
-            os.environ.get("LEAN_NUM_THREADS", str(limits["threads"])),
+        expected_lean_threads = str(
+            alr._resolve_thread_env(limits["threads"], limits["is_cg_capped"])["LEAN_NUM_THREADS"]
         )
+        self.assertEqual(kwargs["env"]["LEAN_NUM_THREADS"], expected_lean_threads)
 
     def test_run_bounded_command_success_and_timeout(self) -> None:
         rc_file = alr.main(
@@ -1269,9 +1269,10 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
         for capped in (False, True):
             for budget in (1, 3, 64):
                 at_budget = dict.fromkeys(self.THREAD_VARS, budget)
-                # Unset, blank, non-numeric, zero or negative: the envelope's budget.
+                # Unset, blank, non-numeric, zero, negative, signed, underscore, or
+                # non-ASCII digit values: fall back to the envelope's budget.
                 self.assertEqual(resolve(budget, capped, {}), at_budget)
-                for raw in ("", "   ", "abc", "1.5", "0", "-2"):
+                for raw in ("", "   ", "abc", "1.5", "0", "-2", "+1", "1_2", "\u0661"):
                     env = dict.fromkeys(self.THREAD_VARS, raw)
                     self.assertEqual(resolve(budget, capped, env), at_budget, (capped, budget, raw))
                 # A positive value at or below the budget always wins, in both regimes.
@@ -1348,7 +1349,17 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
             self.assertEqual(env["LEAN_NUM_THREADS"], lean_threads)
             self.assertEqual(alr.format_threads_diagnostic(3, env), diag)
         # Without a usable child value the field falls back to the budget.
-        for child_env in (None, {}, {"LEAN_NUM_THREADS": ""}, {"LEAN_NUM_THREADS": "x"}, {"LEAN_NUM_THREADS": "0"}):
+        for child_env in (
+            None,
+            {},
+            {"LEAN_NUM_THREADS": ""},
+            {"LEAN_NUM_THREADS": "x"},
+            {"LEAN_NUM_THREADS": "0"},
+            {"LEAN_NUM_THREADS": "-1"},
+            {"LEAN_NUM_THREADS": "+1"},
+            {"LEAN_NUM_THREADS": "1_2"},
+            {"LEAN_NUM_THREADS": "\u0661"},
+        ):
             self.assertEqual(alr.format_threads_diagnostic(3, child_env), "threads=3", child_env)
 
     def test_cpu_quota_stays_at_the_thread_budget(self) -> None:
@@ -1387,6 +1398,81 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
         self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], ["3"])
         self.assertIn("M, threads=3).\n", err)
         self.assertNotIn("thread_budget", err)
+
+    def test_timeout_diagnostic_on_capped_slice_clamps_high_and_rejects_invalid(self) -> None:
+        sleeper = ["--mode", "file", "--timeout", "1", "--no-slot-lock", "--", "sleep", "30"]
+        capped = self._limits(3, is_cg_capped=True)
+        for thread_env, want_threads, want_field in (
+            ({"LEAN_NUM_THREADS": "1"}, "1", "threads=1, thread_budget=3"),
+            ({"LEAN_NUM_THREADS": "64"}, "3", "threads=3"),
+            ({"LEAN_NUM_THREADS": "1_2"}, "3", "threads=3"),
+        ):
+            rc, err, child_envs = self._run(capped, sleeper, thread_env)
+            self.assertEqual(rc, 124, thread_env)
+            self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], [want_threads], thread_env)
+            self.assertIn(f"M, {want_field}).\n", err, thread_env)
+            self.assertEqual(re.findall(r"\bthreads=(\d+)", err), [want_threads], thread_env)
+
+    def test_pressure_abort_diagnostic_logs_effective_lean_num_threads(self) -> None:
+        # Watchdog ancestor-pressure aborts report the same effective thread count as
+        # timeout / OOM diagnostics.
+        capped = self._limits(
+            3,
+            mode="build",
+            is_cg_capped=True,
+            user_systemd_active=True,
+            t_cg_is_user_service=False,
+        )
+
+        class _InstantAbortWatchdog:
+            def __init__(self, **_kwargs: Any) -> None:
+                pass
+
+            def tick(self, _now: float) -> dict[str, Any]:
+                return {"action": "abort_pressure", "tier1_triggered": True, "shed_fired": False, "breach_ticks": 3}
+
+        class _TimeoutOnceProc:
+            pid = 424242
+
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                self._done = False
+
+            def wait(self, timeout: float | None = None) -> int:
+                if not self._done:
+                    self._done = True
+                    raise subprocess.TimeoutExpired(cmd=["sleep"], timeout=timeout or 0)
+                return -9
+
+            def poll(self) -> int | None:
+                return -9 if self._done else None
+
+        for thread_env, want_field in (
+            ({"LEAN_NUM_THREADS": "1"}, "threads=1, thread_budget=3"),
+            ({}, "threads=3"),
+        ):
+            err_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, thread_env))
+                for var in self.THREAD_VARS:
+                    if var not in thread_env:
+                        os.environ.pop(var, None)
+                stack.enter_context(mock.patch.object(alr, "_build_scope_launch_cmd", return_value=(["true"], True)))
+                stack.enter_context(mock.patch.object(alr, "BuildWatchdog", _InstantAbortWatchdog))
+                stack.enter_context(mock.patch.object(alr.subprocess, "Popen", _TimeoutOnceProc))
+                stack.enter_context(mock.patch.object(alr, "_kill_systemd_scope"))
+                stack.enter_context(mock.patch.object(alr, "stamp_last_oom"))
+                stack.enter_context(mock.patch("sys.stderr", err_buf))
+                rc = alr.run_bounded_command(
+                    ["lake", "build"],
+                    capped,
+                    use_slot_lock=False,
+                    probe_fn=lambda **_kw: dict(capped),
+                    evict_fn=lambda _lim: False,
+                )
+            self.assertEqual(rc, 137, thread_env)
+            err = err_buf.getvalue()
+            self.assertIn("USER_SLICE_PRESSURE_ABORT:", err)
+            self.assertIn(f"(mode=build, {want_field}, budget_gb=", err, thread_env)
 
     def test_oom_diagnostic_logs_caller_lowered_lean_num_threads(self) -> None:
         oom = ["--mode", "file", "--no-slot-lock", "--", "sh", "-c", "exit 137"]
@@ -1429,22 +1515,48 @@ class TestCallerLoweredThreadCount(unittest.TestCase):
             self.assertNotIn("thread_budget=64", err)
 
     def test_probe_text_reports_effective_lean_num_threads(self) -> None:
-        limits = self._limits(64, mode="build")
-        for thread_env, lean_threads in (({"LEAN_NUM_THREADS": "1"}, 1), ({}, 64), ({"LEAN_NUM_THREADS": "-1"}, 64)):
-            out = io.StringIO()
-            with mock.patch("sys.stdout", out):
-                rc, _err, child_envs = self._run(limits, ["--probe"], thread_env)
-            self.assertEqual(rc, 0)
-            self.assertEqual(child_envs, [])
-            self.assertIn(
-                f"Thread Budget (-j) : 64 threads (LEAN_NUM_THREADS={lean_threads})\n", out.getvalue()
-            )
-            # The JSON contract keeps reporting the envelope's budget.
-            out = io.StringIO()
-            with mock.patch("sys.stdout", out):
-                rc, _err, _envs = self._run(limits, ["--probe", "--json"], thread_env)
-            self.assertEqual(rc, 0)
-            self.assertEqual(json.loads(out.getvalue()), limits)
+        for limits, cases in (
+            (
+                self._limits(64, mode="build"),
+                (
+                    ({"LEAN_NUM_THREADS": "1"}, 1),
+                    ({"LEAN_NUM_THREADS": "64"}, 64),
+                    ({"LEAN_NUM_THREADS": "128"}, 128),
+                    ({}, 64),
+                    ({"LEAN_NUM_THREADS": "-1"}, 64),
+                    ({"LEAN_NUM_THREADS": "1_2"}, 64),
+                ),
+            ),
+            (
+                self._limits(3, mode="build", is_cg_capped=True),
+                (
+                    ({"LEAN_NUM_THREADS": "1"}, 1),
+                    ({"LEAN_NUM_THREADS": "64"}, 3),
+                    ({}, 3),
+                    ({"LEAN_NUM_THREADS": "0"}, 3),
+                    ({"LEAN_NUM_THREADS": "abc"}, 3),
+                    ({"LEAN_NUM_THREADS": "\u0661"}, 3),
+                ),
+            ),
+        ):
+            budget = limits["threads"]
+            for thread_env, lean_threads in cases:
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    rc, _err, child_envs = self._run(limits, ["--probe"], thread_env)
+                self.assertEqual(rc, 0)
+                self.assertEqual(child_envs, [])
+                self.assertIn(
+                    f"Thread Budget (-j) : {budget} threads (LEAN_NUM_THREADS={lean_threads})\n",
+                    out.getvalue(),
+                    (limits["is_cg_capped"], thread_env),
+                )
+                # The JSON contract keeps reporting the envelope's budget.
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    rc, _err, _envs = self._run(limits, ["--probe", "--json"], thread_env)
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out.getvalue()), limits)
 
 
 class TestCliSubprocess(unittest.TestCase):
@@ -1937,6 +2049,84 @@ class TestCliSubprocess(unittest.TestCase):
                     "ANNEAL_OOM_OFFLOAD_CMD": "false",
                 },
             )
+
+    def test_cli_synthetic_hosts_honor_caller_lowered_lean_num_threads_end_to_end(self) -> None:
+        """Real subprocess CLI on both uncapped and cgroup-capped synthetic hosts:
+        `LEAN_NUM_THREADS=1` flows to `--probe` text and the executed child while
+        leaving `CARGO_BUILD_JOBS`/`RAYON_NUM_THREADS` at the host budget, and
+        oversized values clamp strictly on the capped host."""
+        dump_threads = [
+            sys.executable,
+            "-c",
+            "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+            "('LEAN_NUM_THREADS', 'CARGO_BUILD_JOBS', 'RAYON_NUM_THREADS')}))",
+        ]
+        with tempfile.TemporaryDirectory(prefix="anneal-synth-threads-") as tmp:
+            root = Path(tmp)
+            _write_synthetic_host_base(root)
+            for cg_name, ceiling_mib, capped in (
+                ("cg_uncapped", None, False),
+                ("cg_capped_1", 12288, True),
+            ):
+                _write_synthetic_cgroup_root(root, cg_name, ceiling_mib)
+                probe_json = self._probe_json(
+                    self._synthetic_cli(root, cg_name, "--mode", "build", "--probe", "--json")
+                )
+                self.assertIs(probe_json["is_cg_capped"], capped)
+                budget = probe_json["threads"]
+                self.assertGreater(budget, 1)
+
+                # Lower positive `LEAN_NUM_THREADS=1` wins in both regimes.
+                probe_txt = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--probe",
+                    env_extra={"LEAN_NUM_THREADS": "1"},
+                )
+                self.assertEqual(probe_txt.returncode, 0, probe_txt.stderr)
+                self.assertIn(
+                    f"Thread Budget (-j) : {budget} threads (LEAN_NUM_THREADS=1)\n",
+                    probe_txt.stdout,
+                )
+                run_low = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--no-slot-lock",
+                    "--",
+                    *dump_threads,
+                    env_extra={"LEAN_NUM_THREADS": "1", "CARGO_BUILD_JOBS": "", "RAYON_NUM_THREADS": ""},
+                )
+                self.assertEqual(run_low.returncode, 0, run_low.stderr)
+                self.assertEqual(
+                    json.loads(run_low.stdout),
+                    {
+                        "LEAN_NUM_THREADS": "1",
+                        "CARGO_BUILD_JOBS": str(budget),
+                        "RAYON_NUM_THREADS": str(budget),
+                    },
+                )
+
+                # Oversized `LEAN_NUM_THREADS=99` clamps on capped hosts and is kept on uncapped hosts.
+                want_high = budget if capped else 99
+                run_high = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--no-slot-lock",
+                    "--",
+                    *dump_threads,
+                    env_extra={"LEAN_NUM_THREADS": "99", "CARGO_BUILD_JOBS": "", "RAYON_NUM_THREADS": ""},
+                )
+                self.assertEqual(run_high.returncode, 0, run_high.stderr)
+                self.assertEqual(
+                    json.loads(run_high.stdout)["LEAN_NUM_THREADS"],
+                    str(want_high),
+                )
 
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):

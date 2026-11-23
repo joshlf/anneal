@@ -125,8 +125,10 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 #
 # Dual-authority correspondence modules cited by name below. Each relates
 # `Trusted.Rustc.V2026_06_01.MirSemantics` to MiniRust (`MiniRustSpec.Interp`, the `MR` module)
-# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); a `Bundle` module closes the
-# per-variant `DualCorrespondenceBundle`s over both authorities:
+# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); each `Bundle` module closes
+# the MiniRust side and exports the parameterized `DualCorrespondenceBundle` combinators that
+# the cross-root kernel bridges (`tests/mir/DropBinderAndSubtypeCorrTests.lean`,
+# `tests/mir/NullaryAndPtrCoercionCorrTests.lean`) close against the `LM` module:
 #   UnwindSetDiscrAndFnPtr{MR,LM}        minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean,
 #                                        lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean
 #   DropBinderAndSubtype{MR,LM,Bundle}   minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean,
@@ -5477,10 +5479,15 @@ def _probe_lean_run_memory_max_mib(
 ) -> int | None:
     """`MemoryMax` (MiB) that the `anneal-lean-run` wrapper of `cmd` plans for the
     scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
-    --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped
-    or the probe fails. The suite process is outside that scope, so its own cgroup
-    hierarchy cannot show this cap."""
+    --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped,
+    will pass through without creating a new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1`
+    without `--nested-ok`), or the probe fails. The suite process is outside that
+    scope, so its own cgroup hierarchy cannot show this cap."""
     if not _is_lean_run_wrapped(cmd, env):
+        return None
+    env_map = os.environ if env is None else env
+    _mode, _timeout, _slot_lock, _saw_timeout, _oom_retry, nested_ok = _parse_lean_run_wrapper(cmd)
+    if env_map.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not nested_ok:
         return None
     opts: list[str] = []
     i, n = 1, len(cmd)
@@ -5540,7 +5547,9 @@ def _build_step_env(
     env = dict(os.environ if base_env is None else base_env)
     _ensure_toolchain_path(env, use_ambient_home=base_env is None)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
-    if step_name in LOW_RAM_SINGLE_THREAD_STEPS:
+    if step_name in LOW_RAM_SINGLE_THREAD_STEPS and not (
+        env_overrides is not None and "LEAN_NUM_THREADS" in env_overrides
+    ):
         if effective_ram_mib is _RAM_UNSET:
             probe_env = {**env, **env_overrides} if env_overrides else env
             ceilings = [
