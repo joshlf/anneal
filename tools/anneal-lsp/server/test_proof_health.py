@@ -6783,8 +6783,10 @@ class TestNegationPrecedenceAndFalseElimExemption(unittest.TestCase):
     def setUp(self) -> None:
         proof_health.clear_in_process_caches()
 
-    def test_has_top_level_arrow_delimiters_and_binders(self) -> None:
-        fn = proof_health._has_top_level_arrow
+    def test_looser_than_not_delimiters_and_binders(self) -> None:
+        # `[adv B1]`: A0 tested `_has_top_level_arrow`, a helper nothing called; this is the
+        # precedence scan the auditor actually runs.
+        fn = proof_health._has_top_level_looser_than_not
         for yes in (
             "¬ P → α",
             "¬ P -> α",
@@ -6793,6 +6795,12 @@ class TestNegationPrecedenceAndFalseElimExemption(unittest.TestCase):
             "¬ (∀ x, P x) → Q",
             "¬ P → ∀ x, Q x",
             "¬ a = b → c",
+            "¬ P ↔ Q",
+            "¬ P <-> Q",
+            "¬ P ∨ Q",
+            "¬ P \\/ Q",
+            "¬ P ∧ Q",
+            "¬ P /\\ Q",
         ):
             self.assertTrue(fn(yes), yes)
         for no in (
@@ -6802,11 +6810,12 @@ class TestNegationPrecedenceAndFalseElimExemption(unittest.TestCase):
             "¬ { x : Nat // x → y }",
             "¬ ⟨a → b, c⟩",
             "¬ «a → b»",
-            "¬ P ↔ Q",
-            "¬ P <-> Q",
             "¬ ∀ x, P x → Q x",
             "¬ ∃ x, P x → Q x",
+            "¬ f = fun x => x ∧ y",
             "¬ True",
+            "x <- y",
+            "f x => y",
         ):
             self.assertFalse(fn(no), no)
 
@@ -6977,6 +6986,236 @@ class TestNegationPrecedenceAndFalseElimExemption(unittest.TestCase):
                     [(f.rule, f.line) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
                     [(f.rule, f.line) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
                     (scope, src),
+                )
+
+
+class TestNegationPrecedenceB1AdversarialHardening(unittest.TestCase):
+    """`[adv B1]` regressions for what `[adv A0]`'s two false-positive fixes let through.
+
+    Every `VACUOUS` header was reported at base `da6917c5` and went quiet at A0: a genuinely
+    unsatisfiable or multi-premise hypothesis slipping past the new precedence scan or the new
+    `: False` exemption. `VACUOUS_OTHER` headers are the same hazards in spellings base never
+    read (or that A0 happened to keep). Every `CLEAN` header must stay quiet.
+    """
+
+    VACUOUS = {
+        # The exemption reads `Nat` / `Bool` / `False` by spelling; a binder can rebind them.
+        "rebound_nat_is_a_prop_premise": "theorem bad (Nat : Prop) (hn : Nat) (h : false = true) : False := by sorry\n",
+        "rebound_bool_is_a_prop_premise": "theorem bad (Bool : Prop) (hb : Bool) (h : false = true) : False := by sorry\n",
+        "rebound_unit_is_a_prop_premise": "theorem bad (Unit : Prop) (hu : Unit) (h : false = true) : False := by sorry\n",
+        "rebound_false_conclusion": "theorem bad (False : Prop) (h : false = true) : False := by sorry\n",
+        "forall_rebound_false_conclusion": "theorem bad (h : false = true) : ∀ (False : Prop), False := by sorry\n",
+        # A relation whose left operand starts like a data type is a proposition, not a binder.
+        "membership_of_container_type": "theorem bad (S : List Type) (hm : List Nat ∈ S) (h : false = true) : False := by sorry\n",
+        "non_membership_of_container_type": "theorem bad (S : List Type) (hm : Option Nat ∉ S) (h : false = true) : False := by sorry\n",
+        "membership_of_typeclass": "theorem bad (S : List Type) (hm : Decidable True ∈ S) (h : false = true) : False := by sorry\n",
+        "heq_of_typeclasses": "theorem bad (α β : Type) (hm : BEq α ≍ BEq β) (h : false = true) : False := by sorry\n",
+        "anonymous_instance_relation": "theorem bad (S : List Type) [Decidable True ∈ S] (h : false = true) : False := by sorry\n",
+        # One binder, two propositions: the premise must be a single atomic relation.
+        "bool_and_second_premise": "theorem bad (s : Nat) (h : none = some s && badState s) : False := by sorry\n",
+        "pprod_second_premise": "theorem bad (s : Nat) (h : none = some s ×' Bad s) : False := by sorry\n",
+        "pipe_second_premise": "theorem bad (s : Nat) (h : none = some s |> Bad) : False := by sorry\n",
+        # The statement continues past a line-leading `|`, so the conclusion is not `False`.
+        "conclusion_continues_with_bool_or": "theorem bad (h : false = true) : False\n  || (fun x => x) true = true := by sorry\n",
+        "conclusion_continues_with_pipe": "theorem bad (h : false = true) : False\n  |> (fun p => p ∨ True) := by sorry\n",
+        # Quantified hypotheses: a contradictory conjunct of the body is still a contradiction.
+        "exists_body_conjunct": "theorem bad (P : Nat → Prop) (h : ∃ y, P y ∧ False) : x = 1 := by sorry\n",
+        "exists_pair_with_outer_hypothesis": "theorem bad (P : Prop) (Q : Nat → Prop) (h1 : P) (h2 : ∃ y, Q y ∧ ¬ P) : x = 1 := by sorry\n",
+        "forall_body_conjunct": "theorem bad (R : Nat → Prop) (h : ∀ s, R s ∧ False) : x = 1 := by sorry\n",
+        "conjunct_then_exists_body": "theorem bad (P : Prop) (Q : Nat → Prop) (h : P ∧ ∃ y, Q y ∧ 0 = 1) : x = 1 := by sorry\n",
+        "exists_body_outer_nat_bound": "theorem bad (n : Nat) (Q : Nat → Prop) (h : ∃ y, Q y ∧ n < 0) : x = 1 := by sorry\n",
+        "nested_exists_body": "theorem bad (h : ∃ a, ∃ b : Nat, a < b ∧ b < b) : x = 1 := by sorry\n",
+        "exists_body_operator_operands": "theorem bad (b : Bool) (Q : Nat → Prop) (h : ∃ y, Q y ∧ !b ≠ !b) : x = 1 := by sorry\n",
+        # A character literal is not a connective.
+        "char_literal_arrow_operand": "theorem bad (h : none = some '→') : x = 1 := by sorry\n",
+        "char_literal_pair": "theorem bad (c : Char) (h1 : c = '→') (h2 : ¬ c = '→') : x = 1 := by sorry\n",
+    }
+    VACUOUS_OTHER = {
+        "exists_proof_binder_premise": "theorem bad (h : ∃ _ : Bad, false = true) : False := by sorry\n",
+        "exists_binder_predicate_premise": "theorem bad (s : List Nat) (h : ∃ x ∈ s, x < x) : False := by sorry\n",
+        "exists_first_conjunct": "theorem bad (P : Nat → Prop) (h : ∃ y, False ∧ P y) : x = 1 := by sorry\n",
+        "exists_whole_body": "theorem bad (h : ∃ y : Nat, y ≠ y) : x = 1 := by sorry\n",
+        "exists_over_rebound_type_variable": "theorem bad {α : Type} (α : Prop) (h : ∃ x : α, false = true) : False := by sorry\n",
+        "char_literal_conj_operands": "theorem bad (h : '∧' ≠ '∧') : x = 1 := by sorry\n",
+        "arrow_false_pair": "theorem bad (P : Prop) (h1 : P) (h2 : P → False) : x = 1 := by sorry\n",
+        "ascii_arrow_false_pair": "theorem bad (P : Prop) (h1 : P) (h2 : P -> False) : x = 1 := by sorry\n",
+        "arrow_false_of_implication_pair": "theorem bad (P : Prop) (α : Type) (h1 : P → α) (h2 : (P → α) → False) : x = 1 := by sorry\n",
+        "arrow_false_of_negation_pair": "theorem bad (P : Prop) (h1 : ¬ P) (h2 : ¬ P → False) : x = 1 := by sorry\n",
+        "arrow_false_of_reflexive_equality": "theorem bad (h : x = x → False) : y = 1 := by sorry\n",
+        "arrow_false_of_true": "theorem bad (h : True → False) : y = 1 := by sorry\n",
+    }
+    CLEAN = {
+        # Honest single-premise refutations, including the shapes the new checks must still read.
+        "primed_names": "theorem ok (x' : Nat) (h : x' < x') : False := by sorry\n",
+        "nat_projection_bound": "theorem ok (xs : List Nat) (h : xs.length < 0) : False := by sorry\n",
+        "sum_constructors": "theorem ok (a b : Nat) (h : Sum.inl a = Sum.inr b) : False := by sorry\n",
+        "char_literal_irreflexive": "theorem ok (h : 'a' ≠ 'a') : False := by sorry\n",
+        "arrow_false_of_true": "theorem ok (h : True → False) : False := by sorry\n",
+        "arrow_false_of_reflexive_equality": "theorem ok (x : Nat) (h : x = x → False) : False := by sorry\n",
+        "exists_over_data": "theorem ok (h : ∃ x : Nat, x < x) : False := by sorry\n",
+        "exists_over_type_variable": "theorem ok {α : Type} (h : ∃ x : α, x ≠ x) : False := by sorry\n",
+        "forall_over_data": "theorem ok (h : ∀ x : Nat, x ≠ x) : False := by sorry\n",
+        "inhabited_data_binders": (
+            "theorem ok (xs : List (Fin 0)) (o : Option Empty) (b : BitVec 8) (p : Nat × Bool)\n"
+            "    (e : Except String Nat) (h : false = true) : False := by sorry\n"
+        ),
+        "type_variable_and_instances": (
+            "theorem ok {α : Type u} [DecidableEq α] [inst : BEq α] (x : α) (h : none = some x) : False := by sorry\n"
+        ),
+        # Quantifiers that rebind a name, restrict their domain, or sit under a looser connective.
+        "exists_rebinds_nat_name": "theorem ok (n : Nat) (h : ∃ n : Int, n < 0 ∧ n = -1) : x = 1 := by sorry\n",
+        "exists_rebinds_pair_name": "theorem ok (y : Nat) (Q : Nat → Prop) (h1 : y = 0) (h2 : ∃ y, Q y ∧ ¬ y = 0) : x = 1 := by sorry\n",
+        "forall_proof_binder": "theorem ok (P : Prop) (h : ∀ hp : P, x = 2 ∧ False) : x = 1 := by sorry\n",
+        "forall_binder_predicate": "theorem ok (n : Nat) (h : ∀ i < n, x = 2 ∧ False) : x = 1 := by sorry\n",
+        "forall_possibly_empty_domain": "theorem ok {α : Type} (h : ∀ a : α, a ≠ a) : x = 1 := by sorry\n",
+        "negated_exists": "theorem ok (P : Nat → Prop) (h : ¬ ∃ y, P y ∧ False) : x = 1 := by sorry\n",
+        "exists_body_implication": "theorem ok (P : Nat → Prop) (Q : Prop) (h : ∃ y, P y ∧ False → Q) : x = 1 := by sorry\n",
+        # An arrow into `False` denies exactly its whole antecedent.
+        "by_contra": "theorem by_contra {p : Prop} (h : ¬ p → False) : p := by sorry\n",
+        "curried_arrow_false": "theorem ok (P Q : Prop) (hp : P) (h : P → Q → False) : x = 1 := by sorry\n",
+        "iff_governs_arrow_false": "theorem ok (P Q : Prop) (hp : P) (h : Q ↔ P → False) : x = 1 := by sorry\n",
+        "restricted_forall_arrow_false": "theorem ok (P : Prop) (Q : Nat → Prop) (hp : P) (h : ∀ hq : Q 0, P → False) : x = 1 := by sorry\n",
+        "linear_arith_shape": "theorem ok (a b : Int) (h : Int.add b (Int.ofNat 1) ≤ a → False) : a ≤ b := by sorry\n",
+        # Character literals and primes.
+        "char_literal_operands": "theorem ok (c : Char) (h1 : c ≠ '→') (h2 : c = '∧') : x = 1 := by sorry\n",
+        "primed_inequality": "theorem ok (x' y' : Nat) (h : x' ≠ y') (h2 : y' < x') : x = 1 := by sorry\n",
+    }
+
+    def setUp(self) -> None:
+        proof_health.clear_in_process_caches()
+
+    def test_vacuous_headers_are_reported_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in {**self.VACUOUS, **self.VACUOUS_OTHER}.items():
+            self.assertIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope missed {label}")
+            self.assertIn((R7, rule, 1), scan67(src), f"default-scope missed {label}")
+
+    def test_clean_headers_stay_quiet_in_both_scopes(self) -> None:
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        for label, src in self.CLEAN.items():
+            self.assertNotIn(rule, _rules(audit.scan_lean_text(src)), f"all-scope flagged {label}")
+            self.assertEqual(scan67(src), [], f"default-scope flagged {label}")
+
+    def test_equation_arm_refutation_keeps_its_base_verdicts(self) -> None:
+        # A statement cut at a real equation arm cannot be exempted (the cut is ambiguous), so
+        # the anonymous premise is reported exactly as at base: by the full audit only.
+        src = "theorem boolNe : false = true → False\n  | h => Bool.noConfusion h\n"
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        self.assertIn(rule, _rules(audit.scan_lean_text(src)))
+        self.assertEqual(scan67(src), [])
+        parsed = proof_health._split_lean_theorem_header(src, len("theorem boolNe"))
+        self.assertEqual(parsed, ([("", "false = true")], "False", ["stmt-cut"]))
+
+    def test_cache_never_serves_an_exemption_to_a_different_header(self) -> None:
+        # The exemption depends on every binder and on the conclusion; all of it is in the
+        # `_THM_AUDIT_CACHE` key (the header slice), under one theorem name, in one process.
+        ct = _load_check_trusted()
+        rule = audit.RULE_SYNTACTIC_CONTRADICTION_HYPOTHESIS
+        exempt = "theorem t (h : false = true) : False := Bool.noConfusion h\n"
+        variants = [
+            "theorem t {hp} (h : false = true) : False := Bool.noConfusion h\n",
+            "theorem t hp (h : false = true) : False := Bool.noConfusion h\n",
+            "theorem t (P : Prop) [Fact P] (h : false = true) : False := Bool.noConfusion h\n",
+            "theorem t (P : Prop) (hp : P) (h : false = true) : False := Bool.noConfusion h\n",
+            "theorem t (h : false = true) : False ∨ True := Bool.noConfusion h\n",
+            "theorem t (h : false = true) : False\n  || (fun x => x) true = true := Bool.noConfusion h\n",
+        ]
+        for mod in (proof_health, ct):
+            for scope in ("all", "annotated"):
+                for variant in variants:
+                    for src, flagged in ((exempt, False), (variant, True), (exempt, False), (variant, True)):
+                        found = rule in [f.rule for f in mod.audit_lean_text(src, vacuity_scope=scope)]
+                        self.assertEqual(found, flagged, (mod.__name__, scope, src))
+        # The parse the exemption reads is a function of the keyed slice alone.
+        header = "theorem t {hp} [Fact P] (h : false = true) : False := x\n"
+        alone = proof_health._split_lean_theorem_header(header, len("theorem t"))
+        embedded = proof_health._split_lean_theorem_header(
+            "  " + header + "theorem u (q : Q) : False := y\n", 2 + len("theorem t"), 2 + len(header)
+        )
+        self.assertEqual(alone, embedded)
+        self.assertEqual(alone, ([("h", "false = true")], "False", ["untyped:hp", "[Fact P]"]))
+
+    def test_arrow_false_antecedent(self) -> None:
+        fn = proof_health._arrow_false_antecedent
+        for expr, want in (
+            ("P → False", "P"),
+            ("P -> False", "P"),
+            ("(P → α) → False", "P → α"),
+            ("¬ p → False", "¬ p"),
+            ("A ∧ B → False", "A ∧ B"),
+            ("A ∨ B → False", "A ∨ B"),
+            ("A → B → False", None),
+            ("A ↔ B → False", None),
+            ("∀ x, P x → False", None),
+            ("fun x => x → False", None),
+            ("P → False ∨ Q", None),
+            ("P → isFalse", None),
+            ("f (P → False)", None),
+            ("False", None),
+        ):
+            self.assertEqual(fn(expr), want, expr)
+
+    def test_non_prop_binder_type_is_a_strict_whitelist(self) -> None:
+        fn = proof_health._is_non_prop_binder_type
+        tv = frozenset({"α"})
+        for ok in (
+            "Nat", "Prop", "Type", "Type u", "α", "Nat × Bool", "List (Fin 0)", "Option Empty",
+            "Array α", "BitVec 8", "BitVec (n + 1)", "Except String Nat", "Sum Nat α",
+            "Decidable (a = b)", "DecidableEq α", "BEq α",
+        ):
+            self.assertTrue(fn(ok, tv), ok)
+        for bad in (
+            "Empty", "Fin 0", "P", "β", "Sort u", "List", "PLift P", "Nat × Empty", "Sum Nat Empty",
+            "List Nat ∈ S", "Option Nat ∉ S", "Decidable P ∈ S", "BEq α ≍ BEq β", "List Nat → Prop",
+            "List Nat × Empty", "Option Nat ⊕ Empty", "{ x : Nat // x < 0 }", "a = b", "Nat = Nat",
+            "List Nat |>.Nonempty", "Option fun x => x", "Decidable", "",
+        ):
+            self.assertFalse(fn(bad, tv), bad)
+
+    def test_simple_refutation_premise_is_a_strict_whitelist(self) -> None:
+        fn = proof_health._is_simple_refutation_premise
+        for ok in (
+            "False", "false = true", "x' < x'", "[] = x :: xs", "none = some x", "¬ (x = x)",
+            "¬ True", "xs.length < 0", "a + 1 < 0", ".inl a = .inr b", "True → False",
+            "x = x → False", "'u61' ≠ 'u61'", "(f x).1 ≠ (f x).1",
+        ):
+            self.assertTrue(fn(ok), ok)
+        for bad in (
+            "none = some s && bad s", "none = some s ×' Bad s", "none = some s |> Bad",
+            "none = some fun y => A ∧ B", "a < b < c", "P", "¬ ¬ True", "x = y ∧ False",
+            "none = some x ∨ P", "n < 0 → P", "{ x // p } = s", "x ∈ s",
+        ):
+            self.assertFalse(fn(bad), bad)
+
+    def test_quantifier_binder_helpers(self) -> None:
+        plain = proof_health._plain_quantifier_binders
+        for ok in ("y", "x y", "y : Nat", "(x : Nat) (b : Bool)", "x (y : Nat)", "{P : Prop}", "(x)"):
+            self.assertTrue(plain(ok), ok)
+        for bad in ("hp : P", "i < n", "x ∈ s", "a : α", "(i : Fin n)", "[inst : Foo]", "! x", ""):
+            self.assertFalse(plain(bad), bad)
+        # A type variable's domain may be empty: plain only for callers that pass it in scope.
+        self.assertTrue(plain("a : α", frozenset({"α"})))
+        self.assertTrue(plain("(a : α) (n : Nat)", frozenset({"α"})))
+        self.assertFalse(plain("a : β", frozenset({"α"})))
+        bound = proof_health._quantifier_bound_names
+        self.assertEqual(bound("x y : T n"), frozenset({"x", "y"}))
+        self.assertEqual(bound("(x : Nat) {y : Fin x}"), frozenset({"x", "y"}))
+        self.assertEqual(bound("⟨a, b⟩"), frozenset({"a", "b"}))
+        self.assertEqual(bound("x ∈ s"), frozenset({"x", "s"}))
+        split = proof_health._split_quantifier_prefix
+        self.assertEqual(split("∃ ⟨a, b⟩, a < b"), ("∃", " ⟨a, b⟩", " a < b"))
+        self.assertEqual(split("forall x, P x"), ("∀", " x", " P x"))
+        self.assertIsNone(split("existsUnique x"))
+        self.assertIsNone(split("∀ x"))
+
+    def test_check_trusted_agrees_on_every_b1_header(self) -> None:
+        ct = _load_check_trusted()
+        for label, src in {**self.VACUOUS, **self.VACUOUS_OTHER, **self.CLEAN}.items():
+            for scope in ("all", "annotated", "annotated-only"):
+                self.assertEqual(
+                    [(f.rule, f.line, f.message) for f in ct.audit_lean_text(src, vacuity_scope=scope)],
+                    [(f.rule, f.line, f.message) for f in proof_health.audit_lean_text(src, vacuity_scope=scope)],
+                    (scope, label),
                 )
 
 
