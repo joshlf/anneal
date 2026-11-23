@@ -879,11 +879,18 @@ theorem sourceScanner_segment_matching_edges :
       .error (.forbiddenSourceOption topicProofModName "native_decide/decide +native") :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
-/-- A reducibility override or instance attribute on a genuinely LOCAL target is still accepted. -/
+/-- A reducibility override or instance attribute on a genuinely LOCAL target & declared local instance is accepted. -/
+def proofLocalInstName : SymName := SymName.ofList ["Topic", "Proofs", "instLocal"]
+def proofLocalInstDecl : ConstantRecord := {
+  name := proofLocalInstName, kind := .defnDecl, type := .const SymName.natName,
+  value? := some (.natLit 0), hasValue := true, all := [proofLocalInstName],
+  originModule := topicProofModName
+}
+
 def localTargetExtPkg : PackageAuditInput :=
-  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl, proofLocalInstDecl]
     (extEntries := [
-      .instanceEntry (SymName.ofList ["Topic", "Proofs", "instLocal"]) cleanProofThmName
+      .instanceEntry proofLocalInstName cleanProofThmName
         topicProofModName false,
       .reducibilityOverride cleanProofThmName topicProofModName "irreducible"]))
 
@@ -1409,5 +1416,79 @@ theorem sourceScanner_meta_exec_edges :
     scanProofSource "def x := Nat.run_elab" =
       .error (.forbiddenSourceOption topicProofModName "by_elab/run_tac/run_cmd") :=
   ⟨rfl, rfl, rfl, rfl, rfl⟩
+
+/-! ## Section 11: Pass-`A4` Regression Suite (`_unsafe_rec` Sanitization, Extension Declaration Backing, `extraConstNames` Hygiene, & `unsafe` Term Scanner) -/
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_unsafeRec_sanitized' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_unsafeRec_sanitized
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.auditAndReplayPackage_ext_decls_declared' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms auditAndReplayPackage_ext_decls_declared
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA4_unsafeRec_companion_sanitized' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA4_unsafeRec_companion_sanitized
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA4_dangling_ext_decl_and_extraConst_hygiene_rejected' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA4_dangling_ext_decl_and_extraConst_hygiene_rejected
+
+/--
+info: 'Anneal.ReplayKeyAndTamperAuditPrototype.passA4_unsafe_term_scanner_hardened' depends on axioms: [propext,
+ Classical.choice,
+ Quot.sound]
+-/
+#guard_msgs in #print axioms passA4_unsafe_term_scanner_hardened
+
+example := passA4_unsafeRec_companion_sanitized
+example := passA4_dangling_ext_decl_and_extraConst_hygiene_rejected
+example := passA4_unsafe_term_scanner_hardened
+
+/-- Instantiation on `validBaselinePackage`: every `_unsafe_rec` companion is sanitized AND every
+persisted local instance/coe extension declaration is backed by a genuinely declared constant. -/
+theorem validBaselinePackage_passA4_guarantees :
+    (∀ inv ∈ validBaselinePackage.modules, ∀ ci ∈ inv.constants,
+      isCodegenUnsafeRecInMod inv ci = true →
+      ∀ edges, ConstantRecord.declarationEdges ci = .ok edges →
+        ∀ dep ∈ edges,
+          ∃ depCi, (packageEnv validBaselinePackage).lookup dep = some depCi ∧
+            depCi.isUnsafe = false) ∧
+    (∀ inv ∈ validBaselinePackage.modules, ∀ ext ∈ inv.extEntries, ∀ d,
+      ext.localDecl? = some d → d ∈ inv.constNames) := by
+  cases h : auditAndReplayPackage defaultUnconditionalConfig validBaselinePackage with
+  | error e =>
+    have hok := validBaselinePackage_accepted
+    rw [h] at hok
+    cases hok
+  | ok cert =>
+    refine ⟨?_, auditAndReplayPackage_ext_decls_declared h rfl⟩
+    intro inv hinv ci hci hur edges hedges dep hdep
+    obtain ⟨depCi, hlu, hnu, _⟩ :=
+      auditAndReplayPackage_unsafeRec_sanitized h rfl rfl inv hinv ci hci hur edges hedges dep hdep
+    exact ⟨depCi, hlu, hnu⟩
+
+/-- Even under `--provisional`, `_unsafe_rec` still rejects `Lean.trustCompiler` and `unsafe` keyword in source. -/
+theorem passA4_provisional_still_blocks_unsafeRec_trustCompiler_and_unsafe_term :
+    auditAndReplayPackage provisionalConfig unsafeRecTrustCompilerPkg =
+      .error (.forbiddenNativeReductionAxiom (SymName.str safeRecFnName "_unsafe_rec")
+        SymName.trustCompilerName) ∧
+    SourceScanner.scanSourceDefenseInDepth provisionalConfig topicProofModName .proof
+        "def x : Nat := unsafe (0 : Nat)" =
+      .error (.forbiddenSourceOption topicProofModName "unsafe") :=
+  ⟨rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditProtoTests

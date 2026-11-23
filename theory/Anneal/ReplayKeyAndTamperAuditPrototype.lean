@@ -1127,6 +1127,14 @@ def metaExecTokens : List (List Char) :=
 def hasMetaExecTokensChars (toks : List (List Char)) : Bool :=
   toks.any fun t => metaExecTokens.any fun kw => tokenHasKeyword kw t
 
+/--
+True iff `toks` contains the standalone keyword `unsafe` (`Parser.Command.unsafe` /
+`Parser.Term.unsafe`, banned by `TrustedBoundary.inspectSyntax` L105 & L107 because
+`def x : Nat := unsafe (0 : Nat)` compiles in pure `Init` emitting `isUnsafe = false` constants).
+-/
+def hasUnsafeTokenChars (toks : List (List Char)) : Bool :=
+  toks.any (tokenHasKeyword "unsafe".toList)
+
 /-- Defense-in-depth source scanner over a character stream (comment- and string-stripped tokens). -/
 def scanSourceChars (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     (cs : List Char) : Except AuditFailure Unit := do
@@ -1146,6 +1154,8 @@ def scanSourceChars (cfg : AuditConfig) (modName : SymName) (role : ModuleRole)
     throw (.forbiddenSourceOption modName "quotPrecheck false")
   if hasMetaExecTokensChars toks then
     throw (.forbiddenSourceOption modName "by_elab/run_tac/run_cmd")
+  if hasUnsafeTokenChars toks then
+    throw (.forbiddenSourceOption modName "unsafe")
   if hasAlwaysForbiddenNativeChars toks then
     throw (.forbiddenSourceOption modName "native_decide/decide +native")
   let allowModProvisional := cfg.allowProvisionalNative && role == .proof
@@ -5943,83 +5953,94 @@ def validateReplayInventory (inv : ModuleInventory) : Except AuditFailure Unit :
 def isStrictExemptModule (inv : ModuleInventory) : Bool :=
   inv.role == .defsExempt && SymName.isStrictExemptModuleName inv.moduleName
 
-/-- True iff extension declaration `d` genuinely belongs to `inv` (never a foreign/protected decl). -/
-def isLocalExtDecl (inv : ModuleInventory) (protectedNames : List SymName) (d : SymName) : Bool :=
-  inv.constNames.contains d ||
-  (!protectedNames.contains d && SymName.belongsToModuleNamespace inv.moduleName d)
+/--
+True iff extension declaration `d` is genuinely declared in `inv`'s own inventory (never foreign,
+protected, or a dangling undeclared phantom name, closing `B4`'s observation on `isLocalExtDecl`).
+-/
+def isLocalExtDecl (inv : ModuleInventory) (_protectedNames : List SymName) (d : SymName) : Bool :=
+  inv.constNames.contains d
+
+/-- Validate a single persisted extension entry for `inv` (`V01`, `V02`, `V07`, `V08`, `V10`–`V13`, `V15`, `V16`). -/
+def validateSingleExtEntry (inv : ModuleInventory) (isDefs : Bool)
+    (protectedNames : List SymName) (ext : EnvExtEntry) : Except AuditFailure Unit :=
+  match ext with
+  | .macroEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "macro" d)
+  | .commandElabEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "command_elab" d)
+  | .localCommandElabEntry d _ persistedGlobal =>
+    -- An entry that is PRESENT in a persisted extension table is persisted, whatever its
+    -- `persistedGlobal` flag claims: a genuinely local `elab` leaves no entry at all.
+    if persistedGlobal then
+      .error (.forbiddenMacroOrElab inv.moduleName "local_command_elab_global" d)
+    else
+      .error (.forbiddenMacroOrElab inv.moduleName "local_command_elab" d)
+  | .scopedElabEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "scoped_elab" d)
+  | .scopedMacroEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "scoped_macro" d)
+  | .scopedInstanceEntry d _ targetClass =>
+    -- Even in `Defs`, `scoped instance` must target a class declared locally in `Defs` and use a local decl.
+    if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
+      .error (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
+    else .ok ()
+  | .termElabEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "term_elab" d)
+  | .delabEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "delab" d)
+  | .appUnexpanderEntry d _ =>
+    .error (.forbiddenMacroOrElab inv.moduleName "app_unexpander" d)
+  | .instanceEntry d target targetOrigin _ =>
+    -- Both `target` AND the instance declaration `d` must be declared in `inv` (never foreign/dangling).
+    if targetOrigin != inv.moduleName || !inv.constNames.contains target ||
+        !isLocalExtDecl inv protectedNames d then
+      .error (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
+    else .ok ()
+  | .defaultInstanceEntry d targetClass =>
+    -- Even in `Defs`, `default_instance` cannot override an imported `Init`/foreign class!
+    if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
+      .error (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
+    else .ok ()
+  | .coeEntry d srcTy tgtTy =>
+    -- Even in `Defs`, a coercion must touch a type declared locally in `Defs` (never `Nat → Bool`!).
+    if !isDefs || !(inv.constNames.contains srcTy || inv.constNames.contains tgtTy) ||
+        !isLocalExtDecl inv protectedNames d then
+      .error (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
+    else .ok ()
+  | .reducibilityOverride target targetOrigin _ =>
+    if targetOrigin != inv.moduleName || !inv.constNames.contains target then
+      .error (.forbiddenReducibilityOverride inv.moduleName target)
+    else .ok ()
+  | .exportAlias aliasName target _ =>
+    .error (.forbiddenShadowingOrExport inv.moduleName aliasName target)
+  | .regularInitHook d =>
+    .error (.forbiddenInitOrCodegenHook inv.moduleName "initialize" d)
+  | .metaInitHook d =>
+    .error (.forbiddenInitOrCodegenHook inv.moduleName "meta_initialize" d)
+  | .implementedByHook d _ =>
+    .error (.forbiddenInitOrCodegenHook inv.moduleName "implemented_by" d)
+  | .externHook d _ =>
+    .error (.forbiddenInitOrCodegenHook inv.moduleName "extern" d)
+  | .cachedExportedAxioms _ _ =>
+    -- Defense-in-depth (`V06`): never trust cached axiom extension tables!
+    .ok ()
 
 /--
 Audit persistent environment extension tables and public namespace suffix shadowing for a module
 (`V01`, `V02`, `V07`, `V08`, `V10`, `V11`, `V12`, `V13`, `V15`, `V16`).
 Explicitly ignores `.cachedExportedAxioms` (`V06`) so tampered caches can never mask axioms.
 For genuine `defsExempt` modules (`<Topic>.Defs`), local instances, `scoped_instance`,
-`default_instance`, and `coe` (with local target & local decl) are permitted, while `V10` hooks
-(`initialize`, `meta initialize`, `implemented_by`, `extern`), macro/elab/delab/unexpander entries,
-foreign-target instances/coes, foreign reducibility overrides, `export` aliases, and `Init`/cross-module
-suffix shadowing remain strictly forbidden!
+`default_instance`, and `coe` (with local target & genuinely declared local decl) are permitted,
+while `V10` hooks (`initialize`, `meta initialize`, `implemented_by`, `extern`), macro/elab/delab/
+unexpander entries, foreign-target or dangling instances/coes, foreign reducibility overrides,
+`export` aliases, and `Init`/cross-module suffix shadowing remain strictly forbidden!
 -/
 def validateModuleExtensions (cfg : AuditConfig) (inv : ModuleInventory)
     (protectedNames : List SymName) : Except AuditFailure Unit := do
   if !cfg.enforceStrictProofs || inv.role == .foundation then
     return ()
   let isDefs := isStrictExemptModule inv
-  for ext in inv.extEntries do
-    match ext with
-    | .macroEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "macro" d)
-    | .commandElabEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "command_elab" d)
-    | .localCommandElabEntry d _ persistedGlobal =>
-      -- An entry that is PRESENT in a persisted extension table is persisted, whatever its
-      -- `persistedGlobal` flag claims: a genuinely local `elab` leaves no entry at all.
-      if persistedGlobal then
-        throw (.forbiddenMacroOrElab inv.moduleName "local_command_elab_global" d)
-      else
-        throw (.forbiddenMacroOrElab inv.moduleName "local_command_elab" d)
-    | .scopedElabEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "scoped_elab" d)
-    | .scopedMacroEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "scoped_macro" d)
-    | .scopedInstanceEntry d _ targetClass =>
-      -- Even in `Defs`, `scoped instance` must target a class declared locally in `Defs` and use a local decl.
-      if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
-        throw (.forbiddenInstanceOrCoe inv.moduleName "scoped_instance" d)
-    | .termElabEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "term_elab" d)
-    | .delabEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "delab" d)
-    | .appUnexpanderEntry d _ =>
-      throw (.forbiddenMacroOrElab inv.moduleName "app_unexpander" d)
-    | .instanceEntry d target targetOrigin _ =>
-      -- Both `target` AND the instance declaration `d` must belong to `inv` (never foreign/imported).
-      if targetOrigin != inv.moduleName || !inv.constNames.contains target ||
-          !isLocalExtDecl inv protectedNames d then
-        throw (.forbiddenInstanceOrCoe inv.moduleName "imported_instance" d)
-    | .defaultInstanceEntry d targetClass =>
-      -- Even in `Defs`, `default_instance` cannot override an imported `Init`/foreign class!
-      if !isDefs || !inv.constNames.contains targetClass || !isLocalExtDecl inv protectedNames d then
-        throw (.forbiddenInstanceOrCoe inv.moduleName "default_instance" d)
-    | .coeEntry d srcTy tgtTy =>
-      -- Even in `Defs`, a coercion must touch a type declared locally in `Defs` (never `Nat → Bool`!).
-      if !isDefs || !(inv.constNames.contains srcTy || inv.constNames.contains tgtTy) ||
-          !isLocalExtDecl inv protectedNames d then
-        throw (.forbiddenInstanceOrCoe inv.moduleName "coe" d)
-    | .reducibilityOverride target targetOrigin _ =>
-      if targetOrigin != inv.moduleName || !inv.constNames.contains target then
-        throw (.forbiddenReducibilityOverride inv.moduleName target)
-    | .exportAlias aliasName target _ =>
-      throw (.forbiddenShadowingOrExport inv.moduleName aliasName target)
-    | .regularInitHook d =>
-      throw (.forbiddenInitOrCodegenHook inv.moduleName "initialize" d)
-    | .metaInitHook d =>
-      throw (.forbiddenInitOrCodegenHook inv.moduleName "meta_initialize" d)
-    | .implementedByHook d _ =>
-      throw (.forbiddenInitOrCodegenHook inv.moduleName "implemented_by" d)
-    | .externHook d _ =>
-      throw (.forbiddenInitOrCodegenHook inv.moduleName "extern" d)
-    | .cachedExportedAxioms _ _ =>
-      -- Defense-in-depth (`V06`): never trust cached axiom extension tables!
-      pure ()
+  checkEach inv.extEntries (validateSingleExtEntry inv isDefs protectedNames)
   -- Public namespace suffix shadowing check (`V15`)
   -- Only Lean's `_private` name encoding exempts a declaration (never the `isPrivate` flag), and
   -- only an internal SUFFIX is skipped: `Topic._x.Nat.add` still shadows `Nat.add` inside
@@ -6306,11 +6327,15 @@ def allowReplayAxiom (cfg : AuditConfig) (pkg : PackageAuditInput) (ci : Constan
     (cfg.allowProvisionalNative && role == .proof &&
       SymName.hasNativeComponent ci.name && isValidNativeAxiomType ci.type)
 
-/-- Validate `extraConstNames` provenance across all modules. -/
+/-- Validate `extraConstNames` provenance, non-anonymity, and uniqueness across all modules. -/
 def auditExtraConstProvenance (pkg : PackageAuditInput) (allEnv : KernelEnv) :
     Except AuditFailure Unit := do
   for inv in pkg.modules do
+    if hasDuplicates inv.extraConstNames then
+      throw (.duplicateConstName inv.moduleName inv.moduleName)
     for extra in inv.extraConstNames do
+      if extra.isAnonymous then
+        throw (.anonymousConstantName inv.moduleName)
       if allEnv.contains extra && !inv.constNames.contains extra then
         throw (.extraConstProvenanceMismatch inv.moduleName extra)
 
@@ -6360,12 +6385,58 @@ def nativeAxiomRefutedByKernel (env : KernelEnv) (fuel : Nat) (ty : ExprSkeleton
     whnfAllowOpaque env fuel [] lhs == .const SymName.boolFalseName
   | _ => false
 
-/-- Validate module-wide declaration safety and axiom admissibility (catching unreferenced axioms `V04`). -/
+/--
+Validate a single `declarationEdges` dependency of a codegen `_unsafe_rec` companion:
+every dependency must resolve in `allEnv`, be non-`unsafe`, never be a non-companion `partial`
+declaration, and obey the exact same `sorryAx` / native-reduction / axiom admissibility rules
+as audited declarations (preventing `_unsafe_rec` from smuggling `sorryAx`, `Lean.trustCompiler`,
+or phantom constants while still permitting genuine recursive `_unsafe_rec` bodies).
+-/
+def checkUnsafeRecEdge (cfg : AuditConfig) (pkg : PackageAuditInput) (allEnv : KernelEnv)
+    (inv : ModuleInventory) (ci : ConstantRecord) (dep : SymName) : Except AuditFailure Unit :=
+  match allEnv.lookup dep with
+  | none => .error (.unknownConstant dep)
+  | some depCi =>
+    if depCi.isUnsafe then
+      .error (.unsafeOrPartialDecl (declaringModuleName pkg dep depCi) dep)
+    else if depCi.isPartial &&
+        !(match moduleOfConst? pkg dep with
+          | some depInv => isCodegenUnsafeRecInMod depInv depCi
+          | none => false) then
+      .error (.unsafeOrPartialDecl (declaringModuleName pkg dep depCi) dep)
+    else if depCi.isAxiom then
+      if dep == SymName.sorryAxName then
+        .error (.forbiddenAxiom ci.name dep (declaringModuleName pkg dep depCi))
+      else if SymName.isNativeReductionAxiom dep then
+        let okProv := cfg.allowProvisionalNative &&
+          roleOfConst pkg dep depCi == .proof &&
+          SymName.hasNativeComponent dep &&
+          dep != SymName.trustCompilerName &&
+          isValidNativeAxiomType depCi.type
+        if okProv then .ok ()
+        else .error (.forbiddenNativeReductionAxiom ci.name dep)
+      else if SymName.isFoundationalAxiom dep && roleOfConst pkg dep depCi == .foundation then
+        .ok ()
+      else if cfg.allowAssumptions && roleOfConst pkg dep depCi == .assumptions then
+        .ok ()
+      else if inv.role == .test && cfg.allowAssumptions && cfg.allowLocalTestAxioms &&
+          declaringModuleName pkg dep depCi == inv.moduleName then
+        .ok ()
+      else
+        .error (.forbiddenAxiom ci.name dep (declaringModuleName pkg dep depCi))
+    else .ok ()
+
+/-- Validate module-wide declaration safety, `_unsafe_rec` edge sanitization, and axiom admissibility (`V04`). -/
 def auditModuleDeclarations (cfg : AuditConfig) (pkg : PackageAuditInput) :
-    Except AuditFailure Unit := do
-  for inv in pkg.modules do
-    for ci in inv.constants do
-      if !isCodegenUnsafeRecInMod inv ci then
+    Except AuditFailure Unit :=
+  let allEnv := KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv
+  checkEach pkg.modules fun inv =>
+    checkEach inv.constants fun ci =>
+      if isCodegenUnsafeRecInMod inv ci then
+        match ConstantRecord.declarationEdges ci with
+        | .error e => .error e
+        | .ok edges => checkEach edges (checkUnsafeRecEdge cfg pkg allEnv inv ci)
+      else do
         if ci.isUnsafe || ci.isPartial then
           throw (.unsafeOrPartialDecl inv.moduleName ci.name)
         if ci.isAxiom then
@@ -6380,9 +6451,7 @@ def auditModuleDeclarations (cfg : AuditConfig) (pkg : PackageAuditInput) :
               throw (.forbiddenNativeReductionAxiom ci.name ci.name)
             if !isValidNativeAxiomType ci.type then
               throw (.invalidNativeAxiomType ci.name ci.name)
-            if nativeAxiomRefutedByKernel
-                (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv)
-                cfg.kernelFuel ci.type then
+            if nativeAxiomRefutedByKernel allEnv cfg.kernelFuel ci.type then
               throw (.invalidNativeAxiomType ci.name ci.name)
           else if inv.role == .foundation && SymName.isFoundationalAxiom ci.name then
             pure ()
@@ -9128,6 +9197,146 @@ theorem auditAndReplayPackage_reserved_origins_within_imports {cfg : AuditConfig
         | false => rw [hvis] at h1; cases h1
         | true => exact moduleVisibleFrom_sound hnodup hinv hvis
 
+/--
+Codegen `_unsafe_rec` Companion Sanitization Theorem: in an audited unconditional package
+(`allowAssumptions = false`, `allowProvisionalNative = false`), even though legitimate `_unsafe_rec`
+companions are excluded from clean-env kernel replay, EVERY constant in their `declarationEdges`
+MUST resolve in `packageEnv pkg`, be non-`unsafe`, never be `sorryAx`, never be a native-reduction
+or compiler-trust axiom, and if an axiom be strictly a `.foundation` foundational axiom.
+-/
+theorem auditAndReplayPackage_unsafeRec_sanitized {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert)
+    (hNoA : cfg.allowAssumptions = false)
+    (hNoP : cfg.allowProvisionalNative = false) :
+    ∀ inv ∈ pkg.modules, ∀ ci ∈ inv.constants,
+      isCodegenUnsafeRecInMod inv ci = true →
+      ∀ edges, ConstantRecord.declarationEdges ci = .ok edges →
+        ∀ dep ∈ edges,
+          ∃ depCi, (packageEnv pkg).lookup dep = some depCi ∧
+            depCi.isUnsafe = false ∧
+            (depCi.isAxiom = true →
+              dep ≠ SymName.sorryAxName ∧
+              SymName.isNativeReductionAxiom dep = false ∧
+              SymName.isFoundationalAxiom dep = true ∧
+              roleOfConst pkg dep depCi = .foundation) := by
+  have hmodDecls := (auditAndReplayPackage_elim hAudit).2.2.2.2.2.2.1
+  unfold auditModuleDeclarations at hmodDecls
+  intro inv hinv ci hci hur edges hedges dep hdep
+  have hciOk := checkEach_ok_mem (checkEach_ok_mem hmodDecls inv hinv) ci hci
+  simp only [hur, ↓reduceIte, hedges] at hciOk
+  have hedge := checkEach_ok_mem hciOk dep hdep
+  unfold checkUnsafeRecEdge at hedge
+  cases hlu : (KernelEnv.finalizeImportedEnv pkg.modules ++ mkBaseKernelEnv pkg.baseEnv).lookup dep with
+  | none => rw [hlu] at hedge; cases hedge
+  | some depCi =>
+    rw [hlu] at hedge; dsimp only at hedge
+    have hluPkg : (packageEnv pkg).lookup dep = some depCi := hlu
+    cases hu : depCi.isUnsafe with
+    | true => rw [hu] at hedge; simp at hedge
+    | false =>
+      rw [hu] at hedge; simp only [Bool.false_eq_true, ↓reduceIte] at hedge
+      cases hpart : (depCi.isPartial &&
+          !(match moduleOfConst? pkg dep with
+            | some depInv => isCodegenUnsafeRecInMod depInv depCi
+            | none => false)) with
+      | true => rw [hpart] at hedge; simp at hedge
+      | false =>
+        rw [hpart] at hedge; simp only [Bool.false_eq_true, ↓reduceIte] at hedge
+        refine ⟨depCi, hluPkg, hu, ?_⟩
+        intro hax
+        simp only [hax, ↓reduceIte] at hedge
+        cases hsor : (dep == SymName.sorryAxName) with
+        | true => rw [hsor] at hedge; simp at hedge
+        | false =>
+          rw [hsor] at hedge; simp only [Bool.false_eq_true, ↓reduceIte] at hedge
+          have hneSorry : dep ≠ SymName.sorryAxName := fun h => by
+            rw [h] at hsor; simp at hsor
+          cases hnat : SymName.isNativeReductionAxiom dep with
+          | true =>
+            rw [hnat] at hedge; simp [hNoP] at hedge
+          | false =>
+            rw [hnat] at hedge; simp only [Bool.false_eq_true, ↓reduceIte] at hedge
+            cases hfd : (SymName.isFoundationalAxiom dep && roleOfConst pkg dep depCi == .foundation) with
+            | true =>
+              have hfd' : SymName.isFoundationalAxiom dep = true ∧
+                  roleOfConst pkg dep depCi = .foundation := by
+                simpa [Bool.and_eq_true, beq_iff_eq] using hfd
+              exact ⟨hneSorry, rfl, hfd'.1, hfd'.2⟩
+            | false =>
+              rw [hfd] at hedge; simp [hNoA] at hedge
+
+/--
+Extension Declaration Backing Theorem (closes `B4`'s observation on `isLocalExtDecl`):
+when `cfg.enforceStrictProofs = true`, every persisted `instanceEntry`, `scopedInstanceEntry`,
+`defaultInstanceEntry`, or `coeEntry` in an audited package MUST refer to a declaration `d`
+genuinely present in `inv.constNames` (never a dangling undeclared phantom name, so `d` is itself
+audited, closure-walked, and clean-env kernel-replayed).
+-/
+theorem auditAndReplayPackage_ext_decls_declared {cfg : AuditConfig}
+    {pkg : PackageAuditInput} {cert : AuditCertificate}
+    (hAudit : auditAndReplayPackage cfg pkg = .ok cert)
+    (hStrict : cfg.enforceStrictProofs = true) :
+    ∀ inv ∈ pkg.modules, ∀ ext ∈ inv.extEntries, ∀ d,
+      ext.localDecl? = some d → d ∈ inv.constNames := by
+  have hsound := auditAndReplayPackage_sound hAudit
+  have himps := auditAndReplayPackage_imports_sound hAudit
+  intro inv hinv ext hext d hd
+  have hextOk := (hsound.1 inv hinv).2.2.2.2
+  have hnotStd : ¬ SymName.isStdlibModule inv.moduleName := (himps inv hinv).1
+  have hnotFound : inv.role ≠ .foundation := by
+    intro hrf
+    have hroleOk := (hsound.1 inv hinv).2.2.1
+    unfold validateModuleRole at hroleOk
+    dsimp only [bind, Except.bind, pure, Except.pure, throw, throwThe, MonadExceptOf.throw] at hroleOk
+    split at hroleOk; · cases hroleOk
+    split at hroleOk; · cases hroleOk
+    split at hroleOk; · cases hroleOk
+    split at hroleOk; · cases hroleOk
+    rename_i hrm
+    have hmatch : roleMatchesModuleName inv.role inv.moduleName = true := by
+      cases h : roleMatchesModuleName inv.role inv.moduleName
+      · exfalso; apply hrm; simp [h]
+      · rfl
+    rw [hrf] at hmatch
+    unfold roleMatchesModuleName at hmatch
+    split at hmatch
+    · cases hmatch
+    · exact hnotStd hmatch
+  have hrfF : (inv.role == .foundation) = false := by
+    cases hr : inv.role <;> simp_all
+  unfold validateModuleExtensions at hextOk
+  dsimp only [bind, Except.bind, pure, Except.pure] at hextOk
+  simp only [hStrict, Bool.not_true, hrfF, Bool.or_false, Bool.false_eq_true, ↓reduceIte] at hextOk
+  cases hce : checkEach inv.extEntries (validateSingleExtEntry inv (isStrictExemptModule inv)
+      (collectProtectedNames pkg)) with
+  | error _ => rw [hce] at hextOk; cases hextOk
+  | ok _ =>
+    have h1 := checkEach_ok_mem hce ext hext
+    cases ext with
+    | scopedInstanceEntry d0 _ _ =>
+      injection hd with hdEq; subst hdEq
+      unfold validateSingleExtEntry isLocalExtDecl at h1
+      simp at h1; exact h1.2
+    | instanceEntry d0 _ _ _ =>
+      injection hd with hdEq; subst hdEq
+      unfold validateSingleExtEntry isLocalExtDecl at h1
+      simp at h1; exact h1.2
+    | defaultInstanceEntry d0 _ =>
+      injection hd with hdEq; subst hdEq
+      unfold validateSingleExtEntry isLocalExtDecl at h1
+      simp at h1; exact h1.2
+    | coeEntry d0 _ _ =>
+      injection hd with hdEq; subst hdEq
+      unfold validateSingleExtEntry isLocalExtDecl at h1
+      simp at h1; exact h1.2
+    | macroEntry _ _ | commandElabEntry _ _ | localCommandElabEntry _ _ _
+    | scopedElabEntry _ _ | scopedMacroEntry _ _ | termElabEntry _ _
+    | delabEntry _ _ | appUnexpanderEntry _ _ | reducibilityOverride _ _ _
+    | exportAlias _ _ _ | regularInitHook _ | metaInitHook _
+    | implementedByHook _ _ | externHook _ _ | cachedExportedAxioms _ _ =>
+      simp [EnvExtEntry.localDecl?] at hd
+
 /-! ## Section 9: Constructive Vulnerability Exploits, 18-Vector Tamper Suite (`V01`–`V18`), & Positive Witnesses -/
 
 /-- Helper to construct a well-formed single-module inventory with aligned `constNames`/`replayMap`. -/
@@ -9576,9 +9785,18 @@ def defsBeforeDecl : ConstantRecord := {
 }
 
 def topicDefsLocalInstName : SymName := SymName.ofList ["Topic", "Defs", "instBefore"]
+def topicDefsLocalInstDecl : ConstantRecord := {
+  name := topicDefsLocalInstName
+  kind := .defnDecl
+  type := .const SymName.natName
+  value? := some (.const defsBeforeName)
+  hasValue := true
+  all := [topicDefsLocalInstName]
+  originModule := topicDefsModName
+}
 
 def validDefsModule : ModuleInventory :=
-  mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+  mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl, topicDefsLocalInstDecl]
     (extEntries := [.instanceEntry topicDefsLocalInstName defsBeforeName topicDefsModName false])
 
 def cleanProofThmName : SymName := SymName.ofList ["Topic", "Proofs", "cleanLemma"]
@@ -10768,14 +10986,28 @@ def defsV15ShadowInitPkg : PackageAuditInput := {
   ]
 }
 
+def defsBenignCoeName : SymName := SymName.ofList ["Topic", "Defs", "coeBefore"]
+def defsBenignCoeDecl : ConstantRecord := {
+  name := defsBenignCoeName, kind := .defnDecl, type := .const SymName.natName,
+  value? := some (.const defsBeforeName), hasValue := true, all := [defsBenignCoeName],
+  originModule := topicDefsModName
+}
+def defsBenignDefInstName : SymName := SymName.ofList ["Topic", "Defs", "defInstBefore"]
+def defsBenignDefInstDecl : ConstantRecord := {
+  name := defsBenignDefInstName, kind := .defnDecl, type := .const SymName.natName,
+  value? := some (.const defsBeforeName), hasValue := true, all := [defsBenignDefInstName],
+  originModule := topicDefsModName
+}
+
 def defsBenignCoeAndInstPkg : PackageAuditInput := {
   baseEnv := standardBaseDecls
   modules := [
-    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    mkAlignedModule topicDefsModName .defsExempt
+      [defsBeforeDecl, topicDefsLocalInstDecl, defsBenignCoeDecl, defsBenignDefInstDecl]
       (extEntries := [
         .instanceEntry topicDefsLocalInstName defsBeforeName topicDefsModName false,
-        .coeEntry (SymName.ofList ["Topic", "Defs", "coeBefore"]) defsBeforeName SymName.natName,
-        .defaultInstanceEntry (SymName.ofList ["Topic", "Defs", "defInstBefore"]) defsBeforeName
+        .coeEntry defsBenignCoeName defsBeforeName SymName.natName,
+        .defaultInstanceEntry defsBenignDefInstName defsBeforeName
       ])
   ]
 }
@@ -11755,14 +11987,24 @@ theorem reference_outside_import_closure_rejected :
 /-! ### Section 9.11: Pass-`A3` Regression Witnesses (Extension Import-Closure & Prefix-Collision Hijack, Duplicate Roots, Bare `Verify` & Role Uniqueness, `Lean.*` Non-Foundation, Opaque-Wrapped Provisional Refutation, `requireSources`, & `by_elab`/`run_tac`/`run_cmd`) -/
 
 def defsEvilCoeName : SymName := SymName.ofList ["Topic", "Defs", "evilCoe"]
+def defsEvilCoeDecl : ConstantRecord := {
+  name := defsEvilCoeName, kind := .defnDecl, type := .const SymName.natName,
+  value? := some (.const defsBeforeName), hasValue := true, all := [defsEvilCoeName],
+  originModule := topicDefsModName
+}
 def defsEvilScopedName : SymName := SymName.ofList ["Topic", "Defs", "evilScoped"]
+def defsEvilScopedDecl : ConstantRecord := {
+  name := defsEvilScopedName, kind := .defnDecl, type := .const SymName.natName,
+  value? := some (.const defsBeforeName), hasValue := true, all := [defsEvilScopedName],
+  originModule := topicDefsModName
+}
 
 /-- `Topic.Defs` registers a `.coeEntry` targeting an unimported `.theory` type (`Anneal.TheoryHelper`). -/
 def defsCoeToTheoryPkg : PackageAuditInput := {
   baseEnv := standardBaseDecls
   modules := [
     mkAlignedModule topicTheoryModName .theory [theoryClaimTypeDecl],
-    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl, defsEvilCoeDecl]
       (extEntries := [.coeEntry defsEvilCoeName defsBeforeName theoryClaimTypeName])
   ]
 }
@@ -11772,7 +12014,7 @@ def defsScopedToProofPkg : PackageAuditInput := {
   baseEnv := standardBaseDecls
   modules := [
     mkAlignedModule topicProofModName .proof [cleanProofThmDecl],
-    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl, defsEvilScopedDecl]
       (extEntries := [.scopedInstanceEntry defsEvilScopedName topicProofModName defsBeforeName])
   ]
 }
@@ -11965,5 +12207,105 @@ theorem source_withholding_needs_requireSources :
     auditAndReplayPackage requireSourcesConfig sourceWithheldPkg =
       .error (.missingSourceText topicDefsModName) := by
   refine ⟨rfl, rfl, rfl⟩
+
+/-! ### Section 9.13: Pass-`A4` Regression Witnesses (`_unsafe_rec` Dependency Sanitization, Dangling Extension Entries, `extraConstNames` Hygiene, & `unsafe` Term Scanner) -/
+
+/-- `_unsafe_rec` companions attempting to smuggle `sorryAx`, `Lean.trustCompiler`, or a phantom constant. -/
+def unsafeRecSorryDecl : ConstantRecord := {
+  name := SymName.str safeRecFnName "_unsafe_rec"
+  kind := .defnDecl
+  safety := .partialDecl
+  type := safeRecFnDecl.type
+  value? := some (.const SymName.sorryAxName)
+  hasValue := true
+  all := [SymName.str safeRecFnName "_unsafe_rec"]
+  originModule := topicProofModName
+}
+
+def unsafeRecTrustCompilerDecl : ConstantRecord :=
+  { unsafeRecSorryDecl with value? := some (.const SymName.trustCompilerName) }
+
+def unsafeRecGhostName : SymName := SymName.ofList ["Ghost", "DoesNotExist"]
+def unsafeRecGhostDecl : ConstantRecord :=
+  { unsafeRecSorryDecl with value? := some (.const unsafeRecGhostName) }
+
+def unsafeRecSorryPkg : PackageAuditInput :=
+  { mkSingleProofPkg (mkAlignedModule topicProofModName .proof [safeRecFnDecl, unsafeRecSorryDecl]) with
+    baseEnv := standardBaseDecls ++ [{
+      name := SymName.sorryAxName, kind := .axiomDecl, type := .const SymName.falseName,
+      originModule := SymName.ofList ["Init", "Prelude"] }] }
+
+def unsafeRecTrustCompilerPkg : PackageAuditInput :=
+  { mkSingleProofPkg (mkAlignedModule topicProofModName .proof [safeRecFnDecl, unsafeRecTrustCompilerDecl]) with
+    baseEnv := standardBaseDecls ++ [{
+      name := SymName.trustCompilerName, kind := .axiomDecl, type := .const SymName.trueName,
+      originModule := SymName.mkSimple "Lean" }] }
+
+def unsafeRecGhostPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [safeRecFnDecl, unsafeRecGhostDecl])
+
+theorem passA4_unsafeRec_companion_sanitized :
+    auditAndReplayPackage defaultUnconditionalConfig unsafeRecSorryPkg =
+      .error (.forbiddenAxiom (SymName.str safeRecFnName "_unsafe_rec")
+        SymName.sorryAxName (SymName.ofList ["Init", "Prelude"])) ∧
+    auditAndReplayPackage defaultUnconditionalConfig unsafeRecTrustCompilerPkg =
+      .error (.forbiddenNativeReductionAxiom (SymName.str safeRecFnName "_unsafe_rec")
+        SymName.trustCompilerName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig unsafeRecGhostPkg =
+      .error (.unknownConstant unsafeRecGhostName) := by
+  refine ⟨rfl, rfl, rfl⟩
+
+/-- Dangling undeclared extension declarations (closing `B4`'s observation on `isLocalExtDecl`) & `extraConstNames` hygiene. -/
+def danglingInstName : SymName := SymName.ofList ["Topic", "Proofs", "nonExistentDecl"]
+def danglingInstPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extEntries := [.instanceEntry danglingInstName cleanProofThmName topicProofModName false]))
+
+def danglingDefsCoeName : SymName := SymName.ofList ["Topic", "Defs", "nonExistentCoe"]
+def danglingDefsCoePkg : PackageAuditInput := {
+  baseEnv := standardBaseDecls
+  modules := [
+    mkAlignedModule topicDefsModName .defsExempt [defsBeforeDecl]
+      (extEntries := [.coeEntry danglingDefsCoeName defsBeforeName SymName.natName])
+  ]
+}
+
+def anonExtraConstPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extraConstNames := [.anonymous]))
+
+def dupExtraConstName : SymName := SymName.ofList ["Topic", "Proofs", "cleanLemma", "_cstage1"]
+def dupExtraConstPkg : PackageAuditInput :=
+  mkSingleProofPkg (mkAlignedModule topicProofModName .proof [cleanProofThmDecl]
+    (extraConstNames := [dupExtraConstName, dupExtraConstName]))
+
+theorem passA4_dangling_ext_decl_and_extraConst_hygiene_rejected :
+    auditAndReplayPackage defaultUnconditionalConfig danglingInstPkg =
+      .error (.forbiddenInstanceOrCoe topicProofModName "imported_instance" danglingInstName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig danglingDefsCoePkg =
+      .error (.forbiddenInstanceOrCoe topicDefsModName "coe" danglingDefsCoeName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig anonExtraConstPkg =
+      .error (.anonymousConstantName topicProofModName) ∧
+    auditAndReplayPackage defaultUnconditionalConfig dupExtraConstPkg =
+      .error (.duplicateConstName topicProofModName topicProofModName) := by
+  refine ⟨rfl, rfl, rfl, rfl⟩
+
+/--
+Regression (`unsafe` term & command keyword): in real Lean 4.34.1, `def x : Nat := unsafe (0 : Nat)`
+compiles in pure `Init` (`rc=0`) emitting `isUnsafe = false` constants (`TrustedBoundary.lean` L100–107).
+The scanner bans standalone `unsafe` tokens unconditionally without false-positiving on
+`isUnsafeFlag`, `_unsafe_rec`, comments, or strings.
+-/
+theorem passA4_unsafe_term_scanner_hardened :
+    scanProofSource "def safeWithUnsafeTerm : Nat := unsafe (0 : Nat)" =
+      .error (.forbiddenSourceOption topicProofModName "unsafe") ∧
+    scanProofSource "unsafe def evil : Nat := 0" =
+      .error (.forbiddenSourceOption topicProofModName "unsafe") ∧
+    scanProofSource "def x : Nat := «unsafe» (0 : Nat)" =
+      .error (.forbiddenSourceOption topicProofModName "unsafe") ∧
+    scanProofSource "def isUnsafeFlag : Nat := 0\n-- unsafe in comment\ndef s := \"unsafe in string\"" =
+      .ok () ∧
+    scanProofSource "def fn._unsafe_rec : Nat := 0" = .ok () := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 end Anneal.ReplayKeyAndTamperAuditPrototype
