@@ -1229,6 +1229,88 @@ impl<'a> JsonParser<'a> {
     }
 }
 
+/// Load, SHA-256 verify, and strictly parse every captured MIR `.lean` module
+/// referenced by `records` under `units_dir`, returning a deterministic
+/// `def_id -> FaultSiteCensus` map or failing closed if any captured MIR file is
+/// missing, tampered, mismatched, or unscannable.
+pub fn audit_captured_units_fault_census(
+    units_dir: &Path,
+    records: &[UnitTargetRecord],
+) -> Result<BTreeMap<String, crate::property_registry::FaultSiteCensus>, String> {
+    let mut cfg = crate::scaffold::ScaffoldConfig::new(units_dir);
+    cfg.units_dir = Some(units_dir.to_path_buf());
+    let mut censuses = BTreeMap::new();
+    for record in records {
+        if record.target.mir_module_path.is_empty() {
+            if record.item_kind == CapturedItemKind::ExternalSpec
+                && record.target.def_id.contains("__ANNEAL_EXT_SPEC_TARGET_")
+            {
+                continue;
+            }
+            return Err(format!(
+                "captured record `{}` (`{:?}`) has an empty mir_module_path",
+                record.target.def_id, record.item_kind
+            ));
+        }
+        let suffix = crate::obligations::derive_item_module_suffix(record);
+        let rel_path = crate::obligations::module_suffix_to_rel_path(&suffix);
+        let mir_path = crate::scaffold::find_source_mir_file(&cfg, record, &rel_path).ok_or_else(
+            || {
+                format!(
+                    "missing captured MIR file for `{}` (`{}`) under {}",
+                    record.target.def_id,
+                    record.target.mir_module_path,
+                    units_dir.display()
+                )
+            },
+        )?;
+        let mir_bytes = fs::read(&mir_path).map_err(|err| {
+            format!(
+                "failed to read captured MIR file {} for `{}`: {err}",
+                mir_path.display(),
+                record.target.def_id
+            )
+        })?;
+        if !record.target.mir_module_sha256.is_empty() {
+            let actual_sha = anneal_rustc_capture::sha256_hex(&mir_bytes);
+            if actual_sha != record.target.mir_module_sha256 {
+                return Err(format!(
+                    "captured MIR SHA-256 mismatch for `{}` at {}: expected {}, got {}",
+                    record.target.def_id,
+                    mir_path.display(),
+                    record.target.mir_module_sha256,
+                    actual_sha
+                ));
+            }
+        }
+        let mir_src = String::from_utf8(mir_bytes).map_err(|err| {
+            format!(
+                "captured MIR file {} for `{}` is not valid UTF-8: {err}",
+                mir_path.display(),
+                record.target.def_id
+            )
+        })?;
+        let census = crate::property_registry::FaultSiteCensus::from_lean_mir_module(&mir_src)
+            .map_err(|err| {
+                format!(
+                    "captured MIR fault-site census failed on `{}` ({}): {err}",
+                    record.target.def_id,
+                    mir_path.display()
+                )
+            })?;
+        if census.def_path != record.target.def_id {
+            return Err(format!(
+                "captured MIR defPath mismatch at {}: record expects `{}`, module defines `{}`",
+                mir_path.display(),
+                record.target.def_id,
+                census.def_path
+            ));
+        }
+        censuses.insert(record.target.def_id.clone(), census);
+    }
+    Ok(censuses)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3294,5 +3376,68 @@ opt-level = 3
             merged,
             "-Zmir-enable-passes=-GVN -Cdebuginfo=0 --cfg anodized_embed_specs"
         );
+    }
+
+    #[test]
+    fn audit_captured_units_fault_census_scans_valid_units_and_rejects_corrupt_mir() {
+        let units_dir = unique_temp_dir("driver-fault-census");
+        let unit_sub = units_dir.join("unit-0");
+        fs::create_dir_all(unit_sub.join("Mir/Probes")).expect("create unit Mir dir");
+
+        let scenario = crate::property_registry::MutationProbeScenario::build(
+            crate::property_registry::FalseProofMutationProbe::DerefAliasProbe,
+        );
+        let mir_lean = anneal_rustc_capture::lean_emit::emit_mir_lean_module(
+            "Mir.Probes.deref_alias",
+            &scenario.mir,
+        );
+        let mir_sha = sha256_hex(mir_lean.as_bytes());
+        let mir_file = unit_sub.join("Mir/Probes/deref_alias.lean");
+        fs::write(&mir_file, &mir_lean).expect("write captured Mir");
+
+        let records = vec![UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "probes::deref_alias".to_string(),
+                mir_module_path: "Mir/Probes/deref_alias.lean".to_string(),
+                mir_module_sha256: mir_sha,
+            },
+            lean_module_name: "Mir.Probes.deref_alias".to_string(),
+            item_kind: CapturedItemKind::Subject,
+            associated_subject_def_id: None,
+            trait_impls: Vec::new(),
+        }];
+
+        let map = audit_captured_units_fault_census(&units_dir, &records)
+            .expect("valid captured MIR unit must parse cleanly");
+        assert_eq!(map.len(), 1);
+        let census = map.get("probes::deref_alias").expect("entry");
+        assert!(census.sites.contains(&crate::property_registry::FaultSite::statement(
+            0,
+            0,
+            crate::property_registry::PropertyClass::PointerDereference
+        )));
+
+        // 1. Tampering with the MIR file on disk while keeping the original manifest SHA fails closed on SHA mismatch.
+        fs::write(&mir_file, "import Trusted\ndef body : CapturedMir := nonInlineAlias\n")
+            .expect("write corrupt Mir");
+        let sha_err = audit_captured_units_fault_census(&units_dir, &records)
+            .expect_err("tampered MIR body must fail SHA-256 check");
+        assert!(sha_err.contains("captured MIR SHA-256 mismatch"), "{sha_err}");
+
+        // 2. Even with an unpinned SHA, non-inline MIR syntax fails closed in the strict parser.
+        let mut unpinned = records.clone();
+        unpinned[0].target.mir_module_sha256.clear();
+        let err = audit_captured_units_fault_census(&units_dir, &unpinned)
+            .expect_err("non-inline MIR body must fail closed");
+        assert!(err.contains("captured MIR fault-site census failed"), "{err}");
+
+        // 3. Empty mir_module_path on a Subject record fails closed (whereas synthetic __ANNEAL_EXT_SPEC_TARGET_ is skipped).
+        let mut bad_empty = records.clone();
+        bad_empty[0].target.mir_module_path.clear();
+        let empty_err = audit_captured_units_fault_census(&units_dir, &bad_empty)
+            .expect_err("empty mir_module_path on Subject must fail closed");
+        assert!(empty_err.contains("empty mir_module_path"), "{empty_err}");
+
+        let _ = fs::remove_dir_all(&units_dir);
     }
 }

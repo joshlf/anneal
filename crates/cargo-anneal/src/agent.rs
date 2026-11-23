@@ -2235,6 +2235,17 @@ pub fn render_agent_context(
         if let Some(line) = &locked_fragment_line {
             out.push_str(line);
         }
+        if let Some(mir_disk) = crate::scaffold::resolve_workspace_mir_file(
+            &mir_root,
+            &bundle.subject,
+            &bundle.item_rel_path,
+        ) && let Ok(mir_src) = fs::read_to_string(&mir_disk)
+        {
+            let census = crate::property_registry::FaultSiteCensus::from_lean_mir_fail_closed(
+                def_id, &mir_src,
+            );
+            out.push_str(&format!("- **Fault-Site Census**: {}\n", census.summary_line()));
+        }
         out.push_str(&format!(
             "- **Companion Spec Count**: {companion_count} (requires: {}, ensures: {}, external: {})\n\n",
             bundle.inline_requires.len(),
@@ -2656,6 +2667,504 @@ impl<'a> SimpleJsonParser<'a> {
         } else {
             Err(format!("invalid literal at byte {}", self.pos))
         }
+    }
+}
+
+fn load_verified_workspace_mir(
+    workspace_root: &Path,
+    mir_root: &Path,
+    record: &UnitTargetRecord,
+    rel_path: &Path,
+) -> Result<String, String> {
+    let placed_path = mir_root.join(rel_path);
+    let resolved_path = if placed_path.exists() {
+        placed_path
+    } else {
+        let mut cfg = crate::scaffold::ScaffoldConfig::new(workspace_root);
+        let default_units = workspace_root.join("target").join("anneal").join("units");
+        if default_units.is_dir() {
+            cfg.units_dir = Some(default_units);
+        }
+        crate::scaffold::find_source_mir_file(&cfg, record, rel_path).ok_or_else(|| {
+            format!(
+                "missing captured MIR module for `{}` (expected {})",
+                record.target.def_id,
+                placed_path.display()
+            )
+        })?
+    };
+
+    let bytes = fs::read(&resolved_path).map_err(|err| {
+        format!(
+            "failed to read MIR module {} for `{}`: {err}",
+            resolved_path.display(),
+            record.target.def_id
+        )
+    })?;
+
+    if !record.target.mir_module_sha256.is_empty() {
+        let actual_sha = sha256_hex(&bytes);
+        if actual_sha != record.target.mir_module_sha256 {
+            return Err(format!(
+                "MIR SHA-256 mismatch for `{}` at {}: expected {}, got {}",
+                record.target.def_id,
+                resolved_path.display(),
+                record.target.mir_module_sha256,
+                actual_sha
+            ));
+        }
+    }
+
+    String::from_utf8(bytes).map_err(|err| {
+        format!(
+            "MIR module {} for `{}` is not valid UTF-8: {err}",
+            resolved_path.display(),
+            record.target.def_id
+        )
+    })
+}
+
+fn call_graph_can_reach(
+    edges: &BTreeMap<String, BTreeSet<String>>,
+    start: &str,
+    goal: &str,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    let mut stack = vec![start.to_string()];
+    while let Some(cur) = stack.pop() {
+        if cur == goal {
+            return true;
+        }
+        if !visited.insert(cur.clone()) {
+            continue;
+        }
+        if let Some(nexts) = edges.get(&cur) {
+            for nxt in nexts {
+                if !visited.contains(nxt) {
+                    stack.push(nxt.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Reconcile fault-site coverage across every captured verification subject in
+/// `workspace_root`, checking subject `Mir/<Item>.lean` modules (plus linked
+/// `defaultCallees` transitive MIR bodies and any `StatefulEquivItemSpec`
+/// reference `specBody`) against generated `Obligations/<Item>.lean` and
+/// `Verify/<Item>.lean` assemblies.
+///
+/// Fails closed if any subject, linked transitive callee, equivalence reference
+/// body, `Obligations/<Item>.lean`, or `Verify/<Item>.lean` module is missing,
+/// fails SHA-256 or `defPath` verification, fails token-level claim pinning, or
+/// has any uncovered fault site.
+pub fn reconcile_workspace_fault_coverage(
+    workspace_root: &Path,
+    records: &[UnitTargetRecord],
+) -> Result<Vec<crate::property_registry::CoverageReconciliationReport>, String> {
+    let generated_root = workspace_root.join(".anneal/generated");
+    let mir_root = generated_root.join("Mir");
+    let proofs_root = workspace_root.join("anneal/proofs");
+
+    let mut bundles = group_subject_obligations(records);
+    crate::scaffold::populate_called_callees(&mir_root, records, &mut bundles);
+
+    let records_by_def_id: BTreeMap<&str, &UnitTargetRecord> = records
+        .iter()
+        .map(|r| (r.target.def_id.as_str(), r))
+        .collect();
+    let records_by_suffix: BTreeMap<String, &UnitTargetRecord> = records
+        .iter()
+        .map(|r| (derive_item_module_suffix(r), r))
+        .collect();
+
+    let mut reports = Vec::with_capacity(bundles.len());
+    let mut errors = Vec::new();
+
+    for bundle in &bundles {
+        let def_id = &bundle.subject.target.def_id;
+        let lifting_profile = analyze_workspace_lifting_profile(&mir_root, bundle);
+        let raw_authored = detect_authored_item_modules(&proofs_root, &bundle.item_rel_path);
+        let authored = crate::scaffold::effective_authored_for_bundle(
+            bundle,
+            raw_authored,
+            Some(&lifting_profile),
+        );
+        let registry = crate::property_registry::PropertyRegistry::for_bundle(bundle, authored);
+        let reconciler = crate::property_registry::FaultSiteCoverageReconciler::new(registry);
+
+        let ob_path = generated_root.join("Obligations").join(&bundle.item_rel_path);
+        let ob_src = match fs::read_to_string(&ob_path) {
+            Ok(src) => src,
+            Err(err) => {
+                let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                    def_id,
+                    format!(
+                        "missing or unreadable generated Obligations module {}: {err}",
+                        ob_path.display()
+                    ),
+                );
+                let fail_rep = reconciler.reconcile(&census, [], []);
+                errors.push(fail_rep.render_diagnostic_report());
+                reports.push(fail_rep);
+                continue;
+            }
+        };
+
+        let ver_path = generated_root.join("Verify").join(&bundle.item_rel_path);
+        let ver_src = match fs::read_to_string(&ver_path) {
+            Ok(src) => src,
+            Err(err) => {
+                let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                    def_id,
+                    format!(
+                        "missing or unreadable generated Verify module {}: {err}",
+                        ver_path.display()
+                    ),
+                );
+                let fail_rep = reconciler.reconcile(&census, [], []);
+                errors.push(fail_rep.render_diagnostic_report());
+                reports.push(fail_rep);
+                continue;
+            }
+        };
+
+        let uses_rust_trusted_contract = !authored.has_proof
+            && !authored.has_assumptions
+            && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions);
+
+        let Some(ob_pin) = crate::property_registry::verify_obligations_module_pin(
+            &ob_src,
+            &bundle.item_module_suffix,
+            authored,
+        ) else {
+            let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                def_id,
+                format!(
+                    "Obligations.{} failed token-level claim/body/callees pin verification",
+                    bundle.item_module_suffix
+                ),
+            );
+            let fail_rep = reconciler.reconcile(&census, [], []);
+            errors.push(fail_rep.render_diagnostic_report());
+            reports.push(fail_rep);
+            continue;
+        };
+
+        if !crate::property_registry::verify_module_pins_expected_surface(
+            &ver_src,
+            &bundle.item_module_suffix,
+            bundle,
+            authored,
+            uses_rust_trusted_contract,
+        ) {
+            let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                def_id,
+                format!(
+                    "Verify.{} failed token-level theorem/import/surface pin verification",
+                    bundle.item_module_suffix
+                ),
+            );
+            let fail_rep = reconciler.reconcile(&census, [], []);
+            errors.push(fail_rep.render_diagnostic_report());
+            reports.push(fail_rep);
+            continue;
+        }
+
+        let subject_mir_src = match load_verified_workspace_mir(
+            workspace_root,
+            &mir_root,
+            &bundle.subject,
+            &bundle.item_rel_path,
+        ) {
+            Ok(src) => src,
+            Err(err) => {
+                let census =
+                    crate::property_registry::FaultSiteCensus::fail_closed_with_reason(def_id, err);
+                let fail_rep = reconciler.reconcile(&census, [], []);
+                errors.push(fail_rep.render_diagnostic_report());
+                reports.push(fail_rep);
+                continue;
+            }
+        };
+
+        let parsed_subject =
+            match crate::property_registry::parse_lean_mir_module_strict(&subject_mir_src) {
+                Ok(parsed) if parsed.def_path == *def_id => parsed,
+                Ok(parsed) => {
+                    let census =
+                        crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                            def_id,
+                            format!(
+                                "CapturedMir.defPath mismatch: expected `{def_id}`, found `{}`",
+                                parsed.def_path
+                            ),
+                        );
+                    let fail_rep = reconciler.reconcile(&census, [], []);
+                    errors.push(fail_rep.render_diagnostic_report());
+                    reports.push(fail_rep);
+                    continue;
+                }
+                Err(err) => {
+                    let census =
+                        crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                            def_id,
+                            err.message,
+                        );
+                    let fail_rep = reconciler.reconcile(&census, [], []);
+                    errors.push(fail_rep.render_diagnostic_report());
+                    reports.push(fail_rep);
+                    continue;
+                }
+            };
+
+        let pinned_linked_def_ids: BTreeSet<String> = bundle
+            .transitive_callees
+            .iter()
+            .filter(|c| ob_pin.default_callees_suffixes.contains(&c.item_module_suffix))
+            .map(|c| c.def_id.clone())
+            .collect();
+
+        // Pre-load and strictly parse every callee actually linked in `defaultCallees`
+        // so we can both detect mutual recursion cycles and reconcile each body.
+        let mut parsed_callees = Vec::new();
+        let mut call_edges: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut subject_census =
+            crate::property_registry::FaultSiteCensus::from_ir_captured_mir_with_options(
+                &parsed_subject,
+                true,
+            );
+        call_edges.insert(
+            def_id.clone(),
+            subject_census
+                .direct_callees
+                .iter()
+                .filter(|c| *c == def_id || pinned_linked_def_ids.contains(*c))
+                .cloned()
+                .collect(),
+        );
+
+        for callee in &bundle.transitive_callees {
+            if !ob_pin
+                .default_callees_suffixes
+                .contains(&callee.item_module_suffix)
+            {
+                continue;
+            }
+            let Some(&callee_rec) = records_by_def_id.get(callee.def_id.as_str()) else {
+                errors.push(format!(
+                    "FAULT_COVERAGE_FAILED `{def_id}`: linked callee `{}` has no UnitTargetRecord",
+                    callee.def_id
+                ));
+                continue;
+            };
+            let callee_rel = module_suffix_to_rel_path(&callee.item_module_suffix);
+            match load_verified_workspace_mir(workspace_root, &mir_root, callee_rec, &callee_rel)
+                .and_then(|src| {
+                    crate::property_registry::parse_lean_mir_module_strict(&src)
+                        .map_err(|e| e.message)
+                }) {
+                Ok(parsed_callee) if parsed_callee.def_path == callee.def_id => {
+                    let c_census =
+                        crate::property_registry::FaultSiteCensus::from_ir_captured_mir_with_options(
+                            &parsed_callee,
+                            true,
+                        );
+                    call_edges.insert(
+                        callee.def_id.clone(),
+                        c_census
+                            .direct_callees
+                            .iter()
+                            .filter(|c| *c == def_id || pinned_linked_def_ids.contains(*c))
+                            .cloned()
+                            .collect(),
+                    );
+                    parsed_callees.push((callee.def_id.clone(), parsed_callee, c_census));
+                }
+                Ok(parsed_callee) => {
+                    let c_census =
+                        crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                            &callee.def_id,
+                            format!(
+                                "CapturedMir.defPath mismatch: expected `{}`, found `{}`",
+                                callee.def_id, parsed_callee.def_path
+                            ),
+                        );
+                    let fail_rep = reconciler.reconcile(&c_census, [], []);
+                    errors.push(fail_rep.render_diagnostic_report());
+                }
+                Err(reason) => {
+                    let c_census =
+                        crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                            &callee.def_id,
+                            reason,
+                        );
+                    let fail_rep = reconciler.reconcile(&c_census, [], []);
+                    errors.push(fail_rep.render_diagnostic_report());
+                }
+            }
+        }
+
+        let recursive_targets_for = |owner: &str| -> BTreeSet<String> {
+            let Some(outs) = call_edges.get(owner) else {
+                return BTreeSet::new();
+            };
+            outs.iter()
+                .filter(|target| call_graph_can_reach(&call_edges, target, owner))
+                .cloned()
+                .collect()
+        };
+
+        let subject_rec_targets = recursive_targets_for(def_id);
+        subject_census.add_recursive_call_termination_sites(&subject_rec_targets);
+        let subject_emitted =
+            crate::property_registry::derive_bundle_obligation_coverage_with_recursion(
+                bundle,
+                authored,
+                &parsed_subject,
+                Some(&ob_src),
+                Some(&ver_src),
+                &subject_rec_targets,
+                true,
+            );
+        let report = reconciler.reconcile_with_call_context(
+            &subject_census,
+            subject_emitted.discharged_sites.clone(),
+            subject_emitted.explicit_waivers.clone(),
+            &subject_emitted.call_context,
+        );
+        if !report.is_covered() {
+            errors.push(report.render_diagnostic_report());
+        }
+        reports.push(report);
+
+        let proves_total =
+            authored.is_total || authored.is_equiv || bundle.has_rust_safe_total_attr();
+
+        // Reconcile every linked transitive callee in `defaultCallees` using the
+        // subject's verified `defaultCallees` and modular `envAssumed` closure,
+        // without inheriting authored `Assumptions.<Subject>` onto callees.
+        for (callee_def_id, parsed_callee, mut callee_census) in parsed_callees {
+            let callee_rec_targets = recursive_targets_for(&callee_def_id);
+            callee_census.add_recursive_call_termination_sites(&callee_rec_targets);
+            let cov = crate::property_registry::explore_mir_obligations(
+                &parsed_callee,
+                &crate::property_registry::ObligationExplorerOptions {
+                    proves_total_termination: proves_total,
+                    is_trusted_assumption: uses_rust_trusted_contract,
+                    preserve_retags: true,
+                    call_context: subject_emitted.call_context.clone(),
+                    recursive_callees: callee_rec_targets,
+                    injected_mutation: None,
+                },
+            );
+            let callee_report = reconciler.reconcile_with_call_context(
+                &callee_census,
+                cov.discharged_sites,
+                cov.explicit_waivers,
+                &cov.call_context,
+            );
+            if !callee_report.is_covered() {
+                errors.push(callee_report.render_diagnostic_report());
+            }
+        }
+
+        // When `authored.is_equiv` holds (`StatefulEquivItemSpec`), also reconcile
+        // the reference `specBody` (`Mir.<Ref>.body`) so an unsupported or
+        // unlinked reference MIR body cannot slip past equivalence verification.
+        if authored.is_equiv {
+            let mut equiv_ref_suffixes = BTreeSet::new();
+            if let Some(attr_ref) = bundle.rust_equiv_target_module_suffix() {
+                equiv_ref_suffixes.insert(attr_ref);
+            }
+            if authored.has_specs {
+                let spec_path = proofs_root.join("Specs").join(&bundle.item_rel_path);
+                if let Ok(spec_src) = fs::read_to_string(&spec_path) {
+                    for mir_ref in crate::property_registry::extract_lean_mir_body_refs(&spec_src) {
+                        if mir_ref != bundle.item_module_suffix
+                            && !mir_ref.contains("__anodized_fn_")
+                        {
+                            equiv_ref_suffixes.insert(mir_ref);
+                        }
+                    }
+                }
+            }
+            if equiv_ref_suffixes.is_empty() {
+                errors.push(format!(
+                    "FAULT_COVERAGE_FAILED `{def_id}`: StatefulEquivItemSpec has no resolvable `Mir.<Ref>.body` reference target"
+                ));
+            }
+            for ref_suffix in equiv_ref_suffixes {
+                let Some(&ref_rec) = records_by_suffix.get(&ref_suffix) else {
+                    errors.push(format!(
+                        "FAULT_COVERAGE_FAILED `{def_id}`: equivalence reference `Mir.{ref_suffix}.body` has no UnitTargetRecord"
+                    ));
+                    continue;
+                };
+                let ref_rel = module_suffix_to_rel_path(&ref_suffix);
+                match load_verified_workspace_mir(workspace_root, &mir_root, ref_rec, &ref_rel)
+                    .and_then(|src| {
+                        crate::property_registry::parse_lean_mir_module_strict(&src)
+                            .map_err(|e| e.message)
+                    }) {
+                    Ok(parsed_ref) if parsed_ref.def_path == ref_rec.target.def_id => {
+                        let ref_census =
+                            crate::property_registry::FaultSiteCensus::from_ir_captured_mir_with_options(
+                                &parsed_ref,
+                                true,
+                            );
+                        let cov = crate::property_registry::explore_mir_obligations(
+                            &parsed_ref,
+                            &crate::property_registry::ObligationExplorerOptions {
+                                proves_total_termination: true,
+                                is_trusted_assumption: false,
+                                preserve_retags: true,
+                                call_context: subject_emitted.call_context.clone(),
+                                recursive_callees: BTreeSet::new(),
+                                injected_mutation: None,
+                            },
+                        );
+                        let ref_rep = reconciler.reconcile_with_call_context(
+                            &ref_census,
+                            cov.discharged_sites,
+                            cov.explicit_waivers,
+                            &cov.call_context,
+                        );
+                        if !ref_rep.is_covered() {
+                            errors.push(ref_rep.render_diagnostic_report());
+                        }
+                    }
+                    Ok(parsed_ref) => {
+                        let ref_census =
+                            crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                                &ref_rec.target.def_id,
+                                format!(
+                                    "CapturedMir.defPath mismatch: expected `{}`, found `{}`",
+                                    ref_rec.target.def_id, parsed_ref.def_path
+                                ),
+                            );
+                        let fail_rep = reconciler.reconcile(&ref_census, [], []);
+                        errors.push(fail_rep.render_diagnostic_report());
+                    }
+                    Err(reason) => {
+                        let ref_census =
+                            crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+                                &ref_rec.target.def_id,
+                                reason,
+                            );
+                        let fail_rep = reconciler.reconcile(&ref_census, [], []);
+                        errors.push(fail_rep.render_diagnostic_report());
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(reports)
+    } else {
+        Err(errors.join("\n"))
     }
 }
 
@@ -4246,6 +4755,49 @@ end Mir.Demo.loop_fn
         let err = verify_spec_lock(&ws, &records).expect_err("duplicate mutable_subjects (agent-verify)");
         assert!(err.contains("duplicate 'mutable_subjects' entry 'demo::add'"), "{err}");
         assert!(!marker.exists());
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    #[test]
+    fn reconcile_workspace_fault_coverage_passes_valid_scaffold_and_rejects_missing_mir() {
+        let ws = unique_temp_dir("reconcile-ws-fault-cov");
+        let scenario = crate::property_registry::MutationProbeScenario::build(
+            crate::property_registry::FalseProofMutationProbe::SwitchBreakStripProbe,
+        );
+        let mir_lean = anneal_rustc_capture::lean_emit::emit_mir_lean_module(
+            "Mir.Probes.switch_break_strip",
+            &scenario.mir,
+        );
+        let mir_sha = write_generated_mir(&ws, "Probes/switch_break_strip.lean", &mir_lean);
+        let records = vec![UnitTargetRecord {
+            target: CapturedTarget {
+                def_id: "probes::switch_break_strip".to_string(),
+                mir_module_path: "Mir/Probes/switch_break_strip.lean".to_string(),
+                mir_module_sha256: mir_sha,
+            },
+            lean_module_name: "Mir.Probes.switch_break_strip".to_string(),
+            item_kind: CapturedItemKind::Subject,
+            associated_subject_def_id: None,
+            trait_impls: Vec::new(),
+        }];
+        crate::scaffold::scaffold_workspace(&ws, &records).expect("scaffold workspace");
+
+        let reports = reconcile_workspace_fault_coverage(&ws, &records)
+            .expect("valid scaffolded workspace must pass fault-site reconciliation");
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].is_covered());
+
+        let ctx = render_agent_context(&ws, &records, None).expect("render context");
+        assert!(ctx.contains("- **Fault-Site Census**:"), "{ctx}");
+
+        // Deleting the placed `Mir/` file causes fail-closed `UnsupportedFallback` rejection.
+        fs::remove_file(ws.join(".anneal/generated/Mir/Probes/switch_break_strip.lean"))
+            .expect("remove Mir file");
+        let err = reconcile_workspace_fault_coverage(&ws, &records)
+            .expect_err("missing Mir file must fail closed");
+        assert!(err.contains("FAULT_COVERAGE_FAILED"), "{err}");
+        assert!(err.contains("unsupported_fallback"), "{err}");
 
         let _ = fs::remove_dir_all(&ws);
     }
