@@ -2486,6 +2486,293 @@ fn kani5095_raw_ident_attrs_fn_body_inner_attrs_and_attribute_macro_args() {
 }
 
 // ===========================================================================
+// 3d. `[adv ep2 A2]` Hardening: `peek_fn_body_inner` Macro Pattern Leak,
+//     Static `cfg`/`cfg_attr` Dead-Item Filtering, Opaque Proc-Macro Attrs,
+//     Guard-Mutant Macro Temporary Lifetime Extension & Transitive Caller
+//     Trait-Dispatch Guards
+// ===========================================================================
+
+#[test]
+fn kani5095_macro_pattern_lookahead_and_static_cfg_dead_decoy_hardening() {
+    use InlineBoundaryVerdict::*;
+    let v = |src: &str| verify_fn_inline_never_source(src, "target");
+
+    // 1. `peek_fn_body_inner` MUST NOT look past `)`, `]`, or `=` into a macro
+    //    arm's RHS block `{ #![inline(never)] }`!
+    assert_eq!(
+        v("macro_rules! m { (fn target()) => { #![inline(never)] }; }"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("macro_rules! m { [fn target()] => { #![inline(never)] }; }"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("macro_rules! m { fn target() => { #![inline(never)] }; }"),
+        MissingInlineNever
+    );
+    // And a `#[cfg(any())]` inside a macro pattern arm must not leak past `)`
+    // into the RHS `(fn target() {})`.
+    assert_eq!(
+        v("macro_rules! mk { (#[cfg(any())] impl $t:ty) => (fn target() {}); }"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("macro_rules! mk { (#[cfg(any())] fn helper()) => { fn target() {} }; }"),
+        MissingInlineNever
+    );
+
+    // 2. Statically disabled `#[cfg(any())]`, `#[cfg(false)]`, `#[cfg(not(all()))]`,
+    //    and Kleene `#[cfg(all(test, any()))]` items/scopes are compiled out by
+    //    rustc and MUST NOT satisfy target existence (`TargetFunctionNotFound`)!
+    for dead_decoy in [
+        "#[cfg(any())] #[inline(never)] fn target() {}",
+        "#[cfg(false)] #[inline(never)] fn target() {}",
+        "#[cfg(not(all()))] #[inline(never)] fn target() {}",
+        "#[cfg(not(true))] #[inline(never)] fn target() {}",
+        "#[cfg(all(feature = \"x\", any()))] #[inline(never)] fn target() {}",
+        "#[cfg(all(test, false))] #[inline(never)] fn target() {}",
+        "#[core::prelude::v1::cfg(any())] #[inline(never)] fn target() {}",
+        "#[r#cfg(r#any())] #[inline(never)] fn target() {}",
+        "#[cfg_attr(all(), cfg(any()))] #[inline(never)] fn target() {}",
+        "#[cfg(any())] mod dead { #[inline(never)] pub fn target() {} }",
+        "mod dead { #![cfg(any())] #[inline(never)] pub fn target() {} }",
+        "#![cfg(any())]\n#[inline(never)] pub fn target() {}",
+        "#[cfg(any())] impl Foo { #[inline(never)] fn target(&self) {} }",
+        "#[cfg(any())] trait T { #[inline(never)] fn target(&self) {} }",
+        "#[cfg(any())] extern \"C\" { #[inline(never)] fn target(); }",
+        "#[cfg(any())] fn outer() { #[inline(never)] fn target() {} }",
+        "fn target() { #![cfg(any())] #![inline(never)] }",
+        "#[cfg(any())] const _: () = { #[inline(never)] fn target() {} };",
+        "#[cfg(any())] gen_items! { #[inline(never)] fn target() {} }",
+    ] {
+        assert_eq!(v(dead_decoy), TargetFunctionNotFound, "{dead_decoy}");
+    }
+
+    // A dead un-annotated decoy alongside a live `#[inline(never)]` target is
+    // cleanly ignored rather than causing false rejection.
+    assert_eq!(
+        v("#[cfg(any())] fn target() {}\n#[inline(never)] fn target() {}"),
+        Verified
+    );
+    assert_eq!(
+        v("#[cfg(any())] mod dead { fn target() {} }\n#[inline(never)] fn target() {}"),
+        Verified
+    );
+
+    // 3. Generalized static `cfg` / `cfg_attr` Kleene evaluation:
+    assert_eq!(v("#[cfg(true)] #[inline(never)] fn target() {}"), Verified);
+    assert_eq!(v("#[cfg(not(any()))] #[inline(never)] fn target() {}"), Verified);
+    assert_eq!(v("#[cfg_attr(true, inline(never))] fn target() {}"), Verified);
+    assert_eq!(v("#[cfg_attr(not(any()), inline(never))] fn target() {}"), Verified);
+    assert_eq!(v("#[cfg_attr(not(false), inline(never))] fn target() {}"), Verified);
+    assert_eq!(
+        v("#[cfg_attr(any(test, all()), inline(never))] fn target() {}"),
+        Verified
+    );
+    // Statically false `cfg_attr` arm never applies `inline(never)` ->
+    // `MissingInlineNever` (NOT `ConditionalInlineNever`) and never applies
+    // `inline(always)`.
+    assert_eq!(
+        v("#[cfg_attr(any(), inline(never))] fn target() {}"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("#[cfg_attr(false, inline(never))] fn target() {}"),
+        MissingInlineNever
+    );
+    assert_eq!(
+        v("#[cfg_attr(false, inline(always))] #[inline(never)] fn target() {}"),
+        Verified
+    );
+    // Conditional `cfg_attr(feature = "x", cfg(any()))` does NOT disable the item.
+    assert_eq!(
+        v("#[cfg_attr(feature = \"x\", cfg(any()))] fn target() {}"),
+        MissingInlineNever
+    );
+    // Unknown `any(feature = "x", false)` is NOT statically disabled.
+    assert_eq!(
+        v("#[cfg(any(feature = \"x\", false))] fn target() {}"),
+        MissingInlineNever
+    );
+    // Malformed `cfg` predicates (`not()`, `not(a, b)`, `cfg()`) fail closed.
+    assert_eq!(v("#[cfg(not())] #[inline(never)] fn target() {}"), MalformedSource);
+    assert_eq!(v("#[cfg(not(a, b))] #[inline(never)] fn target() {}"), MalformedSource);
+    assert_eq!(v("#[cfg()] #[inline(never)] fn target() {}"), MalformedSource);
+
+    // 4. Opt-in `forbid_unknown_attributes`: rejects potential rewriting
+    //    proc-macro attributes (`OpaqueAttributeMacro`) while permitting
+    //    built-in non-rewriting rustc/tool attributes.
+    let no_macros = InlineScanOptions::strict().with_forbid_unknown_attributes(true);
+    let check_strict_attrs =
+        |src: &str| verify_fn_inline_never_source_with_options(src, "target", no_macros);
+
+    assert_eq!(
+        check_strict_attrs("#[my_rewrite]\n#[inline(never)] fn target() {}"),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        check_strict_attrs("#[my_crate::rewrite(inline = \"always\")]\n#[inline(never)] fn target() {}"),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        check_strict_attrs("#[cfg_attr(all(), my_rewrite)]\n#[inline(never)] fn target() {}"),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        check_strict_attrs("#[inline(never)] fn target() { #![my_rewrite] }"),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        check_strict_attrs("#[unsafe(unknown_attr)]\n#[inline(never)] fn target() {}"),
+        OpaqueAttributeMacro
+    );
+    assert_eq!(
+        check_strict_attrs("#[unsafe(no_mangle, evil)]\n#[inline(never)] fn target() {}"),
+        OpaqueAttributeMacro
+    );
+    // Default (`forbid_unknown_attributes: false`) still allows custom attrs.
+    assert_eq!(
+        v("#[spec(requires = true)]\n#[inline(never)] fn target() {}"),
+        Verified
+    );
+    // Built-in non-rewriting rustc/tool attrs pass even with `forbid_unknown_attributes: true`.
+    assert_eq!(
+        check_strict_attrs(
+            "#[doc = \"audited\"]\n\
+             #[allow(dead_code)]\n\
+             #[clippy::allow_attributes]\n\
+             #[rustfmt::skip]\n\
+             #[cold]\n\
+             #[must_use]\n\
+             #[track_caller]\n\
+             #[unsafe(no_mangle)]\n\
+             #[unsafe(export_name = \"target_sym\")]\n\
+             #[cfg(true)]\n\
+             #[cfg_attr(false, my_dead_proc_macro)]\n\
+             #[inline(never)]\n\
+             pub fn target() -> u8 { 1 }"
+        ),
+        Verified
+    );
+}
+
+#[test]
+fn guard_mutant_unwind_macros_extend_lifetime_for_capturing_non_copy_closures() {
+    let cfg = PanicCheckConfig::default().with_max_trials(128);
+    let msg1 = String::from("dropped_guard_capture");
+    let msg2 = String::from("spurious_zero_capture");
+
+    // Both single `let` bindings AND array literals MUST extend the temporary
+    // lifetime of capturing non-`Copy` closures cleanly (no E0716 / E0507).
+    let single_mutant = panic_guard_mutant_unwind!("single_capturing", move |&(a, b): &(u8, u8)| {
+        let _ = msg1.len();
+        a.wrapping_add(b)
+    });
+    let array_mutants = [
+        single_mutant,
+        panic_guard_mutant_unwind!("array_capturing", move |&(a, b): &(u8, u8)| {
+            assert!(a != 0 || b != 0, "{}", msg2);
+            checked_add_u8(a, b)
+        }),
+    ];
+    let res = ExactPanicContract::new(
+        |&(_a, _b): &(u8, u8)| true,
+        |&(a, b): &(u8, u8)| (a as u16) + (b as u16) > u8::MAX as u16,
+        |&(a, b): &(u8, u8), &out: &u8| out == a + b,
+    )
+    .check_guard_mutants(
+        cfg,
+        panic_unwind_runner!(|&(a, b): &(u8, u8)| checked_add_u8(a, b)),
+        &array_mutants,
+    );
+    let stats = res
+        .into_result()
+        .expect("capturing guard mutants must compile and all be killed");
+    assert_eq!(stats.guard_mutants_killed, 2);
+
+    // Stateful counterpart with capturing non-`Copy` `String`s in `let` & `[...]`.
+    let smsg1 = String::from("stateful_corrupt_capture");
+    let smsg2 = String::from("stateful_wrong_ret_capture");
+    let single_st = stateful_panic_guard_mutant_unwind!(
+        "stateful_single_capturing",
+        move |s: &mut BoundedStack, &val: &u8| {
+            let _ = smsg1.len();
+            s.push_corrupting(val)
+        }
+    );
+    let array_st = [
+        single_st,
+        stateful_panic_guard_mutant_unwind!(
+            "stateful_array_capturing",
+            move |s: &mut BoundedStack, &val: &u8| {
+                let _ = smsg2.len();
+                s.push_safe(val).wrapping_sub(1)
+            }
+        ),
+    ];
+    let st_res = StatefulPanicContractSpec::exact::<BoundedStack, u8>(
+        |s: &BoundedStack, _v: &u8| s.__anneal_type_invariant_bounded_stack(),
+        |s: &BoundedStack, _v: &u8| s.len == 3,
+        |old_s: &BoundedStack, &val: &u8, new_s: &BoundedStack, &new_len: &u8| {
+            new_s.__anneal_type_invariant_bounded_stack()
+                && new_s.len == old_s.len + 1
+                && new_len == new_s.len
+                && new_s.slots[old_s.len as usize] == val
+        },
+    )
+    .with_panic_state_inv(|old_s: &BoundedStack, post_s: &BoundedStack| post_s == old_s)
+    .check_guard_mutants(
+        cfg,
+        stateful_panic_unwind_runner!(|s: &mut BoundedStack, &val: &u8| s.push_safe(val)),
+        &array_st,
+    );
+    let st_stats = st_res
+        .into_result()
+        .expect("capturing stateful guard mutants must compile and all be killed");
+    assert_eq!(st_stats.guard_mutants_killed, 2);
+}
+
+#[test]
+fn kani5095_verify_reachable_callees_rejects_trait_dispatched_expected_caller() {
+    const CALLER: &str = "crate::api::wrapper_caller";
+    const TARGET: &str = "crate::math::checked_add_u8";
+
+    let caller_blocks = [MirBlockSummary::call(TARGET, &[1]), MirBlockSummary::ret()];
+    let callees = [CalleeEntry::new(CALLER, &caller_blocks)];
+    let caller_override = [TraitImplBinding::new(CALLER, "crate::api::inlined_wrapper")];
+
+    // Direct `verify_reachable_callees_call_sites` rejects trait-dispatched expected caller
+    // whether the override lives in `caller_trait_impls` or inside a callee's `trait_impls`.
+    assert_eq!(
+        verify_reachable_callees_call_sites(&callees, &caller_override, &[(CALLER, 1)], TARGET),
+        CallBoundaryVerdict::ExpectedCallerTraitDispatched { caller_index: 0 }
+    );
+    let hidden_callees = [CalleeEntry::with_trait_impls(
+        CALLER,
+        &caller_blocks,
+        &caller_override,
+    )];
+    assert_eq!(
+        verify_reachable_callees_call_sites(&hidden_callees, &[], &[(CALLER, 1)], TARGET),
+        CallBoundaryVerdict::ExpectedCallerTraitDispatched { caller_index: 0 }
+    );
+
+    // `CallBoundaryGuard::verify_caller_in_callees` respects `forbid_trait_dispatch`.
+    let guard = CallBoundaryGuard::new(CALLER, TARGET);
+    assert_eq!(
+        guard.verify_caller_in_callees(&callees, &caller_override),
+        CallBoundaryVerdict::ExpectedCallerTraitDispatched { caller_index: 0 }
+    );
+    assert!(
+        guard
+            .with_forbid_trait_dispatch(false)
+            .verify_caller_in_callees(&callees, &caller_override)
+            .is_preserved()
+    );
+}
+
+// ===========================================================================
 // 4. Seed-Stability Sweeps & Deterministic Counterexample Replay
 // ===========================================================================
 

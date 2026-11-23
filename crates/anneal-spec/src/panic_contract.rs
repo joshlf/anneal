@@ -4258,42 +4258,65 @@ macro_rules! stateful_panic_unwind_runner {
 
 /// Constructs a named [`PanicGuardMutant`](crate::panic_contract::PanicGuardMutant)
 /// wrapping a panicking Rust closure/function with `::std::panic::catch_unwind`.
+///
+/// Expands directly to a struct literal (without outer block/constructor
+/// wrappers) so Rust temporary lifetime extension keeps capturing non-`Copy`
+/// closures alive in `let m = panic_guard_mutant_unwind!(...);` and array
+/// literals `let ms = [panic_guard_mutant_unwind!(...), ...];`.
 #[macro_export]
 macro_rules! panic_guard_mutant_unwind {
-    ($name:expr, $body:expr) => {{
-        $crate::panic_contract::PanicGuardMutant::new($name, &move |input| {
-            match ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| ($body)(input))) {
-                ::core::result::Result::Ok(ret) => {
-                    $crate::panic_contract::PanicExecOutcome::Returned(ret)
+    ($name:expr, $body:expr) => {
+        $crate::panic_contract::PanicGuardMutant {
+            name: $name,
+            runner: &{
+                let __anneal_body = $body;
+                move |input| {
+                    match ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                        __anneal_body(input)
+                    })) {
+                        ::core::result::Result::Ok(ret) => {
+                            $crate::panic_contract::PanicExecOutcome::Returned(ret)
+                        }
+                        ::core::result::Result::Err(_) => {
+                            $crate::panic_contract::PanicExecOutcome::Panicked
+                        }
+                    }
                 }
-                ::core::result::Result::Err(_) => {
-                    $crate::panic_contract::PanicExecOutcome::Panicked
-                }
-            }
-        })
-    }};
+            },
+        }
+    };
 }
 
 /// Constructs a named
 /// [`StatefulPanicGuardMutant`](crate::panic_contract::StatefulPanicGuardMutant)
 /// wrapping a panicking stateful Rust closure/function with
 /// `::std::panic::catch_unwind`.
+///
+/// Expands directly to a struct literal so Rust temporary lifetime extension
+/// keeps capturing non-`Copy` closures alive in `let` bindings and array
+/// literals.
 #[macro_export]
 macro_rules! stateful_panic_guard_mutant_unwind {
-    ($name:expr, $body:expr) => {{
-        $crate::panic_contract::StatefulPanicGuardMutant::new($name, &move |state, args| {
-            match ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
-                ($body)(state, args)
-            })) {
-                ::core::result::Result::Ok(ret) => {
-                    $crate::panic_contract::PanicExecOutcome::Returned(ret)
+    ($name:expr, $body:expr) => {
+        $crate::panic_contract::StatefulPanicGuardMutant {
+            name: $name,
+            runner: &{
+                let __anneal_body = $body;
+                move |state, args| {
+                    match ::std::panic::catch_unwind(::core::panic::AssertUnwindSafe(|| {
+                        __anneal_body(state, args)
+                    })) {
+                        ::core::result::Result::Ok(ret) => {
+                            $crate::panic_contract::PanicExecOutcome::Returned(ret)
+                        }
+                        ::core::result::Result::Err(_) => {
+                            $crate::panic_contract::PanicExecOutcome::Panicked
+                        }
+                    }
                 }
-                ::core::result::Result::Err(_) => {
-                    $crate::panic_contract::PanicExecOutcome::Panicked
-                }
-            }
-        })
-    }};
+            },
+        }
+    };
 }
 
 /// Executes [`check_panic_contract_fallible`](crate::panic_contract::check_panic_contract_fallible)
@@ -4824,6 +4847,7 @@ impl CallBoundaryGuard {
             InlineScanOptions {
                 require_inline_never: self.require_inline_never,
                 forbid_polymorphic_or_trait_default: self.forbid_trait_dispatch,
+                forbid_unknown_attributes: false,
             },
         )
     }
@@ -4934,12 +4958,25 @@ pub struct InlineScanOptions {
     /// unconditional `#[inline(never)]`. When `false`, still verifies target
     /// existence and rejects `#[inline]` / `#[inline(always)]` /
     /// `ConflictingInlineAttributes` / `MalformedSource` (plus polymorphism if
-    /// `forbid_polymorphic_or_trait_default` is `true`).
+    /// `forbid_polymorphic_or_trait_default` is `true`, and unknown attributes
+    /// if `forbid_unknown_attributes` is `true`).
     pub require_inline_never: bool,
     /// When `true`, rejects generic functions (type/const generics or
     /// `impl Trait` parameters), methods inside generic `impl<T>` blocks, and
     /// trait methods / trait default methods.
     pub forbid_polymorphic_or_trait_default: bool,
+    /// When `true`, rejects any attribute on the target function outside the
+    /// built-in non-rewriting rustc/tool allowlist (`inline`, `cfg`,
+    /// `cfg_attr`, lints, `doc`, `cold`, `must_use`, `deprecated`,
+    /// `track_caller`, `no_mangle`, `export_name`, `link_section`,
+    /// `target_feature`, `unsafe(no_mangle|export_name|link_section|naked)`,
+    /// `clippy::*`, `rustfmt::*`, `diagnostic::*`, `miri::*`, etc.) with
+    /// [`InlineBoundaryVerdict::OpaqueAttributeMacro`], preventing proc-macro
+    /// attributes from silently stripping or overriding `#[inline(never)]`.
+    ///
+    /// Defaults to `false` so custom annotation attributes (such as `#[spec]`
+    /// or `#[embed_spec]`) continue to pass unless explicitly hardened.
+    pub forbid_unknown_attributes: bool,
 }
 
 impl Default for InlineScanOptions {
@@ -4947,6 +4984,7 @@ impl Default for InlineScanOptions {
         Self {
             require_inline_never: true,
             forbid_polymorphic_or_trait_default: false,
+            forbid_unknown_attributes: false,
         }
     }
 }
@@ -4958,7 +4996,16 @@ impl InlineScanOptions {
         Self {
             require_inline_never: true,
             forbid_polymorphic_or_trait_default: true,
+            forbid_unknown_attributes: false,
         }
+    }
+
+    /// Configures whether unrecognized (potential rewriting proc-macro)
+    /// attributes on the target function fail closed with
+    /// [`InlineBoundaryVerdict::OpaqueAttributeMacro`].
+    pub const fn with_forbid_unknown_attributes(mut self, forbid_unknown_attributes: bool) -> Self {
+        self.forbid_unknown_attributes = forbid_unknown_attributes;
+        self
     }
 }
 
@@ -4982,6 +5029,11 @@ pub enum InlineBoundaryVerdict {
     /// Target `fn <name>` carries conflicting `#[inline(never)]` together with
     /// `#[inline]` or `#[inline(always)]`.
     ConflictingInlineAttributes,
+    /// Target `fn <name>` carries an unrecognized attribute (potential
+    /// rewriting proc-macro attribute that could strip or override
+    /// `#[inline(never)]`) while [`InlineScanOptions::forbid_unknown_attributes`]
+    /// is enabled.
+    OpaqueAttributeMacro,
     /// Target `fn <name>` is polymorphic (generic type/const parameter or
     /// `impl Trait` argument) or a trait method / trait default method while
     /// [`InlineScanOptions::forbid_polymorphic_or_trait_default`] is enabled.
@@ -5482,6 +5534,8 @@ struct InlineAttrSummary {
     saw_unconditional_never: bool,
     saw_conditional_never: bool,
     saw_forbidden_inline: bool,
+    saw_disabled_cfg: bool,
+    saw_unknown_attr: bool,
     saw_malformed: bool,
 }
 
@@ -5491,42 +5545,174 @@ impl InlineAttrSummary {
     }
 }
 
-/// Checks if a `cfg_attr` predicate slice is syntactically `all()` (always true).
-fn is_unconditional_cfg_pred(pred: &str) -> bool {
+/// Three-valued (Kleene) static evaluator for Rust `cfg(...)` / `cfg_attr(...)`
+/// predicates:
+/// - `Ok(Some(true))`: statically always true (`true`, `all()`, `not(any())`,
+///   `any(test, all())`, etc.)
+/// - `Ok(Some(false))`: statically always false (`false`, `any()`,
+///   `not(all())`, `all(test, any())`, etc.)
+/// - `Ok(None)`: depends on target/feature flags (`test`, `feature = "..."`,
+///   etc.)
+/// - `Err(())`: syntactically malformed predicate or excessive nesting depth.
+fn eval_static_cfg_pred(pred: &str, depth: usize) -> Result<Option<bool>, ()> {
+    if depth > 8 {
+        return Err(());
+    }
     let mut lex = RustLexer::new(pred);
-    let Ok(t0) = lex.next_token() else {
-        return false;
-    };
-    if !matches!(t0.kind, TokenKind::Ident(id) if unraw(id) == "all") {
-        return false;
+    let t0 = lex.next_token()?;
+    match t0.kind {
+        TokenKind::Eof => Err(()),
+        TokenKind::Ident("true") if matches!(lex.peek_token()?.kind, TokenKind::Eof) => {
+            Ok(Some(true))
+        }
+        TokenKind::Ident("false") if matches!(lex.peek_token()?.kind, TokenKind::Eof) => {
+            Ok(Some(false))
+        }
+        TokenKind::Ident(id)
+            if matches!(unraw(id), "all" | "any" | "not")
+                && matches!(lex.peek_token()?.kind, TokenKind::Punct(b'(')) =>
+        {
+            let op = unraw(id);
+            let _ = lex.next_token()?; // consume '('
+            let inner = lex.consume_balanced_inner(b'(')?;
+            if lex.next_token()?.kind != TokenKind::Eof {
+                return Err(());
+            }
+            eval_cfg_combinator(op, inner, depth + 1)
+        }
+        _ => {
+            // Unknown compile-time predicate (e.g. `test`, `feature = "foo"`,
+            // `target_arch = "x86_64"`): validate delimiter balance, return `None`.
+            if let TokenKind::Punct(p @ (b'(' | b'[' | b'{')) = t0.kind {
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            loop {
+                let tok = lex.next_token()?;
+                match tok.kind {
+                    TokenKind::Eof => return Ok(None),
+                    TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
+                        let _ = lex.consume_balanced_inner(p)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
-    let Ok(t1) = lex.next_token() else {
-        return false;
-    };
-    if t1.kind != TokenKind::Punct(b'(') {
-        return false;
+}
+
+fn eval_cfg_combinator(op: &str, inner: &str, depth: usize) -> Result<Option<bool>, ()> {
+    let mut lex = RustLexer::new(inner);
+    let mut item_start = 0usize;
+    let mut count = 0usize;
+    let mut saw_true = false;
+    let mut saw_false = false;
+    let mut saw_unknown = false;
+    let mut last_val: Option<bool> = None;
+
+    loop {
+        let tok = lex.next_token()?;
+        match tok.kind {
+            TokenKind::Eof => {
+                let tail = &inner[item_start..];
+                let mut check = RustLexer::new(tail);
+                if check.next_token()?.kind != TokenKind::Eof {
+                    let v = eval_static_cfg_pred(tail, depth)?;
+                    count += 1;
+                    last_val = v;
+                    match v {
+                        Some(true) => saw_true = true,
+                        Some(false) => saw_false = true,
+                        None => saw_unknown = true,
+                    }
+                }
+                break;
+            }
+            TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b',') => {
+                let item = &inner[item_start..tok.end - 1];
+                let v = eval_static_cfg_pred(item, depth)?;
+                count += 1;
+                last_val = v;
+                match v {
+                    Some(true) => saw_true = true,
+                    Some(false) => saw_false = true,
+                    None => saw_unknown = true,
+                }
+                item_start = tok.end;
+            }
+            _ => {}
+        }
     }
-    let Ok(inner) = lex.consume_balanced_inner(b'(') else {
-        return false;
-    };
-    let mut inner_lex = RustLexer::new(inner);
-    let Ok(ti) = inner_lex.next_token() else {
-        return false;
-    };
-    if ti.kind != TokenKind::Eof {
-        return false;
+
+    match op {
+        "all" => {
+            if saw_false {
+                Ok(Some(false))
+            } else if saw_unknown {
+                Ok(None)
+            } else {
+                Ok(Some(true))
+            }
+        }
+        "any" => {
+            if saw_true {
+                Ok(Some(true))
+            } else if saw_unknown {
+                Ok(None)
+            } else {
+                Ok(Some(false))
+            }
+        }
+        "not" => {
+            if count != 1 {
+                Err(())
+            } else {
+                Ok(last_val.map(|b| !b))
+            }
+        }
+        _ => Err(()),
     }
-    matches!(lex.next_token(), Ok(Token { kind: TokenKind::Eof, .. }))
+}
+
+/// Returns `Ok(true)` iff `inner` inside Rust 2024 `#[unsafe(...)]` is a known
+/// built-in non-rewriting unsafe attribute (`no_mangle`, `export_name`,
+/// `link_section`, `naked`) with no trailing comma-separated items.
+fn is_known_inert_unsafe_attr(inner: &str) -> Result<bool, ()> {
+    let mut lex = RustLexer::new(inner);
+    let t0 = lex.next_token()?;
+    let TokenKind::Ident(id) = t0.kind else {
+        return Ok(false);
+    };
+    let mut known = matches!(
+        unraw(id),
+        "no_mangle" | "export_name" | "link_section" | "naked"
+    );
+    loop {
+        let tok = lex.next_token()?;
+        match tok.kind {
+            TokenKind::Eof => return Ok(known),
+            TokenKind::Punct(b',') => known = false,
+            TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Classifies a parsed attribute path (bare or prelude-qualified, e.g.
 /// `inline`, `core::prelude::v1::inline`, `::std::prelude::rust_2024::inline`,
-/// `cfg_attr`, `core::prelude::v1::cfg_attr`).
+/// `cfg`, `cfg_attr`, or known built-in non-rewriting rustc/tool attributes).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BuiltinAttrKind {
     Inline,
+    Cfg,
     CfgAttr,
-    Other,
+    UnsafeWrapper,
+    KnownInert,
+    Unknown,
 }
 
 /// Strips a raw-identifier `r#` prefix. Raw identifiers denote the same
@@ -5534,6 +5720,32 @@ enum BuiltinAttrKind {
 /// `#[inline(always)]` (and `#[inline(r#never)]` like `#[inline(never)]`).
 fn unraw(ident: &str) -> &str {
     ident.strip_prefix("r#").unwrap_or(ident)
+}
+
+fn is_known_inert_single_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "allow"
+            | "warn"
+            | "deny"
+            | "forbid"
+            | "expect"
+            | "doc"
+            | "cold"
+            | "must_use"
+            | "deprecated"
+            | "track_caller"
+            | "no_mangle"
+            | "export_name"
+            | "link_section"
+            | "target_feature"
+            | "test"
+            | "ignore"
+            | "should_panic"
+            | "automatically_derived"
+            | "used"
+            | "naked"
+    )
 }
 
 fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
@@ -5544,10 +5756,18 @@ fn classify_attr_path(segments: &[&str]) -> BuiltinAttrKind {
     }
     match &norm[..len] {
         ["inline"] => BuiltinAttrKind::Inline,
+        ["cfg"] => BuiltinAttrKind::Cfg,
         ["cfg_attr"] => BuiltinAttrKind::CfgAttr,
+        ["unsafe"] => BuiltinAttrKind::UnsafeWrapper,
         ["core" | "std", "prelude", _, "inline"] => BuiltinAttrKind::Inline,
+        ["core" | "std", "prelude", _, "cfg"] => BuiltinAttrKind::Cfg,
         ["core" | "std", "prelude", _, "cfg_attr"] => BuiltinAttrKind::CfgAttr,
-        _ => BuiltinAttrKind::Other,
+        [single] if is_known_inert_single_attr(single) => BuiltinAttrKind::KnownInert,
+        ["core" | "std", "prelude", _, leaf] if is_known_inert_single_attr(leaf) => {
+            BuiltinAttrKind::KnownInert
+        }
+        ["clippy" | "rustfmt" | "diagnostic" | "miri", _] => BuiltinAttrKind::KnownInert,
+        _ => BuiltinAttrKind::Unknown,
     }
 }
 
@@ -5625,7 +5845,7 @@ fn analyze_attr_meta_list(
             }
 
             let attr_kind = if path_overflow {
-                BuiltinAttrKind::Other
+                BuiltinAttrKind::Unknown
             } else {
                 classify_attr_path(&path_segs[..seg_count])
             };
@@ -5692,6 +5912,31 @@ fn analyze_attr_meta_list(
                         summary.saw_forbidden_inline = true;
                     }
                 }
+            } else if attr_kind == BuiltinAttrKind::Cfg {
+                if next.kind != TokenKind::Punct(b'(') {
+                    summary.saw_malformed = true;
+                    return;
+                }
+                let _ = lex.next_token(); // consume '('
+                let Ok(args) = lex.consume_balanced_inner(b'(') else {
+                    summary.saw_malformed = true;
+                    return;
+                };
+                match eval_static_cfg_pred(args, depth + 1) {
+                    Ok(Some(false)) => {
+                        // Only an unconditional `#[cfg(false|any()|not(all()))]`
+                        // unconditionally compiles out the target item.
+                        if unconditional {
+                            summary.saw_disabled_cfg = true;
+                        }
+                    }
+                    Ok(Some(true) | None) => {}
+                    Err(()) => {
+                        summary.saw_malformed = true;
+                        return;
+                    }
+                }
+                continue;
             } else if attr_kind == BuiltinAttrKind::CfgAttr && next.kind == TokenKind::Punct(b'(')
             {
                 let _ = lex.next_token(); // consume '('
@@ -5724,14 +5969,60 @@ fn analyze_attr_meta_list(
                         _ => {}
                     }
                 }
-                if let Some(rest_start) = comma_end {
-                    let pred = &args[..pred_end];
-                    let rest = &args[rest_start..];
-                    let child_unconditional = unconditional && is_unconditional_cfg_pred(pred);
-                    analyze_attr_meta_list(rest, child_unconditional, depth + 1, summary);
+                let pred = &args[..pred_end];
+                match eval_static_cfg_pred(pred, depth + 1) {
+                    Ok(Some(true)) => {
+                        if let Some(rest_start) = comma_end {
+                            analyze_attr_meta_list(
+                                &args[rest_start..],
+                                unconditional,
+                                depth + 1,
+                                summary,
+                            );
+                        }
+                    }
+                    Ok(Some(false)) => {
+                        // Statically disabled `cfg_attr` arm (`any()`, `false`,
+                        // `not(all())`): rustc never applies `rest`.
+                    }
+                    Ok(None) => {
+                        if let Some(rest_start) = comma_end {
+                            analyze_attr_meta_list(&args[rest_start..], false, depth + 1, summary);
+                        }
+                    }
+                    Err(()) => {
+                        summary.saw_malformed = true;
+                        return;
+                    }
                 }
                 continue;
+            } else if attr_kind == BuiltinAttrKind::UnsafeWrapper
+                && next.kind == TokenKind::Punct(b'(')
+            {
+                let _ = lex.next_token(); // consume '('
+                let Ok(inner) = lex.consume_balanced_inner(b'(') else {
+                    summary.saw_malformed = true;
+                    return;
+                };
+                match is_known_inert_unsafe_attr(inner) {
+                    Ok(true) => {}
+                    Ok(false) => summary.saw_unknown_attr = true,
+                    Err(()) => {
+                        summary.saw_malformed = true;
+                        return;
+                    }
+                }
+                continue;
+            } else if matches!(
+                attr_kind,
+                BuiltinAttrKind::Unknown
+                    | BuiltinAttrKind::UnsafeWrapper
+                    | BuiltinAttrKind::CfgAttr
+            ) {
+                summary.saw_unknown_attr = true;
             }
+        } else {
+            summary.saw_unknown_attr = true;
         }
 
         // Skip the remainder of this non-inline meta item up to the next
@@ -5846,6 +6137,12 @@ enum ScopeKind {
     Trait,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScopeEntry {
+    kind: ScopeKind,
+    disabled: bool,
+}
+
 const MAX_SCOPE_DEPTH: usize = 32;
 
 /// Pure-`core` (zero-allocation) Rust source scanner verifying that every
@@ -5853,8 +6150,9 @@ const MAX_SCOPE_DEPTH: usize = 32;
 /// `#[inline(never)]` without conflicting or forbidden inline hints.
 ///
 /// Uses default [`InlineScanOptions`] (`forbid_polymorphic_or_trait_default:
-/// false`), so generic functions with `where` clauses pass when annotated with
-/// `#[inline(never)]`. For strict polymorphism/trait-default enforcement, use
+/// false`, `forbid_unknown_attributes: false`), so generic functions with
+/// `where` clauses pass when annotated with `#[inline(never)]`. For strict
+/// polymorphism/trait-default or opaque-attribute-macro enforcement, use
 /// [`verify_fn_inline_never_source_with_options`].
 pub fn verify_fn_inline_never_source(source: &str, fn_name: &str) -> InlineBoundaryVerdict {
     verify_fn_inline_never_source_with_options(source, fn_name, InlineScanOptions::default())
@@ -5882,8 +6180,10 @@ pub fn verify_fn_inline_never_source(source: &str, fn_name: &str) -> InlineBound
 /// Both layers treat leading inner attributes of a matched function's body
 /// (`fn target() { #![inline(always)] }`) as attributes of that function,
 /// resolve raw-identifier attribute paths (`#[r#inline(always)]`) like rustc
-/// does, and the deep layer also scans attribute-macro argument token trees
-/// (`#[gen { fn target() {} }]`).
+/// does, ignore items and scopes statically compiled out via `#[cfg(any())]` /
+/// `#[cfg(false)]` / `#[cfg(not(all()))]` (so dead decoys cannot spoof a real
+/// `#[inline(never)]` definition), and the deep layer also scans
+/// attribute-macro argument token trees (`#[gen { fn target() {} }]`).
 pub fn verify_fn_inline_never_source_with_options(
     source: &str,
     fn_name: &str,
@@ -5960,6 +6260,9 @@ fn evaluate_target_attrs(
         }
         return Some(InlineBoundaryVerdict::MissingInlineNever);
     }
+    if options.forbid_unknown_attributes && pending.saw_unknown_attr {
+        return Some(InlineBoundaryVerdict::OpaqueAttributeMacro);
+    }
     if options.forbid_polymorphic_or_trait_default && polymorphic_or_trait {
         return Some(InlineBoundaryVerdict::ForbiddenPolymorphicOrTraitDefault);
     }
@@ -5976,8 +6279,12 @@ fn structured_inline_scan(
     matched_count: &mut usize,
 ) -> InlineBoundaryVerdict {
     let mut lex = RustLexer::new(source);
-    let mut scopes: [ScopeKind; MAX_SCOPE_DEPTH] = [ScopeKind::Module; MAX_SCOPE_DEPTH];
+    let mut scopes: [ScopeEntry; MAX_SCOPE_DEPTH] = [ScopeEntry {
+        kind: ScopeKind::Module,
+        disabled: false,
+    }; MAX_SCOPE_DEPTH];
     let mut scope_len = 0usize;
+    let mut root_disabled = false;
     let mut pending = InlineAttrSummary::default();
 
     loop {
@@ -5985,6 +6292,7 @@ fn structured_inline_scan(
             Ok(t) => t,
             Err(()) => return InlineBoundaryVerdict::MalformedSource,
         };
+        let in_disabled = root_disabled || (scope_len > 0 && scopes[scope_len - 1].disabled);
 
         match tok.kind {
             TokenKind::Eof => {
@@ -6001,6 +6309,7 @@ fn structured_inline_scan(
                 pending.reset();
             }
             // Inner attribute `#![...]` applies to enclosing module/block, NOT next item.
+            // A statically disabled `#![cfg(any())]` / `#![cfg(false)]` disables the enclosing scope.
             TokenKind::HashBang => {
                 let Ok(next) = lex.next_token() else {
                     return InlineBoundaryVerdict::MalformedSource;
@@ -6008,8 +6317,17 @@ fn structured_inline_scan(
                 if next.kind != TokenKind::Punct(b'[') {
                     return InlineBoundaryVerdict::MalformedSource;
                 }
-                if lex.consume_balanced_inner(b'[').is_err() {
+                let Ok(inner) = lex.consume_balanced_inner(b'[') else {
                     return InlineBoundaryVerdict::MalformedSource;
+                };
+                let mut inner_attr = InlineAttrSummary::default();
+                analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
+                if inner_attr.saw_disabled_cfg {
+                    if scope_len > 0 {
+                        scopes[scope_len - 1].disabled = true;
+                    } else {
+                        root_disabled = true;
+                    }
                 }
             }
             // Outer attribute `#[...]` attaches to the immediately following item.
@@ -6034,7 +6352,17 @@ fn structured_inline_scan(
                 let Ok(inner) = lex.consume_balanced_inner(b'[') else {
                     return InlineBoundaryVerdict::MalformedSource;
                 };
-                if !is_inner {
+                if is_inner {
+                    let mut inner_attr = InlineAttrSummary::default();
+                    analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
+                    if inner_attr.saw_disabled_cfg {
+                        if scope_len > 0 {
+                            scopes[scope_len - 1].disabled = true;
+                        } else {
+                            root_disabled = true;
+                        }
+                    }
+                } else {
                     analyze_attr_meta_list(inner, true, 0, &mut pending);
                 }
             }
@@ -6084,12 +6412,16 @@ fn structured_inline_scan(
                     }
                     TokenKind::Punct(b'{') => {
                         // `extern "C" { ... }` block: descend as module scope.
+                        let block_disabled = in_disabled || pending.saw_disabled_cfg;
                         let _ = lex.next_token();
                         pending.reset();
                         if scope_len >= MAX_SCOPE_DEPTH {
                             return InlineBoundaryVerdict::MalformedSource;
                         }
-                        scopes[scope_len] = ScopeKind::Module;
+                        scopes[scope_len] = ScopeEntry {
+                            kind: ScopeKind::Module,
+                            disabled: block_disabled,
+                        };
                         scope_len += 1;
                     }
                     TokenKind::Ident("crate") => {
@@ -6150,18 +6482,25 @@ fn structured_inline_scan(
                 };
 
                 if fn_ident_matches(ident, fn_name) {
-                    *matched_count += 1;
                     if let Some(body) = body_inner {
                         merge_leading_inner_attrs(body, &mut pending);
                     }
+                    if !(in_disabled || pending.saw_disabled_cfg) {
+                        *matched_count += 1;
 
-                    let in_trait = scope_len > 0 && scopes[scope_len - 1] == ScopeKind::Trait;
-                    let in_generic_impl = scope_len > 0
-                        && matches!(scopes[scope_len - 1], ScopeKind::Impl { is_generic: true });
-                    let polymorphic =
-                        in_trait || in_generic_impl || fn_is_generic || has_impl_trait_param;
-                    if let Some(failure) = evaluate_target_attrs(&pending, polymorphic, options) {
-                        return failure;
+                        let in_trait =
+                            scope_len > 0 && scopes[scope_len - 1].kind == ScopeKind::Trait;
+                        let in_generic_impl = scope_len > 0
+                            && matches!(
+                                scopes[scope_len - 1].kind,
+                                ScopeKind::Impl { is_generic: true }
+                            );
+                        let polymorphic =
+                            in_trait || in_generic_impl || fn_is_generic || has_impl_trait_param;
+                        if let Some(failure) = evaluate_target_attrs(&pending, polymorphic, options)
+                        {
+                            return failure;
+                        }
                     }
                 }
 
@@ -6169,6 +6508,7 @@ fn structured_inline_scan(
             }
             // Module item: `mod foo;` or `mod foo { ... }`
             TokenKind::Ident("mod") => {
+                let mod_disabled = in_disabled || pending.saw_disabled_cfg;
                 pending.reset();
                 let Ok(name_tok) = lex.next_token() else {
                     return InlineBoundaryVerdict::MalformedSource;
@@ -6185,7 +6525,10 @@ fn structured_inline_scan(
                         if scope_len >= MAX_SCOPE_DEPTH {
                             return InlineBoundaryVerdict::MalformedSource;
                         }
-                        scopes[scope_len] = ScopeKind::Module;
+                        scopes[scope_len] = ScopeEntry {
+                            kind: ScopeKind::Module,
+                            disabled: mod_disabled,
+                        };
                         scope_len += 1;
                     }
                     _ => return InlineBoundaryVerdict::MalformedSource,
@@ -6193,6 +6536,7 @@ fn structured_inline_scan(
             }
             // Trait item: `trait Name ... { ... }`
             TokenKind::Ident("trait") => {
+                let trait_disabled = in_disabled || pending.saw_disabled_cfg;
                 pending.reset();
                 if skip_until_open_brace(&mut lex).is_err() {
                     return InlineBoundaryVerdict::MalformedSource;
@@ -6200,11 +6544,15 @@ fn structured_inline_scan(
                 if scope_len >= MAX_SCOPE_DEPTH {
                     return InlineBoundaryVerdict::MalformedSource;
                 }
-                scopes[scope_len] = ScopeKind::Trait;
+                scopes[scope_len] = ScopeEntry {
+                    kind: ScopeKind::Trait,
+                    disabled: trait_disabled,
+                };
                 scope_len += 1;
             }
             // Impl item: `impl<...> ... { ... }`
             TokenKind::Ident("impl") => {
+                let impl_disabled = in_disabled || pending.saw_disabled_cfg;
                 pending.reset();
                 let mut impl_is_generic = false;
                 if matches!(lex.peek_token(), Ok(Token { kind: TokenKind::Punct(b'<'), .. })) {
@@ -6223,8 +6571,11 @@ fn structured_inline_scan(
                 if scope_len >= MAX_SCOPE_DEPTH {
                     return InlineBoundaryVerdict::MalformedSource;
                 }
-                scopes[scope_len] = ScopeKind::Impl {
-                    is_generic: impl_is_generic,
+                scopes[scope_len] = ScopeEntry {
+                    kind: ScopeKind::Impl {
+                        is_generic: impl_is_generic,
+                    },
+                    disabled: impl_disabled,
                 };
                 scope_len += 1;
             }
@@ -6288,30 +6639,39 @@ enum DeepScope {
     Impl { is_generic: bool },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeepScopeEntry {
+    kind: DeepScope,
+    disabled: bool,
+}
+
 const MAX_DEEP_SCOPE_DEPTH: usize = 128;
 const MAX_DEEP_RECURSION: usize = 32;
 
 /// Skips an `impl`/`trait` header up to (and including) its opening `{`,
 /// returning `Ok(true)`, or up to (and including) a terminating `;` (type
 /// position `impl Trait`, trait aliases), returning `Ok(false)`. Stops without
-/// consuming at `}` or end of input (lenient inside macro token trees).
+/// consuming at `}`, `)`, `]`, or end of input (lenient inside macro token
+/// trees).
 ///
 /// Any delimited groups (`(...)`, `[...]`, `<...>`) skipped inside the header
-/// are recursively scanned via [`deep_scan_slice`] so hidden `fn <fn_name>`
-/// items in const generic expressions or `macro_rules!` arms like
+/// are recursively scanned via [`deep_scan_slice`] unless `skip_scan` is `true`
+/// (statically disabled `#[cfg(any())]`), so hidden `fn <fn_name>` items in
+/// const generic expressions or `macro_rules!` arms like
 /// `(impl $t:ty) => (fn target() {})` cannot slip through unseen.
 fn skip_header_to_brace_or_semicolon_scanning(
     lex: &mut RustLexer<'_>,
     fn_name: &str,
     options: InlineScanOptions,
     recursion: usize,
+    skip_scan: bool,
     occurrences: &mut usize,
     first_failure: &mut Option<InlineBoundaryVerdict>,
 ) -> Result<bool, ()> {
     loop {
         let tok = lex.peek_token()?;
         match tok.kind {
-            TokenKind::Eof | TokenKind::Punct(b'}') => return Ok(false),
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']') => return Ok(false),
             TokenKind::Punct(b'{') => {
                 let _ = lex.next_token()?;
                 return Ok(true);
@@ -6323,12 +6683,30 @@ fn skip_header_to_brace_or_semicolon_scanning(
             TokenKind::Punct(p @ (b'(' | b'[')) => {
                 let _ = lex.next_token()?;
                 let inner = lex.consume_balanced_inner(p)?;
-                deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
+                if !skip_scan {
+                    deep_scan_slice(
+                        inner,
+                        fn_name,
+                        options,
+                        recursion + 1,
+                        occurrences,
+                        first_failure,
+                    )?;
+                }
             }
             TokenKind::Punct(b'<') => {
                 let _ = lex.next_token()?;
                 let inner = lex.consume_angle_inner()?;
-                deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
+                if !skip_scan {
+                    deep_scan_slice(
+                        inner,
+                        fn_name,
+                        options,
+                        recursion + 1,
+                        occurrences,
+                        first_failure,
+                    )?;
+                }
             }
             _ => {
                 let _ = lex.next_token()?;
@@ -6343,10 +6721,11 @@ fn skip_header_to_brace_or_semicolon_scanning(
 /// parameter lists, generic parameter const defaults, nested blocks,
 /// `const`/`static` initializers, macro invocation bodies, and `macro_rules!`
 /// templates, which the structured item-level layer skips — and validates
-/// every `fn <fn_name>` occurrence against its own preceding outer attributes.
-/// Nested items cannot capture outer generic parameters (E0401), so only the
-/// occurrence's own generics, `impl Trait` parameters, and its innermost
-/// enclosing `trait` / generic `impl` body determine polymorphism.
+/// every live `fn <fn_name>` occurrence against its own preceding outer
+/// attributes (and leading body inner attributes). Nested items cannot capture
+/// outer generic parameters (E0401), so only the occurrence's own generics,
+/// `impl Trait` parameters, and its innermost enclosing `trait` / generic
+/// `impl` body determine polymorphism.
 ///
 /// Structural oddities inside macro token trees (e.g. `quote! { #name }` or
 /// `mod $name`) are tolerated; only lexical errors, excessive recursion, and
@@ -6376,14 +6755,18 @@ fn deep_scan_slice(
         return Err(());
     }
     let mut lex = RustLexer::new(source);
-    let mut stack = [DeepScope::Plain; MAX_DEEP_SCOPE_DEPTH];
+    let mut stack = [DeepScopeEntry {
+        kind: DeepScope::Plain,
+        disabled: false,
+    }; MAX_DEEP_SCOPE_DEPTH];
     let mut cur_depth = 0usize;
+    let mut root_disabled = false;
     let mut pending = InlineAttrSummary::default();
 
     fn push(
-        stack: &mut [DeepScope; MAX_DEEP_SCOPE_DEPTH],
+        stack: &mut [DeepScopeEntry; MAX_DEEP_SCOPE_DEPTH],
         depth: &mut usize,
-        scope: DeepScope,
+        scope: DeepScopeEntry,
     ) -> Result<(), ()> {
         if *depth >= MAX_DEEP_SCOPE_DEPTH {
             return Err(());
@@ -6395,6 +6778,7 @@ fn deep_scan_slice(
 
     loop {
         let tok = lex.next_token()?;
+        let cur_disabled = root_disabled || (cur_depth > 0 && stack[cur_depth - 1].disabled);
         match tok.kind {
             TokenKind::Eof => {
                 if cur_depth != 0 {
@@ -6408,15 +6792,45 @@ fn deep_scan_slice(
                     let inner = lex.consume_balanced_inner(b'[')?;
                     analyze_attr_meta_list(inner, true, 0, &mut pending);
                     // Attribute-macro arguments are arbitrary token trees that
-                    // may expand to items (`#[gen { fn target() {} }]`).
-                    deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
+                    // may expand to items (`#[gen { fn target() {} }]`), unless
+                    // already compiled out by a preceding `#[cfg(any())]`.
+                    if !cur_disabled && !pending.saw_disabled_cfg {
+                        deep_scan_slice(
+                            inner,
+                            fn_name,
+                            options,
+                            recursion + 1,
+                            occurrences,
+                            first_failure,
+                        )?;
+                    }
                 }
                 TokenKind::Punct(b'!') => {
                     let _ = lex.next_token()?;
                     if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                         let _ = lex.next_token()?;
                         let inner = lex.consume_balanced_inner(b'[')?;
-                        deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
+                        let mut inner_attr = InlineAttrSummary::default();
+                        analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
+                        if inner_attr.saw_disabled_cfg {
+                            if cur_depth > 0 {
+                                stack[cur_depth - 1].disabled = true;
+                            } else {
+                                root_disabled = true;
+                            }
+                        }
+                        let now_disabled =
+                            root_disabled || (cur_depth > 0 && stack[cur_depth - 1].disabled);
+                        if !now_disabled {
+                            deep_scan_slice(
+                                inner,
+                                fn_name,
+                                options,
+                                recursion + 1,
+                                occurrences,
+                                first_failure,
+                            )?;
+                        }
                     }
                 }
                 // e.g. `quote! { #name }` interpolation inside a macro body.
@@ -6426,12 +6840,40 @@ fn deep_scan_slice(
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'[')) {
                     let _ = lex.next_token()?;
                     let inner = lex.consume_balanced_inner(b'[')?;
-                    deep_scan_slice(inner, fn_name, options, recursion + 1, occurrences, first_failure)?;
+                    let mut inner_attr = InlineAttrSummary::default();
+                    analyze_attr_meta_list(inner, true, 0, &mut inner_attr);
+                    if inner_attr.saw_disabled_cfg {
+                        if cur_depth > 0 {
+                            stack[cur_depth - 1].disabled = true;
+                        } else {
+                            root_disabled = true;
+                        }
+                    }
+                    let now_disabled =
+                        root_disabled || (cur_depth > 0 && stack[cur_depth - 1].disabled);
+                    if !now_disabled {
+                        deep_scan_slice(
+                            inner,
+                            fn_name,
+                            options,
+                            recursion + 1,
+                            occurrences,
+                            first_failure,
+                        )?;
+                    }
                 }
             }
             TokenKind::Punct(b'{') => {
+                let block_disabled = cur_disabled || pending.saw_disabled_cfg;
                 pending.reset();
-                push(&mut stack, &mut cur_depth, DeepScope::Plain)?;
+                push(
+                    &mut stack,
+                    &mut cur_depth,
+                    DeepScopeEntry {
+                        kind: DeepScope::Plain,
+                        disabled: block_disabled,
+                    },
+                )?;
             }
             TokenKind::Punct(b'}') => {
                 if cur_depth == 0 {
@@ -6446,13 +6888,57 @@ fn deep_scan_slice(
                     let _ = lex.consume_balanced_inner(b'(')?;
                 }
             }
-            TokenKind::Ident("const" | "async" | "unsafe" | "default" | "safe" | "auto") => {}
+            TokenKind::Ident("async" | "unsafe" | "default" | "safe" | "auto") => {}
+            TokenKind::Ident("const") => {
+                if !matches!(
+                    lex.peek_token()?.kind,
+                    TokenKind::Ident("fn" | "unsafe" | "extern" | "async")
+                ) {
+                    let disabled = pending.saw_disabled_cfg;
+                    pending.reset();
+                    if !cur_disabled && disabled {
+                        skip_disabled_item_to_semicolon(&mut lex)?;
+                    }
+                }
+            }
             TokenKind::Ident("extern") => {
                 if matches!(lex.peek_token()?.kind, TokenKind::Literal) {
                     let _ = lex.next_token()?;
                 }
+                if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'{')) {
+                    let block_disabled = cur_disabled || pending.saw_disabled_cfg;
+                    let _ = lex.next_token()?;
+                    pending.reset();
+                    push(
+                        &mut stack,
+                        &mut cur_depth,
+                        DeepScopeEntry {
+                            kind: DeepScope::Plain,
+                            disabled: block_disabled,
+                        },
+                    )?;
+                }
+            }
+            TokenKind::Ident("mod") => {
+                let mod_disabled = cur_disabled || pending.saw_disabled_cfg;
+                pending.reset();
+                if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+                    let _ = lex.next_token()?;
+                    if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'{')) {
+                        let _ = lex.next_token()?;
+                        push(
+                            &mut stack,
+                            &mut cur_depth,
+                            DeepScopeEntry {
+                                kind: DeepScope::Plain,
+                                disabled: mod_disabled,
+                            },
+                        )?;
+                    }
+                }
             }
             TokenKind::Ident("impl") => {
+                let impl_disabled = cur_disabled || pending.saw_disabled_cfg;
                 pending.reset();
                 let mut is_generic = false;
                 if matches!(lex.peek_token()?.kind, TokenKind::Punct(b'<')) {
@@ -6461,37 +6947,56 @@ fn deep_scan_slice(
                     // Unparseable generic lists (e.g. `impl<#generics>` in
                     // `quote!`) are conservatively treated as generic.
                     is_generic = generic_params_contain_type_or_const(inner).unwrap_or(true);
-                    deep_scan_slice(
-                        inner,
-                        fn_name,
-                        options,
-                        recursion + 1,
-                        occurrences,
-                        first_failure,
-                    )?;
+                    if !impl_disabled {
+                        deep_scan_slice(
+                            inner,
+                            fn_name,
+                            options,
+                            recursion + 1,
+                            occurrences,
+                            first_failure,
+                        )?;
+                    }
                 }
                 if skip_header_to_brace_or_semicolon_scanning(
                     &mut lex,
                     fn_name,
                     options,
                     recursion,
+                    impl_disabled,
                     occurrences,
                     first_failure,
                 )? {
-                    push(&mut stack, &mut cur_depth, DeepScope::Impl { is_generic })?;
+                    push(
+                        &mut stack,
+                        &mut cur_depth,
+                        DeepScopeEntry {
+                            kind: DeepScope::Impl { is_generic },
+                            disabled: impl_disabled,
+                        },
+                    )?;
                 }
             }
             TokenKind::Ident("trait") => {
+                let trait_disabled = cur_disabled || pending.saw_disabled_cfg;
                 pending.reset();
                 if skip_header_to_brace_or_semicolon_scanning(
                     &mut lex,
                     fn_name,
                     options,
                     recursion,
+                    trait_disabled,
                     occurrences,
                     first_failure,
                 )? {
-                    push(&mut stack, &mut cur_depth, DeepScope::Trait)?;
+                    push(
+                        &mut stack,
+                        &mut cur_depth,
+                        DeepScopeEntry {
+                            kind: DeepScope::Trait,
+                            disabled: trait_disabled,
+                        },
+                    )?;
                 }
             }
             TokenKind::Ident("fn") => {
@@ -6516,13 +7021,14 @@ fn deep_scan_slice(
                     polymorphic |= params_contain_impl_trait(params)?;
                     params_slice = Some(params);
                 }
-                if fn_ident_matches(name, fn_name) {
+                if let Some(body) = peek_fn_body_inner(&lex)? {
+                    merge_leading_inner_attrs(body, &mut pending);
+                }
+                let fn_disabled = cur_disabled || pending.saw_disabled_cfg;
+                if !fn_disabled && fn_ident_matches(name, fn_name) {
                     *occurrences += 1;
-                    if let Some(body) = peek_fn_body_inner(&lex)? {
-                        merge_leading_inner_attrs(body, &mut pending);
-                    }
                     let enclosing = if cur_depth > 0 {
-                        stack[cur_depth - 1]
+                        stack[cur_depth - 1].kind
                     } else {
                         DeepScope::Plain
                     };
@@ -6533,27 +7039,52 @@ fn deep_scan_slice(
                     }
                 }
                 pending.reset();
-                // Recursively scan skipped generic defaults and parameter type
-                // expressions (e.g. `fn f(_: [u8; { fn target() {} 1 }])`).
-                if let Some(inner) = gen_slice {
-                    deep_scan_slice(
-                        inner,
-                        fn_name,
-                        options,
-                        recursion + 1,
-                        occurrences,
-                        first_failure,
-                    )?;
+                if fn_disabled {
+                    skip_disabled_fn_tail(&mut lex)?;
+                } else {
+                    // Recursively scan skipped generic defaults and parameter type
+                    // expressions (e.g. `fn f(_: [u8; { fn target() {} 1 }])`).
+                    if let Some(inner) = gen_slice {
+                        deep_scan_slice(
+                            inner,
+                            fn_name,
+                            options,
+                            recursion + 1,
+                            occurrences,
+                            first_failure,
+                        )?;
+                    }
+                    if let Some(params) = params_slice {
+                        deep_scan_slice(
+                            params,
+                            fn_name,
+                            options,
+                            recursion + 1,
+                            occurrences,
+                            first_failure,
+                        )?;
+                    }
                 }
-                if let Some(params) = params_slice {
-                    deep_scan_slice(
-                        params,
-                        fn_name,
-                        options,
-                        recursion + 1,
-                        occurrences,
-                        first_failure,
-                    )?;
+            }
+            TokenKind::Ident("static" | "use" | "type" | "let") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_item_to_semicolon(&mut lex)?;
+                }
+            }
+            TokenKind::Ident("struct" | "enum" | "union") => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_type_decl(&mut lex)?;
+                }
+            }
+            TokenKind::Ident(_) => {
+                let disabled = pending.saw_disabled_cfg;
+                pending.reset();
+                if !cur_disabled && disabled {
+                    skip_disabled_path_or_macro_item(&mut lex)?;
                 }
             }
             _ => pending.reset(),
@@ -6598,7 +7129,8 @@ fn merge_leading_inner_attrs(body_inner: &str, summary: &mut InlineAttrSummary) 
 /// Non-consuming lookahead from just after a function's parameter list to
 /// its body: skips `-> Ret` / `where` tails (consuming nested `(..)`, `[..]`,
 /// `<..>` groups) and returns the body's inner slice, or `None` on `;`, `}`,
-/// or end of input (lenient inside macro token trees).
+/// `)`, `]`, `=`, or end of input (preventing lookahead leaks across macro
+/// pattern boundaries such as `macro_rules! m { (fn target()) => { #![inline(never)] }; }`).
 fn peek_fn_body_inner<'a>(lex: &RustLexer<'a>) -> Result<Option<&'a str>, ()> {
     let mut look = RustLexer {
         src: lex.src,
@@ -6608,7 +7140,9 @@ fn peek_fn_body_inner<'a>(lex: &RustLexer<'a>) -> Result<Option<&'a str>, ()> {
     loop {
         let tok = look.next_token()?;
         match tok.kind {
-            TokenKind::Eof | TokenKind::Punct(b';' | b'}') => return Ok(None),
+            TokenKind::Eof | TokenKind::Punct(b';' | b'}' | b')' | b']' | b'=') => {
+                return Ok(None);
+            }
             TokenKind::Punct(b'{') => return look.consume_balanced_inner(b'{').map(Some),
             TokenKind::Punct(p @ (b'(' | b'[')) => {
                 let _ = look.consume_balanced_inner(p)?;
@@ -6617,6 +7151,122 @@ fn peek_fn_body_inner<'a>(lex: &RustLexer<'a>) -> Result<Option<&'a str>, ()> {
                 let _ = look.consume_angle_inner()?;
             }
             _ => {}
+        }
+    }
+}
+
+/// Skips a statically disabled (`#[cfg(any())]` / `#[cfg(false)]`) function's
+/// signature tail and `{ ... }` body (or `;`) without crossing enclosing
+/// delimiter boundaries (`}`, `)`, `]`, `=`).
+fn skip_disabled_fn_tail(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']' | b'=') => return Ok(()),
+            TokenKind::Punct(b';') => {
+                let _ = lex.next_token()?;
+                return Ok(());
+            }
+            TokenKind::Punct(b'{') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(b'{')?;
+                return Ok(());
+            }
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b'<') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_angle_inner()?;
+            }
+            _ => {
+                let _ = lex.next_token()?;
+            }
+        }
+    }
+}
+
+/// Leniently skips a statically disabled semicolon-terminated item (`const`,
+/// `static`, `use`, `type`, `let`) without crossing enclosing closing delimiters.
+fn skip_disabled_item_to_semicolon(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']') => return Ok(()),
+            TokenKind::Punct(b';') => {
+                let _ = lex.next_token()?;
+                return Ok(());
+            }
+            TokenKind::Punct(p @ (b'(' | b'[' | b'{')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            _ => {
+                let _ = lex.next_token()?;
+            }
+        }
+    }
+}
+
+/// Leniently skips a statically disabled `struct` / `enum` / `union` item
+/// without crossing enclosing closing delimiters.
+fn skip_disabled_type_decl(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::Eof | TokenKind::Punct(b'}' | b')' | b']') => return Ok(()),
+            TokenKind::Punct(b';') => {
+                let _ = lex.next_token()?;
+                return Ok(());
+            }
+            TokenKind::Punct(b'{') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(b'{')?;
+                return Ok(());
+            }
+            TokenKind::Punct(p @ (b'(' | b'[')) => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_balanced_inner(p)?;
+            }
+            TokenKind::Punct(b'<') => {
+                let _ = lex.next_token()?;
+                let _ = lex.consume_angle_inner()?;
+            }
+            _ => {
+                let _ = lex.next_token()?;
+            }
+        }
+    }
+}
+
+/// Leniently skips a statically disabled macro invocation (`m! { ... }`,
+/// `a::b!(...);`, `macro_rules! m { ... }`).
+fn skip_disabled_path_or_macro_item(lex: &mut RustLexer<'_>) -> Result<(), ()> {
+    loop {
+        match lex.peek_token()?.kind {
+            TokenKind::ColonColon => {
+                let _ = lex.next_token()?;
+                if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+                    let _ = lex.next_token()?;
+                } else {
+                    return Ok(());
+                }
+            }
+            TokenKind::Punct(b'!') => {
+                let _ = lex.next_token()?;
+                if matches!(lex.peek_token()?.kind, TokenKind::Ident(_)) {
+                    let _ = lex.next_token()?;
+                }
+                if let TokenKind::Punct(p @ (b'(' | b'[' | b'{')) = lex.peek_token()?.kind {
+                    let _ = lex.next_token()?;
+                    let _ = lex.consume_balanced_inner(p)?;
+                    if p != b'{'
+                        && matches!(lex.peek_token()?.kind, TokenKind::Punct(b';'))
+                    {
+                        let _ = lex.next_token()?;
+                    }
+                }
+                return Ok(());
+            }
+            _ => return Ok(()),
         }
     }
 }
@@ -6925,6 +7575,10 @@ pub enum CallBoundaryVerdict {
     /// An expected transitive caller (`expected_caller_counts[caller_index]`)
     /// has no body in `callees` (`ReachableCalleesCallSitesPreserved`).
     MissingExpectedCaller { caller_index: usize },
+    /// An expected transitive caller (`expected_caller_counts[caller_index]`)
+    /// is overridden by a [`TraitImplBinding`] on the caller or a linked
+    /// callee, allowing runtime dispatch to bypass the audited callee body.
+    ExpectedCallerTraitDispatched { caller_index: usize },
     /// A transitive caller body's `bb0`-reachable call-site count to the target
     /// differs from `expected_caller_counts[caller_index]`.
     CalleeReachableCallSiteCountMismatch {
@@ -7283,6 +7937,9 @@ fn verify_reachable_callees_call_sites_inner(
     let mut total_sites = 0usize;
     let mut total_reachable_blocks = 0usize;
     for (caller_index, &(caller_path, expected)) in expected_caller_counts.iter().enumerate() {
+        if check_traits && has_trait_impl_for_path(caller_trait_impls, callees, caller_path) {
+            return CallBoundaryVerdict::ExpectedCallerTraitDispatched { caller_index };
+        }
         let mut found = false;
         for body in callees.iter().filter(|c| c.def_path == caller_path) {
             found = true;
@@ -7317,8 +7974,9 @@ fn verify_reachable_callees_call_sites_inner(
 /// in `expected_caller_counts`, some body in `callees` has `def_path ==
 /// caller_path`, **every** such body has exactly `expected` `bb0`-reachable
 /// direct call sites to `target_path` (catching partial inlining or dead decoy
-/// calls *inside* linked helpers), and `target_path` is excluded from
-/// `callees` and all trait-dispatch tables.
+/// calls *inside* linked helpers), neither `target_path` nor any expected
+/// `caller_path` is overridden by a [`TraitImplBinding`] on the caller or any
+/// linked callee, and `target_path` is excluded from `callees`.
 ///
 /// Fails closed with [`CallBoundaryVerdict::ZeroExpectedCallSites`] on an
 /// empty expectation list or any `expected == 0` entry.
