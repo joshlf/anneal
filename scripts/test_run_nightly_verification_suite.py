@@ -566,8 +566,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         for key in MIR_PROMOTED_VARIANT_EVIDENCE:
             self.assertEqual(statuses[key], "proved_corresponding", key)
         # Each cited module (and each cross-root kernel bridge closing a `Bundle` over `LM`)
-        # exists in this tree, contains no `sorry` / `axiom` / `native_decide` outside nested
-        # Lean comments, and declares concrete correspondence theorems in comment-stripped code.
+        # exists in this tree, lexes cleanly, contains no `sorry` / `admit` / `native_decide` /
+        # `axiom` declaration outside Lean comments and string literals, and declares concrete
+        # correspondence theorems in that stripped code.
         proof_code: dict[str, str] = {}
         axiom_decl_re = re.compile(
             r"(?:^|\n)\s*(?:(?:private|protected|local|scoped|noncomputable|unsafe)\s+)*axiom\b"
@@ -580,6 +581,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             self.assertGreaterEqual(len(rels), 2, family)
             self.assertTrue(any(rel.endswith("MR.lean") for rel in rels), family)
             self.assertTrue(any(rel.endswith("LM.lean") for rel in rels), family)
+
         def check_clean_lean_code(rel: str) -> str:
             path = REPO_ROOT / rel
             self.assertTrue(path.is_file(), rel)
@@ -637,7 +639,12 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         # Float-cast correspondence modules cited in `MIR_AST_CATEGORIES` exist, pass hygiene,
         # and carry their fail-closed MiniRust boundary and direct Miri step-simulation theorems.
         float_umbrella = check_clean_lean_code("lean-miri/lean/LeanMiriSpec/FloatCastLM.lean")
-        self.assertIn("LeanMiriSpec.FloatCastLM.RealStepDirect", float_umbrella)
+        # The umbrella must *import* the direct-step submodule on its own line: a bare mention
+        # in code, or a longer module name sharing the prefix, does not re-export its theorems.
+        self.assertRegex(
+            float_umbrella,
+            r"(?m)^(?:public[ \t]+)?import[ \t]+LeanMiriSpec\.FloatCastLM\.RealStepDirect[ \t]*$",
+        )
         for rel, required_theorems in (
             (
                 "minirust/lean/MiniRustSpec/FloatCastMR.lean",
