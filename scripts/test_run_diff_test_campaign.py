@@ -4339,6 +4339,180 @@ class QuarantineKeyAndCoverageTest(unittest.TestCase):
                 self.assertTrue(any(t in token for t in campaign.ALL_MIRI_MUTATOR_TOKENS))
                 self.assertEqual(campaign.infer_finding_cause(finding, set()), mutator)
 
+    # A candidate as `VTableAndFnPtrMutator` and `ClosureAndAddrEqMutator` shape it:
+    # the last `pub fn` helper of the preamble, then the private items the mutators
+    # put ahead of the candidate function (which calls that preamble helper, as the
+    # `panic_multi_callee_unwind_*` corpus seeds do), then the candidate function with
+    # a `PerturbAst` prefix driver call ahead of the seed body and a `Pass` driver
+    # call after it.
+    INDIRECT_MUTANT_LINES = (
+        "pub fn helper_unwind_leaf(base: u32, delta: u32) -> u32 {",  # 1
+        "    base + delta",  # 2
+        "}",  # 3
+        "pub fn helper_unwind_guarded(base: u32, delta: u32) -> u32 {",  # 4
+        "    helper_unwind_leaf(base, delta)",  # 5
+        "}",  # 6
+        "#[inline(never)]",  # 7
+        "fn __anneal_fnptr_callee_7(__vt_v: u32) -> u32 {",  # 8
+        "    let __vt_ovf_sum: u32 = __vt_v + 3u32;",  # 9
+        "    __vt_ovf_sum",  # 10
+        "}",  # 11
+        "#[inline(never)]",  # 12
+        "fn __anneal_vt_driver_7(__vt_seed: u32, __vt_bias: u32) -> u32 {",  # 13
+        "    let __vt_fp: fn(u32) -> u32 = __anneal_fnptr_callee_7;",  # 14
+        "    __vt_fp(__vt_seed ^ __vt_bias)",  # 15
+        "}",  # 16
+        "trait __AnnealVtableTrait9 {",  # 17
+        "    fn eval_vt(&self, x: u32) -> u32;",  # 18
+        "}",  # 19
+        "struct __AnnealVtableReceiver9 {",  # 20
+        "    bias: u32,",  # 21
+        "}",  # 22
+        "impl __AnnealVtableTrait9 for __AnnealVtableReceiver9 {",  # 23
+        "    fn eval_vt(&self, x: u32) -> u32 {",  # 24
+        "        self.bias + x",  # 25
+        "    }",  # 26
+        "}",  # 27
+        "#[inline(never)]",  # 28
+        "fn __anneal_wide_slice_addr_eq_5(__clos_p: *const [u32], __clos_q: *const [u32]) -> bool {",  # 29
+        "    (__clos_p as *const ()) == (__clos_q as *const ())",  # 30
+        "}",  # 31
+        "#[inline(never)]",  # 32
+        "fn __anneal_clos_driver_5(__clos_seed: u32, __clos_bias: u32) -> u32 {",  # 33
+        "    let __clos_oob_arr: [u32; 3] = [__clos_seed, __clos_bias, 7u32];",  # 34
+        "    let __clos_oob_idx: usize = 3usize + ((__clos_seed & 1u32) as usize);",  # 35
+        "    __clos_oob_arr[__clos_oob_idx]",  # 36
+        "}",  # 37
+        "pub fn panic_unwind_seed__b0_c0() -> u32 {",  # 38
+        "    let __miri_clos_5: u32 = __anneal_clos_driver_5(7u32, 6u32);",  # 39
+        "    let base: u32 = u32::MAX;",  # 40
+        "    let __tail___miri_clos_5: u32 = helper_unwind_guarded(base, 1u32);",  # 41
+        "    let __tail___miri_vt_7: u32 = __tail___miri_clos_5 ^ (__miri_clos_5 as u32);",  # 42
+        "    let __miri_vt_7: u32 = __anneal_vt_driver_7((base as u32) & 0xFFFFu32, 5u32);",  # 43
+        "    __tail___miri_vt_7 ^ (__miri_vt_7 as u32)",  # 44
+        "}",  # 45
+    )
+
+    def _indirect_mutant_finding(self, line_no: int, mutators: list[str]) -> dict[str, object]:
+        return {
+            "seed_name": "panic_unwind_seed",
+            "fn_name": "panic_unwind_seed__b0_c0",
+            "applied_mutators": mutators,
+            "mutant_source": "\n".join(self.INDIRECT_MUTANT_LINES) + "\n",
+            "miri_pos": f"src/lib.rs:{line_no}:5",
+        }
+
+    def test_indirect_call_driver_item_faults_attribute_to_their_mutator(self) -> None:
+        """A fault inside a private item that `VTableAndFnPtrMutator` or
+        `ClosureAndAddrEqMutator` put ahead of the candidate function is attributed by
+        the tokens on its own line, or to the mutator whose item encloses it, even
+        though the candidate function calls the preamble helper that precedes those
+        items; a fault inside that preamble helper still maps to its call site."""
+        chain = ["ClosureAndAddrEqMutator", "VTableAndFnPtrMutator"]
+        lines = self.INDIRECT_MUTANT_LINES
+        for line_no, mutator in (
+            (9, "VTableAndFnPtrMutator"),  # overflow inside the reified callee
+            (15, "VTableAndFnPtrMutator"),  # indirect call in the driver
+            (36, "ClosureAndAddrEqMutator"),  # out-of-bounds index in the driver
+            (30, "ClosureAndAddrEqMutator"),  # wide-slice address helper
+            (39, "ClosureAndAddrEqMutator"),  # `PerturbAst` prefix driver call
+            (43, "VTableAndFnPtrMutator"),  # `Pass` driver call after the seed body
+        ):
+            for known in (set(), {"panic_unwind_seed"}):
+                with self.subTest(line_no=line_no, known=sorted(known)):
+                    finding = self._indirect_mutant_finding(line_no, chain)
+                    self.assertEqual(
+                        campaign.extract_fault_line_text(finding), lines[line_no - 1]
+                    )
+                    self.assertEqual(campaign.infer_finding_cause(finding, known), mutator)
+                    fp, keys = campaign.quarantine_match_keys_for_miri_finding(
+                        {**finding, "divergence_class": "false_positive_ub", "anneal_lean_tag": "MirDiffTag.ub"},
+                        known,
+                    )
+                    self.assertTrue(fp.startswith(f"{mutator}:false_positive_ub:"), fp)
+                    self.assertIn(mutator, keys)
+                    self.assertEqual(campaign.quarantine_entry_harness(fp), "miri")
+
+        # A trait `impl` method body carries no mutator token of its own: the fault
+        # stays on its line (it is not mapped into the candidate function), and the
+        # finding falls back to the candidate's first mutator.
+        finding = self._indirect_mutant_finding(25, ["VTableAndFnPtrMutator"])
+        self.assertEqual(campaign.extract_fault_line_text(finding), lines[24])
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "VTableAndFnPtrMutator")
+
+        # A fault inside the preamble helper itself is still the seed's call of it.
+        for line_no in (2, 5):
+            with self.subTest(preamble_line=line_no):
+                finding = self._indirect_mutant_finding(line_no, chain)
+                self.assertEqual(campaign.extract_fault_line_text(finding), lines[40])
+
+    def test_perturb_ast_prefix_probe_keeps_seed_fault_attribution(self) -> None:
+        """A `PerturbAst` pass of an indirect-call mutator runs its driver as the
+        first statement of an already-faulting seed. The seed's own fault after that
+        prefix probe is the seed's when the seed is a known corpus bug, and otherwise
+        the mutator's whose driver ran before it (never a later pass's)."""
+        src_lines = (
+            "#[inline(never)]",  # 1
+            "fn __anneal_vt_driver_3(__vt_seed: u32, __vt_bias: u32) -> u32 {",  # 2
+            "    __vt_seed ^ __vt_bias",  # 3
+            "}",  # 4
+            "pub fn ub_deref_null_ptr_write__b0_c4() {",  # 5
+            "    let __miri_vt_3: u32 = __anneal_vt_driver_3(3u32, 5u32);",  # 6
+            "    let mut __miri_sink: u32 = __miri_vt_3;",  # 7
+            "    let p: *mut u32 = 0usize as *mut u32;",  # 8
+            "    unsafe {",  # 9
+            "        *p = 42;",  # 10
+            "    }",  # 11
+            "    let __miri_arith_8: u32 = 1u32;",  # 12
+            "}",  # 13
+        )
+        finding = {
+            "seed_name": "ub_deref_null_ptr_write",
+            "fn_name": "ub_deref_null_ptr_write__b0_c4",
+            "applied_mutators": ["VTableAndFnPtrMutator", "ArithmeticCastMutator"],
+            "mutant_source": "\n".join(src_lines) + "\n",
+            "miri_pos": "src/lib.rs:10:9",
+        }
+        self.assertEqual(campaign.extract_fault_line_text(finding), src_lines[9])
+        self.assertEqual(
+            campaign.infer_finding_cause(finding, {"ub_deref_null_ptr_write"}),
+            "ub_deref_null_ptr_write",
+        )
+        self.assertEqual(campaign.infer_finding_cause(finding, set()), "VTableAndFnPtrMutator")
+
+    def test_indirect_mutators_classify_and_key_findings_by_harness(self) -> None:
+        for token, harness in {
+            "VTableAndFnPtrMutator": "miri",
+            "VTableAndFnPtrMutator:false_positive_ub": "miri",
+            "ClosureAndAddrEqMutator": "miri",
+            "ClosureAndAddrEqMutator:panic_site_mismatch:MirDiffTag.panic": "miri",
+            "IndirectDispatchOutliner": "itree",
+            "IndirectDispatchOutliner:itree_outcome_mismatch": "itree",
+        }.items():
+            with self.subTest(token=token):
+                self.assertEqual(campaign.quarantine_entry_harness(token), harness)
+        for name in ("VTableAndFnPtrMutator", "ClosureAndAddrEqMutator"):
+            self.assertIn(name, campaign.MIRI_MUTATOR_NAMES)
+            self.assertNotIn(name, campaign.ITREE_MUTATOR_NAMES)
+        self.assertIn("IndirectDispatchOutliner", campaign.ITREE_MUTATOR_NAMES)
+        self.assertNotIn("IndirectDispatchOutliner", campaign.MIRI_MUTATOR_NAMES)
+        fp, keys = campaign.quarantine_match_keys_for_itree_finding(
+            {
+                "fn_name": "b0_c1__kernel_step",
+                "seed_index": 2,
+                "applied_mutators": ["IndirectDispatchOutliner", "CallBoundaryOutliner"],
+                "diag_tag": "outcome_mismatch",
+            }
+        )
+        self.assertEqual(
+            fp, "IndirectDispatchOutliner:itree_outcome_mismatch:TraceReplayDiag.outcome_mismatch"
+        )
+        self.assertLessEqual(
+            {"IndirectDispatchOutliner", "itree_seed_2", "IndirectDispatchOutliner:outcome_mismatch"},
+            keys,
+        )
+        self.assertTrue(all(campaign.quarantine_entry_harness(k) == "itree" for k in keys))
+
 
 class GateProfileAndModeTest(unittest.TestCase):
     """`nightly` enables both gates by default (with `--no-*` opt-outs); other

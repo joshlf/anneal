@@ -3990,6 +3990,17 @@ CLOSURE_ADDR_EQ_MUTATOR_TOKENS = (
     "__clos_",
 )
 
+# Prefixes of the headers of the private items that `VTableAndFnPtrMutator` and
+# `ClosureAndAddrEqMutator` put ahead of the candidate function. A header line that
+# starts with one of these and carries one of the two mutators' tokens opens such an
+# item (`fn __anneal_vt_driver_7(`, `impl __AnnealVtableTrait7 for ...`,
+# `mod __anneal_clos_7 {`), never a `MIRI_CORPUS_MODULE_PREAMBLE` helper.
+MIRI_MUTATOR_ITEM_HEADER_PREFIXES = ("fn ", "impl ", "trait ", "struct ", "mod ")
+MIRI_MUTATOR_ITEM_TOKENS = (
+    *VTABLE_FNPTR_MUTATOR_TOKENS,
+    *CLOSURE_ADDR_EQ_MUTATOR_TOKENS,
+)
+
 ALL_MIRI_MUTATOR_TOKENS = (
     *RAW_PTR_OFFSET_MUTATOR_TOKENS,
     *TREE_BORROWS_MUTATOR_TOKENS,
@@ -4079,13 +4090,23 @@ def _resolve_preamble_fault_line_no(
 ) -> int:
     """Maps a fault line inside a `MIRI_CORPUS_MODULE_PREAMBLE` helper or macro
     (`line_no < cand_fn_start_line`) to its call site inside the candidate function
-    when the candidate calls that helper or macro."""
+    when the candidate calls that helper or macro.
+
+    A fault line inside a private item that an indirect-call mutator put ahead of
+    the candidate function (a driver `fn`, its callee, or a trait `impl` method) is
+    not a preamble helper's: it stays where it is, so that the mutator tokens on the
+    line itself attribute it, however the candidate function calls the last
+    `pub fn` helper of the preamble."""
     if line_no >= cand_fn_start_line:
         return line_no
     call_targets: tuple[str, ...] = ()
     always_faults = False
     for idx in range(line_no - 1, -1, -1):
         stripped = src_lines[idx].lstrip()
+        if stripped.startswith(MIRI_MUTATOR_ITEM_HEADER_PREFIXES) and any(
+            tok in stripped for tok in MIRI_MUTATOR_ITEM_TOKENS
+        ):
+            return line_no
         if stripped.startswith("macro_rules! write_bytes"):
             call_targets = ("write_bytes!(",)
             break

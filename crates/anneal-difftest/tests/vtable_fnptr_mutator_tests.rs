@@ -47,9 +47,9 @@ use anneal_difftest::mutators_itree::{
 };
 use anneal_difftest::mutators_miri::{
     ClosureAndAddrEqMutator, DetRng, GeneratedMiriCandidate, MIRI_CORPUS_CRATE_HEADER,
-    MiriAstMutator, MutationMode, RecordedMutationStep, TreeBorrowsRetagInterleaver,
-    VTableAndFnPtrMutator, build_standalone_candidate_source, generate_miri_corpus_batch,
-    load_miri_diff_corpus_seeds, miri_candidate_replay_is_faithful,
+    MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MutationMode, RecordedMutationStep,
+    TreeBorrowsRetagInterleaver, VTableAndFnPtrMutator, build_standalone_candidate_source,
+    generate_miri_corpus_batch, load_miri_diff_corpus_seeds, miri_candidate_replay_is_faithful,
     reconstruct_miri_mutation_steps, replay_miri_mutation_steps,
 };
 use cargo_anneal::{ComparisonVerdict, DivergenceKind, MiriOutcome};
@@ -766,13 +766,15 @@ fn tb_stacked_miri_candidates(
     out
 }
 
-/// Real faulting (`panic_*` / `ub_*`) corpus seeds mutated under
-/// `MutationMode::PerturbAst`.
+/// Faulting seeds, named `panic_*` / `ub_*` like the corpus seeds on which the
+/// scheduler runs pass 0 as `PerturbAst` (the indirect-call mutators recognize
+/// an already-faulting seed by that prefix of its entry function's name),
+/// mutated under `MutationMode::PerturbAst`.
 ///
 /// The `VTableAndFnPtrMutator` cases deliberately reuse the PRNG seeds of
 /// `dyn_dispatch` and `closure_fn_ptr` to prove that `PerturbAst` never emits
 /// a conservative-UB template ahead of the seed's own fault, and
-/// `perturb_clos_unit_ub` exercises the `()` return-type prefix-sink path.
+/// `ub_perturb_clos_unit` exercises the `()` return-type prefix-sink path.
 fn perturb_fault_seed_miri_candidates(
     first_id: usize,
 ) -> Vec<(&'static MiriTemplate, GeneratedMiriCandidate)> {
@@ -787,36 +789,36 @@ fn perturb_fault_seed_miri_candidates(
     };
     let cases: [(&str, &str, &dyn MiriAstMutator, u64, &'static MiriTemplate); 5] = [
         (
-            "perturb_vt_panic",
-            "pub fn perturb_vt_panic() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            "panic_perturb_vt",
+            "pub fn panic_perturb_vt() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
             &VTableAndFnPtrMutator,
             seed_of("dyn_dispatch"),
             &PERTURB_FAULT_TEMPLATES[0],
         ),
         (
-            "perturb_clos_panic",
-            "pub fn perturb_clos_panic() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
+            "panic_perturb_clos",
+            "pub fn panic_perturb_clos() -> u32 {\n    let x: u32 = u32::MAX;\n    let y: u32 = 1;\n    x + y\n}\n",
             &ClosureAndAddrEqMutator,
             seed_of("closure_by_unique_ref"),
             &PERTURB_FAULT_TEMPLATES[0],
         ),
         (
-            "perturb_vt_ub",
-            "pub fn perturb_vt_ub() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
+            "ub_perturb_vt",
+            "pub fn ub_perturb_vt() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
             &VTableAndFnPtrMutator,
             seed_of("closure_fn_ptr"),
             &PERTURB_FAULT_TEMPLATES[1],
         ),
         (
-            "perturb_clos_ub",
-            "pub fn perturb_clos_ub() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
+            "ub_perturb_clos",
+            "pub fn ub_perturb_clos() -> u32 {\n    unsafe { unchecked_add(u32::MAX, 1u32) }\n}\n",
             &ClosureAndAddrEqMutator,
             seed_of("wide_slices"),
             &PERTURB_FAULT_TEMPLATES[1],
         ),
         (
-            "perturb_clos_unit_ub",
-            "pub fn perturb_clos_unit_ub() {\n    let p: *mut u32 = 0usize as *mut u32;\n    unsafe {\n        *p = 42;\n    }\n}\n",
+            "ub_perturb_clos_unit",
+            "pub fn ub_perturb_clos_unit() {\n    let p: *mut u32 = 0usize as *mut u32;\n    unsafe {\n        *p = 42;\n    }\n}\n",
             &ClosureAndAddrEqMutator,
             seed_of("closure_by_shared_ref"),
             &PERTURB_FAULT_TEMPLATES[1],
@@ -1547,9 +1549,9 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
         } else {
             "__anneal_clos_driver_"
         };
-        let fault_marker = if cand.fn_name.ends_with("_panic") {
+        let fault_marker = if cand.fn_name.starts_with("panic_") {
             "x + y"
-        } else if cand.fn_name.ends_with("_unit_ub") {
+        } else if cand.fn_name.ends_with("_unit") {
             "*p = 42"
         } else {
             "unchecked_add"
@@ -1565,7 +1567,7 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
             "`{}` must place PerturbAst driver call before fault:\n{entry_body}",
             cand.fn_name
         );
-        if cand.fn_name.ends_with("_unit_ub") {
+        if cand.fn_name.ends_with("_unit") {
             let sink_pos = entry_body.find("let mut __miri_sink: u32 =").unwrap_or_else(|| {
                 panic!("`{}` missing unit-return sink:\n{entry_body}", cand.fn_name)
             });
@@ -1583,6 +1585,193 @@ fn tb_stacked_and_perturb_fault_miri_candidates_place_probes_and_compile() {
                 );
             }
         }
+    }
+}
+
+/// One `PerturbAst` pass on `base` (whose entry function is `fn_name`) for
+/// every `Pass` template of `singles`, run with that template's mutator and
+/// PRNG seed. Returns the mutated sources after checking that each one:
+/// - is deterministic and parses;
+/// - adds exactly one driver call to the entry function;
+/// - on an already-faulting (`panic_*` / `ub_*`) seed, runs that call as the
+///   entry function's first statement (ahead of the seed's own fault) and
+///   carries no conservative-UB (`dyn Trait` / closure-pointer) template;
+/// - on any other seed, is byte for byte the `Pass` mutant (every template,
+///   appended after the seed body), so `dyn_dispatch` stays reachable there.
+fn checked_perturb_ast_sources(
+    base: &syn::File,
+    fn_name: &str,
+    singles: &[(&'static MiriTemplate, GeneratedMiriCandidate)],
+) -> Vec<String> {
+    let seed_faults = fn_name.starts_with("panic_") || fn_name.starts_with("ub_");
+    let entry_header = format!("pub fn {fn_name}(");
+    let mut out = Vec::new();
+    for (template, single) in singles.iter().filter(|(t, _)| t.mode == MutationMode::Pass) {
+        let is_vt = single.applied_mutators[0] == "VTableAndFnPtrMutator";
+        let mutator: &dyn MiriAstMutator = if is_vt {
+            &VTableAndFnPtrMutator
+        } else {
+            &ClosureAndAddrEqMutator
+        };
+        let mutate = |mode: MutationMode| -> String {
+            let mut file = base.clone();
+            let mut rng = DetRng::new(single.seed_u64);
+            let mut locals = Vec::new();
+            mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals);
+            prettyplease::unparse(&file)
+        };
+        let perturbed = mutate(MutationMode::PerturbAst);
+        assert_eq!(
+            perturbed,
+            mutate(MutationMode::PerturbAst),
+            "`{}` PerturbAst is not deterministic on `{fn_name}`",
+            mutator.name()
+        );
+        assert!(
+            syn::parse_file(&perturbed).is_ok(),
+            "`{}` PerturbAst on `{fn_name}` does not parse:\n{perturbed}",
+            mutator.name()
+        );
+        let entry = perturbed
+            .split_once(entry_header.as_str())
+            .unwrap_or_else(|| panic!("`{fn_name}` missing entry header:\n{perturbed}"))
+            .1;
+        let (driver, probe_let) = if is_vt {
+            ("__anneal_vt_driver_", "let __miri_vt_")
+        } else {
+            ("__anneal_clos_driver_", "let __miri_clos_")
+        };
+        assert_eq!(
+            entry.matches(driver).count(),
+            1,
+            "`{}` PerturbAst must add one driver call to `{fn_name}`:\n{perturbed}",
+            mutator.name()
+        );
+        if seed_faults {
+            let body = entry
+                .split_once('{')
+                .unwrap_or_else(|| panic!("`{fn_name}` missing entry body:\n{perturbed}"))
+                .1
+                .trim_start();
+            assert!(
+                body.starts_with(probe_let),
+                "`{}` PerturbAst must run its driver ahead of faulting `{fn_name}`:\n{perturbed}",
+                mutator.name()
+            );
+            assert!(
+                !perturbed.contains("__AnnealVtable") && !perturbed.contains("__vt_cfp"),
+                "`{}` PerturbAst emitted a conservative-UB template ahead of faulting \
+                 `{fn_name}` (template seed `{}`):\n{perturbed}",
+                mutator.name(),
+                template.label
+            );
+        } else {
+            assert_eq!(
+                perturbed,
+                mutate(MutationMode::Pass),
+                "`{}` PerturbAst must equal Pass on non-faulting `{fn_name}` (template `{}`)",
+                mutator.name(),
+                template.label
+            );
+        }
+        out.push(perturbed);
+    }
+    out
+}
+
+/// `PerturbAst` passes of both indirect-call mutators on EVERY corpus seed
+/// (`load_miri_diff_corpus_seeds`), and on the closed, renamed seed ASTs that
+/// the scheduler mutates: an already-faulting (`panic_*` / `ub_*`) seed gets a
+/// 100%-`Agree` prefix driver ahead of its fault, every other seed keeps the
+/// whole `Pass` template set (including `&T as &dyn Trait` dispatch) after its
+/// body, and the mutants of the closed seeds compile as one crate.
+#[test]
+fn perturb_ast_indirect_passes_place_probes_on_every_corpus_seed() {
+    let seeds = load_miri_diff_corpus_seeds();
+    let seed_refs: Vec<&str> = seeds.iter().map(|s| s.fn_source.as_str()).collect();
+    let singles = all_miri_template_candidates();
+    let n_pass = singles
+        .iter()
+        .filter(|(t, _)| t.mode == MutationMode::Pass)
+        .count();
+    assert!(n_pass >= 2, "expected `Pass` templates of both mutators");
+
+    // 1. Every corpus seed, exactly as `load_miri_diff_corpus_seeds` returns it.
+    let mut faulting = 0usize;
+    let mut live = 0usize;
+    let mut dyn_on_live = 0usize;
+    for seed in &seeds {
+        let base = syn::parse_file(&seed.fn_source)
+            .unwrap_or_else(|e| panic!("corpus seed `{}` does not parse: {e}", seed.name));
+        let sources = checked_perturb_ast_sources(&base, &seed.name, &singles);
+        assert_eq!(sources.len(), n_pass);
+        if seed.name.starts_with("panic_") || seed.name.starts_with("ub_") {
+            faulting += 1;
+        } else {
+            live += 1;
+            dyn_on_live += sources
+                .iter()
+                .filter(|src| src.contains("as &dyn __AnnealVtableTrait"))
+                .count();
+        }
+    }
+    assert!(
+        faulting >= 8 && live >= 8,
+        "corpus must mix faulting ({faulting}) and non-faulting ({live}) seeds"
+    );
+    // Every non-faulting seed still reaches `&T as &dyn Trait` dispatch under
+    // `PerturbAst` (from the `dyn_dispatch` template's PRNG seed).
+    assert!(
+        dyn_on_live >= live,
+        "`PerturbAst` reached `dyn Trait` dispatch on only {dyn_on_live} of {live} live seeds"
+    );
+
+    // 2. The closed, renamed seed ASTs that one scheduled batch mutates (one
+    //    per seed it draws): the same checks, and the mutants (one template per
+    //    seed, rotating) compile together, one module per candidate.
+    let mut closed: BTreeMap<usize, (syn::File, String)> = BTreeMap::new();
+    for cand in generate_miri_corpus_batch(1024, 0x00A2_5EED_2026, 0) {
+        if closed.contains_key(&cand.seed_index) {
+            continue;
+        }
+        let Some((base, _steps)) = reconstruct_miri_mutation_steps(&cand, &seed_refs) else {
+            continue;
+        };
+        let entry_header = format!("pub fn {}(", cand.fn_name);
+        if !cand.fn_name.starts_with(&cand.seed_name)
+            || !prettyplease::unparse(&base).contains(&entry_header)
+        {
+            continue;
+        }
+        closed.insert(cand.seed_index, (base, cand.fn_name.clone()));
+    }
+    let mut closed_faulting = 0usize;
+    let mut closed_live = 0usize;
+    let mut combined = String::from(MIRI_CORPUS_CRATE_HEADER);
+    let mut modules = 0usize;
+    for (seed_index, (base, fn_name)) in &closed {
+        let sources = checked_perturb_ast_sources(base, fn_name, &singles);
+        assert_eq!(sources.len(), n_pass);
+        if fn_name.starts_with("panic_") || fn_name.starts_with("ub_") {
+            closed_faulting += 1;
+        } else {
+            closed_live += 1;
+        }
+        let k = seed_index % n_pass;
+        combined.push_str(&format!(
+            "pub mod s{seed_index}_t{k} {{\n{MIRI_CORPUS_MODULE_PREAMBLE}\n{}\n}}\n",
+            sources[k]
+        ));
+        modules += 1;
+    }
+    assert!(
+        closed_faulting >= 8 && closed_live >= 8,
+        "scheduled batch drew only {closed_faulting} faulting and {closed_live} non-faulting seeds"
+    );
+    if let Err(stderr) = compile_at_opt_level("perturb_all_seeds", "0", &combined) {
+        panic!(
+            "`PerturbAst` mutants of {modules} closed corpus seeds failed to compile:\n{stderr}"
+        );
     }
 }
 

@@ -3240,6 +3240,25 @@ impl<'a> EvalRun<'a> {
                 .rev()
                 .find_map(|methods| methods.get(&inherent_key).copied())
             {
+                // The evaluator records `&dyn Trait` only at the coercion
+                // sites it sees (a typed `let`, parameter, field, or return
+                // value, and an `as` cast). A reference that an `if` / `match`
+                // arm or an array element unsizes implicitly reaches here
+                // without `dyn_trait`, where native Rust dispatches through
+                // the vtable to the trait `impl`. When a trait `impl` of the
+                // receiver's type also defines this method, the inherent
+                // `impl` is therefore not known to be the callee.
+                let trait_also_defines = frame.local_methods.iter().any(|methods| {
+                    methods
+                        .keys()
+                        .any(|(s, tr, mn)| s == ty_name && tr.is_some() && mn == &method_name)
+                });
+                if trait_also_defines {
+                    return eval_unsupported(format!(
+                        "method `{}` defined by both an inherent and a trait `impl`",
+                        mc.method
+                    ));
+                }
                 Some(m)
             } else {
                 let mut found: Option<&'a syn::ImplItemFn> = None;
@@ -5547,6 +5566,20 @@ mod tests {
                 let both = Both { v: a };
                 let left: &dyn Left = &both;
                 (*left).pick() ^ b
+            }",
+            // An `else` branch that is unsized to `&dyn Left` implicitly (to
+            // the type of the `if` branch) carries no trait-object marker, so
+            // `left.pick()` must fail closed rather than dispatch to the
+            // inherent `impl` (native Rust calls `<Both as Left>::pick`).
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
             }",
             // A raw pointer captured in one loop iteration dangles in the next
             // iteration, where native Rust reuses the same stack slot for `y`.

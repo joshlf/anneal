@@ -5387,8 +5387,9 @@ fn splice_items_and_inject_probe(
 }
 
 /// Like [`splice_items_and_inject_probe`], but injects `call_stmts` at the
-/// start of the entry function (`PerturbAst` on faulting seeds) so the driver
-/// executes before the seed's own panic or UB.
+/// start of the entry function (`PerturbAst` on faulting seeds, see
+/// [`entry_fn_is_faulting_seed`]) so the driver executes before the seed's own
+/// panic or UB.
 fn splice_items_and_inject_prefix_probe(
     file: &mut File,
     target_idx: usize,
@@ -5401,6 +5402,21 @@ fn splice_items_and_inject_prefix_probe(
     if let Some(Item::Fn(func)) = file.items.get_mut(entry_idx) {
         inject_prefix_probe(func, call_stmts, probe_ident);
     }
+}
+
+/// Whether `func` is the entry function of an already-faulting (`panic_*` /
+/// `ub_*`) seed: the name test with which [`generate_miri_batch`] decides that
+/// a seed's first pass runs as `PerturbAst` (a candidate's entry function is
+/// named `<seed name>__<batch>_c<id>`).
+///
+/// A `PerturbAst` pass of an indirect-call mutator on such a seed must run its
+/// driver ahead of the seed's own fault (a probe appended after the fault is
+/// dead code) and must not fault before it, so it injects a prefix probe that
+/// never carries a conservative-UB template. On any other seed the end of the
+/// entry function is live, and `PerturbAst` behaves exactly like `Pass`.
+fn entry_fn_is_faulting_seed(func: &ItemFn) -> bool {
+    let name = func.sig.ident.to_string();
+    name.starts_with("panic_") || name.starts_with("ub_")
 }
 
 /// 6. Calls a fresh private driver function that exercises function pointers
@@ -5458,6 +5474,7 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
         for loc in &locals {
             locals_log.push((loc.name.clone(), loc.ty.clone()));
         }
+        let prefix_probe = mode == MutationMode::PerturbAst && entry_fn_is_faulting_seed(func);
         let tag = fresh_indirect_item_tag(file, rng.next_u64());
         let probe_ident = format_ident!("__miri_vt_{tag}");
         let driver_ident = format_ident!("__anneal_vt_driver_{tag}");
@@ -5515,7 +5532,15 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
         };
 
         let new_items: File = match mode {
-            MutationMode::Pass => match rng.gen_range(8) {
+            // `PerturbAst` shares the `Pass` templates (and the `gen_range(8)`
+            // draw, so both regimes consume the PRNG identically). On an
+            // already-faulting (`panic_*` / `ub_*`) seed its driver runs as a
+            // prefix ahead of the seed's fault, so there it emits only the
+            // 100%-`Agree` `fn_ptr_chain` driver and never faults early with
+            // the conservative `FalsePositiveUb` of `dyn_dispatch` or
+            // `closure_fn_ptr` before the seed's own panic or UB.
+            MutationMode::Pass | MutationMode::PerturbAst => match rng.gen_range(8) {
+                _ if prefix_probe => fn_ptr_chain(),
                 // Reify two distinct callees into `fn(u32) -> u32` pointers
                 // chosen at run time, coerce to `unsafe fn`, cast both pointers
                 // to `*const ()` (positive self-equality and negative equality
@@ -5634,16 +5659,6 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                     }
                 },
             },
-            // `PerturbAst` runs as pass 0 on already-faulting (`panic_*` /
-            // `ub_*`) seeds and injects its driver as a prefix before the
-            // seed's fault; emit only the 100%-`Agree` `fn_ptr_chain` driver so
-            // it never faults early with conservative `FalsePositiveUb` before
-            // the seed's own panic/UB. Preserve the `gen_range(8)` draw so PRNG
-            // consumption stays identical to `Pass`.
-            MutationMode::PerturbAst => {
-                let _ = rng.gen_range(8);
-                fn_ptr_chain()
-            }
             MutationMode::Panic => match rng.gen_range(2) {
                 // Overflow inside the callee, reached through the `unsafe fn`
                 // pointer, so the panic unwinds through an indirect call.
@@ -5719,7 +5734,7 @@ impl MiriAstMutator for VTableAndFnPtrMutator {
                 },
             },
         };
-        if mode == MutationMode::PerturbAst {
+        if prefix_probe {
             let call_stmts: Vec<Stmt> = syn::parse_quote! {
                 let #probe_ident: u32 = #driver_ident(#k0, #k1);
             };
@@ -5809,6 +5824,7 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
         for loc in &locals {
             locals_log.push((loc.name.clone(), loc.ty.clone()));
         }
+        let prefix_probe = mode == MutationMode::PerturbAst && entry_fn_is_faulting_seed(func);
         let tag = fresh_indirect_item_tag(file, rng.next_u64());
         let probe_ident = format_ident!("__miri_clos_{tag}");
         let driver_ident = format_ident!("__anneal_clos_driver_{tag}");
@@ -5951,7 +5967,7 @@ impl MiriAstMutator for ClosureAndAddrEqMutator {
         };
         let mut new_items = support_items.items;
         new_items.push(driver_item);
-        if mode == MutationMode::PerturbAst {
+        if prefix_probe {
             let call_stmts: Vec<Stmt> = syn::parse_quote! {
                 let #probe_ident: u32 = #driver_ident(#k0, #k1);
             };
@@ -9693,9 +9709,16 @@ pub fn indirect_seed() -> u32 {
 }
 ";
 
-    /// `INDIRECT_SEED` after one `mode` pass of `mutator` from PRNG seed `s`.
-    fn indirect_mutant(mutator: &dyn MiriAstMutator, mode: MutationMode, s: u64) -> String {
-        let mut file = syn::parse_file(INDIRECT_SEED).unwrap();
+    /// `INDIRECT_SEED`, with its entry function renamed to `fn_name`, after one
+    /// `mode` pass of `mutator` from PRNG seed `s`.
+    fn indirect_mutant(
+        fn_name: &str,
+        mutator: &dyn MiriAstMutator,
+        mode: MutationMode,
+        s: u64,
+    ) -> String {
+        let seed = INDIRECT_SEED.replace("indirect_seed", fn_name);
+        let mut file = syn::parse_file(&seed).unwrap();
         let mut rng = DetRng::new(s);
         let mut locals = Vec::new();
         mutator.mutate_with_mode(&mut file, &mut rng, mode, &mut locals);
@@ -9861,34 +9884,44 @@ pub fn indirect_seed() -> u32 {
         ];
         let vt: &dyn MiriAstMutator = &VTableAndFnPtrMutator;
         let clos: &dyn MiriAstMutator = &ClosureAndAddrEqMutator;
-        let cases: [(&dyn MiriAstMutator, MutationMode, &[Template]); 8] = [
-            (vt, Pass, VT_PASS),
-            // `PerturbAst` injects as a prefix before a faulting seed's body,
-            // so `VTableAndFnPtrMutator` emits only the 100%-`Agree`
+        let cases: [(&dyn MiriAstMutator, MutationMode, &str, &[Template]); 11] = [
+            (vt, Pass, "indirect_seed", VT_PASS),
+            // On a seed that does not already fault, the end of the entry
+            // function is live and `PerturbAst` is exactly `Pass`: every
+            // template (including `dyn_dispatch`), appended after the seed body
+            // and fed the seed's local.
+            (vt, PerturbAst, "indirect_seed", VT_PASS),
+            // On an already-faulting (`panic_*` / `ub_*`) seed, `PerturbAst`
+            // injects its driver as a prefix before the seed's body, so
+            // `VTableAndFnPtrMutator` emits only the 100%-`Agree`
             // `fn_ptr_chain` driver (never conservative-UB `dyn_dispatch` or
             // `closure_fn_ptr`).
-            (vt, PerturbAst, &VT_PASS[..1]),
-            (vt, Panic, VT_PANIC),
-            (vt, Ub, VT_UB),
-            (clos, Pass, CLOS_PASS),
-            (clos, PerturbAst, CLOS_PASS),
-            (clos, Panic, CLOS_PANIC),
-            (clos, Ub, CLOS_UB),
+            (vt, PerturbAst, "ub_indirect_seed", &VT_PASS[..1]),
+            (vt, PerturbAst, "panic_indirect_seed", &VT_PASS[..1]),
+            (vt, Panic, "indirect_seed", VT_PANIC),
+            (vt, Ub, "indirect_seed", VT_UB),
+            (clos, Pass, "indirect_seed", CLOS_PASS),
+            (clos, PerturbAst, "indirect_seed", CLOS_PASS),
+            (clos, PerturbAst, "ub_indirect_seed", CLOS_PASS),
+            (clos, Panic, "indirect_seed", CLOS_PANIC),
+            (clos, Ub, "indirect_seed", CLOS_UB),
         ];
         let mut compiled = 0usize;
-        for (mutator, mode, templates) in cases {
+        for (mutator, mode, fn_name, templates) in cases {
+            let prefix_probe = mode == PerturbAst && fn_name != "indirect_seed";
+            let entry_header = format!("pub fn {fn_name}");
             let mut seen: BTreeMap<&str, String> = BTreeMap::new();
             for s in 0..96u64 {
-                let fn_source = indirect_mutant(mutator, mode, s);
+                let fn_source = indirect_mutant(fn_name, mutator, mode, s);
                 assert_eq!(
                     fn_source,
-                    indirect_mutant(mutator, mode, s),
+                    indirect_mutant(fn_name, mutator, mode, s),
                     "`{}` must be deterministic",
                     mutator.name()
                 );
                 // The entry function gains only the driver call.
                 let entry = fn_source
-                    .split_once("pub fn indirect_seed")
+                    .split_once(entry_header.as_str())
                     .expect("entry function")
                     .1;
                 assert_eq!(
@@ -9896,12 +9929,21 @@ pub fn indirect_seed() -> u32 {
                     1,
                     "entry function must gain exactly one driver call:\n{fn_source}"
                 );
-                if mode == PerturbAst {
-                    let call_pos = entry.find("__anneal_").expect("driver call");
-                    let seed_pos = entry.find("let x: u32").expect("seed local");
-                    assert!(
-                        call_pos < seed_pos,
-                        "`{}` PerturbAst must place its driver call before the seed body:\n{fn_source}",
+                // The driver call precedes the seed body exactly when
+                // `PerturbAst` runs on an already-faulting seed.
+                let call_pos = entry.find("__anneal_").expect("driver call");
+                let seed_pos = entry.find("let x: u32").expect("seed local");
+                assert_eq!(
+                    call_pos < seed_pos,
+                    prefix_probe,
+                    "`{}` {mode:?} misplaced its driver call in `{fn_name}`:\n{fn_source}",
+                    mutator.name()
+                );
+                if mode == PerturbAst && !prefix_probe {
+                    assert_eq!(
+                        fn_source,
+                        indirect_mutant(fn_name, mutator, Pass, s),
+                        "`{}` PerturbAst must equal Pass on a seed that does not already fault",
                         mutator.name()
                     );
                 }
@@ -9936,7 +9978,7 @@ pub fn indirect_seed() -> u32 {
                 compiled += 1;
             }
         }
-        assert_eq!(compiled, 3 + 1 + 2 + 2 + 2 * 5 + 2 + 2);
+        assert_eq!(compiled, 2 * 3 + 2 + 2 + 2 + 3 * 5 + 2 + 2);
     }
 
     #[test]
