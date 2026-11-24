@@ -4975,5 +4975,164 @@ class GuardMutationEp2B1AdversarialTests(unittest.TestCase):
             self.assertIsNotNone(blocked_json["fatal_error"])
 
 
+class GuardMutationEp2A1AdversarialTests(unittest.TestCase):
+    """Pass A1 adversarial regressions for taxonomy parsing, Lean/Rust lexing, and the wildcard probe."""
+
+    RUST_REL = "crates/cargo-anneal/src/property_registry.rs"
+    LEAN_REL = "theory/Anneal/SpecBoundaryGuards.lean"
+
+    def _stage(self, root: Path, rel: str, old: str | None = None, new: str = "") -> None:
+        text = (ANNEAL_ROOT / rel).read_text(encoding="utf-8")
+        if old is not None:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [f.pattern for f in gmut.detect_postcondition_error_wildcards(source, language=language)]
+
+    def test_lean_raw_strings_cannot_smuggle_vacuous_arms_inside_fake_block_comments(self) -> None:
+        # In Lean 4, `#"a"/-"#` is a single raw string literal; a scanner that only knew
+        # `r#"..."#` opened a fake `/-` comment across `| .ub => True`!
+        smuggled = (
+            'def openRaw := #"a"/-"#\n'
+            "def post : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .ub => True\n"
+            'def closeRaw := #"a"-/"#\n'
+        )
+        self.assertEqual(self._patterns(smuggled, "lean"), ["ub_arm_true"])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(smuggled, "ub", language="lean")["status"],
+            "SURVIVED",
+        )
+        # Conversely, a vacuous arm inside a Lean `#"..."#` raw string is literal text, not code.
+        in_raw = 'def doc := #"| .ub => True"#\ndef post : Outcome Nat → Prop\n  | .ub => False\n'
+        self.assertEqual(self._patterns(in_raw, "lean"), [])
+        # Unclosed Lean `#"` raw string and `s!#"{x}"#` interpolated raw string fail closed.
+        for hazard in ('def s := #"unterminated\n| .ub => False', '| .ub => s!#"{x}"#'):
+            self.assertEqual(self._patterns(hazard, "lean"), ["unclosed_literal_or_comment"])
+
+    def test_lean_sequential_let_matches_and_pattern_matching_lambdas_never_collide(self) -> None:
+        # Arms aligned with `let` (`arm_col == 3 < match_col == 19`) previously popped `lean_matches`
+        # on the first arm and collapsed every `let ... := match` onto `match_id = -1`!
+        two_let_matches = (
+            "def post (other out : Outcome Nat) : Prop :=\n"
+            "  let helper := match other with\n"
+            "  | .ub => False\n"
+            "  | _ => True\n"
+            "  let actual := match out with\n"
+            "  | .ok v => v = 1\n"
+            "  | .ub => True\n"
+            "  helper ∧ actual\n"
+        )
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(two_let_matches, "ub", language="lean")["status"],
+            "SURVIVED",
+        )
+        self.assertFalse(gmut.verify_postcondition_kills_error_mutants(two_let_matches, language="lean")["ok"])
+
+        # Separate `let ... := match` on a `Nat` must not inherit `ok_groups` from an earlier `let` match.
+        clean_two_let_matches = (
+            "def post (x : Nat) (out : Outcome Nat) : Prop :=\n"
+            "  let a := match out with\n"
+            "  | .ok v => v = 1\n"
+            "  | .ub => False\n"
+            "  let b := match x with\n"
+            "  | 0 => True\n"
+            "  | _ => True\n"
+            "  a ∧ b\n"
+        )
+        self.assertEqual(self._patterns(clean_two_let_matches, "lean"), [])
+
+        # Sequential pattern-matching `fun | ...` expressions also get distinct match groups.
+        two_funs = (
+            "def post (other out : Outcome Nat) : Prop :=\n"
+            "  let f := fun\n"
+            "  | .ub => False\n"
+            "  | _ => True\n"
+            "  let g := fun\n"
+            "  | .ok v => v = 1\n"
+            "  | .ub => True\n"
+            "  f other ∧ g out\n"
+        )
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(two_funs, "ub", language="lean")["status"],
+            "SURVIVED",
+        )
+
+    def test_expression_precedence_let_propagation_tautologies_and_pure_reflexivity(self) -> None:
+        # Vacuous shapes that previously slipped past `_const_truth` / `_alt_head`.
+        for source, lang, expected in (
+            ("Result::<u32, E>::Err(_) => true", "rust", "err_arm_true"),
+            ("<Result<u32, E>>::Err(_) => true", "rust", "err_arm_true"),
+            ("Err([..]) => true", "rust", "err_arm_true"),
+            ("Err(_) if if true { true } else { false } => true", "rust", "err_arm_true"),
+            ("Err(_) => { let ok = true; ok }", "rust", "err_arm_true"),
+            ("Err(_) => |_| true", "rust", "err_arm_true"),
+            ("Err(e) => *e == 0 || *e != 0", "rust", "err_arm_true"),
+            ("Err(_) => cond || !cond", "rust", "err_arm_true"),
+            ("| .«ub» => «True»", "lean", "ub_arm_true"),
+            ("| «Err» «e» => True", "lean", "err_arm_true"),
+            ("| .ub =>\n  let _ := f 1 2\n  True", "lean", "ub_arm_true"),
+            ("| .ub => let ok := True; ok", "lean", "ub_arm_true"),
+            ("| .ub => have h : Prop := True; h", "lean", "ub_arm_true"),
+            ("| .ub => fun _ => True", "lean", "ub_arm_true"),
+            ("| .err e => e = 0 → e = 0", "lean", "err_arm_true"),
+            ("| .ub => p ∨ ¬p", "lean", "ub_arm_true"),
+        ):
+            self.assertEqual(self._patterns(source, lang), [expected], source)
+
+        # Sound constrained arms that must NOT false-fire:
+        # 1. Lean `if c then False else False ∨ True` extends across `∨` (only True when `¬c`)!
+        # 2. Rust `let _ = assert!(...);` / `let x = check(e)?;` have side effects / early exits!
+        # 3. `f64::NAN == f64::NAN` and `iter.next() == iter.next()` are NOT reflexive tautologies!
+        for guarded, lang in (
+            ("| .err e => if e != .allowed then False else False ∨ True", "lean"),
+            ("| .err e => if e = .allowed then False else False → False", "lean"),
+            ("| .err e =>\n  let ok := e = .overflow\n  ok", "lean"),
+            ("Err(e) => { let _ = assert!(*e == E::Overflow); true }", "rust"),
+            ("Err(e) => { let _ = check(e)?; true }", "rust"),
+            ("Err(e) => { let true = (*e == E::Overflow) else { panic!() }; true }", "rust"),
+            ("Err(_) => f64::NAN == f64::NAN", "rust"),
+            ("Err(_) => iter.next() == iter.next()", "rust"),
+            ("Err(_) => cond && !cond", "rust"),
+        ):
+            self.assertEqual(self._patterns(guarded, lang), [], guarded)
+
+        # `auto` language detection must not let Lean list-cons `::` + a quote in a Lean comment
+        # trigger a bogus Rust `unclosed_literal_or_comment` error!
+        clean_lean_cons = (
+            '/- note with single " quote inside Lean comment -/\n'
+            "def post (xs : List Nat) : Outcome Nat → Prop\n"
+            "  | .ok v => xs = v :: []\n"
+            "  | .ub => False\n"
+        )
+        self.assertEqual(self._patterns(clean_lean_cons, "auto"), [])
+
+        # `@[simp]` and `#check` terminate a column-0 Lean arm body cleanly.
+        at_and_hash = "def post : Outcome Nat → Prop\n| .ok v => v = 1\n| .ub => True\n@[simp]\ntheorem t : True := trivial\n"
+        self.assertEqual(self._patterns(at_and_hash, "lean"), ["ub_arm_true"])
+
+    def test_lean_all_list_continuation_and_require_lean_taxonomy_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-a1-") as tmp:
+            r1 = Path(tmp) / "all_append"
+            self._stage(
+                r1,
+                self.LEAN_REL,
+                "  [.entryPointPrecondition, .fixedWidthGhostLength, .errorBranchWildcard]\n",
+                "  [.entryPointPrecondition, .fixedWidthGhostLength, .errorBranchWildcard] ++ [.entryPointPrecondition]\n",
+            )
+            errs = gmut.validate_property_taxonomy(r1)
+            self.assertTrue(any("SpecBoundaryGuardClass.all" in e for e in errs), errs)
+
+            tcb = _make_tcb_copy_root(Path(tmp) / "tcb")
+            lean_req = gmut.validate_catalog_invariants(tcb, require_lean_taxonomy=True)
+            self.assertEqual(len(lean_req), 1, lean_req)
+            self.assertIn(f"cannot read {self.LEAN_REL}", lean_req[0])
+
+
 if __name__ == "__main__":
     unittest.main()

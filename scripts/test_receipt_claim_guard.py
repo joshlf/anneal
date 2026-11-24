@@ -921,5 +921,209 @@ class Ep2B1AdversarialTests(GuardHarness):
         self.assertEqual(target.read_text(encoding="utf-8"), "{}")
 
 
+class Ep2A1AdversarialTests(GuardHarness):
+    """Pass A1 adversarial regressions for `receipt_claim_guard.py`."""
+
+    def test_inline_code_spans_cannot_mask_claims_via_tildes_or_html_comments(self) -> None:
+        # Two `~~` inside separate inline code spans must NOT strike out claims between them!
+        self.assertEqual(
+            self.codes("Ran `a~~b` check: `unit_tests` 999 passed; ran `c~~d` check: `unit_tests` 42 passed\n"),
+            ["INFLATED_COUNT"],
+        )
+        # `<!--` and `-->` inside inline code spans must NOT open an HTML comment!
+        self.assertEqual(
+            self.codes("Checked `<!--` lexer: `unit_tests` 999 passed; checked `-->` lexer: `unit_tests` 42 passed\n"),
+            ["INFLATED_COUNT"],
+        )
+        # Multi-backtick inline code spans preserve `;` and `|` without splitting clauses/cells.
+        self.assertEqual(
+            self.codes("| ``unit_tests`` | ``note | ; `` 42 passed |\n"),
+            [],
+        )
+        self.assertEqual(
+            self.codes("| ``unit_tests`` | ``note | ; `` 999 passed |\n"),
+            ["INFLATED_COUNT"],
+        )
+
+    def test_commonmark_fences_block_single_line_inline_triple_ticks_and_trailing_smuggling(self) -> None:
+        # Single-line ```...``` has backticks in the info string: CommonMark inline code, NOT a fence!
+        self.assertEqual(
+            self.codes("```unit_tests: 999 passed```\n`unit_tests`: 42 passed\n"),
+            ["INFLATED_COUNT"],
+        )
+        # Claims smuggled onto a putative closing fence line are NOT silently skipped!
+        self.assertEqual(
+            self.codes("```\n$ python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v\n``` `unit_tests`: 999 passed\n"),
+            ["INFLATED_COUNT", "MALFORMED_CLAIMS"],
+        )
+        # Mismatched `~~~` or shorter fence cannot close ```` ``` ````; unclosed fence fails closed.
+        self.assertEqual(
+            self.codes("````\n`unit_tests`: 42 passed\n```\n"),
+            ["MALFORMED_CLAIMS"],
+        )
+        self.assertEqual(
+            self.codes("```\n`unit_tests`: 42 passed\n~~~\n"),
+            ["MALFORMED_CLAIMS"],
+        )
+        # Inside a fenced block, literal `<--` / `<!--` program output does not falsely trigger HTML comment error,
+        # while ignore directives inside a fence are rejected.
+        self.assertEqual(
+            self.codes(
+                "```\n$ python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v\n"
+                "output: x<!--y\nrc=0, 42 passed\n```\n"
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.codes("```\n<!-- claim-guard: ignore-begin -->\n`unit_tests`: 999 passed\n<!-- claim-guard: ignore-end -->\n```\n"),
+            ["INFLATED_COUNT", "MALFORMED_CLAIMS"],
+        )
+
+    def test_table_sha_cells_backticked_sha_labels_and_at_arrow_forms(self) -> None:
+        ok = "\n`unit_tests`: rc=0\n"
+        # Key-value Markdown tables with hex-letter SHAs, placeholders, short prefixes, or non-hex IDs.
+        for row, code in (
+            ("| Commit SHA | deadbeef |", "COMMIT_SHA_MISMATCH"),
+            ("| Commit SHA | unknown |", "INVALID_COMMIT_SHA"),
+            ("| HEAD | 1234 |", "AMBIGUOUS_COMMIT_SHA"),
+            ("| HEAD SHA | g81271f6d1b8 |", "INVALID_COMMIT_SHA"),
+            (f"`commit_sha`: {OTHER_SHA}", "COMMIT_SHA_MISMATCH"),
+            (f"SHA-1: {OTHER_SHA}", "COMMIT_SHA_MISMATCH"),
+            (f"HEAD @ {OTHER_SHA[:10]}", "COMMIT_SHA_MISMATCH"),
+            (f"HEAD -> {OTHER_SHA[:10]}", "COMMIT_SHA_MISMATCH"),
+            (f"Commit ({OTHER_SHA[:10]})", "COMMIT_SHA_MISMATCH"),
+        ):
+            self.assertEqual(self.codes(row + ok), [code], row)
+        # Valid table & `@` / `()` / `SHA-1` forms pass.
+        for valid in (
+            f"| Header | Value |\n| --- | --- |\n| Commit SHA | {SHA[:12]} |",
+            f"`commit_sha`: `{SHA}`",
+            f"SHA-1: `{SHA[:10]}`",
+            f"HEAD @ `{SHA[:10]}`",
+            f"HEAD -> {SHA[:10]}",
+            f"Commit ({SHA[:10]})",
+        ):
+            self.assertEqual(self.codes(valid + ok), [], valid)
+
+    def test_path_labels_leading_step_priority_bare_headings_and_wrapper_spoofing(self) -> None:
+        # Path-shaped leading labels without spaces must NOT fall back to unscoped!
+        for prose in (
+            "- `unit_tests`: rc=0\n- `ci/check_todo.sh`: rc=0\n",
+            "- `/usr/bin/false`: rc=0\n",
+            "| `ci/check_todo.sh` | PASS |\n",
+            "## `ci/check_todo.sh`\n\nrc=0\n",
+            "`env RUSTFLAGS=-Dwarnings cargo test --workspace`: rc=0\n",
+        ):
+            self.assertEqual(self.codes(prose), ["UNBACKED_CLAIM"], prose)
+        # Mentioning a real step in parenthetical notes cannot hijack a fabricated bullet or table row!
+        self.assertEqual(
+            self.codes("- `fabricated_step` (same harness as `unit_tests`): rc=0, 42 passed\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+        self.assertEqual(
+            self.codes("| `fabricated_step` | compared against `unit_tests` | 42 passed |\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+        # Bare snake_case section heading (`## ghost_gate`) fails closed as an unknown step.
+        self.assertEqual(
+            self.codes("## unit_tests\n42 passed\n\n## ghost_gate\n42 passed\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+        # Arbitrary `<cmd> -- <real_cmd>` cannot spoof `anneal-lean-run ... -- <real_cmd>`.
+        self.assertEqual(
+            self.codes("`false -- cargo test --manifest-path crates/anneal-spec/Cargo.toml --locked`: rc=0\n"),
+            ["UNBACKED_CLAIM"],
+        )
+        self.assertEqual(
+            self.codes("`anneal-lean-run --mode build -- cargo test --manifest-path crates/anneal-spec/Cargo.toml --locked`: rc=0\n"),
+            [],
+        )
+
+    def test_suppressed_crashes_behind_zero_counts_malformed_kv_and_negated_zero_words(self) -> None:
+        # Fatal guard-mutation crash (`total=0, survived=0, errors=1`) cannot pass behind `0 survived`!
+        fatal_gm = [guard_mutation(fatal="baseline refute fixture failed")]
+        self.assertEqual(self.codes("`guard_mutation`: 0 survived", fatal_gm), ["SUPPRESSED_FAILURE"])
+        self.assertEqual(self.codes("`guard_mutation`: no survivors", fatal_gm), ["SUPPRESSED_FAILURE"])
+        self.assertEqual(self.codes("`guard_mutation`: zero errors", fatal_gm), ["COUNT_MISMATCH"])
+        # Crashed test runner (`rc=2, ok=False, failed_count=0`) or uncounted failing step in a bundle
+        # cannot pass behind `0 failed` / `no failures`!
+        crashed_unit = [bundle(unit_tests={"returncode": 2, "ok": False, "failed_count": 0})]
+        self.assertEqual(self.codes("`unit_tests`: 42 passed, 0 failed", crashed_unit), ["SUPPRESSED_FAILURE"])
+        crashed_cargo = [bundle(cargo_test={"exit_code": 101, "ok": False})]
+        self.assertEqual(self.codes("42 passed, 0 failed", crashed_cargo), ["COUNT_MISMATCH", "SUPPRESSED_FAILURE"])
+        crashed_no_counts = [
+            {
+                "schema": rcg.RECEIPT_SCHEMA,
+                "steps": [
+                    {"step_id": "unit_tests", "returncode": 0, "passed_count": 42, "failed_count": 0},
+                    {"step_id": "cargo_build", "returncode": 101, "ok": False},
+                ],
+            }
+        ]
+        self.assertEqual(self.codes("42 passed, 0 failed", crashed_no_counts), ["SUPPRESSED_FAILURE"])
+
+        # Numerator > denominator on non-theorem fractions and non-numeric KV assignments fail closed.
+        for bad in (
+            "`unit_tests`: 50/42 passed",
+            "`unit_tests`: 5/4 failed",
+            "`unit_tests`: passed=TBD, rc=0",
+            "`unit_tests`: failed_count: unknown, rc=0",
+            "`spec_boundary_guards`: sorry_count=N/A, rc=0",
+            "kill_rate=NaN, 20 killed",
+        ):
+            self.assertIn("MALFORMED_CLAIM", self.codes(bad, [bundle(), guard_mutation()]), bad)
+
+        # Negated zero-word / standard-axiom claims respect negation polarity.
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: not sorry-free", [bundle(spec_boundary_guards={"sorry_count": 2})]),
+            [],
+        )
+        self.assertEqual(self.codes("`spec_boundary_guards`: not sorry-free"), ["SORRY_VIOLATION"])
+        self.assertEqual(self.codes("`spec_boundary_guards`: not standard axioms only"), ["AXIOM_SET_MISMATCH"])
+
+    def test_symlink_parent_directories_and_bundle_metadata_validation(self) -> None:
+        real_dir = self.tmp / "real_dir"
+        real_dir.mkdir()
+        real_receipt = real_dir / "r.json"
+        real_receipt.write_text(json.dumps(bundle()), encoding="utf-8")
+        real_claims = real_dir / "c.md"
+        real_claims.write_text("`unit_tests`: rc=0\n", encoding="utf-8")
+        sym_dir = self.tmp / "sym_dir"
+        os.symlink(real_dir, sym_dir)
+
+        # `--no-symlinks` rejects symlinked parent directories on `--receipt`, `--claims`, and `--json-out`!
+        self.assertIn("MALFORMED_RECEIPT", self.codes("`unit_tests`: rc=0", [sym_dir / "r.json"], "--no-symlinks"))
+        rc_c, out_c, _ = self.run_main(
+            ["--claims", str(sym_dir / "c.md"), "--receipt", str(real_receipt), "--no-symlinks", "--json"]
+        )
+        self.assertEqual((rc_c, [v["code"] for v in json.loads(out_c)["violations"]]), (1, ["UNREADABLE_CLAIMS"]))
+        rc_o, out_o, _ = self.run_main(
+            ["--claims", str(real_claims), "--receipt", str(real_receipt), "--no-symlinks",
+             "--json-out", str(sym_dir / "out.json"), "--json"]
+        )
+        self.assertEqual((rc_o, json.loads(out_o)["ok"]), (1, False))
+        self.assertFalse((real_dir / "out.json").exists())
+
+        # Malformed top-level bundle metadata, nightly top-level overall_status, and CLI validation.
+        for bad_bundle in (
+            {**bundle(), "artifacts": "not-a-list"},
+            {**bundle(), "metadata": [1, 2]},
+            {**bundle(), "generated_at_utc": ""},
+            {**NIGHTLY, "overall_status": "PASS", "pillar_2_correctness_and_correspondence": {
+                "steps": [{"name": "s", "status": "FAIL", "exit_code": 1}],
+            }},
+            {"name": "s", "status": "   ", "exit_code": 1},
+        ):
+            self.assertTrue(
+                set(self.codes("`unit_tests`: rc=0", [bad_bundle])) & {"MALFORMED_RECEIPT", "INCONSISTENT_RECEIPT"},
+                bad_bundle,
+            )
+        self.assertEqual(self.run_main(["--claims", str(real_claims), "--receipt", f"={real_receipt}"])[0], 2)
+        self.assertEqual(
+            self.run_main(["--claims", str(real_claims), "--receipt", str(real_receipt), "--require-step", " unit_tests "])[0],
+            2,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

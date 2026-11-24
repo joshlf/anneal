@@ -265,14 +265,28 @@ class Violation:
 # ---------------------------------------------------------------------------
 
 
+def _ensure_no_symlink_components(path: Path) -> None:
+    """Raise `OSError` if `path` or any directory traversed to reach it is a symlink."""
+    cur = Path("/") if path.is_absolute() else Path(os.getcwd())
+    parts = path.parts[1:] if path.is_absolute() else path.parts
+    if os.path.islink(cur):
+        raise OSError(f"{cur}: is a symlink (--no-symlinks)")
+    for part in parts:
+        if part in ("", "."):
+            continue
+        cur = cur / part
+        if os.path.islink(cur):
+            raise OSError(f"{cur}: is a symlink (--no-symlinks)")
+
+
 def read_regular_utf8(path: Path, *, no_symlinks: bool, missing_code: str, bad_code: str) -> str:
     """Read a UTF-8 regular file, never blocking on a FIFO or device."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     if no_symlinks:
         flags |= getattr(os, "O_NOFOLLOW", 0)
     try:
-        if no_symlinks and os.path.islink(path):
-            raise InputError(bad_code, f"{path}: is a symlink (--no-symlinks)")
+        if no_symlinks:
+            _ensure_no_symlink_components(path)
         fd = os.open(path, flags)
     except OSError as exc:
         code = missing_code if isinstance(exc, FileNotFoundError) else bad_code
@@ -394,13 +408,27 @@ def _receipt_sha(value: object, source: str, key: str) -> str | None:
     return value
 
 
+def _validate_canonical_top_metadata(obj: dict[str, object], source: str) -> None:
+    _opt_str(obj, "generated_at_utc", source, allow_empty=False)
+    _opt_str(obj, "generator", source, allow_empty=False)
+    artifacts = obj.get("artifacts")
+    if artifacts is not None and not isinstance(artifacts, (list, dict)):
+        raise _bad(source, f"`artifacts` must be a list or object, got {artifacts!r}")
+    metadata = obj.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise _bad(source, f"`metadata` must be a JSON object, got {metadata!r}")
+
+
 def _canonical_step(obj: object, source: str, *, allow_schema: bool = False) -> tuple[Step, str | None]:
     if not isinstance(obj, dict):
         raise _bad(source, "a step must be a JSON object")
-    allowed_keys = _CANONICAL_STEP_KEYS | ({"schema"} if allow_schema else set())
+    extra_top = {"schema", "generated_at_utc", "generator", "metadata"} if allow_schema else set()
+    allowed_keys = _CANONICAL_STEP_KEYS | extra_top
     unknown = sorted(set(obj) - allowed_keys)
     if unknown:
         raise _bad(source, f"unknown step key(s) {unknown}")
+    if allow_schema:
+        _validate_canonical_top_metadata(obj, source)
     step_id = obj.get("step_id")
     if not isinstance(step_id, str) or not step_id.strip() or step_id != step_id.strip() or "\n" in step_id:
         raise _bad(source, f"`step_id` must be a non-empty single-line string, got {step_id!r}")
@@ -563,8 +591,14 @@ def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
         raise _bad(source, "a nightly step must be a JSON object")
     name = obj.get("name")
     status = obj.get("status")
-    if not isinstance(name, str) or not name.strip() or "\n" in name or not isinstance(status, str):
-        raise _bad(source, "a nightly step needs a `name` and a `status` string")
+    if (
+        not isinstance(name, str)
+        or not name.strip()
+        or "\n" in name
+        or not isinstance(status, str)
+        or not status.strip()
+    ):
+        raise _bad(source, "a nightly step needs a non-empty `name` and `status` string")
     where = f"{source} step {name!r}"
     exit_code = _opt_int(obj, "exit_code", where, minimum=None)
     if exit_code is None:
@@ -614,6 +648,7 @@ def load_receipt(
             unknown = sorted(set(obj) - _CANONICAL_TOP_KEYS)
             if unknown:
                 raise _bad(source, f"unknown bundle key(s) {unknown}")
+            _validate_canonical_top_metadata(obj, source)
             if not isinstance(obj["steps"], list) or not obj["steps"]:
                 raise _bad(source, "`steps` must be a non-empty array")
             if forced_id is not None:
@@ -657,7 +692,8 @@ def load_receipt(
         if steps_failed is not None and steps_failed != actual_failed:
             raise _bad(source, f"`steps_failed` ({steps_failed}) contradicts {actual_failed} failing steps", "INCONSISTENT_RECEIPT")
         overall = _opt_str(p2, "overall_status", source, allow_empty=False)
-        if overall == "PASS" and actual_failed > 0:
+        top_overall = _opt_str(obj, "overall_status", source, allow_empty=False)
+        if (overall == "PASS" or top_overall == "PASS") and actual_failed > 0:
             raise _bad(source, "`overall_status` is PASS but a nightly step failed", "INCONSISTENT_RECEIPT")
         steps += loaded_steps
         for key in ("unstable_commit_sha", "git_sha", "commit_sha"):
@@ -745,6 +781,14 @@ _ZERO_WORD_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     ("sorry", re.compile(r"(?i)\b(?:no|zero|without)\s+`?(?:sorr(?:y|ies)|sorryAx)\b`?|\bsorry-free\b")),
+    ("errors", re.compile(r"(?i)\b(?:no|zero|without)\s+errors?\b")),
+)
+_BAD_KV_RE = re.compile(
+    r"(?i)(?<![\w-])[*_]*(?:"
+    r"(?:(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total)_count|kill[ _-]rate_pct)"
+    r"[*_]*\s*[=:]\s*([^\s`,;)|*]+)"
+    r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)"
+    r"[*_]*\s*=(?!=)\s*([^\s`,;)|*]+))"
 )
 _RC_ASSIGN_RE = re.compile(
     r"(?i)(?<![\w-])[*_]*(?:rc|exit[ _-]?code|exit[ _-]?status|return[ _]?code)[*_]*\s*[=:]\s*[`*_]*([^\s`,;)|*]+)"
@@ -755,7 +799,7 @@ _RC_PROSE_RE = re.compile(
 )
 _STATUS_RE = re.compile(r"(?i)(?<![\w-])[*_]*(?:status|result|verdict|outcome)[*_]*\s*[=:]\s*[`*_]*([A-Za-z]+)")
 _OK_RE = re.compile(r"(?i)(?<![\w-])[*_]*ok[*_]*\s*[=:]\s*[`*_]*(true|false)\b")
-_VERDICT_TOKEN_RE = re.compile(r"(?<![\w/-])(PASS(?:ED)?|FAIL(?:ED)?|✅|❌)(?![\w/-])")
+_VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|✅|❌)(?![\w/-]|\.\w)")
 _ALL_PASS_RE = re.compile(
     r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
 )
@@ -772,10 +816,15 @@ _FAIL_WORDS: frozenset[str] = frozenset(
     {"FAIL", "FAILED", "FAILING", "FAILURE", "ERROR", "RED", "TIMEOUT", "❌"}
 )
 _SHA_CLAIM_RE = re.compile(
-    r"(?i)(?<![\w/-])[*_]*(?P<label>(?:(?:base|parent|previous|prior|old|head|target|tip|final|new|current|git)"
-    r"[\s_-]+)*(?:commit(?:[\s_-]+(?:sha|hash|id))?|sha|revision|head|base|parent|target))[*_]*(?![\w-])"
-    r"(?:\s+(?:is|was|at|of)){0,2}[*_]*\s*(?P<sep>[:=|])?[*_]*\s*[*_]*(?P<tick>`?)(?P<value>[0-9A-Za-z/_.?-]+)"
+    r"(?i)(?<![\w/-])[`*_]*(?P<label>(?:(?:base|parent|previous|prior|old|head|target|tip|final|new|current|git)"
+    r"[\s_-]+)*(?:commit(?:[\s_-]+(?:sha(?:-?1)?|hash|id))?|sha(?:-?1)?|revision|head|base|parent|target))[`*_]*(?![\w-])"
+    r"(?:\s+(?:is|was|at|of)){0,2}[`*_]*\s*(?P<sep>[:=|@]|->)?[*_]*\s*(?P<paren>\()?\s*[*_]*(?P<tick>`?)(?P<value>[0-9A-Za-z/_.?-]+)"
 )
+_EXPLICIT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|hash|revision|commit[\s_-]+id)\b")
+_TABLE_NON_SHA_HEADERS: frozenset[str] = frozenset({
+    "status", "result", "verdict", "outcome", "step", "steps", "notes", "note",
+    "details", "detail", "check", "checks", "value", "description", "summary",
+})
 _BASE_ROLE_RE = re.compile(r"(?i)(?:^|[\s_-])(?:base|parent|previous|prior|old)(?:$|[\s_-])")
 _SHA_PLACEHOLDERS: frozenset[str] = frozenset({"unknown", "none", "n/a", "na", "tbd", "null", "dirty", "?"})
 _AXIOM_PREFIX_OPT = r"(?:[*_]*axioms?(?:\s+used|\s+set|\s+closure)?[*_]*\s*[=:]\s*)?"
@@ -792,17 +841,20 @@ _AXIOM_LIST_RE = re.compile(
 )
 _EXPLICIT_STEP_RE = re.compile(r"(?i)(?<![\w-])[*_]*step(?:[ _-]?id)?[*_]*\s*[=:]\s*[`*_]*([A-Za-z0-9][\w.:/-]*)")
 _LEADING_LABEL_RE = re.compile(
-    r"^\s*(?:[-*+]|\d+[.)])?\s*(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*)\s*:"
+    r"^\s*(?:[-*+]|\d+[.)])?\s*(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9_.-]*))(?:\s*\([^)\n]*\))?\s*:"
 )
 _HEADING_CODE_STEP_RE = re.compile(r"^\s*#{1,6}\s+`([^`\n]+)`\s*$")
+_HEADING_BARE_STEP_RE = re.compile(r"^\s*#{1,6}\s+(?:\*\*)?([A-Za-z0-9][A-Za-z0-9.-]*_[A-Za-z0-9_.-]*)(?:\*\*)?\s*$")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
-_CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 _COMMAND_HEAD_RE = re.compile(
-    r"(?:\./|(?:python3?|cargo|lake|lean|anneal-lean-run|bash|sh|git|pytest|make|rg)\b)"
+    r"(?:~?/|(?:\.{1,2}/)+|(?:python3?|cargo|lake|lean|anneal-lean-run|bash|sh|git|pytest|make|rg|"
+    r"env|timeout|time|nice|nohup|rustup|elan)\b)"
 )
-_SHELL_META_RE = re.compile(r"[;&|`$<>]|\|\||&&")
+_ANNEAL_WRAPPER_RE = re.compile(
+    r"(?:[\w./~-]+/)?anneal-lean-run(?:\s+--[A-Za-z0-9_-]+(?:=[^\s;&|`$<>]+|\s+[A-Za-z0-9_./:-]+)?)*"
+)
 _NON_STEP_LABELS: frozenset[str] = frozenset({
-    "commit", "commit sha", "commit_sha", "git sha", "git_sha", "sha", "revision",
+    "commit", "commit sha", "commit_sha", "git sha", "git_sha", "sha", "sha1", "sha-1", "revision",
     "head", "head sha", "head_sha", "base", "base sha", "base_sha", "parent",
     "previous", "prior", "old", "target", "tip", "status", "result", "verdict",
     "outcome", "axioms", "axioms used", "axioms set", "axioms closure", "axiom",
@@ -810,16 +862,80 @@ _NON_STEP_LABELS: frozenset[str] = frozenset({
     "kill rate", "kill_rate", "passed", "failed", "killed", "survived", "errors",
     "theorems", "sorry", "rc", "exit code", "exit_code", "ok", "step", "step_id",
     "verification", "gate", "gates", "checks", "tests", "all", "command", "commands",
+    "historical", "previously", "superseded", "obsolete",
 })
-_FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
+_FENCE_OPEN_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})(.*)$")
 _HISTORICAL_RE = re.compile(
     r"(?i)^(?:[-*+>\s]|[0-9]+[.)])*[\[(*_]*(?:historical|previously|superseded|obsolete)[\])*_]*\s*[:\-–]"
 )
-_STRIKE_RE = re.compile(r"~~.*?~~")
 _IGNORE_BEGIN = "<!-- claim-guard: ignore-begin -->"
 _IGNORE_END = "<!-- claim-guard: ignore-end -->"
 _INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u00ad]")
 _CONTROL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
+
+
+def _inline_code_spans(line: str) -> list[tuple[int, int, str]]:
+    """CommonMark matched inline code spans `(open_idx, close_end, inner)` on `line`."""
+    spans: list[tuple[int, int, str]] = []
+    n = len(line)
+    i = 0
+    while i < n:
+        if line[i] != "`":
+            i += 1
+            continue
+        run_end = i
+        while run_end < n and line[run_end] == "`":
+            run_end += 1
+        tick_len = run_end - i
+        j = run_end
+        closed_at = -1
+        while j < n:
+            if line[j] != "`":
+                j += 1
+                continue
+            k = j
+            while k < n and line[k] == "`":
+                k += 1
+            if k - j == tick_len:
+                closed_at = j
+                break
+            j = k
+        if closed_at != -1:
+            inner = line[run_end:closed_at]
+            if len(inner) >= 2 and inner[0] == " " and inner[-1] == " " and inner.strip(" "):
+                inner = inner[1:-1]
+            spans.append((i, closed_at + tick_len, inner))
+            i = closed_at + tick_len
+        else:
+            i = run_end
+    return spans
+
+
+def _in_spans(idx: int, spans: Sequence[tuple[int, int, str]]) -> bool:
+    return any(lo <= idx < hi for lo, hi, _ in spans)
+
+
+def _strip_strikethrough_outside_code(line: str) -> str:
+    """Replace matched `~~...~~` spans outside inline code spans with spaces."""
+    if "~~" not in line:
+        return line
+    code_spans = _inline_code_spans(line)
+    chars = list(line)
+    n = len(line)
+    i = 0
+    open_at = -1
+    while i + 1 < n:
+        if line[i : i + 2] == "~~" and not _in_spans(i, code_spans):
+            if open_at == -1:
+                open_at = i
+            else:
+                for pos in range(open_at, i + 2):
+                    chars[pos] = " "
+                open_at = -1
+            i += 2
+            continue
+        i += 1
+    return "".join(chars)
 
 
 def _parse_count(prefix: str, token: str) -> int | None:
@@ -849,20 +965,24 @@ class _KnownSteps:
                 self.commands.setdefault(" ".join(step.command.split()), set()).add(step.step_id)
 
     def by_command(self, span: str) -> str | None:
-        """The one step whose command is `span`, allowing a clean `wrapper -- ` prefix."""
+        """The one step whose command is `span`, allowing an `anneal-lean-run ... -- ` wrapper."""
         hits: set[str] = set()
         for command, step_ids in self.commands.items():
-            if span == command or command.endswith(" -- " + span):
+            if span == command:
                 hits |= step_ids
+            elif command.endswith(" -- " + span):
+                prefix = command[: -len(" -- " + span)]
+                if _ANNEAL_WRAPPER_RE.fullmatch(prefix):
+                    hits |= step_ids
             elif span.endswith(" -- " + command):
                 prefix = span[: -len(" -- " + command)]
-                if not _SHELL_META_RE.search(prefix):
+                if _ANNEAL_WRAPPER_RE.fullmatch(prefix):
                     hits |= step_ids
         return next(iter(hits)) if len(hits) == 1 else None
 
 
 def _is_candidate_unknown_step_label(label: str) -> bool:
-    """Whether `label` looks like an unrecognized step name rather than metadata or a value."""
+    """Whether `label` looks like an unrecognized step or script name rather than metadata."""
     norm = " ".join(label.strip().split())
     if not norm or norm.lower() in _NON_STEP_LABELS:
         return False
@@ -870,87 +990,114 @@ def _is_candidate_unknown_step_label(label: str) -> bool:
         return False
     if _SHA_RE.fullmatch(norm) or norm.isdigit():
         return False
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*", norm))
+    return bool(re.fullmatch(r"[A-Za-z0-9.~/][A-Za-z0-9_./~+@ -]*", norm))
 
 
 def _table_cell_spans(line: str) -> list[tuple[int, int]]:
-    """`(lo, hi)` character spans of Markdown table cells, ignoring `|` inside backticks."""
-    pipes: list[int] = []
-    in_ticks = False
-    for idx, ch in enumerate(line):
-        if ch == "`":
-            in_ticks = not in_ticks
-        elif ch == "|" and not in_ticks:
-            pipes.append(idx)
+    """`(lo, hi)` character spans of Markdown table cells, ignoring `|` inside inline code."""
+    code_spans = _inline_code_spans(line)
+    pipes = [idx for idx, ch in enumerate(line) if ch == "|" and not _in_spans(idx, code_spans)]
     if len(pipes) < 2:
         return []
     return [(pipes[i] + 1, pipes[i + 1]) for i in range(len(pipes) - 1)]
 
 
 def _clause_spans(line: str) -> list[tuple[int, int]]:
-    """`(lo, hi)` spans split on `;` outside backticks."""
+    """`(lo, hi)` spans split on `;` outside inline code spans."""
+    code_spans = _inline_code_spans(line)
     spans: list[tuple[int, int]] = []
     start = 0
-    in_ticks = False
     for idx, ch in enumerate(line):
-        if ch == "`":
-            in_ticks = not in_ticks
-        elif ch == ";" and not in_ticks:
+        if ch == ";" and not _in_spans(idx, code_spans):
             spans.append((start, idx))
             start = idx + 1
     spans.append((start, len(line)))
     return spans
 
 
-def _line_refs(line: str, known: _KnownSteps, in_fence: bool) -> list[tuple[int, str | None, str, bool]]:
-    """`(position, step id or None, name, explicit)` for every step the line names."""
-    refs: list[tuple[int, str | None, str, bool]] = []
+def _line_refs(
+    line: str, known: _KnownSteps, in_fence: bool
+) -> list[tuple[int, str | None, str, bool, bool]]:
+    """`(position, step id or None, name, explicit, primary)` for every step the line names."""
+    refs: list[tuple[int, str | None, str, bool, bool]] = []
     taken: list[tuple[int, int]] = []
 
     def overlaps(lo: int, hi: int) -> bool:
         return any(a < hi and lo < b for a, b in taken)
 
-    def add(m_start: int, m_end: int, step_id: str | None, name: str, explicit: bool) -> None:
-        refs.append((m_start, step_id, name, explicit))
+    def add(
+        m_start: int, m_end: int, step_id: str | None, name: str, explicit: bool, primary: bool = False
+    ) -> None:
+        refs.append((m_start, step_id, name, explicit, primary))
         taken.append((m_start, m_end))
 
     for m in _EXPLICIT_STEP_RE.finditer(line):
         name = m.group(1).rstrip(".,;:*_")
-        add(m.start(), m.end(), name if name in known.ids else None, name, True)
+        add(m.start(), m.end(), name if name in known.ids else None, name, True, primary=True)
     if in_fence:
         stripped = line.strip()
         shell = stripped.startswith("$ ")
         candidate = " ".join((stripped[2:] if shell else stripped).split())
         step_id = known.by_command(candidate)
         if step_id is not None or shell or _COMMAND_HEAD_RE.match(candidate):
-            add(0, len(line), step_id, candidate, False)
-    for m in _CODE_SPAN_RE.finditer(line):
-        span = " ".join(m.group(1).split())
-        step_id = span if span in known.ids else known.by_command(span)
-        if step_id is not None or _COMMAND_HEAD_RE.match(span) or " -- " in span:
-            add(m.start(), m.end(), step_id, span, False)
+            add(0, len(line), step_id, candidate, False, primary=True)
+    is_table = not in_fence and line.lstrip().startswith("|")
+    table_cells = _table_cell_spans(line) if is_table else []
+    full_cell_spans = {
+        (lo, hi)
+        for lo, hi in table_cells
+        if re.fullmatch(r"\s*(?:\*\*)?`[^`\n]+`(?:\*\*)?\s*", line[lo:hi])
+    }
+    m_lead = _LEADING_LABEL_RE.match(line) if not in_fence and not is_table else None
+    lead_span: tuple[int, int] | None = None
+    if m_lead is not None:
+        grp = 1 if m_lead.group(1) is not None else (2 if m_lead.group(2) is not None else 3)
+        lead_span = (m_lead.start(grp), m_lead.end(grp))
+        lead_label = " ".join(m_lead.group(grp).split())
+        if lead_label in known.ids:
+            add(lead_span[0], lead_span[1], lead_label, lead_label, True, primary=True)
+        else:
+            cmd_step = known.by_command(lead_label) if grp == 1 else None
+            if cmd_step is not None:
+                add(lead_span[0], lead_span[1], cmd_step, lead_label, False, primary=True)
+            elif grp in (1, 2):
+                if _is_candidate_unknown_step_label(lead_label):
+                    is_step_id = "/" not in lead_label and not _COMMAND_HEAD_RE.match(lead_label)
+                    add(lead_span[0], lead_span[1], None, lead_label, is_step_id, primary=True)
+                elif grp == 1 and lead_label and lead_label.lower() not in _NON_STEP_LABELS and " " in lead_label:
+                    add(lead_span[0], lead_span[1], None, lead_label, False, primary=True)
+    if not in_fence:
+        for lo, hi, raw_inner in _inline_code_spans(line):
+            if overlaps(lo, hi):
+                continue
+            span = " ".join(raw_inner.split())
+            step_id = span if span in known.ids else known.by_command(span)
+            is_full_cell = any(clo <= lo and hi <= chi for clo, chi in full_cell_spans)
+            if step_id is not None or _COMMAND_HEAD_RE.match(span) or " -- " in span:
+                add(lo, hi, step_id, span, False, primary=is_full_cell)
     for step_id, pattern in known.id_res:
         for m in pattern.finditer(line):
             if not overlaps(m.start(), m.end()):
-                add(m.start(), m.end(), step_id, step_id, False)
+                is_col0 = any(
+                    idx == 0 and lo <= m.start() and m.end() <= hi
+                    and line[lo:hi].strip().strip("*") == step_id
+                    for idx, (lo, hi) in enumerate(table_cells)
+                )
+                add(m.start(), m.end(), step_id, step_id, False, primary=is_col0)
     if not in_fence:
         m_head = _HEADING_CODE_STEP_RE.match(line)
         if m_head is not None and not overlaps(m_head.start(1), m_head.end(1)):
             label = " ".join(m_head.group(1).split())
             if _is_candidate_unknown_step_label(label):
-                add(m_head.start(1), m_head.end(1), None, label, True)
-        m_lead = _LEADING_LABEL_RE.match(line)
-        if m_lead is not None:
-            grp = 1 if m_lead.group(1) is not None else 2
-            if not overlaps(m_lead.start(grp), m_lead.end(grp)):
-                label = " ".join(m_lead.group(grp).split())
-                if _is_candidate_unknown_step_label(label):
-                    add(m_lead.start(grp), m_lead.end(grp), None, label, True)
-                elif grp == 1 and label and label.lower() not in _NON_STEP_LABELS and " " in label:
-                    add(m_lead.start(grp), m_lead.end(grp), None, label, False)
-        if line.lstrip().startswith("|"):
-            cells = _table_cell_spans(line)
-            for idx, (lo, hi) in enumerate(cells):
+                is_step_id = "/" not in label and not _COMMAND_HEAD_RE.match(label)
+                add(m_head.start(1), m_head.end(1), None, label, is_step_id, primary=True)
+        m_bare_head = _HEADING_BARE_STEP_RE.match(line)
+        if m_bare_head is not None and not overlaps(m_bare_head.start(1), m_bare_head.end(1)):
+            label = m_bare_head.group(1)
+            if _is_candidate_unknown_step_label(label):
+                add(m_bare_head.start(1), m_bare_head.end(1), None, label, True, primary=True)
+        if is_table:
+            for idx, (lo, hi) in enumerate(table_cells):
                 if overlaps(lo, hi):
                     continue
                 cell = line[lo:hi].strip()
@@ -960,15 +1107,17 @@ def _line_refs(line: str, known: _KnownSteps, in_fence: bool) -> list[tuple[int,
                 if m_cell is not None:
                     label = " ".join(m_cell.group(1).split())
                     if _is_candidate_unknown_step_label(label) and label.upper() not in (_PASS_WORDS | _FAIL_WORDS):
-                        add(lo, hi, None, label, True)
-                elif idx == 0 and re.fullmatch(r"(?:\*\*)?([A-Za-z][A-Za-z0-9_.-]*)(?:\*\*)?", cell):
+                        is_step_id = "/" not in label and not _COMMAND_HEAD_RE.match(label)
+                        add(lo, hi, None, label, is_step_id, primary=True)
+                elif idx == 0 and re.fullmatch(r"(?:\*\*)?([A-Za-z0-9.~/][A-Za-z0-9_./~-]*)(?:\*\*)?", cell):
                     plain = cell.strip("*")
                     if (
-                        ("_" in plain or "-" in plain)
+                        ("_" in plain or "-" in plain or "/" in plain)
                         and _is_candidate_unknown_step_label(plain)
                         and plain.upper() not in (_PASS_WORDS | _FAIL_WORDS)
                     ):
-                        add(lo, hi, None, plain, True)
+                        is_step_id = "/" not in plain and not _COMMAND_HEAD_RE.match(plain)
+                        add(lo, hi, None, plain, is_step_id, primary=True)
     refs.sort(key=lambda ref: ref[0])
     return refs
 
@@ -1047,8 +1196,20 @@ def _line_claims(
 
     for m in list(_SHA_CLAIM_RE.finditer(work[0])):
         sep = m.group("sep")
-        explicit = bool(sep and sep != "|") or bool(m.group("tick"))
-        verdict, detail = _classify_sha(m.group("tick") + m.group("value"), explicit)
+        raw_val = m.group("value")
+        clean_val = raw_val.strip("`'\"*_").rstrip(".,;:)")
+        if sep == "|":
+            is_sep_or_hdr = bool(re.fullmatch(r"[-:\s]+", clean_val)) or clean_val.lower() in _TABLE_NON_SHA_HEADERS
+            has_sha_word = bool(_EXPLICIT_SHA_LABEL_RE.search(m.group("label")))
+            explicit = not is_sep_or_hdr and (
+                bool(m.group("tick"))
+                or any(ch.isdigit() for ch in clean_val)
+                or clean_val.lower() in _SHA_PLACEHOLDERS
+                or has_sha_word
+            )
+        else:
+            explicit = bool(sep) or bool(m.group("paren")) or bool(m.group("tick"))
+        verdict, detail = _classify_sha(m.group("tick") + raw_val, explicit)
         if verdict == "ignore":
             continue
         take(m)
@@ -1063,7 +1224,12 @@ def _line_claims(
         if part is not None and whole is not None:
             raw_metric = m.group(4).lower()
             snippet = m.group(0).strip()
-            if raw_metric.startswith("pass"):
+            if part > whole:
+                violations.append(
+                    Violation("MALFORMED_CLAIM", lineno, None,
+                              f"`{snippet}` numerator exceeds denominator")
+                )
+            elif raw_metric.startswith("pass"):
                 found.append((m.start(), "count", "passed", part, snippet))
                 found.append((m.start(), "count", "tests", whole, snippet))
             elif raw_metric == "killed":
@@ -1076,13 +1242,7 @@ def _line_claims(
                 found.append((m.start(), "count", "survived", part, snippet))
                 found.append((m.start(), "count", "total", whole, snippet))
             elif raw_metric.startswith("theorem"):
-                if part > whole:
-                    violations.append(
-                        Violation("MALFORMED_CLAIM", lineno, None,
-                                  f"`{snippet}` numerator exceeds denominator")
-                    )
-                else:
-                    found.append((m.start(), "count", "theorems", part, snippet))
+                found.append((m.start(), "count", "theorems", part, snippet))
     for pattern in _KILL_RATE_RES:
         for m in list(pattern.finditer(work[0])):
             take(m)
@@ -1099,6 +1259,12 @@ def _line_claims(
             raw_metric = m.group(1).lower()
             metric = _KV_METRIC_ALIASES.get(raw_metric, raw_metric)
             found.append((m.start(), "count", metric, value, m.group(0).strip()))
+    for m in list(_BAD_KV_RE.finditer(work[0])):
+        take(m)
+        violations.append(
+            Violation("MALFORMED_CLAIM", lineno, None,
+                      f"`{m.group(0).strip()}` is not an exact numeric verification claim")
+        )
     for metric, pattern in _COUNT_PATTERNS:
         for m in list(pattern.finditer(work[0])):
             take(m)
@@ -1107,8 +1273,9 @@ def _line_claims(
                 found.append((m.start(), "count", metric, value, m.group(0).strip()))
     for metric, pattern in _ZERO_WORD_RES:
         for m in list(pattern.finditer(work[0])):
+            neg = _preceded_by_negation(line, m.start())
             take(m)
-            found.append((m.start(), "count", metric, 0, m.group(0).strip()))
+            found.append((m.start(), "nonzero" if neg else "count", metric, 1 if neg else 0, m.group(0).strip()))
     for m in list(_RC_ASSIGN_RE.finditer(work[0])):
         take(m)
         token = m.group(1).rstrip(".:")
@@ -1141,11 +1308,13 @@ def _line_claims(
         else:
             found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
     for m in list(_STANDARD_AXIOMS_RE.finditer(work[0])):
+        neg = _preceded_by_negation(line, m.start())
         take(m)
-        found.append((m.start(), "axioms", "standard_only", None, m.group(0).strip()))
+        found.append((m.start(), "axioms", "non_standard" if neg else "standard_only", None, m.group(0).strip()))
     for m in list(_NO_AXIOMS_RE.finditer(work[0])):
+        neg = _preceded_by_negation(line, m.start())
         take(m)
-        found.append((m.start(), "axioms", "set", frozenset(), m.group(0).strip()))
+        found.append((m.start(), "axioms", "non_empty" if neg else "set", frozenset(), m.group(0).strip()))
     for m_list in list(_AXIOM_LIST_RE.finditer(work[0])):
         take(m_list)
         names = _axiom_names(m_list.group(1))
@@ -1161,6 +1330,18 @@ def _line_claims(
     return found
 
 
+def _find_outside_code_spans(
+    line: str, needle: str, pos: int, code_spans: Sequence[tuple[int, int, str]]
+) -> int:
+    """First index of `needle` at or after `pos` that does not start inside an inline code span."""
+    cur = pos
+    while True:
+        idx = line.find(needle, cur)
+        if idx == -1 or not _in_spans(idx, code_spans):
+            return idx
+        cur = idx + 1
+
+
 def _strip_ignore_and_comments_line(
     line: str,
     lineno: int,
@@ -1170,7 +1351,7 @@ def _strip_ignore_and_comments_line(
     comment_line: int,
     violations: list[Violation],
 ) -> tuple[str, bool, int, bool, int, bool]:
-    """Strip inline ignore blocks and HTML comments from one line.
+    """Strip inline ignore blocks and HTML comments outside inline code spans on one line.
 
     Returns `(kept_text, in_ignore, ignore_line, in_comment, comment_line, was_ignored)`.
     Text outside `ignore-begin`..`ignore-end` on the same line is preserved.
@@ -1203,9 +1384,11 @@ def _strip_ignore_and_comments_line(
             pos = close_at + 3
             out.append(" ")
         else:
-            begin_at = line.find(_IGNORE_BEGIN, pos)
-            end_at = line.find(_IGNORE_END, pos)
-            comm_at = line.find("<!--", pos)
+            code_spans = _inline_code_spans(line[pos:])
+            shifted = [(pos + lo, pos + hi, inner) for lo, hi, inner in code_spans]
+            begin_at = _find_outside_code_spans(line, _IGNORE_BEGIN, pos, shifted)
+            end_at = _find_outside_code_spans(line, _IGNORE_END, pos, shifted)
+            comm_at = _find_outside_code_spans(line, "<!--", pos, shifted)
             candidates = [idx for idx in (begin_at, end_at, comm_at) if idx != -1]
             if not candidates:
                 out.append(line[pos:])
@@ -1229,6 +1412,16 @@ def _strip_ignore_and_comments_line(
     return kept, in_ignore, ignore_line, in_comment, comment_line, had_ignored and not kept.strip()
 
 
+def _select_ref_for_pos(
+    refs: Sequence[tuple[int, str | None, str, bool, bool]], pos: int
+) -> tuple[int, str | None, str, bool, bool]:
+    """Pick the step reference governing position `pos` within a clause or line."""
+    primaries = [r for r in refs if r[4]]
+    pool = primaries if primaries else list(refs)
+    before = [r for r in pool if r[0] <= pos]
+    return before[-1] if before else pool[0]
+
+
 def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[Violation], int]:
     """Claims of a Markdown document, the violations found while reading it, and the
     number of explicitly ignored lines."""
@@ -1244,29 +1437,44 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         text = _CONTROL_RE.sub(" ", text)
     text = _INVISIBLE_RE.sub("", text)
     known = _KnownSteps(steps)
-    in_fence = in_ignore = in_comment = False
+    fence_state: tuple[str, int, int] | None = None  # (char, length, open_lineno)
+    in_ignore = in_comment = False
     ignore_line = comment_line = 0
     heading_ctx: tuple[str | None, str, bool] | None = None
     para_ctx: tuple[str | None, str, bool] | None = None
     for lineno, line in enumerate(text.split("\n"), 1):
-        line, in_ignore, ignore_line, in_comment, comment_line, was_ignored = (
-            _strip_ignore_and_comments_line(
-                line, lineno, in_ignore, ignore_line, in_comment, comment_line, violations
+        if fence_state is not None:
+            f_ch, f_len, _f_line = fence_state
+            if _IGNORE_BEGIN in line or _IGNORE_END in line:
+                violations.append(
+                    Violation("MALFORMED_CLAIMS", lineno, None,
+                              "claim-guard ignore directive is not permitted inside a fenced code block")
+                )
+            if re.match(rf"^\s{{0,3}}{re.escape(f_ch)}{{{f_len},}}\s*$", line):
+                fence_state = None
+                para_ctx = None
+                continue
+        else:
+            line, in_ignore, ignore_line, in_comment, comment_line, was_ignored = (
+                _strip_ignore_and_comments_line(
+                    line, lineno, in_ignore, ignore_line, in_comment, comment_line, violations
+                )
             )
-        )
-        if was_ignored:
-            ignored += 1
-            continue
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            para_ctx = None
-            continue
-        line = _STRIKE_RE.sub(" ", line)
+            if was_ignored:
+                ignored += 1
+                continue
+            m_fence = _FENCE_OPEN_RE.match(line)
+            if m_fence is not None and not (m_fence.group(1)[0] == "`" and "`" in m_fence.group(2)):
+                fence_state = (m_fence.group(1)[0], len(m_fence.group(1)), lineno)
+                para_ctx = None
+                continue
+            line = _strip_strikethrough_outside_code(line)
+        in_fence = fence_state is not None
         if not line.strip():
             if not in_fence:
                 para_ctx = None
             continue
-        if _HISTORICAL_RE.match(line):
+        if not in_fence and _HISTORICAL_RE.match(line):
             ignored += 1
             continue
         is_table_row = not in_fence and line.lstrip().startswith("|")
@@ -1274,23 +1482,24 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         if is_table_row or is_list_item:
             para_ctx = None
         refs = _line_refs(line, known, in_fence)
-        clauses = _clause_spans(line)
+        clauses = _clause_spans(line) if not in_fence else [(0, len(line))]
         for pos, kind, metric, value, snippet in _line_claims(line, lineno, violations):
             if kind == "commit_sha" or metric == "all":
                 # A commit names the whole run, and "all ... pass" every step.
                 claims.append(Claim(kind, metric, value, lineno, snippet, None))
                 continue
             seg_refs = [
-                ref for lo, hi in clauses if lo <= pos < hi
-                for ref in refs if lo <= ref[0] < hi
+                r for lo, hi in clauses if lo <= pos < hi
+                for r in refs if lo <= r[0] < hi
             ]
             if seg_refs:
-                seg_before = [ref for ref in seg_refs if ref[0] <= pos]
-                ref = seg_before[-1] if seg_before else seg_refs[0]
+                chosen = _select_ref_for_pos(seg_refs, pos)
+                ref3: tuple[str | None, str, bool] | None = chosen[1:4]
+            elif refs:
+                chosen = _select_ref_for_pos(refs, pos)
+                ref3 = chosen[1:4]
             else:
-                before = [ref for ref in refs if ref[0] <= pos]
-                ref = (before[-1] if before else refs[0]) if refs else (para_ctx or heading_ctx)
-            ref3 = ref[-3:] if ref else None
+                ref3 = para_ctx or heading_ctx
             if ref3 is None:
                 claims.append(Claim(kind, metric, value, lineno, snippet, None))
             elif ref3[0] is None:
@@ -1298,7 +1507,9 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                 claims.append(Claim(kind, metric, value, lineno, snippet, None, missing))
             else:
                 claims.append(Claim(kind, metric, value, lineno, snippet, ref3[0]))
-        distinct = sorted({ref[1:] for ref in refs}, key=repr)
+        primary_refs = [r for r in refs if r[4]]
+        ctx_pool = primary_refs if primary_refs else refs
+        distinct = sorted({r[1:4] for r in ctx_pool}, key=repr)
         is_heading = not in_fence and line.lstrip().startswith("#")
         if is_heading:
             heading_ctx = distinct[0] if len(distinct) == 1 else None
@@ -1307,6 +1518,11 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
             para_ctx = None
         elif distinct:
             para_ctx = distinct[0] if len(distinct) == 1 else None
+    if fence_state is not None:
+        violations.append(
+            Violation("MALFORMED_CLAIMS", fence_state[2], None,
+                      "fenced code block is never closed")
+        )
     if in_ignore:
         violations.append(
             Violation("MALFORMED_CLAIMS", ignore_line, None,
@@ -1436,6 +1652,22 @@ def verify_claims(
             elif not failing:
                 add("EXIT_CODE_MISMATCH", claim, f"`{claim.text}` but {scope} passed")
 
+        elif claim.kind == "nonzero":
+            metric = claim.metric
+            reporting = [step for step in targets if _metric_value(step, metric) is not None]
+            if metric == "sorry" and not reporting:
+                with_axioms = [step for step in targets if step.axioms is not None]
+                if with_axioms:
+                    if not any("sorryAx" in (step.axioms or ()) for step in with_axioms):
+                        add("SORRY_VIOLATION", claim, f"`{claim.text}` but {scope} have no `sorryAx`")
+                    continue
+            if not reporting:
+                add("UNBACKED_CLAIM", claim, f"`{claim.text}`: {scope} report no `{metric}` count")
+                continue
+            actual = sum(_metric_value(step, metric) or 0 for step in reporting)
+            if actual == 0:
+                add(_count_code(metric, 1, 0), claim, f"`{claim.text}` but {scope} report 0 `{metric}`")
+
         elif claim.kind == "count":
             metric, claimed = claim.metric, int(claim.value)  # type: ignore[call-overload]
             reporting = [step for step in targets if _metric_value(step, metric) is not None]
@@ -1458,6 +1690,24 @@ def verify_claims(
                     else f"the {len(reporting)} receipts that report it sum to {actual}; name the step"
                 )
                 add(_count_code(metric, claimed, actual), claim, f"`{claim.text}` but {basis}")
+            elif claimed == 0 and metric in ("failed", "survived", "errors"):
+                # Claiming `0 failed`, `0 survived`, or `0 errors` must not mask a crashed,
+                # fatally aborted, or uncounted failing step.
+                for step in targets:
+                    fail_reason = step.failure()
+                    if fail_reason is None:
+                        continue
+                    if metric == "failed" and (_metric_value(step, "failed") or 0) == 0:
+                        if step.counts.get("survived", 0) == 0 and step.counts.get("errors", 0) == 0:
+                            add("SUPPRESSED_FAILURE", claim,
+                                f"`{claim.text}` but step `{step.step_id}` failed ({fail_reason})", step.step_id)
+                    elif metric == "survived" and step.counts.get("survived", 0) == 0:
+                        if step.fatal_error is not None or step.counts.get("total", 0) == 0 or step.counts.get("errors", 0) > 0:
+                            add("SUPPRESSED_FAILURE", claim,
+                                f"`{claim.text}` but step `{step.step_id}` failed ({fail_reason})", step.step_id)
+                    elif metric == "errors" and step.counts.get("errors", 0) == 0 and step.fatal_error is not None:
+                        add("SUPPRESSED_FAILURE", claim,
+                            f"`{claim.text}` but step `{step.step_id}` failed ({fail_reason})", step.step_id)
 
         elif claim.kind == "kill_rate":
             rated = [step for step in targets if step.counts.get("total") and "killed" in step.counts]
@@ -1481,6 +1731,15 @@ def verify_claims(
             with_axioms = [step for step in targets if step.axioms is not None]
             if not with_axioms:
                 add("UNBACKED_CLAIM", claim, f"`{claim.text}`: {scope} report no axiom list")
+                continue
+            if claim.metric == "non_standard":
+                if all(set(step.axioms or ()) <= ALLOWED_KERNEL_AXIOMS for step in with_axioms):
+                    add("AXIOM_SET_MISMATCH", claim,
+                        f"`{claim.text}` but {scope} use only standard kernel axioms")
+                continue
+            if claim.metric == "non_empty":
+                if all(not (step.axioms or ()) for step in with_axioms):
+                    add("AXIOM_SET_MISMATCH", claim, f"`{claim.text}` but {scope} use 0 axioms")
                 continue
             allowed = ALLOWED_KERNEL_AXIOMS if claim.metric == "standard_only" else set(claim.value)  # type: ignore[arg-type]
             for step in with_axioms:
@@ -1603,8 +1862,8 @@ def format_report(report: dict[str, object]) -> str:
 
 
 def _write_json_out(path: Path, report: dict[str, object], *, no_symlinks: bool = False) -> None:
-    if no_symlinks and os.path.islink(path):
-        raise OSError(f"{path} is a symlink (--no-symlinks)")
+    if no_symlinks:
+        _ensure_no_symlink_components(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
     fd, tmp_name = tempfile.mkstemp(prefix=".rcg-", suffix=".tmp", dir=str(path.parent))
@@ -1654,6 +1913,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     specs: list[tuple[Path, str | None, bool]] = []
     for raw in args.receipt:
         head, sep, tail = raw.partition("=")
+        if sep and not head:
+            parser.error(f"--receipt {raw!r}: empty STEP_ID before '='")
         if sep and _STEP_ID_ARG_RE.fullmatch(head):
             if not tail:
                 parser.error(f"--receipt {raw!r}: missing PATH after STEP_ID=")
@@ -1672,8 +1933,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in args.allow_conditional_axiom:
         if not _AXIOM_NAME_RE.fullmatch(name) or name in NEVER_ALLOWED_AXIOMS:
             parser.error(f"--allow-conditional-axiom {name!r} cannot be authorized")
-    if any(not step_id.strip() for step_id in args.require_step):
-        parser.error("--require-step needs a non-empty STEP_ID")
+    if any(not step_id.strip() or step_id != step_id.strip() or "\n" in step_id for step_id in args.require_step):
+        parser.error("--require-step needs a clean single-line non-empty STEP_ID")
     if args.max_elapsed_ms is not None and not (0 < args.max_elapsed_ms < float("inf")):
         parser.error("--max-elapsed-ms must be a positive finite number")
 
