@@ -55,6 +55,8 @@ Trees*):
   productivity when none is, rejects `ITree.spin` unconditionally, and admits
   the fair retry-loop rule `FairInfOften.iter_fair` for CAS loops, which `DWP`
   and plain `InfOften` cannot verify (`fairInfOften_strict_separation`).
+  `CoBuchi` (`◇□`) is its accepting-edge-free instance; `buchiSat_nondet_incomplete`
+  shows that `BuchiSat` with a nondeterministic monitor cannot replace it.
 - **`iterChain`**: the finite-unfolding $\omega$-chain of `ITree.iter`, its
   convergence in the projective `CofixA` order (`ofITree_iterChain`), and the
   safety ($\bigwedge_n$) versus eventuality ($\bigvee_n$) continuity laws.
@@ -6615,6 +6617,261 @@ theorem FairInfOften.interp {E₁ E₂ : Effect.{u}}
     exact h_lift_prog i k (fun o s' => FairInfOften ewp₁ Acc₁ Fair₁ Q (k o) s')
       (fun o s' hk => h_main (k o) s' hk) m s₀ hm
 
+/--
+**Stateful handler linking** for `FairInfOften` across `ITree.interpState`,
+threading the handler state `H` that the source transformer treats as its
+logical state. The link condition is the stateful analogue of the parity
+constraint of `FairInfOften.interp`: handler returns before any visible `E₂`
+step (or after a `Fair₂` edge) land only in `K3`, unfair `E₂` edges may return
+into `K3 ∨ K2`, and `Acc₂` edges reset to `FairInfOften` over `K4 ∨ K3 ∨ K2`.
+-/
+theorem FairInfOften.interpState {H : Type u} {E₁ E₂ : Effect.{u}} {R : Type u}
+    {ewp₁ : StateEffectWP H E₁} {ewp₂ : EffectWP E₂}
+    {Acc₁ Fair₁ : (i : E₁.I) → E₁.O i → H → H → Prop}
+    {Acc₂ Fair₂ : (j : E₂.I) → E₂.O j → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    (h : (i : E₁.I) → H → ITree E₂ (E₁.O i × H))
+    (h_link : ∀ (i : E₁.I) (K4 K3 K2 : E₁.O i → H → Prop) (st : H),
+      ewp₁.wp i (fun o st' =>
+        (Acc₁ i o st st' ∧ K4 o st') ∨
+        (Fair₁ i o st st' ∧ K3 o st') ∨
+        (¬ Fair₁ i o st st' ∧ K2 o st')) st →
+      fairStep ewp₂ Acc₂ Fair₂ (fun pair _ => K3 pair.1 pair.2)
+        (FairInfOften ewp₂ Acc₂ Fair₂
+          (fun pair _ => K4 pair.1 pair.2 ∨ K3 pair.1 pair.2 ∨ K2 pair.1 pair.2))
+        (fairProgress ewp₂ Acc₂ Fair₂ (fun pair _ => K3 pair.1 pair.2)
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair _ => K4 pair.1 pair.2 ∨ K3 pair.1 pair.2 ∨ K2 pair.1 pair.2)))
+        (fairStall ewp₂ Acc₂ Fair₂
+          (fun pair _ => K3 pair.1 pair.2 ∨ K2 pair.1 pair.2)
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair _ => K4 pair.1 pair.2 ∨ K3 pair.1 pair.2 ∨ K2 pair.1 pair.2))
+          (fairProgress ewp₂ Acc₂ Fair₂ (fun pair _ => K3 pair.1 pair.2)
+            (FairInfOften ewp₂ Acc₂ Fair₂
+              (fun pair _ => K4 pair.1 pair.2 ∨ K3 pair.1 pair.2 ∨ K2 pair.1 pair.2))))
+        (h i st) PUnit.unit)
+    {t : ITree E₁ R} {Q : R → H → Prop} {st : H}
+    (h_fi : FairInfOften ewp₁ Acc₁ Fair₁ Q t st) :
+    FairInfOften ewp₂ Acc₂ Fair₂ (fun pair _ => Q pair.1 pair.2)
+      (ITree.interpState h t st) PUnit.unit := by
+  let Q₂ : R × H → PUnit.{u + 1} → Prop := fun pair _ => Q pair.1 pair.2
+  let X : ITree E₂ (R × H) → PUnit.{u + 1} → Prop := fun u _ =>
+    (∃ t₀ st₀, u = ITree.interpState h t₀ st₀ ∧
+      FairInfOften ewp₁ Acc₁ Fair₁ Q t₀ st₀) ∨
+    (∃ (i : E₁.I) (m : ITree E₂ (E₁.O i × H)) (k : E₁.O i → ITree E₁ R),
+      u = (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+      FairInfOften ewp₂ Acc₂ Fair₂
+        (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2)
+        m PUnit.unit)
+  let FP : ITree E₂ (R × H) → PUnit.{u + 1} → Prop :=
+    fairProgress ewp₂ Acc₂ Fair₂ Q₂ X
+  have h_lift_prog : ∀ (i : E₁.I) (k : E₁.O i → ITree E₁ R)
+      (P3 : E₁.O i × H → PUnit.{u + 1} → Prop),
+      (∀ pair s', P3 pair s' →
+        FP (ITree.interpState h (k pair.1) pair.2) s') →
+      ∀ (m : ITree E₂ (E₁.O i × H)) (s₀ : PUnit.{u + 1}),
+        fairProgress ewp₂ Acc₂ Fair₂ P3
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2))
+          m s₀ →
+        FP (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₀ := by
+    intro i k P3 hP3 m s₀ hm
+    refine fairProgress.induct
+      (fun m₁ s₁ => FP (m₁ >>= fun (o, st') => .tau (ITree.interpState h (k o) st'))
+        s₁) ?_ hm
+    intro m₁ s₁ hm₁
+    dsimp only [FP]
+    rw [fairProgress.unfold_eq]
+    let Zm : ITree E₂ (R × H) → PUnit.{u + 1} → Prop := fun u s₂ =>
+      (∃ m₂, u = (m₂ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+        fairStall ewp₂ Acc₂ Fair₂ P3
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2))
+          (fun m₃ s₃ =>
+            FP (m₃ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃)
+          m₂ s₂) ∨
+      FP u s₂
+    refine fairStall.coinduct Zm ?_ (Or.inl ⟨m₁, rfl, hm₁⟩)
+    rintro u s₂ (⟨m₂, rfl, hm₂⟩ | hu)
+    · rw [fairStall.unfold_eq] at hm₂
+      refine fairStep.induct
+        (fun m₃ s₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Zm
+          (m₃ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃) ?_ hm₂
+      intro m₃ s₃ hm₃
+      cases hm_obs : m₃.observe with
+      | ret pair =>
+        simp only [hm_obs] at hm₃
+        rcases pair with ⟨o, st'⟩
+        rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+        exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+          (fairProgress.toFairStep (hP3 (o, st') s₃ hm₃))
+      | tau m₃' =>
+        simp only [hm_obs] at hm₃
+        rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm₃
+      | vis j c =>
+        simp only [hm_obs] at hm₃
+        rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+        refine ewp₂.mono (fun o₂ s' hp => ?_) hm₃
+        rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hpre⟩ | ⟨hnf, hst⟩
+        · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl, hfi_m⟩⟩
+        · exact Or.inr (Or.inl ⟨hf, hpre⟩)
+        · exact Or.inr (Or.inr ⟨hnf, Or.inl ⟨c o₂, rfl, hst⟩⟩)
+    · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+        (fairProgress.toFairStep hu)
+  have h_main : ∀ (t₀ : ITree E₁ R) (st₀ : H),
+      FairInfOften ewp₁ Acc₁ Fair₁ Q t₀ st₀ →
+      FP (ITree.interpState h t₀ st₀) PUnit.unit := by
+    intro t₀ st₀ ht₀
+    rw [FairInfOften.unfold_eq] at ht₀
+    let Pre : ITree E₁ R → H → Prop := fun v st₃ =>
+      FairInfOften ewp₁ Acc₁ Fair₁ Q v st₃ ∧ FP (ITree.interpState h v st₃) PUnit.unit
+    refine (fairProgress.induct Pre ?_ ht₀).2
+    intro t₁ st₁ ht₁
+    have hfi_t₁ : FairInfOften ewp₁ Acc₁ Fair₁ Q t₁ st₁ :=
+      fairStall_to_fairInfOften
+        (fairStall.mono (fun _ _ hx => hx) (fun _ _ hp => hp.1) ht₁)
+    refine ⟨hfi_t₁, ?_⟩
+    dsimp only [FP]
+    rw [fairProgress.unfold_eq]
+    let Z : ITree E₂ (R × H) → PUnit.{u + 1} → Prop := fun u _ =>
+      (∃ t₂ st₂, u = ITree.interpState h t₂ st₂ ∧
+        fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre t₂ st₂) ∨
+      (∃ (i : E₁.I) (m : ITree E₂ (E₁.O i × H)) (k : E₁.O i → ITree E₁ R),
+        u = (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+        fairStall ewp₂ Acc₂ Fair₂
+          (fun pair _ => Pre (k pair.1) pair.2 ∨
+            fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre
+              (k pair.1) pair.2)
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2))
+          (fairProgress ewp₂ Acc₂ Fair₂ (fun pair _ => Pre (k pair.1) pair.2)
+            (FairInfOften ewp₂ Acc₂ Fair₂
+              (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2)))
+          m PUnit.unit) ∨
+      FP u PUnit.unit
+    have h_step_t : ∀ t₂ st₂,
+        fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre t₂ st₂ →
+        fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z (ITree.interpState h t₂ st₂) PUnit.unit := by
+      intro t₂ st₂ ht₂
+      rw [fairStall.unfold_eq] at ht₂
+      refine fairStep.induct
+        (fun t₃ st₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+          (ITree.interpState h t₃ st₃) PUnit.unit) ?_ ht₂
+      intro t₃ st₃ ht₃
+      cases h_obs : t₃.observe with
+      | ret r =>
+        simp only [h_obs] at ht₃
+        rw [eq_ret_of_observe h_obs, interpState_ret, fairStep.ret_iff]; exact ht₃
+      | tau t₃' =>
+        simp only [h_obs] at ht₃
+        rw [eq_tau_of_observe h_obs, interpState_tau, fairStep.tau_iff]; exact ht₃
+      | vis i k =>
+        simp only [h_obs] at ht₃
+        rw [eq_vis_of_observe h_obs, interpState_vis]
+        let K4 : E₁.O i → H → Prop := fun o st' =>
+          FairInfOften ewp₁ Acc₁ Fair₁ Q (k o) st'
+        let K3 : E₁.O i → H → Prop := fun o st' => Pre (k o) st'
+        let K2 : E₁.O i → H → Prop := fun o st' =>
+          fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre (k o) st'
+        have h_all_fi : ∀ (pair : E₁.O i × H) (s' : PUnit.{u + 1}),
+            K4 pair.1 pair.2 ∨ K3 pair.1 pair.2 ∨ K2 pair.1 pair.2 →
+            K4 pair.1 pair.2 := by
+          intro pair s' hdisj
+          rcases hdisj with h4 | h3 | h2
+          · exact h4
+          · exact h3.1
+          · exact fairStall_to_fairInfOften
+              (fairStall.mono (fun _ _ hx => hx) (fun _ _ hp => hp.1) h2)
+        have h_l := h_link i K4 K3 K2 st₃ ht₃
+        refine fairStep.induct
+          (fun m s₄ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+            (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₄) ?_ h_l
+        intro m s₄ hm
+        cases hm_obs : m.observe with
+        | ret pair =>
+          simp only [hm_obs] at hm
+          rcases pair with ⟨o, st'⟩
+          rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+          exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+            (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hm.2)
+        | tau m' =>
+          simp only [hm_obs] at hm
+          rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm
+        | vis j c =>
+          simp only [hm_obs] at hm
+          rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+          refine ewp₂.mono (fun o₂ s' hp => ?_) hm
+          rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hprog_m⟩ | ⟨hnf, hst_m⟩
+          · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl,
+              FairInfOften.mono_post h_all_fi hfi_m⟩⟩
+          · refine Or.inr (Or.inl ⟨hf, h_lift_prog i k (fun pair _ => K3 pair.1 pair.2)
+              (fun _ _ hp => hp.2) (c o₂) s' ?_⟩)
+            exact fairProgress.mono
+              (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm') hprog_m
+          · refine Or.inr (Or.inr ⟨hnf, Or.inr (Or.inl ⟨i, c o₂, k, rfl, ?_⟩)⟩)
+            exact fairStall.mono
+              (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm')
+              (fun _ _ hp' => fairProgress.mono
+                (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm') hp') hst_m
+    refine fairStall.coinduct Z ?_ (Or.inl ⟨t₁, st₁, rfl, ht₁⟩)
+    rintro u ⟨⟩ (⟨t₂, st₂, rfl, ht₂⟩ | ⟨i, m, k, rfl, hm⟩ | hu)
+    · exact h_step_t t₂ st₂ ht₂
+    · rw [fairStall.unfold_eq] at hm
+      refine fairStep.induct
+        (fun m₁ s₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+          (m₁ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃) ?_ hm
+      intro m₁ s₃ hm₁
+      cases hm_obs : m₁.observe with
+      | ret pair =>
+        simp only [hm_obs] at hm₁
+        rcases pair with ⟨o, st'⟩
+        rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+        rcases hm₁ with hpre | hst_k
+        · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+            (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hpre.2)
+        · exact h_step_t (k o) st' hst_k
+      | tau m₁' =>
+        simp only [hm_obs] at hm₁
+        rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm₁
+      | vis j c =>
+        simp only [hm_obs] at hm₁
+        rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+        refine ewp₂.mono (fun o₂ s' hp => ?_) hm₁
+        rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hprog_m⟩ | ⟨hnf, hst_m⟩
+        · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl, hfi_m⟩⟩
+        · exact Or.inr (Or.inl ⟨hf, h_lift_prog i k (fun pair _ => Pre (k pair.1) pair.2)
+            (fun _ _ hp => hp.2) (c o₂) s' hprog_m⟩)
+        · exact Or.inr (Or.inr ⟨hnf, Or.inr (Or.inl ⟨i, c o₂, k, rfl, hst_m⟩)⟩)
+    · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+        (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hu)
+  refine FairInfOften.coinduct X ?_ (Or.inl ⟨t, st, rfl, h_fi⟩)
+  rintro u ⟨⟩ (⟨t₀, st₀, rfl, ht₀⟩ | ⟨i, m, k, rfl, hm⟩)
+  · exact h_main t₀ st₀ ht₀
+  · rw [FairInfOften.unfold_eq] at hm
+    exact h_lift_prog i k
+      (fun pair _ => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) pair.2)
+      (fun pair _ hk => h_main (k pair.1) pair.2 hk) m PUnit.unit hm
+
+/--
+The link condition of `FairInfOften.interpState` is satisfiable: the
+state-threading re-trigger handler preserves fairness-conditional recurrence.
+-/
+theorem FairInfOften.interpState_retrigger {E : Effect.{u}} {R : Type u}
+    {ewp : EffectWP E}
+    {AccEdge Fair : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {t : ITree E R} {Q : R → PUnit.{u + 1} → Prop}
+    (h_fi : FairInfOften ewp AccEdge Fair Q t PUnit.unit) :
+    FairInfOften ewp AccEdge Fair (fun pair _ => Q pair.1 pair.2)
+      (ITree.interpState (fun i st => ITree.vis i (fun o => ITree.ret (o, st))) t
+        PUnit.unit) PUnit.unit := by
+  refine FairInfOften.interpState _ ?_ h_fi
+  intro i K4 K3 K2 st hw
+  refine (fairStep.vis_iff _ _ _ _ _ _ _ _ _ _).2 (ewp.mono ?_ hw)
+  rintro o s' (⟨ha, h4⟩ | ⟨hf, h3⟩ | ⟨hnf, h2⟩)
+  · exact Or.inl ⟨ha, FairInfOften.ret (Or.inl h4)⟩
+  · exact Or.inr (Or.inl ⟨hf, fairProgress.of_dwp _ (DWP.ret h3)⟩)
+  · refine Or.inr (Or.inr ⟨hnf, ?_⟩)
+    rw [fairStall.unfold_eq, fairStep.ret_iff]; exact Or.inr h2
+
 /-- Re-triggering each request satisfies the link condition of `FairInfOften.interp`. -/
 theorem FairInfOften.interp_trigger {ewp : StateEffectWP S E}
     {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
@@ -6629,6 +6886,43 @@ theorem FairInfOften.interp_trigger {ewp : StateEffectWP S E}
   · exact Or.inr (Or.inl ⟨hf, fairProgress.of_dwp _ (DWP.ret h3)⟩)
   · refine Or.inr (Or.inr ⟨hnf, ?_⟩)
     rw [fairStall.unfold_eq, fairStep.ret_iff]; exact Or.inr h2
+
+/--
+**Vacuity warning for edge-local fairness.** A productive tree that never takes
+a `Fair` edge satisfies `FairInfOften` for *every* choice of accepting edges:
+`□◇ Fair` is simply never triggered. In particular a retry loop that never
+issues the fair-able operation (e.g. spins on loads without attempting the CAS)
+is not refuted. Specifications should therefore classify as `Fair` every
+cooperative environment answer the program could exploit (an
+enabledness-based choice `Fair i o s s' := Enabled s` yields strong fairness).
+-/
+theorem FairInfOften.of_never_fair {ewp : StateEffectWP S E}
+    [h_conj : StateEffectWP.Conjunctive ewp]
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {P Q : R → S → Prop}
+    {t : ITree E R} {s : S}
+    (h_nf : AlwaysStep ewp (fun i o s₀ s' => ¬ Fair i o s₀ s') P t s)
+    (h_prod : InfOften ewp (fun _ _ _ _ => True) Q t s) :
+    FairInfOften ewp AccEdge Fair Q t s := by
+  let X : ITree E R → S → Prop := fun x s₀ =>
+    AlwaysStep ewp (fun i o s₁ s' => ¬ Fair i o s₁ s') P x s₀ ∧
+      InfOften ewp (fun _ _ _ _ => True) Q x s₀
+  refine FairInfOften.coinduct X ?_ ⟨h_nf, h_prod⟩
+  intro x s₀ hx
+  rw [fairProgress.unfold_eq]
+  refine fairStall.coinduct X ?_ hx
+  rintro y s₁ ⟨hay, hiy⟩
+  refine InfOften.progress_induct
+    (fun z s₂ => AlwaysStep ewp (fun i o s₃ s' => ¬ Fair i o s₃ s') P z s₂ →
+      fairStep ewp AccEdge Fair Q X (fairProgress ewp AccEdge Fair Q X) X z s₂)
+    ?_ hiy hay
+  intro z s₂ hz haz
+  rw [fairStep.unfold_eq]
+  rw [AlwaysStep.unfold_eq] at haz
+  cases h_obs : z.observe <;> simp only [h_obs] at hz haz ⊢
+  · exact hz
+  · exact hz.2 haz
+  · exact ewp.mono
+      (fun _ _ hp => Or.inr (Or.inr ⟨hp.2.1, hp.2.2, hp.1.1⟩)) (h_conj.conj hz haz)
 
 private def fairIterAux {I : Type u} (ewp : StateEffectWP S E)
     (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
@@ -8071,6 +8365,240 @@ theorem fairService_strict_separation (Q : PEmpty.{1} → PUnit.{1} → Prop) :
   exact ⟨h_both.1, h_both.2, not_dwp_diverging_loop _ _, h_not_io⟩
 
 end FairCanaries
+
+/-! #### Co-Büchi Persistence (`◇□`) -/
+
+section CoBuchi
+
+variable {S : Type u} {E : Effect.{u}} {R : Type u}
+
+/--
+Co-Büchi persistence `◇□ ¬ Bad`: on every path the tree returns with `Q`, or
+takes `Bad` edges only finitely often (without silently diverging). This is
+the Streett condition `□◇ Bad → □◇ False`, i.e. `FairInfOften` with no
+accepting edges.
+-/
+def CoBuchi (ewp : StateEffectWP S E) (Bad : (i : E.I) → E.O i → S → S → Prop)
+    (Q : R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  FairInfOften ewp (fun _ _ _ _ => False) Bad Q t s
+
+/-- `CoBuchi` is fairness-conditional recurrence without accepting edges. -/
+theorem coBuchi_iff (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    CoBuchi ewp Bad Q t s ↔ FairInfOften ewp (fun _ _ _ _ => False) Bad Q t s :=
+  Iff.rfl
+
+/-- Silent divergence is never persistent. -/
+theorem not_coBuchi_spin {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop} {s : S} :
+    ¬ CoBuchi ewp Bad Q (ITree.spin (E := E) (R := R)) s :=
+  not_fairInfOften_spin
+
+/-- Total correctness implies persistence. -/
+theorem CoBuchi.of_dwp {ewp : StateEffectWP S E}
+    (Bad : (i : E.I) → E.O i → S → S → Prop) {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : DWP ewp t Q s) : CoBuchi ewp Bad Q t s :=
+  fairInfOften_of_dwp _ Bad h
+
+/-- Persistence of `Bad` implies persistence of any smaller edge class. -/
+theorem CoBuchi.mono {ewp : StateEffectWP S E}
+    {Bad Bad' : (i : E.I) → E.O i → S → S → Prop} {P Q : R → S → Prop}
+    {t : ITree E R} {s : S}
+    (h_bad : ∀ i o s₀ s', Bad' i o s₀ s' → Bad i o s₀ s')
+    (h_post : ∀ r s', P r s' → Q r s') (h : CoBuchi ewp Bad P t s) :
+    CoBuchi ewp Bad' Q t s :=
+  FairInfOften.mono (fun _ _ _ _ ha => ha) h_bad h_post h
+
+end CoBuchi
+
+/-! #### Completeness Boundary of `BuchiSat` for Nondeterministic Monitors -/
+
+section BuchiNondetIncomplete
+
+/-- Two visible letters: `fgReqA` (`a`) and `fgReqB` (`b`), each answered by a `Bool`. -/
+abbrev FgE : Effect.{0} := CallE Bool (fun _ => Bool)
+
+/-- The letter `a`. -/
+def fgReqA : FgE.I := CallReq.call true
+
+/-- The letter `b`. -/
+def fgReqB : FgE.I := CallReq.call false
+
+/-- Decode the environment's boolean answer. -/
+def fgAns : (i : FgE.I) → FgE.O i → Bool
+  | .call _, b => b
+
+/-- Answer "keep emitting `a`" to the letter `a`. -/
+def fgYes : FgE.O fgReqA := (true : Bool)
+
+/-- Answer "switch to `b`" to the letter `a`. -/
+def fgNo : FgE.O fgReqA := (false : Bool)
+
+/-- Any answer to the letter `b`. -/
+def fgAnyB : FgE.O fgReqB := (true : Bool)
+
+/-- Demonic environment answering every letter. -/
+abbrev fgWP : StateEffectWP PUnit.{1} FgE :=
+  unconstrainedCallWP PUnit.{1} Bool (fun _ => Bool)
+
+/-- `b`-edges. -/
+def fgIsB : (i : FgE.I) → FgE.O i → PUnit.{1} → PUnit.{1} → Prop :=
+  fun i _ _ _ => i = fgReqB
+
+/--
+Coalgebra of the tree `T = a. (T + b. a^ω)`: in state `none` emit `a` and let
+the environment decide between staying in `T` or moving to `some false`
+(emit one `b`), after which `some true` emits `a` forever.
+-/
+def fgStep : Option Bool → ITreeF FgE PEmpty.{1} (Option Bool)
+  | none => .vis fgReqA (fun c => if fgAns fgReqA c then none else some false)
+  | some false => .vis fgReqB (fun _ => some true)
+  | some true => .vis fgReqA (fun _ => some true)
+
+/-- The trees of the coalgebra `fgStep`. -/
+def fgTree : Option Bool → ITree FgE PEmpty.{1} :=
+  ITree.cofix fgStep
+
+theorem fgTree_none_observe :
+    (fgTree none).observe =
+      .vis fgReqA (fun c => fgTree (if fgAns fgReqA c then none else some false)) :=
+  (ITree.observe_cofix _ _).trans rfl
+
+theorem fgTree_b_observe :
+    (fgTree (some false)).observe = .vis fgReqB (fun _ => fgTree (some true)) :=
+  (ITree.observe_cofix _ _).trans rfl
+
+theorem fgTree_a_observe :
+    (fgTree (some true)).observe = .vis fgReqA (fun _ => fgTree (some true)) :=
+  (ITree.observe_cofix _ _).trans rfl
+
+/--
+The textbook two-state nondeterministic Büchi automaton for `◇□ a`: state
+`false` reads anything and may guess to commit; state `true` only reads `a`
+and accepts.
+-/
+def fgSpec : BuchiSpec PUnit.{1} Bool FgE PEmpty.{1} where
+  ewp := fgWP
+  step q i _ _ _ q' := q = false ∨ (q' = true ∧ i = fgReqA)
+  accept _ _ _ _ _ q' := q' = true
+  inv _ _ := True
+  terminal _ _ _ := False
+
+private theorem fgReqB_ne_fgReqA : fgReqB ≠ fgReqA :=
+  fun h => Bool.noConfusion (CallReq.call.inj h)
+
+private theorem fg_b_dead (X : ITree FgE PEmpty.{1} → Bool × PUnit.{1} → Prop) :
+    ¬ buchiProgress fgSpec.monitorWP fgSpec.acceptEdge fgSpec.terminalPost X
+      (fgTree (some false)) (true, PUnit.unit) := by
+  intro h
+  rw [buchiProgress.unfold_eq, fgTree_b_observe] at h
+  obtain ⟨q', hstep, _⟩ := h fgAnyB
+  rcases hstep with hq | ⟨_, hi⟩
+  · exact Bool.noConfusion hq
+  · exact fgReqB_ne_fgReqA hi
+
+private theorem fg_not_infOften_committed :
+    ¬ InfOften fgSpec.monitorWP fgSpec.acceptEdge fgSpec.terminalPost
+      (fgTree none) (true, PUnit.unit) := by
+  intro h
+  have hb := h.toBuchiProgress
+  rw [buchiProgress.unfold_eq, fgTree_none_observe] at hb
+  obtain ⟨q', hstep, _, hdisj⟩ := hb fgNo
+  have hq' : q' = true := by
+    rcases hstep with hq | ⟨hq, _⟩
+    · exact Bool.noConfusion hq
+    · exact hq
+  subst hq'
+  rcases hdisj with ⟨_, hio⟩ | hprog
+  · exact fg_b_dead _ hio.toBuchiProgress
+  · exact fg_b_dead _ hprog
+
+/-- The tail `a^ω` is accepted from the committed state. -/
+theorem fgSpec_accepts_a :
+    BuchiSat fgSpec (fgTree (some true)) true PUnit.unit := by
+  refine (buchiSat_iff_infOften _ _ _ _).2 ⟨trivial, ?_⟩
+  refine InfOften.coinduct
+    (fun x qs => x = fgTree (some true) ∧ qs.1 = true) ?_ ⟨rfl, rfl⟩
+  rintro x ⟨q, s⟩ ⟨rfl, hq⟩
+  rw [buchiProgress.unfold_eq, fgTree_a_observe]
+  intro _
+  exact ⟨true, Or.inr ⟨rfl, rfl⟩, trivial, Or.inl ⟨rfl, rfl, rfl⟩⟩
+
+/-- The path `b a^ω` is accepted by guessing the commitment after the `b`. -/
+theorem fgSpec_accepts_b :
+    BuchiSat fgSpec (fgTree (some false)) false PUnit.unit := by
+  refine (buchiSat_iff_infOften _ _ _ _).2 ⟨trivial, ?_⟩
+  refine InfOften.of_buchiProgress ?_
+  rw [buchiProgress.unfold_eq, fgTree_b_observe]
+  intro _
+  exact ⟨true, Or.inl rfl, trivial, Or.inl ⟨rfl,
+    ((buchiSat_iff_infOften _ _ _ _).1 fgSpec_accepts_a).2⟩⟩
+
+/--
+Every path of `T` has only finitely many `b`s: `T` satisfies the co-Büchi
+property `◇□ ¬ b`.
+-/
+theorem fgTree_coBuchi (Q : PEmpty.{1} → PUnit.{1} → Prop) :
+    CoBuchi fgWP fgIsB Q (fgTree none) PUnit.unit := by
+  have h_a : CoBuchi fgWP fgIsB Q (fgTree (some true)) PUnit.unit := by
+    unfold CoBuchi
+    rw [FairInfOften.unfold_eq, fairProgress.unfold_eq]
+    refine fairStall.coinduct (fun x _ => x = fgTree (some true)) ?_ rfl
+    rintro x s rfl
+    rw [fairStep.unfold_eq, fgTree_a_observe]
+    intro _
+    exact Or.inr (Or.inr ⟨fun h => fgReqB_ne_fgReqA h.symm, rfl⟩)
+  unfold CoBuchi at h_a ⊢
+  rw [FairInfOften.unfold_eq, fairProgress.unfold_eq]
+  refine fairStall.coinduct
+    (fun x _ => x = fgTree none ∨ x = fgTree (some false)) ?_ (Or.inl rfl)
+  rintro x s (rfl | rfl)
+  · rw [fairStep.unfold_eq, fgTree_none_observe]
+    intro c
+    refine Or.inr (Or.inr ⟨fun h => fgReqB_ne_fgReqA h.symm, ?_⟩)
+    show fgTree _ = fgTree none ∨ fgTree _ = fgTree (some false)
+    cases fgAns fgReqA c
+    · exact Or.inr rfl
+    · exact Or.inl rfl
+  · rw [fairStep.unfold_eq, fgTree_b_observe]
+    intro _
+    refine Or.inr (Or.inl ⟨rfl, ?_⟩)
+    rw [FairInfOften.unfold_eq] at h_a
+    exact h_a
+
+/--
+**`BuchiSat` is incomplete for nondeterministic monitors.** Every path of
+`T = a. (T + b. a^ω)` satisfies `◇□ a` (`fgTree_coBuchi`), and the two-state
+NBA `fgSpec` for `◇□ a` accepts each kind of tail (`fgSpec_accepts_a`,
+`fgSpec_accepts_b`), yet `BuchiSat fgSpec T q₀` fails from **every** initial
+monitor state: the monitor must commit at the current tree position, but the
+environment can always answer with one more `b`. Persistence properties should
+be stated with `CoBuchi` / `FairInfOften`, or with deterministic monitors.
+-/
+theorem buchiSat_nondet_incomplete (Q : PEmpty.{1} → PUnit.{1} → Prop) :
+    CoBuchi fgWP fgIsB Q (fgTree none) PUnit.unit ∧
+      BuchiSat fgSpec (fgTree (some true)) true PUnit.unit ∧
+      BuchiSat fgSpec (fgTree (some false)) false PUnit.unit ∧
+      ∀ q₀ : Bool, ¬ BuchiSat fgSpec (fgTree none) q₀ PUnit.unit := by
+  refine ⟨fgTree_coBuchi Q, fgSpec_accepts_a, fgSpec_accepts_b, ?_⟩
+  intro q₀ hsat
+  have hio := ((buchiSat_iff_infOften _ _ _ _).1 hsat).2
+  cases q₀ with
+  | true => exact fg_not_infOften_committed hio
+  | false =>
+    refine buchiProgress.induct (fun x _ => x = fgTree none → False) ?_
+      hio.toBuchiProgress rfl
+    rintro x ⟨q, s⟩ hx rfl
+    rw [fgTree_none_observe] at hx
+    obtain ⟨q', _, _, hdisj⟩ := hx fgYes
+    rcases hdisj with ⟨hacc, hio'⟩ | hpre
+    · have hq' : q' = true := hacc
+      subst hq'
+      exact fg_not_infOften_committed hio'
+    · exact hpre rfl
+
+end BuchiNondetIncomplete
 
 /-! ## 4. Monotone-Chain / `CofixA` Continuity Laws for `ITree.iter` -/
 
