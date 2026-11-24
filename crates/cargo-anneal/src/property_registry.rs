@@ -6489,6 +6489,2752 @@ fn build_probe_mir_body(probe: FalseProofMutationProbe) -> IrCapturedMir {
     }
 }
 
+// ============================================================================
+// Spec-Boundary Guard Taxonomy, Canonical Taxonomy Manifest & Static Audit
+// ============================================================================
+//
+// The 12 property classes above classify faults *inside* a MIR body. The three
+// guards below reject specifications whose *boundary* makes a kernel-checked
+// proof worthless:
+//
+// - `entry_point_requires` (`verus#3606`): a binary entry point carries a
+//   non-trivial precondition that no verified caller discharges.
+// - `fixed_width_ghost_length` (`Slate` soundness bug 121): a ghost collection
+//   length is typed at a machine width and wraps at `2^64`.
+// - `error_branch_wildcard` (`awsm2`): a postcondition arm such as
+//   `Err(_) => true` accepts every error escape.
+//
+// The identifiers are frozen across `Anneal.SpecBoundaryGuards` (Lean),
+// `anneal_spec::spec_check::SpecBoundaryGuardClass`, and this module.
+
+/// The 3 specification-boundary guards in canonical rank order `0..3`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum SpecBoundaryGuardId {
+    /// Rank 0 (`verus#3606`): a binary entry point (`main`, `#![no_main]`
+    /// `_start`) carries a non-trivial `requires`.
+    EntryPointRequires,
+    /// Rank 1 (`Slate` soundness bug 121): a ghost collection length or
+    /// cardinality has a fixed machine width instead of `Nat` / `Int`.
+    FixedWidthGhostLength,
+    /// Rank 2 (`awsm2`): a postcondition arm accepts every error, `ub`, or
+    /// `unsupported` outcome.
+    ErrorBranchWildcard,
+}
+
+impl SpecBoundaryGuardId {
+    /// Total number of specification-boundary guards.
+    pub const COUNT: usize = 3;
+
+    /// All 3 guards in canonical rank order.
+    pub const ALL: [SpecBoundaryGuardId; Self::COUNT] = [
+        SpecBoundaryGuardId::EntryPointRequires,
+        SpecBoundaryGuardId::FixedWidthGhostLength,
+        SpecBoundaryGuardId::ErrorBranchWildcard,
+    ];
+
+    /// 0-based canonical rank (`0..3`).
+    pub const fn rank(self) -> usize {
+        match self {
+            Self::EntryPointRequires => 0,
+            Self::FixedWidthGhostLength => 1,
+            Self::ErrorBranchWildcard => 2,
+        }
+    }
+
+    /// Reconstruct a guard from its canonical rank `0..3`.
+    pub const fn from_rank(rank: usize) -> Option<Self> {
+        match rank {
+            0 => Some(Self::EntryPointRequires),
+            1 => Some(Self::FixedWidthGhostLength),
+            2 => Some(Self::ErrorBranchWildcard),
+            _ => None,
+        }
+    }
+
+    /// Canonical `snake_case` guard identifier
+    /// (`SpecBoundaryGuardClass::guard_id` in `anneal-spec`, `guardId` in Lean).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EntryPointRequires => "entry_point_requires",
+            Self::FixedWidthGhostLength => "fixed_width_ghost_length",
+            Self::ErrorBranchWildcard => "error_branch_wildcard",
+        }
+    }
+
+    /// Canonical diagnostic name (`canonical_name` / `canonicalName`).
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::EntryPointRequires => "EntryPointPrecondition",
+            Self::FixedWidthGhostLength => "FixedWidthGhostLength",
+            Self::ErrorBranchWildcard => "ErrorBranchWildcard",
+        }
+    }
+
+    /// Canonical name of the frozen vacuity class a violation is reported
+    /// under (`to_vacuity_class` / `toVacuityClass`).
+    pub const fn vacuity_class(self) -> &'static str {
+        match self {
+            Self::EntryPointRequires => "DeadPrecondition",
+            Self::FixedWidthGhostLength => "SpecViolation",
+            Self::ErrorBranchWildcard => "SurvivedAllMutants",
+        }
+    }
+
+    /// Concise human-readable description of the guard.
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::EntryPointRequires => {
+                "binary entry point (main, #![no_main] _start, #[entry]) carries a non-trivial \
+                 requires that no verified caller discharges"
+            }
+            Self::FixedWidthGhostLength => {
+                "ghost collection length or cardinality typed at a fixed machine width wraps at \
+                 2^64 instead of using Nat or Int"
+            }
+            Self::ErrorBranchWildcard => {
+                "postcondition arm accepts every error payload, ub, or unsupported outcome"
+            }
+        }
+    }
+}
+
+impl fmt::Display for SpecBoundaryGuardId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for SpecBoundaryGuardId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|guard| guard.as_str() == s)
+            .ok_or_else(|| format!("unknown SpecBoundaryGuardId identifier `{s}`"))
+    }
+}
+
+impl PropertyClass {
+    /// Rust enum variant name of the class, as exported in the taxonomy
+    /// manifest (`PropertyClassTag.variantName` in Lean).
+    pub const fn variant_name(self) -> &'static str {
+        match self {
+            Self::ArithmeticOverflow => "ArithmeticOverflow",
+            Self::ShiftBounds => "ShiftBounds",
+            Self::DivRemUb => "DivRemUb",
+            Self::PointerDereference => "PointerDereference",
+            Self::SliceArrayBounds => "SliceArrayBounds",
+            Self::DiscriminantValidity => "DiscriminantValidity",
+            Self::CallContract => "CallContract",
+            Self::LoopTermination => "LoopTermination",
+            Self::SwitchExhaustiveness => "SwitchExhaustiveness",
+            Self::MemoryCopyOverlap => "MemoryCopyOverlap",
+            Self::UninitRead => "UninitRead",
+            Self::UnsupportedFallback => "UnsupportedFallback",
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Canonical taxonomy manifest (JSON)
+// ----------------------------------------------------------------------------
+
+/// Schema version of the canonical property taxonomy manifest.
+pub const PROPERTY_TAXONOMY_SCHEMA_VERSION: u32 = 1;
+
+/// One of the 12 property classes as exported in the taxonomy manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyClassManifestEntry {
+    /// 0-based canonical rank.
+    pub rank: usize,
+    /// Canonical `snake_case` wire identifier ([`PropertyClass::as_str`]).
+    pub id: String,
+    /// Rust enum variant name ([`PropertyClass::variant_name`]).
+    pub variant: String,
+    /// Whether a contract or registry waiver may cover the class.
+    pub is_waivable: bool,
+    /// Disposition tag under [`PropertyRegistry::strict`].
+    pub strict_disposition: String,
+    /// Disposition tag under [`PropertyRegistry::for_partial_correctness`].
+    pub partial_disposition: String,
+    /// Disposition tag of the exporting registry. Present only in
+    /// [`PropertyRegistry::to_taxonomy_json`] exports.
+    pub disposition: Option<String>,
+    /// Canonical summary of what the class checks.
+    pub description: String,
+}
+
+/// One of the 3 spec-boundary guards as exported in the taxonomy manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecBoundaryGuardManifestEntry {
+    /// 0-based canonical rank.
+    pub rank: usize,
+    /// Canonical `snake_case` guard identifier.
+    pub id: String,
+    /// Canonical diagnostic name.
+    pub canonical_name: String,
+    /// Canonical name of the vacuity class a violation is reported under.
+    pub vacuity_class: String,
+    /// Canonical summary of what the guard rejects.
+    pub description: String,
+}
+
+/// The cross-language property taxonomy: 12 property classes and 3
+/// spec-boundary guards.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PropertyTaxonomyManifest {
+    /// Manifest schema version ([`PROPERTY_TAXONOMY_SCHEMA_VERSION`]).
+    pub schema_version: u32,
+    /// The property classes in rank order.
+    pub property_classes: Vec<PropertyClassManifestEntry>,
+    /// The spec-boundary guards in rank order.
+    pub spec_boundary_guards: Vec<SpecBoundaryGuardManifestEntry>,
+}
+
+impl PropertyTaxonomyManifest {
+    /// The canonical manifest of the taxonomy compiled into this module.
+    pub fn canonical() -> Self {
+        let strict = PropertyRegistry::strict();
+        let partial = PropertyRegistry::for_partial_correctness();
+        Self {
+            schema_version: PROPERTY_TAXONOMY_SCHEMA_VERSION,
+            property_classes: PropertyClass::ALL
+                .into_iter()
+                .map(|class| PropertyClassManifestEntry {
+                    rank: class.rank(),
+                    id: String::from(class.as_str()),
+                    variant: String::from(class.variant_name()),
+                    is_waivable: class.is_waivable(),
+                    strict_disposition: String::from(strict.disposition(class).tag()),
+                    partial_disposition: String::from(partial.disposition(class).tag()),
+                    disposition: None,
+                    description: String::from(class.description()),
+                })
+                .collect(),
+            spec_boundary_guards: SpecBoundaryGuardId::ALL
+                .into_iter()
+                .map(|guard| SpecBoundaryGuardManifestEntry {
+                    rank: guard.rank(),
+                    id: String::from(guard.as_str()),
+                    canonical_name: String::from(guard.canonical_name()),
+                    vacuity_class: String::from(guard.vacuity_class()),
+                    description: String::from(guard.description()),
+                })
+                .collect(),
+        }
+    }
+
+    /// The canonical manifest annotated with the dispositions of `registry`.
+    pub fn for_registry(registry: &PropertyRegistry) -> Self {
+        let mut manifest = Self::canonical();
+        for (entry, class) in manifest.property_classes.iter_mut().zip(PropertyClass::ALL) {
+            entry.disposition = Some(String::from(registry.disposition(class).tag()));
+        }
+        manifest
+    }
+
+    /// Render the manifest as deterministic canonical JSON: fixed key order,
+    /// two-space indentation, one entry per line, and a trailing newline.
+    pub fn to_json(&self) -> String {
+        let mut out = String::new();
+        out.push_str("{\n");
+        out.push_str(&format!("  \"schema_version\": {},\n", self.schema_version));
+        out.push_str("  \"property_classes\": [\n");
+        for (idx, entry) in self.property_classes.iter().enumerate() {
+            out.push_str("    {");
+            out.push_str(&format!("\"rank\": {}, ", entry.rank));
+            push_json_field(&mut out, "id", &entry.id);
+            out.push_str(", ");
+            push_json_field(&mut out, "variant", &entry.variant);
+            out.push_str(&format!(", \"is_waivable\": {}, ", entry.is_waivable));
+            push_json_field(&mut out, "strict_disposition", &entry.strict_disposition);
+            out.push_str(", ");
+            push_json_field(&mut out, "partial_disposition", &entry.partial_disposition);
+            out.push_str(", ");
+            if let Some(disposition) = &entry.disposition {
+                push_json_field(&mut out, "disposition", disposition);
+                out.push_str(", ");
+            }
+            push_json_field(&mut out, "description", &entry.description);
+            out.push('}');
+            out.push_str(if idx + 1 < self.property_classes.len() {
+                ",\n"
+            } else {
+                "\n"
+            });
+        }
+        out.push_str("  ],\n");
+        out.push_str("  \"spec_boundary_guards\": [\n");
+        for (idx, entry) in self.spec_boundary_guards.iter().enumerate() {
+            out.push_str("    {");
+            out.push_str(&format!("\"rank\": {}, ", entry.rank));
+            push_json_field(&mut out, "id", &entry.id);
+            out.push_str(", ");
+            push_json_field(&mut out, "canonical_name", &entry.canonical_name);
+            out.push_str(", ");
+            push_json_field(&mut out, "vacuity_class", &entry.vacuity_class);
+            out.push_str(", ");
+            push_json_field(&mut out, "description", &entry.description);
+            out.push('}');
+            out.push_str(if idx + 1 < self.spec_boundary_guards.len() {
+                ",\n"
+            } else {
+                "\n"
+            });
+        }
+        out.push_str("  ]\n");
+        out.push_str("}\n");
+        out
+    }
+
+    /// Check that the manifest describes exactly the taxonomy compiled into
+    /// this module, ignoring registry-specific `disposition` annotations.
+    /// Returns a description of the first drift found.
+    pub fn check_canonical(&self) -> Result<(), String> {
+        let canonical = Self::canonical();
+        if self.schema_version != canonical.schema_version {
+            return Err(format!(
+                "taxonomy schema_version drift: manifest has {}, expected {}",
+                self.schema_version, canonical.schema_version
+            ));
+        }
+        if self.property_classes.len() != canonical.property_classes.len() {
+            return Err(format!(
+                "taxonomy drift: manifest has {} property classes, expected {}",
+                self.property_classes.len(),
+                canonical.property_classes.len()
+            ));
+        }
+        for (entry, expected) in self
+            .property_classes
+            .iter()
+            .zip(&canonical.property_classes)
+        {
+            let comparable = PropertyClassManifestEntry {
+                disposition: None,
+                ..entry.clone()
+            };
+            if &comparable != expected {
+                return Err(format!(
+                    "taxonomy drift at property class rank {}: manifest has {comparable:?}, \
+                     expected {expected:?}",
+                    expected.rank
+                ));
+            }
+            if let Some(disposition) = &entry.disposition
+                && !PROPERTY_DISPOSITION_TAGS.contains(&disposition.as_str())
+            {
+                return Err(format!(
+                    "taxonomy drift at property class rank {}: unknown disposition tag \
+                     `{disposition}`",
+                    expected.rank
+                ));
+            }
+        }
+        if self.spec_boundary_guards.len() != canonical.spec_boundary_guards.len() {
+            return Err(format!(
+                "taxonomy drift: manifest has {} spec-boundary guards, expected {}",
+                self.spec_boundary_guards.len(),
+                canonical.spec_boundary_guards.len()
+            ));
+        }
+        for (entry, expected) in self
+            .spec_boundary_guards
+            .iter()
+            .zip(&canonical.spec_boundary_guards)
+        {
+            if entry != expected {
+                return Err(format!(
+                    "taxonomy drift at spec-boundary guard rank {}: manifest has {entry:?}, \
+                     expected {expected:?}",
+                    expected.rank
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Every [`PropertyDisposition::tag`] value.
+const PROPERTY_DISPOSITION_TAGS: [&str; 4] = [
+    "discharged",
+    "explicitly_waived",
+    "unemitted_gap",
+    "unsupported_fail_closed",
+];
+
+/// Render the canonical taxonomy manifest (12 property classes and 3
+/// spec-boundary guards) as deterministic JSON.
+pub fn render_property_taxonomy_json() -> String {
+    PropertyTaxonomyManifest::canonical().to_json()
+}
+
+impl PropertyRegistry {
+    /// Render the canonical taxonomy manifest annotated with this registry's
+    /// per-class `disposition` tags.
+    pub fn to_taxonomy_json(&self) -> String {
+        PropertyTaxonomyManifest::for_registry(self).to_json()
+    }
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+}
+
+fn push_json_field(out: &mut String, key: &str, value: &str) {
+    push_json_string(out, key);
+    out.push_str(": ");
+    push_json_string(out, value);
+}
+
+/// JSON value subset used by the taxonomy manifest: objects, arrays, strings,
+/// unsigned integers, and booleans.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum TaxonomyJson {
+    Bool(bool),
+    Number(u64),
+    String(String),
+    Array(Vec<TaxonomyJson>),
+    Object(Vec<(String, TaxonomyJson)>),
+}
+
+/// Maximum nesting depth accepted by the taxonomy JSON parser.
+const TAXONOMY_JSON_MAX_DEPTH: usize = 8;
+
+struct TaxonomyJsonParser<'a> {
+    src: &'a str,
+    pos: usize,
+}
+
+impl<'a> TaxonomyJsonParser<'a> {
+    fn error(&self, message: &str) -> String {
+        format!("taxonomy JSON error at byte {}: {message}", self.pos)
+    }
+
+    fn skip_ws(&mut self) {
+        let bytes = self.src.as_bytes();
+        while self.pos < bytes.len() && matches!(bytes[self.pos], b' ' | b'\n' | b'\r' | b'\t') {
+            self.pos += 1;
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.src.as_bytes().get(self.pos).copied()
+    }
+
+    fn expect(&mut self, byte: u8) -> Result<(), String> {
+        if self.peek() == Some(byte) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.error(&format!("expected `{}`", byte as char)))
+        }
+    }
+
+    fn parse_value(&mut self, depth: usize) -> Result<TaxonomyJson, String> {
+        if depth > TAXONOMY_JSON_MAX_DEPTH {
+            return Err(self.error("nesting too deep"));
+        }
+        self.skip_ws();
+        match self.peek() {
+            Some(b'{') => self.parse_object(depth),
+            Some(b'[') => self.parse_array(depth),
+            Some(b'"') => self.parse_string().map(TaxonomyJson::String),
+            Some(b't') if self.src[self.pos..].starts_with("true") => {
+                self.pos += 4;
+                Ok(TaxonomyJson::Bool(true))
+            }
+            Some(b'f') if self.src[self.pos..].starts_with("false") => {
+                self.pos += 5;
+                Ok(TaxonomyJson::Bool(false))
+            }
+            Some(b'0'..=b'9') => self.parse_number(),
+            Some(_) => Err(self.error("unexpected character")),
+            None => Err(self.error("unexpected end of input")),
+        }
+    }
+
+    fn parse_number(&mut self) -> Result<TaxonomyJson, String> {
+        let bytes = self.src.as_bytes();
+        let start = self.pos;
+        while self.pos < bytes.len() && bytes[self.pos].is_ascii_digit() {
+            self.pos += 1;
+        }
+        let digits = &self.src[start..self.pos];
+        if digits.len() > 1 && digits.starts_with('0') {
+            return Err(self.error("number has a leading zero"));
+        }
+        if matches!(self.peek(), Some(b'.' | b'e' | b'E' | b'-' | b'+')) {
+            return Err(self.error("only unsigned integers are allowed"));
+        }
+        digits
+            .parse::<u64>()
+            .map(TaxonomyJson::Number)
+            .map_err(|_| self.error("integer out of range"))
+    }
+
+    fn parse_string(&mut self) -> Result<String, String> {
+        self.expect(b'"')?;
+        let mut out = String::new();
+        loop {
+            let Some(ch) = self.src[self.pos..].chars().next() else {
+                return Err(self.error("unterminated string"));
+            };
+            self.pos += ch.len_utf8();
+            match ch {
+                '"' => return Ok(out),
+                '\\' => {
+                    let Some(escape) = self.src[self.pos..].chars().next() else {
+                        return Err(self.error("unterminated escape"));
+                    };
+                    self.pos += escape.len_utf8();
+                    match escape {
+                        '"' => out.push('"'),
+                        '\\' => out.push('\\'),
+                        '/' => out.push('/'),
+                        'n' => out.push('\n'),
+                        'r' => out.push('\r'),
+                        't' => out.push('\t'),
+                        'u' => {
+                            let hex = self
+                                .src
+                                .get(self.pos..self.pos + 4)
+                                .ok_or_else(|| self.error("truncated \\u escape"))?;
+                            let code = u32::from_str_radix(hex, 16)
+                                .map_err(|_| self.error("invalid \\u escape"))?;
+                            let decoded = char::from_u32(code)
+                                .ok_or_else(|| self.error("invalid \\u code point"))?;
+                            out.push(decoded);
+                            self.pos += 4;
+                        }
+                        _ => return Err(self.error("unknown escape")),
+                    }
+                }
+                ch if (ch as u32) < 0x20 => {
+                    return Err(self.error("unescaped control character in string"));
+                }
+                ch => out.push(ch),
+            }
+        }
+    }
+
+    fn parse_array(&mut self, depth: usize) -> Result<TaxonomyJson, String> {
+        self.expect(b'[')?;
+        let mut items = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b']') {
+            self.pos += 1;
+            return Ok(TaxonomyJson::Array(items));
+        }
+        loop {
+            items.push(self.parse_value(depth + 1)?);
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b']') => {
+                    self.pos += 1;
+                    return Ok(TaxonomyJson::Array(items));
+                }
+                _ => return Err(self.error("expected `,` or `]`")),
+            }
+        }
+    }
+
+    fn parse_object(&mut self, depth: usize) -> Result<TaxonomyJson, String> {
+        self.expect(b'{')?;
+        let mut fields: Vec<(String, TaxonomyJson)> = Vec::new();
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            self.pos += 1;
+            return Ok(TaxonomyJson::Object(fields));
+        }
+        loop {
+            self.skip_ws();
+            let key = self.parse_string()?;
+            if fields.iter().any(|(existing, _)| existing == &key) {
+                return Err(self.error(&format!("duplicate key `{key}`")));
+            }
+            self.skip_ws();
+            self.expect(b':')?;
+            let value = self.parse_value(depth + 1)?;
+            fields.push((key, value));
+            self.skip_ws();
+            match self.peek() {
+                Some(b',') => self.pos += 1,
+                Some(b'}') => {
+                    self.pos += 1;
+                    return Ok(TaxonomyJson::Object(fields));
+                }
+                _ => return Err(self.error("expected `,` or `}`")),
+            }
+        }
+    }
+}
+
+/// Typed access to the fields of one manifest object, rejecting unknown keys.
+struct TaxonomyObject<'a> {
+    context: &'a str,
+    fields: Vec<(String, TaxonomyJson)>,
+}
+
+impl<'a> TaxonomyObject<'a> {
+    fn new(context: &'a str, value: TaxonomyJson) -> Result<Self, String> {
+        match value {
+            TaxonomyJson::Object(fields) => Ok(Self { context, fields }),
+            _ => Err(format!(
+                "taxonomy manifest: {context} must be a JSON object"
+            )),
+        }
+    }
+
+    fn take(&mut self, key: &str) -> Option<TaxonomyJson> {
+        let idx = self.fields.iter().position(|(name, _)| name == key)?;
+        Some(self.fields.remove(idx).1)
+    }
+
+    fn require(&mut self, key: &str) -> Result<TaxonomyJson, String> {
+        self.take(key)
+            .ok_or_else(|| format!("taxonomy manifest: {} is missing key `{key}`", self.context))
+    }
+
+    fn string(&mut self, key: &str) -> Result<String, String> {
+        match self.require(key)? {
+            TaxonomyJson::String(value) => Ok(value),
+            _ => Err(format!(
+                "taxonomy manifest: {} key `{key}` must be a string",
+                self.context
+            )),
+        }
+    }
+
+    fn optional_string(&mut self, key: &str) -> Result<Option<String>, String> {
+        match self.take(key) {
+            None => Ok(None),
+            Some(TaxonomyJson::String(value)) => Ok(Some(value)),
+            Some(_) => Err(format!(
+                "taxonomy manifest: {} key `{key}` must be a string",
+                self.context
+            )),
+        }
+    }
+
+    fn number(&mut self, key: &str) -> Result<u64, String> {
+        match self.require(key)? {
+            TaxonomyJson::Number(value) => Ok(value),
+            _ => Err(format!(
+                "taxonomy manifest: {} key `{key}` must be an unsigned integer",
+                self.context
+            )),
+        }
+    }
+
+    fn boolean(&mut self, key: &str) -> Result<bool, String> {
+        match self.require(key)? {
+            TaxonomyJson::Bool(value) => Ok(value),
+            _ => Err(format!(
+                "taxonomy manifest: {} key `{key}` must be a boolean",
+                self.context
+            )),
+        }
+    }
+
+    fn array(&mut self, key: &str) -> Result<Vec<TaxonomyJson>, String> {
+        match self.require(key)? {
+            TaxonomyJson::Array(items) => Ok(items),
+            _ => Err(format!(
+                "taxonomy manifest: {} key `{key}` must be an array",
+                self.context
+            )),
+        }
+    }
+
+    fn finish(self) -> Result<(), String> {
+        match self.fields.first() {
+            None => Ok(()),
+            Some((key, _)) => Err(format!(
+                "taxonomy manifest: {} has unknown key `{key}`",
+                self.context
+            )),
+        }
+    }
+}
+
+fn manifest_rank(value: u64, expected: usize, context: &str) -> Result<usize, String> {
+    let rank = usize::try_from(value)
+        .map_err(|_| format!("taxonomy manifest: {context} rank {value} is out of range"))?;
+    if rank != expected {
+        return Err(format!(
+            "taxonomy manifest: {context} entry {expected} has rank {rank} (entries must be in \
+             rank order)"
+        ));
+    }
+    Ok(rank)
+}
+
+/// Parse a taxonomy manifest produced by [`render_property_taxonomy_json`] or
+/// [`PropertyRegistry::to_taxonomy_json`].
+///
+/// Parsing is strict: unknown, missing, or duplicate keys, entries out of rank
+/// order, an unsupported `schema_version`, and trailing input are errors. The
+/// result is not compared against the compiled taxonomy; call
+/// [`PropertyTaxonomyManifest::check_canonical`] (or use
+/// [`parse_canonical_property_taxonomy_json`]) to detect drift.
+pub fn parse_property_taxonomy_json(json: &str) -> Result<PropertyTaxonomyManifest, String> {
+    let mut parser = TaxonomyJsonParser { src: json, pos: 0 };
+    let root = parser.parse_value(0)?;
+    parser.skip_ws();
+    if parser.pos != json.len() {
+        return Err(parser.error("trailing input after the manifest"));
+    }
+
+    let mut root = TaxonomyObject::new("root", root)?;
+    let schema_version = root.number("schema_version")?;
+    if schema_version != u64::from(PROPERTY_TAXONOMY_SCHEMA_VERSION) {
+        return Err(format!(
+            "taxonomy manifest: unsupported schema_version {schema_version} (expected \
+             {PROPERTY_TAXONOMY_SCHEMA_VERSION})"
+        ));
+    }
+
+    let mut property_classes = Vec::new();
+    for (idx, item) in root.array("property_classes")?.into_iter().enumerate() {
+        let mut entry = TaxonomyObject::new("property class", item)?;
+        let parsed = PropertyClassManifestEntry {
+            rank: manifest_rank(entry.number("rank")?, idx, "property class")?,
+            id: entry.string("id")?,
+            variant: entry.string("variant")?,
+            is_waivable: entry.boolean("is_waivable")?,
+            strict_disposition: entry.string("strict_disposition")?,
+            partial_disposition: entry.string("partial_disposition")?,
+            disposition: entry.optional_string("disposition")?,
+            description: entry.string("description")?,
+        };
+        entry.finish()?;
+        property_classes.push(parsed);
+    }
+
+    let mut spec_boundary_guards = Vec::new();
+    for (idx, item) in root.array("spec_boundary_guards")?.into_iter().enumerate() {
+        let mut entry = TaxonomyObject::new("spec-boundary guard", item)?;
+        let parsed = SpecBoundaryGuardManifestEntry {
+            rank: manifest_rank(entry.number("rank")?, idx, "spec-boundary guard")?,
+            id: entry.string("id")?,
+            canonical_name: entry.string("canonical_name")?,
+            vacuity_class: entry.string("vacuity_class")?,
+            description: entry.string("description")?,
+        };
+        entry.finish()?;
+        spec_boundary_guards.push(parsed);
+    }
+    root.finish()?;
+
+    Ok(PropertyTaxonomyManifest {
+        schema_version: PROPERTY_TAXONOMY_SCHEMA_VERSION,
+        property_classes,
+        spec_boundary_guards,
+    })
+}
+
+/// Parse a taxonomy manifest and require it to describe exactly the taxonomy
+/// compiled into this module ([`PropertyTaxonomyManifest::check_canonical`]).
+pub fn parse_canonical_property_taxonomy_json(
+    json: &str,
+) -> Result<PropertyTaxonomyManifest, String> {
+    let manifest = parse_property_taxonomy_json(json)?;
+    manifest.check_canonical()?;
+    Ok(manifest)
+}
+
+// ----------------------------------------------------------------------------
+// Comment- and literal-aware specification tokenizer
+// ----------------------------------------------------------------------------
+
+/// Source dialect of a scanned specification file, which decides what a
+/// comment is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpecSourceDialect {
+    /// Rust: `//` line comments and nested `/* */` block comments.
+    Rust,
+    /// Lean 4: `--` line comments and nested `/- -/` block comments.
+    Lean,
+    /// Unknown: both comment families are recognized.
+    Unknown,
+}
+
+impl SpecSourceDialect {
+    /// Infer the dialect from a source label: `*.rs` is Rust, `*.lean` is
+    /// Lean, and anything else is [`Self::Unknown`].
+    pub fn from_source_label(source_label: &str) -> Self {
+        if source_label.ends_with(".rs") {
+            Self::Rust
+        } else if source_label.ends_with(".lean") {
+            Self::Lean
+        } else {
+            Self::Unknown
+        }
+    }
+
+    fn rust_comments(self) -> bool {
+        self != Self::Lean
+    }
+
+    fn lean_comments(self) -> bool {
+        self != Self::Rust
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardTokKind {
+    /// Identifier, keyword, or numeric literal.
+    Word,
+    /// String, raw-string, byte-string, or character literal.
+    Literal,
+    /// `=>`
+    FatArrow,
+    /// `::`
+    PathSep,
+    /// `..`, `..=`, or `...`
+    DotDot,
+    /// Any other operator or punctuation.
+    Sym,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GuardTok<'a> {
+    kind: GuardTokKind,
+    text: &'a str,
+    /// 1-based source line of the token's first character.
+    line: usize,
+}
+
+impl GuardTok<'_> {
+    fn is_word(&self, word: &str) -> bool {
+        self.kind == GuardTokKind::Word && self.text == word
+    }
+
+    fn is_sym(&self, sym: &str) -> bool {
+        self.kind == GuardTokKind::Sym && self.text == sym
+    }
+}
+
+/// A block comment, string literal, or character literal left unclosed,
+/// starting at 1-based source line `line`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UnclosedSpecSource {
+    line: usize,
+}
+
+fn is_guard_word_char(ch: char) -> bool {
+    ch == '_' || ch.is_alphanumeric()
+}
+
+/// Tokenize Rust or Lean specification source, skipping comments and never
+/// looking inside literals. Mirrors `SpecLexer` in `anneal_spec::spec_check`.
+fn tokenize_spec_source(
+    src: &str,
+    dialect: SpecSourceDialect,
+) -> Result<Vec<GuardTok<'_>>, UnclosedSpecSource> {
+    let bytes = src.as_bytes();
+    let mut toks = Vec::new();
+    let mut pos = 0usize;
+    let mut line = 1usize;
+    let mut line_pos = 0usize;
+    // Advance the line counter to byte offset `upto`.
+    let line_at = |upto: usize, line: &mut usize, line_pos: &mut usize| {
+        *line += bytes[*line_pos..upto]
+            .iter()
+            .filter(|b| **b == b'\n')
+            .count();
+        *line_pos = upto;
+        *line
+    };
+
+    while pos < bytes.len() {
+        let here = bytes[pos];
+        if here.is_ascii_whitespace() {
+            pos += 1;
+            continue;
+        }
+        let next = bytes.get(pos + 1).copied();
+        let start_line = line_at(pos, &mut line, &mut line_pos);
+
+        // Comments.
+        let line_comment = (dialect.rust_comments() && here == b'/' && next == Some(b'/'))
+            || (dialect.lean_comments() && here == b'-' && next == Some(b'-'));
+        if line_comment {
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        let block_marker = if dialect.rust_comments() && here == b'/' && next == Some(b'*') {
+            Some(b'*')
+        } else if dialect.lean_comments() && here == b'/' && next == Some(b'-') {
+            Some(b'-')
+        } else {
+            None
+        };
+        if let Some(marker) = block_marker {
+            pos += 2;
+            let mut depth = 1usize;
+            while pos < bytes.len() && depth > 0 {
+                let after = bytes.get(pos + 1).copied();
+                if bytes[pos] == b'/' && after == Some(marker) {
+                    depth += 1;
+                    pos += 2;
+                } else if bytes[pos] == marker && after == Some(b'/') {
+                    depth -= 1;
+                    pos += 2;
+                } else {
+                    pos += 1;
+                }
+            }
+            if depth > 0 {
+                return Err(UnclosedSpecSource { line: start_line });
+            }
+            continue;
+        }
+
+        // String literals.
+        if here == b'"' {
+            pos = skip_guard_string(bytes, pos).ok_or(UnclosedSpecSource { line: start_line })?;
+            toks.push(GuardTok {
+                kind: GuardTokKind::Literal,
+                text: &src[pos..pos],
+                line: start_line,
+            });
+            continue;
+        }
+        // Character literals and lone quotes (Rust lifetimes).
+        if here == b'\'' {
+            match lex_guard_quote(src, pos) {
+                Some((end, is_literal)) => {
+                    toks.push(GuardTok {
+                        kind: if is_literal {
+                            GuardTokKind::Literal
+                        } else {
+                            GuardTokKind::Sym
+                        },
+                        text: if is_literal {
+                            &src[pos..pos]
+                        } else {
+                            &src[pos..end]
+                        },
+                        line: start_line,
+                    });
+                    pos = end;
+                }
+                None => return Err(UnclosedSpecSource { line: start_line }),
+            }
+            continue;
+        }
+
+        let first = src[pos..]
+            .chars()
+            .next()
+            .expect("`pos` is a character boundary inside the source");
+        if is_guard_word_char(first) {
+            let mut end = pos;
+            for (offset, ch) in src[pos..].char_indices() {
+                if !is_guard_word_char(ch) {
+                    break;
+                }
+                end = pos + offset + ch.len_utf8();
+            }
+            let word = &src[pos..end];
+            // Raw strings (`r"…"`, `r#"…"#`, `br"…"`) and byte literals.
+            if matches!(word, "r" | "br") {
+                match skip_guard_raw_string(bytes, end) {
+                    Ok(Some(after)) => {
+                        toks.push(GuardTok {
+                            kind: GuardTokKind::Literal,
+                            text: &src[pos..pos],
+                            line: start_line,
+                        });
+                        pos = after;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(()) => return Err(UnclosedSpecSource { line: start_line }),
+                }
+            }
+            if word == "b" && bytes.get(end) == Some(&b'"') {
+                pos =
+                    skip_guard_string(bytes, end).ok_or(UnclosedSpecSource { line: start_line })?;
+                toks.push(GuardTok {
+                    kind: GuardTokKind::Literal,
+                    text: &src[pos..pos],
+                    line: start_line,
+                });
+                continue;
+            }
+            if word == "b" && bytes.get(end) == Some(&b'\'') {
+                match lex_guard_quote(src, end) {
+                    Some((after, true)) => {
+                        toks.push(GuardTok {
+                            kind: GuardTokKind::Literal,
+                            text: &src[pos..pos],
+                            line: start_line,
+                        });
+                        pos = after;
+                        continue;
+                    }
+                    _ => return Err(UnclosedSpecSource { line: start_line }),
+                }
+            }
+            // Lean identifiers may end in primes (`x'`).
+            if dialect != SpecSourceDialect::Rust {
+                while bytes.get(end) == Some(&b'\'') {
+                    end += 1;
+                }
+            }
+            toks.push(GuardTok {
+                kind: GuardTokKind::Word,
+                text: &src[pos..end],
+                line: start_line,
+            });
+            pos = end;
+            continue;
+        }
+
+        let rest = &src[pos..];
+        let (kind, len) = if rest.starts_with("==>") {
+            (GuardTokKind::Sym, 3)
+        } else if rest.starts_with("=>") {
+            (GuardTokKind::FatArrow, 2)
+        } else if rest.starts_with("...") || rest.starts_with("..=") {
+            (GuardTokKind::DotDot, 3)
+        } else if rest.starts_with("..") {
+            (GuardTokKind::DotDot, 2)
+        } else if rest.starts_with("::") {
+            (GuardTokKind::PathSep, 2)
+        } else if rest.starts_with("<->") {
+            (GuardTokKind::Sym, 3)
+        } else if [
+            "==", "!=", "<=", ">=", "&&", "||", "->", "<-", ":=", "/\\", "\\/",
+        ]
+        .iter()
+        .any(|op| rest.starts_with(op))
+        {
+            (GuardTokKind::Sym, 2)
+        } else {
+            (GuardTokKind::Sym, first.len_utf8())
+        };
+        toks.push(GuardTok {
+            kind,
+            text: &rest[..len],
+            line: start_line,
+        });
+        pos += len;
+    }
+    Ok(toks)
+}
+
+/// Skip a `"…"` string starting at the opening quote; returns the offset
+/// after the closing quote, or `None` when the string is unclosed.
+fn skip_guard_string(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut pos = start + 1;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'\\' => pos += 2,
+            b'"' => return Some(pos + 1),
+            _ => pos += 1,
+        }
+    }
+    None
+}
+
+/// Skip a raw string whose hashes start at `start`. `Ok(None)` when no raw
+/// string starts there, `Err(())` when it is unclosed.
+fn skip_guard_raw_string(bytes: &[u8], start: usize) -> Result<Option<usize>, ()> {
+    let mut idx = start;
+    let mut hashes = 0usize;
+    while bytes.get(idx) == Some(&b'#') {
+        hashes += 1;
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'"') {
+        return Ok(None);
+    }
+    idx += 1;
+    while idx < bytes.len() {
+        if bytes[idx] == b'"' {
+            let mut closing = 0usize;
+            while closing < hashes && bytes.get(idx + 1 + closing) == Some(&b'#') {
+                closing += 1;
+            }
+            if closing == hashes {
+                return Ok(Some(idx + 1 + hashes));
+            }
+        }
+        idx += 1;
+    }
+    Err(())
+}
+
+/// Lex the token starting at a `'`. Returns `(end, true)` for a character
+/// literal, `(end, false)` for a lone quote, and `None` for an unclosed
+/// escaped character literal.
+fn lex_guard_quote(src: &str, start: usize) -> Option<(usize, bool)> {
+    const MAX_CHAR_ESCAPE_BYTES: usize = 12;
+    let bytes = src.as_bytes();
+    let rest = &src[start + 1..];
+    if let Some(escape_body) = rest.strip_prefix('\\') {
+        let escaped = escape_body.chars().next()?;
+        let body_start = start + 2 + escaped.len_utf8();
+        let window_end = (body_start + MAX_CHAR_ESCAPE_BYTES).min(bytes.len());
+        return (body_start..window_end)
+            .find(|idx| bytes[*idx] == b'\'')
+            .map(|idx| (idx + 1, true));
+    }
+    if let Some(ch) = rest.chars().next() {
+        let after = start + 1 + ch.len_utf8();
+        if ch != '\'' && bytes.get(after) == Some(&b'\'') {
+            return Some((after + 1, true));
+        }
+    }
+    Some((start + 1, false))
+}
+
+// ----------------------------------------------------------------------------
+// Guard 2: fixed-width ghost length scanner (`Slate` soundness bug 121)
+// ----------------------------------------------------------------------------
+
+/// Fixed-width machine integer type names flagged on ghost lengths
+/// (`fixedWidthGhostTypeNames` in Lean). `BitVec <N>` is flagged as well.
+pub const FIXED_WIDTH_GHOST_INT_TYPE_NAMES: [&str; 22] = [
+    "UInt8", "UInt16", "UInt32", "UInt64", "USize", "Int8", "Int16", "Int32", "Int64", "ISize",
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+];
+
+/// Unbounded integer type names accepted on ghost lengths
+/// (`unboundedGhostTypeNames` in Lean).
+pub const UNBOUNDED_GHOST_INT_TYPE_NAMES: [&str; 2] = ["Nat", "Int"];
+
+/// Ghost (mathematical) collection type names.
+pub const GHOST_COLLECTION_TYPE_NAMES: [&str; 7] = [
+    "GhostList",
+    "GhostSet",
+    "GhostMap",
+    "GhostSeq",
+    "Seq",
+    "Multiset",
+    "Finset",
+];
+
+/// Name segments that mark a declaration as a length or cardinality.
+const GHOST_LENGTH_NAME_SEGMENTS: [&str; 9] = [
+    "len",
+    "length",
+    "card",
+    "cardinality",
+    "size",
+    "count",
+    "cap",
+    "capacity",
+    "bound",
+];
+
+/// Projections whose value is a collection length or cardinality.
+const GHOST_LENGTH_PROJECTIONS: [&str; 5] = ["length", "len", "card", "size", "count"];
+
+/// Lean conversions from `Nat` into a fixed-width machine integer.
+const LEAN_TO_FIXED_WIDTH_CASTS: [&str; 10] = [
+    "toUInt8", "toUInt16", "toUInt32", "toUInt64", "toUSize", "toInt8", "toInt16", "toInt32",
+    "toInt64", "toISize",
+];
+
+/// Lean declaration keywords that introduce a named constant with a type.
+const LEAN_TYPED_DECL_KEYWORDS: [&str; 6] =
+    ["def", "axiom", "opaque", "abbrev", "theorem", "lemma"];
+
+/// Lean keywords that start a new top-level command.
+const LEAN_COMMAND_KEYWORDS: [&str; 22] = [
+    "def",
+    "axiom",
+    "opaque",
+    "abbrev",
+    "theorem",
+    "lemma",
+    "instance",
+    "structure",
+    "inductive",
+    "class",
+    "namespace",
+    "section",
+    "end",
+    "open",
+    "import",
+    "variable",
+    "universe",
+    "example",
+    "noncomputable",
+    "private",
+    "protected",
+    "set_option",
+];
+
+/// What the fixed-width ghost length scanner found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum GhostLengthWidthKind {
+    /// A ghost length or cardinality declaration returns a fixed-width type.
+    FixedWidthReturnType,
+    /// A collection length is cast into a fixed-width type
+    /// (`UInt64.ofNat xs.length`, `xs.length.toUSize`, `s.len() as u64`).
+    WraparoundCast,
+    /// The source has an unclosed comment or literal and cannot be scanned.
+    MalformedSource,
+}
+
+impl GhostLengthWidthKind {
+    /// Short wire tag of the finding.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FixedWidthReturnType => "fixed_width_return_type",
+            Self::WraparoundCast => "wraparound_cast",
+            Self::MalformedSource => "malformed_source",
+        }
+    }
+}
+
+/// A `fixed_width_ghost_length` finding (`Slate` soundness bug 121,
+/// `cl/1028783918`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct GhostLengthWidthDiagnostic {
+    /// Label of the scanned source (usually its path).
+    pub source_label: String,
+    /// 1-based line of the offending type or cast.
+    pub line: usize,
+    /// Name of the ghost declaration (empty for a cast outside a declaration
+    /// and for malformed source).
+    pub declaration: String,
+    /// The fixed-width type as written (`u64`, `USize`, `BitVec 64`).
+    pub fixed_width_type: String,
+    /// What was found.
+    pub kind: GhostLengthWidthKind,
+}
+
+impl GhostLengthWidthDiagnostic {
+    /// The guard every diagnostic of this type reports under.
+    pub const GUARD: SpecBoundaryGuardId = SpecBoundaryGuardId::FixedWidthGhostLength;
+}
+
+impl fmt::Display for GhostLengthWidthDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}: {}: ", self.source_label, self.line, Self::GUARD)?;
+        match self.kind {
+            GhostLengthWidthKind::FixedWidthReturnType => write!(
+                f,
+                "ghost length `{}` has fixed-width type `{}`, which wraps at its bit width; use \
+                 Nat or Int",
+                self.declaration, self.fixed_width_type
+            ),
+            GhostLengthWidthKind::WraparoundCast => write!(
+                f,
+                "collection length is cast into fixed-width type `{}`{}, which wraps at its bit \
+                 width; keep the length in Nat or Int",
+                self.fixed_width_type,
+                if self.declaration.is_empty() {
+                    String::new()
+                } else {
+                    format!(" in `{}`", self.declaration)
+                }
+            ),
+            GhostLengthWidthKind::MalformedSource => f.write_str(
+                "unclosed comment or literal; the source cannot be scanned (fail-closed)",
+            ),
+        }
+    }
+}
+
+/// Split an identifier into lowercase `snake_case` / `camelCase` segments
+/// (`ghostLen` and `ghost_len` both yield `["ghost", "len"]`).
+fn identifier_segments(name: &str) -> Vec<String> {
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut prev_lower = false;
+    for ch in name.chars() {
+        if !ch.is_alphanumeric() {
+            if !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+            prev_lower = false;
+            continue;
+        }
+        if ch.is_uppercase() && prev_lower && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+        }
+        prev_lower = ch.is_lowercase() || ch.is_numeric();
+        current.extend(ch.to_lowercase());
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// The last `.`- or `::`-separated component of a declaration name.
+fn declaration_leaf(name: &str) -> &str {
+    let after_dot = name.rsplit('.').next().unwrap_or(name);
+    after_dot.rsplit("::").next().unwrap_or(after_dot)
+}
+
+/// Whether the declaration's own name marks it as a length or cardinality.
+fn is_ghost_length_name(name: &str) -> bool {
+    identifier_segments(declaration_leaf(name))
+        .iter()
+        .any(|segment| GHOST_LENGTH_NAME_SEGMENTS.contains(&segment.as_str()))
+}
+
+/// Whether any component of the declaration name carries a `ghost` segment
+/// (`ghostLen`, `ghost_len`, `GhostList.len`).
+fn has_ghost_name_marker(name: &str) -> bool {
+    identifier_segments(name)
+        .iter()
+        .any(|segment| segment == "ghost")
+}
+
+fn is_fixed_width_int_type_name(word: &str) -> bool {
+    FIXED_WIDTH_GHOST_INT_TYPE_NAMES.contains(&word)
+}
+
+/// The fixed-width type a type expression denotes, if it is exactly one:
+/// a fixed-width integer name or `BitVec <N>`, optionally parenthesized.
+fn fixed_width_type_of(toks: &[GuardTok<'_>]) -> Option<(String, usize)> {
+    let mut toks = toks;
+    while toks.len() >= 2 && toks[0].is_sym("(") && toks[toks.len() - 1].is_sym(")") {
+        toks = &toks[1..toks.len() - 1];
+    }
+    let first = toks.first()?;
+    if first.kind != GuardTokKind::Word {
+        return None;
+    }
+    if is_fixed_width_int_type_name(first.text) && toks.len() == 1 {
+        return Some((String::from(first.text), first.line));
+    }
+    if first.text == "BitVec" && toks.len() >= 2 {
+        let width: Vec<&str> = toks[1..].iter().map(|tok| tok.text).collect();
+        return Some((format!("BitVec {}", width.join(" ")), first.line));
+    }
+    None
+}
+
+fn mentions_ghost_collection(toks: &[GuardTok<'_>]) -> bool {
+    toks.iter().any(|tok| {
+        tok.kind == GuardTokKind::Word && GHOST_COLLECTION_TYPE_NAMES.contains(&tok.text)
+    })
+}
+
+/// Index of the token closing the bracket opened at `open_idx`.
+fn matching_close(toks: &[GuardTok<'_>], open_idx: usize) -> Option<usize> {
+    let (open, close) = match toks.get(open_idx)?.text {
+        "(" => ("(", ")"),
+        "[" => ("[", "]"),
+        "{" => ("{", "}"),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    for (idx, tok) in toks.iter().enumerate().skip(open_idx) {
+        if tok.kind != GuardTokKind::Sym {
+            continue;
+        }
+        if tok.text == open {
+            depth += 1;
+        } else if tok.text == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn bracket_delta(tok: &GuardTok<'_>) -> i32 {
+    if tok.kind != GuardTokKind::Sym {
+        return 0;
+    }
+    match tok.text {
+        "(" | "[" | "{" | "⟨" => 1,
+        ")" | "]" | "}" | "⟩" => -1,
+        _ => 0,
+    }
+}
+
+/// Scan Lean declarations (`def`, `axiom`, `opaque`, `abbrev`, `theorem`,
+/// `lemma`) for ghost length specs with a fixed-width result type.
+fn scan_lean_ghost_length_decls(
+    source_label: &str,
+    toks: &[GuardTok<'_>],
+    out: &mut Vec<GhostLengthWidthDiagnostic>,
+) {
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        let tok = &toks[idx];
+        if !(tok.kind == GuardTokKind::Word && LEAN_TYPED_DECL_KEYWORDS.contains(&tok.text)) {
+            idx += 1;
+            continue;
+        }
+        // Dotted declaration name.
+        let mut cursor = idx + 1;
+        let mut name = String::new();
+        while let Some(part) = toks.get(cursor) {
+            if part.kind != GuardTokKind::Word {
+                break;
+            }
+            name.push_str(part.text);
+            cursor += 1;
+            if toks.get(cursor).is_some_and(|dot| dot.is_sym("."))
+                && toks
+                    .get(cursor + 1)
+                    .is_some_and(|next| next.kind == GuardTokKind::Word)
+            {
+                name.push('.');
+                cursor += 1;
+            } else {
+                break;
+            }
+        }
+        if name.is_empty() {
+            idx += 1;
+            continue;
+        }
+        // Signature: up to `:=`, `where`, a match-arm `|`, or the next command.
+        let sig_start = cursor;
+        let mut depth = 0i32;
+        let mut sig_end = cursor;
+        while let Some(sig_tok) = toks.get(sig_end) {
+            if depth == 0
+                && (sig_tok.is_sym(":=")
+                    || sig_tok.is_sym("|")
+                    || sig_tok.is_word("where")
+                    || (sig_tok.kind == GuardTokKind::Word
+                        && LEAN_COMMAND_KEYWORDS.contains(&sig_tok.text)))
+            {
+                break;
+            }
+            depth += bracket_delta(sig_tok);
+            sig_end += 1;
+        }
+        let signature = &toks[sig_start..sig_end];
+        idx = sig_end.max(idx + 1);
+
+        // The first depth-0 `:` separates the binders from the result type.
+        let mut depth = 0i32;
+        let mut colon = None;
+        for (offset, sig_tok) in signature.iter().enumerate() {
+            if depth == 0 && sig_tok.is_sym(":") {
+                colon = Some(offset);
+                break;
+            }
+            depth += bracket_delta(sig_tok);
+        }
+        let Some(colon) = colon else { continue };
+        let ty = &signature[colon + 1..];
+        // The result type follows the last depth-0 arrow.
+        let mut depth = 0i32;
+        let mut result_start = 0usize;
+        for (offset, ty_tok) in ty.iter().enumerate() {
+            if depth == 0 && (ty_tok.is_sym("→") || ty_tok.is_sym("->")) {
+                result_start = offset + 1;
+            }
+            depth += bracket_delta(ty_tok);
+        }
+        let Some((fixed_width_type, line)) = fixed_width_type_of(&ty[result_start..]) else {
+            continue;
+        };
+        let ghost_context = has_ghost_name_marker(&name)
+            || mentions_ghost_collection(signature)
+            || name
+                .split('.')
+                .any(|part| GHOST_COLLECTION_TYPE_NAMES.contains(&part));
+        if ghost_context && is_ghost_length_name(&name) {
+            out.push(GhostLengthWidthDiagnostic {
+                source_label: String::from(source_label),
+                line,
+                declaration: name,
+                fixed_width_type,
+                kind: GhostLengthWidthKind::FixedWidthReturnType,
+            });
+        }
+    }
+}
+
+/// Scan Lean source for casts of a collection length into a fixed-width type:
+/// `UInt64.ofNat xs.length`, `USize.ofNat (xs.length + 1)`,
+/// `xs.length.toUInt64`, `(xs.length).toUSize`.
+fn scan_lean_wraparound_casts(
+    source_label: &str,
+    toks: &[GuardTok<'_>],
+    out: &mut Vec<GhostLengthWidthDiagnostic>,
+) {
+    /// Tokens inspected after an unparenthesized `<Fixed>.ofNat`.
+    const OF_NAT_WINDOW: usize = 8;
+    let is_length_projection = |at: usize| {
+        toks.get(at).is_some_and(|dot| dot.is_sym("."))
+            && toks.get(at + 1).is_some_and(|proj| {
+                proj.kind == GuardTokKind::Word && GHOST_LENGTH_PROJECTIONS.contains(&proj.text)
+            })
+    };
+    for idx in 0..toks.len() {
+        let tok = &toks[idx];
+        // `<Fixed>.ofNat <expr containing .length>`
+        if tok.kind == GuardTokKind::Word
+            && is_fixed_width_int_type_name(tok.text)
+            && toks.get(idx + 1).is_some_and(|dot| dot.is_sym("."))
+            && toks
+                .get(idx + 2)
+                .is_some_and(|of_nat| of_nat.is_word("ofNat"))
+        {
+            let arg_start = idx + 3;
+            let arg_end = if toks.get(arg_start).is_some_and(|open| open.is_sym("(")) {
+                matching_close(toks, arg_start).unwrap_or(toks.len())
+            } else {
+                // An unparenthesized argument ends with its line.
+                let line = toks.get(arg_start).map_or(tok.line, |arg| arg.line);
+                let mut end = arg_start;
+                while end < toks.len() && end < arg_start + OF_NAT_WINDOW && toks[end].line == line
+                {
+                    end += 1;
+                }
+                end
+            };
+            if (arg_start..arg_end).any(is_length_projection) {
+                out.push(GhostLengthWidthDiagnostic {
+                    source_label: String::from(source_label),
+                    line: tok.line,
+                    declaration: String::new(),
+                    fixed_width_type: String::from(tok.text),
+                    kind: GhostLengthWidthKind::WraparoundCast,
+                });
+            }
+        }
+        // `<expr>.length.toUInt64` / `(<expr>.length).toUSize`
+        if is_length_projection(idx) {
+            let mut after = idx + 2;
+            if toks.get(after).is_some_and(|close| close.is_sym(")")) {
+                after += 1;
+            }
+            if toks.get(after).is_some_and(|dot| dot.is_sym("."))
+                && let Some(cast) = toks.get(after + 1)
+                && cast.kind == GuardTokKind::Word
+                && LEAN_TO_FIXED_WIDTH_CASTS.contains(&cast.text)
+            {
+                out.push(GhostLengthWidthDiagnostic {
+                    source_label: String::from(source_label),
+                    line: cast.line,
+                    declaration: String::new(),
+                    fixed_width_type: String::from(&cast.text[2..]),
+                    kind: GhostLengthWidthKind::WraparoundCast,
+                });
+            }
+        }
+    }
+}
+
+/// Ghost context an attribute places the following Rust function in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RustGhostAttr {
+    /// `#[model]`: the function itself is ghost code.
+    Model,
+    /// `#[spec]`, `#[embed_spec]`, `#[external_spec]`, `#[invariant]`: a
+    /// runtime item carrying a specification.
+    Spec,
+}
+
+/// Classify the attribute whose `[` is at `open_idx` by the last segment of
+/// its path (`#[model]`, `#[anneal_spec::model]`, `#[spec(…)]`).
+fn rust_ghost_attr(toks: &[GuardTok<'_>], open_idx: usize) -> Option<RustGhostAttr> {
+    let mut cursor = open_idx + 1;
+    let mut leaf = None;
+    while let Some(tok) = toks.get(cursor) {
+        match tok.kind {
+            GuardTokKind::Word => leaf = Some(tok.text),
+            GuardTokKind::PathSep => {}
+            _ => break,
+        }
+        cursor += 1;
+    }
+    match leaf? {
+        "model" => Some(RustGhostAttr::Model),
+        "spec" | "embed_spec" | "external_spec" | "invariant" => Some(RustGhostAttr::Spec),
+        _ => None,
+    }
+}
+
+/// Scan Rust source for ghost length functions with a fixed-width return type
+/// and for length casts inside them. Only functions carrying a specification
+/// attribute are inspected, so ordinary runtime code is never flagged.
+fn scan_rust_ghost_length_fns(
+    source_label: &str,
+    toks: &[GuardTok<'_>],
+    out: &mut Vec<GhostLengthWidthDiagnostic>,
+) {
+    let mut pending: Option<RustGhostAttr> = None;
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        let tok = &toks[idx];
+        // Attributes: `#[…]` and `#![…]`.
+        if tok.is_sym("#") {
+            let mut open = idx + 1;
+            if toks.get(open).is_some_and(|bang| bang.is_sym("!")) {
+                open += 1;
+            }
+            if toks.get(open).is_some_and(|bracket| bracket.is_sym("[")) {
+                if let Some(attr) = rust_ghost_attr(toks, open) {
+                    // `#[model]` wins over a spec attribute on the same item.
+                    if pending != Some(RustGhostAttr::Model) {
+                        pending = Some(attr);
+                    }
+                }
+                idx = matching_close(toks, open).map_or(toks.len(), |close| close + 1);
+                continue;
+            }
+        }
+        if tok.kind == GuardTokKind::Word
+            && matches!(
+                tok.text,
+                "struct" | "enum" | "impl" | "mod" | "trait" | "const" | "static" | "type" | "use"
+            )
+            && !toks.get(idx + 1).is_some_and(|next| next.is_word("fn"))
+        {
+            pending = None;
+            idx += 1;
+            continue;
+        }
+        if !tok.is_word("fn") {
+            idx += 1;
+            continue;
+        }
+        let attr = pending.take();
+        let Some(name_tok) = toks.get(idx + 1).filter(|t| t.kind == GuardTokKind::Word) else {
+            idx += 1;
+            continue;
+        };
+        let name = name_tok.text;
+        // Parameter list.
+        let mut open = idx + 2;
+        while open < toks.len() && !toks[open].is_sym("(") {
+            if toks[open].is_sym("{") || toks[open].is_sym(";") {
+                break;
+            }
+            open += 1;
+        }
+        let Some(close) = toks
+            .get(open)
+            .filter(|t| t.is_sym("("))
+            .and_then(|_| matching_close(toks, open))
+        else {
+            idx += 2;
+            continue;
+        };
+        // Return type: tokens after `->` up to the body, `where`, or `;`.
+        let mut sig_end = close + 1;
+        while sig_end < toks.len()
+            && !toks[sig_end].is_sym("{")
+            && !toks[sig_end].is_sym(";")
+            && !toks[sig_end].is_word("where")
+        {
+            sig_end += 1;
+        }
+        let ret = if toks.get(close + 1).is_some_and(|arrow| arrow.is_sym("->")) {
+            &toks[close + 2..sig_end]
+        } else {
+            &toks[sig_end..sig_end]
+        };
+        // Body.
+        let mut body_open = sig_end;
+        while body_open < toks.len() && !toks[body_open].is_sym("{") && !toks[body_open].is_sym(";")
+        {
+            body_open += 1;
+        }
+        let body_close = toks
+            .get(body_open)
+            .filter(|t| t.is_sym("{"))
+            .and_then(|_| matching_close(toks, body_open));
+        idx = body_close.map_or(body_open.max(idx + 2), |end| end + 1);
+
+        let Some(attr) = attr else { continue };
+        let signature = &toks[open..sig_end];
+        let ghost_collection = mentions_ghost_collection(signature);
+        let ghost_context =
+            attr == RustGhostAttr::Model || ghost_collection || has_ghost_name_marker(name);
+        if !ghost_context {
+            continue;
+        }
+        if is_ghost_length_name(name)
+            && let Some((fixed_width_type, line)) = fixed_width_type_of(ret)
+        {
+            out.push(GhostLengthWidthDiagnostic {
+                source_label: String::from(source_label),
+                line,
+                declaration: String::from(name),
+                fixed_width_type,
+                kind: GhostLengthWidthKind::FixedWidthReturnType,
+            });
+        }
+        // `<ghost>.len() as u64` truncates a ghost collection's length.
+        if ghost_collection && let Some(body_close) = body_close {
+            let body = &toks[body_open..=body_close];
+            for (offset, window) in body.windows(6).enumerate() {
+                if window[0].is_sym(".")
+                    && window[1].kind == GuardTokKind::Word
+                    && GHOST_LENGTH_PROJECTIONS.contains(&window[1].text)
+                    && window[2].is_sym("(")
+                    && window[3].is_sym(")")
+                    && window[4].is_word("as")
+                    && window[5].kind == GuardTokKind::Word
+                    && is_fixed_width_int_type_name(window[5].text)
+                {
+                    out.push(GhostLengthWidthDiagnostic {
+                        source_label: String::from(source_label),
+                        line: body[offset + 5].line,
+                        declaration: String::from(name),
+                        fixed_width_type: String::from(window[5].text),
+                        kind: GhostLengthWidthKind::WraparoundCast,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// Scan a Lean (`Specs/`, `Obligations/`, `Assumptions/`) or Rust (`#[model]`,
+/// `#[spec]`, `#[invariant]`) specification source for ghost collection
+/// lengths typed at a fixed machine width (`Slate` soundness bug 121).
+///
+/// The dialect is inferred from `source_label` ([`SpecSourceDialect`]);
+/// comments and string literals are never inspected.
+///
+/// Flagged:
+///
+/// - a Lean `def` / `axiom` / `opaque` / `abbrev` / `theorem` / `lemma` whose
+///   name marks a length or cardinality (`len`, `length`, `card`, `size`,
+///   `count`, `cap`, `bound`, …), that is ghost (its name has a `ghost`
+///   segment or its signature mentions a [`GHOST_COLLECTION_TYPE_NAMES`]
+///   type), and whose result type is one of
+///   [`FIXED_WIDTH_GHOST_INT_TYPE_NAMES`] or `BitVec <N>`;
+/// - a Rust `fn` under `#[model]` with such a name and return type, or under
+///   `#[spec]` / `#[embed_spec]` / `#[external_spec]` / `#[invariant]` when
+///   it is additionally ghost by name or signature;
+/// - Lean casts of a collection length into a fixed-width type
+///   (`UInt64.ofNat xs.length`, `xs.length.toUSize`), and `.len() as u64`
+///   inside a Rust specification function over a ghost collection.
+///
+/// `Nat` / `Int` lengths, declarations that are not lengths, and Rust
+/// functions without a specification attribute are accepted. Malformed source
+/// yields a single [`GhostLengthWidthKind::MalformedSource`] diagnostic.
+pub fn scan_ghost_length_width_diagnostics(
+    source_label: &str,
+    source_text: &str,
+) -> Vec<GhostLengthWidthDiagnostic> {
+    let dialect = SpecSourceDialect::from_source_label(source_label);
+    let toks = match tokenize_spec_source(source_text, dialect) {
+        Ok(toks) => toks,
+        Err(unclosed) => {
+            return vec![GhostLengthWidthDiagnostic {
+                source_label: String::from(source_label),
+                line: unclosed.line,
+                declaration: String::new(),
+                fixed_width_type: String::new(),
+                kind: GhostLengthWidthKind::MalformedSource,
+            }];
+        }
+    };
+    let mut out = Vec::new();
+    if dialect != SpecSourceDialect::Rust {
+        scan_lean_ghost_length_decls(source_label, &toks, &mut out);
+        scan_lean_wraparound_casts(source_label, &toks, &mut out);
+    }
+    if dialect != SpecSourceDialect::Lean {
+        scan_rust_ghost_length_fns(source_label, &toks, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Guard 3: error-branch wildcard scanner (`awsm2`)
+// ----------------------------------------------------------------------------
+
+/// Syntactic shape of an error-branch wildcard
+/// (`anneal_spec::spec_check::ErrorWildcardPattern`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ErrorBranchWildcardKind {
+    /// `Err(_) => true`, `| Err _ => True`, `| .err _ => True`,
+    /// `| .error _ => True`.
+    ErrArmTrue,
+    /// `| .ub => True`, `| .fail .ub => True`, `| .fail _ => True`.
+    UbArmTrue,
+    /// `| .unsupported => True`.
+    UnsupportedArmTrue,
+    /// `matches!(out, Ok(_) | Err(_))`.
+    MatchesAnyErr,
+    /// `_ => true` in a postcondition that also matches an `Ok` constructor.
+    CatchAllArmTrue,
+    /// The source has an unclosed comment or literal and cannot be scanned.
+    MalformedSource,
+}
+
+impl ErrorBranchWildcardKind {
+    /// Short wire tag, equal to `ErrorWildcardPattern::as_str` in
+    /// `anneal-spec` for every shape both scanners report.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ErrArmTrue => "err_arm_true",
+            Self::UbArmTrue => "ub_arm_true",
+            Self::UnsupportedArmTrue => "unsupported_arm_true",
+            Self::MatchesAnyErr => "matches_any_err",
+            Self::CatchAllArmTrue => "catch_all_arm_true",
+            Self::MalformedSource => "unclosed_literal_or_comment",
+        }
+    }
+}
+
+/// An `error_branch_wildcard` finding (`awsm2`, `cl/1028766308`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ErrorBranchWildcardDiagnostic {
+    /// Label of the scanned source (usually its path).
+    pub source_label: String,
+    /// 1-based line of the arm's `=>` (or of the `matches!` pattern end).
+    pub line: usize,
+    /// What was found.
+    pub kind: ErrorBranchWildcardKind,
+}
+
+impl ErrorBranchWildcardDiagnostic {
+    /// The guard every diagnostic of this type reports under.
+    pub const GUARD: SpecBoundaryGuardId = SpecBoundaryGuardId::ErrorBranchWildcard;
+}
+
+impl fmt::Display for ErrorBranchWildcardDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}: {}: ", self.source_label, self.line, Self::GUARD)?;
+        f.write_str(match self.kind {
+            ErrorBranchWildcardKind::ErrArmTrue => {
+                "postcondition arm accepts every error payload (`Err(_) => true`); constrain the \
+                 error or state when it may occur"
+            }
+            ErrorBranchWildcardKind::UbArmTrue => {
+                "postcondition arm accepts undefined behavior (`| .ub => True`)"
+            }
+            ErrorBranchWildcardKind::UnsupportedArmTrue => {
+                "postcondition arm accepts an unsupported construct (`| .unsupported => True`)"
+            }
+            ErrorBranchWildcardKind::MatchesAnyErr => {
+                "`matches!` pattern accepts every error payload (`Ok(_) | Err(_)`)"
+            }
+            ErrorBranchWildcardKind::CatchAllArmTrue => {
+                "catch-all arm `_ => true` covers the error branches of an `Ok` match"
+            }
+            ErrorBranchWildcardKind::MalformedSource => {
+                "unclosed comment or literal; the source cannot be scanned (fail-closed)"
+            }
+        })
+    }
+}
+
+/// Error-like constructor an arm alternative accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WildcardCtor {
+    Err,
+    Ub,
+    Unsupported,
+    Fail,
+}
+
+impl WildcardCtor {
+    /// Capitalized names stand on their own (`Err`, `Result::Err`); lowercase
+    /// names are constructors only in dotted position (`.err`,
+    /// `Except.error`), since a bare lowercase word is a variable.
+    fn of(word: &str, after_dot: bool) -> Option<Self> {
+        match word {
+            "Err" => Some(Self::Err),
+            "Ub" | "UB" => Some(Self::Ub),
+            "Unsupported" => Some(Self::Unsupported),
+            "err" | "error" if after_dot => Some(Self::Err),
+            "ub" if after_dot => Some(Self::Ub),
+            "unsupported" if after_dot => Some(Self::Unsupported),
+            "fail" if after_dot => Some(Self::Fail),
+            _ => None,
+        }
+    }
+
+    fn kind(self) -> ErrorBranchWildcardKind {
+        match self {
+            Self::Err => ErrorBranchWildcardKind::ErrArmTrue,
+            Self::Ub | Self::Fail => ErrorBranchWildcardKind::UbArmTrue,
+            Self::Unsupported => ErrorBranchWildcardKind::UnsupportedArmTrue,
+        }
+    }
+}
+
+/// Whether `word`, as an error payload, binds or ignores the payload instead
+/// of constraining it (`_`, `_e`, `e`, `ref`).
+fn is_wildcard_payload_word(word: &str) -> bool {
+    if matches!(word, "true" | "false") {
+        return false;
+    }
+    match word.chars().next() {
+        Some(first) => first == '_' || (!first.is_uppercase() && !first.is_numeric()),
+        None => true,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WildcardAlternative {
+    depth: u32,
+    tokens: u32,
+    only_underscore: bool,
+    error_ctor: Option<WildcardCtor>,
+    constrained: bool,
+    after_arrow: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WildcardArm {
+    wildcard: Option<WildcardCtor>,
+    catch_all: bool,
+    guarded: bool,
+    guard_tokens: u32,
+    guard_trivial: bool,
+}
+
+impl WildcardArm {
+    fn absorb(&mut self, alt: &WildcardAlternative) {
+        if alt.tokens == 0 {
+            return;
+        }
+        if self.wildcard.is_none()
+            && !alt.constrained
+            && let Some(ctor) = alt.error_ctor
+        {
+            self.wildcard = Some(ctor);
+        }
+        if alt.only_underscore && alt.tokens == 1 {
+            self.catch_all = true;
+        }
+    }
+
+    fn guard_blocks(&self) -> bool {
+        self.guarded && !(self.guard_tokens == 1 && self.guard_trivial)
+    }
+}
+
+/// Whether the operator following a trivially true arm body combines it into
+/// a body that is no longer trivially true (`true && p`, `True ∧ P`).
+fn is_constraining_continuation(tok: &GuardTok<'_>) -> bool {
+    match tok.kind {
+        GuardTokKind::Sym => matches!(
+            tok.text,
+            "&&" | "&"
+                | "∧"
+                | "/\\"
+                | "->"
+                | "→"
+                | "↔"
+                | "<->"
+                | "="
+                | "=="
+                | "!="
+                | "≠"
+                | "==>"
+                | "."
+                | "?"
+                | "^"
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | "≤"
+                | "≥"
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "@"
+        ),
+        GuardTokKind::PathSep | GuardTokKind::DotDot => true,
+        GuardTokKind::Word => matches!(tok.text, "as" | "and"),
+        GuardTokKind::Literal | GuardTokKind::FatArrow => false,
+    }
+}
+
+/// Whether the arm body starting at `start` is trivially true: `true`,
+/// `True`, or `trivial`, optionally wrapped (`(true)`, `{ true }`,
+/// `{ return true; }`, `by trivial`), and not combined with a constraining
+/// operator.
+fn arm_body_is_trivially_true(toks: &[GuardTok<'_>], start: usize) -> bool {
+    let mut idx = start;
+    let mut parens = 0u32;
+    let mut braces = 0u32;
+    while let Some(tok) = toks.get(idx) {
+        if tok.is_sym("(") {
+            parens += 1;
+        } else if tok.is_sym("{") {
+            braces += 1;
+        } else if !(tok.is_word("return") || tok.is_word("by")) {
+            break;
+        }
+        idx += 1;
+    }
+    if !toks.get(idx).is_some_and(|tok| {
+        tok.kind == GuardTokKind::Word && matches!(tok.text, "true" | "True" | "trivial")
+    }) {
+        return false;
+    }
+    idx += 1;
+    while let Some(tok) = toks.get(idx) {
+        if tok.is_sym(")") && parens > 0 {
+            parens -= 1;
+        } else if tok.is_sym("}") && braces > 0 {
+            braces -= 1;
+        } else if !(tok.is_sym(";") && braces > 0) {
+            break;
+        }
+        idx += 1;
+    }
+    if parens != 0 || braces != 0 {
+        return false;
+    }
+    !toks.get(idx).is_some_and(is_constraining_continuation)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatchesMacroState {
+    Outside,
+    Scrutinee { depth: u32 },
+    Pattern,
+}
+
+/// Token-level error-branch wildcard scan; the same algorithm as
+/// `scan_error_branch_wildcard` in `anneal_spec::spec_check`, reporting every
+/// occurrence instead of the first.
+fn scan_error_branch_wildcard_tokens(
+    toks: &[GuardTok<'_>],
+) -> Vec<(usize, ErrorBranchWildcardKind)> {
+    let mut found = Vec::new();
+    let mut alt = WildcardAlternative::default();
+    let mut arm = WildcardArm::default();
+    let mut matches_state = MatchesMacroState::Outside;
+    let mut matches_wildcard = false;
+    let mut matches_guarded = false;
+    let mut after_dot = false;
+    let mut saw_ok_ctor = false;
+
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        let tok = &toks[idx];
+        idx += 1;
+        let was_after_dot = after_dot;
+        after_dot = tok.is_sym(".");
+
+        if let MatchesMacroState::Scrutinee { depth } = matches_state {
+            if tok.kind == GuardTokKind::Sym {
+                match tok.text {
+                    "(" | "[" | "{" => {
+                        matches_state = MatchesMacroState::Scrutinee { depth: depth + 1 };
+                    }
+                    ")" | "]" | "}" => {
+                        matches_state = if depth <= 1 {
+                            MatchesMacroState::Outside
+                        } else {
+                            MatchesMacroState::Scrutinee { depth: depth - 1 }
+                        };
+                    }
+                    "," if depth == 1 => {
+                        matches_state = MatchesMacroState::Pattern;
+                        matches_wildcard = false;
+                        matches_guarded = false;
+                        alt = WildcardAlternative::default();
+                        arm = WildcardArm::default();
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+
+        match tok.kind {
+            GuardTokKind::FatArrow => {
+                arm.absorb(&alt);
+                if !arm.guard_blocks() && arm_body_is_trivially_true(toks, idx) {
+                    if let Some(ctor) = arm.wildcard {
+                        found.push((tok.line, ctor.kind()));
+                    } else if arm.catch_all && saw_ok_ctor {
+                        found.push((tok.line, ErrorBranchWildcardKind::CatchAllArmTrue));
+                    }
+                }
+                arm = WildcardArm::default();
+                alt = WildcardAlternative {
+                    after_arrow: true,
+                    ..WildcardAlternative::default()
+                };
+            }
+            GuardTokKind::Sym if tok.text == "|" && alt.depth == 0 => {
+                if alt.after_arrow {
+                    arm = WildcardArm::default();
+                } else {
+                    arm.absorb(&alt);
+                }
+                alt = WildcardAlternative::default();
+            }
+            GuardTokKind::Sym if matches!(tok.text, "," | ";") && alt.depth == 0 => {
+                if matches_state == MatchesMacroState::Pattern {
+                    matches_state = MatchesMacroState::Outside;
+                }
+                arm = WildcardArm::default();
+                alt = WildcardAlternative::default();
+            }
+            GuardTokKind::Sym if matches!(tok.text, "(" | "[") => {
+                alt.depth += 1;
+                alt.tokens += 1;
+                alt.only_underscore = false;
+            }
+            GuardTokKind::Sym if tok.text == "{" => {
+                if alt.error_ctor.is_some() && !alt.after_arrow && !arm.guarded {
+                    alt.depth += 1;
+                    alt.tokens += 1;
+                } else {
+                    arm = WildcardArm::default();
+                    alt = WildcardAlternative::default();
+                }
+            }
+            GuardTokKind::Sym if matches!(tok.text, ")" | "]" | "}") => {
+                if alt.depth > 0 {
+                    alt.depth -= 1;
+                    alt.tokens += 1;
+                } else {
+                    if matches_state == MatchesMacroState::Pattern {
+                        arm.absorb(&alt);
+                        if arm.wildcard.is_some() {
+                            matches_wildcard = true;
+                        }
+                        if matches_wildcard && !matches_guarded {
+                            found.push((tok.line, ErrorBranchWildcardKind::MatchesAnyErr));
+                        }
+                        matches_state = MatchesMacroState::Outside;
+                    }
+                    arm = WildcardArm::default();
+                    alt = WildcardAlternative::default();
+                }
+            }
+            GuardTokKind::Word => {
+                let word = tok.text;
+                if word == "Ok" || (was_after_dot && word == "ok") {
+                    saw_ok_ctor = true;
+                }
+                if word == "matches"
+                    && matches_state == MatchesMacroState::Outside
+                    && toks.get(idx).is_some_and(|bang| bang.is_sym("!"))
+                    && toks
+                        .get(idx + 1)
+                        .is_some_and(|open| matches!(open.text, "(" | "[" | "{"))
+                {
+                    idx += 2;
+                    after_dot = false;
+                    matches_state = MatchesMacroState::Scrutinee { depth: 1 };
+                    continue;
+                }
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = word == "true";
+                } else if word == "if" && alt.depth == 0 && !alt.after_arrow {
+                    arm.absorb(&alt);
+                    alt = WildcardAlternative::default();
+                    arm.guarded = true;
+                    if matches_state == MatchesMacroState::Pattern {
+                        matches_guarded = true;
+                        if arm.wildcard.is_some() {
+                            matches_wildcard = true;
+                        }
+                    }
+                } else {
+                    alt.only_underscore = alt.tokens == 0 && word == "_";
+                    alt.tokens += 1;
+                    if let Some(ctor) = WildcardCtor::of(word, was_after_dot) {
+                        alt.error_ctor = Some(ctor);
+                    } else if alt.error_ctor.is_some()
+                        && (was_after_dot || !is_wildcard_payload_word(word))
+                    {
+                        alt.constrained = true;
+                    }
+                }
+            }
+            GuardTokKind::Literal | GuardTokKind::PathSep => {
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = false;
+                } else {
+                    alt.tokens += 1;
+                    alt.only_underscore = false;
+                    if alt.error_ctor.is_some() {
+                        alt.constrained = true;
+                    }
+                }
+            }
+            GuardTokKind::DotDot | GuardTokKind::Sym => {
+                if arm.guarded {
+                    arm.guard_tokens += 1;
+                    arm.guard_trivial = false;
+                } else {
+                    alt.tokens += 1;
+                    alt.only_underscore = false;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Scan a Lean `Specs/` module or a Rust specification source for
+/// postcondition arms that accept every error escape (`awsm2`):
+/// `| Err _ => True`, `Err(_) => true`, `| .err _ => True`,
+/// `| .error _ => True`, `| .ub => True`, `| .unsupported => True`,
+/// `| .fail .ub => True`, `matches!(out, Ok(_) | Err(_))`, and a catch-all
+/// `_ => true` in an `Ok` match.
+///
+/// Arms that constrain the error payload (`Err(E::Overflow) => …`), carry a
+/// non-trivial guard, or have any other body (`| .ub => False`) are accepted,
+/// and comments and literals are never inspected. Every occurrence is
+/// reported, in source order. Malformed source yields a single
+/// [`ErrorBranchWildcardKind::MalformedSource`] diagnostic.
+pub fn scan_error_branch_wildcard_diagnostics(
+    source_label: &str,
+    source_text: &str,
+) -> Vec<ErrorBranchWildcardDiagnostic> {
+    let dialect = SpecSourceDialect::from_source_label(source_label);
+    match tokenize_spec_source(source_text, dialect) {
+        Ok(toks) => scan_error_branch_wildcard_tokens(&toks)
+            .into_iter()
+            .map(|(line, kind)| ErrorBranchWildcardDiagnostic {
+                source_label: String::from(source_label),
+                line,
+                kind,
+            })
+            .collect(),
+        Err(unclosed) => vec![ErrorBranchWildcardDiagnostic {
+            source_label: String::from(source_label),
+            line: unclosed.line,
+            kind: ErrorBranchWildcardKind::MalformedSource,
+        }],
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Guard 1: entry-point `requires` audit (`verus#3606`)
+// ----------------------------------------------------------------------------
+
+/// Name-only binary entry-point test on a crate-qualified definition path
+/// (`isBinaryEntrySymbol` in Lean, `is_binary_entry_symbol` in `anneal-spec`):
+/// `main`, `<crate>::main`, `_start`, `<crate>::_start`, `__start`, and
+/// `<crate>::__start`.
+///
+/// Matching is on whole `::` segments, so `domain`, `maintain`, `main_loop`,
+/// and the method `<crate>::Type::main` are rejected.
+pub fn is_binary_entry_def_path(def_path: &str) -> bool {
+    let mut count = 0usize;
+    let mut leaf = def_path;
+    for segment in def_path.split("::") {
+        count += 1;
+        leaf = segment;
+    }
+    (count == 1 || count == 2) && matches!(leaf, "main" | "_start" | "__start")
+}
+
+/// Where an entry-point precondition was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum EntryPointRequiresKind {
+    /// A Rust `requires` companion (`IrContractRole::Requires`) whose MIR
+    /// body is not the constant `true`.
+    MirRequiresCompanion,
+    /// An authored Lean precondition (`def pre` / `pre :=`) that is neither
+    /// `True` nor a delegation to the generated default.
+    AuthoredLeanPre,
+    /// The authored Lean source has an unclosed comment or literal.
+    MalformedSource,
+}
+
+impl EntryPointRequiresKind {
+    /// Short wire tag of the finding.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MirRequiresCompanion => "mir_requires_companion",
+            Self::AuthoredLeanPre => "authored_lean_pre",
+            Self::MalformedSource => "malformed_source",
+        }
+    }
+}
+
+/// An `entry_point_requires` finding (`verus#3606`).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EntryPointRequiresDiagnostic {
+    /// Definition path of the binary entry point.
+    pub entry_def_path: String,
+    /// Label of the offending source: the companion's definition path, or
+    /// the authored Lean module's label.
+    pub source_label: String,
+    /// 1-based line of the authored precondition (`0` for a MIR companion).
+    pub line: usize,
+    /// Where the precondition was found.
+    pub kind: EntryPointRequiresKind,
+}
+
+impl EntryPointRequiresDiagnostic {
+    /// The guard every diagnostic of this type reports under.
+    pub const GUARD: SpecBoundaryGuardId = SpecBoundaryGuardId::EntryPointRequires;
+}
+
+impl fmt::Display for EntryPointRequiresDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}: {}: ", self.source_label, self.line, Self::GUARD)?;
+        match self.kind {
+            EntryPointRequiresKind::MirRequiresCompanion => write!(
+                f,
+                "binary entry point `{}` carries a non-trivial Rust `requires`; no verified \
+                 caller discharges it",
+                self.entry_def_path
+            ),
+            EntryPointRequiresKind::AuthoredLeanPre => write!(
+                f,
+                "binary entry point `{}` carries a non-trivial authored precondition `pre`; no \
+                 verified caller discharges it",
+                self.entry_def_path
+            ),
+            EntryPointRequiresKind::MalformedSource => write!(
+                f,
+                "unclosed comment or literal in the specification of binary entry point `{}` \
+                 (fail-closed)",
+                self.entry_def_path
+            ),
+        }
+    }
+}
+
+/// Whether a `requires` companion body is the constant `true`: a single basic
+/// block that only assigns `const true` to the return place and returns.
+pub fn ir_requires_body_is_trivially_true(mir: &IrCapturedMir) -> bool {
+    let [block] = mir.basic_blocks.as_slice() else {
+        return false;
+    };
+    if !matches!(block.terminator.kind, IrTerminatorKind::Return) {
+        return false;
+    }
+    let mut returns_true = false;
+    for stmt in &block.statements {
+        match &stmt.kind {
+            IrStatementKind::StorageLive(_)
+            | IrStatementKind::StorageDead(_)
+            | IrStatementKind::Coverage
+            | IrStatementKind::ConstEvalCounter
+            | IrStatementKind::Nop => {}
+            IrStatementKind::Assign(place, IrRvalue::Use(IrOperand::Constant(constant)))
+                if place.local_ == 0 && place.projection.is_empty() =>
+            {
+                let is_true = matches!(constant.ty.kind, IrRigidTy::Bool)
+                    && matches!(
+                        constant.val,
+                        IrConstValue::Scalar(IrConstScalar::Int(IrScalarInt {
+                            bits: 1,
+                            size_bytes: 1,
+                        }))
+                    );
+                if !is_true {
+                    return false;
+                }
+                returns_true = true;
+            }
+            _ => return false,
+        }
+    }
+    returns_true
+}
+
+/// Audit the Rust `requires` companions of a subject item.
+///
+/// When `subject` is a binary entry point — by [`is_binary_entry_def_path`]
+/// or because the caller lists its definition path in `extra_entry_def_paths`
+/// (items the front end classified by attribute, such as `#[entry]`) — every
+/// companion in `companions` with role `IrContractRole::Requires(subject)`
+/// whose body is not the constant `true` is reported.
+pub fn audit_mir_entry_point_requires(
+    subject: &IrCapturedMir,
+    companions: &[IrCapturedMir],
+    extra_entry_def_paths: &[&str],
+) -> Vec<EntryPointRequiresDiagnostic> {
+    let is_entry = is_binary_entry_def_path(&subject.def_path)
+        || extra_entry_def_paths.contains(&subject.def_path.as_str());
+    if !is_entry || subject.role != IrContractRole::Subject {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for companion in companions {
+        if let IrContractRole::Requires(target) = &companion.role
+            && target == &subject.def_path
+            && !ir_requires_body_is_trivially_true(companion)
+        {
+            out.push(EntryPointRequiresDiagnostic {
+                entry_def_path: subject.def_path.clone(),
+                source_label: companion.def_path.clone(),
+                line: 0,
+                kind: EntryPointRequiresKind::MirRequiresCompanion,
+            });
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Whether a Lean precondition body is trivial for the entry-point guard:
+/// `True` (possibly behind a `fun … =>` and parentheses), or a delegation to
+/// the generated default precondition (`Obligations.<Item>.defaultPre args`,
+/// `Obligations.<Item>.defaultSpec.pre args`,
+/// `Obligations.<Item>.rustRequires args`), whose own triviality is decided
+/// by the MIR companion audit.
+fn lean_pre_body_is_trivial(body: &[GuardTok<'_>]) -> bool {
+    let mut body = body;
+    // Strip a leading `fun <binders> =>`.
+    if body.first().is_some_and(|tok| tok.is_word("fun"))
+        && let Some(arrow) = body
+            .iter()
+            .position(|tok| tok.kind == GuardTokKind::FatArrow)
+    {
+        body = &body[arrow + 1..];
+    }
+    while body.len() >= 2 && body[0].is_sym("(") && body[body.len() - 1].is_sym(")") {
+        body = &body[1..body.len() - 1];
+    }
+    // `True`, or a reference to this module's own `def pre`, which the audit
+    // inspects where it is defined.
+    if body.len() == 1 && (body[0].is_word("True") || body[0].is_word("pre")) {
+        return true;
+    }
+    // `Obligations.<path>.<defaultPre|rustRequires|pre> <lowercase args>`
+    if !body.first().is_some_and(|tok| tok.is_word("Obligations")) {
+        return false;
+    }
+    let mut idx = 1usize;
+    let mut last_component = "";
+    while body.get(idx).is_some_and(|tok| tok.is_sym("."))
+        && let Some(component) = body
+            .get(idx + 1)
+            .filter(|tok| tok.kind == GuardTokKind::Word)
+    {
+        last_component = component.text;
+        idx += 2;
+    }
+    matches!(last_component, "defaultPre" | "rustRequires" | "pre")
+        && body[idx..].iter().all(|tok| {
+            tok.kind == GuardTokKind::Word
+                && tok
+                    .text
+                    .chars()
+                    .next()
+                    .is_some_and(|first| first.is_lowercase() || first == '_')
+        })
+}
+
+/// Audit an authored Lean `Specs/<Item>.lean` module of a binary entry point.
+///
+/// Reports every precondition (`def pre … := body`, or an instance field
+/// `pre := body`) whose body is neither `True` nor a delegation to the
+/// generated default. A module without a precondition, and the module of a
+/// non-entry item, yield no diagnostics.
+pub fn audit_lean_spec_entry_point_requires(
+    entry_def_path: &str,
+    source_label: &str,
+    specs_source: &str,
+    extra_entry_def_paths: &[&str],
+) -> Vec<EntryPointRequiresDiagnostic> {
+    if !(is_binary_entry_def_path(entry_def_path)
+        || extra_entry_def_paths.contains(&entry_def_path))
+    {
+        return Vec::new();
+    }
+    let diagnostic = |line, kind| EntryPointRequiresDiagnostic {
+        entry_def_path: String::from(entry_def_path),
+        source_label: String::from(source_label),
+        line,
+        kind,
+    };
+    let toks = match tokenize_spec_source(specs_source, SpecSourceDialect::Lean) {
+        Ok(toks) => toks,
+        Err(unclosed) => {
+            return vec![diagnostic(
+                unclosed.line,
+                EntryPointRequiresKind::MalformedSource,
+            )];
+        }
+    };
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        // `def pre <binders> [: T] := body` or the instance field `pre := body`.
+        let is_def_pre =
+            toks[idx].is_word("def") && toks.get(idx + 1).is_some_and(|name| name.is_word("pre"));
+        let is_field_pre = toks[idx].is_word("pre")
+            && toks.get(idx + 1).is_some_and(|assign| assign.is_sym(":="))
+            && !(idx > 0 && toks[idx - 1].is_sym("."));
+        if !(is_def_pre || is_field_pre) {
+            idx += 1;
+            continue;
+        }
+        let line = toks[idx].line;
+        let mut assign = idx + 1;
+        let mut depth = 0i32;
+        while let Some(tok) = toks.get(assign) {
+            if depth == 0 && tok.is_sym(":=") {
+                break;
+            }
+            depth += bracket_delta(tok);
+            assign += 1;
+        }
+        // The body ends at the next command or at the next instance field.
+        let body_start = (assign + 1).min(toks.len());
+        let mut body_end = body_start;
+        let mut depth = 0i32;
+        while let Some(tok) = toks.get(body_end) {
+            if depth == 0 {
+                let next_command =
+                    tok.kind == GuardTokKind::Word && LEAN_COMMAND_KEYWORDS.contains(&tok.text);
+                let next_field = tok.kind == GuardTokKind::Word
+                    && body_end > body_start
+                    && toks.get(body_end + 1).is_some_and(|a| a.is_sym(":="));
+                let attribute =
+                    tok.is_sym("@") && toks.get(body_end + 1).is_some_and(|open| open.is_sym("["));
+                if next_command || next_field || attribute {
+                    break;
+                }
+            }
+            depth += bracket_delta(tok);
+            body_end += 1;
+        }
+        if !lean_pre_body_is_trivial(&toks[body_start..body_end]) {
+            out.push(diagnostic(line, EntryPointRequiresKind::AuthoredLeanPre));
+        }
+        idx = body_end.max(idx + 1);
+    }
+    out
+}
+
+/// Audit one binary entry point end to end: its Rust `requires` companions
+/// ([`audit_mir_entry_point_requires`]) and, when present, its authored Lean
+/// `Specs/<Item>.lean` module ([`audit_lean_spec_entry_point_requires`]),
+/// given as `(source_label, source_text)`.
+pub fn audit_entry_point_requires_bundle(
+    subject: &IrCapturedMir,
+    companions: &[IrCapturedMir],
+    authored_specs: Option<(&str, &str)>,
+    extra_entry_def_paths: &[&str],
+) -> Vec<EntryPointRequiresDiagnostic> {
+    let mut out = audit_mir_entry_point_requires(subject, companions, extra_entry_def_paths);
+    if let Some((source_label, specs_source)) = authored_specs {
+        out.extend(audit_lean_spec_entry_point_requires(
+            &subject.def_path,
+            source_label,
+            specs_source,
+            extra_entry_def_paths,
+        ));
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Unified spec-boundary guard audit
+// ----------------------------------------------------------------------------
+
+/// A finding of any spec-boundary guard in a uniform shape.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SpecBoundaryGuardDiagnostic {
+    /// The guard that fired.
+    pub guard: SpecBoundaryGuardId,
+    /// Label of the offending source.
+    pub source_label: String,
+    /// 1-based source line (`0` when the finding is not tied to a line).
+    pub line: usize,
+    /// Rendered diagnostic message.
+    pub message: String,
+}
+
+impl fmt::Display for SpecBoundaryGuardDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<&GhostLengthWidthDiagnostic> for SpecBoundaryGuardDiagnostic {
+    fn from(diagnostic: &GhostLengthWidthDiagnostic) -> Self {
+        Self {
+            guard: GhostLengthWidthDiagnostic::GUARD,
+            source_label: diagnostic.source_label.clone(),
+            line: diagnostic.line,
+            message: diagnostic.to_string(),
+        }
+    }
+}
+
+impl From<&ErrorBranchWildcardDiagnostic> for SpecBoundaryGuardDiagnostic {
+    fn from(diagnostic: &ErrorBranchWildcardDiagnostic) -> Self {
+        Self {
+            guard: ErrorBranchWildcardDiagnostic::GUARD,
+            source_label: diagnostic.source_label.clone(),
+            line: diagnostic.line,
+            message: diagnostic.to_string(),
+        }
+    }
+}
+
+impl From<&EntryPointRequiresDiagnostic> for SpecBoundaryGuardDiagnostic {
+    fn from(diagnostic: &EntryPointRequiresDiagnostic) -> Self {
+        Self {
+            guard: EntryPointRequiresDiagnostic::GUARD,
+            source_label: diagnostic.source_label.clone(),
+            line: diagnostic.line,
+            message: diagnostic.to_string(),
+        }
+    }
+}
+
+/// A labeled specification source text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpecBoundarySource<'a> {
+    /// Label of the source, usually its path; its extension selects the
+    /// dialect ([`SpecSourceDialect::from_source_label`]).
+    pub label: &'a str,
+    /// Source text.
+    pub text: &'a str,
+}
+
+/// Input of [`audit_spec_boundary_guards`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SpecBoundaryAuditInput<'a> {
+    /// Lean and Rust specification sources scanned for fixed-width ghost
+    /// lengths and error-branch wildcards.
+    pub spec_sources: &'a [SpecBoundarySource<'a>],
+    /// Captured MIR items: subjects and their contract companions.
+    pub mir_items: &'a [IrCapturedMir],
+    /// Authored Lean `Specs/<Item>.lean` modules, keyed by the definition
+    /// path of the item they specify.
+    pub authored_entry_specs: &'a [(&'a str, SpecBoundarySource<'a>)],
+    /// Definition paths the front end classified as binary entry points by
+    /// attribute (`#[entry]`, `#[no_mangle]` `_start`), in addition to the
+    /// name-only test [`is_binary_entry_def_path`].
+    pub extra_entry_def_paths: &'a [&'a str],
+}
+
+/// Result of [`audit_spec_boundary_guards`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpecBoundaryGuardAuditReport {
+    /// All findings, sorted by guard rank, source label, line, and message.
+    pub diagnostics: Vec<SpecBoundaryGuardDiagnostic>,
+}
+
+impl SpecBoundaryGuardAuditReport {
+    /// Returns `true` iff no guard fired.
+    pub fn is_clean(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+
+    /// Number of findings per guard, in guard rank order.
+    pub fn counts_by_guard(&self) -> [usize; SpecBoundaryGuardId::COUNT] {
+        let mut counts = [0usize; SpecBoundaryGuardId::COUNT];
+        for diagnostic in &self.diagnostics {
+            counts[diagnostic.guard.rank()] += 1;
+        }
+        counts
+    }
+
+    /// Render a deterministic single-line summary of the audit.
+    pub fn summary_line(&self) -> String {
+        let counts = self.counts_by_guard();
+        let parts: Vec<String> = SpecBoundaryGuardId::ALL
+            .into_iter()
+            .map(|guard| format!("{guard}={}", counts[guard.rank()]))
+            .collect();
+        format!(
+            "SpecBoundaryGuardAudit(total={}, {})",
+            self.diagnostics.len(),
+            parts.join(", ")
+        )
+    }
+
+    /// Render the findings one per line, preceded by the summary line.
+    pub fn render_diagnostic_report(&self) -> String {
+        let mut out = self.summary_line();
+        out.push('\n');
+        for diagnostic in &self.diagnostics {
+            out.push_str(&diagnostic.message);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Run all three spec-boundary guards over a verification bundle:
+///
+/// - `fixed_width_ghost_length` and `error_branch_wildcard` over every source
+///   in [`SpecBoundaryAuditInput::spec_sources`] and every authored entry
+///   spec;
+/// - `entry_point_requires` over every subject item in
+///   [`SpecBoundaryAuditInput::mir_items`] and every authored entry spec.
+///
+/// The report is deterministic: findings are sorted and deduplicated.
+pub fn audit_spec_boundary_guards(
+    input: &SpecBoundaryAuditInput<'_>,
+) -> SpecBoundaryGuardAuditReport {
+    let mut diagnostics: Vec<SpecBoundaryGuardDiagnostic> = Vec::new();
+    let authored_sources = input.authored_entry_specs.iter().map(|(_, source)| source);
+    for source in input.spec_sources.iter().chain(authored_sources) {
+        diagnostics.extend(
+            scan_ghost_length_width_diagnostics(source.label, source.text)
+                .iter()
+                .map(SpecBoundaryGuardDiagnostic::from),
+        );
+        diagnostics.extend(
+            scan_error_branch_wildcard_diagnostics(source.label, source.text)
+                .iter()
+                .map(SpecBoundaryGuardDiagnostic::from),
+        );
+    }
+    for subject in input.mir_items {
+        diagnostics.extend(
+            audit_mir_entry_point_requires(subject, input.mir_items, input.extra_entry_def_paths)
+                .iter()
+                .map(SpecBoundaryGuardDiagnostic::from),
+        );
+    }
+    for (entry_def_path, source) in input.authored_entry_specs {
+        diagnostics.extend(
+            audit_lean_spec_entry_point_requires(
+                entry_def_path,
+                source.label,
+                source.text,
+                input.extra_entry_def_paths,
+            )
+            .iter()
+            .map(SpecBoundaryGuardDiagnostic::from),
+        );
+    }
+    diagnostics.sort();
+    diagnostics.dedup();
+    SpecBoundaryGuardAuditReport { diagnostics }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7020,5 +9766,1293 @@ mod tests {
                     UncoveredReason::UnresolvedCallContract { callee } if callee == "probes::callee_u32"
                 )
         }));
+    }
+
+    // ---- Spec-boundary guard taxonomy & canonical manifest ------------------
+
+    #[test]
+    fn spec_boundary_guard_ids_match_frozen_cross_language_contract() {
+        let table: [(usize, &str, &str, &str); 3] = [
+            (
+                0,
+                "entry_point_requires",
+                "EntryPointPrecondition",
+                "DeadPrecondition",
+            ),
+            (
+                1,
+                "fixed_width_ghost_length",
+                "FixedWidthGhostLength",
+                "SpecViolation",
+            ),
+            (
+                2,
+                "error_branch_wildcard",
+                "ErrorBranchWildcard",
+                "SurvivedAllMutants",
+            ),
+        ];
+        assert_eq!(SpecBoundaryGuardId::COUNT, 3);
+        assert_eq!(SpecBoundaryGuardId::ALL.len(), 3);
+        for (guard, (rank, id, name, vacuity)) in SpecBoundaryGuardId::ALL.into_iter().zip(table) {
+            assert_eq!(guard.rank(), rank);
+            assert_eq!(SpecBoundaryGuardId::from_rank(rank), Some(guard));
+            assert_eq!(guard.as_str(), id);
+            assert_eq!(guard.to_string(), id);
+            assert_eq!(id.parse::<SpecBoundaryGuardId>(), Ok(guard));
+            assert_eq!(guard.canonical_name(), name);
+            assert_eq!(guard.vacuity_class(), vacuity);
+            assert!(!guard.description().is_empty());
+            // Guard identifiers are disjoint from property class identifiers.
+            assert!(id.parse::<PropertyClass>().is_err());
+        }
+        assert_eq!(SpecBoundaryGuardId::from_rank(3), None);
+        for near_miss in [
+            "",
+            "EntryPointPrecondition",
+            "entry_point_precondition",
+            "entry_point_requires ",
+            "Entry_Point_Requires",
+            "fixed_width_ghost_len",
+            "error_branch_wildcards",
+            "arithmetic_overflow",
+        ] {
+            assert!(
+                near_miss.parse::<SpecBoundaryGuardId>().is_err(),
+                "{near_miss:?}"
+            );
+        }
+        for class in PropertyClass::ALL {
+            assert!(class.as_str().parse::<SpecBoundaryGuardId>().is_err());
+        }
+    }
+
+    #[test]
+    fn property_class_table_matches_frozen_cross_language_contract() {
+        let table: [(usize, &str, &str, bool); 12] = [
+            (0, "arithmetic_overflow", "ArithmeticOverflow", true),
+            (1, "shift_bounds", "ShiftBounds", true),
+            (2, "div_rem_ub", "DivRemUb", true),
+            (3, "pointer_deref", "PointerDereference", true),
+            (4, "slice_array_bounds", "SliceArrayBounds", true),
+            (5, "discriminant_validity", "DiscriminantValidity", true),
+            (6, "call_contract", "CallContract", true),
+            (7, "loop_termination", "LoopTermination", true),
+            (8, "switch_exhaustiveness", "SwitchExhaustiveness", true),
+            (9, "memory_copy_overlap", "MemoryCopyOverlap", true),
+            (10, "uninit_read", "UninitRead", true),
+            (11, "unsupported_fallback", "UnsupportedFallback", false),
+        ];
+        for (class, (rank, id, variant, waivable)) in PropertyClass::ALL.into_iter().zip(table) {
+            assert_eq!(class.rank(), rank);
+            assert_eq!(class.as_str(), id);
+            assert_eq!(class.variant_name(), variant);
+            assert_eq!(format!("{class:?}"), variant);
+            assert_eq!(class.is_waivable(), waivable);
+        }
+    }
+
+    #[test]
+    fn taxonomy_manifest_json_is_deterministic_and_roundtrips() {
+        let json = render_property_taxonomy_json();
+        assert_eq!(json, render_property_taxonomy_json());
+        assert_eq!(json, PropertyTaxonomyManifest::canonical().to_json());
+        assert!(json.starts_with("{\n  \"schema_version\": 1,\n  \"property_classes\": [\n"));
+        assert!(json.ends_with("  ]\n}\n"));
+        // One entry per line, in rank order, with a fixed key order.
+        assert!(json.contains(
+            "    {\"rank\": 0, \"id\": \"arithmetic_overflow\", \"variant\": \
+             \"ArithmeticOverflow\", \"is_waivable\": true, \"strict_disposition\": \
+             \"discharged\", \"partial_disposition\": \"discharged\", \"description\": "
+        ));
+        assert!(json.contains(
+            "    {\"rank\": 7, \"id\": \"loop_termination\", \"variant\": \"LoopTermination\", \
+             \"is_waivable\": true, \"strict_disposition\": \"discharged\", \
+             \"partial_disposition\": \"explicitly_waived\", \"description\": "
+        ));
+        assert!(json.contains(
+            "    {\"rank\": 11, \"id\": \"unsupported_fallback\", \"variant\": \
+             \"UnsupportedFallback\", \"is_waivable\": false, \"strict_disposition\": \
+             \"unsupported_fail_closed\", \"partial_disposition\": \"unsupported_fail_closed\", \
+             \"description\": "
+        ));
+        assert!(json.contains(
+            "    {\"rank\": 0, \"id\": \"entry_point_requires\", \"canonical_name\": \
+             \"EntryPointPrecondition\", \"vacuity_class\": \"DeadPrecondition\", \
+             \"description\": "
+        ));
+        assert!(json.contains(
+            "    {\"rank\": 1, \"id\": \"fixed_width_ghost_length\", \"canonical_name\": \
+             \"FixedWidthGhostLength\", \"vacuity_class\": \"SpecViolation\", \"description\": "
+        ));
+        assert!(json.contains(
+            "    {\"rank\": 2, \"id\": \"error_branch_wildcard\", \"canonical_name\": \
+             \"ErrorBranchWildcard\", \"vacuity_class\": \"SurvivedAllMutants\", \
+             \"description\": "
+        ));
+        // The canonical manifest carries no registry-specific annotation.
+        assert!(!json.contains("\"disposition\""));
+        assert_eq!(json.lines().count(), 3 + 12 + 2 + 3 + 2);
+
+        let manifest = parse_property_taxonomy_json(&json).expect("canonical manifest parses");
+        assert_eq!(manifest, PropertyTaxonomyManifest::canonical());
+        assert_eq!(manifest.schema_version, PROPERTY_TAXONOMY_SCHEMA_VERSION);
+        assert_eq!(manifest.property_classes.len(), PropertyClass::COUNT);
+        assert_eq!(
+            manifest.spec_boundary_guards.len(),
+            SpecBoundaryGuardId::COUNT
+        );
+        assert_eq!(manifest.check_canonical(), Ok(()));
+        assert_eq!(manifest.to_json(), json);
+        assert_eq!(
+            parse_canonical_property_taxonomy_json(&json),
+            Ok(PropertyTaxonomyManifest::canonical())
+        );
+
+        // Every entry agrees with the compiled enums.
+        for (entry, class) in manifest.property_classes.iter().zip(PropertyClass::ALL) {
+            assert_eq!(entry.rank, class.rank());
+            assert_eq!(entry.id.parse::<PropertyClass>(), Ok(class));
+            assert_eq!(entry.variant, class.variant_name());
+            assert_eq!(entry.is_waivable, class.is_waivable());
+            assert_eq!(entry.description, class.description());
+            assert_eq!(entry.disposition, None);
+        }
+        for (entry, guard) in manifest
+            .spec_boundary_guards
+            .iter()
+            .zip(SpecBoundaryGuardId::ALL)
+        {
+            assert_eq!(entry.rank, guard.rank());
+            assert_eq!(entry.id.parse::<SpecBoundaryGuardId>(), Ok(guard));
+            assert_eq!(entry.canonical_name, guard.canonical_name());
+            assert_eq!(entry.vacuity_class, guard.vacuity_class());
+            assert_eq!(entry.description, guard.description());
+        }
+
+        // Whitespace-insensitive parsing accepts a reformatted manifest.
+        let compact: String = json.split('\n').map(str::trim).collect();
+        assert_eq!(parse_property_taxonomy_json(&compact), Ok(manifest));
+    }
+
+    #[test]
+    fn registry_taxonomy_export_carries_dispositions() {
+        for (registry, loop_tag, overflow_tag) in [
+            (PropertyRegistry::strict(), "discharged", "discharged"),
+            (
+                PropertyRegistry::for_partial_correctness(),
+                "explicitly_waived",
+                "discharged",
+            ),
+            (
+                PropertyRegistry::all_unemitted(),
+                "unemitted_gap",
+                "unemitted_gap",
+            ),
+        ] {
+            let json = registry.to_taxonomy_json();
+            assert_eq!(json, registry.to_taxonomy_json());
+            let manifest = parse_property_taxonomy_json(&json).expect("registry export parses");
+            assert_eq!(manifest, PropertyTaxonomyManifest::for_registry(&registry));
+            assert_eq!(manifest.to_json(), json);
+            // The export still describes the canonical taxonomy.
+            assert_eq!(manifest.check_canonical(), Ok(()));
+            let disposition = |class: PropertyClass| {
+                manifest.property_classes[class.rank()]
+                    .disposition
+                    .as_deref()
+            };
+            assert_eq!(disposition(PropertyClass::LoopTermination), Some(loop_tag));
+            assert_eq!(
+                disposition(PropertyClass::ArithmeticOverflow),
+                Some(overflow_tag)
+            );
+            assert_eq!(
+                disposition(PropertyClass::UnsupportedFallback),
+                Some("unsupported_fail_closed")
+            );
+            for class in PropertyClass::ALL {
+                assert_eq!(disposition(class), Some(registry.disposition(class).tag()));
+            }
+        }
+    }
+
+    #[test]
+    fn taxonomy_manifest_parser_is_strict() {
+        let json = render_property_taxonomy_json();
+        let must_fail = |mutated: String, why: &str| {
+            assert!(
+                parse_property_taxonomy_json(&mutated).is_err(),
+                "parser accepted a manifest with {why}"
+            );
+        };
+        must_fail(String::new(), "no content");
+        must_fail(format!("{json}x"), "trailing input");
+        must_fail(format!("{json}{json}"), "a second document");
+        must_fail(
+            json.replace("\"schema_version\": 1", "\"schema_version\": 2"),
+            "an unsupported schema version",
+        );
+        must_fail(
+            json.replace("\"schema_version\": 1", "\"schema_version\": 01"),
+            "a leading zero",
+        );
+        must_fail(
+            json.replace("\"schema_version\": 1", "\"schema_version\": 1.0"),
+            "a float",
+        );
+        must_fail(
+            json.replace("\"schema_version\": 1", "\"schema_version\": -1"),
+            "a negative number",
+        );
+        must_fail(
+            json.replace("\"schema_version\": 1", "\"schema_version\": \"1\""),
+            "a string schema version",
+        );
+        must_fail(
+            json.replace(
+                "\"schema_version\": 1,",
+                "\"schema_version\": 1, \"schema_version\": 1,",
+            ),
+            "a duplicate key",
+        );
+        must_fail(
+            json.replace(
+                "\"schema_version\": 1,",
+                "\"schema_version\": 1, \"extra\": 0,",
+            ),
+            "an unknown root key",
+        );
+        must_fail(
+            json.replace("\"variant\": \"ShiftBounds\", ", ""),
+            "a missing entry key",
+        );
+        must_fail(
+            json.replace(
+                "\"variant\": \"ShiftBounds\", ",
+                "\"variant\": \"ShiftBounds\", \"alias\": \"sb\", ",
+            ),
+            "an unknown entry key",
+        );
+        must_fail(
+            json.replace("\"is_waivable\": false", "\"is_waivable\": \"false\""),
+            "a string boolean",
+        );
+        must_fail(
+            json.replace(
+                "{\"rank\": 1, \"id\": \"shift_bounds\"",
+                "{\"rank\": 5, \"id\": \"shift_bounds\"",
+            ),
+            "entries out of rank order",
+        );
+        must_fail(
+            json.replace("\"id\": \"shift_bounds\"", "\"id\": \"shift_bounds"),
+            "an unterminated string",
+        );
+        must_fail(
+            json.replace("\"id\": \"shift_bounds\"", "\"id\": \"shift\\qbounds\""),
+            "an unknown escape",
+        );
+        must_fail(
+            json.replace(
+                "  ],\n  \"spec_boundary_guards\"",
+                "  ]\n  \"spec_boundary_guards\"",
+            ),
+            "a missing comma",
+        );
+        must_fail(
+            json.trim_end().trim_end_matches('}').to_string(),
+            "an unclosed object",
+        );
+        must_fail(format!("{}1", "[".repeat(64)), "deep nesting");
+        must_fail(String::from("[]"), "a non-object root");
+        must_fail(String::from("null"), "a null root");
+    }
+
+    #[test]
+    fn taxonomy_manifest_drift_is_detected() {
+        let json = render_property_taxonomy_json();
+        let drifted = |mutated: String, why: &str| {
+            let manifest = parse_property_taxonomy_json(&mutated)
+                .unwrap_or_else(|err| panic!("structurally valid manifest with {why}: {err}"));
+            let err = manifest
+                .check_canonical()
+                .expect_err(&format!("drift not detected: {why}"));
+            assert!(err.contains("drift"), "{err}");
+            assert!(
+                parse_canonical_property_taxonomy_json(&mutated).is_err(),
+                "{why}"
+            );
+        };
+        drifted(
+            json.replace("\"id\": \"div_rem_ub\"", "\"id\": \"div_rem\""),
+            "a renamed property class identifier",
+        );
+        drifted(
+            json.replace("\"variant\": \"DivRemUb\"", "\"variant\": \"DivRem\""),
+            "a renamed variant",
+        );
+        drifted(
+            json.replace("\"is_waivable\": false", "\"is_waivable\": true"),
+            "a waivable unsupported fallback",
+        );
+        drifted(
+            json.replace(
+                "\"partial_disposition\": \"explicitly_waived\"",
+                "\"partial_disposition\": \"discharged\"",
+            ),
+            "a changed partial disposition",
+        );
+        drifted(
+            json.replace(
+                "\"vacuity_class\": \"SurvivedAllMutants\"",
+                "\"vacuity_class\": \"SpecViolation\"",
+            ),
+            "a changed guard vacuity class",
+        );
+        drifted(
+            json.replace(
+                "\"canonical_name\": \"EntryPointPrecondition\"",
+                "\"canonical_name\": \"EntryPointRequires\"",
+            ),
+            "a renamed guard",
+        );
+        drifted(
+            json.replace(
+                "\"id\": \"error_branch_wildcard\"",
+                "\"id\": \"error_wildcard\"",
+            ),
+            "a renamed guard identifier",
+        );
+        // Dropping the last class and the last guard keeps the ranks contiguous.
+        let without_last_class: String = json
+            .lines()
+            .filter(|line| !line.contains("\"unsupported_fallback\""))
+            .map(|line| {
+                if line.contains("\"uninit_read\"") {
+                    format!("{}\n", line.trim_end_matches(','))
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        drifted(without_last_class, "a missing property class");
+        let without_last_guard: String = json
+            .lines()
+            .filter(|line| !line.contains("\"error_branch_wildcard\""))
+            .map(|line| {
+                if line.contains("\"fixed_width_ghost_length\"") {
+                    format!("{}\n", line.trim_end_matches(','))
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        drifted(without_last_guard, "a missing guard");
+        // An unknown registry disposition tag is drift as well.
+        let annotated = PropertyRegistry::strict().to_taxonomy_json().replacen(
+            "\"disposition\": \"discharged\"",
+            "\"disposition\": \"proved\"",
+            1,
+        );
+        drifted(annotated, "an unknown disposition tag");
+    }
+
+    // ---- Guard 2: fixed-width ghost length scanner --------------------------
+
+    #[test]
+    fn ghost_length_type_name_tables_match_lean() {
+        assert_eq!(
+            FIXED_WIDTH_GHOST_INT_TYPE_NAMES,
+            [
+                "UInt8", "UInt16", "UInt32", "UInt64", "USize", "Int8", "Int16", "Int32", "Int64",
+                "ISize", "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64",
+                "i128", "isize",
+            ]
+        );
+        assert_eq!(UNBOUNDED_GHOST_INT_TYPE_NAMES, ["Nat", "Int"]);
+        for unbounded in UNBOUNDED_GHOST_INT_TYPE_NAMES {
+            assert!(!FIXED_WIDTH_GHOST_INT_TYPE_NAMES.contains(&unbounded));
+        }
+        assert_eq!(
+            GhostLengthWidthDiagnostic::GUARD,
+            SpecBoundaryGuardId::FixedWidthGhostLength
+        );
+    }
+
+    fn ghost_findings(
+        label: &str,
+        text: &str,
+    ) -> Vec<(usize, String, String, GhostLengthWidthKind)> {
+        scan_ghost_length_width_diagnostics(label, text)
+            .into_iter()
+            .map(|d| {
+                assert_eq!(d.source_label, label);
+                (d.line, d.declaration, d.fixed_width_type, d.kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ghost_length_scanner_flags_fixed_width_lean_ghost_lengths() {
+        use GhostLengthWidthKind::{FixedWidthReturnType, WraparoundCast};
+        let lean = "\
+axiom GhostList.len : GhostList α → UInt64
+def ghostLen (xs : GhostSeq α) : USize := measure xs
+def card (s : Finset α) : UInt64 := 0
+def Seq.count (s : Seq α) (p : α → Bool) : BitVec 64 := 0
+opaque ghost_cap (m : GhostMap K V) : u64
+theorem GhostSet.size (s : GhostSet α) : (Int32) := 0
+def len (xs : List α) : UInt64 := UInt64.ofNat xs.length
+def next (xs : List α) : USize := USize.ofNat (xs.length + 1)
+theorem cast (xs : List α) (n : USize) : xs.length.toUSize = n := rfl
+theorem cast2 (xs : List α) : (xs.length).toUInt64 = 0 := rfl
+def setSize (s : Multiset α) : UInt32 := UInt32.ofNat s.card
+";
+        assert_eq!(
+            ghost_findings("Specs/Ghost.lean", lean),
+            vec![
+                (
+                    1,
+                    "GhostList.len".into(),
+                    "UInt64".into(),
+                    FixedWidthReturnType
+                ),
+                (2, "ghostLen".into(), "USize".into(), FixedWidthReturnType),
+                (3, "card".into(), "UInt64".into(), FixedWidthReturnType),
+                (
+                    4,
+                    "Seq.count".into(),
+                    "BitVec 64".into(),
+                    FixedWidthReturnType
+                ),
+                (5, "ghost_cap".into(), "u64".into(), FixedWidthReturnType),
+                (
+                    6,
+                    "GhostSet.size".into(),
+                    "Int32".into(),
+                    FixedWidthReturnType
+                ),
+                (7, String::new(), "UInt64".into(), WraparoundCast),
+                (8, String::new(), "USize".into(), WraparoundCast),
+                (9, String::new(), "USize".into(), WraparoundCast),
+                (10, String::new(), "UInt64".into(), WraparoundCast),
+                (11, String::new(), "UInt32".into(), WraparoundCast),
+                (11, "setSize".into(), "UInt32".into(), FixedWidthReturnType),
+            ]
+        );
+        // Every flagged type name is flagged when it is a ghost length type.
+        for ty in FIXED_WIDTH_GHOST_INT_TYPE_NAMES {
+            let src = format!("axiom GhostSeq.len : GhostSeq α → {ty}\n");
+            assert_eq!(
+                ghost_findings("Assumptions/Ghost.lean", &src),
+                vec![(
+                    1,
+                    "GhostSeq.len".into(),
+                    ty.to_string(),
+                    FixedWidthReturnType
+                )],
+                "{ty}"
+            );
+        }
+        let rendered = scan_ghost_length_width_diagnostics("Specs/Ghost.lean", lean)[0].to_string();
+        assert_eq!(
+            rendered,
+            "Specs/Ghost.lean:1: fixed_width_ghost_length: ghost length `GhostList.len` has \
+             fixed-width type `UInt64`, which wraps at its bit width; use Nat or Int"
+        );
+    }
+
+    #[test]
+    fn ghost_length_scanner_accepts_unbounded_and_non_ghost_lean() {
+        let lean = "\
+axiom GhostList.len : GhostList α → Nat
+def ghostLen (xs : GhostSeq α) : Int := 0
+def card (s : Finset α) : Nat := s.card
+def GhostMap.get (m : GhostMap K UInt64) (k : K) : UInt64 := m k
+def bufLen (b : Buffer) : UInt64 := b.len
+def toU64 (n : Nat) : UInt64 := UInt64.ofNat n
+def width : USize := USize.ofNat 8
+axiom GhostSeq.push_len (s : GhostSeq α) (x : α) : (s.push x).len = s.len + 1
+def GhostSeq.lenBounded (s : GhostSeq α) : Prop := s.len < 2 ^ 64
+def GhostSeq.take (s : GhostSeq α) (n : UInt64) : GhostSeq α := s
+-- axiom GhostList.len : GhostList α → UInt64
+/- def ghostLen (xs : GhostSeq α) : USize := 0
+   /- nested: UInt64.ofNat xs.length -/ -/
+def doc : String := \"axiom GhostList.len : GhostList α → UInt64; xs.length.toUSize\"
+theorem natLen (xs : List α) : xs.length = xs.length := rfl
+";
+        assert_eq!(ghost_findings("Specs/Clean.lean", lean), vec![]);
+        for ty in UNBOUNDED_GHOST_INT_TYPE_NAMES {
+            let src = format!("axiom GhostSeq.len : GhostSeq α → {ty}\n");
+            assert_eq!(ghost_findings("Specs/Clean.lean", &src), vec![], "{ty}");
+        }
+    }
+
+    #[test]
+    fn ghost_length_scanner_flags_rust_model_lengths_only_in_ghost_context() {
+        use GhostLengthWidthKind::{FixedWidthReturnType, WraparoundCast};
+        let rust = "\
+#[model]
+fn ghost_len(s: Seq<u8>) -> u64 { s.len() as u64 }
+
+#[anneal_spec::model]
+fn card(s: &GhostSet<u32>) -> usize { 0 }
+
+#[model]
+fn total_count(xs: &Chunks) -> u32 { 0 }
+
+#[spec(ensures: |r| r >= 0)]
+fn seq_size(s: Seq<u8>) -> usize { 0 }
+
+#[invariant(self.items.len() > 0)]
+#[model]
+pub fn ghost_cap(m: &GhostMap<u32, u8>) -> isize { m.count() as isize }
+";
+        assert_eq!(
+            ghost_findings("src/model.rs", rust),
+            vec![
+                (2, "ghost_len".into(), "u64".into(), FixedWidthReturnType),
+                (2, "ghost_len".into(), "u64".into(), WraparoundCast),
+                (5, "card".into(), "usize".into(), FixedWidthReturnType),
+                (8, "total_count".into(), "u32".into(), FixedWidthReturnType),
+                (11, "seq_size".into(), "usize".into(), FixedWidthReturnType),
+                (15, "ghost_cap".into(), "isize".into(), FixedWidthReturnType),
+                (15, "ghost_cap".into(), "isize".into(), WraparoundCast),
+            ]
+        );
+
+        let clean = "\
+fn len(s: &Seq<u8>) -> usize { 0 }
+
+#[spec(ensures: |r| r == self.items.len())]
+fn len(&self) -> usize { self.items.len() }
+
+#[model]
+fn ghost_len_nat(s: Seq<u8>) -> Nat { s.len() }
+
+#[model]
+fn ghost_bounded_inc(x: u32, step: u32) -> u64 { (x as u64) + (step as u64) }
+
+#[model]
+fn lookup(m: &GhostMap<u32, u64>, k: u32) -> u64 { 0 }
+
+#[inline]
+fn ghost_len(s: &[u8]) -> usize { s.len() }
+
+// #[model] fn ghost_len(s: Seq<u8>) -> u64 { 0 }
+/* #[model] fn ghost_len(s: Seq<u8>) -> u64 { 0 } /* nested */ */
+const DOC: &str = \"#[model] fn ghost_len(s: Seq<u8>) -> u64\";
+const RAW: &str = r#\"#[model] fn ghost_len(s: Seq<u8>) -> u64 \"quoted\" \"#;
+
+#[spec(requires: true)]
+struct Wrapper;
+fn wrapper_len(w: &Wrapper) -> usize { 0 }
+";
+        assert_eq!(ghost_findings("src/clean.rs", clean), vec![]);
+    }
+
+    #[test]
+    fn ghost_length_scanner_fails_closed_on_malformed_source() {
+        for (label, text) in [
+            (
+                "Specs/Bad.lean",
+                "/- unclosed\naxiom GhostList.len : GhostList α → Nat",
+            ),
+            ("Specs/Bad.lean", "def doc : String := \"unclosed"),
+            (
+                "src/bad.rs",
+                "/* unclosed\n#[model] fn ghost_len() -> Nat { 0 }",
+            ),
+            ("src/bad.rs", "const S: &str = r#\"unclosed\";"),
+        ] {
+            let diagnostics = scan_ghost_length_width_diagnostics(label, text);
+            assert_eq!(diagnostics.len(), 1, "{text:?}");
+            assert_eq!(diagnostics[0].kind, GhostLengthWidthKind::MalformedSource);
+            assert_eq!(diagnostics[0].line, 1);
+            assert!(diagnostics[0].to_string().contains("fail-closed"));
+        }
+    }
+
+    #[test]
+    fn ghost_length_scanner_uses_the_dialect_of_the_source_label() {
+        assert_eq!(
+            SpecSourceDialect::from_source_label("a/b.rs"),
+            SpecSourceDialect::Rust
+        );
+        assert_eq!(
+            SpecSourceDialect::from_source_label("a/B.lean"),
+            SpecSourceDialect::Lean
+        );
+        assert_eq!(
+            SpecSourceDialect::from_source_label("spec.txt"),
+            SpecSourceDialect::Unknown
+        );
+        // `--` hides the declaration in Lean only.
+        let hidden_in_lean = "-- axiom GhostList.len : GhostList α → UInt64\n";
+        assert_eq!(ghost_findings("Specs/A.lean", hidden_in_lean), vec![]);
+        // `//` does not start a Lean comment, so the declaration is seen.
+        let visible_in_lean = "// note\naxiom GhostList.len : GhostList α → UInt64\n";
+        assert_eq!(ghost_findings("Specs/A.lean", visible_in_lean).len(), 1);
+        // An unlabeled source is scanned with both comment families and both
+        // declaration grammars.
+        let mixed = "#[model]\nfn ghost_len(s: Seq<u8>) -> u64 { 0 }\naxiom GhostList.len : GhostList α → UInt64\n";
+        assert_eq!(ghost_findings("spec.txt", mixed).len(), 2);
+    }
+
+    // ---- Guard 3: error-branch wildcard scanner -----------------------------
+
+    fn wildcard_findings(label: &str, text: &str) -> Vec<(usize, ErrorBranchWildcardKind)> {
+        scan_error_branch_wildcard_diagnostics(label, text)
+            .into_iter()
+            .map(|d| {
+                assert_eq!(d.source_label, label);
+                (d.line, d.kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn error_branch_wildcard_scanner_reports_every_wildcard_arm() {
+        use ErrorBranchWildcardKind::{
+            CatchAllArmTrue, ErrArmTrue, MatchesAnyErr, UbArmTrue, UnsupportedArmTrue,
+        };
+        let lean = "\
+def post (x : Nat) : Except String Nat → Prop
+  | .ok v => v = x + 1
+  | .error _ => True
+
+def post2 (x : Nat) : FallibleOutcome Nat String → Prop
+  | .ok v => v = x + 1
+  | .err _ => (True)
+  | .ub => True
+  | .unsupported => True
+
+def post3 : Outcome → Prop
+  | .ok v => v = 1
+  | .fail .ub => True
+  | Err _ => True
+  | .ub | .unsupported => True
+  | _ => True
+";
+        assert_eq!(
+            wildcard_findings("Specs/Post.lean", lean),
+            vec![
+                (3, ErrArmTrue),
+                (7, ErrArmTrue),
+                (8, UbArmTrue),
+                (9, UnsupportedArmTrue),
+                (13, UbArmTrue),
+                (14, ErrArmTrue),
+                (15, UbArmTrue),
+                (16, CatchAllArmTrue),
+            ]
+        );
+        let rust = "\
+#[spec(ensures: |out| match out {
+    Ok(v) => *v == x + 1,
+    Err(_) => true,
+})]
+fn incr(x: u32) -> Result<u32, E> { step(x) }
+
+#[spec(ensures: |out| matches!(out, Ok(_) | Err(_)))]
+fn any(x: u32) -> Result<u32, E> { run(x) }
+
+#[spec(ensures: |out| match out { Ok(v) => *v == 1, Err(..) => (true), })]
+fn one() -> Result<u32, E> { Ok(1) }
+";
+        assert_eq!(
+            wildcard_findings("src/lib.rs", rust),
+            vec![(3, ErrArmTrue), (7, MatchesAnyErr), (10, ErrArmTrue)]
+        );
+        let diagnostics = scan_error_branch_wildcard_diagnostics("Specs/Post.lean", lean);
+        assert_eq!(
+            diagnostics[0].to_string(),
+            "Specs/Post.lean:3: error_branch_wildcard: postcondition arm accepts every error \
+             payload (`Err(_) => true`); constrain the error or state when it may occur"
+        );
+        assert_eq!(
+            ErrorBranchWildcardDiagnostic::GUARD,
+            SpecBoundaryGuardId::ErrorBranchWildcard
+        );
+    }
+
+    /// The same shapes are asserted by `detect_error_branch_wildcard` in
+    /// `anneal_spec::spec_check`.
+    #[test]
+    fn error_branch_wildcard_scanner_matches_anneal_spec_vectors() {
+        use ErrorBranchWildcardKind::{
+            CatchAllArmTrue, ErrArmTrue, MatchesAnyErr, UbArmTrue, UnsupportedArmTrue,
+        };
+        let flagged: &[(&str, ErrorBranchWildcardKind)] = &[
+            ("Err(_) => true", ErrArmTrue),
+            ("Err(..) => true", ErrArmTrue),
+            ("Err(_e) => true", ErrArmTrue),
+            ("Err(e) => true", ErrArmTrue),
+            ("Result::Err(_) => true", ErrArmTrue),
+            ("Err(_) => (true)", ErrArmTrue),
+            ("Err(_) => { return true; }", ErrArmTrue),
+            ("Err(_) if true => true", ErrArmTrue),
+            ("Ok(0) | Err(_) => true", ErrArmTrue),
+            ("(Err(_), _) => true", ErrArmTrue),
+            ("SemanticOutcome::Ub => true", UbArmTrue),
+            ("SemanticOutcome::Unsupported => true", UnsupportedArmTrue),
+            ("matches!(out, Ok(_) | Err(_))", MatchesAnyErr),
+            ("matches!(out, Err(_))", MatchesAnyErr),
+            ("match out { Ok(v) => *v == 1, _ => true }", CatchAllArmTrue),
+            ("| Err _ => True", ErrArmTrue),
+            ("| .err _ => True", ErrArmTrue),
+            ("| .error _ => True", ErrArmTrue),
+            ("| Except.error _ => True", ErrArmTrue),
+            ("| .err _ => trivial", ErrArmTrue),
+            ("| .err _ => True ∨ x = 3", ErrArmTrue),
+            ("| .ub => True", UbArmTrue),
+            ("| .unsupported => True", UnsupportedArmTrue),
+            ("| .fail .ub => True", UbArmTrue),
+            ("| .fail _ => True", UbArmTrue),
+            ("| .ub | .unsupported => True", UbArmTrue),
+            ("| .ok v => v = 1 | _ => True", CatchAllArmTrue),
+        ];
+        for (src, expected) in flagged {
+            assert_eq!(
+                wildcard_findings("spec.txt", src),
+                vec![(1, *expected)],
+                "{src:?}"
+            );
+        }
+        for src in [
+            "match out { Ok(v) => *v == x + 1, Err(E::Overflow) => x == u32::MAX }",
+            "Err(E::Overflow) => true",
+            "Err(0) => true",
+            "Err(\"overflow\") => true",
+            "Err(_) => x == u32::MAX",
+            "Err(_) => false",
+            "Err(_) if x == u32::MAX => true",
+            "Err(_) => true && x == 3",
+            "| .ub => False",
+            "| .err _ => False",
+            "| .err e => e = .overflow",
+            "| .err .overflow => True",
+            "| .fail .outOfFuel => True",
+            "| .err _ => True ∧ x = 3",
+            "| .err _ => True → False",
+            "| .ok _ => True",
+            "// Err(_) => true\nmatch out { Ok(v) => *v == 1, Err(e) => *e == E::A }",
+            "/* Err(_) => true */ out.is_ok()",
+            "-- | .err _ => True\n| .err e => e = E.a",
+            "/- | .ub => True -/ | .ub => False",
+            "let s = \"Err(_) => true\"; out == Ok(1)",
+            "let s = r#\"| .err _ => True\"#; out == Ok(1)",
+            "match x { 0 => out == 1, _ => true }",
+            "matches!(out, Ok(_))",
+            "matches!(out, Err(E::Overflow))",
+            "matches!(out, Err(_) if x == u32::MAX)",
+            "| .none => r = .err | .some w => True",
+            "| .ok v' => v' = f x' | .err e => e = g x'",
+            "",
+        ] {
+            assert_eq!(wildcard_findings("spec.txt", src), vec![], "{src:?}");
+        }
+        for malformed in [
+            "/* unclosed Err(_) => false",
+            "/- unclosed | .ub => False",
+            "\"unclosed string",
+            "Err(_) => true /* unclosed",
+        ] {
+            assert_eq!(
+                wildcard_findings("spec.txt", malformed),
+                vec![(1, ErrorBranchWildcardKind::MalformedSource)],
+                "{malformed:?}"
+            );
+        }
+        // The dialect of the label decides what a comment is.
+        let src = "Err(_) => true -- && x == 3";
+        assert_eq!(
+            wildcard_findings("Specs/A.lean", src),
+            vec![(1, ErrArmTrue)]
+        );
+        assert_eq!(wildcard_findings("src/a.rs", src), vec![]);
+    }
+
+    // ---- Guard 1: entry-point `requires` audit ------------------------------
+
+    #[test]
+    fn binary_entry_def_paths_match_lean_vectors() {
+        for accepted in [
+            "main",
+            "my_crate::main",
+            "_start",
+            "my_crate::_start",
+            "__start",
+            "my_crate::__start",
+        ] {
+            assert!(is_binary_entry_def_path(accepted), "{accepted:?}");
+        }
+        for rejected in [
+            "",
+            "domain",
+            "maintain",
+            "main_loop",
+            "mainx",
+            "xmain",
+            "Main",
+            "MAIN",
+            "start",
+            "_start_",
+            "___start",
+            "my_crate::domain",
+            "my_crate::maintain",
+            "my_crate::main_loop",
+            "my_crate::Type::main",
+            "my_crate::module::_start",
+            "my_crate::main::helper",
+            "main::",
+            "my_crate::main ",
+            "my_crate:main",
+        ] {
+            assert!(!is_binary_entry_def_path(rejected), "{rejected:?}");
+        }
+    }
+
+    fn guard_test_mir(def_path: &str, role: IrContractRole, ret: IrOperand) -> IrCapturedMir {
+        let mut mir = build_probe_mir_body(FalseProofMutationProbe::CallArgBlindProbe);
+        mir.def_path = String::from(def_path);
+        mir.role = role;
+        mir.basic_blocks = vec![IrBasicBlockData {
+            statements: vec![
+                IrStatement {
+                    kind: IrStatementKind::StorageLive(1),
+                    span: String::new(),
+                    comment: None,
+                },
+                IrStatement {
+                    kind: IrStatementKind::Assign(
+                        IrPlace {
+                            local_: 0,
+                            projection: Vec::new(),
+                        },
+                        IrRvalue::Use(ret),
+                    ),
+                    span: String::new(),
+                    comment: None,
+                },
+            ],
+            terminator: IrTerminator {
+                kind: IrTerminatorKind::Return,
+                span: String::new(),
+                comment: None,
+            },
+            is_cleanup: false,
+        }];
+        mir
+    }
+
+    fn const_bool_operand(value: bool) -> IrOperand {
+        IrOperand::Constant(IrConstOperand {
+            ty: IrTy {
+                kind: IrRigidTy::Bool,
+                layout_idx: 0,
+            },
+            val: IrConstValue::Scalar(IrConstScalar::Int(IrScalarInt {
+                bits: u128::from(value),
+                size_bytes: 1,
+            })),
+        })
+    }
+
+    fn copy_arg_operand() -> IrOperand {
+        IrOperand::Copy(IrPlace {
+            local_: 1,
+            projection: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn requires_companion_triviality_is_structural() {
+        let requires = |ret| {
+            guard_test_mir(
+                "m::__anodized_fn_requires_main",
+                IrContractRole::Requires(String::from("m::main")),
+                ret,
+            )
+        };
+        assert!(ir_requires_body_is_trivially_true(&requires(
+            const_bool_operand(true)
+        )));
+        assert!(!ir_requires_body_is_trivially_true(&requires(
+            const_bool_operand(false)
+        )));
+        assert!(!ir_requires_body_is_trivially_true(&requires(
+            copy_arg_operand()
+        )));
+        // A `u32` constant `1` is not the boolean `true`.
+        assert!(!ir_requires_body_is_trivially_true(&requires(
+            const_u32_operand(1)
+        )));
+        // No assignment to the return place at all.
+        let mut empty = requires(const_bool_operand(true));
+        empty.basic_blocks[0].statements.clear();
+        assert!(!ir_requires_body_is_trivially_true(&empty));
+        // Two blocks, or a non-`return` terminator, are never trivial.
+        let mut two_blocks = requires(const_bool_operand(true));
+        let block = two_blocks.basic_blocks[0].clone();
+        two_blocks.basic_blocks.push(block);
+        assert!(!ir_requires_body_is_trivially_true(&two_blocks));
+        let mut unreachable = requires(const_bool_operand(true));
+        unreachable.basic_blocks[0].terminator.kind = IrTerminatorKind::Unreachable;
+        assert!(!ir_requires_body_is_trivially_true(&unreachable));
+        // A later overwrite with a non-constant makes it non-trivial.
+        let mut overwritten = requires(const_bool_operand(true));
+        let stmt = IrStatement {
+            kind: IrStatementKind::Assign(
+                IrPlace {
+                    local_: 0,
+                    projection: Vec::new(),
+                },
+                IrRvalue::Use(copy_arg_operand()),
+            ),
+            span: String::new(),
+            comment: None,
+        };
+        overwritten.basic_blocks[0].statements.push(stmt);
+        assert!(!ir_requires_body_is_trivially_true(&overwritten));
+    }
+
+    #[test]
+    fn mir_entry_point_requires_audit_flags_main_and_start_only() {
+        let subject =
+            |path: &str| guard_test_mir(path, IrContractRole::Subject, copy_arg_operand());
+        let requires = |target: &str, ret| {
+            guard_test_mir(
+                &format!("{target}::__anodized_fn_requires"),
+                IrContractRole::Requires(String::from(target)),
+                ret,
+            )
+        };
+
+        for entry in ["demo::main", "main", "fw::_start", "fw::__start"] {
+            let items = [subject(entry), requires(entry, copy_arg_operand())];
+            let diagnostics = audit_mir_entry_point_requires(&items[0], &items, &[]);
+            assert_eq!(
+                diagnostics,
+                vec![EntryPointRequiresDiagnostic {
+                    entry_def_path: String::from(entry),
+                    source_label: format!("{entry}::__anodized_fn_requires"),
+                    line: 0,
+                    kind: EntryPointRequiresKind::MirRequiresCompanion,
+                }],
+                "{entry}"
+            );
+            assert!(diagnostics[0].to_string().contains("entry_point_requires"));
+            assert!(diagnostics[0].to_string().contains(entry));
+
+            // A constant-`true` companion is not a precondition.
+            let trivial = [subject(entry), requires(entry, const_bool_operand(true))];
+            assert_eq!(
+                audit_mir_entry_point_requires(&trivial[0], &trivial, &[]),
+                vec![]
+            );
+            // No companion at all.
+            assert_eq!(
+                audit_mir_entry_point_requires(&trivial[0], &trivial[..1], &[]),
+                vec![]
+            );
+        }
+
+        // Non-entry items may carry any precondition.
+        for helper in [
+            "demo::helper",
+            "demo::domain",
+            "demo::maintain",
+            "demo::main_loop",
+            "demo::Type::main",
+            "demo::module::_start",
+        ] {
+            let items = [subject(helper), requires(helper, copy_arg_operand())];
+            assert_eq!(
+                audit_mir_entry_point_requires(&items[0], &items, &[]),
+                vec![],
+                "{helper}"
+            );
+        }
+
+        // A companion of another item is not attributed to the entry point.
+        let items = [
+            subject("demo::main"),
+            requires("demo::helper", copy_arg_operand()),
+        ];
+        assert_eq!(
+            audit_mir_entry_point_requires(&items[0], &items, &[]),
+            vec![]
+        );
+
+        // Attribute-classified entry points are supplied by the front end.
+        let items = [
+            subject("fw::reset"),
+            requires("fw::reset", copy_arg_operand()),
+        ];
+        assert_eq!(
+            audit_mir_entry_point_requires(&items[0], &items, &[]),
+            vec![]
+        );
+        assert_eq!(
+            audit_mir_entry_point_requires(&items[0], &items, &["fw::reset"]).len(),
+            1
+        );
+
+        // The audit is about subjects: a companion is never itself an entry.
+        let companion = requires("demo::main", copy_arg_operand());
+        assert_eq!(
+            audit_mir_entry_point_requires(&companion, std::slice::from_ref(&companion), &[]),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn lean_entry_point_pre_audit_accepts_trivial_and_default_preconditions() {
+        let audit = |path: &str, text: &str| {
+            audit_lean_spec_entry_point_requires(path, "Specs/Demo/main.lean", text, &[])
+                .into_iter()
+                .map(|d| (d.line, d.kind))
+                .collect::<Vec<_>>()
+        };
+        for clean in [
+            "def pre (args : List Value) : Prop :=\n  True\n\ndef post (args : List Value) (ret : Value) : Prop := ret = args.head!\n",
+            "def pre (args : List Value) : Prop := (True)\n",
+            "def pre (args : List Value) : Prop :=\n  Obligations.Demo.main.defaultPre args\n",
+            "def pre (args : List Value) (mem : Memory) : Prop :=\n  Obligations.Demo.main.defaultModularSpec.pre args mem\n",
+            "def pre (args : List Value) : Prop := Obligations.Demo.main.rustRequires args\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre := fun _ => True\n  post := fun _ ret => ret = .unit\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre := pre\n  post := post\n",
+            "-- def pre (args : List Value) : Prop := args.length = 1\ndef pre (args : List Value) : Prop := True\n",
+            "/- def pre (args : List Value) : Prop := args.length = 1 -/\n",
+            "def post (args : List Value) (ret : Value) : Prop := ret = .unit\n",
+            "def preamble (args : List Value) : Prop := args.length = 1\n",
+            "",
+        ] {
+            assert_eq!(audit("demo::main", clean), vec![], "{clean:?}");
+        }
+
+        use EntryPointRequiresKind::{AuthoredLeanPre, MalformedSource};
+        assert_eq!(
+            audit(
+                "demo::main",
+                "import Trusted\n\ndef pre (args : List Value) : Prop :=\n  args = [Value.scalar ⟨1, 1⟩]\n\ndef post (args : List Value) (ret : Value) : Prop := True\n"
+            ),
+            vec![(3, AuthoredLeanPre)]
+        );
+        assert_eq!(
+            audit(
+                "fw::_start",
+                "instance : ItemSpec \"fw::_start\" where\n  pre := fun args => args.length = 1\n  post := fun _ _ => True\n"
+            ),
+            vec![(2, AuthoredLeanPre)]
+        );
+        // Strengthening the default is a non-trivial precondition.
+        assert_eq!(
+            audit(
+                "demo::main",
+                "def pre (args : List Value) : Prop :=\n  Obligations.Demo.main.defaultPre args ∧ args.length = 1\n"
+            ),
+            vec![(1, AuthoredLeanPre)]
+        );
+        assert_eq!(
+            audit(
+                "demo::main",
+                "def pre (args : List Value) : Prop := False\n"
+            ),
+            vec![(1, AuthoredLeanPre)]
+        );
+        // A string that merely spells `True` is not the proposition `True`.
+        assert_eq!(
+            audit(
+                "demo::main",
+                "def pre (args : List Value) : Prop := args = \"True\"\n"
+            ),
+            vec![(1, AuthoredLeanPre)]
+        );
+        assert_eq!(
+            audit(
+                "demo::main",
+                "/- unclosed\ndef pre (args : List Value) : Prop := True\n"
+            ),
+            vec![(1, MalformedSource)]
+        );
+        // Non-entry items are exempt.
+        assert_eq!(
+            audit(
+                "demo::helper",
+                "def pre (args : List Value) : Prop := args.length = 1\n"
+            ),
+            vec![]
+        );
+        assert_eq!(
+            audit_lean_spec_entry_point_requires(
+                "fw::reset",
+                "Specs/Fw/reset.lean",
+                "def pre (args : List Value) : Prop := args.length = 1\n",
+                &["fw::reset"],
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn entry_point_requires_bundle_combines_mir_and_lean_findings() {
+        let subject = guard_test_mir("demo::main", IrContractRole::Subject, copy_arg_operand());
+        let requires = guard_test_mir(
+            "demo::__anodized_fn_requires_main",
+            IrContractRole::Requires(String::from("demo::main")),
+            copy_arg_operand(),
+        );
+        let specs = (
+            "Specs/Demo/main.lean",
+            "def pre (args : List Value) : Prop := args.length = 1\n",
+        );
+        let diagnostics = audit_entry_point_requires_bundle(
+            &subject,
+            std::slice::from_ref(&requires),
+            Some(specs),
+            &[],
+        );
+        assert_eq!(
+            diagnostics.iter().map(|d| d.kind).collect::<Vec<_>>(),
+            vec![
+                EntryPointRequiresKind::MirRequiresCompanion,
+                EntryPointRequiresKind::AuthoredLeanPre
+            ]
+        );
+        assert_eq!(
+            EntryPointRequiresDiagnostic::GUARD,
+            SpecBoundaryGuardId::EntryPointRequires
+        );
+        assert_eq!(
+            audit_entry_point_requires_bundle(&subject, &[], None, &[]),
+            vec![]
+        );
+    }
+
+    // ---- Unified audit ------------------------------------------------------
+
+    #[test]
+    fn unified_spec_boundary_audit_reports_all_three_guards_deterministically() {
+        let mir_items = [
+            guard_test_mir("demo::main", IrContractRole::Subject, copy_arg_operand()),
+            guard_test_mir(
+                "demo::__anodized_fn_requires_main",
+                IrContractRole::Requires(String::from("demo::main")),
+                copy_arg_operand(),
+            ),
+            guard_test_mir("demo::helper", IrContractRole::Subject, copy_arg_operand()),
+            guard_test_mir(
+                "demo::__anodized_fn_requires_helper",
+                IrContractRole::Requires(String::from("demo::helper")),
+                copy_arg_operand(),
+            ),
+        ];
+        let spec_sources = [
+            SpecBoundarySource {
+                label: "Specs/Demo/ghost.lean",
+                text: "axiom GhostList.len : GhostList α → UInt64\n",
+            },
+            SpecBoundarySource {
+                label: "src/lib.rs",
+                text: "#[spec(ensures: |out| match out { Ok(v) => *v == 1, Err(_) => true })]\nfn one() -> Result<u32, E> { Ok(1) }\n",
+            },
+        ];
+        let authored_entry_specs = [(
+            "demo::main",
+            SpecBoundarySource {
+                label: "Specs/Demo/main.lean",
+                text: "def pre (args : List Value) : Prop := args.length = 1\n\ndef post (args : List Value) : Outcome → Prop\n  | .ok v => v = args.head!\n  | .ub => True\n",
+            },
+        )];
+        let input = SpecBoundaryAuditInput {
+            spec_sources: &spec_sources,
+            mir_items: &mir_items,
+            authored_entry_specs: &authored_entry_specs,
+            extra_entry_def_paths: &[],
+        };
+        let report = audit_spec_boundary_guards(&input);
+        assert!(!report.is_clean());
+        assert_eq!(report.counts_by_guard(), [2, 1, 2]);
+        assert_eq!(
+            report.summary_line(),
+            "SpecBoundaryGuardAudit(total=5, entry_point_requires=2, \
+             fixed_width_ghost_length=1, error_branch_wildcard=2)"
+        );
+        // Sorted by guard rank, then source label, then line.
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|d| (d.guard, d.source_label.as_str(), d.line))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    SpecBoundaryGuardId::EntryPointRequires,
+                    "Specs/Demo/main.lean",
+                    1
+                ),
+                (
+                    SpecBoundaryGuardId::EntryPointRequires,
+                    "demo::__anodized_fn_requires_main",
+                    0
+                ),
+                (
+                    SpecBoundaryGuardId::FixedWidthGhostLength,
+                    "Specs/Demo/ghost.lean",
+                    1
+                ),
+                (
+                    SpecBoundaryGuardId::ErrorBranchWildcard,
+                    "Specs/Demo/main.lean",
+                    5
+                ),
+                (SpecBoundaryGuardId::ErrorBranchWildcard, "src/lib.rs", 1),
+            ]
+        );
+        assert_eq!(report, audit_spec_boundary_guards(&input));
+        let rendered = report.render_diagnostic_report();
+        assert_eq!(rendered.lines().count(), 6);
+        assert!(rendered.starts_with("SpecBoundaryGuardAudit(total=5"));
+        for diagnostic in &report.diagnostics {
+            assert!(rendered.contains(&diagnostic.to_string()));
+            assert!(diagnostic.message.contains(diagnostic.guard.as_str()));
+        }
+
+        // A clean bundle produces a clean report.
+        let clean_sources = [
+            SpecBoundarySource {
+                label: "Specs/Demo/ghost.lean",
+                text: "axiom GhostList.len : GhostList α → Nat\n",
+            },
+            SpecBoundarySource {
+                label: "src/lib.rs",
+                text: "#[spec(ensures: |out| match out { Ok(v) => *v == 1, Err(e) => *e == E::A })]\nfn one() -> Result<u32, E> { Ok(1) }\n",
+            },
+        ];
+        let clean_specs = [(
+            "demo::main",
+            SpecBoundarySource {
+                label: "Specs/Demo/main.lean",
+                text: "def pre (args : List Value) : Prop := True\n",
+            },
+        )];
+        let clean = audit_spec_boundary_guards(&SpecBoundaryAuditInput {
+            spec_sources: &clean_sources,
+            mir_items: &mir_items[2..],
+            authored_entry_specs: &clean_specs,
+            extra_entry_def_paths: &[],
+        });
+        assert!(clean.is_clean(), "{clean:?}");
+        assert_eq!(clean.counts_by_guard(), [0, 0, 0]);
+        assert_eq!(
+            clean.summary_line(),
+            "SpecBoundaryGuardAudit(total=0, entry_point_requires=0, \
+             fixed_width_ghost_length=0, error_branch_wildcard=0)"
+        );
+        assert!(audit_spec_boundary_guards(&SpecBoundaryAuditInput::default()).is_clean());
     }
 }
