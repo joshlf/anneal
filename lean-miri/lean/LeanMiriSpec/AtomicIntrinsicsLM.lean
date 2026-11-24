@@ -1443,7 +1443,7 @@ def runPointerBinary (op : Miri.MIR.BinOp) (left right : RvalueImmTy Provenance)
   | .ok val _ => .ok val
   | .error e _ => .error e
 
-/-- **Complete `IntrinsicAtomic.pointerBinary` laws** (closing 100% of `IntrinsicAtomic`'s 11
+/-- **`IntrinsicAtomic.pointerBinary` witness laws** (not exhaustive: `.Ne`/`.Le`/`.Gt`/`.Ge` and address wrap-around are unwitnessed; reaches the 11th of `IntrinsicAtomic`'s 11
 public definitions): raw-pointer `.Eq`/`.Lt` comparisons, address-arithmetic
 `.Add`/`.Sub`/`.BitAnd`/`.BitOr`/`.BitXor` retaining LHS provenance (`childTag`) and `layoutUsize`,
 plus backend-mismatch, non-raw LHS, non-`usize` RHS, `.uninit`, and `.Mul` rejections. -/
@@ -1476,6 +1476,44 @@ theorem eval_signed_unsigned_polarity_and_usize :
     runEvalRmw "atomic_xadd" neg5 layoutI32 5 = .okScalar 0xFFFFFFFB 0 ∧ runEvalRmw "atomic_xadd" neg5 layoutU32 5 = .okScalar 0xFFFFFFFB 0 ∧
     runEvalRmw "atomic_xadd" { widthBytes := 8, initBits := 5 } layoutUsize 3 = .okScalar 5 8 ∧ runEvalCas false { widthBytes := 8, initBits := 5 } layoutUsize 5 9 = .okCas 5 true 9 := by decide +kernel
 
+/-- Threaded runner: each `IntrinsicAtomic.eval` starts from the PREVIOUS step's post-`AtomicState`. -/
+def lmTraceGo : List (LmAtomicChoice × String × Array (OpTy Provenance) × LocalLayout ×
+    (AtomicState → Option LmAtomicObs)) → AtomicState → List LmAtomicObs
+  | [], _ => []
+  | (ch, intr, opArgs, destLayout, obsFn) :: rest, st =>
+    match IntrinsicAtomic.eval (lmAtomicHooksBind .neverFail) ch intr opArgs
+        (mkDestPlace destLayout) none st with
+    | .error e _ => [classifyStepError e]
+    | .ok false _ => [LmAtomicObs.invalidOrUnsupported]
+    | .ok true st' => (obsFn st').getD LmAtomicObs.invalidOrUnsupported :: lmTraceGo rest st'
+
+/-- ONE evolving `u32` cell (`treeBorrows := tb`, root tag) under five threaded intrinsics: `store 5`,
+`xadd 3`, a FAILING `cxchg(5 → 9)`, a SUCCEEDING `cxchg(8 → 9)`, and a final `load`. -/
+def lmAtomicTrace (tb : Bool) : List LmAtomicObs :=
+  let cfg : SingleCellConfig := { widthBytes := 4, initBits := 0, treeBorrows := tb }
+  let c : LmAtomicChoice := { ord1 := .SeqCst, ord2 := .SeqCst, pointeeLayout := layoutU32 }
+  let cCas : LmAtomicChoice := { ord1 := .SeqCst, ord2 := .Relaxed, pointeeLayout := layoutU32 }
+  let cell (st : AtomicState) : Option Nat := readAllocBits st cellAllocId 0 4
+  let dst (st : AtomicState) : Option Nat := readAllocBits st destAllocId 0 4
+  let obsScalar (st : AtomicState) : Option LmAtomicObs :=
+    (dst st).bind fun r => (cell st).map fun p => LmAtomicObs.okScalar r p
+  let obsCas (st : AtomicState) : Option LmAtomicObs :=
+    (dst st).bind fun r => (readAllocBool st destAllocId 4).bind fun ok => (cell st).map fun p => LmAtomicObs.okCas r ok p
+  let ptr := mkCellPtrOp cfg
+  let v := mkIntOp layoutU32
+  lmTraceGo
+    [ (c, "atomic_store", #[ptr, v 5], layoutUnit, fun st => (cell st).map LmAtomicObs.okStore),
+      (c, "atomic_xadd", #[ptr, v 3], layoutU32, obsScalar),
+      (cCas, "atomic_cxchg", #[ptr, v 5, v 9], mkCasDestLayout layoutU32, obsCas),
+      (cCas, "atomic_cxchg", #[ptr, v 8, v 9], mkCasDestLayout layoutU32, obsCas),
+      (c, "atomic_load", #[ptr], layoutU32, obsScalar) ] (mkSingleCellState cfg)
+
+/-- **Threaded 5-step trace through `IntrinsicAtomic.eval` / `AtomicMachine.bind`** (both borrow modes):
+the failing `cxchg` sees the `xadd` write (`8`) and leaves it; the succeeding one installs `9`. -/
+theorem lmAtomicTrace_table (tb : Bool) : lmAtomicTrace tb =
+    ([.okStore 5, .okScalar 5 8, .okCas 8 false 8, .okCas 8 true 9, .okScalar 9 9] : List LmAtomicObs) := by
+  cases tb <;> decide +kernel
+
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
 section AxiomAudit
@@ -1499,7 +1537,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 34 then
+  if theorems < 35 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 

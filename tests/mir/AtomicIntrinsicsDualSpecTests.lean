@@ -267,6 +267,16 @@ run_cmd do
     addThm fastCheckName
       (eqTrue (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) (mkConst fastObsName))) reflTrue
 
+    -- 2c. Threaded 5-step trace: the kernel evaluates BOTH engines per mode; traces must be equal.
+    let traceObs ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
+      mkLambdaFVars #[tb] (mkApp4 (mkConst ``List.map [.zero, .zero]) lmObsTy outcomeTy
+        (mkConst translateName) (mkApp (mkConst (lmNs ++ `lmAtomicTrace)) tb))
+    let traceObsName := ns ++ `crossRootLmTrace
+    let _ ← addDef traceObsName traceObs
+    let traceCheckName := ns ++ `crossRootLmTraceCheck
+    addThm traceCheckName
+      (eqTrue (mkApp (mkConst (dsNs ++ `lmTraceAuthorityCheck)) (mkConst traceObsName))) reflTrue
+
     -- 3. Instantiate closed `AtomicDualContract` and all 5 named projections.
     let contractName := ns ++ `closedAtomicDualContract
     let contractTy ← addDef contractName
@@ -276,7 +286,7 @@ run_cmd do
     let contractC := mkConst contractName
 
     let mut added : Array Lean.Name :=
-      #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName]
+      #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName, traceObsName, traceCheckName]
     for projName in [`contract_agreement_zone_exact,
                      `contract_overflow_divergence,
                      `contract_readonly_alloc_divergence,
@@ -402,7 +412,8 @@ run_cmd do
         dsNs ++ `mr_universal_cas_failure_returns_before,
         dsNs ++ `mr_universal_rmw_out_of_range_specPanic,
         dsNs ++ `mr_universal_atomicLoad_size_too_big_ub,
-        dsNs ++ `mr_signed_unsigned_polarity_and_usize_parity ]
+        dsNs ++ `mr_signed_unsigned_polarity_and_usize_parity,
+        lmNs ++ `lmAtomicTrace_table, dsNs ++ `mrAtomicTrace_table, dsNs ++ `lmTraceAuthorityCheck_sound ]
     for n in keyThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required theorem {n} missing"
@@ -493,7 +504,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 13 && rejectedCount = 6 do
+  unless addedCount = 15 && rejectedCount = 6 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 

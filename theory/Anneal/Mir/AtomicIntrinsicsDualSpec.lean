@@ -913,7 +913,7 @@ def obsMrTwosComp {M P : Type} [Memory M] (width : Nat) (getAllocs : Machine M �
     let bits : Nat := if ret < 0 then (ret + ((2 ^ (8 * width) : Nat) : Int)).toNat else ret.toNat
     match (getAllocs m).head?.bind (decodeLeBytes width) with | some p => .okScalar bits p | none => .invalidOrUnsupported
   | .ok (_, _) => .invalidOrUnsupported
-/-- **Signed vs. unsigned polarity & `usize` parity on `Mach`/`MachTB`**: `IntType.usize_ty = itU64`,
+/-- **Signed vs. unsigned polarity & `usize` parity on `Mach`/`MachTB`** (bitwise `&`/`|`/`^` on `Mach` only): `IntType.usize_ty = itU64`,
 `usize` `xadd`/`cas`, signed `-5` (`0xFFFFFFFB`) RMWs, and `0xFFFFFFFB + 5` polarity flip. -/
 theorem mr_signed_unsigned_polarity_and_usize_parity :
     let bmN := bmWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF]); let tbN := tbWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF]);
@@ -928,6 +928,48 @@ theorem mr_signed_unsigned_polarity_and_usize_parity :
     obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .Add 5 itU32) = .specPanic ∧ obsMrTwosComp 4 tbAllocs (tbRmw tbN tbPtr .Add 5 itU32) = .specPanic ∧
     (match bmLoad bmN bmPtr (.Int itI32) with | .ok (.Int v, _) => decide (v < 3) | _ => false) = true ∧
     (match bmLoad bmN bmPtr (.Int itU32) with | .ok (.Int v, _) => decide (v < 3) | _ => false) = false := by decide +kernel
+
+/-- Thread ONE machine through `steps`, observing every step; stops after the first `Stop`. -/
+def mrTraceGo {V Mc : Type} :
+    List ((Mc → Interp (V × Mc)) × (Interp (V × Mc) → AtomicAccessOutcome)) → Mc → List AtomicAccessOutcome
+  | [], _ => []
+  | (stepFn, obsFn) :: rest, m =>
+    let r := stepFn m
+    obsFn r :: (match r with | .ok (_, m') => mrTraceGo rest m' | .error _ => [])
+
+/-- Threaded `u32` trace `store 5 → fetch_add 3 → cas(5→9)✗ → cas(8→9)✓ → load` on ONE `Mach`/`MachTB`. -/
+def mrAtomicTrace : AtomicMemoryMode → List AtomicAccessOutcome
+  | .basic => mrTraceGo
+      [ (fun (m : Mach) => bmStore m bmPtr (.Int 5) (.Int itU32), obsMrStore 4 bmAllocs),
+        (fun m => bmRmw m bmPtr .Add 3 itU32, obsMrScalar 4 bmAllocs),
+        (fun m => bmCas m bmPtr 5 9 itU32, obsMrCas 4 5 bmAllocs),
+        (fun m => bmCas m bmPtr 8 9 itU32, obsMrCas 4 8 bmAllocs),
+        (fun m => bmLoad m bmPtr (.Int itU32), obsMrScalar 4 bmAllocs) ] (bmWith (initBytes [0, 0, 0, 0]))
+  | .treeBorrows => mrTraceGo
+      [ (fun (m : MachTB) => tbStore m tbPtr (.Int 5) (.Int itU32), obsMrStore 4 tbAllocs),
+        (fun m => tbRmw m tbPtr .Add 3 itU32, obsMrScalar 4 tbAllocs),
+        (fun m => tbCas m tbPtr 5 9 itU32, obsMrCas 4 5 tbAllocs),
+        (fun m => tbCas m tbPtr 8 9 itU32, obsMrCas 4 8 tbAllocs),
+        (fun m => tbLoad m tbPtr (.Int itU32), obsMrScalar 4 tbAllocs) ] (tbWith (initBytes [0, 0, 0, 0]))
+
+/-- **Threaded 5-step trace on `Mach`/`MachTB`**: each step observes its predecessor's write. -/
+theorem mrAtomicTrace_table (m : AtomicMemoryMode) : mrAtomicTrace m =
+    ([.okStore 5, .okScalar 5 8, .okCas 8 false 8, .okCas 8 true 9, .okScalar 9 9] : List AtomicAccessOutcome) := by
+  cases m <;> decide +kernel
+
+/-- Cross-authority trace check: a (translated LeanMiri) trace must equal MiniRust's in BOTH modes. -/
+def lmTraceAuthorityCheck (obs : Bool → List AtomicAccessOutcome) : Bool :=
+  decide (obs (AtomicMemoryMode.toLmTreeBorrows .basic) = mrAtomicTrace .basic ∧
+    obs (AtomicMemoryMode.toLmTreeBorrows .treeBorrows) = mrAtomicTrace .treeBorrows)
+
+/-- Soundness of `lmTraceAuthorityCheck`: a passing check is step-for-step trace agreement. -/
+theorem lmTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutcome)
+    (h : lmTraceAuthorityCheck obs = true) (m : AtomicMemoryMode) :
+    obs m.toLmTreeBorrows = mrAtomicTrace m := by
+  unfold lmTraceAuthorityCheck at h
+  cases m
+  · exact (of_decide_eq_true h).1
+  · exact (of_decide_eq_true h).2
 
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
@@ -971,7 +1013,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 27 then
+  if theorems < 29 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 
