@@ -88,6 +88,36 @@ theorem not_mirWpConverges_of_step_fail {body : CapturedMir} {s : MachineState}
     rw [hStep] at hWp
     exact hWp
 
+/-- **Silent-step inversion for `MirWpConverges`**: if `stepMirFn body s` takes a
+silent `.tau (.running s')` step, convergence from `s` forces convergence from
+`s'`. Lets fail-closed canaries walk a REAL multi-step `CapturedMir` execution
+(e.g. a caller's inline `TerminatorKind.call`) up to a `MirStepNode.fail` node. -/
+theorem mirWpConverges_of_step_tau_inv {body : CapturedMir} {s s' : MachineState}
+    {post : MirOutcome → Prop}
+    (hStep : stepMirFn body s = .tau (.running s'))
+    (h : MirWpConverges body s post) : MirWpConverges body s' post := by
+  rcases h with ⟨fuel, hWp⟩
+  cases fuel with
+  | zero => exact False.elim hWp
+  | succ f =>
+    refine ⟨f, ?_⟩
+    unfold Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirSym
+      Anneal.Rustc.V2026_06_01.SymbolicEval.wpMirExecSym at hWp
+    rw [Anneal.Rustc.V2026_06_01.SymbolicEval.evalSymNodeTree_eq,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.stepMirExecSymTree_eval,
+      Anneal.Rustc.V2026_06_01.SymbolicEval.evalNodeWP_eq] at hWp
+    dsimp only [stepMirState] at hWp
+    rw [hStep] at hWp
+    exact hWp
+
+/-- A silent `.tau` step into a state that cannot converge cannot converge. -/
+theorem not_mirWpConverges_of_step_tau {body : CapturedMir} {s s' : MachineState}
+    {post : MirOutcome → Prop}
+    (hStep : stepMirFn body s = .tau (.running s'))
+    (hNext : ¬ MirWpConverges body s' post) :
+    ¬ MirWpConverges body s post :=
+  fun h => hNext (mirWpConverges_of_step_tau_inv hStep h)
+
 /-- Compose a `wpUntilOk` derivation over any `MirWpOps.ofDetStep (mirDetStep body) tag`
 directly with a `MirFuelFree.MirWpConverges` continuation at the stopping cutpoint. -/
 theorem mirWpConverges_of_wpUntilOk_det {body : CapturedMir} {tag : MachineState → Option Nat}
@@ -1003,6 +1033,68 @@ theorem mirWpConverges_of_ovfCastStageCut {Val : Type}
         (open_ovfCastStageCut hCut ms₀ hInv)))
     hCont
 
+/-- **`BlockTree` on `CapturedMir` → `OvfCastStageCut`**: lifts an
+`OvfCastStageCut` proved over the `O(log n)` `BlockTree`-backed live step
+`mirDetStepWith body bt.lookupForced?` (any `ValidBlockTree body.basicBlocks bt`)
+to the unmodified list-backed `mirDetStep body`. -/
+theorem ovfCastStageCut_mir_of_validBlockTree {Val : Type}
+    {fops : OvfCastFrameOps MachineState Val} {body : CapturedMir}
+    {bt : BlockTree BasicBlockData} (hValid : ValidBlockTree body.basicBlocks bt)
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : MirOutcome → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {fuel : Nat}
+    (h : OvfCastStageCut fops (mirDetStepWith body bt.lookupForced?) baseLocals ids
+      earlyOk srcSpec dstSpec fuel) :
+    OvfCastStageCut fops (mirDetStep body) baseLocals ids earlyOk srcSpec dstSpec fuel :=
+  ovfCastStageCut_congr_step (mirDetStepWith_listGet?_eq body)
+    (ovfCastStageCut_of_validBlockTree hValid fops (mirDetStepWith body)
+      (fun f g s hEq => mirDetStepWith_pointwise body f g s (hEq s.frame.blockIdx)) h)
+
+/-- **`Chunk8BlockTree` on `CapturedMir` → `OvfCastStageCut`** (radix-8 variant of
+`ovfCastStageCut_mir_of_validBlockTree`). -/
+theorem ovfCastStageCut_mir_of_validChunk8BlockTree {Val : Type}
+    {fops : OvfCastFrameOps MachineState Val} {body : CapturedMir}
+    {cbt : Chunk8BlockTree BasicBlockData}
+    (hValid : ValidChunk8BlockTree body.basicBlocks cbt)
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : MirOutcome → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {fuel : Nat}
+    (h : OvfCastStageCut fops (mirDetStepWith body cbt.lookupForced?) baseLocals ids
+      earlyOk srcSpec dstSpec fuel) :
+    OvfCastStageCut fops (mirDetStep body) baseLocals ids earlyOk srcSpec dstSpec fuel :=
+  ovfCastStageCut_congr_step (mirDetStepWith_listGet?_eq body)
+    (ovfCastStageCut_of_validChunk8BlockTree hValid fops (mirDetStepWith body)
+      (fun f g s hEq => mirDetStepWith_pointwise body f g s (hEq s.frame.blockIdx)) h)
+
+/-- **`evalBlockTreeToCut` on `CapturedMir` → `OvfCastStageCut`**: seals an
+`OvfCastStageCut` over live `mirDetStep body` directly from kernel evaluation of
+`evalBlockTreeToCut` over the `BlockTree`-backed `mirDetStepWith body`. -/
+theorem ovfCastStageCut_mir_of_evalBlockTreeToCut {Val : Type}
+    {fops : OvfCastFrameOps MachineState Val} {body : CapturedMir}
+    {bt : BlockTree BasicBlockData} (hValid : ValidBlockTree body.basicBlocks bt)
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : MirOutcome → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {cuts : MaskTree} {fuel : Nat}
+    (hEval : ∀ s : MachineState, StageIntervalStateInv fops baseLocals ids srcSpec s →
+      ∃ s' : MachineState,
+        evalBlockTreeToCut bt (mirDetStepWith body) StepOutcome.next? fops.blockOf cuts
+          fuel s = .cut s' ∧
+        StageIntervalStateInv fops baseLocals ids dstSpec s') :
+    OvfCastStageCut fops (mirDetStep body) baseLocals ids earlyOk srcSpec dstSpec fuel :=
+  ovfCastStageCut_congr_step (mirDetStepWith_listGet?_eq body)
+    (ovfCastStageCut_of_evalBlockTreeToCut hValid fops (mirDetStepWith body)
+      (fun f g s hEq => mirDetStepWith_pointwise body f g s (hEq s.frame.blockIdx)) hEval)
+
+/-- **`BlockTree` on `CapturedMir` → `ByteRunCopyCut`**: lifts a `ByteRunCopyCut`
+proved over `mirDetStepWith body bt.lookupForced?` to live `mirDetStep body`. -/
+theorem byteRunCopyCut_mir_of_validBlockTree {Mem Addr Byte : Type}
+    [ByteStoreOps Mem Addr Byte] {body : CapturedMir}
+    {bt : BlockTree BasicBlockData} (hValid : ValidBlockTree body.basicBlocks bt)
+    {memOf : MachineState → Mem} {opsList : List (ByteRunCopyOp Addr)} {fuel : Nat}
+    {ms₀ ms₁ : MachineState}
+    (h : ByteRunCopyCut (mirDetStepWith body bt.lookupForced?) memOf opsList fuel ms₀ ms₁) :
+    ByteRunCopyCut (mirDetStep body) memOf opsList fuel ms₀ ms₁ :=
+  ByteRunCopyCut.congr_step (mirDetStepWith_listGet?_eq body)
+    (ByteRunCopyCut.of_validBlockTree hValid (stepWith := mirDetStepWith body)
+      (fun f g s hEq => mirDetStepWith_pointwise body f g s (hEq s.frame.blockIdx)) h)
+
 /-! ## Section 3: `CallStackUnwind` & `RefFrame` ↔ `V2026_06_01` Operational Bridge -/
 
 /-- Exact bijection mapping unmodified `MirAst.UnwindAction` to `ParametricCore.UnwindAction4`. -/
@@ -1278,6 +1370,57 @@ theorem not_mirWpConverges_assert_unreachable_ub {body : CapturedMir} {s : Machi
     ¬ MirWpConverges body s post :=
   not_mirWpConverges_of_step_fail
     (stepMirFn_assert_unreachable_ub hPhase hActive hBlk hStmt hTerm hEval hNe)
+
+/-- **Inline-callee diverging-return UB on unmodified `V2026_06_01.MirSemantics`**:
+the REAL inline-call shape of a diverging `TerminatorKind.call` (`target = none`).
+After `pushDivergingCalleeFrame`, `Memory.activeCallee = some callee` and the
+saved caller frame has `isDiverging = true`; when `callee` reaches
+`TerminatorKind.return_`, `stepMirFn` (executing `activeCallee`, NOT the root
+`body`) fails with `MirStepNode.fail .ub`. Unlike `stepMirFn_return_diverging_ub`
+(root frame, `activeCallee = none`), this covers states actually reachable from
+a caller's diverging `TerminatorKind.call`. -/
+theorem stepMirFn_inline_return_diverging_ub {body callee : CapturedMir} {s : MachineState}
+    {bb : BasicBlockData} {retVal : Value} {caller : SavedCallerFrame}
+    {rest : List SavedCallerFrame}
+    (hActive : s.memory.activeCallee = some callee)
+    (hPhase : callee.phase = .runtimeOptimized)
+    (hBlk : get? callee.basicBlocks s.frame.blockIdx = some bb)
+    (hStmt : s.frame.stmtIdx = length bb.statements)
+    (hTerm : bb.terminator.kind = .return_)
+    (hRet : get? s.frame.locals 0 = some (.init retVal))
+    (hStack : s.memory.callStack = caller :: rest)
+    (hDiv : caller.isDiverging = true) :
+    stepMirFn body s = MirStepNode.fail .ub := by
+  have hStmtNone : get? bb.statements s.frame.stmtIdx = none := by
+    rw [hStmt]
+    clear hStmt hTerm hRet hStack hDiv hActive hBlk hPhase
+    induction bb.statements with
+    | nil => rfl
+    | cons _ tl ih => exact ih
+  unfold stepMirFn
+  rw [hActive]
+  dsimp only [Option.getD]
+  rw [hPhase, hBlk]
+  dsimp only
+  rw [hStmtNone, hStmt]
+  simp only [beq_self_eq_true, ↓reduceIte, evalTerminator, hTerm, hRet, hStack, hDiv]
+  cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+      (length (caller :: rest)) (length s.frame.locals) <;> rfl
+
+theorem not_mirWpConverges_inline_return_diverging_ub {body callee : CapturedMir}
+    {s : MachineState} {bb : BasicBlockData} {retVal : Value} {caller : SavedCallerFrame}
+    {rest : List SavedCallerFrame} {post : MirOutcome → Prop}
+    (hActive : s.memory.activeCallee = some callee)
+    (hPhase : callee.phase = .runtimeOptimized)
+    (hBlk : get? callee.basicBlocks s.frame.blockIdx = some bb)
+    (hStmt : s.frame.stmtIdx = length bb.statements)
+    (hTerm : bb.terminator.kind = .return_)
+    (hRet : get? s.frame.locals 0 = some (.init retVal))
+    (hStack : s.memory.callStack = caller :: rest)
+    (hDiv : caller.isDiverging = true) :
+    ¬ MirWpConverges body s post :=
+  not_mirWpConverges_of_step_fail
+    (stepMirFn_inline_return_diverging_ub hActive hPhase hBlk hStmt hTerm hRet hStack hDiv)
 
 /-- Transport `CallStackUnwind.wpCallSite` over `mirDetWpOps body` directly into
 `Anneal.MirFuelFree.MirWpConverges`. -/

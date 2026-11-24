@@ -165,7 +165,7 @@ theorem decodeLittleEndianBytes_encodeLittleEndianBytes
       some (bits % 256 ^ numBytes, if numBytes == 0 then none else prov) := by
   induction numBytes generalizing bits with
   | zero =>
-    simp only [encodeLittleEndianBytes, decodeLittleEndianBytes, Nat.pow_zero,
+    simp only [decodeLittleEndianBytes, Nat.pow_zero,
       Nat.mod_one, beq_self_eq_true, ↓reduceIte]
   | succ rem ih =>
     unfold encodeLittleEndianBytes decodeLittleEndianBytes
@@ -903,7 +903,7 @@ theorem encodeU32LEBytes_eq_mir (layouts : LayoutTable) (n : Nat)
       some ((encodeU32LEBytes n).map (fun b => AbstractByte.init b none)) := by
   have hBlt : Nat.blt n 4294967296 = true := Nat.blt_eq.mpr hLt
   unfold encodeValueToBytes encodeScalarBytes encodeLittleEndianBytes encodeU32LEBytes
-  simp only [rigidTyKindByteSize, intCastTargetBytes, scalarModulus, hBlt,
+  simp only [intCastTargetBytes,
     List.map, Option.some.injEq, List.cons.injEq, AbstractByte.init.injEq, and_true, true_and]
   have hD1 : n.div 256 = n / 256 := rfl
   have hD2 : (n.div 256).div 256 = n / 65536 := by
@@ -1217,7 +1217,7 @@ theorem u32TaggedStd_freeze_mutate_reabsorb_framed (x y : Nat)
     dsimp only
     rw [hUninitY, hAccY]
     simp only [countBlocksForLoan, List.foldr, beq_self_eq_true, Bool.not_false, Bool.and_self,
-      Bool.true_and, ↓reduceIte, hDecY]
+      ↓reduceIte, hDecY]
     rw [hRepY]
     rfl
   exact ⟨stPinned, stMut, stReabsorbed, hFreeze, hMut, hReab, rfl, rfl⟩
@@ -2485,7 +2485,7 @@ theorem decodeValueFromBytes_u8U32_8bytes {layouts : LayoutTable} {idx : Nat}
       change some (a.toBitVec.toNat + 256 * 0, none) = some (a.toBitVec.toNat, none)
       simp only [Nat.mul_zero, Nat.add_zero]
     unfold u8ExactLE
-    simp only [List.length_cons, List.length_nil, Nat.beq_refl, hDec1]
+    simp only [List.length_cons, List.length_nil, Nat.beq_refl]
     exact dite_eq_left a.toBitVec.isLt
   have hU32 : u32ExactLE.decode [.init b0 none, .init b1 none, .init b2 none, .init b3 none] =
       some ⟨decodeU32LEBytes b0 b1 b2 b3, decodeU32LEBytes_lt b0 b1 b2 b3⟩ := by
@@ -2510,7 +2510,7 @@ private theorem encodeValueToBytes_u8_byte (layouts : LayoutTable) (a : UInt8) :
     rw [uint8_ofNat_toBitVec_toNat]
     exact Nat.mod_eq_of_lt hLt
   unfold encodeValueToBytes encodeScalarBytes encodeLittleEndianBytes
-  simp [rigidTyKindByteSize, intCastTargetBytes, scalarModulus, hBlt, hU8]
+  simp [intCastTargetBytes, hU8]
 
 /-- Constructive `LawfulTypedSpatialMemCodec` proof for `paddedU8U32MemCodec`
 against any captured `LayoutTable` mapping `idx` to the padded `(u8, [pad; 3], u32)`
@@ -2647,7 +2647,7 @@ theorem paddedU8U32MemCodec_lawful {layouts : LayoutTable} {idx : Nat}
         rigidTyByteSize, rigidTyKindByteSize, intCastTargetBytes,
         primFieldValAndBytesMatch, hEncU8, hEncU32', List.drop_zero, List.drop_succ_cons,
         List.take_succ_cons, List.take_zero, abstractByteListBeq_refl, sliceAllInitNoProv,
-        checkPaddingBytes, byteIdxCoveredByFields, Bool.and_true, Bool.true_and]
+        checkPaddingBytes, byteIdxCoveredByFields, Bool.and_true]
       cases p1 with
       | uninit =>
         cases p2 with
@@ -2814,7 +2814,7 @@ private theorem allHaveExactProv_encodeLittleEndianBytes (bits n a t : Nat) :
   induction n generalizing bits with
   | zero => rfl
   | succ rem ih =>
-    simp only [encodeLittleEndianBytes, allHaveExactProv, List.foldr,
+    simp only [allHaveExactProv, List.foldr,
       Nat.beq_refl, Bool.and_self, Bool.true_and]
     exact ih (bits / 256)
 
@@ -2983,9 +2983,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
     have hNonPad : nonPadBytesInitialized provPtrPadMask
         (provPtrEncode expectedAllocId expectedAllocId s) = true := by
       unfold provPtrPadMask provPtrEncode
-      simpa only [nonPadBytesInitialized, List.cons_append, List.nil_append] using
-        nonPadBytesInitialized_allFalse_encodeLittleEndianBytes s.ptrOffset.val 8
-          (some (expectedAllocId, expectedAllocId))
+      simp only [nonPadBytesInitialized, List.cons_append, List.nil_append]
     have hProv : provPtrCheck expectedAllocId expectedAllocId
         (provPtrEncode expectedAllocId expectedAllocId s) = true := by
       unfold provPtrCheck
@@ -3046,7 +3044,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
               rigidTyKindByteSize, intCastTargetBytes, Option.getD_some]
             have hCov : (Nat.ble 8 idx0 && Nat.blt idx0 (8 + 8)) = true := by
               rw [Nat.ble_eq.mpr hGe, Nat.blt_eq.mpr (by simp at hLe; omega)]; rfl
-            simp only [hCov, Bool.or_false, Bool.or_true, Bool.true_or, ↓reduceIte, Bool.true_and]
+            simp only [hCov, Bool.or_false, Bool.or_true, ↓reduceIte, Bool.true_and]
             exact ih (idx0 + 1) (by omega) (by simp at hLe; omega)
         have hHead8 :
             checkPaddingBytes true layouts
@@ -3204,7 +3202,7 @@ theorem provPtrPaddedMemCodec_lawful {layouts : LayoutTable} {idx : Nat}
                         rigidTyKindByteSize, intCastTargetBytes, Option.getD_some]
                       have hCov : (Nat.ble 8 idx0 && Nat.blt idx0 (8 + 8)) = true := by
                         rw [Nat.ble_eq.mpr hGe, Nat.blt_eq.mpr (by simp at hLe; omega)]; rfl
-                      simp only [hCov, Bool.or_false, Bool.or_true, Bool.true_or, ↓reduceIte, Bool.true_and]
+                      simp only [hCov, Bool.or_false, Bool.or_true, ↓reduceIte, Bool.true_and]
                       exact ih (idx0 + 1) (by omega) (by simp at hLe; omega)
                   have hPadClean : ∀ (x1 x2 x3 x4 x5 x6 x7 : AbstractByte),
                       padBytesProvFree [true, true, true, true, true, true, true]
@@ -3567,7 +3565,7 @@ private theorem collectHandleRefsIn_true_empty_of_false_empty {Val : Type}
                               exact beq_iff_eq.mp hEq'
                           | none =>
                             rw [hLk] at hA
-                            simp only [Bool.false_eq_true, ↓reduceIte, Option.some.injEq] at hA
+                            simp only [Option.some.injEq] at hA
                             exact hNilT (maxUnionHandleRef_eq_nil hA).1
                       · simp only [hEq', Bool.false_eq_true, ↓reduceIte]
                         cases hLk : lookupCond alg ctx cond with
@@ -3839,7 +3837,7 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
     dsimp only [st0]
     rw [hSpecCtx, hLaw.notRef]
     simp only [List.length_cons, List.length_nil, Nat.beq_refl, beq_self_eq_true, Bool.not_true,
-      Bool.false_or, Bool.false_eq_true, Bool.and_true, ↓reduceIte, hasUniqueLoanId, countLoanId,
+      Bool.false_or, Bool.false_eq_true, ↓reduceIte, hasUniqueLoanId, countLoanId,
       findLoan, LoanPhase.isActiveMut, isUnborrowed, noActiveChildRegionEdges,
       countPaddedBlocksForLoan, hasPaddedBlockId, countBlocksForLoan, hasSpatialBlockId,
       loanDirectLocal?, BackTarget.direct, List.foldr, listGet?]
@@ -3855,7 +3853,7 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
           c.layout.alignBytes (c.encodeValToMem xInit) = some memPinned := hWriteInit
     have hFreshId' := hFreshId
     dsimp only [st0, BackTarget.direct] at hFreshId'
-    simp only [Bool.not_true, Bool.false_or, Bool.or_false, Bool.false_eq_true, Bool.and_true,
+    simp only [Bool.not_true, Bool.or_false, Bool.false_eq_true,
       ↓reduceIte, bne_self_eq_false, toEntries, List.isEmpty, countSpatialBlockId,
       hTargetRefl, Nat.beq_refl, hInitDecSym', hInitEncSym, stdValEq_refl, hInitLen,
       hLaw.padMaskLen, hInitNonPad, hInitProv, hInitMatch, hasPromotedLocal, List.foldr,
@@ -3978,8 +3976,7 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
         unfold deactivateLoan
         rw [hNoChild]
         simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, List.foldr, beq_self_eq_true,
-          isUnborrowed, activeTargetHasSpecial, BackTarget.direct, LoanPhase.isActive,
-          Bool.false_or]
+          isUnborrowed, activeTargetHasSpecial, BackTarget.direct, LoanPhase.isActive]
         rfl
       have hRepEnd : replaceableVals stdValAlg
           [⟨0, .ended, ⟨newSymVal, .unborrowed⟩, .direct (.localReg 1) []⟩]
@@ -4074,7 +4071,7 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
     have hSameNew : sameAtNonPad c.padMask (c.encodeValToMem xNew) newRaw = true :=
       sameAtNonPad_refl c.padMask newRaw (hLaw.padMaskLen.trans hNewLen'.symm)
     simp only [hLenSym, List.length_cons, List.length_nil, Nat.beq_refl, Bool.not_true, Bool.false_or,
-      Bool.false_eq_true, Bool.and_true, ↓reduceIte, syncPromotedLocalsToMem.go, prom,
+      Bool.false_eq_true, ↓reduceIte, syncPromotedLocalsToMem.go, prom,
       anyBlockTargetsLocal, List.foldr, slotMatchesIndirection, listGet?, hGetLoc1,
       hNewDecSym', hNewEncSym, stdValEq_refl, hReadMut', hNewNonPad', hSameNew, hNewMatch',
       Bool.and_self]
@@ -4117,7 +4114,7 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
     have hOtherInd : otherIndirectLocalUsesAlloc 1 m0.nextAllocId
         [.immediate .unit, .indirect place] = false := rfl
     have hOtherRefMut : otherLiveAllocRefsAlloc m0.nextAllocId memMut.allocs = false := hOtherRef
-    simp only [List.length_cons, List.length_nil, Nat.beq_refl, h10, Bool.not_true, Bool.false_or,
+    simp only [List.length_cons, List.length_nil, Nat.beq_refl, h10, Bool.not_true,
       Bool.false_and, Bool.or_false, Bool.and_true, Bool.false_eq_true, ↓reduceIte,
       listGet?, listSet?, prom, place, LoanPhase.isEnded,
       isUnborrowed, toEntries, List.isEmpty, List.foldr, List.filter,
@@ -4160,7 +4157,7 @@ theorem readV2026Bytes_subslice_of_read (mem : V2026ByteMem)
     simp only [List.drop_zero] at hRead
     by_cases hBad : (!a.live || !v2026InBounds a 0 len || !v2026Aligned a 0 align) = true
     · simp only [hBad, ↓reduceIte] at hRead; nomatch hRead
-    · simp only [hBad, ↓reduceIte] at hRead
+    · simp only [hBad] at hRead
       injection hRead with hEq
       have hFalse : (!a.live || !v2026InBounds a 0 len || !v2026Aligned a 0 align) = false :=
         Bool.eq_false_iff.mpr hBad
@@ -4577,5 +4574,204 @@ theorem pinned_loan_blocks_pure_mutation_until_reabsorb :
       endLoanInState stdValAlg 0 stPinned.sym = .fail ∧
       endPaddedLoan ctx3 0 stPinned = .fail :=
   ⟨_, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+
+/-! ## 6. Authentication Soundness (`#4051` `mirTyBeq_sound` / `specsMatchBodyCtx_slot_sound`)
+
+The boolean guards `rigidTyBeq` / `mirTyBeq` / `spatialTargetSpecBeq` /
+`bodySpatialCtxWf` / `specsMatchBodyCtx` are SOUND: a `true` verdict implies
+propositional equality with the real `CapturedMir` declarations, and every
+successful `freezePaddedToMem` / `mutatePaddedInMem` / `reabsorbPaddedFromMem`
+step runs against exactly the authenticated `ctx.specs`. -/
+
+theorem uintTyBeq_sound {a b : UintTy} (h : uintTyBeq a b = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | (exact absurd h (by decide))
+
+theorem intTyBeq_sound {a b : IntTy} (h : intTyBeq a b = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | (exact absurd h (by decide))
+
+theorem mutabilityBeq_sound {a b : Mutability} (h : mutabilityBeq a b = true) : a = b := by
+  cases a <;> cases b <;> first | rfl | (exact absurd h (by decide))
+
+theorem rigidTyBeq_sound : ∀ (fuel : Nat) {a b : RigidTy}, rigidTyBeq fuel a b = true → a = b
+  | 0, _, _, h => by unfold rigidTyBeq at h; exact absurd h (by decide)
+  | fuel + 1, a, b, h => by
+    have ih := @rigidTyBeq_sound fuel
+    have hGo : ∀ ks1 ks2 : List RigidTy, rigidTyBeq.go fuel ks1 ks2 = true → ks1 = ks2 := by
+      intro ks1
+      induction ks1 with
+      | nil => intro ks2 h; cases ks2 with
+        | nil => rfl
+        | cons _ _ => unfold rigidTyBeq.go at h; exact absurd h (by decide)
+      | cons k ks ihk => intro ks2 h; cases ks2 with
+        | nil => unfold rigidTyBeq.go at h; exact absurd h (by decide)
+        | cons k2 ks2 =>
+          unfold rigidTyBeq.go at h
+          rw [Bool.and_eq_true] at h
+          rw [ih h.1, ihk ks2 h.2]
+    have hGoA : ∀ ks1 ks2 : List RigidTy, rigidTyBeq.goArgs fuel ks1 ks2 = true → ks1 = ks2 := by
+      intro ks1
+      induction ks1 with
+      | nil => intro ks2 h; cases ks2 with
+        | nil => rfl
+        | cons _ _ => unfold rigidTyBeq.goArgs at h; exact absurd h (by decide)
+      | cons k ks ihk => intro ks2 h; cases ks2 with
+        | nil => unfold rigidTyBeq.goArgs at h; exact absurd h (by decide)
+        | cons k2 ks2 =>
+          unfold rigidTyBeq.goArgs at h
+          rw [Bool.and_eq_true] at h
+          rw [ih h.1, ihk ks2 h.2]
+    cases a <;> cases b <;> simp only [rigidTyBeq, Bool.and_eq_true, Bool.false_eq_true] at h
+    all_goals first
+      | rfl
+      | (rw [uintTyBeq_sound h])
+      | (rw [intTyBeq_sound h])
+      | (rw [mutabilityBeq_sound h.1, ih h.2])
+      | (rw [hGo _ _ h])
+      | (rw [beq_iff_eq.mp h.1, hGoA _ _ h.2])
+
+theorem mirTyBeq_sound {t1 t2 : Ty} (h : mirTyBeq t1 t2 = true) : t1 = t2 := by
+  unfold mirTyBeq at h
+  rw [Bool.and_eq_true] at h
+  cases t1; cases t2
+  have h1 := Nat.beq_eq.mp h.1
+  have h2 := rigidTyBeq_sound 8 h.2
+  simp only at h1 h2
+  rw [h1, h2]
+
+
+theorem auditedFieldSpecListBeq_sound :
+    ∀ {fs1 fs2 : List AuditedFieldSpec}, auditedFieldSpecListBeq fs1 fs2 = true → fs1 = fs2
+  | [], [], _ => rfl
+  | [], _ :: _, h => by unfold auditedFieldSpecListBeq at h; exact absurd h (by decide)
+  | _ :: _, [], h => by unfold auditedFieldSpecListBeq at h; exact absurd h (by decide)
+  | f1 :: fs1, f2 :: fs2, h => by
+    unfold auditedFieldSpecListBeq auditedFieldSpecBeq at h
+    simp only [Bool.and_eq_true] at h
+    obtain ⟨⟨hOff, hTy⟩, hRest⟩ := h
+    cases f1; cases f2
+    have h1 := Nat.beq_eq.mp hOff
+    have h2 := mirTyBeq_sound hTy
+    simp only at h1 h2
+    rw [h1, h2, auditedFieldSpecListBeq_sound hRest]
+
+theorem spatialTargetSpecBeq_sound {a b : SpatialTargetSpec}
+    (h : spatialTargetSpecBeq a b = true) : a = b := by
+  cases a <;> cases b <;> simp only [spatialTargetSpecBeq, Bool.and_eq_true,
+    Bool.false_eq_true] at h
+  · rw [mirTyBeq_sound h]
+  · obtain ⟨⟨⟨⟨hId, hTy⟩, hSz⟩, hAl⟩, hFs⟩ := h
+    rw [Nat.beq_eq.mp hId, mirTyBeq_sound hTy, Nat.beq_eq.mp hSz, Nat.beq_eq.mp hAl,
+      auditedFieldSpecListBeq_sound hFs]
+
+theorem specMatchesDeclAndLayout_toMirTy {layouts : LayoutTable} {declTy : Ty}
+    {spec : SpatialTargetSpec} (h : specMatchesDeclAndLayout layouts declTy spec = true) :
+    spec.toMirTy = declTy := by
+  unfold specMatchesDeclAndLayout at h
+  rw [Bool.and_eq_true] at h
+  exact mirTyBeq_sound h.1
+
+/-- **`BodySpatialCtx` authentication soundness**: `bodySpatialCtxWf ctx = true`
+implies `ctx.body.wellFormed`, slot-for-slot length agreement, and that EVERY
+spec's MIR type is EXACTLY the declared `LocalDecl.ty` of the real `CapturedMir`. -/
+theorem bodySpatialCtxWf_sound {ctx : BodySpatialCtx} (h : bodySpatialCtxWf ctx = true) :
+    ctx.body.wellFormed = true ∧
+    ctx.body.localDecls.length = ctx.specs.length ∧
+    ∀ (i : Nat) (d : LocalDecl) (s : SpatialTargetSpec),
+      listGet? ctx.body.localDecls i = some d → listGet? ctx.specs i = some s →
+      s.toMirTy = d.ty := by
+  unfold bodySpatialCtxWf at h
+  rw [Bool.and_eq_true] at h
+  refine ⟨h.1, ?_⟩
+  have hGo : ∀ (ds : List LocalDecl) (ss : List SpatialTargetSpec),
+      bodySpatialCtxWf.go ctx ds ss = true →
+      ds.length = ss.length ∧
+      ∀ (i : Nat) (d : LocalDecl) (s : SpatialTargetSpec),
+        listGet? ds i = some d → listGet? ss i = some s → s.toMirTy = d.ty := by
+    intro ds
+    induction ds with
+    | nil =>
+      intro ss hG
+      cases ss with
+      | nil => exact ⟨rfl, fun i _ _ hD _ => by cases i <;> cases hD⟩
+      | cons _ _ => unfold bodySpatialCtxWf.go at hG; exact absurd hG (by decide)
+    | cons d ds ih =>
+      intro ss hG
+      cases ss with
+      | nil => unfold bodySpatialCtxWf.go at hG; exact absurd hG (by decide)
+      | cons s ss =>
+        unfold bodySpatialCtxWf.go at hG
+        rw [Bool.and_eq_true] at hG
+        obtain ⟨hLen, hAll⟩ := ih ss hG.2
+        refine ⟨by simp only [List.length_cons, hLen], ?_⟩
+        intro i d' s' hD hS
+        cases i with
+        | zero =>
+          cases hD; cases hS
+          exact specMatchesDeclAndLayout_toMirTy hG.1
+        | succ i => exact hAll i d' s' hD hS
+  exact hGo _ _ h.2
+
+/-- **`specsMatchBodyCtx` soundness**: a successful authentication pins
+`localSpecs` to EXACTLY the audited `ctx.specs` of a well-formed `BodySpatialCtx`. -/
+theorem specsMatchBodyCtx_sound {ctx : BodySpatialCtx} {localSpecs : List SpatialTargetSpec}
+    (h : specsMatchBodyCtx ctx localSpecs = true) :
+    bodySpatialCtxWf ctx = true ∧ localSpecs = ctx.specs := by
+  unfold specsMatchBodyCtx at h
+  rw [Bool.and_eq_true] at h
+  refine ⟨h.1, ?_⟩
+  have hGo : ∀ (as bs : List SpatialTargetSpec),
+      specsMatchBodyCtx.go as bs = true → bs = as := by
+    intro as
+    induction as with
+    | nil =>
+      intro bs hG
+      cases bs with
+      | nil => rfl
+      | cons _ _ => unfold specsMatchBodyCtx.go at hG; exact absurd hG (by decide)
+    | cons a as ih =>
+      intro bs hG
+      cases bs with
+      | nil => unfold specsMatchBodyCtx.go at hG; exact absurd hG (by decide)
+      | cons b bs =>
+        unfold specsMatchBodyCtx.go at hG
+        rw [Bool.and_eq_true] at hG
+        rw [spatialTargetSpecBeq_sound hG.1, ih bs hG.2]
+  exact hGo _ _ h.2
+
+/-- Every successful `freezePaddedToMem` runs against EXACTLY the authenticated
+`ctx.specs` of a well-formed `BodySpatialCtx`, so every frozen local's MIR type is
+the declared `LocalDecl.ty` of the real `CapturedMir`. -/
+theorem freezePaddedToMem_ok_authenticated {α : Type} {ctx : BodySpatialCtx} {lid : LoanId}
+    {c : TypedSpatialMemCodec α} {hLaw : LawfulTypedSpatialMemCodec ctx.body.layouts c}
+    {st st' : PaddedSymMemState}
+    (h : freezePaddedToMem ctx lid c hLaw st = .ok st') :
+    bodySpatialCtxWf ctx = true ∧ st.mirLocalTypes = ctx.specs ∧
+      c.targetTy.isRefTarget = false := by
+  unfold freezePaddedToMem at h
+  cases hS : specsMatchBodyCtx ctx st.mirLocalTypes with
+  | false => simp only [hS, Bool.not_false, Bool.true_or, ↓reduceIte] at h; cases h
+  | true =>
+    cases hR : c.targetTy.isRefTarget with
+    | true => simp only [hS, hR, Bool.or_true] at h; cases h
+    | false => exact ⟨(specsMatchBodyCtx_sound hS).1, (specsMatchBodyCtx_sound hS).2, rfl⟩
+
+theorem mutatePaddedInMem_ok_authenticated {ctx : BodySpatialCtx} {bid : BlockId} {tag : Nat}
+    {relOff reqAlign : Nat} {newBytes : List AbstractByte} {st st' : PaddedSymMemState}
+    (h : mutatePaddedInMem ctx bid tag relOff reqAlign newBytes st = .ok st') :
+    bodySpatialCtxWf ctx = true ∧ st.mirLocalTypes = ctx.specs := by
+  unfold mutatePaddedInMem at h
+  cases hS : specsMatchBodyCtx ctx st.mirLocalTypes with
+  | false => simp only [hS, Bool.not_false, Bool.true_or, ↓reduceIte] at h; cases h
+  | true => exact specsMatchBodyCtx_sound hS
+
+theorem reabsorbPaddedFromMem_ok_authenticated {ctx : BodySpatialCtx} {lid : LoanId}
+    {st st' : PaddedSymMemState}
+    (h : reabsorbPaddedFromMem ctx lid st = .ok st') :
+    bodySpatialCtxWf ctx = true ∧ st.mirLocalTypes = ctx.specs := by
+  unfold reabsorbPaddedFromMem at h
+  cases hS : specsMatchBodyCtx ctx st.mirLocalTypes with
+  | false => simp only [hS, Bool.not_false, Bool.true_or, ↓reduceIte] at h; cases h
+  | true => exact specsMatchBodyCtx_sound hS
 
 end Anneal.PureLift.SpatialMemV2026

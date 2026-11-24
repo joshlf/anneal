@@ -25,10 +25,13 @@ all five converged capabilities against unmodified
   `addWithOverflow` + `SwitchInt` diamond, `u16 -> u32` widening cast, and
   interval-guarded `addUnchecked`) proved via $O(m)$ `OvfCastStageCut` composition →
   `MirWpConverges` for universally bounded inputs (`∀ x ≤ 20000`) plus exact functional
-  (`r = 3 * x + 107`) and concrete (`1234 ↦ 3809`) witnesses.
+  (`r = 3 * x + 107`) and concrete (`1234 ↦ 3809`) witnesses, and (2b) the same pipeline
+  run through `evalBlockTreeToCut` over a `ValidBlockTree` of the real `CapturedMir`
+  blocks and sealed into a live `StepStageCut` → `MirWpConverges`.
 - **Witness 3 (`CallStackUnwind` + `RefFrame`)**: real caller + inline callee
   `CapturedMir` bodies for (a) normal `TerminatorKind.call` with `&mut u32` writeback +
-  protector release + bystander local framing AND a real `&mut [u8]` slice-writing
+  a REAL `Retag(FnEntry)` strong protector (`activeProtectors = [1]` in the callee,
+  released to `[]` by `return_`) + bystander local framing AND a real `&mut [u8]` slice-writing
   `CallSpecCut` → `mirWpConverges_of_callSpecCut_normal_cleanup` with `UpdatesOnly` +
   `exitFrameWithProtectors`, (b) callee `TerminatorKind.assert` unwinding through caller
   `UnwindAction.cleanup` landing pad into clean recovery → `MirWpConverges`, and (c)
@@ -40,7 +43,10 @@ all five converged capabilities against unmodified
   provenance-carrying `(u8, [pad; 7], *mut u8)` verified against `decodeValueFromBytes`.
 - **Negative Boundary Canaries (`N1..N4`)**: OOB/zero-length/immutable/relocated copy
   rejection, overflowing `mulWithOverflow` arm routing + interval rejection, diverging
-  `return_` UB + `.unreachable` assert UB + `.ProtectedDisabled` rejection, and
+  `return_` UB + `.unreachable` assert UB + `.ProtectedDisabled` rejection (N3b: REAL
+  inline diverging `TerminatorKind.call` (`target = none`) faulting from the caller's
+  entry state vs. the converging contrast, and `exitFrameWithProtectors` failing with
+  `.AccessFailure _ _ _ (.ProtectedDisabled .Unique)`), and
   non-padding `.uninit` / provenance stripping / surplus forgery / pinned-loan pure
   write blocking.
 -/
@@ -1039,12 +1045,17 @@ theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
 
 /-! ## Witness 3: `CallStackUnwind` & `RefFrame` — Inline Call, `CallSpecCut`, Cleanup Unwind & `topo3` -/
 
-/-- Real inline callee `fn bump_mut(p: &mut u32) -> u32 { *p = *p + 5; 1 }`. -/
+/-- Real inline callee `fn bump_mut(p: &mut u32) -> u32 { *p = *p + 5; 1 }`, opening
+with the compiler-emitted function-entry `Retag(FnEntry, _1)` so that unmodified
+`V2026_06_01.MirSemantics.evalFnEntryRetag` allocates a REAL strong protector
+(`activeProtectors := protId :: _`, `nextProtector += 1`) and a protected child
+tag (`perm := .reservedFrz false`, `protector := some protId`, `parentTag := some 1`). -/
 def calleeBumpMutBody : CapturedMir :=
   mkBody "tests::bump_mut" 1
     [decl .mut u32T, decl .not refMutU32T]
     [mkBb
-      [ mkSt (.assign (pl 1 [.deref]) (.binaryOp .add (.copy (pl 1 [.deref])) (u32C 5)))
+      [ mkSt (.retag .fnEntry (pl 1))
+      , mkSt (.assign (pl 1 [.deref]) (.binaryOp .add (.copy (pl 1 [.deref])) (u32C 5)))
       , mkSt (.assign (pl 0) (.use (u32C 1))) ]
       .return_]
 
@@ -1091,10 +1102,15 @@ def callerCleanupBody : CapturedMir :=
     , mkBb [mkSt (.assign (pl 0) (.use (.copy (pl 2))))] .return_
     , mkBb [mkSt (.assign (pl 0) (.use (u32C 999)))] .return_ (isClean := true) ]
 
-/-- **Witness 3a-i (`CallStackUnwind` normal inline call + `&mut` writeback + framing)**:
-for ALL `x ≤ 10000`, `bystander ≤ 10000`, `callerNormalBody` invokes `calleeBumpMutBody`
-through `Memory.callees`, mutates `*p = x + 5`, restores `activeProtectors` on `return_`,
-frames `bystander`, and converges via `MirWpConverges` to `x + bystander + 6`. -/
+/-- **Witness 3a-i (`CallStackUnwind` normal inline call + `&mut` writeback + REAL
+protector lifecycle + framing)**: for ALL `x ≤ 10000`, `bystander ≤ 10000`,
+`callerNormalBody` invokes `calleeBumpMutBody` through `Memory.callees`; the callee's
+`Retag(FnEntry, _1)` pushes strong protector `1` (`activeProtectors = [1]`) on a
+protected child tag `2` of the caller's `&mut x` tag `1`, writes `*p = x + 5` through
+tag `2` (both tags become `.unique`), and `TerminatorKind.return_` RELEASES the
+protector (`restoreCallerProtectors` → `activeProtectors = []`, `nextProtector = 2`
+witnessing that exactly one protector was allocated and released), frames
+`bystander`, and converges via `MirWpConverges` to `x + bystander + 6`. -/
 theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
     (hx : x ≤ 10000) (hb : bystander ≤ 10000) :
     let ms0 : MachineState :=
@@ -1106,7 +1122,10 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
       (fun out =>
         match out with
         | .normal (.scalar ⟨r, 4⟩, mem) =>
-          r = x + bystander + 6 ∧ mem.callStack = [] ∧ mem.activeProtectors = []
+          r = x + bystander + 6 ∧ mem.callStack = [] ∧ mem.activeProtectors = [] ∧
+          mem.nextProtector = 2 ∧
+          mem.borrows.map BorrowEntry.protector = [some 1, none] ∧
+          mem.borrows.map BorrowEntry.parentTag = [some 1, none]
         | _ => False) := by
   intro ms0
   have hW1 : wrapScalarBits (Nat.add x 5) 4294967296 = x + 5 :=
@@ -1118,7 +1137,9 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
   let borrow1 : BorrowEntry :=
     { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
       perm := .reservedFrz false }
-  let borrow1Uniq : BorrowEntry := { borrow1 with perm := .unique }
+  let child2 : BorrowEntry :=
+    { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false, protector := some 1, parentTag := some 1 }
   let mem1 : Memory := { callees := [calleeBumpMutBody], borrows := [borrow1], nextTag := 2 }
   let savedCaller0 : SavedCallerFrame :=
     { callerBody := callerNormalBody
@@ -1138,10 +1159,15 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
   let mem2 : Memory :=
     { mem1 with callStack := [savedCaller0], activeCallee := some calleeBumpMutBody }
   let mem3 : Memory :=
-    { mem2 with borrows := [borrow1Uniq], callStack := [savedCaller1] }
+    { mem2 with borrows := [child2, borrow1], nextTag := 3, activeProtectors := [1],
+                nextProtector := 2 }
   let mem4 : Memory :=
-    { callees := [calleeBumpMutBody], borrows := [borrow1Uniq], nextTag := 2,
-      activeCallee := some callerNormalBody }
+    { mem3 with borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }],
+                callStack := [savedCaller1] }
+  let mem5 : Memory :=
+    { callees := [calleeBumpMutBody],
+      borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }],
+      nextTag := 3, nextProtector := 2, activeCallee := some callerNormalBody }
   have h1 : Anneal.PureMirExec.mirStep callerNormalBody ms0 =
       .cont { frame := { blockIdx := 0, stmtIdx := 1
                          locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨bystander, 4⟩),
@@ -1160,14 +1186,21 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
                    locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8)] }
         memory := mem2 } =
       .cont { frame := { blockIdx := 0, stmtIdx := 1
-                         locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8)] }
-              memory := mem3 } := by
+                         locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+              memory := mem3 } := rfl
+  have h4 : Anneal.PureMirExec.mirStep callerNormalBody
+      { frame := { blockIdx := 0, stmtIdx := 1
+                   locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+        memory := mem3 } =
+      .cont { frame := { blockIdx := 0, stmtIdx := 2
+                         locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+              memory := mem4 } := by
     change Step.cont
-      ({ frame := { blockIdx := 0, stmtIdx := 1
-                    locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8)] }
+      ({ frame := { blockIdx := 0, stmtIdx := 2
+                    locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
          memory :=
-           { mem2 with
-             borrows := [borrow1Uniq]
+           { mem3 with
+             borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }]
              callStack :=
                [{ savedCaller0 with
                   frame := { blockIdx := 0, stmtIdx := 1
@@ -1177,56 +1210,56 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
                                         .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] } }] } } : MachineState) = _
     rw [hW1]
   have h5 : Anneal.PureMirExec.mirStep callerNormalBody
-      { frame := { blockIdx := 0, stmtIdx := 1
-                   locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8)] }
-        memory := mem3 } =
-      .cont { frame := { blockIdx := 0, stmtIdx := 2
-                         locals := [.init (.scalar ⟨1, 4⟩), .init (.ptr ⟨1, 0⟩ 8)] }
-              memory := mem3 } := rfl
-  have h6 : Anneal.PureMirExec.mirStep callerNormalBody
       { frame := { blockIdx := 0, stmtIdx := 2
-                   locals := [.init (.scalar ⟨1, 4⟩), .init (.ptr ⟨1, 0⟩ 8)] }
-        memory := mem3 } =
+                   locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+        memory := mem4 } =
+      .cont { frame := { blockIdx := 0, stmtIdx := 3
+                         locals := [.init (.scalar ⟨1, 4⟩), .init (.ptr ⟨2, 0⟩ 8)] }
+              memory := mem4 } := rfl
+  have h6 : Anneal.PureMirExec.mirStep callerNormalBody
+      { frame := { blockIdx := 0, stmtIdx := 3
+                   locals := [.init (.scalar ⟨1, 4⟩), .init (.ptr ⟨2, 0⟩ 8)] }
+        memory := mem4 } =
       .cont { frame := { blockIdx := 1, stmtIdx := 0
                          locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                                     .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩), .uninit] }
-              memory := mem4 } := rfl
+              memory := mem5 } := rfl
   have h7 : Anneal.PureMirExec.mirStep callerNormalBody
       { frame := { blockIdx := 1, stmtIdx := 0
                    locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                               .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩), .uninit] }
-        memory := mem4 } =
+        memory := mem5 } =
       .cont { frame := { blockIdx := 1, stmtIdx := 1
                          locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                                     .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                                     .init (.scalar ⟨x + 5 + bystander, 4⟩)] }
-              memory := mem4 } := by
+              memory := mem5 } := by
     change Step.cont
       ({ frame := { blockIdx := 1, stmtIdx := 1
                     locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                                .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                                .init (.scalar ⟨wrapScalarBits (Nat.add (x + 5) bystander) 4294967296, 4⟩)] }
-         memory := mem4 } : MachineState) = _
+         memory := mem5 } : MachineState) = _
     rw [hW2]
   have h8 : Anneal.PureMirExec.mirStep callerNormalBody
       { frame := { blockIdx := 1, stmtIdx := 1
                    locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                               .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                               .init (.scalar ⟨x + 5 + bystander, 4⟩)] }
-        memory := mem4 } =
+        memory := mem5 } =
       .cont { frame := { blockIdx := 1, stmtIdx := 2
                          locals := [.init (.scalar ⟨x + 5 + bystander + 1, 4⟩),
                                     .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                                     .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                                     .init (.scalar ⟨x + 5 + bystander, 4⟩)] }
-              memory := mem4 } := by
+              memory := mem5 } := by
     change Step.cont
       ({ frame := { blockIdx := 1, stmtIdx := 2
                     locals := [.init (.scalar ⟨wrapScalarBits (Nat.add (x + 5 + bystander) 1) 4294967296, 4⟩),
                                .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                                .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                                .init (.scalar ⟨x + 5 + bystander, 4⟩)] }
-         memory := mem4 } : MachineState) = _
+         memory := mem5 } : MachineState) = _
     rw [hW3]
   have h9 : Anneal.PureMirExec.mirStep callerNormalBody
       { frame := { blockIdx := 1, stmtIdx := 2
@@ -1234,12 +1267,12 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
                               .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                               .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩),
                               .init (.scalar ⟨x + 5 + bystander, 4⟩)] }
-        memory := mem4 } =
+        memory := mem5 } =
       .done (.normal (.scalar ⟨x + 5 + bystander + 1, 4⟩,
-        { mem4 with borrows := disableFrameBorrows mem4.borrows 0 6 })) := rfl
-  exact step_to_mirWp h1 (step_to_mirWp h2 (step_to_mirWp h3
+        { mem5 with borrows := disableFrameBorrows mem5.borrows 0 6 })) := rfl
+  exact step_to_mirWp h1 (step_to_mirWp h2 (step_to_mirWp h3 (step_to_mirWp h4
     (step_to_mirWp h5 (step_to_mirWp h6 (step_to_mirWp h7 (step_to_mirWp h8
-      (done_to_mirWp h9 ⟨by omega, rfl, rfl⟩)))))))
+      (done_to_mirWp h9 ⟨by omega, rfl, rfl, rfl, rfl, rfl⟩))))))))
 
 /-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + `exitFrameWithProtectors` +
 disjoint sibling framing → `MirWpConverges`)**: seals `calleeWrite2BytesBody` behind a
@@ -1785,6 +1818,92 @@ theorem neg3_diverging_return_unreachable_assert_and_protected_disabled :
   · intro post
     exact not_mirWpConverges_assert_unreachable_ub (body := assertUnreachableBody) (s := sUnreach)
       rfl rfl rfl rfl rfl rfl rfl
+
+/-- Real inline callee `fn ret_zero_callee() -> u32 { 0 }`. -/
+private def retZeroCallee : CapturedMir :=
+  mkBody "tests::ret_zero_callee" 0 [decl .mut u32T]
+    [mkBb [mkSt (.assign (pl 0) (.use (u32C 0)))] .return_]
+
+/-- Real caller issuing a DIVERGING `TerminatorKind.call` (`target = none`, i.e.
+`onRet = none`) to `ret_zero_callee`. -/
+private def divCallerBody : CapturedMir :=
+  mkBody "tests::div_caller" 0 [decl .mut u32T, decl .mut u32T]
+    [ mkBb [] (.call (fnOp "tests::ret_zero_callee") [] (pl 1) none .continue_)
+    , mkBb [mkSt (.assign (pl 0) (.use (.copy (pl 1))))] .return_ ]
+
+/-- Contrast caller: the SAME callee via a converging `TerminatorKind.call`
+(`target = some 1`). -/
+private def convCallerBody : CapturedMir :=
+  mkBody "tests::conv_caller" 0 [decl .mut u32T, decl .mut u32T]
+    [ mkBb [] (.call (fnOp "tests::ret_zero_callee") [] (pl 1) (some 1) .continue_)
+    , mkBb [mkSt (.assign (pl 0) (.binaryOp .add (.copy (pl 1)) (u32C 41)))] .return_ ]
+
+private def divCallerS0 : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.uninit, .uninit] }
+    memory := { callees := [retZeroCallee] } }
+
+/-- Two mutually protected sibling `&mut` tags (`1`, `2`) under `topo3`, whose
+`RefFrame` permissions are the `TreeBorrowPerm ↔ TbPermission` image of the MIR
+`.unique` permission. -/
+private def protExitTree : RangedBorrowTree :=
+  { topology := topo3
+    protectedTags := [1, 2]
+    segments := [⟨0, 8, [(0, ⟨.Unique, true⟩), (1, ⟨tbPermOfMir .unique, true⟩),
+                          (2, ⟨tbPermOfMir .unique, true⟩)]⟩] }
+
+/-- **Negative Canary N3b (`CallStackUnwind` on REAL inline diverging calls + `RefFrame`
+frame exit)**:
+1. A REAL caller `TerminatorKind.call ... (target := none)` (`onRet = none`) pushes a
+   diverging `SavedCallerFrame` via unmodified `pushDivergingCalleeFrame`; when the
+   inline callee (`Memory.activeCallee = some retZeroCallee`) executes
+   `TerminatorKind.return_`, execution faults (`stepMirFn_inline_return_diverging_ub`)
+   so `¬ MirWpConverges` from the caller's ENTRY state, while the SAME callee under a
+   converging call (`target := some 1`) returns `0 + 41 = 41`;
+2. `exitFrameWithProtectors` on frame `[2]` performs tag `2`'s implicit protector-release
+   write, which is a conflicting FOREIGN write to protected sibling `&mut` tag `1`
+   (`.unique` ↦ `.Unique`) and fails with
+   `.AccessFailure 0 8 1 (.ProtectedDisabled .Unique)` (mirrored by unmodified
+   `treeBorrowNodeAccess .write .foreignAccess .unique true = .ub`). -/
+theorem neg3b_real_diverging_call_and_exitFrame_protected_disabled :
+    (∀ post, ¬ MirWpConverges divCallerBody divCallerS0 post) ∧
+    MirWpConverges convCallerBody divCallerS0
+      (fun out => match out with
+        | .normal (.scalar ⟨r, 4⟩, mem) => r = 41 ∧ mem.callStack = []
+        | _ => False) ∧
+    (exitFrameWithProtectors protExitTree [2]).status =
+      .AccessFailure 0 8 1 (.ProtectedDisabled .Unique) ∧
+    treeBorrowNodeAccess .write .foreignAccess .unique true = .ub := by
+  refine ⟨?_, ?_, rfl, rfl⟩
+  · intro post
+    exact not_mirWpConverges_of_step_tau (s' := _) rfl
+      (not_mirWpConverges_of_step_tau (s' := _) rfl
+        (not_mirWpConverges_inline_return_diverging_ub (callee := retZeroCallee)
+          rfl rfl rfl rfl rfl rfl rfl rfl))
+  · exact step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl
+      (done_to_mirWp rfl ⟨rfl, rfl⟩))))
+
+/-- **Witness 2b (`BlockTree` on `CapturedMir` → `OverflowCastJoin` pipeline)**: kernel
+evaluation of `evalBlockTreeToCut` over `BlockTree.ofList ovfCastPipelineBody.basicBlocks`
+(`O(log n)` block lookups through `mirDetStepWith`) runs the narrowing cast and BOTH
+checked `SwitchInt` diamonds plus the widening cast from `bb0` to the `bb6` cutpoint,
+sealed as a `StepStageCut` on live `mirDetStep` (`stepStageCut_of_validBlockTreeToCut`)
+and composed into `MirWpConverges` with the interval-guarded `addUnchecked` tail:
+`1234 ↦ 3 * 1234 + 107 = 3809`. -/
+theorem witness2b_ovfCast_blockTree_cut_mir_wp_converges :
+    MirWpConverges ovfCastPipelineBody
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit, .init (.scalar ⟨42, 4⟩), .init (.scalar ⟨1234, 4⟩),
+                              .uninit, .uninit, .uninit] }
+        memory := {} }
+      (fun out =>
+        match out with
+        | .normal (.scalar ⟨r, 4⟩, _) => r = 3809
+        | _ => False) :=
+  mirWpConverges_of_stepStageCut
+    (stepStageCut_of_validBlockTreeToCut (valid_blockTree_ofList _)
+      (cuts := MaskTree.ofList [false, false, false, false, false, false, true, false])
+      (fuel := 14) (s₁ := _) rfl)
+    (step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl (done_to_mirWp rfl rfl))))
 
 /-- **Negative Canary N4 (`SpatialMemV2026`)**:
 1. Non-padding `.uninit` byte reabsorption returns `.fail` and `decodeValueFromBytes = none`;
