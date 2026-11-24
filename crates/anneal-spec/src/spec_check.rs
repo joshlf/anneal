@@ -4052,11 +4052,16 @@ impl<'a> SpecLexer<'a> {
             }
             let word = &self.src[start..end];
             self.pos = end;
-            // Rust string/byte/C-string literal prefixes (`r"…"`, `r#"…"#`,
-            // `br"…"`, `cr#"…"#`, `b"…"`, `c"…"`, `b'…'`). Never apply these
-            // in Lean mode, where `b'` is a primed identifier.
+            // Raw strings exist in both languages (`r"…"`, `r#"…"#`): a
+            // backslash inside one is not an escape.
+            if word == "r" && self.skip_raw_string()? {
+                return Ok(Some(SpecTok::Literal));
+            }
+            // Rust byte/C-string literal prefixes (`br"…"`, `cr#"…"#`,
+            // `b"…"`, `c"…"`, `b'…'`). Never apply these in Lean mode, where
+            // `b'` is a primed identifier.
             if !matches!(self.syntax, SpecSyntax::Lean) {
-                if matches!(word, "r" | "br" | "cr") && self.skip_raw_string()? {
+                if matches!(word, "br" | "cr") && self.skip_raw_string()? {
                     return Ok(Some(SpecTok::Literal));
                 }
                 if matches!(word, "b" | "c") && self.byte_at(end) == Some(b'"') {
@@ -4221,25 +4226,215 @@ impl<'a> EntryPointDescriptor<'a> {
     /// `#[entry]`, `#[main]`, `#[start]` and their path-qualified forms
     /// (`#[cortex_m_rt::entry]`, `#[tokio::main]`) are entry attributes.
     /// `#[no_mangle]` exports the item under its own name, and
-    /// `#[export_name = "sym"]` under `sym`; an `unsafe(…)` wrapper is
-    /// accepted around either.
+    /// `#[export_name = "sym"]` under `sym` (escape sequences are decoded, so
+    /// `"\x5fstart"` is `_start`); an `unsafe(…)` wrapper is accepted around
+    /// either.
+    ///
+    /// `#[cfg_attr(predicate, attr, …)]` contributes every conditional
+    /// attribute: the predicate may hold in the configuration that ships, so
+    /// `#[cfg_attr(not(test), no_mangle)]` exports the item. When several
+    /// attributes name different link symbols, an entry symbol (`main`,
+    /// `_start`, `__start`) takes precedence.
     pub fn with_attributes(mut self, attributes: &[&'a str]) -> Self {
         for attribute in attributes {
-            let body = attribute_body(attribute);
-            if is_entry_attribute(body) {
-                self.has_entry_attr = true;
-            }
-            let inner = strip_unsafe_wrapper(body);
-            if inner == "no_mangle" {
-                if self.link_symbol.is_none() {
-                    self.link_symbol = Some(path_segment_count_and_leaf(self.def_path).1);
-                }
-            } else if let Some(symbol) = export_name_symbol(inner) {
-                self.link_symbol = Some(symbol);
-            }
+            self.apply_attribute(attribute_body(attribute), MAX_CFG_ATTR_DEPTH);
         }
         self
     }
+
+    /// Derives [`Self::crate_no_main`] from the source text of the crate-level
+    /// attributes: `#![no_main]`, also behind `cfg_attr`
+    /// (`#![cfg_attr(not(test), no_main)]`).
+    pub fn with_crate_attributes(mut self, attributes: &[&str]) -> Self {
+        if attributes.iter().any(|attr| is_no_main_attribute(attr)) {
+            self.crate_no_main = true;
+        }
+        self
+    }
+
+    /// Records the link symbol `symbol`, never replacing an entry symbol by a
+    /// non-entry one.
+    fn export_as(&mut self, symbol: &'a str) {
+        if !self.link_symbol.is_some_and(is_entry_leaf_symbol) {
+            self.link_symbol = Some(symbol);
+        }
+    }
+
+    /// Applies one attribute body (without `#[…]`); `fuel` bounds the nesting
+    /// of `cfg_attr`.
+    fn apply_attribute(&mut self, body: &'a str, fuel: usize) {
+        let body = body.trim();
+        if let Some(args) = cfg_attr_arguments(body) {
+            // Skip the predicate, then apply every conditional attribute.
+            let (_, mut rest) = split_top_level_comma(args);
+            if fuel == 0 {
+                // Nested too deeply to follow: assume the worst.
+                self.has_entry_attr |= rest.is_some();
+                return;
+            }
+            while let Some(attrs) = rest {
+                let (attr, tail) = split_top_level_comma(attrs);
+                self.apply_attribute(attr, fuel - 1);
+                rest = tail;
+            }
+            return;
+        }
+        if is_entry_attribute(body) {
+            self.has_entry_attr = true;
+        }
+        let inner = strip_unsafe_wrapper(body);
+        if inner == "no_mangle" {
+            let leaf = path_segment_count_and_leaf(self.def_path).1;
+            if self.link_symbol.is_none() || is_entry_leaf_symbol(leaf) {
+                self.link_symbol = Some(leaf);
+            }
+        } else if let Some((symbol, is_raw)) = export_name_literal(inner) {
+            if is_raw || !symbol.contains('\\') {
+                self.export_as(symbol);
+            } else if let Some(entry) = escaped_entry_symbol(symbol) {
+                self.export_as(entry);
+            }
+        }
+    }
+}
+
+/// Maximum nesting of `cfg_attr(…, cfg_attr(…, …))` followed by
+/// [`EntryPointDescriptor::with_attributes`]; deeper nests fail closed.
+const MAX_CFG_ATTR_DEPTH: usize = 8;
+
+/// Returns `true` when a crate-level attribute (with or without `#![…]`)
+/// makes the crate `#![no_main]`, directly or as a conditional attribute of
+/// `cfg_attr` (the predicate may hold in the configuration that ships).
+pub fn is_no_main_attribute(attribute: &str) -> bool {
+    fn declares_no_main(body: &str, fuel: usize) -> bool {
+        let body = body.trim();
+        let Some(args) = cfg_attr_arguments(body) else {
+            return body == "no_main";
+        };
+        let (_, mut rest) = split_top_level_comma(args);
+        if fuel == 0 {
+            // Nested too deeply to follow: assume the worst.
+            return rest.is_some();
+        }
+        while let Some(attrs) = rest {
+            let (attr, tail) = split_top_level_comma(attrs);
+            if declares_no_main(attr, fuel - 1) {
+                return true;
+            }
+            rest = tail;
+        }
+        false
+    }
+    declares_no_main(attribute_body(attribute), MAX_CFG_ATTR_DEPTH)
+}
+
+/// Returns the argument list of a `cfg_attr(…)` attribute body.
+fn cfg_attr_arguments(body: &str) -> Option<&str> {
+    body.strip_prefix("cfg_attr")
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.trim_end().strip_suffix(')'))
+}
+
+/// Splits `args` at its first top-level comma (outside brackets and
+/// literals): returns the text before it and, when there is one, the text
+/// after it.
+fn split_top_level_comma(args: &str) -> (&str, Option<&str>) {
+    let mut lexer = SpecLexer::new(args, SpecSyntax::Rust);
+    let mut depth = 0u32;
+    loop {
+        match lexer.next_tok() {
+            Ok(Some(SpecTok::Sym("(" | "[" | "{"))) => depth += 1,
+            Ok(Some(SpecTok::Sym(")" | "]" | "}"))) => depth = depth.saturating_sub(1),
+            Ok(Some(SpecTok::Sym(","))) if depth == 0 => {
+                // `lexer.pos` is right after the one-byte comma.
+                return (&args[..lexer.pos - 1], Some(&args[lexer.pos..]));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return (args, None),
+        }
+    }
+}
+
+/// Returns `true` when the body of a non-raw Rust string literal decodes to
+/// exactly `target` (`"\x5fstart"` and `"\u{5f}start"` decode to `_start`).
+/// Malformed escapes decode to nothing.
+fn escaped_literal_decodes_to(raw: &str, target: &str) -> bool {
+    let mut chars = raw.chars();
+    let mut expected = target.chars();
+    while let Some(ch) = chars.next() {
+        let decoded = if ch == '\\' {
+            match chars.next() {
+                Some('n') => '\n',
+                Some('r') => '\r',
+                Some('t') => '\t',
+                Some('0') => '\0',
+                Some(quoted @ ('\\' | '\'' | '"')) => quoted,
+                Some('x') => {
+                    let hi = chars.next().and_then(|c| c.to_digit(16));
+                    let lo = chars.next().and_then(|c| c.to_digit(16));
+                    match (hi, lo) {
+                        (Some(hi), Some(lo)) if hi < 8 => match char::from_u32(hi * 16 + lo) {
+                            Some(c) => c,
+                            None => return false,
+                        },
+                        _ => return false,
+                    }
+                }
+                Some('u') => {
+                    if chars.next() != Some('{') {
+                        return false;
+                    }
+                    let mut value = 0u32;
+                    let mut digits = 0u32;
+                    loop {
+                        match chars.next() {
+                            Some('}') => break,
+                            Some('_') if digits > 0 => {}
+                            Some(c) => match c.to_digit(16) {
+                                Some(digit) if digits < 6 => {
+                                    value = value * 16 + digit;
+                                    digits += 1;
+                                }
+                                _ => return false,
+                            },
+                            None => return false,
+                        }
+                    }
+                    match char::from_u32(value) {
+                        Some(c) if digits > 0 => c,
+                        _ => return false,
+                    }
+                }
+                Some('\n' | '\r') => {
+                    // Line continuation: the newline and the whitespace that
+                    // follows it are dropped.
+                    loop {
+                        let mut look = chars.clone();
+                        match look.next() {
+                            Some(' ' | '\t' | '\n' | '\r') => chars = look,
+                            _ => break,
+                        }
+                    }
+                    continue;
+                }
+                _ => return false,
+            }
+        } else {
+            ch
+        };
+        if expected.next() != Some(decoded) {
+            return false;
+        }
+    }
+    expected.next().is_none()
+}
+
+/// The entry link symbol an escaped string-literal body decodes to, if any.
+fn escaped_entry_symbol(raw: &str) -> Option<&'static str> {
+    ["main", "_start", "__start"]
+        .into_iter()
+        .find(|target| escaped_literal_decodes_to(raw, target))
 }
 
 /// Strips whitespace and an optional `#[…]` / `#![…]` wrapper from an
@@ -4263,9 +4458,11 @@ fn strip_unsafe_wrapper(body: &str) -> &str {
         .map_or(body, str::trim)
 }
 
-/// Extracts `sym` from `export_name = "sym"`, `export_name = r"sym"`, or
-/// `export_name = r#"sym"#`, rejecting trailing tokens after the literal.
-fn export_name_symbol(body: &str) -> Option<&str> {
+/// Extracts the literal of `export_name = "sym"`, `export_name = r"sym"`, or
+/// `export_name = r#"sym"#`, rejecting trailing tokens after it. Returns the
+/// text between the quotes and whether the literal is raw (a non-raw literal
+/// may contain escape sequences).
+fn export_name_literal(body: &str) -> Option<(&str, bool)> {
     let rest = body.strip_prefix("export_name")?.trim_start();
     let rest = rest.strip_prefix('=')?.trim_start();
     if let Some(after_r) = rest.strip_prefix('r') {
@@ -4287,7 +4484,10 @@ fn export_name_symbol(body: &str) -> Option<&str> {
                 }
                 if closing == hashes {
                     let after = &after_r[idx + 1 + hashes..];
-                    return after.trim().is_empty().then_some(&after_r[content_start..idx]);
+                    return after
+                        .trim()
+                        .is_empty()
+                        .then_some((&after_r[content_start..idx], true));
                 }
             }
             idx += 1;
@@ -4295,12 +4495,22 @@ fn export_name_symbol(body: &str) -> Option<&str> {
         return None;
     }
     let rest = rest.strip_prefix('"')?;
-    let end = rest.find('"')?;
+    // Find the closing quote, stepping over escaped characters.
+    let bytes = rest.as_bytes();
+    let mut end = 0usize;
+    loop {
+        match bytes.get(end) {
+            Some(b'"') => break,
+            Some(b'\\') => end += 2,
+            Some(_) => end += 1,
+            None => return None,
+        }
+    }
     let after = &rest[end + 1..];
     if !after.trim().is_empty() {
         return None;
     }
-    Some(&rest[..end])
+    Some((&rest[..end], false))
 }
 
 /// Returns `true` when the attribute body (without `#[…]`) names an entry
@@ -4437,7 +4647,9 @@ pub fn classify_entry_path(def_path: &str, crate_no_main: bool) -> Option<EntryP
 
 /// Classifies an item as a binary entry point (`classifyEntryPoint` in Lean):
 ///
-/// 1. an associated function is never an entry point;
+/// 1. an associated function is an entry point only when it is exported
+///    under the link symbol `main`, `_start`, or `__start` (the linker does
+///    not see Rust namespaces); its path and attributes never make it one;
 /// 2. an entry attribute makes the item an [`EntryPointKind::EntryAttribute`]
 ///    entry point;
 /// 3. an exported link symbol `main`, `_start`, or `__start` is an
@@ -4445,15 +4657,14 @@ pub fn classify_entry_path(def_path: &str, crate_no_main: bool) -> Option<EntryP
 /// 4. otherwise the crate-root items `main` (always) and `_start` / `__start`
 ///    (under `#![no_main]`) are entry points.
 pub fn classify_entry_point(desc: &EntryPointDescriptor<'_>) -> Option<EntryPointKind> {
+    let exported_entry_symbol = desc.link_symbol.is_some_and(is_entry_leaf_symbol);
     if desc.is_assoc_fn {
-        return None;
+        return exported_entry_symbol.then_some(EntryPointKind::NoMainStart);
     }
     if desc.has_entry_attr {
         return Some(EntryPointKind::EntryAttribute);
     }
-    if let Some(symbol) = desc.link_symbol
-        && is_entry_leaf_symbol(symbol)
-    {
+    if exported_entry_symbol {
         return Some(EntryPointKind::NoMainStart);
     }
     classify_entry_path(desc.def_path, desc.crate_no_main)
@@ -5114,15 +5325,35 @@ fn is_wildcard_payload_word(word: &str) -> bool {
     }
 }
 
-/// One pattern alternative of a match arm (the text between two `|`).
+/// Returns `true` when `word`, standing alone as a pattern alternative, binds
+/// every value: `_`, `_rest`, `e`, `other`. Capitalized names (constructors,
+/// constants), numeric and boolean literals, and the lowercase Lean
+/// constructors of `Option`, `List`, `Nat`, and `Unit` are specific patterns.
+fn is_catch_all_binder_word(word: &str) -> bool {
+    if matches!(
+        word,
+        "true" | "false" | "none" | "some" | "nil" | "zero" | "unit"
+    ) {
+        return false;
+    }
+    word.chars()
+        .next()
+        .is_some_and(|first| first == '_' || first.is_lowercase())
+}
+
+/// One pattern alternative of a match arm (the text between two `|`), or the
+/// arm body that follows `=>`.
 #[derive(Clone, Copy, Debug, Default)]
 struct ArmAlternative {
-    /// Brackets opened and not yet closed inside this alternative.
+    /// Brackets opened and not yet closed around the scan position.
     depth: u32,
     /// Number of tokens.
     tokens: u32,
-    /// The alternative is exactly the catch-all `_` so far.
-    only_underscore: bool,
+    /// The alternative is exactly a catch-all so far: `_`, a bare binding
+    /// (`e`, `other`), or a binding behind `ref` / `mut`.
+    catch_all: bool,
+    /// Every token so far is a `ref` / `mut` binding modifier.
+    only_modifiers: bool,
     /// Innermost error constructor seen.
     error_ctor: Option<ErrorCtor>,
     /// Bracket depth at which `error_ctor` was encountered.
@@ -5135,8 +5366,39 @@ struct ArmAlternative {
     /// The alternative began right after `=>`: it is an arm body, not a
     /// pattern.
     after_arrow: bool,
+    /// Bracket depth at which the arm body began. A `|` at this depth ends
+    /// the body and starts the next arm; a deeper `|` belongs to the body
+    /// (`(a ||| b)`, a Rust closure `|x| …`).
+    body_depth: u32,
     /// Scanning a Lean `fun … =>` lambda binder list rather than a match arm.
     in_lambda: bool,
+}
+
+impl ArmAlternative {
+    /// A fresh pattern alternative at bracket depth `depth`.
+    fn pattern(depth: u32) -> Self {
+        Self {
+            depth,
+            ..Self::default()
+        }
+    }
+
+    /// An arm body beginning at bracket depth `depth`.
+    fn body(depth: u32) -> Self {
+        Self {
+            depth,
+            after_arrow: true,
+            body_depth: depth,
+            ..Self::default()
+        }
+    }
+
+    /// Records a pattern token that is not an identifier.
+    fn push_non_word(&mut self) {
+        self.tokens += 1;
+        self.catch_all = false;
+        self.only_modifiers = false;
+    }
 }
 
 /// Accumulated facts about the alternatives of the arm being scanned.
@@ -5145,7 +5407,7 @@ struct ArmState {
     /// First alternative that accepts an error constructor with an
     /// unconstrained payload.
     wildcard: Option<ErrorCtor>,
-    /// Some alternative is the catch-all `_`.
+    /// Some alternative is a catch-all (`_` or a bare binding).
     catch_all: bool,
     /// A Rust `if` guard follows the pattern.
     guarded: bool,
@@ -5166,13 +5428,143 @@ impl ArmState {
         {
             self.wildcard = Some(ctor);
         }
-        if alt.only_underscore && alt.tokens == 1 {
+        if alt.catch_all {
             self.catch_all = true;
         }
     }
 
     const fn guard_blocks(&self) -> bool {
         self.guarded && !(self.guard_tokens == 1 && self.guard_trivial)
+    }
+}
+
+/// Kind of a scope tracked for [`ErrorWildcardPattern::CatchAllArmTrue`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OkScopeKind {
+    /// A `{ … }` block; `saved_depth` is the bracket depth around it,
+    /// restored when the block closes.
+    Brace { saved_depth: u32 },
+    /// The arms of a Lean `match … with` opened at bracket depth `depth`.
+    /// A Lean match has no terminator: its arms extend to the bracket
+    /// closing that depth, to the brace closing the enclosing block, or to
+    /// the next declaration.
+    LeanMatch { depth: u32 },
+}
+
+/// One entry of [`OkScopes`].
+#[derive(Clone, Copy, Debug)]
+struct OkScope {
+    kind: OkScopeKind,
+    /// The scope matched an `Ok` constructor.
+    saw_ok: bool,
+}
+
+/// Maximum nested `{ … }` / Lean `match … with` scopes tracked for
+/// `CatchAllArmTrue`.
+const MAX_OK_SCOPE_DEPTH: usize = 32;
+
+/// Fixed-capacity stack of the scopes enclosing the scan position. A
+/// catch-all arm is an error wildcard only when its own scope also matches an
+/// `Ok` constructor, so an inner `match n { 0 => false, _ => true }` never
+/// inherits the `Ok` of the result match around it.
+#[derive(Clone, Copy, Debug)]
+struct OkScopes {
+    /// `saw_ok` of the outermost (unbracketed) scope.
+    root_saw_ok: bool,
+    stack: [OkScope; MAX_OK_SCOPE_DEPTH],
+    len: usize,
+    /// Brace scopes opened beyond the capacity of `stack`.
+    overflow: u32,
+}
+
+impl OkScopes {
+    const fn new() -> Self {
+        Self {
+            root_saw_ok: false,
+            stack: [OkScope {
+                kind: OkScopeKind::Brace { saved_depth: 0 },
+                saw_ok: false,
+            }; MAX_OK_SCOPE_DEPTH],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    /// Records an `Ok` constructor in the innermost scope.
+    fn mark_ok(&mut self) {
+        if self.overflow > 0 {
+            return;
+        }
+        match self.len {
+            0 => self.root_saw_ok = true,
+            len => self.stack[len - 1].saw_ok = true,
+        }
+    }
+
+    /// Whether the innermost scope matched an `Ok` constructor. Scopes nested
+    /// beyond the tracked capacity answer `true` (fail closed).
+    fn saw_ok(&self) -> bool {
+        self.overflow > 0
+            || match self.len {
+                0 => self.root_saw_ok,
+                len => self.stack[len - 1].saw_ok,
+            }
+    }
+
+    fn push(&mut self, kind: OkScopeKind) {
+        if self.len < MAX_OK_SCOPE_DEPTH {
+            self.stack[self.len] = OkScope {
+                kind,
+                saw_ok: false,
+            };
+            self.len += 1;
+        } else if matches!(kind, OkScopeKind::Brace { .. }) {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+
+    /// Closes the innermost brace scope above `floor`, together with the Lean
+    /// matches opened inside it, and returns the bracket depth to restore.
+    /// Returns `None` when no brace scope is open above `floor`.
+    fn pop_brace(&mut self, floor: usize) -> Option<u32> {
+        if self.overflow > 0 {
+            self.overflow -= 1;
+            return Some(0);
+        }
+        let mut idx = self.len;
+        while idx > floor {
+            idx -= 1;
+            if let OkScopeKind::Brace { saved_depth } = self.stack[idx].kind {
+                self.len = idx;
+                return Some(saved_depth);
+            }
+        }
+        None
+    }
+
+    /// Closes the innermost Lean matches opened at a bracket depth of at
+    /// least `min_depth`.
+    fn close_lean_matches(&mut self, min_depth: u32) {
+        if self.overflow > 0 {
+            return;
+        }
+        while self.len > 0
+            && matches!(
+                self.stack[self.len - 1].kind,
+                OkScopeKind::LeanMatch { depth } if depth >= min_depth
+            )
+        {
+            self.len -= 1;
+        }
+    }
+
+    /// A new top-level declaration begins: every open Lean match ends, and
+    /// the outermost scope forgets the `Ok` of the previous declaration.
+    fn begin_declaration(&mut self) {
+        self.close_lean_matches(0);
+        if self.len == 0 && self.overflow == 0 {
+            self.root_saw_ok = false;
+        }
     }
 }
 
@@ -5231,11 +5623,9 @@ fn is_constraining_continuation(tok: SpecTok<'_>) -> bool {
 /// Maximum number of `&&` / `∧` terms unfolded in a trivially-true arm body.
 const MAX_TRIVIAL_CONJUNCTS: usize = 8;
 
-/// Maximum nested `{` / Lean `(match …)` scopes tracked for `CatchAllArmTrue`.
-const MAX_OK_SCOPE_DEPTH: usize = 32;
-
 /// Consumes one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
-/// `!false`, `¬False`, `Not False`, optionally followed by `as bool`).
+/// `!false`, `¬False`, `Not False`, optionally followed by `as bool` or,
+/// inside parentheses, by a `: Prop` / `: Bool` ascription).
 /// Returns `Ok(true)` iff such an atom was consumed; `look` is left right
 /// after it.
 fn consume_trivial_true_atom(look: &mut SpecLexer<'_>) -> Result<bool, SpecScanError> {
@@ -5269,6 +5659,18 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>) -> Result<bool, SpecScanE
     {
         *look = probe;
     }
+    // Consume an optional `(True : Prop)` type ascription.
+    if parens > 0 {
+        let mut probe = *look;
+        if matches!(probe.next_tok()?, Some(SpecTok::Sym(":")))
+            && matches!(
+                probe.next_tok()?,
+                Some(SpecTok::Word("Prop" | "Bool" | "bool"))
+            )
+        {
+            *look = probe;
+        }
+    }
     // Handle `true || …` / `True ∨ …` inside an open paren/brace wrapper.
     if parens > 0 || braces > 0 {
         let mut after = *look;
@@ -5284,6 +5686,17 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>) -> Result<bool, SpecScanE
                     SpecTok::Sym("(" | "[" | "{") => inner += 1,
                     SpecTok::Sym(")") if inner > 0 => inner -= 1,
                     SpecTok::Sym("]" | "}") if inner > 0 => inner -= 1,
+                    SpecTok::Sym(";") if inner == 0 => {
+                        // A statement boundary: the disjunction is the value
+                        // of the block only when the block ends right here
+                        // (`{ return true || p; }`, not `{ true || p; false }`).
+                        if braces > 0 && matches!(after.next_tok()?, Some(SpecTok::Sym("}"))) {
+                            braces -= 1;
+                            *look = after;
+                            break;
+                        }
+                        return Ok(false);
+                    }
                     SpecTok::Sym(")") if parens > 0 => {
                         parens -= 1;
                         *look = after;
@@ -5379,7 +5792,19 @@ fn is_lean_decl_reset_word(word: &str) -> bool {
 /// `.fail`) whose payload is unconstrained (`_`, `..`, a bare binding, or a
 /// Lean type ascription `(_ : E)`) and its body is trivially true (`true`,
 /// `True`, `trivial`, `!false`, `¬False`, possibly parenthesized or in a
-/// disjunction). `matches!(…, … | Err(_))` is a wildcard without a body.
+/// disjunction). `matches!(…, … | Err(_))` is a wildcard without a body, and
+/// a catch-all arm (`_ => true`, `e => true`) is one when its own match also
+/// has an `Ok` arm. Arms are found at any bracket depth
+/// (`P ∧ (match r with | .ok v => … | .err _ => True)`), and each component
+/// of a tuple pattern or Lean multi-discriminant arm is judged on its own
+/// (`(Err(_), Ok(_)) => true`).
+///
+/// The scanner is syntactic: it reads `match` arms and `matches!`. An error
+/// escape written without them (`out.map_or(true, …)`,
+/// `out.is_err() || …`, `if let Ok(v) = out { … } else { true }`,
+/// `∀ v, out = .ok v → …`) is caught by the dynamic probes of
+/// [`check_result_contract_no_error_wildcard`] and
+/// [`check_semantic_outcome_no_error_wildcard`], not here.
 ///
 /// An arm that constrains the payload (`Err(E::Overflow) => …`,
 /// `Err(Unsupported) => …`, `| .err .ub => …`), has a non-trivial `if` guard,
@@ -5389,16 +5814,15 @@ pub fn scan_error_branch_wildcard(
     post_src: &str,
     syntax: SpecSyntax,
 ) -> Result<Option<ErrorWildcardPattern>, SpecScanError> {
+    let lean_keywords = !matches!(syntax, SpecSyntax::Rust);
     let mut lexer = SpecLexer::new(post_src, syntax);
     let mut alt = ArmAlternative::default();
     let mut arm = ArmState::default();
     let mut matches_state = MatchesState::Outside;
     let mut matches_saw_ok = false;
+    let mut matches_scope_floor = 0usize;
     let mut after_dot = false;
-    let mut ok_scopes = [false; MAX_OK_SCOPE_DEPTH];
-    let mut ok_depth = 0usize;
-    let mut lean_match_paren_depths = [0u32; MAX_OK_SCOPE_DEPTH];
-    let mut lean_match_paren_len = 0usize;
+    let mut scopes = OkScopes::new();
 
     while let Some(tok) = lexer.next_tok()? {
         let was_after_dot = after_dot;
@@ -5420,6 +5844,7 @@ pub fn scan_error_branch_wildcard(
                 SpecTok::Sym(",") if depth == 1 => {
                     matches_state = MatchesState::Pattern;
                     matches_saw_ok = false;
+                    matches_scope_floor = scopes.len;
                     alt = ArmAlternative::default();
                     arm = ArmState::default();
                 }
@@ -5430,52 +5855,60 @@ pub fn scan_error_branch_wildcard(
 
         match tok {
             SpecTok::FatArrow => {
-                if alt.in_lambda {
-                    arm = ArmState::default();
-                    alt = ArmAlternative {
-                        depth: alt.depth,
-                        after_arrow: true,
-                        ..ArmAlternative::default()
-                    };
-                    continue;
-                }
-                arm.absorb(&alt);
-                if !arm.guard_blocks() && arm_body_is_trivially_true(lexer)? {
-                    if let Some(ctor) = arm.wildcard {
-                        return Ok(Some(ctor.pattern()));
-                    }
-                    let scope_saw_ok = ok_scopes[ok_depth.min(MAX_OK_SCOPE_DEPTH - 1)];
-                    if arm.catch_all && scope_saw_ok {
-                        return Ok(Some(ErrorWildcardPattern::CatchAllArmTrue));
+                if !alt.in_lambda {
+                    arm.absorb(&alt);
+                    if !arm.guard_blocks() && arm_body_is_trivially_true(lexer)? {
+                        if let Some(ctor) = arm.wildcard {
+                            return Ok(Some(ctor.pattern()));
+                        }
+                        if arm.catch_all && scopes.saw_ok() {
+                            return Ok(Some(ErrorWildcardPattern::CatchAllArmTrue));
+                        }
                     }
                 }
                 arm = ArmState::default();
-                alt = ArmAlternative {
-                    depth: alt.depth,
-                    after_arrow: true,
-                    ..ArmAlternative::default()
-                };
+                alt = ArmAlternative::body(alt.depth);
             }
-            SpecTok::Sym("|") if !arm.guarded && (alt.depth == 0 || !alt.after_arrow) => {
+            SpecTok::Sym("|")
+                if !arm.guarded && (!alt.after_arrow || alt.depth == alt.body_depth) =>
+            {
                 if alt.after_arrow {
                     // The previous arm's body ends here: it is not a pattern.
                     arm = ArmState::default();
-                    alt = ArmAlternative::default();
+                    alt = ArmAlternative::pattern(alt.depth);
                 } else {
                     arm.absorb(&alt);
-                    if alt.error_ctor_depth.is_some_and(|d| alt.depth > d) {
-                        // Or-pattern inside an error payload (`Err(E::A | _)`).
-                        alt.constrained = false;
-                        alt.only_underscore = false;
-                        alt.type_ascription_depth = None;
-                    } else {
-                        // Top-level or nested or-pattern (`Some(Err(_) | Ok(0))`).
-                        alt = ArmAlternative {
-                            depth: alt.depth,
-                            ..ArmAlternative::default()
-                        };
+                    match alt.error_ctor_depth {
+                        Some(ctor_depth) if alt.depth > ctor_depth => {
+                            // Or-pattern inside an error payload. Directly
+                            // under the constructor (`Err(E::A | _)`) the
+                            // next alternative starts unconstrained; deeper
+                            // (`Err(Wrap(E::A | _))`) the enclosing
+                            // constructor still constrains the payload.
+                            alt.push_non_word();
+                            if alt.depth == ctor_depth + 1 {
+                                alt.constrained = false;
+                                alt.type_ascription_depth = None;
+                            }
+                        }
+                        // Top-level or nested or-pattern
+                        // (`Some(Err(_) | Ok(0))`).
+                        _ => alt = ArmAlternative::pattern(alt.depth),
                     }
                 }
+            }
+            SpecTok::Sym(",")
+                if !arm.guarded
+                    && !alt.after_arrow
+                    && !alt.in_lambda
+                    && alt.error_ctor_depth.is_some_and(|d| alt.depth <= d) =>
+            {
+                // A sibling of the error constructor, not part of its
+                // payload: the next tuple component (`(Err(_), Ok(_))`) or
+                // Lean discriminant (`| .err _, .ok v`). Its constructors
+                // must not constrain the payload already scanned.
+                arm.absorb(&alt);
+                alt = ArmAlternative::pattern(alt.depth);
             }
             SpecTok::Sym("," | ";") if alt.depth == 0 => {
                 if matches_state == MatchesState::Pattern {
@@ -5493,19 +5926,17 @@ pub fn scan_error_branch_wildcard(
             }
             SpecTok::Sym("(" | "[") => {
                 alt.depth += 1;
-                alt.tokens += 1;
-                alt.only_underscore = false;
+                alt.push_non_word();
             }
             SpecTok::Sym("{") => {
                 if alt.error_ctor.is_some() && !alt.after_arrow && !arm.guarded {
                     // Struct pattern inside an error payload.
                     alt.depth += 1;
-                    alt.tokens += 1;
+                    alt.push_non_word();
                 } else {
-                    ok_depth = ok_depth.saturating_add(1);
-                    if ok_depth < MAX_OK_SCOPE_DEPTH {
-                        ok_scopes[ok_depth] = false;
-                    }
+                    scopes.push(OkScopeKind::Brace {
+                        saved_depth: alt.depth,
+                    });
                     arm = ArmState::default();
                     alt = ArmAlternative::default();
                 }
@@ -5513,18 +5944,31 @@ pub fn scan_error_branch_wildcard(
             SpecTok::Sym(")" | "]" | "}") => {
                 if alt.depth > 0 {
                     alt.depth -= 1;
-                    alt.tokens += 1;
+                    alt.push_non_word();
                     if alt.type_ascription_depth.is_some_and(|d| alt.depth < d) {
                         alt.type_ascription_depth = None;
                     }
-                    if tok == SpecTok::Sym(")")
-                        && lean_match_paren_len > 0
-                        && lean_match_paren_depths[lean_match_paren_len - 1] > alt.depth
-                    {
-                        lean_match_paren_len -= 1;
-                        ok_depth = ok_depth.saturating_sub(1);
+                    if alt.after_arrow && alt.depth < alt.body_depth {
+                        // The bracket around the arm list closed: what
+                        // follows continues the enclosing body.
+                        alt.body_depth = alt.depth;
                     }
+                    scopes.close_lean_matches(alt.depth + 1);
+                } else if tok == SpecTok::Sym("}")
+                    && let Some(saved_depth) =
+                        scopes.pop_brace(if matches_state == MatchesState::Pattern {
+                            matches_scope_floor
+                        } else {
+                            0
+                        })
+                {
+                    // The block closed: a new arm pattern may follow
+                    // (`Ok(v) => { … } Err(_) => true`).
+                    arm = ArmState::default();
+                    alt = ArmAlternative::pattern(saved_depth);
                 } else {
+                    // The closer of a bracket opened before the scanned
+                    // text, or of `matches!(…)`.
                     if matches_state == MatchesState::Pattern {
                         arm.absorb(&alt);
                         if !arm.guard_blocks()
@@ -5534,27 +5978,21 @@ pub fn scan_error_branch_wildcard(
                         }
                         matches_state = MatchesState::Outside;
                     }
-                    if tok == SpecTok::Sym("}") {
-                        ok_depth = ok_depth.saturating_sub(1);
-                    }
+                    scopes.close_lean_matches(0);
                     arm = ArmState::default();
                     alt = ArmAlternative::default();
                 }
             }
             SpecTok::Sym(":=") => {
                 arm = ArmState::default();
-                alt = ArmAlternative {
-                    depth: alt.depth,
-                    after_arrow: true,
-                    ..ArmAlternative::default()
-                };
+                alt = ArmAlternative::body(alt.depth);
             }
             SpecTok::Word(word) => {
                 if word == "Ok" || (was_after_dot && word == "ok") {
                     if matches_state == MatchesState::Pattern {
                         matches_saw_ok = true;
-                    } else if ok_depth < MAX_OK_SCOPE_DEPTH {
-                        ok_scopes[ok_depth] = true;
+                    } else {
+                        scopes.mark_ok();
                     }
                 }
                 if word == "matches" && matches_state == MatchesState::Outside {
@@ -5569,45 +6007,30 @@ pub fn scan_error_branch_wildcard(
                     }
                 }
                 if !arm.guarded && alt.depth == 0 && is_lean_decl_reset_word(word) {
-                    if ok_depth == 0 {
-                        ok_scopes[0] = false;
-                    }
+                    scopes.begin_declaration();
                     arm = ArmState::default();
                     alt = ArmAlternative::default();
                     continue;
                 }
                 if !arm.guarded
-                    && !matches!(syntax, SpecSyntax::Rust)
+                    && lean_keywords
                     && word == "fun"
                     && alt.error_ctor.is_none()
                     && (alt.after_arrow || alt.tokens == 0)
                 {
                     arm = ArmState::default();
                     alt = ArmAlternative {
-                        depth: alt.depth,
                         in_lambda: true,
-                        ..ArmAlternative::default()
+                        ..ArmAlternative::pattern(alt.depth)
                     };
                     continue;
                 }
                 if !arm.guarded && matches!(word, "match" | "with") {
-                    if word == "match"
-                        && alt.depth > 0
-                        && !matches!(syntax, SpecSyntax::Rust)
-                        && lean_match_paren_len < MAX_OK_SCOPE_DEPTH
-                    {
-                        lean_match_paren_depths[lean_match_paren_len] = alt.depth;
-                        lean_match_paren_len += 1;
-                        ok_depth = ok_depth.saturating_add(1);
-                        if ok_depth < MAX_OK_SCOPE_DEPTH {
-                            ok_scopes[ok_depth] = false;
-                        }
+                    if word == "with" && lean_keywords {
+                        scopes.push(OkScopeKind::LeanMatch { depth: alt.depth });
                     }
                     arm = ArmState::default();
-                    alt = ArmAlternative {
-                        depth: alt.depth,
-                        ..ArmAlternative::default()
-                    };
+                    alt = ArmAlternative::pattern(alt.depth);
                     continue;
                 }
                 if arm.guarded {
@@ -5618,7 +6041,9 @@ pub fn scan_error_branch_wildcard(
                     alt = ArmAlternative::default();
                     arm.guarded = true;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.only_underscore = alt.tokens == 0 && word == "_";
+                    let leading = alt.tokens == 0 || alt.only_modifiers;
+                    alt.catch_all = leading && is_catch_all_binder_word(word);
+                    alt.only_modifiers = leading && matches!(word, "ref" | "mut");
                     alt.tokens += 1;
                     if alt.type_ascription_depth.is_some() {
                         continue;
@@ -5650,8 +6075,7 @@ pub fn scan_error_branch_wildcard(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.tokens += 1;
-                    alt.only_underscore = false;
+                    alt.push_non_word();
                     if alt.error_ctor.is_some() && alt.type_ascription_depth.is_none() {
                         alt.constrained = true;
                     }
@@ -5662,8 +6086,7 @@ pub fn scan_error_branch_wildcard(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.tokens += 1;
-                    alt.only_underscore = false;
+                    alt.push_non_word();
                     if tok == SpecTok::Sym(":")
                         && alt.error_ctor.is_some()
                         && !alt.constrained
@@ -6581,7 +7004,7 @@ mod spec_boundary_guard_tests {
     #[test]
     fn entry_point_classification_matches_lean_vectors() {
         use EntryPointKind::{EntryAttribute, Main, NoMainStart};
-        let vectors: [(EntryPointDescriptor<'static>, Option<EntryPointKind>); 34] = [
+        let vectors: [(EntryPointDescriptor<'static>, Option<EntryPointKind>); 38] = [
             (desc("main"), Some(Main)),
             (desc("::main"), Some(Main)),
             (desc("my_crate::main"), Some(Main)),
@@ -6640,6 +7063,31 @@ mod spec_boundary_guard_tests {
                 desc("my_crate::Type::run")
                     .with_assoc_fn(true)
                     .with_entry_attr(true),
+                None,
+            ),
+            (
+                desc("my_crate::Boot::_start")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("_start")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::Server::main")
+                    .with_assoc_fn(true)
+                    .with_entry_attr(true)
+                    .with_link_symbol(Some("main")),
+                Some(NoMainStart),
+            ),
+            (
+                desc("my_crate::Boot::run")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("run")),
+                None,
+            ),
+            (
+                desc("my_crate::Boot::main")
+                    .with_assoc_fn(true)
+                    .with_link_symbol(Some("boot_main")),
                 None,
             ),
             (desc("my_crate::Type::main"), None),
@@ -6756,11 +7204,173 @@ mod spec_boundary_guard_tests {
         assert_eq!(classify_entry_point(&tokio_main), Some(EntryAttribute));
         assert_eq!(classify_entry_point(&desc("app::main")), Some(Main));
 
-        // A method stays a non-entry point whatever attributes it carries.
+        // A method is not an entry point by its path or an entry attribute…
         let method = desc("app::Server::main")
             .with_assoc_fn(true)
-            .with_attributes(&["#[entry]", "#[no_mangle]"]);
+            .with_attributes(&["#[entry]", "#[inline]"]);
         assert_eq!(classify_entry_point(&method), None);
+        let exported_method = desc("app::Server::run")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[no_mangle]"]);
+        assert_eq!(classify_entry_point(&exported_method), None);
+        // …but the linker does not see Rust namespaces: exported as `main`
+        // or `_start` it is the entry symbol of the binary.
+        let no_mangle_method = desc("app::Server::main")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[no_mangle]"]);
+        assert_eq!(no_mangle_method.link_symbol, Some("main"));
+        assert_eq!(classify_entry_point(&no_mangle_method), Some(NoMainStart));
+        let exported_start = desc("fw::Boot::reset")
+            .with_assoc_fn(true)
+            .with_attributes(&["#[unsafe(export_name = \"_start\")]"]);
+        assert_eq!(classify_entry_point(&exported_start), Some(NoMainStart));
+    }
+
+    #[test]
+    fn conditional_attributes_count_as_present() {
+        use EntryPointKind::{EntryAttribute, NoMainStart};
+        for attrs in [
+            &["#[cfg_attr(not(test), no_mangle)]"][..],
+            &["#[cfg_attr(not(test), unsafe(no_mangle))]"],
+            &["#[cfg_attr(target_os = \"none\", inline, no_mangle)]"],
+            &["#[cfg_attr(all(a, any(b, c)), cfg_attr(d, no_mangle))]"],
+            &["#[ cfg_attr ( feature = \"rt,x\" , no_mangle , ) ]"],
+            &["#[inline]", "#[cfg_attr(not(test), no_mangle)]"],
+        ] {
+            let start = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(start.link_symbol, Some("_start"), "{attrs:?}");
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[cfg_attr(not(test), export_name = \"_start\")]"][..],
+            &[
+                "#[cfg_attr(a, export_name = \"boot\")]",
+                "#[cfg_attr(not(a), export_name = \"__start\")]",
+            ],
+            &[
+                "#[cfg_attr(not(a), export_name = \"main\")]",
+                "#[cfg_attr(a, export_name = \"boot\")]",
+            ],
+            &["#[export_name = \"main\"]", "#[no_mangle]"],
+        ] {
+            let boot = desc("fw::arch::boot").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[cfg_attr(not(test), entry)]"][..],
+            &["#[cfg_attr(not(test), cortex_m_rt::entry)]"],
+            &["#[cfg_attr(feature = \"rt\", tokio::main(flavor = \"current_thread\"))]"],
+        ] {
+            let reset = desc("fw::reset").with_attributes(attrs);
+            assert!(reset.has_entry_attr, "{attrs:?}");
+            assert_eq!(
+                classify_entry_point(&reset),
+                Some(EntryAttribute),
+                "{attrs:?}"
+            );
+        }
+        // The predicate itself is never an attribute, and a `cfg_attr`
+        // without attributes adds nothing.
+        for attrs in [
+            &["#[cfg_attr(entry, inline)]"][..],
+            &["#[cfg_attr(no_mangle, inline)]"],
+            &["#[cfg_attr(main)]"],
+            &["#[cfg_attr(feature = \"entry, no_mangle\", inline)]"],
+            &["#[cfg(not(test))]"],
+            &["#[cfg_attrs(a, entry)]"],
+        ] {
+            let helper = desc("fw::arch::_start").with_attributes(attrs);
+            assert!(!helper.has_entry_attr, "{attrs:?}");
+            assert_eq!(helper.link_symbol, None, "{attrs:?}");
+            assert_eq!(classify_entry_point(&helper), None, "{attrs:?}");
+        }
+        // Nesting beyond the followed depth fails closed.
+        let mut nested = std::string::String::from("no_mangle");
+        for _ in 0..=MAX_CFG_ATTR_DEPTH {
+            nested = std::format!("cfg_attr(a, {nested})");
+        }
+        let deep = desc("fw::helper").with_attributes(&[nested.as_str()]);
+        assert_eq!(classify_entry_point(&deep), Some(EntryAttribute));
+    }
+
+    #[test]
+    fn crate_attributes_derive_no_main() {
+        use EntryPointKind::NoMainStart;
+        for attr in [
+            "#![no_main]",
+            "no_main",
+            "#![cfg_attr(not(test), no_main)]",
+            "#![cfg_attr(target_os = \"none\", no_std, no_main)]",
+            "#![cfg_attr(a, cfg_attr(b, no_main))]",
+        ] {
+            assert!(is_no_main_attribute(attr), "{attr}");
+            let start = desc("fw::_start").with_crate_attributes(&["#![no_std]", attr]);
+            assert!(start.crate_no_main, "{attr}");
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attr}");
+        }
+        for attr in [
+            "#![no_std]",
+            "#![cfg_attr(no_main, no_std)]",
+            "#![cfg_attr(feature = \"x, no_main\", no_std)]",
+            "#![no_main_please]",
+            "#![doc = \"no_main\"]",
+            "",
+        ] {
+            assert!(!is_no_main_attribute(attr), "{attr}");
+            let start = desc("fw::_start").with_crate_attributes(&[attr]);
+            assert!(!start.crate_no_main, "{attr}");
+            assert_eq!(classify_entry_point(&start), None, "{attr}");
+        }
+        // Attributes only ever add the fact.
+        let kept = desc("fw::_start")
+            .with_crate_no_main(true)
+            .with_crate_attributes(&["#![no_std]"]);
+        assert!(kept.crate_no_main);
+    }
+
+    #[test]
+    fn escaped_export_names_are_decoded() {
+        use EntryPointKind::NoMainStart;
+        for (attr, symbol) in [
+            ("#[export_name = \"\\x5fstart\"]", "_start"),
+            ("#[export_name = \"\\u{5f}start\"]", "_start"),
+            ("#[export_name = \"\\u{00_5F}\\x5Fstart\"]", "__start"),
+            ("#[export_name = \"m\\x61in\"]", "main"),
+            ("#[export_name = \"ma\\\n      in\"]", "main"),
+            ("#[unsafe(export_name = \"\\u{6d}ain\")]", "main"),
+            (
+                "#[cfg_attr(not(test), export_name = \"_st\\x61rt\")]",
+                "_start",
+            ),
+        ] {
+            let boot = desc("fw::boot").with_attributes(&[attr]);
+            assert_eq!(boot.link_symbol, Some(symbol), "{attr}");
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attr}");
+        }
+        for attr in [
+            // Escapes that decode to another name, or to nothing.
+            "#[export_name = \"\\x5fstar\\x74ed\"]",
+            "#[export_name = \"\\x5f\\x5f\\x5fstart\"]",
+            "#[export_name = \"\\nmain\"]",
+            "#[export_name = \"main\\0\"]",
+            "#[export_name = \"\\xffstart\"]",
+            "#[export_name = \"\\u{}main\"]",
+            "#[export_name = \"\\u{110000}main\"]",
+            "#[export_name = \"\\qmain\"]",
+            // A raw literal has no escapes: this exports the 8 characters.
+            "#[export_name = r\"\\x5fstart\"]",
+            "#[export_name = \"_start\\\"\" extra]",
+        ] {
+            let helper = desc("fw::helper").with_attributes(&[attr]);
+            assert_eq!(classify_entry_point(&helper), None, "{attr}");
+        }
+        assert!(escaped_literal_decodes_to("\\x5fstart", "_start"));
+        assert!(escaped_literal_decodes_to("_start", "_start"));
+        assert!(!escaped_literal_decodes_to("_start", "__start"));
+        assert!(!escaped_literal_decodes_to("__start", "_start"));
+        assert!(!escaped_literal_decodes_to("", "main"));
+        assert_eq!(escaped_entry_symbol("\\x6dain"), Some("main"));
+        assert_eq!(escaped_entry_symbol("\\x6dain_loop"), None);
     }
 
     // ---- Guard 1: trivial `requires` lexer ---------------------------------
@@ -6897,10 +7507,7 @@ mod spec_boundary_guard_tests {
         assert!(!RequiresClause::rust("True").is_syntactically_trivial());
         assert!(!RequiresClause::lean("true").is_syntactically_trivial());
         // Lean primed identifier `b'` must not fail as an unclosed byte literal.
-        assert_eq!(
-            scan_trivial_requires("b' = 1", SpecSyntax::Lean),
-            Ok(false)
-        );
+        assert_eq!(scan_trivial_requires("b' = 1", SpecSyntax::Lean), Ok(false));
         assert_eq!(scan_trivial_requires("b' = 1", SpecSyntax::Any), Ok(false));
         assert_eq!(
             scan_trivial_requires("b' = 1", SpecSyntax::Rust),
@@ -7498,6 +8105,261 @@ mod spec_boundary_guard_tests {
         assert_eq!(
             scan_error_branch_wildcard(lean, SpecSyntax::Rust),
             Ok(Some(ErrorWildcardPattern::ErrArmTrue))
+        );
+    }
+
+    /// Regression vectors shared byte-for-byte by `anneal_spec::spec_check`
+    /// and `cargo_anneal::property_registry` (the two crates cannot depend on
+    /// each other): `(dialect, source, wire tag of the first finding)`, where
+    /// an empty tag means "no finding".
+    const WILDCARD_PARITY_VECTORS: &[(&str, &str, &str)] = &[
+        // A parenthesized or bracketed Lean `match` has arms below depth 0.
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "any",
+            "(match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "P ∧ (match r with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "fun x out => (match out with | .ok v => v = x + 1 | .ub => True)",
+            "ub_arm_true",
+        ),
+        (
+            "lean",
+            "def post (x : Nat) (out : Outcome) : Prop :=\n  (match out with\n  | .ok v => v = x\n  | .unsupported => True)",
+            "unsupported_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | _ => True)",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "[match r with | .ok v => v = 1 | .err _ => True]",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "(fun out => match out with | .ok v => v = 1 | .err _ => True)",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => (match v with | 0 => False | _ => True) ∧ Q | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => xs.all (fun x => x ||| 1 = v) | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | .err e => e = 2) ∧ (match q with | 0 => False | _ => True)",
+            "",
+        ),
+        // A Lean `match` without parentheses owns every later arm.
+        (
+            "lean",
+            "match out with | .err e => e = .a | .ok v => match v with | 0 => False | _ => True",
+            "",
+        ),
+        (
+            "lean",
+            "match out with | .err e => e = .a | .ok v => match v with | 0 => False | n => True",
+            "",
+        ),
+        (
+            "lean",
+            "match out with | .ok v => { s with a := v } = t | _ => True",
+            "catch_all_arm_true",
+        ),
+        // Tuple components and Lean discriminants are siblings, not payloads.
+        ("rust", "(Err(_), Err(_)) => true", "err_arm_true"),
+        ("rust", "(Err(_), Ok(_)) => true", "err_arm_true"),
+        ("rust", "(Err(E::A), Err(_)) => true", "err_arm_true"),
+        ("rust", "(Err(_), Err(E::A)) => true", "err_arm_true"),
+        ("rust", "Wrap(Err(_), 3) => true", "err_arm_true"),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (Err(_), _) | (_, Err(_)) => true }",
+            "err_arm_true",
+        ),
+        ("lean", "| .err _, .ok v => True", "err_arm_true"),
+        ("lean", "| .ok v, .err _ => True", "err_arm_true"),
+        ("lean", "| .err .a, .ok v => True", ""),
+        ("rust", "(Err(E::A), Err(E::B)) => true", ""),
+        ("rust", "Err((_, E::A)) => true", ""),
+        // A bare binding is a catch-all exactly like `_`.
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, _e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => *v == 1, ref other => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { *v == 1 } e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { *v == 1 } Err(_) => true }",
+            "err_arm_true",
+        ),
+        ("lean", "| .ok v => v = 1 | e => True", "catch_all_arm_true"),
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | _e => True",
+            "catch_all_arm_true",
+        ),
+        ("rust", "match x { 0 => out == 1, n => true }", ""),
+        ("rust", "match out { Ok(v) => *v == 1, MAX => true }", ""),
+        (
+            "rust",
+            "match out { Ok(v) => match v.kind { Kind::A => true, other => true }, Err(e) => *e == E::A }",
+            "",
+        ),
+        (
+            "lean",
+            "match x with | some (.ok v) => v = 1 | none => True",
+            "",
+        ),
+        (
+            "lean",
+            "| .ok v => f (fun e => True) | .err e => e = .a",
+            "",
+        ),
+        // Scopes: a block restores the bracket depth around it, and neither
+        // dialect leaks a nested scope into the arms that follow it.
+        (
+            "any",
+            "match out { Ok(v) => (match v { 0 => false, _ => true }), _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "matches!(out, Ok(Foo { x: 1 }) | Err(_))",
+            "matches_any_err",
+        ),
+        (
+            "rust",
+            "fn f() -> bool { matches!{out, Err(_)} }",
+            "matches_any_err",
+        ),
+        ("rust", "matches!(out, Ok(Foo { x: 1 }) | Err(E::A))", ""),
+        // Lean raw strings: a backslash does not escape the closing quote.
+        (
+            "lean",
+            "| .ok v => v = r\"\\\" ∧ True | .err _ => True -- \"",
+            "err_arm_true",
+        ),
+        (
+            "any",
+            "| .ok v => v = r\"\\\" ∧ True | .err _ => True -- \"",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => v = r\"| .err _ => True\" | .err e => e = .a",
+            "",
+        ),
+        (
+            "lean",
+            "| .ok v => v = r#\"\"| .err _ => True\"\"# | .err e => e = .a",
+            "",
+        ),
+        // Trivially-true bodies.
+        ("lean", "| .err _ => (True : Prop)", "err_arm_true"),
+        ("rust", "Err(_) => { return true || p; }", "err_arm_true"),
+        ("rust", "Err(_) => { true || p; false }", ""),
+        ("lean", "| .err _ => (True : Prop) ∧ x = 3", ""),
+        // An or-pattern below a payload constructor stays constrained.
+        ("rust", "Err(Wrap(E::A | _)) => true", ""),
+        ("rust", "Err(Wrap(E::A) | _) => true", "err_arm_true"),
+        ("lean", "| .err (.a | _) => True", "err_arm_true"),
+        ("lean", "| .err (.wrap (.a | _)) => True", ""),
+    ];
+
+    #[test]
+    fn wildcard_scanner_agrees_with_the_parity_vectors() {
+        for (dialect, src, expected) in WILDCARD_PARITY_VECTORS {
+            let syntax = match *dialect {
+                "rust" => SpecSyntax::Rust,
+                "lean" => SpecSyntax::Lean,
+                "any" => SpecSyntax::Any,
+                other => panic!("unknown dialect {other:?}"),
+            };
+            let found = scan_error_branch_wildcard(src, syntax)
+                .expect("parity vectors are well-formed")
+                .map_or("", ErrorWildcardPattern::as_str);
+            assert_eq!(found, *expected, "{dialect}: {src:?}");
+        }
+    }
+
+    #[test]
+    fn wildcard_scanner_scope_tracking_is_bounded_and_fails_closed() {
+        use std::string::String;
+        let depth = MAX_OK_SCOPE_DEPTH + 8;
+        let opens = "{ ".repeat(depth);
+        let closes = " }".repeat(depth);
+        // Beyond the tracked capacity a catch-all is reported (fail closed).
+        let deep = std::format!("{opens}match x {{ 0 => false, _ => true }}{closes}");
+        assert_eq!(
+            detect_error_branch_wildcard(&deep),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        // The stack unwinds: after the nest, scopes are tracked exactly again.
+        let after = std::format!("{opens}{closes} match y {{ 0 => false, _ => true }}");
+        assert_eq!(detect_error_branch_wildcard(&after), None);
+        let after_ok = std::format!("{opens}{closes} match out {{ Ok(v) => *v == 1, _ => true }}");
+        assert_eq!(
+            detect_error_branch_wildcard(&after_ok),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        // Sequential Lean matches never accumulate scopes.
+        let mut many = String::new();
+        for _ in 0..(4 * MAX_OK_SCOPE_DEPTH) {
+            many.push_str("(match a with | 0 => False | _ => True) ∧ ");
+        }
+        let clean = std::format!("{many}(match r with | .ok v => v = 1 | .err e => e = 2)");
+        assert_eq!(
+            scan_error_branch_wildcard(&clean, SpecSyntax::Lean),
+            Ok(None)
+        );
+        let dirty = std::format!("{many}(match r with | .ok v => v = 1 | _ => True)");
+        assert_eq!(
+            scan_error_branch_wildcard(&dirty, SpecSyntax::Lean),
+            Ok(Some(ErrorWildcardPattern::CatchAllArmTrue))
+        );
+        // Closers of brackets opened before the snippet are tolerated.
+        assert_eq!(
+            detect_error_branch_wildcard("} ) ] } match out { Ok(v) => *v == 1, _ => true }"),
+            Some(ErrorWildcardPattern::CatchAllArmTrue)
+        );
+        assert_eq!(
+            detect_error_branch_wildcard("} ) ] } match x { 0 => false, _ => true }"),
+            None
         );
     }
 

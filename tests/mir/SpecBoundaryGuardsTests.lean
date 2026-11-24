@@ -197,6 +197,13 @@ def entryClassificationVectors : List (EntryPointDescriptor × Option EntryPoint
     ({ defPath := "my_crate::Type::main", isAssocFn := true }, none),
     ({ defPath := "Type::main", isAssocFn := true }, none),
     ({ defPath := "my_crate::Type::run", isAssocFn := true, hasEntryAttr := true }, none),
+    ({ defPath := "my_crate::Boot::_start", isAssocFn := true, linkSymbol := some "_start" },
+      some .noMainStart),
+    ({ defPath := "my_crate::Server::main", isAssocFn := true, hasEntryAttr := true,
+       linkSymbol := some "main" }, some .noMainStart),
+    ({ defPath := "my_crate::Boot::run", isAssocFn := true, linkSymbol := some "run" }, none),
+    ({ defPath := "my_crate::Boot::main", isAssocFn := true, linkSymbol := some "boot_main" },
+      none),
     ({ defPath := "my_crate::Type::main" }, none),
     ({ defPath := "<MyType as Trait>::main" }, none),
     ({ defPath := "<impl Foo>::main" }, none),
@@ -220,6 +227,32 @@ theorem classifyEntryPath_sound_on_vectors :
       (classifyEntryPath v.1.defPath v.1.crateNoMain).isNone ||
         isBinaryEntrySymbol v.1.defPath) = true := by
   decide
+
+/-- The linker does not see Rust namespaces: an associated function exported as
+    `_start` is the entry symbol of the binary, whatever its path. -/
+theorem exported_assocFn_start_is_entry :
+    classifyEntryPoint
+        { defPath := "fw::Boot::reset", isAssocFn := true, linkSymbol := some "_start" } =
+      some .noMainStart :=
+  classifyEntryPoint_assocFn_exported rfl rfl (by decide)
+
+/-- Every descriptor exported under `main` is an entry point: no combination of
+    the other facts hides it. -/
+theorem exported_main_is_always_entry (defPath : String) (noMain attr assoc : Bool) :
+    (classifyEntryPoint
+        { defPath := defPath, crateNoMain := noMain, hasEntryAttr := attr,
+          linkSymbol := some "main", isAssocFn := assoc }).isSome = true :=
+  classifyEntryPoint_isSome_of_exported_entry_symbol rfl (by decide)
+
+/-- Fail-closed negative: an unexported method named `main` is not an entry point,
+    and neither is one exported under an ordinary symbol. -/
+theorem unexported_method_main_is_not_entry :
+    classifyEntryPoint { defPath := "app::Server::main", isAssocFn := true } = none ∧
+      classifyEntryPoint
+          { defPath := "app::Server::main", isAssocFn := true, hasEntryAttr := true,
+            linkSymbol := some "server_main" } = none :=
+  ⟨classifyEntryPoint_assocFn rfl rfl,
+    classifyEntryPoint_assocFn_of_non_entry_symbol rfl rfl (by decide)⟩
 
 /-! ### 2.2 The Collapse on `main`, `_start`, and `__start` -/
 
@@ -748,6 +781,7 @@ run_cmd do
   for flagship in
       [``Anneal.SpecBoundaryGuards.PropertyClassTag.asStr_injective,
         ``Anneal.SpecBoundaryGuards.SpecBoundaryGuardClass.guardId_injective,
+        ``Anneal.SpecBoundaryGuards.classifyEntryPoint_isSome_of_exported_entry_symbol,
         ``Anneal.SpecBoundaryGuards.claimClosedProgramSafe_of_guard,
         ``Anneal.SpecBoundaryGuards.statefulClaimClosedProgramSafe_of_guard,
         ``Anneal.SpecBoundaryGuards.totalClaimClosedProgramTotal_of_guard,

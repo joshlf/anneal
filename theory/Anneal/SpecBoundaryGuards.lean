@@ -719,7 +719,9 @@ def classifyEntryPath (defPath : String) (crateNoMain : Bool) : Option EntryPoin
 /-- Classify an item as a binary entry point
     (`anneal_spec::spec_check::classify_entry_point`):
 
-    1. an associated function is never an entry point;
+    1. an associated function is an entry point only when it is exported under
+       the link symbol `main`, `_start`, or `__start` (the linker does not see
+       Rust namespaces); its path and attributes never make it one;
     2. an entry attribute makes the item a `customEntryAttr` entry point;
     3. an exported link symbol `main`, `_start`, or `__start` is a `noMainStart`
        entry point;
@@ -727,7 +729,9 @@ def classifyEntryPath (defPath : String) (crateNoMain : Bool) : Option EntryPoin
        (under `#![no_main]`) are entry points. -/
 def classifyEntryPoint (d : EntryPointDescriptor) : Option EntryPointKind :=
   if d.isAssocFn then
-    none
+    match d.linkSymbol with
+    | some sym => if isEntryLeafSymbol sym then some .noMainStart else none
+    | none => none
   else if d.hasEntryAttr then
     some .customEntryAttr
   else
@@ -737,10 +741,34 @@ def classifyEntryPoint (d : EntryPointDescriptor) : Option EntryPointKind :=
       else classifyEntryPath d.defPath d.crateNoMain
     | none => classifyEntryPath d.defPath d.crateNoMain
 
-/-- An associated function is never classified as an entry point. -/
-theorem classifyEntryPoint_assocFn {d : EntryPointDescriptor} (h : d.isAssocFn = true) :
-    classifyEntryPoint d = none := by
-  simp [classifyEntryPoint, h]
+/-- An associated function that is not exported is never an entry point, whatever
+    its path (`Type::main`) and attributes. -/
+theorem classifyEntryPoint_assocFn {d : EntryPointDescriptor} (h : d.isAssocFn = true)
+    (hSym : d.linkSymbol = none) : classifyEntryPoint d = none := by
+  simp [classifyEntryPoint, h, hSym]
+
+/-- An associated function exported under a non-entry symbol is not an entry
+    point. -/
+theorem classifyEntryPoint_assocFn_of_non_entry_symbol {d : EntryPointDescriptor}
+    {sym : String} (h : d.isAssocFn = true) (hSym : d.linkSymbol = some sym)
+    (hLeaf : isEntryLeafSymbol sym = false) : classifyEntryPoint d = none := by
+  simp [classifyEntryPoint, h, hSym, hLeaf]
+
+/-- The linker does not see Rust namespaces or attributes: any item exported under
+    `main`, `_start`, or `__start` is classified as an entry point, including an
+    associated function (`impl Boot { #[no_mangle] extern "C" fn _start() }`). -/
+theorem classifyEntryPoint_isSome_of_exported_entry_symbol {d : EntryPointDescriptor}
+    {sym : String} (hSym : d.linkSymbol = some sym) (hLeaf : isEntryLeafSymbol sym = true) :
+    (classifyEntryPoint d).isSome = true := by
+  unfold classifyEntryPoint
+  cases hAssoc : d.isAssocFn <;> cases hAttr : d.hasEntryAttr <;> simp [hSym, hLeaf]
+
+/-- An exported associated function is classified exactly by its link symbol. -/
+theorem classifyEntryPoint_assocFn_exported {d : EntryPointDescriptor} {sym : String}
+    (h : d.isAssocFn = true) (hSym : d.linkSymbol = some sym)
+    (hLeaf : isEntryLeafSymbol sym = true) :
+    classifyEntryPoint d = some .noMainStart := by
+  simp [classifyEntryPoint, h, hSym, hLeaf]
 
 /-- Whatever leaf `classifyEntryLeaf` accepts is an entry link symbol. -/
 theorem isEntryLeafSymbol_of_classifyEntryLeaf {leaf : String} {crateNoMain : Bool}
