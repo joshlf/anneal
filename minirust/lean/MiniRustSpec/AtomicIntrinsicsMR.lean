@@ -3006,6 +3006,41 @@ theorem evalArgsM_tail_error {m m1 : Machine M} {e : ValueExpr} {es : List Value
     evalArgsM m (e :: es) = .error err := by
   simp only [evalArgsM, he, hes, interp_ok_bind, interp_error_bind]
 
+/-- General left-to-right error inversion of `evalArgsM`, generalizing
+`evalArgsM_head_error` and `evalArgsM_tail_error`: `es` stops with `err` from `m`
+iff `es = pre ++ e :: post`, `pre` evaluates to `(vals, m1)`, and `e` stops from `m1`. -/
+theorem evalArgsM_error_iff {m : Machine M} {es : List ValueExpr} {err : Stop} :
+    evalArgsM m es = .error err ↔
+      ∃ pre e post vals m1, es = pre ++ e :: post ∧
+        evalArgsM m pre = .ok (vals, m1) ∧ evalValueM m1 e = .error err := by
+  constructor
+  · intro h; revert h
+    induction es generalizing m with
+    | nil => intro h; dsimp only [evalArgsM] at h; cases h
+    | cons e es ih =>
+      intro h; dsimp only [evalArgsM] at h
+      rcases interp_bind_eq_error h with he | ⟨⟨arg, m1⟩, he, htail⟩
+      · exact ⟨[], e, es, [], m, rfl, rfl, he⟩
+      · dsimp only at htail
+        rcases interp_bind_eq_error htail with hes | ⟨⟨_, _⟩, _, hpure⟩
+        · obtain ⟨pre, e', post, vals, m2, rfl, hpre, herr⟩ := @ih m1 hes
+          have hcons : evalArgsM m (e :: pre) = pure (arg :: vals, m2) := by
+            simp only [evalArgsM, he, hpre, interp_ok_bind]
+          exact ⟨e :: pre, e', post, arg :: vals, m2, rfl, hcons, herr⟩
+        · dsimp only at hpure; cases hpure
+  · rintro ⟨pre, e, post, vals, m1, rfl, hpre, herr⟩; revert hpre
+    induction pre generalizing m vals with
+    | nil =>
+      intro hpre; dsimp only [evalArgsM] at hpre
+      obtain ⟨_, hm⟩ := Prod.mk.inj (interp_pure_eq_ok hpre); subst hm
+      exact evalArgsM_head_error herr
+    | cons a pre ih =>
+      intro hpre; dsimp only [evalArgsM] at hpre
+      obtain ⟨⟨arg, m'⟩, ha, hpre⟩ := interp_bind_eq_ok hpre; dsimp only at hpre
+      obtain ⟨⟨rest, m''⟩, hrest, hpure⟩ := interp_bind_eq_ok hpre; dsimp only at hpure
+      obtain ⟨_, hm⟩ := Prod.mk.inj (interp_pure_eq_ok hpure); subst hm
+      exact evalArgsM_tail_error ha (@ih m' rest hrest)
+
 /-- After `eval_place` succeeds, a `Stop` of `evalArgsM` stops the terminator
 before `eval_intrinsic`, `place_store`, or `next_block` run (no atomic access). -/
 theorem evalTerminatorM_intrinsic_args_error {m m1 : Machine M} {op : IntrinsicOp}
@@ -5240,8 +5275,9 @@ def deadPtrExpr : ValueExpr := .AddrOf (.Local (lname 2)) (.Raw .None)
 def divZeroExpr : ValueExpr := .BinOp (.Int .Div) (constU32 1) (constU32 0)
 
 /-- Left-to-right argument faults on `Mach` and `MachTB`: `arg[0]` (`deadPtrExpr`)
-beats `arg[1]` (`divZeroExpr`); when `arg[0]` (`&_0`, `Frozen`) succeeds, `arg[1]`
-stops before `AtomicStore` runs (zero atomic access, preempting `Frozen`-write UB). -/
+beats `arg[1]` (`divZeroExpr`); when `arg[0]` (`&_0`) succeeds, `arg[1]` stops
+before `AtomicStore` runs (zero atomic access; on `MachTB`, where `&_0` is
+`Frozen`, this also preempts `Frozen`-write UB). -/
 theorem argFaultAtomicFn_order :
     stopOf (steps 3 (bmStart (argFaultAtomicFn deadPtrExpr divZeroExpr)) >>= step) =
       some (.ub "access to a dead local") ∧
@@ -5257,20 +5293,26 @@ theorem argFaultAtomicFn_order :
 
 /-- Scalar summary of an integer atomic at `t` on a cell holding `cur`: the returned integer
 (`none` for the unit of `AtomicStore`) and the cell's next integer; `none` when the intrinsic
-stops (ill-formed arguments, arithmetic UB, or a stored integer that `t` cannot represent). -/
+stops (non-atomic width, ill-formed arguments or loaded `cur`, arithmetic UB, or a stored
+integer that `t` cannot represent). -/
 def atomicScalar (op : IntrinsicOp) (t : IntType) (cur : Int) (args : List Int) :
     Option (Option Int × Int) :=
+  let okWidth :=
+    (alignFromBytes t.size.bytes).isSome && decide (t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
   let stored (ret : Option Int) (n : Int) : Option (Option Int × Int) :=
-    if IntType.can_represent t n then some (ret, n) else none
+    if okWidth && IntType.can_represent t n then some (ret, n) else none
   match op, args with
   | .AtomicStore, [v] => stored none v
-  | .AtomicLoad, [] => some (some cur, cur)
+  | .AtomicLoad, [] => stored (some cur) cur
   | .AtomicCompareExchange, [before, next] =>
-    if cur = before then stored (some cur) next else some (some cur, cur)
+    if !IntType.can_represent t cur then none
+    else if cur = before then stored (some cur) next else stored (some cur) cur
   | .AtomicFetchAndOp binOp, [o] =>
-    match evalIntBinOp binOp cur o t with
-    | .ok n => stored (some cur) n
-    | .error _ => none
+    if !IntType.can_represent t cur then none
+    else
+      match evalIntBinOp binOp cur o t with
+      | .ok n => stored (some cur) n
+      | .error _ => none
   | _, _ => none
 
 /-- Integer atomics on a `u32` cell holding `5`, in and out of range, each with the summary
@@ -5350,6 +5392,62 @@ theorem atomic_int2ptr_scalar :
         (scalarCall TBM evalIntrinsicM .AtomicStore [9])) =
       some (.ub "Tree Borrows: local write of Frozen reference") := by
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- `IntType` of `i8`. -/
+@[reducible] def itI8 : IntType := ⟨.Signed, ⟨1⟩⟩
+
+/-- Signed negative atomic cases on `-5` at `i8`/`i32`/`i64`: store/load, CAS, `Add`/`Sub`/
+`BitAnd`/`BitOr`/`BitXor`, and sign-extending floor-division `Shr` (`-5 >> 1 = -3`). -/
+def signedNegCases : List (IntrinsicOp × List Int × Option (Option Int × Int)) :=
+  [(.AtomicStore, [-128], some (none, -128)), (.AtomicLoad, [], some (some (-5), -5)),
+   (.AtomicCompareExchange, [-5, -3], some (some (-5), -3)),
+   (.AtomicCompareExchange, [-6, -3], some (some (-5), -5)),
+   (.AtomicFetchAndOp .Add, [-3], some (some (-5), -8)),
+   (.AtomicFetchAndOp .Sub, [-2], some (some (-5), -3)),
+   (.AtomicFetchAndOp .BitAnd, [-2], some (some (-5), -6)),
+   (.AtomicFetchAndOp .BitOr, [-2], some (some (-5), -1)),
+   (.AtomicFetchAndOp .BitXor, [-2], some (some (-5), 5)),
+   (.AtomicFetchAndOp .BitXor, [3], some (some (-5), -8)),
+   (.AtomicFetchAndOp .Shr, [1], some (some (-5), -3))]
+
+/-- Whether `ev` agrees with `signedNegCases` and `atomicScalar` at signed `t` after storing `-5`. -/
+def signedNegAgrees (M : Type) [Memory M] {S : Type}
+    (ev : S → IntrinsicOp → List (Value M × «Type») → «Type» → Interp (Value M × S))
+    (m : S) (p : ThinPointer (Memory.Provenance M)) (t : IntType) : Bool :=
+  let call (op : IntrinsicOp) (args : List Int) (s : S) :=
+    ev s op ((.Ptr ⟨p, none⟩, tyRawPtr) :: args.map fun (i : Int) => (.Int i, .Int t))
+      (match op with | .AtomicStore => unitType | _ => .Int t)
+  match call .AtomicStore [-5] m with
+  | .error _ => false
+  | .ok (_, m0) =>
+    signedNegCases.all fun c =>
+      let obs := match call c.1 c.2.1 m0 with
+        | .error _ => none
+        | .ok (v, m') => match v, call .AtomicLoad [] m' with
+          | .Int i, .ok (.Int k, _) => some (some i, k)
+          | _, .ok (.Int k, _) => some (none, k)
+          | _, _ => none
+      atomicScalar c.1 t (-5) c.2.1 == c.2.2 && obs == c.2.2
+
+/-- Signed negative two's-complement atomics across `i8`/`i32`/`i64` on `Mach` and `MachTB`
+(`i8` bytes, negative CAS, bitwise/arithmetic RMW, and sign-extending `Shr`), plus `atomicScalar`
+width and representability guards matching `evalIntrinsic`. -/
+theorem atomic_signed_neg_and_scalar_guards :
+    bmObs (bmStoreLoad (.Int (-5)) (.Int itI8) (.Int itI8)) =
+      bmRoundTrip (.Int (-5)) (initBytes [0xFB]) ∧
+    tbObs (tbStoreLoad (.Int (-5)) (.Int itI8) (.Int itI8)) =
+      tbRoundTrip (.Int (-5)) (initBytes [0xFB]) ∧
+    [itI8, itI32, itI64].all (signedNegAgrees BM evalIntrinsic (bmWith []) bmPtr) = true ∧
+    [itI8, itI32, itI64].all (signedNegAgrees TBM evalIntrinsicM (tbWith []) tbPtr) = true ∧
+    atomicScalar .AtomicLoad itU128 5 [] = none ∧
+    stopOf (bmLoad (bmWith []) bmPtr (.Int itU128)) =
+      some (.ub "invalid return type for `AtomicLoad` intrinsic: size too big") ∧
+    atomicScalar .AtomicStore ⟨.Signed, ⟨3⟩⟩ 0 [0] = none ∧
+    atomicScalar .AtomicLoad itI8 128 [] = none ∧
+    atomicScalar (.AtomicFetchAndOp .Add) itI8 (-128) [-1] = none ∧
+    stopOf (bmRmw (bmWith (initBytes [0x80])) bmPtr .Add (-1) itI8) =
+      some (.specPanic "trying to store a value which is ill-formed for its type") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ## §5. Vacuity and axiom audit
 
