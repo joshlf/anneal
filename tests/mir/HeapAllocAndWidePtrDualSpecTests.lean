@@ -33,7 +33,11 @@ in §2.
    `Eq.refl Bool.true` certificates for `lmAuthorityCheck`,
    `lmLifecycleTraceAuthorityCheck`, and the mode-sensitive
    `lmProtectorTraceAuthorityCheck` (on the kernel-evaluable `…U` twins, transported to
-   the source observers along their kernel-checked `eq_src` equations), the closed
+   the source observers along their kernel-checked `eq_src` equations), a universal
+   3-way permission correspondence (`trustedPreventsDeallocation_eq_miri`,
+   `mrPreventsDeallocation_eq_miri`: Anneal `preventsDeallocation` = MiniRust
+   `prevents_deallocation` = "vendored protected foreign write
+   `Miri.TreeBorrows.performAccess` newly disables", for EVERY permission), the closed
    `HeapWideDualContract` and capstone, root-package witnesses re-instantiated,
    ≥ 12 kernel-rejected forgeries, axiom / self-test audits, and 3-way transitive
    reachability to `MiniRustSpec.Interp`, vendored `Miri.*`, and
@@ -476,6 +480,88 @@ run_cmd do
       addThm outName v.type (mkConst src)
       added := added.push outName
 
+    -- 5b. Universal 3-way PERMISSION correspondence Trusted ↔ MiniRust ↔ vendored Miri (only
+    -- statable here: DualSpec may not import `Miri.*`). Anneal's `TreeBorrowPerm` is embedded
+    -- into `Miri.TreeBorrows.Permission` by `casesOn` (zero mocks), and `preventsDeallocation`
+    -- is proved EQUAL, for every permission, to "the vendored protected foreign write
+    -- `Miri.TreeBorrows.performAccess .Write .ForeignAccess q true` newly disables `q` (or is
+    -- the fail-closed `ImpossibleProtectedReservedIM`)" — the foreign write a deallocation
+    -- performs on a strongly protected child (cases `19`, `22`).
+    let elabIn (src : String) (expected? : Option Expr := none) : CoreM Expr := do
+      let stx ← match Lean.Parser.runParserCategory (← getEnv) `term src with
+        | .ok stx => pure stx
+        | .error e => throwError "cross-root parse error: {e}"
+      MetaM.run' <| Lean.Elab.Term.TermElabM.run' do
+        let e ← Lean.Elab.Term.elabTermEnsuringType stx expected?
+        Lean.Elab.Term.synthesizeSyntheticMVarsNoPostponing
+        let e ← instantiateMVars e
+        if e.hasMVar then throwError "cross-root: unresolved metavariables in {src}"
+        pure e
+    let tbp := "Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm"
+    let mp := "Miri.TreeBorrows.Permission"
+    let mkEmbed (swapCellFrozen : Bool) : String :=
+      s!"fun (p : {tbp}) => @{tbp}.casesOn (fun _ => {mp}) p " ++
+      (if swapCellFrozen then s!"{mp}.Frozen" else s!"{mp}.Cell") ++
+      s!" (fun c => {mp}.ReservedFrz c) {mp}.ReservedIM {mp}.Unique " ++
+      (if swapCellFrozen then s!"{mp}.Cell" else s!"{mp}.Frozen") ++ s!" {mp}.Disabled"
+    let embedName := ns ++ `embedTrustedPermInMiri
+    addDef embedName (← elabIn (mkEmbed false))
+    let embedForgedName := ns ++ `embedTrustedPermInMiriForged
+    addDef embedForgedName (← elabIn (mkEmbed true))
+    let blocksName := ns ++ `miriProtectedForeignWriteBlocks
+    addDef blocksName (← elabIn (s!"fun (q : {mp}) => @Miri.TreeBorrows.AccessOutcome.casesOn " ++
+      "(fun _ => Bool) (Miri.TreeBorrows.performAccess Miri.TreeBorrows.AccessKind.Write " ++
+      "Miri.TreeBorrows.AccessRelatedness.ForeignAccess q Bool.true) " ++
+      s!"(fun r => Bool.and ({mp}.isDisabled r) (Bool.not ({mp}.isDisabled q))) Bool.true Bool.true"))
+    -- (`importModules` loads no environment extensions, so only builtin syntax is available:
+    -- no `=`/`!`/`[..]` notation, no instances; everything is spelled with explicit constants.)
+    let prev := "Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation"
+    let motiveBody (x : String) : String := s!"Eq ({prev} {x}) ({blocksName} ({embedName} {x}))"
+    let permEqTy ← elabIn s!"∀ p : {tbp}, {motiveBody "p"}" (some (mkSort .zero))
+    let permEqPf ← elabIn (s!"fun (p : {tbp}) => @{tbp}.casesOn (fun (p : {tbp}) => {motiveBody "p"}) p " ++
+      s!"(Eq.refl Bool.false) (fun (c : Bool) => @Bool.casesOn (fun (c : Bool) => " ++
+      s!"{motiveBody s!"({tbp}.reservedFrz c)"}) c (Eq.refl Bool.true) (Eq.refl Bool.true)) " ++
+      "(Eq.refl Bool.true) (Eq.refl Bool.true) (Eq.refl Bool.true) (Eq.refl Bool.false)") (some permEqTy)
+    let permEqName := ns ++ `trustedPreventsDeallocation_eq_miri
+    addThm permEqName permEqTy permEqPf
+    let permMrTy ← elabIn (s!"∀ p : {tbp}, Eq (MiniRustSpec.Interp.PermissionProt.prevents_deallocation " ++
+      s!"({dsNs}.trustedPermToMrProt p)) ({blocksName} ({embedName} p))") (some (mkSort .zero))
+    let permMrPf ← elabIn (s!"fun (p : {tbp}) => Eq.trans (Eq.symm ({dsNs}.preventsDeallocation_eq_mr p)) " ++
+      s!"({permEqName} p)") (some permMrTy)
+    let permMrName := ns ++ `mrPreventsDeallocation_eq_miri
+    addThm permMrName permMrTy permMrPf
+    let permCheckName := ns ++ `permCorrCheck
+    let consL (xs : List String) : String :=
+      xs.foldr (fun x acc => s!"(List.cons {x} {acc})") s!"(@List.nil {tbp})"
+    addDef permCheckName (← elabIn (s!"fun (e : {tbp} → {mp}) => List.all " ++
+      consL [s!"{tbp}.cell", s!"({tbp}.reservedFrz Bool.false)", s!"({tbp}.reservedFrz Bool.true)",
+        s!"{tbp}.reservedIM", s!"{tbp}.unique", s!"{tbp}.frozen", s!"{tbp}.disabled"] ++
+      s!" (fun (p : {tbp}) => Bool.not (Bool.xor ({prev} p) ({blocksName} (e p))))"))
+    let permCertName := ns ++ `permCorrCheckGenuine
+    addThm permCertName (eqTrue (mkApp (mkConst permCheckName) (mkConst embedName))) reflTrue
+    for n in [embedName, blocksName, permEqName, permMrName, permCheckName, permCertName] do
+      added := added.push n
+    -- The permission theorems must reach the REAL vendored Miri transition and Trusted/MR defs.
+    let reachFrom (root : Lean.Name) : CoreM NameSet := do
+      let env ← getEnv
+      let mut seen : NameSet := {}
+      let mut todo : Array Lean.Name := #[root]
+      while !todo.isEmpty do
+        let n := todo.back!
+        todo := todo.pop
+        if seen.contains n then continue
+        seen := seen.insert n
+        if let some ci := env.find? n then
+          for d in ci.getUsedConstantsAsSet do
+            if !seen.contains d then todo := todo.push d
+      return seen
+    let permReach ← reachFrom permMrName
+    for req in [`Miri.TreeBorrows.performAccess, `Miri.TreeBorrows.Permission.isDisabled,
+                `Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation,
+                `MiniRustSpec.Interp.PermissionProt.prevents_deallocation, permEqName] do
+      unless permReach.contains req do
+        throwError "cross-root permission reachability failure: {permMrName} does not reach {req}"
+
     -- 6. Negative controls on scratch copies: every boolean forgery is FIRST verified to
     -- kernel-reduce to `Bool.false` (`addDecl` ACCEPTS `= false` via `Eq.refl false`), and
     -- THEN verified to be REJECTED when claiming `= true` — proving each rejection is a
@@ -531,7 +617,9 @@ run_cmd do
         ("lifecycle trace passed to the protector check",
           "lifecycleAsProtector", mkApp (mkConst (dsNs ++ `lmProtectorTraceAuthorityCheck)) lcU),
         ("MiniRust observer passed off as LeanMiri (diverges on 28, 29)",
-          "mrAsLm", authCheckExpr mrAsLm) ]
+          "mrAsLm", authCheckExpr mrAsLm),
+        ("cell/frozen-swapped Trusted→Miri permission embedding",
+          "permSwap", mkApp (mkConst permCheckName) (mkConst embedForgedName)) ]
     let mut rejected : Nat := 0
     for (what, tag, expr) in boolForgeries do
       unless ← accepts (thm (tag ++ "IsFalse") (eqFalse expr) reflFalse) do
@@ -796,7 +884,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 88 && rejectedCount = 27 do
+  unless addedCount = 94 && rejectedCount = 28 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
