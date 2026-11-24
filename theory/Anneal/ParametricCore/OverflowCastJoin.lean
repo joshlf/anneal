@@ -1733,6 +1733,93 @@ structure OvfCastFrameOps.Lawful {S : Type u} {Val : Type v}
   asScalar?_mkScalar : ∀ (w : ScalarWidth) (n : Nat),
     n < w.modulus → fops.asScalar? w (fops.mkScalar w n) = some n
 
+/-- Signed (biased-coordinate) view of an `OvfCastFrameOps`. The tracked
+accumulator `n` is the order-preserving biased coordinate of a two's-complement
+bit pattern: `signedView.mkScalar w n` stores the bit pattern `toBiased w n`,
+whose signed value is `n - w.halfModulus`. A raw `StageIntervalSpec` `[lo, hi]`
+over `fops.signedView` is therefore exactly the signed interval
+`[lo - halfModulus, hi - halfModulus]`, including intervals that cross zero.
+Over raw bit patterns those intervals have no tight encoding: `i8 ∈ [-5, 5]`
+is the bit-pattern set `{251..255} ∪ {0..5}`. -/
+def OvfCastFrameOps.signedView {S : Type u} {Val : Type v}
+    (fops : OvfCastFrameOps S Val) : OvfCastFrameOps S Val where
+  blockOf := fops.blockOf
+  localsOf := fops.localsOf
+  withBlockLocals := fops.withBlockLocals
+  mkScalar w n := fops.mkScalar w (toBiased w n)
+  asScalar? w v :=
+    match fops.asScalar? w v with
+    | none => none
+    | some x => some (toBiased w x)
+  mkOvfTuple := fops.mkOvfTuple
+
+/-- `OvfCastFrameOps.signedView` preserves lawfulness (since `toBiased w` is an
+involution on canonical `w`-bit patterns). -/
+theorem OvfCastFrameOps.signedView_lawful {S : Type u} {Val : Type v}
+    {fops : OvfCastFrameOps S Val} (hLaw : fops.Lawful) :
+    fops.signedView.Lawful where
+  blockOf_withBlockLocals := hLaw.blockOf_withBlockLocals
+  localsOf_withBlockLocals := hLaw.localsOf_withBlockLocals
+  asScalar?_mkScalar w n hn := by
+    show (match fops.asScalar? w (fops.mkScalar w (toBiased w n)) with
+      | none => none
+      | some x => some (toBiased w x)) = some n
+    rw [hLaw.asScalar?_mkScalar w _ (toBiased_lt_modulus w n)]
+    show some (toBiased w (toBiased w n)) = some n
+    rw [toBiased_involutive, Nat.mod_eq_of_lt hn]
+
+/-- Tightened signed join interval in biased coordinates: if the accumulator
+bit pattern is `toBiased w accB` with `accB ∈ [lo, hi]` and the checked signed
+addition of `c` takes the `overflowed = false` arm with result `r`, then the
+result's biased coordinate is exactly `accB + toBiased w c - halfModulus`
+(stated without truncated subtraction) and lies in
+`[lo + toBiased w c - halfModulus, hi + toBiased w c - halfModulus]`. -/
+theorem addWithOverflowS_biased_false_interval (w : ScalarWidth)
+    {lo hi accB c r : Nat} (hAcc : accB < w.modulus)
+    (hLo : lo ≤ accB) (hHi : accB ≤ hi)
+    (h : addWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + w.halfModulus = accB + toBiased w c ∧
+    lo + toBiased w c ≤ toBiased w r + w.halfModulus ∧
+    toBiased w r + w.halfModulus ≤ hi + toBiased w c ∧
+    r < w.modulus := by
+  have hNo : (addWithOverflowS w (toBiased w accB) c).2 = false :=
+    congrArg Prod.snd h
+  have hR : (addWithOverflowS w (toBiased w accB) c).1 = r := congrArg Prod.fst h
+  have hInv : toBiased w (toBiased w accB) = accB := by
+    rw [toBiased_involutive, Nat.mod_eq_of_lt hAcc]
+  let ⟨hA, _, hBiLo, _⟩ := (addWithOverflowS_no_overflow_iff w _ c).mp hNo
+  rw [hInv] at hBiLo
+  have hEq := toBiased_addWithOverflowS_of_no_overflow w hNo
+  rw [hR, hInv] at hEq
+  have hSum : toBiased w r + w.halfModulus = accB + toBiased w c := by
+    rw [hEq, Nat.sub_add_cancel hBiLo]
+  have hRlt : r < w.modulus := by
+    rw [← hR]
+    unfold addWithOverflowS
+    exact Nat.mod_lt _ w.modulus_pos
+  refine ⟨hSum, ?_, ?_, hRlt⟩
+  · rw [hSum]; exact Nat.add_le_add_right hLo _
+  · rw [hSum]; exact Nat.add_le_add_right hHi _
+
+/-- Fail-closed signed interval certificate: a biased sum outside
+`[halfModulus, modulus + halfModulus)` (signed result outside the width's
+range) forces `overflowed = true`, so it can never reach a false-branch join. -/
+theorem addWithOverflowS_biased_overflow_of_out_of_range (w : ScalarWidth)
+    {accB c : Nat} (hAcc : accB < w.modulus)
+    (hOut : accB + toBiased w c < w.halfModulus ∨
+      w.modulus + w.halfModulus ≤ accB + toBiased w c) :
+    (addWithOverflowS w (toBiased w accB) c).2 = true := by
+  have hInv : toBiased w (toBiased w accB) = accB := by
+    rw [toBiased_involutive, Nat.mod_eq_of_lt hAcc]
+  cases hF : (addWithOverflowS w (toBiased w accB) c).2 with
+  | true => rfl
+  | false =>
+    let ⟨_, _, hBiLo, hBiHi⟩ := (addWithOverflowS_no_overflow_iff w _ c).mp hF
+    rw [hInv] at hBiLo hBiHi
+    cases hOut with
+    | inl hBelow => exact absurd hBiLo (Nat.not_le_of_gt hBelow)
+    | inr hAbove => exact absurd hBiHi (Nat.not_lt_of_ge hAbove)
+
 /-- Interval cutpoint specification at `blockIdx` for scalar width `width`:
 constrains the active accumulator to `lo ≤ acc ≤ hi < width.modulus`. -/
 structure StageIntervalSpec where
@@ -2706,6 +2793,64 @@ theorem ovfCastStageCut_checked_mul_signed_diamond {fops : OvfCastFrameOps S Val
       exact hNoOvfArm s acc wrapped hInv hLo hHi ha hc hNo hWrEq)
     (fun s acc wrapped hInv hLo hHi hOp =>
       hOvfArm s acc wrapped hInv hLo hHi hOp)
+
+/-- Signed checked-addition diamond with a SIGNED interval cutpoint (via
+`OvfCastFrameOps.signedView`): the accumulator is tracked in biased
+coordinates, so `srcSpec = [lo, hi]` may be any signed interval (including one
+that crosses zero). The `overflowed = false` arm receives the result `r`
+together with its exact biased coordinate
+`toBiased w r + halfModulus = acc + toBiased w c`, which places it in the
+tightened signed join interval
+`[lo + toBiased w c - halfModulus, hi + toBiased w c - halfModulus]`. -/
+theorem ovfCastStageCut_checked_add_signed_interval
+    {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat) (hW : srcSpec.width = w)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.signedView.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (addWithOverflowS w (toBiased w acc) c).1
+        (addWithOverflowS w (toBiased w acc) c).2))
+    (hNoOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      toBiased w r + w.halfModulus = acc + toBiased w c →
+      srcSpec.lo + toBiased w c ≤ toBiased w r + w.halfModulus →
+      toBiased w r + w.halfModulus ≤ srcSpec.hi + toBiased w c →
+      r < w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r false))
+    (hOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      addWithOverflowS w (toBiased w acc) c = (r, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r true)) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond
+    (fun acc => addWithOverflowS w (toBiased w acc) c)
+    branchState hDispatch
+    (fun s acc r hInv hLo hHi hOp => by
+      have hAccLt : acc < w.modulus := by
+        rw [← hW]
+        let ⟨_, _, _, _, hHiMod⟩ := hInv.2.2.1
+        exact Nat.lt_of_le_of_lt hHi hHiMod
+      let ⟨hEq, hILo, hIHi, hRlt⟩ :=
+        addWithOverflowS_biased_false_interval w hAccLt hLo hHi hOp
+      exact hNoOvfArm s acc r hInv hLo hHi hEq hILo hIHi hRlt)
+    (fun s acc r hInv hLo hHi hOp => hOvfArm s acc r hInv hLo hHi hOp)
 
 /-- Generic single-step cast/transfer stage cut: when every entry state with
 `acc ∈ [srcSpec.lo, srcSpec.hi]` steps to `dstSpec.blockIdx` storing
@@ -3969,6 +4114,38 @@ theorem canary_ovfCast_signed_checked_arithmetic_and_boundaries (x : Nat)
       dsimp only [step]
       rw [hBb]
       exact Or.inl rfl)
+
+/-- Signed cross-zero interval canary (`i8`, biased coordinates via
+`OvfCastFrameOps.signedView`):
+1. biased interval `[123, 133]` is the signed interval `[-5, 5]`: its endpoints
+   store bit patterns `251` (`-5`) and `5`, while `-128` (bit pattern `128`)
+   has biased coordinate `0`, outside the interval;
+2. a raw bit-pattern interval holding both `-5` (`251`) and `0` must also hold
+   `-128` (`128`), so raw intervals cannot express `[-5, 5]`;
+3. adding `3` to `-5` takes the no-overflow arm with result `-2` (bit pattern
+   `254`, biased `126`), and `addWithOverflowS_biased_false_interval` places it
+   in the tightened join interval `[126, 136]` (signed `[-2, 8]`);
+4. adding `125` to `5` (signed `130 > 127`) is forced onto the overflow arm by
+   `addWithOverflowS_biased_overflow_of_out_of_range`. -/
+theorem canary_ovfCast_signed_cross_zero_interval :
+    toBiased .u8 123 = 251 ∧ toBiased .u8 133 = 5 ∧ toBiased .u8 128 = 0 ∧
+    (∀ lo hi : Nat, lo ≤ 0 → 251 ≤ hi → lo ≤ 128 ∧ 128 ≤ hi) ∧
+    addWithOverflowS .u8 (toBiased .u8 123) 3 = (254, false) ∧
+    toBiased .u8 254 = 126 ∧
+    (123 + toBiased .u8 3 ≤ toBiased .u8 254 + ScalarWidth.u8.halfModulus ∧
+      toBiased .u8 254 + ScalarWidth.u8.halfModulus ≤ 133 + toBiased .u8 3) ∧
+    (addWithOverflowS .u8 (toBiased .u8 133) 125).2 = true := by
+  have hAdd : addWithOverflowS .u8 (toBiased .u8 123) 3 = (254, false) := by
+    decide
+  have hI := addWithOverflowS_biased_false_interval .u8 (lo := 123) (hi := 133)
+    (by decide) (Nat.le_refl 123) (by decide) hAdd
+  refine ⟨by decide, by decide, by decide, ?_, hAdd, by decide,
+    ⟨hI.2.1, hI.2.2.1⟩, ?_⟩
+  · intro lo hi hLo hHi
+    exact ⟨Nat.le_trans hLo (Nat.zero_le 128),
+      Nat.le_trans (by decide) hHi⟩
+  · exact addWithOverflowS_biased_overflow_of_out_of_range .u8 (by decide)
+      (Or.inr (by decide))
 
 end Anneal.ParametricCore
 
