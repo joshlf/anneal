@@ -18,19 +18,20 @@ import LeanMiriSpec.Correspondence.TreeBorrowsRel
 # Episode 2 Atomic Intrinsics Semantics (`LeanMiriSpec` Authority)
 
 Canonical single-threaded wiring of vendored Miri atomic intrinsics
-(`Miri.Interpreter.AtomicMachine.bind`, proved definitionally equal to
-`Miri.Interpreter.ExecutionIntrinsic.Atomic.{access, dispatcher}`), universal
-structural theorems (`allowDataRaces`, ordering conversion rejections,
-`WeakCasPolicy` laws, vendored `BorrowTree.performBorrowAccessRange` bridge),
-kernel-checked (`decide +kernel` / `rfl`, zero `native_decide`) single-threaded
-execution witnesses across all Rust atomic intrinsics and fault modes
-(misaligned, non-power-of-two, oversized `u128`, out-of-bounds, read-only
-allocation `Mutability.Not`, and Tree Borrows `Frozen` mode sensitivity), and
-the executable cross-root observation runner `lmAtomicObserve`
-(`caseIdx ∈ 0..27`).
+(`Miri.Interpreter.AtomicMachine.bind`, proved definitionally equal to both
+`ExecutionIntrinsic.Atomic.{access, dispatcher}` and `ExecutionIntrinsic.Atomic.make`),
+universal structural theorems (`allowDataRaces`, ordering conversion rejections,
+`WeakCasPolicy` & `pointerBinary` laws, poisoned-hook CAS non-write invariants,
+and vendored `BorrowTree.performBorrowAccessRange` bridge), kernel-checked
+(`decide +kernel` / `rfl`, zero `native_decide`) single-threaded execution witnesses
+across all 11 `IntrinsicAtomic` public defs, signed/unsigned/`usize` polarity,
+threaded/`Frozen`/`Reserved`/signed-boundary traces, `dataRace` fast-path invariance,
+and fault modes (misaligned, non-power-of-two, oversized `u128`, out-of-bounds,
+read-only `Mutability.Not`, and Tree Borrows `Frozen` mode sensitivity), plus the
+executable cross-root observation runner `lmAtomicObserve` (`caseIdx ∈ 0..27`).
 
 Strict import isolation: NEVER imports `MiniRustSpec.*` or `Anneal.*`
-(enforced by the trailing `run_cmd` audit).
+(enforced by the trailing `run_cmd` audit, with theorem-count floor `>= 39`).
 -/
 
 namespace LeanMiriSpec.AtomicIntrinsicsLM

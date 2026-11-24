@@ -35,8 +35,9 @@ authorities:
    - defines `crossRootLmObs` calling `LeanMiriSpec.AtomicIntrinsicsLM.lmAtomicObserve`,
    - proves `lmAuthorityCheck crossRootLmObs = true` in the Lean kernel via
      `Eq.refl Bool.true`,
-   - instantiates `closedAtomicDualContract : AtomicDualContract` and all 9 closed
-     projections (incl. `cas_return_shape`, `divergence_set_exact`, `tcb_codec_bridge`,
+   - instantiates `closedAtomicDualContract : AtomicDualContract` and all 10 closed
+     projections (incl. `ep2_atomic_intrinsics_dual_authority_capstone`,
+     `cas_return_shape`, `divergence_set_exact`, `tcb_codec_bridge`,
      `tcb_codec_divergence_exact`),
    - runs **12 negative controls** on scratch `Environment` copies (forged theorem,
      inverted mode, shifted case, inverted CAS, UB forgery, negated trace, inverted
@@ -45,14 +46,14 @@ authorities:
    - audits every cross-root declaration and key `LeanMiriSpec.AtomicIntrinsicsLM`
      theorems for `.safe`, non-triviality, standard-3-axiom purity (zero
      `sorryAx`, zero `Lean.ofReduceBool`, zero `Lean.trustCompiler`), self-tests
-     the auditor, and verifies **transitive constant reachability** from
-     `closedAtomicDualContract` to BOTH `MiniRustSpec.Interp.{evalIntrinsic,
-     evalIntrinsicM}` AND vendored `Miri.Interpreter.{IntrinsicAtomic.eval,
-     AtomicMachine.bind, PlaceMachine.memoryAccess}` +
-     `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange`.
+     the auditor, and verifies **transitive constant reachability** from closed
+     `ep2_atomic_intrinsics_dual_authority_capstone` (via `closedAtomicDualContract`)
+     to BOTH `MiniRustSpec.Interp.{evalIntrinsic, evalIntrinsicM}` AND vendored
+     `Miri.Interpreter.{IntrinsicAtomic.eval, AtomicMachine.bind,
+     PlaceMachine.memoryAccess}` + `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange`.
 3. **§3. Root-Package Constructive Codec & Test Module Axiom Audit (`run_cmd`)**
    Verifies choice-free `[propext, Quot.sound]` purity of the constructive codec
-   and soundness theorems, and standard-3-axiom purity of all test declarations.
+   and soundness theorems, standard-3-axiom purity, and theorem-count floor (`>= 6`).
 -/
 
 namespace Anneal.Mir.AtomicIntrinsicsDualSpecTests
@@ -315,7 +316,7 @@ run_cmd do
     let wireAt (idx : Nat) : Expr := eqTrue (mkApp3 (mkConst (dsNs ++ `wireAgreesAt)) crossObsC (mkConst (dsNs ++ `AtomicMemoryMode.basic)) (mkNatLit idx))
     let wireOkName := ns ++ `crossRootWireAgreesCell0; addThm wireOkName (wireAt 0) reflTrue
 
-    -- 3. Instantiate closed `AtomicDualContract` and all 9 named projections.
+    -- 3. Instantiate closed `AtomicDualContract`, all 9 named projections, and closed Episode 2 capstone.
     let contractName := ns ++ `closedAtomicDualContract
     let contractTy ← addDef contractName
       (mkApp2 (mkConst (dsNs ++ `atomicDualContractOfCheck)) crossObsC (mkConst checkName))
@@ -335,7 +336,8 @@ run_cmd do
                      `contract_cas_return_shape,
                      `contract_divergence_set_exact,
                      `contract_tcb_codec_bridge,
-                     `contract_tcb_codec_divergence_exact] do
+                     `contract_tcb_codec_divergence_exact,
+                     `ep2_atomic_intrinsics_dual_authority_capstone] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
       let outName := ns ++ projName
@@ -480,7 +482,7 @@ run_cmd do
         dsNs ++ `mrFrozenAndReservedTrace_table, dsNs ++ `lmFrozenTraceAuthorityCheck_sound,
         lmNs ++ `lmSignedBoundaryObs_table, dsNs ++ `mrSignedBoundary_table, dsNs ++ `lmSignedBoundaryAuthorityCheck_sound,
         lmNs ++ `compareExchange_nonwrite_and_choice_invariants, dsNs ++ `contract_tcb_codec_bridge, dsNs ++ `lmReservedTraceAuthorityCheck_sound,
-        dsNs ++ `contract_tcb_codec_divergence_exact ]
+        dsNs ++ `contract_tcb_codec_divergence_exact, dsNs ++ `ep2_atomic_intrinsics_dual_authority_capstone ]
     for n in keyThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required theorem {n} missing"
@@ -506,11 +508,11 @@ run_cmd do
     unless isTrivialProp (mkConst ``True) && isTrivialProp trivEq && !isTrivialProp nonTrivEq do
       throwError "cross-root self-test: trivial theorem detector failed"
 
-    -- Transitive constant reachability BFS from `closedAtomicDualContract` to BOTH
-    -- MiniRust (`evalIntrinsic` / `evalIntrinsicM`) AND all 11 public defs of vendored
-    -- `Miri.Interpreter.IntrinsicAtomic` + `AtomicMachine.bind` + `PlaceMachine.memoryAccess`.
+    -- Transitive constant reachability BFS from closed `ep2_atomic_intrinsics_dual_authority_capstone`
+    -- (via `closedAtomicDualContract`) to BOTH MiniRust (`evalIntrinsic` / `evalIntrinsicM`) AND all
+    -- 11 public defs of vendored `Miri.Interpreter.IntrinsicAtomic` + `AtomicMachine.bind` + `PlaceMachine.memoryAccess`.
     let mut reach : NameSet := {}
-    let mut todo : Array Lean.Name := #[contractName]
+    let mut todo : Array Lean.Name := #[ns ++ `ep2_atomic_intrinsics_dual_authority_capstone]
     while !todo.isEmpty do
       let n := todo.back!
       todo := todo.pop
@@ -520,7 +522,9 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !reach.contains d then todo := todo.push d
     let requiredReach : List Lean.Name :=
-      [ `MiniRustSpec.Interp.evalIntrinsic,
+      [ contractName,
+        dsNs ++ `ep2_atomic_intrinsics_dual_authority_capstone,
+        `MiniRustSpec.Interp.evalIntrinsic,
         `MiniRustSpec.Interp.evalIntrinsicM,
         `MiniRustSpec.AtomicIntrinsicsMR.ep1_minirust_atomic_intrinsics_capstone,
         dsNs ++ `mrAtomicObserve,
@@ -542,7 +546,7 @@ run_cmd do
         `Miri.TreeBorrows.BorrowTree.performBorrowAccessRange ]
     for req in requiredReach do
       unless reach.contains req do
-        throwError "cross-root reachability failure: closedAtomicDualContract does not reach {req}"
+        throwError "cross-root reachability failure: closed ep2_atomic_intrinsics_dual_authority_capstone does not reach {req}"
     -- Verify 11th `IntrinsicAtomic` public def (`pointerBinary`) is reached from `pointerBinary_laws`.
     let mut pbReach : NameSet := {}
     let mut pbTodo : Array Lean.Name := #[lmNs ++ `pointerBinary_laws]
@@ -571,7 +575,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 28 && rejectedCount = 12 do
+  unless addedCount = 29 && rejectedCount = 12 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 
@@ -594,7 +598,8 @@ run_cmd do
     for a in axs do
       unless a == ``propext || a == ``Quot.sound do
         throwError "constructive audit failure: {d} uses non-constructive axiom {a}"
-  for (c, _) in env.constants.map₂.toList do
+  let mut theorems : Nat := 0
+  for (c, info) in env.constants.map₂.toList do
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
       if a == ``sorryAx then throwError "test audit failure: {c} uses sorryAx"
@@ -602,6 +607,10 @@ run_cmd do
         throwError "test audit failure: {c} uses {a}"
       unless a == ``propext || a == ``Quot.sound || a == ``Classical.choice do
         throwError "test audit failure: {c} uses non-standard axiom {a}"
-  logInfo m!"atomics constructive audit: verified {constructiveDecls.length} declarations in [propext, Quot.sound] (0 Classical.choice, 0 sorryAx, 0 ofReduceBool)"
+    if (`Anneal.Mir.AtomicIntrinsicsDualSpecTests).isPrefixOf c then
+      if let .thmInfo _ := info then theorems := theorems + 1
+  if theorems < 6 then
+    throwError "test audit is vacuous: only {theorems} test theorems seen"
+  logInfo m!"atomics constructive audit: verified {constructiveDecls.length} declarations in [propext, Quot.sound] and {theorems} test theorems (0 Classical.choice, 0 sorryAx, 0 ofReduceBool)"
 
 end Anneal.Mir.AtomicIntrinsicsDualSpecTests

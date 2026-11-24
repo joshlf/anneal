@@ -13,8 +13,10 @@ import MiniRustSpec.AtomicIntrinsicsMR
 /-!
 # Episode 2 Dual-Authority Atomic Intrinsics Spec (`Anneal.Mir.AtomicIntrinsicsDualSpec`)
 
-Initial Interface Freeze + MiniRust canonical 28-case (`0..27`) evaluation and
-constructive codec/contract layer for Rust atomic intrinsics across:
+Frozen Episode 2 dual-authority specification, canonical 28-case (`0..27`)
+evaluation, threaded/signed-boundary/Tree-Borrows traces, Episode 2 capstone
+(`ep2_atomic_intrinsics_dual_authority_capstone`), and constructive codec/contract
+layer for Rust atomic intrinsics across:
 - **Authority 1 (MiniRust `d821c6e3`)**: direct execution via
   `MiniRustSpec.Interp.evalIntrinsic` on `Mach` (`BasicMemory<x86_64>`) and
   `MiniRustSpec.Interp.evalIntrinsicM` on `MachTB` (`TreeBorrowsMemory<x86_64>`),
@@ -22,7 +24,8 @@ constructive codec/contract layer for Rust atomic intrinsics across:
 - **Authority 2 (LeanMiri)**: parameterized over `AtomicLmAuthority`, matching
   the exact 28-case (`0..27`) index table of
   `LeanMiriSpec.AtomicIntrinsicsLM.lmAtomicObserve` (closed across roots in
-  Part 2 via `tests/mir/AtomicIntrinsicsDualSpecTests.lean`).
+  `tests/mir/AtomicIntrinsicsDualSpecTests.lean`, with
+  `contract_tcb_codec_divergence_exact` pinning the exact 7/56 wire divergence set).
 
 Explicit cross-authority boundary classification:
 1. **Exact Agreement Zone (24/28 cases: `0..14`, `17..20`, `23..27`)**:
@@ -908,7 +911,7 @@ theorem contract_tcb_codec_divergence_exact (c : AtomicDualContract) (m : Atomic
     (hIdx : idx < canonicalCaseCount) :
     atomicOutcomeCodec.encode (mrAtomicObserve m idx) = atomicOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ↔
       divergesAt m idx = false :=
-  ⟨fun hEnc => eq_false_of_ne_true fun hDiv =>
+  ⟨fun hEnc => Bool.eq_false_of_ne_true fun hDiv =>
       (contract_divergence_set_exact c m idx hIdx).2 hDiv (atomicOutcomeCodec_encode_injective hEnc),
     fun hNoDiv => (contract_tcb_codec_bridge c m idx hIdx hNoDiv).1⟩
 /-- Decidable single-cell wire agreement: the kernel-evaluable left side of `contract_tcb_codec_divergence_exact`
@@ -1093,6 +1096,39 @@ theorem lmSignedBoundaryAuthorityCheck_sound (obs : Bool → List AtomicAccessOu
   · exact ⟨(of_decide_eq_true h).1, fun e => absurd ((of_decide_eq_true h).1.symm.trans e) (by decide +kernel)⟩
   · exact ⟨(of_decide_eq_true h).2, fun e => absurd ((of_decide_eq_true h).2.symm.trans e) (by decide +kernel)⟩
 
+/-- **Episode 2 Dual-Authority Atomic Intrinsics Capstone**: bundles choice-free `atomicOutcomeCodec`
+(`TightValidRep`, injectivity, wire-level exact divergence), universal MiniRust `Mach` ↔ `Machine BM`,
+`MachTB.wfLive`, and Episode 1 capstone linkage, exact 2-mode MiniRust ↔ LeanMiri agreement (`load`,
+`store`, `compareExchange` with `(old, eq) ↦ old` projection, RMW ops, alignment/oversized-`u128`/OOB UB),
+joint `Frozen` mode sensitivity (incl. failing-CAS read-only preservation), and explicit MiniRust
+`specPanic` vs. LeanMiri wrapping RMW / read-only boundaries. -/
+theorem ep2_atomic_intrinsics_dual_authority_capstone (c : AtomicDualContract) :
+    (atomicOutcomeCodec.TightValidRep ∧
+      (∀ (a₁ a₂ : AtomicAccessOutcome), atomicOutcomeCodec.encode a₁ = atomicOutcomeCodec.encode a₂ → a₁ = a₂) ∧
+      (∀ (b₁ b₂ : AtomicOutcomeRep) (a : AtomicAccessOutcome), atomicOutcomeCodec.ValidRep b₁ → atomicOutcomeCodec.ValidRep b₂ → atomicOutcomeCodec.decode b₁ = some a → atomicOutcomeCodec.decode b₂ = some a → b₁ = b₂) ∧
+      (∀ (m : AtomicMemoryMode) (idx : Nat), idx < canonicalCaseCount → (atomicOutcomeCodec.encode (mrAtomicObserve m idx) = atomicOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ↔ divergesAt m idx = false))) ∧
+    ((∀ (m : Mach) (op : IntrinsicOp) (args : List (Val × «Type»)) (retTy : «Type»), isAtomicOp op = true → evalIntrinsicM (M := BM) m op args retTy = evalIntrinsic m op args retTy) ∧
+      (∀ (m m' : MachTB) (op : IntrinsicOp) (args : List (Value TBM × «Type»)) (retTy : «Type») (val : Value TBM), isAtomicOp op = true → MiniRustSpec.Correspondence.MachTB.wfLive m → evalIntrinsicM m op args retTy = .ok (val, m') → MiniRustSpec.Correspondence.MachTB.wfLive m') ∧
+      (MiniRustSpec.Correspondence.MachTB.wfLive (tbWith []) ∧ scalarAgrees BM evalIntrinsic bmFive bmPtr = true ∧ scalarAgrees TBM evalIntrinsicM tbFive tbPtr = true)) ∧
+    ((∀ (m : AtomicMemoryMode) (idx : Nat), idx < canonicalCaseCount → mrAtomicObserve m idx = mrExpectedOutcome m idx) ∧
+      (∀ (m : AtomicMemoryMode) (idx : Nat), idx < canonicalCaseCount → (canonicalCaseMeta idx).comparisonClass = .exactAgreement → mrAtomicObserve m idx = c.lm.observe m.toLmTreeBorrows idx ∧ casOldProjection (c.lm.observe m.toLmTreeBorrows idx) = casOldProjection (mrAtomicObserve m idx)) ∧
+      (∀ (expected : Nat) (o : AtomicAccessOutcome), casOldProjection (casFlagSynth expected o) = casOldProjection o)) ∧
+    ((mrAtomicObserve .basic 23 = .okScalar 5 5 ∧ c.lm.observe false 23 = .okScalar 5 5 ∧ mrAtomicObserve .treeBorrows 23 = .okScalar 5 5 ∧ c.lm.observe true 23 = .okScalar 5 5) ∧
+      (mrAtomicObserve .basic 24 = .okCas 5 false 5 ∧ c.lm.observe false 24 = .okCas 5 false 5 ∧ mrAtomicObserve .treeBorrows 24 = .okCas 5 false 5 ∧ c.lm.observe true 24 = .okCas 5 false 5) ∧
+      (mrAtomicObserve .basic 25 = c.lm.observe false 25 ∧ mrAtomicObserve .basic 25 = .okStore 9 ∧ mrAtomicObserve .treeBorrows 25 = .ub ∧ c.lm.observe true 25 = .ub) ∧
+      (mrAtomicObserve .basic 26 = c.lm.observe false 26 ∧ mrAtomicObserve .basic 26 = .okScalar 5 6 ∧ mrAtomicObserve .treeBorrows 26 = .ub ∧ c.lm.observe true 26 = .ub) ∧
+      (mrAtomicObserve .basic 27 = c.lm.observe false 27 ∧ mrAtomicObserve .basic 27 = .okCas 5 true 9 ∧ mrAtomicObserve .treeBorrows 27 = .ub ∧ c.lm.observe true 27 = .ub)) ∧
+    ((∀ (m : AtomicMemoryMode), mrAtomicObserve m 15 = .specPanic ∧ c.lm.observe m.toLmTreeBorrows 15 = .okScalar 4294967295 0 ∧ mrAtomicObserve m 16 = .specPanic ∧ c.lm.observe m.toLmTreeBorrows 16 = .okScalar 0 4294967295) ∧
+      (c.lm.observe false 21 = .ub ∧ c.lm.observe true 21 = .ub ∧ c.lm.observe false 22 = .ub ∧ c.lm.observe true 22 = .ub ∧ mrAtomicObserve .basic 21 = .okStore 9 ∧ mrAtomicObserve .treeBorrows 21 = .ub ∧ mrAtomicObserve .basic 22 = .okCas 5 false 5 ∧ mrAtomicObserve .treeBorrows 22 = .okCas 5 false 5) ∧
+      (∀ (m : AtomicMemoryMode) (idx : Nat), idx < canonicalCaseCount → (divergesAt m idx = false → mrAtomicObserve m idx = c.lm.observe m.toLmTreeBorrows idx) ∧ (divergesAt m idx = true → mrAtomicObserve m idx ≠ c.lm.observe m.toLmTreeBorrows idx))) :=
+  ⟨⟨atomicOutcomeCodec_tight, fun _ _ h => atomicOutcomeCodec_encode_injective h,
+    fun _ _ _ hv₁ hv₂ hd₁ hd₂ => atomicOutcomeCodec_decode_injective_on_valid hv₁ hv₂ hd₁ hd₂, contract_tcb_codec_divergence_exact c⟩,
+   contract_mr_universal_laws c,
+   ⟨c.mr_matches, fun m idx hIdx hAgree => ⟨c.agreement_zone_exact m idx hIdx hAgree, contract_cas_return_shape c m idx hIdx hAgree⟩, casOldProjection_casFlagSynth⟩,
+   ⟨⟨mr_tb_frozen_mode_sensitivity.1, c.lm.matchesExpected false 23 (by decide), mr_tb_frozen_mode_sensitivity.2.1, c.lm.matchesExpected true 23 (by decide)⟩,
+    ⟨mr_tb_frozen_mode_sensitivity.2.2.1, c.lm.matchesExpected false 24 (by decide), mr_tb_frozen_mode_sensitivity.2.2.2.1, c.lm.matchesExpected true 24 (by decide)⟩, c.mode_sensitivity_joint⟩,
+   ⟨c.overflow_divergence_explicit, c.readonly_alloc_divergence_explicit, contract_divergence_set_exact c⟩⟩
+
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
 section AxiomAudit
@@ -1135,7 +1171,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 36 then
+  if theorems < 37 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 
