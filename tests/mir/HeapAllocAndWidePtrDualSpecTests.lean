@@ -443,6 +443,7 @@ run_cmd do
                      `contract_static_leak_wide_agreement,
                      `contract_total_divergence_exact, `contract_total_wire_divergence_exact,
                      `contract_out_of_range_agreement, `contract_trusted_lm_agreement,
+                     `contract_trusted_lm_case21,
                      `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
@@ -472,7 +473,7 @@ run_cmd do
               `evalCast_then_thinEq_erases_meta_and_prov,
               `trustedCmp_table, `trustedCmp_nonvacuity_twins_table,
               `trustedRvalue_witnesses, `trusted_wide_cases_match_mr,
-              `trusted_protector_is_treeBorrows_mode] do
+              `trusted_protector_is_treeBorrows_mode, `trustedWrongTag_table] do
       let src := dsNs ++ w
       let some (.thmInfo v) := (← getEnv).find? src
         | throwError "cross-root: root witness {src} missing"
@@ -675,6 +676,8 @@ run_cmd do
         throwError "cross-root negative control FAILED: kernel accepted {what}"
       rejected := rejected + 1
     -- 6b. Non-boolean / flipped-polarity / Trusted / codec forgeries (each paired with a true baseline).
+    let wrongTagWrite := mkApp2 (mkConst (dsNs ++ `trustedWrongTagObs))
+      (mkConst `Trusted.Rustc.V2026_06_01.MirAst.BorrowKind.shared) boolTrue
     let tdFrozenTrue := mkApp2 (mkConst (dsNs ++ `trustedTeardownObs))
       (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm.frozen) boolTrue
     let sliceCmpFalse := mkAppN (mkConst (dsNs ++ `trustedCmpObs))
@@ -714,6 +717,13 @@ run_cmd do
           thm "trustedEqLmBasic19"
             (mkApp3 (mkConst ``Eq [1]) obsTy tdFrozenTrue (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 19)))
             (mkApp2 (mkConst ``Eq.refl [1]) obsTy tdFrozenTrue)),
+        ("forged Trusted write through a Frozen tag succeeds (case 21 = okDealloc)",
+          some (thm "wrongTagIsUb"
+            (mkApp3 (mkConst ``Eq [1]) obsTy wrongTagWrite (obsC "ub"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "ub"))),
+          thm "wrongTagForgedOk"
+            (mkApp3 (mkConst ``Eq [1]) obsTy wrongTagWrite (obsC "okDealloc"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "okDealloc"))),
         ("forged out-of-range LeanMiri cell (false, 30) = ub",
           some (thm "outOfRangeIsInvalid"
             (mkApp3 (mkConst ``Eq [1]) obsTy (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 30))
@@ -931,7 +941,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 99 && rejectedCount = 29 do
+  unless addedCount = 101 && rejectedCount = 30 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 

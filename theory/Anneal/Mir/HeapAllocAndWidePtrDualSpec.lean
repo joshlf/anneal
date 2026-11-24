@@ -48,7 +48,11 @@ Trusted bridge scope note: Anneal's `hasFrameDeallocProtectorConflict` governs t
 deallocation of *frame locals* at `return` / tail calls (heap `Allocate`/`Deallocate`
 are not MIR primitives of `V2026_06_01`); the bridge proves the protector-classification
 correspondence with MiniRust universally and ties concrete frame-teardown verdicts to
-MiniRust's heap verdicts on cases `19`, `20`, `22`. The wide-pointer bridge is
+MiniRust's heap verdicts on cases `19`, `20`, `22`; case `21` (deallocation through a
+`Frozen` child = a local write through a `Frozen` tag) is matched by a concrete `stepMirFn`
+write through a real `.frozen` tag minted by `Rvalue.ref .shared` (`trustedWrongTag_table`),
+and `contract_trusted_lm_agreement` / `contract_trusted_lm_case21` close every
+Trusted-covered case (`19..27`) directly against LeanMiri. The wide-pointer bridge is
 universal on `evalCastPtrToPtr` / `evalRvalue` and concrete on `stepMirFn` for `23..27`.
 -/
 
@@ -1479,6 +1483,73 @@ theorem trustedStorageDead_and_release_table :
     mrObserve_table _ 22 (by decide)]
   exact ⟨h1, h2, h3, h4, h5, h6, h1, h5, h4⟩
 
+/-! #### Concrete wrong-tag `Frozen` write (case `21`) -/
+
+/-- `fn() { let _1: u32; _2 = &_1 (bk); (*_2) = 5 }` when `write`, else
+`_1 = copy (*_2)`: the access a deallocation through a child tag performs is a local
+*write* through that tag (MiniRust case `21`: "Tree Borrows: local write of Frozen
+reference"). -/
+def hwWrongTagBody (bk : BorrowKind) (write : Bool) : CapturedMir :=
+  let st (k : StatementKind) : Statement := { kind := k, span := "hw.rs:5:1" }
+  let place (i : Nat) (proj : List ProjectionElem := []) : Place := { local_ := i, projection := proj }
+  hwMirBody "hw::wrong_tag_access" [hwDecl (.tuple []), hwDecl (.uint .u32),
+      hwDecl (match bk with | .shared => .ref .not (.uint .u32) | .mut _ => .ref .mut (.uint .u32))] 0
+    [{ statements :=
+         [st (.assign (place 2) (.ref bk (place 1))),
+          if write then
+            st (.assign (place 2 [.deref])
+              (.use (.constant { ty := { kind := .uint .u32, layoutIdx := 0 }, val := .scalar (.int ⟨5, 4⟩) })))
+          else
+            st (.assign (place 1) (.use (.copy (place 2 [.deref]))))],
+       terminator := { kind := .return_, span := "hw.rs:5:2" }, isCleanup := false }]
+
+/-- Root-frame state: `_1 = 42u32`, `_2` uninitialized, empty borrow table. -/
+def hwWrongTagState : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.init (.aggregate 0 []), .init (.scalar ⟨42, 4⟩), .uninit] },
+    memory := {} }
+
+/-- Run the wrong-tag fixture through `stepMirFn`. -/
+def trustedWrongTagObs (bk : BorrowKind) (write : Bool) : HeapWideObs :=
+  trustedDeallocRun (hwWrongTagBody bk write) 6 hwWrongTagState
+
+/-- Numeric code of a Tree Borrows permission (for decidable observation). -/
+def treeBorrowPermCode : TreeBorrowPerm → Nat
+  | .cell => 0
+  | .reservedFrz _ => 1
+  | .reservedIM => 2
+  | .unique => 3
+  | .frozen => 4
+  | .disabled => 5
+
+/-- The permission of the tag minted by the first statement (`_2 = &_1`), as recorded in
+the real Trusted borrow table after one `stepMirFn` step. -/
+def hwWrongTagMintedPerm (bk : BorrowKind) : Option Nat :=
+  match stepMirFn (hwWrongTagBody bk true) hwWrongTagState with
+  | .tau (.running s') => s'.memory.borrows.head?.map (fun e => treeBorrowPermCode e.perm)
+  | _ => none
+
+/-- **Concrete Trusted wrong-tag `Frozen` table (case `21`)**: the shared borrow mints a
+`.frozen` tag; a local write through it is `.ub`, while a read through the same `.frozen`
+tag and a write through a mutable (`reservedFrz`) tag both succeed — so the `.ub` is exactly
+Tree Borrows' "local write of a Frozen tag", matching MiniRust `MachTB` case `21` and
+differing from `Mach` (`BasicMemory`). -/
+theorem trustedWrongTag_table :
+    hwWrongTagMintedPerm .shared = some 4 ∧
+    hwWrongTagMintedPerm (.mut false) = some 1 ∧
+    trustedWrongTagObs .shared true = .ub ∧
+    trustedWrongTagObs .shared false = .okDealloc ∧
+    trustedWrongTagObs (.mut false) true = .okDealloc ∧
+    trustedWrongTagObs .shared true = mrObserve .treeBorrows 21 ∧
+    trustedWrongTagObs .shared true ≠ mrObserve .basic 21 := by
+  have h1 : hwWrongTagMintedPerm .shared = some 4 := by decide +kernel
+  have h2 : hwWrongTagMintedPerm (.mut false) = some 1 := by decide +kernel
+  have h3 : trustedWrongTagObs .shared true = .ub := by decide +kernel
+  have h4 : trustedWrongTagObs .shared false = .okDealloc := by decide +kernel
+  have h5 : trustedWrongTagObs (.mut false) true = .okDealloc := by decide +kernel
+  rw [mrObserve_table _ 21 (by decide), mrObserve_table .basic 21 (by decide)]
+  exact ⟨h1, h2, h3, h4, h5, h3, by rw [h3]; decide⟩
+
 /-! ### §6.2 Wide-pointer `addr_eq` metadata erasure (`rust#166144`) -/
 
 /-- **Slice → thin cast erases the length** (`evalCastPtrToPtr`): on a 64-bit layout, a
@@ -2050,6 +2121,16 @@ theorem contract_trusted_lm_agreement (c : HeapWideDualContract) :
   exact ⟨w23.trans (a 23 (by decide)), w24.trans (a 24 (by decide)), w25.trans (a 25 (by decide)),
     w26.trans (a 26 (by decide)), w27.trans (a 27 (by decide))⟩
 
+/-- **3-way agreement on case `21`**: the Trusted wrong-tag `Frozen` write verdict equals
+LeanMiri's Tree Borrows verdict on case `21` for every contract. -/
+theorem contract_trusted_lm_case21 (c : HeapWideDualContract) :
+    trustedWrongTagObs .shared true = c.lm.observe true 21 ∧
+    trustedWrongTagObs .shared true ≠ c.lm.observe false 21 := by
+  have hT := c.agreement_zone_exact .treeBorrows 21 (by decide) (by decide)
+  have hB := c.agreement_zone_exact .basic 21 (by decide) (by decide)
+  obtain ⟨_, _, _, _, _, h21, hne⟩ := trustedWrongTag_table
+  exact ⟨h21.trans hT, fun e => hne (e.trans hB.symm)⟩
+
 /-! ## §7. Episode 2 Capstone -/
 
 open Trusted.Rustc.V2026_06_01.MirSemantics (preventsDeallocation hasFrameDeallocProtectorConflict
@@ -2165,7 +2246,9 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @trusted_wide_cases_match_mr) ∧
       (type_of% @trustedCmp_nonvacuity_twins_table) ∧
       (type_of% @trusted_protector_is_treeBorrows_mode) ∧
-      (type_of% (contract_trusted_lm_agreement c))) :=
+      (type_of% (contract_trusted_lm_agreement c)) ∧
+      (type_of% @trustedWrongTag_table) ∧
+      (type_of% (contract_trusted_lm_case21 c))) :=
   ⟨⟨heapWideOutcomeCodec_tight, fun _ _ h => heapWideOutcomeCodec_encode_injective h,
       fun _ _ _ hv₁ hv₂ hd₁ hd₂ => heapWideOutcomeCodec_decode_injective_on_valid hv₁ hv₂ hd₁ hd₂,
       heapWideOutcomeCodec_rejects_malformed, ofMrObs_toMrObs, toMrObs_ofMrObs,
@@ -2198,7 +2281,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       @evalRvalue_wideSlice_eq_matches_mr, @evalRvalue_wideDyn_eq_matches_mr,
       @evalCast_then_thinEq_erases_meta_and_prov, @trustedRvalue_witnesses,
       @trusted_wide_cases_match_mr, @trustedCmp_nonvacuity_twins_table,
-      trusted_protector_is_treeBorrows_mode, contract_trusted_lm_agreement c⟩⟩
+      trusted_protector_is_treeBorrows_mode, contract_trusted_lm_agreement c,
+      trustedWrongTag_table, contract_trusted_lm_case21 c⟩⟩
 
 /-! ## §8. Import-Isolation, Constructive-Codec, Bridge-Reality & Axiom Audit -/
 
@@ -2263,7 +2347,8 @@ run_cmd do
       (ns ++ `trustedStorageDead_and_release_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trustedTailCallRun_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trustedCmp_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
-      (ns ++ `trustedCmp_nonvacuity_twins_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn) ]
+      (ns ++ `trustedCmp_nonvacuity_twins_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trustedWrongTag_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
     let mut seen : NameSet := {}
