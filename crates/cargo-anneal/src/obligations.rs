@@ -2112,6 +2112,97 @@ pub fn render_proof_template_with_options(
     out
 }
 
+/// Reconcile captured MIR fault-site coverage for `bundle` against its
+/// rendered `Obligations.<Item>` and `Verify.<Item>` modules using the
+/// canonical 12-class [`crate::property_registry::PropertyRegistry`] and
+/// fail-closed [`crate::property_registry::FaultSiteCoverageReconciler`].
+pub fn reconcile_subject_bundle_coverage(
+    bundle: &SubjectObligationBundle,
+    authored: AuthoredItemModules,
+    subject_mir_lean_src: &str,
+    obligations_lean_src: Option<&str>,
+    verify_lean_src: Option<&str>,
+) -> crate::property_registry::CoverageReconciliationReport {
+    let registry = crate::property_registry::PropertyRegistry::for_bundle(bundle, authored);
+    let reconciler = crate::property_registry::FaultSiteCoverageReconciler::new(registry);
+    let def_id = &bundle.subject.target.def_id;
+
+    let Ok(parsed_mir) = crate::property_registry::parse_lean_mir_module_strict(subject_mir_lean_src)
+    else {
+        let census = crate::property_registry::FaultSiteCensus::from_lean_mir_fail_closed(
+            def_id,
+            subject_mir_lean_src,
+        );
+        return reconciler.reconcile(&census, [], []);
+    };
+
+    if parsed_mir.def_path != *def_id {
+        let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+            def_id,
+            format!(
+                "CapturedMir.defPath mismatch: expected `{def_id}`, found `{}`",
+                parsed_mir.def_path
+            ),
+        );
+        return reconciler.reconcile(&census, [], []);
+    }
+
+    let uses_rust_trusted_contract = !authored.has_proof
+        && !authored.has_assumptions
+        && (bundle.has_rust_trusted_attr() || authored.has_generated_assumptions);
+    if let Some(ob_src) = obligations_lean_src
+        && crate::property_registry::verify_obligations_module_pin(
+            ob_src,
+            &bundle.item_module_suffix,
+            authored,
+        )
+        .is_none()
+    {
+        let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+            def_id,
+            format!(
+                "Obligations.{} failed token-level claim/body/callees pin verification",
+                bundle.item_module_suffix
+            ),
+        );
+        return reconciler.reconcile(&census, [], []);
+    }
+    if let Some(ver_src) = verify_lean_src
+        && !crate::property_registry::verify_module_pins_expected_surface(
+            ver_src,
+            &bundle.item_module_suffix,
+            bundle,
+            authored,
+            uses_rust_trusted_contract,
+        )
+    {
+        let census = crate::property_registry::FaultSiteCensus::fail_closed_with_reason(
+            def_id,
+            format!(
+                "Verify.{} failed token-level theorem/import/surface pin verification",
+                bundle.item_module_suffix
+            ),
+        );
+        return reconciler.reconcile(&census, [], []);
+    }
+
+    let census =
+        crate::property_registry::FaultSiteCensus::from_ir_captured_mir_with_options(&parsed_mir, true);
+    let emitted = crate::property_registry::derive_bundle_obligation_coverage(
+        bundle,
+        authored,
+        &parsed_mir,
+        obligations_lean_src,
+        verify_lean_src,
+    );
+    reconciler.reconcile_with_call_context(
+        &census,
+        emitted.discharged_sites,
+        emitted.explicit_waivers,
+        &emitted.call_context,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3177,5 +3268,68 @@ mod tests {
             ),
             "verify module with authored ModularItemSpec and no Proof must target modularClaim:\n{verify_mod}"
         );
+    }
+
+    #[test]
+    fn reconcile_subject_bundle_coverage_detects_tampered_body_and_unlinked_callees() {
+        let records = vec![record("probes::call_arg_blind", CapturedItemKind::Subject, None)];
+        let mut bundles = group_subject_obligations(&records);
+        let bundle = &mut bundles[0];
+        bundle.transitive_callees.push(TransitiveCalleeRef {
+            def_id: "probes::callee_u32".to_string(),
+            item_module_suffix: "Probes.callee_u32".to_string(),
+        });
+
+        let scenario = crate::property_registry::MutationProbeScenario::build(
+            crate::property_registry::FalseProofMutationProbe::CallArgBlindProbe,
+        );
+        let mir_lean = anneal_rustc_capture::lean_emit::emit_mir_lean_module(
+            "Mir.Probes.call_arg_blind",
+            &scenario.mir,
+        );
+        let authored = AuthoredItemModules {
+            has_proof: true,
+            is_stateful: true,
+            ..AuthoredItemModules::default()
+        };
+        let ob_lean = render_obligations_module_with_options(bundle, authored);
+        let ver_lean = render_verify_module_with_options(bundle, authored);
+
+        let ok = reconcile_subject_bundle_coverage(
+            bundle,
+            authored,
+            &mir_lean,
+            Some(&ob_lean),
+            Some(&ver_lean),
+        );
+        assert!(ok.is_covered(), "{}", ok.render_diagnostic_report());
+
+        // Tampering `Obligations` to drop `Mir.Probes.callee_u32.body` from `defaultCallees`
+        // causes `CallContract` at `(bb0, term[0])` to fail closed!
+        let stripped_callees_ob = ob_lean.replace("[Mir.Probes.callee_u32.body]", ".nil");
+        let bad_callee = reconcile_subject_bundle_coverage(
+            bundle,
+            authored,
+            &mir_lean,
+            Some(&stripped_callees_ob),
+            Some(&ver_lean),
+        );
+        assert!(!bad_callee.is_covered());
+        assert!(bad_callee.uncovered_diagnostics.iter().any(|d| {
+            d.site.class == crate::property_registry::PropertyClass::CallContract
+        }));
+
+        // Tampering `Verify` to prove a rogue theorem instead of `Obligations.Probes.call_arg_blind.*`
+        // rejects every censused site fail-closed!
+        let rogue_verify = "import Trusted\nnamespace Verify.Probes.call_arg_blind\ntheorem verified : True := trivial\nend Verify.Probes.call_arg_blind\n";
+        let bad_ver = reconcile_subject_bundle_coverage(
+            bundle,
+            authored,
+            &mir_lean,
+            Some(&ob_lean),
+            Some(rogue_verify),
+        );
+        assert!(!bad_ver.is_covered());
+        assert_eq!(bad_ver.uncovered_diagnostics.len(), bad_ver.census_sites.len());
     }
 }
