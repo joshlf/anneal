@@ -5527,5 +5527,151 @@ class GuardMutationEp2B3AdversarialTests(unittest.TestCase):
             self.assertEqual(report["findings"][0]["language"], "rust")  # type: ignore[index]
 
 
+class GuardMutationEp2A3AdversarialTests(unittest.TestCase):
+    """Round 3 A3 audit: 177-vector Rust/Python cross-language parity & edge-case hardening."""
+
+    SPEC_CHECK_REL = "crates/anneal-spec/src/spec_check.rs"
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [
+            f.pattern
+            for f in gmut.detect_postcondition_error_wildcards(source, language=language)
+        ]
+
+    @classmethod
+    def _load_rust_wildcard_parity_vectors(cls) -> list[tuple[str, str, str]]:
+        src = (ANNEAL_ROOT / cls.SPEC_CHECK_REL).read_text(encoding="utf-8")
+        marker = "const WILDCARD_PARITY_VECTORS: &[(&str, &str, &str)] = &["
+        start = src.index(marker) + len(marker)
+        end = src.index("\n    ];", start)
+        code = gmut._strip_source_comments(src[start:end], "rust", blank_literals=False)
+        tuple_re = re.compile(
+            r'\(\s*("(?:\\.|[^"\\])*")\s*,\s*(r#*"[\s\S]*?"#*|"(?:\\.|[^"\\])*")\s*,\s*("(?:\\.|[^"\\])*")\s*,?\s*\)'
+        )
+
+        def decode_lit(lit: str) -> str:
+            if lit.startswith("r"):
+                hashes = len(lit) - len(lit.lstrip("r"))
+                hashes = lit[1:].index('"')
+                return lit[2 + hashes : len(lit) - 1 - hashes]
+            return gmut._decode_rust_string_literal(lit)
+
+        vectors = [
+            (decode_lit(m.group(1)), decode_lit(m.group(2)), decode_lit(m.group(3)))
+            for m in tuple_re.finditer(code)
+        ]
+        assert len(vectors) >= 170, f"expected >= 170 parity vectors, got {len(vectors)}"
+        return vectors
+
+    def test_live_wildcard_parity_vectors_match_anneal_spec_rust_scanner(self) -> None:
+        vectors = self._load_rust_wildcard_parity_vectors()
+        mismatches: list[tuple[int, str, str, str, str]] = []
+        for idx, (dialect, snippet, expected) in enumerate(vectors):
+            lang = "auto" if dialect == "any" else dialect
+            findings = gmut.detect_postcondition_error_wildcards(snippet, language=lang)
+            got = findings[0].pattern if findings else ""
+            if got != expected:
+                mismatches.append((idx, dialect, snippet, expected, got))
+        self.assertEqual(mismatches, [])
+
+    def test_matches_macro_delimiters_qualification_negation_and_non_result_catch_all(self) -> None:
+        for vacuous in (
+            "matches!{out, Err(_)}",
+            "matches![out, Ok(_) | Err(_)]",
+            "core::matches!(out, Ok(_) | _)",
+            "!!(core::matches!{out, Err(_)})",
+            "(matches!(out, Err(_))) == true",
+        ):
+            self.assertEqual(self._patterns(vacuous, "rust"), ["matches_any_err"], vacuous)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(
+                    vacuous, "err", language="rust"
+                )["status"],
+                "SURVIVED",
+                vacuous,
+            )
+
+        for sound in (
+            "!matches!{out, Err(_)}",
+            "!(matches!(out, Err(_)))",
+            "!core::matches!(out, Err(_))",
+            "!::std::matches![out, Err(_)]",
+            "matches!(out, Err(_)) == false",
+            "false == matches!(out, Err(_))",
+            "matches!(out, Err(_)) != true",
+        ):
+            self.assertEqual(self._patterns(sound, "rust"), [], sound)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(
+                    sound, "err", language="rust"
+                )["status"],
+                "KILLED",
+                sound,
+            )
+        # Non-Result `matches!` on an `Option` neither flags `matches_any_err` nor claims to inspect `Err`.
+        self.assertEqual(self._patterns("matches!(opt, Some(1) | _)", "rust"), [])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(
+                "matches!(opt, Some(1) | _)", "err", language="rust"
+            )["status"],
+            "UNMATCHED",
+        )
+
+    def test_tuples_nested_ok_ctors_panicking_lets_let_chains_and_short_circuit_order(self) -> None:
+        # 1-tuples and n-tuples are not boolean propositions.
+        for non_bool_tuple in (
+            "Err(_) => (true,)",
+            "Err(_) => (true, x)",
+            "Err(_) => (true || x, y)",
+        ):
+            self.assertEqual(self._patterns(non_bool_tuple, "rust"), [], non_bool_tuple)
+
+        # Nested `Ok` in structs/tuples enables `catch_all_arm_true`, while tuple precedence keeps
+        # `(_ | 0, Ok(y))` and `(_, ())` sound and `(e, f,)` flagged.
+        self.assertEqual(
+            self._patterns("match w { W { r: Ok(v), .. } => *v == 1, _ => true }", "rust"),
+            ["catch_all_arm_true"],
+        )
+        self.assertEqual(
+            self._patterns("match (a, b) { (Ok(x), Ok(y)) => x == y, (e, f,) => true }", "rust"),
+            ["catch_all_arm_true"],
+        )
+        self.assertEqual(
+            self._patterns("match (a, b) { (Ok(x), Ok(y)) => x == y, (_ | 0, Ok(y)) => true }", "rust"),
+            [],
+        )
+
+        # Panicking `let` initializers, `&& let` let-chain shadowing, and early-exit LHS before `|| true`.
+        for sound_rust in (
+            "Err(e) => { let _ = *e >> 70; true }",
+            "Err(e) => { let _ = slice[*e]; true }",
+            "Err(e) => { let ok = true; if flag && let E::Check(ok) = e { ok } else { true } }",
+            "Err(e) => { let x = true; let y = true; if let A(x) = a && let B(y) = b { x && y } else { true } }",
+            "Err(e) => check(e)? || true",
+            "Err(e) => { if *e != E::Overflow { return false; } false } || true",
+            "Err(e) => { assert!(*e == E::Overflow); false } || true",
+        ):
+            self.assertEqual(self._patterns(sound_rust, "rust"), [], sound_rust)
+
+        # Conversely, `true || check(e)?` short-circuits BEFORE `check(e)?`, and `else { ok }` keeps outer `ok = true`.
+        for vacuous_rust in (
+            "Err(e) => true || check(e)?",
+            "Err(e) => matches!(e, E::Overflow) || true",
+            "Err(e) => { let ok = true; if flag && let E::Check(ok) = e { true } else { ok } }",
+            "Err(e) => { let x = true; let y = true; if let A(x) = a && let B(y) = b { true } else { x && y } }",
+        ):
+            self.assertEqual(self._patterns(vacuous_rust, "rust"), ["err_arm_true"], vacuous_rust)
+
+        # Lean `|||`, `|>`, and outer `:=` boundaries.
+        self.assertEqual(self._patterns("| .err e => n = n ||| 1", "lean"), [])
+        self.assertEqual(self._patterns("| .err e => x = x |> f", "lean"), [])
+        self.assertEqual(
+            self._patterns(
+                "have h : match x with | .ok v => v = 1 | .err _ => True := by simp", "lean"
+            ),
+            ["err_arm_true"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

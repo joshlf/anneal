@@ -1479,5 +1479,125 @@ class Ep2B3AdversarialTests(GuardHarness):
         self.assertEqual(self.run_main(["--claims", c, "--receipt", r, "--require-step", "a\rb"])[0], 2)
 
 
+class Ep2A3AdversarialTests(GuardHarness):
+    """Pass A3 adversarial regression tests closing B3's Shard B bypasses."""
+
+    def test_blockquoted_fences_spaceless_blockquotes_and_formatted_inequalities(self) -> None:
+        # 1. Blockquoted fenced code block naming a fabricated command must NOT drop `$ cmd`
+        # context or inherit an outer passing heading!
+        quoted_bad_fence = (
+            "## unit_tests\n"
+            "> ```\n"
+            "> $ lake build FabricatedTarget\n"
+            "> rc=0, 42 passed\n"
+            "> ```\n"
+        )
+        self.assertEqual(self.codes(quoted_bad_fence), ["UNBACKED_CLAIM"])
+
+        # Unclosed blockquoted fence when the blockquote ends early emits MALFORMED_CLAIMS
+        # and still audits the unquoted line that follows!
+        unclosed_bq_fence = (
+            "> ```\n"
+            "> $ python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v\n"
+            "`unit_tests`: 999 passed, rc=0\n"
+        )
+        self.assertEqual(
+            self.codes(unclosed_bq_fence),
+            ["INFLATED_COUNT", "MALFORMED_CLAIMS"],
+        )
+
+        # Valid blockquoted fence naming a real receipt command passes cleanly.
+        quoted_good_fence = (
+            "> ```\n"
+            "> $ python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v\n"
+            "> rc=0, 42 passed\n"
+            "> ```\n"
+        )
+        self.assertEqual(self.codes(quoted_good_fence), [])
+
+        # 2. CommonMark spaceless blockquotes (`>-`, `>|`, `>##`) cannot bypass step attribution!
+        for spaceless_bq in (
+            "## unit_tests\n>- `fabricated_step`: rc=0, 42 passed\n",
+            "## unit_tests\n>| `fabricated_step` | PASS | 42 passed |\n",
+            "## unit_tests\n>## ghost_gate\n>rc=0, 42 passed\n",
+        ):
+            self.assertEqual(self.codes(spaceless_bq), ["MISSING_STEP_RECEIPT"], spaceless_bq)
+
+        # 3. Formatted/backticked numeric inequalities (`> **42** passed`, ``>= `42` passed``,
+        # `passed != TBD`, `failed <= zero`) fail closed as MALFORMED_CLAIM!
+        for bad_ineq in (
+            "## unit_tests\n> **42** passed\n",
+            "`unit_tests`: >= `42` passed\n",
+            "`unit_tests`: ~`42` passed\n",
+            "`unit_tests`: passed: >= `42`, rc=0\n",
+            "`guard_mutation`: >= `99`% kill rate\n",
+            "`unit_tests`: passed != TBD, rc=0\n",
+            "`unit_tests`: failed <= zero, rc=0\n",
+        ):
+            self.assertIn("MALFORMED_CLAIM", self.codes(bad_ineq), bad_ineq)
+
+    def test_cross_step_rc_neq_poisoning_axiom_tail_smuggling_strict_shas_and_mixed_case_verdicts(self) -> None:
+        # 1. `any_unscoped_fail_ack` ("All checks did not pass.") + acknowledging `cargo_test: FAIL`
+        # must NOT allow an unacknowledged failing `unit_tests` step to hide behind `rc != 99`!
+        two_red = [
+            bundle(
+                unit_tests={"returncode": 1, "ok": False, "failed_count": 1},
+                cargo_test={"exit_code": 1, "failed_count": 2},
+            )
+        ]
+        cross_step_smuggle = (
+            "All checks did not pass.\n"
+            "- `cargo_test`: FAIL\n"
+            "- `unit_tests`: rc != 99\n"
+        )
+        self.assertEqual(self.codes(cross_step_smuggle, two_red), ["SUPPRESSED_FAILURE"])
+
+        # 2. Trailing tokens after an extracted inline claim (`0 sorry`) inside `axioms: ...`
+        # must NOT be truncated away!
+        self.assertEqual(
+            self.codes(
+                "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound, 0 sorry, sorryAx\n"
+            ),
+            ["AXIOM_SET_MISMATCH"],
+        )
+        self.assertEqual(
+            self.codes(
+                "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound, 0 sorry, ???\n"
+            ),
+            ["MALFORMED_CLAIM"],
+        )
+
+        # 3. Non-hex SHA claims under explicit SHA labels fail closed!
+        for bad_sha, expected_code in (
+            ("Commit SHA: `zzzzzzzz`\n`unit_tests`: rc=0\n", "INVALID_COMMIT_SHA"),
+            ("Commit SHA: not_a_sha\n`unit_tests`: rc=0\n", "INVALID_COMMIT_SHA"),
+            ("HEAD SHA: `123`\n`unit_tests`: rc=0\n", "AMBIGUOUS_COMMIT_SHA"),
+            ("| Commit SHA | zzzzzzzz |\n| `unit_tests` | PASS |\n", "INVALID_COMMIT_SHA"),
+        ):
+            self.assertEqual(self.codes(bad_sha), [expected_code], bad_sha)
+        # Non-SHA metadata labels like `Target: \`Anneal.SpecBoundaryGuards\`` remain prose.
+        self.assertEqual(
+            self.codes("Target: `Anneal.SpecBoundaryGuards`\n`unit_tests`: rc=0\n"),
+            [],
+        )
+
+        # 4. Mixed-case standalone scoped verdicts in table cells and colon bullets are audited!
+        red_cargo = [bundle(cargo_test={"exit_code": 1, "failed_count": 1})]
+        for mixed_pass in (
+            "| `cargo_test` | Passed |\n",
+            "| `cargo_test` | Green |\n",
+            "- `cargo_test`: Passed\n",
+            "- `cargo_test`: Green\n",
+            "- `cargo_test`: Succeeded\n",
+        ):
+            self.assertEqual(self.codes(mixed_pass, red_cargo), ["SUPPRESSED_FAILURE"], mixed_pass)
+            self.assertEqual(self.codes(mixed_pass), [], mixed_pass)
+        # Table header cells like `| Step | Passed | Failed |` are not misread as claims.
+        self.assertEqual(
+            self.codes("| Step | Passed |\n| --- | --- |\n| `unit_tests` | Passed |\n"),
+            [],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

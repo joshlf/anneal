@@ -752,7 +752,7 @@ def load_receipt(
 # Claim extraction
 # ---------------------------------------------------------------------------
 
-_NUM = r"(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*"
+_NUM = r"(?<![\w.,/=])[`*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])[`*_]*\s*)?[`*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[`*_]*"
 _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("passed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+|checks?\s+)?(?:passed|passing|pass)\b", re.I)),
     ("failed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+)?(?:failed|failing|failures?)\b", re.I)),
@@ -771,7 +771,7 @@ _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _KV_COUNT_RE = re.compile(
     r"(?i)(?<![\w-])[*_]*(passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total)"
-    r"(?:_count)?[*_]*\s*(?:==|[=:])\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)"
+    r"(?:_count)?[*_]*\s*(?:==|[=:])\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])[`*_]*\s*)?[`*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)"
 )
 _KV_METRIC_ALIASES: dict[str, str] = {
     "failure": "failed",
@@ -781,7 +781,7 @@ _KV_METRIC_ALIASES: dict[str, str] = {
 }
 _FRACTION_RE = re.compile(
     _NUM
-    + r"\s*(?:/|\bof\b)\s*[*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*\s+"
+    + r"\s*(?:/|\bof\b)\s*[`*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[`*_]*\s+"
     + r"(?:(?:unit\s+|doc\s+|new\s+|proved\s+|proven\s+|kernel-checked\s+|checked\s+|verified\s+|Lean\s+|total\s+)?"
     + r"(?:mutants?|guards?|tests?|checks?)\s+)?"
     + r"(killed|passed|passing|pass|failed|failing|failures?|survived|surviving|survivors?|theorems?)\b",
@@ -789,11 +789,11 @@ _FRACTION_RE = re.compile(
 )
 _KILL_RATE_RES: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"(?i)(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*\s*%([+~]?)\s+"
+        r"(?i)(?<![\w.,/=])[`*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])[`*_]*\s*)?[`*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[`*_]*\s*%([+~]?)\s+"
         r"(?:of\s+)?(?:(?:mutants?|guards?)\s+)?(?:kill[ -]rate|killed|mutation\s+score)\b"
     ),
     re.compile(
-        r"(?i)\b[*_]*kill[ _-]rate(?:_pct)?[*_]*\s*(?:==|[=:]|of|is)?\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)\s*(?:%([+~]?))?"
+        r"(?i)\b[*_]*kill[ _-]rate(?:_pct)?[*_]*\s*(?:==|[=:]|of|is)?\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])[`*_]*\s*)?[`*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[`*_]*\s*(?:%([+~]?))?"
     ),
 )
 _ZERO_WORD_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -827,7 +827,9 @@ _BAD_KV_RE = re.compile(
     r"at\s+(?:least|most)|(?:more|less|fewer|greater)\s+than)\s+[0-9]+|"
     r"[~≈<>≥≤≠+\-][0-9]+|(?:>=|<=|!=)\s*[0-9]+|[0-9]+\.[0-9]+)\b"
     r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)(?:_count|_pct)?"
-    r"[*_]*\s*(?:>=|<=|!=|≠|>|<|≥|≤|≈|~(?!~))\s*[`*_]*[0-9][^\s`,;)|*]*"
+    r"[*_]*\s*(?:>=|<=|!=|≠|>|<|≥|≤|≈)\s*[`*_]*[^\s`,;)|*]+"
+    r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)(?:_count|_pct)?"
+    r"[*_]*\s*~(?!~)\s*[`*_]*[0-9][^\s`,;)|*]*"
     r"|ok[*_]*\s*(?:==|!=|≠|=(?!=))\s*[`*_]*(?!(?:true|false)\b)[^\s`,;)|*]+"
     r"|ok[*_]*\s*:\s*[`*_]*(?:unknown|tbd|n/a|na|nan|null|none|pending|skipped)\b"
     r"|(?:status|result|verdict|outcome)[*_]*\s*(?:==|!=|≠|[=:])\s*[`*_]*(?:unknown|tbd|n/a|na|null|none|pending|skipped)\b)"
@@ -847,6 +849,11 @@ _STATUS_RE = re.compile(
 )
 _OK_RE = re.compile(r"(?i)(?<![\w-])[*_]*ok[*_]*\s*(==|!=|≠|[=:])\s*[`*_]*(true|false)\b")
 _VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|OK|✅|❌)(?![\w/-]|\.\w|\()")
+_SCOPED_VERDICT_RE = re.compile(
+    r"(?i)(?:(?<=\|)|(?<=:))\s*[`*_]*\b(?P<neg>not\s+)?"
+    r"(?P<word>pass(?:ed|ing)?|green|succeed(?:ed)|success|fail(?:ed|ing|ure)?)\b[`*_]*\s*"
+    r"(?=\||[.;]|$)"
+)
 _ALL_PASS_RE = re.compile(
     r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
 )
@@ -867,7 +874,9 @@ _COMPARATIVE_PREFIX_RE = re.compile(
     r"(?i)(?:\b(?:vs\.?|versus|after|before|replacing|unlike|than|from|instead\s+of|"
     r"compared\s+(?:to|with|against)|against|see|mirrors|like|same\s+as|matching)\s+)$"
 )
-_PASS_WORDS: frozenset[str] = frozenset({"PASS", "PASSED", "PASSING", "OK", "SUCCESS", "GREEN", "✅"})
+_PASS_WORDS: frozenset[str] = frozenset(
+    {"PASS", "PASSED", "PASSING", "OK", "SUCCESS", "SUCCEEDED", "GREEN", "✅"}
+)
 _FAIL_WORDS: frozenset[str] = frozenset(
     {"FAIL", "FAILED", "FAILING", "FAILURE", "ERROR", "RED", "TIMEOUT", "❌"}
 )
@@ -877,9 +886,14 @@ _SHA_CLAIM_RE = re.compile(
     r"(?:\s+(?:is|was|at|of)){0,2}[`*_]*\s*(?P<sep>[:=|@]|->|→)?[*_]*\s*(?P<paren>\()?\s*[*_]*(?P<tick>[`'\"]?)(?P<value>[0-9A-Za-z/_.?<>-]+)"
 )
 _EXPLICIT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|hash|revision|commit[\s_-]+id)\b")
+_STRICT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|(?:commit|git|head|base)[\s_-]+hash)\b")
 _TABLE_NON_SHA_HEADERS: frozenset[str] = frozenset({
     "status", "result", "verdict", "outcome", "step", "steps", "notes", "note",
     "details", "detail", "check", "checks", "value", "description", "summary",
+})
+_TABLE_HEADER_CELL0_WORDS: frozenset[str] = frozenset({
+    "step", "steps", "check", "checks", "gate", "gates", "target", "command",
+    "commands", "test", "tests", "item", "name",
 })
 _BASE_ROLE_RE = re.compile(r"(?i)(?:^|[\s_-])(?:base|parent|previous|prior|old)(?:$|[\s_-])")
 _SHA_PLACEHOLDERS: frozenset[str] = frozenset({
@@ -953,11 +967,26 @@ _CONTROL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0085\u2028\u2029\u202
 _HAS_DIGIT_RE = re.compile(r"[0-9]")
 _HAS_KV_OP_RE = re.compile(r"[=:<>≤≥≠~≈]")
 _HAS_SHA_WORD_RE = re.compile(r"(?i)commit|sha|revision|head|base|parent|target")
-_BLOCKQUOTE_START_RE = re.compile(r"^\s*>\s+")
-_BLOCKQUOTE_STRIP_RE = re.compile(r"^(?:\s*>\s+)+")
-_BARE_NUM_LINE_RE = re.compile(r"^\s*[0-9]")
+_BQ_ONE_RE = re.compile(r"^\s{0,3}>\s?")
+_INEQ_GT_TAIL_RE = re.compile(r"^\s*(?:=|[~≈]|[+\-]?\s*[*_`]*[0-9])")
 _NUM_LIST_LINE_RE = re.compile(r"^\s*[0-9]+[.)]\s+")
 _TABLE_SEP_CELL_RE = re.compile(r"[-:\s]+")
+
+
+def _strip_blockquote_prefix(line: str, max_depth: int | None = None) -> tuple[str, int]:
+    """Strip CommonMark `>` blockquote prefixes unless `>` starts a numeric inequality."""
+    cur = line
+    depth = 0
+    while max_depth is None or depth < max_depth:
+        m = _BQ_ONE_RE.match(cur)
+        if m is None:
+            break
+        rem = cur[m.end() :]
+        if max_depth is None and _INEQ_GT_TAIL_RE.match(rem) and not _NUM_LIST_LINE_RE.match(rem):
+            break
+        cur = rem
+        depth += 1
+    return cur, depth
 
 
 def _inline_code_spans(line: str) -> list[tuple[int, int, str]]:
@@ -1291,32 +1320,37 @@ def _line_refs(
     return refs
 
 
-def _classify_sha(value: str, explicit: bool) -> tuple[str, str]:
+def _classify_sha(value: str, explicit: bool, *, strict_label: bool = False) -> tuple[str, str]:
     """`("valid", sha)`, `("ignore", "")`, or a violation code with its reason."""
     quoted = value[:1] in ("`", '"', "'")
     token = value.strip("`'\"*_").rstrip(".,;:)")
     if _SHA_RE.fullmatch(token):
         if set(token) == {"0"}:
             return "INVALID_COMMIT_SHA", f"`{token}` is the all-zero SHA"
-        if not explicit and not any(ch.isdigit() for ch in token):
+        if not explicit and not strict_label and not any(ch.isdigit() for ch in token):
             return "ignore", ""
         return "valid", token
     has_digit = any(ch.isdigit() for ch in token)
-    if explicit and (
+    if (explicit or strict_label) and (
         token.lower() in _SHA_PLACEHOLDERS
         or re.fullmatch(r"\?+", token)
         or (token.startswith("<") and token.endswith(">") and len(token) > 2)
     ):
         return "INVALID_COMMIT_SHA", f"`{token}` is a placeholder, not a commit SHA"
     # An English word made of hex letters (`added`, `dead`) is prose unless it
-    # carries a digit, sits in backticks/quotes, or is an explicit 7+ char hex token.
-    if re.fullmatch(r"[0-9a-fA-F]+", token) and (has_digit or quoted or (explicit and len(token) >= 7)):
+    # carries a digit, sits in backticks/quotes, sits under a strict SHA label,
+    # or is an explicit 7+ char hex token.
+    if re.fullmatch(r"[0-9a-fA-F]+", token) and (
+        has_digit or quoted or strict_label or (explicit and len(token) >= 7)
+    ):
         if len(token) < 7:
-            if explicit and (len(token) >= 4 or quoted):
+            if strict_label or (explicit and (len(token) >= 4 or quoted)):
                 return "AMBIGUOUS_COMMIT_SHA", f"`{token}` is shorter than 7 hex characters"
             return "ignore", ""
         reason = "longer than 40 characters" if len(token) > 40 else "not lowercase hex"
         return "INVALID_COMMIT_SHA", f"`{token}` is {reason}"
+    if strict_label and token:
+        return "INVALID_COMMIT_SHA", f"`{token}` is not hexadecimal"
     if explicit and has_digit and len(token) >= 7 and re.fullmatch(r"[0-9A-Za-z]+", token):
         return "INVALID_COMMIT_SHA", f"`{token}` is not hexadecimal"
     return "ignore", ""
@@ -1387,7 +1421,7 @@ def _preceded_by_approx_or_ineq(line: str, pos: int) -> bool:
 
 
 def _line_claims(
-    line: str, lineno: int, violations: list[Violation]
+    line: str, lineno: int, violations: list[Violation], *, has_step_context: bool = False
 ) -> list[tuple[int, str, str, object, str]]:
     """`(position, kind, metric, value, text)` claims of one line, each span used once."""
     found: list[tuple[int, str, str, object, str]] = []
@@ -1418,6 +1452,7 @@ def _line_claims(
             if sep == "|":
                 is_sep_or_hdr = bool(_TABLE_SEP_CELL_RE.fullmatch(clean_val)) or clean_val.lower() in _TABLE_NON_SHA_HEADERS
                 has_sha_word = bool(_EXPLICIT_SHA_LABEL_RE.search(m.group("label")))
+                strict_label = not is_sep_or_hdr and bool(_STRICT_SHA_LABEL_RE.search(m.group("label")))
                 explicit = not is_sep_or_hdr and (
                     bool(m.group("tick"))
                     or any(ch.isdigit() for ch in clean_val)
@@ -1426,7 +1461,12 @@ def _line_claims(
                 )
             else:
                 explicit = bool(sep) or bool(m.group("paren")) or bool(m.group("tick"))
-            verdict, detail = _classify_sha(m.group("tick") + raw_val, explicit)
+                strict_label = (bool(sep) or bool(m.group("tick"))) and bool(
+                    _STRICT_SHA_LABEL_RE.search(m.group("label"))
+                )
+            verdict, detail = _classify_sha(
+                m.group("tick") + raw_val, explicit, strict_label=strict_label
+            )
             if verdict == "ignore":
                 continue
             take(m)
@@ -1605,6 +1645,15 @@ def _line_claims(
                 found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
             else:
                 found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
+    if has_step_context and (":" in line or "|" in line):
+        for m in list(_SCOPED_VERDICT_RE.finditer(work[0])):
+            word = m.group("word").upper()
+            verdict = "pass" if word in _PASS_WORDS else "fail" if word in _FAIL_WORDS else ""
+            if verdict:
+                if m.group("neg") or _preceded_by_negation(line, m.start()):
+                    verdict = "fail" if verdict == "pass" else "pass"
+                take(m)
+                found.append((m.start(), "exit_status", "status", verdict, m.group(0).strip()))
     if "axiom" in low:
         for m in list(_STANDARD_AXIOMS_RE.finditer(work[0])):
             neg = _preceded_by_negation(line, m.start())
@@ -1616,18 +1665,19 @@ def _line_claims(
             found.append((m.start(), "axioms", "non_empty" if neg else "set", frozenset(), m.group(0).strip()))
         for m_list in list(_AXIOM_LIST_RE.finditer(work[0])):
             g_start, g_end = m_list.start(1), m_list.end(1)
-            raw_rest = work[0][g_start:g_end]
-            # If an earlier claim (`0 sorry`, `rc=0`, etc.) was already extracted and
-            # blanked out after a comma separator, truncate before that blanked claim
-            # so honest lines like `axioms: propext, Quot.sound, 0 sorry` do not fail
-            # as a dangling comma while literal `, ???` or trailing `,` still fails closed.
-            cut_at = None
-            for rel_i in range(len(raw_rest)):
-                if raw_rest[rel_i] == " " and line[g_start + rel_i] != " ":
-                    cut_at = rel_i
-                    break
-            if cut_at is not None:
-                raw_rest = raw_rest[:cut_at].rstrip(" \t").rstrip(",")
+            # Drop only comma-separated items that were already extracted in full as
+            # earlier claims (`0 sorry`, `rc=0`), while preserving every unblanked
+            # trailing item (`sorryAx`, `???`, or a genuine dangling comma).
+            kept_segs: list[str] = []
+            seg_pos = g_start
+            for orig_seg in line[g_start:g_end].split(","):
+                seg_end = seg_pos + len(orig_seg)
+                work_seg = work[0][seg_pos:seg_end]
+                seg_pos = seg_end + 1
+                if orig_seg.strip() and not work_seg.strip():
+                    continue
+                kept_segs.append(work_seg)
+            raw_rest = ",".join(kept_segs)
             take(m_list)
             names = _axiom_names(raw_rest)
             words = {name.lower() for name in names or ()}
@@ -1780,7 +1830,7 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         text = _CONTROL_RE.sub(" ", text)
     text = _INVISIBLE_RE.sub("", text)
     known = _KnownSteps(steps)
-    fence_state: tuple[str, int, int] | None = None  # (char, length, open_lineno)
+    fence_state: tuple[str, int, int, int] | None = None  # (char, length, open_lineno, bq_depth)
     in_ignore = in_comment = False
     ignore_line = comment_line = 0
     heading_ctx: tuple[str | None, str, bool] | None = None
@@ -1794,7 +1844,18 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
     ) -> list[tuple[int, str | None, str, bool, bool]]:
         refs = _line_refs(target, known, in_fence_mode)
         clauses = _clause_spans(target) if not in_fence_mode else [(0, len(target))]
-        raw_claims = _line_claims(target, lineno, violations)
+        is_table_hdr = False
+        if not in_fence_mode and not refs and target.lstrip().startswith("|"):
+            t_cells = _table_cell_spans(target)
+            if t_cells:
+                c0_plain = target[t_cells[0][0] : t_cells[0][1]].strip(" \t`*_").lower()
+                is_table_hdr = c0_plain in _TABLE_HEADER_CELL0_WORDS
+        raw_claims = _line_claims(
+            target,
+            lineno,
+            violations,
+            has_step_context=bool(refs or (fallback_ctx and not is_table_hdr)),
+        )
         scoped_positions = [
             c_pos for c_pos, c_kind, c_metric, _v, _s in raw_claims
             if c_kind != "commit_sha" and c_metric != "all"
@@ -1829,7 +1890,20 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
 
     for lineno, line in enumerate(text.split("\n"), 1):
         if fence_state is not None:
-            f_ch, f_len, _f_line = fence_state
+            f_ch, f_len, f_line, f_bq = fence_state
+            if f_bq > 0:
+                unq, got_bq = _strip_blockquote_prefix(line, max_depth=f_bq)
+                if got_bq < f_bq:
+                    violations.append(
+                        Violation("MALFORMED_CLAIMS", f_line, None,
+                                  "fenced code block is never closed")
+                    )
+                    fence_state = None
+                    para_ctx = None
+                else:
+                    line = unq
+        if fence_state is not None:
+            f_ch, f_len, _f_line, _f_bq = fence_state
             if _IGNORE_BEGIN in line or _IGNORE_END in line:
                 violations.append(
                     Violation("MALFORMED_CLAIMS", lineno, None,
@@ -1848,19 +1922,13 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
             if was_ignored:
                 ignored += 1
                 continue
-            if _BLOCKQUOTE_START_RE.match(line):
-                unquoted = _BLOCKQUOTE_STRIP_RE.sub("", line)
-                is_bare_number = bool(_BARE_NUM_LINE_RE.match(unquoted)) and not bool(
-                    _NUM_LIST_LINE_RE.match(unquoted)
-                )
-                if not is_bare_number and not _FENCE_OPEN_RE.match(unquoted):
-                    line = unquoted
+            line, bq_depth = _strip_blockquote_prefix(line)
             m_fence = _FENCE_OPEN_RE.match(line)
             if m_fence is not None:
                 f_ch, f_len, info = m_fence.group(1)[0], len(m_fence.group(1)), m_fence.group(2)
                 is_inline_tilde = f_ch == "~" and bool(re.search(rf"{re.escape(f_ch)}{{{f_len},}}\s*$", info))
                 if not (f_ch == "`" and "`" in info) and not is_inline_tilde:
-                    fence_state = (f_ch, f_len, lineno)
+                    fence_state = (f_ch, f_len, lineno, bq_depth)
                     para_ctx = None
                     info_s = info.strip()
                     if info_s and (
@@ -2045,8 +2113,9 @@ def verify_claims(
                     add("EXIT_CODE_MISMATCH", claim,
                         f"`{claim.text}` but {scope} exited with {claim.value}")
                 elif failing:
+                    unscoped_covers = claim.step is None and len(steps) == 1 and any_unscoped_fail_ack
                     for step in failing:
-                        if step.step_id not in acknowledged_fail_steps and not any_unscoped_fail_ack:
+                        if step.step_id not in acknowledged_fail_steps and not unscoped_covers:
                             add("SUPPRESSED_FAILURE", claim,
                                 f"`{claim.text}` suppresses failure of step `{step.step_id}` ({step.failure()})",
                                 step.step_id)

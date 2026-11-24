@@ -4396,7 +4396,7 @@ class ErrorWildcardFinding:
 
 _SPEC_TOKEN_RE = re.compile(
     r'"[^"]*"|«[^»\n]*»|r#[^\W\d][\w]*|[^\W\d][\w\']*|\d[\w.]*'
-    r"|==>|=>|::|\.\.=|\.\.|->|:=|==|!=|<=|>=|&&|\|\||/\\|\\/|<->|\S"
+    r"|==>|=>|::|\.\.=|\.\.|->|:=|==|!=|<=|>=|&&|\|\|\||\|\||\|>|/\\|\\/|<->|\S"
 )
 _SPEC_WORD_RE = re.compile(r"[^\W\d][\w']*")
 _SPEC_OPENERS: dict[str, str] = {"(": ")", "[": "]", "{": "}", "⟨": "⟩"}
@@ -4490,7 +4490,7 @@ def _wrapped(texts: Sequence[str]) -> bool:
 
 def _strip_parens(texts: Sequence[str]) -> list[str]:
     out = list(texts)
-    while out and out[0] == "(" and _wrapped(out):
+    while out and out[0] == "(" and _wrapped(out) and len(_split_top(out[1:-1], {","})) == 1:
         out = out[1:-1]
     return out
 
@@ -4537,9 +4537,15 @@ _CLOSURE_BAR_PRECEDERS: frozenset[str] = frozenset(
 )
 
 
+_PURE_BOOL_MACROS: frozenset[str] = frozenset({"matches", "cfg"})
+
+
 def _has_macro_invocation(toks: Sequence[str]) -> bool:
     return any(
-        tok == "!" and idx > 0 and _is_spec_word(toks[idx - 1])
+        tok == "!"
+        and idx > 0
+        and _is_spec_word(toks[idx - 1])
+        and _ident_key(toks[idx - 1]) not in _PURE_BOOL_MACROS
         for idx, tok in enumerate(toks)
     )
 
@@ -4791,15 +4797,19 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str], depth: int =
                 after_b = toks[close_b + 1] if 0 <= close_b and close_b + 1 < n else ""
                 is_scrutinee_block = after_b == "{" or after_b in _RUST_EXPR_CONT_OPS
                 if not is_scrutinee_block:
-                    for p_idx in range(len(pending_if_lets) - 1, -1, -1):
-                        entry = pending_if_lets[p_idx]
+                    earliest_chain_saved: dict[str, str] | None = None
+                    kept_if_lets: list[list[object]] = []
+                    for entry in pending_if_lets:
                         if entry[0] == sdepth and entry[3] in (0, 2):
                             for name in entry[1]:  # type: ignore[attr-defined]
                                 new_scope.pop(name, None)
-                            if entry[3] == 2:
-                                scopes[-1] = dict(entry[2])  # type: ignore[arg-type]
-                            pending_if_lets.pop(p_idx)
-                            break
+                            if entry[3] == 2 and earliest_chain_saved is None:
+                                earliest_chain_saved = dict(entry[2])  # type: ignore[arg-type]
+                        else:
+                            kept_if_lets.append(entry)
+                    if earliest_chain_saved is not None:
+                        scopes[-1] = earliest_chain_saved
+                    pending_if_lets = kept_if_lets
             scopes.append(new_scope)
             out.append(tok)
             idx += 1
@@ -4924,9 +4934,17 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str], depth: int =
                     break
                 scan += 1
             header_names = _pattern_binder_names(toks[idx + 1 : scan])
-            if prev in ("if", "while"):
+            if prev in ("if", "while", "&&"):
                 if header_names:
-                    pending_if_lets.append([sdepth, header_names, dict(scopes[-1]), 0, 0])
+                    chain_saved = next(
+                        (
+                            dict(e[2])  # type: ignore[arg-type]
+                            for e in pending_if_lets
+                            if e[0] == sdepth and e[3] == 2
+                        ),
+                        dict(scopes[-1]),
+                    )
+                    pending_if_lets.append([sdepth, header_names, chain_saved, 0, 0])
             elif header_names:
                 pending_lets.append((sdepth, header_names))
             skip_until = scan
@@ -5176,6 +5194,30 @@ def _has_non_let_assignment(toks: Sequence[str]) -> bool:
     return False
 
 
+def _rust_let_rhs_may_panic(rhs: Sequence[str]) -> bool:
+    """Whether an unfolded Rust `let` initializer may panic (arithmetic, shifts, indexing)."""
+    cleaned = _strip_pattern_generics(rhs)
+    for idx, tok in enumerate(cleaned):
+        prev = cleaned[idx - 1] if idx > 0 else ""
+        if tok in ("+", "-", "/", "%", "["):
+            return True
+        is_after_val = _is_spec_word(prev) or prev[:1].isdigit() or prev in (")", "]")
+        if tok == "*" and is_after_val:
+            return True
+        if is_after_val and cleaned[idx : idx + 2] in (["<", "<"], [">", ">"]):
+            return True
+    return False
+
+
+def _rust_part_may_early_exit(toks: Sequence[str]) -> bool:
+    """Whether a Rust subexpression may early-return, panic, or diverge before short-circuiting."""
+    return (
+        any(word in _RUST_BLOCK_ABORT_WORDS for word in toks)
+        or "?" in toks
+        or _has_macro_invocation(toks)
+    )
+
+
 def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
     """Fold a Rust `{ ... }` block body without ignoring earlier control flow."""
     statements = _split_rust_block_statements(toks)
@@ -5208,6 +5250,8 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
                 return None
             binder = _ident_key(lhs[0])
             rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
+            if rhs_val is None and _rust_let_rhs_may_panic(rhs):
+                return None
             if binder != "_":
                 if rhs_val is True:
                     bindings[binder] = "true"
@@ -5543,7 +5587,12 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
         while toks and toks[-1] in (";", ","):
             toks.pop()
             changed = True
-        if len(toks) >= 2 and toks[0] == "(" and _wrapped(toks):
+        if (
+            len(toks) >= 2
+            and toks[0] == "("
+            and _wrapped(toks)
+            and len(_split_top(toks[1:-1], {","})) == 1
+        ):
             toks = toks[1:-1]
             changed = True
         elif len(toks) >= 3 and toks[0] == "unsafe" and toks[1] == "{" and _wrapped(toks[1:]):
@@ -5651,20 +5700,42 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
         return None
     parts = _split_top(toks, {"||", "∨", "\\/"})
     if len(parts) > 1:
-        if _has_complementary_pair(parts):
-            return True
+        has_rust_or = "||" in toks
         values = [_const_truth(part, depth + 1) for part in parts]
-        if any(value is True for value in values):
+        for idx, value in enumerate(values):
+            if value is True and not (
+                has_rust_or and any(_rust_part_may_early_exit(p) for p in parts[:idx])
+            ):
+                return True
+        if _has_complementary_pair(parts) and not (
+            has_rust_or and any(_rust_part_may_early_exit(p) for p in parts)
+        ):
             return True
-        return False if all(value is False for value in values) else None
+        return (
+            False
+            if all(value is False for value in values)
+            and not (has_rust_or and any(_rust_part_may_early_exit(p) for p in parts))
+            else None
+        )
     parts = _split_top(toks, {"&&", "∧", "/\\"})
     if len(parts) > 1:
-        if _has_complementary_pair(parts):
-            return False
+        has_rust_and = "&&" in toks
         values = [_const_truth(part, depth + 1) for part in parts]
-        if any(value is False for value in values):
+        for idx, value in enumerate(values):
+            if value is False and not (
+                has_rust_and and any(_rust_part_may_early_exit(p) for p in parts[:idx])
+            ):
+                return False
+        if _has_complementary_pair(parts) and not (
+            has_rust_and and any(_rust_part_may_early_exit(p) for p in parts)
+        ):
             return False
-        return True if all(value is True for value in values) else None
+        return (
+            True
+            if all(value is True for value in values)
+            and not (has_rust_and and any(_rust_part_may_early_exit(p) for p in parts))
+            else None
+        )
     # Lean `¬` / `Not` bind looser than `=` (`¬ x = x` means `¬ (x = x)`), while
     # Rust `!` binds tighter than `==` / `!=` (`!c == !c` means `(!c) == (!c)`).
     if toks[0] in ("¬", "Not"):
@@ -5994,9 +6065,47 @@ def _alt_error_matches(alt: Sequence[str], depth: int = 0) -> list[tuple[str, bo
     return [(ctor, _payload_is_wildcard(payload))]
 
 
-def _alt_is_ok_ctor(alt: Sequence[str]) -> bool:
-    head, after_dot, _ = _alt_head(alt)
-    return head == "Ok" or (head == "ok" and after_dot)
+def _alt_is_ok_ctor(alt: Sequence[str], depth: int = 0) -> bool:
+    if depth > _MAX_SPEC_DEPTH:
+        return False
+    toks = _strip_pattern_generics(_strip_pattern_wrappers(alt))
+    if not toks:
+        return False
+    for seps in ({"|"}, {","}):
+        parts = _split_top(toks, seps)
+        if len(parts) > 1:
+            return any(_alt_is_ok_ctor(part, depth + 1) for part in parts if part)
+    if toks[0] == "{" and _wrapped(toks):
+        return any(_alt_is_ok_ctor(fp, depth + 1) for fp in _struct_field_patterns(toks[1:-1]))
+    if toks[0] in ("⟨", "[") and _wrapped(toks):
+        return _alt_is_ok_ctor(toks[1:-1], depth + 1)
+    head, after_dot, payload = _alt_head(toks)
+    if head == "Ok" or (head == "ok" and after_dot):
+        return True
+    idx = 0
+    while idx < len(payload):
+        if payload[idx] in _SPEC_OPENERS:
+            close, nesting = idx, 0
+            while close < len(payload):
+                if payload[close] in _SPEC_OPENERS:
+                    nesting += 1
+                elif payload[close] in _SPEC_CLOSERS:
+                    nesting -= 1
+                    if nesting == 0:
+                        break
+                close += 1
+            sub = payload[idx + 1 : close]
+            if payload[idx] == "{":
+                if any(_alt_is_ok_ctor(fp, depth + 1) for fp in _struct_field_patterns(sub)):
+                    return True
+            elif _alt_is_ok_ctor(sub, depth + 1):
+                return True
+            idx = close + 1
+        else:
+            idx += 1
+    if payload[:1] == ["."]:
+        return _alt_is_ok_ctor(payload, depth + 1)
+    return False
 
 
 def _alt_is_catch_all(alt: Sequence[str], depth: int = 0) -> bool:
@@ -6007,12 +6116,18 @@ def _alt_is_catch_all(alt: Sequence[str], depth: int = 0) -> bool:
         return False
     if toks[0] == "⟨" and _wrapped(toks):
         toks = toks[1:-1]
-    parts = _split_top(toks, {"|"})
-    if len(parts) > 1:
-        return any(_alt_is_catch_all(part, depth + 1) for part in parts)
-    parts = _split_top(toks, {","})
-    if len(parts) > 1:
-        return all(_alt_is_catch_all(part, depth + 1) for part in parts)
+    # Tuple comma binds looser than inner `|` inside a tuple element (`(_ | 0, Ok(y))`
+    # has two tuple elements), while top-level `|` without top-level `,` (`_ | 0`) splits below.
+    comma_parts = _split_top(toks, {","})
+    if len(comma_parts) > 1:
+        if not comma_parts[-1]:
+            comma_parts = comma_parts[:-1]
+        return bool(comma_parts) and all(
+            bool(part) and _alt_is_catch_all(part, depth + 1) for part in comma_parts
+        )
+    or_parts = _split_top(toks, {"|"})
+    if len(or_parts) > 1:
+        return any(_alt_is_catch_all(part, depth + 1) for part in or_parts)
     toks = _strip_pattern_wrappers(toks)
     toks = _split_top(toks, {":"})[0]
     toks = _strip_pattern_wrappers(toks)
@@ -6238,7 +6353,11 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                 else:
                     break
             m_stack.append([head_col, i, -1, min_arm_col])
-        if text_ == "matches" and texts[i + 1 : i + 3] == ["!", "("]:
+        if (
+            text_ == "matches"
+            and texts[i + 1 : i + 2] == ["!"]
+            and texts[i + 2 : i + 3] in (["("], ["["], ["{"])
+        ):
             close = partner[i + 2]
             first_comma = _split_first_top(texts[i + 3 : close], {","})
             if first_comma is None or not first_comma[1]:
@@ -6248,8 +6367,41 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                 rhs_pat.pop()
             if not rhs_pat:
                 continue
+            expr_lo, expr_hi = i, close
             negations = 0
-            while i - 1 - negations >= 0 and texts[i - 1 - negations] == "!":
+            changed_span = True
+            while changed_span:
+                changed_span = False
+                while (
+                    expr_lo >= 2
+                    and texts[expr_lo - 1] == "::"
+                    and _is_spec_word(texts[expr_lo - 2])
+                ):
+                    expr_lo -= 2
+                    changed_span = True
+                if expr_lo >= 1 and texts[expr_lo - 1] == "::":
+                    expr_lo -= 1
+                    changed_span = True
+                while expr_lo >= 1 and texts[expr_lo - 1] == "!":
+                    negations += 1
+                    expr_lo -= 1
+                    changed_span = True
+                if (
+                    expr_lo >= 1
+                    and expr_hi + 1 < count
+                    and texts[expr_lo - 1] == "("
+                    and partner.get(expr_lo - 1) == expr_hi + 1
+                ):
+                    expr_lo -= 1
+                    expr_hi += 1
+                    changed_span = True
+            if (
+                texts[expr_hi + 1 : expr_hi + 3] in (["==", "false"], ["!=", "true"])
+                or (
+                    expr_lo >= 2
+                    and texts[expr_lo - 2 : expr_lo] in (["false", "=="], ["true", "!="])
+                )
+            ):
                 negations += 1
             guard_split = _split_first_top(rhs_pat, {"if"})
             pat_tokens = rhs_pat if guard_split is None else guard_split[0]
@@ -6384,6 +6536,7 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
         # Body: scan right to the token that ends this arm.
         k = i + 1
         in_lean_nested_match = False
+        inner_let_headers = 0
         while k < count:
             nxt = texts[k]
             if nxt in _SPEC_OPENERS:
@@ -6396,6 +6549,14 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
             if nxt in _SPEC_CLOSERS or (nxt in (";", ",") and not lean):
                 break
             if lean:
+                if nxt in ("let", "have"):
+                    inner_let_headers += 1
+                elif nxt == ":=":
+                    if inner_let_headers == 0:
+                        break
+                    inner_let_headers -= 1
+                elif nxt in (";", "in", "then"):
+                    inner_let_headers = 0
                 if (
                     nxt == "match"
                     or ((nxt == "fun" or nxt.startswith("λ")) and texts[k + 1 : k + 2] == ["|"])
@@ -6490,8 +6651,11 @@ def _arm_wildcard_pattern(arm: dict[str, object], ok_groups: set[object]) -> str
     if not arm["guard_ok"]:
         return None
     if arm["macro"]:
+        matches_saw_ok = any(_alt_is_ok_ctor(alt) for alt in alts)
         for alt in alts:
-            if any(wild for _, wild in _alt_error_matches(alt)) or _alt_is_catch_all(alt):
+            if any(wild for _, wild in _alt_error_matches(alt)) or (
+                matches_saw_ok and _alt_is_catch_all(alt)
+            ):
                 return "matches_any_err"
         return None
     if arm["body_truth"] is not True:
@@ -6594,7 +6758,10 @@ def _probe_arms(arms: Sequence[dict[str, object]], mutant: str, lang: str) -> di
         hits = [hit for alt in alts for hit in _alt_error_matches(alt) if hit[0] == mutant]
         catch_all = any(_alt_is_catch_all(alt) for alt in alts)
         if arm["macro"]:
-            if arm["guard_ok"] and (catch_all or any(wild for _, wild in hits)):
+            matches_saw_ok = any(_alt_is_ok_ctor(alt) for alt in alts)
+            if arm["guard_ok"] and (
+                (matches_saw_ok and catch_all) or any(wild for _, wild in hits)
+            ):
                 return {
                     **base,
                     "status": "SURVIVED",
@@ -6602,6 +6769,8 @@ def _probe_arms(arms: Sequence[dict[str, object]], mutant: str, lang: str) -> di
                     "line": arm["line"],
                     "detail": f"`matches!` at line {arm['line']} accepts every `{mutant}` outcome",
                 }
+            if hits and constrained_line is None:
+                constrained_line = arm["line"]  # type: ignore[assignment]
             continue
         group = arm["group"]
         if group in decided:
