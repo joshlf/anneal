@@ -1611,6 +1611,313 @@
       ]
     },
     {
+      "module": "Workbench.Pass1.NatBitwise",
+      "path": "lean/Workbench/Pass1/NatBitwise.lean",
+      "badge": "pass1_portable",
+      "summary": "Pass-1-portable (`prelude` + locked `Init.*` only, zero `._unsafe_rec`, exact `TrustedBoundary` CST syntax, axioms `⊆ [propext]`) library consolidating the `Nat.bitwise`, `Nat.land`, `Nat.lor`, `Nat.xor`, `Nat.shiftLeft`, `Nat.shiftRight`, and `Nat.testBit` lemmas missing from `foundation-lock.json` (`Init.Data.Nat.Bitwise.Lemmas` is outside the 51 locked foundation modules):",
+      "line_count": 874,
+      "imports": [
+        "Init.Core",
+        "Init.NotationExtra",
+        "Init.SimpLemmas",
+        "Init.Tactics",
+        "Init.Data.Nat.Basic",
+        "Init.Data.Nat.Div.Basic",
+        "Init.Data.Nat.Bitwise.Basic"
+      ],
+      "declaration_count": 72,
+      "declarations": [
+        {
+          "kind": "theorem",
+          "name": "ite_prop_true"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_prop_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_bool_true"
+        },
+        {
+          "kind": "theorem",
+          "name": "ite_bool_false"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_le_pow_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_pow_pos"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_pow_add"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_add_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_eq_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_one"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_div_eq_div_mul"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_zero_div"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_zero_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mul_div_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_add_mul_mod_self_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_div_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_div_mul_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mul_mod_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_mul_mod_two"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_mul_add_one_mod_two"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_mul_div_two"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_two_mul_add_one_div_two"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_mod_two_eq_zero_or_one"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_div_two_lt_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lt_two_pow_self"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_bitwise_unfold"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_eq_bitwise"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_eq_bitwise"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_eq_bitwise"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_bitwise_lt_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_lt_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_lt_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_lt_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_one_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_zero_bit"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_succ"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_zero"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_eq_false_of_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_two_pow_sub_one"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_mod_two_pow"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_shiftLeft"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_shiftRight"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_bitwise"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_land"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_lor"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_testBit_xor"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_eq_of_testBit_eq_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_eq_of_testBit_eq"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_le_of_testBit_imp_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_le_of_testBit_imp"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_le_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_le_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_two_pow_sub_one_eq_mod"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_comm"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_comm"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_comm"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_assoc"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_assoc"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_assoc"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_self"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_zero_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_zero_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_zero_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_land_zero_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_zero_left"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_xor_zero_right"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_add_land_lt"
+        },
+        {
+          "kind": "theorem",
+          "name": "nat_lor_add_land"
+        }
+      ]
+    },
+    {
       "module": "Workbench.Pass1.PTree",
       "path": "lean/Workbench/Pass1/PTree.lean",
       "badge": "pass1_portable",
@@ -1960,7 +2267,7 @@
       "path": "lean/Workbench/Pass1.lean",
       "badge": "pass1_portable",
       "summary": "",
-      "line_count": 17,
+      "line_count": 18,
       "imports": [
         "Workbench.Pass1.InitLemmas",
         "Workbench.Pass1.Firewall",
@@ -1969,7 +2276,8 @@
         "Workbench.Pass1.LinearArith",
         "Workbench.Pass1.BitTrieLrat",
         "Workbench.Pass1.ClassicalEm",
-        "Workbench.Pass1.ModIntOrder"
+        "Workbench.Pass1.ModIntOrder",
+        "Workbench.Pass1.NatBitwise"
       ],
       "declaration_count": 0,
       "declarations": []

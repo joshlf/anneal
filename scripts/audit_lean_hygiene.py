@@ -56,6 +56,8 @@ def main : IO Unit := do
   let mut badAxiomDecls : List (String × List String) := []
   let mut eqSplitters : List String := []
   let mut foreignRealized : List (String × String) := []
+  let mut foundationRealized : List (String × String) := []
+  let mut realizedModCounts : Std.HashMap String (List String) := {}
   let mut allAxiomsUsed : Std.HashSet String := {}
 
   for i in [:env.header.moduleData.size] do
@@ -65,7 +67,22 @@ def main : IO Unit := do
       for c in mData.constNames do
         let cs := c.toString
         if !(startsWithAny cs prefixes) && !(cs.startsWith "_private.") then
-          foreignRealized := (mName, cs) :: foreignRealized
+          let isReservedFoundationThm :=
+            match env.find? c with
+            | some (.thmInfo _) => Lean.isReservedName env c
+            | _ => false
+          if isReservedFoundationThm then
+            foundationRealized := (mName, cs) :: foundationRealized
+            let prev := realizedModCounts.getD cs []
+            if !(prev.contains mName) then
+              realizedModCounts := realizedModCounts.insert cs (mName :: prev)
+          else
+            foreignRealized := (mName, cs) :: foreignRealized
+
+  let mut dupRealized : List (String × List String) := []
+  for (cs, mods) in realizedModCounts.toList do
+    if mods.length > 1 then
+      dupRealized := (cs, mods.mergeSort) :: dupRealized
 
   for (name, ci) in env.constants.map₁.toList do
     let s := name.toString
@@ -99,6 +116,10 @@ def main : IO Unit := do
     ("eq_or_splitter_decls", toJson eqSplitters.mergeSort),
     ("foreign_realized_consts", Json.arr (foreignRealized.map (fun (m, c) =>
       Json.mkObj [("module", toJson m), ("const", toJson c)])).toArray),
+    ("foundation_realized_helpers", Json.arr (foundationRealized.map (fun (m, c) =>
+      Json.mkObj [("module", toJson m), ("const", toJson c)])).toArray),
+    ("duplicate_realized_helpers", Json.arr (dupRealized.map (fun (c, ms) =>
+      Json.mkObj [("const", toJson c), ("modules", toJson ms)])).toArray),
     ("axioms_used", toJson allAxiomsUsed.toList.mergeSort),
     ("disallowed_axiom_decls", Json.arr (badAxiomDecls.map (fun (d, axs) =>
       Json.mkObj [("decl", toJson d), ("axioms", toJson axs)])).toArray)
@@ -189,6 +210,7 @@ def run_environment_audit(
         and not data["sorry_decls"]
         and not data["disallowed_axiom_decls"]
         and not data.get("foreign_realized_consts")
+        and not data.get("duplicate_realized_helpers")
     )
     return data
 
