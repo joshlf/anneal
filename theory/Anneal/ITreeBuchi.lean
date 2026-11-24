@@ -48,14 +48,22 @@ Trees*):
 - **`BuchiSpec`** / **`BuchiSat`**: a shallow Büchi monitor synchronised with the
   program through `BuchiSpec.monitorWP`, unifying `Always` safety, `InfOften`
   liveness and a terminal Hoare postcondition.
+- **`FairInfOften`** (Streett `□◇ Fair → □◇ AccEdge`): liveness *under a
+  fairness assumption*, the four-level parity fixpoint
+  `ν X₄. μ X₃. ν X₂. μ X₁` (`fairProgress` / `fairStall` / `fairStep`). It
+  reduces exactly to `InfOften` when every edge is fair and to reactive
+  productivity when none is, rejects `ITree.spin` unconditionally, and admits
+  the fair retry-loop rule `FairInfOften.iter_fair` for CAS loops, which `DWP`
+  and plain `InfOften` cannot verify (`fairInfOften_strict_separation`).
 - **`iterChain`**: the finite-unfolding $\omega$-chain of `ITree.iter`, its
   convergence in the projective `CofixA` order (`ofITree_iterChain`), and the
   safety ($\bigwedge_n$) versus eventuality ($\bigvee_n$) continuity laws.
 
 The continuity laws are stated under the one-step continuity classes
-`DownContinuous` / `UpContinuous`. Neither can be dropped: `not_always_iter_continuity_angelic` and
-`not_dwp_iter_continuity_unbounded` exhibit unboundedly angelic and unboundedly
-demonic transformers for which the corresponding law is false.
+`DownContinuous` / `UpContinuous`. Neither can be dropped:
+`not_always_iter_continuity_angelic` and `not_dwp_iter_continuity_unbounded`
+exhibit unboundedly angelic and unboundedly demonic transformers for which the
+corresponding law is false.
 -/
 
 universe u
@@ -176,7 +184,9 @@ theorem DWLP.eutt {S : Type u} {E : Effect.{u}} {R : Type u}
     | step hu_tau hrest =>
       rw [hu_tau]
       exact ⟨t',
-        by rw [Eutt.eq_def]; exact Or.inr (Or.inl ⟨t', u', i, k₁, k₂, .refl t', hrest, htv, huv, hk⟩),
+        by
+          rw [Eutt.eq_def]
+          exact Or.inr (Or.inl ⟨t', u', i, k₁, k₂, .refl t', hrest, htv, huv, hk⟩),
         by rw [eq_vis_of_observe htv, DWLP.vis_iff]; exact ht'⟩
   · rw [eq_tau_of_observe ht, DWLP.tau_iff] at ht₀
     rw [hu]
@@ -576,7 +586,9 @@ theorem Always.eutt {ewp : StateEffectWP S E} {Inv : S → Prop}
     | step hu_tau hrest =>
       rw [hu_tau]
       exact ⟨t',
-        by rw [Eutt.eq_def]; exact Or.inr (Or.inl ⟨t', u', i, k₁, k₂, .refl t', hrest, htv, huv, hk⟩),
+        by
+          rw [Eutt.eq_def]
+          exact Or.inr (Or.inl ⟨t', u', i, k₁, k₂, .refl t', hrest, htv, huv, hk⟩),
         by rw [eq_vis_of_observe htv, Always.vis_iff]; exact ht'⟩
   · rw [eq_tau_of_observe ht, Always.tau_iff] at ht₀
     rw [hu]
@@ -2087,7 +2099,10 @@ theorem Eventually.iter_ranked_lt {I : Type u} {ewp : StateEffectWP S E}
     Eventually ewp Target Q (ITree.iter body init) s :=
   Eventually.iter_wf (fun a b : Nat => a < b) Nat.lt_wfRel.wf body LInv h_body h_init
 
-/-- Classic LTL implication $\Box H \land \Diamond T \implies H \mathbin{\mathcal{U}} (H \land T)$. -/
+/--
+Classic LTL implication
+$\Box H \land \Diamond T \implies H \mathbin{\mathcal{U}} (H \land T)$.
+-/
 theorem until_of_always_eventually {ewp : StateEffectWP S E}
     [StateEffectWP.Conjunctive ewp] {Hold Target : S → Prop}
     {P Q : R → S → Prop} {t : ITree E R} {s : S}
@@ -3292,6 +3307,37 @@ theorem InfOften.guardInv_of_always {ewp : StateEffectWP S E}
         hpq.1.2.elim (fun ha => Or.inl ⟨ha, hpq.2, hpq.1.1⟩)
           (fun hpre => Or.inr (hpre hpq.2))⟩) (h_conj.conj hy hay)
 
+/--
+Under `[Conjunctive ewp]`, transition-relational `AlwaysStep` safety can be
+merged into a Büchi recurrence proof, yielding recurrence over the
+step-guarded transformer (every accepting run respects `StepRel`).
+-/
+theorem InfOften.guardStep_of_alwaysStep {ewp : StateEffectWP S E}
+    [h_conj : StateEffectWP.Conjunctive ewp]
+    {AccEdge StepRel : (i : E.I) → E.O i → S → S → Prop}
+    {P Q : R → S → Prop} {t : ITree E R} {s : S}
+    (h_safe : AlwaysStep ewp StepRel P t s) (h : InfOften ewp AccEdge Q t s) :
+    InfOften (guardStepWP ewp StepRel) AccEdge Q t s := by
+  refine InfOften.coinduct
+    (fun x s₀ => AlwaysStep ewp StepRel P x s₀ ∧ InfOften ewp AccEdge Q x s₀)
+    ?_ ⟨h_safe, h⟩
+  rintro x s₀ ⟨hax, hix⟩
+  refine InfOften.progress_induct
+    (fun y s₁ => AlwaysStep ewp StepRel P y s₁ →
+      buchiProgress (guardStepWP ewp StepRel) AccEdge Q
+        (fun z s₂ => AlwaysStep ewp StepRel P z s₂ ∧ InfOften ewp AccEdge Q z s₂)
+        y s₁) ?_ hix hax
+  intro y s₁ hy hay
+  rw [buchiProgress.unfold_eq]
+  rw [AlwaysStep.unfold_eq] at hay
+  cases h_obs : y.observe <;> simp only [h_obs] at hy hay ⊢
+  · exact hy
+  · exact hy.2 hay
+  · exact ewp.mono
+      (fun _ _ hpq => ⟨hpq.2.1,
+        hpq.1.2.elim (fun ha => Or.inl ⟨ha, hpq.2.2, hpq.1.1⟩)
+          (fun hpre => Or.inr (hpre hpq.2.2))⟩) (h_conj.conj hy hay)
+
 /-- Conditional branching rule for `InfOften`. -/
 theorem InfOften.ite {ewp : StateEffectWP S E}
     {AccEdge : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
@@ -3818,6 +3864,13 @@ variable {S QState : Type u} {E : Effect.{u}} {R : Type u}
 Synchronous product of the program transformer with the monitor: after each
 answer the monitor (angelically, as in a nondeterministic Büchi automaton)
 picks a successor state allowed by `step`.
+
+The successor is chosen *at the current tree position*, i.e. knowing the
+history but not the environment's future answers. `BuchiSat` is therefore
+sound for every monitor, and complete for deterministic (`ofDet`) or
+history-deterministic monitors, but incomplete for monitors that must guess
+the future (e.g. the two-state automaton for `◇□ a` against an environment
+that may emit one more `b` at every step).
 -/
 def prodWP (spec : BuchiSpec S QState E R) : StateEffectWP (QState × S) E where
   wp i K qs :=
@@ -5185,6 +5238,1037 @@ theorem Triple.of_infOften [p : PureEffectWP E]
   fun hp => (h hp).toDWLP
 
 end InfOftenStdDo
+
+/-! ### 3.4 Fairness-Conditional Liveness (`FairInfOften`, Streett / Parity) -/
+
+section FairInfOften
+
+variable {S : Type u} {E : Effect.{u}} {R : Type u}
+
+/-!
+`InfOften` (Büchi) can only state `□◇ AccEdge ∨ ◇ ret`. Liveness of retry loops
+*under a fairness assumption* (`creusot#2386` `Atomic::try_update`: "if the
+environment infinitely often lets the CAS through, the loop terminates") is the
+Streett condition `□◇ Fair → □◇ AccEdge` (or a `Q`-return). `FairInfOften` is the
+max-parity game with priorities
+
+* `4` accepting edges (`AccEdge`, good),
+* `3` fair edges (`Fair`, bad unless dominated by accepting edges),
+* `2` other visible edges (good: an unfair environment is not the program's fault),
+* `1` silent `.tau` steps (bad: silent divergence is always rejected),
+
+encoded as the four-level nested fixpoint `ν X₄. μ X₃. ν X₂. μ X₁`
+(`FairInfOften` / `fairProgress` / `fairStall` / `fairStep`).
+-/
+
+private def fairStepAux (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  match t.observe with
+  | .ret r => Q r s
+  | .tau t' => fairStepAux ewp AccEdge Fair Q X4 X3 X2 t' s
+  | .vis i k =>
+    ewp.wp i
+      (fun o s' => (AccEdge i o s s' ∧ X4 (k o) s') ∨
+        (Fair i o s s' ∧ X3 (k o) s') ∨ (¬ Fair i o s s' ∧ X2 (k o) s')) s
+inductive_fixpoint
+
+/--
+Innermost level (`μ X₁`, priority `1`) of the fairness game: after finitely many
+silent steps the tree returns with `Q` or takes a visible edge, whose residual
+must satisfy `X4` (accepting edge), `X3` (fair edge) or `X2` (unfair edge).
+-/
+def fairStep (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  fairStepAux ewp AccEdge Fair Q X4 X3 X2 t s
+
+theorem fairStep.unfold_eq (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (t : ITree E R) (s : S) :
+    fairStep ewp AccEdge Fair Q X4 X3 X2 t s =
+      match t.observe with
+      | .ret r => Q r s
+      | .tau t' => fairStep ewp AccEdge Fair Q X4 X3 X2 t' s
+      | .vis i k =>
+        ewp.wp i
+          (fun o s' => (AccEdge i o s s' ∧ X4 (k o) s') ∨
+            (Fair i o s s' ∧ X3 (k o) s') ∨ (¬ Fair i o s s' ∧ X2 (k o) s')) s :=
+  fairStepAux.eq_def ewp AccEdge Fair Q X4 X3 X2 t s
+
+/-- Park induction principle for `fairStep`. -/
+theorem fairStep.induct {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 X3 X2 : ITree E R → S → Prop} (Pre : ITree E R → S → Prop)
+    (h_closed : ∀ x s₀,
+      (match x.observe with
+       | .ret r => Q r s₀
+       | .tau x' => Pre x' s₀
+       | .vis i k =>
+         ewp.wp i
+           (fun o s' => (AccEdge i o s₀ s' ∧ X4 (k o) s') ∨
+             (Fair i o s₀ s' ∧ X3 (k o) s') ∨ (¬ Fair i o s₀ s' ∧ X2 (k o) s')) s₀) →
+      Pre x s₀)
+    {t : ITree E R} {s : S} (h : fairStep ewp AccEdge Fair Q X4 X3 X2 t s) :
+    Pre t s :=
+  fairStepAux.induct ewp AccEdge Fair Q X4 X3 X2 s (fun x => Pre x s)
+    (fun x hx => h_closed x s hx) t h
+
+@[simp]
+theorem fairStep.ret_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (r : R) (s : S) :
+    fairStep ewp AccEdge Fair Q X4 X3 X2 (.ret r) s ↔ Q r s := by
+  conv => lhs; rw [fairStep.unfold_eq, ITree.observe_ret]
+
+@[simp]
+theorem fairStep.tau_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (t : ITree E R) (s : S) :
+    fairStep ewp AccEdge Fair Q X4 X3 X2 (.tau t) s ↔
+      fairStep ewp AccEdge Fair Q X4 X3 X2 t s := by
+  conv => lhs; rw [fairStep.unfold_eq, ITree.observe_tau]
+
+@[simp]
+theorem fairStep.vis_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 X2 : ITree E R → S → Prop) (i : E.I) (k : E.O i → ITree E R)
+    (s : S) :
+    fairStep ewp AccEdge Fair Q X4 X3 X2 (.vis i k) s ↔
+      ewp.wp i
+        (fun o s' => (AccEdge i o s s' ∧ X4 (k o) s') ∨
+          (Fair i o s s' ∧ X3 (k o) s') ∨ (¬ Fair i o s s' ∧ X2 (k o) s')) s := by
+  conv => lhs; rw [fairStep.unfold_eq, ITree.observe_vis]
+
+/-- Monotonicity of `fairStep` in its three continuations. -/
+theorem fairStep.mono {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 X4' X3 X3' X2 X2' : ITree E R → S → Prop} {t : ITree E R} {s : S}
+    (h4 : ∀ x s', X4 x s' → X4' x s') (h3 : ∀ x s', X3 x s' → X3' x s')
+    (h2 : ∀ x s', X2 x s' → X2' x s')
+    (h : fairStep ewp AccEdge Fair Q X4 X3 X2 t s) :
+    fairStep ewp AccEdge Fair Q X4' X3' X2' t s := by
+  refine fairStep.induct
+    (fun x s₀ => fairStep ewp AccEdge Fair Q X4' X3' X2' x s₀) ?_ h
+  intro x s₀ hx
+  rw [fairStep.unfold_eq]
+  cases h_obs : x.observe <;> simp only [h_obs] at hx ⊢
+  · exact hx
+  · exact hx
+  · exact ewp.mono
+      (fun _ _ hp => hp.imp (And.imp id (h4 _ _))
+        (Or.imp (And.imp id (h3 _ _)) (And.imp id (h2 _ _)))) hx
+
+/-- `fairStep` is monotone in `X2` for the `coinductive_fixpoint` order. -/
+@[partial_fixpoint_monotone]
+theorem fairStep.monotone_coind (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 : ITree E R → S → Prop)
+    {α : Type _} [Lean.Order.PartialOrder α] (t : ITree E R) (s : S)
+    (f : α → ITree E R → S → Lean.Order.ReverseImplicationOrder)
+    (hf : Lean.Order.monotone f) :
+    @Lean.Order.monotone _ _ _ Lean.Order.ReverseImplicationOrder.instOrder
+      (fun x => fairStep ewp AccEdge Fair Q X4 X3 (f x) t s) :=
+  fun x y hxy h =>
+    fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+      (fun t' s' hr => hf x y hxy t' s' hr) h
+
+private def fairStallAux (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  fairStep ewp AccEdge Fair Q X4 X3 (fairStallAux ewp AccEdge Fair Q X4 X3) t s
+coinductive_fixpoint
+
+/--
+Level `ν X₂` (priority `2`) of the fairness game: unfair visible edges may be
+taken forever.
+-/
+def fairStall (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  fairStallAux ewp AccEdge Fair Q X4 X3 t s
+
+theorem fairStall.unfold_eq (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 X3 : ITree E R → S → Prop) (t : ITree E R) (s : S) :
+    fairStall ewp AccEdge Fair Q X4 X3 t s =
+      fairStep ewp AccEdge Fair Q X4 X3 (fairStall ewp AccEdge Fair Q X4 X3) t s :=
+  fairStallAux.eq_def ewp AccEdge Fair Q X4 X3 t s
+
+/-- Park coinduction principle for `fairStall`. -/
+theorem fairStall.coinduct {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 X3 : ITree E R → S → Prop} (Z : ITree E R → S → Prop)
+    (h_step : ∀ x s₀, Z x s₀ → fairStep ewp AccEdge Fair Q X4 X3 Z x s₀)
+    {t : ITree E R} {s : S} (h : Z t s) :
+    fairStall ewp AccEdge Fair Q X4 X3 t s :=
+  fairStallAux.coinduct ewp AccEdge Fair Q X4 X3 Z h_step t s h
+
+/-- Monotonicity of `fairStall` in `X4` and `X3`. -/
+theorem fairStall.mono {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 X4' X3 X3' : ITree E R → S → Prop} {t : ITree E R} {s : S}
+    (h4 : ∀ x s', X4 x s' → X4' x s') (h3 : ∀ x s', X3 x s' → X3' x s')
+    (h : fairStall ewp AccEdge Fair Q X4 X3 t s) :
+    fairStall ewp AccEdge Fair Q X4' X3' t s := by
+  refine fairStall.coinduct
+    (fun x s₀ => fairStall ewp AccEdge Fair Q X4 X3 x s₀) ?_ h
+  intro x s₀ hx
+  rw [fairStall.unfold_eq] at hx
+  exact fairStep.mono h4 h3 (fun _ _ h => h) hx
+
+/-- `fairStall` is monotone in `X3` for the `inductive_fixpoint` order. -/
+@[partial_fixpoint_monotone]
+theorem fairStall.monotone_ind (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 : ITree E R → S → Prop)
+    {α : Type _} [Lean.Order.PartialOrder α] (t : ITree E R) (s : S)
+    (f : α → ITree E R → S → Lean.Order.ImplicationOrder)
+    (hf : Lean.Order.monotone f) :
+    @Lean.Order.monotone _ _ _ Lean.Order.ImplicationOrder.instOrder
+      (fun x => fairStall ewp AccEdge Fair Q X4 (f x) t s) :=
+  fun x y hxy h =>
+    fairStall.mono (fun _ _ h => h) (fun t' s' hr => hf x y hxy t' s' hr) h
+
+private def fairProgressAux (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  fairStall ewp AccEdge Fair Q X4 (fairProgressAux ewp AccEdge Fair Q X4) t s
+inductive_fixpoint
+
+/--
+Level `μ X₃` (priority `3`) of the fairness game: only finitely many fair edges
+may be taken before the next accepting edge (or a `Q`-return).
+-/
+def fairProgress (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 : ITree E R → S → Prop) (t : ITree E R) (s : S) : Prop :=
+  fairProgressAux ewp AccEdge Fair Q X4 t s
+
+theorem fairProgress.unfold_eq (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 : ITree E R → S → Prop) (t : ITree E R) (s : S) :
+    fairProgress ewp AccEdge Fair Q X4 t s =
+      fairStall ewp AccEdge Fair Q X4 (fairProgress ewp AccEdge Fair Q X4) t s :=
+  fairProgressAux.eq_def ewp AccEdge Fair Q X4 t s
+
+/-- Park induction principle for `fairProgress`. -/
+theorem fairProgress.induct {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 : ITree E R → S → Prop} (Pre : ITree E R → S → Prop)
+    (h_closed : ∀ x s₀, fairStall ewp AccEdge Fair Q X4 Pre x s₀ → Pre x s₀)
+    {t : ITree E R} {s : S} (h : fairProgress ewp AccEdge Fair Q X4 t s) :
+    Pre t s :=
+  fairProgressAux.induct ewp AccEdge Fair Q X4 Pre h_closed t s h
+
+/-- Monotonicity of `fairProgress` in `X4`. -/
+theorem fairProgress.mono {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 X4' : ITree E R → S → Prop} {t : ITree E R} {s : S}
+    (h4 : ∀ x s', X4 x s' → X4' x s')
+    (h : fairProgress ewp AccEdge Fair Q X4 t s) :
+    fairProgress ewp AccEdge Fair Q X4' t s := by
+  refine fairProgress.induct
+    (fun x s₀ => fairProgress ewp AccEdge Fair Q X4' x s₀) ?_ h
+  intro x s₀ hx
+  rw [fairProgress.unfold_eq]
+  exact fairStall.mono h4 (fun _ _ h => h) hx
+
+/-- `fairProgress` is monotone in `X4` for the `coinductive_fixpoint` order. -/
+@[partial_fixpoint_monotone]
+theorem fairProgress.monotone_coind (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    {α : Type _} [Lean.Order.PartialOrder α] (t : ITree E R) (s : S)
+    (f : α → ITree E R → S → Lean.Order.ReverseImplicationOrder)
+    (hf : Lean.Order.monotone f) :
+    @Lean.Order.monotone _ _ _ Lean.Order.ReverseImplicationOrder.instOrder
+      (fun x => fairProgress ewp AccEdge Fair Q (f x) t s) :=
+  fun x y hxy h => fairProgress.mono (fun t' s' hr => hf x y hxy t' s' hr) h
+
+/-- `fairProgress X4` is a fixed point of `Z ↦ fairStep X4 Z Z` (one direction). -/
+theorem fairProgress.toFairStep {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {X4 : ITree E R → S → Prop} {t : ITree E R} {s : S}
+    (h : fairProgress ewp AccEdge Fair Q X4 t s) :
+    fairStep ewp AccEdge Fair Q X4 (fairProgress ewp AccEdge Fair Q X4)
+      (fairProgress ewp AccEdge Fair Q X4) t s := by
+  rw [fairProgress.unfold_eq, fairStall.unfold_eq] at h
+  refine fairStep.mono (fun _ _ h => h) (fun _ _ h => h) ?_ h
+  intro x s' hx
+  rw [fairProgress.unfold_eq]; exact hx
+
+/-- `fairProgress X4` is a fixed point of `Z ↦ fairStep X4 Z Z`. -/
+theorem fairProgress.iff_fairStep (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (X4 : ITree E R → S → Prop) (t : ITree E R) (s : S) :
+    fairProgress ewp AccEdge Fair Q X4 t s ↔
+      fairStep ewp AccEdge Fair Q X4 (fairProgress ewp AccEdge Fair Q X4)
+        (fairProgress ewp AccEdge Fair Q X4) t s := by
+  refine ⟨fairProgress.toFairStep, fun h => ?_⟩
+  rw [fairProgress.unfold_eq]
+  refine fairStall.coinduct
+    (fun x s₀ => fairStep ewp AccEdge Fair Q X4
+      (fairProgress ewp AccEdge Fair Q X4)
+      (fairProgress ewp AccEdge Fair Q X4) x s₀) ?_ h
+  intro x s₀ hx
+  exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+    (fun _ _ hy => fairProgress.toFairStep hy) hx
+
+/-- Total correctness implies `fairProgress` for any outer continuation. -/
+theorem fairProgress.of_dwp {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    (X4 : ITree E R → S → Prop) {t : ITree E R} {s : S}
+    (h : DWP ewp t Q s) : fairProgress ewp AccEdge Fair Q X4 t s := by
+  refine DWP.induct
+    (fun x s₀ => fairProgress ewp AccEdge Fair Q X4 x s₀) ?_ h
+  intro x s₀ hx
+  rw [fairProgress.iff_fairStep, fairStep.unfold_eq]
+  cases h_obs : x.observe <;> simp only [h_obs] at hx ⊢
+  · exact hx
+  · exact fairProgress.toFairStep hx
+  · refine ewp.mono (fun o s' hp => ?_) hx
+    by_cases hf : Fair _ o s₀ s'
+    · exact Or.inr (Or.inl ⟨hf, hp⟩)
+    · exact Or.inr (Or.inr ⟨hf, hp⟩)
+
+private def fairInfOftenAux (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) : Prop :=
+  fairProgress ewp AccEdge Fair Q (fairInfOftenAux ewp AccEdge Fair Q) t s
+coinductive_fixpoint
+
+/--
+**Fairness-conditional Büchi recurrence** (Streett `□◇ Fair → □◇ AccEdge`): on
+every path the tree returns `r` with `Q r s`, or takes accepting edges infinitely
+often, or takes fair edges only finitely often while never silently diverging.
+-/
+def FairInfOften (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) : Prop :=
+  fairInfOftenAux ewp AccEdge Fair Q t s
+
+theorem FairInfOften.unfold_eq (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    FairInfOften ewp AccEdge Fair Q t s =
+      fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q) t s :=
+  fairInfOftenAux.eq_def ewp AccEdge Fair Q t s
+
+/-- Park coinduction principle for the outer greatest fixed point of `FairInfOften`. -/
+theorem FairInfOften.coinduct {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    (X : ITree E R → S → Prop)
+    (h_step : ∀ x s₀, X x s₀ → fairProgress ewp AccEdge Fair Q X x s₀)
+    {t : ITree E R} {s : S} (h : X t s) :
+    FairInfOften ewp AccEdge Fair Q t s :=
+  fairInfOftenAux.coinduct ewp AccEdge Fair Q X h_step t s h
+
+/-- One-step characterisation of `FairInfOften` through `fairStep`. -/
+theorem FairInfOften.iff_fairStep (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    FairInfOften ewp AccEdge Fair Q t s ↔
+      fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+        (FairInfOften ewp AccEdge Fair Q) (FairInfOften ewp AccEdge Fair Q) t s := by
+  constructor
+  · intro h
+    rw [FairInfOften.unfold_eq] at h
+    refine fairStep.mono (fun _ _ h => h) ?_ ?_ (fairProgress.toFairStep h) <;>
+    · intro x s' hx; rw [FairInfOften.unfold_eq]; exact hx
+  · intro h
+    rw [FairInfOften.unfold_eq, fairProgress.iff_fairStep]
+    refine fairStep.mono (fun _ _ h => h) ?_ ?_ h <;>
+    · intro x s' hx; rw [FairInfOften.unfold_eq] at hx; exact hx
+
+@[simp]
+theorem FairInfOften.ret_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (r : R) (s : S) :
+    FairInfOften ewp AccEdge Fair Q (.ret r) s ↔ Q r s := by
+  rw [FairInfOften.iff_fairStep, fairStep.ret_iff]
+
+@[simp]
+theorem FairInfOften.tau_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    FairInfOften ewp AccEdge Fair Q (.tau t) s ↔
+      FairInfOften ewp AccEdge Fair Q t s := by
+  rw [FairInfOften.iff_fairStep, fairStep.tau_iff, ← FairInfOften.iff_fairStep]
+
+/--
+`FairInfOften` is a fixed point of the one-step `DWLP` functor: Streett
+acceptance is prefix-independent.
+-/
+@[simp]
+theorem FairInfOften.vis_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (i : E.I) (k : E.O i → ITree E R) (s : S) :
+    FairInfOften ewp AccEdge Fair Q (.vis i k) s ↔
+      ewp.wp i (fun o s' => FairInfOften ewp AccEdge Fair Q (k o) s') s := by
+  rw [FairInfOften.iff_fairStep, fairStep.vis_iff]
+  constructor
+  · exact ewp.mono (fun _ _ hp =>
+      hp.elim And.right (fun h => h.elim And.right And.right))
+  · refine ewp.mono (fun o s' hp => ?_)
+    by_cases hf : Fair i o s s'
+    · exact Or.inr (Or.inl ⟨hf, hp⟩)
+    · exact Or.inr (Or.inr ⟨hf, hp⟩)
+
+theorem FairInfOften.ret {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {r : R} {s : S} (hq : Q r s) : FairInfOften ewp AccEdge Fair Q (.ret r) s :=
+  (FairInfOften.ret_iff ewp AccEdge Fair Q r s).2 hq
+
+theorem FairInfOften.tau {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : FairInfOften ewp AccEdge Fair Q t s) :
+    FairInfOften ewp AccEdge Fair Q (.tau t) s :=
+  (FairInfOften.tau_iff ewp AccEdge Fair Q t s).2 h
+
+theorem FairInfOften.vis {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {i : E.I} {k : E.O i → ITree E R} {s : S}
+    (hv : ewp.wp i (fun o s' => FairInfOften ewp AccEdge Fair Q (k o) s') s) :
+    FairInfOften ewp AccEdge Fair Q (.vis i k) s :=
+  (FairInfOften.vis_iff ewp AccEdge Fair Q i k s).2 hv
+
+/--
+**Unconditional `spin` refutation** for fairness-conditional recurrence: silent
+divergence is the program's fault, never the environment's.
+-/
+theorem not_fairInfOften_spin {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {s : S} :
+    ¬ FairInfOften ewp AccEdge Fair Q (ITree.spin (E := E) (R := R)) s := by
+  intro h
+  refine fairStep.induct (fun x _ => x ≠ ITree.spin) ?_
+    ((FairInfOften.iff_fairStep ewp AccEdge Fair Q _ s).1 h) rfl
+  intro x _ hx rfl
+  rw [observe_spin] at hx
+  exact hx rfl
+
+/-- Fairness-conditional recurrence implies partial correctness. -/
+theorem FairInfOften.toDWLP {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : FairInfOften ewp AccEdge Fair Q t s) :
+    DWLP ewp t Q s := by
+  refine DWLP.coinduct (fun x s₀ => FairInfOften ewp AccEdge Fair Q x s₀) ?_ h
+  intro x s₀ hx
+  cases h_obs : x.observe with
+  | ret r => rw [eq_ret_of_observe h_obs, FairInfOften.ret_iff] at hx; exact hx
+  | tau x' => rw [eq_tau_of_observe h_obs, FairInfOften.tau_iff] at hx; exact hx
+  | vis i k => rw [eq_vis_of_observe h_obs, FairInfOften.vis_iff] at hx; exact hx
+
+/-- Plain Büchi recurrence implies fairness-conditional recurrence. -/
+theorem InfOften.toFairInfOften {ewp : StateEffectWP S E}
+    {AccEdge : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    (Fair : (i : E.I) → E.O i → S → S → Prop) {t : ITree E R} {s : S}
+    (h : InfOften ewp AccEdge Q t s) :
+    FairInfOften ewp AccEdge Fair Q t s := by
+  refine FairInfOften.coinduct (fun x s₀ => InfOften ewp AccEdge Q x s₀) ?_ h
+  intro x s₀ hx
+  refine buchiProgress.induct
+    (fun y s₁ => fairProgress ewp AccEdge Fair Q (InfOften ewp AccEdge Q) y s₁)
+    ?_ hx.toBuchiProgress
+  intro y s₁ hy
+  rw [fairProgress.iff_fairStep, fairStep.unfold_eq]
+  cases h_obs : y.observe <;> simp only [h_obs] at hy ⊢
+  · exact hy
+  · exact fairProgress.toFairStep hy
+  · refine ewp.mono (fun o s' hp => ?_) hy
+    rcases hp with ha | hpre
+    · exact Or.inl ha
+    · by_cases hf : Fair _ o s₁ s'
+      · exact Or.inr (Or.inl ⟨hf, hpre⟩)
+      · exact Or.inr (Or.inr ⟨hf, hpre⟩)
+
+/-- **`DWP` embedding** for fairness-conditional recurrence. -/
+theorem fairInfOften_of_dwp {ewp : StateEffectWP S E}
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop) {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : DWP ewp t Q s) :
+    FairInfOften ewp AccEdge Fair Q t s :=
+  (infOften_of_dwp AccEdge h).toFairInfOften Fair
+
+/--
+**Exact reduction (every edge fair).** When every edge is fair, the Streett
+condition `□◇ Fair → □◇ AccEdge` is plain Büchi recurrence.
+-/
+theorem fairInfOften_true_iff_infOften (ewp : StateEffectWP S E)
+    (AccEdge : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    FairInfOften ewp AccEdge (fun _ _ _ _ => True) Q t s ↔
+      InfOften ewp AccEdge Q t s := by
+  refine ⟨fun h => ?_, InfOften.toFairInfOften _⟩
+  refine InfOften.coinduct
+    (fun x s₀ => FairInfOften ewp AccEdge (fun _ _ _ _ => True) Q x s₀) ?_ h
+  intro x s₀ hx
+  rw [FairInfOften.unfold_eq] at hx
+  refine fairProgress.induct
+    (fun y s₁ => buchiProgress ewp AccEdge Q
+      (FairInfOften ewp AccEdge (fun _ _ _ _ => True) Q) y s₁) ?_ hx
+  intro y s₁ hy
+  rw [fairStall.unfold_eq] at hy
+  refine fairStep.induct
+    (fun z s₂ => buchiProgress ewp AccEdge Q
+      (FairInfOften ewp AccEdge (fun _ _ _ _ => True) Q) z s₂) ?_ hy
+  intro z s₂ hz
+  rw [buchiProgress.unfold_eq]
+  cases h_obs : z.observe <;> simp only [h_obs] at hz ⊢
+  · exact hz
+  · exact hz
+  · exact ewp.mono
+      (fun _ _ hp => hp.elim Or.inl
+        (fun h => h.elim (fun hf => Or.inr hf.2) (fun hn => (hn.1 trivial).elim)))
+      hz
+
+/--
+**Exact reduction (no edge fair).** When no edge is fair, the Streett
+condition only rules out silent divergence: `FairInfOften` is Büchi recurrence
+of *all* visible edges (reactive productivity plus partial correctness).
+-/
+theorem fairInfOften_false_iff (ewp : StateEffectWP S E)
+    (AccEdge : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    FairInfOften ewp AccEdge (fun _ _ _ _ => False) Q t s ↔
+      InfOften ewp (fun _ _ _ _ => True) Q t s := by
+  constructor
+  · intro h
+    refine InfOften.coinduct
+      (fun x s₀ => FairInfOften ewp AccEdge (fun _ _ _ _ => False) Q x s₀) ?_ h
+    intro x s₀ hx
+    rw [FairInfOften.iff_fairStep] at hx
+    refine fairStep.induct
+      (fun z s₂ => buchiProgress ewp (fun _ _ _ _ => True) Q
+        (FairInfOften ewp AccEdge (fun _ _ _ _ => False) Q) z s₂) ?_ hx
+    intro z s₂ hz
+    rw [buchiProgress.unfold_eq]
+    cases h_obs : z.observe <;> simp only [h_obs] at hz ⊢
+    · exact hz
+    · exact hz
+    · exact ewp.mono
+        (fun _ _ hp => Or.inl ⟨trivial, hp.elim And.right
+          (fun h => h.elim (fun hf => hf.1.elim) And.right)⟩) hz
+  · intro h
+    refine FairInfOften.coinduct
+      (fun x s₀ => InfOften ewp (fun _ _ _ _ => True) Q x s₀) ?_ h
+    intro x s₀ hx
+    rw [fairProgress.unfold_eq]
+    refine fairStall.coinduct
+      (fun y s₁ => InfOften ewp (fun _ _ _ _ => True) Q y s₁) ?_ hx
+    intro y s₁ hy
+    refine InfOften.progress_induct
+      (fun z s₂ => fairStep ewp AccEdge (fun _ _ _ _ => False) Q
+        (InfOften ewp (fun _ _ _ _ => True) Q)
+        (fairProgress ewp AccEdge (fun _ _ _ _ => False) Q
+          (InfOften ewp (fun _ _ _ _ => True) Q))
+        (InfOften ewp (fun _ _ _ _ => True) Q) z s₂) ?_ hy
+    intro z s₂ hz
+    rw [fairStep.unfold_eq]
+    cases h_obs : z.observe <;> simp only [h_obs] at hz ⊢
+    · exact hz
+    · exact hz.2
+    · exact ewp.mono (fun _ _ hp => Or.inr (Or.inr ⟨id, hp.1⟩)) hz
+
+/--
+Monotonicity of `FairInfOften`: weaker accepting edges, *fewer* fair edges and a
+weaker postcondition.
+-/
+theorem FairInfOften.mono {ewp : StateEffectWP S E}
+    {AccEdge AccEdge' Fair Fair' : (i : E.I) → E.O i → S → S → Prop}
+    {P Q : R → S → Prop} {t : ITree E R} {s : S}
+    (h_acc : ∀ i o s₀ s', AccEdge i o s₀ s' → AccEdge' i o s₀ s')
+    (h_fair : ∀ i o s₀ s', Fair' i o s₀ s' → Fair i o s₀ s')
+    (h_post : ∀ r s', P r s' → Q r s')
+    (h : FairInfOften ewp AccEdge Fair P t s) :
+    FairInfOften ewp AccEdge' Fair' Q t s := by
+  refine FairInfOften.coinduct
+    (fun x s₀ => FairInfOften ewp AccEdge Fair P x s₀) ?_ h
+  intro x s₀ hx
+  rw [FairInfOften.unfold_eq] at hx
+  refine fairProgress.induct
+    (fun y s₁ => fairProgress ewp AccEdge' Fair' Q
+      (FairInfOften ewp AccEdge Fair P) y s₁) ?_ hx
+  intro y s₁ hy
+  rw [fairProgress.unfold_eq]
+  refine fairStall.coinduct
+    (fun z s₂ => fairStall ewp AccEdge Fair P (FairInfOften ewp AccEdge Fair P)
+        (fun w s₃ => fairProgress ewp AccEdge' Fair' Q
+          (FairInfOften ewp AccEdge Fair P) w s₃) z s₂ ∨
+      fairProgress ewp AccEdge' Fair' Q (FairInfOften ewp AccEdge Fair P) z s₂)
+    ?_ (Or.inl hy)
+  rintro z s₂ (hz | hz)
+  · rw [fairStall.unfold_eq] at hz
+    refine fairStep.induct
+      (fun w s₃ => fairStep ewp AccEdge' Fair' Q (FairInfOften ewp AccEdge Fair P)
+        (fairProgress ewp AccEdge' Fair' Q (FairInfOften ewp AccEdge Fair P))
+        (fun v s₄ => fairStall ewp AccEdge Fair P (FairInfOften ewp AccEdge Fair P)
+            (fun w s₃ => fairProgress ewp AccEdge' Fair' Q
+              (FairInfOften ewp AccEdge Fair P) w s₃) v s₄ ∨
+          fairProgress ewp AccEdge' Fair' Q (FairInfOften ewp AccEdge Fair P) v s₄)
+        w s₃) ?_ hz
+    intro w s₃ hw
+    rw [fairStep.unfold_eq]
+    cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+    · exact h_post _ _ hw
+    · exact hw
+    · refine ewp.mono (fun o s' hp => ?_) hw
+      rcases hp with ⟨ha, hfi⟩ | ⟨_, hpre⟩ | ⟨hnf, hst⟩
+      · exact Or.inl ⟨h_acc _ _ _ _ ha, hfi⟩
+      · by_cases hf' : Fair' _ o s₃ s'
+        · exact Or.inr (Or.inl ⟨hf', hpre⟩)
+        · exact Or.inr (Or.inr ⟨hf', Or.inr hpre⟩)
+      · exact Or.inr (Or.inr ⟨fun hf' => hnf (h_fair _ _ _ _ hf'), Or.inl hst⟩)
+  · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+      (fairProgress.toFairStep hz)
+
+/--
+**Compositionality** (general prefix): a fairness-recurrent prefix whose
+returns land in fairness-recurrent continuations sequences into a
+fairness-recurrent tree.
+-/
+theorem FairInfOften.bind {A B : Type u} {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : B → S → Prop}
+    {t : ITree E A} {k : A → ITree E B} {s : S}
+    (h : FairInfOften ewp AccEdge Fair
+      (fun a s' => FairInfOften ewp AccEdge Fair Q (k a) s') t s) :
+    FairInfOften ewp AccEdge Fair Q (t >>= k) s := by
+  let FIk : A → S → Prop := fun a s' => FairInfOften ewp AccEdge Fair Q (k a) s'
+  let X : ITree E B → S → Prop := fun u s₀ =>
+    FairInfOften ewp AccEdge Fair Q u s₀ ∨
+      ∃ t₀ : ITree E A, u = (t₀ >>= k) ∧ FairInfOften ewp AccEdge Fair FIk t₀ s₀
+  have h_fi_x : ∀ u s₀, FairInfOften ewp AccEdge Fair Q u s₀ → X u s₀ :=
+    fun _ _ hu => Or.inl hu
+  refine FairInfOften.coinduct X ?_ (Or.inr ⟨t, rfl, h⟩)
+  rintro u s₀ (hu | ⟨t₀, rfl, ht₀⟩)
+  · rw [FairInfOften.unfold_eq] at hu
+    exact fairProgress.mono h_fi_x hu
+  · rw [FairInfOften.unfold_eq] at ht₀
+    refine fairProgress.induct
+      (fun t₁ s₁ => fairProgress ewp AccEdge Fair Q X (t₁ >>= k) s₁) ?_ ht₀
+    intro t₁ s₁ ht₁
+    rw [fairProgress.unfold_eq]
+    refine fairStall.coinduct
+      (fun u s₂ => (∃ t₂ : ITree E A, u = (t₂ >>= k) ∧
+          fairStall ewp AccEdge Fair FIk (FairInfOften ewp AccEdge Fair FIk)
+            (fun t₃ s₃ => fairProgress ewp AccEdge Fair Q X (t₃ >>= k) s₃) t₂ s₂) ∨
+        fairProgress ewp AccEdge Fair Q X u s₂) ?_ (Or.inl ⟨t₁, rfl, ht₁⟩)
+    rintro u s₂ (⟨t₂, rfl, ht₂⟩ | hu)
+    · rw [fairStall.unfold_eq] at ht₂
+      refine fairStep.induct
+        (fun t₃ s₃ => fairStep ewp AccEdge Fair Q X
+          (fairProgress ewp AccEdge Fair Q X)
+          (fun u s₄ => (∃ t₂ : ITree E A, u = (t₂ >>= k) ∧
+              fairStall ewp AccEdge Fair FIk (FairInfOften ewp AccEdge Fair FIk)
+                (fun t₃ s₃ => fairProgress ewp AccEdge Fair Q X (t₃ >>= k) s₃)
+                t₂ s₄) ∨
+            fairProgress ewp AccEdge Fair Q X u s₄) (t₃ >>= k) s₃) ?_ ht₂
+      intro t₃ s₃ ht₃
+      cases h_obs : t₃.observe with
+      | ret a =>
+        simp only [h_obs] at ht₃
+        rw [eq_ret_of_observe h_obs, ret_bind]
+        have hk := (FairInfOften.iff_fairStep ewp AccEdge Fair Q (k a) s₃).1 ht₃
+        refine fairStep.mono (fun _ _ h => Or.inl h) ?_ ?_ hk
+        · intro x s' hx
+          rw [FairInfOften.unfold_eq] at hx
+          exact fairProgress.mono h_fi_x hx
+        · intro x s' hx
+          rw [FairInfOften.unfold_eq] at hx
+          exact Or.inr (fairProgress.mono h_fi_x hx)
+      | tau t₃' =>
+        simp only [h_obs] at ht₃
+        rw [eq_tau_of_observe h_obs, tau_bind, fairStep.tau_iff]
+        exact ht₃
+      | vis i c =>
+        simp only [h_obs] at ht₃
+        rw [eq_vis_of_observe h_obs, vis_bind, fairStep.vis_iff]
+        refine ewp.mono (fun o s' hp => ?_) ht₃
+        rcases hp with ⟨ha, hfi⟩ | ⟨hf, hpre⟩ | ⟨hnf, hst⟩
+        · exact Or.inl ⟨ha, Or.inr ⟨c o, rfl, hfi⟩⟩
+        · exact Or.inr (Or.inl ⟨hf, hpre⟩)
+        · exact Or.inr (Or.inr ⟨hnf, Or.inl ⟨c o, rfl, hst⟩⟩)
+    · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+        (fairProgress.toFairStep hu)
+
+/-- **Compositionality** (`DWP` prefix followed by a fairness-recurrent continuation). -/
+theorem FairInfOften.bind_dwp {A B : Type u} {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : B → S → Prop}
+    {t : ITree E A} {k : A → ITree E B} {s : S}
+    (h : DWP ewp t (fun a s' => FairInfOften ewp AccEdge Fair Q (k a) s') s) :
+    FairInfOften ewp AccEdge Fair Q (t >>= k) s :=
+  FairInfOften.bind (fairInfOften_of_dwp AccEdge Fair h)
+
+/-- Conditional branching rule for `FairInfOften`. -/
+theorem FairInfOften.ite {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {c : Prop} [Decidable c] {t₁ t₂ : ITree E R} {s : S}
+    (h₁ : c → FairInfOften ewp AccEdge Fair Q t₁ s)
+    (h₂ : ¬ c → FairInfOften ewp AccEdge Fair Q t₂ s) :
+    FairInfOften ewp AccEdge Fair Q (if c then t₁ else t₂) s := by
+  split
+  · exact h₁ ‹_›
+  · exact h₂ ‹_›
+
+private def fairIterAux {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (t : ITree E (I ⊕ R)) (s : S) : Prop :=
+  match t.observe with
+  | .ret (.inl next) => seen = true ∧ LInv next s
+  | .ret (.inr r) => Q r s
+  | .tau t' => fairIterAux ewp Fair LInv Q seen t' s
+  | .vis i k =>
+    ewp.wp i
+      (fun o s' =>
+        (Fair i o s s' ∧ DWP ewp (k o) (Sum.elim (fun _ _ => False) Q) s') ∨
+        (¬ Fair i o s s' ∧ fairIterAux ewp Fair LInv Q true (k o) s')) s
+inductive_fixpoint
+
+/--
+Per-iteration obligation of the fair retry-loop rule: after finitely many steps
+the iteration either exits with `Q`, or continues with `LInv` after having taken
+at least one visible edge (`seen`), and **every fair edge commits the iteration
+to exiting** (`DWP` into an `.inr` return).
+-/
+def fairIter {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (t : ITree E (I ⊕ R)) (s : S) : Prop :=
+  fairIterAux ewp Fair LInv Q seen t s
+
+theorem fairIter.unfold_eq {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (t : ITree E (I ⊕ R)) (s : S) :
+    fairIter ewp Fair LInv Q seen t s =
+      match t.observe with
+      | .ret (.inl next) => seen = true ∧ LInv next s
+      | .ret (.inr r) => Q r s
+      | .tau t' => fairIter ewp Fair LInv Q seen t' s
+      | .vis i k =>
+        ewp.wp i
+          (fun o s' =>
+            (Fair i o s s' ∧ DWP ewp (k o) (Sum.elim (fun _ _ => False) Q) s') ∨
+            (¬ Fair i o s s' ∧ fairIter ewp Fair LInv Q true (k o) s')) s :=
+  fairIterAux.eq_def ewp Fair LInv Q seen t s
+
+@[simp]
+theorem fairIter.vis_iff {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (i : E.I) (k : E.O i → ITree E (I ⊕ R))
+    (s : S) :
+    fairIter ewp Fair LInv Q seen (.vis i k) s ↔
+      ewp.wp i
+        (fun o s' =>
+          (Fair i o s s' ∧ DWP ewp (k o) (Sum.elim (fun _ _ => False) Q) s') ∨
+          (¬ Fair i o s s' ∧ fairIter ewp Fair LInv Q true (k o) s')) s := by
+  conv => lhs; rw [fairIter.unfold_eq, ITree.observe_vis]
+
+@[simp]
+theorem fairIter.ret_inl_iff {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (next : I) (s : S) :
+    fairIter ewp Fair LInv Q seen (.ret (.inl next)) s ↔ seen = true ∧ LInv next s := by
+  conv => lhs; rw [fairIter.unfold_eq, ITree.observe_ret]
+
+@[simp]
+theorem fairIter.ret_inr_iff {I : Type u} (ewp : StateEffectWP S E)
+    (Fair : (i : E.I) → E.O i → S → S → Prop) (LInv : I → S → Prop)
+    (Q : R → S → Prop) (seen : Bool) (r : R) (s : S) :
+    fairIter ewp Fair LInv Q seen (.ret (.inr r)) s ↔ Q r s := by
+  conv => lhs; rw [fairIter.unfold_eq, ITree.observe_ret]
+
+/-- Case-analysis induction principle for `fairIter` (children keep `fairIter`). -/
+theorem fairIter.induct_cases {I : Type u} {ewp : StateEffectWP S E}
+    {Fair : (i : E.I) → E.O i → S → S → Prop} {LInv : I → S → Prop}
+    {Q : R → S → Prop} (G : Bool → ITree E (I ⊕ R) → S → Prop)
+    (h_inl : ∀ x next s₀, x.observe = .ret (.inl next) → LInv next s₀ → G true x s₀)
+    (h_inr : ∀ seen x r s₀, x.observe = .ret (.inr r) → Q r s₀ → G seen x s₀)
+    (h_tau : ∀ seen x x' s₀, x.observe = .tau x' → G seen x' s₀ → G seen x s₀)
+    (h_vis : ∀ seen x (i : E.I) (k : E.O i → ITree E (I ⊕ R)) s₀,
+      x.observe = .vis i k →
+      ewp.wp i
+        (fun o s' =>
+          (Fair i o s₀ s' ∧ DWP ewp (k o) (Sum.elim (fun _ _ => False) Q) s') ∨
+          (¬ Fair i o s₀ s' ∧ fairIter ewp Fair LInv Q true (k o) s')) s₀ →
+      G seen x s₀)
+    {seen : Bool} {t : ITree E (I ⊕ R)} {s : S}
+    (h : fairIter ewp Fair LInv Q seen t s) : G seen t s := by
+  refine (fairIterAux.induct ewp Fair LInv Q
+    (fun seen x s₀ => fairIter ewp Fair LInv Q seen x s₀ ∧ G seen x s₀)
+    ?_ seen t s h).2
+  intro seen x s₀ hx
+  cases h_obs : x.observe with
+  | ret res =>
+    cases res with
+    | inl next =>
+      simp only [h_obs] at hx
+      obtain ⟨rfl, hl⟩ := hx
+      refine ⟨?_, h_inl x next s₀ h_obs hl⟩
+      rw [fairIter.unfold_eq, h_obs]; exact ⟨rfl, hl⟩
+    | inr r =>
+      simp only [h_obs] at hx
+      refine ⟨?_, h_inr seen x r s₀ h_obs hx⟩
+      rw [fairIter.unfold_eq, h_obs]; exact hx
+  | tau x' =>
+    simp only [h_obs] at hx
+    refine ⟨?_, h_tau seen x x' s₀ h_obs hx.2⟩
+    rw [fairIter.unfold_eq, h_obs]; exact hx.1
+  | vis i k =>
+    simp only [h_obs] at hx
+    have hw := ewp.mono
+      (fun _ _ hp => hp.imp id (And.imp id And.left)) hx
+    refine ⟨?_, h_vis seen x i k s₀ h_obs hw⟩
+    rw [fairIter.unfold_eq, h_obs]; exact hw
+
+/--
+**Fair retry-loop rule** (`Atomic::try_update` under fairness). If every
+iteration satisfies `fairIter` (it exits with `Q`, or continues with `LInv`
+after at least one *unfair* visible edge, and any fair edge commits it to
+exiting), then the loop satisfies the Streett condition `□◇ Fair → ◇ ret Q`
+for **any** accepting edges: a fair environment forces termination, an unfair
+one at worst keeps it productively retrying.
+-/
+theorem FairInfOften.iter_fair {I : Type u} {ewp : StateEffectWP S E}
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
+    (body : I → ITree E (I ⊕ R)) (LInv : I → S → Prop) {Q : R → S → Prop}
+    (h_body : ∀ a s₀, LInv a s₀ → fairIter ewp Fair LInv Q false (body a) s₀)
+    {init : I} {s : S} (h_init : LInv init s) :
+    FairInfOften ewp AccEdge Fair Q (ITree.iter body init) s := by
+  let cont : I ⊕ R → ITree E R :=
+    Sum.elim (fun next => .tau (ITree.iter body next)) .ret
+  let Z : ITree E R → S → Prop := fun u s₀ =>
+    ∃ (cur : ITree E (I ⊕ R)) (seen : Bool),
+      u = (cur >>= cont) ∧ fairIter ewp Fair LInv Q seen cur s₀
+  have h_exit : ∀ (m : ITree E (I ⊕ R)) (s₀ : S),
+      DWP ewp m (Sum.elim (fun _ _ => False) Q) s₀ →
+      fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+        (m >>= cont) s₀ := by
+    intro m s₀ hm
+    refine fairProgress.of_dwp _ (DWP.bind (DWP.mono ?_ hm))
+    rintro (next | r) s' hp
+    · exact False.elim hp
+    · exact DWP.ret hp
+  have h_vis : ∀ (i : E.I) (k : E.O i → ITree E (I ⊕ R)) (s₀ : S),
+      ewp.wp i
+        (fun o s' =>
+          (Fair i o s₀ s' ∧ DWP ewp (k o) (Sum.elim (fun _ _ => False) Q) s') ∨
+          (¬ Fair i o s₀ s' ∧ fairIter ewp Fair LInv Q true (k o) s')) s₀ →
+      fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+        (fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)) Z
+        (ITree.vis i k >>= cont) s₀ := by
+    intro i k s₀ hw
+    rw [vis_bind, fairStep.vis_iff]
+    exact ewp.mono (fun o s' hp => hp.elim
+      (fun hf => Or.inr (Or.inl ⟨hf.1, h_exit (k o) s' hf.2⟩))
+      (fun hn => Or.inr (Or.inr ⟨hn.1, k o, true, rfl, hn.2⟩))) hw
+  have h_enter : ∀ (cur : ITree E (I ⊕ R)) (s₀ : S),
+      fairIter ewp Fair LInv Q false cur s₀ →
+      fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+        (fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)) Z
+        (cur >>= cont) s₀ := by
+    intro cur s₀ h
+    refine fairIter.induct_cases
+      (G := fun seen c s₁ => seen = false →
+        fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+          (fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)) Z
+          (c >>= cont) s₁) ?_ ?_ ?_ ?_ h rfl
+    · intro _ _ _ _ _ h_eq; exact Bool.noConfusion h_eq
+    · intro _ x r s₁ hx hq _
+      rw [eq_ret_of_observe hx, ret_bind]
+      exact (fairStep.ret_iff _ _ _ _ _ _ _ r s₁).2 hq
+    · intro _ x x' s₁ hx ih hs
+      rw [eq_tau_of_observe hx, tau_bind, fairStep.tau_iff]
+      exact ih hs
+    · intro _ x i k s₁ hx hw _
+      rw [eq_vis_of_observe hx]
+      exact h_vis i k s₁ hw
+  have h_step : ∀ (seen : Bool) (cur : ITree E (I ⊕ R)) (s₀ : S),
+      fairIter ewp Fair LInv Q seen cur s₀ →
+      fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+        (fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)) Z
+        (cur >>= cont) s₀ := by
+    intro seen cur s₀ h
+    refine fairIter.induct_cases
+      (G := fun _ c s₁ =>
+        fairStep ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+          (fairProgress ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)) Z
+          (c >>= cont) s₁) ?_ ?_ ?_ ?_ h
+    · intro x next s₁ hx hl
+      rw [eq_ret_of_observe hx, ret_bind]
+      show fairStep _ _ _ _ _ _ _ (ITree.tau (ITree.iter body next)) s₁
+      rw [fairStep.tau_iff, iter_unfold]
+      exact h_enter (body next) s₁ (h_body next s₁ hl)
+    · intro _ x r s₁ hx hq
+      rw [eq_ret_of_observe hx, ret_bind]
+      exact (fairStep.ret_iff _ _ _ _ _ _ _ r s₁).2 hq
+    · intro _ x x' s₁ hx ih
+      rw [eq_tau_of_observe hx, tau_bind, fairStep.tau_iff]
+      exact ih
+    · intro _ x i k s₁ hx hw
+      rw [eq_vis_of_observe hx]
+      exact h_vis i k s₁ hw
+  rw [FairInfOften.unfold_eq, fairProgress.unfold_eq]
+  refine fairStall.coinduct Z ?_
+    ⟨body init, false, iter_unfold body init, h_body init s h_init⟩
+  rintro u s₀ ⟨cur, seen, rfl, hc⟩
+  exact h_step seen cur s₀ hc
+
+end FairInfOften
+
+/-! #### Separation Canaries: `DWP ⊊ FairInfOften` and `FairInfOften ⊊ productivity` -/
+
+section FairCanaries
+
+/-- A boolean compare-and-swap oracle: the environment answers whether the CAS succeeded. -/
+abbrev CasE : Effect.{0} := PickE Bool
+
+/-- The CAS request. -/
+def casReq : CasE.I := PickReq.pick
+
+/-- An edge is fair when the environment lets the CAS succeed. -/
+def casFair : (i : CasE.I) → CasE.O i → PUnit.{1} → PUnit.{1} → Prop :=
+  fun _ b _ _ => b = true
+
+/-- Whether the CAS succeeded. -/
+def casOk (b : CasE.O casReq) : Bool := b
+
+/-- Loop-body continuation after the CAS: exit on success, retry on failure. -/
+def casStep (b : CasE.O casReq) : ITree CasE (PUnit.{1} ⊕ PUnit.{1}) :=
+  ITree.ret (if casOk b then Sum.inr PUnit.unit else Sum.inl PUnit.unit)
+
+/-- `loop { if cas() { break } }`. -/
+def casBody (_ : PUnit.{1}) : ITree CasE (PUnit.{1} ⊕ PUnit.{1}) :=
+  ITree.vis casReq casStep
+
+/-- The CAS retry loop. -/
+def casLoop : ITree CasE PUnit.{1} :=
+  ITree.iter casBody PUnit.unit
+
+/-- Unfolded continuation of `casLoop` after the CAS. -/
+def casK (b : CasE.O casReq) : ITree CasE PUnit.{1} :=
+  if casOk b then ITree.ret PUnit.unit else ITree.tau casLoop
+
+/-- Loop-body continuation that ignores the CAS result. -/
+def ignoreStep (_ : CasE.O casReq) : ITree CasE (PUnit.{1} ⊕ PEmpty.{1}) :=
+  ITree.ret (Sum.inl PUnit.unit)
+
+/-- `loop { cas(); }`: the result of the CAS is ignored, so the loop never exits. -/
+def ignoreBody (_ : PUnit.{1}) : ITree CasE (PUnit.{1} ⊕ PEmpty.{1}) :=
+  ITree.vis casReq ignoreStep
+
+/-- The CAS-ignoring diverging loop. -/
+def ignoreLoop : ITree CasE PEmpty.{1} :=
+  ITree.iter ignoreBody PUnit.unit
+
+/-- Unfolded continuation of `ignoreLoop` after the CAS. -/
+def ignoreK (_ : CasE.O casReq) : ITree CasE PEmpty.{1} :=
+  ITree.tau ignoreLoop
+
+theorem casLoop_eq : casLoop = ITree.vis casReq casK := by
+  refine (iter_unfold casBody PUnit.unit).trans ?_
+  refine (vis_bind casReq casStep _).trans ?_
+  refine congrArg (ITree.vis casReq) (funext fun b => ?_)
+  cases b
+  · exact (ret_bind (E := CasE) (Sum.inl PUnit.unit) _).trans rfl
+  · exact (ret_bind (E := CasE) (Sum.inr PUnit.unit) _).trans rfl
+
+theorem ignoreLoop_eq : ignoreLoop = ITree.vis casReq ignoreK := by
+  refine (iter_unfold ignoreBody PUnit.unit).trans ?_
+  refine (vis_bind casReq ignoreStep _).trans ?_
+  exact congrArg (ITree.vis casReq)
+    (funext fun _ => (ret_bind (E := CasE) (Sum.inl PUnit.unit) _).trans rfl)
+
+/-- Under a fair environment the CAS retry loop terminates. -/
+theorem casLoop_fairInfOften
+    (AccEdge : (i : CasE.I) → CasE.O i → PUnit.{1} → PUnit.{1} → Prop) :
+    FairInfOften (pickWP PUnit.{1} Bool) AccEdge casFair (fun _ _ => True)
+      casLoop PUnit.unit := by
+  refine FairInfOften.iter_fair casBody (fun _ _ => True) ?_ trivial
+  intro a s₀ _
+  refine (fairIter.vis_iff _ _ _ _ false casReq casStep s₀).2 ?_
+  refine ⟨⟨true⟩, fun b => ?_⟩
+  cases b
+  · refine Or.inr ⟨fun h => Bool.noConfusion h, ?_⟩
+    exact (fairIter.ret_inl_iff (pickWP PUnit.{1} Bool) casFair (fun _ _ => True)
+      (fun _ _ => True) true PUnit.unit s₀).2 ⟨rfl, trivial⟩
+  · exact Or.inl ⟨rfl, DWP.ret trivial⟩
+
+/-- The CAS retry loop is not totally correct: the environment may refuse forever. -/
+theorem not_dwp_casLoop (Q : PUnit.{1} → PUnit.{1} → Prop) :
+    ¬ DWP (pickWP PUnit.{1} Bool) casLoop Q PUnit.unit := by
+  have hobs : casLoop.observe = .vis casReq casK := by
+    conv => lhs; rw [casLoop_eq]
+    exact ITree.observe_vis _ _
+  intro h
+  refine DWP.induct
+    (fun x _ => x = casLoop ∨ x = ITree.tau casLoop → False) ?_ h (Or.inl rfl)
+  intro x s₀ hx hx_eq
+  rcases hx_eq with rfl | rfl
+  · rw [hobs] at hx
+    exact hx.2 false (Or.inr rfl)
+  · rw [ITree.observe_tau] at hx
+    exact hx (Or.inl rfl)
+
+/-- The CAS-ignoring loop is productive and safe (every visible edge accepted). -/
+theorem ignoreLoop_infOften_productive (Q : PEmpty.{1} → PUnit.{1} → Prop) :
+    InfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => True) Q ignoreLoop
+      PUnit.unit := by
+  refine InfOften.iter_progress ignoreBody (fun _ _ => True) ?_ trivial
+  intro a s₀ _
+  exact buchiProgress.vis_accept (i := casReq) (k := ignoreStep)
+    ⟨⟨true⟩, fun _ => ⟨trivial, (InfOften.ret_iff _ _ _ _ _).2 trivial⟩⟩
+
+/--
+The CAS-ignoring loop violates fairness-conditional liveness: along the path on
+which every CAS succeeds the environment is fair, yet the loop never exits.
+-/
+theorem not_fairInfOften_ignoreLoop (Q : PEmpty.{1} → PUnit.{1} → Prop) :
+    ¬ FairInfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False) casFair Q
+      ignoreLoop PUnit.unit := by
+  have hobs : ignoreLoop.observe = .vis casReq ignoreK := by
+    conv => lhs; rw [ignoreLoop_eq]
+    exact ITree.observe_vis _ _
+  intro h
+  rw [FairInfOften.unfold_eq] at h
+  refine fairProgress.induct
+    (fun x _ => x = ignoreLoop ∨ x = ITree.tau ignoreLoop → False) ?_ h (Or.inl rfl)
+  intro x s₀ hx hx_eq
+  rw [fairStall.unfold_eq] at hx
+  refine fairStep.induct
+    (fun y _ => y = ignoreLoop ∨ y = ITree.tau ignoreLoop → False) ?_ hx hx_eq
+  intro y s₁ hy hy_eq
+  rcases hy_eq with rfl | rfl
+  · rw [hobs] at hy
+    rcases hy.2 true with ⟨ha, _⟩ | ⟨_, hpre⟩ | ⟨hnf, _⟩
+    · exact ha
+    · exact hpre (Or.inr rfl)
+    · exact hnf rfl
+  · rw [ITree.observe_tau] at hy
+    exact hy (Or.inl rfl)
+
+/--
+**Strict separation.** `FairInfOften` lies strictly between total correctness
+and reactive productivity:
+
+* the CAS retry loop satisfies fairness-conditional liveness but neither `DWP`
+  nor Büchi recurrence without accepting edges;
+* the CAS-ignoring loop is productive and safe (`InfOften` of every edge) but
+  violates fairness-conditional liveness.
+-/
+theorem fairInfOften_strict_separation :
+    (FairInfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False) casFair
+        (fun _ _ => True) casLoop PUnit.unit ∧
+      ¬ DWP (pickWP PUnit.{1} Bool) casLoop (fun _ _ => True) PUnit.unit ∧
+      ¬ InfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False)
+        (fun _ _ => True) casLoop PUnit.unit) ∧
+    (InfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => True) (fun _ _ => True)
+        ignoreLoop PUnit.unit ∧
+      ¬ FairInfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False) casFair
+        (fun _ _ => True) ignoreLoop PUnit.unit) :=
+  ⟨⟨casLoop_fairInfOften _, not_dwp_casLoop _,
+    fun h => not_dwp_casLoop _
+      ((buchiProgress_false_iff_dwp _ _ _ _ _).1 h.toBuchiProgress)⟩,
+   ⟨ignoreLoop_infOften_productive _, not_fairInfOften_ignoreLoop _⟩⟩
+
+end FairCanaries
 
 /-! ## 4. Monotone-Chain / `CofixA` Continuity Laws for `ITree.iter` -/
 
