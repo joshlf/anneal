@@ -4649,6 +4649,176 @@ theorem tryUpdate_mr_tb_u64_complete {FState G : Type} {A : AtomicEnv Nat FState
     tryUpdate_mr_tb_wfLive_dwp hpre hrep' hadm hrely_wf hm₀ (tbU64_wfLive x₀ acc₀) hs₀,
     mrBudgetWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
 
+/-! #### Weak vs. strong CAS on MiniRust machines -/
+
+/--
+**Strong-CAS MiniRust transformer (`mrStrongCellWP`)**: identical to `mrCellWP`
+except that a CAS whose observed value equals `expected` must commit — exactly
+MiniRust's `AtomicCompareExchange` (strong `compare_exchange`), with no
+`compare_exchange_weak` spurious-failure branch.
+-/
+def mrStrongCellWP {M FState G : Type} [Memory M] [MemoryOps M] (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop) :
+    StateEffectWP (MrAtomicSt M FState G) (AtomicCellE Nat) where
+  wp
+    | .call (.cas e d), K, ms => ∀ m₁, mRely ms.1 m₁ →
+        (∃ ret m₂, mrCasOk m₁ ptr pty t e d ret m₂) ∧
+        ∀ ret m₂, mrCasOk m₁ ptr pty t e d ret m₂ → A.rely ms.2.cell ret.toNat ∧ ∀ b,
+          (ret.toNat ≠ e →
+            K (false, ret.toNat) (m₂, { ms.2 with cell := ret.toNat, budget := b })) ∧
+          (ret.toNat = e →
+            casWin A e d (fun o s' => K o (m₂, s')) { ms.2 with cell := ret.toNat } b)
+    | i, K, ms => (mrCellWP A ptr pty t mRely).wp i K ms
+  mono {i} _ _ _ h hw :=
+    match i with
+    | .call (.cas _ _) => fun m₁ hm =>
+        ⟨(hw m₁ hm).1, fun ret m₂ hok =>
+          ⟨((hw m₁ hm).2 ret m₂ hok).1, fun b =>
+          ⟨fun hne => h _ _ ((((hw m₁ hm).2 ret m₂ hok).2 b).1 hne),
+           fun heq =>
+            ⟨((((hw m₁ hm).2 ret m₂ hok).2 b).2 heq).1,
+             ((((hw m₁ hm).2 ret m₂ hok).2 b).2 heq).2.1,
+             fun g' hg' => h _ _ (((((hw m₁ hm).2 ret m₂ hok).2 b).2 heq).2.2 g' hg')⟩⟩⟩⟩
+    | .call .load => (mrCellWP A ptr pty t mRely).mono h hw
+    | .call (.callF _) => (mrCellWP A ptr pty t mRely).mono h hw
+    | .call .dropF => (mrCellWP A ptr pty t mRely).mono h hw
+    | .call .recv => (mrCellWP A ptr pty t mRely).mono h hw
+
+/-- `ITree` continuation of the unfolded `try_update` loop. -/
+private abbrev mrIterK : Nat ⊕ Except Nat Nat → ITree (AtomicCellE Nat) (Except Nat Nat) :=
+  Sum.elim (fun next => ITree.tau (ITree.iter tryBody next)) ITree.ret
+
+/--
+**Strong CAS terminates on a quiescent MiniRust cell**: if no other thread
+writes (`A.rely` is equality), MiniRust's strong `AtomicCompareExchange` makes
+`tryUpdateLoop` commit or abort on its first iteration, so it is totally
+correct (`DWP`) with the full contract — no budget, no fairness needed.
+-/
+theorem tryUpdate_mr_strong_quiescent_dwp {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hq : ∀ a b, A.rely a b → a = b)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    DWP (mrStrongCellWP A ptr pty t mRely) (tryUpdateLoop Nat)
+      (fun r ms => MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (m₀, s₀) := by
+  refine DWP.vis fun m₁ hm₁ => ?_
+  obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m₀ _ m₁ hm₀ hm₁
+  refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+  obtain ⟨hv, hm2⟩ := mr_observe hadm hm₀ hm₁ hload
+  refine ⟨hv, fun b => ?_⟩
+  dsimp only [loadAns]
+  refine dwp_iter_ranked_lt tryBody
+    (fun (n : Nat) (prev : Nat) (ms : MrAtomicSt M FState G) =>
+      n = 0 ∧ MInv ms.1 ms.2.cell ∧ LoopInv A Rel init f₀ g₀ comm₀ prev ms.2)
+    (fun n prev ms hms => ?_) (n := 0) (init := v.toNat)
+    (s := (m₂, { s₀ with cell := v.toNat, budget := b }))
+    ⟨rfl, hm2, loopInv_of_init hpre hs₀ hv b⟩
+  obtain ⟨m, s⟩ := ms
+  obtain ⟨_, hm, hl⟩ := hms
+  refine DWP.vis ⟨loopInv_pre hpre hl, fun f' r hpost => ?_⟩
+  cases r with
+  | none =>
+    dsimp only
+    change DWP (mrStrongCellWP A ptr pty t mRely) (tryCallK prev (callOut prev none)) _ _
+    rw [tryCallK_none, retAfterDrop]
+    refine DWP.vis fun m₁' hm₁' => ?_
+    obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.load_ok m₁' c' hmc', fun v' m₂' hload' => ?_⟩
+    obtain ⟨hv', hm2'⟩ := mr_observe hadm hm hm₁' hload'
+    exact ⟨hv', fun b' hres => DWP.ret ⟨hm2', loopInv_err_post hpre hl hpost hv' b' hres⟩⟩
+  | some next =>
+    dsimp only
+    change DWP (mrStrongCellWP A ptr pty t mRely) (tryCallK prev (callOut prev (some next))) _ _
+    rw [tryCallK_some]
+    have hnext_rep : IntType.can_represent t next = true :=
+      hrep s.fst prev f' next hl.2.2.1 hpost hl.1
+    refine DWP.vis fun m₁' hm₁' => ?_
+    obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+    obtain ⟨hret, hstore, _⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+    have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
+    have heq : ret.toNat = prev := (hq _ _ hrel).symm.trans hl.2.1
+    refine ⟨hrel, fun b' => ⟨fun hne => absurd heq hne, fun _ => ?_⟩⟩
+    refine ⟨loopInv_unshot (s := s) hpre hl, loopInv_win_pre (s := s) hpre hl hpost,
+      fun g' hg' => ?_⟩
+    dsimp only
+    rw [tryCasK_true, retAfterDrop]
+    have hm2' : MInv m₂' next := hstore (hret ▸ heq)
+    refine DWP.vis fun m₁'' hm₁'' => ?_
+    obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm2' hm₁''
+    refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+    obtain ⟨hv'', hm2''⟩ := mr_observe hadm hm2' hm₁'' hload''
+    refine ⟨hv'', fun b'' hres => DWP.ret ⟨hm2'', ?_⟩⟩
+    have hok := loopInv_ok_post hpre hl hpost hg' hv'' b' b'' hres
+    simpa only [heq] using hok
+
+/-- Shapes reached by an everlasting spurious-failure run of `tryUpdateLoop`. -/
+private def SpuriousShape {M FState G : Type} [Memory M] (t : IntType)
+    (MInv : Machine M → Nat → Prop) (x : ITree (AtomicCellE Nat) (Except Nat Nat))
+    (ms : MrAtomicSt M FState G) : Prop :=
+  MInv ms.1 ms.2.cell ∧
+    ((x = ITree.iter tryBody ms.2.cell) ∨ (x = ITree.tau (ITree.iter tryBody ms.2.cell)) ∨
+      ∃ n : Nat, IntType.can_represent t (n : Int) = true ∧
+        x = ITree.vis (aCas ms.2.cell n) (fun o => tryCasK ms.2.cell n o >>= mrIterK))
+
+/--
+**Weak CAS need not terminate on a quiescent MiniRust cell**: even with no
+interference at all, `compare_exchange_weak`'s spurious failures (each one a
+real MiniRust atomic load leaving the cell unchanged) can repeat forever, so
+`mrCellWP` refutes `DWP` for every postcondition — the machine-level
+counterpart of `weak_vs_strong_cas_separation`.
+-/
+theorem tryUpdate_mr_weak_quiescent_not_dwp {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    (hsome : ∀ f x, ∃ f' n, A.fSpec.post_mut f x f' (some n) ∧
+      IntType.can_represent t (n : Int) = true)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G} (hm₀ : MInv m₀ s₀.cell)
+    (Q : Except Nat Nat → MrAtomicSt M FState G → Prop) :
+    ¬ DWP (mrCellWP A ptr pty t mRely) (tryUpdateLoop Nat) Q (m₀, s₀) := by
+  intro h
+  obtain ⟨v, m₂, hload⟩ := hadm.load_ok m₀ _ hm₀
+  have h1 := (((DWP.vis_iff _ _ _ _ _).1 h m₀ (hadm.rely_refl _ _ hm₀)).2 v m₂ hload).2 0
+  obtain ⟨hv, hm2⟩ := hadm.load_val m₀ _ v m₂ hm₀ hload
+  refine DWP.induct (fun x ms => SpuriousShape t MInv x ms → False) ?_ h1
+    ⟨hv ▸ hm2, Or.inl rfl⟩
+  rintro x ⟨m, s⟩ hx ⟨hm, hshape⟩
+  dsimp only at hm hshape
+  rcases hshape with rfl | rfl | ⟨n, hn, rfl⟩
+  · rw [iter_tryBody_observe] at hx
+    obtain ⟨f', n, hpost, hn⟩ := hsome s.fst s.cell
+    refine hx.2 f' (some n) hpost ⟨hm, Or.inr (Or.inr ⟨n, hn, ?_⟩)⟩
+    exact (congrArg (· >>= mrIterK) (tryCallK_some s.cell n)).trans (vis_bind _ _ _)
+  · rw [ITree.observe_tau] at hx
+    exact hx ⟨hm, Or.inl rfl⟩
+  · rw [ITree.observe_vis] at hx
+    obtain ⟨ret, m₂', hcas⟩ := hadm.cas_ok m _ s.cell n hm hn
+    obtain ⟨hret, _, _⟩ := hadm.cas_val m _ s.cell n ret m₂' hm hn hcas
+    obtain ⟨w, mF, hw⟩ := hadm.load_ok m _ hm
+    obtain ⟨hwv, hmF⟩ := hadm.load_val m _ w mF hm hw
+    have hwr : w = ret := by
+      have h1 := hw.2; have h2 := hcas.2; omega
+    subst hwr
+    have hk := ((((hx m (hadm.rely_refl _ _ hm)).2 w m₂' hcas).2 0).2 hret).2 mF hw
+    refine hk ⟨?_, Or.inr (Or.inl ?_)⟩
+    · show MInv mF w.toNat
+      rw [hret]; exact hmF
+    · show tryCasK s.cell n (false, w.toNat) >>= mrIterK = _
+      rw [show (false, w.toNat) = casOut s.cell n false w.toNat from rfl, tryCasK_false,
+        ret_bind]
+      rfl
+
 end MrBridge
 
 end DualAuthority

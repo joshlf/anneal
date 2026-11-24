@@ -942,6 +942,68 @@ theorem u64_counter_mr_bm_and_tb_complete (delta limit : Nat) (hno : limit + del
   exact ⟨tryUpdate_mr_bm_u64_complete (counter_realizable delta limit) hpre hrep x₀ acc₀ rfl hs₀,
     tryUpdate_mr_tb_u64_complete (counter_realizable delta limit) hpre hrep x₀ acc₀ rfl hs₀⟩
 
+/-- Byte-identity closure `|x| Some(x % 256)` (stateless). -/
+def byteIdSpec : FnMutSpec PUnit Nat Nat where
+  hist_inv _ _ := True
+  hist_inv_laws := ⟨fun _ => trivial, fun _ _ => trivial⟩
+  pre _ _ := True
+  post_mut _ x _ r := r = some (x % 256)
+  step_hist_inv _ _ _ _ _ := trivial
+  resolve _ := True
+
+/-- A quiescent cell (no other writer) with the byte-identity closure. -/
+def quietByteEnv : AtomicEnv Nat PUnit PUnit := ⟨Eq, byteIdSpec, trivialGC⟩
+
+/-- Byte-wise history relation (`a ≡ b mod 256`). -/
+abbrev ByteRel (a b : Nat) : Prop := a % 256 = b % 256
+
+theorem quietByte_pre (c : Nat) :
+    TryUpdatePre quietByteEnv ByteRel c PUnit.unit PUnit.unit (.fresh c) where
+  cellInv := (AtomicHistInv.eq Nat).comap (· % 256)
+  closure_pre _ _ _ _ := trivial
+  closure_step _ x _ n _ h _ := by
+    have h' : some n = some (x % 256) := h
+    cases h'; exact ⟨(Nat.mod_mod x 256).symm, trivial⟩
+  rely_sound _ _ h := h ▸ rfl
+  comm_unshot := rfl
+
+/--
+**Weak vs. strong CAS on a real symbolic `u8` `Mach` cell (no interference)**:
+MiniRust's strong `AtomicCompareExchange` (`mrStrongCellWP`) makes
+`tryUpdateLoop` totally correct, while `compare_exchange_weak` (`mrCellWP`,
+spurious failures realised by genuine MiniRust loads) refutes `DWP` — for every
+byte and every access log.
+-/
+theorem u8_mr_weak_vs_strong_separation (b₀ : UInt8) (acc₀ : List MiniRustSpec.Gen.Access)
+    (budget : Nat) :
+    let s₀ : AtomicSt Nat PUnit PUnit :=
+      ⟨b₀.toNat, PUnit.unit, .fresh b₀.toNat, 0, PUnit.unit, budget⟩
+    DWP (mrStrongCellWP quietByteEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely Eq)) (tryUpdateLoop Nat)
+      (fun r ms => bmU8MInv ms.1 ms.2.cell ∧
+        CreusotPost quietByteEnv ByteRel b₀.toNat PUnit.unit PUnit.unit (.fresh b₀.toNat) r ms.2)
+      (bmU8Mach b₀ acc₀, s₀) ∧
+    ¬ DWP (mrCellWP quietByteEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely Eq)) (tryUpdateLoop Nat)
+      (fun r ms => bmU8MInv ms.1 ms.2.cell ∧
+        CreusotPost quietByteEnv ByteRel b₀.toNat PUnit.unit PUnit.unit (.fresh b₀.toNat) r ms.2)
+      (bmU8Mach b₀ acc₀, s₀) := by
+  intro s₀
+  have hadm := bmU8_mrCellAdmissible quietByteEnv (fun _ => rfl)
+  have hm₀ : bmU8MInv (bmU8Mach b₀ acc₀) s₀.cell := ⟨b₀, acc₀, rfl, rfl⟩
+  have hrep8 : ∀ n : Nat,
+      MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU8
+        ((n % 256 : Nat) : Int) = true :=
+    fun n => (u8_can_represent_iff _).2 (Nat.mod_lt _ (by decide))
+  refine ⟨tryUpdate_mr_strong_quiescent_dwp (fun _ _ h => h) (quietByte_pre b₀.toNat) ?_ hadm hm₀
+    ⟨rfl, rfl, rfl, rfl, rfl⟩, tryUpdate_mr_weak_quiescent_not_dwp hadm
+    (fun _ x => ⟨PUnit.unit, x % 256, rfl, hrep8 x⟩) hm₀ _⟩
+  intro _ x _ n _ h _
+  have h' : some n = some (x % 256) := h
+  cases h'; exact hrep8 x
+
 /-! ## 2. Negative Fail-Closed Canaries -/
 
 /-! ### 2.1 Silent divergence -/
@@ -1353,6 +1415,9 @@ run_cmd do
     , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_wfLive_dwp
     , ``Anneal.AtomicHistInv.mrBudgetWP_nonvacuous_not_false
     , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u8_fair
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_strong_quiescent_dwp
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_weak_quiescent_not_dwp
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_mr_weak_vs_strong_separation
     , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u8_fair
     , ``Anneal.AtomicHistInv.leValue_leBytes
     , ``Anneal.AtomicHistInv.bmU64_mrCellAdmissible
