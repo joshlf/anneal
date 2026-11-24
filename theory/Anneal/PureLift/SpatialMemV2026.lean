@@ -1596,6 +1596,122 @@ theorem valAndBytesMatchTargetSpec_false_of_true (layouts : LayoutTable)
             exact ⟨h.1, hPad fields 0 bs h.2⟩
         | _ => nomatch h
 
+/-- Expected padding mask for `spec` against `layouts` (`true` at padding byte
+indices not covered by any field, `false` at value-carrying field bytes). -/
+def expectedPadMaskForSpec (layouts : LayoutTable) : SpatialTargetSpec → Option (List Bool)
+  | .mirTy ty =>
+    match layouts.lookup ty.layoutIdx with
+    | none => none
+    | some tl => some (List.replicate tl.size.bytes false)
+  | .reprCAdt _ ty sz _ fields =>
+    match layouts.lookup ty.layoutIdx with
+    | none => none
+    | some tl =>
+      if Nat.beq tl.size.bytes sz then
+        some ((List.range sz).map (fun i => !byteIdxCoveredByFields layouts i fields))
+      else none
+
+/-- Runtime authentication checking that a codec's `V2026MemLayout` (`size` and
+`alignBytes`) and `padMask` agree with the `CapturedMir`'s `LayoutTable` entry
+for `spec`. Prevents forged under-alignment or forged all-padding masks from
+passing `freezePaddedToMem`. -/
+def codecLayoutAndMaskMatchSpec (layouts : LayoutTable) (spec : SpatialTargetSpec)
+    (layout : V2026MemLayout) (padMask : List Bool) : Bool :=
+  match layouts.lookup spec.toMirTy.layoutIdx, expectedPadMaskForSpec layouts spec with
+  | some tl, some expMask =>
+    Nat.beq layout.size tl.size.bytes &&
+    Nat.beq layout.alignBytes tl.align.bytes &&
+    Nat.blt 0 layout.alignBytes &&
+    (padMask == expMask) &&
+    (match spec with
+     | .mirTy _ => true
+     | .reprCAdt _ _ sz al _ => Nat.beq layout.size sz && Nat.beq layout.alignBytes al)
+  | _, _ => false
+
+/-- Bounded structural equality on `V2026_06_01.MirSemantics.Value` used by
+`freezePaddedToMem` to verify `st.mirLocals[reg] = .immediate slotVal` matches
+the loan cell's encoded MIR value (preventing symbolic/MIR local desync). -/
+def mirValBeq : Nat → Value → Value → Bool
+  | 0, _, _ => false
+  | _ + 1, .unit, .unit => true
+  | _ + 1, .uninit, .uninit => true
+  | _ + 1, .scalar a, .scalar b => Nat.beq a.bits b.bits && Nat.beq a.sizeBytes b.sizeBytes
+  | _ + 1, .ptr p1 sz1, .ptr p2 sz2 =>
+    Nat.beq p1.allocId p2.allocId && Nat.beq p1.offsetBytes p2.offsetBytes && Nat.beq sz1 sz2
+  | fuel + 1, .aggregate v1 fs1, .aggregate v2 fs2 =>
+    Nat.beq v1 v2 &&
+    let rec go : List Value → List Value → Bool
+      | [], [] => true
+      | x :: xs, y :: ys => mirValBeq fuel x y && go xs ys
+      | _, _ => false
+    go fs1 fs2
+  | _, _, _ => false
+
+/-- Soundness of `codecLayoutAndMaskMatchSpec`: a `true` verdict implies the
+codec's `size`, `alignBytes`, and `padMask` equal the `LayoutTable`'s exact
+`TypeLayout` size, alignment, and derived padding mask. -/
+theorem codecLayoutAndMaskMatchSpec_sound {layouts : LayoutTable} {spec : SpatialTargetSpec}
+    {layout : V2026MemLayout} {padMask : List Bool}
+    (h : codecLayoutAndMaskMatchSpec layouts spec layout padMask = true) :
+    ∃ tl : TypeLayout,
+      layouts.lookup spec.toMirTy.layoutIdx = some tl ∧
+      layout.size = tl.size.bytes ∧
+      layout.alignBytes = tl.align.bytes ∧
+      0 < layout.alignBytes ∧
+      expectedPadMaskForSpec layouts spec = some padMask := by
+  unfold codecLayoutAndMaskMatchSpec at h
+  cases hLk : layouts.lookup spec.toMirTy.layoutIdx with
+  | none => rw [hLk] at h; cases h
+  | some tl =>
+    cases hMask : expectedPadMaskForSpec layouts spec with
+    | none => rw [hLk, hMask] at h; cases h
+    | some expMask =>
+      rw [hLk, hMask] at h
+      simp only [Bool.and_eq_true, Nat.beq_eq, Nat.blt_eq, beq_iff_eq] at h
+      refine ⟨tl, rfl, h.1.1.1.1, h.1.1.1.2, h.1.1.2, ?_⟩
+      rw [h.1.2]
+
+/-- Soundness of `mirValBeq`: a `true` verdict forces propositional equality of
+the two `V2026_06_01.MirSemantics.Value`s. -/
+theorem mirValBeq_sound : ∀ {fuel : Nat} {v1 v2 : Value},
+    mirValBeq fuel v1 v2 = true → v1 = v2
+  | 0, _, _, h => by unfold mirValBeq at h; cases h
+  | _ + 1, .unit, .unit, _ => rfl
+  | _ + 1, .uninit, .uninit, _ => rfl
+  | _ + 1, .scalar a, .scalar b, h => by
+    unfold mirValBeq at h
+    simp only [Bool.and_eq_true, Nat.beq_eq] at h
+    cases a; cases b; dsimp only at h; rw [h.1, h.2]
+  | _ + 1, .ptr p1 sz1, .ptr p2 sz2, h => by
+    unfold mirValBeq at h
+    simp only [Bool.and_eq_true, Nat.beq_eq] at h
+    cases p1; cases p2; dsimp only at h; rw [h.1.1, h.1.2, h.2]
+  | fuel + 1, .aggregate v1 fs1, .aggregate v2 fs2, h => by
+    unfold mirValBeq at h
+    rw [Bool.and_eq_true] at h
+    have hV : v1 = v2 := Nat.beq_eq.mp h.1
+    have hGo : ∀ (xs ys : List Value), mirValBeq.go fuel xs ys = true → xs = ys := by
+      intro xs
+      induction xs with
+      | nil =>
+        intro ys hg; cases ys with | nil => rfl | cons _ _ => unfold mirValBeq.go at hg; cases hg
+      | cons x xs ih =>
+        intro ys hg; cases ys with
+        | nil => unfold mirValBeq.go at hg; cases hg
+        | cons y ys =>
+          unfold mirValBeq.go at hg; rw [Bool.and_eq_true] at hg
+          rw [mirValBeq_sound hg.1, ih ys hg.2]
+    rw [hV, hGo fs1 fs2 h.2]
+  | _ + 1, .unit, .uninit, h | _ + 1, .unit, .scalar _, h | _ + 1, .unit, .ptr _ _, h
+  | _ + 1, .unit, .aggregate _ _, h | _ + 1, .uninit, .unit, h | _ + 1, .uninit, .scalar _, h
+  | _ + 1, .uninit, .ptr _ _, h | _ + 1, .uninit, .aggregate _ _, h
+  | _ + 1, .scalar _, .unit, h | _ + 1, .scalar _, .uninit, h | _ + 1, .scalar _, .ptr _ _, h
+  | _ + 1, .scalar _, .aggregate _ _, h | _ + 1, .ptr _ _, .unit, h
+  | _ + 1, .ptr _ _, .uninit, h | _ + 1, .ptr _ _, .scalar _, h
+  | _ + 1, .ptr _ _, .aggregate _ _, h | _ + 1, .aggregate _ _, .unit, h
+  | _ + 1, .aggregate _ _, .uninit, h | _ + 1, .aggregate _ _, .scalar _, h
+  | _ + 1, .aggregate _ _, .ptr _ _, h => by cases h
+
 /-- Typed spatial memory codec connecting a domain value `α` to:
 1. `V2026_06_01.MirSemantics.AbstractByte` memory bytes (allowing `.uninit` padding),
 2. `V2026_06_01.MirSemantics.Value` (trusted MIR value), and
@@ -1879,6 +1995,7 @@ def freezePaddedToMem {α : Type} (ctx : BodySpatialCtx) (lid : LoanId)
                     let rawBytes := c.encodeValToMem x
                     let mirVal := c.encodeToMirVal x
                     if !stdValEq (c.encodeToSymVal x) e.cell.val ||
+                       !codecLayoutAndMaskMatchSpec ctx.body.layouts c.targetTy c.layout c.padMask ||
                        !Nat.beq rawBytes.length c.layout.size ||
                        !Nat.beq c.padMask.length c.layout.size ||
                        !nonPadBytesInitialized c.padMask rawBytes ||
@@ -1887,8 +2004,9 @@ def freezePaddedToMem {α : Type} (ctx : BodySpatialCtx) (lid : LoanId)
                       .fail
                     else
                       match listGet? st.mirLocals reg with
-                      | some (.immediate _) =>
-                        if hasPromotedLocal reg st.promotedLocals ||
+                      | some (.immediate slotVal) =>
+                        if !mirValBeq 8 slotVal mirVal ||
+                           hasPromotedLocal reg st.promotedLocals ||
                            !freshPromotedAllocId st.mem.nextAllocId st then
                           .fail
                         else
@@ -3624,7 +3742,9 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
     (hLaw : LawfulTypedSpatialMemCodec ctx.body.layouts c)
     (hSpecCtx : specsMatchBodyCtx ctx [.mirTy { kind := .tuple [], layoutIdx := 0 }, c.targetTy] = true)
     (hTargetRefl : spatialTargetSpecBeq c.targetTy c.targetTy = true)
+    (hLayoutMask : codecLayoutAndMaskMatchSpec ctx.body.layouts c.targetTy c.layout c.padMask = true)
     (xInit xNew : α)
+    (hMirValRefl : mirValBeq 8 (c.encodeToMirVal xInit) (c.encodeToMirVal xInit) = true)
     (relOff writeAlign : Nat) (patchBytes : List AbstractByte)
     (hPatchNonEmpty : patchBytes.isEmpty = false)
     (hPatchBounds : relOff + patchBytes.length ≤ c.layout.size)
@@ -3855,8 +3975,8 @@ theorem lawfulCodec_local1_lifecycle_sound {α : Type}
     dsimp only [st0, BackTarget.direct] at hFreshId'
     simp only [Bool.not_true, Bool.or_false, Bool.false_eq_true,
       ↓reduceIte, bne_self_eq_false, toEntries, List.isEmpty, countSpatialBlockId,
-      hTargetRefl, Nat.beq_refl, hInitDecSym', hInitEncSym, stdValEq_refl, hInitLen,
-      hLaw.padMaskLen, hInitNonPad, hInitProv, hInitMatch, hasPromotedLocal, List.foldr,
+      hTargetRefl, hLayoutMask, hMirValRefl, Nat.beq_refl, hInitDecSym', hInitEncSym, stdValEq_refl,
+      hInitLen, hLaw.padMaskLen, hInitNonPad, hInitProv, hInitMatch, hasPromotedLocal, List.foldr,
       hFreshId', hWriteInit']
     rfl
   have hReadPinned :
@@ -4238,7 +4358,9 @@ theorem paddedStruct_mem_freeze_mutate_reabsorb_sound
     hFr, hMirLoc, hMut, hReadFull, hLoad, hReab, hEnd, hGet, hDealloc, hDead, hPromEmpty,
     hFr1, hFr2, hFr3, hFr4⟩ :=
     lawfulCodec_local1_lifecycle_sound u8U32BodyCtx (paddedU8U32MemCodec 0)
-      paddedU8U32MemCodec_lawful_sample rfl rfl initStruct newStruct 4 4 bNewBytes
+      paddedU8U32MemCodec_lawful_sample rfl rfl rfl initStruct newStruct
+      (by simp [paddedU8U32MemCodec, paddedU8U32ToMirVal, mirValBeq, mirValBeq.go])
+      4 4 bNewBytes
       rfl (by simp [bNewBytes, u32MemEncode, encodeU32LEBytes, paddedU8U32MemCodec])
       (by decide) (by decide) rfl rfl
       (by simp [paddedU8U32MemCodec, paddedU8U32Encode, bNewBytes, u32MemEncode,
@@ -4299,7 +4421,9 @@ theorem provPtrStruct_mem_freeze_mutate_reabsorb_sound
     hFr, _, hMut, hReadFull, hLoad, hReab, hEnd, hGet, _, _, _,
     _, hFrMut, _, _⟩ :=
     lawfulCodec_local1_lifecycle_sound provPtrBodyCtx codec
-      (provPtrPaddedMemCodec_lawful_sample expectedAllocId) rfl rfl initS newS 0 1 [.init tagNew none]
+      (provPtrPaddedMemCodec_lawful_sample expectedAllocId) rfl rfl rfl initS newS
+      (by simp [codec, provPtrPaddedMemCodec, provPtrToMirVal, mirValBeq, mirValBeq.go])
+      0 1 [.init tagNew none]
       rfl (by simp [codec, provPtrPaddedMemCodec]) (by decide)
       (by simp [codec, provPtrPaddedMemCodec]) rfl rfl rfl
       rfl rfl m0 hFresh hNoProvRef otherPlace otherLen otherAlign hOtherId
@@ -4739,22 +4863,62 @@ theorem specsMatchBodyCtx_sound {ctx : BodySpatialCtx} {localSpecs : List Spatia
         rw [spatialTargetSpecBeq_sound hG.1, ih bs hG.2]
   exact hGo _ _ h.2
 
+/-- **Negative 7 — Forged alignment, forged `padMask`, and desynced `mirLocals` rejection**:
+1. Forging `c.layout.alignBytes := 1` (instead of `4` in `LayoutTable`) causes
+   `codecLayoutAndMaskMatchSpec = false` and `freezePaddedToMem = .fail`;
+2. Forging `c.padMask := List.replicate 8 true` (hiding field bytes as padding) causes
+   `codecLayoutAndMaskMatchSpec = false` and `freezePaddedToMem = .fail`;
+3. Desyncing `st.mirLocals[1]` from the loan cell's MIR value (`mirValBeq = false`)
+   causes `freezePaddedToMem = .fail`. -/
+theorem forged_align_padMask_and_desync_mirLocal_rejected :
+    let baseC := paddedU8U32MemCodec 0
+    let forgedAlignC : TypedSpatialMemCodec U8U32Struct :=
+      { baseC with layout := { size := 8, alignBytes := 1 } }
+    let forgedMaskC : TypedSpatialMemCodec U8U32Struct :=
+      { baseC with padMask := List.replicate 8 true }
+    let desyncSt : PaddedSymMemState :=
+      { sampleU8U32InitState with
+        mirLocals := [.immediate .unit, .immediate (.aggregate 0 [.scalar ⟨0xFF, 1⟩, .scalar ⟨0, 4⟩])] }
+    codecLayoutAndMaskMatchSpec u8U32BodyCtx.body.layouts forgedAlignC.targetTy
+      forgedAlignC.layout forgedAlignC.padMask = false ∧
+    codecLayoutAndMaskMatchSpec u8U32BodyCtx.body.layouts forgedMaskC.targetTy
+      forgedMaskC.layout forgedMaskC.padMask = false ∧
+    freezePaddedToMem u8U32BodyCtx 0 baseC paddedU8U32MemCodec_lawful_sample desyncSt = .fail :=
+  ⟨rfl, rfl, rfl⟩
+
 /-- Every successful `freezePaddedToMem` runs against EXACTLY the authenticated
-`ctx.specs` of a well-formed `BodySpatialCtx`, so every frozen local's MIR type is
-the declared `LocalDecl.ty` of the real `CapturedMir`. -/
+`ctx.specs` of a well-formed `BodySpatialCtx`, AND validates the codec's
+`V2026MemLayout` (`size`, `alignBytes`) and `padMask` against `ctx.body.layouts`
+as well as `st.mirLocals[reg]` consistency with the loan cell. -/
 theorem freezePaddedToMem_ok_authenticated {α : Type} {ctx : BodySpatialCtx} {lid : LoanId}
     {c : TypedSpatialMemCodec α} {hLaw : LawfulTypedSpatialMemCodec ctx.body.layouts c}
     {st st' : PaddedSymMemState}
     (h : freezePaddedToMem ctx lid c hLaw st = .ok st') :
     bodySpatialCtxWf ctx = true ∧ st.mirLocalTypes = ctx.specs ∧
-      c.targetTy.isRefTarget = false := by
+      c.targetTy.isRefTarget = false ∧
+      codecLayoutAndMaskMatchSpec ctx.body.layouts c.targetTy c.layout c.padMask = true := by
   unfold freezePaddedToMem at h
   cases hS : specsMatchBodyCtx ctx st.mirLocalTypes with
   | false => simp only [hS, Bool.not_false, Bool.true_or, ↓reduceIte] at h; cases h
   | true =>
     cases hR : c.targetTy.isRefTarget with
     | true => simp only [hS, hR, Bool.or_true] at h; cases h
-    | false => exact ⟨(specsMatchBodyCtx_sound hS).1, (specsMatchBodyCtx_sound hS).2, rfl⟩
+    | false =>
+      refine ⟨(specsMatchBodyCtx_sound hS).1, (specsMatchBodyCtx_sound hS).2, rfl, ?_⟩
+      cases hLM : codecLayoutAndMaskMatchSpec ctx.body.layouts c.targetTy c.layout c.padMask with
+      | true => rfl
+      | false =>
+        simp only [hS, hR, hLM, Bool.not_true, Bool.not_false, Bool.false_or, Bool.or_false,
+          Bool.true_or, Bool.or_true, ↓reduceIte] at h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
+        split at h <;> try cases h
 
 theorem mutatePaddedInMem_ok_authenticated {ctx : BodySpatialCtx} {bid : BlockId} {tag : Nat}
     {relOff reqAlign : Nat} {newBytes : List AbstractByte} {st st' : PaddedSymMemState}

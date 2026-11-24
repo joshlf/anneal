@@ -113,11 +113,21 @@ private def fatPtrLayout : TypeLayout :=
         (.initialized (.int 64 false) ⟨0, 18446744073709551615⟩)
     fields := .arbitrary [⟨0⟩, ⟨8⟩] [0, 1], variants := .single 0, isUninhabited := false }
 
+private def u8Arr4Layout : TypeLayout :=
+  { size := ⟨4⟩, align := ⟨1⟩
+    backendRepr := .memory
+    fields := .array ⟨1⟩ 4, variants := .single 0, isUninhabited := false }
+
+private def u8Arr2Layout : TypeLayout :=
+  { size := ⟨2⟩, align := ⟨1⟩
+    backendRepr := .memory
+    fields := .array ⟨1⟩ 2, variants := .single 0, isUninhabited := false }
+
 private def testLayouts : LayoutTable :=
   { pointerBits := 64, isLittleEndian := true
     entries :=
       [u32Layout, u16Layout, boolLayout, u16BoolLayout, u16Arr4Layout,
-       ptrLayout, u8Layout, fatPtrLayout] }
+       ptrLayout, u8Layout, fatPtrLayout, u8Arr4Layout, u8Arr2Layout] }
 
 private def u32T : Ty := { kind := .uint .u32, layoutIdx := 0 }
 private def u16T : Ty := { kind := .uint .u16, layoutIdx := 1 }
@@ -127,6 +137,10 @@ private def u16Arr4T : Ty := { kind := .array (.uint .u16) 4, layoutIdx := 4 }
 private def refMutU32T : Ty := { kind := .ref .mut (.uint .u32), layoutIdx := 5 }
 private def u8T : Ty := { kind := .uint .u8, layoutIdx := 6 }
 private def refMutSliceU8T : Ty := { kind := .ref .mut (.slice (.uint .u8)), layoutIdx := 7 }
+private def refSharedSliceU8T : Ty := { kind := .ref .not (.slice (.uint .u8)), layoutIdx := 7 }
+private def u8Arr4T : Ty := { kind := .array (.uint .u8) 4, layoutIdx := 8 }
+private def refMutU8Arr4T : Ty := { kind := .ref .mut (.array (.uint .u8) 4), layoutIdx := 5 }
+private def u8Arr2T : Ty := { kind := .array (.uint .u8) 2, layoutIdx := 9 }
 
 private def u32C (n : Nat) : Operand :=
   .constant { ty := u32T, val := .scalar (.int { bits := n, sizeBytes := 4 }) }
@@ -304,6 +318,165 @@ theorem witness1b_byterun_repeat_u16x4_mir_wp_converges (x : Nat) (hLt : x < 655
       (by decide) (show 0 < 2 by decide) rfl rfl (Or.inl (show (2 : Nat) ≠ 1 by decide))
   have _ := hLt
   exact ⟨hMir, hFuse, ⟨_, rfl, rfl⟩⟩
+
+/-- Real `V2026_06_01` `CapturedMir` body copying a 2-byte slice `src : &[u8]`
+(`[0..2)` in `Memory.callerLocals[12]`) into `dst : &mut [u8]` (`[2..4)` in
+`Memory.callerLocals[12]`), then transitioning to `bb1` to return `2u32`. -/
+def copy2BytesSliceBody : CapturedMir :=
+  mkBody "tests::copy_2_bytes_slice" 2
+    [decl .mut u32T, decl .not refSharedSliceU8T, decl .not refMutSliceU8T, decl .mut u8Arr2T]
+    [ mkBb
+        [ mkSt (.assign (pl 3) (.use (.copy (pl 1 [.deref]))))
+        , mkSt (.assign (pl 2 [.deref]) (.use (.copy (pl 3)))) ]
+        (.goto 1)
+    , mkBb [mkSt (.assign (pl 0) (.use (u32C 2)))] .return_ ]
+
+/-- **Witness 1c (REAL `CapturedMir` → `ByteRunCopyCut` over `ValidBlockTree` → `MirWpConverges`)**:
+for ALL `b0 b1 sib0 sib1 : UInt8`, seals the live `BlockTree`-backed execution of
+`copy2BytesSliceBody` (`bb0 -> bb1`) as a genuine `ByteRunCopyCut` over
+`Memory.callerLocals` (`memCallerByteStoreOps`, op `copyRange ⟨⟨12⟩, 0, 2⟩ ⟨⟨12⟩, 2, 2⟩`),
+lifts it to unmodified `mirDetStep` via `byteRunCopyCut_mir_of_validBlockTree`, and
+transports it via `mirWpConverges_of_byteRunCopyCut` into `MirWpConverges`, proving both
+the copied destination bytes `[b0, b1]` and disjoint sibling slice `[sib0, sib1]` framing. -/
+theorem witness1c_byterun_real_mir_copy_cut_mir_wp_converges
+    (b0 b1 sib0 sib1 : UInt8) :
+    let srcL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 0, 2⟩
+    let dstL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 2, 2⟩
+    let sibL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 4, 2⟩
+    let borrowSrc : BorrowEntry :=
+      { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .frozen, rangeOffset := 0, rangeLen := 2 }
+    let borrowDst : BorrowEntry :=
+      { tag := 2, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, rangeOffset := 2, rangeLen := 2 }
+    let m0 : Memory :=
+      { borrows := [borrowDst, borrowSrc], nextTag := 3
+        callerLocals :=
+          List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, 0, 0, sib0, sib1]] }
+    let m1 : Memory :=
+      { m0 with
+        callerLocals :=
+          List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, b0, b1, sib0, sib1]] }
+    let ms0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit,
+                              .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                              .init (.aggregate 0 [.ptr ⟨2, 2⟩ 8, .scalar ⟨2, 8⟩]),
+                              .uninit] }
+        memory := m0 }
+    let ms1 : MachineState :=
+      { frame := { blockIdx := 1, stmtIdx := 0
+                   locals := [.uninit,
+                              .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                              .init (.aggregate 0 [.ptr ⟨2, 2⟩ 8, .scalar ⟨2, 8⟩]),
+                              .init (.aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩])] }
+        memory := m1 }
+    ByteRunCopyCut (mirDetStep copy2BytesSliceBody) (fun ms => ms.memory)
+      [ByteRunCopyOp.copyRange srcL dstL] 3 ms0 ms1 ∧
+    MirWpConverges copy2BytesSliceBody ms0
+      (fun out =>
+        match out with
+        | .normal (.scalar ⟨2, 4⟩, mFinal) =>
+          dstL.get mFinal = some [b0, b1] ∧ sibL.get mFinal = some [sib0, sib1]
+        | _ => False) := by
+  intro srcL dstL sibL borrowSrc borrowDst m0 m1 ms0 ms1
+  let bt := BlockTree.ofList copy2BytesSliceBody.basicBlocks
+  have hExecOp :
+      execByteRunCopyOps (Mem := Memory) (Addr := CallerLocalAddr) (Byte := UInt8)
+        [ByteRunCopyOp.copyRange srcL dstL] m0 = some m1 := by
+    rw [execByteRunCopyOps_cons]
+    unfold ByteRunCopyOp.exec copyRangeComp
+    have hSrcG : srcL.get m0 = some [b0, b1] := by
+      unfold srcL ByteSubLens.get memCallerByteStoreOps
+      change (match ParametricCore.listGet? m0.callerLocals 12 with
+        | none => none
+        | some slot =>
+          match slotAsU8Bytes? slot with
+          | none => none
+          | some bytes =>
+            match Nat.ble (0 + 2) bytes.length with
+            | true => some ((bytes.drop 0).take 2)
+            | false => none) = some [b0, b1]
+      have hG : ParametricCore.listGet? m0.callerLocals 12 =
+          some (u8BytesToSlot [b0, b1, 0, 0, sib0, sib1]) := rfl
+      rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]; rfl
+    have hDstS : dstL.set m0 [b0, b1] = some m1 := by
+      unfold dstL ByteSubLens.set memCallerByteStoreOps
+      change (match ParametricCore.listGet? m0.callerLocals 12 with
+        | none => none
+        | some slot =>
+          match slotAsU8Bytes? slot with
+          | none => none
+          | some bytes =>
+            match Nat.ble (2 + 2) bytes.length with
+            | true =>
+              match ParametricCore.listSet? m0.callerLocals 12 (u8BytesToSlot (listSplice bytes 2 [b0, b1])) with
+              | some cl' => some { m0 with callerLocals := cl' }
+              | none => none
+            | false => none) = some m1
+      have hG : ParametricCore.listGet? m0.callerLocals 12 =
+          some (u8BytesToSlot [b0, b1, 0, 0, sib0, sib1]) := rfl
+      rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]; rfl
+    dsimp only
+    have hLenEq : Nat.beq srcL.len dstL.len = true := rfl
+    rw [hLenEq, hSrcG]; dsimp only; rw [hDstS]; rfl
+  have hBtCut :
+      ByteRunCopyCut (mirDetStepWith copy2BytesSliceBody bt.lookupForced?) (fun ms => ms.memory)
+        [ByteRunCopyOp.copyRange srcL dstL] 3 ms0 ms1 := by
+    apply seal_byteRunCopyCut
+    refine ⟨?_, hExecOp⟩
+    exact StepStageCut.step (s₁ := { ms0 with
+        frame := { ms0.frame with
+          stmtIdx := 1
+          locals := [.uninit,
+                     .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                     .init (.aggregate 0 [.ptr ⟨2, 2⟩ 8, .scalar ⟨2, 8⟩]),
+                     .init (.aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩])] } }) rfl
+      (StepStageCut.step (s₁ := { ms1 with frame := { ms1.frame with blockIdx := 0, stmtIdx := 2 } }) rfl
+        (StepStageCut.step (s₁ := ms1) rfl (StepStageCut.refl _ 0 ms1)))
+  have hLiveCut :
+      ByteRunCopyCut (mirDetStep copy2BytesSliceBody) (fun ms => ms.memory)
+        [ByteRunCopyOp.copyRange srcL dstL] 3 ms0 ms1 :=
+    byteRunCopyCut_mir_of_validBlockTree (valid_blockTree_ofList copy2BytesSliceBody.basicBlocks) hBtCut
+  have hGetDst : dstL.get m1 = some [b0, b1] := by
+    unfold dstL ByteSubLens.get memCallerByteStoreOps
+    change (match ParametricCore.listGet? m1.callerLocals 12 with
+      | none => none
+      | some slot =>
+        match slotAsU8Bytes? slot with
+        | none => none
+        | some bytes =>
+          match Nat.ble (2 + 2) bytes.length with
+          | true => some ((bytes.drop 2).take 2)
+          | false => none) = some [b0, b1]
+    have hG : ParametricCore.listGet? m1.callerLocals 12 =
+        some (u8BytesToSlot [b0, b1, b0, b1, sib0, sib1]) := rfl
+    rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]; rfl
+  have hGetSib : sibL.get m1 = some [sib0, sib1] := by
+    unfold sibL ByteSubLens.get memCallerByteStoreOps
+    change (match ParametricCore.listGet? m1.callerLocals 12 with
+      | none => none
+      | some slot =>
+        match slotAsU8Bytes? slot with
+        | none => none
+        | some bytes =>
+          match Nat.ble (4 + 2) bytes.length with
+          | true => some ((bytes.drop 4).take 2)
+          | false => none) = some [sib0, sib1]
+    have hG : ParametricCore.listGet? m1.callerLocals 12 =
+        some (u8BytesToSlot [b0, b1, b0, b1, sib0, sib1]) := rfl
+    rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]; rfl
+  refine ⟨hLiveCut, mirWpConverges_of_byteRunCopyCut hLiveCut (fun _ => ?_)⟩
+  let ms2 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 1
+                 locals := [.init (.scalar ⟨2, 4⟩),
+                            .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                            .init (.aggregate 0 [.ptr ⟨2, 2⟩ 8, .scalar ⟨2, 8⟩]),
+                            .init (.aggregate 0 [.scalar ⟨b0.toNat, 1⟩, .scalar ⟨b1.toNat, 1⟩])] }
+      memory := m1 }
+  exact step_to_mirWp (body := copy2BytesSliceBody) (s := ms1) (s' := ms2) rfl
+    (done_to_mirWp (body := copy2BytesSliceBody) (s := ms2)
+      (out := .normal (.scalar ⟨2, 4⟩, m1)) rfl ⟨hGetDst, hGetSib⟩)
 
 /-! ## Witness 2: `OverflowCastJoin` — Real 8-Block Multi-Diamond `CapturedMir` Pipeline -/
 
@@ -604,19 +777,20 @@ private theorem ovf_step_bb6_1 (l1 l3 l4 l5 : LocalSlot) (acc : Nat) (hLt : acc 
     rw [hEv]
     cases ap <;> rfl
 
-/-- Stage 1 `OvfCastStageCut` (`bb0 -> bb1`): narrowing `u32 [0, 20000] → u16 [0, 20000]`. -/
-private theorem ovfStage1_narrow_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6) :
+/-- Stage 1 `OvfCastStageCut` (`bb0 -> bb1`): narrowing `u32 [lo, hi] → u16 [lo, hi]`. -/
+private theorem ovfStage1_narrow_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6)
+    (lo hi : Nat) (hHi : hi ≤ 20000) :
     OvfCastStageCut v2026PureSlotOvfCastFrameOps (mirDetStep ovfCastPipelineBody)
-      baseLocals ovfPipelineIds ovfEarlyOk ⟨0, .u32, 0, 20000⟩ ⟨1, .u16, 0, 20000⟩ 2 := by
+      baseLocals ovfPipelineIds (fun _ => false) ⟨0, .u32, lo, hi⟩ ⟨1, .u16, lo, hi⟩ 2 := by
   apply seal_ovfCastStageCut
-  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHi, _⟩, hFrame⟩
-  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by decide) hBlk
+  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHiA, _⟩, hFrame⟩
+  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by dsimp; decide) hBlk
   cases ms with
   | mk fr mem =>
     cases fr with
     | mk bb st locs =>
       dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc hFrame
-      dsimp only at hBb hStmt hAct hBor hStk hLo hHi
+      dsimp only at hBb hStmt hAct hBor hStk hLo hHiA
       subst hBb; subst hStmt
       rw [hLen] at hLocLen
       cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
@@ -638,22 +812,24 @@ private theorem ovfStage1_narrow_cut (baseLocals : List LocalSlot) (hLen : baseL
         cases mem; dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk; rfl
       exact ovfStep hStep1 (ovfStep hStep2 (wpUntilFuel_here (ops := ovfWpOps)
         ⟨by unfold v2026PureSlotOvfCastFrameOps; simp [hAct, hBor, hStk],
-         by rw [hLen]; rfl, ⟨acc, rfl, hLo, hHi, by decide⟩, frame_6_locals hFrame⟩))
+         by rw [hLen]; rfl, ⟨acc, rfl, hLo, hHiA, by show hi < 65536; omega⟩,
+         frame_6_locals hFrame⟩))
 
 /-- Stage 2 `OvfCastStageCut` (`bb1 -> bb3`): checked multiplication diamond
-`u16 [0, 20000] → u16 [0, 60000]`. -/
-private theorem ovfStage2_mul_diamond_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6) :
+`u16 [lo, hi] → u16 [lo * 3, hi * 3]`. -/
+private theorem ovfStage2_mul_diamond_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6)
+    (lo hi : Nat) (hHi : hi ≤ 20000) :
     OvfCastStageCut v2026PureSlotOvfCastFrameOps (mirDetStep ovfCastPipelineBody)
-      baseLocals ovfPipelineIds ovfEarlyOk ⟨1, .u16, 0, 20000⟩ ⟨3, .u16, 0, 60000⟩ 5 := by
+      baseLocals ovfPipelineIds (fun _ => false) ⟨1, .u16, lo, hi⟩ ⟨3, .u16, lo * 3, hi * 3⟩ 5 := by
   apply seal_ovfCastStageCut
-  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHi, _⟩, hFrame⟩
-  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by decide) hBlk
+  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHiA, _⟩, hFrame⟩
+  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by dsimp; decide) hBlk
   cases ms with
   | mk fr mem =>
     cases fr with
     | mk bb st locs =>
       dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc hFrame
-      dsimp only at hBb hStmt hAct hBor hStk hLo hHi
+      dsimp only at hBb hStmt hAct hBor hStk hLo hHiA
       subst hBb; subst hStmt
       rw [hLen] at hLocLen
       cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
@@ -707,23 +883,26 @@ private theorem ovfStage2_mul_diamond_cut (baseLocals : List LocalSlot) (hLen : 
       exact ovfStep hStep0 (ovfStep hStep1 (ovfStep hStep2 (ovfStep hStep3 (ovfStep hStep4
         (wpUntilFuel_here (ops := ovfWpOps)
           ⟨by unfold v2026PureSlotOvfCastFrameOps; simp [hAct, hBor, hStk],
-           by rw [hLen]; rfl, ⟨acc * 3, rfl, by dsimp; omega, by dsimp; omega, by decide⟩,
+           by rw [hLen]; rfl,
+           ⟨acc * 3, rfl, by dsimp; omega, by dsimp; omega, by show hi * 3 < 65536; omega⟩,
            frame_6_locals hFrame⟩)))))
 
 /-- Stage 3 `OvfCastStageCut` (`bb3 -> bb5`): checked addition diamond
-`u16 [0, 60000] → u16 [7, 60007]`. -/
-private theorem ovfStage3_add_diamond_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6) :
+`u16 [lo * 3, hi * 3] → u16 [lo * 3 + 7, hi * 3 + 7]`. -/
+private theorem ovfStage3_add_diamond_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6)
+    (lo hi : Nat) (hHi : hi ≤ 20000) :
     OvfCastStageCut v2026PureSlotOvfCastFrameOps (mirDetStep ovfCastPipelineBody)
-      baseLocals ovfPipelineIds ovfEarlyOk ⟨3, .u16, 0, 60000⟩ ⟨5, .u16, 7, 60007⟩ 5 := by
+      baseLocals ovfPipelineIds (fun _ => false)
+      ⟨3, .u16, lo * 3, hi * 3⟩ ⟨5, .u16, lo * 3 + 7, hi * 3 + 7⟩ 5 := by
   apply seal_ovfCastStageCut
-  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHi, _⟩, hFrame⟩
-  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by decide) hBlk
+  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHiA, _⟩, hFrame⟩
+  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by dsimp; decide) hBlk
   cases ms with
   | mk fr mem =>
     cases fr with
     | mk bb st locs =>
       dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc hFrame
-      dsimp only at hBb hStmt hAct hBor hStk hLo hHi
+      dsimp only at hBb hStmt hAct hBor hStk hLo hHiA
       subst hBb; subst hStmt
       rw [hLen] at hLocLen
       cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
@@ -777,22 +956,25 @@ private theorem ovfStage3_add_diamond_cut (baseLocals : List LocalSlot) (hLen : 
       exact ovfStep hStep0 (ovfStep hStep1 (ovfStep hStep2 (ovfStep hStep3 (ovfStep hStep4
         (wpUntilFuel_here (ops := ovfWpOps)
           ⟨by unfold v2026PureSlotOvfCastFrameOps; simp [hAct, hBor, hStk],
-           by rw [hLen]; rfl, ⟨acc + 7, rfl, by dsimp; omega, by dsimp; omega, by decide⟩,
+           by rw [hLen]; rfl,
+           ⟨acc + 7, rfl, by dsimp; omega, by dsimp; omega, by show hi * 3 + 7 < 65536; omega⟩,
            frame_6_locals hFrame⟩)))))
 
-/-- Stage 4 `OvfCastStageCut` (`bb5 -> bb6`): widening `u16 [7, 60007] → u32 [7, 60007]`. -/
-private theorem ovfStage4_widen_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6) :
+/-- Stage 4 `OvfCastStageCut` (`bb5 -> bb6`): widening `u16 [lo * 3 + 7, hi * 3 + 7] → u32`. -/
+private theorem ovfStage4_widen_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6)
+    (lo hi : Nat) (hHi : hi ≤ 20000) :
     OvfCastStageCut v2026PureSlotOvfCastFrameOps (mirDetStep ovfCastPipelineBody)
-      baseLocals ovfPipelineIds ovfEarlyOk ⟨5, .u16, 7, 60007⟩ ⟨6, .u32, 7, 60007⟩ 2 := by
+      baseLocals ovfPipelineIds (fun _ => false)
+      ⟨5, .u16, lo * 3 + 7, hi * 3 + 7⟩ ⟨6, .u32, lo * 3 + 7, hi * 3 + 7⟩ 2 := by
   apply seal_ovfCastStageCut
-  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHi, _⟩, hFrame⟩
-  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by decide) hBlk
+  intro ms ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHiA, _⟩, hFrame⟩
+  obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by dsimp; decide) hBlk
   cases ms with
   | mk fr mem =>
     cases fr with
     | mk bb st locs =>
       dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc hFrame
-      dsimp only at hBb hStmt hAct hBor hStk hLo hHi
+      dsimp only at hBb hStmt hAct hBor hStk hLo hHiA
       subst hBb; subst hStmt
       rw [hLen] at hLocLen
       cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
@@ -814,28 +996,34 @@ private theorem ovfStage4_widen_cut (baseLocals : List LocalSlot) (hLen : baseLo
         cases mem; dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk; rfl
       exact ovfStep hStep1 (ovfStep hStep2 (wpUntilFuel_here (ops := ovfWpOps)
         ⟨by unfold v2026PureSlotOvfCastFrameOps; simp [hAct, hBor, hStk],
-         by rw [hLen]; rfl, ⟨acc, rfl, hLo, hHi, by decide⟩, frame_6_locals hFrame⟩))
+         by rw [hLen]; rfl, ⟨acc, rfl, hLo, hHiA, by show hi * 3 + 7 < 4294967296; omega⟩,
+         frame_6_locals hFrame⟩))
 
-/-- $O(m)$ composed 4-stage `OvfCastStageCut` (`bb0 -> bb6`, total fuel `14`) collapsing
-both `SwitchInt` diamonds and both `intToInt` casts into a single compositional cut. -/
-theorem ovfPipeline_composed_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6) :
+/-- Parametric $O(m)$ composed 4-stage `OvfCastStageCut` (`bb0 -> bb6`, total fuel `14`,
+`earlyOk := fun _ => false`) collapsing both `SwitchInt` diamonds and both `intToInt`
+casts into a single compositional cut for ANY interval `[lo, hi]` with `hi ≤ 20000`.
+Instantiating `(0, 20000)` yields the wide interval cut `[0, 20000] → [7, 60007]`;
+instantiating singleton `(x, x)` yields the EXACT functional cut `[x, x] → [3*x + 7, 3*x + 7]`. -/
+theorem ovfPipeline_composed_cut (baseLocals : List LocalSlot) (hLen : baseLocals.length = 6)
+    (lo hi : Nat) (hHi : hi ≤ 20000) :
     OvfCastStageCut v2026PureSlotOvfCastFrameOps (mirDetStep ovfCastPipelineBody)
-      baseLocals ovfPipelineIds ovfEarlyOk ⟨0, .u32, 0, 20000⟩ ⟨6, .u32, 7, 60007⟩ 14 :=
+      baseLocals ovfPipelineIds (fun _ => false)
+      ⟨0, .u32, lo, hi⟩ ⟨6, .u32, lo * 3 + 7, hi * 3 + 7⟩ 14 :=
   ovfCastStageCut_compose
     (ovfCastStageCut_compose
       (ovfCastStageCut_compose
-        (ovfStage1_narrow_cut baseLocals hLen)
-        (ovfStage2_mul_diamond_cut baseLocals hLen))
-      (ovfStage3_add_diamond_cut baseLocals hLen))
-    (ovfStage4_widen_cut baseLocals hLen)
+        (ovfStage1_narrow_cut baseLocals hLen lo hi hHi)
+        (ovfStage2_mul_diamond_cut baseLocals hLen lo hi hHi))
+      (ovfStage3_add_diamond_cut baseLocals hLen lo hi hHi))
+    (ovfStage4_widen_cut baseLocals hLen lo hi hHi)
 
 /-- **Witness 2 (`OverflowCastJoin` end-to-end $O(m)$ `OvfCastStageCut` composition →
 `MirWpConverges`)**:
-1. Via `ovfPipeline_composed_cut` + `mirWpConverges_of_ovfCastStageCut`: for ALL `x ≤ 20000`
-   and ALL bystanders `k`, proves interval-guarded `AddUnchecked` safety (`107 ≤ r ∧ r ≤ 60107`)
-   and bystander local framing at the `bb6` cutpoint (`MirStepsConverges`);
-2. Proves the exact symbolic functional postcondition `r = 3 * x + 107` for ALL `x ≤ 20000`;
-3. Concrete execution witness `x = 1234 ↦ 3809`. -/
+BOTH the wide interval postcondition (`107 ≤ r ∧ r ≤ 60107`, with NO early-return
+escape hatch) AND the exact symbolic functional postcondition (`r = 3 * x + 107`)
+are derived DIRECTLY through the SAME $O(m)$ composed `ovfPipeline_composed_cut` +
+`mirWpConverges_of_ovfCastStageCut` (at `(0, 20000)` and singleton `(x, x)` respectively),
+plus concrete witness `x = 1234 ↦ 3809`. -/
 theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
     (∀ (x k : Nat), x ≤ 20000 →
       let baseLocals : List LocalSlot :=
@@ -845,7 +1033,7 @@ theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
       MirWpConverges ovfCastPipelineBody ms0
         (fun out =>
           match out with
-          | .normal (.scalar ⟨r, 4⟩, _) => (107 ≤ r ∧ r ≤ 60107) ∨ r = 0xFFFFFFFF
+          | .normal (.scalar ⟨r, 4⟩, _) => 107 ≤ r ∧ r ≤ 60107
           | _ => False) ∧
       MirWpConverges ovfCastPipelineBody ms0
         (fun out =>
@@ -861,7 +1049,7 @@ theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
         match out with
         | .normal (.scalar ⟨r, 4⟩, _) => r = 3809
         | _ => False) := by
-  have hExact : ∀ (x k : Nat), x ≤ 20000 →
+  have hFromCut : ∀ (x k lo hi : Nat), lo ≤ x → x ≤ hi → hi ≤ 20000 →
       MirWpConverges ovfCastPipelineBody
         { frame := { blockIdx := 0, stmtIdx := 0
                      locals := [.uninit, .init (.scalar ⟨k, 4⟩), .init (.scalar ⟨x, 4⟩),
@@ -869,163 +1057,88 @@ theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
           memory := {} }
         (fun out =>
           match out with
-          | .normal (.scalar ⟨r, 4⟩, _) => r = 3 * x + 107 ∧ 107 ≤ r ∧ r ≤ 60107
+          | .normal (.scalar ⟨r, 4⟩, _) => lo * 3 + 107 ≤ r ∧ r ≤ hi * 3 + 107
           | _ => False) := by
-    intro x k hx
-    let mulT : Value := .aggregate 0 [.scalar ⟨x * 3, 2⟩, .scalar ⟨0, 1⟩]
-    let addT : Value := .aggregate 0 [.scalar ⟨x * 3 + 7, 2⟩, .scalar ⟨0, 1⟩]
-    have hS1 := ovf_step_bb0_0 .uninit (.init (.scalar ⟨k, 4⟩)) .uninit .uninit .uninit x (by omega)
-      {} rfl rfl rfl
-    have hS3 := ovf_step_bb1_1 .uninit (.init (.scalar ⟨k, 4⟩)) .uninit .uninit x (by omega)
-      {} rfl rfl rfl
-    have hS7 := ovf_step_bb3_1 .uninit (.init (.scalar ⟨k, 4⟩)) .uninit (.init mulT) (x * 3) (by omega)
-      {} rfl rfl rfl
-    have hS11 := ovf_step_bb5_0 .uninit (.init (.scalar ⟨k, 4⟩)) .uninit (.init mulT) (.init addT)
-      (x * 3 + 7) (by omega) {} rfl rfl rfl
-    have hS14 := ovf_step_bb6_1 (.init (.scalar ⟨k, 4⟩)) .uninit (.init mulT) (.init addT)
-      (x * 3 + 7) (by omega) {} rfl rfl rfl
-    exact
-      step_to_mirWp hS1
-        (step_to_mirWp (s' := { frame := { blockIdx := 1, stmtIdx := 0
-                                           locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                      .init (.scalar ⟨x, 2⟩), .uninit, .uninit, .uninit] }
-                                memory := {} }) rfl
-          (step_to_mirWp (s' := { frame := { blockIdx := 1, stmtIdx := 1
-                                             locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                        .init (.scalar ⟨x, 2⟩), .uninit, .uninit, .uninit] }
-                                  memory := {} }) rfl
-            (step_to_mirWp hS3
-              (step_to_mirWp (s' := { frame := { blockIdx := 2, stmtIdx := 0
-                                                 locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                            .init (.scalar ⟨x, 2⟩), .uninit, .init mulT, .uninit] }
-                                      memory := {} }) rfl
-                (step_to_mirWp (s' := { frame := { blockIdx := 2, stmtIdx := 1
-                                                   locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                              .init (.scalar ⟨x * 3, 2⟩), .uninit, .init mulT, .uninit] }
-                                        memory := {} }) rfl
-                  (step_to_mirWp (s' := { frame := { blockIdx := 3, stmtIdx := 0
-                                                     locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                .init (.scalar ⟨x * 3, 2⟩), .uninit, .init mulT, .uninit] }
-                                          memory := {} }) rfl
-                    (step_to_mirWp (s' := { frame := { blockIdx := 3, stmtIdx := 1
-                                                       locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                  .init (.scalar ⟨x * 3, 2⟩), .uninit, .init mulT, .uninit] }
-                                            memory := {} }) rfl
-                      (step_to_mirWp hS7
-                        (step_to_mirWp (s' := { frame := { blockIdx := 4, stmtIdx := 0
-                                                           locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                      .init (.scalar ⟨x * 3, 2⟩), .uninit, .init mulT, .init addT] }
-                                                memory := {} }) rfl
-                          (step_to_mirWp (s' := { frame := { blockIdx := 4, stmtIdx := 1
-                                                             locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                        .init (.scalar ⟨x * 3 + 7, 2⟩), .uninit, .init mulT, .init addT] }
-                                                  memory := {} }) rfl
-                            (step_to_mirWp (s' := { frame := { blockIdx := 5, stmtIdx := 0
-                                                               locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                          .init (.scalar ⟨x * 3 + 7, 2⟩), .uninit, .init mulT, .init addT] }
-                                                    memory := {} }) rfl
-                              (step_to_mirWp hS11
-                                (step_to_mirWp (s' := { frame := { blockIdx := 6, stmtIdx := 0
-                                                                   locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                              .init (.scalar ⟨x * 3 + 7, 4⟩), .uninit, .init mulT, .init addT] }
-                                                        memory := {} }) rfl
-                                  (step_to_mirWp (s' := { frame := { blockIdx := 6, stmtIdx := 1
-                                                                     locals := [.uninit, .init (.scalar ⟨k, 4⟩),
-                                                                                .init (.scalar ⟨x * 3 + 7, 4⟩), .uninit, .init mulT, .init addT] }
-                                                          memory := {} }) rfl
-                                    (step_to_mirWp hS14
-                                      (step_to_mirWp (s' := { frame := { blockIdx := 6, stmtIdx := 3
-                                                                         locals := [.init (.scalar ⟨x * 3 + 7 + 100, 4⟩),
-                                                                                    .init (.scalar ⟨k, 4⟩),
-                                                                                    .init (.scalar ⟨x * 3 + 7 + 100, 4⟩),
-                                                                                    .uninit, .init mulT, .init addT] }
-                                                              memory := {} }) rfl
-                                        (done_to_mirWp rfl ⟨by omega, by omega, by omega⟩)))))))))))))))))
-  refine ⟨?_, ?_⟩
-  · intro x k hx
+    intro x k lo hi hLoX hXHi hHi
     let baseLocals : List LocalSlot :=
       [.uninit, .init (.scalar ⟨k, 4⟩), .init (.scalar ⟨x, 4⟩), .uninit, .uninit, .uninit]
-    have hCutWp :
-        MirWpConverges ovfCastPipelineBody
-          { frame := { blockIdx := 0, stmtIdx := 0, locals := baseLocals }, memory := {} }
-          (fun out =>
-            match out with
-            | .normal (.scalar ⟨r, 4⟩, _) => (107 ≤ r ∧ r ≤ 60107) ∨ r = 0xFFFFFFFF
-            | _ => False) := by
-      refine mirWpConverges_of_ovfCastStageCut (ovfPipeline_composed_cut baseLocals rfl)
-        ⟨rfl, rfl, ⟨x, rfl, Nat.zero_le x, hx, by decide⟩, fun _ _ _ _ _ => rfl⟩ ?_ ?_
-      · intro ms' ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHi, _⟩, _⟩
-        obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by decide) hBlk
-        cases ms' with
-        | mk fr mem =>
-          cases fr with
-          | mk bb st locs =>
-            dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc
-            dsimp only at hBb hStmt hAct hBor hStk hLo hHi
-            subst hBb; subst hStmt
-            cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
-            cases r1 with | nil => nomatch hLocLen | cons l1 r2 =>
-            cases r2 with | nil => nomatch hLocLen | cons l2 r3 =>
-            cases r3 with | nil => nomatch hLocLen | cons l3 r4 =>
-            cases r4 with | nil => nomatch hLocLen | cons l4 r5 =>
-            cases r5 with | nil => nomatch hLocLen | cons l5 r6 =>
-            cases r6 with | cons _ _ => nomatch hLocLen | nil =>
-            injection hGetAcc with hL2; subst hL2
-            have hT0 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
-                { frame := { blockIdx := 6, stmtIdx := 0
-                             locals := [l0, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5] }
-                  memory := mem } =
-                .cont { frame := { blockIdx := 6, stmtIdx := 1
-                                   locals := [.uninit, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5] }
-                        memory := mem } := by
-              cases mem with
-              | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
-                dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
-                cases ap <;> rfl
-            have hT1 := ovf_step_bb6_1 l1 l3 l4 l5 acc (by omega) mem hAct hBor hStk
-            have hT2 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
-                { frame := { blockIdx := 6, stmtIdx := 2
-                             locals := [.uninit, l1, .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
-                  memory := mem } =
-                .cont { frame := { blockIdx := 6, stmtIdx := 3
-                                   locals := [.init (.scalar ⟨acc + 100, 4⟩), l1,
-                                              .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
-                        memory := mem } := by
-              cases mem with
-              | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
-                dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
-                cases ap <;> rfl
-            have hT3 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
-                { frame := { blockIdx := 6, stmtIdx := 3
-                             locals := [.init (.scalar ⟨acc + 100, 4⟩), l1,
-                                        .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
-                  memory := mem } =
-                .done (.normal (.scalar ⟨acc + 100, 4⟩, mem)) := by
-              cases mem with
-              | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
-                dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
-                cases ap <;> rfl
-            exact step_to_mirWp hT0 (step_to_mirWp hT1 (step_to_mirWp hT2
-              (done_to_mirWp hT3 (Or.inl ⟨by omega, by omega⟩))))
-      · intro out hEarly
-        cases out with
-        | normal rv =>
-          rcases rv with ⟨v, mem⟩
-          cases v with
-          | scalar sc =>
-            rcases sc with ⟨bits, sz⟩
-            by_cases h4 : sz = 4
-            · subst h4
-              exact Or.inr (Nat.beq_eq.mp hEarly)
-            · have hF : ovfEarlyOk (.normal (.scalar ⟨bits, sz⟩, mem)) = false := by
-                unfold ovfEarlyOk
-                match sz, h4 with
-                | 4, h => exact False.elim (h rfl)
-                | 0, _ | 1, _ | 2, _ | 3, _ | _ + 5, _ => rfl
-              rw [hF] at hEarly; cases hEarly
-          | unit | ptr _ _ | aggregate _ _ | uninit => cases hEarly
-        | panic | abort => cases hEarly
-    exact ⟨hCutWp, hExact x k hx⟩
+    refine mirWpConverges_of_ovfCastStageCut (ovfPipeline_composed_cut baseLocals rfl lo hi hHi)
+      ⟨rfl, rfl, ⟨x, rfl, hLoX, hXHi, by show hi < 4294967296; omega⟩, fun _ _ _ _ _ => rfl⟩
+      ?_ (fun _ hF => by cases hF)
+    intro ms' ⟨hBlk, hLocLen, ⟨acc, hGetAcc, hLo, hHiA, _⟩, _⟩
+    obtain ⟨hBb, hStmt, hAct, hBor, hStk⟩ := v2026PureSlot_blockOf_unpack (by dsimp; decide) hBlk
+    cases ms' with
+    | mk fr mem =>
+      cases fr with
+      | mk bb st locs =>
+        dsimp only [v2026PureSlotOvfCastFrameOps] at hLocLen hGetAcc
+        dsimp only at hBb hStmt hAct hBor hStk hLo hHiA
+        subst hBb; subst hStmt
+        cases locs with | nil => nomatch hLocLen | cons l0 r1 =>
+        cases r1 with | nil => nomatch hLocLen | cons l1 r2 =>
+        cases r2 with | nil => nomatch hLocLen | cons l2 r3 =>
+        cases r3 with | nil => nomatch hLocLen | cons l3 r4 =>
+        cases r4 with | nil => nomatch hLocLen | cons l4 r5 =>
+        cases r5 with | nil => nomatch hLocLen | cons l5 r6 =>
+        cases r6 with | cons _ _ => nomatch hLocLen | nil =>
+        injection hGetAcc with hL2; subst hL2
+        have hT0 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
+            { frame := { blockIdx := 6, stmtIdx := 0
+                         locals := [l0, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5] }
+              memory := mem } =
+            .cont { frame := { blockIdx := 6, stmtIdx := 1
+                               locals := [.uninit, l1, .init (.scalar ⟨acc, 4⟩), l3, l4, l5] }
+                    memory := mem } := by
+          cases mem with
+          | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+            dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
+            cases ap <;> rfl
+        have hT1 := ovf_step_bb6_1 l1 l3 l4 l5 acc (by omega) mem hAct hBor hStk
+        have hT2 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
+            { frame := { blockIdx := 6, stmtIdx := 2
+                         locals := [.uninit, l1, .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
+              memory := mem } =
+            .cont { frame := { blockIdx := 6, stmtIdx := 3
+                               locals := [.init (.scalar ⟨acc + 100, 4⟩), l1,
+                                          .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
+                    memory := mem } := by
+          cases mem with
+          | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+            dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
+            cases ap <;> rfl
+        have hT3 : Anneal.PureMirExec.mirStep ovfCastPipelineBody
+            { frame := { blockIdx := 6, stmtIdx := 3
+                         locals := [.init (.scalar ⟨acc + 100, 4⟩), l1,
+                                    .init (.scalar ⟨acc + 100, 4⟩), l3, l4, l5] }
+              memory := mem } =
+            .done (.normal (.scalar ⟨acc + 100, 4⟩, mem)) := by
+          cases mem with
+          | mk na gl bo nt ca ti cs ac ap np cl fp ex =>
+            dsimp only at hAct hBor hStk; subst hAct; subst hBor; subst hStk
+            cases ap <;> rfl
+        exact step_to_mirWp hT0 (step_to_mirWp hT1 (step_to_mirWp hT2
+          (done_to_mirWp hT3 ⟨by omega, by omega⟩)))
+  refine ⟨?_, ?_⟩
+  · intro x k hx
+    refine ⟨hFromCut x k 0 20000 (Nat.zero_le x) hx (Nat.le_refl _), ?_⟩
+    exact MirWpConverges.mono (by
+      intro out h
+      cases out with
+      | normal rv =>
+        rcases rv with ⟨v, mem⟩
+        cases v with
+        | scalar sc =>
+          rcases sc with ⟨bits, sz⟩
+          by_cases h4 : sz = 4
+          · subst h4
+            change x * 3 + 107 ≤ bits ∧ bits ≤ x * 3 + 107 at h
+            exact ⟨by omega, by omega, by omega⟩
+          · match sz, h4 with
+            | 4, hn => exact False.elim (hn rfl)
+            | 0, _ | 1, _ | 2, _ | 3, _ | _ + 5, _ => exact False.elim h
+        | unit | ptr _ _ | aggregate _ _ | uninit => cases h
+      | panic | abort => cases h)
+      (hFromCut x k x x (Nat.le_refl x) (Nat.le_refl x) hx)
   · exact MirWpConverges.mono (by
       intro out h
       cases out with
@@ -1035,13 +1148,16 @@ theorem witness2_ovfCast_multi_diamond_mir_wp_converges :
         | scalar sc =>
           rcases sc with ⟨bits, sz⟩
           by_cases h4 : sz = 4
-          · subst h4; exact h.1
+          · subst h4
+            change 1234 * 3 + 107 ≤ bits ∧ bits ≤ 1234 * 3 + 107 at h
+            change bits = 3809
+            omega
           · match sz, h4 with
             | 4, hn => exact False.elim (hn rfl)
             | 0, _ | 1, _ | 2, _ | 3, _ | _ + 5, _ => exact False.elim h
         | unit | ptr _ _ | aggregate _ _ | uninit => cases h
       | panic | abort => cases h)
-      (hExact 1234 42 (by decide))
+      (hFromCut 1234 42 1234 1234 (by decide) (by decide) (by decide))
 
 /-! ## Witness 3: `CallStackUnwind` & `RefFrame` — Inline Call, `CallSpecCut`, Cleanup Unwind & `topo3` -/
 
@@ -1075,14 +1191,46 @@ def callerNormalBody : CapturedMir :=
     , mkBb [mkSt (.assign (pl 0) (.use (u32C 999)))] .return_ (isClean := true) ]
 
 /-- Real `&mut [u8]` slice-writing callee `fn write2(buf: &mut [u8], b0: u8, b1: u8) -> u32`:
-writes `[b0, b1]` into the caller's `[u8; N]` buffer in `Memory.callerLocals`, returning `1u32`. -/
+opens with `Retag(FnEntry, _1)` creating a REAL strong protector (`activeProtectors = [1]`,
+protected child tag `2`), writes `[b0, b1]` into the caller's `[u8; N]` buffer in
+`Memory.callerLocals`, and returns `1u32`. -/
 def calleeWrite2BytesBody : CapturedMir :=
   mkBody "tests::write2_bytes" 3
     [decl .mut u32T, decl .not refMutSliceU8T, decl .not u8T, decl .not u8T]
     [mkBb
-      [ mkSt (.assign (pl 1 [.deref]) (.aggregate (.array u8T) [.copy (pl 2), .copy (pl 3)]))
+      [ mkSt (.retag .fnEntry (pl 1))
+      , mkSt (.assign (pl 1 [.deref]) (.aggregate (.array u8T) [.copy (pl 2), .copy (pl 3)]))
       , mkSt (.assign (pl 0) (.use (u32C 1))) ]
       .return_]
+
+/-- Real inline slice-prefix writer `fn write_prefix(buf: &mut [u8], b0: u8, b1: u8) -> u32`:
+opens with `Retag(FnEntry, _1)`, writes `(*buf)[0] := b0` and `(*buf)[1] := b1` via
+`ProjectionElem.constantIndex`, leaving indices `[2..4)` untouched, and returns `2u32`. -/
+def calleeWriteSlicePrefixBody : CapturedMir :=
+  mkBody "tests::write_slice_prefix" 3
+    [decl .mut u32T, decl .not refMutSliceU8T, decl .not u8T, decl .not u8T]
+    [mkBb
+      [ mkSt (.retag .fnEntry (pl 1))
+      , mkSt (.assign (pl 1 [.deref, .constantIndex 0 2 false]) (.use (.copy (pl 2))))
+      , mkSt (.assign (pl 1 [.deref, .constantIndex 1 2 false]) (.use (.copy (pl 3))))
+      , mkSt (.assign (pl 0) (.use (u32C 2))) ]
+      .return_]
+
+/-- Real caller `fn caller_slice_write(mut arr: [u8; 4], b0: u8, b1: u8) -> [u8; 4]`:
+creates a REAL mutable borrow `&mut arr` via `Rvalue.ref (.mut false)`, unsizes
+`&mut [u8; 4] → &mut [u8]` via `CastKind.pointerCoercion "Unsize"`, invokes
+`tests::write_slice_prefix` via `TerminatorKind.call`, and returns the updated `[u8; 4]`. -/
+def callerSliceWriteBody : CapturedMir :=
+  mkBody "tests::caller_slice_write" 3
+    [decl .mut u8Arr4T, decl .mut u8Arr4T, decl .not u8T, decl .not u8T,
+     decl .mut refMutU8Arr4T, decl .mut refMutSliceU8T, decl .mut u32T]
+    [ mkBb
+        [ mkSt (.assign (pl 4) (.ref (.mut false) (pl 1)))
+        , mkSt (.assign (pl 5) (.cast (.pointerCoercion "Unsize") (.copy (pl 4)) refMutSliceU8T)) ]
+        (.call (fnOp "tests::write_slice_prefix")
+          [.copy (pl 5), .copy (pl 2), .copy (pl 3)] (pl 6) (some 1) (.cleanup 2))
+    , mkBb [mkSt (.assign (pl 0) (.use (.copy (pl 1))))] .return_
+    , mkBb [mkSt (.assign (pl 0) (.use (.copy (pl 1))))] .return_ (isClean := true) ]
 
 /-- Real inline callee `fn assert_flag(flag: bool) -> u32 { assert!(flag); 0 }`
 unwinding with `UnwindAction.continue_`. -/
@@ -1274,65 +1422,75 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
     (step_to_mirWp h5 (step_to_mirWp h6 (step_to_mirWp h7 (step_to_mirWp h8
       (done_to_mirWp h9 ⟨by omega, rfl, rfl, rfl, rfl, rfl⟩))))))))
 
-/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + `exitFrameWithProtectors` +
-disjoint sibling framing → `MirWpConverges`)**: seals `calleeWrite2BytesBody` behind a
-`CallSpecCut (wops := mirDetWpOps calleeWrite2BytesBody)` over `Memory.callerLocals`
-(`memCallerByteStoreOps`), proving `UpdatesOnly [⟨⟨12⟩, 0, 2⟩]`, `exitFrameWithProtectors`
-protector release (`frameTags := [2]`), and disjoint sibling slice `[2..4)` preservation
-via `mirWpConverges_of_callSpecCut_normal_cleanup`. -/
+/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + live `rangedBorrowTreeOfMirBorrows`
+projection + `exitFrameWithProtectors` + disjoint sibling framing → `MirWpConverges`)**:
+seals `calleeWrite2BytesBody` (with REAL `Retag(FnEntry, _1)`) behind a `CallSpecCut` over
+`Memory.callerLocals` (`memCallerByteStoreOps`), projecting the live post-execution
+`m1.borrows` and `m1.activeProtectors` directly into `RangedBorrowTree` via
+`rangedBorrowTreeOfMirBorrows` (zero hardcoded borrow trees!), proving `UpdatesOnly [⟨⟨12⟩, 0, 2⟩]`,
+`exitFrameWithProtectors _ [2]` releasing the real `FnEntry`-created protector tag `2`, and
+disjoint sibling slice `[2..4)` framing via `mirWpConverges_of_callSpecCut_normal_cleanup`. -/
 theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 sib1 : UInt8) :
     let mutL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 0, 2⟩
     let sibL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 2, 2⟩
-    let tree0 : RangedBorrowTree :=
-      mkSharedTopo3Tree16 .Frozen true (.ReservedFrz false) false [2]
-    let treeAfter : RangedBorrowTree :=
-      (performRangedAccess tree0 8 8 2 .Write .VisitChildrenOfAccessed).tree
     let borrowSlice : BorrowEntry :=
       { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
         perm := .unique, rangeOffset := 0, rangeLen := 2 }
+    let m0Store : Memory :=
+      { callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [0, 0, sib0, sib1]] }
     let m0 : Memory :=
-      { borrows := [borrowSlice], nextTag := 2
-        callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [0, 0, sib0, sib1]] }
+      { m0Store with borrows := [borrowSlice], nextTag := 2 }
+    let tree0 : RangedBorrowTree := rangedBorrowTreeOfMirBorrows m0.borrows m0.activeProtectors 2
     let adapter : CalleeMachineAdapter MachineState MirOutcome Memory Value :=
-      { mkEntry := fun m _ =>
+      { mkEntry := fun mStore _ =>
           { frame := { blockIdx := 0, stmtIdx := 0
                        locals := [.uninit,
                                   .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                   .init (.scalar ⟨b0.toNat, 1⟩),
                                   .init (.scalar ⟨b1.toNat, 1⟩)] }
-            memory := m }
+            memory := { mStore with borrows := [borrowSlice], nextTag := 2 } }
         classifyOut := fun out =>
           match out with
-          | .normal (rv, m1) => some (.returned rv m1 treeAfter)
+          | .normal (rv, m1) =>
+            some (.returned rv { callerLocals := m1.callerLocals }
+              (rangedBorrowTreeOfMirBorrows m1.borrows m1.activeProtectors 2))
           | _ => none }
     let spec : CallSpec Memory CallerLocalAddr Value :=
-      { pre := fun m t => m = m0 ∧ t = tree0
+      { pre := fun m t => m = m0Store ∧ t = tree0
         postRet := fun rv m tRel =>
           rv = .scalar ⟨1, 4⟩ ∧ mutL.get m = some [b0, b1] ∧
-          sibL.get m = some [sib0, sib1] ∧ tRel.protectedTags = []
+          sibL.get m = some [sib0, sib1] ∧
+          tRel.protectedTags = []
         postUnwind := fun _ _ => False
         modifies := [mutL]
-        frameTags := [2]
+        frameTags := [1]
         canNormal := true
         canUnwind := false }
     CallSpecCut (wops := mirDetWpOps calleeWrite2BytesBody) adapter spec ∧
-    MirWpConverges calleeWrite2BytesBody (adapter.mkEntry m0 tree0)
+    MirWpConverges calleeWrite2BytesBody (adapter.mkEntry m0Store tree0)
       (fun out =>
         match out with
         | .normal (rv, m') =>
           rv = .scalar ⟨1, 4⟩ ∧
           mutL.get m' = some [b0, b1] ∧
           sibL.get m' = some [sib0, sib1] ∧
-          (exitFrameWithProtectors treeAfter [2]).status = .Released ∧
-          (exitFrameWithProtectors treeAfter [2]).tree.protectedTags = []
+          (exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1]).status = .Released ∧
+          (exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1]).tree.protectedTags = []
         | _ => False) := by
-  intro mutL sibL tree0 treeAfter borrowSlice m0 adapter spec
-  let m1 : Memory :=
+  intro mutL sibL borrowSlice m0Store m0 tree0 adapter spec
+  let borrowSliceProt : BorrowEntry := { borrowSlice with protector := some 1 }
+  let mRetag : Memory :=
     { m0 with
-      callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, sib0, sib1]] }
-  have hSetMut : mutL.set m0 [b0, b1] = some m1 := by
+      borrows := [borrowSliceProt]
+      activeProtectors := [1]
+      nextProtector := 2 }
+  let m1Store : Memory :=
+    { callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, sib0, sib1]] }
+  let m1 : Memory :=
+    { mRetag with callerLocals := m1Store.callerLocals }
+  have hSetMut : mutL.set m0Store [b0, b1] = some m1Store := by
     unfold mutL ByteSubLens.set memCallerByteStoreOps
-    change (match ParametricCore.listGet? m0.callerLocals 12 with
+    change (match ParametricCore.listGet? m0Store.callerLocals 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1340,16 +1498,16 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
         | some bytes =>
           match Nat.ble (0 + 2) bytes.length with
           | true =>
-            match ParametricCore.listSet? m0.callerLocals 12 (u8BytesToSlot (listSplice bytes 0 [b0, b1])) with
-            | some cl' => some { m0 with callerLocals := cl' }
+            match ParametricCore.listSet? m0Store.callerLocals 12 (u8BytesToSlot (listSplice bytes 0 [b0, b1])) with
+            | some cl' => some { m0Store with callerLocals := cl' }
             | none => none
-          | false => none) = some m1
-    have hG : ParametricCore.listGet? m0.callerLocals 12 = some (u8BytesToSlot [0, 0, sib0, sib1]) := rfl
+          | false => none) = some m1Store
+    have hG : ParametricCore.listGet? m0Store.callerLocals 12 = some (u8BytesToSlot [0, 0, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hGetMut : mutL.get m1 = some [b0, b1] := by
+  have hGetMut : mutL.get m1Store = some [b0, b1] := by
     unfold mutL ByteSubLens.get memCallerByteStoreOps
-    change (match ParametricCore.listGet? m1.callerLocals 12 with
+    change (match ParametricCore.listGet? m1Store.callerLocals 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1358,12 +1516,12 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           match Nat.ble (0 + 2) bytes.length with
           | true => some ((bytes.drop 0).take 2)
           | false => none) = some [b0, b1]
-    have hG : ParametricCore.listGet? m1.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
+    have hG : ParametricCore.listGet? m1Store.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hGetSib : sibL.get m1 = some [sib0, sib1] := by
+  have hGetSib : sibL.get m1Store = some [sib0, sib1] := by
     unfold sibL ByteSubLens.get memCallerByteStoreOps
-    change (match ParametricCore.listGet? m1.callerLocals 12 with
+    change (match ParametricCore.listGet? m1Store.callerLocals 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1372,43 +1530,72 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           match Nat.ble (2 + 2) bytes.length with
           | true => some ((bytes.drop 2).take 2)
           | false => none) = some [sib0, sib1]
-    have hG : ParametricCore.listGet? m1.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
+    have hG : ParametricCore.listGet? m1Store.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hStep1 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody (adapter.mkEntry m0 tree0) =
+  have hStep0 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody (adapter.mkEntry m0Store tree0) =
       .cont { frame := { blockIdx := 0, stmtIdx := 1
+                         locals := [.uninit,
+                                    .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                                    .init (.scalar ⟨b0.toNat, 1⟩),
+                                    .init (.scalar ⟨b1.toNat, 1⟩)] }
+              memory := mRetag } := rfl
+  have hStep1 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody
+      { frame := { blockIdx := 0, stmtIdx := 1
+                   locals := [.uninit,
+                              .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                              .init (.scalar ⟨b0.toNat, 1⟩),
+                              .init (.scalar ⟨b1.toNat, 1⟩)] }
+        memory := mRetag } =
+      .cont { frame := { blockIdx := 0, stmtIdx := 2
                          locals := [.uninit,
                                     .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                     .init (.scalar ⟨b0.toNat, 1⟩),
                                     .init (.scalar ⟨b1.toNat, 1⟩)] }
               memory := m1 } := rfl
   have hStep2 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody
-      { frame := { blockIdx := 0, stmtIdx := 1
+      { frame := { blockIdx := 0, stmtIdx := 2
                    locals := [.uninit,
                               .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                               .init (.scalar ⟨b0.toNat, 1⟩),
                               .init (.scalar ⟨b1.toNat, 1⟩)] }
         memory := m1 } =
-      .cont { frame := { blockIdx := 0, stmtIdx := 2
+      .cont { frame := { blockIdx := 0, stmtIdx := 3
                          locals := [.init (.scalar ⟨1, 4⟩),
                                     .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                     .init (.scalar ⟨b0.toNat, 1⟩),
                                     .init (.scalar ⟨b1.toNat, 1⟩)] }
               memory := m1 } := rfl
   have hStep3 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody
-      { frame := { blockIdx := 0, stmtIdx := 2
+      { frame := { blockIdx := 0, stmtIdx := 3
                    locals := [.init (.scalar ⟨1, 4⟩),
                               .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                               .init (.scalar ⟨b0.toNat, 1⟩),
                               .init (.scalar ⟨b1.toNat, 1⟩)] }
         memory := m1 } =
       .done (.normal (.scalar ⟨1, 4⟩, m1)) := rfl
+  have hRel := rangedBorrowTreeOfMirBorrows_attachProtector_release_unique borrowSliceProt 2
+    rfl rfl rfl rfl
   have hCut : CallSpecCut (wops := mirDetWpOps calleeWrite2BytesBody) adapter spec := by
     apply seal_callSpecCut (wops := mirDetWpOps calleeWrite2BytesBody)
     intro m t ⟨hMEq, hTEq⟩
     subst hMEq; subst hTEq
-    have hDet1 : mirDetStep calleeWrite2BytesBody (adapter.mkEntry m0 tree0) =
+    have hDet0 : mirDetStep calleeWrite2BytesBody (adapter.mkEntry m0Store tree0) =
         .step { frame := { blockIdx := 0, stmtIdx := 1
+                           locals := [.uninit,
+                                      .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                                      .init (.scalar ⟨b0.toNat, 1⟩),
+                                      .init (.scalar ⟨b1.toNat, 1⟩)] }
+                memory := mRetag } := by
+      unfold mirDetStep toStepOutcome; rw [hStep0]
+    have hDet1 : mirDetStep calleeWrite2BytesBody
+        { frame := { blockIdx := 0, stmtIdx := 1
+                     locals := [.uninit,
+                                .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
+                                .init (.scalar ⟨b0.toNat, 1⟩),
+                                .init (.scalar ⟨b1.toNat, 1⟩)] }
+          memory := mRetag } =
+        .step { frame := { blockIdx := 0, stmtIdx := 2
                            locals := [.uninit,
                                       .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                       .init (.scalar ⟨b0.toNat, 1⟩),
@@ -1416,13 +1603,13 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
                 memory := m1 } := by
       unfold mirDetStep toStepOutcome; rw [hStep1]
     have hDet2 : mirDetStep calleeWrite2BytesBody
-        { frame := { blockIdx := 0, stmtIdx := 1
+        { frame := { blockIdx := 0, stmtIdx := 2
                      locals := [.uninit,
                                 .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                 .init (.scalar ⟨b0.toNat, 1⟩),
                                 .init (.scalar ⟨b1.toNat, 1⟩)] }
           memory := m1 } =
-        .step { frame := { blockIdx := 0, stmtIdx := 2
+        .step { frame := { blockIdx := 0, stmtIdx := 3
                            locals := [.init (.scalar ⟨1, 4⟩),
                                       .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                       .init (.scalar ⟨b0.toNat, 1⟩),
@@ -1430,7 +1617,7 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
                 memory := m1 } := by
       unfold mirDetStep toStepOutcome; rw [hStep2]
     have hDet3 : mirDetStep calleeWrite2BytesBody
-        { frame := { blockIdx := 0, stmtIdx := 2
+        { frame := { blockIdx := 0, stmtIdx := 3
                      locals := [.init (.scalar ⟨1, 4⟩),
                                 .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                 .init (.scalar ⟨b0.toNat, 1⟩),
@@ -1438,6 +1625,9 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           memory := m1 } =
         .done (.normal (.scalar ⟨1, 4⟩, m1)) := by
       unfold mirDetStep toStepOutcome; rw [hStep3]
+    apply wpOutcome_step (ops := mirDetWpOps calleeWrite2BytesBody)
+    change (mirDetStep calleeWrite2BytesBody _).wp _ _ _
+    rw [hDet0]
     apply wpOutcome_step (ops := mirDetWpOps calleeWrite2BytesBody)
     change (mirDetStep calleeWrite2BytesBody _).wp _ _ _
     rw [hDet1]
@@ -1467,16 +1657,136 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
     | normal rv =>
       rcases rv with ⟨v, m'⟩
       dsimp only [adapter, spec] at hOut
-      cases hRel : exitFrameWithProtectors treeAfter [2] with
+      cases hEx : exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1] with
       | mk tRel st =>
-        rw [hRel] at hOut
+        rw [hEx] at hOut
         cases st with
         | Released =>
           dsimp only [evalCallCont4Dispatch] at hOut
+          dsimp only
+          rw [hEx]
           exact ⟨hOut.2.1, hOut.2.2.1, hOut.2.2.2.1, rfl, hOut.2.2.2.2⟩
-        | _ =>
-          exact False.elim hOut
+        | _ => exact False.elim hOut
     | panic | abort => exact False.elim hOut) hWp
+
+/-- **Witness 3a-iii (REAL caller `Rvalue.ref` + `PointerCoercion "Unsize"` + inline
+`TerminatorKind.call` `&mut [u8]` slice writeback + REAL `FnEntry` protector release)**:
+for ALL `b0 b1 sib0 sib1 : UInt8`, `callerSliceWriteBody` takes a REAL `&mut [u8; 4]`
+borrow of its local array `[0, 0, sib0, sib1]`, unsizes it to `&mut [u8]` via
+`CastKind.pointerCoercion "Unsize"`, invokes `calleeWriteSlicePrefixBody` (which opens
+with `Retag(FnEntry, _1)` attaching strong protector `1` to tag `1`), writes `b0, b1`
+into indices `0, 1`, frames `[sib0, sib1]` at indices `2, 3`, releases protector `1` on
+`return_`, and converges via `MirWpConverges` to `[b0, b1, sib0, sib1]`. -/
+theorem witness3a_iii_caller_ref_unsize_slice_call_writeback
+    (b0 b1 sib0 sib1 : UInt8) :
+    let ms0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit,
+                              u8BytesToSlot [0, 0, sib0, sib1],
+                              .init (.scalar ⟨b0.toNat, 1⟩),
+                              .init (.scalar ⟨b1.toNat, 1⟩),
+                              .uninit, .uninit, .uninit] }
+        memory := { callees := [calleeWriteSlicePrefixBody] } }
+    MirWpConverges callerSliceWriteBody ms0
+      (fun out =>
+        match out with
+        | .normal (v, mem) =>
+          v = .aggregate 0 (u8BytesToValues [b0, b1, sib0, sib1]) ∧
+          mem.callStack = [] ∧
+          mem.activeProtectors = [] ∧
+          mem.nextProtector = 2
+        | _ => False) := by
+  intro ms0
+  let fatPtr : Value := .aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨4, 8⟩]
+  let b1Entry : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false }
+  let b1Prot : BorrowEntry := { b1Entry with protector := some 1 }
+  let b1ProtUniq : BorrowEntry := { b1Prot with perm := .unique }
+  let mem1 : Memory := { callees := [calleeWriteSlicePrefixBody], borrows := [b1Entry], nextTag := 2 }
+  let callerLocs2 : List LocalSlot :=
+    [.uninit, u8BytesToSlot [0, 0, sib0, sib1],
+     .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+     .init (.ptr ⟨1, 0⟩ 8), .init fatPtr, .uninit]
+  let saved0 : SavedCallerFrame :=
+    { callerBody := callerSliceWriteBody
+      frame := { blockIdx := 0, stmtIdx := 2, locals := callerLocs2 }
+      destination := pl 6
+      returnTarget := 1
+      calleeProtectors := []
+      returnUnwind := .cleanup 2
+      isDiverging := false }
+  let saved1 : SavedCallerFrame :=
+    { saved0 with
+      frame := { blockIdx := 0, stmtIdx := 2
+                 locals := [.uninit, u8BytesToSlot [b0, 0, sib0, sib1],
+                            .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .init fatPtr, .uninit] } }
+  let saved2 : SavedCallerFrame :=
+    { saved0 with
+      frame := { blockIdx := 0, stmtIdx := 2
+                 locals := [.uninit, u8BytesToSlot [b0, b1, sib0, sib1],
+                            .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .init fatPtr, .uninit] } }
+  let calleeLocs0 : List LocalSlot :=
+    [.uninit, .init fatPtr, .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩)]
+  let calleeLocsRet : List LocalSlot :=
+    [.init (.scalar ⟨2, 4⟩), .init fatPtr, .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩)]
+  let mem2 : Memory :=
+    { mem1 with callStack := [saved0], activeCallee := some calleeWriteSlicePrefixBody }
+  let mem3 : Memory :=
+    { mem2 with borrows := [b1Prot], activeProtectors := [1], nextProtector := 2 }
+  let mem4 : Memory :=
+    { mem3 with borrows := [b1ProtUniq], callStack := [saved1] }
+  let mem5 : Memory :=
+    { mem4 with callStack := [saved2] }
+  let mem6 : Memory :=
+    { callees := [calleeWriteSlicePrefixBody], borrows := [b1ProtUniq], nextTag := 2,
+      activeCallee := some callerSliceWriteBody, activeProtectors := [], nextProtector := 2 }
+  let s1 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, u8BytesToSlot [0, 0, sib0, sib1],
+                            .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] }
+      memory := mem1 }
+  let s2 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := callerLocs2 }, memory := mem1 }
+  let s3 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0, locals := calleeLocs0 }, memory := mem2 }
+  let s4 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1, locals := calleeLocs0 }, memory := mem3 }
+  let s5 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2, locals := calleeLocs0 }, memory := mem4 }
+  let s6 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3, locals := calleeLocs0 }, memory := mem5 }
+  let s7 : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 4, locals := calleeLocsRet }, memory := mem5 }
+  let s8 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0
+                 locals := [.uninit, u8BytesToSlot [b0, b1, sib0, sib1],
+                            .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .init fatPtr, .init (.scalar ⟨2, 4⟩)] }
+      memory := mem6 }
+  let s9 : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 1
+                 locals := [u8BytesToSlot [b0, b1, sib0, sib1],
+                            u8BytesToSlot [b0, b1, sib0, sib1],
+                            .init (.scalar ⟨b0.toNat, 1⟩), .init (.scalar ⟨b1.toNat, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .init fatPtr, .init (.scalar ⟨2, 4⟩)] }
+      memory := mem6 }
+  exact step_to_mirWp (s' := s1) rfl
+    (step_to_mirWp (s' := s2) rfl
+      (step_to_mirWp (s' := s3) rfl
+        (step_to_mirWp (s' := s4) rfl
+          (step_to_mirWp (s' := s5) rfl
+            (step_to_mirWp (s' := s6) rfl
+              (step_to_mirWp (s' := s7) rfl
+                (step_to_mirWp (s' := s8) rfl
+                  (step_to_mirWp (s' := s9) rfl
+                    (done_to_mirWp (out := .normal
+                      (.aggregate 0 (u8BytesToValues [b0, b1, sib0, sib1]),
+                       { mem6 with borrows := disableFrameBorrows mem6.borrows 0 7 })) rfl
+                      ⟨rfl, rfl, rfl, rfl⟩)))))))))
 
 /-- **Witness 3b (`CallStackUnwind` callee `assert` failure → caller `UnwindAction.cleanup` recovery)**:
 calling `calleeAssertBody` with `flag = false` triggers `.continue_` unwind across the
@@ -1949,8 +2259,18 @@ theorem neg4_spatialMem_uninit_prov_strip_forgery_and_pinned_write_blocked :
                        debugName := some "r" }] }
             specs :=
               u8U32BodyCtx.specs ++ [.mirTy { kind := .ref .mut (u8U32Ty 0).kind, layoutIdx := 0 }] }
-          0 stPinned = .fail) := by
-  refine ⟨padded_nonpad_uninit_rejected, provPtr_provenance_stripping_rejected, rfl, rfl, ?_⟩
+          0 stPinned = .fail) ∧
+    -- 4. Forged under-alignment, forged all-padding mask, and desynced `mirLocals` rejected
+    (codecLayoutAndMaskMatchSpec u8U32BodyCtx.body.layouts (paddedU8U32MemCodec 0).targetTy
+        { size := 8, alignBytes := 1 } (paddedU8U32MemCodec 0).padMask = false ∧
+      codecLayoutAndMaskMatchSpec u8U32BodyCtx.body.layouts (paddedU8U32MemCodec 0).targetTy
+        (paddedU8U32MemCodec 0).layout (List.replicate 8 true) = false ∧
+      freezePaddedToMem u8U32BodyCtx 0 (paddedU8U32MemCodec 0) paddedU8U32MemCodec_lawful_sample
+        { sampleU8U32InitState with
+          mirLocals := [.immediate .unit, .immediate (.aggregate 0 [.scalar ⟨0xFF, 1⟩, .scalar ⟨0, 4⟩])] } =
+        .fail) := by
+  refine ⟨padded_nonpad_uninit_rejected, provPtr_provenance_stripping_rejected, rfl,
+    ⟨rfl, ?_⟩, forged_align_padMask_and_desync_mirLocal_rejected⟩
   obtain ⟨stPinned, _, hRd, hWr, _, _, _, hEnd⟩ :=
     pinned_loan_blocks_pure_mutation_until_reabsorb
   exact ⟨stPinned, hRd, hWr, hEnd⟩

@@ -1590,4 +1590,114 @@ theorem mirWpConverges_of_callSpecCut_normal_continue {Mem Addr Byte Val : Type}
       (isCleanupBb := isCleanupBb) (onCleanup := onCleanup)
       hCut hPre hNormal hUnwind hAbort)
 
+/-- Project unmodified `V2026_06_01.MirSemantics` `{BorrowEntry, activeProtectors}`
+directly into an `Anneal.RefFrame.RangedBorrowTree` over byte span `[0, rangeLen)`.
+- Tag `0` is the root stack-allocation owner (`parent := none`, `.Unique`).
+- Each live `BorrowEntry` in `borrows` maps to `TbTopoNode ⟨e.tag, some (e.parentTag.getD 0)⟩`
+  with permission `tbPermOfMir e.perm` (and `accessed := true` when not `.reservedFrz false`).
+- `protectedTags` contains precisely those `e.tag` whose `e.protector = some pid`
+  with `pid ∈ activeProtectors`. -/
+def rangedBorrowTreeOfMirBorrows (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (rangeLen : Nat) : RangedBorrowTree :=
+  let topo : List TbTopoNode :=
+    ⟨0, none⟩ :: borrows.map (fun e => ⟨e.tag, some (e.parentTag.getD 0)⟩)
+  let protTags : List Nat :=
+    (borrows.filter (fun e =>
+      match e.protector with
+      | some pid => natListMem pid activeProtectors
+      | none => false)).map (fun e => e.tag)
+  let states : List (Nat × TbLocationState) :=
+    (0, ⟨.Unique, true⟩) ::
+      borrows.map (fun e =>
+        let acc := match e.perm with | .reservedFrz false => false | _ => true
+        (e.tag, ⟨tbPermOfMir e.perm, acc⟩))
+  { topology := topo
+    protectedTags := protTags
+    segments := [⟨0, rangeLen, states⟩] }
+
+/-- When `Memory.activeProtectors = []` (e.g. after `TerminatorKind.return_`
+restores an empty caller protector set), `rangedBorrowTreeOfMirBorrows` has
+empty `protectedTags = []`. -/
+theorem rangedBorrowTreeOfMirBorrows_protectedTags_nil (borrows : List BorrowEntry)
+    (rangeLen : Nat) :
+    (rangedBorrowTreeOfMirBorrows borrows [] rangeLen).protectedTags = [] := by
+  unfold rangedBorrowTreeOfMirBorrows
+  dsimp only
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    cases hP : e.protector with
+    | none => simp only [List.filter, hP]; exact ih
+    | some pid => simp only [List.filter, hP, natListMem, List.foldr]; exact ih
+
+/-- Head-entry permission & protector projection: the most recently pushed
+`BorrowEntry` (`e :: rest`, e.g. from `evalFnEntryRetag`) projects its exact
+permission `tbPermOfMir e.perm` at `e.tag` (when `e.tag ≠ 0`) and appears at
+the head of `protectedTags` whenever `e.protector = some pid` is active in
+`activeProtectors`. -/
+theorem rangedBorrowTreeOfMirBorrows_head_protected (e : BorrowEntry)
+    (rest : List BorrowEntry) (activeProtectors : List Nat) (rangeLen pid : Nat)
+    (hTagNe0 : e.tag ≠ 0)
+    (hProt : e.protector = some pid)
+    (hActive : natListMem pid activeProtectors = true) :
+    (rangedBorrowTreeOfMirBorrows (e :: rest) activeProtectors rangeLen).protectedTags =
+      e.tag :: (rangedBorrowTreeOfMirBorrows rest activeProtectors rangeLen).protectedTags ∧
+    lookupLocState e.tag
+      (match (rangedBorrowTreeOfMirBorrows (e :: rest) activeProtectors rangeLen).segments with
+       | seg :: _ => seg.nodeStates | [] => []) =
+      some ⟨tbPermOfMir e.perm, match e.perm with | .reservedFrz false => false | _ => true⟩ := by
+  have hNe : Nat.beq 0 e.tag = false := by
+    cases hB : Nat.beq 0 e.tag with
+    | false => rfl
+    | true => exact False.elim (hTagNe0 (Nat.beq_eq.mp hB).symm)
+  unfold rangedBorrowTreeOfMirBorrows
+  simp only [List.filter, hProt, hActive, List.map, lookupLocState, List.foldr, hNe,
+    Nat.beq_refl, Bool.false_eq_true, ↓reduceIte, and_self]
+
+/-- **Exact `Retag(FnEntry)` → `exitFrameWithProtectors` refinement**: for the
+2-tag borrow chain `[child{tag:=2, parentTag:=some 1, protector:=some 1, perm:=pChild},
+root{tag:=1, parentTag:=none, protector:=none, perm:=.unique}]` produced by
+unmodified `V2026_06_01.MirSemantics.evalFnEntryRetag` + deref write (`pChild = .unique`
+or `.reservedFrz false`), projecting via `rangedBorrowTreeOfMirBorrows` and calling
+`exitFrameWithProtectors _ [2]` succeeds with `.Released` and strips `protectedTags`
+to `[]`, matching `rangedBorrowTreeOfMirBorrows borrows [] rangeLen`. -/
+theorem rangedBorrowTreeOfMirBorrows_fnEntry_release_unique
+    (child root : BorrowEntry) (rangeLen : Nat)
+    (hChildTag : child.tag = 2) (hChildParent : child.parentTag = some 1)
+    (hChildProt : child.protector = some 1) (hChildPerm : child.perm = .unique)
+    (hRootTag : root.tag = 1) (hRootParent : root.parentTag = none)
+    (hRootProt : root.protector = none) (hRootPerm : root.perm = .unique) :
+    let tActive := rangedBorrowTreeOfMirBorrows [child, root] [1] rangeLen
+    let rel := exitFrameWithProtectors tActive [2]
+    tActive.protectedTags = [2] ∧
+    rel.status = .Released ∧
+    rel.tree.protectedTags = [] ∧
+    rel.tree = rangedBorrowTreeOfMirBorrows [child, root] [] rangeLen := by
+  cases child; cases root
+  dsimp only at hChildTag hChildParent hChildProt hChildPerm hRootTag hRootParent hRootProt hRootPerm
+  subst hChildTag; subst hChildParent; subst hChildProt; subst hChildPerm
+  subst hRootTag; subst hRootParent; subst hRootProt; subst hRootPerm
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-- **Exact fat-pointer `Retag(FnEntry)` (`attachBorrowProtector`) → `exitFrameWithProtectors`
+refinement**: on a `&mut [T]` fat pointer, unmodified `V2026_06_01.MirSemantics.evalStmt (.retag .fnEntry)`
+attaches `protector := some 1` directly onto the slice borrow entry (`tag := 1, parentTag := none,
+perm := .unique`) and pushes `1` onto `activeProtectors`. Projecting via
+`rangedBorrowTreeOfMirBorrows` yields `protectedTags = [1]`, and `exitFrameWithProtectors _ [1]`
+succeeds with `.Released` and strips `protectedTags` to `[]`, matching `activeProtectors = []`. -/
+theorem rangedBorrowTreeOfMirBorrows_attachProtector_release_unique
+    (entry : BorrowEntry) (rangeLen : Nat)
+    (hTag : entry.tag = 1) (hParent : entry.parentTag = none)
+    (hProt : entry.protector = some 1) (hPerm : entry.perm = .unique) :
+    let tActive := rangedBorrowTreeOfMirBorrows [entry] [1] rangeLen
+    let rel := exitFrameWithProtectors tActive [1]
+    tActive.protectedTags = [1] ∧
+    rel.status = .Released ∧
+    rel.tree.protectedTags = [] ∧
+    rel.tree = rangedBorrowTreeOfMirBorrows [entry] [] rangeLen := by
+  cases entry
+  dsimp only at hTag hParent hProt hPerm
+  subst hTag; subst hParent; subst hProt; subst hPerm
+  exact ⟨rfl, rfl, rfl, rfl⟩
+
 end Anneal.ParametricCore.StageCutV2026Bridge
