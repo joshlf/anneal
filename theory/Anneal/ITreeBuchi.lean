@@ -4918,6 +4918,172 @@ theorem InfOften.interpState_dwp {H : Type u} {E₁ E₂ : Effect.{u}} {R : Type
       buchiProgress.mono_rec (fun _ _ hd => infOften_of_dwp Acc₂ hd)
         (h_link i Kacc Knon st hw)) h_io
 
+/--
+**Target-stateful handler linking** for `InfOften` across `ITree.interpState`:
+the handler threads the program state `H`, while an independent logical/monitor
+state `S₂` (such as a Büchi monitor state `QState` or an event trace
+`List (Event E₂)`) is preserved across the lowered `E₂` tree.
+-/
+theorem InfOften.interpState_stateful {S₂ H : Type u} {E₁ E₂ : Effect.{u}}
+    {R : Type u} {ewp₁ : StateEffectWP (S₂ × H) E₁} {ewp₂ : StateEffectWP S₂ E₂}
+    {Acc₁ : (i : E₁.I) → E₁.O i → S₂ × H → S₂ × H → Prop}
+    {Acc₂ : (j : E₂.I) → E₂.O j → S₂ → S₂ → Prop}
+    (h : (i : E₁.I) → H → ITree E₂ (E₁.O i × H))
+    (h_link : ∀ (i : E₁.I) (Kacc Knon : E₁.O i → S₂ × H → Prop)
+      (s₂ : S₂) (st : H),
+      ewp₁.wp i
+        (fun o p' => (Acc₁ i o (s₂, st) p' ∧ Kacc o p') ∨ Knon o p') (s₂, st) →
+      buchiProgress ewp₂ Acc₂ (fun pair s₂' => Knon pair.1 (s₂', pair.2))
+        (InfOften ewp₂ Acc₂
+          (fun pair s₂' => Kacc pair.1 (s₂', pair.2) ∨ Knon pair.1 (s₂', pair.2)))
+        (h i st) s₂)
+    {t : ITree E₁ R} {Q : R → S₂ × H → Prop} {s₂ : S₂} {st : H}
+    (h_io : InfOften ewp₁ Acc₁ Q t (s₂, st)) :
+    InfOften ewp₂ Acc₂ (fun pair s₂' => Q pair.1 (s₂', pair.2))
+      (ITree.interpState h t st) s₂ := by
+  let Q₂ : R × H → S₂ → Prop := fun pair s₂' => Q pair.1 (s₂', pair.2)
+  let X : ITree E₂ (R × H) → S₂ → Prop := fun u s₀ =>
+    (∃ t₀ st₀, u = ITree.interpState h t₀ st₀ ∧
+      InfOften ewp₁ Acc₁ Q t₀ (s₀, st₀)) ∨
+    (∃ (i : E₁.I) (m : ITree E₂ (E₁.O i × H)) (k : E₁.O i → ITree E₁ R),
+      u = (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+      InfOften ewp₂ Acc₂
+        (fun pair s₂' => InfOften ewp₁ Acc₁ Q (k pair.1) (s₂', pair.2)) m s₀)
+  have h_main : ∀ (t₀ : ITree E₁ R) (s₀ : S₂) (st₀ : H),
+      InfOften ewp₁ Acc₁ Q t₀ (s₀, st₀) →
+      buchiProgress ewp₂ Acc₂ Q₂ X (ITree.interpState h t₀ st₀) s₀ := by
+    intro t₀ s₀ st₀ ht₀
+    refine InfOften.progress_induct
+      (fun t₁ p => buchiProgress ewp₂ Acc₂ Q₂ X
+        (ITree.interpState h t₁ p.2) p.1) ?_ ht₀
+    intro t₁ p hx
+    cases h_obs : t₁.observe with
+    | ret r =>
+      simp only [h_obs] at hx
+      rw [eq_ret_of_observe h_obs, interpState_ret, buchiProgress.ret_iff]
+      exact hx
+    | tau t₁' =>
+      simp only [h_obs] at hx
+      rw [eq_tau_of_observe h_obs, interpState_tau, buchiProgress.tau_iff]
+      exact hx.2
+    | vis i k =>
+      simp only [h_obs] at hx
+      rw [eq_vis_of_observe h_obs, interpState_vis]
+      have h_l := h_link i (fun o p' => InfOften ewp₁ Acc₁ Q (k o) p')
+        (fun o p' => InfOften ewp₁ Acc₁ Q (k o) p' ∧
+          buchiProgress ewp₂ Acc₂ Q₂ X (ITree.interpState h (k o) p'.2) p'.1)
+        p.1 p.2
+        (ewp₁.mono
+          (fun _ _ hp => hp.2.elim (fun ha => Or.inl ⟨ha, hp.1⟩)
+            (fun hpre => Or.inr ⟨hp.1, hpre⟩)) hx)
+      refine buchiProgress.induct
+        (fun m s₁ => buchiProgress ewp₂ Acc₂ Q₂ X
+          (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₁) ?_ h_l
+      intro m s₁ hm
+      cases hm_obs : m.observe with
+      | ret pair =>
+        rcases pair with ⟨o, st'⟩
+        simp only [hm_obs] at hm
+        rw [eq_ret_of_observe hm_obs, ret_bind, buchiProgress.tau_iff]
+        exact hm.2
+      | tau m' =>
+        simp only [hm_obs] at hm
+        rw [eq_tau_of_observe hm_obs, tau_bind, buchiProgress.tau_iff]
+        exact hm
+      | vis j c =>
+        simp only [hm_obs] at hm
+        rw [eq_vis_of_observe hm_obs, vis_bind, buchiProgress.vis_iff]
+        exact ewp₂.mono
+          (fun o₂ _ hp => hp.imp
+            (And.imp id (fun hd => Or.inr ⟨i, c o₂, k, rfl,
+              InfOften.mono_post (fun _ _ hq => hq.elim id And.left) hd⟩)) id) hm
+  refine InfOften.coinduct X ?_ (Or.inl ⟨t, st, rfl, h_io⟩)
+  rintro u s₀ (⟨t₀, st₀, rfl, ht₀⟩ | ⟨i, m, k, rfl, hm⟩)
+  · exact h_main t₀ s₀ st₀ ht₀
+  · refine buchiProgress.induct
+      (fun m s₁ => buchiProgress ewp₂ Acc₂ Q₂ X
+        (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₁)
+      ?_ hm.toBuchiProgress
+    intro m s₁ hm
+    cases hm_obs : m.observe with
+    | ret pair =>
+      rcases pair with ⟨o, st'⟩
+      simp only [hm_obs] at hm
+      rw [eq_ret_of_observe hm_obs, ret_bind, buchiProgress.tau_iff]
+      exact h_main (k o) s₁ st' hm
+    | tau m' =>
+      simp only [hm_obs] at hm
+      rw [eq_tau_of_observe hm_obs, tau_bind, buchiProgress.tau_iff]
+      exact hm
+    | vis j c =>
+      simp only [hm_obs] at hm
+      rw [eq_vis_of_observe hm_obs, vis_bind, buchiProgress.vis_iff]
+      exact ewp₂.mono
+        (fun o₂ _ hp => hp.imp
+          (And.imp id (fun hio_m => Or.inr ⟨i, c o₂, k, rfl, hio_m⟩)) id) hm
+
+/--
+**Stateful monitor handler linking** for `BuchiSat` across `ITree.interpState`:
+the handler threads the program state `S` while the ghost Büchi monitor state
+`QState` persists on the target `BuchiSpec PUnit QState E₂ (R × S)`.
+-/
+theorem BuchiSat.interpState {S QState : Type u} {E₁ E₂ : Effect.{u}}
+    {R : Type u} {spec₁ : BuchiSpec S QState E₁ R}
+    {spec₂ : BuchiSpec PUnit.{u + 1} QState E₂ (R × S)}
+    (h_inv : ∀ q s, spec₁.inv q s → spec₂.inv q PUnit.unit)
+    (h_term : ∀ q r s, spec₁.terminal q r s → spec₂.terminal q (r, s) PUnit.unit)
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
+    (h_link : ∀ (i : E₁.I) (Kacc Knon : E₁.O i → QState × S → Prop)
+      (q : QState) (s : S),
+      spec₁.monitorWP.wp i
+        (fun o qs' => (spec₁.acceptEdge i o (q, s) qs' ∧ Kacc o qs') ∨ Knon o qs')
+        (q, s) →
+      buchiProgress spec₂.monitorWP spec₂.acceptEdge
+        (fun pair qp => Knon pair.1 (qp.1, pair.2))
+        (InfOften spec₂.monitorWP spec₂.acceptEdge
+          (fun pair qp =>
+            Kacc pair.1 (qp.1, pair.2) ∨ Knon pair.1 (qp.1, pair.2)))
+        (h i s) (q, PUnit.unit))
+    {t : ITree E₁ R} {q₀ : QState} {s₀ : S}
+    (h_bs : BuchiSat spec₁ t q₀ s₀) :
+    BuchiSat spec₂ (ITree.interpState h t s₀) q₀ PUnit.unit := by
+  have ⟨hi, hio⟩ := (buchiSat_iff_infOften spec₁ t q₀ s₀).1 h_bs
+  let liftEwp₁ : StateEffectWP ((QState × PUnit.{u + 1}) × S) E₁ :=
+    { wp := fun i K p => spec₁.monitorWP.wp i (fun o qs' => K o ((qs'.1, PUnit.unit), qs'.2))
+        (p.1.1, p.2)
+      mono := fun hm hw => spec₁.monitorWP.mono (fun o qs' hk => hm o _ hk) hw }
+  have hio_lift : InfOften liftEwp₁
+      (fun i o p p' => spec₁.acceptEdge i o (p.1.1, p.2) (p'.1.1, p'.2))
+      (fun r p => spec₁.terminal p.1.1 r p.2) t ((q₀, PUnit.unit), s₀) := by
+    refine InfOften.coinduct
+      (fun x p => InfOften spec₁.monitorWP spec₁.acceptEdge spec₁.terminalPost x (p.1.1, p.2))
+      ?_ hio
+    intro x p hx
+    refine buchiProgress.induct
+      (fun y qs => buchiProgress liftEwp₁
+        (fun i o a b => spec₁.acceptEdge i o (a.1.1, a.2) (b.1.1, b.2))
+        (fun r a => spec₁.terminal a.1.1 r a.2)
+        (fun z a => InfOften spec₁.monitorWP spec₁.acceptEdge spec₁.terminalPost z (a.1.1, a.2))
+        y ((qs.1, PUnit.unit), qs.2)) ?_ hx.toBuchiProgress
+    intro y qs hy
+    rw [buchiProgress.unfold_eq]
+    cases h_obs : y.observe <;> simp only [h_obs] at hy ⊢
+    · exact hy
+    · exact hy
+    · exact hy
+  have hio₂ := InfOften.interpState_stateful
+    (S₂ := QState × PUnit.{u + 1}) (H := S) (ewp₁ := liftEwp₁)
+    (ewp₂ := spec₂.monitorWP) h
+    (fun i Kacc Knon qp s hw => by
+      cases qp with
+      | mk q u =>
+        cases u
+        exact h_link i (fun o qs' => Kacc o ((qs'.1, PUnit.unit), qs'.2))
+          (fun o qs' => Knon o ((qs'.1, PUnit.unit), qs'.2)) q s hw)
+    hio_lift
+  refine (buchiSat_iff_infOften spec₂ _ q₀ PUnit.unit).2 ⟨h_inv q₀ s₀ hi, ?_⟩
+  exact InfOften.mono_post (fun pair qp ht => h_term qp.1 pair.1 pair.2 ht) hio₂
+
 section InfOftenAdequacy
 
 variable {E : Effect.{u}} {R : Type u} [FaultEffect E]
@@ -6872,6 +7038,250 @@ theorem FairInfOften.interpState_retrigger {E : Effect.{u}} {R : Type u}
   · refine Or.inr (Or.inr ⟨hnf, ?_⟩)
     rw [fairStall.unfold_eq, fairStep.ret_iff]; exact Or.inr h2
 
+/--
+**Target-stateful handler linking** for `FairInfOften` across `ITree.interpState`:
+the handler threads the program state `H` while an independent logical/monitor
+state `S₂` persists on the target transformer `ewp₂ : StateEffectWP S₂ E₂`.
+-/
+theorem FairInfOften.interpState_stateful {S₂ H : Type u} {E₁ E₂ : Effect.{u}}
+    {R : Type u} {ewp₁ : StateEffectWP (S₂ × H) E₁}
+    {ewp₂ : StateEffectWP S₂ E₂}
+    {Acc₁ Fair₁ : (i : E₁.I) → E₁.O i → S₂ × H → S₂ × H → Prop}
+    {Acc₂ Fair₂ : (j : E₂.I) → E₂.O j → S₂ → S₂ → Prop}
+    (h : (i : E₁.I) → H → ITree E₂ (E₁.O i × H))
+    (h_link : ∀ (i : E₁.I) (K4 K3 K2 : E₁.O i → S₂ × H → Prop)
+      (s₂ : S₂) (st : H),
+      ewp₁.wp i (fun o p' =>
+        (Acc₁ i o (s₂, st) p' ∧ K4 o p') ∨
+        (Fair₁ i o (s₂, st) p' ∧ K3 o p') ∨
+        (¬ Fair₁ i o (s₂, st) p' ∧ K2 o p')) (s₂, st) →
+      fairStep ewp₂ Acc₂ Fair₂ (fun pair s₂' => K3 pair.1 (s₂', pair.2))
+        (FairInfOften ewp₂ Acc₂ Fair₂
+          (fun pair s₂' =>
+            K4 pair.1 (s₂', pair.2) ∨ K3 pair.1 (s₂', pair.2) ∨
+              K2 pair.1 (s₂', pair.2)))
+        (fairProgress ewp₂ Acc₂ Fair₂ (fun pair s₂' => K3 pair.1 (s₂', pair.2))
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair s₂' =>
+              K4 pair.1 (s₂', pair.2) ∨ K3 pair.1 (s₂', pair.2) ∨
+                K2 pair.1 (s₂', pair.2))))
+        (fairStall ewp₂ Acc₂ Fair₂
+          (fun pair s₂' => K3 pair.1 (s₂', pair.2) ∨ K2 pair.1 (s₂', pair.2))
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair s₂' =>
+              K4 pair.1 (s₂', pair.2) ∨ K3 pair.1 (s₂', pair.2) ∨
+                K2 pair.1 (s₂', pair.2)))
+          (fairProgress ewp₂ Acc₂ Fair₂ (fun pair s₂' => K3 pair.1 (s₂', pair.2))
+            (FairInfOften ewp₂ Acc₂ Fair₂
+              (fun pair s₂' =>
+                K4 pair.1 (s₂', pair.2) ∨ K3 pair.1 (s₂', pair.2) ∨
+                  K2 pair.1 (s₂', pair.2)))))
+        (h i st) s₂)
+    {t : ITree E₁ R} {Q : R → S₂ × H → Prop} {s₂ : S₂} {st : H}
+    (h_fi : FairInfOften ewp₁ Acc₁ Fair₁ Q t (s₂, st)) :
+    FairInfOften ewp₂ Acc₂ Fair₂ (fun pair s₂' => Q pair.1 (s₂', pair.2))
+      (ITree.interpState h t st) s₂ := by
+  let Q₂ : R × H → S₂ → Prop := fun pair s₂' => Q pair.1 (s₂', pair.2)
+  let X : ITree E₂ (R × H) → S₂ → Prop := fun u s₀ =>
+    (∃ t₀ st₀, u = ITree.interpState h t₀ st₀ ∧
+      FairInfOften ewp₁ Acc₁ Fair₁ Q t₀ (s₀, st₀)) ∨
+    (∃ (i : E₁.I) (m : ITree E₂ (E₁.O i × H)) (k : E₁.O i → ITree E₁ R),
+      u = (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+      FairInfOften ewp₂ Acc₂ Fair₂
+        (fun pair s₂' => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2))
+        m s₀)
+  let FP : ITree E₂ (R × H) → S₂ → Prop := fairProgress ewp₂ Acc₂ Fair₂ Q₂ X
+  have h_lift_prog : ∀ (i : E₁.I) (k : E₁.O i → ITree E₁ R)
+      (P3 : E₁.O i × H → S₂ → Prop),
+      (∀ pair s', P3 pair s' → FP (ITree.interpState h (k pair.1) pair.2) s') →
+      ∀ (m : ITree E₂ (E₁.O i × H)) (s₀ : S₂),
+        fairProgress ewp₂ Acc₂ Fair₂ P3
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair s₂' =>
+              FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2))) m s₀ →
+        FP (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₀ := by
+    intro i k P3 hP3 m s₀ hm
+    refine fairProgress.induct
+      (fun m₁ s₁ => FP (m₁ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₁)
+      ?_ hm
+    intro m₁ s₁ hm₁
+    dsimp only [FP]
+    rw [fairProgress.unfold_eq]
+    let Zm : ITree E₂ (R × H) → S₂ → Prop := fun u s₁' =>
+      (∃ m₂, u = (m₂ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+        fairStall ewp₂ Acc₂ Fair₂ P3
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair s₂' =>
+              FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2)))
+          (fun m₃ s₃ =>
+            FP (m₃ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃)
+          m₂ s₁') ∨
+      FP u s₁'
+    refine fairStall.coinduct Zm ?_ (Or.inl ⟨m₁, rfl, hm₁⟩)
+    rintro u s₁' (⟨m₂, rfl, hm₂⟩ | hu)
+    · rw [fairStall.unfold_eq] at hm₂
+      refine fairStep.induct
+        (fun m₃ s₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Zm
+          (m₃ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃) ?_ hm₂
+      intro m₃ s₃ hm₃
+      cases hm_obs : m₃.observe with
+      | ret pair =>
+        simp only [hm_obs] at hm₃
+        rcases pair with ⟨o, st'⟩
+        rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+        exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+          (fairProgress.toFairStep (hP3 (o, st') s₃ hm₃))
+      | tau m₃' =>
+        simp only [hm_obs] at hm₃
+        rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm₃
+      | vis j c =>
+        simp only [hm_obs] at hm₃
+        rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+        refine ewp₂.mono (fun o₂ s' hp => ?_) hm₃
+        rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hpre⟩ | ⟨hnf, hst⟩
+        · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl, hfi_m⟩⟩
+        · exact Or.inr (Or.inl ⟨hf, hpre⟩)
+        · exact Or.inr (Or.inr ⟨hnf, Or.inl ⟨c o₂, rfl, hst⟩⟩)
+    · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h) (fun _ _ h => Or.inr h)
+        (fairProgress.toFairStep hu)
+  have h_main : ∀ (t₀ : ITree E₁ R) (s₀ : S₂) (st₀ : H),
+      FairInfOften ewp₁ Acc₁ Fair₁ Q t₀ (s₀, st₀) →
+      FP (ITree.interpState h t₀ st₀) s₀ := by
+    intro t₀ s₀ st₀ ht₀
+    rw [FairInfOften.unfold_eq] at ht₀
+    let Pre : ITree E₁ R → S₂ × H → Prop := fun v p =>
+      FairInfOften ewp₁ Acc₁ Fair₁ Q v p ∧ FP (ITree.interpState h v p.2) p.1
+    refine (fairProgress.induct Pre ?_ ht₀).2
+    intro t₁ p ht₁
+    have hfi_t₁ : FairInfOften ewp₁ Acc₁ Fair₁ Q t₁ p :=
+      fairStall_to_fairInfOften
+        (fairStall.mono (fun _ _ hx => hx) (fun _ _ hp => hp.1) ht₁)
+    refine ⟨hfi_t₁, ?_⟩
+    dsimp only [FP]
+    rw [fairProgress.unfold_eq]
+    let Z : ITree E₂ (R × H) → S₂ → Prop := fun u s₁ =>
+      (∃ t₂ st₂, u = ITree.interpState h t₂ st₂ ∧
+        fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre t₂ (s₁, st₂)) ∨
+      (∃ (i : E₁.I) (m : ITree E₂ (E₁.O i × H)) (k : E₁.O i → ITree E₁ R),
+        u = (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) ∧
+        fairStall ewp₂ Acc₂ Fair₂
+          (fun pair s₂' => Pre (k pair.1) (s₂', pair.2) ∨
+            fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre
+              (k pair.1) (s₂', pair.2))
+          (FairInfOften ewp₂ Acc₂ Fair₂
+            (fun pair s₂' =>
+              FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2)))
+          (fairProgress ewp₂ Acc₂ Fair₂ (fun pair s₂' => Pre (k pair.1) (s₂', pair.2))
+            (FairInfOften ewp₂ Acc₂ Fair₂
+              (fun pair s₂' =>
+                FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2))))
+          m s₁) ∨
+      FP u s₁
+    have h_step_t : ∀ t₂ s₁ st₂,
+        fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre t₂ (s₁, st₂) →
+        fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z (ITree.interpState h t₂ st₂) s₁ := by
+      intro t₂ s₁ st₂ ht₂
+      rw [fairStall.unfold_eq] at ht₂
+      refine fairStep.induct
+        (fun t₃ p₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+          (ITree.interpState h t₃ p₃.2) p₃.1) ?_ ht₂
+      intro t₃ p₃ ht₃
+      cases h_obs : t₃.observe with
+      | ret r =>
+        simp only [h_obs] at ht₃
+        rw [eq_ret_of_observe h_obs, interpState_ret, fairStep.ret_iff]; exact ht₃
+      | tau t₃' =>
+        simp only [h_obs] at ht₃
+        rw [eq_tau_of_observe h_obs, interpState_tau, fairStep.tau_iff]; exact ht₃
+      | vis i k =>
+        simp only [h_obs] at ht₃
+        rw [eq_vis_of_observe h_obs, interpState_vis]
+        let K4 : E₁.O i → S₂ × H → Prop := fun o p' =>
+          FairInfOften ewp₁ Acc₁ Fair₁ Q (k o) p'
+        let K3 : E₁.O i → S₂ × H → Prop := fun o p' => Pre (k o) p'
+        let K2 : E₁.O i → S₂ × H → Prop := fun o p' =>
+          fairStall ewp₁ Acc₁ Fair₁ Q (FairInfOften ewp₁ Acc₁ Fair₁ Q) Pre (k o) p'
+        have h_all_fi : ∀ (pair : E₁.O i × H) (s' : S₂),
+            K4 pair.1 (s', pair.2) ∨ K3 pair.1 (s', pair.2) ∨ K2 pair.1 (s', pair.2) →
+            K4 pair.1 (s', pair.2) := by
+          intro pair s' hdisj
+          rcases hdisj with h4 | h3 | h2
+          · exact h4
+          · exact h3.1
+          · exact fairStall_to_fairInfOften
+              (fairStall.mono (fun _ _ hx => hx) (fun _ _ hp => hp.1) h2)
+        have h_l := h_link i K4 K3 K2 p₃.1 p₃.2 ht₃
+        refine fairStep.induct
+          (fun m s₄ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+            (m >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₄) ?_ h_l
+        intro m s₄ hm
+        cases hm_obs : m.observe with
+        | ret pair =>
+          simp only [hm_obs] at hm
+          rcases pair with ⟨o, st'⟩
+          rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+          exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+            (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hm.2)
+        | tau m' =>
+          simp only [hm_obs] at hm
+          rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm
+        | vis j c =>
+          simp only [hm_obs] at hm
+          rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+          refine ewp₂.mono (fun o₂ s' hp => ?_) hm
+          rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hprog_m⟩ | ⟨hnf, hst_m⟩
+          · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl,
+              FairInfOften.mono_post h_all_fi hfi_m⟩⟩
+          · refine Or.inr (Or.inl ⟨hf,
+              h_lift_prog i k (fun pair s₂' => K3 pair.1 (s₂', pair.2))
+                (fun _ _ hp => hp.2) (c o₂) s' ?_⟩)
+            exact fairProgress.mono
+              (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm') hprog_m
+          · refine Or.inr (Or.inr ⟨hnf, Or.inr (Or.inl ⟨i, c o₂, k, rfl, ?_⟩)⟩)
+            exact fairStall.mono
+              (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm')
+              (fun _ _ hp' => fairProgress.mono
+                (fun _ _ hm' => FairInfOften.mono_post h_all_fi hm') hp') hst_m
+    refine fairStall.coinduct Z ?_ (Or.inl ⟨t₁, p.2, rfl, ht₁⟩)
+    rintro u s₁ (⟨t₂, st₂, rfl, ht₂⟩ | ⟨i, m, k, rfl, hm⟩ | hu)
+    · exact h_step_t t₂ s₁ st₂ ht₂
+    · rw [fairStall.unfold_eq] at hm
+      refine fairStep.induct
+        (fun m₁ s₃ => fairStep ewp₂ Acc₂ Fair₂ Q₂ X FP Z
+          (m₁ >>= fun (o, st') => .tau (ITree.interpState h (k o) st')) s₃) ?_ hm
+      intro m₁ s₃ hm₁
+      cases hm_obs : m₁.observe with
+      | ret pair =>
+        simp only [hm_obs] at hm₁
+        rcases pair with ⟨o, st'⟩
+        rw [eq_ret_of_observe hm_obs, ret_bind, fairStep.tau_iff]
+        rcases hm₁ with hpre | hst_k
+        · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+            (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hpre.2)
+        · exact h_step_t (k o) s₃ st' hst_k
+      | tau m₁' =>
+        simp only [hm_obs] at hm₁
+        rw [eq_tau_of_observe hm_obs, tau_bind, fairStep.tau_iff]; exact hm₁
+      | vis j c =>
+        simp only [hm_obs] at hm₁
+        rw [eq_vis_of_observe hm_obs, vis_bind, fairStep.vis_iff]
+        refine ewp₂.mono (fun o₂ s' hp => ?_) hm₁
+        rcases hp with ⟨ha, hfi_m⟩ | ⟨hf, hprog_m⟩ | ⟨hnf, hst_m⟩
+        · exact Or.inl ⟨ha, Or.inr ⟨i, c o₂, k, rfl, hfi_m⟩⟩
+        · exact Or.inr (Or.inl ⟨hf,
+            h_lift_prog i k (fun pair s₂' => Pre (k pair.1) (s₂', pair.2))
+              (fun _ _ hp => hp.2) (c o₂) s' hprog_m⟩)
+        · exact Or.inr (Or.inr ⟨hnf, Or.inr (Or.inl ⟨i, c o₂, k, rfl, hst_m⟩)⟩)
+    · exact fairStep.mono (fun _ _ h => h) (fun _ _ h => h)
+        (fun _ _ h => Or.inr (Or.inr h)) (fairProgress.toFairStep hu)
+  refine FairInfOften.coinduct X ?_ (Or.inl ⟨t, st, rfl, h_fi⟩)
+  rintro u s₀ (⟨t₀, st₀, rfl, ht₀⟩ | ⟨i, m, k, rfl, hm⟩)
+  · exact h_main t₀ s₀ st₀ ht₀
+  · rw [FairInfOften.unfold_eq] at hm
+    exact h_lift_prog i k
+      (fun pair s₂' => FairInfOften ewp₁ Acc₁ Fair₁ Q (k pair.1) (s₂', pair.2))
+      (fun pair s₂' hk => h_main (k pair.1) s₂' pair.2 hk) m s₀ hm
+
 /-- Re-triggering each request satisfies the link condition of `FairInfOften.interp`. -/
 theorem FairInfOften.interp_trigger {ewp : StateEffectWP S E}
     {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
@@ -7901,6 +8311,458 @@ theorem FairBuchiSat.iter_wf {I : Type u} {α : Type _}
      FairInfOften.iter_wf lt h_wf body (fun m a qs => LInv m a qs.1 qs.2)
        (fun m a qs hm => h_body m a qs.1 qs.2 hm) h_init⟩
 
+/-- Sequential composition for `FairBuchiSat`. -/
+theorem FairBuchiSat.seq {A : Type u} {spec : BuchiSpec S QState E R}
+    {fair : QState → (i : E.I) → E.O i → S → S → QState → Prop}
+    {t₁ : ITree E A} {t₂ : ITree E R} {q₀ : QState} {s₀ : S}
+    (h : FairBuchiSat (spec.withTerminal (fun q _ s => FairBuchiSat spec fair t₂ q s))
+      fair t₁ q₀ s₀) :
+    FairBuchiSat spec fair (t₁ >>= fun _ => t₂) q₀ s₀ :=
+  FairBuchiSat.bind h
+
+/-- `Nat`-ranked loop rule for general `ITree.iter` under `FairBuchiSat`. -/
+theorem FairBuchiSat.iter_ranked {I : Type u}
+    (spec : BuchiSpec S QState E R)
+    (fair : QState → (i : E.I) → E.O i → S → S → QState → Prop)
+    (body : I → ITree E (I ⊕ R)) (LInv : Nat → I → QState → S → Prop)
+    (h_body : ∀ n a q s, LInv n a q s →
+      fairStep spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+        (Sum.elim (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+          spec.terminalPost)
+        (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (Sum.elim (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2)
+            spec.terminalPost))
+        (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (Sum.elim (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+            spec.terminalPost)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (Sum.elim (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2)
+              spec.terminalPost)))
+        (fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (Sum.elim (fun next qs' =>
+              LInv n next qs'.1 qs'.2 ∨ ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+            spec.terminalPost)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (Sum.elim (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2)
+              spec.terminalPost))
+          (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (Sum.elim (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+              spec.terminalPost)
+            (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+              (Sum.elim (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2)
+                spec.terminalPost))))
+        (body a) (q, s))
+    {n : Nat} {init : I} {q₀ : QState} {s₀ : S}
+    (h_inv : spec.inv q₀ s₀) (h_init : LInv n init q₀ s₀) :
+    FairBuchiSat spec fair (ITree.iter body init) q₀ s₀ :=
+  FairBuchiSat.iter_wf spec fair (fun a b : Nat => a < b) Nat.lt_wfRel.wf body
+    LInv h_body h_inv h_init
+
+/-- Well-founded diverging `-> !` reactive loop rule for `FairBuchiSat`. -/
+theorem fairBuchiSat_diverging_loop_wf {I : Type u} {α : Type _}
+    (spec : BuchiSpec S QState E PEmpty.{u + 1})
+    (fair : QState → (i : E.I) → E.O i → S → S → QState → Prop)
+    (lt : α → α → Prop) (h_wf : WellFounded lt)
+    (body : I → ITree E I) (LInv : α → I → QState → S → Prop)
+    (h_live : ∀ m a q s, LInv m a q s →
+      fairStep spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+        (fun next qs' => ∃ m', lt m' m ∧ LInv m' next qs'.1 qs'.2)
+        (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => ∃ m', LInv m' next qs'.1 qs'.2))
+        (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => ∃ m', lt m' m ∧ LInv m' next qs'.1 qs'.2)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m', LInv m' next qs'.1 qs'.2)))
+        (fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' =>
+            LInv m next qs'.1 qs'.2 ∨ ∃ m', lt m' m ∧ LInv m' next qs'.1 qs'.2)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m', LInv m' next qs'.1 qs'.2))
+          (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m', lt m' m ∧ LInv m' next qs'.1 qs'.2)
+            (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+              (fun next qs' => ∃ m', LInv m' next qs'.1 qs'.2))))
+        (body a) (q, s))
+    {m : α} {init : I} {q₀ : QState} {s₀ : S}
+    (h_inv : spec.inv q₀ s₀) (h_init : LInv m init q₀ s₀) :
+    FairBuchiSat spec fair (divergingLoop body init) q₀ s₀ :=
+  (fairBuchiSat_iff_fairInfOften spec fair _ q₀ s₀).2
+    ⟨h_inv,
+     FairInfOften.iter_wf lt h_wf _ (fun m a qs => LInv m a qs.1 qs.2)
+       (fun m a qs hm => fairStep_map_inl (h_live m a qs.1 qs.2 hm)) h_init⟩
+
+/-- Horizontal handler linking for `FairBuchiSat` across `ITree.interp`. -/
+theorem FairBuchiSat.interp {E₁ E₂ : Effect.{u}}
+    {spec₁ : BuchiSpec S QState E₁ R} {spec₂ : BuchiSpec S QState E₂ R}
+    {fair₁ : QState → (i : E₁.I) → E₁.O i → S → S → QState → Prop}
+    {fair₂ : QState → (j : E₂.I) → E₂.O j → S → S → QState → Prop}
+    (h_inv : ∀ q s, spec₁.inv q s → spec₂.inv q s)
+    (h_term : ∀ q r s, spec₁.terminal q r s → spec₂.terminal q r s)
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i))
+    (h_link : ∀ (i : E₁.I) (K4 K3 K2 : E₁.O i → QState × S → Prop)
+      (qs₀ : QState × S),
+      spec₁.monitorWP.wp i (fun o qs' =>
+        (spec₁.acceptEdge i o qs₀ qs' ∧ K4 o qs') ∨
+        (spec₁.fairEdge fair₁ i o qs₀ qs' ∧ K3 o qs') ∨
+        (¬ spec₁.fairEdge fair₁ i o qs₀ qs' ∧ K2 o qs')) qs₀ →
+      fairStep spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂) K3
+        (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+          (fun o qs'' => K4 o qs'' ∨ K3 o qs'' ∨ K2 o qs''))
+        (fairProgress spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂) K3
+          (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+            (fun o qs'' => K4 o qs'' ∨ K3 o qs'' ∨ K2 o qs'')))
+        (fairStall spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+          (fun o qs'' => K3 o qs'' ∨ K2 o qs'')
+          (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+            (fun o qs'' => K4 o qs'' ∨ K3 o qs'' ∨ K2 o qs''))
+          (fairProgress spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂) K3
+            (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+              (fun o qs'' => K4 o qs'' ∨ K3 o qs'' ∨ K2 o qs''))))
+        (h i) qs₀)
+    {t : ITree E₁ R} {q₀ : QState} {s₀ : S}
+    (h_fbs : FairBuchiSat spec₁ fair₁ t q₀ s₀) :
+    FairBuchiSat spec₂ fair₂ (ITree.interp h t) q₀ s₀ := by
+  have ⟨hi, hfi⟩ := (fairBuchiSat_iff_fairInfOften spec₁ fair₁ t q₀ s₀).1 h_fbs
+  refine (fairBuchiSat_iff_fairInfOften spec₂ fair₂ _ q₀ s₀).2 ⟨h_inv q₀ s₀ hi, ?_⟩
+  exact FairInfOften.mono_post (fun r qs ht => h_term qs.1 r qs.2 ht)
+    (FairInfOften.interp h h_link hfi)
+
+/--
+**Stateful monitor handler linking** for `FairBuchiSat` across
+`ITree.interpState`: threads program state `S` while preserving ghost monitor
+state `QState`.
+-/
+theorem FairBuchiSat.interpState {E₁ E₂ : Effect.{u}}
+    {spec₁ : BuchiSpec S QState E₁ R}
+    {spec₂ : BuchiSpec PUnit.{u + 1} QState E₂ (R × S)}
+    {fair₁ : QState → (i : E₁.I) → E₁.O i → S → S → QState → Prop}
+    {fair₂ : QState → (j : E₂.I) → E₂.O j → PUnit.{u + 1} → PUnit.{u + 1} → QState → Prop}
+    (h_inv : ∀ q s, spec₁.inv q s → spec₂.inv q PUnit.unit)
+    (h_term : ∀ q r s, spec₁.terminal q r s → spec₂.terminal q (r, s) PUnit.unit)
+    (h : (i : E₁.I) → S → ITree E₂ (E₁.O i × S))
+    (h_link : ∀ (i : E₁.I) (K4 K3 K2 : E₁.O i → QState × S → Prop)
+      (q : QState) (s : S),
+      spec₁.monitorWP.wp i (fun o qs' =>
+        (spec₁.acceptEdge i o (q, s) qs' ∧ K4 o qs') ∨
+        (spec₁.fairEdge fair₁ i o (q, s) qs' ∧ K3 o qs') ∨
+        (¬ spec₁.fairEdge fair₁ i o (q, s) qs' ∧ K2 o qs')) (q, s) →
+      fairStep spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+        (fun pair qp => K3 pair.1 (qp.1, pair.2))
+        (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+          (fun pair qp =>
+            K4 pair.1 (qp.1, pair.2) ∨ K3 pair.1 (qp.1, pair.2) ∨
+              K2 pair.1 (qp.1, pair.2)))
+        (fairProgress spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+          (fun pair qp => K3 pair.1 (qp.1, pair.2))
+          (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+            (fun pair qp =>
+              K4 pair.1 (qp.1, pair.2) ∨ K3 pair.1 (qp.1, pair.2) ∨
+                K2 pair.1 (qp.1, pair.2))))
+        (fairStall spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+          (fun pair qp => K3 pair.1 (qp.1, pair.2) ∨ K2 pair.1 (qp.1, pair.2))
+          (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+            (fun pair qp =>
+              K4 pair.1 (qp.1, pair.2) ∨ K3 pair.1 (qp.1, pair.2) ∨
+                K2 pair.1 (qp.1, pair.2)))
+          (fairProgress spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+            (fun pair qp => K3 pair.1 (qp.1, pair.2))
+            (FairInfOften spec₂.monitorWP spec₂.acceptEdge (spec₂.fairEdge fair₂)
+              (fun pair qp =>
+                K4 pair.1 (qp.1, pair.2) ∨ K3 pair.1 (qp.1, pair.2) ∨
+                  K2 pair.1 (qp.1, pair.2)))))
+        (h i s) (q, PUnit.unit))
+    {t : ITree E₁ R} {q₀ : QState} {s₀ : S}
+    (h_fbs : FairBuchiSat spec₁ fair₁ t q₀ s₀) :
+    FairBuchiSat spec₂ fair₂ (ITree.interpState h t s₀) q₀ PUnit.unit := by
+  have ⟨hi, hfi⟩ := (fairBuchiSat_iff_fairInfOften spec₁ fair₁ t q₀ s₀).1 h_fbs
+  let liftEwp₁ : StateEffectWP ((QState × PUnit.{u + 1}) × S) E₁ :=
+    { wp := fun i K p => spec₁.monitorWP.wp i
+        (fun o qs' => K o ((qs'.1, PUnit.unit), qs'.2)) (p.1.1, p.2)
+      mono := fun hm hw => spec₁.monitorWP.mono (fun o qs' hk => hm o _ hk) hw }
+  let Acc₁ := fun i o (a b : (QState × PUnit.{u + 1}) × S) =>
+    spec₁.acceptEdge i o (a.1.1, a.2) (b.1.1, b.2)
+  let Fair₁ := fun i o (a b : (QState × PUnit.{u + 1}) × S) =>
+    spec₁.fairEdge fair₁ i o (a.1.1, a.2) (b.1.1, b.2)
+  let Q₁ := fun r (a : (QState × PUnit.{u + 1}) × S) => spec₁.terminal a.1.1 r a.2
+  have hfi_lift : FairInfOften liftEwp₁ Acc₁ Fair₁ Q₁ t ((q₀, PUnit.unit), s₀) := by
+    let X := fun x (p : (QState × PUnit.{u + 1}) × S) =>
+      FairInfOften spec₁.monitorWP spec₁.acceptEdge (spec₁.fairEdge fair₁)
+        spec₁.terminalPost x (p.1.1, p.2)
+    refine FairInfOften.coinduct X ?_ hfi
+    intro x p hx
+    dsimp only [X] at hx
+    rw [FairInfOften.unfold_eq] at hx
+    refine fairProgress.induct
+      (fun y qs => fairProgress liftEwp₁ Acc₁ Fair₁ Q₁ X y ((qs.1, PUnit.unit), qs.2))
+      ?_ hx
+    intro y qs hy
+    rw [fairProgress.unfold_eq]
+    let Z := fun z (a : (QState × PUnit.{u + 1}) × S) =>
+      fairStall spec₁.monitorWP spec₁.acceptEdge (spec₁.fairEdge fair₁)
+        spec₁.terminalPost
+        (FairInfOften spec₁.monitorWP spec₁.acceptEdge (spec₁.fairEdge fair₁)
+          spec₁.terminalPost)
+        (fun v qs' => fairProgress liftEwp₁ Acc₁ Fair₁ Q₁ X v ((qs'.1, PUnit.unit), qs'.2))
+        z (a.1.1, a.2)
+    refine fairStall.coinduct Z ?_ hy
+    intro z a hz
+    dsimp only [Z] at hz
+    rw [fairStall.unfold_eq] at hz
+    refine fairStep.induct
+      (fun w qs' => fairStep liftEwp₁ Acc₁ Fair₁ Q₁ X
+        (fairProgress liftEwp₁ Acc₁ Fair₁ Q₁ X) Z w ((qs'.1, PUnit.unit), qs'.2)) ?_ hz
+    intro w qs' hw
+    rw [fairStep.unfold_eq]
+    cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+    · exact hw
+    · exact hw
+    · exact hw
+  have hfi₂ := FairInfOften.interpState_stateful
+    (S₂ := QState × PUnit.{u + 1}) (H := S) (ewp₁ := liftEwp₁)
+    (ewp₂ := spec₂.monitorWP) h
+    (fun i K4 K3 K2 qp s hw => by
+      cases qp with
+      | mk q u =>
+        cases u
+        exact h_link i
+          (fun o qs' => K4 o ((qs'.1, PUnit.unit), qs'.2))
+          (fun o qs' => K3 o ((qs'.1, PUnit.unit), qs'.2))
+          (fun o qs' => K2 o ((qs'.1, PUnit.unit), qs'.2)) q s hw)
+    hfi_lift
+  refine (fairBuchiSat_iff_fairInfOften spec₂ fair₂ _ q₀ PUnit.unit).2
+    ⟨h_inv q₀ s₀ hi, ?_⟩
+  exact FairInfOften.mono_post (fun pair qp ht => h_term qp.1 pair.1 pair.2 ht) hfi₂
+
+/-- `Nat`-ranked diverging `-> !` reactive loop rule for `FairBuchiSat`. -/
+theorem fairBuchiSat_diverging_loop_ranked {I : Type u}
+    (spec : BuchiSpec S QState E PEmpty.{u + 1})
+    (fair : QState → (i : E.I) → E.O i → S → S → QState → Prop)
+    (body : I → ITree E I) (LInv : Nat → I → QState → S → Prop)
+    (h_live : ∀ n a q s, LInv n a q s →
+      fairStep spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+        (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+        (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2))
+        (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2)))
+        (fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' =>
+            LInv n next qs'.1 qs'.2 ∨ ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2))
+          (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => ∃ m, m < n ∧ LInv m next qs'.1 qs'.2)
+            (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+              (fun next qs' => ∃ m, LInv m next qs'.1 qs'.2))))
+        (body a) (q, s))
+    {n : Nat} {init : I} {q₀ : QState} {s₀ : S}
+    (h_inv : spec.inv q₀ s₀) (h_init : LInv n init q₀ s₀) :
+    FairBuchiSat spec fair (divergingLoop body init) q₀ s₀ :=
+  fairBuchiSat_diverging_loop_wf spec fair (fun a b : Nat => a < b)
+    Nat.lt_wfRel.wf body LInv h_live h_inv h_init
+
+private theorem fairStall_to_dwlp {S : Type u} {E : Effect.{u}} {R : Type u}
+    {ewp : StateEffectWP S E} {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
+    {Q P : R → S → Prop} {X4 X3 : ITree E R → S → Prop}
+    (hQ : ∀ r s', Q r s' → P r s')
+    (h4 : ∀ x s', X4 x s' → DWLP ewp x P s')
+    (h3 : ∀ x s', X3 x s' → DWLP ewp x P s')
+    {t : ITree E R} {s : S} (h : fairStall ewp AccEdge Fair Q X4 X3 t s) :
+    DWLP ewp t P s := by
+  let D : ITree E R → S → Prop := fun x s₀ =>
+    fairStep ewp AccEdge Fair Q X4 X3 (fairStall ewp AccEdge Fair Q X4 X3) x s₀ ∨
+      DWLP ewp x P s₀
+  refine DWLP.coinduct D ?_ (Or.inl (by rw [fairStall.unfold_eq] at h; exact h))
+  rintro x s₀ (hfs | hdw)
+  · rw [fairStep.unfold_eq] at hfs
+    cases h_obs : x.observe <;> simp only [h_obs] at hfs ⊢
+    · exact hQ _ _ hfs
+    · exact Or.inl hfs
+    · refine ewp.mono (fun _ _ hp => ?_) hfs
+      rcases hp with ⟨_, hx4⟩ | ⟨_, hx3⟩ | ⟨_, hst⟩
+      · exact Or.inr (h4 _ _ hx4)
+      · exact Or.inr (h3 _ _ hx3)
+      · rw [fairStall.unfold_eq] at hst; exact Or.inl hst
+  · rw [DWLP.unfold_eq] at hdw
+    cases h_obs : x.observe <;> simp only [h_obs] at hdw ⊢
+    · exact hdw
+    · exact Or.inr hdw
+    · exact ewp.mono (fun _ _ h => Or.inr h) hdw
+
+private theorem fairProgress_to_dwlp {S : Type u} {E : Effect.{u}} {R : Type u}
+    {ewp : StateEffectWP S E} {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
+    {Q P : R → S → Prop} {X4 : ITree E R → S → Prop}
+    (hQ : ∀ r s', Q r s' → P r s') (h4 : ∀ x s', X4 x s' → DWLP ewp x P s')
+    {t : ITree E R} {s : S} (h : fairProgress ewp AccEdge Fair Q X4 t s) :
+    DWLP ewp t P s :=
+  fairProgress.induct (fun x s₀ => DWLP ewp x P s₀)
+    (fun _ _ hx => fairStall_to_dwlp hQ h4 (fun _ _ h => h) hx) h
+
+private theorem fairStep_to_dwlp {S : Type u} {E : Effect.{u}} {R : Type u}
+    {ewp : StateEffectWP S E} {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
+    {Q P : R → S → Prop} {X4 X3 X2 : ITree E R → S → Prop}
+    (hQ : ∀ r s', Q r s' → P r s')
+    (h4 : ∀ x s', X4 x s' → DWLP ewp x P s')
+    (h3 : ∀ x s', X3 x s' → DWLP ewp x P s')
+    (h2 : ∀ x s', X2 x s' → DWLP ewp x P s')
+    {t : ITree E R} {s : S} (h : fairStep ewp AccEdge Fair Q X4 X3 X2 t s) :
+    DWLP ewp t P s := by
+  refine fairStep.induct (fun x s₀ => DWLP ewp x P s₀) ?_ h
+  intro x s₀ hx
+  rw [DWLP.unfold_eq]
+  cases h_obs : x.observe <;> simp only [h_obs] at hx ⊢
+  · exact hQ _ _ hx
+  · exact hx
+  · refine ewp.mono (fun _ _ hp => ?_) hx
+    rcases hp with ⟨_, hx4⟩ | ⟨_, hx3⟩ | ⟨_, hx2⟩
+    · exact h4 _ _ hx4
+    · exact h3 _ _ hx3
+    · exact h2 _ _ hx2
+
+/-- Single-fair-step diverging `-> !` reactive loop rule for `FairBuchiSat`. -/
+theorem fairBuchiSat_diverging_loop_rule {I : Type u}
+    (spec : BuchiSpec S QState E PEmpty.{u + 1})
+    (fair : QState → (i : E.I) → E.O i → S → S → QState → Prop)
+    (body : I → ITree E I) (LInv : I → QState → S → Prop)
+    (h_live : ∀ a q s, LInv a q s →
+      fairStep spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+        (fun _ _ => False)
+        (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => LInv next qs'.1 qs'.2))
+        (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun _ _ => False)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => LInv next qs'.1 qs'.2)))
+        (fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+          (fun next qs' => LInv next qs'.1 qs'.2)
+          (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun next qs' => LInv next qs'.1 qs'.2))
+          (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+            (fun _ _ => False)
+            (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair)
+              (fun next qs' => LInv next qs'.1 qs'.2))))
+        (body a) (q, s))
+    {init : I} {q₀ : QState} {s₀ : S}
+    (h_inv : spec.inv q₀ s₀) (h_init : LInv init q₀ s₀) :
+    FairBuchiSat spec fair (divergingLoop body init) q₀ s₀ := by
+  refine (fairBuchiSat_iff_fairInfOften spec fair _ q₀ s₀).2 ⟨h_inv, ?_⟩
+  refine (fair_diverging_loop_rule (ewp := spec.monitorWP)
+    (AccEdge := spec.acceptEdge) (Fair := spec.fairEdge fair)
+    (Inv := fun _ => True) body (fun a qs => LInv a qs.1 qs.2)
+    (fun a qs ha => (always_true_iff_dwlp spec.monitorWP _ _ _).2 ?_)
+    (fun a qs ha => h_live a qs.1 qs.2 ha) h_init spec.terminalPost).2
+  exact fairStep_to_dwlp (fun _ _ hf => False.elim hf)
+    (fun _ _ hfi => hfi.toDWLP)
+    (fun _ _ hfp => fairProgress_to_dwlp (fun _ _ hf => False.elim hf)
+      (fun _ _ hfi => hfi.toDWLP) hfp)
+    (fun _ _ hst => fairStall_to_dwlp (fun _ _ hl => hl)
+      (fun _ _ hfi => hfi.toDWLP)
+      (fun _ _ hfp => fairProgress_to_dwlp (fun _ _ hf => False.elim hf)
+        (fun _ _ hfi => hfi.toDWLP) hfp) hst)
+    (h_live a qs.1 qs.2 ha)
+
+/--
+**Trivial monitor collapse for `FairBuchiSat`**: a trivial `PUnit` `BuchiSpec`
+reduces identically to `Inv s` plus `FairInfOften` over `guardInvWP ewp Inv`.
+-/
+theorem fairBuchiSat_trivial_iff (ewp : StateEffectWP S E)
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop)
+    (Inv : S → Prop) (Q : R → S → Prop) (t : ITree E R) (s : S) :
+    FairBuchiSat (BuchiSpec.trivial ewp AccEdge Inv Q)
+        (fun _ i o s₀ s' _ => Fair i o s₀ s') t PUnit.unit s ↔
+      Inv s ∧ FairInfOften (guardInvWP ewp Inv) AccEdge Fair Q t s := by
+  let spec := BuchiSpec.trivial ewp AccEdge Inv Q
+  let fairQ : PUnit.{u + 1} → (i : E.I) → E.O i → S → S → PUnit.{u + 1} → Prop :=
+    fun _ i o s₀ s' _ => Fair i o s₀ s'
+  rw [fairBuchiSat_iff_fairInfOften]
+  refine and_congr_right fun _ => ⟨fun h => ?_, fun h => ?_⟩
+  · let X := fun x s₀ =>
+      FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+        spec.terminalPost x (PUnit.unit, s₀)
+    refine FairInfOften.coinduct X ?_ h
+    intro x s₀ hx
+    dsimp only [X] at hx
+    rw [FairInfOften.unfold_eq] at hx
+    refine fairProgress.induct
+      (fun y qs => fairProgress (guardInvWP ewp Inv) AccEdge Fair Q X y qs.2)
+      ?_ hx
+    intro y qs hy
+    rw [fairProgress.unfold_eq]
+    let Z := fun z s₂ =>
+      fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+        spec.terminalPost
+        (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+          spec.terminalPost)
+        (fun v qs' => fairProgress (guardInvWP ewp Inv) AccEdge Fair Q X v qs'.2)
+        z (PUnit.unit, s₂)
+    refine fairStall.coinduct Z ?_ (by cases qs.1; exact hy)
+    intro z s₂ hz
+    dsimp only [Z] at hz
+    rw [fairStall.unfold_eq] at hz
+    refine fairStep.induct
+      (fun w qs' => fairStep (guardInvWP ewp Inv) AccEdge Fair Q X
+        (fairProgress (guardInvWP ewp Inv) AccEdge Fair Q X) Z w qs'.2)
+      ?_ hz
+    intro w qs' hw
+    rw [fairStep.unfold_eq]
+    cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+    · exact hw
+    · exact hw
+    · exact ewp.mono (fun _ _ ⟨⟨⟩, _, hi, hp⟩ => ⟨hi, hp⟩) hw
+  · let X := fun x (qs : PUnit.{u + 1} × S) =>
+      FairInfOften (guardInvWP ewp Inv) AccEdge Fair Q x qs.2
+    refine FairInfOften.coinduct X ?_ h
+    intro x qs hx
+    dsimp only [X] at hx
+    rw [FairInfOften.unfold_eq] at hx
+    refine fairProgress.induct
+      (fun y s₁ => fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+        spec.terminalPost X y (PUnit.unit, s₁)) ?_ hx
+    intro y s₁ hy
+    rw [fairProgress.unfold_eq]
+    let Z := fun z (qs' : PUnit.{u + 1} × S) =>
+      fairStall (guardInvWP ewp Inv) AccEdge Fair Q
+        (FairInfOften (guardInvWP ewp Inv) AccEdge Fair Q)
+        (fun v s₃ => fairProgress spec.monitorWP spec.acceptEdge
+          (spec.fairEdge fairQ) spec.terminalPost X v (PUnit.unit, s₃)) z qs'.2
+    refine fairStall.coinduct Z ?_ hy
+    intro z qs' hz
+    dsimp only [Z] at hz
+    rw [fairStall.unfold_eq] at hz
+    refine fairStep.induct
+      (fun w s₃ => fairStep spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+        spec.terminalPost X
+        (fairProgress spec.monitorWP spec.acceptEdge (spec.fairEdge fairQ)
+          spec.terminalPost X) Z w (qs'.1, s₃)) ?_ hz
+    intro w s₃ hw
+    rw [fairStep.unfold_eq]
+    cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+    · exact hw
+    · exact hw
+    · exact ewp.mono (fun _ _ ⟨hi, hp⟩ => ⟨PUnit.unit, trivial, hi, hp⟩) hw
+
+/--
+Under `[Conjunctive ewp]`, the trivial-monitor `FairBuchiSat` is literally
+`Always ewp Inv Q t s ∧ FairInfOften ewp AccEdge Fair Q t s`.
+-/
+theorem fairBuchiSat_trivial_iff_always_and_fairInfOften (ewp : StateEffectWP S E)
+    [StateEffectWP.Conjunctive ewp]
+    (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop)
+    (Inv : S → Prop) (Q : R → S → Prop) (t : ITree E R) (s : S) :
+    FairBuchiSat (BuchiSpec.trivial ewp AccEdge Inv Q)
+        (fun _ i o s₀ s' _ => Fair i o s₀ s') t PUnit.unit s ↔
+      Always ewp Inv Q t s ∧ FairInfOften ewp AccEdge Fair Q t s := by
+  rw [fairBuchiSat_trivial_iff]
+  constructor
+  · rintro ⟨hi, hfi⟩
+    refine ⟨(always_iff_dwlp_guard ewp Inv Q t s).2 ⟨hi, hfi.toDWLP⟩, ?_⟩
+    exact FairInfOften.mono_wp (ewp := guardInvWP ewp Inv) (ewp' := ewp)
+      (fun _ _ _ hw => ewp.mono (fun _ _ hk => hk.2) hw) hfi
+  · rintro ⟨ha, hfi⟩
+    exact ⟨ha.inv, FairInfOften.guardInv_of_always ha hfi⟩
+
 end FairBuchiSat
 
 section FairInfOftenAdequacy
@@ -8410,7 +9272,1675 @@ theorem CoBuchi.mono {ewp : StateEffectWP S E}
     CoBuchi ewp Bad' Q t s :=
   FairInfOften.mono (fun _ _ _ _ ha => ha) h_bad h_post h
 
+/-- `CoBuchi` with `Bad = False` (`◇□ True`) is reactive productivity (`InfOften True`). -/
+theorem coBuchi_false_iff (ewp : StateEffectWP S E) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    CoBuchi ewp (fun _ _ _ _ => False) Q t s ↔
+      InfOften ewp (fun _ _ _ _ => True) Q t s :=
+  fairInfOften_false_iff ewp (fun _ _ _ _ => False) Q t s
+
+/-- `CoBuchi` with `Bad = True` (`◇□ False`) collapses to total correctness `DWP`. -/
+theorem coBuchi_true_iff_dwp (ewp : StateEffectWP S E) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    CoBuchi ewp (fun _ _ _ _ => True) Q t s ↔ DWP ewp t Q s := by
+  rw [coBuchi_iff, fairInfOften_true_iff_infOften]
+  exact ⟨fun h => (buchiProgress_false_iff_dwp ewp Q _ t s).1 h.toBuchiProgress,
+    infOften_of_dwp _⟩
+
+@[simp]
+theorem CoBuchi.ret_iff (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (r : R) (s : S) :
+    CoBuchi ewp Bad Q (.ret r) s ↔ Q r s :=
+  FairInfOften.ret_iff ewp _ Bad Q r s
+
+@[simp]
+theorem CoBuchi.tau_iff (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (t : ITree E R) (s : S) :
+    CoBuchi ewp Bad Q (.tau t) s ↔ CoBuchi ewp Bad Q t s :=
+  FairInfOften.tau_iff ewp _ Bad Q t s
+
+@[simp]
+theorem CoBuchi.vis_iff (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    (i : E.I) (k : E.O i → ITree E R) (s : S) :
+    CoBuchi ewp Bad Q (.vis i k) s ↔
+      ewp.wp i (fun o s' => CoBuchi ewp Bad Q (k o) s') s :=
+  FairInfOften.vis_iff ewp _ Bad Q i k s
+
+theorem CoBuchi.ret {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {r : R} {s : S} (hq : Q r s) : CoBuchi ewp Bad Q (.ret r) s :=
+  FairInfOften.ret hq
+
+theorem CoBuchi.tau {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : CoBuchi ewp Bad Q t s) :
+    CoBuchi ewp Bad Q (.tau t) s :=
+  FairInfOften.tau h
+
+theorem CoBuchi.vis {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {i : E.I} {k : E.O i → ITree E R} {s : S}
+    (hv : ewp.wp i (fun o s' => CoBuchi ewp Bad Q (k o) s') s) :
+    CoBuchi ewp Bad Q (.vis i k) s :=
+  FairInfOften.vis hv
+
+/-- Persistence implies partial correctness (`DWLP`). -/
+theorem CoBuchi.toDWLP {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t : ITree E R} {s : S} (h : CoBuchi ewp Bad Q t s) :
+    DWLP ewp t Q s :=
+  FairInfOften.toDWLP h
+
+/-- `CoBuchi` is invariant under equivalence up to finite `.tau`s (`Eutt`). -/
+theorem CoBuchi.eutt {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t u : ITree E R} {s : S} (he : Eutt t u) (h : CoBuchi ewp Bad Q t s) :
+    CoBuchi ewp Bad Q u s :=
+  FairInfOften.eutt he h
+
+/-- `Eutt`-equivalent trees satisfy the exact same `CoBuchi` specs. -/
+theorem CoBuchi.eutt_iff (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : R → S → Prop)
+    {t u : ITree E R} (he : Eutt t u) (s : S) :
+    CoBuchi ewp Bad Q t s ↔ CoBuchi ewp Bad Q u s :=
+  ⟨CoBuchi.eutt he, CoBuchi.eutt he.symm⟩
+
+/-- Monadic bind rule for `CoBuchi`. -/
+theorem CoBuchi.bind {A B : Type u} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : B → S → Prop}
+    {t : ITree E A} {k : A → ITree E B} {s : S}
+    (h : CoBuchi ewp Bad (fun a s' => CoBuchi ewp Bad Q (k a) s') t s) :
+    CoBuchi ewp Bad Q (t >>= k) s :=
+  FairInfOften.bind h
+
+/-- Exact monadic bind characterisation for `CoBuchi`. -/
+theorem CoBuchi.bind_iff {A B : Type u} (ewp : StateEffectWP S E)
+    (Bad : (i : E.I) → E.O i → S → S → Prop) (Q : B → S → Prop)
+    (t : ITree E A) (k : A → ITree E B) (s : S) :
+    CoBuchi ewp Bad Q (t >>= k) s ↔
+      CoBuchi ewp Bad (fun a s' => CoBuchi ewp Bad Q (k a) s') t s :=
+  FairInfOften.bind_iff ewp _ Bad Q t k s
+
+/-- Sequencing a terminating prefix before a persistent continuation. -/
+theorem CoBuchi.bind_dwp {A B : Type u} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {P : A → S → Prop}
+    {Q : B → S → Prop} {t : ITree E A} {k : A → ITree E B} {s : S}
+    (ht : DWP ewp t P s)
+    (hk : ∀ a s', P a s' → CoBuchi ewp Bad Q (k a) s') :
+    CoBuchi ewp Bad Q (t >>= k) s :=
+  FairInfOften.bind_dwp (DWP.mono hk ht)
+
+/-- Conditional branching rule for `CoBuchi`. -/
+theorem CoBuchi.ite {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {c : Prop} [Decidable c] {t₁ t₂ : ITree E R} {s : S}
+    (h₁ : c → CoBuchi ewp Bad Q t₁ s)
+    (h₂ : ¬ c → CoBuchi ewp Bad Q t₂ s) :
+    CoBuchi ewp Bad Q (if c then t₁ else t₂) s :=
+  FairInfOften.ite h₁ h₂
+
+/-- `Sum`-branching rule for `CoBuchi`. -/
+theorem CoBuchi.sum_elim {A B : Type u} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {f : A → ITree E R} {g : B → ITree E R} {s : S} (x : A ⊕ B)
+    (h₁ : ∀ a, x = .inl a → CoBuchi ewp Bad Q (f a) s)
+    (h₂ : ∀ b, x = .inr b → CoBuchi ewp Bad Q (g b) s) :
+    CoBuchi ewp Bad Q (Sum.elim f g x) s :=
+  FairInfOften.sum_elim x h₁ h₂
+
+/-- Monotonicity of `CoBuchi` in the effect transformer `ewp`. -/
+theorem CoBuchi.mono_wp {ewp ewp' : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    {t : ITree E R} {s : S}
+    (h_wp : ∀ i K s₀, ewp.wp i K s₀ → ewp'.wp i K s₀)
+    (h : CoBuchi ewp Bad Q t s) : CoBuchi ewp' Bad Q t s :=
+  FairInfOften.mono_wp h_wp h
+
+/-- Merge `Always` safety into `CoBuchi` over `guardInvWP`. -/
+theorem CoBuchi.guardInv_of_always {ewp : StateEffectWP S E}
+    [StateEffectWP.Conjunctive ewp]
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Inv : S → Prop}
+    {P Q : R → S → Prop} {t : ITree E R} {s : S}
+    (h_safe : Always ewp Inv P t s) (h : CoBuchi ewp Bad Q t s) :
+    CoBuchi (guardInvWP ewp Inv) Bad Q t s :=
+  FairInfOften.guardInv_of_always h_safe h
+
+/-- Merge `AlwaysStep` into `CoBuchi` over `guardStepWP`. -/
+theorem CoBuchi.guardStep_of_alwaysStep {ewp : StateEffectWP S E}
+    [StateEffectWP.Conjunctive ewp]
+    {Bad StepRel : (i : E.I) → E.O i → S → S → Prop}
+    {P Q : R → S → Prop} {t : ITree E R} {s : S}
+    (h_safe : AlwaysStep ewp StepRel P t s) (h : CoBuchi ewp Bad Q t s) :
+    CoBuchi (guardStepWP ewp StepRel) Bad Q t s :=
+  FairInfOften.guardStep_of_alwaysStep h_safe h
+
+/--
+A productive tree that never takes a `Bad` edge (`AlwaysStep (¬ Bad)`) satisfies
+`CoBuchi ewp Bad Q` (`□ ¬ Bad ∧ productive → ◇□ ¬ Bad`).
+-/
+theorem CoBuchi.of_alwaysStep_not_bad {ewp : StateEffectWP S E}
+    [StateEffectWP.Conjunctive ewp]
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {P Q : R → S → Prop}
+    {t : ITree E R} {s : S}
+    (h_nb : AlwaysStep ewp (fun i o s₀ s' => ¬ Bad i o s₀ s') P t s)
+    (h_prod : InfOften ewp (fun _ _ _ _ => True) Q t s) :
+    CoBuchi ewp Bad Q t s :=
+  FairInfOften.of_never_fair h_nb h_prod
+
+/--
+**Co-Büchi conjunction closure (`◇□ ¬ Bad₁ ∧ ◇□ ¬ Bad₂ → ◇□ ¬ (Bad₁ ∨ Bad₂)`).**
+Under `[Conjunctive ewp]`, two independent persistence properties compose by
+nested `fairProgress` induction + `fairStall` coinduction, combining BOTH their
+excluded edge classes (`Bad₁ ∨ Bad₂`) AND their return postconditions (`P ∧ Q`).
+-/
+theorem CoBuchi.conj_bad {ewp : StateEffectWP S E}
+    [h_conj : StateEffectWP.Conjunctive ewp]
+    {Bad₁ Bad₂ : (i : E.I) → E.O i → S → S → Prop}
+    {P Q : R → S → Prop} {t : ITree E R} {s : S}
+    (h₁ : CoBuchi ewp Bad₁ P t s) (h₂ : CoBuchi ewp Bad₂ Q t s) :
+    CoBuchi ewp (fun i o s₀ s' => Bad₁ i o s₀ s' ∨ Bad₂ i o s₀ s')
+      (fun r s' => P r s' ∧ Q r s') t s := by
+  let Bad := fun i o s₀ s' => Bad₁ i o s₀ s' ∨ Bad₂ i o s₀ s'
+  let PQ := fun r s' => P r s' ∧ Q r s'
+  let X₁ := FairInfOften ewp (fun _ _ _ _ => False) Bad₁ P
+  let X₂ := FairInfOften ewp (fun _ _ _ _ => False) Bad₂ Q
+  let Xo := FairInfOften ewp (fun _ _ _ _ => False) Bad PQ
+  unfold CoBuchi at h₁ h₂ ⊢
+  rw [FairInfOften.unfold_eq] at h₁
+  refine fairProgress.induct (fun x s₀ => X₂ x s₀ → Xo x s₀) ?_ h₁ h₂
+  intro x s₀ hx₁ hx₂
+  have hx₂_u := hx₂
+  dsimp only [X₂] at hx₂_u
+  rw [FairInfOften.unfold_eq] at hx₂_u
+  refine fairProgress.induct
+    (fun y s₁ =>
+      fairStall ewp (fun _ _ _ _ => False) Bad₁ P X₁ (fun v s' => X₂ v s' → Xo v s') y s₁ →
+      X₂ y s₁ → Xo y s₁) ?_ hx₂_u hx₁ hx₂
+  intro y s₁ hy₂ hy₁ hy₂_cb
+  dsimp only [Xo]
+  rw [FairInfOften.unfold_eq, fairProgress.unfold_eq]
+  let Z : ITree E R → S → Prop := fun z s₂ =>
+    fairStall ewp (fun _ _ _ _ => False) Bad₁ P X₁ (fun v s' => X₂ v s' → Xo v s') z s₂ ∧
+    fairStall ewp (fun _ _ _ _ => False) Bad₂ Q X₂
+      (fun v s' =>
+        fairStall ewp (fun _ _ _ _ => False) Bad₁ P X₁ (fun u s'' => X₂ u s'' → Xo u s'') v s' →
+        X₂ v s' → Xo v s') z s₂ ∧
+    X₂ z s₂
+  refine fairStall.coinduct Z ?_ ⟨hy₁, hy₂, hy₂_cb⟩
+  rintro z s₂ ⟨hz₁, hz₂, hz₂_cb⟩
+  rw [fairStall.unfold_eq] at hz₁ hz₂
+  refine fairStep.induct
+    (fun w s₃ =>
+      fairStep ewp (fun _ _ _ _ => False) Bad₂ Q X₂
+        (fun v s' =>
+          fairStall ewp (fun _ _ _ _ => False) Bad₁ P X₁
+            (fun u s'' => X₂ u s'' → Xo u s'') v s' →
+          X₂ v s' → Xo v s')
+        (fairStall ewp (fun _ _ _ _ => False) Bad₂ Q X₂
+          (fun v s' =>
+            fairStall ewp (fun _ _ _ _ => False) Bad₁ P X₁
+              (fun u s'' => X₂ u s'' → Xo u s'') v s' →
+            X₂ v s' → Xo v s')) w s₃ →
+      X₂ w s₃ →
+      fairStep ewp (fun _ _ _ _ => False) Bad PQ Xo
+        (fairProgress ewp (fun _ _ _ _ => False) Bad PQ Xo) Z w s₃)
+    ?_ hz₁ hz₂ hz₂_cb
+  intro w s₃ hw₁ hw₂ hw₂_cb
+  rw [fairStep.unfold_eq] at hw₂ ⊢
+  cases h_obs : w.observe with
+  | ret r =>
+    simp only [h_obs] at hw₁ hw₂ ⊢
+    exact ⟨hw₁, hw₂⟩
+  | tau w' =>
+    simp only [h_obs] at hw₁ hw₂ ⊢
+    dsimp only [X₂] at hw₂_cb
+    rw [eq_tau_of_observe h_obs, FairInfOften.tau_iff] at hw₂_cb
+    exact hw₁ hw₂ hw₂_cb
+  | vis i k =>
+    simp only [h_obs] at hw₁ hw₂ ⊢
+    dsimp only [X₂] at hw₂_cb
+    rw [eq_vis_of_observe h_obs, FairInfOften.vis_iff] at hw₂_cb
+    refine ewp.mono (fun o s' ⟨⟨hp₁, hp₂⟩, hcb₂⟩ => ?_)
+      (h_conj.conj (h_conj.conj hw₁ hw₂) hw₂_cb)
+    rcases hp₁ with ⟨hf, _⟩ | ⟨hb₁, hpre₁⟩ | ⟨hnb₁, hst₁⟩
+    · exact False.elim hf
+    · refine Or.inr (Or.inl ⟨Or.inl hb₁, ?_⟩)
+      have hxo := hpre₁ hcb₂
+      dsimp only [Xo] at hxo
+      rw [FairInfOften.unfold_eq] at hxo; exact hxo
+    · rcases hp₂ with ⟨hf, _⟩ | ⟨hb₂, hpre₂⟩ | ⟨hnb₂, hst₂⟩
+      · exact False.elim hf
+      · refine Or.inr (Or.inl ⟨Or.inr hb₂, ?_⟩)
+        have hxo := hpre₂ hst₁ hcb₂
+        dsimp only [Xo] at hxo
+        rw [FairInfOften.unfold_eq] at hxo; exact hxo
+      · exact Or.inr (Or.inr ⟨fun hb => hb.elim hnb₁ hnb₂, hst₁, hst₂, hcb₂⟩)
+
+/-- Same-predicate postcondition conjunction for `CoBuchi`. -/
+theorem CoBuchi.conj {ewp : StateEffectWP S E}
+    [StateEffectWP.Conjunctive ewp]
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {P Q : R → S → Prop}
+    {t : ITree E R} {s : S}
+    (hp : CoBuchi ewp Bad P t s) (hq : CoBuchi ewp Bad Q t s) :
+    CoBuchi ewp Bad (fun r s' => P r s' ∧ Q r s') t s :=
+  FairInfOften.conj hp hq
+
+/-- Well-founded loop rule for `ITree.iter` under `CoBuchi` (finite `Bad` budget). -/
+theorem CoBuchi.iter_wf {I : Type u} {α : Type _} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    (lt : α → α → Prop) (h_wf : WellFounded lt)
+    (body : I → ITree E (I ⊕ R)) (LInv : α → I → S → Prop)
+    (h_body : ∀ m a s₀, LInv m a s₀ →
+      fairStep ewp (fun _ _ _ _ => False) Bad
+        (Sum.elim (fun next s' => ∃ m', lt m' m ∧ LInv m' next s') Q)
+        (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m', LInv m' next s') Q))
+        (fairProgress ewp (fun _ _ _ _ => False) Bad
+          (Sum.elim (fun next s' => ∃ m', lt m' m ∧ LInv m' next s') Q)
+          (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m', LInv m' next s') Q)))
+        (fairStall ewp (fun _ _ _ _ => False) Bad
+          (Sum.elim (fun next s' => LInv m next s' ∨ ∃ m', lt m' m ∧ LInv m' next s') Q)
+          (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m', LInv m' next s') Q))
+          (fairProgress ewp (fun _ _ _ _ => False) Bad
+            (Sum.elim (fun next s' => ∃ m', lt m' m ∧ LInv m' next s') Q)
+            (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m', LInv m' next s') Q))))
+        (body a) s₀)
+    {m : α} {init : I} {s : S} (h_init : LInv m init s) :
+    CoBuchi ewp Bad Q (ITree.iter body init) s :=
+  FairInfOften.iter_wf lt h_wf body LInv h_body h_init
+
+/-- `Nat`-ranked loop rule for `ITree.iter` under `CoBuchi`. -/
+theorem CoBuchi.iter_ranked {I : Type u} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Q : R → S → Prop}
+    (body : I → ITree E (I ⊕ R)) (LInv : Nat → I → S → Prop)
+    (h_body : ∀ n a s₀, LInv n a s₀ →
+      fairStep ewp (fun _ _ _ _ => False) Bad
+        (Sum.elim (fun next s' => ∃ m, m < n ∧ LInv m next s') Q)
+        (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m, LInv m next s') Q))
+        (fairProgress ewp (fun _ _ _ _ => False) Bad
+          (Sum.elim (fun next s' => ∃ m, m < n ∧ LInv m next s') Q)
+          (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m, LInv m next s') Q)))
+        (fairStall ewp (fun _ _ _ _ => False) Bad
+          (Sum.elim (fun next s' => LInv n next s' ∨ ∃ m, m < n ∧ LInv m next s') Q)
+          (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m, LInv m next s') Q))
+          (fairProgress ewp (fun _ _ _ _ => False) Bad
+            (Sum.elim (fun next s' => ∃ m, m < n ∧ LInv m next s') Q)
+            (CoBuchi ewp Bad (Sum.elim (fun next s' => ∃ m, LInv m next s') Q))))
+        (body a) s₀)
+    {n : Nat} {init : I} {s : S} (h_init : LInv n init s) :
+    CoBuchi ewp Bad Q (ITree.iter body init) s :=
+  FairInfOften.iter_ranked body LInv h_body h_init
+
+/-- Well-founded diverging `-> !` reactive loop rule for `CoBuchi`. -/
+theorem coBuchi_diverging_loop_wf {I : Type u} {α : Type _}
+    {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Inv : S → Prop}
+    (lt : α → α → Prop) (h_wf : WellFounded lt)
+    (body : I → ITree E I) (LInv : α → I → S → Prop)
+    (h_safe : ∀ m a s₀, LInv m a s₀ →
+      Always ewp Inv (fun next s' => ∃ m', LInv m' next s') (body a) s₀)
+    (h_live : ∀ m a s₀, LInv m a s₀ →
+      fairStep ewp (fun _ _ _ _ => False) Bad
+        (fun next s' => ∃ m', lt m' m ∧ LInv m' next s')
+        (CoBuchi ewp Bad (fun next s' => ∃ m', LInv m' next s'))
+        (fairProgress ewp (fun _ _ _ _ => False) Bad
+          (fun next s' => ∃ m', lt m' m ∧ LInv m' next s')
+          (CoBuchi ewp Bad (fun next s' => ∃ m', LInv m' next s')))
+        (fairStall ewp (fun _ _ _ _ => False) Bad
+          (fun next s' => LInv m next s' ∨ ∃ m', lt m' m ∧ LInv m' next s')
+          (CoBuchi ewp Bad (fun next s' => ∃ m', LInv m' next s'))
+          (fairProgress ewp (fun _ _ _ _ => False) Bad
+            (fun next s' => ∃ m', lt m' m ∧ LInv m' next s')
+            (CoBuchi ewp Bad (fun next s' => ∃ m', LInv m' next s'))))
+        (body a) s₀)
+    {m : α} {init : I} {s : S} (h_init : LInv m init s)
+    (Q : PEmpty.{u + 1} → S → Prop) :
+    Always ewp Inv Q (divergingLoop body init) s ∧
+      CoBuchi ewp Bad Q (divergingLoop body init) s :=
+  fair_diverging_loop_wf lt h_wf body LInv h_safe h_live h_init Q
+
+/-- `Nat`-ranked diverging `-> !` reactive loop rule for `CoBuchi`. -/
+theorem coBuchi_diverging_loop_ranked {I : Type u} {ewp : StateEffectWP S E}
+    {Bad : (i : E.I) → E.O i → S → S → Prop} {Inv : S → Prop}
+    (body : I → ITree E I) (LInv : Nat → I → S → Prop)
+    (h_safe : ∀ n a s₀, LInv n a s₀ →
+      Always ewp Inv (fun next s' => ∃ m, LInv m next s') (body a) s₀)
+    (h_live : ∀ n a s₀, LInv n a s₀ →
+      fairStep ewp (fun _ _ _ _ => False) Bad
+        (fun next s' => ∃ m, m < n ∧ LInv m next s')
+        (CoBuchi ewp Bad (fun next s' => ∃ m, LInv m next s'))
+        (fairProgress ewp (fun _ _ _ _ => False) Bad
+          (fun next s' => ∃ m, m < n ∧ LInv m next s')
+          (CoBuchi ewp Bad (fun next s' => ∃ m, LInv m next s')))
+        (fairStall ewp (fun _ _ _ _ => False) Bad
+          (fun next s' => LInv n next s' ∨ ∃ m, m < n ∧ LInv m next s')
+          (CoBuchi ewp Bad (fun next s' => ∃ m, LInv m next s'))
+          (fairProgress ewp (fun _ _ _ _ => False) Bad
+            (fun next s' => ∃ m, m < n ∧ LInv m next s')
+            (CoBuchi ewp Bad (fun next s' => ∃ m, LInv m next s'))))
+        (body a) s₀)
+    {n : Nat} {init : I} {s : S} (h_init : LInv n init s)
+    (Q : PEmpty.{u + 1} → S → Prop) :
+    Always ewp Inv Q (divergingLoop body init) s ∧
+      CoBuchi ewp Bad Q (divergingLoop body init) s :=
+  fair_diverging_loop_ranked body LInv h_safe h_live h_init Q
+
+/-- Horizontal handler linking for `CoBuchi` across `ITree.interp`. -/
+theorem CoBuchi.interp {E₁ E₂ : Effect.{u}}
+    {ewp₁ : StateEffectWP S E₁} {ewp₂ : StateEffectWP S E₂}
+    {Bad₁ : (i : E₁.I) → E₁.O i → S → S → Prop}
+    {Bad₂ : (j : E₂.I) → E₂.O j → S → S → Prop}
+    (h : (i : E₁.I) → ITree E₂ (E₁.O i))
+    (h_link : ∀ (i : E₁.I) (K3 K2 : E₁.O i → S → Prop) (s₀ : S),
+      ewp₁.wp i (fun o s' =>
+        (Bad₁ i o s₀ s' ∧ K3 o s') ∨
+        (¬ Bad₁ i o s₀ s' ∧ K2 o s')) s₀ →
+      fairStep ewp₂ (fun _ _ _ _ => False) Bad₂ K3
+        (CoBuchi ewp₂ Bad₂ (fun o s'' => K3 o s'' ∨ K2 o s''))
+        (fairProgress ewp₂ (fun _ _ _ _ => False) Bad₂ K3
+          (CoBuchi ewp₂ Bad₂ (fun o s'' => K3 o s'' ∨ K2 o s'')))
+        (fairStall ewp₂ (fun _ _ _ _ => False) Bad₂
+          (fun o s'' => K3 o s'' ∨ K2 o s'')
+          (CoBuchi ewp₂ Bad₂ (fun o s'' => K3 o s'' ∨ K2 o s''))
+          (fairProgress ewp₂ (fun _ _ _ _ => False) Bad₂ K3
+            (CoBuchi ewp₂ Bad₂ (fun o s'' => K3 o s'' ∨ K2 o s''))))
+        (h i) s₀)
+    {t : ITree E₁ R} {Q : R → S → Prop} {s : S}
+    (h_cb : CoBuchi ewp₁ Bad₁ Q t s) :
+    CoBuchi ewp₂ Bad₂ Q (ITree.interp h t) s :=
+  FairInfOften.interp h (fun i K4 K3 K2 s₀ hw =>
+    have hw' := ewp₁.mono (fun _ _ hp => hp.elim (fun ⟨hf, _⟩ => False.elim hf) id) hw
+    have hst := h_link i K3 K2 s₀ hw'
+    have h_fi : ∀ x s',
+        CoBuchi ewp₂ Bad₂ (fun o s'' => K3 o s'' ∨ K2 o s'') x s' →
+        FairInfOften ewp₂ (fun _ _ _ _ => False) Bad₂
+          (fun o s'' => K4 o s'' ∨ K3 o s'' ∨ K2 o s'') x s' :=
+      fun _ _ hx => FairInfOften.mono_post (fun _ _ h => Or.inr h) hx
+    fairStep.mono (fun _ _ hx => h_fi _ _ hx)
+      (fun _ _ hx => fairProgress.mono (fun _ _ h => h_fi _ _ h) hx)
+      (fun _ _ hx => fairStall.mono (fun _ _ h => h_fi _ _ h)
+        (fun _ _ h => fairProgress.mono (fun _ _ h' => h_fi _ _ h') h) hx)
+      hst) h_cb
+
+/-- Stateless operational adequacy for `CoBuchi`. -/
+theorem coBuchi_pure_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : EffectWP E} [PureSoundWP ewp]
+    {Bad : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {t : ITree E R} {post : R → Prop}
+    (h : CoBuchi ewp Bad (fun r _ => post r) t PUnit.unit) :
+    TreeSafe t ∧ Productive t ∧ ¬ MayDiverge t ∧
+      ∀ tr r, ReachesRet t tr r → post r :=
+  fairInfOften_pure_adequacy h
+
+open Std.Do in
+/-- `CoBuchi` over a `PureEffectWP` yields the corresponding `Std.Do.Triple`. -/
+theorem Triple.of_coBuchi {E : Effect.{u}} {R : Type u} [p : PureEffectWP E]
+    {Bad : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {t : ITree E R} {P : Prop} {Q : R → Prop}
+    (h : P → CoBuchi p.ewp Bad (fun r _ => Q r) t PUnit.unit) :
+    ⦃⌜P⌝⦄ t ⦃⇓ r => ⌜Q r⌝⦄ :=
+  Triple.of_fairInfOften h
+
+/--
+**Exact $\omega$-language co-Büchi adequacy (`FollowsStream`)**: a non-returning
+observation tree `t : ITree (ObsE α) PEmpty` satisfies `CoBuchi` for `BadObs`
+**if and only if** it emits an infinite stream `s : Stream' α` with only finitely
+many `BadObs` elements (`∃ K, ∀ n ≥ K, ¬ BadObs (s n)`).
+-/
+theorem coBuchi_obsIgnoreWP_iff_followsStream {α : Type u}
+    (BadObs : α → Prop) (Q : PEmpty.{u + 1} → PUnit.{u + 1} → Prop)
+    (t : ITree (ObsE α) PEmpty.{u + 1}) :
+    CoBuchi (obsIgnoreWP PUnit.{u + 1} α)
+        (fun i _ _ _ => match i with | .emit a => BadObs a) Q t PUnit.unit ↔
+      ∃ s : Stream' α, FollowsStream t s ∧
+        ∃ K : Nat, ∀ n : Nat, K ≤ n → ¬ BadObs (s n) := by
+  have h_eq := fairInfOften_obsIgnoreWP_iff_followsStream
+    (fun _ : α => False) BadObs Q t
+  have h_acc : (fun i (_ : (ObsE α).O i) (_ _ : PUnit.{u + 1}) =>
+      match i with | .emit _ => False) = (fun _ _ _ _ => False) := by
+    funext i _ _ _; cases i; rfl
+  rw [coBuchi_iff, ← h_acc, h_eq]
+  refine exists_congr fun s => and_congr_right fun _ => ⟨fun h => ?_, fun ⟨K, hK⟩ hinf _ => ?_⟩
+  · have h_not : ¬ ∀ k : Nat, ∃ n : Nat, k ≤ n ∧ BadObs (s n) := fun hinf =>
+      let ⟨_, _, hf⟩ := h hinf 0; hf
+    obtain ⟨K, hK⟩ := Classical.not_forall.1 h_not
+    exact ⟨K, fun n hle hb => hK ⟨n, hle, hb⟩⟩
+  · obtain ⟨n, hle, hb⟩ := hinf K
+    exact False.elim (hK n hle hb)
+
 end CoBuchi
+
+/-! #### General `EnvStrategy` Operational Adequacy (All Effects, All `σ`) -/
+
+section StrategyAdequacy
+
+/-- First `n` elements of an infinite stream `ev : Stream' α` as a `List α`. -/
+def takePrefix {α : Type u} (ev : Stream' α) (n : Nat) : List α :=
+  Nat.rec [] (fun k ih => ih ++ [ev k]) n
+
+@[simp]
+theorem takePrefix_zero {α : Type u} (ev : Stream' α) :
+    takePrefix ev 0 = [] := rfl
+
+@[simp]
+theorem takePrefix_succ {α : Type u} (ev : Stream' α) (n : Nat) :
+    takePrefix ev (n + 1) = takePrefix ev n ++ [ev n] := rfl
+
+/--
+`t` reaches a return value `r` along finite event trace `tr` when executed from
+history `hist` against deterministic environment strategy `σ`.
+-/
+def RetWithStrategy {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (σ : EnvStrategy E) (hist : List (Event E)) (t : ITree E R)
+    (tr : List (Event E)) (r : R) : Prop :=
+  ∃ u, ReachesWithStrategy σ hist t tr u ∧ u.observe = .ret r
+
+/--
+`t` exhibits the infinite event stream `ev : Stream' (Event E)` when executed
+from history `hist` against deterministic environment strategy `σ`: every
+finite prefix `takePrefix ev n` is reachable via `ReachesWithStrategy`.
+-/
+def InfRunWithStrategy {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (σ : EnvStrategy E) (hist : List (Event E)) (t : ITree E R)
+    (ev : Stream' (Event E)) : Prop :=
+  ∀ n : Nat, ∃ u, ReachesWithStrategy σ hist t (takePrefix ev n) u
+
+/-- Lift a stateless `EffectWP E` to a trace-recording `StateEffectWP (List (Event E)) E`. -/
+def traceLiftWP {E : Effect.{u}} (ewp : EffectWP E) :
+    StateEffectWP (List (Event E)) E where
+  wp i K tr := ewp.wp i (fun o _ => K o (tr ++ [⟨i, o⟩])) PUnit.unit
+  mono h_imp h_wp := ewp.mono (fun o _ hk => h_imp o _ hk) h_wp
+
+instance {E : Effect.{u}} [FaultEffect E] (ewp : EffectWP E) [h : PureSoundWP ewp] :
+    TraceSoundWP (traceLiftWP ewp) where
+  sound h_wp := h.sound h_wp
+
+/-- Lift a stateless `BuchiSpec` to a trace-recording `BuchiSpec (List (Event E))`. -/
+def BuchiSpec.toTrace {QState : Type u} {E : Effect.{u}} {R : Type u}
+    (spec : BuchiSpec PUnit.{u + 1} QState E R) :
+    BuchiSpec (List (Event E)) QState E R where
+  ewp := traceLiftWP spec.ewp
+  step q i o _ _ q' := spec.step q i o PUnit.unit PUnit.unit q'
+  accept q i o _ _ q' := spec.accept q i o PUnit.unit PUnit.unit q'
+  inv q _ := spec.inv q PUnit.unit
+  terminal q r _ := spec.terminal q r PUnit.unit
+
+instance {QState : Type u} {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (spec : BuchiSpec PUnit.{u + 1} QState E R) [PureSoundWP spec.ewp] :
+    TraceSoundWP spec.toTrace.ewp :=
+  inferInstanceAs (TraceSoundWP (traceLiftWP spec.ewp))
+
+private theorem reachesWithStrategy_of_tauStar {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {σ : EnvStrategy E} {hist tr : List (Event E)}
+    {a b c : ITree E R} (h₁ : TauStar a b)
+    (h₂ : ReachesWithStrategy σ hist b tr c) :
+    ReachesWithStrategy σ hist a tr c := by
+  induction h₁ with
+  | refl => exact h₂
+  | step htau _ ih => exact .tau htau (ih h₂)
+
+private theorem reachesWithStrategy_trans {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {σ : EnvStrategy E} {hist tr₁ tr₂ : List (Event E)}
+    {t u v : ITree E R} (h₁ : ReachesWithStrategy σ hist t tr₁ u)
+    (h₂ : ReachesWithStrategy σ (hist ++ tr₁) u tr₂ v) :
+    ReachesWithStrategy σ hist t (tr₁ ++ tr₂) v := by
+  induction h₁ with
+  | refl h x => simpa using h₂
+  | tau htau _ ih => exact .tau htau (ih h₂)
+  | vis hv hnf _ ih =>
+    rw [List.cons_append]
+    exact .vis hv hnf (ih (by simpa [List.append_assoc] using h₂))
+
+private theorem tauStar_vis_inv_ret {E : Effect.{u}} {R : Type u}
+    {w v : ITree E R} {r : R} {i : E.I} {k : E.O i → ITree E R}
+    (hts : TauStar w v) (hw : w.observe = .ret r) (hv : v.observe = .vis i k) :
+    False := by
+  cases hts with
+  | refl => rw [hw] at hv; exact nomatch hv
+  | step htau _ => rw [hw] at htau; exact nomatch htau
+
+private theorem tauStar_vis_inv_tau {E : Effect.{u}} {R : Type u}
+    {w w' v : ITree E R} {i : E.I} {k : E.O i → ITree E R}
+    (hts : TauStar w v) (hw : w.observe = .tau w') (hv : v.observe = .vis i k) :
+    TauStar w' v := by
+  cases hts with
+  | refl => rw [hw] at hv; exact nomatch hv
+  | step htau hrest =>
+    rw [hw] at htau
+    injection htau with heq
+    exact heq ▸ hrest
+
+private theorem tauStar_vis_inv_vis {E : Effect.{u}} {R : Type u}
+    {w v : ITree E R} {i₀ i : E.I} {k₀ : E.O i₀ → ITree E R}
+    {k : E.O i → ITree E R}
+    (hts : TauStar w v) (hw : w.observe = .vis i₀ k₀) (hv : v.observe = .vis i k) :
+    w = v := by
+  cases hts with
+  | refl => rfl
+  | step htau _ => rw [hw] at htau; exact nomatch htau
+
+private structure GhostStep {E : Effect.{u}} {R G : Type u} [FaultEffect E]
+    (ewp : StateEffectWP (G × List (Event E)) E)
+    (StepG : G → (i : E.I) → E.O i → List (Event E) → G → Prop)
+    (AccEdge Fair : (i : E.I) → E.O i → G × List (Event E) → G × List (Event E) → Prop)
+    (Q : R → G × List (Event E) → Prop)
+    (σ : EnvStrategy E) (tr₀ : List (Event E))
+    (u : ITree E R) (g : G) (tr : List (Event E)) : Type u where
+  v : ITree E R
+  i : E.I
+  k : E.O i → ITree E R
+  hnf : ¬ FaultEffect.isFault i
+  g' : G
+  hts : TauStar u v
+  hv : v.observe = .vis i k
+  hsg : StepG g i (σ (tr₀ ++ tr) i hnf) (tr₀ ++ tr) g'
+  hfi' : FairInfOften ewp AccEdge Fair Q (k (σ (tr₀ ++ tr) i hnf))
+    (g', tr₀ ++ (tr ++ [⟨i, σ (tr₀ ++ tr) i hnf⟩]))
+
+private structure GhostCfg {E : Effect.{u}} {R G : Type u} [FaultEffect E]
+    (ewp : StateEffectWP (G × List (Event E)) E)
+    (AccEdge Fair : (i : E.I) → E.O i → G × List (Event E) → G × List (Event E) → Prop)
+    (Q : R → G × List (Event E) → Prop)
+    (σ : EnvStrategy E) (tr₀ : List (Event E)) (t : ITree E R) : Type u where
+  u : ITree E R
+  g : G
+  tr : List (Event E)
+  hreach : ReachesWithStrategy σ tr₀ t tr u
+  hfi : FairInfOften ewp AccEdge Fair Q u (g, tr₀ ++ tr)
+
+private theorem ghost_trace_fairInfOften_adequacy {E : Effect.{u}} {R G : Type u}
+    [FaultEffect E] (ewp : StateEffectWP (G × List (Event E)) E)
+    (StepG : G → (i : E.I) → E.O i → List (Event E) → G → Prop)
+    (h_sound : ∀ {i K g tr}, ewp.wp i K (g, tr) →
+      ¬ FaultEffect.isFault i ∧ ∀ o, ∃ g', StepG g i o tr g' ∧ K o (g', tr ++ [⟨i, o⟩]))
+    (h_det : ∀ g i o tr g₁ g₂, StepG g i o tr g₁ → StepG g i o tr g₂ → g₁ = g₂)
+    (AccEdge Fair : (i : E.I) → E.O i → G × List (Event E) → G × List (Event E) → Prop)
+    (Q : R → G × List (Event E) → Prop) (σ : EnvStrategy E)
+    {t : ITree E R} {g₀ : G} {tr₀ : List (Event E)}
+    (h : FairInfOften ewp AccEdge Fair Q t (g₀, tr₀)) :
+    (∃ tr r g', RetWithStrategy σ tr₀ t tr r ∧ Q r (g', tr₀ ++ tr)) ∨
+      (∃ (ev : Stream' (Event E)) (g : Stream' G),
+        InfRunWithStrategy σ tr₀ t ev ∧ g 0 = g₀ ∧
+        (∀ n, StepG (g n) (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n) (g (n + 1))) ∧
+        ((∀ k, ∃ n, k ≤ n ∧
+            Fair (ev n).req (ev n).ans (g n, tr₀ ++ takePrefix ev n)
+              (g (n + 1), tr₀ ++ takePrefix ev (n + 1))) →
+          (∀ k, ∃ n, k ≤ n ∧
+            AccEdge (ev n).req (ev n).ans (g n, tr₀ ++ takePrefix ev n)
+              (g (n + 1), tr₀ ++ takePrefix ev (n + 1))))) := by
+  by_cases h_ret : ∃ tr r g', RetWithStrategy σ tr₀ t tr r ∧ Q r (g', tr₀ ++ tr)
+  · exact Or.inl h_ret
+  · right
+    have h_step_ne : ∀ c : GhostCfg ewp AccEdge Fair Q σ tr₀ t,
+        Nonempty (GhostStep ewp StepG AccEdge Fair Q σ tr₀ c.u c.g c.tr) := by
+      intro c
+      have hfs := (FairInfOften.iff_fairStep ewp AccEdge Fair Q c.u (c.g, tr₀ ++ c.tr)).1 c.hfi
+      refine fairStep.induct
+        (fun w p => TauStar c.u w → p = (c.g, tr₀ ++ c.tr) →
+          Nonempty (GhostStep ewp StepG AccEdge Fair Q σ tr₀ c.u c.g c.tr))
+        ?_ hfs (.refl c.u) rfl
+      intro w p hw hts hp
+      subst hp
+      cases h_obs : w.observe with
+      | ret r =>
+        simp only [h_obs] at hw
+        have hreach_w : ReachesWithStrategy σ tr₀ t c.tr w := by
+          have hr := reachesWithStrategy_trans c.hreach
+            (reachesWithStrategy_of_tauStar hts (.refl (tr₀ ++ c.tr) w))
+          simpa using hr
+        exact False.elim (h_ret ⟨c.tr, r, c.g, ⟨w, hreach_w, h_obs⟩, hw⟩)
+      | tau w' =>
+        simp only [h_obs] at hw
+        exact hw (TauStar.trans hts (.step h_obs (.refl w'))) trivial
+      | vis i k =>
+        simp only [h_obs] at hw
+        obtain ⟨hnf, hall⟩ := h_sound hw
+        let o := σ (tr₀ ++ c.tr) i hnf
+        obtain ⟨g', hsg, hbr⟩ := hall o
+        have hfi' : FairInfOften ewp AccEdge Fair Q (k o)
+            (g', tr₀ ++ (c.tr ++ [⟨i, o⟩])) := by
+          have hfi₀ : FairInfOften ewp AccEdge Fair Q (k o)
+              (g', (tr₀ ++ c.tr) ++ [⟨i, o⟩]) :=
+            hbr.elim And.right (fun h' => h'.elim And.right And.right)
+          simpa [List.append_assoc] using hfi₀
+        exact ⟨⟨w, i, k, hnf, g', hts, h_obs, hsg, hfi'⟩⟩
+    let stepOf (c : GhostCfg ewp AccEdge Fair Q σ tr₀ t) :
+        GhostStep ewp StepG AccEdge Fair Q σ tr₀ c.u c.g c.tr :=
+      Classical.choice (h_step_ne c)
+    let nextCfg (c : GhostCfg ewp AccEdge Fair Q σ tr₀ t) :
+        GhostCfg ewp AccEdge Fair Q σ tr₀ t :=
+      let s := stepOf c
+      let o := σ (tr₀ ++ c.tr) s.i s.hnf
+      { u := s.k o
+        g := s.g'
+        tr := c.tr ++ [⟨s.i, o⟩]
+        hreach := reachesWithStrategy_trans c.hreach
+          (reachesWithStrategy_of_tauStar s.hts
+            (.vis s.hv s.hnf (.refl _ (s.k o))))
+        hfi := s.hfi' }
+    let cfg₀ : GhostCfg ewp AccEdge Fair Q σ tr₀ t :=
+      { u := t, g := g₀, tr := [], hreach := .refl tr₀ t, hfi := by simpa using h }
+    let cfg : Nat → GhostCfg ewp AccEdge Fair Q σ tr₀ t :=
+      Nat.rec cfg₀ (fun _ c => nextCfg c)
+    let ev : Stream' (Event E) := fun n =>
+      let s := stepOf (cfg n)
+      ⟨s.i, σ (tr₀ ++ (cfg n).tr) s.i s.hnf⟩
+    let g : Stream' G := fun n => (cfg n).g
+    have h_pref : ∀ n, (cfg n).tr = takePrefix ev n := by
+      intro n
+      induction n with
+      | zero => rfl
+      | succ n ih =>
+        show (cfg n).tr ++ [ev n] = takePrefix ev n ++ [ev n]
+        rw [ih]
+    have h_inf : InfRunWithStrategy σ tr₀ t ev := fun n =>
+      ⟨(cfg n).u, h_pref n ▸ (cfg n).hreach⟩
+    have h_step_g : ∀ n, StepG (g n) (ev n).req (ev n).ans
+        (tr₀ ++ takePrefix ev n) (g (n + 1)) := by
+      intro n
+      have hs := (stepOf (cfg n)).hsg
+      simpa [g, ev, cfg, nextCfg, h_pref n] using hs
+    refine ⟨ev, g, h_inf, rfl, h_step_g, fun hfair_inf k => ?_⟩
+    have hfi_k := (cfg k).hfi
+    rw [FairInfOften.unfold_eq] at hfi_k
+    refine fairProgress.induct
+      (fun y p => ∀ j, y = (cfg j).u → p = (g j, tr₀ ++ takePrefix ev j) →
+        ∃ m, j ≤ m ∧
+          AccEdge (ev m).req (ev m).ans (g m, tr₀ ++ takePrefix ev m)
+            (g (m + 1), tr₀ ++ takePrefix ev (m + 1)))
+      ?_ hfi_k k rfl (by simp [g, h_pref k])
+    intro y p hy j hy_eq hp_eq
+    subst hy_eq; subst hp_eq
+    obtain ⟨n, hle, hfn⟩ := hfair_inf j
+    have h_drop : ∀ (d : Nat) (j₀ : Nat),
+        fairStall ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+          (fun w q => ∀ j₁, w = (cfg j₁).u → q = (g j₁, tr₀ ++ takePrefix ev j₁) →
+            ∃ m, j₁ ≤ m ∧
+              AccEdge (ev m).req (ev m).ans (g m, tr₀ ++ takePrefix ev m)
+                (g (m + 1), tr₀ ++ takePrefix ev (m + 1)))
+          (cfg j₀).u (g j₀, tr₀ ++ takePrefix ev j₀) →
+        Fair (ev (j₀ + d)).req (ev (j₀ + d)).ans
+          (g (j₀ + d), tr₀ ++ takePrefix ev (j₀ + d))
+          (g (j₀ + d + 1), tr₀ ++ takePrefix ev (j₀ + d + 1)) →
+        ∃ m, j₀ ≤ m ∧
+          AccEdge (ev m).req (ev m).ans (g m, tr₀ ++ takePrefix ev m)
+            (g (m + 1), tr₀ ++ takePrefix ev (m + 1)) := by
+      intro d
+      induction d with
+      | zero =>
+        intro j₀ hz hf0
+        rw [fairStall.unfold_eq] at hz
+        let sj := stepOf (cfg j₀)
+        refine fairStep.induct
+          (fun w q => TauStar w sj.v → q = (g j₀, tr₀ ++ takePrefix ev j₀) →
+            ∃ m, j₀ ≤ m ∧
+              AccEdge (ev m).req (ev m).ans (g m, tr₀ ++ takePrefix ev m)
+                (g (m + 1), tr₀ ++ takePrefix ev (m + 1)))
+          ?_ hz sj.hts rfl
+        intro w q hw hts hq
+        subst hq
+        cases h_obs : w.observe with
+        | ret r => exact False.elim (tauStar_vis_inv_ret hts h_obs sj.hv)
+        | tau w' =>
+          simp only [h_obs] at hw
+          exact hw (tauStar_vis_inv_tau hts h_obs sj.hv) trivial
+        | vis i₀ k₀ =>
+          simp only [h_obs] at hw
+          have hwv : w = sj.v := tauStar_vis_inv_vis hts h_obs sj.hv
+          subst hwv
+          rw [sj.hv] at h_obs
+          injection h_obs with hi₀ hk₀
+          subst hi₀
+          have hk_eq : k₀ = sj.k := (eq_of_heq hk₀).symm
+          subst hk_eq
+          obtain ⟨_, hall⟩ := h_sound hw
+          have h_tr_eq : tr₀ ++ (cfg j₀).tr = tr₀ ++ takePrefix ev j₀ := by
+            rw [h_pref j₀]
+          let o_j : E.O sj.i := σ (tr₀ ++ (cfg j₀).tr) sj.i sj.hnf
+          obtain ⟨g', hsg', hbr⟩ := hall o_j
+          have hg'_eq : g' = g (j₀ + 1) :=
+            h_det (g j₀) sj.i o_j (tr₀ ++ takePrefix ev j₀) g' (g (j₀ + 1))
+              hsg' (h_step_g j₀)
+          subst hg'_eq
+          have h_tr_next : (tr₀ ++ takePrefix ev j₀) ++ [⟨sj.i, o_j⟩] =
+              tr₀ ++ takePrefix ev (j₀ + 1) := by
+            show (tr₀ ++ takePrefix ev j₀) ++ [ev j₀] =
+              tr₀ ++ (takePrefix ev j₀ ++ [ev j₀])
+            rw [List.append_assoc]
+          rw [h_tr_next] at hbr
+          rcases hbr with ⟨ha, _⟩ | ⟨_, hpre⟩ | ⟨hnf_f, _⟩
+          · exact ⟨j₀, Nat.le_refl j₀, ha⟩
+          · have h_u_next : sj.k o_j = (cfg (j₀ + 1)).u := rfl
+            obtain ⟨m, hle', hm⟩ := hpre (j₀ + 1) h_u_next rfl
+            exact ⟨m, Nat.le_trans (Nat.le_succ j₀) hle', hm⟩
+          · exact False.elim (hnf_f hf0)
+      | succ d ih =>
+        intro j₀ hz hfsd
+        rw [fairStall.unfold_eq] at hz
+        let sj := stepOf (cfg j₀)
+        refine fairStep.induct
+          (fun w q => TauStar w sj.v → q = (g j₀, tr₀ ++ takePrefix ev j₀) →
+            ∃ m, j₀ ≤ m ∧
+              AccEdge (ev m).req (ev m).ans (g m, tr₀ ++ takePrefix ev m)
+                (g (m + 1), tr₀ ++ takePrefix ev (m + 1)))
+          ?_ hz sj.hts rfl
+        intro w q hw hts hq
+        subst hq
+        cases h_obs : w.observe with
+        | ret r => exact False.elim (tauStar_vis_inv_ret hts h_obs sj.hv)
+        | tau w' =>
+          simp only [h_obs] at hw
+          exact hw (tauStar_vis_inv_tau hts h_obs sj.hv) trivial
+        | vis i₀ k₀ =>
+          simp only [h_obs] at hw
+          have hwv : w = sj.v := tauStar_vis_inv_vis hts h_obs sj.hv
+          subst hwv
+          rw [sj.hv] at h_obs
+          injection h_obs with hi₀ hk₀
+          subst hi₀
+          have hk_eq : k₀ = sj.k := (eq_of_heq hk₀).symm
+          subst hk_eq
+          obtain ⟨_, hall⟩ := h_sound hw
+          let o_j : E.O sj.i := σ (tr₀ ++ (cfg j₀).tr) sj.i sj.hnf
+          obtain ⟨g', hsg', hbr⟩ := hall o_j
+          have hg'_eq : g' = g (j₀ + 1) :=
+            h_det (g j₀) sj.i o_j (tr₀ ++ takePrefix ev j₀) g' (g (j₀ + 1))
+              hsg' (h_step_g j₀)
+          subst hg'_eq
+          have h_tr_next : (tr₀ ++ takePrefix ev j₀) ++ [⟨sj.i, o_j⟩] =
+              tr₀ ++ takePrefix ev (j₀ + 1) := by
+            show (tr₀ ++ takePrefix ev j₀) ++ [ev j₀] =
+              tr₀ ++ (takePrefix ev j₀ ++ [ev j₀])
+            rw [List.append_assoc]
+          rw [h_tr_next] at hbr
+          have h_u_next : sj.k o_j = (cfg (j₀ + 1)).u := rfl
+          rcases hbr with ⟨ha, _⟩ | ⟨_, hpre⟩ | ⟨_, hst⟩
+          · exact ⟨j₀, Nat.le_refl j₀, ha⟩
+          · obtain ⟨m, hle', hm⟩ := hpre (j₀ + 1) h_u_next rfl
+            exact ⟨m, Nat.le_trans (Nat.le_succ j₀) hle', hm⟩
+          · have hfsd' : Fair (ev (j₀ + 1 + d)).req (ev (j₀ + 1 + d)).ans
+                (g (j₀ + 1 + d), tr₀ ++ takePrefix ev (j₀ + 1 + d))
+                (g (j₀ + 1 + d + 1), tr₀ ++ takePrefix ev (j₀ + 1 + d + 1)) := by
+              have h_idx : j₀ + 1 + d = j₀ + (d + 1) := by omega
+              rwa [h_idx]
+            obtain ⟨m, hle', hm⟩ := ih (j₀ + 1) (h_u_next ▸ hst) hfsd'
+            exact ⟨m, Nat.le_trans (Nat.le_succ j₀) hle', hm⟩
+    exact h_drop (n - j) j hy (by rwa [show j + (n - j) = n by omega])
+
+private theorem fairInfOften_lift_punit {E : Effect.{u}} {R : Type u}
+    {ewp : StateEffectWP (List (Event E)) E}
+    {AccEdge Fair : (i : E.I) → E.O i → List (Event E) → List (Event E) → Prop}
+    {Q : R → List (Event E) → Prop} {t : ITree E R} {tr₀ : List (Event E)}
+    (h : FairInfOften ewp AccEdge Fair Q t tr₀) :
+    FairInfOften
+      { wp := fun i K p => ewp.wp i (fun o tr' => K o (PUnit.unit, tr')) p.2
+        mono := fun hm hw => ewp.mono (fun o _ hk => hm o _ hk) hw }
+      (fun i o p₁ p₂ => AccEdge i o p₁.2 p₂.2)
+      (fun i o p₁ p₂ => Fair i o p₁.2 p₂.2)
+      (fun r p => Q r p.2) t (PUnit.unit, tr₀) := by
+  let ewp' : StateEffectWP (PUnit.{u + 1} × List (Event E)) E :=
+    { wp := fun i K p => ewp.wp i (fun o tr' => K o (PUnit.unit, tr')) p.2
+      mono := fun hm hw => ewp.mono (fun o _ hk => hm o _ hk) hw }
+  let Acc' := fun i o (p₁ p₂ : PUnit.{u + 1} × List (Event E)) => AccEdge i o p₁.2 p₂.2
+  let Fair' := fun i o (p₁ p₂ : PUnit.{u + 1} × List (Event E)) => Fair i o p₁.2 p₂.2
+  let Q' := fun r (p : PUnit.{u + 1} × List (Event E)) => Q r p.2
+  let X := fun x (p : PUnit.{u + 1} × List (Event E)) =>
+    FairInfOften ewp AccEdge Fair Q x p.2
+  refine FairInfOften.coinduct X ?_ h
+  intro x p hx
+  dsimp only [X] at hx
+  rw [FairInfOften.unfold_eq] at hx
+  refine fairProgress.induct (fun y tr => fairProgress ewp' Acc' Fair' Q' X y (PUnit.unit, tr))
+    ?_ hx
+  intro y tr hy
+  rw [fairProgress.unfold_eq]
+  let Z := fun z (p' : PUnit.{u + 1} × List (Event E)) =>
+    fairStall ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+      (fun v tr' => fairProgress ewp' Acc' Fair' Q' X v (PUnit.unit, tr')) z p'.2
+  refine fairStall.coinduct Z ?_ hy
+  intro z p' hz
+  dsimp only [Z] at hz
+  rw [fairStall.unfold_eq] at hz
+  refine fairStep.induct
+    (fun w tr' => fairStep ewp' Acc' Fair' Q' X (fairProgress ewp' Acc' Fair' Q' X) Z
+      w (p'.1, tr')) ?_ hz
+  intro w _ hw
+  rw [fairStep.unfold_eq]
+  cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+  · exact hw
+  · exact hw
+  · exact hw
+
+/-- Lift stateless `FairInfOften` over `ewp : EffectWP E` to `traceLiftWP ewp`. -/
+theorem FairInfOften.toTraceLift {E : Effect.{u}} {R : Type u}
+    {ewp : EffectWP E}
+    {AccEdge Fair : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {Q : R → PUnit.{u + 1} → Prop} {t : ITree E R} (tr₀ : List (Event E))
+    (h : FairInfOften ewp AccEdge Fair Q t PUnit.unit) :
+    FairInfOften (traceLiftWP ewp)
+      (fun i o _ _ => AccEdge i o PUnit.unit PUnit.unit)
+      (fun i o _ _ => Fair i o PUnit.unit PUnit.unit)
+      (fun r _ => Q r PUnit.unit) t tr₀ := by
+  let Acc' := fun i o (_ _ : List (Event E)) => AccEdge i o PUnit.unit PUnit.unit
+  let Fair' := fun i o (_ _ : List (Event E)) => Fair i o PUnit.unit PUnit.unit
+  let Q' := fun r (_ : List (Event E)) => Q r PUnit.unit
+  let X := fun x (_ : List (Event E)) => FairInfOften ewp AccEdge Fair Q x PUnit.unit
+  refine FairInfOften.coinduct X ?_ h
+  intro x tr hx
+  dsimp only [X] at hx
+  rw [FairInfOften.unfold_eq] at hx
+  refine fairProgress.induct
+    (fun y _ => ∀ tr₁, fairProgress (traceLiftWP ewp) Acc' Fair' Q' X y tr₁) ?_ hx tr
+  intro y ⟨⟩ hy tr₁
+  rw [fairProgress.unfold_eq]
+  let Z := fun z (_ : List (Event E)) =>
+    fairStall ewp AccEdge Fair Q (FairInfOften ewp AccEdge Fair Q)
+      (fun v _ => ∀ tr₂, fairProgress (traceLiftWP ewp) Acc' Fair' Q' X v tr₂) z PUnit.unit
+  refine fairStall.coinduct Z ?_ hy
+  intro z tr₂ hz
+  dsimp only [Z] at hz
+  rw [fairStall.unfold_eq] at hz
+  refine fairStep.induct
+    (fun w _ => ∀ tr₃, fairStep (traceLiftWP ewp) Acc' Fair' Q' X
+      (fairProgress (traceLiftWP ewp) Acc' Fair' Q' X) Z w tr₃) ?_ hz tr₂
+  intro w ⟨⟩ hw tr₃
+  rw [fairStep.unfold_eq]
+  cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+  · exact hw
+  · exact hw tr₃
+  · exact ewp.mono
+      (fun _ _ hp => hp.imp id (Or.imp (And.imp id (fun hpre => hpre _)) id)) hw
+
+/--
+**General `EnvStrategy` Streett operational adequacy (`TraceSoundWP`)**:
+for ANY `[FaultEffect E]`, ANY `R`, ANY `[TraceSoundWP ewp]`, and EVERY
+deterministic environment strategy `σ : EnvStrategy E`, `FairInfOften` ensures
+that executing `t` against `σ` from `tr₀` either returns `r` satisfying
+`Q r (tr₀ ++ tr)` or produces an infinite event stream `ev` satisfying the
+Streett implication `□◇ Fair → □◇ AccEdge`.
+-/
+theorem trace_fairInfOften_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : StateEffectWP (List (Event E)) E}
+    [h_sound : TraceSoundWP ewp]
+    {AccEdge Fair : (i : E.I) → E.O i → List (Event E) → List (Event E) → Prop}
+    {Q : R → List (Event E) → Prop} {t : ITree E R} {tr₀ : List (Event E)}
+    (h : FairInfOften ewp AccEdge Fair Q t tr₀) (σ : EnvStrategy E) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r (tr₀ ++ tr)) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ((∀ k, ∃ n, k ≤ n ∧
+            Fair (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+              (tr₀ ++ takePrefix ev (n + 1))) →
+          (∀ k, ∃ n, k ≤ n ∧
+            AccEdge (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+              (tr₀ ++ takePrefix ev (n + 1))))) := by
+  have h_res := ghost_trace_fairInfOften_adequacy
+    (G := PUnit.{u + 1})
+    { wp := fun i K p => ewp.wp i (fun o tr' => K o (PUnit.unit, tr')) p.2
+      mono := fun hm hw => ewp.mono (fun o tr' hk => hm o _ hk) hw }
+    (fun _ _ _ _ _ => True)
+    (fun hw => let ⟨hnf, hall⟩ := h_sound.sound hw; ⟨hnf, fun o => ⟨PUnit.unit, trivial, hall o⟩⟩)
+    (fun _ _ _ _ _ _ _ _ => rfl)
+    (fun i o p₁ p₂ => AccEdge i o p₁.2 p₂.2)
+    (fun i o p₁ p₂ => Fair i o p₁.2 p₂.2)
+    (fun r p => Q r p.2) σ (fairInfOften_lift_punit h)
+  rcases h_res with ⟨tr, r, _, hret, hq⟩ | ⟨ev, _, hinf, _, _, hstreett⟩
+  · exact Or.inl ⟨tr, r, hret, hq⟩
+  · exact Or.inr ⟨ev, hinf, hstreett⟩
+
+/-- **General `EnvStrategy` Büchi operational adequacy (`TraceSoundWP`)**. -/
+theorem trace_infOften_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : StateEffectWP (List (Event E)) E}
+    [TraceSoundWP ewp]
+    {AccEdge : (i : E.I) → E.O i → List (Event E) → List (Event E) → Prop}
+    {Q : R → List (Event E) → Prop} {t : ITree E R} {tr₀ : List (Event E)}
+    (h : InfOften ewp AccEdge Q t tr₀) (σ : EnvStrategy E) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r (tr₀ ++ tr)) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ∀ k, ∃ n, k ≤ n ∧
+          AccEdge (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+            (tr₀ ++ takePrefix ev (n + 1))) := by
+  rcases trace_fairInfOften_strategy_adequacy (h.toFairInfOften (fun _ _ _ _ => True)) σ with
+    hret | ⟨ev, hinf, hacc⟩
+  · exact Or.inl hret
+  · exact Or.inr ⟨ev, hinf, hacc (fun k => ⟨k, Nat.le_refl k, trivial⟩)⟩
+
+/-- **General `EnvStrategy` co-Büchi operational adequacy (`TraceSoundWP`)**. -/
+theorem trace_coBuchi_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : StateEffectWP (List (Event E)) E}
+    [TraceSoundWP ewp]
+    {Bad : (i : E.I) → E.O i → List (Event E) → List (Event E) → Prop}
+    {Q : R → List (Event E) → Prop} {t : ITree E R} {tr₀ : List (Event E)}
+    (h : CoBuchi ewp Bad Q t tr₀) (σ : EnvStrategy E) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r (tr₀ ++ tr)) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ∃ K, ∀ n, K ≤ n →
+          ¬ Bad (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+            (tr₀ ++ takePrefix ev (n + 1))) := by
+  rcases trace_fairInfOften_strategy_adequacy h σ with hret | ⟨ev, hinf, hst⟩
+  · exact Or.inl hret
+  · refine Or.inr ⟨ev, hinf, ?_⟩
+    have h_not : ¬ ∀ k, ∃ n, k ≤ n ∧
+        Bad (ev n).req (ev n).ans (tr₀ ++ takePrefix ev n)
+          (tr₀ ++ takePrefix ev (n + 1)) := fun hinf_bad =>
+      let ⟨_, _, hf⟩ := hst hinf_bad 0; hf
+    obtain ⟨K, hK⟩ := Classical.not_forall.1 h_not
+    exact ⟨K, fun n hle hb => hK ⟨n, hle, hb⟩⟩
+
+/-- **General `EnvStrategy` Streett operational adequacy (`PureSoundWP`)**. -/
+theorem pure_fairInfOften_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : EffectWP E} [PureSoundWP ewp]
+    {AccEdge Fair : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {Q : R → PUnit.{u + 1} → Prop} {t : ITree E R}
+    (h : FairInfOften ewp AccEdge Fair Q t PUnit.unit)
+    (σ : EnvStrategy E) (tr₀ : List (Event E) := []) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r PUnit.unit) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ((∀ k, ∃ n, k ≤ n ∧ Fair (ev n).req (ev n).ans PUnit.unit PUnit.unit) →
+          (∀ k, ∃ n, k ≤ n ∧ AccEdge (ev n).req (ev n).ans PUnit.unit PUnit.unit))) :=
+  trace_fairInfOften_strategy_adequacy (FairInfOften.toTraceLift tr₀ h) σ
+
+/-- **General `EnvStrategy` Büchi operational adequacy (`PureSoundWP`)**. -/
+theorem pure_infOften_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : EffectWP E} [PureSoundWP ewp]
+    {AccEdge : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {Q : R → PUnit.{u + 1} → Prop} {t : ITree E R}
+    (h : InfOften ewp AccEdge Q t PUnit.unit)
+    (σ : EnvStrategy E) (tr₀ : List (Event E) := []) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r PUnit.unit) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ∀ k, ∃ n, k ≤ n ∧ AccEdge (ev n).req (ev n).ans PUnit.unit PUnit.unit) :=
+  trace_infOften_strategy_adequacy
+    ((fairInfOften_true_iff_infOften _ _ _ _ _).1
+      (FairInfOften.toTraceLift tr₀ (h.toFairInfOften (fun _ _ _ _ => True)))) σ
+
+/-- **General `EnvStrategy` co-Büchi operational adequacy (`PureSoundWP`)**. -/
+theorem pure_coBuchi_strategy_adequacy {E : Effect.{u}} {R : Type u}
+    [FaultEffect E] {ewp : EffectWP E} [PureSoundWP ewp]
+    {Bad : (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → Prop}
+    {Q : R → PUnit.{u + 1} → Prop} {t : ITree E R}
+    (h : CoBuchi ewp Bad Q t PUnit.unit)
+    (σ : EnvStrategy E) (tr₀ : List (Event E) := []) :
+    (∃ tr r, RetWithStrategy σ tr₀ t tr r ∧ Q r PUnit.unit) ∨
+      (∃ ev : Stream' (Event E), InfRunWithStrategy σ tr₀ t ev ∧
+        ∃ K, ∀ n, K ≤ n → ¬ Bad (ev n).req (ev n).ans PUnit.unit PUnit.unit) :=
+  trace_coBuchi_strategy_adequacy (FairInfOften.toTraceLift tr₀ h) σ
+
+/--
+**Deterministic-monitor `FairBuchiSat` `EnvStrategy` adequacy (`TraceSoundWP`)**:
+produces BOTH the operational infinite run `ev` AND the unique invariant-preserving
+monitor run `q : Stream' QState` satisfying the Streett condition.
+-/
+theorem trace_fairBuchiSat_det_strategy_adequacy {QState : Type u}
+    {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (spec : BuchiSpec (List (Event E)) QState E R) [h_sound : TraceSoundWP spec.ewp]
+    (fair : QState → (i : E.I) → E.O i → List (Event E) → List (Event E) → QState → Prop)
+    (h_det : ∀ q i o tr tr' q₁ q₂,
+      spec.step q i o tr tr' q₁ → spec.step q i o tr tr' q₂ → q₁ = q₂)
+    {t : ITree E R} {q₀ : QState} {tr₀ : List (Event E)}
+    (h : FairBuchiSat spec fair t q₀ tr₀) (σ : EnvStrategy E) :
+    (∃ tr r q', RetWithStrategy σ tr₀ t tr r ∧
+        spec.inv q' (tr₀ ++ tr) ∧ spec.terminal q' r (tr₀ ++ tr)) ∨
+      (∃ (ev : Stream' (Event E)) (q : Stream' QState),
+        InfRunWithStrategy σ tr₀ t ev ∧ q 0 = q₀ ∧
+        (∀ n, spec.inv (q n) (tr₀ ++ takePrefix ev n) ∧
+          spec.step (q n) (ev n).req (ev n).ans
+            (tr₀ ++ takePrefix ev n) (tr₀ ++ takePrefix ev (n + 1)) (q (n + 1))) ∧
+        ((∀ k, ∃ n, k ≤ n ∧
+            fair (q n) (ev n).req (ev n).ans
+              (tr₀ ++ takePrefix ev n) (tr₀ ++ takePrefix ev (n + 1)) (q (n + 1))) →
+          (∀ k, ∃ n, k ≤ n ∧
+            spec.accept (q n) (ev n).req (ev n).ans
+              (tr₀ ++ takePrefix ev n) (tr₀ ++ takePrefix ev (n + 1)) (q (n + 1))))) := by
+  have ⟨hi₀, hfi⟩ := (fairBuchiSat_iff_fairInfOften spec fair t q₀ tr₀).1 h
+  have hfi_inv := FairInfOften.post_inv_guardInv (ewp := spec.prodWP) (Inv := spec.invPred)
+    (s := (q₀, tr₀)) hi₀ hfi
+  let StepG : QState → (i : E.I) → E.O i → List (Event E) → QState → Prop :=
+    fun q i o tr q' =>
+      spec.step q i o tr (tr ++ [⟨i, o⟩]) q' ∧ spec.inv q' (tr ++ [⟨i, o⟩])
+  have h_res := ghost_trace_fairInfOften_adequacy spec.monitorWP StepG
+    (fun {i K q tr} hw =>
+      let ⟨hnf, hall⟩ := h_sound.sound hw
+      ⟨hnf, fun o => let ⟨q', hs, hi, hk⟩ := hall o; ⟨q', ⟨hs, hi⟩, hk⟩⟩)
+    (fun q i o tr q₁ q₂ h₁ h₂ => h_det q i o tr _ q₁ q₂ h₁.1 h₂.1)
+    spec.acceptEdge (spec.fairEdge fair)
+    (fun r qs => spec.inv qs.1 qs.2 ∧ spec.terminal qs.1 r qs.2) σ hfi_inv
+  rcases h_res with ⟨tr, r, q', hret, hi', hterm⟩ | ⟨ev, q, hinf, hq0, hsteps, hst⟩
+  · exact Or.inl ⟨tr, r, q', hret, hi', hterm⟩
+  · refine Or.inr ⟨ev, q, hinf, hq0, fun n => ?_, hst⟩
+    have h_step_n := hsteps n
+    have h_tr_n : (tr₀ ++ takePrefix ev n) ++ [ev n] = tr₀ ++ takePrefix ev (n + 1) := by
+      show (tr₀ ++ takePrefix ev n) ++ [ev n] = tr₀ ++ (takePrefix ev n ++ [ev n])
+      rw [List.append_assoc]
+    have h_inv_n : spec.inv (q n) (tr₀ ++ takePrefix ev n) := by
+      cases n with
+      | zero => simpa [hq0] using hi₀
+      | succ m =>
+        have hsm := (hsteps m).2
+        have h_tr_m : (tr₀ ++ takePrefix ev m) ++ [ev m] = tr₀ ++ takePrefix ev (m + 1) := by
+          show (tr₀ ++ takePrefix ev m) ++ [ev m] = tr₀ ++ (takePrefix ev m ++ [ev m])
+          rw [List.append_assoc]
+        rwa [h_tr_m] at hsm
+    exact ⟨h_inv_n, h_tr_n ▸ h_step_n.1⟩
+
+/-- Lift stateless `FairBuchiSat` to `spec.toTrace`. -/
+theorem FairBuchiSat.toTrace {QState : Type u} {E : Effect.{u}} {R : Type u}
+    {spec : BuchiSpec PUnit.{u + 1} QState E R}
+    {fair : QState → (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → QState → Prop}
+    {t : ITree E R} {q₀ : QState} (tr₀ : List (Event E))
+    (h : FairBuchiSat spec fair t q₀ PUnit.unit) :
+    FairBuchiSat spec.toTrace (fun q i o _ _ q' => fair q i o PUnit.unit PUnit.unit q')
+      t q₀ tr₀ := by
+  have ⟨hi, hfi⟩ := (fairBuchiSat_iff_fairInfOften spec fair t q₀ PUnit.unit).1 h
+  let fairT : QState → (i : E.I) → E.O i → List (Event E) → List (Event E) → QState → Prop :=
+    fun q i o _ _ q' => fair q i o PUnit.unit PUnit.unit q'
+  refine (fairBuchiSat_iff_fairInfOften spec.toTrace fairT t q₀ tr₀).2 ⟨hi, ?_⟩
+  let X := fun x (qs : QState × List (Event E)) =>
+    FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair) spec.terminalPost
+      x (qs.1, PUnit.unit)
+  refine FairInfOften.coinduct X ?_ hfi
+  intro x qs hx
+  dsimp only [X] at hx
+  rw [FairInfOften.unfold_eq] at hx
+  refine fairProgress.induct
+    (fun y qp => ∀ tr, fairProgress spec.toTrace.monitorWP spec.toTrace.acceptEdge
+      (spec.toTrace.fairEdge fairT) spec.toTrace.terminalPost X y (qp.1, tr))
+    ?_ hx qs.2
+  intro y qp hy tr
+  rw [fairProgress.unfold_eq]
+  let Z := fun z (qs' : QState × List (Event E)) =>
+    fairStall spec.monitorWP spec.acceptEdge (spec.fairEdge fair) spec.terminalPost
+      (FairInfOften spec.monitorWP spec.acceptEdge (spec.fairEdge fair) spec.terminalPost)
+      (fun v qp' => ∀ tr', fairProgress spec.toTrace.monitorWP spec.toTrace.acceptEdge
+        (spec.toTrace.fairEdge fairT) spec.toTrace.terminalPost X v (qp'.1, tr'))
+      z (qs'.1, PUnit.unit)
+  refine fairStall.coinduct Z ?_ hy
+  intro z qs' hz
+  dsimp only [Z] at hz
+  rw [fairStall.unfold_eq] at hz
+  refine fairStep.induct
+    (fun w qp' => ∀ tr', fairStep spec.toTrace.monitorWP spec.toTrace.acceptEdge
+      (spec.toTrace.fairEdge fairT) spec.toTrace.terminalPost X
+      (fairProgress spec.toTrace.monitorWP spec.toTrace.acceptEdge
+        (spec.toTrace.fairEdge fairT) spec.toTrace.terminalPost X)
+      Z w (qp'.1, tr')) ?_ hz qs'.2
+  intro w qp' hw tr'
+  rw [fairStep.unfold_eq]
+  cases h_obs : w.observe <;> simp only [h_obs] at hw ⊢
+  · exact hw
+  · exact hw tr'
+  · exact spec.ewp.mono (fun _ _ ⟨q', hs, hi', hp⟩ =>
+      ⟨q', hs, hi', hp.imp id (Or.imp (And.imp id (fun hpre => hpre _)) id)⟩) hw
+
+/--
+**Deterministic-monitor `FairBuchiSat` `EnvStrategy` adequacy (`PureSoundWP`)**.
+-/
+theorem pure_fairBuchiSat_det_strategy_adequacy {QState : Type u}
+    {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (spec : BuchiSpec PUnit.{u + 1} QState E R) [PureSoundWP spec.ewp]
+    (fair : QState → (i : E.I) → E.O i → PUnit.{u + 1} → PUnit.{u + 1} → QState → Prop)
+    (h_det : ∀ q i o q₁ q₂,
+      spec.step q i o PUnit.unit PUnit.unit q₁ →
+      spec.step q i o PUnit.unit PUnit.unit q₂ → q₁ = q₂)
+    {t : ITree E R} {q₀ : QState}
+    (h : FairBuchiSat spec fair t q₀ PUnit.unit)
+    (σ : EnvStrategy E) (tr₀ : List (Event E) := []) :
+    (∃ tr r q', RetWithStrategy σ tr₀ t tr r ∧
+        spec.inv q' PUnit.unit ∧ spec.terminal q' r PUnit.unit) ∨
+      (∃ (ev : Stream' (Event E)) (q : Stream' QState),
+        InfRunWithStrategy σ tr₀ t ev ∧ q 0 = q₀ ∧
+        (∀ n, spec.inv (q n) PUnit.unit ∧
+          spec.step (q n) (ev n).req (ev n).ans PUnit.unit PUnit.unit (q (n + 1))) ∧
+        ((∀ k, ∃ n, k ≤ n ∧
+            fair (q n) (ev n).req (ev n).ans PUnit.unit PUnit.unit (q (n + 1))) →
+          (∀ k, ∃ n, k ≤ n ∧
+            spec.accept (q n) (ev n).req (ev n).ans PUnit.unit PUnit.unit (q (n + 1))))) :=
+  trace_fairBuchiSat_det_strategy_adequacy spec.toTrace
+    (fun q i o _ _ q' => fair q i o PUnit.unit PUnit.unit q')
+    (fun q i o _ _ q₁ q₂ h₁ h₂ => h_det q i o q₁ q₂ h₁ h₂)
+    (FairBuchiSat.toTrace tr₀ h) σ
+
+private inductive MonitorSeg {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    (spec : BuchiSpec (List (Event E)) QState E R) (σ : EnvStrategy E) :
+    List (Event E) → ITree E R → QState →
+      List (Event E × QState) → ITree E R → QState → Prop where
+  | single {hist u v i k q q'} (hts : TauStar u v)
+      (hv : v.observe = .vis i k) (hnf : ¬ FaultEffect.isFault i)
+      (hinv : spec.inv q' (hist ++ [⟨i, σ hist i hnf⟩]))
+      (hstep : spec.step q i (σ hist i hnf) hist (hist ++ [⟨i, σ hist i hnf⟩]) q')
+      (hacc : spec.accept q i (σ hist i hnf) hist (hist ++ [⟨i, σ hist i hnf⟩]) q') :
+      MonitorSeg spec σ hist u q [(⟨i, σ hist i hnf⟩, q')] (k (σ hist i hnf)) q'
+  | cons {hist u v i k q q₁ seg u' q'} (hts : TauStar u v)
+      (hv : v.observe = .vis i k) (hnf : ¬ FaultEffect.isFault i)
+      (hinv : spec.inv q₁ (hist ++ [⟨i, σ hist i hnf⟩]))
+      (hstep : spec.step q i (σ hist i hnf) hist (hist ++ [⟨i, σ hist i hnf⟩]) q₁)
+      (hrest : MonitorSeg spec σ (hist ++ [⟨i, σ hist i hnf⟩])
+        (k (σ hist i hnf)) q₁ seg u' q') :
+      MonitorSeg spec σ hist u q ((⟨i, σ hist i hnf⟩, q₁) :: seg) u' q'
+
+private theorem MonitorSeg.nonempty {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    0 < seg.length := by
+  cases h <;> simp
+
+private theorem MonitorSeg.reaches_end {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    ReachesWithStrategy σ hist u (seg.map Prod.fst) u' := by
+  induction h with
+  | single hts hv hnf _ _ _ =>
+    exact reachesWithStrategy_of_tauStar hts (.vis hv hnf (.refl _ _))
+  | cons hts hv hnf _ _ _ ih =>
+    exact reachesWithStrategy_of_tauStar hts (.vis hv hnf ih)
+
+private theorem MonitorSeg.reaches_pref {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    ∀ j, j ≤ seg.length →
+      ∃ u_j, ReachesWithStrategy σ hist u ((seg.take j).map Prod.fst) u_j := by
+  induction h with
+  | single hts hv hnf _ _ _ =>
+    intro j hj
+    cases j with
+    | zero => exact ⟨_, .refl _ _⟩
+    | succ j' =>
+      have hj0 : j' = 0 := by simp at hj; omega
+      subst hj0
+      exact ⟨_, reachesWithStrategy_of_tauStar hts (.vis hv hnf (.refl _ _))⟩
+  | cons hts hv hnf _ _ _ ih =>
+    intro j hj
+    cases j with
+    | zero => exact ⟨_, .refl _ _⟩
+    | succ j' =>
+      obtain ⟨u_j, hu⟩ := ih j' (Nat.le_of_succ_le_succ hj)
+      exact ⟨u_j, reachesWithStrategy_of_tauStar hts (.vis hv hnf hu)⟩
+
+private theorem MonitorSeg.last_q {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    (seg[seg.length - 1]'(Nat.sub_lt h.nonempty Nat.zero_lt_one)).2 = q' := by
+  induction h with
+  | single => rfl
+  | cons _ _ _ _ _ hrest ih =>
+    cases hrest <;> exact ih
+
+private theorem MonitorSeg.step_at {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    ∀ (j : Nat) (hj : j < seg.length),
+      let prevQ := if _ : j = 0 then q else (seg[j - 1]'(by omega)).2
+      let pref := hist ++ (seg.take j).map Prod.fst
+      spec.inv (seg[j].2) (pref ++ [seg[j].1]) ∧
+        spec.step prevQ seg[j].1.req seg[j].1.ans pref (pref ++ [seg[j].1]) seg[j].2 := by
+  induction h with
+  | single _ _ _ hinv hstep _ =>
+    intro j hj
+    have hj0 : j = 0 := by simp at hj; omega
+    subst hj0
+    simpa using ⟨hinv, hstep⟩
+  | @cons hist u v i k q q₁ seg u' q' _ _ hnf hinv hstep _ ih =>
+    intro j hj
+    cases j with
+    | zero => simpa using ⟨hinv, hstep⟩
+    | succ j' =>
+      have hj' : j' < seg.length := Nat.lt_of_succ_lt_succ hj
+      have hres := ih j' hj'
+      have h_pref : hist ++ (((⟨i, σ hist i hnf⟩, q₁) :: seg).take (j' + 1)).map Prod.fst =
+          (hist ++ [⟨i, σ hist i hnf⟩]) ++ (seg.take j').map Prod.fst := by
+        simp [List.append_assoc]
+      cases j' with
+      | zero => simpa [h_pref] using hres
+      | succ j'' => simpa [h_pref] using hres
+
+private theorem MonitorSeg.last_accept {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    {spec : BuchiSpec (List (Event E)) QState E R} {σ : EnvStrategy E}
+    {hist u q seg u' q'} (h : MonitorSeg spec σ hist u q seg u' q') :
+    let j := seg.length - 1
+    have hj : j < seg.length := Nat.sub_lt h.nonempty Nat.zero_lt_one
+    let prevQ := if _ : j = 0 then q else (seg[j - 1]'(by omega)).2
+    let pref := hist ++ (seg.take j).map Prod.fst
+    spec.accept prevQ seg[j].1.req seg[j].1.ans pref (pref ++ [seg[j].1]) seg[j].2 := by
+  induction h with
+  | single _ _ _ _ _ hacc => simpa using hacc
+  | @cons hist u v i k q q₁ seg u' q' _ _ hnf _ _ hrest ih =>
+    cases hrest with
+    | single =>
+      dsimp only at ih ⊢
+      simpa [List.append_assoc] using ih
+    | cons _ _ _ _ _ hrest₂ =>
+      cases hrest₂ with
+      | single =>
+        dsimp only at ih ⊢
+        simp only [List.length_cons, List.length_nil, Nat.add_sub_cancel,
+          Nat.succ_ne_zero, ↓reduceDIte, List.take_succ_cons, List.take_zero,
+          List.map_cons, List.map_nil, List.getElem_cons_succ,
+          List.getElem_cons_zero] at ih ⊢
+        simpa [List.append_assoc] using ih
+      | cons =>
+        dsimp only at ih ⊢
+        simp only [List.length_cons, Nat.add_sub_cancel, Nat.succ_ne_zero,
+          ↓reduceDIte, List.take_succ_cons, List.map_cons,
+          List.getElem_cons_succ] at ih ⊢
+        simpa [List.append_assoc] using ih
+
+private structure MonitorAccState {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    (spec : BuchiSpec (List (Event E)) QState E R) (σ : EnvStrategy E)
+    (tr₀ : List (Event E)) (t : ITree E R) (q₀ : QState) (m : Nat) : Type u where
+  acc : List (Event E × QState)
+  u : ITree E R
+  q : QState
+  hlen : m ≤ acc.length
+  hreach_end : ReachesWithStrategy σ tr₀ t (acc.map Prod.fst) u
+  hreach_pref : ∀ j, j ≤ acc.length →
+    ∃ u', ReachesWithStrategy σ tr₀ t ((acc.take j).map Prod.fst) u'
+  hlastQ : (if h : acc.length = 0 then q₀ else (acc[acc.length - 1]'(by omega)).2) = q
+  hinv_end : spec.inv q (tr₀ ++ acc.map Prod.fst)
+  hio : InfOften spec.monitorWP spec.acceptEdge spec.terminalPost u (q, tr₀ ++ acc.map Prod.fst)
+  hstep_all : ∀ (j : Nat) (hj : j < acc.length),
+    let prevQ := if _ : j = 0 then q₀ else (acc[j - 1]'(by omega)).2
+    let pref := tr₀ ++ (acc.take j).map Prod.fst
+    spec.inv (acc[j].2) (pref ++ [acc[j].1]) ∧
+      spec.step prevQ acc[j].1.req acc[j].1.ans pref (pref ++ [acc[j].1]) acc[j].2
+  hacc_all : ∀ k, k < m → ∃ (j : Nat) (hj : j < acc.length), k ≤ j ∧
+    let prevQ := if _ : j = 0 then q₀ else (acc[j - 1]'(by omega)).2
+    let pref := tr₀ ++ (acc.take j).map Prod.fst
+    spec.accept prevQ acc[j].1.req acc[j].1.ans pref (pref ++ [acc[j].1]) acc[j].2
+
+private structure SegChoice {E : Effect.{u}} {R QState : Type u} [FaultEffect E]
+    (spec : BuchiSpec (List (Event E)) QState E R) (σ : EnvStrategy E)
+    (hist : List (Event E)) (u : ITree E R) (q : QState) : Type u where
+  seg : List (Event E × QState)
+  u' : ITree E R
+  q' : QState
+  hseg : MonitorSeg spec σ hist u q seg u' q'
+  hinv' : spec.inv q' (hist ++ seg.map Prod.fst)
+  hio' : InfOften spec.monitorWP spec.acceptEdge spec.terminalPost u'
+    (q', hist ++ seg.map Prod.fst)
+
+/--
+**Arbitrary nondeterministic `BuchiSat` `EnvStrategy` operational soundness
+(`TraceSoundWP`)**: even without monitor determinism, every satisfied `BuchiSat`
+produces against EVERY environment strategy `σ` either a valid terminal return
+or an infinite execution stream `ev` accompanied by an infinite accepting
+monitor run `q : Stream' QState` (complementing `buchiSat_nondet_incomplete`).
+-/
+theorem trace_buchiSat_strategy_adequacy {QState : Type u}
+    {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (spec : BuchiSpec (List (Event E)) QState E R) [h_sound : TraceSoundWP spec.ewp]
+    {t : ITree E R} {q₀ : QState} {tr₀ : List (Event E)}
+    (h : BuchiSat spec t q₀ tr₀) (σ : EnvStrategy E) :
+    (∃ tr r q', RetWithStrategy σ tr₀ t tr r ∧
+        spec.inv q' (tr₀ ++ tr) ∧ spec.terminal q' r (tr₀ ++ tr)) ∨
+      (∃ (ev : Stream' (Event E)) (q : Stream' QState),
+        InfRunWithStrategy σ tr₀ t ev ∧ q 0 = q₀ ∧
+        (∀ n, spec.inv (q n) (tr₀ ++ takePrefix ev n) ∧
+          spec.step (q n) (ev n).req (ev n).ans
+            (tr₀ ++ takePrefix ev n) (tr₀ ++ takePrefix ev (n + 1)) (q (n + 1))) ∧
+        (∀ k, ∃ n, k ≤ n ∧
+          spec.accept (q n) (ev n).req (ev n).ans
+            (tr₀ ++ takePrefix ev n) (tr₀ ++ takePrefix ev (n + 1)) (q (n + 1)))) := by
+  by_cases h_ret : ∃ tr r q', RetWithStrategy σ tr₀ t tr r ∧
+      spec.inv q' (tr₀ ++ tr) ∧ spec.terminal q' r (tr₀ ++ tr)
+  · exact Or.inl h_ret
+  · right
+    have ⟨hi₀, hio₀⟩ := (buchiSat_iff_infOften spec t q₀ tr₀).1 h
+    have h_seg_ne : ∀ (tr : List (Event E)) (u : ITree E R) (q : QState),
+        ReachesWithStrategy σ tr₀ t tr u → spec.inv q (tr₀ ++ tr) →
+        InfOften spec.monitorWP spec.acceptEdge spec.terminalPost u (q, tr₀ ++ tr) →
+        Nonempty (SegChoice spec σ (tr₀ ++ tr) u q) := by
+      intro tr u q hreach hinv hio
+      refine buchiProgress.induct
+        (fun w qs => ∀ tr_w, qs.2 = tr₀ ++ tr_w →
+          ReachesWithStrategy σ tr₀ t tr_w w → spec.inv qs.1 (tr₀ ++ tr_w) →
+          Nonempty (SegChoice spec σ (tr₀ ++ tr_w) w qs.1))
+        ?_ hio.toBuchiProgress tr rfl hreach hinv
+      intro w qs hw tr_w hqs_tr hreach_w hinv_w
+      rcases qs with ⟨q_w, tr_qs⟩
+      dsimp only at hqs_tr hinv_w ⊢
+      subst hqs_tr
+      cases h_obs : w.observe with
+      | ret r =>
+        simp only [h_obs] at hw
+        exact False.elim (h_ret ⟨tr_w, r, q_w, ⟨w, hreach_w, h_obs⟩, hinv_w, hw⟩)
+      | tau w' =>
+        simp only [h_obs] at hw
+        have hreach_w' : ReachesWithStrategy σ tr₀ t tr_w w' := by
+          have hr := reachesWithStrategy_trans hreach_w (.tau h_obs (.refl (tr₀ ++ tr_w) w'))
+          simpa using hr
+        obtain ⟨⟨seg, u', q', hseg, hinv', hio'⟩⟩ := hw tr_w rfl hreach_w' hinv_w
+        have hseg' : MonitorSeg spec σ (tr₀ ++ tr_w) w q_w seg u' q' := by
+          cases hseg with
+          | single hts hv hnf hi hs ha =>
+            exact .single (.step h_obs hts) hv hnf hi hs ha
+          | cons hts hv hnf hi hs hr =>
+            exact .cons (.step h_obs hts) hv hnf hi hs hr
+        exact ⟨⟨seg, u', q', hseg', hinv', hio'⟩⟩
+      | vis i k =>
+        simp only [h_obs] at hw
+        rw [BuchiSpec.monitorWP_wp] at hw
+        obtain ⟨hnf, hall⟩ := h_sound.sound hw
+        let o := σ (tr₀ ++ tr_w) i hnf
+        obtain ⟨q₁, hstep₁, hinv₁, hdisj⟩ := hall o
+        have h_tr₁ : (tr₀ ++ tr_w) ++ [⟨i, o⟩] = tr₀ ++ (tr_w ++ [⟨i, o⟩]) := by
+          rw [List.append_assoc]
+        rcases hdisj with ⟨hacc₁, hio₁⟩ | hpre₁
+        · refine ⟨⟨[(⟨i, o⟩, q₁)], k o, q₁,
+            .single (.refl w) h_obs hnf hinv₁ hstep₁ hacc₁,
+            by simpa using hinv₁, by simpa using hio₁⟩⟩
+        · have hreach₁ : ReachesWithStrategy σ tr₀ t (tr_w ++ [⟨i, o⟩]) (k o) :=
+            reachesWithStrategy_trans hreach_w (.vis h_obs hnf (.refl _ (k o)))
+          obtain ⟨⟨seg, u', q', hseg, hinv', hio'⟩⟩ :=
+            hpre₁ (tr_w ++ [⟨i, o⟩]) h_tr₁ hreach₁ (h_tr₁ ▸ hinv₁)
+          refine ⟨⟨(⟨i, o⟩, q₁) :: seg, u', q',
+            .cons (.refl w) h_obs hnf hinv₁ hstep₁ (h_tr₁ ▸ hseg),
+            by simpa [List.append_assoc] using hinv',
+            by simpa [List.append_assoc] using hio'⟩⟩
+    let st₀ : MonitorAccState spec σ tr₀ t q₀ 0 :=
+      { acc := [], u := t, q := q₀, hlen := Nat.le_refl 0,
+        hreach_end := .refl tr₀ t,
+        hreach_pref := fun j hj => ⟨t, by
+          have hj0 : j = 0 := Nat.le_zero.1 hj; subst hj0; exact .refl tr₀ t⟩,
+        hlastQ := rfl,
+        hinv_end := by simpa using hi₀,
+        hio := by simpa using hio₀,
+        hstep_all := fun _ hj => absurd hj (Nat.not_lt_zero _),
+        hacc_all := fun _ hk => absurd hk (Nat.not_lt_zero _) }
+    let stepSt : ∀ m, MonitorAccState spec σ tr₀ t q₀ m →
+        MonitorAccState spec σ tr₀ t q₀ (m + 1) := fun m st =>
+      let sc := Classical.choice (h_seg_ne (st.acc.map Prod.fst) st.u st.q
+        st.hreach_end st.hinv_end st.hio)
+      have hne : 0 < sc.seg.length := sc.hseg.nonempty
+      { acc := st.acc ++ sc.seg
+        u := sc.u'
+        q := sc.q'
+        hlen := by have := st.hlen; rw [List.length_append]; omega
+        hreach_end := by
+          rw [List.map_append]
+          exact reachesWithStrategy_trans st.hreach_end sc.hseg.reaches_end
+        hreach_pref := fun j hj => by
+          rw [List.length_append] at hj
+          by_cases hle : j ≤ st.acc.length
+          · rw [List.take_append_of_le_length hle]
+            exact st.hreach_pref j hle
+          · have hj' : j - st.acc.length ≤ sc.seg.length := by omega
+            obtain ⟨u_j, hu_j⟩ := sc.hseg.reaches_pref (j - st.acc.length) hj'
+            refine ⟨u_j, ?_⟩
+            rw [List.take_append, List.take_of_length_le (by omega), List.map_append]
+            exact reachesWithStrategy_trans st.hreach_end hu_j
+        hlastQ := by
+          have hne_app : (st.acc ++ sc.seg).length ≠ 0 := by
+            rw [List.length_append]; omega
+          simp only [hne_app, ↓reduceDIte]
+          have h_idx : st.acc.length ≤ (st.acc ++ sc.seg).length - 1 := by
+            rw [List.length_append]; omega
+          rw [List.getElem_append_right h_idx]
+          have h_sub : (st.acc ++ sc.seg).length - 1 - st.acc.length = sc.seg.length - 1 := by
+            rw [List.length_append]; omega
+          simp only [h_sub]
+          exact sc.hseg.last_q
+        hinv_end := by simpa [List.map_append, List.append_assoc] using sc.hinv'
+        hio := by simpa [List.map_append, List.append_assoc] using sc.hio'
+        hstep_all := fun j hj => by
+          by_cases hlt : j < st.acc.length
+          · have hst_j := st.hstep_all j hlt
+            have h_take : (st.acc ++ sc.seg).take j = st.acc.take j :=
+              List.take_append_of_le_length (Nat.le_of_lt hlt)
+            have h_el : (st.acc ++ sc.seg)[j] = st.acc[j] :=
+              List.getElem_append_left hlt
+            by_cases h0 : j = 0
+            · dsimp only at hst_j ⊢
+              rw [h_take, h_el]
+              simp only [h0, ↓reduceDIte] at hst_j ⊢
+              exact hst_j
+            · have h_prev : (st.acc ++ sc.seg)[j - 1]'(by omega) =
+                  st.acc[j - 1]'(by omega) := List.getElem_append_left (by omega)
+              dsimp only at hst_j ⊢
+              simp only [h0, ↓reduceDIte] at hst_j ⊢
+              rw [h_take, h_el, h_prev]; exact hst_j
+          · have hge : st.acc.length ≤ j := Nat.le_of_not_lt hlt
+            have hj' : j - st.acc.length < sc.seg.length := by
+              rw [List.length_append] at hj; omega
+            have hseg_j := sc.hseg.step_at (j - st.acc.length) hj'
+            have h_take : ((st.acc ++ sc.seg).take j).map Prod.fst =
+                st.acc.map Prod.fst ++ (sc.seg.take (j - st.acc.length)).map Prod.fst := by
+              rw [List.take_append, List.take_of_length_le hge, List.map_append]
+            have h_el : (st.acc ++ sc.seg)[j] = sc.seg[j - st.acc.length] :=
+              List.getElem_append_right hge
+            by_cases heq : j = st.acc.length
+            · subst heq
+              have h_prevQ : (if _ : st.acc.length = 0 then q₀
+                  else ((st.acc ++ sc.seg)[st.acc.length - 1]'(by omega)).2) = st.q := by
+                by_cases h0 : st.acc.length = 0
+                · simp only [h0, ↓reduceDIte]
+                  simpa [h0] using st.hlastQ
+                · simp only [h0, ↓reduceDIte]
+                  rw [List.getElem_append_left (by omega)]
+                  simpa [h0] using st.hlastQ
+              dsimp only at hseg_j ⊢
+              simp only [Nat.sub_self, ↓reduceDIte] at hseg_j
+              rw [h_take, h_el, h_prevQ]
+              simp only [Nat.sub_self, List.append_assoc] at hseg_j ⊢
+              exact hseg_j
+            · have h0 : j ≠ 0 := by omega
+              have h_sub_ne : j - st.acc.length ≠ 0 := by omega
+              have h_prev : (st.acc ++ sc.seg)[j - 1]'(by omega) =
+                  sc.seg[j - st.acc.length - 1]'(by omega) := by
+                rw [List.getElem_append_right (by omega)]
+                congr 1; omega
+              dsimp only at hseg_j ⊢
+              simp only [h0, h_sub_ne, ↓reduceDIte] at hseg_j ⊢
+              rw [h_take, h_el, h_prev]
+              simp only [List.append_assoc] at hseg_j ⊢
+              exact hseg_j
+        hacc_all := fun k hk => by
+          by_cases hkm : k < m
+          · obtain ⟨j, hj, hkj, hacc_j⟩ := st.hacc_all k hkm
+            refine ⟨j, Nat.lt_of_lt_of_le hj (by rw [List.length_append]; omega), hkj, ?_⟩
+            have h_take : (st.acc ++ sc.seg).take j = st.acc.take j :=
+              List.take_append_of_le_length (Nat.le_of_lt hj)
+            have h_el : (st.acc ++ sc.seg)[j]'(by rw [List.length_append]; omega) =
+                st.acc[j] := List.getElem_append_left hj
+            by_cases h0 : j = 0
+            · dsimp only at hacc_j ⊢
+              rw [h_take, h_el]
+              simp only [h0, ↓reduceDIte] at hacc_j ⊢
+              exact hacc_j
+            · have h_prev : (st.acc ++ sc.seg)[j - 1]'(by rw [List.length_append]; omega) =
+                  st.acc[j - 1]'(by omega) := List.getElem_append_left (by omega)
+              dsimp only at hacc_j ⊢
+              simp only [h0, ↓reduceDIte] at hacc_j ⊢
+              rw [h_take, h_el, h_prev]; exact hacc_j
+          · have h_eq_m : k = m := by omega
+            subst h_eq_m
+            let j := st.acc.length + (sc.seg.length - 1)
+            have hj : j < (st.acc ++ sc.seg).length := by rw [List.length_append]; omega
+            refine ⟨j, hj, by have := st.hlen; omega, ?_⟩
+            have hlast := sc.hseg.last_accept
+            have hge : st.acc.length ≤ j := Nat.le_add_right _ _
+            have h_sub : j - st.acc.length = sc.seg.length - 1 := by omega
+            have h_take : ((st.acc ++ sc.seg).take j).map Prod.fst =
+                st.acc.map Prod.fst ++ (sc.seg.take (sc.seg.length - 1)).map Prod.fst := by
+              rw [List.take_append, List.take_of_length_le hge, h_sub, List.map_append]
+            have h_el : (st.acc ++ sc.seg)[j] = sc.seg[sc.seg.length - 1]'(by omega) := by
+              rw [List.getElem_append_right hge]; simp [h_sub]
+            by_cases heq : sc.seg.length - 1 = 0
+            · have h_prevQ : (if _ : j = 0 then q₀
+                  else ((st.acc ++ sc.seg)[j - 1]'(by omega)).2) = st.q := by
+                by_cases h0 : j = 0
+                · have hlen0 : st.acc.length = 0 := by omega
+                  simp only [h0, ↓reduceDIte]
+                  simpa [hlen0] using st.hlastQ
+                · have hlen_ne : st.acc.length ≠ 0 := by omega
+                  have h_j1 : j - 1 = st.acc.length - 1 := by omega
+                  simp only [h0, ↓reduceDIte]
+                  rw [List.getElem_append_left (by omega)]
+                  have h_lq : (st.acc[st.acc.length - 1]'(by omega)).2 = st.q := by
+                    simpa [hlen_ne] using st.hlastQ
+                  simpa [h_j1] using h_lq
+              dsimp only at hlast ⊢
+              simp only [heq, ↓reduceDIte] at hlast
+              rw [h_take, h_el, h_prevQ]
+              simp only [heq, List.append_assoc] at hlast ⊢
+              exact hlast
+            · have h0 : j ≠ 0 := by omega
+              have h_prev : (st.acc ++ sc.seg)[j - 1]'(by omega) =
+                  sc.seg[sc.seg.length - 1 - 1]'(by omega) := by
+                rw [List.getElem_append_right (by omega)]
+                congr 1; omega
+              dsimp only at hlast ⊢
+              simp only [h0, heq, ↓reduceDIte] at hlast ⊢
+              rw [h_take, h_el, h_prev]
+              simp only [List.append_assoc] at hlast ⊢
+              exact hlast }
+    let st : (m : Nat) → MonitorAccState spec σ tr₀ t q₀ m :=
+      Nat.rec st₀ stepSt
+    have h_ext_step : ∀ m, ∃ s, (st (m + 1)).acc = (st m).acc ++ s := fun m =>
+      ⟨_, rfl⟩
+    have h_ext : ∀ m₁ m₂, m₁ ≤ m₂ → ∃ s, (st m₂).acc = (st m₁).acc ++ s := by
+      intro m₁ m₂ hle
+      obtain ⟨d, rfl⟩ := Nat.exists_eq_add_of_le hle
+      clear hle
+      induction d with
+      | zero => exact ⟨[], by simp⟩
+      | succ d ih =>
+        obtain ⟨s₁, hs₁⟩ := ih
+        obtain ⟨s₂, hs₂⟩ := h_ext_step (m₁ + d)
+        exact ⟨s₁ ++ s₂, by rw [← Nat.add_assoc, hs₂, hs₁, List.append_assoc]⟩
+    let ev : Stream' (Event E) := fun n =>
+      ((st (n + 1)).acc[n]'(Nat.lt_of_lt_of_le (Nat.lt_succ_self n) (st (n + 1)).hlen)).1
+    let q : Stream' QState := fun n =>
+      match n with
+      | 0 => q₀
+      | m + 1 =>
+        ((st (m + 1)).acc[m]'(Nat.lt_of_lt_of_le (Nat.lt_succ_self m) (st (m + 1)).hlen)).2
+    have h_el_eq : ∀ {m j} (hj : j < (st m).acc.length),
+        (st m).acc[j] = (ev j, q (j + 1)) := by
+      intro m j hj
+      have hj' : j < (st (j + 1)).acc.length :=
+        Nat.lt_of_lt_of_le (Nat.lt_succ_self j) (st (j + 1)).hlen
+      by_cases hle : j + 1 ≤ m
+      · obtain ⟨s, hs⟩ := h_ext (j + 1) m hle
+        have h_at : (st m).acc[j] = (st (j + 1)).acc[j] := by
+          have : ((st (j + 1)).acc ++ s)[j]'(by rw [← hs]; exact hj) =
+              (st (j + 1)).acc[j] := List.getElem_append_left hj'
+          simpa [hs] using this
+        rw [h_at]
+      · obtain ⟨s, hs⟩ := h_ext m (j + 1) (by omega)
+        have h_at : (st (j + 1)).acc[j] = (st m).acc[j] := by
+          have : ((st m).acc ++ s)[j]'(by rw [← hs]; exact hj') = (st m).acc[j] :=
+            List.getElem_append_left hj
+          simpa [hs] using this
+        have h_eta : (st m).acc[j] = ((st m).acc[j].1, (st m).acc[j].2) := rfl
+        rw [h_eta, ← h_at]
+    have h_take_eq : ∀ m j, j ≤ (st m).acc.length →
+        ((st m).acc.take j).map Prod.fst = takePrefix ev j := by
+      intro m j
+      induction j with
+      | zero => intro _; rfl
+      | succ j ih =>
+        intro hj
+        have h_take_succ : (st m).acc.take (j + 1) =
+            (st m).acc.take j ++ [(st m).acc[j]'(Nat.lt_of_succ_le hj)] :=
+          List.take_succ_eq_append_getElem (Nat.lt_of_succ_le hj)
+        rw [h_take_succ, List.map_append, ih (Nat.le_of_succ_le hj)]
+        have h_ev := congrArg Prod.fst (h_el_eq (Nat.lt_of_succ_le hj))
+        simp [h_ev]
+    refine ⟨ev, q, fun n => ?_, rfl, fun n => ?_, fun k => ?_⟩
+    · obtain ⟨u_n, hu_n⟩ := (st n).hreach_pref n (st n).hlen
+      exact ⟨u_n, h_take_eq n n (st n).hlen ▸ hu_n⟩
+    · have hn : n < (st (n + 1)).acc.length :=
+        Nat.lt_of_lt_of_le (Nat.lt_succ_self n) (st (n + 1)).hlen
+      have hst_n := (st (n + 1)).hstep_all n hn
+      have h_take_n := h_take_eq (n + 1) n (Nat.le_of_lt hn)
+      have h_el_n := h_el_eq hn
+      have h_prev : (if _ : n = 0 then q₀ else ((st (n + 1)).acc[n - 1]'(by omega)).2) = q n := by
+        cases n with
+        | zero => rfl
+        | succ m =>
+          simp only [Nat.succ_ne_zero, ↓reduceDIte, Nat.add_sub_cancel]
+          exact congrArg Prod.snd (h_el_eq (Nat.lt_trans (Nat.lt_succ_self m) hn))
+      have h_tr_next : (tr₀ ++ takePrefix ev n) ++ [ev n] = tr₀ ++ takePrefix ev (n + 1) := by
+        show (tr₀ ++ takePrefix ev n) ++ [ev n] = tr₀ ++ (takePrefix ev n ++ [ev n])
+        rw [List.append_assoc]
+      have h_inv_n : spec.inv (q n) (tr₀ ++ takePrefix ev n) := by
+        cases n with
+        | zero => simpa [q] using hi₀
+        | succ m =>
+          have hm : m < (st (m + 1)).acc.length :=
+            Nat.lt_of_lt_of_le (Nat.lt_succ_self m) (st (m + 1)).hlen
+          have h_m := ((st (m + 1)).hstep_all m hm).1
+          have h_tm := h_take_eq (m + 1) m (Nat.le_of_lt hm)
+          have h_em := h_el_eq hm
+          have h_tr_m : (tr₀ ++ takePrefix ev m) ++ [ev m] = tr₀ ++ takePrefix ev (m + 1) := by
+            show (tr₀ ++ takePrefix ev m) ++ [ev m] = tr₀ ++ (takePrefix ev m ++ [ev m])
+            rw [List.append_assoc]
+          rw [h_tm, h_em, h_tr_m] at h_m
+          exact h_m
+      dsimp only at hst_n
+      rw [h_take_n, h_el_n, h_prev, h_tr_next] at hst_n
+      exact ⟨h_inv_n, hst_n.2⟩
+    · obtain ⟨j, hj, hkj, hacc_j⟩ := (st (k + 1)).hacc_all k (Nat.lt_succ_self k)
+      have h_take_j := h_take_eq (k + 1) j (Nat.le_of_lt hj)
+      have h_el_j := h_el_eq hj
+      have h_prev : (if _ : j = 0 then q₀ else ((st (k + 1)).acc[j - 1]'(by omega)).2) = q j := by
+        cases j with
+        | zero => rfl
+        | succ m =>
+          simp only [Nat.succ_ne_zero, ↓reduceDIte, Nat.add_sub_cancel]
+          exact congrArg Prod.snd (h_el_eq (Nat.lt_trans (Nat.lt_succ_self m) hj))
+      have h_tr_next : (tr₀ ++ takePrefix ev j) ++ [ev j] = tr₀ ++ takePrefix ev (j + 1) := by
+        show (tr₀ ++ takePrefix ev j) ++ [ev j] = tr₀ ++ (takePrefix ev j ++ [ev j])
+        rw [List.append_assoc]
+      dsimp only at hacc_j
+      rw [h_take_j, h_el_j, h_prev, h_tr_next] at hacc_j
+      exact ⟨j, hkj, hacc_j⟩
+
+/-- Lift stateless `BuchiSat` over `[PureSoundWP spec.ewp]` to `spec.toTrace`. -/
+theorem BuchiSat.toTrace {QState : Type u} {E : Effect.{u}} {R : Type u}
+    {spec : BuchiSpec PUnit.{u + 1} QState E R}
+    {t : ITree E R} {q₀ : QState} (tr₀ : List (Event E))
+    (h : BuchiSat spec t q₀ PUnit.unit) :
+    BuchiSat spec.toTrace t q₀ tr₀ := by
+  have ⟨hi, hio⟩ := (buchiSat_iff_infOften spec t q₀ PUnit.unit).1 h
+  refine (buchiSat_iff_infOften spec.toTrace t q₀ tr₀).2 ⟨hi, ?_⟩
+  let X := fun x (qs : QState × List (Event E)) =>
+    InfOften spec.monitorWP spec.acceptEdge spec.terminalPost x (qs.1, PUnit.unit)
+  refine InfOften.coinduct X ?_ hio
+  intro x qs hx
+  dsimp only [X] at hx
+  refine buchiProgress.induct
+    (fun y qp => ∀ tr, buchiProgress spec.toTrace.monitorWP spec.toTrace.acceptEdge
+      spec.toTrace.terminalPost X y (qp.1, tr)) ?_ hx.toBuchiProgress qs.2
+  intro y qp hy tr
+  rw [buchiProgress.unfold_eq]
+  cases h_obs : y.observe <;> simp only [h_obs] at hy ⊢
+  · exact hy
+  · exact hy tr
+  · exact spec.ewp.mono (fun _ _ ⟨q', hs, hi', hp⟩ =>
+      ⟨q', hs, hi', hp.imp id (fun hpre => hpre _)⟩) hy
+
+/--
+**Arbitrary nondeterministic `BuchiSat` `EnvStrategy` operational soundness
+(`PureSoundWP`)**.
+-/
+theorem pure_buchiSat_strategy_adequacy {QState : Type u}
+    {E : Effect.{u}} {R : Type u} [FaultEffect E]
+    (spec : BuchiSpec PUnit.{u + 1} QState E R) [PureSoundWP spec.ewp]
+    {t : ITree E R} {q₀ : QState} (h : BuchiSat spec t q₀ PUnit.unit)
+    (σ : EnvStrategy E) (tr₀ : List (Event E) := []) :
+    (∃ tr r q', RetWithStrategy σ tr₀ t tr r ∧
+        spec.inv q' PUnit.unit ∧ spec.terminal q' r PUnit.unit) ∨
+      (∃ (ev : Stream' (Event E)) (q : Stream' QState),
+        InfRunWithStrategy σ tr₀ t ev ∧ q 0 = q₀ ∧
+        (∀ n, spec.inv (q n) PUnit.unit ∧
+          spec.step (q n) (ev n).req (ev n).ans PUnit.unit PUnit.unit (q (n + 1))) ∧
+        (∀ k, ∃ n, k ≤ n ∧
+          spec.accept (q n) (ev n).req (ev n).ans PUnit.unit PUnit.unit (q (n + 1)))) :=
+  trace_buchiSat_strategy_adequacy spec.toTrace (BuchiSat.toTrace tr₀ h) σ
+
+end StrategyAdequacy
 
 /-! #### Completeness Boundary of `BuchiSat` for Nondeterministic Monitors -/
 
@@ -9401,6 +11931,85 @@ theorem infOften_iter_not_chain_continuous {ewp : StateEffectWP S E}
    fun n => not_infOften_iterChain_divergingLoop body LInv h_term Q n h_init,
    not_dwp_diverging_loop body init⟩
 
+/--
+Under conjunctivity and excluded miracle, a tree that terminates with `P`
+cannot satisfy `FairInfOften` (hence also `CoBuchi`) with a postcondition
+disjoint from `P`.
+-/
+theorem not_fairInfOften_of_dwp_disjoint {ewp : StateEffectWP S E}
+    [h_conj : StateEffectWP.Conjunctive ewp]
+    [h_em : StateEffectWP.ExcludedMiracle ewp]
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop} {P Q : R → S → Prop}
+    (h_dis : ∀ r s', P r s' → ¬ Q r s') {t : ITree E R} {s : S}
+    (h : DWP ewp t P s) : ¬ FairInfOften ewp AccEdge Fair Q t s := by
+  refine DWP.induct (fun x s₀ => ¬ FairInfOften ewp AccEdge Fair Q x s₀) ?_ h
+  intro x s₀ hx hfi
+  cases h_obs : x.observe with
+  | ret r =>
+    simp only [h_obs] at hx
+    rw [eq_ret_of_observe h_obs, FairInfOften.ret_iff] at hfi
+    exact h_dis r s₀ hx hfi
+  | tau x' =>
+    simp only [h_obs] at hx
+    rw [eq_tau_of_observe h_obs, FairInfOften.tau_iff] at hfi
+    exact hx hfi
+  | vis i k =>
+    simp only [h_obs] at hx
+    rw [eq_vis_of_observe h_obs, FairInfOften.vis_iff] at hfi
+    exact h_em.no_miracle
+      (ewp.mono (fun _ _ hp => hp.1 hp.2) (h_conj.conj hx hfi))
+
+/--
+Every finite unfolding of a diverging loop with terminating iterations ends in
+`ITree.spin` and therefore **fails** `FairInfOften` (and `CoBuchi`), for every
+`(AccEdge, Fair)`.
+-/
+theorem not_fairInfOften_iterChain_divergingLoop {ewp : StateEffectWP S E}
+    [StateEffectWP.Conjunctive ewp] [StateEffectWP.ExcludedMiracle ewp]
+    {AccEdge Fair : (i : E.I) → E.O i → S → S → Prop}
+    (body : I → ITree E I) (LInv : I → S → Prop)
+    (h_term : ∀ a s₀, LInv a s₀ → DWP ewp (body a) LInv s₀)
+    (Q : R → S → Prop) :
+    ∀ (n : Nat) {init : I} {s : S}, LInv init s →
+      ¬ FairInfOften ewp AccEdge Fair Q
+        (iterChain n (fun a => (Sum.inl <$> body a : ITree E (I ⊕ R))) init) s
+  | 0, _, _, _ => not_fairInfOften_spin
+  | n + 1, init, s, h_init => by
+    have h_eq : (Sum.inl <$> body init : ITree E (I ⊕ R)) =
+        (body init >>= fun a => ITree.ret (Sum.inl a)) := rfl
+    rw [iterChain_succ, FairInfOften.bind_iff, h_eq, FairInfOften.bind_iff]
+    refine not_fairInfOften_of_dwp_disjoint ?_ (h_term init s h_init)
+    intro a s' ha hfi
+    rw [FairInfOften.ret_iff] at hfi
+    exact not_fairInfOften_iterChain_divergingLoop body LInv h_term Q n ha
+      ((FairInfOften.tau_iff _ _ _ _ _ _).1 hfi)
+
+/--
+**`FairInfOften` is neither $\bigwedge_n$ nor $\bigvee_n$ chain-continuous.**
+The fair reactive CAS service loop satisfies `FairInfOften` while failing on
+*every* finite unfolding `iterChain n`.
+-/
+theorem fairService_not_chain_continuous (Q : PEmpty.{1} → PUnit.{1} → Prop) :
+    FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+        (divergingLoop fairServiceBody PUnit.unit) PUnit.unit ∧
+      (∀ n, ¬ FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+        (iterChain n (fun a => Sum.inl <$> fairServiceBody a) PUnit.unit) PUnit.unit) ∧
+      ¬ (FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+            (divergingLoop fairServiceBody PUnit.unit) PUnit.unit ↔
+          ∀ n, FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+            (iterChain n (fun a => Sum.inl <$> fairServiceBody a) PUnit.unit) PUnit.unit) ∧
+      ¬ (FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+            (divergingLoop fairServiceBody PUnit.unit) PUnit.unit ↔
+          ∃ n, FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+            (iterChain n (fun a => Sum.inl <$> fairServiceBody a) PUnit.unit) PUnit.unit) := by
+  have h_yes := (fairService_strict_separation Q).2.1
+  have h_no : ∀ n, ¬ FairInfOften (pickWP PUnit.{1} Bool) casFair casFair Q
+      (iterChain n (fun a => Sum.inl <$> fairServiceBody a) PUnit.unit) PUnit.unit := fun n =>
+    not_fairInfOften_iterChain_divergingLoop (ewp := pickWP PUnit.{1} Bool)
+      fairServiceBody (fun _ _ => True)
+      (fun _ _ _ => DWP.vis ⟨⟨true⟩, fun _ => DWP.ret trivial⟩) Q n trivial
+  exact ⟨h_yes, h_no, fun h => h_no 0 (h.1 h_yes 0), fun h => (h.1 h_yes).elim h_no⟩
+
 end IterChain
 
 section Heartbeat
@@ -9462,6 +12071,38 @@ theorem infOften_heartbeat_ne_exists
   fun h =>
     (h.1 (infOften_heartbeat_not_chain_continuous Q).1).elim
       (infOften_heartbeat_not_chain_continuous Q).2.1
+
+/--
+**`CoBuchi` is neither $\bigwedge_n$ nor $\bigvee_n$ chain-continuous.** The
+heartbeat loop satisfies `CoBuchi` (no bad edges) while failing on *every*
+finite unfolding `iterChain n`.
+-/
+theorem coBuchi_heartbeat_not_chain_continuous
+    (Q : PEmpty.{u + 1} → PUnit.{u + 1} → Prop) :
+    CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1}) (fun _ _ _ _ => False) Q
+        (divergingLoop heartbeat PUnit.unit) PUnit.unit ∧
+      (∀ n, ¬ CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1})
+        (fun _ _ _ _ => False) Q
+        (iterChain n (fun a => Sum.inl <$> heartbeat a) PUnit.unit) PUnit.unit) ∧
+      ¬ (CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1}) (fun _ _ _ _ => False) Q
+            (divergingLoop heartbeat PUnit.unit) PUnit.unit ↔
+          ∀ n, CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1})
+            (fun _ _ _ _ => False) Q
+            (iterChain n (fun a => Sum.inl <$> heartbeat a) PUnit.unit) PUnit.unit) ∧
+      ¬ (CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1}) (fun _ _ _ _ => False) Q
+            (divergingLoop heartbeat PUnit.unit) PUnit.unit ↔
+          ∃ n, CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1})
+            (fun _ _ _ _ => False) Q
+            (iterChain n (fun a => Sum.inl <$> heartbeat a) PUnit.unit) PUnit.unit) := by
+  have h_yes : CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1}) (fun _ _ _ _ => False) Q
+      (divergingLoop heartbeat PUnit.unit) PUnit.unit :=
+    (coBuchi_false_iff _ Q _ PUnit.unit).2 (infOften_heartbeat_not_chain_continuous Q).1
+  have h_no : ∀ n, ¬ CoBuchi (obsIgnoreWP PUnit.{u + 1} PUnit.{u + 1})
+      (fun _ _ _ _ => False) Q
+      (iterChain n (fun a => Sum.inl <$> heartbeat a) PUnit.unit) PUnit.unit := fun n =>
+    not_fairInfOften_iterChain_divergingLoop heartbeat (fun _ _ => True)
+      (fun _ _ _ => DWP.vis (DWP.ret trivial)) Q n trivial
+  exact ⟨h_yes, h_no, fun h => h_no 0 (h.1 h_yes 0), fun h => (h.1 h_yes).elim h_no⟩
 
 /--
 A parity Büchi monitor over heartbeats: it flips its bit on every emission and
