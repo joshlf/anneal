@@ -133,6 +133,45 @@ def allowedTheorySyntaxKinds : NameSet :=
 def allowedAttributeNames : List Name :=
   [`simp, `instance, `reducible, `semireducible, `irreducible, `expose]
 
+def allowedTheoryImportAllModules : List Name :=
+  [`Init.Data.Nat.Bitwise.Basic]
+
+def forbiddenPureTermKinds : NameSet := .ofList [
+  ``Lean.includeStr,
+  `Lean.Parser.Term.dbgTrace, `Lean.Parser.Term.idbg,
+  `Lean.Parser.Term.doDbgTrace, `Lean.Parser.Term.doIdbg,
+  `Lean.Parser.Tactic.dbgTrace, `termPrintln!__]
+
+def forbiddenPureIdentifiers : List Name := [
+  `dbgTrace, `dbgTraceVal, `dbgTraceIfShared,
+  `dbgStackTrace, `dbgStackTraceIf, `dbgSleep,
+  `lean_dbg_trace, `lean_dbg_trace_if_shared,
+  `lean_dbg_stack_trace, `lean_dbg_sleep,
+  `loadDynlib, `loadPlugin,
+  `lean_load_dynlib, `lean_load_plugin,
+  `lean_dynlib_load, `lean_dynlib_get, `lean_dynlib_symbol_run_as_init,
+  `includeStr]
+
+def forbiddenPureRootNamespaces : List Name := [
+  `Lake, `IO, `BaseIO, `EIO, `EST, `ST, `Task, `System]
+
+def forbiddenSysUvPrefixes : List Name := [
+  `Init.System, `Std.Internal.UV, `Internal.UV,
+  `Lean.LoadDynlib, `Lean.loadDynlib, `Lean.loadPlugin, `Lean.Dynlib,
+  `Dynlib]
+
+def isForbiddenPureNamespace (n : Name) : Bool :=
+  let u := n.replacePrefix rootNamespace .anonymous
+  let r := u.getRoot
+  forbiddenPureRootNamespaces.contains r ||
+    forbiddenSysUvPrefixes.any fun pre => u == pre || pre.isPrefixOf u
+
+def isForbiddenPureImport (m : Name) : Bool :=
+  let r := m.getRoot
+  r == `Lean || r == `Lake ||
+    m == `Init.System || (`Init.System).isPrefixOf m ||
+    m == `Std.Internal.UV || (`Std.Internal.UV).isPrefixOf m
+
 def isValidSourceIdent (id : Name) : Bool :=
   id.isAnonymous ||
     (!id.hasMacroScopes && id.eraseMacroScopes == id &&
@@ -145,6 +184,39 @@ def isAllowedNestedCommand (k : SyntaxNodeKind) : Bool :=
   allowedCommandKinds.contains k &&
     ![``Parser.Command.namespace, ``Parser.Command.section,
       ``Parser.Command.end, ``Parser.Command.mutual].contains k
+
+def candidateOpenNamespaces (currNs : Name) (openDecls : List OpenDecl)
+    (id : Name) : List Name :=
+  let rec scopeCandidates : Name → List Name
+    | .anonymous => [id.replacePrefix rootNamespace .anonymous]
+    | ns@(.str p _) => (ns ++ id) :: scopeCandidates p
+    | _ => []
+  let openCandidates := openDecls.filterMap fun
+    | OpenDecl.simple ns _ => some (ns ++ id)
+    | _ => none
+  (scopeCandidates currNs ++ openCandidates).eraseDups
+
+def extendOpenDeclsForOpenCmd (currNs : Name) (openDecls : List OpenDecl)
+    (openStx : Syntax) : List OpenDecl :=
+  if !openStx.isOfKind ``Parser.Command.open then
+    openDecls
+  else
+    let openDecl := openStx[1]
+    if !openDecl.isOfKind ``Parser.Command.openSimple then
+      openDecls
+    else
+      openDecl[0].getArgs.foldl (init := openDecls) fun ods idStx =>
+        let id := idStx.getId
+        let hasOpenDecl (ns : Name) : Bool :=
+          ods.any fun
+            | OpenDecl.simple existing _ => existing == ns
+            | _ => false
+        let cands := candidateOpenNamespaces currNs ods id
+        let ods' := cands.foldl (init := ods) fun acc ns =>
+          if hasOpenDecl ns then acc else OpenDecl.simple ns [] :: acc
+        let stripped := id.replacePrefix rootNamespace .anonymous
+        if hasOpenDecl stripped then ods'
+        else OpenDecl.simple stripped [] :: ods'
 
 structure Violation where
   line : Nat
@@ -175,10 +247,11 @@ def isValidSectionHeaderSlot (child : Syntax) : Bool :=
         | .atom _ "@[", .atom _ "expose", .atom _ "]" => true
         | _, _, _ => false))
 
-def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax) : Array String := Id.run do
+def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax)
+    (requirePrelude : Bool := true) : Array String := Id.run do
   let mut errs : Array String := #[]
   if k == ``Parser.Module.header then
-    if (args[1]?.map Syntax.getArgs |>.getD #[]).isEmpty then
+    if requirePrelude && (args[1]?.map Syntax.getArgs |>.getD #[]).isEmpty then
       errs := errs.push "explicit prelude is required"
   else if k == ``Parser.Command.sectionHeader then
     if !args.all isValidSectionHeaderSlot then
@@ -215,22 +288,234 @@ def inspectNodeKind (k : SyntaxNodeKind) (args : Array Syntax) : Array String :=
   return errs
 
 partial def inspectSyntaxFull (fmap : FileMap) (allowedKinds : NameSet) (s : Syntax)
-    (acc : Array Violation) : Array Violation :=
+    (acc : Array Violation) (requirePrelude : Bool := true)
+    (currNs : Name := .anonymous) (openDecls : List OpenDecl := [])
+    (checkPureRefs : Bool := true) : Array Violation :=
   let (ln, col) := posOfSyntax fmap s
   match s with
   | .missing =>
     pushUnique acc { line := ln, column := col, message := "unexpected missing syntax node" }
   | .atom _ _ => acc
   | .ident _ _ val _ =>
-    if isValidSourceIdent val then acc
-    else pushUnique acc { line := ln, column := col, message := s!"invalid source identifier `{val}`" }
+    let acc :=
+      if isValidSourceIdent val then acc
+      else pushUnique acc { line := ln, column := col, message := s!"invalid source identifier `{val}`" }
+    if !checkPureRefs then acc
+    else
+      let isBad (cand : Name) : Bool :=
+        forbiddenPureIdentifiers.contains cand || isForbiddenPureNamespace cand
+      let allCands := val :: candidateOpenNamespaces currNs openDecls val
+      if allCands.any isBad then
+        pushUnique acc { line := ln, column := col, message := s!"disallowed reference `{val}`" }
+      else acc
   | .node _ k args =>
+    let acc :=
+      if forbiddenPureTermKinds.contains k then
+        pushUnique acc { line := ln, column := col, message := s!"disallowed syntax `{k}`" }
+      else acc
     let acc :=
       if k == nullKind || allowedKinds.contains k then acc
       else pushUnique acc { line := ln, column := col, message := s!"unsupported syntax kind `{k}`" }
-    let acc := (inspectNodeKind k args).foldl
+    let acc := (inspectNodeKind k args requirePrelude).foldl
       (fun a msg => pushUnique a { line := ln, column := col, message := msg }) acc
-    args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a) acc
+    if k == ``Parser.Command.in && checkPureRefs && args.size == 3 then
+      let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+      let acc := inspectSyntaxFull fmap allowedKinds args[1]! acc requirePrelude currNs openDecls checkPureRefs
+      let nextOpen := extendOpenDeclsForOpenCmd currNs openDecls args[0]!
+      inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs nextOpen checkPureRefs
+    else if k == ``Parser.Command.mutual && checkPureRefs && args.size == 3 then
+      let acc := inspectSyntaxFull fmap allowedKinds args[0]! acc requirePrelude currNs openDecls checkPureRefs
+      let (acc, _) := args[1]!.getArgs.foldl (init := (acc, openDecls)) fun (a, mutOpen) child =>
+        let a' := inspectSyntaxFull fmap allowedKinds child a requirePrelude currNs mutOpen checkPureRefs
+        (a', extendOpenDeclsForOpenCmd currNs mutOpen child)
+      inspectSyntaxFull fmap allowedKinds args[2]! acc requirePrelude currNs openDecls checkPureRefs
+    else
+      args.foldl (fun a c => inspectSyntaxFull fmap allowedKinds c a requirePrelude currNs openDecls checkPureRefs) acc
+
+def collectScopedExtensionNamespaces (env : Environment) : IO NameSet := do
+  let exts ← scopedEnvExtensionsRef.get
+  let mut acc : NameSet := {}
+  for ext in exts do
+    for (ns, _) in (ext.ext.getState env).scopedEntries.map do
+      acc := acc.insert ns
+  return acc
+
+def collectScopedNamespacePrefixes (scopedNamespaces : NameSet) : NameSet :=
+  let rec insertPrefixes (acc : NameSet) : Name → NameSet
+    | .anonymous => acc
+    | ns@(.str p _) => insertPrefixes (acc.insert ns) p
+    | _ => acc
+  scopedNamespaces.foldl (init := {}) fun acc ns =>
+    match ns with
+    | .str p _ => insertPrefixes acc p
+    | _ => acc
+
+structure ParseScope where
+  header : String
+  currNamespace : Name
+  openDecls : List OpenDecl
+  deriving Inhabited
+
+def nameOfParseScopes : List ParseScope → Nat → Name
+  | _, 0 => .anonymous
+  | [], _ => .anonymous
+  | s :: ss, n + 1 =>
+    if s.header == "" then .anonymous
+    else .str (nameOfParseScopes ss n) s.header
+
+def checkNamespaceAllowed (scopedNamespaces : NameSet) (how : String)
+    (ln col : Nat) (ns : Name) (acc : Array Violation) : Array Violation :=
+  if scopedNamespaces.contains ns then
+    pushUnique acc { line := ln, column := col, message := s!"cannot {how} namespace `{ns}` with scoped syntax or extensions" }
+  else if isForbiddenPureNamespace ns then
+    pushUnique acc { line := ln, column := col, message := s!"cannot {how} forbidden namespace `{ns}`" }
+  else acc
+
+def pushParseScopes (scopedNamespaces : NameSet) (isNewNamespace : Bool)
+    (ln col : Nat) (header : Name) (parserEnv : Environment)
+    (scopes : List ParseScope) (acc : Array Violation) :
+    Environment × List ParseScope × Array Violation :=
+  match header with
+  | .anonymous => (parserEnv, scopes, acc)
+  | .str p seg =>
+    let (parserEnv, scopes, acc) :=
+      pushParseScopes scopedNamespaces isNewNamespace ln col p parserEnv scopes acc
+    let top := scopes.head!
+    let newNs := if isNewNamespace then Name.mkStr top.currNamespace seg else top.currNamespace
+    let acc :=
+      if isNewNamespace then checkNamespaceAllowed scopedNamespaces "enter" ln col newNs acc
+      else acc
+    let parserEnv := parserEnv.registerNamespace newNs
+    let parserEnv := Parser.parserExtension.pushScope parserEnv
+    let newScope : ParseScope := { top with header := seg, currNamespace := newNs }
+    (parserEnv, newScope :: scopes, acc)
+  | _ =>
+    (parserEnv, scopes, pushUnique acc { line := ln, column := col, message := s!"invalid scope name `{header}`" })
+
+def checkDeclNamespacePrefixes (scopedNamespaces : NameSet) (currNs : Name)
+    (ln col : Nat) (id : Name) (parserEnv : Environment) (acc : Array Violation) :
+    Environment × Array Violation :=
+  if (`_root_).isPrefixOf id then
+    (parserEnv, acc)
+  else
+    let rec walkPrefix (ns : Name) (env : Environment) (a : Array Violation) :
+        Name × Environment × Array Violation :=
+      match ns with
+      | .anonymous => (currNs, env, a)
+      | .str p seg =>
+        let (base, env, a) := walkPrefix p env a
+        let full := Name.mkStr base seg
+        let a := checkNamespaceAllowed scopedNamespaces "declare in" ln col full a
+        (full, env.registerNamespace full, a)
+      | _ =>
+        (currNs, env, pushUnique a { line := ln, column := col, message := s!"invalid declaration namespace `{id}`" })
+    match id with
+    | .str .anonymous _ => (parserEnv, acc)
+    | .str pre _ =>
+      let (_, env, a) := walkPrefix pre parserEnv acc
+      (env, a)
+    | _ => (parserEnv, acc)
+
+def declarationIdent? (stx : Syntax) : Option Name :=
+  let decl := stx[1]
+  if decl.getKind == ``Parser.Command.instance then
+    if decl[3].isNone then none else some decl[3][0][0].getId
+  else
+    some decl[1][0].getId
+
+partial def applyCommandScope (fmap : FileMap) (scopedNamespaces scopedPrefixes : NameSet)
+    (parserEnv : Environment) (scopes : List ParseScope) (stx : Syntax)
+    (acc : Array Violation) : Environment × List ParseScope × Array Violation := Id.run do
+  let (ln, col) := posOfSyntax fmap stx
+  let k := stx.getKind
+  if k == ``Parser.Command.namespace then
+    return pushParseScopes scopedNamespaces true ln col stx[1].getId parserEnv scopes acc
+  else if k == ``Parser.Command.section then
+    if stx[2].isNone then
+      let top := scopes.head!
+      let parserEnv := Parser.parserExtension.pushScope parserEnv
+      return (parserEnv, { top with header := "" } :: scopes, acc)
+    else
+      return pushParseScopes scopedNamespaces false ln col stx[2][0].getId parserEnv scopes acc
+  else if k == ``Parser.Command.end then
+    let header? := if stx[1].isNone then none else some stx[1][0].getId
+    let endSize := match header? with
+      | none => 1
+      | some n => n.getNumParts
+    if scopes.length <= 1 then
+      return (parserEnv, scopes, pushUnique acc { line := ln, column := col, message := "unexpected `end` command with no active scope" })
+    let mut bad := acc
+    match header? with
+    | none =>
+      if scopes.head!.header != "" then
+        bad := pushUnique bad { line := ln, column := col, message := s!"missing scope name `{scopes.head!.header}` after `end`" }
+    | some header =>
+      if endSize >= scopes.length then
+        bad := pushUnique bad { line := ln, column := col, message := s!"`end {header}` closes more scopes than are open" }
+      else
+        let expected := nameOfParseScopes scopes endSize
+        if expected != header then
+          bad := pushUnique bad { line := ln, column := col, message := s!"mismatched `end {header}` (expected `{expected}`)" }
+    let dropN := Nat.min endSize (scopes.length - 1)
+    let mut env := parserEnv
+    for _ in [:dropN] do
+      env := Parser.parserExtension.popScope env
+    return (env, scopes.drop dropN, bad)
+  else if k == ``Parser.Command.open then
+    let top := scopes.head!
+    let mut openDecls := top.openDecls
+    let mut bad := acc
+    let openDecl := stx[1]
+    if openDecl.isOfKind ``Parser.Command.openSimple then
+      let hasOpenDecl (ods : List OpenDecl) (ns : Name) : Bool :=
+        ods.any fun
+          | OpenDecl.simple existing _ => existing == ns
+          | _ => false
+      for idStx in openDecl[0].getArgs do
+        let (iln, icol) := posOfSyntax fmap idStx
+        let id := idStx.getId
+        let candidates := candidateOpenNamespaces top.currNamespace openDecls id
+        let mut added := false
+        for ns in candidates do
+          bad := checkNamespaceAllowed scopedNamespaces "open" iln icol ns bad
+          if parserEnv.isNamespace ns || scopedPrefixes.contains ns then
+            if !hasOpenDecl openDecls ns then
+              openDecls := OpenDecl.simple ns [] :: openDecls
+            added := true
+        if !added then
+          let stripped := id.replacePrefix rootNamespace .anonymous
+          bad := checkNamespaceAllowed scopedNamespaces "open" iln icol stripped bad
+          if !hasOpenDecl openDecls stripped then
+            openDecls := OpenDecl.simple stripped [] :: openDecls
+    return (parserEnv, { top with openDecls := openDecls } :: scopes.tail!, bad)
+  else if k == ``Parser.Command.in && stx.getArgs.size == 3 then
+    let top := scopes.head!
+    let tmpEnv := Parser.parserExtension.pushScope parserEnv
+    let (tmpEnv, tmpScopes, bad) :=
+      applyCommandScope fmap scopedNamespaces scopedPrefixes tmpEnv (top :: scopes) stx[0] acc
+    let (tmpEnv, _, bad) :=
+      applyCommandScope fmap scopedNamespaces scopedPrefixes tmpEnv tmpScopes stx[2] bad
+    return (Parser.parserExtension.popScope tmpEnv, scopes, bad)
+  else if k == ``Parser.Command.mutual && stx.getArgs.size == 3 then
+    let top := scopes.head!
+    let mut tmpEnv := Parser.parserExtension.pushScope parserEnv
+    let mut tmpScopes := top :: scopes
+    let mut bad := acc
+    for child in stx[1].getArgs do
+      let (e', sc', b') :=
+        applyCommandScope fmap scopedNamespaces scopedPrefixes tmpEnv tmpScopes child bad
+      tmpEnv := e'
+      tmpScopes := sc'
+      bad := b'
+    return (Parser.parserExtension.popScope tmpEnv, scopes, bad)
+  else if k == ``Parser.Command.declaration then
+    match declarationIdent? stx with
+    | some id =>
+      let (env, bad) := checkDeclNamespacePrefixes scopedNamespaces scopes.head!.currNamespace ln col id parserEnv acc
+      return (env, scopes, bad)
+    | none => return (parserEnv, scopes, acc)
+  else
+    return (parserEnv, scopes, acc)
 
 def foundationModules : Array Name := #[
   `Init.BinderNameHint, `Init.Coe, `Init.Control.Basic, `Init.Control.Do,
@@ -265,27 +550,64 @@ def main (args : List String) : IO Unit := do
   let rawManifest ← IO.FS.readFile manifestPath
   let filesJson ← IO.ofExcept (Json.parse rawManifest)
   let filesArr ← IO.ofExcept filesJson.getArr?
-  let env ← loadFoundationParserEnv
+  let baseEnv ← loadFoundationParserEnv
+  let scopedNamespaces ← collectScopedExtensionNamespaces baseEnv
+  let scopedPrefixes := collectScopedNamespacePrefixes scopedNamespaces
   let mut fileReports : Array Json := #[]
   for item in filesArr do
     let path ← IO.ofExcept item.getStr?
     let txt ← IO.FS.readFile path
     let ictx := mkInputContext txt path
     let (hdr, pstate, msgs) ← parseHeader ictx
-    let mut bad : Array Violation := inspectSyntaxFull ictx.fileMap allowedKinds hdr #[]
+    let mut bad : Array Violation :=
+      inspectSyntaxFull ictx.fileMap allowedKinds hdr.raw #[] (requirePrelude := true) (checkPureRefs := false)
     for m in msgs.toList do
       if m.severity == .error then
         let d ← m.data.toString
         bad := pushUnique bad { line := m.pos.line, column := m.pos.column + 1, message := s!"parseHeader error: {d}" }
+    let (hln, hcol) := posOfSyntax ictx.fileMap hdr.raw
+    let isModule := Elab.HeaderSyntax.isModule hdr
+    let imports := Elab.HeaderSyntax.imports hdr
+    for imp in imports do
+      if imp.isMeta then
+        bad := pushUnique bad { line := hln, column := hcol, message := "import modifiers are unsupported (`meta`)" }
+      if !imp.isExported && !isModule then
+        bad := pushUnique bad { line := hln, column := hcol, message := "non-exported `import` requires `module` header" }
+      if imp.importAll then
+        let allowImportAll :=
+          isModule && role == "theory" && allowedTheoryImportAllModules.contains imp.module
+        if !allowImportAll then
+          bad := pushUnique bad { line := hln, column := hcol, message := s!"unsupported `import all {imp.module}`" }
+      if isForbiddenPureImport imp.module then
+        bad := pushUnique bad { line := hln, column := hcol, message := s!"disallowed sysroot import `{imp.module}`" }
+    let mut parserEnv := baseEnv
+    let mut scopes : List ParseScope :=
+      [{ header := "", currNamespace := .anonymous, openDecls := [] }]
     let mut s := pstate
     repeat
-      let (cmd, s', msgs') := parseCommand ictx { env, options := {} } s {}
+      let top := scopes.head!
+      let pmctx : ParserModuleContext := {
+        env := parserEnv
+        options := {}
+        currNamespace := top.currNamespace
+        openDecls := top.openDecls
+      }
+      let (cmd, s', msgs') := parseCommand ictx pmctx s {}
       for m in msgs'.toList do
         if m.severity == .error then
           let d ← m.data.toString
           bad := pushUnique bad { line := m.pos.line, column := m.pos.column + 1, message := s!"parseCommand error: {d}" }
       if !Parser.isTerminalCommand cmd then
+        if !allowedCommandKinds.contains cmd.getKind then
+          let (cln, ccol) := posOfSyntax ictx.fileMap cmd
+          bad := pushUnique bad { line := cln, column := ccol, message := s!"unsupported command `{cmd.getKind}`" }
         bad := inspectSyntaxFull ictx.fileMap allowedKinds cmd bad
+          (requirePrelude := true) (currNs := top.currNamespace) (openDecls := top.openDecls) (checkPureRefs := true)
+        let (nextEnv, nextScopes, bad') :=
+          applyCommandScope ictx.fileMap scopedNamespaces scopedPrefixes parserEnv scopes cmd bad
+        parserEnv := nextEnv
+        scopes := nextScopes
+        bad := bad'
       if Parser.isTerminalCommand cmd then break
       s := s'
     let vJson := bad.map fun v => Json.mkObj [

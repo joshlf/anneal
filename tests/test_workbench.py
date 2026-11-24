@@ -155,6 +155,31 @@ class PreflightSyntaxCheckTests(unittest.TestCase):
             found = preflight_syntax_check.collect_lean_targets([str(root)])
             self.assertEqual(found, [keep.resolve()])
 
+    def test_pure_ref_and_import_guards_match_trusted_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            clean_mod = root / "CleanMod.lean"
+            clean_mod.write_text(
+                "module\nprelude\npublic import Init.Core\nimport all Init.Data.Nat.Bitwise.Basic\n\n"
+                "public section\nnamespace Demo\npublic theorem ok_rfl : 1 = 1 := by rfl\nend Demo\nend\n",
+                encoding="utf-8",
+            )
+            bad_mod = root / "BadMod.lean"
+            bad_mod.write_text(
+                "prelude\nimport Init.Core\nimport Init.System.FilePath\n\n"
+                "def bad1 (x : Nat) : Nat := dbgTrace \"hi\" (fun _ => x)\n"
+                "open System in\ndef bad2 : Nat := 0\n",
+                encoding="utf-8",
+            )
+            report = preflight_syntax_check.run_syntax_preflight([clean_mod, bad_mod], role="theory")
+            by_name = {pathlib.Path(f["file"]).name: f for f in report["files"]}
+            self.assertTrue(by_name["CleanMod.lean"]["clean"], by_name["CleanMod.lean"]["violations"])
+            self.assertFalse(by_name["BadMod.lean"]["clean"])
+            msgs = "\n".join(v["message"] for v in by_name["BadMod.lean"]["violations"])
+            self.assertIn("Init.System.FilePath", msgs)
+            self.assertIn("dbgTrace", msgs)
+            self.assertIn("System", msgs)
+
 
 if __name__ == "__main__":
     unittest.main()
