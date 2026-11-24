@@ -23213,11 +23213,18 @@ theorem evalCopyNonOverlappingSubplace_window_refines
           (operandPointeeTy localDecls layouts dstOp))
         srcElems dstElems = some elemSize := by rfl)
     (hStride :
+      let effPt := copyEffectivePointee?
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
       Bool.and
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ sl [])
-          (operandPointeeTy localDecls layouts srcOp) srcElems (some elemSize))
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ dl [])
-          (operandPointeeTy localDecls layouts dstOp) dstElems (some elemSize)) = true := by rfl)
+        (copySlicePointeesCompatible
+          (operandPointeeTy localDecls layouts srcOp)
+          (operandPointeeTy localDecls layouts dstOp))
+        (Bool.and
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ sl [])
+            effPt srcElems (some elemSize))
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ dl [])
+            effPt dstElems (some elemSize))) = true := by rfl)
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
       (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
     (hBorrows :
@@ -23455,11 +23462,18 @@ theorem evalStmt_copyNonOverlapping_window_refines
           (operandPointeeTy localDecls layouts dstOp))
         srcElems dstElems = some elemSize := by rfl)
     (hStride :
+      let effPt := copyEffectivePointee?
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
       Bool.and
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals sl [])
-          (operandPointeeTy localDecls layouts srcOp) srcElems (some elemSize))
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals dl [])
-          (operandPointeeTy localDecls layouts dstOp) dstElems (some elemSize)) = true := by rfl)
+        (copySlicePointeesCompatible
+          (operandPointeeTy localDecls layouts srcOp)
+          (operandPointeeTy localDecls layouts dstOp))
+        (Bool.and
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals sl [])
+            effPt srcElems (some elemSize))
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals dl [])
+            effPt dstElems (some elemSize))) = true := by rfl)
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
       (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
     (hBorrows :
@@ -24255,11 +24269,18 @@ theorem evalCopyNonOverlappingSubplace_window_same_or_disjoint_refines
           (operandPointeeTy localDecls layouts dstOp))
         srcElems dstElems = some elemSize := by rfl)
     (hStride :
+      let effPt := copyEffectivePointee?
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
       Bool.and
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ sl [])
-          (operandPointeeTy localDecls layouts srcOp) srcElems (some elemSize))
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ dl [])
-          (operandPointeeTy localDecls layouts dstOp) dstElems (some elemSize)) = true := by rfl)
+        (copySlicePointeesCompatible
+          (operandPointeeTy localDecls layouts srcOp)
+          (operandPointeeTy localDecls layouts dstOp))
+        (Bool.and
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ sl [])
+            effPt srcElems (some elemSize))
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts locals₃ dl [])
+            effPt dstElems (some elemSize))) = true := by rfl)
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
       (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
     (hBorrows :
@@ -24540,11 +24561,18 @@ theorem evalStmt_copyNonOverlapping_window_same_or_disjoint_refines
           (operandPointeeTy localDecls layouts dstOp))
         srcElems dstElems = some elemSize := by rfl)
     (hStride :
+      let effPt := copyEffectivePointee?
+        (operandPointeeTy localDecls layouts srcOp)
+        (operandPointeeTy localDecls layouts dstOp)
       Bool.and
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals sl [])
-          (operandPointeeTy localDecls layouts srcOp) srcElems (some elemSize))
-        (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals dl [])
-          (operandPointeeTy localDecls layouts dstOp) dstElems (some elemSize)) = true := by rfl)
+        (copySlicePointeesCompatible
+          (operandPointeeTy localDecls layouts srcOp)
+          (operandPointeeTy localDecls layouts dstOp))
+        (Bool.and
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals sl [])
+            effPt srcElems (some elemSize))
+          (copyContainerStrideOk (copyContainerElemKind? localDecls layouts s.frame.locals dl [])
+            effPt dstElems (some elemSize))) = true := by rfl)
     (hDstValid : localDecls ≠ [] → validateValueForTy? layouts (placeTy localDecls layouts ⟨dl, []⟩)
       (.aggregate 0 (spliceValues (takeValues count (dropValues s0 srcElems)) d0 dstElems)) = true)
     (hBorrows :

@@ -1827,9 +1827,22 @@ def resolveArraySliceEndpoint?
         | _ => direct
 
 /--
-Whether `k` is an unsigned or signed primitive integer `RigidTy`, whose
-validity invariant accepts every bit pattern of its byte width and whose
-runtime value representation is `Value.scalar` of that width.
+Whether `k` is an unsigned or signed primitive integer `RigidTy` (`.uint _` or
+`.int _`), whose runtime representation is `Value.scalar` of its fixed byte
+width and whose bit-validity invariant admits every initialized bit pattern.
+
+Reference (The Rust Reference 1.98.0, "Numeric types — Integer types"):
+<https://doc.rust-lang.org/1.98.0/reference/types/numeric.html#integer-types>
+
+> "The unsigned integer types consist of:"
+> "The signed two's complement integer types consist of:"
+
+Justification: unlike `bool` or `char`, Rust's fixed-width integer types have no
+invalid initialized bit patterns, so equal-width signed and unsigned integer
+scalars can be transferred directly without bit-pattern re-validation.
+
+Modeling assumptions and unsupported behavior: non-integer scalar kinds (`bool`,
+`char`, `float`) return `false`.
 -/
 @[reducible]
 def isUnrestrictedIntKind : RigidTy → Bool
@@ -1844,6 +1857,22 @@ restricted scalars `.bool` / `.char`) satisfies `pt`'s validity invariant.
 Used by `copyContainerStrideOk` for untyped containers (e.g. caller-owned
 referents) so direct element-window splicing never confuses `.aggregate`,
 `.scalar`, and `.ptr` element shapes.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The following is a non-exhaustive list of invalid values:
+> - A `bool` that isn't 0 or 1.
+> - A `char` that is a surrogate or above `char::MAX`."
+
+Justification: when an untyped container's elements are spliced directly for a
+pointee type `pt`, requiring each element to match `pt`'s runtime constructor,
+width, and scalar range ensures no invalid `bool`/`char` or mismatched aggregate
+enters a typed destination.
+
+Modeling assumptions and unsupported behavior: aggregate and wide-pointer
+pointee types return `false` on untyped containers so they fail closed with
+`.unsupported`.
 -/
 def elemsAllMatchPointeeRep (pt : Ty) (elemSz : Nat) : List Value → Bool
   | .nil => true
@@ -2116,6 +2145,51 @@ def copyAccessCertainlyOob : Option Bool → Bool
   | _ => false
 
 /--
+Select the effective pointee `Ty` shared by the two endpoints of an array-window
+`copy_nonoverlapping` (`copySliceElements`): prefers `srcPtOpt` when present and
+falls back to `dstPtOpt` when `srcPtOpt` is `.none` (paired with
+`copySlicePointeesCompatible`).
+-/
+@[reducible]
+def copyEffectivePointee? (srcPtOpt dstPtOpt : Option Ty) : Option Ty :=
+  match srcPtOpt, dstPtOpt with
+  | .some sp, _ => .some sp
+  | .none, .some dp => .some dp
+  | .none, .none => .none
+
+/--
+Whether the source and destination pointee types of an array-window
+`copy_nonoverlapping` (`copySliceElements`) agree in runtime element
+representation when both are statically known: either structurally equal
+(`rigidTyEq`), or both unrestricted integer scalars (`isUnrestrictedIntKind`;
+byte-size equality was already checked by `copyPointeeSizesConflict`).
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "pub const unsafe fn copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize)"
+
+Justification: in `core::ptr::copy_nonoverlapping::<T>`, `src` and `dst` share a
+common pointee `T`; rejecting mismatched pointee shapes on synthetic MIR (such
+as `*const (u32, u32)` vs `*mut u64` or `*const u8` vs `*mut bool`) prevents
+direct element-window splicing from placing incompatible runtime `Value`s into
+the destination array.
+
+Modeling assumptions and unsupported behavior: mismatched non-integer pointee
+types fail closed with `.unsupported`; equal-width signed/unsigned integers
+share the same `Value.scalar` representation.
+-/
+@[reducible]
+def copySlicePointeesCompatible (srcPtOpt dstPtOpt : Option Ty) : Bool :=
+  match srcPtOpt, dstPtOpt with
+  | .some sp, .some dp =>
+    match rigidTyEq sp.kind dp.kind with
+    | true => true
+    | false =>
+      Bool.and (isUnrestrictedIntKind sp.kind) (isUnrestrictedIntKind dp.kind)
+  | _, _ => true
+
+/--
 Element-window path of a multi-element `copy_nonoverlapping` whose endpoints
 both point into arrays or slices (`resolveArraySliceEndpoint?`): the source
 container is `srcElems` at `srcParentProj` with the pointer at element
@@ -2131,11 +2205,12 @@ container is `srcElems` at `srcParentProj` with the pointer at element
   that is unknown and the exceeded container is the root local itself with an
   exact, non-zero element stride; otherwise it stays inside the allocation or
   is type-punned and is not modeled (`.unsupported`).
-- When both windows are in bounds, the element stride must be exact
-  (`copyContainerStrideOk`, else `.unsupported`), the windows must not overlap
-  (else `.ub`), and the source window is spliced into the destination container;
-  the outcome names the two accessed windows for the Tree Borrows
-  read-then-write transition (`borrowsAfterCopySlice`, applied by
+- When both windows are in bounds, the element stride and cross-endpoint pointee
+  representation must agree (`copySlicePointeesCompatible` and
+  `copyContainerStrideOk` at `copyEffectivePointee?`, else `.unsupported`), the
+  windows must not overlap (else `.ub`), and the source window is spliced into
+  the destination container; the outcome names the two accessed windows for the
+  Tree Borrows read-then-write transition (`borrowsAfterCopySlice`, applied by
   `evalCopySubplaceMulti`).
 
 Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
@@ -2181,18 +2256,21 @@ def copySliceElements
     (dstElems : List Value) :
     CopySliceOutcome :=
   let effSzOpt := copyEffElemSize? elemSzOpt srcElems dstElems
+  let effPtOpt := copyEffectivePointee? srcEp.pointeeOpt dstEp.pointeeOpt
   let strideOk : Bool :=
     Bool.and
-      (copyContainerStrideOk
-        (copyContainerElemKind? localDecls layouts locals srcEp.entry.targetLocal srcParentProj)
-        srcEp.pointeeOpt
-        srcElems
-        effSzOpt)
-      (copyContainerStrideOk
-        (copyContainerElemKind? localDecls layouts locals dstEp.entry.targetLocal dstParentProj)
-        dstEp.pointeeOpt
-        dstElems
-        effSzOpt)
+      (copySlicePointeesCompatible srcEp.pointeeOpt dstEp.pointeeOpt)
+      (Bool.and
+        (copyContainerStrideOk
+          (copyContainerElemKind? localDecls layouts locals srcEp.entry.targetLocal srcParentProj)
+          effPtOpt
+          srcElems
+          effSzOpt)
+        (copyContainerStrideOk
+          (copyContainerElemKind? localDecls layouts locals dstEp.entry.targetLocal dstParentProj)
+          effPtOpt
+          dstElems
+          effSzOpt))
   let zeroByteSlice : Bool :=
     match elemSzOpt with
     | .some _ => false
@@ -2324,9 +2402,21 @@ def listAllLayoutIndepScalar : List RigidTy → Bool
     | false => false
 
 /--
-Whether a `ScalarLayout` represents a non-pointer integer scalar (so
-`decodeScalarLayoutBytes` produces `Value.scalar` without fabricating pointer
-provenance from raw integer bytes).
+Whether every `Value` in `vs` is a non-pointer flat value (`Value.scalar` or
+`Value.unit`). Rejects `Value.ptr` so untyped byte encoding never serializes an
+abstract pointer's relative `offsetBytes` (`0` at allocation base) as concrete
+zero address bytes.
+-/
+def allNonPtrScalarOrUnitValues : List Value → Bool
+  | .nil => true
+  | .scalar _ :: rest => allNonPtrScalarOrUnitValues rest
+  | .unit :: rest => allNonPtrScalarOrUnitValues rest
+  | _ :: _ => false
+
+/--
+Whether a `ScalarLayout` has a `PrimitiveKind.int` representation (as opposed to
+`.pointer` or `.float`), so `decodeScalarLayoutBytes` produces `Value.scalar`
+without fabricating pointer provenance from raw integer bytes.
 -/
 @[reducible]
 def scalarLayoutIsNonPtr : ScalarLayout → Bool
@@ -2335,22 +2425,22 @@ def scalarLayoutIsNonPtr : ScalarLayout → Bool
   | _ => false
 
 /--
-Whether every layout index in `flIdxs` resolves in `layouts` to a live
-single-variant non-pointer primitive scalar layout (`FieldsShape.primitive`),
-so `decodeValueFromBytes`'s `fieldLayouts` path decodes each field without
-synthesizing `layoutIdx := 0`, fabricating pointer provenance, or guessing
-field spans.
+Whether every layout index in `flIdxs` resolves in `layouts` to a non-zero-sized
+live single-variant non-pointer primitive scalar layout (`FieldsShape.primitive`),
+excluding 0-sized generic parameter placeholders (`sigIsParamPlaceholder`), so
+`decodeValueFromBytes`'s `fieldLayouts` path decodes each field cleanly.
 -/
 def fieldLayoutsAllPrimitive (layouts : LayoutTable) : List Nat → Bool
   | .nil => true
   | flIdx :: rest =>
     match LayoutTable.lookup layouts flIdx with
     | .some {
+        size := sz,
         isUninhabited := false,
         variants := .single _,
         fields := .primitive,
         backendRepr := .scalar sl, .. } =>
-      match scalarLayoutIsNonPtr sl with
+      match Bool.and (Nat.ble 1 sz.bytes) (scalarLayoutIsNonPtr sl) with
       | true => fieldLayoutsAllPrimitive layouts rest
       | false => false
     | _ => false
@@ -2359,20 +2449,33 @@ def fieldLayoutsAllPrimitive (layouts : LayoutTable) : List Nat → Bool
 Whether `encodeValueToBytes defaultCodecFuel layouts ty v` produces the exact
 in-memory byte representation of `v : ty` without falling back to untyped
 declaration-order field concatenation (which ignores `repr(Rust)` field
-reordering, padding, and enum tags/niches).
+reordering, padding, and enum tags/niches) or serializing abstract `Value.ptr`
+offsets (`0` at the start of a non-null stack allocation) as concrete zero
+address bytes.
 
 Reference (The Rust Reference 1.98.0, "Type layout — The Rust representation"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
 
 > "There are no guarantees of data layout made by this representation."
 
-Justification: `encodeValueToBytes` only captures exact Rust memory bytes when
+Reference (The Rust Reference 1.98.0, "Pointer types — References (`&` and `&mut`)"):
+<https://doc.rust-lang.org/1.98.0/reference/types/pointer.html#shared-references->
+
+> "Shared references point to memory which is owned by some other value."
+
+Justification: `encodeValueToBytes` captures exact Rust memory bytes only when
 either the type's byte layout is fixed independently of `LayoutTable`
 (`isLayoutIndepByteKind`), or a captured `TypeLayout` entry provides explicit
-`FieldsShape.arbitrary` field offsets (or `.primitive`) for a non-generic
-single-variant struct/tuple whose fields are flat scalars. Enums, generic ADTs,
-and layout-free tuples/structs fail closed so the byte copy never fabricates
-wrong bytes.
+`FieldsShape.arbitrary` field offsets (or non-zero non-pointer `.primitive`, or
+zero-sized unit `.arbitrary .nil`) for a non-generic single-variant struct/tuple
+whose runtime field values contain no abstract pointers
+(`allNonPtrScalarOrUnitValues`). Non-zero-sized 0-field niche/tag ADTs, enums,
+pointer-carrying structs, generic ADTs, and layout-free tuples/structs fail
+closed.
+
+Modeling assumptions and unsupported behavior: encoding of enums, generic ADTs,
+pointer-containing aggregates, and non-zero-sized 0-field ADTs is not modeled
+here and returns `false` so `copyBytesSubplace` fails closed with `.unsupported`.
 -/
 @[reducible]
 def srcValHasExactByteEncoding
@@ -2398,14 +2501,18 @@ def srcValHasExactByteEncoding
       match LayoutTable.lookup layouts ty.layoutIdx with
       | .some l =>
         match l.isUninhabited, l.variants, l.fields with
-        | false, .single _, .primitive => true
-        | false, .single _, .arbitrary .nil _ => true
+        | false, .single _, .primitive =>
+          match l.backendRepr, v with
+          | .scalar sl, .scalar _ =>
+            Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
+          | _, _ => false
+        | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
         | false, .single _, .arbitrary offsets _ =>
           match v with
           | .aggregate _ fieldVals =>
             Bool.and
               (Nat.beq (length offsets) (length fieldVals))
-              (allFlatScalarValues fieldVals)
+              (allNonPtrScalarOrUnitValues fieldVals)
           | _ => false
         | _, _, _ => false
       | .none => false
@@ -2414,18 +2521,31 @@ def srcValHasExactByteEncoding
 /--
 Whether `decodeValueFromBytes defaultCodecFuel layouts ty bs` decodes `bs` into
 an exact value of `ty` without falling back to declaration-order tuple decoding,
-synthetic `layoutIdx := 0` element lookups, or guessed span decoding.
+synthetic `layoutIdx := 0` element lookups, unchecked non-zero-sized 0-field
+tag/niche acceptance, or guessed span decoding.
 
 Reference (The Rust Reference 1.98.0, "Type layout — The Rust representation"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
 
 > "There are no guarantees of data layout made by this representation."
 
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
+
+> "The Rust compiler assumes that all values produced during program execution are “valid”, and producing an invalid value is hence immediate UB."
+
 Justification: decoding raw bytes into a tuple or struct without explicit
 captured field offsets and per-field scalar layouts would fabricate a
-declaration-order layout that Rust does not guarantee. Restricting decoding to
-`isLayoutIndepByteKind` types and explicitly laid-out single-variant structs or
-tuples ensures every committed value matches the captured Rust layout.
+declaration-order layout that Rust does not guarantee, and accepting non-zero
+0-field ADTs without tag validation would ignore niche/discriminant invariants.
+Restricting decoding to `isLayoutIndepByteKind` types, zero-sized 0-field unit
+structs, and explicitly laid-out non-pointer single-variant structs or tuples
+ensures every committed value matches the captured Rust layout.
+
+Modeling assumptions and unsupported behavior: decoding into enums, generic
+ADTs, pointer-containing structs, non-zero-sized 0-field ADTs, and layout-free
+heterogeneous tuples returns `false` so `copyBytesSubplace` fails closed with
+`.unsupported`.
 -/
 @[reducible]
 def dstTyHasExactByteDecode
@@ -2452,9 +2572,10 @@ def dstTyHasExactByteDecode
         match l.isUninhabited, l.variants, l.fields with
         | false, .single _, .primitive =>
           match l.backendRepr with
-          | .scalar sl => scalarLayoutIsNonPtr sl
+          | .scalar sl =>
+            Bool.and (Nat.ble 1 l.size.bytes) (scalarLayoutIsNonPtr sl)
           | _ => false
-        | false, .single _, .arbitrary .nil _ => true
+        | false, .single _, .arbitrary .nil _ => Nat.beq l.size.bytes 0
         | false, .single _, .arbitrary offsets _ =>
           match
             Bool.and
@@ -2643,7 +2764,7 @@ def copyBytesSubplace
                 sVal
             | false => .none
           | .none =>
-            match allFlatScalarValues slicedElems with
+            match allNonPtrScalarOrUnitValues slicedElems with
             | true => encodeUntypedValueToBytes defaultCodecFuel sVal
             | false => .none
         | .none =>

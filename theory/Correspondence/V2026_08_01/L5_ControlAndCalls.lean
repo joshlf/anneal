@@ -7015,6 +7015,128 @@ theorem ep1_b2_subplace_copy_layout_and_stride_hardening :
      copyContainerStrideOk (.some (.int .i32)) (.some u32Ty) (.scalar ⟨0, 4⟩ :: .nil) (.some 4) = true) := by
   exact ⟨rfl, ⟨rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
 
+/--
+Kernel-checked regression witnesses for `ep1-A2` final convergence hardening
+(`V2026_08_01` dialect):
+1. Pointer-containing structs (`HasRef { r: &u32 }`) and untyped pointer slices fail closed
+   with `.unsupported` in `copyBytesSubplace` instead of encoding `offsetBytes = 0` as a
+   false null address `0 : u64`.
+2. Non-zero-sized 0-field niche/tag ADTs (`size = 4, fields = .arbitrary [] []`) and
+   0-sized generic parameter placeholders (`size = 0, fields = .primitive`) are rejected by
+   `srcValHasExactByteEncoding`, `dstTyHasExactByteDecode`, and `fieldLayoutsAllPrimitive`,
+   while genuine 0-sized unit structs (`size = 0, fields = .arbitrary [] []`) remain supported.
+3. Cross-endpoint `copySliceElements` rejects mismatched pointee shapes (`*const (u32, u32)`
+   into `*mut u64`) and one-sided untyped-pointer invalid-scalar splices (`[u8; 2] = [2, 3]`
+   with `pointeeOpt = .none` into `[bool; 2]`), while accepting `[u32; 2]` into `[i32; 2]`.
+-/
+theorem ep1_a2_subplace_copy_ptr_tag_and_cross_endpoint_hardening :
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let i32Ty : Ty := { kind := .int .i32, layoutIdx := 0 }
+    let u64Ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    let pairU32Ty : Ty := { kind := .tuple (.uint .u32 :: .uint .u32 :: .nil), layoutIdx := 0 }
+    let srcEntry0 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetFrameDepth := 0, targetProjection := .nil, perm := .frozen }
+    let dstEntry1 : BorrowEntry :=
+      { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+    -- 1. Pointer-field struct and untyped pointer slice do not fabricate zero/null bytes.
+    (let hasRefLayout : TypeLayout :=
+       { size := { bytes := 8 }, align := { bytes := 8 }, backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: .nil) (0 :: .nil),
+         variants := .single 0, isUninhabited := false }
+     let ltRef : LayoutTable := { pointerBits := 64, isLittleEndian := true, entries := hasRefLayout :: .nil }
+     let hasRefTy : Ty := { kind := .adt "HasRef" .nil, layoutIdx := 0 }
+     let refVal : Value := .ptr { allocId := 1, offsetBytes := 0 } 8
+     let hasRefVal : Value := .aggregate 0 (refVal :: .nil)
+     let declsRef : List LocalDecl :=
+       { mutability := .not, ty := hasRefTy, debugName := .none } ::
+       { mutability := .mut, ty := u64Ty, debugName := .none } :: .nil
+     let sEpRef : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some hasRefVal, pointeeOpt := .some u8Ty }
+     let dEpU64 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨123, 8⟩), pointeeOpt := .some u8Ty }
+     let callerPtrArr : Value := .aggregate 0 (refVal :: .nil)
+     let sEpCallerPtrSlice : CopyEndpoint :=
+       { ptr := { allocId := 3, offsetBytes := 0 },
+         entry := { tag := 3, targetLocal := 2, targetFrameDepth := 0, targetProjection := .nil, perm := .frozen },
+         rootValOpt := .some callerPtrArr, pointeeOpt := .some u64Ty }
+     copyBytesSubplace declsRef ltRef (.init hasRefVal :: .init (.scalar ⟨123, 8⟩) :: .nil)
+       .nil .nil sEpRef dEpU64 (.some 1) 8 .none .none = .unsupported ∧
+     copyBytesSubplace declsRef ltRef (.init hasRefVal :: .init (.scalar ⟨123, 8⟩) :: .nil)
+       (.uninit :: .uninit :: .init callerPtrArr :: .nil) .nil sEpCallerPtrSlice dEpU64
+       (.some 8) 1 (.some (.nil, 0, refVal :: .nil)) .none = .unsupported) ∧
+    -- 2. Non-zero-sized 0-field niche/tag ADTs and 0-sized param placeholders rejected; 0-sized unit struct accepted.
+    (let singleTag4Layout : TypeLayout :=
+       { size := { bytes := 4 }, align := { bytes := 4 },
+         backendRepr := .scalar (.initialized (.int 32 false) { start := 7, end_ := 7 }),
+         fields := .arbitrary .nil .nil, variants := .single 0, isUninhabited := false }
+     let paramPlaceholderLayout : TypeLayout :=
+       { size := { bytes := 0 }, align := { bytes := 1 },
+         backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 0 }),
+         fields := .primitive, variants := .single 0, isUninhabited := false }
+     let unitStructLayout : TypeLayout :=
+       { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
+         fields := .arbitrary .nil .nil, variants := .single 0, isUninhabited := false }
+     let ltAdt : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true,
+         entries := singleTag4Layout :: paramPlaceholderLayout :: unitStructLayout :: .nil }
+     srcValHasExactByteEncoding ltAdt { kind := .adt "SingleTag" .nil, layoutIdx := 0 } (.aggregate 0 .nil) = false ∧
+     dstTyHasExactByteDecode ltAdt { kind := .adt "SingleTag" .nil, layoutIdx := 0 } = false ∧
+     srcValHasExactByteEncoding ltAdt { kind := .adt "Param" .nil, layoutIdx := 1 } (.scalar ⟨0, 0⟩) = false ∧
+     dstTyHasExactByteDecode ltAdt { kind := .adt "Param" .nil, layoutIdx := 1 } = false ∧
+     fieldLayoutsAllPrimitive ltAdt (1 :: .nil) = false ∧
+     srcValHasExactByteEncoding ltAdt { kind := .adt "UnitS" .nil, layoutIdx := 2 } (.aggregate 0 .nil) = true ∧
+     dstTyHasExactByteDecode ltAdt { kind := .adt "UnitS" .nil, layoutIdx := 2 } = true) ∧
+    -- 3. Cross-endpoint copySliceElements guards mismatched pointees and one-sided untyped bool splices.
+    (let declsTupToU64 : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array pairU32Ty.kind 2, layoutIdx := 0 }, debugName := .none } ::
+       { mutability := .mut, ty := { kind := .array (.uint .u64) 2, layoutIdx := 0 }, debugName := .none } :: .nil
+     let tupElem : Value := .aggregate 0 (.scalar ⟨1, 4⟩ :: .scalar ⟨2, 4⟩ :: .nil)
+     let tupElems := tupElem :: tupElem :: .nil
+     let u64Elems := Value.scalar ⟨0, 8⟩ :: .scalar ⟨0, 8⟩ :: .nil
+     let sEpTup : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.aggregate 0 tupElems), pointeeOpt := .some pairU32Ty }
+     let dEpU64Arr : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.aggregate 0 u64Elems), pointeeOpt := .some u64Ty }
+     let declsU8ToBool : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array (.uint .u8) 2, layoutIdx := 0 }, debugName := .none } ::
+       { mutability := .mut, ty := { kind := .array .bool 2, layoutIdx := 0 }, debugName := .none } :: .nil
+     let u8BadElems := Value.scalar ⟨2, 1⟩ :: .scalar ⟨3, 1⟩ :: .nil
+     let boolElems := Value.scalar ⟨0, 1⟩ :: .scalar ⟨0, 1⟩ :: .nil
+     let sEpUntypedPtr : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.aggregate 0 u8BadElems), pointeeOpt := .none }
+     let dEpBoolArr : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.aggregate 0 boolElems), pointeeOpt := .some boolTy }
+     let declsU32ToI32 : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array (.uint .u32) 2, layoutIdx := 0 }, debugName := .none } ::
+       { mutability := .mut, ty := { kind := .array (.int .i32) 2, layoutIdx := 0 }, debugName := .none } :: .nil
+     let u32Elems := Value.scalar ⟨10, 4⟩ :: .scalar ⟨20, 4⟩ :: .nil
+     let i32Elems := Value.scalar ⟨0, 4⟩ :: .scalar ⟨0, 4⟩ :: .nil
+     let sEpU32 : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.aggregate 0 u32Elems), pointeeOpt := .some u32Ty }
+     let dEpI32 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.aggregate 0 i32Elems), pointeeOpt := .some i32Ty }
+     copySliceElements declsTupToU64 emptyLayoutTable
+       (.init (.aggregate 0 tupElems) :: .init (.aggregate 0 u64Elems) :: .nil) .nil .nil
+       sEpTup dEpU64Arr (.some 8) 2 .nil 0 tupElems .nil 0 u64Elems = .unsupported ∧
+     copySliceElements declsU8ToBool emptyLayoutTable
+       (.init (.aggregate 0 u8BadElems) :: .init (.aggregate 0 boolElems) :: .nil) .nil .nil
+       sEpUntypedPtr dEpBoolArr (.some 1) 2 .nil 0 u8BadElems .nil 0 boolElems = .unsupported ∧
+     copySliceElements declsU32ToI32 emptyLayoutTable
+       (.init (.aggregate 0 u32Elems) :: .init (.aggregate 0 i32Elems) :: .nil) .nil .nil
+       sEpU32 dEpI32 (.some 4) 2 .nil 0 u32Elems .nil 0 i32Elems =
+       .write { local_ := 1, projection := .nil } (.aggregate 0 u32Elems) .nil .nil) := by
+  exact ⟨⟨rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
+
 end SubplaceCopyTailCallOpaqueCastHardening
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls
