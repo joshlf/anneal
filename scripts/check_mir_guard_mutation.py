@@ -4389,7 +4389,7 @@ class ErrorWildcardFinding:
 
 
 _SPEC_TOKEN_RE = re.compile(
-    r'"[^"]*"|«[^»\n]*»|[^\W\d][\w\']*|\d[\w.]*'
+    r'"[^"]*"|«[^»\n]*»|r#[^\W\d][\w]*|[^\W\d][\w\']*|\d[\w.]*'
     r"|==>|=>|::|\.\.=|\.\.|->|:=|==|!=|<=|>=|&&|\|\||/\\|\\/|<->|\S"
 )
 _SPEC_WORD_RE = re.compile(r"[^\W\d][\w']*")
@@ -4545,22 +4545,204 @@ def _has_call_expr(toks: Sequence[str]) -> bool:
     )
 
 
-def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]:
+def _rust_brace_ends_arm(toks: Sequence[str], close_idx: int) -> bool:
+    """Whether closing `}` at `close_idx` terminates a Rust `match` arm body."""
+    n = len(toks)
+    if close_idx + 1 >= n:
+        return True
+    after = toks[close_idx + 1]
+    if after in (",", ";") or after in _SPEC_CLOSERS:
+        return True
+    if after in ("else", "=", "{"):
+        return False
+    if after in _RUST_EXPR_CONT_OPS:
+        bdepth = 0
+        probe = close_idx + 1
+        while probe < n:
+            pt = toks[probe]
+            if pt in _SPEC_OPENERS:
+                bdepth += 1
+            elif pt in _SPEC_CLOSERS:
+                if bdepth == 0:
+                    return False
+                bdepth -= 1
+            elif bdepth == 0:
+                if pt == "=>":
+                    return True
+                if pt in (",", ";"):
+                    return False
+            probe += 1
+        return False
+    return True
+
+
+_NON_BINDER_PATTERN_WORDS: frozenset[str] = frozenset(
+    {"mut", "ref", "box", "_", "true", "false", "True", "False", "none", "some", "nil", "zero", "unit"}
+)
+
+
+def _pattern_binder_names(pat_toks: Sequence[str]) -> set[str]:
+    """Variable names bound by a Rust or Lean pattern slice."""
+    names: set[str] = set()
+    n = len(pat_toks)
+    in_type = False
+    bdepth = 0
+    for idx, tok in enumerate(pat_toks):
+        prev = pat_toks[idx - 1] if idx > 0 else ""
+        nxt = pat_toks[idx + 1] if idx + 1 < n else ""
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            in_type = False
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth = max(0, bdepth - 1)
+            in_type = False
+            continue
+        if tok in (",", "|"):
+            in_type = False
+            continue
+        if tok == ":" and prev != ":" and nxt != ":":
+            if bdepth == 0:
+                in_type = True
+            continue
+        if in_type or not _is_spec_word(tok):
+            continue
+        if prev in (".", "::") or nxt in ("::", ".", "{", ":="):
+            continue
+        if nxt == ":" and idx + 2 < n:
+            # Struct field label (`{ field: pat }`), not the bound variable.
+            continue
+        if tok.startswith("r#") and len(tok) > 2:
+            plain = tok[2:]
+            if plain != "_" and not plain[0].isupper():
+                names.add(plain)
+            continue
+        plain = _unquote_ident(tok)
+        if plain in _NON_BINDER_PATTERN_WORDS:
+            continue
+        if plain[0] == "_" or not plain[0].isupper():
+            names.add(plain)
+    return names
+
+
+def _subst_lean_match_arms(arms_toks: Sequence[str], scope: dict[str, str], depth: int) -> list[str]:
+    """Substitute `scope` across Lean `| <pat> => <body>` arms while respecting pattern binders."""
+    if not arms_toks or depth > _MAX_SPEC_DEPTH:
+        return list(arms_toks)
+    segments: list[list[str]] = [[]]
+    has_bar: list[bool] = [False]
+    bdepth = 0
+    for tok in arms_toks:
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth -= 1
+        elif bdepth == 0 and tok == "|":
+            segments.append([])
+            has_bar.append(True)
+            continue
+        segments[-1].append(tok)
+    out: list[str] = []
+    pending_pats: list[tuple[bool, list[str]]] = []
+    for bar, seg in zip(has_bar, segments):
+        if not seg and not bar:
+            continue
+        arrow = _split_first_top(seg, {"=>"})
+        if arrow is None:
+            pending_pats.append((bar, seg))
+            continue
+        pat, body = arrow
+        pats = [*pending_pats, (bar, pat)]
+        pending_pats = []
+        binders: set[str] = set()
+        for _, p_toks in pats:
+            binders |= _pattern_binder_names(p_toks)
+        arm_scope = {k: v for k, v in scope.items() if k not in binders}
+        for p_bar, p_toks in pats:
+            if p_bar:
+                out.append("|")
+            out.extend(p_toks)
+        out.append("=>")
+        out.extend(_subst_ident_map(body, arm_scope, depth + 1))
+    for p_bar, p_toks in pending_pats:
+        if p_bar:
+            out.append("|")
+        out.extend(p_toks)
+    return out
+
+
+def _subst_rust_match_inner(inner: Sequence[str], scope: dict[str, str], depth: int) -> list[str]:
+    """Substitute `scope` across a Rust `match` `{ ... }` arm list while respecting pattern binders."""
+    if not inner or depth > _MAX_SPEC_DEPTH:
+        return list(inner)
+    raw_arms: list[list[str]] = []
+    cur: list[str] = []
+    bdepth = 0
+    saw_arrow = False
+    n = len(inner)
+    for idx, tok in enumerate(inner):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            cur.append(tok)
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            cur.append(tok)
+            if bdepth == 0 and tok == "}" and saw_arrow and _rust_brace_ends_arm(inner, idx):
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            continue
+        if bdepth == 0 and tok == ",":
+            if cur:
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
+            continue
+        if bdepth == 0 and tok == "=>":
+            saw_arrow = True
+        cur.append(tok)
+    if cur:
+        raw_arms.append(cur)
+    out: list[str] = []
+    for arm_idx, arm in enumerate(raw_arms):
+        if arm_idx > 0:
+            out.append(",")
+        arrow = _split_first_top(arm, {"=>"})
+        if arrow is None:
+            out.extend(_subst_ident_map(arm, scope, depth + 1))
+            continue
+        pat_part, body = arrow
+        guard_split = _split_first_top(pat_part, {"if"})
+        pat_toks = pat_part if guard_split is None else guard_split[0]
+        binders = _pattern_binder_names(pat_toks)
+        arm_scope = {k: v for k, v in scope.items() if k not in binders}
+        out.extend(pat_toks)
+        if guard_split is not None:
+            out.append("if")
+            out.extend(_subst_ident_map(guard_split[1], arm_scope, depth + 1))
+        out.append("=>")
+        out.extend(_subst_ident_map(body, arm_scope, depth + 1))
+    return out
+
+
+def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str], depth: int = 0) -> list[str]:
     """Substitute known constant identifiers outside member and shadowing binder positions."""
-    if not bindings:
+    if not bindings or depth > _MAX_SPEC_DEPTH:
         return list(toks)
     out: list[str] = []
     scopes: list[dict[str, str]] = [dict(bindings)]
-    # Pending `(depth, shadowed_names)` from `let`/`have` headers waiting for `;`/`in`.
+    # Pending `(scope_depth, shadowed_names)` from `let`/`have` headers waiting for `;`/`in`.
     pending_lets: list[tuple[int, set[str]]] = []
-    # Pending `(depth, end_idx, shadowed_names)` while skipping a binder header.
+    # Pending `[scope_depth, shadowed_names, saved_scope, stage, if_nesting]` for `if let`.
+    pending_if_lets: list[list[object]] = []
     skip_until = -1
     n = len(toks)
     idx = 0
     while idx < n:
         tok = toks[idx]
         prev = toks[idx - 1] if idx > 0 else ""
-        depth = len(scopes) - 1
+        sdepth = len(scopes) - 1
         if idx < skip_until:
             if tok in _SPEC_OPENERS:
                 scopes.append(dict(scopes[-1]))
@@ -4570,21 +4752,52 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]
             idx += 1
             continue
         if tok in _SPEC_OPENERS:
-            scopes.append(dict(scopes[-1]))
+            new_scope = dict(scopes[-1])
+            if tok == "{":
+                for p_idx in range(len(pending_if_lets) - 1, -1, -1):
+                    entry = pending_if_lets[p_idx]
+                    if entry[0] == sdepth and entry[3] == 0:
+                        for name in entry[1]:  # type: ignore[attr-defined]
+                            new_scope.pop(name, None)
+                        pending_if_lets.pop(p_idx)
+                        break
+            scopes.append(new_scope)
             out.append(tok)
             idx += 1
             continue
         if tok in _SPEC_CLOSERS:
             if len(scopes) > 1:
-                pending_lets = [p for p in pending_lets if p[0] < depth]
+                pending_lets = [p for p in pending_lets if p[0] < sdepth]
+                pending_if_lets = [p for p in pending_if_lets if int(p[0]) < sdepth]  # type: ignore[arg-type]
                 scopes.pop()
             out.append(tok)
             idx += 1
             continue
+        if tok == "if":
+            for entry in pending_if_lets:
+                if entry[0] == sdepth and entry[3] == 1:
+                    entry[4] = int(entry[4]) + 1  # type: ignore[arg-type]
+        elif tok == "then":
+            for entry in reversed(pending_if_lets):
+                if entry[0] == sdepth and entry[3] == 0:
+                    entry[3] = 1
+                    for name in entry[1]:  # type: ignore[attr-defined]
+                        scopes[-1].pop(name, None)
+                    break
+        elif tok == "else":
+            for p_idx in range(len(pending_if_lets) - 1, -1, -1):
+                entry = pending_if_lets[p_idx]
+                if entry[0] == sdepth and entry[3] == 1:
+                    if int(entry[4]) > 0:  # type: ignore[arg-type]
+                        entry[4] = int(entry[4]) - 1  # type: ignore[arg-type]
+                    else:
+                        scopes[-1] = dict(entry[2])  # type: ignore[arg-type]
+                        pending_if_lets.pop(p_idx)
+                    break
         if tok in (";", "in"):
             remaining_pending: list[tuple[int, set[str]]] = []
             for p_depth, p_names in pending_lets:
-                if p_depth == depth:
+                if p_depth == sdepth:
                     for name in p_names:
                         scopes[-1].pop(name, None)
                 else:
@@ -4593,12 +4806,66 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]
             out.append(tok)
             idx += 1
             continue
+        if tok == "match":
+            # Find extent of current bracket scope so inner/outer `match` blocks stay bounded.
+            end_scope = idx + 1
+            bdepth = 0
+            open_brace = -1
+            with_at = -1
+            while end_scope < n:
+                st = toks[end_scope]
+                if st in _SPEC_OPENERS:
+                    if bdepth == 0 and st == "{" and open_brace == -1 and with_at == -1:
+                        open_brace = end_scope
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                    if bdepth == 0 and open_brace != -1:
+                        if toks[end_scope + 1 : end_scope + 2] == ["{"]:
+                            open_brace = -1
+                        else:
+                            close_brace = end_scope
+                            out.append("match")
+                            out.extend(_subst_ident_map(toks[idx + 1 : open_brace], scopes[-1], depth + 1))
+                            out.append("{")
+                            out.extend(_subst_rust_match_inner(toks[open_brace + 1 : close_brace], scopes[-1], depth + 1))
+                            out.append("}")
+                            idx = close_brace + 1
+                            open_brace = -2
+                            break
+                elif bdepth == 0 and st == "with" and open_brace == -1 and with_at == -1:
+                    with_at = end_scope
+                end_scope += 1
+            if open_brace == -2:
+                continue
+            if with_at != -1:
+                out.append("match")
+                out.extend(_subst_ident_map(toks[idx + 1 : with_at], scopes[-1], depth + 1))
+                out.append("with")
+                out.extend(_subst_lean_match_arms(toks[with_at + 1 : end_scope], scopes[-1], depth + 1))
+                idx = end_scope
+                continue
+        if (tok == "fun" or tok.startswith("λ")) and toks[idx + 1 : idx + 2] == ["|"]:
+            end_scope = idx + 1
+            bdepth = 0
+            while end_scope < n:
+                st = toks[end_scope]
+                if st in _SPEC_OPENERS:
+                    bdepth += 1
+                elif st in _SPEC_CLOSERS:
+                    if bdepth == 0:
+                        break
+                    bdepth -= 1
+                end_scope += 1
+            out.append(tok)
+            out.extend(_subst_lean_match_arms(toks[idx + 1 : end_scope], scopes[-1], depth + 1))
+            idx = end_scope
+            continue
         if tok in ("let", "have"):
-            # Do not substitute inside the binder LHS; shadow those names after `;`/`in`.
             bdepth = 0
             scan = idx + 1
-            header_names: set[str] = set()
-            in_type_ann = False
             while scan < n:
                 st = toks[scan]
                 if st in _SPEC_OPENERS:
@@ -4609,15 +4876,13 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]
                     bdepth -= 1
                 elif bdepth == 0 and st in (":=", "=", ";", "in"):
                     break
-                elif bdepth == 0 and st == ":":
-                    in_type_ann = True
-                elif not in_type_ann and _is_spec_word(st):
-                    u = _unquote_ident(st)
-                    if u not in ("mut", "ref", "_"):
-                        header_names.add(u)
                 scan += 1
-            if header_names:
-                pending_lets.append((depth, header_names))
+            header_names = _pattern_binder_names(toks[idx + 1 : scan])
+            if prev in ("if", "while"):
+                if header_names:
+                    pending_if_lets.append([sdepth, header_names, dict(scopes[-1]), 0, 0])
+            elif header_names:
+                pending_lets.append((sdepth, header_names))
             skip_until = scan
             out.append(tok)
             idx += 1
@@ -4627,34 +4892,59 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]
             bdepth = 0
             scan = idx + 1
             binder_names: set[str] = set()
+            binder_positions: set[int] = set()
+            in_top_type = False
+            in_group_type = False
             if tok.startswith("λ") and len(tok) > 1:
                 binder_names.add(tok[1:])
             while scan < n:
                 st = toks[scan]
                 if st in _SPEC_OPENERS:
+                    if bdepth == 0:
+                        in_group_type = False
                     bdepth += 1
                 elif st in _SPEC_CLOSERS:
                     if bdepth == 0:
                         break
                     bdepth -= 1
+                    if bdepth == 0:
+                        in_group_type = False
                 elif bdepth == 0 and st == stop_tok:
                     break
-                elif _is_spec_word(st):
-                    u = _unquote_ident(st)
+                elif bdepth == 0 and st == ":":
+                    in_top_type = True
+                elif bdepth == 1 and st == ":":
+                    in_group_type = True
+                elif _is_spec_word(st) and (
+                    (bdepth == 0 and not in_top_type) or (bdepth == 1 and not in_group_type)
+                ):
+                    u = _ident_key(st)
+                    binder_positions.add(scan)
                     if u in scopes[-1]:
                         binder_names.add(u)
                 scan += 1
             if scan < n and toks[scan] == stop_tok:
+                out.append(tok)
+                hdr_idx = idx + 1
+                while hdr_idx <= scan:
+                    ht = toks[hdr_idx]
+                    hprev = toks[hdr_idx - 1] if hdr_idx > 0 else ""
+                    hkey = _ident_key(ht)
+                    if hdr_idx not in binder_positions and hprev not in (".", "::") and hkey in scopes[-1]:
+                        out.append(scopes[-1][hkey])
+                    else:
+                        out.append(ht)
+                    hdr_idx += 1
                 for name in binder_names:
                     scopes[-1].pop(name, None)
-                skip_until = scan + 1
-            out.append(tok)
-            idx += 1
-            continue
+                idx = scan + 1
+                continue
         if tok == "|" and prev in _CLOSURE_BAR_PRECEDERS:
             bdepth = 0
             scan = idx + 1
             binder_names = set()
+            binder_positions = set()
+            in_param_type = False
             while scan < n:
                 st = toks[scan]
                 if st in _SPEC_OPENERS:
@@ -4668,19 +4958,33 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str]) -> list[str]
                 elif bdepth == 0 and st in (";", "=>"):
                     scan = n
                     break
-                elif _is_spec_word(st):
-                    u = _unquote_ident(st)
+                elif bdepth == 0 and st == ",":
+                    in_param_type = False
+                elif bdepth == 0 and st == ":":
+                    in_param_type = True
+                elif not in_param_type and _is_spec_word(st):
+                    u = _ident_key(st)
+                    binder_positions.add(scan)
                     if u in scopes[-1]:
                         binder_names.add(u)
                 scan += 1
             if scan < n and toks[scan] == "|":
+                out.append(tok)
+                hdr_idx = idx + 1
+                while hdr_idx <= scan:
+                    ht = toks[hdr_idx]
+                    hprev = toks[hdr_idx - 1] if hdr_idx > 0 else ""
+                    hkey = _ident_key(ht)
+                    if hdr_idx not in binder_positions and hprev not in (".", "::") and hkey in scopes[-1]:
+                        out.append(scopes[-1][hkey])
+                    else:
+                        out.append(ht)
+                    hdr_idx += 1
                 for name in binder_names:
                     scopes[-1].pop(name, None)
-                skip_until = scan + 1
-                out.append(tok)
-                idx += 1
+                idx = scan + 1
                 continue
-        key = _unquote_ident(tok)
+        key = _ident_key(tok)
         if prev not in (".", "::") and key in scopes[-1]:
             out.append(scopes[-1][key])
         else:
@@ -4761,9 +5065,66 @@ def _has_complementary_pair(parts: Sequence[Sequence[str]]) -> bool:
     return False
 
 
+_RUST_BLOCK_ABORT_WORDS: frozenset[str] = frozenset(
+    {"while", "for", "loop", "break", "continue", "return", "panic", "assert",
+     "assert_eq", "assert_ne", "debug_assert", "unreachable"}
+)
+
+
+def _split_rust_block_statements(toks: Sequence[str]) -> list[list[str]]:
+    """Split a Rust `{ ... }` body into top-level `;`- and block-terminated statements."""
+    statements: list[list[str]] = []
+    cur: list[str] = []
+    bdepth = 0
+    n = len(toks)
+    for idx, tok in enumerate(toks):
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+            cur.append(tok)
+            continue
+        if tok in _SPEC_CLOSERS:
+            bdepth -= 1
+            cur.append(tok)
+            if (
+                bdepth == 0
+                and tok == "}"
+                and cur[0] in ("{", "unsafe", "if", "match")
+                and idx + 1 < n
+                and toks[idx + 1] != ";"
+                and _rust_brace_ends_arm(toks, idx)
+            ):
+                statements.append(cur)
+                cur = []
+            continue
+        if bdepth == 0 and tok == ";":
+            if cur:
+                statements.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        statements.append(cur)
+    return statements
+
+
+def _has_non_let_assignment(toks: Sequence[str]) -> bool:
+    """Whether `toks` contains any `=` outside an inner `let` header."""
+    in_let_header = False
+    for tok in toks:
+        if tok in (";", "{", "}"):
+            in_let_header = False
+        elif tok == "let":
+            in_let_header = True
+        elif tok == "=":
+            if not in_let_header:
+                return True
+            in_let_header = False
+    return False
+
+
 def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
     """Fold a Rust `{ ... }` block body without ignoring earlier control flow."""
-    statements = [part for part in _split_top(toks, {";"}) if part]
+    statements = _split_rust_block_statements(toks)
     if not statements:
         return None
     bindings: dict[str, str] = {}
@@ -4771,9 +5132,10 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
         if stmt[0] == "return":
             return _const_truth(_subst_ident_map(stmt[1:], bindings), depth + 1)
         if (
-            any(word in _RUST_BLOCK_CTRL_WORDS for word in stmt)
+            any(word in _RUST_BLOCK_ABORT_WORDS for word in stmt)
             or "?" in stmt
             or _has_macro_invocation(stmt)
+            or _has_call_expr(stmt)
         ):
             return None
         if stmt[0] == "let":
@@ -4781,6 +5143,8 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
             if eq_split is None:
                 continue
             lhs, rhs = eq_split
+            if _has_non_let_assignment(rhs):
+                return None
             if lhs[:1] == ["mut"]:
                 lhs = lhs[1:]
             lhs = _split_top(lhs, {":"})[0]
@@ -4788,7 +5152,7 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
             if len(lhs) != 1 or not (lhs[0] == "_" or _is_spec_word(lhs[0])):
                 # Refutable destructuring (`let Ok(x) = ...` / `let true = ...`).
                 return None
-            binder = _unquote_ident(lhs[0])
+            binder = _ident_key(lhs[0])
             rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
             if binder != "_":
                 if rhs_val is True:
@@ -4799,15 +5163,13 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
                     bindings.pop(binder, None)
             continue
         eq_split = _split_first_top(stmt, {"="})
-        if eq_split is not None:
+        if eq_split is not None and stmt[0] not in ("{", "if", "match", "unsafe"):
             lhs, rhs = eq_split
             lhs_s = _strip_parens(lhs)
-            if len(lhs_s) != 1 or not _is_spec_word(lhs_s[0]):
-                # Compound assignment (`&=`, `|=`) or field/deref mutation: abort folding.
+            if len(lhs_s) != 1 or not _is_spec_word(lhs_s[0]) or _has_non_let_assignment(rhs):
+                # Compound assignment (`&=`, `|=`), inner mutation, or field/deref mutation: abort.
                 return None
-            if _has_call_expr(rhs):
-                return None
-            target = _unquote_ident(lhs_s[0])
+            target = _ident_key(lhs_s[0])
             rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
             if rhs_val is True:
                 bindings[target] = "true"
@@ -4816,7 +5178,7 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
             else:
                 bindings.pop(target, None)
             continue
-        if _has_call_expr(stmt):
+        if _has_non_let_assignment(stmt):
             return None
     return _const_truth(_subst_ident_map(statements[-1], bindings), depth + 1)
 
@@ -4836,7 +5198,7 @@ def _strip_lean_let_prefix(toks: Sequence[str], depth: int) -> list[str] | None:
     binder_lhs = _strip_parens(_split_top(binder_lhs, {":"})[0])
     if len(binder_lhs) != 1:
         return None
-    binder = _unquote_ident(binder_lhs[0])
+    binder = _ident_key(binder_lhs[0])
     if binder == "_":
         return rest
     if not _is_spec_word(binder_lhs[0]):
@@ -4846,7 +5208,7 @@ def _strip_lean_let_prefix(toks: Sequence[str], depth: int) -> list[str] | None:
         return _subst_ident_map(rest, {binder: "True"})
     if rhs_val is False:
         return _subst_ident_map(rest, {binder: "False"})
-    if all(_unquote_ident(tok) != binder for tok in rest):
+    if all(_ident_key(tok) != binder for tok in rest):
         return rest
     return None
 
@@ -4921,7 +5283,9 @@ def _eval_lean_match_arms(arms_toks: Sequence[str], depth: int) -> bool | None:
     """Fold Lean `| <pat> => <body> ...` arms when every arm returns the same constant."""
     if not arms_toks:
         return None
-    # Split on top-level `|`, preserving nested `match`/`fun |` inside an arm body.
+    # Split on top-level `|`; layout-delimited nested `match`/`fun |` blocks are
+    # parenthesized by `_normalize_lean_layout_lets`, and single-line inline ones
+    # stay guarded by `nested_match`.
     segments: list[list[str]] = [[]]
     bdepth = 0
     saw_arrow = False
@@ -4989,12 +5353,23 @@ def _eval_rust_match(toks: Sequence[str], depth: int) -> bool | None:
             bdepth -= 1
             if bdepth == 0 and idx == len(toks) - 1 and open_idx > 1:
                 break
-            if bdepth == 0 and open_idx >= 0:
-                return None
+            if bdepth == 0 and open_idx >= 0 and tok == "}":
+                nxt_tok = toks[idx + 1] if idx + 1 < len(toks) else ""
+                if nxt_tok != "{" and nxt_tok not in _RUST_EXPR_CONT_OPS:
+                    return None
+                open_idx = -1
     if open_idx <= 1:
         return None
     scrutinee = toks[1:open_idx]
-    if not _is_pure_reflexive_operand(scrutinee):
+    if (
+        any(word in _RUST_BLOCK_ABORT_WORDS for word in scrutinee)
+        or "?" in scrutinee
+        or "/" in scrutinee
+        or "%" in scrutinee
+        or _has_macro_invocation(scrutinee)
+        or _has_call_expr(scrutinee)
+        or _has_non_let_assignment(scrutinee)
+    ):
         return None
     inner = toks[open_idx + 1 : -1]
     if not inner:
@@ -5015,12 +5390,10 @@ def _eval_rust_match(toks: Sequence[str], depth: int) -> bool | None:
         if tok in _SPEC_CLOSERS:
             bdepth -= 1
             cur.append(tok)
-            if bdepth == 0 and tok == "}" and saw_arrow:
-                nxt = inner[idx + 1] if idx + 1 < n else ""
-                if nxt not in ("else", "=", ",") and nxt not in _RUST_EXPR_CONT_OPS:
-                    raw_arms.append(cur)
-                    cur = []
-                    saw_arrow = False
+            if bdepth == 0 and tok == "}" and saw_arrow and _rust_brace_ends_arm(inner, idx):
+                raw_arms.append(cur)
+                cur = []
+                saw_arrow = False
             idx += 1
             continue
         if bdepth == 0 and tok == ",":
@@ -5064,6 +5437,10 @@ def _eval_rust_match(toks: Sequence[str], depth: int) -> bool | None:
         if not guard_always_true or not any(_alt_is_catch_all(a) for a in alts):
             return None
         return val
+    # An exhaustive Rust `match` always contains at least one unguarded (or
+    # unconditionally-true guarded) arm; guarded-only partial snippets cannot fold.
+    if not any(guard_always_true for _, guard_always_true, _ in parsed):
+        return None
     vals = [val for _, _, val in parsed]
     if all(v is True for v in vals):
         return True
@@ -5134,9 +5511,9 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
             ["trivial"], ["exact", "trivial"], ["exact", "True", ".", "intro"], ["constructor"]
         ) else None
     if toks[0] in ("∀", "forall"):
-        comma_parts = _split_top(toks[1:], {","})
-        if len(comma_parts) >= 2 and comma_parts[-1]:
-            body_val = _const_truth(comma_parts[-1], depth + 1)
+        comma_split = _split_first_top(toks[1:], {","})
+        if comma_split is not None and comma_split[1]:
+            body_val = _const_truth(comma_split[1], depth + 1)
             return True if body_val is True else None
         return None
     if toks[0] == "fun" or toks[0].startswith("λ"):
@@ -5285,9 +5662,18 @@ def _unquote_ident(text: str) -> str:
     return text[1:-1] if len(text) >= 3 and text[0] == "«" and text[-1] == "»" else text
 
 
+def _ident_key(text: str) -> str:
+    """Canonical identifier name, stripping Lean `«...»` or Rust `r#`."""
+    if text.startswith("r#") and len(text) > 2:
+        return text[2:]
+    return _unquote_ident(text)
+
+
 def _is_spec_word(text: str) -> bool:
     if len(text) >= 3 and text[0] == "«" and text[-1] == "»":
         return bool(text[1:-1].strip())
+    if text.startswith("r#") and len(text) > 2:
+        return _SPEC_WORD_RE.fullmatch(text[2:]) is not None
     return _SPEC_WORD_RE.fullmatch(text) is not None
 
 
@@ -5295,6 +5681,9 @@ def _is_wildcard_payload_word(word: str) -> bool:
     """A payload word that binds or ignores instead of constraining (`_`, `e`)."""
     if not _is_spec_word(word):
         return False
+    if word.startswith("r#") and len(word) > 2:
+        plain = word[2:]
+        return plain[0] == "_" or not plain[0].isupper()
     plain = _unquote_ident(word)
     if plain in ("true", "false"):
         return False
@@ -5305,6 +5694,9 @@ def _is_catch_all_word(word: str) -> bool:
     """A lone pattern word that matches every value (`_`, `other`)."""
     if not _is_spec_word(word):
         return False
+    if word.startswith("r#") and len(word) > 2:
+        plain = word[2:]
+        return plain[0] == "_" or plain[0].islower()
     plain = _unquote_ident(word)
     if plain in _SPECIFIC_LOWER_PATTERNS:
         return False
@@ -5381,7 +5773,7 @@ def _payload_is_wildcard(payload: Sequence[str], depth: int = 0) -> bool:
                 if not all(_payload_is_wildcard(fp, depth + 1) for fp in field_pats):
                     return False
             elif text == "[":
-                if inner != [".."]:
+                if _strip_pattern_wrappers(inner) != [".."]:
                     return False
             else:
                 return False
@@ -5443,7 +5835,7 @@ def _alt_head(alt: Sequence[str]) -> tuple[str | None, bool, list[str]]:
         idx += 1
     head: str | None = None
     while idx < len(toks) and _is_spec_word(toks[idx]):
-        head = _unquote_ident(toks[idx])
+        head = _ident_key(toks[idx])
         idx += 1
         if idx + 1 < len(toks) and toks[idx] in ("::", ".") and _is_spec_word(toks[idx + 1]):
             after_dot = toks[idx] == "."
@@ -5455,7 +5847,7 @@ def _alt_head(alt: Sequence[str]) -> tuple[str | None, bool, list[str]]:
 
 def _error_ctor(word: str, after_dot: bool) -> str | None:
     """`ErrorCtor::of`: capitalized names stand alone, lowercase ones need a dot."""
-    word = _unquote_ident(word)
+    word = _ident_key(word)
     if word == "Err":
         return "err"
     if word in ("Ub", "UB"):
@@ -5557,36 +5949,149 @@ def _alt_is_catch_all(alt: Sequence[str], depth: int = 0) -> bool:
 def _normalize_lean_layout_lets(
     body_toks: Sequence[tuple[str, int, int, bool]],
 ) -> list[str]:
-    """Insert `;` where a newline-terminated Lean `let` / `have` returns to its indent."""
+    """Insert `;` for layout `let`/`have` and `(` `)` around layout `match`/`fun |` blocks."""
     out: list[str] = []
-    # Stack of `(bracket_depth, let_col, saw_assign)` for open `let` / `have` headers.
-    open_lets: list[list[int]] = []
+    line_first_col: dict[int, int] = {}
+    for _t, ln, col, _first in body_toks:
+        line_first_col.setdefault(ln, col)
+    # LIFO stack of layout blocks:
+    # - `{"kind": "let", "depth": d, "col": c, "ready": 0|1}`
+    # - `{"kind": "match", "depth": d, "min_col": m, "arm_col": -1|c, "saw_with": 0|1, "if_count": k}`
+    layout: list[dict[str, int | str]] = []
     depth = 0
-    for text, _line, col, first_on_line in body_toks:
+    n = len(body_toks)
+    for idx, (text, ln, col, first_on_line) in enumerate(body_toks):
         if first_on_line:
-            closed = False
-            while open_lets and open_lets[-1][0] == depth and open_lets[-1][2] and col <= open_lets[-1][1]:
-                open_lets.pop()
-                closed = True
-            if closed and out and out[-1] not in (";", "in"):
+            closed_let = False
+            while layout and layout[-1]["depth"] == depth:
+                top = layout[-1]
+                if top["kind"] == "match":
+                    arm_c = int(top["arm_col"])
+                    thresh = arm_c if arm_c != -1 else int(top["min_col"])
+                    if col < thresh:
+                        layout.pop()
+                        out.append(")")
+                        continue
+                    break
+                if int(top["ready"]) and col <= int(top["col"]):
+                    layout.pop()
+                    closed_let = True
+                    continue
+                break
+            if closed_let and out and out[-1] not in (";", "in"):
                 out.append(";")
         if text in _SPEC_OPENERS:
             depth += 1
-        elif text in _SPEC_CLOSERS:
-            open_lets = [entry for entry in open_lets if entry[0] < depth]
+            out.append(text)
+            continue
+        if text in _SPEC_CLOSERS:
+            while layout and int(layout[-1]["depth"]) >= depth:
+                popped = layout.pop()
+                if popped["kind"] == "match":
+                    out.append(")")
             depth -= 1
-        elif text in (";", "in"):
-            while open_lets and open_lets[-1][0] == depth and open_lets[-1][2]:
-                open_lets.pop()
-        elif text in ("let", "have"):
-            open_lets.append([depth, col, 0])
+            out.append(text)
+            continue
+        if text in (";", "in"):
+            while layout and layout[-1]["depth"] == depth:
+                top = layout[-1]
+                if top["kind"] == "match":
+                    layout.pop()
+                    out.append(")")
+                    continue
+                if int(top["ready"]):
+                    layout.pop()
+                    if text == "in":
+                        break
+                    continue
+                break
+            out.append(text)
+            continue
+        if text == "if":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match":
+                    entry["if_count"] = int(entry["if_count"]) + 1
+                    break
+        elif text == "else":
+            while layout and layout[-1]["depth"] == depth and layout[-1]["kind"] == "match":
+                top = layout[-1]
+                if int(top["if_count"]) > 0:
+                    top["if_count"] = int(top["if_count"]) - 1
+                    break
+                layout.pop()
+                out.append(")")
+        is_match_head = text == "match" or (
+            (text == "fun" or text.startswith("λ"))
+            and idx + 1 < n
+            and body_toks[idx + 1][0] == "|"
+        )
+        if is_match_head:
+            after_arrow = any(
+                body_toks[p][0] == "=>" and body_toks[p][1] == ln
+                for p in range(idx - 1, -1, -1)
+                if body_toks[p][1] == ln
+            )
+            min_col = line_first_col[ln] + (1 if after_arrow else 0)
+            out.append("(")
+            layout.append(
+                {
+                    "kind": "match",
+                    "depth": depth,
+                    "min_col": min_col,
+                    "arm_col": -1,
+                    "saw_with": 0 if text == "match" else 1,
+                    "if_count": 0,
+                }
+            )
+            out.append(text)
+            continue
+        if text == "with":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match" and not int(entry["saw_with"]):
+                    entry["saw_with"] = 1
+                    break
+        elif text == "|":
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "match":
+                    if int(entry["saw_with"]) and int(entry["arm_col"]) == -1:
+                        entry["arm_col"] = col
+                    break
+        elif text in ("let", "have") and (not out or out[-1] != "if"):
+            layout.append({"kind": "let", "depth": depth, "col": col, "ready": 0})
         elif text == ":=":
-            for entry in reversed(open_lets):
-                if entry[0] == depth and not entry[2]:
-                    entry[2] = 1
+            for entry in reversed(layout):
+                if entry["depth"] == depth and entry["kind"] == "let" and not int(entry["ready"]):
+                    entry["ready"] = 1
                     break
         out.append(text)
+    while layout:
+        popped = layout.pop()
+        if popped["kind"] == "match":
+            out.append(")")
     return out
+
+
+def _has_rust_if_guard_before_brace(
+    texts: Sequence[str], partner: dict[int, int], open_idx: int
+) -> bool:
+    """Whether `{` at `open_idx` sits inside a Rust match-arm `if` guard rather than a prior arm body."""
+    g = open_idx - 1
+    found_guard_if = False
+    while g >= 0:
+        gt = texts[g]
+        if gt in _SPEC_CLOSERS:
+            g = partner[g] - 1
+            continue
+        if gt in _SPEC_OPENERS or gt in ("=>", ";", ",", ":="):
+            break
+        if gt == "if":
+            prev_gt = texts[g - 1] if g > 0 else ""
+            if prev_gt in ("=>", "return", "=", "let", ";", "{"):
+                return False
+            if prev_gt != "else":
+                found_guard_if = True
+        g -= 1
+    return found_guard_if
 
 
 def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
@@ -5618,9 +6123,9 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
 
     arms: list[dict[str, object]] = []
     decl_by_enclosing: dict[int, int] = {}
-    # Per delimiter scope, stack of `[line_indent, match_token_idx, first_arm_col]`
+    # Per delimiter scope, stack of `[head_col, match_token_idx, first_arm_col, min_arm_col]`
     # so sequential and nested Lean `match ... with` and `fun | ...` expressions
-    # never collide even when arms align with `let` rather than `match`.
+    # never collide even when `match` sits after `=>` with indented arms below.
     lean_matches: dict[int, list[list[int]]] = {}
     for i, text_ in enumerate(texts):
         enc = enclosing[i]
@@ -5638,21 +6143,22 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
         if is_lean_match_head:
             cur_line = toks[i][1]
             after_arrow_on_line = any(
-                texts[p] == "=>" and toks[p][1] == cur_line
+                texts[p] == "=>" and enclosing[p] == enc and toks[p][1] == cur_line
                 for p in range(i - 1, -1, -1)
                 if toks[p][1] == cur_line
             )
-            line_indent = toks[i][2] if after_arrow_on_line else line_col[cur_line]
+            head_col = toks[i][2] if after_arrow_on_line else line_col[cur_line]
+            min_arm_col = line_col[cur_line] + (1 if after_arrow_on_line else 0)
             m_stack = lean_matches.setdefault(enc, [])
             while m_stack:
-                top_indent, top_idx, top_arm_col = m_stack[-1]
-                if top_arm_col != -1 and line_indent <= top_arm_col:
+                top_head_col, top_idx, top_arm_col, _top_min = m_stack[-1]
+                if top_arm_col != -1 and head_col <= top_arm_col:
                     m_stack.pop()
-                elif top_arm_col == -1 and top_indent >= line_indent and toks[i][1] > toks[top_idx][1]:
+                elif top_arm_col == -1 and top_head_col >= head_col and toks[i][1] > toks[top_idx][1]:
                     m_stack.pop()
                 else:
                     break
-            m_stack.append([line_indent, i, -1])
+            m_stack.append([head_col, i, -1, min_arm_col])
         if text_ == "matches" and texts[i + 1 : i + 3] == ["!", "("]:
             close = partner[i + 2]
             first_comma = _split_first_top(texts[i + 3 : close], {","})
@@ -5722,8 +6228,11 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                     if (
                         j == i - 1
                         or after_brace == "else"
-                        or after_brace in _RUST_EXPR_CONT_OPS
                         or (is_struct_pat and after_brace in ("|", "if"))
+                        or (
+                            (after_brace in _RUST_EXPR_CONT_OPS or after_brace == "{")
+                            and _has_rust_if_guard_before_brace(texts, partner, open_idx)
+                        )
                     ):
                         j = open_idx - 1
                         continue
@@ -5767,7 +6276,9 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
         alt_lo = min(max(pat_lo, pat_lo + len(pattern) - alt_tokens), i - 1)
         alt_line = toks[alt_lo][1]
         after_arrow_on_alt_line = any(
-            texts[p] == "=>" for p in range(alt_lo - 1, -1, -1) if toks[p][1] == alt_line
+            texts[p] == "=>" and enclosing[p] == enc
+            for p in range(alt_lo - 1, -1, -1)
+            if toks[p][1] == alt_line
         )
         if after_arrow_on_alt_line:
             bar_col = toks[alt_lo - 1][2] if alt_lo > 0 and texts[alt_lo - 1] == "|" and toks[alt_lo - 1][1] == alt_line else toks[alt_lo][2]
@@ -5778,10 +6289,10 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
         if lean:
             m_stack = lean_matches.get(enc, [])
             while m_stack:
-                top_indent, _top_idx, top_arm_col = m_stack[-1]
+                _top_head, _top_idx, top_arm_col, top_min_arm_col = m_stack[-1]
                 if top_arm_col != -1 and arm_col < top_arm_col:
                     m_stack.pop()
-                elif top_arm_col == -1 and arm_col < top_indent:
+                elif top_arm_col == -1 and arm_col < top_min_arm_col:
                     m_stack.pop()
                 else:
                     break
@@ -5798,29 +6309,9 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
             nxt = texts[k]
             if nxt in _SPEC_OPENERS:
                 close_idx = partner[k]
-                if not lean and nxt == "{":
-                    after = texts[close_idx + 1] if close_idx + 1 < count else ""
-                    starts_leading_bar_arm = False
-                    if after == "|":
-                        # Distinguish a leading-`|` match arm (`| Ok(v) => ...`) from bitwise OR.
-                        probe = close_idx + 2
-                        while probe < count:
-                            pt = texts[probe]
-                            if pt in _SPEC_OPENERS:
-                                probe = partner[probe] + 1
-                                continue
-                            if pt == "=>":
-                                starts_leading_bar_arm = True
-                                break
-                            if pt in _SPEC_CLOSERS or pt in (",", ";"):
-                                break
-                            probe += 1
-                    if (
-                        starts_leading_bar_arm
-                        or (after not in ("else", "=") and after not in _RUST_EXPR_CONT_OPS)
-                    ):
-                        k = close_idx + 1
-                        break
+                if not lean and nxt == "{" and _rust_brace_ends_arm(texts, close_idx):
+                    k = close_idx + 1
+                    break
                 k = close_idx + 1
                 continue
             if nxt in _SPEC_CLOSERS or (nxt in (";", ",") and not lean):

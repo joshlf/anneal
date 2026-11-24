@@ -5284,5 +5284,131 @@ class GuardMutationEp2B2AdversarialTests(unittest.TestCase):
             )
 
 
+class GuardMutationEp2A2AdversarialTests(unittest.TestCase):
+    """Pass A2 adversarial regression tests for Shard A layout/shadowing/raw-ident/arm-boundary edges."""
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [f.pattern for f in gmut.detect_postcondition_error_wildcards(source, language=language)]
+
+    def test_lean_inline_ok_match_and_nested_layout_matches_without_false_positives_or_bypasses(self) -> None:
+        # Inner `match x with` starting on the `| .ok v =>` line with indented `| _ => True`
+        # belongs to the `.ok` arm's inner match, NOT the outer `Outcome` match!
+        guarded_ok_match = (
+            "def post (x : Nat) : Outcome Nat → Prop\n"
+            "  | .ok v => match x with\n"
+            "    | 0 => v = 1\n"
+            "    | _ => True\n"
+            "  | .ub => False\n"
+            "  | .err e => e = .overflow\n"
+            "  | .unsupported => False\n"
+        )
+        self.assertEqual(self._patterns(guarded_ok_match, "lean"), [])
+        self.assertEqual(
+            gmut.verify_postcondition_kills_error_mutants(guarded_ok_match, language="lean")["ok"],
+            True,
+        )
+
+        # Nested layout `match` inside the first arm of an outer `match` followed by another outer arm:
+        # vacuous when all outer+inner arms are `True`, sound when a trailing outer arm constrains `e`.
+        vacuous_nested = (
+            "def post (x y : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err _ =>\n"
+            "    match x with\n"
+            "    | true =>\n"
+            "      match y with\n"
+            "      | true => True\n"
+            "      | false => True\n"
+            "    | false => True\n"
+        )
+        self.assertEqual(self._patterns(vacuous_nested, "lean"), ["err_arm_true"])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(vacuous_nested, "err", language="lean")["status"],
+            "SURVIVED",
+        )
+
+        sound_nested = (
+            "def post (t : Tag) (y : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err e =>\n"
+            "    match t with\n"
+            "    | .a => True\n"
+            "    | .b =>\n"
+            "      match y with\n"
+            "      | true => True\n"
+            "      | false => True\n"
+            "    | .c => e = .overflow\n"
+        )
+        self.assertEqual(self._patterns(sound_nested, "lean"), [])
+
+    def test_pattern_binder_shadowing_in_match_if_let_and_quantifier_binder_types(self) -> None:
+        # Outer constant `let` shadowed by `match` or `if let` pattern binders must NOT fold to True!
+        for sound_rust in (
+            "Err(e) => { let ok = true; match e { E::Check(ok) => ok, _ => true } }",
+            "Err(e) => { let ok = true; if let E::Check(ok) = e { ok } else { true } }",
+            "Err(e) => { let mut ok = true; { ok = *e == E::Overflow; }; ok }",
+            "Err(e) => { let mut ok = true; if *e != E::Overflow { ok = false; } ok }",
+            "Err(e) => match e { x if *x == E::A => true, y if *y == E::B => true }",
+        ):
+            self.assertEqual(self._patterns(sound_rust, "rust"), [], sound_rust)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(sound_rust, "err", language="rust")["status"],
+                "KILLED",
+                sound_rust,
+            )
+
+        for sound_lean in (
+            "| .err e =>\n  let ok := True\n  if let .check ok := e then ok else True",
+            "| .err e =>\n  let x := True\n  match e with\n  | .code x => x\n  | .other => True",
+            "| .err e => ∀ (_ : Unit), ∃ (h : e = .overflow), True",
+        ):
+            self.assertEqual(self._patterns(sound_lean, "lean"), [], sound_lean)
+
+        # Conversely, non-shadowing `if let` else-branch, binder-type free variable, and un-shadowed arms fold!
+        self.assertEqual(
+            self._patterns("Err(_) => { let ok = true; if let E::Check(ok) = x { true } else { ok } }", "rust"),
+            ["err_arm_true"],
+        )
+        self.assertEqual(
+            self._patterns("| .err _ =>\n  let ok := True\n  if let .check ok := x then True else ok", "lean"),
+            ["err_arm_true"],
+        )
+        self.assertEqual(
+            self._patterns("| .ub =>\n  let p := True\n  ∀ (h : P p), p", "lean"),
+            ["ub_arm_true"],
+        )
+
+    def test_rust_raw_identifiers_reference_arm_boundaries_and_semicolonless_blocks(self) -> None:
+        for vacuous_rust, expected in (
+            ("Err(r#e) => true", ["err_arm_true"]),
+            ("r#Err(r#true) => true", ["err_arm_true"]),
+            ("Err([xs @ ..]) => true", ["err_arm_true"]),
+            ("Err(_) => { if cond {} true }", ["err_arm_true"]),
+            ("Err(_) => { { let _ = 1; } true }", ["err_arm_true"]),
+            ("Err(_) => if unsafe { cond } { true } else { true }", ["err_arm_true"]),
+            ("Err(_) => match { x } { _ => true }", ["err_arm_true"]),
+            (
+                "match out_ref {\n"
+                "    &Err(_) => { true }\n"
+                "    &Ok(v) => v == 1,\n"
+                "}\n",
+                ["err_arm_true"],
+            ),
+            (
+                "match out_ref {\n"
+                "    &Ok(v) => { v == 1 }\n"
+                "    r#true => true,\n"
+                "}\n",
+                ["catch_all_arm_true"],
+            ),
+        ):
+            self.assertEqual(self._patterns(vacuous_rust, "rust"), expected, vacuous_rust)
+
+        # `r#true` in expression position is an identifier variable, NOT the boolean literal `true`!
+        self.assertEqual(self._patterns("Err(r#true) => r#true", "rust"), [])
+        self.assertEqual(self._patterns("Err(e) => if *e != E::Overflow { return false; } else { true }", "rust"), [])
+        self.assertEqual(self._patterns("Err(e) => { if *e != E::Overflow { return false; } true }", "rust"), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1259,5 +1259,113 @@ class Ep2B2AdversarialTests(GuardHarness):
         self.assertIn("MALFORMED_RECEIPT", codes)
 
 
+class Ep2A2AdversarialTests(GuardHarness):
+    """Pass A2 adversarial regression tests for compound subjects, inequalities, `not rc=k`, and adapters."""
+
+    def test_compound_step_subjects_in_tables_and_bullets_cannot_mask_unbacked_or_failed_steps(self) -> None:
+        red_cargo = [bundle(cargo_test={"exit_code": 1, "ok": False})]
+        # Multi-cell table rows: col0 fabricated or failing step cannot be overshadowed by col1 real step/cmd.
+        self.assertEqual(
+            self.codes("| `fabricated_step` | `python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v` | PASS | 42 passed |\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+        self.assertEqual(
+            self.codes("| `cargo_test` | `unit_tests` | PASS | 42 passed |\n", red_cargo),
+            ["COUNT_MISMATCH", "SUPPRESSED_FAILURE"],
+        )
+        # Same step referenced by ID in col0 and by its own command in col1 deduplicates cleanly.
+        self.assertEqual(
+            self.codes("| `unit_tests` | `python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v` | PASS | 42 passed |\n"),
+            [],
+        )
+
+        # Compound leading bullet subjects (`A and B:`, `A + B:`) check every named subject.
+        self.assertEqual(
+            self.codes("- `fabricated_step` and `unit_tests`: rc=0, 42 passed\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+        self.assertEqual(
+            self.codes("- `cargo test --workspace` + `unit_tests`: rc=0, 42 passed\n"),
+            ["UNBACKED_CLAIM"],
+        )
+        self.assertEqual(
+            self.codes("- `cargo_test` and `unit_tests`: PASS\n", red_cargo),
+            ["SUPPRESSED_FAILURE"],
+        )
+        self.assertEqual(self.codes("- `cargo_test` and `unit_tests`: PASS\n"), [])
+
+        # Comparative word before a step that immediately introduces its own `:` claims is NOT secondary!
+        self.assertEqual(
+            self.codes("- `cargo_test` (118 passed), unlike `unit_tests`: 118 passed\n"),
+            ["INFLATED_COUNT"],
+        )
+
+    def test_multi_char_inequalities_double_equals_zero_denominators_and_placeholders_fail_closed(self) -> None:
+        # `<=0 survived`, `>=420 passed`, `!= 0 failed`, `passed >= 999`, `0/0 killed`, `status: TBD`, `ok=TBD`.
+        self.assertEqual(
+            self.codes("`guard_mutation`: <=0 survived, 15 killed\n", [guard_mutation(15, 5)]),
+            ["MALFORMED_CLAIM"],
+        )
+        self.assertEqual(
+            self.codes("`guard_mutation`: 0/0 killed\n", [guard_mutation(fatal="boom")]),
+            ["MALFORMED_CLAIM"],
+        )
+        for bad in (
+            "`unit_tests`: >=420 passed, rc=0\n",
+            "`unit_tests`: >= 420 passed, rc=0\n",
+            "`unit_tests`: != 0 failed\n",
+            "`unit_tests`: passed >= 999, rc=0\n",
+            "`unit_tests`: failed <= 5, rc=0\n",
+            "`unit_tests`: status: TBD, 42 passed\n",
+            "`unit_tests`: ok=TBD, 42 passed\n",
+        ):
+            self.assertEqual(self.codes(bad), ["MALFORMED_CLAIM"], bad)
+
+        # `==` forms (`passed == 999`, `rc == 0`, `ok == true`) are parsed and verified cleanly.
+        self.assertEqual(self.codes("`unit_tests`: passed == 999, rc == 0\n"), ["INFLATED_COUNT"])
+        self.assertEqual(self.codes("`unit_tests`: passed == 42, rc == 0, ok == true\n"), [])
+
+    def test_non_zero_rc_negation_fence_verdict_info_axiom_commas_and_check_trusted_fields(self) -> None:
+        red_unit = [bundle(unit_tests={"returncode": 1, "ok": False})]
+        # `not rc=1`, `did not exit 1`, and `rc != 1` fail when the step actually exited with `1`!
+        for prose in (
+            "`unit_tests`: not rc=1\n",
+            "`unit_tests`: did not exit 1\n",
+            "`unit_tests`: rc != 1\n",
+            "`unit_tests`: exit_code ≠ 1\n",
+        ):
+            self.assertEqual(self.codes(prose, red_unit), ["EXIT_CODE_MISMATCH"], prose)
+            self.assertEqual(self.codes(prose), [], prose)
+        self.assertEqual(self.codes("`unit_tests`: status != PASS\n", red_unit), [])
+        self.assertEqual(self.codes("`unit_tests`: status != PASS\n"), ["EXIT_CODE_MISMATCH"])
+
+        # Verdict token (`PASS`) smuggled as a fence opener info string under a failing step heading is caught.
+        self.assertEqual(self.codes("## unit_tests\n```PASS\n```\n", red_unit), ["SUPPRESSED_FAILURE"])
+
+        # Axiom list parenthetical note passes, while trailing comma + garbage fails closed.
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (standard)\n"),
+            [],
+        )
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound, ???\n"),
+            ["MALFORMED_CLAIM"],
+        )
+
+        # `check_trusted` non-stdout `rustcCapture` non-dict and boolean integer fields fail closed.
+        self.assertIn("MALFORMED_RECEIPT", self.codes("`check_trusted`: rc=0\n", [{"rustcCapture": 123}]))
+        self.assertIn(
+            "MALFORMED_RECEIPT",
+            self.codes("`check_trusted`: rc=0\n", [{**CHECK_TRUSTED, "compilerOnlyNames": True}]),
+        )
+        self.assertIn(
+            "MALFORMED_RECEIPT",
+            self.codes(
+                "`check_trusted`: rc=0\n",
+                [{"trusted": {"modules": True, "waivers": 0}, "rustcCapture": {"files": 1}, "downstream": {"files": 1}}],
+            ),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
