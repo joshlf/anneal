@@ -29,6 +29,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
@@ -572,7 +573,20 @@ ALWAYS_FORBIDDEN_TOKENS: tuple[str, ...] = (
 NATIVE_TACTIC_TOKENS: tuple[str, ...] = ("native_decide", "bv_decide", "bv_check")
 
 
-BUILTIN_INTERP_PREFIXES: frozenset[str] = frozenset({"s!", "m!", "f!", "println!", "dbg_trace"})
+BUILTIN_INTERP_PREFIXES: frozenset[str] = frozenset(
+    {
+        "s!",
+        "m!",
+        "f!",
+        "v!",
+        "println!",
+        "dbg_trace",
+        "throwError",
+        "reportIssue!",
+        "reportDbgIssue!",
+        "reportEMatchIssue!",
+    }
+)
 
 
 def _lex_lean_source_both(src: str) -> tuple[str, str]:
@@ -580,13 +594,14 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
 
     - `token_stream` is the faithful port of `Anneal.ReplayKeyAndTamperAudit.SourceScanner.lexSource`
       with `+1]'` checked strictly outside comments and string/char literals, interpolated-string
-      tracking across whitespace/comments after `s!`, `m!`, `f!`, `println!`, `dbg_trace`,
-      `Macro.trace[...]` / `trace[...]` (plus any glued `<ident>!"..."` prefix, without crashing on
-      `echo! "{"`).
+      tracking across whitespace/comments after `s!`, `m!`, `f!`, `v!`, `println!`, `dbg_trace`,
+      `throwError`, `report*Issue!`, `Macro.trace[...]` / `trace[...]` / `trace_goal[...]` (plus any
+      glued `<ident>!"..."` prefix, without crashing on `echo! "{"` or `trace[0] "{"`).
     - `raw_code_stream` is emitted in exact lockstep from the SAME state machine (eliminating
       two-lexer desyncs such as `«"»`, `«--»`, `«/-»`, or `«s!»`), preserving code punctuation
-      (`+`, `-`, `(`, `)`, `:`, `=`) and interpolation holes while erasing comments and plain/raw/char
-      literals and sanitizing guillemet identifiers.
+      (`+`, `-`, `(`, `)`, `:`, `=`), splitting numeric literal prefixes from adjacent tactic names
+      (`0b1decide`, `0o1decide`), and wrapping guillemet identifiers in `«...»` so `«decide» -kernel`
+      never false-positives while `decide +«revert»` and `decide («kernel» := false)` are caught.
     """
     state: tuple[Any, ...] = ("code", "other")
     out: list[str] = []
@@ -596,20 +611,24 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
     cur_ident = ""
     after_interp_prefix = False
     trace_bracket_depth = 0
+    trace_bracket_valid = False
     guillemet_buf: list[str] = []
 
     def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
-        nonlocal after_interp_prefix, cur_ident, trace_bracket_depth
+        nonlocal after_interp_prefix, cur_ident, trace_bracket_depth, trace_bracket_valid
         sep = " " if prev == "escIdent" else ""
         if prev == "ident" and _is_id_rest(c):
             cur_ident += c
-            after_interp_prefix = cur_ident in BUILTIN_INTERP_PREFIXES
+            if trace_bracket_depth == 0:
+                after_interp_prefix = cur_ident in BUILTIN_INTERP_PREFIXES
             return (("code", "ident"), _visible(c), c)
         if prev == "symIdent" and (_is_id_rest(c) or c in ('"', "#")):
             if c in ("'", '"', "#") or ("0" <= c <= "9"):
                 raise ValueError("literal glued to a symbol keyword")
             cur_ident = ""
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("code", "symIdent"), _visible(c), c)
         if prev == "sym" and c == "'":
             raise ValueError("quote glued to a symbol that may absorb it")
@@ -617,6 +636,8 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             after_interp_prefix = False
             if prev == "sym":
                 cur_ident = ""
+                if trace_bracket_depth > 0:
+                    trace_bracket_valid = False
                 return (("code", "symIdent"), _visible(c), c)
             if c == "r" and prev in ("other", "escIdent", "quoteTok"):
                 cur_ident = "r"
@@ -625,15 +646,21 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 cur_ident = "r"
                 return (("dotR",), "", "")
             cur_ident = c
+            if trace_bracket_depth == 0:
+                after_interp_prefix = cur_ident in BUILTIN_INTERP_PREFIXES
             return (("code", "ident"), sep + _visible(c), c)
         prev_ident = cur_ident
         cur_ident = ""
         if c == ".":
             after_interp_prefix = False
+            if trace_bracket_depth > 0 and prev not in ("ident", "escIdent"):
+                trace_bracket_valid = False
             nxt = "identDot" if prev in ("ident", "escIdent") else "dot"
             return (("code", nxt), ".", ".")
         if "0" <= c <= "9":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             if prev in ("identDot", "dot"):
                 return (("fieldIdx",), c, c)
             if c == "0":
@@ -642,22 +669,28 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
         if c == '"':
             is_interp = (prev == "ident" and last_raw_char == "!") or after_interp_prefix
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             if is_interp:
                 return (("str",), " ", " ")
             return (("plainStr",), " ", " ")
         if c == "'":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             if prev == "quoteTok":
                 return (("code", "other"), " ", "'")
             return (("chrOpen",), " ", " ")
         if c == "`":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             if prev == "tick":
                 raise ValueError("doubled backtick")
             return (("code", "tick"), " ", "`")
         if c == "«":
             after_interp_prefix = False
-            return (("guillemet",), "" if prev in ("identDot", "dot") else " ", "")
+            return (("guillemet",), "" if prev in ("identDot", "dot") else " ", "«")
         if c == "»":
             raise ValueError("unmatched identifier escape")
         if c == "-":
@@ -666,38 +699,60 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             return (("slash",), " ", "")
         if c == "<":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("lt",), " ", "")
         if c == "\\":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("bslash",), " ", "")
         if c == "@":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("code", "other"), " @ ", "@")
         if c == "[":
             after_interp_prefix = False
             if trace_bracket_depth > 0:
                 trace_bracket_depth += 1
-            elif prev_ident == "trace":
+                trace_bracket_valid = False
+            elif prev == "ident" and prev_ident in ("trace", "trace_goal"):
+                # Lean's `Macro.trace[id]`, `trace[id]`, and `trace_goal[id]` require `[`
+                # immediately glued to `trace`/`trace_goal` and an identifier `id` inside `[...]`.
                 trace_bracket_depth = 1
+                trace_bracket_valid = True
             return (("code", "other"), " [ ", "[")
         if c == "]":
             if trace_bracket_depth > 0:
                 trace_bracket_depth -= 1
-                after_interp_prefix = trace_bracket_depth == 0
+                if trace_bracket_depth == 0:
+                    after_interp_prefix = trace_bracket_valid and prev in ("ident", "escIdent")
+                    trace_bracket_valid = False
+                else:
+                    after_interp_prefix = False
             else:
                 after_interp_prefix = False
             return (("code", "quoteTok"), " ] ", "]")
         if c in ("×", "Σ", "⊕"):
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("code", "quoteTok"), " ", c)
         if c == "#":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("code", "sym"), " #", "#")
         if c == "~":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
             return (("code", "sym"), " ", "~")
         if not c.isspace():
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_valid = False
         return (("code", "other"), " ", c)
 
     def step_block(depth: int, c: str) -> tuple[Any, ...]:
@@ -952,9 +1007,10 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             if ch == "»":
                 gname = "".join(guillemet_buf)
                 cur_ident = gname
-                after_interp_prefix = gname in BUILTIN_INTERP_PREFIXES
+                if trace_bracket_depth == 0:
+                    after_interp_prefix = gname in BUILTIN_INTERP_PREFIXES
                 guillemet_buf.clear()
-                state, chunk, raw_chunk = (("code", "escIdent"), "", "")
+                state, chunk, raw_chunk = (("code", "escIdent"), "", "»")
             else:
                 guillemet_buf.append(ch)
                 safe_raw = ch if _is_id_rest(ch) else "_"
@@ -974,14 +1030,14 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         elif tag == "numRadix":
             r = state[1]
             if ch == "_" or _is_radix_digit(r, ch):
                 state, chunk, raw_chunk = (("numRadix", r), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         elif tag == "numDec":
             if ("0" <= ch <= "9") or ch == "_":
                 state, chunk, raw_chunk = (("numDec",), ch, ch)
@@ -991,7 +1047,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         elif tag == "numDot":
             if "0" <= ch <= "9":
                 state, chunk, raw_chunk = (("numFrac",), "." + ch, "." + ch)
@@ -1003,7 +1059,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 raise ValueError("identifier after a decimal point")
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, "." + r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, ". " + r2)
         elif tag == "numFrac":
             if ("0" <= ch <= "9") or ch == "_":
                 state, chunk, raw_chunk = (("numFrac",), ch, ch)
@@ -1011,7 +1067,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         elif tag == "numExpStart":
             if ch in ("+", "-"):
                 state, chunk, raw_chunk = (("numExpSign",), "", ch)
@@ -1029,13 +1085,13 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("numExp",), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         elif tag == "fieldIdx":
             if "0" <= ch <= "9":
                 state, chunk, raw_chunk = (("fieldIdx",), ch, ch)
             else:
                 st2, ch2, r2 = step_code("other", ch)
-                state, chunk, raw_chunk = (st2, " " + ch2, r2)
+                state, chunk, raw_chunk = (st2, " " + ch2, " " + r2)
         else:
             raise ValueError(f"unknown lexer state {tag}")
         last_raw_char = ch
@@ -1097,12 +1153,23 @@ def _strip_tactic_suffix(seg: str) -> str:
     return seg
 
 
+_NUM_PREFIX_RE = re.compile(r"^(?:0[bBoOxX][0-9A-Fa-f_]+|[0-9][0-9_]*)")
+
+
+def _strip_num_prefix(s: str) -> str:
+    if s and ("0" <= s[0] <= "9"):
+        return _NUM_PREFIX_RE.sub("", s, count=1)
+    return s
+
+
 def _segment_is_keyword(kw: str, seg: str) -> bool:
     s0 = _strip_tactic_suffix(seg)
     s = s0 if kw.startswith("#") else (s0[1:] if s0.startswith("#") else s0)
     if s == kw:
         return True
-    return bool(s) and ("0" <= s[0] <= "9") and s.endswith(kw)
+    if bool(s) and ("0" <= s[0] <= "9"):
+        return s.endswith(kw) or _strip_num_prefix(s) == kw
+    return False
 
 
 def _token_has_keyword(kw: str, tok: str) -> bool:
@@ -1154,10 +1221,11 @@ def classify_module_role_py(mod_name: str) -> str | None:
 
 
 _DECIDE_NONKERNEL_FLAG_RE = re.compile(
-    r"(?<![A-Za-z0-9_'!?\.])(?:[0-9]+)?decide[!?]?(?:\s*\+kernel(?![A-Za-z0-9_'!?]))*\s*"
-    r"(?:-(?:[A-Za-z_\u00c0-\uffff])"
-    r"|\+(?!kernel(?![A-Za-z0-9_'!?]))(?:[A-Za-z_\u00c0-\uffff])"
-    r"|\(\s*[A-Za-z_\u00c0-\uffff][A-Za-z0-9_'!?\u00c0-\uffff]*\s*:=)"
+    r"(?<![A-Za-z0-9_'!?\.«])(?:0[bBoOxX][0-9A-Fa-f_]+|[0-9][0-9_]*)?decide[!?]?"
+    r"(?:\s*\+kernel(?![A-Za-z0-9_'!?]))*\s*"
+    r"(?:-(?:[A-Za-z_\u00c0-\uffff«])"
+    r"|\+(?!kernel(?![A-Za-z0-9_'!?]))(?:[A-Za-z_\u00c0-\uffff«])"
+    r"|\(\s*(?:[A-Za-z_\u00c0-\uffff][A-Za-z0-9_'!?\u00c0-\uffff]*|«[^»]+»)\s*:=)"
 )
 
 
@@ -1214,7 +1282,7 @@ def scan_source_defense_in_depth(
     # `builtin_<kw>` & `*_parser`
     for t in toks:
         for seg in t.split("."):
-            s = _strip_tactic_suffix(seg).lstrip("#").lstrip("0123456789")
+            s = _strip_num_prefix(_strip_tactic_suffix(seg).lstrip("#"))
             if s.startswith("builtin_"):
                 rest = s[len("builtin_") :]
                 if rest in ALWAYS_FORBIDDEN_TOKENS:
@@ -1328,6 +1396,19 @@ def computeInitMultiNames (initEnv : Environment) : NameSet × NameSet := Id.run
         s := s.insert ci.name
   return (mods, s)
 
+def isStdlibRootName (m : Name) : Bool :=
+  match m.getRoot with
+  | .str .anonymous "Init" | .str .anonymous "Std" => true
+  | _ => false
+
+def isAuditedOpaque (env : Environment) (c : Name) : Bool :=
+  match env.getModuleIdxFor? c with
+  | some idx =>
+    match env.header.modules[idx.toNat]? with
+    | some im => !isStdlibRootName im.module
+    | none => true
+  | none => true
+
 partial def whnfAllowOpaque (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
   match fuel with
   | 0 => none
@@ -1340,7 +1421,10 @@ partial def whnfAllowOpaque (env : Environment) (fuel : Nat) (e : Expr) : Option
       | some (.defnInfo dv) =>
         whnfAllowOpaque env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
       | some (.opaqueInfo ov) =>
-        whnfAllowOpaque env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+        if isAuditedOpaque env c then
+          whnfAllowOpaque env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+        else
+          some e
       | _ => some e
     | .app f a =>
       match whnfAllowOpaque env fuel' f with
@@ -1358,7 +1442,10 @@ partial def unfoldOpaquesInExpr (env : Environment) (fuel : Nat) (e : Expr) : Op
     | .const c lvls =>
       match env.checked.get.find? c with
       | some (.opaqueInfo ov) =>
-        unfoldOpaquesInExpr env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+        if isAuditedOpaque env c then
+          unfoldOpaquesInExpr env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+        else
+          some e
       | _ => some e
     | .app f a =>
       match unfoldOpaquesInExpr env fuel' f, unfoldOpaquesInExpr env fuel' a with
@@ -1383,29 +1470,34 @@ partial def normExprInEnv (env : Environment) (fuel : Nat) (e : Expr) : Option E
   match fuel with
   | 0 => none
   | fuel' + 1 =>
-    match e with
-    | .mdata _ inner => normExprInEnv env fuel' inner
-    | .letE _ _ v b _ => normExprInEnv env fuel' (b.instantiate1 v)
-    | .const c lvls =>
-      match env.checked.get.find? c with
-      | some (.defnInfo dv) =>
-        normExprInEnv env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
+    if (Lean.annotation? `noindex e).isSome then
+      match e with
+      | .mdata md inner => (normExprInEnv env fuel' inner).map (.mdata md)
       | _ => some e
-    | .app f a =>
-      match normExprInEnv env fuel' f, normExprInEnv env fuel' a with
-      | some (.lam _ _ b _), some a' => normExprInEnv env fuel' (b.instantiate1 a')
-      | some f', some a' => some (.app f' a')
-      | _, _ => none
-    | .forallE n d b bi =>
-      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
-      | some d', some b' => some (.forallE n d' b' bi)
-      | _, _ => none
-    | .lam n d b bi =>
-      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
-      | some d', some b' => some (.lam n d' b' bi)
-      | _, _ => none
-    | .proj s i x => (normExprInEnv env fuel' x).map (.proj s i)
-    | _ => some e
+    else
+      match e with
+      | .mdata _ inner => normExprInEnv env fuel' inner
+      | .letE _ _ v b _ => normExprInEnv env fuel' (b.instantiate1 v)
+      | .const c lvls =>
+        match env.checked.get.find? c with
+        | some (.defnInfo dv) =>
+          normExprInEnv env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
+        | _ => some e
+      | .app f a =>
+        match normExprInEnv env fuel' f, normExprInEnv env fuel' a with
+        | some (.lam _ _ b _), some a' => normExprInEnv env fuel' (b.instantiate1 a')
+        | some f', some a' => some (.app f' a')
+        | _, _ => none
+      | .forallE n d b bi =>
+        match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
+        | some d', some b' => some (.forallE n d' b' bi)
+        | _, _ => none
+      | .lam n d b bi =>
+        match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
+        | some d', some b' => some (.lam n d' b' bi)
+        | _, _ => none
+      | .proj s i x => (normExprInEnv env fuel' x).map (.proj s i)
+      | _ => some e
 
 def isParamWrapperConst (c : Name) : Bool :=
   c == ``optParam || c == ``autoParam || c == ``outParam || c == ``semiOutParam
@@ -1468,7 +1560,7 @@ partial def extractCoeSrcAndTgtForInfo (env : Environment) (rawType : Expr)
                 let nextExps := if isSynth then explicitDoms else explicitDoms.push (idx, d)
                 go fuel' (idx + 1) b nextExps
           | cod =>
-            if explicitDoms.size != 1 || explicitDoms[0]!.1 != coercee then
+            if idx < numArgs || explicitDoms.size != 1 || explicitDoms[0]!.1 != coercee then
               none
             else
               match normExprInEnv env 1024 explicitDoms[0]!.2, normExprInEnv env 1024 cod with
@@ -1780,9 +1872,21 @@ def verifyMutualAllAndLinks (modName : Name) (byName : Std.HashMap Name Constant
       policyFail "foreignQuotDecl" modName #[modName, ci.name] "quotInfo outside standard library"
   | .axiomInfo _ => pure ()
 
+def verifyEntriesUniqueWellFormed (modName : Name)
+    (entries : Array (Name × Array EnvExtensionEntry)) : IO Unit := do
+  let mut seenExts : NameSet := {}
+  for (eName, _) in entries do
+    unless isWellFormedName eName do
+      policyFail "anonymousConstantName" modName #[modName] "malformed extension entry name"
+    if seenExts.contains eName then
+      policyFail "keyNameMismatch" modName #[modName, eName]
+        s!"duplicate extension key {eName} in ModuleData.entries"
+    seenExts := seenExts.insert eName
+
 def verifyModuleInventory (modName : Name) (data : ModuleData)
     (env? : Option Environment := none) : IO (Std.HashMap Name ConstantInfo) := do
   verifyPartKeysOnly modName data
+  verifyEntriesUniqueWellFormed modName data.entries
   let mut byName : Std.HashMap Name ConstantInfo := {}
   for ci in data.constants do
     byName := byName.insert ci.name ci
@@ -1857,83 +1961,59 @@ def isNativeReductionConst (n : Name) : Bool :=
 def isFoundationalAxiom (n : Name) : Bool :=
   n == `propext || n == `Classical.choice || n == `Quot.sound
 
-def checkProvisionalNativeAxiomShape (env : Environment) (user axName : Name) (ci : ConstantInfo) : IO Expr := do
+def checkProvisionalNativeAxiomShape (env : Environment) (modName user axName : Name) (ci : ConstantInfo) : IO Expr := do
   -- Must be ground (`levelParams = []`), `@Eq.{1} Bool e Bool.true` with closed `e`.
   unless ci.levelParams.isEmpty do
-    policyFail "invalidNativeAxiomType" axName #[user, axName]
+    policyFail "invalidNativeAxiomType" modName #[user, axName]
       "provisional native axiom must not have universe parameters"
   let ty := ci.type.consumeMData
   let fn := ty.getAppFn
   let args := ty.getAppArgs
   unless fn == Expr.const ``Eq [Level.one] && args.size == 3 &&
          args[0]!.consumeMData.isConstOf ``Bool && args[2]!.consumeMData.isConstOf ``Bool.true do
-    policyFail "invalidNativeAxiomType" axName #[user, axName]
+    policyFail "invalidNativeAxiomType" modName #[user, axName]
       "provisional native axiom must have type `@Eq.{1} Bool e Bool.true`"
   let lhs := args[1]!
   if lhs.hasFVar || lhs.hasMVar || lhs.hasLooseBVars || lhs.hasLevelParam then
-    policyFail "invalidNativeAxiomType" axName #[user, axName] "open LHS in native axiom"
+    policyFail "invalidNativeAxiomType" modName #[user, axName] "open LHS in native axiom"
   match whnfAllowOpaque env 2048 lhs with
   | none =>
-    policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS reduction exhausted budget"
+    policyFail "invalidNativeAxiomType" modName #[user, axName] "native axiom LHS reduction exhausted budget"
   | some (.const c _) =>
     if c == ``Bool.false then
-      policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS reduces to Bool.false"
+      policyFail "invalidNativeAxiomType" modName #[user, axName] "native axiom LHS reduces to Bool.false"
   | some _ => pure ()
   return lhs
 
 /-- Runs AFTER `baseEnv.toKernelEnv.replay` succeeds so C++ `Lean.Kernel.whnf` never touches
     unchecked or non-terminating forged `.defnInfo` declarations!
-    Refutes `Bool.false`, non-convergent opaque chains, AND terms stuck on non-computable axioms
-    such as `Classical.choice` / `Classical.propDecidable` or non-stdlib constants. -/
+    Unfolds ONLY audited (non-stdlib) `.opaqueInfo` declarations—never unfolding stdlib `@[extern]`
+    or `partial` `.opaqueInfo`s whose stored `ov.value` is a dummy `Inhabited.default` /
+    `Classical.ofNonempty` witness—and requires `Lean.Kernel.whnf` to converge strictly to
+    `Bool.true` (rejecting `Bool.false`, non-convergent opaque chains, `Classical.choice`,
+    `propext`/`Quot.sound`, and any stdlib `@[extern]` opaque). -/
 def refuteProvisionalNativeWithKernelWhnf (replayedEnv : Environment) (fullEnv : Environment)
-    (user axName : Name) (lhs : Expr) : IO Unit := do
+    (modName user axName : Name) (lhs : Expr) : IO Unit := do
   let mut cur := lhs
   let mut converged := false
   for _ in [:256] do
     let some expanded := unfoldOpaquesInExpr fullEnv 4096 cur
-      | policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom opaque unfolding exhausted budget"
+      | policyFail "invalidNativeAxiomType" modName #[user, axName] "native axiom opaque unfolding exhausted budget"
     match Lean.Kernel.whnf replayedEnv {} expanded with
     | .error _ =>
-      policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS failed kernel reduction"
+      policyFail "invalidNativeAxiomType" modName #[user, axName] "native axiom LHS failed kernel reduction"
     | .ok next =>
       if next.consumeMData.isConstOf ``Bool.false then
-        policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS reduces to Bool.false in kernel"
+        policyFail "invalidNativeAxiomType" modName #[user, axName] "native axiom LHS reduces to Bool.false in kernel"
       if next.consumeMData.isConstOf ``Bool.true then
         converged := true
         break
       if next == cur then
-        let mut pending : List Name := next.getUsedConstantsAsSet.toList
-        let mut seen : NameSet := {}
-        while !pending.isEmpty do
-          let c := pending.head!
-          pending := pending.tail!
-          if !seen.contains c then
-            seen := seen.insert c
-            match fullEnv.getModuleIdxFor? c with
-            | some ciIdx =>
-              let cm := fullEnv.header.modules[ciIdx]!.module
-              if !isStdlibMod cm then
-                policyFail "invalidNativeAxiomType" axName #[user, axName, c]
-                  s!"native axiom LHS stuck on non-stdlib constant {c}"
-            | none =>
-              policyFail "invalidNativeAxiomType" axName #[user, axName, c]
-                s!"native axiom LHS stuck on unknown constant {c}"
-            match replayedEnv.checked.get.find? c with
-            | some (.axiomInfo _) =>
-              policyFail "invalidNativeAxiomType" axName #[user, axName, c]
-                s!"native axiom LHS stuck on non-computable axiom {c}"
-            | some (.defnInfo dv) =>
-              pending := dv.value.getUsedConstantsAsSet.toList ++ pending
-            | some (.opaqueInfo ov) =>
-              pending := ov.value.getUsedConstantsAsSet.toList ++ pending
-            | some (.thmInfo tv) =>
-              pending := tv.value.getUsedConstantsAsSet.toList ++ pending
-            | _ => pure ()
-        converged := true
-        break
+        policyFail "invalidNativeAxiomType" modName #[user, axName]
+          "native axiom LHS did not reduce to Bool.true in kernel"
       cur := next
   unless converged do
-    policyFail "invalidNativeAxiomType" axName #[user, axName]
+    policyFail "invalidNativeAxiomType" modName #[user, axName]
       "native axiom LHS opaque unfolding did not converge"
 
 def isCodegenUnsafeRec (byName : Std.HashMap Name ConstantInfo) (ci : ConstantInfo) : Bool :=
@@ -1965,9 +2045,12 @@ partial def isOutParamDomain (env : Environment) (fuel : Nat) (d : Expr) : Optio
         let hd := dWhnf.getAppFn.consumeMData
         some (hd.isConstOf ``outParam || hd.isConstOf ``semiOutParam)
 
-def nonOutParamArgs (env : Environment) (cls : Name) (args : Array Expr) : Option (Array Expr) := do
-  let some ci := env.checked.get.find? cls | return args
-  let mut curTy := ci.type
+def nonOutParamArgs (env : Environment) (cls : Name) (lvls : List Level)
+    (args : Array Expr) : Option (Array Expr) := do
+  let some ci := env.checked.get.find? cls | none
+  if ci.levelParams.length != lvls.length then
+    none
+  let mut curTy := ci.type.instantiateLevelParams ci.levelParams lvls
   let mut kept : Array Expr := #[]
   for i in [:args.size] do
     let some tyWhnf := whnfKeepParamWrappers env 512 curTy | none
@@ -1995,23 +2078,26 @@ def isRigidHeadInEnv (env : Environment) (c : Name) : Bool :=
 
 partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (e : Expr) : Bool :=
-  match e with
-  | .mdata _ inner => hasRigidBaseAnchor env localReplayable localRedOver byName inner
-  | .const c _ => isBaseInstanceAnchor localReplayable localRedOver byName c
-  | .forallE _ d b _ =>
-    hasRigidBaseAnchor env localReplayable localRedOver byName d ||
-    hasRigidBaseAnchor env localReplayable localRedOver byName b
-  | .lam _ _ b _ =>
-    hasRigidBaseAnchor env localReplayable localRedOver byName b
-  | .app f a =>
-    match e.getAppFn with
-    | .const hd _ =>
-      isBaseInstanceAnchor localReplayable localRedOver byName hd ||
-      (isRigidHeadInEnv env hd &&
-        ((match f with | .const _ _ => false | _ => hasRigidBaseAnchor env localReplayable localRedOver byName f) ||
-         hasRigidBaseAnchor env localReplayable localRedOver byName a))
+  if (Lean.annotation? `noindex e).isSome then
+    false
+  else
+    match e with
+    | .mdata _ inner => hasRigidBaseAnchor env localReplayable localRedOver byName inner
+    | .const c _ => isBaseInstanceAnchor localReplayable localRedOver byName c
+    | .forallE _ d b _ =>
+      hasRigidBaseAnchor env localReplayable localRedOver byName d ||
+      hasRigidBaseAnchor env localReplayable localRedOver byName b
+    | .lam _ _ b _ =>
+      hasRigidBaseAnchor env localReplayable localRedOver byName b
+    | .app f a =>
+      match e.getAppFn with
+      | .const hd _ =>
+        isBaseInstanceAnchor localReplayable localRedOver byName hd ||
+        (isRigidHeadInEnv env hd &&
+          ((match f with | .const _ _ => false | _ => hasRigidBaseAnchor env localReplayable localRedOver byName f) ||
+           hasRigidBaseAnchor env localReplayable localRedOver byName a))
+      | _ => false
     | _ => false
-  | _ => false
 
 def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo)
     (ci : ConstantInfo) (prio : Nat) (cls : Name) (args : Array Expr) : Bool :=
@@ -2139,17 +2225,25 @@ def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : M
     unless isValidSubPartConstant ci privCi do
       policyFail "duplicateConstName" modName #[modName, ci.name]
         s!"split-brain {partLabel} declaration {ci.name} diverges from .olean.private"
+  let privExtraSet : NameSet := NameSet.ofArray priv.extraConstNames
+  for ec in part.extraConstNames do
+    unless privExtraSet.contains ec || privByName.contains ec do
+      policyFail "keyNameMismatch" modName #[modName, ec]
+        s!"split-brain {partLabel} contains phantom extraConstName {ec} absent from .olean.private"
   let mut privEntCounts : Std.HashMap Name Nat := {}
   for (eName, eArr) in priv.entries do
-    privEntCounts := privEntCounts.insert eName eArr.size
+    privEntCounts := privEntCounts.insert eName ((privEntCounts[eName]?.getD 0) + eArr.size)
+  let mut partEntCounts : Std.HashMap Name Nat := {}
   for (eName, eArr) in part.entries do
+    partEntCounts := partEntCounts.insert eName ((partEntCounts[eName]?.getD 0) + eArr.size)
+  for (eName, partCnt) in partEntCounts.toList do
     -- `Lean.declRangeExt` is server-specific source-range metadata (`computeExtEntries` `.server`);
     -- all semantic kernel/meta/elab/compiler extensions must be monotonic into `.private`.
-    if !eArr.isEmpty && eName != `Lean.declRangeExt then
+    if partCnt > 0 && eName != `Lean.declRangeExt then
       let privCnt := privEntCounts[eName]?.getD 0
-      if eArr.size > privCnt then
+      if partCnt > privCnt then
         policyFail "keyNameMismatch" modName #[modName, eName]
-          s!"split-brain {partLabel} extension {eName} has {eArr.size} entries vs {privCnt} in .olean.private"
+          s!"split-brain {partLabel} extension {eName} has {partCnt} entries vs {privCnt} in .olean.private"
 
 def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OLeanLevel)
     (m : Name) (idx : Nat) (role : String) (strictProofs : Bool)
@@ -2263,6 +2357,14 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
     unless localReplayable.contains de.instanceName &&
            isBaseInstanceAnchor localReplayable localRedOver byName de.className do
       policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
+    let some dCi := byName[de.instanceName]?
+      | policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
+    let some dConcl := (normExprInEnv normEnv 1024 dCi.type).map stripForallAndLam
+      | policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
+    let .const actualCls _ := dConcl.consumeMData.getAppFn
+      | policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
+    unless actualCls == de.className do
+      policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "forged_default_instance_class_mismatch"
 
   let coes := Meta.coeExt.ext.getModuleEntries checkEnv idx (level := extLevel)
   for ce in coes do
@@ -2289,10 +2391,17 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
         policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
       let some ci := byName[dName]?
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let expectedVal := Expr.const dName (ci.levelParams.map Level.param)
+      unless ie.val == expectedVal && ie.attrKind == .scoped do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_entry_mismatch"
       let some normConcl := (normExprInEnv normEnv 1024 ci.type).map stripForallAndLam
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
-      let .const cls _ := normConcl.getAppFn
+      let normConclClean := normConcl.consumeMData
+      let .const cls _ := normConclClean.getAppFn
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
+      let allArgs := normConclClean.getAppArgs
+      unless !ie.keys.isEmpty && ie.keys[0]! == Meta.DiscrTree.Key.const cls allArgs.size do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
       unless isBaseInstanceAnchor localReplayable localRedOver byName cls do
         policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
       unless (nameComponents m).isPrefixOf (nameComponents ns) do
@@ -2304,25 +2413,49 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
         policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
       let some ci := byName[dName]?
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let expectedVal := Expr.const dName (ci.levelParams.map Level.param)
+      unless ie.val == expectedVal && ie.attrKind == .global do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_entry_mismatch"
       let some normConcl := (normExprInEnv normEnv 1024 ci.type).map stripForallAndLam
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-      let .const cls _ := normConcl.getAppFn
+      let normConclClean := normConcl.consumeMData
+      let .const cls lvls := normConclClean.getAppFn
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-      let allArgs := normConcl.getAppArgs
+      let allArgs := normConclClean.getAppArgs
+      unless !ie.keys.isEmpty && ie.keys[0]! == Meta.DiscrTree.Key.const cls allArgs.size do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
+      let conclConsts := normConclClean.getUsedConstantsAsSet
+      for k in ie.keys.extract 1 ie.keys.size do
+        if let .const kc _ := k then
+          unless conclConsts.contains kc do
+            policyFail "forbiddenInstanceOrCoe" m #[m, dName, kc] "forged_instance_keys_foreign_const"
       if isAutoSizeOfInst normEnv byName ci ie.priority cls allArgs then
-        pure ()
+        let hasIndKey := (ie.keys.extract 1 ie.keys.size).any fun
+          | .const kc _ => isBaseInstanceAnchor localReplayable localRedOver byName kc
+          | _ => false
+        unless hasIndKey do
+          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_sizeof_keys_wildcard"
       else if isBaseInstanceAnchor localReplayable localRedOver byName cls then
         pure ()
       else
         if role == "proof" || role == "verify" || (strictProofs && role != "defsExempt") then
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "instance_of_imported_class"
-        let some inputArgs := nonOutParamArgs normEnv cls allArgs
+        let some inputArgs := nonOutParamArgs normEnv cls lvls allArgs
           | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
         unless inputArgs.any (hasRigidBaseAnchor normEnv localReplayable localRedOver byName) do
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
+        let hasArrowOrLamInput := inputArgs.any fun a =>
+          (a.find? fun | .forallE .. | .lam .. => true | _ => false).isSome
+        if !hasArrowOrLamInput then
+          let hasKeyAnchor := (ie.keys.extract 1 ie.keys.size).any fun
+            | .const kc _ => isBaseInstanceAnchor localReplayable localRedOver byName kc
+            | _ => false
+          unless hasKeyAnchor do
+            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_wildcard"
 
 def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
   verifyPartKeysOnly modName data
+  verifyEntriesUniqueWellFormed modName data.entries
   for ci in data.constants do
     if let .quotInfo _ := ci then
       unless isStdlibMod modName do
@@ -2440,6 +2573,21 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
   catch ex =>
     let msg := ex.toString
     if (msg.splitOn "already contains").length > 1 then
+      let mut preQueue : List Name := targetMods.toList
+      let mut preSeen : NameSet := {}
+      let mut preLoaded : Array Name := #[]
+      while !preQueue.isEmpty do
+        let cur := preQueue.head!
+        preQueue := preQueue.tail!
+        if !preSeen.contains cur && !isStdlibMod cur then
+          preSeen := preSeen.insert cur
+          preLoaded := preLoaded.push cur
+          try
+            let p ← findOLean cur
+            let (md, _) ← readModuleData p
+            preQueue := (md.imports.toList.map (·.module)) ++ preQueue
+          catch _ => pure ()
+      loadedModsRef.set preLoaded
       policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
     opFail s!"importModules failed: {msg}"
   unless env.header.modules.size == env.header.moduleData.size do
@@ -2537,6 +2685,9 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
       if hasIrSig != hasIr then
         policyFail "missingOleanPart" m #[m]
           s!"unpaired IR artifact ({irSigFile} exists={hasIrSig}, {irFile} exists={hasIr})"
+      if !d.isModule && (hasIrSig || hasIr) then
+        policyFail "keyNameMismatch" m #[m]
+          s!"non-module artifact {oleanPath} accompanied by unexpected .ir/.ir.sig files"
       if hasIrSig && hasIr then
         let irSigPart ← try
           unsafe CompactedRegion.read (α := ModuleData) irSigFile #[]
@@ -2553,9 +2704,25 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         catch ex =>
           opFail s!"failed deserializing .ir {irFile}: {ex}"
         verifyPartAux m irPart.1
+        unless irPart.1.isModule == d.isModule do
+          policyFail "keyNameMismatch" m #[m] "split-brain .ir isModule flag mismatch"
         unless irPart.1.constNames.isEmpty && irPart.1.constants.isEmpty do
           policyFail "keyNameMismatch" m #[m] "split-brain .ir contains unexpected kernel constants"
         checkIrPartForbiddenEntries m irPart.1.entries
+        let irExtrasSet : NameSet := NameSet.ofArray irPart.1.extraConstNames
+        for ec in irSigPart.1.extraConstNames do
+          unless irExtrasSet.contains ec do
+            policyFail "keyNameMismatch" m #[m, ec]
+              s!"split-brain .ir.sig extraConstName {ec} absent from .ir"
+        let mut irEntCounts : Std.HashMap Name Nat := {}
+        for (eName, eArr) in irPart.1.entries do
+          irEntCounts := irEntCounts.insert eName ((irEntCounts[eName]?.getD 0) + eArr.size)
+        for (eName, eArr) in irSigPart.1.entries do
+          if !eArr.isEmpty then
+            let irCnt := irEntCounts[eName]?.getD 0
+            if eArr.size > irCnt then
+              policyFail "keyNameMismatch" m #[m, eName]
+                s!"split-brain .ir.sig extension {eName} has {eArr.size} entries vs {irCnt} in .ir"
         extraEntries := extraEntries ++ irPart.1.entries
         extraConsts := extraConsts ++ irPart.1.extraConstNames
       extraPartEntriesMap := extraPartEntriesMap.insert m extraEntries
@@ -2716,7 +2883,7 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
   let mut expLevelEnv? : Option (Environment × Std.HashMap Name Nat) := none
   let mut srvLevelEnv? : Option (Environment × Std.HashMap Name Nat) := none
 
-  let mut pendingNativeRefutations : Array (Name × Name × Expr) := #[]
+  let mut pendingNativeRefutations : Array (Name × Name × Name × Expr) := #[]
 
   -- 5. Audit imports, persistent extensions, shadowing, declarations, & reference-vs-import closure
   for idx in auditedIndices do
@@ -2847,8 +3014,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         if isNativeReductionConst ci.name then
           unless allowProvisionalNative && role == "proof" && isProvisionalNativeName ci.name do
             policyFail "forbiddenNativeReductionAxiom" m #[ci.name, ci.name] "native reduction axiom"
-          let lhs ← checkProvisionalNativeAxiomShape env ci.name ci.name ci
-          pendingNativeRefutations := pendingNativeRefutations.push (ci.name, ci.name, lhs)
+          let lhs ← checkProvisionalNativeAxiomShape env m ci.name ci.name ci
+          pendingNativeRefutations := pendingNativeRefutations.push (m, ci.name, ci.name, lhs)
         else if role == "assumptions" then
           unless allowAssumptions do
             policyFail "forbiddenAxiom" m #[ci.name, ci.name, m] "assumption axiom requires --allow-assumptions"
@@ -2905,8 +3072,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "forbiddenNativeReductionAxiom" rootMod #[rootName, dep] "native reduction in test module"
       unless allowProvisionalNative && depRole == "proof" && depCi.isAxiom && isProvisionalNativeName dep do
         policyFail "forbiddenNativeReductionAxiom" rootMod #[rootName, dep] "depends on native reduction axiom"
-      let lhs ← checkProvisionalNativeAxiomShape env rootName dep depCi
-      pendingNativeRef.modify (·.push (rootName, dep, lhs))
+      let lhs ← checkProvisionalNativeAxiomShape env depMod rootName dep depCi
+      pendingNativeRef.modify (·.push (depMod, rootName, dep, lhs))
     else if depCi.isAxiom then
       let isFound := isStdlibMod depMod && isFoundationalAxiom dep
       if !isFound then
@@ -2971,8 +3138,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         let (prov, assum, _) ← walkRootsClosure m normalRoots.reverse isTest {}
         for p in prov do allReachedAxioms := allReachedAxioms.insert p
         for a in assum do allReachedAxioms := allReachedAxioms.insert a
-      for ur in unsafeRecRoots.reverse do
-        let (prov, assum, _) ← walkRootsClosure m [ur] isTest (NameSet.empty.insert ur)
+      if !unsafeRecRoots.isEmpty then
+        let (prov, assum, _) ← walkRootsClosure m unsafeRecRoots.reverse isTest unsafeRecSet
         for p in prov do allReachedAxioms := allReachedAxioms.insert p
         for a in assum do allReachedAxioms := allReachedAxioms.insert a
 
@@ -3108,8 +3275,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
   -- 9. Post-Replay Kernel WHNF Refutation of Provisional Native Axioms
   --    (strictly AFTER `replay` succeeds so `Lean.Kernel.whnf` never touches unchecked/cyclic defs!)
   let replayedEnv := Environment.ofKernelEnv replayedKEnv
-  for (uName, axName, lhsExpr) in (← pendingNativeRef.get) do
-    refuteProvisionalNativeWithKernelWhnf replayedEnv env uName axName lhsExpr
+  for (axMod, uName, axName, lhsExpr) in (← pendingNativeRef.get) do
+    refuteProvisionalNativeWithKernelWhnf replayedEnv env axMod uName axName lhsExpr
 
   let sortedAxioms := (allReachedAxioms.toArray.qsort Name.lt).map Name.toString
   return Json.mkObj [
@@ -3707,6 +3874,26 @@ def main (args : List String) : IO UInt32 := do
     imports := #[{ module := `Init }]
     constNames := #[`Proof.Tamper13UnsafeRecIll.safeFn, `Proof.Tamper13UnsafeRecIll.safeFn._unsafe_rec]
     constants := #[safeParent4, badUnsafeRecIll]
+    extraConstNames := #[]
+    entries := #[]
+  }
+
+  -- 06e_native_extern_false: forged provisional native axiom claiming `String.Internal.length "anneal" == 0`
+  -- (whose `Init` `@[extern]` `.opaqueInfo` dummy `ov.value` is `Inhabited.default = 0` — MUST REJECT!)
+  let axName06e := `Proof.Tamper06NatExtern.f._native.decide.ax_1
+  let strLen06e := mkApp (mkConst ``String.Internal.length) (mkStrLit "anneal")
+  let lhs06e := mkApp2 (mkConst ``Nat.beq) strLen06e (mkNatLit 0)
+  let axCi06e : ConstantInfo := .axiomInfo {
+    name := axName06e
+    levelParams := []
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) lhs06e (mkConst ``Bool.true)
+    isUnsafe := false
+  }
+  writeOlean (outDir / "06e_native_extern") `Proof.Tamper06NatExtern {
+    isModule := false
+    imports := #[{ module := `Init }]
+    constNames := #[axName06e]
+    constants := #[axCi06e]
     extraConstNames := #[]
     entries := #[]
   }
@@ -5007,6 +5194,20 @@ def run_tamper_suite(
                 },
             )
         )
+        batched_specs.append(
+            (
+                "subcheck_06e_provisional_rejects_stdlib_extern_opaque",
+                False,
+                "invalidNativeAxiomType",
+                False,
+                {
+                    "target_modules": ["Proof.Tamper06NatExtern"],
+                    "olean_dirs": [forged_root / "06e_native_extern"],
+                    "allow_provisional_native": True,
+                    "strict_proofs": True,
+                },
+            )
+        )
 
         # `09b`: Source-layer rejection of `set_option debug.skipKernelTC true` on well-typed `.olean`
         batched_specs.append(
@@ -5302,6 +5503,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    def _sigterm_cleanup_handler(_signum: int, _frame: Any) -> None:
+        raise SystemExit(143)
+
+    prev_sigterm: Any = None
+    try:
+        prev_sigterm = signal.signal(signal.SIGTERM, _sigterm_cleanup_handler)
+    except (ValueError, OSError):
+        prev_sigterm = None
+
     json_requested = bool(argv is not None and "--json" in argv) or (
         argv is None and "--json" in sys.argv[1:]
     )
@@ -5431,6 +5641,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(f"Operational error: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if prev_sigterm is not None:
+            try:
+                signal.signal(signal.SIGTERM, prev_sigterm)
+            except (ValueError, OSError):
+                pass
 
 
 if __name__ == "__main__":

@@ -398,6 +398,8 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             'def «echo!» (s : String) : String := s\ndef escBangCall : String := «echo!» "{"\n',
             "def decideTerm : Bool := decide ('.' ∉ ['a'])\n",
             "def trace : Array Nat := #[0]\ndef traceIdx : Nat := trace[0]!\n",
+            'def f (trace : List (String -> Nat)) (h : 0 < trace.length) : Nat := trace[0] "{"\n',
+            "def «decide» : Int := 5\ndef kernel : Int := 3\ndef ok : Int := «decide» -kernel\n",
             'def strWithDecide : String := "decide -kernel"\n',
             "import Topic.all\nset_option maxHeartbeats 400000 in\n"
             "set_option linter.deprecated false in\ntheorem ok : True := trivial\n",
@@ -444,6 +446,18 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ('def s := s! "{show Nat from by native_decide}"', "forbiddenSourceOption"),
             ('def s := s! /- comment -/ "{show Nat from by set_option debug.skipKernelTC true in exact 0}"', "forbiddenSourceOption"),
             ('def s := «s!» "{show Nat from by native_decide}"', "forbiddenSourceOption"),
+            ("theorem binSkip : 1 + 1 = 2 := by iterate 0b1decide -kernel", "forbiddenSourceOption"),
+            ("theorem octSkip : 1 + 1 = 2 := by iterate 0o1decide -kernel", "forbiddenSourceOption"),
+            ("theorem undSkip : 1 + 1 = 2 := by iterate 1_0decide -kernel", "forbiddenSourceOption"),
+            ('def s := v! "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := throwError "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := reportIssue! "{let _ : 1 + 1 = 2 := (by decide -kernel); 0}"', "forbiddenSourceOption"),
+            ('def s := reportDbgIssue! "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := reportEMatchIssue! "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := trace_goal[grind] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := s!"{0x1builtin_elab}"', "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide («kernel» := false)", "forbiddenSourceOption"),
+            ("set_option «debug».«skipKernelTC» true in def x := 0", "forbiddenSourceOption"),
         ]
         for sample, expected_cat in bad_samples:
             with self.assertRaises(audit.AuditPolicyError, msg=sample) as ctx:
@@ -588,6 +602,11 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/B2PrintlnDecide", 'namespace Proof.B2PrintlnDecide\ndef sneak : IO Unit :=\n  println! "{let _ : 1 + 1 = 2 := (by decide -kernel); (0 : Nat)}"\nend Proof.B2PrintlnDecide\n'),
                 ("Proof/B2DecideNoSpace", "namespace Proof.B2DecideNoSpace\ntheorem t1 : 1 + 1 = 2 := by decide(kernel := false)\nend Proof.B2DecideNoSpace\n"),
                 ("Proof/B2GuillDecide", 'namespace Proof.B2GuillDecide\ndef «"» : Nat := 1\ntheorem evil : 1 + 1 = 2 := by decide -kernel\ndef «"2» : Nat := 2\nend Proof.B2GuillDecide\n'),
+                ("Proof/A2BinDecide", "namespace Proof.A2BinDecide\ntheorem binSkip : 1 + 1 = 2 := by iterate 0b1decide -kernel\nend Proof.A2BinDecide\n"),
+                ("Proof/A2OctDecide", "namespace Proof.A2OctDecide\ntheorem octSkip : 1 + 1 = 2 := by iterate 0o1decide -kernel\nend Proof.A2OctDecide\n"),
+                ("Proof/A2ValidMutual", "namespace Proof.A2ValidMutual\nmutual\n  def isEven : Nat -> Bool\n    | 0 => true\n    | n + 1 => isOdd n\n  def isOdd : Nat -> Bool\n    | 0 => false\n    | n + 1 => isEven n\nend\ntheorem even4 : isEven 4 = true := rfl\nend Proof.A2ValidMutual\n"),
+                ("Topic/A2GoodCoeFun/Defs", "namespace Topic.A2GoodCoeFun.Defs\nstructure MyPred where\n  run : Nat -> Bool\ninstance : CoeFun MyPred (fun _ => Nat -> Bool) where\n  coe p := p.run\ninstance : Inhabited (Nat -> MyPred) := ⟨fun _ => ⟨fun _ => true⟩⟩\nend Topic.A2GoodCoeFun.Defs\n"),
+                ("Topic/A2NoindexHijack/Defs", "namespace Topic.A2NoindexHijack.Defs\ninductive LocalAnchor | mk\ninstance evilWildcard : Inhabited (no_index LocalAnchor) := ⟨.mk⟩\nend Topic.A2NoindexHijack.Defs\n"),
                 ("Topic/BadSkipSrc", "namespace Topic.BadSkipSrc\nset_option debug.skipKernelTC true in\ndef v : Nat := 1\nend Topic.BadSkipSrc\n"),
             ):
                 s = b1_dir / f"{rel}.lean"
@@ -656,6 +675,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
             a1_forge_lean = tmp / "A1Forge.lean"
             a1_forge_lean.write_text(
                 r"""import Lean
+import Lean.Meta.Instances
 open Lean
 def writeO (dir : System.FilePath) (m : Name) (d : ModuleData) : IO Unit := do
   let p := dir / (System.mkFilePath (m.components.map Name.toString) |>.addExtension "olean")
@@ -848,6 +868,122 @@ def main (args : List String) : IO UInt32 := do
     (OLeanLevel.server.adjustFileName topOlean, topModData),
     (OLeanLevel.private.adjustFileName topOlean, topModData)
   ]
+  -- Pass A2 forged edge cases:
+  -- 1. Stdlib `@[extern]` opaque (`String.Internal.length "anneal" == 0`) under `--allow-provisional-native`
+  let a2ExtAx := `Proof.A2ExternFalse.f._native.decide.ax_1
+  let a2ExtLhs := mkApp2 (mkConst ``Nat.beq) (mkApp (mkConst ``String.Internal.length) (mkStrLit "anneal")) (mkNatLit 0)
+  let a2ExtCi : ConstantInfo := .axiomInfo {
+    name := a2ExtAx, levelParams := [],
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) a2ExtLhs (mkConst ``Bool.true),
+    isUnsafe := false
+  }
+  writeO (out / "a2_extern_false") `Proof.A2ExternFalse {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2ExtAx], constants := #[a2ExtCi],
+    extraConstNames := #[], entries := #[]
+  }
+  -- 2. Forged `Meta.instanceExtension` entry spoofing `globalName? := some goodInst` while `val := evilNatFn`
+  let a2AnchorName := `Topic.A2SpoofInst.Defs.Anchor
+  let a2AnchorMk := `Topic.A2SpoofInst.Defs.Anchor.mk
+  let a2AnchorInd : ConstantInfo := .inductInfo {
+    name := a2AnchorName, levelParams := [], type := mkSort Level.one,
+    numParams := 0, numIndices := 0, all := [a2AnchorName], ctors := [a2AnchorMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let a2AnchorCtor : ConstantInfo := .ctorInfo {
+    name := a2AnchorMk, levelParams := [], type := mkConst a2AnchorName,
+    induct := a2AnchorName, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let a2AnchorRec : ConstantInfo := .recInfo {
+    name := `Topic.A2SpoofInst.Defs.Anchor.rec, levelParams := [`u],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst a2AnchorName) (mkSort (.param `u)))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst a2AnchorMk))
+        (mkForall `t .default (mkConst a2AnchorName) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [a2AnchorName], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := a2AnchorMk, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst a2AnchorName) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst a2AnchorMk)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let a2GoodInstName := `Topic.A2SpoofInst.Defs.goodInst
+  let a2GoodInst : ConstantInfo := .defnInfo {
+    name := a2GoodInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) (mkConst a2AnchorName),
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) (mkConst a2AnchorName) (mkConst a2AnchorMk),
+    hints := .abbrev, safety := .safe, all := [a2GoodInstName]
+  }
+  let a2EvilFnName := `Topic.A2SpoofInst.Defs.evilNatInst
+  let a2EvilFn : ConstantInfo := .defnInfo {
+    name := a2EvilFnName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) (mkConst ``Nat),
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) (mkConst ``Nat) (mkNatLit 999),
+    hints := .abbrev, safety := .safe, all := [a2EvilFnName]
+  }
+  let spoofEntry : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[.const ``Inhabited 1, .const a2AnchorName 0],
+    val := mkConst a2EvilFnName,
+    priority := 1000,
+    globalName? := some a2GoodInstName,
+    synthOrder := #[],
+    attrKind := .global
+  }
+  writeO (out / "a2_spoof_inst") `Topic.A2SpoofInst.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, a2GoodInstName, a2EvilFnName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, a2GoodInst, a2EvilFn],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast spoofEntry])]
+  }
+  -- 3. Duplicate extension keys in `ModuleData.entries`
+  let dupExtThm : ConstantInfo := .thmInfo {
+    name := `Proof.A2DupExt.ok, levelParams := [],
+    type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.A2DupExt.ok]
+  }
+  writeO (out / "a2_dup_ext") `Proof.A2DupExt {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A2DupExt.ok], constants := #[dupExtThm],
+    extraConstNames := #[],
+    entries := #[(`Lean.declRangeExt, #[]), (`Lean.declRangeExt, #[])]
+  }
+  -- 4. Non-module `.olean` paired with stray `.ir.sig` + `.ir`
+  let nmIrDir := out / "a2_nm_ir" / "Proof"
+  IO.FS.createDirAll nmIrDir
+  let nmIrOlean := nmIrDir / "A2NmIr.olean"
+  saveModuleData nmIrOlean `Proof.A2NmIr {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A2NmIr.ok],
+    constants := #[.thmInfo { name := `Proof.A2NmIr.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.A2NmIr.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.A2NmIr #[
+    (nmIrOlean.withExtension "ir.sig", emptyIr),
+    (nmIrOlean.withExtension "ir", emptyIr)
+  ]
+  -- 5. Transitive early `finalizeImport` `"already contains"` collision across two dependencies
+  let trDir := out / "a2_trans_dup" / "Proof"
+  IO.FS.createDirAll trDir
+  let dupSharedDef1 : ConstantInfo := .defnInfo {
+    name := `Proof.SharedCollision.val, levelParams := [], type := mkConst ``Nat,
+    value := mkConst ``Nat.zero, hints := .abbrev, safety := .safe, all := [`Proof.SharedCollision.val]
+  }
+  let dupSharedDef2 : ConstantInfo := .defnInfo {
+    name := `Proof.SharedCollision.val, levelParams := [], type := mkConst ``Nat,
+    value := mkNatLit 1, hints := .abbrev, safety := .safe, all := [`Proof.SharedCollision.val]
+  }
+  saveModuleData (trDir / "DepA.olean") `Proof.DepA {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.SharedCollision.val], constants := #[dupSharedDef1],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleData (trDir / "DepB.olean") `Proof.DepB {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.SharedCollision.val], constants := #[dupSharedDef2],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleData (trDir / "TopDup.olean") `Proof.TopDup {
+    isModule := false, imports := #[{ module := `Init }, { module := `Proof.DepA }, { module := `Proof.DepB }],
+    constNames := #[`Proof.TopDup.ok],
+    constants := #[.thmInfo { name := `Proof.TopDup.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.TopDup.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
   return 0
 """,
                 encoding="utf-8",
@@ -935,6 +1071,15 @@ def main (args : List String) : IO UInt32 := do
                 ("b2_ir_split_non_ir_ext", False, "keyNameMismatch", {"target_modules": ["Proof.B2IrSplit"], "olean_dirs": [a1_forged / "b2_ir_split"], "strict_proofs": True}),
                 ("b2_ismodule_flag_mismatch", False, "keyNameMismatch", {"target_modules": ["Proof.B2IsMod"], "olean_dirs": [a1_forged / "b2_ismod"], "strict_proofs": True}),
                 ("b2_module_imports_nonmodule", False, "foreignImport", {"target_modules": ["Proof.TopMod"], "olean_dirs": [a1_forged / "b2_mod_imp_nm"], "strict_proofs": True}),
+                ("a2_bin_decide_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.A2BinDecide"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("a2_oct_decide_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.A2OctDecide"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("a2_valid_mutual_def_passes", True, None, {"target_modules": ["Proof.A2ValidMutual"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("a2_valid_coefun_passes", True, None, {"target_modules": ["Topic.A2GoodCoeFun.Defs"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("a2_noindex_local_anchor_orphan_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A2NoindexHijack.Defs"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("a2_forged_extern_opaque_native_rejected", False, "invalidNativeAxiomType", {"target_modules": ["Proof.A2ExternFalse"], "olean_dirs": [a1_forged / "a2_extern_false"], "allow_provisional_native": True, "strict_proofs": True}),
+                ("a2_forged_instance_entry_spoof_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A2SpoofInst.Defs"], "olean_dirs": [a1_forged / "a2_spoof_inst"], "strict_proofs": True}),
+                ("a2_duplicate_ext_keys_in_entries_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A2DupExt"], "olean_dirs": [a1_forged / "a2_dup_ext"], "strict_proofs": True}),
+                ("a2_nonmodule_with_stray_ir_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A2NmIr"], "olean_dirs": [a1_forged / "a2_nm_ir"], "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
@@ -962,10 +1107,32 @@ def main (args : List String) : IO UInt32 := do
                 self.assertEqual(rep["ok"], exp_ok, f"{cid}: {rep}")
                 if exp_cat is not None:
                     self.assertEqual(rep["violations"][0]["category"], exp_cat, f"{cid}: {rep}")
+                    if cid == "a2_forged_extern_opaque_native_rejected":
+                        self.assertEqual(rep["violations"][0]["module"], "Proof.A2ExternFalse")
                 elif cid == "verify_multi_item_isolated":
                     by_mod = {it["module"]: it for it in rep["summary"]["items"]}
                     self.assertEqual(by_mod["Verify.ItemProv"]["status"], "ProvisionalNative")
                     self.assertEqual(by_mod["Verify.Topic"]["status"], "VerifiedUnconditional")
+
+            # Transitive `.olean.server` FIFO/EACCES must raise AuditOperationalError (exit 2)
+            # EVEN when `finalizeImport` throws early `"already contains"` policy error!
+            trans_dup_dir = a1_forged / "a2_trans_dup"
+            fifo_srv = trans_dup_dir / "Proof" / "DepA.olean.server"
+            os.mkfifo(fifo_srv)
+            try:
+                with self.assertRaises(audit.AuditOperationalError):
+                    audit.audit_modules(
+                        ["Proof.TopDup"],
+                        olean_dirs=[trans_dup_dir],
+                        strict_proofs=True,
+                        lean_bin=lean_bin,
+                        sysroot=sysroot,
+                        compiled_inspector=insp,
+                        stage_dir=tmp,
+                    )
+            finally:
+                if fifo_srv.exists() or os.path.lexists(fifo_srv):
+                    os.unlink(fifo_srv)
 
             # Non-UTF-8 `.lean` source file referenced by `--source-map` must raise AuditOperationalError (exit 2).
             bad_utf8_lean = tmp / "BadUtf8Source.lean"
