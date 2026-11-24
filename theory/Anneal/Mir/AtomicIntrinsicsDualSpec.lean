@@ -971,6 +971,36 @@ theorem lmTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutcome)
   · exact (of_decide_eq_true h).1
   · exact (of_decide_eq_true h).2
 
+private def tbTagSteps (ptr : ThinPointer TreeBorrowsProvenance) :
+    List ((MachTB → Interp (Value TBM × MachTB)) × (Interp (Value TBM × MachTB) → AtomicAccessOutcome)) :=
+  [(fun (m : MachTB) => tbLoad m ptr (.Int itU32), obsMrScalar 4 tbAllocs), (fun m => tbCas m ptr 6 9 itU32, obsMrCas 4 6 tbAllocs),
+   (fun m => tbStore m ptr (.Int 9) (.Int itU32), obsMrStore 4 tbAllocs), (fun m => tbLoad m ptr (.Int itU32), obsMrScalar 4 tbAllocs)]
+/-- Mode-sensitive `Frozen`-tag trace (`load → cas(6→9)✗ → store 9 → load`), halting `.ub` at step 3 on `MachTB`. -/
+def mrFrozenTrace : AtomicMemoryMode → List AtomicAccessOutcome
+  | .basic => mrTraceGo
+      [(fun (m : Mach) => bmLoad m bmPtr (.Int itU32), obsMrScalar 4 bmAllocs), (fun m => bmCas m bmPtr 6 9 itU32, obsMrCas 4 6 bmAllocs),
+       (fun m => bmStore m bmPtr (.Int 9) (.Int itU32), obsMrStore 4 bmAllocs), (fun m => bmLoad m bmPtr (.Int itU32), obsMrScalar 4 bmAllocs)] bmFive
+  | .treeBorrows => mrTraceGo (tbTagSteps tbSharedPtr) tbShared
+/-- `Reserved`-activation trace on reachable `tbTwoPhase`: step 3 activates `tbMutPtr` and disables `tbSibPtr`. -/
+def mrReservedActivationTrace : List AtomicAccessOutcome :=
+  mrTraceGo (tbTagSteps tbMutPtr ++ [(fun m => tbLoad m tbSibPtr (.Int itU32), obsMrScalar 4 tbAllocs)]) tbTwoPhase
+/-- **Mode-sensitive `Frozen` trace & `Reserved`-activation trace on `Mach`/`MachTB`**. -/
+theorem mrFrozenAndReservedTrace_table :
+    mrFrozenTrace .basic = [.okScalar 5 5, .okCas 5 false 5, .okStore 9, .okScalar 9 9] ∧
+    mrFrozenTrace .treeBorrows = [.okScalar 5 5, .okCas 5 false 5, .ub] ∧
+    mrReservedActivationTrace = [.okScalar 5 5, .okCas 5 false 5, .okStore 9, .okScalar 9 9, .ub] := by decide +kernel
+/-- Mode-sensitive cross-authority `Frozen`-tag trace check (distinguishes `.basic` vs `.treeBorrows`). -/
+def lmFrozenTraceAuthorityCheck (obs : Bool → List AtomicAccessOutcome) : Bool :=
+  decide (obs (AtomicMemoryMode.toLmTreeBorrows .basic) = mrFrozenTrace .basic ∧
+    obs (AtomicMemoryMode.toLmTreeBorrows .treeBorrows) = mrFrozenTrace .treeBorrows)
+/-- Soundness of `lmFrozenTraceAuthorityCheck`: passing check gives mode-sensitive trace agreement. -/
+theorem lmFrozenTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutcome)
+    (h : lmFrozenTraceAuthorityCheck obs = true) (m : AtomicMemoryMode) :
+    obs m.toLmTreeBorrows = mrFrozenTrace m := by
+  unfold lmFrozenTraceAuthorityCheck at h; cases m
+  · exact (of_decide_eq_true h).1
+  · exact (of_decide_eq_true h).2
+
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
 section AxiomAudit
@@ -1013,7 +1043,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 29 then
+  if theorems < 31 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 

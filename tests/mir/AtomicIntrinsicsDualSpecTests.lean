@@ -267,7 +267,7 @@ run_cmd do
     addThm fastCheckName
       (eqTrue (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) (mkConst fastObsName))) reflTrue
 
-    -- 2c. Threaded 5-step trace: the kernel evaluates BOTH engines per mode; traces must be equal.
+    -- 2c. Threaded 5-step trace + closed soundness theorem across BOTH engines per mode.
     let traceObs ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
       mkLambdaFVars #[tb] (mkApp4 (mkConst ``List.map [.zero, .zero]) lmObsTy outcomeTy
         (mkConst translateName) (mkApp (mkConst (lmNs ++ `lmAtomicTrace)) tb))
@@ -276,8 +276,24 @@ run_cmd do
     let traceCheckName := ns ++ `crossRootLmTraceCheck
     addThm traceCheckName
       (eqTrue (mkApp (mkConst (dsNs ++ `lmTraceAuthorityCheck)) (mkConst traceObsName))) reflTrue
+    let traceEqVal := mkApp2 (mkConst (dsNs ++ `lmTraceAuthorityCheck_sound)) (mkConst traceObsName) (mkConst traceCheckName)
+    let traceEqName := ns ++ `crossRootLmTraceEq
+    addThm traceEqName (← MetaM.run' <| inferType traceEqVal) traceEqVal
+    -- 2d. Mode-sensitive `Frozen`-tag trace (`.basic`: 4 steps; `.treeBorrows`: 3 steps halting `.ub`).
+    let frozenTraceObs ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
+      mkLambdaFVars #[tb] (mkApp4 (mkConst ``List.map [.zero, .zero]) lmObsTy outcomeTy
+        (mkConst translateName) (mkApp2 (mkConst (lmNs ++ `lmTagTrace)) (mkConst (lmNs ++ `CellTagMode.frozenChild)) tb))
+    let frozenTraceObsName := ns ++ `crossRootLmFrozenTrace
+    let _ ← addDef frozenTraceObsName frozenTraceObs
+    let frozenTraceCheckName := ns ++ `crossRootLmFrozenTraceCheck
+    addThm frozenTraceCheckName
+      (eqTrue (mkApp (mkConst (dsNs ++ `lmFrozenTraceAuthorityCheck)) (mkConst frozenTraceObsName))) reflTrue
+    let frozenTraceEqVal := mkApp2 (mkConst (dsNs ++ `lmFrozenTraceAuthorityCheck_sound))
+      (mkConst frozenTraceObsName) (mkConst frozenTraceCheckName)
+    let frozenTraceEqName := ns ++ `crossRootLmFrozenTraceEq
+    addThm frozenTraceEqName (← MetaM.run' <| inferType frozenTraceEqVal) frozenTraceEqVal
 
-    -- 3. Instantiate closed `AtomicDualContract` and all 5 named projections.
+    -- 3. Instantiate closed `AtomicDualContract` and all 7 named projections.
     let contractName := ns ++ `closedAtomicDualContract
     let contractTy ← addDef contractName
       (mkApp2 (mkConst (dsNs ++ `atomicDualContractOfCheck)) crossObsC (mkConst checkName))
@@ -286,7 +302,8 @@ run_cmd do
     let contractC := mkConst contractName
 
     let mut added : Array Lean.Name :=
-      #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName, traceObsName, traceCheckName]
+      #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName,
+        traceObsName, traceCheckName, traceEqName, frozenTraceObsName, frozenTraceCheckName, frozenTraceEqName]
     for projName in [`contract_agreement_zone_exact,
                      `contract_overflow_divergence,
                      `contract_readonly_alloc_divergence,
@@ -300,9 +317,9 @@ run_cmd do
       addThm outName ty val
       added := added.push outName
 
-    -- 4. Six negative controls on scratch copies of the environment: the Lean kernel
+    -- 4. Eight negative controls on scratch copies of the environment: the Lean kernel
     -- MUST reject every forged theorem, inverted mode, shifted case, inverted CAS flag,
-    -- and UB-to-okStore forgery.
+    -- UB-to-okStore forgery, negated trace certificate, and mode-inverted Frozen trace.
     let saved ← getEnv
     let rejects (d : Declaration) : CoreM Bool := do
       let r ← try addDecl d; pure false catch _ => pure true
@@ -314,6 +331,8 @@ run_cmd do
     let casInvertedObs ← MetaM.run' <| mkCrossRootObs casInvertedTr false false
     let ubForgedTr ← MetaM.run' <| mkTranslateLmObs false true
     let ubForgedObs ← MetaM.run' <| mkCrossRootObs ubForgedTr false false
+    let frozenModeInv ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
+      mkLambdaFVars #[tb] (mkApp (mkConst frozenTraceObsName) (mkApp (mkConst ``Bool.not) tb))
     let forged : List (String × Declaration) :=
       [ ("ill-typed 0 = 1 theorem", .thmDecl {
           name := ns ++ `forged.zeroEqOne, levelParams := [],
@@ -338,6 +357,14 @@ run_cmd do
         ("UB-to-okStore forged translator", .thmDecl {
           name := ns ++ `forged.ubForged, levelParams := [],
           type := eqTrue (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) ubForgedObs),
+          value := reflTrue }),
+        ("negated lmTraceAuthorityCheck certificate (= false)", .thmDecl {
+          name := ns ++ `forged.traceCheckFalse, levelParams := [],
+          type := eqFalse (mkApp (mkConst (dsNs ++ `lmTraceAuthorityCheck)) (mkConst traceObsName)),
+          value := reflFalse }),
+        ("mode-inverted Frozen trace (Bool.not tb)", .thmDecl {
+          name := ns ++ `forged.frozenTraceModeInverted, levelParams := [],
+          type := eqTrue (mkApp (mkConst (dsNs ++ `lmFrozenTraceAuthorityCheck)) frozenModeInv),
           value := reflTrue }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
@@ -413,7 +440,9 @@ run_cmd do
         dsNs ++ `mr_universal_rmw_out_of_range_specPanic,
         dsNs ++ `mr_universal_atomicLoad_size_too_big_ub,
         dsNs ++ `mr_signed_unsigned_polarity_and_usize_parity,
-        lmNs ++ `lmAtomicTrace_table, dsNs ++ `mrAtomicTrace_table, dsNs ++ `lmTraceAuthorityCheck_sound ]
+        lmNs ++ `lmAtomicTrace_table, dsNs ++ `mrAtomicTrace_table, dsNs ++ `lmTraceAuthorityCheck_sound,
+        lmNs ++ `lmAtomicHooks_bind_eq_make, lmNs ++ `lmTagTrace_reserved_vs_frozen,
+        dsNs ++ `mrFrozenAndReservedTrace_table, dsNs ++ `lmFrozenTraceAuthorityCheck_sound ]
     for n in keyThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required theorem {n} missing"
@@ -504,7 +533,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 15 && rejectedCount = 6 do
+  unless addedCount = 19 && rejectedCount = 8 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 

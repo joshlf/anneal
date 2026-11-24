@@ -1514,6 +1514,42 @@ theorem lmAtomicTrace_table (tb : Bool) : lmAtomicTrace tb =
     ([.okStore 5, .okScalar 5 8, .okCas 8 false 8, .okCas 8 true 9, .okScalar 9 9] : List LmAtomicObs) := by
   cases tb <;> decide +kernel
 
+/-- Direct construction via `ExecutionIntrinsic.Atomic.make`. -/
+def lmAtomicHooksMake (weakPolicy : WeakCasPolicy := .neverFail) :
+    IntrinsicAtomicHooks Provenance AtomicState LmAtomicChoice (RuntimePlace Provenance) :=
+  let accessBound := MemoryExtras.bindAccess lmExtrasHooks lmAccessConfig
+  let places := PlaceMachine.placeHooks accessBound lmAllocationConfig lmCompilerHooks
+  let leaves : ExecutionIntrinsic.Atomic.Leaves Provenance AtomicState LmAtomicChoice (RuntimePlace Provenance) :=
+    { toAccessLeaves := lmAtomicAccessLeaves weakPolicy, orderingConst := lmOrderingConst, volatileConst := lmVolatileConst }
+  ExecutionIntrinsic.Atomic.make leaves (lmDerefPointer accessBound) lmScalarOpsHooks
+    (fun _ _ => pure ()) accessBound places lmPointerHooks lmExtrasHooks
+
+/-- **`ExecutionIntrinsic.Atomic.make` agreement** with `AtomicMachine.bind` (via `bindAccess` idempotence). -/
+theorem lmAtomicHooks_bind_eq_make (weakPolicy : WeakCasPolicy) :
+    lmAtomicHooksBind weakPolicy = lmAtomicHooksMake weakPolicy := rfl
+
+/-- Mode-sensitive `tagMode` trace (`load → cxchg(6→9)✗ → store 9 → load`), exercising `.error` halt & `.reservedChild`. -/
+def lmTagTrace (tagMode : CellTagMode) (tb : Bool) : List LmAtomicObs :=
+  let cfg : SingleCellConfig := { widthBytes := 4, initBits := 5, allocSize := 4, allocAlign := ⟨2⟩, treeBorrows := tb, tagMode := tagMode }
+  let c : LmAtomicChoice := { ord1 := .SeqCst, ord2 := .SeqCst, pointeeLayout := layoutU32 }
+  let cCas : LmAtomicChoice := { ord1 := .SeqCst, ord2 := .Relaxed, pointeeLayout := layoutU32 }
+  let cell (st : AtomicState) := readAllocBits st cellAllocId 0 4
+  let dst (st : AtomicState) := readAllocBits st destAllocId 0 4
+  let obsS (st : AtomicState) := (dst st).bind fun r => (cell st).map fun p => LmAtomicObs.okScalar r p
+  let obsC (st : AtomicState) := (dst st).bind fun r => (readAllocBool st destAllocId 4).bind fun ok => (cell st).map fun p => LmAtomicObs.okCas r ok p
+  let ptr := mkCellPtrOp cfg
+  let v := mkIntOp layoutU32
+  lmTraceGo [ (c, "atomic_load", #[ptr], layoutU32, obsS), (cCas, "atomic_cxchg", #[ptr, v 6, v 9], mkCasDestLayout layoutU32, obsC),
+    (c, "atomic_store", #[ptr, v 9], layoutUnit, fun st => (cell st).map LmAtomicObs.okStore), (c, "atomic_load", #[ptr], layoutU32, obsS) ] (mkSingleCellState cfg)
+
+/-- **`Reserved` vs. `Frozen` threaded trace & RMW/CAS asymmetry** (`treeBorrows = true`). -/
+theorem lmTagTrace_reserved_vs_frozen :
+    let resCfg : SingleCellConfig := { widthBytes := 4, initBits := 5, allocSize := 4, allocAlign := ⟨2⟩, treeBorrows := true, tagMode := .reservedChild }
+    let ok4 : List LmAtomicObs := [.okScalar 5 5, .okCas 5 false 5, .okStore 9, .okScalar 9 9]
+    lmTagTrace .frozenChild false = ok4 ∧ lmTagTrace .frozenChild true = [.okScalar 5 5, .okCas 5 false 5, .ub] ∧
+    lmTagTrace .reservedChild false = ok4 ∧ lmTagTrace .reservedChild true = ok4 ∧
+    runEvalRmw "atomic_xadd" resCfg layoutU32 1 = .okScalar 5 6 ∧ runEvalCas false resCfg layoutU32 5 9 = .okCas 5 true 9 := by decide +kernel
+
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
 section AxiomAudit
@@ -1537,7 +1573,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 35 then
+  if theorems < 37 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
