@@ -665,6 +665,88 @@ theorem intToIntCast_widen_narrow_roundtrip (srcW dstW : ScalarWidth)
       rw [add_pow2_sub_mod_pow2 x hLe]
       exact Nat.mod_eq_of_lt hx
 
+/-- Signed widening keeps the sign bit set: a negative two's-complement bit
+pattern (`srcW.halfModulus ≤ x < srcW.modulus`) sign-extends to a `dstW` bit
+pattern that is still negative (`dstW.halfModulus ≤ out`). -/
+theorem intToIntCast_widen_signed_neg_sign (srcW dstW : ScalarWidth) {x : Nat}
+    (hLt : srcW.bits < dstW.bits)
+    (hNeg : srcW.halfModulus ≤ x) (hx : x < srcW.modulus) :
+    dstW.halfModulus ≤ intToIntCast srcW true dstW x := by
+  have hS : srcW.modulus ≤ dstW.halfModulus :=
+    pow2_le_pow2 (Nat.le_sub_one_of_lt hLt)
+  have hD : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hSub : dstW.halfModulus ≤ dstW.modulus - srcW.modulus := by
+    rw [hD]
+    exact Nat.le_sub_of_add_le (Nat.add_le_add_left hS _)
+  rw [(intToIntCast_widen_signed_neg srcW dstW hLt hNeg hx).1]
+  exact Nat.le_trans hSub (Nat.le_add_right _ _)
+
+/-- Signed narrowing of an in-range negative value is exact: when
+`dstW.bits ≤ srcW.bits` and `x` is a negative `srcW` bit pattern whose signed
+value fits `dstW` (`srcW.modulus - dstW.halfModulus ≤ x < srcW.modulus`), the
+truncated `dstW` bit pattern drops exactly the `srcW.modulus - dstW.modulus`
+sign-extension bits, is still negative (`dstW.halfModulus ≤ out`), and
+preserves the negative magnitude `dstW.modulus - out = srcW.modulus - x`. -/
+theorem intToIntCast_narrow_signed_neg (srcW : ScalarWidth) (srcSigned : Bool)
+    (dstW : ScalarWidth) {x : Nat} (hLe : dstW.bits ≤ srcW.bits)
+    (hLo : srcW.modulus - dstW.halfModulus ≤ x) (hx : x < srcW.modulus) :
+    (srcW.modulus - dstW.modulus) + intToIntCast srcW srcSigned dstW x = x ∧
+    dstW.halfModulus ≤ intToIntCast srcW srcSigned dstW x ∧
+    dstW.modulus - intToIntCast srcW srcSigned dstW x = srcW.modulus - x := by
+  have hDS : dstW.modulus ≤ srcW.modulus := pow2_le_pow2 hLe
+  have hD : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hBase : srcW.modulus - dstW.modulus ≤ x :=
+    Nat.le_trans
+      (Nat.sub_le_sub_left (Nat.le_of_lt dstW.halfModulus_lt_modulus)
+        srcW.modulus) hLo
+  have hXeq :
+      (srcW.modulus - dstW.modulus) + (x - (srcW.modulus - dstW.modulus)) = x :=
+    Nat.add_sub_of_le hBase
+  have hYlt : x - (srcW.modulus - dstW.modulus) < dstW.modulus := by
+    have h1 :
+        (srcW.modulus - dstW.modulus) + (x - (srcW.modulus - dstW.modulus)) <
+          (srcW.modulus - dstW.modulus) + dstW.modulus := by
+      rw [hXeq, Nat.sub_add_cancel hDS]
+      exact hx
+    cases Nat.lt_or_ge (x - (srcW.modulus - dstW.modulus)) dstW.modulus with
+    | inl hLtD => exact hLtD
+    | inr hGeD =>
+      exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hGeD _))
+  have hCast : intToIntCast srcW srcSigned dstW x =
+      x - (srcW.modulus - dstW.modulus) := by
+    rw [intToIntCast_narrow_eq_mod srcW srcSigned dstW x hLe]
+    have hMod' :
+        ((srcW.modulus - dstW.modulus) +
+            (x - (srcW.modulus - dstW.modulus))) % dstW.modulus =
+          (x - (srcW.modulus - dstW.modulus)) % dstW.modulus :=
+      add_pow2_sub_mod_pow2 (x - (srcW.modulus - dstW.modulus)) hLe
+    rw [hXeq, Nat.mod_eq_of_lt hYlt] at hMod'
+    exact hMod'
+  have hSplit : srcW.modulus - dstW.halfModulus =
+      (srcW.modulus - dstW.modulus) + dstW.halfModulus := by
+    apply Nat.sub_eq_of_eq_add
+    rw [Nat.add_assoc, ← hD, Nat.sub_add_cancel hDS]
+  have hYge : dstW.halfModulus ≤ x - (srcW.modulus - dstW.modulus) := by
+    have h2 :
+        (srcW.modulus - dstW.modulus) + dstW.halfModulus ≤
+          (srcW.modulus - dstW.modulus) + (x - (srcW.modulus - dstW.modulus)) := by
+      rw [hXeq, ← hSplit]
+      exact hLo
+    exact Nat.le_of_add_le_add_left h2
+  have hMag : dstW.modulus - (x - (srcW.modulus - dstW.modulus)) =
+      srcW.modulus - x := by
+    have h3 : srcW.modulus -
+        ((srcW.modulus - dstW.modulus) + (x - (srcW.modulus - dstW.modulus))) =
+          dstW.modulus - (x - (srcW.modulus - dstW.modulus)) := by
+      rw [Nat.sub_add_eq,
+        Nat.sub_eq_of_eq_add (Nat.add_sub_of_le hDS).symm]
+    rw [hXeq] at h3
+    exact h3.symm
+  rw [hCast]
+  exact ⟨hXeq, hYge, hMag⟩
+
 /-- Checked unsigned addition `(wrappedBits, overflowed)` at width `w`. -/
 def addWithOverflowU (w : ScalarWidth) (a b : Nat) : Nat × Bool :=
   let sum := a + b
@@ -1172,6 +1254,73 @@ theorem not_interval_cert_of_mul_overflow (spec : StageIntervalSpec)
     spec.inRange (a * b) = false :=
   spec.inRange_false_of_ge_modulus (Nat.le_of_ble_eq_true hOvf)
 
+/-- Tightened false-branch join interval for a checked unsigned addition: when
+`addWithOverflowU w a c` takes the `overflowed = false` arm with `a ∈ [lo, hi]`,
+the wrapped result is the exact sum, lies in `[lo + c, hi + c]`, and fits the
+width. -/
+theorem addWithOverflowU_false_interval (w : ScalarWidth) {lo hi a c r : Nat}
+    (hLo : lo ≤ a) (hHi : a ≤ hi) (h : addWithOverflowU w a c = (r, false)) :
+    r = a + c ∧ lo + c ≤ r ∧ r ≤ hi + c ∧ r < w.modulus := by
+  have hNo : (addWithOverflowU w a c).2 = false := congrArg Prod.snd h
+  have hLt : a + c < w.modulus := (addWithOverflowU_no_overflow_iff w a c).mp hNo
+  rw [addWithOverflowU_of_lt w hLt] at h
+  have hR : a + c = r := congrArg Prod.fst h
+  subst hR
+  exact ⟨rfl, Nat.add_le_add_right hLo c, Nat.add_le_add_right hHi c, hLt⟩
+
+/-- Tightened false-branch join interval for a checked unsigned subtraction:
+when `subWithOverflowU w a c` takes the `overflowed = false` arm with
+`a ∈ [lo, hi]`, there is no borrow (`c ≤ a`), the wrapped result is the exact
+difference, lies in `[lo - c, hi - c]`, and fits the width. -/
+theorem subWithOverflowU_false_interval (w : ScalarWidth) {lo hi a c r : Nat}
+    (hLo : lo ≤ a) (hHi : a ≤ hi) (h : subWithOverflowU w a c = (r, false)) :
+    r = a - c ∧ c ≤ a ∧ lo - c ≤ r ∧ r ≤ hi - c ∧ r < w.modulus := by
+  have hNo : (subWithOverflowU w a c).2 = false := congrArg Prod.snd h
+  let ⟨hA, _, hLe⟩ := (subWithOverflowU_no_overflow_iff w a c).mp hNo
+  rw [subWithOverflowU_of_le w hA hLe] at h
+  have hR : a - c = r := congrArg Prod.fst h
+  subst hR
+  exact ⟨rfl, hLe, Nat.sub_le_sub_right hLo c, Nat.sub_le_sub_right hHi c,
+    Nat.lt_of_le_of_lt (Nat.sub_le a c) hA⟩
+
+/-- Tightened false-branch join interval for a checked unsigned multiplication:
+when `mulWithOverflowU w a c` takes the `overflowed = false` arm with
+`a ∈ [lo, hi]`, the wrapped result is the exact product, lies in
+`[lo * c, hi * c]`, and fits the width. -/
+theorem mulWithOverflowU_false_interval (w : ScalarWidth) {lo hi a c r : Nat}
+    (hLo : lo ≤ a) (hHi : a ≤ hi) (h : mulWithOverflowU w a c = (r, false)) :
+    r = a * c ∧ lo * c ≤ r ∧ r ≤ hi * c ∧ r < w.modulus := by
+  have hNo : (mulWithOverflowU w a c).2 = false := congrArg Prod.snd h
+  have hLt : a * c < w.modulus := (mulWithOverflowU_no_overflow_iff w a c).mp hNo
+  rw [mulWithOverflowU_of_lt w hLt] at h
+  have hR : a * c = r := congrArg Prod.fst h
+  subst hR
+  exact ⟨rfl, Nat.mul_le_mul_right c hLo, Nat.mul_le_mul_right c hHi, hLt⟩
+
+/-- Fail-closed negative lemma: if a state's accumulator slot decodes (through
+`fops.asScalar?`) to a value outside `[spec.lo, spec.hi]`, it CANNOT satisfy
+`StageIntervalStateInv`. -/
+theorem not_stageIntervalStateInv_of_decoded_out_of_range {S : Type u}
+    {Val : Type v} {fops : OvfCastFrameOps S Val} (hLaw : fops.Lawful)
+    {baseLocals : List Val} {ids : StageLocalIds}
+    {spec : StageIntervalSpec} {s : S} {slot : Val} {n : Nat}
+    (hGet : listGet? (fops.localsOf s) ids.accId = some slot)
+    (hDec : fops.asScalar? spec.width slot = some n)
+    (hOut : n < spec.lo ∨ spec.hi < n) :
+    ¬ StageIntervalStateInv fops baseLocals ids spec s := by
+  intro hInv
+  let ⟨acc, hAccGet, hAccLo, hAccHi, hHiMod⟩ := hInv.2.2.1
+  have hSlot : fops.mkScalar spec.width acc = slot :=
+    Option.some.inj (hAccGet.symm.trans hGet)
+  have hSome : fops.asScalar? spec.width (fops.mkScalar spec.width acc) = some acc :=
+    hLaw.asScalar?_mkScalar spec.width acc (Nat.lt_of_le_of_lt hAccHi hHiMod)
+  rw [hSlot, hDec] at hSome
+  have hEq : n = acc := Option.some.inj hSome
+  rw [hEq] at hOut
+  cases hOut with
+  | inl hBelow => exact Nat.not_lt_of_ge hAccLo hBelow
+  | inr hAbove => exact Nat.not_lt_of_ge hAccHi hAbove
+
 section OvfCut
 
 variable {S : Type u} {Val : Type v} {Out : Type w} {Fault : Type x}
@@ -1453,6 +1602,167 @@ theorem ovfCastStageCut_unchecked_of_interval {fops : OvfCastFrameOps S Val}
     (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
     (stageIntervalStateInv_set_acc (spec₂ := dstSpec)
       hLaw hWf hInv hResLo hResHi hResMod)
+
+/-- Checked unsigned-addition diamond with the join interval facts made
+explicit: instantiates `ovfCastStageCut_checked_diamond` at
+`addWithOverflowU w · c`, handing the `overflowed = false` arm the exact sum
+`acc + c` together with `acc + c < w.modulus`, and the `overflowed = true` arm
+the wrapped sum together with `w.modulus ≤ acc + c`. Neither arm has to
+re-derive what the overflow flag means. -/
+theorem ovfCastStageCut_checked_add_diamond {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (addWithOverflowU w acc c).1
+        (addWithOverflowU w acc c).2))
+    (hNoOvfArm : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      acc + c < w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s (acc + c) false))
+    (hOvfArm : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      w.modulus ≤ acc + c →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s ((acc + c) % w.modulus) true)) :
+    OvfCastStageCut fops step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond (fun acc => addWithOverflowU w acc c)
+    branchState hDispatch
+    (fun s acc wrapped hInv hLo hHi hOp => by
+      have hI := addWithOverflowU_false_interval w hLo hHi hOp
+      have hLt : acc + c < w.modulus :=
+        (addWithOverflowU_no_overflow_iff w acc c).mp (congrArg Prod.snd hOp)
+      rw [hI.1]
+      exact hNoOvfArm s acc hInv hLo hHi hLt)
+    (fun s acc wrapped hInv hLo hHi hOp => by
+      have hFlag : (addWithOverflowU w acc c).2 = true := congrArg Prod.snd hOp
+      have hGe : w.modulus ≤ acc + c := Nat.le_of_ble_eq_true hFlag
+      have hW : (acc + c) % w.modulus = wrapped := congrArg Prod.fst hOp
+      rw [← hW]
+      exact hOvfArm s acc hInv hLo hHi hGe)
+
+/-- Generic single-step cast/transfer stage cut: when every entry state with
+`acc ∈ [srcSpec.lo, srcSpec.hi]` steps to `dstSpec.blockIdx` storing
+`castFn acc` (at `dstSpec.width`) in `ids.accId`, and `castFn` maps the source
+interval into `[dstSpec.lo, dstSpec.hi]`, seals the step into
+`OvfCastStageCut`. Signed widening casts move the interval (negative values
+gain sign-extension bits), which the identity-interval `ovfCastStageCut_narrow`
+and `ovfCastStageCut_widen` rules cannot express. -/
+theorem ovfCastStageCut_cast_of_interval {fops : OvfCastFrameOps S Val}
+    (hLaw : fops.Lawful) {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec}
+    (hWf : ids.wf baseLocals.length = true)
+    (castFn : Nat → Nat)
+    (hRange : ∀ acc : Nat, srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      dstSpec.lo ≤ castFn acc ∧ castFn acc ≤ dstSpec.hi)
+    (hDstMod : dstSpec.hi < dstSpec.width.modulus)
+    (hStep : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (fops.withBlockLocals s dstSpec.blockIdx
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstSpec.width (castFn acc))))) :
+    OvfCastStageCut fops step baseLocals ids earlyOk srcSpec dstSpec 1 := by
+  intro s hInv
+  let ⟨acc, hAccGet, hLo, hHi, _⟩ := hInv.2.2.1
+  have hR := hRange acc hLo hHi
+  have hEv := hStep s acc hInv hAccGet hLo hHi
+  refine wpUntilFuel_step
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st))) ?_
+  change (step s).wp _ _ _
+  rw [hEv]
+  dsimp only [StepOutcome.wp]
+  exact wpUntilFuel_here
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+    (stageIntervalStateInv_set_acc (spec₂ := dstSpec)
+      hLaw hWf hInv hR.1 hR.2 hDstMod)
+
+/-- Signed widening `intToInt` cast stage cut on a non-negative interval
+(`hi < srcW.halfModulus`): sign-extension is the identity, so `[lo, hi]` is
+preserved across `srcW → dstW`. -/
+theorem ovfCastStageCut_widen_signed_nonneg {fops : OvfCastFrameOps S Val}
+    (hLaw : fops.Lawful) {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcBb dstBb lo hi : Nat} {srcW dstW : ScalarWidth}
+    (hWf : ids.wf baseLocals.length = true)
+    (hBits : srcW.bits < dstW.bits)
+    (hHiSrc : hi < srcW.halfModulus)
+    (hStep : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids ⟨srcBb, srcW, lo, hi⟩ s →
+      listGet? (fops.localsOf s) ids.accId = some (fops.mkScalar srcW acc) →
+      lo ≤ acc → acc ≤ hi →
+      step s = .step (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (intToIntCast srcW true dstW acc))))) :
+    OvfCastStageCut fops step baseLocals ids earlyOk
+      ⟨srcBb, srcW, lo, hi⟩ ⟨dstBb, dstW, lo, hi⟩ 1 :=
+  ovfCastStageCut_cast_of_interval
+    (srcSpec := ⟨srcBb, srcW, lo, hi⟩) (dstSpec := ⟨dstBb, dstW, lo, hi⟩)
+    hLaw hWf (intToIntCast srcW true dstW)
+    (fun acc hLo hHi => by
+      rw [intToIntCast_widen_signed_nonneg srcW dstW hBits
+        (Nat.lt_of_le_of_lt hHi hHiSrc)]
+      exact ⟨hLo, hHi⟩)
+    (Nat.lt_of_lt_of_le
+      (Nat.lt_trans hHiSrc srcW.halfModulus_lt_modulus)
+      (pow2_le_pow2 (Nat.le_of_lt hBits)))
+    hStep
+
+/-- Signed widening `intToInt` cast stage cut on a negative interval
+(`srcW.halfModulus ≤ lo` and `hi < srcW.modulus`): two's-complement
+sign-extension shifts `[lo, hi]` up by `dstW.modulus - srcW.modulus`. -/
+theorem ovfCastStageCut_widen_signed_neg {fops : OvfCastFrameOps S Val}
+    (hLaw : fops.Lawful) {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcBb dstBb lo hi : Nat} {srcW dstW : ScalarWidth}
+    (hWf : ids.wf baseLocals.length = true)
+    (hBits : srcW.bits < dstW.bits)
+    (hLoNeg : srcW.halfModulus ≤ lo)
+    (hHiSrc : hi < srcW.modulus)
+    (hStep : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids ⟨srcBb, srcW, lo, hi⟩ s →
+      listGet? (fops.localsOf s) ids.accId = some (fops.mkScalar srcW acc) →
+      lo ≤ acc → acc ≤ hi →
+      step s = .step (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (intToIntCast srcW true dstW acc))))) :
+    OvfCastStageCut fops step baseLocals ids earlyOk
+      ⟨srcBb, srcW, lo, hi⟩
+      ⟨dstBb, dstW, (dstW.modulus - srcW.modulus) + lo,
+        (dstW.modulus - srcW.modulus) + hi⟩ 1 :=
+  ovfCastStageCut_cast_of_interval
+    (srcSpec := ⟨srcBb, srcW, lo, hi⟩)
+    (dstSpec := ⟨dstBb, dstW, (dstW.modulus - srcW.modulus) + lo,
+      (dstW.modulus - srcW.modulus) + hi⟩)
+    hLaw hWf (intToIntCast srcW true dstW)
+    (fun acc hLo hHi => by
+      rw [(intToIntCast_widen_signed_neg srcW dstW hBits
+        (Nat.le_trans hLoNeg hLo) (Nat.lt_of_le_of_lt hHi hHiSrc)).1]
+      exact ⟨Nat.add_le_add_left hLo _, Nat.add_le_add_left hHi _⟩)
+    (by
+      have hAdd := Nat.add_lt_add_left hHiSrc (dstW.modulus - srcW.modulus)
+      have hModLe : srcW.modulus ≤ dstW.modulus :=
+        pow2_le_pow2 (Nat.le_of_lt hBits)
+      rw [Nat.sub_add_cancel hModLe] at hAdd
+      exact hAdd)
+    hStep
 
 /-- Boolean-switched two-arm diamond join: collapses a `flag : Bool` branch
 (e.g. `SwitchInt`) where both arms reach `dstSpec` within `armFuel` steps into

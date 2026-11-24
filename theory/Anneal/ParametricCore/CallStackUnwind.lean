@@ -482,6 +482,125 @@ theorem exitFrameWithProtectors_released_tags
     | AccessFailure _ _ _ _ => cases hRel'
     | InvariantFailure _ _ _ => cases hRel'
 
+private def exitFrameFinish (frameTags : List Nat)
+    (relOut : Anneal.RefFrame.ProtectorReleaseResult) :
+    Anneal.RefFrame.ProtectorReleaseResult :=
+  match relOut.status with
+  | .Released =>
+    ⟨Anneal.RefFrame.endCallRemoveProtectors relOut.tree frameTags, .Released⟩
+  | .MissingTag _ | .AccessFailure _ _ _ _ | .InvariantFailure _ _ _ => relOut
+
+private theorem exitFrameWithProtectors_eq_fold
+    (tree : Anneal.RefFrame.RangedBorrowTree) (frameTags : List Nat) :
+    Anneal.RefFrame.exitFrameWithProtectors tree frameTags =
+      exitFrameFinish frameTags
+        (frameTags.foldl exitFrameStepFn ⟨tree, .Released⟩) :=
+  rfl
+
+private theorem exitFrameFold_released_all_protected
+    (tags : List Nat) (acc : Anneal.RefFrame.ProtectorReleaseResult)
+    (hRel : (tags.foldl exitFrameStepFn acc).status = .Released) :
+    acc.status = .Released ∧
+    ∀ t : Nat, Anneal.RefFrame.natListMem t tags = true →
+      Anneal.RefFrame.natListMem t acc.tree.protectedTags = true := by
+  induction tags generalizing acc with
+  | nil => exact ⟨hRel, fun _ hIn => by cases (hIn : false = true)⟩
+  | cons hd tl ih =>
+    have h := ih (exitFrameStepFn acc hd) hRel
+    cases acc with
+    | mk tr st =>
+      cases st with
+      | MissingTag tg =>
+        cases (h.1 : Anneal.RefFrame.ProtectorReleaseStatus.MissingTag tg = .Released)
+      | AccessFailure o l tg e =>
+        cases (h.1 :
+          Anneal.RefFrame.ProtectorReleaseStatus.AccessFailure o l tg e = .Released)
+      | InvariantFailure o l tg =>
+        cases (h.1 :
+          Anneal.RefFrame.ProtectorReleaseStatus.InvariantFailure o l tg = .Released)
+      | Released =>
+        cases hP : Anneal.RefFrame.natListMem hd tr.protectedTags with
+        | false =>
+          have hStep : exitFrameStepFn ⟨tr, .Released⟩ hd = ⟨tr, .MissingTag hd⟩ := by
+            unfold exitFrameStepFn
+            dsimp only
+            rw [hP] <;> rfl
+          rw [hStep] at h
+          cases (h.1 :
+            Anneal.RefFrame.ProtectorReleaseStatus.MissingTag hd = .Released)
+        | true =>
+          have hStep : exitFrameStepFn ⟨tr, .Released⟩ hd =
+              Anneal.RefFrame.releaseProtectorKeepProtected tr hd := by
+            unfold exitFrameStepFn
+            dsimp only
+            rw [hP] <;> rfl
+          rw [hStep, releaseProtectorKeepProtected_preserves_protectedTags] at h
+          refine ⟨rfl, fun t hIn => ?_⟩
+          have hCons : Anneal.RefFrame.natListMem t (hd :: tl) =
+              (Nat.beq t hd || Anneal.RefFrame.natListMem t tl) := rfl
+          rw [hCons] at hIn
+          cases hEq : Nat.beq t hd with
+          | true =>
+            rw [Nat.eq_of_beq_eq_true hEq]
+            exact hP
+          | false =>
+            rw [hEq] at hIn
+            exact h.2 t hIn
+
+/-- Fail-closed precondition of a clean frame exit: when
+`exitFrameWithProtectors tree frameTags` succeeds (`.Released`), EVERY tag in
+`frameTags` was protected in the input `tree`. Contrapositively, a frame that
+claims a tag it does not protect can never release cleanly. -/
+theorem exitFrameWithProtectors_released_all_protected
+    {tree tree' : Anneal.RefFrame.RangedBorrowTree} {frameTags : List Nat}
+    (hRel : Anneal.RefFrame.exitFrameWithProtectors tree frameTags =
+      ⟨tree', .Released⟩)
+    (t : Nat) (hIn : Anneal.RefFrame.natListMem t frameTags = true) :
+    Anneal.RefFrame.natListMem t tree.protectedTags = true := by
+  have hSt : (Anneal.RefFrame.exitFrameWithProtectors tree frameTags).status =
+      .Released := by
+    rw [hRel]
+  rw [exitFrameWithProtectors_eq_fold] at hSt
+  have hFoldRel :
+      (frameTags.foldl exitFrameStepFn ⟨tree, .Released⟩).status = .Released := by
+    generalize frameTags.foldl exitFrameStepFn ⟨tree, .Released⟩ = relOut at hSt ⊢
+    cases relOut with
+    | mk relTree relSt =>
+      cases relSt with
+      | Released => rfl
+      | MissingTag tg =>
+        cases (hSt : Anneal.RefFrame.ProtectorReleaseStatus.MissingTag tg = .Released)
+      | AccessFailure o l tg e =>
+        cases (hSt :
+          Anneal.RefFrame.ProtectorReleaseStatus.AccessFailure o l tg e = .Released)
+      | InvariantFailure o l tg =>
+        cases (hSt :
+          Anneal.RefFrame.ProtectorReleaseStatus.InvariantFailure o l tg = .Released)
+  exact (exitFrameFold_released_all_protected frameTags ⟨tree, .Released⟩
+    hFoldRel).2 t hIn
+
+/-- Fail-closed: whenever `exitFrameWithProtectors tree frameTags` does not
+release cleanly (`.MissingTag`, `.AccessFailure`, or `.InvariantFailure`), the
+returned tree keeps `tree.protectedTags` unchanged. A failed frame exit never
+strips a protector, not even partially. -/
+theorem exitFrameWithProtectors_not_released_keeps_protectedTags
+    (tree : Anneal.RefFrame.RangedBorrowTree) (frameTags : List Nat)
+    (hNot : (Anneal.RefFrame.exitFrameWithProtectors tree frameTags).status ≠
+      .Released) :
+    (Anneal.RefFrame.exitFrameWithProtectors tree frameTags).tree.protectedTags =
+      tree.protectedTags := by
+  have hKeep := exitFrameFold_preserves_protectedTags frameTags ⟨tree, .Released⟩
+  rw [exitFrameWithProtectors_eq_fold] at hNot ⊢
+  generalize frameTags.foldl exitFrameStepFn ⟨tree, .Released⟩ = relOut
+    at hNot hKeep ⊢
+  cases relOut with
+  | mk relTree relSt =>
+    cases relSt with
+    | Released => exact False.elim (hNot rfl)
+    | MissingTag _ => exact hKeep
+    | AccessFailure _ _ _ _ => exact hKeep
+    | InvariantFailure _ _ _ => exact hKeep
+
 /-- Protected `&mut` borrow writeback frame pairing `RefFrame Addr` with the
 callee's Tree Borrows protector tags `frameTags : List Nat` on a shared
 `Anneal.RefFrame.RangedBorrowTree`. -/
@@ -575,6 +694,45 @@ theorem evalProtectedRefFrameExit_fault_of_invariantFailure
   unfold evalProtectedRefFrameExit
   dsimp only
   rw [hErr]
+
+/-- Universal fail-closed rule for unprotected frame tags: if ANY tag claimed by
+`prf.frameTags` is not in `tree.protectedTags`, `evalProtectedRefFrameExit`
+faults on every `(onRet, onUnwind)` regime and every callee exit, and returns a
+tree whose `protectedTags` are unchanged (no protector is stripped by a failed
+exit). -/
+theorem evalProtectedRefFrameExit_fault_of_unprotected_frameTag
+    (prf : ProtectedRefFrame Addr) (mem : Mem)
+    (tree : Anneal.RefFrame.RangedBorrowTree) (exit : CalleeExit Val Byte)
+    {t : Nat}
+    (hIn : Anneal.RefFrame.natListMem t prf.frameTags = true)
+    (hUnprot : Anneal.RefFrame.natListMem t tree.protectedTags = false) :
+    (evalProtectedRefFrameExit prf mem tree exit).1 = .fault ∧
+    (evalProtectedRefFrameExit prf mem tree exit).2.protectedTags =
+      tree.protectedTags := by
+  have hNot :
+      (Anneal.RefFrame.exitFrameWithProtectors tree prf.frameTags).status ≠
+        .Released := by
+    intro hSt
+    cases hR : Anneal.RefFrame.exitFrameWithProtectors tree prf.frameTags with
+    | mk tr st =>
+      rw [hR] at hSt
+      have hSt' : st = .Released := hSt
+      rw [hSt'] at hR
+      have hProt := exitFrameWithProtectors_released_all_protected hR t hIn
+      rw [hUnprot] at hProt
+      cases hProt
+  have hKeep := exitFrameWithProtectors_not_released_keeps_protectedTags
+    tree prf.frameTags hNot
+  unfold evalProtectedRefFrameExit
+  dsimp only
+  cases hR : Anneal.RefFrame.exitFrameWithProtectors tree prf.frameTags with
+  | mk tr st =>
+    rw [hR] at hNot hKeep
+    cases st with
+    | Released => exact False.elim (hNot rfl)
+    | MissingTag _ => exact ⟨rfl, hKeep⟩
+    | AccessFailure _ _ _ _ => exact ⟨rfl, hKeep⟩
+    | InvariantFailure _ _ _ => exact ⟨rfl, hKeep⟩
 
 /-- Complete 16-equation protected call-frame continuation matrix combining
 `refFrame_callCont4_matrix_sound` with `Anneal.RefFrame.exitFrameWithProtectors`
@@ -1221,6 +1379,77 @@ theorem evalCallCont4Dispatch_fault_of_non_cleanup {Mem : Type u} (Val : Type w)
   dsimp only
   rw [hFalse]
   rfl
+
+/-- Forgets the `RangedBorrowTree` component of a `CallCont4Dispatch`, giving
+the `CallerContOutcome` that `evalRefFrameExit` produces for the same
+continuation regime. -/
+def CallerContOutcome.ofDispatch {Mem : Type u} {Val : Type w} :
+    CallCont4Dispatch Mem Val → CallerContOutcome Mem Val
+  | .stepNormal targetBb retVal mem _ => .jumpNormal targetBb retVal mem
+  | .stepCleanup cleanupBb mem _ => .jumpCleanup cleanupBb mem
+  | .exitUnwind mem _ => .propagateUnwind mem
+  | .exitTerminate mem _ => .abortTerminate mem
+  | .fault => .fault
+
+/-- Agreement between the two call-continuation evaluators of this module: for
+a clean protector release and an accepted `&mut` writeback `L.set mem bs =
+some mem'`, the Part I `evalProtectedRefFrameExit` (which commits the writeback
+itself) and the Part III `evalCallCont4Dispatch` used by `wpCallSite` (which
+receives the post-writeback `(mem', tree')`) select the same continuation on
+both `.returned` and `.unwound` exits, across all 8 `(onRet, onUnwind)`
+regimes. `evalRefFrameExit` does not validate landing pads, so the `.cleanup`
+regime needs `isCleanupBb` to accept the pad. -/
+theorem evalProtectedRefFrameExit_eq_dispatch {Mem : Type u} {Addr : Type v}
+    {Byte : Type a} {Val : Type w} [ops : ByteStoreOps Mem Addr Byte]
+    (L : ByteSubLens Addr) (cont : CallCont4) (frameTags : List Nat)
+    (isCleanupBb : Nat → Bool) (mem mem' : Mem)
+    {tree tree' : Anneal.RefFrame.RangedBorrowTree}
+    (retVal : Val) (bs : List Byte)
+    (hRel : Anneal.RefFrame.exitFrameWithProtectors tree frameTags =
+      ⟨tree', .Released⟩)
+    (hSet : L.set mem bs = some mem')
+    (hClean : ∀ cleanupBb : Nat, cont.onUnwind = .cleanup cleanupBb →
+      isCleanupBb cleanupBb = true) :
+    evalProtectedRefFrameExit ⟨⟨L, cont⟩, frameTags⟩ mem tree
+        (.returned retVal bs) =
+      (CallerContOutcome.ofDispatch
+        (evalCallCont4Dispatch isCleanupBb cont (.returned retVal mem' tree')),
+       tree') ∧
+    evalProtectedRefFrameExit ⟨⟨L, cont⟩, frameTags⟩ mem tree
+        (CalleeExit.unwound (Val := Val) bs) =
+      (CallerContOutcome.ofDispatch
+        (evalCallCont4Dispatch isCleanupBb cont
+          (FrameExitOutcome.unwound (Val := Val) mem' tree')),
+       tree') := by
+  have hW : ∀ ex : CalleeExit Val Byte,
+      evalProtectedRefFrameExit ⟨⟨L, cont⟩, frameTags⟩ mem tree ex =
+        (evalRefFrameExit ⟨L, cont⟩ mem ex, tree') := fun ex =>
+    (evalProtectedRefFrameExit_of_released ⟨⟨L, cont⟩, frameTags⟩ mem ex hRel).1
+  rw [hW, hW]
+  cases cont with
+  | mk onRet onUnwind =>
+    refine ⟨?_, ?_⟩
+    · cases onRet with
+      | none => rfl
+      | some retBb =>
+        unfold evalRefFrameExit
+        dsimp only
+        rw [hSet] <;> rfl
+    · cases onUnwind with
+      | unreachable => rfl
+      | terminate =>
+        unfold evalRefFrameExit
+        dsimp only
+        rw [hSet] <;> rfl
+      | continue_ =>
+        unfold evalRefFrameExit
+        dsimp only
+        rw [hSet] <;> rfl
+      | cleanup cleanupBb =>
+        have hC : isCleanupBb cleanupBb = true := hClean cleanupBb rfl
+        unfold evalRefFrameExit evalCallCont4Dispatch
+        dsimp only
+        rw [hSet, hC] <;> rfl
 
 /-- Saved caller frame on the multi-frame call-stack overlay waiting for a
 callee return or unwind. -/
@@ -2359,5 +2588,43 @@ theorem canary_callStackUnwind_fail_closed_negatives :
       (fun _ _ _ _ => True) (fun _ _ _ => True)
       (fun _ _ => True) (fun _ _ => True)
       csuInitialMem m' tree0 tree0 (.unwound m' tree0) hDone rfl
+
+/-- Co-frame protector ordering canary (Miri frame-exit order): on a single
+`[0..8)` segment where sibling tags `1` and `2` are both `(Unique, accessed)`,
+1. exiting a frame owning BOTH tags faults with `.ProtectedDisabled`, because
+   tag `2` is still protected while tag `1`'s implicit exit write disables it;
+2. the same tree with only tag `1` protected and owned releases cleanly, so
+   the fault in (1) is caused by the co-frame protector staying active during
+   the exit access (stripping protectors first would hide it);
+3. the failed exit in (1) strips no protector, and
+   `evalProtectedRefFrameExit` on a frame claiming the unprotected tag `2`
+   faults while leaving `protectedTags = [1]` unchanged. -/
+theorem canary_coframe_protector_active_during_exit_access :
+    let mkTree (prot : List Nat) : Anneal.RefFrame.RangedBorrowTree :=
+      { topology := Anneal.RefFrame.topo3
+        protectedTags := prot
+        segments :=
+          [⟨0, 8, [(0, ⟨.Unique, true⟩), (1, ⟨.Unique, true⟩),
+                   (2, ⟨.Unique, true⟩)]⟩] }
+    let rf : RefFrame Nat := ⟨csuDstLens, ⟨some 10, .cleanup 99⟩⟩
+    let exNorm : CalleeExit Nat (ByteRunAtom Nat) :=
+      .returned 1 (flattenByteRuns (ByteRunCodec.id Nat) csuNormalRuns)
+    (Anneal.RefFrame.exitFrameWithProtectors (mkTree [1, 2]) [1, 2]).status =
+      .AccessFailure 0 8 2 (.ProtectedDisabled .Unique) ∧
+    (Anneal.RefFrame.exitFrameWithProtectors (mkTree [1]) [1]).status =
+      .Released ∧
+    (Anneal.RefFrame.exitFrameWithProtectors (mkTree [1]) [1]).tree.protectedTags =
+      [] ∧
+    (Anneal.RefFrame.exitFrameWithProtectors (mkTree [1, 2]) [1, 2]).tree.protectedTags =
+      [1, 2] ∧
+    (evalProtectedRefFrameExit ⟨rf, [1, 2]⟩ csuInitialMem (mkTree [1]) exNorm).1 =
+      .fault ∧
+    (evalProtectedRefFrameExit ⟨rf, [1, 2]⟩ csuInitialMem (mkTree [1])
+      exNorm).2.protectedTags = [1] := by
+  refine ⟨rfl, rfl, rfl, rfl, ?_, ?_⟩
+  · exact (evalProtectedRefFrameExit_fault_of_unprotected_frameTag
+      (t := 2) _ _ _ _ rfl rfl).1
+  · exact (evalProtectedRefFrameExit_fault_of_unprotected_frameTag
+      (t := 2) _ _ _ _ rfl rfl).2
 
 end Anneal.ParametricCore

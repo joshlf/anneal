@@ -778,6 +778,30 @@ theorem copyRangeComp_of_get {src dst : ByteSubLens Addr} {m : Mem}
   change (match src.get m with | none => none | some bs => dst.set m bs) = _
   rw [hGet]
 
+/-- Exact success characterization of `copyRangeComp` (both directions): a
+copy succeeds with `m'` exactly when the lengths are positive and equal, `src`
+is readable, and the `dst` write of the bytes read from `src` yields `m'`.
+Every other input fails closed (`none`). -/
+theorem copyRangeComp_eq_some_iff {src dst : ByteSubLens Addr} {m m' : Mem} :
+    copyRangeComp src dst m = some m' ↔
+      0 < src.len ∧ src.len = dst.len ∧
+        ∃ bs : List Byte, src.get m = some bs ∧ dst.set m bs = some m' :=
+  ⟨copyRangeComp_inv, fun ⟨hPos, hLenEq, _, hGet, hSet⟩ =>
+    (copyRangeComp_of_get hPos hLenEq hGet).trans hSet⟩
+
+/-- Fail-closed: `copyRangeComp` returns `none` when the `dst` write of the
+bytes read from `src` is rejected (out-of-bounds or unwritable `dst`). -/
+theorem copyRangeComp_none_of_dst_set_none {src dst : ByteSubLens Addr}
+    {m : Mem} {bs : List Byte} (hGet : src.get m = some bs)
+    (hSetNone : dst.set m bs = none) : copyRangeComp src dst m = none := by
+  cases h : copyRangeComp src dst m with
+  | none => rfl
+  | some m' =>
+    let ⟨_, _, bs', hGet', hSet'⟩ := copyRangeComp_inv h
+    have hEq : bs' = bs := Option.some.inj (hGet'.symm.trans hGet)
+    rw [hEq, hSetNone] at hSet'
+    cases hSet'
+
 /-- Auxiliary metadata preservation for `copyRangeComp`. -/
 theorem copyRangeComp_preserves {V : Sort y} {proj : Mem → V}
     (hPres : ops.WritePreserves proj) {src dst : ByteSubLens Addr}
@@ -1590,6 +1614,28 @@ theorem ByteRunCopyCut.preserves_proj {V : Sort a} {proj : Mem → V}
     (h : ByteRunCopyCut step memOf copyOps fuel s₀ s₁) :
     proj (memOf s₁) = proj (memOf s₀) :=
   execByteRunCopyOps_preserves hPres copyOps h.2
+
+/-- Projects the exact memory transition of a `ByteRunCopyCut`: `memOf s₁` is
+the result of executing `copyOps` on `memOf s₀`. -/
+theorem ByteRunCopyCut.exec_eq {step : S → StepOutcome S Out Fault}
+    {memOf : S → Mem} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (h : ByteRunCopyCut step memOf copyOps fuel s₀ s₁) :
+    execByteRunCopyOps copyOps (memOf s₀) = some (memOf s₁) :=
+  h.2
+
+/-- Fail-closed: no `ByteRunCopyCut` exists (for any fuel or end state) over a
+copy pipeline that fails on `memOf s₀` (zero-length, length-mismatched,
+out-of-bounds, or unwritable copy). -/
+theorem not_byteRunCopyCut_of_exec_none {step : S → StepOutcome S Out Fault}
+    {memOf : S → Mem} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (hNone : execByteRunCopyOps copyOps (memOf s₀) = none) :
+    ¬ ByteRunCopyCut step memOf copyOps fuel s₀ s₁ := by
+  intro h
+  have h2 := h.2
+  rw [hNone] at h2
+  cases h2
 
 end CopyCut
 
