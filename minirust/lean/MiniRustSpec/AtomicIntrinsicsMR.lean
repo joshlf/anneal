@@ -5253,6 +5253,104 @@ theorem argFaultAtomicFn_order :
       some (.ub "division by zero") := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
+/-! ### Exposed provenance: atomics through an `int2ptr` pointer, and their scalar summary -/
+
+/-- Scalar summary of an integer atomic at `t` on a cell holding `cur`: the returned integer
+(`none` for the unit of `AtomicStore`) and the cell's next integer; `none` when the intrinsic
+stops (ill-formed arguments, arithmetic UB, or a stored integer that `t` cannot represent). -/
+def atomicScalar (op : IntrinsicOp) (t : IntType) (cur : Int) (args : List Int) :
+    Option (Option Int × Int) :=
+  let stored (ret : Option Int) (n : Int) : Option (Option Int × Int) :=
+    if IntType.can_represent t n then some (ret, n) else none
+  match op, args with
+  | .AtomicStore, [v] => stored none v
+  | .AtomicLoad, [] => some (some cur, cur)
+  | .AtomicCompareExchange, [before, next] =>
+    if cur = before then stored (some cur) next else some (some cur, cur)
+  | .AtomicFetchAndOp binOp, [o] =>
+    match evalIntBinOp binOp cur o t with
+    | .ok n => stored (some cur) n
+    | .error _ => none
+  | _, _ => none
+
+/-- Integer atomics on a `u32` cell holding `5`, in and out of range, each with the summary
+that `atomicScalar` must give. -/
+def scalarCases : List (IntrinsicOp × List Int × Option (Option Int × Int)) :=
+  [(.AtomicStore, [9], some (none, 9)), (.AtomicStore, [4294967296], none),
+   (.AtomicLoad, [], some (some 5, 5)), (.AtomicLoad, [1], none),
+   (.AtomicCompareExchange, [5, 9], some (some 5, 9)),
+   (.AtomicCompareExchange, [6, 9], some (some 5, 5)),
+   (.AtomicFetchAndOp .Add, [3], some (some 5, 8)), (.AtomicFetchAndOp .Sub, [6], none),
+   (.AtomicFetchAndOp .Div, [0], none)]
+
+/-- The integer atomic `op` on `u32` arguments `args` through `p`, run by `eval_intrinsic` `ev`. -/
+def scalarCall (M : Type) [Memory M] {S : Type}
+    (ev : S → IntrinsicOp → List (Value M × «Type») → «Type» → Interp (Value M × S))
+    (op : IntrinsicOp) (args : List Int) (m : S) (p : ThinPointer (Memory.Provenance M)) :
+    Interp (Value M × S) :=
+  ev m op ((.Ptr ⟨p, none⟩, tyRawPtr) :: args.map fun (i : Int) => (.Int i, .Int itU32))
+    (match op with | .AtomicStore => unitType | _ => .Int itU32)
+
+/-- `PointerExposeProvenance(q)` (when `expose = some q`), then
+`PointerWithExposedProvenance(addr)`, then `op` through the reconstructed thin pointer. -/
+def int2ptrThen (M : Type) [Memory M] {S : Type}
+    (ev : S → IntrinsicOp → List (Value M × «Type») → «Type» → Interp (Value M × S))
+    (m : S) (expose : Option (ThinPointer (Memory.Provenance M))) (addr : Int)
+    (op : S → ThinPointer (Memory.Provenance M) → Interp (Value M × S)) :
+    Interp (Value M × S) := do
+  let (_, m) ← match expose with
+    | some q => ev m .PointerExposeProvenance [(.Ptr ⟨q, none⟩, tyRawPtr)] (.Int itU64)
+    | none => pure (.Int addr, m)
+  let (v, m) ← ev m .PointerWithExposedProvenance [(.Int addr, .Int itU64)] tyRawPtr
+  match v with
+  | .Ptr ⟨p, none⟩ => op m p
+  | _ => .error (.unsupported "PointerWithExposedProvenance returned no thin pointer")
+
+/-- Whether `ev` agrees with `scalarCases` and `atomicScalar` on a `u32` cell at `p` holding `5`:
+the returned integer and the cell's next integer (read back by `AtomicLoad`), through `p` and
+through the pointer reconstructed from `p`'s exposed provenance. -/
+def scalarAgrees (M : Type) [Memory M] {S : Type}
+    (ev : S → IntrinsicOp → List (Value M × «Type») → «Type» → Interp (Value M × S))
+    (m : S) (p : ThinPointer (Memory.Provenance M)) : Bool :=
+  let view (r : Interp (Value M × S)) : Option (Option Int × Int) :=
+    match r with
+    | .error _ => none
+    | .ok (v, m') =>
+      match v, scalarCall M ev .AtomicLoad [] m' p with
+      | .Int i, .ok (.Int c, _) => some (some i, c)
+      | _, .ok (.Int c, _) => some (none, c)
+      | _, _ => none
+  scalarCases.all fun c =>
+    atomicScalar c.1 itU32 5 c.2.1 == c.2.2 && view (scalarCall M ev c.1 c.2.1 m p) == c.2.2 &&
+      view (int2ptrThen M ev m (some p) p.addr (scalarCall M ev c.1 c.2.1)) == c.2.2
+
+/-- Atomics through an `int2ptr` pointer on `Mach` and `MachTB`. In bounds, every integer atomic
+runs through the reconstructed pointer exactly as `atomicScalar` says (`scalarAgrees`). A pointer
+reconstructed with nothing exposed has no provenance, and one reconstructed past the cell's end
+is out of bounds: both are UB. Exposure launders no Tree Borrows permission: through the
+reconstruction of an exposed `Frozen` pointer, `AtomicLoad` reads and `AtomicStore` is UB. -/
+theorem atomic_int2ptr_scalar :
+    scalarAgrees BM evalIntrinsic bmFive bmPtr = true ∧
+    scalarAgrees TBM evalIntrinsicM tbFive tbPtr = true ∧
+    stopOf (int2ptrThen BM evalIntrinsic bmFive none cellAddr
+        (scalarCall BM evalIntrinsic .AtomicCompareExchange [5, 9])) =
+      some (.ub "dereferencing pointer without provenance") ∧
+    stopOf (int2ptrThen TBM evalIntrinsicM tbFive none cellAddr
+        (scalarCall TBM evalIntrinsicM .AtomicLoad [])) =
+      some (.ub "dereferencing pointer without provenance") ∧
+    stopOf (int2ptrThen BM evalIntrinsic bmFive (some bmPtr) (cellAddr + 8)
+        (scalarCall BM evalIntrinsic .AtomicStore [9])) =
+      some (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+    stopOf (int2ptrThen TBM evalIntrinsicM tbFive (some tbPtr) (cellAddr + 8)
+        (scalarCall TBM evalIntrinsicM (.AtomicFetchAndOp .Add) [1])) =
+      some (.ub "dereferencing pointer outside the bounds of its allocation") ∧
+    tbObs (int2ptrThen TBM evalIntrinsicM tbShared (some tbSharedPtr) cellAddr
+        (scalarCall TBM evalIntrinsicM .AtomicLoad [])) = some ⟨.Int 5, [u32Bytes 5], [aLoad 4]⟩ ∧
+    stopOf (int2ptrThen TBM evalIntrinsicM tbShared (some tbSharedPtr) cellAddr
+        (scalarCall TBM evalIntrinsicM .AtomicStore [9])) =
+      some (.ub "Tree Borrows: local write of Frozen reference") := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ## §5. Vacuity and axiom audit
 
 The conditional laws of §2 and §3 take the outcome of `typed_load` or
@@ -5307,9 +5405,29 @@ theorem evalTerminatorM_intrinsic_misaligned_ret_ub_instance :
       (by decide +kernel)
   exact ⟨hint, hmut, evalTerminatorM_intrinsic_misaligned_ret_ub hplace hargs hint rfl⟩
 
+/-- `tbFiveFrame` after the by-value load of `_0`, which logs a non-atomic load. -/
+def tbFiveLoaded : MachTB :=
+  { tbFiveFrame with mem := { tbFiveFrame.mem with accesses := [⟨.Load, .None, cellAddr, ⟨4⟩⟩] } }
+
+/-- `evalArgsM_tail_error` when the head argument changes the machine (`m1 ≠ m`): loading `_0`
+logs a non-atomic load, `arg[1]` stops, and the terminator's `Stop` discards that machine. -/
+theorem evalArgsM_tail_error_mutating_instance :
+    evalValueM tbFiveFrame (.Load (.Local (lname 0))) = .ok ((.Int 5, .Int itU32), tbFiveLoaded) ∧
+    tbFiveLoaded.mem.accesses ≠ tbFiveFrame.mem.accesses ∧
+    evalTerminatorM tbFiveFrame (.Intrinsic (.AtomicFetchAndOp .Add)
+        [.Load (.Local (lname 0)), divZeroExpr] (.Local (lname 0)) none) =
+      .error (.ub "division by zero") := by
+  have hplace : evalPlaceM tbFiveFrame (.Local (lname 0)) =
+      .ok (({ ptr := ⟨tbPtr, none⟩, aligned := true }, .Int itU32), tbFiveFrame) := by kernel_rfl
+  have hload : evalValueM tbFiveFrame (.Load (.Local (lname 0))) =
+      .ok ((.Int 5, .Int itU32), tbFiveLoaded) := by kernel_rfl
+  have hdiv : evalValueM tbFiveLoaded divZeroExpr = .error (.ub "division by zero") := by kernel_rfl
+  exact ⟨hload, by decide +kernel, evalTerminatorM_intrinsic_args_error hplace
+    (evalArgsM_tail_error hload (evalArgsM_head_error hdiv))⟩
+
 /-- `evalTerminatorM_intrinsic_args_error` and `evalArgsM_{head,tail}_error` are
 not vacuous on `tbFiveFrame`: `arg[0]` faults before `arg[1]`, and `arg[1]`
-faults before `eval_intrinsic` runs (leaving `mem.accesses = []`). -/
+faults before `eval_intrinsic` runs (both heads leave the machine as it was). -/
 theorem evalTerminatorM_intrinsic_args_error_instance :
     evalTerminatorM tbFiveFrame (.Intrinsic (.AtomicFetchAndOp .Add)
         [deadPtrExpr, divZeroExpr] (.Local (lname 0)) none) =
