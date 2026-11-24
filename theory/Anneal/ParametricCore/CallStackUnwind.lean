@@ -619,6 +619,30 @@ theorem exitFrameWithProtectors_nil (tree : Anneal.RefFrame.RangedBorrowTree) :
       listFilter_true prot
     rw [hF]
 
+/-- Fail-closed double-release exclusion: once `exitFrameWithProtectors tree
+tags₁` cleanly releases `tags₁` into `t₁`, no subsequent
+`exitFrameWithProtectors t₁ tags₂` that shares a tag `tag` with `tags₁` can
+return `.Released`. Every protector tag is owned and released at most once
+across nested call frames. -/
+theorem exitFrameWithProtectors_double_release_fails
+    {tree t₁ : Anneal.RefFrame.RangedBorrowTree}
+    {tags₁ tags₂ : List Nat} {tag : Nat}
+    (hRel₁ : Anneal.RefFrame.exitFrameWithProtectors tree tags₁ = ⟨t₁, .Released⟩)
+    (hIn₁ : Anneal.RefFrame.natListMem tag tags₁ = true)
+    (hIn₂ : Anneal.RefFrame.natListMem tag tags₂ = true) :
+    (Anneal.RefFrame.exitFrameWithProtectors t₁ tags₂).status ≠ .Released := by
+  intro hRel₂
+  have hAbsent : Anneal.RefFrame.natListMem tag t₁.protectedTags = false :=
+    (exitFrameWithProtectors_released_tags hRel₁).1 tag hIn₁
+  cases hExit₂ : Anneal.RefFrame.exitFrameWithProtectors t₁ tags₂ with
+  | mk t₂ st =>
+    rw [hExit₂] at hRel₂
+    dsimp only at hRel₂
+    subst hRel₂
+    have hNeed := exitFrameWithProtectors_released_all_protected hExit₂ tag hIn₂
+    rw [hAbsent] at hNeed
+    cases hNeed
+
 /-- Protected `&mut` borrow writeback frame pairing `RefFrame Addr` with the
 callee's Tree Borrows protector tags `frameTags : List Nat` on a shared
 `Anneal.RefFrame.RangedBorrowTree`. -/
@@ -1122,6 +1146,27 @@ theorem UpdatesOnly.mono_subset {allowed₁ allowed₂ : List (ByteSubLens Addr)
   induction h with
   | refl m => exact .refl m
   | step hIn hSet _ ih => exact .step (hSub _ hIn) hSet ih
+
+private theorem mem_append_left {α : Type w} {x : α} :
+    ∀ {xs : List α} (ys : List α), x ∈ xs → x ∈ xs ++ ys
+  | _ :: _, _, List.Mem.head _ => List.Mem.head _
+  | _ :: _, ys, List.Mem.tail _ h => List.Mem.tail _ (mem_append_left ys h)
+
+private theorem mem_append_right {α : Type w} {x : α} :
+    ∀ (xs : List α) {ys : List α}, x ∈ ys → x ∈ xs ++ ys
+  | [], _, h => h
+  | _ :: tl, _, h => List.Mem.tail _ (mem_append_right tl h)
+
+/-- Sequential union composition for multi-call footprints: if call 1 stays
+within `allowed₁` and call 2 stays within `allowed₂`, their composition stays
+within `allowed₁ ++ allowed₂`. -/
+theorem UpdatesOnly.trans_append {allowed₁ allowed₂ : List (ByteSubLens Addr)}
+    {m₀ m₁ m₂ : Mem}
+    (h₁ : UpdatesOnly allowed₁ m₀ m₁)
+    (h₂ : UpdatesOnly allowed₂ m₁ m₂) :
+    UpdatesOnly (allowed₁ ++ allowed₂) m₀ m₂ :=
+  (UpdatesOnly.mono_subset (fun _ h => mem_append_left allowed₂ h) h₁).trans
+    (UpdatesOnly.mono_subset (fun _ h => mem_append_right allowed₁ h) h₂)
 
 /-- Any `copyRangeComp src dst` transition is confined to `allowed` whenever
 `dst ∈ allowed`. -/
@@ -2079,6 +2124,57 @@ theorem continueChainReleases_strips_tags {FrameCtx : Type z} {Addr : Type v}
         exact (hIh t).1 (hStepTags.1 t hInFr)
       | tail _ hInRest =>
         exact (hIh t).2 fr hInRest hInFr
+
+private theorem continueChainReleases_needs_all_tags {FrameCtx : Type z}
+    {Addr : Type v}
+    {frames : List (SavedCallFrame FrameCtx Addr)}
+    {t₀ tFinal : Anneal.RefFrame.RangedBorrowTree}
+    (hChain : ContinueChainReleases frames t₀ tFinal) :
+    ∀ (tag : Nat) (fr : SavedCallFrame FrameCtx Addr),
+      fr ∈ frames →
+      Anneal.RefFrame.natListMem tag fr.callerTags = true →
+      Anneal.RefFrame.natListMem tag t₀.protectedTags = true := by
+  induction frames generalizing t₀ with
+  | nil =>
+    intro _ _ hMem _
+    cases hMem
+  | cons saved rest ih =>
+    let ⟨_, tMid, hRel, hRest⟩ := hChain
+    intro tag fr hMem hInFr
+    cases hMem with
+    | head =>
+      exact exitFrameWithProtectors_released_all_protected hRel tag hInFr
+    | tail _ hInRest =>
+      have hMid : Anneal.RefFrame.natListMem tag tMid.protectedTags = true :=
+        ih hRest tag fr hInRest hInFr
+      have hStepTags := exitFrameWithProtectors_released_tags hRel
+      cases hInS : Anneal.RefFrame.natListMem tag saved.callerTags with
+      | true =>
+        rw [hStepTags.1 tag hInS] at hMid
+        cases hMid
+      | false =>
+        rw [hStepTags.2 tag hInS] at hMid
+        exact hMid
+
+/-- Fail-closed multi-frame protector uniqueness: if the head frame `saved`
+and any outer frame `fr ∈ rest` claim the same protector tag `tag`,
+`ContinueChainReleases (saved :: rest) t₀ tFinal` is strictly impossible. -/
+theorem not_continueChainReleases_of_shared_tag {FrameCtx : Type z}
+    {Addr : Type v}
+    {saved fr : SavedCallFrame FrameCtx Addr}
+    {rest : List (SavedCallFrame FrameCtx Addr)}
+    {t₀ tFinal : Anneal.RefFrame.RangedBorrowTree} {tag : Nat}
+    (hInRest : fr ∈ rest)
+    (hInSaved : Anneal.RefFrame.natListMem tag saved.callerTags = true)
+    (hInFr : Anneal.RefFrame.natListMem tag fr.callerTags = true) :
+    ¬ ContinueChainReleases (saved :: rest) t₀ tFinal := by
+  intro ⟨_, tMid, hRel, hRest⟩
+  have hAbsent : Anneal.RefFrame.natListMem tag tMid.protectedTags = false :=
+    (exitFrameWithProtectors_released_tags hRel).1 tag hInSaved
+  have hPresent : Anneal.RefFrame.natListMem tag tMid.protectedTags = true :=
+    continueChainReleases_needs_all_tags hRest tag fr hInRest hInFr
+  rw [hAbsent] at hPresent
+  cases hPresent
 
 /-- Terminal result of propagating a panic unwind through saved caller frames
 (`evalUnwindStack`). -/
@@ -3167,6 +3263,26 @@ theorem CallSpecCut.of_validBlockTree {BB : Type b}
   CallSpecCut.congr_step
     (fun s => hPointwise _ _ s (fun i =>
       (bt.lookupForced?_eq i).trans (hValid.2 i))) hCut
+
+/-- `0 Quot.sound` pointwise `Chunk8BlockTree` transport for deterministic
+`CallSpecCut` (matching `ByteRunCopyCut.of_validChunk8BlockTree` and
+`ovfCastStageCut_of_validChunk8BlockTree`). -/
+theorem CallSpecCut.of_validChunk8BlockTree {BB : Type b}
+    [ops : ByteStoreOps Mem Addr Byte]
+    {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → StepOutcome State Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {tag : State → Option Nat}
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    (hCut : CallSpecCut
+      (wops := MirWpOps.ofDetStep (stepWith bt.lookup?) tag) adapter spec) :
+    CallSpecCut
+      (wops := MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag) adapter spec :=
+  CallSpecCut.congr_step
+    (fun s => hPointwise _ _ s (fun i => hValid.2 i)) hCut
 
 /-- Lifts a `CallSpecCut` directly into a fuel-free `ParametricCore.StageCut`
 over `[wops : MirWpOps State Out Fault]`. -/

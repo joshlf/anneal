@@ -1820,6 +1820,579 @@ theorem addWithOverflowS_biased_overflow_of_out_of_range (w : ScalarWidth)
     | inl hBelow => exact absurd hBiLo (Nat.not_le_of_gt hBelow)
     | inr hAbove => exact absurd hBiHi (Nat.not_lt_of_ge hAbove)
 
+/-- Tightened signed join interval for checked subtraction in biased
+coordinates: if the accumulator bit pattern is `toBiased w accB` with
+`accB ∈ [lo, hi]` and `subWithOverflowS w (toBiased w accB) c = (r, false)`,
+then `toBiased w r + toBiased w c = accB + w.halfModulus`, placing `toBiased w r`
+in the tightened signed join interval without truncated subtraction. -/
+theorem subWithOverflowS_biased_false_interval (w : ScalarWidth)
+    {lo hi accB c r : Nat} (hAcc : accB < w.modulus)
+    (hLo : lo ≤ accB) (hHi : accB ≤ hi)
+    (h : subWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + toBiased w c = accB + w.halfModulus ∧
+    lo + w.halfModulus ≤ toBiased w r + toBiased w c ∧
+    toBiased w r + toBiased w c ≤ hi + w.halfModulus ∧
+    r < w.modulus := by
+  have hNo : (subWithOverflowS w (toBiased w accB) c).2 = false :=
+    congrArg Prod.snd h
+  have hR : (subWithOverflowS w (toBiased w accB) c).1 = r := congrArg Prod.fst h
+  have hInv : toBiased w (toBiased w accB) = accB := by
+    rw [toBiased_involutive, Nat.mod_eq_of_lt hAcc]
+  let ⟨_, _, hBiLo, _⟩ := (subWithOverflowS_no_overflow_iff w _ c).mp hNo
+  rw [hInv] at hBiLo
+  have hEq := toBiased_subWithOverflowS_of_no_overflow w hNo
+  rw [hR, hInv] at hEq
+  have hSum : toBiased w r + toBiased w c = accB + w.halfModulus := by
+    rw [hEq, Nat.sub_add_cancel hBiLo]
+  have hRlt : r < w.modulus := by
+    rw [← hR]
+    unfold subWithOverflowS
+    exact Nat.mod_lt _ w.modulus_pos
+  refine ⟨hSum, ?_, ?_, hRlt⟩
+  · rw [hSum]; exact Nat.add_le_add_right hLo _
+  · rw [hSum]; exact Nat.add_le_add_right hHi _
+
+/-- Fail-closed signed subtraction overflow certificate in biased coordinates. -/
+theorem subWithOverflowS_biased_overflow_of_out_of_range (w : ScalarWidth)
+    {accB c : Nat} (hAcc : accB < w.modulus)
+    (hOut : accB + w.halfModulus < toBiased w c ∨
+      toBiased w c + w.modulus ≤ accB + w.halfModulus) :
+    (subWithOverflowS w (toBiased w accB) c).2 = true := by
+  have hInv : toBiased w (toBiased w accB) = accB := by
+    rw [toBiased_involutive, Nat.mod_eq_of_lt hAcc]
+  cases hF : (subWithOverflowS w (toBiased w accB) c).2 with
+  | true => rfl
+  | false =>
+    let ⟨_, _, hBiLo, hBiHi⟩ := (subWithOverflowS_no_overflow_iff w _ c).mp hF
+    rw [hInv] at hBiLo hBiHi
+    cases hOut with
+    | inl hBelow => exact absurd hBiLo (Nat.not_le_of_gt hBelow)
+    | inr hAbove => exact absurd hBiHi (Nat.not_lt_of_ge hAbove)
+
+/-- Exact biased-coordinate identity for non-overflowing signed multiplication
+by a non-negative multiplier `c < w.halfModulus` (valid on BOTH sides of zero):
+`toBiased w r + w.halfModulus * c = accB * c + w.halfModulus`. -/
+theorem toBiased_mulWithOverflowS_nonneg_mul (w : ScalarWidth)
+    {accB c r : Nat} (hAcc : accB < w.modulus) (hc : c < w.halfModulus)
+    (h : mulWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + w.halfModulus * c = accB * c + w.halfModulus ∧
+    r < w.modulus := by
+  have hNo : (mulWithOverflowS w (toBiased w accB) c).2 = false := congrArg Prod.snd h
+  have hR : (mulWithOverflowS w (toBiased w accB) c).1 = r := congrArg Prod.fst h
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have hcM : c < w.modulus := Nat.lt_trans hc w.halfModulus_lt_modulus
+  have haM : toBiased w accB < w.modulus := toBiased_lt_modulus w accB
+  have hRlt : r < w.modulus := by
+    rw [← hR]; unfold mulWithOverflowS; exact Nat.mod_lt _ w.modulus_pos
+  have hRDef : r = (toBiased w accB * c) % w.modulus := by
+    rw [← hR]; unfold mulWithOverflowS; dsimp only
+    rw [Nat.mod_eq_of_lt haM, Nat.mod_eq_of_lt hcM]
+  let ⟨_, _, hMag⟩ := (mulWithOverflowS_no_overflow_iff w (toBiased w accB) c).mp hNo
+  have hSb : Nat.ble w.halfModulus c = false := nat_ble_false_iff_lt.mpr hc
+  refine ⟨?_, hRlt⟩
+  cases Nat.lt_or_ge accB w.halfModulus with
+  | inl hNegB =>
+    have hA : toBiased w accB = accB + w.halfModulus := toBiased_nonneg w hNegB
+    have hHLeA : w.halfModulus ≤ toBiased w accB := by
+      rw [hA]; exact Nat.le_add_left w.halfModulus accB
+    have hSa : Nat.ble w.halfModulus (toBiased w accB) = true :=
+      Nat.ble_eq_true_of_le hHLeA
+    rw [hSa, hSb] at hMag
+    change (w.modulus - toBiased w accB) * c ≤ w.halfModulus at hMag
+    have hMagA : w.modulus - toBiased w accB = w.halfModulus - accB := by
+      rw [hA, hModEq]
+      have h1 : (w.halfModulus - accB) + (accB + w.halfModulus) =
+          w.halfModulus + w.halfModulus := by
+        rw [← Nat.add_assoc, Nat.sub_add_cancel (Nat.le_of_lt hNegB)]
+      have h2 := congrArg (fun k => k - (accB + w.halfModulus)) h1
+      rw [Nat.add_sub_cancel] at h2
+      exact h2.symm
+    rw [hMagA] at hMag
+    let p := (w.halfModulus - accB) * c
+    have hPAdd : p + accB * c = w.halfModulus * c := by
+      change (w.halfModulus - accB) * c + accB * c = w.halfModulus * c
+      rw [← Nat.add_mul, Nat.sub_add_cancel (Nat.le_of_lt hNegB)]
+    have hMulAdd : toBiased w accB * c + p = w.modulus * c := by
+      change toBiased w accB * c + (w.halfModulus - accB) * c = w.modulus * c
+      rw [← Nat.add_mul, hA, Nat.add_comm accB w.halfModulus, Nat.add_assoc,
+        Nat.add_sub_of_le (Nat.le_of_lt hNegB), ← hModEq]
+    cases Nat.eq_zero_or_pos p with
+    | inl hP0 =>
+      rw [hP0, Nat.add_zero] at hMulAdd
+      have hR0 : r = 0 := by
+        rw [hRDef, hMulAdd, Nat.mul_mod_right]
+      rw [hR0, toBiased_nonneg w (by cases w <;> exact Nat.zero_lt_succ _),
+        Nat.zero_add, ← hPAdd, hP0, Nat.zero_add, Nat.add_comm]
+    | inr hPPos =>
+      have hcPos : 0 < c := by
+        cases c with
+        | zero =>
+          change 0 < (w.halfModulus - accB) * 0 at hPPos
+          rw [Nat.mul_zero] at hPPos
+          exact False.elim (Nat.lt_irrefl 0 hPPos)
+        | succ _ => exact Nat.zero_lt_succ _
+      have hPLeM : p ≤ w.modulus :=
+        Nat.le_trans hMag (Nat.le_of_lt w.halfModulus_lt_modulus)
+      have hSubLtM : w.modulus - p < w.modulus := by
+        have h1 : (w.modulus - p) + p = w.modulus := Nat.sub_add_cancel hPLeM
+        have h2 : (w.modulus - p) + 0 < (w.modulus - p) + p :=
+          Nat.add_lt_add_left hPPos (w.modulus - p)
+        rw [Nat.add_zero, h1] at h2
+        exact h2
+      have hHLeSub : w.halfModulus ≤ w.modulus - p := by
+        have h1 : w.halfModulus + p ≤ w.halfModulus + w.halfModulus :=
+          Nat.add_le_add_left hMag w.halfModulus
+        rw [← hModEq] at h1
+        exact Nat.le_sub_of_add_le h1
+      have hMulSplit :
+          toBiased w accB * c = (w.modulus - p) + w.modulus * (c - 1) := by
+        have h1 : ((w.modulus - p) + w.modulus * (c - 1)) + p = w.modulus * c := by
+          rw [Nat.add_assoc, Nat.add_comm (w.modulus * (c - 1)) p,
+            ← Nat.add_assoc, Nat.sub_add_cancel hPLeM,
+            Nat.add_comm w.modulus (w.modulus * (c - 1)),
+            ← Nat.mul_succ, Nat.succ_eq_add_one, Nat.sub_add_cancel hcPos]
+        exact Nat.add_right_cancel (hMulAdd.trans h1.symm)
+      have hREq : r = w.modulus - p := by
+        rw [hRDef, hMulSplit, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hSubLtM]
+      have hBiR : toBiased w r = w.halfModulus - p := by
+        rw [hREq, toBiased_neg w hHLeSub hSubLtM, hModEq]
+        have h1 : (w.halfModulus - p) + w.halfModulus =
+            (w.halfModulus + w.halfModulus) - p :=
+          sub_add_comm_nat hMag
+        have h2 := congrArg (fun k => k - w.halfModulus) h1
+        rw [Nat.add_sub_cancel] at h2
+        exact h2.symm
+      rw [hBiR, ← hPAdd, ← Nat.add_assoc, Nat.sub_add_cancel hMag, Nat.add_comm]
+  | inr hNonnegB =>
+    have hA : toBiased w accB = accB - w.halfModulus := toBiased_neg w hNonnegB hAcc
+    have hALtH : toBiased w accB < w.halfModulus := by
+      have h1 : w.halfModulus + (accB - w.halfModulus) <
+          w.halfModulus + w.halfModulus := by
+        rw [Nat.add_sub_of_le hNonnegB, ← hModEq]
+        exact hAcc
+      rw [hA]
+      cases Nat.lt_or_ge (accB - w.halfModulus) w.halfModulus with
+      | inl hLt => exact hLt
+      | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hGe _))
+    have hSa : Nat.ble w.halfModulus (toBiased w accB) = false :=
+      nat_ble_false_iff_lt.mpr hALtH
+    rw [hSa, hSb] at hMag
+    change toBiased w accB * c < w.halfModulus at hMag
+    have hProdLtM : toBiased w accB * c < w.modulus :=
+      Nat.lt_trans hMag w.halfModulus_lt_modulus
+    have hREq : r = toBiased w accB * c := by
+      rw [hRDef, Nat.mod_eq_of_lt hProdLtM]
+    rw [hREq, toBiased_nonneg w hMag, hA,
+      Nat.add_assoc ((accB - w.halfModulus) * c) w.halfModulus (w.halfModulus * c),
+      Nat.add_comm w.halfModulus (w.halfModulus * c),
+      ← Nat.add_assoc ((accB - w.halfModulus) * c) (w.halfModulus * c) w.halfModulus,
+      ← Nat.add_mul, Nat.sub_add_cancel hNonnegB]
+
+/-- Tightened signed join interval for checked multiplication by a non-negative
+multiplier `c < w.halfModulus` in biased coordinates (works across zero). -/
+theorem mulWithOverflowS_biased_false_interval_nonneg (w : ScalarWidth)
+    {lo hi accB c r : Nat} (hAcc : accB < w.modulus) (hc : c < w.halfModulus)
+    (hLo : lo ≤ accB) (hHi : accB ≤ hi)
+    (h : mulWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + w.halfModulus * c = accB * c + w.halfModulus ∧
+    lo * c + w.halfModulus ≤ toBiased w r + w.halfModulus * c ∧
+    toBiased w r + w.halfModulus * c ≤ hi * c + w.halfModulus ∧
+    r < w.modulus := by
+  let ⟨hEq, hRlt⟩ := toBiased_mulWithOverflowS_nonneg_mul w hAcc hc h
+  refine ⟨hEq, ?_, ?_, hRlt⟩
+  · rw [hEq]; exact Nat.add_le_add_right (Nat.mul_le_mul_right c hLo) _
+  · rw [hEq]; exact Nat.add_le_add_right (Nat.mul_le_mul_right c hHi) _
+
+/-- Fail-closed signed multiplication overflow certificate for non-negative
+multiplier `c < w.halfModulus` in biased coordinates. -/
+theorem mulWithOverflowS_biased_overflow_of_out_of_range_nonneg (w : ScalarWidth)
+    {accB c : Nat} (hAcc : accB < w.modulus) (hc : c < w.halfModulus)
+    (hOut : accB * c + w.halfModulus < w.halfModulus * c ∨
+      w.modulus + w.halfModulus * c ≤ accB * c + w.halfModulus) :
+    (mulWithOverflowS w (toBiased w accB) c).2 = true := by
+  cases hF : (mulWithOverflowS w (toBiased w accB) c).2 with
+  | true => rfl
+  | false =>
+    have hPair :
+        mulWithOverflowS w (toBiased w accB) c =
+          ((mulWithOverflowS w (toBiased w accB) c).1, false) := by
+      cases hP : mulWithOverflowS w (toBiased w accB) c with
+      | mk fst snd =>
+        rw [hP] at hF
+        dsimp only at hF
+        rw [hF]
+    let ⟨hEq, _⟩ := toBiased_mulWithOverflowS_nonneg_mul w hAcc hc hPair
+    cases hOut with
+    | inl hBelow =>
+      rw [← hEq] at hBelow
+      exact absurd hBelow (Nat.not_lt_of_ge (Nat.le_add_left _ _))
+    | inr hAbove =>
+      rw [← hEq] at hAbove
+      have hLt :
+          toBiased w (mulWithOverflowS w (toBiased w accB) c).1 + w.halfModulus * c <
+            w.modulus + w.halfModulus * c :=
+        Nat.add_lt_add_right (toBiased_lt_modulus w _) _
+      exact absurd hLt (Nat.not_lt_of_ge hAbove)
+
+/-- Exact biased-coordinate identity for non-overflowing signed multiplication
+by a negative multiplier `c` (`w.halfModulus ≤ c < w.modulus`, magnitude
+`k = w.modulus - c`), valid on BOTH sides of zero:
+`toBiased w r + accB * (w.modulus - c) = w.halfModulus * (w.modulus - c) + w.halfModulus`. -/
+theorem toBiased_mulWithOverflowS_neg_mul (w : ScalarWidth)
+    {accB c r : Nat} (hAcc : accB < w.modulus)
+    (hCNeg : w.halfModulus ≤ c) (hcM : c < w.modulus)
+    (h : mulWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + accB * (w.modulus - c) =
+      w.halfModulus * (w.modulus - c) + w.halfModulus ∧
+    r < w.modulus := by
+  have hNo : (mulWithOverflowS w (toBiased w accB) c).2 = false := congrArg Prod.snd h
+  have hR : (mulWithOverflowS w (toBiased w accB) c).1 = r := congrArg Prod.fst h
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have haM : toBiased w accB < w.modulus := toBiased_lt_modulus w accB
+  have hRlt : r < w.modulus := by
+    rw [← hR]; unfold mulWithOverflowS; exact Nat.mod_lt _ w.modulus_pos
+  have hRDef : r = (toBiased w accB * c) % w.modulus := by
+    rw [← hR]; unfold mulWithOverflowS; dsimp only
+    rw [Nat.mod_eq_of_lt haM, Nat.mod_eq_of_lt hcM]
+  let ⟨_, _, hMag⟩ := (mulWithOverflowS_no_overflow_iff w (toBiased w accB) c).mp hNo
+  have hSb : Nat.ble w.halfModulus c = true := Nat.ble_eq_true_of_le hCNeg
+  let k := w.modulus - c
+  have hCK : c + k = w.modulus := Nat.add_sub_of_le (Nat.le_of_lt hcM)
+  refine ⟨?_, hRlt⟩
+  cases Nat.lt_or_ge accB w.halfModulus with
+  | inl hNegB =>
+    have hA : toBiased w accB = accB + w.halfModulus := toBiased_nonneg w hNegB
+    have hHLeA : w.halfModulus ≤ toBiased w accB := by
+      rw [hA]; exact Nat.le_add_left w.halfModulus accB
+    have hSa : Nat.ble w.halfModulus (toBiased w accB) = true :=
+      Nat.ble_eq_true_of_le hHLeA
+    rw [hSa, hSb] at hMag
+    change (w.modulus - toBiased w accB) * k < w.halfModulus at hMag
+    have hMagA : w.modulus - toBiased w accB = w.halfModulus - accB := by
+      rw [hA, hModEq]
+      have h1 : (w.halfModulus - accB) + (accB + w.halfModulus) =
+          w.halfModulus + w.halfModulus := by
+        rw [← Nat.add_assoc, Nat.sub_add_cancel (Nat.le_of_lt hNegB)]
+      have h2 := congrArg (fun j => j - (accB + w.halfModulus)) h1
+      rw [Nat.add_sub_cancel] at h2
+      exact h2.symm
+    rw [hMagA] at hMag
+    let p := (w.halfModulus - accB) * k
+    have hMLeAC : w.modulus ≤ toBiased w accB + c := by
+      rw [hModEq]; exact Nat.add_le_add hHLeA hCNeg
+    have hACDecomp :
+        toBiased w accB * c = p + w.modulus * (toBiased w accB + c - w.modulus) := by
+      have hLeft : toBiased w accB * c + (w.modulus - toBiased w accB) * c =
+          w.modulus * c := by
+        rw [← Nat.add_mul, Nat.add_sub_of_le (Nat.le_of_lt haM)]
+      have hRight :
+          (p + w.modulus * (toBiased w accB + c - w.modulus)) +
+              (w.modulus - toBiased w accB) * c =
+            w.modulus * c := by
+        have hPK : p + (w.modulus - toBiased w accB) * c =
+            w.modulus * (w.modulus - toBiased w accB) := by
+          change (w.halfModulus - accB) * k + (w.modulus - toBiased w accB) * c = _
+          rw [← hMagA, Nat.add_comm, ← Nat.mul_add, hCK, Nat.mul_comm]
+        rw [Nat.add_assoc p _ _, Nat.add_comm (w.modulus * _) _, ← Nat.add_assoc p _ _,
+          hPK, ← Nat.mul_add]
+        have hSum :
+            (w.modulus - toBiased w accB) + (toBiased w accB + c - w.modulus) = c := by
+          have h1 :
+              ((w.modulus - toBiased w accB) + (toBiased w accB + c - w.modulus)) +
+                  w.modulus =
+                c + w.modulus := by
+            rw [Nat.add_assoc, Nat.sub_add_cancel hMLeAC,
+              ← Nat.add_assoc, Nat.sub_add_cancel (Nat.le_of_lt haM),
+              Nat.add_comm]
+          exact Nat.add_right_cancel h1
+        rw [hSum]
+      exact Nat.add_right_cancel (hLeft.trans hRight.symm)
+    have hPLtM : p < w.modulus := Nat.lt_trans hMag w.halfModulus_lt_modulus
+    have hREq : r = p := by
+      rw [hRDef, hACDecomp, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hPLtM]
+    rw [hREq, toBiased_nonneg w hMag,
+      Nat.add_assoc p w.halfModulus (accB * k),
+      Nat.add_comm w.halfModulus (accB * k),
+      ← Nat.add_assoc p (accB * k) w.halfModulus]
+    change (w.halfModulus - accB) * k + accB * k + w.halfModulus = _
+    rw [← Nat.add_mul, Nat.sub_add_cancel (Nat.le_of_lt hNegB)]
+  | inr hNonnegB =>
+    have hA : toBiased w accB = accB - w.halfModulus := toBiased_neg w hNonnegB hAcc
+    have hALtH : toBiased w accB < w.halfModulus := by
+      have h1 : w.halfModulus + (accB - w.halfModulus) <
+          w.halfModulus + w.halfModulus := by
+        rw [Nat.add_sub_of_le hNonnegB, ← hModEq]
+        exact hAcc
+      rw [hA]
+      cases Nat.lt_or_ge (accB - w.halfModulus) w.halfModulus with
+      | inl hLt => exact hLt
+      | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hGe _))
+    have hSa : Nat.ble w.halfModulus (toBiased w accB) = false :=
+      nat_ble_false_iff_lt.mpr hALtH
+    rw [hSa, hSb] at hMag
+    change toBiased w accB * k ≤ w.halfModulus at hMag
+    let p := toBiased w accB * k
+    have hMulAdd : toBiased w accB * c + p = toBiased w accB * w.modulus := by
+      change toBiased w accB * c + toBiased w accB * k = toBiased w accB * w.modulus
+      rw [← Nat.mul_add, hCK]
+    have hAccK : accB * k = p + w.halfModulus * k := by
+      change accB * k = toBiased w accB * k + w.halfModulus * k
+      rw [hA, ← Nat.add_mul, Nat.sub_add_cancel hNonnegB]
+    cases Nat.eq_zero_or_pos p with
+    | inl hP0 =>
+      rw [hP0, Nat.add_zero] at hMulAdd
+      have hR0 : r = 0 := by
+        rw [hRDef, hMulAdd, Nat.mul_mod_left]
+      rw [hR0, toBiased_nonneg w (by cases w <;> exact Nat.zero_lt_succ _),
+        Nat.zero_add, hAccK, hP0, Nat.zero_add, Nat.add_comm]
+    | inr hPPos =>
+      have haPos : 0 < toBiased w accB := by
+        cases hZ : toBiased w accB with
+        | zero =>
+          change 0 < toBiased w accB * k at hPPos
+          rw [hZ, Nat.zero_mul] at hPPos
+          exact False.elim (Nat.lt_irrefl 0 hPPos)
+        | succ _ => exact Nat.zero_lt_succ _
+      have hPLeM : p ≤ w.modulus :=
+        Nat.le_trans hMag (Nat.le_of_lt w.halfModulus_lt_modulus)
+      have hSubLtM : w.modulus - p < w.modulus := by
+        have h1 : (w.modulus - p) + p = w.modulus := Nat.sub_add_cancel hPLeM
+        have h2 : (w.modulus - p) + 0 < (w.modulus - p) + p :=
+          Nat.add_lt_add_left hPPos (w.modulus - p)
+        rw [Nat.add_zero, h1] at h2
+        exact h2
+      have hHLeSub : w.halfModulus ≤ w.modulus - p := by
+        have h1 : w.halfModulus + p ≤ w.halfModulus + w.halfModulus :=
+          Nat.add_le_add_left hMag w.halfModulus
+        rw [← hModEq] at h1
+        exact Nat.le_sub_of_add_le h1
+      have hMulSplit :
+          toBiased w accB * c = (w.modulus - p) + w.modulus * (toBiased w accB - 1) := by
+        have h1 : ((w.modulus - p) + w.modulus * (toBiased w accB - 1)) + p =
+            toBiased w accB * w.modulus := by
+          rw [Nat.add_assoc, Nat.add_comm (w.modulus * _) p,
+            ← Nat.add_assoc, Nat.sub_add_cancel hPLeM,
+            Nat.add_comm w.modulus (w.modulus * (toBiased w accB - 1)),
+            ← Nat.mul_succ, Nat.succ_eq_add_one, Nat.sub_add_cancel haPos,
+            Nat.mul_comm]
+        exact Nat.add_right_cancel (hMulAdd.trans h1.symm)
+      have hREq : r = w.modulus - p := by
+        rw [hRDef, hMulSplit, Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hSubLtM]
+      have hBiR : toBiased w r = w.halfModulus - p := by
+        rw [hREq, toBiased_neg w hHLeSub hSubLtM, hModEq]
+        have h1 : (w.halfModulus - p) + w.halfModulus =
+            (w.halfModulus + w.halfModulus) - p :=
+          sub_add_comm_nat hMag
+        have h2 := congrArg (fun j => j - w.halfModulus) h1
+        rw [Nat.add_sub_cancel] at h2
+        exact h2.symm
+      rw [hBiR, hAccK, ← Nat.add_assoc, Nat.sub_add_cancel hMag, Nat.add_comm]
+
+/-- Tightened reversed signed join interval for checked multiplication by a
+negative multiplier `c` (`w.halfModulus ≤ c < w.modulus`, `k = w.modulus - c`)
+in biased coordinates (works across zero). -/
+theorem mulWithOverflowS_biased_false_interval_neg (w : ScalarWidth)
+    {lo hi accB c r : Nat} (hAcc : accB < w.modulus)
+    (hCNeg : w.halfModulus ≤ c) (hcM : c < w.modulus)
+    (hLo : lo ≤ accB) (hHi : accB ≤ hi)
+    (h : mulWithOverflowS w (toBiased w accB) c = (r, false)) :
+    toBiased w r + accB * (w.modulus - c) =
+      w.halfModulus * (w.modulus - c) + w.halfModulus ∧
+    toBiased w r + lo * (w.modulus - c) ≤
+      w.halfModulus * (w.modulus - c) + w.halfModulus ∧
+    w.halfModulus * (w.modulus - c) + w.halfModulus ≤
+      toBiased w r + hi * (w.modulus - c) ∧
+    r < w.modulus := by
+  let ⟨hEq, hRlt⟩ := toBiased_mulWithOverflowS_neg_mul w hAcc hCNeg hcM h
+  refine ⟨hEq, ?_, ?_, hRlt⟩
+  · rw [← hEq]; exact Nat.add_le_add_left (Nat.mul_le_mul_right _ hLo) _
+  · rw [← hEq]; exact Nat.add_le_add_left (Nat.mul_le_mul_right _ hHi) _
+
+/-- Cross-zero signed widening in biased coordinates: for ANY `accB <
+srcW.modulus` (negative, zero, OR positive!) and `srcW.bits ≤ dstW.bits`,
+sign-extending `toBiased srcW accB` to `dstW` shifts its biased coordinate by
+the exact constant `dstW.halfModulus - srcW.halfModulus`. -/
+theorem toBiased_intToIntCast_widen_signed (srcW dstW : ScalarWidth)
+    {accB : Nat} (hLe : srcW.bits ≤ dstW.bits) (hAcc : accB < srcW.modulus) :
+    toBiased dstW (intToIntCast srcW true dstW (toBiased srcW accB)) =
+      accB + (dstW.halfModulus - srcW.halfModulus) := by
+  have hSMod : srcW.modulus = srcW.halfModulus + srcW.halfModulus := by
+    rw [srcW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDMod : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hHLe : srcW.halfModulus ≤ dstW.halfModulus := by
+    unfold ScalarWidth.halfModulus
+    exact pow2_le_pow2 (Nat.sub_le_sub_right hLe 1)
+  cases Nat.lt_or_eq_of_le hLe with
+  | inr hBitsEq =>
+    have hModEq : srcW.modulus = dstW.modulus := by
+      unfold ScalarWidth.modulus; rw [hBitsEq]
+    have hHalfEq : srcW.halfModulus = dstW.halfModulus := by
+      unfold ScalarWidth.halfModulus; rw [hBitsEq]
+    have hCast : intToIntCast srcW true dstW (toBiased srcW accB) =
+        toBiased srcW accB := by
+      rw [intToIntCast_narrow_exact srcW true dstW (Nat.le_of_eq hBitsEq.symm)]
+      rw [← hModEq]
+      exact toBiased_lt_modulus srcW accB
+    rw [hCast, hHalfEq, Nat.sub_self, Nat.add_zero]
+    unfold toBiased
+    rw [← hModEq, ← hHalfEq]
+    have hInv := toBiased_involutive srcW accB
+    unfold toBiased at hInv
+    rw [hInv, Nat.mod_eq_of_lt hAcc]
+  | inl hLt =>
+    have hModLe : srcW.modulus ≤ dstW.modulus := pow2_le_pow2 hLe
+    cases Nat.lt_or_ge accB srcW.halfModulus with
+    | inl hNegB =>
+      have hX : toBiased srcW accB = accB + srcW.halfModulus :=
+        toBiased_nonneg srcW hNegB
+      have hXNeg : srcW.halfModulus ≤ toBiased srcW accB := by
+        rw [hX]; exact Nat.le_add_left _ _
+      have hXLt : toBiased srcW accB < srcW.modulus := toBiased_lt_modulus srcW accB
+      have hY := (intToIntCast_widen_signed_neg srcW dstW hLt hXNeg hXLt).1
+      have hYNeg := intToIntCast_widen_signed_neg_sign srcW dstW hLt hXNeg hXLt
+      have hYLt := intToIntCast_lt_modulus srcW true dstW (toBiased srcW accB)
+      rw [toBiased_neg dstW hYNeg hYLt, hY, hX]
+      have h1 :
+          (accB + (dstW.halfModulus - srcW.halfModulus)) + dstW.halfModulus + srcW.modulus =
+            ((dstW.modulus - srcW.modulus) + (accB + srcW.halfModulus)) + srcW.modulus := by
+        rw [Nat.add_assoc (dstW.modulus - srcW.modulus) _ _,
+          Nat.add_comm (accB + srcW.halfModulus) srcW.modulus,
+          ← Nat.add_assoc (dstW.modulus - srcW.modulus) srcW.modulus _,
+          Nat.sub_add_cancel hModLe, hDMod, hSMod]
+        rw [Nat.add_assoc accB (dstW.halfModulus - srcW.halfModulus) dstW.halfModulus,
+          Nat.add_assoc accB _ (srcW.halfModulus + srcW.halfModulus),
+          Nat.add_assoc (dstW.halfModulus - srcW.halfModulus) dstW.halfModulus _,
+          ← Nat.add_assoc dstW.halfModulus srcW.halfModulus srcW.halfModulus,
+          Nat.add_comm dstW.halfModulus srcW.halfModulus,
+          Nat.add_assoc srcW.halfModulus dstW.halfModulus srcW.halfModulus,
+          ← Nat.add_assoc (dstW.halfModulus - srcW.halfModulus) srcW.halfModulus _,
+          Nat.sub_add_cancel hHLe]
+        rw [← Nat.add_assoc dstW.halfModulus dstW.halfModulus srcW.halfModulus,
+          Nat.add_comm accB (dstW.halfModulus + dstW.halfModulus + srcW.halfModulus),
+          Nat.add_assoc (dstW.halfModulus + dstW.halfModulus) srcW.halfModulus accB,
+          Nat.add_comm srcW.halfModulus accB]
+      have h2 := Nat.add_right_cancel h1
+      have h3 := congrArg (fun j => j - dstW.halfModulus) h2
+      rw [Nat.add_sub_cancel] at h3
+      exact h3.symm
+    | inr hNonnegB =>
+      have hX : toBiased srcW accB = accB - srcW.halfModulus :=
+        toBiased_neg srcW hNonnegB hAcc
+      have hXLtH : toBiased srcW accB < srcW.halfModulus := by
+        have h1 : srcW.halfModulus + (accB - srcW.halfModulus) <
+            srcW.halfModulus + srcW.halfModulus := by
+          rw [Nat.add_sub_of_le hNonnegB, ← hSMod]; exact hAcc
+        rw [hX]
+        cases Nat.lt_or_ge (accB - srcW.halfModulus) srcW.halfModulus with
+        | inl hL => exact hL
+        | inr hG => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hG _))
+      have hY := intToIntCast_widen_signed_nonneg srcW dstW hLt hXLtH
+      have hYLtDH : toBiased srcW accB < dstW.halfModulus :=
+        Nat.lt_of_lt_of_le hXLtH hHLe
+      rw [hY, toBiased_nonneg dstW hYLtDH, hX]
+      have h1 : (accB - srcW.halfModulus) + dstW.halfModulus + srcW.halfModulus =
+          (accB + (dstW.halfModulus - srcW.halfModulus)) + srcW.halfModulus := by
+        rw [Nat.add_assoc (accB - srcW.halfModulus) dstW.halfModulus srcW.halfModulus,
+          Nat.add_comm dstW.halfModulus srcW.halfModulus,
+          ← Nat.add_assoc (accB - srcW.halfModulus) srcW.halfModulus dstW.halfModulus,
+          Nat.sub_add_cancel hNonnegB,
+          Nat.add_assoc accB (dstW.halfModulus - srcW.halfModulus) srcW.halfModulus,
+          Nat.sub_add_cancel hHLe]
+      exact Nat.add_right_cancel h1
+
+/-- Cross-zero signed narrowing in biased coordinates: when `dstW.bits ≤
+srcW.bits` and `accB` lies inside the exact representable signed range of `dstW`
+(`srcW.halfModulus - dstW.halfModulus ≤ accB < srcW.halfModulus +
+dstW.halfModulus`), narrowing shifts the biased coordinate by
+`-(srcW.halfModulus - dstW.halfModulus)` on BOTH sides of zero. -/
+theorem toBiased_intToIntCast_narrow_signed (srcW : ScalarWidth)
+    (srcSigned : Bool) (dstW : ScalarWidth) {accB : Nat}
+    (hLe : dstW.bits ≤ srcW.bits)
+    (hLo : srcW.halfModulus - dstW.halfModulus ≤ accB)
+    (hHi : accB < srcW.halfModulus + dstW.halfModulus) :
+    toBiased dstW (intToIntCast srcW srcSigned dstW (toBiased srcW accB)) =
+      accB - (srcW.halfModulus - dstW.halfModulus) := by
+  have hSMod : srcW.modulus = srcW.halfModulus + srcW.halfModulus := by
+    rw [srcW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDMod : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hHLe : dstW.halfModulus ≤ srcW.halfModulus := by
+    unfold ScalarWidth.halfModulus
+    exact pow2_le_pow2 (Nat.sub_le_sub_right hLe 1)
+  have hAccLt : accB < srcW.modulus := by
+    rw [hSMod]
+    exact Nat.lt_of_lt_of_le hHi (Nat.add_le_add_left hHLe _)
+  cases Nat.lt_or_ge accB srcW.halfModulus with
+  | inl hNegB =>
+    have hX : toBiased srcW accB = accB + srcW.halfModulus :=
+      toBiased_nonneg srcW hNegB
+    have hXLt : toBiased srcW accB < srcW.modulus := toBiased_lt_modulus srcW accB
+    have hXLo : srcW.modulus - dstW.halfModulus ≤ toBiased srcW accB := by
+      rw [hX, hSMod]
+      have h1 : (srcW.halfModulus + srcW.halfModulus) - dstW.halfModulus =
+          (srcW.halfModulus - dstW.halfModulus) + srcW.halfModulus :=
+        (sub_add_comm_nat hHLe).symm
+      rw [h1]
+      exact Nat.add_le_add_right hLo _
+    let ⟨hCastEq, hYNeg, _⟩ :=
+      intToIntCast_narrow_signed_neg srcW srcSigned dstW hLe hXLo hXLt
+    have hYLt := intToIntCast_lt_modulus srcW srcSigned dstW (toBiased srcW accB)
+    rw [toBiased_neg dstW hYNeg hYLt]
+    have hModLe : dstW.modulus ≤ srcW.modulus := pow2_le_pow2 hLe
+    have h1 :
+        (intToIntCast srcW srcSigned dstW (toBiased srcW accB) - dstW.halfModulus) +
+            (srcW.halfModulus - dstW.halfModulus) + srcW.modulus =
+          accB + srcW.modulus := by
+      have hYPlus :
+          (intToIntCast srcW srcSigned dstW (toBiased srcW accB) - dstW.halfModulus) +
+              (srcW.halfModulus - dstW.halfModulus) + dstW.modulus =
+            intToIntCast srcW srcSigned dstW (toBiased srcW accB) + srcW.halfModulus := by
+        rw [hDMod, Nat.add_assoc _ (srcW.halfModulus - dstW.halfModulus) _,
+          ← Nat.add_assoc (srcW.halfModulus - dstW.halfModulus) dstW.halfModulus dstW.halfModulus,
+          Nat.sub_add_cancel hHLe, Nat.add_comm srcW.halfModulus dstW.halfModulus,
+          ← Nat.add_assoc _ dstW.halfModulus srcW.halfModulus,
+          Nat.sub_add_cancel hYNeg]
+      have hStep :
+          (intToIntCast srcW srcSigned dstW (toBiased srcW accB) - dstW.halfModulus) +
+              (srcW.halfModulus - dstW.halfModulus) + srcW.modulus =
+            ((intToIntCast srcW srcSigned dstW (toBiased srcW accB) - dstW.halfModulus) +
+                (srcW.halfModulus - dstW.halfModulus) + dstW.modulus) +
+              (srcW.modulus - dstW.modulus) := by
+        conv => rhs; rw [Nat.add_assoc _ dstW.modulus (srcW.modulus - dstW.modulus), Nat.add_sub_of_le hModLe]
+      rw [hStep, hYPlus, Nat.add_assoc, Nat.add_comm srcW.halfModulus _,
+        ← Nat.add_assoc, Nat.add_comm (intToIntCast _ _ _ _) _, hCastEq, hX,
+        Nat.add_assoc, ← hSMod]
+    have h2 := Nat.add_right_cancel h1
+    have h3 := congrArg (fun j => j - (srcW.halfModulus - dstW.halfModulus)) h2
+    rw [Nat.add_sub_cancel] at h3
+    exact h3
+  | inr hNonnegB =>
+    have hX : toBiased srcW accB = accB - srcW.halfModulus :=
+      toBiased_neg srcW hNonnegB hAccLt
+    have hXLtDH : toBiased srcW accB < dstW.halfModulus := by
+      rw [hX]
+      have h1 : srcW.halfModulus + (accB - srcW.halfModulus) <
+          srcW.halfModulus + dstW.halfModulus := by
+        rw [Nat.add_sub_of_le hNonnegB]; exact hHi
+      cases Nat.lt_or_ge (accB - srcW.halfModulus) dstW.halfModulus with
+      | inl hL => exact hL
+      | inr hG => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hG _))
+    have hXLtDM : toBiased srcW accB < dstW.modulus :=
+      Nat.lt_trans hXLtDH dstW.halfModulus_lt_modulus
+    rw [intToIntCast_narrow_exact srcW srcSigned dstW hLe hXLtDM,
+      toBiased_nonneg dstW hXLtDH, hX]
+    have h1 :
+        ((accB - srcW.halfModulus) + dstW.halfModulus) +
+            (srcW.halfModulus - dstW.halfModulus) =
+          accB := by
+      rw [Nat.add_assoc, Nat.add_sub_of_le hHLe, Nat.sub_add_cancel hNonnegB]
+    have h2 := congrArg (fun j => j - (srcW.halfModulus - dstW.halfModulus)) h1
+    rw [Nat.add_sub_cancel] at h2
+    exact h2
+
 /-- Interval cutpoint specification at `blockIdx` for scalar width `width`:
 constrains the active accumulator to `lo ≤ acc ≤ hi < width.modulus`. -/
 structure StageIntervalSpec where
@@ -1936,6 +2509,47 @@ def StageIntervalStateInv {S : Type u} {Val : Type v}
   (∀ j : Nat,
     j ≠ ids.accId → j ≠ ids.tmpId → j ≠ ids.ovfMulId → j ≠ ids.ovfAddId →
     listGet? (fops.localsOf s) j = listGet? baseLocals j)
+
+/-- Exact cutpoint bridge between raw unsigned intervals and `signedView`
+biased intervals for non-negative ranges (`hi < w.halfModulus`): lets Episode 2
+switch seamlessly between raw `fops` and `fops.signedView` at any non-negative
+cutpoint without touching machine state. -/
+theorem stageIntervalStateInv_signedView_nonneg_iff {S : Type u} {Val : Type v}
+    (fops : OvfCastFrameOps S Val) (baseLocals : List Val)
+    (ids : StageLocalIds) (bb : Nat) (w : ScalarWidth) {lo hi : Nat}
+    (hHi : hi < w.halfModulus) (s : S) :
+    StageIntervalStateInv fops baseLocals ids ⟨bb, w, lo, hi⟩ s ↔
+      StageIntervalStateInv fops.signedView baseLocals ids
+        ⟨bb, w, lo + w.halfModulus, hi + w.halfModulus⟩ s := by
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have hHiBiLt : hi + w.halfModulus < w.modulus := by
+    rw [hModEq]; exact Nat.add_lt_add_right hHi w.halfModulus
+  constructor
+  · intro ⟨hBb, hLen, ⟨acc, hGet, hALo, hAHi, _⟩, hFrame⟩
+    refine ⟨hBb, hLen, ⟨acc + w.halfModulus, ?_, Nat.add_le_add_right hALo _,
+      Nat.add_le_add_right hAHi _, hHiBiLt⟩, hFrame⟩
+    have hAccH : acc < w.halfModulus := Nat.lt_of_le_of_lt hAHi hHi
+    have hAccBiLt : acc + w.halfModulus < w.modulus := by
+      rw [hModEq]; exact Nat.add_lt_add_right hAccH w.halfModulus
+    show listGet? (fops.localsOf s) ids.accId =
+      some (fops.mkScalar w (toBiased w (acc + w.halfModulus)))
+    rw [toBiased_neg w (Nat.le_add_left _ _) hAccBiLt, Nat.add_sub_cancel]
+    exact hGet
+  · intro ⟨hBb, hLen, ⟨accB, hGet, hALo, hAHi, _⟩, hFrame⟩
+    have hHLe : w.halfModulus ≤ accB :=
+      Nat.le_trans (Nat.le_add_left w.halfModulus lo) hALo
+    have hAccBLt : accB < w.modulus := Nat.lt_of_le_of_lt hAHi hHiBiLt
+    refine ⟨hBb, hLen, ⟨accB - w.halfModulus, ?_, ?_, ?_,
+      Nat.lt_trans hHi w.halfModulus_lt_modulus⟩, hFrame⟩
+    · change listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar w (toBiased w accB)) at hGet
+      rw [toBiased_neg w hHLe hAccBLt] at hGet
+      exact hGet
+    · exact Nat.le_sub_of_add_le hALo
+    · have h1 : (accB - w.halfModulus) + w.halfModulus ≤ hi + w.halfModulus := by
+        rw [Nat.sub_add_cancel hHLe]; exact hAHi
+      exact Nat.le_of_add_le_add_right h1
 
 /-- Any state built with `applyStageSlots` and an in-range accumulator
 satisfies `StageIntervalStateInv`. -/
@@ -2851,6 +3465,324 @@ theorem ovfCastStageCut_checked_add_signed_interval
         addWithOverflowS_biased_false_interval w hAccLt hLo hHi hOp
       exact hNoOvfArm s acc r hInv hLo hHi hEq hILo hIHi hRlt)
     (fun s acc r hInv hLo hHi hOp => hOvfArm s acc r hInv hLo hHi hOp)
+
+/-- Signed checked-subtraction diamond with a SIGNED interval cutpoint over
+`fops.signedView` (cross-zero capable). -/
+theorem ovfCastStageCut_checked_sub_signed_interval
+    {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat) (hW : srcSpec.width = w)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.signedView.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (subWithOverflowS w (toBiased w acc) c).1
+        (subWithOverflowS w (toBiased w acc) c).2))
+    (hNoOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      toBiased w r + toBiased w c = acc + w.halfModulus →
+      srcSpec.lo + w.halfModulus ≤ toBiased w r + toBiased w c →
+      toBiased w r + toBiased w c ≤ srcSpec.hi + w.halfModulus →
+      r < w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r false))
+    (hOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      subWithOverflowS w (toBiased w acc) c = (r, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r true)) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond
+    (fun acc => subWithOverflowS w (toBiased w acc) c)
+    branchState hDispatch
+    (fun s acc r hInv hLo hHi hOp => by
+      have hAccLt : acc < w.modulus := by
+        rw [← hW]
+        let ⟨_, _, _, _, hHiMod⟩ := hInv.2.2.1
+        exact Nat.lt_of_le_of_lt hHi hHiMod
+      let ⟨hEq, hILo, hIHi, hRlt⟩ :=
+        subWithOverflowS_biased_false_interval w hAccLt hLo hHi hOp
+      exact hNoOvfArm s acc r hInv hLo hHi hEq hILo hIHi hRlt)
+    (fun s acc r hInv hLo hHi hOp => hOvfArm s acc r hInv hLo hHi hOp)
+
+/-- Signed checked-multiplication diamond (non-negative multiplier
+`c < w.halfModulus`) with a SIGNED interval cutpoint over `fops.signedView`
+(cross-zero capable). -/
+theorem ovfCastStageCut_checked_mul_signed_interval_nonneg
+    {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat) (hW : srcSpec.width = w)
+    (hc : c < w.halfModulus)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.signedView.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (mulWithOverflowS w (toBiased w acc) c).1
+        (mulWithOverflowS w (toBiased w acc) c).2))
+    (hNoOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      toBiased w r + w.halfModulus * c = acc * c + w.halfModulus →
+      srcSpec.lo * c + w.halfModulus ≤ toBiased w r + w.halfModulus * c →
+      toBiased w r + w.halfModulus * c ≤ srcSpec.hi * c + w.halfModulus →
+      r < w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r false))
+    (hOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      mulWithOverflowS w (toBiased w acc) c = (r, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r true)) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond
+    (fun acc => mulWithOverflowS w (toBiased w acc) c)
+    branchState hDispatch
+    (fun s acc r hInv hLo hHi hOp => by
+      have hAccLt : acc < w.modulus := by
+        rw [← hW]
+        let ⟨_, _, _, _, hHiMod⟩ := hInv.2.2.1
+        exact Nat.lt_of_le_of_lt hHi hHiMod
+      let ⟨hEq, hILo, hIHi, hRlt⟩ :=
+        mulWithOverflowS_biased_false_interval_nonneg w hAccLt hc hLo hHi hOp
+      exact hNoOvfArm s acc r hInv hLo hHi hEq hILo hIHi hRlt)
+    (fun s acc r hInv hLo hHi hOp => hOvfArm s acc r hInv hLo hHi hOp)
+
+/-- Signed checked-multiplication diamond (negative multiplier
+`w.halfModulus ≤ c < w.modulus`) with a SIGNED interval cutpoint over
+`fops.signedView` (cross-zero capable, reversing `[lo, hi]`). -/
+theorem ovfCastStageCut_checked_mul_signed_interval_neg
+    {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat) (hW : srcSpec.width = w)
+    (hCNeg : w.halfModulus ≤ c) (hcM : c < w.modulus)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.signedView.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (mulWithOverflowS w (toBiased w acc) c).1
+        (mulWithOverflowS w (toBiased w acc) c).2))
+    (hNoOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      toBiased w r + acc * (w.modulus - c) =
+        w.halfModulus * (w.modulus - c) + w.halfModulus →
+      toBiased w r + srcSpec.lo * (w.modulus - c) ≤
+        w.halfModulus * (w.modulus - c) + w.halfModulus →
+      w.halfModulus * (w.modulus - c) + w.halfModulus ≤
+        toBiased w r + srcSpec.hi * (w.modulus - c) →
+      r < w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r false))
+    (hOvfArm : ∀ (s : S) (acc r : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      mulWithOverflowS w (toBiased w acc) c = (r, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step
+          (fun st => some (fops.signedView.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s r true)) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond
+    (fun acc => mulWithOverflowS w (toBiased w acc) c)
+    branchState hDispatch
+    (fun s acc r hInv hLo hHi hOp => by
+      have hAccLt : acc < w.modulus := by
+        rw [← hW]
+        let ⟨_, _, _, _, hHiMod⟩ := hInv.2.2.1
+        exact Nat.lt_of_le_of_lt hHi hHiMod
+      let ⟨hEq, hILo, hIHi, hRlt⟩ :=
+        mulWithOverflowS_biased_false_interval_neg w hAccLt hCNeg hcM hLo hHi hOp
+      exact hNoOvfArm s acc r hInv hLo hHi hEq hILo hIHi hRlt)
+    (fun s acc r hInv hLo hHi hOp => hOvfArm s acc r hInv hLo hHi hOp)
+
+/-- Cross-zero signed widening stage cut over `fops.signedView`: widens any
+signed interval `[lo, hi]` (negative, zero-crossing, or positive) from `srcW`
+to `dstW` (`srcW.bits ≤ dstW.bits`), shifting biased bounds by
+`dstW.halfModulus - srcW.halfModulus`. -/
+theorem ovfCastStageCut_widen_signed_interval {fops : OvfCastFrameOps S Val}
+    (hLaw : fops.Lawful) {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcBb dstBb : Nat} {srcW dstW : ScalarWidth} {lo hi : Nat}
+    (hWf : ids.wf baseLocals.length = true)
+    (hLe : srcW.bits ≤ dstW.bits)
+    (hHi : hi < srcW.modulus)
+    (hStep : ∀ (s : S) (accB : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids ⟨srcBb, srcW, lo, hi⟩ s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcW (toBiased srcW accB)) →
+      lo ≤ accB → accB ≤ hi →
+      step s = .step (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (intToIntCast srcW true dstW (toBiased srcW accB)))))) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨srcBb, srcW, lo, hi⟩
+      ⟨dstBb, dstW, lo + (dstW.halfModulus - srcW.halfModulus),
+        hi + (dstW.halfModulus - srcW.halfModulus)⟩ 1 := by
+  have hHLe : srcW.halfModulus ≤ dstW.halfModulus := by
+    unfold ScalarWidth.halfModulus
+    exact pow2_le_pow2 (Nat.sub_le_sub_right hLe 1)
+  have hSMod : srcW.modulus = srcW.halfModulus + srcW.halfModulus := by
+    rw [srcW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDMod : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDstHi : hi + (dstW.halfModulus - srcW.halfModulus) < dstW.modulus := by
+    have h1 : hi + (dstW.halfModulus - srcW.halfModulus) <
+        srcW.modulus + (dstW.halfModulus - srcW.halfModulus) :=
+      Nat.add_lt_add_right hHi _
+    have h2 : srcW.modulus + (dstW.halfModulus - srcW.halfModulus) ≤ dstW.modulus := by
+      rw [hSMod, hDMod, Nat.add_assoc, Nat.add_sub_of_le hHLe]
+      exact Nat.add_le_add_right hHLe _
+    exact Nat.lt_of_lt_of_le h1 h2
+  refine seal_ovfCastStageCut (fun s hInv => ?_)
+  let ⟨accB, hAccGet, hAccLo, hAccHi, _⟩ := hInv.2.2.1
+  have hAccLt : accB < srcW.modulus := Nat.lt_of_le_of_lt hAccHi hHi
+  have hSt := hStep s accB hInv hAccGet hAccLo hAccHi
+  refine wpUntilFuel_step
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.signedView.blockOf st))) ?_
+  change (step s).wp _ _ _
+  rw [hSt]
+  dsimp only [StepOutcome.wp]
+  refine wpUntilFuel_here
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.signedView.blockOf st))) ?_
+  have hCastBi :
+      toBiased dstW (intToIntCast srcW true dstW (toBiased srcW accB)) =
+        accB + (dstW.halfModulus - srcW.halfModulus) :=
+    toBiased_intToIntCast_widen_signed srcW dstW hLe hAccLt
+  have hInvDst :
+      toBiased dstW (accB + (dstW.halfModulus - srcW.halfModulus)) =
+        intToIntCast srcW true dstW (toBiased srcW accB) := by
+    rw [← hCastBi, toBiased_involutive,
+      Nat.mod_eq_of_lt (intToIntCast_lt_modulus srcW true dstW _)]
+  have hGoal :=
+    stageIntervalStateInv_set_acc (fops := fops.signedView)
+      (OvfCastFrameOps.signedView_lawful hLaw) hWf
+      (spec₂ := ⟨dstBb, dstW, lo + (dstW.halfModulus - srcW.halfModulus),
+        hi + (dstW.halfModulus - srcW.halfModulus)⟩)
+      hInv (Nat.add_le_add_right hAccLo _) (Nat.add_le_add_right hAccHi _) hDstHi
+  change StageIntervalStateInv fops.signedView baseLocals ids _
+      (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (toBiased dstW (accB + (dstW.halfModulus - srcW.halfModulus))))))
+    at hGoal
+  rw [hInvDst] at hGoal
+  exact hGoal
+
+/-- Cross-zero signed narrowing stage cut over `fops.signedView`: narrows any
+signed interval `[lo, hi]` fitting in `dstW` (`srcW.halfModulus -
+dstW.halfModulus ≤ lo` and `hi < srcW.halfModulus + dstW.halfModulus`) from
+`srcW` to `dstW` (`dstW.bits ≤ srcW.bits`), shifting biased bounds by
+`-(srcW.halfModulus - dstW.halfModulus)`. -/
+theorem ovfCastStageCut_narrow_signed_interval {fops : OvfCastFrameOps S Val}
+    (hLaw : fops.Lawful) {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcBb dstBb : Nat} {srcW dstW : ScalarWidth} (srcSigned : Bool)
+    {lo hi : Nat}
+    (hWf : ids.wf baseLocals.length = true)
+    (hLe : dstW.bits ≤ srcW.bits)
+    (hLoFit : srcW.halfModulus - dstW.halfModulus ≤ lo)
+    (hHiFit : hi < srcW.halfModulus + dstW.halfModulus)
+    (hStep : ∀ (s : S) (accB : Nat),
+      StageIntervalStateInv fops.signedView baseLocals ids ⟨srcBb, srcW, lo, hi⟩ s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcW (toBiased srcW accB)) →
+      lo ≤ accB → accB ≤ hi →
+      step s = .step (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (intToIntCast srcW srcSigned dstW (toBiased srcW accB)))))) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨srcBb, srcW, lo, hi⟩
+      ⟨dstBb, dstW, lo - (srcW.halfModulus - dstW.halfModulus),
+        hi - (srcW.halfModulus - dstW.halfModulus)⟩ 1 := by
+  have hHLe : dstW.halfModulus ≤ srcW.halfModulus := by
+    unfold ScalarWidth.halfModulus
+    exact pow2_le_pow2 (Nat.sub_le_sub_right hLe 1)
+  have hDMod : dstW.modulus = dstW.halfModulus + dstW.halfModulus := by
+    rw [dstW.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDstHi : hi - (srcW.halfModulus - dstW.halfModulus) < dstW.modulus := by
+    cases Nat.lt_or_ge hi (srcW.halfModulus - dstW.halfModulus) with
+    | inl hSmall =>
+      rw [Nat.sub_eq_zero_of_le (Nat.le_of_lt hSmall)]
+      exact dstW.modulus_pos
+    | inr hBig =>
+      have h1 : (hi - (srcW.halfModulus - dstW.halfModulus)) +
+          (srcW.halfModulus - dstW.halfModulus) <
+          dstW.modulus + (srcW.halfModulus - dstW.halfModulus) := by
+        rw [Nat.sub_add_cancel hBig, hDMod, Nat.add_assoc,
+          Nat.add_sub_of_le hHLe, Nat.add_comm]
+        exact hHiFit
+      cases Nat.lt_or_ge (hi - (srcW.halfModulus - dstW.halfModulus)) dstW.modulus with
+      | inl hLt => exact hLt
+      | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_right hGe _))
+  refine seal_ovfCastStageCut (fun s hInv => ?_)
+  let ⟨accB, hAccGet, hAccLo, hAccHi, _⟩ := hInv.2.2.1
+  have hAccLoFit : srcW.halfModulus - dstW.halfModulus ≤ accB :=
+    Nat.le_trans hLoFit hAccLo
+  have hAccHiFit : accB < srcW.halfModulus + dstW.halfModulus :=
+    Nat.lt_of_le_of_lt hAccHi hHiFit
+  have hSt := hStep s accB hInv hAccGet hAccLo hAccHi
+  refine wpUntilFuel_step
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.signedView.blockOf st))) ?_
+  change (step s).wp _ _ _
+  rw [hSt]
+  dsimp only [StepOutcome.wp]
+  refine wpUntilFuel_here
+    (ops := MirWpOps.ofDetStep step (fun st => some (fops.signedView.blockOf st))) ?_
+  have hCastBi :
+      toBiased dstW (intToIntCast srcW srcSigned dstW (toBiased srcW accB)) =
+        accB - (srcW.halfModulus - dstW.halfModulus) :=
+    toBiased_intToIntCast_narrow_signed srcW srcSigned dstW hLe hAccLoFit hAccHiFit
+  have hInvDst :
+      toBiased dstW (accB - (srcW.halfModulus - dstW.halfModulus)) =
+        intToIntCast srcW srcSigned dstW (toBiased srcW accB) := by
+    rw [← hCastBi, toBiased_involutive,
+      Nat.mod_eq_of_lt (intToIntCast_lt_modulus srcW srcSigned dstW _)]
+  have hGoal :=
+    stageIntervalStateInv_set_acc (fops := fops.signedView)
+      (OvfCastFrameOps.signedView_lawful hLaw) hWf
+      (spec₂ := ⟨dstBb, dstW, lo - (srcW.halfModulus - dstW.halfModulus),
+        hi - (srcW.halfModulus - dstW.halfModulus)⟩)
+      hInv (Nat.sub_le_sub_right hAccLo _) (Nat.sub_le_sub_right hAccHi _) hDstHi
+  change StageIntervalStateInv fops.signedView baseLocals ids _
+      (fops.withBlockLocals s dstBb
+        (listSetAt (fops.localsOf s) ids.accId
+          (fops.mkScalar dstW (toBiased dstW (accB - (srcW.halfModulus - dstW.halfModulus))))))
+    at hGoal
+  rw [hInvDst] at hGoal
+  exact hGoal
 
 /-- Generic single-step cast/transfer stage cut: when every entry state with
 `acc ∈ [srcSpec.lo, srcSpec.hi]` steps to `dstSpec.blockIdx` storing
@@ -4146,6 +5078,241 @@ theorem canary_ovfCast_signed_cross_zero_interval :
       Nat.le_trans (by decide) hHi⟩
   · exact addWithOverflowS_biased_overflow_of_out_of_range .u8 (by decide)
       (Or.inr (by decide))
+
+/-- Concrete `BlockTree`-backed multi-diamond `signedView` pipeline canary
+crossing zero TWICE:
+- Entry: `i8 ∈ [-5, 5]` (biased `[123, 133]`), stored as real two's-complement
+  bit pattern `toBiased .u8 accB`;
+- Block 0 (`ovfCastStageCut_checked_add_signed_interval`): checked signed `+ 3`,
+  tightening to `[-2, 8]` (biased `[126, 136]`), early-return `999` on overflow;
+- Block 1 (`ovfCastStageCut_checked_sub_signed_interval`): checked signed `- 4`,
+  crossing zero BACK into `[-6, 4]` (biased `[122, 132]`), early-return `999`;
+- Block 2 (`ovfCastStageCut_checked_mul_signed_interval_nonneg`): checked signed
+  `* 3`, expanding across zero to `[-18, 12]` (biased `[110, 140]`), early-return
+  `999`;
+- Block 3 (`ovfCastStageCut_widen_signed_interval`): signed widen `i8 → i16`
+  across zero to `[-18, 12]` (biased `[32750, 32780]`);
+- Composed via `ovfCastStageCut_compose`, transported from `bt.lookupForced?` to
+  `listGet? blocks` via `ovfCastStageCut_of_validBlockTree`, and lowered to
+  `wpOutcome` while framing untouched bystander local `4` (`some (.scalar .u32 42)`). -/
+inductive SignedCrossZeroInstr where
+  | addChecked (c nextBb ovfBb : Nat)
+  | subChecked (c nextBb ovfBb : Nat)
+  | mulChecked (c nextBb ovfBb : Nat)
+  | widenI8ToI16 (nextBb : Nat)
+  | ret (code : Nat)
+
+private def signedCrossZeroStep (lookup : Nat → Option SignedCrossZeroInstr)
+    (s : OcjState) : StepOutcome OcjState Nat Unit :=
+  match lookup s.bb with
+  | none => .fault ()
+  | some (.addChecked c nextBb ovfBb) =>
+    match listGet? s.locals 0 with
+    | some (.scalar .u8 a) =>
+      let r := addWithOverflowS .u8 a c
+      if r.2 then .step { bb := ovfBb, locals := s.locals }
+      else .step { bb := nextBb, locals := listSetAt s.locals 0 (.scalar .u8 r.1) }
+    | _ => .fault ()
+  | some (.subChecked c nextBb ovfBb) =>
+    match listGet? s.locals 0 with
+    | some (.scalar .u8 a) =>
+      let r := subWithOverflowS .u8 a c
+      if r.2 then .step { bb := ovfBb, locals := s.locals }
+      else .step { bb := nextBb, locals := listSetAt s.locals 0 (.scalar .u8 r.1) }
+    | _ => .fault ()
+  | some (.mulChecked c nextBb ovfBb) =>
+    match listGet? s.locals 0 with
+    | some (.scalar .u8 a) =>
+      let r := mulWithOverflowS .u8 a c
+      if r.2 then .step { bb := ovfBb, locals := s.locals }
+      else .step { bb := nextBb, locals := listSetAt s.locals 0 (.scalar .u8 r.1) }
+    | _ => .fault ()
+  | some (.widenI8ToI16 nextBb) =>
+    match listGet? s.locals 0 with
+    | some (.scalar .u8 a) =>
+      .step { bb := nextBb,
+              locals := listSetAt s.locals 0 (.scalar .u16 (intToIntCast .u8 true .u16 a)) }
+    | _ => .fault ()
+  | some (.ret code) => .done code
+
+private def signedCrossZeroBlocks : List SignedCrossZeroInstr :=
+  [ .addChecked 3 1 5,
+    .subChecked 4 2 5,
+    .mulChecked 3 3 5,
+    .widenI8ToI16 4,
+    .ret 0,
+    .ret 999 ]
+
+theorem canary_ovfCast_signedView_blockTree_cross_zero_pipeline (accB : Nat)
+    (hLo : 123 ≤ accB) (hHi : accB ≤ 133) :
+    let base : List OcjVal :=
+      [.scalar .u8 (toBiased .u8 accB), .uninit, .uninit, .uninit, .scalar .u32 42]
+    wpOutcome
+      (ops := MirWpOps.ofDetStep (signedCrossZeroStep (listGet? signedCrossZeroBlocks))
+        (fun s => some s.bb))
+      (fun o => o = 0 ∨ o = 999) (fun _ => False) { bb := 0, locals := base } ∧
+    (subWithOverflowS .u8 (toBiased .u8 0) 1).2 = true ∧
+    (mulWithOverflowS .u8 (toBiased .u8 112) 9).2 = true := by
+  let ids : StageLocalIds := { accId := 0, tmpId := 1, ovfMulId := 2, ovfAddId := 3 }
+  let base : List OcjVal :=
+    [.scalar .u8 (toBiased .u8 accB), .uninit, .uninit, .uninit, .scalar .u32 42]
+  let bt := BlockTree.ofList signedCrossZeroBlocks
+  have hValid : ValidBlockTree signedCrossZeroBlocks bt :=
+    valid_blockTree_ofList signedCrossZeroBlocks
+  let stepBt := signedCrossZeroStep bt.lookupForced?
+  let branch (nextBb : Nat) : OcjState → Nat → Bool → OcjState := fun s w b =>
+    if b then { bb := 5, locals := s.locals }
+    else { bb := nextBb, locals := listSetAt s.locals 0 (.scalar .u8 w) }
+  have hS0 :
+      OvfCastStageCut ocjFrameOps.signedView stepBt base ids (fun o => Nat.beq o 999)
+        ⟨0, .u8, 123, 133⟩ ⟨1, .u8, 126, 136⟩ 2 :=
+    ovfCastStageCut_checked_add_signed_interval (fops := ocjFrameOps) (step := stepBt)
+      .u8 3 rfl (branch 1)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 0 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 (toBiased .u8 acc)) := hAccGet
+        have hLook : bt.lookupForced? 0 = some (.addChecked 3 1 5) := rfl
+        dsimp only [stepBt, signedCrossZeroStep, branch]
+        rw [hBb, hLook, hGet]
+        dsimp only
+        cases (addWithOverflowS .u8 (toBiased .u8 acc) 3).2 <;> rfl)
+      (fun s acc r hInv _ _ _ hILo hIHi hRlt => by
+        dsimp only [branch]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        have hBiLo : 126 ≤ toBiased .u8 r :=
+          Nat.le_of_add_le_add_right (show 126 + 128 ≤ toBiased .u8 r + 128 from hILo)
+        have hBiHi : toBiased .u8 r ≤ 136 :=
+          Nat.le_of_add_le_add_right (show toBiased .u8 r + 128 ≤ 136 + 128 from hIHi)
+        have hInvR : toBiased .u8 (toBiased .u8 r) = r := by
+          rw [toBiased_involutive, Nat.mod_eq_of_lt hRlt]
+        have hGoal :=
+          stageIntervalStateInv_set_acc (fops := ocjFrameOps.signedView)
+            (OvfCastFrameOps.signedView_lawful ocjFrameOps_lawful) (by rfl)
+            (spec₂ := ⟨1, .u8, 126, 136⟩) hInv hBiLo hBiHi (Nat.le_of_ble_eq_true rfl)
+        change StageIntervalStateInv ocjFrameOps.signedView base ids ⟨1, .u8, 126, 136⟩
+          { bb := 1, locals := listSetAt s.locals 0 (.scalar .u8 (toBiased .u8 (toBiased .u8 r))) }
+          at hGoal
+        rw [hInvR] at hGoal
+        exact hGoal)
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branch]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hS1 :
+      OvfCastStageCut ocjFrameOps.signedView stepBt base ids (fun o => Nat.beq o 999)
+        ⟨1, .u8, 126, 136⟩ ⟨2, .u8, 122, 132⟩ 2 :=
+    ovfCastStageCut_checked_sub_signed_interval (fops := ocjFrameOps) (step := stepBt)
+      .u8 4 rfl (branch 2)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 1 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 (toBiased .u8 acc)) := hAccGet
+        have hLook : bt.lookupForced? 1 = some (.subChecked 4 2 5) := rfl
+        dsimp only [stepBt, signedCrossZeroStep, branch]
+        rw [hBb, hLook, hGet]
+        dsimp only
+        cases (subWithOverflowS .u8 (toBiased .u8 acc) 4).2 <;> rfl)
+      (fun s acc r hInv _ _ _ hILo hIHi hRlt => by
+        dsimp only [branch]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        have hBiLo : 122 ≤ toBiased .u8 r :=
+          Nat.le_of_add_le_add_right (show 122 + 132 ≤ toBiased .u8 r + 132 from hILo)
+        have hBiHi : toBiased .u8 r ≤ 132 :=
+          Nat.le_of_add_le_add_right (show toBiased .u8 r + 132 ≤ 132 + 132 from hIHi)
+        have hInvR : toBiased .u8 (toBiased .u8 r) = r := by
+          rw [toBiased_involutive, Nat.mod_eq_of_lt hRlt]
+        have hGoal :=
+          stageIntervalStateInv_set_acc (fops := ocjFrameOps.signedView)
+            (OvfCastFrameOps.signedView_lawful ocjFrameOps_lawful) (by rfl)
+            (spec₂ := ⟨2, .u8, 122, 132⟩) hInv hBiLo hBiHi (Nat.le_of_ble_eq_true rfl)
+        change StageIntervalStateInv ocjFrameOps.signedView base ids ⟨2, .u8, 122, 132⟩
+          { bb := 2, locals := listSetAt s.locals 0 (.scalar .u8 (toBiased .u8 (toBiased .u8 r))) }
+          at hGoal
+        rw [hInvR] at hGoal
+        exact hGoal)
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branch]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hS2 :
+      OvfCastStageCut ocjFrameOps.signedView stepBt base ids (fun o => Nat.beq o 999)
+        ⟨2, .u8, 122, 132⟩ ⟨3, .u8, 110, 140⟩ 2 :=
+    ovfCastStageCut_checked_mul_signed_interval_nonneg (fops := ocjFrameOps) (step := stepBt)
+      .u8 3 rfl (Nat.le_of_ble_eq_true rfl) (branch 3)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 2 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 (toBiased .u8 acc)) := hAccGet
+        have hLook : bt.lookupForced? 2 = some (.mulChecked 3 3 5) := rfl
+        dsimp only [stepBt, signedCrossZeroStep, branch]
+        rw [hBb, hLook, hGet]
+        dsimp only
+        cases (mulWithOverflowS .u8 (toBiased .u8 acc) 3).2 <;> rfl)
+      (fun s acc r hInv _ _ _ hILo hIHi hRlt => by
+        dsimp only [branch]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        have hBiLo : 110 ≤ toBiased .u8 r :=
+          Nat.le_of_add_le_add_right (show 110 + 384 ≤ toBiased .u8 r + 384 from hILo)
+        have hBiHi : toBiased .u8 r ≤ 140 :=
+          Nat.le_of_add_le_add_right (show toBiased .u8 r + 384 ≤ 140 + 384 from hIHi)
+        have hInvR : toBiased .u8 (toBiased .u8 r) = r := by
+          rw [toBiased_involutive, Nat.mod_eq_of_lt hRlt]
+        have hGoal :=
+          stageIntervalStateInv_set_acc (fops := ocjFrameOps.signedView)
+            (OvfCastFrameOps.signedView_lawful ocjFrameOps_lawful) (by rfl)
+            (spec₂ := ⟨3, .u8, 110, 140⟩) hInv hBiLo hBiHi (Nat.le_of_ble_eq_true rfl)
+        change StageIntervalStateInv ocjFrameOps.signedView base ids ⟨3, .u8, 110, 140⟩
+          { bb := 3, locals := listSetAt s.locals 0 (.scalar .u8 (toBiased .u8 (toBiased .u8 r))) }
+          at hGoal
+        rw [hInvR] at hGoal
+        exact hGoal)
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branch]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep stepBt (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hS3 :
+      OvfCastStageCut ocjFrameOps.signedView stepBt base ids (fun o => Nat.beq o 999)
+        ⟨3, .u8, 110, 140⟩ ⟨4, .u16, 32750, 32780⟩ 1 :=
+    ovfCastStageCut_widen_signed_interval (fops := ocjFrameOps) (step := stepBt)
+      ocjFrameOps_lawful (by rfl) (Nat.le_of_ble_eq_true rfl)
+      (Nat.le_of_ble_eq_true rfl)
+      (fun s accB hInv hAccGet _ _ => by
+        have hBb : s.bb = 3 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 (toBiased .u8 accB)) := hAccGet
+        have hLook : bt.lookupForced? 3 = some (.widenI8ToI16 4) := rfl
+        dsimp only [stepBt, signedCrossZeroStep]
+        rw [hBb, hLook, hGet]
+        rfl)
+  have hAllBt := ovfCastStageCut_compose (ovfCastStageCut_compose (ovfCastStageCut_compose hS0 hS1) hS2) hS3
+  have hAllList :=
+    ovfCastStageCut_of_validBlockTree hValid ocjFrameOps.signedView signedCrossZeroStep
+      (fun f g s hEq => by unfold signedCrossZeroStep; rw [hEq s.bb]) hAllBt
+  have hEntry :
+      StageIntervalStateInv ocjFrameOps.signedView base ids ⟨0, .u8, 123, 133⟩
+        { bb := 0, locals := base } :=
+    ⟨rfl, rfl, ⟨accB, rfl, hLo, hHi, Nat.le_of_ble_eq_true rfl⟩,
+     fun _ _ _ _ _ => rfl⟩
+  refine ⟨?_, ?_, ?_⟩
+  · exact ovfCastStageCut_to_wpOutcome hEntry hAllList
+      (fun o hEq => Or.inr (Nat.eq_of_beq_eq_true hEq))
+      (fun s hInv => by
+        have hBb : s.bb = 4 := hInv.1
+        refine wpUntil_step
+          (ops := MirWpOps.ofDetStep (signedCrossZeroStep (listGet? signedCrossZeroBlocks))
+            (fun st => some st.bb)) ?_
+        change (signedCrossZeroStep (listGet? signedCrossZeroBlocks) s).wp _ _ _
+        dsimp only [signedCrossZeroStep]
+        rw [hBb]
+        exact Or.inl rfl)
+  · exact subWithOverflowS_biased_overflow_of_out_of_range .u8
+      (Nat.le_of_ble_eq_true rfl) (Or.inl (Nat.le_of_ble_eq_true rfl))
+  · exact mulWithOverflowS_biased_overflow_of_out_of_range_nonneg .u8
+      (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
+      (Or.inl (Nat.le_of_ble_eq_true rfl))
 
 end Anneal.ParametricCore
 
