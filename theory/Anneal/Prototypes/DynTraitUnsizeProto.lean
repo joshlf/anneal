@@ -2652,6 +2652,89 @@ theorem dynLayoutOfValProto_failsClosed
   unfold dynLayoutOfValProto
   simp only [hPred]
 
+/-- **Safe-reference dynamic layout** (`core::mem::size_of_val(&dyn Trait)` /
+`core::mem::align_of_val(&dyn Trait)`). Unlike `size_of_val_raw` on
+`*const dyn Trait` (which reads only the vtable word), calling the safe
+`core::mem` entrypoints requires an initialized, valid shared reference
+(`refDataValid` / `refAddrValid`): null, dead, misaligned, out-of-bounds,
+uninhabited, or `.disabled` references fault `.ub`. -/
+def dynRefLayoutOfValProto
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : ProtoRes (Nat × Nat) :=
+  match valueListContainsUninit [v] with
+  | true => .ub
+  | false =>
+    match pred.failsClosed with
+    | true => .unsupported
+    | false =>
+      match vtableEnvOk ptrBytes vt mem with
+      | false => .unsupported
+      | true =>
+        match decodeWidePtr? ptrBytes v with
+        | some ⟨d, .vtable vtPtr⟩ =>
+          match resolveVTablePtr vt pred vtPtr with
+          | .ok e =>
+            match entryLayoutOk ptrBytes e with
+            | false => .ub
+            | true =>
+              let valid :=
+                match wrapDataWord ptrBytes d with
+                | .prov p => refDataValid ptrBytes e false p locals mem localDecls layouts
+                | .addr bits => refAddrValid ptrBytes e bits
+              match valid with
+              | true => .ok (e.sizeBytes, e.alignBytes)
+              | false => .ub
+          | .invalidPointer => .ub
+          | .invalidTrait => .ub
+        | _ => .ub
+
+/-- **Uninitialized argument gate for safe `size_of_val` / `align_of_val`
+(`kani#5172`).** Any value containing `uninit` faults `.ub` even when the
+predicate fails closed or the vtable environment is unvalidated. -/
+theorem dynRefLayoutOfValProto_uninit_ub
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (hUninit : valueListContainsUninit [v] = true) :
+    dynRefLayoutOfValProto vt ptrBytes pred v locals mem localDecls layouts = .ub := by
+  unfold dynRefLayoutOfValProto
+  simp only [hUninit]
+
+/-- **Sharp safe-vs-raw `size_of_val` / `align_of_val` distinction.** On a
+trait-object pointer whose vtable resolves to `e` but whose data pointer fails
+safe-reference validity (null, dead, misaligned, uninhabited, or `.disabled`),
+safe `dynRefLayoutOfValProto` faults `.ub` while raw `dynLayoutOfValProto`
+(`size_of_val_raw`) succeeds with `(e.sizeBytes, e.alignBytes)`. -/
+theorem dynRefLayoutOfValProto_invalid_ref_vs_raw_ok
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (pred : ProtoTraitPred) (v : Value)
+    (d : ProtoDataWord) (vtPtr : ProvenancePtr) (e : ProtoVTableEntry)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hInit : valueListContainsUninit [v] = false)
+    (hPred : pred.failsClosed = false)
+    (hEnv : vtableEnvOk ptrBytes vt mem = true)
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hRes : resolveVTablePtr vt pred vtPtr = .ok e)
+    (hInvalid :
+      (match wrapDataWord ptrBytes d with
+       | .prov p => refDataValid ptrBytes e false p locals mem localDecls layouts
+       | .addr bits => refAddrValid ptrBytes e bits) = false) :
+    dynRefLayoutOfValProto vt ptrBytes pred v locals mem localDecls layouts = .ub ∧
+    dynLayoutOfValProto vt ptrBytes pred v = .ok (e.sizeBytes, e.alignBytes) := by
+  have hWf : wfProtoVTableTable ptrBytes vt = true := by
+    unfold vtableEnvOk at hEnv
+    cases hW : wfProtoVTableTable ptrBytes vt with
+    | true => rfl
+    | false => rw [hW] at hEnv; cases hEnv
+  have hL : entryLayoutOk ptrBytes e = true :=
+    wfProtoVTableEntry_layoutOk
+      (allEntriesWf_lookupByAlloc (wfProtoVTableTable_allEntriesWf hWf)
+        ((resolveVTablePtr_ok_iff vt pred vtPtr e).mp hRes).2.1)
+  refine ⟨?_, ?_⟩
+  · unfold dynRefLayoutOfValProto
+    simp only [hInit, hPred, hEnv, hDec, hRes, hL, hInvalid]
+  · exact (dynLayoutOfValProto_ok vt ptrBytes pred v d vtPtr e hPred hWf hDec hRes).1
+
 /-! ## §5. Virtual method dispatch and the Tree Borrows receiver protector -/
 
 /-- A virtual call site (`InstanceKind::Virtual(def_id, idx)`): the trait
@@ -3131,6 +3214,69 @@ theorem evalVirtualCallProtoOpt_externalCall_inv
         repeat' split at h
         all_goals cases h
       · cases h
+
+private theorem protectVirtualReceiver_enter_callee
+    (s1 : MachineState) (callee : CapturedMir) (p : ProvenancePtr) (ptrBytes : Nat)
+    (s' : MachineState) (callee' : CapturedMir) (protTag : Option Nat)
+    (h : protectVirtualReceiver s1 callee p ptrBytes = .enter s' callee' protTag) :
+    callee' = callee := by
+  unfold protectVirtualReceiver at h
+  cases hLook : lookupBorrow s1.memory.borrows p.tag with
+  | none => rw [hLook] at h; cases h; rfl
+  | some parentEntry =>
+    rw [hLook] at h; dsimp only at h
+    cases hPerm : parentEntry.perm with
+    | disabled => rw [hPerm] at h; cases h
+    | _ =>
+      rw [hPerm] at h; dsimp only at h
+      split at h <;> first | (cases h; rfl) | cases h
+
+/-- **Inversion: entering a linked concrete callee resolved a method slot.**
+Whenever `evalVirtualCallProtoOpt` enters a linked callee `callee`, the
+receiver unwrapped to a trait-object pointer whose vtable pointer resolves (for
+the site's trait object type) to a captured vtable `e` whose slot `site.slotIdx`
+is `.method defPath`, and `lookupCallee` resolved `defPath` to `callee`. -/
+theorem evalVirtualCallProtoOpt_enter_inv
+    (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction)
+    (s' : MachineState) (callee : CapturedMir) (protTag : Option Nat)
+    (h : evalVirtualCallProtoOpt vt site s callerBody argOps destination target unwind =
+      .enter s' callee protTag) :
+    ∃ (recv : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (e : ProtoVTableEntry)
+      (defPath : String),
+      unwrapDispatchReceiver (layoutPointerBytes callerBody.layouts) 4 recv =
+        some ⟨d, .vtable vtPtr⟩ ∧
+      resolveVTablePtr vt site.traitPred vtPtr = .ok e ∧
+      get? e.slots site.slotIdx = some (.method defPath) ∧
+      lookupCallee s.memory.callees callerBody.layouts defPath [] s.memory.traitImpls =
+        some callee := by
+  unfold evalVirtualCallProtoOpt at h
+  dsimp only at h
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  rename_i _ recv _ _ _
+  split at h <;> try (cases h; done)
+  rename_i d vtPtr hRecv
+  split at h <;> try (cases h; done)
+  rename_i e hRes
+  split at h <;> try (cases h; done)
+  rename_i defPath hSlot
+  split at h <;> try (cases h; done)
+  split at h
+  · cases h
+  · rename_i callee' hCallee
+    split at h
+    · cases h
+    · split at h
+      · have hEq := protectVirtualReceiver_enter_callee _ _ _ _ _ _ _ h
+        subst hEq
+        exact ⟨recv, d, vtPtr, e, defPath, hRecv, hRes, hSlot, hCallee⟩
+      · cases h
+        exact ⟨recv, d, vtPtr, e, defPath, hRecv, hRes, hSlot, hCallee⟩
 
 /-! ### Ranged Tree Borrows view of the receiver protector
 
@@ -4369,28 +4515,36 @@ def isAddrEqCallee (func : Operand) : Bool :=
 
 /-- Detect `core::intrinsics::{size_of_val, align_of_val}` or
 `core::mem::{size_of_val, align_of_val, size_of_val_raw, align_of_val_raw}`
-called on a pointer to `.dynamic traitKey`. Returns `some (isAlign, traitKey)`. -/
+called on a pointer to `.dynamic traitKey`. Returns
+`some (isAlign, isSafeRef, traitKey)` where `isSafeRef = true` iff the callee is
+the safe-reference entrypoint `core::mem::{size_of_val, align_of_val}` (which
+requires safe-reference validity of the data pointer, unlike `*_raw` and
+`core::intrinsics::*`). -/
 def dynLayoutIntrinsic?
     (currentBody : CapturedMir) (func : Operand) (argOps : List Operand) :
-    Option (Bool × String) :=
+    Option (Bool × Bool × String) :=
   match extractCallee? func with
   | some (defPath, typeArgs) =>
-    let isAlign? : Option Bool :=
+    let kind? : Option (Bool × Bool) :=
       match classifyRustIntrinsic? defPath with
-      | some .sizeOfVal => some false
-      | some .alignOfVal => some true
+      | some .sizeOfVal => some (false, false)
+      | some .alignOfVal => some (true, false)
       | _ =>
-        match strEq defPath "core::mem::size_of_val" ||
-            strEq defPath "core::mem::size_of_val_raw" with
-        | true => some false
+        match strEq defPath "core::mem::size_of_val" with
+        | true => some (false, true)
         | false =>
-          match strEq defPath "core::mem::align_of_val" ||
-              strEq defPath "core::mem::align_of_val_raw" with
-          | true => some true
-          | false => none
-    match isAlign? with
+          match strEq defPath "core::mem::align_of_val" with
+          | true => some (true, true)
+          | false =>
+            match strEq defPath "core::mem::size_of_val_raw" with
+            | true => some (false, false)
+            | false =>
+              match strEq defPath "core::mem::align_of_val_raw" with
+              | true => some (true, false)
+              | false => none
+    match kind? with
     | none => none
-    | some isAlign =>
+    | some (isAlign, isSafeRef) =>
       let pointee? : Option RigidTy :=
         match typeArgs with
         | t :: _ => some t
@@ -4403,16 +4557,20 @@ def dynLayoutIntrinsic?
             | _ => none
           | [] => none
       match pointee? with
-      | some (.dynamic traitKey) => some (isAlign, traitKey)
+      | some (.dynamic traitKey) => some (isAlign, isSafeRef, traitKey)
       | _ => none
   | none => none
 
-/-- Step `size_of_val` / `align_of_val` on a pointer to `.dynamic traitKey`
-using `dynSizeOfValProto` / `dynAlignOfValProto`, guarded by `vtableEnvOk`. -/
-def stepDynLayoutIntrinsicProto
-    (vt : ProtoVTableTable) (isAlign : Bool) (traitKey : String) (s : MachineState)
+/-- Step `size_of_val` / `align_of_val` (safe reference or raw pointer;
+returning or diverging) on a pointer to `.dynamic traitKey`. Rejects `uninit`
+arguments BEFORE predicate/environment gates (`kani#5172`); enforces
+`dynRefLayoutOfValProto` when `isSafeRef = true` and `dynLayoutOfValProto`
+(no data-pointer dereference) when `isSafeRef = false`; returning normally to a
+diverging call (`targetOpt = none`) is `.ub`. -/
+def stepDynLayoutIntrinsicProtoOpt
+    (vt : ProtoVTableTable) (isAlign isSafeRef : Bool) (traitKey : String) (s : MachineState)
     (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
-    (target : BasicBlockIdx) : MirStepNode :=
+    (targetOpt : Option BasicBlockIdx) : MirStepNode :=
   let ptrBytes := layoutPointerBytes currentBody.layouts
   match
     evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals currentBody.layouts
@@ -4421,30 +4579,48 @@ def stepDynLayoutIntrinsicProto
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
   | .ok [ptrVal] locals' =>
-    match lookupDynPred vt.dynTypes traitKey with
-    | none => MirStepNode.unsupported
-    | some pred =>
-      match pred.failsClosed with
-      | true => MirStepNode.unsupported
-      | false =>
-        match vtableEnvOk ptrBytes vt s.memory with
-        | false => MirStepNode.unsupported
-        | true =>
-          let res :=
-            match isAlign with
-            | false => dynSizeOfValProto vt ptrBytes pred ptrVal
-            | true => dynAlignOfValProto vt ptrBytes pred ptrVal
-          match res with
-          | .ok n => writeIntrinsicReturn s locals' destination target (.scalar ⟨n, ptrBytes⟩)
-          | .ub => MirStepNode.fail .ub
-          | .unsupported => MirStepNode.unsupported
+    match valueListContainsUninit [ptrVal] with
+    | true => MirStepNode.fail .ub
+    | false =>
+      match lookupDynPred vt.dynTypes traitKey with
+      | none => MirStepNode.unsupported
+      | some pred =>
+        let layoutRes :=
+          match isSafeRef with
+          | true =>
+            dynRefLayoutOfValProto vt ptrBytes pred ptrVal locals' s.memory currentBody.localDecls
+              currentBody.layouts
+          | false =>
+            match pred.failsClosed with
+            | true => .unsupported
+            | false =>
+              match vtableEnvOk ptrBytes vt s.memory with
+              | false => .unsupported
+              | true => dynLayoutOfValProto vt ptrBytes pred ptrVal
+        match layoutRes with
+        | .ok (sz, al) =>
+          let n := match isAlign with | false => sz | true => al
+          match targetOpt with
+          | some target => writeIntrinsicReturn s locals' destination target (.scalar ⟨n, ptrBytes⟩)
+          | none => MirStepNode.fail .ub
+        | .ub => MirStepNode.fail .ub
+        | .unsupported => MirStepNode.unsupported
   | .ok _ _ => MirStepNode.fail .ub
 
-/-- Call `core::ptr::addr_eq(p, q)`: evaluate both arguments, compare the data
-addresses with `evalWideAddrEqProto`, and write the `bool` to the destination
-with `writeIntrinsicReturn`. -/
-def stepAddrEqProto (s : MachineState) (currentBody : CapturedMir) (argOps : List Operand)
-    (destination : Place) (target : BasicBlockIdx) : MirStepNode :=
+/-- Returning `stepDynLayoutIntrinsicProto` (backwards-compatible wrapper). -/
+def stepDynLayoutIntrinsicProto
+    (vt : ProtoVTableTable) (isAlign : Bool) (traitKey : String) (s : MachineState)
+    (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : BasicBlockIdx) : MirStepNode :=
+  stepDynLayoutIntrinsicProtoOpt vt isAlign false traitKey s currentBody argOps destination
+    (some target)
+
+/-- Call `core::ptr::addr_eq(p, q)` (returning or diverging): evaluate both
+arguments, compare the data addresses with `evalWideAddrEqProto`, and write the
+`bool` to the destination with `writeIntrinsicReturn` (returning to a diverging
+call terminator `targetOpt = none` is `.ub`). -/
+def stepAddrEqProtoOpt (s : MachineState) (currentBody : CapturedMir) (argOps : List Operand)
+    (destination : Place) (targetOpt : Option BasicBlockIdx) : MirStepNode :=
   match
     evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals currentBody.layouts
       s.memory.callerLocals (callStack := s.memory.callStack)
@@ -4453,16 +4629,25 @@ def stepAddrEqProto (s : MachineState) (currentBody : CapturedMir) (argOps : Lis
   | .unsupported => MirStepNode.unsupported
   | .ok [p, q] locals' =>
     match evalWideAddrEqProto p q locals' s.memory currentBody.localDecls currentBody.layouts with
-    | .ok ret _ _ => writeIntrinsicReturn s locals' destination target ret
+    | .ok ret _ _ =>
+      match targetOpt with
+      | some target => writeIntrinsicReturn s locals' destination target ret
+      | none => MirStepNode.fail .ub
     | .ub => MirStepNode.fail .ub
     | .unsupported => MirStepNode.unsupported
   | .ok _ _ => MirStepNode.fail .ub
 
+/-- Returning `stepAddrEqProto`. -/
+def stepAddrEqProto (s : MachineState) (currentBody : CapturedMir) (argOps : List Operand)
+    (destination : Place) (target : BasicBlockIdx) : MirStepNode :=
+  stepAddrEqProtoOpt s currentBody argOps destination (some target)
+
 /-- **`stepMirFn` with the prototype rules.** An `Unsize` cast to a pointer to
-a trait object, a raw borrow of a dereferenced trait-object pointer, a virtual
-call (returning or diverging), a `size_of_val`/`align_of_val` intrinsic on a
-trait object, and a call to `core::ptr::addr_eq` use the prototype rules; every
-other statement and terminator is `stepMirFn`. -/
+a trait object (or `Pin<&[mut] dyn Trait>`), a raw borrow of a dereferenced
+trait-object pointer, a virtual call (returning or diverging), a
+`size_of_val`/`align_of_val` intrinsic on a trait object, and a call to
+`core::ptr::addr_eq` use the prototype rules; every other statement and
+terminator is `stepMirFn`. -/
 def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineState) :
     MirStepNode :=
   let currentBody := s.memory.activeCallee.getD body
@@ -4486,14 +4671,16 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
           | _, _ => stepMirFn body s
         | .assign place (.rawPtr mutKind srcPlace) =>
           match
-            place.projection,
             dynRawBorrowProto? prog.vtables (layoutPointerBytes currentBody.layouts) mutKind
               s.frame.locals s.memory currentBody.localDecls currentBody.layouts srcPlace
           with
-          | [], some (.ok v) => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
-          | [], some .ub => MirStepNode.fail .ub
-          | [], some .unsupported => MirStepNode.unsupported
-          | _, _ => stepMirFn body s
+          | none => stepMirFn body s
+          | some res =>
+            match place.projection, res with
+            | [], .ok v => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
+            | [], .ub => MirStepNode.fail .ub
+            | [], .unsupported => MirStepNode.unsupported
+            | _ :: _, _ => MirStepNode.unsupported
         | _ => stepMirFn body s
       | none =>
         match Nat.beq s.frame.stmtIdx (length bb.statements) with
@@ -4503,17 +4690,14 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
           | .call func argOps destination targetOpt unwind =>
             match virtualCallSite? prog currentBody func argOps with
             | .notVirtual =>
-              match targetOpt with
-              | some target =>
-                match isAddrEqCallee func with
-                | true => stepAddrEqProto s currentBody argOps destination target
-                | false =>
-                  match dynLayoutIntrinsic? currentBody func argOps with
-                  | some (isAlign, traitKey) =>
-                    stepDynLayoutIntrinsicProto prog.vtables isAlign traitKey s currentBody argOps
-                      destination target
-                  | none => stepMirFn body s
-              | none => stepMirFn body s
+              match isAddrEqCallee func with
+              | true => stepAddrEqProtoOpt s currentBody argOps destination targetOpt
+              | false =>
+                match dynLayoutIntrinsic? currentBody func argOps with
+                | some (isAlign, isSafeRef, traitKey) =>
+                  stepDynLayoutIntrinsicProtoOpt prog.vtables isAlign isSafeRef traitKey s
+                    currentBody argOps destination targetOpt
+                | none => stepMirFn body s
             | .unsupported => MirStepNode.unsupported
             | .site site =>
               stepVirtualCallProtoOpt prog.vtables site s currentBody argOps destination targetOpt
@@ -5556,6 +5740,47 @@ theorem virtualCall_agrees_with_vtableMethodLookup (L : DynLayout M) (vt : Proto
   have hLook' : lookupVTableByAlloc vt.entries e.vtableAllocId = some e := by rw [hA]; exact hLook
   have hMem : e ∈ vt.entries := lookupVTableByAlloc_mem hLook
   refine ⟨vtPtr', e, hRes, hSlot, ?_⟩
+  exact (evalUnOpM_dyn_correspondence L vt m ptrBytes site.slotIdx e defPath
+    (ptrAt L 0 0) fnThin (.Raw (.VTablePointer (traitName L e.traitPred))) hProv hWf hLook'
+    (hBounds e hMem) rfl hSlot hFn).2.2.2
+
+/-- **Linked-callee virtual dispatch agrees with MiniRust `VTableMethodLookup`,
+universally (on `Mach` and `MachTB`).** Whenever `evalVirtualCallProtoOpt`
+enters a linked concrete callee `callee`, the receiver's vtable resolves to a
+captured entry `e` whose slot `site.slotIdx` is `.method defPath` (resolving to
+`callee` in `s.memory.callees`), and for every function pointer `fnThin` bound
+to `L.fnOf defPath` in `m.fn_ptrs`, MiniRust `UnOp::VTableMethodLookup` at the
+same slot returns `.ok fnThin`. -/
+theorem virtualCall_enter_agrees_with_vtableMethodLookup (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction)
+    (s' : MachineState) (callee : CapturedMir) (protTag : Option Nat)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hBounds : ∀ e, e ∈ vt.entries → inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (h : evalVirtualCallProtoOpt vt site s callerBody argOps destination target unwind =
+      .enter s' callee protTag) :
+    ∃ (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry) (defPath : String),
+      resolveVTablePtr vt site.traitPred vtPtr' = .ok e ∧
+      get? e.slots site.slotIdx = some (.method defPath) ∧
+      lookupCallee s.memory.callees callerBody.layouts defPath [] s.memory.traitImpls =
+        some callee ∧
+      ∀ (fnThin : Gen.ThinPointer (Gen.Memory.Provenance M)),
+        mapGet m.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ = some fnThin →
+        evalUnOpM (.VTableMethodLookup ⟨⟨site.slotIdx⟩⟩)
+            (.Ptr (ThinPointer.widen (vtPtr L e) none), .Ptr (.VTablePtr (traitName L e.traitPred)))
+            (some (installVTables L vt m)) =
+          .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) := by
+  obtain ⟨_, _, vtPtr', e, defPath, _, hRes, hSlot, hCallee⟩ :=
+    evalVirtualCallProtoOpt_enter_inv vt site s callerBody argOps destination target unwind
+      s' callee protTag h
+  obtain ⟨_, hLook, _⟩ := (resolveVTablePtr_ok_iff vt site.traitPred vtPtr' e).mp hRes
+  have hA : e.vtableAllocId = vtPtr'.allocId := lookupVTableByAlloc_allocId hLook
+  have hLook' : lookupVTableByAlloc vt.entries e.vtableAllocId = some e := by rw [hA]; exact hLook
+  have hMem : e ∈ vt.entries := lookupVTableByAlloc_mem hLook
+  refine ⟨vtPtr', e, defPath, hRes, hSlot, hCallee, ?_⟩
+  intro fnThin hFn
   exact (evalUnOpM_dyn_correspondence L vt m ptrBytes site.slotIdx e defPath
     (ptrAt L 0 0) fnThin (.Raw (.VTablePointer (traitName L e.traitPred))) hProv hWf hLook'
     (hBounds e hMem) rfl hSlot hFn).2.2.2
