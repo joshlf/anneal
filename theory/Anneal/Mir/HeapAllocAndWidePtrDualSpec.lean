@@ -1877,6 +1877,67 @@ theorem trustedCmp_nonvacuity_twins_table :
 
 end TrustedBridge
 
+/-! ### §6.3 Direct 3-Way Trusted ↔ MiniRust ↔ LeanMiri Agreement -/
+
+/-- **Trusted is a Tree-Borrows-mode authority**: its protector verdict on case `19` equals
+MiniRust's `MachTB` verdict and *differs* from MiniRust's `Mach` (`BasicMemory`) verdict, so
+the Trusted bridge genuinely discriminates the two memory modes (it is not a basic-mode
+model that happens to agree on the mode-insensitive cells). -/
+theorem trusted_protector_is_treeBorrows_mode :
+    trustedTeardownObs .frozen true = mrObserve .treeBorrows 19 ∧
+    trustedTeardownObs .frozen true ≠ mrObserve .basic 19 ∧
+    trustedStorageDeadObs .frozen true ≠ mrObserve .basic 19 ∧
+    trustedTailCallRunObs .frozen true ≠ mrObserve .basic 19 := by
+  rw [mrObserve_table .basic 19 (by decide)]
+  refine ⟨trusted_protector_cases_match_mr.1, ?_, ?_, ?_⟩
+  · rw [trustedTeardown_table.1]; decide
+  · rw [trustedStorageDead_and_release_table.1]; decide
+  · rw [trustedTailCallRun_table.1]; decide
+
+/-- **Direct 3-way agreement on every Trusted-covered case**: for every contract `c`
+(closed over `LeanMiriSpec.HeapAllocAndWidePtrLM` in the tests), the Trusted
+`stepMirFn` / `evalTerminator` / `evalTailCallTerminator` verdicts equal LeanMiri's
+Tree Borrows verdicts on cases `19`, `20`, `22`, and the Trusted `addr_eq` / `==` verdicts
+equal LeanMiri's on cases `23..27` in BOTH modes — composing the Trusted ↔ MiniRust
+bridge with the MiniRust ↔ LeanMiri agreement zone. -/
+theorem contract_trusted_lm_agreement (c : HeapWideDualContract) :
+    (trustedTeardownObs .frozen true = c.lm.observe true 19 ∧
+      trustedTeardownObs .frozen false = c.lm.observe true 20 ∧
+      trustedTeardownObs .cell true = c.lm.observe true 22) ∧
+    (trustedStorageDeadObs .frozen true = c.lm.observe true 19 ∧
+      trustedCalleeReleaseThenDeallocObs = c.lm.observe true 20 ∧
+      trustedStorageDeadObs .cell true = c.lm.observe true 22) ∧
+    (trustedTailCallRunObs .frozen true = c.lm.observe true 19 ∧
+      trustedTailCallRunObs .frozen false = c.lm.observe true 20 ∧
+      trustedTailCallRunObs .cell true = c.lm.observe true 22) ∧
+    (∀ tb : Bool,
+      trustedCmpObs hwSliceTy hwSliceTy true (hwSlice hwPtrA 3) (hwSlice hwPtrA 7) = c.lm.observe tb 23 ∧
+      trustedCmpObs hwSliceTy hwSliceTy false (hwSlice hwPtrA 3) (hwSlice hwPtrA 7) = c.lm.observe tb 24 ∧
+      trustedCmpObs hwDynTy hwDynTy true (hwDyn hwPtrA hwVt9) (hwDyn hwPtrA hwVtA) = c.lm.observe tb 25 ∧
+      trustedCmpObs hwDynTy hwDynTy false (hwDyn hwPtrA hwVt9) (hwDyn hwPtrA hwVtA) = c.lm.observe tb 26 ∧
+      trustedCmpObs hwSliceTy hwDynTy true (hwSlice hwPtrA 5) (hwDyn hwPtrB hwVt9) = c.lm.observe tb 27) := by
+  have agree : ∀ (m : HeapWideMemoryMode) (k : Nat), k < 28 →
+      mrObserve m k = c.lm.observe m.toLmTreeBorrows k := fun m k hk =>
+    c.agreement_zone_exact m k (Nat.lt_trans hk (by decide))
+      ((caseClass_agreement_iff k (Nat.lt_trans hk (by decide))).mpr hk)
+  have tb19 := agree .treeBorrows 19 (by decide)
+  have tb20 := agree .treeBorrows 20 (by decide)
+  have tb22 := agree .treeBorrows 22 (by decide)
+  obtain ⟨p19, p20, p22⟩ := trusted_protector_cases_match_mr
+  have r := trustedTailCallRun_table
+  have sd := trustedStorageDead_and_release_table
+  have t20 : trustedTeardownObs .frozen false = mrObserve .treeBorrows 20 := by
+    rw [mrObserve_table _ 20 (by decide)]; exact trustedTeardown_table.2.2.2.2.1
+  refine ⟨⟨p19.trans tb19, t20.trans tb20, p22.trans tb22⟩,
+    ⟨sd.2.2.2.2.2.2.1.trans tb19, sd.2.2.2.2.2.2.2.1.trans tb20, sd.2.2.2.2.2.2.2.2.trans tb22⟩,
+    ⟨r.2.2.2.2.2.1.trans tb19, r.2.2.2.2.2.2.1.trans tb20, r.2.2.2.2.2.2.2.trans tb22⟩,
+    fun tb => ?_⟩
+  have hm := HeapWideMemoryMode.to_ofLmTreeBorrows tb
+  obtain ⟨w23, w24, w25, w26, w27⟩ := trusted_wide_cases_match_mr (HeapWideMemoryMode.ofLmTreeBorrows tb)
+  have a := fun k (hk : k < 28) => hm ▸ agree (HeapWideMemoryMode.ofLmTreeBorrows tb) k hk
+  exact ⟨w23.trans (a 23 (by decide)), w24.trans (a 24 (by decide)), w25.trans (a 25 (by decide)),
+    w26.trans (a 26 (by decide)), w27.trans (a 27 (by decide))⟩
+
 /-! ## §7. Episode 2 Capstone -/
 
 open Trusted.Rustc.V2026_06_01.MirSemantics (preventsDeallocation hasFrameDeallocProtectorConflict
@@ -1985,7 +2046,9 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @evalCast_then_thinEq_erases_meta_and_prov) ∧
       (type_of% @trustedRvalue_witnesses) ∧
       (type_of% @trusted_wide_cases_match_mr) ∧
-      (type_of% @trustedCmp_nonvacuity_twins_table)) :=
+      (type_of% @trustedCmp_nonvacuity_twins_table) ∧
+      (type_of% @trusted_protector_is_treeBorrows_mode) ∧
+      (type_of% (contract_trusted_lm_agreement c))) :=
   ⟨⟨heapWideOutcomeCodec_tight, fun _ _ h => heapWideOutcomeCodec_encode_injective h,
       fun _ _ _ hv₁ hv₂ hd₁ hd₂ => heapWideOutcomeCodec_decode_injective_on_valid hv₁ hv₂ hd₁ hd₂,
       heapWideOutcomeCodec_rejects_malformed, ofMrObs_toMrObs, toMrObs_ofMrObs,
@@ -2014,7 +2077,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       @evalRvalue_wideSlice_eq, @evalRvalue_wideDyn_eq,
       @evalRvalue_wideSlice_eq_matches_mr, @evalRvalue_wideDyn_eq_matches_mr,
       @evalCast_then_thinEq_erases_meta_and_prov, @trustedRvalue_witnesses,
-      @trusted_wide_cases_match_mr, @trustedCmp_nonvacuity_twins_table⟩⟩
+      @trusted_wide_cases_match_mr, @trustedCmp_nonvacuity_twins_table,
+      trusted_protector_is_treeBorrows_mode, contract_trusted_lm_agreement c⟩⟩
 
 /-! ## §8. Import-Isolation, Constructive-Codec, Bridge-Reality & Axiom Audit -/
 

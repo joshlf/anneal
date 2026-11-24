@@ -46,7 +46,7 @@ namespace Anneal.Mir.HeapAllocAndWidePtrDualSpecTests
 set_option Elab.async false
 
 open LeanMiriSpec.HeapAllocAndWidePtrLM
-open Miri.ABI (Align)
+open Miri.ABI (Align Size)
 
 /-! ## §1. LeanMiri Positive Witnesses & Fail-Closed Boundary Tests -/
 
@@ -177,6 +177,22 @@ theorem lm_addr_eq_vs_eq_rust166144 (tb : Bool) :
   refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> cases tb <;> first
     | exact Option.some.inj (lm_basic _ (by decide))
     | exact Option.some.inj (lm_tb _ (by decide))
+
+/-- Opposite-polarity LeanMiri `addr_eq` twins (vendored `Cast.ptrToPtr` +
+`ExecutionScalar.pointerBinary`): heterogeneous slice / `dyn` pointers at DISTINCT thin
+addresses give `false`, at the same address `true` (so case `27`'s `true` is not a
+constant), and full slice `==` with equal length gives `true` (so case `24`'s `false` is
+not a constant either). -/
+theorem lm_addr_eq_polarity_twins :
+    lmCompare lmAddrEq (lmSlice ⟨Size.ofBytes 8192, none⟩ 5)
+        (lmDyn ⟨Size.ofBytes 12288, none⟩ (lmAddr 36864)) = .ok (.okBool false) ∧
+    lmCompare lmAddrEq (lmSlice ⟨Size.ofBytes 8192, none⟩ 5)
+        (lmDyn ⟨Size.ofBytes 8192, none⟩ (lmAddr 36864)) = .ok (.okBool true) ∧
+    lmCompare lmEq (lmSlice ⟨Size.ofBytes 8192, none⟩ 3)
+        (lmSlice ⟨Size.ofBytes 8192, none⟩ 3) = .ok (.okBool true) ∧
+    lmCompare lmEq (lmSlice ⟨Size.ofBytes 8192, none⟩ 3)
+        (lmSlice ⟨Size.ofBytes 8192, none⟩ 7) = .ok (.okBool false) := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- Universal LeanMiri `addr_eq` laws: metadata and provenance erasure. -/
 theorem lm_addr_eq_universal :
@@ -412,7 +428,7 @@ run_cmd do
                      `contract_divergence_set_exact, `contract_wire_divergence_exact,
                      `contract_static_leak_wide_agreement,
                      `contract_total_divergence_exact, `contract_total_wire_divergence_exact,
-                     `contract_out_of_range_agreement,
+                     `contract_out_of_range_agreement, `contract_trusted_lm_agreement,
                      `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
@@ -439,7 +455,8 @@ run_cmd do
               `evalRvalue_wideSlice_eq_matches_mr, `evalRvalue_wideDyn_eq_matches_mr,
               `evalCast_then_thinEq_erases_meta_and_prov,
               `trustedCmp_table, `trustedCmp_nonvacuity_twins_table,
-              `trustedRvalue_witnesses, `trusted_wide_cases_match_mr] do
+              `trustedRvalue_witnesses, `trusted_wide_cases_match_mr,
+              `trusted_protector_is_treeBorrows_mode] do
       let src := dsNs ++ w
       let some (.thmInfo v) := (← getEnv).find? src
         | throwError "cross-root: root witness {src} missing"
@@ -543,6 +560,13 @@ run_cmd do
             (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))),
           thm "sliceCmpForgedTrue" (mkApp3 (mkConst ``Eq [1]) obsTy sliceCmpFalse (mkApp (obsC "okBool") boolTrue))
             (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolTrue))),
+        ("forged 3-way: Trusted active-protector verdict equals LeanMiri BASIC-mode case 19",
+          some (thm "trustedEqLmTb19"
+            (mkApp3 (mkConst ``Eq [1]) obsTy tdFrozenTrue (mkApp2 (mkConst crossObsU) boolTrue (mkNatLit 19)))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy tdFrozenTrue)),
+          thm "trustedEqLmBasic19"
+            (mkApp3 (mkConst ``Eq [1]) obsTy tdFrozenTrue (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 19)))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy tdFrozenTrue)),
         ("forged out-of-range LeanMiri cell (false, 30) = ub",
           some (thm "outOfRangeIsInvalid"
             (mkApp3 (mkConst ``Eq [1]) obsTy (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 30))
@@ -734,7 +758,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 82 && rejectedCount = 25 do
+  unless addedCount = 84 && rejectedCount = 26 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
