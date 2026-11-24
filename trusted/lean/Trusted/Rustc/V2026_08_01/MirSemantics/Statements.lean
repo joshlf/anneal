@@ -1710,7 +1710,7 @@ def copyPlaceIsNonArrayAggregate
   match get? locals loc with
   | .none => false
   | .some _ =>
-    match placeTy localDecls layouts { local_ := loc, projection := proj } with
+    match placeTyResolved localDecls layouts { local_ := loc, projection := proj } with
     | .some { kind := .adt _ _, .. } => true
     | .some { kind := .tuple _, .. } => true
     | _ => false
@@ -1730,7 +1730,7 @@ def copyContainerElemKind?
   match get? locals loc with
   | .none => .none
   | .some _ =>
-    match placeTy localDecls layouts { local_ := loc, projection := parentProj } with
+    match placeTyResolved localDecls layouts { local_ := loc, projection := parentProj } with
     | .some { kind := .array ek _, .. } => .some ek
     | .some { kind := .slice ek, .. } => .some ek
     | _ => .none
@@ -1827,30 +1827,99 @@ def resolveArraySliceEndpoint?
         | _ => direct
 
 /--
-Element-stride guard for one container of a multi-element `copy_nonoverlapping`
-(`copySliceStrideOk`): whether an element of the container occupies exactly one
-copied element.
+Whether `k` is an unsigned or signed primitive integer `RigidTy`, whose
+validity invariant accepts every bit pattern of its byte width and whose
+runtime value representation is `Value.scalar` of that width.
+-/
+@[reducible]
+def isUnrestrictedIntKind : RigidTy → Bool
+  | .uint _ => true
+  | .int _ => true
+  | _ => false
 
-- When the container's static element kind `elemKindOpt` and the operand's
-  pointee type `pointeeOpt` are both known, the element kind must have the
-  pointee's value shape (`sameRigidTyShape`) or be a primitive scalar of the
-  copied element size.
-- Otherwise (an untyped container, e.g. a caller-owned referent), every element
-  value must have the copied element size `elemSzOpt` (`elemsMatchByteStride`).
+/--
+Whether every element value in `elems` has the exact runtime representation of
+a scalar or thin-pointer pointee type `pt` of byte size `elemSz`, and (for
+restricted scalars `.bool` / `.char`) satisfies `pt`'s validity invariant.
+Used by `copyContainerStrideOk` for untyped containers (e.g. caller-owned
+referents) so direct element-window splicing never confuses `.aggregate`,
+`.scalar`, and `.ptr` element shapes.
+-/
+def elemsAllMatchPointeeRep (pt : Ty) (elemSz : Nat) : List Value → Bool
+  | .nil => true
+  | v :: rest =>
+    let ok : Bool :=
+      match pt.kind, v with
+      | .uint _, .scalar sc | .int _, .scalar sc | .float _, .scalar sc =>
+        Nat.beq sc.sizeBytes elemSz
+      | .bool, .scalar sc =>
+        Bool.and (Nat.beq sc.sizeBytes 1) (Bool.or (Nat.beq sc.bits 0) (Nat.beq sc.bits 1))
+      | .char, .scalar sc =>
+        Bool.and (Nat.beq sc.sizeBytes 4) (isValidCharCode sc.bits)
+      | .fnPtr _ _ _ _, .ptr _ ptrSz => Nat.beq ptrSz elemSz
+      | .rawPtr _ pointee, .ptr _ ptrSz | .ref _ pointee, .ptr _ ptrSz =>
+        let isThin : Bool :=
+          match pointee with
+          | .slice _ | .str | .dynamic _ => false
+          | _ => true
+        Bool.and isThin (Nat.beq ptrSz elemSz)
+      | _, _ => false
+    match ok with
+    | true => elemsAllMatchPointeeRep pt elemSz rest
+    | false => false
+
+/--
+Whether every value in `elems` is a `Value.scalar` of exact byte width `elemSz`.
+-/
+def elemsAllScalarsOfSize (elemSz : Nat) : List Value → Bool
+  | .nil => true
+  | .scalar sc :: rest =>
+    match Nat.beq sc.sizeBytes elemSz with
+    | true => elemsAllScalarsOfSize elemSz rest
+    | false => false
+  | _ :: _ => false
+
+/--
+Element-stride and representation guard for one container of a multi-element
+`copy_nonoverlapping` (`copySliceElements`): whether transferring element
+values directly is representation- and validity-exact for one copied element
+of the pointee type.
+
+- When both the container's static element kind `elemKindOpt` and the operand's
+  pointee type `pointeeOpt` are known, they must be structurally identical
+  (`rigidTyEq ek pt.kind`), or both must be unrestricted integer scalars
+  (`.uint _` / `.int _`) of the copied element byte size `elemSzOpt` (so
+  restricted scalars like `bool`/`char`, distinct tuple/ADT types, and
+  aggregate-vs-scalar mismatches are never spliced directly as element values).
+- When the container is untyped (`elemKindOpt = .none`, e.g. a caller-owned
+  referent) and `pointeeOpt = .some pt`, every element value must match `pt`'s
+  exact scalar or thin-pointer representation (`elemsAllMatchPointeeRep`).
+- When `pointeeOpt = .none`, only uniform-width scalar elements matching
+  `elemSzOpt` (and, if typed, an unrestricted integer container element kind)
+  are accepted (`elemsAllScalarsOfSize`).
 
 Reference (The Rust Reference 1.98.0, "Array layout"):
 <https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
 
 > "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
 
-Justification: transferring `count` element values is the same as copying
-`count * size_of::<T>()` bytes only if each element value occupies
-`size_of::<T>()` bytes at the stride of the array. When this guard fails the
-copy is type-punned across element boundaries and is not evaluated on element
-values.
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined — Invalid values"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html#invalid-values>
 
-Modeling assumption: a primitive scalar of equal size is accepted because the
-model represents every primitive scalar as `Value.scalar` of that byte size.
+> "The following is a non-exhaustive list of invalid values:
+> - A `bool` that isn't 0 or 1.
+> - A `char` that is a surrogate or above `char::MAX`."
+
+Justification: transferring `count` element values directly is equivalent to
+copying `count * size_of::<T>()` bytes only when each element occupies
+`size_of::<T>()` bytes at the array stride and shares the destination's value
+representation without violating destination validity invariants. Mismatched
+types (such as `u8` into `[bool; N]`, wrapper structs into `[u32; N]`, distinct
+tuples, or untyped aggregate caller referents) fail closed with `.unsupported`
+rather than corrupting runtime values or synthesizing false `.ub`.
+
+Modeling assumption: signed and unsigned integer scalars of equal byte width
+share the same `Value.scalar` representation and unrestricted validity range.
 -/
 @[reducible]
 def copyContainerStrideOk
@@ -1861,15 +1930,29 @@ def copyContainerStrideOk
     Bool :=
   match elemKindOpt, pointeeOpt with
   | .some ek, .some pt =>
-    match sameRigidTyShape ek pt.kind with
+    match rigidTyEq ek pt.kind with
     | true => true
     | false =>
-      match isPrimitiveScalarKind ek, rigidTyKindByteSize ek, elemSzOpt with
-      | true, .some ekSz, .some elemSz => Nat.beq ekSz elemSz
-      | _, _, _ => false
-  | _, _ =>
+      match
+        isUnrestrictedIntKind ek,
+        isUnrestrictedIntKind pt.kind,
+        rigidTyKindByteSize ek,
+        elemSzOpt
+      with
+      | true, true, .some ekSz, .some elemSz => Nat.beq ekSz elemSz
+      | _, _, _, _ => false
+  | .none, .some pt =>
     match elemSzOpt with
-    | .some elemSz => elemsMatchByteStride elems elemSz
+    | .some elemSz => elemsAllMatchPointeeRep pt elemSz elems
+    | .none => false
+  | .some ek, .none =>
+    match isUnrestrictedIntKind ek, rigidTyKindByteSize ek, elemSzOpt with
+    | true, .some ekSz, .some elemSz =>
+      Bool.and (Nat.beq ekSz elemSz) (elemsAllScalarsOfSize elemSz elems)
+    | _, _, _ => false
+  | .none, .none =>
+    match elemSzOpt with
+    | .some elemSz => elemsAllScalarsOfSize elemSz elems
     | .none => false
 
 /--
@@ -2202,30 +2285,225 @@ def copySliceElements
     | _, _ => .unsupported
 
 /--
+Whether `k` is a primitive scalar `RigidTy` whose byte representation is
+layout-table-independent and supported by `Bytes.lean` (`encodeValueToBytes` /
+`decodeValueFromBytes`): integer scalars, `bool`, and `char`.
+-/
+@[reducible]
+def isLayoutIndepScalarKind : RigidTy → Bool
+  | .uint _ => true
+  | .int _ => true
+  | .bool => true
+  | .char => true
+  | _ => false
+
+/--
+Whether `k` has a layout-table-independent exact byte representation in
+`Bytes.lean` (primitive scalars, zero-sized `()`/`fnDef`, and arrays of
+layout-independent primitive scalars or length `0`).
+-/
+@[reducible]
+def isLayoutIndepByteKind : RigidTy → Bool
+  | .uint _ => true
+  | .int _ => true
+  | .bool => true
+  | .char => true
+  | .tuple .nil => true
+  | .fnDef _ _ => true
+  | .array ek n => Bool.or (Nat.beq n 0) (isLayoutIndepScalarKind ek)
+  | _ => false
+
+/--
+Whether every `RigidTy` in `ks` satisfies `isLayoutIndepScalarKind`.
+-/
+def listAllLayoutIndepScalar : List RigidTy → Bool
+  | .nil => true
+  | k :: rest =>
+    match isLayoutIndepScalarKind k with
+    | true => listAllLayoutIndepScalar rest
+    | false => false
+
+/--
+Whether a `ScalarLayout` represents a non-pointer integer scalar (so
+`decodeScalarLayoutBytes` produces `Value.scalar` without fabricating pointer
+provenance from raw integer bytes).
+-/
+@[reducible]
+def scalarLayoutIsNonPtr : ScalarLayout → Bool
+  | .initialized (.int _ _) _ => true
+  | .union (.int _ _) => true
+  | _ => false
+
+/--
+Whether every layout index in `flIdxs` resolves in `layouts` to a live
+single-variant non-pointer primitive scalar layout (`FieldsShape.primitive`),
+so `decodeValueFromBytes`'s `fieldLayouts` path decodes each field without
+synthesizing `layoutIdx := 0`, fabricating pointer provenance, or guessing
+field spans.
+-/
+def fieldLayoutsAllPrimitive (layouts : LayoutTable) : List Nat → Bool
+  | .nil => true
+  | flIdx :: rest =>
+    match LayoutTable.lookup layouts flIdx with
+    | .some {
+        isUninhabited := false,
+        variants := .single _,
+        fields := .primitive,
+        backendRepr := .scalar sl, .. } =>
+      match scalarLayoutIsNonPtr sl with
+      | true => fieldLayoutsAllPrimitive layouts rest
+      | false => false
+    | _ => false
+
+/--
+Whether `encodeValueToBytes defaultCodecFuel layouts ty v` produces the exact
+in-memory byte representation of `v : ty` without falling back to untyped
+declaration-order field concatenation (which ignores `repr(Rust)` field
+reordering, padding, and enum tags/niches).
+
+Reference (The Rust Reference 1.98.0, "Type layout — The Rust representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
+
+> "There are no guarantees of data layout made by this representation."
+
+Justification: `encodeValueToBytes` only captures exact Rust memory bytes when
+either the type's byte layout is fixed independently of `LayoutTable`
+(`isLayoutIndepByteKind`), or a captured `TypeLayout` entry provides explicit
+`FieldsShape.arbitrary` field offsets (or `.primitive`) for a non-generic
+single-variant struct/tuple whose fields are flat scalars. Enums, generic ADTs,
+and layout-free tuples/structs fail closed so the byte copy never fabricates
+wrong bytes.
+-/
+@[reducible]
+def srcValHasExactByteEncoding
+    (layouts : LayoutTable)
+    (ty : Ty)
+    (v : Value) :
+    Bool :=
+  match isLayoutIndepByteKind ty.kind with
+  | true => true
+  | false =>
+    match ty.kind with
+    | .tuple (kHead :: kTail) =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l =>
+        match l.isUninhabited, l.fields with
+        | false, .arbitrary offsets _ =>
+          Bool.and
+            (Nat.beq (length offsets) (length (kHead :: kTail)))
+            (listAllLayoutIndepScalar (kHead :: kTail))
+        | _, _ => false
+      | .none => false
+    | .adt _ .nil =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l =>
+        match l.isUninhabited, l.variants, l.fields with
+        | false, .single _, .primitive => true
+        | false, .single _, .arbitrary .nil _ => true
+        | false, .single _, .arbitrary offsets _ =>
+          match v with
+          | .aggregate _ fieldVals =>
+            Bool.and
+              (Nat.beq (length offsets) (length fieldVals))
+              (allFlatScalarValues fieldVals)
+          | _ => false
+        | _, _, _ => false
+      | .none => false
+    | _ => false
+
+/--
+Whether `decodeValueFromBytes defaultCodecFuel layouts ty bs` decodes `bs` into
+an exact value of `ty` without falling back to declaration-order tuple decoding,
+synthetic `layoutIdx := 0` element lookups, or guessed span decoding.
+
+Reference (The Rust Reference 1.98.0, "Type layout — The Rust representation"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#the-rust-representation>
+
+> "There are no guarantees of data layout made by this representation."
+
+Justification: decoding raw bytes into a tuple or struct without explicit
+captured field offsets and per-field scalar layouts would fabricate a
+declaration-order layout that Rust does not guarantee. Restricting decoding to
+`isLayoutIndepByteKind` types and explicitly laid-out single-variant structs or
+tuples ensures every committed value matches the captured Rust layout.
+-/
+@[reducible]
+def dstTyHasExactByteDecode
+    (layouts : LayoutTable)
+    (ty : Ty) :
+    Bool :=
+  match isLayoutIndepByteKind ty.kind with
+  | true => true
+  | false =>
+    match ty.kind with
+    | .tuple (kHead :: kTail) =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l =>
+        match l.isUninhabited, l.fields with
+        | false, .arbitrary offsets _ =>
+          Bool.and
+            (Nat.beq (length offsets) (length (kHead :: kTail)))
+            (listAllLayoutIndepScalar (kHead :: kTail))
+        | _, _ => false
+      | .none => false
+    | .adt _ .nil =>
+      match LayoutTable.lookup layouts ty.layoutIdx with
+      | .some l =>
+        match l.isUninhabited, l.variants, l.fields with
+        | false, .single _, .primitive =>
+          match l.backendRepr with
+          | .scalar sl => scalarLayoutIsNonPtr sl
+          | _ => false
+        | false, .single _, .arbitrary .nil _ => true
+        | false, .single _, .arbitrary offsets _ =>
+          match
+            Bool.and
+              (Nat.beq (length l.fieldLayouts) (length offsets))
+              (fieldLayoutsAllPrimitive layouts l.fieldLayouts)
+          with
+          | true => true
+          | false =>
+            match offsets, l.backendRepr with
+            | _ :: .nil, .scalar s0 => scalarLayoutIsNonPtr s0
+            | _ :: _ :: .nil, .scalarPair s0 s1 =>
+              Bool.and (scalarLayoutIsNonPtr s0) (scalarLayoutIsNonPtr s1)
+            | _, _ => false
+        | _, _, _ => false
+      | .none => false
+    | _ => false
+
+/--
 Byte-level path of a multi-element or sub-place `copy_nonoverlapping` when at
 least one endpoint is not an array or slice (`copyViaBytes`): the source bytes
-are the untyped encoding of the source value, and they are placed into the
-destination only where the model can place them exactly.
+are obtained by layout-faithful encoding of the source value
+(`encodeValueToBytes` guarded by `srcValHasExactByteEncoding` for declared
+active locals, or scalar-only untyped encoding for untyped scalar slices and
+scalars), and they are placed into the destination only where the model can
+place them with an exact captured layout (`dstTyHasExactByteDecode`).
 
 - An access that is certainly outside its allocation is undefined behavior
   (`copyAccessFitsAlloc?` at `count * size_of::<T>()` bytes).
 - Source: the source is sliced by element only when it is a genuine array or
-  slice whose elements have the copied element size
-  (`elemsMatchByteStride`); otherwise the whole pointed-to value is encoded,
-  which requires the pointer to sit at the start of that value
-  (`srcPtr.offsetBytes = 0`). The encoded length must equal
-  `count * size_of::<T>()` when that is known.
+  slice whose elements have the copied element size (`elemsMatchByteStride`)
+  and are layout-independent primitive scalars (or untyped flat scalars);
+  otherwise the whole pointed-to value is encoded at `srcPtr.offsetBytes = 0`
+  only when its exact byte layout is known (`srcValHasExactByteEncoding` for
+  declared locals, or `.scalar`/`.unit` for untyped targets). The encoded
+  length must equal `count * size_of::<T>()` when that is known.
 - Destination: raw bytes are spliced only into a byte container (`[u8; N]`,
   `[i8; N]`, a byte slice, or an untyped sequence of one-byte scalars) at the
   byte index of the pointer; otherwise the bytes are decoded as one whole value
-  of the pointed-to place (or of its enclosing array when the pointer is at
-  element `0`), which requires `dstPtr.offsetBytes = 0` and an exact size match.
+  of the layout-resolved pointed-to place (`placeTyResolved`, or its enclosing
+  array when the pointer is at element `0`) guarded by
+  `dstTyHasExactByteDecode`, requiring `dstPtr.offsetBytes = 0` and an exact
+  size match.
 - The accessed source and destination places must not overlap; the outcome
   names exactly those places for the Tree Borrows read-then-write transition
   (`borrowsAfterCopySlice`, applied by `evalCopySubplaceMulti`).
 - Every remaining case (a partial read or write of a value, a pointer into the
-  middle of a value, a type-punned sequence) is inside the allocation as far as
-  the model knows and fails closed with `.unsupported`.
+  middle of a value, an enum or layout-free `repr(Rust)` aggregate, or a
+  type-punned sequence) is inside the allocation as far as the model knows and
+  fails closed with `.unsupported`.
 
 Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
@@ -2240,20 +2518,22 @@ Reference (`core::ptr`, "Safety", Rust 1.98.0):
 
 > "For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that the pointer be dereferenceable. The provenance of the pointer is used to determine which allocation it is derived from; a pointer is dereferenceable if the memory range of the given size starting at the pointer is entirely contained within the bounds of that allocation. Note that in Rust, every (stack-allocated) variable is considered a separate allocation."
 
-Justification: a "bitwise copy" writes exactly the source bytes at the
-destination pointer. Splicing bytes element-wise is exact only when each
-destination element is one byte, and decoding a whole value is exact only when
-the written range is exactly the range of that value; every other placement
-would write a different set of bytes than the copy does, so it is not modeled.
-Undefined behavior is reported only when a necessary validity condition fails
-(the access is certainly outside the allocation), when the accessed places
-overlap, or when the aliasing model rejects the accesses.
+Justification: a "bitwise copy" reads and writes exact in-memory bytes.
+Splicing bytes element-wise is exact only when each destination element is one
+byte, and layout-faithful encoding/decoding via `placeTyResolved` and
+`srcValHasExactByteEncoding` / `dstTyHasExactByteDecode` prevents silent
+declaration-order fabrication for `repr(Rust)` structs/tuples, enums, and
+synthetic `layoutIdx := 0` collisions. Undefined behavior is reported only when
+a necessary validity condition fails (the access is certainly outside the
+allocation), when the accessed places overlap, or when the aliasing model
+rejects the accesses.
 
 Modeling assumptions and unsupported behavior: bytes that `decodeValueFromBytes`
-does not decode at the destination type, or untyped caller-owned aggregate
-destinations whose field layout is unknown, fail closed with `.unsupported`; a
-copy between two pointers with the same tag is undefined behavior as in the
-single-element path.
+does not decode at the destination type, sources or destinations without an
+exact captured byte layout (such as enums, layout-free tuples/structs, or
+untyped caller-owned aggregates), and raw-byte pointer reinterpretation fail
+closed with `.unsupported`; a copy between two pointers with the same tag is
+undefined behavior as in the single-element path.
 -/
 def copyBytesSubplace
     (localDecls : List LocalDecl)
@@ -2303,14 +2583,14 @@ def copyBytesSubplace
       match resolveBorrowProjectionElems locals dstEp.entry.targetProjection with
       | .some rp => normalizeSubsliceProjections rp
       | .none => dstEp.entry.targetProjection
-    let wholeSrc : Option (Value × List ProjectionElem) :=
+    let wholeSrc : Option (Value × List ProjectionElem × Option (List ProjectionElem × List Value)) :=
       match Nat.beq srcEp.ptr.offsetBytes 0, srcEp.rootValOpt with
       | true, .some srcRootVal =>
         match readProjectedValue locals srcRootVal srcEp.entry.targetProjection with
-        | .ok srcSubVal => .some (srcSubVal, srcResolvedProj)
+        | .ok srcSubVal => .some (srcSubVal, srcResolvedProj, .none)
         | _ => .none
       | _, _ => .none
-    let srcSlice : Option (Value × List ProjectionElem) :=
+    let srcSlice : Option (Value × List ProjectionElem × Option (List ProjectionElem × List Value)) :=
       match srcWinOpt, sliceElemSzOpt with
       | .some (srcParentProj, srcBaseIdx, srcElems), .some elemSz =>
         match
@@ -2321,9 +2601,11 @@ def copyBytesSubplace
           let effSrcStart := Nat.add srcBaseIdx srcOff
           match Nat.ble (Nat.add effSrcStart n) (length srcElems) with
           | true =>
+            let slicedElems := takeValues n (dropValues effSrcStart srcElems)
             .some
-              (.aggregate 0 (takeValues n (dropValues effSrcStart srcElems)),
-                copySliceWindowProj srcParentProj effSrcStart n (length srcElems))
+              (.aggregate 0 slicedElems,
+                copySliceWindowProj srcParentProj effSrcStart n (length srcElems),
+                .some (srcParentProj, slicedElems))
           | false => .none
         | _, _ => wholeSrc
       | _, _ => wholeSrc
@@ -2332,8 +2614,59 @@ def copyBytesSubplace
       match srcEp.rootValOpt with
       | .none => .ub
       | .some _ => .unsupported
-    | .some (sVal, srcEffProj) =>
-      match encodeUntypedValueToBytes defaultCodecFuel sVal with
+    | .some (sVal, srcEffProj, sliceInfoOpt) =>
+      let bsOpt : Option (List AbstractByte) :=
+        match sliceInfoOpt with
+        | .some (srcParentProj, slicedElems) =>
+          match
+            copyContainerElemKind?
+              localDecls
+              layouts
+              locals
+              srcEp.entry.targetLocal
+              srcParentProj
+          with
+          | .some ek =>
+            let ekExact : Bool :=
+              match isLayoutIndepScalarKind ek with
+              | true => true
+              | false =>
+                match ek with
+                | .tuple .nil | .fnDef _ _ => true
+                | _ => false
+            match ekExact with
+            | true =>
+              encodeValueToBytes
+                defaultCodecFuel
+                layouts
+                { kind := .array ek (length slicedElems), layoutIdx := unresolvedLayoutIdx layouts }
+                sVal
+            | false => .none
+          | .none =>
+            match allFlatScalarValues slicedElems with
+            | true => encodeUntypedValueToBytes defaultCodecFuel sVal
+            | false => .none
+        | .none =>
+          let srcPlaceTyOpt : Option Ty :=
+            match get? locals srcEp.entry.targetLocal with
+            | .some _ =>
+              placeTyResolved
+                localDecls
+                layouts
+                { local_ := srcEp.entry.targetLocal
+                  projection := srcEp.entry.targetProjection }
+            | .none => .none
+          match srcPlaceTyOpt with
+          | .some srcTy =>
+            match srcValHasExactByteEncoding layouts srcTy sVal with
+            | true => encodeValueToBytes defaultCodecFuel layouts srcTy sVal
+            | false => .none
+          | .none =>
+            match sVal with
+            | .scalar _ => encodeUntypedValueToBytes defaultCodecFuel sVal
+            | .unit => encodeUntypedValueToBytes defaultCodecFuel sVal
+            | _ => .none
+      match bsOpt with
       | .none => .unsupported
       | .some bs =>
         let lenOk : Bool :=
@@ -2411,7 +2744,7 @@ def copyBytesSubplace
                 let dstPlaceTyOpt : Option Ty :=
                   match get? locals dstLocal with
                   | .some _ =>
-                    placeTy
+                    placeTyResolved
                       localDecls
                       layouts
                       { local_ := dstLocal, projection := dstEp.entry.targetProjection }
@@ -2431,18 +2764,8 @@ def copyBytesSubplace
                           match dstSubVal with
                           | .scalar sc =>
                             Bool.and
-                              (isPrimitiveScalarKind pt.kind)
+                              (isLayoutIndepScalarKind pt.kind)
                               (Nat.beq ptBytes sc.sizeBytes)
-                          | .ptr _ ptrSz =>
-                            let isThinPtrTy : Bool :=
-                              match pt.kind with
-                              | .fnPtr _ _ _ _ => true
-                              | .rawPtr _ pointee | .ref _ pointee =>
-                                match pointee with
-                                | .slice _ | .str | .dynamic _ => false
-                                | _ => true
-                              | _ => false
-                            Bool.and isThinPtrTy (Nat.beq ptBytes ptrSz)
                           | _ => false
                         match repExact with
                         | true => .some pt
@@ -2459,20 +2782,23 @@ def copyBytesSubplace
                     | _, _ => true
                   match canWriteToSlot, tyOpt with
                   | true, .some dstTy =>
-                    match rigidTyByteSize layouts dstTy with
-                    | .none => .none
-                    | .some dstBytes =>
-                      match Nat.beq (length bs) dstBytes with
-                      | false => .none
-                      | true =>
-                        match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
-                        | .some decodedVal =>
-                          .some
-                            (commit
-                              { local_ := dstLocal, projection := dstProj }
-                              decodedVal
-                              dstEffProj)
-                        | .none => .none
+                    match dstTyHasExactByteDecode layouts dstTy with
+                    | false => .none
+                    | true =>
+                      match rigidTyByteSize layouts dstTy with
+                      | .none => .none
+                      | .some dstBytes =>
+                        match Nat.beq (length bs) dstBytes with
+                        | false => .none
+                        | true =>
+                          match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
+                          | .some decodedVal =>
+                            .some
+                              (commit
+                                { local_ := dstLocal, projection := dstProj }
+                                decodedVal
+                                dstEffProj)
+                          | .none => .none
                   | _, _ => .none
                 match decodeAt dstTargetTyOpt dstEp.entry.targetProjection dstResolvedProj with
                 | .some outcome => outcome
@@ -2482,7 +2808,7 @@ def copyBytesSubplace
                     let parentTyOpt : Option Ty :=
                       match get? locals dstLocal with
                       | .some _ =>
-                        placeTy
+                        placeTyResolved
                           localDecls
                           layouts
                           { local_ := dstLocal, projection := dstParentProj }
@@ -2501,7 +2827,7 @@ def copyBytesSubplace
                         let parentTyOpt : Option Ty :=
                           match get? locals dstLocal with
                           | .some _ =>
-                            placeTy
+                            placeTyResolved
                               localDecls
                               layouts
                               { local_ := dstLocal, projection := initProj }

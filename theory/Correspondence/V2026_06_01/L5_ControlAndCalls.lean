@@ -7021,6 +7021,174 @@ theorem ep1_a1_subplace_copy_and_opaquecast_hardening :
     callConvCanUnwind? .c = .none := by
   exact ⟨rfl, rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩, rfl, ⟨rfl, rfl⟩, rfl, rfl⟩
 
+/--
+Kernel-checked regression witnesses for `ep1-B2` hardening across `Statements.lean`:
+1. `copyBytesSubplace` encodes a reordered `repr(Rust)` struct (`Swapped { a @ 4, b @ 0 }`)
+   using its captured `TypeLayout` (writing `0x00000001_00000002`, not declaration-order
+   `0x00000002_00000001`), and fails closed with `.unsupported` on enum sources, untyped
+   caller-owned enums, and layout-free `repr(Rust)` tuple sources and destinations.
+2. `copyBytesSubplace` resolves destination element types via `placeTyResolved` and
+   `dstTyHasExactByteDecode`: copying 4 bytes into `&raw mut arr[0]` (`arr : [S; 2]`,
+   `S` at `layoutIdx = 2` while `entries[0]` is 8-byte `u64`) decodes `S` accurately, and
+   copying 8 bytes fails closed with `.unsupported` rather than reading `entries[0]`.
+3. `copyContainerStrideOk` rejects `[u8; 4]` into `[bool; 4]`, `[Wrap; 2]` into `[u32; 2]`,
+   `[(u8, u8); 2]` into `[(u32, u64); 2]`, and untyped `callerLocals` `[(u16, u16); 2]`
+   against `u32`, while still accepting `[u32; 2]` into `[i32; 2]`.
+-/
+theorem ep1_b2_subplace_copy_layout_and_stride_hardening :
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let u64Ty : Ty := { kind := .uint .u64, layoutIdx := 0 }
+    let dummyLayout : TypeLayout :=
+      { size := { bytes := 1 }, align := { bytes := 1 },
+        backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 255 }),
+        fields := .primitive, variants := .single 0, isUninhabited := false }
+    let swappedLayout : TypeLayout :=
+      { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+        fields := .arbitrary ({ bytes := 4 } :: { bytes := 0 } :: .nil) (1 :: 0 :: .nil),
+        variants := .single 0, isUninhabited := false }
+    let ltSwap : LayoutTable :=
+      { pointerBits := 64, isLittleEndian := true, entries := dummyLayout :: swappedLayout :: .nil }
+    let swappedTy : Ty := { kind := .adt "Swapped" .nil, layoutIdx := 1 }
+    let srcEntry0 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetFrameDepth := 0, targetProjection := .nil, perm := .frozen }
+    let dstEntry1 : BorrowEntry :=
+      { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+    -- 1. Reordered repr(Rust) struct source -> u64 gets exact layout-ordered bytes (4294967298).
+    (let declsSwap : List LocalDecl :=
+       { mutability := .not, ty := swappedTy, debugName := .none } ::
+       { mutability := .mut, ty := u64Ty, debugName := .none } :: .nil
+     let swapVal : Value := .aggregate 0 (.scalar ⟨1, 4⟩ :: .scalar ⟨2, 4⟩ :: .nil)
+     let sEp : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some swapVal, pointeeOpt := .some u8Ty }
+     let dEp : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨0, 8⟩), pointeeOpt := .some u8Ty }
+     copyBytesSubplace declsSwap ltSwap
+       (.init swapVal :: .init (.scalar ⟨0, 8⟩) :: .nil) .nil .nil sEp dEp (.some 1) 8 .none .none =
+       .write { local_ := 1, projection := .nil } (.scalar ⟨4294967298, 8⟩) .nil .nil) ∧
+    -- 2. Enum source (declared & untyped callerLocals) and layout-free tuple src/dst fail closed.
+    (let enumLayout : TypeLayout :=
+       { size := { bytes := 8 }, align := { bytes := 4 }, backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: .nil) (0 :: .nil),
+         variants := .multiple (.initialized (.int 32 false) { start := 0, end_ := 1 }) 0
+           ((.arbitrary ({ bytes := 4 } :: .nil) (0 :: .nil)) ::
+            (.arbitrary ({ bytes := 4 } :: .nil) (0 :: .nil)) :: .nil),
+         variantDiscriminants := 0 :: 1 :: .nil, isUninhabited := false }
+     let ltEnum : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true, entries := dummyLayout :: enumLayout :: .nil }
+     let enumTy : Ty := { kind := .adt "E" .nil, layoutIdx := 1 }
+     let declsEnum : List LocalDecl :=
+       { mutability := .not, ty := enumTy, debugName := .none } ::
+       { mutability := .mut, ty := u32Ty, debugName := .none } :: .nil
+     let enumVal : Value := .aggregate 1 (.scalar ⟨42, 4⟩ :: .nil)
+     let sEpEnum : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some enumVal, pointeeOpt := .some u8Ty }
+     let dEpU32 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨0, 4⟩), pointeeOpt := .some u8Ty }
+     let tupTy : Ty := { kind := .tuple (.uint .u32 :: .uint .u32 :: .nil), layoutIdx := 0 }
+     let tupVal : Value := .aggregate 0 (.scalar ⟨1, 4⟩ :: .scalar ⟨2, 4⟩ :: .nil)
+     let declsTupSrc : List LocalDecl :=
+       { mutability := .not, ty := tupTy, debugName := .none } ::
+       { mutability := .mut, ty := u64Ty, debugName := .none } :: .nil
+     let sEpTup : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some tupVal, pointeeOpt := .some u8Ty }
+     let dEpU64 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨0, 8⟩), pointeeOpt := .some u8Ty }
+     let declsTupDst : List LocalDecl :=
+       { mutability := .not, ty := u64Ty, debugName := .none } ::
+       { mutability := .mut, ty := tupTy, debugName := .none } :: .nil
+     let sEpU64 : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.scalar ⟨1, 8⟩), pointeeOpt := .some u8Ty }
+     let dEpTup : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some tupVal, pointeeOpt := .some u8Ty }
+     let callerEnumEntry : BorrowEntry :=
+       { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .frozen }
+     let sEpCallerEnum : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := callerEnumEntry,
+         rootValOpt := .some enumVal, pointeeOpt := .some u8Ty }
+     let dstEntry0 : BorrowEntry :=
+       { tag := 2, targetLocal := 0, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+     let dEpU32At0 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry0,
+         rootValOpt := .some (.scalar ⟨0, 4⟩), pointeeOpt := .some u8Ty }
+     copyBytesSubplace declsEnum ltEnum (.init enumVal :: .init (.scalar ⟨0, 4⟩) :: .nil)
+       .nil .nil sEpEnum dEpU32 (.some 1) 4 .none .none = .unsupported ∧
+     copyBytesSubplace declsTupSrc emptyLayoutTable (.init tupVal :: .init (.scalar ⟨0, 8⟩) :: .nil)
+       .nil .nil sEpTup dEpU64 (.some 1) 8 .none .none = .unsupported ∧
+     copyBytesSubplace declsTupDst emptyLayoutTable (.init (.scalar ⟨1, 8⟩) :: .init tupVal :: .nil)
+       .nil .nil sEpU64 dEpTup (.some 1) 8 .none .none = .unsupported ∧
+     copyBytesSubplace ({ mutability := .mut, ty := u32Ty, debugName := .none } :: .nil)
+       emptyLayoutTable (.init (.scalar ⟨0, 4⟩) :: .nil) (.uninit :: .init enumVal :: .nil) .nil
+       sEpCallerEnum dEpU32At0 (.some 1) 4 .none .none = .unsupported) ∧
+    -- 3. placeTyResolved avoids layouts.entries[0] collision on [S; 2][0].
+    (let u64Layout : TypeLayout :=
+       { size := { bytes := 8 }, align := { bytes := 8 },
+         backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 0 }),
+         fields := .primitive, variants := .single 0, isUninhabited := false }
+     let arr2SLayout : TypeLayout :=
+       { size := { bytes := 8 }, align := { bytes := 2 }, backendRepr := .memory,
+         fields := .array { bytes := 4 } 2, fieldLayouts := 2 :: .nil,
+         variants := .single 0, isUninhabited := false }
+     let sLayout : TypeLayout :=
+       { size := { bytes := 4 }, align := { bytes := 2 }, backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: { bytes := 2 } :: .nil) (0 :: 1 :: .nil),
+         fieldLayouts := 3 :: 3 :: .nil, variants := .single 0, isUninhabited := false }
+     let u16Layout : TypeLayout :=
+       { size := { bytes := 2 }, align := { bytes := 2 },
+         backendRepr := .scalar (.initialized (.int 16 false) { start := 0, end_ := 65535 }),
+         fields := .primitive, variants := .single 0, isUninhabited := false }
+     let ltArr : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true,
+         entries := u64Layout :: arr2SLayout :: sLayout :: u16Layout :: .nil }
+     let arr2STy : Ty := { kind := .array (.adt "S" .nil) 2, layoutIdx := 1 }
+     let dstEntryIdx0 : BorrowEntry :=
+       { tag := 2, targetLocal := 1, targetFrameDepth := 0,
+         targetProjection := .constantIndex 0 1 false :: .nil, perm := .active }
+     let sValInit : Value := .aggregate 0 (.scalar ⟨9, 2⟩ :: .scalar ⟨9, 2⟩ :: .nil)
+     let dstArr : Value := .aggregate 0 (sValInit :: sValInit :: .nil)
+     let dstWin := Option.some (.nil, 0, sValInit :: sValInit :: .nil)
+     let decls4 : List LocalDecl :=
+       { mutability := .not, ty := u32Ty, debugName := .none } ::
+       { mutability := .mut, ty := arr2STy, debugName := .none } :: .nil
+     let sEp4 : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.scalar ⟨0x00020001, 4⟩), pointeeOpt := .some u8Ty }
+     let dEpIdx0 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntryIdx0,
+         rootValOpt := .some dstArr, pointeeOpt := .some u8Ty }
+     let decls8 : List LocalDecl :=
+       { mutability := .not, ty := u64Ty, debugName := .none } ::
+       { mutability := .mut, ty := arr2STy, debugName := .none } :: .nil
+     let sEp8 : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some (.scalar ⟨0, 8⟩), pointeeOpt := .some u8Ty }
+     copyBytesSubplace decls4 ltArr (.init (.scalar ⟨0x00020001, 4⟩) :: .init dstArr :: .nil)
+       .nil .nil sEp4 dEpIdx0 (.some 1) 4 .none dstWin =
+       .write { local_ := 1, projection := .constantIndex 0 1 false :: .nil }
+         (.aggregate 0 (.scalar ⟨1, 2⟩ :: .scalar ⟨2, 2⟩ :: .nil))
+         .nil (.constantIndex 0 1 false :: .nil) ∧
+     copyBytesSubplace decls8 ltArr (.init (.scalar ⟨0, 8⟩) :: .init dstArr :: .nil)
+       .nil .nil sEp8 dEpIdx0 (.some 1) 8 .none dstWin = .unsupported) ∧
+    -- 4. copyContainerStrideOk rejects type-confused slices and allows same-width integer slices.
+    (let wrapTy : Ty := { kind := .adt "Wrap" .nil, layoutIdx := 0 }
+     let pairU8Ty : Ty := { kind := .tuple (.uint .u8 :: .uint .u8 :: .nil), layoutIdx := 0 }
+     let aggU16Pair : Value := .aggregate 0 (.scalar ⟨1, 2⟩ :: .scalar ⟨2, 2⟩ :: .nil)
+     copyContainerStrideOk (.some .bool) (.some u8Ty) (.scalar ⟨0, 1⟩ :: .nil) (.some 1) = false ∧
+     copyContainerStrideOk (.some (.uint .u32)) (.some wrapTy) (.scalar ⟨0, 4⟩ :: .nil) (.some 4) = false ∧
+     copyContainerStrideOk (.some (.tuple (.uint .u32 :: .uint .u64 :: .nil))) (.some pairU8Ty)
+       .nil (.some 2) = false ∧
+     copyContainerStrideOk .none (.some u32Ty) (aggU16Pair :: .nil) (.some 4) = false ∧
+     copyContainerStrideOk (.some (.int .i32)) (.some u32Ty) (.scalar ⟨0, 4⟩ :: .nil) (.some 4) = true) := by
+  exact ⟨rfl, ⟨rfl, rfl, rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
+
 end SubplaceCopyTailCallOpaqueCastHardening
 
 end Correspondence.V2026_06_01.L5_ControlAndCalls
