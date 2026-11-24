@@ -3217,6 +3217,171 @@ theorem tb_protector_release_then_deallocate_witness :
     (boxRefAlloc (.Prot (.Frozen true))) 32 (by decide) rfl (by decide) rfl rfl rfl rfl rfl rfl
   exact ⟨tbm1, tbm2, h1, h2⟩
 
+/-- Unprotecting a uniform vector of protected `Unique` (`&mut T`) permissions
+yields unprotected `Unique` with a protector-end write access at every byte. -/
+theorem mapM_unprotect_unique (n : Nat) :
+    (List.replicate n (Permission.Prot .Unique)).mapM Permission.unprotect =
+      .ok (List.replicate n (Permission.Unprot .Unique, some AccessKind.Write)) := by
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+    rw [List.replicate_succ, List.replicate_succ, List.mapM_cons, ih]
+    rfl
+
+/-- The protector-end writes as local accesses keep a uniform `Unique` vector. -/
+theorem releaseProtectorPermissions_local_write_unique (total : Nat) :
+    ∀ (k offset : Nat), offset + k ≤ total →
+      Node.releaseProtectorPermissions .Local offset (List.replicate k (some .Write))
+          (List.replicate total (Permission.Unprot .Unique)) =
+        .ok (List.replicate total (Permission.Unprot .Unique))
+  | 0, _, _ => rfl
+  | k + 1, offset, hle => by
+    have hlt : offset < total := by omega
+    have hidx : listIndex (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        "Node::release_protector" = .ok (Permission.Unprot .Unique) := by
+      rw [listIndex_eq_ok_iff]
+      refine ⟨Int.natCast_nonneg _, ?_⟩
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.getElem?_replicate, hlt, ↓reduceIte]
+    have hset : listSet (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        (Permission.Unprot .Unique) "Node::release_protector" =
+        .ok (List.replicate total (Permission.Unprot .Unique)) := by
+      unfold listSet
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.length_replicate,
+        Int.natCast_nonneg, hlt, and_self, ↓reduceIte, list_set_replicate_same]
+      rfl
+    have htr : Permission.transition (.Unprot .Unique) .Write .Local = .ok (.Unprot .Unique) := rfl
+    rw [List.replicate_succ]
+    unfold Node.releaseProtectorPermissions listMutateAt
+    simp only [hidx, htr, hset, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    exact releaseProtectorPermissions_local_write_unique total k (offset + 1) (by omega)
+
+/-- Unprotecting the strongly protected `Unique` (`&mut T`) child. -/
+theorem unprotectNode_unique (n : Nat) :
+    unprotectNode ⟨[], List.replicate n (.Prot .Unique), .Strong⟩ =
+      .ok (List.replicate n (some AccessKind.Write),
+        ⟨[], List.replicate n (.Unprot .Unique), .Strong⟩) := by
+  unfold unprotectNode
+  have hy : Protected.yes .Strong = true := rfl
+  show (if (!Protected.yes .Strong) = true then _ else _) = _
+  rw [hy]
+  show (do
+    let pairs ← (List.replicate n (Permission.Prot .Unique)).mapM Permission.unprotect
+    pure (pairs.map Prod.snd, (⟨[], pairs.map Prod.fst, .Strong⟩ : Node))) = _
+  rw [mapM_unprotect_unique]
+  simp [bind, Except.bind, pure, Except.pure, List.map_replicate]
+
+/-- `Node::access_node` on a strongly protected `Unique` child unprotects it. -/
+theorem access_node_unprotect_boxRefTree_unique (n : Nat) :
+    Node.access_node unprotectNode [0] (boxRefTree n (.Prot .Unique) .Strong) =
+      .ok (List.replicate n (some AccessKind.Write),
+        ⟨[⟨[], List.replicate n (.Unprot .Unique), .Strong⟩],
+          List.replicate n (.Unprot .Unique), .No⟩) := by
+  rw [boxRefTree, access_node_single_child, unprotectNode_unique]
+  rfl
+
+/-- `Node::release_protector` from the root after unprotecting a `Unique` child. -/
+theorem release_protector_boxRefTree_unique (n : Nat) :
+    Node.release_protector
+        ⟨[⟨[], List.replicate n (.Unprot .Unique), .Strong⟩], List.replicate n (.Unprot .Unique), .No⟩
+        (some [0]) (List.replicate n (some AccessKind.Write)) =
+      .ok (boxRefTree n (.Unprot .Unique) .No) := by
+  simp only [Node.release_protector, Option.isSome, ↓reduceIte, Node.releaseProtectorChildren,
+    releaseProtectorPermissions_local_write_unique n n 0 (by omega)]
+  rfl
+
+/-- `TreeBorrowsMemory::release_protector` on a strongly protected `Unique` child
+over any live allocation. -/
+theorem tb_release_protector_boxRefTree_unique (tbm : TBM) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root = boxRefTree n (.Prot .Unique) .Strong) :
+    TreeBorrowsMemory.release_protector tbm (id, [0]) =
+      .ok { tbm with mem := { tbm.mem with allocations :=
+        (tbm.mem.allocations.set id._0.toNat
+          { a with extra := { root := boxRefTree n (.Unprot .Unique) .No } }) } } := by
+  have hacc := access_node_unprotect_boxRefTree_unique n
+  unfold unprotectNode at hacc
+  have hidx : listIndex tbm.mem.allocations id._0 "TreeBorrowsMemory::release_protector" = .ok a :=
+    listIndex_eq_ok_iff.mpr ⟨hi, hget⟩
+  have hset := listSet_of_getElem?
+    (x := ({ a with live := true, extra := { root := boxRefTree n (.Unprot .Unique) .No } } :
+      Allocation Path TreeBorrowsAllocationExtra))
+    (what := "TreeBorrowsMemory::release_protector") hi hget
+  unfold TreeBorrowsMemory.release_protector listMutateAt
+  simp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure] at hacc ⊢
+  simp only [hidx, hroot, hacc, hlive, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    release_protector_boxRefTree_unique, hset]
+
+/-- `TreeBorrowsMemory::end_call` releasing a strongly protected `Unique` child. -/
+theorem tb_end_call_boxRefTree_unique (tbm : TBM) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root = boxRefTree n (.Prot .Unique) .Strong) :
+    TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } =
+      .ok { tbm with mem := { tbm.mem with allocations :=
+        (tbm.mem.allocations.set id._0.toNat
+          { a with extra := { root := boxRefTree n (.Unprot .Unique) .No } }) } } := by
+  unfold TreeBorrowsMemory.end_call
+  simp only [List.foldlM_cons, List.foldlM_nil,
+    tb_release_protector_boxRefTree_unique tbm id a n hi hget hlive hroot]
+  rfl
+
+/-- After a `Unique` child protector is released, foreign write from the root
+disables it and `tbDeallocHandler` succeeds for every size `n`. -/
+theorem tbDeallocHandler_released_unique_child (n : Nat) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Unprot .Unique) .No⟩ [] =
+      .ok ⟨boxRefTree n (.Unprot .Disabled) .No⟩ := by
+  have hacc : Node.access (boxRefTree n (.Unprot .Unique) .No) (some []) .Write ⟨0⟩ ⟨n⟩ =
+      .ok (boxRefTree n (.Unprot .Disabled) .No) := by
+    rw [node_access_boxRefTree,
+      node_transitionRange_fixed (.Unprot .Unique) .Write .Local rfl n n 0 (by omega),
+      node_transitionRange_uniform (.Unprot .Unique) (.Unprot .Disabled) .Write .Foreign rfl n]
+    rfl
+  have hprot : Node.contains_strong_protector_preventing_deallocation
+      (boxRefTree n (.Unprot .Disabled) .No) = false := by
+    simp only [boxRefTree, node_contains_strong_protector_eq, Node.anyChildPreventsDeallocation,
+      Bool.or_false]
+    rfl
+  exact (tbDeallocHandler_ok_iff _ _ _ _).mpr ⟨_, hacc, hprot, rfl⟩
+
+/-- **Cases 19 and 20 for a strongly protected `Unique` (`&mut T`) child,
+universally on every `TreeBorrowsMemory`**: deallocating through the root is UB
+while the protector is active, `end_call` releases it, and afterwards the same
+deallocation succeeds. -/
+theorem tb_protector_release_then_deallocate_unique (tbm : TBM)
+    (ptr : ThinPointer TreeBorrowsProvenance) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hn : 0 < n)
+    (hp : ptr.provenance = some (id, [])) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr) (hkind : a.kind = .Heap) (hsize : Allocation.size a = ⟨n⟩)
+    (hroot : a.extra.root = boxRefTree n (.Prot .Unique) .Strong) :
+    TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+      .error (.ub "Tree Borrows: foreign read of protected Unique reference") ∧
+    ∃ tbm1, TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } = .ok tbm1 ∧
+      ∃ tbm2, TreeBorrowsMemory.deallocate tbm1 ptr .Heap ⟨n⟩ a.align = .ok tbm2 := by
+  refine ⟨(tb_deallocate_boxRefTree tbm ptr id a n hn hp hi hget hlive haddr hkind hsize).2.2 hroot,
+    _, tb_end_call_boxRefTree_unique tbm id a n hi hget hlive hroot, ?_⟩
+  let a' : Allocation Path TreeBorrowsAllocationExtra :=
+    { a with extra := { root := boxRefTree n (.Unprot .Unique) .No } }
+  have hget' : (tbm.mem.allocations.set id._0.toNat a')[id._0.toNat]? = some a' := by
+    rw [List.getElem?_set_self]
+    exact (List.getElem?_eq_some_iff.mp hget).1
+  obtain ⟨root', hacc, hprot, _⟩ :=
+    (tbDeallocHandler_ok_iff _ _ _ _).mp (tbDeallocHandler_released_unique_child n)
+  exact ⟨_, (tb_deallocate_ok_iff _ _ ptr .Heap ⟨n⟩ a.align).mpr
+    ⟨id, [], a', root', hp, hi, hget', hlive, haddr, hkind.symm, hsize.symm, rfl, hacc, hprot, rfl⟩⟩
+
+/-- Non-vacuity witness for `tb_protector_release_then_deallocate_unique`. -/
+theorem tb_protector_release_then_deallocate_unique_witness :
+    ∃ tbm1 tbm2,
+      TreeBorrowsMemory.end_call (tbmBoxRef (.Prot .Unique)) { protectors := [(⟨0⟩, [0])] } =
+        .ok tbm1 ∧
+      TreeBorrowsMemory.deallocate tbm1 ⟨4294967296, some (⟨0⟩, [])⟩ .Heap ⟨32⟩ ⟨32⟩ = .ok tbm2 := by
+  obtain ⟨_, tbm1, h1, tbm2, h2⟩ := tb_protector_release_then_deallocate_unique
+    (tbmBoxRef (.Prot .Unique)) ⟨4294967296, some (⟨0⟩, [])⟩ ⟨0⟩
+    (boxRefAlloc (.Prot .Unique)) 32 (by decide) rfl (by decide) rfl rfl rfl rfl rfl rfl
+  exact ⟨tbm1, tbm2, h1, h2⟩
+
 /-- **Deallocating what was just allocated succeeds on `TreeBorrowsMemory`**, for
 every `tbm : TBM`, every `kind`, `size`, and `align`. -/
 theorem tb_allocate_then_deallocate {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
@@ -4462,6 +4627,10 @@ theorem ep1_minirust_heap_wide_capstone :
       (∀ (pl pr : Pointer TreeBorrowsProvenance) (tl tr : «Type»),
         evalAddrEqM (M := TBM) (.Ptr pl, tl) (.Ptr pr, tr) =
           .ok (.Bool (decide (pl.thin_pointer.addr = pr.thin_pointer.addr)), .Bool)) ∧
+      (∀ (tl tr vl vr : ThinPointer TreeBorrowsProvenance) (pty : PtrType) (tyr : «Type»),
+        evalWideEqM (M := TBM) (.Ptr ⟨tl, some (.VTablePointer vl)⟩, .Ptr pty)
+            (.Ptr ⟨tr, some (.VTablePointer vr)⟩, tyr) =
+          .ok (.Bool (decide (tl.addr = tr.addr ∧ vl.addr = vr.addr)), .Bool)) ∧
       (∀ (tl tr v : ThinPointer TreeBorrowsProvenance) (n : Int) (pty : PtrType) (tyr : «Type»),
         evalWideEqM (M := TBM) (.Ptr ⟨tl, some (.ElementCount n)⟩, .Ptr pty)
             (.Ptr ⟨tr, some (.VTablePointer v)⟩, tyr) =
@@ -4514,9 +4683,19 @@ theorem ep1_minirust_heap_wide_capstone :
           .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
         ∃ tbm1, TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } = .ok tbm1 ∧
           ∃ tbm2, TreeBorrowsMemory.deallocate tbm1 ptr .Heap ⟨n⟩ a.align = .ok tbm2) ∧
+      (∀ (tbm : TBM) (ptr : ThinPointer TreeBorrowsProvenance) (id : AllocId)
+          (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat), 0 < n →
+        ptr.provenance = some (id, []) → 0 ≤ id._0 →
+        tbm.mem.allocations[id._0.toNat]? = some a → a.live = true →
+        ptr.addr = a.addr → a.kind = .Heap → Allocation.size a = ⟨n⟩ →
+        a.extra.root = boxRefTree n (.Prot .Unique) .Strong →
+        TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+          .error (.ub "Tree Borrows: foreign read of protected Unique reference") ∧
+        ∃ tbm1, TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } = .ok tbm1 ∧
+          ∃ tbm2, TreeBorrowsMemory.deallocate tbm1 ptr .Heap ⟨n⟩ a.align = .ok tbm2) ∧
       (∀ k : Nat, alignFromBytesInt ((2 : Int) ^ k) = some ⟨2 ^ k⟩) ∧
       (∀ sz : Size, x86_64.valid_size sz = true ↔ sz.bytes < 2 ^ 63)) ∧
-    ((List.range 30).map (mrHeapWideObserve false) =
+    (((List.range 30).map (mrHeapWideObserve false) =
         [.okAlloc 0 1, .okAlloc 0 32, .okRoundTrip 3735928559, .okRoundTrip 81985529216486895,
          .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub,
          .memoryLeak, .okDealloc, .okDealloc,
@@ -4530,6 +4709,7 @@ theorem ep1_minirust_heap_wide_capstone :
          .okDealloc, .ub, .okDealloc, .ub, .okDealloc,
          .okBool true, .okBool false, .okBool true, .okBool false, .okBool true,
          .specPanic, .okAlloc 0 1073741824]) ∧
+      (∀ (tb : Bool) (idx : Nat), 30 ≤ idx → mrHeapWideObserve tb idx = .invalidOrUnsupported)) ∧
     (mrHeapLifecycleTrace false =
         [.okAlloc 32 32, .okRoundTrip 14627333968688404088, .memoryLeak, .okBool true,
          .okDealloc, .ub] ∧
@@ -4539,8 +4719,8 @@ theorem ep1_minirust_heap_wide_capstone :
     (mrProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
-  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩,
-    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
+  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_⟩, ?_, ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
   · exact tbInit_wfLive
@@ -4550,6 +4730,7 @@ theorem ep1_minirust_heap_wide_capstone :
       ⟨fun h => h.2, fun h => ⟨rfl, h⟩⟩
   · exact fun pl pr tl tr => evalAddrEqM_ptr (M := BM) pl pr tl tr
   · exact fun pl pr tl tr => evalAddrEqM_ptr (M := TBM) pl pr tl tr
+  · exact fun tl tr vl vr pty tyr => evalWideEqM_vtable (M := TBM) tl tr vl vr pty tyr
   · exact fun tl tr v n pty tyr => (evalWideEqM_mixed_specPanic (M := TBM) tl tr v n pty tyr).1
   · exact node_contains_strong_protector_iff
   · exact weak_protector_never_prevents_deallocation
@@ -4562,9 +4743,11 @@ theorem ep1_minirust_heap_wide_capstone :
     exact ⟨h1.1, h2.1, h1.2.1, h1.2.2, h3.1, h3.2⟩
   · exact tb_deallocate_frozen_child_tag
   · exact tb_protector_release_then_deallocate
+  · exact tb_protector_release_then_deallocate_unique
   · exact alignFromBytesInt_pow2
   · exact x86_64_valid_size_iff
   · exact mrHeapWideObserve_table
+  · exact mrHeapWideObserve_out_of_range
   · exact mrHeapLifecycleTrace_table
   · exact mrProtectorDeallocTrace_table
 
@@ -4627,8 +4810,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 211 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 211 then
+  -- This module states 221 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 221 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
