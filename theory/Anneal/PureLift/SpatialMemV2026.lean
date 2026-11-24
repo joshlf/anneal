@@ -4886,6 +4886,23 @@ theorem forged_align_padMask_and_desync_mirLocal_rejected :
     freezePaddedToMem u8U32BodyCtx 0 baseC paddedU8U32MemCodec_lawful_sample desyncSt = .fail :=
   ⟨rfl, rfl, rfl⟩
 
+/-- **Negative 7b — END-TO-END forged-alignment / forged-`padMask` freeze rejection
+with a GENUINE lawfulness proof**: `LawfulTypedSpatialMemCodec` only demands
+`0 < alignBytes` and a size-consistent `padMask` whose non-pad decoding is stable, so
+a codec claiming `alignBytes := 1` (vs. `align = 4` in the captured `LayoutTable`) is
+still LAWFUL. Without `codecLayoutAndMaskMatchSpec`, `freezePaddedToMem` would accept
+it and promote the local into a 1-aligned allocation; with the guard, freezing the
+SAME `sampleU8U32InitState` that the honest codec freezes successfully fails closed. -/
+theorem forged_align_lawful_codec_freeze_rejected :
+    let forgedAlignC : TypedSpatialMemCodec U8U32Struct :=
+      { paddedU8U32MemCodec 0 with layout := { size := 8, alignBytes := 1 } }
+    let hLawForged : LawfulTypedSpatialMemCodec u8U32BodyCtx.body.layouts forgedAlignC :=
+      { paddedU8U32MemCodec_lawful_sample with alignPos := by decide }
+    freezePaddedToMem u8U32BodyCtx 0 forgedAlignC hLawForged sampleU8U32InitState = .fail ∧
+    (∃ st', freezePaddedToMem u8U32BodyCtx 0 (paddedU8U32MemCodec 0)
+      paddedU8U32MemCodec_lawful_sample sampleU8U32InitState = .ok st') :=
+  ⟨rfl, ⟨_, rfl⟩⟩
+
 /-- Every successful `freezePaddedToMem` runs against EXACTLY the authenticated
 `ctx.specs` of a well-formed `BodySpatialCtx`, AND validates the codec's
 `V2026MemLayout` (`size`, `alignBytes`) and `padMask` against `ctx.body.layouts`

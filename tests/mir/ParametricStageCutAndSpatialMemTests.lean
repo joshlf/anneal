@@ -37,6 +37,10 @@ all five converged capabilities against unmodified
   `UnwindAction.cleanup` landing pad into clean recovery → `MirWpConverges`, and (c)
   universal 3-node `topo3` disjoint sibling commutation (`protectedRefFrame_shared_topo3_commutation`)
   bridged to `TreeBorrowPerm ↔ TbPermission`.
+- **Witness 3d (MIR Tree Borrows ⇒ `RefFrame` step refinement)**: on the REAL
+  `callerNormalBody` run, the MIR deref write and `return_` are EXACTLY
+  `performRangedAccess` / `exitFrameWithProtectors` on the per-allocation projection
+  `rangedBorrowTreeOfMirAlloc` of the live `Memory`.
 - **Witness 4 (`SpatialMemV2026`)**: full `freezePaddedToMem` → `mutatePaddedInMem` →
   `reabsorbPaddedFromMem` → `endPaddedLoan` → `deallocatePromotedLocal` lifecycle on
   both padded `(u8, [pad; 3], u32)` (contrasted with `u8U32Padded_freeze_refused`) and
@@ -1422,13 +1426,14 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
     (step_to_mirWp h5 (step_to_mirWp h6 (step_to_mirWp h7 (step_to_mirWp h8
       (done_to_mirWp h9 ⟨by omega, rfl, rfl, rfl, rfl, rfl⟩))))))))
 
-/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + live `rangedBorrowTreeOfMirBorrows`
-projection + `exitFrameWithProtectors` + disjoint sibling framing → `MirWpConverges`)**:
-seals `calleeWrite2BytesBody` (with REAL `Retag(FnEntry, _1)`) behind a `CallSpecCut` over
-`Memory.callerLocals` (`memCallerByteStoreOps`), projecting the live post-execution
-`m1.borrows` and `m1.activeProtectors` directly into `RangedBorrowTree` via
-`rangedBorrowTreeOfMirBorrows` (zero hardcoded borrow trees!), proving `UpdatesOnly [⟨⟨12⟩, 0, 2⟩]`,
-`exitFrameWithProtectors _ [2]` releasing the real `FnEntry`-created protector tag `2`, and
+/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + live per-allocation
+`rangedBorrowTreeOfMirAlloc` projection + `exitFrameWithProtectors` + disjoint sibling framing
+→ `MirWpConverges`)**: seals `calleeWrite2BytesBody` (with REAL `Retag(FnEntry, _1)`) behind a
+`CallSpecCut` over `Memory.callerLocals` (`memCallerByteStoreOps`), projecting the live
+post-execution `m1.borrows` and `m1.activeProtectors` of caller allocation `(0, 12)` into
+`RangedBorrowTree` via `rangedBorrowTreeOfMirAlloc` (zero hardcoded borrow trees!), proving
+`UpdatesOnly [⟨⟨12⟩, 0, 2⟩]`, `exitFrameWithProtectors _ [1]` releasing the protector that the
+real fat-pointer `Retag(FnEntry)` attached to slice tag `1`, and
 disjoint sibling slice `[2..4)` framing via `mirWpConverges_of_callSpecCut_normal_cleanup`. -/
 theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 sib1 : UInt8) :
     let mutL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 0, 2⟩
@@ -1440,7 +1445,7 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
       { callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [0, 0, sib0, sib1]] }
     let m0 : Memory :=
       { m0Store with borrows := [borrowSlice], nextTag := 2 }
-    let tree0 : RangedBorrowTree := rangedBorrowTreeOfMirBorrows m0.borrows m0.activeProtectors 2
+    let tree0 : RangedBorrowTree := rangedBorrowTreeOfMirAlloc m0.borrows m0.activeProtectors 0 12 2
     let adapter : CalleeMachineAdapter MachineState MirOutcome Memory Value :=
       { mkEntry := fun mStore _ =>
           { frame := { blockIdx := 0, stmtIdx := 0
@@ -1453,7 +1458,7 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           match out with
           | .normal (rv, m1) =>
             some (.returned rv { callerLocals := m1.callerLocals }
-              (rangedBorrowTreeOfMirBorrows m1.borrows m1.activeProtectors 2))
+              (rangedBorrowTreeOfMirAlloc m1.borrows m1.activeProtectors 0 12 2))
           | _ => none }
     let spec : CallSpec Memory CallerLocalAddr Value :=
       { pre := fun m t => m = m0Store ∧ t = tree0
@@ -1474,8 +1479,8 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           rv = .scalar ⟨1, 4⟩ ∧
           mutL.get m' = some [b0, b1] ∧
           sibL.get m' = some [sib0, sib1] ∧
-          (exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1]).status = .Released ∧
-          (exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1]).tree.protectedTags = []
+          (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc m'.borrows m'.activeProtectors 0 12 2) [1]).status = .Released ∧
+          (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc m'.borrows m'.activeProtectors 0 12 2) [1]).tree.protectedTags = []
         | _ => False) := by
   intro mutL sibL borrowSlice m0Store m0 tree0 adapter spec
   let borrowSliceProt : BorrowEntry := { borrowSlice with protector := some 1 }
@@ -1657,7 +1662,7 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
     | normal rv =>
       rcases rv with ⟨v, m'⟩
       dsimp only [adapter, spec] at hOut
-      cases hEx : exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows m'.borrows m'.activeProtectors 2) [1] with
+      cases hEx : exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc m'.borrows m'.activeProtectors 0 12 2) [1] with
       | mk tRel st =>
         rw [hEx] at hOut
         cases st with
@@ -1898,6 +1903,41 @@ theorem witness3c_topo3_commutation_and_mir_tb_bridge :
   intro pSrc pDst accSrc accDst protBoth hRead hWrite rf mem exit
   exact protectedRefFrame_shared_topo3_commutation
     pSrc pDst accSrc accDst protBoth hRead hWrite rf mem exit
+
+/-- **Witness 3d (MIR Tree Borrows step ⇒ `RefFrame` step refinement on the REAL
+`callerNormalBody` → `calleeBumpMutBody` run)**: projecting each live `Memory` through the
+sound per-allocation `rangedBorrowTreeOfMirAlloc _ _ 0 1 4` (caller local `_1 = x`):
+1. after the callee's `Retag(FnEntry, _1)` (`s₃`), protector `1` is live and tag `2` is
+   protected in the projection;
+2. the REAL MIR deref write `*_1 = *_1 + 5` (`s₃ → s₄`, through tag `2`) is EXACTLY
+   `performRangedAccess _ 0 4 2 .Write .VisitChildrenOfAccessed` on the projection
+   (`.Completed`, resulting tree = projection of `s₄`);
+3. the REAL `TerminatorKind.return_` (`s₅ → s₆`) is EXACTLY
+   `exitFrameWithProtectors _ [2]` on the projection (`.Released`, resulting tree =
+   projection of `s₆`, whose `activeProtectors = []`). -/
+theorem witness3d_mir_tree_borrows_step_refines_refframe :
+    let ms0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨3, 4⟩),
+                              .uninit, .uninit, .uninit] }
+        memory := { callees := [calleeBumpMutBody] } }
+    let proj : MachineState → RangedBorrowTree := fun s =>
+      rangedBorrowTreeOfMirAlloc s.memory.borrows s.memory.activeProtectors 0 1 4
+    ∃ s₁ s₂ s₃ s₄ s₅ s₆ : MachineState,
+      Anneal.PureMirExec.mirStep callerNormalBody ms0 = .cont s₁ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₁ = .cont s₂ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₂ = .cont s₃ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₃ = .cont s₄ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₄ = .cont s₅ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₅ = .cont s₆ ∧
+      s₃.memory.activeProtectors = [1] ∧ (proj s₃).protectedTags = [2] ∧
+      (performRangedAccess (proj s₃) 0 4 2 .Write .VisitChildrenOfAccessed).status =
+        .Completed ∧
+      (performRangedAccess (proj s₃) 0 4 2 .Write .VisitChildrenOfAccessed).tree = proj s₄ ∧
+      (exitFrameWithProtectors (proj s₅) [2]).status = .Released ∧
+      (exitFrameWithProtectors (proj s₅) [2]).tree = proj s₆ ∧
+      s₆.memory.activeProtectors = [] ∧ s₆.memory.callStack = [] :=
+  ⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 

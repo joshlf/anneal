@@ -1700,4 +1700,104 @@ theorem rangedBorrowTreeOfMirBorrows_attachProtector_release_unique
   subst hTag; subst hParent; subst hProt; subst hPerm
   exact ⟨rfl, rfl, rfl, rfl⟩
 
+
+/-! ### Per-Allocation `BorrowEntry` → `RangedBorrowTree` Projection
+
+`rangedBorrowTreeOfMirBorrows` places EVERY `BorrowEntry` into ONE tree over ONE byte
+span, regardless of `targetFrameDepth` / `targetLocal` / `allocDead`. Unmodified
+`V2026_06_01.MirSemantics` keeps borrows of DISTINCT allocations independent (the
+`(targetFrameDepth, targetLocal)` pair identifies the allocation), so the unfiltered
+projection is unsound on multi-allocation states: two protected `&mut` borrows of
+distinct locals become sibling nodes, and a protector-release write through one
+spuriously reports `.ProtectedDisabled` on the other (see
+`rangedBorrowTreeOfMirBorrows_cross_alloc_spurious` below).
+`rangedBorrowTreeOfMirAlloc` restricts the projection to the live borrows of a single
+allocation, agreeing with `rangedBorrowTreeOfMirBorrows` whenever every borrow already
+targets that allocation. -/
+
+/-- Live borrows of allocation `(depth, localIdx)`. -/
+def mirBorrowsOfAlloc (borrows : List BorrowEntry) (depth localIdx : Nat) :
+    List BorrowEntry :=
+  borrows.filter (fun e =>
+    Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal localIdx && !e.allocDead)
+
+/-- Sound per-allocation projection of `{BorrowEntry, activeProtectors}` into a
+`RangedBorrowTree` over `[0, rangeLen)` of allocation `(depth, localIdx)`. -/
+def rangedBorrowTreeOfMirAlloc (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (depth localIdx rangeLen : Nat) : RangedBorrowTree :=
+  rangedBorrowTreeOfMirBorrows (mirBorrowsOfAlloc borrows depth localIdx)
+    activeProtectors rangeLen
+
+/-- `mirBorrowsOfAlloc` is the identity on borrow lists that only target the live
+allocation `(depth, localIdx)`. -/
+theorem mirBorrowsOfAlloc_eq_self (borrows : List BorrowEntry) (depth localIdx : Nat)
+    (hAll : ∀ e ∈ borrows,
+      e.targetFrameDepth = depth ∧ e.targetLocal = localIdx ∧ e.allocDead = false) :
+    mirBorrowsOfAlloc borrows depth localIdx = borrows := by
+  unfold mirBorrowsOfAlloc
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    obtain ⟨hD, hL, hA⟩ := hAll e (List.mem_cons_self ..)
+    have hKeep : (Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal localIdx &&
+        !e.allocDead) = true := by
+      rw [hD, hL, hA, Nat.beq_refl, Nat.beq_refl]; rfl
+    simp only [List.filter, hKeep]
+    rw [ih (fun e' h' => hAll e' (List.mem_cons_of_mem _ h'))]
+
+/-- On single-allocation borrow lists, the sound projection coincides with
+`rangedBorrowTreeOfMirBorrows` (so every A1 single-allocation refinement carries over). -/
+theorem rangedBorrowTreeOfMirAlloc_eq_of_single_alloc (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (depth localIdx rangeLen : Nat)
+    (hAll : ∀ e ∈ borrows,
+      e.targetFrameDepth = depth ∧ e.targetLocal = localIdx ∧ e.allocDead = false) :
+    rangedBorrowTreeOfMirAlloc borrows activeProtectors depth localIdx rangeLen =
+      rangedBorrowTreeOfMirBorrows borrows activeProtectors rangeLen := by
+  unfold rangedBorrowTreeOfMirAlloc
+  rw [mirBorrowsOfAlloc_eq_self borrows depth localIdx hAll]
+
+/-- **Cross-allocation isolation**: pushing a borrow of ANY other allocation (or a
+dead one) never changes the projected tree of `(depth, localIdx)`. -/
+theorem rangedBorrowTreeOfMirAlloc_cons_foreign (e : BorrowEntry)
+    (borrows : List BorrowEntry) (activeProtectors : List Nat) (depth localIdx rangeLen : Nat)
+    (hForeign : e.targetFrameDepth ≠ depth ∨ e.targetLocal ≠ localIdx ∨ e.allocDead = true) :
+    rangedBorrowTreeOfMirAlloc (e :: borrows) activeProtectors depth localIdx rangeLen =
+      rangedBorrowTreeOfMirAlloc borrows activeProtectors depth localIdx rangeLen := by
+  unfold rangedBorrowTreeOfMirAlloc mirBorrowsOfAlloc
+  have hDrop : (Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal localIdx &&
+      !e.allocDead) = false := by
+    rcases hForeign with h | h | h
+    · have : Nat.beq e.targetFrameDepth depth = false := by
+        cases hB : Nat.beq e.targetFrameDepth depth with
+        | false => rfl
+        | true => exact False.elim (h (Nat.beq_eq.mp hB))
+      rw [this]; rfl
+    · have : Nat.beq e.targetLocal localIdx = false := by
+        cases hB : Nat.beq e.targetLocal localIdx with
+        | false => rfl
+        | true => exact False.elim (h (Nat.beq_eq.mp hB))
+      rw [this, Bool.and_false, Bool.false_and]
+    · rw [h, Bool.not_true, Bool.and_false]
+  simp only [List.filter, hDrop]
+
+/-- **Unsoundness witness for the unfiltered projection** (and its repair): two
+independently protected `&mut` borrows of DISTINCT locals `1` and `2`. The unfiltered
+`rangedBorrowTreeOfMirBorrows` makes them siblings, so releasing tag `2`'s protector
+spuriously fails with `.ProtectedDisabled .Unique` on tag `1`; the per-allocation
+`rangedBorrowTreeOfMirAlloc` isolates local `2` and releases cleanly. -/
+theorem rangedBorrowTreeOfMirBorrows_cross_alloc_spurious :
+    let xa : BorrowEntry :=
+      { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 1 }
+    let xb : BorrowEntry :=
+      { tag := 2, targetLocal := 2, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 2 }
+    (exitFrameWithProtectors (rangedBorrowTreeOfMirBorrows [xb, xa] [2, 1] 4) [2]).status =
+      .AccessFailure 0 4 1 (.ProtectedDisabled .Unique) ∧
+    (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc [xb, xa] [2, 1] 0 2 4) [2]).status =
+      .Released ∧
+    (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc [xb, xa] [2, 1] 0 2 4) [2]).tree =
+      rangedBorrowTreeOfMirAlloc [xb, xa] [1] 0 2 4 :=
+  ⟨rfl, rfl, rfl⟩
+
 end Anneal.ParametricCore.StageCutV2026Bridge
