@@ -2466,6 +2466,197 @@ theorem tbDeallocHandler_fresh_root (size : Size) :
   rw [node_access_write_fresh_root size]
   rfl
 
+/-! ### Protectors on arbitrary `TreeBorrowsMemory` states (`rust#165833`)
+
+The deallocation handler of `TreeBorrowsMemory::deallocate` on the canonical
+`Box`-with-reference tree: a root that owns `n` bytes as `Unique` and one child
+node holding the same permission `q` on every byte. Deallocating through the
+root is a write that is *foreign* to the child. The laws below hold for every
+`n`, every memory, every allocation, and every pointer whose node is the
+root. -/
+
+/-- A transition that keeps its permission keeps a whole uniform permission
+vector, over every in-bounds range. -/
+theorem node_transitionRange_fixed (p : Permission) (k : AccessKind) (r : NodeRelation)
+    (hp : Permission.transition p k r = .ok p) (total : Nat) :
+    ∀ (rem offset : Nat), offset + rem ≤ total →
+      Node.transitionRange r k offset rem (List.replicate total p) = .ok (List.replicate total p)
+  | 0, _, _ => rfl
+  | rem + 1, offset, hle => by
+    have hlt : offset < total := by omega
+    have hidx : listIndex (List.replicate total p) (Int.ofNat offset) "Node::transition" = .ok p := by
+      rw [listIndex_eq_ok_iff]
+      refine ⟨Int.natCast_nonneg _, ?_⟩
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.getElem?_replicate, hlt, ↓reduceIte]
+    have hset : listSet (List.replicate total p) (Int.ofNat offset) p "Node::transition" =
+        .ok (List.replicate total p) := by
+      unfold listSet
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.length_replicate,
+        Int.natCast_nonneg, hlt, and_self, ↓reduceIte, list_set_replicate_same]
+      rfl
+    unfold Node.transitionRange listMutateAt
+    simp only [hidx, hp, hset, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    exact node_transitionRange_fixed p k r hp total rem (offset + 1) (by omega)
+
+/-- A transition that fails on its permission makes the first in-bounds byte
+of a uniform vector fail, with the same `Stop`. -/
+theorem node_transitionRange_error (p : Permission) (k : AccessKind) (r : NodeRelation) (e : Stop)
+    (hp : Permission.transition p k r = .error e) (total rem offset : Nat) (hlt : offset < total) :
+    Node.transitionRange r k offset (rem + 1) (List.replicate total p) = .error e := by
+  have hidx : listIndex (List.replicate total p) (Int.ofNat offset) "Node::transition" = .ok p := by
+    rw [listIndex_eq_ok_iff]
+    refine ⟨Int.natCast_nonneg _, ?_⟩
+    simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.getElem?_replicate, hlt, ↓reduceIte]
+  unfold Node.transitionRange listMutateAt
+  simp only [hidx, hp, bind, Bind.bind, Except.bind]
+
+/-- The canonical tree: a `Unique` root over `n` bytes with one child holding
+`q` on every byte, protected by `prot`. -/
+def boxRefTree (n : Nat) (q : Permission) (prot : Protected) : Node :=
+  ⟨[⟨[], List.replicate n q, prot⟩], List.replicate n (.Unprot .Unique), .No⟩
+
+/-- A write through the root of `boxRefTree` is a local write on the root and
+a foreign write on the child. -/
+theorem node_access_boxRefTree (n : Nat) (q : Permission) (prot : Protected) :
+    Node.access (boxRefTree n q prot) (some []) .Write ⟨0⟩ ⟨n⟩ =
+      (do
+        let perms ← Node.transitionRange .Local .Write 0 n (List.replicate n (.Unprot .Unique))
+        let cperms ← Node.transitionRange .Foreign .Write 0 n (List.replicate n q)
+        pure ⟨[⟨[], cperms, prot⟩], perms, .No⟩) := by
+  simp only [boxRefTree, Node.access, Node.transition, Node.accessChildren, Option.isSome,
+    ↓reduceIte, Bool.false_eq_true]
+  cases Node.transitionRange .Local .Write 0 n (List.replicate n (.Unprot .Unique)) with
+  | error e => rfl
+  | ok perms =>
+    cases Node.transitionRange .Foreign .Write 0 n (List.replicate n q) with
+    | error e => rfl
+    | ok cperms => rfl
+
+/-- **The `Cell` exemption**, universally: deallocating through the root of a
+block whose child is a strongly protected `Cell` (`UnsafeCell`) reference
+passes the write access and the strong-protector check, for every size. -/
+theorem tbDeallocHandler_strong_cell_child (n : Nat) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Prot .Cell) .Strong⟩ [] =
+      .ok ⟨boxRefTree n (.Prot .Cell) .Strong⟩ := by
+  have hacc : Node.access (boxRefTree n (.Prot .Cell) .Strong) (some []) .Write ⟨0⟩ ⟨n⟩ =
+      .ok (boxRefTree n (.Prot .Cell) .Strong) := by
+    rw [node_access_boxRefTree,
+      node_transitionRange_fixed (.Unprot .Unique) .Write .Local rfl n n 0 (by omega),
+      node_transitionRange_fixed (.Prot .Cell) .Write .Foreign rfl n n 0 (by omega)]
+    rfl
+  have hprot : Node.contains_strong_protector_preventing_deallocation
+      (boxRefTree n (.Prot .Cell) .Strong) = false := by
+    have hcell := strong_cell_never_prevents_deallocation (List.replicate n (.Prot .Cell))
+      (fun p hp => List.eq_of_mem_replicate hp)
+    simp only [boxRefTree, node_contains_strong_protector_eq, Node.anyChildPreventsDeallocation,
+      hcell, Bool.or_false]
+    rfl
+  exact (tbDeallocHandler_ok_iff _ _ _ _).mpr ⟨_, hacc, hprot, rfl⟩
+
+/-- The write through the root of a block whose child holds `q` on every byte
+fails exactly as the child's foreign write fails, for every nonzero size. -/
+theorem node_access_boxRefTree_child_error (n : Nat) (hn : 0 < n) (q : Permission)
+    (prot : Protected) (e : Stop) (hq : Permission.transition q .Write .Foreign = .error e) :
+    Node.access (boxRefTree n q prot) (some []) .Write ⟨0⟩ ⟨n⟩ = .error e := by
+  obtain ⟨k, rfl⟩ : ∃ k, n = k + 1 := ⟨n - 1, by omega⟩
+  rw [node_access_boxRefTree,
+    node_transitionRange_fixed (.Unprot .Unique) .Write .Local rfl _ _ 0 (by omega),
+    node_transitionRange_error q .Write .Foreign e hq _ k 0 (by omega)]
+  rfl
+
+/-- **A strongly protected, read `Frozen` child prevents deallocation through
+the root**, universally: for every nonzero size the foreign write on the child
+is UB. -/
+theorem tbDeallocHandler_strong_frozen_child (n : Nat) (hn : 0 < n) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Prot (.Frozen true)) .Strong⟩ [] =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") :=
+  (tbDeallocHandler_error_iff _ _ _ _).mpr
+    (Or.inl (node_access_boxRefTree_child_error n hn _ .Strong _ rfl))
+
+/-- The same for a strongly protected `Unique` (written `&mut`) child. Upstream
+reports this foreign *write* with the message of a foreign *read*
+(`PermissionProt::foreign_write` at `Unique`,
+`spec/mem/tree_borrows/state_machine_protected.md`); the interpretation keeps
+the message. -/
+theorem tbDeallocHandler_strong_unique_child (n : Nat) (hn : 0 < n) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Prot .Unique) .Strong⟩ [] =
+      .error (.ub "Tree Borrows: foreign read of protected Unique reference") :=
+  (tbDeallocHandler_error_iff _ _ _ _).mpr
+    (Or.inl (node_access_boxRefTree_child_error n hn _ .Strong _ rfl))
+
+/-- The same for a strongly protected `Reserved` child that was read. -/
+theorem tbDeallocHandler_strong_read_reserved_child (n : Nat) (hn : 0 < n) (b : Bool) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Prot (.Reserved true b)) .Strong⟩ [] =
+      .error (.ub "Tree Borrows: foreign write of protected Reserved reference which had a local read") :=
+  (tbDeallocHandler_error_iff _ _ _ _).mpr
+    (Or.inl (node_access_boxRefTree_child_error n hn _ .Strong _ rfl))
+
+/-- **On every `TreeBorrowsMemory`**: deallocating, with matching kind, size,
+and alignment, a live allocation whose borrow tree is `boxRefTree n q .Strong`,
+through a pointer to its beginning tagged with the root node, succeeds when
+`q` is `Cell`, and is UB with the child's foreign-write message when `q` is a
+read `Frozen`, a written `Unique`, or a read `Reserved` (for `n > 0`). -/
+theorem tb_deallocate_boxRefTree (tbm : TBM) (ptr : ThinPointer TreeBorrowsProvenance)
+    (id : AllocId) (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hn : 0 < n)
+    (hp : ptr.provenance = some (id, [])) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr) (hkind : a.kind = .Heap) (hsize : Allocation.size a = ⟨n⟩) :
+    (a.extra.root = boxRefTree n (.Prot .Cell) .Strong →
+      ∃ tbm', TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align = .ok tbm') ∧
+    (a.extra.root = boxRefTree n (.Prot (.Frozen true)) .Strong →
+      TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+        .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read")) ∧
+    (a.extra.root = boxRefTree n (.Prot .Unique) .Strong →
+      TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+        .error (.ub "Tree Borrows: foreign read of protected Unique reference")) := by
+  refine ⟨fun hroot => ?_, fun hroot => ?_, fun hroot => ?_⟩
+  · have hh := tbDeallocHandler_strong_cell_child n
+    obtain ⟨root', hacc, hprot, _⟩ := (tbDeallocHandler_ok_iff _ _ _ _).mp hh
+    have hextra : a.extra = ⟨boxRefTree n (.Prot .Cell) .Strong⟩ := by
+      cases hx : a.extra; rw [hx] at hroot; simp only at hroot; rw [hroot]
+    refine ⟨_, (tb_deallocate_ok_iff tbm _ ptr .Heap ⟨n⟩ a.align).mpr
+      ⟨id, [], a, root', hp, hi, hget, hlive, haddr, hkind.symm, hsize.symm, rfl, ?_, hprot, rfl⟩⟩
+    rw [hextra]; exact hacc
+  · exact tb_deallocate_access_ub tbm ptr .Heap ⟨n⟩ a.align id [] a _ hp hi hget hlive haddr
+      hkind.symm hsize.symm rfl
+      (by rw [hroot]; exact node_access_boxRefTree_child_error n hn _ .Strong _ rfl)
+  · exact tb_deallocate_access_ub tbm ptr .Heap ⟨n⟩ a.align id [] a _ hp hi hget hlive haddr
+      hkind.symm hsize.symm rfl
+      (by rw [hroot]; exact node_access_boxRefTree_child_error n hn _ .Strong _ rfl)
+
+/-- The 32-byte heap block of `tbmBoxRef`. -/
+def boxRefAlloc (q : Permission) : Allocation Path TreeBorrowsAllocationExtra :=
+  { data := List.replicate 32 .Uninit, addr := 4294967296, align := ⟨32⟩, kind := .Heap,
+    live := true, extra := ⟨boxRefTree 32 q .Strong⟩ }
+
+/-- A `TreeBorrowsMemory` holding one 32-byte heap block whose borrow tree is
+`boxRefTree 32 q .Strong`. -/
+def tbmBoxRef (q : Permission) : TBM :=
+  { params := ⟨true⟩
+    mem := { allocations := [boxRefAlloc q], _phantom := ⟨⟩ } }
+
+/-- `tb_deallocate_boxRefTree` is not vacuous: every hypothesis holds on
+`tbmBoxRef q` for the root pointer, for each of the three child permissions,
+and the three conclusions are what `TreeBorrowsMemory.deallocate` computes. -/
+theorem tb_deallocate_boxRefTree_witness :
+    (∃ tbm', TreeBorrowsMemory.deallocate (tbmBoxRef (.Prot .Cell)) ⟨4294967296, some (⟨0⟩, [])⟩
+      .Heap ⟨32⟩ ⟨32⟩ = .ok tbm') ∧
+    TreeBorrowsMemory.deallocate (tbmBoxRef (.Prot (.Frozen true))) ⟨4294967296, some (⟨0⟩, [])⟩
+      .Heap ⟨32⟩ ⟨32⟩ =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    TreeBorrowsMemory.deallocate (tbmBoxRef (.Prot .Unique)) ⟨4294967296, some (⟨0⟩, [])⟩
+      .Heap ⟨32⟩ ⟨32⟩ = .error (.ub "Tree Borrows: foreign read of protected Unique reference") := by
+  refine ⟨?_, ?_, ?_⟩
+  · exact (tb_deallocate_boxRefTree (tbmBoxRef (.Prot .Cell)) _ ⟨0⟩ (boxRefAlloc (.Prot .Cell))
+      32 (by decide) rfl
+      (by decide) rfl rfl rfl rfl rfl).1 rfl
+  · exact (tb_deallocate_boxRefTree (tbmBoxRef (.Prot (.Frozen true))) _ ⟨0⟩ (boxRefAlloc (.Prot (.Frozen true)))
+      32 (by decide) rfl
+      (by decide) rfl rfl rfl rfl rfl).2.1 rfl
+  · exact (tb_deallocate_boxRefTree (tbmBoxRef (.Prot .Unique)) _ ⟨0⟩ (boxRefAlloc (.Prot .Unique))
+      32 (by decide) rfl
+      (by decide) rfl rfl rfl rfl rfl).2.2 rfl
+
 /-- **Deallocating what was just allocated succeeds on `TreeBorrowsMemory`**, for
 every `tbm : TBM`, every `kind`, `size`, and `align`. -/
 theorem tb_allocate_then_deallocate {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
@@ -3828,8 +4019,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 175 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 175 then
+  -- This module states 185 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 185 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
