@@ -222,6 +222,284 @@ theorem traitPredEq_symm {a b : ProtoTraitPred} (h : traitPredEq a b = true) :
   unfold traitPredEq at h ⊢
   rw [keysEq_eq h]; exact keysEq_refl _
 
+/-- `s` occurs in `xs`. -/
+def strMem (s : String) : List String → Bool
+  | [] => false
+  | x :: xs => strEq x s || strMem s xs
+
+/-- Every auto trait in `dst` is already required by `src` (`dst ⊆ src`):
+dropping auto traits on a `dyn` upcast is sound, fabricating new ones is UB. -/
+def autoTraitsSubset (dst src : List String) : Bool :=
+  dst.all (fun a => strMem a src)
+
+theorem natBlt_true_iff (a b : Nat) : Nat.blt a b = true ↔ a < b :=
+  ⟨fun h => Nat.le_of_ble_eq_true h, fun h => Nat.ble_eq_true_of_le h⟩
+
+theorem natListLe_refl : ∀ l : List Nat, natListLe l l = true
+  | [] => rfl
+  | a :: as => by
+    show (match Nat.blt a a with
+          | true => true
+          | false => match Nat.blt a a with | true => false | false => natListLe as as) = true
+    have hlt : Nat.blt a a = false := by
+      cases h : Nat.blt a a with
+      | false => rfl
+      | true => exact absurd ((natBlt_true_iff a a).mp h) (Nat.lt_irrefl a)
+    rw [hlt]
+    exact natListLe_refl as
+
+theorem natListLe_antisymm : ∀ {a b : List Nat},
+    natListLe a b = true → natListLe b a = true → a = b
+  | [], [], _, _ => rfl
+  | [], _ :: _, _, h2 => by cases h2
+  | _ :: _, [], h1, _ => by cases h1
+  | a :: as, b :: bs, h1, h2 => by
+    have h1' : (match Nat.blt a b with
+                | true => true
+                | false => match Nat.blt b a with | true => false | false => natListLe as bs) = true := h1
+    have h2' : (match Nat.blt b a with
+                | true => true
+                | false => match Nat.blt a b with | true => false | false => natListLe bs as) = true := h2
+    cases hab : Nat.blt a b with
+    | true =>
+      have hba : Nat.blt b a = false := by
+        cases h : Nat.blt b a with
+        | false => rfl
+        | true =>
+          exact absurd (Nat.lt_trans ((natBlt_true_iff a b).mp hab) ((natBlt_true_iff b a).mp h))
+            (Nat.lt_irrefl a)
+      rw [hba, hab] at h2'
+      cases h2'
+    | false =>
+      cases hba : Nat.blt b a with
+      | true => rw [hab, hba] at h1'; cases h1'
+      | false =>
+        rw [hab, hba] at h1' h2'
+        have heq : a = b := by
+          have h1n : ¬ a < b := fun h => by
+            have := (natBlt_true_iff a b).mpr h
+            rw [this] at hab; cases hab
+          have h2n : ¬ b < a := fun h => by
+            have := (natBlt_true_iff b a).mpr h
+            rw [this] at hba; cases hba
+          omega
+        rw [heq, natListLe_antisymm h1' h2']
+
+theorem natListLe_total : ∀ {a b : List Nat}, natListLe a b = false → natListLe b a = true
+  | [], _, h => by cases h
+  | _ :: _, [], _ => rfl
+  | a :: as, b :: bs, h => by
+    have h' : (match Nat.blt a b with
+               | true => true
+               | false => match Nat.blt b a with | true => false | false => natListLe as bs) = false := h
+    cases hab : Nat.blt a b with
+    | true => rw [hab] at h'; cases h'
+    | false =>
+      cases hba : Nat.blt b a with
+      | true =>
+        show (match Nat.blt b a with
+              | true => true
+              | false => match Nat.blt a b with | true => false | false => natListLe bs as) = true
+        rw [hba]
+      | false =>
+        rw [hab, hba] at h'
+        show (match Nat.blt b a with
+              | true => true
+              | false => match Nat.blt a b with | true => false | false => natListLe bs as) = true
+        rw [hba, hab]
+        exact natListLe_total h'
+
+theorem natListLe_trans : ∀ {a b c : List Nat},
+    natListLe a b = true → natListLe b c = true → natListLe a c = true
+  | [], _, _, _, _ => rfl
+  | _ :: _, [], _, h1, _ => by cases h1
+  | _ :: _, _ :: _, [], _, h2 => by cases h2
+  | a :: as, b :: bs, c :: cs, h1, h2 => by
+    have h1' : (match Nat.blt a b with
+                | true => true
+                | false => match Nat.blt b a with | true => false | false => natListLe as bs) = true := h1
+    have h2' : (match Nat.blt b c with
+                | true => true
+                | false => match Nat.blt c b with | true => false | false => natListLe bs cs) = true := h2
+    show (match Nat.blt a c with
+          | true => true
+          | false => match Nat.blt c a with | true => false | false => natListLe as cs) = true
+    cases hab : Nat.blt a b with
+    | true =>
+      cases hbc : Nat.blt b c with
+      | true =>
+        have hac : Nat.blt a c = true :=
+          (natBlt_true_iff a c).mpr
+            (Nat.lt_trans ((natBlt_true_iff a b).mp hab) ((natBlt_true_iff b c).mp hbc))
+        rw [hac]
+      | false =>
+        cases hcb : Nat.blt c b with
+        | true => rw [hbc, hcb] at h2'; cases h2'
+        | false =>
+          have hbcEq : b = c := by
+            have hn1 : ¬ b < c := fun h => by
+              have := (natBlt_true_iff b c).mpr h; rw [this] at hbc; cases hbc
+            have hn2 : ¬ c < b := fun h => by
+              have := (natBlt_true_iff c b).mpr h; rw [this] at hcb; cases hcb
+            omega
+          rw [← hbcEq, hab]
+    | false =>
+      cases hba : Nat.blt b a with
+      | true => rw [hab, hba] at h1'; cases h1'
+      | false =>
+        rw [hab, hba] at h1'
+        have habEq : a = b := by
+          have hn1 : ¬ a < b := fun h => by
+            have := (natBlt_true_iff a b).mpr h; rw [this] at hab; cases hab
+          have hn2 : ¬ b < a := fun h => by
+            have := (natBlt_true_iff b a).mpr h; rw [this] at hba; cases hba
+          omega
+        subst habEq
+        cases hbc : Nat.blt a c with
+        | true => rfl
+        | false =>
+          cases hcb : Nat.blt c a with
+          | true => rw [hbc, hcb] at h2'; cases h2'
+          | false =>
+            rw [hbc, hcb] at h2'
+            exact natListLe_trans h1' h2'
+
+theorem insertKey_comm (x y : List Nat) :
+    ∀ l : List (List Nat), insertKey x (insertKey y l) = insertKey y (insertKey x l)
+  | [] => by
+    simp only [insertKey]
+    cases hxy : natListLe x y with
+    | true =>
+      cases hyx : natListLe y x with
+      | true => rw [natListLe_antisymm hxy hyx]
+      | false => rfl
+    | false =>
+      rw [natListLe_total hxy]
+  | h :: t => by
+    simp only [insertKey]
+    cases hxh : natListLe x h with
+    | true =>
+      cases hyh : natListLe y h with
+      | true =>
+        simp only [insertKey]
+        cases hxy : natListLe x y with
+        | true =>
+          cases hyx : natListLe y x with
+          | true => rw [natListLe_antisymm hxy hyx]
+          | false => simp only [hyh]
+        | false =>
+          rw [natListLe_total hxy]; simp only [hxh]
+      | false =>
+        have hhy : natListLe h y = true := natListLe_total hyh
+        have hxy : natListLe x y = true := natListLe_trans hxh hhy
+        have hyx : natListLe y x = false := by
+          cases hyx' : natListLe y x with
+          | false => rfl
+          | true =>
+            have : natListLe y h = true := natListLe_trans hyx' hxh
+            rw [this] at hyh; cases hyh
+        simp only [insertKey, hxh, hyh, hyx]
+    | false =>
+      cases hyh : natListLe y h with
+      | true =>
+        have hhx : natListLe h x = true := natListLe_total hxh
+        have hxy : natListLe x y = false := by
+          cases hxy' : natListLe x y with
+          | false => rfl
+          | true =>
+            have : natListLe x h = true := natListLe_trans hxy' hyh
+            rw [this] at hxh; cases hxh
+        simp only [insertKey, hxh, hyh, hxy]
+      | false =>
+        simp only [insertKey, hxh, hyh, insertKey_comm x y t]
+
+theorem dedupSorted_cons_same (x : List Nat) (t : List (List Nat)) :
+    dedupSorted (x :: x :: t) = dedupSorted (x :: t) := by
+  show (match natListEq x x with | true => dedupSorted (x :: t) | false => x :: dedupSorted (x :: t)) =
+    dedupSorted (x :: t)
+  rw [natListEq_refl]
+
+theorem dedupSorted_insertKey_dup (x : List Nat) :
+    ∀ l : List (List Nat), dedupSorted (insertKey x (insertKey x l)) = dedupSorted (insertKey x l)
+  | [] => by
+    simp only [insertKey, natListLe_refl]
+    exact dedupSorted_cons_same x []
+  | h :: t => by
+    simp only [insertKey]
+    cases hxh : natListLe x h with
+    | true =>
+      simp only [insertKey, natListLe_refl]
+      exact dedupSorted_cons_same x (h :: t)
+    | false =>
+      simp only [insertKey, hxh]
+      have hne : natListEq h x = false := by
+        cases heq : natListEq h x with
+        | false => rfl
+        | true =>
+          rw [natListEq_eq heq, natListLe_refl] at hxh
+          cases hxh
+      cases t with
+      | nil =>
+        simp only [insertKey, natListLe_refl]
+        show (match natListEq h x with | true => dedupSorted [x, x] | false => h :: dedupSorted [x, x]) =
+          (match natListEq h x with | true => dedupSorted [x] | false => h :: dedupSorted [x])
+        rw [hne, dedupSorted_cons_same x []]
+      | cons h' t' =>
+        simp only [insertKey]
+        cases hxh' : natListLe x h' with
+        | true =>
+          simp only [insertKey, natListLe_refl]
+          show (match natListEq h x with
+                | true => dedupSorted (x :: x :: h' :: t')
+                | false => h :: dedupSorted (x :: x :: h' :: t')) =
+            (match natListEq h x with
+             | true => dedupSorted (x :: h' :: t')
+             | false => h :: dedupSorted (x :: h' :: t'))
+          rw [hne, dedupSorted_cons_same x (h' :: t')]
+        | false =>
+          simp only [insertKey, hxh']
+          show (match natListEq h h' with
+                | true => dedupSorted (h' :: insertKey x (insertKey x t'))
+                | false => h :: dedupSorted (h' :: insertKey x (insertKey x t'))) =
+            (match natListEq h h' with
+             | true => dedupSorted (h' :: insertKey x t')
+             | false => h :: dedupSorted (h' :: insertKey x t'))
+          have ih := dedupSorted_insertKey_dup x (h' :: t')
+          simp only [insertKey, hxh'] at ih
+          rw [ih]
+
+theorem sortKeys_append_swap (pre suf : List (List Nat)) (a b : List Nat) :
+    sortKeys (pre ++ a :: b :: suf) = sortKeys (pre ++ b :: a :: suf) := by
+  induction pre with
+  | nil => exact insertKey_comm a b (sortKeys suf)
+  | cons p ps ih =>
+    simp only [List.cons_append, sortKeys]
+    rw [ih]
+
+theorem dedupSorted_sortKeys_append_dup (pre suf : List (List Nat)) (a : List Nat) :
+    dedupSorted (sortKeys (pre ++ a :: a :: suf)) = dedupSorted (sortKeys (pre ++ a :: suf)) := by
+  induction pre with
+  | nil => exact dedupSorted_insertKey_dup a (sortKeys suf)
+  | cons p ps ih =>
+    simp only [List.cons_append, sortKeys]
+    have hcomm : ∀ x l, insertKey p (insertKey x l) = insertKey x (insertKey p l) :=
+      fun x l => insertKey_comm p x l
+    -- Move `p` inside the two copies of `a` by rewriting the suffix? No, recurse on `pre` via `insertKey_comm`!
+    -- Even simpler: prove `dedupSorted (insertKey p (insertKey a (insertKey a l))) = dedupSorted (insertKey p (insertKey a l))`.
+    have hmove : ∀ l : List (List Nat),
+        sortKeys (ps ++ a :: a :: suf) = insertKey a (insertKey a (sortKeys (ps ++ suf))) ∧
+        sortKeys (ps ++ a :: suf) = insertKey a (sortKeys (ps ++ suf)) := by
+      intro _
+      clear ih
+      induction ps with
+      | nil => exact ⟨rfl, rfl⟩
+      | cons q qs ih2 =>
+        simp only [List.cons_append, sortKeys, ih2.1, ih2.2]
+        exact ⟨by rw [insertKey_comm q a, insertKey_comm q a], insertKey_comm q a _⟩
+    have hm := hmove []
+    rw [hm.1, hm.2, insertKey_comm p a, insertKey_comm p a]
+    exact dedupSorted_insertKey_dup a (insertKey p (sortKeys (ps ++ suf)))
+
 /-- `traitPredEq` is transitive. -/
 theorem traitPredEq_trans {a b c : ProtoTraitPred} (h₁ : traitPredEq a b = true)
     (h₂ : traitPredEq b c = true) : traitPredEq a c = true := by
@@ -237,6 +515,32 @@ theorem traitPredEq_ignores_autoTraits_and_flags (p : ProtoTraitPred) (autos : L
                supertraitOutlivesOk := outlives } p = true :=
   traitPredEq_refl p
 
+/-- **Associated-type order invariance (`VTable.sortedPredicates`).** Swapping
+any two adjacent associated-type bindings preserves canonical equality. -/
+theorem traitPredEq_assocBindings_swap (p : ProtoTraitPred)
+    (pre suf : List ProtoAssocBinding) (a b : ProtoAssocBinding) :
+    traitPredEq
+      { p with assocBindings := pre ++ a :: b :: suf }
+      { p with assocBindings := pre ++ b :: a :: suf } = true := by
+  unfold traitPredEq ProtoTraitPred.canonical ProtoTraitPred.nonAutoKeys
+  dsimp only
+  simp only [List.map_append, List.map_cons, ← List.append_assoc]
+  rw [sortKeys_append_swap]
+  exact keysEq_refl _
+
+/-- **Associated-type deduplication (`VTable.sortedPredicates`).** Duplicating
+an associated-type binding preserves canonical equality. -/
+theorem traitPredEq_assocBindings_dup (p : ProtoTraitPred)
+    (pre suf : List ProtoAssocBinding) (a : ProtoAssocBinding) :
+    traitPredEq
+      { p with assocBindings := pre ++ a :: a :: suf }
+      { p with assocBindings := pre ++ a :: suf } = true := by
+  unfold traitPredEq ProtoTraitPred.canonical ProtoTraitPred.nonAutoKeys
+  dsimp only
+  simp only [List.map_append, List.map_cons, ← List.append_assoc]
+  rw [dedupSorted_sortKeys_append_dup]
+  exact keysEq_refl _
+
 /-- One entry of a vtable, as `rustc`'s `VtblEntry` and
 `Miri.Interpreter.VTableEntry`. -/
 inductive ProtoVTableSlot : Type where
@@ -250,7 +554,29 @@ inductive ProtoVTableSlot : Type where
   /-- Pointer to the vtable of a supertrait, for `dyn Sub -> dyn Super`. -/
   | traitVPtr (superVTableId : Nat)
 
-/-- Captured vtable of `concreteTyKey` for the trait object type `traitPred`. -/
+/-- Slot equality, used for prefix-compatible primary supertrait validation. -/
+def slotEq : ProtoVTableSlot → ProtoVTableSlot → Bool
+  | .dropInPlace a, .dropInPlace b =>
+    (match a, b with
+     | some x, some y => strEq x y
+     | none, none => true
+     | _, _ => false)
+  | .size, .size => true
+  | .align, .align => true
+  | .vacant, .vacant => true
+  | .method a, .method b => strEq a b
+  | .traitVPtr a, .traitVPtr b => Nat.beq a b
+  | _, _ => false
+
+/-- `pre` is a slot-wise prefix of `full`. -/
+def slotsPrefix : List ProtoVTableSlot → List ProtoVTableSlot → Bool
+  | [], _ => true
+  | _ :: _, [] => false
+  | a :: as, b :: bs => slotEq a b && slotsPrefix as bs
+
+/-- Captured vtable of `concreteTyKey` for the trait object type `traitPred`.
+`primarySuperVTable?` optionally records the `vtableId` of the primary (prefix)
+supertrait vtable for `dyn Sub -> dyn Super` upcasts without a `.traitVPtr` slot. -/
 structure ProtoVTableEntry : Type where
   vtableId : Nat
   vtableAllocId : Nat
@@ -260,6 +586,7 @@ structure ProtoVTableEntry : Type where
   alignBytes : Nat
   isUninhabited : Bool := false
   slots : List ProtoVTableSlot
+  primarySuperVTable? : Option Nat := none
 
 /-- Captured vtables of a compilation unit, with the side table mapping the
 dialect's `RigidTy.dynamic` key to the full existential predicate list. -/
@@ -307,17 +634,22 @@ def slotsHeaderOk : List ProtoVTableSlot → Bool
   | .dropInPlace _ :: .size :: .align :: _ => true
   | _ => false
 
-/-- A slot after the header: a method, a vacant slot, or a supertrait vtable
-pointer to a vtable of the same concrete type and layout. -/
+/-- Two entries describe the same concrete type with identical layout metadata. -/
+def sameConcreteLayout (s e : ProtoVTableEntry) : Bool :=
+  strEq s.concreteTyKey e.concreteTyKey && Nat.beq s.sizeBytes e.sizeBytes &&
+    Nat.beq s.alignBytes e.alignBytes && (s.isUninhabited == e.isUninhabited)
+
+/-- A slot after the header: a method, a vacant slot, or a non-self supertrait
+vtable pointer to a vtable of the same concrete type and layout for a distinct
+supertrait predicate. -/
 def bodySlotOk (es : List ProtoVTableEntry) (e : ProtoVTableEntry) : ProtoVTableSlot → Bool
   | .method _ => true
   | .vacant => true
   | .traitVPtr sup =>
-    match lookupVTableById es sup with
-    | some s =>
-      strEq s.concreteTyKey e.concreteTyKey && Nat.beq s.sizeBytes e.sizeBytes &&
-        Nat.beq s.alignBytes e.alignBytes && (s.isUninhabited == e.isUninhabited)
-    | none => false
+    !Nat.beq sup e.vtableId &&
+      (match lookupVTableById es sup with
+       | some s => sameConcreteLayout s e && !traitPredEq s.traitPred e.traitPred
+       | none => false)
   | _ => false
 
 /-- Every slot after the header is well formed. -/
@@ -325,18 +657,35 @@ def bodySlotsOk (es : List ProtoVTableEntry) (e : ProtoVTableEntry) : List Proto
   | [] => true
   | s :: rest => bodySlotOk es e s && bodySlotsOk es e rest
 
-/-- Layout metadata of a vtable entry is valid for a `ptrBytes` target: the
-alignment is a power of two, the size is at most `isize::MAX` and a multiple of
-the alignment. -/
+/-- Well-formedness of an optional primary (prefix) supertrait vtable link:
+must point to a distinct entry of the same concrete type and layout whose slots
+are a prefix of `e.slots`. -/
+def primarySuperOk (es : List ProtoVTableEntry) (e : ProtoVTableEntry) : Bool :=
+  match e.primarySuperVTable? with
+  | none => true
+  | some sup =>
+    !Nat.beq sup e.vtableId &&
+      (match lookupVTableById es sup with
+       | some s =>
+         sameConcreteLayout s e && !traitPredEq s.traitPred e.traitPred &&
+           slotsPrefix s.slots e.slots
+       | none => false)
+
+/-- Layout metadata of a vtable entry is valid for a `ptrBytes` target:
+`ptrBytes > 0`, `align` is a power of two strictly below `signedHalfModulus ptrBytes`,
+`size` is a multiple of `align`, and `size + (align - 1) <= isize::MAX` (Rust
+`Layout::from_size_align` invariant; prevents `size = 0, align = 2^100` overflow). -/
 def entryLayoutOk (ptrBytes : Nat) (e : ProtoVTableEntry) : Bool :=
-  isPow2 e.alignBytes && Nat.blt e.sizeBytes (signedHalfModulus ptrBytes) &&
+  let half := signedHalfModulus ptrBytes
+  Nat.blt 0 ptrBytes && isPow2 e.alignBytes && Nat.blt e.alignBytes half &&
+    Nat.blt e.sizeBytes half && Nat.blt (e.sizeBytes + (e.alignBytes - 1)) half &&
     Nat.beq (e.sizeBytes % e.alignBytes) 0
 
 /-- Well-formedness of one vtable entry inside the table `es`. -/
 def wfProtoVTableEntry (ptrBytes : Nat) (es : List ProtoVTableEntry) (e : ProtoVTableEntry) :
     Bool :=
   entryLayoutOk ptrBytes e && !Nat.beq e.vtableAllocId 0 && slotsHeaderOk e.slots &&
-    bodySlotsOk es e (e.slots.drop 3)
+    bodySlotsOk es e (e.slots.drop 3) && primarySuperOk es e
 
 /-- `x` does not occur in `xs`. -/
 def natNotIn (x : Nat) : List Nat → Bool
@@ -348,39 +697,63 @@ def natsUnique : List Nat → Bool
   | [] => true
   | x :: xs => natNotIn x xs && natsUnique xs
 
+/-- Pairwise table consistency: two distinct entries for the same concrete type
+must agree on `(sizeBytes, alignBytes, isUninhabited)` and must not duplicate
+the same canonical trait predicate. -/
+def entryConsistentWith (e : ProtoVTableEntry) : List ProtoVTableEntry → Bool
+  | [] => true
+  | x :: rest =>
+    (match strEq e.concreteTyKey x.concreteTyKey with
+     | false => true
+     | true => sameConcreteLayout e x && !traitPredEq e.traitPred x.traitPred) &&
+      entryConsistentWith e rest
+
+/-- Every pair of distinct entries in `es` is layout-consistent and has distinct
+`(concreteTyKey, canonical traitPred)`. -/
+def entriesPairwiseOk : List ProtoVTableEntry → Bool
+  | [] => true
+  | e :: rest => entryConsistentWith e rest && entriesPairwiseOk rest
+
 /-- Every entry of `es'` is well formed inside `es`. -/
 def allEntriesWf (ptrBytes : Nat) (es : List ProtoVTableEntry) : List ProtoVTableEntry → Bool
   | [] => true
   | e :: rest => wfProtoVTableEntry ptrBytes es e && allEntriesWf ptrBytes es rest
 
 /-- Decidable well-formedness of a vtable table: every entry is well formed,
-and vtable identifiers and vtable allocation identifiers are unique. -/
+vtable identifiers and vtable allocation identifiers are unique, and entries
+for the same concrete type agree on layout without duplicating predicates. -/
 def wfProtoVTableTable (ptrBytes : Nat) (vt : ProtoVTableTable) : Bool :=
   allEntriesWf ptrBytes vt.entries vt.entries &&
     natsUnique (vt.entries.map (·.vtableId)) &&
-    natsUnique (vt.entries.map (·.vtableAllocId))
+    natsUnique (vt.entries.map (·.vtableAllocId)) &&
+    entriesPairwiseOk vt.entries
 
-/-- A vtable allocation identifier is disjoint from the allocation identifiers
-`mem` hands out: it is not null, not a global, not a function pointer, not a
-live borrow tag, and no tag issued so far reaches it. -/
-def vtableAllocDisjoint (mem : Memory) (allocId : Nat) : Bool :=
+/-- A vtable allocation identifier is disjoint from every allocation range of
+`mem` at target pointer width `ptrBytes`: non-null, below `fnPtrAllocBase` and
+`stackLocalAddrPageBase ptrBytes` (so its canonical page address `allocId * 65536`
+cannot alias null, stack locals, or function pointers on 32-bit or 64-bit targets),
+not a global/function/borrow entry, and at or above both `mem.nextAllocId` and
+`mem.nextTag`. -/
+def vtableAllocDisjoint (ptrBytes : Nat) (mem : Memory) (allocId : Nat) : Bool :=
   !Nat.beq allocId 0 &&
+    Nat.blt allocId (stackLocalAddrPageBase ptrBytes) &&
     (match lookupGlobalAlloc mem.globals allocId with | some _ => false | none => true) &&
     (match lookupFnPtr mem.fnPtrs allocId with | some _ => false | none => true) &&
     !isFnPtrAllocId allocId &&
     (match lookupBorrow mem.borrows allocId with | some _ => false | none => true) &&
+    Nat.ble mem.nextAllocId allocId &&
     Nat.ble mem.nextTag allocId
 
-/-- Every vtable allocation of the table is disjoint from `mem`. -/
-def vtablesDisjointFrom (mem : Memory) : List ProtoVTableEntry → Bool
+/-- Every vtable allocation of the table is disjoint from `mem` at width `ptrBytes`. -/
+def vtablesDisjointFrom (ptrBytes : Nat) (mem : Memory) : List ProtoVTableEntry → Bool
   | [] => true
-  | e :: rest => vtableAllocDisjoint mem e.vtableAllocId && vtablesDisjointFrom mem rest
+  | e :: rest => vtableAllocDisjoint ptrBytes mem e.vtableAllocId && vtablesDisjointFrom ptrBytes mem rest
 
 /-- Environment gate of every prototype rule: the table is well formed for the
 target pointer width and disjoint from the allocations of `mem`. A rule whose
 gate fails reports `.unsupported`. -/
 def vtableEnvOk (ptrBytes : Nat) (vt : ProtoVTableTable) (mem : Memory) : Bool :=
-  wfProtoVTableTable ptrBytes vt && vtablesDisjointFrom mem vt.entries
+  wfProtoVTableTable ptrBytes vt && vtablesDisjointFrom ptrBytes mem vt.entries
 
 theorem lookupVTableByAlloc_allocId :
     ∀ {es : List ProtoVTableEntry} {a : Nat} {e : ProtoVTableEntry},
@@ -885,10 +1258,25 @@ def borrowAllocExtent?
         | some allocLen, some placeOff => some (allocLen, placeOff)
         | _, _ => none
 
+/-- Normalize a data word to target pointer width `ptrBytes` (wrapping
+provenance-less scalar addresses modulo `2^(8 * ptrBytes)`). -/
+def wrapDataWord (ptrBytes : Nat) : ProtoDataWord → ProtoDataWord
+  | .prov p => .prov p
+  | .addr bits => .addr (wrapScalarBits bits (scalarModulus ptrBytes))
+
+/-- Tree Borrows access kind required to validate a reference with mutability `dstMut`. -/
+def refAccessKind (dstMut : Bool) : TreeBorrowAccessKind :=
+  match dstMut with
+  | true => .write
+  | false => .read
+
 /-- Safe-reference validity of the data pointer `p` at the layout of the
-vtable entry `e` (`check_ptr` on a safe pointer): the borrow tag permits the
-access, the address is non-null and aligned, the concrete type is inhabited,
-and `[offset, offset + size)` lies inside a live allocation. -/
+vtable entry `e` (`check_ptr` on a safe pointer): the address is in-bounds for
+`ptrBytes`, non-null, and aligned to a valid power-of-two `alignBytes`; the
+concrete type is inhabited; the borrow tag and every strict ancestor permit the
+access (or the global allocation is writable and in bounds; or for a zero-sized
+type, a non-null aligned dangling pointer `allocId = 0` is valid per
+`Places.lean:14620` and MiniRust `check_ptr`). -/
 def refDataValid
     (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
@@ -899,13 +1287,17 @@ def refDataValid
   | none => false
   | some addr =>
     match
-      !Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited
+      isPow2 e.alignBytes && Nat.blt addr (scalarModulus ptrBytes) &&
+        !Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited
     with
     | false => false
     | true =>
       match lookupBorrow mem.borrows p.tag with
       | some b =>
-        match borrowPermAllows b.perm dstMut && !b.allocDead with
+        match
+          borrowPermAllows b.perm dstMut && !b.allocDead &&
+            !treeBorrowAncestorsChildAccessUB (refAccessKind dstMut) mem.borrows b.parentTag
+        with
         | false => false
         | true =>
           match borrowAllocExtent? locals mem localDecls layouts b with
@@ -919,7 +1311,17 @@ def refDataValid
            | true, .not => false
            | _, _ => true) &&
             Nat.ble (p.offsetBytes + e.sizeBytes) (length alloc.bytes)
-        | none => false
+        | none =>
+          -- Valid dangling ZST reference (e.g. `NonNull::<()>::dangling()`):
+          -- `allocId = 0`, non-null aligned offset, `sizeBytes = 0`.
+          Nat.beq e.sizeBytes 0 && Nat.beq p.allocId 0 && !Nat.beq p.offsetBytes 0
+
+/-- Safe-reference validity of a provenance-less address word (valid only for a
+zero-sized, inhabited concrete type at a wrapped non-null aligned address). -/
+def refAddrValid (ptrBytes : Nat) (e : ProtoVTableEntry) (bits : Nat) : Bool :=
+  let wrapped := wrapScalarBits bits (scalarModulus ptrBytes)
+  isPow2 e.alignBytes && Nat.beq e.sizeBytes 0 && !Nat.beq wrapped 0 &&
+    Nat.beq (wrapped % e.alignBytes) 0 && !e.isUninhabited
 
 /-- Vtable pointer `Value` of the entry `e`. -/
 def vtablePtrOf (e : ProtoVTableEntry) : ProvenancePtr :=
@@ -950,27 +1352,6 @@ def resolveVTablePtr (vt : ProtoVTableTable) (pred : ProtoTraitPred) (vtPtr : Pr
       | true => .ok e
       | false => .invalidTrait
 
-/-- `pre` is a prefix of `full`, slot by slot (`Cast.unsizeIntoPointer`'s
-prefix-compatible upcast). -/
-def slotEq : ProtoVTableSlot → ProtoVTableSlot → Bool
-  | .dropInPlace a, .dropInPlace b =>
-    (match a, b with
-     | some x, some y => strEq x y
-     | none, none => true
-     | _, _ => false)
-  | .size, .size => true
-  | .align, .align => true
-  | .vacant, .vacant => true
-  | .method a, .method b => strEq a b
-  | .traitVPtr a, .traitVPtr b => Nat.beq a b
-  | _, _ => false
-
-/-- `pre` is a slot-wise prefix of `full`. -/
-def slotsPrefix : List ProtoVTableSlot → List ProtoVTableSlot → Bool
-  | [], _ => true
-  | _ :: _, [] => false
-  | a :: as, b :: bs => slotEq a b && slotsPrefix as bs
-
 /-- Supertrait vtable reached from the slots `slots` through a `.traitVPtr`
 slot whose vtable has trait object type `dstPred`. -/
 def findSupertraitVPtr (es : List ProtoVTableEntry) (dstPred : ProtoTraitPred) :
@@ -985,20 +1366,35 @@ def findSupertraitVPtr (es : List ProtoVTableEntry) (dstPred : ProtoTraitPred) :
     | none => findSupertraitVPtr es dstPred rest
   | _ :: rest => findSupertraitVPtr es dstPred rest
 
+/-- Fuel-bounded walk along `primarySuperVTable?` (prefix-compatible primary
+supertrait chain), matching `rustc`'s primary supertrait vtable prefix layout
+without permitting arbitrary unrelated 0-method marker traits. -/
+def findPrimarySuperVTable (es : List ProtoVTableEntry) (dstPred : ProtoTraitPred) :
+    Nat → ProtoVTableEntry → Option ProtoVTableEntry
+  | 0, _ => none
+  | fuel + 1, cur =>
+    match cur.primarySuperVTable? with
+    | none => none
+    | some supId =>
+      match lookupVTableById es supId with
+      | none => none
+      | some sup =>
+        match sameConcreteLayout sup cur && slotsPrefix sup.slots cur.slots with
+        | false => none
+        | true =>
+          match traitPredEq sup.traitPred dstPred with
+          | true => some sup
+          | false => findPrimarySuperVTable es dstPred fuel sup
+
 /-- Target vtable of the upcast of `e` to `dstPred`: through a `.traitVPtr`
-slot, or the vtable of the same concrete type whose slots are a prefix of
-`e`'s (`Miri.Interpreter.Cast.unsizeIntoPointer:179-205`). -/
+slot, or along the declared primary-supertrait prefix chain
+(`Miri.Interpreter.Cast.unsizeIntoPointer:179-205`). Unrelated traits (even
+0-method marker traits whose header is a slot prefix) are rejected. -/
 def upcastVTable? (es : List ProtoVTableEntry) (e : ProtoVTableEntry) (dstPred : ProtoTraitPred) :
     Option ProtoVTableEntry :=
   match findSupertraitVPtr es dstPred e.slots with
   | some s => some s
-  | none =>
-    match findVTableFor es e.concreteTyKey dstPred with
-    | some t =>
-      match slotsPrefix t.slots e.slots with
-      | true => some t
-      | false => none
-    | none => none
+  | none => findPrimarySuperVTable es dstPred (length es) e
 
 /-- Unsizing of an evaluated thin pointer `v` to a concrete type `tyKey` into a
 pointer to the trait object type `dstPred`.
@@ -1006,7 +1402,7 @@ pointer to the trait object type `dstPred`.
 A raw-to-raw coercion only pairs the data word with the vtable pointer: the
 data pointer may be null, dangling, misaligned, or provenance-less. A
 coercion from a reference additionally requires safe-reference validity
-(`refDataValid`). -/
+(`refDataValid` / `refAddrValid`). -/
 def unsizeSizedToDyn
     (vt : ProtoVTableTable) (ptrBytes : Nat) (srcKind : ProtoPtrKind) (dstMut : Bool)
     (dstPred : ProtoTraitPred) (tyKey : String) (v : Value)
@@ -1035,48 +1431,47 @@ def unsizeSizedToDyn
         | .raw => .ok (mkDynPtr ptrBytes (.addr bits) e) locals mem
         | .ref =>
           -- A provenance-less reference is valid only to a zero-sized type.
-          match
-            Nat.beq e.sizeBytes 0 && !Nat.beq bits 0 && Nat.beq (bits % e.alignBytes) 0 &&
-              !e.isUninhabited
-          with
+          match refAddrValid ptrBytes e bits with
           | true => .ok (mkDynPtr ptrBytes (.addr bits) e) locals mem
           | false => .ub
     | _ => .ub
 
 /-- Upcast (or identity coercion) of an evaluated trait-object pointer `v` of
 type `srcPred` into a pointer to `dstPred`. The incoming vtable pointer is
-validated first: a null, dangling, offset, non-vtable, or wrong-trait vtable
-pointer is UB. -/
+validated first, auto-trait fabrication (`dstPred.autoTraits ⊈ srcPred.autoTraits`)
+is UB, and provenance-less data addresses are wrapped modulo `2^(8 * ptrBytes)`
+before safe-reference validity is checked. -/
 def unsizeDynToDyn
     (vt : ProtoVTableTable) (ptrBytes : Nat) (srcKind : ProtoPtrKind) (dstMut : Bool)
     (srcPred dstPred : ProtoTraitPred) (v : Value)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable) : RvalueEvalResult :=
-  match decodeWidePtr? ptrBytes v with
-  | some ⟨d, .vtable vtPtr⟩ =>
-    match resolveVTablePtr vt srcPred vtPtr with
-    | .invalidPointer => .ub
-    | .invalidTrait => .ub
-    | .ok e =>
-      match (match traitPredEq srcPred dstPred with
-             | true => some e
-             | false => upcastVTable? vt.entries e dstPred) with
-      | none => .unsupported
-      | some target =>
-        match srcKind, d with
-        | .raw, _ => .ok (mkDynPtr ptrBytes d target) locals mem
-        | .ref, .prov p =>
-          match refDataValid ptrBytes target dstMut p locals mem localDecls layouts with
-          | true => .ok (mkDynPtr ptrBytes d target) locals mem
-          | false => .ub
-        | .ref, .addr bits =>
-          match
-            Nat.beq target.sizeBytes 0 && !Nat.beq bits 0 &&
-              Nat.beq (bits % target.alignBytes) 0 && !target.isUninhabited
-          with
-          | true => .ok (mkDynPtr ptrBytes d target) locals mem
-          | false => .ub
-  | _ => .ub
+  match autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+  | false => .ub
+  | true =>
+    match decodeWidePtr? ptrBytes v with
+    | some ⟨d, .vtable vtPtr⟩ =>
+      match resolveVTablePtr vt srcPred vtPtr with
+      | .invalidPointer => .ub
+      | .invalidTrait => .ub
+      | .ok e =>
+        match (match traitPredEq srcPred dstPred with
+               | true => some e
+               | false => upcastVTable? vt.entries e dstPred) with
+        | none => .unsupported
+        | some target =>
+          let d' := wrapDataWord ptrBytes d
+          match srcKind, d' with
+          | .raw, _ => .ok (mkDynPtr ptrBytes d' target) locals mem
+          | .ref, .prov p =>
+            match refDataValid ptrBytes target dstMut p locals mem localDecls layouts with
+            | true => .ok (mkDynPtr ptrBytes (.prov p) target) locals mem
+            | false => .ub
+          | .ref, .addr bits =>
+            match refAddrValid ptrBytes target bits with
+            | true => .ok (mkDynPtr ptrBytes (.addr bits) target) locals mem
+            | false => .ub
+    | _ => .ub
 
 /-- Unsizing of the evaluated operand `v` of pointer type `src` into a
 `dstKind` pointer of mutability `dstMut` to the trait object type `dstPred`. -/
@@ -1376,6 +1771,23 @@ theorem refDataValid_frozen_mut
     · rfl
     · simp only [hB, borrowPermAllows, hPerm, Bool.not_true, Bool.false_and]
 
+/-- A borrow tag whose strict ancestor in the Tree Borrows hierarchy forbids
+the access (e.g. a `.disabled` parent tag, or a `.frozen` parent tag for a
+mutable reference) is never a valid reference. -/
+theorem refDataValid_ancestor_ub
+    (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) (b : BorrowEntry)
+    (hB : lookupBorrow mem.borrows p.tag = some b)
+    (hAnc : treeBorrowAncestorsChildAccessUB (refAccessKind dstMut) mem.borrows b.parentTag = true) :
+    refDataValid ptrBytes e dstMut p locals mem localDecls layouts = false := by
+  unfold refDataValid
+  split
+  · rfl
+  · split
+    · rfl
+    · simp only [hB, hAnc, Bool.not_true, Bool.and_false]
+
 /-- A reference to an uninhabited concrete type is never valid (`kani#5216`). -/
 theorem refDataValid_uninhabited
     (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
@@ -1387,35 +1799,39 @@ theorem refDataValid_uninhabited
   · rfl
   · simp only [hU, Bool.not_true, Bool.and_false]
 
-/-- A null or misaligned address is never a valid reference. -/
+/-- A null, out-of-address-space, or misaligned address is never a valid reference. -/
 theorem refDataValid_null_or_misaligned
     (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable) (addr : Nat)
     (hAddr : ptrAddress? locals mem.borrows mem.callerLocals localDecls layouts ptrBytes p
       mem.callStack = some addr)
-    (hBad : addr = 0 ∨ addr % e.alignBytes ≠ 0) :
+    (hBad : addr = 0 ∨ addr % e.alignBytes ≠ 0 ∨ Nat.blt addr (scalarModulus ptrBytes) = false) :
     refDataValid ptrBytes e dstMut p locals mem localDecls layouts = false := by
   unfold refDataValid
   rw [hAddr]
-  have hc : (!Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited) = false := by
-    rcases hBad with h0 | hA
-    · subst h0; rfl
+  have hc :
+      (isPow2 e.alignBytes && Nat.blt addr (scalarModulus ptrBytes) &&
+        !Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited) = false := by
+    rcases hBad with h0 | hA | hOob
+    · subst h0; simp
     · have : Nat.beq (addr % e.alignBytes) 0 = false := by
         cases hb : Nat.beq (addr % e.alignBytes) 0 with
         | false => rfl
         | true => exact absurd (Nat.eq_of_beq_eq_true hb) hA
       rw [this]; simp
+    · rw [hOob]; simp
   simp only [hc]
 
-/-- A pointer with no borrow entry and no global allocation (null, dangling,
-a function pointer, or a vtable pointer) is never a valid reference. -/
+/-- A non-zero-sized pointer (or non-zero `allocId` dangling pointer) with no
+borrow entry and no global allocation is never a valid reference. -/
 theorem refDataValid_no_allocation
     (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable)
     (hB : lookupBorrow mem.borrows p.tag = none)
-    (hG : lookupGlobalAlloc mem.globals p.allocId = none) :
+    (hG : lookupGlobalAlloc mem.globals p.allocId = none)
+    (hNotZst : Nat.beq e.sizeBytes 0 = false ∨ Nat.beq p.allocId 0 = false) :
     refDataValid ptrBytes e dstMut p locals mem localDecls layouts = false := by
   unfold refDataValid
   split
@@ -1423,6 +1839,36 @@ theorem refDataValid_no_allocation
   · split
     · rfl
     · simp only [hB, hG]
+      rcases hNotZst with hSz | hId
+      · rw [hSz]; rfl
+      · rw [hId]; simp
+
+/-- **Valid dangling ZST reference** (matching `Places.lean:14620` and MiniRust
+`check_ptr`): a dangling `allocId = 0` pointer with non-null, in-bounds, aligned
+`offsetBytes` to an inhabited zero-sized concrete type passes `refDataValid`. -/
+theorem refDataValid_zst_dangling_ptr
+    (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (off : Nat)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hB : lookupBorrow mem.borrows 0 = none)
+    (hG : lookupGlobalAlloc mem.globals 0 = none)
+    (hPow : isPow2 e.alignBytes = true)
+    (hSz : e.sizeBytes = 0)
+    (hInh : e.isUninhabited = false)
+    (hNz : Nat.beq off 0 = false)
+    (hBound : Nat.blt off (scalarModulus ptrBytes) = true)
+    (hAlign : Nat.beq (off % e.alignBytes) 0 = true) :
+    refDataValid ptrBytes e dstMut { allocId := 0, offsetBytes := off }
+      locals mem localDecls layouts = true := by
+  unfold refDataValid
+  have hAddr :
+      ptrAddress? locals mem.borrows mem.callerLocals localDecls layouts ptrBytes
+        { allocId := 0, offsetBytes := off } mem.callStack = some off := by
+    simp only [ptrAddress?, ProvenancePtr.tag, hB]
+    exact congrArg some (Nat.zero_add off)
+  rw [hAddr]
+  simp only [hPow, hBound, hNz, hAlign, hInh, hSz, hB, hG, ProvenancePtr.tag, Nat.beq_refl,
+    Bool.not_false, Bool.and_true]
 
 /-- An out-of-bounds referent in a global allocation is never a valid
 reference. -/
@@ -1502,6 +1948,80 @@ theorem resolveVTablePtr_wrong_trait_invalid
   rw [hOff, hL]
   simp only [hT]
 
+/-- **No arbitrary marker-trait upcast.** If an entry has neither a `.traitVPtr`
+slot targeting `dstPred` nor a declared `primarySuperVTable?`, `upcastVTable?`
+returns `none` even if an unrelated 0-method marker trait vtable exists whose
+header is a slot prefix of `e.slots`. -/
+theorem upcastVTable?_rejects_unrelated_marker
+    (es : List ProtoVTableEntry) (e : ProtoVTableEntry) (dstPred : ProtoTraitPred)
+    (hNoVPtr : findSupertraitVPtr es dstPred e.slots = none)
+    (hNoPrim : e.primarySuperVTable? = none) :
+    upcastVTable? es e dstPred = none := by
+  unfold upcastVTable?
+  rw [hNoVPtr]
+  cases hLen : length es with
+  | zero => rfl
+  | succ n => simp only [findPrimarySuperVTable, hNoPrim]
+
+/-- **No auto-trait fabrication.** Upcasting or coercing `dyn srcPred` to
+`dyn dstPred` when `dstPred` adds an auto trait absent from `srcPred`
+(e.g. `&dyn Trait -> &dyn Trait + Send`) is UB. -/
+theorem unsizeDynToDyn_forbids_auto_trait_fabrication
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (srcKind : ProtoPtrKind) (dstMut : Bool)
+    (srcPred dstPred : ProtoTraitPred) (v : Value)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits = false) :
+    unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
+      .ub := by
+  unfold unsizeDynToDyn
+  simp only [hAuto]
+
+theorem wrapScalarBits_zero (m : Nat) : wrapScalarBits 0 m = 0 := by
+  unfold wrapScalarBits
+  cases Nat.ble m 0
+  · rfl
+  · exact Nat.zero_mod m
+
+/-- **Wrapped-null rejection on 32-bit/64-bit ZST reference upcast.** A
+provenance-less scalar address whose value wraps to `0` modulo `2^(8 * ptrBytes)`
+(e.g. `2^32` on 32-bit targets) is UB when coerced as a reference even for a
+zero-sized concrete type. -/
+theorem unsizeDynToDyn_zst_wrapped_null_ub
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (dstMut : Bool)
+    (srcPred dstPred : ProtoTraitPred) (bits : Nat) (vtPtr : ProvenancePtr)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (hWrap : wrapScalarBits bits (scalarModulus ptrBytes) = 0) :
+    unsizeDynToDyn vt ptrBytes .ref dstMut srcPred dstPred
+        (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes])
+        locals mem localDecls layouts = .ub ∨
+    unsizeDynToDyn vt ptrBytes .ref dstMut srcPred dstPred
+        (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes])
+        locals mem localDecls layouts = .unsupported := by
+  unfold unsizeDynToDyn
+  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+  | false => exact Or.inl rfl
+  | true =>
+    have hDec :
+        decodeWidePtr? ptrBytes (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes]) =
+          some ⟨.addr bits, .vtable vtPtr⟩ := by
+      simp only [decodeWidePtr?, decodeDataWord?, Nat.beq_refl]
+    simp only [hDec]
+    cases hRes : resolveVTablePtr vt srcPred vtPtr with
+    | invalidPointer => exact Or.inl rfl
+    | invalidTrait => exact Or.inl rfl
+    | ok e =>
+      dsimp only
+      cases (match traitPredEq srcPred dstPred with
+             | true => some e
+             | false => upcastVTable? vt.entries e dstPred) with
+      | none => exact Or.inr rfl
+      | some target =>
+        left
+        simp only [wrapDataWord, hWrap, refAddrValid, wrapScalarBits_zero,
+          Nat.beq_refl, Bool.not_true, Bool.and_false, Bool.false_and]
+
 /-- **Invalid incoming vtable pointer (`lean-miri#75/#79/#82`, `kani#5216`).**
 Upcasting a trait-object pointer whose vtable pointer does not resolve for the
 source trait object type is UB, for raw pointers and references alike. -/
@@ -1515,11 +2035,14 @@ theorem unsizeDynToDyn_invalid_vtable_ub
     unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
       .ub := by
   unfold unsizeDynToDyn
-  simp only [hDec]
-  cases hR : resolveVTablePtr vt srcPred vtPtr with
-  | ok e => exact absurd hR (hBad e)
-  | invalidPointer => rfl
-  | invalidTrait => rfl
+  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+  | false => rfl
+  | true =>
+    simp only [hDec]
+    cases hR : resolveVTablePtr vt srcPred vtPtr with
+    | ok e => exact absurd hR (hBad e)
+    | invalidPointer => rfl
+    | invalidTrait => rfl
 
 /-- A source that is not a trait-object pointer with a vtable-pointer word (a
 thin pointer, or a pair whose metadata is a slice length or a dangling integer)
@@ -1533,10 +2056,14 @@ theorem unsizeDynToDyn_non_vtable_meta_ub
     unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
       .ub := by
   unfold unsizeDynToDyn
-  split
-  · rename_i d vtPtr heq
-    exact absurd heq (hDec d vtPtr)
-  · rfl
+  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+  | false => rfl
+  | true =>
+    dsimp only
+    split
+    · rename_i d vtPtr heq
+      exact absurd heq (hDec d vtPtr)
+    · rfl
 
 /-! ## §4. Vtable-backed dynamic layout (`size_of_val` / `align_of_val`) -/
 
@@ -1713,13 +2240,14 @@ theorem dynLayoutOfValProto_failsClosed
 /-! ## §5. Virtual method dispatch and the Tree Borrows receiver protector -/
 
 /-- A virtual call site (`InstanceKind::Virtual(def_id, idx)`): the trait
-object type of the receiver, the vtable slot index, and whether the receiver is
+object type of the receiver, the vtable slot index, whether the receiver is
 a reference (`&dyn Trait`, `&mut dyn Trait`) or a raw pointer / other
-`DispatchFromDyn` receiver. -/
+`DispatchFromDyn` receiver, and (when a reference) whether it is mutable. -/
 structure ProtoVirtualCallSite : Type where
   traitPred : ProtoTraitPred
   slotIdx : Nat
   receiverIsRef : Bool
+  receiverIsMut : Bool := false
 
 /-- Outcome of resolving and entering a virtual call. -/
 inductive ProtoVirtualCallResult : Type where
@@ -1748,26 +2276,40 @@ def unwrapDispatchReceiver (ptrBytes : Nat) : Nat → Value → Option ProtoWide
         | _ => none
       | _ => none
 
+/-- Receiver mutability compatibility between the virtual call site and the
+concrete callee's `_1` parameter: an immutable `&dyn Trait` call site cannot
+dispatch to a callee expecting `&mut Self`. -/
+def virtualCalleeReceiverOk (site : ProtoVirtualCallSite) (callee : CapturedMir) : Bool :=
+  match site.receiverIsRef, site.receiverIsMut, get? callee.localDecls 1 with
+  | true, false, some { ty := { kind := .ref .mut _, .. }, .. } => false
+  | _, _, _ => true
+
 /-- ABI validation of the concrete callee against the call: not an intrinsic
-ABI, the same argument count, and (when the ABI is captured) a pointer-sized
-thin receiver. -/
-def virtualCalleeAbiOk (ptrBytes : Nat) (callee : CapturedMir) (argCount : Nat) : Bool :=
+ABI, the same argument count, compatible receiver mutability, and (when the ABI
+is captured) a pointer-sized thin receiver. -/
+def virtualCalleeAbiOk (ptrBytes : Nat) (site : ProtoVirtualCallSite) (callee : CapturedMir)
+    (argCount : Nat) : Bool :=
   !callConvEq callee.fnAbi.conv .rustIntrinsic && Nat.beq callee.argCount argCount &&
+    virtualCalleeReceiverOk site callee &&
     (match callee.fnAbi.args with
      | [] => true
      | recvAbi :: _ =>
        Nat.beq (length callee.fnAbi.args) argCount &&
          Nat.beq recvAbi.layout.size.bytes ptrBytes)
 
-/-- Return ABI compatibility: when the destination type has a known size and
-the callee ABI is captured, the sizes agree. -/
-def virtualRetAbiOk (callerBody callee : CapturedMir) (destination : Place) : Bool :=
-  match callee.fnAbi.args, placeTy callerBody.localDecls callerBody.layouts destination with
-  | _ :: _, some dstTy =>
-    match tyByteSize callerBody.localDecls callerBody.layouts dstTy with
-    | some n => Nat.beq n callee.fnAbi.ret.layout.size.bytes
-    | none => true
-  | _, _ => true
+/-- Return ABI compatibility: for non-diverging calls, when the destination
+type has a known size and the callee ABI is captured, the sizes agree. -/
+def virtualRetAbiOk (callerBody callee : CapturedMir) (destination : Place)
+    (target : Option BasicBlockIdx := some 0) : Bool :=
+  match target with
+  | none => true
+  | some _ =>
+    match callee.fnAbi.args, placeTy callerBody.localDecls callerBody.layouts destination with
+    | _ :: _, some dstTy =>
+      match tyByteSize callerBody.localDecls callerBody.layouts dstTy with
+      | some n => Nat.beq n callee.fnAbi.ret.layout.size.bytes
+      | none => true
+    | _, _ => true
 
 /-- **Step 4: receiver call-frame protector.** After the callee frame is
 pushed, retag the narrowed receiver `_1` with `Trusted`'s own function-entry
@@ -1796,7 +2338,22 @@ def protectVirtualReceiver (s1 : MachineState) (callee : CapturedMir) (p : Prove
       | .vis (.inl (.fail .ub)) _ => .ub
       | _ => .unsupported
 
-/-- **`evalVirtualCallProto`.**
+/-- Reference-receiver validity check performed before callee dispatch (for
+both linked and unlinked callees): enforces `site.receiverIsMut` (rejecting
+`.frozen` tags and immutable globals on `&mut dyn Trait` calls) and ZST
+validity for provenance-less addresses. -/
+def virtualReceiverValid
+    (ptrBytes : Nat) (site : ProtoVirtualCallSite) (e : ProtoVTableEntry) (d : ProtoDataWord)
+    (locals' : List LocalSlot) (mem : Memory) (callerBody : CapturedMir) : Bool :=
+  match site.receiverIsRef, d with
+  | false, _ => true
+  | true, .prov p =>
+    refDataValid ptrBytes e site.receiverIsMut p locals' mem callerBody.localDecls
+      callerBody.layouts
+  | true, .addr bits => refAddrValid ptrBytes e bits
+
+/-- **`evalVirtualCallProtoOpt`** (supporting both returning `target = some bb`
+and diverging `target = none` calls).
 
 1. *Argument initialization gate (`kani#5172`).* The receiver and all
    arguments are evaluated first; a UB operand (dead local, uninitialized read)
@@ -1806,15 +2363,17 @@ def protectVirtualReceiver (s1 : MachineState) (callee : CapturedMir) (p : Prove
    whose vtable pointer resolves for the site's trait object type; the slot
    must be a method, otherwise the call is UB ("dyn call trying to call
    something that is not a method").
-3. *Receiver narrowing and ABI validation.* Argument `0` becomes the thin data
-   word (allocation, offset, and tag preserved); the concrete callee must be
-   ABI compatible. A method body that is not linked is an external call.
+3. *Receiver validity, narrowing, and ABI validation.* A reference receiver is
+   validated with `site.receiverIsMut` (`refDataValid` / `refAddrValid`) BEFORE
+   callee lookup, so even unlinked calls fault UB on invalid `&dyn`/`&mut dyn`
+   receivers. Argument `0` becomes the thin data word (allocation, offset, and
+   tag preserved); linked callees must pass ABI and receiver-mutability checks.
 4. *Receiver protector.* A reference receiver is retagged under a fresh
    call-frame protector (`protectVirtualReceiver`). -/
-def evalVirtualCallProto
+def evalVirtualCallProtoOpt
     (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
     (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
-    (target : BasicBlockIdx) (unwind : UnwindAction) : ProtoVirtualCallResult :=
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) : ProtoVirtualCallResult :=
   let layouts := callerBody.layouts
   let ptrBytes := layoutPointerBytes layouts
   match
@@ -1844,37 +2403,40 @@ def evalVirtualCallProto
               | .ok e =>
                 match get? e.slots site.slotIdx with
                 | some (.method defPath) =>
-                  let thinRecv := encodeDataWord ptrBytes d
-                  match lookupCallee s.memory.callees layouts defPath [] s.memory.traitImpls with
-                  | none => .externalCall defPath (thinRecv :: rest) locals'
-                  | some callee =>
-                    match
-                      virtualCalleeAbiOk ptrBytes callee (length argVals) &&
-                        virtualRetAbiOk callerBody callee destination
-                    with
-                    | false => .ub
-                    | true =>
-                      let s1 :=
-                        pushCalleeFrame s callerBody locals' destination target callee
-                          (thinRecv :: rest) unwind
-                      match site.receiverIsRef, d with
-                      | true, .prov p =>
-                        match
-                          refDataValid ptrBytes e false p locals' s.memory callerBody.localDecls
-                            layouts
-                        with
-                        | false => .ub
-                        | true => protectVirtualReceiver s1 callee p ptrBytes
-                      | true, .addr bits =>
-                        match
-                          Nat.beq e.sizeBytes 0 && !Nat.beq bits 0 &&
-                            Nat.beq (bits % e.alignBytes) 0 && !e.isUninhabited
-                        with
-                        | true => .enter s1 callee none
-                        | false => .ub
-                      | false, _ => .enter s1 callee none
+                  let d' := wrapDataWord ptrBytes d
+                  match virtualReceiverValid ptrBytes site e d' locals' s.memory callerBody with
+                  | false => .ub
+                  | true =>
+                    let thinRecv := encodeDataWord ptrBytes d'
+                    match lookupCallee s.memory.callees layouts defPath [] s.memory.traitImpls with
+                    | none => .externalCall defPath (thinRecv :: rest) locals'
+                    | some callee =>
+                      match
+                        virtualCalleeAbiOk ptrBytes site callee (length argVals) &&
+                          virtualRetAbiOk callerBody callee destination target
+                      with
+                      | false => .ub
+                      | true =>
+                        let s1 :=
+                          match target with
+                          | some bb =>
+                            pushCalleeFrame s callerBody locals' destination bb callee
+                              (thinRecv :: rest) unwind
+                          | none =>
+                            pushDivergingCalleeFrame s callerBody locals' destination unwind callee
+                              (thinRecv :: rest)
+                        match site.receiverIsRef, d' with
+                        | true, .prov p => protectVirtualReceiver s1 callee p ptrBytes
+                        | _, _ => .enter s1 callee none
                 | _ => .ub
             | _ => .ub
+
+/-- **`evalVirtualCallProto`** for returning virtual calls (`target : BasicBlockIdx`). -/
+def evalVirtualCallProto
+    (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : BasicBlockIdx) (unwind : UnwindAction) : ProtoVirtualCallResult :=
+  evalVirtualCallProtoOpt vt site s callerBody argOps destination (some target) unwind
 
 /-- **Uninitialized argument gate (`kani#5172`).** If evaluating the arguments
 is UB, the virtual call is UB whatever the vtable table, the site, and the
@@ -1886,7 +2448,7 @@ theorem evalVirtualCallProto_operand_ub
     (hOps : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
       callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) = .ub) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind = .ub := by
-  unfold evalVirtualCallProto
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps]
 
 /-- **Uninitialized argument gate, value form.** If any evaluated argument (the
@@ -1903,7 +2465,7 @@ theorem evalVirtualCallProto_uninit_arg_ub
         .ok argVals locals')
     (hUninit : valueListContainsUninit argVals = true) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind = .ub := by
-  unfold evalVirtualCallProto
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps, hUninit]
 
 /-- **Fail-closed existential boundary at a call.** With initialized
@@ -1921,7 +2483,7 @@ theorem evalVirtualCallProto_failsClosed
     (hFail : site.traitPred.failsClosed = true) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind =
       .unsupported := by
-  unfold evalVirtualCallProto
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps, hInit, hFail]
 
 /-- **Non-method slot.** With initialized arguments and a receiver whose vtable
@@ -1944,7 +2506,7 @@ theorem evalVirtualCallProto_non_method_slot_ub
     (hRes : resolveVTablePtr vt site.traitPred vtPtr = .ok e)
     (hSlot : ∀ defPath, get? e.slots site.slotIdx ≠ some (.method defPath)) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind = .ub := by
-  unfold evalVirtualCallProto
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps, hInit, hFail, hEnv, hRecv, hRes]
 
 /-- **Invalid vtable pointer at a call.** With initialized arguments, a
@@ -1965,17 +2527,44 @@ theorem evalVirtualCallProto_invalid_vtable_ub
       some ⟨d, .vtable vtPtr⟩)
     (hBad : ∀ e, resolveVTablePtr vt site.traitPred vtPtr ≠ .ok e) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind = .ub := by
-  unfold evalVirtualCallProto
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps, hInit, hFail, hEnv, hRecv]
   cases hR : resolveVTablePtr vt site.traitPred vtPtr with
   | ok e => exact absurd hR (hBad e)
   | invalidPointer => rfl
   | invalidTrait => rfl
 
-/-- **Receiver narrowing.** When the method body is not linked, the call is an
-external call whose first argument is exactly the thin data word of the
-receiver: allocation, offset, and tag are preserved, the vtable word is gone,
-and the trailing arguments are unchanged. -/
+/-- **Reference receiver validity precedes callee lookup.** An invalid
+reference receiver (including a `&mut dyn Trait` call on a `.frozen` tag or
+immutable global, or any invalid `&dyn Trait`) is UB even when the concrete
+callee body is NOT linked (never `.externalCall`). -/
+theorem evalVirtualCallProto_invalid_ref_before_callee_ub
+    (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : BasicBlockIdx) (unwind : UnwindAction) (recv : Value) (rest : List Value)
+    (locals' : List LocalSlot) (d : ProtoDataWord) (vtPtr : ProvenancePtr)
+    (e : ProtoVTableEntry) (defPath : String)
+    (hOps : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals
+      callerBody.layouts s.memory.callerLocals (callStack := s.memory.callStack) =
+        .ok (recv :: rest) locals')
+    (hInit : valueListContainsUninit (recv :: rest) = false)
+    (hFail : site.traitPred.failsClosed = false)
+    (hEnv : vtableEnvOk (layoutPointerBytes callerBody.layouts) vt s.memory = true)
+    (hRecv : unwrapDispatchReceiver (layoutPointerBytes callerBody.layouts) 4 recv =
+      some ⟨d, .vtable vtPtr⟩)
+    (hRes : resolveVTablePtr vt site.traitPred vtPtr = .ok e)
+    (hSlot : get? e.slots site.slotIdx = some (.method defPath))
+    (hInvalid : virtualReceiverValid (layoutPointerBytes callerBody.layouts) site e
+      (wrapDataWord (layoutPointerBytes callerBody.layouts) d) locals' s.memory callerBody =
+        false) :
+    evalVirtualCallProto vt site s callerBody argOps destination target unwind = .ub := by
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
+  simp only [hOps, hInit, hFail, hEnv, hRecv, hRes, hSlot, hInvalid]
+
+/-- **Receiver narrowing.** When a valid receiver's method body is not linked,
+the call is an external call whose first argument is the narrowed thin data word
+(allocation, offset, and tag preserved; vtable word removed; trailing arguments
+unchanged). -/
 theorem evalVirtualCallProto_narrows_receiver
     (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
     (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
@@ -1992,13 +2581,17 @@ theorem evalVirtualCallProto_narrows_receiver
       some ⟨d, .vtable vtPtr⟩)
     (hRes : resolveVTablePtr vt site.traitPred vtPtr = .ok e)
     (hSlot : get? e.slots site.slotIdx = some (.method defPath))
+    (hValid : virtualReceiverValid (layoutPointerBytes callerBody.layouts) site e
+      (wrapDataWord (layoutPointerBytes callerBody.layouts) d) locals' s.memory callerBody =
+        true)
     (hCallee : lookupCallee s.memory.callees callerBody.layouts defPath []
       s.memory.traitImpls = none) :
     evalVirtualCallProto vt site s callerBody argOps destination target unwind =
       .externalCall defPath
-        (encodeDataWord (layoutPointerBytes callerBody.layouts) d :: rest) locals' := by
-  unfold evalVirtualCallProto
-  simp only [hOps, hInit, hFail, hEnv, hRecv, hRes, hSlot, hCallee]
+        (encodeDataWord (layoutPointerBytes callerBody.layouts)
+          (wrapDataWord (layoutPointerBytes callerBody.layouts) d) :: rest) locals' := by
+  unfold evalVirtualCallProto evalVirtualCallProtoOpt
+  simp only [hOps, hInit, hFail, hEnv, hRecv, hRes, hSlot, hValid, hCallee]
 
 /-! ### Ranged Tree Borrows view of the receiver protector
 
@@ -2109,14 +2702,21 @@ def evalWideAddrEqProto (p q : Value) (locals : List LocalSlot) (mem : Memory)
   | _, _ => .ub
 
 /-- **Wide pointer `==`.** Compares `(data address, metadata word)` with
-`evalWidePtrRelBinOp .eq`. -/
+`evalWidePtrRelBinOp .eq` on homogeneous wide pointers (both `.vtable` or both
+`.sliceLen`); rejects `.uninit`, non-wide pointers, width mismatches, and
+heterogeneous metadata kinds (`.sliceLen` vs `.vtable`) with `.ub`, matching
+MiniRust `comparePtrM`. -/
 def evalWidePtrEqProto (p q : Value) (locals : List LocalSlot) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
-  match p, q with
-  | .aggregate 0 [pThin, pMeta], .aggregate 0 [qThin, qMeta] =>
-    evalWidePtrRelBinOp .eq pThin pMeta qThin qMeta locals mem localDecls layouts
-      (layoutPointerBytes layouts)
-  | _, _ => .unsupported
+  let ptrBytes := layoutPointerBytes layouts
+  match decodeWidePtr? ptrBytes p, decodeWidePtr? ptrBytes q with
+  | some ⟨dp, .vtable vp⟩, some ⟨dq, .vtable vq⟩ =>
+    evalWidePtrRelBinOp .eq (encodeDataWord ptrBytes dp) (.ptr vp ptrBytes)
+      (encodeDataWord ptrBytes dq) (.ptr vq ptrBytes) locals mem localDecls layouts ptrBytes
+  | some ⟨dp, .sliceLen lp⟩, some ⟨dq, .sliceLen lq⟩ =>
+    evalWidePtrRelBinOp .eq (encodeDataWord ptrBytes dp) (.scalar ⟨lp, ptrBytes⟩)
+      (encodeDataWord ptrBytes dq) (.scalar ⟨lq, ptrBytes⟩) locals mem localDecls layouts ptrBytes
+  | _, _ => .ub
 
 /-- **`addr_eq` ignores ALL metadata.** For every pair of data words and every
 combination of metadata on either side (`.thin`, `.sliceLen n`,
@@ -2161,6 +2761,32 @@ theorem evalWideAddrEqProto_uninit_ub (q : Value) (locals : List LocalSlot)
     · rename_i h1 h2; cases h2
     · rfl
 
+/-- Wide `==` on `.uninit` is UB. -/
+theorem evalWidePtrEqProto_uninit_ub (q : Value) (locals : List LocalSlot)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalWidePtrEqProto .uninit q locals mem localDecls layouts = .ub ∧
+    evalWidePtrEqProto q .uninit locals mem localDecls layouts = .ub := by
+  constructor
+  · rfl
+  · unfold evalWidePtrEqProto
+    dsimp only
+    split <;> first | rfl | (rename_i h2; cases h2)
+
+/-- Wide `==` rejects heterogeneous wide metadata (slice length vs vtable pointer) with UB. -/
+theorem evalWidePtrEqProto_heterogeneous_meta_ub
+    (d₁ d₂ : ProtoDataWord) (len : Nat) (vtPtr : ProvenancePtr) (locals : List LocalSlot)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    evalWidePtrEqProto
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₁, .sliceLen len⟩)
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₂, .vtable vtPtr⟩)
+        locals mem localDecls layouts = .ub ∧
+    evalWidePtrEqProto
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₁, .vtable vtPtr⟩)
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₂, .sliceLen len⟩)
+        locals mem localDecls layouts = .ub := by
+  unfold evalWidePtrEqProto
+  simp only [decodeWidePtr?_encodeWidePtr, and_self]
+
 /-- `PtrToPtr` to a thin raw pointer erases the vtable word of a trait-object
 pointer with provenance and keeps the data pointer exactly. -/
 theorem evalCastPtrToPtr_dyn_to_thin
@@ -2176,11 +2802,114 @@ theorem evalCastPtrToPtr_dyn_to_thin
   unfold evalCastPtrToPtr
   simp only [hOp, Nat.beq_refl, Bool.and_self, hThin]
 
+/-- `PtrToPtr` to a thin raw pointer erases the vtable word of a provenance-less
+trait-object pointer and preserves the wrapped scalar address. -/
+theorem evalCastPtrToPtr_dyn_scalar_to_thin
+    (locals locals' : List LocalSlot) (op : Operand) (targetTy : Ty) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (bits : Nat) (vt : ProvenancePtr)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (.aggregate 0
+              [.scalar ⟨bits, layoutPointerBytes layouts⟩,
+               .ptr vt (layoutPointerBytes layouts)])
+          locals')
+    (hThin : isThinRawPtrTy targetTy = true) :
+    evalCastPtrToPtr locals op targetTy mem localDecls layouts =
+      .ok (.scalar ⟨wrapScalarBits bits (scalarModulus (layoutPointerBytes layouts)),
+                    layoutPointerBytes layouts⟩) locals' mem := by
+  unfold evalCastPtrToPtr
+  simp only [hOp, Nat.beq_refl, Bool.and_self, hThin]
+
+theorem wrapScalarBits_idem (bits m : Nat) :
+    wrapScalarBits (wrapScalarBits bits m) m = wrapScalarBits bits m := by
+  unfold wrapScalarBits
+  cases h : Nat.ble m bits with
+  | false => simp only [h]
+  | true =>
+    cases m with
+    | zero =>
+      change (match Nat.ble 0 (bits % 0) with | true => (bits % 0) % 0 | false => bits % 0) = bits % 0
+      simp only [Nat.mod_zero, h]
+    | succ k =>
+      have hlt : bits % (k + 1) < k + 1 := Nat.mod_lt bits (Nat.succ_pos k)
+      have hble : Nat.ble (k + 1) (bits % (k + 1)) = false := by
+        cases hb : Nat.ble (k + 1) (bits % (k + 1)) with
+        | false => rfl
+        | true => exact absurd (Nat.le_of_ble_eq_true hb) (Nat.not_le_of_gt hlt)
+      change (match Nat.ble (k + 1) (bits % (k + 1)) with
+              | true => (bits % (k + 1)) % (k + 1)
+              | false => bits % (k + 1)) = bits % (k + 1)
+      rw [hble]
+
+theorem evalScalarBinOp_eq_irrel_signed (x y : ScalarInt) (locals : List LocalSlot)
+    (mem : Memory) (s₁ s₂ : Bool) :
+    evalScalarBinOp .eq x y locals mem s₁ = evalScalarBinOp .eq x y locals mem s₂ :=
+  rfl
+
 /-- **`addr_eq` is the MIR fat-to-thin lowering** `(p as *const ()) == (q as
-*const ())`. When the operands `lhsOp` / `rhsOp` read the thin pointers that
-`evalCastPtrToPtr_dyn_to_thin` produces from two trait-object pointers, the
-thin-pointer `BinOp.eq` of `evalRvalue` returns exactly `evalWideAddrEqProto`
-on the two wide pointers. -/
+*const ())` across ALL combinations of provenance / provenance-less data words
+and ALL metadata variants (`.thin`, `.sliceLen`, `.vtable`). When `lhsOp` /
+`rhsOp` evaluate to the wrapped thin data words produced by `evalCastPtrToPtr`,
+`evalRvalue (.binaryOp .eq lhsOp rhsOp)` equals `evalWideAddrEqProto` on the
+wide (or thin) pointers. -/
+theorem evalWideAddrEqProto_eq_thin_binop_eq_all_words
+    (locals : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (d₁ d₂ : ProtoDataWord) (m₁ m₂ : ProtoWidePtrMeta)
+    (hL : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (encodeDataWord (layoutPointerBytes layouts)
+              (wrapDataWord (layoutPointerBytes layouts) d₁)) locals)
+    (hR : evalOperand locals rhsOp mem.borrows mem.globals layouts mem.callerLocals localDecls
+      mem.callStack =
+        .ok (encodeDataWord (layoutPointerBytes layouts)
+              (wrapDataWord (layoutPointerBytes layouts) d₂)) locals)
+    (hRel : isPtrRelationalBinOp .eq localDecls layouts lhsOp rhsOp = true) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem localDecls layouts =
+      evalWideAddrEqProto
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₁, m₁⟩)
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d₂, m₂⟩)
+        locals mem localDecls layouts := by
+  rw [evalWideAddrEqProto_ignores_metadata]
+  cases d₁ with
+  | prov a =>
+    cases d₂ with
+    | prov b =>
+      simp only [wrapDataWord, encodeDataWord] at hL hR
+      simp only [thinWordAddrEq, encodeDataWord, resolveWideWordScalar?, Nat.beq_refl]
+      unfold evalRvalue
+      simp only [hL, hR, hRel]
+      generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
+        (layoutPointerBytes layouts) a (layoutPointerBytes layouts) mem.callStack = x
+      generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
+        (layoutPointerBytes layouts) b (layoutPointerBytes layouts) mem.callStack = y
+      cases x <;> cases y <;> rfl
+    | addr b =>
+      simp only [wrapDataWord, encodeDataWord] at hL hR
+      simp only [thinWordAddrEq, encodeDataWord, resolveWideWordScalar?, Nat.beq_refl]
+      unfold evalRvalue
+      simp only [hL, hR, hRel]
+      generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
+        (layoutPointerBytes layouts) a (layoutPointerBytes layouts) mem.callStack = x
+      cases x <;> rfl
+  | addr a =>
+    cases d₂ with
+    | prov b =>
+      simp only [wrapDataWord, encodeDataWord] at hL hR
+      simp only [thinWordAddrEq, encodeDataWord, resolveWideWordScalar?, Nat.beq_refl]
+      unfold evalRvalue
+      simp only [hL, hR, hRel]
+      generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
+        (layoutPointerBytes layouts) b (layoutPointerBytes layouts) mem.callStack = y
+      cases y <;> rfl
+    | addr b =>
+      simp only [wrapDataWord, encodeDataWord] at hL hR
+      simp only [thinWordAddrEq, encodeDataWord, resolveWideWordScalar?, Nat.beq_refl]
+      unfold evalRvalue
+      simp only [hL, hR]
+      exact evalScalarBinOp_eq_irrel_signed _ _ locals mem _ false
+
+/-- Specialization to two provenance trait-object pointers (`&dyn A` vs `&dyn B`). -/
 theorem evalWideAddrEqProto_eq_thin_ptr_binop_eq
     (locals : List LocalSlot) (lhsOp rhsOp : Operand) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (a b va vb : ProvenancePtr)
@@ -2193,30 +2922,9 @@ theorem evalWideAddrEqProto_eq_thin_ptr_binop_eq
       evalWideAddrEqProto
         (.aggregate 0 [.ptr a (layoutPointerBytes layouts), .ptr va (layoutPointerBytes layouts)])
         (.aggregate 0 [.ptr b (layoutPointerBytes layouts), .ptr vb (layoutPointerBytes layouts)])
-        locals mem localDecls layouts := by
-  have hRhs :
-      evalWideAddrEqProto
-        (.aggregate 0 [.ptr a (layoutPointerBytes layouts), .ptr va (layoutPointerBytes layouts)])
-        (.aggregate 0 [.ptr b (layoutPointerBytes layouts), .ptr vb (layoutPointerBytes layouts)])
-        locals mem localDecls layouts =
-      (match
-        ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) a (layoutPointerBytes layouts) mem.callStack,
-        ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
-          (layoutPointerBytes layouts) b (layoutPointerBytes layouts) mem.callStack
-       with
-       | some x, some y => evalScalarBinOp .eq x y locals mem false
-       | _, _ => .unsupported) := by
-    simp only [evalWideAddrEqProto, decodeWidePtr?, decodeDataWord?, Nat.beq_refl, thinWordAddrEq,
-      encodeDataWord, resolveWideWordScalar?]
-  rw [hRhs]
-  unfold evalRvalue
-  simp only [hL, hR, hRel]
-  generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
-    (layoutPointerBytes layouts) a (layoutPointerBytes layouts) mem.callStack = x
-  generalize ptrAddressScalar? locals mem.borrows mem.callerLocals localDecls layouts
-    (layoutPointerBytes layouts) b (layoutPointerBytes layouts) mem.callStack = y
-  cases x <;> cases y <;> rfl
+        locals mem localDecls layouts :=
+  evalWideAddrEqProto_eq_thin_binop_eq_all_words locals lhsOp rhsOp mem localDecls layouts
+    (.prov a) (.prov b) (.vtable va) (.vtable vb) hL hR hRel
 
 /-- The canonical address word of a pointer that has no borrow entry is its
 allocation page plus its offset, wrapped to the pointer width. -/
@@ -2232,28 +2940,29 @@ theorem resolveWideWordScalar?_unborrowed
           sizeBytes := ptrBytes } := by
   simp only [resolveWideWordScalar?, Nat.beq_refl, ptrAddressScalar?, ptrAddress?, hB]
 
-/-- **Wide `==` compares the metadata word.** Two wide pointers with the same
-data word whose metadata words have different canonical addresses are unequal
-under `evalWidePtrEqProto` (that is, `evalWidePtrRelBinOp .eq`), while
-`addr_eq` on the same pair is the reflexive address comparison of the data
-word. -/
+/-- **Wide `==` compares the metadata word.** Two trait-object pointers with
+the same data word whose vtable pointers have different canonical addresses are
+unequal under `evalWidePtrEqProto` (`evalWidePtrRelBinOp .eq`), while `addr_eq`
+on the same pair ignores the vtables. -/
 theorem evalWidePtrEqProto_same_data_distinct_meta
-    (dataW metaA metaB : Value) (locals : List LocalSlot) (mem : Memory)
+    (d : ProtoDataWord) (va vb : ProvenancePtr) (locals : List LocalSlot) (mem : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) (x ma mb : ScalarInt)
-    (hD : resolveWideWordScalar? dataW locals mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) mem.callStack = some x)
-    (hA : resolveWideWordScalar? metaA locals mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) mem.callStack = some ma)
-    (hB : resolveWideWordScalar? metaB locals mem.borrows mem.callerLocals localDecls layouts
-      (layoutPointerBytes layouts) mem.callStack = some mb)
+    (hD : resolveWideWordScalar? (encodeDataWord (layoutPointerBytes layouts) d) locals mem.borrows
+      mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = some x)
+    (hA : resolveWideWordScalar? (.ptr va (layoutPointerBytes layouts)) locals mem.borrows
+      mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = some ma)
+    (hB : resolveWideWordScalar? (.ptr vb (layoutPointerBytes layouts)) locals mem.borrows
+      mem.callerLocals localDecls layouts (layoutPointerBytes layouts) mem.callStack = some mb)
     (hSz : Nat.beq ma.sizeBytes 0 = false)
     (hSzEq : Nat.beq ma.sizeBytes mb.sizeBytes = true)
     (hNe : Nat.beq ma.bits mb.bits = false) :
-    evalWidePtrEqProto (.aggregate 0 [dataW, metaA]) (.aggregate 0 [dataW, metaB]) locals mem
+    evalWidePtrEqProto
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d, .vtable va⟩)
+        (encodeWidePtr (layoutPointerBytes layouts) ⟨d, .vtable vb⟩) locals mem
         localDecls layouts =
       .ok (.scalar (boolToScalar false)) locals mem := by
-  simp only [evalWidePtrEqProto, evalWidePtrRelBinOp, hD, hA, hB, Nat.beq_refl,
-    evalScalarBinOp, hSz, hSzEq, hNe]
+  simp only [evalWidePtrEqProto, decodeWidePtr?_encodeWidePtr, evalWidePtrRelBinOp,
+    hD, hA, hB, Nat.beq_refl, evalScalarBinOp, hSz, hSzEq, hNe]
 
 /-! ## Spine normalization for kernel evaluation
 
@@ -2587,10 +3296,10 @@ inductive VirtualSiteResolution : Type where
 
 /-- A call is virtual when its callee is a registered virtual method whose
 `Self` type argument is a trait object (`<dyn Trait as Trait>::method`). The
-receiver kind comes from the type of the first argument. A registered virtual
-method whose predicate list was not captured fails closed; a callee that is not
-a registered virtual method is left to `stepMirFn` (which requests an external
-call when no body is linked). -/
+receiver kind and mutability come from the type of the first argument. A
+registered virtual method whose predicate list was not captured fails closed;
+a callee that is not a registered virtual method is left to `stepMirFn` (which
+requests an external call when no body is linked). -/
 def virtualCallSite? (prog : ProtoDynProgram) (callerBody : CapturedMir) (func : Operand)
     (argOps : List Operand) : VirtualSiteResolution :=
   match extractCallee? func with
@@ -2601,14 +3310,16 @@ def virtualCallSite? (prog : ProtoDynProgram) (callerBody : CapturedMir) (func :
       match lookupDynPred prog.vtables.dynTypes traitKey with
       | none => .unsupported
       | some pred =>
-        let isRef :=
+        let (isRef, isMut) :=
           match argOps with
           | recvOp :: _ =>
             match operandTy callerBody.localDecls callerBody.layouts recvOp with
-            | some { kind := .ref _ _, .. } => true
-            | _ => false
-          | [] => false
-        .site { traitPred := pred, slotIdx := slotIdx, receiverIsRef := isRef }
+            | some { kind := .ref m _, .. } => (true, V06.lowerMut m)
+            | _ => (false, false)
+          | [] => (false, false)
+        .site
+          { traitPred := pred, slotIdx := slotIdx, receiverIsRef := isRef,
+            receiverIsMut := isMut }
   | _ => .notVirtual
 
 /-- A borrow entry targets the local `loc` of the frame at depth `depth`. -/
@@ -2646,18 +3357,38 @@ def stepUnsizeAssignProto (vt : ProtoVTableTable) (s : MachineState) (currentBod
           | some locals'' => MirStepNode.step (advanceStmt s locals'' mem')
           | none => MirStepNode.fail .ub
 
-/-- Virtual call terminator. -/
-def stepVirtualCallProto (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+/-- Resume continuation for an external call supporting both returning
+(`target = some bb`) and diverging (`target = none`, where returning normally
+is UB) call terminators. -/
+def resumeExternalCallOpt
+    (s : MachineState) (localsAfterArgs : List LocalSlot) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) (ans : MirCallAns) : MirExecState :=
+  match target with
+  | some bb => resumeExternalCall s localsAfterArgs destination bb unwind ans
+  | none =>
+    match ans with
+    | .returned _ _ => .faulted .ub
+    | _ => resumeExternalCall s localsAfterArgs destination 0 unwind ans
+
+/-- Virtual call terminator (returning or diverging). -/
+def stepVirtualCallProtoOpt
+    (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
     (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
-    (target : BasicBlockIdx) (unwind : UnwindAction) : MirStepNode :=
-  match evalVirtualCallProto vt site s currentBody argOps destination target unwind with
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) : MirStepNode :=
+  match evalVirtualCallProtoOpt vt site s currentBody argOps destination target unwind with
   | .enter s' _ _ => MirStepNode.step s'
   | .externalCall defPath args locals' =>
     MirStepNode.extCall
       { defPath := defPath, typeArgs := [], args := args, memory := s.memory }
-      (resumeExternalCall s locals' destination target unwind)
+      (resumeExternalCallOpt s locals' destination target unwind)
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
+
+/-- Returning virtual call terminator. -/
+def stepVirtualCallProto (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+    (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : BasicBlockIdx) (unwind : UnwindAction) : MirStepNode :=
+  stepVirtualCallProtoOpt vt site s currentBody argOps destination (some target) unwind
 
 /-- Write `v` to the whole local `dst` and advance to the next statement. The
 destination must be a live local that no live borrow targets (prototype
@@ -2675,19 +3406,36 @@ def assignWholeLocalProto (s : MachineState) (locals' : List LocalSlot) (mem' : 
       | some locals'' => MirStepNode.step (advanceStmt s locals'' mem')
       | none => MirStepNode.fail .ub
 
-/-- `dst = &raw const (*src)` / `&raw mut (*src)` where `src` holds a
-trait-object pointer: the reference-to-raw coercion of a `dyn` place. Tree
-Borrows does not retag raw pointers, so the result is the same wide pointer
-(same data word and tag, same vtable word). Any other shape is left to
-`stepMirFn`. -/
-def dynRawBorrowValue? (ptrBytes : Nat) (locals : List LocalSlot) (srcPlace : Place) :
-    Option Value :=
+/-- Classification of `&raw const (*src)` / `&raw mut (*src)` on a trait-object
+pointer: returns `some (.ok v)` when valid, `some .ub` on a mutability or
+disabled-borrow violation (`&raw mut (*shared_dyn_ref)` or disabled ref tag),
+and `none` to fall through to `stepMirFn`. -/
+def dynRawBorrowProto?
+    (ptrBytes : Nat) (mutKind : Mutability) (locals : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (srcPlace : Place) : Option (ProtoRes Value) :=
   match srcPlace.projection with
   | [.deref] =>
     match get? locals srcPlace.local_ with
     | some (.init v) =>
       match decodeWidePtr? ptrBytes v with
-      | some ⟨_, .vtable _⟩ => some v
+      | some ⟨d, .vtable _⟩ =>
+        match get? localDecls srcPlace.local_ with
+        | some { ty := { kind := .ref srcMut (.dynamic _), .. }, .. } =>
+          match unsizeMutCompatible (V06.lowerMut srcMut) (V06.lowerMut mutKind) with
+          | false => some .ub
+          | true =>
+            match d with
+            | .prov p =>
+              match lookupBorrow mem.borrows p.tag with
+              | some b =>
+                match borrowPermAllows b.perm (V06.lowerMut mutKind) && !b.allocDead &&
+                    !treeBorrowAncestorsChildAccessUB (refAccessKind (V06.lowerMut mutKind))
+                      mem.borrows b.parentTag with
+                | true => some (.ok v)
+                | false => some .ub
+              | none => some (.ok v)
+            | .addr _ => some (.ok v)
+        | _ => some (.ok v)
       | _ => none
     | _ => none
   | _ => none
@@ -2697,6 +3445,70 @@ def isAddrEqCallee (func : Operand) : Bool :=
   match extractCalleeDefPath? func with
   | some defPath => strEq defPath "core::ptr::addr_eq"
   | none => false
+
+/-- Detect `core::intrinsics::{size_of_val, align_of_val}` (or `core::mem::*`)
+called on a pointer to `.dynamic traitKey`. Returns `some (isAlign, traitKey)`. -/
+def dynLayoutIntrinsic?
+    (currentBody : CapturedMir) (func : Operand) (argOps : List Operand) :
+    Option (Bool × String) :=
+  match extractCallee? func with
+  | some (defPath, typeArgs) =>
+    let isAlign? : Option Bool :=
+      match classifyRustIntrinsic? defPath with
+      | some .sizeOfVal => some false
+      | some .alignOfVal => some true
+      | _ =>
+        match strEq defPath "core::mem::size_of_val" with
+        | true => some false
+        | false =>
+          match strEq defPath "core::mem::align_of_val" with
+          | true => some true
+          | false => none
+    match isAlign? with
+    | none => none
+    | some isAlign =>
+      let pointee? : Option RigidTy :=
+        match typeArgs with
+        | t :: _ => some t
+        | [] =>
+          match argOps with
+          | ptrOp :: _ =>
+            match operandTy currentBody.localDecls currentBody.layouts ptrOp with
+            | some { kind := .rawPtr _ t, .. } => some t
+            | some { kind := .ref _ t, .. } => some t
+            | _ => none
+          | [] => none
+      match pointee? with
+      | some (.dynamic traitKey) => some (isAlign, traitKey)
+      | _ => none
+  | none => none
+
+/-- Step `size_of_val` / `align_of_val` on a pointer to `.dynamic traitKey`
+using `dynSizeOfValProto` / `dynAlignOfValProto`. -/
+def stepDynLayoutIntrinsicProto
+    (vt : ProtoVTableTable) (isAlign : Bool) (traitKey : String) (s : MachineState)
+    (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : BasicBlockIdx) : MirStepNode :=
+  let ptrBytes := layoutPointerBytes currentBody.layouts
+  match
+    evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals currentBody.layouts
+      s.memory.callerLocals (callStack := s.memory.callStack)
+  with
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+  | .ok [ptrVal] locals' =>
+    match lookupDynPred vt.dynTypes traitKey with
+    | none => MirStepNode.unsupported
+    | some pred =>
+      let res :=
+        match isAlign with
+        | false => dynSizeOfValProto vt ptrBytes pred ptrVal
+        | true => dynAlignOfValProto vt ptrBytes pred ptrVal
+      match res with
+      | .ok n => writeIntrinsicReturn s locals' destination target (.scalar ⟨n, ptrBytes⟩)
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+  | .ok _ _ => MirStepNode.fail .ub
 
 /-- Call `core::ptr::addr_eq(p, q)`: evaluate both arguments, compare the data
 addresses with `evalWideAddrEqProto`, and write the `bool` to the destination
@@ -2718,8 +3530,9 @@ def stepAddrEqProto (s : MachineState) (currentBody : CapturedMir) (argOps : Lis
 
 /-- **`stepMirFn` with the prototype rules.** An `Unsize` cast to a pointer to
 a trait object, a raw borrow of a dereferenced trait-object pointer, a virtual
-call, and a call to `core::ptr::addr_eq` use the prototype rules; every other
-statement and terminator is `stepMirFn`. -/
+call (returning or diverging), a `size_of_val`/`align_of_val` intrinsic on a
+trait object, and a call to `core::ptr::addr_eq` use the prototype rules; every
+other statement and terminator is `stepMirFn`. -/
 def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineState) :
     MirStepNode :=
   let currentBody := s.memory.activeCallee.getD body
@@ -2736,12 +3549,15 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
           match strEq kind "Unsize", dynPtrTarget? targetTy.kind with
           | true, some _ => stepUnsizeAssignProto prog.vtables s currentBody place op targetTy
           | _, _ => stepMirFn body s
-        | .assign place (.rawPtr _ srcPlace) =>
+        | .assign place (.rawPtr mutKind srcPlace) =>
           match
             place.projection,
-            dynRawBorrowValue? (layoutPointerBytes currentBody.layouts) s.frame.locals srcPlace
+            dynRawBorrowProto? (layoutPointerBytes currentBody.layouts) mutKind s.frame.locals
+              s.memory currentBody.localDecls srcPlace
           with
-          | [], some v => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
+          | [], some (.ok v) => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
+          | [], some .ub => MirStepNode.fail .ub
+          | [], some .unsupported => MirStepNode.unsupported
           | _, _ => stepMirFn body s
         | _ => stepMirFn body s
       | none =>
@@ -2749,15 +3565,23 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
         | false => stepMirFn body s
         | true =>
           match bb.terminator.kind with
-          | .call func argOps destination (some target) unwind =>
+          | .call func argOps destination targetOpt unwind =>
             match virtualCallSite? prog currentBody func argOps with
             | .notVirtual =>
-              match isAddrEqCallee func with
-              | true => stepAddrEqProto s currentBody argOps destination target
-              | false => stepMirFn body s
+              match targetOpt with
+              | some target =>
+                match isAddrEqCallee func with
+                | true => stepAddrEqProto s currentBody argOps destination target
+                | false =>
+                  match dynLayoutIntrinsic? currentBody func argOps with
+                  | some (isAlign, traitKey) =>
+                    stepDynLayoutIntrinsicProto prog.vtables isAlign traitKey s currentBody argOps
+                      destination target
+                  | none => stepMirFn body s
+              | none => stepMirFn body s
             | .unsupported => MirStepNode.unsupported
             | .site site =>
-              stepVirtualCallProto prog.vtables site s currentBody argOps destination target
+              stepVirtualCallProtoOpt prog.vtables site s currentBody argOps destination targetOpt
                 unwind
           | _ => stepMirFn body s
 
@@ -2970,8 +3794,14 @@ def vtableOf (L : DynLayout M) (e : ProtoVTableEntry) : Gen.VTable :=
     cells := []
     methods := ⟨methodsFrom L 0 e.slots⟩ }
 
+/-- Deduplicate `prog.traits` by `Gen.TraitName`, keeping the first entry per trait. -/
+def dedupTraits {α : Type} : List (Gen.TraitName × α) → List (Gen.TraitName × α)
+  | [] => []
+  | (tn, tr) :: rest =>
+    (tn, tr) :: (dedupTraits rest).filter (fun p => !decide (p.1 = tn))
+
 /-- **Translation.** Install the vtable table into the MiniRust machine `m`:
-`vtable_ptrs`, `prog.vtables`, and `prog.traits`. -/
+`vtable_ptrs`, `prog.vtables`, and deduplicated `prog.traits`. -/
 def installVTables (L : DynLayout M) (vt : ProtoVTableTable) (m : Gen.Machine M) :
     Gen.Machine M :=
   { m with
@@ -2980,8 +3810,9 @@ def installVTables (L : DynLayout M) (vt : ProtoVTableTable) (m : Gen.Machine M)
       { m.prog with
         vtables := ⟨vt.entries.map (fun e => (vtName e, vtableOf L e))⟩
         traits :=
-          ⟨vt.entries.map (fun e =>
-            (traitName L e.traitPred, ⟨(methodsFrom L 0 e.slots).map Prod.fst⟩))⟩ } }
+          ⟨dedupTraits
+            (vt.entries.map (fun e =>
+              (traitName L e.traitPred, ⟨(methodsFrom L 0 e.slots).map Prod.fst⟩)))⟩ } }
 
 theorem find?_map_unique {α β : Type} (f : α → β) (p : β → Bool) (e : α) :
     ∀ (es : List α), e ∈ es → p (f e) = true → (∀ x, x ∈ es → p (f x) = true → x = e) →
@@ -3081,6 +3912,7 @@ theorem wf_unique {ptrBytes : Nat} {vt : ProtoVTableTable}
   cases h1 : allEntriesWf ptrBytes vt.entries vt.entries <;>
   cases h2 : natsUnique (vt.entries.map (·.vtableId)) <;>
   cases h3 : natsUnique (vt.entries.map (·.vtableAllocId)) <;>
+  cases h4 : entriesPairwiseOk vt.entries <;>
   simp_all
 
 omit [MemoryOps M] in
@@ -3227,6 +4059,306 @@ theorem computeSizeAlignM_eq_dynLayoutProto (L : DynLayout M) (vt : ProtoVTableT
   · unfold computeAlignM
     simp only [LayoutStrategy.compute_size_and_align, vtPtr, hLk, bind, Except.bind, pure,
       Except.pure, vtableOf]
+
+/-- **Universal iff for `vtableFromPtrM`:** on any memory model `M`, well-formed
+table `vt`, and injective provenance map `L`, `vtableFromPtrM` resolves
+`ptrAt L a off` to `v` if and only if `off = 0` and `lookupVTableByAlloc` finds
+an entry `e` with `v = vtableOf L e` (which matches `resolveVTablePtr` up to
+the trait-predicate check). -/
+theorem vtableFromPtrM_install_iff (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes a off : Nat) (v : Gen.VTable)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true) :
+    vtableFromPtrM (installVTables L vt m) (ptrAt L a off) = .ok v ↔
+      (off = 0 ∧ ∃ e, lookupVTableByAlloc vt.entries a = some e ∧ v = vtableOf L e) := by
+  constructor
+  · intro hOk
+    cases off with
+    | zero =>
+      cases hL : lookupVTableByAlloc vt.entries a with
+      | none =>
+        have hUb := (vtableFromPtrM_install_invalid L vt m hProv).1 a hL
+        rw [hUb] at hOk
+        cases hOk
+      | some e =>
+        have hRes := (vtableFromPtrM_install_ok L vt m ptrBytes a e hProv hWf hL).1
+        rw [hRes] at hOk
+        cases hOk
+        exact ⟨rfl, e, rfl, rfl⟩
+    | succ k =>
+      have hUb := (vtableFromPtrM_install_invalid L vt m hProv).2.1 a (k + 1) (Nat.succ_ne_zero k)
+      rw [hUb] at hOk
+      cases hOk
+  · rintro ⟨rfl, e, hL, rfl⟩
+    exact (vtableFromPtrM_install_ok L vt m ptrBytes a e hProv hWf hL).1
+
+/-- **Universal `checkPtrMetadataM` correspondence (valid, trait mismatch,
+invalid vtable pointer, non-vtable metadata).** -/
+theorem checkPtrMetadataM_install_correspondence (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes a : Nat) (e : ProtoVTableEntry) (tn : Gen.TraitName)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hLook : lookupVTableByAlloc vt.entries a = some e)
+    (hBounds : inBounds (ptrAt L a 0).addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtrMetadataM (some (.VTablePointer (ptrAt L a 0))) (.VTablePointer (traitName L e.traitPred))
+        (some (vtableFromPtrM (installVTables L vt m))) = .ok () ∧
+    (traitName L e.traitPred ≠ tn →
+      checkPtrMetadataM (some (.VTablePointer (ptrAt L a 0))) (.VTablePointer tn)
+          (some (vtableFromPtrM (installVTables L vt m))) =
+        ub "Value::Ptr: invalid vtable in metadata") ∧
+    (∀ (off : Nat), off ≠ 0 → inBounds (ptrAt L a off).addr .Unsigned x86_64.PTR_SIZE = true →
+      checkPtrMetadataM (some (.VTablePointer (ptrAt L a off))) (.VTablePointer tn)
+          (some (vtableFromPtrM (installVTables L vt m))) =
+        ub "invalid pointer for vtable lookup") ∧
+    checkPtrMetadataM (some (.ElementCount 3)) (.VTablePointer tn)
+        (some (vtableFromPtrM (installVTables L vt m))) =
+      ub "Value::Ptr: invalid metadata" ∧
+    checkPtrMetadataM none (.VTablePointer tn)
+        (some (vtableFromPtrM (installVTables L vt m))) =
+      ub "Value::Ptr: invalid metadata" := by
+  have hVt := (vtableFromPtrM_install_ok L vt m ptrBytes a e hProv hWf hLook).1
+  refine ⟨?_, ?_, ?_, rfl, rfl⟩
+  · unfold checkPtrMetadataM
+    simp only [hBounds, ensureElseUb, hVt, vtableOf, beq_self_eq_true,
+      Bool.not_true, Bool.false_eq_true, ite_false, bind, Except.bind, pure, Except.pure]
+  · intro hNe
+    have hBeq : (traitName L e.traitPred == tn) = false := by
+      cases hb : (traitName L e.traitPred == tn) with
+      | false => rfl
+      | true => exact absurd (eq_of_beq hb) hNe
+    unfold checkPtrMetadataM
+    simp only [hBounds, ensureElseUb, ite_true, hVt, vtableOf, hBeq,
+      Bool.not_true, Bool.not_false, Bool.false_eq_true, ite_false, bind, Except.bind, pure, Except.pure]
+  · intro off hOff hBOff
+    have hUb := (vtableFromPtrM_install_invalid L vt m hProv).2.1 a off hOff
+    unfold checkPtrMetadataM
+    simp only [hBOff, ensureElseUb, Bool.not_true, Bool.false_eq_true, ite_false,
+      hUb, bind, Except.bind, pure, Except.pure, ub]
+
+/-- **Universal MiniRust raw-pointer dyn validity (`checkPtrM` on `PtrType.Raw`).**
+Matching `unsizeSizedToDyn_raw_ptr_unchecked` and `unsizeSizedToDyn_raw_scalar_unchecked`,
+a raw pointer `*const dyn Trait` with a valid vtable pointer is accepted for
+EVERY in-bounds thin data pointer `dataPtr` — even null, unaligned, dangling, or
+provenance-less. -/
+theorem checkPtrM_raw_dyn_unchecked (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (e : ProtoVTableEntry)
+    (dataPtr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hLook : lookupVTableByAlloc vt.entries e.vtableAllocId = some e)
+    (hDataBounds : inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hVtBounds : inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true) :
+    checkPtrM { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }
+        (.Raw (.VTablePointer (traitName L e.traitPred)))
+        (some (installVTables L vt m)) = .ok () := by
+  have hMeta :=
+    (checkPtrMetadataM_install_correspondence L vt m ptrBytes e.vtableAllocId e
+      (traitName L e.traitPred) hProv hWf hLook hVtBounds).1
+  unfold checkPtrM
+  simp only [hDataBounds, ensureElseUb, PtrType.meta_kind, Option.map_some,
+    vtPtr, hMeta, PtrType.safe_pointee, Bool.not_true, Bool.false_eq_true, ite_false,
+    bind, Except.bind, pure, Except.pure]
+
+private theorem inBounds_zero_unsigned_ptr :
+    inBounds (0 : Int) .Unsigned x86_64.PTR_SIZE = true := by
+  unfold inBounds
+  have h1 : decide ((0 : Int) ≤ 0) = true := decide_eq_true (Int.le_refl 0)
+  have h2 : decide ((0 : Int) < (2 : Int) ^ Size.bits x86_64.PTR_SIZE) = true :=
+    decide_eq_true (Int.pow_pos (by decide : (0 : Int) < 2))
+  rw [h1, h2]
+  rfl
+
+private theorem ensureElseUb_true (msg : String) : ensureElseUb true msg = .ok () := rfl
+private theorem ensureElseUb_false (msg : String) : ensureElseUb false msg = ub msg := rfl
+private theorem bind_ok_interp {α β : Type} (x : α) (f : α → Interp β) :
+    (Except.ok x >>= f) = f x := rfl
+private theorem bind_pure_interp {α β : Type} (x : α) (f : α → Interp β) :
+    (pure x >>= f) = f x := rfl
+private theorem bind_ub_interp {α β : Type} (msg : String) (f : α → Interp β) :
+    (ub msg >>= f) = ub msg := rfl
+
+/-- **Universal MiniRust safe-reference dyn rejections (`checkPtrM` on `PtrType.Ref`).**
+On a safe `&dyn Trait` / `&mut dyn Trait` pointer with a valid vtable pointer
+and `size <= isize::MAX`, MiniRust rejects null, unaligned, and uninhabited
+referents with exact UB messages matching `refDataValid`. -/
+theorem checkPtrM_ref_dyn_rejects_invalid (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (e : ProtoVTableEntry)
+    (mutbl : LibSpecr.Mutability) (freeze unpin : Bool)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hLook : lookupVTableByAlloc vt.entries e.vtableAllocId = some e)
+    (hVtBounds : inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (hSizeSigned : inBounds (e.sizeBytes : Int) .Signed x86_64.PTR_SIZE = true) :
+    (∀ (prov : Option (Gen.Memory.Provenance M)),
+      checkPtrM
+          { thin_pointer := { addr := 0, provenance := prov }
+            metadata := some (.VTablePointer (vtPtr L e)) }
+          (.Ref mutbl
+            { layout := .TraitObject (traitName L e.traitPred), inhabited := true,
+              unsafe_cells := .TraitObject, freeze := freeze, unpin := unpin })
+          (some (installVTables L vt m)) = ub "Value::Ptr: null safe pointer") ∧
+    (∀ (dataPtr : Gen.ThinPointer (Gen.Memory.Provenance M)),
+      inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true →
+      dataPtr.addr ≠ 0 →
+      Align.is_aligned ⟨e.alignBytes⟩ dataPtr.addr = false →
+      checkPtrM
+          { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }
+          (.Ref mutbl
+            { layout := .TraitObject (traitName L e.traitPred), inhabited := true,
+              unsafe_cells := .TraitObject, freeze := freeze, unpin := unpin })
+          (some (installVTables L vt m)) = ub "Value::Ptr: unaligned safe pointer") ∧
+    (∀ (dataPtr : Gen.ThinPointer (Gen.Memory.Provenance M)),
+      inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true →
+      dataPtr.addr ≠ 0 →
+      Align.is_aligned ⟨e.alignBytes⟩ dataPtr.addr = true →
+      checkPtrM
+          { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }
+          (.Ref mutbl
+            { layout := .TraitObject (traitName L e.traitPred), inhabited := false,
+              unsafe_cells := .TraitObject, freeze := freeze, unpin := unpin })
+          (some (installVTables L vt m)) = ub "Value::Ptr: safe pointer to uninhabited type") := by
+  have hMeta :=
+    (checkPtrMetadataM_install_correspondence L vt m ptrBytes e.vtableAllocId e
+      (traitName L e.traitPred) hProv hWf hLook hVtBounds).1
+  have hLk := (vtableFromPtrM_install_ok L vt m ptrBytes e.vtableAllocId e hProv hWf hLook).2
+  refine ⟨?_, ?_, ?_⟩
+  · intro prov
+    unfold checkPtrM
+    rw [inBounds_zero_unsigned_ptr, ensureElseUb_true, bind_ok_interp]
+    dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map_some, vtPtr]
+    rw [hMeta, bind_ok_interp]
+    dsimp only [PtrType.safe_pointee, LayoutStrategy.compute_size_and_align]
+    rw [hLk, bind_ok_interp]
+    dsimp only [vtableOf]
+    rw [bind_pure_interp]
+    dsimp only
+    rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, bne_self_eq_false, ensureElseUb_false,
+      bind_ub_interp]
+  · intro dataPtr hB hNz hUnal
+    have hNzB : (dataPtr.addr != 0) = true := bne_iff_ne.mpr hNz
+    unfold checkPtrM
+    rw [hB, ensureElseUb_true, bind_ok_interp]
+    dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map_some, vtPtr]
+    rw [hMeta, bind_ok_interp]
+    dsimp only [PtrType.safe_pointee, LayoutStrategy.compute_size_and_align]
+    rw [hLk, bind_ok_interp]
+    dsimp only [vtableOf]
+    rw [bind_pure_interp]
+    dsimp only
+    rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, hNzB, ensureElseUb_true, bind_ok_interp,
+      hUnal, ensureElseUb_false, bind_ub_interp]
+  · intro dataPtr hB hNz hAl
+    have hNzB : (dataPtr.addr != 0) = true := bne_iff_ne.mpr hNz
+    unfold checkPtrM
+    rw [hB, ensureElseUb_true, bind_ok_interp]
+    dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map_some, vtPtr]
+    rw [hMeta, bind_ok_interp]
+    dsimp only [PtrType.safe_pointee, LayoutStrategy.compute_size_and_align]
+    rw [hLk, bind_ok_interp]
+    dsimp only [vtableOf]
+    rw [bind_pure_interp]
+    dsimp only
+    rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, hNzB, ensureElseUb_true, bind_ok_interp,
+      hAl, ensureElseUb_true, bind_ok_interp, ensureElseUb_false, bind_ub_interp]
+
+omit [MemoryOps M] in
+/-- Slot lookup in `methodsFrom` agrees with `get? slots` on every `.method` slot. -/
+theorem methodsFrom_find?_method (L : DynLayout M) :
+    ∀ (base idx : Nat) (slots : List ProtoVTableSlot) (defPath : String),
+      get? slots idx = some (.method defPath) →
+      (methodsFrom L base slots).find? (fun p => decide (p.1 = ⟨⟨base + idx⟩⟩)) =
+        some (⟨⟨base + idx⟩⟩, ⟨⟨L.fnOf defPath⟩⟩)
+  | _, _, [], _, h => by cases h
+  | base, 0, .method dp :: rest, defPath, h => by
+    cases h
+    simp [methodsFrom]
+  | base, 0, .dropInPlace _ :: _, _, h => by cases h
+  | base, 0, .size :: _, _, h => by cases h
+  | base, 0, .align :: _, _, h => by cases h
+  | base, 0, .vacant :: _, _, h => by cases h
+  | base, 0, .traitVPtr _ :: _, _, h => by cases h
+  | base, idx + 1, s :: rest, defPath, h => by
+    have hStep : base + (idx + 1) = (base + 1) + idx := by omega
+    have ih := methodsFrom_find?_method L (base + 1) idx rest defPath h
+    rw [hStep]
+    cases s with
+    | method dp =>
+      simp only [methodsFrom, List.find?_cons]
+      have hNe : ¬ (({ _0 := { idx := base } } : Gen.TraitMethodName) = ⟨⟨base + 1 + idx⟩⟩) := by
+        intro heq; injection heq with h1; injection h1 with h2; omega
+      simp [hNe, ih]
+    | dropInPlace _ => exact ih
+    | size => exact ih
+    | align => exact ih
+    | vacant => exact ih
+    | traitVPtr _ => exact ih
+
+/-- **Universal `evalUnOpM` correspondence for `.GetMetadata`, `.ComputeSize`,
+`.ComputeAlign`, and `.VTableMethodLookup`.** Across every memory model `M`
+(including `Mach` and `MachTB`), well-formed table `vt`, and captured vtable `e`:
+* `GetMetadata` extracts the vtable pointer `vtPtr L e`;
+* `ComputeSize` / `ComputeAlign` return `e.sizeBytes` / `e.alignBytes` (matching
+  `dynSizeOfValProto` / `dynAlignOfValProto`);
+* `VTableMethodLookup ⟨⟨slotIdx⟩⟩` resolves to `fn_ptrs[L.fnOf defPath]`
+  whenever `get? e.slots slotIdx = some (.method defPath)`. -/
+theorem evalUnOpM_dyn_correspondence (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes slotIdx : Nat) (e : ProtoVTableEntry) (defPath : String)
+    (dataPtr fnThin : Gen.ThinPointer (Gen.Memory.Provenance M)) (ptrTy : Gen.PtrType)
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hLook : lookupVTableByAlloc vt.entries e.vtableAllocId = some e)
+    (hVtBounds : inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (hMetaKind : PtrType.meta_kind ptrTy = .VTablePointer (traitName L e.traitPred))
+    (hSlot : get? e.slots slotIdx = some (.method defPath))
+    (hFnPtr : mapGet m.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ = some fnThin) :
+    let m' := installVTables L vt m
+    let vtVal : Gen.Value M := .Ptr (ThinPointer.widen (vtPtr L e) none)
+    let tn := traitName L e.traitPred
+    evalUnOpM .GetMetadata
+        (.Ptr { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }, .Ptr ptrTy)
+        (some m') = .ok (vtVal, .Ptr (.VTablePtr tn)) ∧
+    evalUnOpM (.ComputeSize (.TraitObject tn)) (vtVal, .Ptr (.VTablePtr tn)) (some m') =
+      .ok (.Int (e.sizeBytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (.ComputeAlign (.TraitObject tn)) (vtVal, .Ptr (.VTablePtr tn)) (some m') =
+      .ok (.Int (e.alignBytes : Int), .Int IntType.usize_ty) ∧
+    evalUnOpM (.VTableMethodLookup ⟨⟨slotIdx⟩⟩) (vtVal, .Ptr (.VTablePtr tn)) (some m') =
+      .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) := by
+  intro m' vtVal tn
+  have hOk := vtableFromPtrM_install_ok L vt m ptrBytes e.vtableAllocId e hProv hWf hLook
+  have hVt : vtableFromPtrM m' (vtPtr L e) = .ok (vtableOf L e) := hOk.1
+  have hLk : vtableLookupM m' (vtPtr L e) = .ok (vtableOf L e) := hOk.2
+  have hMethod :
+      mapIndex (vtableOf L e).methods ⟨⟨slotIdx⟩⟩ "vtable.methods[method]" =
+        .ok ⟨⟨L.fnOf defPath⟩⟩ := by
+    have hf := methodsFrom_find?_method L 0 slotIdx e.slots defPath hSlot
+    simp only [Nat.zero_add] at hf
+    unfold mapIndex mapGet vtableOf
+    simp only [hf, Option.map_some]
+    rfl
+  have hFnIdx : mapIndex m'.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ "self.fn_ptrs[fn_name]" = .ok fnThin := by
+    unfold mapIndex m' installVTables
+    simp only [hFnPtr]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold evalUnOpM
+    dsimp only
+    rw [hMetaKind]
+    simp only [PointerMetaKind.encode_as_valueM, PointerMetaKind.ty, checkValueM,
+      checkPtrM, vtVal, ThinPointer.widen, hVtBounds, ensureElseUb,
+      PtrType.meta_kind, checkPtrMetadataM, PtrType.safe_pointee, hVt, vtableOf,
+      beq_self_eq_true, Bool.not_true, Bool.false_eq_true, ite_false,
+      bind, Except.bind, pure, Except.pure, tn]
+  · unfold evalUnOpM
+    simp only [Type.meta_kind, PointerMetaKind.decode_valueM, Type.layout, computeSizeM,
+      LayoutStrategy.compute_size_and_align, vtVal, ThinPointer.widen, hLk, vtableOf,
+      bind, Except.bind, pure, Except.pure]
+  · unfold evalUnOpM
+    simp only [Type.meta_kind, PointerMetaKind.decode_valueM, Type.layout, computeAlignM,
+      LayoutStrategy.compute_size_and_align, vtVal, ThinPointer.widen, hLk, vtableOf,
+      bind, Except.bind, pure, Except.pure]
+  · unfold evalUnOpM
+    simp only [vtVal, ThinPointer.widen, hLk, hMethod, hFnIdx, bind, Except.bind, pure,
+      Except.pure]
 
 /-! ### `Mach` (`BasicMemory`) and `MachTB` (`TreeBorrowsMemory`) instances -/
 
@@ -3453,14 +4585,12 @@ inductive LmQuery : Type where
   | ptrToPtrUninit
   /-- `VirtualCalls.resolveVirtual` on a raw trait-object receiver. -/
   | virtualCall (traitIdx slot : Nat) (data vt : LmPtr)
+  /-- `VirtualCalls.resolveVirtual` on a `DispatchFromDyn` single-non-1ZST
+  wrapper struct `((), *const dyn Trait, ())`. -/
+  | virtualCallWrapped (traitIdx slot : Nat) (data vt : LmPtr)
   /-- `VTable.getMethod` on a vtable pointer. -/
   | getMethod (traitIdx slot : Nat) (vt : LmPtr)
   deriving DecidableEq
-
-/-- `s` occurs in `xs`. -/
-def strMem (s : String) : List String → Bool
-  | [] => false
-  | x :: xs => strEq x s || strMem s xs
 
 /-- First occurrences of the strings, in order. -/
 def strDedup : List String → List String → List String
@@ -3560,18 +4690,19 @@ def queryCallerBody : CapturedMir :=
 def queryCallState (recv : Value) : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init recv] }, memory := emptyMemory }
 
-/-- Method resolution of `evalVirtualCallProto` on a raw receiver with no
+/-- Method resolution of `evalVirtualCallProto` on a raw receiver value `recv`
+(direct wide pointer or `DispatchFromDyn` single-non-1ZST wrapper) with no
 callee linked: the concrete method and the narrowed receiver. -/
-def virtualCallObs (vt : ProtoVTableTable) (pred : ProtoTraitPred) (slot : Nat)
-    (data vtp : LmPtr) : LmObs :=
+def virtualCallObsVal (vt : ProtoVTableTable) (pred : ProtoTraitPred) (slot : Nat)
+    (vtp : LmPtr) (recv : Value) : LmObs :=
   match
     evalVirtualCallProto vt { traitPred := pred, slotIdx := slot, receiverIsRef := false }
-      (queryCallState (widePtrValue data vtp)) queryCallerBody
+      (queryCallState recv) queryCallerBody
       [.copy { local_ := 0, projection := [] }] { local_ := 0, projection := [] } 0 .continue_
   with
   | .externalCall defPath (thin :: _) _ =>
     match lmPtrOfWord thin with
-    | some recv => .method (fnIdOf vt defPath) recv
+    | some recvPtr => .method (fnIdOf vt defPath) recvPtr
     | none => .err .other
   | .externalCall _ [] _ => .err .other
   | .enter _ _ _ => .err .other
@@ -3584,6 +4715,12 @@ def virtualCallObs (vt : ProtoVTableTable) (pred : ProtoTraitPred) (slot : Nat)
       | .ok _ => .err .notAMethod
       | .invalidPointer => .err .invalidVTablePointer
       | .invalidTrait => .err .invalidVTableTrait
+
+/-- Method resolution of `evalVirtualCallProto` on a direct raw receiver with
+no callee linked. -/
+def virtualCallObs (vt : ProtoVTableTable) (pred : ProtoTraitPred) (slot : Nat)
+    (data vtp : LmPtr) : LmObs :=
+  virtualCallObsVal vt pred slot vtp (widePtrValue data vtp)
 
 /-- **The prototype's answer to a query**, computed with the rules of §3-§5
 (`resolveVTablePtr`, `dynLayoutOfValProto`, `unsizeSizedToDyn`,
@@ -3653,6 +4790,11 @@ def protoLmRun (vt : ProtoVTableTable) : LmQuery → LmObs
     match nthPred vt traitIdx with
     | none => .err .other
     | some pred => virtualCallObs vt pred slot data vtp
+  | .virtualCallWrapped traitIdx slot data vtp =>
+    match nthPred vt traitIdx with
+    | none => .err .other
+    | some pred =>
+      virtualCallObsVal vt pred slot vtp (.aggregate 0 [.unit, widePtrValue data vtp, .unit])
   | .getMethod traitIdx slot vtp =>
     match nthPred vt traitIdx with
     | none => .err .other
@@ -3671,12 +4813,25 @@ def predAlt : ProtoTraitPred := { principalTrait? := some "TraitAlt" }
 def predSuper : ProtoTraitPred := { principalTrait? := some "Super" }
 def predSub : ProtoTraitPred := { principalTrait? := some "Sub" }
 def predSub2 : ProtoTraitPred := { principalTrait? := some "Sub2" }
+def predMarker : ProtoTraitPred := { principalTrait? := some "Marker" }
+def predIterU32 : ProtoTraitPred :=
+  { principalTrait? := some "Iter",
+    assocBindings := [⟨"Item", "u32"⟩, ⟨"Err", "u8"⟩] }
+def predIterU32PermDupAuto : ProtoTraitPred :=
+  { principalTrait? := some "Iter",
+    assocBindings := [⟨"Err", "u8"⟩, ⟨"Item", "u32"⟩, ⟨"Item", "u32"⟩],
+    autoTraits := ["Send", "Sync"] }
+def predIterU64 : ProtoTraitPred :=
+  { principalTrait? := some "Iter",
+    assocBindings := [⟨"Item", "u64"⟩, ⟨"Err", "u8"⟩] }
 
 /-- Vtable table of the correspondence corpus. Entries `0..2` are the
 Campaign #22 shape (two concrete types for `TraitA`, one type for two traits);
 entry `4` (`dyn Sub`) reaches entry `3` (`dyn Super`) through a `.traitVPtr`
-slot; entry `5` (`dyn Sub2`) has entry `3`'s slots as a prefix and no
-`.traitVPtr` slot. -/
+slot; entry `5` (`dyn Sub2`) declares entry `3` as its `primarySuperVTable?`
+(prefix-compatible); entry `6` (`dyn Marker`) is an unrelated 0-method marker
+trait; entry `7` (`dyn Iter<Item = u32, Err = u8>`) exercises multi-predicate
+associated-type sorting and deduplication. -/
 def corpusTable : ProtoVTableTable :=
   { entries :=
       [ { vtableId := 0, vtableAllocId := 40000, concreteTyKey := "Receiver", traitPred := predA,
@@ -3699,21 +4854,36 @@ def corpusTable : ProtoVTableTable :=
              .method "rec::sub", .vacant] },
         { vtableId := 5, vtableAllocId := 40005, concreteTyKey := "Receiver",
           traitPred := predSub2, sizeBytes := 4, alignBytes := 4,
-          slots := [.dropInPlace none, .size, .align, .method "rec::sup", .method "rec::sub2"] } ],
+          slots := [.dropInPlace none, .size, .align, .method "rec::sup", .method "rec::sub2"],
+          primarySuperVTable? := some 3 },
+        { vtableId := 6, vtableAllocId := 40006, concreteTyKey := "Receiver",
+          traitPred := predMarker, sizeBytes := 4, alignBytes := 4,
+          slots := [.dropInPlace none, .size, .align] },
+        { vtableId := 7, vtableAllocId := 40007, concreteTyKey := "Receiver",
+          traitPred := predIterU32, sizeBytes := 4, alignBytes := 4,
+          slots := [.dropInPlace none, .size, .align, .method "rec::iter_next"] } ],
     dynTypes :=
       [ ("TraitA", predA), ("TraitAlt", predAlt), ("Super", predSuper), ("Sub", predSub),
         ("Sub2", predSub2),
         ("TraitA+Send", { predA with autoTraits := ["Send"] }),
-        ("Unresolved", { predA with hasUnresolvedExistentialBinder := true }) ] }
+        ("Unresolved", { predA with hasUnresolvedExistentialBinder := true }),
+        ("Marker", predMarker),
+        ("IterU32", predIterU32),
+        ("IterU32PermDupAuto", predIterU32PermDupAuto),
+        ("IterU64Mismatch", predIterU64) ] }
 
 /-- Test vectors of the correspondence: every query kind, with valid and
-invalid inputs. -/
+invalid inputs (including multi-predicate associated-type sorting/deduplication
+and `DispatchFromDyn` single-non-1ZST wrapper receivers). -/
 def lmCorpus : List LmQuery :=
-  [ -- vtable type and trait validation
+  [ -- vtable type and trait validation (including assoc-type sorting & dedup)
     .vtableType (.prov 40000 0) none,
     .vtableType (.prov 40000 0) (some 0),
     .vtableType (.prov 40001 0) (some 0),
     .vtableType (.prov 40000 0) (some 5),          -- auto traits are ignored
+    .vtableType (.prov 40007 0) (some 8),          -- multi-predicate exact match
+    .vtableType (.prov 40007 0) (some 9),          -- permuted + duplicated + auto traits
+    .vtableType (.prov 40007 0) (some 10),         -- mismatched associated type (`u64` vs `u32`)
     .vtableType (.prov 40002 0) (some 0),          -- `TraitAlt` vtable used as `dyn TraitA`
     .vtableType (.prov 40000 8) (some 0),          -- non-zero offset
     .vtableType (.prov 7 0) (some 0),              -- non-vtable allocation
@@ -3723,6 +4893,8 @@ def lmCorpus : List LmQuery :=
     .sizeAlign (.prov 40000 0) 0,
     .sizeAlign (.prov 40001 0) 0,
     .sizeAlign (.prov 40002 0) 0,
+    .sizeAlign (.prov 40007 0) 9,                  -- permuted/deduped assoc bindings layout
+    .sizeAlign (.prov 40007 0) 10,                 -- mismatched assoc binding -> InvalidVTableTrait
     .sizeAlign (.prov 40001 4) 0,
     .sizeAlign (.int 64) 0,
     .dynLayout (.prov 40000 0) 0,
@@ -3740,8 +4912,9 @@ def lmCorpus : List LmQuery :=
     .unsize 1 1 (.prov 5 0),                       -- no vtable captured
     -- upcasts
     .upcast 3 2 (.prov 3 0) (.prov 40004 0),       -- through `.traitVPtr`
-    .upcast 4 2 (.prov 3 0) (.prov 40005 0),       -- prefix-compatible
+    .upcast 4 2 (.prov 3 0) (.prov 40005 0),       -- primary-supertrait prefix-compatible
     .upcast 3 3 (.prov 3 0) (.prov 40004 0),       -- identity
+    .upcast 5 0 (.prov 3 0) (.prov 40000 0),       -- drop auto trait (`TraitA+Send -> TraitA`)
     .upcast 3 2 (.prov 3 0) (.prov 40000 0),       -- wrong-trait vtable
     .upcast 3 2 (.prov 3 0) (.prov 40004 8),       -- offset vtable pointer
     .upcast 3 2 (.prov 3 0) (.int 0),              -- null vtable pointer
@@ -3751,11 +4924,14 @@ def lmCorpus : List LmQuery :=
     .ptrToPtr (.int 4096) (.prov 40002 0),
     .ptrToPtr (.prov 3 0) (.int 2),
     .ptrToPtrUninit,
-    -- virtual calls
+    -- virtual calls (direct and `DispatchFromDyn` single-non-1ZST wrapper)
     .virtualCall 0 3 (.prov 3 0) (.prov 40000 0),
     .virtualCall 0 4 (.prov 3 0) (.prov 40000 0),
     .virtualCall 0 3 (.prov 5 4) (.prov 40001 0),  -- receiver with a field offset
     .virtualCall 1 3 (.prov 3 0) (.prov 40002 0),
+    .virtualCall 9 3 (.prov 3 0) (.prov 40007 0),  -- call via permuted/deduped assoc pred
+    .virtualCallWrapped 0 3 (.prov 5 4) (.prov 40001 0), -- `DispatchFromDyn` wrapper `((), ptr, ())`
+    .virtualCallWrapped 0 1 (.prov 3 0) (.prov 40000 0), -- wrapper on header slot -> notAMethod
     .virtualCall 0 0 (.prov 3 0) (.prov 40000 0),  -- `drop_in_place` slot
     .virtualCall 0 1 (.prov 3 0) (.prov 40000 0),  -- `size` slot
     .virtualCall 0 2 (.prov 3 0) (.prov 40000 0),  -- `align` slot
@@ -3785,12 +4961,13 @@ def unsizeLaw : List (LmQuery × LmObs) :=
     (.unsize 1 1 (.prov 5 0), .err .unsupported) ]
 
 /-- A `dyn Sub -> dyn Super` upcast selects the supertrait vtable through the
-`.traitVPtr` slot or the prefix-compatible vtable, and the identity coercion
-keeps the vtable; an invalid incoming vtable pointer is UB. -/
+`.traitVPtr` slot or the primary-supertrait prefix, dropping auto traits and
+identity coercions keep the vtable; an invalid incoming vtable pointer is UB. -/
 def upcastLaw : List (LmQuery × LmObs) :=
   [ (.upcast 3 2 (.prov 3 0) (.prov 40004 0), .wide (.prov 3 0) (.prov 40003 0)),
     (.upcast 4 2 (.prov 3 0) (.prov 40005 0), .wide (.prov 3 0) (.prov 40003 0)),
     (.upcast 3 3 (.prov 3 0) (.prov 40004 0), .wide (.prov 3 0) (.prov 40004 0)),
+    (.upcast 5 0 (.prov 3 0) (.prov 40000 0), .wide (.prov 3 0) (.prov 40000 0)),
     (.upcast 3 2 (.prov 3 0) (.prov 40000 0), .err .invalidVTableTrait),
     (.upcast 3 2 (.prov 3 0) (.prov 40004 8), .err .invalidVTablePointer),
     (.upcast 3 2 (.prov 3 0) (.int 0), .err .invalidVTablePointer) ]
@@ -3800,15 +4977,20 @@ def upcastLaw : List (LmQuery × LmObs) :=
 def layoutLaw : List (LmQuery × LmObs) :=
   [ (.sizeAlign (.prov 40000 0) 0, .sizeAlign 4 4),
     (.sizeAlign (.prov 40001 0) 0, .sizeAlign 8 4),
+    (.sizeAlign (.prov 40007 0) 9, .sizeAlign 4 4),
     (.dynLayout (.prov 40000 0) 0, .sizeAlign 4 4),
     (.dynLayout (.prov 40002 0) 1, .sizeAlign 4 4) ]
 
-/-- The vtable trait check ignores auto traits (`VTable.sortedPredicates`):
-`dyn TraitA + Send` accepts the `dyn TraitA` vtables. -/
+/-- The vtable trait check ignores auto traits and sorts/deduplicates
+non-auto projection predicates (`VTable.sortedPredicates`):
+`dyn TraitA + Send` accepts `dyn TraitA`, and permuted/duplicated associated-type
+bindings with auto traits accept `dyn Iter<Item = u32, Err = u8>`. -/
 def autoTraitLaw : List (LmQuery × LmObs) :=
   [ (.vtableType (.prov 40000 0) (some 0), .tyOk 0),
     (.vtableType (.prov 40000 0) (some 5), .tyOk 0),
     (.vtableType (.prov 40001 0) (some 0), .tyOk 1),
+    (.vtableType (.prov 40007 0) (some 8), .tyOk 0),
+    (.vtableType (.prov 40007 0) (some 9), .tyOk 0),
     (.dynLayout (.prov 40001 0) 5, .sizeAlign 8 4) ]
 
 /-- `InvalidVTablePointer`: a dangling integer, null, a non-zero offset, and a
@@ -3826,20 +5008,26 @@ def invalidPointerLaw : List (LmQuery × LmObs) :=
     (.virtualCall 0 3 (.prov 3 0) (.prov 40000 4), .err .invalidVTablePointer),
     (.getMethod 0 3 (.prov 6 0), .err .invalidVTablePointer) ]
 
-/-- `InvalidVTableTrait`: a vtable of another trait object type. -/
+/-- `InvalidVTableTrait`: a vtable of another trait object type or mismatched
+associated-type binding. -/
 def invalidTraitLaw : List (LmQuery × LmObs) :=
   [ (.vtableType (.prov 40002 0) (some 0), .err .invalidVTableTrait),
+    (.vtableType (.prov 40007 0) (some 10), .err .invalidVTableTrait),
     (.sizeAlign (.prov 40002 0) 0, .err .invalidVTableTrait),
+    (.sizeAlign (.prov 40007 0) 10, .err .invalidVTableTrait),
     (.dynLayout (.prov 40002 0) 0, .err .invalidVTableTrait),
     (.virtualCall 0 3 (.prov 3 0) (.prov 40002 0), .err .invalidVTableTrait) ]
 
-/-- A virtual call resolves the method slot and narrows the receiver to the
-thin data pointer, keeping its allocation and offset. -/
+/-- A virtual call resolves the method slot and narrows the receiver (direct or
+inside a `DispatchFromDyn` single-non-1ZST wrapper) to the thin data pointer,
+keeping its allocation and offset. -/
 def virtualCallLaw : List (LmQuery × LmObs) :=
   [ (.virtualCall 0 3 (.prov 3 0) (.prov 40000 0), .method 0 (.prov 3 0)),
     (.virtualCall 0 4 (.prov 3 0) (.prov 40000 0), .method 1 (.prov 3 0)),
     (.virtualCall 0 3 (.prov 5 4) (.prov 40001 0), .method 2 (.prov 5 4)),
     (.virtualCall 1 3 (.prov 3 0) (.prov 40002 0), .method 4 (.prov 3 0)),
+    (.virtualCall 9 3 (.prov 3 0) (.prov 40007 0), .method 8 (.prov 3 0)),
+    (.virtualCallWrapped 0 3 (.prov 5 4) (.prov 40001 0), .method 2 (.prov 5 4)),
     (.getMethod 0 3 (.prov 40001 0), .method 2 (.int 0)) ]
 
 /-- A header, supertrait, vacant, or out-of-range slot is UB ("dyn call trying
@@ -3848,6 +5036,7 @@ def nonMethodSlotLaw : List (LmQuery × LmObs) :=
   [ (.virtualCall 0 0 (.prov 3 0) (.prov 40000 0), .err .notAMethod),
     (.virtualCall 0 1 (.prov 3 0) (.prov 40000 0), .err .notAMethod),
     (.virtualCall 0 2 (.prov 3 0) (.prov 40000 0), .err .notAMethod),
+    (.virtualCallWrapped 0 1 (.prov 3 0) (.prov 40000 0), .err .notAMethod),
     (.virtualCall 3 4 (.prov 3 0) (.prov 40004 0), .err .notAMethod),
     (.virtualCall 3 6 (.prov 3 0) (.prov 40004 0), .err .notAMethod),
     (.virtualCall 0 9 (.prov 3 0) (.prov 40000 0), .err .notAMethod),

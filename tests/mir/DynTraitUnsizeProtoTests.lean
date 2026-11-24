@@ -78,6 +78,11 @@ def ptrLayout (pointee : Nat) : TypeLayout :=
     fields := .primitive, variants := .single 0, isUninhabited := false,
     fieldLayouts := [pointee] }
 
+def boolLayout : TypeLayout :=
+  { size := { bytes := 1 }, align := { bytes := 1 },
+    backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
 def widePtrLayout : TypeLayout :=
   { size := { bytes := 16 }, align := { bytes := 8 },
     backendRepr :=
@@ -106,9 +111,7 @@ def layouts : LayoutTable :=
           fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1], variants := .single 0,
           isUninhabited := false, fieldLayouts := [0, 0] },
         ptrLayout 1, ptrLayout 2, widePtrLayout,
-        { size := { bytes := 1 }, align := { bytes := 1 },
-          backendRepr := .scalar (.initialized (.int 8 false) { start := 0, end_ := 1 }),
-          fields := .primitive, variants := .single 0, isUninhabited := false },
+        boolLayout,
         { size := { bytes := 0 }, align := { bytes := 1 }, backendRepr := .memory,
           fields := .arbitrary [] [], variants := .single 0, isUninhabited := false },
         ptrLayout 7 ] }
@@ -247,7 +250,7 @@ def addrEqMirBody : CapturedMir :=
             asg 0 (.binaryOp .eq (mv 3) (mv 4)) ] .return_],
     fnAbi :=
       { args := [{ layout := widePtrLayout, mode := .pair }, { layout := widePtrLayout, mode := .pair }],
-        ret := { layout := (ptrLayout 0), mode := .direct }, conv := .rust, canUnwind := false },
+        ret := { layout := boolLayout, mode := .direct }, conv := .rust, canUnwind := false },
     layouts := layouts, allocations := [] }
 
 /-- Linked method bodies. -/
@@ -792,6 +795,43 @@ def run (refReceiver writeInCallee writeAfter : Bool) : ProtoRunResult :=
     (initMachineStateWithCallees (callerBody refReceiver writeAfter) []
       [pokeBody (match refReceiver with | true => refRecTy | false => rawRecTy) writeInCallee])
 
+def refMutPokeTy : Ty := { kind := .ref .mut (.dynamic pokeKey), layoutIdx := 5 }
+
+/-- Caller with `&mut dyn Poke` receiver: `let mut rec = Receiver { bias: 1 };
+let alias = &raw mut rec.bias; let d: &mut dyn Poke = &mut rec;
+let r = d.poke_mut(alias); [rec = Receiver { bias: 5 };] r`. -/
+def mutCallerBody (writeAfter : Bool) : CapturedMir :=
+  { defPath := "c16::mut_caller", phase := .runtimePostCleanup, role := .model, argCount := 0,
+    localDecls :=
+      [ decl u32Ty, decl recTy, decl rawU32Ty, decl refMutPokeTy, decl refMutRecTy, decl u32Ty ],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4, live 5,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.rawPtr .mut { local_ := 1, projection := [.field 0 u32Ty] }),
+             asg 4 (.ref (.mut false) (loc 1)),
+             asg 3 (unsize (mv 4) refMutPokeTy) ]
+           (.call (virtFn pokePath pokeKey) [cp 3, cp 2] (loc 5) (some 1) .continue_),
+        bb ((match writeAfter with
+             | true => [asg 1 (.aggregate (.adt recKey 0 none) [cU32 5])]
+             | false => []) ++ [asg 0 (.use (cp 5))]) .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def runMut (writeInCallee writeAfter : Bool) : ProtoRunResult :=
+  runMirProto pokeProg (mutCallerBody writeAfter) 64
+    (initMachineStateWithCallees (mutCallerBody writeAfter) []
+      [pokeBody refMutRecTy writeInCallee])
+
+/-- **`c16` with `&mut dyn Poke` receiver.** Writing through the alias while
+the protected `&mut dyn Poke` receiver is live is UB; without the write it
+returns `7`, and mutating the owner after the call returns `7` once the frame
+exit releases the protector. -/
+theorem canary_a_c16_mut_dyn_receiver_uaf :
+    tagOf (runMut true false) = 3 ∧
+    scalarOf (runMut false false) = some (7, 4) ∧
+    scalarOf (runMut false true) = some (7, 4) := by
+  decide +kernel
+
 end C16
 
 namespace C16
@@ -920,14 +960,26 @@ def wide (d v : Value) : Value := .aggregate 0 [d, v]
 def ptrV (a o : Nat) : Value := .ptr { allocId := a, offsetBytes := o } 8
 def scV (n : Nat) : Value := .scalar ⟨n, 8⟩
 
+/-- Non-self supertrait entry for `AltReceiver` used in `vtablesWithNonMethodSlots`. -/
+def vtOtherAlt : ProtoVTableEntry :=
+  { vtableId := 3, vtableAllocId := 40003, concreteTyKey := otherKey, traitPred := altPred,
+    sizeBytes := 8, alignBytes := 4,
+    slots := [.dropInPlace none, .size, .align, .method otherEvalAlt] }
+
 /-- Vtable table whose `AltReceiver` vtable has a vacant slot `3` and a
-supertrait slot `4` (well formed: the supertrait vtable is entry `1` itself). -/
+non-self supertrait slot `4` pointing to `vtOtherAlt` (`vtableId = 3`). -/
 def vtablesWithNonMethodSlots : ProtoVTableTable :=
   { vtables with
     entries :=
       [vtRecTrait,
-       { vtOtherTrait with slots := [.dropInPlace none, .size, .align, .vacant, .traitVPtr 1] },
-       vtRecAlt] }
+       { vtOtherTrait with slots := [.dropInPlace none, .size, .align, .vacant, .traitVPtr 3] },
+       vtRecAlt,
+       vtOtherAlt] }
+
+/-- `vtablesWithNonMethodSlots` is genuinely well formed (no self-loop). -/
+theorem vtablesWithNonMethodSlots_wf :
+    wfProtoVTableTable 8 vtablesWithNonMethodSlots = true := by
+  decide +kernel
 
 /-- **(b) Mutability and borrow-state violations.** On the reproducer's
 unsizing state:
@@ -948,7 +1000,9 @@ theorem canary_b_mutability_and_borrow_state :
     unsizeWith vtables (fun s => withLocal s 11 (ptrV 1 4)) driverDecls refDynTy = [3] ∧
     unsizeWith
       { vtables with
-        entries := [{ vtRecTrait with isUninhabited := true }, vtOtherTrait, vtRecAlt] }
+        entries :=
+          [{ vtRecTrait with isUninhabited := true }, vtOtherTrait,
+           { vtRecAlt with isUninhabited := true }] }
       id driverDecls refDynTy = [3] ∧
     unsizeWith vtables (fun s => withLocal s 11 (ptrV 0 0)) driverDecls refDynTy = [3] ∧
     unsizeWith vtables (fun s => withLocal s 11 (scV 0)) driverDecls refDynTy = [3] ∧
@@ -1585,7 +1639,357 @@ theorem mr_universal_correspondence_instance (m : Mach) (mTB : MachTB) (d : Prot
   mach_and_machTB_vtable_correspondence traitOf fnOf vt 8 vtOtherTrait d tn m mTB
     (by decide +kernel) (by decide +kernel) rfl
 
+/-- **Universal MiniRust `checkPtrMetadataM`, `checkPtrM` (raw & ref), and
+`evalUnOpM` correspondence, instantiated on `Mach` and `MachTB`.** -/
+theorem mr_universal_checkPtr_and_evalUnOp_instances
+    (m : Mach) (mTB : MachTB) (dataPtr fnThin : Ptr) (dataPtrTB fnThinTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
+    (hDataB : inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hDataBTB : inBounds dataPtrTB.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hFn : mapGet m.fn_ptrs ⟨⟨fnOf otherEvalVt⟩⟩ = some fnThin)
+    (hFnTB : mapGet mTB.fn_ptrs ⟨⟨fnOf otherEvalVt⟩⟩ = some fnThinTB) :
+    checkPtrM { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr bmL vtOtherTrait)) }
+        (.Raw (.VTablePointer tn)) (some (installVTables bmL vt m)) = .ok () ∧
+    checkPtrM { thin_pointer := dataPtrTB, metadata := some (.VTablePointer (vtPtr tbL vtOtherTrait)) }
+        (.Raw (.VTablePointer tn)) (some (installVTables tbL vt mTB)) = .ok () ∧
+    checkPtrM
+        { thin_pointer := { addr := 0, provenance := none },
+          metadata := some (.VTablePointer (vtPtr bmL vtOtherTrait)) }
+        (.Ref .Immutable (dynInfo true)) (some (installVTables bmL vt m)) =
+      ub "Value::Ptr: null safe pointer" ∧
+    evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩) (vtVal vtOtherTrait) (some (installVTables bmL vt m)) =
+      .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) ∧
+    evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩) (vtValTB vtOtherTrait) (some (installVTables tbL vt mTB)) =
+      .ok (.Ptr (ThinPointer.widen fnThinTB none), .Ptr .FnPtr) := by
+  have hWf : wfProtoVTableTable 8 vt = true := by decide +kernel
+  have hLook : lookupVTableByAlloc vt.entries vtOtherTrait.vtableAllocId = some vtOtherTrait := rfl
+  have hVtB : inBounds (vtPtr bmL vtOtherTrait).addr .Unsigned x86_64.PTR_SIZE = true := by
+    decide +kernel
+  have hVtBTB : inBounds (vtPtr tbL vtOtherTrait).addr .Unsigned x86_64.PTR_SIZE = true := by
+    decide +kernel
+  have hSzB : inBounds (vtOtherTrait.sizeBytes : Int) .Signed x86_64.PTR_SIZE = true := by
+    decide +kernel
+  have hRawBM := checkPtrM_raw_dyn_unchecked bmL vt m 8 vtOtherTrait dataPtr
+    (bmLayout_provOf_inj _ _) hWf hLook hDataB hVtB
+  have hRawTB := checkPtrM_raw_dyn_unchecked tbL vt mTB 8 vtOtherTrait dataPtrTB
+    (tbLayout_provOf_inj _ _) hWf hLook hDataBTB hVtBTB
+  have hNullBM := (checkPtrM_ref_dyn_rejects_invalid bmL vt m 8 vtOtherTrait .Immutable true true
+    (bmLayout_provOf_inj _ _) hWf hLook hVtB hSzB).1 none
+  have hUnOpBM := (evalUnOpM_dyn_correspondence bmL vt m 8 3 vtOtherTrait otherEvalVt
+    dataPtr fnThin rawTy (bmLayout_provOf_inj _ _) hWf hLook hVtB rfl rfl hFn).2.2.2
+  have hUnOpTB := (evalUnOpM_dyn_correspondence tbL vt mTB 8 3 vtOtherTrait otherEvalVt
+    dataPtrTB fnThinTB rawTy (tbLayout_provOf_inj _ _) hWf hLook hVtBTB rfl rfl hFnTB).2.2.2
+  exact ⟨hRawBM, hRawTB, hNullBM, hUnOpBM, hUnOpTB⟩
+
 end MrTest
+
+/-! ## §4b. Adversarial B1 hardening & falsification suite -/
+
+namespace B1Hardening
+open Fx Canary Pillar
+
+/-- Helper: call `evalVirtualCallProto` with explicit `receiverIsRef` and
+`receiverIsMut` on the edited state `edit s49`. -/
+def callWithFlags (vt : ProtoVTableTable) (pred : ProtoTraitPred) (slot : Nat)
+    (isRef isMut : Bool) (edit : MachineState → MachineState) : Nat :=
+  match Canary.s49 with
+  | some s =>
+    vcTag
+      (evalVirtualCallProto vt
+        { traitPred := pred, slotIdx := slot, receiverIsRef := isRef, receiverIsMut := isMut }
+        (edit s) driverBody [cp 14, cp 1] (loc 20) 4 .continue_)
+  | none => 9
+
+/-- **1. `&mut dyn Trait` virtual call mutability, unlinked-callee validity
+ordering, Tree Borrows strict-ancestor chain, and valid dangling ZST `.ptr`.**
+* `&mut dyn Trait` (`receiverIsMut = true`) on a `.frozen` borrow tag is UB
+  (tag `3`), EVEN when `callees = []` (never `.externalCall` = `1`)!
+* `&mut dyn Trait` on a `.unique` borrow tag enters the callee (`0`).
+* `&mut dyn Trait` on an immutable global allocation is UB (`3`), whereas
+  `&dyn Trait` on the same immutable global enters the callee (`0`).
+* `&dyn Trait` with a `.disabled` tag or misaligned offset when `callees = []`
+  is UB (`3`), never `.externalCall` (`1`).
+* A `.frozen` child borrow tag whose strict parent tag is `.disabled` is
+  rejected by `refDataValid` (`false`).
+* A valid dangling ZST `.ptr { allocId := 0, offsetBytes := 4 }` is accepted by
+  `refDataValid` (`true`), while `.ptr { allocId := 0, offsetBytes := 0 }` is
+  rejected (`false`). -/
+theorem b1_mut_dyn_virtual_call_and_ancestor_and_zst :
+    callWithFlags vtables Fx.traitPred 3 true true id = 3 ∧
+    callWithFlags vtables Fx.traitPred 3 true true
+      (fun s => { s with memory := { s.memory with callees := [] } }) = 3 ∧
+    callWithFlags vtables Fx.traitPred 3 true true (fun s => withPerm s 2 .unique) = 0 ∧
+    callWithFlags vtables Fx.traitPred 3 true false
+      (fun s => { withPerm s 2 .disabled with memory := { (withPerm s 2 .disabled).memory with callees := [] } }) = 3 ∧
+    callWithFlags vtables Fx.traitPred 3 true false
+      (fun s => { withLocal s 14 (wide (ptrV 2 1) (ptrV 40001 0)) with
+                  memory := { s.memory with callees := [] } }) = 3 ∧
+    (match Canary.s49 with
+     | some s =>
+       let gAlloc : CapturedAllocation :=
+         { allocId := 90, bytes := List.replicate 8 (some 0), relocations := [],
+           align := { bytes := 4 }, mutability := .not }
+       let sImm :=
+         { withLocal s 14 (wide (ptrV 90 0) (ptrV 40001 0)) with
+           memory := { s.memory with globals := gAlloc :: s.memory.globals } }
+       (vcTag (evalVirtualCallProto vtables
+          { traitPred := Fx.traitPred, slotIdx := 3, receiverIsRef := true, receiverIsMut := true }
+          sImm driverBody [cp 14, cp 1] (loc 20) 4 .continue_),
+        vcTag (evalVirtualCallProto vtables
+          { traitPred := Fx.traitPred, slotIdx := 3, receiverIsRef := true, receiverIsMut := false }
+          sImm driverBody [cp 14, cp 1] (loc 20) 4 .continue_))
+     | none => (9, 9)) = (3, 0) ∧
+    (match Canary.s49 with
+     | some s =>
+       let bParent : BorrowEntry :=
+         { tag := 50, targetLocal := 5, targetProjection := [], perm := .disabled,
+           parentTag := none, protector := none }
+       let bChild : BorrowEntry :=
+         { tag := 51, targetLocal := 5, targetProjection := [], perm := .frozen,
+           parentTag := some 50, protector := none }
+       let memChain := { s.memory with borrows := bChild :: bParent :: s.memory.borrows }
+       let vtZst4 : ProtoVTableEntry := { vtRecTrait with sizeBytes := 0, alignBytes := 4 }
+       (refDataValid 8 vtOtherTrait false { allocId := 51, offsetBytes := 0 }
+          s.frame.locals memChain driverDecls layouts,
+        refDataValid 8 vtZst4 false { allocId := 0, offsetBytes := 4 }
+          s.frame.locals s.memory driverDecls layouts,
+        refDataValid 8 vtZst4 false { allocId := 0, offsetBytes := 0 }
+          s.frame.locals s.memory driverDecls layouts)
+     | none => (true, false, true)) = (false, true, false) := by
+  decide +kernel
+
+/-- **2. Auto-trait fabrication, unrelated 0-method marker-trait upcast, and
+inconsistent same-type layout across vtables are rejected.**
+* `dyn TraitA -> dyn TraitA + Send` (`unsizeDynToDyn` with `autoTraits` growing)
+  is UB (`3`), while `dyn TraitA + Send -> dyn TraitA` succeeds (`0`).
+* `upcastVTable?` rejects `dyn Sub -> dyn Marker` (unrelated 0-method trait
+  whose 3-slot header is trivially a prefix of every vtable) and `unsizeDynToDyn`
+  returns `.unsupported` (`4`), while `dyn Sub -> dyn Super` (`.traitVPtr`)
+  and `dyn Sub2 -> dyn Super` (`primarySuperVTable? := some 3`) succeed.
+* `wfProtoVTableTable` rejects tables where two vtables for the same
+  `concreteTyKey` disagree on `sizeBytes`, `alignBytes`, or `isUninhabited`. -/
+theorem b1_auto_trait_fabrication_and_unrelated_marker_upcast :
+    let eSub := lookupVTableById Lm.corpusTable.entries 4
+    let eSub2 := lookupVTableById Lm.corpusTable.entries 5
+    (match eSub, eSub2 with
+     | some s1, some s2 =>
+       ( (upcastVTable? Lm.corpusTable.entries s1 Lm.predMarker).isNone,
+         (upcastVTable? Lm.corpusTable.entries s1 Lm.predSuper).map (·.vtableId),
+         (upcastVTable? Lm.corpusTable.entries s2 Lm.predSuper).map (·.vtableId) )
+     | _, _ => (false, none, none)) = (true, some 3, some 3) ∧
+    wfProtoVTableTable 8
+      { vtables with entries := [{ vtRecTrait with isUninhabited := true }, vtOtherTrait, vtRecAlt] } =
+      false ∧
+    wfProtoVTableTable 8
+      { vtables with entries := [{ vtRecTrait with sizeBytes := 8 }, vtOtherTrait, vtRecAlt] } =
+      false ∧
+    (match Canary.s39 with
+     | some s =>
+       let pSub : Value := wide (ptrV 1 0) (ptrV 40004 0)
+       let pA : Value := wide (ptrV 1 0) (ptrV 40000 0)
+       let predASend : ProtoTraitPred := { Lm.predA with autoTraits := ["Send"] }
+       ( rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false Lm.predA predASend
+           pA s.frame.locals s.memory driverDecls layouts),
+         rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false predASend Lm.predA
+           pA s.frame.locals s.memory driverDecls layouts),
+         rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false Lm.predSub Lm.predMarker
+           pSub s.frame.locals s.memory driverDecls layouts) )
+     | none => (9, 9, 9)) = (3, 0, 4) := by
+  decide +kernel
+
+/-- **3. 32-bit target (`ptrBytes = 4`) layout overflow bounds, stack-page
+aliasing (`stackLocalAddrPageBase 4 = 32768`), and ZST wrapped-null UB.** -/
+def vt32Ok : ProtoVTableEntry :=
+  { vtableId := 0, vtableAllocId := 20000, concreteTyKey := recKey, traitPred := Fx.traitPred,
+    sizeBytes := 4, alignBytes := 4,
+    slots := [.dropInPlace none, .size, .align, .method recEvalVt, .method recTagVt] }
+
+def vt32Zst : ProtoVTableEntry :=
+  { vtableId := 1, vtableAllocId := 20001, concreteTyKey := "()", traitPred := altPred,
+    sizeBytes := 0, alignBytes := 4,
+    slots := [.dropInPlace none, .size, .align, .vacant] }
+
+def table32 : ProtoVTableTable :=
+  { entries := [vt32Ok, vt32Zst],
+    dynTypes := [(traitKey, Fx.traitPred), (altKey, altPred)] }
+
+def layouts32 : LayoutTable := { layouts with pointerBits := 32 }
+
+theorem b1_32bit_target_and_overflow_bounds :
+    entryLayoutOk 4 { vt32Ok with sizeBytes := 0, alignBytes := 2 ^ 31 } = false ∧
+    entryLayoutOk 4 { vt32Ok with sizeBytes := 0, alignBytes := 2 ^ 100 } = false ∧
+    entryLayoutOk 4 { vt32Ok with sizeBytes := 2 ^ 31 - 4, alignBytes := 8 } = false ∧
+    entryLayoutOk 4 vt32Ok = true ∧
+    wfProtoVTableTable 4 table32 = true ∧
+    vtableAllocDisjoint 4 (driverState driverBody 7 24).memory 32768 = false ∧
+    vtableAllocDisjoint 4 (driverState driverBody 7 24).memory 40000 = false ∧
+    vtableAllocDisjoint 4 (driverState driverBody 7 24).memory 20000 = true ∧
+    vtableEnvOk 4 table32 (driverState driverBody 7 24).memory = true ∧
+    resCode (dynSizeOfValProto table32 4 Fx.traitPred
+      (mkDynPtr 4 (.prov { allocId := 1, offsetBytes := 0 }) vt32Ok)) = (0, 4) ∧
+    resCode (dynAlignOfValProto table32 4 Fx.traitPred
+      (mkDynPtr 4 (.prov { allocId := 1, offsetBytes := 0 }) vt32Ok)) = (0, 4) ∧
+    (match Canary.s39 with
+     | some s =>
+       ( rvalTag (unsizeDynToDyn table32 4 .ref false altPred altPred
+           (mkDynPtr 4 (.addr (2 ^ 32)) vt32Zst) s.frame.locals s.memory driverDecls layouts32),
+         rvalTag (unsizeDynToDyn table32 4 .ref false altPred altPred
+           (mkDynPtr 4 (.addr 4) vt32Zst) s.frame.locals s.memory driverDecls layouts32) )
+     | none => (9, 9)) = (3, 0) := by
+  decide +kernel
+
+/-- **4. Non-zero receiver field `offsetBytes = 4` end-to-end MIR execution.**
+`OuterPair { lead: u32, inner: Receiver }` puts `inner` at byte offset `4`.
+Borrowing `&outer.inner` yields a pointer with `offsetBytes = 4`, unsizing to
+`&dyn Trait` preserves `offsetBytes = 4`, and virtual dispatch to
+`Receiver::eval_vt(&self, 10)` narrows the receiver keeping `offsetBytes = 4`
+so it reads `inner.bias` (`25`, giving `10 ^ 25 = 19`) rather than `outer.lead`
+(`99`, which would give `10 ^ 99 = 105`). -/
+def outerPairKey : String := "b1::OuterPair"
+
+def layoutsWithOuterPair : LayoutTable :=
+  { layouts with
+    entries :=
+      layouts.entries ++
+        [{ size := { bytes := 8 }, align := { bytes := 4 },
+           backendRepr :=
+             .scalarPair (.initialized (.int 32 false) { start := 0, end_ := 4294967295 })
+               (.initialized (.int 32 false) { start := 0, end_ := 4294967295 }),
+           fields := .arbitrary [{ bytes := 0 }, { bytes := 4 }] [0, 1],
+           variants := .single 0, isUninhabited := false, fieldLayouts := [0, 1] }] }
+
+def outerPairTy : Ty := { kind := .adt outerPairKey [], layoutIdx := 9 }
+
+def fieldOffsetCallerBody (lead bias : Nat) : CapturedMir :=
+  { defPath := "b1::field_offset_caller", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl u32Ty, decl outerPairTy, decl recTy, decl refRecTy, decl refDynTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4,
+             asg 2 (.aggregate (.adt recKey 0 none) [cU32 bias]),
+             asg 1 (.aggregate (.adt outerPairKey 0 none) [cU32 lead, mv 2]),
+             asg 3 (.ref .shared { local_ := 1, projection := [.field 1 recTy] }),
+             asg 4 (unsize (mv 3) refDynTy) ]
+           (.call (virtFn evalVtPath traitKey) [cp 4, cU32 10] (loc 0) (some 1) .continue_),
+        bb [] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layoutsWithOuterPair, allocations := [] }
+
+theorem b1_nonzero_receiver_offset_mir_execution :
+    scalarOf (runMirProto prog (fieldOffsetCallerBody 99 25) 64
+      (initMachineStateWithCallees (fieldOffsetCallerBody 99 25) [] methodBodies)) =
+        some (19, 4) ∧
+    scalarOf (runMirProto prog (fieldOffsetCallerBody 99 42) 64
+      (initMachineStateWithCallees (fieldOffsetCallerBody 99 42) [] methodBodies)) =
+        some (32, 4) ∧
+    scalarOf (runMirProto prog (fieldOffsetCallerBody 7 25) 64
+      (initMachineStateWithCallees (fieldOffsetCallerBody 7 25) [] methodBodies)) =
+        some (19, 4) := by
+  decide +kernel
+
+/-- **5. `stepMirFnProto` dynamic-layout intrinsics (`size_of_val` /
+`align_of_val`), `&raw mut (*shared_dyn)` UB, diverging virtual call, and
+`evalWidePtrEqProto` `.uninit` / heterogeneous metadata UB.** -/
+def usizeLayout : TypeLayout :=
+  { size := { bytes := 8 }, align := { bytes := 8 },
+    backendRepr := .scalar (.initialized (.int 64 false) { start := 0, end_ := 18446744073709551615 }),
+    fields := .primitive, variants := .single 0, isUninhabited := false }
+
+def layoutsWithUsize : LayoutTable := { layouts with entries := layouts.entries ++ [usizeLayout] }
+def usizeTy : Ty := { kind := .uint .usize, layoutIdx := 9 }
+
+def dynLayoutIntrinsicCallerBody (useOther : Bool) (isAlign : Bool) : CapturedMir :=
+  let intrinsicPath :=
+    match isAlign with
+    | false => "core::intrinsics::size_of_val"
+    | true => "core::intrinsics::align_of_val"
+  { defPath := "b1::dyn_layout_intrinsic_caller", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls :=
+      [ decl usizeTy,
+        decl (match useOther with | false => recTy | true => otherTy),
+        decl (match useOther with | false => refRecTy | true => refOtherTy),
+        decl refDynTy ],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3,
+             asg 1 (match useOther with
+                    | false => .aggregate (.adt recKey 0 none) [cU32 1]
+                    | true => .aggregate (.adt otherKey 0 none) [cU32 1, cU32 2]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDynTy) ]
+           (.call (fnOp intrinsicPath [.dynamic traitKey]) [cp 3] (loc 0) (some 1) .continue_),
+        bb [] .return_ ],
+    fnAbi :=
+      { args := [], ret := { layout := usizeLayout, mode := .direct },
+        conv := .rust, canUnwind := false },
+    layouts := layoutsWithUsize, allocations := [] }
+
+def sharedToRawMutDynBody : CapturedMir :=
+  { defPath := "b1::shared_to_raw_mut_dyn", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl u32Ty, decl recTy, decl refRecTy, decl refDynTy, decl rawMutDynTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDynTy),
+             asg 4 (.rawPtr .mut (derefPlace 3)),
+             asg 0 (.use (cU32 0)) ] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def divergeMethodPath : String := "b1::Diverge::boom"
+def recDivergePath : String := "<miri_diff_corpus::__AnnealVtableReceiver43543 as b1::Diverge>::boom"
+
+def recDivergeBody : CapturedMir :=
+  { defPath := recDivergePath, phase := .runtimePostCleanup, role := .model, argCount := 1,
+    localDecls := [decl u32Ty, decl refRecTy],
+    basicBlocks := [bb [] .unreachable],
+    fnAbi := { args := [ptrAbi], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def divergeProg : ProtoDynProgram :=
+  { vtables :=
+      { entries :=
+          [{ vtableId := 0, vtableAllocId := 40000, concreteTyKey := recKey,
+             traitPred := { principalTrait? := some "b1::Diverge" },
+             sizeBytes := 4, alignBytes := 4,
+             slots := [.dropInPlace none, .size, .align, .method recDivergePath] }],
+        dynTypes := [("b1::Diverge", { principalTrait? := some "b1::Diverge" })] },
+    virtualMethods := [(divergeMethodPath, 3)] }
+
+def divergeCallerBody : CapturedMir :=
+  let refDivTy : Ty := { kind := .ref .not (.dynamic "b1::Diverge"), layoutIdx := 5 }
+  { defPath := "b1::diverge_caller", phase := .runtimePostCleanup, role := .model, argCount := 0,
+    localDecls := [decl u32Ty, decl recTy, decl refRecTy, decl refDivTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDivTy) ]
+           (.call (virtFn divergeMethodPath "b1::Diverge") [cp 3] (loc 0) none .continue_) ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+theorem b1_intrinsics_raw_mut_diverge_and_wide_eq_ub :
+    scalarOf (runMirProto prog (dynLayoutIntrinsicCallerBody false false) 32
+      (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody false false) [] [])) =
+        some (4, 8) ∧
+    scalarOf (runMirProto prog (dynLayoutIntrinsicCallerBody true false) 32
+      (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody true false) [] [])) =
+        some (8, 8) ∧
+    scalarOf (runMirProto prog (dynLayoutIntrinsicCallerBody true true) 32
+      (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody true true) [] [])) =
+        some (4, 8) ∧
+    tagOf (runMirProto prog sharedToRawMutDynBody 32
+      (initMachineStateWithCallees sharedToRawMutDynBody [] [])) = 3 ∧
+    (advanceSteps divergeCallerBody (stepMirFnProto divergeProg divergeCallerBody) 7
+      (initMachineStateWithCallees divergeCallerBody [] [recDivergeBody])).map
+        (fun s => s.memory.activeCallee.map (·.defPath)) = some (some recDivergePath) ∧
+    wideEq .uninit (localVal 10) = (3, 0) ∧
+    wideEq (wide (ptrV 1 0) (scV 2)) (localVal 10) = (3, 0) := by
+  decide +kernel
+
+end B1Hardening
 
 /-! ## §5. Cross-root dual-authority kernel bridge (vendored `Miri.Interpreter.*`)
 
@@ -1708,6 +2112,12 @@ def sizedLayout (size align : Nat) : LayoutData :=
 /-- Unsized layout of a trait object. -/
 def dynLayoutData : LayoutData :=
   { sizedLayout 0 1 with backendRepr := .Memory (sized := false) }
+
+/-- Layout of a `DispatchFromDyn` wrapper `((), *const dyn T, ())` with two
+1-ZST fields and a single non-1-ZST wide-pointer field at index `1`. -/
+def wrappedDynLayout : LayoutData :=
+  { sizedLayout 16 8 with
+    fields := .Arbitrary #[Size.ZERO, Size.ZERO, Size.ofBytes 16] #[0, 1, 2] }
 
 private def unused {S A : Type} (what : String) : EStateM StepError S A :=
   throw (.unsupported s!"unused hook {what}")
@@ -1924,14 +2334,21 @@ def lmDynLayoutHooks (vt : ProtoVTableTable) : DynamicLayoutHooks LmP LmS LmC wh
 /-- Trait and slot of a virtual method definition (`100 * trait + slot`). -/
 def lmDefOf (t slot : Nat) : Nat := 100 * t + slot
 
-/-- Genuine `VirtualCalls.CompilerHooks`: receiver classification, dyn tail
-data, and the compiler's resolution of the concrete instance. -/
+/-- Genuine `VirtualCalls.CompilerHooks`: receiver classification (direct raw
+pointers `4000 + t` and `DispatchFromDyn` wrappers `5000 + t`), dyn tail data,
+and the compiler's resolution of the concrete instance. -/
 def lmCompilerHooks (vt : ProtoVTableTable) : VirtualCalls.CompilerHooks LmS LmC where
   classifyReceiver := fun ty =>
-    match Nat.ble 4000 ty with
+    match Nat.ble 4000 ty && Nat.blt ty 5000 with
     | true => pure .rawPointer
     | false => pure .other
-  fieldLayout := fun _ _ => unused "fieldLayout"
+  fieldLayout := fun layout idx =>
+    match Nat.ble 5000 layout.ty with
+    | true =>
+      match idx with
+      | 1 => pure ⟨4000 + (layout.ty - 5000), sizedLayout 16 8⟩
+      | _ => pure ⟨2002, sizedLayout 0 1⟩
+    | false => unused "fieldLayout"
   structTailForCodegen := fun ty => pure ty
   dynamicData := fun ty =>
     match Nat.ble 1000 ty && Nat.blt ty 2000 with
@@ -1940,13 +2357,16 @@ def lmCompilerHooks (vt : ProtoVTableTable) : VirtualCalls.CompilerHooks LmS LmC
   mutPointerType := fun _ => pure 2001
   mutReferenceType := fun _ => unused "mutReferenceType"
   builtinDeref := fun ty =>
-    match Nat.ble 4000 ty with
+    match Nat.ble 4000 ty && Nat.blt ty 5000 with
     | true => pure (some (dynTyId (ty - 4000)))
     | false => pure none
   layoutOf := fun ty =>
-    match Nat.ble 4000 ty with
-    | true => pure ⟨ty, sizedLayout 16 8⟩
-    | false => lmLayoutOf vt ty
+    match Nat.ble 5000 ty with
+    | true => pure ⟨ty, wrappedDynLayout⟩
+    | false =>
+      match Nat.ble 4000 ty with
+      | true => pure ⟨ty, sizedLayout 16 8⟩
+      | false => lmLayoutOf vt ty
   parentTrait := fun d => pure d
   rebaseVirtualArgs := fun _ _ ty => pure #[.Type ty]
   expectResolveForVTable := fun _ d args =>
@@ -1965,7 +2385,8 @@ def lmCompilerHooks (vt : ProtoVTableTable) : VirtualCalls.CompilerHooks LmS LmC
   unitLayout := unused "unitLayout"
 
 /-- Genuine `VirtualCalls.Hooks`: receiver unwrapping through
-`VirtualCalls.pointerPlace` (no dereference, no misalignment check). -/
+`VirtualCalls.pointerPlace` and `VirtualCalls.nonOneZstField` + `projectField`
+for `DispatchFromDyn` wrappers (no dereference, no misalignment check). -/
 def lmVirtualHooks (vt : ProtoVTableTable) : VirtualCalls.Hooks LmP LmS LmC Unit where
   debugAssertions := false
   compiler := lmCompilerHooks vt
@@ -1978,11 +2399,20 @@ def lmVirtualHooks (vt : ProtoVTableTable) : VirtualCalls.Hooks LmP LmS LmC Unit
     | .indirect _ => unused "readImmediate"
   immPtrToMPlace := fun _ v =>
     VirtualCalls.pointerPlace (lmCompilerHooks vt) lmTarget (fun _ _ => pure none) v
-  projectField := fun _ _ _ => unused "projectField"
+  projectField := fun _ receiver idx =>
+    match Nat.ble 5000 receiver.layout.ty && Nat.beq idx 1 with
+    | true => pure ⟨receiver.op, ⟨4000 + (receiver.layout.ty - 5000), sizedLayout 16 8⟩⟩
+    | false => unused "projectField"
 
 /-- Caller ABI of a one-argument virtual call. -/
 def lmCallerAbi (t : Nat) : FnAbi Nat :=
   { args := #[⟨⟨4000 + t, sizedLayout 16 8⟩, .Ignore⟩]
+    ret := ⟨⟨2001, sizedLayout 0 1⟩, .Ignore⟩
+    cVariadic := false, fixedCount := 1, conv := .Rust, canUnwind := false }
+
+/-- Caller ABI of a one-argument virtual call with a `DispatchFromDyn` wrapper receiver. -/
+def lmCallerAbiWrapped (t : Nat) : FnAbi Nat :=
+  { args := #[⟨⟨5000 + t, wrappedDynLayout⟩, .Ignore⟩]
     ret := ⟨⟨2001, sizedLayout 0 1⟩, .Ignore⟩
     cVariadic := false, fixedCount := 1, conv := .Rust, canUnwind := false }
 
@@ -2066,6 +2496,24 @@ def miriRun (vt : ProtoVTableTable) : LmQuery → LmObs
             | _ => .err .other
           | _ => .err .other)
     | _, _ => .err .other
+  | .virtualCallWrapped t slot data vtp =>
+    match lmScalar data, lmScalar vtp with
+    | some sd, some sv =>
+      lmRunM
+        (VirtualCalls.resolveVirtual (lmVirtualHooks vt) () 4 ⟨.Virtual (lmDefOf t slot) slot, #[]⟩
+          (lmDefOf t slot) slot (lmCallerAbiWrapped t)
+          #[.Copy ⟨.immediate (.scalarPair sd sv), ⟨5000 + t, wrappedDynLayout⟩⟩])
+        (fun r _ =>
+          match r.2.2[0]? with
+          | some (FnArg.Copy op) =>
+            match op.op with
+            | .immediate (.scalar s) =>
+              match lmPtrOfScalar s with
+              | some p => lmMethodObs r.1 p
+              | none => .err .other
+            | _ => .err .other
+          | _ => .err .other)
+    | _, _ => .err .other
   | .getMethod t slot vtp =>
     lmRunM
       (VTable.getMethod (lmVTableHooks vt) (fun _ _ _ => pure ()) () (lmPointer vtp) t (some t)
@@ -2082,6 +2530,153 @@ theorem miriAuthority_check : lmAuthorityCheck miriAuthority = true := by decide
 /-- **The `lean-miri` correspondence contract over the vendored interpreter.** -/
 theorem miriContract : LmDynContract miriAuthority :=
   lmDynContractOfCheck miriAuthority miriAuthority_check
+
+/-- Real-state `VTableMachine` harness exercising `VTableMachine.reserve`,
+`VTableMachine.globalVTable`, `VTableMachine.hooks`,
+`VTableMachine.Registry.mergePersistent`, and
+`VTableMachine.Registry.ensureDisjointFromFunctions`. -/
+abbrev VtmUser := FunctionPointers.Registry Unit × VTableMachine.Registry
+abbrev VtmState := MachineHooks.State Unit VtmUser
+
+def vtmSeedRegistry : VTableMachine.Registry :=
+  ⟨#[⟨0, 0, ⟨0, by decide⟩, ⟨40000, by decide⟩⟩,
+     ⟨1, 0, ⟨0, by decide⟩, ⟨40001, by decide⟩⟩,
+     ⟨0, 1, ⟨0, by decide⟩, ⟨40002, by decide⟩⟩]⟩
+
+def vtmInitState : VtmState :=
+  { stack := Stack.empty
+    machine :=
+      { memory := { MemoryState.empty with sourceAllocIdWorldActive := true }
+        borrowTracker := none
+        dataRace := none
+        threads := Miri.Concurrency.ThreadManager.initial true
+        raceAllocations := #[]
+        allocationSpans := #[]
+        user := (FunctionPointers.Registry.empty, vtmSeedRegistry) } }
+
+def vtmFnHooks : FunctionPointers.Hooks Unit VtmUser Unit :=
+  { registry := Prod.fst
+    putRegistry := fun u r => (r, u.2)
+    crossCrateInlineAlways := false
+    inlineNever := fun _ => pure false
+    chooseSalt := pure ⟨0, by decide⟩
+    ptrGetAlloc := fun _ => pure none
+    adjustRootPointer := fun id tag =>
+      pure ⟨Size.ZERO, Provenance.concrete id tag⟩
+    importedFunction := fun _ => pure none }
+
+def vtmHooks : VTableMachine.Hooks Unit VtmUser Unit :=
+  { functions := vtmFnHooks
+    registry := Prod.snd
+    putRegistry := fun u r => (u.1, r)
+    target := { RuntimeTargetDataLayout.default with base := lmTarget }
+    importedVTable := fun _ => pure none }
+
+def vtmBaseVTableHooks :
+    VTableHooks Provenance VtmState Unit CallInstance (FnAbi Nat) :=
+  { target := lmTarget
+    isDynamic := fun _ _ => pure false
+    memoryOffset := fun _ _ _ _ _ => unused "memoryOffset"
+    resolvePointer := fun _ _ => unused "resolvePointer"
+    globalVTable := fun _ _ => pure none
+    globalFunction := fun _ _ => pure none
+    predicates := fun _ _ => pure #[]
+    normalizePredicate := fun _ p => pure p.stableKey
+    layoutOf := fun _ ty => pure ⟨ty, sizedLayout 4 4⟩
+    eraseAndAnonymize := fun _ ty d => pure (ty, d)
+    ensureMonomorphicType := fun _ _ => pure ()
+    ensureMonomorphicDyn := fun _ _ => pure ()
+    globalSalt := fun _ => pure 0
+    reserveVTable := fun _ _ _ _ => unused "reserveVTable"
+    globalRootPointer := fun _ _ => unused "globalRootPointer"
+    entries := fun _ _ _ => pure #[]
+    assertVirtualInstanceMatches := fun _ _ _ _ _ => pure () }
+
+def vtmInstalledHooks :
+    VTableHooks Provenance VtmState Unit CallInstance (FnAbi Nat) :=
+  VTableMachine.hooks vtmHooks vtmBaseVTableHooks
+
+/-- Exercises genuine `Miri.Interpreter.VTableMachine` completely inside the
+Lean kernel (`decide +kernel`):
+1. `VTableMachine.reserve` deduplicates captured `(ty, dynType, salt)` keys and
+   returns the exact prepared `AllocId` (`40000`, `40001`, `40002`);
+2. uncaptured salt (`salt = 1`) or uncaptured `(ty, dynType)` fails closed with
+   `.unsupported` under `sourceAllocIdWorldActive = true`;
+3. `VTableMachine.hooks` routes `reserveVTable` / `globalVTable` and rejects
+   out-of-range salt (`32`);
+4. `VTableMachine.globalVTable` recovers `(ty, dynType)` for each reserved id;
+5. `VTableMachine.Registry.mergePersistent` merges consistent registries and
+   rejects conflicting `AllocId`s for the same key or one `AllocId` reused on
+   two keys;
+6. `VTableMachine.Registry.ensureDisjointFromFunctions` accepts disjoint
+   registries and rejects an `AllocId` shared with `FunctionPointers.Registry`. -/
+def vtmMachineCheck : Bool :=
+  let prog : MachineHooks.M Unit VtmUser Bool := do
+    let id0 ← VTableMachine.reserve vtmHooks 0 0 ⟨0, by decide⟩
+    let id1 ← VTableMachine.reserve vtmHooks 1 0 ⟨0, by decide⟩
+    let id2 ← VTableMachine.reserve vtmHooks 0 1 ⟨0, by decide⟩
+    let id0ViaHooks ← vtmInstalledHooks.reserveVTable () 0 0 0
+    let uncapturedSaltRejected ←
+      try
+        let _ ← VTableMachine.reserve vtmHooks 0 0 ⟨1, by decide⟩
+        pure false
+      catch e =>
+        match e with
+        | .unsupported _ => pure true
+        | _ => pure false
+    let uncapturedKeyRejected ←
+      try
+        let _ ← VTableMachine.reserve vtmHooks 1 1 ⟨0, by decide⟩
+        pure false
+      catch e =>
+        match e with
+        | .unsupported _ => pure true
+        | _ => pure false
+    let badSaltRejected ←
+      try
+        let _ ← vtmInstalledHooks.reserveVTable () 0 0 32
+        pure false
+      catch _ => pure true
+    let g0 ← VTableMachine.globalVTable vtmHooks id0
+    let g1 ← vtmInstalledHooks.globalVTable () id1
+    let g2 ← VTableMachine.globalVTable vtmHooks id2
+    let reg := (← get).machine.user.2
+    let mergeSelfOk :=
+      match VTableMachine.Registry.mergePersistent reg reg with
+      | .ok r => r.entries.size == 3
+      | .error _ => false
+    let conflictKey : VTableMachine.Registry := ⟨#[⟨0, 0, ⟨0, by decide⟩, id1⟩]⟩
+    let mergeConflictKeyRej :=
+      match VTableMachine.Registry.mergePersistent reg conflictKey with
+      | .ok _ => false
+      | .error _ => true
+    let conflictAlloc : VTableMachine.Registry := ⟨#[⟨9, 9, ⟨0, by decide⟩, id0⟩]⟩
+    let mergeConflictAllocRej :=
+      match VTableMachine.Registry.mergePersistent reg conflictAlloc with
+      | .ok _ => false
+      | .error _ => true
+    let fnDisjointOk :=
+      match VTableMachine.Registry.ensureDisjointFromFunctions reg
+          (FunctionPointers.Registry.empty : FunctionPointers.Registry Unit) with
+      | .ok () => true
+      | .error _ => false
+    let fnColliding : FunctionPointers.Registry Unit :=
+      ⟨#[⟨⟨.Item 0, #[]⟩, ⟨0, by decide⟩, id0⟩], #[]⟩
+    let fnCollideRej :=
+      match VTableMachine.Registry.ensureDisjointFromFunctions reg fnColliding with
+      | .ok () => false
+      | .error _ => true
+    pure (id0.value == 40000 && id1.value == 40001 && id2.value == 40002 &&
+      id0 == id0ViaHooks && id0 != id1 && id0 != id2 && id1 != id2 &&
+      uncapturedSaltRejected && uncapturedKeyRejected && badSaltRejected &&
+      g0 == some (0, 0) && g1 == some (1, 0) && g2 == some (0, 1) &&
+      mergeSelfOk && mergeConflictKeyRej && mergeConflictAllocRej &&
+      fnDisjointOk && fnCollideRej)
+  match prog.run vtmInitState with
+  | .ok ok _ => ok
+  | .error _ _ => false
+
+theorem vtmMachineCheck_ok : vtmMachineCheck = true := by decide +kernel
 
 /-- Forged authority: virtual calls resolve the next slot. -/
 def forgedNextSlot : LmDynAuthority :=
@@ -2104,16 +2699,53 @@ def forgedKeepsMetadata : LmDynAuthority :=
     | .ptrToPtr d m => .wide d m
     | q => miriRun vt q⟩
 
+/-- MiniRust `checkPtrMetadataM` / `checkPtrM` / `evalUnOpM` correspondence on
+the corpus table (`Mach`), reaching the universal §8 theorems. -/
+theorem corpus_minirust_checkPtr_evalUnOp
+    (m : MiniRustSpec.Interp.Mach)
+    (dataPtr fnThin : MiniRustSpec.Interp.Ptr)
+    (hDataB : MiniRustSpec.Interp.inBounds dataPtr.addr .Unsigned MiniRustSpec.Interp.x86_64.PTR_SIZE = true)
+    (hFn : MiniRustSpec.Interp.mapGet m.fn_ptrs ⟨⟨fnIdOf corpusTable "other::eval"⟩⟩ = some fnThin) :
+    let e : ProtoVTableEntry :=
+      { vtableId := 1, vtableAllocId := 40001, concreteTyKey := "AltReceiver",
+        traitPred := predA, sizeBytes := 8, alignBytes := 4,
+        slots := [.dropInPlace none, .size, .align, .method "other::eval", .method "other::tag"] }
+    let L := MR.bmLayout corpusTraitOf (fnIdOf corpusTable)
+    MiniRustSpec.Interp.checkPtrM
+        { thin_pointer := dataPtr, metadata := some (.VTablePointer (MR.vtPtr L e)) }
+        (.Raw (.VTablePointer (MR.traitName L e.traitPred)))
+        (some (MR.installVTables L corpusTable m)) = .ok () ∧
+    MiniRustSpec.Interp.evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩)
+        (.Ptr (MiniRustSpec.Interp.ThinPointer.widen (MR.vtPtr L e) none),
+         .Ptr (.VTablePtr (MR.traitName L e.traitPred)))
+        (some (MR.installVTables L corpusTable m)) =
+      .ok (.Ptr (MiniRustSpec.Interp.ThinPointer.widen fnThin none), .Ptr .FnPtr) := by
+  intro e L
+  have hLook : lookupVTableByAlloc corpusTable.entries e.vtableAllocId = some e := rfl
+  have hVtB : MiniRustSpec.Interp.inBounds (MR.vtPtr L e).addr .Unsigned
+      MiniRustSpec.Interp.x86_64.PTR_SIZE = true := by decide +kernel
+  refine ⟨MR.checkPtrM_raw_dyn_unchecked L corpusTable m 8 e dataPtr
+      (MR.bmLayout_provOf_inj _ _) corpusTable_wf hLook hDataB hVtB,
+    (MR.evalUnOpM_dyn_correspondence L corpusTable m 8 3 e "other::eval" dataPtr fnThin
+      (.Raw (.VTablePointer (MR.traitName L e.traitPred)))
+      (MR.bmLayout_provOf_inj _ _) corpusTable_wf hLook hVtB rfl rfl hFn).2.2.2⟩
+
 /-- **Dual-authority capstone.** The vendored `lean-miri` interpreter satisfies
-the `LmDynContract` (kernel-checked agreement with the prototype on every test
-vector), and MiniRust's `vtable_from_ptr` / `compute_size` / `compute_align`
-agree with the prototype's dynamic layout on the same corpus table (`Mach` and
-`MachTB`). -/
+`LmDynContract` (including multi-predicate assoc-type sorting/dedup and
+`DispatchFromDyn` wrapper receivers) and `VTableMachine` reservation/merge/
+disjointness checks, and MiniRust's `vtable_from_ptr` / `compute_size` /
+`compute_align` / `check_ptr` / `eval_un_op` agree with the prototype on the
+same corpus table (`Mach` and `MachTB`). -/
 theorem dyn_dual_authority_capstone :
     LmDynContract miriAuthority ∧
+    vtmMachineCheck = true ∧
     (∀ (m : MiniRustSpec.Interp.Mach) (mTB : MiniRustSpec.Interp.MachTB) (d : ProtoDataWord),
-      type_of% (corpus_minirust_instance m mTB d)) :=
-  ⟨miriContract, corpus_minirust_instance⟩
+      type_of% (corpus_minirust_instance m mTB d)) ∧
+    (∀ (m : MiniRustSpec.Interp.Mach) (dataPtr fnThin : MiniRustSpec.Interp.Ptr)
+      (hDataB : MiniRustSpec.Interp.inBounds dataPtr.addr .Unsigned MiniRustSpec.Interp.x86_64.PTR_SIZE = true)
+      (hFn : MiniRustSpec.Interp.mapGet m.fn_ptrs ⟨⟨fnIdOf corpusTable "other::eval"⟩⟩ = some fnThin),
+      type_of% (corpus_minirust_checkPtr_evalUnOp m dataPtr fnThin hDataB hFn)) :=
+  ⟨miriContract, vtmMachineCheck_ok, corpus_minirust_instance, corpus_minirust_checkPtr_evalUnOp⟩
 
 end Anneal.Prototypes.DynTraitUnsizeProtoTests.CrossRoot
 "##
@@ -2176,6 +2808,11 @@ run_cmd do
     let intP (a : Nat) : Expr := mkApp (mkConst (lmNs ++ `LmPtr.int)) (nat a)
     let qVirtual (t s : Nat) (d v : Expr) : Expr :=
       mkApp4 (mkConst (lmNs ++ `LmQuery.virtualCall)) (nat t) (nat s) d v
+    let qVirtualWrapped (t s : Nat) (d v : Expr) : Expr :=
+      mkApp4 (mkConst (lmNs ++ `LmQuery.virtualCallWrapped)) (nat t) (nat s) d v
+    let qVtableType (v : Expr) (t : Nat) : Expr :=
+      mkApp2 (mkConst (lmNs ++ `LmQuery.vtableType)) v
+        (mkApp2 (mkConst ``Option.some [0]) natTy (nat t))
     let qSizeAlign (v : Expr) (t : Nat) : Expr :=
       mkApp2 (mkConst (lmNs ++ `LmQuery.sizeAlign)) v (nat t)
     let qUnsize (ty t : Nat) (d : Expr) : Expr :=
@@ -2183,6 +2820,7 @@ run_cmd do
     let qUpcast (s t : Nat) (d v : Expr) : Expr :=
       mkApp4 (mkConst (lmNs ++ `LmQuery.upcast)) (nat s) (nat t) d v
     let qPtrToPtr (d m : Expr) : Expr := mkApp2 (mkConst (lmNs ++ `LmQuery.ptrToPtr)) d m
+    let oTyOk (ty : Nat) : Expr := mkApp (mkConst (lmNs ++ `LmObs.tyOk)) (nat ty)
     let oMethod (f : Nat) (r : Expr) : Expr := mkApp2 (mkConst (lmNs ++ `LmObs.method)) (nat f) r
     let oSizeAlign (s a : Nat) : Expr := mkApp2 (mkConst (lmNs ++ `LmObs.sizeAlign)) (nat s) (nat a)
     let oWide (d v : Expr) : Expr := mkApp2 (mkConst (lmNs ++ `LmObs.wide)) d v
@@ -2195,21 +2833,25 @@ run_cmd do
     let eqTrue (e : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.true)
     let eqFalse (e : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.false)
 
-    -- 1. The elaborated certificate, contract, and capstone.
+    -- 1. The elaborated certificate, contract, VTableMachine check, and capstone.
     let env0 ← getEnv
     let checkName := ns ++ `miriAuthority_check
     let contractName := ns ++ `miriContract
+    let vtmCheckName := ns ++ `vtmMachineCheck_ok
     let capstoneName := ns ++ `dyn_dual_authority_capstone
-    for n in [checkName, contractName, capstoneName] do
+    for n in [checkName, contractName, vtmCheckName, capstoneName] do
       let some (.thmInfo _) := env0.find? n | throwError "cross-root: theorem {n} missing"
     let some (.thmInfo checkInfo) := env0.find? checkName | throwError "unreachable"
     unless checkInfo.type == eqTrue (mkApp (mkConst (lmNs ++ `lmAuthorityCheck))
         (mkConst (ns ++ `miriAuthority))) do
       throwError "cross-root: {checkName} has an unexpected statement"
+    let some (.thmInfo vtmInfo) := env0.find? vtmCheckName | throwError "unreachable"
+    unless vtmInfo.type == eqTrue (mkConst (ns ++ `vtmMachineCheck)) do
+      throwError "cross-root: {vtmCheckName} has an unexpected statement"
     let contractC := mkConst contractName
 
     -- 2. Closed per-law projections of the contract over the vendored interpreter.
-    let mut added : Array Lean.Name := #[checkName, contractName, capstoneName]
+    let mut added : Array Lean.Name := #[checkName, contractName, vtmCheckName, capstoneName]
     for law in [`agreement, `unsize_pairs_data_with_vtable, `upcast_selects_super_vtable,
                 `layout_from_vtable, `trait_check_ignores_auto_traits,
                 `invalid_vtable_pointer_ub, `invalid_vtable_trait_ub,
@@ -2227,10 +2869,17 @@ run_cmd do
       [ (`cert.resolveVirtual_eval_vt, qVirtual 0 3 (prov 3 0) (prov 40000 0), oMethod 0 (prov 3 0)),
         (`cert.resolveVirtual_field_receiver, qVirtual 0 3 (prov 5 4) (prov 40001 0),
           oMethod 2 (prov 5 4)),
+        (`cert.resolveVirtual_wrapped_dispatch_from_dyn,
+          qVirtualWrapped 0 3 (prov 5 4) (prov 40001 0), oMethod 2 (prov 5 4)),
+        (`cert.resolveVirtual_wrapped_header_ub,
+          qVirtualWrapped 0 1 (prov 3 0) (prov 40000 0), oErr `notAMethod),
         (`cert.resolveVirtual_header_slot_ub, qVirtual 0 1 (prov 3 0) (prov 40000 0),
           oErr `notAMethod),
         (`cert.resolveVirtual_dangling_vtable_ub, qVirtual 0 3 (prov 3 0) (intP 8),
           oErr `invalidVTablePointer),
+        (`cert.vtableType_assoc_perm_dup_auto, qVtableType (prov 40007 0) 9, oTyOk 0),
+        (`cert.vtableType_assoc_mismatch_ub, qVtableType (prov 40007 0) 10,
+          oErr `invalidVTableTrait),
         (`cert.getSizeAndAlign_alt_receiver, qSizeAlign (prov 40001 0) 0, oSizeAlign 8 4),
         (`cert.getSizeAndAlign_wrong_trait_ub, qSizeAlign (prov 40002 0) 0,
           oErr `invalidVTableTrait),
@@ -2247,6 +2896,8 @@ run_cmd do
     -- Pointwise agreement certificates `miriRun q = protoLmRun q`.
     let agreeQs : List (Lean.Name × Expr) :=
       [ (`agree.virtualCall, qVirtual 0 4 (prov 3 0) (prov 40000 0)),
+        (`agree.virtualCallWrapped, qVirtualWrapped 0 3 (prov 5 4) (prov 40001 0)),
+        (`agree.vtableTypeAssocPermDup, qVtableType (prov 40007 0) 9),
         (`agree.upcast, qUpcast 3 2 (prov 3 0) (prov 40004 0)),
         (`agree.sizeAlign, qSizeAlign (prov 40000 0) 0) ]
     for (n, q) in agreeQs do
@@ -2271,6 +2922,10 @@ run_cmd do
           name := ns ++ `forged.checkFalse, levelParams := [],
           type := eqFalse (mkApp (mkConst (lmNs ++ `lmAuthorityCheck)) (mkConst (ns ++ `miriAuthority))),
           value := mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.false) }),
+        ("negated vtmMachineCheck (= false)", .thmDecl {
+          name := ns ++ `forged.vtmFalse, levelParams := [],
+          type := eqFalse (mkConst (ns ++ `vtmMachineCheck)),
+          value := mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.false) }),
         ("authority resolving the next slot", forgedCheck `forgedNextSlot),
         ("authority skipping the vtable trait check", forgedCheck `forgedNoTraitCheck),
         ("authority keeping metadata on fat-to-thin", forgedCheck `forgedKeepsMetadata),
@@ -2280,8 +2935,12 @@ run_cmd do
           (qSizeAlign (prov 40001 0) 0) (oSizeAlign 4 4)),
         ("wrong-trait vtable forged as accepted", forgedObs `wrongTraitAccepted
           (qSizeAlign (prov 40002 0) 0) (oSizeAlign 4 4)),
+        ("mismatched assoc-type vtable forged as accepted", forgedObs `assocMismatchAccepted
+          (qVtableType (prov 40007 0) 10) (oTyOk 0)),
         ("receiver offset forged as 0", forgedObs `receiverOffset0
           (qVirtual 0 3 (prov 5 4) (prov 40001 0)) (oMethod 2 (prov 5 0))),
+        ("wrapped receiver offset forged as 0", forgedObs `wrappedReceiverOffset0
+          (qVirtualWrapped 0 3 (prov 5 4) (prov 40001 0)) (oMethod 2 (prov 5 0))),
         ("upcast forged to keep the Sub vtable", forgedObs `upcastKeepsSub
           (qUpcast 3 2 (prov 3 0) (prov 40004 0)) (oWide (prov 3 0) (prov 40004 0))),
         ("fat-to-thin forged to return the vtable", forgedObs `thinIsVtable
@@ -2308,7 +2967,8 @@ run_cmd do
         else false
     let mut crAxioms : NameSet := {}
     let bridgeDefs := [`miriRun, `miriAuthority, `lmVTableHooks, `lmCastHooks,
-                       `lmDynLayoutHooks, `lmCompilerHooks, `lmVirtualHooks]
+                       `lmDynLayoutHooks, `lmCompilerHooks, `lmVirtualHooks,
+                       `vtmHooks, `vtmInstalledHooks, `vtmMachineCheck]
     for n in added ++ (bridgeDefs.map (ns ++ ·)).toArray do
       let some ci := env.find? n | throwError "cross-root: {n} missing"
       match ci with
@@ -2339,17 +2999,26 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !reach.contains d then todo := todo.push d
     let requiredReach : List Lean.Name :=
-      [ contractName, checkName, lmNs ++ `lmDynContractOfCheck, lmNs ++ `protoLmRun,
+      [ contractName, checkName, vtmCheckName, lmNs ++ `lmDynContractOfCheck, lmNs ++ `protoLmRun,
         `Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto,
         `Anneal.Prototypes.DynTraitUnsizeProto.dynLayoutOfValProto,
         `Anneal.Prototypes.DynTraitUnsizeProto.unsizeDynToDyn,
         `MiniRustSpec.Interp.vtableFromPtr, `MiniRustSpec.Interp.computeSize,
         `MiniRustSpec.Interp.computeAlign,
+        `MiniRustSpec.Interp.checkPtrMetadataM,
+        `MiniRustSpec.Interp.checkPtrM,
+        `MiniRustSpec.Interp.evalUnOpM,
         `Miri.Interpreter.VTable.getPtrVTableTypeRead,
         `Miri.Interpreter.VTable.getSizeAndAlignRead,
         `Miri.Interpreter.VTable.getMethod,
+        `Miri.Interpreter.VTableMachine.reserve,
+        `Miri.Interpreter.VTableMachine.globalVTable,
+        `Miri.Interpreter.VTableMachine.Registry.mergePersistent,
+        `Miri.Interpreter.VTableMachine.Registry.ensureDisjointFromFunctions,
+        `Miri.Interpreter.VTableMachine.hooks,
         `Miri.Interpreter.VirtualCalls.resolveVirtual,
         `Miri.Interpreter.VirtualCalls.pointerPlace,
+        `Miri.Interpreter.VirtualCalls.nonOneZstField,
         `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
         `Miri.Interpreter.Cast.unsizeIntoPointer,
         `Miri.Interpreter.Cast.ptrToPtr ]
@@ -2361,9 +3030,9 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<dyn-trait-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := bridgeEnv }
-  unless addedCount = 27 && rejectedCount = 11 do
+  unless addedCount = 34 && rejectedCount = 14 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter, rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
+  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter (incl. VTableMachine + DispatchFromDyn), rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
 
 /-! ## §6. Axiom and vacuity audit of the prototype and the tests -/
 
@@ -2430,25 +3099,40 @@ run_cmd do
       ``Anneal.Prototypes.DynTraitUnsizeProto.encodeWidePtr_of_decodeWidePtr?,
       ``Anneal.Prototypes.DynTraitUnsizeProto.traitPredEq_symm,
       ``Anneal.Prototypes.DynTraitUnsizeProto.traitPredEq_trans,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.traitPredEq_assocBindings_swap,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.traitPredEq_assocBindings_dup,
       ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerPtrTy_hom,
       ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerCastKind_hom,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercionProto_conservative,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercionProto_slice_conservative,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercion_dyn_target_never_ok,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeDynProto_failsClosed,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_ancestor_ub,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_zst_dangling_ptr,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_raw_ptr_unchecked,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_ref_ptr_iff_valid,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.upcastVTable?_rejects_unrelated_marker,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeDynToDyn_invalid_vtable_ub,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeDynToDyn_forbids_auto_trait_fabrication,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeDynToDyn_zst_wrapped_null_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.dynLayoutOfValProto_ok,
       ``Anneal.Prototypes.DynTraitUnsizeProto.dynLayoutOfValProto_data_independent,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto_uninit_arg_ub,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto_invalid_ref_before_callee_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto_non_method_slot_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto_narrows_receiver,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalWideAddrEqProto_ignores_metadata,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalWideAddrEqProto_eq_thin_ptr_binop_eq,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.evalWideAddrEqProto_eq_thin_binop_eq_all_words,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.evalWidePtrEqProto_heterogeneous_meta_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.runSteps_eq_plain,
       ``Anneal.Prototypes.DynTraitUnsizeProto.Lm.lmDynContractOfCheck,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.vtableFromPtrM_install_ok,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.vtableFromPtrM_install_iff,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrMetadataM_install_correspondence,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrM_raw_dyn_unchecked,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrM_ref_dyn_rejects_invalid,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.evalUnOpM_dyn_correspondence,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.computeSizeAlignM_eq_dynLayoutProto ]
   let mut choiceFree : Nat := 0
   for d in constructive do
