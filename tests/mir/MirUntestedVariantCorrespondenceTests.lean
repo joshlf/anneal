@@ -5297,9 +5297,27 @@ def haltedBits? : Option MirExecState → Option Nat
   | some (.halted (.normal (.scalar sc, _))) => some sc.bits
   | _ => none
 
-/-- Whether a state is an `.unsupported` (fail-closed) fault. -/
-def isUnsupportedFault : Option MirExecState → Bool
-  | some (.faulted .unsupported) => true
+/-- Whether `b` is still running at statement `k` after `k` steps and faults with `.ub` on step
+`k + 1` (proving a negative canary faults *at* the `copy_nonoverlapping` statement rather than
+earlier in setup). -/
+def cpUbAt (b : CapturedMir) (k : Nat) : Bool :=
+  match cpRun b k with
+  | some (.running s) =>
+    s.frame.stmtIdx == k &&
+      match execStep b (.running s) with
+      | some (.faulted .ub) => true
+      | _ => false
+  | _ => false
+
+/-- Whether `b` is still running at statement `k` after `k` steps and faults with `.unsupported`
+on step `k + 1`. -/
+def cpUnsupportedAt (b : CapturedMir) (k : Nat) : Bool :=
+  match cpRun b k with
+  | some (.running s) =>
+    s.frame.stmtIdx == k &&
+      match execStep b (.running s) with
+      | some (.faulted .unsupported) => true
+      | _ => false
   | _ => false
 
 /-- The `(tag, permCode)` summary of the borrow table of a running state (for `decide +kernel`):
@@ -6039,37 +6057,38 @@ theorem copyNonOverlapping_witness_caller_referents_and_byte_pun :
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel⟩
 
-/-- **Negative canaries (fail-closed copies).** A source window that leaves its array
-(`src[1]`, `n = 2`), a destination window that does (`dst[1]`, `n = 2`), and `n = 3` over
-two-element arrays are UB; so are overlapping windows of the same array (`a[0..2] → a[1..3]`),
-a same-tag copy (`copy_nonoverlapping(p, p, 2)` — confirmed still running immediately before
-the copy and UB at step 7), writing through a `.frozen` destination pointer, and a
-three-element copy between the caller's two-element arrays. A byte-punned copy of a *partial*
-scalar, a byte splice into a non-byte container (`[u32; 2]`), an element-stride mismatch
-(`[u8; 4]` cast to `*const u16` into `[u16; 2]`), and a partial field byte-copy into an
-uninitialized aggregate (`&raw mut pair.0 as *mut u8` on uninit `pair: (u32, u32)`) all fail
-closed with `.unsupported` — never a silently wrong value — and a byte window that leaves the
-scalar or the array is UB. -/
+/-- **Negative canaries (fail-closed copies, pinned to the exact `copy_nonoverlapping` statement).**
+Every body below is verified to remain `.running` right at its `copy_nonoverlapping` statement
+`k` and fault on step `k + 1` (`cpUbAt` / `cpUnsupportedAt`), ruling out earlier setup faults.
+A source window that leaves its array (`src[1]`, `n = 2`), a destination window that does
+(`dst[1]`, `n = 2`), and `n = 3` over two-element arrays are UB; so are overlapping windows of
+the same array (`a[0..2] → a[1..3]`), a same-tag copy (`copy_nonoverlapping(p, p, 2)`), writing
+through a `.frozen` destination pointer, and a three-element copy between the caller's
+two-element arrays. A byte-punned copy of a *partial* scalar, a byte splice into a non-byte
+container (`[u32; 4]`), an element-stride mismatch (`[u8; 4]` cast to `*const u16` into
+`[u16; 2]`), and a partial field byte-copy into an uninitialized aggregate (`&raw mut pair.0 as
+*mut u8` on uninit `pair: (u32, u32)`) all fail closed with `.unsupported` — never a silently
+wrong value — and a byte window that leaves the scalar or the array is UB. -/
 theorem copyNonOverlapping_witness_ub_canaries :
-    isUbFault (cpRun (cpBody [22, 99] [0, 0] 1 0 2) 11) = true ∧
-      isUbFault (cpRun (cpBody [22, 99] [0, 0] 0 1 2) 11) = true ∧
-      isUbFault (cpRun (cpBody [22, 99] [0, 0] 0 0 3) 11) = true ∧
-      isUbFault (cpRun (cpSameBody [1, 2, 3, 4] 0 1 2 3) 7) = true ∧
+    cpUbAt (cpBody [22, 99] [0, 0] 1 0 2) 10 = true ∧
+      cpUbAt (cpBody [22, 99] [0, 0] 0 1 2) 10 = true ∧
+      cpUbAt (cpBody [22, 99] [0, 0] 0 0 3) 10 = true ∧
+      cpUbAt (cpSameBody [1, 2, 3, 4] 0 1 2 3) 6 = true ∧
       localScalars? (cpRun cpSameTagBody 6) 1 = some [1, 2, 3, 4] ∧
-      isUbFault (cpRun cpSameTagBody 7) = true ∧
+      cpUbAt cpSameTagBody 6 = true ∧
       isUbFault
           (cpRunMem (cpCallerBody 2) [.ptr ⟨2, 0⟩ 8, .ptr ⟨1, 0⟩ 8] (cpCallerMem []) 1) =
         true ∧
       isUbFault
           (cpRunMem (cpCallerBody 3) [.ptr ⟨1, 0⟩ 8, .ptr ⟨2, 0⟩ 8] (cpCallerMem []) 1) =
         true ∧
-      isUnsupportedFault (cpRun (bytePunBody 0x04030201 1 0 2 0) 13) = true ∧
-      isUnsupportedFault (cpRun (bytePunBody 0x04030201 0 1 2 1) 13) = true ∧
-      isUnsupportedFault (cpRun byteSpliceNonByteBody 13) = true ∧
-      isUnsupportedFault (cpRun strideMismatchBody 11) = true ∧
-      isUnsupportedFault (cpRun cpUninitPartialFieldBody 12) = true ∧
-      isUbFault (cpRun (bytePunBody 0x04030201 2 0 4 0) 13) = true ∧
-      isUbFault (cpRun (bytePunBody 0x04030201 0 2 4 0) 13) = true :=
+      cpUnsupportedAt (bytePunBody 0x04030201 1 0 2 0) 12 = true ∧
+      cpUnsupportedAt (bytePunBody 0x04030201 0 1 2 1) 12 = true ∧
+      cpUnsupportedAt byteSpliceNonByteBody 12 = true ∧
+      cpUnsupportedAt strideMismatchBody 10 = true ∧
+      cpUnsupportedAt cpUninitPartialFieldBody 11 = true ∧
+      cpUbAt (bytePunBody 0x04030201 2 0 4 0) 12 = true ∧
+      cpUbAt (bytePunBody 0x04030201 0 2 4 0) 12 = true :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
