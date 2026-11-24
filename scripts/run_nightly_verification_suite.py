@@ -26,17 +26,22 @@ Profiles (`--profile`):
                `check_trusted.py --fast`, Python test suites
                (`ci/`, `scripts/`, `tools/anneal-lsp/`), `anneal-minirust-gen --check`,
                `cargo anneal correspondence-bugs lint`, `minirust-sync verify-lock`,
+               `lake --dir examples build Trusted` (so the `trusted/rustc-capture`
+               tests find `examples/.lake/build/lib/lean/Trusted.olean` already built),
                and `cargo test --workspace --lib --bins --locked`.
   nightly      Runs `quick` plus `check_trusted.py --self-test`, a `lake build +<Module>`
                of every workspace module imported by the standalone `tests/mir/*` Lean
                suites, those suites, `lake build Correspondence`, `lake build MiniRustSpec`,
+               `lake --dir examples build Miri` (the vendored Miri library) followed by
                `lake --dir examples build LeanMiriSpec`, domain crate integration tests,
                `cargo-anneal` end-to-end suites, and real-world Fuchsia/Fxfs example
                crate verifications.
 
 Step environment: every step runs with `LAKE_ARTIFACT_CACHE=true` and
-`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_lean_miri_spec` with `LEAN_NUM_THREADS=1`
-when its effective RAM ceiling is below 10 GiB. Before their first step, `quick` and
+`LAKE_RESTORE_ARTIFACTS=true`, and `lake_build_minirust_spec` and
+`lake_build_lean_miri_spec` each with `LEAN_NUM_THREADS=1` when its effective RAM ceiling
+is below 10 GiB (`lake_build_examples_miri_vendor` and every other step keep their
+thread count). Before their first step, `quick` and
 `nightly` remove stale Lean build artifacts from `.lake/build/lib/lean/` and
 `examples/.lake/build/lib/lean/` (`clean_stale_oleans`) and report them on stderr.
 
@@ -117,6 +122,25 @@ def _git_head_sha(repo_root: Path, ref: str = "HEAD") -> str:
 # the parsed `Trusted.Rustc.V2026_06_01.MirAst` inductives (94 constructors). rustc variants that
 # `trusted/rustc-capture` lowers onto an existing constructor are not separate entries (like
 # `FakeRead` -> `.placeMention`, `AggregateKind::CoroutineClosure` -> `.closure`).
+#
+# Dual-authority correspondence modules cited by name below. Each relates
+# `Trusted.Rustc.V2026_06_01.MirSemantics` to MiniRust (`MiniRustSpec.Interp`, the `MR` module)
+# and to vendored Miri (`Miri.Interpreter.Step`, the `LM` module); each `Bundle` module closes
+# the MiniRust side and exports the parameterized `DualCorrespondenceBundle` combinators that
+# the cross-root kernel bridges (`tests/mir/DropBinderAndSubtypeCorrTests.lean`,
+# `tests/mir/NullaryAndPtrCoercionCorrTests.lean`) close against the `LM` module:
+#   UnwindSetDiscrAndFnPtr{MR,LM}        minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean
+#   DropBinderAndSubtype{MR,LM,Bundle}   minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean,
+#                                        theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean
+#   NullaryAndPtrCoercion{MR,LM,Bundle}  minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean,
+#                                        lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean,
+#                                        theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean
+#
+# Census: 90 `proved_corresponding`, 1 `supported_and_tested` (`ProjectionElem.opaqueCast`),
+# 0 `supported_untested`, 3 `unsupported_fail_closed` (`TerminatorKind.inlineAsm`,
+# `Rvalue.threadLocalRef`, `AggregateKind.coroutine`).
 MIR_AST_CATEGORIES: list[dict[str, Any]] = [
     {
         "category": "StatementKind",
@@ -131,10 +155,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("placeMention", "proved_corresponding"),
             ("intrinsic", "proved_corresponding"),
             ("nop", "proved_corresponding"),
-            ("coverage", "supported_and_tested"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C4`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("coverage", "proved_corresponding"),
             # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
             ("constEvalCounter", "proved_corresponding"),
-            ("backwardIncompatibleDropHint", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C5`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("backwardIncompatibleDropHint", "proved_corresponding"),
         ],
     },
     {
@@ -155,11 +181,13 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("unreachable", "proved_corresponding"),
             ("assert", "proved_corresponding"),
             ("call", "proved_corresponding"),
-            ("drop", "supported_and_tested"),
+            # DropBinderAndSubtype{MR,LM,Bundle}.
+            ("drop", "proved_corresponding"),
             # Trusted / MiniRust / LeanMiri correspondence: tests/mir/MirUntestedVariantCorrespondenceTests.lean
             ("tailCall", "proved_corresponding"),
-            ("unwindResume", "unsupported_fail_closed"),
-            ("unwindTerminate", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C2` and `C3`).
+            ("unwindResume", "proved_corresponding"),
+            ("unwindTerminate", "proved_corresponding"),
             ("inlineAsm", "unsupported_fail_closed"),
         ],
     },
@@ -175,7 +203,8 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("downcast", "proved_corresponding"),
             # Phase boundary, not a gap: rustc's validator rejects OpaqueCast at MirPhase::Runtime (after PostAnalysisNormalize) and both vendored Miri paths throw "OpaqueCast after borrowck" (Projection.lean `.invariant` / PlaceDynamic.lean `.invalidProgram`), while Trusted treats it as a value-transparent retype.
             ("opaqueCast", "supported_and_tested"),
-            ("unwrapUnsafeBinder", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C9`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
+            ("unwrapUnsafeBinder", "proved_corresponding"),
         ],
     },
     {
@@ -196,10 +225,12 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             # Ground semantics in Trusted (`evalNullaryOp`, `evalShallowInitBox`,
             # `evalWrapUnsafeBinder` in `MirSemantics/Places.lean`), with two-sided
             # equalities and ground round-trip witnesses in Anneal.Mir.PlaceAndRvalue
-            # and Anneal.Mir.AdtAndControl.
-            ("nullaryOp", "supported_and_tested"),
-            ("shallowInitBox", "supported_and_tested"),
-            ("wrapUnsafeBinder", "supported_and_tested"),
+            # and Anneal.Mir.AdtAndControl. Dual-authority correspondence:
+            # NullaryAndPtrCoercion{MR,LM,Bundle} (`nullaryOp`) and
+            # DropBinderAndSubtype{MR,LM,Bundle} (`shallowInitBox`, `wrapUnsafeBinder`).
+            ("nullaryOp", "proved_corresponding"),
+            ("shallowInitBox", "proved_corresponding"),
+            ("wrapUnsafeBinder", "proved_corresponding"),
             ("threadLocalRef", "unsupported_fail_closed"),
         ],
     },
@@ -253,18 +284,21 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("transmute", "proved_corresponding"),
             ("pointerExposeProvenance", "proved_corresponding"),
             ("pointerWithExposedProvenance", "proved_corresponding"),
-            ("pointerCoercion", "supported_and_tested"),
-            ("subtype", "supported_and_tested"),
-            # Float casts: evidence is the kernel-checked IEEE-754 reference-model
-            # agreement in `theory/Anneal/Mir/IeeeFloatCast.lean` (ties-to-even,
-            # saturating float->int, NaN quietization, subnormal single rounding) plus
-            # `tests/mir/CastStage1Tests.lean`; there is not yet a MiniRustSpec /
-            # LeanMiriSpec step-simulation theorem for `FloatToInt`/`IntToFloat`/
-            # `FloatToFloat` (LeanMiriSpec only translates the cast kinds).
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C8`: the five non-`Unsize` coercions) and
+            # NullaryAndPtrCoercion{MR,LM,Bundle} (including `Unsize`).
+            ("pointerCoercion", "proved_corresponding"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C7`) and DropBinderAndSubtype{MR,LM,Bundle}.
+            ("subtype", "proved_corresponding"),
+            # Float casts: kernel-checked IEEE-754 theory in `theory/Anneal/Mir/IeeeFloatCast.lean`
+            # and `tests/mir/CastStage1Tests.lean`, fail-closed MiniRustSpec translation boundary
+            # and bit-carrier transmutes in `minirust/lean/MiniRustSpec/FloatCastMR.lean` (pinned
+            # MiniRust has no float type or float-cast operator), and direct `Miri.Interpreter.Step.step`
+            # correspondence in `lean-miri/lean/LeanMiriSpec/FloatCastLM.lean` / `WitFloatCastLM.lean`.
             ("floatToInt", "proved_corresponding"),
             ("intToFloat", "proved_corresponding"),
             ("floatToFloat", "proved_corresponding"),
-            ("fnPtrToPtr", "unsupported_fail_closed"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C6`) and NullaryAndPtrCoercion{MR,LM,Bundle}.
+            ("fnPtrToPtr", "proved_corresponding"),
         ],
     },
     {
@@ -274,9 +308,11 @@ MIR_AST_CATEGORIES: list[dict[str, Any]] = [
             ("array", "proved_corresponding"),
             ("tuple", "proved_corresponding"),
             ("adt", "proved_corresponding"),
-            ("rawPtr", "supported_and_tested"),
+            # DropBinderAndSubtype{MR,LM,Bundle}.
+            ("rawPtr", "proved_corresponding"),
+            # UnwindSetDiscrAndFnPtr{MR,LM} (`C10`) and DropBinderAndSubtype{MR,LM,Bundle}.
             # Also covers rustc's `AggregateKind::CoroutineClosure`, which `mir_lower.rs` lowers to `.closure`.
-            ("closure", "unsupported_fail_closed"),
+            ("closure", "proved_corresponding"),
             ("coroutine", "unsupported_fail_closed"),
         ],
     },
@@ -4922,9 +4958,17 @@ LAKE_ARTIFACT_CACHE_ENV: dict[str, str] = {
 }
 
 # Hosts / cgroups with an effective RAM ceiling strictly below 10 GiB (10240 MiB)
-# elaborate `LeanMiriSpec` (608-file `Miri` + `LeanMiriSpec` closure) single-threaded
-# to avoid `exit 137` cgroup OOM kills.
+# elaborate the `LOW_RAM_SINGLE_THREAD_STEPS` closures single-threaded to avoid
+# `exit 137` cgroup OOM kills. (The name is historical: the threshold first applied to
+# `lake_build_lean_miri_spec` alone and is kept for callers that import it.)
 LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB = 10240
+# Steps `_build_step_env` runs with `LEAN_NUM_THREADS=1` below that threshold: the
+# `MiniRustSpec` closure and the `LeanMiriSpec` modules. The vendored `Miri` library
+# under them is built by `lake_build_examples_miri_vendor`, which is deliberately not
+# listed and stays multi-threaded.
+LOW_RAM_SINGLE_THREAD_STEPS: frozenset[str] = frozenset(
+    ("lake_build_minirust_spec", "lake_build_lean_miri_spec")
+)
 
 # Sentinel distinguishing "caller omitted `effective_ram_mib`" from an explicit
 # `None` (representing an unreadable `/proc` / cgroup probe).
@@ -5003,6 +5047,15 @@ _LEAN_RUN_BOOL_OPTS: frozenset[str] = frozenset(
         "--exclusive",
         "--no-oom-retry",
         "--unsafe-ignore-cgroup",
+        "--ensure-slice",
+        "-h",
+        "--help",
+    )
+)
+_LEAN_RUN_NON_EXEC_OPTS: frozenset[str] = frozenset(
+    (
+        "--probe",
+        "--print-limits",
         "--ensure-slice",
         "-h",
         "--help",
@@ -5434,41 +5487,124 @@ def _probe_lean_run_memory_max_mib(
 ) -> int | None:
     """`MemoryMax` (MiB) that the `anneal-lean-run` wrapper of `cmd` plans for the
     scope it runs the wrapped command in (`memory_max_mb` of `<wrapper> <its options>
-    --probe --json`, which never runs the command), or `None` if `cmd` is not wrapped
-    or the probe fails. The suite process is outside that scope, so its own cgroup
-    hierarchy cannot show this cap."""
+    --mode <resolved mode> --probe --json`, which never runs the command), or `None`
+    if `cmd` is not wrapped, carries a non-executing wrapper action (`--ensure-slice`,
+    `--probe`, `--print-limits`, `-h`/`-h...`, `--help`) or no wrapped command, will
+    pass through without creating a new scope (`ANNEAL_LEAN_RUN_IN_SCOPE=1` without
+    `--nested-ok`), or the probe fails. The suite process is outside that scope, so
+    its own cgroup hierarchy cannot show this cap.
+
+    When that probe reports a concurrency other than the one the wrapper executes at,
+    it is repeated at the execution concurrency. If only the repeat fails, the answer
+    is a lower bound on the execution cap derived from the first probe, never `None`:
+    callers single-thread below a threshold, so an unknown cap must not read as "no
+    cap". If the repeat itself still reports fewer than its `build_slots` (the host's
+    concurrency file grew between the two probes), its cap is scaled down to the same
+    kind of lower bound instead of probing a third time."""
     if not _is_lean_run_wrapped(cmd, env):
         return None
+    env_map = os.environ if env is None else env
+    mode, _timeout, _slot_lock, _saw_timeout, _oom_retry, nested_ok = _parse_lean_run_wrapper(cmd)
+    if env_map.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1" and not nested_ok:
+        return None
     opts: list[str] = []
+    exclusive = False
     i, n = 1, len(cmd)
     while i < n:
         tok = cmd[i]
         if tok == "--" or tok == "-" or not tok.startswith("-"):
             break
+        opt = _resolve_lean_run_opt(tok.split("=", 1)[0] if "=" in tok else tok)
+        if opt in _LEAN_RUN_NON_EXEC_OPTS or (tok.startswith("-h") and not tok.startswith("--")):
+            # Never forward `--ensure-slice` (which mutates systemd user units before
+            # `--probe` runs) or probe non-executing meta-invocations (including `-h...`
+            # short-option clusters that argparse treats as `--help`).
+            return None
+        if opt == "--exclusive":
+            exclusive = True
         opts.append(tok)
-        if "=" not in tok and _resolve_lean_run_opt(tok) in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
+        if "=" not in tok and opt in _LEAN_RUN_VALUE_OPTS and i + 1 < n:
             opts.append(cmd[i + 1])
             i += 1
         i += 1
-    try:
-        out = subprocess.run(
-            [cmd[0], *opts, "--probe", "--json"],
-            cwd=None if cwd is None else str(cwd),
-            env=None if env is None else dict(env),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout_sec,
-            check=False,
-        )
-        limits = json.loads(out.stdout) if out.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
+    inner_start = i + 1 if i < n and cmd[i] == "--" else i
+    if inner_start >= n:
+        # `anneal-lean-run` prints help and exits 2 when no wrapped command is given.
         return None
-    mem_max = limits.get("memory_max_mb") if isinstance(limits, dict) else None
-    if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
-        return mem_max
-    return None
+
+    def run_probe(probe_args: list[str]) -> dict[str, Any] | None:
+        try:
+            out = subprocess.run(
+                [cmd[0], *probe_args],
+                cwd=None if cwd is None else str(cwd),
+                env=None if env is None else dict(env),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=timeout_sec,
+                check=False,
+            )
+            parsed = json.loads(out.stdout) if out.returncode == 0 else None
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    # The probe drops the wrapped command, so an `auto` mode would resolve to `build`
+    # there even when the wrapper runs this command in `file` mode (`lean File.lean`,
+    # `lake env lean ...`), whose `MemoryMax` is capped lower. Pin the mode the wrapper
+    # resolves for the real command (the last `--mode` wins).
+    def planned_cap(probed: dict[str, Any] | None) -> int | None:
+        mem_max = None if probed is None else probed.get("memory_max_mb")
+        if isinstance(mem_max, int) and not isinstance(mem_max, bool) and mem_max > 0:
+            return mem_max
+        return None
+
+    def pos_int(val: object) -> int | None:
+        return val if isinstance(val, int) and not isinstance(val, bool) and val >= 1 else None
+
+    limits = run_probe([*opts, "--mode", mode, "--probe", "--json"])
+    first_cap = planned_cap(limits)
+    if limits is None or first_cap is None:
+        return None
+
+    # In `anneal-lean-run`'s `resolve_effective_concurrency`, `--probe` with an explicit
+    # `--concurrency` (`cli_concurrency`, such as `--concurrency 1` in `build_suite_steps`)
+    # evaluates at `cli_concurrency` even when the host's concurrency file (`build_slots`)
+    # is larger, whereas actual execution (`is_probe=False`) raises `w_eff` to
+    # `max(w_req, build_slots)` unless `--exclusive` is set. Re-probe at the runtime
+    # concurrency so multi-slot hosts do not overestimate `memory_max_mb` above 10 GiB.
+    w_eff = pos_int(limits.get("w_eff"))
+    build_slots = pos_int(limits.get("build_slots"))
+    if not exclusive and w_eff is not None and build_slots is not None and w_eff < build_slots:
+        reprobed = run_probe(
+            [*opts, "--mode", mode, "--concurrency", str(build_slots), "--probe", "--json"]
+        )
+        runtime_cap = planned_cap(reprobed)
+        if runtime_cap is not None:
+            # If the host's concurrency file grew between the two probes so the re-probe
+            # still evaluated below `build_slots`, clamp fail-closed without a third fork.
+            re_w = pos_int(reprobed.get("w_eff")) if reprobed is not None else None
+            re_slots = pos_int(reprobed.get("build_slots")) if reprobed is not None else None
+            if re_w is not None and re_slots is not None and re_w < re_slots:
+                return max(1, runtime_cap * re_w // re_slots)
+            return runtime_cap
+        # The re-probe failed, but the first answer is still known to be too high: the
+        # wrapper divides its pool by `w_eff`, so execution at `build_slots` gets at
+        # least `first_cap * w_eff // build_slots` and at most `first_cap`. Report that
+        # lower bound rather than `None`, which `_build_step_env` would read as "no
+        # wrapper cap" and leave the step multi-threaded on a host that looks large.
+        return max(1, first_cap * w_eff // build_slots)
+    if exclusive and w_eff is not None and w_eff > 1:
+        # Older fleet wrappers ignore `--exclusive` in `--probe` when `--concurrency`
+        # is also present, whereas execution forces `w_eff = 1`. If the re-probe fails,
+        # `first_cap` (planned for `w_eff > 1`) is a lower bound on the `w_eff = 1` cap.
+        runtime_cap = planned_cap(
+            run_probe([*opts, "--mode", mode, "--concurrency", "1", "--probe", "--json"])
+        )
+        return first_cap if runtime_cap is None else runtime_cap
+
+    return first_cap
 
 
 def _build_step_env(
@@ -5485,9 +5621,11 @@ def _build_step_env(
     - Always populates toolchain dirs on `PATH` without mutating `os.environ`.
     - Always sets `LAKE_ARTIFACT_CACHE=true` and `LAKE_RESTORE_ARTIFACTS=true`
       so Lake 4.34.1 restores cached `.olean`s into workspace build dirs.
-    - For `lake_build_lean_miri_spec`, injects `LEAN_NUM_THREADS=1` whenever the
+    - For each `LOW_RAM_SINGLE_THREAD_STEPS` step (`lake_build_minirust_spec` and
+      `lake_build_lean_miri_spec`), injects `LEAN_NUM_THREADS=1` whenever the
       effective RAM ceiling is `< 10240 MiB` (`< 10 GiB`), while preserving normal
-      multi-threaded builds on `>= 10 GiB` hosts. Unless `effective_ram_mib` is given,
+      multi-threaded builds on `>= 10 GiB` hosts and for every other step (including
+      `lake_build_examples_miri_vendor`). Unless `effective_ram_mib` is given,
       the ceiling is the tightest of the host/cgroup probe and, for an
       `anneal-lean-run`-wrapped step `cmd`, the `MemoryMax` the wrapper plans for it.
     - Explicit `env_overrides` take final precedence.
@@ -5495,18 +5633,30 @@ def _build_step_env(
     env = dict(os.environ if base_env is None else base_env)
     _ensure_toolchain_path(env, use_ambient_home=base_env is None)
     env.update(LAKE_ARTIFACT_CACHE_ENV)
-    if step_name == "lake_build_lean_miri_spec":
+    if step_name in LOW_RAM_SINGLE_THREAD_STEPS and not (
+        env_overrides is not None and "LEAN_NUM_THREADS" in env_overrides
+    ):
         if effective_ram_mib is _RAM_UNSET:
-            probe_env = {**env, **env_overrides} if env_overrides else env
-            ceilings = [
-                mib
-                for mib in (
-                    _probe_effective_ram_ceiling_mib(),
-                    _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None,
+            host_mib = _probe_effective_ram_ceiling_mib()
+            if (
+                isinstance(host_mib, int)
+                and not isinstance(host_mib, bool)
+                and host_mib < LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB
+            ):
+                # The host/cgroup ceiling is already below the threshold, so the tightest
+                # ceiling cannot reach it: skip spawning the wrapper `--probe` subprocess.
+                ram_mib: int | None | object = host_mib
+            else:
+                probe_env = {**env, **env_overrides} if env_overrides else env
+                wrapper_mib = (
+                    _probe_lean_run_memory_max_mib(cmd, env=probe_env, cwd=cwd) if cmd else None
                 )
-                if mib is not None
-            ]
-            ram_mib: int | None | object = min(ceilings) if ceilings else None
+                ceilings = [
+                    mib
+                    for mib in (host_mib, wrapper_mib)
+                    if isinstance(mib, int) and not isinstance(mib, bool)
+                ]
+                ram_mib = min(ceilings) if ceilings else None
         else:
             ram_mib = effective_ram_mib
         if (
@@ -6406,9 +6556,12 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
     """Return ordered `(step_name, category, cmd, timeout_sec)` for `profile`.
 
     `quick` and `nightly` start with `lake_build_core_theory` (`Trusted`, `Anneal`,
-    `MiniRust` `.olean`s) before any trusted-boundary or Lean step; `nightly` also
-    builds every workspace module imported by the standalone `tests/mir` files
-    (`lake_build_mir_test_modules`) right before running them. A step wrapped in
+    `MiniRust` `.olean`s) before any trusted-boundary or Lean step, and build `Trusted`
+    in the `examples` Lake root (`lake_build_examples_trusted`) right before
+    `rust_workspace_unit_tests`; `nightly` also builds every workspace module imported
+    by the standalone `tests/mir` files (`lake_build_mir_test_modules`) right before
+    running them, and the vendored `Miri` library (`lake_build_examples_miri_vendor`)
+    right before `lake_build_lean_miri_spec`. A step wrapped in
     `anneal-lean-run` receives its step budget as the wrapper's own `--timeout`, so
     the two can never drift apart (`_outer_timeout_sec` adds the wrapper's slot
     queueing and a grace margin on top).
@@ -6529,6 +6682,19 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             ],
             180,
         )
+        # `cargo test --workspace` runs the `trusted/rustc-capture` tests in parallel, and
+        # each one that kernel-checks emitted Lean modules starts its own
+        # `lake --dir examples build Trusted` when
+        # `examples/.lake/build/lib/lean/Trusted.olean` is missing: concurrent builds of
+        # one Lake root race. Building `Trusted` there first (a no-op once built) leaves
+        # those tests nothing to build.
+        add(
+            "lake_build_examples_trusted",
+            "cat1_trusted_boundary",
+            ["lake", "--dir", "examples", "build", "Trusted"],
+            600,
+            wrap="build",
+        )
         add(
             "rust_workspace_unit_tests",
             "cat3_rust_unit_tests",
@@ -6577,6 +6743,18 @@ def build_suite_steps(repo_root: Path, profile: str) -> list[tuple[str, str, lis
             "cat2_correspondence_suites",
             ["lake", "build", "MiniRustSpec"],
             1200,
+            wrap="build",
+        )
+        # The `LeanMiriSpec` closure is built in two steps, each with its own budget and
+        # thread policy: first the vendored `Miri` library (`lean-miri/vendor`, which never
+        # imports `Trusted`), always multi-threaded, then the `LeanMiriSpec` modules on top
+        # of it, single-threaded below 10 GiB (`LOW_RAM_SINGLE_THREAD_STEPS`). Both run in
+        # the `examples` Lake root, so the second step reuses the first one's `.olean`s.
+        add(
+            "lake_build_examples_miri_vendor",
+            "cat2_correspondence_suites",
+            ["lake", "--dir", "examples", "build", "Miri"],
+            900,
             wrap="build",
         )
         add(

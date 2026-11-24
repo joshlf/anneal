@@ -28,6 +28,8 @@ pub mod minirust_sync;
 pub mod miri_diff;
 pub mod miri_oracle;
 pub mod obligations;
+#[forbid(unsafe_code)]
+pub mod property_registry;
 pub mod scaffold;
 pub mod setup;
 pub mod trace_observer;
@@ -44,8 +46,9 @@ pub use agent::{
     SpecLockManifest, check_specs_non_vacuous, check_specs_non_vacuous_with_records,
     compute_spec_lock_manifest_digest, is_canonical_mir_fragment_tag, is_lowercase_sha256_hex,
     lock_workspace_specs, lock_workspace_specs_with_mutable, lock_workspace_specs_with_options,
-    parse_spec_lock_manifest, render_agent_context, run_agent_sandbox,
-    serialize_spec_lock_manifest, verify_spec_lock, verify_spec_lock_with_options,
+    parse_spec_lock_manifest, reconcile_workspace_fault_coverage, render_agent_context,
+    run_agent_sandbox, serialize_spec_lock_manifest, verify_spec_lock,
+    verify_spec_lock_with_options,
 };
 pub use correspondence_bugs::{
     CorrespondenceBugsSubcommand, CorrespondenceGapEntry, CorrespondenceGapsRegistry,
@@ -59,8 +62,8 @@ pub use correspondence_bugs::{
 };
 pub use driver::{
     ANNEAL_CAPTURE_FILTER_ENV, ANODIZED_EMBED_SPECS_CFG, CaptureDriverConfig,
-    aggregate_unit_manifests, build_cargo_check_command, invoke_cargo_capture,
-    load_captured_unit_records, merge_rustflags, parse_capture_manifest,
+    aggregate_unit_manifests, audit_captured_units_fault_census, build_cargo_check_command,
+    invoke_cargo_capture, load_captured_unit_records, merge_rustflags, parse_capture_manifest,
     parse_unit_capture_manifest, resolve_rustc_wrapper, run_cargo_capture,
     serialize_unit_capture_manifest,
 };
@@ -96,10 +99,22 @@ pub use miri_oracle::{
 pub use obligations::{
     AuthoredItemModules, CalleeContractRef, SubjectObligationBundle,
     derive_item_module_suffix, group_subject_obligations,
-    module_suffix_to_rel_path, render_crate_verify_module,
+    module_suffix_to_rel_path, reconcile_subject_bundle_coverage, render_crate_verify_module,
     render_obligations_module, render_obligations_module_with_options, render_proof_template,
     render_proof_template_with_options, render_specs_template, render_verify_module,
     render_verify_module_with_options,
+};
+pub use property_registry::{
+    CallCoverageContext, CallSiteTarget, CensusError, CoverageReconciliationError,
+    CoverageReconciliationReport, EmittedObligationCoverage, ExplicitSiteWaiver,
+    FalseProofMutationProbe, FaultSite, FaultSiteCensus, FaultSiteCoverageReconciler,
+    MutationProbeScenario, ObligationExplorerOptions, PropertyClass, PropertyDisposition,
+    PropertyEntry, PropertyRegistry, UncoveredReason, UncoveredSiteDiagnostic, WaiverKind,
+    collect_reachable_body_obligations, derive_bundle_obligation_coverage,
+    derive_bundle_obligation_coverage_with_recursion, detect_cfg_cycle_back_edges,
+    explore_mir_obligations, is_natively_modeled_converging_mir_callee,
+    is_natively_modeled_diverging_mir_callee, is_natively_modeled_mir_call,
+    is_natively_modeled_mir_callee, parse_lean_mir_module_strict, terminator_all_targets,
 };
 pub use scaffold::{
     LEAN_TOOLCHAIN, MirFragment, MirFragmentClassification, MirLiftingProfile, ScaffoldConfig,

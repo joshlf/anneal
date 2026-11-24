@@ -143,11 +143,12 @@ pub fn kernel_step(magic: u32, payload_len: u32) -> u32 {
 ];
 
 /// Canonical mutator names always included in `mutator_applications`.
-pub const ITREE_MUTATOR_NAMES: [&str; 4] = [
+pub const ITREE_MUTATOR_NAMES: [&str; 5] = [
     "CallBoundaryOutliner",
     "LayoutPaddingPerturber",
     "BranchLoopWeaver",
     "ExtOracleInjector",
+    "IndirectDispatchOutliner",
 ];
 
 /// Canonical `TraceReplayDiag.tagName` keys always included in `diag_tag_counts`.

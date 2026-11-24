@@ -31,6 +31,7 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import audit_mir_coverage_matrix as mir_audit  # noqa: E402
 import run_nightly_verification_suite as suite  # noqa: E402
 
 
@@ -46,6 +47,320 @@ UNTESTED_VARIANT_TEST_WORKSPACE_IMPORTS = (
     "Correspondence.V2026_06_01.L5_ControlAndCalls",
     "MiniRustSpec.Correspondence.Translate",
 )
+
+# The dual-authority correspondence modules `MIR_AST_CATEGORIES` cites for the 14 variants
+# promoted to `proved_corresponding`, the cross-root kernel bridges closing the `Bundle`
+# modules over `LM`, and concrete kernel-checked theorem / variant evidence in each file.
+MIR_DUAL_AUTHORITY_MODULES: dict[str, tuple[str, ...]] = {
+    "UnwindSetDiscrAndFnPtr": (
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean",
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean",
+    ),
+    "DropBinderAndSubtype": (
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean",
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean",
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean",
+    ),
+    "NullaryAndPtrCoercion": (
+        "minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean",
+        "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean",
+        "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean",
+    ),
+}
+MIR_BUNDLE_KERNEL_BRIDGES: dict[str, str] = {
+    "DropBinderAndSubtype": "tests/mir/DropBinderAndSubtypeCorrTests.lean",
+    "NullaryAndPtrCoercion": "tests/mir/NullaryAndPtrCoercionCorrTests.lean",
+}
+# Each promoted variant maps to `{rel_path: (theorems_or_bundle_variant_names, ...)}`.
+# For `MR`/`LM` files, every entry must be an actual `theorem`/`lemma` declaration in
+# comment-stripped Lean code; for `Bundle` files, the first entry is the variant
+# constructor listed in `allEp2Variants`/`allNpVariants` and the rest are theorems.
+MIR_PROMOTED_VARIANT_THEOREMS: dict[str, dict[str, tuple[str, ...]]] = {
+    "StatementKind.coverage": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "coverage_stuttering_step",
+            "c4_coverage_stuttering_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_coverage_simulation",
+            "w_c4_coverage_multiStep",
+        ),
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v1_coverage_universal_sim",
+            "v1_coverage_positive_and_ub_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v1_v2_overlay_universal_sim",
+            "lm_v1_v2_coverage_and_dropHint_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".coverage",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "StatementKind.backwardIncompatibleDropHint": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "backwardIncompatibleDropHint_stuttering_step",
+            "c5_backwardIncompatibleDropHint_dead_place_no_ub_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_backwardIncompatibleDropHint_simulation",
+            "w_c5_dropHint_dead_uninit_dangling_vs_placeMention_ub",
+        ),
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v2_dropHint_universal_sim",
+            "v2_dropHint_positive_and_ub_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v1_v2_overlay_universal_sim",
+            "lm_v1_v2_coverage_and_dropHint_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".backwardIncompatibleDropHint",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "TerminatorKind.drop": {
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v3_drop_whole_coupled_lockstep_and_wfLive",
+            "v3_drop_comprehensive_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v3_drop_dead_ub_overlay_universal",
+            "lm_v3_drop_comprehensive_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".dropTerminator",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "TerminatorKind.unwindResume": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "unwindResume_continue_chain_coupled_steps_and_wfLive",
+            "c2_unwindResume_all_five_regimes_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_unwindResume_cleanup_and_unreachable_simulation",
+            "w_c2_c3_unwind_all_regimes_and_terminate",
+        ),
+    },
+    "TerminatorKind.unwindTerminate": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "unwindTerminate_lockstep_abort_mach_and_tb",
+            "c3_unwindTerminate_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_unwindTerminate_directUnwind_abort_simulation",
+            "w_c2_c3_unwind_all_regimes_and_terminate",
+        ),
+    },
+    "ProjectionElem.unwrapUnsafeBinder": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "unwrapUnsafeBinder_assign_coupled_lockstep_and_wfLive",
+            "c9_unwrapUnsafeBinder_three_way_len_and_ub_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_unwrapUnsafeBinder_copy_simulation",
+            "step_unwrapUnsafeBinder_write_simulation",
+        ),
+        "minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean": (
+            "np_v4_unwrapUnsafeBinder_three_way_witness",
+            "npMrObserve_unwrap_mode_sensitivity",
+        ),
+        "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean": (
+            "lm_np_v4_unwrapUnsafeBinder_witness",
+            "npLmObserve_v4_unwrapUnsafeBinder_table",
+        ),
+        "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean": (
+            ".unwrapUnsafeBinder",
+            "allNpVariants_complete",
+            "mrVariantSide_check",
+            "ep2_nullary_ptrcoercion_fnptr_unwrap_capstone",
+        ),
+    },
+    "Rvalue.nullaryOp": {
+        "minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean": (
+            "np_v1_nullaryOp_coupled_step_sim_all_four",
+            "np_v1_nullaryOp_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean": (
+            "lm_np_v1_nullaryOp_boundary_and_lowered_witness",
+            "npLmObserve_v1_nullaryOp_table",
+        ),
+        "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean": (
+            ".nullaryOp",
+            "allNpVariants_complete",
+            "mrVariantSide_check",
+            "ep2_nullary_ptrcoercion_fnptr_unwrap_capstone",
+        ),
+    },
+    "Rvalue.shallowInitBox": {
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v4_shallowInitBox_universal_sim",
+            "v4_shallowInitBox_comprehensive_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "trusted_shallowInitBox_eq_transmute_on_rawPtr",
+            "lm_v4_shallowInitBox_boundary_and_lowered_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".shallowInitBox",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "Rvalue.wrapUnsafeBinder": {
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v5_wrapUnsafeBinder_universal_sim",
+            "v5_wrapUnsafeBinder_comprehensive_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v5_wrapUnsafeBinder_evalRvalue_universal",
+            "lm_v5_wrapUnsafeBinder_comprehensive_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".wrapUnsafeBinder",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "CastKind.pointerCoercion": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "reify_and_closure_fnPointer_lockstep_M",
+            "unsafeFnPointer_ground_truth_and_divergences",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_cast_closureFnPointer_simulation",
+            "step_cast_mutToConstPointer_thin_simulation",
+        ),
+        "minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean": (
+            "np_v2_pointerCoercion_dispatch",
+            "np_v2_pointerCoercion_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean": (
+            "lm_np_v2_pointerCoercion_six_subkinds_witness",
+            "npLmObserve_v2_pointerCoercion_table",
+        ),
+        "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean": (
+            ".pointerCoercion",
+            "allNpVariants_complete",
+            "mrVariantSide_check",
+            "ep2_nullary_ptrcoercion_fnptr_unwrap_capstone",
+        ),
+    },
+    "CastKind.subtype": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "subtype_thinPtr_and_u32_coupled_lockstep",
+            "c7_subtype_positive_and_invalid_ub_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_cast_subtype_scalar_and_ub_simulation",
+            "w_c7_subtype_scalars_ptrs_newtype_and_ub",
+        ),
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v6_subtype_eq_transmute_and_sim",
+            "v5_v6_binder_and_subtype_coupled_valRel_sim",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "miri_cast_subtype_eq_transmute",
+            "lm_v6_castSubtype_comprehensive_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".castSubtype",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "CastKind.fnPtrToPtr": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "fnPtrToPtr_lockstep_mach_and_tb",
+            "c6_fnPtrToPtr_three_way_and_ub_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_cast_fnPtrToPtr_simulation",
+            "w_c6_fnPtrToPtr_roundtrip_ub_and_divergence",
+        ),
+        "minirust/lean/MiniRustSpec/NullaryAndPtrCoercionMR.lean": (
+            "np_v3_evalRvalue_fnPtrToPtr_eq",
+            "np_v3_fnPtrToPtr_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/NullaryAndPtrCoercionLM.lean": (
+            "lm_np_v3_fnPtrToPtr_ub_and_divergence_witness",
+            "npLmObserve_v3_fnPtrToPtr_table",
+        ),
+        "theory/Anneal/Mir/NullaryAndPtrCoercionBundle.lean": (
+            ".fnPtrToPtr",
+            "allNpVariants_complete",
+            "mrVariantSide_check",
+            "ep2_nullary_ptrcoercion_fnptr_unwrap_capstone",
+        ),
+    },
+    "AggregateKind.rawPtr": {
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v7_aggregateRawPtr_universal_sim",
+            "v7_aggregateRawPtr_comprehensive_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v7_writeAggregate_rawPtr_universal",
+            "lm_v7_aggregateRawPtr_comprehensive_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".aggregateRawPtr",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+    "AggregateKind.closure": {
+        "minirust/lean/MiniRustSpec/UnwindSetDiscrAndFnPtrMR.lean": (
+            "closure_assign_coupled_lockstep_and_wfLive",
+            "c10_closure_zst_capture_and_ub_three_way_witness",
+        ),
+        "lean-miri/lean/LeanMiriSpec/UnwindSetDiscrAndFnPtrLM.lean": (
+            "step_aggregate_closure_zst_simulation",
+            "step_aggregate_closure_twoCapture_simulation",
+        ),
+        "minirust/lean/MiniRustSpec/DropBinderAndSubtypeMR.lean": (
+            "v8_closure_universal_sim",
+            "v8_closure_coupled_valRel_sim",
+        ),
+        "lean-miri/lean/LeanMiriSpec/DropBinderAndSubtypeLM.lean": (
+            "lm_v8_closure_overlay_universal",
+            "lm_v8_aggregateClosure_comprehensive_witness",
+        ),
+        "theory/Anneal/Mir/DropBinderAndSubtypeBundle.lean": (
+            ".aggregateClosure",
+            "allEp2Variants_complete",
+            "mrVariantSide_check",
+            "variant_bundle_claims_with",
+        ),
+    },
+}
+MIR_PROMOTED_VARIANT_EVIDENCE: dict[str, tuple[str, ...]] = {
+    "StatementKind.coverage": ("UnwindSetDiscrAndFnPtr", "DropBinderAndSubtype"),
+    "StatementKind.backwardIncompatibleDropHint": ("UnwindSetDiscrAndFnPtr", "DropBinderAndSubtype"),
+    "TerminatorKind.drop": ("DropBinderAndSubtype",),
+    "TerminatorKind.unwindResume": ("UnwindSetDiscrAndFnPtr",),
+    "TerminatorKind.unwindTerminate": ("UnwindSetDiscrAndFnPtr",),
+    "ProjectionElem.unwrapUnsafeBinder": ("UnwindSetDiscrAndFnPtr", "NullaryAndPtrCoercion"),
+    "Rvalue.nullaryOp": ("NullaryAndPtrCoercion",),
+    "Rvalue.shallowInitBox": ("DropBinderAndSubtype",),
+    "Rvalue.wrapUnsafeBinder": ("DropBinderAndSubtype",),
+    "CastKind.pointerCoercion": ("UnwindSetDiscrAndFnPtr", "NullaryAndPtrCoercion"),
+    "CastKind.subtype": ("UnwindSetDiscrAndFnPtr", "DropBinderAndSubtype"),
+    "CastKind.fnPtrToPtr": ("UnwindSetDiscrAndFnPtr", "NullaryAndPtrCoercion"),
+    "AggregateKind.rawPtr": ("DropBinderAndSubtype",),
+    "AggregateKind.closure": ("UnwindSetDiscrAndFnPtr", "DropBinderAndSubtype"),
+}
 
 # Pillar 3 divergences resolved by `*_simulation` theorems (statement-pinned in their
 # authority audit module, or in `tests/mir/MirUntestedVariantCorrespondenceTests.lean` itself).
@@ -142,8 +457,10 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
     _AMBIENT_SUITE_KNOBS = (
         "ANNEAL_LEAN_RUN",
         "ANNEAL_LEAN_TIMEOUT_SEC",
+        "ANNEAL_LEAN_MEMORY_MAX_MB",
         "ANNEAL_LEAN_RUN_IN_SCOPE",
         "ANNEAL_LSP_NO_EVICT",
+        "LEAN_NUM_THREADS",
     )
 
     def setUp(self) -> None:
@@ -161,7 +478,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         # Exactly the `Trusted.Rustc.V2026_06_01.MirAst` constructors (checked against the Lean
         # inductives by `scripts/audit_mir_coverage_matrix.py`).
         self.assertEqual(mir["total_variants"], 94)
-        self.assertGreaterEqual(mir["proved_corresponding"], 73)
+        self.assertEqual(mir["proved_corresponding"], 90)
+        self.assertEqual(mir["supported_and_tested"], 1)
+        self.assertEqual(mir["unsupported_fail_closed"], 3)
         self.assertEqual(mir["supported_untested"], 0)
         self.assertEqual(mir["untested_variants"], [])
         self.assertEqual(
@@ -217,6 +536,175 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         self.assertIn("LM-1.1", lm["milestones_merged"])
         self.assertIn("LM-3.3", lm["milestones_merged"])
         self.assertGreater(lm["audited_declarations"], 500)
+
+    def test_mir_ast_categories_reconciled_to_90_of_94_proved_corresponding(self) -> None:
+        statuses: dict[str, str] = {}
+        for entry in suite.MIR_AST_CATEGORIES:
+            for name, status in entry["variants"]:
+                key = f"{entry['category']}.{name}"
+                self.assertNotIn(key, statuses, "variant listed twice")
+                statuses[key] = status
+        self.assertEqual(len(statuses), 94)
+
+        def with_status(status: str) -> list[str]:
+            return [key for key, value in statuses.items() if value == status]
+
+        self.assertEqual(len(with_status("proved_corresponding")), 90)
+        self.assertEqual(with_status("supported_and_tested"), ["ProjectionElem.opaqueCast"])
+        self.assertEqual(with_status("supported_untested"), [])
+        self.assertEqual(
+            with_status("unsupported_fail_closed"),
+            ["TerminatorKind.inlineAsm", "Rvalue.threadLocalRef", "AggregateKind.coroutine"],
+        )
+        self.assertEqual(
+            set(statuses.values()), {"proved_corresponding", "supported_and_tested", "unsupported_fail_closed"}
+        )
+
+        # The 14 variants promoted from `supported_and_tested` / `unsupported_fail_closed`.
+        self.assertEqual(len(MIR_PROMOTED_VARIANT_EVIDENCE), 14)
+        self.assertEqual(set(MIR_PROMOTED_VARIANT_THEOREMS), set(MIR_PROMOTED_VARIANT_EVIDENCE))
+        for key in MIR_PROMOTED_VARIANT_EVIDENCE:
+            self.assertEqual(statuses[key], "proved_corresponding", key)
+        # Each cited module (and each cross-root kernel bridge closing a `Bundle` over `LM`)
+        # exists in this tree, lexes cleanly, contains no `sorry` / `admit` / `native_decide` /
+        # `axiom` declaration outside Lean comments and string literals, and declares concrete
+        # correspondence theorems in that stripped code.
+        proof_code: dict[str, str] = {}
+        axiom_decl_re = re.compile(
+            r"(?:^|\n)\s*(?:(?:private|protected|local|scoped|noncomputable|unsafe)\s+)*axiom\b"
+        )
+        all_checked_files = [
+            *(rel for rels in MIR_DUAL_AUTHORITY_MODULES.values() for rel in rels),
+            *MIR_BUNDLE_KERNEL_BRIDGES.values(),
+        ]
+        for family, rels in MIR_DUAL_AUTHORITY_MODULES.items():
+            self.assertGreaterEqual(len(rels), 2, family)
+            self.assertTrue(any(rel.endswith("MR.lean") for rel in rels), family)
+            self.assertTrue(any(rel.endswith("LM.lean") for rel in rels), family)
+
+        def check_clean_lean_code(rel: str) -> str:
+            path = REPO_ROOT / rel
+            self.assertTrue(path.is_file(), rel)
+            code, lex_errors = mir_audit.strip_lean_source(path.read_text(encoding="utf-8"), keep_strings=False)
+            self.assertEqual(lex_errors, [], f"{rel}: {lex_errors}")
+            for banned in ("sorry", "admit", "native_decide"):
+                self.assertIsNone(re.search(rf"\b{banned}\b", code), f"{rel}: {banned}")
+            self.assertIsNone(axiom_decl_re.search(code), f"{rel}: axiom")
+            return code
+
+        for rel in all_checked_files:
+            proof_code[rel] = check_clean_lean_code(rel)
+        for key, families in MIR_PROMOTED_VARIANT_EVIDENCE.items():
+            self.assertTrue(families, key)
+            expected_files = {rel for family in families for rel in MIR_DUAL_AUTHORITY_MODULES[family]}
+            by_file = MIR_PROMOTED_VARIANT_THEOREMS[key]
+            self.assertEqual(set(by_file), expected_files, key)
+            for rel, symbols in by_file.items():
+                self.assertTrue(symbols, (key, rel))
+                code = proof_code[rel]
+                for sym in symbols:
+                    if sym.startswith("."):
+                        self.assertRegex(
+                            code,
+                            rf"{re.escape(sym)}\b",
+                            f"{rel} missing bundle variant {sym} for {key}",
+                        )
+                    else:
+                        self.assertRegex(
+                            code,
+                            rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
+                            f"{rel} missing theorem {sym} for {key}",
+                        )
+        # Cross-root kernel bridge files declare concrete closing theorems.
+        for rel, bridge_theorems in (
+            (
+                MIR_BUNDLE_KERNEL_BRIDGES["DropBinderAndSubtype"],
+                ("ep2_all_8_variants_flip_verdict", "ep2_drop_mode_sensitivity_root"),
+            ),
+            (
+                MIR_BUNDLE_KERNEL_BRIDGES["NullaryAndPtrCoercion"],
+                (
+                    "np_all_4_variants_flip_verdict",
+                    "ep2_nullary_ptrcoercion_fnptr_unwrap_root_capstone",
+                ),
+            ),
+        ):
+            code = proof_code[rel]
+            for sym in bridge_theorems:
+                self.assertRegex(
+                    code,
+                    rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
+                    f"{rel} missing bridge theorem {sym}",
+                )
+        # Float-cast correspondence modules cited in `MIR_AST_CATEGORIES` exist, pass hygiene,
+        # and carry their fail-closed MiniRust boundary and direct Miri step-simulation theorems.
+        float_umbrella = check_clean_lean_code("lean-miri/lean/LeanMiriSpec/FloatCastLM.lean")
+        # The umbrella must *import* the direct-step submodule on its own line: a bare mention
+        # in code, or a longer module name sharing the prefix, does not re-export its theorems.
+        self.assertRegex(
+            float_umbrella,
+            r"(?m)^(?:public[ \t]+)?import[ \t]+LeanMiriSpec\.FloatCastLM\.RealStepDirect[ \t]*$",
+        )
+        for rel, required_theorems in (
+            (
+                "minirust/lean/MiniRustSpec/FloatCastMR.lean",
+                ("fc_intTypeOf_float", "fc_translateTy_float"),
+            ),
+            (
+                "lean-miri/lean/LeanMiriSpec/FloatCastLM/RealStepDirect.lean",
+                ("step_cast_float_copy_simulation_mode", "step_cast_float_move_simulation_mode"),
+            ),
+            (
+                "lean-miri/lean/LeanMiriSpec/WitFloatCastLM.lean",
+                ("wfcW5_promoted_raw_pipeline_end_to_end", "wfcW5_indirect_float_pipeline_end_to_end"),
+            ),
+        ):
+            code = check_clean_lean_code(rel)
+            for sym in required_theorems:
+                self.assertRegex(
+                    code,
+                    rf"(?m)^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+{re.escape(sym)}\b",
+                    f"{rel} missing float-cast theorem {sym}",
+                )
+
+        # The census and the Markdown-facing lists are derived from the same table.
+        mir = suite.compute_stage_a_syntactic_completeness(REPO_ROOT)["anneal_mir_ast"]
+        self.assertEqual(
+            (
+                mir["total_variants"],
+                mir["proved_corresponding"],
+                mir["supported_and_tested"],
+                mir["supported_untested"],
+                mir["unsupported_fail_closed"],
+            ),
+            (94, 90, 1, 0, 3),
+        )
+        self.assertEqual(mir["proved_corresponding_pct"], 95.74)
+        self.assertEqual(mir["supported_total"], 91)
+        self.assertEqual(mir["supported_pct"], 96.81)
+        self.assertEqual(mir["untested_variants"], [])
+        self.assertEqual(
+            mir["unsupported_variants"],
+            ["TerminatorKind.inlineAsm", "Rvalue.threadLocalRef", "AggregateKind.coroutine"],
+        )
+        by_category = {
+            cat: (c["proved_corresponding"], c["supported_and_tested"], c["unsupported_fail_closed"], c["total"])
+            for cat, c in mir["by_category"].items()
+        }
+        self.assertEqual(
+            by_category,
+            {
+                "StatementKind": (12, 0, 0, 12),
+                "NonDivergingIntrinsic": (2, 0, 0, 2),
+                "TerminatorKind": (10, 0, 1, 11),
+                "ProjectionElem": (7, 1, 0, 8),
+                "Rvalue": (14, 0, 1, 15),
+                "BinOp": (26, 0, 0, 26),
+                "UnOp": (3, 0, 0, 3),
+                "CastKind": (11, 0, 0, 11),
+                "AggregateKind": (5, 0, 1, 6),
+            },
+        )
 
     def test_stage_b_blended_completeness_and_marginal_unlock_math(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1550,6 +2038,9 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         )
         self.assertNotIn("check_trusted_self_test", quick_names)
         self.assertNotIn("lake_build_minirust_spec", quick_names)
+        self.assertNotIn("lake_build_examples_miri_vendor", quick_names)
+        self.assertNotIn("lake_build_lean_miri_spec", quick_names)
+        self.assertEqual(quick_names[-2:], ["lake_build_examples_trusted", "rust_workspace_unit_tests"])
 
         nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
         nightly_names = [s[0] for s in nightly_steps]
@@ -1565,6 +2056,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_untested_variant_correspondence",
             "lake_build_correspondence",
             "lake_build_minirust_spec",
+            "lake_build_examples_trusted",
+            "lake_build_examples_miri_vendor",
             "lake_build_lean_miri_spec",
         ):
             self.assertIn(dependent, nightly_names)
@@ -1634,6 +2127,516 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             ),
         )
 
+    @staticmethod
+    def _inner_cmd(cmd: list[str]) -> list[str]:
+        """The command a step runs, without its `anneal-lean-run` wrapper prefix."""
+        return cmd[cmd.index("--") + 1 :] if suite._is_lean_run_wrapped(cmd) else cmd
+
+    def test_examples_trusted_prebuild_precedes_rust_workspace_unit_tests(self) -> None:
+        # Parallel `trusted/rustc-capture` tests each start `lake --dir examples build Trusted`
+        # when `examples/.lake/build/lib/lean/Trusted.olean` is missing; the suite builds it
+        # once, before any `cargo test`, in both profiles that run `cargo test --workspace`.
+        census_names = [s[0] for s in suite.build_suite_steps(REPO_ROOT, "census-only")]
+        self.assertNotIn("lake_build_examples_trusted", census_names)
+        for profile in ("quick", "nightly"):
+            steps = suite.build_suite_steps(REPO_ROOT, profile)
+            names = [s[0] for s in steps]
+            self.assertEqual(names.count("lake_build_examples_trusted"), 1, profile)
+            self.assertEqual(names.count("rust_workspace_unit_tests"), 1, profile)
+            idx = names.index("lake_build_examples_trusted")
+            self.assertEqual(idx + 1, names.index("rust_workspace_unit_tests"), profile)
+            self.assertLess(names.index("lake_build_core_theory"), idx, profile)
+            _name, category, cmd, timeout_sec = steps[idx]
+            self.assertEqual(category, "cat1_trusted_boundary")
+            self.assertEqual(timeout_sec, 600)
+            self.assertTrue(suite._is_lean_run_wrapped(cmd))
+            self.assertEqual(suite._lean_run_wrapper_flags(cmd), ("build", 600, True))
+            self.assertEqual(self._inner_cmd(cmd), ["lake", "--dir", "examples", "build", "Trusted"])
+            self.assertGreaterEqual(
+                suite._outer_timeout_sec(cmd, timeout_sec), timeout_sec + suite.WRAPPER_TIMEOUT_GRACE_SEC
+            )
+            # No `cargo test` (which may run the racing tests) is scheduled before it.
+            cargo_test_steps = [
+                name for name, _c, step_cmd, _t in steps if self._inner_cmd(step_cmd)[:2] == ["cargo", "test"]
+            ]
+            self.assertIn("rust_workspace_unit_tests", cargo_test_steps)
+            for name in cargo_test_steps:
+                self.assertLess(idx, names.index(name), f"{profile}/{name}")
+        # Without a resolvable wrapper the step runs the bare Lake command.
+        with mock.patch.object(suite, "_resolve_anneal_lean_run", return_value=None):
+            bare = {name: cmd for name, _c, cmd, _t in suite.build_suite_steps(REPO_ROOT, "quick")}
+        self.assertEqual(bare["lake_build_examples_trusted"], ["lake", "--dir", "examples", "build", "Trusted"])
+        # The prebuild keeps the ambient thread count even on a low-RAM host.
+        env = suite._build_step_env(
+            "lake_build_examples_trusted",
+            base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+            effective_ram_mib=5712,
+        )
+        self.assertEqual(env["LEAN_NUM_THREADS"], "4")
+        self.assertEqual(env["LAKE_ARTIFACT_CACHE"], "true")
+        self.assertEqual(env["LAKE_RESTORE_ARTIFACTS"], "true")
+
+    def test_lean_miri_spec_build_is_split_into_vendor_and_spec_steps(self) -> None:
+        for profile in ("census-only", "quick"):
+            names = [s[0] for s in suite.build_suite_steps(REPO_ROOT, profile)]
+            self.assertNotIn("lake_build_examples_miri_vendor", names)
+            self.assertNotIn("lake_build_lean_miri_spec", names)
+        steps = suite.build_suite_steps(REPO_ROOT, "nightly")
+        names = [s[0] for s in steps]
+        by_name = {name: (cat, cmd, timeout_sec) for name, cat, cmd, timeout_sec in steps}
+        self.assertEqual(len(names), len(set(names)))
+        vendor_idx = names.index("lake_build_examples_miri_vendor")
+        self.assertEqual(names[vendor_idx + 1], "lake_build_lean_miri_spec")
+        self.assertEqual(names[vendor_idx - 1], "lake_build_minirust_spec")
+        self.assertLess(names.index("lake_build_core_theory"), vendor_idx)
+        expected = {
+            "lake_build_examples_miri_vendor": (["lake", "--dir", "examples", "build", "Miri"], 900),
+            "lake_build_lean_miri_spec": (["lake", "--dir", "examples", "build", "LeanMiriSpec"], 1800),
+        }
+        grace = suite.WRAPPER_TIMEOUT_GRACE_SEC
+        for name, (inner, budget) in expected.items():
+            category, cmd, timeout_sec = by_name[name]
+            self.assertEqual(category, "cat2_correspondence_suites", name)
+            self.assertEqual(timeout_sec, budget, name)
+            self.assertTrue(suite._is_lean_run_wrapped(cmd), name)
+            self.assertEqual(suite._lean_run_wrapper_flags(cmd), ("build", budget, True), name)
+            self.assertEqual(self._inner_cmd(cmd), inner, name)
+            self.assertEqual(
+                suite._outer_timeout_sec(cmd, timeout_sec),
+                max(suite.LEAN_RUN_SLOT_WAIT_SEC["build"], budget)
+                + max(suite.LEAN_RUN_OOM_RETRY_WINDOW_SEC, budget)
+                + grace,
+                name,
+            )
+        # Both steps (and the `Trusted` prebuild) name libraries the `examples` Lake root
+        # declares, and the vendored library is the one the stale-`.olean` guard already
+        # treats as independent of `Trusted`.
+        import tomllib
+
+        examples_libs = {
+            lib["name"]
+            for lib in tomllib.loads((REPO_ROOT / "examples/lakefile.toml").read_text(encoding="utf-8"))["lean_lib"]
+        }
+        self.assertTrue({"Trusted", "Miri", "LeanMiriSpec"} <= examples_libs)
+        self.assertIn("Miri", suite._TRUSTED_INDEPENDENT_LIBS)
+        self.assertNotIn("LeanMiriSpec", suite._TRUSTED_INDEPENDENT_LIBS)
+        # Without a resolvable wrapper both run the bare Lake commands, in the same order.
+        with mock.patch.object(suite, "_resolve_anneal_lean_run", return_value=None):
+            bare = [(name, cmd) for name, _c, cmd, _t in suite.build_suite_steps(REPO_ROOT, "nightly")]
+        self.assertEqual([name for name, _cmd in bare], names)
+        bare_by_name = dict(bare)
+        for name, (inner, _budget) in expected.items():
+            self.assertEqual(bare_by_name[name], inner, name)
+
+    def test_low_ram_single_thread_policy_covers_minirust_spec_and_lean_miri_spec_only(self) -> None:
+        self.assertEqual(
+            suite.LOW_RAM_SINGLE_THREAD_STEPS, frozenset({"lake_build_minirust_spec", "lake_build_lean_miri_spec"})
+        )
+        self.assertEqual(suite.LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB, 10240)
+        nightly = suite.build_suite_steps(REPO_ROOT, "nightly")
+        nightly_names = [name for name, _c, _cmd, _t in nightly]
+        self.assertTrue(suite.LOW_RAM_SINGLE_THREAD_STEPS <= set(nightly_names))
+
+        def threads(step: str, ram: object, base: str | None = "4", **kwargs: object) -> str | None:
+            base_env = {"PATH": "/usr/bin"}
+            if base is not None:
+                base_env["LEAN_NUM_THREADS"] = base
+            return suite._build_step_env(step, base_env=base_env, effective_ram_mib=ram, **kwargs).get(
+                "LEAN_NUM_THREADS"
+            )
+
+        for step in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+            # Strictly below 10 GiB: single-threaded, whatever the ambient value.
+            for ram in (1, 5712, 10239):
+                self.assertEqual(threads(step, ram), "1", (step, ram))
+                self.assertEqual(threads(step, ram, base=None), "1", (step, ram))
+            # At or above it, or with no usable ceiling: untouched.
+            for ram in (10240, 32768, None, True, 5712.0, "5712"):
+                self.assertEqual(threads(step, ram), "4", (step, ram))
+                self.assertIsNone(threads(step, ram, base=None), (step, ram))
+            # Explicit overrides still win.
+            self.assertEqual(threads(step, 5712, env_overrides={"LEAN_NUM_THREADS": "3"}), "3", step)
+            # The exported threshold is the one the policy reads.
+            with mock.patch.object(suite, "LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB", 4096):
+                self.assertEqual(threads(step, 5712), "4", step)
+                self.assertEqual(threads(step, 4095), "1", step)
+
+        # Every other step of every profile keeps its thread count below 10 GiB, the
+        # vendored `Miri` build and the `Trusted` prebuild included.
+        others = {
+            name
+            for profile in ("census-only", "quick", "nightly")
+            for name, _c, _cmd, _t in suite.build_suite_steps(REPO_ROOT, profile)
+        } - suite.LOW_RAM_SINGLE_THREAD_STEPS
+        self.assertTrue(
+            {"lake_build_examples_miri_vendor", "lake_build_examples_trusted", "lake_build_correspondence"} <= others
+        )
+        for step in sorted(others):
+            self.assertEqual(threads(step, 5712), "4", step)
+            self.assertIsNone(threads(step, 5712, base=None), step)
+
+        # Only the two right-sized steps probe the host and their wrapper.
+        with (
+            mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536) as host_probe,
+            mock.patch.object(suite, "_probe_lean_run_memory_max_mib", return_value=5712) as wrapper_probe,
+        ):
+            seen = {
+                name: suite._build_step_env(name, base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "7"}, cmd=cmd).get(
+                    "LEAN_NUM_THREADS"
+                )
+                for name, _c, cmd, _t in nightly
+            }
+        self.assertEqual(host_probe.call_count, 2)
+        by_name = {name: cmd for name, _c, cmd, _t in nightly}
+        self.assertEqual(
+            sorted(call.args[0] for call in wrapper_probe.call_args_list),
+            sorted(by_name[name] for name in suite.LOW_RAM_SINGLE_THREAD_STEPS),
+        )
+        self.assertEqual(
+            seen,
+            {name: ("1" if name in suite.LOW_RAM_SINGLE_THREAD_STEPS else "7") for name in nightly_names},
+        )
+
+        # End to end through `_run_step`: with a wrapper that plans a 5712 MiB scope, the
+        # `MiniRustSpec` and `LeanMiriSpec` builds see `LEAN_NUM_THREADS=1`, and the vendored
+        # `Miri` build keeps the ambient 7 threads.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            wrapper = root / "bin/anneal-lean-run"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "if '--probe' in args:\n"
+                "    print(json.dumps({'memory_max_mb': 5712}))\n"
+                "    sys.exit(0)\n"
+                "cmd = args[args.index('--') + 1:]\n"
+                "os.execvp(cmd[0], cmd)\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            out_file = root / "threads.txt"
+            dump = (
+                "import os, pathlib; "
+                f"pathlib.Path({str(out_file)!r}).write_text(os.environ.get('LEAN_NUM_THREADS', '<unset>'))"
+            )
+            run_cmd = [str(wrapper), "--mode", "build", "--timeout", "30", "--", sys.executable, "-c", dump]
+            for step, expected in (
+                ("lake_build_minirust_spec", "1"),
+                ("lake_build_lean_miri_spec", "1"),
+                ("lake_build_examples_miri_vendor", "7"),
+            ):
+                out_file.unlink(missing_ok=True)
+                with (
+                    mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536),
+                    mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "7"}),
+                ):
+                    res = suite._run_step(
+                        name=step,
+                        category="cat2_correspondence_suites",
+                        cmd=run_cmd,
+                        cwd=root,
+                        timeout_sec=30,
+                    )
+                self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
+                self.assertEqual(out_file.read_text(encoding="utf-8"), expected, step)
+
+    def test_low_ram_policy_skips_probe_on_explicit_override_and_passthrough(self) -> None:
+        # 1. Explicit `env_overrides={"LEAN_NUM_THREADS": ...}` takes final precedence AND
+        #    avoids spawning a wasted wrapper probe for both right-sized steps.
+        # 2. Under `ANNEAL_LEAN_RUN_IN_SCOPE=1` without `--nested-ok`, the wrapper runs
+        #    `_exec_passthrough` and never creates a new leaf scope, so
+        #    `_probe_lean_run_memory_max_mib` must return `None` (no phantom nested cap)
+        #    while `--nested-ok` still probes the wrapper.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            wrapper = root / "bin/anneal-lean-run"
+            wrapper.parent.mkdir()
+            probe_log = root / "probes.txt"
+            wrapper.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\n"
+                f"open({str(probe_log)!r}, 'a', encoding='utf-8').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                "print(json.dumps({'memory_max_mb': 5712}))\n",
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            probe_log.write_text("", encoding="utf-8")
+
+            def probe_count() -> int:
+                return len(probe_log.read_text(encoding="utf-8").splitlines())
+
+            plain_cmd = [str(wrapper), "--mode", "build", "--timeout", "1200", "--", "lake", "build", "MiniRustSpec"]
+            nested_cmd = [
+                str(wrapper),
+                "--mode",
+                "build",
+                "--nested-ok",
+                "--timeout",
+                "1200",
+                "--",
+                "lake",
+                "build",
+                "MiniRustSpec",
+            ]
+
+            for step in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+                before = probe_count()
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=4096) as host_probe:
+                    env = suite._build_step_env(
+                        step,
+                        base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "7"},
+                        env_overrides={"LEAN_NUM_THREADS": "3"},
+                        cmd=plain_cmd,
+                        cwd=root,
+                    )
+                self.assertEqual(env["LEAN_NUM_THREADS"], "3", step)
+                self.assertEqual(host_probe.call_count, 0, step)
+                self.assertEqual(probe_count(), before, step)
+
+                # Re-entrancy pass-through inside a >= 10 GiB enclosing scope: do not probe
+                # a phantom nested scope that will never be created.
+                before = probe_count()
+                self.assertIsNone(
+                    suite._probe_lean_run_memory_max_mib(
+                        plain_cmd, env={"ANNEAL_LEAN_RUN_IN_SCOPE": "1"}, cwd=root
+                    )
+                )
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=12288):
+                    pt_high = suite._build_step_env(
+                        step,
+                        base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "7", "ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+                        cmd=plain_cmd,
+                        cwd=root,
+                    )
+                self.assertEqual(pt_high["LEAN_NUM_THREADS"], "7", step)
+                self.assertEqual(probe_count(), before, step)
+
+                # Inside a < 10 GiB enclosing scope, the host/cgroup ceiling still forces 1 thread.
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=8192):
+                    pt_low = suite._build_step_env(
+                        step,
+                        base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "7", "ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+                        cmd=plain_cmd,
+                        cwd=root,
+                    )
+                self.assertEqual(pt_low["LEAN_NUM_THREADS"], "1", step)
+                self.assertEqual(probe_count(), before, step)
+
+                # With `--nested-ok`, the wrapper WILL create a nested scope, so probing runs.
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=12288):
+                    nested_env = suite._build_step_env(
+                        step,
+                        base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "7", "ANNEAL_LEAN_RUN_IN_SCOPE": "1"},
+                        cmd=nested_cmd,
+                        cwd=root,
+                    )
+                self.assertEqual(nested_env["LEAN_NUM_THREADS"], "1", step)
+                self.assertEqual(probe_count(), before + 1, step)
+
+    def test_real_wrapper_end_to_end_low_ram_right_sizing_and_oom_threads_diagnostic(self) -> None:
+        # Cross-script integration: `_run_step` -> real `scripts/anneal-lean-run` (isolated to a
+        # temp runtime dir with synthetic 5712 MiB / 8-thread envelope). `lake_build_minirust_spec`
+        # and `lake_build_lean_miri_spec` receive `LEAN_NUM_THREADS=1` and report
+        # `threads=1, thread_budget=8` on exit 137, whereas `lake_build_examples_miri_vendor` and
+        # `lake_build_examples_trusted` keep the ambient thread count.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            rt = root / "rt"
+            rt.mkdir()
+            shim = root / "anneal-lean-run"
+            wrapper_src = REPO_ROOT / "scripts/anneal-lean-run"
+            shim.write_text(
+                f"#!{sys.executable}\n"
+                "import importlib.machinery, importlib.util, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                f"loader = importlib.machinery.SourceFileLoader('alr_e2e', {os.fspath(wrapper_src)!r})\n"
+                "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(mod)\n"
+                f"rt = pathlib.Path({os.fspath(rt)!r})\n"
+                "mod.resolve_runtime_base = lambda: (rt, False)\n"
+                "def _probe(*_a, **_kw):\n"
+                "    d = mod.compute_workload_memory_envelope(\n"
+                "        cpu_cores=8, mem_total_mb=65536, mem_avail_mb=50000,\n"
+                "        user_systemd_active=False, cli_concurrency=1, mode='build',\n"
+                "        runtime_base=str(rt),\n"
+                "    )\n"
+                "    d['memory_max_mb'] = 5712\n"
+                "    d['threads'] = 8\n"
+                "    return d\n"
+                "mod.probe_host_envelope = _probe\n"
+                "mod.stamp_last_oom = lambda *a, **kw: None\n"
+                "mod._try_oom_offload = lambda *a, **kw: None\n"
+                "sys.exit(mod.main(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            shim.chmod(0o755)
+            out_file = root / "seen_threads.txt"
+            child_ok = (
+                "import os, pathlib; "
+                f"pathlib.Path({str(out_file)!r}).write_text(os.environ.get('LEAN_NUM_THREADS', '<unset>'))"
+            )
+            cmd_ok = [str(shim), "--mode", "build", "--no-slot-lock", "--timeout", "30", "--", sys.executable, "-c", child_ok]
+            for step, expected in (
+                ("lake_build_minirust_spec", "1"),
+                ("lake_build_lean_miri_spec", "1"),
+                ("lake_build_examples_miri_vendor", "5"),
+                ("lake_build_examples_trusted", "5"),
+            ):
+                out_file.unlink(missing_ok=True)
+                with (
+                    mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536),
+                    mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "5"}),
+                ):
+                    res = suite._run_step(step, "cat2_correspondence_suites", cmd_ok, cwd=root, timeout_sec=30)
+                self.assertEqual(res["status"], "PASS", (step, res.get("failure_excerpt")))
+                self.assertEqual(out_file.read_text(encoding="utf-8"), expected, step)
+
+            # On OOM (exit 137) under the real wrapper, the failure excerpt reports `threads=1, thread_budget=8`.
+            cmd_oom = [str(shim), "--mode", "build", "--no-slot-lock", "--timeout", "30", "--", "sh", "-c", "exit 137"]
+            with (
+                mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536),
+                mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "5"}),
+            ):
+                res_oom = suite._run_step(
+                    "lake_build_minirust_spec", "cat2_correspondence_suites", cmd_oom, cwd=root, timeout_sec=30
+                )
+            self.assertEqual(res_oom["status"], "FAIL")
+            self.assertEqual(res_oom["exit_code"], 137)
+            self.assertIn("MemoryMax=5712M, MemorySwapMax=0, mode=build, threads=1, thread_budget=8,", res_oom["failure_excerpt"])
+
+    def test_examples_trusted_and_miri_split_dashboard_and_stale_olean_coherence(self) -> None:
+        # 1. When `examples` has a stale `Trusted` module, `clean_stale_oleans` removes
+        #    `Trusted` and `LeanMiriSpec` while preserving vendored `Miri` `.olean`s, matching
+        #    the `lake_build_examples_trusted` -> ... -> `lake_build_examples_miri_vendor` ->
+        #    `lake_build_lean_miri_spec` build order.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "examples").mkdir()
+            shutil.copy2(REPO_ROOT / "examples/lakefile.toml", root / "examples/lakefile.toml")
+            t_old = 1_700_000_000_000_000_000
+            t_new = t_old + 5_000_000_000
+
+            def touch(path: Path, ns: int, text: str = "") -> Path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                os.utime(path, ns=(ns, ns))
+                return path
+
+            touch(root / "trusted/lean/Trusted/Core.lean", t_new, "-- edited\n")
+            touch(root / "lean-miri/vendor/Miri/Core.lean", t_old, "-- vendor\n")
+            touch(root / "lean-miri/lean/LeanMiriSpec/Spec.lean", t_old, "-- spec\n")
+            ex_lib = root / "examples/.lake/build/lib/lean"
+            trusted_olean = touch(ex_lib / "Trusted/Core.olean", t_old)
+            miri_olean = touch(ex_lib / "Miri/Core.olean", t_old)
+            spec_olean = touch(ex_lib / "LeanMiriSpec/Spec.olean", t_old)
+
+            removed = suite.clean_stale_oleans(root)
+            self.assertIn(trusted_olean, removed)
+            self.assertIn(spec_olean, removed)
+            self.assertNotIn(miri_olean, removed)
+            self.assertFalse(trusted_olean.exists())
+            self.assertFalse(spec_olean.exists())
+            self.assertTrue(miri_olean.exists())
+
+            # 2. `run_suite_and_generate_dashboard` records the new steps and reconciled 90/94
+            #    MIR matrix in both JSON and Markdown outputs for `quick` (12) and `nightly` (29).
+            #    Stub Stage B corpus scanning and divergence discovery (covered by their own
+            #    end-to-end tests) so running both profiles stays fast while Stage A, step
+            #    planning, Markdown rendering, and JSON persistence remain real.
+            empty_layer = {
+                "fully_verifiable_fn_pct": 0.0,
+                "fully_verifiable_fns": 0,
+                "partially_covered_fn_pct": 0.0,
+                "partially_covered_fns": 0,
+                "within_blocked_fns_stmt_coverage_pct": 0.0,
+                "within_blocked_fns_cfg_prefix_pct": 0.0,
+                "total_stmt_coverage_pct": 0.0,
+                "blended_completeness_score_pct": 0.0,
+            }
+            stub_stage_b = {
+                "combined": {
+                    "total_fns": 0,
+                    "total_stmt_units": 0,
+                    "top_marginal_unlock_blockers": [],
+                    "layers": {
+                        layer: dict(empty_layer)
+                        for layer in (
+                            "trusted_mir",
+                            "anneal_proof_lifters",
+                            "minirust_correspondence",
+                            "lean_miri_correspondence",
+                        )
+                    },
+                },
+                "corpora": {},
+            }
+            stub_divs = {"actionable_anneal_bugs_count": 0, "actionable_anneal_bugs": []}
+            for profile, expected_count, required_order in (
+                ("quick", 12, ("lake_build_core_theory", "lake_build_examples_trusted", "rust_workspace_unit_tests")),
+                (
+                    "nightly",
+                    29,
+                    (
+                        "lake_build_core_theory",
+                        "lake_build_examples_trusted",
+                        "rust_workspace_unit_tests",
+                        "lake_build_minirust_spec",
+                        "lake_build_examples_miri_vendor",
+                        "lake_build_lean_miri_spec",
+                    ),
+                ),
+            ):
+                state_dir = root / f"state_{profile}"
+                seen_steps: list[str] = []
+
+                def fake_run_step(
+                    name: str,
+                    category: str,
+                    cmd: list[str],
+                    cwd: Path,
+                    timeout_sec: int = 900,
+                    env_overrides: dict[str, str] | None = None,
+                ) -> dict[str, Any]:
+                    seen_steps.append(name)
+                    return {
+                        "name": name,
+                        "category": category,
+                        "status": "PASS",
+                        "exit_code": 0,
+                        "duration_sec": 0.01,
+                        "command": " ".join(cmd),
+                        "audit_tags": [],
+                        "failure_excerpt": "",
+                    }
+
+                with (
+                    mock.patch.object(suite, "compute_stage_b_empirical_corpora", return_value=stub_stage_b),
+                    mock.patch.object(suite, "discover_correspondence_divergences", return_value=stub_divs),
+                    mock.patch.object(suite, "_preflight_clean_stale_oleans", return_value=[]),
+                    mock.patch.object(suite, "_run_step", side_effect=fake_run_step),
+                ):
+                    rc, dash, md = suite.run_suite_and_generate_dashboard(REPO_ROOT, profile, state_dir)
+                self.assertEqual(rc, suite.EXIT_SUCCESS, profile)
+                self.assertEqual(len(seen_steps), expected_count, profile)
+                indices = [seen_steps.index(s) for s in required_order]
+                self.assertEqual(indices, sorted(indices), (profile, required_order))
+                p2 = dash["pillar_2_correctness_and_correspondence"]
+                self.assertEqual(p2["steps_total"], expected_count, profile)
+                self.assertEqual(p2["steps_passed"], expected_count, profile)
+                mir = dash["pillar_1_completeness"]["syntactic_authorities"]["anneal_mir_ast"]
+                self.assertEqual(mir["proved_corresponding"], 90)
+                self.assertEqual(mir["total_variants"], 94)
+                self.assertIn("`90` (`95.74%`)", md)
+                self.assertIn("`lake_build_examples_trusted`", md)
+                if profile == "nightly":
+                    self.assertIn("`lake_build_examples_miri_vendor`", md)
+                    self.assertLess(md.index("`lake_build_examples_miri_vendor`"), md.index("`lake_build_lean_miri_spec`"))
+                persisted = json.loads((state_dir / "reports/LATEST_DASHBOARD_STATE.json").read_text(encoding="utf-8"))
+                self.assertEqual(persisted["pillar_2_correctness_and_correspondence"]["steps_total"], expected_count)
+
     def test_mir_test_prebuild_modules_fallback_when_a_header_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1664,6 +2667,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         expected_timeouts = {
             "lake_build_core_theory": 900,
             "check_trusted_fast": 600,
+            "lake_build_examples_trusted": 600,
             "rust_workspace_unit_tests": 600,
             "check_trusted_self_test": 1500,
             "tests_mir_bit_validity_stage1": 300,
@@ -1674,6 +2678,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             "tests_mir_untested_variant_correspondence": 300,
             "lake_build_correspondence": 900,
             "lake_build_minirust_spec": 1200,
+            "lake_build_examples_miri_vendor": 900,
             "lake_build_lean_miri_spec": 1800,
             "domain_integration_tests_anneal_difftest": 1500,
             "cargo_anneal_e2e_minirust_correspondence": 600,
@@ -4289,13 +5294,29 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
         )
         self.assertEqual(high_preserve["LEAN_NUM_THREADS"], "4")
 
-        # Other steps are unaffected even under `< 10240 MiB`.
-        other_low = suite._build_step_env(
-            "lake_build_core_theory",
-            base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
-            effective_ram_mib=5712,
-        )
-        self.assertEqual(other_low["LEAN_NUM_THREADS"], "4")
+        # `lake_build_minirust_spec` follows the same threshold.
+        for ram_mib, expected in ((5712, "1"), (10239, "1"), (10240, "4"), (32768, "4")):
+            minirust_env = suite._build_step_env(
+                "lake_build_minirust_spec",
+                base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+                effective_ram_mib=ram_mib,
+            )
+            self.assertEqual(minirust_env["LEAN_NUM_THREADS"], expected, ram_mib)
+
+        # Other steps are unaffected even under `< 10240 MiB`, including the vendored
+        # `Miri` build that precedes `lake_build_lean_miri_spec`.
+        for other_step in ("lake_build_core_theory", "lake_build_examples_miri_vendor", "lake_build_correspondence"):
+            other_low = suite._build_step_env(
+                other_step,
+                base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "4"},
+                effective_ram_mib=5712,
+            )
+            self.assertEqual(other_low["LEAN_NUM_THREADS"], "4", other_step)
+            self.assertNotIn(
+                "LEAN_NUM_THREADS",
+                suite._build_step_env(other_step, base_env={"PATH": "/usr/bin"}, effective_ram_mib=5712),
+                other_step,
+            )
 
     def test_lean_miri_spec_right_sizing_honors_wrapper_planned_memory_max(self) -> None:
         # `anneal-lean-run` runs the step in its own scope with `MemoryMax=<memory_max_mb>M`
@@ -4348,17 +5369,54 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 "build",
                 "LeanMiriSpec",
             ]
-            # The probe forwards exactly the wrapper's own options and never the command.
+            # The probe forwards exactly the wrapper's own options, pins the mode the wrapper
+            # resolves for the real command, and never forwards the command itself.
             reply.write_text(json.dumps({"memory_max_mb": 5712, "threads": 8}), encoding="utf-8")
             self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 5712)
             self.assertEqual(
-                probes(), [["--mode", "build", "--concurrency", "1", "--timeout", "1800", "--probe", "--json"]]
+                probes(),
+                [
+                    [
+                        "--mode",
+                        "build",
+                        "--concurrency",
+                        "1",
+                        "--timeout",
+                        "1800",
+                        "--mode",
+                        "build",
+                        "--probe",
+                        "--json",
+                    ]
+                ],
             )
             joined = [str(wrapper), "--mode=build", "--time", "60", "--no-slot-lock", "lake", "build"]
             self.assertEqual(suite._probe_lean_run_memory_max_mib(joined), 5712)
             self.assertEqual(
-                probes()[-1], ["--mode=build", "--time", "60", "--no-slot-lock", "--probe", "--json"]
+                probes()[-1],
+                ["--mode=build", "--time", "60", "--no-slot-lock", "--mode", "build", "--probe", "--json"],
             )
+            # Without the command, the wrapper's `auto` mode resolves to `build`: a wrapper
+            # that will run its command in `file` mode (lower `MemoryMax`) must be probed
+            # in `file` mode, whether `--mode` is omitted, `auto`, or abbreviated.
+            for wrapper_opts, inner, want_mode in (
+                ([], ["lake", "env", "lean", "tests/mir/X.lean"], "file"),
+                (["--mode", "auto"], ["lean", "X.lean"], "file"),
+                (
+                    ["--mode=auto", "--timeout", "300"],
+                    ["--", "lake", "--dir", "examples", "env", "lean", "X.lean"],
+                    "file",
+                ),
+                (["--mod", "auto"], ["lake", "env", "lean", "--run", "X.lean"], "build"),
+                ([], ["lake", "build", "MiniRustSpec"], "build"),
+                (["--mode", "file"], ["lake", "build", "MiniRustSpec"], "file"),
+                (["--mode", "build"], ["lean", "X.lean"], "build"),
+            ):
+                auto_cmd = [str(wrapper), *wrapper_opts, *inner]
+                self.assertEqual(suite._probe_lean_run_memory_max_mib(auto_cmd), 5712, auto_cmd)
+                self.assertEqual(
+                    probes()[-1], [*wrapper_opts, "--mode", want_mode, "--probe", "--json"], auto_cmd
+                )
             # Anything but a positive integer `memory_max_mb` from a successful probe is no answer.
             for bad in (
                 "exit:3",
@@ -4397,9 +5455,16 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 self.assertIsNone(threads("lake_build_lean_miri_spec", ["lake", "build", "LeanMiriSpec"]))
                 self.assertIsNone(threads("lake_build_lean_miri_spec", None))
                 self.assertIsNone(threads("lake_build_core_theory", step_cmd))
+                self.assertIsNone(threads("lake_build_examples_miri_vendor", step_cmd))
+                self.assertIsNone(threads("lake_build_correspondence", step_cmd))
                 self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd, effective_ram_mib=32768))
                 self.assertIsNone(threads("lake_build_lean_miri_spec", step_cmd, effective_ram_mib=None))
                 self.assertEqual(len(probes()), asked)
+                # `lake_build_minirust_spec` asks its wrapper exactly like `lake_build_lean_miri_spec`.
+                self.assertEqual(threads("lake_build_minirust_spec", step_cmd), "1")
+                self.assertEqual(len(probes()), asked + 1)
+                reply.write_text(json.dumps({"memory_max_mb": 10240}), encoding="utf-8")
+                self.assertIsNone(threads("lake_build_minirust_spec", step_cmd))
             # The tightest ceiling wins in either direction, and an unreadable host probe
             # still leaves the wrapper's answer.
             reply.write_text(json.dumps({"memory_max_mb": 157253}), encoding="utf-8")
@@ -4433,6 +5498,342 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                     )
                 self.assertEqual(res["status"], "PASS", res.get("failure_excerpt"))
                 self.assertEqual(out_file.read_text(encoding="utf-8"), expected)
+
+    def test_probe_lean_run_reconciles_multi_slot_concurrency_and_skips_non_exec_flags(self) -> None:
+        # 1. On a multi-slot host (`build_slots > cli_concurrency`), `anneal-lean-run --probe`
+        #    evaluates at `--concurrency 1` while actual execution raises `w_eff` to
+        #    `build_slots` (unless `--exclusive`). `_probe_lean_run_memory_max_mib` must
+        #    re-probe at `build_slots` so `< 10 GiB` per-slot caps still trigger
+        #    `LEAN_NUM_THREADS=1` for `LOW_RAM_SINGLE_THREAD_STEPS`.
+        # 2. Non-executing / mutating wrapper flags (`--ensure-slice`, `--ensure`, `--probe`,
+        #    `--print-limits`, `-h`, `--help`) must return `None` without spawning the wrapper.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "bin/anneal-lean-run"
+            argv_log = root / "argv.jsonl"
+            wrapper.parent.mkdir()
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, os, sys
+                    args = sys.argv[1:]
+                    with open({str(argv_log)!r}, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(args) + "\\n")
+                    # Simulate a 3-slot host (~24 GiB live pool): w_eff=1 -> 21600 MiB (>= 10 GiB),
+                    # w_eff=3 -> 7200 MiB (< 10 GiB). Last `--concurrency` wins as in argparse.
+                    conc = 3
+                    i = 0
+                    while i < len(args):
+                        if args[i] == "--concurrency" and i + 1 < len(args):
+                            conc = int(args[i + 1])
+                            i += 2
+                            continue
+                        if args[i].startswith("--concurrency="):
+                            conc = int(args[i].split("=", 1)[1])
+                        i += 1
+                    if os.environ.get("FAIL_REPROBE") == "1" and conc == 3:
+                        sys.exit(2)
+                    sys.stdout.write(json.dumps({{
+                        "memory_max_mb": 21600 // conc,
+                        "w_eff": conc,
+                        "build_slots": 3,
+                    }}))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+            argv_log.write_text("", encoding="utf-8")
+
+            def probes() -> list[list[str]]:
+                return [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+
+            # Non-executing / mutating flags, `-h...` clusters, and empty inner commands never spawn the wrapper.
+            for non_exec in (
+                [str(wrapper)],
+                [str(wrapper), "--mode", "build"],
+                [str(wrapper), "--mode", "build", "--"],
+                [str(wrapper), "--ensure-slice"],
+                [str(wrapper), "--ensure", "--", "lake", "build"],
+                [str(wrapper), "--probe", "--json"],
+                [str(wrapper), "--print-limits"],
+                [str(wrapper), "-h"],
+                [str(wrapper), "-hW1", "--", "lake", "build"],
+                [str(wrapper), "--help"],
+            ):
+                self.assertIsNone(suite._probe_lean_run_memory_max_mib(non_exec), non_exec)
+            self.assertEqual(probes(), [])
+            # A `--help` after `--` belongs to the wrapped command, not the wrapper.
+            self.assertEqual(
+                suite._probe_lean_run_memory_max_mib(
+                    [str(wrapper), "--mode", "build", "--concurrency", "3", "--", "lake", "--help"]
+                ),
+                7200,
+            )
+            self.assertEqual(len(probes()), 1)
+
+            # `--concurrency 1` without `--exclusive` re-probes at `build_slots=3` -> 7200 MiB.
+            step_cmd = [
+                str(wrapper),
+                "--mode",
+                "build",
+                "--concurrency",
+                "1",
+                "--timeout",
+                "1800",
+                "--",
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec",
+            ]
+            before = len(probes())
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 7200)
+            new_probes = probes()[before:]
+            self.assertEqual(len(new_probes), 2)
+            self.assertEqual(new_probes[1][-4:], ["--concurrency", "3", "--probe", "--json"])
+
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=32768):
+                for step_name in ("lake_build_minirust_spec", "lake_build_lean_miri_spec"):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+                # A failed re-probe fails closed: neither the inflated 21600 MiB cap of the
+                # first probe nor `None` (which would leave only the 32 GiB host ceiling and
+                # keep the step multi-threaded), but the per-slot lower bound 21600 * 1 // 3.
+                self.assertEqual(
+                    suite._probe_lean_run_memory_max_mib(step_cmd, env={"FAIL_REPROBE": "1"}),
+                    7200,
+                )
+                for step_name in ("lake_build_minirust_spec", "lake_build_lean_miri_spec"):
+                    env = suite._build_step_env(
+                        step_name,
+                        base_env={"PATH": "/usr/bin", "FAIL_REPROBE": "1"},
+                        cmd=step_cmd,
+                        cwd=root,
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+                # With `--exclusive`, execution stays at `w_eff=1` (21600 MiB >= 10 GiB):
+                # even an older wrapper that reports `w_eff=3` on `--exclusive --concurrency 3`
+                # re-probes to `w_eff=1` (21600 MiB) and skips single-threading.
+                excl_cmd = [
+                    str(wrapper),
+                    "--mode",
+                    "build",
+                    "--exclusive",
+                    "--concurrency",
+                    "3",
+                    "--",
+                    "lake",
+                    "build",
+                    "MiniRustSpec",
+                ]
+                self.assertEqual(suite._probe_lean_run_memory_max_mib(excl_cmd), 21600)
+                excl_env = suite._build_step_env(
+                    "lake_build_minirust_spec", base_env={"PATH": "/usr/bin"}, cmd=excl_cmd, cwd=root
+                )
+                self.assertNotIn("LEAN_NUM_THREADS", excl_env)
+
+            # End-to-end against real `scripts/anneal-lean-run` on a synthetic 3-slot host
+            # (`w_file=3`, 24 GiB host RAM -> 18 GiB slice: w_eff=1 gives 16.2 GiB >= 10 GiB,
+            # while runtime w_eff=3 gives 5.4 GiB < 10 GiB).
+            xdg = root / "xdg"
+            (xdg / "anneal").mkdir(parents=True)
+            (xdg / "anneal/concurrency").write_text("3\n", encoding="utf-8")
+            meminfo = root / "meminfo"
+            meminfo.write_text(
+                f"MemTotal:       {24576 * 1024} kB\nMemAvailable:   {22528 * 1024} kB\n",
+                encoding="utf-8",
+            )
+            real_shim = root / "real_host_bin/anneal-lean-run"
+            real_shim.parent.mkdir()
+            real_shim.write_text(
+                f"#!{sys.executable}\n"
+                "import importlib.machinery, importlib.util, pathlib, sys\n"
+                "sys.dont_write_bytecode = True\n"
+                f"loader = importlib.machinery.SourceFileLoader('alr_ms', {os.fspath(REPO_ROOT / 'scripts/anneal-lean-run')!r})\n"
+                "spec = importlib.util.spec_from_loader(loader.name, loader)\n"
+                "mod = importlib.util.module_from_spec(spec)\n"
+                "loader.exec_module(mod)\n"
+                "orig = mod.probe_host_envelope\n"
+                f"mod.probe_host_envelope = lambda *a, **kw: orig(*a, meminfo_path=pathlib.Path({os.fspath(meminfo)!r}), "
+                f"cgroup_root=pathlib.Path({os.fspath(root / 'no_cg')!r}), proc_cgroup_path=pathlib.Path({os.fspath(root / 'no_proc_cg')!r}), "
+                "user_systemd_active=False, cpu_cores=24, **kw)\n"
+                "sys.exit(mod.main(sys.argv[1:]))\n",
+                encoding="utf-8",
+            )
+            real_shim.chmod(0o755)
+            real_cmd = [
+                os.fspath(real_shim),
+                "--mode",
+                "build",
+                "--concurrency",
+                "1",
+                "--timeout",
+                "1800",
+                "--",
+                "lake",
+                "--dir",
+                "examples",
+                "build",
+                "LeanMiriSpec",
+            ]
+            real_env = {"PATH": "/usr/bin", "XDG_CONFIG_HOME": os.fspath(xdg)}
+            real_cap = suite._probe_lean_run_memory_max_mib(real_cmd, env=real_env, cwd=root)
+            self.assertIsNotNone(real_cap)
+            assert real_cap is not None
+            self.assertLess(real_cap, suite.LEAN_MIRI_SPEC_SINGLE_THREAD_RAM_THRESHOLD_MIB)
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=22528):
+                step_env = suite._build_step_env(
+                    "lake_build_lean_miri_spec", base_env=real_env, cmd=real_cmd, cwd=root
+                )
+            self.assertEqual(step_env.get("LEAN_NUM_THREADS"), "1")
+
+    def test_probe_lean_run_failed_reprobe_reports_lower_bound_never_none(self) -> None:
+        # `_build_step_env` reads a `None` wrapper cap as "no wrapper cap". Once the first
+        # probe has shown that the wrapper executes at another concurrency, a failed or
+        # unusable re-probe must therefore still answer with a lower bound on the cap the
+        # command will really get, so a low-RAM step is never left multi-threaded.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wrapper = root / "bin/anneal-lean-run"
+            table = root / "replies.json"
+            argv_log = root / "argv.jsonl"
+            wrapper.parent.mkdir()
+            # Replies are keyed by the last `--concurrency` / `-W` on the command line
+            # (argparse's last-wins rule); `"exit:<n>"` makes that probe fail.
+            wrapper.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json, sys
+                    args = sys.argv[1:]
+                    with open({str(argv_log)!r}, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(args) + "\\n")
+                    conc = "unset"
+                    for i, arg in enumerate(args):
+                        if arg in ("--concurrency", "-W") and i + 1 < len(args):
+                            conc = args[i + 1]
+                        elif arg.startswith("--concurrency="):
+                            conc = arg.split("=", 1)[1]
+                    with open({str(table)!r}, encoding="utf-8") as fh:
+                        reply = json.load(fh)[conc]
+                    if isinstance(reply, str) and reply.startswith("exit:"):
+                        sys.exit(int(reply[5:]))
+                    sys.stdout.write(reply if isinstance(reply, str) else json.dumps(reply))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wrapper.chmod(0o755)
+
+            def probe(wrapper_opts: list[str], replies: dict[str, object]) -> tuple[int | None, list[list[str]]]:
+                table.write_text(json.dumps(replies), encoding="utf-8")
+                argv_log.write_text("", encoding="utf-8")
+                cmd = [str(wrapper), "--mode", "build", *wrapper_opts, "--", "lake", "build", "MiniRustSpec"]
+                cap = suite._probe_lean_run_memory_max_mib(cmd)
+                calls = [json.loads(line) for line in argv_log.read_text(encoding="utf-8").splitlines()]
+                return cap, calls
+
+            def first(mem: int, w_eff: int, slots: int) -> dict[str, int]:
+                return {"memory_max_mb": mem, "w_eff": w_eff, "build_slots": slots}
+
+            # 1. Non-exclusive: execution runs at `build_slots`, so the pool is split
+            #    `build_slots / w_eff` ways further than the first probe planned.
+            for spelling in (["--concurrency", "1"], ["--concurrency=1"], ["-W", "1"]):
+                for bad_reprobe in (
+                    "exit:2",
+                    "not json",
+                    "[]",
+                    {"w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": 0, "w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": True, "w_eff": 3, "build_slots": 3},
+                    {"memory_max_mb": "7200", "w_eff": 3, "build_slots": 3},
+                ):
+                    cap, calls = probe(spelling, {"1": first(21600, 1, 3), "3": bad_reprobe})
+                    self.assertEqual(cap, 7200, (spelling, bad_reprobe))
+                    self.assertEqual(len(calls), 2, (spelling, bad_reprobe))
+                    self.assertEqual(calls[1][-4:], ["--concurrency", "3", "--probe", "--json"])
+                # A usable re-probe is still taken verbatim, above or below that bound.
+                for runtime_mem in (6100, 7200, 9000):
+                    cap, _calls = probe(spelling, {"1": first(21600, 1, 3), "3": first(runtime_mem, 3, 3)})
+                    self.assertEqual(cap, runtime_mem, spelling)
+            # The bound scales by `w_eff / build_slots`, rounds down, and stays positive.
+            cap, _calls = probe(["--concurrency", "2"], {"2": first(20001, 2, 3), "3": "exit:1"})
+            self.assertEqual(cap, 13334)
+            cap, _calls = probe(["--concurrency", "1"], {"1": first(2, 1, 4), "4": "exit:1"})
+            self.assertEqual(cap, 1)
+
+            # 2. `--exclusive` on an older wrapper whose probe ignored it: execution runs at
+            #    `w_eff = 1`, so the first cap (planned for 3 slots) is already a lower bound.
+            cap, calls = probe(["--exclusive", "--concurrency", "3"], {"3": first(7200, 3, 3), "1": "exit:2"})
+            self.assertEqual(cap, 7200)
+            self.assertEqual(calls[1][-4:], ["--concurrency", "1", "--probe", "--json"])
+            cap, _calls = probe(
+                ["--exclusive", "--concurrency", "3"], {"3": first(7200, 3, 3), "1": {"w_eff": 1}}
+            )
+            self.assertEqual(cap, 7200)
+
+            # 3. A first probe without a usable cap is no answer, and is not re-probed.
+            for unusable in ({"w_eff": 1, "build_slots": 3}, {"memory_max_mb": 0, "w_eff": 1, "build_slots": 3}):
+                cap, calls = probe(["--concurrency", "1"], {"1": unusable, "3": first(7200, 3, 3)})
+                self.assertIsNone(cap, unusable)
+                self.assertEqual(len(calls), 1, unusable)
+            # Nor is a consistent one (`w_eff >= build_slots`, or no concurrency fields).
+            for consistent in (first(7200, 3, 3), first(5400, 4, 3), {"memory_max_mb": 7200}):
+                cap, calls = probe(["--concurrency", "1"], {"1": consistent})
+                self.assertEqual(cap, consistent["memory_max_mb"], consistent)
+                self.assertEqual(len(calls), 1, consistent)
+
+            # 4. The regression itself: a 9000 MiB first answer is already below 10 GiB, so
+            #    the cap at two slots is too. With the re-probe failing, both low-RAM steps
+            #    must stay single-threaded on a host whose own ceiling is 32 GiB.
+            table.write_text(json.dumps({"1": first(9000, 1, 2), "2": "exit:2"}), encoding="utf-8")
+            step_cmd = [str(wrapper), "--mode", "build", "--concurrency", "1", "--", "lake", "build", "MiniRustSpec"]
+            self.assertEqual(suite._probe_lean_run_memory_max_mib(step_cmd), 4500)
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=32768):
+                for step_name in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+                # The vendored `Miri` build is not a low-RAM step and never asks the wrapper.
+                argv_log.write_text("", encoding="utf-8")
+                env = suite._build_step_env(
+                    "lake_build_examples_miri_vendor", base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                )
+                self.assertNotIn("LEAN_NUM_THREADS", env)
+                self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
+
+            # 5. If `build_slots` grows between probe 1 and probe 2 (so the re-probe still
+            #    reports `w_eff < build_slots`), clamp fail-closed without a 3rd probe.
+            cap, calls = probe(["--concurrency", "1"], {"1": first(21600, 1, 2), "2": first(12000, 2, 4)})
+            self.assertEqual(cap, 6000)
+            self.assertEqual(len(calls), 2)
+
+            # 6. Short-circuit: when the host/cgroup ceiling is already `< 10 GiB`,
+            #    `_build_step_env` single-threads immediately without spawning the wrapper.
+            table.write_text(json.dumps({"1": first(21600, 1, 3), "3": first(7200, 3, 3)}), encoding="utf-8")
+            argv_log.write_text("", encoding="utf-8")
+            with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=8192):
+                for step_name in sorted(suite.LOW_RAM_SINGLE_THREAD_STEPS):
+                    env = suite._build_step_env(
+                        step_name, base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                    self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", step_name)
+            self.assertEqual(argv_log.read_text(encoding="utf-8"), "")
+            # At `>= 10 GiB` or non-integer (`None` / `bool`) host ceiling, the wrapper IS still probed.
+            for host_mib in (10240, None, True):
+                argv_log.write_text("", encoding="utf-8")
+                with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=host_mib):
+                    env = suite._build_step_env(
+                        "lake_build_minirust_spec", base_env={"PATH": "/usr/bin"}, cmd=step_cmd, cwd=root
+                    )
+                self.assertEqual(env.get("LEAN_NUM_THREADS"), "1", host_mib)
+                self.assertEqual(len(argv_log.read_text(encoding="utf-8").splitlines()), 2, host_mib)
 
     def test_resolve_anneal_lean_run_anchors_relative_candidates(self) -> None:
         # Steps run with `cwd=repo_root`; a relative `ANNEAL_LEAN_RUN` or `PATH` entry that
@@ -4494,8 +5895,8 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             canonical_wrapped = {
                 name for name, (cmd, _t) in canonical.items() if Path(cmd[0]).name == "anneal-lean-run"
             }
-            self.assertEqual(len(canonical), 27)
-            self.assertEqual(len(canonical_wrapped), 19)
+            self.assertEqual(len(canonical), 29)
+            self.assertEqual(len(canonical_wrapped), 21)
 
             with mock.patch.dict(os.environ, {"ANNEAL_LEAN_RUN": os.fspath(renamed), "LEAN_NUM_THREADS": "7"}):
                 steps = suite.build_suite_steps(REPO_ROOT, "nightly")
@@ -4520,11 +5921,24 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
                 miri_cmd = next(cmd for name, _c, cmd, _t in steps if name == "lake_build_lean_miri_spec")
                 self.assertEqual(suite._outer_timeout_sec(miri_cmd, 1800), 2 * 1800 + suite.WRAPPER_TIMEOUT_GRACE_SEC)
                 self.assertEqual(suite._probe_lean_run_memory_max_mib(miri_cmd), 5712)
+                by_step = {name: cmd for name, _c, cmd, _t in steps}
                 with mock.patch.object(suite, "_probe_effective_ram_ceiling_mib", return_value=65536):
                     step_env = suite._build_step_env("lake_build_lean_miri_spec", cmd=miri_cmd, cwd=root)
-                    other_env = suite._build_step_env("lake_build_minirust_spec", cmd=miri_cmd, cwd=root)
+                    minirust_env = suite._build_step_env(
+                        "lake_build_minirust_spec", cmd=by_step["lake_build_minirust_spec"], cwd=root
+                    )
+                    # Negative controls: steps the low-RAM policy does not right-size keep the
+                    # ambient thread count although the same wrapper plans the same 5712 MiB cap.
+                    vendor_env = suite._build_step_env(
+                        "lake_build_examples_miri_vendor", cmd=by_step["lake_build_examples_miri_vendor"], cwd=root
+                    )
+                    corr_env = suite._build_step_env(
+                        "lake_build_correspondence", cmd=by_step["lake_build_correspondence"], cwd=root
+                    )
                 self.assertEqual(step_env["LEAN_NUM_THREADS"], "1")
-                self.assertEqual(other_env["LEAN_NUM_THREADS"], "7")
+                self.assertEqual(minirust_env["LEAN_NUM_THREADS"], "1")
+                self.assertEqual(vendor_env["LEAN_NUM_THREADS"], "7")
+                self.assertEqual(corr_env["LEAN_NUM_THREADS"], "7")
                 self.assertEqual(os.environ["LEAN_NUM_THREADS"], "7")
                 # End to end: the wrapped step itself sees the right-sized thread count.
                 out_file = root / "threads.txt"
@@ -4700,6 +6114,195 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
             expected = wrapper.detect_mode(inner, "auto")
             self.assertEqual(suite._lean_run_wrapper_flags([lr, "--", *inner])[0], expected, inner)
             self.assertEqual(suite._lean_run_wrapper_flags([lr, *inner])[0], expected, inner)
+
+    def test_wrapper_option_tables_and_memory_probe_match_the_in_repo_wrapper(self) -> None:
+        # `_LEAN_RUN_VALUE_OPTS` / `_LEAN_RUN_BOOL_OPTS` / `_LEAN_RUN_NON_EXEC_OPTS` are a copy of
+        # the wrapper's `build_parser()`, and the two-probe protocol of
+        # `_probe_lean_run_memory_max_mib` mirrors its `resolve_effective_concurrency`. The other
+        # probe tests answer from a hand-written table, which encodes what the suite assumes
+        # about the wrapper. Here the in-repo wrapper's own parser and memory envelope answer
+        # (in process, no subprocess), so neither copy can drift silently.
+        loader = importlib.machinery.SourceFileLoader(
+            "anneal_lean_run_probe_under_test", os.fspath(REPO_ROOT / "scripts/anneal-lean-run")
+        )
+        wrapper = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        with mock.patch.object(sys, "dont_write_bytecode", True):
+            loader.exec_module(wrapper)
+        # `build_parser` reads `ANNEAL_LEAN_MEMORY_MAX_MB` / `ANNEAL_LEAN_TIMEOUT_SEC` defaults.
+        with mock.patch.dict(os.environ, clear=True):
+            parser = wrapper.build_parser()
+
+        # 1. Option tables: every wrapper option, split by whether it takes a value, and the
+        #    ones after which the wrapper never runs the wrapped command.
+        actions = parser._option_string_actions
+        self.assertEqual({o for o, a in actions.items() if a.nargs != 0}, set(suite._LEAN_RUN_VALUE_OPTS))
+        self.assertEqual({o for o, a in actions.items() if a.nargs == 0}, set(suite._LEAN_RUN_BOOL_OPTS))
+        self.assertEqual(
+            {o for o, a in actions.items() if a.dest in ("help", "probe", "ensure_slice")},
+            set(suite._LEAN_RUN_NON_EXEC_OPTS),
+        )
+
+        def parse(argv: list[str]):
+            """The wrapper's parsed arguments, or its `SystemExit` code (help: 0, usage error: 2)."""
+            try:
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                    return parser.parse_args(argv)
+            except SystemExit as exc:
+                return int(exc.code or 0)
+
+        def make_host(mem_total: int, mem_avail: int, cores: int, c_high: int | None) -> dict:
+            ancestors = (
+                []
+                if c_high is None
+                else [
+                    {
+                        "path": "/sys/fs/cgroup/user.slice",
+                        "name": "user.slice",
+                        "c_high_mb": c_high,
+                        "w_mb": 512,
+                        "is_shared_user_slice": False,
+                    }
+                ]
+            )
+            return dict(cpu_cores=cores, mem_total_mb=mem_total, mem_avail_mb=mem_avail, ancestors=ancestors)
+
+        def plan(host: dict, w_file: int | None, args, mode: str, is_probe: bool) -> dict:
+            return wrapper.compute_workload_memory_envelope(
+                **host,
+                w_file=w_file,
+                cli_concurrency=args.concurrency,
+                exclusive=args.exclusive,
+                is_probe=is_probe,
+                mode=mode,
+                override_mem_mb=args.memory_max_mb,
+                override_timeout_sec=args.timeout,
+                unsafe_ignore_cgroup=args.unsafe_ignore_cgroup,
+            )
+
+        # What the fake `subprocess.run` answers: `w_files[k]` is the host's concurrency file
+        # at the k-th probe (the last entry repeats), and probes from `fail_from` on exit 1.
+        state: dict = {"host": make_host(65536, 60000, 32, None), "w_files": [None], "fail_from": None}
+        calls: list[list[str]] = []
+
+        def fake_run(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            calls.append(list(argv))
+            if state["fail_from"] is not None and len(calls) >= state["fail_from"]:
+                return subprocess.CompletedProcess(argv, 1, "", "probe failed")
+            args = parse(list(argv[1:]))
+            if isinstance(args, int):
+                return subprocess.CompletedProcess(argv, args, "usage: anneal-lean-run", "")
+            # Every probe the suite spawns is a pure `--probe --json` with no wrapped command.
+            self.assertTrue(args.probe and args.json and not args.ensure_slice and not args.cmd, argv)
+            w_file = state["w_files"][min(len(calls), len(state["w_files"])) - 1]
+            limits = plan(state["host"], w_file, args, wrapper.detect_mode([], args.mode), True)
+            return subprocess.CompletedProcess(argv, 0, json.dumps(limits), "")
+
+        def probe(cmd: list[str]) -> int | None:
+            calls.clear()
+            with mock.patch.object(suite.subprocess, "run", side_effect=fake_run):
+                return suite._probe_lean_run_memory_max_mib(cmd, env={})
+
+        lr = "/opt/bin/anneal-lean-run"
+
+        # 2. The suite reports a cap exactly when the wrapper would run the wrapped command, and
+        #    never spawns it for help / `--probe` / `--ensure-slice` (which mutates systemd units).
+        for opts in (
+            ["-h"],
+            ["-hW1"],
+            ["--he"],
+            ["--probe"],
+            ["--pro"],
+            ["--print"],
+            ["--ensure"],
+            ["--ens", "--json"],
+            ["--pr"],  # Ambiguous abbreviations and bad values: the wrapper exits 2.
+            ["--e"],
+            ["--no"],
+            ["--m", "file"],
+            ["--mode", "bogus"],
+            ["-W", "x"],
+            ["-W", "--ensure-slice"],
+            ["--mode", "-h"],
+            ["--timeout", "--ensure-slice"],
+            ["--", "--ensure-slice"],
+            [],
+            ["--json"],
+            ["--ex"],
+            ["-W", "2"],
+            ["-W2"],
+            ["-W=2"],
+            ["--conc=2"],
+            ["--mode=file"],
+            ["--nested", "--no-s", "--no-o"],
+            ["--t", "5", "--me", "9000", "--u"],
+        ):
+            for tail in (["--", "lake", "build"], ["lake", "build"], ["--"], []):
+                parsed = parse([*opts, *tail])
+                executes = (
+                    not isinstance(parsed, int)
+                    and not parsed.probe
+                    and not parsed.ensure_slice
+                    and bool(parsed.cmd[1:] if parsed.cmd[:1] == ["--"] else parsed.cmd)
+                )
+                got = probe([lr, *opts, *tail])
+                self.assertEqual(got is not None, executes, (opts, tail))
+                if parsed == 0 or (not isinstance(parsed, int) and not executes):
+                    self.assertEqual(calls, [], (opts, tail))
+
+        # 3. The cap the suite derives is the `MemoryMax` the wrapper executes with, in at most
+        #    two probes. When only the re-probe fails, or the host's concurrency file changes
+        #    between the two probes, it is still at most that `MemoryMax` (fail-closed: callers
+        #    single-thread below a threshold).
+        reprobed = clamped = 0
+        for host in (
+            make_host(16384, 14000, 8, None),
+            make_host(65536, 60000, 32, None),
+            make_host(65536, 60000, 32, 49152),
+            make_host(262144, 200000, 96, 131072),
+        ):
+            for w_file in (None, 1, 2, 4):
+                for cli_opts in (
+                    [],
+                    ["--concurrency", "1"],
+                    ["-W2"],
+                    ["--conc=3"],
+                    ["--concurrency", "1", "--exclusive"],
+                    ["--concurrency", "3", "--exclusive"],
+                ):
+                    for inner in (["lake", "build", "MiniRustSpec"], ["lake", "env", "lean", "Foo.lean"]):
+                        for extra in ([], ["--memory-max-mb", "9000"]):
+                            cmd = [lr, *cli_opts, *extra, "--timeout", "900", "--", *inner]
+                            case = (host["mem_total_mb"], bool(host["ancestors"]), w_file, cli_opts, inner[1], extra)
+                            args = parse(cmd[1:])
+                            mode = wrapper.detect_mode(inner, args.mode)
+
+                            def executed_cap(w_file_at_exec: int | None) -> int:
+                                return plan(host, w_file_at_exec, args, mode, False)["memory_max_mb"]
+
+                            want = executed_cap(w_file)
+                            self.assertGreater(want, 0, case)
+                            state.update(host=host, w_files=[w_file], fail_from=None)
+                            self.assertEqual(probe(cmd), want, case)
+                            self.assertLessEqual(len(calls), 2, case)
+                            if len(calls) < 2:
+                                continue
+                            reprobed += 1
+                            self.assertIsNotNone(w_file, case)
+
+                            state.update(fail_from=2)
+                            low = probe(cmd)
+                            self.assertIsNotNone(low, case)
+                            self.assertTrue(1 <= low <= want, (case, low, want))
+
+                            for drifted in (w_file + 2, max(1, w_file - 1)):
+                                state.update(w_files=[w_file, drifted], fail_from=None)
+                                got = probe(cmd)
+                                self.assertEqual(len(calls), 2, case)
+                                self.assertIsNotNone(got, case)
+                                self.assertLessEqual(got, executed_cap(drifted), (case, drifted))
+                                clamped += executed_cap(drifted) < want and got < want
+        self.assertGreater(reprobed, 0)
+        self.assertGreater(clamped, 0)
 
     def test_run_step_survives_real_wrapper_slot_contention_exceeding_step_budget(self) -> None:
         # End-to-end verification under real `flock` build-slot contention using the actual
@@ -4908,7 +6511,7 @@ class NightlyVerificationSuiteTests(unittest.TestCase):
 
     def test_domain_integration_tests_anneal_difftest_config_and_timeout_invariants(self) -> None:
         nightly_steps = suite.build_suite_steps(REPO_ROOT, "nightly")
-        self.assertEqual(len(nightly_steps), 27)
+        self.assertEqual(len(nightly_steps), 29)
         for step in nightly_steps:
             self.assertEqual(len(step), 4)
         by_name = {name: (cat, cmd, timeout) for name, cat, cmd, timeout in nightly_steps}

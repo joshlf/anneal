@@ -937,10 +937,10 @@ class TestCliAndLimits(unittest.TestCase):
         self.assertTrue(kwargs.get("start_new_session"))
         self.assertEqual(kwargs["env"]["ANNEAL_LEAN_RUN_IN_SCOPE"], "1")
         self.assertEqual(kwargs["env"]["ANNEAL_LEAN_RUN_ACTIVE"], "1")
-        self.assertEqual(
-            kwargs["env"]["LEAN_NUM_THREADS"],
-            os.environ.get("LEAN_NUM_THREADS", str(limits["threads"])),
+        expected_lean_threads = str(
+            alr._resolve_thread_env(limits["threads"], limits["is_cg_capped"])["LEAN_NUM_THREADS"]
         )
+        self.assertEqual(kwargs["env"]["LEAN_NUM_THREADS"], expected_lean_threads)
 
     def test_run_bounded_command_success_and_timeout(self) -> None:
         rc_file = alr.main(
@@ -1179,6 +1179,448 @@ class TestCliAndLimits(unittest.TestCase):
         self.assertIn("terminated by the OS memory guard", err)
         self.assertIn("MemorySwapMax=0", err)
         self.assertIn("Cgroup v2 Snapshot : anon+shmem=1234M, file=5678M", err)
+
+
+class TestCallerLoweredThreadCount(unittest.TestCase):
+    """A caller's lower positive `LEAN_NUM_THREADS` is what the command runs with and what
+    the timeout / OOM diagnostics report, never the envelope's larger thread budget."""
+
+    THREAD_VARS = ("LEAN_NUM_THREADS", "CARGO_BUILD_JOBS", "RAYON_NUM_THREADS")
+
+    def _limits(self, cpu_cores: int, mode: str = "file", **overrides: Any) -> dict[str, Any]:
+        """Synthetic uncapped host envelope whose thread budget is `cpu_cores`."""
+        limits = alr.compute_workload_memory_envelope(
+            cpu_cores=cpu_cores,
+            mem_total_mb=262144,
+            mem_avail_mb=200000,
+            user_systemd_active=False,
+            cli_concurrency=1,
+            mode=mode,
+        )
+        self.assertEqual(limits["threads"], cpu_cores)
+        self.assertFalse(limits["is_cg_capped"])
+        self.assertFalse(limits["user_systemd_active"])
+        limits.update(overrides)
+        return limits
+
+    def _run(
+        self,
+        limits: dict[str, Any] | list[dict[str, Any]],
+        argv: list[str],
+        thread_env: dict[str, str],
+        *,
+        direct: bool = False,
+    ) -> tuple[int, str, list[dict[str, str]]]:
+        """Runs `alr.main(argv)` (or `run_bounded_command` when `direct`) against synthetic
+        `limits` with exactly `thread_env` of the three thread variables exported.
+
+        Returns `(exit code, stderr, environments of the launched commands)`."""
+        real_popen = subprocess.Popen
+        child_envs: list[dict[str, str]] = []
+
+        def spy_popen(popen_argv: Any, *args: Any, **kwargs: Any) -> Any:
+            env = kwargs.get("env")
+            if env is not None and env.get("ANNEAL_LEAN_RUN_IN_SCOPE") == "1":
+                child_envs.append(dict(env))
+            return real_popen(popen_argv, *args, **kwargs)
+
+        probe_replies = [dict(lim) for lim in (limits if isinstance(limits, list) else [limits])]
+        probe_calls = 0
+
+        def fake_probe(**kwargs: Any) -> dict[str, Any]:
+            nonlocal probe_calls
+            reply = dict(probe_replies[min(probe_calls, len(probe_replies) - 1)])
+            probe_calls += 1
+            # Like the real probe, honor `--timeout` (`override_timeout_sec`).
+            override_timeout = kwargs.get("override_timeout_sec")
+            if override_timeout is not None and override_timeout > 0:
+                reply["timeout_sec"] = int(override_timeout)
+            return reply
+
+        err_buf = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(os.environ, thread_env))
+            for var in self.THREAD_VARS:
+                if var not in thread_env:
+                    os.environ.pop(var, None)
+            stack.enter_context(mock.patch.object(alr, "probe_host_envelope", side_effect=fake_probe))
+            stack.enter_context(
+                mock.patch.object(alr, "probe_cgroup_v2_memory", return_value=dict(FAKE_CGROUP_INFO))
+            )
+            stack.enter_context(mock.patch.object(alr, "stamp_last_oom"))
+            stack.enter_context(mock.patch.object(alr, "_try_oom_offload", return_value=None))
+            stack.enter_context(mock.patch.object(alr.subprocess, "Popen", side_effect=spy_popen))
+            stack.enter_context(mock.patch("sys.stderr", err_buf))
+            if direct:
+                rc = alr.run_bounded_command(
+                    argv,
+                    probe_replies[0],
+                    use_slot_lock=False,
+                    probe_fn=fake_probe,
+                    evict_fn=lambda _limits: True,
+                )
+            else:
+                rc = alr.main(argv)
+        return rc, err_buf.getvalue(), child_envs
+
+    def test_oversized_thread_counts_fall_back_to_the_budget_without_raising(self) -> None:
+        parse = alr._parse_positive_thread_count
+        limit = alr._MAX_THREAD_COUNT_DIGITS
+        self.assertEqual(limit, 9)
+        # Up to `limit` significant digits parse; leading zeros are not significant.
+        self.assertEqual(parse("9" * limit), 10**limit - 1)
+        self.assertEqual(parse("0" * 5000 + "8"), 8)
+        self.assertEqual(parse(" 007 "), 7)
+        # All-zero strings of any length are not positive.
+        for zeros in ("0", "000", "0" * 5000):
+            self.assertIsNone(parse(zeros), len(zeros))
+        # One digit more overflows the tools' 32-bit job counts, and past
+        # `sys.get_int_max_str_digits()` (4300) digits `int()` raises `ValueError`.
+        oversized = ("1" + "0" * limit, "9" * 4300, "9" * 4301, "9" * 20000, "0" * 3 + "9" * 5000)
+        for raw in oversized:
+            self.assertIsNone(parse(raw), len(raw))
+        for capped in (False, True):
+            for raw in oversized:
+                env = dict.fromkeys(self.THREAD_VARS, raw)
+                self.assertEqual(
+                    alr._resolve_thread_env(3, capped, env),
+                    dict.fromkeys(self.THREAD_VARS, 3),
+                    (capped, len(raw)),
+                )
+                self.assertEqual(alr.format_threads_diagnostic(3, env), "threads=3", (capped, len(raw)))
+        # The child environment never carries the oversized value through.
+        with mock.patch.dict(os.environ, dict.fromkeys(self.THREAD_VARS, "9" * 5000)):
+            child = alr._build_child_env(
+                threads=4,
+                lean_m_mb=1024,
+                is_cg_capped=False,
+                runtime_base=Path("/tmp"),
+                user_systemd_sock_alive=False,
+            )
+        self.assertEqual({var: child[var] for var in self.THREAD_VARS}, dict.fromkeys(self.THREAD_VARS, "4"))
+
+    def test_resolve_thread_env_keeps_lower_positive_caller_values(self) -> None:
+        resolve = alr._resolve_thread_env
+        self.assertEqual(alr._THREAD_ENV_VARS, self.THREAD_VARS)
+        for capped in (False, True):
+            for budget in (1, 3, 64):
+                at_budget = dict.fromkeys(self.THREAD_VARS, budget)
+                # Unset, blank, non-numeric, zero, negative, signed, underscore, non-ASCII
+                # digit, or non-ASCII whitespace values: fall back to the envelope's budget.
+                self.assertEqual(resolve(budget, capped, {}), at_budget)
+                for raw in (
+                    "",
+                    "   ",
+                    "abc",
+                    "1.5",
+                    "0",
+                    "-2",
+                    "+1",
+                    "1_2",
+                    "\u0661",
+                    "\u00a01\u00a0",
+                    "\u20032",
+                    "\u30004",
+                    "\x851",
+                ):
+                    env = dict.fromkeys(self.THREAD_VARS, raw)
+                    self.assertEqual(resolve(budget, capped, env), at_budget, (capped, budget, raw))
+                # A positive value at or below the budget always wins, in both regimes.
+                for raw, want in (("1", 1), (" 1 ", 1), (str(budget), budget)):
+                    env = dict.fromkeys(self.THREAD_VARS, raw)
+                    self.assertEqual(
+                        resolve(budget, capped, env),
+                        dict.fromkeys(self.THREAD_VARS, want),
+                        (capped, budget, raw),
+                    )
+        # Defensive clamp: a non-positive budget still yields at least 1 thread.
+        for bad_budget in (0, -3):
+            self.assertEqual(resolve(bad_budget, True, {}), dict.fromkeys(self.THREAD_VARS, 1))
+            self.assertEqual(
+                resolve(bad_budget, True, {"LEAN_NUM_THREADS": "4"}),
+                dict.fromkeys(self.THREAD_VARS, 1),
+            )
+            self.assertEqual(alr.format_threads_diagnostic(bad_budget, None), "threads=1")
+            self.assertEqual(
+                alr.format_threads_diagnostic(bad_budget, {"LEAN_NUM_THREADS": "4"}),
+                "threads=4, thread_budget=1",
+            )
+        # A value above the budget is clamped on a memory-capped slice only.
+        self.assertEqual(resolve(3, True, {"LEAN_NUM_THREADS": "64"})["LEAN_NUM_THREADS"], 3)
+        self.assertEqual(resolve(3, False, {"LEAN_NUM_THREADS": "64"})["LEAN_NUM_THREADS"], 64)
+        # Each variable is resolved on its own.
+        self.assertEqual(
+            resolve(8, True, {"LEAN_NUM_THREADS": "1", "CARGO_BUILD_JOBS": "4"}),
+            {"LEAN_NUM_THREADS": 1, "CARGO_BUILD_JOBS": 4, "RAYON_NUM_THREADS": 8},
+        )
+        # Default source is the ambient environment, which is only read.
+        with mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "1"}):
+            for var in self.THREAD_VARS[1:]:
+                os.environ.pop(var, None)
+            before = dict(os.environ)
+            self.assertEqual(
+                resolve(64, False),
+                {"LEAN_NUM_THREADS": 1, "CARGO_BUILD_JOBS": 64, "RAYON_NUM_THREADS": 64},
+            )
+            self.assertEqual(dict(os.environ), before)
+
+    def test_build_child_env_and_diagnostic_field_report_the_lowered_count(self) -> None:
+        for budget in (3, 64):
+            for capped in (False, True):
+                base_env = {"PATH": "/usr/bin", "LEAN_NUM_THREADS": "1"}
+                env = alr._build_child_env(
+                    threads=budget,
+                    lean_m_mb=1024,
+                    is_cg_capped=capped,
+                    runtime_base=Path("/tmp"),
+                    user_systemd_sock_alive=False,
+                    base_env=base_env,
+                )
+                self.assertEqual(base_env, {"PATH": "/usr/bin", "LEAN_NUM_THREADS": "1"})
+                self.assertEqual(env["LEAN_NUM_THREADS"], "1")
+                self.assertEqual(env["CARGO_BUILD_JOBS"], str(budget))
+                self.assertEqual(env["RAYON_NUM_THREADS"], str(budget))
+                self.assertEqual(
+                    alr.format_threads_diagnostic(budget, env), f"threads=1, thread_budget={budget}"
+                )
+        # No caller value: the budget itself, with no separate budget field.
+        env = alr._build_child_env(
+            threads=3,
+            lean_m_mb=1024,
+            is_cg_capped=True,
+            runtime_base=Path("/tmp"),
+            user_systemd_sock_alive=False,
+            base_env={"PATH": "/usr/bin"},
+        )
+        self.assertEqual([env[var] for var in self.THREAD_VARS], ["3", "3", "3"])
+        self.assertEqual(alr.format_threads_diagnostic(3, env), "threads=3")
+        # A larger caller value: clamped (and reported as the budget) on a capped slice,
+        # kept (and reported with the budget next to it) on an uncapped host.
+        for capped, lean_threads, diag in (
+            (True, "3", "threads=3"),
+            (False, "64", "threads=64, thread_budget=3"),
+        ):
+            env = alr._build_child_env(
+                threads=3,
+                lean_m_mb=1024,
+                is_cg_capped=capped,
+                runtime_base=Path("/tmp"),
+                user_systemd_sock_alive=False,
+                base_env={"PATH": "/usr/bin", "LEAN_NUM_THREADS": "64"},
+            )
+            self.assertEqual(env["LEAN_NUM_THREADS"], lean_threads)
+            self.assertEqual(alr.format_threads_diagnostic(3, env), diag)
+        # Without a usable child value the field falls back to the budget.
+        for child_env in (
+            None,
+            {},
+            {"LEAN_NUM_THREADS": ""},
+            {"LEAN_NUM_THREADS": "x"},
+            {"LEAN_NUM_THREADS": "0"},
+            {"LEAN_NUM_THREADS": "-1"},
+            {"LEAN_NUM_THREADS": "+1"},
+            {"LEAN_NUM_THREADS": "1_2"},
+            {"LEAN_NUM_THREADS": "\u0661"},
+            {"LEAN_NUM_THREADS": "\u00a01\u00a0"},
+            {"LEAN_NUM_THREADS": "\u20031"},
+        ):
+            self.assertEqual(alr.format_threads_diagnostic(3, child_env), "threads=3", child_env)
+
+    def test_cpu_quota_stays_at_the_thread_budget(self) -> None:
+        with mock.patch.dict(os.environ, {"LEAN_NUM_THREADS": "1"}), mock.patch.object(
+            alr, "_find_systemd_run", return_value="/usr/bin/systemd-run"
+        ):
+            argv, in_scope = alr._build_scope_launch_cmd(
+                ["lake", "build"],
+                b_max_mb=4096,
+                threads=64,
+                timeout_sec=60,
+                user_systemd_active=True,
+                unit_name="anneal-run-test.scope",
+            )
+        self.assertTrue(in_scope)
+        self.assertIn("CPUQuota=6400%", argv)
+        self.assertEqual([a for a in argv if a.startswith("CPUQuota=")], ["CPUQuota=6400%"])
+
+    def test_timeout_diagnostic_logs_caller_lowered_lean_num_threads(self) -> None:
+        sleeper = ["--mode", "file", "--timeout", "1", "--no-slot-lock", "--", "sleep", "30"]
+        for budget in (3, 64):
+            rc, err, child_envs = self._run(self._limits(budget), sleeper, {"LEAN_NUM_THREADS": "1"})
+            self.assertEqual(rc, 124)
+            self.assertEqual(len(child_envs), 1)
+            self.assertEqual(child_envs[0]["LEAN_NUM_THREADS"], "1")
+            self.assertEqual(child_envs[0]["CARGO_BUILD_JOBS"], str(budget))
+            self.assertIn("Command timed out after 1s (mode=file, MemoryMax=", err)
+            self.assertIn(f"M, threads=1, thread_budget={budget}).\n", err)
+            self.assertNotIn(f"threads={budget}", err)
+            self.assertEqual(re.findall(r"\bthreads=(\d+)", err), ["1"])
+
+    def test_timeout_diagnostic_without_caller_value_logs_the_budget(self) -> None:
+        sleeper = ["--mode", "file", "--timeout", "1", "--no-slot-lock", "--", "sleep", "30"]
+        rc, err, child_envs = self._run(self._limits(3), sleeper, {})
+        self.assertEqual(rc, 124)
+        self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], ["3"])
+        self.assertIn("M, threads=3).\n", err)
+        self.assertNotIn("thread_budget", err)
+
+    def test_timeout_diagnostic_on_capped_slice_clamps_high_and_rejects_invalid(self) -> None:
+        sleeper = ["--mode", "file", "--timeout", "1", "--no-slot-lock", "--", "sleep", "30"]
+        capped = self._limits(3, is_cg_capped=True)
+        for thread_env, want_threads, want_field in (
+            ({"LEAN_NUM_THREADS": "1"}, "1", "threads=1, thread_budget=3"),
+            ({"LEAN_NUM_THREADS": "64"}, "3", "threads=3"),
+            ({"LEAN_NUM_THREADS": "1_2"}, "3", "threads=3"),
+        ):
+            rc, err, child_envs = self._run(capped, sleeper, thread_env)
+            self.assertEqual(rc, 124, thread_env)
+            self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], [want_threads], thread_env)
+            self.assertIn(f"M, {want_field}).\n", err, thread_env)
+            self.assertEqual(re.findall(r"\bthreads=(\d+)", err), [want_threads], thread_env)
+
+    def test_pressure_abort_diagnostic_logs_effective_lean_num_threads(self) -> None:
+        # Watchdog ancestor-pressure aborts report the same effective thread count as
+        # timeout / OOM diagnostics.
+        capped = self._limits(
+            3,
+            mode="build",
+            is_cg_capped=True,
+            user_systemd_active=True,
+            t_cg_is_user_service=False,
+        )
+
+        class _InstantAbortWatchdog:
+            def __init__(self, **_kwargs: Any) -> None:
+                pass
+
+            def tick(self, _now: float) -> dict[str, Any]:
+                return {"action": "abort_pressure", "tier1_triggered": True, "shed_fired": False, "breach_ticks": 3}
+
+        class _TimeoutOnceProc:
+            pid = 424242
+
+            def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+                self._done = False
+
+            def wait(self, timeout: float | None = None) -> int:
+                if not self._done:
+                    self._done = True
+                    raise subprocess.TimeoutExpired(cmd=["sleep"], timeout=timeout or 0)
+                return -9
+
+            def poll(self) -> int | None:
+                return -9 if self._done else None
+
+        for thread_env, want_field in (
+            ({"LEAN_NUM_THREADS": "1"}, "threads=1, thread_budget=3"),
+            ({}, "threads=3"),
+        ):
+            err_buf = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, thread_env))
+                for var in self.THREAD_VARS:
+                    if var not in thread_env:
+                        os.environ.pop(var, None)
+                stack.enter_context(mock.patch.object(alr, "_build_scope_launch_cmd", return_value=(["true"], True)))
+                stack.enter_context(mock.patch.object(alr, "BuildWatchdog", _InstantAbortWatchdog))
+                stack.enter_context(mock.patch.object(alr.subprocess, "Popen", _TimeoutOnceProc))
+                stack.enter_context(mock.patch.object(alr, "_kill_systemd_scope"))
+                stack.enter_context(mock.patch.object(alr, "stamp_last_oom"))
+                stack.enter_context(mock.patch("sys.stderr", err_buf))
+                rc = alr.run_bounded_command(
+                    ["lake", "build"],
+                    capped,
+                    use_slot_lock=False,
+                    probe_fn=lambda **_kw: dict(capped),
+                    evict_fn=lambda _lim: False,
+                )
+            self.assertEqual(rc, 137, thread_env)
+            err = err_buf.getvalue()
+            self.assertIn("USER_SLICE_PRESSURE_ABORT:", err)
+            self.assertIn(f"(mode=build, {want_field}, budget_gb=", err, thread_env)
+
+    def test_oom_diagnostic_logs_caller_lowered_lean_num_threads(self) -> None:
+        oom = ["--mode", "file", "--no-slot-lock", "--", "sh", "-c", "exit 137"]
+        for budget, thread_env, lean_threads, field in (
+            (3, {"LEAN_NUM_THREADS": "1"}, "1", "threads=1, thread_budget=3"),
+            (64, {"LEAN_NUM_THREADS": "1"}, "1", "threads=1, thread_budget=64"),
+            (64, {"LEAN_NUM_THREADS": " 2 "}, "2", "threads=2, thread_budget=64"),
+            (3, {}, "3", "threads=3"),
+            (3, {"LEAN_NUM_THREADS": "0"}, "3", "threads=3"),
+            (3, {"LEAN_NUM_THREADS": "64"}, "64", "threads=64, thread_budget=3"),
+        ):
+            rc, err, child_envs = self._run(self._limits(budget), oom, thread_env)
+            self.assertEqual(rc, 137, thread_env)
+            self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], [lean_threads], thread_env)
+            self.assertIn("terminated by the OS memory guard (exit 137, MemoryMax=", err)
+            self.assertIn(f"MemorySwapMax=0, mode=file, {field}, budget_gb=", err, thread_env)
+            self.assertEqual(re.findall(r"\bthreads=(\d+)", err), [lean_threads], thread_env)
+        # On a memory-capped slice a larger caller value is clamped to the budget.
+        capped = self._limits(3, is_cg_capped=True)
+        rc, err, child_envs = self._run(capped, oom, {"LEAN_NUM_THREADS": "64"})
+        self.assertEqual(rc, 137)
+        self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], ["3"])
+        self.assertIn("mode=file, threads=3, budget_gb=", err)
+        self.assertNotIn("thread_budget", err)
+
+    def test_oom_retry_diagnostic_reports_the_retry_attempt_threads(self) -> None:
+        # Attempt 1 runs under a 64-thread budget, the single on-OOM retry under a re-probed
+        # 8-thread budget: the final diagnostic describes the attempt that actually failed last.
+        first = self._limits(64, mode="build", memory_max_mb=4096, b_max_evict_mb=8192, skip_evict=True)
+        retry = self._limits(8, mode="build", memory_max_mb=8192, b_max_evict_mb=8192, skip_evict=True)
+        for thread_env, lean_threads, field in (
+            ({"LEAN_NUM_THREADS": "1"}, ["1", "1"], "threads=1, thread_budget=8"),
+            ({}, ["64", "8"], "threads=8"),
+        ):
+            rc, err, child_envs = self._run([first, retry], ["sh", "-c", "exit 137"], thread_env, direct=True)
+            self.assertEqual(rc, 137, thread_env)
+            self.assertIn("Attempt 1 OOMed at 4096M; evicted LSP workers and retrying once at 8192M", err)
+            self.assertEqual([env["LEAN_NUM_THREADS"] for env in child_envs], lean_threads, thread_env)
+            self.assertIn(f"MemoryMax=8192M, MemorySwapMax=0, mode=build, {field}, budget_gb=", err, thread_env)
+            self.assertNotIn("thread_budget=64", err)
+
+    def test_probe_text_reports_effective_lean_num_threads(self) -> None:
+        for limits, cases in (
+            (
+                self._limits(64, mode="build"),
+                (
+                    ({"LEAN_NUM_THREADS": "1"}, 1),
+                    ({"LEAN_NUM_THREADS": "64"}, 64),
+                    ({"LEAN_NUM_THREADS": "128"}, 128),
+                    ({}, 64),
+                    ({"LEAN_NUM_THREADS": "-1"}, 64),
+                    ({"LEAN_NUM_THREADS": "1_2"}, 64),
+                ),
+            ),
+            (
+                self._limits(3, mode="build", is_cg_capped=True),
+                (
+                    ({"LEAN_NUM_THREADS": "1"}, 1),
+                    ({"LEAN_NUM_THREADS": "64"}, 3),
+                    ({}, 3),
+                    ({"LEAN_NUM_THREADS": "0"}, 3),
+                    ({"LEAN_NUM_THREADS": "abc"}, 3),
+                    ({"LEAN_NUM_THREADS": "\u0661"}, 3),
+                ),
+            ),
+        ):
+            budget = limits["threads"]
+            for thread_env, lean_threads in cases:
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    rc, _err, child_envs = self._run(limits, ["--probe"], thread_env)
+                self.assertEqual(rc, 0)
+                self.assertEqual(child_envs, [])
+                self.assertIn(
+                    f"Thread Budget (-j) : {budget} threads (LEAN_NUM_THREADS={lean_threads})\n",
+                    out.getvalue(),
+                    (limits["is_cg_capped"], thread_env),
+                )
+                # The JSON contract keeps reporting the envelope's budget.
+                out = io.StringIO()
+                with mock.patch("sys.stdout", out):
+                    rc, _err, _envs = self._run(limits, ["--probe", "--json"], thread_env)
+                self.assertEqual(rc, 0)
+                self.assertEqual(json.loads(out.getvalue()), limits)
 
 
 class TestCliSubprocess(unittest.TestCase):
@@ -1672,6 +2114,84 @@ class TestCliSubprocess(unittest.TestCase):
                 },
             )
 
+    def test_cli_synthetic_hosts_honor_caller_lowered_lean_num_threads_end_to_end(self) -> None:
+        """Real subprocess CLI on both uncapped and cgroup-capped synthetic hosts:
+        `LEAN_NUM_THREADS=1` flows to `--probe` text and the executed child while
+        leaving `CARGO_BUILD_JOBS`/`RAYON_NUM_THREADS` at the host budget, and
+        oversized values clamp strictly on the capped host."""
+        dump_threads = [
+            sys.executable,
+            "-c",
+            "import json, os; print(json.dumps({k: os.environ.get(k) for k in "
+            "('LEAN_NUM_THREADS', 'CARGO_BUILD_JOBS', 'RAYON_NUM_THREADS')}))",
+        ]
+        with tempfile.TemporaryDirectory(prefix="anneal-synth-threads-") as tmp:
+            root = Path(tmp)
+            _write_synthetic_host_base(root)
+            for cg_name, ceiling_mib, capped in (
+                ("cg_uncapped", None, False),
+                ("cg_capped_1", 12288, True),
+            ):
+                _write_synthetic_cgroup_root(root, cg_name, ceiling_mib)
+                probe_json = self._probe_json(
+                    self._synthetic_cli(root, cg_name, "--mode", "build", "--probe", "--json")
+                )
+                self.assertIs(probe_json["is_cg_capped"], capped)
+                budget = probe_json["threads"]
+                self.assertGreater(budget, 1)
+
+                # Lower positive `LEAN_NUM_THREADS=1` wins in both regimes.
+                probe_txt = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--probe",
+                    env_extra={"LEAN_NUM_THREADS": "1"},
+                )
+                self.assertEqual(probe_txt.returncode, 0, probe_txt.stderr)
+                self.assertIn(
+                    f"Thread Budget (-j) : {budget} threads (LEAN_NUM_THREADS=1)\n",
+                    probe_txt.stdout,
+                )
+                run_low = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--no-slot-lock",
+                    "--",
+                    *dump_threads,
+                    env_extra={"LEAN_NUM_THREADS": "1", "CARGO_BUILD_JOBS": "", "RAYON_NUM_THREADS": ""},
+                )
+                self.assertEqual(run_low.returncode, 0, run_low.stderr)
+                self.assertEqual(
+                    json.loads(run_low.stdout),
+                    {
+                        "LEAN_NUM_THREADS": "1",
+                        "CARGO_BUILD_JOBS": str(budget),
+                        "RAYON_NUM_THREADS": str(budget),
+                    },
+                )
+
+                # Oversized `LEAN_NUM_THREADS=99` clamps on capped hosts and is kept on uncapped hosts.
+                want_high = budget if capped else 99
+                run_high = self._synthetic_cli(
+                    root,
+                    cg_name,
+                    "--mode",
+                    "build",
+                    "--no-slot-lock",
+                    "--",
+                    *dump_threads,
+                    env_extra={"LEAN_NUM_THREADS": "99", "CARGO_BUILD_JOBS": "", "RAYON_NUM_THREADS": ""},
+                )
+                self.assertEqual(run_high.returncode, 0, run_high.stderr)
+                self.assertEqual(
+                    json.loads(run_high.stdout)["LEAN_NUM_THREADS"],
+                    str(want_high),
+                )
+
 
 class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
     """Tests v2 `anneal-workloads.slice`, `--exclusive`, re-entrancy, and OOM retry guards."""
@@ -1962,6 +2482,137 @@ class TestWorkloadMemoryEnvelopeV2(unittest.TestCase):
                 self.assertEqual(cap2["s_heavy_safe"], 2)
                 self.assertEqual(cap2["concurrency"], 2)
                 self.assertEqual(cap2["build_slots"], 2)
+
+    def test_exclusive_probe_matches_execution_w_eff_with_cli_concurrency(self) -> None:
+        """`--exclusive` forces `w_eff = 1` in `--probe` just as in execution, even when
+        `--concurrency` (`cli_concurrency`) is also supplied, while preserving `build_slots`."""
+        for is_cg_capped, s_heavy_safe, w_file, cli_c, want_slots in (
+            (False, 4, None, 4, 4),
+            (False, 4, 3, 2, 3),
+            (True, 2, None, 4, 2),
+            (True, 2, 4, 3, 2),
+        ):
+            probe_res = alr.resolve_effective_concurrency(
+                is_cg_capped=is_cg_capped,
+                s_heavy_safe=s_heavy_safe,
+                w_file=w_file,
+                cli_concurrency=cli_c,
+                env_concurrency=None,
+                exclusive=True,
+                is_probe=True,
+            )
+            exec_res = alr.resolve_effective_concurrency(
+                is_cg_capped=is_cg_capped,
+                s_heavy_safe=s_heavy_safe,
+                w_file=w_file,
+                cli_concurrency=cli_c,
+                env_concurrency=None,
+                exclusive=True,
+                is_probe=False,
+            )
+            self.assertEqual(probe_res, (1, want_slots))
+            self.assertEqual(probe_res, exec_res)
+
+        probe_env = alr.compute_workload_memory_envelope(
+            cpu_cores=16,
+            mem_total_mb=32768,
+            mem_avail_mb=28672,
+            w_file=4,
+            cli_concurrency=4,
+            exclusive=True,
+            is_probe=True,
+            mode="build",
+        )
+        exec_env = alr.compute_workload_memory_envelope(
+            cpu_cores=16,
+            mem_total_mb=32768,
+            mem_avail_mb=28672,
+            w_file=4,
+            cli_concurrency=4,
+            exclusive=True,
+            is_probe=False,
+            mode="build",
+        )
+        self.assertEqual(probe_env["w_eff"], 1)
+        self.assertEqual(probe_env["build_slots"], 4)
+        self.assertEqual(probe_env["memory_max_mb"], exec_env["memory_max_mb"])
+
+    def test_probe_cap_brackets_execution_cap_on_multi_slot_hosts(self) -> None:
+        """Contract `run_nightly_verification_suite._probe_lean_run_memory_max_mib` relies on.
+
+        A non-exclusive `--probe --concurrency w` plans for `w` slots, while execution
+        runs at `build_slots` when the host's concurrency file asks for more. Then
+        `--probe --concurrency <build_slots>` reproduces the execution plan, and the
+        execution `memory_max_mb` lies in `[probe * w // build_slots, probe]`.
+        """
+        reprobed = 0
+        for mem_total, mem_avail, cores in (
+            (16384, 14000, 8),
+            (32768, 28672, 16),
+            (65536, 60000, 32),
+            (262144, 200000, 96),
+        ):
+            for c_high in (None, mem_total // 2, (3 * mem_total) // 4):
+                ancestors = (
+                    []
+                    if c_high is None
+                    else [
+                        {
+                            "path": "/sys/fs/cgroup/user.slice",
+                            "name": "user.slice",
+                            "c_high_mb": c_high,
+                            "w_mb": 512,
+                            "is_shared_user_slice": False,
+                        }
+                    ]
+                )
+                for w_file in (2, 3, 4):
+                    for cli_c in (1, 2, 3):
+                        for mode in ("build", "file"):
+                            for l_ws, w_cg in ((0, 0), (1500, 2500)):
+
+                                def plan(concurrency: int, is_probe: bool) -> dict:
+                                    return alr.compute_workload_memory_envelope(
+                                        cpu_cores=cores,
+                                        mem_total_mb=mem_total,
+                                        mem_avail_mb=mem_avail,
+                                        ancestors=ancestors,
+                                        w_cg_mb=w_cg,
+                                        w_cg_nonrecl_mb=w_cg,
+                                        l_ws_mb=l_ws,
+                                        w_file=w_file,
+                                        cli_concurrency=concurrency,
+                                        is_probe=is_probe,
+                                        mode=mode,
+                                    )
+
+                                case = (mem_total, c_high, w_file, cli_c, mode, l_ws)
+                                probe, execd = plan(cli_c, True), plan(cli_c, False)
+                                slots = probe["build_slots"]
+                                self.assertEqual(slots, execd["build_slots"], case)
+                                if probe["w_eff"] >= slots:
+                                    # Nothing to reconcile: the probe already is the plan.
+                                    self.assertEqual(probe["w_eff"], execd["w_eff"], case)
+                                    self.assertEqual(
+                                        probe["memory_max_mb"], execd["memory_max_mb"], case
+                                    )
+                                    continue
+                                reprobed += 1
+                                self.assertEqual(execd["w_eff"], slots, case)
+                                again = plan(slots, True)
+                                self.assertEqual(again["w_eff"], slots, case)
+                                self.assertEqual(
+                                    again["memory_max_mb"], execd["memory_max_mb"], case
+                                )
+                                self.assertLessEqual(
+                                    execd["memory_max_mb"], probe["memory_max_mb"], case
+                                )
+                                self.assertGreaterEqual(
+                                    execd["memory_max_mb"],
+                                    probe["memory_max_mb"] * probe["w_eff"] // slots,
+                                    case,
+                                )
+        self.assertGreater(reprobed, 0)
 
     def test_oom_retry_guard_blocks_watchdog_and_timeout(self) -> None:
         common = dict(

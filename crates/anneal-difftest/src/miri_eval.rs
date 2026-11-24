@@ -45,12 +45,14 @@ use crate::shrink::{MemoizedOracle, MutatorChainShrinkStatus, shrink_mutation_ch
 pub const MIRI_DIFFTEST_CANDIDATE_FUEL: u32 = DEFAULT_ORACLE_FUEL * 4;
 
 /// Canonical mutator names always included in `mutator_applications`.
-pub const MIRI_MUTATOR_NAMES: [&str; 5] = [
+pub const MIRI_MUTATOR_NAMES: [&str; 7] = [
     "ArithmeticCastMutator",
     "PlaceProjectionWrapper",
     "RawPtrOffsetMutator",
     "TreeBorrowsRetagInterleaver",
     "BitValidityTransmuteMutator",
+    "VTableAndFnPtrMutator",
+    "ClosureAndAddrEqMutator",
 ];
 
 /// Canonical divergence classes always included in `divergence_classes`.

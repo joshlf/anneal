@@ -8,8 +8,8 @@
 
 //! Milestone 5: ITree-strength strictly safe-Rust `syn` AST mutators
 //! (`CallBoundaryOutliner`, `LayoutPaddingPerturber`, `BranchLoopWeaver`,
-//! `ExtOracleInjector`) plus [`generate_itree_batch`] and
-//! [`annotate_itree_external_callees`].
+//! `ExtOracleInjector`, `IndirectDispatchOutliner`) plus
+//! [`generate_itree_batch`] and [`annotate_itree_external_callees`].
 //!
 //! Enforces a hard zero-`unsafe` invariant: [`contains_unsafe_token`] verifies
 //! that **zero** `unsafe` tokens appear anywhere in any emitted candidate
@@ -227,6 +227,7 @@ fn disambiguate_itree_tag(file: &File, base_tag: u64) -> u64 {
         || existing.contains(&format!("__anneal_itree_outlined_stage2_{tag}"))
         || existing.contains(&format!("__AnnealSafePadded_{tag}"))
         || existing.contains(&format!("__anneal_ext_oracle_{tag}"))
+        || existing.contains(&format!("__anneal_itree_indirect_{tag}"))
         || existing.contains(&format!("__itree_step_{tag}"))
     {
         tag = (tag + 1) & 0xFFFF;
@@ -482,6 +483,219 @@ impl ItreeAstMutator for ExtOracleInjector {
     }
 }
 
+/// 5. Outlines an indirect-call computation across a real function call
+/// boundary: a top-level safe helper `__anneal_itree_indirect_<tag>(seed, delta)`
+/// whose body is one of
+/// - `&T as &dyn Trait` unsizing for two traits, a virtual call through each
+///   vtable, and `core::ptr::addr_eq` on the two trait-object references (one
+///   data address, two vtables);
+/// - a call through a `fn(u32, u32) -> u32` pointer chosen at run time between
+///   two nested functions, then through a pointer coerced from a non-capturing
+///   closure;
+/// - closures capturing a local by shared reference, by value (`move`), and by
+///   unique reference (an `FnMut` closure called twice);
+/// - `core::ptr::addr_eq` on slice references into one array that share a data
+///   address but differ in length, and on two that start at different elements.
+///
+/// The root function only calls the helper, so `TraceCheck` sees one boundary
+/// call with `u32` arguments and a `u32` return. Every trait, `impl`, struct,
+/// and function the helper needs is declared inside its body, so a candidate
+/// gains exactly one top-level item and nothing for
+/// [`stage_itree_candidate_items`] to prefix other than that function. The
+/// helper never panics and never returns `0`, and it derives its arguments
+/// from the root's parameters as [`CallBoundaryOutliner`] does, so the argument
+/// freedom of the boundary calls woven in before it is preserved.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct IndirectDispatchOutliner;
+
+impl ItreeAstMutator for IndirectDispatchOutliner {
+    fn name(&self) -> &'static str {
+        "IndirectDispatchOutliner"
+    }
+
+    fn mutate(&self, file: &mut File, rng: &mut DetRng) {
+        let raw_tag = rng.next_u64();
+        let tag = disambiguate_itree_tag(file, raw_tag);
+        let variant = (raw_tag >> 16) % 4;
+        let helper_ident = format_ident!("__anneal_itree_indirect_{}", tag);
+        let k_const = ((rng.next_u64() % 251) as u32).wrapping_add(1);
+
+        let helper_item: Item = match variant {
+            0 => syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    trait AnnealDynProbe {
+                        fn probe(&self, x: u32) -> u32;
+                        fn stamp(&self) -> u32;
+                    }
+                    trait AnnealDynAlt {
+                        fn alt(&self) -> u32;
+                    }
+                    struct AnnealDynHolderA {
+                        bias: u32,
+                    }
+                    struct AnnealDynHolderB {
+                        pad: u32,
+                        bias: u32,
+                    }
+                    impl AnnealDynProbe for AnnealDynHolderA {
+                        fn probe(&self, x: u32) -> u32 {
+                            (x >> 1) ^ (self.bias & 0xFFFFu32)
+                        }
+                        fn stamp(&self) -> u32 {
+                            (self.bias & 0x3Fu32) ^ 0x15u32
+                        }
+                    }
+                    impl AnnealDynProbe for AnnealDynHolderB {
+                        fn probe(&self, x: u32) -> u32 {
+                            ((x >> 2) ^ self.pad) ^ (self.bias & 0xFFFFu32)
+                        }
+                        fn stamp(&self) -> u32 {
+                            ((self.pad ^ self.bias) & 0x3Fu32) ^ 0x2Au32
+                        }
+                    }
+                    impl AnnealDynAlt for AnnealDynHolderA {
+                        fn alt(&self) -> u32 {
+                            (self.bias >> 3) & 0x7Fu32
+                        }
+                    }
+                    let holder = AnnealDynHolderA { bias: delta ^ #k_const };
+                    let other = AnnealDynHolderB {
+                        pad: (seed & 0xFFu32) ^ #k_const,
+                        bias: (delta >> 1) ^ #k_const,
+                    };
+                    let as_probe: &dyn AnnealDynProbe = &holder as &dyn AnnealDynProbe;
+                    let other_probe: &dyn AnnealDynProbe = &other as &dyn AnnealDynProbe;
+                    let as_alt: &dyn AnnealDynAlt = &holder as &dyn AnnealDynAlt;
+                    let picked: &dyn AnnealDynProbe = if (seed & 1u32) == 0u32 {
+                        as_probe
+                    } else {
+                        other_probe
+                    };
+                    let dispatched: u32 = picked.probe(seed) ^ picked.stamp();
+                    let alt_bits: u32 = as_alt.alt();
+                    let same_bit: u32 = if core::ptr::addr_eq(as_probe, as_alt) {
+                        2u32
+                    } else {
+                        0u32
+                    };
+                    let diff_bit: u32 = if core::ptr::addr_eq(as_probe, other_probe) {
+                        0u32
+                    } else {
+                        4u32
+                    };
+                    let mix: u32 = (dispatched << 3) ^ (alt_bits << 3) ^ same_bit ^ diff_bit;
+                    (mix >> 1) + #k_const
+                }
+            },
+            1 => syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    fn anneal_fnptr_mix(a: u32, b: u32) -> u32 {
+                        (a >> 1) ^ (b & 0xFFFFu32)
+                    }
+                    fn anneal_fnptr_fold(a: u32, b: u32) -> u32 {
+                        (a & 0xFFFF_FF00u32) | ((b >> 2) & 0xFFu32)
+                    }
+                    let op: fn(u32, u32) -> u32 = if (seed & 1u32) == 0u32 {
+                        anneal_fnptr_mix
+                    } else {
+                        anneal_fnptr_fold
+                    };
+                    let lifted: fn(u32, u32) -> u32 = |a: u32, b: u32| (a ^ b) >> 1;
+                    let raw_op: *const () = op as *const ();
+                    let raw_lifted: *const () = lifted as *const ();
+                    let raw_seed: *const u32 = &seed as *const u32;
+                    let same_op: u32 = if core::ptr::addr_eq(raw_op, op as *const ()) {
+                        2u32
+                    } else {
+                        0u32
+                    };
+                    let same_lifted: u32 = if core::ptr::addr_eq(raw_lifted, lifted as *const ()) {
+                        4u32
+                    } else {
+                        0u32
+                    };
+                    let diff_stack: u32 = if core::ptr::addr_eq(raw_op, raw_seed) {
+                        0u32
+                    } else {
+                        8u32
+                    };
+                    let first: u32 = op(seed, delta);
+                    let second: u32 = lifted(first, #k_const);
+                    let combined: u32 = (second << 4) ^ same_op ^ same_lifted ^ diff_stack;
+                    (combined >> 1) + #k_const
+                }
+            },
+            2 => syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    let bias: u32 = (delta & 0xFFFFu32) ^ #k_const;
+                    let bias_ref: &u32 = &bias;
+                    let by_ref = |x: u32| {
+                        let same: u32 = if core::ptr::addr_eq(&bias, bias_ref) {
+                            8u32
+                        } else {
+                            0u32
+                        };
+                        ((x >> 1) ^ (*bias_ref)) ^ same
+                    };
+                    let by_val = move |x: u32| (x & 0xFFFF_FFFEu32) ^ (bias >> 2);
+                    let first: u32 = by_ref(seed);
+                    let second: u32 = by_val(first);
+                    let mut acc: u32 = second ^ (*bias_ref & 0xFFu32);
+                    let mut bump = |d: u32| {
+                        acc = (acc >> 1) ^ d;
+                    };
+                    bump(#k_const);
+                    bump(bias & 0xFFu32);
+                    (acc >> 1) + #k_const
+                }
+            },
+            _ => syn::parse_quote! {
+                #[inline(never)]
+                pub fn #helper_ident(seed: u32, delta: u32) -> u32 {
+                    let arr: [u32; 3] = [seed, delta, #k_const];
+                    let whole: &[u32] = &arr;
+                    let [lead @ .., _, _] = &arr;
+                    let short: &[u32] = lead;
+                    let [_, tail @ ..] = &arr;
+                    let shifted: &[u32] = tail;
+                    let same_bit: u32 = if core::ptr::addr_eq(whole, short) {
+                        2u32
+                    } else {
+                        0u32
+                    };
+                    let diff_bit: u32 = if core::ptr::addr_eq(whole, shifted) {
+                        0u32
+                    } else {
+                        4u32
+                    };
+                    let picked: u32 = (arr[0] >> 1) & 0xFFFF_FFF8u32;
+                    let masked: u32 = (arr[1] & 0xFFF8u32) ^ same_bit ^ diff_bit;
+                    ((picked ^ masked) >> 1) + #k_const
+                }
+            },
+        };
+
+        let (outer_shift, _) = preamble_arg_shifts(file);
+        let target_idx = target_fn_index(file);
+        if let Some(idx) = target_idx
+            && let Item::Fn(func) = &mut file.items[idx]
+        {
+            let arg0_expr = first_u32_param_expr(func, k_const);
+            let arg1_expr = second_u32_param_expr(func, k_const);
+            let local_ident = format_ident!("__itree_ind_res_{}", tag);
+            let injected: Vec<Stmt> = syn::parse_quote! {
+                let #local_ident: u32 = #helper_ident(#arg0_expr, #arg1_expr >> #outer_shift);
+            };
+            weave_into_fn_body(func, injected, &local_ident);
+        }
+
+        file.items.push(helper_item);
+    }
+}
+
 /// Attaches `#[anneal_trace::external]` (and `#[inline(never)]`) to every
 /// top-level function in `source` whose name is not `root_fn_name`, returning
 /// the formatted Rust source and the ordered list of external callee names.
@@ -674,13 +888,27 @@ pub fn generate_itree_identity_batch(seeds: &[&str]) -> Vec<GeneratedItreeCandid
 }
 
 /// The safe ITree AST mutators, in the order in which [`generate_itree_batch`]
-/// indexes them when it picks a pass's mutator.
-pub const ITREE_AST_MUTATORS: [&dyn ItreeAstMutator; 4] = [
+/// indexes them when it picks a pass's mutator: the
+/// [`ITREE_BASE_MUTATOR_COUNT`] base mutators, then
+/// [`IndirectDispatchOutliner`] (see [`apply_itree_mutation_passes`]).
+pub const ITREE_AST_MUTATORS: [&dyn ItreeAstMutator; 5] = [
     &CallBoundaryOutliner,
     &LayoutPaddingPerturber,
     &BranchLoopWeaver,
     &ExtOracleInjector,
+    &IndirectDispatchOutliner,
 ];
+
+/// Number of leading [`ITREE_AST_MUTATORS`] entries that the passes rotate
+/// through.
+const ITREE_BASE_MUTATOR_COUNT: usize = 4;
+
+/// Index in [`ITREE_AST_MUTATORS`] of [`IndirectDispatchOutliner`].
+const ITREE_INDIRECT_MUTATOR_INDEX: usize = ITREE_BASE_MUTATOR_COUNT;
+
+/// One pass in `ITREE_INDIRECT_PASS_DENOMINATOR` runs
+/// [`IndirectDispatchOutliner`] instead of a base mutator.
+const ITREE_INDIRECT_PASS_DENOMINATOR: usize = 16;
 
 fn itree_mutator_by_name(name: &str) -> Option<&'static dyn ItreeAstMutator> {
     ITREE_AST_MUTATORS.into_iter().find(|m| m.name() == name)
@@ -694,7 +922,7 @@ pub struct ItreeMutationStep {
     /// Zero-based index of this pass in the candidate's mutator chain.
     pub pass_index: usize,
     /// Canonical mutator name (`CallBoundaryOutliner`, `LayoutPaddingPerturber`,
-    /// `BranchLoopWeaver`, or `ExtOracleInjector`).
+    /// `BranchLoopWeaver`, `ExtOracleInjector`, or `IndirectDispatchOutliner`).
     pub mutator_name: String,
     /// PRNG state immediately before this pass's `mutate` call.
     pub rng_before_step: DetRng,
@@ -710,21 +938,44 @@ fn parse_safe_itree_seed(seed_src: &str) -> Option<File> {
 
 /// Draw and apply candidate `id`'s mutation passes, recording for each pass the
 /// mutator and the PRNG state that `mutate` started from. The first pass's
-/// mutator rotates with `id`; every later pass draws a different mutator.
+/// base mutator rotates with `id`; every later pass draws a different base
+/// mutator.
+///
+/// Each of the two PRNG draws of the base schedule (the pass count, and a
+/// later pass's mutator) also decides, through its quotient, whether that pass
+/// runs [`IndirectDispatchOutliner`] instead (one pass in
+/// [`ITREE_INDIRECT_PASS_DENOMINATOR`], and never two passes of one
+/// candidate). The redirect consumes no extra draw, so a candidate none of
+/// whose passes is redirected keeps the PRNG stream, and so the program, that
+/// the base schedule alone would give it.
 fn apply_itree_mutation_passes(
     parsed: &mut File,
     cand_rng: &mut DetRng,
     id: usize,
 ) -> Vec<ItreeMutationStep> {
-    let mutator_count = ITREE_AST_MUTATORS.len();
-    let num_passes = 1 + cand_rng.gen_range(2);
+    let mutator_count = ITREE_BASE_MUTATOR_COUNT;
+    let pass_draw = cand_rng.next_u64() as usize;
+    let num_passes = 1 + pass_draw % 2;
+    let first_indirect = (pass_draw / 2) % ITREE_INDIRECT_PASS_DENOMINATOR == 0;
     let first_idx = id % mutator_count;
     let mut steps = Vec::with_capacity(num_passes);
     for pass in 0..num_passes {
         let m_idx = if pass == 0 {
-            first_idx
+            if first_indirect {
+                ITREE_INDIRECT_MUTATOR_INDEX
+            } else {
+                first_idx
+            }
         } else {
-            (first_idx + 1 + cand_rng.gen_range(mutator_count - 1)) % mutator_count
+            let draw = cand_rng.next_u64() as usize;
+            let base_idx = (first_idx + 1 + draw % (mutator_count - 1)) % mutator_count;
+            let later_indirect =
+                (draw / (mutator_count - 1)) % ITREE_INDIRECT_PASS_DENOMINATOR == 0;
+            if later_indirect && !first_indirect {
+                ITREE_INDIRECT_MUTATOR_INDEX
+            } else {
+                base_idx
+            }
         };
         let mutator = ITREE_AST_MUTATORS[m_idx];
         let rng_before_step = cand_rng.clone();
@@ -920,8 +1171,97 @@ enum EvalTy {
     Bool,
     Unit,
     Named(String),
+    /// `&...&T` (including `&[T]`): shared reference of the given reference
+    /// depth without trait-object erasure (`&u32` -> `1`, `&&u32` -> `2`).
+    Ref(usize),
+    /// `&dyn Trait`: shared trait-object reference carrying vtable identity.
+    DynRef(String),
+    /// `*const T`: safe raw pointer carrying pointer+reference depth (`*const u32`
+    /// -> `1`, `*const &u32` -> `2`; never dereferenced in safe Rust).
+    ConstPtr(usize),
+    /// `fn(..) -> ..`: a function item or a closure that captures nothing.
+    FnPtr,
+    /// `[T; N]` with element type `T`.
+    Array(Box<EvalTy>),
     /// No annotation (`let x = ...`).
     Infer,
+}
+
+fn dyn_trait_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Paren(p) => dyn_trait_name(&p.elem),
+        Type::Group(g) => dyn_trait_name(&g.elem),
+        Type::TraitObject(o) => {
+            let mut principal: Option<String> = None;
+            for bound in &o.bounds {
+                match bound {
+                    syn::TypeParamBound::Trait(tb) => {
+                        let id = tb.path.get_ident()?;
+                        if principal.is_some() {
+                            return None;
+                        }
+                        principal = Some(id.to_string());
+                    }
+                    syn::TypeParamBound::Lifetime(_) => {}
+                    _ => return None,
+                }
+            }
+            principal
+        }
+        _ => None,
+    }
+}
+
+fn is_trait_object_type(ty: &Type) -> bool {
+    match ty {
+        Type::Paren(p) => is_trait_object_type(&p.elem),
+        Type::Group(g) => is_trait_object_type(&g.elem),
+        Type::TraitObject(_) => true,
+        _ => false,
+    }
+}
+
+/// Counts leading shared-reference layers (`&...&T`) and returns `(depth, T)`.
+fn ref_target_and_depth(ty: &Type) -> (usize, &Type) {
+    let mut depth = 0usize;
+    let mut cur = ty;
+    loop {
+        match cur {
+            Type::Paren(p) => cur = &p.elem,
+            Type::Group(g) => cur = &g.elem,
+            Type::Reference(r) if r.mutability.is_none() => {
+                depth += 1;
+                cur = &r.elem;
+            }
+            _ => return (depth, cur),
+        }
+    }
+}
+
+/// Whether `target`, a type that [`ref_target_and_depth`] stripped of its
+/// leading shared references, certainly is not a reference type itself, so
+/// that the depth counted in front of it is the depth of the whole type.
+///
+/// `_`, `impl Trait`, an associated type (`Self::Out`, `<T as Trait>::Out`),
+/// and a macro can each stand for a reference type: `let rr: &_ = &r1;` with
+/// `r1: &u32` declares a `&&u32` that holds the address of `r1`, whereas a
+/// deref coercion to `&u32` would hold the address of `r1`'s referent. A
+/// single-segment path names a primitive, a struct, or the `Self` of a
+/// struct's `impl`; the type aliases and generic parameters that could also
+/// hide a reference are rejected with the items that declare them (`type`
+/// items, and generic functions, methods, and `impl`s).
+fn ref_depth_is_exact(target: &Type) -> bool {
+    match target {
+        Type::Path(tp) => tp.qself.is_none() && tp.path.segments.len() == 1,
+        Type::Array(_)
+        | Type::BareFn(_)
+        | Type::Never(_)
+        | Type::Ptr(_)
+        | Type::Slice(_)
+        | Type::TraitObject(_)
+        | Type::Tuple(_) => true,
+        _ => false,
+    }
 }
 
 fn eval_ty_of(ty: &Type) -> EvalTy {
@@ -938,6 +1278,43 @@ fn eval_ty_of(ty: &Type) -> EvalTy {
         }
         Type::Tuple(t) if t.elems.is_empty() => EvalTy::Unit,
         Type::Paren(p) => eval_ty_of(&p.elem),
+        Type::Group(g) => eval_ty_of(&g.elem),
+        Type::Reference(r) if r.mutability.is_none() => {
+            let (depth, target) = ref_target_and_depth(ty);
+            // Reject `&mut` nested inside `&`, and a target that may itself
+            // be a reference (`&_`, `&impl Trait`, `&Self::Out`): its depth is
+            // unknown, so whether a deeper value deref-coerces to it is too.
+            if !ref_depth_is_exact(target) {
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            // Reject multi-bound or qualified trait-object references (such
+            // as `&(dyn Trait + Send)` or `&&(dyn Trait + Send)`) rather than
+            // stripping `dyn` into `Ref` and mis-dispatching to an inherent
+            // method.
+            if is_trait_object_type(target) {
+                if depth == 1
+                    && let Some(tr) = dyn_trait_name(target)
+                {
+                    return EvalTy::DynRef(tr);
+                }
+                if dyn_trait_name(target).is_some() {
+                    return EvalTy::Ref(depth);
+                }
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            EvalTy::Ref(depth)
+        }
+        Type::Ptr(p) if p.mutability.is_none() => {
+            let (inner_ref_depth, target) = ref_target_and_depth(&p.elem);
+            // Likewise `*const &mut T` and a pointee of unknown depth
+            // (`*const _`).
+            if !ref_depth_is_exact(target) {
+                return EvalTy::Named(quote!(#ty).to_string());
+            }
+            EvalTy::ConstPtr(1 + inner_ref_depth)
+        }
+        Type::BareFn(_) => EvalTy::FnPtr,
+        Type::Array(a) => EvalTy::Array(Box::new(eval_ty_of(&a.elem))),
         other => EvalTy::Named(quote!(#other).to_string()),
     }
 }
@@ -949,12 +1326,217 @@ fn ret_ty_of(output: &ReturnType) -> EvalTy {
     }
 }
 
+/// Abstract address identity modeled by [`ItreeConcreteEvaluator`] for
+/// `core::ptr::addr_eq`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalAddr {
+    /// `(binding identity, byte offset within that binding)`.
+    Local(u64, u64),
+    /// Function item in `EvalRun::fn_table`.
+    FnItem(usize),
+    /// Capture-free closure in `EvalRun::closures`.
+    ClosureFn(usize),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EvalValue {
     Int(u128, EvalIntTy),
     Bool(bool),
-    Struct(String, BTreeMap<String, EvalValue>),
+    /// `(AST ItemStruct identity, struct name, field values)`.
+    Struct(usize, String, BTreeMap<String, EvalValue>),
     Unit,
+    /// `[T; N]` array, or the elements that a slice reference views.
+    Array(Vec<EvalValue>),
+    /// Shared reference.
+    Ref(Box<EvalRef>),
+    /// Safe `*const T` raw pointer (never dereferenced; used for `addr_eq`).
+    ConstPtr {
+        addr: Option<EvalAddr>,
+        nonzero: bool,
+    },
+    /// Function item or function pointer (index into `EvalRun::fn_table`).
+    FnRef(usize),
+    /// Closure (index into `EvalRun::closures`); `captures` records whether it
+    /// captured any variable, so only a capture-free closure coerces to a
+    /// function pointer.
+    Closure {
+        id: usize,
+        captures: bool,
+    },
+}
+
+/// A shared reference: the referent's value and, when the evaluator can place
+/// it, its address (plus optional `&dyn Trait` vtable identity).
+///
+/// Safe Rust cannot mutate a referent while a shared reference to it is live
+/// (the evaluator's subset has no interior mutability), so the snapshot `val`
+/// taken when the reference was created is the referent's value for as long
+/// as the reference is usable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvalRef {
+    /// Address of the referent, or `None` when the address is not modeled (a
+    /// temporary, whose address the compiler may share with another constant's,
+    /// or a place whose byte offset depends on a layout the evaluator does not
+    /// compute).
+    addr: Option<EvalAddr>,
+    val: EvalValue,
+    /// AST `ItemTrait` identity when coerced or cast to `&dyn Trait`.
+    dyn_trait: Option<usize>,
+}
+
+impl EvalRef {
+    /// The reference that auto-dereferencing reaches: `self`, or the innermost
+    /// reference when `self` refers to a reference.
+    fn autoderef(mut self) -> EvalRef {
+        loop {
+            match self.val {
+                EvalValue::Ref(inner) => self = *inner,
+                _ => return self,
+            }
+        }
+    }
+}
+
+/// Number of nested [`EvalValue::Ref`] layers starting at `r` (at least `1`).
+fn eval_ref_depth(r: &EvalRef) -> usize {
+    let mut depth = 1usize;
+    let mut cur = &r.val;
+    while let EvalValue::Ref(inner) = cur {
+        depth += 1;
+        cur = &inner.val;
+    }
+    depth
+}
+
+/// Deref-coerces `r` to `expected_depth` reference layers by peeling outer
+/// [`EvalValue::Ref`] layers (`&&T` -> `&T`). Fails closed if `r` has fewer
+/// than `expected_depth` layers.
+fn peel_ref_layers(mut r: Box<EvalRef>, expected_depth: usize) -> Result<Box<EvalRef>, EvalCtrl> {
+    let actual_depth = eval_ref_depth(&r);
+    if expected_depth == 0 || actual_depth < expected_depth {
+        return eval_unsupported("reference depth mismatch");
+    }
+    for _ in 0..(actual_depth - expected_depth) {
+        let EvalValue::Ref(inner) = r.val else {
+            return eval_unsupported("reference deref coercion failed");
+        };
+        r = inner;
+    }
+    Ok(r)
+}
+
+/// Auto-dereferenced value of `v` (the referent of any chain of references).
+fn eval_autoderef(v: EvalValue) -> EvalValue {
+    match v {
+        EvalValue::Ref(r) => r.autoderef().val,
+        other => other,
+    }
+}
+
+/// Size in bytes of `v`, when the evaluator knows its layout (unsigned
+/// integers, `bool`, and arrays of those).
+fn eval_value_size(v: &EvalValue) -> Option<u64> {
+    match v {
+        EvalValue::Int(_, EvalIntTy::Infer) => None,
+        EvalValue::Int(_, t) => Some(u64::from(t.bits() / 8)),
+        EvalValue::Bool(_) => Some(1),
+        EvalValue::Array(elems) => {
+            let mut total = 0u64;
+            for e in elems {
+                total = total.checked_add(eval_value_size(e)?)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `v` certainly occupies at least one byte.
+fn eval_value_is_sized_nonzero(v: &EvalValue) -> bool {
+    match v {
+        EvalValue::Int(..)
+        | EvalValue::Bool(_)
+        | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
+        | EvalValue::FnRef(_) => true,
+        // A closure's runtime size can be 0 even when `ClosureFreeIdents`
+        // saw a free local (e.g., moving a ZST like `[u32; 0]`, or Rust
+        // 2021+ disjoint non-capturing `let _ = x;`).
+        EvalValue::Unit | EvalValue::Closure { .. } => false,
+        EvalValue::Array(elems) => elems.iter().any(eval_value_is_sized_nonzero),
+        EvalValue::Struct(_, _, fields) => fields.values().any(eval_value_is_sized_nonzero),
+    }
+}
+
+/// Whether `v` has a `Copy` type. A closure that is not `move` borrows such a
+/// capture however its body uses it, so the capture keeps its address inside
+/// the closure. A struct or a closure may instead be moved into the closure
+/// (when the body uses it by value), which the evaluator does not determine.
+fn eval_value_is_copy(v: &EvalValue) -> bool {
+    match v {
+        EvalValue::Int(..)
+        | EvalValue::Bool(_)
+        | EvalValue::Unit
+        | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
+        | EvalValue::FnRef(_) => true,
+        EvalValue::Array(elems) => elems.iter().all(eval_value_is_copy),
+        EvalValue::Struct(..) | EvalValue::Closure { .. } => false,
+    }
+}
+
+/// `core::ptr::addr_eq(a, b)` on two references or `*const` raw pointers.
+///
+/// Two references into one binding are equal iff their byte offsets are
+/// equal, references into two live bindings are never equal, a function
+/// pointer is equal to itself and never equal to a live non-ZST stack
+/// binding, and comparisons between two distinct functions are rejected rather
+/// than guessed (LLVM ICF may merge functions). Zero-sized referents and
+/// unmodeled addresses are likewise rejected.
+///
+/// A raw pointer, unlike a reference, may outlive the variable it points to,
+/// whose address a later variable or call may then reuse. The caller
+/// (`EvalRun::eval_call`) therefore passes a raw pointer into a variable only
+/// while that variable is in scope in the frame that compares it.
+fn eval_addr_eq(a: &EvalValue, b: &EvalValue) -> EvalRes {
+    let extract = |v: &EvalValue| -> Result<(Option<EvalAddr>, bool), EvalCtrl> {
+        match v {
+            EvalValue::Ref(r) => Ok((r.addr, eval_value_is_sized_nonzero(&r.val))),
+            EvalValue::ConstPtr { addr, nonzero } => Ok((*addr, *nonzero)),
+            _ => eval_unsupported("`addr_eq` on a non-pointer operand"),
+        }
+    };
+    let (addr_a, nz_a) = extract(a)?;
+    let (addr_b, nz_b) = extract(b)?;
+    if !nz_a || !nz_b {
+        return eval_unsupported("`addr_eq` on a possibly zero-sized referent");
+    }
+    match (addr_a, addr_b) {
+        (Some(EvalAddr::Local(alloc_a, off_a)), Some(EvalAddr::Local(alloc_b, off_b))) => {
+            Ok(EvalValue::Bool(alloc_a == alloc_b && off_a == off_b))
+        }
+        (Some(EvalAddr::FnItem(i)), Some(EvalAddr::FnItem(j))) if i == j => {
+            Ok(EvalValue::Bool(true))
+        }
+        (Some(EvalAddr::ClosureFn(i)), Some(EvalAddr::ClosureFn(j))) if i == j => {
+            Ok(EvalValue::Bool(true))
+        }
+        (Some(EvalAddr::FnItem(_) | EvalAddr::ClosureFn(_)), Some(EvalAddr::Local(..)))
+        | (Some(EvalAddr::Local(..)), Some(EvalAddr::FnItem(_) | EvalAddr::ClosureFn(_))) => {
+            Ok(EvalValue::Bool(false))
+        }
+        _ => eval_unsupported("`addr_eq` on a referent at an unmodeled or ICF-sensitive address"),
+    }
+}
+
+/// Whether `path` names `core::ptr::addr_eq` (`core::ptr::addr_eq` or
+/// `std::ptr::addr_eq`, without generic arguments).
+fn is_core_ptr_addr_eq_path(path: &syn::Path) -> bool {
+    path.segments.len() == 3
+        && path.segments.iter().all(|seg| seg.arguments.is_none())
+        && (path.segments[0].ident == "core" || path.segments[0].ident == "std")
+        && path.segments[1].ident == "ptr"
+        && path.segments[2].ident == "addr_eq"
 }
 
 /// Non-local control flow and evaluation failures.
@@ -975,21 +1557,11 @@ fn eval_unsupported<T>(what: impl Into<String>) -> Result<T, EvalCtrl> {
     Err(EvalCtrl::Unsupported(what.into()))
 }
 
-fn eval_coerce(v: EvalValue, ty: &EvalTy) -> EvalRes {
-    match (v, ty) {
-        (v, EvalTy::Infer) => Ok(v),
-        (EvalValue::Int(x, EvalIntTy::Infer), EvalTy::Int(t)) => {
-            if x <= t.max() {
-                Ok(EvalValue::Int(x, *t))
-            } else {
-                eval_unsupported("integer literal out of range for its type")
-            }
-        }
-        (EvalValue::Int(x, s), EvalTy::Int(t)) if s == *t => Ok(EvalValue::Int(x, s)),
-        (EvalValue::Bool(b), EvalTy::Bool) => Ok(EvalValue::Bool(b)),
-        (EvalValue::Unit, EvalTy::Unit) => Ok(EvalValue::Unit),
-        (EvalValue::Struct(n, f), EvalTy::Named(m)) if n == *m => Ok(EvalValue::Struct(n, f)),
-        (v, ty) => eval_unsupported(format!("value {v:?} does not have type {ty:?}")),
+fn coerce_inferred_int(x: u128, t: EvalIntTy) -> EvalRes {
+    if x <= t.max() {
+        Ok(EvalValue::Int(x, t))
+    } else {
+        eval_unsupported("integer literal out of range for its type")
     }
 }
 
@@ -1000,6 +1572,11 @@ fn eval_encode(v: &EvalValue) -> Result<Vec<u8>, EvalCtrl> {
         EvalValue::Bool(b) => Ok(vec![u8::from(*b)]),
         EvalValue::Unit => Ok(Vec::new()),
         EvalValue::Struct(..) => eval_unsupported("struct value at a boundary"),
+        EvalValue::Array(_)
+        | EvalValue::Ref(_)
+        | EvalValue::ConstPtr { .. }
+        | EvalValue::FnRef(_)
+        | EvalValue::Closure { .. } => eval_unsupported("non-scalar value at a boundary"),
     }
 }
 
@@ -1212,8 +1789,307 @@ impl<'ast> Visit<'ast> for BranchSiteCollector {
         visit::visit_expr_binary(self, node);
     }
 
-    // Functions nested inside the root body are separate (uninstrumented) bodies.
+    // Functions, methods, and closures nested inside the root body are
+    // separate (uninstrumented) bodies.
     fn visit_item_fn(&mut self, _node: &'ast syn::ItemFn) {}
+
+    fn visit_item_impl(&mut self, _node: &'ast syn::ItemImpl) {}
+
+    fn visit_item_trait(&mut self, _node: &'ast syn::ItemTrait) {}
+
+    fn visit_expr_closure(&mut self, _node: &'ast syn::ExprClosure) {}
+}
+
+/// Collect all identifier bindings introduced by pattern `pat`.
+fn collect_pat_idents(pat: &Pat, out: &mut BTreeSet<String>) {
+    match pat {
+        Pat::Ident(pi) => {
+            out.insert(pi.ident.to_string());
+            if let Some((_, sub)) = &pi.subpat {
+                collect_pat_idents(sub, out);
+            }
+        }
+        Pat::Type(pt) => collect_pat_idents(&pt.pat, out),
+        Pat::Paren(pp) => collect_pat_idents(&pp.pat, out),
+        Pat::Reference(pr) => collect_pat_idents(&pr.pat, out),
+        Pat::Slice(ps) => {
+            for e in &ps.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        Pat::Tuple(pt) => {
+            for e in &pt.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        Pat::Or(po) => {
+            for c in &po.cases {
+                collect_pat_idents(c, out);
+            }
+        }
+        Pat::Struct(ps) => {
+            for f in &ps.fields {
+                collect_pat_idents(&f.pat, out);
+            }
+        }
+        Pat::TupleStruct(pt) => {
+            for e in &pt.elems {
+                collect_pat_idents(e, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Free single-identifier path expressions of a closure body (respecting
+/// local `let` bindings, `match` arm patterns, and nested closure parameters):
+/// the names the closure may capture from the enclosing function.
+#[derive(Default)]
+struct ClosureFreeIdents {
+    names: BTreeSet<String>,
+    bound: Vec<BTreeSet<String>>,
+    /// Set when the closure body contains any macro invocation whose token
+    /// stream `syn::Visit` cannot inspect for captured identifiers.
+    has_macro: bool,
+}
+
+impl<'ast> Visit<'ast> for ClosureFreeIdents {
+    fn visit_block(&mut self, node: &'ast Block) {
+        self.bound.push(BTreeSet::new());
+        for stmt in &node.stmts {
+            self.visit_stmt(stmt);
+        }
+        self.bound.pop();
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(init) = &node.init {
+            self.visit_expr(&init.expr);
+            if let Some((_, diverge)) = &init.diverge {
+                self.visit_expr(diverge);
+            }
+        }
+        if let Some(scope) = self.bound.last_mut() {
+            collect_pat_idents(&node.pat, scope);
+        }
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        let mut scope = BTreeSet::new();
+        collect_pat_idents(&node.pat, &mut scope);
+        self.bound.push(scope);
+        if let Some((_, guard)) = &node.guard {
+            self.visit_expr(guard);
+        }
+        self.visit_expr(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        let mut scope = BTreeSet::new();
+        for input in &node.inputs {
+            collect_pat_idents(input, &mut scope);
+        }
+        self.bound.push(scope);
+        self.visit_expr(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_expr(&node.expr);
+        let mut scope = BTreeSet::new();
+        collect_pat_idents(&node.pat, &mut scope);
+        self.bound.push(scope);
+        self.visit_block(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.bound.push(BTreeSet::new());
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.then_branch);
+        self.bound.pop();
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.bound.push(BTreeSet::new());
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.body);
+        self.bound.pop();
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        self.visit_expr(&node.expr);
+        if let Some(scope) = self.bound.last_mut() {
+            collect_pat_idents(&node.pat, scope);
+        }
+    }
+
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if node.qself.is_none()
+            && let Some(id) = node.path.get_ident()
+        {
+            let name = id.to_string();
+            if !self.bound.iter().any(|s| s.contains(&name)) {
+                self.names.insert(name);
+            }
+        }
+    }
+
+    fn visit_macro(&mut self, _node: &'ast syn::Macro) {
+        self.has_macro = true;
+    }
+
+    // Items declared inside the closure body cannot capture.
+    fn visit_item(&mut self, _node: &'ast Item) {}
+}
+
+/// Every trait and inherent method a candidate declares, wherever it declares it.
+///
+/// A trait or inherent `impl` applies to its type wherever the item sits: at
+/// the top level, in a block the evaluator never enters or has already left, in
+/// the body of a function that is never called, or after an early `return`. A
+/// reference that an `if` / `match` arm or an array element unsizes implicitly
+/// reaches a method call without a `&dyn Trait` marker (see
+/// `EvalRun::eval_method_call`), where native Rust still dispatches through the
+/// vtable, and an inherent `impl` anywhere takes precedence over a trait
+/// `impl`. The methods visible from the caller's enclosing blocks therefore do
+/// not decide whether a trait or inherent method could be the callee; this
+/// census of the whole file does.
+#[derive(Debug, Default)]
+struct TraitMethodCensus {
+    /// Names of the default methods of every trait, by trait name.
+    defaults: BTreeMap<String, BTreeSet<String>>,
+    /// `(Self type name, trait name, method names)` of every trait `impl`. The
+    /// `Self` type name is `None` for a generic `impl` and for a `Self` type
+    /// that is not a plain path, either of which may apply to any type.
+    impls: Vec<(Option<String>, String, BTreeSet<String>)>,
+    /// `(Self type name, method names)` of every inherent `impl`. The `Self`
+    /// type name is `None` for a generic `impl` and for a `Self` type that is
+    /// not a plain path.
+    inherent_impls: Vec<(Option<String>, BTreeSet<String>)>,
+    /// Whether the candidate invokes or defines a macro, whose expansion may
+    /// declare items, `use` aliases, or `impl`s that `syn::Visit` cannot inspect.
+    has_macro: bool,
+}
+
+impl TraitMethodCensus {
+    /// Names of the traits that give a type named `ty_name` a method named
+    /// `method`, through a method of a trait `impl` or through a default
+    /// method of the implemented trait. Types and traits are matched by name,
+    /// so a name that two scopes declare counts for both.
+    fn providers(&self, ty_name: &str, method: &str) -> BTreeSet<&str> {
+        let mut out = BTreeSet::new();
+        for (self_name, trait_name, methods) in &self.impls {
+            let applies = match self_name {
+                Some(name) => name.as_str() == ty_name,
+                None => true,
+            };
+            let provides = methods.contains(method)
+                || self
+                    .defaults
+                    .get(trait_name)
+                    .is_some_and(|names| names.contains(method));
+            if applies && provides {
+                out.insert(trait_name.as_str());
+            }
+        }
+        out
+    }
+
+    /// Whether any inherent `impl` anywhere in the candidate gives a type
+    /// named `ty_name` a method named `method`.
+    fn has_inherent(&self, ty_name: &str, method: &str) -> bool {
+        self.inherent_impls.iter().any(|(self_name, methods)| {
+            let applies = match self_name {
+                Some(name) => name.as_str() == ty_name,
+                None => true,
+            };
+            applies && methods.contains(method)
+        })
+    }
+}
+
+impl<'ast> Visit<'ast> for TraitMethodCensus {
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let names = self.defaults.entry(node.ident.to_string()).or_default();
+        for item in &node.items {
+            if let syn::TraitItem::Fn(f) = item
+                && f.default.is_some()
+            {
+                names.insert(f.sig.ident.to_string());
+            }
+        }
+        visit::visit_item_trait(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let self_name = match node.self_ty.as_ref() {
+            Type::Path(tp) if tp.qself.is_none() && node.generics.params.is_empty() => {
+                tp.path.segments.last().map(|seg| seg.ident.to_string())
+            }
+            _ => None,
+        };
+        let methods: BTreeSet<String> = node
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::ImplItem::Fn(m) => Some(m.sig.ident.to_string()),
+                _ => None,
+            })
+            .collect();
+        if let Some((_, trait_path, _)) = &node.trait_ {
+            if let Some(trait_seg) = trait_path.segments.last() {
+                self.impls
+                    .push((self_name, trait_seg.ident.to_string(), methods));
+            }
+        } else {
+            self.inherent_impls.push((self_name, methods));
+        }
+        visit::visit_item_impl(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        self.has_macro = true;
+        visit::visit_macro(self, node);
+    }
+}
+
+/// Names of the `fn`, `struct`, and `trait` items that a candidate declares
+/// inside function bodies, at any depth.
+///
+/// The body of a nested `fn` or of a method sees the items of the blocks that
+/// enclose its own declaration, but the evaluator runs it in a fresh frame
+/// that indexes only the blocks of the body itself (a closure body, by
+/// contrast, runs with the items of the frame that created the closure). A
+/// name that such a frame resolves to a top-level item may therefore name a
+/// nested item instead whenever a nested item of that name exists.
+#[derive(Debug, Default)]
+struct NestedItemNames {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for NestedItemNames {
+    fn visit_block(&mut self, node: &'ast Block) {
+        for stmt in &node.stmts {
+            match stmt {
+                Stmt::Item(Item::Fn(f)) => {
+                    self.names.insert(f.sig.ident.to_string());
+                }
+                Stmt::Item(Item::Struct(st)) => {
+                    self.names.insert(st.ident.to_string());
+                }
+                Stmt::Item(Item::Trait(tr)) => {
+                    self.names.insert(tr.ident.to_string());
+                }
+                _ => {}
+            }
+        }
+        visit::visit_block(self, node);
+    }
 }
 
 /// Root-function event predicted by [`ItreeConcreteEvaluator`], the evaluator-side
@@ -1291,21 +2167,37 @@ impl ItreeConcreteRun {
 /// Concrete interpreter for the strictly safe Rust subset emitted by
 /// [`ITREE_AST_MUTATORS`] over the ITree seeds (unsigned integer arithmetic with
 /// `-C opt-level=0` overflow panics, casts, `if` / `match` / `while`, `let` /
-/// assignment, `#[repr(C)]` struct literals and field reads, nested helper
-/// functions, and boundary calls).
+/// assignment, struct literals and field reads, arrays, shared references,
+/// nested helper functions, boundary calls, and, inside a function body:
+/// struct / trait / `impl` items with `&self` methods called directly or
+/// through a `&dyn Trait`, calls through function pointers, closures that
+/// capture by value or by reference, and `core::ptr::addr_eq`).
 ///
 /// Executing the root function records the same observable boundary that the
 /// native harness traces: root-body branch decisions and calls to top-level
 /// (`#[anneal_trace::external]`) callees with their little-endian arguments and
 /// returns, honoring an [`EnvSchedule`] exactly like `EnvSchedule::next_action`
 /// (FIFO responses, defaults, `PanicOnCall`, pass-through). Constructs outside
-/// the subset make [`Self::run`] return `Err` rather than guess.
+/// the subset make [`Self::run`] return `Err` rather than guess, except for a
+/// deref or reference-to-raw-pointer coercion at a site without a type
+/// annotation, which the evaluator cannot see (`EvalRun::eval_coerce`).
 pub struct ItreeConcreteEvaluator {
     file: File,
     root_fn_name: String,
     fns: BTreeMap<String, usize>,
-    structs: BTreeMap<String, Vec<(String, EvalTy)>>,
+    /// Top-level struct declarations: `name -> Some((item_id, fields))` for
+    /// non-generic named-field structs, or `None` for unsupported structs.
+    structs: BTreeMap<String, Option<(usize, EvalStructDef)>>,
+    /// Top-level trait declarations: `name -> item_id`.
+    traits: BTreeMap<String, usize>,
+    /// First top-level item outside the supported subset (`use`, `mod`,
+    /// `const`, `static`, `type`, `enum`, `union`, `macro_rules!`, etc.),
+    /// rejected on [`Self::run`].
+    unsupported_top_item: Option<&'static str>,
     branch_sites: BTreeMap<usize, u32>,
+    trait_census: TraitMethodCensus,
+    /// See [`NestedItemNames`].
+    nested_item_names: BTreeSet<String>,
 }
 
 impl ItreeConcreteEvaluator {
@@ -1314,33 +2206,58 @@ impl ItreeConcreteEvaluator {
     pub fn new(source: &str, root_fn_name: &str) -> Result<Self, String> {
         let file = syn::parse_str::<File>(source).map_err(|e| e.to_string())?;
         let mut fns = BTreeMap::new();
-        let mut structs = BTreeMap::new();
+        let mut unsupported_top_item = None;
         for (idx, item) in file.items.iter().enumerate() {
             match item {
                 Item::Fn(f) => {
                     fns.insert(f.sig.ident.to_string(), idx);
                 }
-                Item::Struct(s) => {
-                    let fields = s
-                        .fields
-                        .iter()
-                        .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
-                        .collect();
-                    structs.insert(s.ident.to_string(), fields);
+                Item::Struct(_) | Item::Trait(_) | Item::Impl(_) => {}
+                _ => {
+                    unsupported_top_item.get_or_insert("unsupported top-level item");
                 }
-                _ => {}
             }
         }
         let Some(&root_idx) = fns.get(root_fn_name) else {
             return Err(format!("root function `{root_fn_name}` not found"));
         };
+        let mut trait_census = TraitMethodCensus::default();
+        trait_census.visit_file(&file);
+        let mut nested_items = NestedItemNames::default();
+        nested_items.visit_file(&file);
         let mut evaluator = Self {
             file,
             root_fn_name: root_fn_name.to_string(),
             fns,
-            structs,
+            structs: BTreeMap::new(),
+            traits: BTreeMap::new(),
+            unsupported_top_item,
             branch_sites: BTreeMap::new(),
+            trait_census,
+            nested_item_names: nested_items.names,
         };
+        let mut structs = BTreeMap::new();
+        let mut traits = BTreeMap::new();
+        for item in &evaluator.file.items {
+            match item {
+                Item::Struct(s) => {
+                    let fields: EvalStructDef = s
+                        .fields
+                        .iter()
+                        .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
+                        .collect();
+                    let def = (s.generics.params.is_empty() && fields.len() == s.fields.len())
+                        .then_some((s as *const syn::ItemStruct as usize, fields));
+                    structs.insert(s.ident.to_string(), def);
+                }
+                Item::Trait(tr) => {
+                    traits.insert(tr.ident.to_string(), tr as *const syn::ItemTrait as usize);
+                }
+                _ => {}
+            }
+        }
+        evaluator.structs = structs;
+        evaluator.traits = traits;
         let mut collector = BranchSiteCollector::default();
         if let Item::Fn(root) = &evaluator.file.items[root_idx] {
             collector.visit_block(&root.block);
@@ -1411,6 +2328,12 @@ impl ItreeConcreteEvaluator {
         schedule: &EnvSchedule,
         callee_key_prefix: &str,
     ) -> Result<ItreeConcreteRun, String> {
+        if let Some(reason) = self.unsupported_top_item {
+            return Err(reason.to_string());
+        }
+        if self.trait_census.has_macro {
+            return Err("macro in candidate source".to_string());
+        }
         let root = self
             .top_fn(&self.root_fn_name)
             .ok_or_else(|| format!("root function `{}` not found", self.root_fn_name))?;
@@ -1441,6 +2364,10 @@ impl ItreeConcreteEvaluator {
             events: Vec::new(),
             global_call_idx: 0,
             steps: 0,
+            fn_table: Vec::new(),
+            closures: Vec::new(),
+            next_frame_id: 0,
+            next_alloc_id: 0,
         };
         let outcome = match ctx.call_fn(root, args, true) {
             Ok(v) => ItreeConcreteOutcome::Return(match eval_encode(&v) {
@@ -1474,12 +2401,105 @@ impl ItreeConcreteEvaluator {
     }
 }
 
+/// Fields of a struct declared by an item statement, in declaration order.
+type EvalStructDef = Vec<(String, EvalTy)>;
+
+/// Methods of the `impl` items of one block, keyed by
+/// `(Self ItemStruct id, Option<ItemTrait id>, method name)` (`None` for
+/// inherent `impl`s).
+type EvalMethodTable<'a> = BTreeMap<(usize, Option<usize>, String), &'a syn::ImplItemFn>;
+
 struct EvalFrame<'a> {
     scopes: Vec<BTreeMap<String, EvalValue>>,
+    /// Binding identities (`EvalRef::addr`) of the variables of `scopes` that a
+    /// reference was taken to; parallel to `scopes`.
+    allocs: Vec<BTreeMap<String, u64>>,
+    /// Variables of the outermost scope whose address is not modeled: the
+    /// captures of a closure that may hold them either by reference or by
+    /// value (see `EvalRun::call_closure`).
+    unplaced: BTreeSet<String>,
+    /// Number of bindings of each name made in this frame so far. A closure
+    /// records the count of every variable it captures by reference and
+    /// refuses to run once one of them was bound again, since the name would
+    /// then resolve to a different variable.
+    bind_gen: BTreeMap<String, u64>,
     local_fns: Vec<BTreeMap<String, &'a syn::ItemFn>>,
+    /// `Some((item_id, fields))` for supported nested structs, or `None` for
+    /// generic/tuple nested structs (so they still shadow outer structs).
+    local_structs: Vec<BTreeMap<String, Option<(usize, EvalStructDef)>>>,
+    /// Nested trait declarations visible in enclosing blocks (`name -> item_id`).
+    local_traits: Vec<BTreeMap<String, usize>>,
+    local_methods: Vec<EvalMethodTable<'a>>,
+    /// Identity of this function, method, or closure invocation.
+    id: u64,
     /// Only the root body is instrumented: its branches and top-level calls are
     /// observable events; callee bodies run natively.
     is_root: bool,
+}
+
+impl<'a> EvalFrame<'a> {
+    fn new(scope: BTreeMap<String, EvalValue>, id: u64, is_root: bool) -> Self {
+        let mut frame = Self {
+            scopes: Vec::new(),
+            allocs: Vec::new(),
+            unplaced: BTreeSet::new(),
+            bind_gen: BTreeMap::new(),
+            local_fns: Vec::new(),
+            local_structs: Vec::new(),
+            local_traits: Vec::new(),
+            local_methods: Vec::new(),
+            id,
+            is_root,
+        };
+        frame.push_scope(scope);
+        frame
+    }
+
+    /// Enter a scope whose bindings are `scope`.
+    fn push_scope(&mut self, scope: BTreeMap<String, EvalValue>) {
+        for name in scope.keys() {
+            *self.bind_gen.entry(name.clone()).or_insert(0) += 1;
+        }
+        self.scopes.push(scope);
+        self.allocs.push(BTreeMap::new());
+    }
+
+    fn pop_scope(&mut self) {
+        self.scopes.pop();
+        self.allocs.pop();
+    }
+
+    /// Bind `name` to `v` in the innermost scope (shadowing any binding of
+    /// `name` there, which is a new variable with a new address).
+    fn bind(&mut self, name: String, v: EvalValue) {
+        *self.bind_gen.entry(name.clone()).or_insert(0) += 1;
+        if let Some(allocs) = self.allocs.last_mut() {
+            allocs.remove(&name);
+        }
+        if let Some(scope) = self.scopes.last_mut() {
+            scope.insert(name, v);
+        }
+    }
+}
+
+/// A closure value: its expression, the variables it captured, and where it
+/// was created.
+struct EvalClosure<'a> {
+    expr: &'a syn::ExprClosure,
+    /// Captured variables and their values when the closure was created.
+    env: BTreeMap<String, EvalValue>,
+    /// `move` closure: it owns the copies in `env`.
+    by_move: bool,
+    /// Frame that created the closure.
+    def_frame: u64,
+    /// `EvalFrame::bind_gen` of every captured variable at creation.
+    gens: Vec<(String, u64)>,
+    /// Lexical `fn` / `struct` / `trait` / `impl` items visible where the
+    /// closure was created.
+    local_fns: Vec<BTreeMap<String, &'a syn::ItemFn>>,
+    local_structs: Vec<BTreeMap<String, Option<(usize, EvalStructDef)>>>,
+    local_traits: Vec<BTreeMap<String, usize>>,
+    local_methods: Vec<EvalMethodTable<'a>>,
 }
 
 struct EvalRun<'a> {
@@ -1489,6 +2509,14 @@ struct EvalRun<'a> {
     events: Vec<ItreeConcreteEvent>,
     global_call_idx: usize,
     steps: usize,
+    /// Functions that `EvalValue::FnRef` values index.
+    fn_table: Vec<&'a syn::ItemFn>,
+    /// Closures that `EvalValue::Closure` values index.
+    closures: Vec<EvalClosure<'a>>,
+    /// Next `EvalFrame::id`.
+    next_frame_id: u64,
+    /// Next binding identity for `EvalRef::addr`.
+    next_alloc_id: u64,
 }
 
 impl<'a> EvalRun<'a> {
@@ -1508,7 +2536,143 @@ impl<'a> EvalRun<'a> {
         }
     }
 
+    /// Resolve struct `name` in `frame`'s enclosing blocks, falling back to
+    /// top-level structs only when no nested item anywhere shares `name`.
+    fn resolve_struct(
+        &self,
+        frame: &EvalFrame<'a>,
+        name: &str,
+    ) -> Result<(usize, EvalStructDef), EvalCtrl> {
+        for structs in frame.local_structs.iter().rev() {
+            if let Some(entry) = structs.get(name) {
+                return match entry {
+                    Some(def) => Ok(def.clone()),
+                    None => eval_unsupported(format!("unsupported struct `{name}`")),
+                };
+            }
+        }
+        // This frame may not index the nested struct that `name` refers to
+        // (see `NestedItemNames`).
+        if self.ev.nested_item_names.contains(name) {
+            return eval_unsupported(format!("struct `{name}` is also a nested item"));
+        }
+        match self.ev.structs.get(name) {
+            Some(Some(def)) => Ok(def.clone()),
+            Some(None) => eval_unsupported(format!("unsupported struct `{name}`")),
+            None => eval_unsupported(format!("unknown struct `{name}`")),
+        }
+    }
+
+    /// Resolve trait `name` in `frame`'s enclosing blocks, falling back to
+    /// top-level traits only when no nested item anywhere shares `name`.
+    fn resolve_trait(&self, frame: &EvalFrame<'a>, name: &str) -> Result<usize, EvalCtrl> {
+        for traits in frame.local_traits.iter().rev() {
+            if let Some(&id) = traits.get(name) {
+                return Ok(id);
+            }
+        }
+        if self.ev.nested_item_names.contains(name) {
+            return eval_unsupported(format!("trait `{name}` is also a nested item"));
+        }
+        match self.ev.traits.get(name) {
+            Some(&id) => Ok(id),
+            None => eval_unsupported(format!("unknown trait `{name}`")),
+        }
+    }
+
+    /// Coerce `v` to `ty`, the declared type of a `let`, parameter, struct
+    /// field, array element, or return value, resolving the struct and trait
+    /// names of `ty` in `frame` (at the top level when `frame` is `None`).
+    ///
+    /// Only these annotated sites coerce. Rust also coerces where no
+    /// annotation says to what: at an assignment, where the arms of an `if` /
+    /// `match` or the elements of an array literal unify, and at a closure
+    /// whose signature comes from its expected type. [`TraitMethodCensus`]
+    /// accounts for a reference that such a site unsizes to `&dyn Trait`. A
+    /// deref coercion (`&&T` to `&T`) or a reference-to-raw-pointer coercion
+    /// at such a site is neither modeled nor detected, so a candidate has to
+    /// give a nested reference or a raw pointer its type at a `let`,
+    /// parameter, field, return, or `as` cast.
+    fn eval_coerce(
+        &self,
+        frame: Option<&EvalFrame<'a>>,
+        v: EvalValue,
+        ty: &EvalTy,
+    ) -> EvalRes {
+        match (v, ty) {
+            (v, EvalTy::Infer) => Ok(v),
+            (EvalValue::Int(x, EvalIntTy::Infer), EvalTy::Int(t)) => coerce_inferred_int(x, *t),
+            (EvalValue::Int(x, s), EvalTy::Int(t)) if s == *t => Ok(EvalValue::Int(x, s)),
+            (EvalValue::Bool(b), EvalTy::Bool) => Ok(EvalValue::Bool(b)),
+            (EvalValue::Unit, EvalTy::Unit) => Ok(EvalValue::Unit),
+            (EvalValue::Struct(id, n, f), EvalTy::Named(m)) if n == *m => {
+                if let Some(frame) = frame {
+                    let (expected_id, _) = self.resolve_struct(frame, m)?;
+                    if id != expected_id {
+                        return eval_unsupported(format!(
+                            "struct `{n}` does not match `{m}` in scope"
+                        ));
+                    }
+                }
+                Ok(EvalValue::Struct(id, n, f))
+            }
+            (EvalValue::Ref(r), EvalTy::Ref(expected_depth)) => {
+                Ok(EvalValue::Ref(peel_ref_layers(r, *expected_depth)?))
+            }
+            (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                // `&&T` unsizes to `&dyn Trait` only through an
+                // `impl Trait for &T`, whose vtable the evaluator does not
+                // index, so a nested reference is rejected rather than
+                // auto-dereferenced to `T`'s vtable.
+                if eval_ref_depth(&r) != 1 {
+                    return eval_unsupported("trait-object coercion of a nested reference");
+                }
+                let trait_id = match frame {
+                    Some(frame) => self.resolve_trait(frame, tr)?,
+                    None => {
+                        if self.ev.nested_item_names.contains(tr) {
+                            return eval_unsupported(format!(
+                                "trait `{tr}` is also a nested item"
+                            ));
+                        }
+                        match self.ev.traits.get(tr) {
+                            Some(&id) => id,
+                            None => return eval_unsupported(format!("unknown trait `{tr}`")),
+                        }
+                    }
+                };
+                let mut inner = r.autoderef();
+                inner.dyn_trait = Some(trait_id);
+                Ok(EvalValue::Ref(Box::new(inner)))
+            }
+            (EvalValue::Ref(r), EvalTy::ConstPtr(expected_depth)) => {
+                let r = peel_ref_layers(r, *expected_depth)?;
+                Ok(EvalValue::ConstPtr {
+                    addr: r.addr,
+                    nonzero: eval_value_is_sized_nonzero(&r.val),
+                })
+            }
+            (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr(_)) => Ok(v),
+            (v @ EvalValue::FnRef(_), EvalTy::FnPtr) => Ok(v),
+            (
+                v @ EvalValue::Closure {
+                    captures: false, ..
+                },
+                EvalTy::FnPtr,
+            ) => Ok(v),
+            (EvalValue::Array(elems), EvalTy::Array(elem_ty)) => elems
+                .into_iter()
+                .map(|e| self.eval_coerce(frame, e, elem_ty))
+                .collect::<Result<Vec<_>, _>>()
+                .map(EvalValue::Array),
+            (v, ty) => eval_unsupported(format!("value {v:?} does not have type {ty:?}")),
+        }
+    }
+
     fn call_fn(&mut self, func: &'a syn::ItemFn, args: Vec<EvalValue>, is_root: bool) -> EvalRes {
+        if !func.sig.generics.params.is_empty() {
+            return eval_unsupported(format!("generic function `{}`", func.sig.ident));
+        }
         if func.sig.inputs.len() != args.len() {
             return eval_unsupported(format!("arity mismatch calling `{}`", func.sig.ident));
         }
@@ -1520,13 +2684,12 @@ impl<'a> EvalRun<'a> {
             let Pat::Ident(pi) = pt.pat.as_ref() else {
                 return eval_unsupported("parameter pattern");
             };
-            scope.insert(pi.ident.to_string(), eval_coerce(arg, &eval_ty_of(&pt.ty))?);
+            scope.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?,
+            );
         }
-        let mut frame = EvalFrame {
-            scopes: vec![scope],
-            local_fns: Vec::new(),
-            is_root,
-        };
+        let mut frame = EvalFrame::new(scope, self.fresh_frame_id(), is_root);
         let value = match self.eval_block(&mut frame, &func.block) {
             Ok(v) | Err(EvalCtrl::Return(v)) => v,
             Err(EvalCtrl::Break | EvalCtrl::Continue) => {
@@ -1534,21 +2697,312 @@ impl<'a> EvalRun<'a> {
             }
             Err(e) => return Err(e),
         };
-        eval_coerce(value, &ret_ty_of(&func.sig.output))
+        self.eval_coerce(Some(&frame), value, &ret_ty_of(&func.sig.output))
+    }
+
+    fn fresh_frame_id(&mut self) -> u64 {
+        let id = self.next_frame_id;
+        self.next_frame_id += 1;
+        id
+    }
+
+    /// Call the `&self` method `method` of an `impl` item on the reference
+    /// `self_ref`.
+    fn call_method(
+        &mut self,
+        method: &'a syn::ImplItemFn,
+        self_ref: EvalValue,
+        args: Vec<EvalValue>,
+    ) -> EvalRes {
+        if !method.sig.generics.params.is_empty() {
+            return eval_unsupported(format!("generic method `{}`", method.sig.ident));
+        }
+        let mut inputs = method.sig.inputs.iter();
+        match inputs.next() {
+            Some(FnArg::Receiver(rcv))
+                if rcv.reference.is_some()
+                    && rcv.mutability.is_none()
+                    && rcv.colon_token.is_none() => {}
+            _ => return eval_unsupported("method without a `&self` receiver"),
+        }
+        if inputs.len() != args.len() {
+            return eval_unsupported(format!("arity mismatch calling `{}`", method.sig.ident));
+        }
+        let mut scope = BTreeMap::new();
+        scope.insert("self".to_string(), self_ref);
+        for (input, arg) in inputs.zip(args) {
+            let FnArg::Typed(pt) = input else {
+                return eval_unsupported("method receiver");
+            };
+            let Pat::Ident(pi) = pt.pat.as_ref() else {
+                return eval_unsupported("parameter pattern");
+            };
+            scope.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?,
+            );
+        }
+        let mut frame = EvalFrame::new(scope, self.fresh_frame_id(), false);
+        let value = match self.eval_block(&mut frame, &method.block) {
+            Ok(v) | Err(EvalCtrl::Return(v)) => v,
+            Err(EvalCtrl::Break | EvalCtrl::Continue) => {
+                return eval_unsupported("`break` / `continue` outside of a loop");
+            }
+            Err(e) => return Err(e),
+        };
+        self.eval_coerce(Some(&frame), value, &ret_ty_of(&method.sig.output))
+    }
+
+    /// Create the closure value of `expr`, capturing every free variable of
+    /// `frame` that its body names.
+    fn make_closure(&mut self, frame: &EvalFrame<'a>, expr: &'a syn::ExprClosure) -> EvalRes {
+        if expr.asyncness.is_some()
+            || expr.constness.is_some()
+            || expr.movability.is_some()
+            || expr.lifetimes.is_some()
+        {
+            return eval_unsupported("closure qualifier");
+        }
+        let mut free = ClosureFreeIdents::default();
+        free.visit_expr_closure(expr);
+        if free.has_macro {
+            return eval_unsupported("macro in closure body");
+        }
+        let mut env = BTreeMap::new();
+        let mut gens = Vec::new();
+        for name in free.names {
+            if let Some(v) = Self::lookup(frame, &name) {
+                gens.push((
+                    name.clone(),
+                    frame.bind_gen.get(&name).copied().unwrap_or(0),
+                ));
+                env.insert(name, v);
+            }
+        }
+        let id = self.closures.len();
+        let captures = !env.is_empty();
+        self.closures.push(EvalClosure {
+            expr,
+            env,
+            by_move: expr.capture.is_some(),
+            def_frame: frame.id,
+            gens,
+            local_fns: frame.local_fns.clone(),
+            local_structs: frame.local_structs.clone(),
+            local_traits: frame.local_traits.clone(),
+            local_methods: frame.local_methods.clone(),
+        });
+        Ok(EvalValue::Closure { id, captures })
+    }
+
+    /// Call closure `id` from `frame`.
+    ///
+    /// A closure that captures by reference and is called from the frame that
+    /// created it reads its captured variables' current values (sharing their
+    /// stack allocation identities for `addr_eq`) and writes any it assigns
+    /// back to them (a unique borrow). A captured struct or closure may be held
+    /// by reference or by value, so its address inside the closure is not
+    /// modeled. A `move` closure, or a closure that captures nothing, runs on
+    /// the values captured at creation; such a call must not assign a captured
+    /// variable, because the evaluator has no storage that would carry the
+    /// assignment to the next call. A closure that borrows its captures and is
+    /// called from any other frame (for example from the body of another
+    /// closure) is rejected: only the frame that created it can supply the
+    /// addresses of the variables it borrows.
+    fn call_closure(
+        &mut self,
+        frame: &mut EvalFrame<'a>,
+        id: usize,
+        args: Vec<EvalValue>,
+    ) -> EvalRes {
+        let Some(closure) = self.closures.get(id) else {
+            return eval_unsupported("unknown closure");
+        };
+        let expr = closure.expr;
+        let live = !closure.by_move && closure.def_frame == frame.id;
+        let mut env = closure.env.clone();
+        let local_fns = closure.local_fns.clone();
+        let local_structs = closure.local_structs.clone();
+        let local_traits = closure.local_traits.clone();
+        let local_methods = closure.local_methods.clone();
+        if !closure.by_move && !live && !env.is_empty() {
+            return eval_unsupported(
+                "by-reference closure called outside the frame that created it",
+            );
+        }
+        if live {
+            for (name, generation) in &closure.gens {
+                if frame.bind_gen.get(name).copied().unwrap_or(0) != *generation {
+                    return eval_unsupported(format!(
+                        "closure-captured variable `{name}` was bound again"
+                    ));
+                }
+            }
+        }
+        let mut live_allocs = BTreeMap::new();
+        // Captured variables whose address inside the closure is not modeled.
+        let mut unplaced = BTreeSet::new();
+        if live {
+            for (name, slot) in &mut env {
+                match Self::lookup(frame, name) {
+                    Some(v) => *slot = v,
+                    None => {
+                        return eval_unsupported(format!(
+                            "closure-captured variable `{name}` left scope"
+                        ));
+                    }
+                }
+                if !eval_value_is_copy(slot) {
+                    unplaced.insert(name.clone());
+                } else if let Some(alloc) = self.alloc_id_of(frame, name) {
+                    live_allocs.insert(name.clone(), alloc);
+                }
+            }
+        }
+        if expr.inputs.len() != args.len() {
+            return eval_unsupported("arity mismatch calling a closure");
+        }
+        let before = env.clone();
+        // A closure body is not instrumented, so it runs like a callee body.
+        let mut closure_frame = EvalFrame::new(env, self.fresh_frame_id(), false);
+        closure_frame.local_fns = local_fns;
+        closure_frame.local_structs = local_structs;
+        closure_frame.local_traits = local_traits;
+        closure_frame.local_methods = local_methods;
+        if !live_allocs.is_empty()
+            && let Some(allocs0) = closure_frame.allocs.first_mut()
+        {
+            *allocs0 = live_allocs;
+        }
+        closure_frame.unplaced = unplaced;
+        let mut params = BTreeMap::new();
+        for (input, arg) in expr.inputs.iter().zip(args) {
+            let (pat, ty) = match input {
+                Pat::Type(pt) => (pt.pat.as_ref(), eval_ty_of(&pt.ty)),
+                other => (other, EvalTy::Infer),
+            };
+            let Pat::Ident(pi) = pat else {
+                return eval_unsupported("closure parameter pattern");
+            };
+            if pi.subpat.is_some() || pi.by_ref.is_some() {
+                return eval_unsupported("closure parameter pattern");
+            }
+            params.insert(
+                pi.ident.to_string(),
+                self.eval_coerce(Some(&closure_frame), arg, &ty)?,
+            );
+        }
+        closure_frame.push_scope(params);
+        let value = match self.eval_expr(&mut closure_frame, &expr.body) {
+            Ok(v) | Err(EvalCtrl::Return(v)) => v,
+            Err(EvalCtrl::Break | EvalCtrl::Continue) => {
+                return eval_unsupported("`break` / `continue` outside of a loop");
+            }
+            Err(e) => return Err(e),
+        };
+        let value = match &expr.output {
+            ReturnType::Default => value,
+            ReturnType::Type(_, ty) => {
+                self.eval_coerce(Some(&closure_frame), value, &eval_ty_of(ty))?
+            }
+        };
+        let after = closure_frame.scopes.swap_remove(0);
+        if after != before {
+            if !live {
+                return eval_unsupported("closure assigned a captured variable it does not borrow");
+            }
+            for (name, v) in after {
+                if before.get(&name) != Some(&v) {
+                    Self::assign_var(frame, &name, v)?;
+                }
+            }
+        }
+        Ok(value)
     }
 
     fn eval_block(&mut self, frame: &mut EvalFrame<'a>, block: &'a Block) -> EvalRes {
         let mut fns = BTreeMap::new();
+        let mut structs: BTreeMap<String, Option<(usize, EvalStructDef)>> = BTreeMap::new();
+        let mut traits: BTreeMap<String, usize> = BTreeMap::new();
         for stmt in &block.stmts {
-            if let Stmt::Item(Item::Fn(f)) = stmt {
-                fns.insert(f.sig.ident.to_string(), f);
+            match stmt {
+                Stmt::Item(Item::Fn(f)) => {
+                    fns.insert(f.sig.ident.to_string(), f);
+                }
+                Stmt::Item(Item::Struct(st)) => {
+                    let fields: EvalStructDef = st
+                        .fields
+                        .iter()
+                        .filter_map(|f| Some((f.ident.as_ref()?.to_string(), eval_ty_of(&f.ty))))
+                        .collect();
+                    // Only a non-generic struct whose fields are all named
+                    // is a struct the evaluator can build and read; insert
+                    // `None` otherwise so it still shadows any outer struct.
+                    let def = (st.generics.params.is_empty() && fields.len() == st.fields.len())
+                        .then_some((st as *const syn::ItemStruct as usize, fields));
+                    structs.insert(st.ident.to_string(), def);
+                }
+                // A trait declares signatures only; `TraitMethodCensus`
+                // accounts for the default methods it may also carry.
+                Stmt::Item(Item::Trait(tr)) => {
+                    traits.insert(tr.ident.to_string(), tr as *const syn::ItemTrait as usize);
+                }
+                Stmt::Item(Item::Impl(_)) => {}
+                // Any other item (`use`, `const`, `static`, `mod`, ...) or
+                // macro statement is in scope throughout the block, before its
+                // own statement and past an early `return` alike, so it is
+                // rejected when the block is entered rather than when reached.
+                Stmt::Item(_) => return eval_unsupported("nested item"),
+                Stmt::Macro(_) => return eval_unsupported("macro statement"),
+                _ => {}
             }
         }
-        frame.scopes.push(BTreeMap::new());
+        frame.push_scope(BTreeMap::new());
         frame.local_fns.push(fns);
+        frame.local_structs.push(structs);
+        frame.local_traits.push(traits);
+        let mut methods: EvalMethodTable<'a> = BTreeMap::new();
+        for stmt in &block.stmts {
+            let Stmt::Item(Item::Impl(im)) = stmt else {
+                continue;
+            };
+            let self_ty = match im.self_ty.as_ref() {
+                Type::Path(tp) if tp.qself.is_none() => tp.path.get_ident(),
+                _ => None,
+            };
+            let trait_name = match &im.trait_ {
+                None => Some(None),
+                Some((None, path, _)) => path.get_ident().map(|id| Some(id.to_string())),
+                Some((Some(_), _, _)) => None,
+            };
+            // A generic `impl`, negative `impl`, or one for a non-local
+            // type/trait registers nothing, so calling it is rejected.
+            if let Some(self_ty) = self_ty
+                && let Some(trait_name) = trait_name
+                && im.generics.params.is_empty()
+                && let Ok((self_id, _)) = self.resolve_struct(frame, &self_ty.to_string())
+            {
+                let trait_id = match trait_name {
+                    None => Some(None),
+                    Some(tr_name) => self.resolve_trait(frame, &tr_name).ok().map(Some),
+                };
+                if let Some(trait_id) = trait_id {
+                    for impl_item in &im.items {
+                        if let syn::ImplItem::Fn(m) = impl_item {
+                            let key = (self_id, trait_id, m.sig.ident.to_string());
+                            methods.insert(key, m);
+                        }
+                    }
+                }
+            }
+        }
+        frame.local_methods.push(methods);
         let res = self.eval_stmts(frame, &block.stmts);
+        frame.local_methods.pop();
+        frame.local_traits.pop();
+        frame.local_structs.pop();
         frame.local_fns.pop();
-        frame.scopes.pop();
+        frame.pop_scope();
         res
     }
 
@@ -1558,8 +3012,8 @@ impl<'a> EvalRun<'a> {
             last = EvalValue::Unit;
             match stmt {
                 Stmt::Local(loc) => self.eval_local(frame, loc)?,
-                Stmt::Item(Item::Fn(_)) => {}
-                Stmt::Item(_) => return eval_unsupported("nested non-function item"),
+                // Declarations that `eval_block` checked and indexed on entry.
+                Stmt::Item(_) => {}
                 Stmt::Expr(e, semi) => {
                     let v = self.eval_expr(frame, e)?;
                     if semi.is_none() && i + 1 == stmts.len() {
@@ -1577,11 +3031,23 @@ impl<'a> EvalRun<'a> {
         frame: &mut EvalFrame<'a>,
         loc: &'a syn::Local,
     ) -> Result<(), EvalCtrl> {
+        if let Pat::Slice(ps) = &loc.pat {
+            let Some(init) = &loc.init else {
+                return eval_unsupported("uninitialized `let`");
+            };
+            if init.diverge.is_some() {
+                return eval_unsupported("`let ... else`");
+            }
+            let v = self.eval_expr(frame, &init.expr)?;
+            return Self::bind_slice_pattern(frame, ps, v);
+        }
         let (name, ty) = match &loc.pat {
-            Pat::Ident(pi) if pi.subpat.is_none() => (Some(pi.ident.to_string()), EvalTy::Infer),
+            Pat::Ident(pi) if pi.subpat.is_none() && pi.by_ref.is_none() => {
+                (Some(pi.ident.to_string()), EvalTy::Infer)
+            }
             Pat::Wild(_) => (None, EvalTy::Infer),
             Pat::Type(pt) => match pt.pat.as_ref() {
-                Pat::Ident(pi) if pi.subpat.is_none() => {
+                Pat::Ident(pi) if pi.subpat.is_none() && pi.by_ref.is_none() => {
                     (Some(pi.ident.to_string()), eval_ty_of(&pt.ty))
                 }
                 Pat::Wild(_) => (None, eval_ty_of(&pt.ty)),
@@ -1596,11 +3062,95 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("`let ... else`");
         }
         let v = self.eval_expr(frame, &init.expr)?;
-        let v = eval_coerce(v, &ty)?;
-        if let Some(name) = name
-            && let Some(scope) = frame.scopes.last_mut()
-        {
-            scope.insert(name, v);
+        let v = self.eval_coerce(Some(&*frame), v, &ty)?;
+        if let Some(name) = name {
+            frame.bind(name, v);
+        }
+        Ok(())
+    }
+
+    /// Bind the identifiers of the irrefutable array pattern `ps` (elements
+    /// that are `_`, an identifier, `..`, or `name @ ..`) to the elements of
+    /// `v`: an array, or a reference to one, in which case every identifier
+    /// binds a reference to its element or sub-array.
+    fn bind_slice_pattern(
+        frame: &mut EvalFrame<'a>,
+        ps: &'a syn::PatSlice,
+        v: EvalValue,
+    ) -> Result<(), EvalCtrl> {
+        let (elems, base_addr, by_ref) = match v {
+            EvalValue::Array(elems) => (elems, None, false),
+            EvalValue::Ref(r) => {
+                let r = r.autoderef();
+                let local_addr = match r.addr {
+                    Some(EvalAddr::Local(alloc, off)) => Some((alloc, off)),
+                    _ => None,
+                };
+                match r.val {
+                    EvalValue::Array(elems) => (elems, local_addr, true),
+                    _ => return eval_unsupported("array pattern on a non-array"),
+                }
+            }
+            _ => return eval_unsupported("array pattern on a non-array"),
+        };
+        let is_rest = |p: &Pat| match p {
+            Pat::Rest(_) => true,
+            Pat::Ident(pi) => {
+                matches!(pi.subpat.as_ref(), Some((_, sub)) if matches!(**sub, Pat::Rest(_)))
+            }
+            _ => false,
+        };
+        let pats: Vec<&Pat> = ps.elems.iter().collect();
+        let rest_positions: Vec<usize> = (0..pats.len()).filter(|&i| is_rest(pats[i])).collect();
+        let (rest_pos, rest_len) = match rest_positions.as_slice() {
+            [] if pats.len() == elems.len() => (None, 0),
+            [pos] if pats.len() - 1 <= elems.len() => (Some(*pos), elems.len() - (pats.len() - 1)),
+            _ => return eval_unsupported("array pattern length mismatch"),
+        };
+        // Byte offset of element `idx` from the array's start, when every
+        // element before it has a known size.
+        let offset_of = |idx: usize| -> Option<u64> {
+            let mut off = 0u64;
+            for e in &elems[..idx] {
+                off = off.checked_add(eval_value_size(e)?)?;
+            }
+            Some(off)
+        };
+        for (i, pat) in pats.iter().enumerate() {
+            // Elements `[start, end)` that pattern element `i` covers.
+            let (start, end) = match rest_pos {
+                Some(pos) if i == pos => (pos, pos + rest_len),
+                Some(pos) if i > pos => (i - 1 + rest_len, i + rest_len),
+                _ => (i, i + 1),
+            };
+            let pi = match pat {
+                Pat::Wild(_) | Pat::Rest(_) => continue,
+                Pat::Ident(pi) if pi.by_ref.is_none() && pi.mutability.is_none() => pi,
+                _ => return eval_unsupported("array pattern element"),
+            };
+            let covered = if is_rest(pat) {
+                EvalValue::Array(elems[start..end].to_vec())
+            } else if pi.subpat.is_none() {
+                elems[start].clone()
+            } else {
+                return eval_unsupported("array pattern element");
+            };
+            let bound = if by_ref {
+                let addr = match (base_addr, offset_of(start)) {
+                    (Some((alloc, base_off)), Some(off)) => base_off
+                        .checked_add(off)
+                        .map(|total| EvalAddr::Local(alloc, total)),
+                    _ => None,
+                };
+                EvalValue::Ref(Box::new(EvalRef {
+                    addr,
+                    val: covered,
+                    dyn_trait: None,
+                }))
+            } else {
+                covered
+            };
+            frame.bind(pi.ident.to_string(), bound);
         }
         Ok(())
     }
@@ -1613,6 +3163,132 @@ impl<'a> EvalRun<'a> {
             .find_map(|scope| scope.get(name).cloned())
     }
 
+    /// Identity of the variable `name` of `frame` (for `EvalRef::addr`),
+    /// assigned on first use; `None` for a variable whose address is not
+    /// modeled (`EvalFrame::unplaced`).
+    fn alloc_id_of(&mut self, frame: &mut EvalFrame<'a>, name: &str) -> Option<u64> {
+        let depth = frame
+            .scopes
+            .iter()
+            .rposition(|scope| scope.contains_key(name))?;
+        if depth == 0 && frame.unplaced.contains(name) {
+            return None;
+        }
+        if let Some(&id) = frame.allocs[depth].get(name) {
+            return Some(id);
+        }
+        let id = self.next_alloc_id;
+        self.next_alloc_id += 1;
+        frame.allocs[depth].insert(name.to_string(), id);
+        Some(id)
+    }
+
+    /// The shared reference `&place`.
+    ///
+    /// A variable has an address of its own; an array element's is its
+    /// array's plus the sizes of the elements before it; a struct field's
+    /// depends on a layout the evaluator does not compute, and a temporary's
+    /// may be shared with another constant's, so neither is modeled.
+    fn eval_borrow(&mut self, frame: &mut EvalFrame<'a>, place: &'a Expr) -> EvalRes {
+        let unplaced = |val: EvalValue| {
+            Ok(EvalValue::Ref(Box::new(EvalRef {
+                addr: None,
+                val,
+                dyn_trait: None,
+            })))
+        };
+        match place {
+            Expr::Paren(p) => self.eval_borrow(frame, &p.expr),
+            Expr::Group(g) => self.eval_borrow(frame, &g.expr),
+            Expr::Path(p) if p.qself.is_none() && p.path.get_ident().is_some() => {
+                let name = p
+                    .path
+                    .get_ident()
+                    .map(ToString::to_string)
+                    .unwrap_or_default();
+                let Some(val) = Self::lookup(frame, &name) else {
+                    // A function item: `&f` borrows a temporary.
+                    let val = self.eval_expr(frame, place)?;
+                    return unplaced(val);
+                };
+                let addr = self
+                    .alloc_id_of(frame, &name)
+                    .map(|alloc| EvalAddr::Local(alloc, 0));
+                Ok(EvalValue::Ref(Box::new(EvalRef {
+                    addr,
+                    val,
+                    dyn_trait: None,
+                })))
+            }
+            Expr::Unary(u) if matches!(u.op, syn::UnOp::Deref(_)) => {
+                match self.eval_expr(frame, &u.expr)? {
+                    r @ EvalValue::Ref(_) => Ok(r),
+                    _ => eval_unsupported("dereference of a non-reference"),
+                }
+            }
+            Expr::Field(f) => {
+                let EvalValue::Ref(base) = self.eval_borrow(frame, &f.base)? else {
+                    return eval_unsupported("field borrow");
+                };
+                match (base.autoderef().val, &f.member) {
+                    (EvalValue::Struct(_, _, fields), syn::Member::Named(id)) => {
+                        match fields.get(&id.to_string()) {
+                            Some(val) => unplaced(val.clone()),
+                            None => eval_unsupported(format!("unknown field `{id}`")),
+                        }
+                    }
+                    _ => eval_unsupported("field borrow"),
+                }
+            }
+            Expr::Index(ix) => {
+                let EvalValue::Ref(base) = self.eval_borrow(frame, &ix.expr)? else {
+                    return eval_unsupported("index borrow");
+                };
+                let base = base.autoderef();
+                let EvalValue::Array(elems) = base.val else {
+                    return eval_unsupported("index of a non-array");
+                };
+                let idx = self.eval_index(frame, &ix.index, elems.len())?;
+                let mut addr = match base.addr {
+                    Some(EvalAddr::Local(alloc, off)) => Some((alloc, off)),
+                    _ => None,
+                };
+                for e in &elems[..idx] {
+                    addr = match (addr, eval_value_size(e)) {
+                        (Some((alloc, off)), Some(sz)) => off.checked_add(sz).map(|o| (alloc, o)),
+                        _ => None,
+                    };
+                }
+                Ok(EvalValue::Ref(Box::new(EvalRef {
+                    addr: addr.map(|(alloc, off)| EvalAddr::Local(alloc, off)),
+                    val: elems[idx].clone(),
+                    dyn_trait: None,
+                })))
+            }
+            _ => {
+                let val = self.eval_expr(frame, place)?;
+                unplaced(val)
+            }
+        }
+    }
+
+    /// Evaluate the index expression of `base[index]` for an array of `len`
+    /// elements: an out-of-bounds index panics, as the bounds check does.
+    fn eval_index(
+        &mut self,
+        frame: &mut EvalFrame<'a>,
+        index: &'a Expr,
+        len: usize,
+    ) -> Result<usize, EvalCtrl> {
+        match self.eval_expr(frame, index)? {
+            EvalValue::Int(i, EvalIntTy::Usize | EvalIntTy::Infer) => match usize::try_from(i) {
+                Ok(i) if i < len => Ok(i),
+                _ => Err(EvalCtrl::Panic),
+            },
+            _ => eval_unsupported("non-`usize` index"),
+        }
+    }
+
     fn assign(frame: &mut EvalFrame<'a>, target: &Expr, v: EvalValue) -> Result<(), EvalCtrl> {
         let Expr::Path(p) = target else {
             return eval_unsupported("assignment target");
@@ -1620,12 +3296,16 @@ impl<'a> EvalRun<'a> {
         let Some(id) = p.path.get_ident() else {
             return eval_unsupported("assignment target path");
         };
-        let name = id.to_string();
+        Self::assign_var(frame, &id.to_string(), v)
+    }
+
+    /// Assign `v` to the innermost variable `name` of `frame`.
+    fn assign_var(frame: &mut EvalFrame<'a>, name: &str, v: EvalValue) -> Result<(), EvalCtrl> {
         for scope in frame.scopes.iter_mut().rev() {
-            if let Some(slot) = scope.get_mut(&name) {
+            if let Some(slot) = scope.get_mut(name) {
                 let new = match (&*slot, v) {
                     (EvalValue::Int(_, t), EvalValue::Int(x, EvalIntTy::Infer)) => {
-                        eval_coerce(EvalValue::Int(x, EvalIntTy::Infer), &EvalTy::Int(*t))?
+                        coerce_inferred_int(x, *t)?
                     }
                     (_, v) => v,
                 };
@@ -1644,13 +3324,36 @@ impl<'a> EvalRun<'a> {
                 let Some(id) = p.path.get_ident() else {
                     return eval_unsupported("multi-segment path");
                 };
-                Self::lookup(frame, &id.to_string())
-                    .map_or_else(|| eval_unsupported(format!("unknown variable `{id}`")), Ok)
+                let name = id.to_string();
+                if let Some(v) = Self::lookup(frame, &name) {
+                    return Ok(v);
+                }
+                // A function nested in an enclosing block, used as a value.
+                // (A top-level function is a trace boundary: a call through a
+                // pointer to it would bypass the boundary's instrumentation.)
+                let local_fn = frame
+                    .local_fns
+                    .iter()
+                    .rev()
+                    .find_map(|fns| fns.get(&name).copied());
+                match local_fn {
+                    Some(f) => Ok(EvalValue::FnRef(self.fn_ref_index(f))),
+                    None => eval_unsupported(format!("unknown variable `{id}`")),
+                }
             }
             Expr::Paren(p) => self.eval_expr(frame, &p.expr),
             Expr::Group(g) => self.eval_expr(frame, &g.expr),
             Expr::Block(b) if b.label.is_none() => self.eval_block(frame, &b.block),
             Expr::Unary(u) => match (&u.op, self.eval_expr(frame, &u.expr)?) {
+                (syn::UnOp::Deref(_), EvalValue::Ref(r)) => {
+                    // Dereferencing `&dyn Trait` yields an unsized trait object
+                    // place; returning `r.val` would drop `dyn_trait` and let
+                    // `(*r).method()` dispatch to an inherent `impl`.
+                    if r.dyn_trait.is_some() {
+                        return eval_unsupported("dereference of a trait object");
+                    }
+                    Ok(r.val)
+                }
                 (syn::UnOp::Not(_), EvalValue::Bool(b)) => Ok(EvalValue::Bool(!b)),
                 (syn::UnOp::Not(_), EvalValue::Int(x, t)) if t != EvalIntTy::Infer => {
                     Ok(EvalValue::Int(!x & t.max(), t))
@@ -1665,6 +3368,50 @@ impl<'a> EvalRun<'a> {
                 (EvalValue::Bool(b), EvalTy::Int(t)) if t != EvalIntTy::Infer => {
                     Ok(EvalValue::Int(u128::from(b), t))
                 }
+                // Safe trait-object unsizing (`&T as &dyn Trait`): records the
+                // vtable's principal trait while preserving referent & address.
+                (EvalValue::Ref(r), EvalTy::DynRef(tr)) => {
+                    // A nested reference has no modeled vtable (see
+                    // `eval_coerce`).
+                    if eval_ref_depth(&r) != 1 {
+                        return eval_unsupported("trait-object cast of a nested reference");
+                    }
+                    let trait_id = self.resolve_trait(frame, &tr)?;
+                    let mut inner = r.autoderef();
+                    inner.dyn_trait = Some(trait_id);
+                    Ok(EvalValue::Ref(Box::new(inner)))
+                }
+                // Safe cast between non-trait reference types (`&[T; N] as &[T]`).
+                (EvalValue::Ref(r), EvalTy::Ref(expected_depth))
+                    if eval_ref_depth(&r) == expected_depth =>
+                {
+                    Ok(EvalValue::Ref(r))
+                }
+                // Safe raw-pointer casts (`&T as *const T`, `fn(...) as *const ()`,
+                // `*const T as *const ()`).
+                (EvalValue::Ref(r), EvalTy::ConstPtr(expected_depth))
+                    if eval_ref_depth(&r) == expected_depth =>
+                {
+                    Ok(EvalValue::ConstPtr {
+                        addr: r.addr,
+                        nonzero: eval_value_is_sized_nonzero(&r.val),
+                    })
+                }
+                (EvalValue::FnRef(idx), EvalTy::ConstPtr(_)) => Ok(EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::FnItem(idx)),
+                    nonzero: true,
+                }),
+                (
+                    EvalValue::Closure {
+                        id,
+                        captures: false,
+                    },
+                    EvalTy::ConstPtr(_),
+                ) => Ok(EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::ClosureFn(id)),
+                    nonzero: true,
+                }),
+                (v @ EvalValue::ConstPtr { .. }, EvalTy::ConstPtr(_)) => Ok(v),
                 _ => eval_unsupported("cast"),
             },
             Expr::If(i) => self.eval_if(frame, i),
@@ -1677,8 +3424,8 @@ impl<'a> EvalRun<'a> {
             }
             Expr::Call(c) => self.eval_call(frame, c),
             Expr::Struct(s) => self.eval_struct_lit(frame, s),
-            Expr::Field(f) => match (self.eval_expr(frame, &f.base)?, &f.member) {
-                (EvalValue::Struct(_, fields), syn::Member::Named(id)) => fields
+            Expr::Field(f) => match (eval_autoderef(self.eval_expr(frame, &f.base)?), &f.member) {
+                (EvalValue::Struct(_, _, fields), syn::Member::Named(id)) => fields
                     .get(&id.to_string())
                     .cloned()
                     .map_or_else(|| eval_unsupported(format!("unknown field `{id}`")), Ok),
@@ -1693,6 +3440,23 @@ impl<'a> EvalRun<'a> {
             }
             Expr::Break(b) if b.label.is_none() && b.expr.is_none() => Err(EvalCtrl::Break),
             Expr::Continue(c) if c.label.is_none() => Err(EvalCtrl::Continue),
+            Expr::Reference(r) if r.mutability.is_none() => self.eval_borrow(frame, &r.expr),
+            Expr::Array(a) => {
+                let mut elems = Vec::with_capacity(a.elems.len());
+                for e in &a.elems {
+                    elems.push(self.eval_expr(frame, e)?);
+                }
+                Ok(EvalValue::Array(elems))
+            }
+            Expr::Index(ix) => match eval_autoderef(self.eval_expr(frame, &ix.expr)?) {
+                EvalValue::Array(elems) => {
+                    let idx = self.eval_index(frame, &ix.index, elems.len())?;
+                    Ok(elems[idx].clone())
+                }
+                _ => eval_unsupported("index of a non-array"),
+            },
+            Expr::Closure(c) => self.make_closure(frame, c),
+            Expr::MethodCall(mc) => self.eval_method_call(frame, mc),
             _ => eval_unsupported(format!(
                 "expression `{}`",
                 quote!(#expr).to_string().chars().take(48).collect::<String>()
@@ -1757,9 +3521,9 @@ impl<'a> EvalRun<'a> {
                 continue;
             }
             self.record_branch(frame, m, tag);
-            frame.scopes.push(bindings);
+            frame.push_scope(bindings);
             let res = self.eval_expr(frame, &arm.body);
-            frame.scopes.pop();
+            frame.pop_scope();
             return res;
         }
         eval_unsupported("no `match` arm matched (non-exhaustive pattern subset)")
@@ -1794,9 +3558,7 @@ impl<'a> EvalRun<'a> {
             return eval_unsupported("struct literal path");
         };
         let name = id.to_string();
-        let Some(def) = self.ev.structs.get(&name) else {
-            return eval_unsupported(format!("unknown struct `{name}`"));
-        };
+        let (struct_id, def) = self.resolve_struct(frame, &name)?;
         let mut fields = BTreeMap::new();
         for fv in &s.fields {
             let syn::Member::Named(fid) = &fv.member else {
@@ -1808,25 +3570,65 @@ impl<'a> EvalRun<'a> {
             };
             let fty = fty.clone();
             let v = self.eval_expr(frame, &fv.expr)?;
-            fields.insert(fname, eval_coerce(v, &fty)?);
+            fields.insert(fname, self.eval_coerce(Some(&*frame), v, &fty)?);
         }
         if fields.len() != def.len() {
             return eval_unsupported("struct literal with missing fields");
         }
-        Ok(EvalValue::Struct(name, fields))
+        Ok(EvalValue::Struct(struct_id, name, fields))
     }
 
     fn eval_call(&mut self, frame: &mut EvalFrame<'a>, c: &'a syn::ExprCall) -> EvalRes {
         let Expr::Path(p) = c.func.as_ref() else {
             return eval_unsupported("call target");
         };
+        if p.qself.is_none() && is_core_ptr_addr_eq_path(&p.path) {
+            if c.args.len() != 2 {
+                return eval_unsupported("arity mismatch calling `addr_eq`");
+            }
+            let lhs = self.eval_expr(frame, &c.args[0])?;
+            let rhs = self.eval_expr(frame, &c.args[1])?;
+            // A raw pointer may dangle, and a dead variable's address may be
+            // reused (two calls of one function place their locals at one
+            // address): compare a raw pointer into a variable only while that
+            // variable is in scope in this frame.
+            for operand in [&lhs, &rhs] {
+                if let EvalValue::ConstPtr {
+                    addr: Some(EvalAddr::Local(alloc, _)),
+                    ..
+                } = operand
+                    && !frame
+                        .allocs
+                        .iter()
+                        .any(|scope| scope.values().any(|id| id == alloc))
+                {
+                    return eval_unsupported(
+                        "`addr_eq` on a raw pointer whose referent may be out of scope",
+                    );
+                }
+            }
+            return eval_addr_eq(&lhs, &rhs);
+        }
         let Some(id) = p.path.get_ident() else {
             return eval_unsupported("qualified call target");
         };
         let name = id.to_string();
+        // A variable shadows a function of the same name.
+        let callee_var = Self::lookup(frame, &name);
         let mut args = Vec::with_capacity(c.args.len());
         for a in &c.args {
             args.push(self.eval_expr(frame, a)?);
+        }
+        match callee_var {
+            Some(EvalValue::Closure { id, .. }) => return self.call_closure(frame, id, args),
+            Some(EvalValue::FnRef(idx)) => {
+                let Some(&f) = self.fn_table.get(idx) else {
+                    return eval_unsupported("unknown function pointer");
+                };
+                return self.call_fn(f, args, false);
+            }
+            Some(_) => return eval_unsupported(format!("call of non-callable `{name}`")),
+            None => {}
         }
         for fns in frame.local_fns.iter().rev() {
             if let Some(&f) = fns.get(&name) {
@@ -1837,6 +3639,11 @@ impl<'a> EvalRun<'a> {
         let Some(f) = ev.top_fn(&name) else {
             return eval_unsupported(format!("unknown callee `{name}`"));
         };
+        // This frame may not index the nested function that `name` refers to
+        // (see `NestedItemNames`).
+        if ev.nested_item_names.contains(&name) {
+            return eval_unsupported(format!("callee `{name}` is also a nested item"));
+        }
         if name == ev.root_fn_name {
             return eval_unsupported("recursive call of the root function");
         }
@@ -1844,6 +3651,130 @@ impl<'a> EvalRun<'a> {
             return self.call_fn(f, args, false);
         }
         self.external_call(f, name, args)
+    }
+
+    /// Index of `f` in `fn_table`, adding it on first use.
+    fn fn_ref_index(&mut self, f: &'a syn::ItemFn) -> usize {
+        match self.fn_table.iter().position(|g| std::ptr::eq(*g, f)) {
+            Some(idx) => idx,
+            None => {
+                self.fn_table.push(f);
+                self.fn_table.len() - 1
+            }
+        }
+    }
+
+    /// Call `receiver.method(args)` on a struct declared in an enclosing block
+    /// (directly, or behind a reference such as a `&dyn Trait`): a `&dyn Trait`
+    /// receiver dispatches strictly to `(Self, Some(Trait), method)`; a concrete
+    /// receiver prefers an inherent `impl` and otherwise requires a unique
+    /// matching trait `impl` in scope, and is rejected when
+    /// [`TraitMethodCensus`] shows that a trait declared anywhere in the
+    /// candidate could be the callee instead.
+    fn eval_method_call(
+        &mut self,
+        frame: &mut EvalFrame<'a>,
+        mc: &'a syn::ExprMethodCall,
+    ) -> EvalRes {
+        if mc.turbofish.is_some() {
+            return eval_unsupported("method call with generic arguments");
+        }
+        // Auto-reference a by-value receiver, so that `self` is a reference
+        // in either case. (The receiver is evaluated once; the address of an
+        // auto-referenced receiver is left unmodeled.)
+        let self_ref = match self.eval_expr(frame, &mc.receiver)? {
+            EvalValue::Ref(r) => EvalValue::Ref(Box::new(r.autoderef())),
+            val => EvalValue::Ref(Box::new(EvalRef {
+                addr: None,
+                val,
+                dyn_trait: None,
+            })),
+        };
+        let EvalValue::Ref(r) = self_ref else {
+            return eval_unsupported("method receiver");
+        };
+        let EvalValue::Struct(struct_id, ty_name, _) = &r.val else {
+            return eval_unsupported("method call on a non-struct receiver");
+        };
+        let struct_id = *struct_id;
+        let method_name = mc.method.to_string();
+        let census = &self.ev.trait_census;
+        let method = if let Some(tr_id) = r.dyn_trait {
+            let key = (struct_id, Some(tr_id), method_name.clone());
+            frame
+                .local_methods
+                .iter()
+                .rev()
+                .find_map(|methods| methods.get(&key).copied())
+        } else {
+            let inherent_key = (struct_id, None, method_name.clone());
+            if let Some(m) = frame
+                .local_methods
+                .iter()
+                .rev()
+                .find_map(|methods| methods.get(&inherent_key).copied())
+            {
+                // The evaluator records `&dyn Trait` only at the coercion
+                // sites it sees (a typed `let`, parameter, field, or return
+                // value, and an `as` cast). A reference that an `if` / `match`
+                // arm or an array element unsizes implicitly reaches here
+                // without `dyn_trait`, where native Rust dispatches through
+                // the vtable to the trait `impl`. When any trait gives the
+                // receiver's type this method (through an `impl` anywhere in
+                // the candidate, a default method, or possibly a macro), the
+                // inherent `impl` is therefore not known to be the callee.
+                if census.has_macro || !census.providers(ty_name, &method_name).is_empty() {
+                    return eval_unsupported(format!(
+                        "method `{}` defined by both an inherent and a trait `impl`",
+                        mc.method
+                    ));
+                }
+                Some(m)
+            } else {
+                let mut found: Option<&'a syn::ImplItemFn> = None;
+                let mut ambiguous = false;
+                for methods in frame.local_methods.iter().rev() {
+                    for ((s_id, tr_id, mn), &m) in methods {
+                        if *s_id == struct_id && tr_id.is_some() && mn == &method_name {
+                            if found.is_some() {
+                                ambiguous = true;
+                                break;
+                            }
+                            found = Some(m);
+                        }
+                    }
+                    if ambiguous {
+                        break;
+                    }
+                }
+                // Likewise, a macro, a second trait, or an inherent `impl`
+                // outside the enclosing blocks may supply the method instead.
+                if ambiguous
+                    || census.has_macro
+                    || census.providers(ty_name, &method_name).len() > 1
+                    || census.has_inherent(ty_name, &method_name)
+                {
+                    None
+                } else {
+                    found
+                }
+            }
+        };
+        let Some(method) = method else {
+            return eval_unsupported(format!("unknown or ambiguous method `{}`", mc.method));
+        };
+        let mut args = Vec::with_capacity(mc.args.len());
+        for a in &mc.args {
+            args.push(self.eval_expr(frame, a)?);
+        }
+        // Inside an `impl` body, `self` has the concrete `&Self` type rather
+        // than `&dyn Trait`.
+        let concrete_self = EvalValue::Ref(Box::new(EvalRef {
+            addr: r.addr,
+            val: r.val,
+            dyn_trait: None,
+        }));
+        self.call_method(method, concrete_self, args)
     }
 
     fn external_call(
@@ -1861,7 +3792,7 @@ impl<'a> EvalRun<'a> {
             let FnArg::Typed(pt) = input else {
                 return eval_unsupported("method receiver");
             };
-            let v = eval_coerce(arg, &eval_ty_of(&pt.ty))?;
+            let v = self.eval_coerce(None, arg, &eval_ty_of(&pt.ty))?;
             raw_args.push(eval_encode(&v)?);
             typed.push(v);
         }
@@ -2890,12 +4821,27 @@ mod tests {
     /// branch-flip trials synthesized from them.
     #[test]
     fn concrete_evaluator_matches_native_rustc_boundary_calls_on_generated_candidates() {
-        use std::fmt::Write as _;
         let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
         let cands: Vec<GeneratedItreeCandidate> = generate_itree_batch(seeds, 20, 0x3333_4444)
             .into_iter()
             .chain(generate_itree_identity_batch(seeds))
             .collect();
+        assert_evaluator_matches_native_rustc(&cands);
+    }
+
+    /// Compile `cands` natively (`rustc -C opt-level=0 -C overflow-checks=on`)
+    /// with every boundary callee wrapped to log its arguments and return, and
+    /// compare each run on the base inputs and on the synthesized concolic
+    /// inputs against the evaluator's prediction.
+    fn assert_evaluator_matches_native_rustc(cands: &[GeneratedItreeCandidate]) {
+        assert_evaluator_matches_native_rustc_at_opt_levels(cands, &["0"]);
+    }
+
+    fn assert_evaluator_matches_native_rustc_at_opt_levels(
+        cands: &[GeneratedItreeCandidate],
+        opt_levels: &[&str],
+    ) {
+        use std::fmt::Write as _;
         let mut program = String::from(
             "#![allow(dead_code, unused_parens, non_snake_case, non_camel_case_types)]\n\
              use std::cell::RefCell;\n\
@@ -3018,41 +4964,50 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let src_path = dir.join("native_check.rs");
-        let bin_path = dir.join("native_check");
         std::fs::write(&src_path, &program).unwrap();
-        let compile = std::process::Command::new(crate::miri_eval::resolve_rustc_bin())
-            .args([
-                "--edition=2024",
-                "-C",
-                "opt-level=0",
-                "-C",
-                "overflow-checks=on",
-                "-A",
-                "warnings",
-            ])
-            .arg(&src_path)
-            .arg("-o")
-            .arg(&bin_path)
-            .output()
-            .expect("invoke rustc");
-        assert!(
-            compile.status.success(),
-            "rustc failed:\n{}",
-            String::from_utf8_lossy(&compile.stderr)
-        );
-        let out = std::process::Command::new(&bin_path)
-            .output()
-            .expect("run native check");
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(out.status.success(), "native check binary failed");
-        let native: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_string)
-            .collect();
-        assert_eq!(native.len(), expected.len());
-        for (n, e) in native.iter().zip(&expected) {
-            assert_eq!(n, e, "evaluator prediction diverges from native execution");
+        for &opt_level in opt_levels {
+            let bin_path = dir.join(format!("native_check_o{opt_level}"));
+            let opt_flag = format!("opt-level={opt_level}");
+            let compile = std::process::Command::new(crate::miri_eval::resolve_rustc_bin())
+                .args([
+                    "--edition=2024",
+                    "-C",
+                    &opt_flag,
+                    "-C",
+                    "overflow-checks=on",
+                    "-A",
+                    "warnings",
+                ])
+                .arg(&src_path)
+                .arg("-o")
+                .arg(&bin_path)
+                .output()
+                .expect("invoke rustc");
+            assert!(
+                compile.status.success(),
+                "rustc (-C {opt_flag}) failed:\n{}",
+                String::from_utf8_lossy(&compile.stderr)
+            );
+            let out = std::process::Command::new(&bin_path)
+                .output()
+                .expect("run native check");
+            assert!(
+                out.status.success(),
+                "native check binary (-C {opt_flag}) failed"
+            );
+            let native: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(native.len(), expected.len());
+            for (n, e) in native.iter().zip(&expected) {
+                assert_eq!(
+                    n, e,
+                    "evaluator prediction diverges from native execution at -C {opt_flag}"
+                );
+            }
         }
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(expected.len() >= cands.len() * ITREE_CONCOLIC_BASE_INPUTS.len());
     }
 
@@ -3567,5 +5522,1077 @@ mod tests {
                 && (t.magic, t.payload_len) == (0x414E_4E4C, 2)
                 && matches!(t.predicted.outcome, ItreeConcreteOutcome::Return(_))
         }));
+    }
+
+    /// One [`IndirectDispatchOutliner`] candidate per template and ITree seed.
+    fn indirect_dispatch_candidates() -> Vec<(&'static str, GeneratedItreeCandidate)> {
+        const TEMPLATES: [(&str, &str); 4] = [
+            ("dyn_dispatch", "as &dyn AnnealDynProbe"),
+            ("fn_pointer", "anneal_fnptr_mix"),
+            ("closures", "let mut bump"),
+            ("slice_addr_eq", "lead @ .."),
+        ];
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let mut out = Vec::new();
+        for (seed_index, seed) in seeds.iter().enumerate() {
+            for (label, marker) in TEMPLATES {
+                let id = out.len();
+                let cand = (0..64u64)
+                    .find_map(|s| {
+                        let mut file = parse_safe_itree_seed(seed)?;
+                        let mut rng = DetRng::new(s);
+                        IndirectDispatchOutliner.mutate(&mut file, &mut rng);
+                        let source = prettyplease::unparse(&file);
+                        source.contains(marker).then(|| GeneratedItreeCandidate {
+                            id,
+                            seed_index,
+                            seed_u64: s,
+                            applied_mutators: vec!["IndirectDispatchOutliner".to_string()],
+                            source,
+                        })
+                    })
+                    .unwrap_or_else(|| panic!("no `{label}` template for seed {seed_index}"));
+                out.push((label, cand));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn indirect_dispatch_outliner_templates_are_safe_staged_and_match_native_rustc() {
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let cands = indirect_dispatch_candidates();
+        assert_eq!(cands.len(), 4 * seeds.len());
+        let mut combined = String::from("#![forbid(unsafe_code)]\n");
+        for (i, (label, cand)) in cands.iter().enumerate() {
+            assert!(
+                !contains_unsafe_token(&cand.source),
+                "{label}:\n{}",
+                cand.source
+            );
+            // Exactly one top-level item is added: the helper function.
+            let seed_items = syn::parse_file(seeds[cand.seed_index]).unwrap().items.len();
+            let file = syn::parse_file(&cand.source).unwrap();
+            assert_eq!(
+                file.items.len(),
+                seed_items + 1,
+                "{label}:\n{}",
+                cand.source
+            );
+            let Some(Item::Fn(helper)) = file.items.last() else {
+                panic!("{label}: last item is not the helper function");
+            };
+            let helper_name = helper.sig.ident.to_string();
+            assert!(helper_name.starts_with("__anneal_itree_indirect_"));
+
+            let staged = stage_itree_candidate_items(&cand.source, "b0_c0__", "kernel_step")
+                .unwrap_or_else(|e| panic!("{label}: staging failed: {e}"));
+            assert!(
+                staged
+                    .ext_callee_names
+                    .contains(&format!("b0_c0__{helper_name}"))
+            );
+            assert!(syn::parse_file(&staged.staged_source).is_ok());
+            let (_, callees) = annotate_itree_external_callees(&cand.source, "kernel_step")
+                .unwrap_or_else(|e| panic!("{label}: annotation failed: {e}"));
+            assert!(callees.contains(&helper_name));
+
+            // The helper is the root's first boundary call on every input: it
+            // takes two `u32`s, never unwinds, and never returns `0`.
+            let ev = ItreeConcreteEvaluator::new(&cand.source, "kernel_step").unwrap();
+            for (m, p) in ITREE_CONCOLIC_BASE_INPUTS {
+                let run = ev
+                    .run_kernel_step(m, p, &EnvSchedule::new(), "")
+                    .unwrap_or_else(|e| panic!("{label} unsupported on ({m:#x}, {p:#x}): {e}"));
+                match run.events.first() {
+                    Some(ItreeConcreteEvent::ExtCall { callee, args, ret }) => {
+                        assert_eq!(*callee, helper_name);
+                        assert_eq!(args.len(), 2);
+                        assert_ne!(*ret, le32(0), "{label} returned 0 on ({m:#x}, {p:#x})");
+                    }
+                    other => panic!("{label}: first event is {other:?}"),
+                }
+            }
+            combined.push_str(&format!("pub mod c{i} {{\n{}\n}}\n", cand.source));
+        }
+        for opt_level in ["0", "2"] {
+            assert!(
+                crate::itree_eval::compile_rust_strict_opt(
+                    "indirect_templates",
+                    opt_level,
+                    &combined
+                ),
+                "indirect-dispatch templates must compile warning-free under \
+                 `#![forbid(unsafe_code)]` at `-C opt-level={opt_level}`:\n{combined}"
+            );
+        }
+        let cands: Vec<GeneratedItreeCandidate> = cands.into_iter().map(|(_, c)| c).collect();
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
+
+        // Scheduled batches carry the mutator and replay faithfully.
+        let mut scheduled = 0usize;
+        for batch_seed in [0x3333_4444u64, 0xABCD_1234, 0x1111_2222] {
+            for cand in generate_itree_batch(seeds, 20, batch_seed) {
+                if !cand
+                    .applied_mutators
+                    .iter()
+                    .any(|m| m == "IndirectDispatchOutliner")
+                {
+                    continue;
+                }
+                scheduled += 1;
+                assert_eq!(
+                    cand.applied_mutators
+                        .iter()
+                        .filter(|m| *m == "IndirectDispatchOutliner")
+                        .count(),
+                    1,
+                    "a candidate runs the indirect-dispatch pass at most once"
+                );
+                let (base, steps) =
+                    reconstruct_itree_mutation_steps(&cand, seeds).expect("reconstruct steps");
+                assert!(itree_candidate_replay_is_faithful(&cand, &base, &steps));
+            }
+        }
+        assert!(
+            scheduled >= 4,
+            "expected scheduled indirect-dispatch candidates"
+        );
+    }
+
+    /// `IndirectDispatchOutliner` stacked with each base mutator, in both
+    /// orders, on every ITree seed: the stack stays free of `unsafe`, keeps
+    /// every top-level function distinct, stages, is supported by the concrete
+    /// evaluator (which sees the indirect-dispatch helper called), and runs
+    /// natively as the evaluator predicts.
+    #[test]
+    fn indirect_dispatch_outliner_stacks_with_every_base_mutator_and_matches_native_rustc() {
+        let seeds = crate::itree_eval::ITREE_SAFE_SEEDS;
+        let indirect: &dyn ItreeAstMutator = &IndirectDispatchOutliner;
+        let mut cands: Vec<GeneratedItreeCandidate> = Vec::new();
+        for (seed_index, seed) in seeds.iter().enumerate() {
+            for &other in ITREE_AST_MUTATORS.iter().take(ITREE_BASE_MUTATOR_COUNT) {
+                for indirect_first in [true, false] {
+                    let id = cands.len();
+                    let s = 0x57AC_0000u64 + id as u64;
+                    let order: [&dyn ItreeAstMutator; 2] = if indirect_first {
+                        [indirect, other]
+                    } else {
+                        [other, indirect]
+                    };
+                    let mut file = parse_safe_itree_seed(seed).expect("parse ITree seed");
+                    let mut rng = DetRng::new(s);
+                    for mutator in order {
+                        mutator.mutate(&mut file, &mut rng);
+                    }
+                    let source = prettyplease::unparse(&file);
+                    let label = format!(
+                        "`{}` then `{}` on seed {seed_index}",
+                        order[0].name(),
+                        order[1].name()
+                    );
+                    assert!(!contains_unsafe_token(&source), "{label}:\n{source}");
+                    let parsed = syn::parse_file(&source).unwrap();
+                    let mut fn_names = BTreeSet::new();
+                    for item in &parsed.items {
+                        if let Item::Fn(f) = item {
+                            assert!(
+                                fn_names.insert(f.sig.ident.to_string()),
+                                "{label}: `{}` is defined twice:\n{source}",
+                                f.sig.ident
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        fn_names
+                            .iter()
+                            .filter(|n| n.starts_with("__anneal_itree_indirect_"))
+                            .count(),
+                        1,
+                        "{label}:\n{source}"
+                    );
+                    let staged = stage_itree_candidate_items(&source, "b0_c0__", "kernel_step")
+                        .unwrap_or_else(|e| panic!("{label}: staging failed: {e}"));
+                    assert!(syn::parse_file(&staged.staged_source).is_ok());
+                    let ev = ItreeConcreteEvaluator::new(&source, "kernel_step")
+                        .unwrap_or_else(|e| panic!("{label}: {e}"));
+                    let mut helper_called = false;
+                    for (m, p) in ITREE_CONCOLIC_BASE_INPUTS {
+                        let run = ev
+                            .run_kernel_step(m, p, &EnvSchedule::new(), "")
+                            .unwrap_or_else(|e| {
+                                panic!("{label} unsupported on ({m:#x}, {p:#x}): {e}")
+                            });
+                        helper_called |= run.events.iter().any(|event| {
+                            matches!(
+                                event,
+                                ItreeConcreteEvent::ExtCall { callee, .. }
+                                    if callee.starts_with("__anneal_itree_indirect_")
+                            )
+                        });
+                    }
+                    assert!(
+                        helper_called,
+                        "{label}: no base input calls the indirect-dispatch helper:\n{source}"
+                    );
+                    cands.push(GeneratedItreeCandidate {
+                        id,
+                        seed_index,
+                        seed_u64: s,
+                        applied_mutators: vec![
+                            order[0].name().to_string(),
+                            order[1].name().to_string(),
+                        ],
+                        source,
+                    });
+                }
+            }
+        }
+        assert_eq!(cands.len(), seeds.len() * ITREE_BASE_MUTATOR_COUNT * 2);
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
+    }
+
+    /// The two PRNG draws of the base schedule also decide the indirect-dispatch
+    /// redirect, so a candidate without a redirected pass draws exactly what the
+    /// base schedule draws.
+    #[test]
+    fn indirect_dispatch_pass_is_scheduled_without_extra_draws() {
+        let seed = crate::itree_eval::ITREE_SAFE_SEEDS[0];
+        let (mut redirected, mut base_only) = (0usize, 0usize);
+        for s in 0..2048u64 {
+            let id = (s % 9) as usize;
+            let mut rng = DetRng::new(s);
+            let mut file = parse_safe_itree_seed(seed).unwrap();
+            let steps = apply_itree_mutation_passes(&mut file, &mut rng, id);
+            let names: Vec<&str> = steps.iter().map(|st| st.mutator_name.as_str()).collect();
+            if names.contains(&"IndirectDispatchOutliner") {
+                redirected += 1;
+                continue;
+            }
+            base_only += 1;
+            // Replay the base schedule by hand from the same PRNG seed.
+            let mut base_rng = DetRng::new(s);
+            let mut base_file = parse_safe_itree_seed(seed).unwrap();
+            let num_passes = 1 + base_rng.gen_range(2);
+            let first_idx = id % ITREE_BASE_MUTATOR_COUNT;
+            let mut expected = Vec::new();
+            for pass in 0..num_passes {
+                let m_idx = if pass == 0 {
+                    first_idx
+                } else {
+                    (first_idx + 1 + base_rng.gen_range(ITREE_BASE_MUTATOR_COUNT - 1))
+                        % ITREE_BASE_MUTATOR_COUNT
+                };
+                ITREE_AST_MUTATORS[m_idx].mutate(&mut base_file, &mut base_rng);
+                expected.push(ITREE_AST_MUTATORS[m_idx].name());
+            }
+            assert_eq!(names, expected);
+            assert_eq!(
+                prettyplease::unparse(&file),
+                prettyplease::unparse(&base_file)
+            );
+            assert_eq!(rng.next_u64(), base_rng.next_u64());
+        }
+        // One pass in `ITREE_INDIRECT_PASS_DENOMINATOR`, over 1.5 passes per
+        // candidate on average.
+        let expected = 2048 * 3 / 2 / ITREE_INDIRECT_PASS_DENOMINATOR;
+        assert!(
+            (expected * 3 / 4..=expected * 5 / 4).contains(&redirected),
+            "{redirected} of 2048 candidates redirected, expected about {expected}"
+        );
+        assert_eq!(redirected + base_only, 2048);
+    }
+
+    #[test]
+    fn concrete_evaluator_models_indirect_constructs_like_native_rustc_and_rejects_the_rest() {
+        const ROOT: &str = "pub fn kernel_step(magic: u32, payload_len: u32) -> u32 { probe(magic, payload_len) }\n";
+        // 1. Constructs the evaluator models, checked against native execution.
+        let modeled = [
+            // A `move` closure keeps the copy it captured; a closure that
+            // assigns a captured variable updates it across calls.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let mut x: u32 = a & 0xFFFFu32;
+                let frozen = move |d: u32| -> u32 { (x >> 1) ^ d };
+                x = x ^ 0x55u32;
+                let mut total: u32 = b & 0xFFu32;
+                let mut add = |d: u32| {
+                    total = total ^ (d << 1);
+                };
+                add(3u32);
+                add(x & 7u32);
+                let k: u32 = frozen(total);
+                ((k ^ x) >> 1) + 1u32
+            }",
+            // Arrays, by-value and by-reference array patterns, a bounds-check
+            // panic, element addresses, and a method on a by-value receiver.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Pair {
+                    lo: u32,
+                    hi: u32,
+                }
+                impl Pair {
+                    fn mix(&self, k: u32) -> u32 {
+                        (self.lo >> 1) ^ (self.hi & k)
+                    }
+                }
+                let arr: [u32; 4] = [a, b, a ^ b, 7];
+                let [first, middle @ .., last] = arr;
+                let pair = Pair { lo: first ^ middle[1], hi: last };
+                let idx: usize = if (b & 3u32) == 3u32 { 4 } else { 1 };
+                let picked: u32 = arr[idx];
+                let [head, ..] = &arr;
+                let same: bool = core::ptr::addr_eq(head, &arr[0]);
+                let diff: bool = core::ptr::addr_eq(head, &arr[1]);
+                let r: u32 = pair.mix(picked) ^ (*head);
+                if same && !diff { (r >> 1) + 1u32 } else { 0u32 }
+            }",
+            // Function pointers, capture-free closures (including one whose
+            // body shadows an outer variable with a local `let`), and safe
+            // `FnPtrToPtr` `addr_eq` checks.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn twice(f: fn(u32) -> u32, v: u32) -> u32 {
+                    f(f(v))
+                }
+                fn halve(v: u32) -> u32 {
+                    v >> 1
+                }
+                let x: u32 = a ^ b;
+                let lifted: fn(u32) -> u32 = |v: u32| {
+                    let x: u32 = v ^ 0x33u32;
+                    x
+                };
+                let chosen: fn(u32) -> u32 = if a > b { halve } else { lifted };
+                let raw: *const () = chosen as *const ();
+                let same: bool = core::ptr::addr_eq(raw, chosen as *const ());
+                let diff: bool = core::ptr::addr_eq(raw, &x as *const u32);
+                let base: u32 = twice(chosen, x);
+                if same && !diff { (base >> 1) + 1u32 } else { 0u32 }
+            }",
+            // Vtable-keyed `&dyn Trait` dispatch when two traits define the
+            // same method name on one concrete struct, plus by-ref closure
+            // capture address identity (`addr_eq(&captured, outer_ref)`).
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                trait Right { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v & 0xFFFFu32 } }
+                impl Right for Both { fn pick(&self) -> u32 { 7u32 } }
+                let both = Both { v: a };
+                let left: &dyn Left = &both;
+                let right: &dyn Right = &both;
+                let same_obj: bool = core::ptr::addr_eq(left, right);
+                let cap: u32 = b & 0xFFu32;
+                let cap_ref: &u32 = &cap;
+                let check = |x: u32| {
+                    if core::ptr::addr_eq(&cap, cap_ref) { x ^ (*cap_ref) } else { 0u32 }
+                };
+                let res: u32 = check(left.pick() ^ right.pick());
+                if same_obj { (res >> 1) + 1u32 } else { 0u32 }
+            }",
+            // A closure body sees enclosing local `fn`, `struct`, and `impl`
+            // items (shadowing any top-level `fn` of the same name).
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                 fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                 struct Tag { k: u32 }
+                 impl Tag { fn mix(&self, x: u32) -> u32 { self.k ^ x } }
+                 let f = |x: u32| {
+                     let t = Tag { k: b & 0xFFu32 };
+                     t.mix(helper(x))
+                 };
+                 (f(a) >> 1) + 1u32
+             }",
+            // Deref coercion `&&u32 -> &u32` keeps the referent's address,
+            // while an explicit `&&u32` (or `*const &u32`) keeps the outer
+            // reference's stack address.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let r2: &u32 = &r1;
+                let rr: &&u32 = &r1;
+                let p1: *const u32 = r2;
+                let p2: *const &u32 = &r1;
+                let same_ref: bool = core::ptr::addr_eq(r1, r2);
+                let diff_ref: bool = core::ptr::addr_eq(r1, rr);
+                let same_ptr: bool = core::ptr::addr_eq(r1, p1);
+                let diff_ptr: bool = core::ptr::addr_eq(r1, p2);
+                if same_ref && !diff_ref && same_ptr && !diff_ptr {
+                    ((*r2) >> 1) + 1u32
+                } else {
+                    0u32
+                }
+            }",
+            // A `&dyn Left` created in an outer block keeps the outer trait's
+            // vtable even when an inner block declares a second `trait Left`
+            // and `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { (self.v >> 1) ^ 0x55u32 } }
+                let both = Both { v: a };
+                let r: &dyn Left = &both;
+                let inner_res: u32 = {
+                    trait Left { fn pick(&self) -> u32; }
+                    impl Left for Both { fn pick(&self) -> u32 { 999u32 } }
+                    let inner_r: &dyn Left = &both;
+                    r.pick() ^ inner_r.pick()
+                };
+                (inner_res >> 1) ^ (b & 0xFFu32)
+            }",
+        ];
+        let cands: Vec<GeneratedItreeCandidate> = modeled
+            .iter()
+            .enumerate()
+            .map(|(id, probe)| GeneratedItreeCandidate {
+                id,
+                seed_index: 0,
+                seed_u64: id as u64,
+                applied_mutators: Vec::new(),
+                source: format!("{probe}\n{ROOT}"),
+            })
+            .collect();
+        let empty = EnvSchedule::new();
+        // `payload_len & 3 == 3` indexes out of bounds: the boundary call unwinds.
+        let ev = ItreeConcreteEvaluator::new(&cands[1].source, "kernel_step").unwrap();
+        let run = ev.run_kernel_step(9, 3, &empty, "").unwrap();
+        assert_eq!(run.outcome, ItreeConcreteOutcome::Panic);
+        assert!(matches!(
+            run.events[..],
+            [ItreeConcreteEvent::ExtCallPanic { .. }]
+        ));
+        assert_evaluator_matches_native_rustc_at_opt_levels(&cands, &["0", "2"]);
+
+        // 2. Constructs whose result the evaluator cannot determine are rejected.
+        let rejected = [
+            // A unique borrow: the evaluator's references are read-only.
+            "pub fn probe(a: u32, b: u32) -> u32 { let mut x: u32 = a; let r = &mut x; b }",
+            // A `let ref` binding must not be silently bound by value.
+            "pub fn probe(a: u32, b: u32) -> u32 { let ref r = a; (*r) ^ b }",
+            // A pointer to a boundary function bypasses its instrumentation.
+            "pub fn ext(v: u32) -> u32 { v }
+             pub fn probe(a: u32, b: u32) -> u32 { let f: fn(u32) -> u32 = ext; f(a ^ b) }",
+            // Two distinct functions may be merged by ICF, so their address
+            // inequality is not assumed.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn f1(v: u32) -> u32 { v ^ 1u32 }
+                fn f2(v: u32) -> u32 { v ^ 2u32 }
+                let p1: fn(u32) -> u32 = f1;
+                let p2: fn(u32) -> u32 = f2;
+                if core::ptr::addr_eq(p1 as *const (), p2 as *const ()) { a } else { b }
+            }",
+            // Dangling raw pointers: both calls of `leak` place `y` at one
+            // address, so the two pointers are equal natively although they
+            // name two variables.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn leak(v: u32) -> *const u32 {
+                    let y: u32 = v;
+                    &y as *const u32
+                }
+                let p: *const u32 = leak(a);
+                let q: *const u32 = leak(b);
+                if core::ptr::addr_eq(p, q) { a } else { b }
+            }",
+            // A raw pointer that left its referent's scope: the address may be
+            // reused for `z`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let p: *const u32 = {
+                    let y: u32 = a;
+                    &y as *const u32
+                };
+                let z: u32 = b;
+                if core::ptr::addr_eq(p, &z as *const u32) { a } else { b }
+            }",
+            // A closure that borrows `cap`, called from another closure's
+            // frame, still sees `cap` at its own address, which only the
+            // frame that created the closure knows.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a & 0xFFu32;
+                let cap_ref: &u32 = &cap;
+                let inner = |x: u32| if core::ptr::addr_eq(&cap, cap_ref) { x } else { 0u32 };
+                let outer = |x: u32| inner(x ^ b);
+                outer(1u32)
+            }",
+            // A struct that the closure body moves is captured by value, so it
+            // has a new address inside the closure.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Boxed { v: u32 }
+                let s = Boxed { v: a };
+                let p: *const Boxed = &s as *const Boxed;
+                let check = |x: u32| {
+                    let same: bool = core::ptr::addr_eq(&s as *const Boxed, p);
+                    let moved = s;
+                    if same { moved.v ^ x } else { x }
+                };
+                check(b)
+            }",
+            // A struct field's offset depends on a layout that is not computed.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Pair { lo: u32, hi: u32 }
+                let p = Pair { lo: a, hi: b };
+                if core::ptr::addr_eq(&p.lo, &p.hi) { 1 } else { 2 }
+            }",
+            // Two temporaries may or may not share an address.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                if core::ptr::addr_eq(&(a ^ 1u32), &(b ^ 1u32)) { 1 } else { 2 }
+            }",
+            // A zero-sized referent may share its address with anything.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let empty: [u32; 0] = [];
+                let other: u32 = a;
+                if core::ptr::addr_eq(&empty, &other) { 1 } else { b }
+            }",
+            // A `move` closure that updates its own captured copy.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let mut n: u32 = a & 0xFFu32;
+                let mut bump = move || { n = n ^ 1u32; n };
+                bump() ^ bump() ^ b
+            }",
+            // A captured name that is bound again before the call.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a;
+                let get = || x;
+                let x: u32 = b;
+                get() ^ x
+            }",
+            // A trait's default method has no `impl` method to run.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Twice { fn twice(&self) -> u32 { 2 } }
+                struct Unit { v: u32 }
+                impl Twice for Unit {}
+                let u = Unit { v: a };
+                u.twice() ^ u.v ^ b
+            }",
+            // Ambiguous direct method call on a concrete value when two traits
+            // define the same method name without an inherent `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                trait Right { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                impl Right for Both { fn pick(&self) -> u32 { 7 } }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // Multi-bound trait object `&(dyn Left + Send)` must fail closed
+            // rather than stripping `dyn` into `Ref` and dispatching to an
+            // inherent `impl` of the same name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let left: &(dyn Left + Send) = &both;
+                left.pick() ^ b
+            }",
+            // Explicit dereference of `&dyn Left` (`(*left).pick()`) must fail
+            // closed rather than dropping `dyn_trait` and dispatching to an
+            // inherent `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let left: &dyn Left = &both;
+                (*left).pick() ^ b
+            }",
+            // An `else` branch that is unsized to `&dyn Left` implicitly (to
+            // the type of the `if` branch) carries no trait-object marker, so
+            // `left.pick()` must fail closed rather than dispatch to the
+            // inherent `impl` (native Rust calls `<Both as Left>::pick`).
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A raw pointer captured in one loop iteration dangles in the next
+            // iteration, where native Rust reuses the same stack slot for `y`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let mut p: *const u32 = &a as *const u32;
+                let mut out: u32 = b;
+                let mut i: u32 = 0u32;
+                while i < 2u32 {
+                    let y: u32 = a ^ i;
+                    if i == 0u32 {
+                        p = &y as *const u32;
+                    } else if core::ptr::addr_eq(p, &y as *const u32) {
+                        out = a ^ 1u32;
+                    }
+                    i = i + 1u32;
+                }
+                out
+            }",
+            // A macro inside a closure body (even on an untaken branch) may
+            // capture outer locals that `syn::Visit` cannot inspect.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = |x: u32| {
+                    if x == 0u32 {
+                        let _ = matches!(cap, 1u32);
+                    }
+                    x ^ b
+                };
+                f(1u32)
+            }",
+            // A closure moving a zero-sized value is itself zero-sized, so `&f`
+            // may share an address with another local.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let empty: [u32; 0] = [];
+                let f = move || empty;
+                let y: u32 = a;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { b }
+            }",
+            // Under Rust 2021+ disjoint captures, `let _ = x;` does not capture
+            // `x`, so `f` is zero-sized even though `ClosureFreeIdents` sees `x`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a;
+                let f = || {
+                    let _ = x;
+                    1u32
+                };
+                let y: u32 = b;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { b }
+            }",
+            // A trait with a default method and an empty `impl Left for Both {}`
+            // must fail closed rather than letting an implicitly unsized `else`
+            // branch dispatch to an inherent `impl` of the same method name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32 { 1u32 } }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // The same default method when the trait is declared after an
+            // early `return`: an item is in scope throughout its block, so a
+            // statement that evaluation never reaches still decides the callee.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                return left.pick() ^ b;
+                trait Left { fn pick(&self) -> u32 { 1u32 } }
+            }",
+            // The same default method when the trait is a top-level item.
+            "pub trait Left { fn pick(&self) -> u32 { 1u32 } }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A trait `impl` applies to its type from inside a block that is
+            // never entered, where the evaluator indexes no method.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                if a == b {
+                    impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A generic `impl` gives every type the trait method, although it
+            // registers no method under the receiver's type name.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                impl<T> Left for T { fn pick(&self) -> u32 { 1u32 } }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A macro may expand to such an `impl`, here after an early `return`
+            // that keeps the macro statement itself from being reached.
+            "macro_rules! hide {
+                () => { impl Left for Both { fn pick(&self) -> u32 { 1u32 } } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                return left.pick() ^ b;
+                hide!();
+            }",
+            // Without an inherent `impl`: the trait object that leaves the
+            // inner block dispatches to `Hidden::pick`, not to the one trait
+            // `impl` (`Shown`) that is still in scope at the call.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Shown { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Shown for Both { fn pick(&self) -> u32 { 7u32 } }
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = {
+                    trait Hidden { fn pick(&self) -> u32; }
+                    impl Hidden for Both { fn pick(&self) -> u32 { self.v } }
+                    if a < b { &both as &dyn Hidden } else { &other }
+                };
+                left.pick() ^ b
+            }",
+            // A `use` after an early `return` still renames the callee of the
+            // call before it (`first(a)` runs `second`).
+            "pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                return first(a) ^ b;
+                use self::second as first;
+            }",
+            // The body of a nested function sees the items of the block that
+            // declares it: `outer` calls the nested `helper`, not the top-level
+            // one, which is all that the fresh frame of `outer` can find.
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                fn outer(v: u32) -> u32 { helper(v) }
+                outer(a) ^ b
+            }",
+            // Likewise the body of a method.
+            "pub fn helper(v: u32) -> u32 { v ^ 999u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                fn helper(v: u32) -> u32 { (v >> 1) ^ 0x55u32 }
+                struct Tag { k: u32 }
+                impl Tag { fn mix(&self, x: u32) -> u32 { self.k ^ helper(x) } }
+                let t = Tag { k: b & 0xFFu32 };
+                t.mix(a)
+            }",
+            // A closure that captures a `u32` by value is four bytes, but the
+            // evaluator computes no closure layout (a closure whose captures
+            // are all zero-sized is itself zero-sized), so the address of any
+            // closure is rejected rather than assumed distinct.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = move || cap;
+                let y: u32 = b;
+                if core::ptr::addr_eq(&f, &y) { 1u32 } else { f() }
+            }",
+            // Nor does it report a closure's size: `size_of_val` is outside
+            // the subset, so a capturing closure is never said to be 0 bytes.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let cap: u32 = a;
+                let f = move || cap;
+                (core::mem::size_of_val(&f) as u32) ^ f() ^ b
+            }",
+            // A value of a shadowed inner `struct Both` leaving its block must
+            // not dispatch to the outer `struct Both`'s inherent `impl`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                let inner = {
+                    struct Both { v: u32 }
+                    impl Both { fn pick(&self) -> u32 { self.v } }
+                    Both { v: a }
+                };
+                inner.pick() ^ b
+            }",
+            // An inherent `impl` inside an unentered block still overrides a
+            // trait `impl` on a concrete receiver in native Rust.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                if a == b {
+                    impl Both { fn pick(&self) -> u32 { 999u32 } }
+                }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // Likewise a top-level inherent `impl` on a top-level struct.
+            "pub struct Both { pub v: u32 }
+             impl Both { pub fn pick(&self) -> u32 { 999u32 } }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // A macro statement after an early `return` expands at compile time
+            // and can introduce a `use` alias that renames the callee before
+            // `return`, even when no method call runs.
+            "macro_rules! alias {
+                () => { use self::second as first; };
+             }
+             pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                return first(a) ^ b;
+                alias!();
+            }",
+            // A macro inside an inherent `impl` (`ImplItem::Macro`) may expand
+            // to an inherent method that shadows the trait `impl` in scope.
+            "macro_rules! gen_pick {
+                () => { fn pick(&self) -> u32 { 999u32 } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Shown { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Both { gen_pick!(); }
+                impl Shown for Both { fn pick(&self) -> u32 { self.v } }
+                let both = Both { v: a };
+                both.pick() ^ b
+            }",
+            // A macro inside a `trait` (`TraitItem::Macro`) may expand to a
+            // default method that an empty `impl` inherits.
+            "macro_rules! gen_default {
+                () => { fn pick(&self) -> u32 { 1u32 } };
+             }
+             pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { gen_default!(); }
+                struct Both { v: u32 }
+                impl Both { fn pick(&self) -> u32 { 999u32 } }
+                impl Left for Both {}
+                let both = Both { v: a };
+                let other = Both { v: b };
+                let left = if a < b { &both as &dyn Left } else { &other };
+                left.pick() ^ b
+            }",
+            // A top-level `use` alias is outside the supported subset.
+            "pub fn first(v: u32) -> u32 { v ^ 1u32 }
+             pub fn second(v: u32) -> u32 { v ^ 2u32 }
+             use self::second as renamed;
+             pub fn probe(a: u32, b: u32) -> u32 {
+                renamed(a) ^ first(b)
+            }",
+            // `&_` is inferred as `&&u32`, so `rr` holds the address of `r1`
+            // (the comparison is false natively): no deref coercion shortens
+            // it to the address of `x`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let rr: &_ = &r1;
+                if core::ptr::addr_eq(rr, r1) { 1u32 } else { 2u32 }
+            }",
+            // Likewise `*const _` is inferred as `*const &u32`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                let p: *const _ = &r1;
+                if core::ptr::addr_eq(p, r1) { 1u32 } else { 2u32 }
+            }",
+            // Likewise `&impl Sized` stands for `&&u32` in this call.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                fn same(o: &impl Sized, p: &u32) -> bool { core::ptr::addr_eq(o, p) }
+                let x: u32 = a ^ b;
+                let r1: &u32 = &x;
+                if same(&r1, r1) { 1u32 } else { 2u32 }
+            }",
+            // `&&Both` unsizes to `&dyn Left` through `impl Left for &Both`
+            // (native Rust calls `<&Both as Left>::pick`), a vtable that the
+            // evaluator does not index, so it must not auto-dereference the
+            // nested reference to the vtable of `Both`.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                impl Left for &Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let r: &Both = &both;
+                let nested: &dyn Left = &r;
+                nested.pick() ^ b
+            }",
+            // The same unsizing through an `as` cast.
+            "pub fn probe(a: u32, b: u32) -> u32 {
+                trait Left { fn pick(&self) -> u32; }
+                struct Both { v: u32 }
+                impl Left for Both { fn pick(&self) -> u32 { self.v } }
+                impl Left for &Both { fn pick(&self) -> u32 { 999u32 } }
+                let both = Both { v: a };
+                let r: &Both = &both;
+                (&r as &dyn Left).pick() ^ b
+            }",
+        ];
+        for probe in rejected {
+            let source = format!("{probe}\n{ROOT}");
+            let ev = ItreeConcreteEvaluator::new(&source, "kernel_step").unwrap();
+            assert!(
+                ev.run_kernel_step(0x414E_4E4C, 2048, &empty, "").is_err(),
+                "evaluator must reject:\n{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn eval_ty_of_counts_reference_depth_only_in_front_of_a_known_target() {
+        let ty_of = |src: &str| -> EvalTy {
+            let ty: Type = syn::parse_str(src).expect("parse type");
+            eval_ty_of(&ty)
+        };
+        // The depth that `eval_coerce` deref-coerces a deeper reference to.
+        assert_eq!(ty_of("&u32"), EvalTy::Ref(1));
+        assert_eq!(ty_of("&&u32"), EvalTy::Ref(2));
+        assert_eq!(ty_of("&[u32]"), EvalTy::Ref(1));
+        assert_eq!(ty_of("&(&u32)"), EvalTy::Ref(2));
+        assert_eq!(ty_of("&dyn Left"), EvalTy::DynRef("Left".to_string()));
+        assert_eq!(ty_of("&&dyn Left"), EvalTy::Ref(2));
+        assert_eq!(ty_of("*const u32"), EvalTy::ConstPtr(1));
+        assert_eq!(ty_of("*const &u32"), EvalTy::ConstPtr(2));
+        assert_eq!(ty_of("*const ()"), EvalTy::ConstPtr(1));
+        assert_eq!(ty_of("*const [u32]"), EvalTy::ConstPtr(1));
+        // A target that may itself be a reference has no known depth, and
+        // neither `&mut` nor a multi-bound trait object is modeled.
+        for unknown in [
+            "&_",
+            "&&_",
+            "*const _",
+            "*const &_",
+            "&impl Sized",
+            "*const impl Sized",
+            "&Self::Out",
+            "&<Unit as Carrier>::Out",
+            "*const Self::Out",
+            "&mut u32",
+            "&&mut u32",
+            "*const &mut u32",
+            "&(dyn Left + Send)",
+        ] {
+            assert!(
+                matches!(ty_of(unknown), EvalTy::Named(_)),
+                "`{unknown}` must not be given a reference depth"
+            );
+        }
+    }
+
+    #[test]
+    fn trait_method_census_counts_trait_methods_at_any_depth() {
+        let file: File = syn::parse_str(
+            "pub trait Top { fn pick(&self) -> u32 { 1u32 } fn solid(&self) -> u32; }
+             pub fn probe(a: u32) -> u32 {
+                 struct Both { v: u32 }
+                 impl Both { fn own(&self) -> u32 { self.v } }
+                 impl Top for Both { fn solid(&self) -> u32 { 2u32 } }
+                 if a == 0u32 {
+                     trait Inner { fn deep(&self) -> u32; }
+                     impl Inner for Both { fn deep(&self) -> u32 { 3u32 } }
+                 }
+                 fn never() {
+                     trait Wide { fn any(&self) -> u32; }
+                     impl<T> Wide for T { fn any(&self) -> u32 { 4u32 } }
+                 }
+                 a
+             }",
+        )
+        .expect("parse census source");
+        let mut census = TraitMethodCensus::default();
+        census.visit_file(&file);
+        assert!(!census.has_macro);
+        let providers = |ty: &str, method: &str| -> Vec<String> {
+            census
+                .providers(ty, method)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        // A default method counts for every type that implements its trait.
+        assert_eq!(providers("Both", "pick"), ["Top"]);
+        assert_eq!(providers("Both", "solid"), ["Top"]);
+        // An `impl` in a block that may never be entered counts.
+        assert_eq!(providers("Both", "deep"), ["Inner"]);
+        // A generic `impl` in a function that is never called counts for
+        // every type.
+        assert_eq!(providers("Both", "any"), ["Wide"]);
+        assert_eq!(providers("Other", "any"), ["Wide"]);
+        // Inherent methods and the trait methods of other types do not.
+        assert!(providers("Both", "own").is_empty());
+        assert!(providers("Other", "pick").is_empty());
+        assert!(providers("Other", "deep").is_empty());
+        // Inherent `impl`s are tracked separately so a trait-only receiver
+        // fails closed when an inherent method exists outside enclosing blocks.
+        assert!(census.has_inherent("Both", "own"));
+        assert!(!census.has_inherent("Other", "own"));
+        assert!(!census.has_inherent("Both", "pick"));
+
+        for macro_src in [
+            "pub fn probe(a: u32) -> u32 { hide!(); a }",
+            "struct S; impl S { gen_pick!(); }",
+            "trait T { gen_default!(); }",
+            "gen_top_item!();",
+        ] {
+            let with_macro: File = syn::parse_str(macro_src).expect("parse macro source");
+            let mut macro_census = TraitMethodCensus::default();
+            macro_census.visit_file(&with_macro);
+            assert!(
+                macro_census.has_macro,
+                "expected `has_macro` on:\n{macro_src}"
+            );
+        }
+    }
+
+    #[test]
+    fn closure_free_idents_respects_loop_and_let_chain_binders() {
+        let free_of = |expr_src: &str| -> BTreeSet<String> {
+            let clos: syn::ExprClosure = syn::parse_str(expr_src).expect("parse closure");
+            let mut free = ClosureFreeIdents::default();
+            free.visit_expr_closure(&clos);
+            free.names
+        };
+        // `for` binder shadows `i` inside the loop body, while `iter_src` is free.
+        assert_eq!(
+            free_of("|n: u32| { let mut s = n; for i in iter_src { s = s ^ i; } s }"),
+            BTreeSet::from(["iter_src".to_string()])
+        );
+        // `for i in i { ... }`: RHS `i` is evaluated before the loop binder!
+        assert_eq!(
+            free_of("|n: u32| { let mut s = n; for i in i { s = s ^ i; } s }"),
+            BTreeSet::from(["i".to_string()])
+        );
+        // `if let` chain: `x` bound in first `let` is in scope in second `let`
+        // and `then` branch, but NOT in `else` branch.
+        assert_eq!(
+            free_of("|a: u32| if let Some(x) = opt && let Some(y) = x { y ^ a } else { x }"),
+            BTreeSet::from(["opt".to_string(), "x".to_string()])
+        );
+        assert_eq!(
+            free_of("|a: u32| if let Some(x) = opt && let Some(y) = x { y ^ a } else { a }"),
+            BTreeSet::from(["opt".to_string()])
+        );
+        // `while let` binds `x` inside the loop body; RHS `src` is free.
+        assert_eq!(
+            free_of("|a: u32| { let mut acc = a; while let Some(x) = src { acc = acc ^ x; } acc }"),
+            BTreeSet::from(["src".to_string()])
+        );
+        // `let ... else`: `x` is NOT bound in `else { ... }`, only after `let`.
+        assert_eq!(
+            free_of("|a: u32| { let Some(x) = opt else { return x; }; x ^ a }"),
+            BTreeSet::from(["opt".to_string(), "x".to_string()])
+        );
+        assert_eq!(
+            free_of("|a: u32| { let Some(x) = opt else { return a; }; x ^ a }"),
+            BTreeSet::from(["opt".to_string()])
+        );
+        // Macros inside closure bodies flag `has_macro` so `make_closure` fails closed.
+        let has_macro_of = |expr_src: &str| -> bool {
+            let clos: syn::ExprClosure = syn::parse_str(expr_src).expect("parse closure");
+            let mut free = ClosureFreeIdents::default();
+            free.visit_expr_closure(&clos);
+            free.has_macro
+        };
+        assert!(!has_macro_of("|a: u32| a ^ b"));
+        assert!(has_macro_of(
+            "|a: u32| { if a == 0u32 { let _ = matches!(cap, 1u32); } a }"
+        ));
+        assert!(has_macro_of("|a: u32| { assert_eq!(cap, a); a }"));
     }
 }
