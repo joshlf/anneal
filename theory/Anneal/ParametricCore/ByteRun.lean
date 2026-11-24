@@ -2260,6 +2260,8 @@ example : True := by
     have : @ByteRunCopyCut = @denoteByteRunCopyCut := rfl
   fail_if_success
     have : @ByteRunCopyCut = @denoteByteRunCopyCut := by simp only []
+  fail_if_success
+    have : @ByteRunCopyCut = @denoteByteRunCopyCut := by simp
   trivial
 
 /-! ### Interop with `MutSummary` / `MutSummaryCut` and `Anneal.Firewall.IndexedCut` -/

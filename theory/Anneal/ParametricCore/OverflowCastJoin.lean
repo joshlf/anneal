@@ -4235,9 +4235,110 @@ example : True := by
     have : @OvfCastStageCut = @denoteOvfCastStageCut := rfl
   fail_if_success
     have : @OvfCastStageCut = @denoteOvfCastStageCut := by simp only []
+  fail_if_success
+    have : @OvfCastStageCut = @denoteOvfCastStageCut := by simp
   trivial
 
 /-! ### Mixed Unsigned/Signed View Composition -/
+
+/-- Sealed view lift (`raw → signedView`): any raw-view `OvfCastStageCut` whose
+source and destination intervals are non-negative (`hi₀ < w₀.halfModulus`,
+`hi₁ < w₁.halfModulus`) lifts directly into a sealed `OvfCastStageCut
+fops.signedView` without leaking unsealed `wpUntilFuel`. -/
+theorem ovfCastStageCut_signedView_of_raw_nonneg {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {bb₀ bb₁ lo₀ hi₀ lo₁ hi₁ f : Nat} {w₀ w₁ : ScalarWidth}
+    (hHi₀ : hi₀ < w₀.halfModulus) (hHi₁ : hi₁ < w₁.halfModulus)
+    (h : OvfCastStageCut fops step baseLocals ids earlyOk
+      ⟨bb₀, w₀, lo₀, hi₀⟩ ⟨bb₁, w₁, lo₁, hi₁⟩ f) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨bb₀, w₀, lo₀ + w₀.halfModulus, hi₀ + w₀.halfModulus⟩
+      ⟨bb₁, w₁, lo₁ + w₁.halfModulus, hi₁ + w₁.halfModulus⟩ f :=
+  seal_ovfCastStageCut (fun s hInv₀ =>
+    wpUntilFuel_weaken
+      (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+      (fun st hInv₁ =>
+        (stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb₁ w₁
+          hHi₁ st).mp hInv₁)
+      (fun _ ho => ho) (fun _ hf => hf)
+      (open_ovfCastStageCut h s
+        ((stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb₀ w₀
+          hHi₀ s).mpr hInv₀)))
+
+/-- Sealed view lowering (`signedView → raw`): any `signedView`
+`OvfCastStageCut` whose source and destination intervals are non-negative
+(biased `[lo + halfModulus, hi + halfModulus]` with `hi < halfModulus`) lowers
+directly into a sealed `OvfCastStageCut fops` — even if intermediate steps
+inside the cut cross zero arbitrarily! -/
+theorem ovfCastStageCut_raw_of_signedView_nonneg {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {bb₀ bb₁ lo₀ hi₀ lo₁ hi₁ f : Nat} {w₀ w₁ : ScalarWidth}
+    (hHi₀ : hi₀ < w₀.halfModulus) (hHi₁ : hi₁ < w₁.halfModulus)
+    (h : OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨bb₀, w₀, lo₀ + w₀.halfModulus, hi₀ + w₀.halfModulus⟩
+      ⟨bb₁, w₁, lo₁ + w₁.halfModulus, hi₁ + w₁.halfModulus⟩ f) :
+    OvfCastStageCut fops step baseLocals ids earlyOk
+      ⟨bb₀, w₀, lo₀, hi₀⟩ ⟨bb₁, w₁, lo₁, hi₁⟩ f :=
+  seal_ovfCastStageCut (fun s hInv₀ =>
+    wpUntilFuel_weaken
+      (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+      (fun st hInv₁ =>
+        (stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb₁ w₁
+          hHi₁ st).mpr hInv₁)
+      (fun _ ho => ho) (fun _ hf => hf)
+      (open_ovfCastStageCut h s
+        ((stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb₀ w₀
+          hHi₀ s).mp hInv₀)))
+
+/-- Sealed 3-phase sandwich composition (`raw → signedView → raw`): composes a
+raw unsigned prefix `h₁`, an arbitrarily long cross-zero `signedView` middle
+pipeline `hMid` whose endpoints are non-negative, and a raw unsigned suffix
+`h₂` back into a SINGLE sealed `@[irreducible] OvfCastStageCut fops`! -/
+theorem ovfCastStageCut_sandwich_signedView {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {n₀ n₃ : StageIntervalSpec}
+    {bb₁ bb₂ lo₁ hi₁ lo₂ hi₂ f₁ fMid f₂ : Nat} {w₁ w₂ : ScalarWidth}
+    (hHi₁ : hi₁ < w₁.halfModulus) (hHi₂ : hi₂ < w₂.halfModulus)
+    (h₁ : OvfCastStageCut fops step baseLocals ids earlyOk n₀ ⟨bb₁, w₁, lo₁, hi₁⟩ f₁)
+    (hMid : OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨bb₁, w₁, lo₁ + w₁.halfModulus, hi₁ + w₁.halfModulus⟩
+      ⟨bb₂, w₂, lo₂ + w₂.halfModulus, hi₂ + w₂.halfModulus⟩ fMid)
+    (h₂ : OvfCastStageCut fops step baseLocals ids earlyOk ⟨bb₂, w₂, lo₂, hi₂⟩ n₃ f₂) :
+    OvfCastStageCut fops step baseLocals ids earlyOk n₀ n₃ (f₁ + fMid + f₂) :=
+  ovfCastStageCut_compose
+    (ovfCastStageCut_compose h₁
+      (ovfCastStageCut_raw_of_signedView_nonneg hHi₁ hHi₂ hMid))
+    h₂
+
+/-- Sealed 3-phase sandwich composition (`signedView → raw → signedView`):
+composes a `signedView` prefix, a non-negative raw unsigned middle cut, and a
+`signedView` suffix back into a SINGLE sealed `@[irreducible] OvfCastStageCut
+fops.signedView`! -/
+theorem ovfCastStageCut_sandwich_raw {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {n₀ n₃ : StageIntervalSpec}
+    {bb₁ bb₂ lo₁ hi₁ lo₂ hi₂ f₁ fMid f₂ : Nat} {w₁ w₂ : ScalarWidth}
+    (hHi₁ : hi₁ < w₁.halfModulus) (hHi₂ : hi₂ < w₂.halfModulus)
+    (h₁ : OvfCastStageCut fops.signedView step baseLocals ids earlyOk n₀
+      ⟨bb₁, w₁, lo₁ + w₁.halfModulus, hi₁ + w₁.halfModulus⟩ f₁)
+    (hMid : OvfCastStageCut fops step baseLocals ids earlyOk
+      ⟨bb₁, w₁, lo₁, hi₁⟩ ⟨bb₂, w₂, lo₂, hi₂⟩ fMid)
+    (h₂ : OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨bb₂, w₂, lo₂ + w₂.halfModulus, hi₂ + w₂.halfModulus⟩ n₃ f₂) :
+    OvfCastStageCut fops.signedView step baseLocals ids earlyOk n₀ n₃
+      (f₁ + fMid + f₂) :=
+  ovfCastStageCut_compose
+    (ovfCastStageCut_compose h₁
+      (ovfCastStageCut_signedView_of_raw_nonneg hHi₁ hHi₂ hMid))
+    h₂
 
 /-- Mixed-view composition (raw → signed): a raw-view `OvfCastStageCut` ending
 at a non-negative interval `[lo, hi]` (`hi < halfModulus`) chains into a
@@ -5380,6 +5481,201 @@ theorem canary_ovfCast_signedView_blockTree_cross_zero_pipeline (accB : Nat)
   · exact mulWithOverflowS_biased_overflow_of_out_of_range_nonneg .u8
       (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
       (Or.inl (Nat.le_of_ble_eq_true rfl))
+
+/-- End-to-end sealed mixed unsigned/signed-view sandwich canary:
+`u8 [0, 10]` (raw) → widen `u8 → u16` `[0, 10]` (raw) → checked signed `- 15`
+crossing zero into `[-15, -5]` (`signedView`) → checked signed `+ 20` crossing
+zero BACK into `[5, 15]` (`signedView`) → narrow `u16 → u8` `[5, 15]` (raw),
+sealed back into a SINGLE `OvfCastStageCut ocjFrameOps` via
+`ovfCastStageCut_sandwich_signedView` and lowered to `wpOutcome`! -/
+theorem canary_ovfCast_mixed_raw_signedView_sandwich (x : Nat) (hHi : x ≤ 10) :
+    let base : List OcjVal := [.scalar .u8 x, .uninit, .uninit, .uninit]
+    let step : OcjState → StepOutcome OcjState Nat Unit := fun s =>
+      match s.bb with
+      | 0 =>
+        match listGet? s.locals 0 with
+        | some (.scalar .u8 a) =>
+          .step { bb := 1,
+                  locals := listSetAt s.locals 0 (.scalar .u16 (intToIntCast .u8 false .u16 a)) }
+        | _ => .fault ()
+      | 1 =>
+        match listGet? s.locals 0 with
+        | some (.scalar .u16 a) =>
+          let r := subWithOverflowS .u16 a 15
+          if r.2 then .step { bb := 99, locals := s.locals }
+          else .step { bb := 2, locals := listSetAt s.locals 0 (.scalar .u16 r.1) }
+        | _ => .fault ()
+      | 2 =>
+        match listGet? s.locals 0 with
+        | some (.scalar .u16 a) =>
+          let r := addWithOverflowS .u16 a 20
+          if r.2 then .step { bb := 99, locals := s.locals }
+          else .step { bb := 3, locals := listSetAt s.locals 0 (.scalar .u16 r.1) }
+        | _ => .fault ()
+      | 3 =>
+        match listGet? s.locals 0 with
+        | some (.scalar .u16 a) =>
+          .step { bb := 4,
+                  locals := listSetAt s.locals 0 (.scalar .u8 (intToIntCast .u16 false .u8 a)) }
+        | _ => .fault ()
+      | 99 => .done 999
+      | _ => .done 0
+    wpOutcome (ops := MirWpOps.ofDetStep step (fun s => some s.bb))
+      (fun o => o = 0 ∨ o = 999) (fun _ => False) { bb := 0, locals := base } := by
+  let ids : StageLocalIds := { accId := 0, tmpId := 1, ovfMulId := 2, ovfAddId := 3 }
+  let base : List OcjVal := [.scalar .u8 x, .uninit, .uninit, .uninit]
+  let step : OcjState → StepOutcome OcjState Nat Unit := fun s =>
+    match s.bb with
+    | 0 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u8 a) =>
+        .step { bb := 1,
+                locals := listSetAt s.locals 0 (.scalar .u16 (intToIntCast .u8 false .u16 a)) }
+      | _ => .fault ()
+    | 1 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u16 a) =>
+        let r := subWithOverflowS .u16 a 15
+        if r.2 then .step { bb := 99, locals := s.locals }
+        else .step { bb := 2, locals := listSetAt s.locals 0 (.scalar .u16 r.1) }
+      | _ => .fault ()
+    | 2 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u16 a) =>
+        let r := addWithOverflowS .u16 a 20
+        if r.2 then .step { bb := 99, locals := s.locals }
+        else .step { bb := 3, locals := listSetAt s.locals 0 (.scalar .u16 r.1) }
+      | _ => .fault ()
+    | 3 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u16 a) =>
+        .step { bb := 4,
+                locals := listSetAt s.locals 0 (.scalar .u8 (intToIntCast .u16 false .u8 a)) }
+      | _ => .fault ()
+    | 99 => .done 999
+    | _ => .done 0
+  let branch (nextBb : Nat) : OcjState → Nat → Bool → OcjState := fun s w b =>
+    if b then { bb := 99, locals := s.locals }
+    else { bb := nextBb, locals := listSetAt s.locals 0 (.scalar .u16 w) }
+  have hPre :
+      OvfCastStageCut ocjFrameOps step base ids (fun o => Nat.beq o 999)
+        ⟨0, .u8, 0, 10⟩ ⟨1, .u16, 0, 10⟩ 1 :=
+    ovfCastStageCut_widen (fops := ocjFrameOps) (step := step)
+      ocjFrameOps_lawful (by rfl) (Nat.le_of_ble_eq_true rfl)
+      (Nat.le_of_ble_eq_true rfl)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 0 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 acc) := hAccGet
+        dsimp only [step]
+        rw [hBb, hGet]
+        rfl)
+  have hMid1 :
+      OvfCastStageCut ocjFrameOps.signedView step base ids (fun o => Nat.beq o 999)
+        ⟨1, .u16, 0 + ScalarWidth.u16.halfModulus, 10 + ScalarWidth.u16.halfModulus⟩
+        ⟨2, .u16, 32753, 32763⟩ 2 :=
+    ovfCastStageCut_checked_sub_signed_interval (fops := ocjFrameOps) (step := step)
+      .u16 15 rfl (branch 2)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 1 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u16 (toBiased .u16 acc)) := hAccGet
+        dsimp only [step, branch]
+        rw [hBb, hGet]
+        dsimp only
+        cases (subWithOverflowS .u16 (toBiased .u16 acc) 15).2 <;> rfl)
+      (fun s acc r hInv _ _ _ hILo hIHi hRlt => by
+        dsimp only [branch]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        have hBiLo : 32753 ≤ toBiased .u16 r :=
+          Nat.le_of_add_le_add_right (show 32753 + 32783 ≤ toBiased .u16 r + 32783 from hILo)
+        have hBiHi : toBiased .u16 r ≤ 32763 :=
+          Nat.le_of_add_le_add_right (show toBiased .u16 r + 32783 ≤ 32763 + 32783 from hIHi)
+        have hInvR : toBiased .u16 (toBiased .u16 r) = r := by
+          rw [toBiased_involutive, Nat.mod_eq_of_lt hRlt]
+        have hGoal :=
+          stageIntervalStateInv_set_acc (fops := ocjFrameOps.signedView)
+            (OvfCastFrameOps.signedView_lawful ocjFrameOps_lawful) (by rfl)
+            (spec₂ := ⟨2, .u16, 32753, 32763⟩) hInv hBiLo hBiHi (Nat.le_of_ble_eq_true rfl)
+        change StageIntervalStateInv ocjFrameOps.signedView base ids ⟨2, .u16, 32753, 32763⟩
+          { bb := 2, locals := listSetAt s.locals 0 (.scalar .u16 (toBiased .u16 (toBiased .u16 r))) }
+          at hGoal
+        rw [hInvR] at hGoal
+        exact hGoal)
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branch]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hMid2 :
+      OvfCastStageCut ocjFrameOps.signedView step base ids (fun o => Nat.beq o 999)
+        ⟨2, .u16, 32753, 32763⟩
+        ⟨3, .u16, 5 + ScalarWidth.u16.halfModulus, 15 + ScalarWidth.u16.halfModulus⟩ 2 :=
+    ovfCastStageCut_checked_add_signed_interval (fops := ocjFrameOps) (step := step)
+      .u16 20 rfl (branch 3)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 2 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u16 (toBiased .u16 acc)) := hAccGet
+        dsimp only [step, branch]
+        rw [hBb, hGet]
+        dsimp only
+        cases (addWithOverflowS .u16 (toBiased .u16 acc) 20).2 <;> rfl)
+      (fun s acc r hInv _ _ _ hILo hIHi hRlt => by
+        dsimp only [branch]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        have hBiLo : 32773 ≤ toBiased .u16 r :=
+          Nat.le_of_add_le_add_right (show 32773 + 32768 ≤ toBiased .u16 r + 32768 from hILo)
+        have hBiHi : toBiased .u16 r ≤ 32783 :=
+          Nat.le_of_add_le_add_right (show toBiased .u16 r + 32768 ≤ 32783 + 32768 from hIHi)
+        have hInvR : toBiased .u16 (toBiased .u16 r) = r := by
+          rw [toBiased_involutive, Nat.mod_eq_of_lt hRlt]
+        have hGoal :=
+          stageIntervalStateInv_set_acc (fops := ocjFrameOps.signedView)
+            (OvfCastFrameOps.signedView_lawful ocjFrameOps_lawful) (by rfl)
+            (spec₂ := ⟨3, .u16, 5 + ScalarWidth.u16.halfModulus, 15 + ScalarWidth.u16.halfModulus⟩)
+            hInv hBiLo hBiHi (Nat.le_of_ble_eq_true rfl)
+        change StageIntervalStateInv ocjFrameOps.signedView base ids
+          ⟨3, .u16, 5 + ScalarWidth.u16.halfModulus, 15 + ScalarWidth.u16.halfModulus⟩
+          { bb := 3, locals := listSetAt s.locals 0 (.scalar .u16 (toBiased .u16 (toBiased .u16 r))) }
+          at hGoal
+        rw [hInvR] at hGoal
+        exact hGoal)
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branch]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hPost :
+      OvfCastStageCut ocjFrameOps step base ids (fun o => Nat.beq o 999)
+        ⟨3, .u16, 5, 15⟩ ⟨4, .u8, 5, 15⟩ 1 :=
+    ovfCastStageCut_narrow (fops := ocjFrameOps) (step := step)
+      (srcSigned := false) ocjFrameOps_lawful (by rfl)
+      (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 3 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u16 acc) := hAccGet
+        dsimp only [step]
+        rw [hBb, hGet]
+        rfl)
+  have hFull :
+      OvfCastStageCut ocjFrameOps step base ids (fun o => Nat.beq o 999)
+        ⟨0, .u8, 0, 10⟩ ⟨4, .u8, 5, 15⟩ (1 + (2 + 2) + 1) :=
+    ovfCastStageCut_sandwich_signedView (Nat.le_of_ble_eq_true rfl)
+      (Nat.le_of_ble_eq_true rfl) hPre (ovfCastStageCut_compose hMid1 hMid2) hPost
+  have hEntry :
+      StageIntervalStateInv ocjFrameOps base ids ⟨0, .u8, 0, 10⟩
+        { bb := 0, locals := base } :=
+    ⟨rfl, rfl, ⟨x, rfl, Nat.zero_le x, hHi, Nat.le_of_ble_eq_true rfl⟩,
+     fun _ _ _ _ _ => rfl⟩
+  exact ovfCastStageCut_to_wpOutcome hEntry hFull
+    (fun o hEq => Or.inr (Nat.eq_of_beq_eq_true hEq))
+    (fun s hInv => by
+      have hBb : s.bb = 4 := hInv.1
+      refine wpUntil_step (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+      change (step s).wp _ _ _
+      dsimp only [step]
+      rw [hBb]
+      exact Or.inl rfl)
 
 end Anneal.ParametricCore
 
