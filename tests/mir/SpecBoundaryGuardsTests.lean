@@ -554,6 +554,18 @@ theorem i64_signed_overflow_and_wraparound_false :
   ⟨i64GhostLen_max_pos, i64GhostLen_two_pow_63_neg, i64GhostLen_two_pow_64_zero,
     false_of_i64_list_len_nonneg (), false_of_i64_list_len_zero_imp_nil ()⟩
 
+/-- The capacity of a fixed-width model is the exact length at which the machine
+    type wraps to zero (unsigned) or turns negative (signed). -/
+theorem fixed_width_capacity_matches_machine_overflow :
+    (GhostIntWidth.fixedUnsigned 64).capacity? = some (2 ^ 64) ∧
+      u64GhostLen (2 ^ 64) = 0 ∧
+      (GhostIntWidth.fixedSigned 64).capacity? = some (2 ^ 63) ∧
+      (i64GhostLen (2 ^ 63)).toInt < 0 :=
+  ⟨fixedUnsigned64_capacity_is_u64_wraparound.1,
+    fixedUnsigned64_capacity_is_u64_wraparound.2.2.2,
+    fixedSigned64_capacity_is_i64_sign_flip.1,
+    fixedSigned64_capacity_is_i64_sign_flip.2.2.2.2⟩
+
 /-- **Positive.** The unbounded `Int` list model is consistent and never wraps. -/
 theorem unboundedInt_list_model_never_wraps (n : Nat) :
     Nonempty (UnboundedIntGhostCollectionAxioms (List Unit)) ∧
@@ -812,6 +824,8 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.usizeGhostLen_wraps,
         ``Anneal.SpecBoundaryGuards.bitVec64GhostLen_two_pow_64,
         ``Anneal.SpecBoundaryGuards.i64GhostLen_two_pow_63_neg,
+        ``Anneal.SpecBoundaryGuards.fixedUnsigned64_capacity_is_u64_wraparound,
+        ``Anneal.SpecBoundaryGuards.fixedSigned64_capacity_is_i64_sign_flip,
         ``Anneal.SpecBoundaryGuards.false_of_i64_list_len_nonneg,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_strict_mono,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_zero_empty,

@@ -1851,6 +1851,30 @@ theorem false_of_i64_list_len_zero_imp_nil {α : Type u} (x : α)
     (hAxiom : ∀ xs : List α, i64ListGhostLen xs = 0 → xs = []) : False :=
   replicate_two_pow_64_ne_nil x (hAxiom _ (i64ListGhostLen_replicate_two_pow_64 x))
 
+/-- The model and the machine agree on where an unsigned 64-bit length breaks:
+    `2 ^ 64` is the capacity of `.fixedUnsigned 64`, it is the first length the
+    width does not represent, and it is exactly the length `UInt64` stores as `0`. -/
+theorem fixedUnsigned64_capacity_is_u64_wraparound :
+    (GhostIntWidth.fixedUnsigned 64).capacity? = some (2 ^ 64) ∧
+      (GhostIntWidth.fixedUnsigned 64).Represents (2 ^ 64 - 1) ∧
+      ¬ (GhostIntWidth.fixedUnsigned 64).Represents (2 ^ 64) ∧
+      u64GhostLen (2 ^ 64) = 0 :=
+  ⟨rfl, (by decide : (2 ^ 64 - 1 : Nat) < 2 ^ 64),
+    (by decide : ¬ ((2 ^ 64 : Nat) < 2 ^ 64)), u64GhostLen_two_pow_64⟩
+
+/-- The model and the machine agree on where a signed 64-bit length breaks:
+    `2 ^ 63` is the capacity of `.fixedSigned 64`; the last representable length
+    `2 ^ 63 - 1` is stored faithfully, and `2 ^ 63`, the first length the width
+    does not represent, is exactly where `Int64` turns negative. -/
+theorem fixedSigned64_capacity_is_i64_sign_flip :
+    (GhostIntWidth.fixedSigned 64).capacity? = some (2 ^ 63) ∧
+      (GhostIntWidth.fixedSigned 64).Represents (2 ^ 63 - 1) ∧
+      (i64GhostLen (2 ^ 63 - 1)).toInt = 2 ^ 63 - 1 ∧
+      ¬ (GhostIntWidth.fixedSigned 64).Represents (2 ^ 63) ∧
+      (i64GhostLen (2 ^ 63)).toInt < 0 :=
+  ⟨rfl, (by decide : (2 ^ 63 - 1 : Nat) < 2 ^ (64 - 1)), i64GhostLen_max_pos,
+    (by decide : ¬ ((2 ^ 63 : Nat) < 2 ^ (64 - 1))), i64GhostLen_two_pow_63_neg⟩
+
 /-! ### 4.3 `False` from Fixed-Width Ghost Collection Axioms -/
 
 /-- `n`-fold application of `snoc` to `c`. -/

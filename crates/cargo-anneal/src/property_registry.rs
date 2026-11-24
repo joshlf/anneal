@@ -7382,6 +7382,13 @@ fn tokenize_spec_source(
             pos += 1;
             continue;
         }
+        // Lean identifier quotes (`«pre»` is the identifier `pre`).
+        if dialect != SpecSourceDialect::Rust
+            && (src[pos..].starts_with('«') || src[pos..].starts_with('»'))
+        {
+            pos += '«'.len_utf8();
+            continue;
+        }
         let next = bytes.get(pos + 1).copied();
         let start_line = line_at(pos, &mut line, &mut line_pos);
 
@@ -7945,7 +7952,9 @@ fn is_closed_width_bound(bound: &[GuardTok<'_>]) -> bool {
                     || is_fixed_width_int_type_name(tok.text)
                     || tok.text == "size"
             }
-            GuardTokKind::Sym => matches!(tok.text, "^" | "*" | "+" | "(" | ")" | "."),
+            GuardTokKind::Sym => {
+                matches!(tok.text, "^" | "*" | "+" | "-" | "/" | "%" | "(" | ")" | ".")
+            }
             _ => false,
         })
 }
@@ -8085,9 +8094,50 @@ fn resolve_fixed_width_leaf(
         .map(|(_, underlying)| (underlying.clone(), leaf.line))
 }
 
+/// Type constructors whose arguments are element, key, marker, or parameter
+/// types rather than the value itself (in addition to
+/// [`GHOST_COLLECTION_TYPE_NAMES`]): a fixed-width integer below one of them
+/// is not the length.
+const ELEMENT_CONTAINER_TYPE_NAMES: [&str; 27] = [
+    "Vec",
+    "VecDeque",
+    "LinkedList",
+    "BinaryHeap",
+    "HashMap",
+    "HashSet",
+    "BTreeMap",
+    "BTreeSet",
+    "IndexMap",
+    "IndexSet",
+    "List",
+    "Array",
+    "Set",
+    "Map",
+    "Vector",
+    "Subarray",
+    "RBMap",
+    "RBTree",
+    "AssocList",
+    "Stream",
+    "Iterator",
+    "IntoIterator",
+    "PhantomData",
+    "fn",
+    "Fn",
+    "FnMut",
+    "FnOnce",
+];
+
+fn is_element_container_type_name(name: &str) -> bool {
+    GHOST_COLLECTION_TYPE_NAMES.contains(&name) || ELEMENT_CONTAINER_TYPE_NAMES.contains(&name)
+}
+
 /// Structurally inspect a type expression for a fixed-width scalar integer
-/// length type (descending only through scalar/reference/tuple/option/ok-result
-/// wrappers, never through collection/slice/array/error-slot element types).
+/// length type. Every type constructor is looked through (a wrapper the
+/// scanner has never heard of, `Tracked<u64>` or `WithTop UInt64`, is still a
+/// machine integer) except the element containers
+/// ([`GHOST_COLLECTION_TYPE_NAMES`], [`ELEMENT_CONTAINER_TYPE_NAMES`], slices,
+/// arrays) and the error slot of `Result` / `Except`.
 ///
 /// A wrapper does not make a machine integer unbounded, so `Option<u64>`,
 /// `Wrapping<u64>`, `NonZero<u64>`, `&u64`, `(u64, bool)`, `Result<u64, E>`,
@@ -8155,12 +8205,32 @@ fn fixed_width_type_within(
             return None;
         }
         // Tuples / products at depth 0 (`(u64, bool)`, `UInt64 × Bool`).
-        let tuple_parts = split_top_level_toks(toks, |t| t.is_sym(",") || t.is_sym("×"));
+        let tuple_parts =
+            split_top_level_toks(toks, |t| t.is_sym(",") || t.is_sym("×") || t.is_sym("⊕"));
         if tuple_parts.len() > 1 {
             for part in tuple_parts {
                 if let Some(found) = inspect(part, aliases, depth - 1) {
                     return Some(found);
                 }
+            }
+            return None;
+        }
+        // `impl Trait<…> + …` / `dyn Trait<…> + …`.
+        if toks[0].is_word("impl") || toks[0].is_word("dyn") {
+            return split_top_level_toks(&toks[1..], |t| t.is_sym("+"))
+                .into_iter()
+                .find_map(|bound| inspect(bound, aliases, depth - 1));
+        }
+        // Qualified path `<T as Trait>::Assoc`: judged by its self type.
+        if toks[0].is_sym("<") {
+            let close = skip_rust_generics(toks, 0);
+            if close > 1 && close <= toks.len() {
+                let inner = &toks[1..close - 1];
+                let self_end = inner
+                    .iter()
+                    .position(|t| t.is_word("as"))
+                    .unwrap_or(inner.len());
+                return inspect(&inner[..self_end], aliases, depth - 1);
             }
             return None;
         }
@@ -8214,56 +8284,35 @@ fn fixed_width_type_within(
                     .into_iter()
                     .filter(|arg| !arg.is_empty() && !arg.first().is_some_and(|t| t.is_sym("'")))
                     .collect();
-                if matches!(
-                    head.text,
-                    "Option"
-                        | "Wrapping"
-                        | "Saturating"
-                        | "NonZero"
-                        | "Cell"
-                        | "RefCell"
-                        | "Box"
-                        | "Arc"
-                        | "Rc"
-                        | "ManuallyDrop"
-                        | "MaybeUninit"
-                        | "Pin"
-                        | "Ghost"
-                        | "Snapshot"
-                        | "Spec"
-                ) {
-                    if let Some(inner) = type_args.first() {
-                        return inspect(inner, aliases, depth - 1);
-                    }
-                } else if head.text == "Result"
-                    && let Some(ok_ty) = type_args.first()
-                {
-                    return inspect(ok_ty, aliases, depth - 1);
+                if is_element_container_type_name(head.text) {
+                    return None;
                 }
+                // The error slot of a `Result` does not carry the length.
+                let value_args = if head.text == "Result" {
+                    &type_args[..type_args.len().min(1)]
+                } else {
+                    &type_args[..]
+                };
+                return value_args
+                    .iter()
+                    .find_map(|arg| inspect(arg, aliases, depth - 1));
             }
             return None;
         }
         // Lean type application `Head Arg1 Arg2 …`.
         let lean_args = split_lean_type_args(&toks[after_head..]);
-        if matches!(
-            head.text,
-            "Option" | "Id" | "Thunk" | "Ghost" | "PLift" | "ULift"
-        ) {
-            if let Some(inner) = lean_args.last() {
-                return inspect(inner, aliases, depth - 1);
-            }
-        } else if matches!(head.text, "Prod" | "PProd" | "MProd") {
-            for arg in lean_args {
-                if let Some(found) = inspect(arg, aliases, depth - 1) {
-                    return Some(found);
-                }
-            }
-        } else if head.text == "Except"
-            && let Some(ok_ty) = lean_args.get(1)
-        {
-            return inspect(ok_ty, aliases, depth - 1);
+        if is_element_container_type_name(head.text) {
+            return None;
         }
-        None
+        // The error slot of `Except ε α` / `ExceptT ε m α` is not the length.
+        let value_args = if matches!(head.text, "Except" | "ExceptT") {
+            lean_args.get(1..).unwrap_or(&[])
+        } else {
+            &lean_args[..]
+        };
+        value_args
+            .iter()
+            .find_map(|arg| inspect(arg, aliases, depth - 1))
     }
     inspect(toks, aliases, MAX_TYPE_DEPTH)
 }
@@ -8319,7 +8368,7 @@ fn is_lean_type_expression(toks: &[GuardTok<'_>]) -> bool {
             GuardTokKind::Sym => {
                 matches!(
                     tok.text,
-                    "." | "(" | ")" | "×" | "→" | "->" | "^" | "*" | "+" | "⊕"
+                    "." | "(" | ")" | "×" | "→" | "->" | "^" | "*" | "+" | "-" | "/" | "%" | "⊕"
                 )
             }
             _ => false,
@@ -8397,12 +8446,42 @@ fn collect_fixed_width_type_aliases(
                     }
                     candidate = Some((String::from(name.text), &toks[assign + 1..end]));
                 }
+            } else if dialect != SpecSourceDialect::Lean && tok.is_word("use") {
+                // `use core::primitive::u64 as Len;`
+                let mut end = idx + 1;
+                while end < toks.len() && !toks[end].is_sym(";") {
+                    end += 1;
+                }
+                if end >= idx + 4
+                    && end <= toks.len()
+                    && toks[end - 2].is_word("as")
+                    && toks[end - 1].kind == GuardTokKind::Word
+                {
+                    candidate = Some((String::from(toks[end - 1].text), &toks[idx + 1..end - 2]));
+                }
             } else if dialect != SpecSourceDialect::Lean
                 && tok.is_word("struct")
                 && let Some(name) = toks.get(idx + 1).filter(|t| t.kind == GuardTokKind::Word)
             {
                 let open = skip_rust_generics(toks, idx + 2);
-                if toks.get(open).is_some_and(|paren| paren.is_sym("("))
+                if toks.get(open).is_some_and(|brace| brace.is_sym("{"))
+                    && let Some(close) = matching_close(toks, open)
+                {
+                    // A struct with a single named field (`struct Len { n: u64 }`)
+                    // is a newtype as well.
+                    let fields = split_top_level_toks(&toks[open + 1..close], |t| t.is_sym(","));
+                    let non_empty: Vec<&[GuardTok<'_>]> =
+                        fields.into_iter().filter(|f| !f.is_empty()).collect();
+                    if non_empty.len() == 1 {
+                        let field = strip_rust_field_prefix(non_empty[0]);
+                        if field.len() > 2
+                            && field[0].kind == GuardTokKind::Word
+                            && field[1].is_sym(":")
+                        {
+                            candidate = Some((String::from(name.text), &field[2..]));
+                        }
+                    }
+                } else if toks.get(open).is_some_and(|paren| paren.is_sym("("))
                     && let Some(close) = matching_close(toks, open)
                 {
                     let fields = split_top_level_toks(&toks[open + 1..close], |t| t.is_sym(","));
@@ -9853,6 +9932,17 @@ struct WildcardAlternative {
     /// the next arm, a deeper one belongs to the body.
     body_depth: u32,
     in_lambda: bool,
+    /// Bracket depth just inside the outermost struct-pattern brace around
+    /// the scan position; a `:=` at or below it separates a field from its
+    /// pattern (Lean `{ val := .err _ }`).
+    struct_pattern_depth: Option<u32>,
+    /// An earlier `|` alternative of the current component of a
+    /// parenthesized catch-all candidate was a catch-all (`(_ | 0)`).
+    or_wild: bool,
+    /// A `,` was seen directly inside the outer catch-all parentheses.
+    tuple_started: bool,
+    /// Every completed component of that tuple was a catch-all.
+    tuple_wild: bool,
 }
 
 impl WildcardAlternative {
@@ -9864,13 +9954,20 @@ impl WildcardAlternative {
         }
     }
 
-    fn next_alt(depth: u32, arm_base_depth: u32, catch_all_parens: u32) -> Self {
+    fn next_alt(&self, catch_all_parens: u32) -> Self {
         Self {
-            depth,
-            arm_base_depth,
+            depth: self.depth,
+            arm_base_depth: self.arm_base_depth,
             catch_all_parens,
+            struct_pattern_depth: self.struct_pattern_depth,
             ..Self::default()
         }
+    }
+
+    /// Whether the scan position is directly inside the outer catch-all
+    /// parentheses (not in a nested bracket).
+    fn at_catch_all_paren_level(&self) -> bool {
+        self.catch_all_parens > 0 && self.depth == self.arm_base_depth + self.catch_all_parens
     }
 
     fn body(depth: u32) -> Self {
@@ -10098,17 +10195,87 @@ fn is_looser_than_disjunction(tok: &GuardTok<'_>) -> bool {
     tok.kind == GuardTokKind::Sym && matches!(tok.text, "->" | "→" | "↔" | "<->" | "==>")
 }
 
-fn is_arm_body_terminator(tok: &GuardTok<'_>) -> bool {
+/// Whether `tok` (followed by `next`) ends an arm body that no bracket
+/// closes: the next arm, a statement or item boundary, or the next top-level
+/// command of a Lean module (`#eval …`, `@[simp] theorem …`, `namespace …`).
+/// Scanning past it would attribute unrelated code to the arm.
+fn is_arm_body_terminator(tok: &GuardTok<'_>, next: Option<&GuardTok<'_>>) -> bool {
     match tok.kind {
         GuardTokKind::FatArrow => true,
-        GuardTokKind::Sym => matches!(tok.text, "," | "|" | ";" | ")" | "]" | "}"),
+        GuardTokKind::Sym => {
+            matches!(tok.text, "," | "|" | ";" | ")" | "]" | "}" | "#")
+                || (tok.text == "@" && next.is_some_and(|open| open.is_sym("[")))
+        }
         GuardTokKind::Word => {
             is_lean_decl_reset_word(tok.text)
                 || matches!(
                     tok.text,
-                    "fn" | "pub" | "struct" | "enum" | "impl" | "trait" | "mod" | "where" | "end"
+                    "fn" | "pub"
+                        | "struct"
+                        | "enum"
+                        | "impl"
+                        | "trait"
+                        | "mod"
+                        | "use"
+                        | "const"
+                        | "static"
+                        | "type"
+                        | "where"
+                        | "end"
+                        | "namespace"
+                        | "section"
+                        | "open"
+                        | "export"
+                        | "import"
+                        | "variable"
+                        | "universe"
+                        | "set_option"
+                        | "attribute"
+                        | "class"
+                        | "mutual"
+                        | "noncomputable"
+                        | "private"
+                        | "protected"
+                        | "local"
+                        | "scoped"
+                        | "notation"
+                        | "infix"
+                        | "infixl"
+                        | "infixr"
+                        | "prefix"
+                        | "postfix"
+                        | "macro"
+                        | "syntax"
+                        | "deriving"
+                        | "termination_by"
+                        | "decreasing_by"
                 )
         }
+        _ => false,
+    }
+}
+
+/// Whether `tok` starts a construct that extends as far to the right as
+/// possible (`if … then … else e`, `fun x => e`, `∀ x, e`, `let x := v; e`):
+/// a later disjunction belongs to that construct, not to the whole body.
+fn extends_to_the_right(tok: &GuardTok<'_>) -> bool {
+    match tok.kind {
+        GuardTokKind::Word => matches!(
+            tok.text,
+            "if" | "then"
+                | "else"
+                | "fun"
+                | "λ"
+                | "match"
+                | "let"
+                | "have"
+                | "show"
+                | "from"
+                | "do"
+                | "forall"
+                | "exists"
+        ),
+        GuardTokKind::Sym => matches!(tok.text, "∀" | "∃" | "Σ" | "∑" | "∏"),
         _ => false,
     }
 }
@@ -10217,11 +10384,14 @@ fn expr_is_trivially_true(
     let mut at_disjunct_start = true;
     let mut inner_depth = 0u32;
     let mut prev_closed_brace_at_zero = false;
+    // A right-extending construct was seen: later disjuncts are its own.
+    let mut disjuncts_blocked = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
-            if let Some(after) =
-                consume_trivial_conjunction(toks, idx, stop_delim == Some(")"), depth)
+            if !disjuncts_blocked
+                && let Some(after) =
+                    consume_trivial_conjunction(toks, idx, stop_delim == Some(")"), depth)
             {
                 found_trivial = true;
                 idx = after;
@@ -10254,14 +10424,19 @@ fn expr_is_trivially_true(
                     return (toks.get(idx).is_some_and(|t| t.is_sym("}")) && found_trivial)
                         .then_some(idx + 1);
                 }
-                if tok.kind == GuardTokKind::Sym && matches!(tok.text, ")" | "]" | "}") {
+                // A tuple or argument list (`(true, x)`) is not a
+                // parenthesized proposition.
+                if tok.kind == GuardTokKind::Sym && matches!(tok.text, ")" | "]" | "}" | ",") {
                     return None;
                 }
-            } else if is_arm_body_terminator(tok) {
+            } else if is_arm_body_terminator(tok, toks.get(idx)) {
                 return found_trivial.then_some(before);
             }
             if is_looser_than_disjunction(tok) {
                 return None;
+            }
+            if extends_to_the_right(tok) {
+                disjuncts_blocked = true;
             }
             if is_disjunction_tok(tok) {
                 at_disjunct_start = true;
@@ -10334,6 +10509,30 @@ enum MatchesMacroState {
     Outside,
     Scrutinee { depth: u32 },
     Pattern,
+}
+
+/// Maximum tokens of a brace group inspected to recognize a struct pattern.
+const MAX_STRUCT_PATTERN_TOKENS: usize = 256;
+
+/// Whether the brace group whose `{` precedes `start` closes within
+/// [`MAX_STRUCT_PATTERN_TOKENS`] tokens without containing `=>` or `;`: such
+/// a group has no arms or statements of its own.
+fn brace_is_pattern_like(toks: &[GuardTok<'_>], start: usize) -> bool {
+    let mut depth = 1u32;
+    for tok in toks.iter().skip(start).take(MAX_STRUCT_PATTERN_TOKENS) {
+        if tok.kind == GuardTokKind::FatArrow || tok.is_sym(";") {
+            return false;
+        }
+        if tok.is_sym("{") {
+            depth += 1;
+        } else if tok.is_sym("}") {
+            depth -= 1;
+            if depth == 0 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Token-level error-branch wildcard scan; the same algorithm as
@@ -10414,7 +10613,16 @@ fn scan_error_branch_wildcard_tokens(
                     arm = WildcardArm::default();
                     alt = WildcardAlternative::pattern(alt.depth);
                 } else {
-                    arm.absorb(&alt);
+                    if alt.at_catch_all_paren_level() {
+                        // Record the error wildcard now; the catch-all
+                        // verdict waits for the closing parenthesis.
+                        arm.absorb(&WildcardAlternative {
+                            catch_all: false,
+                            ..alt
+                        });
+                    } else {
+                        arm.absorb(&alt);
+                    }
                     match alt.error_ctor_depth {
                         Some(ctor_depth) if alt.depth > ctor_depth => {
                             // Or-pattern inside an error payload: directly
@@ -10427,13 +10635,18 @@ fn scan_error_branch_wildcard_tokens(
                                 alt.type_ascription_depth = None;
                             }
                         }
-                        _ => {
-                            alt = WildcardAlternative::next_alt(
-                                alt.depth,
-                                alt.arm_base_depth,
-                                alt.catch_all_parens,
-                            );
+                        // Or-pattern directly inside catch-all parentheses
+                        // (`(0 | _)`, `(_ | 0, y)`): whether the group is a
+                        // catch-all is only known once it closes.
+                        _ if alt.at_catch_all_paren_level() => {
+                            let or_wild = alt.or_wild || alt.catch_all;
+                            let (tuple_started, tuple_wild) = (alt.tuple_started, alt.tuple_wild);
+                            alt = alt.next_alt(alt.catch_all_parens);
+                            alt.or_wild = or_wild;
+                            alt.tuple_started = tuple_started;
+                            alt.tuple_wild = tuple_wild;
                         }
+                        _ => alt = alt.next_alt(alt.catch_all_parens),
                     }
                 }
             }
@@ -10446,8 +10659,11 @@ fn scan_error_branch_wildcard_tokens(
             {
                 // A sibling of the error constructor (`(Err(_), Ok(_))`,
                 // `| .err _, .ok v`), not part of its payload.
-                arm.absorb(&alt);
-                alt = WildcardAlternative::next_alt(alt.depth, alt.arm_base_depth, 0);
+                arm.absorb(&WildcardAlternative {
+                    catch_all: false,
+                    ..alt
+                });
+                alt = alt.next_alt(0);
             }
             GuardTokKind::Sym if matches!(tok.text, "," | ";") && alt.depth == 0 => {
                 in_match_scrutinee = false;
@@ -10489,16 +10705,21 @@ fn scan_error_branch_wildcard_tokens(
                 }
             }
             GuardTokKind::Sym if tok.text == "{" => {
+                // In pattern position a brace group without `=>` or `;` is a
+                // struct pattern (`W { r: Err(_) }`, Lean `{ val := .err _ }`)
+                // or a small expression: it holds no arms of its own, so it
+                // is tracked by depth and its error constructors stay with
+                // the arm around it.
                 let is_struct_pattern_brace = !alt.after_arrow
                     && !arm.guarded
                     && !in_match_scrutinee
-                    && (alt.error_ctor.is_some()
-                        || matches_state == MatchesMacroState::Pattern
-                        || arm.wildcard.is_some()
-                        || arm.catch_all);
+                    && (matches_state == MatchesMacroState::Pattern
+                        || brace_is_pattern_like(toks, idx));
                 if is_struct_pattern_brace {
-                    // Struct pattern inside a match arm or `matches!` pattern.
                     alt.depth += 1;
+                    if alt.struct_pattern_depth.is_none() {
+                        alt.struct_pattern_depth = Some(alt.depth);
+                    }
                     if alt.type_ascription_depth.is_some() {
                         alt.tokens += 1;
                     } else {
@@ -10525,11 +10746,25 @@ fn scan_error_branch_wildcard_tokens(
                     if alt.type_ascription_depth.is_some_and(|d| alt.depth < d) {
                         alt.type_ascription_depth = None;
                     }
+                    if alt.struct_pattern_depth.is_some_and(|d| alt.depth < d) {
+                        alt.struct_pattern_depth = None;
+                    }
                     let closed_outer_catch_all_paren = tok.text == ")"
                         && alt.catch_all_parens > 0
                         && alt.depth < alt.arm_base_depth + alt.catch_all_parens;
                     if closed_outer_catch_all_paren {
                         alt.catch_all_parens -= 1;
+                        // The group is a catch-all when its last component
+                        // is and, for a tuple, every earlier one was too.
+                        let last_wild = alt.catch_all || alt.or_wild;
+                        alt.catch_all = if alt.tuple_started {
+                            alt.tuple_wild && (last_wild || alt.only_modifiers)
+                        } else {
+                            last_wild
+                        };
+                        alt.or_wild = false;
+                        alt.tuple_started = false;
+                        alt.tuple_wild = false;
                     }
                     if was_ascription || closed_outer_catch_all_paren {
                         alt.tokens += 1;
@@ -10567,6 +10802,21 @@ fn scan_error_branch_wildcard_tokens(
                     scopes.close_lean_matches(0);
                     arm = WildcardArm::default();
                     alt = WildcardAlternative::default();
+                }
+            }
+            GuardTokKind::Sym
+                if tok.text == ":="
+                    && alt.struct_pattern_depth.is_some()
+                    && !alt.after_arrow
+                    && !alt.in_lambda =>
+            {
+                // Lean structure pattern field `{ val := pattern }`.
+                if !arm.guarded {
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                    }
                 }
             }
             GuardTokKind::Sym if tok.text == ":=" => {
@@ -10690,6 +10940,16 @@ fn scan_error_branch_wildcard_tokens(
                         alt.tokens += 1;
                         alt.catch_all = false;
                         alt.only_modifiers = keep_mod;
+                    } else if tok.is_sym(",") && alt.at_catch_all_paren_level() {
+                        // A tuple component ended (`(_, _)`).
+                        let component_wild = alt.catch_all || alt.or_wild;
+                        alt.tuple_wild =
+                            component_wild && (alt.tuple_wild || !alt.tuple_started);
+                        alt.tuple_started = true;
+                        alt.or_wild = false;
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = alt.tuple_wild;
                     } else if tok.is_sym("@") && alt.catch_all {
                         alt.tokens += 1;
                         alt.catch_all = false;
@@ -10949,7 +11209,7 @@ fn lean_pre_body_is_trivial(body: &[GuardTok<'_>], module_defines_pre: bool) -> 
             .is_some_and(|tok| tok.is_word("fun") || tok.is_word("λ"))
             && let Some(arrow) = body
                 .iter()
-                .position(|tok| tok.kind == GuardTokKind::FatArrow)
+                .position(|tok| tok.kind == GuardTokKind::FatArrow || tok.is_sym("↦"))
         {
             body = &body[arrow + 1..];
             continue;
@@ -11209,6 +11469,57 @@ struct LeanSpecValueDecl<'t, 'a> {
     /// Tokens after `:=`; `None` for a `where` structure (whose fields the
     /// field audit inspects).
     value: Option<&'t [GuardTok<'a>]>,
+    /// Field tokens after `where`, for a `where` structure.
+    where_fields: Option<&'t [GuardTok<'a>]>,
+}
+
+/// Whether a structure-instance field takes its value from a whole base
+/// structure: the spread field `__ := base` or a parent projection
+/// `toItemSpec := base`. Such a field supplies `pre` from `base`.
+fn is_lean_spread_field_name(name: &str) -> bool {
+    name == "__"
+        || name
+            .strip_prefix("to")
+            .is_some_and(|rest| rest.starts_with(|first: char| first.is_uppercase()))
+}
+
+/// Values of the spread fields ([`is_lean_spread_field_name`]) among the
+/// fields of a structure instance (`{ … }` or `where …`).
+fn lean_spread_field_values<'t, 'a>(fields: &'t [GuardTok<'a>]) -> Vec<&'t [GuardTok<'a>]> {
+    let mut values = Vec::new();
+    let mut depth = 0i32;
+    let mut pos = 0usize;
+    while pos < fields.len() {
+        let tok = &fields[pos];
+        if depth == 0
+            && tok.kind == GuardTokKind::Word
+            && is_lean_spread_field_name(tok.text)
+            && fields.get(pos + 1).is_some_and(|assign| assign.is_sym(":="))
+            && !(pos > 0 && fields[pos - 1].is_sym("."))
+        {
+            let start = pos + 2;
+            let mut end = start;
+            let mut value_depth = 0i32;
+            while let Some(value_tok) = fields.get(end) {
+                if value_depth == 0
+                    && (value_tok.is_sym(",")
+                        || (end > start
+                            && is_first_on_line(fields, end)
+                            && lean_field_header(fields, end).is_some()))
+                {
+                    break;
+                }
+                value_depth += bracket_delta(value_tok);
+                end += 1;
+            }
+            values.push(&fields[start..end]);
+            pos = end;
+            continue;
+        }
+        depth += bracket_delta(tok);
+        pos += 1;
+    }
+    values
 }
 
 /// Every specification-valued declaration of a Lean module, in source order.
@@ -11248,16 +11559,17 @@ fn lean_spec_value_decls<'t, 'a>(toks: &'t [GuardTok<'a>]) -> Vec<LeanSpecValueD
             continue;
         }
         let (name, _) = read_lean_dotted_name(toks, idx + 1);
-        let value = match body {
-            Some(body) if toks[body].is_sym(":=") => Some(&toks[body + 1..end]),
-            Some(_) => None,
+        let (value, where_fields) = match body {
+            Some(body) if toks[body].is_sym(":=") => (Some(&toks[body + 1..end]), None),
+            Some(body) => (None, Some(&toks[body + 1..end])),
             // A specification-typed declaration without a body: fail closed.
-            None => Some(&toks[end..end]),
+            None => (Some(&toks[end..end]), None),
         };
         decls.push(LeanSpecValueDecl {
             name,
             line: keyword.line,
             value,
+            where_fields,
         });
     }
     decls
@@ -11336,6 +11648,13 @@ fn lean_spec_value_is_safe(
         // `{ base with pre }` unless `pre` is defined (and thus audited) in
         // this module.
         let fields = &inner[fields_start..];
+        // A spread field (`__ := base`) supplies `pre` like a `with` base.
+        if lean_spread_field_values(fields)
+            .into_iter()
+            .any(|base| !lean_spec_value_is_safe(base, toks, decls, module_defines_pre))
+        {
+            return false;
+        }
         let mut fdepth = 0i32;
         let mut at_field_start = true;
         for (pos, tok) in fields.iter().enumerate() {
@@ -11374,6 +11693,31 @@ fn lean_spec_value_is_safe(
         && decls
             .iter()
             .any(|decl| !decl.name.is_empty() && declaration_leaf(&decl.name) == leaf)
+}
+
+/// Item module paths a `Specs` module stands for: `Demo.main` for the source
+/// label `…/Specs/Demo/main.lean` and for a `namespace Specs.Demo.main`
+/// command. Empty when neither is present.
+fn lean_spec_module_item_paths(source_label: &str, toks: &[GuardTok<'_>]) -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Some(at) = source_label.rfind("Specs/")
+        && let Some(stem) = source_label[at + "Specs/".len()..].strip_suffix(".lean")
+        && !stem.is_empty()
+    {
+        paths.push(stem.replace('/', "."));
+    }
+    for idx in 0..toks.len() {
+        if toks[idx].is_word("namespace") {
+            let (name, _) = read_lean_dotted_name(toks, idx + 1);
+            if let Some(item) = name.strip_prefix("Specs.")
+                && !item.is_empty()
+                && !paths.iter().any(|known| known == item)
+            {
+                paths.push(String::from(item));
+            }
+        }
+    }
+    paths
 }
 
 /// Audit an authored Lean `Specs/<Item>.lean` module of a binary entry point.
@@ -11419,13 +11763,82 @@ pub fn audit_lean_spec_entry_point_requires(
     // `:= Obligations.<Item>.refineSpec extraPre extraPost`, …).
     let spec_decls = lean_spec_value_decls(&toks);
     for decl in &spec_decls {
-        if let Some(value) = decl.value
-            && !lean_spec_value_is_safe(value, &toks, &spec_decls, module_defines_pre)
-        {
+        let unsafe_value = decl.value.is_some_and(|value| {
+            !lean_spec_value_is_safe(value, &toks, &spec_decls, module_defines_pre)
+        });
+        // `where __ := base` takes `pre` from `base`.
+        let unsafe_spread = decl.where_fields.is_some_and(|fields| {
+            lean_spread_field_values(fields).into_iter().any(|base| {
+                !lean_spec_value_is_safe(base, &toks, &spec_decls, module_defines_pre)
+            })
+        });
+        if unsafe_value || unsafe_spread {
             out.push(diagnostic(
                 decl.line,
                 EntryPointRequiresKind::AuthoredLeanPre,
             ));
+        }
+    }
+    // `attribute [instance] name` registers `name` as the specification;
+    // it must be a specification value declared (and inspected) here.
+    for idx in 0..toks.len() {
+        if !toks[idx].is_word("attribute") || !toks.get(idx + 1).is_some_and(|t| t.is_sym("[")) {
+            continue;
+        }
+        let Some(close) = matching_close(&toks, idx + 1) else {
+            continue;
+        };
+        if !toks[idx + 2..close].iter().any(|t| t.is_word("instance")) {
+            continue;
+        }
+        let mut cursor = close + 1;
+        while toks.get(cursor).is_some_and(|t| t.kind == GuardTokKind::Word)
+            && !is_lean_command_start(&toks, cursor)
+        {
+            let (name, next) = read_lean_dotted_name(&toks, cursor);
+            let leaf = declaration_leaf(&name);
+            if !spec_decls
+                .iter()
+                .any(|decl| !decl.name.is_empty() && declaration_leaf(&decl.name) == leaf)
+            {
+                out.push(diagnostic(
+                    toks[idx].line,
+                    EntryPointRequiresKind::AuthoredLeanPre,
+                ));
+            }
+            cursor = next.max(cursor + 1);
+        }
+    }
+    // A delegation to generated obligations is only trivial for this
+    // module's own item; another item's `requires` is not audited as an
+    // entry-point precondition.
+    let item_paths = lean_spec_module_item_paths(source_label, &toks);
+    if !item_paths.is_empty() {
+        for idx in 0..toks.len() {
+            if !toks[idx].is_word("Obligations")
+                || (idx > 0
+                    && (toks[idx - 1].is_sym(".")
+                        || toks[idx - 1].is_word("import")
+                        || toks[idx - 1].is_word("open")))
+            {
+                continue;
+            }
+            let (name, _) = read_lean_dotted_name(&toks, idx);
+            let components: Vec<&str> = name.split('.').collect();
+            let Some(leaf_at) = components.iter().skip(1).position(|component| {
+                matches!(*component, "defaultPre" | "rustRequires" | "pre")
+                    || (component.ends_with("Spec")
+                        && (component.starts_with("default") || component.starts_with("refine")))
+            }) else {
+                continue;
+            };
+            let item = components[1..=leaf_at].join(".");
+            if !item_paths.contains(&item) {
+                out.push(diagnostic(
+                    toks[idx].line,
+                    EntryPointRequiresKind::AuthoredLeanPre,
+                ));
+            }
         }
     }
     let mut idx = 0usize;
@@ -13459,6 +13872,96 @@ fn wrapper_len(w: &Wrapper) -> usize { 0 }
     }
 
     #[test]
+    fn ghost_length_scanner_looks_through_unknown_wrappers() {
+        use GhostLengthWidthKind::FixedWidthReturnType;
+        let found = |label: &str, text: &str| -> Vec<(usize, String, GhostLengthWidthKind)> {
+            ghost_findings(label, text)
+                .into_iter()
+                .map(|(line, _, ty, kind)| (line, ty, kind))
+                .collect()
+        };
+        let ret = |line: usize, ty: &str| vec![(line, String::from(ty), FixedWidthReturnType)];
+        // A wrapper the scanner has never heard of is still a machine integer.
+        for (ret_ty, fixed) in [
+            ("Tracked<u64>", "u64"),
+            ("Mutex<u64>", "u64"),
+            ("core::cmp::Reverse<usize>", "usize"),
+            ("ControlFlow<E, u64>", "u64"),
+            ("Either<u64, Nat>", "u64"),
+            ("impl Into<u64>", "u64"),
+            ("dyn Into<u32> + Send", "u32"),
+            ("<u64 as Id>::T", "u64"),
+            ("Result<Tracked<usize>, E>", "usize"),
+        ] {
+            let text = format!("#[model]\nfn ghost_len(s: Seq<u8>) -> {ret_ty} {{ x }}");
+            assert_eq!(found("src/model.rs", &text), ret(2, fixed), "{text:?}");
+        }
+        for (text, expected) in [
+            (
+                "use core::primitive::u64 as Len;\n#[model]\nfn ghost_len(s: Seq<u8>) -> Len { 0 }",
+                ret(3, "u64"),
+            ),
+            (
+                "struct GhostLen { n: u64 }\n#[model]\nfn ghost_len(s: Seq<u8>) -> GhostLen { g }",
+                ret(3, "u64"),
+            ),
+            (
+                "type Len<T> = Wrapping<T>;\n#[model]\nfn ghost_len(s: Seq<u8>) -> Len<u64> { 0 }",
+                ret(3, "u64"),
+            ),
+        ] {
+            assert_eq!(found("src/model.rs", text), expected, "{text:?}");
+        }
+        for (ret_ty, fixed) in [
+            ("WithTop UInt64", "UInt64"),
+            ("Tracked UInt64", "UInt64"),
+            ("IO USize", "USize"),
+            ("UInt64 ⊕ Nat", "UInt64"),
+            ("Sum Nat UInt32", "UInt32"),
+            ("ExceptT String Id UInt64", "UInt64"),
+            ("Fin (2 ^ 64 - 1 + 1)", "Fin 2 ^ 64 - 1 + 1"),
+        ] {
+            let text = format!("def ghostLen (s : GhostSeq Nat) : {ret_ty} := x");
+            assert_eq!(found("Specs/Buf.lean", &text), ret(1, fixed), "{text:?}");
+        }
+        // Element, key, marker, parameter, and error-slot types are not the
+        // length.
+        for ret_ty in [
+            "Vec<u64>",
+            "Seq<u8>",
+            "HashMap<u64, Nat>",
+            "(Nat, Seq<u8>)",
+            "Result<Nat, u8>",
+            "PhantomData<u64>",
+            "[u64; 1]",
+            "&[u8]",
+            "fn(u64) -> Nat",
+            "impl Fn(u64) -> Nat",
+            "Self::Len",
+        ] {
+            let text = format!("#[model]\nfn ghost_len(s: Seq<u8>) -> {ret_ty} {{ x }}");
+            assert_eq!(found("src/model.rs", &text), vec![], "{text:?}");
+        }
+        for ret_ty in [
+            "List UInt8",
+            "Array UInt64",
+            "Except UInt32 Nat",
+            "ExceptT UInt32 Id Nat",
+            "Nat × List UInt8",
+            "Fin (s.cap - 1)",
+        ] {
+            let text = format!("def ghostLen (s : GhostSeq Nat) : {ret_ty} := x");
+            assert_eq!(found("Specs/Buf.lean", &text), vec![], "{text:?}");
+        }
+        for clean in [
+            "use core::primitive::u64 as Len;\n#[model]\nfn ghost_len(s: Seq<Len>) -> Nat { 0 }",
+            "struct Pair { n: Nat, m: u64 }\n#[model]\nfn ghost_len(s: Seq<u8>) -> Pair { p }",
+        ] {
+            assert_eq!(found("src/model.rs", clean), vec![], "{clean:?}");
+        }
+    }
+
+    #[test]
     fn ghost_length_scanner_fails_closed_on_malformed_source() {
         for (label, text) in [
             (
@@ -14013,6 +14516,128 @@ fn one() -> Result<u32, E> { Ok(1) }
         // Unicode Lean lambda `λ` behaves like `fun`.
         ("lean", "| .ok v => λ _ => True", ""),
         ("lean", "| .ok v => f (λ e => True) | .err e => e = .a", ""),
+        // An arm body ends at the next top-level command: later code is
+        // not part of it.
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => False\n\n#eval decide (1 = 1) || true",
+            "",
+        ),
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => False\n\n#check P ∨ True",
+            "",
+        ),
+        (
+            "lean",
+            "def post : Outcome → Prop\n  | .ok v => v = 1\n  | .ub => False\n\nnamespace Foo\nvariable (x : Nat)\n#reduce x = x ∨ True",
+            "",
+        ),
+        (
+            "lean",
+            "| .err _ => False\n@[simp] theorem t : P ∨ True := trivial",
+            "",
+        ),
+        (
+            "lean",
+            "| .err _ => e = .a\nopen Foo in\n#check Q ∨ True",
+            "",
+        ),
+        // Right-extending constructs own the disjunctions after them.
+        ("lean", "| .err _ => if c then False else P ∨ True", ""),
+        (
+            "lean",
+            "| .err _ => True ∨ if c then P else Q",
+            "err_arm_true",
+        ),
+        ("lean", "| .err _ => False ∨ True", "err_arm_true"),
+        // A tuple is not a parenthesized proposition.
+        ("rust", "Err(_) => (true, x)", ""),
+        ("rust", "Err(_) => (true || x, y)", ""),
+        // Struct patterns keep their error constructors.
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(_) } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { x: 1, inner: Err(_) } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(_), x: 1, y: 2 } => true }",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Wrapper { inner: Err(E::A), x: 1 } => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match w { W { r: Ok(v), .. } => v == 1, _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | { val := .ok v } => v = 1 | { val := .err _ } => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | { val := .ok v } => v = 1 | { val := .err .a } => True",
+            "",
+        ),
+        (
+            "rust",
+            "fn f() -> Foo { Foo { r: Err(e) } }\nfn g(x: u8) -> bool { match x { 0 => false, _ => true } }",
+            "",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => { check(Err(e)) } Err(E::A) => true }",
+            "",
+        ),
+        // A tuple of catch-alls is a catch-all.
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (e, f,) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((_, _), _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, Ok(y)) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_ | 0, Ok(y)) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, (_ | 0) => true }",
+            "catch_all_arm_true",
+        ),
+        // Lean identifier quotes are transparent.
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | «e» => True",
+            "catch_all_arm_true",
+        ),
+        ("lean", "| «Except.error» _ => True", "err_arm_true"),
     ];
 
     /// The same table is asserted by `scan_error_branch_wildcard` in
@@ -14696,6 +15321,84 @@ end Specs.Demo.main
             "def extraPre (args : List Value) : Prop := args.length = 1\n\ninstance : ItemSpec \"demo::main\" :=\n  Obligations.Demo.main.refineSpec extraPre post\n",
         );
         assert_eq!(audit(&refined), vec![(36, AuthoredLeanPre)]);
+    }
+
+    #[test]
+    fn lean_entry_point_audit_closes_spread_quote_and_foreign_item_routes() {
+        let audit_as = |label: &str, text: &str| {
+            audit_lean_spec_entry_point_requires("demo::main", label, text, &[])
+                .into_iter()
+                .map(|d| d.line)
+                .collect::<Vec<_>>()
+        };
+        let audit = |text: &str| audit_as("Specs/Demo/main.lean", text);
+        for (flagged, line) in [
+            // A spread or parent field supplies `pre` from a base value.
+            (
+                "instance : ItemSpec \"demo::main\" where\n  __ := importedSpec\n  post := post\n",
+                1,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" where\n  toItemSpecBase := importedBase\n  post := post\n",
+                1,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" := { __ := importedSpec, post := fun _ _ => True }\n",
+                1,
+            ),
+            (
+                "def base : ItemSpec \"demo::main\" := ⟨fun a => a = [], fun _ _ => True⟩\ninstance : ItemSpec \"demo::main\" where\n  __ := base\n",
+                1,
+            ),
+            // `«pre»` is the identifier `pre`.
+            (
+                "def «pre» (args : List Value) : Prop := args.length = 1\n",
+                1,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" where\n  «pre» := fun args => args.length = 1\n  post := post\n",
+                2,
+            ),
+            // Another item's generated precondition is not this entry point's.
+            (
+                "def pre (args : List Value) : Prop :=\n  Obligations.Other.helper.defaultPre args\n",
+                2,
+            ),
+            (
+                "def pre (args : List Value) : Prop := Obligations.Other.helper.rustRequires args\n",
+                1,
+            ),
+            (
+                "def pre (args : List Value) (m : Memory) : Prop :=\n  Obligations.Demo.helper.defaultModularSpec.pre args m\n",
+                2,
+            ),
+            // An instance attribute on a value this module does not declare.
+            ("attribute [instance] importedSpec\n", 1),
+            ("attribute [local instance, simp] importedSpec\n", 1),
+        ] {
+            assert_eq!(audit(flagged), vec![line], "{flagged:?}");
+        }
+        for clean in [
+            "instance : ItemSpec \"demo::main\" where\n  __ := Obligations.Demo.main.defaultSpec\n  post := fun _ ret => ret = .unit\n",
+            "def base : ItemSpec \"demo::main\" := Obligations.Demo.main.defaultSpec\ninstance : ItemSpec \"demo::main\" := { __ := base, post := fun _ _ => True }\n",
+            "def mainSpec : ItemSpec \"demo::main\" where\n  pre _ := True\n  post _ _ := True\nattribute [instance] mainSpec\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre := fun _ ↦ True\n  post := post\n",
+            "def «pre» (args : List Value) : Prop := True\n",
+            "import Obligations.Other.helper\nopen Obligations.Other.helper in\ndef pre (args : List Value) : Prop := Obligations.Demo.main.defaultPre args\n",
+            "def post (args : List Value) (ret : Value) : Prop := Obligations.Other.helper.rustEnsures args ret\n",
+            "attribute [simp] importedLemma\n",
+        ] {
+            assert_eq!(audit(clean), vec![], "{clean:?}");
+        }
+        // The module's item comes from its path or its `namespace Specs.…`.
+        let foreign = "def pre (args : List Value) : Prop := Obligations.Other.helper.defaultPre args\n";
+        assert_eq!(audit_as("main.lean", foreign), vec![]);
+        let namespaced = format!("namespace Specs.Demo.main\n{foreign}end Specs.Demo.main\n");
+        assert_eq!(audit_as("main.lean", &namespaced), vec![2]);
+        assert_eq!(
+            lean_spec_module_item_paths("proofs/Specs/Demo/main.lean", &[]),
+            vec![String::from("Demo.main")]
+        );
     }
 
     #[test]
