@@ -2992,6 +2992,30 @@ theorem evalTerminatorM_intrinsic_place_error {m : Machine M} {op : IntrinsicOp}
     evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) = .error e := by
   simp only [evalTerminatorM, hplace, interp_error_bind]
 
+/-- `evalArgsM` evaluates arguments left to right: if the head expression stops,
+no later argument is evaluated. -/
+theorem evalArgsM_head_error {m : Machine M} {e : ValueExpr} {es : List ValueExpr}
+    {err : Stop} (he : evalValueM m e = .error err) :
+    evalArgsM m (e :: es) = .error err := by
+  simp only [evalArgsM, he, interp_error_bind]
+
+/-- Once the head argument succeeds, a `Stop` in the tail propagates through `evalArgsM`. -/
+theorem evalArgsM_tail_error {m m1 : Machine M} {e : ValueExpr} {es : List ValueExpr}
+    {arg : Value M × «Type»} {err : Stop}
+    (he : evalValueM m e = .ok (arg, m1)) (hes : evalArgsM m1 es = .error err) :
+    evalArgsM m (e :: es) = .error err := by
+  simp only [evalArgsM, he, hes, interp_ok_bind, interp_error_bind]
+
+/-- After `eval_place` succeeds, a `Stop` of `evalArgsM` stops the terminator
+before `eval_intrinsic`, `place_store`, or `next_block` run (no atomic access). -/
+theorem evalTerminatorM_intrinsic_args_error {m m1 : Machine M} {op : IntrinsicOp}
+    {argExprs : List ValueExpr} {retExpr : PlaceExpr} {nextBlock : Option BbName}
+    {retPlace : Place M} {retTy : «Type»} {e : Stop}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, retTy), m1))
+    (hargs : evalArgsM m1 argExprs = .error e) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) = .error e := by
+  simp only [evalTerminatorM, hplace, hargs, interp_ok_bind, interp_error_bind]
+
 /-- Once the return place and the arguments evaluate, a `Stop` of the intrinsic
 is the terminator's `Stop`: every UB law above is also UB of the terminator. -/
 theorem evalTerminatorM_intrinsic_fn_error {m m1 m2 : Machine M} {op : IntrinsicOp}
@@ -5199,12 +5223,111 @@ theorem misalignedRetAtomicFn_store_ub :
       some (.ub "storing to a place based on a misaligned pointer") := by
   refine ⟨?_, ?_⟩ <;> decide +kernel
 
+/-- `_0 = 5; _1 = AtomicStore(arg0, arg1)` with `_2 : u32` dead and `next_block = none`. -/
+def argFaultAtomicFn (arg0 arg1 : ValueExpr) : Function :=
+  { locals := ⟨[(lname 0, .Int itU32), (lname 1, unitType), (lname 2, .Int itU32)]⟩
+    args := [], ret := lname 1, calling_convention := .Rust
+    blocks := ⟨[(bname 0,
+      { statements := [.StorageLive (lname 0), .StorageLive (lname 1),
+          .Assign (.Local (lname 0)) (constU32 5)]
+        terminator := .Intrinsic .AtomicStore [arg0, arg1] (.Local (lname 1)) none
+        kind := .Regular })]⟩
+    start := bname 0, implicit_writes := true }
+
+/-- Faulting `ValueExpr`s: `&raw _2` (dead local) and `1u32 / 0u32`. -/
+def deadPtrExpr : ValueExpr := .AddrOf (.Local (lname 2)) (.Raw .None)
+/-- `1u32 / 0u32` (division by zero). -/
+def divZeroExpr : ValueExpr := .BinOp (.Int .Div) (constU32 1) (constU32 0)
+
+/-- Left-to-right argument faults on `Mach` and `MachTB`: `arg[0]` (`deadPtrExpr`)
+beats `arg[1]` (`divZeroExpr`); when `arg[0]` (`&_0`, `Frozen`) succeeds, `arg[1]`
+stops before `AtomicStore` runs (zero atomic access, preempting `Frozen`-write UB). -/
+theorem argFaultAtomicFn_order :
+    stopOf (steps 3 (bmStart (argFaultAtomicFn deadPtrExpr divZeroExpr)) >>= step) =
+      some (.ub "access to a dead local") ∧
+    stopOf (stepsTB 3 (tbStart (argFaultAtomicFn deadPtrExpr divZeroExpr)) >>= stepTB) =
+      some (.ub "access to a dead local") ∧
+    stopOf (steps 3 (bmStart (argFaultAtomicFn cellRefExpr divZeroExpr)) >>= step) =
+      some (.ub "division by zero") ∧
+    stopOf (stepsTB 3 (tbStart (argFaultAtomicFn cellRefExpr divZeroExpr)) >>= stepTB) =
+      some (.ub "division by zero") := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
 /-! ## §5. Vacuity and axiom audit
 
 The conditional laws of §2 and §3 take the outcome of `typed_load` or
 `typed_store` as a hypothesis. The instances below discharge those hypotheses
 on the concrete machines of §4 and so show that the laws are not vacuous; the
 results agree with what the kernel computes directly in §4. -/
+
+/-- `tbFive` with a live frame binding `_0 : u32` to `tbPtr` (`_2 : u32` dead). -/
+def tbFiveFrame : MachTB :=
+  { tbFive with
+    active_thread := 0
+    threads := [{ stack := [{ func := { locals := ⟨[(lname 0, .Int itU32), (lname 2, .Int itU32)]⟩
+                                        args := [], ret := lname 0, calling_convention := .Rust
+                                        blocks := ⟨[]⟩, start := bname 0, implicit_writes := true }
+                              locals := ⟨[(lname 0, tbPtr)]⟩
+                              stack_pop_action := .BottomOfStack
+                              next_block := bname 0, next_stmt := 0
+                              extra := TreeBorrowsMemory.new_call }]
+                  state := .Enabled, unwind_payloads := [] }] }
+
+/-- `tbFiveFrame` after `AtomicFetchAndOp(Add)(&raw _0, 3)` mutates `_0` from `5` to `8`. -/
+def tbEightFrame : MachTB :=
+  { tbFiveFrame with
+    mem := (tbMach [tbCell (u32Bytes 8 ++ uninitBytes 4)] [aLoad 4, aStore 4]).mem }
+
+/-- A `u32` return place at misaligned address `cellAddr + 1` (`aligned = false`). -/
+def misalignedRetExpr : PlaceExpr :=
+  .Deref (.Constant (.PointerWithoutProvenance (cellAddr + 1)) tyRawPtr) (.Int itU32)
+
+/-- `evalTerminatorM_intrinsic_misaligned_ret_ub` is not vacuous: on `tbFiveFrame`,
+`AtomicFetchAndOp(Add)(&raw _0, 3)` mutates `_0` from `5` to `8` (logging
+`[aLoad 4, aStore 4]`) in `tbEightFrame` before `place_store` raises UB. -/
+theorem evalTerminatorM_intrinsic_misaligned_ret_ub_instance :
+    evalIntrinsicM tbFiveFrame (.AtomicFetchAndOp .Add)
+        [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int 3, .Int itU32)] (.Int itU32) =
+      .ok (.Int 5, tbEightFrame) ∧
+    tbEightFrame.mem.memory ≠ tbFiveFrame.mem.memory ∧
+    evalTerminatorM tbFiveFrame (.Intrinsic (.AtomicFetchAndOp .Add)
+        [cellPtrExpr, constU32 3] misalignedRetExpr none) =
+      .error (.ub "storing to a place based on a misaligned pointer") := by
+  have hplace : evalPlaceM tbFiveFrame misalignedRetExpr =
+      .ok (({ ptr := ⟨⟨cellAddr + 1, none⟩, none⟩, aligned := false }, .Int itU32),
+        tbFiveFrame) := by kernel_rfl
+  have hargs : evalArgsM tbFiveFrame [cellPtrExpr, constU32 3] =
+      .ok ([(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int 3, .Int itU32)], tbFiveFrame) := by kernel_rfl
+  have hint : evalIntrinsicM tbFiveFrame (.AtomicFetchAndOp .Add)
+      [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int 3, .Int itU32)] (.Int itU32) =
+      .ok (.Int 5, tbEightFrame) := by kernel_rfl
+  have hmut : tbEightFrame.mem.memory ≠ tbFiveFrame.mem.memory := by
+    intro h
+    exact absurd (congrArg (fun (m : TBM) => m.mem.allocations.map (fun a => a.data)) h)
+      (by decide +kernel)
+  exact ⟨hint, hmut, evalTerminatorM_intrinsic_misaligned_ret_ub hplace hargs hint rfl⟩
+
+/-- `evalTerminatorM_intrinsic_args_error` and `evalArgsM_{head,tail}_error` are
+not vacuous on `tbFiveFrame`: `arg[0]` faults before `arg[1]`, and `arg[1]`
+faults before `eval_intrinsic` runs (leaving `mem.accesses = []`). -/
+theorem evalTerminatorM_intrinsic_args_error_instance :
+    evalTerminatorM tbFiveFrame (.Intrinsic (.AtomicFetchAndOp .Add)
+        [deadPtrExpr, divZeroExpr] (.Local (lname 0)) none) =
+      .error (.ub "access to a dead local") ∧
+    evalTerminatorM tbFiveFrame (.Intrinsic (.AtomicFetchAndOp .Add)
+        [cellPtrExpr, divZeroExpr] (.Local (lname 0)) none) =
+      .error (.ub "division by zero") := by
+  have hplace : evalPlaceM tbFiveFrame (.Local (lname 0)) =
+      .ok (({ ptr := ⟨tbPtr, none⟩, aligned := true }, .Int itU32), tbFiveFrame) := by kernel_rfl
+  have heDead : evalValueM tbFiveFrame deadPtrExpr =
+      .error (.ub "access to a dead local") := by kernel_rfl
+  have hePtr : evalValueM tbFiveFrame cellPtrExpr =
+      .ok ((.Ptr ⟨tbPtr, none⟩, tyRawPtr), tbFiveFrame) := by kernel_rfl
+  have heDiv : evalValueM tbFiveFrame divZeroExpr =
+      .error (.ub "division by zero") := by kernel_rfl
+  exact ⟨evalTerminatorM_intrinsic_args_error hplace (evalArgsM_head_error heDead),
+    evalTerminatorM_intrinsic_args_error hplace
+      (evalArgsM_tail_error hePtr (evalArgsM_head_error heDiv))⟩
 
 /-- The fresh-cell `MachTB` of §4 satisfies `MachTB.wfLive`: its memory is what
 `TreeBorrowsMemory::allocate` makes of the empty memory. -/
