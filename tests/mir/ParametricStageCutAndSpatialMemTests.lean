@@ -46,9 +46,19 @@ all five converged capabilities against unmodified
   `rangedBorrowTreeOfMirAllocSegmented` commutes disjoint same-allocation subslice borrows
   (`[0..2)` and `[2..4)`) and releases protectors cleanly where flat 1-segment projection
   spuriously fails with `.ProtectedDisabled`, alongside `mirSemantics_vs_refFrame_accessed_coarsening`.
+- **Witness 3f (MIR-side per-allocation isolation, exact round-trip & span alignment)**:
+  unmodified MIR writes/reads/frame-teardowns leave distinct allocations' projected trees
+  100% invariant, `mirBorrowsOfRangedTree` round-trips multi-range/distinct-protector trees
+  identically, and `borrowCoversSegment` is byte-exact iff spans align with borrow endpoints.
 - **Witness 3g (remaining `UnwindAction` arms)**: a failing inline callee `assert`
   unwinding into a caller frame with `.terminate` halts with `Outcome.abort`, and with
   `.continue_` propagates past the root to `Outcome.panic`.
+- **Witness 3h (UNIVERSAL protected callee unwind ⇒ live `FnEntry` protector release +
+  cleanup writeback observation)**: for ALL `x ≤ 10000`, a callee opening with REAL
+  `Retag(FnEntry)` (`activeProtectors = [1]`), writing `*p = *p + 10`, and failing
+  `TerminatorKind.assert` unwinds into caller `.cleanup 2`, releases protector `1`
+  (`activeProtectors = []`, matching `exitFrameWithProtectors _ [2] = .Released` on
+  `rangedBorrowTreeOfMirAlloc`), and recovers via `MirWpConverges` to `x + 110`.
 - **Witness 4 (`SpatialMemV2026`)**: full `freezePaddedToMem` → `mutatePaddedInMem` →
   `reabsorbPaddedFromMem` → `endPaddedLoan` → `deallocatePromotedLocal` lifecycle on
   both padded `(u8, [pad; 3], u32)` (contrasted with `u8U32Padded_freeze_refused`) and
@@ -1807,8 +1817,9 @@ theorem witness3a_iii_caller_ref_unsize_slice_call_writeback
 
 /-- **Witness 3b (`CallStackUnwind` callee `assert` failure → caller `UnwindAction.cleanup` recovery)**:
 calling `calleeAssertBody` with `flag = false` triggers `.continue_` unwind across the
-saved caller frame's `.cleanup 2` landing pad (`isCleanup = true`), releasing callee
-protectors and recovering cleanly with return value `999u32` via `MirWpConverges`. -/
+saved caller frame's `.cleanup 2` landing pad (`isCleanup = true`), unwinding the call
+stack and recovering cleanly with return value `999u32` via `MirWpConverges` (for live
+`Retag(FnEntry)` strong protector release during unwind, see Witness 3h below). -/
 theorem witness3b_callee_assert_unwinds_into_caller_cleanup :
     let ms0 : MachineState :=
       { frame := { blockIdx := 0, stmtIdx := 0
@@ -2254,6 +2265,184 @@ theorem witness3g_unwind_terminate_abort_and_continue_panic :
   · exact step_to_mirWp rfl (done_to_mirWp rfl rfl)
   · exact step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl
       (step_to_mirWp rfl (done_to_mirWp rfl ⟨rfl, rfl⟩)))))
+
+/-- Real inline callee `fn bump_then_assert(p: &mut u32, flag: bool) -> u32`:
+opens with REAL `Retag(FnEntry, _1)` attaching strong protector `1` to child tag `2`
+(`activeProtectors = [1]`), writes `*p = *p + 10`, then executes `assert(flag == true)`
+with `.continue_` unwind. -/
+private def calleeProtectedAssertBody : CapturedMir :=
+  mkBody "tests::bump_then_assert" 2
+    [decl .mut u32T, decl .not refMutU32T, decl .not boolT]
+    [ mkBb
+        [ mkSt (.retag .fnEntry (pl 1))
+        , mkSt (.assign (pl 1 [.deref]) (.binaryOp .add (.copy (pl 1 [.deref])) (u32C 10))) ]
+        (.assert (.copy (pl 2)) true 1 .continue_)
+    , mkBb [mkSt (.assign (pl 0) (.use (u32C 0)))] .return_ ]
+
+/-- Real caller `fn caller_protected_cleanup(mut x: u32, flag: bool) -> u32`:
+borrows `p := &mut x`, calls `bump_then_assert(p, flag)` with `unwind = .cleanup 2`, and
+in its cleanup landing pad (`bb2`, `isCleanup = true`) observes the pre-unwind writeback
+and returns `x + 100`. -/
+private def callerProtectedCleanupBody : CapturedMir :=
+  mkBody "tests::caller_protected_cleanup" 2
+    [decl .mut u32T, decl .mut u32T, decl .not boolT, decl .mut refMutU32T, decl .mut u32T]
+    [ mkBb [mkSt (.assign (pl 3) (.ref (.mut false) (pl 1)))]
+        (.call (fnOp "tests::bump_then_assert") [.copy (pl 3), .copy (pl 2)]
+          (pl 4) (some 1) (.cleanup 2))
+    , mkBb [mkSt (.assign (pl 0) (.use (.copy (pl 1))))] .return_
+    , mkBb [mkSt (.assign (pl 0) (.binaryOp .add (.copy (pl 1)) (u32C 100)))]
+        .return_ (isClean := true) ]
+
+/-- **Witness 3h (UNIVERSAL protected callee unwind ⇒ live `Retag(FnEntry)` protector
+release + `RefFrame.exitFrameWithProtectors` agreement + cleanup writeback recovery)**:
+for ALL `x ≤ 10000`, calling `bump_then_assert(&mut x, false)`:
+1. establishes a LIVE strong protector (`s₃.memory.activeProtectors = [1]`,
+   `(proj s₃).protectedTags = [2]`) via real `Retag(FnEntry, _1)`;
+2. mutates `*p = x + 10` through protected child tag `2` (`s₃ → s₄`, matching
+   `performRangedAccess`);
+3. fails `TerminatorKind.assert`, unwinding into caller `.cleanup 2` (`s₄ → s₅`), which
+   RELEASES protector `1` (`s₅.memory.activeProtectors = []`) in exact agreement with
+   `exitFrameWithProtectors (proj s₄) [2]` (`.Released`, `tree = proj s₅`); and
+4. converges via `MirWpConverges` through the cleanup landing pad to `x + 110` with
+   `callStack = []`, `activeProtectors = []`, and `nextProtector = 2`. -/
+theorem witness3h_protected_callee_unwind_releases_protector_and_recovers
+    (x : Nat) (hx : x ≤ 10000) :
+    let ms0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨0, 1⟩),
+                              .uninit, .uninit] }
+        memory := { callees := [calleeProtectedAssertBody] } }
+    let proj : MachineState → RangedBorrowTree := fun s =>
+      rangedBorrowTreeOfMirAlloc s.memory.borrows s.memory.activeProtectors 0 1 4
+    (∃ s₁ s₂ s₃ s₄ s₅ : MachineState,
+      Anneal.PureMirExec.mirStep callerProtectedCleanupBody ms0 = .cont s₁ ∧
+      Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₁ = .cont s₂ ∧
+      Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₂ = .cont s₃ ∧
+      Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₃ = .cont s₄ ∧
+      Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₄ = .cont s₅ ∧
+      s₃.memory.activeProtectors = [1] ∧ (proj s₃).protectedTags = [2] ∧
+      (performRangedAccess (proj s₃) 0 4 2 .Write .VisitChildrenOfAccessed).tree = proj s₄ ∧
+      (exitFrameWithProtectors (proj s₄) [2]).status = .Released ∧
+      (exitFrameWithProtectors (proj s₄) [2]).tree = proj s₅ ∧
+      s₅.frame.blockIdx = 2 ∧ s₅.memory.activeProtectors = []) ∧
+    MirWpConverges callerProtectedCleanupBody ms0
+      (fun out =>
+        match out with
+        | .normal (.scalar ⟨r, 4⟩, mem) =>
+          r = x + 110 ∧ mem.callStack = [] ∧
+          mem.activeProtectors = [] ∧ mem.nextProtector = 2
+        | _ => False) := by
+  intro ms0 proj
+  have hW1 : wrapScalarBits (Nat.add x 10) 4294967296 = x + 10 :=
+    wrapScalarBits_of_lt (show x + 10 < 4294967296 by omega)
+  have hW2 : wrapScalarBits (Nat.add (x + 10) 100) 4294967296 = x + 110 :=
+    wrapScalarBits_of_lt (show x + 10 + 100 < 4294967296 by omega)
+  let borrow1 : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false }
+  let child2 : BorrowEntry :=
+    { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false, protector := some 1, parentTag := some 1 }
+  let mem1 : Memory :=
+    { callees := [calleeProtectedAssertBody], borrows := [borrow1], nextTag := 2 }
+  let savedCaller0 : SavedCallerFrame :=
+    { callerBody := callerProtectedCleanupBody
+      frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨0, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit] }
+      destination := pl 4
+      returnTarget := 1
+      calleeProtectors := []
+      returnUnwind := .cleanup 2
+      isDiverging := false }
+  let mem2 : Memory :=
+    { mem1 with callStack := [savedCaller0], activeCallee := some calleeProtectedAssertBody }
+  let mem3 : Memory :=
+    { mem2 with
+      borrows := [child2, borrow1], nextTag := 3,
+      activeProtectors := [1], nextProtector := 2 }
+  let mem4 : Memory :=
+    { mem3 with
+      borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }]
+      callStack :=
+        [{ savedCaller0 with
+           frame := { blockIdx := 0, stmtIdx := 1
+                      locals := [.uninit, .init (.scalar ⟨x + 10, 4⟩), .init (.scalar ⟨0, 1⟩),
+                                 .init (.ptr ⟨1, 0⟩ 8), .uninit] } }] }
+  let mem5 : Memory :=
+    { callees := [calleeProtectedAssertBody],
+      borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }],
+      nextTag := 3, nextProtector := 2, activeCallee := some callerProtectedCleanupBody }
+  let s₁ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨0, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit] }
+      memory := mem1 }
+  let s₂ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0
+                 locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨0, 1⟩)] }
+      memory := mem2 }
+  let s₃ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8), .init (.scalar ⟨0, 1⟩)] }
+      memory := mem3 }
+  let s₄ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2
+                 locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8), .init (.scalar ⟨0, 1⟩)] }
+      memory := mem4 }
+  let s₅ : MachineState :=
+    { frame := { blockIdx := 2, stmtIdx := 0
+                 locals := [.uninit, .init (.scalar ⟨x + 10, 4⟩), .init (.scalar ⟨0, 1⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit] }
+      memory := mem5 }
+  let s₆ : MachineState :=
+    { frame := { blockIdx := 2, stmtIdx := 1
+                 locals := [.init (.scalar ⟨x + 110, 4⟩), .init (.scalar ⟨x + 10, 4⟩),
+                            .init (.scalar ⟨0, 1⟩), .init (.ptr ⟨1, 0⟩ 8), .uninit] }
+      memory := mem5 }
+  have hStep4 : Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₃ = .cont s₄ := by
+    change Step.cont
+      ({ frame := { blockIdx := 0, stmtIdx := 2
+                    locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8), .init (.scalar ⟨0, 1⟩)] }
+         memory :=
+           { mem3 with
+             borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }]
+             callStack :=
+               [{ savedCaller0 with
+                  frame := { blockIdx := 0, stmtIdx := 1
+                             locals := [.uninit,
+                                        .init (.scalar ⟨wrapScalarBits (Nat.add x 10) 4294967296, 4⟩),
+                                        .init (.scalar ⟨0, 1⟩),
+                                        .init (.ptr ⟨1, 0⟩ 8), .uninit] } }] } } : MachineState) = _
+    rw [hW1]
+  have hStep6 : Anneal.PureMirExec.mirStep callerProtectedCleanupBody s₅ = .cont s₆ := by
+    change Step.cont
+      ({ frame := { blockIdx := 2, stmtIdx := 1
+                    locals := [.init (.scalar ⟨wrapScalarBits (Nat.add (x + 10) 100) 4294967296, 4⟩),
+                               .init (.scalar ⟨x + 10, 4⟩),
+                               .init (.scalar ⟨0, 1⟩),
+                               .init (.ptr ⟨1, 0⟩ 8), .uninit] }
+         memory := mem5 } : MachineState) = _
+    rw [hW2]
+  have hWriteRef := rangedBorrowTreeOfMirAlloc_twoTag_write_refines child2 borrow1 [] 0 1 4
+    (by decide) ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩
+    (fun _ h => nomatch h)
+  have hRetRef := rangedBorrowTreeOfMirAlloc_twoTag_return_refines
+    { child2 with perm := .unique } { borrow1 with perm := .unique } [] 0 1 4
+    ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩
+    (fun _ h => nomatch h)
+  refine ⟨⟨s₁, s₂, s₃, s₄, s₅, rfl, rfl, rfl, hStep4, rfl,
+    rfl, hWriteRef.1, hWriteRef.2.2, hRetRef.2.1, hRetRef.2.2.2, rfl, rfl⟩, ?_⟩
+  exact step_to_mirWp (s' := s₁) rfl
+    (step_to_mirWp (s' := s₂) rfl
+      (step_to_mirWp (s' := s₃) rfl
+        (step_to_mirWp (s' := s₄) hStep4
+          (step_to_mirWp (s' := s₅) rfl
+            (step_to_mirWp (s' := s₆) hStep6
+              (done_to_mirWp (out := .normal
+                (.scalar ⟨x + 110, 4⟩,
+                 { mem5 with borrows := disableFrameBorrows mem5.borrows 0 5 })) rfl
+                ⟨rfl, rfl, rfl, rfl⟩))))))
 
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 
