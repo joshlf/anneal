@@ -1053,11 +1053,13 @@ def lowerPinDynTarget? : RigidTy → Option (Bool × String)
     | false => none
   | _ => none
 
-/-- Inner pointer type of a `Pin<P>` source (`V2026_06_01`). -/
+/-- Inner reference type of a `Pin<&[mut] T>` source (`V2026_06_01`). Only a
+reference is a `CoerceUnsized` pointer of `Pin` that the prototype unsizes;
+`Pin<*const T>` / `Pin<Box<T>>` sources fail closed. -/
 def lowerPinPtrSource? : RigidTy → Option ProtoPtrTy
-  | .adt path [inner] =>
+  | .adt path [.ref m pointee] =>
     match strEq path "core::pin::Pin" with
-    | true => lowerPtrTy inner
+    | true => lowerPtrTy (.ref m pointee)
     | false => none
   | _ => none
 
@@ -1140,9 +1142,9 @@ def lowerPinDynTarget? : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option (Bo
 
 /-- Inner pointer type of a `Pin<P>` source (`V2026_08_01`). -/
 def lowerPinPtrSource? : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option ProtoPtrTy
-  | .adt path [inner] =>
+  | .adt path [.ref m pointee] =>
     match strEq path "core::pin::Pin" with
-    | true => lowerPtrTy inner
+    | true => lowerPtrTy (.ref m pointee)
     | false => none
   | _ => none
 
@@ -1363,7 +1365,22 @@ theorem lowerPinDynTarget?_hom
               | none => rw [hp] at hi; cases hi
               | some q => rw [hp] at hi; cases hi; rfl
             | _ => simp [homPtrTy?] at hi
-          · simp only [V08.lowerPinPtrSource?, V06.lowerPinPtrSource?, lowerPtrTy_hom hi]
+          · cases inner with
+            | ref m pointee =>
+              have hl := lowerPtrTy_hom hi
+              simp only [homPtrTy?] at hi
+              cases hp : homPointee? pointee with
+              | none => rw [hp] at hi; cases hi
+              | some q =>
+                rw [hp] at hi; cases hi
+                simp only [V08.lowerPinPtrSource?, V06.lowerPinPtrSource?]
+                rw [hl]
+            | rawPtr m pointee =>
+              simp only [homPtrTy?] at hi
+              cases hp : homPointee? pointee with
+              | none => rw [hp] at hi; cases hi
+              | some q => rw [hp] at hi; cases hi; rfl
+            | _ => simp [homPtrTy?] at hi
   | ref m pointee =>
     simp only [homRecvTy?, homPtrTy?] at h
     cases hp : homPointee? pointee with
@@ -3071,6 +3088,49 @@ theorem evalVirtualCallProto_narrows_receiver
           (wrapDataWord (layoutPointerBytes callerBody.layouts) d) :: rest) locals' := by
   unfold evalVirtualCallProto evalVirtualCallProtoOpt
   simp only [hOps, hInit, hFail, hEnv, hRecv, hRes, hSlot, hValid, hCallee]
+
+/-- **Inversion: an external virtual call resolved a method slot.** Whenever
+`evalVirtualCallProto` requests the external call of `defPath`, the receiver
+unwrapped to a trait-object pointer whose vtable pointer resolves (for the
+site's trait object type) to a captured vtable `e` whose slot `site.slotIdx` is
+`.method defPath`. -/
+theorem evalVirtualCallProtoOpt_externalCall_inv
+    (vt : ProtoVTableTable) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) (defPath : String)
+    (args : List Value) (locals' : List LocalSlot)
+    (h : evalVirtualCallProtoOpt vt site s callerBody argOps destination target unwind =
+      .externalCall defPath args locals') :
+    ∃ (recv : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (e : ProtoVTableEntry),
+      unwrapDispatchReceiver (layoutPointerBytes callerBody.layouts) 4 recv =
+        some ⟨d, .vtable vtPtr⟩ ∧
+      resolveVTablePtr vt site.traitPred vtPtr = .ok e ∧
+      get? e.slots site.slotIdx = some (.method defPath) := by
+  unfold evalVirtualCallProtoOpt at h
+  dsimp only at h
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  split at h <;> try (cases h; done)
+  rename_i _ recv _ _ _
+  split at h <;> try (cases h; done)
+  rename_i d vtPtr hRecv
+  split at h <;> try (cases h; done)
+  rename_i e hRes
+  split at h <;> try (cases h; done)
+  rename_i defPath' hSlot
+  split at h <;> try (cases h; done)
+  split at h
+  · cases h
+    exact ⟨recv, d, vtPtr, e, hRecv, hRes, hSlot⟩
+  · split at h
+    · cases h
+    · split at h
+      · unfold protectVirtualReceiver at h
+        repeat' split at h
+        all_goals cases h
+      · cases h
 
 /-! ### Ranged Tree Borrows view of the receiver protector
 
@@ -5462,6 +5522,43 @@ theorem mach_and_machTB_vtable_correspondence
   have hM := mach_install_ok (bmLayout traitOf fnOf) vt m ptrBytes e.vtableAllocId e tn
     (bmLayout_provOf_inj traitOf fnOf) hWf hLook
   exact ⟨⟨hM.1, hM.2.2.1, hM.2.2.2⟩, ⟨hFT, hT.1, hT.2.1⟩, hB.2.2.1, hB.2.2.2⟩
+
+/-- **Virtual dispatch agrees with MiniRust `VTableMethodLookup`, universally.**
+On every memory model, whenever `evalVirtualCallProtoOpt` dispatches to the
+(external) concrete method `defPath`, the receiver's vtable resolves to a
+captured entry `e`, and MiniRust's `UnOp::VTableMethodLookup` at the same slot
+on the translated vtable pointer of `e` returns exactly the function pointer
+of `defPath`. -/
+theorem virtualCall_agrees_with_vtableMethodLookup (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (site : ProtoVirtualCallSite) (s : MachineState)
+    (callerBody : CapturedMir) (argOps : List Operand) (destination : Place)
+    (target : Option BasicBlockIdx) (unwind : UnwindAction) (defPath : String)
+    (args : List Value) (locals' : List LocalSlot)
+    (fnThin : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hBounds : ∀ e, e ∈ vt.entries → inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (hFn : mapGet m.fn_ptrs ⟨⟨L.fnOf defPath⟩⟩ = some fnThin)
+    (h : evalVirtualCallProtoOpt vt site s callerBody argOps destination target unwind =
+      .externalCall defPath args locals') :
+    ∃ (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry),
+      resolveVTablePtr vt site.traitPred vtPtr' = .ok e ∧
+      get? e.slots site.slotIdx = some (.method defPath) ∧
+      evalUnOpM (.VTableMethodLookup ⟨⟨site.slotIdx⟩⟩)
+          (.Ptr (ThinPointer.widen (vtPtr L e) none), .Ptr (.VTablePtr (traitName L e.traitPred)))
+          (some (installVTables L vt m)) =
+        .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) := by
+  obtain ⟨_, _, vtPtr', e, _, hRes, hSlot⟩ :=
+    evalVirtualCallProtoOpt_externalCall_inv vt site s callerBody argOps destination target unwind
+      defPath args locals' h
+  obtain ⟨_, hLook, _⟩ := (resolveVTablePtr_ok_iff vt site.traitPred vtPtr' e).mp hRes
+  have hA : e.vtableAllocId = vtPtr'.allocId := lookupVTableByAlloc_allocId hLook
+  have hLook' : lookupVTableByAlloc vt.entries e.vtableAllocId = some e := by rw [hA]; exact hLook
+  have hMem : e ∈ vt.entries := lookupVTableByAlloc_mem hLook
+  refine ⟨vtPtr', e, hRes, hSlot, ?_⟩
+  exact (evalUnOpM_dyn_correspondence L vt m ptrBytes site.slotIdx e defPath
+    (ptrAt L 0 0) fnThin (.Raw (.VTablePointer (traitName L e.traitPred))) hProv hWf hLook'
+    (hBounds e hMem) rfl hSlot hFn).2.2.2
 
 end MR
 

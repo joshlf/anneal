@@ -1809,6 +1809,44 @@ theorem mr_universal_checkPtr_and_evalUnOp_instances
     exact (checkPtrM_ref_dyn_ok_and_nonderef tbL vt mTB 8 vtOtherTrait .Immutable true true dataPtrTB
       (tbLayout_provOf_inj _ _) hWf hLook hVtBTB hSzB hDataBTB hNz hAl).2 msg hDeref
 
+/-- **Universal dispatch-vs-`VTableMethodLookup` theorem, instantiated.** A raw
+`*const dyn Trait` virtual call on the reproducer's `Receiver` vtable at slot
+`3` dispatches externally to `eval_vt`, and the universal theorem then yields
+MiniRust's `VTableMethodLookup` returning `eval_vt`'s function pointer
+(address `4096`) on `Mach`. -/
+theorem mr_virtual_dispatch_agrees_instance :
+    ∃ (vtPtr' : ProvenancePtr) (e : ProtoVTableEntry),
+      resolveVTablePtr vt Fx.traitPred vtPtr' = .ok e ∧
+      get? e.slots 3 = some (.method recEvalVt) ∧
+      evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩)
+          (.Ptr (ThinPointer.widen (vtPtr bmL e) none), .Ptr (.VTablePtr (traitName bmL e.traitPred)))
+          (some (installVTables bmL vt (baseMach bmAllocs fnPtrsBM))) =
+        .ok (.Ptr (ThinPointer.widen { addr := 4096, provenance := some (⟨100⟩, ()) } none),
+          .Ptr .FnPtr) :=
+  virtualCall_agrees_with_vtableMethodLookup bmL vt (baseMach bmAllocs fnPtrsBM) 8
+    { traitPred := Fx.traitPred, slotIdx := 3, receiverIsRef := false }
+    (Lm.queryCallState (Lm.widePtrValue (.prov 1 0) (.prov 40000 0))) Lm.queryCallerBody
+    [.copy { local_ := 0, projection := [] }] { local_ := 0, projection := [] } (some 0) .continue_
+    recEvalVt [.ptr { allocId := 1, offsetBytes := 0 } 8]
+    [.init (Lm.widePtrValue (.prov 1 0) (.prov 40000 0))]
+    { addr := 4096, provenance := some (⟨100⟩, ()) }
+    (bmLayout_provOf_inj _ _) (by decide +kernel)
+    (fun e he => List.all_eq_true.mp
+      (by decide +kernel :
+        vt.entries.all (fun e => inBounds (vtPtr bmL e).addr .Unsigned x86_64.PTR_SIZE) = true)
+      e he)
+    rfl rfl
+
+/-- `Pin` unsizing sources: only `Pin<&[mut] T>` lowers (`Pin<*const T>` and
+`Pin<Box<T>>` fail closed instead of reaching `unsizeDynValue`'s kind check as
+UB). -/
+theorem a3_pin_source_is_reference_only :
+    (V06.lowerPinPtrSource? (.adt "core::pin::Pin" [.ref .mut (.adt recKey [])])).isSome = true ∧
+    V06.lowerPinPtrSource? (.adt "core::pin::Pin" [.rawPtr .not (.adt recKey [])]) = none ∧
+    V06.lowerPinPtrSource? (.adt "core::pin::Pin" [.adt "alloc::boxed::Box" [.adt recKey []]]) =
+      none := by
+  decide +kernel
+
 end MrTest
 
 /-! ## §4b. Adversarial B1 hardening & falsification suite -/
