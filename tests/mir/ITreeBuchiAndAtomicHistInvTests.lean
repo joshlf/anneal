@@ -14,20 +14,24 @@ import Anneal.AtomicHistInv
 # `Anneal.ITreeBuchi` + `Anneal.AtomicHistInv` Test Suite
 
 1. **Positive witnesses**: a `#![no_std]` `-> !` request/response server
-   (`Always` + `InfOften` + `BuchiSat`, yet `¬ DWP`); a monotone
-   `AtomicU64::try_update` counter with a stateful attempt-counting `FnMut`
-   closure, a ghost-log committer callback, safety under arbitrary contention and
-   termination under bounded contention; a concrete `AtomicDualContract` built
-   from a kernel-checked `lmAuthorityCheck` witness and the threaded MiniRust
-   trace `5 → 8 → 8 (CAS✗) → 9 (CAS✓) → 9`.
+   (`Always` + `InfOften` + `BuchiSat` + 2-state protocol automaton, yet `¬ DWP`);
+   a monotone `AtomicU64::try_update` counter with stateful `FnMut` closure,
+   ghost-log committer, safety under arbitrary contention, termination under
+   bounded contention, non-miraculous prophecy elimination
+   (`u64_counter_prophecy_eliminated`), concrete strong-fairness `EnvStrategy`
+   termination, `#4162` reactive ticket service, a concrete `AtomicDualContract`
+   + threaded MiniRust trace `5 → 8 → 8 (CAS✗) → 9 (CAS✓) → 9`, and universal
+   symbolic `Mach` + `MachTB` `mrCellWP` witnesses (`u8_counter_mr_bm_and_tb_witness`).
 2. **Negative fail-closed canaries**: `ITree.spin` refutes `Eventually`,
    `Until`, `InfOften` and `BuchiSat`; loops that stop accepting refute
-   `InfOften`; non-reflexive / non-transitive relations and non-`hist_inv`-closed
-   closure preconditions break the contract; unbounded contention refutes `DWP`;
-   UB / spec-panic / `Frozen`-write steps are rejected by `AdmissibleAtomicStep`.
-3. **Compile-time audit (`run_cmd`)**: axioms, definition safety, theorem
-   non-triviality and theorem-count floors over all three namespaces, with
-   self-tests of the auditor.
+   `InfOften`; non-reflexive / non-transitive relations, non-`hist_inv`-closed
+   closure preconditions, double-fire committers, weak-vs-strong CAS separation,
+   unbounded contention, unrealizable `resolve` / inconsistent-prophecy miracles,
+   and UB / out-of-range `specPanic` / `Frozen`-write steps are rejected.
+3. **Compile-time audit (`run_cmd`)**: import isolation (`ITreeBuchi` +
+   `AtomicHistInv`), axioms, strict definition safety, theorem non-triviality,
+   and theorem-count floors over all three namespaces, with 13 real kernel
+   `addDeclCore` self-tests.
 -/
 
 namespace Anneal.ITreeBuchiAndAtomicHistInvTests
@@ -315,27 +319,45 @@ theorem counter_no_u64_overflow (delta limit : Nat) (hw : limit + delta ≤ u64M
   rw [hvs]; omega
 
 /--
-**Genuine `UInt64` counter with Creusot prophetic `&mut Nat` retry counter**:
-`FState = Nat × Nat` represents `(current_attempts, final_prophecy)` with
-`hist_inv (c₁, f₁) (c₂, f₂) := c₁ ≤ c₂ ∧ f₁ = f₂` and non-trivial prophetic
-`resolve (c, f) := c = f`.
+Runtime `UInt64` attempt-counting closure `|x| if x < limit { Some(x + delta) } else { None }`
+with total `resolve _ := True`.
 -/
-def u64PropheticSpec (delta limit : UInt64) : FnMutSpec (Nat × Nat) UInt64 UInt64 where
-  hist_inv p q := p.1 ≤ q.1 ∧ p.2 = q.2
-  hist_inv_laws := ⟨fun _ => ⟨Nat.le_refl _, rfl⟩,
-    fun hab hbc => ⟨Nat.le_trans hab.1 hbc.1, hab.2.trans hbc.2⟩⟩
+def u64RuntimeSpec (delta limit : UInt64) : FnMutSpec Nat UInt64 UInt64 where
+  hist_inv a a' := a ≤ a'
+  hist_inv_laws := AtomicHistInv.nat_le
   pre _ _ := True
-  post_mut p x q r := q.1 = p.1 + 1 ∧ q.2 = p.2 ∧
+  post_mut a x a' r := a' = a + 1 ∧
     r = (if x.toNat < limit.toNat then some (x + delta) else none)
-  step_hist_inv _ _ _ _ h := ⟨h.1 ▸ Nat.le_succ _, h.2.1.symm⟩
-  resolve p := p.1 = p.2
+  step_hist_inv _ _ _ _ h := h.1 ▸ Nat.le_succ _
+  resolve _ := True
 
 def u64LogGC : GhostCommit UInt64 (List (UInt64 × UInt64)) :=
   ⟨fun _ _ _ => True, fun g o n g' => g' = g ++ [(o, n)]⟩
 
-def u64CounterEnv (delta limit : UInt64) :
+/-- Non-miraculous runtime environment for `AtomicU64::try_update`. -/
+def u64RuntimeEnv (delta limit : UInt64) :
+    AtomicEnv UInt64 Nat (List (UInt64 × UInt64)) :=
+  ⟨fun a b => a.toNat ≤ b.toNat, u64RuntimeSpec delta limit, u64LogGC⟩
+
+theorem u64RuntimeEnv_realizable (delta limit : UInt64) :
+    (u64RuntimeEnv delta limit).Realizable where
+  rely_refl _ := Nat.le_refl _
+  post_mut_total a x _ :=
+    ⟨a + 1, if x.toNat < limit.toNat then some (x + delta) else none, rfl, rfl⟩
+  gc_post_total g e d _ := ⟨g ++ [(e, d)], rfl⟩
+  resolve_total _ := trivial
+
+/--
+**Genuine `UInt64` counter with Creusot prophetic `&mut Nat` retry counter**:
+lifted from `u64RuntimeSpec` via `propheticSpec` (`FState = Nat × Nat`,
+`hist_inv (c₁, f₁) (c₂, f₂) := c₁ ≤ c₂ ∧ f₁ = f₂`, `resolve (c, f) := c = f`).
+-/
+abbrev u64PropheticSpec (delta limit : UInt64) : FnMutSpec (Nat × Nat) UInt64 UInt64 :=
+  propheticSpec (u64RuntimeSpec delta limit)
+
+abbrev u64CounterEnv (delta limit : UInt64) :
     AtomicEnv UInt64 (Nat × Nat) (List (UInt64 × UInt64)) :=
-  ⟨fun a b => a.toNat ≤ b.toNat, u64PropheticSpec delta limit, u64LogGC⟩
+  propheticEnv (u64RuntimeEnv delta limit)
 
 theorem u64Counter_pre (delta limit init : UInt64) (hno : limit.toNat + delta.toNat ≤ UInt64.size)
     (fin : Nat) :
@@ -344,7 +366,7 @@ theorem u64Counter_pre (delta limit init : UInt64) (hno : limit.toNat + delta.to
   cellInv := AtomicHistInv.u64_le
   closure_pre _ _ _ _ := trivial
   closure_step _ x _ n _ h _ := by
-    obtain ⟨_, _, hr⟩ := h
+    obtain ⟨⟨_, hr⟩, _⟩ := h
     by_cases hx : x.toNat < limit.toNat
     · simp only [hx, ↓reduceIte] at hr; cases hr
       exact ⟨(AtomicHistInv.u64_add_preserves x delta (by omega)).2, trivial⟩
@@ -381,8 +403,8 @@ theorem u64_counter_prophetic_spec (delta limit init : UInt64)
   intro r s hr
   cases r with
   | ok old =>
-    obtain ⟨new, f₂, f₃, hinv, ⟨hc3, hf3, hret⟩, hres, _, _, _, _, hfst, _, hshot, _, hvs, _, _⟩ :=
-      hr
+    obtain ⟨new, f₂, f₃, hinv, ⟨⟨hc3, hret⟩, hf3⟩,
+      hres, _, _, _, _, hfst, _, hshot, _, hvs, _, _⟩ := hr
     by_cases hx : old.toNat < limit.toNat
     · simp only [hx, ↓reduceIte] at hret; cases hret
       have hfin : f₃.2 = fin := hf3.trans hinv.2.symm
@@ -392,7 +414,7 @@ theorem u64_counter_prophetic_spec (delta limit init : UInt64)
       · rw [hvs]; exact (AtomicHistInv.u64_add_preserves old delta (by omega)).1
     · simp only [hx, ↓reduceIte] at hret; cases hret
   | error cur =>
-    obtain ⟨f₂, f₃, hinv, ⟨hc3, hf3, hret⟩, hres, _, _, _, hfst, _, hshot, _, _⟩ := hr
+    obtain ⟨f₂, f₃, hinv, ⟨⟨hc3, hret⟩, hf3⟩, hres, _, _, _, hfst, _, hshot, _, _⟩ := hr
     by_cases hx : cur.toNat < limit.toNat
     · simp only [hx, ↓reduceIte] at hret; cases hret
     · have hfin : f₃.2 = fin := hf3.trans hinv.2.symm
@@ -427,7 +449,7 @@ theorem prophecy_consistent_nonvacuous :
   dsimp only [loadAns] at h1
   rw [iter_tryBody_eq] at h1
   have h2 := ((budgetWP_call _ _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h1)).2 (1, 1) (some 6)
-    ⟨rfl, rfl, by decide⟩
+    ⟨⟨rfl, by decide⟩, rfl⟩
   rw [tryCallK_some, vis_bind] at h2
   have h3 := (((budgetWP_cas _ _ _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h2) 5
     (Nat.le_refl _)).1 rfl).2.2 rfl
@@ -436,6 +458,69 @@ theorem prophecy_consistent_nonvacuous :
   have h5 := ((budgetWP_drop _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h4) 6 (Nat.le_refl _)).1
     rfl rfl
   simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h5
+
+/--
+**Non-miraculous prophecy elimination on `AtomicU64`**: eliminating `∀ fin` from
+`u64_counter_prophetic_spec` via `prophecy_elimination_always` and
+`prophecy_elimination_dwp` produces a runtime `Always` + `DWP` contract over the
+`ExcludedMiracle`-satisfying `u64RuntimeEnv`, together with `¬ DWP … False`
+under both bounded and unbounded contention.
+-/
+theorem u64_counter_prophecy_eliminated (delta limit init : UInt64)
+    (hno : limit.toNat + delta.toNat ≤ UInt64.size) (b : Nat) :
+    let s₀ : AtomicSt UInt64 Nat (List (UInt64 × UInt64)) := ⟨init, 0, .fresh init, 0, [], b⟩
+    Always (atomicHistWP (u64RuntimeEnv delta limit))
+        (fun s => init.toNat ≤ s.cell.toNat ∧ 0 ≤ s.fst)
+        (fun r s => match r with
+          | .ok old => init.toNat ≤ old.toNat ∧ s.comm.shot_store = true ∧ s.fires = 1
+          | .error cur => init.toNat ≤ cur.toNat ∧ s.comm.shot_store = false ∧ s.fires = 0)
+        (tryUpdateLoop UInt64) s₀ ∧
+      DWP (atomicBudgetWP (u64RuntimeEnv delta limit)) (tryUpdateLoop UInt64)
+        (fun r s => 1 ≤ s.fst ∧
+          match r with
+          | .ok old => old.toNat < limit.toNat ∧
+              s.comm.val_store.toNat = old.toNat + delta.toNat ∧ s.comm.shot_store = true
+          | .error cur => limit.toNat ≤ cur.toNat ∧ s.comm.shot_store = false) s₀ ∧
+      ¬ DWP (atomicBudgetWP (u64RuntimeEnv delta limit)) (tryUpdateLoop UInt64)
+        (fun _ _ => False) s₀ ∧
+      ¬ DWP (atomicHistWP (u64RuntimeEnv delta limit)) (tryUpdateLoop UInt64)
+        (fun _ _ => False) s₀ := by
+  intro s₀
+  have halw : Always (atomicHistWP (u64RuntimeEnv delta limit))
+      (fun s => init.toNat ≤ s.cell.toNat ∧ 0 ≤ s.fst)
+      (fun r s => match r with
+        | .ok old => init.toNat ≤ old.toNat ∧ s.comm.shot_store = true ∧ s.fires = 1
+        | .error cur => init.toNat ≤ cur.toNat ∧ s.comm.shot_store = false ∧ s.fires = 0)
+      (tryUpdateLoop UInt64) s₀ := by
+    refine prophecy_elimination_always (tryUpdateLoop_terminalDrop UInt64) (Q := fun r _ s =>
+      match r with
+      | .ok old => init.toNat ≤ old.toNat ∧ s.comm.shot_store = true ∧ s.fires = 1
+      | .error cur => init.toNat ≤ cur.toNat ∧ s.comm.shot_store = false ∧ s.fires = 0)
+      (fun fin => Always.mono (fun _ hi => ⟨hi.1, hi.2.1.1⟩) (fun r _ hr => by
+        cases r with
+        | ok old =>
+          obtain ⟨_, _, _, _, _, _, hio, _, _, _, _, _, hshot, _, _, hfires, _⟩ := hr
+          exact ⟨hio, hshot, hfires⟩
+        | error cur =>
+          obtain ⟨_, _, _, _, _, hio, _, _, _, _, hshot, hfires, _⟩ := hr
+          exact ⟨hio, hshot, hfires⟩)
+        (u64_counter_prophetic_spec delta limit init hno fin b).1)
+  have hdwp : DWP (atomicBudgetWP (u64RuntimeEnv delta limit)) (tryUpdateLoop UInt64)
+      (fun r s => 1 ≤ s.fst ∧
+        match r with
+        | .ok old => old.toNat < limit.toNat ∧
+            s.comm.val_store.toNat = old.toNat + delta.toNat ∧ s.comm.shot_store = true
+        | .error cur => limit.toNat ≤ cur.toNat ∧ s.comm.shot_store = false) s₀ :=
+    prophecy_elimination_dwp (tryUpdateLoop_terminalDrop UInt64)
+      (Q := fun r fin s => 1 ≤ fin ∧
+        match r with
+        | .ok old => old.toNat < limit.toNat ∧
+            s.comm.val_store.toNat = old.toNat + delta.toNat ∧ s.comm.shot_store = true
+        | .error cur => limit.toNat ≤ cur.toNat ∧ s.comm.shot_store = false)
+      (fun fin => DWP.mono (fun _ _ h => ⟨h.2.1, h.2.2.2⟩)
+        (u64_counter_prophetic_spec delta limit init hno fin b).2)
+  have hnv := tryUpdate_nonvacuous_not_false (u64RuntimeEnv_realizable delta limit) s₀
+  exact ⟨halw, hdwp, hnv.1, hnv.2.1⟩
 
 /-- Bitmask-monotone flags (`BitsMono`) and ABA-free `Versioned` combinator witnesses. -/
 theorem combinator_flags_and_versioned_witness :
@@ -656,6 +741,57 @@ theorem dual_trace_not_antitone (m : AtomicMemoryMode) :
   have h2 := h.2.2.2.2.2.1 5 8 rfl rfl
   exact absurd h2 (by decide)
 
+/-! ### 1.4 Universal symbolic MiniRust `Mach` & `MachTB` `mrCellWP` witnesses -/
+
+/--
+**Positive universal MiniRust `Mach` & `MachTB` `try_update` witness**:
+for ANY bounded `u8` counter (`limit + delta ≤ 256`), ANY initial byte `b₀ : UInt8`,
+and ANY initial access log `acc₀`, `tryUpdateLoop` executed directly over MiniRust
+`BasicMemory` (`bmU8Mach`) and `TreeBorrowsMemory` (`tbU8Mach`) under concurrent
+`rely`-respecting interference preserves the coupled cell invariant, `MachTB.wfLive`,
+and `HistInvSt` at every step, establishes `CreusotPost` on return, and is provably
+non-vacuous (`¬ DWP … False`).
+-/
+theorem u8_counter_mr_bm_and_tb_witness (delta limit : Nat) (hno : limit + delta ≤ 256)
+    (b₀ : UInt8) (acc₀ : List MiniRustSpec.Gen.Access) (budget : Nat) :
+    let s₀ : AtomicSt Nat Nat (List (Nat × Nat)) :=
+      ⟨b₀.toNat, 0, .fresh b₀.toNat, 0, [], budget⟩
+    (Always (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely (· ≤ ·)))
+        (fun ms => bmU8MInv ms.1 ms.2.cell ∧
+          HistInvSt (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 ms.2)
+        (fun r ms => bmU8MInv ms.1 ms.2.cell ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 [] (.fresh b₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (bmU8Mach b₀ acc₀, s₀) ∧
+      ¬ DWP (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely (· ≤ ·)))
+        (tryUpdateLoop Nat) (fun _ _ => False) (bmU8Mach b₀ acc₀, s₀)) ∧
+    (Always (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·)))
+        (fun ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          HistInvSt (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 ms.2)
+        (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 [] (.fresh b₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+      ¬ DWP (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·)))
+        (tryUpdateLoop Nat) (fun _ _ => False) (tbU8Mach b₀ acc₀, s₀)) := by
+  intro s₀
+  have hrep : ∀ f₂ x f₃ (n : Nat), (counterEnv delta limit).fSpec.hist_inv 0 f₂ →
+      (counterEnv delta limit).fSpec.post_mut f₂ x f₃ (some n) → b₀.toNat ≤ x → n < 256 := by
+    intro _ x _ n _ ⟨_, hr⟩ _
+    by_cases hx : x < limit
+    · simp only [hx, ↓reduceIte] at hr; cases hr; omega
+    · simp only [hx, ↓reduceIte] at hr; cases hr
+  have hpre := counter_pre delta limit b₀.toNat 0 []
+  have hs₀ : InitSt b₀.toNat 0 [] (.fresh b₀.toNat) s₀ := ⟨rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨tryUpdate_mr_bm_u8_safety (counter_realizable delta limit) hpre hrep b₀ acc₀ rfl hs₀,
+    tryUpdate_mr_tb_u8_safety (counter_realizable delta limit) hpre hrep b₀ acc₀ rfl hs₀⟩
+
 /-! ## 2. Negative Fail-Closed Canaries -/
 
 /-! ### 2.1 Silent divergence -/
@@ -790,6 +926,32 @@ theorem canary_mrCellWP_ub :
         (tryUpdateLoop Nat) (fun _ _ => True) (MiniRustSpec.AtomicIntrinsicsMR.tbShared, s₅) :=
   mrCellWP_rejects_misaligned_u128_frozen ⟨5, PUnit.unit, .fresh 5, 0, PUnit.unit, 0⟩ _ _
 
+/--
+**Fail-closed width-overflow `specPanic` canary**: even when `b.toNat ≤ d` holds
+for the monotone history invariant `(· ≤ ·)`, any out-of-range `desired` (`256 ≤ d`)
+on `u8` causes MiniRust `AtomicCompareExchange` to `Stop.specPanic` on BOTH
+`BasicMemory` and `TreeBorrowsMemory`, refuting `∃ ret m', mrCasOk …`.
+-/
+theorem canary_mr_out_of_range_specPanic (b : UInt8) (acc : List MiniRustSpec.Gen.Access)
+    (d : Nat) (hd : 256 ≤ d) :
+    b.toNat ≤ d ∧
+    (¬ ∃ ret m', mrCasOk (bmU8Mach b acc) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        b.toNat d ret m') ∧
+    (¬ ∃ ret m', mrCasOk (tbU8Mach b acc) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        b.toNat d ret m') := by
+  have hb : b.toNat < 256 := b.toNat_lt
+  have hfalse : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU8
+      (d : Int) = false := by
+    cases h : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (d : Int)
+    · rfl
+    · exact absurd ((u8_can_represent_iff d).1 h) (by omega)
+  exact ⟨by omega,
+    mr_cas_out_of_range_specPanic_canary rfl (by decide) (bmU8_typedLoad b acc) hfalse,
+    mr_cas_out_of_range_specPanic_canary rfl (by decide) (tbU8_typedLoad b acc) hfalse⟩
+
 /-! ### 2.4 Unbounded contention: safe but not live -/
 
 theorem canary_unbounded_contention :
@@ -847,11 +1009,14 @@ open Lean Elab Command Meta
 def auditStdAxiom (a : Name) : Bool :=
   a == ``propext || a == ``Classical.choice || a == ``Quot.sound
 
-/-- Trivial theorem statements (`True`, `a = a`, `P ↔ P`), under binders. -/
+/--
+Trivial theorem statements (`True`, `a = a`, `P ↔ P`, and trivial conjunctions), under binders.
+-/
 def auditTrivialProp : Expr → Bool
   | .forallE _ _ body _ => auditTrivialProp body
   | .letE _ _ _ body _ => auditTrivialProp body
   | .mdata _ e => auditTrivialProp e
+  | .app (.app (.const ``And _) a) b => auditTrivialProp a && auditTrivialProp b
   | e =>
     if e.isConstOf ``True then true
     else if e.isAppOfArity ``Eq 3 then e.appFn!.appArg! == e.appArg!
@@ -909,17 +1074,19 @@ def auditDef (n : Name) (ty val : Expr) (safety : DefinitionSafety) : Declaratio
 
 run_cmd do
   let env ← getEnv
-  -- Import-isolation check on `Anneal.AtomicHistInv`: no `Lean`, `Miri.*`, or `LeanMiriSpec.*`.
-  let some ahiIdx := env.getModuleIdx? `Anneal.AtomicHistInv
-    | throwError "audit: module Anneal.AtomicHistInv not found in environment"
-  let ahiMod := env.header.moduleData[ahiIdx.toNat]!
-  for imp in ahiMod.imports do
-    if imp.module == `Lean || (`Lean).isPrefixOf imp.module ||
-       (`Miri).isPrefixOf imp.module || (`LeanMiriSpec).isPrefixOf imp.module then
-      throwError "import-isolation violation: Anneal.AtomicHistInv imports {imp.module}"
+  -- Import-isolation check on BOTH `Anneal.ITreeBuchi` and `Anneal.AtomicHistInv`:
+  -- neither may import `Lean`, `Lean.*`, `Miri.*`, or `LeanMiriSpec.*`.
+  for modName in [`Anneal.ITreeBuchi, `Anneal.AtomicHistInv] do
+    let some modIdx := env.getModuleIdx? modName
+      | throwError "audit: module {modName} not found in environment"
+    let modData := env.header.moduleData[modIdx.toNat]!
+    for imp in modData.imports do
+      if imp.module == `Lean || (`Lean).isPrefixOf imp.module ||
+         (`Miri).isPrefixOf imp.module || (`LeanMiriSpec).isPrefixOf imp.module then
+        throwError "import-isolation violation: {modName} imports {imp.module}"
   let nss : Array Name :=
     #[`Anneal.ITreeBuchi, `Anneal.AtomicHistInv, `Anneal.ITreeBuchiAndAtomicHistInvTests]
-  let floors : Array Nat := #[675, 200, 68]
+  let floors : Array Nat := #[675, 235, 78]
   let userName (c : Name) : Name := (privateToUserName? c).getD c
   let decls := env.constants.fold (init := (#[] : Array (Name × ConstantInfo)))
     fun acc c ci => if nss.any (·.isPrefixOf (userName c)) then acc.push (c, ci) else acc
@@ -946,12 +1113,21 @@ run_cmd do
     , ``Anneal.AtomicHistInv.tryUpdate_fairInfOften
     , ``Anneal.AtomicHistInv.tryUpdate_fairBuchiSat_committer
     , ``Anneal.AtomicHistInv.tryUpdate_trace_strongFair_terminates
+    , ``Anneal.AtomicHistInv.tryUpdateLoop_terminalDrop
+    , ``Anneal.AtomicHistInv.prophecy_elimination_dwp
+    , ``Anneal.AtomicHistInv.prophecy_elimination_always
     , ``Anneal.AtomicHistInv.tryUpdate_reactive_service_infOften
     , ``Anneal.AtomicHistInv.mr_scalar_widths_admissible
     , ``Anneal.AtomicHistInv.mr_cas_success_transition
     , ``Anneal.AtomicHistInv.mr_cas_failure_preserves_memory_and_no_race
     , ``Anneal.AtomicHistInv.mr_atomic_tb_preserves_wfLive
     , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_wfLive_safety
+    , ``Anneal.AtomicHistInv.mrCellWP_nonvacuous_not_false
+    , ``Anneal.AtomicHistInv.mr_cas_out_of_range_specPanic_canary
+    , ``Anneal.AtomicHistInv.bmU8_mrCellAdmissible
+    , ``Anneal.AtomicHistInv.tbU8_mrCellAdmissible
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u8_safety
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u8_safety
     , ``Anneal.AtomicHistInv.mrCellWP_rejects_misaligned_u128_frozen
     , ``Anneal.AtomicHistInv.double_cas_violates_oneshot_committer
     , ``Anneal.AtomicHistInv.weak_vs_strong_cas_separation
@@ -959,7 +1135,10 @@ run_cmd do
     , ``Anneal.AtomicHistInv.mrCellWP_tb_ticket_nonvacuous
     , ``Anneal.AtomicHistInv.mrCellWP_empty_rely_miracle
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_inconsistent_miracle
-    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_consistent_nonvacuous ]
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_consistent_nonvacuous
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_counter_prophecy_eliminated
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_counter_mr_bm_and_tb_witness
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.canary_mr_out_of_range_specPanic ]
   for req in requiredThms do
     let some (.thmInfo ti) := env.find? req
       | throwError "audit: required theorem {req} missing"
@@ -1027,12 +1206,18 @@ run_cmd do
   let orphanPartial := auditDef `Anneal.AtomicHistInv.orphan._unsafe_rec natTy (mkNatLit 0) .partial
   unless ← rejectsDecl orphanPartial `Anneal.AtomicHistInv.orphan._unsafe_rec do
     throwError "audit self-test: orphan partial _unsafe_rec without safe parent accepted"
-  unless auditTrivialProp pIff && !auditTrivialProp oneEqTwo do
+  let trivialConj := mkApp2 (mkConst ``And) (mkConst ``True) oneEqOne
+  let trivialConjProof := mkApp4 (mkConst ``And.intro) (mkConst ``True) oneEqOne
+    (mkConst ``True.intro) (mkApp2 (mkConst ``Eq.refl [1]) natTy (mkNatLit 1))
+  unless ← rejectsDecl (auditThm `auditSelfTest.trivialConj trivialConj trivialConjProof)
+      `auditSelfTest.trivialConj do
+    throwError "audit self-test: trivial True ∧ (1 = 1) accepted"
+  unless auditTrivialProp pIff && auditTrivialProp trivialConj && !auditTrivialProp oneEqTwo do
     throwError "audit self-test: trivial-statement detector failed"
   logInfo m!"ITreeBuchi/AtomicHistInv audit: {decls.size} declarations, theorems \
-    {nss.toList.zip counts.toList}, import_isolated=true, axioms ⊆ [propext, Classical.choice, \
-    Quot.sound], all definitions safe (strict _unsafe_rec check), 0 trivial theorems, \
-    12 real addDecl self-tests passed"
+    {nss.toList.zip counts.toList}, import_isolated=true (ITreeBuchi + AtomicHistInv), \
+    axioms ⊆ [propext, Classical.choice, Quot.sound], all definitions safe \
+    (strict _unsafe_rec check), 0 trivial theorems, 13 real addDecl self-tests passed"
 
 end Audit
 

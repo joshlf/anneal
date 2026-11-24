@@ -33,21 +33,27 @@ A specification and verification library for `SeqCst` `Atomic::try_update` /
 * **§4–5** The exact `creusot#2386` contract `CreusotPost` under `TryUpdatePre`
   (with concurrent post-commit/post-abort `rely` interference at `dropF`),
   proved as `Always` / `AlwaysStep` / `DWLP` safety under unbounded contention.
-* **§6** Liveness: `DWP` / `Eventually` under bounded contention, unconditional
-  strong-CAS termination under quiescence, non-vacuity (`¬ DWP ... False`),
-  Streett `FairInfOften` / `CoBuchi` under CAS fairness, `InfOften` CAS
-  enabledness, a one-shot committer `FairBuchiSat` monitor, and operational
-  termination against every strongly fair `EnvStrategy`
-  (`trace_strongFair_terminates` over `eventTraceWP`).
+* **§6** Liveness & Prophecy Elimination: `DWP` / `Eventually` under bounded
+  contention, unconditional strong-CAS termination under quiescence,
+  non-vacuity (`¬ DWP ... False`), Streett `FairInfOften` / `CoBuchi` under CAS
+  fairness, `InfOften` CAS enabledness, a one-shot committer `FairBuchiSat`
+  monitor, operational termination against every strongly fair `EnvStrategy`
+  (`trace_strongFair_terminates` over `eventTraceWP`), and non-miraculous
+  prophecy elimination (`prophecy_elimination_dwp`, `prophecy_elimination_always`
+  for `TerminalDrop` programs including `tryUpdateLoop`).
 * **§7** A `#4162` diverging `-> !` ticket service composing `tryUpdateLoop`
   (`Always` with one-shot per-request committer + `InfOften TicketCommit` +
   `¬ DWP`, via `buchi_diverging_loop_rule`).
 * **§8** Dual-authority & MiniRust grounding: all integer widths
   (`u8`/`u16`/`u32`/`u64`/`usize`), universal MiniRust CAS success/failure/
   frame/no-data-race/`MachTB.wfLive` laws, threaded traces, `AdmissibleAtomicStep`,
-  and a direct `evalIntrinsicM`-backed transformer `mrCellWP` transporting
-  `tryUpdateLoop` safety to `MachTB` while failing closed on misaligned / `u128`
-  / `Frozen` UB.
+  and a direct `evalIntrinsicM`-backed transformer `mrCellWP` with coupled
+  `MrCellAdmissible` (guarded by `IntType.can_represent`), general non-vacuity
+  (`mrCellWP_nonvacuous_not_false`), fail-closed out-of-range `specPanic`
+  (`mr_cas_out_of_range_specPanic_canary`), positive universal symbolic
+  instances on both `Mach` (`bmU8_mrCellAdmissible`, `tryUpdate_mr_bm_u8_safety`)
+  and `MachTB` (`tbU8_mrCellAdmissible`, `tryUpdate_mr_tb_u8_safety`), and
+  fail-closed rejection of misaligned / `u128` / `Frozen` UB.
 * **§9** Fail-closed boundaries: irreflexive relations (on both `Err` and failed
   CAS), non-transitive relations, non-`hist_inv`-closed closure preconditions,
   one-shot committer double-fire rejection, weak-vs-strong CAS 2-axis
@@ -1550,6 +1556,304 @@ theorem tryUpdate_trace_strongFair_terminates (σ : EnvStrategy (AtomicCellE Val
 
 end Trace
 
+/-! ### 6.3 Non-miraculous prophecy semantics & prophecy elimination -/
+
+section Prophetic
+
+variable {Val RState G : Type}
+
+/--
+Prophetic lifting of a runtime `FnMutSpec` on `RState` to `RState × RState`
+(current runtime closure state paired with a fixed prophetic final value `fin`):
+`hist_inv` and `post_mut` preserve `fin`, and `resolve (cur, fin) := cur = fin`.
+-/
+def propheticSpec (base : FnMutSpec RState Val Val) : FnMutSpec (RState × RState) Val Val where
+  hist_inv p q := base.hist_inv p.1 q.1 ∧ p.2 = q.2
+  hist_inv_laws := ⟨fun _ => ⟨base.hist_inv_laws.refl _, rfl⟩,
+    fun hab hbc => ⟨base.hist_inv_laws.trans hab.1 hbc.1, hab.2.trans hbc.2⟩⟩
+  pre p x := base.pre p.1 x
+  post_mut p x q r := base.post_mut p.1 x q.1 r ∧ q.2 = p.2
+  step_hist_inv _ _ _ _ h := ⟨base.step_hist_inv _ _ _ _ h.1, h.2.symm⟩
+  resolve p := p.1 = p.2
+
+/-- Prophetic lifting of a runtime `AtomicEnv`. -/
+def propheticEnv (A : AtomicEnv Val RState G) : AtomicEnv Val (RState × RState) G :=
+  ⟨A.rely, propheticSpec A.fSpec, A.gc⟩
+
+/-- Attach a prophetic final value `fin` to a runtime state `s`. -/
+def AtomicSt.withProphecy (s : AtomicSt Val RState G) (fin : RState) :
+    AtomicSt Val (RState × RState) G :=
+  ⟨s.cell, (s.fst, fin), s.comm, s.fires, s.gst, s.budget⟩
+
+/-- Erase the prophetic component, recovering the runtime state. -/
+def AtomicSt.eraseProphecy (ps : AtomicSt Val (RState × RState) G) : AtomicSt Val RState G :=
+  ⟨ps.cell, ps.fst.1, ps.comm, ps.fires, ps.gst, ps.budget⟩
+
+@[simp] theorem AtomicSt.erase_withProphecy (s : AtomicSt Val RState G) (fin : RState) :
+    (s.withProphecy fin).eraseProphecy = s := rfl
+
+/--
+Auxiliary transformer tracking whether `dropF` has fired (`d = false` before
+drop, `d = true` after drop). In state `true` no further `vis` is permitted.
+-/
+def terminalDropWP (Val : Type) : StateEffectWP Bool (AtomicCellE Val) where
+  wp
+    | .call .dropF, K, d => d = false ∧ ∀ o, K o true
+    | .call .load, K, d => d = false ∧ ∀ o, K o false
+    | .call (.cas _ _), K, d => d = false ∧ ∀ o, K o false
+    | .call (.callF _), K, d => d = false ∧ ∀ o, K o false
+    | .call .recv, K, d => d = false ∧ ∀ o, K o false
+  mono {i} _ _ _ h hw :=
+    match i with
+    | .call .dropF => ⟨hw.1, fun o => h o true (hw.2 o)⟩
+    | .call .load => ⟨hw.1, fun o => h o false (hw.2 o)⟩
+    | .call (.cas _ _) => ⟨hw.1, fun o => h o false (hw.2 o)⟩
+    | .call (.callF _) => ⟨hw.1, fun o => h o false (hw.2 o)⟩
+    | .call .recv => ⟨hw.1, fun o => h o false (hw.2 o)⟩
+
+/-- Every `dropF` step of `t` is terminal: no further effects occur after `dropF`. -/
+def TerminalDrop {R : Type} (t : ITree (AtomicCellE Val) R) : Prop :=
+  DWLP (terminalDropWP Val) t (fun _ _ => True) false
+
+/-- `tryUpdateLoop` satisfies `TerminalDrop` (its only `dropF` is `retAfterDrop`). -/
+theorem tryUpdateLoop_terminalDrop (Val : Type) : TerminalDrop (tryUpdateLoop Val) := by
+  refine (DWLP.vis_iff _ _ _ _ _).2 ⟨rfl, fun o => ?_⟩
+  refine DWLP.iter_invariant tryBody (fun _ d => d = false) (fun prev d hd => ?_) rfl
+  subst hd
+  refine (DWLP.vis_iff _ _ _ _ _).2 ⟨rfl, forall_callOut prev _ fun r => ?_⟩
+  cases r with
+  | none =>
+    rw [tryCallK_none]
+    exact (DWLP.vis_iff _ _ _ _ _).2 ⟨rfl, fun _ => (DWLP.ret_iff _ _ _ _).2 trivial⟩
+  | some next =>
+    rw [tryCallK_some]
+    refine (DWLP.vis_iff _ _ _ _ _).2 ⟨rfl, forall_casOut prev next _ fun b v => ?_⟩
+    cases b with
+    | false => rw [tryCasK_false]; exact (DWLP.ret_iff _ _ _ _).2 rfl
+    | true =>
+      rw [tryCasK_casOut_true]
+      exact (DWLP.vis_iff _ _ _ _ _).2 ⟨rfl, fun _ => (DWLP.ret_iff _ _ _ _).2 trivial⟩
+
+private theorem noVis_dwp_transfer {S₁ S₂ R : Type} {ewp₁ : StateEffectWP S₁ (AtomicCellE Val)}
+    {ewp₂ : StateEffectWP S₂ (AtomicCellE Val)} {Q₁ : R → S₁ → Prop} {Q₂ : R → S₂ → Prop}
+    {t : ITree (AtomicCellE Val) R} {s₁ : S₁} {s₂ : S₂}
+    (hnv : DWLP (terminalDropWP Val) t (fun _ _ => True) true)
+    (h : DWP ewp₁ t Q₁ s₁) (himp : ∀ r, Q₁ r s₁ → Q₂ r s₂) : DWP ewp₂ t Q₂ s₂ := by
+  refine DWP.induct (fun x st => st = s₁ → DWLP (terminalDropWP Val) x (fun _ _ => True) true →
+    DWP ewp₂ x Q₂ s₂) ?_ h rfl hnv
+  intro x st hx hst hnv'
+  subst hst
+  cases hobs : x.observe with
+  | ret r =>
+    rw [hobs] at hx
+    exact of_observe_ret hobs (himp r hx)
+  | tau x' =>
+    rw [hobs] at hx
+    have hnv'' : DWLP (terminalDropWP Val) x' (fun _ _ => True) true := by
+      rw [DWLP.unfold_eq, hobs] at hnv'; exact hnv'
+    exact of_observe_tau hobs (hx rfl hnv'')
+  | vis i k =>
+    rw [DWLP.unfold_eq, hobs] at hnv'
+    cases i with
+    | call req => cases req <;> exact Bool.noConfusion hnv'.1
+where
+  of_observe_ret {S : Type} {E : Effect.{0}} {R : Type} {ewp : StateEffectWP S E}
+      {Q : R → S → Prop} {x : ITree E R} {r : R} {s : S}
+      (hobs : x.observe = .ret r) (hq : Q r s) : DWP ewp x Q s := by
+    rw [DWP.unfold_eq, hobs]; exact hq
+  of_observe_tau {S : Type} {E : Effect.{0}} {R : Type} {ewp : StateEffectWP S E}
+      {Q : R → S → Prop} {x x' : ITree E R} {s : S}
+      (hobs : x.observe = .tau x') (hd : DWP ewp x' Q s) : DWP ewp x Q s := by
+    rw [DWP.unfold_eq, hobs]; exact hd
+
+private theorem noVis_always_transfer {S₁ S₂ R : Type} {ewp₁ : StateEffectWP S₁ (AtomicCellE Val)}
+    {ewp₂ : StateEffectWP S₂ (AtomicCellE Val)} {Inv₁ : S₁ → Prop} {Inv₂ : S₂ → Prop}
+    {Q₁ : R → S₁ → Prop} {Q₂ : R → S₂ → Prop}
+    {t : ITree (AtomicCellE Val) R} {s₁ : S₁} {s₂ : S₂}
+    (hnv : DWLP (terminalDropWP Val) t (fun _ _ => True) true)
+    (h : Always ewp₁ Inv₁ Q₁ t s₁)
+    (hinv : Inv₁ s₁ → Inv₂ s₂) (himp : ∀ r, Q₁ r s₁ → Q₂ r s₂) :
+    Always ewp₂ Inv₂ Q₂ t s₂ := by
+  refine Always.coinduct (fun x st => st = s₂ ∧ DWLP (terminalDropWP Val) x (fun _ _ => True) true ∧
+    Always ewp₁ Inv₁ Q₁ x s₁) ?_ ⟨rfl, hnv, h⟩
+  rintro x st ⟨rfl, hnv', ha⟩
+  refine ⟨hinv ha.inv, ?_⟩
+  cases hobs : x.observe with
+  | ret r =>
+    rw [Always.unfold_eq, hobs] at ha
+    exact himp r ha.2
+  | tau x' =>
+    rw [Always.unfold_eq, hobs] at ha
+    rw [DWLP.unfold_eq, hobs] at hnv'
+    exact ⟨rfl, hnv', ha.2⟩
+  | vis i k =>
+    rw [DWLP.unfold_eq, hobs] at hnv'
+    cases i with
+    | call req => cases req <;> exact Bool.noConfusion hnv'.1
+
+/--
+**Prophecy Elimination (`DWP`, non-miraculous soundness)**: even though fixing a
+single inconsistent prophecy `fin` makes assume-style `dropF` miraculous,
+proving the prophetic `DWP` contract universally over **all** prophecies
+`∀ fin` soundly eliminates into the **non-miraculous, `ExcludedMiracle`**
+runtime transformer `atomicBudgetWP A` (binding `fin` to the actual final
+runtime state `s.fst` upon return) for every `TerminalDrop` program (including
+`tryUpdateLoop`).
+-/
+theorem prophecy_elimination_dwp {A : AtomicEnv Val RState G} {R : Type}
+    {t : ITree (AtomicCellE Val) R} (htd : TerminalDrop t)
+    {Q : R → RState → AtomicSt Val RState G → Prop}
+    {s₀ : AtomicSt Val RState G}
+    (hall : ∀ fin, DWP (atomicBudgetWP (propheticEnv A)) t
+      (fun r ps => Q r ps.fst.2 ps.eraseProphecy) (s₀.withProphecy fin)) :
+    DWP (atomicBudgetWP A) t (fun r s => Q r s.fst s) s₀ := by
+  refine DWP.induct (fun x ps => ∀ (s : AtomicSt Val RState G) (fin₀ : RState),
+      ps = s.withProphecy fin₀ → TerminalDrop x →
+      (∀ fin, DWP (atomicBudgetWP (propheticEnv A)) x
+        (fun r ps' => Q r ps'.fst.2 ps'.eraseProphecy) (s.withProphecy fin)) →
+      DWP (atomicBudgetWP A) x (fun r s' => Q r s'.fst s') s)
+    ?_ (hall s₀.fst) s₀ s₀.fst rfl htd hall
+  intro x ps hx s fin₀ hps htd' hall'
+  subst hps
+  rw [DWP.unfold_eq]
+  cases hobs : x.observe with
+  | ret r =>
+    have hr := hall' s.fst
+    rw [DWP.unfold_eq, hobs] at hr
+    exact hr
+  | tau x' =>
+    rw [hobs] at hx
+    have htd'' : TerminalDrop x' := by rw [TerminalDrop, DWLP.unfold_eq, hobs] at htd'; exact htd'
+    exact hx s fin₀ rfl htd'' fun fin => by
+      have hf := hall' fin; rw [DWP.unfold_eq, hobs] at hf; exact hf
+  | vis i k =>
+    rw [hobs] at hx
+    have htd'' : (terminalDropWP Val).wp i
+        (fun o d => DWLP (terminalDropWP Val) (k o) (fun _ _ => True) d) false := by
+      rw [TerminalDrop, DWLP.unfold_eq, hobs] at htd'; exact htd'
+    have hstep : ∀ fin, (atomicBudgetWP (propheticEnv A)).wp i
+        (fun o ps' => DWP (atomicBudgetWP (propheticEnv A)) (k o)
+          (fun r ps'' => Q r ps''.fst.2 ps''.eraseProphecy) ps') (s.withProphecy fin) := by
+      intro fin; have hf := hall' fin; rw [DWP.unfold_eq, hobs] at hf; exact hf
+    cases i with
+    | call req =>
+      cases req with
+      | load =>
+        intro v hv
+        refine ⟨fun he => (hx v hv).1 he { s with cell := v } fin₀ rfl (htd''.2 v)
+            fun fin => ((hstep fin) v hv).1 he,
+          fun hne hb => (hx v hv).2 hne hb { s with cell := v, budget := s.budget - 1 } fin₀ rfl
+            (htd''.2 v) fun fin => ((hstep fin) v hv).2 hne hb⟩
+      | cas e d =>
+        intro v hv
+        refine ⟨fun hc =>
+          ⟨fun hne => ((hx v hv).1 hc).1 hne { s with cell := v } fin₀ rfl (htd''.2 (false, v))
+              fun fin => (((hstep fin) v hv).1 hc).1 hne,
+           fun he hb => ((hx v hv).1 hc).2.1 he hb { s with cell := v, budget := s.budget - 1 }
+              fin₀ rfl (htd''.2 (false, v)) fun fin => (((hstep fin) v hv).1 hc).2.1 he hb,
+           fun he =>
+            let hwin := ((hx v hv).1 hc).2.2 he
+            ⟨hwin.1, hwin.2.1, fun g' hg' => hwin.2.2 g' hg'
+              (({ s with cell := v } : AtomicSt Val RState G).commit e d g' s.budget) fin₀ rfl
+              (htd''.2 (true, e)) fun fin => ((((hstep fin) v hv).1 hc).2.2 he).2.2 g' hg'⟩⟩,
+          fun hc hb =>
+            ⟨((hx v hv).2 hc hb).1 { s with cell := v, budget := s.budget - 1 } fin₀ rfl
+                (htd''.2 (false, v)) fun fin => (((hstep fin) v hv).2 hc hb).1,
+             fun he =>
+              let hwin := ((hx v hv).2 hc hb).2 he
+              ⟨hwin.1, hwin.2.1, fun g' hg' => hwin.2.2 g' hg'
+                (({ s with cell := v } : AtomicSt Val RState G).commit e d g' (s.budget - 1))
+                fin₀ rfl (htd''.2 (true, e))
+                fun fin => ((((hstep fin) v hv).2 hc hb).2 he).2.2 g' hg'⟩⟩⟩
+      | callF arg =>
+        refine ⟨hx.1, fun f' r hpost =>
+          hx.2 (f', fin₀) r ⟨hpost, rfl⟩ { s with fst := f' } fin₀ rfl (htd''.2 r)
+            fun fin => (hstep fin).2 (f', fin) r ⟨hpost, rfl⟩⟩
+      | dropF =>
+        intro v hv
+        refine ⟨fun he _ => ?_, fun hne hb _ => ?_⟩
+        · have hres := ((hstep s.fst) v hv).1 he rfl
+          exact noVis_dwp_transfer (htd''.2 PUnit.unit) hres (fun _ hq => hq)
+        · have hres := ((hstep s.fst) v hv).2 hne hb rfl
+          exact noVis_dwp_transfer (htd''.2 PUnit.unit) hres (fun _ hq => hq)
+      | recv =>
+        intro b
+        exact hx b { s with comm := .fresh s.cell, fires := 0, budget := b } fin₀ rfl
+          (htd''.2 PUnit.unit) fun fin => (hstep fin) b
+
+/--
+**Prophecy Elimination (`Always`, unbounded contention)**: proving a prophetic
+`Always` safety contract universally over `∀ fin` soundly eliminates into the
+non-miraculous runtime transformer `atomicHistWP A` for every `TerminalDrop`
+program (including `tryUpdateLoop`).
+-/
+theorem prophecy_elimination_always {A : AtomicEnv Val RState G} {R : Type}
+    {t : ITree (AtomicCellE Val) R} (htd : TerminalDrop t)
+    {Inv : AtomicSt Val RState G → Prop}
+    {Q : R → RState → AtomicSt Val RState G → Prop}
+    {s₀ : AtomicSt Val RState G}
+    (hall : ∀ fin, Always (atomicHistWP (propheticEnv A))
+      (fun ps => Inv ps.eraseProphecy)
+      (fun r ps => Q r ps.fst.2 ps.eraseProphecy) t (s₀.withProphecy fin)) :
+    Always (atomicHistWP A) Inv (fun r s => Q r s.fst s) t s₀ := by
+  refine Always.coinduct (fun x s =>
+      (TerminalDrop x ∧ ∀ fin, Always (atomicHistWP (propheticEnv A))
+        (fun ps => Inv ps.eraseProphecy)
+        (fun r ps => Q r ps.fst.2 ps.eraseProphecy) x (s.withProphecy fin)) ∨
+      Always (atomicHistWP A) Inv (fun r s' => Q r s'.fst s') x s)
+    ?_ (Or.inl ⟨htd, hall⟩)
+  rintro x s (⟨htd', hall'⟩ | ha)
+  · refine ⟨(hall' s.fst).inv, ?_⟩
+    cases hobs : x.observe with
+    | ret r =>
+      have hf := hall' s.fst
+      rw [Always.unfold_eq, hobs] at hf
+      exact hf.2
+    | tau x' =>
+      have htd'' : TerminalDrop x' := by rw [TerminalDrop, DWLP.unfold_eq, hobs] at htd'; exact htd'
+      refine Or.inl ⟨htd'', fun fin => ?_⟩
+      have hf := hall' fin; rw [Always.unfold_eq, hobs] at hf; exact hf.2
+    | vis i k =>
+      have htd'' : (terminalDropWP Val).wp i
+          (fun o d => DWLP (terminalDropWP Val) (k o) (fun _ _ => True) d) false := by
+        rw [TerminalDrop, DWLP.unfold_eq, hobs] at htd'; exact htd'
+      have hstep : ∀ fin, (atomicHistWP (propheticEnv A)).wp i
+          (fun o ps' => Always (atomicHistWP (propheticEnv A))
+            (fun ps => Inv ps.eraseProphecy)
+            (fun r ps'' => Q r ps''.fst.2 ps''.eraseProphecy) (k o) ps') (s.withProphecy fin) := by
+        intro fin; have hf := hall' fin; rw [Always.unfold_eq, hobs] at hf; exact hf.2
+      cases i with
+      | call req =>
+        cases req with
+        | load =>
+          intro v hv b
+          exact Or.inl ⟨htd''.2 v, fun fin => (hstep fin) v hv b⟩
+        | cas e d =>
+          intro v hv b
+          refine ⟨Or.inl ⟨htd''.2 (false, v), fun fin => ((hstep fin) v hv b).1⟩, fun he => ?_⟩
+          have hw₀ := ((hstep s.fst) v hv b).2 he
+          exact ⟨hw₀.1, hw₀.2.1, fun g' hg' =>
+            Or.inl ⟨htd''.2 (true, e), fun fin => (((hstep fin) v hv b).2 he).2.2 g' hg'⟩⟩
+        | callF arg =>
+          refine ⟨(hstep s.fst).1, fun f' r hpost =>
+            Or.inl ⟨htd''.2 r, fun fin => (hstep fin).2 (f', fin) r ⟨hpost, rfl⟩⟩⟩
+        | dropF =>
+          intro v hv b _
+          have hdrop := (hstep s.fst) v hv b rfl
+          exact Or.inr (noVis_always_transfer (htd''.2 PUnit.unit) hdrop id (fun _ hq => hq))
+        | recv =>
+          intro b
+          exact Or.inl ⟨htd''.2 PUnit.unit, fun fin => (hstep fin) b⟩
+  · refine ⟨ha.inv, ?_⟩
+    cases hobs : x.observe with
+    | ret r => rw [Always.unfold_eq, hobs] at ha; exact ha.2
+    | tau x' => rw [Always.unfold_eq, hobs] at ha; exact Or.inr ha.2
+    | vis i k =>
+      rw [Always.unfold_eq, hobs] at ha
+      exact (atomicHistWP A).mono (fun _ _ hx => Or.inr hx) ha.2
+
+end Prophetic
+
 /-! ## 7. A `#4162` Diverging `-> !` Ticket Service Composing `tryUpdateLoop` -/
 
 section Service
@@ -2139,34 +2443,63 @@ def mrCellWP {M FState G : Type} [Memory M] [MemoryOps M] (A : AtomicEnv Nat FSt
           ⟨((hw m₁ hm).2 v m₂ hok).1, fun b hr => h _ _ (((hw m₁ hm).2 v m₂ hok).2 b hr)⟩⟩
     | .call .recv => fun b => h _ _ (hw b)
 
+instance {M FState G : Type} [Memory M] [MemoryOps M] (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop) :
+    StateEffectWP.Conjunctive (mrCellWP A ptr pty t mRely) where
+  conj {i} _ _ _ hp hq :=
+    match i with
+    | .call .load => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun v m₂ hok =>
+          ⟨((hp m₁ hm).2 v m₂ hok).1, fun b =>
+            ⟨((hp m₁ hm).2 v m₂ hok).2 b, ((hq m₁ hm).2 v m₂ hok).2 b⟩⟩⟩
+    | .call (.cas _ _) => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun ret m₂ hok =>
+          ⟨((hp m₁ hm).2 ret m₂ hok).1, fun b =>
+            ⟨fun hne => ⟨(((hp m₁ hm).2 ret m₂ hok).2 b).1 hne,
+              (((hq m₁ hm).2 ret m₂ hok).2 b).1 hne⟩,
+             fun heq =>
+              ⟨⟨((((hp m₁ hm).2 ret m₂ hok).2 b).2 heq).1.1,
+                ((((hp m₁ hm).2 ret m₂ hok).2 b).2 heq).1.2.1,
+                fun g' hg' => ⟨((((hp m₁ hm).2 ret m₂ hok).2 b).2 heq).1.2.2 g' hg',
+                  ((((hq m₁ hm).2 ret m₂ hok).2 b).2 heq).1.2.2 g' hg'⟩⟩,
+               fun mFail hfail => ⟨((((hp m₁ hm).2 ret m₂ hok).2 b).2 heq).2 mFail hfail,
+                ((((hq m₁ hm).2 ret m₂ hok).2 b).2 heq).2 mFail hfail⟩⟩⟩⟩⟩
+    | .call (.callF _) => ⟨hp.1, fun f' r h => ⟨hp.2 f' r h, hq.2 f' r h⟩⟩
+    | .call .dropF => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun v m₂ hok =>
+          ⟨((hp m₁ hm).2 v m₂ hok).1, fun b hr =>
+            ⟨((hp m₁ hm).2 v m₂ hok).2 b hr, ((hq m₁ hm).2 v m₂ hok).2 b hr⟩⟩⟩
+    | .call .recv => fun b => ⟨hp b, hq b⟩
+
 /--
 Operational admissibility of a MiniRust cell `(ptr, pty, t)` under machine-level
 interference `mRely`, **coupled** to the logical cell: `MInv m c` says machine
-`m` holds value `c` in the cell. Interference may stutter (so the bridge cannot
-be discharged by an empty, miraculous `mRely`, cf. `mrCellWP_empty_rely_miracle`)
-and moves the held value along
-`A.rely`; loads return exactly the held value and write nothing; a CAS returns
-the held value and stores `desired` exactly when the held value equals
-`expected` (the shape of `atomicCompareExchange_ok_iff`).
+`m` holds value `c` in the cell. Interference may stutter (`rely_refl`) and
+moves the held value along `A.rely`; loads return exactly `c` without writing;
+for every `t`-representable `desired` (`IntType.can_represent t d = true`), CAS
+returns `c` and stores `d` iff `c = e` (the shape of
+`atomicCompareExchange_ok_iff`, avoiding out-of-range `specPanic`).
 -/
 structure MrCellAdmissible {M FState G : Type} [Memory M] [MemoryOps M]
     (A : AtomicEnv Nat FState G)
     (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
-    (mRely : Machine M → Machine M → Prop) (MInv : Machine M → Nat → Prop)
-    (Rel : Nat → Nat → Prop) : Prop where
+    (mRely : Machine M → Machine M → Prop) (MInv : Machine M → Nat → Prop) : Prop where
   rely_refl : ∀ m c, MInv m c → mRely m m
   rely_pres : ∀ m c m', MInv m c → mRely m m' → ∃ c', A.rely c c' ∧ MInv m' c'
   load_ok : ∀ m c, MInv m c → ∃ v m', mrLoadOk m ptr pty t v m'
   load_val : ∀ m c v m', MInv m c → mrLoadOk m ptr pty t v m' → v.toNat = c ∧ MInv m' c
-  cas_ok : ∀ m c e d, MInv m c → Rel e d → ∃ ret m', mrCasOk m ptr pty t e d ret m'
-  cas_val : ∀ m c e d ret m', MInv m c → Rel e d → mrCasOk m ptr pty t e d ret m' →
+  cas_ok : ∀ m c (e d : Nat), MInv m c → IntType.can_represent t (d : Int) = true →
+    ∃ ret m', mrCasOk m ptr pty t e d ret m'
+  cas_val : ∀ m c (e d : Nat) ret m', MInv m c → IntType.can_represent t (d : Int) = true →
+    mrCasOk m ptr pty t e d ret m' →
     ret.toNat = c ∧ (c = e → MInv m' d) ∧ (c ≠ e → MInv m' c)
 
 /-- Machine interference followed by a load: the observed value is `rely`-related. -/
 private theorem mr_observe {M FState G : Type} [Memory M] [MemoryOps M]
     {A : AtomicEnv Nat FState G} {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»}
     {t : IntType} {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
-    {Rel : Nat → Nat → Prop} (hadm : MrCellAdmissible A ptr pty t mRely MInv Rel)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
     {m m₁ m₂ : Machine M} {c : Nat} {v : Int} (hm : MInv m c) (hr : mRely m m₁)
     (hl : mrLoadOk m₁ ptr pty t v m₂) : A.rely c v.toNat ∧ MInv m₂ v.toNat := by
   obtain ⟨c', hc', hm₁⟩ := hadm.rely_pres m c m₁ hm hr
@@ -2175,11 +2508,11 @@ private theorem mr_observe {M FState G : Type} [Memory M] [MemoryOps M]
 
 /--
 **Machine-backed safety (`tryUpdate_mr_always_safety`)**: for any memory model
-`M` and coupled MiniRust admissibility invariant `MInv`, `tryUpdateLoop`
-executes without UB/specPanic on `mrCellWP`, every machine observation is
-*proved* `rely`-related to the logical history, the machine keeps holding the
-logical cell value, `HistInvSt` holds at every step, and every return
-establishes the exact `creusot#2386` postcondition.
+`M`, coupled MiniRust admissibility invariant `MInv`, and closure outputs
+representable at integer type `t` (`hrep`), `tryUpdateLoop` executes without
+UB/specPanic on `mrCellWP`, every machine observation is *proved* `rely`-related
+to the logical history, the machine keeps holding the logical cell value,
+`HistInvSt` holds at every step, and every return establishes `CreusotPost`.
 -/
 theorem tryUpdate_mr_always_safety {M FState G : Type} [Memory M] [MemoryOps M]
     {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
@@ -2187,7 +2520,9 @@ theorem tryUpdate_mr_always_safety {M FState G : Type} [Memory M] [MemoryOps M]
     {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
     {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
     (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
-    (hadm : MrCellAdmissible A ptr pty t mRely MInv Rel)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
     {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
     (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
     Always (mrCellWP A ptr pty t mRely)
@@ -2223,11 +2558,12 @@ theorem tryUpdate_mr_always_safety {M FState G : Type} [Memory M] [MemoryOps M]
     dsimp only
     change Always (mrCellWP A ptr pty t mRely) _ _ (tryCallK prev (callOut prev (some next))) _
     rw [tryCallK_some]
-    have hrn := (loopInv_rel_next hpre hl hpost).1
+    have hnext_rep : IntType.can_represent t next = true :=
+      hrep s.fst prev f' next hl.2.2.1 hpost hl.1
     refine Always.vis ⟨hm, hinv⟩ fun m₁' hm₁' => ?_
     obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
-    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hrn, fun ret m₂' hcas => ?_⟩
-    obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hrn hcas
+    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+    obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
     have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
     refine ⟨hrel, fun b' => ⟨fun hne => ?_, fun heq => ?_⟩⟩
     · dsimp only
@@ -2276,7 +2612,9 @@ theorem tryUpdate_mr_tb_wfLive_safety {FState G : Type}
     {mRely : MachTB → MachTB → Prop} {MInv : MachTB → Nat → Prop}
     {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
     (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
-    (hadm : MrCellAdmissible A ptr pty t mRely MInv Rel)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
     (hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m → mRely m m' →
       MiniRustSpec.Correspondence.MachTB.wfLive m')
     {m₀ : MachTB} {s₀ : AtomicSt Nat FState G}
@@ -2289,7 +2627,7 @@ theorem tryUpdate_mr_tb_wfLive_safety {FState G : Type}
         CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
       (tryUpdateLoop Nat) (m₀, s₀) := by
   let hadm' : MrCellAdmissible A ptr pty t mRely
-      (fun m c => MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m) Rel :=
+      (fun m c => MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m) :=
     { rely_refl := fun m c hm => hadm.rely_refl m c hm.1
       rely_pres := fun m c m' hm hrel =>
         let ⟨c', hc', hm'⟩ := hadm.rely_pres m c m' hm.1 hrel
@@ -2303,9 +2641,95 @@ theorem tryUpdate_mr_tb_wfLive_safety {FState G : Type}
         let ⟨hret, hs, hk⟩ := hadm.cas_val m c e d ret m' hm.1 hr hok
         let hwf := evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1
         ⟨hret, fun he => ⟨hs he, hwf⟩, fun hne => ⟨hk hne, hwf⟩⟩ }
-  have h := tryUpdate_mr_always_safety hpre hadm' ⟨hm₀, hwf₀⟩ hs₀
+  have h := tryUpdate_mr_always_safety hpre hrep hadm' ⟨hm₀, hwf₀⟩ hs₀
   exact Always.mono (fun _ hi => ⟨⟨hi.1.1, hi.1.2⟩, hi.2⟩)
     (fun _ _ hq => ⟨⟨hq.1.1, hq.1.2⟩, hq.2⟩) h
+
+/--
+**General non-vacuity of `mrCellWP`**: for ANY memory model `M`, ANY
+`Realizable A`, and ANY coupled `MrCellAdmissible` invariant, `mrCellWP` cannot
+discharge `DWP … False` from any admissible state (`MInv m₀ s₀.cell`) — every
+operation has a live successor keeping `MInv`.
+-/
+theorem mrCellWP_nonvacuous_not_false {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    ¬ DWP (mrCellWP A ptr pty t mRely) (tryUpdateLoop Nat) (fun _ _ => False) (m₀, s₀) := by
+  intro hd
+  have hsafe := tryUpdate_mr_always_safety hpre hrep hadm hm₀ hs₀
+  refine DWP.induct (fun x ms =>
+      Always (mrCellWP A ptr pty t mRely)
+        (fun ms' => MInv ms'.1 ms'.2.cell ∧ HistInvSt A Rel init f₀ ms'.2)
+        (fun r ms' => MInv ms'.1 ms'.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms'.2)
+        x ms → False) ?_ hd hsafe
+  intro x ms hx ha
+  have hm : MInv ms.1 ms.2.cell := ha.inv.1
+  cases hobs : x.observe with
+  | ret r => rw [hobs] at hx; exact hx
+  | tau x' =>
+    rw [hobs] at hx
+    rw [Always.unfold_eq, hobs] at ha
+    exact hx ha.2
+  | vis i k =>
+    rw [hobs] at hx
+    rw [Always.unfold_eq, hobs] at ha
+    have ha' := ha.2
+    cases i with
+    | call req =>
+      cases req with
+      | load =>
+        have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+        obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+        exact ((hx ms.1 hrf).2 v m₂ hok).2 0 (((ha' ms.1 hrf).2 v m₂ hok).2 0)
+      | cas e d =>
+        have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+        obtain ⟨ret, m₂, hok⟩ := (ha' ms.1 hrf).1
+        have hstepD := ((hx ms.1 hrf).2 ret m₂ hok).2 0
+        have hstepA := ((ha' ms.1 hrf).2 ret m₂ hok).2 0
+        by_cases he : ret.toNat = e
+        · obtain ⟨_, hgp, hcont⟩ := (hstepD.2 he).1
+          obtain ⟨g', hg'⟩ := hR.gc_post_total _ _ _ hgp
+          exact hcont g' hg' ((hstepA.2 he).1.2.2 g' hg')
+        · exact hstepD.1 he (hstepA.1 he)
+      | callF arg =>
+        obtain ⟨f', r, hpost⟩ := hR.post_mut_total _ _ hx.1
+        exact hx.2 f' r hpost (ha'.2 f' r hpost)
+      | dropF =>
+        have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+        obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+        exact ((hx ms.1 hrf).2 v m₂ hok).2 0 (hR.resolve_total _)
+          (((ha' ms.1 hrf).2 v m₂ hok).2 0 (hR.resolve_total _))
+      | recv =>
+        exact hx 0 (ha' 0)
+
+/--
+**Fail-closed width-representability boundary**: on any machine where `load`
+reads `c`, an out-of-range `desired` (`IntType.can_represent t d = false`, e.g.
+`d = 256` on `u8` even though `c ≤ d`) causes MiniRust `AtomicCompareExchange`
+to emit `Stop.specPanic`, refuting `∃ ret m', mrCasOk …`. This is why
+`MrCellAdmissible.cas_ok` must require `IntType.can_represent t d = true`
+rather than an unbounded `Rel e d`.
+-/
+theorem mr_cas_out_of_range_specPanic_canary {M : Type} [Memory M] [MemoryOps M]
+    {m m₁ : Machine M} {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»}
+    {t : IntType} {al : Align} {c d : Nat}
+    (hal : alignFromBytes t.size.bytes = some al)
+    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hload : typedLoadM m ptr (.Int t) al .Atomic = .ok (.Int c, m₁))
+    (hout : IntType.can_represent t d = false) :
+    ¬ ∃ ret m', mrCasOk m ptr pty t c d ret m' := by
+  rintro ⟨ret, m', hok, _⟩
+  have hsp := atomicCompareExchange_next_out_of_range_specPanic pty hal hsz hload hout
+  rw [hsp] at hok; cases hok
 
 /--
 Generic fail-closed helper for `mrCellWP`: if `load` returns `v` (advancing
@@ -2456,6 +2880,395 @@ theorem mrCellWP_tb_ticket_nonvacuous (s₀ : AtomicSt Nat PUnit PUnit) :
   simp only [tryCasK_true, retAfterDrop, vis_bind] at h4
   have h5 := (((DWP.vis_iff _ _ _ _ _).1 h4 m2 (rfl : m2 = m2)).2 6 m3 hz).2 0 trivial
   simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h5
+
+/-! #### Positive universal symbolic `MrCellAdmissible` instances (`Mach` & `MachTB`) -/
+
+private abbrev mrALoad1 : Access := MiniRustSpec.AtomicIntrinsicsMR.aLoad 1
+private abbrev mrAStore1 : Access := MiniRustSpec.AtomicIntrinsicsMR.aStore 1
+
+/-- A `Mach` (`BasicMemory<x86_64>`) holding `u8` byte `b` with arbitrary access log `acc`. -/
+def bmU8Mach (b : UInt8) (acc : List Access) : Mach :=
+  bmMach [bmCell (.Init b none :: uninitBytes 7)] acc
+
+/--
+A `MachTB` (`TreeBorrowsMemory<x86_64>`) holding `u8` byte `b` with arbitrary access log `acc`.
+-/
+def tbU8Mach (b : UInt8) (acc : List Access) : MachTB :=
+  let m0 := tbWith [.Init b none]
+  { m0 with mem := { m0.mem with accesses := acc } }
+
+theorem u8_inBounds (b : UInt8) : inBounds (b.toNat : Int) .Unsigned ⟨1⟩ = true := by
+  have hb : b.toNat < 256 := b.toNat_lt
+  simp [inBounds, Size.bits]; omega
+
+theorem u8_can_represent_iff (n : Nat) :
+    IntType.can_represent itU8 (n : Int) = true ↔ n < 256 := by
+  simp [IntType.can_represent, inBounds, Size.bits]; omega
+
+theorem u8_encodeM {M : Type} [Memory M] (d : UInt8) :
+    Type.encodeM (M := M) (.Int itU8) (.Int d.toNat) = .ok [.Init d none] := by
+  have hrep := u8_inBounds d
+  have hd : d.toNat < 256 := d.toNat_lt
+  simp only [Type.encodeM, Type.encodeIntM, Endianness.encode, x86_64.ENDIANNESS,
+    hrep, ↓reduceIte, pure, Except.pure, leBytes, Size.bits]
+  have hbyte : UInt8.ofNat (((d.toNat : Int) % 2 ^ (1 * 8)).toNat % 256) = d := by
+    have hm : ((d.toNat : Int) % 2 ^ (1 * 8)).toNat % 256 = d.toNat := by omega
+    rw [hm]; exact UInt8.ofNat_toNat
+  simp only [List.map, hbyte]
+
+theorem u8_decodeM {M : Type} [Memory M] [MemoryOps M] (b : UInt8) :
+    Type.decodeM (M := M) (.Int itU8) [.Init b none] = .ok (some (.Int b.toNat)) := by
+  simp [Type.decodeM, Type.decodeIntM, Endianness.decode, x86_64.ENDIANNESS,
+    AbstractByte.dataM, leValue, pure, Except.pure]
+
+theorem u8_layout : Type.layout (.Int itU8) = .ok (.Sized ⟨1⟩ ⟨1⟩) := rfl
+
+/-- Symbolic MiniRust `typedLoadM` on `bmU8Mach b acc` for arbitrary `b : UInt8` and `acc`. -/
+theorem bmU8_typedLoad (b : UInt8) (acc : List Access) :
+    typedLoadM (M := BM) (bmU8Mach b acc) bmPtr (.Int itU8) ⟨1⟩ .Atomic =
+      .ok (.Int b.toNat, bmU8Mach b (acc ++ [mrALoad1])) := by
+  have hmem : MemoryOps.load (M := BM) (bmU8Mach b acc).mem.memory bmPtr ⟨1⟩ ⟨1⟩ =
+      .ok ([.Init b none], (bmU8Mach b acc).mem.memory) := rfl
+  unfold typedLoadM ConcurrentMemory.load
+  rw [u8_layout, interp_ok_bind]
+  change (pure (⟨1⟩ : Size) >>= fun size => _) = _
+  rw [interp_pure_bind, hmem, interp_ok_bind, interp_pure_bind]
+  dsimp only
+  rw [u8_decodeM b, interp_ok_bind]
+  simp only [checkValueM, IntType.can_represent, u8_inBounds b, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, interp_pure_bind]
+  rfl
+
+/-- Symbolic MiniRust `typedStoreM` on `bmU8Mach b acc` for arbitrary `b d : UInt8` and `acc`. -/
+theorem bmU8_typedStore (b d : UInt8) (acc : List Access) :
+    typedStoreM (M := BM) (bmU8Mach b acc) bmPtr (.Int d.toNat) (.Int itU8) ⟨1⟩ .Atomic =
+      .ok (bmU8Mach d (acc ++ [mrAStore1])) := by
+  have hmem : MemoryOps.store (M := BM) (bmU8Mach b acc).mem.memory bmPtr [.Init d none] ⟨1⟩ =
+      .ok (bmU8Mach d acc).mem.memory := rfl
+  unfold typedStoreM ConcurrentMemory.store
+  simp only [checkValueM, IntType.can_represent, u8_inBounds d, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Except.pure,
+    u8_encodeM d, interp_ok_bind]
+  rw [hmem, interp_ok_bind, interp_ok_bind]
+  rfl
+
+/-- Symbolic MiniRust `typedLoadM` on `tbU8Mach b acc` for arbitrary `b : UInt8` and `acc`. -/
+theorem tbU8_typedLoad (b : UInt8) (acc : List Access) :
+    typedLoadM (M := TBM) (tbU8Mach b acc) tbPtr (.Int itU8) ⟨1⟩ .Atomic =
+      .ok (.Int b.toNat, tbU8Mach b (acc ++ [mrALoad1])) := by
+  have hmem : MemoryOps.load (M := TBM) (tbU8Mach b acc).mem.memory tbPtr ⟨1⟩ ⟨1⟩ =
+      .ok ([.Init b none], (tbU8Mach b acc).mem.memory) := rfl
+  unfold typedLoadM ConcurrentMemory.load
+  rw [u8_layout, interp_ok_bind]
+  change (pure (⟨1⟩ : Size) >>= fun size => _) = _
+  rw [interp_pure_bind, hmem, interp_ok_bind, interp_pure_bind]
+  dsimp only
+  rw [u8_decodeM b, interp_ok_bind]
+  simp only [checkValueM, IntType.can_represent, u8_inBounds b, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, interp_pure_bind]
+  rfl
+
+/-- Symbolic MiniRust `typedStoreM` on `tbU8Mach b acc` for arbitrary `b d : UInt8` and `acc`. -/
+theorem tbU8_typedStore (b d : UInt8) (acc : List Access) :
+    typedStoreM (M := TBM) (tbU8Mach b acc) tbPtr (.Int d.toNat) (.Int itU8) ⟨1⟩ .Atomic =
+      .ok (tbU8Mach d (acc ++ [mrAStore1])) := by
+  have hmem : MemoryOps.store (M := TBM) (tbU8Mach b acc).mem.memory tbPtr [.Init d none] ⟨1⟩ =
+      .ok (tbU8Mach d acc).mem.memory := rfl
+  unfold typedStoreM ConcurrentMemory.store
+  simp only [checkValueM, IntType.can_represent, u8_inBounds d, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Except.pure,
+    u8_encodeM d, interp_ok_bind]
+  rw [hmem, interp_ok_bind, interp_ok_bind]
+  rfl
+
+/-- Every `tbU8Mach b acc` is `MachTB.wfLive` (derived via `evalIntrinsicM_atomic_tb_wfLive`). -/
+theorem tbU8_wfLive (b : UInt8) (acc : List Access) :
+    MiniRustSpec.Correspondence.MachTB.wfLive (tbU8Mach b acc) := by
+  have h0 : MiniRustSpec.Correspondence.MachTB.wfLive (tbWith []) :=
+    ep1_minirust_atomic_intrinsics_capstone.2.1.2
+  have hmem : MemoryOps.store (M := TBM) (tbWith []).mem.memory tbPtr [.Init b none] ⟨1⟩ =
+      .ok (tbU8Mach b []).mem.memory := rfl
+  have hst : evalIntrinsicM (M := TBM) (tbWith []) .AtomicStore
+      [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int b.toNat, .Int itU8)] unitType =
+      .ok (unitValueM, tbU8Mach b [mrAStore1]) := by
+    rw [atomicStore_eq_typedStoreM (tbWith []) tbPtr tyRawPtr (.Int b.toNat) (.Int itU8)
+      u8_layout rfl (by decide)]
+    unfold typedStoreM ConcurrentMemory.store
+    simp only [checkValueM, IntType.can_represent, u8_inBounds b, ensureElseUb,
+      Bool.not_true, Bool.false_eq_true, ↓reduceIte, pure, Except.pure,
+      u8_encodeM b, interp_ok_bind, Int.toNat_natCast]
+    rw [hmem, interp_ok_bind, interp_ok_bind, interp_ok_bind]
+    rfl
+  change MiniRustSpec.Correspondence.MachTB.wfLive (tbU8Mach b [mrAStore1])
+  exact evalIntrinsicM_atomic_tb_wfLive rfl h0 hst
+
+/-- Coupled invariant on `Mach`: the heap cell holds `u8` byte `c` (arbitrary access log). -/
+def bmU8MInv (m : Mach) (c : Nat) : Prop :=
+  ∃ (b : UInt8) (acc : List Access), b.toNat = c ∧ m = bmU8Mach b acc
+
+/-- Coupled invariant on `MachTB`: the Tree Borrows cell holds `u8` byte `c` (arbitrary log). -/
+def tbU8MInv (m : MachTB) (c : Nat) : Prop :=
+  ∃ (b : UInt8) (acc : List Access), b.toNat = c ∧ m = tbU8Mach b acc
+
+/-- Concurrent machine rely on `Mach`: other threads advance the `u8` byte along `rely`. -/
+def bmU8MRely (rely : Nat → Nat → Prop) (m m' : Mach) : Prop :=
+  ∃ (b b' : UInt8) (acc acc' : List Access),
+    rely b.toNat b'.toNat ∧ m = bmU8Mach b acc ∧ m' = bmU8Mach b' acc'
+
+/-- Concurrent machine rely on `MachTB`: other threads advance the `u8` byte along `rely`. -/
+def tbU8MRely (rely : Nat → Nat → Prop) (m m' : MachTB) : Prop :=
+  ∃ (b b' : UInt8) (acc acc' : List Access),
+    rely b.toNat b'.toNat ∧ m = tbU8Mach b acc ∧ m' = tbU8Mach b' acc'
+
+private theorem bmU8Mach_byte_inj {b₁ b₂ : UInt8} {acc₁ acc₂ : List Access}
+    (h : bmU8Mach b₁ acc₁ = bmU8Mach b₂ acc₂) : b₁ = b₂ := by
+  have h1 := congrArg (fun m => m.mem.memory.allocations) h
+  dsimp [bmU8Mach, bmMach, bmCell] at h1
+  have h2 := congrArg (fun a => a.data) (List.cons.inj h1).1
+  exact (AbstractByte.Init.inj (List.cons.inj h2).1).1
+
+private theorem tbU8Mach_byte_inj {b₁ b₂ : UInt8} {acc₁ acc₂ : List Access}
+    (h : tbU8Mach b₁ acc₁ = tbU8Mach b₂ acc₂) : b₁ = b₂ := by
+  have h1 := congrArg (fun m => m.mem.memory.mem.allocations) h
+  dsimp [tbU8Mach, tbWith, tbMach, tbCell] at h1
+  have h2 := congrArg (fun a => a.data) (List.cons.inj h1).1
+  exact (AbstractByte.Init.inj (List.cons.inj h2).1).1
+
+private theorem nat_to_u8_of_rep {d : Nat} (hd : IntType.can_represent itU8 (d : Int) = true) :
+    ∃ db : UInt8, db.toNat = d := by
+  have hlt : d < 256 := (u8_can_represent_iff d).1 hd
+  exact ⟨UInt8.ofNat d, by simp [Nat.mod_eq_of_lt hlt]⟩
+
+/--
+**Positive universal `MrCellAdmissible` on `Mach` (`BasicMemory<x86_64>`)**:
+holds for EVERY `AtomicEnv` with reflexive `A.rely`, arbitrary `u8` cell values
+`0..255`, arbitrary access logs `acc`, and arbitrary `A.rely`-respecting
+concurrent interference `bmU8MRely A.rely`.
+-/
+theorem bmU8_mrCellAdmissible {FState G : Type} (A : AtomicEnv Nat FState G)
+    (hrefl : ∀ v, A.rely v v) :
+    MrCellAdmissible A bmPtr tyRawPtr itU8 (bmU8MRely A.rely) bmU8MInv where
+  rely_refl m c hm := by
+    obtain ⟨b, acc, _, rfl⟩ := hm
+    exact ⟨b, b, acc, acc, hrefl _, rfl, rfl⟩
+  rely_pres m c m' hm hr := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨b₁, b', acc₁, acc', hrel, heq, rfl⟩ := hr
+    have hb : b = b₁ := bmU8Mach_byte_inj heq
+    subst hb
+    exact ⟨b'.toNat, hrel, b', acc', rfl, rfl⟩
+  load_ok m c hm := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    refine ⟨b.toNat, bmU8Mach b (acc ++ [mrALoad1]), ?_, Int.natCast_nonneg _⟩
+    rw [atomicLoad_eq_typedLoadM (bmU8Mach b acc) bmPtr tyRawPtr (.Int itU8) u8_layout rfl
+      (by decide)]
+    exact bmU8_typedLoad b acc
+  load_val m c v m' hm hok := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨hok1, _⟩ := hok
+    have hL : evalIntrinsicM (M := BM) (bmU8Mach b acc) .AtomicLoad
+        [(.Ptr ⟨bmPtr, none⟩, tyRawPtr)] (.Int itU8) =
+        .ok (.Int b.toNat, bmU8Mach b (acc ++ [mrALoad1])) := by
+      rw [atomicLoad_eq_typedLoadM (bmU8Mach b acc) bmPtr tyRawPtr (.Int itU8) u8_layout rfl
+        (by decide)]
+      exact bmU8_typedLoad b acc
+    rw [hL] at hok1
+    obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+    cases hv
+    exact ⟨Int.toNat_natCast _, b, acc ++ [mrALoad1], rfl, rfl⟩
+  cas_ok m c e d hm hd := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨db, hdb⟩ := nat_to_u8_of_rep hd
+    by_cases he : b.toNat = e
+    · refine ⟨b.toNat, bmU8Mach db ((acc ++ [mrALoad1]) ++ [mrAStore1]), ?_,
+        Int.natCast_nonneg _⟩
+      have hst := bmU8_typedStore b db (acc ++ [mrALoad1])
+      rw [hdb] at hst
+      rw [← he]
+      exact atomicCompareExchange_success tyRawPtr (al := ⟨1⟩) rfl (by decide)
+        (bmU8_typedLoad b acc) hst
+    · refine ⟨b.toNat, bmU8Mach b (acc ++ [mrALoad1]), ?_, Int.natCast_nonneg _⟩
+      refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨1⟩) rfl (by decide)
+        (bmU8_typedLoad b acc) ?_
+      intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+  cas_val m c e d ret m' hm hd hok := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨db, hdb⟩ := nat_to_u8_of_rep hd
+    obtain ⟨hok1, _⟩ := hok
+    by_cases he : b.toNat = e
+    · have hst := bmU8_typedStore b db (acc ++ [mrALoad1])
+      rw [hdb] at hst
+      have hC : evalIntrinsicM (M := BM) (bmU8Mach b acc) .AtomicCompareExchange
+          [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int e, .Int itU8), (.Int d, .Int itU8)] (.Int itU8) =
+          .ok (.Int b.toNat, bmU8Mach db ((acc ++ [mrALoad1]) ++ [mrAStore1])) := by
+        rw [← he]
+        exact atomicCompareExchange_success tyRawPtr (al := ⟨1⟩) rfl (by decide)
+          (bmU8_typedLoad b acc) hst
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun _ => ⟨db, (acc ++ [mrALoad1]) ++ [mrAStore1], hdb, rfl⟩,
+        fun hne => absurd he hne⟩
+    · have hC : evalIntrinsicM (M := BM) (bmU8Mach b acc) .AtomicCompareExchange
+          [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int e, .Int itU8), (.Int d, .Int itU8)] (.Int itU8) =
+          .ok (.Int b.toNat, bmU8Mach b (acc ++ [mrALoad1])) := by
+        refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨1⟩) rfl (by decide)
+          (bmU8_typedLoad b acc) ?_
+        intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun hEq => absurd hEq he,
+        fun _ => ⟨b, acc ++ [mrALoad1], rfl, rfl⟩⟩
+
+/--
+**Positive universal `MrCellAdmissible` on `MachTB` (`TreeBorrowsMemory<x86_64>`)**:
+holds for EVERY `AtomicEnv` with reflexive `A.rely`, arbitrary `u8` cell values
+`0..255`, arbitrary access logs `acc`, and arbitrary `A.rely`-respecting
+concurrent interference `tbU8MRely A.rely`, with `tbU8_wfLive` supplying
+`MachTB.wfLive` at every configuration.
+-/
+theorem tbU8_mrCellAdmissible {FState G : Type} (A : AtomicEnv Nat FState G)
+    (hrefl : ∀ v, A.rely v v) :
+    MrCellAdmissible A tbPtr tyRawPtr itU8 (tbU8MRely A.rely) tbU8MInv where
+  rely_refl m c hm := by
+    obtain ⟨b, acc, _, rfl⟩ := hm
+    exact ⟨b, b, acc, acc, hrefl _, rfl, rfl⟩
+  rely_pres m c m' hm hr := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨b₁, b', acc₁, acc', hrel, heq, rfl⟩ := hr
+    have hb : b = b₁ := tbU8Mach_byte_inj heq
+    subst hb
+    exact ⟨b'.toNat, hrel, b', acc', rfl, rfl⟩
+  load_ok m c hm := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    refine ⟨b.toNat, tbU8Mach b (acc ++ [mrALoad1]), ?_, Int.natCast_nonneg _⟩
+    rw [atomicLoad_eq_typedLoadM (tbU8Mach b acc) tbPtr tyRawPtr (.Int itU8) u8_layout rfl
+      (by decide)]
+    exact tbU8_typedLoad b acc
+  load_val m c v m' hm hok := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨hok1, _⟩ := hok
+    have hL : evalIntrinsicM (M := TBM) (tbU8Mach b acc) .AtomicLoad
+        [(.Ptr ⟨tbPtr, none⟩, tyRawPtr)] (.Int itU8) =
+        .ok (.Int b.toNat, tbU8Mach b (acc ++ [mrALoad1])) := by
+      rw [atomicLoad_eq_typedLoadM (tbU8Mach b acc) tbPtr tyRawPtr (.Int itU8) u8_layout rfl
+        (by decide)]
+      exact tbU8_typedLoad b acc
+    rw [hL] at hok1
+    obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+    cases hv
+    exact ⟨Int.toNat_natCast _, b, acc ++ [mrALoad1], rfl, rfl⟩
+  cas_ok m c e d hm hd := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨db, hdb⟩ := nat_to_u8_of_rep hd
+    by_cases he : b.toNat = e
+    · refine ⟨b.toNat, tbU8Mach db ((acc ++ [mrALoad1]) ++ [mrAStore1]), ?_,
+        Int.natCast_nonneg _⟩
+      have hst := tbU8_typedStore b db (acc ++ [mrALoad1])
+      rw [hdb] at hst
+      rw [← he]
+      exact atomicCompareExchange_success tyRawPtr (al := ⟨1⟩) rfl (by decide)
+        (tbU8_typedLoad b acc) hst
+    · refine ⟨b.toNat, tbU8Mach b (acc ++ [mrALoad1]), ?_, Int.natCast_nonneg _⟩
+      refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨1⟩) rfl (by decide)
+        (tbU8_typedLoad b acc) ?_
+      intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+  cas_val m c e d ret m' hm hd hok := by
+    obtain ⟨b, acc, rfl, rfl⟩ := hm
+    obtain ⟨db, hdb⟩ := nat_to_u8_of_rep hd
+    obtain ⟨hok1, _⟩ := hok
+    by_cases he : b.toNat = e
+    · have hst := tbU8_typedStore b db (acc ++ [mrALoad1])
+      rw [hdb] at hst
+      have hC : evalIntrinsicM (M := TBM) (tbU8Mach b acc) .AtomicCompareExchange
+          [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int e, .Int itU8), (.Int d, .Int itU8)] (.Int itU8) =
+          .ok (.Int b.toNat, tbU8Mach db ((acc ++ [mrALoad1]) ++ [mrAStore1])) := by
+        rw [← he]
+        exact atomicCompareExchange_success tyRawPtr (al := ⟨1⟩) rfl (by decide)
+          (tbU8_typedLoad b acc) hst
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun _ => ⟨db, (acc ++ [mrALoad1]) ++ [mrAStore1], hdb, rfl⟩,
+        fun hne => absurd he hne⟩
+    · have hC : evalIntrinsicM (M := TBM) (tbU8Mach b acc) .AtomicCompareExchange
+          [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int e, .Int itU8), (.Int d, .Int itU8)] (.Int itU8) =
+          .ok (.Int b.toNat, tbU8Mach b (acc ++ [mrALoad1])) := by
+        refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨1⟩) rfl (by decide)
+          (tbU8_typedLoad b acc) ?_
+        intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun hEq => absurd hEq he,
+        fun _ => ⟨b, acc ++ [mrALoad1], rfl, rfl⟩⟩
+
+/--
+**End-to-end positive Tree Borrows `MachTB` witness**: for ANY `Realizable`
+bounded `u8` environment (`hrep`), `tryUpdateLoop` executed directly over
+MiniRust `TreeBorrowsMemory` (`mrCellWP`) under concurrent `tbU8MRely A.rely`
+interference preserves `tbU8MInv ∧ MachTB.wfLive ∧ HistInvSt` at every step,
+satisfies `CreusotPost` upon return, and is provably non-vacuous (`¬ DWP … False`).
+-/
+theorem tryUpdate_mr_tb_u8_safety {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 256)
+    (b₀ : UInt8) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hb₀ : b₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    Always (mrCellWP A tbPtr tyRawPtr itU8 (tbU8MRely A.rely))
+      (fun ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        HistInvSt A Rel init f₀ ms.2)
+      (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+    ¬ DWP (mrCellWP A tbPtr tyRawPtr itU8 (tbU8MRely A.rely))
+      (tryUpdateLoop Nat) (fun _ _ => False) (tbU8Mach b₀ acc₀, s₀) := by
+  have hadm := tbU8_mrCellAdmissible A hR.rely_refl
+  have hrep' : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent itU8 (n : Int) = true :=
+    fun f₂ x f₃ n hf hp hr => (u8_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr)
+  have hm₀ : tbU8MInv (tbU8Mach b₀ acc₀) s₀.cell := ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩
+  have hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m →
+      tbU8MRely A.rely m m' → MiniRustSpec.Correspondence.MachTB.wfLive m' := by
+    rintro m m' _ ⟨_, b', _, acc', _, _, rfl⟩
+    exact tbU8_wfLive b' acc'
+  exact ⟨tryUpdate_mr_tb_wfLive_safety hpre hrep' hadm hrely_wf hm₀ (tbU8_wfLive b₀ acc₀) hs₀,
+    mrCellWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
+
+/--
+**End-to-end positive `BasicMemory` `Mach` witness**: for ANY `Realizable`
+bounded `u8` environment (`hrep`), `tryUpdateLoop` executed directly over
+MiniRust `BasicMemory` (`mrCellWP`) under concurrent `bmU8MRely A.rely`
+interference preserves `bmU8MInv ∧ HistInvSt` at every step, satisfies
+`CreusotPost`, and is provably non-vacuous (`¬ DWP … False`).
+-/
+theorem tryUpdate_mr_bm_u8_safety {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 256)
+    (b₀ : UInt8) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hb₀ : b₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    Always (mrCellWP A bmPtr tyRawPtr itU8 (bmU8MRely A.rely))
+      (fun ms => bmU8MInv ms.1 ms.2.cell ∧ HistInvSt A Rel init f₀ ms.2)
+      (fun r ms => bmU8MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (bmU8Mach b₀ acc₀, s₀) ∧
+    ¬ DWP (mrCellWP A bmPtr tyRawPtr itU8 (bmU8MRely A.rely))
+      (tryUpdateLoop Nat) (fun _ _ => False) (bmU8Mach b₀ acc₀, s₀) := by
+  have hadm := bmU8_mrCellAdmissible A hR.rely_refl
+  have hrep' : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent itU8 (n : Int) = true :=
+    fun f₂ x f₃ n hf hp hr => (u8_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr)
+  have hm₀ : bmU8MInv (bmU8Mach b₀ acc₀) s₀.cell := ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩
+  exact ⟨tryUpdate_mr_always_safety hpre hrep' hadm hm₀ hs₀,
+    mrCellWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
 
 end MrBridge
 
