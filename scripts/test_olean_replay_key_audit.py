@@ -451,6 +451,7 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             "def trace : Array Nat := #[0]\ndef traceIdx : Nat := trace[0]!\n",
             'def f (trace : List (String -> Nat)) (h : 0 < trace.length) : Nat := trace[0] "{"\n',
             'structure S where trace : Array (String -> Nat)\ndef dotTrace (x : S) (i : Fin x.trace.size) : Nat := x.trace[i] "{"\n',
+            'structure S2 where trace : Array (String -> Nat)\ndef escDotTrace («x» : S2) (i : Fin «x».trace.size) : Nat := «x».trace[i] "{"\n',
             'structure G where trace_goal : Array (String -> Nat)\ndef dotTraceGoal (x : G) (i : Fin x.trace_goal.size) : Nat := x.trace_goal[i] "{"\n',
             'def g : String := trace[a b] "{"\n',
             'def numsInHole : String := s!"{1.5} {1e-2} {1e+2} {0x1f} {p.1}"\n',
@@ -517,6 +518,9 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ('def s := Macro.trace[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := Macro.trace[foo /- c -/] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := Lean.Macro.trace[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := «Macro».trace[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ("@[command_code_action] def badCA : Nat := 0", "forbiddenSourceOption"),
+            ("@[combinator_formatter Foo] def badFmt : Nat := 0", "forbiddenSourceOption"),
             ('def s := trace_goal[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := «trace»[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := throwErrorAt stx "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
@@ -703,7 +707,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/ImpAllPub", "module\npublic import Topic.Defs\nimport all Topic.Defs\nnamespace Proof.ImpAllPub\npublic def x : Topic.Defs.PubTag := default\nend Proof.ImpAllPub\n"),
                 (
                     "Topic/A3ModPriv/Defs",
-                    "module\nnamespace Topic.A3ModPriv.Defs\npublic inductive LocalAnchor | mk\npublic abbrev MyAnchor := LocalAnchor\nprivate structure PrivT where x : Nat\nprivate instance : Inhabited PrivT := ⟨⟨0⟩⟩\npublic structure Holder where trace : Array (String -> Nat)\npublic def useDotTrace (h : Holder) (i : Fin h.trace.size) : Nat := h.trace[i] \"{\"\npublic instance instOptAbbr : Inhabited (Option MyAnchor) := ⟨some .mk⟩\npublic instance instSub : Inhabited { x : LocalAnchor // x = x } := ⟨⟨.mk, rfl⟩⟩\npublic instance instFinArr : Inhabited (Fin 8 → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptArr : Inhabited (Option Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instArrArr : Inhabited ((Nat → Bool) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\nend Topic.A3ModPriv.Defs\n",
+                    "module\nnamespace Topic.A3ModPriv.Defs\npublic inductive LocalAnchor | mk\npublic abbrev MyAnchor := LocalAnchor\nprivate structure PrivT where x : Nat\nprivate inductive PrivList | nil | cons (x : Nat) (tl : PrivList)\nprivate instance : Inhabited PrivT := ⟨⟨0⟩⟩\npublic structure Holder where trace : Array (String -> Nat)\npublic def useDotTrace (h : Holder) (i : Fin h.trace.size) : Nat := h.trace[i] \"{\"\npublic inductive Tag {n : Nat} (α : Type) | mk (x : α)\npublic inductive Box (h : True) (α : Type) | mk (x : α)\npublic inductive LocalProp : Prop | mk\npublic instance instTagImpl : Inhabited (@Tag 5 LocalAnchor) := ⟨.mk .mk⟩\npublic instance instBoxProof : Inhabited (Box True.intro LocalAnchor) := ⟨.mk .mk⟩\npublic instance instFinAdd (n : Nat) : Inhabited (Fin (n + 1) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instFinSucc (n : Nat) : Inhabited (Fin (Nat.succ n) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instAndProp : Decidable (And False LocalProp) := isFalse (fun h => h.1)\npublic instance instQuotArr : Inhabited (Quot (fun (_ _ : Nat) => True) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptAbbr : Inhabited (Option MyAnchor) := ⟨some .mk⟩\npublic instance instSub : Inhabited { x : LocalAnchor // x = x } := ⟨⟨.mk, rfl⟩⟩\npublic instance instFinArr : Inhabited (Fin 8 → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptArr : Inhabited (Option Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instArrArr : Inhabited ((Nat → Bool) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\nend Topic.A3ModPriv.Defs\n",
                 ),
             ):
                 s = pkg_pub15 / f"{rel}.lean"
@@ -1464,6 +1468,86 @@ def main (args : List String) : IO UInt32 := do
     (OLeanLevel.server.adjustFileName pdBase, pdPrivMd),
     (OLeanLevel.private.adjustFileName pdBase, pdPrivMd)
   ]
+  -- Pass B4 forged regressions:
+  -- B4-1: `Inhabited (Quot r -> Anchor)` with forged `#[.const Inhabited 1, .arrow, .star]` (`Quot` rigid head!)
+  let qRel := mkLambda `_ .default (mkConst ``Nat) (mkLambda `_ .default (mkConst ``Nat) (mkConst ``True))
+  let quotNat := mkApp2 (mkConst ``Quot [Level.one]) (mkConst ``Nat) qRel
+  let quotArrTy := mkForall `_ .default quotNat (mkConst a2AnchorName)
+  let b4QuotInstName := `Topic.B4QuotStar.Defs.instQuot
+  let b4QuotInst : ConstantInfo := .defnInfo {
+    name := b4QuotInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) quotArrTy,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) quotArrTy (mkLambda `_ .default quotNat (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [b4QuotInstName]
+  }
+  let b4QuotEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.star],
+    val := mkConst b4QuotInstName, priority := 1000, globalName? := some b4QuotInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "b4_quot_star") `Topic.B4QuotStar.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, b4QuotInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, b4QuotInst],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast b4QuotEnt])]
+  }
+  -- B4-2: Module-mode `Proof.B4PrivImpLeak` privately importing `Topic.Defs` (`isExported := false`)
+  --       yet leaking `Topic.Defs.PubTag` in a public `.olean` declaration!
+  let pilMod := `Proof.B4PrivImpLeak
+  let pilThmName := `Proof.B4PrivImpLeak.pubLeak
+  let pilTy := mkForall `_ .default (mkConst `Topic.Defs.PubTag) (mkConst ``True)
+  let pilPrivCi : ConstantInfo := .thmInfo {
+    name := pilThmName, levelParams := [], type := pilTy,
+    value := mkLambda `_ .default (mkConst `Topic.Defs.PubTag) (mkConst ``True.intro),
+    all := [pilThmName]
+  }
+  let pilExpCi : ConstantInfo := .axiomInfo {
+    name := pilThmName, levelParams := [], type := pilTy, isUnsafe := false
+  }
+  let pilImps : Array Import := #[
+    { module := `Init, isExported := true },
+    { module := `Topic.Defs, isExported := false }
+  ]
+  let pilDir := out / "b4_priv_imp_leak" / "Proof"
+  IO.FS.createDirAll pilDir
+  let pilBase := pilDir / "B4PrivImpLeak.olean"
+  saveModuleDataParts pilMod #[
+    (pilBase, { isModule := true, imports := pilImps, constNames := #[pilThmName], constants := #[pilExpCi], extraConstNames := #[], entries := #[] }),
+    (OLeanLevel.server.adjustFileName pilBase, { isModule := true, imports := pilImps, constNames := #[pilThmName], constants := #[pilPrivCi], extraConstNames := #[], entries := #[] }),
+    (OLeanLevel.private.adjustFileName pilBase, { isModule := true, imports := pilImps, constNames := #[pilThmName], constants := #[pilPrivCi], extraConstNames := #[], entries := #[] })
+  ]
+  -- B4-3: Bare `_private.Proof.B4BarePriv.0`, non-zero `_private.Proof.B4NonZeroPriv.7.secret`,
+  --       and cross-module `_private.Specs.Other.0.secret` in `extraConstNames`
+  let barePrivName := Name.num (`_private ++ `Proof.B4BarePriv) 0
+  writeO (out / "b4_bare_priv") `Proof.B4BarePriv {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[barePrivName],
+    constants := #[.thmInfo { name := barePrivName, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [barePrivName] }],
+    extraConstNames := #[], entries := #[]
+  }
+  let nzPrivName := Name.str (Name.num (`_private ++ `Proof.B4NonZeroPriv) 7) "secret"
+  writeO (out / "b4_nz_priv") `Proof.B4NonZeroPriv {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[nzPrivName],
+    constants := #[.thmInfo { name := nzPrivName, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [nzPrivName] }],
+    extraConstNames := #[], entries := #[]
+  }
+  let extraForeignPriv := Name.str (Name.num (`_private ++ `Specs.Other) 0) "secret"
+  writeO (out / "b4_extra_priv") `Proof.B4ExtraPriv {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B4ExtraPriv.ok],
+    constants := #[.thmInfo { name := `Proof.B4ExtraPriv.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B4ExtraPriv.ok] }],
+    extraConstNames := #[extraForeignPriv], entries := #[]
+  }
+  -- B4-4: Unblocked `Lean.PrettyPrinter.formatterAttribute` persistent extension
+  writeO (out / "b4_formatter_ext") `Proof.B4FormatterExt {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B4FormatterExt.ok],
+    constants := #[.thmInfo { name := `Proof.B4FormatterExt.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B4FormatterExt.ok] }],
+    extraConstNames := #[],
+    entries := #[(`Lean.PrettyPrinter.formatterAttribute, #[unsafe unsafeCast ()])]
+  }
   return 0
 """,
                 encoding="utf-8",
@@ -1586,6 +1670,12 @@ def main (args : List String) : IO UInt32 := do
                 ("a3_cross_module_private_prefix_spoof_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A3CrossPriv"], "olean_dirs": [a1_forged / "a3_cross_priv"], "strict_proofs": True}),
                 ("a3_split_brain_public_olean_leaks_private_instance_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A3PubLeakInst.Defs"], "olean_dirs": [a1_forged / "a3_pub_leak_inst"], "module_mode": True, "strict_proofs": True}),
                 ("a3_split_brain_public_olean_dangling_private_type_ref_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A3PubDangle"], "olean_dirs": [a1_forged / "a3_pub_dangle"], "module_mode": True, "strict_proofs": True}),
+                ("b4_forged_quot_arrow_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B4QuotStar.Defs"], "olean_dirs": [a1_forged / "b4_quot_star"], "strict_proofs": True}),
+                ("b4_private_import_leaked_in_public_olean_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4PrivImpLeak"], "olean_dirs": [a1_forged / "b4_priv_imp_leak", pkg_pub15], "module_mode": True, "strict_proofs": True}),
+                ("b4_bare_private_prefix_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4BarePriv"], "olean_dirs": [a1_forged / "b4_bare_priv"], "strict_proofs": True}),
+                ("b4_nonzero_private_prefix_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4NonZeroPriv"], "olean_dirs": [a1_forged / "b4_nz_priv"], "strict_proofs": True}),
+                ("b4_cross_module_private_extra_const_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4ExtraPriv"], "olean_dirs": [a1_forged / "b4_extra_priv"], "strict_proofs": True}),
+                ("b4_formatter_ext_rejected", False, "forbiddenMacroOrElab", {"target_modules": ["Proof.B4FormatterExt"], "olean_dirs": [a1_forged / "b4_formatter_ext"], "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),

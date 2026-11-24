@@ -556,6 +556,10 @@ EXT_HOOK_TOKENS: tuple[str, ...] = (
     "sym_discharger",
     "run_parser_attribute_hooks",
     "run_builtin_parser_attribute_hooks",
+    "command_code_action",
+    "hole_code_action",
+    "combinator_formatter",
+    "combinator_parenthesizer",
     "throwErrorAt",
     "throwNamedError",
     "throwNamedErrorAt",
@@ -684,7 +688,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             if prev == "ident":
                 qual_prefix = prev_qual + prev_ident + "."
             elif prev == "escIdent":
-                qual_prefix = prev_qual + "«»."
+                qual_prefix = prev_qual + prev_ident + "."
             else:
                 qual_prefix = "."
             if trace_bracket_depth > 0:
@@ -1904,14 +1908,75 @@ def sameStoredDecl (a b : ConstantInfo) : Bool :=
       r1.ctor == r2.ctor && r1.nfields == r2.nfields && r1.rhs == r2.rhs
   | _, _ => false
 
-def hasPrivateModPrefix (pfx : Name) : Name → Bool
-  | .anonymous => false
-  | .num p _   => p == pfx || hasPrivateModPrefix pfx p
-  | .str p _   => hasPrivateModPrefix pfx p
+def rootPrivatePrefix? : Name → Option Name
+  | .anonymous => none
+  | n@(.num p i) =>
+    match rootPrivatePrefix? p with
+    | some r => some r
+    | none => if i == 0 && Lean.isPrivatePrefix n then some n else none
+  | .str p _ => rootPrivatePrefix? p
 
 def hasValidPrivateOwner (modName : Name) (n : Name) : Bool :=
   if !isPrivateName n then true
-  else hasPrivateModPrefix (`_private ++ modName) n
+  else
+    let expectedPfx := Name.num (`_private ++ modName) 0
+    match Lean.privateToUserName? n, rootPrivatePrefix? n with
+    | some u, some rootPfx => !u.isAnonymous && n != expectedPfx && rootPfx == expectedPfx
+    | _, _ => false
+
+def namePartsRaw : Name → List (Sum String Nat)
+  | .anonymous => []
+  | .str p s   => namePartsRaw p ++ [.inl s]
+  | .num p i   => namePartsRaw p ++ [.inr i]
+
+def reconstructNameRaw (cs : List (Sum String Nat)) : Name :=
+  cs.foldl (fun acc c => match c with | .inl s => .str acc s | .inr i => .num acc i) .anonymous
+
+def isSpecComponent (s : String) : Bool :=
+  if s.startsWith "spec_" then
+    let rest := s.toList.drop 5
+    !rest.isEmpty && rest.all Char.isDigit
+  else if s.startsWith "_spec_" then
+    let rest := s.toList.drop 6
+    !rest.isEmpty && rest.all Char.isDigit
+  else false
+
+/-- Validates `extraConstNames` private ownership: permits module-owned private aux decls and
+    genuine Lean LCNF specializations `<privateCallee>._at_.<caller>.spec_<N>[...]` whose root
+    private prefix is well-formed and whose innermost caller after the last `_at_` is not a
+    foreign private decl. Rejects bare/non-zero private prefixes and foreign private names. -/
+def hasValidExtraPrivateOwner (modName : Name) (n : Name) : Bool :=
+  if !isPrivateName n then true
+  else if hasValidPrivateOwner modName n then true
+  else
+    match Lean.privateToUserName? n, rootPrivatePrefix? n with
+    | some u, some rootPfx =>
+      if u.isAnonymous || n == rootPfx then false
+      else
+        let cs := (namePartsRaw n).toArray
+        Id.run do
+          let mut lastAt? : Option Nat := none
+          let mut i : Nat := 0
+          while i < cs.size do
+            if cs[i]? == some (Sum.inl "_at_") then
+              lastAt? := some i
+            i := i + 1
+          let some lastAt := lastAt? | return false
+          let mut specIdx? : Option Nat := none
+          let mut j : Nat := lastAt + 1
+          while j < cs.size do
+            match cs[j]? with
+            | some (Sum.inl s) =>
+              if isSpecComponent s then
+                specIdx? := some j
+                break
+            | _ => pure ()
+            j := j + 1
+          let some specIdx := specIdx? | return false
+          if specIdx <= lastAt + 1 then return false
+          let callerName := reconstructNameRaw (cs.extract (lastAt + 1) specIdx).toList
+          return isWellFormedName callerName && hasValidPrivateOwner modName callerName
+    | _, _ => false
 
 def verifyPartKeysOnly (modName : Name) (data : ModuleData) : IO Unit := do
   unless data.constNames.size == data.constants.size do
@@ -2061,6 +2126,9 @@ def verifyModuleInventory (modName : Name) (data : ModuleData)
   for e in data.extraConstNames do
     unless isWellFormedName e do
       policyFail "anonymousConstantName" modName #[modName] "malformed extraConstNames entry"
+    unless hasValidExtraPrivateOwner modName e do
+      policyFail "keyNameMismatch" modName #[modName, e]
+        s!"private extraConstName {e} does not belong to module {modName}"
     if seenExtra.contains e then
       policyFail "duplicateConstName" modName #[modName, e] s!"duplicate extraConstName {e}"
     seenExtra := seenExtra.insert e
@@ -2275,7 +2343,8 @@ def isBaseInstanceAnchor (localReplayable : NameSet) (localReducibilityOverridde
 
 def isRigidHeadInEnv (env : Environment) (c : Name) : Bool :=
   match env.checked.get.find? c with
-  | some (.inductInfo _) | some (.ctorInfo _) | some (.opaqueInfo _) | some (.axiomInfo _) => true
+  | some (.inductInfo _) | some (.ctorInfo _) | some (.opaqueInfo _)
+  | some (.axiomInfo _) | some (.quotInfo _) => true
   | _ => false
 
 def isLocalNonReducibleDef (localReplayable localRedOver : NameSet)
@@ -2285,7 +2354,8 @@ def isLocalNonReducibleDef (localReplayable localRedOver : NameSet)
   | some (.defnInfo dv) => dv.hints != .abbrev
   | _ => false
 
-def isNonReducibleDefInEnv (env : Environment) (c : Name) : Bool :=
+def isNonReducibleDefInEnv (env : Environment) (localRedOver : NameSet) (c : Name) : Bool :=
+  !localRedOver.contains c &&
   match env.checked.get.find? c with
   | some (.defnInfo dv) => dv.hints != .abbrev
   | _ => false
@@ -2306,33 +2376,95 @@ partial def evalDiscrNatLit? (e : Expr) : Option Nat :=
         none
   | _ => none
 
+def isDiscrOffsetExpr (e : Expr) : Bool :=
+  let c := e.consumeMData
+  let fn := c.getAppFn.consumeMData
+  let args := c.getAppArgs
+  match fn with
+  | .const fName _ =>
+    if fName == ``Nat.succ && args.size == 1 then true
+    else if fName == ``Nat.add && args.size == 2 then (evalDiscrNatLit? args[1]!).isSome
+    else if fName == ``Add.add && args.size == 4 then
+      args[0]!.consumeMData.isConstOf ``Nat && (evalDiscrNatLit? args[3]!).isSome
+    else if fName == ``HAdd.hAdd && args.size == 6 then
+      args[1]!.consumeMData.isConstOf ``Nat && (evalDiscrNatLit? args[5]!).isSome
+    else false
+  | _ => false
+
+def isSortDomain (env : Environment) (dom : Expr) : Bool :=
+  match whnfKeepParamWrappers env 64 dom with
+  | none => false
+  | some dWhnf =>
+    let d := dWhnf.consumeMData
+    match d with
+    | .sort _ => true
+    | _ =>
+      let fn := d.getAppFn.consumeMData
+      let args := d.getAppArgs
+      if (fn.isConstOf ``outParam || fn.isConstOf ``semiOutParam) && args.size == 1 then
+        match whnfKeepParamWrappers env 64 args[0]! with
+        | some inner => inner.consumeMData.isSort
+        | none => false
+      else false
+
+/-- Returns `true` iff `e` itself has sort `Prop` (`e : Prop`), so values `a : e` are proofs
+    ignored by Lean 4.34.1 `DiscrTree.ignoreArg`. Returns `false` for `e == Prop` (`.sort .zero`),
+    whose inhabitants are propositions (`False`, `And`, `Not`) that ARE indexed! -/
+partial def exprIsPropType (env : Environment) (fuel : Nat) (e : Expr) : Bool :=
+  match fuel with
+  | 0 => false
+  | fuel' + 1 =>
+    match whnfKeepParamWrappers env 64 e with
+    | none => false
+    | some ew =>
+      let ew := ew.consumeMData
+      match ew with
+      | .forallE _ _ b _ => exprIsPropType env fuel' b
+      | .sort _ => false
+      | _ =>
+        let fn := ew.getAppFn.consumeMData
+        let args := ew.getAppArgs
+        match fn with
+        | .const hd lvls =>
+          if (hd == ``outParam || hd == ``semiOutParam) && args.size == 1 then
+            exprIsPropType env fuel' args[0]!
+          else
+            match env.checked.get.find? hd with
+            | some ci =>
+              if ci.levelParams.length != lvls.length then false
+              else Id.run do
+                let mut ty := ci.type.instantiateLevelParams ci.levelParams lvls
+                for a in args do
+                  match whnfKeepParamWrappers env 64 ty with
+                  | some (.forallE _ _ b _) => ty := b.instantiate1 a
+                  | _ => return false
+                match whnfKeepParamWrappers env 64 ty with
+                | some res => res.consumeMData == .sort .zero
+                | none => false
+            | none => false
+        | _ => false
+
 def paramAllowsStarMask (env : Environment) (c : Name) (lvls : List Level)
     (args : Array Expr) : Array Bool := Id.run do
   let some ci := env.checked.get.find? c
-    | return Array.replicate args.size true
+    | return Array.replicate args.size false
   if ci.levelParams.length != lvls.length then
-    return Array.replicate args.size true
+    return Array.replicate args.size false
   let mut curTy := ci.type.instantiateLevelParams ci.levelParams lvls
   let mut mask : Array Bool := #[]
   for i in [:args.size] do
     match whnfKeepParamWrappers env 64 curTy with
-    | none => mask := mask.push true
+    | none => mask := mask.push false
     | some (.forallE _ dom body bi) =>
       let isInst := bi == .instImplicit
       let isNoSpec := (Lean.annotation? `nospecialize dom).isSome
-      let isPropDom := match whnfKeepParamWrappers env 64 dom with
-        | some dWhnf =>
-          match dWhnf.consumeMData with
-          | .sort .zero => true
-          | _ =>
-            if dWhnf.getAppFn.consumeMData.isConstOf ``outParam && dWhnf.getAppNumArgs == 1 then
-              dWhnf.getAppArgs[0]!.consumeMData == .sort .zero
-            else false
-        | none => false
-      mask := mask.push (isInst || isNoSpec || isPropDom)
+      let isImplicitNonType :=
+        (bi == .implicit || bi == .strictImplicit) && !isSortDomain env dom
+      let isProofParam := exprIsPropType env 16 dom
+      mask := mask.push (isInst || isNoSpec || isImplicitNonType || isProofParam)
       curTy := body.instantiate1 args[i]!
     | some _ =>
-      mask := mask.push true
+      mask := mask.push false
   return mask
 
 partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver : NameSet)
@@ -2361,10 +2493,11 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
 
 /-- Recursively verifies a non-anchor `DiscrTree.Key` subtree (such as the domain `d` of `d → b`
     when the local anchor sits in `b`, or sibling arguments `Nat` in `Prod Nat LocalAnchor` /
-    `HAdd Nat LocalAnchor LocalAnchor`). Rejects forged `.star` wildcards on rigid closed
-    subterms (`Option Nat → LocalAnchor`, `(Nat → Bool) → LocalAnchor`, `Prod Nat LocalAnchor`),
-    while preserving `Fin 8` `OfNat` literals, semireducible definitions, `[Inst]`/proof args,
-    polymorphic `.bvar`s, and `no_index`. Note `normD` is already deeply normalized by `normExprInEnv`. -/
+    `HAdd Nat LocalAnchor LocalAnchor`). Faithfully mirrors Lean 4.34.1 `DiscrTree.ignoreArg`
+    and `shouldAddAsStar` (`isOffset`), rejecting forged `.star` wildcards on rigid closed
+    subterms (`Option Nat`, `And False _`, `Not False`, `Quot`, `Prod Nat _`), while preserving
+    `Fin 8` literals, `Fin (n + 1)`/`Nat.succ n` offsets, `{n : Nat}` implicit non-Types,
+    explicit proofs `h : True`, `[Inst]` args, polymorphic `.bvar`s, and `no_index`. -/
 partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable localRedOver : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (rawD normD : Expr)
     (domSub : Array Meta.DiscrTree.Key) (allowParamStar : Bool := false) : Bool :=
@@ -2381,10 +2514,12 @@ partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable 
       | none => false
     if matchesNatLit then
       true
+    else if (isDiscrOffsetExpr rD || isDiscrOffsetExpr nD) && domSub == #[Meta.DiscrTree.Key.star] then
+      true
     else
       let matchesRawSemired := match rD.getAppFn.consumeMData with
         | .const rc rLvls =>
-          if isNonReducibleDefInEnv env rc then
+          if isNonReducibleDefInEnv env localRedOver rc then
             let rArgs := rD.getAppArgs
             match splitDiscrTreeChildren domSub rc rArgs.size with
             | none => false
@@ -2402,7 +2537,7 @@ partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable 
         | .lit l => domSub == #[Meta.DiscrTree.Key.lit l]
         | .const dc _ =>
           if isRigidHeadInEnv env dc then domSub == #[Meta.DiscrTree.Key.const dc 0]
-          else true
+          else domSub != #[Meta.DiscrTree.Key.star]
         | .app .. =>
           match nD.getAppFn.consumeMData with
           | .const dc dLvls =>
@@ -2417,8 +2552,30 @@ partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable 
                 (List.range dArgs.size).all fun j =>
                   keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
                     rSubArgs[j]! dArgs[j]! dSubs[j]! starMask[j]!
-            else true
-          | _ => true
+            else
+              domSub != #[Meta.DiscrTree.Key.star]
+          | .proj s idx structExpr =>
+            let pArgs := nD.getAppArgs
+            match domSub[0]! with
+            | .proj s' idx' nargs =>
+              if s != s' || idx != idx' || nargs != pArgs.size then false
+              else Id.run do
+                let mut pos : Nat := 1
+                let some (sSub, nextPos) := extractDiscrSubtree domSub pos | return false
+                pos := nextPos
+                let structOk :=
+                  if isClass env s then sSub == #[Meta.DiscrTree.Key.star]
+                  else keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                    structExpr structExpr sSub false
+                if !structOk then return false
+                for a in pArgs do
+                  let some (aSub, nextP) := extractDiscrSubtree domSub pos | return false
+                  pos := nextP
+                  if !keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName a a aSub false then
+                    return false
+                return pos == domSub.size
+            | _ => false
+          | _ => domSub != #[Meta.DiscrTree.Key.star]
         | .forallE _ d _ _ =>
           if domSub[0]! != Meta.DiscrTree.Key.arrow || domSub.size < 2 then
             false
@@ -2427,11 +2584,17 @@ partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable 
             keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
               rawDom d (domSub.extract 1 domSub.size) false
         | .lam .. | .sort .. => domSub == #[Meta.DiscrTree.Key.other]
-        | .proj s idx _ =>
+        | .proj s idx structExpr =>
           match domSub[0]! with
-          | .proj s' idx' _ => s == s' && idx == idx'
+          | .proj s' idx' 0 =>
+            if s != s' || idx != idx' || domSub.size < 2 then false
+            else
+              let sSub := domSub.extract 1 domSub.size
+              if isClass env s then sSub == #[Meta.DiscrTree.Key.star]
+              else keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                structExpr structExpr sSub false
           | _ => false
-        | _ => true
+        | _ => domSub != #[Meta.DiscrTree.Key.star]
 
 /-- Structural alignment verifier between a non-outParam argument `(rawArg, normArg)` and its
     exact arity-balanced `DiscrTree.Key` child subtree `sub` (`normArg` already deeply normalized). -/
@@ -2590,7 +2753,8 @@ def forbiddenRawExtSubstrings : List String := [
   "librarySuggestions", "LibrarySuggestions", "selectorExt",
   "envLinter", "EnvLinter", "codeQuality", "CodeQuality",
   "missingDocs", "MissingDocs", "unusedVariables", "UnusedVariables",
-  "codeSuggestions", "codeBlockSuggestions", "docRole", "deriving", "Deriving"
+  "codeSuggestions", "codeBlockSuggestions", "docRole", "deriving", "Deriving",
+  "codeAction", "CodeAction", "formatter", "Formatter", "parenthesizer", "Parenthesizer"
 ]
 
 def forbiddenRawCodegenSubstrings : List String := [
@@ -2932,6 +3096,9 @@ def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
   for e in data.extraConstNames do
     unless isWellFormedName e do
       policyFail "anonymousConstantName" modName #[modName] "malformed extraConstNames entry"
+    unless hasValidExtraPrivateOwner modName e do
+      policyFail "keyNameMismatch" modName #[modName, e]
+        s!"private extraConstName {e} does not belong to module {modName}"
     if seenExtra.contains e then
       policyFail "duplicateConstName" modName #[modName, e] s!"duplicate extraConstName {e}"
     seenExtra := seenExtra.insert e
@@ -3497,6 +3664,20 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         if let some eIdx := expMap[m]? then
           let mut pubReplayable : NameSet := {}
           if let some (mainD, _, _) := subPartsMap[m]? then
+            -- Public transitive import closure of `m` (strictly `imp.isExported == true` edges)
+            -- so a privately imported audited module cannot be leaked into public `.olean` decls!
+            let mut pubImpVisited : NameSet := {}
+            let mut pubImpPending : List Name :=
+              (mainD.imports.filter (·.isExported)).toList.map (·.module)
+            while !pubImpPending.isEmpty do
+              let curr := pubImpPending.head!
+              pubImpPending := pubImpPending.tail!
+              if !pubImpVisited.contains curr then
+                pubImpVisited := pubImpVisited.insert curr
+                if let some (curMainD, _, _) := subPartsMap[curr]? then
+                  pubImpPending := ((curMainD.imports.filter (·.isExported)).toList.map (·.module)) ++ pubImpPending
+                else if let some more := directImportsMap[curr]? then
+                  pubImpPending := (more.toList.map (·.module)) ++ pubImpPending
             for pubCi in mainD.constants do
               if !isPrivateName pubCi.name && !isCodegenUnsafeRec byName pubCi then
                 pubReplayable := pubReplayable.insert pubCi.name
@@ -3505,6 +3686,13 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
                 if (expE.find? dep).isNone then
                   policyFail "keyNameMismatch" m #[m, pubCi.name, dep]
                     s!"split-brain public .olean declaration {pubCi.name} references unexported {dep}"
+                let depMod? := match realDeclOwner[dep]? with
+                  | some om => some om
+                  | none => (env.getModuleIdxFor? dep).map fun i => env.header.modules[i]!.module
+                if let some depMod := depMod? then
+                  if auditedSet.contains depMod && depMod != m && !pubImpVisited.contains depMod then
+                    policyFail "keyNameMismatch" m #[m, pubCi.name, dep, depMod]
+                      s!"split-brain public .olean declaration {pubCi.name} leaks privately imported {dep} from {depMod}"
               if !isPrivateName pubCi.name then
                 let pubTyEdges ← expressionEdges m pubCi.name pubCi.type
                 for dep in pubTyEdges do
@@ -4520,6 +4708,58 @@ def main (args : List String) : IO UInt32 := do
     constants := #[anc17bInd, anc17bCtor, anc17bRec, inst17c],
     extraConstNames := #[],
     entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast wildEnt17c])]
+  }
+
+  -- 17d_forged_and_prop_star: `Decidable (And False LocalProp)` with forged `.star` on `False` (`Prop` param != proof param!)
+  let lp17d := `Topic.Tamper17d.Defs.LocalProp
+  let lp17dMk := `Topic.Tamper17d.Defs.LocalProp.mk
+  let lp17dInd : ConstantInfo := .inductInfo {
+    name := lp17d, levelParams := [], type := mkSort Level.zero,
+    numParams := 0, numIndices := 0, all := [lp17d], ctors := [lp17dMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let lp17dCtor : ConstantInfo := .ctorInfo {
+    name := lp17dMk, levelParams := [], type := mkConst lp17d,
+    induct := lp17d, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let lp17dRec : ConstantInfo := .recInfo {
+    name := `Topic.Tamper17d.Defs.LocalProp.rec, levelParams := [],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst lp17d) (mkSort Level.zero))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst lp17dMk))
+        (mkForall `t .default (mkConst lp17d) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [lp17d], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := lp17dMk, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst lp17d) (mkSort Level.zero)) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst lp17dMk)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let andProp17d := mkApp2 (mkConst ``And) (mkConst ``False) (mkConst lp17d)
+  let inst17dName := `Topic.Tamper17d.Defs.instAnd
+  let inst17d : ConstantInfo := .defnInfo {
+    name := inst17dName, levelParams := [],
+    type := mkApp (mkConst ``Decidable) andProp17d,
+    value := mkApp2 (mkConst ``Decidable.isFalse) andProp17d
+      (mkLambda `h .default andProp17d (mkProj ``And 0 (mkBVar 0))),
+    hints := .abbrev, safety := .safe, all := [inst17dName]
+  }
+  let wildEnt17d : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Decidable 1, Meta.DiscrTree.Key.const ``And 2, Meta.DiscrTree.Key.star, Meta.DiscrTree.Key.const lp17d 0],
+    val := mkConst inst17dName, priority := 1000, globalName? := some inst17dName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeOlean (outDir / "17d_and_prop_star") `Topic.Tamper17d.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[lp17d, lp17dMk, `Topic.Tamper17d.Defs.LocalProp.rec, inst17dName],
+    constants := #[lp17dInd, lp17dCtor, lp17dRec, inst17d],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast wildEnt17d])]
+  }
+
+  -- 14d_code_action_ext: persistent server codeAction hook (`Lean.CodeAction.cmdCodeActionExt`)
+  writeOlean (outDir / "14d_code_action") `Proof.Tamper14d {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.Tamper14d.ok],
+    constants := #[.thmInfo { name := `Proof.Tamper14d.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.Tamper14d.ok] }],
+    extraConstNames := #[],
+    entries := #[(`Lean.CodeAction.cmdCodeActionExt, #[unsafe unsafeCast ()])]
   }
 
   -- 15e_split_brain_priv_inst: module-mode `Topic.Tamper15e.Defs` leaking `.private` instance into public `.olean`!
@@ -5851,6 +6091,8 @@ def run_tamper_suite(
             ("subcheck_15e_split_brain_public_leaks_private_inst", "Topic.Tamper15e.Defs", forged_root / "15e_split_brain_priv_inst", "forbiddenInstanceOrCoe"),
             ("subcheck_17b_forged_arrow_instance_wildcard", "Topic.Tamper17b.Defs", forged_root / "17b_arrow_wildcard", "forbiddenInstanceOrCoe"),
             ("subcheck_17c_forged_arrow_option_star", "Topic.Tamper17b.Defs", forged_root / "17c_arrow_opt_star", "forbiddenInstanceOrCoe"),
+            ("subcheck_17d_forged_and_prop_star", "Topic.Tamper17d.Defs", forged_root / "17d_and_prop_star", "forbiddenInstanceOrCoe"),
+            ("subcheck_14d_code_action_ext_rejected", "Proof.Tamper14d", forged_root / "14d_code_action", "forbiddenMacroOrElab"),
             ("subcheck_B3_reference_outside_import_closure", "Specs.UnimportedRef", forged_root / "b3_ref_outside", "referenceOutsideImportClosure"),
         ]
         batched_specs.append(
