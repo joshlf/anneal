@@ -1590,16 +1590,20 @@ theorem mirWpConverges_of_callSpecCut_normal_continue {Mem Addr Byte Val : Type}
       (isCleanupBb := isCleanupBb) (onCleanup := onCleanup)
       hCut hPre hNormal hUnwind hAbort)
 
-/-- Explicit `accessed` projection for unmodified `V2026_06_01.MirSemantics.BorrowEntry`.
-Unmodified `V2026_06_01.MirSemantics.BorrowEntry` stores a single `perm : TreeBorrowPerm`
-without a separate `accessed : Bool` bit: a freshly created two-phase mutable borrow
-starts at `.reservedFrz false` (`accessed = false`) and transitions to `.unique` (or
-`.reservedFrz true`) on first access (`accessed = true`), whereas `.frozen`, `.reservedIM`,
-and `.disabled` have no distinct unaccessed representation in `V2026_06_01.MirSemantics`. -/
-@[reducible] def borrowEntryAccessed (e : BorrowEntry) : Bool :=
-  match e.perm with
-  | .reservedFrz false => false
-  | _ => true
+/-- Sound `accessed` projection for unmodified `V2026_06_01.MirSemantics.BorrowEntry`.
+`BorrowEntry` stores a single `perm : TreeBorrowPerm` and NO `accessed` bit, and its
+per-node semantics `treeBorrowNodeAccess` coincides EXACTLY with
+`TbLocationState.performAccess ⟨tbPermOfMir perm, true⟩` on every non-disabled node
+(`treeBorrowNodeAccess_agrees_with_performAccess`), i.e. MIR treats every node as
+ACCESSED. The projection must therefore set `accessed := true` for every borrow:
+marking `.reservedFrz false` as unaccessed (the A2 choice) is UNSOUND in the safety
+direction, because `RefFrame` lets a protected UNACCESSED `Reserved` node absorb a
+foreign write silently (`.Success ⟨.Disabled, false⟩`) while unmodified MIR faults
+(`treeBorrowNodeAccess .write .foreignAccess (.reservedFrz false) true = .ub`) — and
+Miri agrees with MIR here, since `Retag(FnEntry)` performs an initial read through the
+fresh protected child (`evalFnEntryRetag` / `freezeTreeBorrowsOnReadAtProj`), so that
+child IS accessed. See `borrowEntryAccessed_unaccessed_reserved_unsound`. -/
+@[reducible] def borrowEntryAccessed (_e : BorrowEntry) : Bool := true
 
 /-- **Exact `accessed`-bit contrast between unmodified `V2026_06_01.MirSemantics` and
 `Anneal.RefFrame.TbLocationState`**: because `BorrowEntry` omits a separate `accessed`
@@ -1642,6 +1646,40 @@ def rangedBorrowTreeOfMirBorrows (borrows : List BorrowEntry)
     protectedTags := protTags
     segments := [⟨0, rangeLen, states⟩] }
 
+/-- **Why `borrowEntryAccessed` must be constantly `true`**: (1) node level — a protected
+`.reservedFrz false` foreign write is MIR `.ub`; the unaccessed `RefFrame` state accepts
+it silently, while the accessed state reports `.ProtectedDisabled` exactly like MIR;
+(2) tree level — on the projection of the REAL post-`Retag(FnEntry)` borrow chain
+(`child 2` protected `.reservedFrz false` under `root 1`) extended by a sibling `&mut`
+tag `3`, a write through tag `3` is a FOREIGN write to protected tag `2`: the sound
+(`accessed := true`) projection fails with `.ProtectedDisabled (.ReservedFrz false)`,
+agreeing with MIR's `.ub`, whereas the unaccessed encoding would complete silently. -/
+theorem borrowEntryAccessed_unaccessed_reserved_unsound :
+    (treeBorrowNodeAccess .write .foreignAccess (.reservedFrz false) true = .ub ∧
+     TbLocationState.performAccess ⟨.ReservedFrz false, false⟩ .Write .ForeignAccess true =
+       .Success ⟨.Disabled, false⟩ ∧
+     TbLocationState.performAccess ⟨tbPermOfMir (.reservedFrz false), true⟩ .Write
+       .ForeignAccess true =
+       .Error ⟨.Disabled, true⟩ (.ProtectedDisabled (.ReservedFrz false))) ∧
+    (let child : BorrowEntry :=
+       { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+         perm := .reservedFrz false, protector := some 1, parentTag := some 1 }
+     let sib : BorrowEntry :=
+       { tag := 3, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+         perm := .unique, parentTag := some 1 }
+     let root : BorrowEntry :=
+       { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+         perm := .unique }
+     let tSound := rangedBorrowTreeOfMirBorrows [sib, child, root] [1] 4
+     let tUnacc : RangedBorrowTree :=
+       { tSound with
+         segments := [⟨0, 4, [(0, ⟨.Unique, true⟩), (3, ⟨.Unique, true⟩),
+           (2, ⟨.ReservedFrz false, false⟩), (1, ⟨.Unique, true⟩)]⟩] }
+     (performRangedAccess tSound 0 4 3 .Write .VisitChildrenOfAccessed).status =
+       .TransitionError 0 4 2 (.ProtectedDisabled (.ReservedFrz false)) ∧
+     (performRangedAccess tUnacc 0 4 3 .Write .VisitChildrenOfAccessed).status = .Completed) :=
+  ⟨⟨rfl, rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
 /-- When `Memory.activeProtectors = []` (e.g. after `TerminatorKind.return_`
 restores an empty caller protector set), `rangedBorrowTreeOfMirBorrows` has
 empty `protectedTags = []`. -/
@@ -1672,7 +1710,7 @@ theorem rangedBorrowTreeOfMirBorrows_head_protected (e : BorrowEntry)
     lookupLocState e.tag
       (match (rangedBorrowTreeOfMirBorrows (e :: rest) activeProtectors rangeLen).segments with
        | seg :: _ => seg.nodeStates | [] => []) =
-      some ⟨tbPermOfMir e.perm, match e.perm with | .reservedFrz false => false | _ => true⟩ := by
+      some ⟨tbPermOfMir e.perm, true⟩ := by
   have hNe : Nat.beq 0 e.tag = false := by
     cases hB : Nat.beq 0 e.tag with
     | false => rfl
@@ -2051,18 +2089,18 @@ theorem rangedBorrowTreeOfMirAlloc_twoTag_write_refines
     subst hRT; subst hRPa; subst hRPr; subst hRPe
     have hSplit0 : splitSegmentsAt 0
         [{ offset := 0, length := n + 1,
-           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
-             (1, ⟨.ReservedFrz false, false⟩)] }] =
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+             (1, ⟨.ReservedFrz false, true⟩)] }] =
         [{ offset := 0, length := n + 1,
-           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
-             (1, ⟨.ReservedFrz false, false⟩)] }] := rfl
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+             (1, ⟨.ReservedFrz false, true⟩)] }] := rfl
     have hSplitEnd : splitSegmentsAt (0 + (n + 1))
         [{ offset := 0, length := n + 1,
-           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
-             (1, ⟨.ReservedFrz false, false⟩)] }] =
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+             (1, ⟨.ReservedFrz false, true⟩)] }] =
         [{ offset := 0, length := n + 1,
-           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
-             (1, ⟨.ReservedFrz false, false⟩)] }] := by
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+             (1, ⟨.ReservedFrz false, true⟩)] }] := by
       unfold splitSegmentsAt
       simp only [List.foldr, Nat.zero_add, hBltSelf, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
     have hDisjF : Anneal.RefFrame.rangesDisjoint 0 (n + 1) 0 (n + 1) = false := by
@@ -2072,7 +2110,7 @@ theorem rangedBorrowTreeOfMirAlloc_twoTag_write_refines
     have hSegAcc :
         performSegmentAccess
           [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩] [2]
-          ⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩), (1, ⟨.ReservedFrz false, false⟩)]⟩
+          ⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩), (1, ⟨.ReservedFrz false, true⟩)]⟩
           2 .Write .VisitChildrenOfAccessed =
         .ok ⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.Unique, true⟩), (1, ⟨.Unique, true⟩)]⟩ := rfl
     have hFind : findTopoNode 2
@@ -2082,8 +2120,8 @@ theorem rangedBorrowTreeOfMirAlloc_twoTag_write_refines
         performRangedAccess
           { topology := [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩]
             protectedTags := [2]
-            segments := [⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
-              (1, ⟨.ReservedFrz false, false⟩)]⟩] }
+            segments := [⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+              (1, ⟨.ReservedFrz false, true⟩)]⟩] }
           0 (n + 1) 2 .Write .VisitChildrenOfAccessed =
         ⟨{ topology := [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩]
            protectedTags := [2]

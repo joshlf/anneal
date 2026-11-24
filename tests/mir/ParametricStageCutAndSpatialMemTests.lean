@@ -2078,6 +2078,36 @@ theorem witness3e_partial_range_segmented_borrows_and_accessed_contrast :
    hSeg.2.2.2.2.2.2.1, hSeg.2.2.2.2.2.2.2,
    mirSemantics_vs_refFrame_accessed_coarsening.2⟩
 
+/-- **Negative Canary N3c (`accessed`-bit soundness of the MIR → `RefFrame` projection)**:
+on the REAL `callerNormalBody` run, the post-`Retag(FnEntry)` state `s₃` holds protected
+child tag `2` at `.reservedFrz false` under protector `1`. Unmodified MIR faults on ANY
+foreign write to such a node (`.ub`), so the projection must encode it as ACCESSED: the
+sound `rangedBorrowTreeOfMirAlloc` projection of `s₃` carries `(2, ⟨.ReservedFrz false, true⟩)`,
+and a sibling `&mut` write through tag `3` then fails with
+`.ProtectedDisabled (.ReservedFrz false)` — exactly MIR's verdict — whereas the unsound
+unaccessed encoding would complete silently. -/
+theorem neg3c_projection_accessed_bit_soundness :
+    let ms0 : MachineState :=
+      { frame := { blockIdx := 0, stmtIdx := 0
+                   locals := [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨3, 4⟩),
+                              .uninit, .uninit, .uninit] }
+        memory := { callees := [calleeBumpMutBody] } }
+    ∃ s₁ s₂ s₃ : MachineState,
+      Anneal.PureMirExec.mirStep callerNormalBody ms0 = .cont s₁ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₁ = .cont s₂ ∧
+      Anneal.PureMirExec.mirStep callerNormalBody s₂ = .cont s₃ ∧
+      s₃.memory.borrows.map BorrowEntry.perm = [.reservedFrz false, .reservedFrz false] ∧
+      s₃.memory.activeProtectors = [1] ∧
+      (rangedBorrowTreeOfMirAlloc s₃.memory.borrows s₃.memory.activeProtectors 0 1 4).segments =
+        [⟨0, 4, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, true⟩),
+                 (1, ⟨.ReservedFrz false, true⟩)]⟩] ∧
+      treeBorrowNodeAccess .write .foreignAccess (.reservedFrz false) true = .ub ∧
+      TbLocationState.performAccess ⟨.ReservedFrz false, false⟩ .Write .ForeignAccess true =
+        .Success ⟨.Disabled, false⟩ :=
+  ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl,
+   borrowEntryAccessed_unaccessed_reserved_unsound.1.1,
+   borrowEntryAccessed_unaccessed_reserved_unsound.1.2.1⟩
+
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 
 /-- **Witness 4a (`SpatialMemV2026` padded `(u8, [pad; 3], u32)` lifecycle + contrast
