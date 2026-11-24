@@ -707,7 +707,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/ImpAllPub", "module\npublic import Topic.Defs\nimport all Topic.Defs\nnamespace Proof.ImpAllPub\npublic def x : Topic.Defs.PubTag := default\nend Proof.ImpAllPub\n"),
                 (
                     "Topic/A3ModPriv/Defs",
-                    "module\nnamespace Topic.A3ModPriv.Defs\npublic inductive LocalAnchor | mk\npublic abbrev MyAnchor := LocalAnchor\nprivate structure PrivT where x : Nat\nprivate inductive PrivList | nil | cons (x : Nat) (tl : PrivList)\nprivate instance : Inhabited PrivT := ⟨⟨0⟩⟩\npublic structure Holder where trace : Array (String -> Nat)\npublic def useDotTrace (h : Holder) (i : Fin h.trace.size) : Nat := h.trace[i] \"{\"\npublic inductive Tag {n : Nat} (α : Type) | mk (x : α)\npublic inductive Box (h : True) (α : Type) | mk (x : α)\npublic inductive LocalProp : Prop | mk\npublic instance instTagImpl : Inhabited (@Tag 5 LocalAnchor) := ⟨.mk .mk⟩\npublic instance instBoxProof : Inhabited (Box True.intro LocalAnchor) := ⟨.mk .mk⟩\npublic instance instFinAdd (n : Nat) : Inhabited (Fin (n + 1) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instFinSucc (n : Nat) : Inhabited (Fin (Nat.succ n) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instAndProp : Decidable (And False LocalProp) := isFalse (fun h => h.1)\npublic instance instQuotArr : Inhabited (Quot (fun (_ _ : Nat) => True) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptAbbr : Inhabited (Option MyAnchor) := ⟨some .mk⟩\npublic instance instSub : Inhabited { x : LocalAnchor // x = x } := ⟨⟨.mk, rfl⟩⟩\npublic instance instFinArr : Inhabited (Fin 8 → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptArr : Inhabited (Option Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instArrArr : Inhabited ((Nat → Bool) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\nend Topic.A3ModPriv.Defs\n",
+                    "module\nnamespace Topic.A3ModPriv.Defs\npublic inductive LocalAnchor | mk\npublic abbrev MyAnchor := LocalAnchor\nprivate structure PrivT where x : Nat\nprivate inductive PrivList | nil | cons (x : Nat) (tl : PrivList)\nprivate instance : Inhabited PrivT := ⟨⟨0⟩⟩\npublic structure Holder where trace : Array (String -> Nat)\npublic def useDotTrace (h : Holder) (i : Fin h.trace.size) : Nat := h.trace[i] \"{\"\npublic inductive Tag {n : Nat} (α : Type) | mk (x : α)\npublic inductive Box (h : True) (α : Type) | mk (x : α)\npublic inductive ProofBox (p : Prop) (h : p) (α : Type) | mk (x : α)\npublic inductive LocalProp : Prop | mk\npublic instance instTagImpl : Inhabited (@Tag 5 LocalAnchor) := ⟨.mk .mk⟩\npublic instance instBoxProof : Inhabited (Box True.intro LocalAnchor) := ⟨.mk .mk⟩\npublic instance instHKT (F : Type → Type) : Inhabited (F Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instDepProof (p : Prop) (hp : p ∧ True) : Inhabited (ProofBox p hp.1 LocalAnchor) := ⟨.mk .mk⟩\npublic instance instFinAdd (n : Nat) : Inhabited (Fin (n + 1) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instFinSucc (n : Nat) : Inhabited (Fin (Nat.succ n) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instAndProp : Decidable (And False LocalProp) := isFalse (fun h => h.1)\npublic instance instQuotArr : Inhabited (Quot (fun (_ _ : Nat) => True) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptAbbr : Inhabited (Option MyAnchor) := ⟨some .mk⟩\npublic instance instSub : Inhabited { x : LocalAnchor // x = x } := ⟨⟨.mk, rfl⟩⟩\npublic instance instFinArr : Inhabited (Fin 8 → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptArr : Inhabited (Option Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instArrArr : Inhabited ((Nat → Bool) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\nend Topic.A3ModPriv.Defs\n",
                 ),
             ):
                 s = pkg_pub15 / f"{rel}.lean"
@@ -1548,6 +1548,45 @@ def main (args : List String) : IO UInt32 := do
     extraConstNames := #[],
     entries := #[(`Lean.PrettyPrinter.formatterAttribute, #[unsafe unsafeCast ()])]
   }
+  -- Pass A4 forged regressions:
+  -- A4-1: `Inhabited (Fin (Nat.succ Nat.zero) -> Anchor)` with forged `.star` (closed offset fallthrough bypass)
+  let fin1A4 := mkApp (mkConst ``Fin) (mkApp (mkConst ``Nat.succ) (mkConst ``Nat.zero))
+  let finArrA4 := mkForall `_ .default fin1A4 (mkConst a2AnchorName)
+  let a4FinInstName := `Topic.A4FinSuccStar.Defs.instFin1
+  let a4FinInstDef : ConstantInfo := .defnInfo {
+    name := a4FinInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) finArrA4,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) finArrA4 (mkLambda `_ .default fin1A4 (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [a4FinInstName]
+  }
+  let a4FinEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.const ``Fin 1, Meta.DiscrTree.Key.star],
+    val := mkConst a4FinInstName, priority := 1000, globalName? := some a4FinInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "a4_fin_succ_star") `Topic.A4FinSuccStar.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, a4FinInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, a4FinInstDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast a4FinEnt])]
+  }
+  -- A4-2: Foreign-caller `_at_` specialization spoof in `extraConstNames` (`_private.Specs.Other.0.secret._at_.Nat.spec_0`)
+  let spoofAtSpec := Name.str (Name.str (Name.str (Name.str (Name.num (`_private ++ `Specs.Other) 0) "secret") "_at_") "Nat") "spec_0"
+  writeO (out / "a4_spoof_at_spec") `Proof.A4SpoofAtSpec {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A4SpoofAtSpec.ok],
+    constants := #[.thmInfo { name := `Proof.A4SpoofAtSpec.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.A4SpoofAtSpec.ok] }],
+    extraConstNames := #[spoofAtSpec], entries := #[]
+  }
+  -- A4-3: Local-caller `_at_` specialization claiming private callee from unimported `Specs.Unimported`
+  let unimpAtSpec := Name.str (Name.str (Name.str (Name.str (Name.str (Name.num (`_private ++ `Specs.Unimported) 0) "secret") "_at_") "Proof") "A4UnimpSpec") "ok" |>.str "spec_0"
+  writeO (out / "a4_unimp_at_spec") `Proof.A4UnimpSpec {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A4UnimpSpec.ok],
+    constants := #[.thmInfo { name := `Proof.A4UnimpSpec.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.A4UnimpSpec.ok] }],
+    extraConstNames := #[unimpAtSpec], entries := #[]
+  }
   return 0
 """,
                 encoding="utf-8",
@@ -1676,6 +1715,9 @@ def main (args : List String) : IO UInt32 := do
                 ("b4_nonzero_private_prefix_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4NonZeroPriv"], "olean_dirs": [a1_forged / "b4_nz_priv"], "strict_proofs": True}),
                 ("b4_cross_module_private_extra_const_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B4ExtraPriv"], "olean_dirs": [a1_forged / "b4_extra_priv"], "strict_proofs": True}),
                 ("b4_formatter_ext_rejected", False, "forbiddenMacroOrElab", {"target_modules": ["Proof.B4FormatterExt"], "olean_dirs": [a1_forged / "b4_formatter_ext"], "strict_proofs": True}),
+                ("a4_forged_fin_succ_zero_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A4FinSuccStar.Defs"], "olean_dirs": [a1_forged / "a4_fin_succ_star"], "strict_proofs": True}),
+                ("a4_forged_foreign_caller_at_spec_extra_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A4SpoofAtSpec"], "olean_dirs": [a1_forged / "a4_spoof_at_spec"], "strict_proofs": True}),
+                ("a4_forged_unimported_callee_at_spec_extra_rejected", False, "referenceOutsideImportClosure", {"target_modules": ["Proof.A4UnimpSpec"], "olean_dirs": [a1_forged / "a4_unimp_at_spec"], "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
@@ -1697,7 +1739,7 @@ def main (args : List String) : IO UInt32 := do
                 sysroot=sysroot,
                 stage_dir=tmp,
                 compiled_inspector=insp,
-                chunk_size=70,
+                chunk_size=80,
             )
             for (cid, exp_ok, exp_cat, _), rep in zip(cases, reps):
                 self.assertEqual(rep["ok"], exp_ok, f"{cid}: {rep}")
