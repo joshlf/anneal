@@ -52,10 +52,19 @@ A specification and verification library for `SeqCst` `Atomic::try_update` /
   (`mrCellWP_nonvacuous_not_false`), fail-closed out-of-range `specPanic`
   (`mr_cas_out_of_range_specPanic_canary`), positive universal symbolic
   instances on both `Mach` (`bmU8_mrCellAdmissible`, `tryUpdate_mr_bm_u8_safety`)
-  and `MachTB` (`tbU8_mrCellAdmissible`, `tryUpdate_mr_tb_u8_safety`),
-  machine-backed Streett liveness (`tryUpdate_mr_fairInfOften`,
-  `tryUpdate_mr_bm_u8_fair`), and fail-closed rejection of misaligned / `u128` /
-  `Frozen` UB.
+  and `MachTB` (`tbU8_mrCellAdmissible`, `tryUpdate_mr_tb_u8_safety`,
+  `tryUpdate_mr_tb_u8_fair`), full 8-byte little-endian `u64` symbolic
+  instances on both `Mach` and `MachTB` (`leValue_leBytes`,
+  `bmU64_mrCellAdmissible`, `tbU64_mrCellAdmissible`,
+  `tryUpdate_mr_bm_u64_complete`, `tryUpdate_mr_tb_u64_complete`),
+  machine-backed Streett liveness + enabledness + CoBuchi non-vacuity
+  (`tryUpdate_mr_fairInfOften`, `tryUpdate_mr_infOften_attemptCas`,
+  `tryUpdate_mr_tb_wfLive_fair`, `tryUpdate_mr_fairInfOften_nonvacuous`,
+  `mrCellWP_loadStutter_cobuchi_vacuous`), bounded-contention unconditional
+  machine termination (`mrBudgetWP`, `mrCellWP_refines_budget`,
+  `tryUpdate_mr_dwp_ranked`, `tryUpdate_mr_eventually`,
+  `tryUpdate_mr_tb_wfLive_dwp`, `mrBudgetWP_nonvacuous_not_false`), and
+  fail-closed rejection of misaligned / `u128` / `Frozen` UB.
 * **§9** Fail-closed boundaries: irreflexive relations (on both `Err` and failed
   CAS), non-transitive relations, non-`hist_inv`-closed closure preconditions,
   one-shot committer double-fire rejection, weak-vs-strong CAS 2-axis
@@ -2744,6 +2753,678 @@ theorem tryUpdate_mr_fairInfOften {M FState G : Type} [Memory M] [MemoryOps M]
           ⟨rfl, hmf, loopInv_fail hpre hl hpost hrel b'⟩
 
 /--
+**Machine-backed enabledness (`tryUpdate_mr_infOften_attemptCas`)**: pairs with
+`tryUpdate_mr_fairInfOften` so CAS fairness on `mrCellWP` cannot be satisfied
+vacuously by a load-spinning loop (`mrLoadStutter` via `FairInfOften.of_never_fair`).
+Every non-terminating MiniRust execution attempts a real `AtomicCompareExchange`
+infinitely often.
+-/
+theorem tryUpdate_mr_infOften_attemptCas {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    InfOften (mrCellWP A ptr pty t mRely) CasAttempt
+      (fun r ms => MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (m₀, s₀) := by
+  refine InfOften.vis fun m₁ hm₁ => ?_
+  obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m₀ _ m₁ hm₀ hm₁
+  refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+  obtain ⟨hv, hm2⟩ := mr_observe hadm hm₀ hm₁ hload
+  refine ⟨hv, fun b => ?_⟩
+  dsimp only [loadAns]
+  refine InfOften.iter_progress tryBody
+    (fun (prev : Nat) (ms : MrAtomicSt M FState G) =>
+      MInv ms.1 ms.2.cell ∧ LoopInv A Rel init f₀ g₀ comm₀ prev ms.2)
+    (fun prev ms hms => ?_) ⟨hm2, loopInv_of_init hpre hs₀ hv b⟩
+  obtain ⟨m, s⟩ := ms
+  obtain ⟨hm, hl⟩ := hms
+  refine buchiProgress.vis_skip ⟨loopInv_pre hpre hl, fun f' r hpost => ?_⟩
+  cases r with
+  | none =>
+    dsimp only
+    change buchiProgress (mrCellWP A ptr pty t mRely) CasAttempt _ _
+      (tryCallK prev (callOut prev none)) _
+    rw [tryCallK_none]
+    refine buchiProgress.vis_skip fun m₁' hm₁' => ?_
+    obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.load_ok m₁' c' hmc', fun v' m₂' hload' => ?_⟩
+    obtain ⟨hv', hm2'⟩ := mr_observe hadm hm hm₁' hload'
+    exact ⟨hv', fun b' hres => (buchiProgress.ret_iff _ _ _ _ _ _).2
+      ⟨hm2', loopInv_err_post hpre hl hpost hv' b' hres⟩⟩
+  | some next =>
+    dsimp only
+    change buchiProgress (mrCellWP A ptr pty t mRely) CasAttempt _ _
+      (tryCallK prev (callOut prev (some next))) _
+    rw [tryCallK_some]
+    have hnext_rep : IntType.can_represent t next = true :=
+      hrep s.fst prev f' next hl.2.2.1 hpost hl.1
+    refine buchiProgress.vis_accept fun m₁' hm₁' => ?_
+    obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+    obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+    have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
+    refine ⟨hrel, fun b' => ⟨fun hne => ⟨trivial, ?_⟩, fun heq => ?_⟩⟩
+    · dsimp only
+      change InfOften (mrCellWP A ptr pty t mRely) CasAttempt _
+        (tryCasK prev next (casOut prev next false ret.toNat)) _
+      rw [tryCasK_false]
+      have hm2' : MInv m₂' ret.toNat := hret ▸ hkeep (hret ▸ hne)
+      exact InfOften.ret ⟨hm2', loopInv_fail hpre hl hpost hrel b'⟩
+    · refine ⟨⟨loopInv_unshot (s := s) hpre hl, loopInv_win_pre (s := s) hpre hl hpost,
+        fun g' hg' => ⟨trivial, ?_⟩⟩,
+        fun mFail hfail => ⟨trivial, ?_⟩⟩
+      · dsimp only
+        rw [tryCasK_true]
+        have hm2' : MInv m₂' next := hstore (hret ▸ heq)
+        refine InfOften.vis fun m₁'' hm₁'' => ?_
+        obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm2' hm₁''
+        refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+        obtain ⟨hv'', hm2''⟩ := mr_observe hadm hm2' hm₁'' hload''
+        refine ⟨hv'', fun b'' hres => InfOften.ret ⟨hm2'', ?_⟩⟩
+        have hok := loopInv_ok_post hpre hl hpost hg' hv'' b' b'' hres
+        simpa only [heq] using hok
+      · dsimp only
+        change InfOften (mrCellWP A ptr pty t mRely) CasAttempt _
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        have hmf : MInv mFail ret.toNat := by
+          have := (hadm.load_val m₁' c' ret mFail hmc' hfail)
+          exact this.1 ▸ this.2
+        exact InfOften.ret ⟨hmf, loopInv_fail hpre hl hpost hrel b'⟩
+
+/--
+**Tree Borrows `MachTB.wfLive` Streett liveness + enabledness**: enriches any
+coupled `MachTB` admissibility invariant with `MachTB.wfLive` across both
+`FairInfOften` (`CoBuchi CasWon`) and `InfOften CasAttempt`.
+-/
+theorem tryUpdate_mr_tb_wfLive_fair {FState G : Type}
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer TreeBorrowsProvenance} {pty : «Type»} {t : IntType}
+    {mRely : MachTB → MachTB → Prop} {MInv : MachTB → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    (hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m → mRely m m' →
+      MiniRustSpec.Correspondence.MachTB.wfLive m')
+    {m₀ : MachTB} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hwf₀ : MiniRustSpec.Correspondence.MachTB.wfLive m₀)
+    (hs₀ : InitSt init f₀ g₀ comm₀ s₀)
+    (AccEdge : (i : (AtomicCellE Nat).I) → (AtomicCellE Nat).O i →
+      MrAtomicSt TBM FState G → MrAtomicSt TBM FState G → Prop) :
+    FairInfOften (mrCellWP A ptr pty t mRely) AccEdge CasWon
+      (fun r ms => (MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (m₀, s₀) ∧
+    InfOften (mrCellWP A ptr pty t mRely) CasAttempt
+      (fun r ms => (MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (m₀, s₀) := by
+  let hadm' : MrCellAdmissible A ptr pty t mRely
+      (fun m c => MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m) :=
+    { rely_refl := fun m c hm => hadm.rely_refl m c hm.1
+      rely_pres := fun m c m' hm hrel =>
+        let ⟨c', hc', hm'⟩ := hadm.rely_pres m c m' hm.1 hrel
+        ⟨c', hc', hm', hrely_wf m m' hm.2 hrel⟩
+      load_ok := fun m c hm => hadm.load_ok m c hm.1
+      load_val := fun m c v m' hm hok =>
+        let ⟨hv, hm'⟩ := hadm.load_val m c v m' hm.1 hok
+        ⟨hv, hm', evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1⟩
+      cas_ok := fun m c e d hm hr => hadm.cas_ok m c e d hm.1 hr
+      cas_val := fun m c e d ret m' hm hr hok =>
+        let ⟨hret, hs, hk⟩ := hadm.cas_val m c e d ret m' hm.1 hr hok
+        let hwf := evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1
+        ⟨hret, fun he => ⟨hs he, hwf⟩, fun hne => ⟨hk hne, hwf⟩⟩ }
+  exact ⟨tryUpdate_mr_fairInfOften hpre hrep hadm' ⟨hm₀, hwf₀⟩ hs₀ AccEdge,
+    tryUpdate_mr_infOften_attemptCas hpre hrep hadm' ⟨hm₀, hwf₀⟩ hs₀⟩
+
+/--
+**General Streett / `CoBuchi` non-vacuity on `mrCellWP`** (strictly stronger than
+`¬ DWP … False`): for ANY memory model `M`, ANY `Realizable A`, ANY coupled
+`MrCellAdmissible`, and EVERY `AccEdge`/`Fair` (in particular `CoBuchi … CasWon`),
+a finite returning MiniRust execution witnesses that `mrCellWP` cannot discharge
+`FairInfOften … False` from any admissible initial state `(m₀, s₀)`.
+-/
+theorem tryUpdate_mr_fairInfOften_nonvacuous {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀)
+    (AccEdge Fair : (i : (AtomicCellE Nat).I) → (AtomicCellE Nat).O i →
+      MrAtomicSt M FState G → MrAtomicSt M FState G → Prop) :
+    ¬ FairInfOften (mrCellWP A ptr pty t mRely) AccEdge Fair (fun _ _ => False)
+      (tryUpdateLoop Nat) (m₀, s₀) := by
+  intro hfi
+  have hrf₀ := hadm.rely_refl m₀ s₀.cell hm₀
+  obtain ⟨v₀, m₁, hl₀⟩ := hadm.load_ok m₀ s₀.cell hm₀
+  obtain ⟨hv₀, hm₁⟩ := hadm.load_val m₀ s₀.cell v₀ m₁ hm₀ hl₀
+  have h1 := (((FairInfOften.vis_iff _ _ _ _ _ _ _).1 hfi m₀ hrf₀).2 v₀ m₁ hl₀).2 0
+  dsimp only [loadAns] at h1
+  rw [iter_tryBody_eq] at h1
+  have hcall := (FairInfOften.vis_iff _ _ _ _ _ _ _).1 h1
+  obtain ⟨f', r, hpost⟩ := hR.post_mut_total _ _ hcall.1
+  have h2 := hcall.2 f' r hpost
+  cases r with
+  | none =>
+    change FairInfOften (mrCellWP A ptr pty t mRely) AccEdge Fair (fun _ _ => False)
+      (tryCallK v₀.toNat (callOut v₀.toNat none) >>= _) _ at h2
+    simp only [tryCallK_none, retAfterDrop, vis_bind] at h2
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨v₁, m₂, hl₁⟩ := hadm.load_ok m₁ s₀.cell hm₁
+    have h3 := (((FairInfOften.vis_iff _ _ _ _ _ _ _).1 h2 m₁ hrf₁).2 v₁ m₂ hl₁).2 0
+      (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, FairInfOften.ret_iff] at h3
+  | some next =>
+    change FairInfOften (mrCellWP A ptr pty t mRely) AccEdge Fair (fun _ _ => False)
+      (tryCallK v₀.toNat (callOut v₀.toNat (some next)) >>= _) _ at h2
+    rw [tryCallK_some, vis_bind] at h2
+    have hnext_rep : IntType.can_represent t (next : Int) = true := by
+      have hrl : Rel init v₀.toNat := by
+        rw [hv₀, hs₀.1]; exact hpre.cellInv.refl init
+      have hf : A.fSpec.hist_inv f₀ s₀.fst := hs₀.2.1 ▸ A.fSpec.hist_inv_laws.refl f₀
+      exact hrep s₀.fst v₀.toNat f' next hf hpost hrl
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨ret, m₂, hcas⟩ := hadm.cas_ok m₁ s₀.cell v₀.toNat next hm₁ hnext_rep
+    obtain ⟨hret, hstore, _⟩ := hadm.cas_val m₁ s₀.cell v₀.toNat next ret m₂ hm₁ hnext_rep hcas
+    have heq : ret.toNat = v₀.toNat := hret.trans hv₀.symm
+    have hwin := ((((FairInfOften.vis_iff _ _ _ _ _ _ _).1 h2 m₁ hrf₁).2 ret m₂ hcas).2 0).2 heq
+    obtain ⟨g', hg'⟩ := hR.gc_post_total _ _ _ hwin.1.2.1
+    have h3 := hwin.1.2.2 g' hg'
+    simp only [tryCasK_true, retAfterDrop, vis_bind] at h3
+    have hm₂ : MInv m₂ next := hstore hv₀.symm
+    have hrf₂ := hadm.rely_refl m₂ next hm₂
+    obtain ⟨v₂, m₃, hl₂⟩ := hadm.load_ok m₂ next hm₂
+    have h4 := (((FairInfOften.vis_iff _ _ _ _ _ _ _).1 h3 m₂ hrf₂).2 v₂ m₃ hl₂).2 0
+      (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, FairInfOften.ret_iff] at h4
+
+/-- Load-only stutter loop (`loop { load(); }`) used to witness `CoBuchi` vacuity. -/
+def mrLoadStutter : ITree (AtomicCellE Nat) PEmpty.{1} :=
+  ITree.iter (fun _ => ITree.vis aLoad (fun _ => ITree.ret (Sum.inl PUnit.unit))) PUnit.unit
+
+private theorem mrLoadStutter_eq :
+    mrLoadStutter = ITree.vis aLoad (fun _ => ITree.tau mrLoadStutter) := by
+  refine (iter_unfold _ PUnit.unit).trans ((vis_bind _ _ _).trans ?_)
+  congr 1; funext _; exact ret_bind _ _
+
+/--
+**Why `CoBuchi CasWon` alone (without `InfOften CasAttempt` and `¬ CoBuchi False`)
+is vacuous on `mrCellWP`**: on ANY coupled-admissible MiniRust cell, `mrLoadStutter`
+simultaneously proves `CoBuchi CasWon False` (vacuously, via `FairInfOften.of_never_fair`)
+AND `¬ DWP … False`, while refuting `InfOften CasAttempt Q` for every `Q`.
+-/
+theorem mrCellWP_loadStutter_cobuchi_vacuous {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G} (hm₀ : MInv m₀ s₀.cell)
+    (Q : PEmpty.{1} → MrAtomicSt M FState G → Prop) :
+    CoBuchi (mrCellWP A ptr pty t mRely) CasWon (fun _ _ => False) mrLoadStutter (m₀, s₀) ∧
+    ¬ DWP (mrCellWP A ptr pty t mRely) mrLoadStutter (fun _ _ => False) (m₀, s₀) ∧
+    ¬ InfOften (mrCellWP A ptr pty t mRely) CasAttempt Q mrLoadStutter (m₀, s₀) := by
+  have hnf : AlwaysStep (mrCellWP A ptr pty t mRely) (fun i o a b => ¬ CasWon i o a b)
+      (fun _ _ => True) mrLoadStutter (m₀, s₀) := by
+    refine AlwaysStep.iter_invariant _ (fun _ ms => MInv ms.1 ms.2.cell) (fun _ ms hm => ?_) hm₀
+    refine (AlwaysStep.vis_iff _ _ _ _ _ _).2 fun m₁ hm₁ => ?_
+    obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres ms.1 _ m₁ hm hm₁
+    refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+    obtain ⟨hv, hm₂⟩ := mr_observe hadm hm hm₁ hload
+    exact ⟨hv, fun b => ⟨fun h => h, (AlwaysStep.ret_iff _ _ _ _ _).2 hm₂⟩⟩
+  have hprod : InfOften (mrCellWP A ptr pty t mRely) (fun _ _ _ _ => True)
+      (fun _ _ => False) mrLoadStutter (m₀, s₀) := by
+    refine InfOften.iter_progress _ (fun _ ms => MInv ms.1 ms.2.cell) (fun _ ms hm => ?_) hm₀
+    refine buchiProgress.vis_accept fun m₁ hm₁ => ?_
+    obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres ms.1 _ m₁ hm hm₁
+    refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+    obtain ⟨hv, hm₂⟩ := mr_observe hadm hm hm₁ hload
+    exact ⟨hv, fun b => ⟨trivial, InfOften.ret hm₂⟩⟩
+  have hc : CoBuchi (mrCellWP A ptr pty t mRely) CasWon (fun _ _ => False)
+      mrLoadStutter (m₀, s₀) := FairInfOften.of_never_fair hnf hprod
+  have hnd : ¬ DWP (mrCellWP A ptr pty t mRely) mrLoadStutter (fun _ _ => False) (m₀, s₀) := by
+    intro hd
+    refine DWP.induct (fun x ms =>
+        (x = mrLoadStutter ∨ x = ITree.tau mrLoadStutter) → MInv ms.1 ms.2.cell → False)
+      ?_ hd (Or.inl rfl) hm₀
+    rintro x ms hx (rfl | rfl) hm
+    · have hobs : mrLoadStutter.observe = .vis aLoad (fun _ => ITree.tau mrLoadStutter) := by
+        conv => lhs; rw [mrLoadStutter_eq, ITree.observe_vis]
+      rw [hobs] at hx
+      have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+      obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+      obtain ⟨hv, hm₂⟩ := hadm.load_val ms.1 ms.2.cell v m₂ hm hok
+      exact ((hx ms.1 hrf).2 v m₂ hok).2 0 (Or.inr rfl) (hv ▸ hm₂)
+    · rw [ITree.observe_tau] at hx
+      exact hx (Or.inl rfl) hm
+  have hni : ¬ InfOften (mrCellWP A ptr pty t mRely) CasAttempt Q mrLoadStutter (m₀, s₀) := by
+    intro hi
+    rw [InfOften.unfold_eq] at hi
+    refine buchiProgress.induct (fun x ms =>
+        (x = mrLoadStutter ∨ x = ITree.tau mrLoadStutter) → MInv ms.1 ms.2.cell → False)
+      ?_ hi (Or.inl rfl) hm₀
+    rintro x ms hx (rfl | rfl) hm
+    · have hobs : mrLoadStutter.observe = .vis aLoad (fun _ => ITree.tau mrLoadStutter) := by
+        conv => lhs; rw [mrLoadStutter_eq, ITree.observe_vis]
+      rw [hobs] at hx
+      have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+      obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+      obtain ⟨hv, hm₂⟩ := hadm.load_val ms.1 ms.2.cell v m₂ hm hok
+      rcases ((hx ms.1 hrf).2 v m₂ hok).2 0 with ⟨ha, _⟩ | hskip
+      · exact ha
+      · exact hskip (Or.inr rfl) (hv ▸ hm₂)
+    · rw [ITree.observe_tau] at hx
+      exact hx (Or.inl rfl) hm
+  exact ⟨hc, hnd, hni⟩
+
+/--
+**Bounded-contention MiniRust-backed `StateEffectWP` (`mrBudgetWP`)**: the
+machine-level analogue of `atomicBudgetWP`. Every `load`/`cas`/`dropF` executes
+real `MiniRustSpec.Interp.evalIntrinsicM` and proves `A.rely`; quiescent steps
+keep `s.budget`, while interfering machine steps (`v.toNat ≠ s.cell`) or
+spurious weak-CAS failures require `0 < s.budget` and strictly decrement
+`s.budget - 1`. Refined by `mrCellWP` (`mrCellWP_refines_budget`).
+-/
+def mrBudgetWP {M FState G : Type} [Memory M] [MemoryOps M] (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop) :
+    StateEffectWP (MrAtomicSt M FState G) (AtomicCellE Nat) where
+  wp
+    | .call .load, K, ms => ∀ m₁, mRely ms.1 m₁ →
+        (∃ v m₂, mrLoadOk m₁ ptr pty t v m₂) ∧
+        ∀ v m₂, mrLoadOk m₁ ptr pty t v m₂ → A.rely ms.2.cell v.toNat ∧
+          (v.toNat = ms.2.cell → K v.toNat (m₂, { ms.2 with cell := v.toNat })) ∧
+          (v.toNat ≠ ms.2.cell → 0 < ms.2.budget →
+            K v.toNat (m₂, { ms.2 with cell := v.toNat, budget := ms.2.budget - 1 }))
+    | .call (.cas e d), K, ms => ∀ m₁, mRely ms.1 m₁ →
+        (∃ ret m₂, mrCasOk m₁ ptr pty t e d ret m₂) ∧
+        ∀ ret m₂, mrCasOk m₁ ptr pty t e d ret m₂ → A.rely ms.2.cell ret.toNat ∧
+          (ret.toNat = ms.2.cell →
+            (ret.toNat ≠ e → K (false, ret.toNat) (m₂, { ms.2 with cell := ret.toNat })) ∧
+            (ret.toNat = e →
+              casWin A e d (fun o s' => K o (m₂, s')) { ms.2 with cell := ret.toNat } ms.2.budget ∧
+              (0 < ms.2.budget → ∀ mFail, mrLoadOk m₁ ptr pty t ret mFail →
+                K (false, ret.toNat)
+                  (mFail, { ms.2 with cell := ret.toNat, budget := ms.2.budget - 1 })))) ∧
+          (ret.toNat ≠ ms.2.cell → 0 < ms.2.budget →
+            (ret.toNat ≠ e →
+              K (false, ret.toNat)
+                (m₂, { ms.2 with cell := ret.toNat, budget := ms.2.budget - 1 })) ∧
+            (ret.toNat = e →
+              casWin A e d (fun o s' => K o (m₂, s'))
+                { ms.2 with cell := ret.toNat } (ms.2.budget - 1) ∧
+              ∀ mFail, mrLoadOk m₁ ptr pty t ret mFail →
+                K (false, ret.toNat)
+                  (mFail, { ms.2 with cell := ret.toNat, budget := ms.2.budget - 1 })))
+    | .call (.callF x), K, ms =>
+        A.fSpec.pre ms.2.fst x ∧
+        ∀ f' r, A.fSpec.post_mut ms.2.fst x f' r → K r (ms.1, { ms.2 with fst := f' })
+    | .call .dropF, K, ms => ∀ m₁, mRely ms.1 m₁ →
+        (∃ v m₂, mrLoadOk m₁ ptr pty t v m₂) ∧
+        ∀ v m₂, mrLoadOk m₁ ptr pty t v m₂ → A.rely ms.2.cell v.toNat ∧
+          (v.toNat = ms.2.cell → A.fSpec.resolve ms.2.fst →
+            K PUnit.unit (m₂, { ms.2 with cell := v.toNat })) ∧
+          (v.toNat ≠ ms.2.cell → 0 < ms.2.budget → A.fSpec.resolve ms.2.fst →
+            K PUnit.unit (m₂, { ms.2 with cell := v.toNat, budget := ms.2.budget - 1 }))
+    | .call .recv, K, ms =>
+        ∀ b, K PUnit.unit (ms.1, { ms.2 with comm := .fresh ms.2.cell, fires := 0, budget := b })
+  mono {i} _ _ _ h hw :=
+    match i with
+    | .call .load => fun m₁ hm =>
+        ⟨(hw m₁ hm).1, fun v m₂ hok =>
+          ⟨((hw m₁ hm).2 v m₂ hok).1,
+           fun he => h _ _ (((hw m₁ hm).2 v m₂ hok).2.1 he),
+           fun hne hp => h _ _ (((hw m₁ hm).2 v m₂ hok).2.2 hne hp)⟩⟩
+    | .call (.cas _ _) => fun m₁ hm =>
+        ⟨(hw m₁ hm).1, fun ret m₂ hok =>
+          let hs := ((hw m₁ hm).2 ret m₂ hok).2
+          ⟨((hw m₁ hm).2 ret m₂ hok).1,
+           fun hc =>
+            ⟨fun hne => h _ _ ((hs.1 hc).1 hne),
+             fun he =>
+              ⟨⟨((hs.1 hc).2 he).1.1, ((hs.1 hc).2 he).1.2.1,
+                fun g' hg' => h _ _ (((hs.1 hc).2 he).1.2.2 g' hg')⟩,
+               fun hp mFail hfail => h _ _ (((hs.1 hc).2 he).2 hp mFail hfail)⟩⟩,
+           fun hc hp =>
+            ⟨fun hne => h _ _ ((hs.2 hc hp).1 hne),
+             fun he =>
+              ⟨⟨((hs.2 hc hp).2 he).1.1, ((hs.2 hc hp).2 he).1.2.1,
+                fun g' hg' => h _ _ (((hs.2 hc hp).2 he).1.2.2 g' hg')⟩,
+               fun mFail hfail => h _ _ (((hs.2 hc hp).2 he).2 mFail hfail)⟩⟩⟩⟩
+    | .call (.callF _) => ⟨hw.1, fun f' r hp => h _ _ (hw.2 f' r hp)⟩
+    | .call .dropF => fun m₁ hm =>
+        ⟨(hw m₁ hm).1, fun v m₂ hok =>
+          ⟨((hw m₁ hm).2 v m₂ hok).1,
+           fun he hr => h _ _ (((hw m₁ hm).2 v m₂ hok).2.1 he hr),
+           fun hne hp hr => h _ _ (((hw m₁ hm).2 v m₂ hok).2.2 hne hp hr)⟩⟩
+    | .call .recv => fun b => h _ _ (hw b)
+
+instance {M FState G : Type} [Memory M] [MemoryOps M] (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop) :
+    StateEffectWP.Conjunctive (mrBudgetWP A ptr pty t mRely) where
+  conj {i} _ _ _ hp hq :=
+    match i with
+    | .call .load => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun v m₂ hok =>
+          ⟨((hp m₁ hm).2 v m₂ hok).1,
+           fun he => ⟨((hp m₁ hm).2 v m₂ hok).2.1 he, ((hq m₁ hm).2 v m₂ hok).2.1 he⟩,
+           fun hne hpos =>
+            ⟨((hp m₁ hm).2 v m₂ hok).2.2 hne hpos, ((hq m₁ hm).2 v m₂ hok).2.2 hne hpos⟩⟩⟩
+    | .call (.cas _ _) => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun ret m₂ hok =>
+          let sp := ((hp m₁ hm).2 ret m₂ hok).2
+          let sq := ((hq m₁ hm).2 ret m₂ hok).2
+          ⟨((hp m₁ hm).2 ret m₂ hok).1,
+           fun hc =>
+            ⟨fun hne => ⟨(sp.1 hc).1 hne, (sq.1 hc).1 hne⟩,
+             fun he =>
+              ⟨⟨((sp.1 hc).2 he).1.1, ((sp.1 hc).2 he).1.2.1,
+                fun g' hg' => ⟨((sp.1 hc).2 he).1.2.2 g' hg', ((sq.1 hc).2 he).1.2.2 g' hg'⟩⟩,
+               fun hpos mFail hfail =>
+                ⟨((sp.1 hc).2 he).2 hpos mFail hfail, ((sq.1 hc).2 he).2 hpos mFail hfail⟩⟩⟩,
+           fun hc hpos =>
+            ⟨fun hne => ⟨(sp.2 hc hpos).1 hne, (sq.2 hc hpos).1 hne⟩,
+             fun he =>
+              ⟨⟨((sp.2 hc hpos).2 he).1.1, ((sp.2 hc hpos).2 he).1.2.1,
+                fun g' hg' => ⟨((sp.2 hc hpos).2 he).1.2.2 g' hg',
+                  ((sq.2 hc hpos).2 he).1.2.2 g' hg'⟩⟩,
+               fun mFail hfail =>
+                ⟨((sp.2 hc hpos).2 he).2 mFail hfail, ((sq.2 hc hpos).2 he).2 mFail hfail⟩⟩⟩⟩⟩
+    | .call (.callF _) => ⟨hp.1, fun f' r h => ⟨hp.2 f' r h, hq.2 f' r h⟩⟩
+    | .call .dropF => fun m₁ hm =>
+        ⟨(hp m₁ hm).1, fun v m₂ hok =>
+          ⟨((hp m₁ hm).2 v m₂ hok).1,
+           fun he hr => ⟨((hp m₁ hm).2 v m₂ hok).2.1 he hr, ((hq m₁ hm).2 v m₂ hok).2.1 he hr⟩,
+           fun hne hpos hr =>
+            ⟨((hp m₁ hm).2 v m₂ hok).2.2 hne hpos hr,
+             ((hq m₁ hm).2 v m₂ hok).2.2 hne hpos hr⟩⟩⟩
+    | .call .recv => fun b => ⟨hp b, hq b⟩
+
+/-- Every `mrCellWP` safety property transfers automatically to `mrBudgetWP`. -/
+theorem mrCellWP_refines_budget {M FState G : Type} [Memory M] [MemoryOps M]
+    (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop)
+    (i : (AtomicCellE Nat).I)
+    (K : (AtomicCellE Nat).O i → MrAtomicSt M FState G → Prop)
+    (ms : MrAtomicSt M FState G)
+    (hw : (mrCellWP A ptr pty t mRely).wp i K ms) :
+    (mrBudgetWP A ptr pty t mRely).wp i K ms := by
+  match i with
+  | .call .load =>
+    intro m₁ hm
+    refine ⟨(hw m₁ hm).1, fun v m₂ hok =>
+      ⟨((hw m₁ hm).2 v m₂ hok).1, fun _ => ((hw m₁ hm).2 v m₂ hok).2 ms.2.budget,
+       fun _ _ => ((hw m₁ hm).2 v m₂ hok).2 (ms.2.budget - 1)⟩⟩
+  | .call (.cas _ _) =>
+    intro m₁ hm
+    refine ⟨(hw m₁ hm).1, fun ret m₂ hok =>
+      let hw0 := ((hw m₁ hm).2 ret m₂ hok).2 ms.2.budget
+      let hw1 := ((hw m₁ hm).2 ret m₂ hok).2 (ms.2.budget - 1)
+      ⟨((hw m₁ hm).2 ret m₂ hok).1,
+       fun _ => ⟨hw0.1, fun he => ⟨(hw0.2 he).1, fun _ => (hw1.2 he).2⟩⟩,
+       fun _ _ => ⟨hw1.1, fun he => ⟨(hw1.2 he).1, (hw1.2 he).2⟩⟩⟩⟩
+  | .call (.callF _) => exact hw
+  | .call .dropF =>
+    intro m₁ hm
+    refine ⟨(hw m₁ hm).1, fun v m₂ hok =>
+      ⟨((hw m₁ hm).2 v m₂ hok).1, fun _ hr => ((hw m₁ hm).2 v m₂ hok).2 ms.2.budget hr,
+       fun _ _ hr => ((hw m₁ hm).2 v m₂ hok).2 (ms.2.budget - 1) hr⟩⟩
+  | .call .recv => exact hw
+
+/--
+**Machine-backed unconditional termination (`tryUpdate_mr_dwp_ranked`)**: under
+bounded concurrent machine interference and bounded spurious weak-CAS failures
+(`mrBudgetWP`), `tryUpdateLoop` terminates unconditionally through real
+`evalIntrinsicM` steps with `MInv ms.1 ms.2.cell ∧ CreusotPost …` (proved by
+well-founded induction on `s.budget` via `dwp_iter_ranked_lt`).
+-/
+theorem tryUpdate_mr_dwp_ranked {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    DWP (mrBudgetWP A ptr pty t mRely) (tryUpdateLoop Nat)
+      (fun r ms => MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (m₀, s₀) := by
+  have hstep : ∀ n prev (ms : MrAtomicSt M FState G),
+      (MInv ms.1 ms.2.cell ∧ RankedInv A Rel init f₀ g₀ comm₀ n prev ms.2) →
+      DWP (mrBudgetWP A ptr pty t mRely) (tryBody prev)
+        (Sum.elim (fun next ms' => ∃ m, m < n ∧
+            MInv ms'.1 ms'.2.cell ∧ RankedInv A Rel init f₀ g₀ comm₀ m next ms'.2)
+          (fun r ms' =>
+            MInv ms'.1 ms'.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms'.2)) ms := by
+    intro n prev ⟨m, s⟩ ⟨hm, hl, hb⟩
+    dsimp only at hm hl hb
+    refine DWP.vis ⟨loopInv_pre hpre hl, fun f' r hpost => ?_⟩
+    cases r with
+    | none =>
+      dsimp only
+      change DWP (mrBudgetWP A ptr pty t mRely) (tryCallK prev (callOut prev none)) _ _
+      rw [tryCallK_none]
+      refine DWP.vis fun m₁' hm₁' => ?_
+      obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+      refine ⟨hadm.load_ok m₁' c' hmc', fun v' m₂' hload' => ?_⟩
+      obtain ⟨hv', hm2'⟩ := mr_observe hadm hm hm₁' hload'
+      exact ⟨hv',
+        fun _ hres => DWP.ret ⟨hm2', loopInv_err_post hpre hl hpost hv' s.budget hres⟩,
+        fun _ _ hres => DWP.ret ⟨hm2', loopInv_err_post hpre hl hpost hv' (s.budget - 1) hres⟩⟩
+    | some next =>
+      dsimp only
+      change DWP (mrBudgetWP A ptr pty t mRely) (tryCallK prev (callOut prev (some next))) _ _
+      rw [tryCallK_some]
+      have hnext_rep : IntType.can_represent t next = true :=
+        hrep s.fst prev f' next hl.2.2.1 hpost hl.1
+      refine DWP.vis fun m₁' hm₁' => ?_
+      obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+      refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+      obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+      have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
+      have hwin : ∀ b (heq : ret.toNat = prev),
+          casWin A prev next
+            (fun o s' => DWP (mrBudgetWP A ptr pty t mRely) (tryCasK prev next o)
+              (Sum.elim (fun next ms' => ∃ m, m < n ∧
+                  MInv ms'.1 ms'.2.cell ∧ RankedInv A Rel init f₀ g₀ comm₀ m next ms'.2)
+                (fun r ms' => MInv ms'.1 ms'.2.cell ∧
+                  CreusotPost A Rel init f₀ g₀ comm₀ r ms'.2)) (m₂', s'))
+            { s with fst := f', cell := ret.toNat } b := by
+        intro b heq
+        refine ⟨loopInv_unshot (s := s) hpre hl, loopInv_win_pre (s := s) hpre hl hpost,
+          fun g' hg' => ?_⟩
+        dsimp only
+        rw [tryCasK_true]
+        have hm2' : MInv m₂' next := hstore (hret ▸ heq)
+        refine DWP.vis fun m₁'' hm₁'' => ?_
+        obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm2' hm₁''
+        refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+        obtain ⟨hv'', hm2''⟩ := mr_observe hadm hm2' hm₁'' hload''
+        refine ⟨hv'', fun _ hres => DWP.ret ⟨hm2'', ?_⟩, fun _ _ hres => DWP.ret ⟨hm2'', ?_⟩⟩
+        · simpa only [heq, AtomicSt.commit] using loopInv_ok_post hpre hl hpost hg' hv'' b b hres
+        · simpa only [heq, AtomicSt.commit] using
+            loopInv_ok_post hpre hl hpost hg' hv'' b (b - 1) hres
+      refine ⟨hrel, fun hsc => ⟨fun hne => absurd (hsc.trans hl.2.1) hne, fun heq => ?_⟩,
+        fun _ hpos => ⟨fun hne => ?_, fun heq => ?_⟩⟩
+      · refine ⟨hwin s.budget heq, fun hpos mFail hfail => ?_⟩
+        dsimp only at hpos ⊢
+        change DWP (mrBudgetWP A ptr pty t mRely)
+          (tryCasK prev next (casOut prev next false ret.toNat)) _ _
+        rw [tryCasK_false]
+        have hmf : MInv mFail ret.toNat := by
+          have := hadm.load_val m₁' c' ret mFail hmc' hfail; exact this.1 ▸ this.2
+        exact DWP.ret ⟨n - 1, by omega, hmf, loopInv_fail hpre hl hpost hrel (s.budget - 1),
+          show s.budget - 1 = n - 1 by omega⟩
+      · dsimp only at hpos ⊢
+        change DWP (mrBudgetWP A ptr pty t mRely)
+          (tryCasK prev next (casOut prev next false ret.toNat)) _ _
+        rw [tryCasK_false]
+        have hm2' : MInv m₂' ret.toNat := hret ▸ hkeep (hret ▸ hne)
+        exact DWP.ret ⟨n - 1, by omega, hm2', loopInv_fail hpre hl hpost hrel (s.budget - 1),
+          show s.budget - 1 = n - 1 by omega⟩
+      · refine ⟨hwin (s.budget - 1) heq, fun mFail hfail => ?_⟩
+        dsimp only at hpos ⊢
+        change DWP (mrBudgetWP A ptr pty t mRely)
+          (tryCasK prev next (casOut prev next false ret.toNat)) _ _
+        rw [tryCasK_false]
+        have hmf : MInv mFail ret.toNat := by
+          have := hadm.load_val m₁' c' ret mFail hmc' hfail; exact this.1 ▸ this.2
+        exact DWP.ret ⟨n - 1, by omega, hmf, loopInv_fail hpre hl hpost hrel (s.budget - 1),
+          show s.budget - 1 = n - 1 by omega⟩
+  refine DWP.vis fun m₁ hm₁ => ?_
+  obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m₀ _ m₁ hm₀ hm₁
+  refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+  obtain ⟨hv, hm2⟩ := mr_observe hadm hm₀ hm₁ hload
+  refine ⟨hv, fun _ => ?_, fun _ _ => ?_⟩
+  · dsimp only [loadAns]
+    exact dwp_iter_ranked_lt tryBody
+      (fun n prev (ms : MrAtomicSt M FState G) =>
+        MInv ms.1 ms.2.cell ∧ RankedInv A Rel init f₀ g₀ comm₀ n prev ms.2)
+      hstep (n := s₀.budget) ⟨hm2, loopInv_of_init hpre hs₀ hv s₀.budget, rfl⟩
+  · dsimp only [loadAns]
+    exact dwp_iter_ranked_lt tryBody
+      (fun n prev (ms : MrAtomicSt M FState G) =>
+        MInv ms.1 ms.2.cell ∧ RankedInv A Rel init f₀ g₀ comm₀ n prev ms.2)
+      hstep (n := s₀.budget - 1) ⟨hm2, loopInv_of_init hpre hs₀ hv (s₀.budget - 1), rfl⟩
+
+/-- Machine-backed `Eventually` termination under bounded contention (`mrBudgetWP`). -/
+theorem tryUpdate_mr_eventually {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀)
+    (Target : MrAtomicSt M FState G → Prop) :
+    Eventually (mrBudgetWP A ptr pty t mRely) Target
+      (fun r ms => MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (m₀, s₀) :=
+  eventually_of_dwp Target (tryUpdate_mr_dwp_ranked hpre hrep hadm hm₀ hs₀)
+
+/-- Tree Borrows `MachTB.wfLive` unconditional termination (`DWP`) under `mrBudgetWP`. -/
+theorem tryUpdate_mr_tb_wfLive_dwp {FState G : Type}
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer TreeBorrowsProvenance} {pty : «Type»} {t : IntType}
+    {mRely : MachTB → MachTB → Prop} {MInv : MachTB → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    (hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m → mRely m m' →
+      MiniRustSpec.Correspondence.MachTB.wfLive m')
+    {m₀ : MachTB} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hwf₀ : MiniRustSpec.Correspondence.MachTB.wfLive m₀)
+    (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    DWP (mrBudgetWP A ptr pty t mRely) (tryUpdateLoop Nat)
+      (fun r ms => (MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (m₀, s₀) := by
+  let hadm' : MrCellAdmissible A ptr pty t mRely
+      (fun m c => MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m) :=
+    { rely_refl := fun m c hm => hadm.rely_refl m c hm.1
+      rely_pres := fun m c m' hm hrel =>
+        let ⟨c', hc', hm'⟩ := hadm.rely_pres m c m' hm.1 hrel
+        ⟨c', hc', hm', hrely_wf m m' hm.2 hrel⟩
+      load_ok := fun m c hm => hadm.load_ok m c hm.1
+      load_val := fun m c v m' hm hok =>
+        let ⟨hv, hm'⟩ := hadm.load_val m c v m' hm.1 hok
+        ⟨hv, hm', evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1⟩
+      cas_ok := fun m c e d hm hr => hadm.cas_ok m c e d hm.1 hr
+      cas_val := fun m c e d ret m' hm hr hok =>
+        let ⟨hret, hs, hk⟩ := hadm.cas_val m c e d ret m' hm.1 hr hok
+        let hwf := evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1
+        ⟨hret, fun he => ⟨hs he, hwf⟩, fun hne => ⟨hk hne, hwf⟩⟩ }
+  exact tryUpdate_mr_dwp_ranked hpre hrep hadm' ⟨hm₀, hwf₀⟩ hs₀
+
+/--
+**General non-vacuity of `mrBudgetWP`**: for ANY memory model `M`, ANY
+`Realizable A`, and ANY coupled `MrCellAdmissible`, `mrBudgetWP` cannot
+discharge `DWP … False` from any admissible initial state `(m₀, s₀)`.
+-/
+theorem mrBudgetWP_nonvacuous_not_false {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    ¬ DWP (mrBudgetWP A ptr pty t mRely) (tryUpdateLoop Nat) (fun _ _ => False) (m₀, s₀) := by
+  intro hd
+  have hrf₀ := hadm.rely_refl m₀ s₀.cell hm₀
+  obtain ⟨v₀, m₁, hl₀⟩ := hadm.load_ok m₀ s₀.cell hm₀
+  obtain ⟨hv₀, hm₁⟩ := hadm.load_val m₀ s₀.cell v₀ m₁ hm₀ hl₀
+  have h1 := (((DWP.vis_iff _ _ _ _ _).1 hd m₀ hrf₀).2 v₀ m₁ hl₀).2.1 hv₀
+  dsimp only [loadAns] at h1
+  rw [iter_tryBody_eq] at h1
+  have hcall := (DWP.vis_iff _ _ _ _ _).1 h1
+  obtain ⟨f', r, hpost⟩ := hR.post_mut_total _ _ hcall.1
+  have h2 := hcall.2 f' r hpost
+  cases r with
+  | none =>
+    change DWP (mrBudgetWP A ptr pty t mRely)
+      (tryCallK v₀.toNat (callOut v₀.toNat none) >>= _) _ _ at h2
+    simp only [tryCallK_none, retAfterDrop, vis_bind] at h2
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨v₁, m₂, hl₁⟩ := hadm.load_ok m₁ s₀.cell hm₁
+    obtain ⟨hv₁, _⟩ := hadm.load_val m₁ s₀.cell v₁ m₂ hm₁ hl₁
+    have h3 := (((DWP.vis_iff _ _ _ _ _).1 h2 m₁ hrf₁).2 v₁ m₂ hl₁).2.1
+      (hv₁.trans hv₀.symm) (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h3
+  | some next =>
+    change DWP (mrBudgetWP A ptr pty t mRely)
+      (tryCallK v₀.toNat (callOut v₀.toNat (some next)) >>= _) _ _ at h2
+    rw [tryCallK_some, vis_bind] at h2
+    have hnext_rep : IntType.can_represent t (next : Int) = true := by
+      have hrl : Rel init v₀.toNat := by
+        rw [hv₀, hs₀.1]; exact hpre.cellInv.refl init
+      have hf : A.fSpec.hist_inv f₀ s₀.fst := hs₀.2.1 ▸ A.fSpec.hist_inv_laws.refl f₀
+      exact hrep s₀.fst v₀.toNat f' next hf hpost hrl
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨ret, m₂, hcas⟩ := hadm.cas_ok m₁ s₀.cell v₀.toNat next hm₁ hnext_rep
+    obtain ⟨hret, hstore, _⟩ := hadm.cas_val m₁ s₀.cell v₀.toNat next ret m₂ hm₁ hnext_rep hcas
+    have heq : ret.toNat = v₀.toNat := hret.trans hv₀.symm
+    have hwin := (((((DWP.vis_iff _ _ _ _ _).1 h2 m₁ hrf₁).2 ret m₂ hcas).2.1 heq).2 heq).1
+    obtain ⟨g', hg'⟩ := hR.gc_post_total _ _ _ hwin.2.1
+    have h3 := hwin.2.2 g' hg'
+    simp only [tryCasK_true, retAfterDrop, vis_bind] at h3
+    have hm₂ : MInv m₂ next := hstore hv₀.symm
+    have hrf₂ := hadm.rely_refl m₂ next hm₂
+    obtain ⟨v₂, m₃, hl₂⟩ := hadm.load_ok m₂ next hm₂
+    obtain ⟨hv₂, _⟩ := hadm.load_val m₂ next v₂ m₃ hm₂ hl₂
+    have h4 := (((DWP.vis_iff _ _ _ _ _).1 h3 m₂ hrf₂).2 v₂ m₃ hl₂).2.1
+      hv₂ (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h4
+
+/--
 **General non-vacuity of `mrCellWP`**: for ANY memory model `M`, ANY
 `Realizable A`, and ANY coupled `MrCellAdmissible` invariant, `mrCellWP` cannot
 discharge `DWP … False` from any admissible state (`MInv m₀ s₀.cell`) — every
@@ -3389,6 +4070,584 @@ theorem tryUpdate_mr_bm_u8_fair {FState G : Type} {A : AtomicEnv Nat FState G}
   tryUpdate_mr_fairInfOften hpre
     (fun f₂ x f₃ n hf hp hr => (u8_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr))
     (bmU8_mrCellAdmissible A hrefl) ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩ hs₀ _
+
+/--
+**Tree Borrows `u8` Streett liveness + enabledness + non-vacuity**: closes the
+`MachTB` parity gap on `u8`, proving `CoBuchi CasWon`, `InfOften CasAttempt`,
+and `¬ CoBuchi CasWon False` with `MachTB.wfLive` preserved at every step.
+-/
+theorem tryUpdate_mr_tb_u8_fair {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 256)
+    (b₀ : UInt8) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hb₀ : b₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    CoBuchi (mrCellWP A tbPtr tyRawPtr itU8 (tbU8MRely A.rely)) CasWon
+      (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+    InfOften (mrCellWP A tbPtr tyRawPtr itU8 (tbU8MRely A.rely)) CasAttempt
+      (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+    ¬ CoBuchi (mrCellWP A tbPtr tyRawPtr itU8 (tbU8MRely A.rely)) CasWon
+      (fun _ _ => False) (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) := by
+  have hadm := tbU8_mrCellAdmissible A hR.rely_refl
+  have hrep' : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ →
+      A.fSpec.post_mut f₂ x f₃ (some n) → Rel init x →
+      IntType.can_represent itU8 (n : Int) = true :=
+    fun f₂ x f₃ n hf hp hr => (u8_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr)
+  have hm₀ : tbU8MInv (tbU8Mach b₀ acc₀) s₀.cell := ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩
+  have hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m →
+      tbU8MRely A.rely m m' → MiniRustSpec.Correspondence.MachTB.wfLive m' := by
+    rintro m m' _ ⟨_, b', _, acc', _, _, rfl⟩
+    exact tbU8_wfLive b' acc'
+  have hf := tryUpdate_mr_tb_wfLive_fair hpre hrep' hadm hrely_wf hm₀ (tbU8_wfLive b₀ acc₀) hs₀
+    (fun _ _ _ _ => False)
+  exact ⟨hf.1, hf.2, tryUpdate_mr_fairInfOften_nonvacuous hR hpre hrep' hadm hm₀ hs₀ _ _⟩
+
+/-!
+#### Positive universal symbolic 8-byte little-endian `u64` instances (`Mach` & `MachTB`)
+
+Unlike 1-byte `u8` (`Align 1`), `itU64` exercises real multi-byte little-endian
+encoding/decoding (`leBytes` / `leValue` across all 8 bytes of the 8-aligned
+`bmCell` / `tbCell` allocation) and `Align 8` checks on both `BasicMemory` and
+`TreeBorrowsMemory` (`MachTB.wfLive`).
+-/
+
+private abbrev mrALoad8 : Access := MiniRustSpec.AtomicIntrinsicsMR.aLoad 8
+private abbrev mrAStore8 : Access := MiniRustSpec.AtomicIntrinsicsMR.aStore 8
+
+/-- Little-endian byte round-trip for every byte width `n` and unsigned integer `u`. -/
+theorem leValue_leBytes (n : Nat) : ∀ u : Nat, leValue (leBytes u n) = u % 256 ^ n := by
+  induction n with
+  | zero => intro u; simp [leBytes, leValue, Nat.mod_one]
+  | succ n ih =>
+    intro u
+    simp only [leBytes, leValue, ih (u / 256)]
+    have hlt : u % 256 < 256 := Nat.mod_lt u (by decide)
+    have hu8 : (UInt8.ofNat (u % 256)).toNat = u % 256 := by
+      simp [Nat.mod_eq_of_lt hlt]
+    rw [hu8, Nat.pow_succ, Nat.mul_comm (256 ^ n) 256]
+    have hpow : 0 < 256 ^ n := Nat.pow_pos (by decide)
+    have hlt2 : (u / 256) % 256 ^ n < 256 ^ n := Nat.mod_lt _ hpow
+    have hbound : u % 256 + 256 * ((u / 256) % 256 ^ n) < 256 * 256 ^ n := by
+      have := Nat.mul_le_mul_left 256 (Nat.le_sub_one_of_lt hlt2)
+      omega
+    have hdecomp : u = (256 * 256 ^ n) * ((u / 256) / 256 ^ n) +
+        (u % 256 + 256 * ((u / 256) % 256 ^ n)) := by
+      have h1 : u = 256 * (u / 256) + u % 256 := (Nat.div_add_mod u 256).symm
+      have h2 : u / 256 = 256 ^ n * ((u / 256) / 256 ^ n) + (u / 256) % 256 ^ n :=
+        (Nat.div_add_mod (u / 256) (256 ^ n)).symm
+      calc u = 256 * (256 ^ n * ((u / 256) / 256 ^ n) + (u / 256) % 256 ^ n) + u % 256 := by
+            conv => lhs; rw [h1, h2]
+        _ = (256 * 256 ^ n) * ((u / 256) / 256 ^ n) +
+              (u % 256 + 256 * ((u / 256) % 256 ^ n)) := by
+            rw [Nat.mul_add, ← Nat.mul_assoc]; omega
+    conv => rhs; rw [hdecomp]
+    rw [Nat.mul_add_mod, Nat.mod_eq_of_lt hbound]
+
+/-- The 8 initialized little-endian bytes of a `UInt64`. -/
+def u64InitBytes {P : Type} (x : UInt64) : List (AbstractByte P) :=
+  (leBytes x.toNat 8).map (AbstractByte.Init · none)
+
+/-- A `Mach` (`BasicMemory<x86_64>`) holding 8-byte little-endian `x : UInt64` and log `acc`. -/
+def bmU64Mach (x : UInt64) (acc : List Access) : Mach :=
+  bmMach [bmCell (u64InitBytes x)] acc
+
+/--
+A `MachTB` (`TreeBorrowsMemory<x86_64>`) holding 8-byte little-endian `x : UInt64` and log `acc`.
+-/
+def tbU64Mach (x : UInt64) (acc : List Access) : MachTB :=
+  let m0 := tbWith (u64InitBytes x)
+  { m0 with mem := { m0.mem with accesses := acc } }
+
+private theorem int_two_pow_64 : (2 : Int) ^ (8 * 8) = ((2 ^ 64 : Nat) : Int) := by
+  rw [show 8 * 8 = 64 from rfl]
+  exact (Int.natCast_pow 2 64).symm
+
+private theorem pow256_8_eq : (256 : Nat) ^ 8 = 2 ^ 64 := by
+  rw [show (256 : Nat) = 2 ^ 8 from by decide, ← Nat.pow_mul]
+
+theorem u64_inBounds (x : UInt64) : inBounds (x.toNat : Int) .Unsigned ⟨8⟩ = true := by
+  have hx : x.toNat < 2 ^ 64 := x.toNat_lt
+  unfold inBounds Size.bits; dsimp only
+  rw [int_two_pow_64]
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  exact ⟨Int.natCast_nonneg _, Int.ofNat_lt.2 hx⟩
+
+theorem u64_can_represent_iff (n : Nat) :
+    IntType.can_represent itU64 (n : Int) = true ↔ n < 2 ^ 64 := by
+  unfold IntType.can_represent itU64 inBounds Size.bits; dsimp only
+  rw [int_two_pow_64]
+  simp only [Bool.and_eq_true, decide_eq_true_eq, Int.natCast_nonneg, true_and, Int.ofNat_lt]
+
+private theorem u64_endianness_encode (x : UInt64) :
+    Endianness.encode x86_64.ENDIANNESS .Unsigned ⟨8⟩ (x.toNat : Int) =
+      some (leBytes x.toNat 8) := by
+  have hx : x.toNat < 2 ^ 64 := x.toNat_lt
+  have hmod : ((x.toNat : Int) % (2 : Int) ^ Size.bits ⟨8⟩).toNat = x.toNat := by
+    change ((x.toNat : Int) % (2 : Int) ^ (8 * 8)).toNat = x.toNat
+    rw [int_two_pow_64, ← Int.natCast_emod, Nat.mod_eq_of_lt hx, Int.toNat_natCast]
+  unfold Endianness.encode
+  rw [u64_inBounds x]
+  simp only [↓reduceIte, x86_64.ENDIANNESS, hmod]
+
+theorem u64_encodeM {M : Type} [Memory M] (x : UInt64) :
+    Type.encodeM (M := M) (.Int itU64) (.Int x.toNat) = .ok (u64InitBytes x) := by
+  rw [Type.encodeM, Type.encodeIntM, u64_endianness_encode x]
+  rfl
+
+private theorem u64_checkValueM {M : Type} [Memory M] [MemoryOps M]
+    (x : UInt64) (m : Option (Machine M)) :
+    checkValueM (M := M) (.Int x.toNat) (.Int itU64) m = .ok () := by
+  rw [checkValueM]
+  unfold IntType.can_represent
+  dsimp only [itU64]
+  rw [u64_inBounds x]
+  rfl
+
+private theorem mapM_init_dataM_8 {P : Type} (b0 b1 b2 b3 b4 b5 b6 b7 : UInt8) :
+    List.mapM (AbstractByte.dataM (Provenance := P))
+      ([b0, b1, b2, b3, b4, b5, b6, b7].map (AbstractByte.Init · none)) =
+      some [b0, b1, b2, b3, b4, b5, b6, b7] := rfl
+
+theorem u64_decodeM {M : Type} [Memory M] [MemoryOps M] (x : UInt64) :
+    Type.decodeM (M := M) (.Int itU64) (u64InitBytes x) = .ok (some (.Int x.toNat)) := by
+  have hlt : x.toNat < 256 ^ 8 := pow256_8_eq ▸ x.toNat_lt
+  have hlen : (u64InitBytes (P := Memory.Provenance M) x).length = 8 := rfl
+  have hmap : List.mapM (AbstractByte.dataM (Provenance := Memory.Provenance M))
+      (u64InitBytes x) = some (leBytes x.toNat 8) :=
+    mapM_init_dataM_8 _ _ _ _ _ _ _ _
+  unfold Type.decodeM Type.decodeIntM Endianness.decode
+  simp only [x86_64.ENDIANNESS, hlen, ne_eq, not_true_eq_false, ↓reduceIte]
+  rw [hmap]
+  dsimp only [pure, Except.pure]
+  rw [leValue_leBytes, Nat.mod_eq_of_lt hlt]
+
+theorem u64_layout : Type.layout (.Int itU64) = .ok (.Sized ⟨8⟩ ⟨8⟩) := rfl
+
+/-- Symbolic 8-byte MiniRust `typedLoadM` on `bmU64Mach x acc` for arbitrary `x : UInt64`. -/
+theorem bmU64_typedLoad (x : UInt64) (acc : List Access) :
+    typedLoadM (M := BM) (bmU64Mach x acc) bmPtr (.Int itU64) ⟨8⟩ .Atomic =
+      .ok (.Int x.toNat, bmU64Mach x (acc ++ [mrALoad8])) := by
+  have hmem : MemoryOps.load (M := BM) (bmU64Mach x acc).mem.memory bmPtr ⟨8⟩ ⟨8⟩ =
+      .ok (u64InitBytes x, (bmU64Mach x acc).mem.memory) := rfl
+  unfold typedLoadM ConcurrentMemory.load
+  rw [u64_layout, interp_ok_bind]
+  change (pure (⟨8⟩ : Size) >>= fun size => _) = _
+  rw [interp_pure_bind, hmem, interp_ok_bind, interp_pure_bind]
+  dsimp only
+  rw [u64_decodeM x, interp_ok_bind]
+  simp only [checkValueM, IntType.can_represent, u64_inBounds x, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, interp_pure_bind]
+  rfl
+
+private theorem typedStoreM_of_ok {M : Type} [Memory M] [MemoryOps M]
+    {m : Machine M} {ptr : ThinPointer (Memory.Provenance M)}
+    {val : Value M} {ty : «Type»} {align : Align} {atomicity : Atomicity}
+    {bytes : List (AbstractByte (Memory.Provenance M))} {mem' : M}
+    (hchk : checkValueM val ty (some m) = .ok ())
+    (henc : Type.encodeM (M := M) ty val = .ok bytes)
+    (hmem : MemoryOps.store m.mem.memory ptr bytes align = .ok mem') :
+    typedStoreM m ptr val ty align atomicity =
+      .ok { m with mem := ConcurrentMemory.mk mem' (m.mem.accesses ++
+        [{ ty := .Store, atomicity := atomicity, addr := ptr.addr,
+           len := ⟨bytes.length⟩ }]) } := by
+  unfold typedStoreM ConcurrentMemory.store
+  rw [hchk]
+  dsimp only
+  rw [henc, interp_ok_bind, hmem, interp_ok_bind, interp_pure_bind]
+  rfl
+
+/-- Symbolic 8-byte MiniRust `typedStoreM` on `bmU64Mach x acc` for arbitrary `x y : UInt64`. -/
+theorem bmU64_typedStore (x y : UInt64) (acc : List Access) :
+    typedStoreM (M := BM) (bmU64Mach x acc) bmPtr (.Int y.toNat) (.Int itU64) ⟨8⟩ .Atomic =
+      .ok (bmU64Mach y (acc ++ [mrAStore8])) := by
+  have hmem : MemoryOps.store (M := BM) (bmU64Mach x acc).mem.memory bmPtr (u64InitBytes y) ⟨8⟩ =
+      .ok (bmU64Mach y acc).mem.memory := rfl
+  exact typedStoreM_of_ok (u64_checkValueM y _) (u64_encodeM y) hmem
+
+/-- Symbolic 8-byte MiniRust `typedLoadM` on `tbU64Mach x acc` for arbitrary `x : UInt64`. -/
+theorem tbU64_typedLoad (x : UInt64) (acc : List Access) :
+    typedLoadM (M := TBM) (tbU64Mach x acc) tbPtr (.Int itU64) ⟨8⟩ .Atomic =
+      .ok (.Int x.toNat, tbU64Mach x (acc ++ [mrALoad8])) := by
+  have hmem : MemoryOps.load (M := TBM) (tbU64Mach x acc).mem.memory tbPtr ⟨8⟩ ⟨8⟩ =
+      .ok (u64InitBytes x, (tbU64Mach x acc).mem.memory) := rfl
+  unfold typedLoadM ConcurrentMemory.load
+  rw [u64_layout, interp_ok_bind]
+  change (pure (⟨8⟩ : Size) >>= fun size => _) = _
+  rw [interp_pure_bind, hmem, interp_ok_bind, interp_pure_bind]
+  dsimp only
+  rw [u64_decodeM x, interp_ok_bind]
+  simp only [checkValueM, IntType.can_represent, u64_inBounds x, ensureElseUb,
+    Bool.not_true, Bool.false_eq_true, ↓reduceIte, interp_pure_bind]
+  rfl
+
+/-- Symbolic 8-byte MiniRust `typedStoreM` on `tbU64Mach x acc` for arbitrary `x y : UInt64`. -/
+theorem tbU64_typedStore (x y : UInt64) (acc : List Access) :
+    typedStoreM (M := TBM) (tbU64Mach x acc) tbPtr (.Int y.toNat) (.Int itU64) ⟨8⟩ .Atomic =
+      .ok (tbU64Mach y (acc ++ [mrAStore8])) := by
+  have hmem : MemoryOps.store (M := TBM) (tbU64Mach x acc).mem.memory tbPtr (u64InitBytes y) ⟨8⟩ =
+      .ok (tbU64Mach y acc).mem.memory := rfl
+  exact typedStoreM_of_ok (u64_checkValueM y _) (u64_encodeM y) hmem
+
+/-- Every `tbU64Mach x acc` is `MachTB.wfLive` (derived via `evalIntrinsicM_atomic_tb_wfLive`). -/
+theorem tbU64_wfLive (x : UInt64) (acc : List Access) :
+    MiniRustSpec.Correspondence.MachTB.wfLive (tbU64Mach x acc) := by
+  have h0 : MiniRustSpec.Correspondence.MachTB.wfLive (tbWith []) :=
+    ep1_minirust_atomic_intrinsics_capstone.2.1.2
+  have hmem : MemoryOps.store (M := TBM) (tbWith []).mem.memory tbPtr (u64InitBytes x) ⟨8⟩ =
+      .ok (tbU64Mach x []).mem.memory := rfl
+  have hst : evalIntrinsicM (M := TBM) (tbWith []) .AtomicStore
+      [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int x.toNat, .Int itU64)] unitType =
+      .ok (unitValueM, tbU64Mach x [mrAStore8]) := by
+    rw [atomicStore_eq_typedStoreM (tbWith []) tbPtr tyRawPtr (.Int x.toNat) (.Int itU64)
+      u64_layout rfl (by decide)]
+    have hts : typedStoreM (M := TBM) (tbWith []) tbPtr (.Int x.toNat) (.Int itU64)
+        ⟨((8 : Nat) : Int).toNat⟩ .Atomic = .ok (tbU64Mach x [mrAStore8]) :=
+      typedStoreM_of_ok (u64_checkValueM x _) (u64_encodeM x) hmem
+    rw [hts, interp_ok_bind]
+    rfl
+  change MiniRustSpec.Correspondence.MachTB.wfLive (tbU64Mach x [mrAStore8])
+  exact evalIntrinsicM_atomic_tb_wfLive rfl h0 hst
+
+/-- Coupled invariant on `Mach`: the 8-byte heap cell holds little-endian `u64` `c`. -/
+def bmU64MInv (m : Mach) (c : Nat) : Prop :=
+  ∃ (x : UInt64) (acc : List Access), x.toNat = c ∧ m = bmU64Mach x acc
+
+/-- Coupled invariant on `MachTB`: the 8-byte Tree Borrows cell holds little-endian `u64` `c`. -/
+def tbU64MInv (m : MachTB) (c : Nat) : Prop :=
+  ∃ (x : UInt64) (acc : List Access), x.toNat = c ∧ m = tbU64Mach x acc
+
+/-- Concurrent 8-byte machine rely on `Mach`. -/
+def bmU64MRely (rely : Nat → Nat → Prop) (m m' : Mach) : Prop :=
+  ∃ (x x' : UInt64) (acc acc' : List Access),
+    rely x.toNat x'.toNat ∧ m = bmU64Mach x acc ∧ m' = bmU64Mach x' acc'
+
+/-- Concurrent 8-byte machine rely on `MachTB`. -/
+def tbU64MRely (rely : Nat → Nat → Prop) (m m' : MachTB) : Prop :=
+  ∃ (x x' : UInt64) (acc acc' : List Access),
+    rely x.toNat x'.toNat ∧ m = tbU64Mach x acc ∧ m' = tbU64Mach x' acc'
+
+private theorem list_map_inj {α β : Type} {f : α → β} (hf : ∀ a b, f a = f b → a = b) :
+    ∀ {l₁ l₂ : List α}, l₁.map f = l₂.map f → l₁ = l₂
+  | [], [], _ => rfl
+  | _ :: _, [], h => nomatch h
+  | [], _ :: _, h => nomatch h
+  | a :: as, b :: bs, h => by
+    have ⟨h1, h2⟩ := List.cons.inj h
+    rw [hf a b h1, list_map_inj hf h2]
+
+private theorem u64InitBytes_inj {P : Type} {x₁ x₂ : UInt64}
+    (h : u64InitBytes (P := P) x₁ = u64InitBytes (P := P) x₂) : x₁ = x₂ := by
+  have hmap : leBytes x₁.toNat 8 = leBytes x₂.toNat 8 :=
+    list_map_inj (fun _ _ he => (AbstractByte.Init.inj he).1) h
+  have hval := congrArg leValue hmap
+  rw [leValue_leBytes, leValue_leBytes] at hval
+  have h1 : x₁.toNat < 256 ^ 8 := pow256_8_eq ▸ x₁.toNat_lt
+  have h2 : x₂.toNat < 256 ^ 8 := pow256_8_eq ▸ x₂.toNat_lt
+  rw [Nat.mod_eq_of_lt h1, Nat.mod_eq_of_lt h2] at hval
+  cases x₁; cases x₂
+  congr 1
+  exact BitVec.eq_of_toNat_eq hval
+
+private theorem bmU64Mach_val_inj {x₁ x₂ : UInt64} {acc₁ acc₂ : List Access}
+    (h : bmU64Mach x₁ acc₁ = bmU64Mach x₂ acc₂) : x₁ = x₂ := by
+  have h1 := congrArg (fun m => m.mem.memory.allocations) h
+  dsimp [bmU64Mach, bmMach, bmCell] at h1
+  exact u64InitBytes_inj (congrArg (fun a => a.data) (List.cons.inj h1).1)
+
+private theorem tbU64Mach_val_inj {x₁ x₂ : UInt64} {acc₁ acc₂ : List Access}
+    (h : tbU64Mach x₁ acc₁ = tbU64Mach x₂ acc₂) : x₁ = x₂ := by
+  have h1 := congrArg (fun m => m.mem.memory.mem.allocations) h
+  dsimp [tbU64Mach, tbWith, tbMach, tbCell] at h1
+  have h2 := congrArg (fun a => a.data) (List.cons.inj h1).1
+  have hlen : (u64InitBytes (P := TreeBorrowsProvenance) x₁).length = 8 := rfl
+  have hlen2 : (u64InitBytes (P := TreeBorrowsProvenance) x₂).length = 8 := rfl
+  simp only [hlen, hlen2, Nat.sub_self, uninitBytes] at h2
+  exact u64InitBytes_inj (by simpa using h2)
+
+private theorem nat_to_u64_of_rep {d : Nat} (hd : IntType.can_represent itU64 (d : Int) = true) :
+    ∃ dx : UInt64, dx.toNat = d := by
+  have hlt : d < 2 ^ 64 := (u64_can_represent_iff d).1 hd
+  exact ⟨UInt64.ofNat d, by simp [Nat.mod_eq_of_lt hlt]⟩
+
+/--
+**Positive universal 8-byte little-endian `u64` `MrCellAdmissible` on `Mach`**:
+holds for EVERY `AtomicEnv` with reflexive `A.rely`, EVERY 64-bit word
+`x : UInt64`, EVERY access log `acc`, and arbitrary `A.rely`-respecting
+concurrent interference `bmU64MRely A.rely`.
+-/
+theorem bmU64_mrCellAdmissible {FState G : Type} (A : AtomicEnv Nat FState G)
+    (hrefl : ∀ v, A.rely v v) :
+    MrCellAdmissible A bmPtr tyRawPtr itU64 (bmU64MRely A.rely) bmU64MInv where
+  rely_refl m c hm := by
+    obtain ⟨x, acc, _, rfl⟩ := hm
+    exact ⟨x, x, acc, acc, hrefl _, rfl, rfl⟩
+  rely_pres m c m' hm hr := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨x₁, x', acc₁, acc', hrel, heq, rfl⟩ := hr
+    have hx : x = x₁ := bmU64Mach_val_inj heq
+    subst hx
+    exact ⟨x'.toNat, hrel, x', acc', rfl, rfl⟩
+  load_ok m c hm := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    refine ⟨x.toNat, bmU64Mach x (acc ++ [mrALoad8]), ?_, Int.natCast_nonneg _⟩
+    rw [atomicLoad_eq_typedLoadM (bmU64Mach x acc) bmPtr tyRawPtr (.Int itU64) u64_layout rfl
+      (by decide)]
+    exact bmU64_typedLoad x acc
+  load_val m c v m' hm hok := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨hok1, _⟩ := hok
+    have hL : evalIntrinsicM (M := BM) (bmU64Mach x acc) .AtomicLoad
+        [(.Ptr ⟨bmPtr, none⟩, tyRawPtr)] (.Int itU64) =
+        .ok (.Int x.toNat, bmU64Mach x (acc ++ [mrALoad8])) := by
+      rw [atomicLoad_eq_typedLoadM (bmU64Mach x acc) bmPtr tyRawPtr (.Int itU64) u64_layout rfl
+        (by decide)]
+      exact bmU64_typedLoad x acc
+    rw [hL] at hok1
+    obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+    cases hv
+    exact ⟨Int.toNat_natCast _, x, acc ++ [mrALoad8], rfl, rfl⟩
+  cas_ok m c e d hm hd := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨dx, hdx⟩ := nat_to_u64_of_rep hd
+    by_cases he : x.toNat = e
+    · refine ⟨x.toNat, bmU64Mach dx ((acc ++ [mrALoad8]) ++ [mrAStore8]), ?_,
+        Int.natCast_nonneg _⟩
+      have hst := bmU64_typedStore x dx (acc ++ [mrALoad8])
+      rw [hdx] at hst
+      rw [← he]
+      exact atomicCompareExchange_success tyRawPtr (al := ⟨8⟩) rfl (by decide)
+        (bmU64_typedLoad x acc) hst
+    · refine ⟨x.toNat, bmU64Mach x (acc ++ [mrALoad8]), ?_, Int.natCast_nonneg _⟩
+      refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨8⟩) rfl (by decide)
+        (bmU64_typedLoad x acc) ?_
+      intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+  cas_val m c e d ret m' hm hd hok := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨dx, hdx⟩ := nat_to_u64_of_rep hd
+    obtain ⟨hok1, _⟩ := hok
+    by_cases he : x.toNat = e
+    · have hst := bmU64_typedStore x dx (acc ++ [mrALoad8])
+      rw [hdx] at hst
+      have hC : evalIntrinsicM (M := BM) (bmU64Mach x acc) .AtomicCompareExchange
+          [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int e, .Int itU64), (.Int d, .Int itU64)]
+          (.Int itU64) =
+          .ok (.Int x.toNat, bmU64Mach dx ((acc ++ [mrALoad8]) ++ [mrAStore8])) := by
+        rw [← he]
+        exact atomicCompareExchange_success tyRawPtr (al := ⟨8⟩) rfl (by decide)
+          (bmU64_typedLoad x acc) hst
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun _ => ⟨dx, (acc ++ [mrALoad8]) ++ [mrAStore8], hdx, rfl⟩,
+        fun hne => absurd he hne⟩
+    · have hC : evalIntrinsicM (M := BM) (bmU64Mach x acc) .AtomicCompareExchange
+          [(.Ptr ⟨bmPtr, none⟩, tyRawPtr), (.Int e, .Int itU64), (.Int d, .Int itU64)]
+          (.Int itU64) =
+          .ok (.Int x.toNat, bmU64Mach x (acc ++ [mrALoad8])) := by
+        refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨8⟩) rfl (by decide)
+          (bmU64_typedLoad x acc) ?_
+        intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun hEq => absurd hEq he,
+        fun _ => ⟨x, acc ++ [mrALoad8], rfl, rfl⟩⟩
+
+/--
+**Positive universal 8-byte little-endian `u64` `MrCellAdmissible` on `MachTB`**:
+holds for EVERY `AtomicEnv` with reflexive `A.rely`, EVERY 64-bit word
+`x : UInt64`, EVERY access log `acc`, and arbitrary `A.rely`-respecting
+concurrent interference `tbU64MRely A.rely`, with `tbU64_wfLive` supplying
+`MachTB.wfLive` at every configuration.
+-/
+theorem tbU64_mrCellAdmissible {FState G : Type} (A : AtomicEnv Nat FState G)
+    (hrefl : ∀ v, A.rely v v) :
+    MrCellAdmissible A tbPtr tyRawPtr itU64 (tbU64MRely A.rely) tbU64MInv where
+  rely_refl m c hm := by
+    obtain ⟨x, acc, _, rfl⟩ := hm
+    exact ⟨x, x, acc, acc, hrefl _, rfl, rfl⟩
+  rely_pres m c m' hm hr := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨x₁, x', acc₁, acc', hrel, heq, rfl⟩ := hr
+    have hx : x = x₁ := tbU64Mach_val_inj heq
+    subst hx
+    exact ⟨x'.toNat, hrel, x', acc', rfl, rfl⟩
+  load_ok m c hm := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    refine ⟨x.toNat, tbU64Mach x (acc ++ [mrALoad8]), ?_, Int.natCast_nonneg _⟩
+    rw [atomicLoad_eq_typedLoadM (tbU64Mach x acc) tbPtr tyRawPtr (.Int itU64) u64_layout rfl
+      (by decide)]
+    exact tbU64_typedLoad x acc
+  load_val m c v m' hm hok := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨hok1, _⟩ := hok
+    have hL : evalIntrinsicM (M := TBM) (tbU64Mach x acc) .AtomicLoad
+        [(.Ptr ⟨tbPtr, none⟩, tyRawPtr)] (.Int itU64) =
+        .ok (.Int x.toNat, tbU64Mach x (acc ++ [mrALoad8])) := by
+      rw [atomicLoad_eq_typedLoadM (tbU64Mach x acc) tbPtr tyRawPtr (.Int itU64) u64_layout rfl
+        (by decide)]
+      exact tbU64_typedLoad x acc
+    rw [hL] at hok1
+    obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+    cases hv
+    exact ⟨Int.toNat_natCast _, x, acc ++ [mrALoad8], rfl, rfl⟩
+  cas_ok m c e d hm hd := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨dx, hdx⟩ := nat_to_u64_of_rep hd
+    by_cases he : x.toNat = e
+    · refine ⟨x.toNat, tbU64Mach dx ((acc ++ [mrALoad8]) ++ [mrAStore8]), ?_,
+        Int.natCast_nonneg _⟩
+      have hst := tbU64_typedStore x dx (acc ++ [mrALoad8])
+      rw [hdx] at hst
+      rw [← he]
+      exact atomicCompareExchange_success tyRawPtr (al := ⟨8⟩) rfl (by decide)
+        (tbU64_typedLoad x acc) hst
+    · refine ⟨x.toNat, tbU64Mach x (acc ++ [mrALoad8]), ?_, Int.natCast_nonneg _⟩
+      refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨8⟩) rfl (by decide)
+        (tbU64_typedLoad x acc) ?_
+      intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+  cas_val m c e d ret m' hm hd hok := by
+    obtain ⟨x, acc, rfl, rfl⟩ := hm
+    obtain ⟨dx, hdx⟩ := nat_to_u64_of_rep hd
+    obtain ⟨hok1, _⟩ := hok
+    by_cases he : x.toNat = e
+    · have hst := tbU64_typedStore x dx (acc ++ [mrALoad8])
+      rw [hdx] at hst
+      have hC : evalIntrinsicM (M := TBM) (tbU64Mach x acc) .AtomicCompareExchange
+          [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int e, .Int itU64), (.Int d, .Int itU64)]
+          (.Int itU64) =
+          .ok (.Int x.toNat, tbU64Mach dx ((acc ++ [mrALoad8]) ++ [mrAStore8])) := by
+        rw [← he]
+        exact atomicCompareExchange_success tyRawPtr (al := ⟨8⟩) rfl (by decide)
+          (tbU64_typedLoad x acc) hst
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun _ => ⟨dx, (acc ++ [mrALoad8]) ++ [mrAStore8], hdx, rfl⟩,
+        fun hne => absurd he hne⟩
+    · have hC : evalIntrinsicM (M := TBM) (tbU64Mach x acc) .AtomicCompareExchange
+          [(.Ptr ⟨tbPtr, none⟩, tyRawPtr), (.Int e, .Int itU64), (.Int d, .Int itU64)]
+          (.Int itU64) =
+          .ok (.Int x.toNat, tbU64Mach x (acc ++ [mrALoad8])) := by
+        refine atomicCompareExchange_failure tyRawPtr (.Int d) (al := ⟨8⟩) rfl (by decide)
+          (tbU64_typedLoad x acc) ?_
+        intro hEq; exact he (Int.ofNat.inj (Value.Int.inj hEq)).symm
+      rw [hC] at hok1
+      obtain ⟨hv, rfl⟩ := Prod.mk.inj (Except.ok.inj hok1)
+      cases hv
+      exact ⟨Int.toNat_natCast _, fun hEq => absurd hEq he,
+        fun _ => ⟨x, acc ++ [mrALoad8], rfl, rfl⟩⟩
+
+/--
+**End-to-end 8-byte `u64` `BasicMemory` capstone**: for ANY `Realizable`
+64-bit-bounded environment (`hrep`), ANY `x₀ : UInt64`, and ANY `acc₀`, proves
+unbounded safety (`Always` + `¬ DWP … False`), Streett liveness + enabledness +
+CoBuchi non-vacuity (`CoBuchi CasWon` + `InfOften CasAttempt` +
+`¬ CoBuchi CasWon False`), and bounded-contention unconditional termination
+(`mrBudgetWP` `DWP` + `Eventually` + `¬ DWP … False`).
+-/
+theorem tryUpdate_mr_bm_u64_complete {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 2 ^ 64)
+    (x₀ : UInt64) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hx₀ : x₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    Always (mrCellWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely))
+      (fun ms => bmU64MInv ms.1 ms.2.cell ∧ HistInvSt A Rel init f₀ ms.2)
+      (fun r ms => bmU64MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+    CoBuchi (mrCellWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely)) CasWon
+      (fun r ms => bmU64MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+    InfOften (mrCellWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely)) CasAttempt
+      (fun r ms => bmU64MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+    ¬ CoBuchi (mrCellWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely)) CasWon
+      (fun _ _ => False) (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+    DWP (mrBudgetWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely)) (tryUpdateLoop Nat)
+      (fun r ms => bmU64MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (bmU64Mach x₀ acc₀, s₀) ∧
+    ¬ DWP (mrBudgetWP A bmPtr tyRawPtr itU64 (bmU64MRely A.rely)) (tryUpdateLoop Nat)
+      (fun _ _ => False) (bmU64Mach x₀ acc₀, s₀) := by
+  have hadm := bmU64_mrCellAdmissible A hR.rely_refl
+  have hrep' : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ →
+      A.fSpec.post_mut f₂ x f₃ (some n) → Rel init x →
+      IntType.can_represent itU64 (n : Int) = true :=
+    fun f₂ x f₃ n hf hp hr => (u64_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr)
+  have hm₀ : bmU64MInv (bmU64Mach x₀ acc₀) s₀.cell := ⟨x₀, acc₀, hx₀.trans hs₀.1.symm, rfl⟩
+  exact ⟨tryUpdate_mr_always_safety hpre hrep' hadm hm₀ hs₀,
+    tryUpdate_mr_fairInfOften hpre hrep' hadm hm₀ hs₀ _,
+    tryUpdate_mr_infOften_attemptCas hpre hrep' hadm hm₀ hs₀,
+    tryUpdate_mr_fairInfOften_nonvacuous hR hpre hrep' hadm hm₀ hs₀ _ _,
+    tryUpdate_mr_dwp_ranked hpre hrep' hadm hm₀ hs₀,
+    mrBudgetWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
+
+/--
+**End-to-end 8-byte `u64` Tree Borrows `MachTB` capstone**: for ANY `Realizable`
+64-bit-bounded environment (`hrep`), ANY `x₀ : UInt64`, and ANY `acc₀`, proves
+unbounded safety (`Always` + `MachTB.wfLive`), Streett liveness + enabledness +
+CoBuchi non-vacuity (`CoBuchi CasWon` + `InfOften CasAttempt` +
+`¬ CoBuchi CasWon False` + `MachTB.wfLive`), and bounded-contention unconditional
+termination (`mrBudgetWP` `DWP` + `MachTB.wfLive` + `¬ DWP … False`).
+-/
+theorem tryUpdate_mr_tb_u64_complete {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 2 ^ 64)
+    (x₀ : UInt64) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hx₀ : x₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    Always (mrCellWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely))
+      (fun ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        HistInvSt A Rel init f₀ ms.2)
+      (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+    CoBuchi (mrCellWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely)) CasWon
+      (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+    InfOften (mrCellWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely)) CasAttempt
+      (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+    ¬ CoBuchi (mrCellWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely)) CasWon
+      (fun _ _ => False) (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+    DWP (mrBudgetWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely)) (tryUpdateLoop Nat)
+      (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tbU64Mach x₀ acc₀, s₀) ∧
+    ¬ DWP (mrBudgetWP A tbPtr tyRawPtr itU64 (tbU64MRely A.rely)) (tryUpdateLoop Nat)
+      (fun _ _ => False) (tbU64Mach x₀ acc₀, s₀) := by
+  have hadm := tbU64_mrCellAdmissible A hR.rely_refl
+  have hrep' : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ →
+      A.fSpec.post_mut f₂ x f₃ (some n) → Rel init x →
+      IntType.can_represent itU64 (n : Int) = true :=
+    fun f₂ x f₃ n hf hp hr => (u64_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr)
+  have hm₀ : tbU64MInv (tbU64Mach x₀ acc₀) s₀.cell := ⟨x₀, acc₀, hx₀.trans hs₀.1.symm, rfl⟩
+  have hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m →
+      tbU64MRely A.rely m m' → MiniRustSpec.Correspondence.MachTB.wfLive m' := by
+    rintro m m' _ ⟨_, x', _, acc', _, _, rfl⟩
+    exact tbU64_wfLive x' acc'
+  have hf := tryUpdate_mr_tb_wfLive_fair hpre hrep' hadm hrely_wf hm₀ (tbU64_wfLive x₀ acc₀) hs₀
+    (fun _ _ _ _ => False)
+  exact ⟨tryUpdate_mr_tb_wfLive_safety hpre hrep' hadm hrely_wf hm₀ (tbU64_wfLive x₀ acc₀) hs₀,
+    hf.1, hf.2,
+    tryUpdate_mr_fairInfOften_nonvacuous hR hpre hrep' hadm hm₀ hs₀ _ _,
+    tryUpdate_mr_tb_wfLive_dwp hpre hrep' hadm hrely_wf hm₀ (tbU64_wfLive x₀ acc₀) hs₀,
+    mrBudgetWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
 
 end MrBridge
 

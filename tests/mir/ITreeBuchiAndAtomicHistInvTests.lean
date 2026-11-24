@@ -813,6 +813,135 @@ theorem u8_counter_mr_bm_fair (delta limit : Nat) (hno : limit + delta ≤ 256)
   · simp only [hx, ↓reduceIte] at hr; cases hr; omega
   · simp only [hx, ↓reduceIte] at hr; cases hr
 
+/--
+**Tree Borrows `u8` Streett liveness + enabledness + CoBuchi non-vacuity**:
+closes `MachTB` parity for `u8`, pairing `CoBuchi CasWon` with
+`InfOften CasAttempt` and `¬ CoBuchi CasWon False` while preserving `MachTB.wfLive`.
+-/
+theorem u8_counter_mr_tb_fair (delta limit : Nat) (hno : limit + delta ≤ 256)
+    (b₀ : UInt8) (acc₀ : List MiniRustSpec.Gen.Access) (budget : Nat) :
+    let s₀ : AtomicSt Nat Nat (List (Nat × Nat)) :=
+      ⟨b₀.toNat, 0, .fresh b₀.toNat, 0, [], budget⟩
+    CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·))) CasWon
+      (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 [] (.fresh b₀.toNat) r ms.2)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+    InfOften (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·))) CasAttempt
+      (fun r ms => (tbU8MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 [] (.fresh b₀.toNat) r ms.2)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) ∧
+    ¬ CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·))) CasWon (fun _ _ => False)
+      (tryUpdateLoop Nat) (tbU8Mach b₀ acc₀, s₀) := by
+  intro s₀
+  refine tryUpdate_mr_tb_u8_fair (counter_realizable delta limit)
+    (counter_pre delta limit b₀.toNat 0 []) ?_ b₀ acc₀ rfl ⟨rfl, rfl, rfl, rfl, rfl⟩
+  intro _ x _ n _ ⟨_, hr⟩ _
+  by_cases hx : x < limit
+  · simp only [hx, ↓reduceIte] at hr; cases hr; omega
+  · simp only [hx, ↓reduceIte] at hr; cases hr
+
+/--
+**End-to-end 8-byte little-endian `AtomicU64` MiniRust `Mach` & `MachTB` witness**:
+for ANY 64-bit-bounded counter (`limit + delta ≤ 2^64`), ANY 64-bit word `x₀`,
+ANY access log `acc₀`, and ANY contention budget `budget`, proves on BOTH
+`BasicMemory` and `TreeBorrowsMemory` (`MachTB.wfLive`):
+1. Unbounded safety (`Always` under `mrCellWP`),
+2. Streett liveness (`CoBuchi CasWon`),
+3. Machine-level CAS enabledness (`InfOften CasAttempt`),
+4. Strict CoBuchi non-vacuity (`¬ CoBuchi CasWon False`),
+5. Bounded-contention unconditional termination (`DWP` under `mrBudgetWP`) +
+   non-vacuity (`¬ DWP … False`).
+-/
+theorem u64_counter_mr_bm_and_tb_complete (delta limit : Nat) (hno : limit + delta ≤ 2 ^ 64)
+    (x₀ : UInt64) (acc₀ : List MiniRustSpec.Gen.Access) (budget : Nat) :
+    let s₀ : AtomicSt Nat Nat (List (Nat × Nat)) :=
+      ⟨x₀.toNat, 0, .fresh x₀.toNat, 0, [], budget⟩
+    (Always (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·)))
+        (fun ms => bmU64MInv ms.1 ms.2.cell ∧
+          HistInvSt (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 ms.2)
+        (fun r ms => bmU64MInv ms.1 ms.2.cell ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+      CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) CasWon
+        (fun r ms => bmU64MInv ms.1 ms.2.cell ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+      InfOften (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) CasAttempt
+        (fun r ms => bmU64MInv ms.1 ms.2.cell ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+      ¬ CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) CasWon (fun _ _ => False)
+        (tryUpdateLoop Nat) (bmU64Mach x₀ acc₀, s₀) ∧
+      DWP (mrBudgetWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) (tryUpdateLoop Nat)
+        (fun r ms => bmU64MInv ms.1 ms.2.cell ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (bmU64Mach x₀ acc₀, s₀) ∧
+      ¬ DWP (mrBudgetWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) (tryUpdateLoop Nat) (fun _ _ => False)
+        (bmU64Mach x₀ acc₀, s₀)) ∧
+    (Always (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·)))
+        (fun ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          HistInvSt (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 ms.2)
+        (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+      CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) CasWon
+        (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+      InfOften (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) CasAttempt
+        (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+      ¬ CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) CasWon (fun _ _ => False)
+        (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+      DWP (mrBudgetWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) (tryUpdateLoop Nat)
+        (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+          CreusotPost (counterEnv delta limit) (· ≤ ·) x₀.toNat 0 [] (.fresh x₀.toNat) r ms.2)
+        (tbU64Mach x₀ acc₀, s₀) ∧
+      ¬ DWP (mrBudgetWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) (tryUpdateLoop Nat) (fun _ _ => False)
+        (tbU64Mach x₀ acc₀, s₀)) := by
+  intro s₀
+  have hrep : ∀ f₂ x f₃ (n : Nat), (counterEnv delta limit).fSpec.hist_inv 0 f₂ →
+      (counterEnv delta limit).fSpec.post_mut f₂ x f₃ (some n) → x₀.toNat ≤ x → n < 2 ^ 64 := by
+    intro _ x _ n _ ⟨_, hr⟩ _
+    by_cases hx : x < limit
+    · simp only [hx, ↓reduceIte] at hr; cases hr; omega
+    · simp only [hx, ↓reduceIte] at hr; cases hr
+  have hpre := counter_pre delta limit x₀.toNat 0 []
+  have hs₀ : InitSt x₀.toNat 0 [] (.fresh x₀.toNat) s₀ := ⟨rfl, rfl, rfl, rfl, rfl⟩
+  exact ⟨tryUpdate_mr_bm_u64_complete (counter_realizable delta limit) hpre hrep x₀ acc₀ rfl hs₀,
+    tryUpdate_mr_tb_u64_complete (counter_realizable delta limit) hpre hrep x₀ acc₀ rfl hs₀⟩
+
 /-! ## 2. Negative Fail-Closed Canaries -/
 
 /-! ### 2.1 Silent divergence -/
@@ -973,6 +1102,64 @@ theorem canary_mr_out_of_range_specPanic (b : UInt8) (acc : List MiniRustSpec.Ge
     mr_cas_out_of_range_specPanic_canary rfl (by decide) (bmU8_typedLoad b acc) hfalse,
     mr_cas_out_of_range_specPanic_canary rfl (by decide) (tbU8_typedLoad b acc) hfalse⟩
 
+/--
+**8-byte `u64` width-overflow `specPanic` canary**: even when `x.toNat ≤ d`,
+any `2^64 ≤ d` causes MiniRust `AtomicCompareExchange` at `itU64` (`Align 8`) to
+`Stop.specPanic` on BOTH `BasicMemory` and `TreeBorrowsMemory`.
+-/
+theorem canary_mr_u64_out_of_range_specPanic (x : UInt64) (acc : List MiniRustSpec.Gen.Access)
+    (d : Nat) (hd : 2 ^ 64 ≤ d) :
+    x.toNat ≤ d ∧
+    (¬ ∃ ret m', mrCasOk (bmU64Mach x acc) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        x.toNat d ret m') ∧
+    (¬ ∃ ret m', mrCasOk (tbU64Mach x acc) MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        x.toNat d ret m') := by
+  have hx : x.toNat < 2 ^ 64 := x.toNat_lt
+  have hfalse : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+      (d : Int) = false := by
+    cases h : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (d : Int)
+    · rfl
+    · exact absurd ((u64_can_represent_iff d).1 h) (by omega)
+  exact ⟨by omega,
+    mr_cas_out_of_range_specPanic_canary rfl (by decide) (bmU64_typedLoad x acc) hfalse,
+    mr_cas_out_of_range_specPanic_canary rfl (by decide) (tbU64_typedLoad x acc) hfalse⟩
+
+/--
+**Machine-level `CoBuchi` vacuity separation**: on BOTH `bmU64Mach` and
+`tbU64Mach`, `mrLoadStutter` vacuously discharges `CoBuchi CasWon False` AND
+satisfies `¬ DWP … False`, while refuting `InfOften CasAttempt` — demonstrating
+why `CoBuchi` must be paired with `InfOften CasAttempt` and `¬ CoBuchi False`.
+-/
+theorem canary_mr_loadStutter_cobuchi_vacuity (x : UInt64) (acc : List MiniRustSpec.Gen.Access)
+    (Qbm : PEmpty.{1} → MrAtomicSt MiniRustSpec.Interp.BM PUnit PUnit → Prop)
+    (Qtb : PEmpty.{1} → MrAtomicSt MiniRustSpec.Interp.TBM PUnit PUnit → Prop) :
+    let s₀ : AtomicSt Nat PUnit PUnit := ⟨x.toNat, PUnit.unit, .fresh x.toNat, 0, PUnit.unit, 0⟩
+    (CoBuchi (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) CasWon (fun _ _ => False) mrLoadStutter (bmU64Mach x acc, s₀) ∧
+      ¬ DWP (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) mrLoadStutter (fun _ _ => False) (bmU64Mach x acc, s₀) ∧
+      ¬ InfOften (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) CasAttempt Qbm mrLoadStutter (bmU64Mach x acc, s₀)) ∧
+    (CoBuchi (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) CasWon (fun _ _ => False) mrLoadStutter (tbU64Mach x acc, s₀) ∧
+      ¬ DWP (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) mrLoadStutter (fun _ _ => False) (tbU64Mach x acc, s₀) ∧
+      ¬ InfOften (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) CasAttempt Qtb mrLoadStutter (tbU64Mach x acc, s₀)) :=
+  ⟨mrCellWP_loadStutter_cobuchi_vacuous (bmU64_mrCellAdmissible ticketEnv Nat.le_refl)
+      ⟨x, acc, rfl, rfl⟩ Qbm,
+   mrCellWP_loadStutter_cobuchi_vacuous (tbU64_mrCellAdmissible ticketEnv Nat.le_refl)
+      ⟨x, acc, rfl, rfl⟩ Qtb⟩
+
 /-! ### 2.4 Unbounded contention: safe but not live -/
 
 theorem canary_unbounded_contention :
@@ -1107,7 +1294,7 @@ run_cmd do
         throwError "import-isolation violation: {modName} imports {imp.module}"
   let nss : Array Name :=
     #[`Anneal.ITreeBuchi, `Anneal.AtomicHistInv, `Anneal.ITreeBuchiAndAtomicHistInvTests]
-  let floors : Array Nat := #[675, 235, 78]
+  let floors : Array Nat := #[675, 260, 84]
   let userName (c : Name) : Name := (privateToUserName? c).getD c
   let decls := env.constants.fold (init := (#[] : Array (Name × ConstantInfo)))
     fun acc c ci => if nss.any (·.isPrefixOf (userName c)) then acc.push (c, ci) else acc
@@ -1156,8 +1343,27 @@ run_cmd do
     , ``Anneal.AtomicHistInv.mrCellWP_tb_ticket_nonvacuous
     , ``Anneal.AtomicHistInv.mrCellWP_empty_rely_miracle
     , ``Anneal.AtomicHistInv.tryUpdate_mr_fairInfOften
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_infOften_attemptCas
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_wfLive_fair
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_fairInfOften_nonvacuous
+    , ``Anneal.AtomicHistInv.mrCellWP_loadStutter_cobuchi_vacuous
+    , ``Anneal.AtomicHistInv.mrCellWP_refines_budget
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_dwp_ranked
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_eventually
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_wfLive_dwp
+    , ``Anneal.AtomicHistInv.mrBudgetWP_nonvacuous_not_false
     , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u8_fair
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u8_fair
+    , ``Anneal.AtomicHistInv.leValue_leBytes
+    , ``Anneal.AtomicHistInv.bmU64_mrCellAdmissible
+    , ``Anneal.AtomicHistInv.tbU64_mrCellAdmissible
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u64_complete
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u64_complete
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_counter_mr_bm_fair
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_counter_mr_tb_fair
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_counter_mr_bm_and_tb_complete
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.canary_mr_u64_out_of_range_specPanic
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.canary_mr_loadStutter_cobuchi_vacuity
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_inconsistent_miracle
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_consistent_nonvacuous
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_counter_prophecy_eliminated
