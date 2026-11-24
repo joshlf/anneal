@@ -4413,6 +4413,208 @@ def widePtrThinBytes (M : Type) [Memory M] (metaKind : PointerMetaKind)
   let bytes ← encodeWidePtrM (M := M) metaKind ptr
   pure (bytes.take 8)
 
+/-! ### Universal wide-pointer codec round-trip (`encodeWidePtrM` / `decodeWidePtrM`)
+
+On every memory model `M` (in particular `BM` and `TBM`), every slice pointer
+and every trait-object pointer whose addresses (and slice length) fit in a
+`usize` survives `encodeWidePtrM` followed by `decodeWidePtrM` unchanged,
+provenance included. -/
+
+/-- `leValue` inverts `leBytes` modulo `256 ^ n`. -/
+theorem hw_leValue_leBytes (v : Nat) : ∀ n, leValue (leBytes v n) = v % 256 ^ n
+  | 0 => by simp [leBytes, leValue, Nat.mod_one]
+  | n + 1 => by
+    simp only [leBytes, leValue, UInt8.toNat_ofNat', hw_leValue_leBytes (v / 256) n]
+    rw [show (2 : Nat) ^ 8 = 256 by decide, Nat.mod_mod, Nat.pow_succ']
+    have h1 := Nat.mod_add_div v 256
+    have h2 := Nat.mod_add_div (v / 256) (256 ^ n)
+    have hlt1 : v % 256 < 256 := Nat.mod_lt v (by decide)
+    have hlt2 : v / 256 % 256 ^ n < 256 ^ n := Nat.mod_lt _ (Nat.pow_pos (by decide))
+    have hlt : v % 256 + 256 * (v / 256 % 256 ^ n) < 256 * 256 ^ n := by
+      have hmul : 256 * (v / 256 % 256 ^ n + 1) ≤ 256 * 256 ^ n := Nat.mul_le_mul_left 256 hlt2
+      have hmul' : 256 * (v / 256 % 256 ^ n) + 256 ≤ 256 * 256 ^ n := by
+        simpa [Nat.mul_add] using hmul
+      exact Nat.lt_of_lt_of_le (Nat.add_lt_add_right hlt1 _) (by rw [Nat.add_comm]; exact hmul')
+    have heq : v = (v % 256 + 256 * (v / 256 % 256 ^ n)) + (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
+      calc v = v % 256 + 256 * (v / 256) := h1.symm
+        _ = v % 256 + 256 * (v / 256 % 256 ^ n + 256 ^ n * (v / 256 / 256 ^ n)) := by rw [h2]
+        _ = (v % 256 + 256 * (v / 256 % 256 ^ n)) + (256 * 256 ^ n) * (v / 256 / 256 ^ n) := by
+          rw [Nat.mul_add, ← Nat.add_assoc, ← Nat.mul_assoc]
+    conv => rhs; rw [heq]
+    rw [Nat.add_mul_mod_self_left, Nat.mod_eq_of_lt hlt]
+
+/-- `Endianness::encode` at `usize` followed by `Endianness::decode` is the
+identity, and emits exactly `PTR_SIZE = 8` bytes. -/
+theorem hw_usize_encode_decode (i : Int) (data : List UInt8)
+    (h : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE i = some data) :
+    Endianness.decode x86_64.ENDIANNESS .Unsigned data = i ∧ data.length = 8 := by
+  unfold Endianness.encode at h
+  by_cases hin : inBounds i .Unsigned x86_64.PTR_SIZE = true
+  · rw [ite_eq_left hin] at h
+    cases h
+    have h64 : (2 : Int) ^ Size.bits x86_64.PTR_SIZE = 18446744073709551616 := by decide
+    have hb : 0 ≤ i ∧ i < 18446744073709551616 := by
+      simp only [inBounds, Bool.and_eq_true, decide_eq_true_eq] at hin
+      rw [h64] at hin
+      exact hin
+    rw [h64, Int.emod_eq_of_lt hb.1 hb.2]
+    refine ⟨?_, leBytes_length _ _⟩
+    have hlt : i.toNat < 256 ^ 8 := by
+      have := (Int.toNat_lt hb.1).mpr hb.2
+      exact this
+    simp only [Endianness.decode, x86_64.ENDIANNESS, x86_64.PTR_SIZE, hw_leValue_leBytes,
+      Nat.mod_eq_of_lt hlt]
+    exact Int.toNat_of_nonneg hb.1
+  · rw [ite_eq_right hin] at h
+    cases h
+
+/-- The data bytes of `encodePtrBytesM` are the encoded bytes. -/
+theorem hw_encodePtrBytesM_data {M : Type} [Memory M] (prov : Option (Memory.Provenance M))
+    (i : Nat) (data : List UInt8) :
+    (encodePtrBytesM (M := M) prov i data).mapM AbstractByte.dataM = some data := by
+  induction data generalizing i with
+  | nil => rfl
+  | cons b rest ih => simp [encodePtrBytesM, AbstractByte.dataM, ih]
+
+/-- `decodePtrProvenanceM` recovers the provenance stamped by `encodePtrBytesM`. -/
+theorem hw_decodePtrProvenanceM_encode {M : Type} [Memory M] [MemoryOps M]
+    (prov : Option (Memory.Provenance M)) (i : Nat) (data : List UInt8) :
+    decodePtrProvenanceM (M := M) i prov (encodePtrBytesM (M := M) prov i data) = prov := by
+  induction data generalizing i with
+  | nil => rfl
+  | cons b rest ih =>
+    cases prov with
+    | none => simp [encodePtrBytesM, decodePtrProvenanceM, AbstractByte.provenance_fragM, ih]
+    | some p => simp [encodePtrBytesM, decodePtrProvenanceM, AbstractByte.provenance_fragM, ih]
+
+/-- **Universal thin-pointer codec**: on every `M`, a thin pointer whose
+address is in `usize` bounds encodes to 8 bytes that decode back to it,
+provenance included. -/
+theorem hw_encodePtrM_decodePtrM {M : Type} [Memory M] [MemoryOps M]
+    (thin : ThinPointer (Memory.Provenance M))
+    (hin : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true) :
+    ∃ bs, encodePtrM (M := M) thin = .ok bs ∧ bs.length = 8 ∧
+      decodePtrM (M := M) bs = .ok (some thin) := by
+  have henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE thin.addr =
+      some (leBytes (thin.addr % (2 : Int) ^ Size.bits x86_64.PTR_SIZE).toNat 8) := by
+    unfold Endianness.encode
+    rw [ite_eq_left hin]
+    rfl
+  obtain ⟨hdec, hlen⟩ := hw_usize_encode_decode _ _ henc
+  generalize hdata : leBytes (thin.addr % (2 : Int) ^ Size.bits x86_64.PTR_SIZE).toNat 8 = data
+    at henc hdec hlen
+  have hlen' : (encodePtrBytesM (M := M) thin.provenance 0 data).length = 8 := by
+    rw [encodePtrBytesM_length (M := M)]
+    exact hlen
+  refine ⟨_, by unfold encodePtrM; rw [henc]; rfl, hlen', ?_⟩
+  obtain ⟨b, rest, rfl⟩ : ∃ b rest, data = b :: rest := by
+    cases data with
+    | nil => cases hlen
+    | cons b rest => exact ⟨b, rest, rfl⟩
+  have hfirst : firstProvenanceM (M := M) (encodePtrBytesM (M := M) thin.provenance 0 (b :: rest)) =
+      thin.provenance := by
+    cases hp : thin.provenance <;> simp [encodePtrBytesM, firstProvenanceM, AbstractByte.provenance_fragM]
+  unfold decodePtrM
+  rw [ite_eq_right (fun hn => hn hlen'), hw_encodePtrBytesM_data]
+  dsimp only
+  rw [hdec, hfirst, hw_decodePtrProvenanceM_encode]
+  rfl
+
+/-- **Universal `usize` codec**: on every `M`, an in-bounds `usize` value
+encodes to 8 bytes that decode back to it. -/
+theorem hw_encodeIntM_decodeIntM_usize {M : Type} [Memory M] (n : Int)
+    (hin : inBounds n .Unsigned x86_64.PTR_SIZE = true) :
+    ∃ bs, Type.encodeIntM (M := M) IntType.usize_ty (.Int n) = .ok bs ∧ bs.length = 8 ∧
+      Type.decodeIntM (M := M) IntType.usize_ty bs = .ok (some (.Int n)) := by
+  have henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE n =
+      some (leBytes (n % (2 : Int) ^ Size.bits x86_64.PTR_SIZE).toNat 8) := by
+    unfold Endianness.encode
+    rw [ite_eq_left hin]
+    rfl
+  obtain ⟨hdec, hlen⟩ := hw_usize_encode_decode _ _ henc
+  generalize leBytes (n % (2 : Int) ^ Size.bits x86_64.PTR_SIZE).toNat 8 = data at henc hdec hlen
+  have hlen' : (data.map (fun b => (AbstractByte.Init b none : AbstractByte (Memory.Provenance M)))).length
+      = 8 := by
+    rw [List.length_map]
+    exact hlen
+  have hmap : (data.map (fun b => (AbstractByte.Init b none : AbstractByte (Memory.Provenance M)))).mapM
+      AbstractByte.dataM = some data := by
+    clear hlen hlen' hdec henc
+    induction data with
+    | nil => rfl
+    | cons _ _ ih => simp [AbstractByte.dataM, ih]
+  refine ⟨_, by simp only [IntType.usize_ty, Type.encodeIntM, henc]; rfl, hlen', ?_⟩
+  simp only [IntType.usize_ty, Type.decodeIntM, x86_64.PTR_SIZE, hlen', ne_eq, not_true_eq_false,
+    ↓reduceIte, hmap, hdec]
+  rfl
+
+/-- **Universal slice-pointer codec round-trip** on every `M`: a slice
+pointer whose address and length are in `usize` bounds survives
+`encodeWidePtrM` then `decodeWidePtrM` unchanged, provenance included. -/
+theorem widePtrCodec_slice {M : Type} [Memory M] [MemoryOps M]
+    (thin : ThinPointer (Memory.Provenance M)) (n : Int)
+    (hthin : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hn : inBounds n .Unsigned x86_64.PTR_SIZE = true) :
+    widePtrCodec M .ElementCount ⟨thin, some (.ElementCount n)⟩ =
+      .ok (some (.Ptr ⟨thin, some (.ElementCount n)⟩)) := by
+  obtain ⟨tb, htb, htlen, htdec⟩ := hw_encodePtrM_decodePtrM thin hthin
+  obtain ⟨mb, hmb, hmlen, hmdec⟩ := hw_encodeIntM_decodeIntM_usize (M := M) n hn
+  have hlen : (tb ++ mb).length = 2 * x86_64.PTR_SIZE.bytes := by
+    rw [List.length_append, htlen, hmlen]
+    rfl
+  have htake : (tb ++ mb).take x86_64.PTR_SIZE.bytes = tb := by
+    rw [show x86_64.PTR_SIZE.bytes = tb.length from htlen.symm, List.take_left]
+  have hdrop : (tb ++ mb).drop x86_64.PTR_SIZE.bytes = mb := by
+    rw [show x86_64.PTR_SIZE.bytes = tb.length from htlen.symm, List.drop_left]
+  unfold widePtrCodec
+  rw [encodeWidePtrM_slice, htb]
+  simp only [hmb, bind, Except.bind, pure, Except.pure]
+  unfold decodeWidePtrM
+  rw [ite_eq_right (fun hne => hne hlen), htake, hdrop, htdec]
+  simp only [decodeMetaFieldM, hmdec, bind, Except.bind, pure, Except.pure,
+    PointerMetaKind.decode_valueM]
+  rfl
+
+/-- **Universal trait-object-pointer codec round-trip** on every `M`: a
+`dyn Trait` pointer whose data and vtable addresses are in `usize` bounds
+survives `encodeWidePtrM` then `decodeWidePtrM` unchanged, the provenance of
+both its data pointer and its vtable pointer included. -/
+theorem widePtrCodec_vtable {M : Type} [Memory M] [MemoryOps M]
+    (thin vtable : ThinPointer (Memory.Provenance M)) (trait : TraitName)
+    (hthin : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hvt : inBounds vtable.addr .Unsigned x86_64.PTR_SIZE = true) :
+    widePtrCodec M (.VTablePointer trait) ⟨thin, some (.VTablePointer vtable)⟩ =
+      .ok (some (.Ptr ⟨thin, some (.VTablePointer vtable)⟩)) := by
+  obtain ⟨tb, htb, htlen, htdec⟩ := hw_encodePtrM_decodePtrM thin hthin
+  obtain ⟨vb, hvb, hvlen, hvdec⟩ := hw_encodePtrM_decodePtrM vtable hvt
+  have hlen : (tb ++ vb).length = 2 * x86_64.PTR_SIZE.bytes := by
+    rw [List.length_append, htlen, hvlen]
+    rfl
+  have htake : (tb ++ vb).take x86_64.PTR_SIZE.bytes = tb := by
+    rw [show x86_64.PTR_SIZE.bytes = tb.length from htlen.symm, List.take_left]
+  have hdrop : (tb ++ vb).drop x86_64.PTR_SIZE.bytes = vb := by
+    rw [show x86_64.PTR_SIZE.bytes = tb.length from htlen.symm, List.drop_left]
+  unfold widePtrCodec
+  rw [encodeWidePtrM_vtable, htb]
+  simp only [hvb, bind, Except.bind, pure, Except.pure]
+  unfold decodeWidePtrM
+  rw [ite_eq_right (fun hne => hne hlen), htake, hdrop, htdec]
+  simp only [decodeMetaFieldM, hvdec, bind, Except.bind, pure, Except.pure,
+    PointerMetaKind.decode_valueM]
+  rfl
+
+/-- The universal codec laws are not vacuous: on `BM` and `TBM` they apply to
+the concrete `rust#166144` operands (address `0x2000`, `len = 3`, vtable
+`0x9000`) used by the 30-case table. -/
+theorem widePtrCodec_universal_witness :
+    widePtrCodec BM .ElementCount ⟨⟨8192, some bmHarness.provA⟩, some (.ElementCount 3)⟩ =
+      .ok (some (.Ptr ⟨⟨8192, some bmHarness.provA⟩, some (.ElementCount 3)⟩)) ∧
+    widePtrCodec TBM (.VTablePointer dynTrait)
+        ⟨⟨8192, some tbHarness.provB⟩, some (.VTablePointer ⟨36864, none⟩)⟩ =
+      .ok (some (.Ptr ⟨⟨8192, some tbHarness.provB⟩, some (.VTablePointer ⟨36864, none⟩)⟩)) :=
+  ⟨widePtrCodec_slice _ _ (by decide) (by decide),
+    widePtrCodec_vtable _ _ _ (by decide) (by decide)⟩
+
 /-- On both machines, slice and trait-object pointers with provenance survive
 `encode` then `decode` (`encodeWidePtrM`, `decodeWidePtrM`), and the thin
 prefix of the encoding does not depend on the slice length: the bytes
@@ -4571,7 +4773,10 @@ statement.
    `VTable` memory never leaks: `rust#166221`).
 4. `ptr::addr_eq` compares addresses only, on both memory models, whatever
    the metadata and provenance of its operands, whereas `==` on a slice
-   pointer and a trait-object pointer is a specification panic (`rust#166144`).
+   pointer and a trait-object pointer is a specification panic (`rust#166144`);
+   and on both memory models every in-bounds slice and trait-object pointer
+   survives `encodeWidePtrM` then `decodeWidePtrM` unchanged, provenance
+   included (`widePtrCodec_slice`, `widePtrCodec_vtable`).
 5. Protectors (`rust#165833`): a `Protected::Weak` node and a `Cell`-only
    strongly protected node never prevent deallocation; a strongly protected
    node with a `Frozen` permission that had a local read does; and on every
@@ -4634,7 +4839,23 @@ theorem ep1_minirust_heap_wide_capstone :
       (∀ (tl tr v : ThinPointer TreeBorrowsProvenance) (n : Int) (pty : PtrType) (tyr : «Type»),
         evalWideEqM (M := TBM) (.Ptr ⟨tl, some (.ElementCount n)⟩, .Ptr pty)
             (.Ptr ⟨tr, some (.VTablePointer v)⟩, tyr) =
-          .error (.specPanic "unmatching metadata in wide pointer comparasion"))) ∧
+          .error (.specPanic "unmatching metadata in wide pointer comparasion")) ∧
+      (∀ (thin vt : ThinPointer Prov) (n : Int) (trait : TraitName),
+        inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true →
+        inBounds n .Unsigned x86_64.PTR_SIZE = true →
+        inBounds vt.addr .Unsigned x86_64.PTR_SIZE = true →
+        widePtrCodec BM .ElementCount ⟨thin, some (.ElementCount n)⟩ =
+          .ok (some (.Ptr ⟨thin, some (.ElementCount n)⟩)) ∧
+        widePtrCodec BM (.VTablePointer trait) ⟨thin, some (.VTablePointer vt)⟩ =
+          .ok (some (.Ptr ⟨thin, some (.VTablePointer vt)⟩))) ∧
+      (∀ (thin vt : ThinPointer TreeBorrowsProvenance) (n : Int) (trait : TraitName),
+        inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true →
+        inBounds n .Unsigned x86_64.PTR_SIZE = true →
+        inBounds vt.addr .Unsigned x86_64.PTR_SIZE = true →
+        widePtrCodec TBM .ElementCount ⟨thin, some (.ElementCount n)⟩ =
+          .ok (some (.Ptr ⟨thin, some (.ElementCount n)⟩)) ∧
+        widePtrCodec TBM (.VTablePointer trait) ⟨thin, some (.VTablePointer vt)⟩ =
+          .ok (some (.Ptr ⟨thin, some (.VTablePointer vt)⟩)))) ∧
     ((∀ n : Node,
         Node.contains_strong_protector_preventing_deallocation n = true ↔
           ∃ nd, Node.InTree nd n ∧ nd.«protected» = .Strong ∧
@@ -4719,7 +4940,7 @@ theorem ep1_minirust_heap_wide_capstone :
     (mrProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
-  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩,
+  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_⟩,
     ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ⟨?_, ?_⟩, ?_, ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
@@ -4732,6 +4953,10 @@ theorem ep1_minirust_heap_wide_capstone :
   · exact fun pl pr tl tr => evalAddrEqM_ptr (M := TBM) pl pr tl tr
   · exact fun tl tr vl vr pty tyr => evalWideEqM_vtable (M := TBM) tl tr vl vr pty tyr
   · exact fun tl tr v n pty tyr => (evalWideEqM_mixed_specPanic (M := TBM) tl tr v n pty tyr).1
+  · exact fun thin vt n trait hthin hn hvt =>
+      ⟨widePtrCodec_slice (M := BM) thin n hthin hn, widePtrCodec_vtable (M := BM) thin vt trait hthin hvt⟩
+  · exact fun thin vt n trait hthin hn hvt =>
+      ⟨widePtrCodec_slice (M := TBM) thin n hthin hn, widePtrCodec_vtable (M := TBM) thin vt trait hthin hvt⟩
   · exact node_contains_strong_protector_iff
   · exact weak_protector_never_prevents_deallocation
   · exact strong_cell_never_prevents_deallocation
@@ -4810,8 +5035,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 221 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 221 then
+  -- This module states 230 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 230 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
