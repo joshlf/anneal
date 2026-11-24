@@ -35,11 +35,13 @@ authorities:
    - defines `crossRootLmObs` calling `LeanMiriSpec.AtomicIntrinsicsLM.lmAtomicObserve`,
    - proves `lmAuthorityCheck crossRootLmObs = true` in the Lean kernel via
      `Eq.refl Bool.true`,
-   - instantiates `closedAtomicDualContract : AtomicDualContract` and all 8 closed
-     projections (incl. `cas_return_shape`, `divergence_set_exact`, `tcb_codec_bridge`),
-   - runs **11 negative controls** on scratch `Environment` copies (forged theorem,
+   - instantiates `closedAtomicDualContract : AtomicDualContract` and all 9 closed
+     projections (incl. `cas_return_shape`, `divergence_set_exact`, `tcb_codec_bridge`,
+     `tcb_codec_divergence_exact`),
+   - runs **12 negative controls** on scratch `Environment` copies (forged theorem,
      inverted mode, shifted case, inverted CAS, UB forgery, negated trace, inverted
-     Frozen trace, inverted signed CAS, and Frozen/Reserved trace swaps),
+     Frozen trace, inverted signed CAS, Frozen/Reserved trace swaps, and a forged
+     wire-tuple agreement on diverging cell `(basic, 15)`),
    - audits every cross-root declaration and key `LeanMiriSpec.AtomicIntrinsicsLM`
      theorems for `.safe`, non-triviality, standard-3-axiom purity (zero
      `sorryAx`, zero `Lean.ofReduceBool`, zero `Lean.trustCompiler`), self-tests
@@ -309,7 +311,11 @@ run_cmd do
     let resTraceEqVal := mkApp2 (mkConst (dsNs ++ `lmReservedTraceAuthorityCheck_sound)) (mkConst resTraceObsName) (mkConst resTraceCheckName)
     let resTraceEqName := ns ++ `crossRootLmReservedTraceEq; addThm resTraceEqName (← MetaM.run' <| inferType resTraceEqVal) resTraceEqVal
 
-    -- 3. Instantiate closed `AtomicDualContract` and all 8 named projections.
+    -- 2g. Wire-level single-cell agreement: agreeing cell `(basic, 0)` is kernel-accepted (well-typed positive twin of step 4's `(basic, 15)` forgery).
+    let wireAt (idx : Nat) : Expr := eqTrue (mkApp3 (mkConst (dsNs ++ `wireAgreesAt)) crossObsC (mkConst (dsNs ++ `AtomicMemoryMode.basic)) (mkNatLit idx))
+    let wireOkName := ns ++ `crossRootWireAgreesCell0; addThm wireOkName (wireAt 0) reflTrue
+
+    -- 3. Instantiate closed `AtomicDualContract` and all 9 named projections.
     let contractName := ns ++ `closedAtomicDualContract
     let contractTy ← addDef contractName
       (mkApp2 (mkConst (dsNs ++ `atomicDualContractOfCheck)) crossObsC (mkConst checkName))
@@ -320,7 +326,7 @@ run_cmd do
     let mut added : Array Lean.Name :=
       #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName,
         traceObsName, traceCheckName, traceEqName, frozenTraceObsName, frozenTraceCheckName, frozenTraceEqName,
-        signedObsName, signedCheckName, signedEqName, resTraceObsName, resTraceCheckName, resTraceEqName]
+        signedObsName, signedCheckName, signedEqName, resTraceObsName, resTraceCheckName, resTraceEqName, wireOkName]
     for projName in [`contract_agreement_zone_exact,
                      `contract_overflow_divergence,
                      `contract_readonly_alloc_divergence,
@@ -328,14 +334,15 @@ run_cmd do
                      `contract_mr_universal_laws,
                      `contract_cas_return_shape,
                      `contract_divergence_set_exact,
-                     `contract_tcb_codec_bridge] do
+                     `contract_tcb_codec_bridge,
+                     `contract_tcb_codec_divergence_exact] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
       let outName := ns ++ projName
       addThm outName ty val
       added := added.push outName
 
-    -- 4. Eleven negative controls (incl. signed CAS inversion & Frozen/Reserved swap) on scratch copies of the environment: the Lean kernel
+    -- 4. Twelve negative controls (incl. signed CAS inversion, Frozen/Reserved swap & wire-tuple forgery) on scratch copies of the environment: the Lean kernel
     -- MUST reject every forged theorem, inverted mode, shifted case, inverted CAS flag,
     -- UB-to-okStore forgery, negated trace certificate, and mode-inverted Frozen trace.
     let saved ← getEnv
@@ -392,7 +399,8 @@ run_cmd do
           type := eqTrue (mkApp (mkConst (dsNs ++ `lmSignedBoundaryAuthorityCheck)) signedCasInv),
           value := reflTrue }),
         ("Frozen trace passed to lmReservedTraceAuthorityCheck", .thmDecl { name := ns ++ `forged.frozenAsReservedTrace, levelParams := [], type := eqTrue (mkApp (mkConst (dsNs ++ `lmReservedTraceAuthorityCheck)) (mkConst frozenTraceObsName)), value := reflTrue }),
-        ("Reserved trace passed to lmFrozenTraceAuthorityCheck", .thmDecl { name := ns ++ `forged.reservedAsFrozenTrace, levelParams := [], type := eqTrue (mkApp (mkConst (dsNs ++ `lmFrozenTraceAuthorityCheck)) (mkConst resTraceObsName)), value := reflTrue }) ]
+        ("Reserved trace passed to lmFrozenTraceAuthorityCheck", .thmDecl { name := ns ++ `forged.reservedAsFrozenTrace, levelParams := [], type := eqTrue (mkApp (mkConst (dsNs ++ `lmFrozenTraceAuthorityCheck)) (mkConst resTraceObsName)), value := reflTrue }),
+        ("Wire tuples forged equal on diverging cell (basic, 15)", .thmDecl { name := ns ++ `forged.wireAgreesOnDivergence, levelParams := [], type := wireAt 15, value := reflTrue }) ]
     let mut rejected : Nat := 0
     for (what, d) in forged do
       unless ← rejects d do
@@ -471,7 +479,8 @@ run_cmd do
         lmNs ++ `lmAtomicHooks_bind_eq_make, lmNs ++ `lmTagTrace_reserved_vs_frozen,
         dsNs ++ `mrFrozenAndReservedTrace_table, dsNs ++ `lmFrozenTraceAuthorityCheck_sound,
         lmNs ++ `lmSignedBoundaryObs_table, dsNs ++ `mrSignedBoundary_table, dsNs ++ `lmSignedBoundaryAuthorityCheck_sound,
-        lmNs ++ `compareExchange_nonwrite_and_choice_invariants, dsNs ++ `contract_tcb_codec_bridge, dsNs ++ `lmReservedTraceAuthorityCheck_sound ]
+        lmNs ++ `compareExchange_nonwrite_and_choice_invariants, dsNs ++ `contract_tcb_codec_bridge, dsNs ++ `lmReservedTraceAuthorityCheck_sound,
+        dsNs ++ `contract_tcb_codec_divergence_exact ]
     for n in keyThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required theorem {n} missing"
@@ -562,7 +571,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 26 && rejectedCount = 11 do
+  unless addedCount = 28 && rejectedCount = 12 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 
