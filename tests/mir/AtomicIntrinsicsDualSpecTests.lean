@@ -256,6 +256,17 @@ run_cmd do
     let checkExpr := mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) crossObsC
     addThm checkName (eqTrue checkExpr) reflTrue
 
+    -- 2b. Fast-path (`dataRace = some _`) certificate: same check over `lmAtomicObserveWith true`.
+    let fastObs ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
+      withLocalDeclD `idx natTy fun idx =>
+        mkLambdaFVars #[tb, idx] (mkApp (mkConst translateName)
+          (mkApp3 (mkConst (lmNs ++ `lmAtomicObserveWith)) boolTrue tb idx))
+    let fastObsName := ns ++ `crossRootLmObsFastPath
+    let _ ← addDef fastObsName fastObs
+    let fastCheckName := ns ++ `crossRootLmCheckFastPath
+    addThm fastCheckName
+      (eqTrue (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) (mkConst fastObsName))) reflTrue
+
     -- 3. Instantiate closed `AtomicDualContract` and all 5 named projections.
     let contractName := ns ++ `closedAtomicDualContract
     let contractTy ← addDef contractName
@@ -264,7 +275,8 @@ run_cmd do
       throwError "cross-root: {contractName} is not an AtomicDualContract"
     let contractC := mkConst contractName
 
-    let mut added : Array Lean.Name := #[translateName, crossObsName, checkName, contractName]
+    let mut added : Array Lean.Name :=
+      #[translateName, crossObsName, checkName, fastObsName, fastCheckName, contractName]
     for projName in [`contract_agreement_zone_exact,
                      `contract_overflow_divergence,
                      `contract_readonly_alloc_divergence,
@@ -378,7 +390,14 @@ run_cmd do
         lmNs ++ `eval_single_thread_global_fast_path,
         lmNs ++ `eval_fault_witnesses,
         lmNs ++ `eval_tb_frozen_mode_sensitivity,
-        lmNs ++ `lmAtomicObserve_table ]
+        lmNs ++ `lmAtomicObserve_table,
+        lmNs ++ `rmwValue_universal_laws, lmNs ++ `fence_without_global_noop,
+        lmNs ++ `eval_u128_in_bounds_mutable_load_not_ub,
+        lmNs ++ `lmAtomicObserve_fastPath_invariant, dsNs ++ `casOldProjection_casFlagSynth,
+        dsNs ++ `contract_cas_return_shape, dsNs ++ `contract_divergence_set_exact,
+        dsNs ++ `mr_universal_cas_failure_returns_before,
+        dsNs ++ `mr_universal_rmw_out_of_range_specPanic,
+        dsNs ++ `mr_universal_atomicLoad_size_too_big_ub ]
     for n in lmKeyThms do
       let some (.thmInfo v) := env.find? n
         | throwError "cross-root: required LM theorem {n} missing"
@@ -424,6 +443,8 @@ run_cmd do
         dsNs ++ `mrAtomicObserve,
         dsNs ++ `mrAtomicObserve_table,
         lmNs ++ `lmAtomicObserve,
+        lmNs ++ `lmAtomicObserveWith, lmNs ++ `lmTreeBorrowsDiagnostic,
+        `Miri.Interpreter.IntrinsicAtomic.allowDataRaces,
         `Miri.Interpreter.IntrinsicAtomic.eval,
         `Miri.Interpreter.AtomicMachine.bind,
         `Miri.Interpreter.PlaceMachine.memoryAccess,
@@ -431,6 +452,14 @@ run_cmd do
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: closedAtomicDualContract does not reach {req}"
+    -- `borrowTracker = none` at runtime (contract reaches `performBorrowAccessRange` only via a
+    -- dead branch), so the bridge theorem's *statement* must tie it to the executed diagnostic.
+    let tbBridge := lmNs ++ `atomic_tb_check_bridges_vendored_performBorrowAccessRange
+    let some tbCi := env.find? tbBridge | throwError "cross-root: {tbBridge} missing"
+    for req in [`Miri.TreeBorrows.BorrowTree.performBorrowAccessRange,
+                lmNs ++ `lmTreeBorrowsDiagnostic] do
+      unless tbCi.type.getUsedConstants.contains req do
+        throwError "cross-root: {tbBridge} statement does not mention {req}"
 
     return (added.size, rejected, crAxioms.toArray)
 
@@ -438,7 +467,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 9 && rejectedCount = 6 do
+  unless addedCount = 11 && rejectedCount = 6 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 

@@ -40,6 +40,9 @@ Explicit cross-authority boundary classification:
    compare-exchange on `Mutability.Not` allocations (`ReadOnlyAtomicViolation.storeOrRmw`);
    MiniRust allocations carry no `Mutability` field and model read-only via Tree
    Borrows `Frozen` (where failing CAS is read-only and succeeds).
+   Cell `(treeBorrows, 21)` still agrees (`.ub`/`.ub`): see `contract_divergence_set_exact`.
+4. **Coincidental Agreement on Case `18` (`u128`)**: MiniRust's UB is its size rule, LeanMiri's
+   only the out-of-bounds read (`eval_u128_in_bounds_mutable_load_not_ub` in `AtomicIntrinsicsLM`).
 
 Strict import isolation: imports ONLY `MiniRustSpec.AtomicIntrinsicsMR`
 (ZERO `Trusted.*`, `Miri.*`, or `LeanMiriSpec.*` imports; verified by the
@@ -379,21 +382,22 @@ def obsMrScalar {M P : Type} [Memory M] (width : Nat)
       | none => .invalidOrUnsupported
   | .ok (_, _) => .invalidOrUnsupported
 
-/-- Observe a MiniRust `AtomicCompareExchange` result. Upstream MiniRust returns
-the loaded `before` integer; `succeeded` is `before == expected` (exact match
-with `valueEqM` in `evalIntrinsicM`). -/
+/-- CAS return-shape *embedding*: MiniRust `AtomicCompareExchange` returns only the loaded `before`
+(never a `(T, bool)` pair), so `succeeded` is **synthesized** as `before == expected`. -/
+def casFlagSynth (expected : Nat) : AtomicAccessOutcome → AtomicAccessOutcome
+  | .okScalar ret post => .okCas ret (ret == expected) post
+  | o => o
+
+/-- CAS return-shape *projection* `(old, succeeded) ↦ old`, keeping the post-memory cell. -/
+def casOldProjection : AtomicAccessOutcome → AtomicAccessOutcome
+  | .okCas ret _ post => .okScalar ret post
+  | o => o
+
+/-- Observe a MiniRust CAS: the raw scalar observation (`obsMrScalar`) plus the synthesized flag. -/
 def obsMrCas {M P : Type} [Memory M] (width : Nat) (expected : Nat)
     (getAllocs : Machine M → List (List (AbstractByte P)))
     (r : Interp (Value M × Machine M)) : AtomicAccessOutcome :=
-  match r with
-  | .error s => classifyMrStop s
-  | .ok (.Int ret, m) =>
-    if ret < 0 then .invalidOrUnsupported
-    else
-      match (getAllocs m).head?.bind (decodeLeBytes width) with
-      | some post => .okCas ret.toNat (ret.toNat == expected) post
-      | none => .invalidOrUnsupported
-  | .ok (_, _) => .invalidOrUnsupported
+  casFlagSynth expected (obsMrScalar width getAllocs r)
 
 private def bmAllocs (m : Mach) : List (List Byte) :=
   m.mem.memory.allocations.map (fun a => a.data)
@@ -828,6 +832,65 @@ theorem contract_mr_universal_laws (c : AtomicDualContract) :
       scalarAgrees TBM evalIntrinsicM tbFive tbPtr = true) :=
   ⟨c.mr_bm_eq_atomic, c.mr_tb_wfLive, c.mr_ep1_capstone_linked⟩
 
+/-! ## §5.5. CAS Return-Shape Projection, Universal Divergence Laws & Exact Divergence Set -/
+
+/-- Erasing the synthesized flag recovers the erased raw observation (the flag carries no data). -/
+theorem casOldProjection_casFlagSynth (expected : Nat) (o : AtomicAccessOutcome) :
+    casOldProjection (casFlagSynth expected o) = casOldProjection o := by
+  cases o <;> rfl
+
+/-- **Cross-authority CAS return shape**: on every agreement-zone cell, LeanMiri's
+`(old, succeeded)` erased to `old` equals MiniRust's erased observation (same `old`, same post
+cell); unerased `agreement_zone_exact` further pins LeanMiri's real flag to `old == expected`. -/
+theorem contract_cas_return_shape (c : AtomicDualContract) (m : AtomicMemoryMode) (idx : Nat)
+    (hIdx : idx < canonicalCaseCount)
+    (hAgree : (canonicalCaseMeta idx).comparisonClass = .exactAgreement) :
+    casOldProjection (c.lm.observe m.toLmTreeBorrows idx) =
+      casOldProjection (mrAtomicObserve m idx) :=
+  congrArg casOldProjection (c.agreement_zone_exact m idx hIdx hAgree).symm
+
+/-- Universal MiniRust CAS law: a failing CAS returns exactly `before` + the post-load machine. -/
+theorem mr_universal_cas_failure_returns_before :
+    type_of% @atomicCompareExchange_failure := @atomicCompareExchange_failure
+
+/-- Universal MiniRust `d821c6e3` RMW law (divergence 1): out-of-range is `Stop.specPanic`. -/
+theorem mr_universal_rmw_out_of_range_specPanic :
+    type_of% @atomicFetchAndOp_out_of_range_specPanic := @atomicFetchAndOp_out_of_range_specPanic
+
+/-- Universal MiniRust size rule (case `18`): `AtomicLoad` above `MAX_ATOMIC_SIZE` is UB. -/
+theorem mr_universal_atomicLoad_size_too_big_ub :
+    type_of% @atomicLoad_size_too_big_ub := @atomicLoad_size_too_big_ub
+
+/-- Exact divergence set (7/56 cells): `15`, `16`, `22`, and `21` in `basic` mode only. -/
+def divergesAt (m : AtomicMemoryMode) : Nat → Bool
+  | 15 | 16 | 22 => true
+  | 21 => match m with | .basic => true | .treeBorrows => false
+  | _ => false
+
+private theorem divergence_set_exact_aux :
+    (allAtomicMemoryModes.all fun m =>
+      (List.range canonicalCaseCount).all fun idx =>
+        (divergesAt m idx || decide (mrExpectedOutcome m idx = lmExpectedOutcome m idx)) &&
+        (!(divergesAt m idx) ||
+          decide (mrExpectedOutcome m idx ≠ lmExpectedOutcome m idx))) = true := by
+  decide +kernel
+
+/-- **Exact divergence set** (both directions): the authorities agree on every cell outside
+`divergesAt` (49 cells, incl. `(treeBorrows, 21)`) and provably differ on every cell inside it. -/
+theorem contract_divergence_set_exact (c : AtomicDualContract) (m : AtomicMemoryMode)
+    (idx : Nat) (hIdx : idx < canonicalCaseCount) :
+    (divergesAt m idx = false → mrAtomicObserve m idx = c.lm.observe m.toLmTreeBorrows idx) ∧
+    (divergesAt m idx = true → mrAtomicObserve m idx ≠ c.lm.observe m.toLmTreeBorrows idx) := by
+  have h1 := List.all_eq_true.mp divergence_set_exact_aux m (allAtomicMemoryModes_complete m)
+  have h2 := List.all_eq_true.mp h1 idx (List.mem_range.mpr hIdx)
+  rw [mrAtomicObserve_table m idx hIdx, c.lm.matchesExpected m.toLmTreeBorrows idx hIdx,
+      AtomicMemoryMode.of_toLmTreeBorrows m]
+  refine ⟨fun hNo => ?_, fun hYes => ?_⟩
+  · simp only [hNo, Bool.false_or, Bool.not_false, Bool.true_or, Bool.and_true] at h2
+    exact of_decide_eq_true h2
+  · simp only [hYes, Bool.true_or, Bool.not_true, Bool.false_or, Bool.true_and] at h2
+    exact of_decide_eq_true h2
+
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
 section AxiomAudit
@@ -869,7 +932,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 15 then
+  if theorems < 25 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 

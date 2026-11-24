@@ -925,6 +925,31 @@ theorem fence_rejects_relaxed_and_singlethread_noop {P S C V : Type}
     IntrinsicAtomic.fence h ord true s = .ok () s :=
   ⟨rfl, by cases ord <;> rfl⟩
 
+/-! ### §3.3 Universal `rmwValue` & `fence` Laws (ALL Hook Dictionaries & States) -/
+
+/-- **Universal `rmwValue` laws**: `atomic_xchg` (`.swap`) returns `right` touching no hook or
+state; every `.mir op negate` is exactly `ScalarOps.binary op` followed by `ScalarOps.unary .Not`
+iff `negate`; hence `atomic_nand` (`.mir .BitAnd true`) is `Not ∘ BitAnd`. -/
+theorem rmwValue_universal_laws {P S C V : Type} [PointerProvenance P]
+    (h : AtomicAccessHooks P S C V) (choice : C) (left right : RvalueImmTy P) :
+    (∀ s : S, IntrinsicAtomic.rmwValue h choice .swap left right s = .ok right s) ∧
+    (∀ (op : Miri.MIR.BinOp) (negate : Bool),
+      IntrinsicAtomic.rmwValue h choice (.mir op negate) left right =
+        (ScalarOps.binary h.scalarOps choice op left right >>= fun value =>
+          if negate then ScalarOps.unary h.scalarOps choice .Not value else pure value)) ∧
+    IntrinsicAtomic.rmwValue h choice (.mir .BitAnd true) left right =
+      (ScalarOps.binary h.scalarOps choice .BitAnd left right >>=
+        ScalarOps.unary h.scalarOps choice .Not) :=
+  ⟨fun _ => rfl, fun _ _ => rfl, rfl⟩
+
+/-- **Fence without a vector-clock backend** (`getGlobal = fun _ => none`): for every hook
+dictionary, state, and non-`Relaxed` ordering, a multi-thread fence is a state-preserving NOP. -/
+theorem fence_without_global_noop {P S C V : Type} (h : AtomicAccessHooks P S C V)
+    (ord : Miri.Concurrency.AtomicOrdering) (s : S) (hOrd : ord ≠ .Relaxed) :
+    IntrinsicAtomic.fence ({ h with getGlobal := fun _ => none } : AtomicAccessHooks P S C V)
+      ord false s = .ok () s := by
+  cases ord <;> first | rfl | exact absurd rfl hOrd
+
 /-! ## §4. Executable Observation Type (`LmAtomicObs`) & `IntrinsicAtomic.eval` Runner -/
 
 /-- Authority-typed observation returned by `lmAtomicObserve`. -/
@@ -1268,10 +1293,19 @@ theorem eval_tb_frozen_mode_sensitivity :
     runEvalCas false (mkCfg true) layoutU32 5 9 = .ub := by
   decide +kernel
 
+/-- **Third (previously undocumented) authority divergence — `u128` atomics**: vendored
+`atomicAccessCheck` restricts oversized atomics only on read-only allocations, so a 16-byte
+`atomic_load` on an in-bounds *mutable* cell is NOT UB (MiniRust: UB above `MAX_ATOMIC_SIZE = 8`,
+`atomicLoad_size_too_big_ub`); case `18`'s `.ub` is merely its out-of-bounds 16-byte read. -/
+theorem eval_u128_in_bounds_mutable_load_not_ub :
+    runEvalLoad { widthBytes := 16, initBits := 5, allocSize := 16, allocAlign := ⟨4⟩ }
+      layoutU128 .Relaxed ≠ .ub := by
+  decide +kernel
+
 /-! ## §6. Executable Cross-Root Observation Runner (`lmAtomicObserve`, Cases `0..27`) -/
 
 /-- Canonical 28-case (`0..27`) executable observation runner through vendored
-`IntrinsicAtomic.eval` over `AtomicMachine.bind`:
+`IntrinsicAtomic.eval` over `AtomicMachine.bind` (`fastPath` selects `dataRace = some _`):
 - `0..7`: `u8`/`u16`/`u32`/`u64` atomic load & store
 - `8..9`: `atomic_cxchg` equal (`(5, 9)`) and unequal (`(6, 9)`) on `u32`
 - `10..14`: `atomic_xadd`/`xsub`/`and`/`or`/`xor` in-range on `u32`
@@ -1280,34 +1314,35 @@ theorem eval_tb_frozen_mode_sensitivity :
 - `20..22`: read-only allocation (`Mutability.Not`): `Relaxed` load ok, `store` UB, failing `cxchg` UB
 - `23..27`: Tree Borrows `Frozen` tag: `load` & failing `cxchg` ok in both modes;
   `store`, `xadd`, and succeeding `cxchg` ok when `treeBorrows = false` and UB when `treeBorrows = true`. -/
-def lmAtomicObserve (treeBorrows : Bool) (caseIdx : Nat) : LmAtomicObs :=
+def lmAtomicObserveWith (fastPath treeBorrows : Bool) (caseIdx : Nat) : LmAtomicObs :=
   let frozenCfg : SingleCellConfig :=
     { widthBytes := 4, initBits := 5, allocSize := 4, allocAlign := ⟨2⟩,
-      treeBorrows := treeBorrows, tagMode := .frozenChild }
+      treeBorrows := treeBorrows, useDataRaceFastPath := fastPath, tagMode := .frozenChild }
   let roCfg : SingleCellConfig :=
     { widthBytes := 4, initBits := 5, allocSize := 8, allocAlign := Align.EIGHT,
-      mutability := .Not, treeBorrows := treeBorrows }
+      mutability := .Not, treeBorrows := treeBorrows, useDataRaceFastPath := fastPath }
+  let base : SingleCellConfig := { treeBorrows := treeBorrows, useDataRaceFastPath := fastPath }
   match caseIdx with
-  | 0 => runEvalLoad { widthBytes := 1, initBits := 200, treeBorrows := treeBorrows } layoutU8
-  | 1 => runEvalStore { widthBytes := 1, initBits := 0, treeBorrows := treeBorrows } layoutU8 200
-  | 2 => runEvalLoad { widthBytes := 2, initBits := 48879, treeBorrows := treeBorrows } layoutU16
-  | 3 => runEvalStore { widthBytes := 2, initBits := 0, treeBorrows := treeBorrows } layoutU16 48879
-  | 4 => runEvalLoad { widthBytes := 4, initBits := 3735928559, treeBorrows := treeBorrows } layoutU32
-  | 5 => runEvalStore { widthBytes := 4, initBits := 0, treeBorrows := treeBorrows } layoutU32 3735928559
-  | 6 => runEvalLoad { widthBytes := 8, initBits := 81985529216486895, treeBorrows := treeBorrows } layoutU64
-  | 7 => runEvalStore { widthBytes := 8, initBits := 0, treeBorrows := treeBorrows } layoutU64 81985529216486895
-  | 8 => runEvalCas false { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 5 9
-  | 9 => runEvalCas false { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 6 9
-  | 10 => runEvalRmw "atomic_xadd" { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 3
-  | 11 => runEvalRmw "atomic_xsub" { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 2
-  | 12 => runEvalRmw "atomic_and" { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 4
-  | 13 => runEvalRmw "atomic_or" { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 2
-  | 14 => runEvalRmw "atomic_xor" { widthBytes := 4, initBits := 5, treeBorrows := treeBorrows } layoutU32 1
-  | 15 => runEvalRmw "atomic_xadd" { widthBytes := 4, initBits := 4294967295, treeBorrows := treeBorrows } layoutU32 1
-  | 16 => runEvalRmw "atomic_xsub" { widthBytes := 4, initBits := 0, treeBorrows := treeBorrows } layoutU32 1
-  | 17 => runEvalLoad { widthBytes := 4, initBits := 5, ptrOffset := 1, treeBorrows := treeBorrows } layoutU32
-  | 18 => runEvalLoad { widthBytes := 8, initBits := 5, allocSize := 8, treeBorrows := treeBorrows } layoutU128 .Relaxed
-  | 19 => runEvalLoad { widthBytes := 4, initBits := 5, ptrOffset := 8, treeBorrows := treeBorrows } layoutU32
+  | 0 => runEvalLoad { base with widthBytes := 1, initBits := 200 } layoutU8
+  | 1 => runEvalStore { base with widthBytes := 1, initBits := 0 } layoutU8 200
+  | 2 => runEvalLoad { base with widthBytes := 2, initBits := 48879 } layoutU16
+  | 3 => runEvalStore { base with widthBytes := 2, initBits := 0 } layoutU16 48879
+  | 4 => runEvalLoad { base with widthBytes := 4, initBits := 3735928559 } layoutU32
+  | 5 => runEvalStore { base with widthBytes := 4, initBits := 0 } layoutU32 3735928559
+  | 6 => runEvalLoad { base with widthBytes := 8, initBits := 81985529216486895 } layoutU64
+  | 7 => runEvalStore { base with widthBytes := 8, initBits := 0 } layoutU64 81985529216486895
+  | 8 => runEvalCas false { base with widthBytes := 4, initBits := 5 } layoutU32 5 9
+  | 9 => runEvalCas false { base with widthBytes := 4, initBits := 5 } layoutU32 6 9
+  | 10 => runEvalRmw "atomic_xadd" { base with widthBytes := 4, initBits := 5 } layoutU32 3
+  | 11 => runEvalRmw "atomic_xsub" { base with widthBytes := 4, initBits := 5 } layoutU32 2
+  | 12 => runEvalRmw "atomic_and" { base with widthBytes := 4, initBits := 5 } layoutU32 4
+  | 13 => runEvalRmw "atomic_or" { base with widthBytes := 4, initBits := 5 } layoutU32 2
+  | 14 => runEvalRmw "atomic_xor" { base with widthBytes := 4, initBits := 5 } layoutU32 1
+  | 15 => runEvalRmw "atomic_xadd" { base with widthBytes := 4, initBits := 4294967295 } layoutU32 1
+  | 16 => runEvalRmw "atomic_xsub" { base with widthBytes := 4, initBits := 0 } layoutU32 1
+  | 17 => runEvalLoad { base with widthBytes := 4, initBits := 5, ptrOffset := 1 } layoutU32
+  | 18 => runEvalLoad { base with widthBytes := 8, initBits := 5, allocSize := 8 } layoutU128 .Relaxed
+  | 19 => runEvalLoad { base with widthBytes := 4, initBits := 5, ptrOffset := 8 } layoutU32
   | 20 => runEvalLoad roCfg layoutU32 .Relaxed
   | 21 => runEvalStore roCfg layoutU32 9 .Relaxed
   | 22 => runEvalCas false roCfg layoutU32 6 9 .Relaxed .Relaxed
@@ -1317,6 +1352,10 @@ def lmAtomicObserve (treeBorrows : Bool) (caseIdx : Nat) : LmAtomicObs :=
   | 26 => runEvalRmw "atomic_xadd" frozenCfg layoutU32 1
   | 27 => runEvalCas false frozenCfg layoutU32 5 9
   | _ => .invalidOrUnsupported
+
+/-- Canonical cross-root runner (`dataRace = none`; see `lmAtomicObserve_fastPath_invariant`). -/
+def lmAtomicObserve (treeBorrows : Bool) (caseIdx : Nat) : LmAtomicObs :=
+  lmAtomicObserveWith false treeBorrows caseIdx
 
 /-- Expected output table for `lmAtomicObserve` across all 28 cases (`0..27`). -/
 def lmExpectedObs (tb : Bool) : Nat → LmAtomicObs
@@ -1367,6 +1406,25 @@ theorem lmAtomicObserve_table (tb : Bool) (idx : Nat) (hIdx : idx < 28) :
   have h2 := List.all_eq_true.mp h1 idx hMem
   exact of_decide_eq_true h2
 
+private theorem lmAtomicObserve_fastPath_aux :
+    ([false, true].all fun tb =>
+      (List.range 28).all fun idx =>
+        decide (lmAtomicObserveWith true tb idx = lmExpectedObs tb idx)) = true := by
+  decide +kernel
+
+/-- **Fast-path invariance of the entire corpus**: with `dataRace = some (GlobalState.initial
+false false)` every case takes the `some global` bracket of `IntrinsicAtomic.allowDataRaces` and
+every failing `compareExchange` its `isSome` VClock tail, yet all observations are unchanged. -/
+theorem lmAtomicObserve_fastPath_invariant (fastPath tb : Bool) (idx : Nat) (hIdx : idx < 28) :
+    lmAtomicObserveWith fastPath tb idx = lmAtomicObserve tb idx := by
+  have hTb : tb ∈ [false, true] := by cases tb <;> simp
+  have h1 := List.all_eq_true.mp lmAtomicObserve_fastPath_aux tb hTb
+  have hFast : lmAtomicObserveWith true tb idx = lmExpectedObs tb idx :=
+    of_decide_eq_true (List.all_eq_true.mp h1 idx (List.mem_range.mpr hIdx))
+  cases fastPath
+  · rfl
+  · exact hFast.trans (lmAtomicObserve_table tb idx hIdx).symm
+
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
 section AxiomAudit
@@ -1390,7 +1448,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 18 then
+  if theorems < 32 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
