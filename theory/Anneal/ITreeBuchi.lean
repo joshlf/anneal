@@ -57,6 +57,9 @@ Trees*):
   and plain `InfOften` cannot verify (`fairInfOften_strict_separation`).
   `CoBuchi` (`◇□`) is its accepting-edge-free instance; `buchiSat_nondet_incomplete`
   shows that `BuchiSat` with a nondeterministic monitor cannot replace it.
+- **`tryUpdate`** (§5): an end-to-end `Atomic::try_update` template combining
+  history monotonicity (`AlwaysStep`), fairness-conditional liveness
+  (`FairInfOften.iter_fair`) and the failure of `DWP` (`tryUpdate_spec`).
 - **`iterChain`**: the finite-unfolding $\omega$-chain of `ITree.iter`, its
   convergence in the projective `CofixA` order (`ofITree_iterChain`), and the
   safety ($\bigwedge_n$) versus eventuality ($\bigvee_n$) continuity laws.
@@ -12373,5 +12376,187 @@ theorem not_downContinuous_witnessNat :
         not_always_iter_continuity_angelic.1)
 
 end ContinuityCounterexamples
+
+/-! ## 5. Episode-2 Template: `Atomic::try_update` Under Fairness With History -/
+
+section TryUpdate
+
+/-!
+An end-to-end template for `creusot#2386` `Atomic::try_update` style proofs:
+a thread repeatedly loads an atomic cell (the environment may have changed it)
+and attempts a CAS that the environment may refuse. The logical state is the
+history of values this thread has published. The loop is proved
+
+* transition-safe: the history only grows (`AlwaysStep` with `List.IsPrefix`);
+* live under fairness: if the environment lets a CAS through infinitely often,
+  the loop returns a value `v` whose update `f v` was the last published write
+  (`FairInfOften`, via `FairInfOften.iter_fair`);
+* not totally correct (`¬ DWP`): an adversarial environment may refuse forever.
+-/
+
+/-- Requests of an atomic cell observed by one thread. -/
+inductive TryReq : Type where
+  /-- Read the current value (chosen by the environment). -/
+  | load
+  /-- Compare-and-swap `expected ↦ new`; the environment reports success. -/
+  | cas (expected new : Nat)
+
+/-- Answers: a load returns the current value, a CAS reports success. -/
+def TryAns : TryReq → Type
+  | .load => Nat
+  | .cas _ _ => Bool
+
+/-- The atomic-cell effect. -/
+abbrev TryE : Effect.{0} := CallE TryReq TryAns
+
+/--
+Demonic environment over the published history: a load may return any value,
+and a CAS may fail (history unchanged) or succeed (`new` is published).
+-/
+def tryWP : StateEffectWP (List Nat) TryE where
+  wp
+    | .call .load, K, h => ∀ v : Nat, K v h
+    | .call (.cas _ n), K, h => K false h ∧ K true (h ++ [n])
+  mono {i} _ _ _ hPQ hw :=
+    match i with
+    | .call .load => fun v => hPQ v _ (hw v)
+    | .call (.cas _ _) => ⟨hPQ false _ hw.1, hPQ true _ hw.2⟩
+
+instance : StateEffectWP.Conjunctive tryWP where
+  conj {i} _ _ _ hp hq :=
+    match i with
+    | .call .load => fun v => ⟨hp v, hq v⟩
+    | .call (.cas _ _) => ⟨⟨hp.1, hq.1⟩, ⟨hp.2, hq.2⟩⟩
+
+/-- The load request. -/
+def tryLoad : TryE.I := .call .load
+
+/-- The CAS request. -/
+def tryCas (expected new : Nat) : TryE.I := .call (.cas expected new)
+
+/-- Decode a loaded value. -/
+def tryVal (o : TryE.O tryLoad) : Nat := o
+
+/-- Decode a CAS outcome. -/
+def tryOk (expected new : Nat) (o : TryE.O (tryCas expected new)) : Bool := o
+
+/-- Fair edges: CAS attempts that the environment lets through. -/
+def tryFair : (i : TryE.I) → TryE.O i → List Nat → List Nat → Prop
+  | .call .load, _, _, _ => False
+  | .call (.cas _ _), b, _, _ => b = true
+
+/-- History monotonicity: every step extends the published history. -/
+def tryHist : (i : TryE.I) → TryE.O i → List Nat → List Nat → Prop :=
+  fun _ _ h h' => h <+: h'
+
+/-- On return with `v`, the last published write is `f v`. -/
+def tryPost (f : Nat → Nat) : Nat → List Nat → Prop :=
+  fun v h => ∃ h₀, h = h₀ ++ [f v]
+
+/-- Body continuation after the CAS: exit with the loaded value on success. -/
+def tryCasK (f : Nat → Nat) (v : Nat) (o : TryE.O (tryCas v (f v))) :
+    ITree TryE (PUnit.{1} ⊕ Nat) :=
+  ITree.ret (if tryOk v (f v) o then Sum.inr v else Sum.inl PUnit.unit)
+
+/-- Body continuation after the load: attempt `v ↦ f v`. -/
+def tryLoadK (f : Nat → Nat) (o : TryE.O tryLoad) : ITree TryE (PUnit.{1} ⊕ Nat) :=
+  ITree.vis (tryCas (tryVal o) (f (tryVal o))) (tryCasK f (tryVal o))
+
+/-- One `try_update` attempt. -/
+def tryBody (f : Nat → Nat) (_ : PUnit.{1}) : ITree TryE (PUnit.{1} ⊕ Nat) :=
+  ITree.vis tryLoad (tryLoadK f)
+
+/-- `loop { let v = load(); if cas(v, f v) { return v } }`. -/
+def tryUpdate (f : Nat → Nat) : ITree TryE Nat :=
+  ITree.iter (tryBody f) PUnit.unit
+
+/-- Unfolded continuation of `tryUpdate` after the CAS. -/
+def tryAfterCas (f : Nat → Nat) (v : Nat) (o : TryE.O (tryCas v (f v))) :
+    ITree TryE Nat :=
+  if tryOk v (f v) o then ITree.ret v else ITree.tau (tryUpdate f)
+
+/-- Unfolded continuation of `tryUpdate` after the load. -/
+def tryAfterLoad (f : Nat → Nat) (v : Nat) : ITree TryE Nat :=
+  ITree.vis (tryCas v (f v)) (tryAfterCas f v)
+
+theorem tryUpdate_eq (f : Nat → Nat) :
+    tryUpdate f = ITree.vis tryLoad (fun o => tryAfterLoad f (tryVal o)) := by
+  refine (iter_unfold (tryBody f) PUnit.unit).trans ?_
+  refine (vis_bind tryLoad (tryLoadK f) _).trans ?_
+  refine congrArg (ITree.vis tryLoad) (funext fun o => ?_)
+  refine (vis_bind _ (tryCasK f (tryVal o)) _).trans ?_
+  refine congrArg (ITree.vis (tryCas (tryVal o) (f (tryVal o)))) (funext fun b => ?_)
+  cases b
+  · exact (ret_bind (E := TryE) (Sum.inl PUnit.unit) _).trans rfl
+  · exact (ret_bind (E := TryE) (Sum.inr (tryVal o)) _).trans rfl
+
+/-- **Safety**: `try_update` only ever extends the published history. -/
+theorem tryUpdate_history_monotone (f : Nat → Nat) (h₀ : List Nat) :
+    AlwaysStep tryWP tryHist (fun _ _ => True) (tryUpdate f) h₀ := by
+  refine AlwaysStep.iter_invariant (tryBody f) (fun _ _ => True) ?_ trivial
+  intro a h _
+  refine (AlwaysStep.vis_iff _ _ _ tryLoad (tryLoadK f) h).2 ?_
+  intro v
+  refine ⟨List.prefix_refl h, ?_⟩
+  refine (AlwaysStep.vis_iff _ _ _ (tryCas v (f v)) (tryCasK f v) h).2 ?_
+  refine ⟨⟨List.prefix_refl h, ?_⟩, ⟨List.prefix_append h [f v], ?_⟩⟩
+  · exact (AlwaysStep.ret_iff _ _ _ (Sum.inl PUnit.unit) h).2 trivial
+  · exact (AlwaysStep.ret_iff _ _ _ (Sum.inr v) (h ++ [f v])).2 trivial
+
+/--
+**Liveness under fairness**: on every path along which the environment lets a
+CAS through infinitely often, `try_update` returns `v` with `f v` as the last
+published write.
+-/
+theorem tryUpdate_fairInfOften (f : Nat → Nat) (h₀ : List Nat) :
+    FairInfOften tryWP (fun _ _ _ _ => False) tryFair (tryPost f)
+      (tryUpdate f) h₀ := by
+  refine FairInfOften.iter_fair (tryBody f) (fun _ _ => True) ?_ trivial
+  intro a h _
+  refine (fairIter.vis_iff _ _ _ _ false tryLoad (tryLoadK f) h).2 ?_
+  intro v
+  refine Or.inr ⟨fun hf => hf, ?_⟩
+  refine (fairIter.vis_iff _ _ _ _ true (tryCas v (f v)) (tryCasK f v) h).2 ?_
+  refine ⟨Or.inr ⟨fun hf => Bool.noConfusion hf, ?_⟩, Or.inl ⟨rfl, ?_⟩⟩
+  · exact (fairIter.ret_inl_iff tryWP tryFair (fun _ _ => True) (tryPost f) true
+      PUnit.unit h).2 ⟨rfl, trivial⟩
+  · exact DWP.ret ⟨h, rfl⟩
+
+/-- **No total correctness**: the environment may refuse every CAS. -/
+theorem not_dwp_tryUpdate (f : Nat → Nat) (Q : Nat → List Nat → Prop)
+    (h₀ : List Nat) : ¬ DWP tryWP (tryUpdate f) Q h₀ := by
+  have hobs : (tryUpdate f).observe =
+      .vis tryLoad (fun o => tryAfterLoad f (tryVal o)) := by
+    conv => lhs; rw [tryUpdate_eq]
+    exact ITree.observe_vis _ _
+  have hobs' : ∀ v, (tryAfterLoad f v).observe =
+      .vis (tryCas v (f v)) (tryAfterCas f v) :=
+    fun _ => ITree.observe_vis _ _
+  intro h
+  refine DWP.induct
+    (fun x _ => (x = tryUpdate f ∨ x = ITree.tau (tryUpdate f) ∨
+      ∃ v, x = tryAfterLoad f v) → False) ?_ h (Or.inl rfl)
+  intro x s₀ hx hx_eq
+  rcases hx_eq with rfl | rfl | ⟨v, rfl⟩
+  · rw [hobs] at hx
+    exact hx 0 (Or.inr (Or.inr ⟨_, rfl⟩))
+  · rw [ITree.observe_tau] at hx
+    exact hx (Or.inl rfl)
+  · rw [hobs'] at hx
+    exact hx.1 (Or.inr (Or.inl rfl))
+
+/--
+**`try_update` specification**: fairness-conditional liveness along the
+history-monotone (step-guarded) environment, and no total correctness.
+-/
+theorem tryUpdate_spec (f : Nat → Nat) (h₀ : List Nat) :
+    FairInfOften (guardStepWP tryWP tryHist) (fun _ _ _ _ => False) tryFair
+        (tryPost f) (tryUpdate f) h₀ ∧
+      ¬ DWP tryWP (tryUpdate f) (tryPost f) h₀ :=
+  ⟨FairInfOften.guardStep_of_alwaysStep (tryUpdate_history_monotone f h₀)
+     (tryUpdate_fairInfOften f h₀),
+   not_dwp_tryUpdate f _ h₀⟩
+
+end TryUpdate
 
 end Anneal.ITreeBuchi
