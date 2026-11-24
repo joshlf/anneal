@@ -939,6 +939,64 @@ theorem hasFrameDeallocProtectorConflict_nil_protectors (borrows : List BorrowEn
     (depth nLocals : Nat) : hasFrameDeallocProtectorConflict borrows [] depth nLocals = false := by
   cases borrows <;> rfl
 
+/-- **Frame-depth & local-range isolation**: borrows targeting another frame
+(`targetFrameDepth ≠ depth`), caller-owned referents (`nLocals ≤ targetLocal`), released
+protectors, or `.cell`/`.disabled` permissions never trigger
+`hasFrameDeallocProtectorConflict`. -/
+theorem hasFrameDeallocProtectorConflict_frame_isolation (borrows : List BorrowEntry)
+    (ap : List Nat) (depth nLocals : Nat)
+    (hIso : ∀ e ∈ borrows, e.targetFrameDepth ≠ depth ∨ nLocals ≤ e.targetLocal ∨
+      isBorrowProtected ap e = false ∨ preventsDeallocation e.perm = false) :
+    hasFrameDeallocProtectorConflict borrows ap depth nLocals = false := by
+  cases hc : hasFrameDeallocProtectorConflict borrows ap depth nLocals with
+  | false => rfl
+  | true =>
+    obtain ⟨_, e, hm, hd, hl, hp, hpd⟩ := (hasFrameDeallocProtectorConflict_iff borrows ap depth nLocals).mp hc
+    rcases hIso e hm with h1 | h2 | h3 | h4
+    · exact absurd hd h1
+    · exact absurd hl (Nat.not_lt.mpr h2)
+    · rw [hp] at h3; cases h3
+    · rw [hpd] at h4; cases h4
+
+/-- **Frame-teardown borrow-purging post-condition (`disableFrameBorrows`)**: every borrow
+targeting a local `< nLocals` of frame `depth` becomes `.disabled` with `allocDead = true`,
+while every borrow of another frame or caller referent (`targetLocal ≥ nLocals`) is
+preserved unchanged. -/
+theorem disableFrameBorrows_post (borrows : List BorrowEntry) (depth nLocals : Nat) :
+    (∀ e ∈ disableFrameBorrows borrows depth nLocals,
+      e.targetFrameDepth = depth → e.targetLocal < nLocals →
+        e.perm = .disabled ∧ e.allocDead = true) ∧
+    (∀ e ∈ borrows, (e.targetFrameDepth ≠ depth ∨ nLocals ≤ e.targetLocal) →
+      e ∈ disableFrameBorrows borrows depth nLocals) := by
+  induction borrows with
+  | nil => exact ⟨(fun _ h => by cases h), (fun _ h => by cases h)⟩
+  | cons e rest ih =>
+    rw [disableFrameBorrows]
+    cases hm : (Nat.beq e.targetFrameDepth depth && Nat.blt e.targetLocal nLocals) with
+    | true =>
+      obtain ⟨hd, hl⟩ := Bool.and_eq_true _ _ |>.mp hm
+      have hd' := Nat.eq_of_beq_eq_true hd
+      have hl' := Nat.blt_eq.mp hl
+      refine ⟨fun x hx hxd hxl => ?_, fun x hx hne => ?_⟩
+      · rcases List.mem_cons.mp hx with rfl | hx'
+        · exact ⟨rfl, rfl⟩
+        · exact ih.1 x hx' hxd hxl
+      · rcases List.mem_cons.mp hx with rfl | hx'
+        · rcases hne with h1 | h2
+          · exact absurd hd' h1
+          · exact absurd hl' (Nat.not_lt.mpr h2)
+        · exact List.mem_cons_of_mem _ (ih.2 x hx' hne)
+    | false =>
+      refine ⟨fun x hx hxd hxl => ?_, fun x hx hne => ?_⟩
+      · rcases List.mem_cons.mp hx with rfl | hx'
+        · have h1 : Nat.beq x.targetFrameDepth depth = true := by rw [hxd]; exact Nat.beq_refl depth
+          have h2 : Nat.blt x.targetLocal nLocals = true := Nat.blt_eq.mpr hxl
+          rw [h1, h2] at hm; cases hm
+        · exact ih.1 x hx' hxd hxl
+      · rcases List.mem_cons.mp hx with rfl | hx'
+        · exact List.mem_cons_self
+        · exact List.mem_cons_of_mem _ (ih.2 x hx' hne)
+
 /-- Universal characterization of `hasProtectedLocalBorrow`. -/
 theorem hasProtectedLocalBorrow_iff (borrows : List BorrowEntry) (ap : List Nat) (loc : Local)
     (d : Nat) :
@@ -1515,6 +1573,38 @@ theorem evalRvalue_thinScalar_eq (locals : List LocalSlot) (mem : Memory) (decls
       .ok (.scalar (boolToScalar (Nat.beq sc₁.bits sc₂.bits))) l₂ mem := by
   simp only [evalRvalue, h1, h2, evalScalarBinOp, hSz1, hSz2]
 
+/-- **Mixed provenance-thin vs scalar-thin `==` compares only address bits** (composing
+`evalCastPtrToPtr_slice_to_thin` / `evalCastPtrToPtr_dyn_to_thin` with
+`evalCastPtrToPtr_scalarPair_to_thin` / `evalCastPtrToPtr_scalarDyn_to_thin`). -/
+theorem evalRvalue_thinPtr_scalar_eq (locals : List LocalSlot) (mem : Memory)
+    (decls : List LocalDecl) (layouts : LayoutTable) (lhsOp rhsOp : Operand)
+    (p : ProvenancePtr) (sc : ScalarInt) (l₁ l₂ : List LocalSlot)
+    (h1 : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.ptr p 8) l₁)
+    (h2 : evalOperand l₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.scalar sc) l₂)
+    (hRel : isPtrRelationalBinOp .eq decls layouts lhsOp rhsOp = true)
+    (hB : lookupBorrow mem.borrows p.tag = none) (hSz : sc.sizeBytes = 8) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      .ok (.scalar (boolToScalar (Nat.beq (ptrToAddrScalar p 8).bits sc.bits))) l₂ mem := by
+  simp only [evalRvalue, h1, h2, hRel,
+    ptrAddressScalar?_unborrowed _ _ _ _ _ _ _ _ _ hB, evalScalarBinOp, ptrToAddrScalar, hSz]
+
+/-- Symmetric mixed scalar-thin vs provenance-thin `==`. -/
+theorem evalRvalue_thinScalar_ptr_eq (locals : List LocalSlot) (mem : Memory)
+    (decls : List LocalDecl) (layouts : LayoutTable) (lhsOp rhsOp : Operand)
+    (sc : ScalarInt) (p : ProvenancePtr) (l₁ l₂ : List LocalSlot)
+    (h1 : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.scalar sc) l₁)
+    (h2 : evalOperand l₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.ptr p 8) l₂)
+    (hRel : isPtrRelationalBinOp .eq decls layouts lhsOp rhsOp = true)
+    (hB : lookupBorrow mem.borrows p.tag = none) (hSz : sc.sizeBytes = 8) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      .ok (.scalar (boolToScalar (Nat.beq sc.bits (ptrToAddrScalar p 8).bits))) l₂ mem := by
+  simp only [evalRvalue, h1, h2, hRel,
+    ptrAddressScalar?_unborrowed _ _ _ _ _ _ _ _ _ hB, evalScalarBinOp, ptrToAddrScalar, hSz]
+
 private theorem resolveWideWordScalar?_ptr_unborrowed (locals : List LocalSlot)
     (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (decls : List LocalDecl)
     (layouts : LayoutTable) (p : ProvenancePtr) (callStack : List SavedCallerFrame)
@@ -1872,8 +1962,10 @@ theorem trustedCmp_nonvacuity_twins_table :
     trustedCmpObs hwDynTy hwDynTy false (hwDyn hwPtrA hwVt9) (hwDyn hwPtrA hwVt9) = .okBool true ∧
     trustedCmpObs hwSliceTy hwSliceTy true (hwScalarSlice 8192 3) (hwScalarSlice 8192 7) = .okBool true ∧
     trustedCmpObs hwSliceTy hwDynTy true (hwScalarSlice 8192 3) (hwScalarDyn 8192 hwVt9) = .okBool true ∧
-    trustedCmpObs hwSliceTy hwSliceTy true (hwScalarSlice 8192 3) (hwScalarSlice 12288 3) = .okBool false := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+    trustedCmpObs hwSliceTy hwSliceTy true (hwScalarSlice 8192 3) (hwScalarSlice 12288 3) = .okBool false ∧
+    trustedCmpObs hwSliceTy hwDynTy true (hwSlice hwPtrA 5) (hwScalarDyn 73728 hwVt9) = .okBool true ∧
+    trustedCmpObs hwSliceTy hwDynTy true (hwSlice hwPtrA 5) (hwScalarDyn 12288 hwVt9) = .okBool false := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 end TrustedBridge
 
@@ -2016,6 +2108,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @hasProtectedLocalBorrow_eq_mr_node) ∧
       (type_of% @hasFrameDeallocProtectorConflict_iff) ∧
       (type_of% @hasFrameDeallocProtectorConflict_nil_protectors) ∧
+      (type_of% @hasFrameDeallocProtectorConflict_frame_isolation) ∧
+      (type_of% @disableFrameBorrows_post) ∧
       (type_of% @hasProtectedLocalBorrow_iff) ∧
       (type_of% @isBorrowProtected_released) ∧
       (type_of% @evalTerminator_return_protector_ub) ∧
@@ -2039,6 +2133,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @ptrToAddrScalar_addr_only) ∧
       (type_of% @evalRvalue_thinPtr_eq) ∧
       (type_of% @evalRvalue_thinScalar_eq) ∧
+      (type_of% @evalRvalue_thinPtr_scalar_eq) ∧
+      (type_of% @evalRvalue_thinScalar_ptr_eq) ∧
       (type_of% @evalRvalue_wideSlice_eq) ∧
       (type_of% @evalRvalue_wideDyn_eq) ∧
       (type_of% @evalRvalue_wideSlice_eq_matches_mr) ∧
@@ -2062,6 +2158,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
     ⟨@preventsDeallocation_eq_mr, @mr_prevents_deallocation_iff_trusted,
       @hasFrameDeallocProtectorConflict_eq_mr_node, @hasProtectedLocalBorrow_eq_mr_node,
       @hasFrameDeallocProtectorConflict_iff, @hasFrameDeallocProtectorConflict_nil_protectors,
+      @hasFrameDeallocProtectorConflict_frame_isolation, @disableFrameBorrows_post,
       @hasProtectedLocalBorrow_iff, @isBorrowProtected_released,
       @evalTerminator_return_protector_ub, @evalTerminator_return_no_conflict_root,
       @evalTerminator_callee_return_releases_protector, @evalTailCallTerminator_protector_ub,
@@ -2074,6 +2171,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       @evalCastPtrToPtr_scalarPair_to_thin, @evalCastPtrToPtr_scalarDyn_to_thin,
       @ptrAddressScalar?_unborrowed, @ptrToAddrScalar_addr_only,
       @evalRvalue_thinPtr_eq, @evalRvalue_thinScalar_eq,
+      @evalRvalue_thinPtr_scalar_eq, @evalRvalue_thinScalar_ptr_eq,
       @evalRvalue_wideSlice_eq, @evalRvalue_wideDyn_eq,
       @evalRvalue_wideSlice_eq_matches_mr, @evalRvalue_wideDyn_eq_matches_mr,
       @evalCast_then_thinEq_erases_meta_and_prov, @trustedRvalue_witnesses,
@@ -2124,6 +2222,7 @@ run_cmd do
       (ns ++ `hasProtectedLocalBorrow_eq_mr_node,
         `MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation),
       (ns ++ `evalTerminator_return_protector_ub, `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator),
+      (ns ++ `disableFrameBorrows_post, `Trusted.Rustc.V2026_06_01.MirSemantics.disableFrameBorrows),
       (ns ++ `evalTerminator_callee_return_releases_protector,
         `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors),
       (ns ++ `evalTailCallTerminator_protector_ub,

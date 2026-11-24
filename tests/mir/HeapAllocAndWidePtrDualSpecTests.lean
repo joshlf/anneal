@@ -194,6 +194,16 @@ theorem lm_addr_eq_polarity_twins :
         (lmSlice ⟨Size.ofBytes 8192, none⟩ 7) = .ok (.okBool false) := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
+/-- Opposite-polarity LeanMiri `dyn Trait` wide `==` twin (Case `26` non-vacuity):
+identical address + identical vtable evaluates to `true`, whereas distinct vtables
+evaluate to `false` on vendored `ExecutionScalar.pointerBinary`. -/
+theorem lm_dyn_eq_polarity_twin :
+    lmCompare lmEq (lmDyn ⟨Size.ofBytes 8192, none⟩ (lmAddr 36864))
+        (lmDyn ⟨Size.ofBytes 8192, none⟩ (lmAddr 36864)) = .ok (.okBool true) ∧
+    lmCompare lmEq (lmDyn ⟨Size.ofBytes 8192, none⟩ (lmAddr 36864))
+        (lmDyn ⟨Size.ofBytes 8192, none⟩ (lmAddr 40960)) = .ok (.okBool false) := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
 /-- Universal LeanMiri `addr_eq` laws: metadata and provenance erasure. -/
 theorem lm_addr_eq_universal :
     (type_of% @addrEq_metadata_erased) ∧ (type_of% @thinEq_provenance_erased) ∧
@@ -440,7 +450,8 @@ run_cmd do
               `mrProtectorTrace_table, `heapWideOutcomeCodec_rejects_malformed,
               `preventsDeallocation_eq_mr, `mr_prevents_deallocation_iff_trusted,
               `hasFrameDeallocProtectorConflict_eq_mr_node, `hasProtectedLocalBorrow_eq_mr_node,
-              `hasFrameDeallocProtectorConflict_iff, `hasProtectedLocalBorrow_iff,
+              `hasFrameDeallocProtectorConflict_iff, `hasFrameDeallocProtectorConflict_frame_isolation,
+              `disableFrameBorrows_post, `hasProtectedLocalBorrow_iff,
               `evalTerminator_return_protector_ub, `evalTerminator_callee_return_releases_protector,
               `evalTailCallTerminator_protector_ub, `evalTailCallTerminator_no_conflict_steps,
               `evalStmt_storageDead_protector_ub, `evalStmt_storageDead_no_conflict_steps,
@@ -451,6 +462,7 @@ run_cmd do
               `evalCastPtrToPtr_slice_to_thin, `evalCastPtrToPtr_dyn_to_thin,
               `evalCastPtrToPtr_scalarPair_to_thin, `evalCastPtrToPtr_scalarDyn_to_thin,
               `evalRvalue_thinPtr_eq, `evalRvalue_thinScalar_eq,
+              `evalRvalue_thinPtr_scalar_eq, `evalRvalue_thinScalar_ptr_eq,
               `evalRvalue_wideSlice_eq, `evalRvalue_wideDyn_eq,
               `evalRvalue_wideSlice_eq_matches_mr, `evalRvalue_wideDyn_eq_matches_mr,
               `evalCast_then_thinEq_erases_meta_and_prov,
@@ -635,7 +647,26 @@ run_cmd do
                   mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
                   mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3)])
               (mkApp (obsC "okBool") boolFalse))
-            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))) ]
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))),
+        ("forged 3-way: Trusted hetero addr_eq equals LeanMiri full-wide-eq case 24",
+          some (thm "trustedHeteroEqLm27"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwDynTy), boolTrue,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 5),
+                  mkApp2 (mkConst (dsNs ++ `hwDyn)) (mkConst (dsNs ++ `hwPtrB)) (mkConst (dsNs ++ `hwVt9))])
+              (mkApp2 (mkConst crossObsU) boolTrue (mkNatLit 27)))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy
+              (mkApp2 (mkConst crossObsU) boolTrue (mkNatLit 27)))),
+          thm "trustedHeteroForgedLm24"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwDynTy), boolTrue,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 5),
+                  mkApp2 (mkConst (dsNs ++ `hwDyn)) (mkConst (dsNs ++ `hwPtrB)) (mkConst (dsNs ++ `hwVt9))])
+              (mkApp2 (mkConst crossObsU) boolTrue (mkNatLit 24)))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy
+              (mkApp2 (mkConst crossObsU) boolTrue (mkNatLit 24)))) ]
     for (what, baseOpt, d) in extraForged do
       if let some baseDecl := baseOpt then
         unless ← accepts baseDecl do
@@ -648,11 +679,17 @@ run_cmd do
     let env ← getEnv
     let isStdAx (a : Lean.Name) : Bool :=
       a == ``propext || a == ``Classical.choice || a == ``Quot.sound
-    -- Constructive codec layer in DualSpec must be strictly choice-free (`[propext, Quot.sound]`).
+    -- Constructive codec & authority-check layer in DualSpec must be strictly choice-free (`[propext, Quot.sound]`).
     for c in [dsNs ++ `heapWideOutcomeCodec, dsNs ++ `heapWideOutcomeCodec_tight,
               dsNs ++ `heapWideOutcomeCodec_encode_injective,
               dsNs ++ `heapWideOutcomeCodec_decode_injective_on_valid,
-              dsNs ++ `heapWideDecode_canonical, dsNs ++ `lmAuthorityCheck_sound] do
+              dsNs ++ `heapWideDecode_canonical, dsNs ++ `heapWideOutcomeCodec_rejects_malformed,
+              dsNs ++ `ofMrObs_toMrObs, dsNs ++ `toMrObs_ofMrObs, dsNs ++ `ofMrObs_injective,
+              dsNs ++ `HeapWideMemoryMode.of_toLmTreeBorrows,
+              dsNs ++ `HeapWideMemoryMode.to_ofLmTreeBorrows,
+              dsNs ++ `range_map_cell, dsNs ++ `expected_agreement_zone,
+              dsNs ++ `caseClass_agreement_iff, dsNs ++ `divergesAt_iff_class,
+              dsNs ++ `lmAuthorityCheck_sound, dsNs ++ `lmAuthorityOfCheck] do
       for a in ← collectAxioms c do
         unless a == ``propext || a == ``Quot.sound do
           throwError "cross-root constructive audit: {c} must not depend on {a}"
@@ -738,6 +775,7 @@ run_cmd do
         `Miri.Interpreter.Cast.ptrToPtr, `Miri.Interpreter.ExecutionScalar.pointerBinary,
         `Trusted.Rustc.V2026_06_01.MirSemantics.hasFrameDeallocProtectorConflict,
         `Trusted.Rustc.V2026_06_01.MirSemantics.hasProtectedLocalBorrow,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.disableFrameBorrows,
         `Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator,
@@ -758,7 +796,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 84 && rejectedCount = 26 do
+  unless addedCount = 88 && rejectedCount = 27 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
