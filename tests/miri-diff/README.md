@@ -253,14 +253,14 @@ statement) or agreement with Miri:
   `ub_copy_nonoverlapping_partial_overlap_array` with `offset(p, 1isize)`
   perturbed to `offset(p, 2isize)`).
   `pass_copy_nonoverlapping_same_tag_disjoint_array_halves` (Miri `30`, `&raw
-  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copyViaBytes`
+  mut arr[0]` on `[u32; 4]`, exercising `Statements.lean`'s `copySliceElements`
   same-tag guard),
   `pass_copy_nonoverlapping_same_tag_disjoint_u8_array_halves` (Miri
   `285803779`, `(&raw mut arr) as *mut u8` on `[u8; 8]`, directly entering
-  `Statements.lean`'s `sameContainer` array-slice branch and hitting `Nat.beq
-  srcPtr.tag dstPtr.tag`), and
+  `Statements.lean`'s `copySliceElements` array-slice branch and hitting `Nat.beq
+  srcEp.ptr.tag dstEp.ptr.tag`), and
   `pass_copy_nonoverlapping_same_tag_disjoint_struct_fields` (Miri `44`, `&raw
-  mut pair.a` on `PairU32`) copy between disjoint parts of one local through two
+  mut pair.a` on `PairU32`, hitting `copyBytesSubplace`'s same-tag guard) copy between disjoint parts of one local through two
   pointers that share one tag. Both forward (`src < dst`) and backward (`dst <
   src`) disjoint copies, plus whole-struct `(&raw mut pair) as *mut u32`, report
   UB at the `copy_nonoverlapping` (`false_positive_ub`,

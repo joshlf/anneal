@@ -3691,11 +3691,11 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
     let mut conservative_gaps = 0usize;
     let mut location_gaps = 0usize;
 
-    // Same-tag disjoint copies across `copyViaBytes` (`&raw mut arr[0]` / `&raw mut
-    // pair.a`), `sameContainer` (`(&raw mut arr) as *mut u8` on `[u8; 8]`),
-    // whole-struct casts, and both forward (`src < dst`) and backward (`dst < src`)
-    // directions: Miri returns the copied value; Anneal reports UB at the
-    // `copy_nonoverlapping` or, once fixed, agrees.
+    // Same-tag disjoint copies across `copySliceElements` (`&raw mut arr[0]` on
+    // `[u32; 4]`, `(&raw mut arr) as *mut u8` on `[u8; 8]`), `copyBytesSubplace`
+    // (`&raw mut pair.a` and whole-struct casts), and both forward (`src < dst`)
+    // and backward (`dst < src`) directions: Miri returns the copied value; Anneal
+    // reports UB at the `copy_nonoverlapping` or, once fixed, agrees.
     let probe_header = |probe: &str| format!("pub fn {probe}() -> u32 {{");
     for (name, header, bits, copy) in [
         (
@@ -3817,9 +3817,9 @@ fn campaign16_same_tag_disjoint_copy_and_static_retag_probes_verify_live() {
         }
     }
 
-    // True same-tag overlaps on both `[u32; 4]` (`copyViaBytes`) and `[u8; 8]`
-    // (`sameContainer`) must stay UB at the copy in both Miri and Anneal, so the
-    // pins above cannot hold because Anneal stopped checking overlap.
+    // True same-tag overlaps on both `[u32; 4]` and `[u8; 8]` (`copySliceElements`)
+    // must stay UB at the copy in both Miri and Anneal, so the pins above cannot
+    // hold because Anneal stopped checking overlap.
     for (ctrl_name, copy_stmt) in [
         (
             "c16_same_tag_overlap_control",
