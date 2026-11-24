@@ -70,11 +70,20 @@ MiniRust-side facts only (the `BasicMemory` codec equivalences and
   atomic write vs non-atomic load, atomic read vs non-atomic store,
   synchronized threads, disjoint byte ranges, and failing vs succeeding
   compare-exchange against a non-atomic load); provenance of pointer bytes
-  under integer atomics; the Tree Borrows `Frozen` and `Reserved` witnesses; and
+  under integer atomics; the Tree Borrows `Frozen` and `Reserved` witnesses;
   `Terminator::Intrinsic` end to end through `step` / `steps` and `stepTB` /
-  `stepsTB`.
+  `stepsTB`, where a faulting argument stops the terminator before the
+  intrinsic runs, leftmost first (`evalArgsM_error_iff`,
+  `evalTerminatorM_intrinsic_args_error`, `argFaultAtomicFn_order`); atomics
+  through `int2ptr` pointers against the scalar summary `atomicScalar`
+  (`atomic_int2ptr_scalar`); and signed negative two's-complement cases
+  (`atomic_signed_neg_and_scalar_guards`).
 * **§5** Instances showing that the conditional laws (including the data-race
-  laws) are not vacuous, and the axiom and import audit.
+  laws) are not vacuous; the Episode 1 capstone
+  `ep1_minirust_atomic_intrinsics_capstone`, one statement bundling the
+  `Mach` / `BasicMemory` agreement, `MachTB.wfLive` preservation, the
+  `atomicScalar` summary on both machines, and the round-trip, `Frozen`,
+  `Reserved`, and data-race witnesses; and the axiom and import audit.
 
 ## What the laws say about upstream MiniRust `d821c6e3`
 
@@ -5293,8 +5302,9 @@ theorem argFaultAtomicFn_order :
 
 /-- Scalar summary of an integer atomic at `t` on a cell holding `cur`: the returned integer
 (`none` for the unit of `AtomicStore`) and the cell's next integer; `none` when the intrinsic
-stops (non-atomic width, ill-formed arguments or loaded `cur`, arithmetic UB, or a stored
-integer that `t` cannot represent). -/
+stops (wrong arity, non-atomic width, arithmetic UB, or a stored integer that `t` cannot
+represent) and when `cur` is not a value of `t`, which no cell holds. Like upstream, it never
+checks the `before` of `AtomicCompareExchange` and checks `next` only when the exchange stores. -/
 def atomicScalar (op : IntrinsicOp) (t : IntType) (cur : Int) (args : List Int) :
     Option (Option Int × Int) :=
   let okWidth :=
@@ -5430,8 +5440,10 @@ def signedNegAgrees (M : Type) [Memory M] {S : Type}
       atomicScalar c.1 t (-5) c.2.1 == c.2.2 && obs == c.2.2
 
 /-- Signed negative two's-complement atomics across `i8`/`i32`/`i64` on `Mach` and `MachTB`
-(`i8` bytes, negative CAS, bitwise/arithmetic RMW, and sign-extending `Shr`), plus `atomicScalar`
-width and representability guards matching `evalIntrinsic`. -/
+(`i8` bytes, negative CAS, bitwise/arithmetic RMW, and sign-extending `Shr`), plus the
+`atomicScalar` guards, each next to the `evalIntrinsic` stop it summarizes: a `u128` width
+(UB), a 3-byte width (it stops), and an `i8` overflow (specification panic). The `128`-at-`i8`
+guard has no such counterpart: no `i8` cell decodes to `128`. -/
 theorem atomic_signed_neg_and_scalar_guards :
     bmObs (bmStoreLoad (.Int (-5)) (.Int itI8) (.Int itI8)) =
       bmRoundTrip (.Int (-5)) (initBytes [0xFB]) ∧
@@ -5443,11 +5455,12 @@ theorem atomic_signed_neg_and_scalar_guards :
     stopOf (bmLoad (bmWith []) bmPtr (.Int itU128)) =
       some (.ub "invalid return type for `AtomicLoad` intrinsic: size too big") ∧
     atomicScalar .AtomicStore ⟨.Signed, ⟨3⟩⟩ 0 [0] = none ∧
+    (stopOf (bmStore (bmWith []) bmPtr (.Int 0) (.Int ⟨.Signed, ⟨3⟩⟩))).isSome = true ∧
     atomicScalar .AtomicLoad itI8 128 [] = none ∧
     atomicScalar (.AtomicFetchAndOp .Add) itI8 (-128) [-1] = none ∧
     stopOf (bmRmw (bmWith (initBytes [0x80])) bmPtr .Add (-1) itI8) =
       some (.specPanic "trying to store a value which is ill-formed for its type") := by
-  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-! ## §5. Vacuity and axiom audit
 
@@ -5802,6 +5815,62 @@ theorem atomicCompareExchange_failure_memory_bm_instance :
   exact ⟨h, atomicCompareExchange_failure_memory_bm h
     (fun hc => absurd (Value.Int.inj hc) (by decide))⟩
 
+/-! ### Episode 1 capstone -/
+
+/-- **Episode 1 capstone**: the headline guarantees of this module in one statement.
+1. On the four atomic intrinsics, the polymorphic `evalIntrinsicM` at `BasicMemory` is exactly
+   `evalIntrinsic` on `Mach`.
+2. On `MachTB`, all four preserve the Tree Borrows invariant `MachTB.wfLive`, which the fresh
+   machine `tbWith []` satisfies.
+3. `atomicScalar` summarizes both machines on `scalarCases`, through the cell's pointer and
+   through its `int2ptr` reconstruction.
+4. Kernel-evaluated witnesses: (a) the `i8` round trip of `-5` on both machines; (b) through a
+   `Frozen` reference, a mismatching `AtomicCompareExchange` is a pure read (returns `5`, logs
+   one atomic load, changes no byte and no permission) and a matching one is Tree Borrows UB;
+   (c) through a `Reserved` reference, the mismatching one keeps it `Reserved` and the matching
+   one activates it to `Unique`, disabling its `Frozen` sibling; (d) against an `AtomicStore` on
+   an unsynchronized thread, an `Atomicity::Atomic` load passes `check_data_races` and an
+   `Atomicity::None` load of the same bytes is UB `"Data race"`. -/
+theorem ep1_minirust_atomic_intrinsics_capstone :
+    (∀ (m : Mach) (op : IntrinsicOp) (args : List (Val × «Type»)) (retTy : «Type»),
+      isAtomicOp op = true →
+        evalIntrinsicM (M := BM) m op args retTy = evalIntrinsic m op args retTy) ∧
+    ((∀ (m m' : MachTB) (op : IntrinsicOp) (args : List (Value TBM × «Type»)) (retTy : «Type»)
+        (val : Value TBM), isAtomicOp op = true →
+        MiniRustSpec.Correspondence.MachTB.wfLive m →
+        evalIntrinsicM m op args retTy = .ok (val, m') →
+        MiniRustSpec.Correspondence.MachTB.wfLive m') ∧
+      MiniRustSpec.Correspondence.MachTB.wfLive (tbWith [])) ∧
+    (scalarAgrees BM evalIntrinsic bmFive bmPtr = true ∧
+      scalarAgrees TBM evalIntrinsicM tbFive tbPtr = true) ∧
+    (bmObs (bmStoreLoad (.Int (-5)) (.Int itI8) (.Int itI8)) =
+        bmRoundTrip (.Int (-5)) (initBytes [0xFB]) ∧
+      tbObs (tbStoreLoad (.Int (-5)) (.Int itI8) (.Int itI8)) =
+        tbRoundTrip (.Int (-5)) (initBytes [0xFB])) ∧
+    (tbObs (tbCas tbShared tbSharedPtr 6 9 itU32) = some ⟨.Int 5, [u32Bytes 5], [aLoad 4]⟩ ∧
+      tbPerms (tbCas tbShared tbSharedPtr 6 9 itU32) =
+        some (List.replicate 4 (.Unprot .Unique), [List.replicate 4 (.Unprot .Frozen)]) ∧
+      tbCas tbShared tbSharedPtr 5 9 itU32 =
+        .error (.ub "Tree Borrows: local write of Frozen reference")) ∧
+    (tbPerms (tbCas tbTwoPhase tbMutPtr 6 9 itU32) = tbTwoPhasePerms .Unique .Reserved .Frozen ∧
+      tbPerms (tbCas tbTwoPhase tbMutPtr 5 9 itU32) =
+        tbTwoPhasePerms .Unique .Unique .Disabled) ∧
+    (ConcurrentMemory.check_data_races
+        (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem
+        1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]).mem.accesses) =
+        .ok () ∧
+      ConcurrentMemory.check_data_races
+        (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [⟨.Load, .None, cellAddr, ⟨4⟩⟩]).mem
+        1 (⟨[]⟩, (tbMach [tbCell (u32Bytes 7 ++ uninitBytes 4)] [aStore 4]).mem.accesses) =
+        .error (.ub "Data race")) :=
+  ⟨fun m op args retTy hop => evalIntrinsicM_bm_eq_atomic m op args retTy hop,
+   ⟨fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_atomic_tb_wfLive hop hwf h, tbFresh_wfLive⟩,
+   ⟨atomic_int2ptr_scalar.1, atomic_int2ptr_scalar.2.1⟩,
+   ⟨atomic_signed_neg_and_scalar_guards.1, atomic_signed_neg_and_scalar_guards.2.1⟩,
+   ⟨atomic_frozen_tb.2.1, atomic_frozen_tb.2.2.1, atomic_frozen_tb.2.2.2.1⟩,
+   ⟨atomic_reserved_reads_tb.2.2.2, atomic_reserved_writes_activate_tb.2.2.1⟩,
+   ⟨atomic_atomic_no_data_race_instance, atomicStore_nonAtomicLoad_data_race_instance.1⟩⟩
+
 /-! ### Axiom and import audit -/
 
 section AxiomAudit
@@ -5832,7 +5901,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.AtomicIntrinsicsMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 230 then
+  -- Episode 1 closes with 262 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 262 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.AtomicIntrinsicsMR seen"
   logInfo m!"MiniRustSpec.AtomicIntrinsicsMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
