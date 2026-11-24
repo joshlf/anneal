@@ -1044,12 +1044,14 @@ def runEvalRmw (name : String) (cfg : SingleCellConfig) (valLayout : LocalLayout
     | _, _ => .invalidOrUnsupported
 
 /-- Execute `atomic_cxchg` or `atomic_cxchgweak` through `IntrinsicAtomic.eval`
-over `AtomicMachine.bind`. -/
-def runEvalCas (weak : Bool) (cfg : SingleCellConfig) (valLayout : LocalLayout)
+with explicit `IntrinsicAtomicHooks` (used by `runEvalCas` and poisoned-hook invariants). -/
+def runEvalCasWithHooks
+    (hooks : IntrinsicAtomicHooks Provenance AtomicState LmAtomicChoice (RuntimePlace Provenance))
+    (weak : Bool) (cfg : SingleCellConfig) (valLayout : LocalLayout)
     (expectedBits newBits : Nat)
     (successOrd : Miri.Concurrency.AtomicOrdering := .SeqCst)
     (failureOrd : Miri.Concurrency.AtomicOrdering := .Relaxed)
-    (weakPolicy : WeakCasPolicy := .neverFail) (weakSuccess : Bool := true) : LmAtomicObs :=
+    (weakSuccess : Bool := true) : LmAtomicObs :=
   let st := mkSingleCellState cfg
   let choice : LmAtomicChoice := {
     ord1 := successOrd
@@ -1059,7 +1061,7 @@ def runEvalCas (weak : Bool) (cfg : SingleCellConfig) (valLayout : LocalLayout)
   let dest := mkDestPlace (mkCasDestLayout valLayout)
   let width := valLayout.layout.size.bytes.toNat
   let name := if weak then "atomic_cxchgweak" else "atomic_cxchg"
-  match IntrinsicAtomic.eval (lmAtomicHooksBind weakPolicy) choice
+  match IntrinsicAtomic.eval hooks choice
       name #[mkCellPtrOp cfg, mkIntOp valLayout expectedBits, mkIntOp valLayout newBits]
       dest none st with
   | .error e _ => classifyStepError e
@@ -1070,6 +1072,20 @@ def runEvalCas (weak : Bool) (cfg : SingleCellConfig) (valLayout : LocalLayout)
           readAllocBits st' cellAllocId 0 width with
     | some retBits, some ok, some postBits => .okCas retBits ok postBits
     | _, _, _ => .invalidOrUnsupported
+
+/-- Execute `atomic_cxchg` or `atomic_cxchgweak` through `IntrinsicAtomic.eval` over `AtomicMachine.bind`. -/
+def runEvalCas (weak : Bool) (cfg : SingleCellConfig) (valLayout : LocalLayout) (expectedBits newBits : Nat)
+    (successOrd : Miri.Concurrency.AtomicOrdering := .SeqCst) (failureOrd : Miri.Concurrency.AtomicOrdering := .Relaxed)
+    (weakPolicy : WeakCasPolicy := .neverFail) (weakSuccess : Bool := true) : LmAtomicObs :=
+  runEvalCasWithHooks (lmAtomicHooksBind weakPolicy) weak cfg valLayout expectedBits newBits successOrd failureOrd weakSuccess
+
+/-- `lmAtomicHooksBind` with `physicalWrite` poisoned (`.ub`) and optional `weakSuccessChoice` poison (`.invalidProgram`). -/
+def lmAtomicHooksCasPoisoned (weakPolicy : WeakCasPolicy) (poisonChoice : Bool := false) :
+    IntrinsicAtomicHooks Provenance AtomicState LmAtomicChoice (RuntimePlace Provenance) :=
+  let b := lmAtomicHooksBind weakPolicy
+  { b with toAtomicAccessHooks := { b.toAtomicAccessHooks with
+      physicalWrite := fun _ _ _ => throw (.undefinedBehavior "poisoned physicalWrite"),
+      weakSuccessChoice := if poisonChoice then fun _ => throw (.invalidProgram "poisoned weakSuccessChoice") else b.toAtomicAccessHooks.weakSuccessChoice } }
 
 /-- Execute `atomic_fence` or `atomic_singlethreadfence` through
 `IntrinsicAtomic.eval` over `AtomicMachine.bind`, returning `some true` if
@@ -1567,6 +1583,21 @@ theorem lmSignedBoundaryObs_table (tb : Bool) : lmSignedBoundaryObs tb =
       .okScalar 0x7F 0x80, .okScalar 0x80 0x7F, .okScalar 0x7FFFFFFF 0x80000000, .okScalar 0x8000000000000000 0x7FFFFFFFFFFFFFFF] : List LmAtomicObs) := by
   cases tb <;> decide +kernel
 
+/-- **CAS mismatch vs. weak-CAS spurious-failure non-write & choice-hook invariants** (both `fastPath` modes):
+mismatch skips both `physicalWrite` and `weakSuccessChoice` for all `(weak, policy)`; weak spurious failure skips
+`physicalWrite` (`.alwaysFail` skips `weakSuccessChoice`; `.mayFail` consults it); succeeding CAS hits `.ub`. -/
+theorem compareExchange_nonwrite_and_choice_invariants :
+    (∀ (weak : Bool) (policy : WeakCasPolicy) (fastPath : Bool),
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned policy true) weak { widthBytes := 4, initBits := 5, useDataRaceFastPath := fastPath } layoutU32 6 9 = .okCas 5 false 5) ∧
+    (∀ (fastPath : Bool), let cfg : SingleCellConfig := { widthBytes := 4, initBits := 5, useDataRaceFastPath := fastPath };
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .alwaysFail true) true cfg layoutU32 5 9 = .okCas 5 false 5 ∧
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .mayFail false) true cfg layoutU32 5 9 .SeqCst .Relaxed false = .okCas 5 false 5 ∧
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .mayFail true) true cfg layoutU32 5 9 = .invalidOrUnsupported ∧
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .mayFail true) false cfg layoutU32 5 9 = .ub ∧
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .neverFail true) true cfg layoutU32 5 9 = .ub ∧
+      runEvalCasWithHooks (lmAtomicHooksCasPoisoned .mayFail false) true cfg layoutU32 5 9 .SeqCst .Relaxed true = .ub) := by
+  exact ⟨fun weak policy fastPath => by cases weak <;> cases policy <;> cases fastPath <;> decide +kernel, fun fastPath => by cases fastPath <;> decide +kernel⟩
+
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
 section AxiomAudit
@@ -1590,7 +1621,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 38 then
+  if theorems < 39 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 

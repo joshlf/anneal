@@ -891,6 +891,16 @@ theorem contract_divergence_set_exact (c : AtomicDualContract) (m : AtomicMemory
   · simp only [hYes, Bool.true_or, Bool.not_true, Bool.false_or, Bool.true_and] at h2
     exact of_decide_eq_true h2
 
+/-- **Tier 3 TCB-readiness codec projection**: on every non-diverging cell (`49/56`), both authorities encode
+to the exact same `ValidRep` wire tuple and round-trip through `atomicOutcomeCodec.decode` identically. -/
+theorem contract_tcb_codec_bridge (c : AtomicDualContract) (m : AtomicMemoryMode) (idx : Nat)
+    (hIdx : idx < canonicalCaseCount) (hNoDiv : divergesAt m idx = false) :
+    atomicOutcomeCodec.encode (mrAtomicObserve m idx) = atomicOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ∧
+    atomicOutcomeCodec.ValidRep (atomicOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx)) ∧
+    atomicOutcomeCodec.decode (atomicOutcomeCodec.encode (mrAtomicObserve m idx)) = some (c.lm.observe m.toLmTreeBorrows idx) := by
+  have hEq := (contract_divergence_set_exact c m idx hIdx).1 hNoDiv
+  exact ⟨congrArg atomicOutcomeCodec.encode hEq, atomicOutcomeCodec.encode_valid _, (atomicOutcomeCodec.decode_encode _).trans (congrArg some hEq)⟩
+
 private theorem casOldProjection_ite {P : Prop} [d : Decidable P] (a b : AtomicAccessOutcome)
     (ha : casOldProjection a = a) (hb : casOldProjection b = b) :
     casOldProjection (if P then a else b) = if P then a else b := by cases d <;> assumption
@@ -1000,6 +1010,19 @@ theorem lmFrozenTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutco
   unfold lmFrozenTraceAuthorityCheck at h; cases m
   · exact (of_decide_eq_true h).1
   · exact (of_decide_eq_true h).2
+/-- Cross-authority `Reserved`-tag prefix check: LeanMiri's `.reservedChild` trace equals the 4-step
+activation prefix `mrReservedActivationTrace.take 4` in both modes (step 5 disables the sibling on `MachTB`). -/
+def lmReservedTraceAuthorityCheck (obs : Bool → List AtomicAccessOutcome) : Bool :=
+  decide (obs (AtomicMemoryMode.toLmTreeBorrows .basic) = mrReservedActivationTrace.take 4 ∧
+    obs (AtomicMemoryMode.toLmTreeBorrows .treeBorrows) = mrReservedActivationTrace.take 4)
+/-- Soundness: agreement on `mrReservedActivationTrace.take 4` in both modes, distinct from `mrFrozenTrace .treeBorrows`. -/
+theorem lmReservedTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutcome)
+    (h : lmReservedTraceAuthorityCheck obs = true) (m : AtomicMemoryMode) :
+    obs m.toLmTreeBorrows = mrReservedActivationTrace.take 4 ∧
+    obs m.toLmTreeBorrows ≠ mrFrozenTrace .treeBorrows := by
+  unfold lmReservedTraceAuthorityCheck at h; cases m
+  · exact ⟨(of_decide_eq_true h).1, fun e => absurd ((of_decide_eq_true h).1.symm.trans e) (by decide +kernel)⟩
+  · exact ⟨(of_decide_eq_true h).2, fun e => absurd ((of_decide_eq_true h).2.symm.trans e) (by decide +kernel)⟩
 
 private def itS8 : IntType := ⟨.Signed, ⟨1⟩⟩
 /-- MiniRust signed two's-complement boundary cells on `i8`/`i32`/`i64`, observed as bit patterns: `.1` = seven **in-range** cells (`-1 + 1`, `126 + 1`, `-127 - 1`,
@@ -1085,7 +1108,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 33 then
+  if theorems < 35 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 
