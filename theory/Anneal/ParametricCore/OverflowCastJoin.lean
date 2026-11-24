@@ -4227,6 +4227,73 @@ end OvfCut
 
 attribute [irreducible] OvfCastStageCut
 
+/- Build-time regression guard for the `@[irreducible]` barrier: neither
+`rfl` (default-transparency `isDefEq`) nor `simp` may unfold `OvfCastStageCut` into
+`denoteOvfCastStageCut`; clients must go through `open_ovfCastStageCut`. -/
+example : True := by
+  fail_if_success
+    have : @OvfCastStageCut = @denoteOvfCastStageCut := rfl
+  fail_if_success
+    have : @OvfCastStageCut = @denoteOvfCastStageCut := by simp only []
+  trivial
+
+/-! ### Mixed Unsigned/Signed View Composition -/
+
+/-- Mixed-view composition (raw → signed): a raw-view `OvfCastStageCut` ending
+at a non-negative interval `[lo, hi]` (`hi < halfModulus`) chains into a
+`signedView` cut starting at the same values in biased coordinates
+(`[lo + halfModulus, hi + halfModulus]`), with budgets adding. This is the
+`u8 → … as i32 → signed arithmetic` pipeline shape; the two cuts carry
+different `OvfCastFrameOps`, so `ovfCastStageCut_compose` cannot join them. -/
+theorem ovfCastStageCut_compose_raw_to_signedView {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {n₀ n₂ : StageIntervalSpec} {bb lo hi : Nat} {wd : ScalarWidth}
+    {f₁ f₂ : Nat} (hHi : hi < wd.halfModulus)
+    (h₁ : OvfCastStageCut fops step baseLocals ids earlyOk n₀ ⟨bb, wd, lo, hi⟩ f₁)
+    (h₂ : OvfCastStageCut fops.signedView step baseLocals ids earlyOk
+      ⟨bb, wd, lo + wd.halfModulus, hi + wd.halfModulus⟩ n₂ f₂) :
+    ∀ s : S, StageIntervalStateInv fops baseLocals ids n₀ s →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops.signedView baseLocals ids n₂)
+        (fun o => earlyOk o = true) (fun _ => False) (f₁ + f₂) s :=
+  fun s hInv₀ =>
+    wpUntilFuel_bind
+      (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+      (open_ovfCastStageCut h₁ s hInv₀)
+      (fun st hInv₁ =>
+        open_ovfCastStageCut h₂ st
+          ((stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb wd
+            hHi st).mp hInv₁))
+
+/-- Mixed-view composition (signed → raw): a `signedView` cut ending at a
+non-negative signed interval (biased `[lo + halfModulus, hi + halfModulus]`
+with `hi < halfModulus`) chains into a raw-view cut starting at `[lo, hi]`,
+with budgets adding (the `… as u32` after signed arithmetic proven
+non-negative). -/
+theorem ovfCastStageCut_compose_signedView_to_raw {S : Type u} {Val : Type v}
+    {Out : Type w} {Fault : Type x}
+    {fops : OvfCastFrameOps S Val} {step : S → StepOutcome S Out Fault}
+    {baseLocals : List Val} {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {n₀ n₂ : StageIntervalSpec} {bb lo hi : Nat} {wd : ScalarWidth}
+    {f₁ f₂ : Nat} (hHi : hi < wd.halfModulus)
+    (h₁ : OvfCastStageCut fops.signedView step baseLocals ids earlyOk n₀
+      ⟨bb, wd, lo + wd.halfModulus, hi + wd.halfModulus⟩ f₁)
+    (h₂ : OvfCastStageCut fops step baseLocals ids earlyOk ⟨bb, wd, lo, hi⟩ n₂ f₂) :
+    ∀ s : S, StageIntervalStateInv fops.signedView baseLocals ids n₀ s →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids n₂)
+        (fun o => earlyOk o = true) (fun _ => False) (f₁ + f₂) s :=
+  fun s hInv₀ =>
+    wpUntilFuel_bind
+      (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+      (open_ovfCastStageCut h₁ s hInv₀)
+      (fun st hInv₁ =>
+        open_ovfCastStageCut h₂ st
+          ((stageIntervalStateInv_signedView_nonneg_iff fops baseLocals ids bb wd
+            hHi st).mpr hInv₁))
+
 /-! ### `Anneal.Firewall.IndexedCut` Interop for `OvfCastStageCut` -/
 
 /-- Indexed stage-cut family for `Anneal.Firewall.IndexedCut`: stage `k` holds

@@ -3483,6 +3483,16 @@ end CallSpecCutSec
 
 attribute [irreducible] CallSpecCut
 
+/- Build-time regression guard for the `@[irreducible]` barrier: neither
+`rfl` (default-transparency `isDefEq`) nor `simp` may unfold `CallSpecCut` into
+`denoteCallSpecCut`; clients must go through `open_callSpecCut`. -/
+example : True := by
+  fail_if_success
+    have : @CallSpecCut = @denoteCallSpecCut := rfl
+  fail_if_success
+    have : @CallSpecCut = @denoteCallSpecCut := by simp only []
+  trivial
+
 /-! ### `Anneal.Firewall.IndexedCut` Interop for `CallSpecCut` -/
 
 /-- Indexed call-contract family for `Anneal.Firewall.IndexedCut`: stage `k`

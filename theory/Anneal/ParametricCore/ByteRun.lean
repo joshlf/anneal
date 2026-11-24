@@ -2252,6 +2252,16 @@ end CopyCut
 
 attribute [irreducible] ByteRunCopyCut
 
+/- Build-time regression guard for the `@[irreducible]` barrier: neither
+`rfl` (default-transparency `isDefEq`) nor `simp` may unfold `ByteRunCopyCut` into
+`denoteByteRunCopyCut`; clients must go through `open_byteRunCopyCut`. -/
+example : True := by
+  fail_if_success
+    have : @ByteRunCopyCut = @denoteByteRunCopyCut := rfl
+  fail_if_success
+    have : @ByteRunCopyCut = @denoteByteRunCopyCut := by simp only []
+  trivial
+
 /-! ### Interop with `MutSummary` / `MutSummaryCut` and `Anneal.Firewall.IndexedCut` -/
 
 /-- `MutSummary` that overwrites a slice of length `runsByteLen runs` with
