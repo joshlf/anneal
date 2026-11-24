@@ -3092,6 +3092,909 @@ theorem borrowTree_deallocate_fresh (rootTag : BorTag) (size : Size)
         simp [hbz, hnode0, nd, hperm0, hp, hindex0, UniIndex.ofNat?, Permission.newUnique, Permission.isCell]
         rfl
 
+/-! ### Universal 2-node (`Box` + child reference) `BorrowTree.deallocateBorrowRange` laws (`rust#165833`)
+
+The exact Lean-Miri counterpart to MiniRust's `tb_deallocate_boxRefTree`:
+a root tag `rootTag` (`⟨0⟩`) owning `size` bytes as accessed `Unique`, with one
+child tag `childTag` (`⟨1⟩`, `rootTag ≠ childTag`) holding `childLoc` across
+`[0, size)`. Every theorem below is universal over all `rootTag`, `childTag`,
+all `2^64` byte sizes `size : Size`, arbitrary `protectedTags : ProtectedTags`,
+and arbitrary out-of-bounds child defaults `(childDefaultPerm, childDefaultSifa)`. -/
+
+/-- The canonical 2-node location map (`root = ⟨0⟩` accessed `Unique`,
+`child = ⟨1⟩` holding `childLoc`). -/
+def lmBoxRefLoc (childLoc : Tree.LocationState) : LocationTree :=
+  { perms := ⟨#[some ⟨Permission.newUnique, true, .None⟩, some childLoc]⟩
+    exposedCache := {} }
+
+/-- The canonical 2-node `BorrowTree`: root tag `rootTag` (`⟨0⟩`) owning `size`
+bytes as accessed `Unique`, with one child tag `childTag` (`⟨1⟩`) holding
+`childLoc` across `[0, size)`. Matches the exact tree constructed by vendored
+`BorrowTree.newChild` (verified in `borrowTree_newChild_boxRefTree_witness`). -/
+def lmBoxRefTree (rootTag childTag : BorTag) (size : Size) (childLoc : Tree.LocationState)
+    (childDefaultPerm : Permission := .Frozen)
+    (childDefaultSifa : IdempotentForeignAccess := .Read) : BorrowTree :=
+  { tagMapping := { mapping := #[(rootTag, ⟨0⟩), (childTag, ⟨1⟩)], deassigned := #[] }
+    nodes := ⟨#[
+      some ⟨rootTag, none, #[⟨1⟩], Permission.newDisabled, .None, false, none⟩,
+      some ⟨childTag, some ⟨0⟩, #[], childDefaultPerm, childDefaultSifa, false, none⟩]⟩
+    locations := DedupRangeMap.new size (lmBoxRefLoc childLoc)
+    roots := #[⟨0⟩] }
+
+/-- `forIn` over the 2-element range `[:2]` runs `f 0` then (if yielded) `f 1`. -/
+theorem forIn_range_two {β : Type} (init : β) (f : Nat → β → Id (ForInStep β)) :
+    forIn (m := Id) [:2] init f =
+      match f 0 init with
+      | .done a => a
+      | .yield a => match f 1 a with | .done b => b | .yield b => b := by
+  rw [Std.Legacy.Range.forIn_eq_forIn_range']
+  simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+    List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil]
+  cases f 0 init with
+  | done a => rfl
+  | yield a => cases f 1 a <;> rfl
+
+/-- `lmBoxRefTree` maps `rootTag` to `⟨0⟩`. -/
+theorem lmBoxRefTree_indexOfTag_root (rootTag childTag : BorTag) (size : Size)
+    (childLoc : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess) :
+    (lmBoxRefTree rootTag childTag size childLoc dp ds).indexOfTag rootTag = some ⟨0⟩ := by
+  unfold BorrowTree.indexOfTag
+  change ((#[(rootTag, (⟨0⟩ : UniIndex)), (childTag, ⟨1⟩)]).find?
+    (fun entry => entry.1 == rootTag)).map Prod.snd = some ⟨0⟩
+  simp
+
+/-- `lmBoxRefTree` maps `childTag` to `⟨1⟩` whenever `rootTag ≠ childTag`. -/
+theorem lmBoxRefTree_indexOfTag_child (rootTag childTag : BorTag) (hne : rootTag ≠ childTag)
+    (size : Size) (childLoc : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess) :
+    (lmBoxRefTree rootTag childTag size childLoc dp ds).indexOfTag childTag = some ⟨1⟩ := by
+  unfold BorrowTree.indexOfTag
+  change ((#[(rootTag, (⟨0⟩ : UniIndex)), (childTag, ⟨1⟩)]).find?
+    (fun entry => entry.1 == childTag)).map Prod.snd = some ⟨1⟩
+  have hneq : (rootTag == childTag) = false := beq_false_of_ne hne
+  simp [hneq]
+
+/-- Updating index `⟨0⟩` of a 2-element `UniValMap` replaces entry `0`. -/
+theorem uniValMap_insert_pair_zero {α : Type} (u0 u1 v0 : α) :
+    ((⟨#[some u0, some u1]⟩ : UniValMap α).insert ⟨0⟩ v0) = ⟨#[some v0, some u1]⟩ := rfl
+
+/-- Updating index `⟨1⟩` of a 2-element `UniValMap` replaces entry `1`. -/
+theorem uniValMap_insert_pair_one {α : Type} (u0 u1 v1 : α) :
+    ((⟨#[some u0, some u1]⟩ : UniValMap α).insert ⟨1⟩ v1) = ⟨#[some u0, some v1]⟩ := rfl
+
+/-- Single-location normal-access reduction for `lmBoxRefTree`: any exact 2-node
+`NormalTreeState.performAccess` result lifts directly to `performNormalAccessAt`
+with `outcome = .ok ()` and updated 2-entry `LocationTree` (independent of
+out-of-bounds defaults `dp`, `ds` and `size`). -/
+theorem lmBoxRefTree_performNormalAccess_eq (rootTag childTag : BorTag) (size : Size)
+    (childLoc rLoc' cLoc' : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess)
+    (protectedTags : ProtectedTags) (startIdx : UniIndex) (vis : List Tree.TraversalEvent)
+    (st : Tree.NormalAccessStatus)
+    (hvis : ∀ e ∈ vis, e.node = 0 ∨ e.node = 1)
+    (hnorm : Tree.NormalTreeState.performAccess
+      { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+        defaultStates := #[⟨Permission.newDisabled, false, .None⟩, ⟨dp, false, ds⟩]
+        protectedNodes :=
+          (if protectedTags.contains rootTag then [0] else []) ++
+            (if protectedTags.contains childTag then [1] else [])
+        locationStates := #[some ⟨Permission.newUnique, true, .None⟩, some childLoc] }
+      startIdx.toNat .Write .VisitChildrenOfAccessed =
+      { tree := { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+                  defaultStates := #[⟨Permission.newDisabled, false, .None⟩, ⟨dp, false, ds⟩]
+                  protectedNodes :=
+                    (if protectedTags.contains rootTag then [0] else []) ++
+                      (if protectedTags.contains childTag then [1] else [])
+                  locationStates := #[some rLoc', some cLoc'] }
+        root := 0
+        visited := vis
+        status := st }) :
+    let tree := lmBoxRefTree rootTag childTag size childLoc dp ds
+    let res := tree.performNormalAccessAt (lmBoxRefLoc childLoc) startIdx .Write
+      protectedTags .VisitChildrenOfAccessed
+    res.outcome = .ok () ∧
+    res.access.status = st ∧
+    res.access.root = 0 ∧
+    res.location = { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} } := by
+  intro tree res
+  let nd0 : TreeNode := ⟨rootTag, none, #[⟨1⟩], Permission.newDisabled, .None, false, none⟩
+  let nd1 : TreeNode := ⟨childTag, some ⟨0⟩, #[], dp, ds, false, none⟩
+  have hnodes : tree.nodes = ⟨#[some nd0, some nd1]⟩ := rfl
+  have hent : tree.nodes.entries = #[(⟨0⟩, nd0), (⟨1⟩, nd1)] := by
+    rw [hnodes]
+    unfold UniValMap.entries
+    dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+    have hsz : (#[some nd0, some nd1] : Array (Option TreeNode)).size = 2 := rfl
+    rw [hsz, forIn_range_two]
+    simp [UniIndex.ofNat?]
+  have hprot :
+      (tree.nodes.entries.toList.filterMap fun (index, node) =>
+        if protectedTags.contains node.tag then some index.toNat else none) =
+      (if protectedTags.contains rootTag then [0] else []) ++
+        (if protectedTags.contains childTag then [1] else []) := by
+    rw [hent]
+    cases hp0 : protectedTags.contains rootTag <;> cases hp1 : protectedTags.contains childTag <;>
+      simp [nd0, nd1, hp0, hp1, UniIndex.toNat]
+  have hproj_eq : Tree.NormalTreeState.performAccess
+      { topology := ⟨tree.nodes.data.map fun entry =>
+          match entry with
+          | none => ⟨none, []⟩
+          | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+        defaultStates := tree.nodes.data.map fun entry =>
+          match entry with
+          | some node => node.defaultLocationState
+          | none => ⟨.Disabled, false, .None⟩
+        protectedNodes := tree.nodes.entries.toList.filterMap fun (index, node) =>
+          if protectedTags.contains node.tag then some index.toNat else none
+        locationStates := tree.nodes.data.mapIdx fun position _ =>
+          match UniIndex.ofNat? position with
+          | none => none
+          | some index => (lmBoxRefLoc childLoc).perms.get index }
+      startIdx.toNat .Write .VisitChildrenOfAccessed =
+      { tree := { topology := ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩
+                  defaultStates := #[⟨Permission.newDisabled, false, .None⟩, ⟨dp, false, ds⟩]
+                  protectedNodes :=
+                    (if protectedTags.contains rootTag then [0] else []) ++
+                      (if protectedTags.contains childTag then [1] else [])
+                  locationStates := #[some rLoc', some cLoc'] }
+        root := 0
+        visited := vis
+        status := st } := by
+    rw [hprot]
+    have htop : (tree.nodes.data.map fun entry =>
+        match entry with
+        | none => ⟨none, []⟩
+        | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩) =
+        (#[⟨none, [1]⟩, ⟨some 0, []⟩] : Array Tree.TraversalNode) := by
+      simp [tree, lmBoxRefTree, UniIndex.toNat]
+    have hdef : (tree.nodes.data.map fun entry =>
+        match entry with
+        | some node => node.defaultLocationState
+        | none => ⟨.Disabled, false, .None⟩) =
+        #[⟨Permission.newDisabled, false, .None⟩, ⟨dp, false, ds⟩] := by
+      simp [tree, lmBoxRefTree, TreeNode.defaultLocationState]
+    have hlocst : (tree.nodes.data.mapIdx fun position _ =>
+        match UniIndex.ofNat? position with
+        | none => none
+        | some index => (lmBoxRefLoc childLoc).perms.get index) =
+        #[some ⟨Permission.newUnique, true, .None⟩, some childLoc] := by
+      simp [tree, lmBoxRefTree, lmBoxRefLoc, UniIndex.ofNat?, UniValMap.get, UniIndex.toNat]
+    rw [htop, hdef, hlocst]
+    exact hnorm
+  dsimp only [res]
+  unfold BorrowTree.performNormalAccessAt
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  erw [hproj_eq]
+  have hsz2 : (#[some rLoc', some cLoc'] : Array (Option Tree.LocationState)).size = 2 := rfl
+  rw [hsz2, forIn_range_two]
+  have hget0 : (#[some rLoc', some cLoc'] : Array (Option Tree.LocationState))[0]? = some (some rLoc') := rfl
+  have hget1 : (#[some rLoc', some cLoc'] : Array (Option Tree.LocationState))[1]? = some (some cLoc') := rfl
+  simp only [hget0, hget1,
+    show UniIndex.ofNat? 0 = some ⟨0⟩ from rfl, show UniIndex.ofNat? 1 = some ⟨1⟩ from rfl,
+    lmBoxRefLoc, uniValMap_insert_pair_zero, uniValMap_insert_pair_one]
+  -- Every visited node in `vis` is 0 or 1 and has `isExposed = false`, so the cache loop is a no-op.
+  have hnode0 : tree.nodeAt ⟨0⟩ = some nd0 := rfl
+  have hnode1 : tree.nodeAt ⟨1⟩ = some nd1 := rfl
+  clear hnorm hproj_eq
+  induction vis with
+  | nil => exact ⟨rfl, trivial, trivial, rfl⟩
+  | cons e rest ih =>
+    have he := hvis e (List.mem_cons_self ..)
+    have hrest : ∀ e' ∈ rest, e'.node = 0 ∨ e'.node = 1 :=
+      fun e' hm => hvis e' (List.mem_cons_of_mem _ hm)
+    rcases he with h0 | h1
+    · simp only [List.forIn_cons, h0, show UniIndex.ofNat? 0 = some ⟨0⟩ from rfl, hnode0,
+        nd0, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+      exact ih hrest
+    · simp only [List.forIn_cons, h1, show UniIndex.ofNat? 1 = some ⟨1⟩ from rfl, hnode1,
+        nd1, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+      exact ih hrest
+
+/-- Ranged write access on a non-empty `lmBoxRefTree`: lifts any single-location
+`performNormalAccessAt` outcome directly to `performBorrowAccessRange`. -/
+theorem lmBoxRefTree_performBorrowAccessRange_step (rootTag childTag : BorTag) (size : Size)
+    (childLoc rLoc' cLoc' : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess)
+    (protectedTags : ProtectedTags) (tag : BorTag) (startIdx : UniIndex)
+    (st : Tree.NormalAccessStatus) (hne : size.bytes ≠ 0)
+    (hidx : (lmBoxRefTree rootTag childTag size childLoc dp ds).indexOfTag tag = some startIdx)
+    (hnorm :
+      let res := (lmBoxRefTree rootTag childTag size childLoc dp ds).performNormalAccessAt
+        (lmBoxRefLoc childLoc) startIdx .Write protectedTags .VisitChildrenOfAccessed
+      res.outcome = .ok () ∧ res.access.status = st ∧ res.access.root = 0 ∧
+      res.location = { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }) :
+    let tree := lmBoxRefTree rootTag childTag size childLoc dp ds
+    let newLoc : LocationTree := { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }
+    let acc := tree.performBorrowAccessRange (.concrete tag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed
+    acc.status = (if st == .Completed then .Completed else .AccessFailure ⟨0, size.bytes⟩ st) ∧
+    acc.tree = { tree with locations := DedupRangeMap.new size newLoc } := by
+  intro tree newLoc acc
+  have hlocs : tree.locations = DedupRangeMap.new size (lmBoxRefLoc childLoc) := rfl
+  have hiter : tree.locations.iterMut Size.ZERO size =
+      { state := ⟨#[⟨⟨0, size.bytes⟩, lmBoxRefLoc childLoc⟩]⟩, positions := #[0],
+        segments := #[⟨⟨0, size.bytes⟩, lmBoxRefLoc childLoc⟩], outcome := .ok () } := by
+    rw [hlocs]; exact iterMut_fresh_nonzero size (lmBoxRefLoc childLoc) hne
+  obtain ⟨hn_ok, hn_st, hn_rt, hn_loc⟩ := hnorm
+  have hnew_loc : DedupRangeMap.new size newLoc = ⟨#[⟨⟨0, size.bytes⟩, newLoc⟩]⟩ := by
+    unfold DedupRangeMap.new; simp [beq_false_of_ne hne]
+  have hacc_eq : acc = performBorrowAccessRangeU tree (.concrete tag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed := by
+    dsimp only [acc]
+    rw [show @BorrowTree.performBorrowAccessRange = @performBorrowAccessRangeU from
+      performBorrowAccessRangeU.eq_src]
+  rw [hacc_eq]
+  unfold performBorrowAccessRangeU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [show @DedupRangeMap.iterMut = @iterMutU from iterMutU.eq_src] at hiter
+  rw [hidx, hiter]
+  simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte]
+  have hsz1 : (#[0] : Array Nat).size = 1 := rfl
+  rw [hsz1, forIn_range_one]
+  have hpos0 : (#[0] : Array Nat)[0]? = some 0 := rfl
+  have hseg0 : (#[⟨⟨0, size.bytes⟩, lmBoxRefLoc childLoc⟩] :
+      Array (RangeMapSegment LocationTree))[0]? = some ⟨⟨0, size.bytes⟩, lmBoxRefLoc childLoc⟩ := rfl
+  simp only [beq_self_eq_true, ↓reduceIte, hpos0, hseg0]
+  unfold performTreeAccessAtU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  have hof0 : UniIndex.ofNat? 0 = some ⟨0⟩ := rfl
+  rw [hn_ok, hn_loc, hn_st, hn_rt, hof0]
+  have hroots : tree.roots = #[⟨0⟩] := rfl
+  have hszr : tree.roots.size = 1 := rfl
+  have hset : ∀ (x : LocationTree),
+      (DedupRangeMap.mk (entries := #[⟨⟨0, size.bytes⟩, lmBoxRefLoc childLoc⟩])).setAtPos 0 x =
+      ⟨⟨#[⟨⟨0, size.bytes⟩, x⟩]⟩, .ok ()⟩ := fun _ => rfl
+  cases hst : (st == .Completed)
+  · have hne_st : (st != .Completed) = true := by simp [bne, hst]
+    simp only [hne_st, ↓reduceIte, hset, hnew_loc]
+    exact ⟨rfl, rfl⟩
+  · have hne_st : (st != .Completed) = false := by simp [bne, hst]
+    simp only [hne_st, Bool.false_eq_true, ↓reduceIte]
+    rw [hszr, forIn_range_one]
+    simp only [hroots, Array.getElem?_eq_getElem, Array.size_singleton, Nat.zero_lt_one,
+      Array.getElem_singleton, Option.isNone_none, Bool.not_false, Bool.and_self,
+      Bool.false_eq_true, bne_self_eq_false, ↓reduceIte, hset, hnew_loc]
+    exact ⟨rfl, rfl⟩
+
+/-- Zero-sized deallocation on `lmBoxRefTree` touches zero locations and always
+returns `.Deallocated` (through either `rootTag` or `childTag`). -/
+theorem lmBoxRefTree_deallocate_zero (rootTag childTag : BorTag) (childLoc : Tree.LocationState)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags)
+    (tag : BorTag) (startIdx : UniIndex)
+    (hidx : (lmBoxRefTree rootTag childTag Size.ZERO childLoc dp ds).indexOfTag tag = some startIdx) :
+    ((lmBoxRefTree rootTag childTag Size.ZERO childLoc dp ds).deallocateBorrowRange
+      (.concrete tag) Size.ZERO Size.ZERO protectedTags).status = .Deallocated := by
+  have hlocs0 : (lmBoxRefTree rootTag childTag Size.ZERO childLoc dp ds).locations = ⟨#[]⟩ := rfl
+  have hiter0 : ({ entries := #[] } : DedupRangeMap LocationTree).iterMut Size.ZERO Size.ZERO =
+      { state := ⟨#[]⟩, positions := #[], segments := #[], outcome := .ok () } := by
+    rw [show @DedupRangeMap.iterMut = @iterMutU from iterMutU.eq_src]
+    unfold iterMutU iterMutWithCloneU
+    rfl
+  have hacc0 :
+      (lmBoxRefTree rootTag childTag Size.ZERO childLoc dp ds).performBorrowAccessRange
+        (.concrete tag) Size.ZERO Size.ZERO .Write protectedTags .VisitChildrenOfAccessed =
+      { tree := lmBoxRefTree rootTag childTag Size.ZERO childLoc dp ds,
+        locations := #[], status := .Completed } := by
+    unfold BorrowTree.performBorrowAccessRange
+    dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+    rw [hidx, hlocs0, hiter0]
+    simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte, Array.size_empty,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel,
+      Nat.div_one, List.range'_zero, List.forIn_nil, pure, Pure.pure]
+    rfl
+  unfold BorrowTree.deallocateBorrowRange
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [hacc0]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  rw [hidx, hlocs0, hiter0]
+  simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte, Array.size_empty,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel,
+    Nat.div_one, List.range'_zero, List.forIn_nil, pure, Pure.pure]
+
+/-- Failing-write deallocation bridge on `lmBoxRefTree`: when the initial write
+access fails with `st ≠ .Completed`, `deallocateBorrowRange` immediately returns
+`.AccessFailure (.AccessFailure ⟨0, size.bytes⟩ st)`. -/
+theorem lmBoxRefTree_deallocate_err (rootTag childTag : BorTag) (size : Size)
+    (childLoc rLoc' cLoc' : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess)
+    (protectedTags : ProtectedTags) (tag : BorTag) (startIdx : UniIndex)
+    (st : Tree.NormalAccessStatus) (hne : size.bytes ≠ 0) (hst : st ≠ .Completed)
+    (hidx : (lmBoxRefTree rootTag childTag size childLoc dp ds).indexOfTag tag = some startIdx)
+    (hnorm :
+      let res := (lmBoxRefTree rootTag childTag size childLoc dp ds).performNormalAccessAt
+        (lmBoxRefLoc childLoc) startIdx .Write protectedTags .VisitChildrenOfAccessed
+      res.outcome = .ok () ∧ res.access.status = st ∧ res.access.root = 0 ∧
+      res.location = { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }) :
+    ((lmBoxRefTree rootTag childTag size childLoc dp ds).deallocateBorrowRange
+      (.concrete tag) Size.ZERO size protectedTags).status =
+      .AccessFailure (.AccessFailure ⟨0, size.bytes⟩ st) := by
+  have hacc := lmBoxRefTree_performBorrowAccessRange_step rootTag childTag size childLoc rLoc' cLoc'
+    dp ds protectedTags tag startIdx st hne hidx hnorm
+  have hst_f : (st == .Completed) = false := beq_false_of_ne hst
+  have hacc_st : ((lmBoxRefTree rootTag childTag size childLoc dp ds).performBorrowAccessRange
+      (.concrete tag) Size.ZERO size .Write protectedTags .VisitChildrenOfAccessed).status =
+      .AccessFailure ⟨0, size.bytes⟩ st := by
+    simpa [hst_f] using hacc.1
+  unfold BorrowTree.deallocateBorrowRange
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [hacc_st]
+  rfl
+
+/-- Completing-write deallocation bridge on `lmBoxRefTree` through `rootTag`
+(`⟨0⟩`): visits root `⟨0⟩` then child `⟨1⟩` and checks strong-protector
+preventing-deallocation in source order. -/
+theorem lmBoxRefTree_deallocate_root_ok (rootTag childTag : BorTag) (size : Size)
+    (childLoc rLoc' cLoc' : Tree.LocationState) (dp : Permission) (ds : IdempotentForeignAccess)
+    (protectedTags : ProtectedTags) (hne : size.bytes ≠ 0)
+    (hnorm :
+      let res := (lmBoxRefTree rootTag childTag size childLoc dp ds).performNormalAccessAt
+        (lmBoxRefLoc childLoc) ⟨0⟩ .Write protectedTags .VisitChildrenOfAccessed
+      res.outcome = .ok () ∧ res.access.status = .Completed ∧ res.access.root = 0 ∧
+      res.location = { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }) :
+    ((lmBoxRefTree rootTag childTag size childLoc dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if protectedTags.get rootTag == some .StrongProtector && !rLoc'.permission.isCell && rLoc'.accessed then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else if protectedTags.get childTag == some .StrongProtector && !cLoc'.permission.isCell && cLoc'.accessed then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨1⟩
+      else .Deallocated := by
+  let tree := lmBoxRefTree rootTag childTag size childLoc dp ds
+  let newLoc : LocationTree := { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }
+  let tree' : BorrowTree := { tree with locations := DedupRangeMap.new size newLoc }
+  have hidx0 : tree.indexOfTag rootTag = some ⟨0⟩ :=
+    lmBoxRefTree_indexOfTag_root rootTag childTag size childLoc dp ds
+  have hacc := lmBoxRefTree_performBorrowAccessRange_step rootTag childTag size childLoc rLoc' cLoc'
+    dp ds protectedTags rootTag ⟨0⟩ .Completed hne hidx0 hnorm
+  have hacc_st : (tree.performBorrowAccessRange (.concrete rootTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed).status = .Completed := by
+    simpa using hacc.1
+  have hacc_tr : (tree.performBorrowAccessRange (.concrete rootTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed).tree = tree' := hacc.2
+  have hidx0' : tree'.indexOfTag rootTag = some ⟨0⟩ := hidx0
+  have hiter' : tree'.locations.iterMut Size.ZERO size =
+      { state := ⟨#[⟨⟨0, size.bytes⟩, newLoc⟩]⟩, positions := #[0],
+        segments := #[⟨⟨0, size.bytes⟩, newLoc⟩], outcome := .ok () } :=
+    iterMut_fresh_nonzero size newLoc hne
+  have htrav : Tree.TraversalTree.traverse ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩ 0
+      .VisitChildrenOfAccessed [] = (0, [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩]) := by
+    decide +kernel
+  have htp :
+      Tree.TraversalTree.traverse
+        ⟨tree'.nodes.data.map fun entry =>
+          match entry with
+          | none => ⟨none, []⟩
+          | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+        0 .VisitChildrenOfAccessed [] = (0, [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩]) := by
+    have htop : (tree'.nodes.data.map fun entry =>
+        match entry with
+        | none => ⟨none, []⟩
+        | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩) =
+        (#[⟨none, [1]⟩, ⟨some 0, []⟩] : Array Tree.TraversalNode) := by
+      simp [tree', tree, lmBoxRefTree, UniIndex.toNat]
+    rw [htop]
+    exact htrav
+  have hindex0 : (DedupRangeMap.mk (entries := #[⟨⟨0, size.bytes⟩, newLoc⟩])).index 0 =
+      .ok ⟨⟨0, size.bytes⟩, newLoc⟩ := rfl
+  let nd0 : TreeNode := ⟨rootTag, none, #[⟨1⟩], Permission.newDisabled, .None, false, none⟩
+  let nd1 : TreeNode := ⟨childTag, some ⟨0⟩, #[], dp, ds, false, none⟩
+  have hnode0 : tree'.nodeAt ⟨0⟩ = some nd0 := rfl
+  have hnode1 : tree'.nodeAt ⟨1⟩ = some nd1 := rfl
+  have hperm0 : newLoc.perms.get ⟨0⟩ = some rLoc' := rfl
+  have hperm1 : newLoc.perms.get ⟨1⟩ = some cLoc' := rfl
+  have hroots : tree'.roots = #[⟨0⟩] := rfl
+  have hrev : (#[(⟨0⟩ : UniIndex)]).reverse = #[⟨0⟩] := rfl
+  have hto0 : (⟨0⟩ : UniIndex).toNat = 0 := rfl
+  have hfor_arr : ∀ {α β : Type} (a : α) (init : β) (f : α → β → Id (ForInStep β)),
+      forIn (m := Id) (#[a] : Array α) init f =
+        match f a init with | .done b => b | .yield b => b := by
+    intro _ _ a init f
+    rw [← Array.forIn_toList]
+    change forIn (m := Id) [a] init f = _
+    simp only [List.forIn_cons, List.forIn_nil]
+    cases f a init <;> rfl
+  unfold BorrowTree.deallocateBorrowRange
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [hacc_st, hacc_tr]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hidx0', Option.isNone_some, hiter']
+  have hsz1 : (#[0] : Array Nat).size = 1 := rfl
+  rw [hsz1, forIn_range_one]
+  have hpos0 : (#[0] : Array Nat)[0]? = some 0 := rfl
+  have hseg0 : (#[⟨⟨0, size.bytes⟩, newLoc⟩] : Array (RangeMapSegment LocationTree))[0]? =
+      some ⟨⟨0, size.bytes⟩, newLoc⟩ := rfl
+  simp only [hpos0, hseg0]
+  rw [hroots, hrev, hfor_arr, hto0]
+  erw [htp]
+  simp only [List.forIn_cons, List.forIn_nil, show UniIndex.ofNat? 0 = some ⟨0⟩ from rfl,
+    show UniIndex.ofNat? 1 = some ⟨1⟩ from rfl, hnode0, hnode1, nd0, nd1, hperm0, hperm1,
+    Option.getD_some, Option.isNone_none, ↓reduceIte, pure, Pure.pure, bind, Bind.bind]
+  cases h0 : (protectedTags.get rootTag == some .StrongProtector && !rLoc'.permission.isCell && rLoc'.accessed)
+  · cases h1 : (protectedTags.get childTag == some .StrongProtector && !cLoc'.permission.isCell && cLoc'.accessed) <;>
+      simp [hindex0]
+  · simp
+
+/-- Completing-write deallocation bridge on `lmBoxRefTree` through `childTag`
+(`⟨1⟩`): visits child `⟨1⟩` first, then root `⟨0⟩`, checking strong protectors in
+that source order. -/
+theorem lmBoxRefTree_deallocate_child_ok (rootTag childTag : BorTag) (hne_tag : rootTag ≠ childTag)
+    (size : Size) (childLoc rLoc' cLoc' : Tree.LocationState) (dp : Permission)
+    (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags) (hne : size.bytes ≠ 0)
+    (hnorm :
+      let res := (lmBoxRefTree rootTag childTag size childLoc dp ds).performNormalAccessAt
+        (lmBoxRefLoc childLoc) ⟨1⟩ .Write protectedTags .VisitChildrenOfAccessed
+      res.outcome = .ok () ∧ res.access.status = .Completed ∧ res.access.root = 0 ∧
+      res.location = { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }) :
+    ((lmBoxRefTree rootTag childTag size childLoc dp ds).deallocateBorrowRange
+      (.concrete childTag) Size.ZERO size protectedTags).status =
+      if protectedTags.get childTag == some .StrongProtector && !cLoc'.permission.isCell && cLoc'.accessed then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨1⟩
+      else if protectedTags.get rootTag == some .StrongProtector && !rLoc'.permission.isCell && rLoc'.accessed then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  let tree := lmBoxRefTree rootTag childTag size childLoc dp ds
+  let newLoc : LocationTree := { perms := ⟨#[some rLoc', some cLoc']⟩, exposedCache := {} }
+  let tree' : BorrowTree := { tree with locations := DedupRangeMap.new size newLoc }
+  have hidx1 : tree.indexOfTag childTag = some ⟨1⟩ :=
+    lmBoxRefTree_indexOfTag_child rootTag childTag hne_tag size childLoc dp ds
+  have hacc := lmBoxRefTree_performBorrowAccessRange_step rootTag childTag size childLoc rLoc' cLoc'
+    dp ds protectedTags childTag ⟨1⟩ .Completed hne hidx1 hnorm
+  have hacc_st : (tree.performBorrowAccessRange (.concrete childTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed).status = .Completed := by
+    simpa using hacc.1
+  have hacc_tr : (tree.performBorrowAccessRange (.concrete childTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed).tree = tree' := hacc.2
+  have hidx1' : tree'.indexOfTag childTag = some ⟨1⟩ := hidx1
+  have hiter' : tree'.locations.iterMut Size.ZERO size =
+      { state := ⟨#[⟨⟨0, size.bytes⟩, newLoc⟩]⟩, positions := #[0],
+        segments := #[⟨⟨0, size.bytes⟩, newLoc⟩], outcome := .ok () } :=
+    iterMut_fresh_nonzero size newLoc hne
+  have htrav : Tree.TraversalTree.traverse ⟨#[⟨none, [1]⟩, ⟨some 0, []⟩]⟩ 1
+      .VisitChildrenOfAccessed [] = (0, [⟨1, .LocalAccess⟩, ⟨0, .LocalAccess⟩]) := by
+    decide +kernel
+  have htp :
+      Tree.TraversalTree.traverse
+        ⟨tree'.nodes.data.map fun entry =>
+          match entry with
+          | none => ⟨none, []⟩
+          | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+        1 .VisitChildrenOfAccessed [] = (0, [⟨1, .LocalAccess⟩, ⟨0, .LocalAccess⟩]) := by
+    have htop : (tree'.nodes.data.map fun entry =>
+        match entry with
+        | none => ⟨none, []⟩
+        | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩) =
+        (#[⟨none, [1]⟩, ⟨some 0, []⟩] : Array Tree.TraversalNode) := by
+      simp [tree', tree, lmBoxRefTree, UniIndex.toNat]
+    rw [htop]
+    exact htrav
+  have hindex0 : (DedupRangeMap.mk (entries := #[⟨⟨0, size.bytes⟩, newLoc⟩])).index 0 =
+      .ok ⟨⟨0, size.bytes⟩, newLoc⟩ := rfl
+  let nd0 : TreeNode := ⟨rootTag, none, #[⟨1⟩], Permission.newDisabled, .None, false, none⟩
+  let nd1 : TreeNode := ⟨childTag, some ⟨0⟩, #[], dp, ds, false, none⟩
+  have hnode0 : tree'.nodeAt ⟨0⟩ = some nd0 := rfl
+  have hnode1 : tree'.nodeAt ⟨1⟩ = some nd1 := rfl
+  have hperm0 : newLoc.perms.get ⟨0⟩ = some rLoc' := rfl
+  have hperm1 : newLoc.perms.get ⟨1⟩ = some cLoc' := rfl
+  have hroots : tree'.roots = #[⟨0⟩] := rfl
+  have hrev : (#[(⟨0⟩ : UniIndex)]).reverse = #[⟨0⟩] := rfl
+  have hto1 : (⟨1⟩ : UniIndex).toNat = 1 := rfl
+  have hfor_arr : ∀ {α β : Type} (a : α) (init : β) (f : α → β → Id (ForInStep β)),
+      forIn (m := Id) (#[a] : Array α) init f =
+        match f a init with | .done b => b | .yield b => b := by
+    intro _ _ a init f
+    rw [← Array.forIn_toList]
+    change forIn (m := Id) [a] init f = _
+    simp only [List.forIn_cons, List.forIn_nil]
+    cases f a init <;> rfl
+  unfold BorrowTree.deallocateBorrowRange
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [hacc_st, hacc_tr]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hidx1', Option.isNone_some, hiter']
+  have hsz1 : (#[0] : Array Nat).size = 1 := rfl
+  rw [hsz1, forIn_range_one]
+  have hpos0 : (#[0] : Array Nat)[0]? = some 0 := rfl
+  have hseg0 : (#[⟨⟨0, size.bytes⟩, newLoc⟩] : Array (RangeMapSegment LocationTree))[0]? =
+      some ⟨⟨0, size.bytes⟩, newLoc⟩ := rfl
+  simp only [hpos0, hseg0]
+  rw [hroots, hrev, hfor_arr, hto1]
+  erw [htp]
+  simp only [List.forIn_cons, List.forIn_nil, show UniIndex.ofNat? 0 = some ⟨0⟩ from rfl,
+    show UniIndex.ofNat? 1 = some ⟨1⟩ from rfl, hnode0, hnode1, nd0, nd1, hperm0, hperm1,
+    Option.getD_some, Option.isNone_none, ↓reduceIte, pure, Pure.pure, bind, Bind.bind]
+  cases h1 : (protectedTags.get childTag == some .StrongProtector && !cLoc'.permission.isCell && cLoc'.accessed)
+  · cases h0 : (protectedTags.get rootTag == some .StrongProtector && !rLoc'.permission.isCell && rLoc'.accessed) <;>
+      simp [hindex0]
+  · simp
+
+/-- **Universal Lean-Miri `Cell` exemption (`rust#165833`)**: for every
+`rootTag`, `childTag`, every `size : Size`, every `accessed : Bool`, every
+`protectedTags` (even when `childTag` has `.StrongProtector`!), and arbitrary
+defaults `(dp, ds)`, deallocating through `rootTag` succeeds (`.Deallocated`)
+whenever `rootTag` itself is not strongly protected (and returns
+`.ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩` iff `size.bytes ≠ 0` and `rootTag` has
+`.StrongProtector`). -/
+theorem borrowTree_deallocate_boxRefTree_cell (rootTag childTag : BorTag) (size : Size)
+    (accessed : Bool) (dp : Permission) (ds : IdempotentForeignAccess)
+    (protectedTags : ProtectedTags) :
+    ((lmBoxRefTree rootTag childTag size ⟨.Cell, accessed, .Write⟩ dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  by_cases hzero : size.bytes = 0
+  · cases size with
+    | mk b =>
+      dsimp only at hzero; subst hzero
+      simpa [Size.ZERO, Size.ofBytes] using lmBoxRefTree_deallocate_zero rootTag childTag
+        ⟨.Cell, accessed, .Write⟩ dp ds protectedTags rootTag ⟨0⟩
+        (lmBoxRefTree_indexOfTag_root ..)
+  · have hbz : (size.bytes != 0) = true := bne_iff_ne.mpr hzero
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Cell, accessed, .Write⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Cell, accessed, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩] .Completed
+      (by intro e he; simp at he; subst he; exact Or.inl rfl)
+      (by
+        cases accessed <;> cases protectedTags.contains rootTag <;> cases protectedTags.contains childTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_root_ok rootTag childTag size
+      ⟨.Cell, accessed, .Write⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Cell, accessed, .Write⟩
+      dp ds protectedTags hzero hnorm
+    simpa [hbz, Permission.newUnique, Permission.isCell] using hres
+
+/-- **Universal Lean-Miri accessed `Frozen` child law (`rust#165833`)**: for
+every `rootTag`, `childTag`, nonzero `size`, `dp`, `ds`, and `protectedTags`:
+- if `childTag` is protected (`protectedTags.contains childTag = true`),
+  deallocating through `rootTag` fails with
+  `.AccessFailure (.AccessFailure ⟨0, size.bytes⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)))`;
+- if `childTag` is unprotected (`protectedTags.contains childTag = false`), the
+  foreign write disables the child and deallocation returns `.Deallocated`
+  (unless `rootTag` itself carries `.StrongProtector`). -/
+theorem borrowTree_deallocate_boxRefTree_frozen_accessed (rootTag childTag : BorTag) (size : Size)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags)
+    (hne : size.bytes ≠ 0) :
+    ((lmBoxRefTree rootTag childTag size ⟨.Frozen, true, .Read⟩ dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if protectedTags.contains childTag then
+        .AccessFailure (.AccessFailure ⟨0, size.bytes⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen)))
+      else if protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  cases hc : protectedTags.contains childTag
+  · have hget_c : protectedTags.get childTag = none := by
+      unfold ProtectedTags.contains at hc
+      cases hg : protectedTags.get childTag <;> simp [hg] at hc ⊢
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Frozen, true, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩] .Completed
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_root_ok rootTag childTag size
+      ⟨.Frozen, true, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags hne hnorm
+    simpa [hc, hget_c, Permission.newUnique, Permission.isCell] using hres
+  · have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Frozen, true, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩]
+      (.TransitionError 1 (.ProtectedDisabled .Frozen))
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_err rootTag childTag size
+      ⟨.Frozen, true, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags rootTag ⟨0⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen))
+      hne (by decide) (lmBoxRefTree_indexOfTag_root ..) hnorm
+    simpa [hc] using hres
+
+/-- **Universal Lean-Miri unaccessed (unread) `Frozen` child law
+(`rust#165833`)**: mirrors MiniRust's `tbDeallocHandler_strong_unread_frozen_child`.
+Even when `childTag` carries `.StrongProtector`, a foreign write from `rootTag`
+disables an unaccessed `Frozen` child without `ProtectedDisabled` or
+`ProtectedDealloc`, returning `.Deallocated` whenever `rootTag` itself is not
+strongly protected. -/
+theorem borrowTree_deallocate_boxRefTree_frozen_unaccessed (rootTag childTag : BorTag) (size : Size)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags) :
+    ((lmBoxRefTree rootTag childTag size ⟨.Frozen, false, .Read⟩ dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  by_cases hzero : size.bytes = 0
+  · cases size with
+    | mk b =>
+      dsimp only at hzero; subst hzero
+      simpa [Size.ZERO, Size.ofBytes] using lmBoxRefTree_deallocate_zero rootTag childTag
+        ⟨.Frozen, false, .Read⟩ dp ds protectedTags rootTag ⟨0⟩
+        (lmBoxRefTree_indexOfTag_root ..)
+  · have hbz : (size.bytes != 0) = true := bne_iff_ne.mpr hzero
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Frozen, false, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, false, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩] .Completed
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        cases protectedTags.contains rootTag <;> cases protectedTags.contains childTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_root_ok rootTag childTag size
+      ⟨.Frozen, false, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, false, .Write⟩
+      dp ds protectedTags hzero hnorm
+    simpa [hbz, Permission.newUnique, Permission.isCell] using hres
+
+/-- **Universal Lean-Miri accessed `Unique` child law (`rust#165833`)**:
+protected `Unique` child fails with `.ProtectedDisabled .Unique`; unprotected
+`Unique` child disables cleanly and returns `.Deallocated` (unless `rootTag` is
+strongly protected). -/
+theorem borrowTree_deallocate_boxRefTree_unique (rootTag childTag : BorTag) (size : Size)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags)
+    (hne : size.bytes ≠ 0) :
+    ((lmBoxRefTree rootTag childTag size ⟨.Unique, true, .None⟩ dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if protectedTags.contains childTag then
+        .AccessFailure (.AccessFailure ⟨0, size.bytes⟩ (.TransitionError 1 (.ProtectedDisabled .Unique)))
+      else if protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  cases hc : protectedTags.contains childTag
+  · have hget_c : protectedTags.get childTag = none := by
+      unfold ProtectedTags.contains at hc
+      cases hg : protectedTags.get childTag <;> simp [hg] at hc ⊢
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Unique, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩] .Completed
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_root_ok rootTag childTag size
+      ⟨.Unique, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags hne hnorm
+    simpa [hc, hget_c, Permission.newUnique, Permission.isCell] using hres
+  · have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.Unique, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩]
+      (.TransitionError 1 (.ProtectedDisabled .Unique))
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_err rootTag childTag size
+      ⟨.Unique, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags rootTag ⟨0⟩ (.TransitionError 1 (.ProtectedDisabled .Unique))
+      hne (by decide) (lmBoxRefTree_indexOfTag_root ..) hnorm
+    simpa [hc] using hres
+
+/-- **Universal Lean-Miri accessed `ReservedFrz false` child law (root
+deallocation)**: protected child fails with `.ProtectedDisabled (.ReservedFrz false)`;
+unprotected child disables cleanly. -/
+theorem borrowTree_deallocate_boxRefTree_reserved_root (rootTag childTag : BorTag) (size : Size)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags)
+    (hne : size.bytes ≠ 0) :
+    ((lmBoxRefTree rootTag childTag size ⟨.ReservedFrz false, true, .None⟩ dp ds).deallocateBorrowRange
+      (.concrete rootTag) Size.ZERO size protectedTags).status =
+      if protectedTags.contains childTag then
+        .AccessFailure (.AccessFailure ⟨0, size.bytes⟩
+          (.TransitionError 1 (.ProtectedDisabled (.ReservedFrz false))))
+      else if protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else .Deallocated := by
+  cases hc : protectedTags.contains childTag
+  · have hget_c : protectedTags.get childTag = none := by
+      unfold ProtectedTags.contains at hc
+      cases hg : protectedTags.get childTag <;> simp [hg] at hc ⊢
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.ReservedFrz false, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩] .Completed
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_root_ok rootTag childTag size
+      ⟨.ReservedFrz false, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags hne hnorm
+    simpa [hc, hget_c, Permission.newUnique, Permission.isCell] using hres
+  · have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.ReservedFrz false, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags ⟨0⟩ [⟨0, .LocalAccess⟩, ⟨1, .ForeignAccess⟩]
+      (.TransitionError 1 (.ProtectedDisabled (.ReservedFrz false)))
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        rw [hc]; cases protectedTags.contains rootTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_err rootTag childTag size
+      ⟨.ReservedFrz false, true, .None⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Disabled, true, .Write⟩
+      dp ds protectedTags rootTag ⟨0⟩ (.TransitionError 1 (.ProtectedDisabled (.ReservedFrz false)))
+      hne (by decide) (lmBoxRefTree_indexOfTag_root ..) hnorm
+    simpa [hc] using hres
+
+/-- **Universal Lean-Miri `WeakProtector` `Box<T>` vs `StrongProtector` `&mut T`
+self-deallocation dichotomy (`rust#165833`)**: deallocating through a
+`ReservedFrz false` child tag `childTag` activates it to `Unique` (passing the
+write phase), and then returns:
+- `.ProtectedDealloc ⟨0, size.bytes⟩ ⟨1⟩` iff `size.bytes ≠ 0` and `childTag`
+  carries `.StrongProtector`;
+- `.ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩` if `childTag` is not strongly
+  protected (`none` or `.WeakProtector`!) while `rootTag` is strongly protected;
+- `.Deallocated` otherwise (in particular, a `WeakProtector`-protected `Box<T>`
+  child deallocates cleanly for every size!). -/
+theorem borrowTree_deallocate_boxRefTree_reserved_child (rootTag childTag : BorTag)
+    (hne_tag : rootTag ≠ childTag) (size : Size) (accessed : Bool)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags) :
+    ((lmBoxRefTree rootTag childTag size ⟨.ReservedFrz false, accessed, .None⟩ dp ds).deallocateBorrowRange
+      (.concrete childTag) Size.ZERO size protectedTags).status =
+      if size.bytes != 0 then
+        if protectedTags.get childTag == some .StrongProtector then
+          .ProtectedDealloc ⟨0, size.bytes⟩ ⟨1⟩
+        else if protectedTags.get rootTag == some .StrongProtector then
+          .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+        else .Deallocated
+      else .Deallocated := by
+  by_cases hzero : size.bytes = 0
+  · cases size with
+    | mk b =>
+      dsimp only at hzero; subst hzero
+      simpa [Size.ZERO, Size.ofBytes] using lmBoxRefTree_deallocate_zero rootTag childTag
+        ⟨.ReservedFrz false, accessed, .None⟩ dp ds protectedTags childTag ⟨1⟩
+        (lmBoxRefTree_indexOfTag_child rootTag childTag hne_tag ..)
+  · have hbz : (size.bytes != 0) = true := bne_iff_ne.mpr hzero
+    have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+      ⟨.ReservedFrz false, accessed, .None⟩ ⟨Permission.newUnique, true, .None⟩
+      ⟨.Unique, true, .None⟩ dp ds protectedTags ⟨1⟩
+      [⟨1, .LocalAccess⟩, ⟨0, .LocalAccess⟩] .Completed
+      (by intro e he; simp at he; rcases he with rfl | rfl <;> simp)
+      (by
+        cases accessed <;> cases protectedTags.contains rootTag <;> cases protectedTags.contains childTag <;> rfl)
+    have hres := lmBoxRefTree_deallocate_child_ok rootTag childTag hne_tag size
+      ⟨.ReservedFrz false, accessed, .None⟩ ⟨Permission.newUnique, true, .None⟩
+      ⟨.Unique, true, .None⟩ dp ds protectedTags hzero hnorm
+    simpa [hbz, Permission.newUnique, Permission.isCell] using hres
+
+/-- **Universal Lean-Miri wrong-tag `Frozen` child deallocation (`rust#165833`,
+universal Case 21)**: for every `rootTag ≠ childTag`, every nonzero `size`,
+every `accessed : Bool`, every `dp`, `ds`, and every `protectedTags`,
+deallocating through a `Frozen` child tag always fails with
+`.AccessFailure (.AccessFailure ⟨0, size.bytes⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen)))`. -/
+theorem borrowTree_deallocate_boxRefTree_frozen_child_tag (rootTag childTag : BorTag)
+    (hne_tag : rootTag ≠ childTag) (size : Size) (accessed : Bool)
+    (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags)
+    (hne : size.bytes ≠ 0) :
+    ((lmBoxRefTree rootTag childTag size ⟨.Frozen, accessed, .Read⟩ dp ds).deallocateBorrowRange
+      (.concrete childTag) Size.ZERO size protectedTags).status =
+      .AccessFailure (.AccessFailure ⟨0, size.bytes⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen))) := by
+  have hnorm := lmBoxRefTree_performNormalAccess_eq rootTag childTag size
+    ⟨.Frozen, accessed, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Frozen, accessed, .None⟩
+    dp ds protectedTags ⟨1⟩ [⟨1, .LocalAccess⟩]
+    (.TransitionError 1 (.ChildAccessForbidden .Frozen))
+    (by intro e he; simp at he; subst he; exact Or.inr rfl)
+    (by
+      cases accessed <;> cases protectedTags.contains rootTag <;> cases protectedTags.contains childTag <;> rfl)
+  exact lmBoxRefTree_deallocate_err rootTag childTag size
+    ⟨.Frozen, accessed, .Read⟩ ⟨Permission.newUnique, true, .None⟩ ⟨.Frozen, accessed, .None⟩
+    dp ds protectedTags childTag ⟨1⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen))
+    hne (by decide) (lmBoxRefTree_indexOfTag_child rootTag childTag hne_tag ..) hnorm
+
+/-- **End-to-end `AllocationMachine.deallocate` Tree Borrows UB bridge on
+`lmBoxRefTree`**: composes our universal 2-node `BorrowTree.deallocateBorrowRange`
+laws with `allocationMachine_deallocate_treeBorrows_ub`, proving that on any
+live `MachineHooks.State` with an active `borrowTracker`, deallocating a
+nonzero `lmBoxRefTree` allocation with a protected accessed `Frozen`/`Unique`
+child (via `rootTag`) or through a `Frozen` child tag (via `childTag`) always
+surfaces as `StepError.undefinedBehavior`. -/
+theorem allocationMachine_deallocate_boxRefTree_ub {K User Payload : Type} [DecidableEq K]
+    (h : AllocationMachine.DeallocationHooks K User Payload)
+    (pointer : Pointer (Option Provenance)) (kind : MemoryKind K)
+    (st : MachineHooks.State K User) (id : AllocId)
+    (rootTag childTag : BorTag) (hne_tag : rootTag ≠ childTag)
+    (entry : LocalAllocation Provenance BorrowTree K)
+    (m1 m2 : PlaceMachine.Machine K User)
+    (tracker : MachineHooks.BorrowState)
+    (dp : Permission) (ds : IdempotentForeignAccess)
+    (hne : entry.allocation.byteSize.bytes ≠ 0)
+    (hlive : (h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).memory.live.find?
+      (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut) (hkind : entry.kind = kind)
+    (hnat : entry.allocation.nativeBuffer = none)
+    (hdiag :
+      let r := h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      h.diagnostic id { r.state.machine with memory := afterRemove } = .ok () m1)
+    (hrace : MachineHooks.memoryRaceAccess m1 id ⟨Size.ZERO, entry.allocation.byteSize⟩
+      (some .Deallocate) .Read = (m2, .ok ()))
+    (htracker : m2.borrowTracker = some tracker) :
+    ((h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).outcome =
+          .ok (id, Size.ZERO, .concrete rootTag) →
+        entry.allocation.extra = lmBoxRefTree rootTag childTag entry.allocation.byteSize
+          ⟨.Frozen, true, .Read⟩ dp ds →
+        tracker.global.protectedTags.contains childTag = true →
+        ∃ msg st', AllocationMachine.deallocate h pointer
+          (some (entry.allocation.byteSize, entry.allocation.align)) kind st =
+          .error (.undefinedBehavior msg) st') ∧
+    ((h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).outcome =
+          .ok (id, Size.ZERO, .concrete childTag) →
+        ∀ (accessed : Bool),
+        entry.allocation.extra = lmBoxRefTree rootTag childTag entry.allocation.byteSize
+          ⟨.Frozen, accessed, .Read⟩ dp ds →
+        ∃ msg st', AllocationMachine.deallocate h pointer
+          (some (entry.allocation.byteSize, entry.allocation.align)) kind st =
+          .error (.undefinedBehavior msg) st') := by
+  refine ⟨?_, ?_⟩
+  · intro hres hextra hc
+    have hst : (entry.allocation.extra.deallocateBorrowRange (.concrete rootTag) Size.ZERO
+        entry.allocation.byteSize tracker.global.protectedTags).status ≠ .Deallocated := by
+      rw [hextra, borrowTree_deallocate_boxRefTree_frozen_accessed rootTag childTag
+        entry.allocation.byteSize dp ds tracker.global.protectedTags hne, hc]
+      simp
+    obtain ⟨st', hm⟩ := allocationMachine_deallocate_treeBorrows_ub h pointer kind st id
+      (.concrete rootTag) entry m1 m2 tracker hres hlive hmut hkind hnat hdiag hrace htracker hst
+    exact ⟨_, st', hm⟩
+  · intro hres accessed hextra
+    have hst : (entry.allocation.extra.deallocateBorrowRange (.concrete childTag) Size.ZERO
+        entry.allocation.byteSize tracker.global.protectedTags).status ≠ .Deallocated := by
+      rw [hextra, borrowTree_deallocate_boxRefTree_frozen_child_tag rootTag childTag hne_tag
+        entry.allocation.byteSize accessed dp ds tracker.global.protectedTags hne]
+      simp
+    obtain ⟨st', hm⟩ := allocationMachine_deallocate_treeBorrows_ub h pointer kind st id
+      (.concrete childTag) entry m1 m2 tracker hres hlive hmut hkind hnat hdiag hrace htracker hst
+    exact ⟨_, st', hm⟩
+
+/-- **Reachability & non-vacuity witness for `lmBoxRefTree`**: vendored
+`BorrowTree.newChild` starting from `BorrowTree.new t1 ⟨32⟩` literally builds
+`lmBoxRefTree t1 t2 ⟨32⟩ ...` for `Cell`, `Frozen`, and `ReservedFrz false`
+children, and instantiates the universal `deallocateBorrowRange` laws on those
+reachable trees. -/
+theorem borrowTree_newChild_boxRefTree_witness :
+    let t1 : BorTag := ⟨1, by decide⟩
+    let t2 : BorTag := ⟨2, by decide⟩
+    let cellIns := (BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+      (DedupRangeMap.new ⟨32⟩ ⟨.Cell, false, .Write⟩) .Frozen true
+    let frzIns := (BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+      (DedupRangeMap.new ⟨32⟩ ⟨.Frozen, true, .Read⟩) .Frozen true
+    let resIns := (BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+      (DedupRangeMap.new ⟨32⟩ ⟨.ReservedFrz false, false, .None⟩) .Frozen true
+    cellIns.outcome = .ok () ∧
+    cellIns.tree = lmBoxRefTree t1 t2 ⟨32⟩ ⟨.Cell, false, .Write⟩ .Frozen .Read ∧
+    frzIns.outcome = .ok () ∧
+    frzIns.tree = lmBoxRefTree t1 t2 ⟨32⟩ ⟨.Frozen, true, .Read⟩ .Frozen .Read ∧
+    resIns.outcome = .ok () ∧
+    resIns.tree = lmBoxRefTree t1 t2 ⟨32⟩ ⟨.ReservedFrz false, false, .None⟩ .Frozen .Read ∧
+    (cellIns.tree.deallocateBorrowRange (.concrete t1) Size.ZERO ⟨32⟩
+      (ProtectedTags.insert {} t2 .StrongProtector)).status = .Deallocated ∧
+    (frzIns.tree.deallocateBorrowRange (.concrete t1) Size.ZERO ⟨32⟩
+      (ProtectedTags.insert {} t2 .StrongProtector)).status =
+      .AccessFailure (.AccessFailure ⟨0, 32⟩ (.TransitionError 1 (.ProtectedDisabled .Frozen))) ∧
+    (frzIns.tree.deallocateBorrowRange (.concrete t2) Size.ZERO ⟨32⟩ {}).status =
+      .AccessFailure (.AccessFailure ⟨0, 32⟩ (.TransitionError 1 (.ChildAccessForbidden .Frozen))) ∧
+    (resIns.tree.deallocateBorrowRange (.concrete t2) Size.ZERO ⟨32⟩
+      (ProtectedTags.insert {} t2 .WeakProtector)).status = .Deallocated ∧
+    (resIns.tree.deallocateBorrowRange (.concrete t2) Size.ZERO ⟨32⟩
+      (ProtectedTags.insert {} t2 .StrongProtector)).status =
+      .ProtectedDealloc ⟨0, 32⟩ ⟨1⟩ := by
+  let t1 : BorTag := ⟨1, by decide⟩
+  let t2 : BorTag := ⟨2, by decide⟩
+  dsimp only
+  have hcell :
+      ((BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+        (DedupRangeMap.new ⟨32⟩ ⟨.Cell, false, .Write⟩) .Frozen true) =
+      { tree := lmBoxRefTree t1 t2 ⟨32⟩ ⟨.Cell, false, .Write⟩ .Frozen .Read,
+        outcome := .ok () } := by
+    rw [show @BorrowTree.newChild = @newChildU from newChildU.eq_src]
+    decide +kernel
+  have hfrz :
+      ((BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+        (DedupRangeMap.new ⟨32⟩ ⟨.Frozen, true, .Read⟩) .Frozen true) =
+      { tree := lmBoxRefTree t1 t2 ⟨32⟩ ⟨.Frozen, true, .Read⟩ .Frozen .Read,
+        outcome := .ok () } := by
+    rw [show @BorrowTree.newChild = @newChildU from newChildU.eq_src]
+    decide +kernel
+  have hres :
+      ((BorrowTree.new t1 ⟨32⟩).newChild Size.ZERO (.concrete t1) t2
+        (DedupRangeMap.new ⟨32⟩ ⟨.ReservedFrz false, false, .None⟩) .Frozen true) =
+      { tree := lmBoxRefTree t1 t2 ⟨32⟩ ⟨.ReservedFrz false, false, .None⟩ .Frozen .Read,
+        outcome := .ok () } := by
+    rw [show @BorrowTree.newChild = @newChildU from newChildU.eq_src]
+    decide +kernel
+  rw [hcell, hfrz, hres]
+  have hgs : (ProtectedTags.insert {} t2 .StrongProtector).get t1 = none := by decide
+  have hgw : (ProtectedTags.insert {} t2 .WeakProtector).get t1 = none := by decide
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_⟩
+  · simpa [hgs] using borrowTree_deallocate_boxRefTree_cell t1 t2 ⟨32⟩ false .Frozen .Read
+      (ProtectedTags.insert {} t2 .StrongProtector)
+  · simpa [ProtectedTags.contains] using
+      borrowTree_deallocate_boxRefTree_frozen_accessed t1 t2 ⟨32⟩ .Frozen .Read
+        (ProtectedTags.insert {} t2 .StrongProtector) (by decide)
+  · exact borrowTree_deallocate_boxRefTree_frozen_child_tag t1 t2 (by decide) ⟨32⟩ true
+      .Frozen .Read {} (by decide)
+  · simpa [hgw] using borrowTree_deallocate_boxRefTree_reserved_child t1 t2 (by decide) ⟨32⟩ false
+      .Frozen .Read (ProtectedTags.insert {} t2 .WeakProtector)
+  · simpa using borrowTree_deallocate_boxRefTree_reserved_child t1 t2 (by decide) ⟨32⟩ false
+      .Frozen .Read (ProtectedTags.insert {} t2 .StrongProtector)
+
 /-- Zeroed byte storage produced by `Array.replicate n 0` contains no nonzero byte. -/
 theorem forIn_range'_replicate_zero (n : Nat) :
     ∀ (k start : Nat), start + k ≤ n →
@@ -4331,7 +5234,52 @@ theorem ep1_lean_miri_heap_wide_capstone :
           Size.ZERO size protectedTags).status =
           if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
             .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
-          else .Deallocated)) ∧
+          else .Deallocated) ∧
+      (∀ (rootTag childTag : BorTag) (size : Size) (accessed : Bool)
+          (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags),
+        ((lmBoxRefTree rootTag childTag size ⟨.Cell, accessed, .Write⟩ dp ds).deallocateBorrowRange
+          (.concrete rootTag) Size.ZERO size protectedTags).status =
+          if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+            .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+          else .Deallocated) ∧
+      (∀ (rootTag childTag : BorTag) (size : Size)
+          (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags),
+        size.bytes ≠ 0 →
+        ((lmBoxRefTree rootTag childTag size ⟨.Frozen, true, .Read⟩ dp ds).deallocateBorrowRange
+          (.concrete rootTag) Size.ZERO size protectedTags).status =
+          if protectedTags.contains childTag then
+            .AccessFailure (.AccessFailure ⟨0, size.bytes⟩
+              (.TransitionError 1 (.ProtectedDisabled .Frozen)))
+          else if protectedTags.get rootTag == some .StrongProtector then
+            .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+          else .Deallocated) ∧
+      (∀ (rootTag childTag : BorTag) (size : Size)
+          (dp : Permission) (ds : IdempotentForeignAccess) (protectedTags : ProtectedTags),
+        ((lmBoxRefTree rootTag childTag size ⟨.Frozen, false, .Read⟩ dp ds).deallocateBorrowRange
+          (.concrete rootTag) Size.ZERO size protectedTags).status =
+          if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+            .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+          else .Deallocated) ∧
+      (∀ (rootTag childTag : BorTag), rootTag ≠ childTag →
+        ∀ (size : Size) (accessed : Bool) (dp : Permission) (ds : IdempotentForeignAccess)
+          (protectedTags : ProtectedTags),
+        ((lmBoxRefTree rootTag childTag size ⟨.ReservedFrz false, accessed, .None⟩ dp ds).deallocateBorrowRange
+          (.concrete childTag) Size.ZERO size protectedTags).status =
+          if size.bytes != 0 then
+            if protectedTags.get childTag == some .StrongProtector then
+              .ProtectedDealloc ⟨0, size.bytes⟩ ⟨1⟩
+            else if protectedTags.get rootTag == some .StrongProtector then
+              .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+            else .Deallocated
+          else .Deallocated) ∧
+      (∀ (rootTag childTag : BorTag), rootTag ≠ childTag →
+        ∀ (size : Size) (accessed : Bool) (dp : Permission) (ds : IdempotentForeignAccess)
+          (protectedTags : ProtectedTags),
+        size.bytes ≠ 0 →
+        ((lmBoxRefTree rootTag childTag size ⟨.Frozen, accessed, .Read⟩ dp ds).deallocateBorrowRange
+          (.concrete childTag) Size.ZERO size protectedTags).status =
+          .AccessFailure (.AccessFailure ⟨0, size.bytes⟩
+            (.TransitionError 1 (.ChildAccessForbidden .Frozen))))) ∧
     ((∀ (tb : Bool) (size align : Nat) (al : Align),
         size ≤ lmIsizeMax → lmCheckAlign align = .ok al →
         let ptr : Pointer (Option Provenance) :=
@@ -4383,7 +5331,11 @@ theorem ep1_lean_miri_heap_wide_capstone :
   · exact thinEq_provenance_erased
   · exact fun a b c d => (wideEq_hetero_invalidProgram a b c d).1
   · obtain ⟨h1, h2, h3, h4, h5, h6⟩ := deallocateBorrowRange_protector_laws
-    exact ⟨h1, h2, h3, h4, h5, h6, borrowTree_deallocate_fresh⟩
+    exact ⟨h1, h2, h3, h4, h5, h6, borrowTree_deallocate_fresh,
+      borrowTree_deallocate_boxRefTree_cell, borrowTree_deallocate_boxRefTree_frozen_accessed,
+      borrowTree_deallocate_boxRefTree_frozen_unaccessed,
+      borrowTree_deallocate_boxRefTree_reserved_child,
+      borrowTree_deallocate_boxRefTree_frozen_child_tag⟩
   · exact lm_heap_lifecycle_universal
   · exact lm_global_alloc_universal
   · exact lmHeapWideObserve_table
@@ -4442,7 +5394,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.HeapAllocAndWidePtrLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 113 then
+  if theorems < 134 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.HeapAllocAndWidePtrLM seen"
   logInfo m!"LeanMiriSpec.HeapAllocAndWidePtrLM: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
