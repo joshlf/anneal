@@ -259,7 +259,9 @@ theorem liftDirectCaller_lift :
   -- bb1 terminator: `tailCall lift_poly_id::<u32>(move _1)`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallDirect (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
+  dsimp only [FrameStep.Continues, tailCallFrameMem, enterTailCalleeFrame,
+    tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent,
+    narrowCallStackForTailCallee, disableFrameBorrows, Option.getD]
   -- Tail callee bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
@@ -577,7 +579,9 @@ theorem liftPolyLayoutCaller_lift :
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallIndirect (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
+  dsimp only [FrameStep.Continues, tailCallFrameMem, enterTailCalleeFrame,
+    tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent,
+    narrowCallStackForTailCallee, disableFrameBorrows, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
@@ -589,7 +593,7 @@ theorem liftPolyLayoutCaller_lift :
   dsimp only [FrameStep.Continues, returnFrameMem, restoreCallerProtectors]
   -- bb1 terminator: projected drop of `_1.0 -> bb2`.
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
-  apply LiftTerminator.dropProjected (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
+  apply LiftTerminator.dropProjected (by rfl) (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
   dsimp only [FrameStep.Continues, invalidateConflictingBorrowsAtProj]
   -- bb2[0]: `StorageLive(_3)`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
@@ -1109,7 +1113,9 @@ theorem liftClosureAndTraitCaller_lift :
   apply LiftFrame.term (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftTerminator.tailCallFnItem (by rfl) (by rfl) (by rfl) (by rfl) (by rfl)
     (by rfl) (by rfl)
-  dsimp only [FrameStep.Continues, tailCallFrameMem, disableFrameBorrows, Option.getD]
+  dsimp only [FrameStep.Continues, tailCallFrameMem, enterTailCalleeFrame,
+    tailCalleeEntryMemory, relocateRootCallerReferents, hasAnyRootCallerReferent,
+    narrowCallStackForTailCallee, disableFrameBorrows, Option.getD]
   -- `lift_poly_id::<u32>` bb0[0]: `_0 = move _1`.
   apply LiftFrame.stmt (by rfl) (Or.inl rfl) (by rfl) (by rfl) (by rfl)
   apply LiftStmtMem.pure (by rfl) (by rfl) (by rfl)
@@ -1543,7 +1549,7 @@ theorem PureMirModularConverges.call_diverging_panic_pureTarget
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   have h_res_m :
@@ -1577,7 +1583,7 @@ theorem PureMirModularConverges.call_diverging_panic_pureTarget
     dsimp only [evalTerminator, bodyLocalDeclsOf]
     rw [h_res_m]
     dsimp only
-    rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
+    rw [evalOperandsWithBodyCast_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
       m.callerLocals h_args_pure]
     unfold evalPureOperands at h_args
     rw [h_args]
@@ -1601,12 +1607,13 @@ theorem PureMirModularConverges.call_diverging_panic_pureTarget
           rw [hm.2.2.1]
           dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
             Trusted.ITree.ITreeF.map]
+          rw [h_ruc]
           trivial
         · dsimp only [applyUnwindAction, MirStepNode.retOutcome,
             Trusted.ITree.ITreeF.map]
           trivial
         · dsimp only [applyUnwindAction]
-          exact h_clean m hm
+          exact h_clean m hm h_ruc
 
 theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
     {subContract contract : MirCallContract}
@@ -1697,7 +1704,7 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   have h_res_m :
@@ -1731,7 +1738,7 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
     dsimp only [evalTerminator, bodyLocalDeclsOf]
     rw [h_res_m]
     dsimp only
-    rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
+    rw [evalOperandsWithBodyCast_pure_eq envAfterFunc argOps m.borrows m.globals body.layouts
       m.callerLocals h_args_pure]
     unfold evalPureOperands at h_args
     cases h_ev : evalOperands envAfterFunc argOps [] [] body.layouts [] with
@@ -1764,17 +1771,18 @@ theorem PureMirModularConverges.call_diverging_modular_sub_pureTarget
         exact False.elim (h_no_ret m retMem retVal hm hp)
       | panicked panicMem =>
         rcases h_contract_panic with rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
-        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction, PureState.toMachineState]
           rw [h_panic_stack m panicMem hm hp]
           dsimp only [unwindFromCallStack]
-          rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+          rw [h_ruc, Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
           trivial
         · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
           rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
           trivial
         · exact False.elim (h_no_panic m panicMem hm hp)
-        · dsimp only [resumeExternalDivergingCall, applyUnwindAction]
-          exact h_clean panicMem (h_mod_p m panicMem hm hp)
+        · dsimp only [resumeExternalDivergingCall, applyUnwindAction, PureState.toMachineState]
+          exact h_clean { panicMem with rootUnwindCeiling := m.rootUnwindCeiling }
+            ((h_mod_p m panicMem hm hp).withRootUnwindCeiling _) h_ruc
 
 /-!
 ## 10. Concrete Multi-Callee, Polymorphic, Intrinsic, & `#[external_spec]`
@@ -2508,7 +2516,7 @@ theorem nestedMultiCalleeCaller_inline
   exact wpMirExecNoCallSym_of_runPureTauSteps (n := 9) (fuel := 9) h_run9
     (wpMirExecNoCallSym_of_step_eq (fuel := 8) h_step10
       (wpMirExecNoCallSym_of_runPureTauSteps (n := 7) (fuel := 1) h_run7
-        (wpMirExecNoCallSym_of_retNormal h_ret17 ⟨Or.inr ⟨_, rfl⟩, rfl⟩)))
+        (wpMirExecNoCallSym_of_retNormal h_ret17 ⟨Or.inr ⟨_, _, rfl⟩, rfl⟩)))
 
 /-- Stateless `Claim` for `nestedMultiCalleeCallerBody` with `demoCallees`. -/
 def nestedMultiCalleeStatelessClaim : Claim where
@@ -2919,7 +2927,8 @@ def pureIntrinsicCallerPre (args : List Value) (mem : Memory) : Prop :=
   mem.callees = [] ∧
   mem.callStack = [] ∧
   (mem.activeCallee = none ∨ mem.activeCallee = some pureIntrinsicCallerBody) ∧
-  mem.activeProtectors = []
+  mem.activeProtectors = [] ∧
+  mem.rootUnwindCeiling = true
 
 /-- Modular postcondition for `pureIntrinsicCallerBody`. -/
 def pureIntrinsicCallerPost
@@ -2934,7 +2943,7 @@ theorem pureIntrinsicCaller_modularPre_nonVacuous :
   ⟨[.scalar { bits := 0x12345678, sizeBytes := 4 }],
    emptyMemory,
    ⟨0x12345678, by decide, rfl⟩,
-   rfl, rfl, Or.inl rfl, rfl⟩
+   rfl, rfl, Or.inl rfl, rfl, rfl⟩
 
 /--
 Audited `ModularVerificationResult` for `pureIntrinsicCallerBody` against
@@ -3157,11 +3166,12 @@ theorem externalSpecAndPolyCallee_modularPre_nonVacuous :
         mem.callStack = [] ∧
         (mem.activeCallee = none ∨
          mem.activeCallee = some externalSpecAndPolyCalleeCallerBody) ∧
-        mem.activeProtectors = []) :=
+        mem.activeProtectors = [] ∧
+        mem.rootUnwindCeiling = true) :=
   ⟨[.aggregate 0 [.scalar { bits := 41, sizeBytes := 4 }, .scalar { bits := 7, sizeBytes := 4 }]],
    emptyMemory,
    ⟨41, 7, by decide, rfl⟩,
-   rfl, Or.inl rfl, rfl⟩
+   rfl, Or.inl rfl, rfl, rfl⟩
 
 /--
 Audited `ModularVerificationResult` for `externalSpecAndPolyCalleeCallerBody`
@@ -3184,7 +3194,8 @@ theorem verify_externalSpecAndPolyCalleeModular :
           mem.callStack = [] ∧
           (mem.activeCallee = none ∨
            mem.activeCallee = some externalSpecAndPolyCalleeCallerBody) ∧
-          mem.activeProtectors = []
+          mem.activeProtectors = [] ∧
+          mem.rootUnwindCeiling = true
         post := fun args _ retVal _ =>
           ∀ (x y : Nat),
             args = [
@@ -3657,11 +3668,12 @@ theorem combinedModularPipeline_modularPre_nonVacuous :
         mem.callStack = [] ∧
         (mem.activeCallee = none ∨
          mem.activeCallee = some combinedModularPipelineBody) ∧
-        mem.activeProtectors = []) :=
+        mem.activeProtectors = [] ∧
+        mem.rootUnwindCeiling = true) :=
   ⟨[.aggregate 0 [.scalar { bits := 19, sizeBytes := 4 }, .scalar { bits := 3, sizeBytes := 4 }]],
    emptyMemory,
    ⟨19, 3, by decide, rfl⟩,
-   rfl, Or.inl rfl, rfl⟩
+   rfl, Or.inl rfl, rfl, rfl⟩
 
 /--
 Audited `ModularVerificationResult` for `combinedModularPipelineBody` against
@@ -3684,7 +3696,8 @@ theorem verify_combinedModularPipeline :
           mem.callStack = [] ∧
           (mem.activeCallee = none ∨
            mem.activeCallee = some combinedModularPipelineBody) ∧
-          mem.activeProtectors = []
+          mem.activeProtectors = [] ∧
+          mem.rootUnwindCeiling = true
         post := fun args _ retVal _ =>
           ∀ (x y : Nat),
             args = [
@@ -4306,6 +4319,7 @@ def calleeBackedModularPre (args : List Value) (mem : Memory) : Prop :=
   (mem.activeCallee = none ∨
     mem.activeCallee = some calleeBackedConstEvalAndIntrinsicTailBody) ∧
   mem.activeProtectors = [] ∧
+  mem.rootUnwindCeiling = true ∧
   ((args = [.aggregate 0 [
       .scalar { bits := 7, sizeBytes := 4 },
       .scalar { bits := 0x0F0F0005, sizeBytes := 4 }
@@ -4323,7 +4337,7 @@ theorem calleeBackedConstEval_modularPre_nonVacuous :
       .scalar { bits := 0x0F0F0005, sizeBytes := 4 }
     ]],
    emptyMemory,
-   ⟨rfl, Or.inl rfl, rfl, Or.inl rfl⟩⟩
+   ⟨rfl, Or.inl rfl, rfl, rfl, Or.inl rfl⟩⟩
 
 /--
 End-to-end audited `ModularVerificationResult` certificate via
@@ -4349,10 +4363,10 @@ theorem verify_calleeBackedConstEvalAndIntrinsicTail :
         callees := [polySwapPairBody] } := by
   refine verifyModularMir_of_pureModularExec_any
     calleeBackedModularContract _ rfl (Or.inl (by decide))
-    (fun _ _ hp => ⟨hp.1, hp.2.1, hp.2.2.1⟩)
+    (fun _ _ hp => ⟨hp.1, hp.2.1, hp.2.2.1, hp.2.2.2.1⟩)
     (fun args _ hp => ?_)
   simp only [List.isEmpty, Bool.false_eq_true, ↓reduceIte]
-  rcases hp.2.2.2 with rfl | rfl
+  rcases hp.2.2.2.2 with rfl | rfl
   · -- Case 1: y = 0x0F0F0005 -> const_eval_select -> switchInt -> tailCall ctpop = 10
     refine PureMirModularConverges.step_stmt
       (fun _ h => nomatch h) rfl rfl rfl rfl ?_
@@ -4707,7 +4721,8 @@ def localFnItemAndCleanupPre (args : List Value) (mem : Memory) : Prop :=
   mem.callStack = [] ∧
   (mem.activeCallee = none ∨
     mem.activeCallee = some localFnItemAndCleanupModularBody) ∧
-  mem.activeProtectors = []
+  mem.activeProtectors = [] ∧
+  mem.rootUnwindCeiling = true
 
 /-- Non-vacuity witness for `localFnItemAndCleanupPre`. -/
 theorem localFnItemAndCleanup_modularPre_nonVacuous :
@@ -4715,7 +4730,7 @@ theorem localFnItemAndCleanup_modularPre_nonVacuous :
   ⟨[.scalar { bits := 41, sizeBytes := 4 }, .unit, .unit],
    emptyMemory,
    ⟨41, by decide, rfl⟩,
-   rfl, rfl, Or.inl rfl, rfl⟩
+   rfl, rfl, Or.inl rfl, rfl, rfl⟩
 
 @[irreducible]
 def expectedCtpopU32 (v : Nat) : Value := .scalar ⟨pureCtpopLoop 32 v, 4⟩

@@ -2383,28 +2383,32 @@ theorem mirStatefulTreeWithCallees_nil
 /--
 Predicate asserting that `mem` is at a borrow-free root caller activation
 (`mem.borrows = []`, `mem.callStack = []`, `mem.activeCallee = none`,
-`mem.activeProtectors = []`), while leaving heap allocations (`globals`,
-`nextAllocId`), tag/protector counters (`nextTag`, `nextProtector`), caller
-locals (`callerLocals`), and linked callee tables (`callees`) completely
-unconstrained.
+`mem.activeProtectors = []`) that may unwind (`mem.rootUnwindCeiling = true`:
+a panic leaving the root activation is `.halted .panic`, not the
+`DIV-LM-TAILCALL-NOUNWIND-UNWIND` undefined behavior of unwinding out of a
+root-level tail callee that cannot unwind), while leaving heap allocations
+(`globals`, `nextAllocId`), tag/protector counters (`nextTag`,
+`nextProtector`), caller locals (`callerLocals`), and linked callee tables
+(`callees`) completely unconstrained.
 -/
 def RootActiveMemory (mem : Memory) : Prop :=
   mem.borrows = [] ∧
   mem.callStack = [] ∧
   mem.activeCallee = none ∧
-  mem.activeProtectors = []
+  mem.activeProtectors = [] ∧
+  mem.rootUnwindCeiling = true
 
 @[simp]
 theorem rootActiveMemory_initMachineState
     (body : CapturedMir) (args : List Value) :
     RootActiveMemory (initMachineState body args).memory :=
-  ⟨rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 @[simp]
 theorem rootActiveMemory_initMachineStateWithCallees
     (body : CapturedMir) (args : List Value) (callees : List CapturedMir) :
     RootActiveMemory (initMachineStateWithCallees body args callees).memory := by
-  cases callees <;> exact ⟨rfl, rfl, rfl, rfl⟩
+  cases callees <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /--
 `initMachineStateWithCallees body args callees` is the frame of
@@ -4399,7 +4403,7 @@ theorem multiBlockPipeline_stage1_converges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl⟩
 
 /--
@@ -4417,7 +4421,7 @@ theorem multiBlockPipeline_stage2_converges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl⟩
 
 /--
@@ -4529,7 +4533,7 @@ theorem verify_multiBlockPipelineClaim :
         exact by rw [h_rv]
       | panic => exact False.elim ho
       | abort => exact False.elim ho)
-    (multiBlockPipeline_wpConverges b _ ⟨rfl, rfl, rfl, rfl⟩)
+    (multiBlockPipeline_wpConverges b _ ⟨rfl, rfl, rfl, rfl, rfl⟩)
 
 /--
 Stateful `StatefulClaim` for `multiBlockPipelineBody` over any root-activation
@@ -4549,7 +4553,7 @@ theorem multiBlockPipelineStatefulClaim_nonVacuous :
     [.scalar { bits := 42, sizeBytes := 4 }]
     (initMachineStateWithCallees multiBlockPipelineBody
       [.scalar { bits := 42, sizeBytes := 4 }] [multiBlockPipelineBody]).memory
-    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
+    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
 
 /--
 Fuel-free discharge of `StatefulVerificationResult multiBlockPipelineStatefulClaim`
@@ -4589,7 +4593,7 @@ theorem multiBlockPipelineTotalClaim_nonVacuous :
     [.scalar { bits := 42, sizeBytes := 4 }]
     (initMachineStateWithCallees multiBlockPipelineBody
       [.scalar { bits := 42, sizeBytes := 4 }] [multiBlockPipelineBody]).memory
-    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩
+    ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩
 
 /--
 Fuel-free discharge of `TotalVerificationResult multiBlockPipelineTotalClaim`
@@ -4626,7 +4630,7 @@ theorem multiBlockPipeline_stage2_noCallWpConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl⟩
 
 /--
@@ -4710,7 +4714,7 @@ theorem multiBlockPipeline_stage2_ubWaivedWpConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl⟩
 
 /--
@@ -4756,7 +4760,7 @@ theorem multiBlockPipelineUbExceptionClaim_strictDomain_nonVacuous :
   ⟨[.scalar { bits := 42, sizeBytes := 4 }],
    (initMachineState multiBlockPipelineBody
      [.scalar { bits := 42, sizeBytes := 4 }]).memory,
-   ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩,
+   ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩,
    rfl⟩
 
 /--
@@ -4770,7 +4774,7 @@ theorem multiBlockPipelineUbExceptionClaim_waivedDomain_nonVacuous :
   ⟨[.scalar { bits := 42, sizeBytes := 4 }],
    (initMachineStateWithCallees multiBlockPipelineBody
      [.scalar { bits := 42, sizeBytes := 4 }] [multiBlockPipelineBody]).memory,
-   ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩,
+   ⟨⟨42, by decide, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩,
    fun h => nomatch h⟩
 
 /--
@@ -4915,7 +4919,7 @@ theorem multiBlockPipeline_stage1_traceStepsConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl⟩
 
 /--
@@ -4936,7 +4940,7 @@ theorem multiBlockPipeline_stage2_traceWpConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl, rfl⟩
 
 /--
@@ -5075,7 +5079,7 @@ theorem branchingTracePipeline_stage1_traceStepsConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨1, rfl, rfl⟩
 
 /--
@@ -5095,7 +5099,7 @@ theorem branchingTracePipeline_stage2_traceWpConverges
   rcases mem with
     ⟨nextAllocId, globals, borrows, nextTag, callees, callStack,
      activeCallee, activeProtectors, nextProtector, callerLocals⟩
-  rcases h_root with ⟨rfl, rfl, rfl, rfl⟩
+  rcases h_root with ⟨rfl, rfl, rfl, rfl, rfl⟩
   exact ⟨3, rfl, rfl, rfl⟩
 
 /--
@@ -5206,7 +5210,7 @@ functions (`FF-2.1`), modeled on `Py/PureExec.lean`:
    (`Rvalue.ref`, `Rvalue.rawPtr`), dereferences a pointer
    (`ProjectionElem.deref`), reads indirect global memory, or mutates heap/borrow
    state, while permitting arbitrary value projections (`.field`, `.downcast`,
-   `.index`, `.constantIndex`, `.subslice`, `.opaqueCast`), local statements
+   `.index`, `.constantIndex`, `.subslice`), local statements
    (`storageLive`, `storageDead`, `assign`, `setDiscriminant`, `nop`, `deinit`,
    `placeMention`), and control-flow terminators (`return_`, `goto`,
    `switchInt`, `assert`, `drop`, `unreachable`).
@@ -5471,8 +5475,18 @@ def isPureConstValue : ConstValue → Bool
 
 /--
 Syntactic purity check on a `ProjectionElem`: allows arbitrary value projections
-(`.field`, `.downcast`, `.index`, `.constantIndex`, `.subslice`, `.opaqueCast`)
-while rejecting pointer dereferences (`.deref`).
+(`.field`, `.downcast`, `.index`, `.constantIndex`, `.subslice`) while rejecting
+pointer dereferences (`.deref`) and the type-changing projections
+`.unwrapUnsafeBinder` and `.opaqueCast`.
+
+`.opaqueCast` is outside the pure fragment because a place that starts with an
+opaque cast is dispatched on the projections below the cast chain
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`: `Trusted`'s `stripLeadingOpaqueCast` makes
+`(_l as T)` a whole-local place), which the projected-place equations of this
+fragment do not describe. `Runtime` MIR, the phase this library lifts, never
+contains the projection (`rustc_middle::mir::RuntimePhase::Initial` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`: "beginning with this phase, the
+following variants are disallowed: ... [`PlaceElem::OpaqueCast`]").
 -/
 def isPureProjElem : ProjectionElem → Bool
   | .deref => false
@@ -5481,7 +5495,7 @@ def isPureProjElem : ProjectionElem → Bool
   | .constantIndex .. => true
   | .subslice .. => true
   | .downcast _ _ => true
-  | .opaqueCast _ => true
+  | .opaqueCast _ => false
   | .unwrapUnsafeBinder _ => false
 
 /-- Syntactic purity check on a `Place`: every projection element is pure. -/
@@ -5710,6 +5724,42 @@ theorem evalOperand_pure_eq
       cases hd <;> first | rfl | exact False.elim (Bool.false_ne_true h_pure.1)
 
 /--
+A pure operand never moves out of a place that starts with an opaque cast, so
+terminator operand evaluation (`evalOperandWithBodyCast`,
+`DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is the declaration-erased `evalOperand`.
+-/
+theorem operandIsLeadingOpaqueCastMove_eq_false_of_isPureOperand
+    {op : Operand} (h : isPureOperand op = true) :
+    operandIsLeadingOpaqueCastMove op = false := by
+  cases op with
+  | constant c => rfl
+  | copy p => rfl
+  | move p =>
+    rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+    · rfl
+    · cases hd with
+      | opaqueCast castTy => exact False.elim (Bool.false_ne_true h)
+      | _ => rfl
+
+/--
+Terminator operand evaluation of a pure operand (`evalOperandWithBodyCast`) is
+independent of the memory-derived arguments and of the active body's
+declarations.
+-/
+theorem evalOperandWithBodyCast_pure_eq
+    (locals : List LocalSlot) (op : Operand)
+    (borrows : List BorrowEntry) (globals : List CapturedAllocation)
+    (layouts : LayoutTable) (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl) (callStack : List SavedCallerFrame)
+    (h_pure : isPureOperand op = true) :
+    evalOperandWithBodyCast locals op borrows globals layouts callerLocals
+        bodyLocalDecls callStack =
+      evalOperand locals op [] [] layouts [] := by
+  rw [evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+    (operandIsLeadingOpaqueCastMove_eq_false_of_isPureOperand h_pure)]
+  exact evalOperand_pure_eq locals op borrows globals layouts callerLocals h_pure
+
+/--
 Evaluating a list of pure `Operand`s is completely independent of `borrows`,
 `globals`, `callerLocals`, and the suspended-frame `callStack`.
 -/
@@ -5797,7 +5847,10 @@ theorem resumeExternalCall_pure_returned_eq
       | .ok updatedLocals =>
         .running {
           frame := { s.frame with blockIdx := targetBb, stmtIdx := 0, locals := updatedLocals }
-          memory := invalidateDirectDestWriteBorrows retMem localsAfterArgs destination
+          memory :=
+            invalidateDirectDestWriteBorrows
+              { retMem with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+              localsAfterArgs destination
         }
       | .ub => .faulted .ub
       | .unsupported => .faulted .unsupported := by
@@ -5814,9 +5867,15 @@ theorem resumeExternalCall_pure_returned_eq
     exact h_cs.trans (writePlaceValue_pure_eq localsAfterArgs retMem.borrows destination retVal h_pure)
   have h_mem_eta :
       ({ retMem with
-         borrows := (invalidateDirectDestWriteBorrows retMem localsAfterArgs destination).borrows } : Memory) =
-        invalidateDirectDestWriteBorrows retMem localsAfterArgs destination := by
-    rcases retMem with ⟨nA, gl, _ | ⟨bHd, bTl⟩, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex⟩
+         borrows :=
+           (invalidateDirectDestWriteBorrows
+              { retMem with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+              localsAfterArgs destination).borrows
+         rootUnwindCeiling := s.memory.rootUnwindCeiling } : Memory) =
+        invalidateDirectDestWriteBorrows
+          { retMem with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+          localsAfterArgs destination := by
+    rcases retMem with ⟨nA, gl, _ | ⟨bHd, bTl⟩, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex, ru⟩
     · rfl
     · unfold invalidateDirectDestWriteBorrows
       rcases destination with ⟨loc, _ | ⟨hd, tl⟩⟩
@@ -6922,8 +6981,8 @@ def evalAssignDst
     (s : MachineState) (dst : Place) (val : Value)
     (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
-  match dst.projection with
-  | .nil =>
+  match dst.projection, stripLeadingOpaqueCast dst.projection with
+  | .nil, _ =>
     match get? locals₁ dst.local_ with
     | .some .dead => MirStepNode.fail .ub
     | .some _ =>
@@ -6949,7 +7008,7 @@ def evalAssignDst
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
-  | .deref :: restProj =>
+  | .deref :: restProj, _ =>
     match
       evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts
         mem₁.callStack
@@ -6993,7 +7052,33 @@ def evalAssignDst
       | _ :: _ =>
         evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
     | .unsupported => MirStepNode.unsupported
-  | hd :: tl =>
+  | .opaqueCast _ :: _, .nil =>
+    match get? locals₁ dst.local_ with
+    | .some .dead => MirStepNode.fail .ub
+    | .some _ =>
+      match set? locals₁ dst.local_ (.init val) with
+      | .some locals₂ =>
+        match mem₁.activeProtectors with
+        | .nil =>
+          let borrows' :=
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | protHead :: protTail =>
+          match
+            hasProtectedWriteConflict
+              mem₁.borrows (protHead :: protTail) dst.local_ .none .nil 0 0
+              (length mem₁.callStack)
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+      | .none => MirStepNode.fail .ub
+    | .none => MirStepNode.fail .ub
+  | hd :: tl, _ =>
     evalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁ localDecls layouts
 
 theorem evalStmt_assign_eq
@@ -7015,21 +7100,146 @@ theorem evalStmt_assign_eq
     | nil => rfl
     | cons hd tl => cases hd <;> rfl
 
+/--
+A projection list whose head is not an opaque cast is not a pure opaque-cast
+chain, so `Trusted`'s `DIV-TR-OPAQUECAST-ROOT-DISPATCH` place dispatch
+(`stripLeadingOpaqueCast`) treats the place as projected.
+-/
+theorem stripLeadingOpaqueCast_cons_ne_nil_of_ne_opaqueCast
+    {hd : ProjectionElem} {tl : List ProjectionElem}
+    (h : ∀ (castTy : Ty), hd ≠ .opaqueCast castTy) :
+    stripLeadingOpaqueCast (hd :: tl) ≠ [] := by
+  cases hd with
+  | opaqueCast castTy => exact False.elim (h castTy rfl)
+  | _ => intro h_eq; cases h_eq
+
+theorem ne_deref_of_isPureProjElem
+    {hd : ProjectionElem} (h : isPureProjElem hd = true) : hd ≠ .deref := by
+  intro h_eq; subst h_eq; cases h
+
+/-- A pure projection element is not an opaque cast (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`). -/
+theorem ne_opaqueCast_of_isPureProjElem
+    {hd : ProjectionElem} (h : isPureProjElem hd = true) :
+    ∀ (castTy : Ty), hd ≠ .opaqueCast castTy := by
+  intro castTy h_eq; subst h_eq; cases h
+
+/-- A projection list with a pure head is dispatched as a projected place. -/
+theorem stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem
+    {hd : ProjectionElem} {tl : List ProjectionElem}
+    (h : isPureProjElem hd = true) :
+    stripLeadingOpaqueCast (hd :: tl) ≠ [] :=
+  stripLeadingOpaqueCast_cons_ne_nil_of_ne_opaqueCast (ne_opaqueCast_of_isPureProjElem h)
+
+/--
+A pure place is either the whole local or dispatched as a projected place: it
+is never a non-empty pure opaque-cast chain.
+-/
+theorem isPurePlace_nil_or_strip_ne_nil
+    {p : Place} (h : isPurePlace p = true) :
+    p.projection = [] ∨ stripLeadingOpaqueCast p.projection ≠ [] := by
+  rcases p with ⟨loc, _ | ⟨hd, tl⟩⟩
+  · exact Or.inl rfl
+  · refine Or.inr (stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem ?_)
+    simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h
+    exact h.1
+
+/-- Case split on `Trusted`'s `DIV-TR-OPAQUECAST-ROOT-DISPATCH` place dispatch. -/
+theorem stripLeadingOpaqueCast_eq_nil_or_ne_nil (proj : List ProjectionElem) :
+    stripLeadingOpaqueCast proj = [] ∨ stripLeadingOpaqueCast proj ≠ [] := by
+  cases stripLeadingOpaqueCast proj with
+  | nil => exact Or.inl rfl
+  | cons a b => exact Or.inr (List.cons_ne_nil a b)
+
 theorem evalAssignDst_nonDeref
     (s : MachineState) (dstLoc : Local) (hd : ProjectionElem)
     (tl : List ProjectionElem) (val : Value)
     (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (h_nd : hd ≠ .deref) :
+    (h_nd : hd ≠ .deref)
+    (h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ []) :
     evalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ localDecls layouts =
       evalAssignNonDeref s dstLoc (hd :: tl) val locals₁ mem₁ localDecls layouts := by
-  cases hd with
-  | deref => exact False.elim (h_nd rfl)
-  | _ => rfl
+  unfold evalAssignDst
+  dsimp only
+  split
+  · rename_i h; cases h
+  · rename_i h; cases h; exact False.elim (h_nd rfl)
+  · rename_i _ h; exact False.elim (h_nr h)
+  · rename_i h _; cases h; rfl
 
-theorem ne_deref_of_isPureProjElem
-    {hd : ProjectionElem} (h : isPureProjElem hd = true) : hd ≠ .deref := by
-  intro h_eq; subst h_eq; cases h
+/--
+Assignment to a pure opaque-cast chain over a local (`(_l as T) = v`) is the
+whole-local assignment `_l = v` (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
+-/
+theorem evalAssignDst_castRoot
+    (s : MachineState) (dstLoc : Local) (hd : ProjectionElem)
+    (tl : List ProjectionElem) (val : Value)
+    (locals₁ : List LocalSlot) (mem₁ : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_root : stripLeadingOpaqueCast (List.cons hd tl) = .nil) :
+    evalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ localDecls layouts =
+      evalAssignDst s ⟨dstLoc, []⟩ val locals₁ mem₁ localDecls layouts := by
+  cases hd with
+  | opaqueCast castTy =>
+    unfold evalAssignDst
+    dsimp only
+    rw [h_root]
+  | _ => cases h_root
+
+/--
+`Deinit` of a pure opaque-cast chain over a local is the whole-local `Deinit`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
+-/
+theorem evalStmt_deinit_castRoot
+    (s : MachineState) (loc : Local) (hd : ProjectionElem) (tl : List ProjectionElem)
+    (sp : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_root : stripLeadingOpaqueCast (List.cons hd tl) = .nil) :
+    evalStmt s { kind := .deinit ⟨loc, hd :: tl⟩, span := sp } localDecls layouts =
+      evalStmt s { kind := .deinit ⟨loc, []⟩, span := sp } localDecls layouts := by
+  cases hd with
+  | opaqueCast castTy =>
+    unfold evalStmt
+    dsimp only
+    rw [h_root]
+  | _ => cases h_root
+
+/--
+`SetDiscriminant` on a pure opaque-cast chain over a local is the whole-local
+`SetDiscriminant` evaluated against the cast-erased declarations
+(`eraseLeadingOpaqueCastDecls`, `DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
+-/
+theorem evalStmt_setDiscriminant_castRoot
+    (s : MachineState) (loc : Local) (hd : ProjectionElem) (tl : List ProjectionElem)
+    (variantIdx : Nat) (sp : String) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (h_root : stripLeadingOpaqueCast (List.cons hd tl) = .nil) :
+    evalStmt s { kind := .setDiscriminant ⟨loc, hd :: tl⟩ variantIdx, span := sp }
+        localDecls layouts =
+      evalStmt s { kind := .setDiscriminant ⟨loc, []⟩ variantIdx, span := sp }
+        (eraseLeadingOpaqueCastDecls localDecls layouts loc (hd :: tl)) layouts := by
+  cases hd with
+  | opaqueCast castTy =>
+    unfold evalStmt
+    dsimp only
+    rw [h_root]
+  | _ => cases h_root
+
+/--
+`Drop` of a pure opaque-cast chain over a local is the whole-local `Drop`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
+-/
+theorem evalTerminator_drop_castRoot
+    (s : MachineState) (loc : Local) (hd : ProjectionElem) (tl : List ProjectionElem)
+    (target : BasicBlockIdx) (unwind : UnwindAction) (sp : String)
+    (curBodyOpt : Option CapturedMir)
+    (h_root : stripLeadingOpaqueCast (List.cons hd tl) = .nil) :
+    evalTerminator s { kind := .drop ⟨loc, hd :: tl⟩ target unwind, span := sp } curBodyOpt =
+      evalTerminator s { kind := .drop ⟨loc, []⟩ target unwind, span := sp } curBodyOpt := by
+  cases hd with
+  | opaqueCast castTy =>
+    unfold evalTerminator
+    dsimp only
+    rw [h_root]
+  | _ => cases h_root
 
 def isOtherPhase : MirPhaseTag → Bool
   | .other _ => true
@@ -7071,7 +7281,8 @@ theorem evalStmt_setDiscriminant_nonDeref
     (s : MachineState) (loc : Local) (hd : ProjectionElem)
     (tl : List ProjectionElem) (variantIdx : Nat) (span : String)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (h_nd : hd ≠ .deref) :
+    (h_nd : hd ≠ .deref)
+    (h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ []) :
     evalStmt s ⟨.setDiscriminant ⟨loc, hd :: tl⟩ variantIdx, span⟩ localDecls layouts =
       match
         evalOperand s.frame.locals (.copy ⟨loc, hd :: tl⟩) s.memory.borrows
@@ -7109,24 +7320,29 @@ theorem evalStmt_setDiscriminant_nonDeref
       | .unsupported => MirStepNode.unsupported := by
   unfold evalStmt
   dsimp only
-  cases evalOperand s.frame.locals (.copy ⟨loc, hd :: tl⟩) s.memory.borrows
-      s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack with
-  | ub =>
-    cases hd with
-    | deref => exact False.elim (h_nd rfl)
-    | _ => rfl
-  | unsupported => rfl
-  | ok v l1 =>
-    cases v with
-    | aggregate _ fields =>
-      dsimp only
-      cases padSetDiscriminantInitFields? localDecls layouts ⟨loc, hd :: tl⟩ variantIdx fields with
-      | none => rfl
-      | some _ =>
-        cases hd with
-        | deref => exact False.elim (h_nd rfl)
-        | _ => rfl
-    | _ => rfl
+  split
+  · rename_i h; cases h
+  · rename_i _ h; exact False.elim (h_nr h)
+  · rename_i h _
+    cases h
+    cases evalOperand s.frame.locals (.copy ⟨loc, hd :: tl⟩) s.memory.borrows
+        s.memory.globals layouts s.memory.callerLocals localDecls s.memory.callStack with
+    | ub =>
+      cases hd with
+      | deref => exact False.elim (h_nd rfl)
+      | _ => rfl
+    | unsupported => rfl
+    | ok v l1 =>
+      cases v with
+      | aggregate _ fields =>
+        dsimp only
+        cases padSetDiscriminantInitFields? localDecls layouts ⟨loc, hd :: tl⟩ variantIdx fields with
+        | none => rfl
+        | some _ =>
+          cases hd with
+          | deref => exact False.elim (h_nd rfl)
+          | _ => rfl
+      | _ => rfl
 
 /--
 Evaluating a pure `Statement` from `ps.toMachineState mem₀` produces the exact
@@ -7177,15 +7393,18 @@ def evalDeinitBorrowsNil
 theorem evalStmt_deinit_borrows_nil
     {s : MachineState} {p : Place} {sp : String}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
-    (h_bor : s.memory.borrows = []) :
+    (h_bor : s.memory.borrows = [])
+    (h_nr : p.projection = [] ∨ stripLeadingOpaqueCast p.projection ≠ []) :
     evalStmt s { kind := .deinit p, span := sp } localDecls layouts =
       evalDeinitBorrowsNil s p localDecls layouts := by
-  rcases s with ⟨sFr, ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex⟩⟩
+  rcases s with ⟨sFr, ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex, ru⟩⟩
   dsimp only at h_bor
   subst h_bor
   unfold evalStmt evalDeinitBorrowsNil
-  rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
-  · dsimp only
+  rcases p with ⟨loc, proj⟩
+  dsimp only at h_nr ⊢
+  split
+  · try dsimp only
     cases get? sFr.locals loc with
     | none => rfl
     | some sl =>
@@ -7196,7 +7415,12 @@ theorem evalStmt_deinit_borrows_nil
         cases set? sFr.locals loc .uninit with
         | none => rfl
         | some _ => cases ap <;> rfl
-  · dsimp only
+  · rename_i h
+    rcases h_nr with h_nil | h_ne
+    · cases h_nil
+    · exact False.elim (h_ne h)
+  · rename_i phd ptl _
+    try dsimp only
     cases get? sFr.locals loc with
     | none => rfl
     | some sl =>
@@ -7253,8 +7477,9 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
     dsimp only [PureState.toMachineState]
     repeat' (first | rfl | split)
   | deinit p =>
-    rw [evalStmt_deinit_borrows_nil h_borrows,
-        evalStmt_deinit_borrows_nil (s := ps.toMachineState emptyMemory) rfl]
+    have h_nr := isPurePlace_nil_or_strip_ne_nil (p := p) h_pure
+    rw [evalStmt_deinit_borrows_nil h_borrows h_nr,
+        evalStmt_deinit_borrows_nil (s := ps.toMachineState emptyMemory) rfl h_nr]
     unfold evalDeinitBorrowsNil
     rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
     · dsimp only [PureState.toMachineState]
@@ -7335,8 +7560,9 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
         simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pp
         exact h_pp.1
       have h_nd := ne_deref_of_isPureProjElem h_hd
-      rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd,
-          evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd]
+      have h_nr := stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem (tl := tl) h_hd
+      rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd h_nr,
+          evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd h_nr]
       dsimp only [PureState.toMachineState]
       rw [evalOperand_pure_eq ps.env (.copy { local_ := loc, projection := hd :: tl })
         [] gl layouts cl h_op]
@@ -7415,8 +7641,9 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
       | cons hd tl =>
         simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
         have h_nd := ne_deref_of_isPureProjElem h_dst.1
-        rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd,
-            evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd]
+        have h_nr := stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem (tl := tl) h_dst.1
+        rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr,
+            evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr]
         unfold evalAssignNonDeref
         dsimp only
         cases get? locals₁ dstLoc with
@@ -7486,7 +7713,7 @@ theorem evalStmt_toMachineState_eq_withMem
       MirStepNode.withMem mem₀
         (evalStmt (ps.toMachineState emptyMemory) stmt localDecls layouts) :=
   evalStmt_toMachineState_eq_withMem_of_frameFree ps mem₀ stmt localDecls layouts
-    h_pure h_root.1 h_root.2.2.2
+    h_pure h_root.1 h_root.2.2.2.1
 
 /--
 Evaluating a pure `Terminator` from `ps.toMachineState mem₀` under
@@ -7538,14 +7765,16 @@ theorem evalTerminator_drop_borrows_nil
     {s : MachineState} {place : Place} {target : BasicBlockIdx}
     {unwind : UnwindAction} {sp : String}
     {curBodyOpt : Option CapturedMir}
-    (h_bor : s.memory.borrows = []) :
+    (h_bor : s.memory.borrows = [])
+    (h_nr : place.projection = [] ∨ stripLeadingOpaqueCast place.projection ≠ []) :
     evalTerminator s { kind := .drop place target unwind, span := sp } curBodyOpt =
       evalDropBorrowsNil s place target curBodyOpt := by
-  rcases s with ⟨sFr, ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex⟩⟩
+  rcases s with ⟨sFr, ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex, ru⟩⟩
   dsimp only at h_bor
   subst h_bor
   unfold evalTerminator evalDropBorrowsNil
   rcases place with ⟨loc, proj⟩
+  dsimp only at h_nr
   cases curBodyOpt <;>
   · dsimp only
     cases get? sFr.locals loc with
@@ -7555,27 +7784,33 @@ theorem evalTerminator_drop_borrows_nil
       | dead => rfl
       | uninit =>
         dsimp only
-        cases proj with
-        | nil =>
-          dsimp only
+        split
+        · try dsimp only
           cases set? sFr.locals loc .uninit with
           | none => rfl
           | some _ => cases ap <;> rfl
-        | cons phd ptl =>
-          dsimp only
+        · rename_i h
+          rcases h_nr with h_nil | h_ne
+          · cases h_nil
+          · exact False.elim (h_ne h)
+        · rename_i phd ptl _
+          try dsimp only
           cases deinitTailOk sFr.locals _ _ _ (phd :: ptl) with
           | false => dsimp only; cases projectionHasDeref (phd :: ptl) <;> rfl
           | true => cases ap <;> rfl
       | init rv =>
         dsimp only
-        cases proj with
-        | nil =>
-          dsimp only
+        split
+        · try dsimp only
           cases set? sFr.locals loc .uninit with
           | none => rfl
           | some _ => cases ap <;> rfl
-        | cons phd ptl =>
-          dsimp only
+        · rename_i h
+          rcases h_nr with h_nil | h_ne
+          · cases h_nil
+          · exact False.elim (h_ne h)
+        · rename_i phd ptl _
+          try dsimp only
           cases deinitProjectedForLocal sFr.locals _ _ loc rv (phd :: ptl) with
           | ub => rfl
           | unsupported => rfl
@@ -7593,7 +7828,7 @@ theorem evalTerminator_toMachineState_eq_withMem
       MirStepNode.withMem mem₀
         (evalTerminator (ps.toMachineState emptyMemory) term (some body)) := by
   rcases term with ⟨kind, span⟩
-  rcases h_root with ⟨h_bor, h_stack, _, h_prot⟩
+  rcases h_root with ⟨h_bor, h_stack, _, h_prot, h_ceil⟩
   cases kind with
   | goto target => rfl
   | unreachable => rfl
@@ -7608,13 +7843,14 @@ theorem evalTerminator_toMachineState_eq_withMem
       | dead => rfl
       | init retVal =>
         dsimp only
-        rcases mem₀ with ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex⟩
+        rcases mem₀ with ⟨nA, gl, bor, nT, cal, tr, cs, ac, ap, nP, cl, fp, ex, ru⟩
         dsimp only at h_bor h_stack h_prot
         subst h_bor h_stack h_prot
         cases valueContainsUninit retVal <;> rfl
   | drop p target unwind =>
-    rw [evalTerminator_drop_borrows_nil (s := ps.toMachineState mem₀) h_bor,
-        evalTerminator_drop_borrows_nil (s := ps.toMachineState emptyMemory) rfl]
+    have h_nr := isPurePlace_nil_or_strip_ne_nil (p := p) h_pure
+    rw [evalTerminator_drop_borrows_nil (s := ps.toMachineState mem₀) h_bor h_nr,
+        evalTerminator_drop_borrows_nil (s := ps.toMachineState emptyMemory) rfl h_nr]
     unfold evalDropBorrowsNil
     rcases p with ⟨loc, proj⟩
     dsimp only [PureState.toMachineState]
@@ -7645,8 +7881,10 @@ theorem evalTerminator_toMachineState_eq_withMem
     dsimp only [isPureTerminator] at h_pure
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
-    rw [evalOperand_pure_eq ps.env discr mem₀.borrows mem₀.globals body.layouts mem₀.callerLocals h_pure]
-    rw [evalOperand_pure_eq ps.env discr emptyMemory.borrows emptyMemory.globals body.layouts emptyMemory.callerLocals h_pure]
+    rw [evalOperandWithBodyCast_pure_eq ps.env discr mem₀.borrows mem₀.globals body.layouts
+      mem₀.callerLocals _ _ h_pure]
+    rw [evalOperandWithBodyCast_pure_eq ps.env discr emptyMemory.borrows emptyMemory.globals
+      body.layouts emptyMemory.callerLocals _ _ h_pure]
     cases evalOperand ps.env discr [] [] body.layouts [] with
     | ub => rfl
     | unsupported => rfl
@@ -7656,8 +7894,10 @@ theorem evalTerminator_toMachineState_eq_withMem
     dsimp only [isPureTerminator] at h_pure
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
-    rw [evalOperand_pure_eq ps.env cond mem₀.borrows mem₀.globals body.layouts mem₀.callerLocals h_pure]
-    rw [evalOperand_pure_eq ps.env cond emptyMemory.borrows emptyMemory.globals body.layouts emptyMemory.callerLocals h_pure]
+    rw [evalOperandWithBodyCast_pure_eq ps.env cond mem₀.borrows mem₀.globals body.layouts
+      mem₀.callerLocals _ _ h_pure]
+    rw [evalOperandWithBodyCast_pure_eq ps.env cond emptyMemory.borrows emptyMemory.globals
+      body.layouts emptyMemory.callerLocals _ _ h_pure]
     cases evalOperand ps.env cond [] [] body.layouts [] with
     | ub => rfl
     | unsupported => rfl
@@ -7670,13 +7910,15 @@ theorem evalTerminator_toMachineState_eq_withMem
           | true => rfl
           | false =>
             dsimp only [applyUnwindAction]
-            cases unwind <;> (try rw [h_stack]) <;> rfl
+            cases unwind <;> (try rw [h_stack]) <;>
+              (try (dsimp only [unwindFromCallStack]; rw [h_ceil])) <;> rfl
         · dsimp only
           cases Nat.beq sc.bits 1 with
           | true => rfl
           | false =>
             dsimp only [applyUnwindAction]
-            cases unwind <;> (try rw [h_stack]) <;> rfl
+            cases unwind <;> (try rw [h_stack]) <;>
+              (try (dsimp only [unwindFromCallStack]; rw [h_ceil])) <;> rfl
       | _ => rfl
   | call _ _ _ _ _ => cases h_pure
   | tailCall _ _ => cases h_pure
@@ -7684,6 +7926,8 @@ theorem evalTerminator_toMachineState_eq_withMem
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
     rw [h_stack]
+    dsimp only [unwindFromCallStack]
+    rw [h_ceil]
     rfl
   | unwindTerminate => rfl
   | inlineAsm => rfl
@@ -7864,7 +8108,7 @@ theorem PureMirStepsConverges.refl
 /-- Root-active memory witness for `emptyMemory`. -/
 @[simp]
 theorem rootActiveMemory_emptyMemory : RootActiveMemory emptyMemory :=
-  ⟨rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Fuel-free sequential composition (`PureMirConverges.bind`) over `PureState`. -/
 theorem PureMirConverges.bind
@@ -8163,8 +8407,8 @@ theorem mirWpConverges_of_pureExec_sim
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body ms
       (mirNormalPost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) := by
   have h_ms := (mirFrameSim_iff_eq_toMachineState body mem₀ ps ms).mp h_sim
@@ -8190,8 +8434,8 @@ theorem mirWpConverges_of_pureExec
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body (initMachineStateWithMemory body args mem₀)
       (mirNormalPost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) :=
   mirWpConverges_of_pureExec_sim h_pure
@@ -8211,7 +8455,7 @@ theorem mirWpConverges_of_pureExec_init
       (mirNormalPost
         (fun retVal mem' =>
           mem' = (initMachineState body args).memory ∧ post retVal)) :=
-  mirWpConverges_of_pureExec h_pure h_conv (h_root := ⟨rfl, rfl, rfl, rfl⟩)
+  mirWpConverges_of_pureExec h_pure h_conv (h_root := ⟨rfl, rfl, rfl, rfl, rfl⟩)
 
 /--
 Specialization of `mirWpConverges_of_pureExec` to
@@ -8246,8 +8490,8 @@ theorem mirWpConverges_of_pureExec_withMemoryAndCallees
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body
       (MirFuelFree.initMachineStateWithMemoryAndCallees body args mem₀ callees)
       (mirNormalPost
@@ -8267,8 +8511,8 @@ theorem mirNoCallWpConverges_of_pureExec
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirNoCallWpConverges body (initMachineStateWithMemory body args mem₀)
       (mirNormalPost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) := by
   rcases h_conv with ⟨fuel, h_wp⟩
@@ -8368,7 +8612,8 @@ theorem mirNoCallWpConverges_of_pureExec
                       dsimp only [evalStmt] at h_step
                       repeat' (first | cases h_step | split at h_step)
                     | deinit p =>
-                      rw [evalStmt_deinit_borrows_nil (s := { s with memory := emptyMemory }) rfl] at h_step
+                      rw [evalStmt_deinit_borrows_nil (s := { s with memory := emptyMemory }) rfl
+                        (isPurePlace_nil_or_strip_ne_nil (p := p) h_s)] at h_step
                       unfold evalDeinitBorrowsNil at h_step
                       rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
                       · dsimp only at h_step
@@ -8452,7 +8697,8 @@ theorem mirNoCallWpConverges_of_pureExec
                             | _ => cases h_step
                       · simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_s
                         have h_nd := ne_deref_of_isPureProjElem h_s.1
-                        rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd] at h_step
+                        rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_nd
+                          (stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem h_s.1)] at h_step
                         dsimp only [emptyMemory] at h_step
                         cases h1 : evalOperand s.frame.locals _ _ _ _ _ _ _ <;> rw [h1] at h_step
                         · rename_i rv _
@@ -8479,7 +8725,8 @@ theorem mirNoCallWpConverges_of_pureExec
                         · have h_dst := h_s.1
                           simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_dst
                           have h_nd := ne_deref_of_isPureProjElem h_dst.1
-                          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd] at h_step
+                          rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd
+                            (stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem h_dst.1)] at h_step
                           unfold evalAssignNonDeref at h_step; dsimp only at h_step
                           repeat' (first | cases h_step | split at h_step)
                       · cases h_step
@@ -8491,7 +8738,8 @@ theorem mirNoCallWpConverges_of_pureExec
                     · rcases bb with ⟨_, ⟨tkind, tspan⟩, _⟩
                       cases tkind with
                       | drop p target _ =>
-                        rw [evalTerminator_drop_borrows_nil (s := { s with memory := emptyMemory }) rfl] at h_step
+                        rw [evalTerminator_drop_borrows_nil (s := { s with memory := emptyMemory }) rfl
+                          (isPurePlace_nil_or_strip_ne_nil (p := p) h_term)] at h_step
                         unfold evalDropBorrowsNil at h_step
                         dsimp only at h_step
                         cases h1 : get? s.frame.locals p.local_ with
@@ -8548,8 +8796,8 @@ theorem mirSafeWpConverges_of_pureExec
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body (initMachineStateWithMemory body args mem₀)
       (mirSafePost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) := by
   rcases h_conv with ⟨fuel, h_wp⟩
@@ -8570,8 +8818,8 @@ theorem mirStepsConverges_of_pureExec_sim
     (h_root : RootActiveMemory mem₀ := by
       first
       | assumption
-      | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirStepsConverges body ms
       (fun ms' =>
         ∃ ps' : PureState, mid ps' ∧ MirFrameSim body mem₀ ps' ms')
@@ -9335,7 +9583,7 @@ theorem pureAdtMultiBlockStatefulClaim_nonVacuous :
       .aggregate 1 []
     ],
     (initMachineStateWithCallees pureAdtMultiBlockBody [] [pureAdtMultiBlockBody]).memory,
-    ⟨⟨10, 20, 1, [], rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl⟩⟩⟩
+    ⟨⟨10, 20, 1, [], rfl, rfl⟩, ⟨rfl, rfl, rfl, rfl, rfl⟩⟩⟩
 
 /--
 Concrete `StatefulVerificationResult` discharge for `pureAdtMultiBlockStatefulClaim`
@@ -9385,7 +9633,8 @@ leaving every other field of `mem₀` (`borrows`, `globals`, `callStack`,
 -/
 def ActiveRootMemory (_body : CapturedMir) (mem₀ mem : Memory) : Prop :=
   mem = mem₀ ∨
-  ∃ activeBody : CapturedMir, mem = { mem₀ with activeCallee := some activeBody }
+  ∃ (activeBody : CapturedMir) (ruc : Bool),
+    mem = { mem₀ with activeCallee := some activeBody, rootUnwindCeiling := ruc }
 
 @[simp]
 theorem ActiveRootMemory.refl (body : CapturedMir) (mem₀ : Memory) :
@@ -9400,18 +9649,20 @@ theorem ActiveRootMemory.of_eq
 theorem ActiveRootMemory.with_some
     (body activeBody : CapturedMir) (mem₀ : Memory) :
     ActiveRootMemory body mem₀ { mem₀ with activeCallee := some activeBody } :=
-  Or.inr ⟨activeBody, rfl⟩
+  Or.inr ⟨activeBody, mem₀.rootUnwindCeiling, rfl⟩
 
 theorem ActiveRootMemory.with_some_body
     (body : CapturedMir) (mem₀ : Memory) :
     ActiveRootMemory body mem₀ { mem₀ with activeCallee := some body } :=
-  Or.inr ⟨body, rfl⟩
+  Or.inr ⟨body, mem₀.rootUnwindCeiling, rfl⟩
 
 theorem ActiveRootMemory.trans_with_some_body
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     ActiveRootMemory body mem₀ { mem with activeCallee := some body } := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> exact Or.inr ⟨body, rfl⟩
+  rcases h with rfl | ⟨_, ruc, rfl⟩
+  · exact Or.inr ⟨body, mem.rootUnwindCeiling, rfl⟩
+  · exact Or.inr ⟨body, ruc, rfl⟩
 
 theorem ActiveRootMemory.activeCallee_getD
     {body : CapturedMir} {mem₀ mem : Memory}
@@ -9426,62 +9677,62 @@ theorem ActiveRootMemory.borrows_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.borrows = mem₀.borrows := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.callStack_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.callStack = mem₀.callStack := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.activeProtectors_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.activeProtectors = mem₀.activeProtectors := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.callees_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.callees = mem₀.callees := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.traitImpls_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.traitImpls = mem₀.traitImpls := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.globals_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.globals = mem₀.globals := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.nextAllocId_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.nextAllocId = mem₀.nextAllocId := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.callerLocals_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.callerLocals = mem₀.callerLocals := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.fnPtrs_eq
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
     mem.fnPtrs = mem₀.fnPtrs := by
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 theorem ActiveRootMemory.restore_activeCallee
     {body : CapturedMir} {mem₀ mem : Memory}
     (h : ActiveRootMemory body mem₀ mem) :
-    { mem with activeCallee := mem₀.activeCallee } = mem₀ := by
+    { mem with activeCallee := mem₀.activeCallee, rootUnwindCeiling := mem₀.rootUnwindCeiling } = mem₀ := by
   cases mem₀
-  rcases h with rfl | ⟨_, rfl⟩ <;> rfl
+  rcases h with rfl | ⟨_, _, rfl⟩ <;> rfl
 
 /--
 Callee-aware frame simulation between alias-erased `ps : PureState` and full
@@ -9525,8 +9776,12 @@ def Memory.pushBaseStack
     callStack :=
       match baseStack with
       | [] => m.callStack
-      | _ :: _ => m.callStack ++ baseStack
-    activeCallee := some (m.activeCallee.getD calleeBody) }
+      | b :: bs => m.callStack ++ narrowCallStackForTailCallee (b :: bs) m.rootUnwindCeiling
+    activeCallee := some (m.activeCallee.getD calleeBody)
+    rootUnwindCeiling :=
+      match baseStack with
+      | [] => m.rootUnwindCeiling
+      | _ :: _ => true }
 
 /-- Lift `Memory.pushBaseStack` to `MachineState`. -/
 def MachineState.pushBaseStack
@@ -10376,9 +10631,9 @@ theorem Memory.pushBaseStack_callStack
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (mem : Memory) :
     (Memory.pushBaseStack calleeBody baseStack mem).callStack =
-      mem.callStack ++ baseStack := by
+      mem.callStack ++ narrowCallStackForTailCallee baseStack mem.rootUnwindCeiling := by
   cases baseStack with
-  | nil => exact (List.append_nil mem.callStack).symm
+  | nil => cases mem.rootUnwindCeiling <;> exact (List.append_nil mem.callStack).symm
   | cons _ _ => rfl
 
 @[simp]
@@ -10486,94 +10741,6 @@ def copyWriteDstVal
           (advanceStmt s locals₃
             { s.memory with borrows := borrows', callerLocals := callerLocals' })
 
-def copyViaBytesBody
-    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
-    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
-    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) : MirStepNode :=
-  let n := countBits
-  let srcStart := srcPtr.offsetBytes
-  let dstStart := dstPtr.offsetBytes
-  let overlaps :=
-    match Nat.beq srcPtr.tag dstPtr.tag with
-    | true => true
-    | false =>
-      match Nat.beq srcEntry.targetLocal dstEntry.targetLocal with
-      | false => false
-      | true => projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection
-  match overlaps with
-  | true => MirStepNode.fail .ub
-  | false =>
-    let srcSliceVal : Option Value :=
-      match srcSubVal with
-      | .aggregate 0 srcElems =>
-        match Nat.ble (Nat.add srcStart n) (length srcElems) with
-        | true => .some (.aggregate 0 (takeValues n (dropValues srcStart srcElems)))
-        | false =>
-          match Nat.beq srcStart 0 with
-          | true => .some srcSubVal
-          | false => .none
-      | _ => .some srcSubVal
-    let dstTargetTyOpt : Option Ty :=
-      match dstLocalPlaceTy with
-      | .some t => .some t
-      | .none => operandPointeeTy localDecls layouts dst
-    match srcSliceVal with
-    | .none => MirStepNode.fail .ub
-    | .some sVal =>
-      match encodeUntypedValueToBytes defaultCodecFuel sVal with
-      | .none => MirStepNode.unsupported
-      | .some bs =>
-        let spliceBytesToDstArray : Option Value :=
-          match Bool.not dstIsAdt, dstSubVal with
-          | true, .aggregate 0 dstElems =>
-            match Nat.ble (Nat.add dstStart (length bs)) (length dstElems) with
-            | false => .none
-            | true =>
-              match decodeArrayChunksWith
-                  (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                  1 (length bs) bs with
-              | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstStart dstElems))
-              | .none => .none
-          | _, _ => .none
-        let preferSplicedArray : Bool :=
-          match dstLocalPlaceTy, dstSubVal with
-          | .none, .aggregate 0 _ => true
-          | _, _ => false
-        match preferSplicedArray, spliceBytesToDstArray with
-        | true, .some splicedVal =>
-          copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
-        | _, _ =>
-          match dstTargetTyOpt with
-          | .some dstPt =>
-            match rigidTyByteSize layouts dstPt with
-            | .some dstBytes =>
-              match Nat.beq (length bs) dstBytes with
-              | true =>
-                match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                | .some decodedVal =>
-                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag decodedVal localDecls layouts
-                | .none =>
-                  match spliceBytesToDstArray with
-                  | .some splicedVal =>
-                    copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
-                  | .none => MirStepNode.fail .ub
-              | false =>
-                match spliceBytesToDstArray with
-                | .some splicedVal =>
-                  copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
-                | .none => MirStepNode.unsupported
-            | .none =>
-              match spliceBytesToDstArray with
-              | .some splicedVal =>
-                copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
-              | .none => MirStepNode.unsupported
-          | .none =>
-            match spliceBytesToDstArray with
-            | .some splicedVal =>
-              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag splicedVal localDecls layouts
-            | .none => MirStepNode.fail .ub
-
 def evalCopyNonOverlappingPermOk
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
@@ -10601,80 +10768,7 @@ def evalCopyNonOverlappingPermOk
     | true =>
       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
     | false =>
-      let srcRootSlot : Option LocalSlot :=
-        match get? locals₃ srcEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals srcEntry.targetLocal with
-          | .some slot => .some slot
-          | .none => get? s.memory.callerLocals (Nat.sub srcEntry.targetLocal (length locals₃))
-      let dstRootSlot : Option LocalSlot :=
-        match get? locals₃ dstEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals dstEntry.targetLocal with
-          | .some slot => .some slot
-          | .none => get? s.memory.callerLocals (Nat.sub dstEntry.targetLocal (length locals₃))
-      match srcRootSlot, dstRootSlot with
-      | .some (.init srcRootVal), .some (.init dstRootVal) =>
-        let dstPlace : Place := {
-          local_ := dstEntry.targetLocal
-          projection := dstEntry.targetProjection
-        }
-        let dstLocalPlaceTy : Option Ty :=
-          match get? locals₃ dstPlace.local_ with
-          | .some _ => placeTy localDecls layouts dstPlace
-          | .none => .none
-        let dstIsAdt : Bool :=
-          match dstLocalPlaceTy with
-          | .some { kind := .adt _ _, .. } => true
-          | _ => false
-        match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
-              readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
-        | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-          let inBounds :=
-            Bool.and (Bool.not dstIsAdt)
-              (Bool.and (Nat.ble (Nat.add srcStart n) (length srcElems))
-                (Nat.ble (Nat.add dstStart n) (length dstElems)))
-          match inBounds with
-          | false =>
-            match Bool.and (Nat.beq dstStart 0) (Nat.ble (Nat.add srcStart n) (length srcElems)) with
-            | true =>
-              copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-                countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt
-                (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-            | false => MirStepNode.fail .ub
-          | true =>
-            let sameContainer :=
-              Bool.and (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                (projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection)
-            let disjoint :=
-              match Nat.beq srcPtr.tag dstPtr.tag with
-              | true => false
-              | false =>
-                match sameContainer with
-                | false => true
-                | true =>
-                  Bool.or (Nat.ble (Nat.add srcStart n) dstStart)
-                    (Nat.ble (Nat.add dstStart n) srcStart)
-            match disjoint with
-            | false => MirStepNode.fail .ub
-            | true =>
-              let copiedSlice := takeValues n (dropValues srcStart srcElems)
-              let dstElems' := spliceValues copiedSlice dstStart dstElems
-              copyWriteDstVal s locals₃ dstPlace dstEntry.targetLocal dstPtr.tag
-                (.aggregate 0 dstElems') localDecls layouts
-        | .ok srcSubVal, .ok dstSubVal =>
-          copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-            countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
-        | .ok srcSubVal, .ub =>
-          match Nat.beq dstStart 0 with
-          | true =>
-            copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-              countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal .unit
-          | false => MirStepNode.fail .ub
-        | _, _ => MirStepNode.fail .ub
-      | _, _ => MirStepNode.fail .ub
+      evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃
 
 theorem evalCopyNonOverlappingWithCount_eq
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
@@ -10765,33 +10859,64 @@ theorem commitCopyDstPlaceWrite_eq_copyWriteDstVal
       copyWriteDstVal s locals₃ dstPlace dstLoc dstTag newVal localDecls layouts :=
   rfl
 
-theorem copyViaBytesBody_pushBaseStack
+theorem commitCopyDstPlaceWriteWithBorrows_pushBaseStack
     (calleeBody : CapturedMir)
-    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
-    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
-    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
-    copyViaBytesBody (MachineState.pushBaseStack calleeBody [] s)
-        dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits
-        locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal =
+    (s : MachineState) (dstPlace : Place) (locals₃ : List LocalSlot) (newVal : Value)
+    (borrows' : List BorrowEntry) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    commitCopyDstPlaceWriteWithBorrows (MachineState.pushBaseStack calleeBody [] s)
+        dstPlace locals₃ newVal borrows' localDecls layouts =
       MirStepNode.pushBaseStack calleeBody []
-        (copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-          countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
-  unfold copyViaBytesBody
-  dsimp only
-  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | exact copyWriteDstVal_pushBaseStack .. | split)
+        (commitCopyDstPlaceWriteWithBorrows s dstPlace locals₃ newVal borrows' localDecls
+          layouts) := by
+  unfold commitCopyDstPlaceWriteWithBorrows
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
-theorem copyViaBytesBody_isStmtNode
-    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
-    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
-    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
-    IsStmtNode (copyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-      countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
-  unfold copyViaBytesBody
+theorem commitCopyDstPlaceWriteWithBorrows_isStmtNode
+    (s : MachineState) (dstPlace : Place) (locals₃ : List LocalSlot) (newVal : Value)
+    (borrows' : List BorrowEntry) (localDecls : List LocalDecl) (layouts : LayoutTable) :
+    IsStmtNode
+      (commitCopyDstPlaceWriteWithBorrows s dstPlace locals₃ newVal borrows' localDecls
+        layouts) := by
+  unfold commitCopyDstPlaceWriteWithBorrows
   dsimp only
   repeat' (first
-    | exact copyWriteDstVal_isStmtNode ..
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
+
+/-- The multi-element / offset sub-place copy (`evalCopySubplaceMulti`) reads the machine state
+only through `Memory.borrows`, `Memory.activeProtectors`, `Memory.callerLocals`, and
+`Memory.callStack`, so it commutes with pushing an empty base stack. -/
+theorem evalCopySubplaceMulti_pushBaseStack
+    (calleeBody : CapturedMir)
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    evalCopySubplaceMulti (MachineState.pushBaseStack calleeBody [] s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃ =
+      MirStepNode.pushBaseStack calleeBody []
+        (evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+          countBits locals₃) := by
+  unfold evalCopySubplaceMulti
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first
+    | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl
+    | exact commitCopyDstPlaceWriteWithBorrows_pushBaseStack ..
+    | split)
+
+theorem evalCopySubplaceMulti_isStmtNode
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    IsStmtNode
+      (evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        countBits locals₃) := by
+  unfold evalCopySubplaceMulti
+  repeat' (first
+    | exact commitCopyDstPlaceWriteWithBorrows_isStmtNode ..
+    | exact Or.inl ⟨_, rfl⟩
     | exact Or.inr (Or.inl ⟨_, rfl⟩)
     | exact Or.inr (Or.inr rfl)
     | split)
@@ -10864,7 +10989,7 @@ theorem evalCopyNonOverlappingPermOk_pushBaseStack
     | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl
     | exact evalCopyUnionBytes_pushBaseStack ..
     | exact evalCopySingleDirect_pushBaseStack ..
-    | exact copyViaBytesBody_pushBaseStack ..
+    | exact evalCopySubplaceMulti_pushBaseStack ..
     | exact copyWriteDstVal_pushBaseStack ..
     | split)
 
@@ -10881,7 +11006,7 @@ theorem evalCopyNonOverlappingPermOk_isStmtNode
   repeat' (first
     | exact evalCopyUnionBytes_isStmtNode ..
     | exact evalCopySingleDirect_isStmtNode ..
-    | exact copyViaBytesBody_isStmtNode ..
+    | exact evalCopySubplaceMulti_isStmtNode ..
     | exact copyWriteDstVal_isStmtNode ..
     | exact Or.inl ⟨_, rfl⟩
     | exact Or.inr (Or.inl ⟨_, rfl⟩)
@@ -11202,7 +11327,8 @@ theorem writeReturnDestination_nonDeref
     (callerLocals : List LocalSlot) (mem : Memory) (loc : Local)
     (hd : ProjectionElem) (tl : List ProjectionElem)
     (retVal : Value) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (h_nd : hd ≠ .deref) :
+    (h_nd : hd ≠ .deref)
+    (h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ []) :
     writeReturnDestination callerLocals mem ⟨loc, hd :: tl⟩ retVal localDecls layouts =
       let depth := length mem.callStack
       let resolvedLocalProj :=
@@ -11235,9 +11361,13 @@ theorem writeReturnDestination_nonDeref
             | .none => .ub
           | .ub => .ub
           | .unsupported => .unsupported := by
-  cases hd with
-  | deref => exact False.elim (h_nd rfl)
-  | _ => rfl
+  unfold writeReturnDestination
+  dsimp only
+  split
+  · rename_i h; cases h
+  · rename_i h; cases h; exact False.elim (h_nd rfl)
+  · rename_i _ h; exact False.elim (h_nr h)
+  · rename_i h _; cases h; rfl
 
 private theorem evalFnEntryRetag_pushBaseStack
     (calleeBody : CapturedMir) (s : MachineState) (ld : List LocalDecl) (ly : LayoutTable)
@@ -11318,10 +11448,16 @@ private theorem evalStmt_setDiscriminant_pushBaseStack
               | exact step_push_step rfl
               | exact h_sdw _ _ _
               | split)
-    · rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d,
-          evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d]
-      dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-      repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+    · rcases stripLeadingOpaqueCast_eq_nil_or_ne_nil (phd :: ptl) with h_s | h_nr
+      · rw [evalStmt_setDiscriminant_castRoot _ _ _ _ _ _ _ _ h_s,
+            evalStmt_setDiscriminant_castRoot _ _ _ _ _ _ _ _ h_s]
+        unfold evalStmt evalSetDiscriminantLocal
+        dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+        repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+      · rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d h_nr,
+            evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d h_nr]
+        dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+        repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 private theorem evalStmt_deinit_pushBaseStack
     (calleeBody : CapturedMir) (s : MachineState) (p : Place) (span : String)
@@ -11331,72 +11467,8 @@ private theorem evalStmt_deinit_pushBaseStack
       MirStepNode.pushBaseStack calleeBody []
         (evalStmt s { kind := .deinit p, span := span } localDecls layouts) := by
   unfold evalStmt
-  rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
-  · dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-    cases get? s.frame.locals loc with
-    | none => exact step_push_fail
-    | some sl =>
-      cases sl with
-      | dead => exact step_push_fail
-      | uninit | init _ =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact step_push_fail
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact step_push_step rfl
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact step_push_fail
-            | false => exact step_push_step rfl
-  · dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-    cases get? s.frame.locals loc with
-    | none => exact step_push_fail
-    | some sl =>
-      cases sl with
-      | dead => exact step_push_fail
-      | uninit =>
-        dsimp only
-        cases deinitTailOk s.frame.locals localDecls layouts
-            (placeTy localDecls layouts { local_ := loc, projection := .nil })
-            (phd :: ptl) with
-        | false =>
-          dsimp only
-          cases projectionHasDeref (phd :: ptl) with
-          | true => exact step_push_unsupported
-          | false => exact step_push_fail
-        | true =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact step_push_step rfl
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                (length s.memory.callStack) with
-            | true => exact step_push_fail
-            | false => exact step_push_step rfl
-      | init rv =>
-        dsimp only
-        cases deinitProjectedForLocal s.frame.locals localDecls layouts loc rv (phd :: ptl) with
-        | ub => exact step_push_fail
-        | unsupported => exact step_push_unsupported
-        | ok rv' =>
-          dsimp only
-          cases set? s.frame.locals loc (.init rv') with
-          | none => exact step_push_fail
-          | some _ =>
-            dsimp only
-            cases s.memory.activeProtectors with
-            | nil => exact step_push_step rfl
-            | cons ph pt =>
-              dsimp only
-              cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                  (length s.memory.callStack) with
-              | true => exact step_push_fail
-              | false => exact step_push_step rfl
+  dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 theorem evalTerminator_drop_pushBaseStack_nil
     (calleeBody : CapturedMir) (s : MachineState)
@@ -11407,84 +11479,8 @@ theorem evalTerminator_drop_pushBaseStack_nil
       MirStepNode.pushBaseStack calleeBody []
         (evalTerminator s { kind := .drop place target unwind, span := sp } curOpt) := by
   unfold evalTerminator
-  rcases place with ⟨loc, proj⟩
   dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
-  cases get? s.frame.locals loc with
-  | none => exact step_push_fail
-  | some sl =>
-    cases sl with
-    | dead => exact step_push_fail
-    | uninit =>
-      dsimp only
-      cases proj with
-      | nil =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact step_push_fail
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact step_push_step rfl
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact step_push_fail
-            | false => exact step_push_step rfl
-      | cons phd ptl =>
-        dsimp only
-        cases deinitTailOk s.frame.locals _ _ _ (phd :: ptl) with
-        | false =>
-          dsimp only
-          cases projectionHasDeref (phd :: ptl) with
-          | true => exact step_push_unsupported
-          | false => exact step_push_fail
-        | true =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact step_push_step rfl
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                (length s.memory.callStack) with
-            | true => exact step_push_fail
-            | false => exact step_push_step rfl
-    | init rv =>
-      dsimp only
-      cases proj with
-      | nil =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact step_push_fail
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact step_push_step rfl
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact step_push_fail
-            | false => exact step_push_step rfl
-      | cons phd ptl =>
-        dsimp only
-        cases deinitProjectedForLocal s.frame.locals _ _ loc rv (phd :: ptl) with
-        | ub => exact step_push_fail
-        | unsupported => exact step_push_unsupported
-        | ok rv' =>
-          dsimp only
-          cases set? s.frame.locals loc (.init rv') with
-          | none => exact step_push_fail
-          | some _ =>
-            dsimp only
-            cases s.memory.activeProtectors with
-            | nil => exact step_push_step rfl
-            | cons ph pt =>
-              dsimp only
-              cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                  (length s.memory.callStack) with
-              | true => exact step_push_fail
-              | false => exact step_push_step rfl
+  repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 theorem evalTerminator_drop_pushBaseStack_borrows_nil
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame) (s : MachineState)
@@ -11495,52 +11491,67 @@ theorem evalTerminator_drop_pushBaseStack_borrows_nil
         { kind := .drop place target unwind, span := sp } curOpt =
       MirStepNode.pushBaseStack calleeBody baseStack
         (evalTerminator s { kind := .drop place target unwind, span := sp } curOpt) := by
-  have h_pbs_bor : (MachineState.pushBaseStack calleeBody baseStack s).memory.borrows = [] := h_bor
-  rw [evalTerminator_drop_borrows_nil (s := MachineState.pushBaseStack calleeBody baseStack s) h_pbs_bor,
-      evalTerminator_drop_borrows_nil (s := s) h_bor]
-  unfold evalDropBorrowsNil
   rcases place with ⟨loc, proj⟩
-  dsimp only [MachineState.pushBaseStack]
-  cases get? s.frame.locals loc with
-  | none => exact step_push_fail
-  | some sl =>
-    cases sl with
-    | dead => exact step_push_fail
-    | uninit =>
-      dsimp only
-      cases proj with
-      | nil =>
+  have h_main : ∀ (proj : List ProjectionElem),
+      (proj = [] ∨ stripLeadingOpaqueCast proj ≠ []) →
+      evalTerminator (MachineState.pushBaseStack calleeBody baseStack s)
+          { kind := .drop ⟨loc, proj⟩ target unwind, span := sp } curOpt =
+        MirStepNode.pushBaseStack calleeBody baseStack
+          (evalTerminator s { kind := .drop ⟨loc, proj⟩ target unwind, span := sp } curOpt) := by
+    intro proj h_nr
+    have h_pbs_bor : (MachineState.pushBaseStack calleeBody baseStack s).memory.borrows = [] := h_bor
+    rw [evalTerminator_drop_borrows_nil (s := MachineState.pushBaseStack calleeBody baseStack s) h_pbs_bor h_nr,
+        evalTerminator_drop_borrows_nil (s := s) h_bor h_nr]
+    unfold evalDropBorrowsNil
+    dsimp only [MachineState.pushBaseStack]
+    cases get? s.frame.locals loc with
+    | none => exact step_push_fail
+    | some sl =>
+      cases sl with
+      | dead => exact step_push_fail
+      | uninit =>
         dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact step_push_fail
-        | some _ => exact step_push_step rfl
-      | cons phd ptl =>
-        dsimp only
-        cases deinitTailOk s.frame.locals _ _ _ (phd :: ptl) with
-        | true => exact step_push_step rfl
-        | false =>
+        cases proj with
+        | nil =>
           dsimp only
-          cases projectionHasDeref (phd :: ptl) with
-          | true => exact step_push_unsupported
-          | false => exact step_push_fail
-    | init rv =>
-      dsimp only
-      cases proj with
-      | nil =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact step_push_fail
-        | some _ => exact step_push_step rfl
-      | cons phd ptl =>
-        dsimp only
-        cases deinitProjectedForLocal s.frame.locals _ _ loc rv (phd :: ptl) with
-        | ub => exact step_push_fail
-        | unsupported => exact step_push_unsupported
-        | ok rv' =>
-          dsimp only
-          cases set? s.frame.locals loc (.init rv') with
+          cases set? s.frame.locals loc .uninit with
           | none => exact step_push_fail
           | some _ => exact step_push_step rfl
+        | cons phd ptl =>
+          dsimp only
+          cases deinitTailOk s.frame.locals _ _ _ (phd :: ptl) with
+          | true => exact step_push_step rfl
+          | false =>
+            dsimp only
+            cases projectionHasDeref (phd :: ptl) with
+            | true => exact step_push_unsupported
+            | false => exact step_push_fail
+      | init rv =>
+        dsimp only
+        cases proj with
+        | nil =>
+          dsimp only
+          cases set? s.frame.locals loc .uninit with
+          | none => exact step_push_fail
+          | some _ => exact step_push_step rfl
+        | cons phd ptl =>
+          dsimp only
+          cases deinitProjectedForLocal s.frame.locals _ _ loc rv (phd :: ptl) with
+          | ub => exact step_push_fail
+          | unsupported => exact step_push_unsupported
+          | ok rv' =>
+            dsimp only
+            cases set? s.frame.locals loc (.init rv') with
+            | none => exact step_push_fail
+            | some _ => exact step_push_step rfl
+  cases proj with
+  | nil => exact h_main [] (Or.inl rfl)
+  | cons hd tl =>
+    rcases stripLeadingOpaqueCast_eq_nil_or_ne_nil (hd :: tl) with h_s | h_nr
+    · rw [evalTerminator_drop_castRoot _ _ _ _ _ _ _ _ h_s,
+          evalTerminator_drop_castRoot _ _ _ _ _ _ _ _ h_s]
+      exact h_main [] (Or.inl rfl)
+    · exact h_main (hd :: tl) (Or.inr h_nr)
 
 theorem evalStmt_pushBaseStack
     (calleeBody : CapturedMir)
@@ -11600,11 +11611,17 @@ theorem evalStmt_pushBaseStack
           unfold evalAssignDst
           dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
           repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | exact h_ff | split)
-        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d,
-              evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
-          unfold evalAssignNonDeref
-          dsimp only [Memory.pushBaseStack]
-          repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+        · rcases stripLeadingOpaqueCast_eq_nil_or_ne_nil (hd :: tl) with h_s | h_nr
+          · rw [evalAssignDst_castRoot _ _ _ _ _ _ _ _ _ h_s,
+                evalAssignDst_castRoot _ _ _ _ _ _ _ _ _ h_s]
+            unfold evalAssignDst
+            dsimp only [Memory.pushBaseStack]
+            repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
+          · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr,
+                evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr]
+            unfold evalAssignNonDeref
+            dsimp only [Memory.pushBaseStack]
+            repeat' (first | exact step_push_fail | exact step_push_unsupported | exact step_push_step rfl | split)
 
 private theorem evalFnEntryRetag_isStmtNode
     (s : MachineState) (ld : List LocalDecl) (ly : LayoutTable)
@@ -11662,84 +11679,32 @@ private theorem evalStmt_setDiscriminant_isStmtNode
         | exact Or.inr (Or.inr rfl)
         | exact evalSetDiscriminantDerefWrite_isStmtNode ..
         | split)
-    · rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d]; dsimp only
-      repeat' (first
-        | exact Or.inl ⟨_, rfl⟩
-        | exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | exact Or.inr (Or.inr rfl)
-        | split)
+    · rcases stripLeadingOpaqueCast_eq_nil_or_ne_nil (phd :: ptl) with h_s | h_nr
+      · rw [evalStmt_setDiscriminant_castRoot _ _ _ _ _ _ _ _ h_s]
+        unfold evalStmt evalSetDiscriminantLocal; dsimp only
+        repeat' (first
+          | exact Or.inl ⟨_, rfl⟩
+          | exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | exact Or.inr (Or.inr rfl)
+          | split)
+      · rw [evalStmt_setDiscriminant_nonDeref _ _ _ _ _ _ _ _ h_d h_nr]; dsimp only
+        repeat' (first
+          | exact Or.inl ⟨_, rfl⟩
+          | exact Or.inr (Or.inl ⟨_, rfl⟩)
+          | exact Or.inr (Or.inr rfl)
+          | split)
 
 private theorem evalStmt_deinit_isStmtNode
     (s : MachineState) (p : Place) (sp : String)
     (localDecls : List LocalDecl) (layouts : LayoutTable) :
     IsStmtNode (evalStmt s { kind := .deinit p, span := sp } localDecls layouts) := by
   unfold evalStmt
-  rcases p with ⟨loc, _ | ⟨phd, ptl⟩⟩
-  · dsimp only
-    cases get? s.frame.locals loc with
-    | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-    | some sl =>
-      cases sl with
-      | dead => exact Or.inr (Or.inl ⟨_, rfl⟩)
-      | uninit | init _ =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact Or.inl ⟨_, rfl⟩
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | false => exact Or.inl ⟨_, rfl⟩
-  · dsimp only
-    cases get? s.frame.locals loc with
-    | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-    | some sl =>
-      cases sl with
-      | dead => exact Or.inr (Or.inl ⟨_, rfl⟩)
-      | uninit =>
-        dsimp only
-        cases deinitTailOk s.frame.locals localDecls layouts
-            (placeTy localDecls layouts { local_ := loc, projection := .nil })
-            (phd :: ptl) with
-        | false =>
-          dsimp only
-          cases projectionHasDeref (phd :: ptl) with
-          | true => exact Or.inr (Or.inr rfl)
-          | false => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | true =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact Or.inl ⟨_, rfl⟩
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                (length s.memory.callStack) with
-            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | false => exact Or.inl ⟨_, rfl⟩
-      | init rv =>
-        dsimp only
-        cases deinitProjectedForLocal s.frame.locals localDecls layouts loc rv (phd :: ptl) with
-        | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | unsupported => exact Or.inr (Or.inr rfl)
-        | ok rv' =>
-          dsimp only
-          cases set? s.frame.locals loc (.init rv') with
-          | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | some _ =>
-            dsimp only
-            cases s.memory.activeProtectors with
-            | nil => exact Or.inl ⟨_, rfl⟩
-            | cons ph pt =>
-              dsimp only
-              cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                  (length s.memory.callStack) with
-              | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-              | false => exact Or.inl ⟨_, rfl⟩
+  dsimp only
+  repeat' (first
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
 
 theorem evalTerminator_drop_isStmtNode
     (s : MachineState) (place : Place) (target : BasicBlockIdx)
@@ -11747,84 +11712,12 @@ theorem evalTerminator_drop_isStmtNode
     (curOpt : Option CapturedMir) :
     IsStmtNode (evalTerminator s { kind := .drop place target unwind, span := sp } curOpt) := by
   unfold evalTerminator
-  rcases place with ⟨loc, proj⟩
   dsimp only
-  cases get? s.frame.locals loc with
-  | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-  | some sl =>
-    cases sl with
-    | dead => exact Or.inr (Or.inl ⟨_, rfl⟩)
-    | uninit =>
-      dsimp only
-      cases proj with
-      | nil =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact Or.inl ⟨_, rfl⟩
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | false => exact Or.inl ⟨_, rfl⟩
-      | cons phd ptl =>
-        dsimp only
-        cases deinitTailOk s.frame.locals _ _ _ (phd :: ptl) with
-        | false =>
-          dsimp only
-          cases projectionHasDeref (phd :: ptl) with
-          | true => exact Or.inr (Or.inr rfl)
-          | false => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | true =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact Or.inl ⟨_, rfl⟩
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                (length s.memory.callStack) with
-            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | false => exact Or.inl ⟨_, rfl⟩
-    | init rv =>
-      dsimp only
-      cases proj with
-      | nil =>
-        dsimp only
-        cases set? s.frame.locals loc .uninit with
-        | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | some _ =>
-          dsimp only
-          cases s.memory.activeProtectors with
-          | nil => exact Or.inl ⟨_, rfl⟩
-          | cons ph pt =>
-            dsimp only
-            cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none .nil 0 0
-                (length s.memory.callStack) with
-            | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | false => exact Or.inl ⟨_, rfl⟩
-      | cons phd ptl =>
-        dsimp only
-        cases deinitProjectedForLocal s.frame.locals _ _ loc rv (phd :: ptl) with
-        | ub => exact Or.inr (Or.inl ⟨_, rfl⟩)
-        | unsupported => exact Or.inr (Or.inr rfl)
-        | ok rv' =>
-          dsimp only
-          cases set? s.frame.locals loc (.init rv') with
-          | none => exact Or.inr (Or.inl ⟨_, rfl⟩)
-          | some _ =>
-            dsimp only
-            cases s.memory.activeProtectors with
-            | nil => exact Or.inl ⟨_, rfl⟩
-            | cons ph pt =>
-              dsimp only
-              cases hasProtectedWriteConflict s.memory.borrows (ph :: pt) loc .none _ 0 0
-                  (length s.memory.callStack) with
-              | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
-              | false => exact Or.inl ⟨_, rfl⟩
+  repeat' (first
+    | exact Or.inl ⟨_, rfl⟩
+    | exact Or.inr (Or.inl ⟨_, rfl⟩)
+    | exact Or.inr (Or.inr rfl)
+    | split)
 
 theorem evalStmt_isStmtNode
     (s : MachineState) (stmt : Statement)
@@ -11946,13 +11839,21 @@ theorem evalStmt_isStmtNode
                   cases derefWriteTreeUB locals₁ mem₁.borrows ⟨dstLoc, .deref :: tl⟩ with
                   | true => exact Or.inr (Or.inl ⟨_, rfl⟩)
                   | false => exact Or.inl ⟨_, rfl⟩
-        · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
-          unfold evalAssignNonDeref; dsimp only
-          repeat' (first
-            | exact Or.inl ⟨_, rfl⟩
-            | exact Or.inr (Or.inl ⟨_, rfl⟩)
-            | exact Or.inr (Or.inr rfl)
-            | split)
+        · rcases stripLeadingOpaqueCast_eq_nil_or_ne_nil (hd :: tl) with h_s | h_nr
+          · rw [evalAssignDst_castRoot _ _ _ _ _ _ _ _ _ h_s]
+            unfold evalAssignDst; dsimp only
+            repeat' (first
+              | exact Or.inl ⟨_, rfl⟩
+              | exact Or.inr (Or.inl ⟨_, rfl⟩)
+              | exact Or.inr (Or.inr rfl)
+              | split)
+          · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr]
+            unfold evalAssignNonDeref; dsimp only
+            repeat' (first
+              | exact Or.inl ⟨_, rfl⟩
+              | exact Or.inr (Or.inl ⟨_, rfl⟩)
+              | exact Or.inr (Or.inr rfl)
+              | split)
 
 @[simp]
 theorem resolveCallTarget_pushBaseStack
@@ -11967,38 +11868,46 @@ theorem resolveCallTarget_pushBaseStack
 
 /--
 If `unwindFromCallStack stk mem` does not reach the empty stack `.nil` (i.e., it
-does not return `.halted .panic`), then appending `[]` beneath `stk`
-commutes via `MirExecState.pushBaseStack calleeBody []`.
+returns neither `.halted .panic` nor, under a `false` `rootUnwindCeiling`, the
+root `.faulted .ub`; a `.faulted .ub` from an `.unreachable` frame commutes
+anyway), then appending `baseStack` beneath `stk` commutes via
+`MirExecState.pushBaseStack calleeBody baseStack`.
 -/
 theorem unwindFromCallStack_pushBaseStack_of_ne_panic
     (calleeBody : CapturedMir) (baseStack : List SavedCallerFrame)
     (stk : List SavedCallerFrame) (mem : Memory)
     (h_no_panic : unwindFromCallStack stk mem ≠ .halted .panic)
+    (h_no_ub : unwindFromCallStack stk mem ≠ .faulted .ub)
     (h_bor : baseStack = [] ∨ mem.borrows = []) :
     unwindFromCallStack
-        (match baseStack with | [] => stk | _ :: _ => stk ++ baseStack)
+        (match baseStack with
+         | [] => stk
+         | b :: bs => stk ++ narrowCallStackForTailCallee (b :: bs) mem.rootUnwindCeiling)
         (Memory.pushBaseStack calleeBody baseStack mem) =
       MirExecState.pushBaseStack calleeBody baseStack
         (unwindFromCallStack stk mem) := by
   induction stk generalizing mem with
   | nil =>
-    exact False.elim (h_no_panic rfl)
+    dsimp only [unwindFromCallStack] at h_no_panic h_no_ub
+    cases h_c : mem.rootUnwindCeiling with
+    | true => rw [h_c] at h_no_panic; exact False.elim (h_no_panic rfl)
+    | false => rw [h_c] at h_no_ub; exact False.elim (h_no_ub rfl)
   | cons caller rest ih =>
     cases baseStack with
     | nil =>
-      dsimp only [unwindFromCallStack] at h_no_panic ⊢
+      dsimp only [unwindFromCallStack] at h_no_panic h_no_ub ⊢
       cases h_uw : caller.returnUnwind with
       | unreachable => rfl
       | terminate => rfl
       | cleanup cleanupBb => rfl
       | continue_ =>
-        rw [h_uw] at h_no_panic
-        dsimp only at h_no_panic
-        exact ih _ h_no_panic (Or.inl rfl)
+        rw [h_uw] at h_no_panic h_no_ub
+        dsimp only at h_no_panic h_no_ub
+        exact ih _ h_no_panic h_no_ub (Or.inl rfl)
     | cons bHd bTl =>
       rcases h_bor with h_nil | h_mb
       · cases h_nil
-      · dsimp only [List.cons_append, unwindFromCallStack] at h_no_panic ⊢
+      · dsimp only [List.cons_append, unwindFromCallStack] at h_no_panic h_no_ub ⊢
         cases h_uw : caller.returnUnwind with
         | unreachable => rfl
         | terminate => rfl
@@ -12008,15 +11917,17 @@ theorem unwindFromCallStack_pushBaseStack_of_ne_panic
           rw [h_mb]
           rfl
         | continue_ =>
-          rw [h_uw] at h_no_panic
-          dsimp only at h_no_panic
-          exact ih _ h_no_panic (Or.inr h_mb)
+          rw [h_uw] at h_no_panic h_no_ub
+          dsimp only at h_no_panic h_no_ub
+          exact ih _ h_no_panic h_no_ub (Or.inr h_mb)
 
 theorem unwindFromCallStack_ne_normal
     (stk : List SavedCallerFrame) (mem : Memory) (rv : MirReturn) :
     unwindFromCallStack stk mem ≠ .halted (.normal rv) := by
   induction stk generalizing mem with
-  | nil => intro h; cases h
+  | nil =>
+    dsimp only [unwindFromCallStack]
+    cases mem.rootUnwindCeiling <;> (intro h; cases h)
   | cons hd tl ih =>
     dsimp only [unwindFromCallStack]
     cases hd.returnUnwind with
@@ -12041,6 +11952,8 @@ theorem applyUnwindAction_pushBaseStack_of_ne_panic
     (unwind : UnwindAction)
     (h_no_panic :
       applyUnwindAction s localsAfterArgs s.memory unwind ≠ .halted .panic)
+    (h_no_ub :
+      applyUnwindAction s localsAfterArgs s.memory unwind ≠ .faulted .ub)
     (h_bor : baseStack = [] ∨ s.memory.borrows = []) :
     applyUnwindAction
         (MachineState.pushBaseStack calleeBody baseStack s)
@@ -12058,10 +11971,10 @@ theorem applyUnwindAction_pushBaseStack_of_ne_panic
     cases baseStack with
     | nil =>
       exact unwindFromCallStack_pushBaseStack_of_ne_panic
-        calleeBody [] s.memory.callStack s.memory h_no_panic (Or.inl rfl)
+        calleeBody [] s.memory.callStack s.memory h_no_panic h_no_ub (Or.inl rfl)
     | cons bHd bTl =>
       exact unwindFromCallStack_pushBaseStack_of_ne_panic
-        calleeBody (bHd :: bTl) s.memory.callStack s.memory h_no_panic h_bor
+        calleeBody (bHd :: bTl) s.memory.callStack s.memory h_no_panic h_no_ub h_bor
 
 def IsIntrinsicCallFamily
     (locals' : List LocalSlot) (destination : Place) (targetBb : BasicBlockIdx)

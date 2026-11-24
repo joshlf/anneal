@@ -1396,297 +1396,6 @@ def evalCopyUnionBytes
                 | .none => MirStepNode.fail .ub
 
 /--
-Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
-have been evaluated into `locals₃`, supporting direct element copies,
-byte-encoded copies into initialized or union destinations, and untyped copies
-of uninitialized union bytes (`FieldsShape.union`) into a union destination.
-
-Reference (`core::intrinsics::copy_nonoverlapping`, Rust 1.98.0):
-<https://doc.rust-lang.org/1.98.0/core/intrinsics/fn.copy_nonoverlapping.html>
-
-Reference (The Rust Reference, "Behavior considered undefined"):
-<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
-
-> "The following is a non-exhaustive list of invalid values:
-> - A value of any type, other than a union or raw pointer, with uninitialized
->   bytes (except for padding bytes, which may be uninitialized)."
--/
-def evalCopyNonOverlappingPermOk
-    (s : MachineState)
-    (src dst : Operand)
-    (localDecls : List LocalDecl)
-    (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr)
-    (srcEntry dstEntry : BorrowEntry)
-    (countBits : Nat)
-    (locals₃ : List LocalSlot) :
-    MirStepNode :=
-  let n := countBits
-  let srcStart := srcPtr.offsetBytes
-  let dstStart := dstPtr.offsetBytes
-  let srcUnionOpt :=
-    resolveUnionEndpoint? localDecls layouts locals₃ srcEntry
-  let dstUnionOpt :=
-    resolveUnionEndpoint? localDecls layouts locals₃ dstEntry
-  let hasUnionEndpoint :=
-    match srcUnionOpt, dstUnionOpt with
-    | .none, .none => false
-    | _, _ => true
-  match hasUnionEndpoint with
-  | true =>
-    evalCopyUnionBytes
-      s
-      src
-      dst
-      localDecls
-      layouts
-      srcPtr
-      dstPtr
-      srcEntry
-      dstEntry
-      srcUnionOpt
-      dstUnionOpt
-      n
-      locals₃
-  | false =>
-    let isSingleDirect :=
-      Bool.and
-        (Nat.beq n 1)
-        (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
-    match isSingleDirect with
-    | true =>
-      evalCopySingleDirect
-        s
-        src
-        dst
-        localDecls
-        layouts
-        srcPtr
-        dstPtr
-        srcEntry
-        dstEntry
-        locals₃
-    | false =>
-      let srcRootSlot : Option LocalSlot :=
-        match get? locals₃ srcEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals srcEntry.targetLocal with
-          | .some slot => .some slot
-          | .none =>
-            get?
-              s.memory.callerLocals
-              (Nat.sub srcEntry.targetLocal (length locals₃))
-      let dstRootSlot : Option LocalSlot :=
-        match get? locals₃ dstEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals dstEntry.targetLocal with
-          | .some slot => .some slot
-          | .none =>
-            get?
-              s.memory.callerLocals
-              (Nat.sub dstEntry.targetLocal (length locals₃))
-      match srcRootSlot, dstRootSlot with
-      | .some (.init srcRootVal), .some (.init dstRootVal) =>
-        let dstPlace : Place := {
-          local_ := dstEntry.targetLocal
-          projection := dstEntry.targetProjection
-        }
-        let dstLocalPlaceTy : Option Ty :=
-          match get? locals₃ dstPlace.local_ with
-          | .some _ => placeTy localDecls layouts dstPlace
-          | .none => .none
-        let dstIsAdt : Bool :=
-          match dstLocalPlaceTy with
-          | .some { kind := .adt _ _, .. } => true
-          | _ => false
-        let writeDstVal (newVal : Value) : MirStepNode :=
-          commitCopyDstPlaceWrite
-            s
-            dstPlace
-            dstEntry.targetLocal
-            dstPtr.tag
-            locals₃
-            newVal
-            localDecls
-            layouts
-        let copyViaBytes
-            (srcSubVal dstSubVal : Value) :
-            MirStepNode :=
-          let overlaps :=
-            match Nat.beq srcPtr.tag dstPtr.tag with
-            | true => true
-            | false =>
-              match
-                Nat.beq srcEntry.targetLocal dstEntry.targetLocal
-              with
-              | false => false
-              | true =>
-                projectionsOverlap
-                  srcEntry.targetProjection
-                  dstEntry.targetProjection
-          match overlaps with
-          | true => MirStepNode.fail .ub
-          | false =>
-            let srcSliceVal : Option Value :=
-              match srcSubVal with
-              | .aggregate 0 srcElems =>
-                match
-                  Nat.ble (Nat.add srcStart n) (length srcElems)
-                with
-                | true =>
-                  .some
-                    (.aggregate 0
-                      (takeValues n (dropValues srcStart srcElems)))
-                | false =>
-                  match Nat.beq srcStart 0 with
-                  | true => .some srcSubVal
-                  | false => .none
-              | _ => .some srcSubVal
-            let dstTargetTyOpt : Option Ty :=
-              match dstLocalPlaceTy with
-              | .some t => .some t
-              | .none => operandPointeeTy localDecls layouts dst
-            match srcSliceVal with
-            | .none => MirStepNode.fail .ub
-            | .some sVal =>
-              match encodeUntypedValueToBytes defaultCodecFuel sVal with
-              | .none => MirStepNode.unsupported
-              | .some bs =>
-                let spliceBytesToDstArray : Option Value :=
-                  match Bool.not dstIsAdt, dstSubVal with
-                  | true, .aggregate 0 dstElems =>
-                    match
-                      Nat.ble
-                        (Nat.add dstStart (length bs))
-                        (length dstElems)
-                    with
-                    | false => .none
-                    | true =>
-                      match
-                        decodeArrayChunksWith
-                          (fun chunk =>
-                            decodeValueFromBytes
-                              defaultCodecFuel
-                              layouts
-                              { kind := .uint .u8, layoutIdx := 0 }
-                              chunk)
-                          1
-                          (length bs)
-                          bs
-                      with
-                      | .some copiedBytes =>
-                        .some
-                          (.aggregate 0
-                            (spliceValues
-                              copiedBytes
-                              dstStart
-                              dstElems))
-                      | .none => .none
-                  | _, _ => .none
-                let preferSplicedArray : Bool :=
-                  match dstLocalPlaceTy, dstSubVal with
-                  | .none, .aggregate 0 _ => true
-                  | _, _ => false
-                match preferSplicedArray, spliceBytesToDstArray with
-                | true, .some splicedVal => writeDstVal splicedVal
-                | _, _ =>
-                  match dstTargetTyOpt with
-                  | .some dstPt =>
-                    match rigidTyByteSize layouts dstPt with
-                    | .some dstBytes =>
-                      match Nat.beq (length bs) dstBytes with
-                      | true =>
-                        match
-                          decodeValueFromBytes
-                            defaultCodecFuel
-                            layouts
-                            dstPt
-                            bs
-                        with
-                        | .some decodedVal => writeDstVal decodedVal
-                        | .none =>
-                          match spliceBytesToDstArray with
-                          | .some splicedVal => writeDstVal splicedVal
-                          | .none => MirStepNode.fail .ub
-                      | false =>
-                        match spliceBytesToDstArray with
-                        | .some splicedVal => writeDstVal splicedVal
-                        | .none => MirStepNode.unsupported
-                    | .none =>
-                      match spliceBytesToDstArray with
-                      | .some splicedVal => writeDstVal splicedVal
-                      | .none => MirStepNode.unsupported
-                  | .none =>
-                    match spliceBytesToDstArray with
-                    | .some splicedVal => writeDstVal splicedVal
-                    | .none => MirStepNode.fail .ub
-        match
-          readProjectedValue
-            locals₃
-            srcRootVal
-            srcEntry.targetProjection,
-          readProjectedValue
-            locals₃
-            dstRootVal
-            dstEntry.targetProjection
-        with
-        | .ok (.aggregate 0 srcElems),
-          .ok (.aggregate 0 dstElems) =>
-          let inBounds :=
-            Bool.and
-              (Bool.not dstIsAdt)
-              (Bool.and
-                (Nat.ble (Nat.add srcStart n) (length srcElems))
-                (Nat.ble (Nat.add dstStart n) (length dstElems)))
-          match inBounds with
-          | false =>
-            match
-              Bool.and
-                (Nat.beq dstStart 0)
-                (Nat.ble (Nat.add srcStart n) (length srcElems))
-            with
-            | true =>
-              copyViaBytes
-                (.aggregate 0 srcElems)
-                (.aggregate 0 dstElems)
-            | false => MirStepNode.fail .ub
-          | true =>
-            let sameContainer :=
-              Bool.and
-                (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                (projectionsOverlap
-                  srcEntry.targetProjection
-                  dstEntry.targetProjection)
-            let disjoint :=
-              match Nat.beq srcPtr.tag dstPtr.tag with
-              | true => false
-              | false =>
-                match sameContainer with
-                | false => true
-                | true =>
-                  Bool.or
-                    (Nat.ble (Nat.add srcStart n) dstStart)
-                    (Nat.ble (Nat.add dstStart n) srcStart)
-            match disjoint with
-            | false => MirStepNode.fail .ub
-            | true =>
-              let copiedSlice :=
-                takeValues n (dropValues srcStart srcElems)
-              let dstElems' :=
-                spliceValues copiedSlice dstStart dstElems
-              writeDstVal (.aggregate 0 dstElems')
-        | .ok srcSubVal, .ok dstSubVal =>
-          copyViaBytes srcSubVal dstSubVal
-        | .ok srcSubVal, .ub =>
-          match Nat.beq dstStart 0 with
-          | true => copyViaBytes srcSubVal .unit
-          | false => MirStepNode.fail .ub
-        | _, _ => MirStepNode.fail .ub
-      | _, _ => MirStepNode.fail .ub
-
-/--
 `copy_nonoverlapping` source and destination borrow targets both lie in the
 active frame. With an empty `callStack` (root frame active) this always holds
 (every live tag then targets depth `0`). Inside an inline callee, when a source
@@ -1862,6 +1571,1244 @@ def borrowsAfterCopySingleDirect
               dstEntry.rangeLen
               dstEntry.targetFrameDepth
         .some borrows'
+
+/--
+Whether every element of `elems` is the zero-sized `Value.unit` (vacuously
+`true` on `.nil`).
+-/
+@[reducible]
+def allUnitValues : List Value → Bool
+  | .nil => true
+  | .unit :: rest => allUnitValues rest
+  | _ :: _ => false
+
+/--
+Whether `elems` is non-empty and every element is the zero-sized `Value.unit`:
+the runtime witness of a zero-sized element type when no static pointee type is
+in scope. Unlike `allUnitValues`, an empty list is not a witness.
+-/
+@[reducible]
+def nonEmptyAllUnitValues : List Value → Bool
+  | .nil => false
+  | .unit :: rest => allUnitValues rest
+  | _ :: _ => false
+
+/--
+Whether every element of `elems` occupies exactly `elemSz` bytes: for
+`elemSz = 0` every element must be `Value.unit` (`allUnitValues`), otherwise
+every element must have byte size `elemSz` (`elemsHaveUniformByteStride`).
+-/
+@[reducible]
+def elemsMatchByteStride (elems : List Value) (elemSz : Nat) : Bool :=
+  match Nat.beq elemSz 0 with
+  | true => allUnitValues elems
+  | false => elemsHaveUniformByteStride elems elemSz
+
+/--
+Whether every element of `elems` is a one-byte scalar.
+-/
+@[reducible]
+def elemsAreByteScalars : List Value → Bool
+  | .nil => true
+  | .scalar sc :: rest =>
+    match Nat.beq sc.sizeBytes 1 with
+    | true => elemsAreByteScalars rest
+    | false => false
+  | _ :: _ => false
+
+/--
+One endpoint (`src` or `dst`) of a multi-element or sub-place
+`copy_nonoverlapping`: the pointer value `ptr`, its live borrow `entry`, the
+initialized root value `rootVal` of the local (or caller-owned referent) that
+`entry` targets, and the operand's static pointee type `pointeeOpt` when known.
+-/
+structure CopyEndpoint : Type where
+  /-- Pointer value of the operand. -/
+  ptr : ProvenancePtr
+  /-- Borrow entry of `ptr.tag`. -/
+  entry : BorrowEntry
+  /-- Initialized root value of `entry.targetLocal`. -/
+  rootVal : Value
+  /-- Static pointee type of the operand (`operandPointeeTy`), when known. -/
+  pointeeOpt : Option Ty
+
+/--
+Outcome of resolving a multi-element or sub-place `copy_nonoverlapping`
+(`resolveCopySubplaceMulti`) before it is committed to the machine state.
+-/
+inductive CopySliceOutcome : Type where
+  /-- The copy is undefined behavior. -/
+  | ub : CopySliceOutcome
+  /-- The copy is not modeled (fail closed). -/
+  | unsupported : CopySliceOutcome
+  /-- The copy transfers zero bytes: no memory or borrow-state effect. -/
+  | noop : CopySliceOutcome
+  /-- Write `newVal` to `dstPlace`, after the Tree Borrows read of the source
+      place `srcWindowProj` and write of the destination place `dstWindowProj`
+      (projections relative to each borrow's target local). -/
+  | write
+      (dstPlace : Place)
+      (newVal : Value)
+      (srcWindowProj dstWindowProj : List ProjectionElem) :
+      CopySliceOutcome
+
+/--
+Static byte size `size_of::<T>()` of the pointee `T` of a
+`copy_nonoverlapping::<T>` whose operands have static pointee types
+`srcPtOpt` / `dstPtOpt` (`tyByteSize`), when either is known.
+-/
+@[reducible]
+def copyPointeeByteSize?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtOpt dstPtOpt : Option Ty) :
+    Option Nat :=
+  let srcSzOpt : Option Nat :=
+    match srcPtOpt with
+    | .some srcPt => tyByteSize localDecls layouts srcPt
+    | .none => .none
+  match srcSzOpt with
+  | .some sz => .some sz
+  | .none =>
+    match dstPtOpt with
+    | .some dstPt => tyByteSize localDecls layouts dstPt
+    | .none => .none
+
+/--
+Whether the static pointee sizes of the two operands of a `copy_nonoverlapping`
+are both known and differ (ill-typed for a single type parameter `T`).
+-/
+@[reducible]
+def copyPointeeSizesConflict
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtOpt dstPtOpt : Option Ty) :
+    Bool :=
+  match srcPtOpt, dstPtOpt with
+  | .some srcPt, .some dstPt =>
+    match tyByteSize localDecls layouts srcPt, tyByteSize localDecls layouts dstPt with
+    | .some a, .some b => Bool.not (Nat.beq a b)
+    | _, _ => false
+  | _, _ => false
+
+/--
+Whether the place `⟨loc, proj⟩` of an active-frame local is statically a struct,
+enum, or tuple (`RigidTy.adt` / `RigidTy.tuple`), i.e. an aggregate whose
+`Value.aggregate 0 fields` representation is not a sequence of equally sized
+elements. `false` for caller-owned referents and untyped places.
+-/
+@[reducible]
+def copyPlaceIsNonArrayAggregate
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (loc : Local)
+    (proj : List ProjectionElem) :
+    Bool :=
+  match get? locals loc with
+  | .none => false
+  | .some _ =>
+    match placeTy localDecls layouts { local_ := loc, projection := proj } with
+    | .some { kind := .adt _ _, .. } => true
+    | .some { kind := .tuple _, .. } => true
+    | _ => false
+
+/--
+Static element kind of the array or slice place `⟨loc, parentProj⟩` of an
+active-frame local (`RigidTy.array ek _` / `RigidTy.slice ek`), when known.
+-/
+@[reducible]
+def copyContainerElemKind?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (loc : Local)
+    (parentProj : List ProjectionElem) :
+    Option RigidTy :=
+  match get? locals loc with
+  | .none => .none
+  | .some _ =>
+    match placeTy localDecls layouts { local_ := loc, projection := parentProj } with
+    | .some { kind := .array ek _, .. } => .some ek
+    | .some { kind := .slice ek, .. } => .some ek
+    | _ => .none
+
+/--
+Resolve the array or slice that the endpoint `ep` of a multi-element
+`copy_nonoverlapping` points into, as `(parentProj, baseIdx, elems)`: the
+projection of the container within `ep.entry.targetLocal`, the element index of
+the pointed-to place inside it, and its element values.
+
+- When the borrow's projection ends with a forward
+  `.constantIndex idx minLen false` (an element pointer such as
+  `&raw const a[idx]`) and the enclosing place reads as `.aggregate 0 elems`,
+  is not statically a struct or tuple, and contains index `idx`, the container
+  is the enclosing array with `baseIdx = idx` (`splitLastConstantIndex?`). If
+  the element is itself a sequence and only its own elements have the copied
+  element size `elemSzOpt`, the element is the container instead.
+- Otherwise, when the pointed-to place itself reads as `.aggregate 0 elems` and
+  is not statically a struct or tuple, it is the container with `baseIdx = 0`.
+- Otherwise the endpoint is not an array (`.none`), and the copy is evaluated
+  on bytes.
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "src must be valid for reads of count * size_of::<T>() bytes or that number must be 0."
+> "dst must be valid for writes of count * size_of::<T>() bytes or that number must be 0."
+
+Reference (The Rust Reference 1.98.0, "Array layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
+
+> "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
+
+Justification: an access of `count * size_of::<T>()` bytes starting at element
+`idx` of an array of `T` covers exactly the elements `idx .. idx + count`,
+because consecutive elements are `size_of::<T>()` bytes apart. Resolving the
+enclosing array turns the byte access into an element window; the caller checks
+that the elements really have the copied element size (`copyContainerStrideOk`)
+before using that window.
+
+Modeling assumptions and unsupported behavior: `fromEnd` constant indices and
+dynamic indices whose index local is not an initialized scalar are not peeled;
+a struct or tuple is never treated as a sequence when its static type is known.
+-/
+def resolveArraySliceEndpoint?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (ep : CopyEndpoint)
+    (elemSzOpt : Option Nat) :
+    Option (List ProjectionElem × Nat × List Value) :=
+  let resolvedProj : List ProjectionElem :=
+    match resolveBorrowProjectionElems locals ep.entry.targetProjection with
+    | .some rp => normalizeSubsliceProjections rp
+    | .none => ep.entry.targetProjection
+  let direct : Option (List ProjectionElem × Nat × List Value) :=
+    match
+      copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal resolvedProj
+    with
+    | true => .none
+    | false =>
+      match readProjectedValue locals ep.rootVal resolvedProj with
+      | .ok (.aggregate 0 elems) => .some (resolvedProj, 0, elems)
+      | _ => .none
+  match splitLastConstantIndex? resolvedProj with
+  | .none => direct
+  | .some (initProj, idx, minLen) =>
+    match
+      copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal initProj
+    with
+    | true => direct
+    | false =>
+      match readProjectedValue locals ep.rootVal initProj with
+      | .ok (.aggregate 0 outerElems) =>
+        match
+          Bool.and
+            (Nat.ble minLen (length outerElems))
+            (Nat.blt idx (length outerElems))
+        with
+        | false => direct
+        | true =>
+          match direct, elemSzOpt with
+          | .some (innerProj, innerIdx, innerElems), .some elemSz =>
+            match
+              elemsMatchByteStride outerElems elemSz,
+              elemsMatchByteStride innerElems elemSz
+            with
+            | false, true => .some (innerProj, innerIdx, innerElems)
+            | _, _ => .some (initProj, idx, outerElems)
+          | _, _ => .some (initProj, idx, outerElems)
+      | _ => direct
+
+/--
+Element-stride guard for one container of a multi-element `copy_nonoverlapping`
+(`copySliceStrideOk`): whether an element of the container occupies exactly one
+copied element.
+
+- When the container's static element kind `elemKindOpt` and the operand's
+  pointee type `pointeeOpt` are both known, the element kind must have the
+  pointee's value shape (`sameRigidTyShape`) or be a primitive scalar of the
+  copied element size.
+- Otherwise (an untyped container, e.g. a caller-owned referent), every element
+  value must have the copied element size `elemSzOpt` (`elemsMatchByteStride`).
+
+Reference (The Rust Reference 1.98.0, "Array layout"):
+<https://doc.rust-lang.org/1.98.0/reference/type-layout.html#array-layout>
+
+> "An array of [T; N] has a size of size_of::<T>() * N and the same alignment of T. Arrays are laid out so that the zero-based nth element of the array is offset from the start of the array by n * size_of::<T>() bytes."
+
+Justification: transferring `count` element values is the same as copying
+`count * size_of::<T>()` bytes only if each element value occupies
+`size_of::<T>()` bytes at the stride of the array. When this guard fails the
+copy is type-punned across element boundaries and is not evaluated on element
+values.
+
+Modeling assumption: a primitive scalar of equal size is accepted because the
+model represents every primitive scalar as `Value.scalar` of that byte size.
+-/
+@[reducible]
+def copyContainerStrideOk
+    (elemKindOpt : Option RigidTy)
+    (pointeeOpt : Option Ty)
+    (elems : List Value)
+    (elemSzOpt : Option Nat) :
+    Bool :=
+  match elemKindOpt, pointeeOpt with
+  | .some ek, .some pt =>
+    match sameRigidTyShape ek pt.kind with
+    | true => true
+    | false =>
+      match isPrimitiveScalarKind ek, rigidTyKindByteSize ek, elemSzOpt with
+      | true, .some ekSz, .some elemSz => Nat.beq ekSz elemSz
+      | _, _, _ => false
+  | _, _ =>
+    match elemSzOpt with
+    | .some elemSz => elemsMatchByteStride elems elemSz
+    | .none => false
+
+/--
+Element byte size used to convert pointer byte offsets to element indices: the
+static pointee size `elemSzOpt` when known, otherwise the byte size of the first
+element value of the source (else destination) container.
+-/
+@[reducible]
+def copyEffElemSize?
+    (elemSzOpt : Option Nat)
+    (srcElems dstElems : List Value) :
+    Option Nat :=
+  match elemSzOpt with
+  | .some sz => .some sz
+  | .none =>
+    match srcElems with
+    | e :: _ => inferValueByteSizeAux 8 e
+    | .nil =>
+      match dstElems with
+      | e :: _ => inferValueByteSizeAux 8 e
+      | .nil => .none
+
+/--
+Projection of the element window `start .. start + n` of the container
+`parentProj` whose length is `len`: `parentProj` itself when the window covers
+the whole container, and `parentProj` followed by
+`.subslice start (start + n) false` otherwise.
+-/
+@[reducible]
+def copySliceWindowProj
+    (parentProj : List ProjectionElem)
+    (start n len : Nat) :
+    List ProjectionElem :=
+  match Bool.and (Nat.beq start 0) (Nat.beq n len) with
+  | true => parentProj
+  | false => appendProjections parentProj (.subslice start (Nat.add start n) false :: .nil)
+
+/--
+Tree Borrows read-then-write check and permission transition for a
+multi-element or byte-level `copy_nonoverlapping` that reads the source place
+`srcWindowProj` and writes the destination place `dstWindowProj` (both relative
+to their borrow's target local): `borrowsAfterCopySingleDirect` on the borrow
+entries re-targeted at the accessed windows, with no byte sub-range
+(`rangeLen := 0`). Returns `.none` on any Tree Borrows undefined behavior.
+
+Reference (The Rust Reference 1.98.0, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "Breaking the pointer aliasing rules. The exact aliasing rules are not determined yet, but here is an outline of the general principles:"
+> "&T must point to memory that is not mutated while they are live (except for data inside an UnsafeCell<U>), and &mut T must point to memory that is not read or written by any pointer not derived from the reference and that no other reference points to while they are live."
+
+Justification: the copy reads every byte of the source window through `srcPtr`
+and writes every byte of the destination window through `dstPtr`, so the
+aliasing state must be checked and updated for those whole windows, not only
+for the single element the pointers were derived from.
+
+Modeling assumption: the aliasing model is Tree Borrows as implemented by
+`borrowsAfterCopySingleDirect`; the Reference states the aliasing rules only in
+outline.
+-/
+def borrowsAfterCopySlice
+    (borrows : List BorrowEntry)
+    (activeProtectors : List Nat)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (srcWindowProj dstWindowProj : List ProjectionElem) :
+    Option (List BorrowEntry) :=
+  borrowsAfterCopySingleDirect
+    borrows
+    activeProtectors
+    srcPtr
+    dstPtr
+    { srcEntry with targetProjection := srcWindowProj, rangeOffset := 0, rangeLen := 0 }
+    { dstEntry with targetProjection := dstWindowProj, rangeOffset := 0, rangeLen := 0 }
+
+/--
+Whether an access of `accessBytes` bytes through the endpoint `ep`
+(`ep.ptr.offsetBytes` bytes past the place `ep.entry` borrows) lies inside the
+allocation of the local it targets: `.some true` when it certainly does,
+`.some false` when it certainly does not, and `.none` when the allocation size
+or the place offset is unknown.
+
+The allocation size is `tyByteSize` of the declared type for a declared
+active-frame local and `valueDefaultByteSize ep.rootVal` otherwise (an untyped
+or caller-owned target); the offset of the borrowed place is
+`borrowPlaceByteOffset?`, falling back to `projectionChainByteOffset?` on the
+runtime value only for an undeclared target (never for a declared local whose
+layout lacks field offsets).
+
+Reference (`core::ptr`, "Safety", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#safety>
+
+> "For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that the pointer be dereferenceable. The provenance of the pointer is used to determine which allocation it is derived from; a pointer is dereferenceable if the memory range of the given size starting at the pointer is entirely contained within the bounds of that allocation. Note that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+Justification: `.some false` states that the accessed memory range is not
+"entirely contained within the bounds of that allocation", so the pointer is
+not dereferenceable for the access, which is a necessary condition for validity;
+the caller turns only this answer into undefined behavior. `.some true` is
+necessary but "not always sufficient" for validity, so the caller never treats
+it as permission by itself.
+
+Modeling assumptions: the allocation of a pointer into a local is that whole
+local ("every (stack-allocated) variable is considered a separate allocation");
+for an untyped target the size and offsets are inferred from the runtime value.
+-/
+def copyAccessFitsAlloc?
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (callerLocals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (ep : CopyEndpoint)
+    (accessBytes : Nat) :
+    Option Bool :=
+  let declTyOpt : Option Ty :=
+    match get? locals ep.entry.targetLocal, get? localDecls ep.entry.targetLocal with
+    | .some _, .some decl => .some decl.ty
+    | _, _ => .none
+  let rootBytesOpt : Option Nat :=
+    match declTyOpt with
+    | .some declTy => tyByteSize localDecls layouts declTy
+    | .none => valueDefaultByteSize ep.rootVal
+  let resolvedEntry : BorrowEntry :=
+    match resolveBorrowProjectionElems locals ep.entry.targetProjection with
+    | .some rp => { ep.entry with targetProjection := rp }
+    | .none => ep.entry
+  let placeOffOpt : Option Nat :=
+    match borrowPlaceByteOffset? locals callerLocals localDecls layouts resolvedEntry callStack with
+    | .some off => .some off
+    | .none =>
+      match declTyOpt with
+      | .some _ => .none
+      | .none =>
+        projectionChainByteOffset?
+          layouts
+          .none
+          (.some ep.rootVal)
+          .none
+          0
+          .nil
+          (normalizeSubsliceProjections
+            (stripTransparentProjections resolvedEntry.targetProjection))
+  match rootBytesOpt, placeOffOpt with
+  | .some rootBytes, .some placeOff =>
+    .some
+      (Nat.ble
+        (Nat.add (Nat.add placeOff ep.ptr.offsetBytes) accessBytes)
+        rootBytes)
+  | _, _ => .none
+
+/--
+`true` exactly when `fitsOpt` (`copyAccessFitsAlloc?`) reports an access that is
+certainly outside its allocation.
+-/
+@[reducible]
+def copyAccessCertainlyOob : Option Bool → Bool
+  | .some false => true
+  | _ => false
+
+/--
+Element-window path of a multi-element `copy_nonoverlapping` whose endpoints
+both point into arrays or slices (`resolveArraySliceEndpoint?`): the source
+container is `srcElems` at `srcParentProj` with the pointer at element
+`srcBaseIdx`, and likewise for the destination.
+
+- A copy between containers of zero-sized `Value.unit` elements without a
+  static pointee type is a no-op.
+- Pointer byte offsets are converted to element indices
+  (`byteOffsetToElemIdx?`); an offset that is not a whole number of elements is
+  not modeled (`.unsupported`; alignment was already checked).
+- When a window exceeds its container, the copy is undefined behavior if an
+  access is certainly outside its allocation (`copyAccessFitsAlloc?`), or if
+  that is unknown and the exceeded container is the root local itself with an
+  exact, non-zero element stride; otherwise it stays inside the allocation or
+  is type-punned and is not modeled (`.unsupported`).
+- When both windows are in bounds, the element stride must be exact
+  (`copyContainerStrideOk`, else `.unsupported`), the windows must not overlap
+  (else `.ub`), and the source window is spliced into the destination container;
+  the outcome names the two accessed windows for the Tree Borrows
+  read-then-write transition (`borrowsAfterCopySlice`, applied by
+  `evalCopySubplaceMulti`).
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "src must be valid for reads of count * size_of::<T>() bytes or that number must be 0."
+> "dst must be valid for writes of count * size_of::<T>() bytes or that number must be 0."
+> "The region of memory beginning at src with a size of count * size_of::<T>() bytes must not overlap with the region of memory beginning at dst with the same size."
+
+Reference (`core::ptr`, "Safety", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#safety>
+
+> "For memory accesses of size zero, every non-null pointer is valid for reads/writes."
+> "For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that the pointer be dereferenceable. The provenance of the pointer is used to determine which allocation it is derived from; a pointer is dereferenceable if the memory range of the given size starting at the pointer is entirely contained within the bounds of that allocation. Note that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+Justification: the copy accesses `count * size_of::<T>()` bytes at each pointer;
+with an exact element stride those bytes are the element windows
+`start .. start + count`. Undefined behavior is reported only for an access
+that is certainly not contained in its allocation (a necessary condition for
+validity fails), for overlapping windows, and for an aliasing violation. A
+window that leaves its container but may stay inside the allocation (a nested
+array, a type-punned element size) is never reported as undefined behavior.
+
+Modeling assumptions and unsupported behavior: tags are compared as in the
+single-element path (a copy between two pointers with the same tag is
+undefined behavior); in-allocation overruns of a nested array and type-punned
+element sizes fail closed with `.unsupported`.
+-/
+def copySliceElements
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (callerLocals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (srcEp dstEp : CopyEndpoint)
+    (elemSzOpt : Option Nat)
+    (n : Nat)
+    (srcParentProj : List ProjectionElem)
+    (srcBaseIdx : Nat)
+    (srcElems : List Value)
+    (dstParentProj : List ProjectionElem)
+    (dstBaseIdx : Nat)
+    (dstElems : List Value) :
+    CopySliceOutcome :=
+  let effSzOpt := copyEffElemSize? elemSzOpt srcElems dstElems
+  let strideOk : Bool :=
+    Bool.and
+      (copyContainerStrideOk
+        (copyContainerElemKind? localDecls layouts locals srcEp.entry.targetLocal srcParentProj)
+        srcEp.pointeeOpt
+        srcElems
+        effSzOpt)
+      (copyContainerStrideOk
+        (copyContainerElemKind? localDecls layouts locals dstEp.entry.targetLocal dstParentProj)
+        dstEp.pointeeOpt
+        dstElems
+        effSzOpt)
+  let zeroByteSlice : Bool :=
+    match elemSzOpt with
+    | .some _ => false
+    | .none => Bool.and (nonEmptyAllUnitValues srcElems) (nonEmptyAllUnitValues dstElems)
+  match zeroByteSlice with
+  | true => .noop
+  | false =>
+    let offElemSz : Nat :=
+      match effSzOpt with
+      | .some sz => sz
+      | .none => 0
+    match
+      byteOffsetToElemIdx? srcEp.ptr.offsetBytes offElemSz,
+      byteOffsetToElemIdx? dstEp.ptr.offsetBytes offElemSz
+    with
+    | .some srcOff, .some dstOff =>
+      let effSrcStart := Nat.add srcBaseIdx srcOff
+      let effDstStart := Nat.add dstBaseIdx dstOff
+      let srcIn := Nat.ble (Nat.add effSrcStart n) (length srcElems)
+      let dstIn := Nat.ble (Nat.add effDstStart n) (length dstElems)
+      match Bool.and srcIn dstIn with
+      | false =>
+        let srcFits : Option Bool :=
+          match effSzOpt with
+          | .some sz =>
+            copyAccessFitsAlloc?
+              localDecls layouts locals callerLocals callStack srcEp (Nat.mul n sz)
+          | .none => .none
+        let dstFits : Option Bool :=
+          match effSzOpt with
+          | .some sz =>
+            copyAccessFitsAlloc?
+              localDecls layouts locals callerLocals callStack dstEp (Nat.mul n sz)
+          | .none => .none
+        match Bool.or (copyAccessCertainlyOob srcFits) (copyAccessCertainlyOob dstFits) with
+        | true => .ub
+        | false =>
+          let srcRootOverrun : Bool :=
+            match srcIn, srcParentProj, srcFits with
+            | false, .nil, .none => true
+            | _, _, _ => false
+          let dstRootOverrun : Bool :=
+            match dstIn, dstParentProj, dstFits with
+            | false, .nil, .none => true
+            | _, _, _ => false
+          match
+            Bool.and
+              strideOk
+              (Bool.and
+                (Bool.not
+                  (Bool.or (nonEmptyAllUnitValues srcElems) (nonEmptyAllUnitValues dstElems)))
+                (Bool.or srcRootOverrun dstRootOverrun))
+          with
+          | true => .ub
+          | false => .unsupported
+      | true =>
+        match strideOk with
+        | false => .unsupported
+        | true =>
+          let srcWindowProj :=
+            copySliceWindowProj srcParentProj effSrcStart n (length srcElems)
+          let dstWindowProj :=
+            copySliceWindowProj dstParentProj effDstStart n (length dstElems)
+          let overlaps : Bool :=
+            match Nat.beq srcEp.ptr.tag dstEp.ptr.tag with
+            | true => true
+            | false =>
+              match Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+              | false => false
+              | true => projectionsOverlap srcWindowProj dstWindowProj
+          match overlaps with
+          | true => .ub
+          | false =>
+            .write
+              { local_ := dstEp.entry.targetLocal, projection := dstParentProj }
+              (.aggregate 0
+                (spliceValues
+                  (takeValues n (dropValues effSrcStart srcElems))
+                  effDstStart
+                  dstElems))
+              srcWindowProj
+              dstWindowProj
+    | _, _ => .unsupported
+
+/--
+Byte-level path of a multi-element or sub-place `copy_nonoverlapping` when at
+least one endpoint is not an array or slice (`copyViaBytes`): the source bytes
+are the untyped encoding of the source value, and they are placed into the
+destination only where the model can place them exactly.
+
+- An access that is certainly outside its allocation is undefined behavior
+  (`copyAccessFitsAlloc?` at `count * size_of::<T>()` bytes).
+- Source: the source is sliced by element only when it is a genuine array or
+  slice whose elements have the copied element size
+  (`elemsMatchByteStride`); otherwise the whole pointed-to value is encoded,
+  which requires the pointer to sit at the start of that value
+  (`srcPtr.offsetBytes = 0`). The encoded length must equal
+  `count * size_of::<T>()` when that is known.
+- Destination: raw bytes are spliced only into a byte container (`[u8; N]`,
+  `[i8; N]`, a byte slice, or an untyped sequence of one-byte scalars) at the
+  byte index of the pointer; otherwise the bytes are decoded as one whole value
+  of the pointed-to place (or of its enclosing array when the pointer is at
+  element `0`), which requires `dstPtr.offsetBytes = 0` and an exact size match.
+- The accessed source and destination places must not overlap; the outcome
+  names exactly those places for the Tree Borrows read-then-write transition
+  (`borrowsAfterCopySlice`, applied by `evalCopySubplaceMulti`).
+- Every remaining case (a partial read or write of a value, a pointer into the
+  middle of a value, a type-punned sequence) is inside the allocation as far as
+  the model knows and fails closed with `.unsupported`.
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "src must be valid for reads of count * size_of::<T>() bytes or that number must be 0."
+> "dst must be valid for writes of count * size_of::<T>() bytes or that number must be 0."
+> "The region of memory beginning at src with a size of count * size_of::<T>() bytes must not overlap with the region of memory beginning at dst with the same size."
+> "Like read, copy_nonoverlapping creates a bitwise copy of T, regardless of whether T is Copy."
+
+Reference (`core::ptr`, "Safety", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#safety>
+
+> "For a pointer to be valid for reads/writes, it is necessary, but not always sufficient, that the pointer be dereferenceable. The provenance of the pointer is used to determine which allocation it is derived from; a pointer is dereferenceable if the memory range of the given size starting at the pointer is entirely contained within the bounds of that allocation. Note that in Rust, every (stack-allocated) variable is considered a separate allocation."
+
+Justification: a "bitwise copy" writes exactly the source bytes at the
+destination pointer. Splicing bytes element-wise is exact only when each
+destination element is one byte, and decoding a whole value is exact only when
+the written range is exactly the range of that value; every other placement
+would write a different set of bytes than the copy does, so it is not modeled.
+Undefined behavior is reported only when a necessary validity condition fails
+(the access is certainly outside the allocation), when the accessed places
+overlap, when the aliasing model rejects the accesses, or when the copied bytes
+do not form a value of the destination type.
+
+Modeling assumptions and unsupported behavior: bytes that do not decode at the
+destination type (for example uninitialized bytes) are reported as undefined
+behavior, the policy of the single-element path; a copy between two pointers
+with the same tag is undefined behavior as in the single-element path.
+-/
+def copyBytesSubplace
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (locals : List LocalSlot)
+    (callerLocals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (srcEp dstEp : CopyEndpoint)
+    (elemSzOpt : Option Nat)
+    (n : Nat)
+    (srcWinOpt dstWinOpt : Option (List ProjectionElem × Nat × List Value)) :
+    CopySliceOutcome :=
+  let srcElemSzOpt : Option Nat :=
+    match elemSzOpt with
+    | .some sz => .some sz
+    | .none =>
+      match srcWinOpt with
+      | .some (_, _, e :: _) => inferValueByteSizeAux 8 e
+      | _ => .none
+  let expBytesOpt : Option Nat :=
+    match srcElemSzOpt with
+    | .some sz => .some (Nat.mul n sz)
+    | .none => .none
+  let fitsAt (ep : CopyEndpoint) (bytesOpt : Option Nat) : Option Bool :=
+    match bytesOpt with
+    | .some bytes =>
+      copyAccessFitsAlloc? localDecls layouts locals callerLocals callStack ep bytes
+    | .none => .none
+  match
+    Bool.or
+      (copyAccessCertainlyOob (fitsAt srcEp expBytesOpt))
+      (copyAccessCertainlyOob (fitsAt dstEp expBytesOpt))
+  with
+  | true => .ub
+  | false =>
+    let wholeSrc : Option (Value × List ProjectionElem) :=
+      match Nat.beq srcEp.ptr.offsetBytes 0 with
+      | false => .none
+      | true =>
+        match readProjectedValue locals srcEp.rootVal srcEp.entry.targetProjection with
+        | .ok srcSubVal => .some (srcSubVal, srcEp.entry.targetProjection)
+        | _ => .none
+    let srcSlice : Option (Value × List ProjectionElem) :=
+      match srcWinOpt, srcElemSzOpt with
+      | .some (srcParentProj, srcBaseIdx, srcElems), .some elemSz =>
+        match
+          elemsMatchByteStride srcElems elemSz,
+          byteOffsetToElemIdx? srcEp.ptr.offsetBytes elemSz
+        with
+        | true, .some srcOff =>
+          let effSrcStart := Nat.add srcBaseIdx srcOff
+          match Nat.ble (Nat.add effSrcStart n) (length srcElems) with
+          | true =>
+            .some
+              (.aggregate 0 (takeValues n (dropValues effSrcStart srcElems)),
+                copySliceWindowProj srcParentProj effSrcStart n (length srcElems))
+          | false => .none
+        | _, _ => wholeSrc
+      | _, _ => wholeSrc
+    match srcSlice with
+    | .none =>
+      match readProjectedValue locals srcEp.rootVal srcEp.entry.targetProjection with
+      | .ub => .ub
+      | _ => .unsupported
+    | .some (sVal, srcEffProj) =>
+      match encodeUntypedValueToBytes defaultCodecFuel sVal with
+      | .none => .unsupported
+      | .some bs =>
+        let lenOk : Bool :=
+          match expBytesOpt with
+          | .some expBytes => Nat.beq (length bs) expBytes
+          | .none => true
+        match lenOk with
+        | false => .unsupported
+        | true =>
+          match copyAccessCertainlyOob (fitsAt dstEp (.some (length bs))) with
+          | true => .ub
+          | false =>
+            let commit
+                (dstPlace : Place)
+                (newVal : Value)
+                (dstEffProj : List ProjectionElem) :
+                CopySliceOutcome :=
+              let overlaps : Bool :=
+                match Nat.beq srcEp.ptr.tag dstEp.ptr.tag with
+                | true => true
+                | false =>
+                  match Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+                  | false => false
+                  | true => projectionsOverlap srcEffProj dstEffProj
+              match overlaps with
+              | true => .ub
+              | false => .write dstPlace newVal srcEffProj dstEffProj
+            let dstLocal := dstEp.entry.targetLocal
+            let dstByteWin : Option (List ProjectionElem × Nat × List Value) :=
+              match dstWinOpt with
+              | .some (dstParentProj, dstBaseIdx, dstElems) =>
+                let isByteContainer : Bool :=
+                  match
+                    copyContainerElemKind? localDecls layouts locals dstLocal dstParentProj
+                  with
+                  | .some (.uint .u8) => true
+                  | .some (.int .i8) => true
+                  | .some _ => false
+                  | .none =>
+                    match dstElems with
+                    | .nil => false
+                    | _ :: _ => elemsAreByteScalars dstElems
+                match isByteContainer with
+                | true => .some (dstParentProj, dstBaseIdx, dstElems)
+                | false => .none
+              | .none => .none
+            match dstByteWin with
+            | .some (dstParentProj, dstBaseIdx, dstElems) =>
+              let effDstStart := Nat.add dstBaseIdx dstEp.ptr.offsetBytes
+              match Nat.ble (Nat.add effDstStart (length bs)) (length dstElems) with
+              | false => .unsupported
+              | true =>
+                match
+                  decodeArrayChunksWith
+                    (fun chunk =>
+                      decodeValueFromBytes
+                        defaultCodecFuel
+                        layouts
+                        { kind := .uint .u8, layoutIdx := 0 }
+                        chunk)
+                    1
+                    (length bs)
+                    bs
+                with
+                | .some copiedBytes =>
+                  commit
+                    { local_ := dstLocal, projection := dstParentProj }
+                    (.aggregate 0 (spliceValues copiedBytes effDstStart dstElems))
+                    (copySliceWindowProj dstParentProj effDstStart (length bs) (length dstElems))
+                | .none => .unsupported
+            | .none =>
+              match Nat.beq dstEp.ptr.offsetBytes 0 with
+              | false => .unsupported
+              | true =>
+                let dstPlaceTyOpt : Option Ty :=
+                  match get? locals dstLocal with
+                  | .some _ =>
+                    placeTy
+                      localDecls
+                      layouts
+                      { local_ := dstLocal, projection := dstEp.entry.targetProjection }
+                  | .none => .none
+                let dstTargetTyOpt : Option Ty :=
+                  match dstPlaceTyOpt with
+                  | .some t => .some t
+                  | .none => dstEp.pointeeOpt
+                let decodeAt
+                    (tyOpt : Option Ty)
+                    (dstProj : List ProjectionElem) :
+                    Option CopySliceOutcome :=
+                  match tyOpt with
+                  | .none => .none
+                  | .some dstTy =>
+                    match rigidTyByteSize layouts dstTy with
+                    | .none => .none
+                    | .some dstBytes =>
+                      match Nat.beq (length bs) dstBytes with
+                      | false => .none
+                      | true =>
+                        match decodeValueFromBytes defaultCodecFuel layouts dstTy bs with
+                        | .some decodedVal =>
+                          .some
+                            (commit
+                              { local_ := dstLocal, projection := dstProj }
+                              decodedVal
+                              dstProj)
+                        | .none => .some .ub
+                match decodeAt dstTargetTyOpt dstEp.entry.targetProjection with
+                | .some outcome => outcome
+                | .none =>
+                  match dstWinOpt with
+                  | .some (dstParentProj, .zero, _) =>
+                    let parentTyOpt : Option Ty :=
+                      match get? locals dstLocal with
+                      | .some _ =>
+                        placeTy
+                          localDecls
+                          layouts
+                          { local_ := dstLocal, projection := dstParentProj }
+                      | .none => .none
+                    match decodeAt parentTyOpt dstParentProj with
+                    | .some outcome => outcome
+                    | .none => .unsupported
+                  | _ => .unsupported
+
+/--
+Resolve a `copy_nonoverlapping` of `n ≥ 1` elements that is neither a union
+copy nor the single-element direct copy (`n = 1` with both pointers at byte
+offset `0`): a multi-element copy, or a copy through a pointer at a non-zero
+byte offset (`RawPtrOffsetMutator:wrong_value:MirDiffTag.normalScalar`).
+
+1. Both root slots must be initialized (else `.ub`, as before).
+2. Both pointers must be aligned for the pointee type (`checkDerefAlign`, else
+   `.ub`).
+3. A copy whose pointee type is statically zero-sized transfers zero bytes and
+   is a no-op.
+4. When both endpoints point into arrays or slices
+   (`resolveArraySliceEndpoint?`), the copy is the element-window copy
+   `copySliceElements`; otherwise it is the byte-level copy `copyBytesSubplace`.
+
+The resolution depends on the machine state only through `callerLocals` and
+`callStack` (to locate caller-owned referents and place offsets); the aliasing
+transition and the destination commit are applied by `evalCopySubplaceMulti`.
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "Copies count * size_of::<T>() bytes from src to dst. The source and destination must not overlap."
+> "src must be valid for reads of count * size_of::<T>() bytes or that number must be 0."
+> "dst must be valid for writes of count * size_of::<T>() bytes or that number must be 0."
+> "Both src and dst must be properly aligned."
+> "Note that even if the effectively copied size (count * size_of::<T>()) is 0, the pointers must be properly aligned."
+
+Reference (`core::ptr`, "Safety", Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/index.html#safety>
+
+> "For memory accesses of size zero, every non-null pointer is valid for reads/writes."
+
+Justification: the copy transfers `count * size_of::<T>()` bytes, not one
+element: a pointer to element `i` of an array with `count > 1` reads `count`
+consecutive elements, and the pointer's byte offset is a byte offset, not an
+element index. Alignment is required "even if the effectively copied size ...
+is 0", so it is checked before the zero-size case; a zero-sized access is
+otherwise valid through "every non-null pointer", and the model has no null
+pointers with a borrow entry, so it is a no-op.
+
+Modeling assumptions and unsupported behavior: alignment is decided by
+`checkDerefAlign` on the pointer's byte offset (the borrowed place itself is
+assumed aligned for the pointee type); operand pointee types that disagree in
+size fail closed with `.unsupported`.
+-/
+def resolveCopySubplaceMulti
+    (callerLocals : List LocalSlot)
+    (callStack : List SavedCallerFrame)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (n : Nat)
+    (locals₃ : List LocalSlot) :
+    CopySliceOutcome :=
+  let srcRootSlot : Option LocalSlot :=
+    match get? locals₃ srcEntry.targetLocal with
+    | .some slot => .some slot
+    | .none =>
+      match get? callerLocals srcEntry.targetLocal with
+      | .some slot => .some slot
+      | .none =>
+        get?
+          callerLocals
+          (Nat.sub srcEntry.targetLocal (length locals₃))
+  let dstRootSlot : Option LocalSlot :=
+    match get? locals₃ dstEntry.targetLocal with
+    | .some slot => .some slot
+    | .none =>
+      match get? callerLocals dstEntry.targetLocal with
+      | .some slot => .some slot
+      | .none =>
+        get?
+          callerLocals
+          (Nat.sub dstEntry.targetLocal (length locals₃))
+  match srcRootSlot, dstRootSlot with
+  | .some (.init srcRootVal), .some (.init dstRootVal) =>
+    let srcPtOpt := operandPointeeTy localDecls layouts src
+    let dstPtOpt := operandPointeeTy localDecls layouts dst
+    let srcEp : CopyEndpoint :=
+      { ptr := srcPtr, entry := srcEntry, rootVal := srcRootVal, pointeeOpt := srcPtOpt }
+    let dstEp : CopyEndpoint :=
+      { ptr := dstPtr, entry := dstEntry, rootVal := dstRootVal, pointeeOpt := dstPtOpt }
+    match
+      Bool.and
+        (checkDerefAlign localDecls layouts srcPtOpt srcPtr.offsetBytes)
+        (checkDerefAlign localDecls layouts dstPtOpt dstPtr.offsetBytes)
+    with
+    | false => .ub
+    | true =>
+      match copyPointeeSizesConflict localDecls layouts srcPtOpt dstPtOpt with
+      | true => .unsupported
+      | false =>
+        let elemSzOpt := copyPointeeByteSize? localDecls layouts srcPtOpt dstPtOpt
+        match elemSzOpt with
+        | .some .zero => .noop
+        | _ =>
+          let srcWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ srcEp elemSzOpt
+          let dstWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ dstEp elemSzOpt
+          match srcWinOpt, dstWinOpt with
+          | .some (srcParentProj, srcBaseIdx, srcElems),
+            .some (dstParentProj, dstBaseIdx, dstElems) =>
+            copySliceElements
+              localDecls
+              layouts
+              locals₃
+              callerLocals
+              callStack
+              srcEp
+              dstEp
+              elemSzOpt
+              n
+              srcParentProj
+              srcBaseIdx
+              srcElems
+              dstParentProj
+              dstBaseIdx
+              dstElems
+          | _, _ =>
+            copyBytesSubplace
+              localDecls
+              layouts
+              locals₃
+              callerLocals
+              callStack
+              srcEp
+              dstEp
+              elemSzOpt
+              n
+              srcWinOpt
+              dstWinOpt
+  | _, _ => .ub
+
+/--
+Write `newVal` to `dstPlace` in `locals₃` (or `s.memory.callerLocals` when
+`dstPlace.local_` indexes a caller-owned referent), install the borrow table
+`borrows'` computed by the caller, and advance `s` to the next statement: the
+destination commit of `commitCopyDstPlaceWrite` for a copy whose Tree Borrows
+transition (`borrowsAfterCopySlice`) was already applied.
+-/
+def commitCopyDstPlaceWriteWithBorrows
+    (s : MachineState)
+    (dstPlace : Place)
+    (locals₃ : List LocalSlot)
+    (newVal : Value)
+    (borrows' : List BorrowEntry)
+    (localDecls : List LocalDecl := .nil)
+    (layouts : LayoutTable := emptyLayoutTable) :
+    MirStepNode :=
+  match
+    writePlaceValue
+      locals₃
+      s.memory.borrows
+      dstPlace
+      newVal
+      localDecls
+      layouts
+  with
+  | .ok locals₄ =>
+    MirStepNode.step
+      (advanceStmt
+        s
+        locals₄
+        { s.memory with borrows := borrows' })
+  | .unsupported => MirStepNode.unsupported
+  | .ub =>
+    match get? locals₃ dstPlace.local_ with
+    | .some _ => MirStepNode.fail .ub
+    | .none =>
+      let callerIdx :=
+        match get? s.memory.callerLocals dstPlace.local_ with
+        | .some _ => dstPlace.local_
+        | .none => Nat.sub dstPlace.local_ (length locals₃)
+      let callerWriteRes : PlaceWriteResult :=
+        match dstPlace.projection with
+        | .nil =>
+          match get? s.memory.callerLocals callerIdx with
+          | .some .dead => .ub
+          | .some _ =>
+            match set? s.memory.callerLocals callerIdx (.init newVal) with
+            | .some callerLocals' => .ok callerLocals'
+            | .none => .ub
+          | .none => .ub
+        | .deref :: _ => .ub
+        | proj :: rest =>
+          match get? s.memory.callerLocals callerIdx with
+          | .some (.init rootVal) =>
+            match
+              writeProjectedValue
+                locals₃
+                rootVal
+                (proj :: rest)
+                newVal
+            with
+            | .ok rootVal' =>
+              match set? s.memory.callerLocals callerIdx (.init rootVal') with
+              | .some callerLocals' => .ok callerLocals'
+              | .none => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | _ => .ub
+      match callerWriteRes with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok callerLocals' =>
+        MirStepNode.step
+          (advanceStmt
+            s
+            locals₃
+            { s.memory with
+              borrows := borrows'
+              callerLocals := callerLocals' })
+
+/--
+Evaluate a `copy_nonoverlapping` of `countBits ≥ 1` elements that is neither a
+union copy nor the single-element direct copy: resolve it
+(`resolveCopySubplaceMulti`) and commit the outcome: `.ub`, `.unsupported`, a
+no-op step, or a destination write. A write first runs the Tree Borrows
+read-then-write check and transition on the accessed source and destination
+places (`borrowsAfterCopySlice`, `.ub` on a violation) and then commits the
+value with the updated borrow table (`commitCopyDstPlaceWriteWithBorrows`).
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "Copies count * size_of::<T>() bytes from src to dst. The source and destination must not overlap."
+
+Justification and modeling assumptions: see `resolveCopySubplaceMulti`.
+-/
+def evalCopySubplaceMulti
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  match
+    resolveCopySubplaceMulti
+      s.memory.callerLocals
+      s.memory.callStack
+      src
+      dst
+      localDecls
+      layouts
+      srcPtr
+      dstPtr
+      srcEntry
+      dstEntry
+      countBits
+      locals₃
+  with
+  | .ub => MirStepNode.fail .ub
+  | .unsupported => MirStepNode.unsupported
+  | .noop => MirStepNode.step (advanceStmt s locals₃)
+  | .write dstPlace newVal srcWindowProj dstWindowProj =>
+    match
+      borrowsAfterCopySlice
+        s.memory.borrows
+        s.memory.activeProtectors
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        srcWindowProj
+        dstWindowProj
+    with
+    | .none => MirStepNode.fail .ub
+    | .some borrows' =>
+      commitCopyDstPlaceWriteWithBorrows
+        s
+        dstPlace
+        locals₃
+        newVal
+        borrows'
+        localDecls
+        layouts
+
+/--
+Evaluate `copy_nonoverlapping` once `srcVal`, `dstVal`, and scalar `countBits`
+have been evaluated into `locals₃`, supporting direct element copies,
+byte-encoded copies into initialized or union destinations, untyped copies of
+uninitialized union bytes (`FieldsShape.union`) into a union destination, and
+multi-element and offset sub-place copies (`evalCopySubplaceMulti`).
+
+The union copy (`evalCopyUnionBytes`) and the single-element direct copy
+(`evalCopySingleDirect`, `countBits = 1` with both pointers at byte offset `0`)
+are dispatched first and are unchanged; every other copy copies
+`countBits * size_of::<T>()` bytes through `evalCopySubplaceMulti`
+(`RawPtrOffsetMutator:wrong_value:MirDiffTag.normalScalar`).
+
+Reference (`core::ptr::copy_nonoverlapping`, Rust 1.98.0):
+<https://doc.rust-lang.org/1.98.0/core/ptr/fn.copy_nonoverlapping.html>
+
+> "Copies count * size_of::<T>() bytes from src to dst. The source and destination must not overlap."
+
+Reference (The Rust Reference, "Behavior considered undefined"):
+<https://doc.rust-lang.org/1.98.0/reference/behavior-considered-undefined.html>
+
+> "The following is a non-exhaustive list of invalid values:
+> - A value of any type, other than a union or raw pointer, with uninitialized
+>   bytes (except for padding bytes, which may be uninitialized)."
+
+Justification: the copied byte count is `count * size_of::<T>()`, so only the
+case `count = 1` at the start of the pointed-to place is a copy of exactly one
+value of that place; all other cases are resolved on element windows or bytes.
+-/
+def evalCopyNonOverlappingPermOk
+    (s : MachineState)
+    (src dst : Operand)
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr)
+    (srcEntry dstEntry : BorrowEntry)
+    (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    MirStepNode :=
+  let n := countBits
+  let srcStart := srcPtr.offsetBytes
+  let dstStart := dstPtr.offsetBytes
+  let srcUnionOpt :=
+    resolveUnionEndpoint? localDecls layouts locals₃ srcEntry
+  let dstUnionOpt :=
+    resolveUnionEndpoint? localDecls layouts locals₃ dstEntry
+  let hasUnionEndpoint :=
+    match srcUnionOpt, dstUnionOpt with
+    | .none, .none => false
+    | _, _ => true
+  match hasUnionEndpoint with
+  | true =>
+    evalCopyUnionBytes
+      s
+      src
+      dst
+      localDecls
+      layouts
+      srcPtr
+      dstPtr
+      srcEntry
+      dstEntry
+      srcUnionOpt
+      dstUnionOpt
+      n
+      locals₃
+  | false =>
+    let isSingleDirect :=
+      Bool.and
+        (Nat.beq n 1)
+        (Bool.and (Nat.beq srcStart 0) (Nat.beq dstStart 0))
+    match isSingleDirect with
+    | true =>
+      evalCopySingleDirect
+        s
+        src
+        dst
+        localDecls
+        layouts
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        locals₃
+    | false =>
+      evalCopySubplaceMulti
+        s
+        src
+        dst
+        localDecls
+        layouts
+        srcPtr
+        dstPtr
+        srcEntry
+        dstEntry
+        n
+        locals₃
 
 /--
 Frame-qualified single-element direct value copy (`count == 1`, `srcStart == 0`,
@@ -2828,11 +3775,17 @@ and nested aggregate field writes (`_1.a.b = v` or `_1.0.1 = v`) materialize
 `.aggregate 0 ...` shells at every intermediate `.adt` or `.tuple` field.
 A field with a higher index that was never written still faults with `.ub` when
 read, while a lower-index field that was never written reads as the `.unit`
-padding that `setOrExtendFields` also uses for union fields. Every other
+padding that `setOrExtendFields` also uses for union fields. A leading
+`ProjectionElem.opaqueCast` (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is stripped
+together with the rest of the leading cast chain (`stripLeadingOpaqueCast`), and
+the shell is the one of the field projection below it, keyed on the effective
+cast type: local `loc` is re-declared at that type
+(`eraseLeadingOpaqueCastDecls`), because `(_loc as T).f = v` writes field `f` of
+`_loc` at type `T`, not at the local's declared opaque type. Every other
 projection head (`.index`, `.constantIndex`, `.subslice`, `.downcast`,
-`.opaqueCast`, `.unwrapUnsafeBinder`; `.deref` writes never reach this helper)
-and every non-aggregate declared type yields `.none`, preserving the fault on
-projected writes into uninitialized locals.
+`.unwrapUnsafeBinder`, or a cast chain not followed by `.field`; `.deref` writes
+never reach this helper) and every non-aggregate declared or cast type yields
+`.none`, preserving the fault on projected writes into uninitialized locals.
 
 Reference (MiniRust `spec/lang/step/statements.md` at commit
 `d821c6e3a3d358fa8a556774dc12b4aa5d0d65ed`):
@@ -2848,6 +3801,18 @@ Reference (The Rust Reference, "Union types"):
 
 > "Unions have no notion of an \"active field\". Instead, every union access
 > just interprets the storage as the type of the field used for the access."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification for the cast arm: the cast "changes the place's type to the given
+one, and makes no other changes", so the container whose field shell is
+allocated is the local at the cast type.
 -/
 def uninitFieldWriteShell?
     (localDecls : List LocalDecl)
@@ -2869,6 +3834,27 @@ def uninitFieldWriteShell?
         (ensureNestedFieldShells
           (.aggregate 0 .nil)
           (.field fieldIdx fieldTy :: rest))
+    | _ => .none
+  | .opaqueCast castTy =>
+    match stripLeadingOpaqueCast rest with
+    | .field fieldIdx fieldTy :: fieldRest =>
+      match
+        placeTy
+          (eraseLeadingOpaqueCastDecls localDecls layouts loc (.opaqueCast castTy :: rest))
+          layouts
+          { local_ := loc, projection := .nil }
+      with
+      | .some { kind := .adt _ _, .. } =>
+        .some
+          (ensureNestedFieldShells
+            (.aggregate 0 .nil)
+            (.field fieldIdx fieldTy :: fieldRest))
+      | .some { kind := .tuple _, .. } =>
+        .some
+          (ensureNestedFieldShells
+            (.aggregate 0 .nil)
+            (.field fieldIdx fieldTy :: fieldRest))
+      | _ => .none
     | _ => .none
   | _ => .none
 
@@ -3902,6 +4888,35 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// This statement exists to preserve a trace of a scrutinee matched against a
 > /// wildcard binding. ...
 > PlaceMention(Box<Place<'tcx>>),"
+
+Opaque-cast root dispatch (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): in
+`StatementKind.deinit`, `StatementKind.setDiscriminant`, and
+`StatementKind.assign`, a place whose projection is a pure
+`ProjectionElem.opaqueCast` chain (`stripLeadingOpaqueCast p.projection = .nil`
+with a leading `.opaqueCast`) names the whole local and takes the whole-local
+arm (`Deinit` marks the local `.uninit`, `Assign` may initialize a live
+`.uninit` local, and `SetDiscriminant` resolves the enum at the cast type via
+`eraseLeadingOpaqueCastDecls`). A cast chain followed by further projections
+takes the projected arm unchanged, whose typed helpers follow `.opaqueCast`
+steps and whose field shell for an uninitialized local is keyed on the cast
+type (`uninitFieldWriteShell?`). Places without a leading `.opaqueCast` evaluate
+exactly as before.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification: the cast "changes the place's type to the given one, and makes no
+other changes", so whether a statement addresses a whole local or a strict
+sub-place is decided by the projections below the leading casts, and any
+type-directed step uses the cast type.
+
+Modeling assumption: well-formedness of each cast is a compiler fact about the
+captured MIR and is not re-checked.
 -/
 def evalStmt
     (s : MachineState)
@@ -4144,8 +5159,8 @@ def evalStmt
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
   | .deinit p =>
-    match p.projection with
-    | .nil =>
+    match p.projection, stripLeadingOpaqueCast p.projection with
+    | .nil, _ =>
       match get? s.frame.locals p.local_ with
       | .some .dead => MirStepNode.fail .ub
       | .some _ =>
@@ -4153,7 +5168,15 @@ def evalStmt
         | .some locals' => MirStepNode.step (advanceStmt s locals')
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | proj :: rest =>
+    | .opaqueCast _ :: _, .nil =>
+      match get? s.frame.locals p.local_ with
+      | .some .dead => MirStepNode.fail .ub
+      | .some _ =>
+        match set? s.frame.locals p.local_ .uninit with
+        | .some locals' => MirStepNode.step (advanceStmt s locals')
+        | .none => MirStepNode.fail .ub
+      | .none => MirStepNode.fail .ub
+    | proj :: rest, _ =>
       match get? s.frame.locals p.local_ with
       | .some (.init rootVal) =>
         match readProjectedValue s.frame.locals rootVal (proj :: rest) with
@@ -4183,8 +5206,8 @@ def evalStmt
   | .intrinsic (.copyNonOverlapping src dst count) =>
     evalCopyNonOverlapping s src dst count localDecls layouts
   | .setDiscriminant p variantIdx =>
-    match p.projection with
-    | .nil =>
+    match p.projection, stripLeadingOpaqueCast p.projection with
+    | .nil, _ =>
       match get? s.frame.locals p.local_ with
       | .some (.init (.aggregate _ fields)) =>
         evalSetDiscriminantLocal s p.local_ variantIdx fields
@@ -4195,7 +5218,26 @@ def evalStmt
         | false => MirStepNode.unsupported
       | .some .dead => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | proj :: rest =>
+    | .opaqueCast castTy :: restCast, .nil =>
+      match get? s.frame.locals p.local_ with
+      | .some (.init (.aggregate _ fields)) =>
+        evalSetDiscriminantLocal s p.local_ variantIdx fields
+      | .some (.init _) => MirStepNode.fail .ub
+      | .some .uninit =>
+        match
+          setDiscriminantUninitDeclOk
+            (eraseLeadingOpaqueCastDecls
+              localDecls
+              layouts
+              p.local_
+              (.opaqueCast castTy :: restCast))
+            p.local_
+        with
+        | true => evalSetDiscriminantLocal s p.local_ variantIdx .nil
+        | false => MirStepNode.unsupported
+      | .some .dead => MirStepNode.fail .ub
+      | .none => MirStepNode.fail .ub
+    | proj :: rest, _ =>
       match
         evalOperand
           s.frame.locals
@@ -4323,8 +5365,8 @@ def evalStmt
   | .assign dst rv =>
     match evalRvalue s.frame.locals rv s.memory localDecls layouts with
     | .ok val locals₁ mem₁ =>
-      match dst.projection with
-      | .nil =>
+      match dst.projection, stripLeadingOpaqueCast dst.projection with
+      | .nil, _ =>
         match get? locals₁ dst.local_ with
         | .some .dead => MirStepNode.fail .ub
         | .some _ =>
@@ -4358,7 +5400,7 @@ def evalStmt
                   (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
           | .none => MirStepNode.fail .ub
         | .none => MirStepNode.fail .ub
-      | .deref :: restProj =>
+      | .deref :: restProj, _ =>
         match
           evalPlaceWrite
             locals₁
@@ -4435,7 +5477,41 @@ def evalStmt
           | _ :: _ =>
             evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
         | .unsupported => MirStepNode.unsupported
-      | proj :: rest =>
+      | .opaqueCast _ :: _, .nil =>
+        match get? locals₁ dst.local_ with
+        | .some .dead => MirStepNode.fail .ub
+        | .some _ =>
+          match set? locals₁ dst.local_ (.init val) with
+          | .some locals₂ =>
+            match mem₁.activeProtectors with
+            | .nil =>
+              let borrows' :=
+                invalidateConflictingBorrows
+                  mem₁.borrows dst.local_ .none (length mem₁.callStack)
+              MirStepNode.step
+                (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+            | protHead :: protTail =>
+              match
+                hasProtectedWriteConflict
+                  mem₁.borrows
+                  (protHead :: protTail)
+                  dst.local_
+                  .none
+                  .nil
+                  0
+                  0
+                  (length mem₁.callStack)
+              with
+              | true => MirStepNode.fail .ub
+              | false =>
+                let borrows' :=
+                  invalidateConflictingBorrows
+                    mem₁.borrows dst.local_ .none (length mem₁.callStack)
+                MirStepNode.step
+                  (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+          | .none => MirStepNode.fail .ub
+        | .none => MirStepNode.fail .ub
+      | proj :: rest, _ =>
         match get? locals₁ dst.local_ with
         | .some (.init rootVal) =>
           match
@@ -5030,7 +6106,9 @@ theorem uninitFieldWriteShell?_field_tuple
 
 /--
 `uninitFieldWriteShell?` yields `.none` for every projection head other than a
-field projection, regardless of any trailing projections `rest`.
+field projection or a leading `.opaqueCast` (whose shell is the one of the
+field projection below the cast chain, `DIV-TR-OPAQUECAST-ROOT-DISPATCH`),
+regardless of any trailing projections `rest`.
 -/
 theorem uninitFieldWriteShell?_eq_none_of_not_field
     (localDecls : List LocalDecl)
@@ -5038,10 +6116,12 @@ theorem uninitFieldWriteShell?_eq_none_of_not_field
     (loc : Local)
     (proj : ProjectionElem)
     (rest : List ProjectionElem := .nil)
-    (hNotField : ∀ (fieldIdx : FieldIdx) (fieldTy : Ty), proj ≠ .field fieldIdx fieldTy) :
+    (hNotField : ∀ (fieldIdx : FieldIdx) (fieldTy : Ty), proj ≠ .field fieldIdx fieldTy)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by intro _ h; nomatch h) :
     uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
   cases proj with
   | field fieldIdx fieldTy => exact False.elim (hNotField fieldIdx fieldTy rfl)
+  | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
   | _ => rfl
 
 /--
@@ -5060,9 +6140,11 @@ theorem uninitFieldWriteShell?_eq_none_of_non_aggregate_ty
         .some { kind := .adt defPath args, layoutIdx := layoutIdx })
     (hNotTuple : ∀ (fields : List RigidTy) (layoutIdx : Nat),
       placeTy localDecls layouts { local_ := loc, projection := .nil } ≠
-        .some { kind := .tuple fields, layoutIdx := layoutIdx }) :
+        .some { kind := .tuple fields, layoutIdx := layoutIdx })
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by intro _ h; nomatch h) :
     uninitFieldWriteShell? localDecls layouts loc proj rest = .none := by
   cases proj with
+  | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
   | field fieldIdx fieldTy =>
     unfold uninitFieldWriteShell?
     cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
@@ -5077,7 +6159,10 @@ theorem uninitFieldWriteShell?_eq_none_of_non_aggregate_ty
 
 /--
 Whether `uninitFieldWriteShell?` returns `.none` depends only on the root local
-and the head projection `proj`, not on the trailing projection path `rest`.
+and the head projection `proj`, not on the trailing projection path `rest`,
+for a head projection other than `.opaqueCast` (`hNotCast`; the shell below a
+leading cast chain depends on the projections that follow it,
+`DIV-TR-OPAQUECAST-ROOT-DISPATCH`).
 -/
 @[simp]
 theorem uninitFieldWriteShell?_eq_none_iff
@@ -5085,10 +6170,12 @@ theorem uninitFieldWriteShell?_eq_none_iff
     (layouts : LayoutTable)
     (loc : Local)
     (proj : ProjectionElem)
-    (rest : List ProjectionElem) :
+    (rest : List ProjectionElem)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by intro _ h; nomatch h) :
     uninitFieldWriteShell? localDecls layouts loc proj rest = .none ↔
       uninitFieldWriteShell? localDecls layouts loc proj .nil = .none := by
   cases proj with
+  | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
   | field fieldIdx fieldTy =>
     unfold uninitFieldWriteShell?
     cases hTy : placeTy localDecls layouts { local_ := loc, projection := .nil } with
@@ -5540,14 +6627,16 @@ theorem evalStmt_assign_uninit_non_aggregate_ub
     (hNotDeref : proj ≠ .deref)
     (hRv : evalRvalue s.frame.locals rv s.memory localDecls layouts = .ok val locals₁ mem₁)
     (hUninit : get? locals₁ dstLoc = .some .uninit)
-    (hNoShell : uninitFieldWriteShell? localDecls layouts dstLoc proj = .none) :
+    (hNoShell : uninitFieldWriteShell? localDecls layouts dstLoc proj = .none)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by intro _ h; nomatch h) :
     evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.fail .ub := by
   have hNoShellRest :
       uninitFieldWriteShell? localDecls layouts dstLoc proj rest = .none :=
-    (uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest).mpr hNoShell
+    (uninitFieldWriteShell?_eq_none_iff localDecls layouts dstLoc proj rest hNotCast).mpr hNoShell
   cases proj with
   | deref => exact False.elim (hNotDeref rfl)
+  | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
   | _ => simp [evalStmt, hRv, hUninit, hNoShellRest]
 
 /--
@@ -5692,7 +6781,8 @@ theorem evalStmt_assign_init_projected_step
       mem₁.activeProtectors = protHead :: protTail →
       hasProtectedWriteConflict mem₁.borrows (protHead :: protTail) dstLoc .none
         (resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc
-          (proj :: rest)) 0 0 (length mem₁.callStack) = false) :
+          (proj :: rest)) 0 0 (length mem₁.callStack) = false)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy := by intro _ h; nomatch h) :
     evalStmt s ⟨.assign ⟨dstLoc, proj :: rest⟩ rv, span⟩ localDecls layouts =
       MirStepNode.step
         (advanceStmt s locals₂
@@ -5736,6 +6826,7 @@ theorem evalStmt_assign_init_projected_step
                         (proj :: rest)) 0 0 (length mem₁.callStack) }) := by
     cases proj with
     | deref => exact False.elim (hNotDeref rfl)
+    | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
     | _ =>
       unfold evalStmt
       dsimp only

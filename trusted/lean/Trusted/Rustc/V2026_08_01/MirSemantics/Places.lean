@@ -10121,6 +10121,116 @@ def evalPlaceRead
     | .none => .ub
 
 /--
+The maximal leading run of `ProjectionElem.opaqueCast` projections of `proj`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): `(_l as T₁ as … as Tₙ).rest` has leading
+cast chain `[.opaqueCast T₁, …, .opaqueCast Tₙ]`, whose `placeTyResolved` on
+`_l` is the effective cast type `Tₙ`.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification: every element of the returned prefix "changes the place's type to
+the given one, and makes no other changes", so the prefix names the same memory
+as the bare local at the type of its last cast.
+
+Modeling assumption: well-formedness of the cast (an opaque type of the current
+crate) is a compiler fact about captured MIR and is not re-checked.
+-/
+@[reducible]
+def takeLeadingOpaqueCast : List ProjectionElem → List ProjectionElem
+  | .opaqueCast castTy :: rest => .opaqueCast castTy :: takeLeadingOpaqueCast rest
+  | _ => .nil
+
+/--
+`proj` without its maximal leading run of `ProjectionElem.opaqueCast`
+projections (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): `.nil` exactly when `proj` is a
+pure cast chain, i.e. when the place names the whole local.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification: an `OpaqueCast` "makes no other changes" to the place, so whether
+a place is the whole local (root dispatch: de-initializing move, whole-local
+write, whole-local deinitialization) or a strict sub-place is decided by the
+projections that remain after the leading casts.
+
+Modeling assumption: only leading casts are stripped; an `OpaqueCast` after a
+field, index, or dereference projection stays part of the projected path, which
+the projection evaluators treat as transparent.
+-/
+@[reducible]
+def stripLeadingOpaqueCast : List ProjectionElem → List ProjectionElem
+  | .opaqueCast _ :: rest => stripLeadingOpaqueCast rest
+  | proj => proj
+
+/--
+`localDecls` with the declared type of local `loc` replaced by `ty` (other
+fields of the `LocalDecl` and every other declaration are unchanged; an
+out-of-range `loc` leaves `localDecls` unchanged).
+-/
+@[reducible]
+def setLocalDeclTy : List LocalDecl → Nat → Ty → List LocalDecl
+  | .nil, _, _ => .nil
+  | decl :: rest, .zero, ty => { decl with ty := ty } :: rest
+  | decl :: rest, .succ idx, ty => decl :: setLocalDeclTy rest idx ty
+
+/--
+Local declarations for evaluating the place `(_loc as T₁ as … as Tₙ).rest` below
+its leading cast chain (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): when `proj` starts
+with `.opaqueCast` and the effective cast type
+`placeTyResolved localDecls layouts ⟨loc, takeLeadingOpaqueCast proj⟩` is known,
+local `loc` is re-declared at that type (`setLocalDeclTy`); otherwise (no
+leading cast, or an undeclared local) `localDecls` is returned unchanged
+(definitionally, for a projection that does not start with `.opaqueCast`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification: the cast "changes the place's type to the given one", so every
+type-directed step below the cast chain (field shells of an uninitialized
+local, typed validation of a stored value, union detection, enum layouts) must
+use the cast type rather than the local's declared opaque type. Re-declaring
+the local at the cast type expresses exactly that and changes nothing else.
+
+Modeling assumption: the effective cast type is resolved against the original
+`localDecls` (`resolveTyWithLocalDecls` inside `placeTyResolved`), as the
+projection evaluators already do for `.opaqueCast` steps.
+-/
+@[reducible]
+def eraseLeadingOpaqueCastDecls
+    (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (loc : Local)
+    (proj : List ProjectionElem) :
+    List LocalDecl :=
+  match proj with
+  | .opaqueCast castTy :: rest =>
+    match
+      placeTyResolved
+        localDecls
+        layouts
+        { local_ := loc, projection := takeLeadingOpaqueCast (.opaqueCast castTy :: rest) }
+    with
+    | .some effCastTy => setLocalDeclTy localDecls loc effCastTy
+    | .none => localDecls
+  | _ => localDecls
+
+/--
 Evaluate an `Operand` in `locals` with active borrow table `borrows`, global
 allocations `globals`, and layout table `layouts`, supporting root locals
 (`projection = []`), dereferences (`ProjectionElem.deref` resolved through
@@ -10132,6 +10242,37 @@ projections.
 In `Runtime(PostCleanup)` MIR, reading a root local via `Operand.move`
 transitions its slot to `.uninit`, whereas a projected or dereferenced read
 extracts the sub-value while keeping the parent aggregate slot initialized.
+
+A moved pure cast chain `move (_l as T₁ as … as Tₙ)`
+(`stripLeadingOpaqueCast = .nil`, `DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is a move of
+the whole local: it de-initializes `_l` like a root move and, when `localDecls`
+is non-empty, validates the loaded value against the effective cast type
+(`placeTyResolved localDecls layouts p`). A cast chain followed by further
+projections keeps the projected read.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1310-L1314>
+
+> "/// Creates a value by performing loading the place, just like the `Copy` operand.
+> ///
+> /// This *may* additionally overwrite the place with `uninit` bytes, depending on how we decide
+> /// in [UCG#188]. You should not emit MIR that may attempt a subsequent second load of this
+> /// place without first re-initializing it."
+
+Justification for the cast arm: the cast "makes no other changes" to the place,
+so `move (_l as T)` loads the place `_l` at type `T` and is subject to the same
+"overwrite the place with `uninit`" treatment the model applies to `move _l`.
+Validating the loaded value at `T` is a modeling choice (a typed load at the
+cast type); it can only add `.ub` verdicts relative to the untyped root move.
 
 Reference (The Rust Reference, "Place expressions and value expressions"):
 <https://doc.rust-lang.org/1.98.0/reference/expressions.html#place-expressions-and-value-expressions>
@@ -10678,6 +10819,53 @@ def evalOperand
             accessedTyOpt
             (callStack := callStack)
         | _ => .ub
+    | .opaqueCast castTy :: restCast =>
+      match stripLeadingOpaqueCast restCast with
+      | .nil =>
+        match get? locals p.local_ with
+        | .some (.init v) =>
+          let tyValid :=
+            match localDecls with
+            | .nil => true
+            | _ :: _ =>
+              validateValueForTy? layouts (placeTyResolved localDecls layouts p) v
+          match tyValid with
+          | false => .ub
+          | true =>
+            match set? locals p.local_ .uninit with
+            | .some locals' => .ok v locals'
+            | .none => .ub
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
+      | _ :: _ =>
+        match get? locals p.local_ with
+        | .some (.init rootVal) =>
+          match placeTouchesUnion localDecls layouts p with
+          | false =>
+            match readProjectedValue locals rootVal (.opaqueCast castTy :: restCast) with
+            | .ok fieldVal => .ok fieldVal locals
+            | .ub => .ub
+            | .unsupported => .unsupported
+          | true =>
+            match
+              readProjectedForLocal
+                locals
+                localDecls
+                layouts
+                p.local_
+                rootVal
+                (.opaqueCast castTy :: restCast)
+            with
+            | .ok fieldVal =>
+              match validateValueForTy? layouts (placeTyResolved localDecls layouts p) fieldVal with
+              | true => .ok fieldVal locals
+              | false => .ub
+            | .ub => .ub
+            | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
     | proj :: rest =>
       match get? locals p.local_ with
       | .some (.init rootVal) =>
@@ -10730,6 +10918,311 @@ def evalOperands
       | .unsupported => .unsupported
     | .ub => .ub
     | .unsupported => .unsupported
+
+/--
+Whether `op` is a move of a place whose projection starts with
+`ProjectionElem.opaqueCast` (`move (_l as T)…`).
+-/
+@[reducible]
+def operandIsLeadingOpaqueCastMove : Operand → Bool
+  | .move { projection := .opaqueCast _ :: _, .. } => true
+  | _ => false
+
+/--
+Evaluate a terminator operand (`TerminatorKind.switchInt` discriminant,
+`TerminatorKind.assert` condition, `TerminatorKind.call` /
+`TerminatorKind.tailCall` function and argument operands)
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`): a move of a place that starts with
+`ProjectionElem.opaqueCast` is evaluated by `evalOperand` with the active body's
+`bodyLocalDecls`, so a moved pure cast chain `move (_l as T)` de-initializes
+`_l` and is validated against the cast type exactly as in a statement; every
+other operand is evaluated as before with erased declarations
+(`localDecls := .nil`), definitionally.
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1310-L1314>
+
+> "/// Creates a value by performing loading the place, just like the `Copy` operand.
+> ///
+> /// This *may* additionally overwrite the place with `uninit` bytes, depending on how we decide
+> /// in [UCG#188]. You should not emit MIR that may attempt a subsequent second load of this
+> /// place without first re-initializing it."
+
+Justification: the cast changes only the place's type, so the load performed by
+a moved cast operand is the same in a terminator as in a statement; giving it
+the body's declarations applies one validation policy for moved cast operands
+in every context. Operands without a leading cast keep the erased evaluation the
+terminators used before, so no verdict changes for them.
+
+Modeling assumption: typed validation of non-cast terminator operands remains
+out of scope (erased evaluation), as before.
+-/
+@[reducible]
+def evalOperandWithBodyCast
+    (locals : List LocalSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry := .nil)
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (callerLocals : List LocalSlot := .nil)
+    (bodyLocalDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) :
+    PlaceReadResult :=
+  match operandIsLeadingOpaqueCastMove op with
+  | true => evalOperand locals op borrows globals layouts callerLocals bodyLocalDecls callStack
+  | false => evalOperand locals op borrows globals layouts callerLocals (callStack := callStack)
+
+/--
+Evaluate a list of terminator operands left-to-right with
+`evalOperandWithBodyCast`, threading `locals` state updates
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`). On operands without a leading
+`ProjectionElem.opaqueCast` move this is `evalOperands` with erased declarations
+(`evalOperandsWithBodyCast_eq_evalOperands`).
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification and modeling assumptions: see `evalOperandWithBodyCast`.
+-/
+def evalOperandsWithBodyCast
+    (locals : List LocalSlot)
+    (ops : List Operand)
+    (borrows : List BorrowEntry := .nil)
+    (globals : List CapturedAllocation := .nil)
+    (layouts : LayoutTable := emptyLayoutTable)
+    (callerLocals : List LocalSlot := .nil)
+    (bodyLocalDecls : List LocalDecl := .nil)
+    (callStack : List SavedCallerFrame := .nil) :
+    OperandsEvalResult :=
+  match ops with
+  | .nil => .ok .nil locals
+  | op :: rest =>
+    match
+      evalOperandWithBodyCast locals op borrows globals layouts callerLocals bodyLocalDecls callStack
+    with
+    | .ok v locals₁ =>
+      match
+        evalOperandsWithBodyCast
+          locals₁ rest borrows globals layouts callerLocals bodyLocalDecls callStack
+      with
+      | .ok vs locals₂ => .ok (v :: vs) locals₂
+      | .ub => .ub
+      | .unsupported => .unsupported
+    | .ub => .ub
+    | .unsupported => .unsupported
+
+/--
+Whether some operand of `ops` is a move of a place that starts with
+`ProjectionElem.opaqueCast`.
+-/
+@[reducible]
+def operandsHaveLeadingOpaqueCastMove : List Operand → Bool
+  | .nil => false
+  | op :: rest =>
+    match operandIsLeadingOpaqueCastMove op with
+    | true => true
+    | false => operandsHaveLeadingOpaqueCastMove rest
+
+/--
+`evalOperandWithBodyCast` on a constant operand is the erased `evalOperand`.
+-/
+@[simp]
+theorem evalOperandWithBodyCast_constant
+    (locals : List LocalSlot)
+    (c : ConstOperand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast
+        locals (.constant c) borrows globals layouts callerLocals bodyLocalDecls callStack =
+      evalOperand locals (.constant c) borrows globals layouts callerLocals
+        (callStack := callStack) :=
+  rfl
+
+/--
+`evalOperandWithBodyCast` on a copied place is the erased `evalOperand`.
+-/
+@[simp]
+theorem evalOperandWithBodyCast_copy
+    (locals : List LocalSlot)
+    (p : Place)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast
+        locals (.copy p) borrows globals layouts callerLocals bodyLocalDecls callStack =
+      evalOperand locals (.copy p) borrows globals layouts callerLocals
+        (callStack := callStack) :=
+  rfl
+
+/--
+`evalOperandWithBodyCast` on a moved whole local is the erased `evalOperand`.
+-/
+@[simp]
+theorem evalOperandWithBodyCast_move_nil
+    (locals : List LocalSlot)
+    (loc : Local)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandWithBodyCast
+        locals (.move { local_ := loc, projection := .nil }) borrows globals layouts
+        callerLocals bodyLocalDecls callStack =
+      evalOperand locals (.move { local_ := loc, projection := .nil }) borrows globals layouts
+        callerLocals (callStack := callStack) :=
+  rfl
+
+/--
+`evalOperandWithBodyCast` on a moved place whose first projection is not
+`ProjectionElem.opaqueCast` is the erased `evalOperand`.
+-/
+@[simp]
+theorem evalOperandWithBodyCast_move_of_head_not_cast
+    (locals : List LocalSlot)
+    (loc : Local)
+    (proj : ProjectionElem)
+    (rest : List ProjectionElem)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy) :
+    evalOperandWithBodyCast
+        locals (.move { local_ := loc, projection := proj :: rest }) borrows globals layouts
+        callerLocals bodyLocalDecls callStack =
+      evalOperand locals (.move { local_ := loc, projection := proj :: rest }) borrows globals
+        layouts callerLocals (callStack := callStack) := by
+  cases proj with
+  | opaqueCast castTy => exact False.elim (hNotCast castTy rfl)
+  | _ => rfl
+
+/--
+`evalOperandsWithBodyCast` on the empty operand list.
+-/
+@[simp]
+theorem evalOperandsWithBodyCast_nil
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandsWithBodyCast
+        locals .nil borrows globals layouts callerLocals bodyLocalDecls callStack =
+      .ok .nil locals :=
+  rfl
+
+/--
+`evalOperandsWithBodyCast` on a non-empty operand list evaluates the head with
+`evalOperandWithBodyCast` and then the tail.
+-/
+@[simp]
+theorem evalOperandsWithBodyCast_cons
+    (locals : List LocalSlot)
+    (op : Operand)
+    (rest : List Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame) :
+    evalOperandsWithBodyCast
+        locals (op :: rest) borrows globals layouts callerLocals bodyLocalDecls callStack =
+      match
+        evalOperandWithBodyCast
+          locals op borrows globals layouts callerLocals bodyLocalDecls callStack
+      with
+      | .ok v locals₁ =>
+        match
+          evalOperandsWithBodyCast
+            locals₁ rest borrows globals layouts callerLocals bodyLocalDecls callStack
+        with
+        | .ok vs locals₂ => .ok (v :: vs) locals₂
+        | .ub => .ub
+        | .unsupported => .unsupported
+      | .ub => .ub
+      | .unsupported => .unsupported :=
+  rfl
+
+/--
+An operand without a leading `ProjectionElem.opaqueCast` move is evaluated by
+`evalOperandWithBodyCast` exactly as by `evalOperand` with erased declarations.
+-/
+theorem evalOperandWithBodyCast_eq_evalOperand
+    (locals : List LocalSlot)
+    (op : Operand)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (hNoCast : operandIsLeadingOpaqueCastMove op = false) :
+    evalOperandWithBodyCast
+        locals op borrows globals layouts callerLocals bodyLocalDecls callStack =
+      evalOperand locals op borrows globals layouts callerLocals (callStack := callStack) := by
+  unfold evalOperandWithBodyCast
+  rw [hNoCast]
+
+/--
+An operand list without a leading `ProjectionElem.opaqueCast` move is evaluated
+by `evalOperandsWithBodyCast` exactly as by `evalOperands` with erased
+declarations.
+-/
+theorem evalOperandsWithBodyCast_eq_evalOperands
+    (ops : List Operand)
+    (locals : List LocalSlot)
+    (borrows : List BorrowEntry)
+    (globals : List CapturedAllocation)
+    (layouts : LayoutTable)
+    (callerLocals : List LocalSlot)
+    (bodyLocalDecls : List LocalDecl)
+    (callStack : List SavedCallerFrame)
+    (hNoCast : operandsHaveLeadingOpaqueCastMove ops = false) :
+    evalOperandsWithBodyCast
+        locals ops borrows globals layouts callerLocals bodyLocalDecls callStack =
+      evalOperands locals ops borrows globals layouts callerLocals (callStack := callStack) := by
+  induction ops generalizing locals with
+  | nil => rfl
+  | cons op rest ih =>
+    unfold operandsHaveLeadingOpaqueCastMove at hNoCast
+    cases hOp : operandIsLeadingOpaqueCastMove op with
+    | true => rw [hOp] at hNoCast; nomatch hNoCast
+    | false =>
+      rw [hOp] at hNoCast
+      unfold evalOperandsWithBodyCast evalOperands
+      rw [evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _ hOp]
+      cases evalOperand locals op borrows globals layouts callerLocals (callStack := callStack) with
+      | ok v locals₁ => dsimp only; rw [ih locals₁ hNoCast]
+      | ub => rfl
+      | unsupported => rfl
 
 /--
 Extract the underlying `ProvenancePtr` from either a thin pointer (`Value.ptr`)
@@ -11552,6 +12045,16 @@ checked against `TreeBorrowPerm`), and nested `.field`, `.downcast`, `.index`,
 `.constantIndex`, `.subslice`, `.opaqueCast`, and `.unwrapUnsafeBinder`
 projections.
 
+A destination that starts with `ProjectionElem.opaqueCast`
+(`DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is dispatched on the projections that remain
+after the leading cast chain (`stripLeadingOpaqueCast`): a pure cast chain
+`(_l as T)` is a write of the whole local (allowed on a live `.uninit` slot,
+validated against the cast type `placeTy localDecls layouts dst` when
+`localDecls` is non-empty); a cast chain followed by a dereference is not
+modeled (`.unsupported`); and a cast chain followed by any other projection is
+a projected write evaluated with local `dst.local_` re-declared at the cast type
+(`eraseLeadingOpaqueCastDecls`).
+
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L305-L310>
@@ -11560,6 +12063,25 @@ Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 > /// (`x = ...`) except without the possibility of dropping the previous value
 > /// (that must be done separately, if at all).
 > Assign(Box<(Place<'tcx>, Rvalue<'tcx>)>),"
+
+Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
+`14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+Justification for the cast arm: the cast "changes the place's type to the given
+one, and makes no other changes", so `(_l as T) = v` stores `v` to the whole
+local `_l` at type `T` (which does not require `_l` to be initialized, as for
+`_l = v`), and `(_l as T).f = v` is the projected store `_l.f = v` with `_l`
+typed `T`.
+
+Modeling assumptions and unsupported behavior: a dereference directly below a
+cast chain (`*(_l as T)`) fails closed with `.unsupported`; validation of the
+stored value at the cast type is the typed-store policy of the root arm applied
+at the cast type.
 -/
 def writePlaceValue
     (locals : List LocalSlot)
@@ -11721,6 +12243,53 @@ def writePlaceValue
             | _ => .ub
         | .none => .ub
     | _ => .ub
+  | .opaqueCast castTy :: restCast =>
+    let tyValid :=
+      match localDecls with
+      | .nil => true
+      | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) val
+    match stripLeadingOpaqueCast restCast with
+    | .nil =>
+      match tyValid with
+      | false => .ub
+      | true =>
+        match get? locals dst.local_ with
+        | .some .dead => .ub
+        | .some _ =>
+          match set? locals dst.local_ (.init val) with
+          | .some locals' => .ok locals'
+          | .none => .ub
+        | .none => .ub
+    | .deref :: _ => .unsupported
+    | _ :: _ =>
+      match tyValid with
+      | false => .ub
+      | true =>
+        match get? locals dst.local_ with
+        | .some (.init rootVal) =>
+          match
+            writeProjectedForLocal
+              locals
+              (eraseLeadingOpaqueCastDecls
+                localDecls
+                layouts
+                dst.local_
+                (.opaqueCast castTy :: restCast))
+              layouts
+              dst.local_
+              rootVal
+              (.opaqueCast castTy :: restCast)
+              val
+          with
+          | .ok rootVal' =>
+            match set? locals dst.local_ (.init rootVal') with
+            | .some locals' => .ok locals'
+            | .none => .ub
+          | .ub => .ub
+          | .unsupported => .unsupported
+        | .some .uninit => .ub
+        | .some .dead => .ub
+        | .none => .ub
   | proj :: rest =>
     let tyValid :=
       match localDecls with

@@ -1650,8 +1650,8 @@ def finishAssignStmtNode
   | .ub => MirStepNode.fail .ub
   | .unsupported => MirStepNode.unsupported
   | .ok val locals₁ mem₁ =>
-    match dst.projection with
-    | .nil =>
+    match dst.projection, stripLeadingOpaqueCast dst.projection with
+    | .nil, _ =>
       match get? locals₁ dst.local_ with
       | .some .dead => MirStepNode.fail .ub
       | .some _ =>
@@ -1685,7 +1685,7 @@ def finishAssignStmtNode
                 (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
-    | .deref :: restProj =>
+    | .deref :: restProj, _ =>
       match
         evalPlaceWrite
           locals₁
@@ -1762,7 +1762,41 @@ def finishAssignStmtNode
         | _ :: _ =>
           evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
       | .unsupported => MirStepNode.unsupported
-    | proj :: rest =>
+    | .opaqueCast _ :: _, .nil =>
+      match get? locals₁ dst.local_ with
+      | .some .dead => MirStepNode.fail .ub
+      | .some _ =>
+        match set? locals₁ dst.local_ (.init val) with
+        | .some locals₂ =>
+          match mem₁.activeProtectors with
+          | .nil =>
+            let borrows' :=
+              invalidateConflictingBorrows
+                mem₁.borrows dst.local_ .none (length mem₁.callStack)
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+          | protHead :: protTail =>
+            match
+              hasProtectedWriteConflict
+                mem₁.borrows
+                (protHead :: protTail)
+                dst.local_
+                .none
+                .nil
+                0
+                0
+                (length mem₁.callStack)
+            with
+            | true => MirStepNode.fail .ub
+            | false =>
+              let borrows' :=
+                invalidateConflictingBorrows
+                  mem₁.borrows dst.local_ .none (length mem₁.callStack)
+              MirStepNode.step
+                (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | .none => MirStepNode.fail .ub
+      | .none => MirStepNode.fail .ub
+    | proj :: rest, _ =>
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
         match
@@ -2017,14 +2051,15 @@ def evalTerminatorSymTree
   match term.kind with
   | .switchInt discr targets =>
     match
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         discr
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        currentBody.localDecls
+        s.memory.callStack
     with
     | .ok (.scalar sc) locals' =>
       (lookupSwitchTargetTree sc.bits targets.branches targets.otherwise).bind
@@ -2041,14 +2076,15 @@ def evalTerminatorSymTree
     | .unsupported => .leaf MirStepNode.unsupported
   | .assert cond expected target unwind =>
     match
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         cond
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack)
+        currentBody.localDecls
+        s.memory.callStack
     with
     | .ok (.scalar sc) locals' =>
       let expectedBit := match expected with | true => 1 | false => 0
@@ -2077,9 +2113,9 @@ theorem evalTerminatorSymTree_eval
   rcases term with ⟨kind, span⟩
   cases kind with
   | switchInt discr targets =>
-    dsimp only [evalTerminatorSymTree, evalTerminator]
-    cases evalOperand s.frame.locals discr s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals
-        (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf]
+    cases evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals
+        currentBody.layouts s.memory.callerLocals currentBody.localDecls s.memory.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -2090,9 +2126,9 @@ theorem evalTerminatorSymTree_eval
         rfl
       | _ => rfl
   | assert cond expected target unwind =>
-    dsimp only [evalTerminatorSymTree, evalTerminator]
-    cases evalOperand s.frame.locals cond s.memory.borrows s.memory.globals currentBody.layouts s.memory.callerLocals
-        (callStack := s.memory.callStack) with
+    dsimp only [evalTerminatorSymTree, evalTerminator, bodyLocalDeclsOf]
+    cases evalOperandWithBodyCast s.frame.locals cond s.memory.borrows s.memory.globals
+        currentBody.layouts s.memory.callerLocals currentBody.localDecls s.memory.callStack with
     | ub => rfl
     | unsupported => rfl
     | ok v locals' =>
@@ -5288,14 +5324,15 @@ theorem resolveCallTarget_indirect_fnPtr
     (fnEntry : FnPtrEntry)
     (h_nonConst : extractCalleeDefPath? func = .none)
     (h_eval :
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         func
         s.memory.borrows
         s.memory.globals
         bodyLayouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        bodyLocalDecls
+        s.memory.callStack =
       .ok (.ptr ptrVal 8) localsAfterFunc)
     (h_off : ptrVal.offsetBytes = 0)
     (h_noBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none)
@@ -5352,14 +5389,15 @@ theorem evalTerminatorSymTree_call_extCall
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_indirect : resolvedTarget.isIndirect = false)
     (h_callee :
@@ -5416,14 +5454,15 @@ theorem evalTerminatorSymTree_call_inlined_of_calleeCtx
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -5480,14 +5519,15 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -5512,12 +5552,16 @@ theorem evalTerminatorSymTree_tailCall_inlined_of_calleeCtx
     .leaf
       (MirStepNode.step
         (enterTailCalleeFrame
-          { s.memory with
-            borrows :=
-              disableFrameBorrows
-                s.memory.borrows
-                (length s.memory.callStack)
-                (length s.frame.locals) }
+          (tailCalleeEntryMemory
+            s.memory.callStack
+            { s.memory with
+              borrows :=
+                disableFrameBorrows
+                  s.memory.borrows
+                  (length s.memory.callStack)
+                  (length s.frame.locals) }
+            (length s.frame.locals)
+            (length (initLocals calleeBody argVals)))
           calleeBody argVals)) := by
   dsimp only [evalTerminatorSymTree, evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
   rw [h_res]
@@ -5551,14 +5595,15 @@ theorem evalTerminatorSymTree_tailCall_deallocConflict
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_deallocConflict :
       hasFrameDeallocProtectorConflict
@@ -5600,14 +5645,15 @@ theorem evalTerminatorSymTree_diverging_call_inlined_of_calleeCtx
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_callee :
       CalleeCtx
@@ -5658,14 +5704,15 @@ theorem evalTerminatorSymTree_diverging_extCall
         s func (length argOps) currentBody.localDecls currentBody.layouts =
       .ok resolvedTarget localsAfterFunc)
     (h_args :
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         currentBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) =
+        currentBody.localDecls
+        s.memory.callStack =
       .ok argVals locals')
     (h_none :
       lookupCallee
@@ -7189,6 +7236,38 @@ theorem evalOperand_copy_nil_eq (locals : List LocalSlot) (idx : LocalIdx)
     | uninit => rfl
     | dead => rfl
 
+theorem reachesModularSafePanicExecStep_tau
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream) (st' : MirExecState) :
+    reachesModularSafePanicExecStep fuel body answers (.tau st') =
+      reachesModularSafePanicExecBounded fuel body answers st' := rfl
+
+theorem reachesModularSafePanicExecStep_ret_panic
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream) :
+    reachesModularSafePanicExecStep fuel body answers (.ret .panic) = true := rfl
+
+theorem reachesModularSafePanicExecStep_ret_abort
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream) :
+    reachesModularSafePanicExecStep fuel body answers (.ret .abort) = true := rfl
+
+theorem reachesModularSafePanicExecStep_obs
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream)
+    (obs : MirObsE.I) (k : PUnit → MirExecState) :
+    reachesModularSafePanicExecStep fuel body answers (.vis (.inr (.inl obs)) k) =
+      reachesModularSafePanicExecBounded fuel body answers (k PUnit.unit) := rfl
+
+theorem reachesModularSafePanicExecStep_call
+    (fuel : Nat) (body : CapturedMir) (answers : MirCallAnswerStream)
+    (req : MirCallReq) (k : MirCallAns → MirExecState) :
+    reachesModularSafePanicExecStep fuel body answers (.vis (.inr (.inr (.call req))) k) =
+      Bool.and
+        (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+          (k (.returned (answers 0).1 (restoreCallFrame req.memory (answers 0).2))))
+        (Bool.and
+          (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+            (k (.panicked (restoreCallFrame req.memory (answers 0).2))))
+          (reachesModularSafePanicExecBounded fuel body (fun n => answers (n + 1))
+            (k .aborted))) := rfl
+
 /--
 Certify a Miri `panic` test whose execution passes through uninterpreted
 external calls, with linked `callees`, at `(args, mem)`. It proves both
@@ -7221,21 +7300,40 @@ theorem verifyModularSafePanicMirBounded
             true := by
       intro answers h_init
       repeat' (
+        try (conv =>
+          lhs; arg 4; whnf
+          try (arg 1; dsimp only [advanceStmt, pushCalleeFrame, resumeExternalCall,
+            resumeExternalDivergingCall, restoreCallFrame,
+            initMachineStateWithMemoryAndCallees, initMachineStateWithMemory,
+            initMachineState, emptyMemory]))
         rw [reachesModularSafePanicExecBounded_succ]
         (conv => lhs; arg 4; whnf)
-        try (
-          simp (config := { decide := false }) only [
-            evalOperands_cons_eq, evalOperand_move_nil_eq, evalOperand_copy_nil_eq]
-          (conv in valueContainsUninit _ => arg 1; whnf)
-          simp (config := { decide := false }) only [h_init]
-          (conv => lhs; arg 4; whnf)
-        )
-        delta reachesModularSafePanicExecStep
-        dsimp only []
         first
-        | rfl
-        | apply modular_call_branches_true
-        | skip
+        | exact reachesModularSafePanicExecStep_ret_panic _ _ _
+        | exact reachesModularSafePanicExecStep_ret_abort _ _ _
+        | rw [reachesModularSafePanicExecStep_tau]
+        | rw [reachesModularSafePanicExecStep_obs]
+        | (rw [reachesModularSafePanicExecStep_call]; apply modular_call_branches_true)
+        | (
+            (conv =>
+              lhs; arg 4
+              simp (config := { decide := false }) only [
+                evalOperandsWithBodyCast_cons, evalOperandsWithBodyCast_nil,
+                evalOperandWithBodyCast_constant, evalOperandWithBodyCast_copy,
+                evalOperandWithBodyCast_move_nil,
+                evalOperands_cons_eq, evalOperand_move_nil_eq, evalOperand_copy_nil_eq])
+            (conv in valueContainsUninit _ => arg 1; whnf)
+            (conv =>
+              lhs; arg 4
+              simp (config := { decide := false }) only [h_init]
+              whnf)
+            first
+            | exact reachesModularSafePanicExecStep_ret_panic _ _ _
+            | exact reachesModularSafePanicExecStep_ret_abort _ _ _
+            | rw [reachesModularSafePanicExecStep_tau]
+            | rw [reachesModularSafePanicExecStep_obs]
+            | (rw [reachesModularSafePanicExecStep_call]; apply modular_call_branches_true)
+          )
       ))
     (h_panic :
       reachesPanicAcrossCallsBounded (fun req => .returned .unit req.memory)

@@ -2511,7 +2511,8 @@ def strictMemory (m : Memory) : Option Memory :=
             { nextAllocId := naid, globals := glob, borrows := bor, nextTag := nt,
               callees := cal, traitImpls := ti, callStack := cs, activeCallee := ac,
               activeProtectors := ap, nextProtector := np, callerLocals := cl,
-              fnPtrs := fp, exposedAllocIds := ea }
+              fnPtrs := fp, exposedAllocIds := ea,
+              rootUnwindCeiling := m.rootUnwindCeiling }
         | _, _ => .none
       | _, _, _ => .none
     | _, _, _, _ => .none

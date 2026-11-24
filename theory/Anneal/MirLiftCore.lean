@@ -37,7 +37,7 @@ def evalPureRvalue (body : CapturedMir) (env : PureEnv) (rv : Rvalue) : RvalueEv
   evalRvalue env rv emptyMemory [] body.layouts
 
 def evalPureOperand (body : CapturedMir) (env : PureEnv) (op : Operand) : PlaceReadResult :=
-  evalOperand env op [] [] body.layouts []
+  evalOperandWithBodyCast env op [] [] body.layouts [] body.localDecls []
 
 def evalPureStmt (body : CapturedMir) (bbIdx : BasicBlockIdx) (stmtIdx : Nat) (env : PureEnv) (stmt : Statement) : Option PureEnv :=
   if isPureStatement stmt.kind then
@@ -712,6 +712,9 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     | none => none
   | .deref :: _ => none
   | proj :: rest =>
+    match (stripLeadingOpaqueCast (proj :: rest)).isEmpty with
+    | true => none
+    | false =>
     match get? locals dst.local_ with
     | some (.init rootVal) =>
       match
@@ -780,11 +783,14 @@ new caller frame onto `mem.callStack`. This is
 -/
 @[reducible]
 def tailCallFrameMem (mem : Memory) (calleeNumLocals : Nat)
-    (calleeBody : CapturedMir) : Memory :=
-  { mem with
-    borrows :=
-      disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals
-    activeCallee := some calleeBody }
+    (calleeBody : CapturedMir) (argVals : List Value := []) : Memory :=
+  (enterTailCalleeFrame
+    (tailCalleeEntryMemory mem.callStack
+      { mem with
+        borrows :=
+          disableFrameBorrows mem.borrows (length mem.callStack) calleeNumLocals }
+      calleeNumLocals (length (initLocals calleeBody argVals)))
+    calleeBody argVals).memory
 
 /--
 Memory after `TerminatorKind.return_` tears down the returning callee's locals
@@ -1064,7 +1070,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .goto target, span := span }
   | switchInt {discr : Operand} {targets : SwitchTargets} {span : String}
       {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env discr mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env discr mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok (.scalar sc) env' →
       post (.frame (lookupSwitchTarget sc.bits targets.branches targets.otherwise)
         0 env' mem) →
@@ -1072,7 +1078,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
         { kind := .switchInt discr targets, span := span }
   | assert {cond : Operand} {expected : Bool} {target : BasicBlockIdx}
       {unwind : UnwindAction} {span : String} {sc : ScalarInt} {env' : PureEnv} :
-      evalOperand env cond mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env cond mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok (.scalar sc) env' →
       Nat.beq sc.bits (match expected with | true => 1 | false => 0) = true →
       post (.frame target 0 env' mem) →
@@ -1099,6 +1105,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {rest : List ProjectionElem} {rootVal rootVal' : Value} {env' : PureEnv} :
       get? env place.local_ = some (.init rootVal) →
       place.projection = proj :: rest →
+      (stripLeadingOpaqueCast (proj :: rest)).isEmpty = false →
       deinitProjectedForLocal env cur.localDecls cur.layouts place.local_ rootVal (proj :: rest) = .ok rootVal' →
       set? env place.local_ (.init rootVal') = some env' →
       hasProtectedWriteConflict mem.borrows mem.activeProtectors
@@ -1157,7 +1164,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast env argOps mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1175,13 +1182,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env func mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
-      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       post (.frame 0 0 (initLocals calleeBody argVals)
@@ -1201,15 +1208,15 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env func mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
       lookupFnPtr mem.fnPtrs ptrVal.allocId = some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
-      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1238,8 +1245,8 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
           (PureState.toMachineState { bb := bbIdx, stmtIdx := stmtIdx, env := env } mem)
           func (length (lhsOp :: rhsOps)) cur.localDecls cur.layouts =
         .ok resolvedTarget envAfterFunc →
-      evalOperands envAfterFunc (lhsOp :: rhsOps) mem.borrows mem.globals
-          cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast envAfterFunc (lhsOp :: rhsOps) mem.borrows mem.globals
+          cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok [.scalar lhs, .scalar rhs] env' →
       lookupCallee mem.callees cur.layouts resolvedTarget.defPath
           resolvedTarget.typeArgs mem.traitImpls = none →
@@ -1251,7 +1258,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
        | .deref :: _ => PlaceWriteResult.ub
        | _ =>
          writePlaceValue env' mem.borrows destination (.scalar retScalar)
-           (callStack := mem.callStack)) =
+           [] emptyLayoutTable mem.callStack) =
         .ok updatedEnv →
       post (.frame targetBb 0 updatedEnv
         (invalidateDirectDestWriteBorrows mem env' destination)) →
@@ -1266,13 +1273,13 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {defPath : DefPath} {typeArgs : List RigidTy} {argVals : List Value}
       {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCallee? func = some (defPath, typeArgs) →
-      evalOperands env argOps mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast env argOps mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem (length env) calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody argVals)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1284,19 +1291,19 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {typeArgs : List RigidTy} {argVals : List Value} {env' : PureEnv}
       {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env func mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok fnVal envAfterFunc →
       isZstFnItemValue fnVal = true →
       extractFnItemTarget? (operandTy cur.localDecls cur.layouts func) =
         some (defPath, typeArgs) →
-      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts defPath typeArgs mem.traitImpls calleeBody →
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem (length env) calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody argVals)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
   /--
@@ -1307,15 +1314,15 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       {ptrVal : ProvenancePtr} {envAfterFunc : PureEnv} {fnEntry : FnPtrEntry}
       {argVals : List Value} {env' : PureEnv} {calleeBody : CapturedMir} :
       extractCalleeDefPath? func = none →
-      evalOperand env func mem.borrows mem.globals cur.layouts mem.callerLocals (callStack := mem.callStack) =
+      evalOperandWithBodyCast env func mem.borrows mem.globals cur.layouts mem.callerLocals cur.localDecls mem.callStack =
         .ok (.ptr ptrVal 8) envAfterFunc →
       ptrVal.offsetBytes = 0 →
       lookupBorrow mem.borrows ptrVal.tag = none →
       lookupFnPtr mem.fnPtrs ptrVal.allocId = some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps)
           (operandTy cur.localDecls cur.layouts func) = true →
-      evalOperands envAfterFunc argOps mem.borrows mem.globals cur.layouts
-          mem.callerLocals (callStack := mem.callStack) =
+      evalOperandsWithBodyCast envAfterFunc argOps mem.borrows mem.globals cur.layouts
+          mem.callerLocals cur.localDecls mem.callStack =
         .ok argVals env' →
       CalleeCtx mem.callees cur.layouts fnEntry.defPath fnEntry.typeArgs
           mem.traitImpls calleeBody →
@@ -1326,7 +1333,7 @@ inductive LiftTerminator (cur : CapturedMir) (bbIdx : BasicBlockIdx)
       hasFrameDeallocProtectorConflict mem.borrows mem.activeProtectors
           (length mem.callStack) (length env) = false →
       post (.frame 0 0 (initLocals calleeBody argVals)
-        (tailCallFrameMem mem (length env) calleeBody)) →
+        (tailCallFrameMem mem (length env) calleeBody argVals)) →
       LiftTerminator cur bbIdx stmtIdx env mem post
         { kind := .tailCall func argOps, span := span }
 
@@ -1423,6 +1430,7 @@ private theorem assignLocalPlace_cons_inv
       assignLocalPlace env₁ borrows { local_ := dstLoc, projection := proj :: rest } val
         localDecls layouts depth = some (env₂, borrows')) :
     proj ≠ .deref ∧
+    stripLeadingOpaqueCast (proj :: rest) ≠ [] ∧
     ∃ rootVal shelledRoot rootVal',
       get? env₁ dstLoc = some (.init rootVal) ∧
       ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
@@ -1434,7 +1442,38 @@ private theorem assignLocalPlace_cons_inv
           (resolveBorrowWriteLocalProj localDecls layouts env₁ dstLoc (proj :: rest)) 0 0 depth := by
   have h_nd : proj ≠ .deref := by
     intro h_eq; subst h_eq; simp [assignLocalPlace] at h_write
-  refine ⟨h_nd, ?_⟩
+  have h_unfold0 :
+      (match (stripLeadingOpaqueCast (proj :: rest)).isEmpty with
+       | true => none
+       | false =>
+         match get? env₁ dstLoc with
+         | some (.init rootVal) =>
+           match ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
+               (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+           | .none => none
+           | .some shelledRoot =>
+             match writeProjectedForLocal env₁ localDecls layouts dstLoc shelledRoot (proj :: rest) val with
+             | .ok rootVal' =>
+               match set? env₁ dstLoc (.init rootVal') with
+               | some locals' =>
+                 some (locals',
+                   invalidateConflictingBorrowsAtProj borrows dstLoc .none
+                     (resolveBorrowWriteLocalProj localDecls layouts env₁ dstLoc (proj :: rest)) 0 0 depth)
+               | none => none
+             | _ => none
+         | _ => none) = some (env₂, borrows') := by
+    cases proj with
+    | deref => exact False.elim (h_nd rfl)
+    | _ => exact h_write
+  have h_nr : stripLeadingOpaqueCast (proj :: rest) ≠ [] := by
+    intro h_nil
+    rw [h_nil] at h_unfold0
+    cases h_unfold0
+  have h_emp : (stripLeadingOpaqueCast (proj :: rest)).isEmpty = false := by
+    cases hs : stripLeadingOpaqueCast (proj :: rest) with
+    | nil => exact False.elim (h_nr hs)
+    | cons _ _ => rfl
+  refine ⟨h_nd, h_nr, ?_⟩
   have h_unfold :
       (match get? env₁ dstLoc with
        | some (.init rootVal) =>
@@ -1452,9 +1491,8 @@ private theorem assignLocalPlace_cons_inv
              | none => none
            | _ => none
        | _ => none) = some (env₂, borrows') := by
-    cases proj with
-    | deref => exact False.elim (h_nd rfl)
-    | _ => exact h_write
+    rw [h_emp] at h_unfold0
+    exact h_unfold0
   cases h_get : get? env₁ dstLoc with
   | none => rw [h_get] at h_unfold; cases h_unfold
   | some slot =>
@@ -1541,11 +1579,31 @@ theorem evalStmt_assign_of_evalRvalue {bbIdx : BasicBlockIdx} {stmtIdx : Nat}
           rw [h_prot]
           rfl
   | cons proj rest =>
-    obtain ⟨h_nd, rootVal, shelledRoot, rootVal', h_get, h_ens, h_wp, h_set, h_bor⟩ :=
+    obtain ⟨h_nd, h_nr, rootVal, shelledRoot, rootVal', h_get, h_ens, h_wp, h_set, h_bor⟩ :=
       assignLocalPlace_cons_inv h_write
     subst h_bor
     cases proj with
     | deref => exact False.elim (h_nd rfl)
+    | opaqueCast castTy =>
+      dsimp only [stripLeadingOpaqueCast] at h_nr
+      unfold evalStmt
+      dsimp only [PureState.toMachineState, stripLeadingOpaqueCast]
+      rw [h_rv]
+      dsimp only []
+      cases hs : stripLeadingOpaqueCast rest with
+      | nil => exact False.elim (h_nr hs)
+      | cons _ _ =>
+        dsimp only []
+        rw [h_get]
+        dsimp only []
+        rw [h_ens]
+        dsimp only []
+        rw [h_wp]
+        dsimp only []
+        rw [h_set]
+        dsimp only []
+        rw [h_prot]
+        rfl
     | _ =>
       unfold evalStmt
       dsimp only [PureState.toMachineState]
@@ -1678,8 +1736,8 @@ theorem resolveCallTarget_fnItem (s : MachineState) (func : Operand)
     (typeArgs : List RigidTy)
     (h_nonConst : extractCalleeDefPath? func = none)
     (h_eval :
-      evalOperand s.frame.locals func s.memory.borrows s.memory.globals
-          bodyLayouts s.memory.callerLocals (callStack := s.memory.callStack) =
+      evalOperandWithBodyCast s.frame.locals func s.memory.borrows s.memory.globals
+          bodyLayouts s.memory.callerLocals bodyLocalDecls s.memory.callStack =
         .ok fnVal localsAfterFunc)
     (h_zst : isZstFnItemValue fnVal = true)
     (h_target :
@@ -1750,13 +1808,13 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
   | goto h_next => exact h_next
   | switchInt h_eval h_next =>
     unfold evalTerminator
-    dsimp only [PureState.toMachineState]
+    dsimp only [PureState.toMachineState, bodyLocalDeclsOf]
     rw [h_eval]
     exact h_next
   | assert h_eval h_cond h_next =>
     rename_i cond expected target unwind span sc env'
     unfold evalTerminator
-    dsimp only [PureState.toMachineState]
+    dsimp only [PureState.toMachineState, bodyLocalDeclsOf]
     rw [h_eval]
     -- The expected-bit `match` in the premise and in `evalTerminator` are
     -- distinct auxiliary matchers, so align them by splitting on `expected`.
@@ -1773,7 +1831,7 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       rw [h_proj]
       dsimp only []
       rw [h_set]
-      rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _⟩
+      rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _, _⟩
       · exact h_next
       · dsimp only [] at h_noConflict ⊢
         rw [h_noConflict]
@@ -1783,26 +1841,44 @@ theorem LiftTerminator.evalNodeWP_of {body cur : CapturedMir}
       rw [h_proj]
       dsimp only []
       rw [h_set]
-      rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _⟩
+      rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _, _⟩
       · exact h_next
       · dsimp only [] at h_noConflict ⊢
         rw [h_noConflict]
         exact h_next
-  | dropProjected h_get h_proj h_deinit h_set h_noConflict h_next =>
+  | dropProjected h_get h_proj h_nonEmpty h_deinit h_set h_noConflict h_next =>
+    rename_i place target unwind span proj rest rootVal rootVal' env'
+    have h_nr : stripLeadingOpaqueCast (proj :: rest) ≠ [] := by
+      intro h_nil; rw [h_nil] at h_nonEmpty; cases h_nonEmpty
     unfold evalTerminator
     dsimp only [PureState.toMachineState, bodyLocalDeclsOf]
-    rw [h_get]
-    dsimp only []
-    rw [h_proj]
-    dsimp only []
-    rw [h_deinit]
-    dsimp only []
-    rw [h_set]
-    rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _⟩
-    · exact h_next
-    · dsimp only [] at h_noConflict ⊢
-      rw [h_noConflict]
-      exact h_next
+    rw [h_get, h_proj]
+    cases proj with
+    | deref => cases h_deinit
+    | opaqueCast castTy =>
+      dsimp only [stripLeadingOpaqueCast] at h_nr ⊢
+      cases hs : stripLeadingOpaqueCast rest with
+      | nil => exact False.elim (h_nr hs)
+      | cons _ _ =>
+        dsimp only []
+        rw [h_deinit]
+        dsimp only []
+        rw [h_set]
+        rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _, _⟩
+        · exact h_next
+        · dsimp only [] at h_noConflict ⊢
+          rw [h_noConflict]
+          exact h_next
+    | _ =>
+      dsimp only []
+      rw [h_deinit]
+      dsimp only []
+      rw [h_set]
+      rcases mem with ⟨_, _, _, _, _, _, _, _, _ | ⟨ph, pt⟩, _, _, _, _, _⟩
+      · exact h_next
+      · dsimp only [] at h_noConflict ⊢
+        rw [h_noConflict]
+        exact h_next
   | return_ h_ret h_init h_stack h_noDealloc h_post =>
     unfold evalTerminator
     dsimp only [PureState.toMachineState]
@@ -2056,7 +2132,7 @@ theorem PureMirModularConverges.step_unwindResume
     (h_end : ps.stmtIdx = length bb.statements)
     (h_term : bb.terminator.kind = .unwindResume) :
     PureMirModularConverges contract body callees ps post traitImpls := by
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
@@ -2081,6 +2157,7 @@ theorem PureMirModularConverges.step_unwindResume
     rw [hm.2.2.1]
     dsimp only [unwindFromCallStack, MirStepNode.retOutcome,
       Trusted.ITree.ITreeF.map]
+    rw [h_ruc]
     trivial
 
 /--
@@ -2098,7 +2175,7 @@ theorem PureMirModularConverges.step_unwindTerminate
     (h_end : ps.stmtIdx = length bb.statements)
     (h_term : bb.terminator.kind = .unwindTerminate) :
     PureMirModularConverges contract body callees ps post traitImpls := by
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
@@ -2230,7 +2307,7 @@ theorem PureMirModularConverges.call_modular_resolved
       classifyRustIntrinsic? resolvedTarget.defPath = none := by
       first | exact Or.inr (by decide) | exact Or.inl (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   change Anneal.ITreeWP.DWP _ (Trusted.ITree.ITree.cofix (stepMirState body) _) _ _
@@ -2265,7 +2342,7 @@ theorem PureMirModularConverges.call_modular_resolved
       dsimp only [evalTerminator, bodyLocalDeclsOf]
       rw [h_res_m]
       dsimp only
-      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+      rw [evalOperandsWithBodyCast_pure_eq envAfterFunc argOps m.borrows m.globals
         body.layouts m.callerLocals h_args_pure]
       unfold evalPureOperands at h_args
       rw [h_args]
@@ -2296,17 +2373,18 @@ theorem PureMirModularConverges.call_modular_resolved
   | panicked panicMem =>
     rcases h_contract_panic with
       rfl | rfl | h_no_panic | ⟨cleanupBb, rfl, h_mod_p, h_clean⟩
-    · dsimp only [resumeExternalCall, applyUnwindAction]
+    · dsimp only [resumeExternalCall, applyUnwindAction, PureState.toMachineState]
       rw [h_panic_stack m panicMem hm hp]
       dsimp only [unwindFromCallStack]
-      rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      rw [h_ruc, Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
       trivial
     · dsimp only [resumeExternalCall, applyUnwindAction]
       rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
       trivial
     · exact False.elim (h_no_panic m panicMem hm hp)
-    · dsimp only [resumeExternalCall, applyUnwindAction]
-      exact h_clean panicMem (h_mod_p m panicMem hm hp)
+    · dsimp only [resumeExternalCall, applyUnwindAction, PureState.toMachineState]
+      exact h_clean { panicMem with rootUnwindCeiling := m.rootUnwindCeiling }
+        ((h_mod_p m panicMem hm hp).withRootUnwindCeiling _) h_ruc
   | returned retVal retMem =>
     rcases h_contract_ret m retMem retVal hm hp with ⟨h_mod_ret, h_cp⟩
     rcases h_after retVal h_cp with ⟨updEnv, h_wr, h_next⟩
@@ -2315,7 +2393,9 @@ theorem PureMirModularConverges.call_modular_resolved
       retVal retMem h_dst_pure h_mod_ret.2.2.2.2]
     unfold writePurePlaceValue at h_wr
     rw [h_wr]
-    exact h_next _ (h_mod_ret.withDirectDestBorrows envAfterArgs destination)
+    exact h_next _
+      ((h_mod_ret.withRootUnwindCeiling m.rootUnwindCeiling).withDirectDestBorrows envAfterArgs destination)
+      (by rw [invalidateDirectDestWriteBorrows_rootUnwindCeiling]; exact h_ruc)
 
 /--
 Subsumption-aware 1-step polymorphic `#[external_spec]` call rule supporting
@@ -2558,7 +2638,7 @@ theorem PureMirModularConverges.call_exact_div_pureTarget
     PureMirModularConverges contract body callees ps post traitImpls := by
   have h_rt := resolvePureCalleeTarget_ok_target h_res_pure
   subst h_rt
-  intro m hm
+  intro m hm h_ruc
   have h_stmt_none : get? bb.statements ps.stmtIdx = none := by
     rw [h_end]; exact get?_length_eq_none bb.statements
   have h_step_eq :
@@ -2594,7 +2674,7 @@ theorem PureMirModularConverges.call_exact_div_pureTarget
       dsimp only [evalTerminator, bodyLocalDeclsOf]
       rw [h_res_m]
       dsimp only
-      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+      rw [evalOperandsWithBodyCast_pure_eq envAfterFunc argOps m.borrows m.globals
         body.layouts m.callerLocals h_args_pure]
       unfold evalPureOperands at h_args
       rw [h_args]
@@ -2616,6 +2696,7 @@ theorem PureMirModularConverges.call_exact_div_pureTarget
   dsimp only [stepMirState]
   rw [h_step_eq]
   exact h_next _ (hm.withDirectDestBorrows envAfterArgs destination)
+    (by rw [invalidateDirectDestWriteBorrows_rootUnwindCeiling]; exact h_ruc)
 
 /--
 Generalized subsumption-aware 1-step external `tailCall` rule
@@ -2679,9 +2760,21 @@ theorem PureMirModularConverges.tailCall_modular_resolved
             args := argVals
             memory := m }
           (.panicked panicMem) →
-        panicMem.callStack = []) :
+        panicMem.callStack = [])
+    (h_ext_unwind :
+      externalTargetCanUnwind resolvedTarget (operandTy body.localDecls body.layouts func) =
+        .some true ∨
+      ∀ (m panicMem : Memory),
+        ModularRootMemory body callees traitImpls m →
+        ¬ subContract.post
+          { defPath := resolvedTarget.defPath
+            typeArgs := resolvedTarget.typeArgs
+            args := argVals
+            memory := m }
+          (.panicked panicMem) := by
+      first | exact Or.inl rfl | exact Or.inl (by decide)) :
     PureMirModularConverges contract body callees ps post traitImpls := by
-  intro m hm
+  intro m hm h_ruc
   let mTd : Memory :=
     { m with borrows := disableFrameBorrows m.borrows (length m.callStack) (length ps.env) }
   have hmTd : ModularRootMemory body callees traitImpls mTd :=
@@ -2698,7 +2791,9 @@ theorem PureMirModularConverges.tailCall_modular_resolved
             typeArgs := resolvedTarget.typeArgs
             args := argVals
             memory := mTd }
-          resumeExternalTailCall := by
+          (resumeExternalTailCallWithAbi m.rootUnwindCeiling
+            (externalTargetCanUnwind resolvedTarget
+              (operandTy body.localDecls body.layouts func))) := by
     have h_res_m := h_resolve m hm
     dsimp only [PureState.toMachineState] at h_res_m
     unfold stepMirFn
@@ -2719,7 +2814,7 @@ theorem PureMirModularConverges.tailCall_modular_resolved
       dsimp only [evalTerminator, evalTailCallTerminator, bodyLocalDeclsOf]
       rw [h_res_m]
       dsimp only
-      rw [evalOperands_pure_eq envAfterFunc argOps m.borrows m.globals
+      rw [evalOperandsWithBodyCast_pure_eq envAfterFunc argOps m.borrows m.globals
         body.layouts m.callerLocals h_args_pure]
       unfold evalPureOperands at h_args
       rw [h_args]
@@ -2737,18 +2832,22 @@ theorem PureMirModularConverges.tailCall_modular_resolved
   have hp := h_cpost_imp ans hp_sup
   cases ans with
   | aborted =>
-    dsimp only [resumeExternalTailCall]
+    dsimp only [resumeExternalTailCallWithAbi]
     rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
     trivial
   | panicked panicMem =>
-    dsimp only [resumeExternalTailCall]
-    rw [h_panic_stack mTd panicMem hmTd hp]
-    dsimp only [unwindFromCallStack]
-    rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
-    trivial
+    rcases h_ext_unwind with h_eu | h_no_p
+    · dsimp only [resumeExternalTailCallWithAbi, resumeExternalTailCall]
+      rw [h_eu]
+      dsimp only
+      rw [h_panic_stack mTd panicMem hmTd hp]
+      dsimp only [unwindFromCallStack]
+      rw [h_ruc, Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
+      trivial
+    · exact False.elim (h_no_p mTd panicMem hmTd hp)
   | returned retVal retMem =>
     rcases h_contract_ret mTd retMem retVal hmTd hp with ⟨h_cs, h_post_ret⟩
-    dsimp only [resumeExternalTailCall]
+    dsimp only [resumeExternalTailCallWithAbi, resumeExternalTailCall]
     rw [h_cs]
     dsimp only
     rw [Anneal.ITreeWP.DWP.unfold_eq, Trusted.ITree.ITree.observe_cofix]
@@ -4652,7 +4751,7 @@ theorem mirWpConverges_of_mirLoopLiftReady {α : Type}
       first
       | assumption
       | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body (initMachineStateWithMemory body args mem₀)
       (mirNormalPost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) :=
   mirWpConverges_of_pureExec
@@ -4683,7 +4782,7 @@ theorem mirWpConverges_forRangeUp_of_mirLoopLiftReady {α : Type}
       first
       | assumption
       | exact ⟨rfl, rfl, rfl, rfl⟩
-      | (refine ⟨?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
+      | (refine ⟨?_, ?_, ?_, ?_, ?_⟩ <;> simp_all [RootActiveMemory])) :
     MirWpConverges body (initMachineStateWithMemory body args mem₀)
       (mirNormalPost (fun retVal mem' => mem' = mem₀ ∧ post retVal)) :=
   mirWpConverges_of_pureExec
@@ -8384,8 +8483,8 @@ private def ccEvalAssignDst
     (s : MachineState) (dst : Place) (val : Value)
     (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
-  match dst.projection with
-  | .nil =>
+  match dst.projection, stripLeadingOpaqueCast dst.projection with
+  | .nil, _ =>
     match get? locals₁ dst.local_ with
     | .some .dead => MirStepNode.fail .ub
     | .some _ =>
@@ -8411,7 +8510,7 @@ private def ccEvalAssignDst
               (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
       | .none => MirStepNode.fail .ub
     | .none => MirStepNode.fail .ub
-  | .deref :: restProj =>
+  | .deref :: restProj, _ =>
     match
       evalPlaceWrite locals₁ mem₁.borrows dst val mem₁.activeProtectors localDecls layouts
         mem₁.callStack
@@ -8455,7 +8554,33 @@ private def ccEvalAssignDst
       | _ :: _ =>
         evalForeignFrameDerefWrite s locals₁ mem₁ dst restProj val localDecls layouts
     | .unsupported => MirStepNode.unsupported
-  | hd :: tl =>
+  | .opaqueCast _ :: _, .nil =>
+    match get? locals₁ dst.local_ with
+    | .some .dead => MirStepNode.fail .ub
+    | .some _ =>
+      match set? locals₁ dst.local_ (.init val) with
+      | .some locals₂ =>
+        match mem₁.activeProtectors with
+        | .nil =>
+          let borrows' :=
+            invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
+          MirStepNode.step
+            (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+        | protHead :: protTail =>
+          match
+            hasProtectedWriteConflict
+              mem₁.borrows (protHead :: protTail) dst.local_ .none .nil 0 0
+              (length mem₁.callStack)
+          with
+          | true => MirStepNode.fail .ub
+          | false =>
+            let borrows' :=
+              invalidateConflictingBorrows mem₁.borrows dst.local_ .none (length mem₁.callStack)
+            MirStepNode.step
+              (advanceStmt s locals₂ { mem₁ with borrows := borrows' })
+      | .none => MirStepNode.fail .ub
+    | .none => MirStepNode.fail .ub
+  | hd :: tl, _ =>
     ccEvalAssignNonDeref s dst.local_ (hd :: tl) val locals₁ mem₁ localDecls layouts
 
 private theorem ccEvalStmt_assign_eq
@@ -8482,11 +8607,18 @@ private theorem ccEvalAssignDst_nonDeref
     (tl : List ProjectionElem) (val : Value)
     (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (h_nd : hd ≠ .deref) :
+    (h_nd : hd ≠ .deref)
+    (h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ []) :
     ccEvalAssignDst s ⟨dstLoc, hd :: tl⟩ val locals₁ mem₁ localDecls layouts =
       ccEvalAssignNonDeref s dstLoc (hd :: tl) val locals₁ mem₁ localDecls layouts := by
   cases hd with
   | deref => exact False.elim (h_nd rfl)
+  | opaqueCast castTy =>
+    unfold ccEvalAssignDst
+    dsimp only [stripLeadingOpaqueCast] at h_nr ⊢
+    cases hs : stripLeadingOpaqueCast tl with
+    | nil => exact False.elim (h_nr hs)
+    | cons _ _ => rfl
   | _ => rfl
 
 /-- Constructive decision of `hd = .deref` (`ProjectionElem` has no `DecidableEq`, and a
@@ -10225,94 +10357,6 @@ theorem evalCopySingleDirect_callerBodies (s : MachineState) (src dst : Operand)
   (evalCopySingleDirect_stepCtxCB [] none [] s src dst localDecls layouts srcPtr dstPtr srcEntry
     dstEntry locals₃).2
 
-private def ccCopyViaBytesBody
-    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
-    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
-    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) : MirStepNode :=
-  let n := countBits
-  let srcStart := srcPtr.offsetBytes
-  let dstStart := dstPtr.offsetBytes
-  let overlaps :=
-    match Nat.beq srcPtr.tag dstPtr.tag with
-    | true => true
-    | false =>
-      match Nat.beq srcEntry.targetLocal dstEntry.targetLocal with
-      | false => false
-      | true => projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection
-  match overlaps with
-  | true => MirStepNode.fail .ub
-  | false =>
-    let srcSliceVal : Option Value :=
-      match srcSubVal with
-      | .aggregate 0 srcElems =>
-        match Nat.ble (Nat.add srcStart n) (length srcElems) with
-        | true => .some (.aggregate 0 (takeValues n (dropValues srcStart srcElems)))
-        | false =>
-          match Nat.beq srcStart 0 with
-          | true => .some srcSubVal
-          | false => .none
-      | _ => .some srcSubVal
-    let dstTargetTyOpt : Option Ty :=
-      match dstLocalPlaceTy with
-      | .some t => .some t
-      | .none => operandPointeeTy localDecls layouts dst
-    match srcSliceVal with
-    | .none => MirStepNode.fail .ub
-    | .some sVal =>
-      match encodeUntypedValueToBytes defaultCodecFuel sVal with
-      | .none => MirStepNode.unsupported
-      | .some bs =>
-        let spliceBytesToDstArray : Option Value :=
-          match Bool.not dstIsAdt, dstSubVal with
-          | true, .aggregate 0 dstElems =>
-            match Nat.ble (Nat.add dstStart (length bs)) (length dstElems) with
-            | false => .none
-            | true =>
-              match decodeArrayChunksWith
-                  (fun chunk => decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 } chunk)
-                  1 (length bs) bs with
-              | .some copiedBytes => .some (.aggregate 0 (spliceValues copiedBytes dstStart dstElems))
-              | .none => .none
-          | _, _ => .none
-        let preferSplicedArray : Bool :=
-          match dstLocalPlaceTy, dstSubVal with
-          | .none, .aggregate 0 _ => true
-          | _, _ => false
-        match preferSplicedArray, spliceBytesToDstArray with
-        | true, .some splicedVal =>
-          commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ splicedVal localDecls layouts
-        | _, _ =>
-          match dstTargetTyOpt with
-          | .some dstPt =>
-            match rigidTyByteSize layouts dstPt with
-            | .some dstBytes =>
-              match Nat.beq (length bs) dstBytes with
-              | true =>
-                match decodeValueFromBytes defaultCodecFuel layouts dstPt bs with
-                | .some decodedVal =>
-                  commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ decodedVal localDecls layouts
-                | .none =>
-                  match spliceBytesToDstArray with
-                  | .some splicedVal =>
-                    commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ splicedVal localDecls layouts
-                  | .none => MirStepNode.fail .ub
-              | false =>
-                match spliceBytesToDstArray with
-                | .some splicedVal =>
-                  commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ splicedVal localDecls layouts
-                | .none => MirStepNode.unsupported
-            | .none =>
-              match spliceBytesToDstArray with
-              | .some splicedVal =>
-                commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ splicedVal localDecls layouts
-              | .none => MirStepNode.unsupported
-          | .none =>
-            match spliceBytesToDstArray with
-            | .some splicedVal =>
-              commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃ splicedVal localDecls layouts
-            | .none => MirStepNode.fail .ub
-
 private def ccEvalCopyNonOverlappingPermOk
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
@@ -10340,83 +10384,10 @@ private def ccEvalCopyNonOverlappingPermOk
     | true =>
       evalCopySingleDirect s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry locals₃
     | false =>
-      let srcRootSlot : Option LocalSlot :=
-        match get? locals₃ srcEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals srcEntry.targetLocal with
-          | .some slot => .some slot
-          | .none => get? s.memory.callerLocals (Nat.sub srcEntry.targetLocal (length locals₃))
-      let dstRootSlot : Option LocalSlot :=
-        match get? locals₃ dstEntry.targetLocal with
-        | .some slot => .some slot
-        | .none =>
-          match get? s.memory.callerLocals dstEntry.targetLocal with
-          | .some slot => .some slot
-          | .none => get? s.memory.callerLocals (Nat.sub dstEntry.targetLocal (length locals₃))
-      match srcRootSlot, dstRootSlot with
-      | .some (.init srcRootVal), .some (.init dstRootVal) =>
-        let dstPlace : Place := {
-          local_ := dstEntry.targetLocal
-          projection := dstEntry.targetProjection
-        }
-        let dstLocalPlaceTy : Option Ty :=
-          match get? locals₃ dstPlace.local_ with
-          | .some _ => placeTy localDecls layouts dstPlace
-          | .none => .none
-        let dstIsAdt : Bool :=
-          match dstLocalPlaceTy with
-          | .some { kind := .adt _ _, .. } => true
-          | _ => false
-        match readProjectedValue locals₃ srcRootVal srcEntry.targetProjection,
-              readProjectedValue locals₃ dstRootVal dstEntry.targetProjection with
-        | .ok (.aggregate 0 srcElems), .ok (.aggregate 0 dstElems) =>
-          let inBounds :=
-            Bool.and (Bool.not dstIsAdt)
-              (Bool.and (Nat.ble (Nat.add srcStart n) (length srcElems))
-                (Nat.ble (Nat.add dstStart n) (length dstElems)))
-          match inBounds with
-          | false =>
-            match Bool.and (Nat.beq dstStart 0) (Nat.ble (Nat.add srcStart n) (length srcElems)) with
-            | true =>
-              ccCopyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-                countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt
-                (.aggregate 0 srcElems) (.aggregate 0 dstElems)
-            | false => MirStepNode.fail .ub
-          | true =>
-            let sameContainer :=
-              Bool.and (Nat.beq srcEntry.targetLocal dstEntry.targetLocal)
-                (projectionsOverlap srcEntry.targetProjection dstEntry.targetProjection)
-            let disjoint :=
-              match Nat.beq srcPtr.tag dstPtr.tag with
-              | true => false
-              | false =>
-                match sameContainer with
-                | false => true
-                | true =>
-                  Bool.or (Nat.ble (Nat.add srcStart n) dstStart)
-                    (Nat.ble (Nat.add dstStart n) srcStart)
-            match disjoint with
-            | false => MirStepNode.fail .ub
-            | true =>
-              let copiedSlice := takeValues n (dropValues srcStart srcElems)
-              let dstElems' := spliceValues copiedSlice dstStart dstElems
-              commitCopyDstPlaceWrite s dstPlace dstEntry.targetLocal dstPtr.tag locals₃
-                (.aggregate 0 dstElems') localDecls layouts
-        | .ok srcSubVal, .ok dstSubVal =>
-          ccCopyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-            countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal
-        | .ok srcSubVal, .ub =>
-          match Nat.beq dstStart 0 with
-          | true =>
-            ccCopyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-              countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal .unit
-          | false => MirStepNode.fail .ub
-        | _, _ => MirStepNode.fail .ub
-      | _, _ => MirStepNode.fail .ub
+      evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry n locals₃
 
-/-- Trusted's `evalCopyNonOverlappingPermOk` is the `cc` mirror (whose union / byte-path
-pieces are factored through `ccCopyViaBytesBody` / `commitCopyDstPlaceWrite`), definitionally. -/
+/-- Trusted's `evalCopyNonOverlappingPermOk` is the `cc` mirror (whose multi-element / offset
+sub-place branch is Trusted's `evalCopySubplaceMulti`), definitionally. -/
 private theorem evalCopyNonOverlappingPermOk_eq_cc
     (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
     (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
@@ -10456,26 +10427,45 @@ theorem commitCopyDstPlaceWrite_callerBodies (s : MachineState) (dstPlace : Plac
   (commitCopyDstPlaceWrite_stepCtxCB [] none [] s dstPlace dstTargetLocal dstTag locals₃ newVal
     localDecls layouts).2
 
-private theorem copyViaBytesBody_stepCtxCB
+private theorem commitCopyDstPlaceWriteWithBorrows_stepCtxCB
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
-    (s : MachineState) (dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
-    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
-    (locals₃ : List LocalSlot) (dstPlace : Place) (dstLocalPlaceTy : Option Ty)
-    (dstIsAdt : Bool) (srcSubVal dstSubVal : Value) :
+    (s : MachineState) (dstPlace : Place) (locals₃ : List LocalSlot) (newVal : Value)
+    (borrows' : List BorrowEntry) (localDecls : List LocalDecl) (layouts : LayoutTable) :
     StepCtxCB c ac ti s.memory.callStack
-      (ccCopyViaBytesBody (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
-        dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits
-        locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal)
-      (ccCopyViaBytesBody s dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
-        countBits locals₃ dstPlace dstLocalPlaceTy dstIsAdt srcSubVal dstSubVal) := by
-  unfold ccCopyViaBytesBody
-  dsimp only
+      (commitCopyDstPlaceWriteWithBorrows (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        dstPlace locals₃ newVal borrows' localDecls layouts)
+      (commitCopyDstPlaceWriteWithBorrows s dstPlace locals₃ newVal borrows' localDecls
+        layouts) := by
+  unfold commitCopyDstPlaceWriteWithBorrows
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
   repeat' (first
     | with_reducible (first
       | exact stepCtxCB_fail | exact stepCtxCB_unsupported
       | exact stepCtxCB_advance rfl rfl (CallerBodiesEq.refl _)
-      | exact stepCtxCB_mk rfl (CallerBodiesEq.refl _)
-      | exact commitCopyDstPlaceWrite_stepCtxCB ..)
+      | exact stepCtxCB_mk rfl (CallerBodiesEq.refl _))
+    | split)
+
+/-- The multi-element / offset sub-place copy (`evalCopySubplaceMulti`) reads the machine state
+only through `Memory.borrows`, `Memory.activeProtectors`, `Memory.callerLocals`, and
+`Memory.callStack`, so it commutes with `Memory.withCalleeCtx` and preserves caller bodies. -/
+private theorem evalCopySubplaceMulti_stepCtxCB
+    (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
+    (s : MachineState) (src dst : Operand) (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (srcPtr dstPtr : ProvenancePtr) (srcEntry dstEntry : BorrowEntry) (countBits : Nat)
+    (locals₃ : List LocalSlot) :
+    StepCtxCB c ac ti s.memory.callStack
+      (evalCopySubplaceMulti (MachineState.mapMem (Memory.withCalleeCtx c ac ti) s)
+        src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry countBits locals₃)
+      (evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr srcEntry dstEntry
+        countBits locals₃) := by
+  unfold evalCopySubplaceMulti
+  dsimp only [MachineState.mapMem, Memory.withCalleeCtx]
+  repeat' (first
+    | with_reducible (first
+      | exact stepCtxCB_fail | exact stepCtxCB_unsupported
+      | exact stepCtxCB_advance rfl rfl (CallerBodiesEq.refl _)
+      | exact stepCtxCB_mk rfl (CallerBodiesEq.refl _))
+    | exact commitCopyDstPlaceWriteWithBorrows_stepCtxCB ..
     | split)
 
 private theorem evalCopyUnionBytes_stepCtxCB
@@ -10534,7 +10524,7 @@ private theorem evalCopyNonOverlappingPermOk_stepCtxCB
       | exact stepCtxCB_mk rfl (CallerBodiesEq.refl _))
     | exact ⟨(evalCopyUnionBytes_stepCtxCB ..).1, evalCopyUnionBytes_callerBodies ..⟩
     | exact ⟨evalCopySingleDirect_withCalleeCtx .., evalCopySingleDirect_callerBodies ..⟩
-    | exact copyViaBytesBody_stepCtxCB ..
+    | exact evalCopySubplaceMulti_stepCtxCB ..
     | exact ⟨(commitCopyDstPlaceWrite_stepCtxCB ..).1, commitCopyDstPlaceWrite_callerBodies ..⟩
     | split)
 
@@ -11079,15 +11069,33 @@ private theorem ccEvalAssignDst_stepCtxCB
           | exact hFor ..)
         | split)
     | isFalse h_d =>
-      rw [ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d,
-          ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d]
-      unfold ccEvalAssignNonDeref
-      dsimp only [Memory.withCalleeCtx]
-      repeat' (first
-        | with_reducible (first
-          | exact stepCtxCB_fail | exact stepCtxCB_unsupported
-          | exact stepCtxCB_advance rfl rfl hcs)
-        | split)
+      cases h_strip : stripLeadingOpaqueCast (hd :: tl) with
+      | nil =>
+        cases hd with
+        | deref => exact False.elim (h_d rfl)
+        | opaqueCast castTy =>
+          dsimp only [stripLeadingOpaqueCast] at h_strip
+          unfold ccEvalAssignDst
+          dsimp only [stripLeadingOpaqueCast, Memory.withCalleeCtx]
+          rw [h_strip]
+          dsimp only
+          repeat' (first
+            | with_reducible (first
+              | exact stepCtxCB_fail | exact stepCtxCB_unsupported
+              | exact stepCtxCB_advance rfl rfl hcs)
+            | split)
+        | _ => cases h_strip
+      | cons sh st =>
+        have h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ [] := by rw [h_strip]; nofun
+        rw [ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr,
+            ccEvalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr]
+        unfold ccEvalAssignNonDeref
+        dsimp only [Memory.withCalleeCtx]
+        repeat' (first
+          | with_reducible (first
+            | exact stepCtxCB_fail | exact stepCtxCB_unsupported
+            | exact stepCtxCB_advance rfl rfl hcs)
+          | split)
 
 private theorem evalStmt_stepCtxCB
     (c : CalleeEnv) (ac : Option CapturedMir) (ti : List TraitImplEntry)
@@ -11513,7 +11521,10 @@ theorem unwindFromCallStack_withCallees (c : CalleeEnv) :
     ∀ (stk : List SavedCallerFrame) (m : Memory),
       unwindFromCallStack stk (Memory.withCallees c m) =
         MirExecState.mapMem (Memory.withCallees c) (unwindFromCallStack stk m)
-  | [], _ => rfl
+  | [], m => by
+    unfold unwindFromCallStack
+    dsimp only [Memory.withCallees]
+    cases m.rootUnwindCeiling <;> rfl
   | caller :: rest, m => by
     unfold unwindFromCallStack
     dsimp only
@@ -11575,6 +11586,46 @@ private theorem nodeCC_unwind (c : CalleeEnv) (s : MachineState) (l : List Local
     (Memory.withCallees c m).activeCallee = m.activeCallee := rfl
 @[simp] theorem Memory.withCallees_activeProtectors (c : CalleeEnv) (m : Memory) :
     (Memory.withCallees c m).activeProtectors = m.activeProtectors := rfl
+@[simp] theorem Memory.withCallees_rootUnwindCeiling (c : CalleeEnv) (m : Memory) :
+    (Memory.withCallees c m).rootUnwindCeiling = m.rootUnwindCeiling := rfl
+
+private theorem tailCalleeEntryMemory_withCallees
+    (c : CalleeEnv) (stk : List SavedCallerFrame) (m : Memory) (nOld nNew : Nat) :
+    tailCalleeEntryMemory stk (Memory.withCallees c m) nOld nNew =
+      Memory.withCallees c (tailCalleeEntryMemory stk m nOld nNew) := by
+  cases stk with
+  | cons _ _ => rfl
+  | nil =>
+    unfold tailCalleeEntryMemory relocateRootCallerReferents
+    dsimp only [Memory.withCallees_borrows, Memory.withCallees_callerLocals]
+    cases Nat.blt nOld nNew <;> cases hasAnyRootCallerReferent m.borrows nOld <;>
+      repeat' (first | rfl | split)
+
+private theorem enterTailCalleeFrame_withCallees
+    (c : CalleeEnv) (m : Memory) (calleeBody : CapturedMir) (argVals : List Value) :
+    enterTailCalleeFrame (Memory.withCallees c m) calleeBody argVals =
+      MachineState.mapMem (Memory.withCallees c) (enterTailCalleeFrame m calleeBody argVals) := by
+  unfold enterTailCalleeFrame
+  dsimp only [Memory.withCallees]
+  cases m.callStack <;> cases calleeBody.fnAbi.canUnwind <;> rfl
+
+private theorem tailCalleeEntryMemory_callees
+    (stk : List SavedCallerFrame) (m : Memory) (nOld nNew : Nat) :
+    (tailCalleeEntryMemory stk m nOld nNew).callees = m.callees := by
+  cases stk <;> unfold tailCalleeEntryMemory relocateRootCallerReferents <;>
+    repeat' (first | rfl | split)
+
+private theorem tailCalleeEntryMemory_traitImpls
+    (stk : List SavedCallerFrame) (m : Memory) (nOld nNew : Nat) :
+    (tailCalleeEntryMemory stk m nOld nNew).traitImpls = m.traitImpls := by
+  cases stk <;> unfold tailCalleeEntryMemory relocateRootCallerReferents <;>
+    repeat' (first | rfl | split)
+
+private theorem tailCalleeEntryMemory_callStack
+    (stk : List SavedCallerFrame) (m : Memory) (nOld nNew : Nat) :
+    (tailCalleeEntryMemory stk m nOld nNew).callStack = m.callStack := by
+  cases stk <;> unfold tailCalleeEntryMemory relocateRootCallerReferents <;>
+    repeat' (first | rfl | split)
 
 theorem commitForeignFrameLocals_withCallees (c : CalleeEnv) (m : Memory)
     (t : ForeignFrameTarget) (l : List LocalSlot) :
@@ -12212,8 +12263,8 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -12243,8 +12294,8 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -12262,7 +12313,8 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
     unfold evalTailCallTerminator
     dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory, Memory.withCallees_borrows,
       Memory.withCallees_globals, Memory.withCallees_callerLocals, Memory.withCallees_callees,
-      Memory.withCallees_traitImpls]
+      Memory.withCallees_traitImpls, Memory.withCallees_callStack, Memory.withCallees_activeProtectors,
+      Memory.withCallees_rootUnwindCeiling]
     rw [show resolveCallTarget (MachineState.mapMem (Memory.withCallees c₂) s) func (length argOps)
         (bodyLocalDeclsOf (some cur)) cur.layouts =
       resolveCallTarget s func (length argOps) (bodyLocalDeclsOf (some cur)) cur.layouts from rfl]
@@ -12272,17 +12324,39 @@ theorem evalTerminator_withCallees (cone : List DefPath) (c₂ : CalleeEnv) (s :
     | ok tgt localsAfterFunc =>
       obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
       dsimp only
-      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-          s.memory.callerLocals (callStack := s.memory.callStack) with
+      cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+          s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok argVals locals' =>
         dsimp only
-        rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
-            (h_agree tgt.defPath h_dp).symm]
-        repeat' (first
-          | exact nodeCC_fail | rfl
-          | split)
+        cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals) with
+        | true => rfl
+        | false =>
+          dsimp only
+          rw [h_ta, lookupCallee_nil_eq_of_findCallee_eq cur.layouts s.memory.traitImpls
+              (h_agree tgt.defPath h_dp).symm]
+          cases lookupCallee s.memory.callees cur.layouts tgt.defPath [] s.memory.traitImpls with
+          | none => rfl
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => rfl
+            | true =>
+              dsimp only
+              have hm_wc :
+                  ({ nextAllocId := s.memory.nextAllocId, globals := s.memory.globals,
+                     borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack) (length s.frame.locals),
+                     nextTag := s.memory.nextTag, callees := c₂, traitImpls := s.memory.traitImpls,
+                     callStack := s.memory.callStack, activeCallee := s.memory.activeCallee,
+                     activeProtectors := s.memory.activeProtectors, nextProtector := s.memory.nextProtector,
+                     callerLocals := s.memory.callerLocals, fnPtrs := s.memory.fnPtrs,
+                     exposedAllocIds := s.memory.exposedAllocIds, rootUnwindCeiling := s.memory.rootUnwindCeiling } : Memory) =
+                  Memory.withCallees c₂
+                    { s.memory with borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack) (length s.frame.locals) } := rfl
+              rw [hm_wc, tailCalleeEntryMemory_withCallees, enterTailCalleeFrame_withCallees]
+              rfl
   | _ => rfl
 
 
@@ -13118,7 +13192,9 @@ theorem closedInv_unwindFromCallStack {cone : List DefPath} {root : CapturedMir}
     ∀ (stk : List SavedCallerFrame) (m : Memory), m.callees = c₁ →
       (∀ f, f ∈ stk → InConeSet cone root c₁ f.callerBody) →
       ∀ s', unwindFromCallStack stk m = .running s' → ClosedInv cone root c₁ s'
-  | [], _, _, _, _, h => by cases h
+  | [], m, _, _, _, h => by
+    unfold unwindFromCallStack at h
+    cases hr : m.rootUnwindCeiling <;> (rw [hr] at h; cases h)
   | caller :: rest, m, hc, hf, s', h => by
     unfold unwindFromCallStack at h
     dsimp only at h
@@ -13288,8 +13364,9 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -13330,8 +13407,9 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -13364,25 +13442,38 @@ theorem nodeSuccs_evalTerminator {cone : List DefPath} {root : CapturedMir} {c�
     | ok tgt localsAfterFunc =>
       obtain ⟨h_dp, h_ta, h_cl⟩ := hq tgt localsAfterFunc h_res
       dsimp only
-      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+      cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
       | ub => trivial
       | unsupported => trivial
       | ok argVals locals' =>
         dsimp only
-        rw [h_ta]
-        cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
-            tgt.defPath [] s.memory.traitImpls with
-        | some calleeBody =>
+        cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals) with
+        | true => trivial
+        | false =>
           dsimp only
-          rw [h_inv.1] at h_lk
-          repeat' (first
-            | trivial
-            | exact ⟨h_inv.1, inConeSet_of_lookup h_dp h_lk, h_inv.2.2⟩
-            | split)
-        | none =>
-          dsimp only
-          repeat' (first | trivial | split)
+          rw [h_ta]
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath [] s.memory.traitImpls with
+          | none => trivial
+          | some calleeBody =>
+            dsimp only
+            rw [h_inv.1] at h_lk
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              dsimp only [NodeSuccs]
+              refine ⟨(tailCalleeEntryMemory_callees _ _ _ _).trans h_inv.1,
+                inConeSet_of_lookup h_dp h_lk, ?_⟩
+              dsimp only [enterTailCalleeFrame]
+              rw [tailCalleeEntryMemory_callStack]
+              intro f hf
+              rcases Anneal.PureMirExec.narrowCallStackForTailCallee_mem hf with
+                ⟨f₀, hf₀, _, hcb⟩
+              rw [hcb.2.2]
+              exact h_inv.2.2 f₀ hf₀
   | _ => trivial
 
 theorem nodeSuccs_stepMirFn {cone : List DefPath} {root : CapturedMir} {c₁ : CalleeEnv}
@@ -13777,8 +13868,8 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_no₁, h_no₂, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -13808,8 +13899,8 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_no₁, h_no₂, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-            s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+            s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
         | ub => rfl
         | unsupported => rfl
         | ok argVals locals' =>
@@ -13827,7 +13918,8 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
     unfold evalTailCallTerminator
     dsimp only [MachineState.mapMem_frame, MachineState.mapMem_memory, Memory.withCallees_borrows,
       Memory.withCallees_globals, Memory.withCallees_callerLocals, Memory.withCallees_callees,
-      Memory.withCallees_traitImpls]
+      Memory.withCallees_traitImpls, Memory.withCallees_callStack, Memory.withCallees_activeProtectors,
+      Memory.withCallees_rootUnwindCeiling]
     rw [show resolveCallTarget (MachineState.mapMem (Memory.withCallees c₂) s) func (length argOps)
         (bodyLocalDeclsOf (some cur)) cur.layouts =
       resolveCallTarget s func (length argOps) (bodyLocalDeclsOf (some cur)) cur.layouts from rfl]
@@ -13837,17 +13929,39 @@ theorem evalTerminator_withCallees_poly (cone : List DefPath) (c₂ : CalleeEnv)
     | ok tgt localsAfterFunc =>
       obtain ⟨h_dp, h_no₁, h_no₂, _⟩ := hq tgt localsAfterFunc h_res
       dsimp only
-      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
-          s.memory.callerLocals (callStack := s.memory.callStack) with
+      cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals cur.layouts
+          s.memory.callerLocals (bodyLocalDeclsOf (some cur)) s.memory.callStack with
       | ub => rfl
       | unsupported => rfl
       | ok argVals locals' =>
         dsimp only
-        rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
-            s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁]
-        repeat' (first
-          | exact nodeCC_fail | rfl
-          | split)
+        cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals) with
+        | true => rfl
+        | false =>
+          dsimp only
+          rw [lookupCallee_eq_of_findCallee_eq_of_no_traitImpl cur.layouts tgt.typeArgs
+              s.memory.traitImpls (h_agree tgt.defPath h_dp).symm h_no₂ h_no₁]
+          cases lookupCallee s.memory.callees cur.layouts tgt.defPath tgt.typeArgs s.memory.traitImpls with
+          | none => rfl
+          | some calleeBody =>
+            dsimp only
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => rfl
+            | true =>
+              dsimp only
+              have hm_wc :
+                  ({ nextAllocId := s.memory.nextAllocId, globals := s.memory.globals,
+                     borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack) (length s.frame.locals),
+                     nextTag := s.memory.nextTag, callees := c₂, traitImpls := s.memory.traitImpls,
+                     callStack := s.memory.callStack, activeCallee := s.memory.activeCallee,
+                     activeProtectors := s.memory.activeProtectors, nextProtector := s.memory.nextProtector,
+                     callerLocals := s.memory.callerLocals, fnPtrs := s.memory.fnPtrs,
+                     exposedAllocIds := s.memory.exposedAllocIds, rootUnwindCeiling := s.memory.rootUnwindCeiling } : Memory) =
+                  Memory.withCallees c₂
+                    { s.memory with borrows := disableFrameBorrows s.memory.borrows (length s.memory.callStack) (length s.frame.locals) } := rfl
+              rw [hm_wc, tailCalleeEntryMemory_withCallees, enterTailCalleeFrame_withCallees]
+              rfl
   | _ => rfl
 
 theorem stepMirFn_withCallees_poly (cone : List DefPath) (body : CapturedMir) (s : MachineState)
@@ -14214,7 +14328,9 @@ theorem closedInvPoly_unwindFromCallStack {cone : List DefPath} {root : Captured
     ∀ (stk : List SavedCallerFrame) (m : Memory), m.callees = c₁ → m.traitImpls = ti →
       (∀ f, f ∈ stk → InConeSetPoly cone root c₁ f.callerBody) →
       ∀ s', unwindFromCallStack stk m = .running s' → ClosedInvPoly cone root c₁ ti s'
-  | [], _, _, _, _, _, h => by cases h
+  | [], m, _, _, _, _, h => by
+    unfold unwindFromCallStack at h
+    cases hr : m.rootUnwindCeiling <;> (rw [hr] at h; cases h)
   | caller :: rest, m, hc, hti, hf, s', h => by
     unfold unwindFromCallStack at h
     dsimp only at h
@@ -14434,8 +14550,9 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_no₁, _, h_cl⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -14475,8 +14592,9 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
       | ok tgt localsAfterFunc =>
         obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
         dsimp only
-        cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+        cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+            (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+            (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
         | ub => trivial
         | unsupported => trivial
         | ok argVals locals' =>
@@ -14506,24 +14624,38 @@ theorem nodeSuccs_evalTerminatorPoly {cone : List DefPath} {root : CapturedMir}
     | ok tgt localsAfterFunc =>
       obtain ⟨h_dp, h_no₁, _, _⟩ := hq tgt localsAfterFunc h_res
       dsimp only
-      cases evalOperands localsAfterFunc argOps s.memory.borrows s.memory.globals
-          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals (callStack := s.memory.callStack) with
+      cases evalOperandsWithBodyCast localsAfterFunc argOps s.memory.borrows s.memory.globals
+          (s.memory.activeCallee.getD root).layouts s.memory.callerLocals
+          (bodyLocalDeclsOf (some (s.memory.activeCallee.getD root))) s.memory.callStack with
       | ub => trivial
       | unsupported => trivial
       | ok argVals locals' =>
         dsimp only
-        cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
-            tgt.defPath tgt.typeArgs s.memory.traitImpls with
-        | some calleeBody =>
+        cases hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+            (length s.memory.callStack) (length s.frame.locals) with
+        | true => trivial
+        | false =>
           dsimp only
-          rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
-          repeat' (first
-            | trivial
-            | exact ⟨h_inv.1, h_inv.2.1, inConeSetPoly_of_lookup h_dp h_no₁ h_lk, h_inv.2.2.2⟩
-            | split)
-        | none =>
-          dsimp only
-          repeat' (first | trivial | split)
+          cases h_lk : lookupCallee s.memory.callees (s.memory.activeCallee.getD root).layouts
+              tgt.defPath tgt.typeArgs s.memory.traitImpls with
+          | none => trivial
+          | some calleeBody =>
+            dsimp only
+            rw [h_inv.1, h_inv.2.1] at h_lk h_no₁
+            cases checkCalleeTargetCompatible tgt calleeBody (length argVals) with
+            | false => trivial
+            | true =>
+              dsimp only [NodeSuccs]
+              refine ⟨(tailCalleeEntryMemory_callees _ _ _ _).trans h_inv.1,
+                (tailCalleeEntryMemory_traitImpls _ _ _ _).trans h_inv.2.1,
+                inConeSetPoly_of_lookup h_dp h_no₁ h_lk, ?_⟩
+              dsimp only [enterTailCalleeFrame]
+              rw [tailCalleeEntryMemory_callStack]
+              intro f hf
+              rcases Anneal.PureMirExec.narrowCallStackForTailCallee_mem hf with
+                ⟨f₀, hf₀, _, hcb⟩
+              rw [hcb.2.2]
+              exact h_inv.2.2.2 f₀ hf₀
   | _ => trivial
 
 theorem nodeSuccs_stepMirFnPoly {cone : List DefPath} {root : CapturedMir} {c₁ c₂ : CalleeEnv}
@@ -15861,8 +15993,8 @@ theorem evalTerminator_call_nonSelectIntrinsic (s : MachineState) (cur : Capture
     (defPath : DefPath) (typeArgs : List RigidTy) (kind : RustIntrinsicKind)
     (argVals : List Value) (locals' : List LocalSlot)
     (hCallee : extractCallee? func = some (defPath, typeArgs))
-    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hArgs : evalOperandsWithBodyCast s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok argVals locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
       s.memory.traitImpls = none)
     (hNoExact :
@@ -16134,8 +16266,8 @@ theorem mirStep_call_sizeOfVal_slice {body cur : CapturedMir} {s : MachineState}
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16160,10 +16292,10 @@ theorem mirStep_call_sizeOfVal_slice {body cur : CapturedMir} {s : MachineState}
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
   intro s'
   have hStepTerm := stepMirFn_frame_term_constructive hCur hPhase hBb hEnd
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hEvTerm := evalTerminator_call_nonSelectIntrinsic s cur func [ptrOp]
@@ -16198,8 +16330,8 @@ theorem mirStep_call_sizeOfVal_str {body cur : CapturedMir} {s : MachineState}
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16223,10 +16355,10 @@ theorem mirStep_call_sizeOfVal_str {body cur : CapturedMir} {s : MachineState}
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
   intro s'
   have hStepTerm := stepMirFn_frame_term_constructive hCur hPhase hBb hEnd
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hEvTerm := evalTerminator_call_nonSelectIntrinsic s cur func [ptrOp]
@@ -16261,8 +16393,8 @@ theorem mirStep_call_alignOfVal_slice {body cur : CapturedMir} {s : MachineState
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16288,10 +16420,10 @@ theorem mirStep_call_alignOfVal_slice {body cur : CapturedMir} {s : MachineState
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
   intro s'
   have hStepTerm := stepMirFn_frame_term_constructive hCur hPhase hBb hEnd
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hEvTerm := evalTerminator_call_nonSelectIntrinsic s cur func [ptrOp]
@@ -16326,8 +16458,8 @@ theorem mirStep_call_alignOfVal_str {body cur : CapturedMir} {s : MachineState}
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16351,10 +16483,10 @@ theorem mirStep_call_alignOfVal_str {body cur : CapturedMir} {s : MachineState}
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
   intro s'
   have hStepTerm := stepMirFn_frame_term_constructive hCur hPhase hBb hEnd
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hEvTerm := evalTerminator_call_nonSelectIntrinsic s cur func [ptrOp]
@@ -16392,8 +16524,8 @@ theorem stepMirFn_call_nonSelectIntrinsic {body cur : CapturedMir} {s : MachineS
     (hTerm : blk.terminator =
       { kind := .call func argOps destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some (defPath, typeArgs))
-    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hArgs : evalOperandsWithBodyCast s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok argVals locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
       s.memory.traitImpls = none)
     (hNoExact :
@@ -16433,8 +16565,8 @@ theorem mirStep_call_nonSelectIntrinsic_fail {body cur : CapturedMir} {s : Machi
     (hTerm : blk.terminator =
       { kind := .call func argOps destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some (defPath, typeArgs))
-    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hArgs : evalOperandsWithBodyCast s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok argVals locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
       s.memory.traitImpls = none)
     (hNoExact :
@@ -16470,8 +16602,8 @@ theorem mirStep_call_nonSelectIntrinsic_write_local {body cur : CapturedMir} {s 
       { kind := .call func argOps { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some (defPath, typeArgs))
-    (hArgs : evalOperands s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok argVals locals')
+    (hArgs : evalOperandsWithBodyCast s.frame.locals argOps s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok argVals locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts defPath typeArgs
       s.memory.traitImpls = none)
     (hNoExact :
@@ -16523,8 +16655,8 @@ theorem mirStep_call_sizeOfVal_sized {body cur : CapturedMir} {s : MachineState}
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p 8) locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok (.ptr p 8) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -16548,9 +16680,9 @@ theorem mirStep_call_sizeOfVal_sized {body cur : CapturedMir} {s : MachineState}
       Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
         Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p 8] locals' := by
-    unfold evalOperands
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok [.ptr p 8] locals' := by
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_write_local hCur hPhase hBb hEnd hTerm hCallee hArgs
@@ -16575,8 +16707,8 @@ theorem mirStep_call_alignOfVal_sized {body cur : CapturedMir} {s : MachineState
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p 8) locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok (.ptr p 8) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -16599,9 +16731,9 @@ theorem mirStep_call_alignOfVal_sized {body cur : CapturedMir} {s : MachineState
       Anneal.Rustc.V2026_06_01.Lower.wpMirBounded (fuel + 1) body s post ↔
         Anneal.Rustc.V2026_06_01.Lower.wpMirBounded fuel body s' post) ∧
     (∀ post, WpConverges (mirStep body) s' post → WpConverges (mirStep body) s post) := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p 8] locals' := by
-    unfold evalOperands
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok [.ptr p 8] locals' := by
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_write_local hCur hPhase hBb hEnd hTerm hCallee hArgs
@@ -16627,8 +16759,8 @@ theorem mirStep_call_sizeOfVal_slice_overflow_ub {body cur : CapturedMir} {s : M
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16640,10 +16772,10 @@ theorem mirStep_call_sizeOfVal_slice_overflow_ub {body cur : CapturedMir} {s : M
     (hLen : len < scalarModulus 8)
     (hGe : signedHalfModulus 8 ≤ len * elemSz) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
@@ -16666,8 +16798,8 @@ theorem mirStep_call_alignOfVal_slice_overflow_ub {body cur : CapturedMir} {s : 
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16680,10 +16812,10 @@ theorem mirStep_call_alignOfVal_slice_overflow_ub {body cur : CapturedMir} {s : 
     (hLen : len < scalarModulus 8)
     (hGe : signedHalfModulus 8 ≤ len * elemSz) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
@@ -16707,8 +16839,8 @@ theorem mirStep_call_sizeOfVal_unsized_thinPtr_ub {body cur : CapturedMir} {s : 
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p ptrSz) locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok (.ptr p ptrSz) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -16716,9 +16848,9 @@ theorem mirStep_call_sizeOfVal_unsized_thinPtr_ub {body cur : CapturedMir} {s : 
         isIndirect := false }
       cur.localDecls cur.layouts [ptrOp] = some dstTy) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p ptrSz] locals' := by
-    unfold evalOperands
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok [.ptr p ptrSz] locals' := by
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hThin := evalNonSelectIntrinsicCall_unsized_thinPtr_ub s
@@ -16826,8 +16958,8 @@ theorem mirStep_call_sizeOfVal_str_overflow_ub {body cur : CapturedMir} {s : Mac
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16838,10 +16970,10 @@ theorem mirStep_call_sizeOfVal_str_overflow_ub {body cur : CapturedMir} {s : Mac
     (hLen : len < scalarModulus 8)
     (hGe : signedHalfModulus 8 ≤ len) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
@@ -16863,8 +16995,8 @@ theorem mirStep_call_alignOfVal_str_overflow_ub {body cur : CapturedMir} {s : Ma
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16875,10 +17007,10 @@ theorem mirStep_call_alignOfVal_str_overflow_ub {body cur : CapturedMir} {s : Ma
     (hLen : len < scalarModulus 8)
     (hGe : signedHalfModulus 8 ≤ len) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   exact mirStep_call_nonSelectIntrinsic_fail hCur hPhase hBb hEnd hTerm hCallee hArgs hNoOverride
@@ -16902,8 +17034,8 @@ theorem mirStep_call_alignOfVal_unsized_thinPtr_ub {body cur : CapturedMir} {s :
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack = .ok (.ptr p ptrSz) locals')
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok (.ptr p ptrSz) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
     (hPt : resolveIntrinsicPointeeTy?
@@ -16911,9 +17043,9 @@ theorem mirStep_call_alignOfVal_unsized_thinPtr_ub {body cur : CapturedMir} {s :
         isIndirect := false }
       cur.localDecls cur.layouts [ptrOp] = some dstTy) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) = .ok [.ptr p ptrSz] locals' := by
-    unfold evalOperands
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack = .ok [.ptr p ptrSz] locals' := by
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hThin := evalNonSelectIntrinsicCall_unsized_thinPtr_ub s
@@ -16946,8 +17078,8 @@ theorem mirStep_call_sizeOfVal_slice_ptrSz_ne_ub {body cur : CapturedMir} {s : M
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16957,10 +17089,10 @@ theorem mirStep_call_sizeOfVal_slice_ptrSz_ne_ub {body cur : CapturedMir} {s : M
       cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
     (hNe : ptrSz ≠ 8) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_slice_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
@@ -16983,8 +17115,8 @@ theorem mirStep_call_alignOfVal_slice_ptrSz_ne_ub {body cur : CapturedMir} {s : 
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -16994,10 +17126,10 @@ theorem mirStep_call_alignOfVal_slice_ptrSz_ne_ub {body cur : CapturedMir} {s : 
       cur.localDecls cur.layouts [ptrOp] = some (.slice elemTy))
     (hNe : ptrSz ≠ 8) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_slice_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
@@ -17325,8 +17457,8 @@ theorem mirStep_call_sizeOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : Mac
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -17336,10 +17468,10 @@ theorem mirStep_call_sizeOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : Mac
       cur.localDecls cur.layouts [ptrOp] = some .str)
     (hNe : ptrSz ≠ 8) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_str_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
@@ -17361,8 +17493,8 @@ theorem mirStep_call_alignOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : Ma
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.ptr p ptrSz, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -17372,10 +17504,10 @@ theorem mirStep_call_alignOfVal_str_ptrSz_ne_ub {body cur : CapturedMir} {s : Ma
       cur.localDecls cur.layouts [ptrOp] = some .str)
     (hNe : ptrSz ≠ 8) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.ptr p ptrSz, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_str_ptrSz_ne_ub s _ cur.localDecls cur.layouts [ptrOp]
@@ -17399,8 +17531,8 @@ theorem mirStep_call_sizeOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {s
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.scalar addrSc, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::size_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -17409,10 +17541,10 @@ theorem mirStep_call_sizeOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {s
         isIndirect := false }
       cur.localDecls cur.layouts [ptrOp] = some dstTy) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_unsized_scalarAddr_ub s _ cur.localDecls cur.layouts
@@ -17436,8 +17568,8 @@ theorem mirStep_call_alignOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {
     (hTerm : blk.terminator =
       { kind := .call func [ptrOp] destination (some targetBb) unwind, span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals .nil s.memory.callStack =
+    (hArg : evalOperandWithBodyCast s.frame.locals ptrOp s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok (.aggregate 0 [.scalar addrSc, .scalar lenSc]) locals')
     (hNoOverride : lookupCallee s.memory.callees cur.layouts "core::intrinsics::align_of_val"
       typeArgs s.memory.traitImpls = none)
@@ -17446,10 +17578,10 @@ theorem mirStep_call_alignOfVal_unsized_scalarAddr_ub {body cur : CapturedMir} {
         isIndirect := false }
       cur.localDecls cur.layouts [ptrOp] = some dstTy) :
     stepMirFn body s = MirStepNode.fail .ub ∧ mirStep body s = .fault := by
-  have hArgs : evalOperands s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
-      s.memory.callerLocals (callStack := s.memory.callStack) =
+  have hArgs : evalOperandsWithBodyCast s.frame.locals [ptrOp] s.memory.borrows s.memory.globals cur.layouts
+      s.memory.callerLocals cur.localDecls s.memory.callStack =
         .ok [.aggregate 0 [.scalar addrSc, .scalar lenSc]] locals' := by
-    unfold evalOperands
+    unfold evalOperandsWithBodyCast
     rw [hArg]
     rfl
   have hFail := (evalNonSelectIntrinsicCall_unsized_scalarAddr_ub s _ cur.localDecls cur.layouts

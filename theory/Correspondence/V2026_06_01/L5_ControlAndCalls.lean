@@ -755,8 +755,10 @@ theorem mir_applyUnwindAction_characterization
       mrApplyUnwindAction none true false = .abort) ∧
     (applyUnwindAction s localsAfter memAfter .continue_ =
         unwindFromCallStack memAfter.callStack memAfter ∧
-      (memAfter.callStack = .nil →
+      (memAfter.callStack = .nil → memAfter.rootUnwindCeiling = true →
         applyUnwindAction s localsAfter memAfter .continue_ = .halted .panic) ∧
+      (memAfter.callStack = .nil → memAfter.rootUnwindCeiling = false →
+        applyUnwindAction s localsAfter memAfter .continue_ = .faulted .ub) ∧
       mrApplyUnwindAction none false false = .panic) ∧
     (applyUnwindAction s localsAfter memAfter (.cleanup bb) =
       .running
@@ -765,9 +767,11 @@ theorem mir_applyUnwindAction_characterization
       mrApplyUnwindAction (some bb) false false = .cleanup bb ∧
       toMrStackFrame { s.frame with blockIdx := bb, stmtIdx := 0, locals := localsAfter } =
         MrStackFrame.jump_to_block (toMrStackFrame s.frame) bb) := by
-  refine ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, ?_, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
-  intro hNil
-  simp [applyUnwindAction, hNil]
+  refine ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩, ⟨rfl, ?_, ?_, rfl⟩, ⟨rfl, rfl, rfl⟩⟩
+  · intro hNil hCeil
+    simp [applyUnwindAction, hNil, hCeil]
+  · intro hNil hCeil
+    simp [applyUnwindAction, hNil, hCeil]
 
 /-- Universal correspondence for `TerminatorKind.goto` (`Terminators.lean:231-235`
 vs. `Generated.Ops.MrStackFrame.jump_to_block` at `spec/lang/step/terminators.md:20-30`):
@@ -941,14 +945,15 @@ theorem mir_evalTerminator_assert_corresponds
     (currentBody : Option CapturedMir)
     (sc : ScalarInt) (locals' : List LocalSlot)
     (hEval :
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         cond
         s.memory.borrows
         s.memory.globals
         (match currentBody with | .some b => b.layouts | .none => emptyLayoutTable)
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok (.scalar sc) locals') :
+        (bodyLocalDeclsOf currentBody)
+        s.memory.callStack = .ok (.scalar sc) locals') :
     let expectedBit := match expected with | true => 1 | false => 0
     (Nat.beq sc.bits expectedBit = true →
       evalTerminator s ⟨.assert cond expected target unwind, span⟩ currentBody =
@@ -967,11 +972,11 @@ theorem mir_evalTerminator_assert_corresponds
   · intro hMatch
     refine ⟨?_, rfl⟩
     cases expected <;> cases currentBody <;>
-      simp only [evalTerminator] at hEval ⊢ <;>
+      simp only [evalTerminator, bodyLocalDeclsOf] at hEval ⊢ <;>
       simp [hEval, hMatch]
   · intro hMismatch
     cases expected <;> cases currentBody <;>
-      simp only [evalTerminator] at hEval ⊢ <;>
+      simp only [evalTerminator, bodyLocalDeclsOf] at hEval ⊢ <;>
       simp [hEval, hMismatch] <;>
       cases applyUnwindAction s locals' s.memory unwind <;> rfl
 
@@ -1003,14 +1008,15 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
        (argVals : List Value) (locals' : List LocalSlot),
       extractCalleeDefPath? func = .some defPath →
       currentBody = .some callerBody →
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals' →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals' →
       lookupCallee s.memory.callees callerBody.layouts defPath (extractCalleeTypeArgs func) s.memory.traitImpls = .some calleeBody →
       let savedCaller : SavedCallerFrame :=
         { callerBody := callerBody
@@ -1034,11 +1040,11 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
   refine ⟨?_, ?_, ?_⟩
   · intro hUnreach hFind
     cases currentBody <;>
-      simp [evalTerminator, resolveCallTarget, evalOperands, hUnreach, hFind] <;>
+      simp [evalTerminator, resolveCallTarget, hUnreach, hFind] <;>
       rfl
   · intro hUnreach hFind
     cases currentBody <;>
-      simp [evalTerminator, resolveCallTarget, evalOperands, hUnreach, hFind] <;>
+      simp [evalTerminator, resolveCallTarget, hUnreach, hFind] <;>
       rfl
   · intro defPath targetBb calleeBody callerBody argVals locals' hFunc hCurr hArgs hFind
     subst hCurr
@@ -1057,8 +1063,8 @@ theorem evalTerminator_switchInt_agrees_with_generated
     (span : String) (currentBody : Option CapturedMir) :
     let bodyLayouts := match currentBody with | .some b => b.layouts | .none => emptyLayoutTable
     (∀ (sc : ScalarInt) (locals' : List LocalSlot),
-      evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
-          s.memory.callerLocals (callStack := s.memory.callStack) =
+      evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
+          s.memory.callerLocals (bodyLocalDeclsOf currentBody) s.memory.callStack =
         .ok (.scalar sc) locals' →
       let target := mrLookupSwitchTarget sc.bits targets.branches targets.otherwise
       evalTerminator s ⟨.switchInt discr targets, span⟩ currentBody =
@@ -1066,8 +1072,8 @@ theorem evalTerminator_switchInt_agrees_with_generated
           { s with frame := { blockIdx := target, stmtIdx := 0, locals := locals' } } ∧
       toMrStackFrame { blockIdx := target, stmtIdx := 0, locals := locals' } =
         MrStackFrame.jump_to_block (toMrStackFrame s.frame) target) ∧
-    (evalOperand s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
-        s.memory.callerLocals (callStack := s.memory.callStack) = .ub →
+    (evalOperandWithBodyCast s.frame.locals discr s.memory.borrows s.memory.globals bodyLayouts
+        s.memory.callerLocals (bodyLocalDeclsOf currentBody) s.memory.callStack = .ub →
       evalTerminator s ⟨.switchInt discr targets, span⟩ currentBody = MirStepNode.fail .ub) := by
   dsimp only
   refine ⟨?_, ?_⟩
@@ -1075,11 +1081,11 @@ theorem evalTerminator_switchInt_agrees_with_generated
     refine ⟨?_, rfl⟩
     rw [← mir_lookupSwitchTarget_corresponds sc.bits targets.branches targets.otherwise]
     cases currentBody <;>
-      simp only [evalTerminator] at hEval ⊢ <;>
+      simp only [evalTerminator, bodyLocalDeclsOf] at hEval ⊢ <;>
       simp [hEval]
   · intro hUb
     cases currentBody <;>
-      simp only [evalTerminator] at hUb ⊢ <;>
+      simp only [evalTerminator, bodyLocalDeclsOf] at hUb ⊢ <;>
       simp [hUb]
 
 /-! ## 3. Function-Item Reification (`ReifyFnPointer`), `fnPtrToPtr`, and Indirect `FnPtr` Calls (`BRIEF-1.1`) -/
@@ -1422,14 +1428,15 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
     (argVals : List Value)
     (hNoDirect : extractCalleeDefPath? func = .none)
     (hEvalFunc :
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         func
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok (.ptr ptrVal 8) (localsAfterFunc argVals))
+        callerBody.localDecls
+        s.memory.callStack = .ok (.ptr ptrVal 8) (localsAfterFunc argVals))
     (hOffsetZero : ptrVal.offsetBytes = 0)
     (hNoBorrow : lookupBorrow s.memory.borrows ptrVal.tag = .none) :
     let callerFuncTyOpt := operandTy callerBody.localDecls callerBody.layouts func
@@ -1453,14 +1460,15 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
             (length s.frame.locals) }
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
-      evalOperands
+      evalOperandsWithBodyCast
         (localsAfterFunc argVals)
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals (locals' argVals) →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals (locals' argVals) →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody →
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = true →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
@@ -1471,20 +1479,28 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
           (pushDivergingCalleeFrame s callerBody (locals' argVals) destination unwind calleeBody argVals) ∧
       (tailTeardownConflict = false →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
-          MirStepNode.step (enterTailCalleeFrame memAfterTeardown calleeBody argVals)) ∧
+          MirStepNode.step
+            (enterTailCalleeFrame
+              (tailCalleeEntryMemory
+                s.memory.callStack
+                memAfterTeardown
+                (length s.frame.locals)
+                (length (initLocals calleeBody argVals)))
+              calleeBody argVals)) ∧
       (tailTeardownConflict = true →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
           MirStepNode.fail .ub)) ∧
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
-      evalOperands
+      evalOperandsWithBodyCast
         (localsAfterFunc argVals)
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals (locals' argVals) →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals (locals' argVals) →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .none →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
@@ -1499,7 +1515,9 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
           MirStepNode.extCall
             { defPath := fnEntry.defPath, typeArgs := fnEntry.typeArgs, args := argVals,
               memory := memAfterTeardown }
-            resumeExternalTailCall) ∧
+            (resumeExternalTailCallWithAbi
+              s.memory.rootUnwindCeiling
+              (externalTargetCanUnwind resolvedTarget callerFuncTyOpt))) ∧
       (tailTeardownConflict = true →
         evalTerminator s ⟨.tailCall func argOps, span⟩ (.some callerBody) =
           MirStepNode.fail .ub)) ∧
@@ -1520,14 +1538,15 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         MirStepNode.fail .ub) ∧
     (lookupFnPtr s.memory.fnPtrs ptrVal.allocId = .some fnEntry →
       fnEntryCompatibleWithCallSite fnEntry (length argOps) callerFuncTyOpt = true →
-      evalOperands
+      evalOperandsWithBodyCast
         (localsAfterFunc argVals)
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals (locals' argVals) →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals (locals' argVals) →
       lookupCallee s.memory.callees callerBody.layouts fnEntry.defPath fnEntry.typeArgs s.memory.traitImpls = .some calleeBody →
       checkCalleeTargetCompatible resolvedTarget calleeBody (length argVals) = false →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
@@ -1548,7 +1567,7 @@ theorem mir_evalTerminator_indirect_call_and_tailCall_corresponds
         resolveCallTarget, Nat.beq_refl, Bool.and_self, *]
   · intro hLookupNone
     refine ⟨?_, ?_, ?_⟩ <;>
-      simp only [evalTerminator, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
+      simp only [evalTerminator, bodyLocalDeclsOf, evalTailCallTerminator, resolveCallTarget, hNoDirect, hEvalFunc,
         hOffsetZero, hNoBorrow, hLookupNone, Nat.beq_refl, Bool.and_self]
   · intro hLookup hCompatFalse
     refine ⟨?_, ?_, ?_⟩ <;>
@@ -1588,14 +1607,15 @@ theorem mir_evalTerminator_indirect_call_nonZeroOffset_or_borrow_is_ub
     (localsAfterFunc : List LocalSlot)
     (hNoDirect : extractCalleeDefPath? func = .none)
     (hEvalFunc :
-      evalOperand
+      evalOperandWithBodyCast
         s.frame.locals
         func
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok (.ptr ptrVal 8) localsAfterFunc) :
+        callerBody.localDecls
+        s.memory.callStack = .ok (.ptr ptrVal 8) localsAfterFunc) :
     (ptrVal.offsetBytes = n + 1 →
       evalTerminator s ⟨.call func argOps destination (.some targetBb) unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub ∧
@@ -1652,40 +1672,43 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
     (∀ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot),
       resolveCallTarget s func (length argOps) callerBody.localDecls callerBody.layouts =
         .ok target localsAfterFunc →
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ub →
+        callerBody.localDecls
+        s.memory.callStack = .ub →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
     (∀ (argVals : List Value) (locals' : List LocalSlot),
       extractCalleeDefPath? func = .some "core::hint::unreachable_unchecked" →
       lookupCallee s.memory.callees callerBody.layouts "core::hint::unreachable_unchecked" (extractCalleeTypeArgs func) s.memory.traitImpls = .none →
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals' →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals' →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
     (∀ (argVals : List Value) (locals' : List LocalSlot),
       extractCalleeDefPath? func = .some "core::intrinsics::unreachable" →
       lookupCallee s.memory.callees callerBody.layouts "core::intrinsics::unreachable" (extractCalleeTypeArgs func) s.memory.traitImpls = .none →
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals' →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals' →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.fail .ub) ∧
     (∀ (target : ResolvedCallTarget) (localsAfterFunc : List LocalSlot)
@@ -1694,14 +1717,15 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
         .ok target localsAfterFunc →
       target.isIndirect = true →
       lookupCallee s.memory.callees callerBody.layouts target.defPath target.typeArgs s.memory.traitImpls = .none →
-      evalOperands
+      evalOperandsWithBodyCast
         localsAfterFunc
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals' →
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals' →
       evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
         MirStepNode.extCall
           { defPath := target.defPath, typeArgs := target.typeArgs, args := argVals, memory := s.memory }
@@ -1714,9 +1738,9 @@ theorem mir_evalTerminator_diverging_call_args_and_unreachable
   · intro target localsAfterFunc hResolveOk hArgsUb
     simp only [evalTerminator, bodyLocalDeclsOf, hResolveOk, hArgsUb]
   · intro argVals locals' hFunc hFind hArgsOk
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach1]
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach1]
   · intro argVals locals' hFunc hFind hArgsOk
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach2]
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgsOk, hFind, hUnreach2]
   · intro target localsAfterFunc argVals locals' hResolveOk hIndirect hFind hArgsOk
     simp only [evalTerminator, bodyLocalDeclsOf, hResolveOk, hArgsOk, hFind, hIndirect]
 
@@ -1757,14 +1781,15 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
     (locals' : List LocalSlot)
     (hFunc : extractCalleeDefPath? func = .some defPath)
     (hArgs :
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals')
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals')
     (hFind : lookupCallee s.memory.callees callerBody.layouts defPath (extractCalleeTypeArgs func) s.memory.traitImpls = .some calleeBody) :
     let enteredState :=
       pushDivergingCalleeFrame s callerBody locals' destination unwind calleeBody argVals
@@ -1800,11 +1825,12 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
         MirStepNode.fail .ub) ∧
     (unwind = .continue_ →
       s.memory.callStack = .nil →
+      s.memory.rootUnwindCeiling = true →
       evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
         MirStepNode.retOutcome .panic) := by
   dsimp only
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
-  · simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFind,
+  · simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFind,
       checkCalleeTargetCompatible]
   · intro calleeLocals
     unfold evalTerminator pushDivergingCalleeFrame
@@ -1824,9 +1850,9 @@ theorem mir_evalTerminator_diverging_call_linked_callee_corresponds
   · intro hUnwind
     subst hUnwind
     simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack]
-  · intro hUnwind hRoot
+  · intro hUnwind hRoot hCeil
     subst hUnwind
-    simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, hRoot]
+    simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, hRoot, hCeil]
 
 /--
 Universal characterization of diverging `TerminatorKind.call` (`target = .none`)
@@ -1882,14 +1908,15 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
     (argVals : List Value)
     (locals' : List LocalSlot)
     (hArgs :
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals') :
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals') :
     let mkFnOp (p : DefPath) : Operand :=
       .constant { ty := { kind := .fnDef p .nil, layoutIdx := 0 }, val := .zeroSized }
     (∀ pAbort : DefPath,
@@ -1937,6 +1964,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
        p = "core::panicking::panic_const::panic_const_rem_by_zero") →
       findCallee? s.memory.callees p = .none →
       (s.memory.callStack = .nil →
+        s.memory.rootUnwindCeiling = true →
         evalTerminator s ⟨.call (mkFnOp p) argOps destination .none .continue_, span⟩ (.some callerBody) =
           MirStepNode.retOutcome .panic) ∧
       (s.memory.callStack = caller :: restStack →
@@ -1966,7 +1994,7 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
         isAbortingPanicDefPath pAbort = true := by
       rcases hpAbort with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpAbortFlags with ⟨hNotUnreach, hAbort⟩
-    simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+    simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
       extractCalleeTypeArgs, hArgs, hFindNone, hNotUnreach, hAbort]
   · intro p hp hFindNone
     have hpFlags :
@@ -1976,23 +2004,23 @@ theorem mir_evalTerminator_diverging_call_panic_entrypoints
       rcases hp with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide
     rcases hpFlags with ⟨hNotUnreach, hNotAbort, hUnwindPanic⟩
     refine ⟨?_, ?_, ?_, ?_, ?_⟩
-    · intro hRoot
+    · intro hRoot hCeil
       rw [hRoot] at hArgs
-      simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+      simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
         extractCalleeTypeArgs, hArgs, hNotUnreach, hFindNone, hNotAbort, hUnwindPanic,
-        applyUnwindAction, hRoot, unwindFromCallStack]
+        applyUnwindAction, hRoot, unwindFromCallStack, hCeil]
     · intro hStack hCallerUnwind
       rw [hStack] at hArgs
-      simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+      simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
         extractCalleeTypeArgs, hArgs, hNotUnreach, hFindNone, hNotAbort, hUnwindPanic,
         applyUnwindAction, hStack, unwindFromCallStack, hCallerUnwind]
-    · simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+    · simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
         extractCalleeTypeArgs, hArgs, hNotUnreach, hFindNone, hNotAbort, hUnwindPanic,
         applyUnwindAction]
-    · simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+    · simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
         extractCalleeTypeArgs, hArgs, hNotUnreach, hFindNone, hNotAbort, hUnwindPanic,
         applyUnwindAction]
-    · simp only [evalTerminator, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
+    · simp only [evalTerminator, bodyLocalDeclsOf, lookupCallee, resolveCalleeBodyAndArgs?, resolveCallTarget, extractCalleeDefPath?,
         extractCalleeTypeArgs, hArgs, hNotUnreach, hFindNone, hNotAbort, hUnwindPanic,
         applyUnwindAction]
 
@@ -2030,14 +2058,15 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
     (hNotAbort : isAbortingPanicDefPath defPath = false)
     (hNotPanic : isUnwindingPanicDefPath defPath = false)
     (hArgs :
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals') :
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals') :
     (evalTerminator s ⟨.call func argOps destination .none unwind, span⟩ (.some callerBody) =
       MirStepNode.extCall
         { defPath := defPath, typeArgs := extractCalleeTypeArgs func, args := argVals, memory := s.memory }
@@ -2046,10 +2075,14 @@ theorem mir_evalTerminator_diverging_call_external_corresponds
       resumeExternalDivergingCall s locals' unwind (.returned retVal memAfter) = .faulted .ub) ∧
     (∀ (memAfter : Memory),
       resumeExternalDivergingCall s locals' unwind (.panicked memAfter) =
-        applyUnwindAction s locals' memAfter unwind) ∧
+        applyUnwindAction
+          s
+          locals'
+          { memAfter with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+          unwind) ∧
     (resumeExternalDivergingCall s locals' unwind .aborted = .halted .abort) := by
   refine ⟨?_, ?_, ?_, ?_⟩
-  · simp only [evalTerminator, resolveCallTarget, hFunc, hArgs,
+  · simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs,
       hNotUnreach, hFindNone, hNotAbort, hNotPanic]
   · intro retVal memAfter
     rfl
@@ -2089,8 +2122,10 @@ theorem mir_evalTerminator_unwindResume_and_unwindTerminate_corresponds
     (restStack restStack₂ : List SavedCallerFrame)
     (cleanupBb grandCleanupBb : BasicBlockIdx) :
     (evalTerminator s ⟨.unwindTerminate, span⟩ currentBody = MirStepNode.retOutcome .abort) ∧
-    (s.memory.callStack = .nil →
+    (s.memory.callStack = .nil → s.memory.rootUnwindCeiling = true →
       evalTerminator s ⟨.unwindResume, span⟩ currentBody = MirStepNode.retOutcome .panic) ∧
+    (s.memory.callStack = .nil → s.memory.rootUnwindCeiling = false →
+      evalTerminator s ⟨.unwindResume, span⟩ currentBody = MirStepNode.fail .ub) ∧
     (s.memory.callStack = caller :: restStack →
       caller.returnUnwind = .cleanup cleanupBb →
       evalTerminator s ⟨.unwindResume, span⟩ currentBody =
@@ -2120,9 +2155,11 @@ theorem mir_evalTerminator_unwindResume_and_unwindTerminate_corresponds
                 callStack := restStack₂
                 activeCallee := .some grandCaller.callerBody
                 activeProtectors := restoreCallerProtectors grandCaller } }) := by
-  refine ⟨rfl, ?_, ?_, ?_, ?_, ?_⟩
-  · intro hNil
-    simp [evalTerminator, hNil]
+  refine ⟨rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro hNil hCeil
+    simp [evalTerminator, hNil, hCeil]
+  · intro hNil hCeil
+    simp [evalTerminator, hNil, hCeil]
   · intro hStack hUnwind
     simp [evalTerminator, hStack, hUnwind]
   · intro hStack hUnwind
@@ -2188,17 +2225,19 @@ theorem mir_evalTerminator_callee_unwind_and_external_resume_corresponds
         MirStepNode.fail .ub) ∧
     (unwind = .continue_ →
       s.memory.callStack = .nil →
+      s.memory.rootUnwindCeiling = true →
       evalTerminator enteredState ⟨.unwindResume, span⟩ (.some calleeBody) =
         MirStepNode.retOutcome .panic) ∧
     (unwind = .cleanup cleanupBb →
-      evalOperand
+      evalOperandWithBodyCast
         enteredState.frame.locals
         cond
         enteredState.memory.borrows
         enteredState.memory.globals
         calleeBody.layouts
         enteredState.memory.callerLocals
-        (callStack := enteredState.memory.callStack) =
+        calleeBody.localDecls
+        enteredState.memory.callStack =
           .ok (.scalar { bits := 0, sizeBytes := 1 }) calleeLocalsAfterCond →
       evalTerminator
         enteredState
@@ -2218,7 +2257,11 @@ theorem mir_evalTerminator_callee_unwind_and_external_resume_corresponds
                 activeProtectors := s.memory.activeProtectors } }) ∧
     (∀ memAfter : Memory,
       resumeExternalCall s locals' destination targetBb unwind (.panicked memAfter) =
-        applyUnwindAction s locals' memAfter unwind ∧
+        applyUnwindAction
+          s
+          locals'
+          { memAfter with rootUnwindCeiling := s.memory.rootUnwindCeiling }
+          unwind ∧
       resumeExternalCall s locals' destination targetBb unwind .aborted = .halted .abort ∧
       resumeExternalTailCall (.panicked memAfter) =
         unwindFromCallStack memAfter.callStack memAfter ∧
@@ -2234,12 +2277,12 @@ theorem mir_evalTerminator_callee_unwind_and_external_resume_corresponds
   · intro hUnwind
     subst hUnwind
     simp [evalTerminator, pushCalleeFrame, unwindFromCallStack]
-  · intro hUnwind hNil
+  · intro hUnwind hNil hCeil
     subst hUnwind
-    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack, hNil]
+    simp [evalTerminator, pushCalleeFrame, unwindFromCallStack, hNil, hCeil]
   · intro hUnwind hCond
     subst hUnwind
-    simp only [evalTerminator, hCond]
+    simp only [evalTerminator, bodyLocalDeclsOf, hCond]
     rfl
   · intro memAfter
     exact ⟨rfl, rfl, rfl, rfl⟩
@@ -2287,14 +2330,15 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
     (calleeActiveProtectors : List Nat)
     (hFunc : extractCalleeDefPath? func = .some defPath)
     (hArgs :
-      evalOperands
+      evalOperandsWithBodyCast
         s.frame.locals
         argOps
         s.memory.borrows
         s.memory.globals
         callerBody.layouts
         s.memory.callerLocals
-        (callStack := s.memory.callStack) = .ok argVals locals') :
+        callerBody.localDecls
+        s.memory.callStack = .ok argVals locals') :
     let s₁ :=
       pushDivergingCalleeFrame
         s
@@ -2356,6 +2400,7 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
      evalTerminator s₂ ⟨.unwindResume, span⟩ (.some calleeBody) =
       MirStepNode.step s₃ ∧
      (s.memory.callStack = .nil →
+       s.memory.rootUnwindCeiling = true →
        evalTerminator s₃ ⟨.unwindResume, span⟩ (.some callerBody) =
          MirStepNode.retOutcome .panic) ∧
      evalTerminator s₃ ⟨.unwindTerminate, span⟩ (.some callerBody) =
@@ -2363,20 +2408,20 @@ theorem mir_evalTerminator_diverging_call_partition_and_cleanup_chain
   dsimp only
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro hFindNone hUnreach
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone, hUnreach]
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone, hUnreach]
   · intro hFindNone hNotUnreach hAbort
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone, hNotUnreach, hAbort]
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone, hNotUnreach, hAbort]
   · intro hFindNone hNotUnreach hNotAbort hPanic
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone,
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
       hNotUnreach, hNotAbort, hPanic]
     cases applyUnwindAction s locals' s.memory unwind <;> rfl
   · intro hFindNone hNotUnreach hNotAbort hNotPanic
-    simp only [evalTerminator, resolveCallTarget, hFunc, hArgs, hFindNone,
+    simp only [evalTerminator, bodyLocalDeclsOf, resolveCallTarget, hFunc, hArgs, hFindNone,
       hNotUnreach, hNotAbort, hNotPanic]
   · refine ⟨rfl, ?_, ?_, rfl⟩
     · simp [evalTerminator, pushDivergingCalleeFrame, unwindFromCallStack, restoreCallerProtectors]
-    · intro hNil
-      simp [evalTerminator, unwindFromCallStack, hNil]
+    · intro hNil hCeil
+      simp [evalTerminator, unwindFromCallStack, hNil, hCeil]
 
 /-! ## 5. `CallConv.rustIntrinsic` Compiler Intrinsics Executed Inside `core` (`BRIEF-1.3`) -/
 
@@ -2463,24 +2508,24 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
   refine ⟨?_, ?_, ?_, ?_, ?_⟩
   · intro retScalar hOk
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
       hOk, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, hUb]
   · intro retScalar hOk
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
       hOk, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, hUb]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, resolveIntrinsicIsSigned,
       operandTy, placeTy]
 
@@ -2529,13 +2574,13 @@ theorem mir_evalTerminator_ub_checks_intrinsic_corresponds
   have hEx : stringEq "core::intrinsics::ub_checks" "core::intrinsics::exact_div" = false := rfl
   refine ⟨?_, ?_⟩
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, emptyMemory,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, emptyMemory,
       isDirectExactDivTarget, evalDirectRustIntrinsic?, h, hEx,
       evalNonSelectIntrinsicCall, writeIntrinsicReturn,
       writePlaceValue, get?, set?]
   · unfold evalTerminator mkIntrinsicCallTerm
     cases hInit : valueContainsUninit argVal <;>
-      simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+      simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
         readProjectedValue, hInit, emptyMemory, get?, isDirectExactDivTarget,
         evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
 
@@ -6405,7 +6450,8 @@ theorem mir_uninit_aggregate_field_write_characterizations
     (shell rootVal' : Value)
     (locals₂ : List LocalSlot)
     (protHead : Nat)
-    (protTail : List Nat) :
+    (protTail : List Nat)
+    (hNotCast : ∀ (castTy : Ty), proj ≠ .opaqueCast castTy) :
     ensureNestedFieldShells val [proj] localDecls layouts (.some rootTy) = .some val ∧
     (fieldShellChainPopulated rootVal (proj :: rest) = true →
       ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts (.some rootTy) =
@@ -6580,19 +6626,22 @@ theorem mir_uninit_aggregate_field_write_characterizations
   refine ⟨ensureNestedFieldShells_singleton val proj localDecls layouts (.some rootTy),
     ensureNestedFieldShells_eq_self_of_populated (proj :: rest) rootVal localDecls layouts
       (.some rootTy),
-    evalStmt_assign_init_projected_step s dstLoc proj rest rv span localDecls layouts
-      val rootVal rootVal' locals₁ locals₂ mem₁,
+    fun hND hRv hInit hPop hWrite hSet hNoConf =>
+      evalStmt_assign_init_projected_step s dstLoc proj rest rv span localDecls layouts
+        val rootVal rootVal' locals₁ locals₂ mem₁ hND hRv hInit hPop hWrite hSet hNoConf hNotCast,
     uninitFieldWriteShell?_field_union localDecls layouts dstLoc fieldIdx fieldTy
       rootTy defPath args l count,
     uninitFieldWriteShell?_field_struct localDecls layouts dstLoc fieldIdx fieldTy
       rootTy defPath args l offsets memOrder,
     uninitFieldWriteShell?_field_tuple localDecls layouts dstLoc fieldIdx fieldTy
       tupleFields layoutIdx,
-    uninitFieldWriteShell?_eq_none_of_not_field localDecls layouts dstLoc proj rest,
+    fun hNF =>
+      uninitFieldWriteShell?_eq_none_of_not_field localDecls layouts dstLoc proj rest hNF hNotCast,
     fun hNA hNT hNC =>
       uninitFieldWriteShell?_eq_none_of_non_aggregate_ty localDecls layouts dstLoc proj rest
-        hNA hNT hNC,
-    uninitFieldWriteShell?_eq_none_of_nil localDecls layouts dstLoc proj rest,
+        hNA hNT hNC hNotCast,
+    fun hNil =>
+      uninitFieldWriteShell?_eq_none_of_nil localDecls layouts dstLoc proj rest hNil hNotCast,
     evalStmt_assign_uninit_aggregate_field_protected_conflict_ub s dstLoc fieldIdx fieldTy
       rest rv span localDecls layouts val locals₁ mem₁ shell rootVal' locals₂ protHead protTail,
     fun hRv hUninit hTy hKind hLook hInhab hVar hFields hLt hSet hProt hNoUnion =>
@@ -6609,8 +6658,9 @@ theorem mir_uninit_aggregate_field_write_characterizations
       arrLayoutIdx rest rv span localDecls layouts val locals₁ mem₁,
     evalStmt_assign_uninit_field_non_field_subproj_ub s dstLoc fieldIdx fieldTy nextProj
       rest rv span localDecls layouts val locals₁ mem₁,
-    evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
-      val locals₁ mem₁⟩
+    fun hND hRv hUninit hNoShell =>
+      evalStmt_assign_uninit_non_aggregate_ub s dstLoc proj rest rv span localDecls layouts
+        val locals₁ mem₁ hND hRv hUninit hNoShell hNotCast⟩
 
 /--
 Correspondence theorem for projected local union field writes (`R1`):

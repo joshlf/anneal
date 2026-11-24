@@ -7730,8 +7730,8 @@ theorem mirStep_call_sizeOfVal_slice_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack =
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
@@ -7790,8 +7790,8 @@ theorem mirStep_call_sizeOfVal_str_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack =
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
@@ -7849,8 +7849,8 @@ theorem mirStep_call_alignOfVal_slice_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack =
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
@@ -7910,8 +7910,8 @@ theorem mirStep_call_alignOfVal_str_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack =
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack =
         .ok (.aggregate 0 [.ptr p 8, .scalar ⟨len, 8⟩]) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
@@ -8168,8 +8168,8 @@ theorem mirStep_call_sizeOfVal_sized_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::size_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack = .ok (.ptr p 8) locals')
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok (.ptr p 8) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
     (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::size_of_val"
@@ -8227,8 +8227,8 @@ theorem mirStep_call_alignOfVal_sized_preserves_spatialPin
       { kind := .call func [ptrOp] { local_ := dstLoc, projection := [] } (some targetBb) unwind,
         span := span })
     (hCallee : extractCallee? func = some ("core::intrinsics::align_of_val", typeArgs))
-    (hArg : evalOperand ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
-      ms.memory.callerLocals .nil ms.memory.callStack = .ok (.ptr p 8) locals')
+    (hArg : evalOperandWithBodyCast ms.frame.locals ptrOp ms.memory.borrows ms.memory.globals cur.layouts
+      ms.memory.callerLocals cur.localDecls ms.memory.callStack = .ok (.ptr p 8) locals')
     (hPinLoc : locals'[l]? = ms.frame.locals[l]?)
     (hBindLoc : ∀ b, b ∈ bindings → locals'[b.2.1]? = ms.frame.locals[b.2.1]?)
     (hNoOverride : lookupCallee ms.memory.callees cur.layouts "core::intrinsics::align_of_val"
