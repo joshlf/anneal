@@ -1058,6 +1058,37 @@ theorem typeEq_int_right_iff (ty : «Type») (t : IntType) :
     · intro h
       cases h
 
+/-- Variant entries `[(0, bool), (1, bool)]` and their swapped-order counterpart. -/
+def permEnumEntriesA : List (Int × Variant) := [(0, ⟨.Bool, ⟨[]⟩⟩), (1, ⟨.Bool, ⟨[]⟩⟩)]
+/-- Swapped-order counterpart of `permEnumEntriesA`. -/
+def permEnumEntriesB : List (Int × Variant) := [(1, ⟨.Bool, ⟨[]⟩⟩), (0, ⟨.Bool, ⟨[]⟩⟩)]
+/-- Two extensionally identical `Type::Enum`s with opposite variant list order. -/
+def permEnumA : «Type» := .Enum ⟨permEnumEntriesA⟩ itU8 .Invalid ⟨1⟩ ⟨1⟩
+/-- Swapped-order counterpart of `permEnumA`. -/
+def permEnumB : «Type» := .Enum ⟨permEnumEntriesB⟩ itU8 .Invalid ⟨1⟩ ⟨1⟩
+
+/-- `permEnumA` and `permEnumB` satisfy `typeEq` yet are propositionally distinct. -/
+theorem permEnum_typeEq_ne : typeEq permEnumA permEnumB = true ∧ permEnumA ≠ permEnumB := by
+  refine ⟨?_, ?_⟩
+  · have hml : (mapLen ⟨permEnumEntriesA⟩ == mapLen ⟨permEnumEntriesB⟩) = true := rfl
+    have hget0 : mapGet ⟨permEnumEntriesB⟩ 0 = some ⟨.Bool, ⟨[]⟩⟩ := rfl
+    have hget1 : mapGet ⟨permEnumEntriesB⟩ 1 = some ⟨.Bool, ⟨[]⟩⟩ := rfl
+    have hc0 : (([] : List Int).contains 0) = false := rfl
+    have hc1 : (([0] : List Int).contains 1) = false := rfl
+    simp only [permEnumA, permEnumB, typeEq, discriminatorEq, hml, beq_self_eq_true,
+      Bool.true_and, Bool.and_true]
+    simp only [permEnumEntriesA, typeVariantsEq, typeEq, mapEq, List.all_nil, hget0, hget1,
+      hc0, hc1, Bool.false_eq_true, ↓reduceIte, Bool.and_self]
+  · intro h
+    have hfst :=
+      congrArg (fun t => match t with | .Enum ⟨(k, _) :: _⟩ _ _ _ _ => k | _ => (2 : Int)) h
+    dsimp only [permEnumA, permEnumB, permEnumEntriesA, permEnumEntriesB] at hfst
+    exact absurd hfst (by decide)
+
+/-- Unlike on `Type::Int`, `typeEq` on all of `Type` is not propositional equality. -/
+theorem typeEq_not_eq : ∃ t1 t2 : «Type», typeEq t1 t2 = true ∧ t1 ≠ t2 :=
+  ⟨permEnumA, permEnumB, permEnum_typeEq_ne⟩
+
 /-- `Align::from_bytes(n)` succeeds only for positive byte counts. -/
 theorem alignFromBytes_pos {n : Nat} {al : Align} (h : alignFromBytes n = some al) :
     0 < n := by
@@ -1708,19 +1739,39 @@ theorem atomicCompareExchange_load_error {m : Machine M}
   rw [atomicCompareExchange_eq m ptr pty cur next t hal hsz, hload]
   rfl
 
+/-- A successful `AtomicCompareExchange` at `Type::Int(t)` passed the size
+checks: `t`'s size is a power of two no bigger than `MAX_ATOMIC_SIZE`. -/
+theorem atomicCompareExchange_ok_size {m m' : Machine M}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next val : Value M} {t : IntType}
+    (h : evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (val, m')) :
+    ∃ al, alignFromBytes t.size.bytes = some al ∧
+      t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes := by
+  have hte : typeEq (.Int t) (.Int t) = true := by simp only [typeEq, beq_self_eq_true]
+  simp only [evalIntrinsicM, hte, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
+  cases hal : alignFromBytes t.size.bytes with
+  | none => simp only [layout_int_ill_formed hal, interp_error_bind] at h; cases h
+  | some al =>
+    have ha : alignFromBytesInt (t.size.bytes : Int) = some al := by
+      rw [alignFromBytesInt_natCast]; exact hal
+    simp only [layout_int hal, interp_ok_bind, LayoutStrategy.expect_size,
+      interp_pure_bind, ha] at h
+    by_cases hbig : t.size.bytes > x86_64.MAX_ATOMIC_SIZE.bytes
+    · simp only [hbig, ↓reduceIte, ub] at h; cases h
+    · exact ⟨al, rfl, Nat.not_lt.mp hbig⟩
+
 /-- Upstream: "We do *not* do a store on a failing AtomicCompareExchange. This
 means that races between a non-atomic load and a failing AtomicCompareExchange
 are not considered UB!" An `AtomicCompareExchange` that returns something other
 than `current` appends exactly one access to the log, an atomic `Load`. -/
 theorem atomicCompareExchange_failure_accesses {m m' : Machine M}
     {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next before : Value M}
-    {t : IntType} {al : Align}
-    (hal : alignFromBytes t.size.bytes = some al)
-    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    {t : IntType}
     (h : evalIntrinsicM m .AtomicCompareExchange
         [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (before, m'))
     (hne : cur ≠ before) :
     m'.mem.accesses = m.mem.accesses ++ [⟨.Load, .Atomic, ptr.addr, t.size⟩] := by
+  obtain ⟨_, hal, hsz⟩ := atomicCompareExchange_ok_size h
   rw [atomicCompareExchange_eq m ptr pty cur next t hal hsz] at h
   obtain ⟨⟨b, m1⟩, hload, h⟩ := interp_bind_eq_ok h
   dsimp only at h
@@ -1742,14 +1793,13 @@ theorem atomicCompareExchange_failure_accesses {m m' : Machine M}
 atomic `Load` and then an atomic `Store` of the encoding of `next`. -/
 theorem atomicCompareExchange_success_accesses {m m' : Machine M}
     {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next : Value M}
-    {t : IntType} {al : Align}
-    (hal : alignFromBytes t.size.bytes = some al)
-    (hsz : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    {t : IntType}
     (h : evalIntrinsicM m .AtomicCompareExchange
         [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (cur, m')) :
     ∃ bytes, Type.encodeM (M := M) (.Int t) next = .ok bytes ∧
       m'.mem.accesses = m.mem.accesses ++
         [⟨.Load, .Atomic, ptr.addr, t.size⟩, ⟨.Store, .Atomic, ptr.addr, ⟨bytes.length⟩⟩] := by
+  obtain ⟨_, hal, hsz⟩ := atomicCompareExchange_ok_size h
   rw [atomicCompareExchange_eq m ptr pty cur next t hal hsz] at h
   obtain ⟨⟨b, m1⟩, hload, h⟩ := interp_bind_eq_ok h
   dsimp only at h
@@ -1966,25 +2016,6 @@ theorem atomicCompareExchange_error_iff {m : Machine M} {args : List (Value M ×
         · exact atomicCompareExchange_load_error pty cur next hal hsz hload
         · exact atomicCompareExchange_store_error pty hal hsz hload hstore
 
-/-- A successful `AtomicCompareExchange` at `Type::Int(t)` passed the size
-checks: `t`'s size is a power of two no bigger than `MAX_ATOMIC_SIZE`. The laws
-above that take these two facts as hypotheses next to a successful
-compare-exchange (`atomicCompareExchange_failure_accesses`,
-`atomicCompareExchange_success_accesses`) do not need them. -/
-theorem atomicCompareExchange_ok_size {m m' : Machine M}
-    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {cur next val : Value M}
-    {t : IntType}
-    (h : evalIntrinsicM m .AtomicCompareExchange
-        [(.Ptr ⟨ptr, none⟩, pty), (cur, .Int t), (next, .Int t)] (.Int t) = .ok (val, m')) :
-    ∃ al, alignFromBytes t.size.bytes = some al ∧
-      t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes := by
-  obtain ⟨_, _, _, _, t', al, _, _, hret, hal, hsz, _, _⟩ := atomicCompareExchange_ok_iff.mp h
-  have ht : t = t' := by
-    cases hret
-    rfl
-  rw [← ht] at hal hsz
-  exact ⟨al, hal, hsz⟩
-
 /-- The complete access log of a successful `AtomicCompareExchange`, without
 side hypotheses: it returned `current` and logged an atomic `Load` followed by
 an atomic `Store`, or it returned something else and logged only the atomic
@@ -1998,13 +2029,12 @@ theorem atomicCompareExchange_accesses {m m' : Machine M}
         [⟨.Load, .Atomic, ptr.addr, t.size⟩, ⟨.Store, .Atomic, ptr.addr, t.size⟩]) ∨
     (cur ≠ val ∧
       m'.mem.accesses = m.mem.accesses ++ [⟨.Load, .Atomic, ptr.addr, t.size⟩]) := by
-  obtain ⟨_, hal, hsz⟩ := atomicCompareExchange_ok_size h
   by_cases hcv : cur = val
   · subst hcv
-    obtain ⟨bytes, henc, hacc⟩ := atomicCompareExchange_success_accesses hal hsz h
+    obtain ⟨bytes, henc, hacc⟩ := atomicCompareExchange_success_accesses h
     rw [encodeM_int_length henc] at hacc
     exact Or.inl ⟨rfl, hacc⟩
-  · exact Or.inr ⟨hcv, atomicCompareExchange_failure_accesses hal hsz h hcv⟩
+  · exact Or.inr ⟨hcv, atomicCompareExchange_failure_accesses h hcv⟩
 
 /-- `AtomicCompareExchange` never checks `current` against the type: upstream
 compares it structurally with the loaded value and nothing else. A `current`
@@ -2430,6 +2460,25 @@ theorem atomicFetchAndOp_stores_no_provenance {m m' : Machine M} {binOp : IntBin
   rw [← hval] at hload
   obtain ⟨bytes, henc, hmem⟩ := typedStoreM_ok_memory hstore
   exact ⟨al, m1, bytes, hload, encodeM_int_no_provenance henc, encodeM_int_length henc, hmem⟩
+
+/-- Passing `permEnumA` and `permEnumB` (`permEnumA ≠ permEnumB`) passes `typeEq`
+and triggers the non-integer return type UB (not `"not same type as return value"`),
+so `atomicCompareExchange_error_iff` and `atomicFetchAndOp_error_iff` cannot
+replace `typeEq` by propositional `=`. -/
+theorem atomic_enum_extensional_typeEq_ub (m : Machine M)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (v1 v2 : Value M) (binOp : IntBinOp) :
+    permEnumA ≠ permEnumB ∧
+    evalIntrinsicM m .AtomicCompareExchange
+        [(.Ptr ⟨ptr, none⟩, pty), (v1, permEnumA), (v2, permEnumA)] permEnumB =
+      .error (.ub "invalid return type for `Intrinis::AtomicCompareExchange`: only works with integers") ∧
+    evalIntrinsicM m (.AtomicFetchAndOp binOp)
+        [(.Ptr ⟨ptr, none⟩, pty), (v1, permEnumA)] permEnumB =
+      .error (.ub "invalid return type for `AtomicFetchAndOp` intrinsic: only works with integers") :=
+  ⟨permEnum_typeEq_ne.2,
+   atomicCompareExchange_non_int_ub m ptr pty v1 v2 permEnumA permEnumA permEnumB
+     permEnum_typeEq_ne.1 permEnum_typeEq_ne.1 (fun _ h => by dsimp only [permEnumB] at h; cases h),
+   atomicFetchAndOp_non_int_ub m binOp ptr pty v1 permEnumA permEnumB
+     permEnum_typeEq_ne.1 (fun _ h => by dsimp only [permEnumB] at h; cases h)⟩
 
 /-! ### `eval_int_bin_op` as used by `AtomicFetchAndOp` -/
 
@@ -2890,6 +2939,26 @@ theorem atomicStore_misaligned_ub (hM : StoreChecksAlign M) (m : Machine M)
   obtain rfl := alignFromBytes_eq_some hal
   rw [typedStoreM_int_store_error .Atomic hrep (fun bytes => hM _ _ bytes _ hmis)]
   rfl
+
+/-- `Terminator::Intrinsic` (`spec/lang/step/terminators.md`): after evaluating
+`ret_place`, arguments, any returning intrinsic (including all four atomics),
+and `place_store`, `next_block = some nb` jumps to `nb` while `next_block = none`
+is UB `"return from an intrinsic where caller did not specify next block"`. -/
+theorem evalTerminatorM_intrinsic_ok {m m1 m2 m3 m4 : Machine M}
+    {op : IntrinsicOp} {argExprs : List ValueExpr} {retExpr : PlaceExpr}
+    {nextBlock : Option BbName} {retPlace : Place M} {retTy : «Type»}
+    {args : List (Value M × «Type»)} {val : Value M}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, retTy), m1))
+    (hargs : evalArgsM m1 argExprs = .ok (args, m2))
+    (hint : evalIntrinsicM m2 op args retTy = .ok (val, m3))
+    (hstore : placeStoreM m3 retPlace val retTy = .ok m4) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) =
+      match nextBlock with
+      | some nb => jumpToBlockM m4 nb
+      | none => .error (.ub "return from an intrinsic where caller did not specify next block") := by
+  cases nextBlock with
+  | none => simp only [evalTerminatorM, hplace, hargs, hint, hstore, interp_ok_bind, ub]
+  | some _ => simp only [evalTerminatorM, hplace, hargs, hint, hstore, interp_ok_bind]
 
 end Guards
 
@@ -3401,8 +3470,7 @@ theorem atomicCompareExchange_failure_nonAtomicLoad_no_data_race
     (tid : ThreadId) (sync : Set ThreadId) :
     ConcurrentMemory.check_data_races m3.mem tid (sync, m1.mem.accesses) = .ok () ∧
     ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) = .ok () := by
-  obtain ⟨_, hal1, hsz1⟩ := atomicCompareExchange_ok_size hcas
-  have hacc1 := atomicCompareExchange_failure_accesses hal1 hsz1 hcas hne
+  have hacc1 := atomicCompareExchange_failure_accesses hcas hne
   obtain ⟨sz2, _, _, hacc2⟩ := typedLoadM_ok_accesses hload
   rw [hemp0, List.nil_append] at hacc1
   rw [hemp2, List.nil_append] at hacc2
@@ -3446,8 +3514,7 @@ theorem atomicCompareExchange_success_nonAtomicLoad_data_race
       .error (.ub "Data race") ∧
     ConcurrentMemory.check_data_races m1.mem tid (sync, m3.mem.accesses) =
       .error (.ub "Data race") := by
-  obtain ⟨_, hal1, hsz1⟩ := atomicCompareExchange_ok_size hcas
-  obtain ⟨bytes, henc, hacc1⟩ := atomicCompareExchange_success_accesses hal1 hsz1 hcas
+  obtain ⟨bytes, henc, hacc1⟩ := atomicCompareExchange_success_accesses hcas
   have hlen : bytes.length = t1.size.bytes := encodeM_int_length henc
   obtain ⟨sz2, _, hl2', hacc2⟩ := typedLoadM_ok_accesses hload
   have hsz2 : sz2 = size2 := by
@@ -4996,6 +5063,25 @@ theorem sharedRefFn_mode_sensitivity :
       some (.ub "Tree Borrows: local write of Frozen reference") := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
+/-- Function whose `AtomicStore` terminator omits `next_block` (`none`). -/
+def divergingAtomicFn : Function :=
+  { locals := ⟨[(lname 0, .Int itU32), (lname 1, unitType)]⟩
+    args := [], ret := lname 1, calling_convention := .Rust
+    blocks := ⟨[(bname 0,
+      { statements := [.StorageLive (lname 0), .StorageLive (lname 1)]
+        terminator := .Intrinsic .AtomicStore [cellPtrExpr, constU32 5] (.Local (lname 1)) none
+        kind := .Regular })]⟩
+    start := bname 0, implicit_writes := true }
+
+/-- `divergingAtomicFn` end to end on `Mach` and `MachTB`: a returning atomic
+intrinsic with `next_block = none` hits UB on both memory models. -/
+theorem divergingAtomicFn_no_next_block_ub :
+    stopOf (steps 2 (bmStart divergingAtomicFn) >>= step) =
+      some (.ub "return from an intrinsic where caller did not specify next block") ∧
+    stopOf (stepsTB 2 (tbStart divergingAtomicFn) >>= stepTB) =
+      some (.ub "return from an intrinsic where caller did not specify next block") := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
 /-! ## §5. Vacuity and axiom audit
 
 The conditional laws of §2 and §3 take the outcome of `typed_load` or
@@ -5045,7 +5131,7 @@ failing compare-exchange is exactly one atomic load of 4 bytes. -/
 theorem atomicCompareExchange_failure_accesses_instance :
     (tbMach [tbCell (u32Bytes 5 ++ uninitBytes 4)] [aLoad 4]).mem.accesses =
       tbFive.mem.accesses ++ [⟨.Load, .Atomic, tbPtr.addr, itU32.size⟩] :=
-  atomicCompareExchange_failure_accesses (al := ⟨4⟩) rfl (by decide)
+  atomicCompareExchange_failure_accesses
     atomicCompareExchange_failure_instance (fun h => absurd (Value.Int.inj h) (by decide))
 
 /-- `atomicCompareExchange_success` on `tbFive`: comparing against `5` stores
