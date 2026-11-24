@@ -4563,7 +4563,7 @@ impl<'a> Iterator for AttributeBodies<'a> {
         loop {
             match lexer.next_tok() {
                 Ok(Some(SpecTok::Sym("[" | "(" | "{"))) => depth += 1,
-                Ok(Some(SpecTok::Sym("]" | ")" | "}"))) => {
+                Ok(Some(SpecTok::Sym("]"))) => {
                     depth -= 1;
                     if depth == 0 {
                         // `lexer.pos` is right after the one-byte closer.
@@ -4571,6 +4571,9 @@ impl<'a> Iterator for AttributeBodies<'a> {
                         self.rest = &rest[lexer.pos..];
                         return Some(body);
                     }
+                }
+                Ok(Some(SpecTok::Sym(")" | "}"))) if depth > 1 => {
+                    depth -= 1;
                 }
                 Ok(Some(_)) => {}
                 Ok(None) | Err(_) => {
@@ -4697,7 +4700,7 @@ pub fn is_entry_attribute(attribute: &str) -> bool {
                     last_segment = Some(word);
                     expect_segment = false;
                 }
-                SpecTok::Sym("(") if !expect_segment => break,
+                SpecTok::Sym("(" | "[" | "{") if !expect_segment => break,
                 SpecTok::Sym("=") => return false,
                 _ => return false,
             }
@@ -5507,6 +5510,23 @@ fn is_catch_all_binder_word(word: &str) -> bool {
         .is_some_and(|first| first == '_' || first.is_lowercase())
 }
 
+/// Maximum nested catch-all parenthesis levels tracked per pattern alternative
+/// (`(((_, _), _))`).
+const MAX_CATCH_ALL_PAREN_DEPTH: usize = 8;
+
+/// Per-parenthesis-level tuple and or-pattern catch-all state so nested
+/// parenthesized patterns (`(_, ())`, `(_, (a, b) | (0, 1))`) never leak into
+/// or overwrite an enclosing tuple's state.
+#[derive(Clone, Copy, Debug, Default)]
+struct CatchAllParenFrame {
+    /// An earlier `|` alternative of the current component was a catch-all.
+    or_wild: bool,
+    /// A `,` was seen directly inside this parenthesis group (it is a tuple).
+    tuple_started: bool,
+    /// Every completed component of this tuple was a catch-all.
+    tuple_wild: bool,
+}
+
 /// One pattern alternative of a match arm (the text between two `|`), or the
 /// arm body that follows `=>`.
 #[derive(Clone, Copy, Debug, Default)]
@@ -5517,7 +5537,7 @@ struct ArmAlternative {
     /// `(match r with | …)`).
     arm_base_depth: u32,
     /// Number of outer grouping parentheses `(` opened around a catch-all
-    /// pattern (`(_)`, `((e))`, `(_ : T)`).
+    /// pattern (`(_)`, `((e))`, `(_ : T)`, `(_, _)`).
     catch_all_parens: u32,
     /// Number of tokens.
     tokens: u32,
@@ -5551,14 +5571,9 @@ struct ArmAlternative {
     /// the scan position (`W { r: Err(_) }`, Lean `{ val := .err _ }`); a
     /// `:=` at or below it separates a field from its pattern.
     struct_pattern_depth: Option<u32>,
-    /// An earlier `|` alternative of the current component of a
-    /// parenthesized catch-all candidate was a catch-all (`(_ | 0)`).
-    or_wild: bool,
-    /// A `,` was seen directly inside the outer catch-all parentheses: the
-    /// candidate is a tuple (`(_, _)`).
-    tuple_started: bool,
-    /// Every completed component of that tuple was a catch-all.
-    tuple_wild: bool,
+    /// Stack of per-level tuple/or catch-all frames for the active
+    /// `catch_all_parens` levels (`0..catch_all_parens`).
+    paren_frames: [CatchAllParenFrame; MAX_CATCH_ALL_PAREN_DEPTH],
 }
 
 impl ArmAlternative {
@@ -5573,21 +5588,30 @@ impl ArmAlternative {
 
     /// The next `|` / sibling alternative inside the same arm, preserving the
     /// arm's base depth, the enclosing struct pattern, and `catch_all_parens`
-    /// outer catch-all parentheses.
+    /// outer catch-all parentheses (along with their active frames).
     fn next_alt(&self, catch_all_parens: u32) -> Self {
-        Self {
+        let mut next = Self {
             depth: self.depth,
             arm_base_depth: self.arm_base_depth,
             catch_all_parens,
             struct_pattern_depth: self.struct_pattern_depth,
             ..Self::default()
-        }
+        };
+        let keep = (catch_all_parens as usize).min(MAX_CATCH_ALL_PAREN_DEPTH);
+        next.paren_frames[..keep].copy_from_slice(&self.paren_frames[..keep]);
+        next
     }
 
     /// Whether the scan position is directly inside the outer catch-all
     /// parentheses (not in a nested bracket).
     fn at_catch_all_paren_level(&self) -> bool {
         self.catch_all_parens > 0 && self.depth == self.arm_base_depth + self.catch_all_parens
+    }
+
+    /// Mutable reference to the innermost active catch-all paren frame.
+    fn top_paren_frame_mut(&mut self) -> Option<&mut CatchAllParenFrame> {
+        let idx = self.catch_all_parens.checked_sub(1)? as usize;
+        self.paren_frames.get_mut(idx)
     }
 
     /// An arm body beginning at bracket depth `depth`.
@@ -5846,8 +5870,12 @@ fn is_conjunction_tok(tok: SpecTok<'_>) -> bool {
     matches!(tok, SpecTok::Sym("&&" | "∧" | "/\\") | SpecTok::Word("and"))
 }
 
-fn is_looser_than_disjunction(tok: SpecTok<'_>) -> bool {
-    matches!(tok, SpecTok::Sym("->" | "→" | "↔" | "<->" | "==>"))
+fn is_implication_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("->" | "→" | "==>"))
+}
+
+fn is_biconditional_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("↔" | "<->"))
 }
 
 /// Whether `tok` (followed by `next`) ends an arm body that no bracket
@@ -5950,9 +5978,17 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<boo
         Some(SpecTok::Sym("(")) => expr_is_trivially_true(&mut probe, Some(")"), depth - 1)?,
         Some(SpecTok::Sym("{")) => expr_is_trivially_true(&mut probe, Some("}"), depth - 1)?,
         Some(SpecTok::Word("true" | "True" | "trivial")) => true,
-        Some(SpecTok::Sym("!")) => matches!(probe.next_tok()?, Some(SpecTok::Word("false"))),
+        Some(SpecTok::Sym("!")) => {
+            let next = probe.next_tok()?;
+            matches!(next, Some(SpecTok::Word("false")))
+                || (next == Some(SpecTok::Sym("!"))
+                    && consume_trivial_true_atom(&mut probe, depth - 1)?)
+        }
         Some(SpecTok::Sym("¬") | SpecTok::Word("Not")) => {
-            matches!(probe.next_tok()?, Some(SpecTok::Word("False")))
+            let next = probe.next_tok()?;
+            matches!(next, Some(SpecTok::Word("False")))
+                || (matches!(next, Some(SpecTok::Sym("¬") | SpecTok::Word("Not")))
+                    && consume_trivial_true_atom(&mut probe, depth - 1)?)
         }
         _ => false,
     };
@@ -6050,8 +6086,12 @@ fn expr_is_trivially_true(
     let mut at_disjunct_start = true;
     let mut inner_depth = 0u32;
     let mut prev_closed_brace_at_zero = false;
-    // A right-extending construct was seen: later disjuncts are its own.
+    // A right-extending construct was seen: later disjuncts are its own
+    // (unless a Rust `else { … }` block closes right before a disjunction).
     let mut disjuncts_blocked = false;
+    let mut saw_else_before_brace = false;
+    let mut in_else_brace = false;
+    let mut else_brace_just_closed = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
@@ -6072,6 +6112,8 @@ fn expr_is_trivially_true(
             return Ok(false);
         }
         if inner_depth == 0 {
+            let unblocks_rust_if_else = else_brace_just_closed && is_disjunction_tok(tok);
+            else_brace_just_closed = false;
             if prev_closed_brace_at_zero {
                 prev_closed_brace_at_zero = false;
                 if stop_delim.is_none()
@@ -6103,11 +6145,33 @@ fn expr_is_trivially_true(
                     return Ok(found_trivial);
                 }
             }
-            if is_looser_than_disjunction(tok) {
+            if is_biconditional_tok(tok) {
                 return Ok(false);
             }
-            if extends_to_the_right(tok) {
+            if is_implication_tok(tok) {
+                // `P → True` is tautologically true whenever the implication
+                // is at top level (not nested under an unparenthesized `if`);
+                // `True → False` and `P ∨ True → False` recurse into `False`
+                // and return `Ok(false)`.
+                if disjuncts_blocked {
+                    return Ok(false);
+                }
+                return expr_is_trivially_true(look, stop_delim, depth - 1);
+            }
+            if unblocks_rust_if_else {
+                disjuncts_blocked = false;
+            }
+            if tok == SpecTok::Word("else") {
+                saw_else_before_brace = true;
                 disjuncts_blocked = true;
+            } else {
+                if tok == SpecTok::Sym("{") && saw_else_before_brace {
+                    in_else_brace = true;
+                }
+                saw_else_before_brace = false;
+                if extends_to_the_right(tok) {
+                    disjuncts_blocked = true;
+                }
             }
             if is_disjunction_tok(tok) {
                 at_disjunct_start = true;
@@ -6143,6 +6207,10 @@ fn expr_is_trivially_true(
                 inner_depth -= 1;
                 if inner_depth == 0 && tok == SpecTok::Sym("}") {
                     prev_closed_brace_at_zero = true;
+                    if in_else_brace {
+                        in_else_brace = false;
+                        else_brace_just_closed = true;
+                    }
                 }
             }
             _ => {}
@@ -6334,12 +6402,11 @@ pub fn scan_error_branch_wildcard(
                         // (`(0 | _)`, `(_ | 0, y)`): whether the group is a
                         // catch-all is only known once it closes.
                         _ if alt.at_catch_all_paren_level() => {
-                            let or_wild = alt.or_wild || alt.catch_all;
-                            let (tuple_started, tuple_wild) = (alt.tuple_started, alt.tuple_wild);
+                            let catch_all = alt.catch_all;
+                            if let Some(frame) = alt.top_paren_frame_mut() {
+                                frame.or_wild |= catch_all;
+                            }
                             alt = alt.next_alt(alt.catch_all_parens);
-                            alt.or_wild = or_wild;
-                            alt.tuple_started = tuple_started;
-                            alt.tuple_wild = tuple_wild;
                         }
                         // Top-level or nested or-pattern
                         // (`Some(Err(_) | Ok(0))`).
@@ -6380,7 +6447,8 @@ pub fn scan_error_branch_wildcard(
             }
             SpecTok::Sym("(") => {
                 let outer_wrapper = (alt.tokens == 0 || alt.only_modifiers)
-                    && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
+                    && alt.depth == alt.arm_base_depth + alt.catch_all_parens
+                    && (alt.catch_all_parens as usize) < MAX_CATCH_ALL_PAREN_DEPTH;
                 alt.depth += 1;
                 if alt.type_ascription_depth.is_some() {
                     alt.tokens += 1;
@@ -6389,6 +6457,8 @@ pub fn scan_error_branch_wildcard(
                     alt.catch_all = false;
                     alt.only_modifiers = outer_wrapper;
                     if outer_wrapper {
+                        alt.paren_frames[alt.catch_all_parens as usize] =
+                            CatchAllParenFrame::default();
                         alt.catch_all_parens += 1;
                     }
                 }
@@ -6445,18 +6515,18 @@ pub fn scan_error_branch_wildcard(
                         && alt.depth < alt.arm_base_depth + alt.catch_all_parens;
                     if closed_outer_catch_all_paren {
                         alt.catch_all_parens -= 1;
+                        let frame = alt.paren_frames[alt.catch_all_parens as usize];
+                        alt.paren_frames[alt.catch_all_parens as usize] =
+                            CatchAllParenFrame::default();
                         // The group is a catch-all when its last component
                         // is (`(e)`, `(0 | _)`) and, for a tuple, every
                         // earlier component was too (`(_, _)`, `(_, _,)`).
-                        let last_wild = alt.catch_all || alt.or_wild;
-                        alt.catch_all = if alt.tuple_started {
-                            alt.tuple_wild && (last_wild || alt.only_modifiers)
+                        let last_wild = alt.catch_all || frame.or_wild;
+                        alt.catch_all = if frame.tuple_started {
+                            frame.tuple_wild && (last_wild || alt.only_modifiers)
                         } else {
                             last_wild
                         };
-                        alt.or_wild = false;
-                        alt.tuple_started = false;
-                        alt.tuple_wild = false;
                     }
                     if was_ascription || closed_outer_catch_all_paren {
                         alt.tokens += 1;
@@ -6636,13 +6706,20 @@ pub fn scan_error_branch_wildcard(
                         alt.only_modifiers = keep_mod;
                     } else if tok == SpecTok::Sym(",") && alt.at_catch_all_paren_level() {
                         // A tuple component ended (`(_, _)`).
-                        let component_wild = alt.catch_all || alt.or_wild;
-                        alt.tuple_wild = component_wild && (alt.tuple_wild || !alt.tuple_started);
-                        alt.tuple_started = true;
-                        alt.or_wild = false;
+                        let catch_all = alt.catch_all;
+                        let tuple_wild = if let Some(frame) = alt.top_paren_frame_mut() {
+                            let component_wild = catch_all || frame.or_wild;
+                            frame.tuple_wild =
+                                component_wild && (frame.tuple_wild || !frame.tuple_started);
+                            frame.tuple_started = true;
+                            frame.or_wild = false;
+                            frame.tuple_wild
+                        } else {
+                            false
+                        };
                         alt.tokens += 1;
                         alt.catch_all = false;
-                        alt.only_modifiers = alt.tuple_wild;
+                        alt.only_modifiers = tuple_wild;
                     } else if tok == SpecTok::Sym("@") && alt.catch_all {
                         alt.tokens += 1;
                         alt.catch_all = false;
@@ -7887,6 +7964,8 @@ mod spec_boundary_guard_tests {
             "/* c */ #[cortex_m_rt::entry]",
             "#[inline]\n#[entry]",
             "#[tokio::main(flavor = \"current_thread\")] // c",
+            "#[tokio::main[flavor = \"current_thread\"]]",
+            "#[my_rt::entry { stack = 4096 }]",
         ] {
             assert!(is_entry_attribute(attr), "{attr}");
             let reset = desc("fw::reset").with_attributes(&[attr]);
@@ -9224,6 +9303,54 @@ mod spec_boundary_guard_tests {
             "catch_all_arm_true",
         ),
         ("lean", "| «Except.error» _ => True", "err_arm_true"),
+        // Nested catch-all paren frames neither leak into inner unit patterns
+        // nor lose outer tuple/or state.
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, ()) => true }",
+            "",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, (_, (a, b) | (0, 1)) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((a, b) | (0, 1), _) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match (a, b) { (Ok(x), Ok(y)) => x == y, ((_, _), (0, 1)) => true }",
+            "",
+        ),
+        // Double negation, tautological implications (`P → True`), and Rust
+        // braced `if … else { … } || true`.
+        ("rust", "Err(_) => !!true", "err_arm_true"),
+        ("lean", "| .err _ => ¬¬True", "err_arm_true"),
+        ("lean", "| .err _ => ¬ ¬ True", "err_arm_true"),
+        ("lean", "| .err _ => e = .overflow → True", "err_arm_true"),
+        ("lean", "| .err _ => P → Q → True", "err_arm_true"),
+        ("lean", "| .err _ => (P → True)", "err_arm_true"),
+        ("lean", "| .err _ => (P → True) ∧ x = 3", ""),
+        ("lean", "| .err _ => P ↔ True", ""),
+        ("lean", "| .err _ => if c then False else P → True", ""),
+        (
+            "rust",
+            "Err(_) => if c { false } else { x == 1 } || true",
+            "err_arm_true",
+        ),
+        (
+            "rust",
+            "Err(_) => if c || true { false } else { false }",
+            "",
+        ),
+        (
+            "rust",
+            "Err(_) => if c { false } else { x == 1 } && true",
+            "",
+        ),
     ];
 
     #[test]

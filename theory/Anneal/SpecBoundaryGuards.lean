@@ -1875,6 +1875,49 @@ theorem fixedSigned64_capacity_is_i64_sign_flip :
   ⟨rfl, (by decide : (2 ^ 63 - 1 : Nat) < 2 ^ (64 - 1)), i64GhostLen_max_pos,
     (by decide : ¬ ((2 ^ 63 : Nat) < 2 ^ (64 - 1))), i64GhostLen_two_pow_63_neg⟩
 
+/-- **Universal faithfulness for `UInt64`.** For every cardinality `n`, `u64GhostLen n`
+    recovers `n` without wraparound if and only if `.fixedUnsigned 64` represents `n`. -/
+theorem u64GhostLen_faithful_iff (n : Nat) :
+    (u64GhostLen n).toNat = n ↔ (GhostIntWidth.fixedUnsigned 64).Represents n := by
+  rw [u64GhostLen_toNat]
+  simp only [GhostIntWidth.Represents]
+  constructor
+  · intro h
+    rw [← h]
+    exact Nat.mod_lt n two_pow_64_pos
+  · exact Nat.mod_eq_of_lt
+
+/-- **Universal faithfulness for `BitVec w`.** At every bit width `w` and every
+    cardinality `n`, `bitVecGhostLen w n` recovers `n` if and only if
+    `.fixedUnsigned w` represents `n`. -/
+theorem bitVecGhostLen_faithful_iff (w n : Nat) :
+    (bitVecGhostLen w n).toNat = n ↔ (GhostIntWidth.fixedUnsigned w).Represents n := by
+  simp only [bitVecGhostLen, BitVec.toNat_ofNat, GhostIntWidth.Represents]
+  constructor
+  · intro h
+    rw [← h]
+    exact Nat.mod_lt n (Nat.two_pow_pos w)
+  · exact Nat.mod_eq_of_lt
+
+/-- **Universal faithfulness for signed `Int64`.** For every cardinality `n`,
+    `(i64GhostLen n).toInt = Int.ofNat n` if and only if `.fixedSigned 64` represents `n`
+    (i.e. `n < 2 ^ 63`). -/
+theorem i64GhostLen_faithful_iff (n : Nat) :
+    (i64GhostLen n).toInt = Int.ofNat n ↔ (GhostIntWidth.fixedSigned 64).Represents n := by
+  simp only [i64GhostLen, GhostIntWidth.Represents]
+  have hMod : (Int64.ofNat n).toInt < (2 : Int) ^ 63 := Int64.toInt_lt (Int64.ofNat n)
+  constructor
+  · intro hEq
+    rw [hEq] at hMod
+    exact Int.ofNat_lt.mp hMod
+  · intro hLt
+    have hLt64 : n < 2 ^ 64 := Nat.lt_trans hLt (by decide)
+    have hSub : (Int64.ofNat n).toInt = (BitVec.ofNat 64 n).toInt := rfl
+    rw [hSub, BitVec.toInt_eq_toNat_cond]
+    simp only [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hLt64]
+    have hCond : 2 * n < 2 ^ 64 := by omega
+    simp [hCond]
+
 /-! ### 4.3 `False` from Fixed-Width Ghost Collection Axioms -/
 
 /-- `n`-fold application of `snoc` to `c`. -/

@@ -566,6 +566,14 @@ theorem fixed_width_capacity_matches_machine_overflow :
     fixedSigned64_capacity_is_i64_sign_flip.1,
     fixedSigned64_capacity_is_i64_sign_flip.2.2.2.2⟩
 
+/-- Universal faithfulness across `UInt64`, `BitVec w`, and `Int64`: machine storage
+    is faithful on `n` if and only if the corresponding `GhostIntWidth` represents `n`. -/
+theorem machine_ghost_lengths_faithful_iff_represents (w n : Nat) :
+    ((u64GhostLen n).toNat = n ↔ (GhostIntWidth.fixedUnsigned 64).Represents n) ∧
+      ((bitVecGhostLen w n).toNat = n ↔ (GhostIntWidth.fixedUnsigned w).Represents n) ∧
+      ((i64GhostLen n).toInt = Int.ofNat n ↔ (GhostIntWidth.fixedSigned 64).Represents n) :=
+  ⟨u64GhostLen_faithful_iff n, bitVecGhostLen_faithful_iff w n, i64GhostLen_faithful_iff n⟩
+
 /-- **Positive.** The unbounded `Int` list model is consistent and never wraps. -/
 theorem unboundedInt_list_model_never_wraps (n : Nat) :
     Nonempty (UnboundedIntGhostCollectionAxioms (List Unit)) ∧
@@ -826,6 +834,9 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.i64GhostLen_two_pow_63_neg,
         ``Anneal.SpecBoundaryGuards.fixedUnsigned64_capacity_is_u64_wraparound,
         ``Anneal.SpecBoundaryGuards.fixedSigned64_capacity_is_i64_sign_flip,
+        ``Anneal.SpecBoundaryGuards.u64GhostLen_faithful_iff,
+        ``Anneal.SpecBoundaryGuards.bitVecGhostLen_faithful_iff,
+        ``Anneal.SpecBoundaryGuards.i64GhostLen_faithful_iff,
         ``Anneal.SpecBoundaryGuards.false_of_i64_list_len_nonneg,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_strict_mono,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_zero_empty,
