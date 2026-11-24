@@ -2209,10 +2209,12 @@ instance callerLocalsByteStoreOps : ByteStoreOps (List LocalSlot) CallerLocalAdd
         | false => none
 
 /-- Reconstruct single-segment `V2026_06_01.MirSemantics.BorrowEntry`s for allocation
-`(depth, localIdx)` directly from a `RangedBorrowTree`, so `CalleeMachineAdapter.mkEntry`
-builds `Memory.borrows` faithfully from the `RangedBorrowTree` input without hardcoding
-or overwriting borrow state. -/
-def mirBorrowsOfRangedTree (t : RangedBorrowTree) (depth localIdx rangeOff rangeLen : Nat) :
+`(depth, localIdx)` directly from a `RangedBorrowTree` together with explicit per-tag
+byte-range and protector-ID metadata `(rangeOfTag, protOfTag)`. Does not invent synthetic
+protector IDs or force uniform ranges across distinct subslice borrows. -/
+def mirBorrowsOfRangedTree (t : RangedBorrowTree) (depth localIdx : Nat)
+    (rangeOfTag : Nat → Nat × Nat)
+    (protOfTag : Nat → Option Nat := fun _ => none) :
     List BorrowEntry :=
   let states := match t.segments with | seg :: _ => seg.nodeStates | [] => []
   (t.topology.filter (fun n => !Nat.beq n.tag 0)).map (fun n =>
@@ -2226,7 +2228,8 @@ def mirBorrowsOfRangedTree (t : RangedBorrowTree) (depth localIdx rangeOff range
       | some 0 => none
       | some p => some p
     let prot :=
-      if natListMem n.tag t.protectedTags then some n.tag else none
+      if natListMem n.tag t.protectedTags then protOfTag n.tag else none
+    let rng := rangeOfTag n.tag
     { tag := n.tag
       targetLocal := localIdx
       targetFrameDepth := depth
@@ -2234,7 +2237,566 @@ def mirBorrowsOfRangedTree (t : RangedBorrowTree) (depth localIdx rangeOff range
       perm := perm
       protector := prot
       parentTag := parent
-      rangeOffset := rangeOff
-      rangeLen := rangeLen })
+      rangeOffset := rng.1
+      rangeLen := rng.2 })
+
+private theorem lookupLocState_map_of_unique (tag : Nat) (borrows : List BorrowEntry)
+    (e : BorrowEntry) (hMem : e ∈ borrows) (hTag : e.tag = tag)
+    (hUnique : ∀ e' ∈ borrows, e'.tag = tag → e' = e) :
+    lookupLocState tag
+      (borrows.map (fun b =>
+        (b.tag, ({ permission := tbPermOfMir b.perm, accessed := borrowEntryAccessed b } : TbLocationState)))) =
+      some ⟨tbPermOfMir e.perm, borrowEntryAccessed e⟩ := by
+  induction borrows with
+  | nil => cases hMem
+  | cons b rest ih =>
+    unfold lookupLocState
+    dsimp only [List.map, List.foldr]
+    cases hEq : Nat.beq b.tag tag with
+    | true =>
+      have hB : b = e := hUnique b (List.mem_cons_self ..) (Nat.beq_eq.mp hEq)
+      subst hB
+      simp only [↓reduceIte]
+    | false =>
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      have hInRest : e ∈ rest := by
+        cases hMem with
+        | head =>
+          rw [hTag, Nat.beq_refl] at hEq
+          cases hEq
+        | tail _ hR => exact hR
+      exact ih hInRest (fun e' h' => hUnique e' (List.mem_cons_of_mem _ h'))
+
+private theorem natListMem_protTags_iff (xs : List BorrowEntry)
+    (activeProtectors : List Nat) (t : Nat) :
+    natListMem t
+      ((xs.filter (fun b =>
+        match b.protector with
+        | some pid => natListMem pid activeProtectors
+        | none => false)).map (fun b => b.tag)) = true ↔
+      ∃ b ∈ xs, b.tag = t ∧
+        (match b.protector with
+         | some pid => natListMem pid activeProtectors
+         | none => false) = true := by
+  let pred : BorrowEntry → Bool := fun b =>
+    match b.protector with
+    | some pid => natListMem pid activeProtectors
+    | none => false
+  change natListMem t ((xs.filter pred).map (fun b => b.tag)) = true ↔
+    ∃ b ∈ xs, b.tag = t ∧ pred b = true
+  induction xs with
+  | nil =>
+    constructor
+    · intro h; cases h
+    · intro ⟨_, hMem, _, _⟩; cases hMem
+  | cons x rest ih =>
+    cases hP : pred x with
+    | false =>
+      have hFilt : (x :: rest).filter pred = rest.filter pred := by
+        simp only [List.filter, hP]
+      rw [hFilt, ih]
+      constructor
+      · intro ⟨b, hb, hbt, hbp⟩; exact ⟨b, List.mem_cons_of_mem _ hb, hbt, hbp⟩
+      · intro ⟨b, hb, hbt, hbp⟩
+        cases hb with
+        | head => rw [hP] at hbp; cases hbp
+        | tail _ hR => exact ⟨b, hR, hbt, hbp⟩
+    | true =>
+      have hFilt : (x :: rest).filter pred = x :: rest.filter pred := by
+        simp only [List.filter, hP]
+      rw [hFilt]
+      change (Nat.beq t x.tag || natListMem t ((rest.filter pred).map (fun b => b.tag))) = true ↔ _
+      rw [Bool.or_eq_true, Nat.beq_eq, ih]
+      constructor
+      · intro h
+        rcases h with hEq | ⟨b, hb, hbt, hbp⟩
+        · exact ⟨x, List.mem_cons_self .., hEq.symm, hP⟩
+        · exact ⟨b, List.mem_cons_of_mem _ hb, hbt, hbp⟩
+      · intro ⟨b, hb, hbt, hbp⟩
+        cases hb with
+        | head => exact Or.inl hbt.symm
+        | tail _ hR => exact Or.inr ⟨b, hR, hbt, hbp⟩
+
+private theorem natListMem_protTags_of_unique (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (e : BorrowEntry) (hMem : e ∈ borrows)
+    (hUnique : ∀ e' ∈ borrows, e'.tag = e.tag → e' = e) :
+    natListMem e.tag
+      ((borrows.filter (fun b =>
+        match b.protector with
+        | some pid => natListMem pid activeProtectors
+        | none => false)).map (fun b => b.tag)) =
+      (match e.protector with
+       | some pid => natListMem pid activeProtectors
+       | none => false) := by
+  have hIff := natListMem_protTags_iff borrows activeProtectors e.tag
+  cases hLHS : natListMem e.tag
+      ((borrows.filter (fun b =>
+        match b.protector with
+        | some pid => natListMem pid activeProtectors
+        | none => false)).map (fun b => b.tag)) with
+  | true =>
+    obtain ⟨b, hb, hbt, hbp⟩ := hIff.mp hLHS
+    have hEq := hUnique b hb hbt
+    rw [hEq] at hbp
+    exact hbp.symm
+  | false =>
+    cases hRHS : (match e.protector with | some pid => natListMem pid activeProtectors | none => false) with
+    | false => rfl
+    | true =>
+      have hT := hIff.mpr ⟨e, hMem, rfl, hRHS⟩
+      rw [hLHS] at hT
+      cases hT
+
+/-- **Exact `rangedBorrowTreeOfMirAlloc` → `mirBorrowsOfRangedTree` round-trip theorem**:
+for ANY live borrow list `borrows` on `(depth, localIdx)` with distinct nonzero tags,
+empty projection, `parentTag ≠ some 0`, per-tag ranges `rangeOfTag`, and active protectors
+matching `protOfTag`, projecting via `rangedBorrowTreeOfMirAlloc` and reconstructing via
+`mirBorrowsOfRangedTree` recovers `borrows` **identically**. -/
+theorem mirBorrowsOfRangedTree_rangedBorrowTreeOfMirAlloc_eq
+    (borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (depth localIdx segLen : Nat)
+    (rangeOfTag : Nat → Nat × Nat) (protOfTag : Nat → Option Nat)
+    (hAlloc : ∀ e ∈ borrows,
+      e.targetFrameDepth = depth ∧ e.targetLocal = localIdx ∧
+      e.allocDead = false ∧ e.targetProjection = [])
+    (hTags : ∀ e ∈ borrows, e.tag ≠ 0 ∧ e.parentTag ≠ some 0)
+    (hUnique : ∀ e₁ ∈ borrows, ∀ e₂ ∈ borrows, e₁.tag = e₂.tag → e₁ = e₂)
+    (hRange : ∀ e ∈ borrows, rangeOfTag e.tag = (e.rangeOffset, e.rangeLen))
+    (hProt : ∀ e ∈ borrows,
+      match e.protector with
+      | none => True
+      | some pid => natListMem pid activeProtectors = true ∧ protOfTag e.tag = some pid) :
+    mirBorrowsOfRangedTree
+      (rangedBorrowTreeOfMirAlloc borrows activeProtectors depth localIdx segLen)
+      depth localIdx rangeOfTag protOfTag = borrows := by
+  have hSelf : mirBorrowsOfAlloc borrows depth localIdx = borrows :=
+    mirBorrowsOfAlloc_eq_self borrows depth localIdx
+      (fun e he => let ⟨hD, hL, hA, _⟩ := hAlloc e he; ⟨hD, hL, hA⟩)
+  unfold mirBorrowsOfRangedTree rangedBorrowTreeOfMirAlloc
+  rw [hSelf]
+  unfold rangedBorrowTreeOfMirBorrows
+  dsimp only
+  have hDrop0 :
+      (({ tag := 0, parentTag := none } : TbTopoNode) ::
+        borrows.map (fun e => ({ tag := e.tag, parentTag := some (e.parentTag.getD 0) } : TbTopoNode))).filter
+          (fun n => !Nat.beq n.tag 0) =
+      (borrows.map (fun e => ({ tag := e.tag, parentTag := some (e.parentTag.getD 0) } : TbTopoNode))).filter
+          (fun n => !Nat.beq n.tag 0) := rfl
+  rw [hDrop0]
+  -- Filter over mapped topology keeps every element since `e.tag ≠ 0`
+  let protTags :=
+    (borrows.filter (fun e =>
+      match e.protector with
+      | some pid => natListMem pid activeProtectors
+      | none => false)).map (fun e => e.tag)
+  let fullStates : List (Nat × TbLocationState) :=
+    (0, ⟨.Unique, true⟩) ::
+      borrows.map (fun e => (e.tag, ⟨tbPermOfMir e.perm, borrowEntryAccessed e⟩))
+  have hAux : ∀ (xs : List BorrowEntry), (∀ e ∈ xs, e ∈ borrows) →
+      ((xs.map (fun e => ({ tag := e.tag, parentTag := some (e.parentTag.getD 0) } : TbTopoNode))).filter
+        (fun n => !Nat.beq n.tag 0)).map (fun n =>
+          let perm :=
+            match lookupLocState n.tag fullStates with
+            | some st => mirOfTbPerm st.permission
+            | none => .disabled
+          let parent :=
+            match n.parentTag with
+            | none => none
+            | some 0 => none
+            | some p => some p
+          let prot := if natListMem n.tag protTags then protOfTag n.tag else none
+          let rng := rangeOfTag n.tag
+          { tag := n.tag, targetLocal := localIdx, targetFrameDepth := depth,
+            targetProjection := [], perm := perm, protector := prot,
+            parentTag := parent, rangeOffset := rng.1, rangeLen := rng.2 : BorrowEntry }) = xs := by
+    intro xs
+    induction xs with
+    | nil => intro _; rfl
+    | cons e rest ih =>
+      intro hSub
+      have he : e ∈ borrows := hSub e (List.mem_cons_self ..)
+      obtain ⟨hD, hL, hA, hProj⟩ := hAlloc e he
+      obtain ⟨hTagNe0, hParNe0⟩ := hTags e he
+      have hBeq0 : Nat.beq e.tag 0 = false := by
+        cases hB : Nat.beq e.tag 0 with
+        | false => rfl
+        | true => exact False.elim (hTagNe0 (Nat.beq_eq.mp hB))
+      have h0Beq : Nat.beq 0 e.tag = false := by
+        cases hB : Nat.beq 0 e.tag with
+        | false => rfl
+        | true => exact False.elim (hTagNe0 (Nat.beq_eq.mp hB).symm)
+      have hLook : lookupLocState e.tag fullStates =
+          some ⟨tbPermOfMir e.perm, borrowEntryAccessed e⟩ := by
+        unfold fullStates lookupLocState
+        simp only [List.foldr, h0Beq, Bool.false_eq_true, ↓reduceIte]
+        exact lookupLocState_map_of_unique e.tag borrows e he rfl
+          (fun e' h' hEq => hUnique e' h' e he hEq)
+      have hParentEq :
+          (match (some (e.parentTag.getD 0) : Option Nat) with
+           | none => none
+           | some 0 => none
+           | some p => some p) = e.parentTag := by
+        cases hP : e.parentTag with
+        | none => rfl
+        | some p =>
+          cases p with
+          | zero => exact False.elim (hParNe0 hP)
+          | succ k => rfl
+      have hProtEq :
+          (if natListMem e.tag protTags then protOfTag e.tag else none) = e.protector := by
+        have hMemP := natListMem_protTags_of_unique borrows activeProtectors e he
+          (fun e' h' hEq => hUnique e' h' e he hEq)
+        have hPr := hProt e he
+        dsimp only [protTags]
+        rw [hMemP]
+        cases hP : e.protector with
+        | none => rfl
+        | some pid =>
+          rw [hP] at hPr
+          simp only [hPr.1, ↓reduceIte, hPr.2]
+      have hRng := hRange e he
+      have hEntry :
+          ({ tag := e.tag
+             targetLocal := localIdx
+             targetFrameDepth := depth
+             targetProjection := []
+             perm := mirOfTbPerm (tbPermOfMir e.perm)
+             protector := if natListMem e.tag protTags then protOfTag e.tag else none
+             parentTag :=
+               match (some (e.parentTag.getD 0) : Option Nat) with
+               | none => none
+               | some 0 => none
+               | some p => some p
+             rangeOffset := (rangeOfTag e.tag).1
+             rangeLen := (rangeOfTag e.tag).2 } : BorrowEntry) = e := by
+        rw [mirOfTbPerm_tbPermOfMir, hParentEq, hProtEq, hRng]
+        cases e
+        dsimp only at hD hL hA hProj
+        subst hD; subst hL; subst hA; subst hProj
+        rfl
+      simp only [List.map, List.filter, hBeq0, Bool.not_false, hLook]
+      rw [hEntry, ih (fun x hx => hSub x (List.mem_cons_of_mem _ hx))]
+  exact hAux borrows (fun _ h => h)
+
+/-! ### MIR-Side Per-Allocation Borrow-Transition Isolation & Span Boundary Alignment -/
+
+/-- **MIR-side write isolation**: unmodified `V2026_06_01.MirSemantics.invalidateTreeBorrowsAtProj`
+on allocation `(depthA, locA)` leaves `mirBorrowsOfAlloc _ depthB locB` **IDENTICAL** for
+every distinct allocation `(depthB, locB) ≠ (depthA, locA)`. -/
+theorem mirBorrowsOfAlloc_invalidateTreeBorrowsAtProj_ne
+    (allBorrows borrows : List BorrowEntry)
+    (locA depthA locB depthB : Nat) (writerTag : Option Nat)
+    (writeProj : List ProjectionElem) (writeRangeOff writeRangeLen : Nat)
+    (hNe : depthA ≠ depthB ∨ locA ≠ locB) :
+    mirBorrowsOfAlloc
+      (invalidateTreeBorrowsAtProj allBorrows borrows locA writerTag writeProj
+        writeRangeOff writeRangeLen depthA)
+      depthB locB =
+    mirBorrowsOfAlloc borrows depthB locB := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    unfold invalidateTreeBorrowsAtProj
+    dsimp only [mirBorrowsOfAlloc, List.filter]
+    cases hKeep : (Nat.beq e.targetFrameDepth depthB && Nat.beq e.targetLocal locB && !e.allocDead) with
+    | true =>
+      simp only [Bool.and_eq_true, Nat.beq_eq, Bool.not_eq_true'] at hKeep
+      obtain ⟨⟨hD, hL⟩, hAlive⟩ := hKeep
+      have hSkipA : Bool.and (Nat.beq e.targetFrameDepth depthA) (Nat.beq e.targetLocal locA) = false := by
+        rcases hNe with hDn | hLn
+        · have hF : Nat.beq e.targetFrameDepth depthA = false := by
+            cases hB : Nat.beq e.targetFrameDepth depthA with
+            | false => rfl
+            | true => exact False.elim (hDn ((Nat.beq_eq.mp hB).symm.trans hD))
+          rw [hF]; rfl
+        · have hF : Nat.beq e.targetLocal locA = false := by
+            cases hB : Nat.beq e.targetLocal locA with
+            | false => rfl
+            | true => exact False.elim (hLn ((Nat.beq_eq.mp hB).symm.trans hL))
+          rw [hF, Bool.and_false]
+      have hUnch : updateBorrowPermTreeAtProj allBorrows e locA writerTag writeProj
+          writeRangeOff writeRangeLen depthA = e := by
+        unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
+        rw [hSkipA]
+      rw [hUnch]
+      have hKeep' : (Nat.beq e.targetFrameDepth depthB && Nat.beq e.targetLocal locB && !e.allocDead) = true := by
+        rw [hD, hL, hAlive, Nat.beq_refl, Nat.beq_refl]; rfl
+      rw [hKeep']
+      exact congrArg (List.cons e) ih
+    | false =>
+      have hDropUpdated :
+          (Nat.beq (updateBorrowPermTreeAtProj allBorrows e locA writerTag writeProj
+              writeRangeOff writeRangeLen depthA).targetFrameDepth depthB &&
+           Nat.beq (updateBorrowPermTreeAtProj allBorrows e locA writerTag writeProj
+              writeRangeOff writeRangeLen depthA).targetLocal locB &&
+           !(updateBorrowPermTreeAtProj allBorrows e locA writerTag writeProj
+              writeRangeOff writeRangeLen depthA).allocDead) = false := by
+        have hSameMeta : ∀ (e' : BorrowEntry) (tr : TreeBorrowTransition),
+            (applyTreeBorrowTransition e' tr).targetFrameDepth = e'.targetFrameDepth ∧
+            (applyTreeBorrowTransition e' tr).targetLocal = e'.targetLocal ∧
+            (applyTreeBorrowTransition e' tr).allocDead = e'.allocDead := by
+          intro e' tr; cases tr <;> exact ⟨rfl, rfl, rfl⟩
+        unfold updateBorrowPermTreeAtProj updateBorrowPermAtProj
+        cases Bool.and (Nat.beq e.targetFrameDepth depthA) (Nat.beq e.targetLocal locA) with
+        | false => exact hKeep
+        | true =>
+          cases treeBorrowWriterRelatedness e (resolveTreeBorrowWriterTag allBorrows e writerTag) with
+          | localAccess =>
+            obtain ⟨h1, h2, h3⟩ := hSameMeta e _
+            rw [h1, h2, h3]; exact hKeep
+          | foreignAccess =>
+            cases borrowEntryOverlapsWrite e writeProj writeRangeOff writeRangeLen with
+            | false => exact hKeep
+            | true =>
+              obtain ⟨h1, h2, h3⟩ := hSameMeta e _
+              rw [h1, h2, h3]; exact hKeep
+      rw [hDropUpdated]
+      exact ih
+
+/-- **MIR-side read isolation**: unmodified `V2026_06_01.MirSemantics.freezeTreeBorrowsOnReadAtProj`
+on allocation `(depthA, locA)` leaves `mirBorrowsOfAlloc _ depthB locB` **IDENTICAL** for
+every distinct allocation `(depthB, locB) ≠ (depthA, locA)`. -/
+theorem mirBorrowsOfAlloc_freezeTreeBorrowsOnReadAtProj_ne
+    (allBorrows borrows : List BorrowEntry)
+    (locA depthA locB depthB : Nat) (readerTag : Option Nat)
+    (readProj : List ProjectionElem) (readRangeOff readRangeLen : Nat)
+    (activeProtectors : List Nat)
+    (hNe : depthA ≠ depthB ∨ locA ≠ locB) :
+    mirBorrowsOfAlloc
+      (freezeTreeBorrowsOnReadAtProj allBorrows borrows locA readerTag readProj
+        readRangeOff readRangeLen activeProtectors depthA)
+      depthB locB =
+    mirBorrowsOfAlloc borrows depthB locB := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    unfold freezeTreeBorrowsOnReadAtProj
+    dsimp only [mirBorrowsOfAlloc, List.filter]
+    cases hKeep : (Nat.beq e.targetFrameDepth depthB && Nat.beq e.targetLocal locB && !e.allocDead) with
+    | true =>
+      simp only [Bool.and_eq_true, Nat.beq_eq, Bool.not_eq_true'] at hKeep
+      obtain ⟨⟨hD, hL⟩, hAlive⟩ := hKeep
+      have hSkipA : Bool.and (Nat.beq e.targetFrameDepth depthA) (Nat.beq e.targetLocal locA) = false := by
+        rcases hNe with hDn | hLn
+        · have hF : Nat.beq e.targetFrameDepth depthA = false := by
+            cases hB : Nat.beq e.targetFrameDepth depthA with
+            | false => rfl
+            | true => exact False.elim (hDn ((Nat.beq_eq.mp hB).symm.trans hD))
+          rw [hF]; rfl
+        · have hF : Nat.beq e.targetLocal locA = false := by
+            cases hB : Nat.beq e.targetLocal locA with
+            | false => rfl
+            | true => exact False.elim (hLn ((Nat.beq_eq.mp hB).symm.trans hL))
+          rw [hF, Bool.and_false]
+      have hUnch : updateBorrowPermOnReadAtProj allBorrows e locA readerTag readProj
+          readRangeOff readRangeLen activeProtectors depthA = e := by
+        unfold updateBorrowPermOnReadAtProj
+        rw [hSkipA]
+      rw [hUnch]
+      have hKeep' : (Nat.beq e.targetFrameDepth depthB && Nat.beq e.targetLocal locB && !e.allocDead) = true := by
+        rw [hD, hL, hAlive, Nat.beq_refl, Nat.beq_refl]; rfl
+      rw [hKeep']
+      exact congrArg (List.cons e) ih
+    | false =>
+      have hDropUpdated :
+          (Nat.beq (updateBorrowPermOnReadAtProj allBorrows e locA readerTag readProj
+              readRangeOff readRangeLen activeProtectors depthA).targetFrameDepth depthB &&
+           Nat.beq (updateBorrowPermOnReadAtProj allBorrows e locA readerTag readProj
+              readRangeOff readRangeLen activeProtectors depthA).targetLocal locB &&
+           !(updateBorrowPermOnReadAtProj allBorrows e locA readerTag readProj
+              readRangeOff readRangeLen activeProtectors depthA).allocDead) = false := by
+        have hSameMeta : ∀ (e' : BorrowEntry) (tr : TreeBorrowTransition),
+            (applyTreeBorrowTransition e' tr).targetFrameDepth = e'.targetFrameDepth ∧
+            (applyTreeBorrowTransition e' tr).targetLocal = e'.targetLocal ∧
+            (applyTreeBorrowTransition e' tr).allocDead = e'.allocDead := by
+          intro e' tr; cases tr <;> exact ⟨rfl, rfl, rfl⟩
+        unfold updateBorrowPermOnReadAtProj
+        cases Bool.and (Nat.beq e.targetFrameDepth depthA) (Nat.beq e.targetLocal locA) with
+        | false => exact hKeep
+        | true =>
+          cases borrowEntryOverlapsWrite e readProj readRangeOff readRangeLen with
+          | false => exact hKeep
+          | true =>
+            dsimp only
+            cases readerTag with
+            | none =>
+              dsimp only
+              obtain ⟨h1, h2, h3⟩ := hSameMeta e _
+              rw [h1, h2, h3]; exact hKeep
+            | some rTag =>
+              dsimp only
+              cases isBorrowDescendantOrSelf allBorrows rTag e.tag with
+              | true => exact hKeep
+              | false =>
+                obtain ⟨h1, h2, h3⟩ := hSameMeta e _
+                rw [h1, h2, h3]; exact hKeep
+      rw [hDropUpdated]
+      exact ih
+
+/-- **MIR-side frame-teardown isolation**: `disableFrameBorrows borrows depthA nLocals`
+leaves `mirBorrowsOfAlloc _ depthB locB` **IDENTICAL** for every other frame `depthB ≠ depthA`. -/
+theorem mirBorrowsOfAlloc_disableFrameBorrows_ne
+    (borrows : List BorrowEntry) (depthA nLocals depthB locB : Nat)
+    (hNe : depthA ≠ depthB) :
+    mirBorrowsOfAlloc (disableFrameBorrows borrows depthA nLocals) depthB locB =
+      mirBorrowsOfAlloc borrows depthB locB := by
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    unfold disableFrameBorrows
+    dsimp only [mirBorrowsOfAlloc, List.filter]
+    cases hHit : Bool.and (Nat.beq e.targetFrameDepth depthA) (Nat.blt e.targetLocal nLocals) with
+    | false =>
+      dsimp only [List.filter]
+      cases (Nat.beq e.targetFrameDepth depthB && Nat.beq e.targetLocal locB && !e.allocDead) with
+      | true => exact congrArg (List.cons e) ih
+      | false => exact ih
+    | true =>
+      have hEqA : e.targetFrameDepth = depthA := by
+        have h1 : Nat.beq e.targetFrameDepth depthA = true := by
+          cases hD : Nat.beq e.targetFrameDepth depthA with
+          | true => rfl
+          | false => rw [hD] at hHit; cases hHit
+        exact Nat.beq_eq.mp h1
+      have hNeB : Nat.beq e.targetFrameDepth depthB = false := by
+        cases hB : Nat.beq e.targetFrameDepth depthB with
+        | false => rfl
+        | true => exact False.elim (hNe (hEqA.symm.trans (Nat.beq_eq.mp hB)))
+      dsimp only [List.filter]
+      simp only [hNeB, Bool.false_and]
+      exact ih
+
+/-- Corollary: `rangedBorrowTreeOfMirAlloc` and `rangedBorrowTreeOfMirAllocSegmented` on
+allocation `(depthB, locB)` are **100% INVARIANT** across every unmodified MIR write
+(`invalidateTreeBorrowsAtProj`) and MIR read (`freezeTreeBorrowsOnReadAtProj`) on any
+distinct allocation `(depthA, locA) ≠ (depthB, locB)`. -/
+theorem rangedBorrowTreeOfMirAlloc_invariant_under_foreign_alloc_ops
+    (allBorrows borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (locA depthA locB depthB rangeLen : Nat) (spans : List (Nat × Nat))
+    (actorTag : Option Nat) (proj : List ProjectionElem) (off len : Nat)
+    (hNe : depthA ≠ depthB ∨ locA ≠ locB) :
+    rangedBorrowTreeOfMirAlloc
+      (invalidateTreeBorrowsAtProj allBorrows borrows locA actorTag proj off len depthA)
+      activeProtectors depthB locB rangeLen =
+    rangedBorrowTreeOfMirAlloc borrows activeProtectors depthB locB rangeLen ∧
+    rangedBorrowTreeOfMirAllocSegmented
+      (invalidateTreeBorrowsAtProj allBorrows borrows locA actorTag proj off len depthA)
+      activeProtectors depthB locB spans =
+    rangedBorrowTreeOfMirAllocSegmented borrows activeProtectors depthB locB spans ∧
+    rangedBorrowTreeOfMirAlloc
+      (freezeTreeBorrowsOnReadAtProj allBorrows borrows locA actorTag proj off len activeProtectors depthA)
+      activeProtectors depthB locB rangeLen =
+    rangedBorrowTreeOfMirAlloc borrows activeProtectors depthB locB rangeLen := by
+  have hW := mirBorrowsOfAlloc_invalidateTreeBorrowsAtProj_ne allBorrows borrows
+    locA depthA locB depthB actorTag proj off len hNe
+  have hR := mirBorrowsOfAlloc_freezeTreeBorrowsOnReadAtProj_ne allBorrows borrows
+    locA depthA locB depthB actorTag proj off len activeProtectors hNe
+  refine ⟨?_, ?_, ?_⟩
+  · unfold rangedBorrowTreeOfMirAlloc; rw [hW]
+  · unfold rangedBorrowTreeOfMirAllocSegmented; rw [hW]
+  · unfold rangedBorrowTreeOfMirAlloc; rw [hR]
+
+/-- Byte-level membership in a `BorrowEntry`'s covered range: whole-local borrows
+(`e.rangeLen = 0`) cover every byte `b`; partial-range borrows cover
+`[e.rangeOffset, e.rangeOffset + e.rangeLen)`. -/
+def borrowContainsByte (e : BorrowEntry) (b : Nat) : Prop :=
+  e.rangeLen = 0 ∨ (e.rangeOffset ≤ b ∧ b < e.rangeOffset + e.rangeLen)
+
+/-- A byte span `[segOff, segOff + segLen)` is **boundary-aligned** with borrow `e` iff
+either `e` is whole-local (`e.rangeLen = 0`), the span is completely disjoint from `e`'s
+range, or the span is completely contained inside `e`'s range (never straddling an endpoint
+of `e`). -/
+def spanAlignedWithBorrow (e : BorrowEntry) (segOff segLen : Nat) : Prop :=
+  e.rangeLen = 0 ∨
+  (segOff + segLen ≤ e.rangeOffset ∨ e.rangeOffset + e.rangeLen ≤ segOff) ∨
+  (e.rangeOffset ≤ segOff ∧ segOff + segLen ≤ e.rangeOffset + e.rangeLen)
+
+/-- **Exactness of `borrowCoversSegment` on boundary-aligned positive-length spans**:
+whenever `spanAlignedWithBorrow e segOff segLen` and `0 < segLen`, `borrowCoversSegment`
+classifies EVERY byte `b ∈ [segOff, segOff + segLen)` uniformly and identically:
+- `borrowCoversSegment e segOff segLen = true ↔ ∀ b, segOff ≤ b → b < segOff + segLen → borrowContainsByte e b`
+- `borrowCoversSegment e segOff segLen = false ↔ ∀ b, segOff ≤ b → b < segOff + segLen → ¬ borrowContainsByte e b`. -/
+theorem borrowCoversSegment_exact_of_aligned (e : BorrowEntry) (segOff segLen : Nat)
+    (hPos : 0 < segLen) (hAlign : spanAlignedWithBorrow e segOff segLen) :
+    (borrowCoversSegment e segOff segLen = true ↔
+      ∀ b, segOff ≤ b → b < segOff + segLen → borrowContainsByte e b) ∧
+    (borrowCoversSegment e segOff segLen = false ↔
+      ∀ b, segOff ≤ b → b < segOff + segLen → ¬ borrowContainsByte e b) := by
+  unfold borrowCoversSegment borrowContainsByte
+  rcases hAlign with hZero | hDisj | hInside
+  · have hT : (Nat.beq e.rangeLen 0 ||
+        (Nat.blt e.rangeOffset (segOff + segLen) && Nat.blt segOff (e.rangeOffset + e.rangeLen))) = true := by
+      rw [hZero]; rfl
+    rw [hT]
+    refine ⟨⟨fun _ _ _ _ => Or.inl hZero, fun _ => rfl⟩,
+      ⟨(fun h => nomatch h), fun hNot => False.elim (hNot segOff (Nat.le_refl _) (by omega) (Or.inl hZero))⟩⟩
+  · cases hRL : e.rangeLen with
+    | zero =>
+      have hT : (Nat.beq 0 0 ||
+          (Nat.blt e.rangeOffset (segOff + segLen) && Nat.blt segOff (e.rangeOffset + 0))) = true := rfl
+      rw [hT]
+      refine ⟨⟨fun _ _ _ _ => Or.inl rfl, fun _ => rfl⟩,
+        ⟨(fun h => nomatch h), fun hNot => False.elim (hNot segOff (Nat.le_refl _) (by omega) (Or.inl rfl))⟩⟩
+    | succ k =>
+      have hF : (Nat.beq (k + 1) 0 ||
+          (Nat.blt e.rangeOffset (segOff + segLen) && Nat.blt segOff (e.rangeOffset + (k + 1)))) = false := by
+        have hZ : Nat.beq (k + 1) 0 = false := rfl
+        rw [hZ, Bool.false_or]
+        rcases hDisj with hL | hR
+        · have : Nat.blt e.rangeOffset (segOff + segLen) = false :=
+            Bool.eq_false_iff.mpr (fun h => by have := Nat.blt_eq.mp h; omega)
+          rw [this]; rfl
+        · rw [hRL] at hR
+          have : Nat.blt segOff (e.rangeOffset + (k + 1)) = false :=
+            Bool.eq_false_iff.mpr (fun h => by have := Nat.blt_eq.mp h; omega)
+          rw [this, Bool.and_false]
+      rw [hF]
+      have hNone : ∀ b, segOff ≤ b → b < segOff + segLen →
+          ¬ (k + 1 = 0 ∨ e.rangeOffset ≤ b ∧ b < e.rangeOffset + (k + 1)) := by
+        intro b hb1 hb2 hIn
+        rcases hIn with h0 | ⟨h1, h2⟩
+        · omega
+        · rw [hRL] at hDisj; omega
+      refine ⟨⟨(fun h => nomatch h), fun hAll => False.elim (hNone segOff (Nat.le_refl _) (by omega)
+        (hAll segOff (Nat.le_refl _) (by omega)))⟩,
+        ⟨fun _ => hNone, fun _ => rfl⟩⟩
+  · have hT : (Nat.beq e.rangeLen 0 ||
+        (Nat.blt e.rangeOffset (segOff + segLen) && Nat.blt segOff (e.rangeOffset + e.rangeLen))) = true := by
+      have h1 : Nat.blt e.rangeOffset (segOff + segLen) = true := Nat.blt_eq.mpr (by omega)
+      have h2 : Nat.blt segOff (e.rangeOffset + e.rangeLen) = true := Nat.blt_eq.mpr (by omega)
+      rw [h1, h2, Bool.and_true, Bool.or_true]
+    rw [hT]
+    have hAll : ∀ b, segOff ≤ b → b < segOff + segLen →
+        e.rangeLen = 0 ∨ e.rangeOffset ≤ b ∧ b < e.rangeOffset + e.rangeLen :=
+      fun b hb1 hb2 => Or.inr ⟨by omega, by omega⟩
+    refine ⟨⟨fun _ => hAll, fun _ => rfl⟩,
+      ⟨(fun h => nomatch h), fun hNot => False.elim (hNot segOff (Nat.le_refl _) (by omega)
+        (hAll segOff (Nat.le_refl _) (by omega)))⟩⟩
+
+/-- **Boundary-misalignment over-approximation witness**: on a straddling span `[0, 4)`
+against a partial borrow `[0, 2)`, `¬ spanAlignedWithBorrow` holds and
+`borrowCoversSegment = true` even though byte `2 ∈ [0, 4)` is NOT in `[0, 2)`
+(`¬ borrowContainsByte`). Splitting at the borrow boundary into `[(0, 2), (2, 2)]`
+restores `spanAlignedWithBorrow` for both `[0, 2)` and `[2, 4)` borrows. -/
+theorem borrowCoversSegment_misaligned_overapprox :
+    let bSrc : BorrowEntry :=
+      { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 1, rangeOffset := 0, rangeLen := 2 }
+    let bDst : BorrowEntry :=
+      { tag := 2, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 2, rangeOffset := 2, rangeLen := 2 }
+    ¬ spanAlignedWithBorrow bSrc 0 4 ∧
+    borrowCoversSegment bSrc 0 4 = true ∧
+    ¬ borrowContainsByte bSrc 2 ∧
+    spanAlignedWithBorrow bSrc 0 2 ∧ spanAlignedWithBorrow bSrc 2 2 ∧
+    spanAlignedWithBorrow bDst 0 2 ∧ spanAlignedWithBorrow bDst 2 2 := by
+  refine ⟨?_, rfl, ?_, Or.inr (Or.inr ⟨by decide, by decide⟩),
+    Or.inr (Or.inl (Or.inr (by decide))),
+    Or.inr (Or.inl (Or.inl (by decide))),
+    Or.inr (Or.inr ⟨by decide, by decide⟩)⟩
+  · intro h
+    rcases h with h0 | (hL | hR) | ⟨_, hIn⟩ <;> simp at *
+  · intro h
+    rcases h with h0 | ⟨_, h2⟩ <;> simp at *
 
 end Anneal.ParametricCore.StageCutV2026Bridge

@@ -1461,7 +1461,7 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
                                   .init (.scalar ⟨b0.toNat, 1⟩),
                                   .init (.scalar ⟨b1.toNat, 1⟩)] }
             memory :=
-              { borrows := mirBorrowsOfRangedTree t 0 12 0 2
+              { borrows := mirBorrowsOfRangedTree t 0 12 (fun _ => (0, 2))
                 activeProtectors := t.protectedTags
                 nextTag := (t.topology.foldr (fun n acc => Nat.max n.tag acc) 0) + 1
                 callerLocals := cl } }
@@ -2107,6 +2107,104 @@ theorem neg3c_projection_accessed_bit_soundness :
   ⟨_, _, _, rfl, rfl, rfl, rfl, rfl, rfl,
    borrowEntryAccessed_unaccessed_reserved_unsound.1.1,
    borrowEntryAccessed_unaccessed_reserved_unsound.1.2.1⟩
+
+/-- **Witness 3f (MIR-side per-allocation isolation, exact multi-range/protector round-trip,
+and span boundary-alignment exactness)**:
+1. Unmodified MIR writes (`invalidateTreeBorrowsAtProj`), reads
+   (`freezeTreeBorrowsOnReadAtProj`), and foreign frame teardowns (`disableFrameBorrows`)
+   on any distinct allocation `(depthA, locA) ≠ (depthB, locB)` leave both
+   `rangedBorrowTreeOfMirAlloc` and `rangedBorrowTreeOfMirAllocSegmented` on `(depthB, locB)`
+   **100% invariant**;
+2. `mirBorrowsOfRangedTree` round-trips `rangedBorrowTreeOfMirAlloc` **identically** on a
+   multi-range, distinct-protector borrow list `[bDst{range:=[2..4), prot:=20},
+   bSrc{range:=[0..2), prot:=10}]` via `mirBorrowsOfRangedTree_rangedBorrowTreeOfMirAlloc_eq`;
+3. `borrowCoversSegment` is byte-exact on every boundary-aligned span
+   (`borrowCoversSegment_exact_of_aligned`) and over-approximates straddling spans such as
+   `[0, 4)` against `[0, 2)` at byte `2` (`borrowCoversSegment_misaligned_overapprox`). -/
+theorem witness3f_mir_isolation_roundtrip_and_span_alignment
+    (allBorrows borrows : List BorrowEntry) (activeProtectors : List Nat)
+    (actorTag : Option Nat) (proj : List ProjectionElem) (off len : Nat) :
+    let bSrc : BorrowEntry :=
+      { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 10, rangeOffset := 0, rangeLen := 2 }
+    let bDst : BorrowEntry :=
+      { tag := 2, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 20, rangeOffset := 2, rangeLen := 2 }
+    let rngOf : Nat → Nat × Nat := fun t => if Nat.beq t 1 then (0, 2) else (2, 2)
+    let protOf : Nat → Option Nat := fun t => if Nat.beq t 1 then some 10 else some 20
+    (rangedBorrowTreeOfMirAlloc
+        (invalidateTreeBorrowsAtProj allBorrows borrows 1 actorTag proj off len 0)
+        activeProtectors 0 2 4 =
+      rangedBorrowTreeOfMirAlloc borrows activeProtectors 0 2 4) ∧
+    (rangedBorrowTreeOfMirAlloc
+        (freezeTreeBorrowsOnReadAtProj allBorrows borrows 1 actorTag proj off len activeProtectors 0)
+        activeProtectors 0 2 4 =
+      rangedBorrowTreeOfMirAlloc borrows activeProtectors 0 2 4) ∧
+    (mirBorrowsOfAlloc (disableFrameBorrows borrows 1 8) 0 2 =
+      mirBorrowsOfAlloc borrows 0 2) ∧
+    (mirBorrowsOfRangedTree
+        (rangedBorrowTreeOfMirAlloc [bDst, bSrc] [20, 10] 0 12 4)
+        0 12 rngOf protOf = [bDst, bSrc]) ∧
+    (¬ spanAlignedWithBorrow bSrc 0 4 ∧ borrowCoversSegment bSrc 0 4 = true ∧
+      ¬ borrowContainsByte bSrc 2) ∧
+    (∀ b, 0 ≤ b → b < 2 → borrowContainsByte bSrc b) ∧
+    (∀ b, 2 ≤ b → b < 4 → ¬ borrowContainsByte bSrc b) := by
+  intro bSrc bDst rngOf protOf
+  have hIso := rangedBorrowTreeOfMirAlloc_invariant_under_foreign_alloc_ops
+    allBorrows borrows activeProtectors 1 0 2 0 4 [(0, 2), (2, 2)] actorTag proj off len
+    (Or.inr (by decide))
+  have hFrame := mirBorrowsOfAlloc_disableFrameBorrows_ne borrows 1 8 0 2 (by decide)
+  have hRT : mirBorrowsOfRangedTree
+      (rangedBorrowTreeOfMirAlloc [bDst, bSrc] [20, 10] 0 12 4)
+      0 12 rngOf protOf = [bDst, bSrc] :=
+    mirBorrowsOfRangedTree_rangedBorrowTreeOfMirAlloc_eq [bDst, bSrc] [20, 10] 0 12 4
+      rngOf protOf
+      (fun e he => by
+        rcases List.mem_cons.mp he with rfl | h2
+        · exact ⟨rfl, rfl, rfl, rfl⟩
+        · rcases List.mem_cons.mp h2 with rfl | h3
+          · exact ⟨rfl, rfl, rfl, rfl⟩
+          · cases h3)
+      (fun e he => by
+        rcases List.mem_cons.mp he with rfl | h2
+        · exact ⟨by decide, by decide⟩
+        · rcases List.mem_cons.mp h2 with rfl | h3
+          · exact ⟨by decide, by decide⟩
+          · cases h3)
+      (fun e1 h1 e2 h2 hEq => by
+        rcases List.mem_cons.mp h1 with rfl | h1' <;>
+        rcases List.mem_cons.mp h2 with rfl | h2'
+        · rfl
+        · rcases List.mem_cons.mp h2' with rfl | h2''
+          · cases hEq
+          · cases h2''
+        · rcases List.mem_cons.mp h1' with rfl | h1''
+          · cases hEq
+          · cases h1''
+        · rcases List.mem_cons.mp h1' with rfl | h1''
+          · rcases List.mem_cons.mp h2' with rfl | h2''
+            · rfl
+            · cases h2''
+          · cases h1'')
+      (fun e he => by
+        rcases List.mem_cons.mp he with rfl | h2
+        · rfl
+        · rcases List.mem_cons.mp h2 with rfl | h3
+          · rfl
+          · cases h3)
+      (fun e he => by
+        rcases List.mem_cons.mp he with rfl | h2
+        · exact ⟨rfl, rfl⟩
+        · rcases List.mem_cons.mp h2 with rfl | h3
+          · exact ⟨rfl, rfl⟩
+          · cases h3)
+  have hMis := borrowCoversSegment_misaligned_overapprox
+  have hExIn := (borrowCoversSegment_exact_of_aligned bSrc 0 2 (by decide) hMis.2.2.2.1).1.mp rfl
+  have hExOut := (borrowCoversSegment_exact_of_aligned bSrc 2 2 (by decide) hMis.2.2.2.2.1).2.mp rfl
+  exact ⟨hIso.1, hIso.2.2, hFrame, hRT,
+    ⟨hMis.1, hMis.2.1, hMis.2.2.1⟩,
+    (fun b h1 h2 => hExIn b h1 h2),
+    (fun b h1 h2 => hExOut b h1 h2)⟩
 
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 
