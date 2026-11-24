@@ -1760,7 +1760,8 @@ theorem b1_mut_dyn_virtual_call_and_ancestor_and_zst :
 /-- **2. Auto-trait fabrication, unrelated 0-method marker-trait upcast, and
 inconsistent same-type layout across vtables are rejected.**
 * `dyn TraitA -> dyn TraitA + Send` (`unsizeDynToDyn` with `autoTraits` growing)
-  is UB (`3`), while `dyn TraitA + Send -> dyn TraitA` succeeds (`0`).
+  is ill-typed MIR and fails closed (`4`, never `.ok` and never UB: vendored Miri
+  runs it without UB), while `dyn TraitA + Send -> dyn TraitA` succeeds (`0`).
 * `upcastVTable?` rejects `dyn Sub -> dyn Marker` (unrelated 0-method trait
   whose 3-slot header is trivially a prefix of every vtable) and `unsizeDynToDyn`
   returns `.unsupported` (`4`), while `dyn Sub -> dyn Super` (`.traitVPtr`)
@@ -1793,7 +1794,7 @@ theorem b1_auto_trait_fabrication_and_unrelated_marker_upcast :
            pA s.frame.locals s.memory driverDecls layouts),
          rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false Lm.predSub Lm.predMarker
            pSub s.frame.locals s.memory driverDecls layouts) )
-     | none => (9, 9, 9)) = (3, 0, 4) := by
+     | none => (9, 9, 9)) = (4, 0, 4) := by
   decide +kernel
 
 /-- **3. 32-bit target (`ptrBytes = 4`) layout overflow bounds, stack-page
@@ -1887,7 +1888,8 @@ theorem b1_nonzero_receiver_offset_mir_execution :
   decide +kernel
 
 /-- **5. `stepMirFnProto` dynamic-layout intrinsics (`size_of_val` /
-`align_of_val`), `&raw mut (*shared_dyn)` UB, diverging virtual call, and
+`align_of_val`), `&raw mut (*shared_dyn)` failing closed (ill-typed MIR,
+`rustc` E0596), diverging virtual call, and
 `evalWidePtrEqProto` `.uninit` / heterogeneous metadata UB.** -/
 def usizeLayout : TypeLayout :=
   { size := { bytes := 8 }, align := { bytes := 8 },
@@ -1981,12 +1983,82 @@ theorem b1_intrinsics_raw_mut_diverge_and_wide_eq_ub :
       (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody true true) [] [])) =
         some (4, 8) ∧
     tagOf (runMirProto prog sharedToRawMutDynBody 32
-      (initMachineStateWithCallees sharedToRawMutDynBody [] [])) = 3 ∧
+      (initMachineStateWithCallees sharedToRawMutDynBody [] [])) = 4 ∧
     (advanceSteps divergeCallerBody (stepMirFnProto divergeProg divergeCallerBody) 7
       (initMachineStateWithCallees divergeCallerBody [] [recDivergeBody])).map
         (fun s => s.memory.activeCallee.map (·.defPath)) = some (some recDivergePath) ∧
     wideEq .uninit (localVal 10) = (3, 0) ∧
     wideEq (wide (ptrV 1 0) (scV 2)) (localVal 10) = (3, 0) := by
+  decide +kernel
+
+
+/-! ### A1 regressions -/
+
+/-- `&raw const (*r)` through a trait-object reference `r` whose borrow tag is
+`.disabled`: creating a raw pointer performs no access, so the end-to-end run
+does not fault at the raw borrow. The body disables `&rec` by writing `rec`
+directly, then takes `&raw const *r` and returns `0`. -/
+def rawBorrowAfterDisableBody : CapturedMir :=
+  { defPath := "a1::raw_borrow_after_disable", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl u32Ty, decl recTy, decl refRecTy, decl refDynTy, decl rawDynTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDynTy),
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 5]),
+             asg 4 (.rawPtr .not (derefPlace 3)),
+             asg 0 (.use (cU32 0)) ] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+/-- Virtual-call caller whose receiver has type `recvTy` (a `&dyn Trait`
+reference, a `Box<dyn Trait>`, or a `Pin<&mut dyn Trait>`). -/
+def wrappedReceiverCaller (recvTy : Ty) : CapturedMir :=
+  { defPath := "a1::wrapped_receiver_caller", phase := .runtimePostCleanup, role := .model,
+    argCount := 0, localDecls := [decl u32Ty, decl recvTy, decl u32Ty],
+    basicBlocks :=
+      [bb [] (.call (virtFn evalVtPath traitKey) [cp 1, cp 2] (loc 0) (some 0) .continue_)],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+/-- Site classification code: `0` not virtual, `4` unsupported, `[ref, mut]` site. -/
+def siteCode : VirtualSiteResolution → List Nat
+  | .notVirtual => [0]
+  | .unsupported => [4]
+  | .site st => [1, (match st.receiverIsRef with | true => 1 | false => 0),
+                    (match st.receiverIsMut with | true => 1 | false => 0)]
+
+/-- **A1 regressions.**
+1. `&raw const *r` after `r`'s tag was disabled by a direct write to the owner
+   runs to completion (`0`): raw borrows are not Tree Borrows accesses.
+2. A `Box<dyn Trait>` receiver fails closed (`[4]`) instead of being treated as a
+   raw pointer (which skipped receiver validity and the protector);
+   `Pin<&mut dyn Trait>` is a mutable reference receiver (`[1, 1, 1]`);
+   `&dyn Trait` stays a shared reference receiver (`[1, 1, 0]`) and
+   `*const dyn Trait` a raw receiver (`[1, 0, 0]`).
+3. Auto-trait fabrication with an *invalid* vtable pointer is still UB: the
+   runtime vtable check comes before the type-level fail-closed check. -/
+theorem a1_raw_borrow_receiver_class_and_auto_trait_order :
+    scalarOf (runMirProto prog rawBorrowAfterDisableBody 32
+      (initMachineStateWithCallees rawBorrowAfterDisableBody [] [])) = some (0, 4) ∧
+    [ siteCode (virtualCallSite? prog
+        (wrappedReceiverCaller
+          { kind := .adt "alloc::boxed::Box" [.dynamic traitKey], layoutIdx := 5 })
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]),
+      siteCode (virtualCallSite? prog
+        (wrappedReceiverCaller
+          { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic traitKey)], layoutIdx := 5 })
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]),
+      siteCode (virtualCallSite? prog (wrappedReceiverCaller refDynTy)
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]),
+      siteCode (virtualCallSite? prog (wrappedReceiverCaller rawDynTy)
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]) ] =
+      [[4], [1, 1, 1], [1, 1, 0], [1, 0, 0]] ∧
+    rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false Lm.predA
+      { Lm.predA with autoTraits := ["Send"] } (wide (ptrV 1 0) (ptrV 40000 8)) [] emptyMemory []
+      layouts) = 3 := by
   decide +kernel
 
 end B1Hardening

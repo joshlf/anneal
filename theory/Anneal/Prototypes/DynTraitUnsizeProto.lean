@@ -228,7 +228,9 @@ def strMem (s : String) : List String → Bool
   | x :: xs => strEq x s || strMem s xs
 
 /-- Every auto trait in `dst` is already required by `src` (`dst ⊆ src`):
-dropping auto traits on a `dyn` upcast is sound, fabricating new ones is UB. -/
+dropping auto traits on a `dyn` upcast is well typed; adding one is rejected by
+`rustc`'s type checker, so such MIR is ill formed (the prototype fails closed
+with `.unsupported`, never `.ub`: vendored Miri executes it without UB). -/
 def autoTraitsSubset (dst src : List String) : Bool :=
   dst.all (fun a => strMem a src)
 
@@ -1438,23 +1440,25 @@ def unsizeSizedToDyn
 
 /-- Upcast (or identity coercion) of an evaluated trait-object pointer `v` of
 type `srcPred` into a pointer to `dstPred`. The incoming vtable pointer is
-validated first, auto-trait fabrication (`dstPred.autoTraits ⊈ srcPred.autoTraits`)
-is UB, and provenance-less data addresses are wrapped modulo `2^(8 * ptrBytes)`
-before safe-reference validity is checked. -/
+validated first (a runtime check: invalid vtable pointers are UB, as in
+`Cast.unsizeIntoPointer`'s `vtableType`). Auto-trait fabrication
+(`dstPred.autoTraits ⊈ srcPred.autoTraits`) is ill-typed MIR and fails closed
+with `.unsupported`. Provenance-less data addresses are wrapped modulo
+`2^(8 * ptrBytes)` before safe-reference validity is checked. -/
 def unsizeDynToDyn
     (vt : ProtoVTableTable) (ptrBytes : Nat) (srcKind : ProtoPtrKind) (dstMut : Bool)
     (srcPred dstPred : ProtoTraitPred) (v : Value)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable) : RvalueEvalResult :=
-  match autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
-  | false => .ub
-  | true =>
-    match decodeWidePtr? ptrBytes v with
-    | some ⟨d, .vtable vtPtr⟩ =>
-      match resolveVTablePtr vt srcPred vtPtr with
-      | .invalidPointer => .ub
-      | .invalidTrait => .ub
-      | .ok e =>
+  match decodeWidePtr? ptrBytes v with
+  | some ⟨d, .vtable vtPtr⟩ =>
+    match resolveVTablePtr vt srcPred vtPtr with
+    | .invalidPointer => .ub
+    | .invalidTrait => .ub
+    | .ok e =>
+      match autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+      | false => .unsupported
+      | true =>
         match (match traitPredEq srcPred dstPred with
                | true => some e
                | false => upcastVTable? vt.entries e dstPred) with
@@ -1471,7 +1475,7 @@ def unsizeDynToDyn
             match refAddrValid ptrBytes target bits with
             | true => .ok (mkDynPtr ptrBytes (.addr bits) target) locals mem
             | false => .ub
-    | _ => .ub
+  | _ => .ub
 
 /-- Unsizing of the evaluated operand `v` of pointer type `src` into a
 `dstKind` pointer of mutability `dstMut` to the trait object type `dstPred`. -/
@@ -1963,19 +1967,24 @@ theorem upcastVTable?_rejects_unrelated_marker
   | zero => rfl
   | succ n => simp only [findPrimarySuperVTable, hNoPrim]
 
-/-- **No auto-trait fabrication.** Upcasting or coercing `dyn srcPred` to
-`dyn dstPred` when `dstPred` adds an auto trait absent from `srcPred`
-(e.g. `&dyn Trait -> &dyn Trait + Send`) is UB. -/
+/-- **No auto-trait fabrication, fail closed.** Upcasting or coercing a valid
+`dyn srcPred` pointer to `dyn dstPred` when `dstPred` adds an auto trait absent
+from `srcPred` (e.g. `&dyn Trait -> &dyn Trait + Send`) is `.unsupported`:
+never `.ok` (no fabricated `Send`), never `.ub` (the MIR is ill typed, and
+vendored Miri runs it without UB). -/
 theorem unsizeDynToDyn_forbids_auto_trait_fabrication
     (vt : ProtoVTableTable) (ptrBytes : Nat) (srcKind : ProtoPtrKind) (dstMut : Bool)
-    (srcPred dstPred : ProtoTraitPred) (v : Value)
+    (srcPred dstPred : ProtoTraitPred) (v : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr)
+    (e : ProtoVTableEntry)
     (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
     (layouts : LayoutTable)
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hRes : resolveVTablePtr vt srcPred vtPtr = .ok e)
     (hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits = false) :
     unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
-      .ub := by
+      .unsupported := by
   unfold unsizeDynToDyn
-  simp only [hAuto]
+  simp only [hDec, hRes, hAuto]
 
 theorem wrapScalarBits_zero (m : Nat) : wrapScalarBits 0 m = 0 := by
   unfold wrapScalarBits
@@ -2000,18 +2009,19 @@ theorem unsizeDynToDyn_zst_wrapped_null_ub
         (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes])
         locals mem localDecls layouts = .unsupported := by
   unfold unsizeDynToDyn
-  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
-  | false => exact Or.inl rfl
-  | true =>
-    have hDec :
-        decodeWidePtr? ptrBytes (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes]) =
-          some ⟨.addr bits, .vtable vtPtr⟩ := by
-      simp only [decodeWidePtr?, decodeDataWord?, Nat.beq_refl]
-    simp only [hDec]
-    cases hRes : resolveVTablePtr vt srcPred vtPtr with
-    | invalidPointer => exact Or.inl rfl
-    | invalidTrait => exact Or.inl rfl
-    | ok e =>
+  have hDec :
+      decodeWidePtr? ptrBytes (.aggregate 0 [.scalar ⟨bits, ptrBytes⟩, .ptr vtPtr ptrBytes]) =
+        some ⟨.addr bits, .vtable vtPtr⟩ := by
+    simp only [decodeWidePtr?, decodeDataWord?, Nat.beq_refl]
+  simp only [hDec]
+  cases hRes : resolveVTablePtr vt srcPred vtPtr with
+  | invalidPointer => exact Or.inl rfl
+  | invalidTrait => exact Or.inl rfl
+  | ok e =>
+    dsimp only
+    cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
+    | false => exact Or.inr rfl
+    | true =>
       dsimp only
       cases (match traitPredEq srcPred dstPred with
              | true => some e
@@ -2035,14 +2045,11 @@ theorem unsizeDynToDyn_invalid_vtable_ub
     unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
       .ub := by
   unfold unsizeDynToDyn
-  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
-  | false => rfl
-  | true =>
-    simp only [hDec]
-    cases hR : resolveVTablePtr vt srcPred vtPtr with
-    | ok e => exact absurd hR (hBad e)
-    | invalidPointer => rfl
-    | invalidTrait => rfl
+  simp only [hDec]
+  cases hR : resolveVTablePtr vt srcPred vtPtr with
+  | ok e => exact absurd hR (hBad e)
+  | invalidPointer => rfl
+  | invalidTrait => rfl
 
 /-- A source that is not a trait-object pointer with a vtable-pointer word (a
 thin pointer, or a pair whose metadata is a slice length or a dangling integer)
@@ -2056,14 +2063,10 @@ theorem unsizeDynToDyn_non_vtable_meta_ub
     unsizeDynToDyn vt ptrBytes srcKind dstMut srcPred dstPred v locals mem localDecls layouts =
       .ub := by
   unfold unsizeDynToDyn
-  cases hAuto : autoTraitsSubset dstPred.autoTraits srcPred.autoTraits with
-  | false => rfl
-  | true =>
-    dsimp only
-    split
-    · rename_i d vtPtr heq
-      exact absurd heq (hDec d vtPtr)
-    · rfl
+  split
+  · rename_i d vtPtr heq
+    exact absurd heq (hDec d vtPtr)
+  · rfl
 
 /-! ## §4. Vtable-backed dynamic layout (`size_of_val` / `align_of_val`) -/
 
@@ -3294,6 +3297,49 @@ inductive VirtualSiteResolution : Type where
   | unsupported
   | site (site : ProtoVirtualCallSite)
 
+/-- Receiver class of a virtual call from the type of its first argument:
+`(isRef, isMut)`. A reference `&[mut] dyn Trait` and a `Pin<&[mut] dyn Trait>`
+wrapper (whose inner reference Miri retags with a function-entry protector,
+`RetagFields`) are reference receivers; a raw pointer is not. Every other
+`DispatchFromDyn` receiver (`Box<dyn Trait>`, `Rc<Self>`, unknown types) fails
+closed with `none`: classifying it as raw would skip the safe-reference
+validity check and the receiver protector. -/
+def classifyVirtualReceiver : Option Ty → Option (Bool × Bool)
+  | some { kind := .ref m _, .. } => some (true, V06.lowerMut m)
+  | some { kind := .rawPtr _ _, .. } => some (false, false)
+  | some { kind := .adt path [.ref m _], .. } =>
+    match strEq path "core::pin::Pin" with
+    | true => some (true, V06.lowerMut m)
+    | false => none
+  | _ => none
+
+/-- **Receiver classification fails closed.** A wrapper receiver other than
+`Pin<&[mut] _>` (for example `Box<dyn Trait>`) and an untyped receiver are never
+classified as raw pointers; `Pin<&mut dyn Trait>` is a mutable reference
+receiver. -/
+theorem classifyVirtualReceiver_fail_closed (path : String) (args : List RigidTy) (idx : Nat)
+    (hPin : strEq path "core::pin::Pin" = false) :
+    classifyVirtualReceiver (some { kind := .adt path args, layoutIdx := idx }) = none ∧
+    classifyVirtualReceiver none = none ∧
+    classifyVirtualReceiver
+      (some { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic "T")], layoutIdx := idx }) =
+        some (true, true) := by
+  refine ⟨?_, rfl, ?_⟩
+  · unfold classifyVirtualReceiver
+    split
+    · rename_i h; cases h
+    · rename_i h; cases h
+    · rename_i path' m _ _ h
+      injection h with h1
+      injection h1 with h2
+      injection h2 with h3 _
+      subst h3
+      simp only [hPin]
+    · rfl
+  · unfold classifyVirtualReceiver
+    simp only [V06.lowerMut]
+    rfl
+
 /-- A call is virtual when its callee is a registered virtual method whose
 `Self` type argument is a trait object (`<dyn Trait as Trait>::method`). The
 receiver kind and mutability come from the type of the first argument. A
@@ -3310,16 +3356,15 @@ def virtualCallSite? (prog : ProtoDynProgram) (callerBody : CapturedMir) (func :
       match lookupDynPred prog.vtables.dynTypes traitKey with
       | none => .unsupported
       | some pred =>
-        let (isRef, isMut) :=
-          match argOps with
-          | recvOp :: _ =>
-            match operandTy callerBody.localDecls callerBody.layouts recvOp with
-            | some { kind := .ref m _, .. } => (true, V06.lowerMut m)
-            | _ => (false, false)
-          | [] => (false, false)
-        .site
-          { traitPred := pred, slotIdx := slotIdx, receiverIsRef := isRef,
-            receiverIsMut := isMut }
+        match argOps with
+        | [] => .unsupported
+        | recvOp :: _ =>
+          match classifyVirtualReceiver (operandTy callerBody.localDecls callerBody.layouts recvOp) with
+          | none => .unsupported
+          | some (isRef, isMut) =>
+            .site
+              { traitPred := pred, slotIdx := slotIdx, receiverIsRef := isRef,
+                receiverIsMut := isMut }
   | _ => .notVirtual
 
 /-- A borrow entry targets the local `loc` of the frame at depth `depth`. -/
@@ -3407,38 +3452,56 @@ def assignWholeLocalProto (s : MachineState) (locals' : List LocalSlot) (mem' : 
       | none => MirStepNode.fail .ub
 
 /-- Classification of `&raw const (*src)` / `&raw mut (*src)` on a trait-object
-pointer: returns `some (.ok v)` when valid, `some .ub` on a mutability or
-disabled-borrow violation (`&raw mut (*shared_dyn_ref)` or disabled ref tag),
-and `none` to fall through to `stepMirFn`. -/
+pointer `src`.
+
+Creating a raw pointer performs no memory access and no retag under Tree
+Borrows (Miri does not retag raw pointers; MiniRust's `AddrOf Raw` only
+re-wraps the pointer), so the result is the same wide pointer whatever the
+permission of the borrow tag is: a `.disabled` or `.frozen` tag is *not* UB
+here (it becomes UB at the first access through the raw pointer). The only
+rejection is `&raw mut (*r)` with `r : &dyn Trait`, which `rustc` refuses to
+compile (E0596): such MIR is ill formed and fails closed with `.unsupported`.
+Returns `none` to fall through to `stepMirFn`. -/
 def dynRawBorrowProto?
-    (ptrBytes : Nat) (mutKind : Mutability) (locals : List LocalSlot) (mem : Memory)
+    (ptrBytes : Nat) (mutKind : Mutability) (locals : List LocalSlot)
     (localDecls : List LocalDecl) (srcPlace : Place) : Option (ProtoRes Value) :=
   match srcPlace.projection with
   | [.deref] =>
     match get? locals srcPlace.local_ with
     | some (.init v) =>
       match decodeWidePtr? ptrBytes v with
-      | some ⟨d, .vtable _⟩ =>
+      | some ⟨_, .vtable _⟩ =>
         match get? localDecls srcPlace.local_ with
         | some { ty := { kind := .ref srcMut (.dynamic _), .. }, .. } =>
           match unsizeMutCompatible (V06.lowerMut srcMut) (V06.lowerMut mutKind) with
-          | false => some .ub
-          | true =>
-            match d with
-            | .prov p =>
-              match lookupBorrow mem.borrows p.tag with
-              | some b =>
-                match borrowPermAllows b.perm (V06.lowerMut mutKind) && !b.allocDead &&
-                    !treeBorrowAncestorsChildAccessUB (refAccessKind (V06.lowerMut mutKind))
-                      mem.borrows b.parentTag with
-                | true => some (.ok v)
-                | false => some .ub
-              | none => some (.ok v)
-            | .addr _ => some (.ok v)
-        | _ => some (.ok v)
+          | false => some .unsupported
+          | true => some (.ok v)
+        | some { ty := { kind := .rawPtr _ (.dynamic _), .. }, .. } => some (.ok v)
+        | _ => some .unsupported
       | _ => none
     | _ => none
   | _ => none
+
+/-- **Raw borrows of a `dyn` place perform no Tree Borrows check.** Whatever the
+borrow table says (a `.disabled` or `.frozen` tag included), `&raw const (*r)`
+of a `&dyn Trait` / `&mut dyn Trait` local `r` holding a trait-object pointer
+returns that pointer unchanged. -/
+theorem dynRawBorrowProto?_ignores_borrow_state
+    (ptrBytes : Nat) (locals : List LocalSlot) (localDecls : List LocalDecl) (r : Local)
+    (v : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (decl : LocalDecl)
+    (m : Mutability) (traitKey : String)
+    (hSlot : get? locals r = some (.init v))
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hDecl : get? localDecls r = some decl)
+    (hTy : decl.ty.kind = .ref m (.dynamic traitKey)) :
+    dynRawBorrowProto? ptrBytes .not locals localDecls { local_ := r, projection := [.deref] } =
+      some (.ok v) := by
+  obtain ⟨mu, ⟨kind, idx⟩, dn⟩ := decl
+  simp only at hTy
+  subst hTy
+  unfold dynRawBorrowProto?
+  simp only [hSlot, hDec, hDecl]
+  cases m <;> rfl
 
 /-- The callee of a call terminator is `core::ptr::addr_eq`. -/
 def isAddrEqCallee (func : Operand) : Bool :=
@@ -3553,7 +3616,7 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
           match
             place.projection,
             dynRawBorrowProto? (layoutPointerBytes currentBody.layouts) mutKind s.frame.locals
-              s.memory currentBody.localDecls srcPlace
+              currentBody.localDecls srcPlace
           with
           | [], some (.ok v) => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
           | [], some .ub => MirStepNode.fail .ub
