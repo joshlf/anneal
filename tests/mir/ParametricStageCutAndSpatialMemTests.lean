@@ -46,6 +46,9 @@ all five converged capabilities against unmodified
   `rangedBorrowTreeOfMirAllocSegmented` commutes disjoint same-allocation subslice borrows
   (`[0..2)` and `[2..4)`) and releases protectors cleanly where flat 1-segment projection
   spuriously fails with `.ProtectedDisabled`, alongside `mirSemantics_vs_refFrame_accessed_coarsening`.
+- **Witness 3g (remaining `UnwindAction` arms)**: a failing inline callee `assert`
+  unwinding into a caller frame with `.terminate` halts with `Outcome.abort`, and with
+  `.continue_` propagates past the root to `Outcome.panic`.
 - **Witness 4 (`SpatialMemV2026`)**: full `freezePaddedToMem` → `mutatePaddedInMem` →
   `reabsorbPaddedFromMem` → `endPaddedLoan` → `deallocatePromotedLocal` lifecycle on
   both padded `(u8, [pad; 3], u32)` (contrasted with `u8U32Padded_freeze_refused`) and
@@ -2205,6 +2208,52 @@ theorem witness3f_mir_isolation_roundtrip_and_span_alignment
     ⟨hMis.1, hMis.2.1, hMis.2.2.1⟩,
     (fun b h1 h2 => hExIn b h1 h2),
     (fun b h1 h2 => hExOut b h1 h2)⟩
+
+/-- Real caller calling `assert_flag(flag)` with `UnwindAction.terminate`; on normal
+return it computes `_0 := _2 + 41`. -/
+private def callerTerminateBody : CapturedMir :=
+  mkBody "tests::caller_terminate" 1
+    [decl .mut u32T, decl .not boolT, decl .mut u32T]
+    [ mkBb [] (.call (fnOp "tests::assert_flag") [.copy (pl 1)] (pl 2) (some 1) .terminate)
+    , mkBb [mkSt (.assign (pl 0) (.binaryOp .add (.copy (pl 2)) (u32C 41)))] .return_ ]
+
+/-- Real caller calling `assert_flag(flag)` with `UnwindAction.continue_` (propagate
+the unwind to ITS caller). -/
+private def callerContinueBody : CapturedMir :=
+  mkBody "tests::caller_continue" 1
+    [decl .mut u32T, decl .not boolT, decl .mut u32T]
+    [ mkBb [] (.call (fnOp "tests::assert_flag") [.copy (pl 1)] (pl 2) (some 1) .continue_)
+    , mkBb [mkSt (.assign (pl 0) (.binaryOp .add (.copy (pl 2)) (u32C 41)))] .return_ ]
+
+private def assertCallerS0 (flag : Nat) : MachineState :=
+  { frame := { blockIdx := 0, stmtIdx := 0
+               locals := [.uninit, .init (.scalar ⟨flag, 1⟩), .uninit] }
+    memory := { callees := [calleeAssertBody] } }
+
+/-- **Witness 3g (`CallStackUnwind`: the REMAINING `UnwindAction` arms on REAL inline
+calls)**: the inline callee `assert_flag(false)` fails its `TerminatorKind.assert` and
+unwinds (`.continue_`) into the saved caller frame, whose `UnwindAction` decides:
+1. `.terminate` ⇒ the whole execution halts with `Outcome.abort`
+   (`unwindFromCallStack_terminate_eq_abort` on a real run);
+2. `.continue_` ⇒ the unwind propagates past the root caller and the run ends with
+   `Outcome.panic`;
+3. contrast: under the SAME `.terminate` caller, `assert_flag(true)` returns `0`
+   normally and the caller converges to `0 + 41 = 41` with an empty call stack.
+Together with Witness 3b (`.cleanup` landing pad) and N3/N3b (`.unreachable` UB and
+diverging `onRet = none` UB), every `UnwindAction ↔ UnwindAction4` arm is exercised on
+real `CapturedMir` inline calls. -/
+theorem witness3g_unwind_terminate_abort_and_continue_panic :
+    MirWpConverges callerTerminateBody (assertCallerS0 0) (fun out => out = .abort) ∧
+    MirWpConverges callerContinueBody (assertCallerS0 0) (fun out => out = .panic) ∧
+    MirWpConverges callerTerminateBody (assertCallerS0 1)
+      (fun out => match out with
+        | .normal (.scalar ⟨r, 4⟩, mem) => r = 41 ∧ mem.callStack = []
+        | _ => False) := by
+  refine ⟨?_, ?_, ?_⟩
+  · exact step_to_mirWp rfl (done_to_mirWp rfl rfl)
+  · exact step_to_mirWp rfl (done_to_mirWp rfl rfl)
+  · exact step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl (step_to_mirWp rfl
+      (step_to_mirWp rfl (done_to_mirWp rfl ⟨rfl, rfl⟩)))))
 
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 
