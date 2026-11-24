@@ -339,15 +339,39 @@ run_cmd do
     let ptEqName := ns ++ `crossRootLmProtectorEq
     addThm ptEqName (← MetaM.run' <| inferType ptEqVal) ptEqVal
 
-    -- 4. Wire-level positive controls on agreeing cells (incl. mode-sensitive `(treeBorrows, 19)`).
-    let wireAt (obs : Lean.Name) (m : Expr) (idx : Nat) : Expr :=
-      eqTrue (mkApp3 (mkConst (dsNs ++ `wireAgreesAt)) (mkConst obs) m (mkNatLit idx))
-    let wire0 := ns ++ `crossRootWireAgreesBasic0
-    addThm wire0 (wireAt crossObsU modeBasic 0) reflTrue
-    let wire19 := ns ++ `crossRootWireAgreesTb19
-    addThm wire19 (wireAt crossObsU modeTb 19) reflTrue
-    let wire27 := ns ++ `crossRootWireAgreesTb27
-    addThm wire27 (wireAt crossObsU modeTb 27) reflTrue
+    -- 4. Wire-level positive controls on agreeing cells (incl. BOTH mode-sensitive cells
+    -- `(treeBorrows, 19)` and `(treeBorrows, 21)`) and wire-disagreement controls on ALL
+    -- 4 diverging cells `(basic/treeBorrows, 28/29)`, transported from `crossObsU` to the
+    -- source `crossObs` via `lmHeapWideObserveU.eq_src`.
+    let wireExpr (obs : Expr) (m : Expr) (idx : Nat) : Expr :=
+      mkApp3 (mkConst (dsNs ++ `wireAgreesAt)) obs m (mkNatLit idx)
+    let certifyWire (base : Lean.Name) (m : Expr) (idx : Nat) (expected : Bool) :
+        CoreM (Lean.Name × Lean.Name) := do
+      let uName := ns ++ (base.appendAfter "U")
+      let sName := ns ++ base
+      let rhs := if expected then boolTrue else boolFalse
+      let refl := if expected then reflTrue else reflFalse
+      let eqRhs (e : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) boolTy e rhs
+      addThm uName (eqRhs (wireExpr (mkConst crossObsU) m idx)) refl
+      let srcTy ← MetaM.run' <| inferType (mkConst (lmNs ++ `lmHeapWideObserve))
+      let F ← MetaM.run' <| withLocalDeclD `g srcTy fun g => do
+        mkLambdaFVars #[g] (wireExpr (← mkObs trC g) m idx)
+      let congr := mkApp6 (mkConst ``congrArg [1, 1]) srcTy boolTy
+        (mkConst (lmNs ++ `lmHeapWideObserve)) (mkConst (lmNs ++ `lmHeapWideObserveU)) F
+        (mkConst (lmNs ++ `lmHeapWideObserveU.eq_src))
+      let pf := mkApp6 (mkConst ``Eq.trans [1]) boolTy
+        (wireExpr (mkConst crossObs) m idx) (wireExpr (mkConst crossObsU) m idx) rhs
+        congr (mkConst uName)
+      addThm sName (eqRhs (wireExpr (mkConst crossObs) m idx)) pf
+      return (uName, sName)
+    let (wire0U, wire0) ← certifyWire `crossRootWireAgreesBasic0 modeBasic 0 true
+    let (wire19U, wire19) ← certifyWire `crossRootWireAgreesTb19 modeTb 19 true
+    let (wire21U, wire21) ← certifyWire `crossRootWireAgreesTb21 modeTb 21 true
+    let (wire27U, wire27) ← certifyWire `crossRootWireAgreesTb27 modeTb 27 true
+    let (wire28BU, wire28B) ← certifyWire `crossRootWireDivergesBasic28 modeBasic 28 false
+    let (wire28TU, wire28T) ← certifyWire `crossRootWireDivergesTb28 modeTb 28 false
+    let (wire29BU, wire29B) ← certifyWire `crossRootWireDivergesBasic29 modeBasic 29 false
+    let (wire29TU, wire29T) ← certifyWire `crossRootWireDivergesTb29 modeTb 29 false
 
     -- 5. Closed `HeapWideDualContract`, every named projection, and the closed capstone.
     let contractName := ns ++ `closedHeapWideDualContract
@@ -361,7 +385,9 @@ run_cmd do
     let contractC := mkConst contractName
     let mut added : Array Lean.Name :=
       #[translateName, crossObs, crossObsU, crossCheck, crossCheckU, lcObs, lcObsU, lcCheck, lcCheckU,
-        ptObs, ptObsU, ptCheck, ptCheckU, lcEqName, ptEqName, wire0, wire19, wire27, contractName]
+        ptObs, ptObsU, ptCheck, ptCheckU, lcEqName, ptEqName,
+        wire0U, wire0, wire19U, wire19, wire21U, wire21, wire27U, wire27,
+        wire28BU, wire28B, wire28TU, wire28T, wire29BU, wire29B, wire29TU, wire29T, contractName]
     for projName in [`contract_agreement_zone_exact, `contract_divergence_explicit,
                      `contract_mode_sensitivity_joint, `contract_traces,
                      `contract_divergence_set_exact, `contract_wire_divergence_exact,
@@ -376,11 +402,19 @@ run_cmd do
     for w in [`mrObserve_table, `mr_mode_sensitivity, `mrLifecycleTrace_table,
               `mrProtectorTrace_table, `heapWideOutcomeCodec_rejects_malformed,
               `preventsDeallocation_eq_mr, `mr_prevents_deallocation_iff_trusted,
+              `hasFrameDeallocProtectorConflict_eq_mr_node, `hasProtectedLocalBorrow_eq_mr_node,
               `hasFrameDeallocProtectorConflict_iff, `hasProtectedLocalBorrow_iff,
-              `evalTerminator_return_protector_ub, `evalTailCallTerminator_protector_ub,
+              `evalTerminator_return_protector_ub, `evalTerminator_callee_return_releases_protector,
+              `evalTailCallTerminator_protector_ub,
+              `evalStmt_storageDead_protector_ub, `evalStmt_storageDead_no_conflict_steps,
+              `evalStmt_storageLive_protector_ub,
               `trustedTeardown_table, `trusted_protector_cases_match_mr,
+              `trustedStorageDead_and_release_table,
               `evalCastPtrToPtr_slice_to_thin, `evalCastPtrToPtr_dyn_to_thin,
-              `evalCastPtrToPtr_scalarPair_to_thin, `evalRvalue_thinPtr_eq,
+              `evalCastPtrToPtr_scalarPair_to_thin, `evalCastPtrToPtr_scalarDyn_to_thin,
+              `evalRvalue_thinPtr_eq, `evalRvalue_thinScalar_eq,
+              `evalRvalue_wideSlice_eq, `evalRvalue_wideDyn_eq,
+              `evalCast_then_thinEq_erases_meta_and_prov,
               `trustedCmp_table, `trustedRvalue_witnesses, `trusted_wide_cases_match_mr] do
       let src := dsNs ++ w
       let some (.thmInfo v) := (← getEnv).find? src
@@ -389,10 +423,15 @@ run_cmd do
       addThm outName v.type (mkConst src)
       added := added.push outName
 
-    -- 6. Negative controls on scratch copies: the kernel MUST reject every forgery. Every
-    -- forgery is built over the kernel-evaluable `…U` twins (whose genuine versions were
-    -- accepted above), so each rejection is a real value mismatch, not a stuck reduction.
+    -- 6. Negative controls on scratch copies: every boolean forgery is FIRST verified to
+    -- kernel-reduce to `Bool.false` (`addDecl` ACCEPTS `= false` via `Eq.refl false`), and
+    -- THEN verified to be REJECTED when claiming `= true` — proving each rejection is a
+    -- genuine value mismatch (`false ≠ true`), never a type error or stuck reduction.
     let saved ← getEnv
+    let accepts (d : Declaration) : CoreM Bool := do
+      let r ← try addDecl d; pure true catch _ => pure false
+      setEnv saved
+      return r
     let rejects (d : Declaration) : CoreM Bool := do
       let r ← try addDecl d; pure false catch _ => pure true
       setEnv saved
@@ -400,7 +439,7 @@ run_cmd do
     let lmObsU := mkConst (lmNs ++ `lmHeapWideObserveU)
     let lmLcU := mkConst (lmNs ++ `lmHeapLifecycleTraceU)
     let lmPtU := mkConst (lmNs ++ `lmProtectorDeallocTraceU)
-    let authCheck (o : Expr) : Expr := eqTrue (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) o)
+    let authCheckExpr (o : Expr) : Expr := mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) o
     let modeInv ← MetaM.run' <| mkObs trC lmObsU true false
     let caseShift ← MetaM.run' <| mkObs trC lmObsU false true
     let boolInv ← MetaM.run' <| mkObs (← MetaM.run' <| mkTranslate true false false false) lmObsU
@@ -409,54 +448,102 @@ run_cmd do
     let invForged ← MetaM.run' <| mkObs (← MetaM.run' <| mkTranslate false false false true) lmObsU
     let ptModeInv ← MetaM.run' <| mkTrace trC lmPtU true
     let lcU ← MetaM.run' <| mkTrace trC lmLcU
-    -- MiniRust passed off as LeanMiri: must fail exactly on the divergence set.
+    -- MiniRust passed off as LeanMiri: must reduce to `false` on the divergence set `{28, 29}`.
     let mrAsLm ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb => withLocalDeclD `idx natTy fun idx =>
       mkLambdaFVars #[tb, idx] (mkApp2 (mkConst (dsNs ++ `mrObserve))
         (mkApp (mkConst (dsNs ++ `HeapWideMemoryMode.ofLmTreeBorrows)) tb) idx)
     let thm (n : String) (ty pf : Expr) : Declaration :=
       .thmDecl { name := ns ++ `forged ++ Lean.Name.mkSimple n, levelParams := [], type := ty, value := pf }
-    let forged : List (String × Declaration) :=
-      [ ("ill-typed 0 = 1 theorem",
+    -- 6a. Two-sided boolean negative controls (kernel MUST accept `= false` AND reject `= true`).
+    let boolForgeries : List (String × String × Expr) :=
+      [ ("mode-inverted observer (Bool.not tb) catching cases 19/21", "modeInverted", authCheckExpr modeInv),
+        ("case-shifted observer (idx + 1)", "caseShifted", authCheckExpr caseShift),
+        ("okBool-inverted translator", "boolInverted", authCheckExpr boolInv),
+        ("ub-to-okDealloc forged translator", "ubForged", authCheckExpr ubForged),
+        ("memoryLeak-to-okDealloc forged translator", "leakForged", authCheckExpr leakForged),
+        ("invalidOrUnsupported-to-specPanic forged translator masking case 28",
+          "invalidForged", authCheckExpr invForged),
+        ("wire tuples forged equal on diverging cell (basic, 28)",
+          "wire28Basic", wireExpr (mkConst crossObsU) modeBasic 28),
+        ("wire tuples forged equal on diverging cell (treeBorrows, 28)",
+          "wire28Tb", wireExpr (mkConst crossObsU) modeTb 28),
+        ("wire tuples forged equal on diverging cell (basic, 29)",
+          "wire29Basic", wireExpr (mkConst crossObsU) modeBasic 29),
+        ("wire tuples forged equal on diverging cell (treeBorrows, 29)",
+          "wire29Tb", wireExpr (mkConst crossObsU) modeTb 29),
+        ("mode-inverted protector trace (Bool.not tb)",
+          "protectorModeInverted", mkApp (mkConst (dsNs ++ `lmProtectorTraceAuthorityCheck)) ptModeInv),
+        ("protector trace passed to the lifecycle check",
+          "protectorAsLifecycle", mkApp (mkConst (dsNs ++ `lmLifecycleTraceAuthorityCheck)) (mkConst ptObsU)),
+        ("lifecycle trace passed to the protector check",
+          "lifecycleAsProtector", mkApp (mkConst (dsNs ++ `lmProtectorTraceAuthorityCheck)) lcU),
+        ("MiniRust observer passed off as LeanMiri (diverges on 28, 29)",
+          "mrAsLm", authCheckExpr mrAsLm) ]
+    let mut rejected : Nat := 0
+    for (what, tag, expr) in boolForgeries do
+      unless ← accepts (thm (tag ++ "IsFalse") (eqFalse expr) reflFalse) do
+        throwError "cross-root negative control VACUOUS: {what} did not kernel-reduce to Bool.false"
+      unless ← rejects (thm tag (eqTrue expr) reflTrue) do
+        throwError "cross-root negative control FAILED: kernel accepted {what}"
+      rejected := rejected + 1
+    -- 6b. Non-boolean / flipped-polarity / Trusted / codec forgeries (each paired with a true baseline).
+    let tdFrozenTrue := mkApp2 (mkConst (dsNs ++ `trustedTeardownObs))
+      (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm.frozen) boolTrue
+    let sliceCmpFalse := mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+      #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwSliceTy), boolFalse,
+        mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
+        mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 7)]
+    let badTuple := mkApp4 (mkConst ``Prod.mk [0, 0]) natTy
+      (mkApp2 (mkConst ``Prod [0, 0]) natTy (mkApp2 (mkConst ``Prod [0, 0]) natTy boolTy))
+      (mkNatLit 8)
+      (mkApp4 (mkConst ``Prod.mk [0, 0]) natTy (mkApp2 (mkConst ``Prod [0, 0]) natTy boolTy)
+        (mkNatLit 0) (mkApp4 (mkConst ``Prod.mk [0, 0]) natTy boolTy (mkNatLit 0) boolFalse))
+    let badDecode := mkApp (mkConst (dsNs ++ `heapWideDecode)) badTuple
+    let optObsTy := mkApp (mkConst ``Option [0]) obsTy
+    let extraForged : List (String × Option Declaration × Declaration) :=
+      [ ("ill-typed 0 = 1 theorem", none,
           thm "zeroEqOne" (mkApp3 (mkConst ``Eq [1]) natTy (mkNatLit 0) (mkNatLit 1))
             (mkApp2 (mkConst ``Eq.refl [1]) natTy (mkNatLit 0))),
-        ("negated lmAuthorityCheck certificate (= false)",
-          thm "lmCheckFalse" (eqFalse (mkApp (mkConst (dsNs ++ `lmAuthorityCheck)) (mkConst crossObsU)))
-            reflFalse),
-        ("mode-inverted observer (Bool.not tb) catching cases 19/21", thm "modeInverted" (authCheck modeInv) reflTrue),
-        ("case-shifted observer (idx + 1)", thm "caseShifted" (authCheck caseShift) reflTrue),
-        ("okBool-inverted translator", thm "boolInverted" (authCheck boolInv) reflTrue),
-        ("ub-to-okDealloc forged translator", thm "ubForged" (authCheck ubForged) reflTrue),
-        ("memoryLeak-to-okDealloc forged translator", thm "leakForged" (authCheck leakForged) reflTrue),
-        ("invalidOrUnsupported-to-specPanic forged translator masking case 28",
-          thm "invalidForged" (authCheck invForged) reflTrue),
-        ("wire tuples forged equal on diverging cell (basic, 28)",
-          thm "wire28" (wireAt crossObsU modeBasic 28) reflTrue),
-        ("wire tuples forged equal on diverging cell (treeBorrows, 29)",
-          thm "wire29" (wireAt crossObsU modeTb 29) reflTrue),
-        ("negated lifecycle trace certificate (= false)",
+        ("negated lmAuthorityCheck certificate (= false)", none,
+          thm "lmCheckFalse" (eqFalse (authCheckExpr (mkConst crossObsU))) reflFalse),
+        ("negated lifecycle trace certificate (= false)", none,
           thm "lifecycleFalse"
             (eqFalse (mkApp (mkConst (dsNs ++ `lmLifecycleTraceAuthorityCheck)) (mkConst lcObsU))) reflFalse),
-        ("mode-inverted protector trace (Bool.not tb)",
-          thm "protectorModeInverted"
-            (eqTrue (mkApp (mkConst (dsNs ++ `lmProtectorTraceAuthorityCheck)) ptModeInv)) reflTrue),
-        ("protector trace passed to the lifecycle check",
-          thm "protectorAsLifecycle"
-            (eqTrue (mkApp (mkConst (dsNs ++ `lmLifecycleTraceAuthorityCheck)) (mkConst ptObsU))) reflTrue),
-        ("lifecycle trace passed to the protector check",
-          thm "lifecycleAsProtector"
-            (eqTrue (mkApp (mkConst (dsNs ++ `lmProtectorTraceAuthorityCheck)) lcU)) reflTrue),
-        ("MiniRust observer passed off as LeanMiri (diverges on 28, 29)",
-          thm "mrAsLm" (authCheck mrAsLm) reflTrue) ]
-    let mut rejected : Nat := 0
-    for (what, d) in forged do
+        ("forged Trusted active strong-protector teardown = okDealloc",
+          some (thm "tdFrozenIsUb" (mkApp3 (mkConst ``Eq [1]) obsTy tdFrozenTrue (obsC "ub"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "ub"))),
+          thm "tdFrozenForgedOk" (mkApp3 (mkConst ``Eq [1]) obsTy tdFrozenTrue (obsC "okDealloc"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "okDealloc"))),
+        ("forged Trusted full wide slice == ignores length (okBool true)",
+          some (thm "sliceCmpIsFalse" (mkApp3 (mkConst ``Eq [1]) obsTy sliceCmpFalse (mkApp (obsC "okBool") boolFalse))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))),
+          thm "sliceCmpForgedTrue" (mkApp3 (mkConst ``Eq [1]) obsTy sliceCmpFalse (mkApp (obsC "okBool") boolTrue))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolTrue))),
+        ("forged malformed codec tuple decodes to some .ub",
+          some (thm "badDecodeIsNone" (mkApp3 (mkConst ``Eq [1]) optObsTy badDecode (mkApp (mkConst ``Option.none [0]) obsTy))
+            (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp (mkConst ``Option.none [0]) obsTy))),
+          thm "badDecodeForgedUb" (mkApp3 (mkConst ``Eq [1]) optObsTy badDecode (mkApp2 (mkConst ``Option.some [0]) obsTy (obsC "ub")))
+            (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp2 (mkConst ``Option.some [0]) obsTy (obsC "ub")))) ]
+    for (what, baseOpt, d) in extraForged do
+      if let some baseDecl := baseOpt then
+        unless ← accepts baseDecl do
+          throwError "cross-root negative control VACUOUS: baseline for {what} failed to kernel-reduce"
       unless ← rejects d do
         throwError "cross-root negative control FAILED: kernel accepted {what}"
       rejected := rejected + 1
 
-    -- 7. Safety, non-triviality, standard-3-axiom purity, self-tests, reachability.
+    -- 7. Safety, non-triviality, choice-free codec check, standard-3-axiom purity, self-tests, reachability.
     let env ← getEnv
     let isStdAx (a : Lean.Name) : Bool :=
       a == ``propext || a == ``Classical.choice || a == ``Quot.sound
+    -- Constructive codec layer in DualSpec must be strictly choice-free (`[propext, Quot.sound]`).
+    for c in [dsNs ++ `heapWideOutcomeCodec, dsNs ++ `heapWideOutcomeCodec_tight,
+              dsNs ++ `heapWideOutcomeCodec_encode_injective,
+              dsNs ++ `heapWideOutcomeCodec_decode_injective_on_valid,
+              dsNs ++ `heapWideDecode_canonical, dsNs ++ `lmAuthorityCheck_sound] do
+      for a in ← collectAxioms c do
+        unless a == ``propext || a == ``Quot.sound do
+          throwError "cross-root constructive audit: {c} must not depend on {a}"
     let rec isTrivialProp : Expr → Bool
       | .forallE _ _ body _ => isTrivialProp body
       | .letE _ _ _ body _ => isTrivialProp body
@@ -487,7 +574,12 @@ run_cmd do
         `MiniRustSpec.HeapAllocAndWidePtrMR.mrHeapWideObserve_table,
         dsNs ++ `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone,
         dsNs ++ `contract_divergence_set_exact, dsNs ++ `contract_wire_divergence_exact,
-        dsNs ++ `trustedTeardown_table, dsNs ++ `trustedCmp_table ]
+        dsNs ++ `hasFrameDeallocProtectorConflict_eq_mr_node,
+        dsNs ++ `hasProtectedLocalBorrow_eq_mr_node,
+        dsNs ++ `evalRvalue_wideSlice_eq, dsNs ++ `evalRvalue_wideDyn_eq,
+        dsNs ++ `evalCast_then_thinEq_erases_meta_and_prov,
+        dsNs ++ `trustedTeardown_table, dsNs ++ `trustedStorageDead_and_release_table,
+        dsNs ++ `trustedCmp_table ]
     for n in keyThms do
       let some (.thmInfo v) := env.find? n | throwError "cross-root: required theorem {n} missing"
       if isTrivialProp v.type then throwError "cross-root: theorem {n} is trivial"
@@ -520,20 +612,30 @@ run_cmd do
       [ contractName, crossObs, crossCheck, lcCheck, ptCheck,
         dsNs ++ `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone,
         lmNs ++ `lmHeapWideObserve, lmNs ++ `lmHeapWideObserveU,
+        lmNs ++ `lmHeapLifecycleTrace, lmNs ++ `lmProtectorDeallocTrace,
         `MiniRustSpec.HeapAllocAndWidePtrMR.mrHeapWideObserve,
         `MiniRustSpec.HeapAllocAndWidePtrMR.ep1_minirust_heap_wide_capstone,
         `MiniRustSpec.Interp.evalIntrinsic, `MiniRustSpec.Interp.evalIntrinsicM,
         `MiniRustSpec.Interp.BasicMemory.leak_check, `MiniRustSpec.Interp.TreeBorrowsMemory.deallocate,
+        `MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation,
         `MiniRustSpec.Interp.comparePtr,
+        `Miri.ABI.Align.fromBytes,
         `Miri.Memory.MemoryLifecycle.allocatePtr, `Miri.Memory.MemoryLifecycle.deallocatePtrWith,
         `Miri.TreeBorrows.BorrowTree.deallocateBorrowRange, `Miri.Interpreter.LeakCheck.take,
         `Miri.Interpreter.Cast.ptrToPtr, `Miri.Interpreter.ExecutionScalar.pointerBinary,
         `Trusted.Rustc.V2026_06_01.MirSemantics.hasFrameDeallocProtectorConflict,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.hasProtectedLocalBorrow,
         `Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation,
-        `Trusted.Rustc.V2026_06_01.MirSemantics.evalCastPtrToPtr,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator,
-        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn,
-        `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue ]
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalTailCallTerminator,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalCastPtrToPtr,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.ptrToAddrScalar,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalWidePtrAggregateRelBinOp,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.evalWidePtrRelBinOp,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn ]
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: closed capstone does not reach {req}"
@@ -542,9 +644,9 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 47 && rejectedCount = 15 do
+  unless addedCount = 72 && rejectedCount = 20 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri+Trusted, axioms {crAxioms}"
+  logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
 /-! ## §3. Test Module Axiom Audit -/
 

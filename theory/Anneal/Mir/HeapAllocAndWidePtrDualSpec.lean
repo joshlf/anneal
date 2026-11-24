@@ -735,6 +735,126 @@ theorem preventsDeallocation_eq_mr_permission (p : TreeBorrowPerm) :
       MiniRustSpec.Interp.Permission.prevents_deallocation (.Prot (trustedPermToMrProt p)) := by
   cases p <;> rfl
 
+/-- Embed a single Trusted `BorrowEntry` under active protector list `ap` as a
+MiniRust Tree Borrows leaf `Node`: strongly protected iff `isBorrowProtected ap e`. -/
+def trustedBorrowToMrLeaf (ap : List Nat) (e : BorrowEntry) : MiniRustSpec.Gen.Node :=
+  ⟨[], [.Prot (trustedPermToMrProt e.perm)], if isBorrowProtected ap e then .Strong else .No⟩
+
+/-- Embed every borrow targeting a local `< nLocals` of frame `depth` as children of an
+unprotected root `Node` in MiniRust's Tree Borrows model. -/
+def trustedFrameBorrowsToMrNode (borrows : List BorrowEntry) (ap : List Nat)
+    (depth nLocals : Nat) : MiniRustSpec.Gen.Node :=
+  let matching := borrows.filter fun e =>
+    Nat.beq e.targetFrameDepth depth && Nat.blt e.targetLocal nLocals
+  ⟨matching.map (trustedBorrowToMrLeaf ap), [.Unprot .Unique], .No⟩
+
+/-- Embed every borrow targeting stack local `loc` of frame `depth` as children of an
+unprotected root `Node` in MiniRust's Tree Borrows model. -/
+def trustedLocalBorrowsToMrNode (borrows : List BorrowEntry) (ap : List Nat)
+    (loc : Local) (depth : Nat) : MiniRustSpec.Gen.Node :=
+  let matching := borrows.filter fun e =>
+    Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal loc
+  ⟨matching.map (trustedBorrowToMrLeaf ap), [.Unprot .Unique], .No⟩
+
+/-- Single-leaf equivalence: a leaf `trustedBorrowToMrLeaf ap e` triggers MiniRust's
+`Node::contains_strong_protector_preventing_deallocation` iff the Trusted borrow is
+protected and its permission prevents deallocation. -/
+theorem trustedBorrowToMrLeaf_contains_strong_protector (ap : List Nat) (e : BorrowEntry) :
+    MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+        (trustedBorrowToMrLeaf ap e) =
+      (isBorrowProtected ap e && preventsDeallocation e.perm) := by
+  unfold trustedBorrowToMrLeaf
+  rw [MiniRustSpec.HeapAllocAndWidePtrMR.node_contains_strong_protector_eq]
+  simp only [MiniRustSpec.Interp.Node.anyChildPreventsDeallocation, Bool.or_false,
+    List.any_cons, List.any_nil, Bool.or_false, ← preventsDeallocation_eq_mr_permission]
+  cases isBorrowProtected ap e <;> simp
+
+private theorem anyChildPreventsDeallocation_map_leaf (ap : List Nat) (es : List BorrowEntry) :
+    MiniRustSpec.Interp.Node.anyChildPreventsDeallocation (es.map (trustedBorrowToMrLeaf ap)) =
+      es.any (fun e => isBorrowProtected ap e && preventsDeallocation e.perm) := by
+  induction es with
+  | nil => rfl
+  | cons e rest ih =>
+    simp only [List.map_cons, MiniRustSpec.Interp.Node.anyChildPreventsDeallocation,
+      trustedBorrowToMrLeaf_contains_strong_protector, ih, List.any_cons]
+
+private theorem isBorrowProtected_nil (e : BorrowEntry) : isBorrowProtected [] e = false := by
+  unfold isBorrowProtected
+  cases e.protector <;> rfl
+
+/-- **Universal `hasFrameDeallocProtectorConflict` ↔ MiniRust `Node` correspondence**:
+for every borrow list, active protector set, frame depth, and local count, Anneal's
+`hasFrameDeallocProtectorConflict` equals MiniRust's
+`Node::contains_strong_protector_preventing_deallocation` on the embedded borrow tree. -/
+theorem hasFrameDeallocProtectorConflict_eq_mr_node (borrows : List BorrowEntry) (ap : List Nat)
+    (depth nLocals : Nat) :
+    hasFrameDeallocProtectorConflict borrows ap depth nLocals =
+      MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+        (trustedFrameBorrowsToMrNode borrows ap depth nLocals) := by
+  unfold trustedFrameBorrowsToMrNode
+  rw [MiniRustSpec.HeapAllocAndWidePtrMR.node_contains_strong_protector_eq]
+  simp only [reduceCtorEq, decide_false, Bool.false_and, Bool.false_or,
+    anyChildPreventsDeallocation_map_leaf]
+  cases ap with
+  | nil =>
+    have hL : hasFrameDeallocProtectorConflict borrows [] depth nLocals = false := by
+      cases borrows <;> rfl
+    rw [hL]
+    symm
+    cases h : ((borrows.filter fun e =>
+        Nat.beq e.targetFrameDepth depth && Nat.blt e.targetLocal nLocals).any fun e =>
+        isBorrowProtected [] e && preventsDeallocation e.perm) with
+    | false => rfl
+    | true =>
+      obtain ⟨e, _, he⟩ := List.any_eq_true.mp h
+      rw [isBorrowProtected_nil] at he
+      cases he
+  | cons a as =>
+    induction borrows with
+    | nil => rfl
+    | cons e rest ih =>
+      rw [hasFrameDeallocProtectorConflict, List.filter_cons]
+      cases hm : (Nat.beq e.targetFrameDepth depth && Nat.blt e.targetLocal nLocals) with
+      | false =>
+        simp only [Bool.false_and, Bool.false_eq_true, ite_false]
+        exact ih
+      | true =>
+        simp only [Bool.true_and, ite_true, List.any_cons]
+        cases hp : (isBorrowProtected (a :: as) e && preventsDeallocation e.perm) with
+        | true => rfl
+        | false =>
+          simp only [Bool.false_or]
+          exact ih
+
+/-- **Universal `hasProtectedLocalBorrow` ↔ MiniRust `Node` correspondence**:
+for every borrow list, active protector set, local index, and frame depth, Anneal's
+`hasProtectedLocalBorrow` equals MiniRust's
+`Node::contains_strong_protector_preventing_deallocation` on the embedded local borrow tree. -/
+theorem hasProtectedLocalBorrow_eq_mr_node (borrows : List BorrowEntry) (ap : List Nat)
+    (loc : Local) (depth : Nat) :
+    hasProtectedLocalBorrow borrows ap loc depth =
+      MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+        (trustedLocalBorrowsToMrNode borrows ap loc depth) := by
+  unfold trustedLocalBorrowsToMrNode
+  rw [MiniRustSpec.HeapAllocAndWidePtrMR.node_contains_strong_protector_eq]
+  simp only [reduceCtorEq, decide_false, Bool.false_and, Bool.false_or,
+    anyChildPreventsDeallocation_map_leaf]
+  induction borrows with
+  | nil => rfl
+  | cons e rest ih =>
+    rw [hasProtectedLocalBorrow, List.filter_cons]
+    cases hm : (Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal loc) with
+    | false =>
+      simp only [Bool.false_and, Bool.false_eq_true, ite_false]
+      exact ih
+    | true =>
+      simp only [Bool.true_and, ite_true, List.any_cons]
+      cases hp : (isBorrowProtected ap e && preventsDeallocation e.perm) with
+      | true => rfl
+      | false =>
+        simp only [Bool.false_or]
+        exact ih
+
 /-- Universal characterization of `hasFrameDeallocProtectorConflict`: some borrow of a
 local `< nLocals` of the frame at `depth` carries a still-active protector whose
 permission prevents deallocation. -/
@@ -869,6 +989,92 @@ theorem evalTailCallTerminator_protector_ub (s : MachineState) (func : Operand)
     evalTailCallTerminator s func argOps (some body) = MirStepNode.fail .ub := by
   simp only [evalTailCallTerminator, bodyLocalDeclsOf, hr, ha, hc]
 
+/-- **Per-local `StorageDead` faults when MiniRust's embedded local borrow tree has a
+strong deallocation-preventing protector** (`evalStmt` `.storageDead`, linked directly
+through `hasProtectedLocalBorrow_eq_mr_node`). -/
+theorem evalStmt_storageDead_protector_ub (s : MachineState) (loc : Local) (slot : LocalSlot)
+    (localsDead : List LocalSlot) (span : String) (decls : List LocalDecl) (layouts : LayoutTable)
+    (hGet : get? s.frame.locals loc = .some slot)
+    (hSet : set? s.frame.locals loc .dead = .some localsDead)
+    (hMr : MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+      (trustedLocalBorrowsToMrNode s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack)) = true) :
+    evalStmt s ⟨.storageDead loc, span⟩ decls layouts = MirStepNode.fail .ub := by
+  have hProt : hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+      (length s.memory.callStack) = true := by
+    rw [hasProtectedLocalBorrow_eq_mr_node]; exact hMr
+  exact (evalStmt_storageDead_purges_borrows s loc slot localsDead span decls layouts).2.1
+    hGet hSet hProt
+
+/-- **Per-local `StorageDead` succeeds and purges borrows when no strong protector blocks
+deallocation** (including released protectors and protected `.cell` / `.disabled` tags). -/
+theorem evalStmt_storageDead_no_conflict_steps (s : MachineState) (loc : Local) (slot : LocalSlot)
+    (localsDead : List LocalSlot) (span : String) (decls : List LocalDecl) (layouts : LayoutTable)
+    (hGet : get? s.frame.locals loc = .some slot)
+    (hSet : set? s.frame.locals loc .dead = .some localsDead)
+    (hMr : MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+      (trustedLocalBorrowsToMrNode s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack)) = false) :
+    evalStmt s ⟨.storageDead loc, span⟩ decls layouts =
+      MirStepNode.step (advanceStmt s localsDead
+        { s.memory with borrows := disableLocalBorrows s.memory.borrows loc (length s.memory.callStack) }) := by
+  have hProt : hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+      (length s.memory.callStack) = false := by
+    rw [hasProtectedLocalBorrow_eq_mr_node]; exact hMr
+  exact ((evalStmt_storageDead_purges_borrows s loc slot localsDead span decls layouts).1
+    hGet hSet hProt).1
+
+/-- **Per-local `StorageLive` (implicit prior-storage deallocation) faults on a strong
+protector conflict**, matching MiniRust's embedded local borrow tree. -/
+theorem evalStmt_storageLive_protector_ub (s : MachineState) (loc : Local) (slot : LocalSlot)
+    (localsUninit : List LocalSlot) (span : String) (decls : List LocalDecl) (layouts : LayoutTable)
+    (hGet : get? s.frame.locals loc = .some slot)
+    (hSet : set? s.frame.locals loc .uninit = .some localsUninit)
+    (hMr : MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation
+      (trustedLocalBorrowsToMrNode s.memory.borrows s.memory.activeProtectors loc
+        (length s.memory.callStack)) = true) :
+    evalStmt s ⟨.storageLive loc, span⟩ decls layouts = MirStepNode.fail .ub := by
+  have hProt : hasProtectedLocalBorrow s.memory.borrows s.memory.activeProtectors loc
+      (length s.memory.callStack) = true := by
+    rw [hasProtectedLocalBorrow_eq_mr_node]; exact hMr
+  exact (evalStmt_storageLive_purges_borrows s loc slot localsUninit span decls layouts).2.1
+    hGet hSet hProt
+
+/-- **Callee `return_` releases callee protectors via `restoreCallerProtectors`** (the
+Trusted operational counterpart of MiniRust `end_call` / LeanMiri `releaseProtector`,
+Case `19 → 20`): once a non-diverging callee frame returns without conflicting on its own
+locals, `activeProtectors` becomes `restoreCallerProtectors caller`, so any callee
+protector `pid ∉ restoreCallerProtectors caller` no longer protects any borrow entry. -/
+theorem evalTerminator_callee_return_releases_protector (s : MachineState) (span : String)
+    (cb : Option CapturedMir) (v : Value) (caller : SavedCallerFrame)
+    (restStack : List SavedCallerFrame) (updatedCallerLocals : List LocalSlot) (mem' : Memory)
+    (h0 : get? s.frame.locals 0 = some (.init v))
+    (hstack : s.memory.callStack = caller :: restStack)
+    (hc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+      (length s.memory.callStack) (length s.frame.locals) = false)
+    (hdiv : caller.isDiverging = false)
+    (hinit : valueContainsUninit v = false)
+    (hwrite : writeReturnDestination caller.frame.locals
+      { s.memory with
+        borrows := disableFrameBorrows s.memory.borrows (length (caller :: restStack)) (length s.frame.locals)
+        callStack := restStack
+        activeCallee := .some caller.callerBody
+        activeProtectors := restoreCallerProtectors caller }
+      caller.destination v caller.callerBody.localDecls caller.callerBody.layouts =
+      .ok updatedCallerLocals mem') :
+    evalTerminator s { kind := .return_, span := span } cb =
+      MirStepNode.step
+        { frame := { blockIdx := caller.returnTarget, stmtIdx := 0, locals := updatedCallerLocals }
+          memory := mem' } ∧
+    (∀ (e : BorrowEntry) (pid : Nat), e.protector = some pid →
+      pid ∉ restoreCallerProtectors caller →
+      isBorrowProtected (restoreCallerProtectors caller) e = false) := by
+  have hc' : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+      (length (caller :: restStack)) (length s.frame.locals) = false := by
+    rw [← hstack]; exact hc
+  refine ⟨?_, fun e pid hp hrel => isBorrowProtected_released _ e pid hp hrel⟩
+  simp only [evalTerminator, h0, hstack, hc', hdiv, hinit, hwrite]
+
 /-! #### Concrete `evalTerminator` / `stepMirFn` executions (cases `19`, `20`, `22`) -/
 
 /-- A unit return layout for the protector fixture. -/
@@ -952,6 +1158,90 @@ theorem trusted_protector_cases_match_mr :
   exact ⟨trustedTeardown_table.1, trustedTeardown_table.2.2.2.2.1,
     trustedTeardown_table.2.2.2.2.2.2.1⟩
 
+/-- Bounded multi-step runner for Trusted teardown / `StorageDead` fixtures: a root normal
+return is `.okDealloc`, a `.ub` fault is `.ub`. -/
+def trustedDeallocRun (body : CapturedMir) : Nat → MachineState → HeapWideObs
+  | 0, _ => .invalidOrUnsupported
+  | fuel + 1, s =>
+    match stepMirFn body s with
+    | .tau (.running s') => trustedDeallocRun body fuel s'
+    | .ret (.normal _) => .okDealloc
+    | .vis (.inl (.fail .ub)) _ => .ub
+    | _ => .invalidOrUnsupported
+
+/-- `fn(_1: u32) -> () { StorageDead(_1); return }`: explicit per-local deallocation via
+`evalStmt` `.storageDead` (`hasProtectedLocalBorrow`). -/
+def hwStorageDeadBody : CapturedMir :=
+  hwMirBody "hw::storage_dead" [hwDecl (.tuple []), hwDecl (.uint .u32)] 1
+    [{ statements := [{ kind := .storageDead 1, span := "hw.rs:1:1" }],
+       terminator := { kind := .return_, span := "hw.rs:1:2" }, isCleanup := false }]
+
+/-- Run `StorageDead(_1)` + `return_` through `stepMirFn`. -/
+def trustedStorageDeadObs (perm : TreeBorrowPerm) (active : Bool) : HeapWideObs :=
+  trustedDeallocRun hwStorageDeadBody 4 (hwTeardownState perm active)
+
+/-- Trivial callee `fn() -> () { return }` used to execute the real callee-return
+protector release (`restoreCallerProtectors`) before caller `StorageDead(_1)`. -/
+def hwCalleeBody : CapturedMir :=
+  hwMirBody "hw::release_callee" [hwDecl (.tuple [])] 0
+    [{ statements := [], terminator := { kind := .return_, span := "hw.rs:2:1" }, isCleanup := false }]
+
+/-- Two-frame state inside `hwCalleeBody` with active protector `1` guarding caller local
+`_1` (`targetFrameDepth = 0`, `perm = .frozen`): returning from `hwCalleeBody` releases
+protector `1` via `restoreCallerProtectors`, allowing caller `StorageDead(_1)` to succeed
+(genuine operational Case `19 → 20` transition). -/
+def hwCalleeReleaseState : MachineState :=
+  let savedCaller : SavedCallerFrame :=
+    { callerBody := hwStorageDeadBody
+      frame := { blockIdx := 0, stmtIdx := 0,
+                 locals := [.init (.aggregate 0 []), .init (.scalar ⟨42, 4⟩)] }
+      destination := { local_ := 0, projection := [] }
+      returnTarget := 0
+      callerProtector := none
+      calleeProtectors := []
+      returnUnwind := .continue_
+      isDiverging := false }
+  { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.aggregate 0 [])] }
+    memory := { borrows := [hwProtectedEntry .frozen]
+                activeProtectors := [1]
+                callStack := [savedCaller]
+                activeCallee := some hwCalleeBody } }
+
+/-- Multi-step execution of callee return (releasing protector `1`) followed by caller
+`StorageDead(_1)` + `return_`. -/
+def trustedCalleeReleaseThenDeallocObs : HeapWideObs :=
+  trustedDeallocRun hwStorageDeadBody 6 hwCalleeReleaseState
+
+/-- Concrete tail-call protector conflict fixture (`evalTailCallTerminator`). -/
+def trustedTailCallObs (perm : TreeBorrowPerm) (active : Bool) : HeapWideObs :=
+  let fnOp : Operand :=
+    .constant { ty := { kind := .fnDef "hw::tail_callee" [], layoutIdx := 0 },
+                val := .unevaluated "hw::tail_callee" }
+  trustedStepObs (evalTailCallTerminator (hwTeardownState perm active) fnOp [] (some hwTeardownBody))
+
+/-- **Concrete `StorageDead`, 2-frame callee-return protector release (`19 → 20`), and
+tail-call protector execution table** through real `stepMirFn` / `evalStmt` /
+`evalTailCallTerminator`, matching MiniRust `MachTB` cases `19`, `20`, `22`. -/
+theorem trustedStorageDead_and_release_table :
+    trustedStorageDeadObs .frozen true = .ub ∧
+    trustedStorageDeadObs .unique true = .ub ∧
+    trustedStorageDeadObs .frozen false = .okDealloc ∧
+    trustedStorageDeadObs .cell true = .okDealloc ∧
+    trustedCalleeReleaseThenDeallocObs = .okDealloc ∧
+    trustedTailCallObs .frozen true = .ub ∧
+    trustedStorageDeadObs .frozen true = mrObserve .treeBorrows 19 ∧
+    trustedCalleeReleaseThenDeallocObs = mrObserve .treeBorrows 20 ∧
+    trustedStorageDeadObs .cell true = mrObserve .treeBorrows 22 := by
+  have h1 : trustedStorageDeadObs .frozen true = .ub := by decide +kernel
+  have h2 : trustedStorageDeadObs .unique true = .ub := by decide +kernel
+  have h3 : trustedStorageDeadObs .frozen false = .okDealloc := by decide +kernel
+  have h4 : trustedStorageDeadObs .cell true = .okDealloc := by decide +kernel
+  have h5 : trustedCalleeReleaseThenDeallocObs = .okDealloc := by decide +kernel
+  have h6 : trustedTailCallObs .frozen true = .ub := by decide +kernel
+  rw [mrObserve_table _ 19 (by decide), mrObserve_table _ 20 (by decide),
+    mrObserve_table _ 22 (by decide)]
+  exact ⟨h1, h2, h3, h4, h5, h6, h1, h5, h4⟩
+
 /-! ### §6.2 Wide-pointer `addr_eq` metadata erasure (`rust#166144`) -/
 
 /-- **Slice → thin cast erases the length** (`evalCastPtrToPtr`): on a 64-bit layout, a
@@ -995,6 +1285,20 @@ theorem evalCastPtrToPtr_scalarPair_to_thin (locals : List LocalSlot) (op : Oper
   unfold evalCastPtrToPtr
   simp only [hPB, hOp, hA, hMeta, hThin, Nat.beq_refl, Bool.and_self]
 
+/-- **Scalar-address trait-object → thin cast erases the vtable** (4th wide-pointer shape
+of `evalCastPtrToPtr`: `.aggregate 0 [.scalar addrSc, .ptr vt 8]`). -/
+theorem evalCastPtrToPtr_scalarDyn_to_thin (locals : List LocalSlot) (op : Operand) (targetTy : Ty)
+    (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable) (addrSc : ScalarInt)
+    (vt : ProvenancePtr) (locals' : List LocalSlot)
+    (hPB : layoutPointerBytes layouts = 8)
+    (hOp : evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.scalar addrSc, .ptr vt 8]) locals')
+    (hA : addrSc.sizeBytes = 8) (hThin : isThinRawPtrTy targetTy = true) :
+    evalCastPtrToPtr locals op targetTy mem decls layouts =
+      .ok (.scalar ⟨wrapScalarBits addrSc.bits (scalarModulus 8), 8⟩) locals' mem := by
+  unfold evalCastPtrToPtr
+  simp only [hPB, hOp, hA, hThin, Nat.beq_refl, Bool.and_self]
+
 /-- An unborrowed (heap / global) pointer's comparison address is `ptrToAddrScalar`. -/
 theorem ptrAddressScalar?_unborrowed (locals : List LocalSlot) (borrows : List BorrowEntry)
     (callerLocals : List LocalSlot) (decls : List LocalDecl) (layouts : LayoutTable)
@@ -1037,6 +1341,171 @@ theorem evalRvalue_thinPtr_eq (locals : List LocalSlot) (mem : Memory) (decls : 
   simp only [evalRvalue, h1, h2, hRel,
     ptrAddressScalar?_unborrowed _ _ _ _ _ _ _ _ _ hB1,
     ptrAddressScalar?_unborrowed _ _ _ _ _ _ _ _ _ hB2]
+
+/-- **Thin 64-bit scalar-address `==` compares only address bits** (composing directly with
+`evalCastPtrToPtr_scalarPair_to_thin` and `evalCastPtrToPtr_scalarDyn_to_thin`). -/
+theorem evalRvalue_thinScalar_eq (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl)
+    (layouts : LayoutTable) (lhsOp rhsOp : Operand) (sc₁ sc₂ : ScalarInt)
+    (l₁ l₂ : List LocalSlot)
+    (h1 : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.scalar sc₁) l₁)
+    (h2 : evalOperand l₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.scalar sc₂) l₂)
+    (hSz1 : sc₁.sizeBytes = 8) (hSz2 : sc₂.sizeBytes = 8) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      .ok (.scalar (boolToScalar (Nat.beq sc₁.bits sc₂.bits))) l₂ mem := by
+  simp only [evalRvalue, h1, h2, evalScalarBinOp, hSz1, hSz2]
+
+private theorem resolveWideWordScalar?_ptr_unborrowed (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    (layouts : LayoutTable) (p : ProvenancePtr) (callStack : List SavedCallerFrame)
+    (hB : lookupBorrow borrows p.tag = none) :
+    resolveWideWordScalar? (.ptr p 8) locals borrows callerLocals decls layouts 8 callStack =
+      some (ptrToAddrScalar p 8) := by
+  simp only [resolveWideWordScalar?, ptrAddressScalar?_unborrowed _ _ _ _ _ _ _ _ _ hB]
+
+private theorem resolveWideWordScalar?_scalar8 (locals : List LocalSlot)
+    (borrows : List BorrowEntry) (callerLocals : List LocalSlot) (decls : List LocalDecl)
+    (layouts : LayoutTable) (sc : ScalarInt) (callStack : List SavedCallerFrame)
+    (hSz : sc.sizeBytes = 8) :
+    resolveWideWordScalar? (.scalar sc) locals borrows callerLocals decls layouts 8 callStack =
+      some ⟨wrapScalarBits sc.bits (scalarModulus 8), 8⟩ := by
+  simp only [resolveWideWordScalar?, hSz, Nat.beq_refl]
+
+private theorem evalWidePtrRelBinOp_eq_of_resolved (lhsThin lhsMeta rhsThin rhsMeta : Value)
+    (l₂ : List LocalSlot) (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable)
+    (a₁ a₂ m₁ m₂ : ScalarInt)
+    (ha₁ : resolveWideWordScalar? lhsThin l₂ mem.borrows mem.callerLocals decls layouts 8 mem.callStack = some a₁)
+    (ha₂ : resolveWideWordScalar? rhsThin l₂ mem.borrows mem.callerLocals decls layouts 8 mem.callStack = some a₂)
+    (hm₁ : resolveWideWordScalar? lhsMeta l₂ mem.borrows mem.callerLocals decls layouts 8 mem.callStack = some m₁)
+    (hm₂ : resolveWideWordScalar? rhsMeta l₂ mem.borrows mem.callerLocals decls layouts 8 mem.callStack = some m₂)
+    (hszA1 : a₁.sizeBytes = 8) (hszA2 : a₂.sizeBytes = 8)
+    (hszM1 : m₁.sizeBytes = 8) (hszM2 : m₂.sizeBytes = 8) :
+    evalWidePtrRelBinOp .eq lhsThin lhsMeta rhsThin rhsMeta l₂ mem decls layouts 8 =
+      .ok (.scalar (boolToScalar (Nat.beq a₁.bits a₂.bits && Nat.beq m₁.bits m₂.bits))) l₂ mem := by
+  simp only [evalWidePtrRelBinOp, ha₁, ha₂, hm₁, hm₂]
+  cases h : Nat.beq a₁.bits a₂.bits with
+  | false => simp only [Bool.false_and, evalScalarBinOp, hszA1, hszA2, h]
+  | true => simp only [Bool.true_and, evalScalarBinOp, hszM1, hszM2]
+
+/-- **Universal full wide slice-pointer `==` distinguishes length metadata** (`evalRvalue`
+→ `evalWidePtrAggregateRelBinOp` → `evalWidePtrRelBinOp`, matching MiniRust
+`evalWideEqM_slice` and Case `24`): compares BOTH `ptrToAddrScalar p 8` AND wrapped
+`len.bits`. -/
+theorem evalRvalue_wideSlice_eq (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl)
+    (layouts : LayoutTable) (lhsOp rhsOp : Operand) (p₁ p₂ : ProvenancePtr)
+    (len₁ len₂ : ScalarInt) (l₁ l₂ : List LocalSlot)
+    (hPB : layoutPointerBytes layouts = 8)
+    (h1 : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₁ 8, .scalar len₁]) l₁)
+    (h2 : evalOperand l₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₂ 8, .scalar len₂]) l₂)
+    (hPtrTy : isPtrOrUntypedOperand decls layouts lhsOp = true)
+    (hL1 : len₁.sizeBytes = 8) (hL2 : len₂.sizeBytes = 8)
+    (hB1 : lookupBorrow mem.borrows p₁.tag = none) (hB2 : lookupBorrow mem.borrows p₂.tag = none) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      .ok (.scalar (boolToScalar
+        (Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits &&
+          Nat.beq (wrapScalarBits len₁.bits (scalarModulus 8))
+            (wrapScalarBits len₂.bits (scalarModulus 8))))) l₂ mem := by
+  have hStep : evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      evalWidePtrRelBinOp .eq (.ptr p₁ 8) (.scalar len₁) (.ptr p₂ 8) (.scalar len₂)
+        l₂ mem decls layouts 8 := by
+    simp only [evalRvalue, h1, h2, evalWidePtrAggregateRelBinOp, hPtrTy, hPB]
+    cases isExplicitWidePtrTy (operandTy decls layouts lhsOp) <;> rfl
+  rw [hStep]
+  exact evalWidePtrRelBinOp_eq_of_resolved _ _ _ _ l₂ mem decls layouts
+    (ptrToAddrScalar p₁ 8) (ptrToAddrScalar p₂ 8)
+    ⟨wrapScalarBits len₁.bits (scalarModulus 8), 8⟩ ⟨wrapScalarBits len₂.bits (scalarModulus 8), 8⟩
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hB1)
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hB2)
+    (resolveWideWordScalar?_scalar8 _ _ _ _ _ _ _ hL1)
+    (resolveWideWordScalar?_scalar8 _ _ _ _ _ _ _ hL2) rfl rfl rfl rfl
+
+/-- **Universal full wide trait-object `==` distinguishes vtable pointers** (`evalRvalue`
+→ `evalWidePtrAggregateRelBinOp` → `evalWidePtrRelBinOp`, matching MiniRust
+`evalWideEqM_vtable` and Case `26`): compares BOTH `ptrToAddrScalar p 8` AND
+`ptrToAddrScalar vt 8`. -/
+theorem evalRvalue_wideDyn_eq (locals : List LocalSlot) (mem : Memory) (decls : List LocalDecl)
+    (layouts : LayoutTable) (lhsOp rhsOp : Operand) (p₁ p₂ vt₁ vt₂ : ProvenancePtr)
+    (l₁ l₂ : List LocalSlot)
+    (hPB : layoutPointerBytes layouts = 8)
+    (h1 : evalOperand locals lhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₁ 8, .ptr vt₁ 8]) l₁)
+    (h2 : evalOperand l₁ rhsOp mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₂ 8, .ptr vt₂ 8]) l₂)
+    (hPtrTy : isPtrOrUntypedOperand decls layouts lhsOp = true)
+    (hB1 : lookupBorrow mem.borrows p₁.tag = none) (hB2 : lookupBorrow mem.borrows p₂.tag = none)
+    (hV1 : lookupBorrow mem.borrows vt₁.tag = none) (hV2 : lookupBorrow mem.borrows vt₂.tag = none) :
+    evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      .ok (.scalar (boolToScalar
+        (Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits &&
+          Nat.beq (ptrToAddrScalar vt₁ 8).bits (ptrToAddrScalar vt₂ 8).bits))) l₂ mem := by
+  have hStep : evalRvalue locals (.binaryOp .eq lhsOp rhsOp) mem decls layouts =
+      evalWidePtrRelBinOp .eq (.ptr p₁ 8) (.ptr vt₁ 8) (.ptr p₂ 8) (.ptr vt₂ 8)
+        l₂ mem decls layouts 8 := by
+    simp only [evalRvalue, h1, h2, evalWidePtrAggregateRelBinOp, hPtrTy, hPB]
+    cases isExplicitWidePtrTy (operandTy decls layouts lhsOp) <;> rfl
+  rw [hStep]
+  exact evalWidePtrRelBinOp_eq_of_resolved _ _ _ _ l₂ mem decls layouts
+    (ptrToAddrScalar p₁ 8) (ptrToAddrScalar p₂ 8)
+    (ptrToAddrScalar vt₁ 8) (ptrToAddrScalar vt₂ 8)
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hB1)
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hB2)
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hV1)
+    (resolveWideWordScalar?_ptr_unborrowed _ _ _ _ _ _ _ hV2) rfl rfl rfl rfl
+
+/-- **Universal 2-step `ptr::addr_eq` composition** (`evalCastPtrToPtr` + `evalRvalue`
+`.binaryOp .eq`, polymorphic across EVERY MiniRust memory `M` — `BasicMemory` and
+`TreeBorrowsMemory` alike — matching `evalAddrEqM_ptr` across heterogeneous metadata and
+distinct provenance tags): casting a slice wide pointer `(p₁, metaSc)` and a trait-object
+wide pointer `(p₂, vt)` to thin raw pointers discards both metadata words and compares
+strictly `ptrToAddrScalar p₁ 8` vs `ptrToAddrScalar p₂ 8`. -/
+theorem evalCast_then_thinEq_erases_meta_and_prov
+    (locals locals₁ locals₂ locals₃ : List LocalSlot)
+    (wOp₁ wOp₂ tOp₁ tOp₂ : Operand) (targetTy : Ty)
+    (mem : Memory) (decls : List LocalDecl) (layouts : LayoutTable)
+    (p₁ p₂ vt : ProvenancePtr) (metaSc : ScalarInt)
+    (hPB : layoutPointerBytes layouts = 8) (hThin : isThinRawPtrTy targetTy = true)
+    (hMeta : metaSc.sizeBytes = 8)
+    (hB1 : lookupBorrow mem.borrows p₁.tag = none) (hB2 : lookupBorrow mem.borrows p₂.tag = none)
+    (hW1 : evalOperand locals wOp₁ mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₁ 8, .scalar metaSc]) locals₁)
+    (hW2 : evalOperand locals₁ wOp₂ mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.aggregate 0 [.ptr p₂ 8, .ptr vt 8]) locals₂)
+    (hT1 : evalOperand locals₂ tOp₁ mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.ptr p₁ 8) locals₂)
+    (hT2 : evalOperand locals₂ tOp₂ mem.borrows mem.globals layouts mem.callerLocals decls
+      mem.callStack = .ok (.ptr p₂ 8) locals₃)
+    (hRel : isPtrRelationalBinOp .eq decls layouts tOp₁ tOp₂ = true) :
+    evalCastPtrToPtr locals wOp₁ targetTy mem decls layouts = .ok (.ptr p₁ 8) locals₁ mem ∧
+    evalCastPtrToPtr locals₁ wOp₂ targetTy mem decls layouts = .ok (.ptr p₂ 8) locals₂ mem ∧
+    evalRvalue locals₂ (.binaryOp .eq tOp₁ tOp₂) mem decls layouts =
+      .ok (.scalar (boolToScalar
+        (Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits))) locals₃ mem ∧
+    (∀ (M : Type) [MiniRustSpec.Gen.Memory M] [MiniRustSpec.Interp.MemoryOps M]
+       (prov₁ prov₂ : Option (MiniRustSpec.Gen.Memory.Provenance M))
+       (m₁ m₂ : Option (MiniRustSpec.Gen.PointerMeta (MiniRustSpec.Gen.Memory.Provenance M)))
+       (ty₁ ty₂ : MiniRustSpec.Gen.«Type»),
+      MiniRustSpec.HeapAllocAndWidePtrMR.evalAddrEqM (M := M)
+          (.Ptr ⟨⟨Int.ofNat (ptrToAddrScalar p₁ 8).bits, prov₁⟩, m₁⟩, ty₁)
+          (.Ptr ⟨⟨Int.ofNat (ptrToAddrScalar p₂ 8).bits, prov₂⟩, m₂⟩, ty₂) =
+        Except.ok (.Bool (Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits), .Bool)) := by
+  refine ⟨evalCastPtrToPtr_slice_to_thin _ _ _ _ _ _ _ _ _ hPB hW1 hMeta hThin hB1,
+    evalCastPtrToPtr_dyn_to_thin _ _ _ _ _ _ _ _ _ hPB hW2 hThin,
+    evalRvalue_thinPtr_eq _ _ _ _ _ _ _ _ _ _ hT1 hT2 hRel hB1 hB2, ?_⟩
+  intro M _ _ prov₁ prov₂ m₁ m₂ ty₁ ty₂
+  rw [MiniRustSpec.HeapAllocAndWidePtrMR.evalAddrEqM_ptr]
+  have hDec : decide (Int.ofNat (ptrToAddrScalar p₁ 8).bits = Int.ofNat (ptrToAddrScalar p₂ 8).bits) =
+      Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits := by
+    cases h : Nat.beq (ptrToAddrScalar p₁ 8).bits (ptrToAddrScalar p₂ 8).bits with
+    | true =>
+      have heq := Nat.eq_of_beq_eq_true h
+      rw [heq]; exact decide_eq_true rfl
+    | false =>
+      have hne := Nat.ne_of_beq_eq_false h
+      exact decide_eq_false (fun hi => hne (Int.ofNat.inj hi))
+  rw [hDec]
 
 /-! #### Concrete `evalRvalue` / `stepMirFn` executions (cases `23..27`) -/
 
@@ -1144,24 +1613,30 @@ end TrustedBridge
 /-! ## §7. Episode 2 Capstone -/
 
 open Trusted.Rustc.V2026_06_01.MirSemantics (preventsDeallocation hasFrameDeallocProtectorConflict
-  hasProtectedLocalBorrow evalTerminator evalTailCallTerminator evalCastPtrToPtr evalRvalue
-  ptrToAddrScalar ptrAddressScalar? stepMirFn) in
+  hasProtectedLocalBorrow evalTerminator evalTailCallTerminator evalStmt restoreCallerProtectors
+  evalCastPtrToPtr evalRvalue ptrToAddrScalar ptrAddressScalar? stepMirFn) in
 /-- **Episode 2 Dual-Authority Heap Allocation & Wide-Pointer Capstone.** For every
 contract `c` (closed across roots over `LeanMiriSpec.HeapAllocAndWidePtrLM` in
 `tests/mir/HeapAllocAndWidePtrDualSpecTests.lean`):
-1. choice-free codec laws and the wire-level exact divergence set;
+1. choice-free codec laws (incl. malformed-tuple rejection and `ofMrObs`/`toMrObs`
+   bijection) and the wire-level exact divergence set;
 2. Episode 1's universal MiniRust laws (`ep1_minirust_heap_wide_capstone`);
-3. the 60-cell MiniRust table, exact agreement on `0..27`, the exact `↔` divergence set
-   `{28, 29}` with explicit witnesses, joint Tree Borrows mode sensitivity on `19`, `21`,
-   and `StaticAllocator` / leak / `addr_eq` agreement;
+3. the 60-cell MiniRust table, out-of-range guard, exact agreement on `0..27`, the exact
+   `↔` divergence set `{28, 29}` with explicit witnesses, joint Tree Borrows mode
+   sensitivity on `19`, `21`, full MR mode-sensitivity `↔`, and `StaticAllocator` / leak /
+   `addr_eq` agreement (`13..17, 23..27`);
 4. both threaded traces (lifecycle and mode-sensitive protector);
 5. the direct bridge to unmodified `Trusted.Rustc.V2026_06_01.MirSemantics`:
    `preventsDeallocation` ↔ MiniRust `prevents_deallocation`, universal
-   `hasFrameDeallocProtectorConflict` / `hasProtectedLocalBorrow` characterizations,
-   `evalTerminator` `.return_` / `evalTailCallTerminator` faults, concrete `stepMirFn`
-   protector verdicts equal to MiniRust's on `19`, `20`, `22`, universal
-   `evalCastPtrToPtr` metadata erasure, `evalRvalue` thin `==` on `ptrToAddrScalar`, and
-   concrete `stepMirFn` `addr_eq` / `==` verdicts equal to MiniRust's on `23..27`. -/
+   `hasFrameDeallocProtectorConflict` & `hasProtectedLocalBorrow` ↔ MiniRust
+   `Node::contains_strong_protector_preventing_deallocation`, `evalTerminator` `.return_`
+   (including callee-return `restoreCallerProtectors` release), `evalTailCallTerminator`,
+   and `evalStmt` `.storageDead`/`.storageLive` protector laws + concrete `stepMirFn`
+   verdicts equal to MiniRust's on `19`, `20`, `22`, universal `evalCastPtrToPtr` metadata
+   erasure (all 4 wide shapes), universal `evalRvalue` thin `==` and full wide slice /
+   `dyn Trait` `==` (`evalWidePtrAggregateRelBinOp` / `evalWidePtrRelBinOp`), composed
+   cast-then-`==` equivalence with MiniRust `evalAddrEqM_ptr`, and concrete `stepMirFn`
+   `addr_eq` / `==` verdicts equal to MiniRust's on `23..27`. -/
 theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualContract) :
     (heapWideOutcomeCodec.TightValidRep ∧
       (∀ a₁ a₂ : HeapWideObs, heapWideOutcomeCodec.encode a₁ = heapWideOutcomeCodec.encode a₂ →
@@ -1169,6 +1644,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (∀ (b₁ b₂ : HeapWideOutcomeRep) (a : HeapWideObs), heapWideOutcomeCodec.ValidRep b₁ →
         heapWideOutcomeCodec.ValidRep b₂ → heapWideOutcomeCodec.decode b₁ = some a →
         heapWideOutcomeCodec.decode b₂ = some a → b₁ = b₂) ∧
+      (type_of% @heapWideOutcomeCodec_rejects_malformed) ∧
+      (type_of% @ofMrObs_toMrObs) ∧ (type_of% @toMrObs_ofMrObs) ∧
       (∀ (m : HeapWideMemoryMode) (idx : Nat), idx < canonicalCaseCount →
         (heapWideOutcomeCodec.encode (mrObserve m idx) =
           heapWideOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ↔
@@ -1176,6 +1653,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
     ((type_of% @ep1_minirust_heap_wide_capstone) ∧ (type_of% @mr_addrEq_wideEq_bm_bridge)) ∧
     ((∀ (m : HeapWideMemoryMode) (idx : Nat), idx < canonicalCaseCount →
         mrObserve m idx = mrExpected m idx) ∧
+      (type_of% @mrObserve_out_of_range) ∧
+      (type_of% @mr_mode_sensitivity) ∧
       (∀ (m : HeapWideMemoryMode) (idx : Nat), idx < canonicalCaseCount →
         caseClass idx = .exactAgreement → mrObserve m idx = c.lm.observe m.toLmTreeBorrows idx) ∧
       (∀ (m : HeapWideMemoryMode) (idx : Nat), idx < canonicalCaseCount →
@@ -1186,7 +1665,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       ((mrObserve .basic 19 = c.lm.observe false 19 ∧ mrObserve .basic 19 = .okDealloc ∧
           mrObserve .treeBorrows 19 = c.lm.observe true 19 ∧ c.lm.observe true 19 = .ub) ∧
         (mrObserve .basic 21 = c.lm.observe false 21 ∧ mrObserve .basic 21 = .okDealloc ∧
-          mrObserve .treeBorrows 21 = c.lm.observe true 21 ∧ c.lm.observe true 21 = .ub))) ∧
+          mrObserve .treeBorrows 21 = c.lm.observe true 21 ∧ c.lm.observe true 21 = .ub)) ∧
+      (∀ m, type_of% (contract_static_leak_wide_agreement c m))) ∧
     ((∀ m, c.lmLifecycle m.toLmTreeBorrows = mrLifecycleTrace m) ∧
       (∀ m, c.lmProtector m.toLmTreeBorrows = mrProtectorTrace m) ∧
       c.lmProtector false ≠ c.lmProtector true ∧
@@ -1195,35 +1675,60 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       c.lmProtector true = protectorExpected .treeBorrows) ∧
     ((type_of% @preventsDeallocation_eq_mr) ∧
       (type_of% @mr_prevents_deallocation_iff_trusted) ∧
+      (type_of% @hasFrameDeallocProtectorConflict_eq_mr_node) ∧
+      (type_of% @hasProtectedLocalBorrow_eq_mr_node) ∧
       (type_of% @hasFrameDeallocProtectorConflict_iff) ∧
       (type_of% @hasFrameDeallocProtectorConflict_nil_protectors) ∧
       (type_of% @hasProtectedLocalBorrow_iff) ∧
       (type_of% @isBorrowProtected_released) ∧
       (type_of% @evalTerminator_return_protector_ub) ∧
       (type_of% @evalTerminator_return_no_conflict_root) ∧
+      (type_of% @evalTerminator_callee_return_releases_protector) ∧
       (type_of% @evalTailCallTerminator_protector_ub) ∧
+      (type_of% @evalStmt_storageDead_protector_ub) ∧
+      (type_of% @evalStmt_storageDead_no_conflict_steps) ∧
+      (type_of% @evalStmt_storageLive_protector_ub) ∧
+      (type_of% @trustedTeardown_table) ∧
       (type_of% @trusted_protector_cases_match_mr) ∧
+      (type_of% @trustedStorageDead_and_release_table) ∧
       (type_of% @evalCastPtrToPtr_slice_to_thin) ∧
       (type_of% @evalCastPtrToPtr_dyn_to_thin) ∧
       (type_of% @evalCastPtrToPtr_scalarPair_to_thin) ∧
+      (type_of% @evalCastPtrToPtr_scalarDyn_to_thin) ∧
       (type_of% @ptrAddressScalar?_unborrowed) ∧
+      (type_of% @ptrToAddrScalar_addr_only) ∧
       (type_of% @evalRvalue_thinPtr_eq) ∧
+      (type_of% @evalRvalue_thinScalar_eq) ∧
+      (type_of% @evalRvalue_wideSlice_eq) ∧
+      (type_of% @evalRvalue_wideDyn_eq) ∧
+      (type_of% @evalCast_then_thinEq_erases_meta_and_prov) ∧
+      (type_of% @trustedRvalue_witnesses) ∧
       (type_of% @trusted_wide_cases_match_mr)) :=
   ⟨⟨heapWideOutcomeCodec_tight, fun _ _ h => heapWideOutcomeCodec_encode_injective h,
       fun _ _ _ hv₁ hv₂ hd₁ hd₂ => heapWideOutcomeCodec_decode_injective_on_valid hv₁ hv₂ hd₁ hd₂,
+      heapWideOutcomeCodec_rejects_malformed, ofMrObs_toMrObs, toMrObs_ofMrObs,
       contract_wire_divergence_exact c⟩,
     ⟨c.mr_ep1_capstone, mr_addrEq_wideEq_bm_bridge⟩,
-    ⟨c.mr_matches, c.agreement_zone_exact, contract_divergence_set_exact c, c.divergence_explicit,
-      c.mode_sensitivity_joint⟩,
+    ⟨c.mr_matches, mrObserve_out_of_range, mr_mode_sensitivity, c.agreement_zone_exact,
+      contract_divergence_set_exact c, c.divergence_explicit, c.mode_sensitivity_joint,
+      contract_static_leak_wide_agreement c⟩,
     contract_traces c,
     ⟨@preventsDeallocation_eq_mr, @mr_prevents_deallocation_iff_trusted,
+      @hasFrameDeallocProtectorConflict_eq_mr_node, @hasProtectedLocalBorrow_eq_mr_node,
       @hasFrameDeallocProtectorConflict_iff, @hasFrameDeallocProtectorConflict_nil_protectors,
       @hasProtectedLocalBorrow_iff, @isBorrowProtected_released,
       @evalTerminator_return_protector_ub, @evalTerminator_return_no_conflict_root,
-      @evalTailCallTerminator_protector_ub, @trusted_protector_cases_match_mr,
+      @evalTerminator_callee_return_releases_protector, @evalTailCallTerminator_protector_ub,
+      @evalStmt_storageDead_protector_ub, @evalStmt_storageDead_no_conflict_steps,
+      @evalStmt_storageLive_protector_ub, @trustedTeardown_table,
+      @trusted_protector_cases_match_mr, @trustedStorageDead_and_release_table,
       @evalCastPtrToPtr_slice_to_thin, @evalCastPtrToPtr_dyn_to_thin,
-      @evalCastPtrToPtr_scalarPair_to_thin, @ptrAddressScalar?_unborrowed,
-      @evalRvalue_thinPtr_eq, @trusted_wide_cases_match_mr⟩⟩
+      @evalCastPtrToPtr_scalarPair_to_thin, @evalCastPtrToPtr_scalarDyn_to_thin,
+      @ptrAddressScalar?_unborrowed, @ptrToAddrScalar_addr_only,
+      @evalRvalue_thinPtr_eq, @evalRvalue_thinScalar_eq,
+      @evalRvalue_wideSlice_eq, @evalRvalue_wideDyn_eq,
+      @evalCast_then_thinEq_erases_meta_and_prov, @trustedRvalue_witnesses,
+      @trusted_wide_cases_match_mr⟩⟩
 
 /-! ## §8. Import-Isolation, Constructive-Codec, Bridge-Reality & Axiom Audit -/
 
@@ -1241,33 +1746,48 @@ run_cmd do
   for modName in env.header.moduleNames do
     if (`Miri).isPrefixOf modName || (`LeanMiriSpec).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported"
-  -- 3. Constructive codec layer is choice-free.
+  -- 3. Constructive codec & authority-check layer is choice-free.
   let ns := `Anneal.Mir.HeapAllocAndWidePtrDualSpec
   let constructiveDecls : List Lean.Name :=
     [ ns ++ `heapWideOutcomeCodec, ns ++ `heapWideOutcomeCodec_tight,
       ns ++ `heapWideOutcomeCodec_encode_injective,
       ns ++ `heapWideOutcomeCodec_decode_injective_on_valid, ns ++ `heapWideDecode_canonical,
-      ns ++ `ofMrObs_toMrObs, ns ++ `toMrObs_ofMrObs,
+      ns ++ `heapWideOutcomeCodec_rejects_malformed,
+      ns ++ `ofMrObs_toMrObs, ns ++ `toMrObs_ofMrObs, ns ++ `ofMrObs_injective,
       ns ++ `HeapWideMemoryMode.of_toLmTreeBorrows, ns ++ `HeapWideMemoryMode.to_ofLmTreeBorrows,
-      ns ++ `lmAuthorityCheck_sound ]
+      ns ++ `range_map_cell, ns ++ `expected_agreement_zone, ns ++ `caseClass_agreement_iff,
+      ns ++ `divergesAt_iff_class, ns ++ `lmAuthorityCheck_sound, ns ++ `lmAuthorityOfCheck ]
   for c in constructiveDecls do
     unless env.contains c do throwError "constructive audit: {c} missing"
     for a in ← liftCoreM <| Lean.collectAxioms c do
       unless a == ``propext || a == ``Quot.sound do
         throwError "constructive codec {c} must not depend on {a}"
-  -- 4. The bridge theorems are stated on the REAL Trusted definitions (zero shadow evaluators).
+  -- 4. The bridge theorems are stated on the REAL Trusted & MiniRust definitions (zero shadow evaluators).
   let bridgeReq : List (Lean.Name × Lean.Name) :=
     [ (ns ++ `preventsDeallocation_eq_mr, `Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation),
-      (ns ++ `hasFrameDeallocProtectorConflict_iff,
+      (ns ++ `hasFrameDeallocProtectorConflict_eq_mr_node,
         `Trusted.Rustc.V2026_06_01.MirSemantics.hasFrameDeallocProtectorConflict),
-      (ns ++ `hasProtectedLocalBorrow_iff, `Trusted.Rustc.V2026_06_01.MirSemantics.hasProtectedLocalBorrow),
+      (ns ++ `hasFrameDeallocProtectorConflict_eq_mr_node,
+        `MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation),
+      (ns ++ `hasProtectedLocalBorrow_eq_mr_node,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.hasProtectedLocalBorrow),
+      (ns ++ `hasProtectedLocalBorrow_eq_mr_node,
+        `MiniRustSpec.Interp.Node.contains_strong_protector_preventing_deallocation),
       (ns ++ `evalTerminator_return_protector_ub, `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator),
+      (ns ++ `evalTerminator_callee_return_releases_protector,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors),
       (ns ++ `evalTailCallTerminator_protector_ub,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalTailCallTerminator),
+      (ns ++ `evalStmt_storageDead_protector_ub, `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt),
+      (ns ++ `evalStmt_storageLive_protector_ub, `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt),
       (ns ++ `evalCastPtrToPtr_slice_to_thin, `Trusted.Rustc.V2026_06_01.MirSemantics.evalCastPtrToPtr),
+      (ns ++ `evalCastPtrToPtr_scalarDyn_to_thin, `Trusted.Rustc.V2026_06_01.MirSemantics.evalCastPtrToPtr),
       (ns ++ `evalRvalue_thinPtr_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue),
       (ns ++ `evalRvalue_thinPtr_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.ptrToAddrScalar),
+      (ns ++ `evalRvalue_wideSlice_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue),
+      (ns ++ `evalRvalue_wideDyn_eq, `Trusted.Rustc.V2026_06_01.MirSemantics.evalRvalue),
       (ns ++ `trustedTeardown_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
+      (ns ++ `trustedStorageDead_and_release_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn),
       (ns ++ `trustedCmp_table, `Trusted.Rustc.V2026_06_01.MirSemantics.stepMirFn) ]
   for (thm, req) in bridgeReq do
     let some ci := env.find? thm | throwError "bridge audit: {thm} missing"
@@ -1299,7 +1819,7 @@ run_cmd do
     let last := c.componentsRev.head!.toString
     if (ns).isPrefixOf c && !c.isInternal && !last.startsWith "eq_" && !last.startsWith "match_" then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 55 then
+  if theorems < 65 then
     throwError "axiom audit is vacuous: only {theorems} authored theorems seen"
   logInfo m!"Anneal.Mir.HeapAllocAndWidePtrDualSpec: verified {checked} declarations ({theorems} authored theorems), constructive codecs choice-free, bridge on real Trusted.Rustc.V2026_06_01.MirSemantics, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 
