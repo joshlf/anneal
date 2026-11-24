@@ -623,6 +623,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
     code_tail = ""
     last_raw_char = ""
     cur_ident = ""
+    qual_prefix = ""
     after_interp_prefix = False
     trace_bracket_depth = 0
     trace_bracket_valid = False
@@ -631,7 +632,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
     guillemet_buf: list[str] = []
 
     def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
-        nonlocal after_interp_prefix, cur_ident, trace_bracket_depth, trace_bracket_valid
+        nonlocal after_interp_prefix, cur_ident, qual_prefix, trace_bracket_depth, trace_bracket_valid
         nonlocal trace_bracket_seen_ident, trace_bracket_closed_ident
         sep = " " if prev == "escIdent" else ""
         if prev == "ident" and _is_id_rest(c):
@@ -643,6 +644,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             if c in ("'", '"', "#") or ("0" <= c <= "9"):
                 raise ValueError("literal glued to a symbol keyword")
             cur_ident = ""
+            qual_prefix = ""
             after_interp_prefix = False
             if trace_bracket_depth > 0:
                 trace_bracket_valid = False
@@ -653,9 +655,12 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             after_interp_prefix = False
             if prev == "sym":
                 cur_ident = ""
+                qual_prefix = ""
                 if trace_bracket_depth > 0:
                     trace_bracket_valid = False
                 return (("code", "symIdent"), _visible(c), c)
+            if prev != "identDot":
+                qual_prefix = "." if prev == "dot" else ""
             if trace_bracket_depth > 0:
                 if trace_bracket_closed_ident:
                     trace_bracket_valid = False
@@ -672,9 +677,16 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 after_interp_prefix = cur_ident in BUILTIN_INTERP_PREFIXES
             return (("code", "ident"), sep + _visible(c), c)
         prev_ident = cur_ident
+        prev_qual = qual_prefix
         cur_ident = ""
         if c == ".":
             after_interp_prefix = False
+            if prev == "ident":
+                qual_prefix = prev_qual + prev_ident + "."
+            elif prev == "escIdent":
+                qual_prefix = prev_qual + "«»."
+            else:
+                qual_prefix = "."
             if trace_bracket_depth > 0:
                 if prev in ("ident", "escIdent") and not trace_bracket_closed_ident:
                     trace_bracket_seen_ident = False
@@ -682,6 +694,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                     trace_bracket_valid = False
             nxt = "identDot" if prev in ("ident", "escIdent") else "dot"
             return (("code", nxt), ".", ".")
+        qual_prefix = ""
         if "0" <= c <= "9":
             after_interp_prefix = False
             if trace_bracket_depth > 0:
@@ -715,6 +728,7 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             return (("code", "tick"), " ", "`")
         if c == "«":
             after_interp_prefix = False
+            qual_prefix = prev_qual if prev == "identDot" else ("." if prev == "dot" else "")
             if trace_bracket_depth > 0:
                 if trace_bracket_closed_ident:
                     trace_bracket_valid = False
@@ -748,13 +762,17 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             return (("code", "other"), " @ ", "@")
         if c == "[":
             after_interp_prefix = False
+            full_trace_id = prev_qual + prev_ident
             if trace_bracket_depth > 0:
                 trace_bracket_depth += 1
                 trace_bracket_valid = False
-            elif prev in ("ident", "escIdent") and prev_ident in ("trace", "trace_goal"):
+            elif prev in ("ident", "escIdent") and (
+                full_trace_id in ("trace", "trace_goal", "Macro.trace")
+                or full_trace_id.endswith(".Macro.trace")
+            ):
                 # Lean's `Macro.trace[id]`, `trace[id]`, and `trace_goal[id]` require `[`
-                # immediately glued to `trace`/`trace_goal` and an identifier `id` (with optional
-                # surrounding whitespace/comments) inside `[...]`.
+                # immediately glued to `trace`/`trace_goal` (never arbitrary field projections
+                # `x.trace[i]` or `.trace[i]`) and an identifier `id` inside `[...]`.
                 trace_bracket_depth = 1
                 trace_bracket_valid = True
                 trace_bracket_seen_ident = False
@@ -1886,6 +1904,15 @@ def sameStoredDecl (a b : ConstantInfo) : Bool :=
       r1.ctor == r2.ctor && r1.nfields == r2.nfields && r1.rhs == r2.rhs
   | _, _ => false
 
+def hasPrivateModPrefix (pfx : Name) : Name → Bool
+  | .anonymous => false
+  | .num p _   => p == pfx || hasPrivateModPrefix pfx p
+  | .str p _   => hasPrivateModPrefix pfx p
+
+def hasValidPrivateOwner (modName : Name) (n : Name) : Bool :=
+  if !isPrivateName n then true
+  else hasPrivateModPrefix (`_private ++ modName) n
+
 def verifyPartKeysOnly (modName : Name) (data : ModuleData) : IO Unit := do
   unless data.constNames.size == data.constants.size do
     policyFail "constNamesSizeMismatch" modName #[modName]
@@ -1899,6 +1926,9 @@ def verifyPartKeysOnly (modName : Name) (data : ModuleData) : IO Unit := do
     unless k == ci.name do
       policyFail "keyNameMismatch" modName #[modName, k, ci.name]
         s!"map key {k} != ConstantInfo.name {ci.name}"
+    unless hasValidPrivateOwner modName k do
+      policyFail "keyNameMismatch" modName #[modName, k]
+        s!"private constant {k} does not belong to module {modName}"
     if seen.contains k then
       policyFail "duplicateConstName" modName #[modName, k] s!"duplicate constant name {k}"
     seen := seen.insert k
@@ -2255,6 +2285,56 @@ def isLocalNonReducibleDef (localReplayable localRedOver : NameSet)
   | some (.defnInfo dv) => dv.hints != .abbrev
   | _ => false
 
+def isNonReducibleDefInEnv (env : Environment) (c : Name) : Bool :=
+  match env.checked.get.find? c with
+  | some (.defnInfo dv) => dv.hints != .abbrev
+  | _ => false
+
+partial def evalDiscrNatLit? (e : Expr) : Option Nat :=
+  match e.consumeMData with
+  | .lit (.natVal n) => some n
+  | .const ``Nat.zero _ => some 0
+  | .app f a =>
+    if f.consumeMData.isConstOf ``Nat.succ then
+      (evalDiscrNatLit? a).map (· + 1)
+    else
+      let fn := e.getAppFn.consumeMData
+      let args := e.getAppArgs
+      if fn.isConstOf ``OfNat.ofNat && args.size >= 2 then
+        evalDiscrNatLit? args[1]!
+      else
+        none
+  | _ => none
+
+def paramAllowsStarMask (env : Environment) (c : Name) (lvls : List Level)
+    (args : Array Expr) : Array Bool := Id.run do
+  let some ci := env.checked.get.find? c
+    | return Array.replicate args.size true
+  if ci.levelParams.length != lvls.length then
+    return Array.replicate args.size true
+  let mut curTy := ci.type.instantiateLevelParams ci.levelParams lvls
+  let mut mask : Array Bool := #[]
+  for i in [:args.size] do
+    match whnfKeepParamWrappers env 64 curTy with
+    | none => mask := mask.push true
+    | some (.forallE _ dom body bi) =>
+      let isInst := bi == .instImplicit
+      let isNoSpec := (Lean.annotation? `nospecialize dom).isSome
+      let isPropDom := match whnfKeepParamWrappers env 64 dom with
+        | some dWhnf =>
+          match dWhnf.consumeMData with
+          | .sort .zero => true
+          | _ =>
+            if dWhnf.getAppFn.consumeMData.isConstOf ``outParam && dWhnf.getAppNumArgs == 1 then
+              dWhnf.getAppArgs[0]!.consumeMData == .sort .zero
+            else false
+        | none => false
+      mask := mask.push (isInst || isNoSpec || isPropDom)
+      curTy := body.instantiate1 args[i]!
+    | some _ =>
+      mask := mask.push true
+  return mask
+
 partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (e : Expr) : Bool :=
   if (Lean.annotation? `noindex e).isSome then
@@ -2266,7 +2346,8 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
     | .forallE _ d b _ =>
       hasRigidBaseAnchor env localReplayable localRedOver byName d ||
       hasRigidBaseAnchor env localReplayable localRedOver byName b
-    | .lam _ _ b _ =>
+    | .lam _ d b _ =>
+      hasRigidBaseAnchor env localReplayable localRedOver byName d ||
       hasRigidBaseAnchor env localReplayable localRedOver byName b
     | .app f a =>
       match e.getAppFn with
@@ -2278,46 +2359,86 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
       | _ => false
     | _ => false
 
-/-- Verifies the domain key subtree of a `.forallE _ d b _` arrow whose local anchor sits in
-    the codomain `b` (e.g. `Inhabited (Nat → LocalAnchor)`). Rejects forged `.star` wildcards
-    on rigid closed domains like `Nat`, while permitting `.star` on bound variables or `no_index`. -/
-def keySubtreeMatchesArrowDomain (env : Environment) (localReplayable localRedOver : NameSet)
+/-- Recursively verifies a non-anchor `DiscrTree.Key` subtree (such as the domain `d` of `d → b`
+    when the local anchor sits in `b`, or sibling arguments `Nat` in `Prod Nat LocalAnchor` /
+    `HAdd Nat LocalAnchor LocalAnchor`). Rejects forged `.star` wildcards on rigid closed
+    subterms (`Option Nat → LocalAnchor`, `(Nat → Bool) → LocalAnchor`, `Prod Nat LocalAnchor`),
+    while preserving `Fin 8` `OfNat` literals, semireducible definitions, `[Inst]`/proof args,
+    polymorphic `.bvar`s, and `no_index`. Note `normD` is already deeply normalized by `normExprInEnv`. -/
+partial def keySubtreeMatchesNonAnchorExpr (env : Environment) (localReplayable localRedOver : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (rawD normD : Expr)
-    (domSub : Array Meta.DiscrTree.Key) : Bool :=
+    (domSub : Array Meta.DiscrTree.Key) (allowParamStar : Bool := false) : Bool :=
   if domSub.isEmpty then false
-  else if (Lean.annotation? `noindex normD).isSome then
+  else if allowParamStar && domSub == #[Meta.DiscrTree.Key.star] then
+    true
+  else if (Lean.annotation? `noindex rawD).isSome || (Lean.annotation? `noindex normD).isSome then
     domSub == #[Meta.DiscrTree.Key.star]
   else
     let rD := rawD.consumeMData
     let nD := normD.consumeMData
-    let matchesLocalAlias := match rD.getAppFn.consumeMData with
-      | .const rc _ =>
-        isLocalNonReducibleDef localReplayable localRedOver byName rc &&
-        domSub[0]! == Meta.DiscrTree.Key.const rc rD.getAppNumArgs
-      | _ => false
-    if matchesLocalAlias then true
-    else match nD with
-      | .const dc _ =>
-        if isRigidHeadInEnv env dc then domSub == #[Meta.DiscrTree.Key.const dc 0]
-        else true
-      | .app .. =>
-        match nD.getAppFn.consumeMData with
+    let matchesNatLit := match (evalDiscrNatLit? rD).orElse (fun _ => evalDiscrNatLit? nD) with
+      | some k => domSub == #[Meta.DiscrTree.Key.lit (.natVal k)]
+      | none => false
+    if matchesNatLit then
+      true
+    else
+      let matchesRawSemired := match rD.getAppFn.consumeMData with
+        | .const rc rLvls =>
+          if isNonReducibleDefInEnv env rc then
+            let rArgs := rD.getAppArgs
+            match splitDiscrTreeChildren domSub rc rArgs.size with
+            | none => false
+            | some rSubs =>
+              let rMask := paramAllowsStarMask env rc rLvls rArgs
+              (List.range rArgs.size).all fun j =>
+                keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                  rArgs[j]! rArgs[j]! rSubs[j]! rMask[j]!
+          else false
+        | _ => false
+      if matchesRawSemired then
+        true
+      else match nD with
+        | .bvar _ | .fvar _ | .mvar _ => domSub == #[Meta.DiscrTree.Key.star]
+        | .lit l => domSub == #[Meta.DiscrTree.Key.lit l]
         | .const dc _ =>
-          if isRigidHeadInEnv env dc then
-            domSub[0]! == Meta.DiscrTree.Key.const dc nD.getAppNumArgs
+          if isRigidHeadInEnv env dc then domSub == #[Meta.DiscrTree.Key.const dc 0]
           else true
+        | .app .. =>
+          match nD.getAppFn.consumeMData with
+          | .const dc dLvls =>
+            if isRigidHeadInEnv env dc then
+              let dArgs := nD.getAppArgs
+              match splitDiscrTreeChildren domSub dc dArgs.size with
+              | none => false
+              | some dSubs =>
+                let rawSame := rD.getAppFn.consumeMData.isConstOf dc && rD.getAppNumArgs == dArgs.size
+                let rSubArgs := if rawSame then rD.getAppArgs else dArgs
+                let starMask := paramAllowsStarMask env dc dLvls dArgs
+                (List.range dArgs.size).all fun j =>
+                  keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                    rSubArgs[j]! dArgs[j]! dSubs[j]! starMask[j]!
+            else true
+          | _ => true
+        | .forallE _ d _ _ =>
+          if domSub[0]! != Meta.DiscrTree.Key.arrow || domSub.size < 2 then
+            false
+          else
+            let rawDom := match rD with | .forallE _ rd _ _ => rd | _ => d
+            keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+              rawDom d (domSub.extract 1 domSub.size) false
+        | .lam .. | .sort .. => domSub == #[Meta.DiscrTree.Key.other]
+        | .proj s idx _ =>
+          match domSub[0]! with
+          | .proj s' idx' _ => s == s' && idx == idx'
+          | _ => false
         | _ => true
-      | .forallE .. => domSub[0]! == Meta.DiscrTree.Key.arrow
-      | .lam .. | .sort .. => domSub[0]! == Meta.DiscrTree.Key.other
-      | _ => true
 
 /-- Structural alignment verifier between a non-outParam argument `(rawArg, normArg)` and its
-    exact arity-balanced `DiscrTree.Key` child subtree `sub`. Closes wildcard/arity-overflow/
-    arrow-skip/outParam-swap key forgeries while preserving valid semireducible local aliases. -/
+    exact arity-balanced `DiscrTree.Key` child subtree `sub` (`normArg` already deeply normalized). -/
 partial def keySubtreeAlignedWithAnchor (env : Environment) (localReplayable localRedOver : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (rawArg normArg : Expr)
     (sub : Array Meta.DiscrTree.Key) : Bool :=
-  if sub.isEmpty || (Lean.annotation? `noindex normArg).isSome then
+  if sub.isEmpty || (Lean.annotation? `noindex rawArg).isSome || (Lean.annotation? `noindex normArg).isSome then
     false
   else
     let rA := rawArg.consumeMData
@@ -2325,9 +2446,23 @@ partial def keySubtreeAlignedWithAnchor (env : Environment) (localReplayable loc
     -- Semireducible local type alias (`def LocalAlias := LocalAnchor`) keeps `.const LocalAlias k`
     -- in `DiscrTree.mkPath` (`TransparencyMode.reducible`) while `normArg` unfolds to `LocalAnchor`.
     let matchesLocalAlias := match rA.getAppFn.consumeMData with
-      | .const rc _ =>
-        isLocalNonReducibleDef localReplayable localRedOver byName rc &&
-        sub[0]! == Meta.DiscrTree.Key.const rc rA.getAppNumArgs
+      | .const rc rLvls =>
+        if isLocalNonReducibleDef localReplayable localRedOver byName rc then
+          let rArgs := rA.getAppArgs
+          match splitDiscrTreeChildren sub rc rArgs.size with
+          | none => false
+          | some rSubs =>
+            let rMask := paramAllowsStarMask env rc rLvls rArgs
+            let nSame := nA.getAppFn.consumeMData.isConstOf rc && nA.getAppNumArgs == rArgs.size
+            let nSubArgs := if nSame then nA.getAppArgs else rArgs
+            (List.range rArgs.size).all fun j =>
+              if hasRigidBaseAnchor env localReplayable localRedOver byName nSubArgs[j]! then
+                keySubtreeAlignedWithAnchor env localReplayable localRedOver byName
+                  rArgs[j]! nSubArgs[j]! rSubs[j]!
+              else
+                keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                  rArgs[j]! nSubArgs[j]! rSubs[j]! rMask[j]!
+        else false
       | _ => false
     if matchesLocalAlias then
       true
@@ -2337,24 +2472,37 @@ partial def keySubtreeAlignedWithAnchor (env : Environment) (localReplayable loc
         sub == #[Meta.DiscrTree.Key.const c 0]
       | .app .. =>
         match nA.getAppFn.consumeMData with
-        | .const c _ =>
+        | .const c cLvls =>
           let args := nA.getAppArgs
-          if sub[0]! != Meta.DiscrTree.Key.const c args.size then
-            false
-          else if isBaseInstanceAnchor localReplayable localRedOver byName c then
-            true
-          else if !isRigidHeadInEnv env c then
-            false
-          else
-            match splitDiscrTreeChildren sub c args.size with
-            | none => false
-            | some childSubs =>
-              let rawSameHead := rA.getAppFn.consumeMData.isConstOf c && rA.getAppNumArgs == args.size
-              let rawSubArgs := if rawSameHead then rA.getAppArgs else args
-              (List.range args.size).any fun j =>
+          match splitDiscrTreeChildren sub c args.size with
+          | none => false
+          | some childSubs =>
+            let rawSameHead := rA.getAppFn.consumeMData.isConstOf c && rA.getAppNumArgs == args.size
+            let rawSubArgs := if rawSameHead then rA.getAppArgs else args
+            let starMask := paramAllowsStarMask env c cLvls args
+            if isBaseInstanceAnchor localReplayable localRedOver byName c then
+              (List.range args.size).all fun j =>
+                if hasRigidBaseAnchor env localReplayable localRedOver byName args[j]! then
+                  keySubtreeAlignedWithAnchor env localReplayable localRedOver byName
+                    rawSubArgs[j]! args[j]! childSubs[j]!
+                else
+                  keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                    rawSubArgs[j]! args[j]! childSubs[j]! starMask[j]!
+            else if !isRigidHeadInEnv env c then
+              false
+            else
+              let hasAnchorChild := (List.range args.size).any fun j =>
                 hasRigidBaseAnchor env localReplayable localRedOver byName args[j]! &&
                 keySubtreeAlignedWithAnchor env localReplayable localRedOver byName
                   rawSubArgs[j]! args[j]! childSubs[j]!
+              let allSiblingsValid := (List.range args.size).all fun j =>
+                if hasRigidBaseAnchor env localReplayable localRedOver byName args[j]! then
+                  keySubtreeAlignedWithAnchor env localReplayable localRedOver byName
+                    rawSubArgs[j]! args[j]! childSubs[j]!
+                else
+                  keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName
+                    rawSubArgs[j]! args[j]! childSubs[j]! starMask[j]!
+              hasAnchorChild && allSiblingsValid
         | _ => false
       | .forallE _ d b _ =>
         if sub[0]! != Meta.DiscrTree.Key.arrow || sub.size < 2 then
@@ -2367,12 +2515,13 @@ partial def keySubtreeAlignedWithAnchor (env : Environment) (localReplayable loc
           if hasRigidBaseAnchor env localReplayable localRedOver byName d then
             keySubtreeAlignedWithAnchor env localReplayable localRedOver byName rawD d domSub
           else if hasRigidBaseAnchor env localReplayable localRedOver byName b then
-            keySubtreeMatchesArrowDomain env localReplayable localRedOver byName rawD d domSub
+            keySubtreeMatchesNonAnchorExpr env localReplayable localRedOver byName rawD d domSub false
           else
             false
-      | .lam _ _ b _ =>
+      | .lam _ d b _ =>
         sub == #[Meta.DiscrTree.Key.other] &&
-        hasRigidBaseAnchor env localReplayable localRedOver byName b
+        (hasRigidBaseAnchor env localReplayable localRedOver byName d ||
+         hasRigidBaseAnchor env localReplayable localRedOver byName b)
       | _ => false
 
 def autoSizeOfTarget? (env : Environment) (byName : Std.HashMap Name ConstantInfo)
@@ -2490,6 +2639,13 @@ def isValidSubPartConstant (ci privCi : ConstantInfo) : Bool :=
      | _ => false)
   | _ => false
 
+def isAllowedPrivateInPublicOlean (partNames : NameSet) (ci : ConstantInfo) : Bool :=
+  match ci with
+  | .inductInfo iv => iv.all.all partNames.contains && iv.ctors.all partNames.contains
+  | .ctorInfo cv   => partNames.contains cv.induct
+  | .recInfo rv    => rv.all.all partNames.contains
+  | _              => false
+
 def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : ModuleData)
     (privByName : Std.HashMap Name ConstantInfo) : IO Unit := do
   unless part.isModule && priv.isModule do
@@ -2498,10 +2654,14 @@ def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : M
   unless part.imports == priv.imports do
     policyFail "foreignImport" modName #[modName]
       s!"split-brain imports mismatch between {partLabel} and .olean.private"
+  let partNameSet : NameSet := NameSet.ofArray part.constNames
   for ci in part.constants do
-    if partLabel == ".olean" && isPrivateName ci.name then
+    -- Lean 4.34.1 `addInduct` exports kernel inductive triads (`.inductInfo`/`.ctorInfo`/`.recInfo`)
+    -- into `.olean` even for `private structure`/`private inductive`, while private
+    -- `.thmInfo`/`.defnInfo`/`.opaqueInfo`/`.axiomInfo` are strictly confined to `.olean.private`.
+    if partLabel == ".olean" && isPrivateName ci.name && !isAllowedPrivateInPublicOlean partNameSet ci then
       policyFail "keyNameMismatch" modName #[modName, ci.name]
-        s!"split-brain public .olean exposes private declaration {ci.name}"
+        s!"split-brain public .olean exposes non-inductive private declaration {ci.name}"
     let some privCi := privByName[ci.name]?
       | policyFail "keyNameMismatch" modName #[modName, ci.name]
           s!"split-brain {partLabel} contains phantom declaration {ci.name} absent from .olean.private"
@@ -2510,6 +2670,9 @@ def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : M
         s!"split-brain {partLabel} declaration {ci.name} diverges from .olean.private"
   let privExtraSet : NameSet := NameSet.ofArray priv.extraConstNames
   for ec in part.extraConstNames do
+    if partLabel == ".olean" && isPrivateName ec then
+      policyFail "keyNameMismatch" modName #[modName, ec]
+        s!"split-brain public .olean exposes private extraConstName {ec}"
     unless privExtraSet.contains ec || privByName.contains ec do
       policyFail "keyNameMismatch" modName #[modName, ec]
         s!"split-brain {partLabel} contains phantom extraConstName {ec} absent from .olean.private"
@@ -2530,7 +2693,8 @@ def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : M
 
 def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OLeanLevel)
     (m : Name) (idx : Nat) (role : String) (strictProofs : Bool)
-    (byName : Std.HashMap Name ConstantInfo) (localReplayable : NameSet) : IO Unit := do
+    (byName : Std.HashMap Name ConstantInfo) (localReplayable : NameSet)
+    (allowedRedTargets : NameSet := localReplayable) : IO Unit := do
   let macros := Elab.macroAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
   for entry in macros do
     match entry with
@@ -2623,13 +2787,13 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
 
   let mut localRedOver : NameSet := {}
   for (target, status) in reducibilityCoreExt.getModuleEntries checkEnv idx (level := extLevel) do
-    unless localReplayable.contains target do
+    unless allowedRedTargets.contains target do
       policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibilityCore on non-local decl"
     if status == .reducible then
       localRedOver := localRedOver.insert target
   for entry in reducibilityExtraExt.ext.getModuleEntries checkEnv idx (level := extLevel) do
     let target := match entry with | .global (t, _) => t | .scoped _ (t, _) => t
-    unless localReplayable.contains target do
+    unless allowedRedTargets.contains target do
       policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibility override on foreign decl"
     localRedOver := localRedOver.insert target
 
@@ -2742,11 +2906,19 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
         let rawSameHead := rawConclClean.getAppFn.consumeMData.isConstOf cls &&
           rawConclClean.getAppNumArgs == allArgs.size
         let rawArgs := if rawSameHead then rawConclClean.getAppArgs else allArgs
+        let clsStarMask := paramAllowsStarMask normEnv cls lvls allArgs
         let hasAlignedInputKey := inputIndices.any fun i =>
           hasRigidBaseAnchor normEnv localReplayable localRedOver byName allArgs[i]! &&
           keySubtreeAlignedWithAnchor normEnv localReplayable localRedOver byName
             rawArgs[i]! allArgs[i]! childSlices[i]!
-        unless hasAlignedInputKey do
+        let allInputsAligned := inputIndices.all fun i =>
+          if hasRigidBaseAnchor normEnv localReplayable localRedOver byName allArgs[i]! then
+            keySubtreeAlignedWithAnchor normEnv localReplayable localRedOver byName
+              rawArgs[i]! allArgs[i]! childSlices[i]!
+          else
+            keySubtreeMatchesNonAnchorExpr normEnv localReplayable localRedOver byName
+              rawArgs[i]! allArgs[i]! childSlices[i]! clsStarMask[i]!
+        unless hasAlignedInputKey && allInputsAligned do
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_unaligned"
 
 def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
@@ -2767,7 +2939,9 @@ def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
 def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     (cachedInitEnv? : Option Environment := none)
     (cachedInitMods : NameSet := {}) (cachedInitMulti? : Option NameSet := none)
-    (cachedInitState? : Option ImportState := none) : IO Json := do
+    (cachedInitState? : Option ImportState := none)
+    (cachedInitExpRef? : Option (IO.Ref (Option ImportState)) := none)
+    (cachedInitSrvRef? : Option (IO.Ref (Option ImportState)) := none) : IO Json := do
   let sysrootStr ← field (α := String) j "sysroot"
   let sysroot := System.FilePath.mk sysrootStr
   let stdRoot ← IO.FS.realPath (sysroot / "lib" / "lean")
@@ -3250,8 +3424,40 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     if moduleFlaggedSet.contains m then
       if expLevelEnv?.isNone then
         let modTargets := (moduleFlaggedSet.toArray.qsort Name.lt).map fun n => ({ module := n } : Import)
+        let allModImportInit := !cachedInitMods.isEmpty &&
+          (moduleFlaggedSet.toList.all fun nm =>
+            match subPartsMap[nm]? with
+            | some (md, sd, _) =>
+              md.imports.any (·.module == `Init) && sd.imports.any (·.module == `Init)
+            | none => false)
+        let curSp ← searchPathRef.get
+        let getCachedLevelInit (lvl : OLeanLevel) (ref? : Option (IO.Ref (Option ImportState))) :
+            IO (Option ImportState) := do
+          match ref?, allModImportInit with
+          | some r, true =>
+            if let some st ← r.get then
+              return some st
+            searchPathRef.set [sysroot / "lib" / "lean"]
+            try
+              let st ← withImporting do
+                let (_, st) ← importModulesCore (globalLevel := lvl) #[{ module := `Init }] |>.run
+                pure st
+              r.set (some st)
+              return some st
+            finally
+              searchPathRef.set curSp
+          | _, _ => return none
+
+        let expInitSt? ← getCachedLevelInit .exported cachedInitExpRef?
         let expE ← try
-          importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .exported)
+          match expInitSt? with
+          | some expSt =>
+            withImporting do
+              let (_, s) ← importModulesCore (globalLevel := .exported) modTargets |>.run expSt
+              finalizeImport s modTargets {} (trustLevel := 0)
+                (leakEnv := false) (loadExts := false) (level := .exported)
+          | none =>
+            importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .exported)
         catch ex =>
           let msg := ex.toString
           if (msg.splitOn "already contains").length > 1 then
@@ -3266,8 +3472,16 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           expMap := expMap.insert expE.header.modules[i].module i
         expLevelEnv? := some (expE.setExporting false, expMap)
 
+        let srvInitSt? ← getCachedLevelInit .server cachedInitSrvRef?
         let srvE ← try
-          importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .server)
+          match srvInitSt? with
+          | some srvSt =>
+            withImporting do
+              let (_, s) ← importModulesCore (globalLevel := .server) modTargets |>.run srvSt
+              finalizeImport s modTargets {} (trustLevel := 0)
+                (leakEnv := false) (loadExts := false) (level := .server)
+          | none =>
+            importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .server)
         catch ex =>
           let msg := ex.toString
           if (msg.splitOn "already contains").length > 1 then
@@ -3281,7 +3495,23 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         srvLevelEnv? := some (srvE.setExporting false, srvMap)
       if let some (expE, expMap) := expLevelEnv? then
         if let some eIdx := expMap[m]? then
-          auditModuleExtensionsAtLevel env expE .exported m eIdx role strictProofs byName localReplayable
+          let mut pubReplayable : NameSet := {}
+          if let some (mainD, _, _) := subPartsMap[m]? then
+            for pubCi in mainD.constants do
+              if !isPrivateName pubCi.name && !isCodegenUnsafeRec byName pubCi then
+                pubReplayable := pubReplayable.insert pubCi.name
+              let pubEdges ← declarationEdges m pubCi
+              for dep in pubEdges do
+                if (expE.find? dep).isNone then
+                  policyFail "keyNameMismatch" m #[m, pubCi.name, dep]
+                    s!"split-brain public .olean declaration {pubCi.name} references unexported {dep}"
+              if !isPrivateName pubCi.name then
+                let pubTyEdges ← expressionEdges m pubCi.name pubCi.type
+                for dep in pubTyEdges do
+                  if isPrivateName dep then
+                    policyFail "keyNameMismatch" m #[m, pubCi.name, dep]
+                      s!"split-brain public .olean declaration {pubCi.name} type references private {dep}"
+          auditModuleExtensionsAtLevel env expE .exported m eIdx role strictProofs byName pubReplayable localReplayable
       if let some (srvE, srvMap) := srvLevelEnv? then
         if let some sIdx := srvMap[m]? then
           auditModuleExtensionsAtLevel env srvE .server m sIdx role strictProofs byName localReplayable
@@ -3616,10 +3846,13 @@ end OleanReplayInspector
 def runOneItem (j : Json) (cachedInitEnv? : Option Environment := none)
     (cachedInitMods : NameSet := {})
     (cachedInitMulti? : Option NameSet := none)
-    (cachedInitState? : Option ImportState := none) : IO (Json × UInt32) := do
+    (cachedInitState? : Option ImportState := none)
+    (cachedInitExpRef? : Option (IO.Ref (Option ImportState)) := none)
+    (cachedInitSrvRef? : Option (IO.Ref (Option ImportState)) := none) : IO (Json × UInt32) := do
   let loadedModsRef ← IO.mkRef (#[] : Array Name)
   try
-    let res ← OleanReplayInspector.auditOleans j loadedModsRef cachedInitEnv? cachedInitMods cachedInitMulti? cachedInitState?
+    let res ← OleanReplayInspector.auditOleans j loadedModsRef cachedInitEnv? cachedInitMods
+      cachedInitMulti? cachedInitState? cachedInitExpRef? cachedInitSrvRef?
     return (Json.mkObj [("ok", toJson true), ("result", res)], 0)
   catch ex =>
     let loadedMods := (← loadedModsRef.get).map Name.toString
@@ -3670,9 +3903,12 @@ def main (args : List String) : IO UInt32 := do
       if let some (n, ciName) := findKeyMismatch cleanInit.checked.get.constants then
         OleanReplayInspector.opFail s!"cleanInit SMap key mismatch: {n} != {ciName}"
       let (initMods, initMulti) := computeInitMultiNames cleanInit
+      let expStateRef ← IO.mkRef (none : Option ImportState)
+      let srvStateRef ← IO.mkRef (none : Option ImportState)
       let mut outs : Array Json := #[]
       for item in items do
-        let (outJ, _) ← runOneItem item (some cleanInit) initMods (some initMulti) (some initState)
+        let (outJ, _) ← runOneItem item (some cleanInit) initMods (some initMulti)
+          (some initState) (some expStateRef) (some srvStateRef)
         outs := outs.push outJ
       IO.FS.writeFile respPath (Json.mkObj [("items", .arr outs)]).pretty
       return 0
@@ -4264,6 +4500,86 @@ def main (args : List String) : IO UInt32 := do
     entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast wildEnt17b])]
   }
 
+  -- 17c_forged_arrow_option_star: `Inhabited (Option Nat -> Anchor)` with nested domain `.star`!
+  let optNat17c := mkApp (mkConst ``Option [Level.zero]) (mkConst ``Nat)
+  let arrTy17c := mkForall `_ .default optNat17c (mkConst anc17b)
+  let inst17c : ConstantInfo := .defnInfo {
+    name := inst17bName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) arrTy17c,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) arrTy17c (mkLambda `_ .default optNat17c (mkConst anc17bMk)),
+    hints := .abbrev, safety := .safe, all := [inst17bName]
+  }
+  let wildEnt17c : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.const ``Option 1, Meta.DiscrTree.Key.star],
+    val := mkConst inst17bName, priority := 1000, globalName? := some inst17bName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeOlean (outDir / "17c_arrow_opt_star") `Topic.Tamper17b.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[anc17b, anc17bMk, `Topic.Tamper17b.Defs.Anchor.rec, inst17bName],
+    constants := #[anc17bInd, anc17bCtor, anc17bRec, inst17c],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast wildEnt17c])]
+  }
+
+  -- 15e_split_brain_priv_inst: module-mode `Topic.Tamper15e.Defs` leaking `.private` instance into public `.olean`!
+  let mod15e := `Topic.Tamper15e.Defs
+  let privInd15e := Name.str (Name.num (`_private ++ mod15e) 0) "PrivInd"
+  let privMk15e := privInd15e.str "mk"
+  let privRec15e := privInd15e.str "rec"
+  let indCi15e : ConstantInfo := .inductInfo {
+    name := privInd15e, levelParams := [], type := mkSort Level.one,
+    numParams := 0, numIndices := 0, all := [privInd15e], ctors := [privMk15e],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let ctorCi15e : ConstantInfo := .ctorInfo {
+    name := privMk15e, levelParams := [], type := mkConst privInd15e,
+    induct := privInd15e, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let recCi15e : ConstantInfo := .recInfo {
+    name := privRec15e, levelParams := [`u],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst privInd15e) (mkSort (.param `u)))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst privMk15e))
+        (mkForall `t .default (mkConst privInd15e) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [privInd15e], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := privMk15e, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst privInd15e) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst privMk15e)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let privInst15e := Name.str (Name.num (`_private ++ mod15e) 0) "instPriv"
+  let instCi15e : ConstantInfo := .defnInfo {
+    name := privInst15e, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) (mkConst privInd15e),
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) (mkConst privInd15e) (mkConst privMk15e),
+    hints := .abbrev, safety := .safe, all := [privInst15e]
+  }
+  let instEnt15e : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.const privInd15e 0],
+    val := mkConst privInst15e, priority := 1000, globalName? := some privInst15e,
+    synthOrder := #[], attrKind := .global
+  }
+  let dir15e := outDir / "15e_split_brain_priv_inst" / "Topic" / "Tamper15e"
+  IO.FS.createDirAll dir15e
+  let base15e := dir15e / "Defs.olean"
+  let expMd15e : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[privInd15e, privMk15e, privRec15e],
+    constants := #[indCi15e, ctorCi15e, recCi15e],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast instEnt15e])]
+  }
+  let privMd15e : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[privInd15e, privMk15e, privRec15e, privInst15e],
+    constants := #[indCi15e, ctorCi15e, recCi15e, instCi15e],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast instEnt15e])]
+  }
+  saveModuleDataParts mod15e #[
+    (base15e, expMd15e),
+    (OLeanLevel.server.adjustFileName base15e, privMd15e),
+    (OLeanLevel.private.adjustFileName base15e, privMd15e)
+  ]
+
   -- 15d_forged_ir_imports_lean: module-mode artifact with paired `.ir.sig`/`.ir` importing `Lean`!
   let irDir15d := outDir / "15d_ir_imports_lean" / "Proof"
   IO.FS.createDirAll irDir15d
@@ -4469,6 +4785,14 @@ def resolve_source_map_arg(
                     "--source-map JSON must be an object mapping module names to file paths"
                 )
             for mod, spath_str in raw.items():
+                if not _is_valid_module_name(mod):
+                    raise AuditOperationalError(
+                        f"malformed module key '{mod}' in --source-map {p}"
+                    )
+                if not spath_str or not spath_str.strip() or "\x00" in spath_str:
+                    raise AuditOperationalError(
+                        f"empty or NUL source path for '{mod}' in --source-map {p}"
+                    )
                 spath = Path(spath_str)
                 if stat_regular_fail_closed(spath) is None:
                     raise AuditPolicyError("missingSourceText", mod, f"missing source {spath}")
@@ -5524,7 +5848,9 @@ def run_tamper_suite(
             ("subcheck_18e_asymmetric_mutual_all", "Proof.LowmemMutual18d", forged_root / "18e_asymmetric_mutual_all", "invalidMutualAll"),
             ("subcheck_15c_split_brain_exported_axiom", "Proof.SplitBrain15c", forged_root / "15c_split_brain", "keyNameMismatch"),
             ("subcheck_15d_forged_ir_imports_lean", "Proof.Tamper15d", forged_root / "15d_ir_imports_lean", "foreignImport"),
+            ("subcheck_15e_split_brain_public_leaks_private_inst", "Topic.Tamper15e.Defs", forged_root / "15e_split_brain_priv_inst", "forbiddenInstanceOrCoe"),
             ("subcheck_17b_forged_arrow_instance_wildcard", "Topic.Tamper17b.Defs", forged_root / "17b_arrow_wildcard", "forbiddenInstanceOrCoe"),
+            ("subcheck_17c_forged_arrow_option_star", "Topic.Tamper17b.Defs", forged_root / "17c_arrow_opt_star", "forbiddenInstanceOrCoe"),
             ("subcheck_B3_reference_outside_import_closure", "Specs.UnimportedRef", forged_root / "b3_ref_outside", "referenceOutsideImportClosure"),
         ]
         batched_specs.append(
@@ -5737,45 +6063,48 @@ def run_tamper_suite(
             )
         )
 
+        # Live audit of compiled `Anneal.ReplayKeyAndTamperAudit` reusing warm `Init` state in `--batch`
+        if (
+            repo_olean.is_dir()
+            and stat_regular_fail_closed(
+                repo_olean / "Anneal" / "ReplayKeyAndTamperAudit.olean", base_dir=repo_olean
+            )
+            is not None
+        ):
+            batched_specs.append(
+                (
+                    "subcheck_live_Anneal_ReplayKeyAndTamperAudit",
+                    True,
+                    None,
+                    False,
+                    {
+                        "target_modules": ["Anneal.ReplayKeyAndTamperAudit"],
+                        "olean_dirs": [repo_olean],
+                        "source_map": {
+                            "Anneal.ReplayKeyAndTamperAudit": REPO_ROOT
+                            / "theory"
+                            / "Anneal"
+                            / "ReplayKeyAndTamperAudit.lean"
+                        },
+                        "require_sources": True,
+                        "strict_proofs": False,
+                    },
+                )
+            )
+
         batch_reports = batch_audit_modules(
             [spec_cfg for (_, _, _, _, spec_cfg) in batched_specs],
             lean_bin=lean_bin,
             sysroot=sysroot,
             stage_dir=tmp,
             compiled_inspector=compiled_insp,
-            chunk_size=50,
+            chunk_size=70,
         )
         for (cid, exp_ok, exp_cat, is_canon, _), rep in zip(batched_specs, batch_reports):
             _record_case(cid, rep, expected_ok=exp_ok, expected_category=exp_cat, canonical=is_canon)
         if init_sentinel.exists():
             failures.append(
                 f"subcheck_10b_initialize_hook_no_rce: RCE sentinel {init_sentinel} was created!"
-            )
-
-        # Live audit of compiled `Anneal.ReplayKeyAndTamperAudit` in its own bounded process
-        if (repo_olean / "Anneal" / "ReplayKeyAndTamperAudit.olean").is_file():
-            rep_live = audit_modules(
-                ["Anneal.ReplayKeyAndTamperAudit"],
-                olean_dirs=[repo_olean],
-                source_map={
-                    "Anneal.ReplayKeyAndTamperAudit": REPO_ROOT
-                    / "theory"
-                    / "Anneal"
-                    / "ReplayKeyAndTamperAudit.lean"
-                },
-                require_sources=True,
-                strict_proofs=False,
-                lean_bin=lean_bin,
-                sysroot=sysroot,
-                compiled_inspector=compiled_insp,
-                stage_dir=tmp,
-            )
-            _record_case(
-                "subcheck_live_Anneal_ReplayKeyAndTamperAudit",
-                rep_live,
-                expected_ok=True,
-                expected_category=None,
-                canonical=False,
             )
 
     elapsed = round(time.monotonic() - t0, 3)
@@ -5823,6 +6152,12 @@ class _ExitCodeArgumentParser(argparse.ArgumentParser):
         raise AuditOperationalError(f"CLI argument error: {message}")
 
 
+def _non_empty_path_arg(raw: str) -> Path:
+    if not raw or not raw.strip() or "\x00" in raw:
+        raise argparse.ArgumentTypeError("path argument must not be empty or contain NUL")
+    return Path(raw)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = _ExitCodeArgumentParser(
         prog="olean_replay_key_audit.py",
@@ -5841,14 +6176,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--olean-dir",
         dest="olean_dirs",
         action="append",
-        type=Path,
+        type=_non_empty_path_arg,
         default=[],
         metavar="DIR",
         help="Search directory for compiled `.olean` artifacts (repeatable; defaults to `.lake/build/lib/lean`).",
     )
     parser.add_argument(
         "--source-map",
-        type=Path,
+        type=_non_empty_path_arg,
         default=None,
         metavar="JSON_OR_DIR",
         help="JSON mapping `{module: path}` or root source directory for defense-in-depth source auditing.",
@@ -5892,7 +6227,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--lean",
-        type=Path,
+        type=_non_empty_path_arg,
         default=None,
         metavar="ABS_LEAN_PATH",
         help="Optional absolute path to pinned Lean 4.34.1 binary.",

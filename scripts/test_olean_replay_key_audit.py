@@ -161,6 +161,28 @@ class TestCliArgumentParsing(unittest.TestCase):
                 audit.main(["--audit-module", "Foo.Bar", "--emit-patch-spec"]), 2
             )
 
+    def test_empty_path_cli_args_and_malformed_source_map_keys_return_exit_2(self) -> None:
+        for argv in (
+            ["--audit-module", "Proof.A", "--olean-dir", ""],
+            ["--audit-module", "Proof.A", "--olean-dir", "   "],
+            ["--audit-module", "Proof.A", "--source-map", ""],
+            ["--audit-module", "Proof.A", "--lean", ""],
+        ):
+            with mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(audit.main(argv), 2, f"expected exit 2 for {argv}")
+        with tempfile.TemporaryDirectory(prefix="anneal-smap-key-") as td:
+            tmp = Path(td)
+            valid_lean = tmp / "Valid.lean"
+            valid_lean.write_text("theorem ok : True := True.intro\n", encoding="utf-8")
+            bad_mod_json = tmp / "bad_mod.json"
+            bad_mod_json.write_text(json.dumps({"../Bad": str(valid_lean)}), encoding="utf-8")
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.resolve_source_map_arg(bad_mod_json, ["Proof.A"])
+            empty_val_json = tmp / "empty_val.json"
+            empty_val_json.write_text(json.dumps({"Proof.A": ""}), encoding="utf-8")
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.resolve_source_map_arg(empty_val_json, ["Proof.A"])
+
     def test_relative_lean_path_rejected_exit_2(self) -> None:
         buf_out = io.StringIO()
         with mock.patch("sys.stdout", buf_out):
@@ -428,6 +450,8 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             "def decideTerm : Bool := decide ('.' ∉ ['a'])\n",
             "def trace : Array Nat := #[0]\ndef traceIdx : Nat := trace[0]!\n",
             'def f (trace : List (String -> Nat)) (h : 0 < trace.length) : Nat := trace[0] "{"\n',
+            'structure S where trace : Array (String -> Nat)\ndef dotTrace (x : S) (i : Fin x.trace.size) : Nat := x.trace[i] "{"\n',
+            'structure G where trace_goal : Array (String -> Nat)\ndef dotTraceGoal (x : G) (i : Fin x.trace_goal.size) : Nat := x.trace_goal[i] "{"\n',
             'def g : String := trace[a b] "{"\n',
             'def numsInHole : String := s!"{1.5} {1e-2} {1e+2} {0x1f} {p.1}"\n',
             'def decOkHole : String := s!"{by decide +kernel}"\n',
@@ -492,6 +516,7 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ("set_option «debug».«skipKernelTC» true in def x := 0", "forbiddenSourceOption"),
             ('def s := Macro.trace[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := Macro.trace[foo /- c -/] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := Lean.Macro.trace[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := trace_goal[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := «trace»[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s := throwErrorAt stx "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
@@ -676,6 +701,10 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
             for rel, code in (
                 ("Topic/Defs", "module\nnamespace Topic.Defs\npublic inductive PubTag | mk\npublic instance pubInst : Inhabited PubTag := ⟨.mk⟩\nend Topic.Defs\n"),
                 ("Proof/ImpAllPub", "module\npublic import Topic.Defs\nimport all Topic.Defs\nnamespace Proof.ImpAllPub\npublic def x : Topic.Defs.PubTag := default\nend Proof.ImpAllPub\n"),
+                (
+                    "Topic/A3ModPriv/Defs",
+                    "module\nnamespace Topic.A3ModPriv.Defs\npublic inductive LocalAnchor | mk\npublic abbrev MyAnchor := LocalAnchor\nprivate structure PrivT where x : Nat\nprivate instance : Inhabited PrivT := ⟨⟨0⟩⟩\npublic structure Holder where trace : Array (String -> Nat)\npublic def useDotTrace (h : Holder) (i : Fin h.trace.size) : Nat := h.trace[i] \"{\"\npublic instance instOptAbbr : Inhabited (Option MyAnchor) := ⟨some .mk⟩\npublic instance instSub : Inhabited { x : LocalAnchor // x = x } := ⟨⟨.mk, rfl⟩⟩\npublic instance instFinArr : Inhabited (Fin 8 → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instOptArr : Inhabited (Option Nat → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instArrArr : Inhabited ((Nat → Bool) → LocalAnchor) := ⟨fun _ => .mk⟩\npublic instance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\nend Topic.A3ModPriv.Defs\n",
+                ),
             ):
                 s = pkg_pub15 / f"{rel}.lean"
                 s.parent.mkdir(parents=True, exist_ok=True)
@@ -1274,6 +1303,167 @@ def main (args : List String) : IO UInt32 := do
     (irImpBase.withExtension "ir.sig", cleanIrSig),
     (irImpBase.withExtension "ir", evilIrBody)
   ]
+  -- Pass A3 forged edge cases:
+  -- A3-1: `Inhabited (Option Nat -> Anchor)` with forged `#[.const Inhabited 1, .arrow, .const Option 1, .star]`
+  let optNatTy := mkApp (mkConst ``Option [Level.zero]) (mkConst ``Nat)
+  let optArrTy := mkForall `_ .default optNatTy (mkConst a2AnchorName)
+  let a3OptArrName := `Topic.A3OptArrStar.Defs.instOptArr
+  let a3OptArrDef : ConstantInfo := .defnInfo {
+    name := a3OptArrName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) optArrTy,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) optArrTy (mkLambda `_ .default optNatTy (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [a3OptArrName]
+  }
+  let a3OptArrEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.const ``Option 1, Meta.DiscrTree.Key.star],
+    val := mkConst a3OptArrName, priority := 1000, globalName? := some a3OptArrName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "a3_opt_arr_star") `Topic.A3OptArrStar.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, a3OptArrName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, a3OptArrDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast a3OptArrEnt])]
+  }
+  -- A3-2: `Inhabited ((Nat -> Bool) -> Anchor)` with forged `#[.const Inhabited 1, .arrow, .arrow, .star]`
+  let natBoolArr := mkForall `_ .default (mkConst ``Nat) (mkConst ``Bool)
+  let nestedArrTy := mkForall `_ .default natBoolArr (mkConst a2AnchorName)
+  let a3NestArrName := `Topic.A3NestArrStar.Defs.instNestArr
+  let a3NestArrDef : ConstantInfo := .defnInfo {
+    name := a3NestArrName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) nestedArrTy,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) nestedArrTy (mkLambda `_ .default natBoolArr (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [a3NestArrName]
+  }
+  let a3NestArrEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.star],
+    val := mkConst a3NestArrName, priority := 1000, globalName? := some a3NestArrName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "a3_nest_arr_star") `Topic.A3NestArrStar.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, a3NestArrName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, a3NestArrDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast a3NestArrEnt])]
+  }
+  -- A3-3: `Inhabited (Prod Nat Anchor)` with forged sibling `.star` `#[.const Inhabited 1, .const Prod 2, .star, .const Anchor 0]`
+  let prodSibEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.const ``Prod 2, Meta.DiscrTree.Key.star, Meta.DiscrTree.Key.const a2AnchorName 0],
+    val := mkConst prodInstName, priority := 1000, globalName? := some prodInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "a3_prod_sib_star") `Topic.A3ProdSibStar.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, prodInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, prodInst],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast prodSibEnt])]
+  }
+  -- A3-4: Cross-module `_private.Specs.Target.0.secret` prefix spoofing inside `Proof.A3CrossPriv`
+  let crossPrivName := Name.str (Name.num (`_private ++ `Specs.Target) 0) "secret"
+  let crossPrivThm : ConstantInfo := .thmInfo {
+    name := crossPrivName, levelParams := [], type := mkConst ``True,
+    value := mkConst ``True.intro, all := [crossPrivName]
+  }
+  writeO (out / "a3_cross_priv") `Proof.A3CrossPriv {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[crossPrivName], constants := #[crossPrivThm],
+    extraConstNames := #[], entries := #[]
+  }
+  -- A3-5: Split-brain module-mode `Topic.A3PubLeakInst.Defs` whose public `.olean` exports a private instance
+  -- (`partCnt = 1 <= privCnt = 1` in `instanceExtension`!)
+  let plMod := `Topic.A3PubLeakInst.Defs
+  let plPrivIndName := Name.str (Name.num (`_private ++ plMod) 0) "PrivInd"
+  let plPrivMk := plPrivIndName.str "mk"
+  let plPrivRecName := plPrivIndName.str "rec"
+  let plPrivInd : ConstantInfo := .inductInfo {
+    name := plPrivIndName, levelParams := [], type := mkSort Level.one,
+    numParams := 0, numIndices := 0, all := [plPrivIndName], ctors := [plPrivMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let plPrivCtor : ConstantInfo := .ctorInfo {
+    name := plPrivMk, levelParams := [], type := mkConst plPrivIndName,
+    induct := plPrivIndName, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let plPrivRec : ConstantInfo := .recInfo {
+    name := plPrivRecName, levelParams := [`u],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst plPrivIndName) (mkSort (.param `u)))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst plPrivMk))
+        (mkForall `t .default (mkConst plPrivIndName) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [plPrivIndName], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := plPrivMk, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst plPrivIndName) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst plPrivMk)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let plPrivInstName := Name.str (Name.num (`_private ++ plMod) 0) "instPriv"
+  let plPrivInstDef : ConstantInfo := .defnInfo {
+    name := plPrivInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) (mkConst plPrivIndName),
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) (mkConst plPrivIndName) (mkConst plPrivMk),
+    hints := .abbrev, safety := .safe, all := [plPrivInstName]
+  }
+  let plPrivInstEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.const plPrivIndName 0],
+    val := mkConst plPrivInstName, priority := 1000, globalName? := some plPrivInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  let plDir := out / "a3_pub_leak_inst" / "Topic" / "A3PubLeakInst"
+  IO.FS.createDirAll plDir
+  let plBase := plDir / "Defs.olean"
+  let plExpMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[plPrivIndName, plPrivMk, plPrivRecName],
+    constants := #[plPrivInd, plPrivCtor, plPrivRec],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast plPrivInstEnt])]
+  }
+  let plPrivMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[plPrivIndName, plPrivMk, plPrivRecName, plPrivInstName],
+    constants := #[plPrivInd, plPrivCtor, plPrivRec, plPrivInstDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast plPrivInstEnt])]
+  }
+  saveModuleDataParts plMod #[
+    (plBase, plExpMd),
+    (OLeanLevel.server.adjustFileName plBase, plPrivMd),
+    (OLeanLevel.private.adjustFileName plBase, plPrivMd)
+  ]
+  -- A3-6: Split-brain module-mode `Proof.A3PubDangle` whose public `.olean` exports `pubThm`
+  -- with a `type` referencing `.olean.private`-only `_private.Proof.A3PubDangle.0.privProp`!
+  let pdMod := `Proof.A3PubDangle
+  let pdPrivProp := Name.str (Name.num (`_private ++ pdMod) 0) "privProp"
+  let pdPrivDef : ConstantInfo := .defnInfo {
+    name := pdPrivProp, levelParams := [], type := mkSort Level.zero,
+    value := mkConst ``True, hints := .abbrev, safety := .safe, all := [pdPrivProp]
+  }
+  let pdPubName := `Proof.A3PubDangle.pubThm
+  let pdPubThmPriv : ConstantInfo := .thmInfo {
+    name := pdPubName, levelParams := [], type := mkConst pdPrivProp,
+    value := mkConst ``True.intro, all := [pdPubName]
+  }
+  let pdPubThmExp : ConstantInfo := .axiomInfo {
+    name := pdPubName, levelParams := [], type := mkConst pdPrivProp, isUnsafe := false
+  }
+  let pdDir := out / "a3_pub_dangle" / "Proof"
+  IO.FS.createDirAll pdDir
+  let pdBase := pdDir / "A3PubDangle.olean"
+  let pdExpMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[pdPubName], constants := #[pdPubThmExp],
+    extraConstNames := #[], entries := #[]
+  }
+  let pdPrivMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[pdPrivProp, pdPubName], constants := #[pdPrivDef, pdPubThmPriv],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts pdMod #[
+    (pdBase, pdExpMd),
+    (OLeanLevel.server.adjustFileName pdBase, pdPrivMd),
+    (OLeanLevel.private.adjustFileName pdBase, pdPrivMd)
+  ]
   return 0
 """,
                 encoding="utf-8",
@@ -1382,6 +1572,20 @@ def main (args : List String) : IO UInt32 := do
                 ("b3_public_olean_private_name_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B3PubPriv"], "olean_dirs": [a1_forged / "b3_pub_priv"], "module_mode": True, "strict_proofs": True}),
                 ("b3_module_verify_private_verified_rejected", False, "invalidVerifyRoot", {"target_modules": ["Verify.B3PrivMod"], "olean_dirs": [a1_forged / "b3_priv_verify", pkg_v], "module_mode": True, "strict_proofs": True}),
                 ("b3_forged_ir_body_imports_lean_rejected", False, "foreignImport", {"target_modules": ["Proof.B3IrImp"], "olean_dirs": [a1_forged / "b3_ir_imp"], "module_mode": True, "strict_proofs": True}),
+                ("a3_module_priv_struct_and_rich_instances_passes", True, None, {
+                    "target_modules": ["Topic.A3ModPriv.Defs"],
+                    "olean_dirs": [pkg_pub15],
+                    "source_map": {"Topic.A3ModPriv.Defs": pkg_pub15 / "Topic" / "A3ModPriv" / "Defs.lean"},
+                    "require_sources": True,
+                    "module_mode": True,
+                    "strict_proofs": True,
+                }),
+                ("a3_forged_arrow_option_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A3OptArrStar.Defs"], "olean_dirs": [a1_forged / "a3_opt_arr_star"], "strict_proofs": True}),
+                ("a3_forged_nested_arrow_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A3NestArrStar.Defs"], "olean_dirs": [a1_forged / "a3_nest_arr_star"], "strict_proofs": True}),
+                ("a3_forged_prod_sibling_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A3ProdSibStar.Defs"], "olean_dirs": [a1_forged / "a3_prod_sib_star"], "strict_proofs": True}),
+                ("a3_cross_module_private_prefix_spoof_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A3CrossPriv"], "olean_dirs": [a1_forged / "a3_cross_priv"], "strict_proofs": True}),
+                ("a3_split_brain_public_olean_leaks_private_instance_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A3PubLeakInst.Defs"], "olean_dirs": [a1_forged / "a3_pub_leak_inst"], "module_mode": True, "strict_proofs": True}),
+                ("a3_split_brain_public_olean_dangling_private_type_ref_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A3PubDangle"], "olean_dirs": [a1_forged / "a3_pub_dangle"], "module_mode": True, "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
@@ -1403,7 +1607,7 @@ def main (args : List String) : IO UInt32 := do
                 sysroot=sysroot,
                 stage_dir=tmp,
                 compiled_inspector=insp,
-                chunk_size=30,
+                chunk_size=70,
             )
             for (cid, exp_ok, exp_cat, _), rep in zip(cases, reps):
                 self.assertEqual(rep["ok"], exp_ok, f"{cid}: {rep}")
