@@ -400,6 +400,43 @@ theorem u64_counter_prophetic_spec (delta limit init : UInt64)
       have h1 : f₃.1 = f₃.2 := hres
       rw [hfst]; omega
 
+/--
+**Prophecy-vacuity boundary of assume-style `resolve`**: with a prophecy `fin = 0`
+inconsistent with every run (each run calls the closure at least once), every
+path is cut off at `dropF`, so `u64_counter_prophetic_spec` yields `DWP … False`
+— its per-prophecy conclusions are miraculous for inconsistent prophecies.
+-/
+theorem prophecy_inconsistent_miracle (b : Nat) :
+    DWP (atomicBudgetWP (u64CounterEnv 1 10)) (tryUpdateLoop UInt64) (fun _ _ => False)
+      ⟨5, (0, 0), .fresh 5, 0, [], b⟩ :=
+  DWP.mono (fun _ _ h => absurd (h.2.2.1 ▸ h.2.1) (by decide))
+    (u64_counter_prophetic_spec 1 10 5 (by decide) 0 b).2
+
+/--
+**…but the consistent prophecy is not miraculous**: for `fin = 1` and a
+quiescent environment, the run `load 5 → f(5) = Some 6 → cas✓ → drop` resolves
+(`attempts = 1 = fin`) and returns, so `DWP … False` fails. Prophetic
+conclusions are therefore meaningful exactly for the prophecy matching the run.
+-/
+theorem prophecy_consistent_nonvacuous :
+    ¬ DWP (atomicBudgetWP (u64CounterEnv 1 10)) (tryUpdateLoop UInt64) (fun _ _ => False)
+      ⟨5, (0, 1), .fresh 5, 0, [], 0⟩ := by
+  intro h
+  have h1 := ((budgetWP_load _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h) 5
+    (Nat.le_refl _)).1 rfl
+  dsimp only [loadAns] at h1
+  rw [iter_tryBody_eq] at h1
+  have h2 := ((budgetWP_call _ _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h1)).2 (1, 1) (some 6)
+    ⟨rfl, rfl, by decide⟩
+  rw [tryCallK_some, vis_bind] at h2
+  have h3 := (((budgetWP_cas _ _ _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h2) 5
+    (Nat.le_refl _)).1 rfl).2.2 rfl
+  have h4 := ((casWin_iff _ _ _ _ _ _).1 h3).2.2 [((5 : UInt64), (6 : UInt64))] rfl
+  simp only [tryCasK_true, retAfterDrop, vis_bind] at h4
+  have h5 := ((budgetWP_drop _ _ _).1 ((DWP.vis_iff _ _ _ _ _).1 h4) 6 (Nat.le_refl _)).1
+    rfl rfl
+  simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h5
+
 /-- Bitmask-monotone flags (`BitsMono`) and ABA-free `Versioned` combinator witnesses. -/
 theorem combinator_flags_and_versioned_witness :
     (AtomicHistInv.BitsMono 0b0010 (0b0010 ||| 0b0101) ∧
@@ -725,6 +762,21 @@ theorem canary_unrealizable_resolve_miracle :
    (unrealizable_resolve_miracle zeroSt).2,
    (tryUpdate_nonvacuous_not_false ticketEnv_realizable zeroSt).1⟩
 
+/--
+`mrCellWP` is neither vacuous on a real MiniRust run (Tree Borrows `tbFive`,
+`load 5 → cas(5→6)✓ → load 6` reaches a return) nor allowed to hide behind an
+empty machine rely (which would be miraculous).
+-/
+theorem mrCellWP_nonvacuity_boundary (s₀ : AtomicSt Nat PUnit PUnit) :
+    ¬ DWP (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU32 Eq)
+        (tryUpdateLoop Nat) (fun _ _ => False) (MiniRustSpec.AtomicIntrinsicsMR.tbFive, s₀) ∧
+      DWP (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU32
+        (fun _ _ => False))
+        (tryUpdateLoop Nat) (fun _ _ => False) (MiniRustSpec.AtomicIntrinsicsMR.tbFive, s₀) :=
+  ⟨mrCellWP_tb_ticket_nonvacuous s₀, mrCellWP_empty_rely_miracle _ _ _ _ _⟩
+
 theorem canary_mrCellWP_ub :
     let s₅ : AtomicSt Nat PUnit PUnit := ⟨5, PUnit.unit, .fresh 5, 0, PUnit.unit, 0⟩
     ¬ DWLP (mrCellWP ticketEnv (MiniRustSpec.AtomicIntrinsicsMR.bmPtr 1)
@@ -736,7 +788,7 @@ theorem canary_mrCellWP_ub :
     ¬ DWLP (mrCellWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbSharedPtr
         MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU32 Eq)
         (tryUpdateLoop Nat) (fun _ _ => True) (MiniRustSpec.AtomicIntrinsicsMR.tbShared, s₅) :=
-  mrCellWP_rejects_misaligned_u128_frozen ⟨5, PUnit.unit, .fresh 5, 0, PUnit.unit, 0⟩ rfl _ _
+  mrCellWP_rejects_misaligned_u128_frozen ⟨5, PUnit.unit, .fresh 5, 0, PUnit.unit, 0⟩ _ _
 
 /-! ### 2.4 Unbounded contention: safe but not live -/
 
@@ -867,7 +919,7 @@ run_cmd do
       throwError "import-isolation violation: Anneal.AtomicHistInv imports {imp.module}"
   let nss : Array Name :=
     #[`Anneal.ITreeBuchi, `Anneal.AtomicHistInv, `Anneal.ITreeBuchiAndAtomicHistInvTests]
-  let floors : Array Nat := #[675, 195, 65]
+  let floors : Array Nat := #[675, 200, 68]
   let userName (c : Name) : Name := (privateToUserName? c).getD c
   let decls := env.constants.fold (init := (#[] : Array (Name × ConstantInfo)))
     fun acc c ci => if nss.any (·.isPrefixOf (userName c)) then acc.push (c, ci) else acc
@@ -903,7 +955,11 @@ run_cmd do
     , ``Anneal.AtomicHistInv.mrCellWP_rejects_misaligned_u128_frozen
     , ``Anneal.AtomicHistInv.double_cas_violates_oneshot_committer
     , ``Anneal.AtomicHistInv.weak_vs_strong_cas_separation
-    , ``Anneal.AtomicHistInv.unrealizable_resolve_miracle ]
+    , ``Anneal.AtomicHistInv.unrealizable_resolve_miracle
+    , ``Anneal.AtomicHistInv.mrCellWP_tb_ticket_nonvacuous
+    , ``Anneal.AtomicHistInv.mrCellWP_empty_rely_miracle
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_inconsistent_miracle
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_consistent_nonvacuous ]
   for req in requiredThms do
     let some (.thmInfo ti) := env.find? req
       | throwError "audit: required theorem {req} missing"
