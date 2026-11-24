@@ -4035,8 +4035,14 @@ def _parse_lean_property_taxonomy(text: str) -> dict[str, object]:
         m = _one_match(
             r"(?m)^def[ \t]+all[ \t]*:[^\n]*:=\s*\[([^\]]*)\][ \t]*$", body, f"`{where}.all`"
         )
-        m_cont = re.search(r"(?m)^([ \t]*)\S", body[m.end() :])
-        if m_cont is not None and m_cont.group(1):
+        m_cont = re.search(r"(?m)^([ \t]*)(\S+)", body[m.end() :])
+        if m_cont is not None and (
+            m_cont.group(1)
+            or (
+                m_cont.group(2) not in _LEAN_DECL_WORDS
+                and not m_cont.group(2).startswith(("#", "@"))
+            )
+        ):
             raise ValueError(f"`{where}.all` has a trailing continuation")
         out: list[str] = []
         for raw_item in m.group(1).split(","):
@@ -4545,6 +4551,9 @@ def _has_call_expr(toks: Sequence[str]) -> bool:
     )
 
 
+_RUST_ARM_START_OPS: frozenset[str] = frozenset({"|", "&", "&&", "-"})
+
+
 def _rust_brace_ends_arm(toks: Sequence[str], close_idx: int) -> bool:
     """Whether closing `}` at `close_idx` terminates a Rust `match` arm body."""
     n = len(toks)
@@ -4556,11 +4565,21 @@ def _rust_brace_ends_arm(toks: Sequence[str], close_idx: int) -> bool:
     if after in ("else", "=", "{"):
         return False
     if after in _RUST_EXPR_CONT_OPS:
+        # Only `|`, `&`, `&&`, and `-` can legally open a new Rust match-arm pattern
+        # (`| Pat =>`, `&Pat =>`, `&&Pat =>`, `-1 =>`). Binary ops like `||` or `==`
+        # always continue the current arm expression (`{ false } || { true }`).
+        if after not in _RUST_ARM_START_OPS:
+            return False
         bdepth = 0
         probe = close_idx + 1
         while probe < n:
             pt = toks[probe]
             if pt in _SPEC_OPENERS:
+                if bdepth == 0 and pt == "{":
+                    prev_pt = toks[probe - 1] if probe > close_idx + 1 else ""
+                    if not (_is_spec_word(prev_pt) or prev_pt == ">"):
+                        # Bare `{ ... }` after `&`/`|` is a block expression, not a struct pattern.
+                        return False
                 bdepth += 1
             elif pt in _SPEC_CLOSERS:
                 if bdepth == 0:
@@ -4754,17 +4773,44 @@ def _subst_ident_map(toks: Sequence[str], bindings: dict[str, str], depth: int =
         if tok in _SPEC_OPENERS:
             new_scope = dict(scopes[-1])
             if tok == "{":
-                for p_idx in range(len(pending_if_lets) - 1, -1, -1):
-                    entry = pending_if_lets[p_idx]
-                    if entry[0] == sdepth and entry[3] == 0:
-                        for name in entry[1]:  # type: ignore[attr-defined]
-                            new_scope.pop(name, None)
-                        pending_if_lets.pop(p_idx)
-                        break
+                # Check if this `{ ... }` is a scrutinee block (e.g. `if let P(x) = unsafe { e } { ... }`)
+                # rather than the `if let` body block itself.
+                close_b = -1
+                bd = 1
+                scan_b = idx + 1
+                while scan_b < n:
+                    sbt = toks[scan_b]
+                    if sbt in _SPEC_OPENERS:
+                        bd += 1
+                    elif sbt in _SPEC_CLOSERS:
+                        bd -= 1
+                        if bd == 0:
+                            close_b = scan_b
+                            break
+                    scan_b += 1
+                after_b = toks[close_b + 1] if 0 <= close_b and close_b + 1 < n else ""
+                is_scrutinee_block = after_b == "{" or after_b in _RUST_EXPR_CONT_OPS
+                if not is_scrutinee_block:
+                    for p_idx in range(len(pending_if_lets) - 1, -1, -1):
+                        entry = pending_if_lets[p_idx]
+                        if entry[0] == sdepth and entry[3] in (0, 2):
+                            for name in entry[1]:  # type: ignore[attr-defined]
+                                new_scope.pop(name, None)
+                            if entry[3] == 2:
+                                scopes[-1] = dict(entry[2])  # type: ignore[arg-type]
+                            pending_if_lets.pop(p_idx)
+                            break
             scopes.append(new_scope)
             out.append(tok)
             idx += 1
             continue
+        if tok == "&&":
+            for entry in reversed(pending_if_lets):
+                if entry[0] == sdepth and entry[3] == 0:
+                    entry[3] = 2
+                    for name in entry[1]:  # type: ignore[attr-defined]
+                        scopes[-1].pop(name, None)
+                    break
         if tok in _SPEC_CLOSERS:
             if len(scopes) > 1:
                 pending_lets = [p for p in pending_lets if p[0] < sdepth]
@@ -5109,16 +5155,24 @@ def _split_rust_block_statements(toks: Sequence[str]) -> list[list[str]]:
 
 def _has_non_let_assignment(toks: Sequence[str]) -> bool:
     """Whether `toks` contains any `=` outside an inner `let` header."""
-    in_let_header = False
+    bdepth = 0
+    let_depth: int | None = None
     for tok in toks:
-        if tok in (";", "{", "}"):
-            in_let_header = False
+        if tok in _SPEC_OPENERS:
+            bdepth += 1
+        elif tok in _SPEC_CLOSERS:
+            bdepth = max(0, bdepth - 1)
+            if let_depth is not None and bdepth < let_depth:
+                let_depth = None
+        elif tok == ";":
+            if let_depth is not None and bdepth <= let_depth:
+                let_depth = None
         elif tok == "let":
-            in_let_header = True
+            let_depth = bdepth
         elif tok == "=":
-            if not in_let_header:
+            if let_depth is None or bdepth != let_depth:
                 return True
-            in_let_header = False
+            let_depth = None
     return False
 
 
@@ -5551,7 +5605,9 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
     # over their conditions (which may contain `||`/`&&`), so fold them before
     # splitting on binary connectives.
     if toks[0] == "if":
-        if_parts = _split_lean_if(toks) or _split_rust_if(toks)
+        lean_if = _split_lean_if(toks)
+        rust_if = None if lean_if is not None else _split_rust_if(toks)
+        if_parts = lean_if or rust_if
         if if_parts is not None:
             cond_toks, t_branch, f_branch = if_parts
             cond_val = _const_truth(cond_toks, depth + 1)
@@ -5559,6 +5615,13 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
                 return _const_truth(t_branch, depth + 1)
             if cond_val is False:
                 return _const_truth(f_branch, depth + 1)
+            if rust_if is not None and (
+                any(word in _RUST_BLOCK_ABORT_WORDS for word in cond_toks)
+                or "?" in cond_toks
+                or _has_macro_invocation(cond_toks)
+                or _has_non_let_assignment(cond_toks)
+            ):
+                return None
             first = _const_truth(t_branch, depth + 1)
             return first if first is not None and first == _const_truth(f_branch, depth + 1) else None
 
@@ -5662,10 +5725,20 @@ def _unquote_ident(text: str) -> str:
     return text[1:-1] if len(text) >= 3 and text[0] == "«" and text[-1] == "»" else text
 
 
+_RAW_IDENT_RESERVED: frozenset[str] = frozenset(
+    {
+        "true", "false", "True", "False", "if", "else", "match", "let",
+        "return", "as", "in", "unsafe", "move", "for", "while", "loop",
+        "break", "continue",
+    }
+)
+
+
 def _ident_key(text: str) -> str:
-    """Canonical identifier name, stripping Lean `«...»` or Rust `r#`."""
+    """Canonical identifier name, keeping `r#<keyword>` distinct from bare keywords/literals."""
     if text.startswith("r#") and len(text) > 2:
-        return text[2:]
+        plain = text[2:]
+        return text if plain in _RAW_IDENT_RESERVED else plain
     return _unquote_ident(text)
 
 
@@ -5948,6 +6021,9 @@ def _alt_is_catch_all(alt: Sequence[str], depth: int = 0) -> bool:
 
 def _normalize_lean_layout_lets(
     body_toks: Sequence[tuple[str, int, int, bool]],
+    *,
+    outer_arm_col: int = -1,
+    outer_line: int = -1,
 ) -> list[str]:
     """Insert `;` for layout `let`/`have` and `(` `)` around layout `match`/`fun |` blocks."""
     out: list[str] = []
@@ -5968,7 +6044,7 @@ def _normalize_lean_layout_lets(
                 if top["kind"] == "match":
                     arm_c = int(top["arm_col"])
                     thresh = arm_c if arm_c != -1 else int(top["min_col"])
-                    if col < thresh:
+                    if col < thresh or (arm_c != -1 and col == arm_c and text != "|"):
                         layout.pop()
                         out.append(")")
                         continue
@@ -6026,12 +6102,15 @@ def _normalize_lean_layout_lets(
             and body_toks[idx + 1][0] == "|"
         )
         if is_match_head:
-            after_arrow = any(
-                body_toks[p][0] == "=>" and body_toks[p][1] == ln
-                for p in range(idx - 1, -1, -1)
-                if body_toks[p][1] == ln
-            )
-            min_col = line_first_col[ln] + (1 if after_arrow else 0)
+            if ln == outer_line and outer_arm_col >= 0:
+                min_col = outer_arm_col + 1
+            else:
+                after_arrow = any(
+                    body_toks[p][0] == "=>" and body_toks[p][1] == ln
+                    for p in range(idx - 1, -1, -1)
+                    if body_toks[p][1] == ln
+                )
+                min_col = line_first_col[ln] + (1 if after_arrow else 0)
             out.append("(")
             layout.append(
                 {
@@ -6336,7 +6415,11 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                 ):
                     break
             k += 1
-        body_slice = _normalize_lean_layout_lets(toks[i + 1 : k]) if lean else texts[i + 1 : k]
+        body_slice = (
+            _normalize_lean_layout_lets(toks[i + 1 : k], outer_arm_col=arm_col, outer_line=toks[i][1])
+            if lean
+            else texts[i + 1 : k]
+        )
         arms.append(
             {
                 "macro": False,
@@ -6733,7 +6816,7 @@ def check_spec_wildcard_paths(paths: Sequence[Path]) -> dict[str, object]:
         except (OSError, UnicodeDecodeError) as exc:
             errors.append({"path": str(path), "error": f"cannot read: {exc}"})
             continue
-        language = {".lean": "lean", ".rs": "rust"}.get(path.suffix, "auto")
+        language = {".lean": "lean", ".rs": "rust"}.get(path.suffix.lower(), "auto")
         checked += 1
         findings.extend(
             {"path": str(path), **asdict(finding)}

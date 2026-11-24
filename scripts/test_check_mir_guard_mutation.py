@@ -5410,5 +5410,122 @@ class GuardMutationEp2A2AdversarialTests(unittest.TestCase):
         self.assertEqual(self._patterns("Err(e) => { if *e != E::Overflow { return false; } true }", "rust"), [])
 
 
+class GuardMutationEp2B3AdversarialTests(unittest.TestCase):
+    """Round 3 adversarial regression tests closing A2's Shard A bypasses and false positives."""
+
+    LEAN_REL = "theory/Anneal/SpecBoundaryGuards.lean"
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [f.pattern for f in gmut.detect_postcondition_error_wildcards(source, language=language)]
+
+    def test_lean_inline_err_match_and_let_rhs_aligned_match_no_longer_bypass(self) -> None:
+        # 1. `match x with` starting on the `| .err _ =>` line with indented arms below
+        # previously popped `(` before the first arm because `line_first_col` saw col(match)!
+        inline_err_match = (
+            "def post (x : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err _ => match x with\n"
+            "    | true => True\n"
+            "    | false => True\n"
+        )
+        self.assertEqual(self._patterns(inline_err_match, "lean"), ["err_arm_true"])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(inline_err_match, "err", language="lean")["status"],
+            "SURVIVED",
+        )
+        # Nested inline `match y with` inside inline `match x with` followed by trailing outer arm.
+        inline_nested_match = (
+            "def post (x y : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err _ => match x with\n"
+            "    | true => match y with\n"
+            "      | true => True\n"
+            "      | false => True\n"
+            "    | false => True\n"
+        )
+        self.assertEqual(self._patterns(inline_nested_match, "lean"), ["err_arm_true"])
+
+        # 2. `let p := match x with` with arms aligned at `let`'s column followed by `p`
+        # previously failed to close `match` before `p` and never inserted `;`!
+        let_aligned_match = (
+            "def post (x : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err _ =>\n"
+            "    let p := match x with\n"
+            "    | true => True\n"
+            "    | false => True\n"
+            "    p\n"
+        )
+        self.assertEqual(self._patterns(let_aligned_match, "lean"), ["err_arm_true"])
+
+        # Sound counterpart with constraining arm stays clean.
+        sound_inline = (
+            "def post (x : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err e => match x with\n"
+            "    | true => e = .overflow\n"
+            "    | false => False\n"
+        )
+        self.assertEqual(self._patterns(sound_inline, "lean"), [])
+
+    def test_rust_block_or_expr_raw_keyword_shadowing_if_let_scrutinee_and_side_effect_conditions(self) -> None:
+        # 1. `{ false } || { true }` without trailing comma before `Ok(v) =>` must NOT split after `{ false }`!
+        block_or_arm = (
+            "match out {\n"
+            "    Err(_) => { false } || { true }\n"
+            "    Ok(v) => *v == 1,\n"
+            "}\n"
+        )
+        self.assertEqual(self._patterns(block_or_arm, "rust"), ["err_arm_true"])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(block_or_arm, "err", language="rust")["status"],
+            "SURVIVED",
+        )
+
+        # 2. `let r#true = false; true` must NOT overwrite literal `true`, and `let r#false = true; false`
+        # must NOT overwrite literal `false`; `let r#true = true; r#true` still folds!
+        for vacuous in (
+            "Err(_) => { let r#true = false; true }",
+            "Err(_) => { let r#true = true; r#true }",
+            "Err(_) => { if let Foo { a } = x {} true }",
+            "Err(_) => { let ok = true; if let E::Check(ok) = e && c { true } else { ok } }",
+        ):
+            self.assertEqual(self._patterns(vacuous, "rust"), ["err_arm_true"], vacuous)
+
+        # 3. Sound arms that must NOT false-fire:
+        # - `let r#false = true; false`
+        # - `if let` with block scrutinee (`unsafe { e }` / `{ e }`) or `&&` let-chain shadowing `ok`
+        # - `if` condition with `assert!`, `?`, or `return false`
+        for sound in (
+            "Err(e) => { let r#false = true; false }",
+            "Err(e) => { let ok = true; if let E::Check(ok) = unsafe { e } { ok } else { true } }",
+            "Err(e) => { let ok = true; if let E::Check(ok) = { e } { ok } else { true } }",
+            "Err(e) => { let ok = true; if let E::Check(ok) = e && ok { true } else { false } }",
+            "Err(e) => if { assert!(*e == E::Overflow); true } { true } else { true }",
+            "Err(e) => if { if *e != E::Overflow { return false; } true } { true } else { true }",
+            "Err(e) => if check(e)? { true } else { true }",
+        ):
+            self.assertEqual(self._patterns(sound, "rust"), [], sound)
+
+    def test_lean_col0_all_continuation_and_uppercase_spec_extension(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-b3-") as tmp:
+            root = Path(tmp) / "repo"
+            src = (ANNEAL_ROOT / self.LEAN_REL).read_text(encoding="utf-8")
+            old = "  [.entryPointPrecondition, .fixedWidthGhostLength, .errorBranchWildcard]\n"
+            new = old + "++ [.entryPointPrecondition]\n"
+            self.assertEqual(src.count(old), 1)
+            dst = root / self.LEAN_REL
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_text(src.replace(old, new), encoding="utf-8")
+            errs = gmut.validate_property_taxonomy(root)
+            self.assertTrue(any("SpecBoundaryGuardClass.all" in e for e in errs), errs)
+
+            upper = Path(tmp) / "SPEC.RS"
+            upper.write_text("match out { Ok(v) => *v == 1, Err(_) => true }\n", encoding="utf-8")
+            report = gmut.check_spec_wildcard_paths([upper])
+            self.assertFalse(report["ok"])
+            self.assertEqual(report["findings"][0]["language"], "rust")  # type: ignore[index]
+
+
 if __name__ == "__main__":
     unittest.main()

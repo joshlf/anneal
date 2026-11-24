@@ -572,11 +572,15 @@ def _check_trusted_step(
             step.counts[metric] = value
     for top_key in ("compilerOnlyNames", "reachableDeclarations"):
         _opt_int(obj, top_key, source)
-    for down_key in ("downstreamModules", "localTestAxioms", "files"):
+    if "graph" in obj and obj["graph"] is not None and not isinstance(obj["graph"], dict):
+        raise _bad(source, "`graph` must be a JSON object")
+    if "declarations" in obj and obj["declarations"] is not None and not isinstance(obj["declarations"], list):
+        raise _bad(source, "`declarations` must be a JSON list")
+    for down_key in ("downstreamModules", "localTestAxioms", "files", "leanFiles", "rustFiles"):
         _opt_int(down_dict, down_key, source)
-    for tr_key in ("modules", "waivers", "files"):
+    for tr_key in ("modules", "waivers", "files", "leanFiles", "rustFiles"):
         _opt_int(trusted_dict, tr_key, source)  # type: ignore[arg-type]
-    for rc_key in ("files", "crates"):
+    for rc_key in ("files", "crates", "leanFiles", "rustFiles"):
         _opt_int(rustc_dict, rc_key, source)  # type: ignore[arg-type]
     digest = obj.get("sourceSha256")
     if digest is not None and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
@@ -748,7 +752,7 @@ def load_receipt(
 # Claim extraction
 # ---------------------------------------------------------------------------
 
-_NUM = r"(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤+\-])\s*)?([0-9]+(?:[,._][0-9]+)*)[*_]*"
+_NUM = r"(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*"
 _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("passed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+|checks?\s+)?(?:passed|passing|pass)\b", re.I)),
     ("failed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+)?(?:failed|failing|failures?)\b", re.I)),
@@ -767,7 +771,7 @@ _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 _KV_COUNT_RE = re.compile(
     r"(?i)(?<![\w-])[*_]*(passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total)"
-    r"(?:_count)?[*_]*\s*(?:==|[=:])\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤+\-])\s*)?([0-9]+(?:[,._][0-9]+)*)"
+    r"(?:_count)?[*_]*\s*(?:==|[=:])\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)"
 )
 _KV_METRIC_ALIASES: dict[str, str] = {
     "failure": "failed",
@@ -777,7 +781,7 @@ _KV_METRIC_ALIASES: dict[str, str] = {
 }
 _FRACTION_RE = re.compile(
     _NUM
-    + r"\s*(?:/|\bof\b)\s*[*_]*([0-9]+(?:[,._][0-9]+)*)[*_]*\s+"
+    + r"\s*(?:/|\bof\b)\s*[*_]*([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*\s+"
     + r"(?:(?:unit\s+|doc\s+|new\s+|proved\s+|proven\s+|kernel-checked\s+|checked\s+|verified\s+|Lean\s+|total\s+)?"
     + r"(?:mutants?|guards?|tests?|checks?)\s+)?"
     + r"(killed|passed|passing|pass|failed|failing|failures?|survived|surviving|survivors?|theorems?)\b",
@@ -785,11 +789,11 @@ _FRACTION_RE = re.compile(
 )
 _KILL_RATE_RES: tuple[re.Pattern[str], ...] = (
     re.compile(
-        r"(?i)(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤+\-])\s*)?([0-9]+(?:[,._][0-9]+)*)[*_]*\s*%\s+"
+        r"(?i)(?<![\w.,/=])[*_]*((?:>=|<=|!=|==|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)[*_]*\s*%([+~]?)\s+"
         r"(?:of\s+)?(?:(?:mutants?|guards?)\s+)?(?:kill[ -]rate|killed|mutation\s+score)\b"
     ),
     re.compile(
-        r"(?i)\b[*_]*kill[ _-]rate(?:_pct)?[*_]*\s*(?:==|[=:]|of|is)?\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤+\-])\s*)?([0-9]+(?:[,._][0-9]+)*)\s*%?"
+        r"(?i)\b[*_]*kill[ _-]rate(?:_pct)?[*_]*\s*(?:==|[=:]|of|is)?\s*[`*_]*((?:>=|<=|!=|[~≈<>≥≤≠+\-])\s*)?([0-9]+(?:[,._][0-9]+)*[+~]?)\s*(?:%([+~]?))?"
     ),
 )
 _ZERO_WORD_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -818,11 +822,15 @@ _BAD_KV_RE = re.compile(
     r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)"
     r"[*_]*\s*(?:==|=(?!=))\s*[`*_]*([^\s`,;)|*]+)"
     r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)"
-    r"[*_]*\s*:\s*[`*_]*(?:unknown|tbd|n/a|na|nan|inf(?:inity)?|null|[~≈<>≥≤+\-][0-9]+|(?:>=|<=|!=)\s*[0-9]+|[0-9]+\.[0-9]+)\b"
+    r"[*_]*\s*:\s*[`*_]*(?:unknown|tbd|n/a|na|nan|inf(?:inity)?|null|"
+    r"(?:approx\.?|approximately|roughly|around|about|over|under|above|below|"
+    r"at\s+(?:least|most)|(?:more|less|fewer|greater)\s+than)\s+[0-9]+|"
+    r"[~≈<>≥≤≠+\-][0-9]+|(?:>=|<=|!=)\s*[0-9]+|[0-9]+\.[0-9]+)\b"
     r"|(?:passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total|kill[ _-]rate)(?:_count|_pct)?"
-    r"[*_]*\s*(?:>=|<=|!=|≠|>|<|≈|~(?!~))\s*[`*_]*[0-9][^\s`,;)|*]*"
-    r"|ok[*_]*\s*(?:==|=(?!=)|:)\s*[`*_]*(?!(?:true|false)\b)[^\s`,;)|*]+"
-    r"|(?:status|result|verdict|outcome)[*_]*\s*(?:==|[=:])\s*[`*_]*(?:unknown|tbd|n/a|na|null|none|pending|skipped)\b)"
+    r"[*_]*\s*(?:>=|<=|!=|≠|>|<|≥|≤|≈|~(?!~))\s*[`*_]*[0-9][^\s`,;)|*]*"
+    r"|ok[*_]*\s*(?:==|!=|≠|=(?!=))\s*[`*_]*(?!(?:true|false)\b)[^\s`,;)|*]+"
+    r"|ok[*_]*\s*:\s*[`*_]*(?:unknown|tbd|n/a|na|nan|null|none|pending|skipped)\b"
+    r"|(?:status|result|verdict|outcome)[*_]*\s*(?:==|!=|≠|[=:])\s*[`*_]*(?:unknown|tbd|n/a|na|null|none|pending|skipped)\b)"
 )
 _RC_NEQ_RE = re.compile(
     r"(?i)(?<![\w-])[*_]*(?:rc|exit[ _-]?code|exit[ _-]?status|return[ _]?code)[*_]*\s*(?:!=|≠)\s*[`*_]*([^\s`,;)|*]+)"
@@ -838,7 +846,7 @@ _STATUS_RE = re.compile(
     r"(?i)(?<![\w-])[*_]*(?:status|result|verdict|outcome)[*_]*\s*(==|!=|≠|[=:])\s*[`*_]*([A-Za-z]+)"
 )
 _OK_RE = re.compile(r"(?i)(?<![\w-])[*_]*ok[*_]*\s*(==|!=|≠|[=:])\s*[`*_]*(true|false)\b")
-_VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|✅|❌)(?![\w/-]|\.\w)")
+_VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|OK|✅|❌)(?![\w/-]|\.\w|\()")
 _ALL_PASS_RE = re.compile(
     r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
 )
@@ -849,6 +857,11 @@ _NEGATION_WORDS: frozenset[str] = frozenset({
 })
 _PRECEDING_NEG_RE = re.compile(
     r"(?i)(?:\b(?:not|never|no|non|didn't|did\s+not|does\s+not|doesn't|failed\s+to|cannot|can't)\s*[-]?)$"
+)
+_APPROX_OR_INEQ_PREFIX_RE = re.compile(
+    r"(?i)(?:\b(?:approx\.?|approximately|roughly|around|about|nearly|almost|"
+    r"over|under|above|below|up\s+to|at\s+least|at\s+most|"
+    r"more\s+than|less\s+than|fewer\s+than|greater\s+than)\s+)$"
 )
 _COMPARATIVE_PREFIX_RE = re.compile(
     r"(?i)(?:\b(?:vs\.?|versus|after|before|replacing|unlike|than|from|instead\s+of|"
@@ -861,7 +874,7 @@ _FAIL_WORDS: frozenset[str] = frozenset(
 _SHA_CLAIM_RE = re.compile(
     r"(?i)(?<![\w/-])[`*_]*(?P<label>(?:(?:base|parent|previous|prior|old|head|target|tip|final|new|current|git)"
     r"[\s_-]+)*(?:commit(?:[\s_-]+(?:sha(?:-?1)?|hash|id))?|sha(?:-?1)?|revision|head|base|parent|target))[`*_]*(?![\w-])"
-    r"(?:\s+(?:is|was|at|of)){0,2}[`*_]*\s*(?P<sep>[:=|@]|->|→)?[*_]*\s*(?P<paren>\()?\s*[*_]*(?P<tick>[`'\"]?)(?P<value>[0-9A-Za-z/_.?-]+)"
+    r"(?:\s+(?:is|was|at|of)){0,2}[`*_]*\s*(?P<sep>[:=|@]|->|→)?[*_]*\s*(?P<paren>\()?\s*[*_]*(?P<tick>[`'\"]?)(?P<value>[0-9A-Za-z/_.?<>-]+)"
 )
 _EXPLICIT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|hash|revision|commit[\s_-]+id)\b")
 _TABLE_NON_SHA_HEADERS: frozenset[str] = frozenset({
@@ -869,7 +882,9 @@ _TABLE_NON_SHA_HEADERS: frozenset[str] = frozenset({
     "details", "detail", "check", "checks", "value", "description", "summary",
 })
 _BASE_ROLE_RE = re.compile(r"(?i)(?:^|[\s_-])(?:base|parent|previous|prior|old)(?:$|[\s_-])")
-_SHA_PLACEHOLDERS: frozenset[str] = frozenset({"unknown", "none", "n/a", "na", "tbd", "null", "dirty", "?"})
+_SHA_PLACEHOLDERS: frozenset[str] = frozenset({
+    "unknown", "none", "n/a", "na", "tbd", "null", "dirty", "pending", "uncommitted", "wip", "?", "??", "???",
+})
 _AXIOM_PREFIX_OPT = r"(?:[*_]*axioms?(?:\s+used|\s+set|\s+closure)?[*_]*\s*[=:]\s*)?"
 _STANDARD_AXIOMS_RE = re.compile(
     r"(?i)" + _AXIOM_PREFIX_OPT
@@ -890,9 +905,19 @@ _LABEL_ATOM_SRC = r"(?:`[^`\n]+`|\*\*[^*\n`]+\*\*|[A-Za-z0-9][A-Za-z0-9_.-]*)"
 _COMPOUND_LEADING_LABELS_RE = re.compile(
     r"^\s*(?:[-*+]|\d+[.)])?\s*(?P<head>"
     + _LABEL_ATOM_SRC
-    + r"(?:\s*(?:,|&|\+|\band\b)\s*"
+    + r"(?:\s*(?:,|&|\+|/|\band\b)\s*"
     + _LABEL_ATOM_SRC
-    + r")+)\s*:"
+    + r")+)(?:\s*\([^)\n]*\))?\s*:"
+)
+_TABLE_CELL_SINGLE_LABEL_RE = re.compile(
+    r"^\s*(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9.~/][A-Za-z0-9_./~-]*))(?:\s*\([^)\n]*\))?\s*$"
+)
+_TABLE_CELL_COMPOUND_LABELS_RE = re.compile(
+    r"^\s*(?P<head>"
+    + _LABEL_ATOM_SRC
+    + r"(?:\s*(?:,|&|\+|/|\band\b)\s*"
+    + _LABEL_ATOM_SRC
+    + r")+)(?:\s*\([^)\n]*\))?\s*$"
 )
 _LABEL_ITEM_RE = re.compile(r"`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9_.-]*)")
 _HEADING_CODE_STEP_RE = re.compile(r"^\s*#{1,6}\s+`([^`\n]+)`\s*$")
@@ -922,8 +947,17 @@ _HISTORICAL_RE = re.compile(
 )
 _IGNORE_BEGIN = "<!-- claim-guard: ignore-begin -->"
 _IGNORE_END = "<!-- claim-guard: ignore-end -->"
-_INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u00ad]")
-_CONTROL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u202a-\u202e\u2066-\u2069]")
+_INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060-\u2064\u206a-\u206f\ufeff\u00ad\u034f\u061c\u180e\U000e0000-\U000e007f]")
+_LINE_SEP_CONTROL_RE = re.compile("[\u0085\u2028\u2029]")
+_CONTROL_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u0085\u2028\u2029\u202a-\u202e\u2066-\u2069]")
+_HAS_DIGIT_RE = re.compile(r"[0-9]")
+_HAS_KV_OP_RE = re.compile(r"[=:<>≤≥≠~≈]")
+_HAS_SHA_WORD_RE = re.compile(r"(?i)commit|sha|revision|head|base|parent|target")
+_BLOCKQUOTE_START_RE = re.compile(r"^\s*>\s+")
+_BLOCKQUOTE_STRIP_RE = re.compile(r"^(?:\s*>\s+)+")
+_BARE_NUM_LINE_RE = re.compile(r"^\s*[0-9]")
+_NUM_LIST_LINE_RE = re.compile(r"^\s*[0-9]+[.)]\s+")
+_TABLE_SEP_CELL_RE = re.compile(r"[-:\s]+")
 
 
 def _inline_code_spans(line: str) -> list[tuple[int, int, str]]:
@@ -1102,7 +1136,9 @@ def _line_refs(
     m_lead = _LEADING_LABEL_RE.match(line) if not in_fence and not is_table else None
     lead_paren_span: tuple[int, int] | None = None
 
-    def add_lead_item(grp: int, raw_text: str, span_lo: int, span_hi: int) -> bool:
+    def add_lead_item(
+        grp: int, raw_text: str, span_lo: int, span_hi: int, *, allow_slash_bare: bool = False
+    ) -> bool:
         if overlaps(span_lo, span_hi):
             return False
         lead_label = " ".join(raw_text.split())
@@ -1113,6 +1149,8 @@ def _line_refs(
         if cmd_step is not None:
             add(span_lo, span_hi, cmd_step, lead_label, False)
             return True
+        if is_table and lead_label.upper() in (_PASS_WORDS | _FAIL_WORDS):
+            return False
         if grp in (1, 2):
             if _is_candidate_unknown_step_label(lead_label):
                 is_step_id = "/" not in lead_label and not _COMMAND_HEAD_RE.match(lead_label)
@@ -1121,8 +1159,11 @@ def _line_refs(
             if grp == 1 and lead_label and lead_label.lower() not in _NON_STEP_LABELS and " " in lead_label:
                 add(span_lo, span_hi, None, lead_label, False)
                 return True
-        elif grp == 3 and ("_" in lead_label or "-" in lead_label) and _is_candidate_unknown_step_label(lead_label):
-            add(span_lo, span_hi, None, lead_label, True)
+        elif grp == 3 and (
+            "_" in lead_label or "-" in lead_label or (allow_slash_bare and "/" in lead_label)
+        ) and _is_candidate_unknown_step_label(lead_label):
+            is_step_id = "/" not in lead_label and not _COMMAND_HEAD_RE.match(lead_label)
+            add(span_lo, span_hi, None, lead_label, is_step_id)
             return True
         return False
 
@@ -1135,12 +1176,52 @@ def _line_refs(
         m_comp = _COMPOUND_LEADING_LABELS_RE.match(line)
         if m_comp is not None:
             base_off = m_comp.start("head")
+            comp_added = False
             for m_item in _LABEL_ITEM_RE.finditer(m_comp.group("head")):
                 igrp = 1 if m_item.group(1) is not None else (2 if m_item.group(2) is not None else 3)
                 tok_text = m_item.group(igrp)
                 if igrp == 3 and tok_text.lower() == "and":
                     continue
-                add_lead_item(igrp, tok_text, base_off + m_item.start(igrp), base_off + m_item.end(igrp))
+                if add_lead_item(igrp, tok_text, base_off + m_item.start(igrp), base_off + m_item.end(igrp)):
+                    comp_added = True
+            if comp_added and m_comp.end() > m_comp.end("head"):
+                lead_paren_span = (m_comp.end("head"), m_comp.end())
+    elif is_table and table_cells:
+        c0_lo, c0_hi = table_cells[0]
+        cell0 = line[c0_lo:c0_hi]
+        if cell0.strip() and not re.fullmatch(r"[-:\s]+", cell0.strip()):
+            m_c0 = _TABLE_CELL_SINGLE_LABEL_RE.match(cell0)
+            if m_c0 is not None:
+                grp = 1 if m_c0.group(1) is not None else (2 if m_c0.group(2) is not None else 3)
+                c0_added = add_lead_item(
+                    grp,
+                    m_c0.group(grp),
+                    c0_lo + m_c0.start(grp),
+                    c0_lo + m_c0.end(grp),
+                    allow_slash_bare=True,
+                )
+                if c0_added and m_c0.end() > m_c0.end(grp):
+                    lead_paren_span = (c0_lo + m_c0.end(grp), c0_lo + m_c0.end())
+            else:
+                m_c0_comp = _TABLE_CELL_COMPOUND_LABELS_RE.match(cell0)
+                if m_c0_comp is not None:
+                    base_off = c0_lo + m_c0_comp.start("head")
+                    c0_comp_added = False
+                    for m_item in _LABEL_ITEM_RE.finditer(m_c0_comp.group("head")):
+                        igrp = 1 if m_item.group(1) is not None else (2 if m_item.group(2) is not None else 3)
+                        tok_text = m_item.group(igrp)
+                        if igrp == 3 and tok_text.lower() == "and":
+                            continue
+                        if add_lead_item(
+                            igrp,
+                            tok_text,
+                            base_off + m_item.start(igrp),
+                            base_off + m_item.end(igrp),
+                            allow_slash_bare=True,
+                        ):
+                            c0_comp_added = True
+                    if c0_comp_added and m_c0_comp.end() > m_c0_comp.end("head"):
+                        lead_paren_span = (c0_lo + m_c0_comp.end("head"), c0_lo + m_c0_comp.end())
 
     def is_secondary(lo: int, hi: int) -> bool:
         if lead_paren_span is not None and lead_paren_span[0] <= lo and hi <= lead_paren_span[1]:
@@ -1221,11 +1302,15 @@ def _classify_sha(value: str, explicit: bool) -> tuple[str, str]:
             return "ignore", ""
         return "valid", token
     has_digit = any(ch.isdigit() for ch in token)
-    if explicit and token.lower() in _SHA_PLACEHOLDERS:
+    if explicit and (
+        token.lower() in _SHA_PLACEHOLDERS
+        or re.fullmatch(r"\?+", token)
+        or (token.startswith("<") and token.endswith(">") and len(token) > 2)
+    ):
         return "INVALID_COMMIT_SHA", f"`{token}` is a placeholder, not a commit SHA"
     # An English word made of hex letters (`added`, `dead`) is prose unless it
-    # carries a digit or sits in backticks/quotes.
-    if re.fullmatch(r"[0-9a-fA-F]+", token) and (has_digit or quoted):
+    # carries a digit, sits in backticks/quotes, or is an explicit 7+ char hex token.
+    if re.fullmatch(r"[0-9a-fA-F]+", token) and (has_digit or quoted or (explicit and len(token) >= 7)):
         if len(token) < 7:
             if explicit and (len(token) >= 4 or quoted):
                 return "AMBIGUOUS_COMMIT_SHA", f"`{token}` is shorter than 7 hex characters"
@@ -1297,6 +1382,10 @@ def _preceded_by_negation(line: str, pos: int) -> bool:
     return bool(_PRECEDING_NEG_RE.search(line[:pos]))
 
 
+def _preceded_by_approx_or_ineq(line: str, pos: int) -> bool:
+    return bool(_APPROX_OR_INEQ_PREFIX_RE.search(line[:pos]))
+
+
 def _line_claims(
     line: str, lineno: int, violations: list[Violation]
 ) -> list[tuple[int, str, str, object, str]]:
@@ -1316,114 +1405,166 @@ def _line_claims(
             )
         return value
 
-    for m in list(_SHA_CLAIM_RE.finditer(work[0])):
-        sep = m.group("sep")
-        raw_val = m.group("value")
-        clean_val = raw_val.strip("`'\"*_").rstrip(".,;:)")
-        if sep == "|":
-            is_sep_or_hdr = bool(re.fullmatch(r"[-:\s]+", clean_val)) or clean_val.lower() in _TABLE_NON_SHA_HEADERS
-            has_sha_word = bool(_EXPLICIT_SHA_LABEL_RE.search(m.group("label")))
-            explicit = not is_sep_or_hdr and (
-                bool(m.group("tick"))
-                or any(ch.isdigit() for ch in clean_val)
-                or clean_val.lower() in _SHA_PLACEHOLDERS
-                or has_sha_word
-            )
-        else:
-            explicit = bool(sep) or bool(m.group("paren")) or bool(m.group("tick"))
-        verdict, detail = _classify_sha(m.group("tick") + raw_val, explicit)
-        if verdict == "ignore":
-            continue
-        take(m)
-        if verdict == "valid":
-            role = "base" if _BASE_ROLE_RE.search(m.group("label")) else "head"
-            found.append((m.start(), "commit_sha", role, detail, m.group(0).strip()))
-        else:
-            violations.append(Violation(verdict, lineno, None, f"commit SHA claim: {detail}"))
-    for m in list(_FRACTION_RE.finditer(work[0])):
-        take(m)
-        part, whole = count(m, m.group(1) or "", m.group(2)), count(m, "", m.group(3))
-        if part is not None and whole is not None:
-            raw_metric = m.group(4).lower()
-            snippet = m.group(0).strip()
-            if whole == 0:
-                violations.append(
-                    Violation("MALFORMED_CLAIM", lineno, None,
-                              f"`{snippet}` has a zero denominator")
+    low = line.lower()
+    has_digit = _HAS_DIGIT_RE.search(line) is not None
+    has_kv_op = _HAS_KV_OP_RE.search(line) is not None
+    has_eq_or_colon = "=" in line or ":" in line
+
+    if _HAS_SHA_WORD_RE.search(line) is not None:
+        for m in list(_SHA_CLAIM_RE.finditer(work[0])):
+            sep = m.group("sep")
+            raw_val = m.group("value")
+            clean_val = raw_val.strip("`'\"*_").rstrip(".,;:)")
+            if sep == "|":
+                is_sep_or_hdr = bool(_TABLE_SEP_CELL_RE.fullmatch(clean_val)) or clean_val.lower() in _TABLE_NON_SHA_HEADERS
+                has_sha_word = bool(_EXPLICIT_SHA_LABEL_RE.search(m.group("label")))
+                explicit = not is_sep_or_hdr and (
+                    bool(m.group("tick"))
+                    or any(ch.isdigit() for ch in clean_val)
+                    or clean_val.lower() in _SHA_PLACEHOLDERS
+                    or has_sha_word
                 )
-            elif part > whole:
-                violations.append(
-                    Violation("MALFORMED_CLAIM", lineno, None,
-                              f"`{snippet}` numerator exceeds denominator")
-                )
-            elif raw_metric.startswith("pass"):
-                found.append((m.start(), "count", "passed", part, snippet))
-                found.append((m.start(), "count", "tests", whole, snippet))
-            elif raw_metric == "killed":
-                found.append((m.start(), "count", "killed", part, snippet))
-                found.append((m.start(), "count", "total", whole, snippet))
-            elif raw_metric.startswith("fail"):
-                found.append((m.start(), "count", "failed", part, snippet))
-                found.append((m.start(), "count", "tests", whole, snippet))
-            elif raw_metric.startswith("surviv"):
-                found.append((m.start(), "count", "survived", part, snippet))
-                found.append((m.start(), "count", "total", whole, snippet))
-            elif raw_metric.startswith("theorem"):
-                found.append((m.start(), "count", "theorems", part, snippet))
-    for pattern in _KILL_RATE_RES:
-        for m in list(pattern.finditer(work[0])):
-            take(m)
-            token = m.group(2).rstrip(".,;:")
-            if m.group(1) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
-                violations.append(Violation("MALFORMED_CLAIM", lineno, None,
-                                            f"`{m.group(0).strip()}` is not an exact kill rate"))
             else:
-                found.append((m.start(), "kill_rate", "kill_rate", float(token), m.group(0).strip()))
-    for m in list(_KV_COUNT_RE.finditer(work[0])):
-        take(m)
-        value = count(m, m.group(2) or "", m.group(3))
-        if value is not None:
-            raw_metric = m.group(1).lower()
-            metric = _KV_METRIC_ALIASES.get(raw_metric, raw_metric)
-            found.append((m.start(), "count", metric, value, m.group(0).strip()))
-    for m in list(_BAD_KV_RE.finditer(work[0])):
-        take(m)
-        violations.append(
-            Violation("MALFORMED_CLAIM", lineno, None,
-                      f"`{m.group(0).strip()}` is not an exact numeric verification claim")
-        )
-    for metric, pattern in _COUNT_PATTERNS:
-        for m in list(pattern.finditer(work[0])):
+                explicit = bool(sep) or bool(m.group("paren")) or bool(m.group("tick"))
+            verdict, detail = _classify_sha(m.group("tick") + raw_val, explicit)
+            if verdict == "ignore":
+                continue
             take(m)
-            value = count(m, m.group(1) or "", m.group(2))
-            if value is not None:
-                found.append((m.start(), "count", metric, value, m.group(0).strip()))
-    for metric, pattern in _ZERO_WORD_RES:
-        for m in list(pattern.finditer(work[0])):
+            if verdict == "valid":
+                role = "base" if _BASE_ROLE_RE.search(m.group("label")) else "head"
+                found.append((m.start(), "commit_sha", role, detail, m.group(0).strip()))
+            else:
+                violations.append(Violation(verdict, lineno, None, f"commit SHA claim: {detail}"))
+    if has_digit:
+        for m in list(_FRACTION_RE.finditer(work[0])):
+            inexact_prefix = _preceded_by_approx_or_ineq(line, m.start()) or _preceded_by_negation(line, m.start())
+            take(m)
+            if inexact_prefix:
+                violations.append(
+                    Violation("MALFORMED_CLAIM", lineno, None,
+                              f"`{m.group(0).strip()}` is negated or approximate, not an exact count")
+                )
+                continue
+            part, whole = count(m, m.group(1) or "", m.group(2)), count(m, "", m.group(3))
+            if part is not None and whole is not None:
+                raw_metric = m.group(4).lower()
+                snippet = m.group(0).strip()
+                if whole == 0:
+                    violations.append(
+                        Violation("MALFORMED_CLAIM", lineno, None,
+                                  f"`{snippet}` has a zero denominator")
+                    )
+                elif part > whole:
+                    violations.append(
+                        Violation("MALFORMED_CLAIM", lineno, None,
+                                  f"`{snippet}` numerator exceeds denominator")
+                    )
+                elif raw_metric.startswith("pass"):
+                    found.append((m.start(), "count", "passed", part, snippet))
+                    found.append((m.start(), "count", "tests", whole, snippet))
+                elif raw_metric == "killed":
+                    found.append((m.start(), "count", "killed", part, snippet))
+                    found.append((m.start(), "count", "total", whole, snippet))
+                elif raw_metric.startswith("fail"):
+                    found.append((m.start(), "count", "failed", part, snippet))
+                    found.append((m.start(), "count", "tests", whole, snippet))
+                elif raw_metric.startswith("surviv"):
+                    found.append((m.start(), "count", "survived", part, snippet))
+                    found.append((m.start(), "count", "total", whole, snippet))
+                elif raw_metric.startswith("theorem"):
+                    found.append((m.start(), "count", "theorems", part, snippet))
+        if "kill" in low or "mutation" in low:
+            for pattern in _KILL_RATE_RES:
+                for m in list(pattern.finditer(work[0])):
+                    inexact_prefix = _preceded_by_approx_or_ineq(line, m.start()) or _preceded_by_negation(line, m.start())
+                    take(m)
+                    token = m.group(2).rstrip(".,;:")
+                    trailing_approx = bool(m.group(3))
+                    if inexact_prefix or m.group(1) or trailing_approx or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
+                        violations.append(Violation("MALFORMED_CLAIM", lineno, None,
+                                                    f"`{m.group(0).strip()}` is not an exact kill rate"))
+                    else:
+                        found.append((m.start(), "kill_rate", "kill_rate", float(token), m.group(0).strip()))
+        if has_eq_or_colon:
+            for m in list(_KV_COUNT_RE.finditer(work[0])):
+                inexact_prefix = _preceded_by_negation(line, m.start())
+                take(m)
+                if inexact_prefix:
+                    violations.append(
+                        Violation("MALFORMED_CLAIM", lineno, None,
+                                  f"`{m.group(0).strip()}` is negated, not an exact count")
+                    )
+                    continue
+                value = count(m, m.group(2) or "", m.group(3))
+                if value is not None:
+                    raw_metric = m.group(1).lower()
+                    metric = _KV_METRIC_ALIASES.get(raw_metric, raw_metric)
+                    found.append((m.start(), "count", metric, value, m.group(0).strip()))
+    if has_kv_op:
+        for m in list(_BAD_KV_RE.finditer(work[0])):
+            take(m)
+            violations.append(
+                Violation("MALFORMED_CLAIM", lineno, None,
+                          f"`{m.group(0).strip()}` is not an exact numeric verification claim")
+            )
+    if has_digit:
+        for metric, pattern in _COUNT_PATTERNS:
+            for m in list(pattern.finditer(work[0])):
+                inexact_prefix = _preceded_by_approx_or_ineq(line, m.start()) or _preceded_by_negation(line, m.start())
+                take(m)
+                if inexact_prefix:
+                    violations.append(
+                        Violation("MALFORMED_CLAIM", lineno, None,
+                                  f"`{m.group(0).strip()}` is negated or approximate, not an exact count")
+                    )
+                    continue
+                value = count(m, m.group(1) or "", m.group(2))
+                if value is not None:
+                    found.append((m.start(), "count", metric, value, m.group(0).strip()))
+    if "no" in low or "zero" in low or "without" in low or "sorry" in low:
+        for metric, pattern in _ZERO_WORD_RES:
+            for m in list(pattern.finditer(work[0])):
+                neg = _preceded_by_negation(line, m.start())
+                take(m)
+                found.append((m.start(), "nonzero" if neg else "count", metric, 1 if neg else 0, m.group(0).strip()))
+    if "!=" in line or "≠" in line:
+        for m in list(_RC_NEQ_RE.finditer(work[0])):
             neg = _preceded_by_negation(line, m.start())
             take(m)
-            found.append((m.start(), "nonzero" if neg else "count", metric, 1 if neg else 0, m.group(0).strip()))
-    for m in list(_RC_NEQ_RE.finditer(work[0])):
-        neg = _preceded_by_negation(line, m.start())
-        take(m)
-        token = m.group(1).rstrip(".:")
-        if re.fullmatch(r"-?[0-9]+", token):
-            val = int(token)
-            if neg:
-                found.append((m.start(), "exit_status", "rc", val, m.group(0).strip()))
-            elif val == 0:
-                found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
+            token = m.group(1).rstrip(".:")
+            if re.fullmatch(r"-?[0-9]+", token):
+                val = int(token)
+                if neg:
+                    found.append((m.start(), "exit_status", "rc", val, m.group(0).strip()))
+                elif val == 0:
+                    found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
+                else:
+                    found.append((m.start(), "exit_status", "rc_neq", val, m.group(0).strip()))
             else:
-                found.append((m.start(), "exit_status", "rc_neq", val, m.group(0).strip()))
-        else:
-            violations.append(Violation("MALFORMED_CLAIM", lineno, None,
-                                        f"`{m.group(0).strip()}` is not an integer exit code"))
-    for m in list(_RC_ASSIGN_RE.finditer(work[0])):
-        neg = _preceded_by_negation(line, m.start())
-        take(m)
-        token = m.group(1).rstrip(".:")
-        if re.fullmatch(r"-?[0-9]+", token):
-            val = int(token)
+                violations.append(Violation("MALFORMED_CLAIM", lineno, None,
+                                            f"`{m.group(0).strip()}` is not an integer exit code"))
+    if has_eq_or_colon:
+        for m in list(_RC_ASSIGN_RE.finditer(work[0])):
+            neg = _preceded_by_negation(line, m.start())
+            take(m)
+            token = m.group(1).rstrip(".:")
+            if re.fullmatch(r"-?[0-9]+", token):
+                val = int(token)
+                if neg:
+                    if val == 0:
+                        found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
+                    else:
+                        found.append((m.start(), "exit_status", "rc_neq", val, m.group(0).strip()))
+                else:
+                    found.append((m.start(), "exit_status", "rc", val, m.group(0).strip()))
+            else:
+                violations.append(Violation("MALFORMED_CLAIM", lineno, None,
+                                            f"`{m.group(0).strip()}` is not an integer exit code"))
+    if has_digit:
+        for m in list(_RC_PROSE_RE.finditer(work[0])):
+            neg = _preceded_by_negation(line, m.start())
+            take(m)
+            val = int(m.group(1))
             if neg:
                 if val == 0:
                     found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
@@ -1431,21 +1572,12 @@ def _line_claims(
                     found.append((m.start(), "exit_status", "rc_neq", val, m.group(0).strip()))
             else:
                 found.append((m.start(), "exit_status", "rc", val, m.group(0).strip()))
-        else:
-            violations.append(Violation("MALFORMED_CLAIM", lineno, None,
-                                        f"`{m.group(0).strip()}` is not an integer exit code"))
-    for m in list(_RC_PROSE_RE.finditer(work[0])):
-        neg = _preceded_by_negation(line, m.start())
-        take(m)
-        val = int(m.group(1))
-        if neg:
-            if val == 0:
-                found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
-            else:
-                found.append((m.start(), "exit_status", "rc_neq", val, m.group(0).strip()))
-        else:
-            found.append((m.start(), "exit_status", "rc", val, m.group(0).strip()))
-    for pattern in (_STATUS_RE, _OK_RE, _VERDICT_TOKEN_RE):
+    verdict_patterns: tuple[re.Pattern[str], ...] = (
+        (_STATUS_RE, _OK_RE, _VERDICT_TOKEN_RE)
+        if (has_eq_or_colon or "≠" in line)
+        else (_VERDICT_TOKEN_RE,)
+    )
+    for pattern in verdict_patterns:
         for m in list(pattern.finditer(work[0])):
             if pattern is _VERDICT_TOKEN_RE:
                 op_neq = False
@@ -1464,33 +1596,48 @@ def _line_claims(
                     verdict = "fail" if verdict == "pass" else "pass"
                 take(m)
                 found.append((m.start(), "exit_status", "status", verdict, m.group(0).strip()))
-    for m in list(_ALL_PASS_RE.finditer(work[0])):
-        take(m)
-        words = [w.lower() for w in re.findall(r"[A-Za-z']+", m.group(0))]
-        negated = _preceded_by_negation(line, m.start()) or any(w in _NEGATION_WORDS for w in words[:-1])
-        if negated:
-            found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
-        else:
-            found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
-    for m in list(_STANDARD_AXIOMS_RE.finditer(work[0])):
-        neg = _preceded_by_negation(line, m.start())
-        take(m)
-        found.append((m.start(), "axioms", "non_standard" if neg else "standard_only", None, m.group(0).strip()))
-    for m in list(_NO_AXIOMS_RE.finditer(work[0])):
-        neg = _preceded_by_negation(line, m.start())
-        take(m)
-        found.append((m.start(), "axioms", "non_empty" if neg else "set", frozenset(), m.group(0).strip()))
-    for m_list in list(_AXIOM_LIST_RE.finditer(work[0])):
-        take(m_list)
-        names = _axiom_names(m_list.group(1))
-        words = {name.lower() for name in names or ()}
-        if names is None:
-            violations.append(Violation("MALFORMED_CLAIM", lineno, None,
-                                        f"`{m_list.group(0).strip()}` lists no readable axiom name"))
-        elif "standard" in words and words <= {"standard", "only", "the", "three", "lean", "kernel"}:
-            found.append((m_list.start(), "axioms", "standard_only", None, m_list.group(0).strip()))
-        else:
-            found.append((m_list.start(), "axioms", "set", names, m_list.group(0).strip()))
+    if "all" in low:
+        for m in list(_ALL_PASS_RE.finditer(work[0])):
+            take(m)
+            words = [w.lower() for w in re.findall(r"[A-Za-z']+", m.group(0))]
+            negated = _preceded_by_negation(line, m.start()) or any(w in _NEGATION_WORDS for w in words[:-1])
+            if negated:
+                found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
+            else:
+                found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
+    if "axiom" in low:
+        for m in list(_STANDARD_AXIOMS_RE.finditer(work[0])):
+            neg = _preceded_by_negation(line, m.start())
+            take(m)
+            found.append((m.start(), "axioms", "non_standard" if neg else "standard_only", None, m.group(0).strip()))
+        for m in list(_NO_AXIOMS_RE.finditer(work[0])):
+            neg = _preceded_by_negation(line, m.start())
+            take(m)
+            found.append((m.start(), "axioms", "non_empty" if neg else "set", frozenset(), m.group(0).strip()))
+        for m_list in list(_AXIOM_LIST_RE.finditer(work[0])):
+            g_start, g_end = m_list.start(1), m_list.end(1)
+            raw_rest = work[0][g_start:g_end]
+            # If an earlier claim (`0 sorry`, `rc=0`, etc.) was already extracted and
+            # blanked out after a comma separator, truncate before that blanked claim
+            # so honest lines like `axioms: propext, Quot.sound, 0 sorry` do not fail
+            # as a dangling comma while literal `, ???` or trailing `,` still fails closed.
+            cut_at = None
+            for rel_i in range(len(raw_rest)):
+                if raw_rest[rel_i] == " " and line[g_start + rel_i] != " ":
+                    cut_at = rel_i
+                    break
+            if cut_at is not None:
+                raw_rest = raw_rest[:cut_at].rstrip(" \t").rstrip(",")
+            take(m_list)
+            names = _axiom_names(raw_rest)
+            words = {name.lower() for name in names or ()}
+            if names is None:
+                violations.append(Violation("MALFORMED_CLAIM", lineno, None,
+                                            f"`{m_list.group(0).strip()}` lists no readable axiom name"))
+            elif "standard" in words and words <= {"standard", "only", "the", "three", "lean", "kernel"}:
+                found.append((m_list.start(), "axioms", "standard_only", None, m_list.group(0).strip()))
+            else:
+                found.append((m_list.start(), "axioms", "set", names, m_list.group(0).strip()))
     found.sort(key=lambda claim: claim[0])
     return found
 
@@ -1623,11 +1770,13 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
     claims: list[Claim] = []
     ignored = 0
     text = unicodedata.normalize("NFKC", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     if _CONTROL_RE.search(text):
         violations.append(
             Violation("MALFORMED_CLAIMS", 0, None,
                       "the document contains control or bidirectional-override characters")
         )
+        text = _LINE_SEP_CONTROL_RE.sub("\n", text)
         text = _CONTROL_RE.sub(" ", text)
     text = _INVISIBLE_RE.sub("", text)
     known = _KnownSteps(steps)
@@ -1699,6 +1848,13 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
             if was_ignored:
                 ignored += 1
                 continue
+            if _BLOCKQUOTE_START_RE.match(line):
+                unquoted = _BLOCKQUOTE_STRIP_RE.sub("", line)
+                is_bare_number = bool(_BARE_NUM_LINE_RE.match(unquoted)) and not bool(
+                    _NUM_LIST_LINE_RE.match(unquoted)
+                )
+                if not is_bare_number and not _FENCE_OPEN_RE.match(unquoted):
+                    line = unquoted
             m_fence = _FENCE_OPEN_RE.match(line)
             if m_fence is not None:
                 f_ch, f_len, info = m_fence.group(1)[0], len(m_fence.group(1)), m_fence.group(2)
@@ -1839,6 +1995,17 @@ def verify_claims(
             if not _sha_compatible(sha, known_sha):
                 add("COMMIT_SHA_MISMATCH", claim, f"claimed commit `{sha}` is not the receipt commit `{known_sha}`")
 
+    # Track which failing steps are explicitly acknowledged as failing by another claim.
+    acknowledged_fail_steps: set[str] = set()
+    any_unscoped_fail_ack = False
+    for c in claims:
+        if c.kind == "exit_status" and not c.missing:
+            if (c.metric == "status" and c.value == "fail") or (c.metric == "rc" and c.value != 0):
+                if c.step is None:
+                    any_unscoped_fail_ack = True
+                else:
+                    acknowledged_fail_steps.add(c.step)
+
     for claim in claims:
         if claim.kind == "commit_sha":
             continue
@@ -1877,6 +2044,12 @@ def verify_claims(
                 elif claim.value in codes:
                     add("EXIT_CODE_MISMATCH", claim,
                         f"`{claim.text}` but {scope} exited with {claim.value}")
+                elif failing:
+                    for step in failing:
+                        if step.step_id not in acknowledged_fail_steps and not any_unscoped_fail_ack:
+                            add("SUPPRESSED_FAILURE", claim,
+                                f"`{claim.text}` suppresses failure of step `{step.step_id}` ({step.failure()})",
+                                step.step_id)
             elif not failing:
                 add("EXIT_CODE_MISMATCH", claim, f"`{claim.text}` but {scope} passed")
 
@@ -2162,7 +2335,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     for name in args.allow_conditional_axiom:
         if not _AXIOM_NAME_RE.fullmatch(name) or name in NEVER_ALLOWED_AXIOMS:
             parser.error(f"--allow-conditional-axiom {name!r} cannot be authorized")
-    if any(not step_id.strip() or step_id != step_id.strip() or "\n" in step_id for step_id in args.require_step):
+    if any(
+        not step_id.strip() or step_id != step_id.strip() or "\n" in step_id or "\r" in step_id
+        for step_id in args.require_step
+    ):
         parser.error("--require-step needs a clean single-line non-empty STEP_ID")
     if args.max_elapsed_ms is not None and not (0 < args.max_elapsed_ms < float("inf")):
         parser.error("--max-elapsed-ms must be a positive finite number")

@@ -1367,5 +1367,117 @@ class Ep2A2AdversarialTests(GuardHarness):
         )
 
 
+class Ep2B3AdversarialTests(GuardHarness):
+    """Pass B3 adversarial regression tests closing A2's Shard B bypasses and regressions."""
+
+    def test_unicode_neq_trailing_plus_english_approx_negated_counts_and_ok_colon(self) -> None:
+        red_unit = [bundle(unit_tests={"returncode": 1, "ok": False, "failed_count": 1})]
+        # `≠ 0 failed`, `999+ passed`, `over 42 passed`, `less than 1 failed`, `not 1 failed`,
+        # `ok != TBD`, `status != TBD`, and `passed: approx 42` all fail closed as MALFORMED_CLAIM.
+        for bad, recs in (
+            ("`unit_tests`: ≠ 0 failed\n", [bundle()]),
+            ("`unit_tests`: rc=0, 999+ passed\n", [bundle()]),
+            ("`guard_mutation`: rc=0, 100+ killed\n", [guard_mutation()]),
+            ("`guard_mutation`: 99%+ kill rate\n", [guard_mutation()]),
+            ("`unit_tests`: over 42 passed\n", [bundle()]),
+            ("`unit_tests`: more than 42 passed\n", [bundle()]),
+            ("`unit_tests`: at least 42 passed\n", [bundle()]),
+            ("`unit_tests`: approx. 42 passed\n", [bundle()]),
+            ("`unit_tests`: less than 1 failed\n", red_unit),
+            ("`unit_tests`: fewer than 1 failed\n", red_unit),
+            ("`unit_tests`: not 1 failed\n", red_unit),
+            ("`unit_tests`: not 42 passed\n", [bundle()]),
+            ("`unit_tests`: not 42/42 passed\n", [bundle()]),
+            ("`unit_tests`: passed: approx 42, rc=0\n", [bundle()]),
+            ("`unit_tests`: ok != TBD, 42 passed\n", [bundle()]),
+            ("`unit_tests`: status != TBD, 42 passed\n", [bundle()]),
+            ("`unit_tests`: ok: TBD, 42 passed\n", [bundle()]),
+        ):
+            self.assertIn("MALFORMED_CLAIM", self.codes(bad, recs), bad)
+
+        # Ordinary prose `OK: 42 passed` and table `| unit_tests | OK |` work on green and catch suppressed failures!
+        self.assertEqual(self.codes("`unit_tests`: OK: 42 passed\n"), [])
+        self.assertEqual(self.codes("`unit_tests`: OK: 42 passed\n", red_unit), ["SUPPRESSED_FAILURE"])
+        self.assertEqual(self.codes("| `unit_tests` | OK | 42 passed |\n", red_unit), ["SUPPRESSED_FAILURE"])
+
+        # Honest axiom list followed by another claim on the same line must NOT fail as dangling comma!
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound, 0 sorry, rc=0\n"),
+            [],
+        )
+        # While a genuine dangling comma or `, ???` still fails closed.
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound,\n"),
+            ["MALFORMED_CLAIM"],
+        )
+
+    def test_table_cell0_compound_and_paren_blockquotes_and_slash_compounds(self) -> None:
+        # Compound / parenthetical labels in table cell 0 and blockquote-wrapped items cannot bypass!
+        for prose, expected in (
+            ("| `fabricated_step` and `unit_tests` | PASS |\n", ["MISSING_STEP_RECEIPT"]),
+            ("| `fabricated_step` (same as `unit_tests`) | PASS |\n", ["MISSING_STEP_RECEIPT"]),
+            ("| fabricated_step / unit_tests | PASS |\n", ["MISSING_STEP_RECEIPT"]),
+            ("- `fabricated_step` / `unit_tests`: rc=0\n", ["MISSING_STEP_RECEIPT"]),
+            ("- `fabricated_step` and `unit_tests` (all green): rc=0\n", ["MISSING_STEP_RECEIPT"]),
+            ("## unit_tests\n> - `fabricated_step`: rc=0, 42 passed\n", ["MISSING_STEP_RECEIPT"]),
+            ("## unit_tests\n> | `fabricated_step` | PASS | 42 passed |\n", ["MISSING_STEP_RECEIPT"]),
+            ("## unit_tests\n> ## ghost_gate\n> rc=0, 42 passed\n", ["MISSING_STEP_RECEIPT"]),
+            # Leading `> 42 passed` inequality under a heading must NOT be stripped as a blockquote!
+            ("## unit_tests\n> 42 passed\n", ["MALFORMED_CLAIM"]),
+        ):
+            self.assertEqual(self.codes(prose), expected, prose)
+        # Clean blockquote with real step stays green.
+        self.assertEqual(self.codes("> - `unit_tests`: rc=0, 42 passed\n"), [])
+
+    def test_line_smuggling_extended_invisible_chars_vacuous_rc_neq_uppercase_sha_and_live_vacuity_keys(self) -> None:
+        # 1. Bare `\r` and Unicode `\u2028` cannot hide claims behind a `Historical:` prefix!
+        self.assertEqual(
+            self.codes("Historical: old run\r`unit_tests`: 999 passed, rc=0\n`unit_tests`: rc=0\n"),
+            ["INFLATED_COUNT"],
+        )
+        self.assertEqual(
+            self.codes("Historical: old run\u2028`unit_tests`: 999 passed, rc=0\n`unit_tests`: rc=0\n"),
+            ["INFLATED_COUNT", "MALFORMED_CLAIMS"],
+        )
+        # Extended invisible chars (`\u034f`, `\u061c`, Unicode tag `\U000e0020`) cannot hide inflated counts!
+        for inv in ("\u034f", "\u061c", "\u180e", "\U000e0020"):
+            self.assertEqual(
+                self.codes(f"`unit_tests`: 9{inv}99 passed, rc=0\n"),
+                ["INFLATED_COUNT"],
+                repr(inv),
+            )
+
+        # 2. Vacuous `rc != 99` on a failing step (`rc=1`) cannot pass without acknowledging failure!
+        red_unit = [bundle(unit_tests={"returncode": 1, "ok": False})]
+        self.assertEqual(self.codes("`unit_tests`: rc != 99\n", red_unit), ["SUPPRESSED_FAILURE"])
+        self.assertEqual(self.codes("`unit_tests`: FAIL, rc != 99\n", red_unit), [])
+
+        # 3. Unquoted uppercase hex SHA, `???`, `pending`, and `<sha>` placeholders fail closed!
+        for bad_sha in (
+            "Commit SHA: DEADBEEFCAFE\n`unit_tests`: rc=0\n",
+            "Commit SHA: ???\n`unit_tests`: rc=0\n",
+            "Commit SHA: pending\n`unit_tests`: rc=0\n",
+            "Commit SHA: <sha>\n`unit_tests`: rc=0\n",
+        ):
+            self.assertEqual(self.codes(bad_sha), ["INVALID_COMMIT_SHA"], bad_sha)
+
+        # 4. Live `check_trusted --audit-vacuity` keys (`leanFiles`/`rustFiles`) and `graph`/`declarations` types.
+        for bad_ct in (
+            {
+                "trusted": {"leanFiles": True, "rustFiles": 0},
+                "rustcCapture": {"leanFiles": 0, "rustFiles": 9},
+                "downstream": {"leanFiles": 55, "rustFiles": 0},
+            },
+            {**CHECK_TRUSTED, "graph": []},
+            {**CHECK_TRUSTED, "declarations": {}},
+        ):
+            self.assertIn("MALFORMED_RECEIPT", self.codes("`check_trusted`: rc=0\n", [bad_ct]), bad_ct)
+
+        # 5. `--require-step` rejects embedded `\r`.
+        c = str(self.write("c.md", "`unit_tests`: rc=0\n"))
+        r = str(self.write("r.json", bundle()))
+        self.assertEqual(self.run_main(["--claims", c, "--receipt", r, "--require-step", "a\rb"])[0], 2)
+
+
 if __name__ == "__main__":
     unittest.main()
