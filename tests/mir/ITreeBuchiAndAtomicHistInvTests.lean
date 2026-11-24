@@ -19,15 +19,21 @@ import Anneal.AtomicHistInv
    ghost-log committer, safety under arbitrary contention, termination under
    bounded contention, non-miraculous prophecy elimination
    (`u64_counter_prophecy_eliminated`), concrete strong-fairness `EnvStrategy`
-   termination, `#4162` reactive ticket service, a concrete `AtomicDualContract`
-   + threaded MiniRust trace `5 → 8 → 8 (CAS✗) → 9 (CAS✓) → 9`, and universal
-   symbolic `Mach` + `MachTB` `mrCellWP` witnesses (`u8_counter_mr_bm_and_tb_witness`).
+   termination, `#4162` reactive ticket service (both abstract and 8-byte Tree
+   Borrows `u64` wrapping service `u64_mr_tb_wrapping_service_witness`), a
+   concrete `AtomicDualContract` + threaded MiniRust trace
+   `5 → 8 → 8 (CAS✗) → 9 (CAS✓) → 9`, universal symbolic `Mach` + `MachTB`
+   `mrCellWP` / `mrBudgetWP` / `mrStrongCellWP` witnesses on both `u8` and 8-byte
+   little-endian `u64` (`u64_counter_mr_bm_and_tb_complete`,
+   `u64_mr_tb_weak_vs_strong_separation`, `u64_mr_tb_fairBuchiSat_committer`).
 2. **Negative fail-closed canaries**: `ITree.spin` refutes `Eventually`,
    `Until`, `InfOften` and `BuchiSat`; loops that stop accepting refute
    `InfOften`; non-reflexive / non-transitive relations, non-`hist_inv`-closed
-   closure preconditions, double-fire committers, weak-vs-strong CAS separation,
-   unbounded contention, unrealizable `resolve` / inconsistent-prophecy miracles,
-   and UB / out-of-range `specPanic` / `Frozen`-write steps are rejected.
+   closure preconditions, double-fire committers, weak-vs-strong CAS 2-axis
+   separation (abstract and MiniRust `u8`/`u64`), unbounded contention,
+   unrealizable `resolve` / inconsistent-prophecy miracles, `mrLoadStutter`
+   CoBuchi vacuity separation, finite-width `ticketService` overflow at `u8`/
+   `u64` `MAX`, and UB / out-of-range `specPanic` / `Frozen`-write steps.
 3. **Compile-time audit (`run_cmd`)**: import isolation (`ITreeBuchi` +
    `AtomicHistInv`), axioms, strict definition safety, theorem non-triviality,
    and theorem-count floors over all three namespaces, with 13 real kernel
@@ -1004,6 +1010,167 @@ theorem u8_mr_weak_vs_strong_separation (b₀ : UInt8) (acc₀ : List MiniRustSp
   have h' : some n = some (x % 256) := h
   cases h'; exact hrep8 x
 
+/-- Quiescent wrapping 64-bit environment (`rely := Eq`, `|x| Some((x + 1) % 2^64)`). -/
+def quietU64WrapEnv : AtomicEnv Nat PUnit PUnit := ⟨Eq, u64WrapTicketSpec, trivialGC⟩
+
+theorem quietU64Wrap_realizable : quietU64WrapEnv.Realizable where
+  rely_refl _ := rfl
+  post_mut_total _ x _ := ⟨PUnit.unit, some ((x + 1) % 2 ^ 64), rfl⟩
+  gc_post_total _ _ _ _ := ⟨PUnit.unit, trivial⟩
+  resolve_total _ := trivial
+
+theorem quietU64Wrap_pre (c : Nat) :
+    TryUpdatePre quietU64WrapEnv (fun _ _ => True) c PUnit.unit PUnit.unit (.fresh c) where
+  cellInv := ⟨fun _ => trivial, fun _ _ => trivial⟩
+  closure_pre _ _ _ _ := trivial
+  closure_step _ _ _ _ _ _ _ := ⟨trivial, trivial⟩
+  rely_sound _ _ _ := trivial
+  comm_unshot := rfl
+
+/--
+**Full 4-quadrant 2-axis weak-vs-strong CAS separation on 8-byte Tree Borrows `u64`**:
+for EVERY 64-bit word `x₀ : UInt64` and EVERY access log `acc₀`:
+1. Quiescent strong CAS (`mrStrongCellWP`) terminates (`DWP` with `tbU64MInv ∧ CreusotPost`)
+   and is non-vacuous (`¬ DWP … False`);
+2. Quiescent weak CAS (`mrCellWP`) refutes `DWP` (spurious failures);
+3. Contending strong CAS (`tbU64MRely (fun _ _ => True)`) preserves `Always` (`MachTB.wfLive`);
+4. Contending strong CAS refutes `DWP` via genuine MiniRust value-mismatch failures
+   (`x ↦ x + 1` mod `2^64`).
+-/
+theorem u64_mr_tb_weak_vs_strong_separation (x₀ : UInt64) (acc₀ : List MiniRustSpec.Gen.Access)
+    (budget : Nat) :
+    let s₀ : AtomicSt Nat PUnit PUnit :=
+      ⟨x₀.toNat, PUnit.unit, .fresh x₀.toNat, 0, PUnit.unit, budget⟩
+    DWP (mrStrongCellWP quietU64WrapEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely Eq)) (tryUpdateLoop Nat)
+      (fun r ms => tbU64MInv ms.1 ms.2.cell ∧
+        CreusotPost quietU64WrapEnv (fun _ _ => True) x₀.toNat PUnit.unit PUnit.unit
+          (.fresh x₀.toNat) r ms.2)
+      (tbU64Mach x₀ acc₀, s₀) ∧
+    ¬ DWP (mrStrongCellWP quietU64WrapEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely Eq)) (tryUpdateLoop Nat) (fun _ _ => False) (tbU64Mach x₀ acc₀, s₀) ∧
+    ¬ DWP (mrCellWP quietU64WrapEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely Eq)) (tryUpdateLoop Nat) (fun _ _ => True) (tbU64Mach x₀ acc₀, s₀) ∧
+    Always (mrStrongCellWP u64WrapTicketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (fun _ _ => True)))
+      (fun ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        HistInvSt u64WrapTicketEnv (fun _ _ => True) x₀.toNat PUnit.unit ms.2)
+      (fun r ms => (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+        CreusotPost u64WrapTicketEnv (fun _ _ => True) x₀.toNat PUnit.unit PUnit.unit
+          (.fresh x₀.toNat) r ms.2)
+      (tryUpdateLoop Nat) (tbU64Mach x₀ acc₀, s₀) ∧
+    ¬ DWP (mrStrongCellWP u64WrapTicketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (fun _ _ => True))) (tryUpdateLoop Nat) (fun _ _ => True)
+      (tbU64Mach x₀ acc₀, s₀) := by
+  intro s₀
+  have hadmQ := tbU64_mrCellAdmissible quietU64WrapEnv (fun _ => rfl)
+  have hadmC := tbU64_mrCellAdmissible u64WrapTicketEnv (fun _ => trivial)
+  have hm₀ : tbU64MInv (tbU64Mach x₀ acc₀) s₀.cell := ⟨x₀, acc₀, rfl, rfl⟩
+  have hs₀ : InitSt x₀.toNat PUnit.unit PUnit.unit (.fresh x₀.toNat) s₀ := ⟨rfl, rfl, rfl, rfl, rfl⟩
+  have hrep64 : ∀ n : Nat,
+      MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (((n + 1) % 2 ^ 64 : Nat) : Int) = true :=
+    fun n => (u64_can_represent_iff _).2 (Nat.mod_lt _ (Nat.pow_pos (by decide)))
+  have hrepFn : ∀ f₂ x f₃ (n : Nat), u64WrapTicketSpec.hist_inv PUnit.unit f₂ →
+      u64WrapTicketSpec.post_mut f₂ x f₃ (some n) → True →
+      MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (n : Int) = true := by
+    intro _ x _ n _ h _
+    have h' : some n = some ((x + 1) % 2 ^ 64) := h
+    cases h'; exact hrep64 x
+  have hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m →
+      tbU64MRely (fun _ _ => True) m m' → MiniRustSpec.Correspondence.MachTB.wfLive m' := by
+    rintro m m' _ ⟨_, x', _, acc', _, _, rfl⟩; exact tbU64_wfLive x' acc'
+  have hdiff : ∀ m c, tbU64MInv m c →
+      ∃ m₁ c₁, tbU64MRely (fun _ _ => True) m m₁ ∧ tbU64MInv m₁ c₁ ∧ c₁ ≠ c := by
+    rintro m c ⟨x, acc, rfl, rfl⟩
+    refine ⟨tbU64Mach (x + 1) acc, (x + 1).toNat, ⟨x, x + 1, acc, acc, trivial, rfl, rfl⟩,
+      ⟨x + 1, acc, rfl, rfl⟩, ?_⟩
+    intro heq
+    have h1 : (x + 1).toNat = (x.toNat + 1) % 2 ^ 64 := UInt64.toNat_add x 1
+    have hlt : x.toNat < 2 ^ 64 := x.toNat_lt
+    rw [h1] at heq
+    by_cases htop : x.toNat + 1 < 2 ^ 64
+    · rw [Nat.mod_eq_of_lt htop] at heq; omega
+    · have hmax : x.toNat + 1 = 2 ^ 64 := by omega
+      rw [hmax, Nat.mod_self] at heq; omega
+  exact ⟨tryUpdate_mr_strong_quiescent_dwp (fun _ _ h => h) (quietU64Wrap_pre x₀.toNat)
+      hrepFn hadmQ hm₀ hs₀,
+    mrStrongCellWP_nonvacuous_not_false quietU64Wrap_realizable (quietU64Wrap_pre x₀.toNat)
+      hrepFn hadmQ hm₀ hs₀,
+    tryUpdate_mr_weak_quiescent_not_dwp hadmQ
+      (fun _ x => ⟨PUnit.unit, (x + 1) % 2 ^ 64, rfl, hrep64 x⟩) hm₀ _,
+    Always.mono_wp (mrCellWP_refines_strong _ _ _ _ _)
+      (tryUpdate_mr_tb_wfLive_safety (u64WrapTicket_pre x₀.toNat) hrepFn hadmC hrely_wf
+        hm₀ (tbU64_wfLive x₀ acc₀) hs₀),
+    tryUpdate_mr_strong_contention_not_dwp hadmC
+      (fun _ x => ⟨PUnit.unit, (x + 1) % 2 ^ 64, rfl, hrep64 x⟩) hdiff hm₀ _⟩
+
+/--
+**Machine-backed one-shot committer `FairBuchiSat` monitor on 8-byte Tree Borrows `u64`**:
+pins the 2-state `Bool` committer automaton directly to `mrCellWP` on `tbU64Mach`,
+preserving `tbU64MInv ∧ MachTB.wfLive ∧ HistInvSt` at every step.
+-/
+theorem u64_mr_tb_fairBuchiSat_committer (delta limit : Nat) (hno : limit + delta ≤ 2 ^ 64)
+    (x₀ : UInt64) (acc₀ : List MiniRustSpec.Gen.Access) (budget : Nat) :
+    let s₀ : AtomicSt Nat Nat (List (Nat × Nat)) :=
+      ⟨x₀.toNat, 0, .fresh x₀.toNat, 0, [], budget⟩
+    FairBuchiSat (mrCommitterSpec (counterEnv delta limit) (· ≤ ·)
+        MiniRustSpec.AtomicIntrinsicsMR.tbPtr MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr
+        MiniRustSpec.AtomicIntrinsicsMR.itU64 (tbU64MRely (· ≤ ·))
+        (fun m c => tbU64MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m)
+        x₀.toNat 0 [] (.fresh x₀.toNat))
+      (fun _ i o ms ms' _ => CasWon i o ms ms') (tryUpdateLoop Nat) false
+      (tbU64Mach x₀ acc₀, s₀) := by
+  intro s₀
+  have hadm := tbU64_mrCellAdmissible (counterEnv delta limit) Nat.le_refl
+  have hadm' : MrCellAdmissible (counterEnv delta limit)
+      MiniRustSpec.AtomicIntrinsicsMR.tbPtr MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr
+      MiniRustSpec.AtomicIntrinsicsMR.itU64 (tbU64MRely (· ≤ ·))
+      (fun m c => tbU64MInv m c ∧ MiniRustSpec.Correspondence.MachTB.wfLive m) :=
+    { rely_refl := fun m c hm => hadm.rely_refl m c hm.1
+      rely_pres := fun m c m' hm hrel =>
+        let ⟨c', hc', hm'⟩ := hadm.rely_pres m c m' hm.1 hrel
+        let ⟨_, x', _, acc', _, _, hmeq⟩ := hrel
+        ⟨c', hc', hm', hmeq ▸ tbU64_wfLive x' acc'⟩
+      load_ok := fun m c hm => hadm.load_ok m c hm.1
+      load_val := fun m c v m' hm hok =>
+        let ⟨hv, hm'⟩ := hadm.load_val m c v m' hm.1 hok
+        ⟨hv, hm', MiniRustSpec.AtomicIntrinsicsMR.evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1⟩
+      cas_ok := fun m c e d hm hr => hadm.cas_ok m c e d hm.1 hr
+      cas_val := fun m c e d ret m' hm hr hok =>
+        let ⟨hret, hs, hk⟩ := hadm.cas_val m c e d ret m' hm.1 hr hok
+        let hwf := MiniRustSpec.AtomicIntrinsicsMR.evalIntrinsicM_atomic_tb_wfLive rfl hm.2 hok.1
+        ⟨hret, fun he => ⟨hs he, hwf⟩, fun hne => ⟨hk hne, hwf⟩⟩ }
+  refine tryUpdate_mr_fairBuchiSat_committer (counter_pre delta limit x₀.toNat 0 []) ?_ hadm'
+    ⟨⟨x₀, acc₀, rfl, rfl⟩, tbU64_wfLive x₀ acc₀⟩ ⟨rfl, rfl, rfl, rfl, rfl⟩
+  intro _ x _ n _ ⟨_, hr⟩ _
+  by_cases hx : x < limit
+  · simp only [hx, ↓reduceIte] at hr; cases hr
+    exact (u64_can_represent_iff _).2 (by omega)
+  · simp only [hx, ↓reduceIte] at hr; cases hr
+
+/-- Positive `#4162` `-> !` 8-byte Tree Borrows wrapping `u64` service witness. -/
+theorem u64_mr_tb_wrapping_service_witness (x₀ : UInt64) (acc₀ : List MiniRustSpec.Gen.Access)
+    (Q : PEmpty.{1} → MrAtomicSt MiniRustSpec.Interp.TBM PUnit PUnit → Prop) :
+    let m₀ := tbU64Mach x₀ acc₀
+    let s₀ : AtomicSt Nat PUnit PUnit := ⟨x₀.toNat, PUnit.unit, .fresh x₀.toNat, 0, PUnit.unit, 0⟩
+    Always (mrBudgetWP u64WrapTicketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (fun _ _ => True))) MrWrapSvcInv Q (ticketService 0) (m₀, s₀) ∧
+      InfOften (mrBudgetWP u64WrapTicketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (fun _ _ => True))) MrWrapTicketCommit Q (ticketService 0) (m₀, s₀) ∧
+      ¬ DWP (mrBudgetWP u64WrapTicketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (fun _ _ => True))) (ticketService 0) Q (m₀, s₀) :=
+  tryUpdate_mr_tb_u64_wrapping_service x₀ acc₀ Q
+
 /-! ## 2. Negative Fail-Closed Canaries -/
 
 /-! ### 2.1 Silent divergence -/
@@ -1222,6 +1389,62 @@ theorem canary_mr_loadStutter_cobuchi_vacuity (x : UInt64) (acc : List MiniRustS
    mrCellWP_loadStutter_cobuchi_vacuous (tbU64_mrCellAdmissible ticketEnv Nat.le_refl)
       ⟨x, acc, rfl, rfl⟩ Qtb⟩
 
+/--
+**Fail-closed finite-width `#4162` service overflow canary**: unbounded `ticketService`
+(`|x| Some(x + 1)`) fails closed (`¬ DWLP`) at `MAX` on BOTH `u8` (`255`) and `u64`
+(`2^64 - 1`), on BOTH `BasicMemory` (`Mach`) and `TreeBorrowsMemory` (`MachTB`).
+-/
+theorem canary_mr_ticketService_finite_width_overflow (acc : List MiniRustSpec.Gen.Access)
+    (Qbm : PEmpty.{1} → MrAtomicSt MiniRustSpec.Interp.BM PUnit PUnit → Prop)
+    (Qtb : PEmpty.{1} → MrAtomicSt MiniRustSpec.Interp.TBM PUnit PUnit → Prop) :
+    let u8Max : UInt8 := UInt8.ofNat 255
+    let u64MaxW : UInt64 := UInt64.ofNat (2 ^ 64 - 1)
+    let s8 : AtomicSt Nat PUnit PUnit :=
+      ⟨u8Max.toNat, PUnit.unit, .fresh u8Max.toNat, 0, PUnit.unit, 0⟩
+    let s64 : AtomicSt Nat PUnit PUnit :=
+      ⟨u64MaxW.toNat, PUnit.unit, .fresh u64MaxW.toNat, 0, PUnit.unit, 0⟩
+    ¬ DWLP (mrBudgetWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely (· ≤ ·))) (ticketService 0) Qbm (bmU8Mach u8Max acc, s8) ∧
+    ¬ DWLP (mrBudgetWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (tbU8MRely (· ≤ ·))) (ticketService 0) Qtb (tbU8Mach u8Max acc, s8) ∧
+    ¬ DWLP (mrBudgetWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (bmU64MRely (· ≤ ·))) (ticketService 0) Qbm (bmU64Mach u64MaxW acc, s64) ∧
+    ¬ DWLP (mrBudgetWP ticketEnv MiniRustSpec.AtomicIntrinsicsMR.tbPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU64
+        (tbU64MRely (· ≤ ·))) (ticketService 0) Qtb (tbU64Mach u64MaxW acc, s64) := by
+  intro u8Max u64MaxW s8 s64
+  have hout8 : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU8
+      ((u8Max.toNat + 1 : Nat) : Int) = false := by
+    cases h : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU8
+        ((u8Max.toNat + 1 : Nat) : Int)
+    · rfl
+    · have := (u8_can_represent_iff _).1 h; simp [u8Max] at this
+  have hout64 : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+      ((u64MaxW.toNat + 1 : Nat) : Int) = false := by
+    cases h : MiniRustSpec.Interp.IntType.can_represent MiniRustSpec.AtomicIntrinsicsMR.itU64
+        ((u64MaxW.toNat + 1 : Nat) : Int)
+    · rfl
+    · have := (u64_can_represent_iff _).1 h; simp [u64MaxW] at this
+  exact ⟨mr_ticketService_overflow_canary u8_layout rfl (by decide) (Or.inl rfl)
+      ⟨u8Max, u8Max, acc, acc, Nat.le_refl _, rfl, rfl⟩
+      ⟨u8Max, u8Max, _, _, Nat.le_refl _, rfl, rfl⟩
+      (bmU8_typedLoad u8Max acc) ⟨_, bmU8_typedLoad u8Max _⟩ hout8 s8 rfl Qbm,
+    mr_ticketService_overflow_canary u8_layout rfl (by decide) (Or.inl rfl)
+      ⟨u8Max, u8Max, acc, acc, Nat.le_refl _, rfl, rfl⟩
+      ⟨u8Max, u8Max, _, _, Nat.le_refl _, rfl, rfl⟩
+      (tbU8_typedLoad u8Max acc) ⟨_, tbU8_typedLoad u8Max _⟩ hout8 s8 rfl Qtb,
+    mr_ticketService_overflow_canary u64_layout rfl (by decide) (Or.inr (Or.inr (Or.inr rfl)))
+      ⟨u64MaxW, u64MaxW, acc, acc, Nat.le_refl _, rfl, rfl⟩
+      ⟨u64MaxW, u64MaxW, _, _, Nat.le_refl _, rfl, rfl⟩
+      (bmU64_typedLoad u64MaxW acc) ⟨_, bmU64_typedLoad u64MaxW _⟩ hout64 s64 rfl Qbm,
+    mr_ticketService_overflow_canary u64_layout rfl (by decide) (Or.inr (Or.inr (Or.inr rfl)))
+      ⟨u64MaxW, u64MaxW, acc, acc, Nat.le_refl _, rfl, rfl⟩
+      ⟨u64MaxW, u64MaxW, _, _, Nat.le_refl _, rfl, rfl⟩
+      (tbU64_typedLoad u64MaxW acc) ⟨_, tbU64_typedLoad u64MaxW _⟩ hout64 s64 rfl Qtb⟩
+
 /-! ### 2.4 Unbounded contention: safe but not live -/
 
 theorem canary_unbounded_contention :
@@ -1356,7 +1579,7 @@ run_cmd do
         throwError "import-isolation violation: {modName} imports {imp.module}"
   let nss : Array Name :=
     #[`Anneal.ITreeBuchi, `Anneal.AtomicHistInv, `Anneal.ITreeBuchiAndAtomicHistInvTests]
-  let floors : Array Nat := #[675, 260, 84]
+  let floors : Array Nat := #[675, 290, 90]
   let userName (c : Name) : Name := (privateToUserName? c).getD c
   let decls := env.constants.fold (init := (#[] : Array (Name × ConstantInfo)))
     fun acc c ci => if nss.any (·.isPrefixOf (userName c)) then acc.push (c, ci) else acc
@@ -1417,7 +1640,17 @@ run_cmd do
     , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u8_fair
     , ``Anneal.AtomicHistInv.tryUpdate_mr_strong_quiescent_dwp
     , ``Anneal.AtomicHistInv.tryUpdate_mr_weak_quiescent_not_dwp
+    , ``Anneal.AtomicHistInv.mrCellWP_refines_strong
+    , ``Anneal.AtomicHistInv.mrStrongCellWP_nonvacuous_not_false
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_strong_contention_not_dwp
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_fairBuchiSat_committer
+    , ``Anneal.AtomicHistInv.mr_ticketService_overflow_canary
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u64_wrapping_service
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_mr_weak_vs_strong_separation
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_mr_tb_weak_vs_strong_separation
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_mr_tb_fairBuchiSat_committer
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_mr_tb_wrapping_service_witness
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.canary_mr_ticketService_finite_width_overflow
     , ``Anneal.AtomicHistInv.tryUpdate_mr_tb_u8_fair
     , ``Anneal.AtomicHistInv.leValue_leBytes
     , ``Anneal.AtomicHistInv.bmU64_mrCellAdmissible

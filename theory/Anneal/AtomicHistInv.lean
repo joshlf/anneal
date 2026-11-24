@@ -63,8 +63,16 @@ A specification and verification library for `SeqCst` `Atomic::try_update` /
   `mrCellWP_loadStutter_cobuchi_vacuous`), bounded-contention unconditional
   machine termination (`mrBudgetWP`, `mrCellWP_refines_budget`,
   `tryUpdate_mr_dwp_ranked`, `tryUpdate_mr_eventually`,
-  `tryUpdate_mr_tb_wfLive_dwp`, `mrBudgetWP_nonvacuous_not_false`), and
-  fail-closed rejection of misaligned / `u128` / `Frozen` UB.
+  `tryUpdate_mr_tb_wfLive_dwp`, `mrBudgetWP_nonvacuous_not_false`),
+  machine-level weak-vs-strong CAS 2-axis separation (`mrStrongCellWP`,
+  `mrCellWP_refines_strong`, `mrStrongCellWP_nonvacuous_not_false`,
+  `tryUpdate_mr_strong_quiescent_dwp`, `tryUpdate_mr_weak_quiescent_not_dwp`,
+  `tryUpdate_mr_strong_contention_not_dwp`), machine-backed one-shot committer
+  `FairBuchiSat` monitor (`mrCommitterSpec`, `tryUpdate_mr_fairBuchiSat_committer`),
+  finite-width saturation canary (`mr_ticketService_overflow_canary`) and
+  positive `#4162` 8-byte Tree Borrows wrapping `u64` service
+  (`tryUpdate_mr_tb_u64_wrapping_service`), and fail-closed rejection of
+  misaligned / `u128` / `Frozen` UB.
 * **§9** Fail-closed boundaries: irreflexive relations (on both `Err` and failed
   CAS), non-transitive relations, non-`hist_inv`-closed closure preconditions,
   one-shot committer double-fire rejection, weak-vs-strong CAS 2-axis
@@ -4818,6 +4826,571 @@ theorem tryUpdate_mr_weak_quiescent_not_dwp {M FState G : Type} [Memory M] [Memo
       rw [show (false, w.toNat) = casOut s.cell n false w.toNat from rfl, tryCasK_false,
         ret_bind]
       rfl
+
+/-- Every `mrCellWP` safety property transfers automatically to `mrStrongCellWP`. -/
+theorem mrCellWP_refines_strong {M FState G : Type} [Memory M] [MemoryOps M]
+    (A : AtomicEnv Nat FState G)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop)
+    (i : (AtomicCellE Nat).I)
+    (K : (AtomicCellE Nat).O i → MrAtomicSt M FState G → Prop)
+    (ms : MrAtomicSt M FState G)
+    (hw : (mrCellWP A ptr pty t mRely).wp i K ms) :
+    (mrStrongCellWP A ptr pty t mRely).wp i K ms := by
+  match i with
+  | .call (.cas _ _) =>
+    intro m₁ hm
+    refine ⟨(hw m₁ hm).1, fun ret m₂ hok =>
+      ⟨((hw m₁ hm).2 ret m₂ hok).1, fun b =>
+        ⟨(((hw m₁ hm).2 ret m₂ hok).2 b).1, fun he => ((((hw m₁ hm).2 ret m₂ hok).2 b).2 he).1⟩⟩⟩
+  | .call .load => exact hw
+  | .call (.callF _) => exact hw
+  | .call .dropF => exact hw
+  | .call .recv => exact hw
+
+/--
+**General non-vacuity of `mrStrongCellWP`**: for ANY memory model `M`, ANY
+`Realizable A`, and ANY coupled `MrCellAdmissible`, `mrStrongCellWP` cannot
+discharge `DWP … False` from any admissible initial state `(m₀, s₀)`.
+-/
+theorem mrStrongCellWP_nonvacuous_not_false {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hR : A.Realizable)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    ¬ DWP (mrStrongCellWP A ptr pty t mRely) (tryUpdateLoop Nat) (fun _ _ => False) (m₀, s₀) := by
+  intro hd
+  have hrf₀ := hadm.rely_refl m₀ s₀.cell hm₀
+  obtain ⟨v₀, m₁, hl₀⟩ := hadm.load_ok m₀ s₀.cell hm₀
+  obtain ⟨hv₀, hm₁⟩ := hadm.load_val m₀ s₀.cell v₀ m₁ hm₀ hl₀
+  have h1 := (((DWP.vis_iff _ _ _ _ _).1 hd m₀ hrf₀).2 v₀ m₁ hl₀).2 0
+  dsimp only [loadAns] at h1
+  rw [iter_tryBody_eq] at h1
+  have hcall := (DWP.vis_iff _ _ _ _ _).1 h1
+  obtain ⟨f', r, hpost⟩ := hR.post_mut_total _ _ hcall.1
+  have h2 := hcall.2 f' r hpost
+  cases r with
+  | none =>
+    change DWP (mrStrongCellWP A ptr pty t mRely)
+      (tryCallK v₀.toNat (callOut v₀.toNat none) >>= _) _ _ at h2
+    simp only [tryCallK_none, retAfterDrop, vis_bind] at h2
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨v₁, m₂, hl₁⟩ := hadm.load_ok m₁ s₀.cell hm₁
+    have h3 := (((DWP.vis_iff _ _ _ _ _).1 h2 m₁ hrf₁).2 v₁ m₂ hl₁).2 0 (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h3
+  | some next =>
+    change DWP (mrStrongCellWP A ptr pty t mRely)
+      (tryCallK v₀.toNat (callOut v₀.toNat (some next)) >>= _) _ _ at h2
+    rw [tryCallK_some, vis_bind] at h2
+    have hnext_rep : IntType.can_represent t (next : Int) = true := by
+      have hrl : Rel init v₀.toNat := by
+        rw [hv₀, hs₀.1]; exact hpre.cellInv.refl init
+      have hf : A.fSpec.hist_inv f₀ s₀.fst := hs₀.2.1 ▸ A.fSpec.hist_inv_laws.refl f₀
+      exact hrep s₀.fst v₀.toNat f' next hf hpost hrl
+    have hrf₁ := hadm.rely_refl m₁ s₀.cell hm₁
+    obtain ⟨ret, m₂, hcas⟩ := hadm.cas_ok m₁ s₀.cell v₀.toNat next hm₁ hnext_rep
+    obtain ⟨hret, hstore, _⟩ := hadm.cas_val m₁ s₀.cell v₀.toNat next ret m₂ hm₁ hnext_rep hcas
+    have heq : ret.toNat = v₀.toNat := hret.trans hv₀.symm
+    have hwin := ((((DWP.vis_iff _ _ _ _ _).1 h2 m₁ hrf₁).2 ret m₂ hcas).2 0).2 heq
+    obtain ⟨g', hg'⟩ := hR.gc_post_total _ _ _ hwin.2.1
+    have h3 := hwin.2.2 g' hg'
+    simp only [tryCasK_true, retAfterDrop, vis_bind] at h3
+    have hm₂ : MInv m₂ next := hstore hv₀.symm
+    have hrf₂ := hadm.rely_refl m₂ next hm₂
+    obtain ⟨v₂, m₃, hl₂⟩ := hadm.load_ok m₂ next hm₂
+    have h4 := (((DWP.vis_iff _ _ _ _ _).1 h3 m₂ hrf₂).2 v₂ m₃ hl₂).2 0 (hR.resolve_total f')
+    simp only [ret_bind, Sum.elim_inr, DWP.ret_iff] at h4
+
+/--
+**Second axis of MiniRust strong-CAS separation**: under unbounded concurrent
+machine interference where other threads can always advance the cell to a
+distinct value (`hstep_diff`), even **strong** `compare_exchange`
+(`mrStrongCellWP`, zero spurious failures) suffers an infinite stream of genuine
+MiniRust value-mismatch CAS failures (`atomicCompareExchange_failure`), refuting
+`DWP` for every postcondition `Q`.
+-/
+theorem tryUpdate_mr_strong_contention_not_dwp {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    (hsome : ∀ f x, ∃ f' n, A.fSpec.post_mut f x f' (some n) ∧
+      IntType.can_represent t (n : Int) = true)
+    (hstep_diff : ∀ m c, MInv m c → ∃ m₁ c₁, mRely m m₁ ∧ MInv m₁ c₁ ∧ c₁ ≠ c)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G} (hm₀ : MInv m₀ s₀.cell)
+    (Q : Except Nat Nat → MrAtomicSt M FState G → Prop) :
+    ¬ DWP (mrStrongCellWP A ptr pty t mRely) (tryUpdateLoop Nat) Q (m₀, s₀) := by
+  intro h
+  obtain ⟨v, m₂, hload⟩ := hadm.load_ok m₀ _ hm₀
+  have h1 := (((DWP.vis_iff _ _ _ _ _).1 h m₀ (hadm.rely_refl _ _ hm₀)).2 v m₂ hload).2 0
+  obtain ⟨hv, hm2⟩ := hadm.load_val m₀ _ v m₂ hm₀ hload
+  refine DWP.induct (fun x ms => SpuriousShape t MInv x ms → False) ?_ h1
+    ⟨hv ▸ hm2, Or.inl rfl⟩
+  rintro x ⟨m, s⟩ hx ⟨hm, hshape⟩
+  dsimp only at hm hshape
+  rcases hshape with rfl | rfl | ⟨n, hn, rfl⟩
+  · rw [iter_tryBody_observe] at hx
+    obtain ⟨f', n, hpost, hn⟩ := hsome s.fst s.cell
+    refine hx.2 f' (some n) hpost ⟨hm, Or.inr (Or.inr ⟨n, hn, ?_⟩)⟩
+    exact (congrArg (· >>= mrIterK) (tryCallK_some s.cell n)).trans (vis_bind _ _ _)
+  · rw [ITree.observe_tau] at hx
+    exact hx ⟨hm, Or.inl rfl⟩
+  · rw [ITree.observe_vis] at hx
+    obtain ⟨m₁, c₁, hrel₁, hm₁, hne₁⟩ := hstep_diff m s.cell hm
+    obtain ⟨ret, m₂', hcas⟩ := hadm.cas_ok m₁ c₁ s.cell n hm₁ hn
+    obtain ⟨hret, _, hkeep⟩ := hadm.cas_val m₁ c₁ s.cell n ret m₂' hm₁ hn hcas
+    have hne : ret.toNat ≠ s.cell := hret ▸ hne₁
+    have hk := ((((hx m₁ hrel₁).2 ret m₂' hcas).2 0).1 hne)
+    refine hk ⟨?_, Or.inr (Or.inl ?_)⟩
+    · show MInv m₂' ret.toNat
+      rw [hret]; exact hkeep hne₁
+    · show tryCasK s.cell n (false, ret.toNat) >>= mrIterK = _
+      rw [show (false, ret.toNat) = casOut s.cell n false ret.toNat from rfl, tryCasK_false,
+        ret_bind]
+      rfl
+
+/-! #### Machine-backed one-shot committer `FairBuchiSat` monitor -/
+
+/--
+Deterministic one-shot `Committer` monitor directly over MiniRust `mrCellWP`:
+`QState = Bool` (`shot?`), moving `false → true` strictly on a winning MiniRust
+`AtomicCompareExchange`, while pinning the invariant to `MInv ∧ HistInvSt` and
+`q = ms.2.comm.shot_store`.
+-/
+def mrCommitterSpec {M FState G : Type} [Memory M] [MemoryOps M]
+    (A : AtomicEnv Nat FState G) (Rel : Nat → Nat → Prop)
+    (ptr : ThinPointer (Memory.Provenance M)) (pty : «Type») (t : IntType)
+    (mRely : Machine M → Machine M → Prop) (MInv : Machine M → Nat → Prop)
+    (init : Nat) (f₀ : FState) (g₀ : G) (comm₀ : OneShotCommitter Nat) :
+    BuchiSpec (MrAtomicSt M FState G) Bool (AtomicCellE Nat) (Except Nat Nat) where
+  ewp := mrCellWP A ptr pty t mRely
+  step q i o ms ms' q' :=
+    (CasWon i o ms ms' → q = false ∧ q' = true) ∧ (¬ CasWon i o ms ms' → q' = q)
+  accept _ _ _ _ _ _ := False
+  inv q ms := MInv ms.1 ms.2.cell ∧ HistInvSt A Rel init f₀ ms.2 ∧ q = ms.2.comm.shot_store
+  terminal q r ms :=
+    MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2 ∧ q = ms.2.comm.shot_store
+
+/--
+**Machine-backed `FairBuchiSat` one-shot committer monitor**: for ANY memory
+model `M` (including `MachTB` with `MInv ∧ MachTB.wfLive`) and coupled
+`MrCellAdmissible`, `tryUpdateLoop` satisfies `mrCommitterSpec` under weak-CAS
+fairness (`□◇ CasWon`) through real `evalIntrinsicM` steps.
+-/
+theorem tryUpdate_mr_fairBuchiSat_committer {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    FairBuchiSat (mrCommitterSpec A Rel ptr pty t mRely MInv init f₀ g₀ comm₀)
+      (fun _ i o ms ms' _ => CasWon i o ms ms') (tryUpdateLoop Nat) false (m₀, s₀) := by
+  let spec := mrCommitterSpec A Rel ptr pty t mRely MInv init f₀ g₀ comm₀
+  have h0 : s₀.comm.shot_store = false := by rw [hs₀.2.2.1, hpre.comm_unshot]
+  refine (fairBuchiSat_iff_fairInfOften spec _ (tryUpdateLoop Nat) false (m₀, s₀)).2
+    ⟨⟨hm₀, histInvSt_of_init hpre hs₀, h0.symm⟩, ?_⟩
+  refine FairInfOften.vis ((BuchiSpec.monitorWP_wp _ _ _ _ _).2 fun m₁ hm₁ => ?_)
+  obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m₀ _ m₁ hm₀ hm₁
+  refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+  obtain ⟨hv, hm2⟩ := mr_observe hadm hm₀ hm₁ hload
+  refine ⟨hv, fun b => ⟨false, ⟨fun h => False.elim h, fun _ => rfl⟩,
+    ⟨hm2, histInvSt_of_loopInv hpre (loopInv_of_init hpre hs₀ hv b), h0.symm⟩, ?_⟩⟩
+  dsimp only [loadAns]
+  refine FairInfOften.iter_fair tryBody
+    (fun (prev : Nat) (qms : Bool × MrAtomicSt M FState G) =>
+      qms.1 = false ∧ MInv qms.2.1 qms.2.2.cell ∧ LoopInv A Rel init f₀ g₀ comm₀ prev qms.2.2)
+    (fun prev qms hqms => ?_)
+    ⟨rfl, hm2, loopInv_of_init hpre hs₀ hv b⟩
+  obtain ⟨q, m, s⟩ := qms
+  obtain ⟨hq, hm, hl⟩ := hqms
+  dsimp only at hq hm hl
+  subst hq
+  have hunshot : s.comm.shot_store = false := loopInv_unshot hpre hl
+  refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2 ((BuchiSpec.monitorWP_wp _ _ _ _ _).2
+    ⟨loopInv_pre hpre hl, fun f' r hpost =>
+      ⟨false, ⟨fun h => False.elim h, fun _ => rfl⟩,
+        ⟨hm, loopInv_call hpre hl hpost, hunshot.symm⟩, Or.inr ⟨fun h => h, ?_⟩⟩⟩)
+  cases r with
+  | none =>
+    dsimp only
+    change fairIter spec.monitorWP _ _ _ true (tryCallK prev (callOut prev none)) _
+    rw [tryCallK_none]
+    refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2 ((BuchiSpec.monitorWP_wp _ _ _ _ _).2
+      fun m₁' hm₁' => ?_)
+    obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.load_ok m₁' c' hmc', fun v' m₂' hload' => ?_⟩
+    obtain ⟨hv', hm2'⟩ := mr_observe hadm hm hm₁' hload'
+    refine ⟨hv', fun b' hres => ⟨false, ⟨fun h => False.elim h, fun _ => rfl⟩,
+      ⟨hm2', loopInv_drop_inv hpre (loopInv_call hpre hl hpost) hv' b', hunshot.symm⟩,
+      Or.inr ⟨fun h => h, (fairIter.ret_inr_iff _ _ _ _ _ _ _).2
+        ⟨hm2', loopInv_err_post hpre hl hpost hv' b' hres, hunshot.symm⟩⟩⟩⟩
+  | some next =>
+    dsimp only
+    change fairIter spec.monitorWP _ _ _ true (tryCallK prev (callOut prev (some next))) _
+    rw [tryCallK_some]
+    have hnext_rep : IntType.can_represent t next = true :=
+      hrep s.fst prev f' next hl.2.2.1 hpost hl.1
+    refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2 ((BuchiSpec.monitorWP_wp _ _ _ _ _).2
+      fun m₁' hm₁' => ?_)
+    obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+    obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+    have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
+    refine ⟨hrel, fun b' => ⟨fun hne => ?_, fun heq => ?_⟩⟩
+    · have hm2' : MInv m₂' ret.toNat := hret ▸ hkeep (hret ▸ hne)
+      have hl' := loopInv_fail hpre hl hpost hrel b'
+      refine ⟨false, ⟨fun h => Bool.noConfusion h, fun _ => rfl⟩,
+        ⟨hm2', histInvSt_of_loopInv hpre hl', hunshot.symm⟩,
+        Or.inr ⟨fun h => Bool.noConfusion h, ?_⟩⟩
+      dsimp only
+      change fairIter spec.monitorWP _ _ _ true
+        (tryCasK prev next (casOut prev next false ret.toNat)) _
+      rw [tryCasK_false]
+      exact (fairIter.ret_inl_iff _ _ _ _ _ _ _).2 ⟨rfl, rfl, hm2', hl'⟩
+    · refine ⟨⟨hunshot, loopInv_win_pre (s := s) hpre hl hpost, fun g' hg' => ?_⟩,
+        fun mFail hfail => ?_⟩
+      · have hm2' : MInv m₂' next := hstore (hret ▸ heq)
+        have hwin : HistInvSt A Rel init f₀
+            (AtomicSt.commit { s with fst := f', cell := ret.toNat } prev next g' b') := by
+          simpa only [heq] using loopInv_win_inv hpre hl hpost g' b'
+        refine ⟨true, ⟨fun _ => ⟨rfl, rfl⟩, fun h => absurd rfl h⟩, ⟨hm2', hwin, rfl⟩,
+          Or.inl ⟨rfl, ?_⟩⟩
+        dsimp only
+        rw [tryCasK_true]
+        refine DWP.vis ((BuchiSpec.monitorWP_wp _ _ _ _ _).2 fun m₁'' hm₁'' => ?_)
+        obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm2' hm₁''
+        refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+        obtain ⟨hv'', hm2''⟩ := mr_observe hadm hm2' hm₁'' hload''
+        refine ⟨hv'', fun b'' hres => ⟨true, ⟨fun h => False.elim h, fun _ => rfl⟩,
+          ⟨hm2'', loopInv_drop_inv hpre hwin hv'' b'', rfl⟩, DWP.ret ⟨hm2'', ?_, rfl⟩⟩⟩
+        simpa only [heq] using loopInv_ok_post hpre hl hpost hg' hv'' b' b'' hres
+      · have hmf : MInv mFail ret.toNat := by
+          have := hadm.load_val m₁' c' ret mFail hmc' hfail; exact this.1 ▸ this.2
+        have hl' := loopInv_fail hpre hl hpost hrel b'
+        refine ⟨false, ⟨fun h => Bool.noConfusion h, fun _ => rfl⟩,
+          ⟨hmf, histInvSt_of_loopInv hpre hl', hunshot.symm⟩,
+          Or.inr ⟨fun h => Bool.noConfusion h, ?_⟩⟩
+        dsimp only
+        change fairIter spec.monitorWP _ _ _ true
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        exact (fairIter.ret_inl_iff _ _ _ _ _ _ _).2 ⟨rfl, rfl, hmf, hl'⟩
+
+/-! #### Finite-width saturation canary & `#4162` wrapping `u64` Tree Borrows service -/
+
+private theorem ticketService_eq (k : Nat) :
+    ticketService k = ITree.vis aRecv (fun _ =>
+      ((tryUpdateLoop Nat >>= fun _ => ITree.ret (k + 1)) >>=
+        fun x => ITree.ret (Sum.inl x)) >>=
+        Sum.elim (fun n' => ITree.tau (ticketService n')) ITree.ret) := by
+  change ITree.iter (fun a => Sum.inl <$> serviceBody a) k = _
+  rw [iter_unfold]
+  change (serviceBody k >>= fun x => ITree.ret (Sum.inl x)) >>= _ = _
+  rw [serviceBody, vis_bind, vis_bind]
+  rfl
+
+/--
+**Fail-closed finite-width saturation canary**: on ANY finite-width MiniRust
+cell whose current value `c` sits at the top of `t` (`can_represent t (c + 1) = false`,
+e.g. `255` on `u8` or `2^64 - 1` on `u64`), the unbounded `ticketService`
+(`|x| Some(x + 1)`) fails closed (`¬ DWLP`) under `mrBudgetWP` because MiniRust
+`AtomicCompareExchange` emits `Stop.specPanic` on `c + 1`.
+-/
+theorem mr_ticketService_overflow_canary {M : Type} [Memory M] [MemoryOps M]
+    {m₀ m₁ : Machine M} {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»}
+    {t : IntType} {al : Align} {c : Nat}
+    {mRely : Machine M → Machine M → Prop}
+    (hlay : Type.layout (.Int t) = .ok (.Sized ⟨al.bytes⟩ al))
+    (hal : alignFromBytes t.size.bytes = some al)
+    (hmax : t.size.bytes ≤ x86_64.MAX_ATOMIC_SIZE.bytes)
+    (hsize : al.bytes = 1 ∨ al.bytes = 2 ∨ al.bytes = 4 ∨ al.bytes = 8)
+    (hrefl₀ : mRely m₀ m₀) (hrefl₁ : mRely m₁ m₁)
+    (hload₀ : typedLoadM (M := M) m₀ ptr (.Int t) al .Atomic = .ok (.Int c, m₁))
+    (hload₁ : ∃ m₂, typedLoadM (M := M) m₁ ptr (.Int t) al .Atomic = .ok (.Int c, m₂))
+    (hout : IntType.can_represent t ((c + 1 : Nat) : Int) = false)
+    (s₀ : AtomicSt Nat PUnit PUnit) (hs : s₀.cell = c)
+    (Q : PEmpty.{1} → MrAtomicSt M PUnit PUnit → Prop) :
+    ¬ DWLP (mrBudgetWP ticketEnv ptr pty t mRely) (ticketService 0) Q (m₀, s₀) := by
+  intro hd
+  rw [ticketService_eq 0, DWLP.vis_iff] at hd
+  have h1 := hd 0
+  rw [tryUpdateLoop, bind_assoc, bind_assoc, vis_bind] at h1
+  have hl₀ : mrLoadOk m₀ ptr pty t c m₁ := by
+    refine ⟨?_, Int.natCast_nonneg _⟩
+    cases al with
+    | mk ab =>
+      dsimp only at hlay hsize hload₀
+      have halign : alignFromBytesInt (ab : Int) = some ⟨ab⟩ := by
+        rcases hsize with rfl | rfl | rfl | rfl <;> rfl
+      have hmax' : ab ≤ x86_64.MAX_ATOMIC_SIZE.bytes := by
+        rcases hsize with rfl | rfl | rfl | rfl <;> decide
+      rw [atomicLoad_eq_typedLoadM m₀ ptr pty (.Int t) hlay halign hmax']
+      exact hload₀
+  have h2 := (((DWLP.vis_iff _ _ _ _ _).1 h1 m₀ hrefl₀).2 c m₁ hl₀).2.1
+    (by simp [hs])
+  dsimp only [loadAns] at h2
+  rw [iter_tryBody_eq] at h2
+  simp only [bind_assoc, vis_bind] at h2
+  have h3 := ((DWLP.vis_iff _ _ _ _ _).1 h2).2 PUnit.unit (some (c + 1)) rfl
+  change DWLP (mrBudgetWP ticketEnv ptr pty t mRely)
+    (tryCallK c (callOut c (some (c + 1))) >>= _) _ _ at h3
+  simp only [tryCallK_some, vis_bind] at h3
+  have hcas_ex := ((DWLP.vis_iff _ _ _ _ _).1 h3 m₁ hrefl₁).1
+  obtain ⟨m₂, htl₁⟩ := hload₁
+  exact mr_cas_out_of_range_specPanic_canary hal hmax htl₁ hout hcas_ex
+
+/-- Wrapping 64-bit ticket closure `|x| Some((x + 1) % 2^64)`. -/
+def u64WrapTicketSpec : FnMutSpec PUnit Nat Nat where
+  hist_inv _ _ := True
+  hist_inv_laws := ⟨fun _ => trivial, fun _ _ => trivial⟩
+  pre _ _ := True
+  post_mut _ x _ r := r = some ((x + 1) % 2 ^ 64)
+  step_hist_inv _ _ _ _ _ := trivial
+  resolve _ := True
+
+/-- Wrapping 64-bit ticket environment (arbitrary modular interference). -/
+def u64WrapTicketEnv : AtomicEnv Nat PUnit PUnit :=
+  ⟨fun _ _ => True, u64WrapTicketSpec, trivialGC⟩
+
+theorem u64WrapTicket_realizable : u64WrapTicketEnv.Realizable where
+  rely_refl _ := trivial
+  post_mut_total _ x _ := ⟨PUnit.unit, some ((x + 1) % 2 ^ 64), rfl⟩
+  gc_post_total _ _ _ _ := ⟨PUnit.unit, trivial⟩
+  resolve_total _ := trivial
+
+theorem u64WrapTicket_pre (c : Nat) :
+    TryUpdatePre u64WrapTicketEnv (fun _ _ => True) c PUnit.unit PUnit.unit (.fresh c) where
+  cellInv := ⟨fun _ => trivial, fun _ _ => trivial⟩
+  closure_pre _ _ _ _ := trivial
+  closure_step _ _ _ _ _ _ _ := ⟨trivial, trivial⟩
+  rely_sound _ _ _ := trivial
+  comm_unshot := rfl
+
+/-- Safety invariant for the 8-byte Tree Borrows wrapping `u64` `#4162` service. -/
+def MrWrapSvcInv (ms : MrAtomicSt TBM PUnit PUnit) : Prop :=
+  (tbU64MInv ms.1 ms.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms.1) ∧
+    ms.2.fires ≤ 1 ∧ (ms.2.comm.shot_store = true ↔ ms.2.fires = 1)
+
+/-- Accepting edge: a real 8-byte Tree Borrows winning CAS advancing the `u64` ticket mod `2^64`. -/
+def MrWrapTicketCommit : (i : (AtomicCellE Nat).I) → (AtomicCellE Nat).O i →
+    MrAtomicSt TBM PUnit PUnit → MrAtomicSt TBM PUnit PUnit → Prop :=
+  fun i o ms ms' => CasWon i o ms ms' ∧ ms'.2.cell = (ms.2.cell + 1) % 2 ^ 64 ∧
+    ms.2.comm.shot_store = false ∧ ms'.2.comm.shot_store = true
+
+/--
+**Positive real MiniRust `#4162` `-> !` reactive service on 8-byte Tree Borrows `u64`**:
+for EVERY initial 64-bit word `x₀ : UInt64` and EVERY access log `acc₀`,
+`ticketService 0` executed directly on `TreeBorrowsMemory` (`mrBudgetWP`) with
+modular `u64` wrapping preserves `tbU64MInv ∧ MachTB.wfLive` and one-shot
+per-request committer discipline (`Always`), commits infinitely many real 8-byte
+little-endian `AtomicCompareExchange` ticket updates (`InfOften`), and is
+genuinely non-terminating (`¬ DWP`).
+-/
+theorem tryUpdate_mr_tb_u64_wrapping_service (x₀ : UInt64) (acc₀ : List Access)
+    (Q : PEmpty.{1} → MrAtomicSt TBM PUnit PUnit → Prop) :
+    let m₀ := tbU64Mach x₀ acc₀
+    let s₀ : AtomicSt Nat PUnit PUnit := ⟨x₀.toNat, PUnit.unit, .fresh x₀.toNat, 0, PUnit.unit, 0⟩
+    Always (mrBudgetWP u64WrapTicketEnv tbPtr tyRawPtr itU64 (tbU64MRely (fun _ _ => True)))
+        MrWrapSvcInv Q (ticketService 0) (m₀, s₀) ∧
+      InfOften (mrBudgetWP u64WrapTicketEnv tbPtr tyRawPtr itU64 (tbU64MRely (fun _ _ => True)))
+        MrWrapTicketCommit Q (ticketService 0) (m₀, s₀) ∧
+      ¬ DWP (mrBudgetWP u64WrapTicketEnv tbPtr tyRawPtr itU64 (tbU64MRely (fun _ _ => True)))
+        (ticketService 0) Q (m₀, s₀) := by
+  intro m₀ s₀
+  let ewp := mrBudgetWP u64WrapTicketEnv tbPtr tyRawPtr itU64 (tbU64MRely (fun _ _ => True))
+  have hadm := tbU64_mrCellAdmissible u64WrapTicketEnv (fun _ => trivial)
+  have hrely_wf : ∀ m m', MiniRustSpec.Correspondence.MachTB.wfLive m →
+      tbU64MRely (fun _ _ => True) m m' → MiniRustSpec.Correspondence.MachTB.wfLive m' := by
+    rintro m m' _ ⟨_, x', _, acc', _, _, rfl⟩; exact tbU64_wfLive x' acc'
+  have hrep : ∀ f₂ x f₃ (n : Nat), u64WrapTicketEnv.fSpec.hist_inv PUnit.unit f₂ →
+      u64WrapTicketEnv.fSpec.post_mut f₂ x f₃ (some n) → True →
+      IntType.can_represent itU64 (n : Int) = true := by
+    intro _ x _ n _ hr _
+    have heq : some n = some ((x + 1) % 2 ^ 64) := hr
+    cases heq
+    exact (u64_can_represent_iff _).2 (Nat.mod_lt _ (Nat.pow_pos (by decide)))
+  have hbody_always : ∀ (n : Nat) (ms : MrAtomicSt TBM PUnit PUnit), MrWrapSvcInv ms →
+      Always ewp MrWrapSvcInv (fun _ ms' => MrWrapSvcInv ms') (serviceBody n) ms := by
+    intro n ⟨m, s⟩ ⟨⟨hm, hwf⟩, hfires, hshot⟩
+    refine Always.vis ⟨⟨hm, hwf⟩, hfires, hshot⟩ fun b => Always.bind ?_
+    have hreq := Always.mono_wp (mrCellWP_refines_budget _ _ _ _ _)
+      (tryUpdate_mr_tb_wfLive_safety (u64WrapTicket_pre s.cell) hrep hadm hrely_wf hm hwf
+        (s₀ := { s with comm := .fresh s.cell, fires := 0, budget := b }) ⟨rfl, rfl, rfl, rfl, rfl⟩)
+    exact Always.mono (fun _ hi => ⟨hi.1, hi.2.2.2⟩)
+      (fun _ _ hq => Always.ret ⟨hq.1.1, hq.1.2.2.2⟩ ⟨hq.1.1, hq.1.2.2.2⟩) hreq.post_inv
+  have hbody_live : ∀ (n : Nat) (ms : MrAtomicSt TBM PUnit PUnit), MrWrapSvcInv ms →
+      buchiProgress ewp MrWrapTicketCommit (fun _ _ => False)
+        (InfOften ewp MrWrapTicketCommit (fun _ ms' => MrWrapSvcInv ms')) (serviceBody n) ms := by
+    intro n ⟨m, s⟩ ⟨⟨hm, hwf⟩, _, _⟩
+    refine buchiProgress.vis_skip fun b => ?_
+    refine buchiProgress.bind ?_
+    refine buchiProgress.vis_skip fun m₁ hm₁ => ?_
+    obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m _ m₁ hm hm₁
+    refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+    obtain ⟨hv, hm₂⟩ := mr_observe hadm hm hm₁ hload
+    have hwf₁ := hrely_wf m m₁ hwf hm₁
+    have hwf₂ := evalIntrinsicM_atomic_tb_wfLive rfl hwf₁ hload.1
+    let RInv : Nat → Nat → MrAtomicSt TBM PUnit PUnit → Prop := fun k prev ms' =>
+      (tbU64MInv ms'.1 ms'.2.cell ∧ MiniRustSpec.Correspondence.MachTB.wfLive ms'.1) ∧
+      ms'.2.cell = prev ∧ ms'.2.comm.shot_store = false ∧ ms'.2.fires = 0 ∧ ms'.2.budget = k
+    have hiter : ∀ (Qex : Except Nat Nat → MrAtomicSt TBM PUnit PUnit → Prop)
+        k prev (ms' : MrAtomicSt TBM PUnit PUnit), RInv k prev ms' →
+        buchiProgress ewp MrWrapTicketCommit
+          (Sum.elim (fun next ms'' => ∃ k', k' < k ∧ RInv k' next ms'') Qex)
+          (fun t' ms'' => InfOften ewp MrWrapTicketCommit (fun _ ms''' => MrWrapSvcInv ms''')
+            ((t' >>= mrIterK) >>= fun _ => ITree.ret (n + 1)) ms'') (tryBody prev) ms' := by
+      intro Qex k prev ⟨m', s'⟩ ⟨⟨hm', hwf'⟩, hcell', hunshot', hfires', hbud'⟩
+      dsimp only at hm' hwf' hcell' hunshot' hfires' hbud'
+      refine buchiProgress.vis_skip ⟨trivial, fun _ r hr => ?_⟩
+      have hreq : r = some ((prev + 1) % 2 ^ 64) := hr
+      subst hreq
+      dsimp only
+      change buchiProgress ewp MrWrapTicketCommit _ _ (tryCallK prev (callOut prev (some _))) _
+      rw [tryCallK_some]
+      let next := (prev + 1) % 2 ^ 64
+      have hnext_rep : IntType.can_represent itU64 (next : Int) = true :=
+        (u64_can_represent_iff _).2 (Nat.mod_lt _ (Nat.pow_pos (by decide)))
+      refine (buchiProgress.vis_iff _ _ _ _ _ _ _).2 fun m₁' hm₁' => ?_
+      obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m' _ m₁' hm' hm₁'
+      refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+      obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+      have hwf₁' := hrely_wf m' m₁' hwf' hm₁'
+      have hwf₂' := evalIntrinsicM_atomic_tb_wfLive rfl hwf₁' hcas.1
+      have hwin : ∀ (b' : Nat) (heq : ret.toNat = prev),
+          casWin u64WrapTicketEnv prev next
+            (fun o s'' => (MrWrapTicketCommit (aCas prev next) o
+                (m', { s' with fst := PUnit.unit }) (m₂', s'') ∧
+              InfOften ewp MrWrapTicketCommit (fun _ ms''' => MrWrapSvcInv ms''')
+                ((tryCasK prev next o >>= mrIterK) >>= fun _ => ITree.ret (n + 1)) (m₂', s'')) ∨
+              buchiProgress ewp MrWrapTicketCommit
+                (Sum.elim (fun next ms'' => ∃ k', k' < k ∧ RInv k' next ms'') Qex)
+                (fun t' ms'' => InfOften ewp MrWrapTicketCommit (fun _ ms''' => MrWrapSvcInv ms''')
+                  ((t' >>= mrIterK) >>= fun _ => ITree.ret (n + 1)) ms'')
+                (tryCasK prev next o) (m₂', s''))
+            { s' with fst := PUnit.unit, cell := ret.toNat } b' := by
+        intro b' heq
+        refine ⟨hunshot', trivial, fun _ _ => Or.inl ⟨⟨rfl, by
+          show next = (s'.cell + 1) % 2 ^ 64; rw [hcell'], hunshot', rfl⟩, ?_⟩⟩
+        simp only [tryCasK_true, retAfterDrop, vis_bind, ret_bind, Sum.elim_inr]
+        have hm₂' : tbU64MInv m₂' next := hstore (hret ▸ heq)
+        refine InfOften.vis fun m₁'' hm₁'' => ?_
+        obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm₂' hm₁''
+        refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+        obtain ⟨_, hm₂''⟩ := mr_observe hadm hm₂' hm₁'' hload''
+        have hwf₂'' := evalIntrinsicM_atomic_tb_wfLive rfl (hrely_wf m₂' m₁'' hwf₂' hm₁'') hload''.1
+        have hfin : s'.fires + 1 ≤ 1 ∧ (true = true ↔ s'.fires + 1 = 1) := by
+          simp [hfires']
+        exact ⟨trivial, fun _ _ => InfOften.ret ⟨⟨hm₂'', hwf₂''⟩, hfin⟩,
+          fun _ _ _ => InfOften.ret ⟨⟨hm₂'', hwf₂''⟩, hfin⟩⟩
+      refine ⟨trivial, fun hsc => ⟨fun hne => absurd (hsc.trans hcell') hne, fun heq => ?_⟩,
+        fun _ hpos => ⟨fun hne => Or.inr ?_, fun heq => ?_⟩⟩
+      · refine ⟨hwin s'.budget heq, fun hpos mFail hfail => Or.inr ?_⟩
+        dsimp only at hpos ⊢
+        change buchiProgress ewp MrWrapTicketCommit _ _
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        have hmf : tbU64MInv mFail ret.toNat := by
+          have := hadm.load_val m₁' c' ret mFail hmc' hfail; exact this.1 ▸ this.2
+        have hwff := evalIntrinsicM_atomic_tb_wfLive rfl hwf₁' hfail.1
+        exact (buchiProgress.ret_iff _ _ _ _ _ _).2
+          ⟨k - 1, by omega, ⟨hmf, hwff⟩, rfl, hunshot', hfires',
+            show s'.budget - 1 = k - 1 by omega⟩
+      · dsimp only at hpos ⊢
+        change buchiProgress ewp MrWrapTicketCommit _ _
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        have hm₂' : tbU64MInv m₂' ret.toNat := hret ▸ hkeep (hret ▸ hne)
+        exact (buchiProgress.ret_iff _ _ _ _ _ _).2
+          ⟨k - 1, by omega, ⟨hm₂', hwf₂'⟩, rfl, hunshot', hfires',
+            show s'.budget - 1 = k - 1 by omega⟩
+      · refine ⟨hwin (s'.budget - 1) heq, fun mFail hfail => Or.inr ?_⟩
+        dsimp only at hpos ⊢
+        change buchiProgress ewp MrWrapTicketCommit _ _
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        have hmf : tbU64MInv mFail ret.toNat := by
+          have := hadm.load_val m₁' c' ret mFail hmc' hfail; exact this.1 ▸ this.2
+        have hwff := evalIntrinsicM_atomic_tb_wfLive rfl hwf₁' hfail.1
+        exact (buchiProgress.ret_iff _ _ _ _ _ _).2
+          ⟨k - 1, by omega, ⟨hmf, hwff⟩, rfl, hunshot', hfires',
+            show s'.budget - 1 = k - 1 by omega⟩
+    refine ⟨trivial, fun _ => ?_, fun _ _ => ?_⟩
+    · dsimp only [loadAns]
+      exact buchiProgress.iter_ranked tryBody RInv (hiter _) (n := b)
+        ⟨⟨hm₂, hwf₂⟩, rfl, rfl, rfl, rfl⟩
+    · dsimp only [loadAns]
+      exact buchiProgress.iter_ranked tryBody RInv (hiter _) (n := b - 1)
+        ⟨⟨hm₂, hwf₂⟩, rfl, rfl, rfl, rfl⟩
+  have hinit : MrWrapSvcInv (m₀, s₀) :=
+    ⟨⟨⟨x₀, acc₀, rfl, rfl⟩, tbU64_wfLive x₀ acc₀⟩, Nat.zero_le 1, by simp [s₀]⟩
+  have hrule := buchi_diverging_loop_rule serviceBody (fun _ ms => MrWrapSvcInv ms)
+    hbody_always hbody_live (init := 0) hinit Q
+  have hnd : ¬ DWP ewp (ticketService 0) Q (m₀, s₀) := by
+    intro hd
+    refine DWP.induct (fun x ms => Always ewp MrWrapSvcInv Q x ms → False) ?_ hd hrule.1
+    intro x ms hx ha
+    have hm : tbU64MInv ms.1 ms.2.cell := ha.inv.1.1
+    cases hobs : x.observe with
+    | ret r => exact nomatch r
+    | tau x' =>
+      rw [hobs] at hx; rw [Always.unfold_eq, hobs] at ha; exact hx ha.2
+    | vis i k =>
+      rw [hobs] at hx; rw [Always.unfold_eq, hobs] at ha
+      have ha' := ha.2
+      cases i with
+      | call req =>
+        cases req with
+        | load =>
+          have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+          obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+          obtain ⟨hv, _⟩ := hadm.load_val ms.1 ms.2.cell v m₂ hm hok
+          exact ((hx ms.1 hrf).2 v m₂ hok).2.1 hv (((ha' ms.1 hrf).2 v m₂ hok).2.1 hv)
+        | cas e d =>
+          have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+          obtain ⟨ret, m₂, hok⟩ := (ha' ms.1 hrf).1
+          have hret : ret.toNat = ms.2.cell := by
+            obtain ⟨xcur, acc, hxcur, hmeq⟩ := hm
+            rw [hmeq] at hok
+            obtain ⟨ptr', pty', _, _, t', al', m₁', hargs, hty, hal, _, htl, _⟩ :=
+              atomicCompareExchange_ok_iff.1 hok.1
+            cases «Type».Int.inj hty
+            have hptr' : ptr' = tbPtr :=
+              (congrArg (fun p => p.thin_pointer)
+                (Value.Ptr.inj (Prod.mk.inj (List.cons.inj hargs).1).1)).symm
+            subst hptr'
+            have hal' : al' = ⟨8⟩ := Option.some.inj hal.symm
+            subst hal'
+            rw [tbU64_typedLoad] at htl
+            have hv := Value.Int.inj (Prod.mk.inj (Except.ok.inj htl)).1
+            rw [← hv, Int.toNat_natCast, hxcur]
+          have hstepD := ((hx ms.1 hrf).2 ret m₂ hok).2.1 hret
+          have hstepA := ((ha' ms.1 hrf).2 ret m₂ hok).2.1 hret
+          by_cases he : ret.toNat = e
+          · exact (hstepD.2 he).1.2.2 PUnit.unit trivial ((hstepA.2 he).1.2.2 PUnit.unit trivial)
+          · exact hstepD.1 he (hstepA.1 he)
+        | callF arg =>
+          obtain ⟨f', r, hpost⟩ := u64WrapTicket_realizable.post_mut_total _ _ hx.1
+          exact hx.2 f' r hpost (ha'.2 f' r hpost)
+        | dropF =>
+          have hrf := hadm.rely_refl ms.1 ms.2.cell hm
+          obtain ⟨v, m₂, hok⟩ := hadm.load_ok ms.1 ms.2.cell hm
+          obtain ⟨hv, _⟩ := hadm.load_val ms.1 ms.2.cell v m₂ hm hok
+          exact ((hx ms.1 hrf).2 v m₂ hok).2.1 hv trivial
+            (((ha' ms.1 hrf).2 v m₂ hok).2.1 hv trivial)
+        | recv => exact hx 0 (ha' 0)
+  exact ⟨hrule.1, hrule.2, hnd⟩
 
 end MrBridge
 
