@@ -155,26 +155,35 @@ theorem pathSegments_vectors :
 
 /-- Binary entry symbols accepted by the name-only test. -/
 theorem entrySymbol_accepts :
-    ["main", "my_crate::main", "_start", "my_crate::_start", "__start",
-      "my_crate::__start"].all isBinaryEntrySymbol = true := by
+    ["main", "::main", "my_crate::main", "::my_crate::main", "_start", "::_start",
+      "my_crate::_start", "::my_crate::_start", "__start", "::__start",
+      "my_crate::__start", "::my_crate::__start", "crate::main"].all
+        isBinaryEntrySymbol = true := by
   decide
 
-/-- Substring and nesting false positives rejected by the name-only test. -/
+/-- Substring, impl/trait, malformed-crate, and nesting false positives rejected
+    by the name-only test. -/
 theorem entrySymbol_rejects :
     ["", "domain", "maintain", "main_loop", "mainx", "xmain", "Main", "MAIN", "start",
       "_start_", "___start", "my_crate::domain", "my_crate::maintain", "my_crate::main_loop",
       "my_crate::Type::main", "my_crate::module::_start", "my_crate::main::helper", "main::",
-      "my_crate::main ", "my_crate:main"].all (fun s => !isBinaryEntrySymbol s) = true := by
+      "my_crate::main ", "my_crate:main", "<MyType as Trait>::main", "<impl Foo>::main",
+      "{{impl}}::main", ":::main", "::::main", "my_crate::::main", "123::main",
+      "my crate::main", " ::main"].all (fun s => !isBinaryEntrySymbol s) = true := by
   decide
 
 /-- Cross-language entry-point classification vectors
     (`anneal_spec::spec_check::classify_entry_point` asserts the same table). -/
 def entryClassificationVectors : List (EntryPointDescriptor × Option EntryPointKind) :=
   [ ({ defPath := "main" }, some .rustMain),
+    ({ defPath := "::main" }, some .rustMain),
     ({ defPath := "my_crate::main" }, some .rustMain),
+    ({ defPath := "::my_crate::main" }, some .rustMain),
     ({ defPath := "my_crate::main", crateNoMain := true }, some .noMainStart),
     ({ defPath := "_start", crateNoMain := true }, some .noMainStart),
+    ({ defPath := "::_start", crateNoMain := true }, some .noMainStart),
     ({ defPath := "my_crate::_start", crateNoMain := true }, some .noMainStart),
+    ({ defPath := "::my_crate::_start", crateNoMain := true }, some .noMainStart),
     ({ defPath := "my_crate::__start", crateNoMain := true }, some .noMainStart),
     ({ defPath := "my_crate::_start" }, none),
     ({ defPath := "my_crate::__start" }, none),
@@ -189,6 +198,12 @@ def entryClassificationVectors : List (EntryPointDescriptor × Option EntryPoint
     ({ defPath := "Type::main", isAssocFn := true }, none),
     ({ defPath := "my_crate::Type::run", isAssocFn := true, hasEntryAttr := true }, none),
     ({ defPath := "my_crate::Type::main" }, none),
+    ({ defPath := "<MyType as Trait>::main" }, none),
+    ({ defPath := "<impl Foo>::main" }, none),
+    ({ defPath := "{{impl}}::main" }, none),
+    ({ defPath := ":::main" }, none),
+    ({ defPath := "::::main" }, none),
+    ({ defPath := "123::main" }, none),
     ({ defPath := "my_crate::module::main" }, none),
     ({ defPath := "my_crate::domain" }, none),
     ({ defPath := "my_crate::maintain" }, none),
@@ -247,6 +262,26 @@ theorem stateful_collapse_refutes_safety :
     ¬ StatefulClaimEntryRequiresGuard u8StatefulEntryAbi (divEntryStatefulClaim "_start") :=
   ⟨start_requires_stateful_collapse.not_closedProgramSafe,
     start_requires_stateful_collapse.not_guard⟩
+
+open EntryDemo in
+/-- Even a kernel-verified `TotalVerificationResult` on `main` or `_start` collapses
+    when its `requires` is non-universal. -/
+theorem total_collapse_refutes_total_and_guard :
+    ¬ TotalClaimClosedProgramTotal u8StatefulEntryAbi (divEntryTotalClaim "entry_demo::main") ∧
+    ¬ TotalClaimEntryRequiresGuard u8StatefulEntryAbi (divEntryTotalClaim "entry_demo::main") ∧
+    ¬ TotalClaimClosedProgramTotal u8StatefulEntryAbi (divEntryTotalClaim "_start") ∧
+    ¬ TotalClaimEntryRequiresGuard u8StatefulEntryAbi (divEntryTotalClaim "_start") :=
+  ⟨main_requires_total_collapse.not_closedProgramTotal, main_requires_total_collapse.not_guard,
+    start_requires_total_collapse.not_closedProgramTotal, start_requires_total_collapse.not_guard⟩
+
+open EntryDemo in
+/-- The collapsing `TotalClaim` passes every standard realizability and verification gate. -/
+theorem total_collapse_passes_every_spec_gate :
+    NonVacuousStatefulPre (divEntryTotalClaim "entry_demo::main").pre ∧
+    TotalClaimDichotomy (divEntryTotalClaim "entry_demo::main") ∧
+    TotalVerificationResult (divEntryTotalClaim "entry_demo::main") :=
+  ⟨main_requires_total_collapse.nonVacuous, main_requires_total_collapse.dichotomy,
+    main_requires_total_collapse.verified⟩
 
 open EntryDemo in
 /-- **Positive.** The guarded echo entry point is safe on `argc == 0`, the very
@@ -454,8 +489,27 @@ theorem guard_iff_model_examples :
   ⟨(ghostLengthTypeGuard_iff_nonempty_model _).mp ghostLengthTypeGuard_unboundedNat,
     (ghostLengthTypeGuard_iff_nonempty_model _).mp ghostLengthTypeGuard_unboundedInt,
     isEmpty_model_of_fixedUnsigned 64,
-    fun h => not_ghostLengthTypeGuard_fixedSigned 64
-      ((ghostLengthTypeGuard_iff_nonempty_model _).mpr h)⟩
+    isEmpty_model_of_fixedSigned 64⟩
+
+/-- Target-width-independent `USize` and arbitrary-width `BitVec` ghost lengths
+    also wrap to zero and derive `False` from the zero-length-is-empty axiom. -/
+theorem usize_and_bitvec_wraparound_false :
+    usizeGhostLen USize.size = 0 ∧
+    bitVecGhostLen 64 (2 ^ 64) = 0 ∧
+    bitVecGhostLen 32 (2 ^ 32) = 0 ∧
+    (¬ ∀ xs : List Unit, usizeListGhostLen xs = 0 → xs = []) ∧
+    (¬ ∀ xs : List Unit, bitVecListGhostLen 64 xs = 0 → xs = []) :=
+  ⟨usizeGhostLen_wraps, bitVec64GhostLen_two_pow_64, bitVecGhostLen_two_pow 32,
+    false_of_usize_list_len_zero_imp_nil (),
+    false_of_bitVec_list_len_zero_imp_nil 64 ()⟩
+
+/-- **Positive.** The unbounded `Int` list model is consistent and never wraps. -/
+theorem unboundedInt_list_model_never_wraps (n : Nat) :
+    Nonempty (UnboundedIntGhostCollectionAxioms (List Unit)) ∧
+    (listIntGhostLengthAxioms 'x').len
+        (iterSnoc (listIntGhostLengthAxioms 'x').snoc n (listIntGhostLengthAxioms 'x').empty) =
+      Int.ofNat n :=
+  ⟨unboundedIntGhostCollectionAxioms_nonempty, (listIntGhostLengthAxioms 'x').len_iterSnoc n⟩
 
 /-! ## 4. Guard 3 — Error-Branch `True` Wildcard -/
 
@@ -571,6 +625,27 @@ theorem except_wildcard_vacuity :
     exceptErrorWildcardPost_constError_survives _ _, True.intro, rfl,
     fun h : (5 : Nat) = 3 + 1 => absurd h (by decide)⟩
 
+/-- **Positive (`Except`).** `exceptGuardedPost` satisfies
+    `ErrorBranchGuardedExceptPost`, kills constant-`error` and wrong-payload
+    mutants, and achieves error-fibre dichotomy; `exceptErrorWildcardPost` fails it. -/
+theorem except_guarded_kills_mutants_and_dichotomy :
+    let post := exceptGuardedPost incrExpectsOk (fun x => x + 1) (fun _ => "overflow")
+    ¬ MutantSurvives incrPre post (fun _ => Except.error "overflow") ∧
+    ¬ post 255 (Except.error "disk on fire") ∧
+    (∃ x, incrPre x ∧ ∃ eOk eBad : String,
+      post x (.error eOk) ∧ ¬ post x (.error eBad)) ∧
+    ¬ ErrorBranchGuardedExceptPost incrPre incrExpectsOk
+        (exceptErrorWildcardPost (ε := String) (fun x : Nat => x + 1)) := by
+  have hG := exceptGuardedPost_guarded incrPre incrExpectsOk (fun x => x + 1) (fun _ => "overflow")
+  have hErr : ¬ incrExpectsOk 255 := by decide
+  have hAccept : exceptGuardedPost incrExpectsOk (fun x => x + 1) (fun _ => "overflow")
+      255 (.error "overflow") := ⟨hErr, rfl⟩
+  exact ⟨hG.kills_constError ⟨0, by decide, by decide⟩ "overflow",
+    hG.kills_wrong_error_payload (by decide) hErr hAccept (by decide),
+    hG.errorDichotomy ⟨255, by decide, by decide⟩ ⟨"a", "b", by decide⟩,
+    not_errorBranchGuardedExceptPost_exceptErrorWildcardPost _
+      ⟨0, by decide, by decide⟩ "overflow"⟩
+
 /-- `MirSemantics` counterexamples: `Div` and `Rem` by zero are `.ub`, the wildcard
     correspondence accepts both, and the guarded correspondence rejects both. -/
 theorem scalar_corr_mir_counterexamples (expected : Value) :
@@ -678,14 +753,21 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.totalClaimClosedProgramTotal_of_guard,
         ``Anneal.SpecBoundaryGuards.EntryDemo.main_requires_collapse,
         ``Anneal.SpecBoundaryGuards.EntryDemo.start_requires_collapse,
+        ``Anneal.SpecBoundaryGuards.EntryDemo.divEntryTotalClaim_collapse,
+        ``Anneal.SpecBoundaryGuards.EntryDemo.main_requires_total_collapse,
         ``Anneal.SpecBoundaryGuards.u64GhostLen_two_pow_64,
+        ``Anneal.SpecBoundaryGuards.usizeGhostLen_wraps,
+        ``Anneal.SpecBoundaryGuards.bitVec64GhostLen_two_pow_64,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_strict_mono,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_zero_empty,
+        ``Anneal.SpecBoundaryGuards.isEmpty_model_of_fixedSigned,
+        ``Anneal.SpecBoundaryGuards.unboundedIntGhostCollectionAxioms_nonempty,
         ``Anneal.SpecBoundaryGuards.ghostLengthTypeGuard_iff_nonempty_model,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_postconditionDichotomy,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_not_errorFibreDichotomy,
         ``Anneal.SpecBoundaryGuards.scalarWildcardCorr_accepts_div_by_zero,
-        ``Anneal.SpecBoundaryGuards.ErrorBranchGuardedPost.kills_constErr] do
+        ``Anneal.SpecBoundaryGuards.ErrorBranchGuardedPost.kills_constErr,
+        ``Anneal.SpecBoundaryGuards.exceptGuardedPost_guarded] do
     match env.find? flagship with
     | some (.thmInfo _) =>
       unless env.getModuleIdxFor? flagship == some modIdx do

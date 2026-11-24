@@ -477,6 +477,53 @@ theorem reachesRet_of_observe_tau [FaultEffect E] {t t' : ITree E R} {r : R}
     cases hObs
   · exact ⟨u, hr', hObs⟩
 
+/-- A tree observed at `.ret` does not silently diverge. -/
+theorem not_diverges_of_observe_ret {t : ITree E R} {r : R}
+    (h : t.observe = .ret r) : ¬ Diverges t := by
+  intro hd
+  rw [Diverges.eq_def, h] at hd
+  exact hd
+
+/-- Silent divergence steps across `.tau`. -/
+theorem diverges_of_observe_tau {t t' : ITree E R}
+    (h : t.observe = .tau t') (hd : Diverges t) : Diverges t' := by
+  rw [Diverges.eq_def, h] at hd
+  exact hd
+
+/-- A tree observed at `.ret` is reactively productive. -/
+theorem productive_of_observe_ret [FaultEffect E] {t : ITree E R} {r : R}
+    (h : t.observe = .ret r) : Productive t := by
+  intro tr u hr
+  obtain ⟨-, hEq⟩ := reaches_of_observe_ret h hr
+  subst hEq
+  refine ⟨u, TauStar.refl u, fun w hTau => ?_⟩
+  rw [h] at hTau
+  cases hTau
+
+/-- Productivity propagates backwards across a silent step. -/
+theorem productive_of_observe_tau [FaultEffect E] {t t' : ITree E R}
+    (h : t.observe = .tau t') (hProd : Productive t') : Productive t := by
+  intro tr u hr
+  rcases reaches_of_observe_tau h hr with ⟨-, rfl⟩ | hr'
+  · obtain ⟨u', hs, hNonTau⟩ := hProd [] t' (Reaches.refl t')
+    exact ⟨u', TauStar.step h hs, hNonTau⟩
+  · exact hProd tr u hr'
+
+/-- A tree observed at `.ret` cannot diverge. -/
+theorem not_mayDiverge_of_observe_ret [FaultEffect E] {t : ITree E R} {r : R}
+    (h : t.observe = .ret r) : ¬ MayDiverge t := by
+  rintro ⟨tr, u, hr, hd⟩
+  obtain ⟨-, rfl⟩ := reaches_of_observe_ret h hr
+  exact not_diverges_of_observe_ret h hd
+
+/-- Non-divergence propagates backwards across a silent step. -/
+theorem not_mayDiverge_of_observe_tau [FaultEffect E] {t t' : ITree E R}
+    (h : t.observe = .tau t') (hNoDiv : ¬ MayDiverge t') : ¬ MayDiverge t := by
+  rintro ⟨tr, u, hr, hd⟩
+  rcases reaches_of_observe_tau h hr with ⟨-, rfl⟩ | hr'
+  · exact hNoDiv ⟨[], t', Reaches.refl t', diverges_of_observe_tau h hd⟩
+  · exact hNoDiv ⟨tr, u, hr', hd⟩
+
 end StepLemmas
 
 /-! ### MIR Coalgebra Unfolding -/
@@ -595,20 +642,42 @@ def pathSegments (path : String) : List String :=
   (path.toList.foldl PathSplitState.step
     { pendingColon := false, cur := [], acc := [] }).finish.map String.ofList
 
+/-- Whether `seg` is a valid crate-root segment name: non-empty, starting with an
+    ASCII letter or `_`, and containing only ASCII alphanumerics, `_`, or `-`.
+    This rejects rustc impl/trait pseudo-segments such as `<MyType as Trait>`,
+    `<impl Foo>`, `{{impl}}`, and empty or whitespace-bearing segments. -/
+def isValidCrateSegment (seg : String) : Bool :=
+  match seg.toList with
+  | [] => false
+  | first :: rest =>
+    (first.isAlpha || first == '_') &&
+      rest.all (fun ch => ch.isAlphanum || ch == '_' || ch == '-')
+
+/-- Normalize `pathSegments` by stripping a single leading root `::` (`::main`
+    ↦ `["main"]`, `::my_crate::main` ↦ `["my_crate", "main"]`). Double root
+    separators (`::::main`) leave an empty crate segment that
+    `isValidCrateSegment` rejects. -/
+def normalizeEntryPathSegments (defPath : String) : List String :=
+  match pathSegments defPath with
+  | "" :: rest => rest
+  | segs => segs
+
 /-- Link-level names under which a loader or C runtime transfers control to a
     binary: `main`, `_start`, and `__start`. -/
 def isEntryLeafSymbol (leaf : String) : Bool :=
   leaf == "main" || leaf == "_start" || leaf == "__start"
 
-/-- Name-only entry-point test: `main`, `<crate>::main`, `_start`, `<crate>::_start`,
-    `__start`, `<crate>::__start`. Matching is on whole path segments, so `domain`,
-    `maintain`, `main_loop`, and the inherent method `<crate>::Type::main` are all
-    rejected. This over-approximates `classifyEntryPoint` when no attribute
-    information is available. -/
+/-- Name-only entry-point test: `main`, `::main`, `<crate>::main`,
+    `::<crate>::main`, `_start`, `<crate>::_start`, `__start`,
+    `<crate>::__start`. Matching is on whole path segments with a validated crate
+    segment, so `domain`, `maintain`, `main_loop`, `<crate>::Type::main`,
+    `<MyType as Trait>::main`, `{{impl}}::main`, and `:::main` are all rejected.
+    This over-approximates `classifyEntryPoint` when no attribute information is
+    available. -/
 def isBinaryEntrySymbol (defPath : String) : Bool :=
-  match pathSegments defPath with
+  match normalizeEntryPathSegments defPath with
   | [leaf] => isEntryLeafSymbol leaf
-  | [_, leaf] => isEntryLeafSymbol leaf
+  | [crateSeg, leaf] => isValidCrateSegment crateSeg && isEntryLeafSymbol leaf
   | _ => false
 
 /-- Facts about an item that decide whether it is a binary entry point
@@ -638,11 +707,13 @@ def classifyEntryLeaf (leaf : String) (crateNoMain : Bool) : Option EntryPointKi
     none
 
 /-- Classify an item by its definition path alone: only crate-root items
-    (`leaf` or `<crate>::leaf`) can be entry points. -/
+    (`leaf`, `::leaf`, `<crate>::leaf`, `::<crate>::leaf` with a valid crate
+    segment) can be entry points. -/
 def classifyEntryPath (defPath : String) (crateNoMain : Bool) : Option EntryPointKind :=
-  match pathSegments defPath with
+  match normalizeEntryPathSegments defPath with
   | [leaf] => classifyEntryLeaf leaf crateNoMain
-  | [_, leaf] => classifyEntryLeaf leaf crateNoMain
+  | [crateSeg, leaf] =>
+    if isValidCrateSegment crateSeg then classifyEntryLeaf leaf crateNoMain else none
   | _ => none
 
 /-- Classify an item as a binary entry point
@@ -691,11 +762,16 @@ theorem isBinaryEntrySymbol_of_classifyEntryPath {defPath : String} {crateNoMain
     isBinaryEntrySymbol defPath = true := by
   unfold classifyEntryPath at h
   unfold isBinaryEntrySymbol
-  generalize pathSegments defPath = segs at h
+  generalize normalizeEntryPathSegments defPath = segs at h
   match segs, h with
   | [], h => cases h
   | [_], h => exact isEntryLeafSymbol_of_classifyEntryLeaf h
-  | [_, _], h => exact isEntryLeafSymbol_of_classifyEntryLeaf h
+  | [crateSeg, leaf], h =>
+    by_cases hCrate : isValidCrateSegment crateSeg = true
+    · simp only [hCrate, ↓reduceIte] at h
+      simp only [hCrate, Bool.true_and]
+      exact isEntryLeafSymbol_of_classifyEntryLeaf h
+    · simp [hCrate] at h
   | _ :: _ :: _ :: _, h => cases h
 
 /-! ### 3.2 Closed-Program Safety and the Guard -/
@@ -964,6 +1040,39 @@ theorem StatefulEntryRequiresSoundnessCollapse.not_closedProgramSafe
   obtain ⟨args, mem, hAdm, -, hFault⟩ := h.escapes
   exact hFault.not_treeSafe (hSafe (args, mem) hAdm)
 
+/-- **Total-correctness `verus#3606` collapse witness**: even a kernel-checked
+    `TotalVerificationResult` (UB-free, productive, non-diverging, panic-free) on
+    a binary entry point collapses when its `requires` is non-universal. -/
+structure TotalEntryRequiresSoundnessCollapse
+    (admissible : List Value → Memory → Prop) (c : TotalClaim) : Prop where
+  /-- The verified item is a binary entry point. -/
+  entrySymbol : isBinaryEntrySymbol c.body.defPath = true
+  /-- The stateful precondition is satisfiable. -/
+  nonVacuous : NonVacuousStatefulPre c.pre
+  /-- The total contract is dichotomous. -/
+  dichotomy : TotalClaimDichotomy c
+  /-- The claim carries a kernel-checked total-correctness certificate. -/
+  verified : TotalVerificationResult c
+  /-- Some ABI-admissible initial `(args, memory)` violates `pre` and raises `.ub`. -/
+  escapes : ∃ args mem, admissible args mem ∧ ¬ c.pre args mem ∧
+    FaultsWith (mirStatefulTreeWithCallees c.body args mem c.callees) .ub
+
+theorem TotalEntryRequiresSoundnessCollapse.not_guard
+    {admissible : List Value → Memory → Prop} {c : TotalClaim}
+    (h : TotalEntryRequiresSoundnessCollapse admissible c) :
+    ¬ TotalClaimEntryRequiresGuard admissible c := by
+  intro hGuard
+  obtain ⟨args, mem, hAdm, hPre, -⟩ := h.escapes
+  exact hPre (hGuard (args, mem) hAdm)
+
+theorem TotalEntryRequiresSoundnessCollapse.not_closedProgramTotal
+    {admissible : List Value → Memory → Prop} {c : TotalClaim}
+    (h : TotalEntryRequiresSoundnessCollapse admissible c) :
+    ¬ TotalClaimClosedProgramTotal admissible c := by
+  intro hTotal
+  obtain ⟨args, mem, hAdm, -, hFault⟩ := h.escapes
+  exact hFault.not_treeSafe (hTotal.closedProgramSafe (args, mem) hAdm)
+
 /-! ### 3.5 A Concrete Collapse in `Trusted.Rustc.V2026_06_01.MirSemantics`
 
 The entry point `extern "C" fn main(argc: u8) -> u8 { 1 / argc }` with
@@ -983,6 +1092,24 @@ theorem mirTree_safe_of_step_tau_ret {body : CapturedMir} {s s' : MachineState}
   refine ⟨treeSafe_of_observe_tau hObs₀ (treeSafe_of_observe_ret hObs₁), ?_⟩
   intro tr out' hRet
   exact (reachesRet_of_observe_ret hObs₁ (reachesRet_of_observe_tau hObs₀ hRet)).2
+
+/-- A MIR execution that takes one silent step and then returns `out` is safe,
+    reactively productive, non-diverging, and returns exactly `out`. -/
+theorem mirTree_total_of_step_tau_ret {body : CapturedMir} {s s' : MachineState}
+    {out : MirOutcome}
+    (h₀ : stepMirState body (.running s) = .tau (.running s'))
+    (h₁ : stepMirState body (.running s') = .ret out) :
+    TreeSafe (mirTree body s) ∧
+      Productive (mirTree body s) ∧
+      ¬ MayDiverge (mirTree body s) ∧
+      ∀ tr out', ReachesRet (mirTree body s) tr out' → out' = out := by
+  have hObs₀ := cofix_observe_of_step_tau h₀
+  have hObs₁ := cofix_observe_of_step_ret h₁
+  obtain ⟨hSafe, hRet⟩ := mirTree_safe_of_step_tau_ret h₀ h₁
+  exact ⟨hSafe,
+    productive_of_observe_tau hObs₀ (productive_of_observe_ret hObs₁),
+    not_mayDiverge_of_observe_tau hObs₀ (not_mayDiverge_of_observe_ret hObs₁),
+    hRet⟩
 
 namespace EntryDemo
 
@@ -1272,6 +1399,71 @@ theorem start_requires_stateful_collapse :
       (divEntryStatefulClaim "_start") :=
   divEntryStatefulClaim_collapse _ (by decide)
 
+/-- The verified total-correctness claim
+    `{argc == 1 ∧ mem == ∅} <entry> {ret == 1 ∧ mem' == ∅}`. -/
+def divEntryTotalClaim (defPath : DefPath) : TotalClaim where
+  body := divEntryBody defPath
+  pre := fun args mem => args = u8Arg 1 ∧ mem = emptyMemory
+  post := fun _ _ ret mem' => ret = .scalar { bits := 1, sizeBytes := 1 } ∧ mem' = emptyMemory
+
+/-- `divEntryTotalClaim` carries a kernel-checked `TotalVerificationResult`. -/
+theorem divEntryTotalClaim_verified (defPath : DefPath) :
+    TotalVerificationResult (divEntryTotalClaim defPath) := by
+  refine ⟨fun args mem hPre => ?_⟩
+  obtain ⟨hArgs, hMem⟩ : args = u8Arg 1 ∧ mem = emptyMemory := hPre
+  subst hArgs hMem
+  obtain ⟨hSafe, hProd, hNoDiv, hRet⟩ :=
+    mirTree_total_of_step_tau_ret (divEntry_stateful_step_one defPath)
+      (divEntry_step_return defPath)
+  refine ⟨hSafe, hProd, hNoDiv, ?_⟩
+  intro tr out hReach
+  have hEq := hRet tr out hReach
+  exact ⟨.scalar { bits := 1, sizeBytes := 1 }, emptyMemory, hEq, rfl, rfl⟩
+
+/-- **Negative soundness-collapse theorem (total correctness).** -/
+theorem divEntryTotalClaim_collapse (defPath : DefPath)
+    (hEntry : isBinaryEntrySymbol defPath = true) :
+    TotalEntryRequiresSoundnessCollapse u8StatefulEntryAbi
+      (divEntryTotalClaim defPath) where
+  entrySymbol := hEntry
+  nonVacuous := ⟨u8Arg 1, emptyMemory, rfl, rfl⟩
+  dichotomy :=
+    ⟨(u8Arg 1, emptyMemory), ⟨rfl, rfl⟩,
+      ⟨(.scalar { bits := 1, sizeBytes := 1 }, emptyMemory), ⟨rfl, rfl⟩⟩,
+      ⟨(.unit, emptyMemory), fun h => Value.noConfusion h.1⟩⟩
+  verified := divEntryTotalClaim_verified defPath
+  escapes := by
+    refine ⟨u8Arg 0, emptyMemory, ⟨⟨0, by decide, rfl⟩, rfl⟩, ?_,
+      faultsWith_of_step_fail (divEntry_stateful_step_zero defPath)⟩
+    intro hPre
+    have hArgs : u8Arg 0 = u8Arg 1 := hPre.1
+    cases hArgs
+
+/-- The total-correctness collapse on `main`. -/
+theorem main_requires_total_collapse :
+    TotalEntryRequiresSoundnessCollapse u8StatefulEntryAbi
+      (divEntryTotalClaim "entry_demo::main") :=
+  divEntryTotalClaim_collapse _ (by decide)
+
+/-- The total-correctness collapse on `#![no_main]` `_start`. -/
+theorem start_requires_total_collapse :
+    TotalEntryRequiresSoundnessCollapse u8StatefulEntryAbi
+      (divEntryTotalClaim "_start") :=
+  divEntryTotalClaim_collapse _ (by decide)
+
+/-- Even `TotalVerificationResult`, precondition satisfiability, and dichotomy do
+    not imply closed-program total correctness of an entry point without the guard. -/
+theorem totalVerified_nonVacuous_dichotomy_not_closedProgramTotal :
+    ¬ ∀ (admissible : List Value → Memory → Prop) (c : TotalClaim),
+        isBinaryEntrySymbol c.body.defPath = true → NonVacuousStatefulPre c.pre →
+          TotalClaimDichotomy c → TotalVerificationResult c →
+            TotalClaimClosedProgramTotal admissible c :=
+  fun hAll =>
+    main_requires_total_collapse.not_closedProgramTotal
+      (hAll u8StatefulEntryAbi _ main_requires_total_collapse.entrySymbol
+        main_requires_total_collapse.nonVacuous main_requires_total_collapse.dichotomy
+        main_requires_total_collapse.verified)
+
 end EntryDemo
 
 /-! ## 4. Guard 2 — Fixed-Width Ghost Length (`Slate` Soundness Bug 121)
@@ -1463,6 +1655,72 @@ theorem replicate_two_pow_64_ne_nil {α : Type u} (x : α) :
 theorem false_of_u64_list_len_zero_imp_nil {α : Type u} (x : α)
     (hAxiom : ∀ xs : List α, u64ListGhostLen xs = 0 → xs = []) : False :=
   replicate_two_pow_64_ne_nil x (hAxiom _ (u64ListGhostLen_replicate_two_pow_64 x))
+
+/-- A ghost length stored in a target pointer-sized `USize`. -/
+def usizeGhostLen (n : Nat) : USize := USize.ofNat n
+
+/-- The `USize` ghost length of a list. -/
+def usizeListGhostLen {α : Type u} (xs : List α) : USize := usizeGhostLen xs.length
+
+/-- **`USize` wraparound at every target pointer width.** `USize.ofNat USize.size = 0`,
+    whether the platform is 32-bit or 64-bit. -/
+theorem usizeGhostLen_wraps : usizeGhostLen USize.size = 0 := by
+  apply USize.eq_of_toBitVec_eq
+  apply BitVec.eq_of_toNat_eq
+  simp [usizeGhostLen, USize.size]
+
+theorem usize_size_pos : 0 < USize.size := by
+  rw [USize.size]
+  exact Nat.two_pow_pos _
+
+/-- A list of `USize.size` elements has `USize` ghost length `0`. -/
+theorem usizeListGhostLen_replicate_size {α : Type u} (x : α) :
+    usizeListGhostLen (List.replicate USize.size x) = 0 := by
+  unfold usizeListGhostLen
+  rw [List.length_replicate]
+  exact usizeGhostLen_wraps
+
+/-- A list of `USize.size` elements is not empty. -/
+theorem replicate_usize_size_ne_nil {α : Type u} (x : α) :
+    List.replicate USize.size x ≠ [] := by
+  intro h
+  have hLen : (List.replicate USize.size x).length = ([] : List α).length :=
+    congrArg List.length h
+  rw [List.length_replicate] at hLen
+  exact Nat.ne_of_gt usize_size_pos hLen
+
+/-- **`False` from the `USize` list length** at every target pointer width. -/
+theorem false_of_usize_list_len_zero_imp_nil {α : Type u} (x : α)
+    (hAxiom : ∀ xs : List α, usizeListGhostLen xs = 0 → xs = []) : False :=
+  replicate_usize_size_ne_nil x (hAxiom _ (usizeListGhostLen_replicate_size x))
+
+/-- A ghost length stored in a `BitVec w`. -/
+def bitVecGhostLen (w n : Nat) : BitVec w := BitVec.ofNat w n
+
+/-- The `BitVec w` ghost length of a list. -/
+def bitVecListGhostLen (w : Nat) {α : Type u} (xs : List α) : BitVec w :=
+  bitVecGhostLen w xs.length
+
+/-- **`BitVec w` wraparound at every width `w`.** -/
+theorem bitVecGhostLen_two_pow (w : Nat) : bitVecGhostLen w (2 ^ w) = 0 := by
+  apply BitVec.eq_of_toNat_eq
+  simp [bitVecGhostLen]
+
+/-- Concrete `BitVec 64` wraparound at `2 ^ 64`. -/
+theorem bitVec64GhostLen_two_pow_64 : bitVecGhostLen 64 (2 ^ 64) = 0 :=
+  bitVecGhostLen_two_pow 64
+
+/-- **`False` from a `BitVec w` ghost list length** at every width `w`. -/
+theorem false_of_bitVec_list_len_zero_imp_nil (w : Nat) {α : Type u} (x : α)
+    (hAxiom : ∀ xs : List α, bitVecListGhostLen w xs = 0 → xs = []) : False := by
+  have hNil : List.replicate (2 ^ w) x = [] := hAxiom _ (by
+    unfold bitVecListGhostLen
+    rw [List.length_replicate]
+    exact bitVecGhostLen_two_pow w)
+  have hLen : (List.replicate (2 ^ w) x).length = ([] : List α).length :=
+    congrArg List.length hNil
+  rw [List.length_replicate] at hLen
+  exact Nat.ne_of_gt (Nat.two_pow_pos w) hLen
 
 /-! ### 4.3 `False` from Fixed-Width Ghost Collection Axioms -/
 
@@ -1714,6 +1972,60 @@ theorem UnboundedGhostCollectionAxioms.len_iterSnoc {Coll : Type u}
     show A.len (A.snoc (iterSnoc A.snoc n A.empty)) = n + 1
     rw [A.len_snoc, ih]
 
+/-- The full inductive axiom set of a ghost collection with an unbounded `Int`
+    length (`0 ≤ len c`). -/
+structure UnboundedIntGhostCollectionAxioms (Coll : Type u) where
+  /-- The empty collection. -/
+  empty : Coll
+  /-- Append one element. -/
+  snoc : Coll → Coll
+  /-- Emptiness predicate. -/
+  IsEmpty : Coll → Prop
+  /-- Unbounded signed length. -/
+  len : Coll → Int
+  /-- Ghost lengths are always non-negative. -/
+  len_nonneg : ∀ c, 0 ≤ len c
+  /-- The empty collection has length `0`. -/
+  len_empty : len empty = 0
+  /-- `snoc` advances the length by exactly one. -/
+  len_snoc : ∀ c, len (snoc c) = len c + 1
+  /-- `snoc` strictly increases the length. -/
+  len_strict_mono : ∀ c, len c < len (snoc c)
+  /-- Length zero characterizes emptiness. -/
+  len_zero_iff_isEmpty : ∀ c, len c = 0 ↔ IsEmpty c
+  /-- A collection built by `snoc` is not empty. -/
+  not_isEmpty_snoc : ∀ c, ¬ IsEmpty (snoc c)
+
+/-- The list model of the unbounded `Int` axioms. -/
+def listIntGhostLengthAxioms {α : Type u} (x : α) :
+    UnboundedIntGhostCollectionAxioms (List α) where
+  empty := []
+  snoc := fun xs => x :: xs
+  IsEmpty := fun xs => xs = []
+  len := intGhostLen
+  len_nonneg := intGhostLen_nonneg
+  len_empty := intGhostLen_nil
+  len_snoc := intGhostLen_cons x
+  len_strict_mono := intGhostLen_lt_cons x
+  len_zero_iff_isEmpty := intGhostLen_eq_zero_iff
+  not_isEmpty_snoc := fun _ h => nomatch h
+
+/-- **Model consistency (`Int`).** The unbounded `Int` inductive axioms are satisfiable. -/
+theorem unboundedIntGhostCollectionAxioms_nonempty :
+    Nonempty (UnboundedIntGhostCollectionAxioms (List Unit)) :=
+  ⟨listIntGhostLengthAxioms ()⟩
+
+/-- Under the unbounded `Int` axioms the length after `n` appends is `Int.ofNat n`. -/
+theorem UnboundedIntGhostCollectionAxioms.len_iterSnoc {Coll : Type u}
+    (A : UnboundedIntGhostCollectionAxioms Coll) (n : Nat) :
+    A.len (iterSnoc A.snoc n A.empty) = Int.ofNat n := by
+  induction n with
+  | zero => exact A.len_empty
+  | succ n ih =>
+    show A.len (A.snoc (iterSnoc A.snoc n A.empty)) = Int.ofNat (n + 1)
+    rw [A.len_snoc, ih]
+    rfl
+
 /-! ### 4.5 The Guard Is Exactly Right -/
 
 /-- A model of the strict-monotonicity axiom whose length denotes only values
@@ -1771,10 +2083,16 @@ theorem ghostLengthTypeGuard_iff_nonempty_model (w : GhostIntWidth) :
         (M.len_represents (iterSnoc M.snoc cap M.empty))
       exact absurd hLt (Nat.not_lt.mpr (M.le_len_iterSnoc cap))
 
-/-- No fixed-width ghost length admits the inductive length axiom. -/
+/-- No fixed-width unsigned ghost length admits the inductive length axiom. -/
 theorem isEmpty_model_of_fixedUnsigned (bits : Nat) :
     ¬ Nonempty (InductiveGhostLengthModel (.fixedUnsigned bits)) :=
   fun h => not_ghostLengthTypeGuard_fixedUnsigned bits
+    ((ghostLengthTypeGuard_iff_nonempty_model _).mpr h)
+
+/-- No fixed-width signed ghost length admits the inductive length axiom. -/
+theorem isEmpty_model_of_fixedSigned (bits : Nat) :
+    ¬ Nonempty (InductiveGhostLengthModel (.fixedSigned bits)) :=
+  fun h => not_ghostLengthTypeGuard_fixedSigned bits
     ((ghostLengthTypeGuard_iff_nonempty_model _).mpr h)
 
 /-! ## 5. Guard 3 — Error-Branch `True` Wildcard (`awsm2`)
@@ -2242,5 +2560,86 @@ theorem errorGuardedPost_guarded {X : Type u} {α : Type v} {ε : Type w}
   ok_rejects_err := fun _ _ hOk _ h => h.1 hOk
   err_rejects_ok := fun _ _ hErr _ h => hErr h.1
   err_payload_unique := fun _ _ _ _ _ h₁ h₂ => h₁.2.trans h₂.2.symm
+
+/-- The pure `Except ε α` counterpart of `ErrorBranchGuardedPost`. -/
+structure ErrorBranchGuardedExceptPost {X : Type u} {α : Type v} {ε : Type w}
+    (pre expectsOk : X → Prop) (post : X → Except ε α → Prop) : Prop where
+  /-- Every valid input has an accepted `Except` outcome. -/
+  realizable : ∀ x, pre x → ∃ out, post x out
+  /-- On an expected-`ok` input every `error` is rejected. -/
+  ok_rejects_error : ∀ x, pre x → expectsOk x → ∀ e, ¬ post x (.error e)
+  /-- On an expected-`error` input every `ok` is rejected. -/
+  error_rejects_ok : ∀ x, pre x → ¬ expectsOk x → ∀ v, ¬ post x (.ok v)
+  /-- On an expected-`error` input the accepted error payload is unique. -/
+  error_payload_unique : ∀ x, pre x → ¬ expectsOk x → ∀ e₁ e₂,
+    post x (.error e₁) → post x (.error e₂) → e₁ = e₂
+
+namespace ErrorBranchGuardedExceptPost
+
+variable {X : Type u} {α : Type v} {ε : Type w} {pre expectsOk : X → Prop}
+  {post : X → Except ε α → Prop}
+
+/-- On an expected-`error` input some error payload is accepted. -/
+theorem exists_error_accepted (h : ErrorBranchGuardedExceptPost pre expectsOk post) {x : X}
+    (hx : pre x) (hErr : ¬ expectsOk x) : ∃ e, post x (.error e) := by
+  obtain ⟨out, hOut⟩ := h.realizable x hx
+  cases out with
+  | ok v => exact absurd hOut (h.error_rejects_ok x hx hErr v)
+  | error e => exact ⟨e, hOut⟩
+
+/-- Kills every constant-`.error` escape mutant whenever some input must succeed. -/
+theorem kills_constError (h : ErrorBranchGuardedExceptPost pre expectsOk post)
+    (hOk : ∃ x, pre x ∧ expectsOk x) (e : ε) :
+    ¬ MutantSurvives pre post (fun _ => .error e) := by
+  intro hSurvives
+  obtain ⟨x, hx, hExp⟩ := hOk
+  exact h.ok_rejects_error x hx hExp e (hSurvives x hx)
+
+/-- Kills wrong error payloads on expected-`error` inputs. -/
+theorem kills_wrong_error_payload (h : ErrorBranchGuardedExceptPost pre expectsOk post) {x : X}
+    (hx : pre x) (hErr : ¬ expectsOk x) {e e' : ε} (hAccept : post x (.error e))
+    (hNe : e' ≠ e) : ¬ post x (.error e') :=
+  fun hAccept' => hNe (h.error_payload_unique x hx hErr e' e hAccept' hAccept)
+
+/-- Achieves error-fibre dichotomy on `Except ε α`. -/
+theorem errorDichotomy (h : ErrorBranchGuardedExceptPost pre expectsOk post)
+    (hErr : ∃ x, pre x ∧ ¬ expectsOk x) (hTwo : ∃ e₁ e₂ : ε, e₁ ≠ e₂) :
+    ∃ x, pre x ∧ ∃ eOk eBad : ε, post x (.error eOk) ∧ ¬ post x (.error eBad) := by
+  obtain ⟨x, hx, hExp⟩ := hErr
+  obtain ⟨e, hAccept⟩ := h.exists_error_accepted hx hExp
+  obtain ⟨e₁, e₂, hNe⟩ := hTwo
+  refine ⟨x, hx, e, ?_⟩
+  by_cases hEq : e₁ = e
+  · exact ⟨e₂, hAccept, h.kills_wrong_error_payload hx hExp hAccept
+      (fun h₂ => hNe (hEq.trans h₂.symm))⟩
+  · exact ⟨e₁, hAccept, h.kills_wrong_error_payload hx hExp hAccept hEq⟩
+
+end ErrorBranchGuardedExceptPost
+
+/-- The pure `Except` wildcard fails `ErrorBranchGuardedExceptPost` whenever some
+    valid input must succeed. -/
+theorem not_errorBranchGuardedExceptPost_exceptErrorWildcardPost
+    {X : Type u} {α : Type v} {ε : Type w} {pre expectsOk : X → Prop}
+    (specFn : X → α) (hOk : ∃ x, pre x ∧ expectsOk x) (e : ε) :
+    ¬ ErrorBranchGuardedExceptPost pre expectsOk (exceptErrorWildcardPost (ε := ε) specFn) :=
+  fun h => h.kills_constError hOk e (exceptErrorWildcardPost_constError_survives specFn e)
+
+/-- The repaired pure `Except` postcondition. -/
+def exceptGuardedPost {X : Type u} {α : Type v} {ε : Type w} (expectsOk : X → Prop)
+    (specFn : X → α) (errFn : X → ε) (x : X) : Except ε α → Prop
+  | .ok v => expectsOk x ∧ v = specFn x
+  | .error e => ¬ expectsOk x ∧ e = errFn x
+
+/-- The repaired pure `Except` postcondition satisfies `ErrorBranchGuardedExceptPost`. -/
+theorem exceptGuardedPost_guarded {X : Type u} {α : Type v} {ε : Type w}
+    (pre expectsOk : X → Prop) (specFn : X → α) (errFn : X → ε) :
+    ErrorBranchGuardedExceptPost pre expectsOk (exceptGuardedPost expectsOk specFn errFn) where
+  realizable := fun x _ => by
+    by_cases hOk : expectsOk x
+    · exact ⟨.ok (specFn x), hOk, rfl⟩
+    · exact ⟨.error (errFn x), hOk, rfl⟩
+  ok_rejects_error := fun _ _ hOk _ h => h.1 hOk
+  error_rejects_ok := fun _ _ hErr _ h => hErr h.1
+  error_payload_unique := fun _ _ _ _ _ h₁ h₂ => h₁.2.trans h₂.2.symm
 
 end Anneal.SpecBoundaryGuards
