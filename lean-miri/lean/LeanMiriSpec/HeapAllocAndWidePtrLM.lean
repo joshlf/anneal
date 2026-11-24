@@ -2211,6 +2211,103 @@ theorem allocationMachine_deallocate_dangling {K User Payload : Type} [Decidable
     EStateM.throw, throw, throwThe, MonadExceptOf.throw, hsync, hres, hpend, Option.getD_none]
   rfl
 
+/-! ### `Memory::allocate_ptr` failure classification
+
+`MemoryLifecycle.allocatePtr` creates the backing storage (`Allocation.tryNew`)
+*before* `insert_allocation` checks the size against the maximum object size,
+reserves an `AllocId`, and rejects a dynamic allocation of the global kind.
+The Rust allocator shim therefore has to reject a size above `isize::MAX`
+before calling it (`lmAllocateKind`), or the host is asked for the storage. -/
+
+/-- A failure to create the backing storage stops `allocate_ptr` first, with
+the memory unchanged. -/
+theorem allocatePtr_tryNew_error {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (e : AllocError) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .error e) :
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).outcome = .error (.allocation e) ∧
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).memory = memory := by
+  unfold MemoryLifecycle.allocatePtr
+  simp only [Id.run, h]
+  exact ⟨rfl, rfl⟩
+
+/-- Once the storage exists, an object larger than the maximum object size
+stops `insert_allocation` with `allocationTooLarge`, before any `AllocId` is
+reserved: the memory is unchanged. -/
+theorem allocatePtr_too_large {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hbig : a.byteSize.bytes > maximumObjectSize.bytes) :
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).outcome =
+        .error (.allocationTooLarge a.byteSize maximumObjectSize) ∧
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).memory = memory := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  simp only [Id.run, h, pure_bind, hbig, ↓reduceIte]
+  exact ⟨rfl, rfl⟩
+
+/-- Once the storage exists and fits, a dynamic allocation of the global kind
+is rejected with `dynamicallyAllocatingGlobal`, after the `AllocId` was
+reserved (the reservation is kept, as in the source). -/
+theorem allocatePtr_dynamically_global {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size)
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hfit : ¬ a.byteSize.bytes > maximumObjectSize.bytes) (id : AllocId)
+    (hres : memory.reserveAllocId.2 = .ok id) :
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      (some kind) zeroedStorage initExtra adjustRoot).outcome = .error .dynamicallyAllocatingGlobal ∧
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      (some kind) zeroedStorage initExtra adjustRoot).memory = memory.reserveAllocId.1 := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  cases hr : memory.reserveAllocId with
+  | mk mem' r =>
+    rw [hr] at hres
+    simp only at hres
+    subst hres
+    simp only [Id.run, h, pure_bind, hfit, ↓reduceIte]
+    exact ⟨rfl, rfl⟩
+
+/-- `allocatePtr_too_large` is not vacuous and explains the shim's guard: the
+vendored `Allocation.tryNew` happily creates a 16-byte backing store, and
+`allocate_ptr` then rejects it against an 8-byte maximum object size. -/
+theorem allocatePtr_too_large_witness :
+    (MemoryLifecycle.allocatePtr (MemoryState.empty : LmMem) { treeBorrows := false }
+      (fun _ ctx => ctx) (Size.ofBytes 16) Align.ONE (.machine .rust) .Uninit (Size.ofBytes 8)
+      (some (.machine .global)) (fun size _ => some (Array.replicate size.bytes.toNat 0))
+      lmInitExtra lmAdjustRoot).outcome =
+        .error (.allocationTooLarge (Size.ofBytes 16) (Size.ofBytes 8)) := by
+  rw [allocatePtrU.eq_src]
+  decide +kernel
+
 /-! ### Tree Borrows universal laws (`rust#165833`) -/
 
 /-- On the single-threaded hooks (`lmHookContext`, `lmMachineHooks`), vendored
@@ -3107,7 +3204,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.HeapAllocAndWidePtrLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 85 then
+  if theorems < 89 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.HeapAllocAndWidePtrLM seen"
   logInfo m!"LeanMiriSpec.HeapAllocAndWidePtrLM: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 

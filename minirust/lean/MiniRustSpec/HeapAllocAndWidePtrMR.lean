@@ -2227,6 +2227,188 @@ theorem cm_leak_check_error_iff (cm : ConcurrentMemory BM) (e : Stop) :
   rw [← cm_leak_check_bm_eq]
   exact cm_leak_check_bm_error_iff cm e
 
+
+/-! ### The heap lifecycle, universally
+
+What the threaded trace `mrHeapLifecycleTrace` shows on one machine holds on
+every `BasicMemory`: a fresh `Heap` allocation is live, so `leak_check`
+reports it; deallocating it with the size, alignment, and kind it was
+allocated with passes every check of `BasicMemory::deallocate`; afterwards
+`leak_check` is back to what it was before the allocation; and a second
+deallocation is a double-free. -/
+
+section HeapLifecycle
+
+variable {ProvExtra AllocExtra : Type}
+
+/-- The allocation record `BasicMemory::allocate` appends. -/
+def freshAllocation (addr : Int) (kind : AllocationKind) (size : Size) (align : Align)
+    (live : Bool) (extra : AllocExtra) : Allocation ProvExtra AllocExtra :=
+  { addr := addr, align := align, kind := kind, live := live,
+    data := List.replicate size.bytes .Uninit, extra := extra }
+
+/-- `Allocation::size` of a fresh allocation is the requested size. -/
+theorem freshAllocation_size (addr : Int) (kind : AllocationKind) (size : Size) (align : Align)
+    (live : Bool) (extra : AllocExtra) :
+    Allocation.size (freshAllocation (ProvExtra := ProvExtra) addr kind size align live extra) =
+      size := by
+  cases size
+  simp only [Allocation.size, freshAllocation, List.length_replicate]
+
+/-- **Deallocating what was just allocated succeeds**, for every memory, kind,
+size, alignment, and every `handle_extra` that accepts the fresh extra: the
+pointer `BasicMemory::allocate` returned passes every check of
+`BasicMemory::deallocate` with the same kind, size, and alignment, and the
+allocation is marked dead in place. -/
+theorem basicMemory_allocate_then_deallocate
+    {mem mem' : BasicMemory x86_64 ProvExtra AllocExtra} {kind : AllocationKind} {size : Size}
+    {align : Align} {provExtra : ProvExtra} {allocExtra extra' : AllocExtra}
+    {ptr : ThinPointer (Provenance ProvExtra)}
+    (handleExtra : AllocExtra → ProvExtra → Interp AllocExtra)
+    (h : BasicMemory.allocate mem kind size align provExtra allocExtra = .ok (ptr, mem'))
+    (hh : handleExtra allocExtra provExtra = .ok extra') :
+    ∃ addr, ptr.addr = addr ∧
+      mem' = { mem with allocations :=
+        mem.allocations ++ [freshAllocation addr kind size align true allocExtra] } ∧
+      BasicMemory.deallocate mem' ptr kind size align handleExtra =
+        .ok { mem with allocations :=
+          mem.allocations ++ [freshAllocation addr kind size align false extra'] } := by
+  obtain ⟨_, addr, _, rfl, rfl⟩ :=
+    (basicMemory_allocate_ok_iff mem mem' kind size align provExtra allocExtra ptr).mp h
+  refine ⟨addr, rfl, rfl, ?_⟩
+  rw [(basicMemory_deallocate_ok_iff _ _ _ kind size align handleExtra).mpr
+    ⟨⟨mem.allocations.length⟩, provExtra, freshAllocation addr kind size align true allocExtra,
+      extra', rfl, Int.natCast_nonneg _, ?_, rfl, rfl, rfl,
+      (freshAllocation_size addr kind size align true allocExtra).symm, rfl, hh, rfl⟩]
+  · simp only [Int.toNat_natCast, List.set_append_right _ _ (Nat.le_refl _), Nat.sub_self,
+      List.set_cons_zero]
+    rfl
+  · simp only [Int.toNat_natCast, List.getElem?_append_right (Nat.le_refl _), Nat.sub_self,
+      List.getElem?_cons_zero]
+    rfl
+
+/-- A second deallocation of the same pointer is a double-free. -/
+theorem basicMemory_deallocate_twice_double_free
+    {mem mem' : BasicMemory x86_64 ProvExtra AllocExtra} {kind : AllocationKind} {size : Size}
+    {align : Align} {provExtra : ProvExtra} {allocExtra extra' : AllocExtra}
+    {ptr : ThinPointer (Provenance ProvExtra)}
+    (handleExtra : AllocExtra → ProvExtra → Interp AllocExtra)
+    (h : BasicMemory.allocate mem kind size align provExtra allocExtra = .ok (ptr, mem'))
+    (hh : handleExtra allocExtra provExtra = .ok extra')
+    (kind' : AllocationKind) (size' : Size) (align' : Align) :
+    ∃ mem'', BasicMemory.deallocate mem' ptr kind size align handleExtra = .ok mem'' ∧
+      BasicMemory.deallocate mem'' ptr kind' size' align' handleExtra = .error (.ub "double-free") := by
+  obtain ⟨addr, haddr, rfl, hd⟩ := basicMemory_allocate_then_deallocate handleExtra h hh
+  obtain ⟨_, _, _, hp, _⟩ :=
+    (basicMemory_allocate_ok_iff mem _ kind size align provExtra allocExtra ptr).mp h
+  refine ⟨_, hd, ?_⟩
+  refine basicMemory_deallocate_double_free_ub _ ptr kind' size' align' handleExtra
+    ⟨mem.allocations.length⟩ provExtra (freshAllocation addr kind size align false extra')
+    (by rw [hp]) ?_ rfl
+  rw [listIndex_eq_ok_iff]
+  refine ⟨Int.natCast_nonneg _, ?_⟩
+  simp only [Int.toNat_natCast, List.getElem?_append_right (Nat.le_refl _), Nat.sub_self,
+    List.getElem?_cons_zero]
+
+/-- A fresh `Heap` allocation makes `leak_check` report `MemoryLeak`, whatever
+memory it was allocated in. -/
+theorem basicMemory_allocate_heap_leaks
+    {mem mem' : BasicMemory x86_64 ProvExtra AllocExtra} {size : Size} {align : Align}
+    {provExtra : ProvExtra} {allocExtra : AllocExtra} {ptr : ThinPointer (Provenance ProvExtra)}
+    (h : BasicMemory.allocate mem .Heap size align provExtra allocExtra = .ok (ptr, mem')) :
+    BasicMemory.leak_check mem' = .error .memoryLeak := by
+  obtain ⟨_, addr, _, _, rfl⟩ :=
+    (basicMemory_allocate_ok_iff mem mem' .Heap size align provExtra allocExtra ptr).mp h
+  rw [basicMemory_leak_check_error_iff]
+  exact ⟨rfl, freshAllocation addr .Heap size align true allocExtra,
+    List.mem_append_right _ (List.mem_singleton_self _), rfl, rfl⟩
+
+/-- After allocating and deallocating a block, `leak_check` gives exactly
+what it gave before the allocation: the dead record is ignored. -/
+theorem basicMemory_allocate_deallocate_leak_check
+    {mem mem' : BasicMemory x86_64 ProvExtra AllocExtra} {kind : AllocationKind} {size : Size}
+    {align : Align} {provExtra : ProvExtra} {allocExtra extra' : AllocExtra}
+    {ptr : ThinPointer (Provenance ProvExtra)}
+    (handleExtra : AllocExtra → ProvExtra → Interp AllocExtra)
+    (h : BasicMemory.allocate mem kind size align provExtra allocExtra = .ok (ptr, mem'))
+    (hh : handleExtra allocExtra provExtra = .ok extra') :
+    ∃ mem'', BasicMemory.deallocate mem' ptr kind size align handleExtra = .ok mem'' ∧
+      BasicMemory.leak_check mem'' = BasicMemory.leak_check mem := by
+  obtain ⟨addr, _, rfl, hd⟩ := basicMemory_allocate_then_deallocate handleExtra h hh
+  refine ⟨_, hd, ?_⟩
+  unfold BasicMemory.leak_check
+  simp only [List.any_append, List.any_cons, List.any_nil, freshAllocation, Bool.false_and,
+    Bool.or_false]
+
+end HeapLifecycle
+
+/-- `ConcurrentMemory::allocate` over `BasicMemory<x86_64>` is the polymorphic
+`BasicMemory::allocate` on the wrapped memory. -/
+theorem cm_allocate_bm_basic (cm : ConcurrentMemory BM) (kind : AllocationKind) (size : Size)
+    (align : Align) :
+    ConcurrentMemory.allocate (M := BM) cm kind size align =
+      (do
+        let (ptr, mem) ← BasicMemory.allocate cm.memory kind size align () ()
+        pure (ptr, { cm with memory := mem })) := by
+  rw [cm_allocate_bm_eq]
+  unfold CM.allocate
+  rw [bm_allocate_eq_basic]
+
+/-- `ConcurrentMemory::deallocate` over `BasicMemory<x86_64>` is the
+polymorphic `BasicMemory::deallocate` with the trivial `handle_extra`. -/
+theorem cm_deallocate_bm_basic (cm : ConcurrentMemory BM) (ptr : Ptr) (kind : AllocationKind)
+    (size : Size) (align : Align) :
+    ConcurrentMemory.deallocate (M := BM) cm ptr kind size align =
+      (do
+        let mem ← BasicMemory.deallocate cm.memory ptr kind size align (fun extra _ => pure extra)
+        pure { cm with memory := mem }) := by
+  rw [cm_deallocate_bm_eq]
+  unfold CM.deallocate
+  rw [bm_deallocate_eq_basic]
+
+/-- **The heap lifecycle on every `Mach`.** Whenever `Allocate(size, align)`
+succeeds at a thin pointer type on a `Machine<BasicMemory<x86_64>>`, the new
+machine reports a leak; `Deallocate(ptr, size, align)` of the returned
+pointer succeeds; the machine after it passes `leak_check` exactly when the
+machine before the allocation did; and a second `Deallocate` of the same
+pointer is UB `"double-free"`. -/
+theorem heap_lifecycle_bm (m m1 : Mach) (size align : Int) (sTy aTy : «Type») (p : PtrType)
+    (val : Val) (pTy : «Type»)
+    (h : evalIntrinsicM m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) =
+      .ok (val, m1)) :
+    ∃ ptr m2, val = .Ptr ⟨ptr, none⟩ ∧
+      ConcurrentMemory.leak_check m1.mem = .error .memoryLeak ∧
+      evalIntrinsicM m1 .Deallocate [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)]
+        unitType = .ok (unitValueM, m2) ∧
+      ConcurrentMemory.leak_check m2.mem = ConcurrentMemory.leak_check m.mem ∧
+      evalIntrinsicM m2 .Deallocate [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)]
+        unitType = .error (.ub "double-free") := by
+  obtain ⟨size', sTy', align', aTy', al, p', ptr, cm, hargs, hs, ha, hret, hk, hal, hval, hm1⟩ :=
+    allocate_ok_iff.mp h
+  have hsz : size' = size := by cases hargs; rfl
+  have hag : align' = align := by cases hargs; rfl
+  subst hsz hag hval hm1
+  rw [cm_allocate_bm_basic] at hal
+  obtain ⟨⟨ptr', mem1⟩, halloc, hp'⟩ := interp_bind_eq_ok hal
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp')
+  obtain ⟨mem2, hd, hd2⟩ := basicMemory_deallocate_twice_double_free (fun extra _ => pure extra)
+    halloc rfl .Heap ⟨size'.toNat⟩ al
+  obtain ⟨mem2', hd', hleak⟩ := basicMemory_allocate_deallocate_leak_check
+    (fun extra _ => pure extra) halloc rfl
+  rw [hd] at hd'
+  cases hd'
+  refine ⟨ptr', { m with mem := { m.mem with memory := mem2 } }, rfl, ?_, ?_, ?_, ?_⟩
+  · exact basicMemory_allocate_heap_leaks halloc
+  · rw [deallocate_eq_memory (M := BM) _ ptr' pTy size' sTy align' aTy al hs ha,
+      cm_deallocate_bm_basic]
+    simp only [hd]
+    rfl
+  · exact hleak
+  · rw [deallocate_eq_memory (M := BM) _ ptr' pTy size' sTy align' aTy al hs ha,
+      cm_deallocate_bm_basic]
+    simp only [hd2]
+    rfl
+
 /-! ## §4. `ptr::addr_eq` against `==` on wide pointers
 
 `core::ptr::addr_eq(p, q)` is `p.cast::<()>() == q.cast::<()>()`: both
@@ -3268,7 +3450,10 @@ theorem tb_deallocate_strong_protector_witness :
 /-- **Episode 1 capstone**: the headline guarantees of this module in one
 statement.
 1. On `Allocate` and `Deallocate`, the polymorphic `evalIntrinsicM` at
-   `BasicMemory` is exactly `evalIntrinsic` on `Mach`.
+   `BasicMemory` is exactly `evalIntrinsic` on `Mach`; and on every `Mach`, a
+   successful `Allocate` leaks until its pointer is passed to `Deallocate`
+   with the same size and alignment, which succeeds, restores `leak_check`,
+   and makes a second `Deallocate` a double-free (`heap_lifecycle_bm`).
 2. On `MachTB`, both preserve the Tree Borrows invariant `MachTB.wfLive`,
    which the initial machine satisfies.
 3. `leak_check` reports `MemoryLeak` exactly when a live `Heap` allocation
@@ -3286,6 +3471,18 @@ theorem ep1_minirust_heap_wide_capstone :
     (∀ (m : Mach) (op : IntrinsicOp) (args : List (Val × «Type»)) (retTy : «Type»),
       isHeapOp op = true →
         evalIntrinsicM (M := BM) m op args retTy = evalIntrinsic m op args retTy) ∧
+    (∀ (m m1 : Mach) (size align : Int) (sTy aTy : «Type») (p : PtrType) (val : Val)
+        (pTy : «Type»),
+      evalIntrinsicM m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) = .ok (val, m1) →
+      ∃ ptr m2, val = .Ptr ⟨ptr, none⟩ ∧
+        ConcurrentMemory.leak_check m1.mem = .error .memoryLeak ∧
+        evalIntrinsicM m1 .Deallocate
+            [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+          .ok (unitValueM, m2) ∧
+        ConcurrentMemory.leak_check m2.mem = ConcurrentMemory.leak_check m.mem ∧
+        evalIntrinsicM m2 .Deallocate
+            [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+          .error (.ub "double-free")) ∧
     ((∀ (m m' : MachTB) (op : IntrinsicOp) (args : List (Value TBM × «Type»)) (retTy : «Type»)
         (val : Value TBM), isHeapOp op = true →
         MiniRustSpec.Correspondence.MachTB.wfLive m →
@@ -3341,7 +3538,8 @@ theorem ep1_minirust_heap_wide_capstone :
     (mrProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
-  refine ⟨?_, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
+  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_,
+    ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
   · exact tbInit_wfLive
@@ -3421,8 +3619,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 158 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 158 then
+  -- This module states 166 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 166 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
