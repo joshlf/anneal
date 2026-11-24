@@ -208,7 +208,7 @@ Agreed fragments (kernel-certified per step over Stage-1 `stepMirFn`, lifted her
   between same-typed scalar locals (`step_intrinsic_copyNonOverlapping_stage1_simulation`;
   from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_disjoint_returns` and
   `MiriDiffWitnesses.w6_copy_nonoverlapping_overlap_ub`)
-  and full-local multi-element `copyViaBytes` copies between distinct integer
+  and full-local multi-element `copyBytesSubplace` copies between distinct integer
   locals of equal width
   (`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`;
   from-entry `MiriDiffWitnesses.w6_copy_nonoverlapping_full_bytes_returns`),

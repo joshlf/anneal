@@ -5169,6 +5169,59 @@ def cpSameTagBody : CapturedMir :=
           st (.intrinsic (.copyNonOverlapping (.copy (lc 3)) (.copy (lc 2)) (cUsize 2))),
           assignU32 0 1] .return_]
 
+/-- Byte-level copy initializing an *uninitialized* (`LocalSlot.uninit`) scalar destination
+(`let src = 0x12345678u32; let mut dst: u32; copy_nonoverlapping(&raw const src as *const u8,
+&raw mut dst as *mut u8, 4); dst`): `copyBytesSubplace` decodes all 4 bytes into `_2` (copy is
+statement `11`). -/
+def cpUninitScalarDstBody : CapturedMir :=
+  mkBody "w::cpus" 0
+    [u32Decl "_0", u32Decl "src", u32Decl "dst", cptrDecl "ps", ptrOf tyPtrConstU8 "p",
+     ptrDecl "qd", ptrOf tyPtrMutU8 "q"]
+    [blk [st (.storageLive 1), st (.storageLive 2), st (.storageLive 3), st (.storageLive 4),
+          st (.storageLive 5), st (.storageLive 6),
+          assignU32 1 0x12345678,
+          st (.assign (lc 3) (.rawPtr .not (lc 1))),
+          st (.assign (lc 4) (.cast .ptrToPtr (.copy (lc 3)) tyPtrConstU8)),
+          st (.assign (lc 5) (.rawPtr .mut (lc 2))),
+          st (.assign (lc 6) (.cast .ptrToPtr (.copy (lc 5)) tyPtrMutU8)),
+          st (.intrinsic (.copyNonOverlapping (.copy (lc 4)) (.copy (lc 6)) (cUsize 4))),
+          st (.assign (lc 0) (.use (.copy (lc 2))))] .return_]
+
+/-- Multi-element copy through `&raw mut dst[0]` into an *uninitialized* (`LocalSlot.uninit`)
+array destination `[u32; 2]`: `resolveArraySliceEndpoint?` is `none` on the uninitialized `_2`,
+so `copyBytesSubplace` takes the `splitLastConstantIndex? = some ([], 0, 2)` parent-array decode
+branch and initializes all of `dst` to `[22, 99]` (copy is statement `9`). -/
+def cpUninitElemZeroArrDstBody : CapturedMir :=
+  mkBody "w::cpua" 0
+    [u32Decl "_0", arrDecl "src" 2, arrDecl "dst" 2, cptrDecl "p", ptrDecl "q",
+     u32Decl "d0", u32Decl "d1"]
+    [blk [st (.storageLive 1), st (.storageLive 2), st (.storageLive 3), st (.storageLive 4),
+          st (.storageLive 5), st (.storageLive 6),
+          st (.assign (lc 1) (arrLit [22, 99])),
+          st (.assign (lc 3) (.rawPtr .not (elemPlace 1 0 2))),
+          st (.assign (lc 4) (.rawPtr .mut (elemPlace 2 0 2))),
+          st (.intrinsic (.copyNonOverlapping (.copy (lc 3)) (.copy (lc 4)) (cUsize 2))),
+          st (.assign (lc 5) (.use (.copy (elemPlace 2 0 2)))),
+          st (.assign (lc 6) (.use (.copy (elemPlace 2 1 2)))),
+          st (.assign (lc 0) (.binaryOp .bitXor (.copy (lc 5)) (.copy (lc 6))))] .return_]
+
+/-- Partial field byte-copy into an *uninitialized* (`LocalSlot.uninit`) tuple destination
+(`&raw mut pair.0 as *mut u8` on `pair: (u32, u32)`): `copyBytesSubplace` sets `canWriteToSlot =
+false` and fails closed with `.unsupported` (copy is statement `11`). -/
+def cpUninitPartialFieldBody : CapturedMir :=
+  mkBody "w::cpup" 0
+    [u32Decl "_0", u32Decl "src", pairDecl, cptrDecl "ps", ptrOf tyPtrConstU8 "p",
+     ptrDecl "qp", ptrOf tyPtrMutU8 "q"]
+    [blk [st (.storageLive 1), st (.storageLive 2), st (.storageLive 3), st (.storageLive 4),
+          st (.storageLive 5), st (.storageLive 6),
+          assignU32 1 7,
+          st (.assign (lc 3) (.rawPtr .not (lc 1))),
+          st (.assign (lc 4) (.cast .ptrToPtr (.copy (lc 3)) tyPtrConstU8)),
+          st (.assign (lc 5) (.rawPtr .mut ⟨2, [.field 0 tyU32]⟩)),
+          st (.assign (lc 6) (.cast .ptrToPtr (.copy (lc 5)) tyPtrMutU8)),
+          st (.intrinsic (.copyNonOverlapping (.copy (lc 4)) (.copy (lc 6)) (cUsize 4))),
+          assignU32 0 1] .return_]
+
 /-- Caller memory with additional foreign `.unique` borrows (tags `10` on source slot `3`,
 `11` on destination slot `4`) to witness Tree Borrows read-then-write transitions during
 `copy_nonoverlapping`. -/
@@ -5525,17 +5578,37 @@ private theorem copyBytesSubplace_no_win_ub_or_unsup
           | true => simp [h1, h2, h3]
           | false => simp [h1, h2, h3]
 
+/-- Normalized target projection of a copy endpoint (`resolveBorrowProjectionElems`, then
+`normalizeSubsliceProjections`), matching `copyBytesSubplace`'s `srcResolvedProj` /
+`dstResolvedProj`. -/
+def copyEndpointResolvedProj (locals : List LocalSlot) (ep : CopyEndpoint) : List ProjectionElem :=
+  match resolveBorrowProjectionElems locals ep.entry.targetProjection with
+  | .some rp => normalizeSubsliceProjections rp
+  | .none => ep.entry.targetProjection
+
 /-- **Trusted byte-level sub-place copy (universal).** Whenever a `NonDivergingIntrinsic.copyNonOverlapping`
 (`evalCopyNonOverlapping` → `resolveCopySubplaceMulti`) has an initialized source root, aligned
 compatible non-zero-sized pointees, and at least one non-array endpoint (`resolveArraySliceEndpoint? = none`),
 it dispatches to `copyBytesSubplace`, on which:
-* an access that is certainly outside either allocation (`copyAccessFitsAlloc? = some false`)
-  is UB unconditionally, before any encoding or decoding;
-* two pointers carrying the same borrow tag are UB unconditionally (matching the single-element
-  and element-window paths);
-* a missing source root slot (`srcWinOpt = none`, `srcEp.rootValOpt = none`) is UB;
-* a non-zero destination byte offset (`dstEp.ptr.offsetBytes ≠ 0`) into a non-byte destination
-  (`dstWinOpt = none`) never writes or silently steps as a no-op: it is `.ub` or `.unsupported`. -/
+* **positive byte-container splice**: when a whole-source value with exact byte encoding `bs` of
+  length `n * sz` is copied into an in-bounds `[u8; N]` / `[i8; N]` destination window at byte
+  offset `dstEp.ptr.offsetBytes` across distinct, non-overlapping places, `copyBytesSubplace`
+  commits `.write` splicing `copiedBytes` at `dstBaseIdx + dstEp.ptr.offsetBytes` with exact
+  Tree Borrows window projections;
+* **positive whole-value exact decode**: when `bs` of length `n * sz` is copied into a non-window
+  destination at `dstEp.ptr.offsetBytes = 0` whose target place has `dstTyHasExactByteDecode`
+  (either an initialized slot or an `.uninit` root local with `stripLeadingOpaqueCast = []`),
+  `copyBytesSubplace` commits `.write` of `decodedVal` at `dstEp.entry`;
+* **certainly-OOB UB**: an access that is certainly outside either allocation
+  (`copyAccessFitsAlloc? = some false`) is UB unconditionally, before any encoding or decoding;
+* **same-tag UB**: two pointers carrying the same borrow tag are UB unconditionally (matching the
+  single-element and element-window paths);
+* **missing source root UB**: `srcWinOpt = none` with `srcEp.rootValOpt = none` is UB;
+* **fail-closed partial writes**: both a non-zero destination byte offset into a non-byte
+  destination (`dstWinOpt = none`, `dstEp.ptr.offsetBytes ≠ 0`) and a partial non-index projection
+  into an uninitialized destination (`dstEp.rootValOpt = none`, `stripLeadingOpaqueCast ≠ []`,
+  `splitLastConstantIndex? = none`) evaluate to `.ub` or `.unsupported` — never `.write` or
+  `.noop`. -/
 theorem copyNonOverlapping_trusted_byte_subplace_universal
     (decls : List LocalDecl) (layouts : LayoutTable) (locals callerLocals : List LocalSlot)
     (callStack : List SavedCallerFrame) (srcEp dstEp : CopyEndpoint) (n : Nat)
@@ -5567,6 +5640,86 @@ theorem copyNonOverlapping_trusted_byte_subplace_universal
           (some (k + 1)) n
           (resolveArraySliceEndpoint? decls layouts locals srcEp' (some (k + 1)))
           (resolveArraySliceEndpoint? decls layouts locals dstEp' (some (k + 1)))) ∧
+    (∀ (sz : Nat) (srcRootVal sVal : Value) (srcSlot : LocalSlot) (srcTy : Ty)
+        (bs : List AbstractByte) (dstParentProj : List ProjectionElem) (dstBaseIdx : Nat)
+        (dstElems copiedBytes : List Value),
+      copyAccessCertainlyOob
+        (copyAccessFitsAlloc? decls layouts locals callerLocals callStack srcEp (Nat.mul n sz)) =
+        false →
+      copyAccessCertainlyOob
+        (copyAccessFitsAlloc? decls layouts locals callerLocals callStack dstEp (Nat.mul n sz)) =
+        false →
+      Nat.beq srcEp.ptr.tag dstEp.ptr.tag = false →
+      srcWinOpt = none →
+      Nat.beq srcEp.ptr.offsetBytes 0 = true →
+      srcEp.rootValOpt = some srcRootVal →
+      readProjectedValue locals srcRootVal srcEp.entry.targetProjection = .ok sVal →
+      get? locals srcEp.entry.targetLocal = some srcSlot →
+      placeTyResolved decls layouts ⟨srcEp.entry.targetLocal, srcEp.entry.targetProjection⟩ =
+        some srcTy →
+      srcValHasExactByteEncoding layouts srcTy sVal = true →
+      encodeValueToBytes defaultCodecFuel layouts srcTy sVal = some bs →
+      length bs = Nat.mul n sz →
+      dstWinOpt = some (dstParentProj, dstBaseIdx, dstElems) →
+      (copyContainerElemKind? decls layouts locals dstEp.entry.targetLocal dstParentProj =
+          some (.uint .u8) ∨
+        copyContainerElemKind? decls layouts locals dstEp.entry.targetLocal dstParentProj =
+          some (.int .i8)) →
+      Nat.ble (Nat.add (Nat.add dstBaseIdx dstEp.ptr.offsetBytes) (length bs)) (length dstElems) =
+        true →
+      decodeArrayChunksWith
+          (fun chunk =>
+            decodeValueFromBytes defaultCodecFuel layouts { kind := .uint .u8, layoutIdx := 0 }
+              chunk)
+          1 (length bs) bs = some copiedBytes →
+      (Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal = false ∨
+        projectionsOverlap (copyEndpointResolvedProj locals srcEp)
+            (copySliceWindowProj dstParentProj (Nat.add dstBaseIdx dstEp.ptr.offsetBytes)
+              (length bs) (length dstElems)) = false) →
+      copyBytesSubplace decls layouts locals callerLocals callStack srcEp dstEp (some sz) n
+          srcWinOpt dstWinOpt =
+        .write ⟨dstEp.entry.targetLocal, dstParentProj⟩
+          (.aggregate 0
+            (spliceValues copiedBytes (Nat.add dstBaseIdx dstEp.ptr.offsetBytes) dstElems))
+          (copyEndpointResolvedProj locals srcEp)
+          (copySliceWindowProj dstParentProj (Nat.add dstBaseIdx dstEp.ptr.offsetBytes)
+            (length bs) (length dstElems))) ∧
+    (∀ (sz : Nat) (srcRootVal sVal decodedVal : Value) (srcSlot dstSlot : LocalSlot)
+        (srcTy dstTy : Ty) (bs : List AbstractByte),
+      copyAccessCertainlyOob
+        (copyAccessFitsAlloc? decls layouts locals callerLocals callStack srcEp (Nat.mul n sz)) =
+        false →
+      copyAccessCertainlyOob
+        (copyAccessFitsAlloc? decls layouts locals callerLocals callStack dstEp (Nat.mul n sz)) =
+        false →
+      Nat.beq srcEp.ptr.tag dstEp.ptr.tag = false →
+      srcWinOpt = none →
+      Nat.beq srcEp.ptr.offsetBytes 0 = true →
+      srcEp.rootValOpt = some srcRootVal →
+      readProjectedValue locals srcRootVal srcEp.entry.targetProjection = .ok sVal →
+      get? locals srcEp.entry.targetLocal = some srcSlot →
+      placeTyResolved decls layouts ⟨srcEp.entry.targetLocal, srcEp.entry.targetProjection⟩ =
+        some srcTy →
+      srcValHasExactByteEncoding layouts srcTy sVal = true →
+      encodeValueToBytes defaultCodecFuel layouts srcTy sVal = some bs →
+      length bs = Nat.mul n sz →
+      dstWinOpt = none →
+      Nat.beq dstEp.ptr.offsetBytes 0 = true →
+      ((∃ v, dstEp.rootValOpt = some v) ∨
+        stripLeadingOpaqueCast dstEp.entry.targetProjection = []) →
+      get? locals dstEp.entry.targetLocal = some dstSlot →
+      placeTyResolved decls layouts ⟨dstEp.entry.targetLocal, dstEp.entry.targetProjection⟩ =
+        some dstTy →
+      dstTyHasExactByteDecode layouts dstTy = true →
+      rigidTyByteSize layouts dstTy = some (length bs) →
+      decodeValueFromBytes defaultCodecFuel layouts dstTy bs = some decodedVal →
+      (Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal = false ∨
+        projectionsOverlap (copyEndpointResolvedProj locals srcEp)
+            (copyEndpointResolvedProj locals dstEp) = false) →
+      copyBytesSubplace decls layouts locals callerLocals callStack srcEp dstEp (some sz) n
+          srcWinOpt dstWinOpt =
+        .write ⟨dstEp.entry.targetLocal, dstEp.entry.targetProjection⟩ decodedVal
+          (copyEndpointResolvedProj locals srcEp) (copyEndpointResolvedProj locals dstEp)) ∧
     (∀ sz : Nat,
       (copyAccessCertainlyOob
           (copyAccessFitsAlloc? decls layouts locals callerLocals callStack srcEp (Nat.mul n sz)) =
@@ -5588,8 +5741,16 @@ theorem copyNonOverlapping_trusted_byte_subplace_universal
       dstWinOpt = none → Nat.beq dstEp.ptr.offsetBytes 0 = false →
       let out := copyBytesSubplace decls layouts locals callerLocals callStack srcEp dstEp
         elemSzOpt n srcWinOpt dstWinOpt
+      out = .ub ∨ out = .unsupported) ∧
+    (∀ (elemSzOpt : Option Nat) (p0 : ProjectionElem) (ps : List ProjectionElem),
+      dstWinOpt = none →
+      dstEp.rootValOpt = none →
+      stripLeadingOpaqueCast dstEp.entry.targetProjection = p0 :: ps →
+      splitLastConstantIndex? (copyEndpointResolvedProj locals dstEp) = none →
+      let out := copyBytesSubplace decls layouts locals callerLocals callStack srcEp dstEp
+        elemSzOpt n srcWinOpt dstWinOpt
       out = .ub ∨ out = .unsupported) := by
-  refine ⟨fun _ _ _ _ _ => rfl, ?_, ?_, ?_, ?_, ?_⟩
+  refine ⟨fun _ _ _ _ _ => rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
   · intro src dst srcRootVal dstSlot k hs hd hdn ha hc hsz
     dsimp only
     intro hna
@@ -5610,6 +5771,90 @@ theorem copyNonOverlapping_trusted_byte_subplace_universal
         cases resolveArraySliceEndpoint? decls layouts locals
           { ptr := srcEp.ptr, entry := srcEp.entry, rootValOpt := some srcRootVal,
             pointeeOpt := operandPointeeTy decls layouts src } (some (k + 1)) <;> rfl
+  · intro sz srcRootVal sVal srcSlot srcTy bs dstParentProj dstBaseIdx dstElems copiedBytes
+      hsoob hdoob htag hsw hsoff hsrv hsrd hsloc hsty hsenc_ok hsenc hlen hdw hdbc hdble hddec hdis
+    subst hsw hdw
+    have hbeq_len : Nat.beq (length bs) (Nat.mul n sz) = true := by
+      rw [hlen]; exact Nat.beq_refl _
+    have hdoob' :
+        copyAccessCertainlyOob
+          (copyAccessFitsAlloc? decls layouts locals callerLocals callStack dstEp (length bs)) =
+          false := by
+      rw [hlen]; exact hdoob
+    unfold copyBytesSubplace copyEndpointResolvedProj
+    rcases hdbc with hdu8 | hdi8
+    · rcases hdis with hloc | hov
+      · simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+          hdoob', hdu8, hdble, hddec, hloc, Bool.or_false]; rfl
+      · unfold copyEndpointResolvedProj at hov
+        cases Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+        | false =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdu8, hdble, hddec, Bool.or_false]; rfl
+        | true =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdu8, hdble, hddec, Bool.or_false]
+          erw [hov]; rfl
+    · rcases hdis with hloc | hov
+      · simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+          hdoob', hdi8, hdble, hddec, hloc, Bool.or_false]; rfl
+      · unfold copyEndpointResolvedProj at hov
+        cases Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+        | false =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdi8, hdble, hddec, Bool.or_false]; rfl
+        | true =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdi8, hdble, hddec, Bool.or_false]
+          erw [hov]; rfl
+  · intro sz srcRootVal sVal decodedVal srcSlot dstSlot srcTy dstTy bs
+      hsoob hdoob htag hsw hsoff hsrv hsrd hsloc hsty hsenc_ok hsenc hlen hdw hdoff hcan hdloc
+      hdty hddec_ok hdsz hddec hdis
+    subst hsw hdw
+    have hbeq_len : Nat.beq (length bs) (Nat.mul n sz) = true := by
+      rw [hlen]; exact Nat.beq_refl _
+    have hdoob' :
+        copyAccessCertainlyOob
+          (copyAccessFitsAlloc? decls layouts locals callerLocals callStack dstEp (length bs)) =
+          false := by
+      rw [hlen]; exact hdoob
+    have hbeq_self : Nat.beq (length bs) (length bs) = true := Nat.beq_refl _
+    unfold copyBytesSubplace copyEndpointResolvedProj
+    cases hrv : dstEp.rootValOpt with
+    | none =>
+      rcases hcan with ⟨_, hv⟩ | hnil
+      · rw [hrv] at hv; cases hv
+      · rcases hdis with hloc | hov
+        · simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdoff, hnil, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec, hloc,
+            Bool.or_false]; rfl
+        · unfold copyEndpointResolvedProj at hov
+          cases Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+          | false =>
+            simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc,
+              hbeq_len, hdoob', hdoff, hnil, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec,
+              Bool.or_false]; rfl
+          | true =>
+            simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc,
+              hbeq_len, hdoob', hdoff, hnil, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec,
+              Bool.or_false]
+            erw [hov]; rfl
+    | some v =>
+      rcases hdis with hloc | hov
+      · simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+          hdoob', hdoff, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec, hloc,
+          Bool.or_false]; rfl
+      · unfold copyEndpointResolvedProj at hov
+        cases Nat.beq srcEp.entry.targetLocal dstEp.entry.targetLocal with
+        | false =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdoff, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec,
+            Bool.or_false]; rfl
+        | true =>
+          simp only [hsoob, hdoob, htag, hsoff, hsrv, hsrd, hsloc, hsty, hsenc_ok, hsenc, hbeq_len,
+            hdoob', hdoff, hdloc, hdty, hddec_ok, hdsz, hbeq_self, hddec,
+            Bool.or_false]
+          erw [hov]; rfl
   · intro sz hoob
     unfold copyBytesSubplace
     dsimp only
@@ -5635,6 +5880,28 @@ theorem copyNonOverlapping_trusted_byte_subplace_universal
     dsimp only
     rw [hoff]
     exact copyBytesSubplace_no_win_ub_or_unsup _ _ _ (fun sVal sliceInfoOpt => _) _ _
+  · intro elemSzOpt p0 ps hdw hduninit hstrip hsplit
+    subst hdw
+    unfold copyBytesSubplace
+    unfold copyEndpointResolvedProj at hsplit
+    dsimp only
+    split
+    · exact Or.inl rfl
+    · split
+      · split
+        · exact Or.inl rfl
+        · exact Or.inr rfl
+      · split
+        · exact Or.inr rfl
+        · split
+          · exact Or.inr rfl
+          · split
+            · exact Or.inl rfl
+            · split
+              · exact Or.inr rfl
+              · simp only [hduninit, hstrip]
+                erw [hsplit]
+                exact Or.inr rfl
 
 /-- **MiniRustSpec (universal, fail-closed).** Upstream `minimize` aborts on
 `NonDivergingIntrinsic::CopyNonOverlapping` (`span_bug!`, anchored above). The `MiniRustSpec`
@@ -5736,16 +6003,18 @@ theorem copyNonOverlapping_witness_elem_subplace_copies :
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel⟩
 
-/-- **Positive witnesses (caller-owned referents, Tree Borrows read-then-write, and byte-punned
-offset copies).** A modular root copies two elements between two arrays owned by its external
-caller (the destination slot becomes `[22, 99]`, the source slot is untouched, and the run
-returns); under Tree Borrows, a foreign `.unique` borrow on the source (tag `10`) is frozen to
-`.frozen` (`3`) while a foreign `.unique` borrow on the destination (tag `11`) is disabled to
-`.disabled` (`4`); a byte-punned copy of `word: u32 = 0x04030201` into `bytes: [u8; 4]` yields
-`[1, 2, 3, 4]`, into `(&raw mut bytes[0]).offset(1)` of `[u8; 6]` yields `[0, 1, 2, 3, 4, 0]`
-(non-zero destination byte offset), and from `(&raw const src[0]).offset(1)` of
-`[0xAA, 1, 2, 3, 4, 0xBB]` into `&raw mut word as *mut u8` yields `0x04030201` (non-zero source
-byte offset). -/
+/-- **Positive witnesses (caller-owned referents, Tree Borrows read-then-write, uninitialized
+whole-destination initialization, and byte-punned offset copies).** A modular root copies two
+elements between two arrays owned by its external caller (the destination slot becomes `[22, 99]`,
+the source slot is untouched, and the run returns); under Tree Borrows, a foreign `.unique` borrow
+on the source (tag `10`) is frozen to `.frozen` (`3`) while a foreign `.unique` borrow on the
+destination (tag `11`) is disabled to `.disabled` (`4`); a byte-punned copy of
+`word: u32 = 0x04030201` into `bytes: [u8; 4]` yields `[1, 2, 3, 4]`, into
+`(&raw mut bytes[0]).offset(1)` of `[u8; 6]` yields `[0, 1, 2, 3, 4, 0]` (non-zero destination
+byte offset), and from `(&raw const src[0]).offset(1)` of `[0xAA, 1, 2, 3, 4, 0xBB]` into
+`&raw mut word as *mut u8` yields `0x04030201` (non-zero source byte offset); and copying into an
+uninitialized (`LocalSlot.uninit`) `u32` or `[u32; 2]` (`&raw mut dst[0]`) initializes the whole
+destination cleanly (`0x12345678`, `[22, 99]` / `117`). -/
 theorem copyNonOverlapping_witness_caller_referents_and_byte_pun :
     callerScalars?
         (cpRunMem (cpCallerBody 2) [.ptr ⟨1, 0⟩ 8, .ptr ⟨2, 0⟩ 8] (cpCallerMem []) 1) 4 =
@@ -5762,9 +6031,13 @@ theorem copyNonOverlapping_witness_caller_referents_and_byte_pun :
       localScalars? (cpRun (bytePunDstOffsetBody 0x04030201 6 1 4) 13) 2 =
         some [0, 1, 2, 3, 4, 0] ∧
       haltedBits? (cpRun (bytePunSrcToWordBody [0xAA, 1, 2, 3, 4, 0xBB] 1 4) 15) =
-        some 0x04030201 :=
+        some 0x04030201 ∧
+      haltedBits? (cpRun cpUninitScalarDstBody 14) = some 0x12345678 ∧
+      localScalars? (cpRun cpUninitElemZeroArrDstBody 10) 2 = some [22, 99] ∧
+      haltedBits? (cpRun cpUninitElemZeroArrDstBody 14) = some 117 :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel⟩
+    by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- **Negative canaries (fail-closed copies).** A source window that leaves its array
 (`src[1]`, `n = 2`), a destination window that does (`dst[1]`, `n = 2`), and `n = 3` over
@@ -5772,9 +6045,11 @@ two-element arrays are UB; so are overlapping windows of the same array (`a[0..2
 a same-tag copy (`copy_nonoverlapping(p, p, 2)` — confirmed still running immediately before
 the copy and UB at step 7), writing through a `.frozen` destination pointer, and a
 three-element copy between the caller's two-element arrays. A byte-punned copy of a *partial*
-scalar, a byte splice into a non-byte container (`[u32; 2]`), and an element-stride mismatch
-(`[u8; 4]` cast to `*const u16` into `[u16; 2]`) all fail closed with `.unsupported` — never a
-silently wrong value — and a byte window that leaves the scalar or the array is UB. -/
+scalar, a byte splice into a non-byte container (`[u32; 2]`), an element-stride mismatch
+(`[u8; 4]` cast to `*const u16` into `[u16; 2]`), and a partial field byte-copy into an
+uninitialized aggregate (`&raw mut pair.0 as *mut u8` on uninit `pair: (u32, u32)`) all fail
+closed with `.unsupported` — never a silently wrong value — and a byte window that leaves the
+scalar or the array is UB. -/
 theorem copyNonOverlapping_witness_ub_canaries :
     isUbFault (cpRun (cpBody [22, 99] [0, 0] 1 0 2) 11) = true ∧
       isUbFault (cpRun (cpBody [22, 99] [0, 0] 0 1 2) 11) = true ∧
@@ -5792,12 +6067,13 @@ theorem copyNonOverlapping_witness_ub_canaries :
       isUnsupportedFault (cpRun (bytePunBody 0x04030201 0 1 2 1) 13) = true ∧
       isUnsupportedFault (cpRun byteSpliceNonByteBody 13) = true ∧
       isUnsupportedFault (cpRun strideMismatchBody 11) = true ∧
+      isUnsupportedFault (cpRun cpUninitPartialFieldBody 12) = true ∧
       isUbFault (cpRun (bytePunBody 0x04030201 2 0 4 0) 13) = true ∧
       isUbFault (cpRun (bytePunBody 0x04030201 0 2 4 0) 13) = true :=
   ⟨by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
     by decide +kernel, by decide +kernel, by decide +kernel, by decide +kernel,
-    by decide +kernel, by decide +kernel⟩
+    by decide +kernel, by decide +kernel, by decide +kernel⟩
 
 /-- **Negative canaries (sub-place resolution).** `resolveCopySubplaceMulti` on concrete
 frames: a zero-sized pointee (`()`) is a no-op for `n = 5` over uninitialized *and* over
