@@ -426,17 +426,20 @@ run_cmd do
               `hasFrameDeallocProtectorConflict_eq_mr_node, `hasProtectedLocalBorrow_eq_mr_node,
               `hasFrameDeallocProtectorConflict_iff, `hasProtectedLocalBorrow_iff,
               `evalTerminator_return_protector_ub, `evalTerminator_callee_return_releases_protector,
-              `evalTailCallTerminator_protector_ub,
+              `evalTailCallTerminator_protector_ub, `evalTailCallTerminator_no_conflict_steps,
               `evalStmt_storageDead_protector_ub, `evalStmt_storageDead_no_conflict_steps,
               `evalStmt_storageLive_protector_ub,
               `trustedTeardown_table, `trusted_protector_cases_match_mr,
               `trustedStorageDead_and_release_table, `trusted_protector_twins_table,
+              `trustedTailCallRun_table,
               `evalCastPtrToPtr_slice_to_thin, `evalCastPtrToPtr_dyn_to_thin,
               `evalCastPtrToPtr_scalarPair_to_thin, `evalCastPtrToPtr_scalarDyn_to_thin,
               `evalRvalue_thinPtr_eq, `evalRvalue_thinScalar_eq,
               `evalRvalue_wideSlice_eq, `evalRvalue_wideDyn_eq,
+              `evalRvalue_wideSlice_eq_matches_mr, `evalRvalue_wideDyn_eq_matches_mr,
               `evalCast_then_thinEq_erases_meta_and_prov,
-              `trustedCmp_table, `trustedRvalue_witnesses, `trusted_wide_cases_match_mr] do
+              `trustedCmp_table, `trustedCmp_nonvacuity_twins_table,
+              `trustedRvalue_witnesses, `trusted_wide_cases_match_mr] do
       let src := dsNs ++ w
       let some (.thmInfo v) := (← getEnv).find? src
         | throwError "cross-root: root witness {src} missing"
@@ -561,7 +564,54 @@ run_cmd do
           some (thm "badDecodeIsNone" (mkApp3 (mkConst ``Eq [1]) optObsTy badDecode (mkApp (mkConst ``Option.none [0]) obsTy))
             (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp (mkConst ``Option.none [0]) obsTy))),
           thm "badDecodeForgedUb" (mkApp3 (mkConst ``Eq [1]) optObsTy badDecode (mkApp2 (mkConst ``Option.some [0]) obsTy (obsC "ub")))
-            (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp2 (mkConst ``Option.some [0]) obsTy (obsC "ub")))) ]
+            (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp2 (mkConst ``Option.some [0]) obsTy (obsC "ub")))),
+        ("forged released tail-call run still faults (.ub instead of .okDealloc)",
+          some (thm "tailCallRunRelIsOk"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkApp2 (mkConst (dsNs ++ `trustedTailCallRunObs))
+                (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm.frozen) boolFalse)
+              (obsC "okDealloc"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "okDealloc"))),
+          thm "tailCallRunRelForgedUb"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkApp2 (mkConst (dsNs ++ `trustedTailCallRunObs))
+                (mkConst `Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm.frozen) boolFalse)
+              (obsC "ub"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "ub"))),
+        ("forged Trusted addr_eq ignores distinct addresses (hwPtrA vs hwPtrC = true)",
+          some (thm "addrEqDiffIsFalse"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwSliceTy), boolTrue,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrC)) (mkNatLit 3)])
+              (mkApp (obsC "okBool") boolFalse))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))),
+          thm "addrEqDiffForgedTrue"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwSliceTy), boolTrue,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrC)) (mkNatLit 3)])
+              (mkApp (obsC "okBool") boolTrue))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolTrue))),
+        ("forged Trusted full wide slice == on identical ptr+len returns false",
+          some (thm "wideEqSameIsTrue"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwSliceTy), boolFalse,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3)])
+              (mkApp (obsC "okBool") boolTrue))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolTrue))),
+          thm "wideEqSameForgedFalse"
+            (mkApp3 (mkConst ``Eq [1]) obsTy
+              (mkAppN (mkConst (dsNs ++ `trustedCmpObs))
+                #[mkConst (dsNs ++ `hwSliceTy), mkConst (dsNs ++ `hwSliceTy), boolFalse,
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3),
+                  mkApp2 (mkConst (dsNs ++ `hwSlice)) (mkConst (dsNs ++ `hwPtrA)) (mkNatLit 3)])
+              (mkApp (obsC "okBool") boolFalse))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))) ]
     for (what, baseOpt, d) in extraForged do
       if let some baseDecl := baseOpt then
         unless ← accepts baseDecl do
@@ -668,6 +718,7 @@ run_cmd do
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalStmt,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalTerminator,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalTailCallTerminator,
+        `Trusted.Rustc.V2026_06_01.MirSemantics.enterTailCalleeFrame,
         `Trusted.Rustc.V2026_06_01.MirSemantics.restoreCallerProtectors,
         `Trusted.Rustc.V2026_06_01.MirSemantics.evalCastPtrToPtr,
         `Trusted.Rustc.V2026_06_01.MirSemantics.ptrToAddrScalar,
@@ -683,7 +734,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 77 && rejectedCount = 22 do
+  unless addedCount = 82 && rejectedCount = 25 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
