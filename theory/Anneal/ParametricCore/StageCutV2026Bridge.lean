@@ -1590,11 +1590,39 @@ theorem mirWpConverges_of_callSpecCut_normal_continue {Mem Addr Byte Val : Type}
       (isCleanupBb := isCleanupBb) (onCleanup := onCleanup)
       hCut hPre hNormal hUnwind hAbort)
 
+/-- Explicit `accessed` projection for unmodified `V2026_06_01.MirSemantics.BorrowEntry`.
+Unmodified `V2026_06_01.MirSemantics.BorrowEntry` stores a single `perm : TreeBorrowPerm`
+without a separate `accessed : Bool` bit: a freshly created two-phase mutable borrow
+starts at `.reservedFrz false` (`accessed = false`) and transitions to `.unique` (or
+`.reservedFrz true`) on first access (`accessed = true`), whereas `.frozen`, `.reservedIM`,
+and `.disabled` have no distinct unaccessed representation in `V2026_06_01.MirSemantics`. -/
+@[reducible] def borrowEntryAccessed (e : BorrowEntry) : Bool :=
+  match e.perm with
+  | .reservedFrz false => false
+  | _ => true
+
+/-- **Exact `accessed`-bit contrast between unmodified `V2026_06_01.MirSemantics` and
+`Anneal.RefFrame.TbLocationState`**: because `BorrowEntry` omits a separate `accessed`
+field, `treeBorrowNodeAccess` agrees identically with `TbLocationState.performAccess` on
+every accessed node (`treeBorrowNodeAccess_agrees_with_performAccess`), and on an
+unaccessed `.reservedFrz false` child write (`⟨.Reserved false, false⟩ → ⟨.Unique, true⟩`),
+while conservatively rejecting protected foreign writes to `.frozen` as `.ub` even when
+full Tree Borrows permits an *unaccessed* protected `.Frozen` node (`accessed = false`) to
+transition to `.Disabled` without UB (sound over-approximation). -/
+theorem mirSemantics_vs_refFrame_accessed_coarsening :
+    (TbLocationState.performAccess ⟨.ReservedFrz false, false⟩ .Write .LocalAccess true =
+      .Success ⟨.Unique, true⟩ ∧
+     treeBorrowNodeAccess .write .localAccess (.reservedFrz false) true = .transition .unique) ∧
+    (TbLocationState.performAccess ⟨.Frozen, false⟩ .Write .ForeignAccess true =
+      .Success ⟨.Disabled, false⟩ ∧
+     treeBorrowNodeAccess .write .foreignAccess .frozen true = .ub) := by
+  exact ⟨⟨rfl, rfl⟩, ⟨rfl, rfl⟩⟩
+
 /-- Project unmodified `V2026_06_01.MirSemantics` `{BorrowEntry, activeProtectors}`
 directly into an `Anneal.RefFrame.RangedBorrowTree` over byte span `[0, rangeLen)`.
 - Tag `0` is the root stack-allocation owner (`parent := none`, `.Unique`).
 - Each live `BorrowEntry` in `borrows` maps to `TbTopoNode ⟨e.tag, some (e.parentTag.getD 0)⟩`
-  with permission `tbPermOfMir e.perm` (and `accessed := true` when not `.reservedFrz false`).
+  with permission `tbPermOfMir e.perm` and `accessed := borrowEntryAccessed e`.
 - `protectedTags` contains precisely those `e.tag` whose `e.protector = some pid`
   with `pid ∈ activeProtectors`. -/
 def rangedBorrowTreeOfMirBorrows (borrows : List BorrowEntry)
@@ -1609,8 +1637,7 @@ def rangedBorrowTreeOfMirBorrows (borrows : List BorrowEntry)
   let states : List (Nat × TbLocationState) :=
     (0, ⟨.Unique, true⟩) ::
       borrows.map (fun e =>
-        let acc := match e.perm with | .reservedFrz false => false | _ => true
-        (e.tag, ⟨tbPermOfMir e.perm, acc⟩))
+        (e.tag, ⟨tbPermOfMir e.perm, borrowEntryAccessed e⟩))
   { topology := topo
     protectedTags := protTags
     segments := [⟨0, rangeLen, states⟩] }
@@ -1799,5 +1826,377 @@ theorem rangedBorrowTreeOfMirBorrows_cross_alloc_spurious :
     (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc [xb, xa] [2, 1] 0 2 4) [2]).tree =
       rangedBorrowTreeOfMirAlloc [xb, xa] [1] 0 2 4 :=
   ⟨rfl, rfl, rfl⟩
+
+/-! ### Range-Segmented Per-Allocation Projection (`rangeOffset` / `rangeLen`) & General Step Refinement
+
+`rangedBorrowTreeOfMirAlloc` flattens all borrows of allocation `(depth, localIdx)` onto
+one segment `[0, rangeLen)`, ignoring per-borrow subslice byte ranges `(rangeOffset,
+rangeLen)`. For disjoint partial-range borrows of the SAME allocation (such as `&[u8]` at
+`[0..2)` and `&mut [u8]` at `[2..4)` on `callerLocals[12]`), flattening treats them as
+overlapping and spuriously reports `.ProtectedDisabled` on protector release.
+`rangedBorrowTreeOfMirAllocSegmented` projects each borrow onto its covered byte spans
+(marking non-covered spans `(Disabled, false)` exactly as `Anneal.RefFrame.mkSharedTopo3Tree16`
+does), reducing identically to `rangedBorrowTreeOfMirAlloc` when all borrows are whole-local. -/
+
+/-- Does `e` cover byte span `[segOff, segOff + segLen)` of its target allocation?
+Whole-local borrows (`e.rangeLen = 0`) cover every span; partial-range slice borrows
+(`e.rangeLen > 0`) cover spans that overlap `[e.rangeOffset, e.rangeOffset + e.rangeLen)`. -/
+def borrowCoversSegment (e : BorrowEntry) (segOff segLen : Nat) : Bool :=
+  Nat.beq e.rangeLen 0 ||
+    (Nat.blt e.rangeOffset (segOff + segLen) && Nat.blt segOff (e.rangeOffset + e.rangeLen))
+
+/-- **Range-segmented per-allocation projection** of unmodified `V2026_06_01.MirSemantics`
+`{BorrowEntry, activeProtectors}` into `Anneal.RefFrame.RangedBorrowTree` across explicit
+byte spans `spans : List (Nat × Nat)` of allocation `(depth, localIdx)`. -/
+def rangedBorrowTreeOfMirAllocSegmented (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (depth localIdx : Nat)
+    (spans : List (Nat × Nat)) : RangedBorrowTree :=
+  let allocBorrows := mirBorrowsOfAlloc borrows depth localIdx
+  let topo : List TbTopoNode :=
+    ⟨0, none⟩ :: allocBorrows.map (fun e => ⟨e.tag, some (e.parentTag.getD 0)⟩)
+  let protTags : List Nat :=
+    (allocBorrows.filter (fun e =>
+      match e.protector with
+      | some pid => natListMem pid activeProtectors
+      | none => false)).map (fun e => e.tag)
+  let segs : List RangeSegment :=
+    spans.map (fun (segOff, segLen) =>
+      let states : List (Nat × TbLocationState) :=
+        (0, ⟨.Unique, true⟩) ::
+          allocBorrows.map (fun e =>
+            if borrowCoversSegment e segOff segLen then
+              (e.tag, ⟨tbPermOfMir e.perm, borrowEntryAccessed e⟩)
+            else
+              (e.tag, ⟨.Disabled, false⟩))
+      ⟨segOff, segLen, states⟩)
+  { topology := topo
+    protectedTags := protTags
+    segments := segs }
+
+/-- When every live borrow on `(depth, localIdx)` is whole-local (`rangeLen = 0`),
+the single-span segmented projection equals `rangedBorrowTreeOfMirAlloc` identically. -/
+theorem rangedBorrowTreeOfMirAllocSegmented_single_whole (borrows : List BorrowEntry)
+    (activeProtectors : List Nat) (depth localIdx rangeLen : Nat)
+    (hWhole : ∀ e ∈ mirBorrowsOfAlloc borrows depth localIdx, e.rangeLen = 0) :
+    rangedBorrowTreeOfMirAllocSegmented borrows activeProtectors depth localIdx [(0, rangeLen)] =
+      rangedBorrowTreeOfMirAlloc borrows activeProtectors depth localIdx rangeLen := by
+  unfold rangedBorrowTreeOfMirAllocSegmented rangedBorrowTreeOfMirAlloc rangedBorrowTreeOfMirBorrows
+  dsimp only [List.map]
+  have hStates :
+      ((mirBorrowsOfAlloc borrows depth localIdx).map (fun e =>
+        if borrowCoversSegment e 0 rangeLen then
+          (e.tag, ({ permission := tbPermOfMir e.perm, accessed := borrowEntryAccessed e } : TbLocationState))
+        else (e.tag, ({ permission := .Disabled, accessed := false } : TbLocationState)))) =
+      (mirBorrowsOfAlloc borrows depth localIdx).map (fun e =>
+        (e.tag, ({ permission := tbPermOfMir e.perm, accessed := borrowEntryAccessed e } : TbLocationState))) := by
+    have hAux : ∀ (xs : List BorrowEntry), (∀ e ∈ xs, e.rangeLen = 0) →
+        xs.map (fun e =>
+          if borrowCoversSegment e 0 rangeLen then
+            (e.tag, ({ permission := tbPermOfMir e.perm, accessed := borrowEntryAccessed e } : TbLocationState))
+          else (e.tag, ({ permission := .Disabled, accessed := false } : TbLocationState))) =
+        xs.map (fun e =>
+          (e.tag, ({ permission := tbPermOfMir e.perm, accessed := borrowEntryAccessed e } : TbLocationState))) := by
+      intro xs
+      induction xs with
+      | nil => intro _; rfl
+      | cons e rest ih =>
+        intro hAll
+        have hZero := hAll e (List.mem_cons_self ..)
+        have hCov : borrowCoversSegment e 0 rangeLen = true := by
+          unfold borrowCoversSegment; rw [hZero]; rfl
+        simp only [List.map, hCov, ↓reduceIte]
+        rw [ih (fun e' h' => hAll e' (List.mem_cons_of_mem _ h'))]
+    exact hAux _ hWhole
+  simp only [hStates]
+
+/-- **Cross-allocation isolation for the segmented projection**: pushing any borrow of
+another allocation (or a dead borrow) never changes `rangedBorrowTreeOfMirAllocSegmented`. -/
+theorem rangedBorrowTreeOfMirAllocSegmented_cons_foreign (e : BorrowEntry)
+    (borrows : List BorrowEntry) (activeProtectors : List Nat) (depth localIdx : Nat)
+    (spans : List (Nat × Nat))
+    (hForeign : e.targetFrameDepth ≠ depth ∨ e.targetLocal ≠ localIdx ∨ e.allocDead = true) :
+    rangedBorrowTreeOfMirAllocSegmented (e :: borrows) activeProtectors depth localIdx spans =
+      rangedBorrowTreeOfMirAllocSegmented borrows activeProtectors depth localIdx spans := by
+  unfold rangedBorrowTreeOfMirAllocSegmented mirBorrowsOfAlloc
+  have hDrop : (Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal localIdx &&
+      !e.allocDead) = false := by
+    rcases hForeign with h | h | h
+    · have : Nat.beq e.targetFrameDepth depth = false := by
+        cases hB : Nat.beq e.targetFrameDepth depth with
+        | false => rfl
+        | true => exact False.elim (h (Nat.beq_eq.mp hB))
+      rw [this]; rfl
+    · have : Nat.beq e.targetLocal localIdx = false := by
+        cases hB : Nat.beq e.targetLocal localIdx with
+        | false => rfl
+        | true => exact False.elim (h (Nat.beq_eq.mp hB))
+      rw [this, Bool.and_false, Bool.false_and]
+    · rw [h, Bool.not_true, Bool.and_false]
+  simp only [List.filter, hDrop]
+
+/-- **Partial-range same-allocation disjointness witness (flat vs. segmented)**:
+two disjoint protected borrows on the SAME allocation `(0, 12)` (`src` at `[0..2)`
+and `dst` at `[2..4)`). The flat 1-segment `rangedBorrowTreeOfMirAlloc` spuriously fails
+`exitFrameWithProtectors _ [2]` with `.ProtectedDisabled .Unique`, whereas the
+range-segmented `rangedBorrowTreeOfMirAllocSegmented _ _ 0 12 [(0, 2), (2, 2)]`:
+1. executes read on `[0..2)` via tag `1` and write on `[2..4)` via tag `2` with
+   `.Completed` in BOTH orders and **exact commutation** (`s12.tree = s21.tree`), and
+2. releases protector `[2]` cleanly with `.Released`, matching `activeProtectors = [1]`. -/
+theorem rangedBorrowTreeOfMirAlloc_partial_range_spurious_vs_segmented :
+    let bSrc : BorrowEntry :=
+      { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 1, rangeOffset := 0, rangeLen := 2 }
+    let bDst : BorrowEntry :=
+      { tag := 2, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 2, rangeOffset := 2, rangeLen := 2 }
+    let tFlat := rangedBorrowTreeOfMirAlloc [bDst, bSrc] [2, 1] 0 12 4
+    let tSeg := rangedBorrowTreeOfMirAllocSegmented [bDst, bSrc] [2, 1] 0 12 [(0, 2), (2, 2)]
+    let s1 := performRangedAccess tSeg 0 2 1 .Read .VisitChildrenOfAccessed
+    let s12 := performRangedAccess s1.tree 2 2 2 .Write .VisitChildrenOfAccessed
+    let s2 := performRangedAccess tSeg 2 2 2 .Write .VisitChildrenOfAccessed
+    let s21 := performRangedAccess s2.tree 0 2 1 .Read .VisitChildrenOfAccessed
+    let relSeg := exitFrameWithProtectors s12.tree [2]
+    (exitFrameWithProtectors tFlat [2]).status =
+      .AccessFailure 0 4 1 (.ProtectedDisabled .Unique) ∧
+    s1.status = .Completed ∧ s2.status = .Completed ∧
+    s12.status = .Completed ∧ s21.status = .Completed ∧
+    s12.tree = s21.tree ∧
+    relSeg.status = .Released ∧
+    relSeg.tree = rangedBorrowTreeOfMirAllocSegmented [bDst, bSrc] [1] 0 12 [(0, 2), (2, 2)] :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `mirBorrowsOfAlloc` drops every list of foreign or dead borrows. -/
+theorem mirBorrowsOfAlloc_eq_nil_of_foreign (foreign : List BorrowEntry) (depth localIdx : Nat)
+    (hForeign : ∀ e ∈ foreign,
+      e.targetFrameDepth ≠ depth ∨ e.targetLocal ≠ localIdx ∨ e.allocDead = true) :
+    mirBorrowsOfAlloc foreign depth localIdx = [] := by
+  induction foreign with
+  | nil => rfl
+  | cons e rest ih =>
+    have hF := hForeign e (List.mem_cons_self ..)
+    have hDrop : (Nat.beq e.targetFrameDepth depth && Nat.beq e.targetLocal localIdx &&
+        !e.allocDead) = false := by
+      rcases hF with h | h | h
+      · have : Nat.beq e.targetFrameDepth depth = false := by
+          cases hB : Nat.beq e.targetFrameDepth depth with
+          | false => rfl
+          | true => exact False.elim (h (Nat.beq_eq.mp hB))
+        rw [this]; rfl
+      · have : Nat.beq e.targetLocal localIdx = false := by
+          cases hB : Nat.beq e.targetLocal localIdx with
+          | false => rfl
+          | true => exact False.elim (h (Nat.beq_eq.mp hB))
+        rw [this, Bool.and_false, Bool.false_and]
+      · rw [h, Bool.not_true, Bool.and_false]
+    unfold mirBorrowsOfAlloc
+    simp only [List.filter, hDrop]
+    exact ih (fun e' h' => hForeign e' (List.mem_cons_of_mem _ h'))
+
+/-- **General parametric MIR deref-write ⇒ `performRangedAccess` refinement**:
+for ANY allocation `(depth, localIdx)`, ANY positive span `0 < rangeLen`, and ANY tail
+`foreign` of borrows on other allocations (or dead borrows), upgrading the two-phase
+`Retag(FnEntry)` chain `[child{tag:=2, parentTag:=some 1, protector:=some 1, perm:=.reservedFrz false},
+root{tag:=1, parentTag:=none, protector:=none, perm:=.reservedFrz false}] ++ foreign` to
+`.unique` (as unmodified `V2026_06_01.MirSemantics` does on a write through tag `2`)
+commutes EXACTLY with `performRangedAccess _ 0 rangeLen 2 .Write .VisitChildrenOfAccessed`. -/
+theorem rangedBorrowTreeOfMirAlloc_twoTag_write_refines
+    (child root : BorrowEntry) (foreign : List BorrowEntry) (depth localIdx rangeLen : Nat)
+    (hPos : 0 < rangeLen)
+    (hChildAlloc : child.targetFrameDepth = depth ∧ child.targetLocal = localIdx ∧ child.allocDead = false)
+    (hChildMeta : child.tag = 2 ∧ child.parentTag = some 1 ∧ child.protector = some 1 ∧
+      child.perm = .reservedFrz false)
+    (hRootAlloc : root.targetFrameDepth = depth ∧ root.targetLocal = localIdx ∧ root.allocDead = false)
+    (hRootMeta : root.tag = 1 ∧ root.parentTag = none ∧ root.protector = none ∧
+      root.perm = .reservedFrz false)
+    (hForeign : ∀ e ∈ foreign,
+      e.targetFrameDepth ≠ depth ∨ e.targetLocal ≠ localIdx ∨ e.allocDead = true) :
+    let tPre := rangedBorrowTreeOfMirAlloc (child :: root :: foreign) [1] depth localIdx rangeLen
+    let tPost := rangedBorrowTreeOfMirAlloc
+      ({ child with perm := .unique } :: { root with perm := .unique } :: foreign)
+      [1] depth localIdx rangeLen
+    let acc := performRangedAccess tPre 0 rangeLen 2 .Write .VisitChildrenOfAccessed
+    tPre.protectedTags = [2] ∧ acc.status = .Completed ∧ acc.tree = tPost := by
+  have hNil : mirBorrowsOfAlloc foreign depth localIdx = [] :=
+    mirBorrowsOfAlloc_eq_nil_of_foreign foreign depth localIdx hForeign
+  cases rangeLen with
+  | zero => omega
+  | succ n =>
+    have hBltSelf : Nat.blt (n + 1) (n + 1) = false :=
+      Bool.eq_false_iff.mpr (fun h => Nat.lt_irrefl (n + 1) (Nat.blt_eq.mp h))
+    rcases hChildAlloc with ⟨hCD, hCL, hCA⟩
+    rcases hChildMeta with ⟨hCT, hCPa, hCPr, hCPe⟩
+    rcases hRootAlloc with ⟨hRD, hRL, hRA⟩
+    rcases hRootMeta with ⟨hRT, hRPa, hRPr, hRPe⟩
+    have hKeepC : (Nat.beq child.targetFrameDepth depth && Nat.beq child.targetLocal localIdx &&
+        !child.allocDead) = true := by
+      rw [hCD, hCL, hCA, Nat.beq_refl, Nat.beq_refl]; rfl
+    have hKeepR : (Nat.beq root.targetFrameDepth depth && Nat.beq root.targetLocal localIdx &&
+        !root.allocDead) = true := by
+      rw [hRD, hRL, hRA, Nat.beq_refl, Nat.beq_refl]; rfl
+    have hFilterPre : mirBorrowsOfAlloc (child :: root :: foreign) depth localIdx = [child, root] := by
+      unfold mirBorrowsOfAlloc
+      simp only [List.filter, hKeepC, hKeepR]
+      exact congrArg (fun rest => child :: root :: rest) hNil
+    have hFilterPost : mirBorrowsOfAlloc
+        ({ child with perm := .unique } :: { root with perm := .unique } :: foreign) depth localIdx =
+        [{ child with perm := .unique }, { root with perm := .unique }] := by
+      unfold mirBorrowsOfAlloc
+      simp only [List.filter, hKeepC, hKeepR]
+      exact congrArg (fun rest => { child with perm := .unique } :: { root with perm := .unique } :: rest) hNil
+    dsimp only [rangedBorrowTreeOfMirAlloc]
+    rw [hFilterPre, hFilterPost]
+    cases child; cases root
+    dsimp only at hCT hCPa hCPr hCPe hRT hRPa hRPr hRPe
+    subst hCT; subst hCPa; subst hCPr; subst hCPe
+    subst hRT; subst hRPa; subst hRPr; subst hRPe
+    have hSplit0 : splitSegmentsAt 0
+        [{ offset := 0, length := n + 1,
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
+             (1, ⟨.ReservedFrz false, false⟩)] }] =
+        [{ offset := 0, length := n + 1,
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
+             (1, ⟨.ReservedFrz false, false⟩)] }] := rfl
+    have hSplitEnd : splitSegmentsAt (0 + (n + 1))
+        [{ offset := 0, length := n + 1,
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
+             (1, ⟨.ReservedFrz false, false⟩)] }] =
+        [{ offset := 0, length := n + 1,
+           nodeStates := [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
+             (1, ⟨.ReservedFrz false, false⟩)] }] := by
+      unfold splitSegmentsAt
+      simp only [List.foldr, Nat.zero_add, hBltSelf, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+    have hDisjF : Anneal.RefFrame.rangesDisjoint 0 (n + 1) 0 (n + 1) = false := by
+      unfold Anneal.RefFrame.rangesDisjoint
+      simp only [Nat.zero_add]
+      rfl
+    have hSegAcc :
+        performSegmentAccess
+          [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩] [2]
+          ⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩), (1, ⟨.ReservedFrz false, false⟩)]⟩
+          2 .Write .VisitChildrenOfAccessed =
+        .ok ⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.Unique, true⟩), (1, ⟨.Unique, true⟩)]⟩ := rfl
+    have hFind : findTopoNode 2
+        [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩] = some ⟨2, some 1⟩ := rfl
+    have hNe0 : Nat.beq (n + 1) 0 = false := rfl
+    have hAcc :
+        performRangedAccess
+          { topology := [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩]
+            protectedTags := [2]
+            segments := [⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.ReservedFrz false, false⟩),
+              (1, ⟨.ReservedFrz false, false⟩)]⟩] }
+          0 (n + 1) 2 .Write .VisitChildrenOfAccessed =
+        ⟨{ topology := [⟨0, none⟩, ⟨2, some 1⟩, ⟨1, some 0⟩]
+           protectedTags := [2]
+           segments := [⟨0, n + 1, [(0, ⟨.Unique, true⟩), (2, ⟨.Unique, true⟩),
+             (1, ⟨.Unique, true⟩)]⟩] }, .Completed⟩ := by
+      unfold performRangedAccess
+      dsimp only
+      rw [hFind, hNe0]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [hSplit0, hSplitEnd]
+      dsimp only [List.foldl, stepRangedSegment]
+      rw [hDisjF]
+      simp only [Bool.false_eq_true, ↓reduceIte, Nat.zero_add]
+      rw [hSegAcc]
+      simp only [Nat.beq_refl, List.nil_append]
+    exact ⟨rfl, congrArg RangedAccessResult.status hAcc, congrArg RangedAccessResult.tree hAcc⟩
+
+/-- **General parametric MIR `return_` ⇒ `exitFrameWithProtectors` refinement**:
+for ANY allocation `(depth, localIdx)`, ANY `rangeLen`, and ANY foreign/dead tail
+`foreign`, popping protector `1` on `[child{.unique}, root{.unique}] ++ foreign`
+commutes EXACTLY with `exitFrameWithProtectors _ [2]`. -/
+theorem rangedBorrowTreeOfMirAlloc_twoTag_return_refines
+    (child root : BorrowEntry) (foreign : List BorrowEntry) (depth localIdx rangeLen : Nat)
+    (hChildAlloc : child.targetFrameDepth = depth ∧ child.targetLocal = localIdx ∧ child.allocDead = false)
+    (hChildMeta : child.tag = 2 ∧ child.parentTag = some 1 ∧ child.protector = some 1 ∧
+      child.perm = .unique)
+    (hRootAlloc : root.targetFrameDepth = depth ∧ root.targetLocal = localIdx ∧ root.allocDead = false)
+    (hRootMeta : root.tag = 1 ∧ root.parentTag = none ∧ root.protector = none ∧
+      root.perm = .unique)
+    (hForeign : ∀ e ∈ foreign,
+      e.targetFrameDepth ≠ depth ∨ e.targetLocal ≠ localIdx ∨ e.allocDead = true) :
+    let tActive := rangedBorrowTreeOfMirAlloc (child :: root :: foreign) [1] depth localIdx rangeLen
+    let tReleased := rangedBorrowTreeOfMirAlloc (child :: root :: foreign) [] depth localIdx rangeLen
+    let rel := exitFrameWithProtectors tActive [2]
+    tActive.protectedTags = [2] ∧ rel.status = .Released ∧
+    rel.tree.protectedTags = [] ∧ rel.tree = tReleased := by
+  have hNil : mirBorrowsOfAlloc foreign depth localIdx = [] :=
+    mirBorrowsOfAlloc_eq_nil_of_foreign foreign depth localIdx hForeign
+  rcases hChildAlloc with ⟨hCD, hCL, hCA⟩
+  rcases hChildMeta with ⟨hCT, hCPa, hCPr, hCPe⟩
+  rcases hRootAlloc with ⟨hRD, hRL, hRA⟩
+  rcases hRootMeta with ⟨hRT, hRPa, hRPr, hRPe⟩
+  have hKeepC : (Nat.beq child.targetFrameDepth depth && Nat.beq child.targetLocal localIdx &&
+      !child.allocDead) = true := by
+    rw [hCD, hCL, hCA, Nat.beq_refl, Nat.beq_refl]; rfl
+  have hKeepR : (Nat.beq root.targetFrameDepth depth && Nat.beq root.targetLocal localIdx &&
+      !root.allocDead) = true := by
+    rw [hRD, hRL, hRA, Nat.beq_refl, Nat.beq_refl]; rfl
+  have hFilter : mirBorrowsOfAlloc (child :: root :: foreign) depth localIdx = [child, root] := by
+    unfold mirBorrowsOfAlloc
+    simp only [List.filter, hKeepC, hKeepR]
+    exact congrArg (fun rest => child :: root :: rest) hNil
+  dsimp only [rangedBorrowTreeOfMirAlloc]
+  rw [hFilter]
+  exact rangedBorrowTreeOfMirBorrows_fnEntry_release_unique child root rangeLen
+    hCT hCPa hCPr hCPe hRT hRPa hRPr hRPe
+
+/-! ### Orthogonal Caller-Byte-Store (`List LocalSlot`) + `RangedBorrowTree` Round-Trip -/
+
+/-- `ByteStoreOps` directly on `List LocalSlot` (`Memory.callerLocals`), cleanly separating
+caller byte storage from `Memory`'s Tree Borrows / protector metadata so `CallSpecCut`
+adapters need never discard or overwrite `Memory.borrows`. -/
+instance callerLocalsByteStoreOps : ByteStoreOps (List LocalSlot) CallerLocalAddr UInt8 where
+  addrDisjoint := memCallerByteStoreOps.addrDisjoint
+  readBytes? cl addr off len :=
+    match ParametricCore.listGet? cl addr.localIdx with
+    | none => none
+    | some slot =>
+      match slotAsU8Bytes? slot with
+      | none => none
+      | some bytes =>
+        match Nat.ble (off + len) bytes.length with
+        | true => some ((bytes.drop off).take len)
+        | false => none
+  writeBytes? cl addr off newBytes :=
+    match ParametricCore.listGet? cl addr.localIdx with
+    | none => none
+    | some slot =>
+      match slotAsU8Bytes? slot with
+      | none => none
+      | some bytes =>
+        match Nat.ble (off + newBytes.length) bytes.length with
+        | true =>
+          ParametricCore.listSet? cl addr.localIdx (u8BytesToSlot (listSplice bytes off newBytes))
+        | false => none
+
+/-- Reconstruct single-segment `V2026_06_01.MirSemantics.BorrowEntry`s for allocation
+`(depth, localIdx)` directly from a `RangedBorrowTree`, so `CalleeMachineAdapter.mkEntry`
+builds `Memory.borrows` faithfully from the `RangedBorrowTree` input without hardcoding
+or overwriting borrow state. -/
+def mirBorrowsOfRangedTree (t : RangedBorrowTree) (depth localIdx rangeOff rangeLen : Nat) :
+    List BorrowEntry :=
+  let states := match t.segments with | seg :: _ => seg.nodeStates | [] => []
+  (t.topology.filter (fun n => !Nat.beq n.tag 0)).map (fun n =>
+    let perm :=
+      match lookupLocState n.tag states with
+      | some st => mirOfTbPerm st.permission
+      | none => .disabled
+    let parent :=
+      match n.parentTag with
+      | none => none
+      | some 0 => none
+      | some p => some p
+    let prot :=
+      if natListMem n.tag t.protectedTags then some n.tag else none
+    { tag := n.tag
+      targetLocal := localIdx
+      targetFrameDepth := depth
+      targetProjection := []
+      perm := perm
+      protector := prot
+      parentTag := parent
+      rangeOffset := rangeOff
+      rangeLen := rangeLen })
 
 end Anneal.ParametricCore.StageCutV2026Bridge

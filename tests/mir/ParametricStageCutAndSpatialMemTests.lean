@@ -37,10 +37,15 @@ all five converged capabilities against unmodified
   `UnwindAction.cleanup` landing pad into clean recovery → `MirWpConverges`, and (c)
   universal 3-node `topo3` disjoint sibling commutation (`protectedRefFrame_shared_topo3_commutation`)
   bridged to `TreeBorrowPerm ↔ TbPermission`.
-- **Witness 3d (MIR Tree Borrows ⇒ `RefFrame` step refinement)**: on the REAL
-  `callerNormalBody` run, the MIR deref write and `return_` are EXACTLY
-  `performRangedAccess` / `exitFrameWithProtectors` on the per-allocation projection
-  `rangedBorrowTreeOfMirAlloc` of the live `Memory`.
+- **Witness 3d (UNIVERSAL MIR Tree Borrows ⇒ `RefFrame` step refinement)**: for ALL
+  `x ≤ 10000, bystander ≤ 10000` on the REAL `callerNormalBody → calleeBumpMutBody` run,
+  the MIR deref write and `return_` commute EXACTLY with `performRangedAccess` /
+  `exitFrameWithProtectors` on `rangedBorrowTreeOfMirAlloc` via general parametric
+  theorems `rangedBorrowTreeOfMirAlloc_twoTag_{write,return}_refines`.
+- **Witness 3e (Range-segmented subslice borrows & `accessed`-bit contrast)**:
+  `rangedBorrowTreeOfMirAllocSegmented` commutes disjoint same-allocation subslice borrows
+  (`[0..2)` and `[2..4)`) and releases protectors cleanly where flat 1-segment projection
+  spuriously fails with `.ProtectedDisabled`, alongside `mirSemantics_vs_refFrame_accessed_coarsening`.
 - **Witness 4 (`SpatialMemV2026`)**: full `freezePaddedToMem` → `mutatePaddedInMem` →
   `reabsorbPaddedFromMem` → `endPaddedLoan` → `deallocatePromotedLocal` lifecycle on
   both padded `(u8, [pad; 3], u32)` (contrasted with `u8U32Padded_freeze_refused`) and
@@ -1426,45 +1431,51 @@ theorem witness3a_inline_call_mut_writeback_and_frame (x bystander : Nat)
     (step_to_mirWp h5 (step_to_mirWp h6 (step_to_mirWp h7 (step_to_mirWp h8
       (done_to_mirWp h9 ⟨by omega, rfl, rfl, rfl, rfl, rfl⟩))))))))
 
-/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + live per-allocation
-`rangedBorrowTreeOfMirAlloc` projection + `exitFrameWithProtectors` + disjoint sibling framing
-→ `MirWpConverges`)**: seals `calleeWrite2BytesBody` (with REAL `Retag(FnEntry, _1)`) behind a
-`CallSpecCut` over `Memory.callerLocals` (`memCallerByteStoreOps`), projecting the live
-post-execution `m1.borrows` and `m1.activeProtectors` of caller allocation `(0, 12)` into
-`RangedBorrowTree` via `rangedBorrowTreeOfMirAlloc` (zero hardcoded borrow trees!), proving
-`UpdatesOnly [⟨⟨12⟩, 0, 2⟩]`, `exitFrameWithProtectors _ [1]` releasing the protector that the
-real fat-pointer `Retag(FnEntry)` attached to slice tag `1`, and
-disjoint sibling slice `[2..4)` framing via `mirWpConverges_of_callSpecCut_normal_cleanup`. -/
+/-- **Witness 3a-ii (`CallSpecCut` `&mut [u8]` slice writeback + lossless orthogonal
+`(callerLocals, RangedBorrowTree)` adapter + `exitFrameWithProtectors` + disjoint sibling
+framing → `MirWpConverges`)**: seals `calleeWrite2BytesBody` (with REAL `Retag(FnEntry, _1)`)
+behind a `CallSpecCut` whose byte store is `List LocalSlot` (`callerLocalsByteStoreOps`)
+and whose borrow/protector state lives in `RangedBorrowTree`:
+- `adapter.mkEntry cl t` reconstructs `Memory` faithfully from BOTH `cl` (`callerLocals`)
+  and `t` (`mirBorrowsOfRangedTree t 0 12 0 2`, `activeProtectors := t.protectedTags`,
+  `nextTag := maxTag(t) + 1`), with ZERO hardcoded borrow lists or overwritten fields;
+- `adapter.classifyOut` projects `.normal (rv, m1)` losslessly to
+  `(m1.callerLocals, rangedBorrowTreeOfMirAlloc m1.borrows m1.activeProtectors 0 12 2)`;
+- proves `UpdatesOnly [⟨⟨12⟩, 0, 2⟩]` on `callerLocals`, `exitFrameWithProtectors _ [1]`
+  releasing the protector attached by the real fat-pointer `Retag(FnEntry)`, and
+  disjoint sibling slice `[2..4)` framing via `mirWpConverges_of_callSpecCut_normal_cleanup`. -/
 theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 sib1 : UInt8) :
     let mutL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 0, 2⟩
     let sibL : ByteSubLens CallerLocalAddr := ⟨⟨12⟩, 2, 2⟩
     let borrowSlice : BorrowEntry :=
       { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
         perm := .unique, rangeOffset := 0, rangeLen := 2 }
-    let m0Store : Memory :=
-      { callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [0, 0, sib0, sib1]] }
-    let m0 : Memory :=
-      { m0Store with borrows := [borrowSlice], nextTag := 2 }
-    let tree0 : RangedBorrowTree := rangedBorrowTreeOfMirAlloc m0.borrows m0.activeProtectors 0 12 2
-    let adapter : CalleeMachineAdapter MachineState MirOutcome Memory Value :=
-      { mkEntry := fun mStore _ =>
+    let cl0 : List LocalSlot :=
+      List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [0, 0, sib0, sib1]]
+    let tree0 : RangedBorrowTree := rangedBorrowTreeOfMirAlloc [borrowSlice] [] 0 12 2
+    let adapter : CalleeMachineAdapter MachineState MirOutcome (List LocalSlot) Value :=
+      { mkEntry := fun cl t =>
           { frame := { blockIdx := 0, stmtIdx := 0
                        locals := [.uninit,
                                   .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
                                   .init (.scalar ⟨b0.toNat, 1⟩),
                                   .init (.scalar ⟨b1.toNat, 1⟩)] }
-            memory := { mStore with borrows := [borrowSlice], nextTag := 2 } }
+            memory :=
+              { borrows := mirBorrowsOfRangedTree t 0 12 0 2
+                activeProtectors := t.protectedTags
+                nextTag := (t.topology.foldr (fun n acc => Nat.max n.tag acc) 0) + 1
+                callerLocals := cl } }
         classifyOut := fun out =>
           match out with
           | .normal (rv, m1) =>
-            some (.returned rv { callerLocals := m1.callerLocals }
+            some (.returned rv m1.callerLocals
               (rangedBorrowTreeOfMirAlloc m1.borrows m1.activeProtectors 0 12 2))
           | _ => none }
-    let spec : CallSpec Memory CallerLocalAddr Value :=
-      { pre := fun m t => m = m0Store ∧ t = tree0
-        postRet := fun rv m tRel =>
-          rv = .scalar ⟨1, 4⟩ ∧ mutL.get m = some [b0, b1] ∧
-          sibL.get m = some [sib0, sib1] ∧
+    let spec : CallSpec (List LocalSlot) CallerLocalAddr Value :=
+      { pre := fun cl t => cl = cl0 ∧ t = tree0
+        postRet := fun rv cl tRel =>
+          rv = .scalar ⟨1, 4⟩ ∧ mutL.get cl = some [b0, b1] ∧
+          sibL.get cl = some [sib0, sib1] ∧
           tRel.protectedTags = []
         postUnwind := fun _ _ => False
         modifies := [mutL]
@@ -1472,30 +1483,32 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
         canNormal := true
         canUnwind := false }
     CallSpecCut (wops := mirDetWpOps calleeWrite2BytesBody) adapter spec ∧
-    MirWpConverges calleeWrite2BytesBody (adapter.mkEntry m0Store tree0)
+    MirWpConverges calleeWrite2BytesBody (adapter.mkEntry cl0 tree0)
       (fun out =>
         match out with
         | .normal (rv, m') =>
           rv = .scalar ⟨1, 4⟩ ∧
-          mutL.get m' = some [b0, b1] ∧
-          sibL.get m' = some [sib0, sib1] ∧
+          mutL.get m'.callerLocals = some [b0, b1] ∧
+          sibL.get m'.callerLocals = some [sib0, sib1] ∧
           (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc m'.borrows m'.activeProtectors 0 12 2) [1]).status = .Released ∧
           (exitFrameWithProtectors (rangedBorrowTreeOfMirAlloc m'.borrows m'.activeProtectors 0 12 2) [1]).tree.protectedTags = []
         | _ => False) := by
-  intro mutL sibL borrowSlice m0Store m0 tree0 adapter spec
+  intro mutL sibL borrowSlice cl0 tree0 adapter spec
   let borrowSliceProt : BorrowEntry := { borrowSlice with protector := some 1 }
+  let m0 : Memory :=
+    { borrows := [borrowSlice], nextTag := 2, callerLocals := cl0 }
   let mRetag : Memory :=
     { m0 with
       borrows := [borrowSliceProt]
       activeProtectors := [1]
       nextProtector := 2 }
-  let m1Store : Memory :=
-    { callerLocals := List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, sib0, sib1]] }
+  let cl1 : List LocalSlot :=
+    List.replicate 12 LocalSlot.uninit ++ [u8BytesToSlot [b0, b1, sib0, sib1]]
   let m1 : Memory :=
-    { mRetag with callerLocals := m1Store.callerLocals }
-  have hSetMut : mutL.set m0Store [b0, b1] = some m1Store := by
-    unfold mutL ByteSubLens.set memCallerByteStoreOps
-    change (match ParametricCore.listGet? m0Store.callerLocals 12 with
+    { mRetag with callerLocals := cl1 }
+  have hSetMut : mutL.set cl0 [b0, b1] = some cl1 := by
+    unfold mutL ByteSubLens.set callerLocalsByteStoreOps
+    change (match ParametricCore.listGet? cl0 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1503,16 +1516,14 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
         | some bytes =>
           match Nat.ble (0 + 2) bytes.length with
           | true =>
-            match ParametricCore.listSet? m0Store.callerLocals 12 (u8BytesToSlot (listSplice bytes 0 [b0, b1])) with
-            | some cl' => some { m0Store with callerLocals := cl' }
-            | none => none
-          | false => none) = some m1Store
-    have hG : ParametricCore.listGet? m0Store.callerLocals 12 = some (u8BytesToSlot [0, 0, sib0, sib1]) := rfl
+            ParametricCore.listSet? cl0 12 (u8BytesToSlot (listSplice bytes 0 [b0, b1]))
+          | false => none) = some cl1
+    have hG : ParametricCore.listGet? cl0 12 = some (u8BytesToSlot [0, 0, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hGetMut : mutL.get m1Store = some [b0, b1] := by
-    unfold mutL ByteSubLens.get memCallerByteStoreOps
-    change (match ParametricCore.listGet? m1Store.callerLocals 12 with
+  have hGetMut : mutL.get cl1 = some [b0, b1] := by
+    unfold mutL ByteSubLens.get callerLocalsByteStoreOps
+    change (match ParametricCore.listGet? cl1 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1521,12 +1532,12 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           match Nat.ble (0 + 2) bytes.length with
           | true => some ((bytes.drop 0).take 2)
           | false => none) = some [b0, b1]
-    have hG : ParametricCore.listGet? m1Store.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
+    have hG : ParametricCore.listGet? cl1 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hGetSib : sibL.get m1Store = some [sib0, sib1] := by
-    unfold sibL ByteSubLens.get memCallerByteStoreOps
-    change (match ParametricCore.listGet? m1Store.callerLocals 12 with
+  have hGetSib : sibL.get cl1 = some [sib0, sib1] := by
+    unfold sibL ByteSubLens.get callerLocalsByteStoreOps
+    change (match ParametricCore.listGet? cl1 12 with
       | none => none
       | some slot =>
         match slotAsU8Bytes? slot with
@@ -1535,10 +1546,10 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
           match Nat.ble (2 + 2) bytes.length with
           | true => some ((bytes.drop 2).take 2)
           | false => none) = some [sib0, sib1]
-    have hG : ParametricCore.listGet? m1Store.callerLocals 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
+    have hG : ParametricCore.listGet? cl1 12 = some (u8BytesToSlot [b0, b1, sib0, sib1]) := rfl
     rw [hG]; dsimp only; rw [slotAsU8Bytes?_u8BytesToSlot]
     rfl
-  have hStep0 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody (adapter.mkEntry m0Store tree0) =
+  have hStep0 : Anneal.PureMirExec.mirStep calleeWrite2BytesBody (adapter.mkEntry cl0 tree0) =
       .cont { frame := { blockIdx := 0, stmtIdx := 1
                          locals := [.uninit,
                                     .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
@@ -1579,13 +1590,11 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
                               .init (.scalar ⟨b1.toNat, 1⟩)] }
         memory := m1 } =
       .done (.normal (.scalar ⟨1, 4⟩, m1)) := rfl
-  have hRel := rangedBorrowTreeOfMirBorrows_attachProtector_release_unique borrowSliceProt 2
-    rfl rfl rfl rfl
   have hCut : CallSpecCut (wops := mirDetWpOps calleeWrite2BytesBody) adapter spec := by
     apply seal_callSpecCut (wops := mirDetWpOps calleeWrite2BytesBody)
-    intro m t ⟨hMEq, hTEq⟩
-    subst hMEq; subst hTEq
-    have hDet0 : mirDetStep calleeWrite2BytesBody (adapter.mkEntry m0Store tree0) =
+    intro cl t ⟨hClEq, hTEq⟩
+    subst hClEq; subst hTEq
+    have hDet0 : mirDetStep calleeWrite2BytesBody (adapter.mkEntry cl0 tree0) =
         .step { frame := { blockIdx := 0, stmtIdx := 1
                            locals := [.uninit,
                                       .init (.aggregate 0 [.ptr ⟨1, 0⟩ 8, .scalar ⟨2, 8⟩]),
@@ -1646,14 +1655,14 @@ theorem witness3a_callSpecCut_slice_writeback_and_frame (b0 b1 : UInt8) (sib0 si
   refine ⟨hCut, ?_⟩
   have hWp := mirWpConverges_of_callSpecCut_normal_cleanup (isCleanupBb := fun bb => Nat.beq bb 2)
     (retBb := 1) (cleanupBb := 2)
-    (onNormal := fun bb rv m' t' =>
+    (onNormal := fun bb rv cl' t' =>
       bb = 1 ∧ rv = .scalar ⟨1, 4⟩ ∧
-      mutL.get m' = some [b0, b1] ∧ sibL.get m' = some [sib0, sib1] ∧ t'.protectedTags = [])
+      mutL.get cl' = some [b0, b1] ∧ sibL.get cl' = some [sib0, sib1] ∧ t'.protectedTags = [])
     (onCleanup := fun _ _ _ => False)
     (onUnwindExit := fun _ _ => False)
     (onTerminate := fun _ _ => False)
     hCut ⟨rfl, rfl⟩ rfl
-    (fun retVal m' tRel _ _ _ ⟨hRv, hM, hS, hP⟩ => ⟨rfl, hRv, hM, hS, hP⟩)
+    (fun retVal cl' tRel _ _ _ ⟨hRv, hM, hS, hP⟩ => ⟨rfl, hRv, hM, hS, hP⟩)
     (fun _ _ hC _ _ _ => by cases hC)
     (fun _ _ hA _ _ => by cases hA)
   exact MirWpConverges.mono (by
@@ -1904,21 +1913,25 @@ theorem witness3c_topo3_commutation_and_mir_tb_bridge :
   exact protectedRefFrame_shared_topo3_commutation
     pSrc pDst accSrc accDst protBoth hRead hWrite rf mem exit
 
-/-- **Witness 3d (MIR Tree Borrows step ⇒ `RefFrame` step refinement on the REAL
-`callerNormalBody` → `calleeBumpMutBody` run)**: projecting each live `Memory` through the
-sound per-allocation `rangedBorrowTreeOfMirAlloc _ _ 0 1 4` (caller local `_1 = x`):
+/-- **Witness 3d (UNIVERSAL MIR Tree Borrows step ⇒ `RefFrame` step refinement on the REAL
+`callerNormalBody` → `calleeBumpMutBody` run)**: for ALL `x ≤ 10000` and `bystander ≤ 10000`,
+projecting each live `Memory` through the sound per-allocation `rangedBorrowTreeOfMirAlloc _ _ 0 1 4`
+(caller local `_1 = x`):
 1. after the callee's `Retag(FnEntry, _1)` (`s₃`), protector `1` is live and tag `2` is
    protected in the projection;
-2. the REAL MIR deref write `*_1 = *_1 + 5` (`s₃ → s₄`, through tag `2`) is EXACTLY
-   `performRangedAccess _ 0 4 2 .Write .VisitChildrenOfAccessed` on the projection
-   (`.Completed`, resulting tree = projection of `s₄`);
-3. the REAL `TerminatorKind.return_` (`s₅ → s₆`) is EXACTLY
-   `exitFrameWithProtectors _ [2]` on the projection (`.Released`, resulting tree =
-   projection of `s₆`, whose `activeProtectors = []`). -/
-theorem witness3d_mir_tree_borrows_step_refines_refframe :
+2. the REAL MIR deref write `*_1 = *_1 + 5` (`s₃ → s₄`, through tag `2`) commutes EXACTLY
+   with `performRangedAccess _ 0 4 2 .Write .VisitChildrenOfAccessed` on the projection
+   (proved via `rangedBorrowTreeOfMirAlloc_twoTag_write_refines`, `.Completed`, exact tree
+   equality `= proj s₄`);
+3. the REAL `TerminatorKind.return_` (`s₅ → s₆`) commutes EXACTLY with
+   `exitFrameWithProtectors _ [2]` on the projection (proved via
+   `rangedBorrowTreeOfMirAlloc_twoTag_return_refines`, `.Released`, exact tree equality
+   `= proj s₆`, `activeProtectors = []`, caller local `_1 = x + 5`, bystander `_2 = bystander`). -/
+theorem witness3d_mir_tree_borrows_step_refines_refframe
+    (x bystander : Nat) (hx : x ≤ 10000) (_hb : bystander ≤ 10000) :
     let ms0 : MachineState :=
       { frame := { blockIdx := 0, stmtIdx := 0
-                   locals := [.uninit, .init (.scalar ⟨7, 4⟩), .init (.scalar ⟨3, 4⟩),
+                   locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨bystander, 4⟩),
                               .uninit, .uninit, .uninit] }
         memory := { callees := [calleeBumpMutBody] } }
     let proj : MachineState → RangedBorrowTree := fun s =>
@@ -1936,8 +1949,134 @@ theorem witness3d_mir_tree_borrows_step_refines_refframe :
       (performRangedAccess (proj s₃) 0 4 2 .Write .VisitChildrenOfAccessed).tree = proj s₄ ∧
       (exitFrameWithProtectors (proj s₅) [2]).status = .Released ∧
       (exitFrameWithProtectors (proj s₅) [2]).tree = proj s₆ ∧
-      s₆.memory.activeProtectors = [] ∧ s₆.memory.callStack = [] :=
-  ⟨_, _, _, _, _, _, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+      s₆.memory.activeProtectors = [] ∧ s₆.memory.callStack = [] ∧
+      ParametricCore.listGet? s₆.frame.locals 1 = some (.init (.scalar ⟨x + 5, 4⟩)) ∧
+      ParametricCore.listGet? s₆.frame.locals 2 = some (.init (.scalar ⟨bystander, 4⟩)) := by
+  intro ms0 proj
+  have hW1 : wrapScalarBits (Nat.add x 5) 4294967296 = x + 5 :=
+    wrapScalarBits_of_lt (show x + 5 < 4294967296 by omega)
+  let borrow1 : BorrowEntry :=
+    { tag := 1, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false }
+  let child2 : BorrowEntry :=
+    { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := [],
+      perm := .reservedFrz false, protector := some 1, parentTag := some 1 }
+  let mem1 : Memory :=
+    { callees := [calleeBumpMutBody], borrows := [borrow1], nextTag := 2 }
+  let savedCaller0 : SavedCallerFrame :=
+    { callerBody := callerNormalBody
+      frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨bystander, 4⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] }
+      destination := pl 4
+      returnTarget := 1
+      calleeProtectors := []
+      returnUnwind := .cleanup 2
+      isDiverging := false }
+  let mem2 : Memory :=
+    { mem1 with callStack := [savedCaller0], activeCallee := some calleeBumpMutBody }
+  let mem3 : Memory :=
+    { mem2 with
+      borrows := [child2, borrow1], nextTag := 3,
+      activeProtectors := [1], nextProtector := 2 }
+  let mem4 : Memory :=
+    { mem3 with
+      borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }]
+      callStack :=
+        [{ savedCaller0 with
+           frame := { blockIdx := 0, stmtIdx := 1
+                      locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
+                                 .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] } }] }
+  let mem5 : Memory :=
+    { callees := [calleeBumpMutBody],
+      borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }],
+      nextTag := 3, nextProtector := 2, activeCallee := some callerNormalBody }
+  let s₁ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.scalar ⟨x, 4⟩), .init (.scalar ⟨bystander, 4⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] }
+      memory := mem1 }
+  let s₂ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 0
+                 locals := [.uninit, .init (.ptr ⟨1, 0⟩ 8)] }
+      memory := mem2 }
+  let s₃ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 1
+                 locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+      memory := mem3 }
+  let s₄ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 2
+                 locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+      memory := mem4 }
+  let s₅ : MachineState :=
+    { frame := { blockIdx := 0, stmtIdx := 3
+                 locals := [.init (.scalar ⟨1, 4⟩), .init (.ptr ⟨2, 0⟩ 8)] }
+      memory := mem4 }
+  let s₆ : MachineState :=
+    { frame := { blockIdx := 1, stmtIdx := 0
+                 locals := [.uninit, .init (.scalar ⟨x + 5, 4⟩), .init (.scalar ⟨bystander, 4⟩),
+                            .init (.ptr ⟨1, 0⟩ 8), .init (.scalar ⟨1, 4⟩), .uninit] }
+      memory := mem5 }
+  have hStep4 : Anneal.PureMirExec.mirStep callerNormalBody s₃ = .cont s₄ := by
+    change Step.cont
+      ({ frame := { blockIdx := 0, stmtIdx := 2
+                    locals := [.uninit, .init (.ptr ⟨2, 0⟩ 8)] }
+         memory :=
+           { mem3 with
+             borrows := [{ child2 with perm := .unique }, { borrow1 with perm := .unique }]
+             callStack :=
+               [{ savedCaller0 with
+                  frame := { blockIdx := 0, stmtIdx := 1
+                             locals := [.uninit,
+                                        .init (.scalar ⟨wrapScalarBits (Nat.add x 5) 4294967296, 4⟩),
+                                        .init (.scalar ⟨bystander, 4⟩),
+                                        .init (.ptr ⟨1, 0⟩ 8), .uninit, .uninit] } }] } } : MachineState) = _
+    rw [hW1]
+  have hWriteRef := rangedBorrowTreeOfMirAlloc_twoTag_write_refines child2 borrow1 [] 0 1 4
+    (by decide) ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩
+    (fun _ h => nomatch h)
+  have hRetRef := rangedBorrowTreeOfMirAlloc_twoTag_return_refines
+    { child2 with perm := .unique } { borrow1 with perm := .unique } [] 0 1 4
+    ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl⟩ ⟨rfl, rfl, rfl, rfl⟩
+    (fun _ h => nomatch h)
+  exact ⟨s₁, s₂, s₃, s₄, s₅, s₆,
+    rfl, rfl, rfl, hStep4, rfl, rfl,
+    rfl, hWriteRef.1, hWriteRef.2.1, hWriteRef.2.2,
+    hRetRef.2.1, hRetRef.2.2.2, rfl, rfl, rfl, rfl⟩
+
+/-- **Witness 3e (Range-segmented same-allocation subslice borrows & `accessed`-bit contrast)**:
+contrasts flat 1-segment `rangedBorrowTreeOfMirAlloc` against range-segmented
+`rangedBorrowTreeOfMirAllocSegmented` on two disjoint protected `&mut` subslice borrows
+(`[0..2)` and `[2..4)`) of the same allocation `(0, 12)` — showing flat projection
+spuriously reports `.ProtectedDisabled .Unique`, while segmented projection commutes
+disjoint reads/writes and releases protector `[2]` cleanly — together with the explicit
+`accessed`-bit over-approximation witness (`mirSemantics_vs_refFrame_accessed_coarsening`). -/
+theorem witness3e_partial_range_segmented_borrows_and_accessed_contrast :
+    let bSrc : BorrowEntry :=
+      { tag := 1, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 1, rangeOffset := 0, rangeLen := 2 }
+    let bDst : BorrowEntry :=
+      { tag := 2, targetLocal := 12, targetFrameDepth := 0, targetProjection := [],
+        perm := .unique, protector := some 2, rangeOffset := 2, rangeLen := 2 }
+    let tFlat := rangedBorrowTreeOfMirAlloc [bDst, bSrc] [2, 1] 0 12 4
+    let tSeg := rangedBorrowTreeOfMirAllocSegmented [bDst, bSrc] [2, 1] 0 12 [(0, 2), (2, 2)]
+    let s1 := performRangedAccess tSeg 0 2 1 .Read .VisitChildrenOfAccessed
+    let s12 := performRangedAccess s1.tree 2 2 2 .Write .VisitChildrenOfAccessed
+    let s2 := performRangedAccess tSeg 2 2 2 .Write .VisitChildrenOfAccessed
+    let s21 := performRangedAccess s2.tree 0 2 1 .Read .VisitChildrenOfAccessed
+    (exitFrameWithProtectors tFlat [2]).status =
+      .AccessFailure 0 4 1 (.ProtectedDisabled .Unique) ∧
+    s12.status = .Completed ∧ s21.status = .Completed ∧ s12.tree = s21.tree ∧
+    (exitFrameWithProtectors s12.tree [2]).status = .Released ∧
+    (exitFrameWithProtectors s12.tree [2]).tree =
+      rangedBorrowTreeOfMirAllocSegmented [bDst, bSrc] [1] 0 12 [(0, 2), (2, 2)] ∧
+    (TbLocationState.performAccess ⟨.Frozen, false⟩ .Write .ForeignAccess true =
+      .Success ⟨.Disabled, false⟩ ∧
+     treeBorrowNodeAccess .write .foreignAccess .frozen true = .ub) :=
+  let hSeg := rangedBorrowTreeOfMirAlloc_partial_range_spurious_vs_segmented
+  ⟨hSeg.1, hSeg.2.2.2.1, hSeg.2.2.2.2.1, hSeg.2.2.2.2.2.1,
+   hSeg.2.2.2.2.2.2.1, hSeg.2.2.2.2.2.2.2,
+   mirSemantics_vs_refFrame_accessed_coarsening.2⟩
 
 /-! ## Witness 4: `SpatialMemV2026` — Padded `(u8, [pad; 3], u32)` & Provenance Pointer Struct -/
 
