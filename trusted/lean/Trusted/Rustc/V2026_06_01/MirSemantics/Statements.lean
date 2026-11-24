@@ -2691,8 +2691,10 @@ def copyBytesSubplace
     | .none => .none
   match
     Bool.or
-      (copyAccessCertainlyOob (fitsAt srcEp expBytesOpt))
-      (copyAccessCertainlyOob (fitsAt dstEp expBytesOpt))
+      (Bool.or
+        (copyAccessCertainlyOob (fitsAt srcEp expBytesOpt))
+        (copyAccessCertainlyOob (fitsAt dstEp expBytesOpt)))
+      (Nat.beq srcEp.ptr.tag dstEp.ptr.tag)
   with
   | true => .ub
   | false =>
