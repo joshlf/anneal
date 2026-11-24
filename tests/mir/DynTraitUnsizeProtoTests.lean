@@ -882,32 +882,117 @@ theorem canary_a_protector_lifetime :
     ((stateAt false 10).map protectorView).map (·.1) = some [] := by
   decide +kernel
 
+/-- State of the `&mut dyn Poke` run after `n` steps. -/
+def mutStateAt (n : Nat) : Option MachineState :=
+  advanceSteps (mutCallerBody false) (stepMirFnProto pokeProg (mutCallerBody false)) n
+    (initMachineStateWithCallees (mutCallerBody false) [] [pokeBody refMutRecTy false])
+
 open Anneal.RefFrame in
-/-- **`Trusted` protector and ranged Tree Borrows view agree on c16.** Inside
-the callee of the `&dyn Poke` run (10 steps), the ranged view of the
-`Trusted` borrow state for receiver tag `3` over `Receiver`'s bytes `[0, 4)`
-is protected: the entry reborrow read completes, a foreign write by the owner
-is `ProtectedDisabled` at tag `3`, and after `exitFrameWithProtectors` the same
-write completes. This is the verdict of the end-to-end run
-(`canary_a_c16_receiver_uaf_under_protector`: UB in the callee, `7` after
-return). The raw-pointer run registers no receiver tag (no view). -/
+/-- **`Trusted` protector and ranged Tree Borrows view agree on c16** across
+`&dyn Poke` (in-callee step 10 AND post-return step 12), `&mut dyn Poke`
+(in-callee step 10 AND post-return step 12), raw `*const dyn Poke` (no view),
+tag-`0` parent borrows (no collision with fresh owner tag), 3-level nested
+protected borrow chains (grandparent + child protectors both preserved), dead
+allocations (`allocDead = true -> none`), and self-cycles (`none`). -/
 theorem canary_a_trusted_and_ranged_views_agree :
+    -- 1. `&dyn Poke` in-callee (step 10): fresh owner tag `4`, protected tag `3`.
     (match stateAt true 10 with
      | some s =>
-       match rangedReceiverView s.memory 3 0 4 with
-       | some t =>
-         [ accessCode (receiverEnter t 3 0 4).status,
+       match rangedReceiverOwnerTag s.memory 3, rangedReceiverView s.memory 3 0 4 with
+       | some owner, some t =>
+         [ [owner], t.protectedTags,
+           accessCode (receiverEnter t 3 0 4).status,
            accessCode
-             (receiverForeignAccess (receiverEnter t 3 0 4).tree 0 0 4 .Write).status,
+             (receiverForeignAccess (receiverEnter t 3 0 4).tree owner 0 4 .Write).status,
            releaseCode (receiverExit (receiverEnter t 3 0 4).tree 3).status,
            accessCode
              (receiverForeignAccess
-               (receiverExit (receiverEnter t 3 0 4).tree 3).tree 0 0 4 .Write).status ]
-       | none => [[9]]
-     | none => [[9]]) = [[0], [2, 0, 4, 3, 2], [0], [0]] ∧
+               (receiverExit (receiverEnter t 3 0 4).tree 3).tree owner 0 4 .Write).status ]
+       | _, _ => [[9]]
+     | none => [[9]]) = [[4], [3], [0], [2, 0, 4, 3, 2], [0], [0]] ∧
+    -- 2. `&dyn Poke` post-return (step 12): `Trusted` cleared `activeProtectors = []`,
+    --    so `rangedReceiverView` has `protectedTags = []` and foreign write completes directly.
+    (match stateAt true 12 with
+     | some s =>
+       match rangedReceiverOwnerTag s.memory 3, rangedReceiverView s.memory 3 0 4 with
+       | some owner, some t =>
+         [ t.protectedTags,
+           accessCode (receiverEnter t 3 0 4).status,
+           accessCode
+             (receiverForeignAccess (receiverEnter t 3 0 4).tree owner 0 4 .Write).status ]
+       | _, _ => [[9]]
+     | none => [[9]]) = [[], [0], [0]] ∧
+    -- 3. `&mut dyn Poke` in-callee (step 10) and post-return (step 12).
+    (match mutStateAt 10, mutStateAt 12 with
+     | some sIn, some sOut =>
+       match rangedReceiverOwnerTag sIn.memory 3, rangedReceiverView sIn.memory 3 0 4,
+             rangedReceiverOwnerTag sOut.memory 3, rangedReceiverView sOut.memory 3 0 4 with
+       | some oIn, some tIn, some oOut, some tOut =>
+         [ tIn.protectedTags,
+           accessCode (receiverEnter tIn 3 0 4).status,
+           accessCode
+             (receiverForeignAccess (receiverEnter tIn 3 0 4).tree oIn 0 4 .Write).status,
+           tOut.protectedTags,
+           accessCode
+             (receiverForeignAccess (receiverEnter tOut 3 0 4).tree oOut 0 4 .Write).status ]
+       | _, _, _, _ => [[9]]
+     | _, _ => [[9]]) = [[3], [0], [2, 0, 4, 3, 2], [], [0]] ∧
+    -- 4. Raw `*const dyn Poke` registers no receiver tag (no view).
     (match stateAt false 10 with
      | some s => (rangedReceiverView s.memory 3 0 4).isNone
-     | none => false) = true := by
+     | none => false) = true ∧
+    -- 5. Tag `0` parent borrow (zero collision), 3-level nested protected chain,
+    --    dead allocation (`allocDead = true`), and self-cycle.
+    (let bTag0 : BorrowEntry :=
+       { tag := 0, targetLocal := 1, targetProjection := [], perm := .frozen,
+         parentTag := none, protector := none }
+     let bChild1 : BorrowEntry :=
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+         parentTag := some 0, protector := some 7 }
+     let memTag0 : Memory :=
+       { emptyMemory with borrows := [bChild1, bTag0], activeProtectors := [7] }
+     let bGrand : BorrowEntry :=
+       { tag := 1, targetLocal := 1, targetProjection := [], perm := .frozen,
+         parentTag := none, protector := some 10 }
+     let bMid : BorrowEntry :=
+       { tag := 2, targetLocal := 1, targetProjection := [], perm := .frozen,
+         parentTag := some 1, protector := none }
+     let bLeaf : BorrowEntry :=
+       { tag := 3, targetLocal := 1, targetProjection := [], perm := .reservedFrz false,
+         parentTag := some 2, protector := some 20 }
+     let memNested : Memory :=
+       { emptyMemory with borrows := [bLeaf, bMid, bGrand], activeProtectors := [20, 10] }
+     let memDead : Memory :=
+       { emptyMemory with borrows := [{ bChild1 with allocDead := true }, bTag0], activeProtectors := [7] }
+     let memCycle : Memory :=
+       { emptyMemory with
+         borrows := [{ tag := 5, targetLocal := 1, targetProjection := [], perm := .frozen,
+                       parentTag := some 5, protector := some 1 }],
+         activeProtectors := [1] }
+     let tag0Res :=
+       match rangedReceiverOwnerTag memTag0 1, rangedReceiverView memTag0 1 0 4 with
+       | some o0, some t0 =>
+         [ [o0],
+           accessCode (receiverEnter t0 1 0 4).status,
+           accessCode (receiverForeignAccess (receiverEnter t0 1 0 4).tree o0 0 4 .Write).status ]
+       | _, _ => [[9]]
+     let nestedRes :=
+       match rangedReceiverOwnerTag memNested 3, rangedReceiverView memNested 3 0 4 with
+       | some oN, some tN =>
+         let t1 := (receiverEnter tN 3 0 4).tree
+         let tExitChild := (receiverExit t1 3).tree
+         let tExitGrand := (receiverExit t1 1).tree
+         let tExitBoth := (receiverExit tExitChild 1).tree
+         [ [oN], tN.protectedTags,
+           accessCode (receiverForeignAccess tExitGrand oN 0 4 .Write).status,
+           accessCode (receiverForeignAccess tExitChild oN 0 4 .Write).status,
+           accessCode (receiverForeignAccess tExitBoth oN 0 4 .Write).status ]
+       | _, _ => [[9]]
+     (tag0Res, nestedRes, (rangedReceiverView memDead 1 0 4).isNone,
+      (rangedReceiverView memCycle 5 0 4).isNone)) =
+      ( [[2], [0], [2, 0, 4, 1, 2]],
+        [[4], [1, 3], [2, 0, 4, 3, 2], [2, 0, 4, 1, 2], [0]],
+        true, true ) := by
   decide +kernel
 
 end C16
@@ -2299,6 +2384,169 @@ theorem b2_trailing_arg_abi_nonptr_recv_and_intrinsic_env_gate :
        (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody false false) [] []))) = 4 := by
   decide +kernel
 
+/-! ### B3 regressions (`CoerceUnsized` `Pin<&mut T> -> Pin<&mut dyn Trait>`
+& `Pin` upcast end-to-end, fail-closed `Box<dyn>`/`&Wrapper<dyn>` avoiding
+false-positive `.ub`, `Pin` ranged TB agreement, and `V06`/`V08` float/`i128`/
+`Pin` dialect symmetry) -/
+
+/-- Caller constructing `Pin::new(&mut rec)` FIRST (type `Pin<&mut Receiver>`),
+then coercing `Pin<&mut Receiver> as Pin<&mut dyn Poke> (PointerCoercion(Unsize))`
+through `stepMirFnProto`, and dispatching `<dyn Poke as Poke>::poke(pin, alias)`. -/
+def pinUnsizeCallerBody (writeAfter : Bool) : CapturedMir :=
+  { defPath := "b3::pin_unsize_caller", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls :=
+      [ decl u32Ty, decl recTy, decl C16.rawU32Ty, decl refMutRecTy, decl pinRefMutRecTy,
+        decl pinRefMutDynPokeTy, decl u32Ty ],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4, live 5, live 6,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 23]),
+             asg 2 (.rawPtr .mut { local_ := 1, projection := [.field 0 u32Ty] }),
+             asg 3 (.ref (.mut false) (loc 1)),
+             asg 4 (.aggregate (.adt "core::pin::Pin" 0 none) [mv 3]),
+             asg 5 (unsize (mv 4) pinRefMutDynPokeTy) ]
+           (.call (virtFn C16.pokePath C16.pokeKey) [cp 5, cp 2] (loc 6) (some 1) .continue_),
+        bb ((match writeAfter with
+             | true => [asg 1 (.aggregate (.adt recKey 0 none) [cU32 5])]
+             | false => []) ++ [asg 0 (.use (cp 6))]) .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def runPinUnsize (writeInCallee writeAfter : Bool) : ProtoRunResult :=
+  runMirProto C16.pokeProg (pinUnsizeCallerBody writeAfter) 64
+    (initMachineStateWithCallees (pinUnsizeCallerBody writeAfter) [] [pinPokeBody writeInCallee])
+
+/-- `Pin<&mut dyn Sub> -> Pin<&mut dyn Super>` upcast end-to-end through `stepMirFnProto`. -/
+def subKey : String := "b3::Sub"
+def supKey : String := "b3::Super"
+def supPath : String := "b3::Super::sup"
+def recSupPath : String := "<miri_diff_corpus::__AnnealVtableReceiver43543 as b3::Super>::sup"
+def subPred : ProtoTraitPred := { principalTrait? := some subKey }
+def supPred : ProtoTraitPred := { principalTrait? := some supKey }
+
+def pinSupProg : ProtoDynProgram :=
+  { vtables :=
+      { entries :=
+          [ { vtableId := 0, vtableAllocId := 40000, concreteTyKey := recKey, traitPred := supPred,
+              sizeBytes := 4, alignBytes := 4,
+              slots := [.dropInPlace none, .size, .align, .method recSupPath] },
+            { vtableId := 1, vtableAllocId := 40001, concreteTyKey := recKey, traitPred := subPred,
+              sizeBytes := 4, alignBytes := 4,
+              slots := [.dropInPlace none, .size, .align, .method recSupPath, .traitVPtr 0] } ],
+        dynTypes := [(supKey, supPred), (subKey, subPred)] },
+    virtualMethods := [(supPath, 3)] }
+
+def pinSupBody : CapturedMir :=
+  { defPath := recSupPath, phase := .runtimePostCleanup, role := .model, argCount := 1,
+    localDecls := [decl u32Ty, decl pinRefMutRecTy, decl refMutRecTy],
+    basicBlocks :=
+      [ bb [ live 2,
+             asg 2 (.use (.copy { local_ := 1, projection := [.field 0 refMutRecTy] })),
+             asg 0 (.use (selfField 2 0)) ] .return_ ],
+    fnAbi := { args := [ptrAbi], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def pinUpcastCallerBody : CapturedMir :=
+  let pinSubTy : Ty := { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic subKey)], layoutIdx := 5 }
+  let pinSupTy : Ty := { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic supKey)], layoutIdx := 5 }
+  { defPath := "b3::pin_upcast_caller", phase := .runtimePostCleanup, role := .model, argCount := 0,
+    localDecls :=
+      [ decl u32Ty, decl recTy, decl refMutRecTy, decl pinRefMutRecTy, decl pinSubTy, decl pinSupTy ],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4, live 5,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 41]),
+             asg 2 (.ref (.mut false) (loc 1)),
+             asg 3 (.aggregate (.adt "core::pin::Pin" 0 none) [mv 2]),
+             asg 4 (unsize (mv 3) pinSubTy),
+             asg 5 (unsize (mv 4) pinSupTy) ]
+           (.call (virtFn supPath supKey) [cp 5] (loc 0) (some 1) .continue_),
+        bb [] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+/-- Unsupported `CoerceUnsized` ADT unsizing target (`Box<dyn>`, `Pin<Box<dyn>>`,
+`&Wrapper<dyn>`): MUST fail closed with `.unsupported` (`4`), NEVER false-positive
+`.ub` (`3`) from `Trusted`'s slice-only `evalUnsizeCoercion`. -/
+def unsupportedDynAdtUnsizeBody (srcTy targetTy : Ty) : CapturedMir :=
+  { defPath := "b3::unsupported_dyn_adt_unsize", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl u32Ty, decl recTy, decl refRecTy, decl srcTy, decl targetTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (.aggregate (.adt "wrapper" 0 none) [mv 2]),
+             asg 4 (unsize (mv 3) targetTy),
+             asg 0 (.use (cU32 0)) ] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+open Anneal.RefFrame in
+/-- **B3 regressions.**
+1. `Pin<&mut Receiver> as Pin<&mut dyn Poke> (PointerCoercion(Unsize))` runs
+   end-to-end through `stepMirFnProto` and virtual dispatch (`23u32`), enforces
+   the `c16` protector inside the callee (UB `3`), releases it on return (`23u32`),
+   and agrees with `rangedReceiverView` both in-callee and post-return.
+2. `Pin<&mut Receiver> -> Pin<&mut dyn Sub> -> Pin<&mut dyn Super>` upcast via
+   `stepMirFnProto` resolves the supertrait vtable and returns `41u32`.
+3. `Box<dyn Trait>`, `Pin<Box<dyn Trait>>`, and `&Wrapper<dyn Trait>` unsizing
+   casts fail closed (`4`), NEVER faulting false-positive `.ub` (`3`).
+4. `V06` and `V08` adapters agree on `u128`/`i128`/`f16`/`f32`/`f64`/`f128` and
+   `Pin<&[mut] dyn Trait>`. -/
+theorem b3_pin_unsize_box_fail_closed_and_dialect_symmetry :
+    scalarOf (runPinUnsize false false) = some (23, 4) ∧
+    tagOf (runPinUnsize true false) = 3 ∧
+    scalarOf (runPinUnsize false true) = some (23, 4) ∧
+    (match advanceSteps (pinUnsizeCallerBody false)
+        (stepMirFnProto C16.pokeProg (pinUnsizeCallerBody false)) 12
+        (initMachineStateWithCallees (pinUnsizeCallerBody false) [] [pinPokeBody false]),
+      advanceSteps (pinUnsizeCallerBody false)
+        (stepMirFnProto C16.pokeProg (pinUnsizeCallerBody false)) 18
+        (initMachineStateWithCallees (pinUnsizeCallerBody false) [] [pinPokeBody false]) with
+     | some sIn, some sOut =>
+       match rangedReceiverOwnerTag sIn.memory 3, rangedReceiverView sIn.memory 3 0 4,
+             rangedReceiverOwnerTag sOut.memory 3, rangedReceiverView sOut.memory 3 0 4 with
+       | some oIn, some tIn, some oOut, some tOut =>
+         [ tIn.protectedTags,
+           accessCode (receiverForeignAccess (receiverEnter tIn 3 0 4).tree oIn 0 4 .Write).status,
+           tOut.protectedTags,
+           accessCode (receiverForeignAccess (receiverEnter tOut 3 0 4).tree oOut 0 4 .Write).status ]
+       | _, _, _, _ => [[9]]
+     | _, _ => [[9]]) = [[3], [2, 0, 4, 3, 2], [], [0]] ∧
+    scalarOf (runMirProto pinSupProg pinUpcastCallerBody 64
+      (initMachineStateWithCallees pinUpcastCallerBody [] [pinSupBody])) = some (41, 4) ∧
+    (let boxSrc : Ty := { kind := .adt "alloc::boxed::Box" [.adt recKey []], layoutIdx := 3 }
+     let boxDst : Ty := { kind := .adt "alloc::boxed::Box" [.dynamic traitKey], layoutIdx := 5 }
+     let pinBoxSrc : Ty := { kind := .adt "core::pin::Pin" [.adt "alloc::boxed::Box" [.adt recKey []]], layoutIdx := 3 }
+     let pinBoxDst : Ty := { kind := .adt "core::pin::Pin" [.adt "alloc::boxed::Box" [.dynamic traitKey]], layoutIdx := 5 }
+     let wrapSrc : Ty := { kind := .ref .not (.adt "Wrapper" [.adt recKey []]), layoutIdx := 3 }
+     let wrapDst : Ty := { kind := .ref .not (.adt "Wrapper" [.dynamic traitKey]), layoutIdx := 5 }
+     [ tagOf (runMirProto prog (unsupportedDynAdtUnsizeBody boxSrc boxDst) 32
+         (initMachineStateWithCallees (unsupportedDynAdtUnsizeBody boxSrc boxDst) [] [])),
+       tagOf (runMirProto prog (unsupportedDynAdtUnsizeBody pinBoxSrc pinBoxDst) 32
+         (initMachineStateWithCallees (unsupportedDynAdtUnsizeBody pinBoxSrc pinBoxDst) [] [])),
+       tagOf (runMirProto prog (unsupportedDynAdtUnsizeBody wrapSrc wrapDst) 32
+         (initMachineStateWithCallees (unsupportedDynAdtUnsizeBody wrapSrc wrapDst) [] [])) ]) =
+      [4, 4, 4] ∧
+    [ V06.tyKey? (.uint .u128), V08.tyKey? (.uint .u128),
+      V06.tyKey? (.int .i128), V08.tyKey? (.int .i128),
+      V06.tyKey? (.float .f16), V08.tyKey? (.float .f16),
+      V06.tyKey? (.float .f32), V08.tyKey? (.float .f32),
+      V06.tyKey? (.float .f64), V08.tyKey? (.float .f64),
+      V06.tyKey? (.float .f128), V08.tyKey? (.float .f128) ] =
+      [ some "u128", some "u128", some "i128", some "i128",
+        some "f16", some "f16", some "f32", some "f32",
+        some "f64", some "f64", some "f128", some "f128" ] ∧
+    V06.lowerVirtualReceiver (.adt "core::pin::Pin" [.ref .mut (.dynamic traitKey)]) =
+      some (true, true, true) ∧
+    V08.lowerVirtualReceiver (.adt "core::pin::Pin" [.ref .mut (.dynamic traitKey)]) =
+      some (true, true, true) ∧
+    V06.lowerPinDynTarget? (.adt "core::pin::Pin" [.ref .not (.dynamic traitKey)]) =
+      some (false, traitKey) ∧
+    V08.lowerPinDynTarget? (.adt "core::pin::Pin" [.ref .not (.dynamic traitKey)]) =
+      some (false, traitKey) := by
+  decide +kernel
+
 end B1Hardening
 
 /-! ## §5. Cross-root dual-authority kernel bridge (vendored `Miri.Interpreter.*`)
@@ -2429,6 +2677,16 @@ def wrappedDynLayout : LayoutData :=
   { sizedLayout 16 8 with
     fields := .Arbitrary #[Size.ZERO, Size.ZERO, Size.ofBytes 16] #[0, 1, 2] }
 
+/-- Layout of a single-field `Pin<*const T>` ADT (`fields.count = 1`, field 0
+at offset 0) exercised by `Cast.unsizeInto`. -/
+def pinThinLayout : LayoutData :=
+  { sizedLayout 8 8 with fields := .Arbitrary #[Size.ZERO] #[0] }
+
+/-- Layout of a single-field `Pin<*const dyn Trait>` ADT (`fields.count = 1`,
+field 0 at offset 0) exercised by `Cast.unsizeInto`. -/
+def pinWideLayout : LayoutData :=
+  { sizedLayout 16 8 with fields := .Arbitrary #[Size.ZERO] #[0] }
+
 private def unused {S A : Type} (what : String) : EStateM StepError S A :=
   throw (.unsupported s!"unused hook {what}")
 
@@ -2446,9 +2704,15 @@ def lmLayoutOf (vt : ProtoVTableTable) (ty : Nat) : EStateM StepError LmS (TyAnd
     match Nat.blt ty 2000 with
     | true => pure ⟨ty, dynLayoutData⟩
     | false =>
-      match Nat.beq ty 2001 with
+      match Nat.beq ty 2001 || (Nat.ble 3000 ty && Nat.blt ty 4000) with
       | true => pure ⟨ty, sizedLayout 8 8⟩
-      | false => pure ⟨ty, sizedLayout 16 8⟩
+      | false =>
+        match Nat.ble 6000 ty && Nat.blt ty 7000 with
+        | true => pure ⟨ty, pinThinLayout⟩
+        | false =>
+          match Nat.ble 7000 ty && Nat.blt ty 8000 with
+          | true => pure ⟨ty, pinWideLayout⟩
+          | false => pure ⟨ty, sizedLayout 16 8⟩
 
 /-- Genuine `VTableHooks` over the table: symbolic vtable allocations, the
 compiler's predicate lists, layouts, and vtable entries. -/
@@ -2562,8 +2826,9 @@ def supertraitSlotOf (vt : ProtoVTableTable) (src dst : Nat) : Option Nat :=
     | none => none
   | _, _ => none
 
-/-- Genuine `CastHooks`: the type, layout, vtable, and immediate leaves that
-`Cast.unsizeIntoPointer` and `Cast.ptrToPtr` consult. -/
+/-- Genuine `CastHooks`: the type, layout, field-projection, vtable, and
+immediate leaves that `Cast.unsizeInto`, `Cast.unsizeIntoPointer`, and
+`Cast.ptrToPtr` consult. -/
 def lmCastHooks (vt : ProtoVTableTable) : CastHooks LmP LmS LmC Unit where
   target := lmTarget
   typeInfo := fun _ ty =>
@@ -2572,7 +2837,19 @@ def lmCastHooks (vt : ProtoVTableTable) : CastHooks LmP LmS LmC Unit where
     | false =>
       match Nat.blt ty 2000 with
       | true => pure (.dynamic (ty - 1000))
-      | false => pure (.rawPointer 0)
+      | false =>
+        match Nat.blt ty 3000 with
+        | true => pure (.rawPointer 0)
+        | false =>
+          match Nat.blt ty 4000 with
+          | true => pure (.rawPointer (ty - 3000))
+          | false =>
+            match Nat.blt ty 5000 with
+            | true => pure (.rawPointer (dynTyId (ty - 4000)))
+            | false =>
+              match Nat.ble 6000 ty && Nat.blt ty 8000 with
+              | true => pure (.adt 99)
+              | false => pure (.rawPointer 0)
   layoutOf := fun _ ty => lmLayoutOf vt ty
   destLayout := fun _ => ⟨2001, sizedLayout 8 8⟩
   readImmediate := fun _ op =>
@@ -2604,10 +2881,31 @@ def lmCastHooks (vt : ProtoVTableTable) : CastHooks LmP LmS LmC Unit where
   boxLayout := fun _ _ => unused "boxLayout"
   validateImmediateABI := fun _ _ => .ok ()
   copyAllowTransmute := fun _ _ _ => unused "copyAllowTransmute"
-  copyNoValidate := fun _ _ _ _ => unused "copyNoValidate"
-  projectRead := fun _ _ _ => unused "projectRead"
-  projectWrite := fun _ _ _ => unused "projectWrite"
-  fieldLayout := fun _ _ _ => unused "fieldLayout"
+  copyNoValidate := fun _ src _ _ =>
+    match src.op with
+    | .immediate imm => set (some imm)
+    | .indirect _ => unused "copyNoValidate"
+  projectRead := fun _ src idx =>
+    match Nat.beq idx 0 with
+    | false => unused "projectRead"
+    | true =>
+      match Nat.ble 6000 src.layout.ty && Nat.blt src.layout.ty 7000 with
+      | true => pure ⟨src.op, ⟨3000 + (src.layout.ty - 6000), sizedLayout 8 8⟩⟩
+      | false =>
+        match Nat.ble 7000 src.layout.ty && Nat.blt src.layout.ty 8000 with
+        | true => pure ⟨src.op, ⟨4000 + (src.layout.ty - 7000), sizedLayout 16 8⟩⟩
+        | false => unused "projectRead"
+  projectWrite := fun _ _ idx =>
+    match Nat.beq idx 0 with
+    | true => pure ()
+    | false => unused "projectWrite"
+  fieldLayout := fun _ target idx =>
+    match Nat.beq idx 0 with
+    | false => unused "fieldLayout"
+    | true =>
+      match Nat.ble 7000 target.ty && Nat.blt target.ty 8000 with
+      | true => pure ⟨4000 + (target.ty - 7000), sizedLayout 16 8⟩
+      | false => unused "fieldLayout"
   lockstepTails := fun _ a b => pure (a, b)
   vtableType := fun c ptr expected =>
     VTable.getPtrVTableTypeRead (lmVTableHooks vt).readHooks c ptr expected
@@ -2760,6 +3058,15 @@ def miriRun (vt : ProtoVTableTable) : LmQuery → LmObs
         (Cast.unsizeIntoPointer (lmCastHooks vt) () ⟨.immediate (.scalar s), ⟨2001, sizedLayout 8 8⟩⟩
           () tyIdx (dynTyId traitIdx))
         (fun _ st => lmWrittenObs st)
+  | .unsizePin tyIdx traitIdx data =>
+    match lmScalar data with
+    | none => .err .other
+    | some s =>
+      lmRunM
+        (Cast.unsizeInto (lmCastHooks vt) () 4
+          ⟨.immediate (.scalar s), ⟨6000 + tyIdx, pinThinLayout⟩⟩
+          ⟨7000 + traitIdx, pinWideLayout⟩ ())
+        (fun _ st => lmWrittenObs st)
   | .upcast srcTrait dstTrait data vtp =>
     match lmScalar data, lmScalar vtp with
     | some sd, some sv =>
@@ -2767,6 +3074,15 @@ def miriRun (vt : ProtoVTableTable) : LmQuery → LmObs
         (Cast.unsizeIntoPointer (lmCastHooks vt) ()
           ⟨.immediate (.scalarPair sd sv), ⟨4000 + srcTrait, sizedLayout 16 8⟩⟩ ()
           (dynTyId srcTrait) (dynTyId dstTrait))
+        (fun _ st => lmWrittenObs st)
+    | _, _ => .err .other
+  | .upcastPin srcTrait dstTrait data vtp =>
+    match lmScalar data, lmScalar vtp with
+    | some sd, some sv =>
+      lmRunM
+        (Cast.unsizeInto (lmCastHooks vt) () 4
+          ⟨.immediate (.scalarPair sd sv), ⟨7000 + srcTrait, pinWideLayout⟩⟩
+          ⟨7000 + dstTrait, pinWideLayout⟩ ())
         (fun _ st => lmWrittenObs st)
     | _, _ => .err .other
   | .ptrToPtr data ptrMeta =>
@@ -3135,8 +3451,12 @@ run_cmd do
       mkApp2 (mkConst (lmNs ++ `LmQuery.sizeAlign)) v (nat t)
     let qUnsize (ty t : Nat) (d : Expr) : Expr :=
       mkApp3 (mkConst (lmNs ++ `LmQuery.unsize)) (nat ty) (nat t) d
+    let qUnsizePin (ty t : Nat) (d : Expr) : Expr :=
+      mkApp3 (mkConst (lmNs ++ `LmQuery.unsizePin)) (nat ty) (nat t) d
     let qUpcast (s t : Nat) (d v : Expr) : Expr :=
       mkApp4 (mkConst (lmNs ++ `LmQuery.upcast)) (nat s) (nat t) d v
+    let qUpcastPin (s t : Nat) (d v : Expr) : Expr :=
+      mkApp4 (mkConst (lmNs ++ `LmQuery.upcastPin)) (nat s) (nat t) d v
     let qPtrToPtr (d m : Expr) : Expr := mkApp2 (mkConst (lmNs ++ `LmQuery.ptrToPtr)) d m
     let oTyOk (ty : Nat) : Expr := mkApp (mkConst (lmNs ++ `LmObs.tyOk)) (nat ty)
     let oMethod (f : Nat) (r : Expr) : Expr := mkApp2 (mkConst (lmNs ++ `LmObs.method)) (nat f) r
@@ -3207,6 +3527,13 @@ run_cmd do
           oErr `invalidVTableTrait),
         (`cert.unsizeIntoPointer_sized, qUnsize 1 0 (prov 5 4), oWide (prov 5 4) (prov 40001 0)),
         (`cert.unsizeIntoPointer_null_raw, qUnsize 0 0 (intP 0), oWide (intP 0) (prov 40000 0)),
+        (`cert.unsizeInto_pin_sized, qUnsizePin 1 0 (prov 5 4), oWide (prov 5 4) (prov 40001 0)),
+        (`cert.unsizeInto_pin_upcast_traitVPtr, qUpcastPin 3 2 (prov 3 0) (prov 40004 0),
+          oWide (prov 3 0) (prov 40003 0)),
+        (`cert.unsizeInto_pin_upcast_prefix, qUpcastPin 4 2 (prov 3 0) (prov 40005 0),
+          oWide (prov 3 0) (prov 40003 0)),
+        (`cert.unsizeInto_pin_identity, qUpcastPin 3 3 (prov 3 0) (prov 40004 0),
+          oWide (prov 3 0) (prov 40004 0)),
         (`cert.unsizeIntoPointer_upcast_traitVPtr, qUpcast 3 2 (prov 3 0) (prov 40004 0),
           oWide (prov 3 0) (prov 40003 0)),
         (`cert.unsizeIntoPointer_upcast_prefix, qUpcast 4 2 (prov 3 0) (prov 40005 0),
@@ -3220,6 +3547,8 @@ run_cmd do
       [ (`agree.virtualCall, qVirtual 0 4 (prov 3 0) (prov 40000 0)),
         (`agree.virtualCallWrapped, qVirtualWrapped 0 3 (prov 5 4) (prov 40001 0)),
         (`agree.vtableTypeAssocPermDup, qVtableType (prov 40007 0) 9),
+        (`agree.unsizePin, qUnsizePin 0 0 (prov 3 0)),
+        (`agree.upcastPin, qUpcastPin 3 2 (prov 3 0) (prov 40004 0)),
         (`agree.upcast, qUpcast 3 2 (prov 3 0) (prov 40004 0)),
         (`agree.sizeAlign, qSizeAlign (prov 40000 0) 0) ]
     for (n, q) in agreeQs do
@@ -3269,6 +3598,10 @@ run_cmd do
           (qVirtualWrapped 0 3 (prov 5 4) (prov 40001 0)) (oMethod 2 (prov 5 0))),
         ("upcast forged to keep the Sub vtable", forgedObs `upcastKeepsSub
           (qUpcast 3 2 (prov 3 0) (prov 40004 0)) (oWide (prov 3 0) (prov 40004 0))),
+        ("Pin unsize forged with wrong vtable", forgedObs `pinUnsizeWrongVt
+          (qUnsizePin 1 0 (prov 5 4)) (oWide (prov 5 4) (prov 40000 0))),
+        ("Pin upcast forged to keep the Sub vtable", forgedObs `pinUpcastKeepsSub
+          (qUpcastPin 3 2 (prov 3 0) (prov 40004 0)) (oWide (prov 3 0) (prov 40004 0))),
         ("fat-to-thin forged to return the vtable", forgedObs `thinIsVtable
           (qPtrToPtr (prov 5 4) (prov 40001 0)) (oThin (prov 40001 0))),
         ("ill-typed 0 = 1", .thmDecl {
@@ -3322,7 +3655,7 @@ run_cmd do
           if a == ``Classical.choice then
             throwError "cross-root constructive audit failure: {n} unexpectedly uses Classical.choice"
         choiceFreeBridge := choiceFreeBridge + 1
-    unless choiceFreeBridge ≥ 40 do
+    unless choiceFreeBridge ≥ 46 do
       throwError "cross-root constructive audit vacuous: only {choiceFreeBridge} choice-free decls"
     unless !(← collectAxioms ``sorryAx).all isStdAx do
       throwError "cross-root self-test: sorryAx was not detected"
@@ -3365,6 +3698,7 @@ run_cmd do
         `Miri.Interpreter.VirtualCalls.pointerPlace,
         `Miri.Interpreter.VirtualCalls.nonOneZstField,
         `Miri.Interpreter.DynamicLayout.sizeAndAlignFromMeta,
+        `Miri.Interpreter.Cast.unsizeInto,
         `Miri.Interpreter.Cast.unsizeIntoPointer,
         `Miri.Interpreter.Cast.ptrToPtr ]
     for req in requiredReach do
@@ -3375,9 +3709,9 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<dyn-trait-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := bridgeEnv }
-  unless addedCount = 35 && rejectedCount = 15 do
+  unless addedCount = 41 && rejectedCount = 17 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter (incl. choice-free VTableMachine.Registry + stateful VTableMachine + DispatchFromDyn), rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
+  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter (incl. choice-free Cast.unsizeInto + VTableMachine.Registry + stateful VTableMachine + DispatchFromDyn), rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
 
 /-! ## §6. Axiom and vacuity audit of the prototype and the tests -/
 
@@ -3448,16 +3782,26 @@ run_cmd do
       ``Anneal.Prototypes.DynTraitUnsizeProto.traitPredEq_assocBindings_dup,
       ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerPtrTy_hom,
       ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerCastKind_hom,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerVirtualReceiver_hom,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.Hom.lowerPinDynTarget?_hom,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercionProto_conservative,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercionProto_slice_conservative,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeCoercion_dyn_target_never_ok,
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeDynProto_failsClosed,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizePinDynProto_failsClosed,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.classifyDynUnsizeTarget?_box_and_slice,
       ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_ancestor_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_zst_dangling_ptr,
       ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValidNoTB_of_refDataValid,
       ``Anneal.Prototypes.DynTraitUnsizeProto.classifyVirtualReceiver_fail_closed,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.dynRawBorrowProto?_raw_source,
       ``Anneal.Prototypes.DynTraitUnsizeProto.dynRawBorrowProto?_ignores_borrow_state,
       ``Anneal.Prototypes.DynTraitUnsizeProto.dynRawBorrowProto?_invalid_ref_ub,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.rangedReceiverView_allocDead_none,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.borrowAncestorChain_self_cycle_none,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.rangedReceiverView_fresh_owner_gt,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.rangedReceiverView_protectedTags_mem_iff,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.rangedReceiverView_empty_protectors,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_raw_ptr_unchecked,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_ref_ptr_iff_valid,
       ``Anneal.Prototypes.DynTraitUnsizeProto.upcastVTable?_rejects_unrelated_marker,

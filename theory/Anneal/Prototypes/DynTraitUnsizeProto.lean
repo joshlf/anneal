@@ -1001,12 +1001,18 @@ def tyKey? : RigidTy → Option String
   | .uint .u16 => some "u16"
   | .uint .u32 => some "u32"
   | .uint .u64 => some "u64"
+  | .uint .u128 => some "u128"
   | .uint .usize => some "usize"
   | .int .i8 => some "i8"
   | .int .i16 => some "i16"
   | .int .i32 => some "i32"
   | .int .i64 => some "i64"
+  | .int .i128 => some "i128"
   | .int .isize => some "isize"
+  | .float .f16 => some "f16"
+  | .float .f32 => some "f32"
+  | .float .f64 => some "f64"
+  | .float .f128 => some "f128"
   | .tuple [] => some "()"
   | _ => none
 
@@ -1024,6 +1030,35 @@ def lowerPointee : RigidTy → ProtoPointee
 def lowerPtrTy : RigidTy → Option ProtoPtrTy
   | .ref m pointee => some ⟨.ref, lowerMut m, lowerPointee pointee⟩
   | .rawPtr m pointee => some ⟨.raw, lowerMut m, lowerPointee pointee⟩
+  | _ => none
+
+/-- Virtual-call receiver class (`V2026_06_01`): `(isRef, isMut, isPin)`.
+Only pointer-to-`dyn` receivers (`&[mut] dyn Trait`, `*[const/mut] dyn Trait`)
+and `Pin<&[mut] dyn Trait>` wrappers are classified; non-`dyn` pointees and
+other wrappers (`Box<dyn Trait>`, `Rc<dyn Trait>`, unknown types) fail closed. -/
+def lowerVirtualReceiver : RigidTy → Option (Bool × Bool × Bool)
+  | .ref m (.dynamic _) => some (true, lowerMut m, false)
+  | .rawPtr _ (.dynamic _) => some (false, false, false)
+  | .adt path [.ref m (.dynamic _)] =>
+    match strEq path "core::pin::Pin" with
+    | true => some (true, lowerMut m, true)
+    | false => none
+  | _ => none
+
+/-- `Pin<&[mut] dyn Trait>` unsizing target (`V2026_06_01`): `(isMut, traitKey)`. -/
+def lowerPinDynTarget? : RigidTy → Option (Bool × String)
+  | .adt path [.ref m (.dynamic traitKey)] =>
+    match strEq path "core::pin::Pin" with
+    | true => some (lowerMut m, traitKey)
+    | false => none
+  | _ => none
+
+/-- Inner pointer type of a `Pin<P>` source (`V2026_06_01`). -/
+def lowerPinPtrSource? : RigidTy → Option ProtoPtrTy
+  | .adt path [inner] =>
+    match strEq path "core::pin::Pin" with
+    | true => lowerPtrTy inner
+    | false => none
   | _ => none
 
 /-- Coercion class of a cast kind (`V2026_06_01`): `none` on a cast that is not
@@ -1053,12 +1088,18 @@ def tyKey? : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option String
   | .uint .u16 => some "u16"
   | .uint .u32 => some "u32"
   | .uint .u64 => some "u64"
+  | .uint .u128 => some "u128"
   | .uint .usize => some "usize"
   | .int .i8 => some "i8"
   | .int .i16 => some "i16"
   | .int .i32 => some "i32"
   | .int .i64 => some "i64"
+  | .int .i128 => some "i128"
   | .int .isize => some "isize"
+  | .float .f16 => some "f16"
+  | .float .f32 => some "f32"
+  | .float .f64 => some "f64"
+  | .float .f128 => some "f128"
   | .tuple [] => some "()"
   | _ => none
 
@@ -1076,6 +1117,33 @@ def lowerPointee : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → ProtoPointee
 def lowerPtrTy : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option ProtoPtrTy
   | .ref m pointee => some ⟨.ref, lowerMut m, lowerPointee pointee⟩
   | .rawPtr m pointee => some ⟨.raw, lowerMut m, lowerPointee pointee⟩
+  | _ => none
+
+/-- Virtual-call receiver class (`V2026_08_01`): `(isRef, isMut, isPin)`. -/
+def lowerVirtualReceiver :
+    Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option (Bool × Bool × Bool)
+  | .ref m (.dynamic _) => some (true, lowerMut m, false)
+  | .rawPtr _ (.dynamic _) => some (false, false, false)
+  | .adt path [.ref m (.dynamic _)] =>
+    match strEq path "core::pin::Pin" with
+    | true => some (true, lowerMut m, true)
+    | false => none
+  | _ => none
+
+/-- `Pin<&[mut] dyn Trait>` unsizing target (`V2026_08_01`): `(isMut, traitKey)`. -/
+def lowerPinDynTarget? : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option (Bool × String)
+  | .adt path [.ref m (.dynamic traitKey)] =>
+    match strEq path "core::pin::Pin" with
+    | true => some (lowerMut m, traitKey)
+    | false => none
+  | _ => none
+
+/-- Inner pointer type of a `Pin<P>` source (`V2026_08_01`). -/
+def lowerPinPtrSource? : Trusted.Rustc.V2026_08_01.MirAst.RigidTy → Option ProtoPtrTy
+  | .adt path [inner] =>
+    match strEq path "core::pin::Pin" with
+    | true => lowerPtrTy inner
+    | false => none
   | _ => none
 
 /-- Coercion class of a cast kind (`V2026_08_01`). -/
@@ -1112,12 +1180,18 @@ def homPointee? : V2026_06_01.MirAst.RigidTy → Option V2026_08_01.MirAst.Rigid
   | .uint .u16 => some (.uint .u16)
   | .uint .u32 => some (.uint .u32)
   | .uint .u64 => some (.uint .u64)
+  | .uint .u128 => some (.uint .u128)
   | .uint .usize => some (.uint .usize)
   | .int .i8 => some (.int .i8)
   | .int .i16 => some (.int .i16)
   | .int .i32 => some (.int .i32)
   | .int .i64 => some (.int .i64)
+  | .int .i128 => some (.int .i128)
   | .int .isize => some (.int .isize)
+  | .float .f16 => some (.float .f16)
+  | .float .f32 => some (.float .f32)
+  | .float .f64 => some (.float .f64)
+  | .float .f128 => some (.float .f128)
   | .tuple [] => some (.tuple [])
   | .str => some .str
   | .slice _ => some (.slice (.tuple []))
@@ -1135,6 +1209,14 @@ def homPtrTy? : V2026_06_01.MirAst.RigidTy → Option V2026_08_01.MirAst.RigidTy
     | some p => some (.rawPtr (homMut m) p)
     | none => none
   | _ => none
+
+/-- Homologous pointer or `Pin<P>` receiver/coercion type. -/
+def homRecvTy? : V2026_06_01.MirAst.RigidTy → Option V2026_08_01.MirAst.RigidTy
+  | .adt path [inner] =>
+    match homPtrTy? inner with
+    | some p => some (.adt path [p])
+    | none => none
+  | ty => homPtrTy? ty
 
 /-- Homologous cast kind (total: the two dialects have the same cast kinds). -/
 def homCastKind : V2026_06_01.MirAst.CastKind → V2026_08_01.MirAst.CastKind
@@ -1185,25 +1267,138 @@ theorem lowerPtrTy_hom {t : V2026_06_01.MirAst.RigidTy} {t' : V2026_08_01.MirAst
       simp only [V08.lowerPtrTy, V06.lowerPtrTy, lowerMut_hom, lowerPointee_hom hp]
   | _ => simp [homPtrTy?] at h
 
+/-- **Dialect invariance of virtual-receiver classification** (covering
+`&[mut] dyn`, `*[const/mut] dyn`, `Pin<&[mut] dyn>`, and fail-closed wrappers). -/
+theorem lowerVirtualReceiver_hom
+    {t : V2026_06_01.MirAst.RigidTy} {t' : V2026_08_01.MirAst.RigidTy}
+    (h : homRecvTy? t = some t') :
+    V08.lowerVirtualReceiver t' = V06.lowerVirtualReceiver t := by
+  cases t with
+  | ref m pointee =>
+    simp only [homRecvTy?, homPtrTy?] at h
+    cases hp : homPointee? pointee with
+    | none => rw [hp] at h; cases h
+    | some p =>
+      rw [hp] at h; cases h
+      unfold homPointee? at hp
+      split at hp <;> first
+        | (cases hp; simp only [V08.lowerVirtualReceiver, V06.lowerVirtualReceiver, lowerMut_hom])
+        | (cases hp; rfl)
+        | cases hp
+  | rawPtr m pointee =>
+    simp only [homRecvTy?, homPtrTy?] at h
+    cases hp : homPointee? pointee with
+    | none => rw [hp] at h; cases h
+    | some p =>
+      rw [hp] at h; cases h
+      unfold homPointee? at hp
+      split at hp <;> first | (cases hp; rfl) | cases hp
+  | adt path args =>
+    cases args with
+    | nil => simp [homRecvTy?, homPtrTy?] at h
+    | cons inner rest =>
+      cases rest with
+      | cons _ _ => simp [homRecvTy?, homPtrTy?] at h
+      | nil =>
+        simp only [homRecvTy?] at h
+        cases hi : homPtrTy? inner with
+        | none => rw [hi] at h; cases h
+        | some p =>
+          rw [hi] at h; cases h
+          cases inner with
+          | ref m pointee =>
+            simp only [homPtrTy?] at hi
+            cases hp : homPointee? pointee with
+            | none => rw [hp] at hi; cases hi
+            | some q =>
+              rw [hp] at hi; cases hi
+              unfold homPointee? at hp
+              split at hp <;> first
+                | (cases hp; simp only [V08.lowerVirtualReceiver, V06.lowerVirtualReceiver, lowerMut_hom])
+                | (cases hp; rfl)
+                | cases hp
+          | rawPtr m pointee =>
+            simp only [homPtrTy?] at hi
+            cases hp : homPointee? pointee with
+            | none => rw [hp] at hi; cases hi
+            | some q => rw [hp] at hi; cases hi; rfl
+          | _ => simp [homPtrTy?] at hi
+  | _ => simp [homRecvTy?, homPtrTy?] at h
+
+/-- **Dialect invariance of `Pin` unsizing target and source lowering.** -/
+theorem lowerPinDynTarget?_hom
+    {t : V2026_06_01.MirAst.RigidTy} {t' : V2026_08_01.MirAst.RigidTy}
+    (h : homRecvTy? t = some t') :
+    V08.lowerPinDynTarget? t' = V06.lowerPinDynTarget? t ∧
+    V08.lowerPinPtrSource? t' = V06.lowerPinPtrSource? t := by
+  cases t with
+  | adt path args =>
+    cases args with
+    | nil => simp [homRecvTy?, homPtrTy?] at h
+    | cons inner rest =>
+      cases rest with
+      | cons _ _ => simp [homRecvTy?, homPtrTy?] at h
+      | nil =>
+        simp only [homRecvTy?] at h
+        cases hi : homPtrTy? inner with
+        | none => rw [hi] at h; cases h
+        | some p =>
+          rw [hi] at h; cases h
+          constructor
+          · cases inner with
+            | ref m pointee =>
+              simp only [homPtrTy?] at hi
+              cases hp : homPointee? pointee with
+              | none => rw [hp] at hi; cases hi
+              | some q =>
+                rw [hp] at hi; cases hi
+                unfold homPointee? at hp
+                split at hp <;> first
+                  | (cases hp; simp only [V08.lowerPinDynTarget?, V06.lowerPinDynTarget?, lowerMut_hom])
+                  | (cases hp; rfl)
+                  | cases hp
+            | rawPtr m pointee =>
+              simp only [homPtrTy?] at hi
+              cases hp : homPointee? pointee with
+              | none => rw [hp] at hi; cases hi
+              | some q => rw [hp] at hi; cases hi; rfl
+            | _ => simp [homPtrTy?] at hi
+          · simp only [V08.lowerPinPtrSource?, V06.lowerPinPtrSource?, lowerPtrTy_hom hi]
+  | ref m pointee =>
+    simp only [homRecvTy?, homPtrTy?] at h
+    cases hp : homPointee? pointee with
+    | none => rw [hp] at h; cases h
+    | some p => rw [hp] at h; cases h; exact ⟨rfl, rfl⟩
+  | rawPtr m pointee =>
+    simp only [homRecvTy?, homPtrTy?] at h
+    cases hp : homPointee? pointee with
+    | none => rw [hp] at h; cases h
+    | some p => rw [hp] at h; cases h; exact ⟨rfl, rfl⟩
+  | _ => simp [homRecvTy?, homPtrTy?] at h
+
 /-- The homologue exists whenever the `V2026_06_01` adapter classifies the
 pointee: the translation is total on the pointees the rules act on. -/
 theorem homPointee?_isSome_of_classified (t : V2026_06_01.MirAst.RigidTy)
     (h : (match V06.lowerPointee t with | .opaque => false | _ => true) = true) :
     (homPointee? t).isSome = true := by
-  unfold homPointee?
-  split <;> first | rfl | skip
-  rename_i h1 h2 h3 h4 h5 h6 h7 h8 h9 h10 h11 h12 h13 h14 h15 h16 h17
-  unfold V06.lowerPointee at h
-  split at h
-  all_goals first
-    | exact (h16 _ rfl).elim
-    | exact (h15 rfl).elim
-    | exact (h17 _ rfl).elim
-    | (cases h; done)
-    | (exfalso
-       rename_i k heq
-       unfold V06.tyKey? at heq
-       split at heq <;> first | (simp_all; done) | cases heq)
+  cases t with
+  | bool => rfl
+  | char => rfl
+  | str => rfl
+  | slice _ => rfl
+  | dynamic _ => rfl
+  | uint w => cases w <;> rfl
+  | int w => cases w <;> rfl
+  | float w => cases w <;> rfl
+  | adt path args =>
+    cases args with
+    | nil => rfl
+    | cons _ _ => cases h
+  | tuple fields =>
+    cases fields with
+    | nil => rfl
+    | cons _ _ => cases h
+  | _ => cases h
 
 end Hom
 
@@ -1616,6 +1811,127 @@ def evalUnsizeDynProto
             | some src =>
               unsizeDynValue vt ptrBytes dstKind dstMut dstPred src v locals' mem localDecls
                 layouts
+
+/-- Unwrap a single-field `Pin` aggregate `.aggregate 0 [inner]`, apply
+`unsizeDynValue` to `inner`, and re-wrap the resulting wide pointer in
+`.aggregate 0 [wide]`. Rejects `.uninit` with `.ub` and unexpected non-`Pin`
+runtime shapes with `.unsupported`. -/
+def unsizePinValue
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (dstKind : ProtoPtrKind) (dstMut : Bool)
+    (dstPred : ProtoTraitPred) (src : ProtoPtrTy) (v : Value)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : RvalueEvalResult :=
+  match v with
+  | .uninit => .ub
+  | .aggregate 0 [inner] =>
+    match unsizeDynValue vt ptrBytes dstKind dstMut dstPred src inner locals mem localDecls layouts with
+    | .ok wide locals' mem' => .ok (.aggregate 0 [wide]) locals' mem'
+    | .ub => .ub
+    | .unsupported => .unsupported
+  | _ => .unsupported
+
+/-- `CastKind.pointerCoercion "Unsize"` targeting `core::pin::Pin<&[mut] dyn Trait>`
+(from `Pin<&[mut] Concrete>` or `Pin<&[mut] dyn Sub>`). Enforces the same
+fail-closed environment/predicate gates as `evalUnsizeDynProto` before
+evaluating the operand. -/
+def evalUnsizePinDynProto
+    (vt : ProtoVTableTable) (dstMut : Bool) (traitKey : String)
+    (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) : RvalueEvalResult :=
+  let ptrBytes := layoutPointerBytes layouts
+  match lookupDynPred vt.dynTypes traitKey with
+  | none => .unsupported
+  | some dstPred =>
+    match dstPred.failsClosed with
+    | true => .unsupported
+    | false =>
+      match vtableEnvOk ptrBytes vt mem with
+      | false => .unsupported
+      | true =>
+        match
+          evalOperand locals op mem.borrows mem.globals layouts mem.callerLocals localDecls
+            mem.callStack
+        with
+        | .ub => .ub
+        | .unsupported => .unsupported
+        | .ok v locals' =>
+          match operandTy localDecls layouts op with
+          | none => .unsupported
+          | some srcTy =>
+            match V06.lowerPinPtrSource? srcTy.kind with
+            | none => .unsupported
+            | some src =>
+              unsizePinValue vt ptrBytes .ref dstMut dstPred src v locals' mem localDecls layouts
+
+/-- Does `ty` contain an unsized trait object `.dynamic _` in a `CoerceUnsized`
+position (excluding slice targets `&[T]`/`*const [T]`, which belong to
+array-to-slice unsizing)? Bounded by `fuel` for total structural recursion. -/
+def rigidTyHasUnsizedDyn : Nat → RigidTy → Bool
+  | 0, _ => false
+  | fuel + 1, ty =>
+    match ty with
+    | .dynamic _ => true
+    | .ref _ (.slice _) | .rawPtr _ (.slice _) => false
+    | .ref _ inner | .rawPtr _ inner => rigidTyHasUnsizedDyn fuel inner
+    | .adt _ args | .tuple args => args.any (rigidTyHasUnsizedDyn fuel)
+    | _ => false
+
+/-- Classification of a `PointerCoercion("Unsize")` target type for
+`stepMirFnProto`:
+* `.ptr`: direct `&[mut] dyn Trait` or `*[const/mut] dyn Trait`;
+* `.pinRef`: `core::pin::Pin<&[mut] dyn Trait>`;
+* `.unsupportedDynAdt`: any other `CoerceUnsized` target containing an unsized
+  trait object (`Box<dyn Trait>`, `Arc<dyn Trait>`, `Pin<Box<dyn Trait>>`,
+  `&Wrapper<dyn Trait>`, `&(u32, dyn Trait)`), which MUST fail closed with
+  `.unsupported` rather than falling through to `Trusted`'s slice-only
+  `evalUnsizeCoercion` (which would fault false-positive `.ub`). -/
+inductive DynUnsizeTarget : Type where
+  | ptr (kind : ProtoPtrKind) (isMut : Bool) (traitKey : String)
+  | pinRef (isMut : Bool) (traitKey : String)
+  | unsupportedDynAdt
+  deriving DecidableEq
+
+def classifyDynUnsizeTarget? (ty : RigidTy) : Option DynUnsizeTarget :=
+  match dynPtrTarget? ty with
+  | some (k, m, key) => some (.ptr k m key)
+  | none =>
+    match V06.lowerPinDynTarget? ty with
+    | some (m, key) => some (.pinRef m key)
+    | none =>
+      match rigidTyHasUnsizedDyn 8 ty with
+      | true => some .unsupportedDynAdt
+      | false => none
+
+/-- **Fail-closed `Pin` unsizing boundary.** An unresolved existential binder
+or undischarged outlives obligation on the target predicate fails closed with
+`.unsupported` for every operand and state. -/
+theorem evalUnsizePinDynProto_failsClosed
+    (vt : ProtoVTableTable) (dstMut : Bool) (traitKey : String)
+    (locals : List LocalSlot) (op : Operand) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (pred : ProtoTraitPred)
+    (hLook : lookupDynPred vt.dynTypes traitKey = some pred)
+    (hFail : pred.failsClosed = true) :
+    evalUnsizePinDynProto vt dstMut traitKey locals op mem localDecls layouts = .unsupported := by
+  unfold evalUnsizePinDynProto
+  simp only [hLook, hFail]
+
+/-- **Unsupported `CoerceUnsized` ADT targets fail closed; slice targets stay
+with `Trusted`.** `Box<dyn Trait>`, `Pin<Box<dyn Trait>>`, and
+`&Wrapper<dyn Trait>` classify as `.unsupportedDynAdt` (never falling through
+to false-positive `.ub`), whereas `&[T]` and `*const [T]` (even when `T` is
+`&dyn Trait`) classify as `none` (handled by `Trusted`'s slice unsizing). -/
+theorem classifyDynUnsizeTarget?_box_and_slice
+    (traitKey : String) (m : Mutability) (elem : RigidTy) :
+    classifyDynUnsizeTarget? (.adt "alloc::boxed::Box" [.dynamic traitKey]) =
+      some .unsupportedDynAdt ∧
+    classifyDynUnsizeTarget?
+      (.adt "core::pin::Pin" [.adt "alloc::boxed::Box" [.dynamic traitKey]]) =
+      some .unsupportedDynAdt ∧
+    classifyDynUnsizeTarget? (.ref m (.adt "Wrapper" [.dynamic traitKey])) =
+      some .unsupportedDynAdt ∧
+    classifyDynUnsizeTarget? (.ref m (.slice elem)) = none ∧
+    classifyDynUnsizeTarget? (.rawPtr m (.slice elem)) = none := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-- **Prototype replacement for `evalUnsizeCoercion`.** A reference or raw
 pointer target to a trait object uses `evalUnsizeDynProto`; every other target
@@ -2853,23 +3169,168 @@ def tbPermOf : TreeBorrowPerm → TbPermission
   | .frozen => .Frozen
   | .disabled => .Disabled
 
-open Anneal.RefFrame in
-/-- Ranged view of the receiver tag `childTag` over `[off, off + size)`: owner
-tag `0` (`Unique`), the child's parent borrow, and the child, protected iff its
-protector is active in `mem`. `none` when `childTag` or its parent is not in
-the borrow table. -/
-def rangedReceiverView (mem : Memory) (childTag off size : Nat) : Option RangedBorrowTree :=
-  match lookupBorrow mem.borrows childTag with
-  | none => none
-  | some c =>
-    match c.parentTag with
-    | none => none
-    | some pt =>
-      match lookupBorrow mem.borrows pt with
+/-- Membership in a list of natural numbers (boolean). -/
+def natMem : Nat → List Nat → Bool
+  | _, [] => false
+  | x, y :: rest => Nat.beq x y || natMem x rest
+
+/-- Maximum tag across a list of borrow entries (`0` on empty). -/
+def maxBorrowTag : List BorrowEntry → Nat
+  | [] => 0
+  | b :: rest => Nat.max b.tag (maxBorrowTag rest)
+
+theorem maxBorrowTag_ge : ∀ (bs : List BorrowEntry) (b : BorrowEntry),
+    b ∈ bs → b.tag ≤ maxBorrowTag bs
+  | [], _, h => nomatch h
+  | x :: xs, b, h => by
+    unfold maxBorrowTag
+    rcases List.mem_cons.mp h with rfl | hmem
+    · exact Nat.le_max_left _ _
+    · exact Nat.le_trans (maxBorrowTag_ge xs b hmem) (Nat.le_max_right _ _)
+
+/-- Walk the live ancestor chain from `tag` up to its root borrow (returned
+child-first: `[child, parent, ..., root]`). Returns `none` if any borrow along
+the chain is missing, has `allocDead = true`, forms a cycle (tracked in `seen`),
+or exhausts `fuel`. -/
+def borrowAncestorChain (borrows : List BorrowEntry) :
+    Nat → List Nat → Nat → Option (List BorrowEntry)
+  | 0, _, _ => none
+  | fuel + 1, seen, tag =>
+    match natMem tag seen with
+    | true => none
+    | false =>
+      match lookupBorrow borrows tag with
       | none => none
-      | some par =>
-        some (receiverTree 0 pt childTag off size (tbPermOf par.perm) (tbPermOf c.perm)
-          (isBorrowProtected mem.activeProtectors c))
+      | some b =>
+        match b.allocDead with
+        | true => none
+        | false =>
+          match b.parentTag with
+          | none => some [b]
+          | some pt =>
+            match borrowAncestorChain borrows fuel (tag :: seen) pt with
+            | none => none
+            | some ancestors => some (b :: ancestors)
+
+/-- Fresh synthetic storage-owner tag for the ranged view of `childTag`:
+strictly greater than every borrow tag in `childTag`'s live ancestor chain
+(never colliding with tag `0`, any ancestor tag, or `childTag`). -/
+def rangedReceiverOwnerTag (mem : Memory) (childTag : Nat) : Option Nat :=
+  match borrowAncestorChain mem.borrows (length mem.borrows + 1) [] childTag with
+  | none => none
+  | some chain => some (1 + maxBorrowTag chain)
+
+open Anneal.RefFrame in
+/-- Ranged Tree Borrows view of the live ancestor chain ending at `childTag`
+over `[off, off + size)`:
+* allocates a guaranteed-fresh root owner tag `1 + maxBorrowTag chain` (`Unique`,
+  never colliding with tag `0` or any borrow tag in the chain);
+* walks the full multi-hop parent chain (`owner -> root -> ... -> parent -> child`)
+  and rejects dead allocations (`allocDead = true`), missing parents, and cycles
+  with `none`;
+* preserves every active protector along the chain in `protectedTags`. -/
+def rangedReceiverView (mem : Memory) (childTag off size : Nat) : Option RangedBorrowTree :=
+  match borrowAncestorChain mem.borrows (length mem.borrows + 1) [] childTag with
+  | none => none
+  | some chain =>
+    let ownerTag := 1 + maxBorrowTag chain
+    let rootToChild := chain.reverse
+    some
+      { topology :=
+          ⟨ownerTag, none⟩ ::
+            rootToChild.map (fun b => ⟨b.tag, some (b.parentTag.getD ownerTag)⟩)
+        protectedTags :=
+          (rootToChild.filter (fun b => isBorrowProtected mem.activeProtectors b)).map (·.tag)
+        segments :=
+          [⟨off, size,
+            (ownerTag, ⟨.Unique, true⟩) ::
+              rootToChild.map (fun b => (b.tag, ⟨tbPermOf b.perm, !Nat.beq b.tag childTag⟩))⟩] }
+
+/-- **Dead allocations never yield a live ranged receiver view.** -/
+theorem rangedReceiverView_allocDead_none
+    (mem : Memory) (childTag off size : Nat) (c : BorrowEntry)
+    (hLook : lookupBorrow mem.borrows childTag = some c)
+    (hDead : c.allocDead = true) :
+    rangedReceiverView mem childTag off size = none := by
+  unfold rangedReceiverView borrowAncestorChain
+  simp only [natMem, hLook, hDead]
+
+/-- **Self-cyclic borrow entries never yield a ranged chain.** -/
+theorem borrowAncestorChain_self_cycle_none
+    (borrows : List BorrowEntry) (fuel tag : Nat) (c : BorrowEntry)
+    (hLook : lookupBorrow borrows tag = some c)
+    (hLive : c.allocDead = false)
+    (hSelf : c.parentTag = some tag) :
+    borrowAncestorChain borrows fuel [] tag = none := by
+  cases fuel with
+  | zero => rfl
+  | succ fuel' =>
+    cases fuel' with
+    | zero =>
+      unfold borrowAncestorChain
+      simp only [natMem, hLook, hLive, hSelf]
+      rfl
+    | succ fuel'' =>
+      unfold borrowAncestorChain
+      simp only [natMem, hLook, hLive, hSelf]
+      rw [borrowAncestorChain]
+      simp only [natMem, Nat.beq_refl, Bool.true_or]
+
+/-- **Guaranteed-fresh synthetic owner tag.** The synthetic owner tag is
+strictly greater than every borrow tag in the ancestor chain (zero collision
+with tag `0`, any ancestor tag, or `childTag`). -/
+theorem rangedReceiverView_fresh_owner_gt
+    (mem : Memory) (childTag : Nat) (chain : List BorrowEntry)
+    (hChain : borrowAncestorChain mem.borrows (length mem.borrows + 1) [] childTag = some chain)
+    (b : BorrowEntry) (hb : b ∈ chain) :
+    rangedReceiverOwnerTag mem childTag = some (1 + maxBorrowTag chain) ∧
+    b.tag < 1 + maxBorrowTag chain := by
+  refine ⟨by unfold rangedReceiverOwnerTag; rw [hChain], ?_⟩
+  rw [Nat.add_comm]
+  exact Nat.lt_succ_of_le (maxBorrowTag_ge chain b hb)
+
+/-- **Exact protector correspondence along the full ancestor chain.** A tag is
+in `t.protectedTags` iff it belongs to a borrow in `childTag`'s live ancestor
+chain whose protector is active in `mem.activeProtectors`. -/
+theorem rangedReceiverView_protectedTags_mem_iff
+    (mem : Memory) (childTag off size : Nat) (chain : List BorrowEntry)
+    (t : Anneal.RefFrame.RangedBorrowTree) (tag : Nat)
+    (hChain : borrowAncestorChain mem.borrows (length mem.borrows + 1) [] childTag = some chain)
+    (hView : rangedReceiverView mem childTag off size = some t) :
+    tag ∈ t.protectedTags ↔
+      ∃ b, (b ∈ chain ∧ isBorrowProtected mem.activeProtectors b = true) ∧ b.tag = tag := by
+  unfold rangedReceiverView at hView
+  rw [hChain] at hView
+  cases hView
+  simp only [List.mem_map, List.mem_filter, List.mem_reverse]
+
+private theorem isBorrowProtected_nil (b : BorrowEntry) :
+    isBorrowProtected [] b = false := by
+  unfold isBorrowProtected
+  cases b.protector <;> rfl
+
+private theorem filter_isBorrowProtected_nil :
+    ∀ (bs : List BorrowEntry), bs.filter (fun b => isBorrowProtected [] b) = []
+  | [] => rfl
+  | b :: rest => by
+    rw [List.filter_cons, isBorrowProtected_nil]
+    exact filter_isBorrowProtected_nil rest
+
+/-- **Post-return protector clearance.** Whenever `mem.activeProtectors = []`
+(e.g., after frame return in `Trusted`), the ranged view has
+`t.protectedTags = []`. -/
+theorem rangedReceiverView_empty_protectors
+    (mem : Memory) (childTag off size : Nat) (t : Anneal.RefFrame.RangedBorrowTree)
+    (hEmpty : mem.activeProtectors = [])
+    (hView : rangedReceiverView mem childTag off size = some t) :
+    t.protectedTags = [] := by
+  unfold rangedReceiverView at hView
+  cases hChain : borrowAncestorChain mem.borrows (length mem.borrows + 1) [] childTag with
+  | none => rw [hChain] at hView; cases hView
+  | some chain =>
+    rw [hChain] at hView
+    cases hView
+    simp only [hEmpty, filter_isBorrowProtected_nil, List.map]
 
 /-! ## §6. `core::ptr::addr_eq` (`rust#166144`) versus wide `==` -/
 
@@ -3502,13 +3963,8 @@ classified; non-`dyn` pointees (e.g. `&u32`, `Pin<&mut u32>`) and other
 `DispatchFromDyn` wrappers (`Box<dyn Trait>`, `Rc<dyn Trait>`, unknown types)
 fail closed with `none`. -/
 def classifyVirtualReceiver : Option Ty → Option (Bool × Bool × Bool)
-  | some { kind := .ref m (.dynamic _), .. } => some (true, V06.lowerMut m, false)
-  | some { kind := .rawPtr _ (.dynamic _), .. } => some (false, false, false)
-  | some { kind := .adt path [.ref m (.dynamic _)], .. } =>
-    match strEq path "core::pin::Pin" with
-    | true => some (true, V06.lowerMut m, true)
-    | false => none
-  | _ => none
+  | some ty => V06.lowerVirtualReceiver ty.kind
+  | none => none
 
 /-- **Receiver classification fails closed.** A wrapper receiver other than
 `Pin<&[mut] dyn _>` (for example `Box<dyn Trait>` or `Pin<&mut u32>`), a
@@ -3525,18 +3981,24 @@ theorem classifyVirtualReceiver_fail_closed (path : String) (args : List RigidTy
       (some { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic "T")], layoutIdx := idx }) =
         some (true, true, true) := by
   refine ⟨?_, rfl, rfl, rfl, ?_⟩
-  · unfold classifyVirtualReceiver
-    split
-    · rename_i h; cases h
-    · rename_i h; cases h
-    · rename_i path' m _ _ h
-      injection h with h1
-      injection h1 with h2
-      injection h2 with h3 _
-      subst h3
-      simp only [hPin]
-    · rfl
-  · unfold classifyVirtualReceiver
+  · unfold classifyVirtualReceiver V06.lowerVirtualReceiver
+    dsimp only
+    cases args with
+    | nil => rfl
+    | cons a rest =>
+      cases rest with
+      | cons _ _ =>
+        cases a with
+        | ref _ pt => cases pt <;> rfl
+        | _ => rfl
+      | nil =>
+        cases a with
+        | ref m pt =>
+          cases pt with
+          | dynamic _ => simp only [hPin]
+          | _ => rfl
+        | _ => rfl
+  · unfold classifyVirtualReceiver V06.lowerVirtualReceiver
     simp only [V06.lowerMut]
     rfl
 
@@ -3590,6 +4052,32 @@ def stepUnsizeAssignProto (vt : ProtoVTableTable) (s : MachineState) (currentBod
     | false =>
       match
         evalUnsizeCoercionProto vt s.frame.locals op targetTy s.memory currentBody.localDecls
+          currentBody.layouts
+      with
+      | .ub => MirStepNode.fail .ub
+      | .unsupported => MirStepNode.unsupported
+      | .ok v locals' mem' =>
+        match get? locals' place.local_ with
+        | none => MirStepNode.fail .ub
+        | some .dead => MirStepNode.fail .ub
+        | some _ =>
+          match set? locals' place.local_ (.init v) with
+          | some locals'' => MirStepNode.step (advanceStmt s locals'' mem')
+          | none => MirStepNode.fail .ub
+
+/-- Assignment `place = op as Pin<&[mut] dyn Trait> (PointerCoercion(Unsize))`.
+Enforces the same whole-local unborrowed destination guard as
+`stepUnsizeAssignProto`. -/
+def stepUnsizePinAssignProto (vt : ProtoVTableTable) (dstMut : Bool) (traitKey : String)
+    (s : MachineState) (currentBody : CapturedMir) (place : Place) (op : Operand) : MirStepNode :=
+  match place.projection with
+  | _ :: _ => MirStepNode.unsupported
+  | [] =>
+    match anyBorrowTargets s.memory.borrows (length s.memory.callStack) place.local_ with
+    | true => MirStepNode.unsupported
+    | false =>
+      match
+        evalUnsizePinDynProto vt dstMut traitKey s.frame.locals op s.memory currentBody.localDecls
           currentBody.layouts
       with
       | .ub => MirStepNode.fail .ub
@@ -3928,8 +4416,13 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
       | some stmt =>
         match stmt.kind with
         | .assign place (.cast (.pointerCoercion kind) op targetTy) =>
-          match strEq kind "Unsize", dynPtrTarget? targetTy.kind with
-          | true, some _ => stepUnsizeAssignProto prog.vtables s currentBody place op targetTy
+          match strEq kind "Unsize", classifyDynUnsizeTarget? targetTy.kind with
+          | true, some (.ptr _ _ _) =>
+            stepUnsizeAssignProto prog.vtables s currentBody place op targetTy
+          | true, some (.pinRef dstMut traitKey) =>
+            stepUnsizePinAssignProto prog.vtables dstMut traitKey s currentBody place op
+          | true, some .unsupportedDynAdt =>
+            MirStepNode.unsupported
           | _, _ => stepMirFn body s
         | .assign place (.rawPtr mutKind srcPlace) =>
           match
@@ -5035,8 +5528,12 @@ inductive LmQuery : Type where
   | dynLayout (vtPtr : LmPtr) (expected : Nat)
   /-- `Cast.unsizeIntoPointer` from a pointer to a sized type. -/
   | unsize (tyIdx traitIdx : Nat) (data : LmPtr)
+  /-- `Cast.unsizeInto` recursively unsizing a `Pin<*const T>` ADT to `Pin<*const dyn Trait>`. -/
+  | unsizePin (tyIdx traitIdx : Nat) (data : LmPtr)
   /-- `Cast.unsizeIntoPointer` from a trait-object pointer (upcast). -/
   | upcast (srcTrait dstTrait : Nat) (data vt : LmPtr)
+  /-- `Cast.unsizeInto` recursively upcasting `Pin<*const dyn Sub>` to `Pin<*const dyn Super>`. -/
+  | upcastPin (srcTrait dstTrait : Nat) (data vt : LmPtr)
   /-- `Cast.ptrToPtr` from a wide raw pointer to a thin raw pointer. -/
   | ptrToPtr (data ptrMeta : LmPtr)
   /-- `Cast.ptrToPtr` on an uninitialized immediate. -/
@@ -5221,6 +5718,21 @@ def protoLmRun (vt : ProtoVTableTable) : LmQuery → LmObs
         | .ub => .err .otherUb
         | .unsupported => .err .unsupported
     | _, _ => .err .other
+  | .unsizePin tyIdx traitIdx data =>
+    match get? (tyKeys vt) tyIdx, nthPred vt traitIdx with
+    | some key, some pred =>
+      match pred.failsClosed with
+      | true => .err .unsupported
+      | false =>
+        match
+          unsizePinValue vt 8 .raw false pred ⟨.raw, false, .sized key⟩
+            (.aggregate 0 [encodeDataWord 8 (dataWordOf data)]) [] emptyMemory [] emptyLayoutTable
+        with
+        | .ok (.aggregate 0 [w]) _ _ => obsOfWide w
+        | .ok _ _ _ => .err .other
+        | .ub => .err .otherUb
+        | .unsupported => .err .unsupported
+    | _, _ => .err .other
   | .upcast srcTrait dstTrait data vtp =>
     match nthPred vt srcTrait, nthPred vt dstTrait with
     | some srcPred, some dstPred =>
@@ -5229,6 +5741,18 @@ def protoLmRun (vt : ProtoVTableTable) : LmQuery → LmObs
           emptyLayoutTable
       with
       | .ok v _ _ => obsOfWide v
+      | .ub => .err (classifyVtErr vt srcPred vtp)
+      | .unsupported => .err .unsupported
+    | _, _ => .err .other
+  | .upcastPin srcTrait dstTrait data vtp =>
+    match get? vt.dynTypes srcTrait, nthPred vt dstTrait with
+    | some (srcKey, srcPred), some dstPred =>
+      match
+        unsizePinValue vt 8 .raw false dstPred ⟨.raw, false, .dyn srcKey⟩
+          (.aggregate 0 [widePtrValue data vtp]) [] emptyMemory [] emptyLayoutTable
+      with
+      | .ok (.aggregate 0 [w]) _ _ => obsOfWide w
+      | .ok _ _ _ => .err .other
       | .ub => .err (classifyVtErr vt srcPred vtp)
       | .unsupported => .err .unsupported
     | _, _ => .err .other
@@ -5361,14 +5885,17 @@ def lmCorpus : List LmQuery :=
     .dynLayout (.prov 40002 0) 0,
     .dynLayout (.prov 9 0) 0,
     .dynLayout (.int 0) 0,
-    -- unsizing from a sized type
+    -- unsizing from a sized type (direct pointers and recursive `Pin` ADTs)
     .unsize 0 0 (.prov 3 0),
     .unsize 1 0 (.prov 5 4),
     .unsize 0 1 (.prov 3 0),
     .unsize 0 0 (.int 0),                          -- null raw pointer
     .unsize 0 0 (.int 4097),                       -- misaligned dangling raw pointer
     .unsize 1 1 (.prov 5 0),                       -- no vtable captured
-    -- upcasts
+    .unsizePin 0 0 (.prov 3 0),                    -- `Cast.unsizeInto` on `Pin<*const Receiver>`
+    .unsizePin 1 0 (.prov 5 4),                    -- `Cast.unsizeInto` on `Pin<*const AltReceiver>`
+    .unsizePin 1 1 (.prov 5 0),                    -- uncaptured vtable inside `Pin`
+    -- upcasts (direct pointers and recursive `Pin` ADTs)
     .upcast 3 2 (.prov 3 0) (.prov 40004 0),       -- through `.traitVPtr`
     .upcast 4 2 (.prov 3 0) (.prov 40005 0),       -- primary-supertrait prefix-compatible
     .upcast 3 3 (.prov 3 0) (.prov 40004 0),       -- identity
@@ -5376,6 +5903,10 @@ def lmCorpus : List LmQuery :=
     .upcast 3 2 (.prov 3 0) (.prov 40000 0),       -- wrong-trait vtable
     .upcast 3 2 (.prov 3 0) (.prov 40004 8),       -- offset vtable pointer
     .upcast 3 2 (.prov 3 0) (.int 0),              -- null vtable pointer
+    .upcastPin 3 2 (.prov 3 0) (.prov 40004 0),    -- `Cast.unsizeInto` `Pin` upcast via `.traitVPtr`
+    .upcastPin 4 2 (.prov 3 0) (.prov 40005 0),    -- `Cast.unsizeInto` `Pin` upcast via prefix
+    .upcastPin 3 3 (.prov 3 0) (.prov 40004 0),    -- `Cast.unsizeInto` `Pin` identity (`copyNoValidate`)
+    .upcastPin 3 2 (.prov 3 0) (.prov 40000 0),    -- `Cast.unsizeInto` `Pin` wrong-trait vtable
     -- fat-to-thin
     .ptrToPtr (.prov 3 0) (.prov 40000 0),
     .ptrToPtr (.prov 5 4) (.prov 40001 0),
@@ -5407,20 +5938,25 @@ def lmCorpus : List LmQuery :=
 def lmAuthorityCheck (auth : LmDynAuthority) : Bool :=
   lmCorpus.all (fun q => decide (auth.run corpusTable q = protoLmRun corpusTable q))
 
-/-- `Cast.unsizeIntoPointer` pairs the data pointer, unchanged, with the base
-pointer of the captured vtable; a null or dangling raw data pointer is paired
-the same way, and an uncaptured vtable is unsupported. -/
+/-- `Cast.unsizeIntoPointer` and recursive `Cast.unsizeInto` (`Pin` ADT) pair
+the data pointer, unchanged, with the base pointer of the captured vtable; a
+null or dangling raw data pointer is paired the same way, and an uncaptured
+vtable is unsupported. -/
 def unsizeLaw : List (LmQuery × LmObs) :=
   [ (.unsize 0 0 (.prov 3 0), .wide (.prov 3 0) (.prov 40000 0)),
     (.unsize 1 0 (.prov 5 4), .wide (.prov 5 4) (.prov 40001 0)),
     (.unsize 0 1 (.prov 3 0), .wide (.prov 3 0) (.prov 40002 0)),
     (.unsize 0 0 (.int 0), .wide (.int 0) (.prov 40000 0)),
     (.unsize 0 0 (.int 4097), .wide (.int 4097) (.prov 40000 0)),
-    (.unsize 1 1 (.prov 5 0), .err .unsupported) ]
+    (.unsize 1 1 (.prov 5 0), .err .unsupported),
+    (.unsizePin 0 0 (.prov 3 0), .wide (.prov 3 0) (.prov 40000 0)),
+    (.unsizePin 1 0 (.prov 5 4), .wide (.prov 5 4) (.prov 40001 0)),
+    (.unsizePin 1 1 (.prov 5 0), .err .unsupported) ]
 
-/-- A `dyn Sub -> dyn Super` upcast selects the supertrait vtable through the
-`.traitVPtr` slot or the primary-supertrait prefix, dropping auto traits and
-identity coercions keep the vtable; an invalid incoming vtable pointer is UB. -/
+/-- A `dyn Sub -> dyn Super` upcast (direct or inside `Pin`) selects the
+supertrait vtable through the `.traitVPtr` slot or the primary-supertrait
+prefix, dropping auto traits and identity coercions keep the vtable; an invalid
+incoming vtable pointer is UB. -/
 def upcastLaw : List (LmQuery × LmObs) :=
   [ (.upcast 3 2 (.prov 3 0) (.prov 40004 0), .wide (.prov 3 0) (.prov 40003 0)),
     (.upcast 4 2 (.prov 3 0) (.prov 40005 0), .wide (.prov 3 0) (.prov 40003 0)),
@@ -5428,7 +5964,11 @@ def upcastLaw : List (LmQuery × LmObs) :=
     (.upcast 5 0 (.prov 3 0) (.prov 40000 0), .wide (.prov 3 0) (.prov 40000 0)),
     (.upcast 3 2 (.prov 3 0) (.prov 40000 0), .err .invalidVTableTrait),
     (.upcast 3 2 (.prov 3 0) (.prov 40004 8), .err .invalidVTablePointer),
-    (.upcast 3 2 (.prov 3 0) (.int 0), .err .invalidVTablePointer) ]
+    (.upcast 3 2 (.prov 3 0) (.int 0), .err .invalidVTablePointer),
+    (.upcastPin 3 2 (.prov 3 0) (.prov 40004 0), .wide (.prov 3 0) (.prov 40003 0)),
+    (.upcastPin 4 2 (.prov 3 0) (.prov 40005 0), .wide (.prov 3 0) (.prov 40003 0)),
+    (.upcastPin 3 3 (.prov 3 0) (.prov 40004 0), .wide (.prov 3 0) (.prov 40004 0)),
+    (.upcastPin 3 2 (.prov 3 0) (.prov 40000 0), .err .invalidVTableTrait) ]
 
 /-- Dynamic size and alignment come from the vtable, through both
 `VTable.getSizeAndAlignRead` and `DynamicLayout.sizeAndAlignFromMeta`. -/
