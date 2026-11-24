@@ -891,6 +891,44 @@ theorem contract_divergence_set_exact (c : AtomicDualContract) (m : AtomicMemory
   · simp only [hYes, Bool.true_or, Bool.not_true, Bool.false_or, Bool.true_and] at h2
     exact of_decide_eq_true h2
 
+private theorem casOldProjection_ite {P : Prop} [d : Decidable P] (a b : AtomicAccessOutcome)
+    (ha : casOldProjection a = a) (hb : casOldProjection b = b) :
+    casOldProjection (if P then a else b) = if P then a else b := by cases d <;> assumption
+/-- Erasing the synthesized flag from `obsMrCas` recovers raw `obsMrScalar` identically. -/
+theorem casOldProjection_obsMrCas {M P : Type} [Memory M] (width expected : Nat)
+    (getAllocs : Machine M → List (List (AbstractByte P))) (r : Interp (Value M × Machine M)) :
+    casOldProjection (obsMrCas width expected getAllocs r) = obsMrScalar width getAllocs r := by
+  unfold obsMrCas; rw [casOldProjection_casFlagSynth]; unfold obsMrScalar
+  cases r with
+  | error s => cases s <;> rfl
+  | ok vm =>
+    rcases vm with ⟨v, m⟩; cases v with
+    | Int _ => dsimp only; exact casOldProjection_ite _ _ rfl (by cases (getAllocs m).head?.bind (decodeLeBytes width) <;> rfl)
+    | _ => rfl
+/-- Observe a signed/unsigned MiniRust scalar as its `width`-byte two's-complement bit pattern. -/
+def obsMrTwosComp {M P : Type} [Memory M] (width : Nat) (getAllocs : Machine M → List (List (AbstractByte P))) :
+    Interp (Value M × Machine M) → AtomicAccessOutcome
+  | .error s => classifyMrStop s
+  | .ok (.Int ret, m) =>
+    let bits : Nat := if ret < 0 then (ret + ((2 ^ (8 * width) : Nat) : Int)).toNat else ret.toNat
+    match (getAllocs m).head?.bind (decodeLeBytes width) with | some p => .okScalar bits p | none => .invalidOrUnsupported
+  | .ok (_, _) => .invalidOrUnsupported
+/-- **Signed vs. unsigned polarity & `usize` parity on `Mach`/`MachTB`**: `IntType.usize_ty = itU64`,
+`usize` `xadd`/`cas`, signed `-5` (`0xFFFFFFFB`) RMWs, and `0xFFFFFFFB + 5` polarity flip. -/
+theorem mr_signed_unsigned_polarity_and_usize_parity :
+    let bmN := bmWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF]); let tbN := tbWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF]);
+    let bm5 := bmWith (initBytes [5, 0, 0, 0, 0, 0, 0, 0]); let tb5 := tbWith (initBytes [5, 0, 0, 0, 0, 0, 0, 0]);
+    IntType.usize_ty = itU64 ∧ obsMrScalar 8 bmAllocs (bmRmw bm5 bmPtr .Add 3 IntType.usize_ty) = .okScalar 5 8 ∧
+    obsMrScalar 8 tbAllocs (tbRmw tb5 tbPtr .Add 3 IntType.usize_ty) = .okScalar 5 8 ∧
+    obsMrCas 8 5 bmAllocs (bmCas bm5 bmPtr 5 9 IntType.usize_ty) = .okCas 5 true 9 ∧ obsMrCas 8 5 tbAllocs (tbCas tb5 tbPtr 5 9 IntType.usize_ty) = .okCas 5 true 9 ∧
+    obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .Add 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFFE ∧ obsMrTwosComp 4 tbAllocs (tbRmw tbN tbPtr .Add 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFFE ∧
+    obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .Sub 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFF8 ∧ obsMrTwosComp 4 tbAllocs (tbRmw tbN tbPtr .Sub 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFF8 ∧
+    obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .BitAnd 3 itI32) = .okScalar 0xFFFFFFFB 3 ∧ obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .BitOr 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFFB ∧ obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .BitXor 3 itI32) = .okScalar 0xFFFFFFFB 0xFFFFFFF8 ∧
+    obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .Add 5 itI32) = .okScalar 0xFFFFFFFB 0 ∧ obsMrTwosComp 4 tbAllocs (tbRmw tbN tbPtr .Add 5 itI32) = .okScalar 0xFFFFFFFB 0 ∧
+    obsMrTwosComp 4 bmAllocs (bmRmw bmN bmPtr .Add 5 itU32) = .specPanic ∧ obsMrTwosComp 4 tbAllocs (tbRmw tbN tbPtr .Add 5 itU32) = .specPanic ∧
+    (match bmLoad bmN bmPtr (.Int itI32) with | .ok (.Int v, _) => decide (v < 3) | _ => false) = true ∧
+    (match bmLoad bmN bmPtr (.Int itU32) with | .ok (.Int v, _) => decide (v < 3) | _ => false) = false := by decide +kernel
+
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
 section AxiomAudit
@@ -906,7 +944,8 @@ run_cmd do
     , ``atomicOutcomeCodec_tight
     , ``atomicOutcomeCodec_encode_injective
     , ``atomicOutcomeCodec_decode_injective_on_valid
-    , ``lmAuthorityCheck_sound ]
+    , ``lmAuthorityCheck_sound
+    , ``casOldProjection_casFlagSynth ]
   for c in constructiveDecls do
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
@@ -932,7 +971,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 25 then
+  if theorems < 27 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 

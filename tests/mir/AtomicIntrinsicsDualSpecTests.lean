@@ -281,7 +281,9 @@ run_cmd do
                      `contract_overflow_divergence,
                      `contract_readonly_alloc_divergence,
                      `contract_mode_sensitivity_joint,
-                     `contract_mr_universal_laws] do
+                     `contract_mr_universal_laws,
+                     `contract_cas_return_shape,
+                     `contract_divergence_set_exact] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
       let outName := ns ++ projName
@@ -362,8 +364,8 @@ run_cmd do
           throwError "cross-root: {n} depends on non-standard axiom {a}"
         crAxioms := crAxioms.insert a
 
-    -- Verify key LeanMiriSpec.AtomicIntrinsicsLM theorems are present, non-trivial, and pure.
-    let lmKeyThms : List Lean.Name :=
+    -- Verify key LeanMiriSpec.AtomicIntrinsicsLM and AtomicIntrinsicsDualSpec theorems are pure.
+    let keyThms : List Lean.Name :=
       [ lmNs ++ `lmAtomicHooks_bind_eq_exec,
         lmNs ++ `atomic_tb_check_bridges_vendored_performBorrowAccessRange,
         lmNs ++ `allowDataRaces_none,
@@ -393,21 +395,24 @@ run_cmd do
         lmNs ++ `lmAtomicObserve_table,
         lmNs ++ `rmwValue_universal_laws, lmNs ++ `fence_without_global_noop,
         lmNs ++ `eval_u128_in_bounds_mutable_load_not_ub,
-        lmNs ++ `lmAtomicObserve_fastPath_invariant, dsNs ++ `casOldProjection_casFlagSynth,
+        lmNs ++ `lmAtomicObserve_fastPath_invariant,
+        lmNs ++ `pointerBinary_laws, lmNs ++ `eval_signed_unsigned_polarity_and_usize,
+        dsNs ++ `casOldProjection_casFlagSynth, dsNs ++ `casOldProjection_obsMrCas,
         dsNs ++ `contract_cas_return_shape, dsNs ++ `contract_divergence_set_exact,
         dsNs ++ `mr_universal_cas_failure_returns_before,
         dsNs ++ `mr_universal_rmw_out_of_range_specPanic,
-        dsNs ++ `mr_universal_atomicLoad_size_too_big_ub ]
-    for n in lmKeyThms do
+        dsNs ++ `mr_universal_atomicLoad_size_too_big_ub,
+        dsNs ++ `mr_signed_unsigned_polarity_and_usize_parity ]
+    for n in keyThms do
       let some (.thmInfo v) := env.find? n
-        | throwError "cross-root: required LM theorem {n} missing"
+        | throwError "cross-root: required theorem {n} missing"
       if isTrivialProp v.type then
-        throwError "cross-root: LM theorem {n} is trivial"
+        throwError "cross-root: theorem {n} is trivial"
       for a in ← collectAxioms n do
         if a == ``sorryAx || a == ``Lean.ofReduceBool || a == ``Lean.trustCompiler then
-          throwError "cross-root: LM theorem {n} depends on forbidden axiom {a}"
+          throwError "cross-root: theorem {n} depends on forbidden axiom {a}"
         unless isStdAx a do
-          throwError "cross-root: LM theorem {n} depends on non-standard axiom {a}"
+          throwError "cross-root: theorem {n} depends on non-standard axiom {a}"
         crAxioms := crAxioms.insert a
 
     -- Self-tests: auditor MUST detect sorryAx, Lean.ofReduceBool, Lean.trustCompiler,
@@ -424,8 +429,8 @@ run_cmd do
       throwError "cross-root self-test: trivial theorem detector failed"
 
     -- Transitive constant reachability BFS from `closedAtomicDualContract` to BOTH
-    -- MiniRust (`evalIntrinsic` / `evalIntrinsicM`) AND vendored Miri (`IntrinsicAtomic.eval` /
-    -- `AtomicMachine.bind` / `PlaceMachine.memoryAccess` / `BorrowTree.performBorrowAccessRange`).
+    -- MiniRust (`evalIntrinsic` / `evalIntrinsicM`) AND all 11 public defs of vendored
+    -- `Miri.Interpreter.IntrinsicAtomic` + `AtomicMachine.bind` + `PlaceMachine.memoryAccess`.
     let mut reach : NameSet := {}
     let mut todo : Array Lean.Name := #[contractName]
     while !todo.isEmpty do
@@ -445,6 +450,14 @@ run_cmd do
         lmNs ++ `lmAtomicObserve,
         lmNs ++ `lmAtomicObserveWith, lmNs ++ `lmTreeBorrowsDiagnostic,
         `Miri.Interpreter.IntrinsicAtomic.allowDataRaces,
+        `Miri.Interpreter.IntrinsicAtomic.access,
+        `Miri.Interpreter.IntrinsicAtomic.dispatch,
+        `Miri.Interpreter.IntrinsicAtomic.load,
+        `Miri.Interpreter.IntrinsicAtomic.store,
+        `Miri.Interpreter.IntrinsicAtomic.rmwValue,
+        `Miri.Interpreter.IntrinsicAtomic.rmw,
+        `Miri.Interpreter.IntrinsicAtomic.compareExchange,
+        `Miri.Interpreter.IntrinsicAtomic.fence,
         `Miri.Interpreter.IntrinsicAtomic.eval,
         `Miri.Interpreter.AtomicMachine.bind,
         `Miri.Interpreter.PlaceMachine.memoryAccess,
@@ -452,6 +465,19 @@ run_cmd do
     for req in requiredReach do
       unless reach.contains req do
         throwError "cross-root reachability failure: closedAtomicDualContract does not reach {req}"
+    -- Verify 11th `IntrinsicAtomic` public def (`pointerBinary`) is reached from `pointerBinary_laws`.
+    let mut pbReach : NameSet := {}
+    let mut pbTodo : Array Lean.Name := #[lmNs ++ `pointerBinary_laws]
+    while !pbTodo.isEmpty do
+      let n := pbTodo.back!
+      pbTodo := pbTodo.pop
+      if pbReach.contains n then continue
+      pbReach := pbReach.insert n
+      if let some ci := env.find? n then
+        for d in ci.getUsedConstantsAsSet do
+          if !pbReach.contains d then pbTodo := pbTodo.push d
+    unless pbReach.contains `Miri.Interpreter.IntrinsicAtomic.pointerBinary do
+      throwError "cross-root reachability failure: pointerBinary_laws does not reach IntrinsicAtomic.pointerBinary"
     -- `borrowTracker = none` at runtime (contract reaches `performBorrowAccessRange` only via a
     -- dead branch), so the bridge theorem's *statement* must tie it to the executed diagnostic.
     let tbBridge := lmNs ++ `atomic_tb_check_bridges_vendored_performBorrowAccessRange
@@ -467,7 +493,7 @@ run_cmd do
     { fileName := "<atomics-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ←
     liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 11 && rejectedCount = 6 do
+  unless addedCount = 13 && rejectedCount = 6 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"atomics cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls, reached MiniRust+Miri, axioms {crAxioms}"
 
@@ -483,7 +509,8 @@ run_cmd do
       ``Anneal.Mir.AtomicIntrinsicsDualSpec.atomicOutcomeCodec_decode_injective_on_valid,
       ``Anneal.Mir.AtomicIntrinsicsDualSpec.AtomicMemoryMode.of_toLmTreeBorrows,
       ``Anneal.Mir.AtomicIntrinsicsDualSpec.AtomicMemoryMode.to_ofLmTreeBorrows,
-      ``Anneal.Mir.AtomicIntrinsicsDualSpec.lmAuthorityCheck_sound ]
+      ``Anneal.Mir.AtomicIntrinsicsDualSpec.lmAuthorityCheck_sound,
+      ``Anneal.Mir.AtomicIntrinsicsDualSpec.casOldProjection_casFlagSynth ]
   for d in constructiveDecls do
     let axs ← liftCoreM <| Lean.collectAxioms d
     for a in axs do

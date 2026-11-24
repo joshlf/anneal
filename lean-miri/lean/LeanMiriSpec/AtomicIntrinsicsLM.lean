@@ -1425,6 +1425,57 @@ theorem lmAtomicObserve_fastPath_invariant (fastPath tb : Bool) (idx : Nat) (hId
   · rfl
   · exact hFast.trans (lmAtomicObserve_table tb idx hIdx).symm
 
+/-! ### §6.1 `IntrinsicAtomic.pointerBinary` Laws, Signed/Unsigned Polarity & `usize` Parity -/
+
+/-- Construct a pointer `RvalueImmTy Provenance` with concrete provenance and address. -/
+def mkPtrImm (addr : UInt64) (prov : Provenance := .concrete cellAllocId rootTag)
+    (lay : LocalLayout := layoutPtr) : RvalueImmTy Provenance :=
+  ⟨.scalar (Miri.Memory.Scalar.fromPointer x86_64RuntimeLayout.base
+    (Pointer.new prov (Size.ofBytes addr))), lay⟩
+
+/-- Execute `IntrinsicAtomic.pointerBinary` over `x86_64RuntimeLayout.base` and
+`lmScalarOpsHooks`, discarding the unchanged `AtomicState`. -/
+def runPointerBinary (op : Miri.MIR.BinOp) (left right : RvalueImmTy Provenance)
+    (isRaw : Bool := true) : Except StepError (RvalueImmTy Provenance) :=
+  match IntrinsicAtomic.pointerBinary x86_64RuntimeLayout.base lmScalarOpsHooks
+      (fun _ _ => pure isRaw) (fun _ => pure layoutUsize) {} op left right
+      (mkSingleCellState {}) with
+  | .ok val _ => .ok val
+  | .error e _ => .error e
+
+/-- **Complete `IntrinsicAtomic.pointerBinary` laws** (closing 100% of `IntrinsicAtomic`'s 11
+public definitions): raw-pointer `.Eq`/`.Lt` comparisons, address-arithmetic
+`.Add`/`.Sub`/`.BitAnd`/`.BitOr`/`.BitXor` retaining LHS provenance (`childTag`) and `layoutUsize`,
+plus backend-mismatch, non-raw LHS, non-`usize` RHS, `.uninit`, and `.Mul` rejections. -/
+theorem pointerBinary_laws :
+    let prov : Provenance := .concrete cellAllocId childTag
+    let p1 : RvalueImmTy Provenance := mkPtrImm 0x1008 prov
+    let p2 : RvalueImmTy Provenance := mkPtrImm 0x1010 (.concrete cellAllocId rootTag)
+    let rhs (n : Nat) : RvalueImmTy Provenance := ⟨.scalar (mkIntScalar 8 n), layoutUsize⟩
+    runPointerBinary .Eq p1 (mkPtrImm 0x1008 (.concrete cellAllocId rootTag)) = .ok ⟨.scalar (Miri.Memory.Scalar.fromBool true), layoutBool⟩ ∧
+    runPointerBinary .Eq p1 p2 = .ok ⟨.scalar (Miri.Memory.Scalar.fromBool false), layoutBool⟩ ∧
+    runPointerBinary .Lt p1 p2 = .ok ⟨.scalar (Miri.Memory.Scalar.fromBool true), layoutBool⟩ ∧ runPointerBinary .Lt p2 p1 = .ok ⟨.scalar (Miri.Memory.Scalar.fromBool false), layoutBool⟩ ∧
+    runPointerBinary .Add p1 (rhs 0x10) = .ok (mkPtrImm 0x1018 prov layoutUsize) ∧ runPointerBinary .Sub p1 (rhs 0x08) = .ok (mkPtrImm 0x1000 prov layoutUsize) ∧
+    runPointerBinary .BitAnd p1 (rhs 0x1FF0) = .ok (mkPtrImm 0x1000 prov layoutUsize) ∧ runPointerBinary .BitOr p1 (rhs 0x03) = .ok (mkPtrImm 0x100B prov layoutUsize) ∧ runPointerBinary .BitXor p1 (rhs 0x0B) = .ok (mkPtrImm 0x1003 prov layoutUsize) ∧
+    runPointerBinary .Eq p1 ⟨.scalar (mkIntScalar 4 0x1008), layoutU32⟩ = .error (.invalidProgram "pointer comparison backend mismatch") ∧
+    runPointerBinary .Add p1 (rhs 8) false = .error (.invalidProgram "atomic pointer arithmetic requires raw pointer") ∧
+    runPointerBinary .Add p1 ⟨.scalar (mkIntScalar 4 8), layoutU32⟩ = .error (.invalidProgram "atomic pointer arithmetic RHS must be usize") ∧
+    runPointerBinary .Eq ⟨.uninit, layoutPtr⟩ p1 = .error (.invalidProgram "uninitialized pointer comparison immediate") ∧
+    runPointerBinary .Mul p1 (rhs 2) = .error (.invalidProgram "unsupported Miri pointer binary operation") := by decide +kernel
+
+/-- **Signed vs. unsigned RMW polarity inversion** on the exact same two's-complement bit pattern
+(`-5 = 0xFFFFFFFB` vs `3` on `i32`/`u32`: `atomic_min`/`max` pick `-5`/`3` while `atomic_umin`/
+`umax` pick `3`/`0xFFFFFFFB`), signed negative `i32` RMWs (`+3`, `-3`, `&3`, `|3`, `^3`, `+5`),
+wrapping `u32` `0xFFFFFFFB + 5 = 0`, and 8-byte `usize` `atomic_xadd`/`atomic_cxchg` parity. -/
+theorem eval_signed_unsigned_polarity_and_usize :
+    let neg5 : SingleCellConfig := { widthBytes := 4, initBits := 0xFFFFFFFB };
+    runEvalRmw "atomic_min" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFFB ∧ runEvalRmw "atomic_max" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 3 ∧
+    runEvalRmw "atomic_umin" neg5 layoutU32 3 = .okScalar 0xFFFFFFFB 3 ∧ runEvalRmw "atomic_umax" neg5 layoutU32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFFB ∧
+    runEvalRmw "atomic_xadd" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFFE ∧ runEvalRmw "atomic_xsub" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFF8 ∧
+    runEvalRmw "atomic_and" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 3 ∧ runEvalRmw "atomic_or" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFFB ∧ runEvalRmw "atomic_xor" neg5 layoutI32 3 = .okScalar 0xFFFFFFFB 0xFFFFFFF8 ∧
+    runEvalRmw "atomic_xadd" neg5 layoutI32 5 = .okScalar 0xFFFFFFFB 0 ∧ runEvalRmw "atomic_xadd" neg5 layoutU32 5 = .okScalar 0xFFFFFFFB 0 ∧
+    runEvalRmw "atomic_xadd" { widthBytes := 8, initBits := 5 } layoutUsize 3 = .okScalar 5 8 ∧ runEvalCas false { widthBytes := 8, initBits := 5 } layoutUsize 5 9 = .okCas 5 true 9 := by decide +kernel
+
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
 section AxiomAudit
@@ -1448,7 +1499,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 32 then
+  if theorems < 34 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
