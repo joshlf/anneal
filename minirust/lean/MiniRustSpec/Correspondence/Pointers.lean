@@ -9942,6 +9942,53 @@ private theorem evalIntrinsicM_bm_eq (m : Mach) (intrinsic : Gen.IntrinsicOp)
   | Exit => exact machineExitM_bm_eq m
   | Assume => exact evalIntrinsicM_bm_eq_assume m arguments retTy
   | GetUnwindPayload => exact evalIntrinsicM_bm_eq_getUnwindPayload m arguments retTy
+  | AtomicStore =>
+    have hS : @typedStoreM BM _ _ = typedStore := by
+      funext m ptr val ty align atomicity
+      exact typedStoreM_bm_eq m ptr val ty align atomicity
+    simp only [hS]
+    rcases arguments with _ | ⟨⟨ptrV, _⟩, _ | ⟨⟨val, ty⟩, _ | ⟨_, _⟩⟩⟩ <;> try rfl
+    rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ <;> rfl
+  | AtomicLoad =>
+    have hL : @typedLoadM BM _ _ = typedLoad := by
+      funext m ptr ty align atomicity
+      exact typedLoadM_bm_eq m ptr ty align atomicity
+    simp only [hL]
+    rcases arguments with _ | ⟨⟨ptrV, _⟩, _ | ⟨_, _⟩⟩ <;> try rfl
+    rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ <;> rfl
+  | AtomicCompareExchange =>
+    have hL : @typedLoadM BM _ _ = typedLoad := by
+      funext m ptr ty align atomicity
+      exact typedLoadM_bm_eq m ptr ty align atomicity
+    have hS : @typedStoreM BM _ _ = typedStore := by
+      funext m ptr val ty align atomicity
+      exact typedStoreM_bm_eq m ptr val ty align atomicity
+    simp only [hL, hS]
+    rcases arguments with
+      _ | ⟨⟨ptrV, _⟩, _ | ⟨⟨current, currTy⟩, _ | ⟨⟨next, nextTy⟩, _ | ⟨_, _⟩⟩⟩⟩ <;> try rfl
+    rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ <;> rfl
+  | AtomicFetchAndOp binOp =>
+    have hL : @typedLoadM BM _ _ = typedLoad := by
+      funext m ptr ty align atomicity
+      exact typedLoadM_bm_eq m ptr ty align atomicity
+    have hS : @typedStoreM BM _ _ = typedStore := by
+      funext m ptr val ty align atomicity
+      exact typedStoreM_bm_eq m ptr val ty align atomicity
+    simp only [hL, hS]
+    rcases arguments with _ | ⟨⟨ptrV, _⟩, _ | ⟨⟨other, otherTy⟩, _ | ⟨_, _⟩⟩⟩ <;> try rfl
+    rcases ptrV with _ | _ | ⟨ptr, _ | _⟩ | _ | _ <;> try rfl
+    rcases other with _ | _ | _ | _ | _ | _ <;> try rfl
+    dsimp only
+    split
+    · rfl
+    · cases retTy <;> try rfl
+      refine bind_congr_right _ (fun _ => ?_)
+      refine bind_congr_right _ (fun _ => ?_)
+      split <;> try rfl
+      split <;> try rfl
+      refine bind_congr_right _ (fun x => ?_)
+      rcases x with ⟨previous, m1⟩
+      cases previous <;> rfl
   | _ => rfl
 
 private theorem terminateActiveThreadM_bm_eq (m : Mach) :
@@ -12748,6 +12795,68 @@ theorem evalIntrinsicM_tb_wfLive {m m' : MachTB} {intrinsic : Gen.IntrinsicOp}
          all_goals first
            | (obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h); exact hwf)
            | (dsimp only [ub] at h; cases h))
+  | AtomicStore =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨_, _, h⟩ := bind_ok h
+         repeat' split at h
+         all_goals first
+           | (dsimp only [ub] at h; cases h)
+           | (obtain ⟨_, hs, h⟩ := bind_ok h
+              obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+              exact typedStoreM_tb_wfLive hwf hs))
+  | AtomicLoad =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨_, _, h⟩ := bind_ok h
+         obtain ⟨_, _, h⟩ := bind_ok h
+         repeat' split at h
+         all_goals first
+           | (dsimp only [ub] at h; cases h)
+           | exact typedLoadM_tb_wfLive hwf h)
+  | AtomicCompareExchange =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨_, _, h⟩ := bind_ok h
+         obtain ⟨_, _, h⟩ := bind_ok h
+         repeat' split at h
+         all_goals first
+           | (dsimp only [ub, specPanic] at h; cases h)
+           | (obtain ⟨⟨_, m1⟩, hl, h⟩ := bind_ok h
+              have hm1 := typedLoadM_tb_wfLive hwf hl
+              try dsimp only at h
+              split at h
+              · obtain ⟨_, hs, h⟩ := bind_ok h
+                obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+                exact typedStoreM_tb_wfLive hm1 hs
+              · obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+                exact hm1))
+  | AtomicFetchAndOp binOp =>
+    dsimp only [evalIntrinsicM] at h
+    repeat' split at h
+    all_goals first
+      | (dsimp only [ub] at h; cases h)
+      | (obtain ⟨_, _, h⟩ := bind_ok h
+         obtain ⟨_, _, h⟩ := bind_ok h
+         repeat' split at h
+         all_goals first
+           | (dsimp only [ub, specPanic] at h; cases h)
+           | (obtain ⟨⟨_, m1⟩, hl, h⟩ := bind_ok h
+              have hm1 := typedLoadM_tb_wfLive hwf hl
+              try dsimp only at h
+              repeat' split at h
+              all_goals first
+                | (dsimp only [specPanic] at h; cases h)
+                | (obtain ⟨_, _, h⟩ := bind_ok h
+                   obtain ⟨_, hs, h⟩ := bind_ok h
+                   obtain ⟨_, rfl⟩ := Prod.mk.inj (interp_pure_ok h)
+                   exact typedStoreM_tb_wfLive hm1 hs)))
   | _ =>
     dsimp only [evalIntrinsicM, unsupported] at h; cases h
 
