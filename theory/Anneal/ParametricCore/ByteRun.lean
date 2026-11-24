@@ -810,6 +810,93 @@ theorem copyRangeComp_preserves {V : Sort y} {proj : Mem → V}
   let ⟨_, _, _, _, hSet⟩ := copyRangeComp_inv h
   exact ByteSubLens.set_preserves hPres hSet
 
+/-- Auxiliary metadata preservation for `writeRepeatRunsComp`. -/
+theorem writeRepeatRunsComp_preserves {Prov : Type x} {V : Sort y}
+    {proj : Mem → V} (hPres : ops.WritePreserves proj)
+    (codec : ByteRunCodec Prov Byte) {dstAddr : Addr} {dstOff n : Nat}
+    {runs : List (ByteRun Prov)} {m m' : Mem}
+    (hWr : writeRepeatRunsComp codec dstAddr dstOff n runs m = some m') :
+    proj m' = proj m :=
+  ByteSubLens.set_preserves hPres hWr
+
+/-- Fail-closed: `copyRepeatedlyComp` returns `none` when `n = 0`. -/
+theorem copyRepeatedlyComp_none_of_zero_n (src : ByteSubLens Addr)
+    (dstAddr : Addr) (dstOff : Nat) (m : Mem) :
+    copyRepeatedlyComp src dstAddr dstOff 0 m = none :=
+  rfl
+
+/-- Fail-closed: `copyRepeatedlyComp` returns `none` when `src.len = 0`. -/
+theorem copyRepeatedlyComp_none_of_zero_len {src : ByteSubLens Addr}
+    (dstAddr : Addr) (dstOff n : Nat) (m : Mem) (hZero : src.len = 0) :
+    copyRepeatedlyComp src dstAddr dstOff n m = none := by
+  unfold copyRepeatedlyComp
+  rw [hZero]
+  cases Nat.beq n 0 <;> rfl
+
+/-- Fail-closed: `copyRepeatedlyComp` returns `none` whenever `src.get m =
+none` (missing, unwritable, or out-of-bounds source). -/
+theorem copyRepeatedlyComp_none_of_src_get_none {src : ByteSubLens Addr}
+    (dstAddr : Addr) (dstOff n : Nat) (m : Mem)
+    (hNone : src.get m = none) :
+    copyRepeatedlyComp src dstAddr dstOff n m = none := by
+  unfold copyRepeatedlyComp
+  cases hN : n with
+  | zero => rfl
+  | succ k =>
+    cases hGuard : (Nat.beq (k + 1) 0 || Nat.beq src.len 0) with
+    | true => rfl
+    | false =>
+      have hNone0 :
+          @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                copyRangeComp src
+                  { addr := dstAddr, offset := dstOff + i * src.len,
+                    len := src.len } mCur) (k + 1) = none := by
+        clear hN hGuard
+        induction k with
+        | zero =>
+          change copyRangeComp src
+            { addr := dstAddr, offset := dstOff + 0 * src.len, len := src.len } m =
+            none
+          exact copyRangeComp_none_of_src_none hNone
+        | succ k' ih =>
+          change (match @Nat.rec (fun _ => Option Mem) (some m)
+              (fun i acc =>
+                match acc with
+                | none => none
+                | some mCur =>
+                  copyRangeComp src
+                    { addr := dstAddr, offset := dstOff + i * src.len,
+                      len := src.len } mCur) (k' + 1) with
+            | none => none
+            | some mCur =>
+              copyRangeComp src
+                { addr := dstAddr, offset := dstOff + (k' + 1) * src.len,
+                  len := src.len } mCur) = none
+          rw [ih]
+      exact hNone0
+
+/-- Fail-closed: `writeRepeatRunsComp` returns `none` when `n = 0`. -/
+theorem writeRepeatRunsComp_none_of_zero_n {Prov : Type x}
+    (codec : ByteRunCodec Prov Byte) (dstAddr : Addr) (dstOff : Nat)
+    (runs : List (ByteRun Prov)) (m : Mem) :
+    writeRepeatRunsComp codec dstAddr dstOff 0 runs m = none := by
+  unfold writeRepeatRunsComp
+  exact ByteSubLens.set_none_of_len_zero m _ (Nat.zero_mul _)
+
+/-- Fail-closed: `writeRepeatRunsComp` returns `none` when `runsByteLen runs
+= 0`. -/
+theorem writeRepeatRunsComp_none_of_zero_len {Prov : Type x}
+    (codec : ByteRunCodec Prov Byte) (dstAddr : Addr) (dstOff n : Nat)
+    {runs : List (ByteRun Prov)} (m : Mem) (hZero : runsByteLen runs = 0) :
+    writeRepeatRunsComp codec dstAddr dstOff n runs m = none := by
+  unfold writeRepeatRunsComp
+  rw [hZero]
+  exact ByteSubLens.set_none_of_len_zero m _ (Nat.mul_zero n)
+
 /-- Auxiliary metadata preservation for `copyRepeatedlyComp`. -/
 theorem copyRepeatedlyComp_preserves {V : Sort y} {proj : Mem → V}
     (hPres : ops.WritePreserves proj) {src : ByteSubLens Addr}
@@ -1637,6 +1724,77 @@ theorem not_byteRunCopyCut_of_exec_none {step : S → StepOutcome S Out Fault}
   rw [hNone] at h2
   cases h2
 
+/-- Pointwise step-function congruence for `ByteRunCopyCut` (`0 Quot.sound`). -/
+theorem ByteRunCopyCut.congr_step {step₁ step₂ : S → StepOutcome S Out Fault}
+    (hEq : ∀ s : S, step₁ s = step₂ s) {memOf : S → Mem}
+    {copyOps : List (ByteRunCopyOp Addr)} {fuel : Nat} {s₀ s₁ : S}
+    (h : ByteRunCopyCut step₁ memOf copyOps fuel s₀ s₁) :
+    ByteRunCopyCut step₂ memOf copyOps fuel s₀ s₁ :=
+  ⟨(StepStageCut.congr_step hEq).mp h.1, h.2⟩
+
+/-- `0 Quot.sound` pointwise `BlockTree` transport for `ByteRunCopyCut`: lifts
+a cut proved over a pre-built `ValidBlockTree` (`lookupForced?`) directly to
+the list-backed step function `stepWith (listGet? blocks)`. -/
+theorem ByteRunCopyCut.of_validBlockTree {BB : Type a}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    {stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault}
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {memOf : S → Mem} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (h : ByteRunCopyCut (stepWith bt.lookupForced?) memOf copyOps fuel s₀ s₁) :
+    ByteRunCopyCut (stepWith (listGet? blocks)) memOf copyOps fuel s₀ s₁ :=
+  ByteRunCopyCut.congr_step
+    (fun s => hPointwise _ _ s (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i))) h
+
+/-- `0 Quot.sound` pointwise `Chunk8BlockTree` transport for `ByteRunCopyCut`. -/
+theorem ByteRunCopyCut.of_validChunk8BlockTree {BB : Type a}
+    {blocks : List BB} {bt : Chunk8BlockTree BB}
+    (hValid : ValidChunk8BlockTree blocks bt)
+    {stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault}
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {memOf : S → Mem} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (h : ByteRunCopyCut (stepWith bt.lookupForced?) memOf copyOps fuel s₀ s₁) :
+    ByteRunCopyCut (stepWith (listGet? blocks)) memOf copyOps fuel s₀ s₁ :=
+  ByteRunCopyCut.congr_step
+    (fun s => hPointwise _ _ s (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i))) h
+
+/-- Seals a `ByteRunCopyCut` directly from `evalBlockTreeToCut` on a pre-built
+`ValidBlockTree` (`0 Quot.sound`). -/
+theorem ByteRunCopyCut.of_evalBlockTreeToCut {BB : Type a}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    {stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault}
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {memOf : S → Mem} {blockOf : S → Nat} {cuts : MaskTree}
+    {copyOps : List (ByteRunCopyOp Addr)} {fuel : Nat} {s₀ s₁ : S}
+    (hEval : evalBlockTreeToCut bt stepWith StepOutcome.next? blockOf cuts
+      fuel s₀ = .cut s₁)
+    (hExec : execByteRunCopyOps copyOps (memOf s₀) = some (memOf s₁)) :
+    ByteRunCopyCut (stepWith (listGet? blocks)) memOf copyOps fuel s₀ s₁ :=
+  ⟨stageCut_of_validBlockTreeToCut_of_pointwise hValid stepWith hPointwise hEval,
+   hExec⟩
+
+/-- Seals a `ByteRunCopyCut` directly from `evalBlockTreeFromCut` on a pre-built
+`ValidBlockTree` at budget `fuel + 1` (`0 Quot.sound`). -/
+theorem ByteRunCopyCut.of_evalBlockTreeFromCut {BB : Type a}
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    {stepWith : (Nat → Option BB) → S → StepOutcome S Out Fault}
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : S),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {memOf : S → Mem} {blockOf : S → Nat} {cuts : MaskTree}
+    {copyOps : List (ByteRunCopyOp Addr)} {fuel : Nat} {s₀ s₁ : S}
+    (hEval : evalBlockTreeFromCut bt stepWith StepOutcome.next? blockOf cuts
+      fuel s₀ = .cut s₁)
+    (hExec : execByteRunCopyOps copyOps (memOf s₀) = some (memOf s₁)) :
+    ByteRunCopyCut (stepWith (listGet? blocks)) memOf copyOps (fuel + 1) s₀ s₁ :=
+  ⟨stageCut_of_validBlockTreeFromCut_of_pointwise hValid stepWith hPointwise hEval,
+   hExec⟩
+
 end CopyCut
 
 attribute [irreducible] ByteRunCopyCut
@@ -2021,5 +2179,58 @@ theorem canary_byterun_negative_fail_closed :
     copyRangeComp { addr := 99, offset := 0, len := 4 }
       { addr := 1, offset := 12, len := 4 } canaryProvMixStore0 = none :=
   ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Necessity canary for `copyRepeatedlyComp_eq_writeRepeatRunsComp`: when
+`src = [0..4)` overlaps the destination window `[2..10)` (`dstOff = 2`,
+`n = 2`), iteration `0` overwrites `[2..6)` (corrupting the upper half of
+`src`) before iteration `1` reads `src`, so sequential `copyRepeatedlyComp`
+and fused `writeRepeatRunsComp` both succeed but produce strictly DIFFERENT
+target slices (`mRep ≠ mFused`). This witnesses that the `Disjoint` side
+condition on repeat fusion is strictly necessary. -/
+theorem canary_byterun_overlap_breaks_repeat_fusion :
+    let elemRuns : List (ByteRun PEmpty.{1}) := [.initPlain [0x11, 0x22, 0x33, 0x44]]
+    let c := ByteRunCodec.optionUInt8
+    let m0 : SliceStore (Option UInt8) :=
+      { allocs := [{ allocId := 1,
+                     bytes := [some 0x11, some 0x22, some 0x33, some 0x44,
+                               none, none, none, none, none, none],
+                     writable := true }] }
+    let src : ByteSubLens Nat := { addr := 1, offset := 0, len := 4 }
+    let dstWin : ByteSubLens Nat := { addr := 1, offset := 2, len := 8 }
+    ∃ (mRep mFused : SliceStore (Option UInt8)),
+      copyRepeatedlyComp src 1 2 2 m0 = some mRep ∧
+      writeRepeatRunsComp c 1 2 2 elemRuns m0 = some mFused ∧
+      dstWin.get mRep =
+        some [some 0x11, some 0x22, some 0x33, some 0x44,
+              some 0x11, some 0x22, some 0x11, some 0x22] ∧
+      dstWin.get mFused =
+        some [some 0x11, some 0x22, some 0x33, some 0x44,
+              some 0x11, some 0x22, some 0x33, some 0x44] ∧
+      mRep ≠ mFused := by
+  let elemRuns : List (ByteRun PEmpty.{1}) := [.initPlain [0x11, 0x22, 0x33, 0x44]]
+  let c := ByteRunCodec.optionUInt8
+  let m0 : SliceStore (Option UInt8) :=
+    { allocs := [{ allocId := 1,
+                   bytes := [some 0x11, some 0x22, some 0x33, some 0x44,
+                             none, none, none, none, none, none],
+                   writable := true }] }
+  let src : ByteSubLens Nat := { addr := 1, offset := 0, len := 4 }
+  let dstWin : ByteSubLens Nat := { addr := 1, offset := 2, len := 8 }
+  let mRep : SliceStore (Option UInt8) :=
+    { allocs := [{ allocId := 1,
+                   bytes := [some 0x11, some 0x22, some 0x11, some 0x22,
+                             some 0x33, some 0x44, some 0x11, some 0x22,
+                             some 0x11, some 0x22],
+                   writable := true }] }
+  let mFused : SliceStore (Option UInt8) :=
+    { allocs := [{ allocId := 1,
+                   bytes := [some 0x11, some 0x22, some 0x11, some 0x22,
+                             some 0x33, some 0x44, some 0x11, some 0x22,
+                             some 0x33, some 0x44],
+                   writable := true }] }
+  refine ⟨mRep, mFused, rfl, rfl, rfl, rfl, ?_⟩
+  intro hEq
+  have hGet := congrArg (dstWin.get) hEq
+  cases hGet
 
 end Anneal.ParametricCore

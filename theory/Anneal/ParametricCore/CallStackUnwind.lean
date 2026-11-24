@@ -601,6 +601,24 @@ theorem exitFrameWithProtectors_not_released_keeps_protectedTags
     | AccessFailure _ _ _ _ => exact hKeep
     | InvariantFailure _ _ _ => exact hKeep
 
+private theorem listFilter_true {α : Type} :
+    ∀ (xs : List α), xs.filter (fun _ => true) = xs
+  | [] => rfl
+  | x :: tl => congrArg (List.cons x) (listFilter_true tl)
+
+/-- Empty-protector frame exit (`frameTags = []`): a callee owning no
+Tree Borrows protectors releases cleanly and returns the identical
+`RangedBorrowTree`. -/
+theorem exitFrameWithProtectors_nil (tree : Anneal.RefFrame.RangedBorrowTree) :
+    Anneal.RefFrame.exitFrameWithProtectors tree [] = ⟨tree, .Released⟩ := by
+  unfold Anneal.RefFrame.exitFrameWithProtectors Anneal.RefFrame.endCallRemoveProtectors
+  cases tree with
+  | mk topo prot segs =>
+    dsimp only [List.foldl]
+    have hF : prot.filter (fun t => !Anneal.RefFrame.natListMem t []) = prot :=
+      listFilter_true prot
+    rw [hF]
+
 /-- Protected `&mut` borrow writeback frame pairing `RefFrame Addr` with the
 callee's Tree Borrows protector tags `frameTags : List Nat` on a shared
 `Anneal.RefFrame.RangedBorrowTree`. -/
@@ -1231,6 +1249,298 @@ theorem updatesOnly_frame_disjoint [LawfulByteStoreOps Mem Addr Byte]
   | step hIn hSet _ ih =>
     exact ih.trans (ByteSubLens.get_set_disjoint (hDisj _ hIn) hSet)
 
+private theorem contained_zoom_eq {a b : ByteSubLens Addr}
+    (hCont : a.ContainedIn b) :
+    b.zoom (a.offset - b.offset) a.len = a ∧
+    (a.offset - b.offset) + a.len ≤ b.len := by
+  refine ⟨?_, ?_⟩
+  · unfold ByteSubLens.zoom
+    cases a with
+    | mk aa aoff alen =>
+      cases b with
+      | mk ba boff blen =>
+        dsimp only [ByteSubLens.ContainedIn] at hCont
+        rw [hCont.1.symm, Nat.add_sub_of_le hCont.2.1]
+  · have hAdd : b.offset + ((a.offset - b.offset) + a.len) ≤ b.offset + b.len := by
+      rw [← Nat.add_assoc, Nat.add_sub_of_le hCont.2.1]
+      exact hCont.2.2
+    exact Nat.le_of_add_le_add_left hAdd
+
+/-- Lens readability and writability validity after `UpdatesOnly` (parametric
+analog of `#4177`'s `lens_valid_after_updatesOnly`): for any positive-length
+lens `Q` readable at entry (`Q.get m₀ = some old`), if every `L ∈ allowed` is
+either disjoint from `Q`, contained in `Q`, or contains `Q`, then `Q` remains
+readable (with exact length `Q.len`) and writable for any slice of length
+`Q.len` in `m₁`. -/
+theorem lens_valid_after_updatesOnly [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {Q : ByteSubLens Addr}
+    {m₀ m₁ : Mem} {old : List Byte}
+    (hGet : Q.get m₀ = some old)
+    (hCompat : ∀ L : ByteSubLens Addr, L ∈ allowed →
+      L.Disjoint Mem Q ∨ L.ContainedIn Q ∨ Q.ContainedIn L)
+    (hUpd : UpdatesOnly allowed m₀ m₁) :
+    ∃ bs₁ : List Byte,
+      Q.get m₁ = some bs₁ ∧
+      bs₁.length = Q.len ∧
+      (∀ newBs : List Byte, newBs.length = Q.len → ∃ m₂, Q.set m₁ newBs = some m₂) := by
+  have hQPos : 0 < Q.len := (ByteSubLens.get_inv hGet).1
+  have hAux : ∀ {ma mb : Mem} {oldA : List Byte},
+      Q.get ma = some oldA → UpdatesOnly allowed ma mb →
+      ∃ bs₁ : List Byte, Q.get mb = some bs₁ := by
+    intro ma mb oldA hG hU
+    induction hU generalizing oldA with
+    | refl _ => exact ⟨oldA, hG⟩
+    | @step mA mB mC L bs hIn hSet _ ih =>
+      cases hCompat L hIn with
+      | inl hDisj =>
+        have hNext : Q.get mB = some oldA :=
+          (ByteSubLens.get_set_disjoint hDisj hSet).trans hG
+        exact ih hNext
+      | inr hNest =>
+        cases hNest with
+        | inl hSub =>
+          let ⟨hZoom, hBound⟩ := contained_zoom_eq hSub
+          rw [← hZoom] at hSet
+          exact ih (ByteSubLens.get_zoom_set hG hBound hSet)
+        | inr hSup =>
+          let ⟨hZoom, hBound⟩ := contained_zoom_eq hSup
+          have hGetL : L.get mB = some bs := ByteSubLens.get_set hSet
+          have hNext : Q.get mB = some ((bs.drop (Q.offset - L.offset)).take Q.len) := by
+            have hZ := ByteSubLens.zoom_get hGetL hQPos hBound
+            rw [hZoom] at hZ
+            exact hZ
+          exact ih hNext
+  let ⟨bs₁, hGet₁⟩ := hAux hGet hUpd
+  exact ⟨bs₁, hGet₁, ByteSubLens.get_len hGet₁,
+    fun newBs hLen => ByteSubLens.set_isSome_of_get newBs hGet₁ hLen⟩
+
+/-- Single-lens validity corollary: if `L` is readable before
+`UpdatesOnly [L] m₀ m₁`, it remains readable and writable in `m₁`. -/
+theorem lens_valid_after_updatesOnly_self [LawfulByteStoreOps Mem Addr Byte]
+    {L : ByteSubLens Addr} {m₀ m₁ : Mem} {old : List Byte}
+    (hGet : L.get m₀ = some old) (hUpd : UpdatesOnly [L] m₀ m₁) :
+    ∃ bs₁ : List Byte,
+      L.get m₁ = some bs₁ ∧
+      bs₁.length = L.len ∧
+      (∀ newBs : List Byte, newBs.length = L.len → ∃ m₂, L.set m₁ newBs = some m₂) :=
+  lens_valid_after_updatesOnly hGet
+    (fun L' hIn => by
+      cases hIn with
+      | head => exact Or.inr (Or.inl (ByteSubLens.containedIn_refl L))
+      | tail _ hE => cases hE)
+    hUpd
+
+/-- Generalized hierarchical containment monotonicity for multi-lens footprints:
+if every `L ∈ allowed` is contained in `bigL` and `bigL` is readable in `m₀`,
+then `UpdatesOnly allowed m₀ m₁` collapses into `UpdatesOnly [bigL] m₀ m₁` and
+preserves `bigL` readability. -/
+theorem UpdatesOnly.mono_contained_list [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {bigL : ByteSubLens Addr}
+    {m₀ m₁ : Mem} {old : List Byte}
+    (hAllSub : ∀ L : ByteSubLens Addr, L ∈ allowed → L.ContainedIn bigL)
+    (hGetBig : bigL.get m₀ = some old)
+    (hUpd : UpdatesOnly allowed m₀ m₁) :
+    UpdatesOnly [bigL] m₀ m₁ ∧ ∃ bs₁ : List Byte, bigL.get m₁ = some bs₁ := by
+  induction hUpd generalizing old with
+  | refl m => exact ⟨.refl m, old, hGetBig⟩
+  | @step ma mb mc L bs hIn hSet _ ih =>
+    have hCont := hAllSub L hIn
+    have hStepBig : UpdatesOnly [bigL] ma mb :=
+      UpdatesOnly.of_contained_set (List.Mem.head []) hCont hGetBig hSet
+    let ⟨hZoom, hBound⟩ := contained_zoom_eq hCont
+    have hSetZ : (bigL.zoom (L.offset - bigL.offset) L.len).set ma bs = some mb := by
+      rw [hZoom]; exact hSet
+    have hGetMb := ByteSubLens.get_zoom_set hGetBig hBound hSetZ
+    let ⟨hRestBig, bs₁, hGetEnd⟩ := ih hGetMb
+    exact ⟨hStepBig.trans hRestBig, bs₁, hGetEnd⟩
+
+/-- Bridge from `ByteRun.copyRepeatedlyComp` into `UpdatesOnly`: if the target
+window `dstWin = { addr := dstAddr, offset := dstOff, len := n * src.len }`
+lies in `allowed` and is readable in `m₀`, every successful `copyRepeatedlyComp`
+execution satisfies `UpdatesOnly allowed m₀ m₁`. -/
+theorem UpdatesOnly.of_copyRepeatedlyComp [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {src : ByteSubLens Addr}
+    {dstAddr : Addr} {dstOff n : Nat} {m₀ m₁ : Mem} {oldWin : List Byte}
+    (hIn : ({ addr := dstAddr, offset := dstOff,
+              len := n * src.len } : ByteSubLens Addr) ∈ allowed)
+    (hWinGet : ({ addr := dstAddr, offset := dstOff,
+                  len := n * src.len } : ByteSubLens Addr).get m₀ = some oldWin)
+    (hRep : copyRepeatedlyComp src dstAddr dstOff n m₀ = some m₁) :
+    UpdatesOnly allowed m₀ m₁ := by
+  let dstWin : ByteSubLens Addr :=
+    { addr := dstAddr, offset := dstOff, len := n * src.len }
+  unfold copyRepeatedlyComp at hRep
+  cases hGuard : (Nat.beq n 0 || Nat.beq src.len 0) with
+  | true => rw [hGuard] at hRep; cases hRep
+  | false =>
+    rw [hGuard] at hRep
+    have hRec :
+        ∀ (j : Nat) (mOut : Mem), j ≤ n →
+          @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                copyRangeComp src
+                  { addr := dstAddr, offset := dstOff + i * src.len,
+                    len := src.len } mCur) j = some mOut →
+          UpdatesOnly allowed m₀ mOut ∧ ∃ curWin, dstWin.get mOut = some curWin := by
+      intro j
+      induction j with
+      | zero =>
+        intro mOut _ hEq
+        have hM : m₀ = mOut := Option.some.inj hEq
+        rw [← hM]
+        exact ⟨.refl m₀, oldWin, hWinGet⟩
+      | succ k ih =>
+        intro mOut hK1Le hStep
+        change (match @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                copyRangeComp src
+                  { addr := dstAddr, offset := dstOff + i * src.len,
+                    len := src.len } mCur) k with
+          | none => none
+          | some mCur =>
+            copyRangeComp src
+              { addr := dstAddr, offset := dstOff + k * src.len,
+                len := src.len } mCur) = some mOut at hStep
+        cases hPrev : @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                copyRangeComp src
+                  { addr := dstAddr, offset := dstOff + i * src.len,
+                    len := src.len } mCur) k with
+        | none => rw [hPrev] at hStep; cases hStep
+        | some mK =>
+          rw [hPrev] at hStep
+          let ⟨hUpdK, curWin, hGetK⟩ := ih mK (Nat.le_trans (Nat.le_succ k) hK1Le) hPrev
+          let ⟨_, _, bs, _, hSet⟩ := copyRangeComp_inv hStep
+          let elemLens : ByteSubLens Addr :=
+            { addr := dstAddr, offset := dstOff + k * src.len, len := src.len }
+          have hSubBound : k * src.len + src.len ≤ n * src.len := by
+            rw [← Nat.succ_mul]
+            exact Nat.mul_le_mul_right src.len hK1Le
+          have hElemZoom : dstWin.zoom (k * src.len) src.len = elemLens := rfl
+          have hCont : elemLens.ContainedIn dstWin := by
+            rw [← hElemZoom]
+            exact ByteSubLens.zoom_containedIn dstWin hSubBound
+          have hUpdStep : UpdatesOnly allowed mK mOut :=
+            UpdatesOnly.of_contained_set hIn hCont hGetK hSet
+          have hGetOut : dstWin.get mOut =
+              some (listSplice curWin (k * src.len) bs) :=
+            ByteSubLens.get_zoom_set hGetK hSubBound hSet
+          exact ⟨hUpdK.trans hUpdStep, _, hGetOut⟩
+    exact (hRec n m₁ (Nat.le_refl n) hRep).1
+
+/-- Predicate that a `ByteRunCopyOp` pipeline consists solely of `.copyRange`
+operations whose target lenses lie in `allowed`. -/
+def CopyOpsTargetsIn (allowed : List (ByteSubLens Addr))
+    (copyOps : List (ByteRunCopyOp Addr)) : Prop :=
+  ∀ op : ByteRunCopyOp Addr, op ∈ copyOps →
+    ∃ src dst : ByteSubLens Addr, op = .copyRange src dst ∧ dst ∈ allowed
+
+/-- Bridge from `execByteRunCopyOps` into `UpdatesOnly` for `.copyRange`
+pipelines. -/
+theorem UpdatesOnly.of_execByteRunCopyOps_ranges
+    {allowed : List (ByteSubLens Addr)} {copyOps : List (ByteRunCopyOp Addr)}
+    {m₀ m₁ : Mem}
+    (hTargets : CopyOpsTargetsIn allowed copyOps)
+    (hExec : execByteRunCopyOps copyOps m₀ = some m₁) :
+    UpdatesOnly allowed m₀ m₁ := by
+  induction copyOps generalizing m₀ with
+  | nil =>
+    have hEq : m₀ = m₁ := Option.some.inj hExec
+    rw [← hEq]
+    exact .refl m₀
+  | cons op rest ih =>
+    rw [execByteRunCopyOps_cons] at hExec
+    let ⟨src, dst, hOpEq, hIn⟩ := hTargets op (List.Mem.head rest)
+    rw [hOpEq] at hExec
+    dsimp only [ByteRunCopyOp.exec] at hExec
+    cases hStep : copyRangeComp src dst m₀ with
+    | none => rw [hStep] at hExec; cases hExec
+    | some mMid =>
+      rw [hStep] at hExec
+      exact (UpdatesOnly.of_copyRangeComp hIn hStep).trans
+        (ih (fun op' hM => hTargets op' (List.Mem.tail op hM)) hExec)
+
+/-- Bridge from a sealed `ByteRunCopyCut` directly into `UpdatesOnly` (Episode 2
+hook connecting `ByteRun` copy stages to `CallSpecCut`'s modification footprint).
+-/
+theorem ByteRunCopyCut.to_updatesOnly_ranges {S : Type x} {Out : Type y}
+    {Fault : Type z} {step : S → StepOutcome S Out Fault} {memOf : S → Mem}
+    {allowed : List (ByteSubLens Addr)} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (hTargets : CopyOpsTargetsIn allowed copyOps)
+    (hCut : ByteRunCopyCut step memOf copyOps fuel s₀ s₁) :
+    UpdatesOnly allowed (memOf s₀) (memOf s₁) :=
+  UpdatesOnly.of_execByteRunCopyOps_ranges hTargets (ByteRunCopyCut.exec_eq hCut)
+
+/-- Bridge from Part I (`evalRefFrameExit`) into Part II (`UpdatesOnly`): every
+non-faulting outcome of `evalRefFrameExit rf mem exit` yields a post-memory
+satisfying `UpdatesOnly [rf.refLens] mem mem'`. -/
+theorem evalRefFrameExit_updatesOnly {Val : Type w}
+    (rf : RefFrame Addr) (mem : Mem) (exit : CalleeExit Val Byte) :
+    match evalRefFrameExit rf mem exit with
+    | .jumpNormal _ _ mem' => UpdatesOnly [rf.refLens] mem mem'
+    | .jumpCleanup _ mem' => UpdatesOnly [rf.refLens] mem mem'
+    | .propagateUnwind mem' => UpdatesOnly [rf.refLens] mem mem'
+    | .abortTerminate mem' => UpdatesOnly [rf.refLens] mem mem'
+    | .fault => True := by
+  unfold evalRefFrameExit
+  cases exit with
+  | returned retVal mutSlice =>
+    cases rf.cont.onRet with
+    | none => exact True.intro
+    | some retBb =>
+      dsimp only
+      cases hSet : rf.refLens.set mem mutSlice with
+      | none => exact True.intro
+      | some mem' => exact UpdatesOnly.of_single_set hSet
+  | unwound partialSlice =>
+    cases rf.cont.onUnwind with
+    | unreachable => exact True.intro
+    | cleanup _ =>
+      dsimp only
+      cases hSet : rf.refLens.set mem partialSlice with
+      | none => exact True.intro
+      | some mem' => exact UpdatesOnly.of_single_set hSet
+    | continue_ =>
+      dsimp only
+      cases hSet : rf.refLens.set mem partialSlice with
+      | none => exact True.intro
+      | some mem' => exact UpdatesOnly.of_single_set hSet
+    | terminate =>
+      dsimp only
+      cases hSet : rf.refLens.set mem partialSlice with
+      | none => exact True.intro
+      | some mem' => exact UpdatesOnly.of_single_set hSet
+
+/-- Bridge from Part I (`evalProtectedRefFrameExit`) into Part II
+(`UpdatesOnly`): every non-faulting outcome satisfies
+`UpdatesOnly [prf.frame.refLens] mem mem'`. -/
+theorem evalProtectedRefFrameExit_updatesOnly {Val : Type w}
+    (prf : ProtectedRefFrame Addr) (mem : Mem)
+    (tree : Anneal.RefFrame.RangedBorrowTree) (exit : CalleeExit Val Byte) :
+    match (evalProtectedRefFrameExit prf mem tree exit).1 with
+    | .jumpNormal _ _ mem' => UpdatesOnly [prf.frame.refLens] mem mem'
+    | .jumpCleanup _ mem' => UpdatesOnly [prf.frame.refLens] mem mem'
+    | .propagateUnwind mem' => UpdatesOnly [prf.frame.refLens] mem mem'
+    | .abortTerminate mem' => UpdatesOnly [prf.frame.refLens] mem mem'
+    | .fault => True := by
+  unfold evalProtectedRefFrameExit
+  dsimp only
+  cases (Anneal.RefFrame.exitFrameWithProtectors tree prf.frameTags).status with
+  | Released => exact evalRefFrameExit_updatesOnly prf.frame mem exit
+  | MissingTag _ => exact True.intro
+  | AccessFailure _ _ _ _ => exact True.intro
+  | InvariantFailure _ _ _ => exact True.intro
+
 end UpdatesOnlyLaws
 
 /-- Computable pairwise separation check for a `Nat`-addressed lens list against
@@ -1272,6 +1582,9 @@ structure CallSpec (Mem : Type u) (Addr : Type v) (Val : Type w) where
   separate from `postRet` so normal postconditions never leak onto cleanup
   paths). -/
   postUnwind : Mem → Anneal.RefFrame.RangedBorrowTree → Prop
+  /-- Process-abort (`UnwindAction.terminate`) postcondition on `(mem, tree)`
+  when `canAbort = true` (defaults to `fun _ _ => False`). -/
+  postAbort : Mem → Anneal.RefFrame.RangedBorrowTree → Prop := fun _ _ => False
   /-- Allowed modification footprint (`UpdatesOnly`). -/
   modifies : List (ByteSubLens Addr)
   /-- Tree Borrows protector tags released on callee frame exit. -/
@@ -1282,6 +1595,10 @@ structure CallSpec (Mem : Type u) (Addr : Type v) (Val : Type w) where
   /-- Whether panic unwind is permitted by this contract (`false` for
   no-unwind callees). -/
   canUnwind : Bool
+  /-- Whether uncatchable process abort (`.abortTerminate`, e.g. from an inner
+  `UnwindAction.terminate` boundary) is permitted by this contract (defaults
+  to `false`). -/
+  canAbort : Bool := false
 
 /-- Pure-boolean constructor for `CallSpec` over a single `&mut` lens
 (convenient bridge for `#4177`-style boolean contracts). -/
@@ -1622,7 +1939,11 @@ def wpCallSite {State : Type x} {Out : Type y} {Fault : Type z}
           | .exitTerminate m' t' => onTerminate m' t'
           | _ => False
         | _ => False
-      | some (.abortTerminate _ _) => False)
+      | some (.abortTerminate m₁ t₁) =>
+        match evalCallCont4Dispatch isCleanupBb cont
+            (FrameExitOutcome.abortTerminate (Val := Val) m₁ t₁) with
+        | .exitTerminate m' t' => onTerminate m' t'
+        | _ => False)
     (fun _ => False)
     (adapter.mkEntry m₀ t₀)
 
@@ -1639,7 +1960,10 @@ forbids faults and certifies that:
   and `spec.postRet retVal m₁ tRel`;
 - panic unwinds satisfy `spec.canUnwind = true`, `UpdatesOnly spec.modifies
   m₀ m₁`, clean `exitFrameWithProtectors t₁ spec.frameTags = ⟨tRel, .Released⟩`,
-  and `spec.postUnwind m₁ tRel`. -/
+  and `spec.postUnwind m₁ tRel`;
+- process aborts (`.abortTerminate`) satisfy `spec.canAbort = true`,
+  `UpdatesOnly spec.modifies m₀ m₁`, and `spec.postAbort m₁ t₁` (aborting
+  immediately without unwinding or releasing outer protectors). -/
 def denoteCallSpecCut [wops : MirWpOps State Out Fault]
     [ops : ByteStoreOps Mem Addr Byte]
     (adapter : CalleeMachineAdapter State Out Mem Val)
@@ -1664,7 +1988,10 @@ def denoteCallSpecCut [wops : MirWpOps State Out Fault]
             Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
               ⟨tRel, .Released⟩ ∧
             spec.postUnwind m₁ tRel
-        | some (.abortTerminate _ _) => False)
+        | some (.abortTerminate m₁ t₁) =>
+          spec.canAbort = true ∧
+          UpdatesOnly spec.modifies m₀ m₁ ∧
+          spec.postAbort m₁ t₁)
       (fun _ => False)
       (adapter.mkEntry m₀ t₀)
 
@@ -1725,7 +2052,12 @@ theorem callSpecCut_call_normal_cleanup [wops : MirWpOps State Out Fault]
       (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
         Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
       spec.postUnwind m₁ tRel →
-      onCleanup cleanupBb m₁ tRel) :
+      onCleanup cleanupBb m₁ tRel)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
     wpCallSite adapter ⟨some retBb, .cleanup cleanupBb⟩ isCleanupBb
       spec.frameTags onNormal onCleanup onUnwindExit onTerminate m₀ t₀ := by
   unfold wpCallSite wpOutcome
@@ -1752,12 +2084,15 @@ theorem callSpecCut_call_normal_cleanup [wops : MirWpOps State Out Fault]
       rw [hCleanValid]
       have hStripped := (exitFrameWithProtectors_released_tags hRel).1
       exact hCleanup m₁ tRel hCanU hUpd hStripped hPost
-    | abortTerminate _ _ => exact False.elim hOut
+    | abortTerminate m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact hAbort m₁ t₁ hCanA hUpd hPost
 
 /-- Modular call-site WP rule for `⟨some retBb, .continue_⟩`:
-normal returns jump to `retBb` with `spec.postRet`, and unwinds exit the
+normal returns jump to `retBb` with `spec.postRet`, unwinds exit the
 caller frame via `onUnwindExit` with `spec.postUnwind`, `UpdatesOnly`, and
-stripped `frameTags`. -/
+stripped `frameTags`, and callee process aborts route to `onTerminate`. -/
 theorem callSpecCut_call_normal_continue [wops : MirWpOps State Out Fault]
     [ops : ByteStoreOps Mem Addr Byte]
     {adapter : CalleeMachineAdapter State Out Mem Val}
@@ -1783,7 +2118,12 @@ theorem callSpecCut_call_normal_continue [wops : MirWpOps State Out Fault]
       (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
         Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
       spec.postUnwind m₁ tRel →
-      onUnwindExit m₁ tRel) :
+      onUnwindExit m₁ tRel)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
     wpCallSite adapter ⟨some retBb, .continue_⟩ isCleanupBb
       spec.frameTags onNormal onCleanup onUnwindExit onTerminate m₀ t₀ := by
   unfold wpCallSite wpOutcome
@@ -1807,7 +2147,72 @@ theorem callSpecCut_call_normal_continue [wops : MirWpOps State Out Fault]
       rw [hRel]
       exact hUnwind m₁ tRel hCanU hUpd
         (exitFrameWithProtectors_released_tags hRel).1 hPost
-    | abortTerminate _ _ => exact False.elim hOut
+    | abortTerminate m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact hAbort m₁ t₁ hCanA hUpd hPost
+
+/-- Modular call-site WP rule for `⟨some retBb, .terminate⟩`:
+normal returns jump to `retBb` with `spec.postRet`; both callee unwinds (after
+protector release) and callee aborts route to `onTerminate`. -/
+theorem callSpecCut_call_normal_terminate [wops : MirWpOps State Out Fault]
+    [ops : ByteStoreOps Mem Addr Byte]
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    {isCleanupBb : Nat → Bool} {retBb : Nat}
+    {onNormal : Nat → Val → Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onCleanup : Nat → Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onUnwindExit : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {m₀ : Mem} {t₀ : Anneal.RefFrame.RangedBorrowTree}
+    (hCut : CallSpecCut adapter spec)
+    (hPre : spec.pre m₀ t₀)
+    (hNormal : ∀ (retVal : Val) (m₁ : Mem) (tRel : Anneal.RefFrame.RangedBorrowTree),
+      spec.canNormal = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
+        Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
+      spec.postRet retVal m₁ tRel →
+      onNormal retBb retVal m₁ tRel)
+    (hUnwindTerm : ∀ (m₁ : Mem) (tRel : Anneal.RefFrame.RangedBorrowTree),
+      spec.canUnwind = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
+        Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
+      spec.postUnwind m₁ tRel →
+      onTerminate m₁ tRel)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
+    wpCallSite adapter ⟨some retBb, .terminate⟩ isCleanupBb
+      spec.frameTags onNormal onCleanup onUnwindExit onTerminate m₀ t₀ := by
+  unfold wpCallSite wpOutcome
+  refine wpUntil_mono (ops := wops) (fun _ hf => hf) ?_ (fun _ hf => hf)
+    (hCut m₀ t₀ hPre)
+  intro out hOut
+  cases hCls : adapter.classifyOut out with
+  | none => rw [hCls] at hOut; exact False.elim hOut
+  | some ex =>
+    rw [hCls] at hOut
+    cases ex with
+    | returned retVal m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanN, hUpd, tRel, hRel, hPost⟩ := hOut
+      rw [hRel]
+      exact hNormal retVal m₁ tRel hCanN hUpd
+        (exitFrameWithProtectors_released_tags hRel).1 hPost
+    | unwound m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanU, hUpd, tRel, hRel, hPost⟩ := hOut
+      rw [hRel]
+      exact hUnwindTerm m₁ tRel hCanU hUpd
+        (exitFrameWithProtectors_released_tags hRel).1 hPost
+    | abortTerminate m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact hAbort m₁ t₁ hCanA hUpd hPost
 
 /-- Modular call-site WP rule for no-unwind calls (`spec.canUnwind = false`) at
 `⟨some retBb, uAct⟩` (covering `.unreachable`, `.terminate`, `.continue_`, or
@@ -1831,7 +2236,12 @@ theorem callSpecCut_call_normal_no_unwind [wops : MirWpOps State Out Fault]
       (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
         Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
       spec.postRet retVal m₁ tRel →
-      onNormal retBb retVal m₁ tRel) :
+      onNormal retBb retVal m₁ tRel)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
     wpCallSite adapter ⟨some retBb, uAct⟩ isCleanupBb
       spec.frameTags onNormal onCleanup onUnwindExit onTerminate m₀ t₀ := by
   unfold wpCallSite wpOutcome
@@ -1852,12 +2262,16 @@ theorem callSpecCut_call_normal_no_unwind [wops : MirWpOps State Out Fault]
     | unwound _ _ =>
       rw [hNoUnw] at hOut
       cases hOut.1
-    | abortTerminate _ _ => exact False.elim hOut
+    | abortTerminate m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact hAbort m₁ t₁ hCanA hUpd hPost
 
 /-- Modular call-site WP rule for diverging `-> !` calls (`onRet = none`,
-`spec.canNormal = false`): normal return is statically excluded, and unwind
+`spec.canNormal = false`): normal return is statically excluded, unwind
 paths discharge `.cleanup`, `.continue_`, or `.terminate` cleanly (while
-`.unreachable` remains excluded unless `spec.canUnwind = false`). -/
+`.unreachable` remains excluded unless `spec.canUnwind = false`), and callee
+process aborts route to `onTerminate`. -/
 theorem callSpecCut_call_diverging_unwind [wops : MirWpOps State Out Fault]
     [ops : ByteStoreOps Mem Addr Byte]
     {adapter : CalleeMachineAdapter State Out Mem Val}
@@ -1882,7 +2296,12 @@ theorem callSpecCut_call_diverging_unwind [wops : MirWpOps State Out Fault]
         isCleanupBb cleanupBb = true ∧ onCleanup cleanupBb m₁ tRel
       | .continue_ => onUnwindExit m₁ tRel
       | .terminate => onTerminate m₁ tRel
-      | .unreachable => False) :
+      | .unreachable => False)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
     wpCallSite adapter ⟨none, uAct⟩ isCleanupBb
       spec.frameTags onNormal onCleanup onUnwindExit onTerminate m₀ t₀ := by
   unfold wpCallSite wpOutcome
@@ -1912,15 +2331,19 @@ theorem callSpecCut_call_diverging_unwind [wops : MirWpOps State Out Fault]
         dsimp only
         rw [hU.1]
         exact hU.2
-    | abortTerminate _ _ => exact False.elim hOut
+    | abortTerminate m₁ t₁ =>
+      dsimp only at hOut ⊢
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact hAbort m₁ t₁ hCanA hUpd hPost
 
 /-- Multi-frame unwind propagation chain rule (`StackFrameState`): when a
 callee satisfies `CallSpecCut` at a `.continue_` call site and its unwind
 propagates across a chain of `.continue_` caller frames (`prefixFrames`)
 releasing each frame's `callerTags` sequentially via `exitFrameWithProtectors`
-into `suffixFrames`, the combined call site discharges normal return and
-multi-frame `wpUnwindStack` while preserving `UpdatesOnly spec.modifies m₀ m₁`
-and stripping all callee + intermediate caller protector tags. -/
+into `suffixFrames`, the combined call site discharges normal return,
+multi-frame `wpUnwindStack`, and callee aborts while preserving
+`UpdatesOnly spec.modifies m₀ m₁` and stripping all callee + intermediate
+caller protector tags. -/
 theorem callSpecCut_unwind_propagate_chain {FrameCtx : Type b}
     [wops : MirWpOps State Out Fault] [ops : ByteStoreOps Mem Addr Byte]
     {adapter : CalleeMachineAdapter State Out Mem Val}
@@ -1952,7 +2375,12 @@ theorem callSpecCut_unwind_propagate_chain {FrameCtx : Type b}
       ∃ tFinal : Anneal.RefFrame.RangedBorrowTree,
         ContinueChainReleases prefixFrames tRel tFinal ∧
         wpUnwindStack onCleanupFrame onRootUnwind onAbortTerminate
-          suffixFrames m₁ tFinal) :
+          suffixFrames m₁ tFinal)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
     wpCallSite adapter ⟨some retBb, .continue_⟩ isCleanupBb spec.frameTags
       onNormal onCleanup
       (wpUnwindStack onCleanupFrame onRootUnwind onAbortTerminate
@@ -1962,10 +2390,11 @@ theorem callSpecCut_unwind_propagate_chain {FrameCtx : Type b}
     (fun m₁ tRel hCanU hUpd hStripped hPost => by
       let ⟨tFinal, hRelChain, hSuf⟩ := hChain m₁ tRel hCanU hUpd hStripped hPost
       exact wpUnwindStack_append_continue_chain hRelChain hSuf)
+    hAbort
 
 /-- Disjoint-lens frame rule for `CallSpecCut`: for any bystander lens `other`
-pairwise disjoint from `spec.modifies`, every normal return and every unwind
-exit of the callee preserves `other.get m₁ = other.get m₀`. -/
+pairwise disjoint from `spec.modifies`, every normal return, unwind exit, and
+abort exit of the callee preserves `other.get m₁ = other.get m₀`. -/
 theorem callSpecCut_frame_disjoint [wops : MirWpOps State Out Fault]
     [ops : ByteStoreOps Mem Addr Byte] [LawfulByteStoreOps Mem Addr Byte]
     {adapter : CalleeMachineAdapter State Out Mem Val}
@@ -1993,7 +2422,10 @@ theorem callSpecCut_frame_disjoint [wops : MirWpOps State Out Fault]
             Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
               ⟨tRel, .Released⟩ ∧
             spec.postUnwind m₁ tRel
-        | some (.abortTerminate _ _) => False)
+        | some (.abortTerminate m₁ t₁) =>
+          spec.canAbort = true ∧
+          other.get m₁ = other.get m₀ ∧
+          spec.postAbort m₁ t₁)
       (fun _ => False)
       (adapter.mkEntry m₀ t₀) := by
   unfold wpOutcome
@@ -2011,7 +2443,193 @@ theorem callSpecCut_frame_disjoint [wops : MirWpOps State Out Fault]
     | unwound m₁ t₁ =>
       let ⟨hCanU, hUpd, tRel, hRel, hPost⟩ := hOut
       exact ⟨hCanU, updatesOnly_frame_disjoint hDisj hUpd, tRel, hRel, hPost⟩
-    | abortTerminate _ _ => exact False.elim hOut
+    | abortTerminate m₁ t₁ =>
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact ⟨hCanA, updatesOnly_frame_disjoint hDisj hUpd, hPost⟩
+
+/-- Auxiliary-projection frame rule for `CallSpecCut`: any write-invariant
+projection `proj` (such as metadata stored alongside bytes) is preserved on
+normal return, unwind, and abort exits. -/
+theorem CallSpecCut.frame_preserves_proj {V : Sort b} {proj : Mem → V}
+    [wops : MirWpOps State Out Fault] [ops : ByteStoreOps Mem Addr Byte]
+    (hPres : ops.WritePreserves proj)
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    {m₀ : Mem} {t₀ : Anneal.RefFrame.RangedBorrowTree}
+    (hCut : CallSpecCut adapter spec)
+    (hPre : spec.pre m₀ t₀) :
+    wpOutcome (ops := wops)
+      (fun out =>
+        match adapter.classifyOut out with
+        | none => False
+        | some (.returned retVal m₁ t₁) =>
+          spec.canNormal = true ∧ proj m₁ = proj m₀ ∧
+          ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+            Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+              ⟨tRel, .Released⟩ ∧
+            spec.postRet retVal m₁ tRel
+        | some (.unwound m₁ t₁) =>
+          spec.canUnwind = true ∧ proj m₁ = proj m₀ ∧
+          ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+            Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+              ⟨tRel, .Released⟩ ∧
+            spec.postUnwind m₁ tRel
+        | some (.abortTerminate m₁ t₁) =>
+          spec.canAbort = true ∧ proj m₁ = proj m₀ ∧
+          spec.postAbort m₁ t₁)
+      (fun _ => False)
+      (adapter.mkEntry m₀ t₀) := by
+  unfold wpOutcome
+  refine wpUntil_mono (ops := wops) (fun _ hf => hf) ?_ (fun _ hf => hf)
+    (hCut m₀ t₀ hPre)
+  intro out hOut
+  cases hCls : adapter.classifyOut out with
+  | none => rw [hCls] at hOut; exact False.elim hOut
+  | some ex =>
+    rw [hCls] at hOut
+    cases ex with
+    | returned retVal m₁ t₁ =>
+      let ⟨hCanN, hUpd, tRel, hRel, hPost⟩ := hOut
+      exact ⟨hCanN, updatesOnly_preserves_proj hPres hUpd, tRel, hRel, hPost⟩
+    | unwound m₁ t₁ =>
+      let ⟨hCanU, hUpd, tRel, hRel, hPost⟩ := hOut
+      exact ⟨hCanU, updatesOnly_preserves_proj hPres hUpd, tRel, hRel, hPost⟩
+    | abortTerminate m₁ t₁ =>
+      let ⟨hCanA, hUpd, hPost⟩ := hOut
+      exact ⟨hCanA, updatesOnly_preserves_proj hPres hUpd, hPost⟩
+
+/-- Rule of consequence for `CallSpecCut`: strengthens `pre`, weakens
+`postRet` / `postUnwind` / `postAbort`, enlarges `modifies` via
+`UpdatesOnly.mono_subset`, and relaxes `canNormal` / `canUnwind` / `canAbort`
+for the same `frameTags`. -/
+theorem CallSpecCut.weaken [wops : MirWpOps State Out Fault]
+    [ops : ByteStoreOps Mem Addr Byte]
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec₁ spec₂ : CallSpec Mem Addr Val}
+    (hTags : spec₂.frameTags = spec₁.frameTags)
+    (hPre : ∀ m t, spec₂.pre m t → spec₁.pre m t)
+    (hMod : ∀ L, L ∈ spec₁.modifies → L ∈ spec₂.modifies)
+    (hCanN : spec₁.canNormal = true → spec₂.canNormal = true)
+    (hCanU : spec₁.canUnwind = true → spec₂.canUnwind = true)
+    (hCanA : spec₁.canAbort = true → spec₂.canAbort = true)
+    (hPostR : ∀ rv m t, spec₁.postRet rv m t → spec₂.postRet rv m t)
+    (hPostU : ∀ m t, spec₁.postUnwind m t → spec₂.postUnwind m t)
+    (hPostA : ∀ m t, spec₁.postAbort m t → spec₂.postAbort m t)
+    (hCut : CallSpecCut adapter spec₁) :
+    CallSpecCut adapter spec₂ := by
+  intro m₀ t₀ hPre₂
+  unfold wpOutcome
+  refine wpUntil_mono (ops := wops) (fun _ hf => hf) ?_ (fun _ hf => hf)
+    (hCut m₀ t₀ (hPre m₀ t₀ hPre₂))
+  intro out hOut
+  cases hCls : adapter.classifyOut out with
+  | none => rw [hCls] at hOut; exact False.elim hOut
+  | some ex =>
+    rw [hCls] at hOut
+    cases ex with
+    | returned retVal m₁ t₁ =>
+      let ⟨hN, hUpd, tRel, hRel, hP⟩ := hOut
+      refine ⟨hCanN hN, UpdatesOnly.mono_subset hMod hUpd, tRel, ?_, hPostR _ _ _ hP⟩
+      rw [hTags]
+      exact hRel
+    | unwound m₁ t₁ =>
+      let ⟨hU, hUpd, tRel, hRel, hP⟩ := hOut
+      refine ⟨hCanU hU, UpdatesOnly.mono_subset hMod hUpd, tRel, ?_, hPostU _ _ hP⟩
+      rw [hTags]
+      exact hRel
+    | abortTerminate m₁ t₁ =>
+      let ⟨hA, hUpd, hP⟩ := hOut
+      exact ⟨hCanA hA, UpdatesOnly.mono_subset hMod hUpd, hPostA _ _ hP⟩
+
+/-- Pointwise step-function congruence for deterministic `CallSpecCut`
+(`0 Quot.sound`), enabling `BlockTree`-backed callee proofs to transport
+directly to list-backed lookup. -/
+theorem CallSpecCut.congr_step [ops : ByteStoreOps Mem Addr Byte]
+    {step₁ step₂ : State → StepOutcome State Out Fault}
+    {tag₁ tag₂ : State → Option Nat}
+    (hEq : ∀ s : State, step₁ s = step₂ s)
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    (hCut : CallSpecCut (wops := MirWpOps.ofDetStep step₁ tag₁) adapter spec) :
+    CallSpecCut (wops := MirWpOps.ofDetStep step₂ tag₂) adapter spec := by
+  intro m₀ t₀ hPre
+  have hAux : ∀ s : State,
+      wpUntil (ops := MirWpOps.ofDetStep step₁ tag₁)
+        (fun _ => False)
+        (fun out =>
+          match adapter.classifyOut out with
+          | none => False
+          | some (.returned retVal m₁ t₁) =>
+            spec.canNormal = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+              Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+                ⟨tRel, .Released⟩ ∧
+              spec.postRet retVal m₁ tRel
+          | some (.unwound m₁ t₁) =>
+            spec.canUnwind = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+              Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+                ⟨tRel, .Released⟩ ∧
+              spec.postUnwind m₁ tRel
+          | some (.abortTerminate m₁ t₁) =>
+            spec.canAbort = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            spec.postAbort m₁ t₁)
+        (fun _ => False) s →
+      wpUntil (ops := MirWpOps.ofDetStep step₂ tag₂)
+        (fun _ => False)
+        (fun out =>
+          match adapter.classifyOut out with
+          | none => False
+          | some (.returned retVal m₁ t₁) =>
+            spec.canNormal = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+              Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+                ⟨tRel, .Released⟩ ∧
+              spec.postRet retVal m₁ tRel
+          | some (.unwound m₁ t₁) =>
+            spec.canUnwind = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+              Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+                ⟨tRel, .Released⟩ ∧
+              spec.postUnwind m₁ tRel
+          | some (.abortTerminate m₁ t₁) =>
+            spec.canAbort = true ∧
+            UpdatesOnly spec.modifies m₀ m₁ ∧
+            spec.postAbort m₁ t₁)
+        (fun _ => False) s := by
+    intro s hW
+    induction hW with
+    | here hf => exact False.elim hf
+    | step mid hStep _ ih =>
+      refine wpUntil_step (ops := MirWpOps.ofDetStep step₂ tag₂) ?_
+      change (step₂ _).wp _ _ _
+      rw [← hEq]
+      exact StepOutcome.wp_mono ih (fun _ ho => ho) (fun _ hf => hf) hStep
+  exact hAux (adapter.mkEntry m₀ t₀) (hCut m₀ t₀ hPre)
+
+/-- `0 Quot.sound` pointwise `BlockTree` transport for deterministic
+`CallSpecCut`. -/
+theorem CallSpecCut.of_validBlockTree {BB : Type b}
+    [ops : ByteStoreOps Mem Addr Byte]
+    {blocks : List BB} {bt : BlockTree BB} (hValid : ValidBlockTree blocks bt)
+    (stepWith : (Nat → Option BB) → State → StepOutcome State Out Fault)
+    (hPointwise : ∀ (f g : Nat → Option BB) (s : State),
+      (∀ i, f i = g i) → stepWith f s = stepWith g s)
+    {tag : State → Option Nat}
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    (hCut : CallSpecCut
+      (wops := MirWpOps.ofDetStep (stepWith bt.lookupForced?) tag) adapter spec) :
+    CallSpecCut
+      (wops := MirWpOps.ofDetStep (stepWith (listGet? blocks)) tag) adapter spec :=
+  CallSpecCut.congr_step
+    (fun s => hPointwise _ _ s (fun i =>
+      (bt.lookupForced?_eq i).trans (hValid.2 i))) hCut
 
 /-- Lifts a `CallSpecCut` directly into a fuel-free `ParametricCore.StageCut`
 over `[wops : MirWpOps State Out Fault]`. -/
@@ -2038,7 +2656,9 @@ theorem CallSpecCut.to_stageCut [wops : MirWpOps State Out Fault]
             Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
               ⟨tRel, .Released⟩ ∧
             spec.postUnwind m₁ tRel
-        | some (.abortTerminate _ _) => False)
+        | some (.abortTerminate m₁ t₁) =>
+          spec.canAbort = true ∧
+          spec.postAbort m₁ t₁)
       (fun _ => False) :=
   StageCut.intro (ops := wops) (fun _ hEntry => by
     let ⟨m₀, t₀, hEq, hPre⟩ := hEntry
@@ -2057,7 +2677,9 @@ theorem CallSpecCut.to_stageCut [wops : MirWpOps State Out Fault]
       | unwound m₁ t₁ =>
         let ⟨hCanU, _, tRel, hRel, hPost⟩ := hOut
         exact ⟨hCanU, tRel, hRel, hPost⟩
-      | abortTerminate _ _ => exact False.elim hOut)
+      | abortTerminate m₁ t₁ =>
+        let ⟨hCanA, _, hPost⟩ := hOut
+        exact ⟨hCanA, hPost⟩)
 
 /-- Fail-closed: if a deterministic callee terminates immediately with a
 normal return `.returned`, `wpCallSite` at a diverging call site
@@ -2132,6 +2754,37 @@ theorem not_wpCallSite_unreachable_of_done_unwound
       | MissingTag _ => exact hStep
       | AccessFailure _ _ _ _ => exact hStep
       | InvariantFailure _ _ _ => exact hStep
+
+/-- Fail-closed: if a deterministic callee terminates immediately with a
+process abort `.abortTerminate m₁ t₁` and the caller's `onTerminate` rejects
+`(m₁, t₁)`, then `wpCallSite` is strictly refutable (`¬ wpCallSite ...`). -/
+theorem not_wpCallSite_of_done_abort_rejected
+    {step : State → StepOutcome State Out Fault}
+    {tag : State → Option Nat}
+    (adapter : CalleeMachineAdapter State Out Mem Val)
+    (cont : CallCont4) (isCleanupBb : Nat → Bool) (frameTags : List Nat)
+    (onNormal : Nat → Val → Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (onCleanup : Nat → Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (onUnwindExit : Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (onTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (m₀ m₁ : Mem) (t₀ t₁ : Anneal.RefFrame.RangedBorrowTree)
+    (out : Out)
+    (hDone : step (adapter.mkEntry m₀ t₀) = .done out)
+    (hCls : adapter.classifyOut out = some (.abortTerminate m₁ t₁))
+    (hReject : ¬ onTerminate m₁ t₁) :
+    ¬ wpCallSite (wops := MirWpOps.ofDetStep step tag) adapter
+        cont isCleanupBb frameTags onNormal onCleanup onUnwindExit
+        onTerminate m₀ t₀ := by
+  intro hWp
+  cases (wpUntil_unfold_iff (ops := MirWpOps.ofDetStep step tag)).mp hWp with
+  | inl hFalse => exact hFalse
+  | inr hStep =>
+    change (step (adapter.mkEntry m₀ t₀)).wp _ _ _ at hStep
+    rw [hDone] at hStep
+    dsimp only [StepOutcome.wp] at hStep
+    rw [hCls] at hStep
+    dsimp only at hStep
+    exact hReject hStep
 
 end CallSpecCutSec
 
@@ -2413,7 +3066,8 @@ theorem canary_callSpecCut_cleanup_and_indexedCut (shouldPanic : Bool) :
             updatesOnly_frame_disjoint hDisj hUpd, hStrip 2 rfl⟩)
         (fun m₁ tRel _ hUpd hStrip hPost =>
           ⟨rfl, hPost.1,
-            updatesOnly_frame_disjoint hDisj hUpd, hStrip 2 rfl⟩))
+            updatesOnly_frame_disjoint hDisj hUpd, hStrip 2 rfl⟩)
+        (fun _ _ hA _ _ => by cases hA))
     hIc
 
 /-- Canary 4 (Positive): Multi-frame `.continue_` unwind propagation chain
@@ -2506,6 +3160,7 @@ theorem canary_callSpecCut_multiframe_continue_chain :
       refine ⟨t2, ⟨rfl, t2, rfl, rfl⟩, ?_⟩
       exact ⟨rfl, rfl, rfl, hPost.1,
         updatesOnly_frame_disjoint hDisj hUpd, rfl⟩)
+    (fun _ _ hA _ _ => by cases hA)
 
 /-- Canary 5 (Negative / Fail-Closed):
 1. Foreign write on an accessed protected tag raises `.ProtectedDisabled`
@@ -2626,5 +3281,87 @@ theorem canary_coframe_protector_active_during_exit_access :
       (t := 2) _ _ _ _ rfl rfl).1
   · exact (evalProtectedRefFrameExit_fault_of_unprotected_frameTag
       (t := 2) _ _ _ _ rfl rfl).2
+
+/-- Canary 6 (Positive + Negative): Callee abort propagation (`canAbort = true`),
+`UpdatesOnly` validity (`lens_valid_after_updatesOnly_self`), disjoint framing
+across `.abortTerminate`, and fail-closed rejection when `onTerminate` forbids
+aborts (`not_wpCallSite_of_done_abort_rejected`). -/
+theorem canary_callSpecCut_abort_terminate_and_frame :
+    let tree0 := Anneal.RefFrame.mkSharedTopo3Tree16 .Frozen true .Unique true [1, 2]
+    let abortStep : CsuCalleeState →
+        StepOutcome CsuCalleeState (FrameExitOutcome CsuMem Nat) Unit := fun s =>
+      match csuDstLens.set s.mem (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns) with
+      | none => .fault ()
+      | some m' => .done (.abortTerminate m' s.tree)
+    wpCallSite (wops := MirWpOps.ofDetStep abortStep (fun _ => none))
+      (csuAdapter true) ⟨some 10, .terminate⟩ (fun _ => false) [2]
+      (fun _ _ _ _ => False) (fun _ _ _ => False) (fun _ _ => False)
+      (fun m _ =>
+        csuDstLens.get m = some (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns) ∧
+        csuSrcLens.get m = csuSrcLens.get csuInitialMem ∧
+        (∃ bs, csuDstLens.get m = some bs ∧ bs.length = 8))
+      csuInitialMem tree0 ∧
+    (¬ wpCallSite (wops := MirWpOps.ofDetStep abortStep (fun _ => none))
+        (csuAdapter true) ⟨some 10, .terminate⟩ (fun _ => false) [2]
+        (fun _ _ _ _ => True) (fun _ _ _ => True)
+        (fun _ _ => True) (fun _ _ => False)
+        csuInitialMem tree0) := by
+  let tree0 := Anneal.RefFrame.mkSharedTopo3Tree16 .Frozen true .Unique true [1, 2]
+  let abortStep : CsuCalleeState →
+      StepOutcome CsuCalleeState (FrameExitOutcome CsuMem Nat) Unit := fun s =>
+    match csuDstLens.set s.mem (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns) with
+    | none => .fault ()
+    | some m' => .done (.abortTerminate m' s.tree)
+  let abortSpec : CallSpec CsuMem Nat Nat :=
+    { pre := fun m _ => ∃ bs, csuDstLens.get m = some bs
+      postRet := fun _ _ _ => False
+      postUnwind := fun _ _ => False
+      postAbort := fun m _ =>
+        csuDstLens.get m = some (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns)
+      modifies := [csuDstLens]
+      frameTags := [2]
+      canNormal := false
+      canUnwind := false
+      canAbort := true }
+  have hDisj : ∀ L : ByteSubLens Nat, L ∈ abortSpec.modifies →
+      L.Disjoint CsuMem csuSrcLens :=
+    allDisjoint_of_allNatLensesSeparatedBool rfl
+  have hGet0 : csuDstLens.get csuInitialMem =
+      some (csuInitialBytes.drop 8 |>.take 8) := rfl
+  have hAbortCut :
+      CallSpecCut (wops := MirWpOps.ofDetStep abortStep (fun _ => none))
+        (csuAdapter true) abortSpec := by
+    apply seal_callSpecCut (wops := MirWpOps.ofDetStep abortStep (fun _ => none))
+    intro m₀ t₀ hPre
+    let ⟨old, hGet⟩ := hPre
+    refine wpUntil_step (ops := MirWpOps.ofDetStep abortStep (fun _ => none)) ?_
+    change (abortStep ⟨true, m₀, t₀⟩).wp _ _ _
+    let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get
+      (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns) hGet rfl
+    dsimp only [abortStep]
+    rw [hSet]
+    exact ⟨rfl, UpdatesOnly.of_single_set hSet, ByteSubLens.get_set hSet⟩
+  refine ⟨?_, ?_⟩
+  · exact callSpecCut_call_normal_terminate
+      (wops := MirWpOps.ofDetStep abortStep (fun _ => none))
+      hAbortCut ⟨_, hGet0⟩
+      (fun _ _ _ hN _ _ _ => by cases hN)
+      (fun _ _ hU _ _ _ => by cases hU)
+      (fun m₁ _ _ hUpd hPost => by
+        let ⟨bs, hG, hLen, _⟩ := lens_valid_after_updatesOnly_self hGet0 hUpd
+        exact ⟨hPost, updatesOnly_frame_disjoint hDisj hUpd, bs, hG, hLen⟩)
+  · let ⟨m', hSet⟩ := ByteSubLens.set_isSome_of_get
+      (flattenByteRuns (ByteRunCodec.id Nat) csuPartialRuns) hGet0 rfl
+    have hDone : abortStep ⟨true, csuInitialMem, tree0⟩ =
+        .done (.abortTerminate m' tree0) := by
+      dsimp only [abortStep]
+      rw [hSet]
+    exact not_wpCallSite_of_done_abort_rejected
+      (step := abortStep) (tag := fun _ => none)
+      (csuAdapter true) ⟨some 10, .terminate⟩ (fun _ => false) [2]
+      (fun _ _ _ _ => True) (fun _ _ _ => True)
+      (fun _ _ => True) (fun _ _ => False)
+      csuInitialMem m' tree0 tree0 (.abortTerminate m' tree0) hDone rfl
+      (fun hF => hF)
 
 end Anneal.ParametricCore
