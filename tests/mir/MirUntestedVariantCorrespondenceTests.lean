@@ -3238,6 +3238,12 @@ def mainCatchUnwindBody : CapturedMir :=
      { statements := [assignU32 0 99], terminator := { kind := .return_, span := "w" },
        isCleanup := true }]
 
+/-- The active body (`none` for the root body) and program counter of a running state. -/
+def activeAt? : Option MirExecState → Option (Option DefPath × Nat × Nat)
+  | some (.running s) =>
+    some (s.memory.activeCallee.map (·.defPath), s.frame.blockIdx, s.frame.stmtIdx)
+  | _ => none
+
 /-- **LeanMiri witnesses (unwinding out of a tail-callee).** `main` (root) below `f`, which
 returns into `bb1` and keeps unwinding (`continue_`). After `f` tail-calls a non-unwinding
 `g`, an unwind out of `g` is UB ("unwinding past a frame that does not allow unwinding");
@@ -3281,6 +3287,9 @@ theorem tailCall_leanMiri_witness_unwind :
     execN fUnwindBody 2
         (.running (initMachineStateWithCallees fUnwindBody [] [gUnwindBodyU])) =
       some (.halted .panic) ∧
+    activeAt? (execN mainCatchUnwindBody 2
+        (.running (initMachineStateWithCallees mainCatchUnwindBody [] [fUnwindBody, gUnwindBody]))) =
+      some (some "w::gunw", 0, 0) ∧
     execN mainCatchUnwindBody 3
         (.running (initMachineStateWithCallees mainCatchUnwindBody [] [fUnwindBody, gUnwindBody])) =
       some (.faulted .ub) ∧
@@ -3297,17 +3306,11 @@ theorem tailCall_leanMiri_witness_unwind :
     resumeExternalTailCallWithAbi false (some true)
         (.panicked (initMachineState fExtBody [.scalar ⟨7, 4⟩]).memory) =
       .faulted .ub :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- The borrow table of a running state. -/
 def borrowsOf? : Option MirExecState → Option (List BorrowEntry)
   | some (.running s) => some s.memory.borrows
-  | _ => none
-
-/-- The active body (`none` for the root body) and program counter of a running state. -/
-def activeAt? : Option MirExecState → Option (Option DefPath × Nat × Nat)
-  | some (.running s) =>
-    some (s.memory.activeCallee.map (·.defPath), s.frame.blockIdx, s.frame.stmtIdx)
   | _ => none
 
 /-- **Resolved correspondence (dangling tail-caller local; formerly the Trusted soundness gap
@@ -3496,11 +3499,14 @@ theorem tailCall_witness_root_caller_referent_simulation :
     haltedVal? (execN fMixBody 11
         (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
           [.ptr ⟨1, 0⟩ 8] (mixMem 1)))) = some (.scalar ⟨42, 4⟩) ∧
+    activeAt? (execN fMixBody 9
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
+          [.ptr ⟨1, 0⟩ 8] (mixMem 2)))) = some (some "w::gfin", 0, 2) ∧
     execN fMixBody 10
         (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
           [.ptr ⟨1, 0⟩ 8] (mixMem 2))) =
       some (.faulted .ub) :=
-  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
 
 /-- Typed statement pin of the resolved root caller-referent correspondence
 (`DIV-TR-TAILCALL-ROOT-CALLER-REFERENT-SHADOW`). -/
@@ -3545,6 +3551,9 @@ example :
     haltedVal? (execN fMixBody 11
         (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
           [.ptr ⟨1, 0⟩ 8] (mixMem 1)))) = some (.scalar ⟨42, 4⟩) ∧
+    activeAt? (execN fMixBody 9
+        (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
+          [.ptr ⟨1, 0⟩ 8] (mixMem 2)))) = some (some "w::gfin", 0, 2) ∧
     execN fMixBody 10
         (.running (Trusted.VerificationResult.initMachineStateWithMemory fMixBody
           [.ptr ⟨1, 0⟩ 8] (mixMem 2))) =
