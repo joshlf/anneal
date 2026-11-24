@@ -617,7 +617,7 @@ def _check_trusted_step(
     return step, _receipt_sha(obj.get("commit_sha"), source, "commit_sha")
 
 
-def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
+def _nightly_step(obj: object, source: str) -> tuple[Step, list[str]]:
     if not isinstance(obj, dict):
         raise _bad(source, "a nightly step must be a JSON object")
     name = obj.get("name")
@@ -625,6 +625,7 @@ def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
     if (
         not isinstance(name, str)
         or not name.strip()
+        or name != name.strip()
         or "\n" in name
         or "\r" in name
         or not isinstance(status, str)
@@ -638,7 +639,7 @@ def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
     if (status == "PASS") != (exit_code == 0):
         raise _bad(where, f"status {status!r} contradicts exit code {exit_code}", "INCONSISTENT_RECEIPT")
     step = Step(
-        step_id=name.strip(),
+        step_id=name,
         kind="nightly",
         source=source,
         command=_opt_str(obj, "command", where),
@@ -646,7 +647,13 @@ def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
         ok=status == "PASS",
         status=status,
     )
-    return step, _receipt_sha(obj.get("commit_sha"), where, "commit_sha")
+    step_shas: list[str] = []
+    for sha_key in ("commit_sha", "git_sha", "unstable_commit_sha"):
+        if sha_key in obj:
+            sha = _receipt_sha(obj.get(sha_key), where, sha_key)
+            if sha is not None:
+                step_shas.append(sha)
+    return step, step_shas
 
 
 def load_receipt(
@@ -709,9 +716,9 @@ def load_receipt(
             raise _bad(source, "a STEP_ID= prefix cannot name a multi-step dashboard")
         loaded_steps: list[Step] = []
         for entry in entries:
-            step, sha = _nightly_step(entry, source)
+            step, entry_shas = _nightly_step(entry, source)
             loaded_steps.append(step)
-            shas += [sha] if sha else []
+            shas += entry_shas
         steps_total = _opt_int(p2, "steps_total", source)
         steps_passed = _opt_int(p2, "steps_passed", source)
         steps_failed = _opt_int(p2, "steps_failed", source)
@@ -727,6 +734,15 @@ def load_receipt(
         top_overall = _opt_str(obj, "overall_status", source, allow_empty=False)
         if (overall == "PASS" or top_overall == "PASS") and actual_failed > 0:
             raise _bad(source, "`overall_status` is PASS but a nightly step failed", "INCONSISTENT_RECEIPT")
+        if (
+            (overall is not None and overall != "PASS")
+            or (top_overall is not None and top_overall != "PASS")
+        ) and actual_failed == 0:
+            raise _bad(
+                source,
+                "`overall_status` is not PASS despite all listed nightly steps passing",
+                "INCONSISTENT_RECEIPT",
+            )
         steps += loaded_steps
         for key in ("unstable_commit_sha", "git_sha", "commit_sha"):
             if key in obj:
@@ -734,10 +750,10 @@ def load_receipt(
                 if sha is not None:
                     shas.append(sha)
     elif not stdout_form and {"name", "status", "exit_code"} <= set(obj):
-        step, sha = _nightly_step(obj, source)
+        step, entry_shas = _nightly_step(obj, source)
         step.step_id = single(step.step_id)
         steps.append(step)
-        shas += [sha] if sha else []
+        shas += entry_shas
     elif stdout_form or set(obj) & {"kernelDeclarations", "claimTheoremsChecked", "replayedDeclarations",
                                     "sourceSha256", "rustcCapture"}:
         step, sha = _check_trusted_step(obj, single("check_trusted"), source, stdout_form=stdout_form)
@@ -850,9 +866,9 @@ _STATUS_RE = re.compile(
 _OK_RE = re.compile(r"(?i)(?<![\w-])[*_]*ok[*_]*\s*(==|!=|≠|[=:])\s*[`*_]*(true|false)\b")
 _VERDICT_TOKEN_RE = re.compile(r"(?<![\w/.-])(PASS(?:ED)?|FAIL(?:ED)?|OK|✅|❌)(?![\w/-]|\.\w|\()")
 _SCOPED_VERDICT_RE = re.compile(
-    r"(?i)(?:(?<=\|)|(?<=:))\s*[`*_]*\b(?P<neg>not\s+)?"
-    r"(?P<word>pass(?:ed|ing)?|green|succeed(?:ed)|success|fail(?:ed|ing|ure)?)\b[`*_]*\s*"
-    r"(?=\||[.;]|$)"
+    r"(?i)(?:(?<=\|)|(?<=:))\s*[`*_]*\b(?P<neg>(?:not|never|did\s+not|didn't|does\s+not|doesn't|failed\s+to)\s+)?"
+    r"(?P<word>pass(?:ed|ing)?|green|ok|succeed(?:ed)|success|fail(?:ed|ing|ure)?|red|error|timeout)\b[`*_]*\s*"
+    r"(?=\||[.;,()]|$)"
 )
 _ALL_PASS_RE = re.compile(
     r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
@@ -886,7 +902,9 @@ _SHA_CLAIM_RE = re.compile(
     r"(?:\s+(?:is|was|at|of)){0,2}[`*_]*\s*(?P<sep>[:=|@]|->|→)?[*_]*\s*(?P<paren>\()?\s*[*_]*(?P<tick>[`'\"]?)(?P<value>[0-9A-Za-z/_.?<>-]+)"
 )
 _EXPLICIT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|hash|revision|commit[\s_-]+id)\b")
-_STRICT_SHA_LABEL_RE = re.compile(r"(?i)\b(?:sha(?:-?1)?|(?:commit|git|head|base)[\s_-]+hash)\b")
+_STRICT_SHA_LABEL_RE = re.compile(
+    r"(?i)\b(?:sha(?:-?1)?|(?:commit|git|head|base)[\s_-]+hash|commit[\s_-]+id|revision)\b"
+)
 _TABLE_NON_SHA_HEADERS: frozenset[str] = frozenset({
     "status", "result", "verdict", "outcome", "step", "steps", "notes", "note",
     "details", "detail", "check", "checks", "value", "description", "summary",
@@ -934,6 +952,12 @@ _TABLE_CELL_COMPOUND_LABELS_RE = re.compile(
     + r")+)(?:\s*\([^)\n]*\))?\s*$"
 )
 _LABEL_ITEM_RE = re.compile(r"`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9_.-]*)")
+_HEADING_PREFIX_RE = re.compile(r"^\s*#{1,6}\s+")
+_HEADING_SINGLE_LABEL_RE = re.compile(
+    r"(?i)^(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*|([A-Za-z0-9][A-Za-z0-9.-]*_[A-Za-z0-9_.-]*))"
+    r"(?:\s+(?:verification|results?|summary|report|audit|checks?|gates?|status|output|receipts?))*"
+    r"(?:\s*\([^)\n]*\))?\s*$"
+)
 _HEADING_CODE_STEP_RE = re.compile(r"^\s*#{1,6}\s+`([^`\n]+)`\s*$")
 _HEADING_BARE_STEP_RE = re.compile(r"^\s*#{1,6}\s+(?:\*\*)?([A-Za-z0-9][A-Za-z0-9.-]*_[A-Za-z0-9_.-]*)(?:\*\*)?\s*$")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
@@ -1202,19 +1226,56 @@ def _line_refs(
         if lead_added and m_lead.end() > m_lead.end(grp):
             lead_paren_span = (m_lead.end(grp), m_lead.end())
     elif not in_fence and not is_table:
-        m_comp = _COMPOUND_LEADING_LABELS_RE.match(line)
-        if m_comp is not None:
-            base_off = m_comp.start("head")
-            comp_added = False
-            for m_item in _LABEL_ITEM_RE.finditer(m_comp.group("head")):
-                igrp = 1 if m_item.group(1) is not None else (2 if m_item.group(2) is not None else 3)
-                tok_text = m_item.group(igrp)
-                if igrp == 3 and tok_text.lower() == "and":
-                    continue
-                if add_lead_item(igrp, tok_text, base_off + m_item.start(igrp), base_off + m_item.end(igrp)):
-                    comp_added = True
-            if comp_added and m_comp.end() > m_comp.end("head"):
-                lead_paren_span = (m_comp.end("head"), m_comp.end())
+        m_hpre = _HEADING_PREFIX_RE.match(line)
+        if m_hpre is not None:
+            h_lo = m_hpre.end()
+            h_body = line[h_lo:]
+            m_hsingle = _HEADING_SINGLE_LABEL_RE.match(h_body)
+            if m_hsingle is not None:
+                grp = 1 if m_hsingle.group(1) is not None else (2 if m_hsingle.group(2) is not None else 3)
+                h_added = add_lead_item(
+                    grp,
+                    m_hsingle.group(grp),
+                    h_lo + m_hsingle.start(grp),
+                    h_lo + m_hsingle.end(grp),
+                    allow_slash_bare=True,
+                )
+                if h_added and m_hsingle.end() > m_hsingle.end(grp):
+                    lead_paren_span = (h_lo + m_hsingle.end(grp), h_lo + m_hsingle.end())
+            else:
+                m_hcomp = _TABLE_CELL_COMPOUND_LABELS_RE.match(h_body)
+                if m_hcomp is not None:
+                    base_off = h_lo + m_hcomp.start("head")
+                    h_comp_added = False
+                    for m_item in _LABEL_ITEM_RE.finditer(m_hcomp.group("head")):
+                        igrp = 1 if m_item.group(1) is not None else (2 if m_item.group(2) is not None else 3)
+                        tok_text = m_item.group(igrp)
+                        if igrp == 3 and tok_text.lower() == "and":
+                            continue
+                        if add_lead_item(
+                            igrp,
+                            tok_text,
+                            base_off + m_item.start(igrp),
+                            base_off + m_item.end(igrp),
+                            allow_slash_bare=True,
+                        ):
+                            h_comp_added = True
+                    if h_comp_added and m_hcomp.end() > m_hcomp.end("head"):
+                        lead_paren_span = (h_lo + m_hcomp.end("head"), h_lo + m_hcomp.end())
+        else:
+            m_comp = _COMPOUND_LEADING_LABELS_RE.match(line)
+            if m_comp is not None:
+                base_off = m_comp.start("head")
+                comp_added = False
+                for m_item in _LABEL_ITEM_RE.finditer(m_comp.group("head")):
+                    igrp = 1 if m_item.group(1) is not None else (2 if m_item.group(2) is not None else 3)
+                    tok_text = m_item.group(igrp)
+                    if igrp == 3 and tok_text.lower() == "and":
+                        continue
+                    if add_lead_item(igrp, tok_text, base_off + m_item.start(igrp), base_off + m_item.end(igrp)):
+                        comp_added = True
+                if comp_added and m_comp.end() > m_comp.end("head"):
+                    lead_paren_span = (m_comp.end("head"), m_comp.end())
     elif is_table and table_cells:
         c0_lo, c0_hi = table_cells[0]
         cell0 = line[c0_lo:c0_hi]
@@ -1364,12 +1425,27 @@ def _axiom_names(rest: str) -> frozenset[str] | None:
     names: set[str] = set()
     expect_more = True
     done = False
-    for chunk in trimmed.split():
+    chunks = trimmed.split()
+    for c_idx, chunk in enumerate(chunks):
         if done:
             break
         if chunk.startswith("(") and names and not expect_more:
-            # Parenthetical note after a complete list (`axioms: propext, Quot.sound (standard)`).
-            break
+            # Parenthetical note after a complete list (`axioms: propext, Quot.sound (standard)`),
+            # accepted only when balanced `(...)` reaches the end with no trailing items or axiom names.
+            tail = " ".join(chunks[c_idx:])
+            if (
+                tail.endswith((")", ")."))
+                and "," not in tail
+                and tail.count("(") == 1
+                and tail.count(")") == 1
+            ):
+                inner_note = tail.rstrip(".")[1:-1]
+                if not any(
+                    tok.strip("`'\"*_") in NEVER_ALLOWED_AXIOMS or "." in tok.strip("`'\"*_")
+                    for tok in inner_note.split()
+                ):
+                    break
+            return None
         parts = chunk.split(",")
         for p_idx, raw in enumerate(parts):
             has_comma = p_idx < len(parts) - 1
@@ -1461,7 +1537,7 @@ def _line_claims(
                 )
             else:
                 explicit = bool(sep) or bool(m.group("paren")) or bool(m.group("tick"))
-                strict_label = (bool(sep) or bool(m.group("tick"))) and bool(
+                strict_label = explicit and bool(
                     _STRICT_SHA_LABEL_RE.search(m.group("label"))
                 )
             verdict, detail = _classify_sha(
@@ -1676,6 +1752,8 @@ def _line_claims(
                 seg_pos = seg_end + 1
                 if orig_seg.strip() and not work_seg.strip():
                     continue
+                if work_seg != orig_seg and work_seg.strip().lower() in ("with", "and", "plus"):
+                    continue
                 kept_segs.append(work_seg)
             raw_rest = ",".join(kept_segs)
             take(m_list)
@@ -1833,14 +1911,14 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
     fence_state: tuple[str, int, int, int] | None = None  # (char, length, open_lineno, bq_depth)
     in_ignore = in_comment = False
     ignore_line = comment_line = 0
-    heading_ctx: tuple[str | None, str, bool] | None = None
-    para_ctx: tuple[str | None, str, bool] | None = None
+    heading_ctx: list[tuple[str | None, str, bool]] = []
+    para_ctx: list[tuple[str | None, str, bool]] = []
 
     def _audit_line(
         target: str,
         lineno: int,
         in_fence_mode: bool,
-        fallback_ctx: tuple[str | None, str, bool] | None,
+        fallback_ctx: Sequence[tuple[str | None, str, bool]],
     ) -> list[tuple[int, str | None, str, bool, bool]]:
         refs = _line_refs(target, known, in_fence_mode)
         clauses = _clause_spans(target) if not in_fence_mode else [(0, len(target))]
@@ -1873,8 +1951,8 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                 chosen_list = _select_refs_for_pos(seg_refs, seg_claim_pos, pos)
             elif refs:
                 chosen_list = _select_refs_for_pos(refs, scoped_positions, pos)
-            elif fallback_ctx is not None:
-                chosen_list = [fallback_ctx]
+            elif fallback_ctx:
+                chosen_list = list(fallback_ctx)
             else:
                 chosen_list = []
             if not chosen_list:
@@ -1899,7 +1977,7 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                                   "fenced code block is never closed")
                     )
                     fence_state = None
-                    para_ctx = None
+                    para_ctx = []
                 else:
                     line = unq
         if fence_state is not None:
@@ -1911,7 +1989,7 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                 )
             if re.match(rf"^\s{{0,3}}{re.escape(f_ch)}{{{f_len},}}\s*$", line):
                 fence_state = None
-                para_ctx = None
+                para_ctx = []
                 continue
         else:
             line, in_ignore, ignore_line, in_comment, comment_line, was_ignored = (
@@ -1929,19 +2007,18 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
                 is_inline_tilde = f_ch == "~" and bool(re.search(rf"{re.escape(f_ch)}{{{f_len},}}\s*$", info))
                 if not (f_ch == "`" and "`" in info) and not is_inline_tilde:
                     fence_state = (f_ch, f_len, lineno, bq_depth)
-                    para_ctx = None
+                    para_ctx = []
                     info_s = info.strip()
-                    if info_s and (
-                        info_s.upper() in (_PASS_WORDS | _FAIL_WORDS)
-                        or not re.fullmatch(r"[A-Za-z0-9_+#.-]+", info_s)
-                    ):
+                    if info_s and info_s.upper() in (_PASS_WORDS | _FAIL_WORDS):
+                        _audit_line(f": {info_s}", lineno, False, heading_ctx)
+                    elif info_s and not re.fullmatch(r"[A-Za-z0-9_+#.-]+", info_s):
                         _audit_line(_strip_strikethrough_outside_code(info), lineno, False, heading_ctx)
                     continue
             line = _strip_strikethrough_outside_code(line)
         in_fence = fence_state is not None
         if not line.strip():
             if not in_fence:
-                para_ctx = None
+                para_ctx = []
             continue
         if not in_fence and _HISTORICAL_RE.match(line):
             ignored += 1
@@ -1949,19 +2026,19 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         is_table_row = not in_fence and line.lstrip().startswith("|")
         is_list_item = not in_fence and bool(_LIST_ITEM_RE.match(line))
         if is_table_row or is_list_item:
-            para_ctx = None
+            para_ctx = []
         refs = _audit_line(line, lineno, in_fence, para_ctx or heading_ctx)
         non_sec = [r for r in refs if not r[4]]
         ctx_pool = non_sec if non_sec else refs
         distinct = sorted({r[1:4] for r in ctx_pool}, key=repr)
         is_heading = not in_fence and line.lstrip().startswith("#")
         if is_heading:
-            heading_ctx = distinct[0] if len(distinct) == 1 else None
-            para_ctx = None
+            heading_ctx = distinct
+            para_ctx = []
         elif is_table_row:
-            para_ctx = None
+            para_ctx = []
         elif distinct:
-            para_ctx = distinct[0] if len(distinct) == 1 else None
+            para_ctx = distinct if len(distinct) == 1 else []
     if fence_state is not None:
         violations.append(
             Violation("MALFORMED_CLAIMS", fence_state[2], None,

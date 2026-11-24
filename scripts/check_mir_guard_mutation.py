@@ -5195,14 +5195,14 @@ def _has_non_let_assignment(toks: Sequence[str]) -> bool:
 
 
 def _rust_let_rhs_may_panic(rhs: Sequence[str]) -> bool:
-    """Whether an unfolded Rust `let` initializer may panic (arithmetic, shifts, indexing)."""
+    """Whether an unfolded Rust expression may panic (arithmetic, shifts, indexing)."""
     cleaned = _strip_pattern_generics(rhs)
     for idx, tok in enumerate(cleaned):
         prev = cleaned[idx - 1] if idx > 0 else ""
-        if tok in ("+", "-", "/", "%", "["):
-            return True
         is_after_val = _is_spec_word(prev) or prev[:1].isdigit() or prev in (")", "]")
-        if tok == "*" and is_after_val:
+        if tok in ("+", "-", "/", "%"):
+            return True
+        if tok in ("*", "[") and is_after_val:
             return True
         if is_after_val and cleaned[idx : idx + 2] in (["<", "<"], [">", ">"]):
             return True
@@ -5215,6 +5215,8 @@ def _rust_part_may_early_exit(toks: Sequence[str]) -> bool:
         any(word in _RUST_BLOCK_ABORT_WORDS for word in toks)
         or "?" in toks
         or _has_macro_invocation(toks)
+        or _has_non_let_assignment(toks)
+        or _rust_let_rhs_may_panic(toks)
     )
 
 
@@ -5269,6 +5271,8 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
                 return None
             target = _ident_key(lhs_s[0])
             rhs_val = _const_truth(_subst_ident_map(rhs, bindings), depth + 1)
+            if rhs_val is None and _rust_let_rhs_may_panic(rhs):
+                return None
             if rhs_val is True:
                 bindings[target] = "true"
             elif rhs_val is False:
@@ -5276,7 +5280,7 @@ def _eval_rust_block_statements(toks: Sequence[str], depth: int) -> bool | None:
             else:
                 bindings.pop(target, None)
             continue
-        if _has_non_let_assignment(stmt):
+        if _has_non_let_assignment(stmt) or _rust_let_rhs_may_panic(stmt):
             return None
     return _const_truth(_subst_ident_map(statements[-1], bindings), depth + 1)
 
@@ -5568,6 +5572,49 @@ def _strip_closure_return_type(body: Sequence[str]) -> list[str]:
     return list(body)
 
 
+def _eval_rust_matches_macro(toks: Sequence[str], depth: int) -> bool | None:
+    """Fold pure `(::? (core|std)::)? matches!(<scrutinee>, <pat> [if <guard>])` when constant."""
+    pos = 0
+    if toks[pos : pos + 1] == ["::"]:
+        pos += 1
+    while pos + 2 < len(toks) and _is_spec_word(toks[pos]) and toks[pos + 1] == "::":
+        pos += 2
+    if (
+        pos + 3 >= len(toks)
+        or toks[pos] != "matches"
+        or toks[pos + 1] != "!"
+        or toks[pos + 2] not in ("(", "[", "{")
+        or not _wrapped(toks[pos + 2 :])
+    ):
+        return None
+    inner = toks[pos + 3 : -1]
+    first_comma = _split_first_top(inner, {","})
+    if first_comma is None or not first_comma[0] or not first_comma[1]:
+        return None
+    scrutinee, rhs_pat = first_comma
+    if _rust_part_may_early_exit(scrutinee) or _has_call_expr(scrutinee):
+        return None
+    rhs_list = list(rhs_pat)
+    while rhs_list and rhs_list[-1] == ",":
+        rhs_list.pop()
+    if not rhs_list:
+        return None
+    guard_split = _split_first_top(rhs_list, {"if"})
+    pat_toks = rhs_list if guard_split is None else guard_split[0]
+    guard_val: bool | None = True
+    if guard_split is not None:
+        guard_toks = guard_split[1]
+        if _rust_part_may_early_exit(guard_toks) or _has_call_expr(guard_toks):
+            return None
+        guard_val = _const_truth(guard_toks, depth + 1)
+        if guard_val is False:
+            return False
+    alts = [alt for alt in _split_top(pat_toks, {"|"}) if alt]
+    if guard_val is True and any(_alt_is_catch_all(alt) for alt in alts):
+        return True
+    return None
+
+
 def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
     """Constant truth value of a boolean / `Prop` expression, or `None`.
 
@@ -5782,6 +5829,9 @@ def _const_truth(texts: Sequence[str], depth: int = 0) -> bool | None:
             return _const_truth(parts[0], depth + 1)
     if toks[0] == "decide" and len(toks) > 1:
         return _const_truth(toks[1:], depth + 1)
+    matches_val = _eval_rust_matches_macro(toks, depth + 1)
+    if matches_val is not None:
+        return matches_val
     if len(toks) == 1:
         atom = _unquote_ident(toks[0])
         return True if atom in _TRUE_ATOMS else False if atom in _FALSE_ATOMS else None
@@ -6395,14 +6445,23 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                     expr_lo -= 1
                     expr_hi += 1
                     changed_span = True
-            if (
-                texts[expr_hi + 1 : expr_hi + 3] in (["==", "false"], ["!=", "true"])
-                or (
-                    expr_lo >= 2
-                    and texts[expr_lo - 2 : expr_lo] in (["false", "=="], ["true", "!="])
-                )
-            ):
-                negations += 1
+                suffix2 = texts[expr_hi + 1 : expr_hi + 3]
+                if suffix2 in (["==", "false"], ["!=", "true"]):
+                    negations += 1
+                    expr_hi += 2
+                    changed_span = True
+                elif suffix2 in (["==", "true"], ["!=", "false"]):
+                    expr_hi += 2
+                    changed_span = True
+                if expr_lo >= 2:
+                    prefix2 = texts[expr_lo - 2 : expr_lo]
+                    if prefix2 in (["false", "=="], ["true", "!="]):
+                        negations += 1
+                        expr_lo -= 2
+                        changed_span = True
+                    elif prefix2 in (["true", "=="], ["false", "!="]):
+                        expr_lo -= 2
+                        changed_span = True
             guard_split = _split_first_top(rhs_pat, {"if"})
             pat_tokens = rhs_pat if guard_split is None else guard_split[0]
             guard_ok = negations % 2 == 0 and (
@@ -6555,7 +6614,7 @@ def _collect_spec_arms(text: str, lang: str) -> list[dict[str, object]]:
                     if inner_let_headers == 0:
                         break
                     inner_let_headers -= 1
-                elif nxt in (";", "in", "then"):
+                elif nxt in (";", "in"):
                     inner_let_headers = 0
                 if (
                     nxt == "match"

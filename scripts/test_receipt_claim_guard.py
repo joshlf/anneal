@@ -1599,5 +1599,97 @@ class Ep2A3AdversarialTests(GuardHarness):
         )
 
 
+class Ep2B4AdversarialTests(GuardHarness):
+    """Pass B4 adversarial regression tests closing A3's Shard B bypasses and regressions."""
+
+    def test_scoped_mixed_case_verdicts_with_commas_parens_negation_and_fence_info(self) -> None:
+        red_cargo = [bundle(cargo_test={"exit_code": 1, "failed_count": 1})]
+        red_unit = [bundle(unit_tests={"returncode": 1, "ok": False, "failed_count": 1})]
+        # Comma/paren-followed mixed-case verdicts, `Ok`, and mixed-case fence openers catch failures!
+        for prose, recs in (
+            ("- `cargo_test`: Passed, 118 passed\n", red_cargo),
+            ("| `cargo_test` | Passed, 118 passed |\n", red_cargo),
+            ("- `cargo_test`: Green (all good)\n", red_cargo),
+            ("| `cargo_test` | Ok |\n", red_cargo),
+            ("- `cargo_test`: Succeeded, 118 passed\n", red_cargo),
+            ("## unit_tests\n```Passed\n```\n", red_unit),
+            ("## unit_tests\n```Green\n```\n", red_unit),
+        ):
+            self.assertEqual(self.codes(prose, recs), ["SUPPRESSED_FAILURE"], prose)
+        # Same prose passes on green receipts.
+        for prose in (
+            "- `cargo_test`: Passed, 118 passed\n",
+            "| `cargo_test` | Passed, 118 passed |\n",
+            "- `cargo_test`: Green (all good)\n",
+            "| `cargo_test` | Ok |\n",
+        ):
+            self.assertEqual(self.codes(prose), [], prose)
+        # Multi-word negated scoped verdicts (`did not pass`, `never passed`) respect polarity!
+        for neg_pass in (
+            "- `cargo_test`: did not pass\n",
+            "| `cargo_test` | never passed |\n",
+            "- `cargo_test`: failed to pass\n",
+        ):
+            self.assertEqual(self.codes(neg_pass, red_cargo), [], neg_pass)
+            self.assertEqual(self.codes(neg_pass), ["EXIT_CODE_MISMATCH"], neg_pass)
+
+    def test_axiom_paren_tail_smuggling_strict_sha_ids_and_compound_headings(self) -> None:
+        # 1. Parenthetical note in `axioms:` cannot smuggle trailing items or unauthorized axioms!
+        for bad_ax in (
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (standard), sorryAx\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (standard), ???\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (plus sorryAx)\n",
+            "`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound (plus Lean.ofReduceBool)\n",
+        ):
+            self.assertEqual(self.codes(bad_ax), ["MALFORMED_CLAIM"], bad_ax)
+        # Honest connector before blanked inline claim stays clean.
+        self.assertEqual(
+            self.codes("`spec_boundary_guards`: axioms: propext, Classical.choice, Quot.sound, with 0 sorry\n"),
+            [],
+        )
+
+        # 2. Strict SHA labels (`Commit ID:`, `Revision:`, `Commit SHA (not_a_sha)`) fail closed!
+        for bad_sha in (
+            "Commit ID: not_a_sha\n`unit_tests`: rc=0\n",
+            "Revision: zzzzzzzz\n`unit_tests`: rc=0\n",
+            "Commit SHA (not_a_sha)\n`unit_tests`: rc=0\n",
+        ):
+            self.assertEqual(self.codes(bad_sha), ["INVALID_COMMIT_SHA"], bad_sha)
+
+        # 3. Compound, parenthetical, and metadata-suffixed headings cannot hide fabricated steps!
+        for prose in (
+            "## `fabricated_step` and `unit_tests`\nrc=0\n",
+            "## `fabricated_step` (same as `unit_tests`)\nrc=0, 42 passed\n",
+            "## `fabricated_step` verification\nrc=0\n",
+            "## `fabricated_step` / `unit_tests`\nrc=0\n",
+        ):
+            self.assertEqual(self.codes(prose), ["MISSING_STEP_RECEIPT"], prose)
+        # Compound heading naming two real steps checks BOTH steps!
+        red_cargo = [bundle(cargo_test={"exit_code": 1, "failed_count": 1})]
+        self.assertEqual(
+            self.codes("## `cargo_test` and `unit_tests`\nrc=0\n", red_cargo),
+            ["SUPPRESSED_FAILURE"],
+        )
+        self.assertEqual(self.codes("## `cargo_test` and `unit_tests`\nrc=0\n"), [])
+
+    def test_nightly_overall_fail_contradiction_single_step_git_sha_and_padded_name(self) -> None:
+        # 1. Nightly dashboard with `overall_status: FAIL` when all listed Pillar 2 steps PASS
+        # must fail closed as `INCONSISTENT_RECEIPT` (cannot pass behind `"All gates pass"`).
+        bad_top = {**NIGHTLY, "overall_status": "FAIL"}
+        bad_p2 = json.loads(json.dumps(NIGHTLY))
+        bad_p2["pillar_2_correctness_and_correspondence"]["overall_status"] = "FAIL"
+        for bad_dash in (bad_top, bad_p2):
+            self.assertIn("INCONSISTENT_RECEIPT", self.codes("All gates pass\n", [bad_dash]))
+
+        # 2. Single nightly step receipt respects `git_sha` (catches stale/mismatched SHA) and rejects padded `name`.
+        single_nightly = {"name": "trusted_audit", "status": "PASS", "exit_code": 0, "git_sha": OTHER_SHA}
+        self.assertEqual(
+            self.codes(f"Commit SHA: `{SHA}`\n`trusted_audit`: PASS\n", [single_nightly]),
+            ["COMMIT_SHA_MISMATCH"],
+        )
+        padded_nightly = {"name": " trusted_audit ", "status": "PASS", "exit_code": 0}
+        self.assertIn("MALFORMED_RECEIPT", self.codes("`trusted_audit`: PASS\n", [padded_nightly]))
+
+
 if __name__ == "__main__":
     unittest.main()

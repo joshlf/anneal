@@ -5673,5 +5673,92 @@ class GuardMutationEp2A3AdversarialTests(unittest.TestCase):
         )
 
 
+class GuardMutationEp2B4AdversarialTests(unittest.TestCase):
+    """Round 4 B4 adversarial regression tests for Shard A parity & edge-case convergence."""
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [
+            f.pattern
+            for f in gmut.detect_postcondition_error_wildcards(source, language=language)
+        ]
+
+    def test_nested_matches_boolean_negation_and_matches_wildcard_inside_err_arms(self) -> None:
+        # 1. Nested `!(matches!(...) == false)` (double negation = vacuous!) must NOT bypass,
+        # while `!(matches!(...) == true)` (single negation = sound!) must NOT false-fire!
+        for vacuous in (
+            "!(matches!(out, Err(_)) == false)",
+            "!(false == matches!(out, Err(_)))",
+            "!(matches!(out, Err(_)) != true)",
+            "(matches!(out, Err(_)) == false) == false",
+            "!(matches!(out, Err(_)) == true) == false",
+        ):
+            self.assertEqual(self._patterns(vacuous, "rust"), ["matches_any_err"], vacuous)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(vacuous, "err", language="rust")["status"],
+                "SURVIVED",
+                vacuous,
+            )
+        for sound in (
+            "!(matches!(out, Err(_)) == true)",
+            "!(true == matches!(out, Err(_)))",
+            "!(matches!(out, Err(_)) != false)",
+            "((matches!(out, Err(_)) == false) == true)",
+        ):
+            self.assertEqual(self._patterns(sound, "rust"), [], sound)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(sound, "err", language="rust")["status"],
+                "KILLED",
+                sound,
+            )
+
+        # 2. `Err(e) => matches!(e, _)` (constant-true `matches!` inside an `Err` arm) must NOT bypass!
+        for vacuous_arm in (
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(e, _) }",
+            "match out { Ok(v) => *v == 1, Err(e) => core::matches!(e, E::Overflow | _) }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!{e, _ if true} }",
+        ):
+            self.assertEqual(self._patterns(vacuous_arm, "rust"), ["err_arm_true"], vacuous_arm)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(vacuous_arm, "err", language="rust")["status"],
+                "SURVIVED",
+                vacuous_arm,
+            )
+        for sound_arm in (
+            "match out { Ok(v) => *v == 1, Err(e) => !matches!(e, _) }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(e, _ if false) }",
+            "match out { Ok(v) => *v == 1, Err(e) => matches!(e, E::Overflow) }",
+        ):
+            self.assertEqual(self._patterns(sound_arm, "rust"), [], sound_arm)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(sound_arm, "err", language="rust")["status"],
+                "KILLED",
+                sound_arm,
+            )
+
+    def test_array_literal_let_panicking_stmts_and_lean_have_if_type_header(self) -> None:
+        # 1. Pure array literal in `let` cannot panic and MUST still fold to `err_arm_true`,
+        # while indexing (`slice[*e]`) and division (`*e / 0`) in expression statements or
+        # short-circuit LHS can panic and MUST NOT false-fire!
+        self.assertEqual(self._patterns("Err(_) => { let _ = [1, 2]; true }", "rust"), ["err_arm_true"])
+        for panicking_sound in (
+            "Err(e) => { slice[*e]; true }",
+            "Err(e) => { *e / 0; true }",
+            "Err(e) => (slice[*e] == 0) || true",
+            "Err(e) => (*e / 0 == 0) || true",
+            "Err(e) => { let mut ok = false; ok = (slice[*e] == 0); true }",
+        ):
+            self.assertEqual(self._patterns(panicking_sound, "rust"), [], panicking_sound)
+
+        # 2. Lean `have`/`let` whose type contains `if ... then ... else ... :=` must NOT break arm scanning at `:=`!
+        lean_have_if = (
+            "def post (c : Bool) : Outcome Nat → Prop\n"
+            "  | .ok v => v = 1\n"
+            "  | .err _ =>\n"
+            "    have h : if c then True else True := by trivial\n"
+            "    True\n"
+        )
+        self.assertEqual(self._patterns(lean_have_if, "lean"), ["err_arm_true"])
+
+
 if __name__ == "__main__":
     unittest.main()
