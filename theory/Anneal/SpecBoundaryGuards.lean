@@ -2414,6 +2414,19 @@ theorem eq_errorWildcardPost_of_tautological_fault_arms {X : Type u} {α : Type 
   | ub => exact propext ⟨fun _ => True.intro, fun _ => hUb x⟩
   | unsupported => exact propext ⟨fun _ => True.intro, fun _ => hUnsupported x⟩
 
+/-- Pure `Except ε α` counterpart of `eq_errorWildcardPost_of_tautological_fault_arms`:
+    any `Except` postcondition whose `.error` arm is tautological (whether spelled
+    `True`, `e = e`, `¬¬True`, or `P e → True`) equals `exceptErrorWildcardPost`. -/
+theorem eq_exceptErrorWildcardPost_of_tautological_error_arm {X : Type u} {α : Type v}
+    {ε : Type w} (specFn : X → α) (post : X → Except ε α → Prop)
+    (hOk : ∀ x v, post x (.ok v) ↔ v = specFn x)
+    (hErr : ∀ x e, post x (.error e)) :
+    post = exceptErrorWildcardPost specFn := by
+  funext x out
+  cases out with
+  | ok v => exact propext (hOk x v)
+  | error e => exact propext ⟨fun _ => True.intro, fun _ => hErr x e⟩
+
 /-- **The wildcard passes `PostconditionDichotomy`.** With two distinct values of `α`
     and a satisfiable precondition, the `ok` arm alone supplies an accepted and a
     rejected output. -/

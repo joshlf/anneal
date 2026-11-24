@@ -684,11 +684,17 @@ theorem tautological_error_arms_are_the_wildcard :
         | .ok v => v = x + 1
         | .err e => e = "overflow" → True
         | .ub => True
-        | .unsupported => True) = errorWildcardPost (fun x => x + 1) :=
+        | .unsupported => True) = errorWildcardPost (fun x => x + 1) ∧
+      (fun (x : Nat) (out : Except String Nat) =>
+        match out with
+        | .ok v => v = x + 1
+        | .error e => e = e) = exceptErrorWildcardPost (fun x => x + 1) :=
   ⟨eq_errorWildcardPost_of_tautological_fault_arms _ _ (fun _ _ => Iff.rfl) (fun _ _ => rfl)
       (fun _ => rfl) (fun _ h => h True.intro),
     eq_errorWildcardPost_of_tautological_fault_arms _ _ (fun _ _ => Iff.rfl)
-      (fun _ _ _ => True.intro) (fun _ => True.intro) (fun _ => True.intro)⟩
+      (fun _ _ _ => True.intro) (fun _ => True.intro) (fun _ => True.intro),
+    eq_exceptErrorWildcardPost_of_tautological_error_arm _ _ (fun _ _ => Iff.rfl)
+      (fun _ _ => rfl)⟩
 
 /-- The guarded contract is dichotomous and forces fault-freedom of `checkedIncr`. -/
 theorem guarded_dichotomy_and_fault_free :
@@ -865,6 +871,7 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.unboundedIntGhostCollectionAxioms_nonempty,
         ``Anneal.SpecBoundaryGuards.ghostLengthTypeGuard_iff_nonempty_model,
         ``Anneal.SpecBoundaryGuards.eq_errorWildcardPost_of_tautological_fault_arms,
+        ``Anneal.SpecBoundaryGuards.eq_exceptErrorWildcardPost_of_tautological_error_arm,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_postconditionDichotomy,
         ``Anneal.SpecBoundaryGuards.errorWildcardPost_not_errorFibreDichotomy,
         ``Anneal.SpecBoundaryGuards.scalarWildcardCorr_accepts_div_by_zero,

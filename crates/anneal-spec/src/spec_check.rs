@@ -5961,14 +5961,17 @@ fn extends_to_the_right(tok: SpecTok<'_>) -> bool {
 }
 
 /// Whether the token at `look` continues the preceding operand as a function
-/// application or literal suffix (Lean `f = f x`), so that the operand is not
-/// complete yet.
+/// application, Lean bitwise-OR (`|||`), Lean pipeline (`|>`), or literal
+/// suffix (Lean `f = f x`, `n = n ||| 1`, `x = x |> f`), so that the operand
+/// is not complete yet.
 fn continues_as_application(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
     let Some(tok) = look.next_tok()? else {
         return Ok(false);
     };
     Ok(match tok {
         SpecTok::Literal | SpecTok::Sym("(" | "[" | "⟨" | "@") => true,
+        SpecTok::Sym("||") => matches!(look.next_tok()?, Some(SpecTok::Sym("|"))),
+        SpecTok::Sym("|") => matches!(look.next_tok()?, Some(SpecTok::Sym(">"))),
         SpecTok::Word(word) => {
             !matches!(word, "as" | "and" | "or" | "then" | "else")
                 && !is_arm_body_terminator(tok, look.next_tok()?)
@@ -5977,14 +5980,15 @@ fn continues_as_application(mut look: SpecLexer<'_>) -> Result<bool, SpecScanErr
     })
 }
 
-/// Whether `tok` rules out a benign statement: a call, macro, block, or
-/// control flow may panic, diverge, or return early, so the statement can
-/// constrain the outcome (`assert!(…);`, `check(e)?;`).
+/// Whether `tok` rules out a benign statement: a call, macro, block, division,
+/// remainder, or control flow may panic, diverge, or return early, so the
+/// statement can constrain the outcome (`assert!(…);`, `check(e)?;`,
+/// `let _ = 1 / *e;`).
 fn ends_benign_statement(tok: SpecTok<'_>) -> bool {
     matches!(
         tok,
         SpecTok::FatArrow
-            | SpecTok::Sym("(" | "[" | "{" | "}" | "!" | "?")
+            | SpecTok::Sym("(" | "[" | "{" | "}" | "!" | "?" | "/" | "%")
             | SpecTok::Word(
                 "match"
                     | "if"
@@ -6001,9 +6005,87 @@ fn ends_benign_statement(tok: SpecTok<'_>) -> bool {
     )
 }
 
+/// Maximum tokens in one side of a reflexive equality atom (`*e == *e`,
+/// `e.code == e.code`, `0 = 0`): up to 2 deref/ref prefixes + 1 word + up to
+/// 4 `.field` projections.
+const MAX_REFLEXIVE_OPERAND_TOKS: usize = 12;
+
+/// Consumes a simple reflexive operand (`e`, `0`, `*e`, `&e`, `e.code`) into
+/// `out`, returning the number of tokens stored (`0` when `first` does not
+/// start such an operand).
+fn consume_reflexive_operand<'a>(
+    look: &mut SpecLexer<'a>,
+    first: SpecTok<'a>,
+    out: &mut [SpecTok<'a>; MAX_REFLEXIVE_OPERAND_TOKS],
+) -> Result<usize, SpecScanError> {
+    let mut len = 0usize;
+    let mut tok = first;
+    for _ in 0..2 {
+        if matches!(tok, SpecTok::Sym("*" | "&")) {
+            out[len] = tok;
+            len += 1;
+            let Some(next) = look.next_tok()? else {
+                return Ok(0);
+            };
+            tok = next;
+        } else {
+            break;
+        }
+    }
+    if !matches!(tok, SpecTok::Word(_)) {
+        return Ok(0);
+    }
+    out[len] = tok;
+    len += 1;
+    for _ in 0..4 {
+        let mut dot_probe = *look;
+        if dot_probe.next_tok()? == Some(SpecTok::Sym("."))
+            && let Some(field @ SpecTok::Word(_)) = dot_probe.next_tok()?
+            && len + 2 <= MAX_REFLEXIVE_OPERAND_TOKS
+        {
+            out[len] = SpecTok::Sym(".");
+            out[len + 1] = field;
+            len += 2;
+            *look = dot_probe;
+        } else {
+            break;
+        }
+    }
+    Ok(len)
+}
+
+/// Consumes a reflexive comparison of identical simple operands (`e == e`,
+/// `*e == *e`, `e.code == e.code`, `0 = 0`, `false == false`) not continued by
+/// an application or Lean `|||` / `|>` operator.
+fn consume_reflexive_path_eq<'a>(
+    look: &mut SpecLexer<'a>,
+    first: SpecTok<'a>,
+) -> Result<bool, SpecScanError> {
+    let mut eq = *look;
+    let mut lhs = [SpecTok::Literal; MAX_REFLEXIVE_OPERAND_TOKS];
+    let len = consume_reflexive_operand(&mut eq, first, &mut lhs)?;
+    if len == 0 {
+        return Ok(false);
+    }
+    if !matches!(eq.next_tok()?, Some(SpecTok::Sym("==" | "="))) {
+        return Ok(false);
+    }
+    for expected in &lhs[..len] {
+        if eq.next_tok()? != Some(*expected) {
+            return Ok(false);
+        }
+    }
+    if continues_as_application(eq)? {
+        return Ok(false);
+    }
+    *look = eq;
+    Ok(true)
+}
+
 /// Consumes one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
-/// `!false`, `¬False`, `Not False`, or a parenthesized/braced trivially-true
-/// expression, optionally preceded by `return`/`by` and followed by `as bool`).
+/// `!false`, `¬False`, `Not False`, reflexive equality `e == e` / `*e == *e` /
+/// `e.code = e.code`, or a parenthesized/braced trivially-true expression,
+/// optionally preceded by `return`/`by` and followed by `as bool`).
 /// Returns `Ok(true)` iff such an atom was consumed; `look` is left right
 /// after it.
 fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<bool, SpecScanError> {
@@ -6018,7 +6100,6 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<boo
     let matched = match tok {
         Some(SpecTok::Sym("(")) => expr_is_trivially_true(&mut probe, Some(")"), depth - 1)?,
         Some(SpecTok::Sym("{")) => expr_is_trivially_true(&mut probe, Some("}"), depth - 1)?,
-        Some(SpecTok::Word("true" | "True" | "trivial")) => true,
         Some(SpecTok::Sym("!")) => {
             let next = probe.next_tok()?;
             matches!(next, Some(SpecTok::Word("false")))
@@ -6031,16 +6112,9 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<boo
                 || (matches!(next, Some(SpecTok::Sym("¬") | SpecTok::Word("Not")))
                     && consume_trivial_true_atom(&mut probe, depth - 1)?)
         }
-        // One token compared with itself (`e == e`, `0 = 0`).
-        Some(SpecTok::Word(word)) => {
-            let mut eq = probe;
-            let reflexive = matches!(eq.next_tok()?, Some(SpecTok::Sym("==" | "=")))
-                && eq.next_tok()? == Some(SpecTok::Word(word))
-                && !continues_as_application(eq)?;
-            if reflexive {
-                probe = eq;
-            }
-            reflexive
+        Some(first @ (SpecTok::Word(_) | SpecTok::Sym("*" | "&"))) => {
+            consume_reflexive_path_eq(&mut probe, first)?
+                || matches!(first, SpecTok::Word("true" | "True" | "trivial"))
         }
         _ => false,
     };
@@ -6192,9 +6266,9 @@ fn expr_is_trivially_true(
                         *look = after;
                         return Ok(found_trivial);
                     }
-                    if stmt_benign {
-                        // `let _ = e;` constrains nothing: the value of the
-                        // block is what follows it.
+                    if stmt_benign || !stmt_started {
+                        // `let _ = e;` or an empty `;` constrains nothing:
+                        // the value of the block is what follows it.
                         found_trivial = false;
                         at_disjunct_start = true;
                         disjuncts_blocked = false;
@@ -9463,6 +9537,22 @@ mod spec_boundary_guard_tests {
         ("rust", "Err(e) => { assert_eq!(*e, E::A); true }", ""),
         ("rust", "Err(e) => { let ok = check(e); true }", ""),
         ("rust", "Err(e) => { true; x == 1 }", ""),
+        // Deref/field reflexive equality, Lean `|||` / `|>` continuations,
+        // empty `;`, and panicking div/rem `let` statements.
+        ("rust", "Err(e) => *e == *e", "err_arm_true"),
+        ("rust", "Err(e) => e.code == e.code", "err_arm_true"),
+        ("lean", "| .err e => e.code = e.code", "err_arm_true"),
+        ("rust", "Err(_) => false == false", "err_arm_true"),
+        ("rust", "Err(_) => true == true", "err_arm_true"),
+        ("rust", "Err(_) => true == false", ""),
+        ("rust", "Err(e) => *e == *e && x == 1", ""),
+        ("rust", "Err(e) => e.code == e.code.abs()", ""),
+        ("lean", "| .err e => n = n ||| 1", ""),
+        ("lean", "| .err e => x = x |> f", ""),
+        ("rust", "Err(e) => { let _ = e;; true }", "err_arm_true"),
+        ("rust", "Err(e) => { ; true }", "err_arm_true"),
+        ("rust", "Err(e) => { let _ = 1 / *e; true }", ""),
+        ("rust", "Err(e) => { let _ = *e % 2; true }", ""),
     ];
 
     #[test]
