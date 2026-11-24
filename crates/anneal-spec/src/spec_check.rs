@@ -4010,13 +4010,6 @@ impl<'a> SpecLexer<'a> {
             while self.pos < bytes.len() && bytes[self.pos].is_ascii_whitespace() {
                 self.pos += 1;
             }
-            // Lean identifier quotes (`«pre»` is the identifier `pre`).
-            if self.lean_comments()
-                && (self.src[self.pos..].starts_with('«') || self.src[self.pos..].starts_with('»'))
-            {
-                self.pos += '«'.len_utf8();
-                continue;
-            }
             let Some(here) = self.byte_at(self.pos) else {
                 return Ok(None);
             };
@@ -4036,6 +4029,21 @@ impl<'a> SpecLexer<'a> {
 
         let start = self.pos;
         let here = bytes[start];
+
+        // A Lean quoted identifier `«…»` is one name, whatever it contains:
+        // `«pre»` is the identifier `pre`, and `«(»` is a name, not a
+        // bracket.
+        if self.lean_comments() && self.src[start..].starts_with('«') {
+            let inner_start = start + '«'.len_utf8();
+            let Some(len) = self.src[inner_start..].find('»').filter(|len| *len > 0) else {
+                self.pos = self.src.len();
+                return Err(SpecScanError::UnclosedLiteralOrComment);
+            };
+            self.pos = inner_start + len + '»'.len_utf8();
+            return Ok(Some(SpecTok::Word(
+                &self.src[inner_start..inner_start + len],
+            )));
+        }
 
         if here == b'"' {
             self.skip_string()?;
@@ -5980,29 +5988,40 @@ fn continues_as_application(mut look: SpecLexer<'_>) -> Result<bool, SpecScanErr
     })
 }
 
-/// Whether `tok` rules out a benign statement: a call, macro, block, division,
-/// remainder, or control flow may panic, diverge, or return early, so the
-/// statement can constrain the outcome (`assert!(…);`, `check(e)?;`,
-/// `let _ = 1 / *e;`).
-fn ends_benign_statement(tok: SpecTok<'_>) -> bool {
-    matches!(
-        tok,
-        SpecTok::FatArrow
-            | SpecTok::Sym("(" | "[" | "{" | "}" | "!" | "?" | "/" | "%")
-            | SpecTok::Word(
-                "match"
-                    | "if"
-                    | "else"
-                    | "loop"
-                    | "while"
-                    | "for"
-                    | "return"
-                    | "break"
-                    | "continue"
-                    | "unsafe"
-                    | "await"
-            )
-    )
+/// Whether `tok` keeps a `let` statement benign: it only names, projects,
+/// borrows, dereferences, or copies values, so the statement can neither
+/// panic nor diverge nor return early (`let _ = e;`, `let code = &e.code;`,
+/// `let _ = *e;`). Calls, macros, indexing, blocks, control flow, and
+/// arithmetic may constrain the outcome (`check(e)?;`, `let _ = 1 / *e;`,
+/// `let _ = *e + 1;` panics on overflow in a debug build).
+/// `prev_is_operand` tells a multiplication from a prefix `*`.
+fn keeps_statement_benign(tok: SpecTok<'_>, prev_is_operand: bool) -> bool {
+    match tok {
+        SpecTok::Literal | SpecTok::PathSep => true,
+        SpecTok::FatArrow | SpecTok::DotDot => false,
+        SpecTok::Word(word) => !matches!(
+            word,
+            "match"
+                | "if"
+                | "else"
+                | "loop"
+                | "while"
+                | "for"
+                | "return"
+                | "break"
+                | "continue"
+                | "unsafe"
+                | "await"
+                | "async"
+                | "move"
+                | "yield"
+        ),
+        SpecTok::Sym(sym) => match sym {
+            "=" | "." | "&" | ":" => true,
+            "*" => !prev_is_operand,
+            _ => false,
+        },
+    }
 }
 
 /// Maximum tokens in one side of a reflexive equality atom (`*e == *e`,
@@ -6132,6 +6151,30 @@ fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<boo
     Ok(true)
 }
 
+/// Whether `tok` (followed by `next`) may follow a trivially-true operand
+/// without making it part of a larger term: the end of the body, a closing
+/// bracket, a separator, or a connective the caller evaluates (`||`, `→`,
+/// `↔`). Any other operator binds the operand into a term the scanner cannot
+/// evaluate (`f = f ∘ g`, `s = s ∪ t`, Rust `e == e | m`), so the operand is
+/// not the value of the body. `|` starts the next arm in Lean and is bitwise
+/// or in Rust (`rust`).
+fn may_follow_trivial_atom(tok: SpecTok<'_>, next: Option<SpecTok<'_>>, rust: bool) -> bool {
+    match tok {
+        SpecTok::FatArrow => true,
+        SpecTok::Literal | SpecTok::PathSep | SpecTok::DotDot => false,
+        SpecTok::Word(_) => !is_constraining_continuation(tok),
+        SpecTok::Sym(sym) => match sym {
+            ")" | "]" | "}" | "⟩" | "," | ";" | "#" | ":=" => true,
+            // Lean `|||` is an operator, `||` a disjunction.
+            "||" => !matches!(next, Some(SpecTok::Sym("|"))),
+            // Lean `|>` is the pipeline operator.
+            "|" => !rust && !matches!(next, Some(SpecTok::Sym(">"))),
+            "@" => matches!(next, Some(SpecTok::Sym("["))),
+            _ => is_disjunction_tok(tok) || is_implication_tok(tok) || is_biconditional_tok(tok),
+        },
+    }
+}
+
 /// Consumes a conjunction of trivially-true atoms (`true && true`,
 /// `(True ∧ True)`, optionally followed by `as bool` or a parenthesized
 /// `: Prop` / `: Bool` ascription) that is not continued by a constraining
@@ -6173,11 +6216,15 @@ fn consume_trivial_conjunction(
                 }
             }
             other => {
-                if !other.is_some_and(is_constraining_continuation) {
+                let rust = matches!(probe.syntax, SpecSyntax::Rust);
+                let follows = match other {
+                    None => true,
+                    Some(tok) => may_follow_trivial_atom(tok, next_probe.next_tok()?, rust),
+                };
+                if follows {
                     *look = probe;
-                    return Ok(true);
                 }
-                return Ok(false);
+                return Ok(follows);
             }
         }
     }
@@ -6222,6 +6269,7 @@ fn expr_is_trivially_true(
     // call, macro, block, or control flow so far.
     let mut stmt_started = false;
     let mut stmt_benign = false;
+    let mut stmt_prev_operand = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
@@ -6285,8 +6333,12 @@ fn expr_is_trivially_true(
                     if !stmt_started {
                         stmt_started = true;
                         stmt_benign = tok == SpecTok::Word("let");
-                    } else if ends_benign_statement(tok) {
-                        stmt_benign = false;
+                        stmt_prev_operand = false;
+                    } else {
+                        if !keeps_statement_benign(tok, stmt_prev_operand) {
+                            stmt_benign = false;
+                        }
+                        stmt_prev_operand = matches!(tok, SpecTok::Word(_) | SpecTok::Literal);
                     }
                 }
                 // A tuple or argument list (`(true, x)`) is not a
@@ -6380,10 +6432,22 @@ fn expr_is_trivially_true(
 /// `true as bool`), a conjunction of trivially-true atoms (`true && true`,
 /// `(true && true)`, `(True ∧ True)`), or a disjunction containing one
 /// (`true || p`, `p || true`, `(p || true)`, `P ∨ True`), and not combined
-/// with a constraining operator. One token compared with itself (`e == e`,
-/// `0 = 0`) is such an atom, and a block whose statements are `let` bindings
-/// without a call, macro, or control flow has the value of its final
-/// expression (`{ let _ = e; true }`).
+/// with a constraining operator.
+///
+/// An operand compared with itself (`e == e`, `*e == *e`, `e.code = e.code`,
+/// `0 = 0`) is such an atom. For a `PartialEq` that is not reflexive (a
+/// floating-point `NaN`) the comparison is not a tautology; it is reported
+/// all the same, since it accepts every other payload.
+///
+/// An atom counts only when nothing binds it into a larger term: it must be
+/// followed by the end of the body, a closing bracket, a separator, or a
+/// connective evaluated here ([`may_follow_trivial_atom`]). `f = f ∘ g` and
+/// Rust `e == e | m` are not tautologies.
+///
+/// A block has the value of its final expression when every statement before
+/// it is a `let` that only names, projects, borrows, or dereferences
+/// (`{ let _ = e; true }`); a call, macro, or arithmetic may panic and is
+/// therefore a constraint ([`keeps_statement_benign`]).
 fn arm_body_is_trivially_true(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
     expr_is_trivially_true(&mut look, None, MAX_TRIVIAL_EXPR_DEPTH)
 }
@@ -9012,6 +9076,8 @@ mod spec_boundary_guard_tests {
             "cr#\"unclosed raw c\"",
             "'\\n\nfn f<'a>() {}",
             "Err(_) => true /* unclosed",
+            "| .err «unclosed => False",
+            "| .err «» => False",
         ] {
             assert_eq!(
                 detect_error_branch_wildcard(malformed),
@@ -9024,6 +9090,56 @@ mod spec_boundary_guard_tests {
                 "{malformed:?}"
             );
         }
+    }
+
+    #[test]
+    fn quoted_lean_identifiers_are_single_names() {
+        // `«…»` is one name whatever it contains: never a bracket.
+        let mut lexer = SpecLexer::new("«(» «pre» x", SpecSyntax::Lean);
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("("))));
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("pre"))));
+        assert_eq!(lexer.next_tok(), Ok(Some(SpecTok::Word("x"))));
+        assert_eq!(lexer.next_tok(), Ok(None));
+        // Rust has no quoted identifiers.
+        assert_eq!(
+            SpecLexer::new("«x»", SpecSyntax::Rust).next_tok(),
+            Ok(Some(SpecTok::Sym("«")))
+        );
+        // Unclosed and empty quotes are malformed source.
+        for malformed in ["«x", "«»", "a «"] {
+            let mut lexer = SpecLexer::new(malformed, SpecSyntax::Any);
+            let mut last = lexer.next_tok();
+            while let Ok(Some(_)) = last {
+                last = lexer.next_tok();
+            }
+            assert_eq!(
+                last,
+                Err(SpecScanError::UnclosedLiteralOrComment),
+                "{malformed}"
+            );
+        }
+        // The quoted spelling of a name is that name.
+        assert!(RequiresClause::lean("«True»").is_syntactically_trivial());
+        assert!(!RequiresClause::lean("«False»").is_syntactically_trivial());
+        assert_eq!(
+            scan_trivial_requires("«True", SpecSyntax::Lean),
+            Err(SpecScanError::UnclosedLiteralOrComment)
+        );
+        // A bracket inside a quoted name does not shift the arms that follow.
+        assert_eq!(
+            scan_error_branch_wildcard(
+                "def «)» := 0\nmatch x with | 0 => False | _ => True",
+                SpecSyntax::Lean
+            ),
+            Ok(None)
+        );
+        assert_eq!(
+            scan_error_branch_wildcard(
+                "def «)» := 0\nmatch r with | .ok v => v = 1 | _ => True",
+                SpecSyntax::Lean
+            ),
+            Ok(Some(ErrorWildcardPattern::CatchAllArmTrue))
+        );
     }
 
     #[test]
@@ -9461,7 +9577,7 @@ mod spec_boundary_guard_tests {
             "match out with | .ok v => v = 1 | «e» => True",
             "catch_all_arm_true",
         ),
-        ("lean", "| «Except.error» _ => True", "err_arm_true"),
+        ("lean", "| «Except.error» _ => True", ""),
         // Nested catch-all paren frames neither leak into inner unit patterns
         // nor lose outer tuple/or state.
         (
@@ -9553,6 +9669,51 @@ mod spec_boundary_guard_tests {
         ("rust", "Err(e) => { ; true }", "err_arm_true"),
         ("rust", "Err(e) => { let _ = 1 / *e; true }", ""),
         ("rust", "Err(e) => { let _ = *e % 2; true }", ""),
+        // What follows a trivially-true operand must not bind it into a
+        // larger term: an unknown operator is not a tautology.
+        ("lean", "| .err f => f = f ∘ g", ""),
+        ("lean", "| .err s => s = s ∪ t", ""),
+        ("lean", "| .err e => e = e $ x", ""),
+        ("lean", "| .err a => a = a ∣ b", ""),
+        ("rust", "Err(e) => e == e | m", ""),
+        ("lean", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        ("any", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        (
+            "lean",
+            "⟨fun out => match out with | .ok v => v = 1 | .err _ => True⟩",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "have h : match x with | .ok v => v = 1 | .err _ => True := by simp",
+            "err_arm_true",
+        ),
+        // Only a `let` that names, projects, borrows, or dereferences is
+        // benign: arithmetic may panic.
+        ("rust", "Err(e) => { let _ = *e + 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e - 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e * 2; true }", ""),
+        ("rust", "Err(e) => { let _ = -*e; true }", ""),
+        ("rust", "Err(e) => { let _ = *e << 70; true }", ""),
+        ("rust", "Err(e) => { let _ = *e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _ = &*e; let c = e.code; true }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = E::A; true }", "err_arm_true"),
+        // A quoted Lean identifier is one name, never a bracket or a
+        // constructor path.
+        (
+            "lean",
+            "def «(» : Nat := 0\ndef post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | «e'» => True",
+            "catch_all_arm_true",
+        ),
     ];
 
     #[test]

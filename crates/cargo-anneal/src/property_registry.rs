@@ -7382,15 +7382,25 @@ fn tokenize_spec_source(
             pos += 1;
             continue;
         }
-        // Lean identifier quotes (`«pre»` is the identifier `pre`).
-        if dialect != SpecSourceDialect::Rust
-            && (src[pos..].starts_with('«') || src[pos..].starts_with('»'))
-        {
-            pos += '«'.len_utf8();
-            continue;
-        }
         let next = bytes.get(pos + 1).copied();
         let start_line = line_at(pos, &mut line, &mut line_pos);
+
+        // A Lean quoted identifier `«…»` is one name, whatever it contains:
+        // `«pre»` is the identifier `pre`, and `«(»` is a name, not a
+        // bracket.
+        if dialect != SpecSourceDialect::Rust && src[pos..].starts_with('«') {
+            let inner_start = pos + '«'.len_utf8();
+            let Some(len) = src[inner_start..].find('»').filter(|len| *len > 0) else {
+                return Err(UnclosedSpecSource { line: start_line });
+            };
+            toks.push(GuardTok {
+                kind: GuardTokKind::Word,
+                text: &src[inner_start..inner_start + len],
+                line: start_line,
+            });
+            pos = inner_start + len + '»'.len_utf8();
+            continue;
+        }
 
         // Comments.
         let line_comment = (dialect.rust_comments() && here == b'/' && next == Some(b'/'))
@@ -9125,6 +9135,13 @@ fn scan_lean_ghost_length_decls(
                                         | "->"
                                         | "↔"
                                         | "<->"
+                                        | "∈"
+                                        | "∉"
+                                        | "⊆"
+                                        | "⊂"
+                                        | "∣"
+                                        | "&&"
+                                        | "||"
                                 )
                             {
                                 found = true;
@@ -10615,13 +10632,16 @@ fn continues_as_application(toks: &[GuardTok<'_>], idx: usize) -> bool {
     }
 }
 
-/// Whether `tok` rules out a benign statement: a call, macro, block, division,
-/// remainder, or control flow may panic, diverge, or return early.
-fn ends_benign_statement(tok: &GuardTok<'_>) -> bool {
+/// Whether `tok` keeps a `let` statement benign: it only names, projects,
+/// borrows, dereferences, or copies values, so the statement can neither
+/// panic nor diverge nor return early. Calls, macros, indexing, blocks,
+/// control flow, and arithmetic may constrain the outcome.
+/// `prev_is_operand` tells a multiplication from a prefix `*`.
+fn keeps_statement_benign(tok: &GuardTok<'_>, prev_is_operand: bool) -> bool {
     match tok.kind {
-        GuardTokKind::FatArrow => true,
-        GuardTokKind::Sym => matches!(tok.text, "(" | "[" | "{" | "}" | "!" | "?" | "/" | "%"),
-        GuardTokKind::Word => matches!(
+        GuardTokKind::Literal | GuardTokKind::PathSep => true,
+        GuardTokKind::FatArrow | GuardTokKind::DotDot => false,
+        GuardTokKind::Word => !matches!(
             tok.text,
             "match"
                 | "if"
@@ -10634,8 +10654,15 @@ fn ends_benign_statement(tok: &GuardTok<'_>) -> bool {
                 | "continue"
                 | "unsafe"
                 | "await"
+                | "async"
+                | "move"
+                | "yield"
         ),
-        _ => false,
+        GuardTokKind::Sym => match tok.text {
+            "=" | "." | "&" | ":" => true,
+            "*" => !prev_is_operand,
+            _ => false,
+        },
     }
 }
 
@@ -10703,7 +10730,12 @@ fn consume_reflexive_path_eq(toks: &[GuardTok<'_>], start: usize) -> Option<usiz
 /// `e.code = e.code`, or a parenthesized/braced trivially-true expression,
 /// optionally preceded by `return`/`by` and followed by `as bool`).
 /// Returns `Some(next_idx)` on match.
-fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) -> Option<usize> {
+fn consume_trivial_true_atom(
+    toks: &[GuardTok<'_>],
+    start: usize,
+    depth: u32,
+    rust: bool,
+) -> Option<usize> {
     if depth == 0 {
         return None;
     }
@@ -10716,14 +10748,14 @@ fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) ->
     }
     let tok = toks.get(idx)?;
     if tok.is_sym("(") {
-        idx = expr_is_trivially_true(toks, idx + 1, Some(")"), depth - 1)?;
+        idx = expr_is_trivially_true(toks, idx + 1, Some(")"), depth - 1, rust)?;
     } else if tok.is_sym("{") {
-        idx = expr_is_trivially_true(toks, idx + 1, Some("}"), depth - 1)?;
+        idx = expr_is_trivially_true(toks, idx + 1, Some("}"), depth - 1, rust)?;
     } else if tok.is_sym("!") {
         if toks.get(idx + 1).is_some_and(|t| t.is_word("false")) {
             idx += 2;
         } else if toks.get(idx + 1).is_some_and(|t| t.is_sym("!")) {
-            idx = consume_trivial_true_atom(toks, idx + 2, depth - 1)?;
+            idx = consume_trivial_true_atom(toks, idx + 2, depth - 1, rust)?;
         } else {
             return None;
         }
@@ -10734,7 +10766,7 @@ fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) ->
             .get(idx + 1)
             .is_some_and(|t| t.is_sym("¬") || t.is_word("Not"))
         {
-            idx = consume_trivial_true_atom(toks, idx + 2, depth - 1)?;
+            idx = consume_trivial_true_atom(toks, idx + 2, depth - 1, rust)?;
         } else {
             return None;
         }
@@ -10754,6 +10786,29 @@ fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) ->
     Some(idx)
 }
 
+/// Whether `tok` (followed by `next`) may follow a trivially-true operand
+/// without making it part of a larger term: the end of the body, a closing
+/// bracket, a separator, or a connective the caller evaluates (`||`, `→`,
+/// `↔`). Any other operator binds the operand into a term the scanner cannot
+/// evaluate (`f = f ∘ g`, `s = s ∪ t`, Rust `e == e | m`). `|` starts the
+/// next arm in Lean and is bitwise or in Rust (`rust`).
+fn may_follow_trivial_atom(tok: &GuardTok<'_>, next: Option<&GuardTok<'_>>, rust: bool) -> bool {
+    match tok.kind {
+        GuardTokKind::FatArrow => true,
+        GuardTokKind::Literal | GuardTokKind::PathSep | GuardTokKind::DotDot => false,
+        GuardTokKind::Word => !is_constraining_continuation(tok),
+        GuardTokKind::Sym => match tok.text {
+            ")" | "]" | "}" | "⟩" | "," | ";" | "#" | ":=" => true,
+            // Lean `|||` is an operator, `||` a disjunction.
+            "||" => !next.is_some_and(|bar| bar.is_sym("|")),
+            // Lean `|>` is the pipeline operator.
+            "|" => !rust && !next.is_some_and(|gt| gt.is_sym(">")),
+            "@" => next.is_some_and(|open| open.is_sym("[")),
+            _ => is_disjunction_tok(tok) || is_implication_tok(tok) || is_biconditional_tok(tok),
+        },
+    }
+}
+
 /// Consume a conjunction of trivially-true atoms (`true && true`,
 /// `(True ∧ True)`, optionally followed by `as bool` or a parenthesized
 /// `: Prop` / `: Bool` ascription) not continued by a constraining operator.
@@ -10762,14 +10817,15 @@ fn consume_trivial_conjunction(
     start: usize,
     allow_type_ascription: bool,
     depth: u32,
+    rust: bool,
 ) -> Option<usize> {
-    let mut idx = consume_trivial_true_atom(toks, start, depth)?;
+    let mut idx = consume_trivial_true_atom(toks, start, depth, rust)?;
     for _ in 0..MAX_TRIVIAL_CONJUNCTS {
         let Some(next) = toks.get(idx) else {
             return Some(idx);
         };
         if is_conjunction_tok(next) {
-            idx = consume_trivial_true_atom(toks, idx + 1, depth)?;
+            idx = consume_trivial_true_atom(toks, idx + 1, depth, rust)?;
         } else if next.is_word("as") {
             if toks.get(idx + 1).is_some_and(|t| t.is_word("bool")) {
                 idx += 2;
@@ -10784,10 +10840,8 @@ fn consume_trivial_conjunction(
             } else {
                 return None;
             }
-        } else if !is_constraining_continuation(next) {
-            return Some(idx);
         } else {
-            return None;
+            return may_follow_trivial_atom(next, toks.get(idx + 1), rust).then_some(idx);
         }
     }
     None
@@ -10802,6 +10856,7 @@ fn expr_is_trivially_true(
     start: usize,
     stop_delim: Option<&str>,
     depth: u32,
+    rust: bool,
 ) -> Option<usize> {
     if depth == 0 {
         return None;
@@ -10828,12 +10883,13 @@ fn expr_is_trivially_true(
     // call, macro, block, or control flow so far.
     let mut stmt_started = false;
     let mut stmt_benign = false;
+    let mut stmt_prev_operand = false;
     loop {
         if at_disjunct_start && inner_depth == 0 {
             at_disjunct_start = false;
             if !disjuncts_blocked
                 && let Some(after) =
-                    consume_trivial_conjunction(toks, idx, stop_delim == Some(")"), depth)
+                    consume_trivial_conjunction(toks, idx, stop_delim == Some(")"), depth, rust)
             {
                 found_trivial = true;
                 idx = after;
@@ -10887,8 +10943,13 @@ fn expr_is_trivially_true(
                     if !stmt_started {
                         stmt_started = true;
                         stmt_benign = tok.is_word("let");
-                    } else if ends_benign_statement(tok) {
-                        stmt_benign = false;
+                        stmt_prev_operand = false;
+                    } else {
+                        if !keeps_statement_benign(tok, stmt_prev_operand) {
+                            stmt_benign = false;
+                        }
+                        stmt_prev_operand =
+                            matches!(tok.kind, GuardTokKind::Word | GuardTokKind::Literal);
                     }
                 }
                 // A tuple or argument list (`(true, x)`) is not a
@@ -10906,7 +10967,7 @@ fn expr_is_trivially_true(
                 if disjuncts_blocked {
                     return None;
                 }
-                return expr_is_trivially_true(toks, idx, stop_delim, depth - 1);
+                return expr_is_trivially_true(toks, idx, stop_delim, depth - 1, rust);
             }
             if unblocks_rust_if_else {
                 disjuncts_blocked = false;
@@ -10971,8 +11032,8 @@ fn expr_is_trivially_true(
 /// (`(true)`, `{ true }`, `{ return true; }`, `by trivial`, `true as bool`),
 /// a conjunction of trivially-true atoms, or a disjunction containing one,
 /// and not combined with a constraining operator.
-fn arm_body_is_trivially_true(toks: &[GuardTok<'_>], start: usize) -> bool {
-    expr_is_trivially_true(toks, start, None, MAX_TRIVIAL_EXPR_DEPTH).is_some()
+fn arm_body_is_trivially_true(toks: &[GuardTok<'_>], start: usize, rust: bool) -> bool {
+    expr_is_trivially_true(toks, start, None, MAX_TRIVIAL_EXPR_DEPTH, rust).is_some()
 }
 
 /// Lean declaration keywords that begin a fresh top-level item and close any
@@ -11081,7 +11142,13 @@ fn scan_error_branch_wildcard_tokens(
                 in_match_scrutinee = false;
                 if !alt.in_lambda {
                     arm.absorb(&alt);
-                    if !arm.guard_blocks() && arm_body_is_trivially_true(toks, idx) {
+                    if !arm.guard_blocks()
+                        && arm_body_is_trivially_true(
+                            toks,
+                            idx,
+                            dialect == SpecSourceDialect::Rust,
+                        )
+                    {
                         if let Some(ctor) = arm.wildcard {
                             found.push((tok.line, ctor.kind()));
                         } else if arm.catch_all && scopes.saw_ok() {
@@ -12053,10 +12120,78 @@ fn lean_definition_bodies<'t, 'a>(
 
 /// Whether the tokens between a declaration's name and its body give it a
 /// specification-class type (`ItemSpec "…"`, `StatefulItemSpec "…"`, …).
-fn is_lean_spec_class_header(header: &[GuardTok<'_>]) -> bool {
-    header.iter().any(|tok| {
-        tok.kind == GuardTokKind::Word && declaration_leaf(tok.text).ends_with("ItemSpec")
+fn is_lean_spec_class_header(header: &[GuardTok<'_>], class_aliases: &[String]) -> bool {
+    mentions_lean_spec_class(header, class_aliases)
+        // `instance : _ := (… : ItemSpec "…")` leaves the class to the value.
+        || (header.len() == 1 && header[0].is_word("_"))
+}
+
+/// Whether `toks` name a specification class (`ItemSpec`, `StatefulItemSpec`,
+/// …) or one of this module's aliases of one.
+fn mentions_lean_spec_class(toks: &[GuardTok<'_>], class_aliases: &[String]) -> bool {
+    toks.iter().any(|tok| {
+        tok.kind == GuardTokKind::Word && {
+            let leaf = declaration_leaf(tok.text);
+            leaf.ends_with("ItemSpec") || class_aliases.iter().any(|alias| alias == leaf)
+        }
     })
+}
+
+/// Names this module gives to a specification class:
+/// `abbrev S := ItemSpec "demo::main"`, `def S (n : String) := ItemSpec n`,
+/// `alias S := ItemSpec`, and aliases of those. An instance declared at such
+/// a name (`instance : S := ⟨pre, post⟩`) is a specification value like any
+/// other. A declaration whose own type is a specification class is a value,
+/// not an alias.
+fn lean_spec_class_aliases(toks: &[GuardTok<'_>]) -> Vec<String> {
+    let mut aliases: Vec<String> = Vec::new();
+    loop {
+        let known = aliases.len();
+        for idx in 0..toks.len() {
+            let keyword = &toks[idx];
+            if !(keyword.is_word("abbrev") || keyword.is_word("def") || keyword.is_word("alias"))
+                || (idx > 0 && toks[idx - 1].is_sym("."))
+            {
+                continue;
+            }
+            let (name, after_name) = read_lean_dotted_name(toks, idx + 1);
+            let leaf = declaration_leaf(&name);
+            if leaf.is_empty() || aliases.iter().any(|alias| alias == leaf) {
+                continue;
+            }
+            let end = lean_command_end(toks, after_name);
+            let mut depth = 0i32;
+            let mut assign = None;
+            for cursor in after_name..end {
+                if depth == 0 && toks[cursor].is_sym(":=") {
+                    assign = Some(cursor);
+                    break;
+                }
+                depth += bracket_delta(&toks[cursor]);
+            }
+            let Some(assign) = assign else {
+                continue;
+            };
+            let header = &toks[after_name..assign];
+            let mut depth = 0i32;
+            let mut colon = None;
+            for (pos, tok) in header.iter().enumerate() {
+                if depth == 0 && tok.is_sym(":") {
+                    colon = Some(pos);
+                }
+                depth += bracket_delta(tok);
+            }
+            if colon.is_some_and(|colon| mentions_lean_spec_class(&header[colon + 1..], &aliases)) {
+                continue;
+            }
+            if mentions_lean_spec_class(&toks[assign + 1..end], &aliases) {
+                aliases.push(String::from(leaf));
+            }
+        }
+        if aliases.len() == known {
+            return aliases;
+        }
+    }
 }
 
 /// A specification-valued Lean declaration: `instance … : ItemSpec "…"`,
@@ -12182,6 +12317,29 @@ fn has_preceding_instance_attr(toks: &[GuardTok<'_>], decl_idx: usize) -> bool {
     false
 }
 
+/// Whether the `instance` keyword at `idx` names the attribute inside an
+/// attribute list (`@[instance]`, `@[reducible, instance]`,
+/// `attribute [local instance] x`, `attribute [-instance] x`) rather than
+/// starting a declaration: only attribute names, `,`, and `-` separate it
+/// from the opening `[`.
+fn lean_instance_keyword_is_attribute(toks: &[GuardTok<'_>], idx: usize) -> bool {
+    if !toks[idx].is_word("instance") {
+        return false;
+    }
+    let mut pos = idx;
+    while pos > 0 {
+        pos -= 1;
+        let tok = &toks[pos];
+        if tok.is_sym("[") {
+            return true;
+        }
+        if !(tok.kind == GuardTokKind::Word || tok.is_sym(",") || tok.is_sym("-")) {
+            return false;
+        }
+    }
+    false
+}
+
 /// Every specification-valued declaration of a Lean module, in source order.
 ///
 /// Captures explicit `: *ItemSpec` declarations (`instance`, `def`, `abbrev`,
@@ -12189,12 +12347,16 @@ fn has_preceding_instance_attr(toks: &[GuardTok<'_>], decl_idx: usize) -> bool {
 /// `@[instance] def/abbrev/opaque := …` declarations whose header omits `:`.
 fn lean_spec_value_decls<'t, 'a>(toks: &'t [GuardTok<'a>]) -> Vec<LeanSpecValueDecl<'t, 'a>> {
     let mut decls = Vec::new();
-    let mut outer_depth = 0i32;
+    let class_aliases = lean_spec_class_aliases(toks);
     for idx in 0..toks.len() {
         let keyword = &toks[idx];
-        let at_top = outer_depth == 0 && !(idx > 0 && toks[idx - 1].is_sym("."));
-        outer_depth += bracket_delta(keyword);
-        if !at_top
+        // Declaration keywords are reserved words, so one is a declaration
+        // wherever it stands, except `instance` naming the attribute
+        // (`@[instance]`, `attribute [local instance] x`). No bracket depth is
+        // consulted: a token stream the lexer reads as unbalanced must not
+        // hide later declarations.
+        if (idx > 0 && toks[idx - 1].is_sym("."))
+            || lean_instance_keyword_is_attribute(toks, idx)
             || !(keyword.is_word("instance")
                 || keyword.is_word("def")
                 || keyword.is_word("abbrev")
@@ -12227,7 +12389,7 @@ fn lean_spec_value_decls<'t, 'a>(toks: &'t [GuardTok<'a>]) -> Vec<LeanSpecValueD
         }
         match colon {
             Some(colon) => {
-                if !is_lean_spec_class_header(&toks[colon + 1..header_end]) {
+                if !is_lean_spec_class_header(&toks[colon + 1..header_end], &class_aliases) {
                     continue;
                 }
             }
@@ -12472,24 +12634,24 @@ const LEAN_NOTATION_KEYWORDS: [&str; 6] =
 /// Lines of a Lean specification module that make it uninspectable for the
 /// entry-point audit:
 ///
-/// * a declaration, `variable` binder, or `open`/`export` renaming/import list
-///   that shadows a name the audit trusts: `True`
+/// * a declaration, `variable` binder, or `open`/`export` import list that
+///   shadows a name the audit trusts: `True`
 ///   (`def True : Prop := False` inside `namespace Specs.…` wins over the
 ///   root `True`) or anything under `Obligations`
 ///   (`def Obligations.Demo.main.defaultPre …`, `namespace Obligations.…`,
-///   `open Evil (True)`, `open Evil renaming badPre → True`);
+///   `open Evil (True)`);
+/// * any `open … renaming`, which gives an existing constant a new name
+///   (`renaming ItemSpec → Foo`, `renaming badPre → True`);
 /// * a syntax extension or meta-program ([`LEAN_SYNTAX_EXTENSION_KEYWORDS`],
 ///   [`LEAN_NOTATION_KEYWORDS`], `#eval`, `#elab`, `#run_cmd`).
 fn lean_uninspectable_module_lines(toks: &[GuardTok<'_>]) -> Vec<usize> {
     let mut lines = Vec::new();
-    let mut outer_depth = 0i32;
+    // No bracket depth is consulted: command keywords are reserved words, and
+    // a token stream the lexer reads as unbalanced must not hide later
+    // commands. The shape checks below keep binders and fields that merely
+    // share a keyword's spelling clean.
     for idx in 0..toks.len() {
         let tok = &toks[idx];
-        let at_top = outer_depth == 0;
-        outer_depth += bracket_delta(tok);
-        if !at_top {
-            continue;
-        }
         if tok.is_sym("#")
             && toks.get(idx + 1).is_some_and(|next| {
                 next.kind == GuardTokKind::Word
@@ -12581,6 +12743,10 @@ fn lean_uninspectable_module_lines(toks: &[GuardTok<'_>]) -> Vec<usize> {
                     break;
                 }
                 if t.is_word("renaming") {
+                    // A renaming gives an existing constant a new name
+                    // (`renaming ItemSpec → Foo`, `renaming badPre → True`):
+                    // the names the audit reads are no longer what they say.
+                    lines.push(tok.line);
                     in_renaming = true;
                     cursor += 1;
                     continue;
@@ -12666,6 +12832,30 @@ fn lean_uninspectable_module_lines(toks: &[GuardTok<'_>]) -> Vec<usize> {
 /// / struct field `pre := body`) whose body is neither `True` nor a delegation
 /// to the generated default. A module without a precondition, and the module of
 /// a non-entry item, yield no diagnostics.
+///
+/// Every specification value of the module is inspected as well: an
+/// `instance`, `@[instance] def`, or `attribute [instance]` target whose type
+/// is a specification class (`*ItemSpec`) or one of the module's aliases of
+/// one ([`lean_spec_class_aliases`]) must be a structure instance, a generated
+/// default, or a `refine*Spec` with a trivial `pre` argument. A module that
+/// redeclares a trusted name, renames a constant, or extends the syntax is
+/// uninspectable and reported ([`lean_uninspectable_module_lines`]).
+///
+/// # Limits
+///
+/// The audit reads one module, token by token. It is sound for a module whose
+/// names mean what they say; it cannot see:
+///
+/// * a declaration in an *imported* module that shadows a trusted name in a
+///   namespace this module enters (`Evil.True`, reached by `namespace Evil`);
+/// * code inside a string literal, including the `{…}` holes of an
+///   interpolated string;
+/// * a precondition that is semantically but not syntactically trivial, which
+///   is reported (fail closed), or semantically non-trivial behind a
+///   definition in another module, which is not.
+///
+/// A complete check elaborates the module; `EntryPointRequiresGuard` in
+/// `Anneal.SpecBoundaryGuards` states the property to check.
 pub fn audit_lean_spec_entry_point_requires(
     entry_def_path: &str,
     source_label: &str,
@@ -15011,6 +15201,8 @@ fn wrapper_len(w: &Wrapper) -> usize { 0 }
             "def ghostLen (s : GhostSeq Nat) := (s.toList.length : Nat)",
             "def ghostLenBound (s : GhostSeq Nat) := (s.toList.length < UInt64.size : Prop)",
             "def ghostLenBound (s : GhostSeq Nat) := UInt64.ofNat 0 < UInt64.ofNat 1",
+            "def ghostCountOk (s : GhostSet UInt64) := UInt64.ofNat 0 ∈ s",
+            "def ghostLenDvd (s : GhostSeq Nat) := UInt64.ofNat 2 ∣ UInt64.ofNat 4",
             "def bufferLen (b : Buffer) := (0 : UInt64)",
             "theorem ghost_len_eq (s : GhostSeq Nat) := (rfl : (0 : UInt64) = 0)",
         ] {
@@ -15694,7 +15886,7 @@ fn one() -> Result<u32, E> { Ok(1) }
             "match out with | .ok v => v = 1 | «e» => True",
             "catch_all_arm_true",
         ),
-        ("lean", "| «Except.error» _ => True", "err_arm_true"),
+        ("lean", "| «Except.error» _ => True", ""),
         // Nested catch-all paren frames neither leak into inner unit patterns
         // nor lose outer tuple/or state.
         (
@@ -15786,6 +15978,51 @@ fn one() -> Result<u32, E> { Ok(1) }
         ("rust", "Err(e) => { ; true }", "err_arm_true"),
         ("rust", "Err(e) => { let _ = 1 / *e; true }", ""),
         ("rust", "Err(e) => { let _ = *e % 2; true }", ""),
+        // What follows a trivially-true operand must not bind it into a
+        // larger term: an unknown operator is not a tautology.
+        ("lean", "| .err f => f = f ∘ g", ""),
+        ("lean", "| .err s => s = s ∪ t", ""),
+        ("lean", "| .err e => e = e $ x", ""),
+        ("lean", "| .err a => a = a ∣ b", ""),
+        ("rust", "Err(e) => e == e | m", ""),
+        ("lean", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        ("any", "| .err e => e = e | .ok v => v = 1", "err_arm_true"),
+        (
+            "lean",
+            "⟨fun out => match out with | .ok v => v = 1 | .err _ => True⟩",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "have h : match x with | .ok v => v = 1 | .err _ => True := by simp",
+            "err_arm_true",
+        ),
+        // Only a `let` that names, projects, borrows, or dereferences is
+        // benign: arithmetic may panic.
+        ("rust", "Err(e) => { let _ = *e + 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e - 1; true }", ""),
+        ("rust", "Err(e) => { let _ = *e * 2; true }", ""),
+        ("rust", "Err(e) => { let _ = -*e; true }", ""),
+        ("rust", "Err(e) => { let _ = *e << 70; true }", ""),
+        ("rust", "Err(e) => { let _ = *e; true }", "err_arm_true"),
+        (
+            "rust",
+            "Err(e) => { let _ = &*e; let c = e.code; true }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(e) => { let _ = E::A; true }", "err_arm_true"),
+        // A quoted Lean identifier is one name, never a bracket or a
+        // constructor path.
+        (
+            "lean",
+            "def «(» : Nat := 0\ndef post : Outcome → Prop\n  | .ok v => v = 1\n  | .err _ => True",
+            "err_arm_true",
+        ),
+        (
+            "lean",
+            "match out with | .ok v => v = 1 | «e'» => True",
+            "catch_all_arm_true",
+        ),
     ];
 
     /// The same table is asserted by `scan_error_branch_wildcard` in
@@ -16702,6 +16939,127 @@ end Specs.Demo.main
         ] {
             assert_eq!(audit(clean), vec![], "{clean:?}");
         }
+    }
+
+    #[test]
+    fn lean_entry_point_audit_sees_through_class_aliases_and_unbalanced_tokens() {
+        let audit = |text: &str| {
+            audit_lean_spec_entry_point_requires("demo::main", "Specs/Demo/main.lean", text, &[])
+                .into_iter()
+                .map(|d| d.line)
+                .collect::<Vec<_>>()
+        };
+        let bad = "⟨fun a => a = [], fun _ _ => True⟩";
+        for (flagged, lines) in [
+            // An instance declared at an alias of the specification class.
+            (
+                format!("abbrev S := ItemSpec \"demo::main\"\ninstance : S := {bad}\n"),
+                vec![2],
+            ),
+            (
+                format!("def S : Type := ItemSpec \"demo::main\"\ninstance : S := {bad}\n"),
+                vec![2],
+            ),
+            (
+                format!(
+                    "abbrev S (n : String) := ItemSpec n\ninstance : S \"demo::main\" := {bad}\n"
+                ),
+                vec![2],
+            ),
+            (
+                format!(
+                    "abbrev S := ItemSpec \"demo::main\"\nabbrev T := S\n@[instance] def bad : T := {bad}\n"
+                ),
+                vec![3],
+            ),
+            (
+                format!("alias S := ItemSpec\ninstance : S \"demo::main\" := {bad}\n"),
+                vec![2],
+            ),
+            // The class left to the value.
+            (
+                format!("instance : _ := ({bad} : ItemSpec \"demo::main\")\n"),
+                vec![1],
+            ),
+            // Any renaming makes the names unreliable.
+            (
+                format!(
+                    "open Trusted.VerificationResult renaming ItemSpec → Foo\ninstance : Foo \"demo::main\" := {bad}\n"
+                ),
+                vec![1],
+            ),
+            (
+                String::from(
+                    "open Foo renaming a → b\ndef pre (args : List Value) : Prop := True\n",
+                ),
+                vec![1],
+            ),
+            // A token stream the lexer reads as unbalanced hides nothing: a
+            // quoted identifier is one name, and declarations are found
+            // without consulting a bracket depth.
+            (
+                format!("def «(» : Nat := 0\ninstance : ItemSpec \"demo::main\" := {bad}\n"),
+                vec![2],
+            ),
+            (
+                format!(
+                    "def msg := s!\"{{f \"(\"}}\"\ninstance : ItemSpec \"demo::main\" := {bad}\n"
+                ),
+                vec![2],
+            ),
+            (
+                String::from(
+                    "def msg := s!\"{f \"(\"}\"\nlocal notation \"True\" => False\ndef pre (args : List Value) : Prop := True\n",
+                ),
+                vec![2],
+            ),
+            (
+                String::from(
+                    "def msg := s!\"{f \"(\"}\"\nnamespace Specs.Demo.main\ndef True : Prop := False\ndef pre (args : List Value) : Prop := True\n",
+                ),
+                vec![3],
+            ),
+            // An unclosed quoted identifier is malformed source.
+            (
+                String::from("def «pre (args : List Value) : Prop := True\n"),
+                vec![1],
+            ),
+        ] {
+            assert_eq!(audit(&flagged), lines, "{flagged:?}");
+        }
+        for clean in [
+            "abbrev S := ItemSpec \"demo::main\"\ninstance : S := Obligations.Demo.main.defaultSpec\n",
+            "abbrev S := ItemSpec \"demo::main\"\ninstance : S where\n  pre := fun _ => True\n  post := fun _ _ => True\n",
+            "abbrev M := Marker\ninstance : Inhabited M := ⟨Marker.mk⟩\n",
+            "@[instance] def good : ItemSpec \"demo::main\" := Obligations.Demo.main.defaultSpec\n",
+            "@[reducible, instance] def good : ItemSpec \"demo::main\" := Obligations.Demo.main.defaultSpec\n",
+            "def mainSpec : ItemSpec \"demo::main\" where\n  pre _ := True\n  post _ _ := True\nattribute [local instance] mainSpec\n",
+            "def «pre» (args : List Value) : Prop := True\ndef «odd (name» : Nat := 0\n",
+        ] {
+            assert_eq!(audit(clean), Vec::<usize>::new(), "{clean:?}");
+        }
+        assert_eq!(
+            lean_spec_class_aliases(
+                &tokenize_spec_source(
+                    "abbrev S := ItemSpec \"x\"\nabbrev T := S\ndef v : ItemSpec \"x\" := (w : ItemSpec \"x\")\n",
+                    SpecSourceDialect::Lean
+                )
+                .expect("well-formed")
+            ),
+            vec![String::from("S"), String::from("T")]
+        );
+        // The other scanners fail closed on an unclosed quoted identifier too.
+        assert_eq!(
+            wildcard_findings("Specs/A.lean", "| .err «e => False"),
+            vec![(1, ErrorBranchWildcardKind::MalformedSource)]
+        );
+        assert_eq!(
+            ghost_findings("Specs/A.lean", "def «ghostLen (s : GhostSeq Nat) : Nat := 0")
+                .into_iter()
+                .map(|(line, _, _, kind)| (line, kind))
+                .collect::<Vec<_>>(),
+            vec![(1, GhostLengthWidthKind::MalformedSource)]
+        );
     }
 
     #[test]
