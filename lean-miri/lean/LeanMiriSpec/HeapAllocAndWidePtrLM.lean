@@ -2211,6 +2211,118 @@ theorem allocationMachine_deallocate_dangling {K User Payload : Type} [Decidable
     EStateM.throw, throw, throwThe, MonadExceptOf.throw, hsync, hres, hpend, Option.getD_none]
   rfl
 
+/-- Direct universal bridge on vendored `Miri.Interpreter.AllocationMachine.deallocate`
+for Tree Borrows violations: when `before` observes `borrowTracker = some tracker`
+and `deallocateBorrowRange` returns a status other than `.Deallocated`, the typed
+`.undefinedBehavior` stored in `AccessState.pendingError` overrides the lifecycle's
+`.hookFailure` (so it surfaces as `.undefinedBehavior`, never `.callback`). -/
+theorem allocationMachine_deallocate_treeBorrows_ub {K User Payload : Type} [DecidableEq K]
+    (h : AllocationMachine.DeallocationHooks K User Payload)
+    (pointer : Pointer (Option Provenance)) (kind : MemoryKind K)
+    (st : MachineHooks.State K User)
+    (id : AllocId) (provExtra : ProvenanceExtra)
+    (entry : LocalAllocation Provenance BorrowTree K)
+    (m1 : PlaceMachine.Machine K User) (m2 : PlaceMachine.Machine K User)
+    (tracker : MachineHooks.BorrowState)
+    (hres : (h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).outcome =
+      .ok (id, Size.ZERO, provExtra))
+    (hlive : (h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).memory.live.find?
+      (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut)
+    (hkind : entry.kind = kind)
+    (hnat : entry.allocation.nativeBuffer = none)
+    (hdiag :
+      let r := h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      h.diagnostic id { r.state.machine with memory := afterRemove } = .ok () m1)
+    (hrace : MachineHooks.memoryRaceAccess m1 id ⟨Size.ZERO, entry.allocation.byteSize⟩
+      (some .Deallocate) .Read = (m2, .ok ()))
+    (htracker : m2.borrowTracker = some tracker)
+    (htb : (entry.allocation.extra.deallocateBorrowRange provExtra Size.ZERO
+      entry.allocation.byteSize tracker.global.protectedTags).status ≠ .Deallocated) :
+    let tbRes := entry.allocation.extra.deallocateBorrowRange provExtra Size.ZERO
+      entry.allocation.byteSize tracker.global.protectedTags
+    ∃ st', AllocationMachine.deallocate h pointer
+        (some (entry.allocation.byteSize, entry.allocation.align)) kind st =
+      .error (.undefinedBehavior s!"Tree Borrows deallocation: {reprStr tbRes.status}") st' := by
+  intro tbRes
+  let hooks : MemoryDeallocationHooks Provenance BorrowTree K (PlaceMachine.AccessState K User) ProvenanceExtra :=
+    { synchronizeMemory := fun memory access => { access with machine := { access.machine with memory } }
+      resolvePointer := h.resolvePointer
+      beforeDeallocation := fun memory (state : PlaceMachine.AccessState K User) allocation _ id' prov' size' align' kind' =>
+        let state' : PlaceMachine.AccessState K User :=
+          { state with machine := { state.machine with memory } }
+        let res : EStateM.Result StepError (PlaceMachine.Machine K User) Unit :=
+          (do
+            h.diagnostic id'
+            let (machine, result) := MachineHooks.memoryRaceAccess (← get) id' ⟨Size.ZERO, size'⟩
+              (some .Deallocate) .Read
+            set machine
+            match result with | .error error => throw error | .ok () => pure ()
+            if let some tr := (← get).borrowTracker then
+              let result := allocation.extra.deallocateBorrowRange prov' Size.ZERO size'
+                tr.global.protectedTags
+              modify (h.retainDetached (allocation.setExtra result.tree))
+              if result.status != BorrowTree.BorrowTreeDeallocStatus.Deallocated then
+                throw (StepError.undefinedBehavior s!"Tree Borrows deallocation: {reprStr result.status}")
+            MemoryExtras.beforeDeallocationSync h.extras id'
+            let span ← h.currentSpan
+            modify fun (machine : PlaceMachine.Machine K User) => { machine with
+              allocationSpans := machine.allocationSpans.map fun (old, allocated, freed) =>
+                (old, allocated, if old == id' then some span else freed) }
+            h.freeAllocId id' size' align' kind'
+            MemoryExtras.removeAllocation h.extras id'
+            modify fun (machine : PlaceMachine.Machine K User) => { machine with
+              raceAllocations := machine.raceAllocations.filter fun entry => entry.1 != id' })
+          state'.machine
+        match res with
+        | .ok value machine => ⟨machine.memory, { state' with machine }, .ok value⟩
+        | .error error machine => ⟨machine.memory, ⟨machine, some error⟩, .error (reprStr error)⟩ }
+  have hne : ((entry.allocation.extra.deallocateBorrowRange provExtra Size.ZERO
+      entry.allocation.byteSize tracker.global.protectedTags).status != .Deallocated) = true :=
+    bne_iff_ne.mpr htb
+  have hbef :
+      let r := h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      let st1 := hooks.synchronizeMemory afterRemove (hooks.synchronizeMemory r.memory r.state)
+      let b := hooks.beforeDeallocation afterRemove st1 entry.allocation pointer id provExtra
+        entry.allocation.byteSize entry.allocation.align kind
+      b.outcome = .error (reprStr (StepError.undefinedBehavior s!"Tree Borrows deallocation: {reprStr tbRes.status}")) ∧
+      b.state.pendingError = some (.undefinedBehavior s!"Tree Borrows deallocation: {reprStr tbRes.status}") := by
+    dsimp only [hooks]
+    simp only [bind, Bind.bind, EStateM.bind, get, getThe, MonadStateOf.get, EStateM.get,
+      set, MonadStateOf.set, EStateM.set, modify, modifyGet, MonadStateOf.modifyGet,
+      EStateM.modifyGet, throw, throwThe, MonadExceptOf.throw,
+      EStateM.throw, hdiag, hrace, htracker, hne, ↓reduceIte]
+    exact ⟨rfl, rfl⟩
+  have hsync : hooks.synchronizeMemory st.machine.memory ⟨st.machine, none⟩ = ⟨st.machine, none⟩ := rfl
+  have hstep := deallocatePtrWith_zero_offset_step st.machine.memory ⟨st.machine, none⟩ pointer
+    (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks id provExtra
+    (by simpa [hsync] using hres)
+  have hres_eq :
+      let res := MemoryLifecycle.deallocatePtrWith st.machine.memory ⟨st.machine, none⟩ pointer
+        (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks
+      res.outcome = .error (.hookFailure "beforeMemoryDeallocation"
+        (reprStr (StepError.undefinedBehavior s!"Tree Borrows deallocation: {reprStr tbRes.status}"))) ∧
+      res.detached = some (id, entry) ∧
+      res.hooks.pendingError = some (.undefinedBehavior s!"Tree Borrows deallocation: {reprStr tbRes.status}") := by
+    dsimp only
+    rw [hstep]
+    have hresolve_eq : hooks.resolvePointer = h.resolvePointer := rfl
+    rw [hresolve_eq]
+    simp only [hsync, hlive, Option.map_some, hmut, show (Mutability.Mut == .Not) = false by rfl,
+      Bool.false_eq_true, hkind, ne_eq, not_true_eq_false, bne_self_eq_false, Bool.or_self,
+      ↓reduceIte, hbef.1]
+    exact ⟨trivial, trivial, hbef.2⟩
+  unfold AllocationMachine.deallocate
+  simp only [get, getThe, MonadStateOf.get, modify, modifyGet, MonadStateOf.modifyGet,
+    bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.get,
+    throw, throwThe, MonadExceptOf.throw]
+  erw [hres_eq.1, hres_eq.2.1, hres_eq.2.2]
+  dsimp only
+  rw [hnat]
+  exact ⟨_, rfl⟩
+
 /-! ### `Memory::allocate_ptr` failure classification
 
 `MemoryLifecycle.allocatePtr` creates the backing storage (`Allocation.tryNew`)
@@ -2308,6 +2420,180 @@ theorem allocatePtr_too_large_witness :
   rw [allocatePtrU.eq_src]
   decide +kernel
 
+/-- When `reserveAllocId` fails (exhaustion or duplicate ID), `allocate_ptr`
+returns `.allocationIdError` and keeps the updated memory from `reserveAllocId`. -/
+theorem allocatePtr_reserve_error {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hfit : ¬ a.byteSize.bytes > maximumObjectSize.bytes) (e : AllocationIdError)
+    (hres : memory.reserveAllocId.2 = .error e) :
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).outcome = .error (.allocationIdError e) ∧
+    (MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot).memory = memory.reserveAllocId.1 := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  cases hr : memory.reserveAllocId with
+  | mk mem' r =>
+    rw [hr] at hres
+    dsimp only at hres
+    subst hres
+    simp only [Id.run, h, pure_bind, hfit, ↓reduceIte]
+    exact ⟨rfl, rfl⟩
+
+/-- When `initExtra` fails after `reserveAllocId`, `allocate_ptr` reports
+`.hookFailure "initLocalAllocation" msg`. -/
+theorem allocatePtr_initExtra_error {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hfit : ¬ a.byteSize.bytes > maximumObjectSize.bytes)
+    (mem1 : MemoryState Prov Extra MachineKind) (id : AllocId)
+    (hres : memory.reserveAllocId = (mem1, .ok id))
+    (hng : globalKind ≠ some kind)
+    (mem2 : MemoryState Prov Extra MachineKind) (st2 : HookState) (msg : String)
+    (hinit : initExtra mem1 (sync mem1 (sync memory (sync memory hooksState))) id kind a.byteSize a.align =
+      ⟨mem2, st2, .error msg⟩) :
+    MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot =
+      ⟨mem2, sync mem2 st2, .error (.hookFailure "initLocalAllocation" msg)⟩ := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  simp only [Id.run, h, pure_bind, hfit, ↓reduceIte, hres, hng]
+  dsimp only [pure, Pure.pure]
+  conv => lhs; whnf
+  generalize hq : globalKind.instDecidableEq (some kind) = q
+  cases q with
+  | isTrue ht => exact absurd ht hng
+  | isFalse _ =>
+    dsimp only
+    rw [hinit]
+    rfl
+
+/-- When `adjustRoot` fails after `initExtra` and live-map insertion,
+`allocate_ptr` reports `.hookFailure "adjustAllocRootPointer" msg` and keeps
+the inserted allocation in `memory`. -/
+theorem allocatePtr_adjustRoot_error {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hfit : ¬ a.byteSize.bytes > maximumObjectSize.bytes)
+    (mem1 : MemoryState Prov Extra MachineKind) (id : AllocId)
+    (hres : memory.reserveAllocId = (mem1, .ok id))
+    (hng : globalKind ≠ some kind)
+    (mem2 : MemoryState Prov Extra MachineKind) (st2 : HookState) (extra : Extra)
+    (hinit : initExtra mem1 (sync mem1 (sync memory (sync memory hooksState))) id kind a.byteSize a.align =
+      ⟨mem2, st2, .ok extra⟩)
+    (mem3 : MemoryState Prov Extra MachineKind) (st3 : HookState) (msg : String)
+    (hadj :
+      let inserted := { mem2 with live := (mem2.live.filter fun old => old.1 != id).push (id, ⟨kind, a.withExtra extra⟩) }
+      adjustRoot inserted (sync inserted (sync mem2 st2)) id kind = ⟨mem3, st3, .error msg⟩) :
+    MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot =
+      ⟨mem3, sync mem3 st3, .error (.hookFailure "adjustAllocRootPointer" msg)⟩ := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  simp only [Id.run, h, pure_bind, hfit, ↓reduceIte, hres, hng]
+  dsimp only [pure, Pure.pure]
+  conv => lhs; whnf
+  generalize hq : globalKind.instDecidableEq (some kind) = q
+  cases q with
+  | isTrue ht => exact absurd ht hng
+  | isFalse _ =>
+    dsimp only
+    rw [hinit]
+    dsimp only [bind, Bind.bind, pure, Pure.pure]
+    erw [hadj]
+
+/-- Universal success law of vendored `MemoryLifecycle.allocatePtr`: when
+storage creation, size bound, ID reservation, non-global check, `initExtra`,
+and `adjustRoot` all succeed, `allocatePtr` inserts `(id, ⟨kind, a.withExtra extra⟩)`
+into `live` and returns the root pointer `ptr`. -/
+theorem allocatePtr_ok {Prov Extra MachineKind HookState : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (sync : MemoryState Prov Extra MachineKind → HookState → HookState)
+    (size : Size) (align : Align) (kind : MemoryKind MachineKind) (init : AllocInit)
+    (maximumObjectSize : Size) (globalKind : Option (MemoryKind MachineKind))
+    (zeroedStorage : Size → Align → Option (Array UInt8))
+    (initExtra : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → Size → Align →
+      MemoryStateHookResult Prov Extra MachineKind HookState Extra)
+    (adjustRoot : MemoryState Prov Extra MachineKind → HookState → AllocId →
+      MemoryKind MachineKind → MemoryStateHookResult Prov Extra MachineKind HookState (Pointer Prov))
+    (a : Allocation Prov Unit) (h : Allocation.tryNew (Prov := Prov) size align init zeroedStorage = .ok a)
+    (hfit : ¬ a.byteSize.bytes > maximumObjectSize.bytes)
+    (mem1 : MemoryState Prov Extra MachineKind) (id : AllocId)
+    (hres : memory.reserveAllocId = (mem1, .ok id))
+    (hng : globalKind ≠ some kind)
+    (mem2 : MemoryState Prov Extra MachineKind) (st2 : HookState) (extra : Extra)
+    (hinit : initExtra mem1 (sync mem1 (sync memory (sync memory hooksState))) id kind a.byteSize a.align =
+      ⟨mem2, st2, .ok extra⟩)
+    (mem3 : MemoryState Prov Extra MachineKind) (st3 : HookState) (ptr : Pointer Prov)
+    (hadj :
+      let inserted := { mem2 with live := (mem2.live.filter fun old => old.1 != id).push (id, ⟨kind, a.withExtra extra⟩) }
+      adjustRoot inserted (sync inserted (sync mem2 st2)) id kind = ⟨mem3, st3, .ok ptr⟩) :
+    MemoryLifecycle.allocatePtr memory hooksState sync size align kind init maximumObjectSize
+      globalKind zeroedStorage initExtra adjustRoot =
+      ⟨mem3, sync mem3 st3, .ok ptr⟩ := by
+  unfold MemoryLifecycle.allocatePtr MemoryLifecycle.insertAllocation
+  simp only [Id.run, h, pure_bind, hfit, ↓reduceIte, hres, hng]
+  dsimp only [pure, Pure.pure]
+  conv => lhs; whnf
+  generalize hq : globalKind.instDecidableEq (some kind) = q
+  cases q with
+  | isTrue ht => exact absurd ht hng
+  | isFalse _ =>
+    dsimp only
+    rw [hinit]
+    dsimp only [bind, Bind.bind, pure, Pure.pure]
+    erw [hadj]
+
+/-- `allocatePtr_tryNew_error` is not vacuous: an exhausting host storage
+callback yields `.error (.allocation .hostMemoryExhausted)`. -/
+theorem allocatePtr_tryNew_error_witness :
+    (MemoryLifecycle.allocatePtr (MemoryState.empty : LmMem) { treeBorrows := false }
+      (fun _ ctx => ctx) (Size.ofBytes 8) Align.EIGHT (.machine .rust) .Uninit
+      (Size.ofBytes (UInt64.ofNat lmIsizeMax)) (some (.machine .global))
+      (fun _ _ => none) lmInitExtra lmAdjustRoot).outcome =
+        .error (.allocation .hostMemoryExhausted) := by
+  have htry : Allocation.tryNew (Prov := Provenance) (Size.ofBytes 8) Align.EIGHT .Uninit
+      (fun _ _ => none) = .error .hostMemoryExhausted := rfl
+  exact (allocatePtr_tryNew_error _ _ _ _ _ _ _ _ _ _ _ _ .hostMemoryExhausted htry).1
+
+/-- `allocatePtr_dynamically_global` is not vacuous (`rust#166221`): requesting
+a dynamic `.machine .global` allocation when `globalKind = some (.machine .global)`
+fails with `.dynamicallyAllocatingGlobal`. -/
+theorem allocatePtr_dynamically_global_witness :
+    (MemoryLifecycle.allocatePtr (MemoryState.empty : LmMem) { treeBorrows := false }
+      (fun _ ctx => ctx) (Size.ofBytes 8) Align.EIGHT (.machine .global) .Uninit
+      (Size.ofBytes (UInt64.ofNat lmIsizeMax)) (some (.machine .global))
+      (fun size _ => some (Array.replicate size.bytes.toNat 0)) lmInitExtra lmAdjustRoot).outcome =
+        .error .dynamicallyAllocatingGlobal := by
+  rw [allocatePtrU.eq_src]
+  decide +kernel
+
 /-! ### Tree Borrows universal laws (`rust#165833`) -/
 
 /-- On the single-threaded hooks (`lmHookContext`, `lmMachineHooks`), vendored
@@ -2360,6 +2646,930 @@ theorem deallocateBorrowRange_missing_tag (tree : BorrowTree)
   unfold BorrowTree.deallocateBorrowRange
   simp only [Id.run, hok, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hmiss,
     Option.isNone_none, pure, Pure.pure]
+
+/-- One yield step of `loopFuelK` with positive fuel. -/
+theorem loopFuelK_yield_pos {β : Type} (f : Unit → β → Id (ForInStep β)) (n : Nat) (b next : β)
+    (k : β → β) (h : f () b = .yield next) :
+    loopFuelK f (n + 1) b k = loopFuelK f n next k := by
+  simp only [loopFuelK, h]
+
+/-- One terminating step of `loopFuelK` with positive fuel. -/
+theorem loopFuelK_done_pos {β : Type} (f : Unit → β → Id (ForInStep β)) (n : Nat) (b res : β)
+    (k : β → β) (h : f () b = .done res) :
+    loopFuelK f (n + 1) b k = res := by
+  simp only [loopFuelK, h]
+
+/-- On a single-segment range map `[0, size)` with `size ≠ 0`, `findOffset` at
+byte `0` returns `.ok 0` for every `size` (universal across all `2^64 - 1` sizes). -/
+theorem findOffsetU_fresh_nonzero {α : Type} [DecidableEq α] (size : Size) (v : α)
+    (hne : size.bytes ≠ 0) :
+    findOffsetU (⟨#[⟨⟨0, size.bytes⟩, v⟩]⟩ : DedupRangeMap α) 0 = .ok 0 := by
+  unfold findOffsetU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind, loopUnrolled]
+  rw [loopFuelK_yield_pos (next := (0, 1, some (Except.ok 0)))]
+  · rw [loopFuelK_done_pos (res := (0, 1, some (Except.ok 0)))]
+    rfl
+  · simp only [Array.size_singleton]
+    conv => lhs; whnf
+    have hge0 : ¬ (size.bytes ≤ 0) := by
+      intro hge
+      exact hne (UInt64.le_antisymm hge (Nat.zero_le _))
+    have hd : size.bytes.decLe 0 = isFalse hge0 := by
+      cases size.bytes.decLe 0 with
+      | isFalse _ => rfl
+      | isTrue ht => exact absurd ht hge0
+    erw [hd]
+
+/-- Universal full-range `DedupRangeMap.iterMut` law on a freshly created
+non-empty `DedupRangeMap.new size v`: returns the single segment `[0, size)` at
+position `0` without splitting. -/
+theorem iterMut_fresh_nonzero {α : Type} [DecidableEq α] (size : Size) (v : α)
+    (hne : size.bytes ≠ 0) :
+    (DedupRangeMap.new size v).iterMut Size.ZERO size =
+      { state := ⟨#[⟨⟨0, size.bytes⟩, v⟩]⟩, positions := #[0],
+        segments := #[⟨⟨0, size.bytes⟩, v⟩], outcome := .ok () } := by
+  have hnew : DedupRangeMap.new size v = ⟨#[⟨⟨0, size.bytes⟩, v⟩]⟩ := by
+    unfold DedupRangeMap.new
+    have hbz : (size.bytes == 0) = false := beq_false_of_ne hne
+    simp [hbz]
+  rw [hnew]
+  rw [show @DedupRangeMap.iterMut = @iterMutU from iterMutU.eq_src]
+  unfold iterMutU iterMutWithCloneU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind, loopUnrolled]
+  have hbz : (size.bytes == 0) = false := beq_false_of_ne hne
+  have hfind := findOffsetU_fresh_nonzero size v hne
+  have hsz0 : Size.ZERO.bytes = 0 := rfl
+  simp only [hbz, Bool.false_eq_true, ↓reduceIte, hsz0, hfind]
+  split
+  · rename_i e he
+    conv at he => lhs; whnf
+    cases he
+  · rename_i entries didSplit hs1
+    conv at hs1 => lhs; whnf
+    cases hs1
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    split
+    · rename_i finish hfin
+      conv at hfin => lhs; whnf
+      have hfin_eq : finish = size.bytes := by
+        simp [Size.ofBytes] at hfin
+        exact hfin.symm
+      subst hfin_eq
+      rw [loopFuelK_yield_pos (next :=
+        (⟨#[⟨⟨0, size.bytes⟩, v⟩]⟩, 1, 2, 1, true, none))]
+      · rw [loopFuelK_done_pos (res :=
+          (⟨#[⟨⟨0, size.bytes⟩, v⟩]⟩, 1, 2, 1, true, none))]
+        · dsimp only
+          have hd : instDecidableEqBool (size.bytes == 0 || size.bytes == size.bytes) true =
+              isTrue (by simp) := by
+            cases instDecidableEqBool (size.bytes == 0 || size.bytes == size.bytes) true with
+            | isTrue _ => rfl
+            | isFalse hf => exact absurd (by simp) hf
+          split
+          · rename_i e he
+            conv at he => lhs; whnf
+            erw [hd] at he
+            cases he
+          · rename_i ents' ds' hs2
+            conv at hs2 => lhs; whnf
+            erw [hd] at hs2
+            cases hs2
+            split
+            · rename_i e he
+              conv at he => lhs; whnf
+              cases he
+            · rename_i segs hsegs
+              conv at hsegs => lhs; whnf
+              cases hsegs
+              simp
+        · rfl
+      · conv => lhs; whnf
+        have hd : size.bytes.decLe size.bytes = isTrue (UInt64.le_refl _) := by
+          cases size.bytes.decLe size.bytes with
+          | isTrue _ => rfl
+          | isFalse hf => exact absurd (UInt64.le_refl _) hf
+        erw [hd]
+        simp
+        generalize hq : instDecidableEqBool
+            (!decide (size.bytes ≥ size.bytes) &&
+              decide (1 ≥ (#[⟨⟨0, size.bytes⟩, v⟩] : Array (RangeMapSegment α)).size)) true = q
+        cases q with
+        | isFalse _ => rfl
+        | isTrue ht => exfalso; simp at ht
+    · rename_i e he
+      conv at he => lhs; whnf
+      simp [Size.ofBytes] at he
+
+/-- `forIn` over the 1-element range `[:1]` executes `f 0 init` once. -/
+theorem forIn_range_one {β : Type} (init : β) (f : Nat → β → Id (ForInStep β)) :
+    forIn (m := Id) [:1] init f =
+      match f 0 init with | .done a => a | .yield a => a := by
+  rw [Std.Legacy.Range.forIn_eq_forIn_range']
+  simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one,
+    List.range'_succ, List.range'_zero, List.forIn_cons, List.forIn_nil]
+  cases f 0 init <;> rfl
+
+/-- `BorrowTree.new rootTag size` maps `rootTag` to root index `⟨0⟩`. -/
+theorem borrowTree_new_indexOfTag (rootTag : BorTag) (size : Size) :
+    (BorrowTree.new rootTag size).indexOfTag rootTag = some ⟨0⟩ := by
+  unfold BorrowTree.indexOfTag
+  change ((#[(rootTag, (⟨0⟩ : UniIndex))]).find? (fun entry => entry.1 == rootTag)).map Prod.snd = some ⟨0⟩
+  simp
+
+/-- Updating index `⟨0⟩` of a singleton `UniValMap` replaces its unique entry. -/
+theorem uniValMap_insert_singleton_zero {α : Type} (u v : α) :
+    ((⟨#[some u]⟩ : UniValMap α).insert ⟨0⟩ v) = ⟨#[some v]⟩ := rfl
+
+/-- Universal single-location write access on a fresh `BorrowTree.new rootTag size`:
+writing locally through the root tag succeeds and preserves the initial `Unique`
+location tree for every `rootTag`, `size`, and `protectedTags`. -/
+theorem borrowTree_performNormalAccess_fresh (rootTag : BorTag) (size : Size)
+    (protectedTags : ProtectedTags) :
+    let initLoc : LocationTree :=
+      { perms := ({} : UniValMap Tree.LocationState).insert ⟨0⟩ ⟨Permission.newUnique, true, .None⟩
+        exposedCache := {} }
+    let res := (BorrowTree.new rootTag size).performNormalAccessAt initLoc ⟨0⟩ .Write
+      protectedTags .VisitChildrenOfAccessed
+    res.outcome = .ok () ∧
+    res.access.status = .Completed ∧
+    res.access.root = 0 ∧
+    res.location = initLoc := by
+  intro initLoc res
+  let nd : TreeNode := ⟨rootTag, none, #[], Permission.newDisabled, .None, false, none⟩
+  have hnodes : (BorrowTree.new rootTag size).nodes = ⟨#[some nd]⟩ := rfl
+  have hloc : initLoc = { perms := ⟨#[some ⟨Permission.newUnique, true, .None⟩]⟩, exposedCache := {} } := rfl
+  have hent : (BorrowTree.new rootTag size).nodes.entries = #[(⟨0⟩, nd)] := by
+    rw [hnodes]
+    unfold UniValMap.entries
+    dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+    have hsz : (#[some nd] : Array (Option TreeNode)).size = 1 := rfl
+    rw [hsz, forIn_range_one]
+    simp [UniIndex.ofNat?]
+  have hprot :
+      ((BorrowTree.new rootTag size).nodes.entries.toList.filterMap fun (index, node) =>
+        if protectedTags.contains node.tag then some index.toNat else none) =
+      (if protectedTags.contains rootTag then [0] else []) := by
+    rw [hent]
+    cases hp : protectedTags.contains rootTag <;> simp [nd, hp, UniIndex.toNat]
+  have hacc_t : Tree.NormalTreeState.performAccess
+      { topology := ⟨#[⟨none, []⟩]⟩
+        defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+        protectedNodes := [0]
+        locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+      0 .Write .VisitChildrenOfAccessed =
+      { tree := { topology := ⟨#[⟨none, []⟩]⟩
+                  defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+                  protectedNodes := [0]
+                  locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+        root := 0
+        visited := [⟨0, .LocalAccess⟩]
+        status := .Completed } := by
+    decide +kernel
+  have hacc_f : Tree.NormalTreeState.performAccess
+      { topology := ⟨#[⟨none, []⟩]⟩
+        defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+        protectedNodes := []
+        locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+      0 .Write .VisitChildrenOfAccessed =
+      { tree := { topology := ⟨#[⟨none, []⟩]⟩
+                  defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+                  protectedNodes := []
+                  locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+        root := 0
+        visited := [⟨0, .LocalAccess⟩]
+        status := .Completed } := by
+    decide +kernel
+  dsimp only [res]
+  unfold BorrowTree.performNormalAccessAt
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  cases hp : protectedTags.contains rootTag
+  · have hproj_eq : Tree.NormalTreeState.performAccess
+        { topology := ⟨(BorrowTree.new rootTag size).nodes.data.map fun entry =>
+            match entry with
+            | none => ⟨none, []⟩
+            | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+          defaultStates := (BorrowTree.new rootTag size).nodes.data.map fun entry =>
+            match entry with
+            | some node => node.defaultLocationState
+            | none => ⟨.Disabled, false, .None⟩
+          protectedNodes := (BorrowTree.new rootTag size).nodes.entries.toList.filterMap fun (index, node) =>
+            if protectedTags.contains node.tag then some index.toNat else none
+          locationStates := (BorrowTree.new rootTag size).nodes.data.mapIdx fun position _ =>
+            match UniIndex.ofNat? position with
+            | none => none
+            | some index => initLoc.perms.get index }
+        (⟨0⟩ : UniIndex).toNat .Write .VisitChildrenOfAccessed =
+        { tree := { topology := ⟨#[⟨none, []⟩]⟩
+                    defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+                    protectedNodes := []
+                    locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+          root := 0
+          visited := [⟨0, .LocalAccess⟩]
+          status := .Completed } := by
+      rw [hprot, hp, hnodes, hloc]
+      simp only [Bool.false_eq_true, ↓reduceIte, Array.map_singleton,
+        nd, TreeNode.defaultLocationState, Option.map_none, List.map_nil,
+        UniIndex.ofNat?, UniValMap.get, UniIndex.toNat]
+      exact hacc_f
+    erw [hproj_eq]
+    have hsz1 : (#[some ⟨Permission.newUnique, true, .None⟩] : Array (Option Tree.LocationState)).size = 1 := rfl
+    rw [hsz1, forIn_range_one]
+    simp [UniIndex.ofNat?, BorrowTree.nodeAt, hnodes, hloc, nd, uniValMap_insert_singleton_zero,
+      UniValMap.get, UniIndex.toNat]
+    exact ⟨rfl, rfl⟩
+  · have hproj_eq : Tree.NormalTreeState.performAccess
+        { topology := ⟨(BorrowTree.new rootTag size).nodes.data.map fun entry =>
+            match entry with
+            | none => ⟨none, []⟩
+            | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+          defaultStates := (BorrowTree.new rootTag size).nodes.data.map fun entry =>
+            match entry with
+            | some node => node.defaultLocationState
+            | none => ⟨.Disabled, false, .None⟩
+          protectedNodes := (BorrowTree.new rootTag size).nodes.entries.toList.filterMap fun (index, node) =>
+            if protectedTags.contains node.tag then some index.toNat else none
+          locationStates := (BorrowTree.new rootTag size).nodes.data.mapIdx fun position _ =>
+            match UniIndex.ofNat? position with
+            | none => none
+            | some index => initLoc.perms.get index }
+        (⟨0⟩ : UniIndex).toNat .Write .VisitChildrenOfAccessed =
+        { tree := { topology := ⟨#[⟨none, []⟩]⟩
+                    defaultStates := #[⟨Permission.newDisabled, false, .None⟩]
+                    protectedNodes := [0]
+                    locationStates := #[some ⟨Permission.newUnique, true, .None⟩] }
+          root := 0
+          visited := [⟨0, .LocalAccess⟩]
+          status := .Completed } := by
+      rw [hprot, hp, hnodes, hloc]
+      simp only [↓reduceIte, Array.map_singleton,
+        nd, TreeNode.defaultLocationState, Option.map_none, List.map_nil,
+        UniIndex.ofNat?, UniValMap.get, UniIndex.toNat]
+      exact hacc_t
+    erw [hproj_eq]
+    have hsz1 : (#[some ⟨Permission.newUnique, true, .None⟩] : Array (Option Tree.LocationState)).size = 1 := rfl
+    rw [hsz1, forIn_range_one]
+    simp [UniIndex.ofNat?, BorrowTree.nodeAt, hnodes, hloc, nd, uniValMap_insert_singleton_zero,
+      UniValMap.get, UniIndex.toNat]
+    exact ⟨rfl, rfl⟩
+
+/-- Universal full-range write access on a fresh non-empty `BorrowTree.new rootTag size`:
+completes and preserves the tree for every `rootTag`, nonzero `size`, and `protectedTags`. -/
+theorem borrowTree_performBorrowAccessRange_fresh_nonzero (rootTag : BorTag) (size : Size)
+    (protectedTags : ProtectedTags) (hne : size.bytes ≠ 0) :
+    let tree := BorrowTree.new rootTag size
+    let acc := tree.performBorrowAccessRange (.concrete rootTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed
+    acc.status = .Completed ∧ acc.tree = tree := by
+  intro tree acc
+  let initLoc : LocationTree :=
+    { perms := ({} : UniValMap Tree.LocationState).insert ⟨0⟩ ⟨Permission.newUnique, true, .None⟩
+      exposedCache := {} }
+  have hidx : tree.indexOfTag rootTag = some ⟨0⟩ := borrowTree_new_indexOfTag rootTag size
+  have hlocs : tree.locations = DedupRangeMap.new size initLoc := rfl
+  have hiter : tree.locations.iterMut Size.ZERO size =
+      { state := ⟨#[⟨⟨0, size.bytes⟩, initLoc⟩]⟩, positions := #[0],
+        segments := #[⟨⟨0, size.bytes⟩, initLoc⟩], outcome := .ok () } := by
+    rw [hlocs]; exact iterMut_fresh_nonzero size initLoc hne
+  have hnorm := borrowTree_performNormalAccess_fresh rootTag size protectedTags
+  obtain ⟨hn_ok, hn_st, hn_rt, hn_loc⟩ := hnorm
+  have htree_loc_eq : { tree with locations := ⟨#[⟨⟨0, size.bytes⟩, initLoc⟩]⟩ } = tree := by
+    have hnew : DedupRangeMap.new size initLoc = ⟨#[⟨⟨0, size.bytes⟩, initLoc⟩]⟩ := by
+      unfold DedupRangeMap.new; simp [beq_false_of_ne hne]
+    have hle : tree.locations = ⟨#[⟨⟨0, size.bytes⟩, initLoc⟩]⟩ := hlocs.trans hnew
+    rcases h : tree with ⟨tm, nds, locs, rts⟩
+    rw [h] at hle
+    dsimp only at hle
+    subst hle
+    rfl
+  have hacc_eq : acc = performBorrowAccessRangeU tree (.concrete rootTag) Size.ZERO size .Write
+      protectedTags .VisitChildrenOfAccessed := by
+    dsimp only [acc]
+    rw [show @BorrowTree.performBorrowAccessRange = @performBorrowAccessRangeU from
+      performBorrowAccessRangeU.eq_src]
+  rw [hacc_eq]
+  unfold performBorrowAccessRangeU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [show @DedupRangeMap.iterMut = @iterMutU from iterMutU.eq_src] at hiter
+  rw [hidx, hiter]
+  simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte]
+  have hsz1 : (#[0] : Array Nat).size = 1 := rfl
+  rw [hsz1, forIn_range_one]
+  have hpos0 : (#[0] : Array Nat)[0]? = some 0 := rfl
+  have hseg0 : (#[⟨⟨0, size.bytes⟩, initLoc⟩] : Array (RangeMapSegment LocationTree))[0]? =
+      some ⟨⟨0, size.bytes⟩, initLoc⟩ := rfl
+  simp only [beq_self_eq_true, ↓reduceIte, hpos0, hseg0]
+  unfold performTreeAccessAtU
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  have hof0 : UniIndex.ofNat? 0 = some ⟨0⟩ := rfl
+  rw [hn_ok, hn_loc, hn_st, hn_rt, hof0]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  have hroots : tree.roots = #[⟨0⟩] := rfl
+  have hszr : tree.roots.size = 1 := rfl
+  rw [hszr, forIn_range_one]
+  have hset : ∀ (x : LocationTree),
+      (DedupRangeMap.mk (entries := #[⟨⟨0, size.bytes⟩, initLoc⟩])).setAtPos 0 x =
+      ⟨⟨#[⟨⟨0, size.bytes⟩, x⟩]⟩, .ok ()⟩ := fun _ => rfl
+  simp only [hroots, Array.getElem?_eq_getElem, Array.size_singleton, Nat.zero_lt_one,
+    Array.getElem_singleton, Option.isNone_none, Bool.not_false, Bool.and_self,
+    Bool.false_eq_true, bne_self_eq_false, ↓reduceIte, hset]
+  exact ⟨rfl, htree_loc_eq⟩
+
+/-- Universal zero-sized deallocation on a fresh `BorrowTree`: touches zero
+byte locations, so it returns `.Deallocated` for every `rootTag` and
+`protectedTags` (even if `rootTag` carries a strong protector). -/
+theorem borrowTree_deallocate_fresh_zero (rootTag : BorTag) (protectedTags : ProtectedTags) :
+    ((BorrowTree.new rootTag Size.ZERO).deallocateBorrowRange (.concrete rootTag)
+      Size.ZERO Size.ZERO protectedTags).status = .Deallocated := by
+  have hlocs0 : (BorrowTree.new rootTag Size.ZERO).locations = ⟨#[]⟩ := rfl
+  have hiter0 : ({ entries := #[] } : DedupRangeMap LocationTree).iterMut Size.ZERO Size.ZERO =
+      { state := ⟨#[]⟩, positions := #[], segments := #[], outcome := .ok () } := by
+    rw [show @DedupRangeMap.iterMut = @iterMutU from iterMutU.eq_src]
+    unfold iterMutU iterMutWithCloneU
+    rfl
+  have hacc0 :
+      (BorrowTree.new rootTag Size.ZERO).performBorrowAccessRange (.concrete rootTag)
+        Size.ZERO Size.ZERO .Write protectedTags .VisitChildrenOfAccessed =
+      { tree := BorrowTree.new rootTag Size.ZERO, locations := #[], status := .Completed } := by
+    unfold BorrowTree.performBorrowAccessRange
+    dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+    rw [borrowTree_new_indexOfTag, hlocs0, hiter0]
+    simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte, Array.size_empty,
+      Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel,
+      Nat.div_one, List.range'_zero, List.forIn_nil, pure, Pure.pure]
+    rfl
+  unfold BorrowTree.deallocateBorrowRange
+  dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+  rw [hacc0]
+  simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+  rw [borrowTree_new_indexOfTag, hlocs0, hiter0]
+  simp only [Option.isNone_some, Bool.false_eq_true, ↓reduceIte, Array.size_empty,
+    Std.Legacy.Range.forIn_eq_forIn_range', Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel,
+    Nat.div_one, List.range'_zero, List.forIn_nil, pure, Pure.pure]
+
+/-- **Universal fresh `BorrowTree.deallocateBorrowRange` classification
+(`rust#165833`)**: across every `rootTag : BorTag`, every `size : Size` (all
+`2^64` byte sizes, zero or nonzero), and every `protectedTags : ProtectedTags`,
+deallocating a fresh allocation through its root tag fails with
+`.ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩` **if and only if** `size.bytes ≠ 0` and
+`rootTag` has a `.StrongProtector`; otherwise (zero-sized, unprotected, or
+`.WeakProtector`) it returns `.Deallocated`. -/
+theorem borrowTree_deallocate_fresh (rootTag : BorTag) (size : Size)
+    (protectedTags : ProtectedTags) :
+    ((BorrowTree.new rootTag size).deallocateBorrowRange (.concrete rootTag)
+      Size.ZERO size protectedTags).status =
+      if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+        .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+      else
+        .Deallocated := by
+  by_cases hzero : size.bytes = 0
+  · cases size with
+    | mk b =>
+      dsimp only at hzero
+      subst hzero
+      simpa [Size.ZERO, Size.ofBytes] using borrowTree_deallocate_fresh_zero rootTag protectedTags
+  · have hbz : (size.bytes != 0) = true := bne_iff_ne.mpr hzero
+    let initLoc : LocationTree :=
+      { perms := ({} : UniValMap Tree.LocationState).insert ⟨0⟩ ⟨Permission.newUnique, true, .None⟩
+        exposedCache := {} }
+    have hacc := borrowTree_performBorrowAccessRange_fresh_nonzero rootTag size protectedTags hzero
+    obtain ⟨hacc_st, hacc_tr⟩ := hacc
+    have hidx : (BorrowTree.new rootTag size).indexOfTag rootTag = some ⟨0⟩ :=
+      borrowTree_new_indexOfTag rootTag size
+    have hiter : (BorrowTree.new rootTag size).locations.iterMut Size.ZERO size =
+        { state := ⟨#[⟨⟨0, size.bytes⟩, initLoc⟩]⟩, positions := #[0],
+          segments := #[⟨⟨0, size.bytes⟩, initLoc⟩], outcome := .ok () } :=
+      iterMut_fresh_nonzero size initLoc hzero
+    have htrav : Tree.TraversalTree.traverse ⟨#[⟨none, []⟩]⟩ 0 .VisitChildrenOfAccessed [] =
+        (0, [⟨0, .LocalAccess⟩]) := by
+      decide +kernel
+    have hindex0 : (DedupRangeMap.mk (entries := #[⟨⟨0, size.bytes⟩, initLoc⟩])).index 0 =
+        .ok ⟨⟨0, size.bytes⟩, initLoc⟩ := rfl
+    unfold BorrowTree.deallocateBorrowRange
+    dsimp only [Id.run, pure, Pure.pure, bind, Bind.bind]
+    rw [hacc_st, hacc_tr]
+    simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hidx, Option.isNone_some, hiter]
+    have hsz1 : (#[0] : Array Nat).size = 1 := rfl
+    rw [hsz1, forIn_range_one]
+    have hpos0 : (#[0] : Array Nat)[0]? = some 0 := rfl
+    have hseg0 : (#[⟨⟨0, size.bytes⟩, initLoc⟩] : Array (RangeMapSegment LocationTree))[0]? =
+        some ⟨⟨0, size.bytes⟩, initLoc⟩ := rfl
+    simp only [hpos0, hseg0]
+    let nd : TreeNode := ⟨rootTag, none, #[], Permission.newDisabled, .None, false, none⟩
+    have hnodes : (BorrowTree.new rootTag size).nodes = ⟨#[some nd]⟩ := rfl
+    have hnode0 : (BorrowTree.new rootTag size).nodeAt ⟨0⟩ = some nd := rfl
+    have hperm0 : initLoc.perms.get ⟨0⟩ = some ⟨Permission.newUnique, true, .None⟩ := rfl
+    have hroots : (BorrowTree.new rootTag size).roots = #[⟨0⟩] := rfl
+    have hrev : (#[(⟨0⟩ : UniIndex)]).reverse = #[⟨0⟩] := rfl
+    have hto0 : (⟨0⟩ : UniIndex).toNat = 0 := rfl
+    have hfor_arr : ∀ {α β : Type} (a : α) (init : β) (f : α → β → Id (ForInStep β)),
+        forIn (m := Id) (#[a] : Array α) init f =
+          match f a init with | .done b => b | .yield b => b := by
+      intro _ _ a init f
+      rw [← Array.forIn_toList]
+      change forIn (m := Id) [a] init f = _
+      simp only [List.forIn_cons, List.forIn_nil]
+      cases f a init <;> rfl
+    have htp :
+        Tree.TraversalTree.traverse
+          ⟨(BorrowTree.new rootTag size).nodes.data.map fun entry =>
+            match entry with
+            | none => ⟨none, []⟩
+            | some node => ⟨node.parent.map UniIndex.toNat, node.children.toList.map UniIndex.toNat⟩⟩
+          0 .VisitChildrenOfAccessed [] = (0, [⟨0, .LocalAccess⟩]) := by
+      rw [hnodes]
+      simp only [nd, Array.map_singleton, Option.map_none, List.map_nil]
+      exact htrav
+    rw [hroots, hrev, hfor_arr, hto0]
+    erw [htp]
+    cases hp : protectedTags.get rootTag with
+    | none =>
+      simp [hbz, hnode0, nd, hperm0, hp, hindex0, UniIndex.ofNat?, Permission.newUnique, Permission.isCell]
+    | some k =>
+      cases k with
+      | WeakProtector =>
+        simp [hbz, hnode0, nd, hperm0, hp, hindex0, UniIndex.ofNat?, Permission.newUnique, Permission.isCell]
+      | StrongProtector =>
+        simp [hbz, hnode0, nd, hperm0, hp, hindex0, UniIndex.ofNat?, Permission.newUnique, Permission.isCell]
+        rfl
+
+/-- Zeroed byte storage produced by `Array.replicate n 0` contains no nonzero byte. -/
+theorem forIn_range'_replicate_zero (n : Nat) :
+    ∀ (k start : Nat), start + k ≤ n →
+      forIn (m := Id) (List.range' start k) ((none : Option (Option (Nat × UInt8))), ())
+        (fun index _ =>
+          match (Array.replicate n (0 : UInt8))[index]? with
+          | some byte =>
+            if (byte != 0) = true then .done (some (some (index, byte)), ())
+            else .yield (none, ())
+          | none => .done (some (some (index, 0)), ())) = (none, ()) := by
+  intro k
+  induction k with
+  | zero => intro _ _; rfl
+  | succ k ih =>
+    intro start hle
+    simp only [List.range'_succ, List.forIn_cons]
+    have hlt : start < (Array.replicate n (0 : UInt8)).size := by
+      rw [Array.size_replicate]; omega
+    rw [Array.getElem?_eq_getElem hlt, Array.getElem_replicate]
+    simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+    exact ih (start + 1) (by omega)
+
+/-- Universal `Allocation.tryNew` success law on zeroed `Array.replicate` storage:
+for every `size : Size`, every valid alignment (`align.pow2 < 30`), and every
+`init : AllocInit`, `tryNew` succeeds and produces a mutable allocation with
+exact layout `(size, align)` and empty `ProvenanceMap.new`. -/
+theorem allocation_tryNew_replicate_zero {Prov : Type} (size : Size) (align : Align)
+    (hal : align.pow2 < 30) (init : AllocInit) :
+    ∃ a : Allocation Prov Unit,
+      Allocation.tryNew (Prov := Prov) size align init
+        (fun s _ => some (Array.replicate s.bytes.toNat 0)) = .ok a ∧
+      a.byteSize = size ∧
+      a.align = align ∧
+      a.mutability = .Mut ∧
+      a.provenanceMap = ProvenanceMap.new := by
+  have hchk : ∀ k : Fin 30,
+      ((do
+        let bytes ← (Align.bytes ⟨k.val⟩).mapError AllocError.alignment
+        let normalized ← (Align.fromBytes bytes).mapError AllocError.alignment
+        if normalized == ⟨k.val⟩ then pure (⟨k.val⟩ : Align)
+        else throw (AllocError.alignment (.tooLarge bytes)) : Except AllocError Align)) = .ok ⟨k.val⟩ := by
+    decide +kernel
+  have hca := hchk ⟨align.pow2, hal⟩
+  cases align with
+  | mk p =>
+    dsimp only at hal hca
+    have hreduce : ∀ {r : Except AllocError (Allocation Prov Unit)},
+        Allocation.tryNew (Prov := Prov) size ⟨p⟩ init
+          (fun s _ => some (Array.replicate s.bytes.toNat 0)) = r →
+        ∃ a : Allocation Prov Unit,
+          r = .ok a ∧ a.byteSize = size ∧ a.align = ⟨p⟩ ∧ a.mutability = .Mut ∧
+          a.provenanceMap = ProvenanceMap.new := by
+      intro r hr
+      unfold Allocation.tryNew at hr
+      dsimp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure] at hr
+      split at hr
+      · rename_i err herr
+        exfalso
+        have h1 : (do
+            let bytes ← (Align.bytes ⟨p⟩).mapError AllocError.alignment
+            let normalized ← (Align.fromBytes bytes).mapError AllocError.alignment
+            if normalized == ⟨p⟩ then pure (⟨p⟩ : Align)
+            else throw (AllocError.alignment (.tooLarge bytes)) : Except AllocError Align) = .error err := herr
+        rw [hca] at h1; cases h1
+      · rename_i al' hal'
+        have h1 : (do
+            let bytes ← (Align.bytes ⟨p⟩).mapError AllocError.alignment
+            let normalized ← (Align.fromBytes bytes).mapError AllocError.alignment
+            if normalized == ⟨p⟩ then pure (⟨p⟩ : Align)
+            else throw (AllocError.alignment (.tooLarge bytes)) : Except AllocError Align) = .ok al' := hal'
+        rw [hca] at h1
+        cases h1
+        simp only [Array.size_replicate, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte] at hr
+        split at hr
+        · rename_i idx val hbad
+          exfalso
+          conv at hbad => lhs; whnf
+          rw [Array.size_replicate, Std.Legacy.Range.forIn_eq_forIn_range'] at hbad
+          simp only [Std.Legacy.Range.size, Nat.sub_zero, Nat.add_sub_cancel, Nat.div_one] at hbad
+          erw [forIn_range'_replicate_zero size.bytes.toNat size.bytes.toNat 0 (by omega)] at hbad
+          cases hbad
+        · rename_i hnone
+          subst hr
+          exact ⟨_, rfl, rfl, rfl, rfl, rfl⟩
+    exact hreduce rfl
+
+/-- Any alignment accepted by `lmCheckAlign` has exponent `< 30`. -/
+theorem lmCheckAlign_pow2_lt (align : Nat) (al : Align)
+    (h : lmCheckAlign align = .ok al) : al.pow2 < 30 := by
+  unfold lmCheckAlign at h
+  by_cases h0 : align = 0
+  · simp [h0] at h
+  · by_cases hbig : align ≥ 2 ^ 64
+    · simp [h0, hbig] at h
+    · simp only [h0, hbig, ↓reduceIte] at h
+      unfold Align.fromBytes at h
+      dsimp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure, throw, throwThe,
+        MonadExceptOf.throw] at h
+      split at h
+      · cases h; decide
+      · split at h
+        · cases h
+        · split at h
+          · cases h
+          · cases h; rename_i hle; simp only [Align.MAX] at hle; dsimp only; omega
+
+/-- A freshly created allocation (`provenanceMap = ProvenanceMap.new`) contributes
+no outgoing provenance edges to `LeakCheck.allocationIds`. -/
+theorem allocation_tryNew_ids_empty {E : Type} (a : Allocation Provenance Unit) (extra : E)
+    (hprov : a.provenanceMap = ProvenanceMap.new) :
+    LeakCheck.allocationIds (a.withExtra extra) = #[] := by
+  have hp : (a.withExtra extra).provenanceMap = ProvenanceMap.new := by
+    simpa [Allocation.provenanceMap, Allocation.withExtra] using hprov
+  unfold LeakCheck.allocationIds
+  rw [hp]
+  rfl
+
+/-- **Universal Lean-Miri heap lifecycle theorem (both basic and Tree Borrows
+modes)**: for every `tb : Bool`, every `size ≤ isize::MAX`, and every valid
+Rust alignment `align` (`lmCheckAlign align = .ok al`), starting from `lmInit tb`:
+1. `lmAllocate` succeeds via vendored `MemoryLifecycle.allocatePtr`, yielding
+   the root pointer `ptr` for `lmFirstId`;
+2. `lmLeakCheck` reports `lmFirstId` as leaked (`MiriMemoryKind::Rust` may not leak);
+3. `lmDeallocate` succeeds via vendored `MemoryLifecycle.deallocatePtrWith` (and,
+   when `tb = true`, `MachineMemoryHooks.beforeMemoryDeallocation` ->
+   `BorrowTree.deallocateBorrowRange`);
+4. `lmLeakCheck` after deallocation reports zero leaks;
+5. a second `lmDeallocate` fails with `.useAfterFree lmFirstId` (double-free UB). -/
+theorem lm_heap_lifecycle_universal (tb : Bool) (size align : Nat) (al : Align)
+    (hsize : size ≤ lmIsizeMax) (halign : lmCheckAlign align = .ok al) :
+    let ptr : Pointer (Option Provenance) :=
+      ⟨Size.ofBytes (lmBaseAddr lmFirstId), some (.concrete lmFirstId (lmRootTag lmFirstId))⟩
+    ∃ st1 st2,
+      lmAllocate (lmInit tb) size align = .ok (ptr, st1) ∧
+      lmLeakCheck st1 = .error (.leak [lmFirstId]) ∧
+      lmDeallocate st1 ptr size align = .ok st2 ∧
+      lmLeakCheck st2 = .ok () ∧
+      lmDeallocate st2 ptr size align = .error (.dealloc (.useAfterFree lmFirstId)) := by
+  intro ptr
+  have hal : al.pow2 < 30 := lmCheckAlign_pow2_lt align al halign
+  have hsz_u64 : (UInt64.ofNat size).toNat = size := by
+    change size % 2 ^ 64 = size
+    have hmax : lmIsizeMax < 2 ^ 64 := by decide
+    exact Nat.mod_eq_of_lt (by omega)
+  obtain ⟨a, htry, hsz_a, hal_a, hmut_a, hprov_a⟩ :=
+    allocation_tryNew_replicate_zero (Prov := Provenance) (Size.ofBytes (UInt64.ofNat size)) al hal .Uninit
+  have hfit : ¬ a.byteSize.bytes > (Size.ofBytes (UInt64.ofNat lmIsizeMax)).bytes := by
+    rw [hsz_a]
+    change ¬ (UInt64.ofNat size > UInt64.ofNat lmIsizeMax)
+    intro hgt
+    have h1 : (UInt64.ofNat size).toNat > (UInt64.ofNat lmIsizeMax).toNat := hgt
+    rw [hsz_u64] at h1
+    have h2 : (UInt64.ofNat lmIsizeMax).toNat = lmIsizeMax := by decide
+    omega
+  let mem1 : LmMem := (MemoryState.empty : LmMem).reserveAllocId.1
+  have hres0 : (MemoryState.empty : LmMem).reserveAllocId = (mem1, .ok lmFirstId) := by
+    have h2 : (MemoryState.empty : LmMem).reserveAllocId.2 = .ok lmFirstId := by
+      rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src]
+      decide +kernel
+    cases hr : (MemoryState.empty : LmMem).reserveAllocId with
+    | mk m r =>
+      dsimp only [mem1]; rw [hr]; rw [hr] at h2; dsimp only at h2; subst h2; rfl
+  have hlive0 : mem1.live = #[] := by
+    dsimp only [mem1]
+    rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src]
+    decide +kernel
+  have hdead0 : mem1.dead = #[] := by
+    dsimp only [mem1]
+    rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src]
+    decide +kernel
+  have hglob0 : mem1.findGlobal? lmFirstId = none := by
+    dsimp only [mem1]
+    rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src,
+      show @MemoryState.findGlobal? = @findGlobalU from findGlobalU.eq_src]
+    decide +kernel
+  let g1 : GlobalState := { GlobalState.new with
+    nextPointerTag := ⟨2, by decide⟩
+    rootPointerTags := #[(lmFirstId, lmRootTag lmFirstId)] }
+  have hrpt0 : GlobalState.new.rootPointerTag lmFirstId = .ok (g1, lmRootTag lmFirstId) := by
+    decide +kernel
+  have hrpt1 : g1.rootPointerTag lmFirstId = .ok (g1, lmRootTag lmFirstId) := by
+    decide +kernel
+  have hprot1 : g1.protectedTags.get (lmRootTag lmFirstId) = none := by
+    decide +kernel
+  let tree0 : BorrowTree := BorrowTree.new (lmRootTag lmFirstId) a.byteSize
+  let alloc1 : Allocation Provenance BorrowTree := a.withExtra tree0
+  let entry1 : LocalAllocation Provenance BorrowTree MiriMemoryKind := ⟨.machine .rust, alloc1⟩
+  let mem2 : LmMem := { mem1 with live := #[(lmFirstId, entry1)] }
+  let ctx1 : LmCtx := { treeBorrows := tb, global := g1 }
+  let st1 : LmState := { mem := mem2, ctx := ctx1 }
+  have hinit1 : lmInitExtra mem1 { treeBorrows := tb } lmFirstId (.machine .rust) a.byteSize a.align =
+      ⟨mem1, ctx1, .ok tree0⟩ := by
+    unfold lmInitExtra; rw [hrpt0]
+  have hins_eq : { mem1 with live := (mem1.live.filter fun old => old.1 != lmFirstId).push (lmFirstId, entry1) } = mem2 := by
+    simp [mem2, hlive0]
+  have hadj1 : lmAdjustRoot mem2 ctx1 lmFirstId (.machine .rust) =
+      ⟨mem2, ctx1, .ok ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩⟩ := by
+    unfold lmAdjustRoot; dsimp only [ctx1]; rw [hrpt1]
+  have halloc_ptr : lmAllocatePtr (lmInit tb) (Size.ofBytes (UInt64.ofNat size)) al (.machine .rust)
+      (some (.machine .global)) =
+      ⟨mem2, ctx1, .ok ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩⟩ := by
+    unfold lmAllocatePtr lmInit
+    exact allocatePtr_ok MemoryState.empty { treeBorrows := tb } (fun _ ctx => ctx)
+      (Size.ofBytes (UInt64.ofNat size)) al (.machine .rust) .Uninit
+      (Size.ofBytes (UInt64.ofNat lmIsizeMax)) (some (.machine .global))
+      (fun size _ => some (Array.replicate size.bytes.toNat 0))
+      lmInitExtra lmAdjustRoot a htry hfit mem1 lmFirstId hres0 (by decide)
+      mem1 ctx1 tree0 hinit1 mem2 ctx1
+      ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩
+      (by dsimp only; rw [hins_eq]; exact hadj1)
+  have halloc : lmAllocate (lmInit tb) size align = .ok (ptr, st1) := by
+    unfold lmAllocate lmAllocateKind
+    simp only [halign, hsize, ↓reduceIte,
+      show (MemoryKind.machine MiriMemoryKind.rust = .machine .global) = False by decide,
+      halloc_ptr]
+    rfl
+  have hids1 : LeakCheck.allocationIds alloc1 = #[] := allocation_tryNew_ids_empty a tree0 hprov_a
+  have htake1 : LeakCheck.take mem2 #[] = .ok ({ mem2 with live := #[] }, #[(lmFirstId, entry1)]) := by
+    have htodo1 : (mem2.live.filterMap fun (id, entry) =>
+        if entry.kind == .machine .global then some id else none) ++ #[] = #[] := by
+      simp [mem2, entry1]
+    have hedges1 : mem2.live.foldl (fun count (_, entry) =>
+        count + (LeakCheck.allocationIds entry.allocation).size) 0 = 0 := by
+      simp [mem2, entry1, hids1]
+    unfold LeakCheck.take LeakCheck.takeProfiled
+    dsimp only [Lean.profileit, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    rw [htodo1, hedges1]
+    change Except.ok ({ mem2 with live := mem2.live.filter fun p =>
+        !((mem2.live.filter fun (q : AllocId × LocalAllocation Provenance BorrowTree MiriMemoryKind) =>
+            !LeakCheck.mayLeak q.2.kind && !(#[] : Array AllocId).contains q.1).any (·.1 == p.1)) },
+      mem2.live.filter fun (q : AllocId × LocalAllocation Provenance BorrowTree MiriMemoryKind) =>
+        !LeakCheck.mayLeak q.2.kind && !(#[] : Array AllocId).contains q.1) = _
+    simp [mem2, entry1, LeakCheck.mayLeak, MiriMemoryKind.mayLeak]
+  have hleak1 : lmLeakCheck st1 = .error (.leak [lmFirstId]) := by
+    unfold lmLeakCheck
+    dsimp only [st1]
+    rw [htake1]
+    rfl
+  have hres_ptr : lmResolve mem2 ctx1 ptr 0 =
+      ⟨mem2, ctx1, .ok (lmFirstId, Size.ZERO, .concrete (lmRootTag lmFirstId))⟩ := by
+    unfold lmResolve; dsimp only [ptr]
+    have hlt : ¬ ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes < lmBaseAddr lmFirstId) := by decide
+    simp only [hlt, ↓reduceIte]
+    have hsub : Size.ofBytes ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes - lmBaseAddr lmFirstId) = Size.ZERO := by
+      decide
+    rw [hsub]
+  have htb_ok : (tree0.deallocateBorrowRange (.concrete (lmRootTag lmFirstId)) Size.ZERO
+      a.byteSize g1.protectedTags).status = .Deallocated := by
+    rw [borrowTree_deallocate_fresh (lmRootTag lmFirstId) a.byteSize g1.protectedTags, hprot1]
+    simp
+  have hbef_eq : lmBeforeDeallocation { mem2 with live := mem2.live.filter fun old => old.1 != lmFirstId }
+      ctx1 alloc1 ptr lmFirstId (.concrete (lmRootTag lmFirstId)) alloc1.byteSize alloc1.align
+      (.machine .rust) =
+      ⟨{ mem2 with live := mem2.live.filter fun old => old.1 != lmFirstId }, ctx1, .ok ()⟩ := by
+    unfold lmBeforeDeallocation; dsimp only [ctx1]
+    cases tb
+    · rfl
+    · simp only [↓reduceIte]
+      have hbm : (MachineMemoryHooks.beforeMemoryDeallocation lmHookContext
+          (lmMachineHooks g1.protectedTags) alloc1 ptr lmFirstId (.concrete (lmRootTag lmFirstId))
+          alloc1.byteSize alloc1.align (.machine .rust)).outcome = .ok () := by
+        rw [beforeMemoryDeallocation_ok_iff]; exact htb_ok
+      rw [hbm]
+  have hlay_eq : (Size.ofBytes (UInt64.ofNat size), al) = (entry1.allocation.byteSize, entry1.allocation.align) :=
+    Prod.ext hsz_a.symm hal_a.symm
+  let rDealloc := MemoryLifecycle.deallocatePtrWith mem2 ctx1 ptr
+    (some (Size.ofBytes (UInt64.ofNat size), al)) (.machine .rust) lmDeallocHooks
+  let st2 : LmState := { mem := rDealloc.memory, ctx := rDealloc.hooks }
+  have hrDealloc_eq : rDealloc =
+      ⟨{ mem2 with
+          live := mem2.live.filter fun old => old.1 != lmFirstId
+          dead := (mem2.dead.filter fun old => old.allocId != lmFirstId).push
+            ⟨lmFirstId, entry1.allocation.byteSize, entry1.allocation.align⟩ },
+       ctx1, some (lmFirstId, entry1), .ok ()⟩ := by
+    have hstep := deallocatePtrWith_zero_offset_step mem2 ctx1 ptr
+      (some (entry1.allocation.byteSize, entry1.allocation.align)) (.machine .rust) lmDeallocHooks
+      lmFirstId (.concrete (lmRootTag lmFirstId)) (by change (lmResolve mem2 ctx1 ptr 0).outcome = _; rw [hres_ptr])
+    have hrd : rDealloc = MemoryLifecycle.deallocatePtrWith mem2 ctx1 ptr
+        (some (entry1.allocation.byteSize, entry1.allocation.align)) (.machine .rust) lmDeallocHooks := by
+      dsimp only [rDealloc]; rw [hlay_eq]
+    rw [hrd, hstep]
+    have hlive1 : mem2.live.find? (fun e => e.1 == lmFirstId) = some (lmFirstId, entry1) := by
+      simp [mem2]
+    have hmut1 : entry1.allocation.mutability = .Mut := by
+      simpa [entry1, alloc1, Allocation.withExtra] using hmut_a
+    have hdead2 : mem2.dead = #[] := hdead0
+    dsimp only [lmDeallocHooks]
+    rw [hres_ptr]
+    simp only [hlive1, Option.map_some, hmut1,
+      show (Mutability.Mut == .Not) = false by rfl, Bool.false_eq_true, ne_eq,
+      bne_self_eq_false, Bool.or_self, ↓reduceIte]
+    dsimp only [entry1]
+    rw [hbef_eq]
+    simp only [hdead2, Array.any_empty, Bool.false_eq_true, ↓reduceIte]
+    rfl
+  have hdealloc1 : lmDeallocate st1 ptr size align = .ok st2 := by
+    unfold lmDeallocate
+    simp only [halign, st1]
+    change (match rDealloc.outcome with
+      | Except.ok () => Except.ok st2
+      | Except.error e => Except.error (rDealloc.hooks.pending.getD (.dealloc e))) = Except.ok st2
+    rw [hrDealloc_eq]
+  have hst2_live : rDealloc.memory.live = #[] := by
+    rw [hrDealloc_eq]; simp [mem2]
+  have hst2_glob : rDealloc.memory.findGlobal? lmFirstId = none := by
+    rw [hrDealloc_eq]; exact hglob0
+  have hst2_pend : rDealloc.hooks.pending = none := by
+    rw [hrDealloc_eq]
+  have hleak2 : lmLeakCheck st2 = .ok () := by
+    unfold lmLeakCheck LeakCheck.take LeakCheck.takeProfiled
+    dsimp only [st2, Lean.profileit, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    rw [hst2_live]
+    rfl
+  have hdealloc2 : lmDeallocate st2 ptr size align = .error (.dealloc (.useAfterFree lmFirstId)) := by
+    unfold lmDeallocate
+    simp only [halign, st2]
+    have hres2 : lmResolve rDealloc.memory rDealloc.hooks ptr 0 =
+        ⟨rDealloc.memory, rDealloc.hooks, .ok (lmFirstId, Size.ZERO, .concrete (lmRootTag lmFirstId))⟩ := by
+      unfold lmResolve; dsimp only [ptr]
+      have hlt : ¬ ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes < lmBaseAddr lmFirstId) := by decide
+      simp only [hlt, ↓reduceIte]
+      have hsub : Size.ofBytes ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes - lmBaseAddr lmFirstId) = Size.ZERO := by
+        decide
+      rw [hsub]
+    have hstep2 := deallocatePtrWith_zero_offset_step rDealloc.memory rDealloc.hooks ptr
+      (some (Size.ofBytes (UInt64.ofNat size), al)) (.machine .rust) lmDeallocHooks
+      lmFirstId (.concrete (lmRootTag lmFirstId))
+      (by change (lmResolve rDealloc.memory rDealloc.hooks ptr 0).outcome = _; rw [hres2])
+    rw [hstep2]
+    dsimp only [lmDeallocHooks]
+    rw [hres2]
+    simp only [hst2_live, hst2_glob, hst2_pend,
+      Array.find?_empty, Option.map_none, Option.getD_none]
+  exact ⟨st1, st2, halloc, hleak1, hdealloc1, hleak2, hdealloc2⟩
+
+/-- **Universal Lean-Miri global-allocation policy theorem (`rust#166221`, both
+modes)**: for every `tb : Bool`, every `size ≤ isize::MAX`, and every valid
+Rust alignment `align` (`lmCheckAlign align = .ok al`), a materialized
+`MiriMemoryKind::Global` allocation is exempt from `LeakCheck.take` AND
+deallocating it via `__rust_dealloc` (`MiriMemoryKind::Rust`) fails with
+`.memoryKindMismatch lmFirstId`. -/
+theorem lm_global_alloc_universal (tb : Bool) (size align : Nat) (al : Align)
+    (hsize : size ≤ lmIsizeMax) (halign : lmCheckAlign align = .ok al) :
+    let ptr : Pointer (Option Provenance) :=
+      ⟨Size.ofBytes (lmBaseAddr lmFirstId), some (.concrete lmFirstId (lmRootTag lmFirstId))⟩
+    ∃ st1,
+      lmAllocateKind (lmInit tb) size align (.machine .global) = .ok (ptr, st1) ∧
+      lmLeakCheck st1 = .ok () ∧
+      lmDeallocate st1 ptr size align = .error (.dealloc (.memoryKindMismatch lmFirstId)) := by
+  intro ptr
+  have hal : al.pow2 < 30 := lmCheckAlign_pow2_lt align al halign
+  have hsz_u64 : (UInt64.ofNat size).toNat = size := by
+    change size % 2 ^ 64 = size
+    have hmax : lmIsizeMax < 2 ^ 64 := by decide
+    exact Nat.mod_eq_of_lt (by omega)
+  obtain ⟨a, htry, hsz_a, hal_a, hmut_a, hprov_a⟩ :=
+    allocation_tryNew_replicate_zero (Prov := Provenance) (Size.ofBytes (UInt64.ofNat size)) al hal .Uninit
+  have hfit : ¬ a.byteSize.bytes > (Size.ofBytes (UInt64.ofNat lmIsizeMax)).bytes := by
+    rw [hsz_a]
+    change ¬ (UInt64.ofNat size > UInt64.ofNat lmIsizeMax)
+    intro hgt
+    have h1 : (UInt64.ofNat size).toNat > (UInt64.ofNat lmIsizeMax).toNat := hgt
+    rw [hsz_u64] at h1
+    have h2 : (UInt64.ofNat lmIsizeMax).toNat = lmIsizeMax := by decide
+    omega
+  let mem1 : LmMem := (MemoryState.empty : LmMem).reserveAllocId.1
+  have hres0 : (MemoryState.empty : LmMem).reserveAllocId = (mem1, .ok lmFirstId) := by
+    have h2 : (MemoryState.empty : LmMem).reserveAllocId.2 = .ok lmFirstId := by
+      rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src]
+      decide +kernel
+    cases hr : (MemoryState.empty : LmMem).reserveAllocId with
+    | mk m r =>
+      dsimp only [mem1]; rw [hr]; rw [hr] at h2; dsimp only at h2; subst h2; rfl
+  have hlive0 : mem1.live = #[] := by
+    dsimp only [mem1]
+    rw [show @MemoryState.reserveAllocId = @reserveAllocIdU from reserveAllocIdU.eq_src]
+    decide +kernel
+  let g1 : GlobalState := { GlobalState.new with
+    nextPointerTag := ⟨2, by decide⟩
+    rootPointerTags := #[(lmFirstId, lmRootTag lmFirstId)] }
+  have hrpt0 : GlobalState.new.rootPointerTag lmFirstId = .ok (g1, lmRootTag lmFirstId) := by
+    decide +kernel
+  have hrpt1 : g1.rootPointerTag lmFirstId = .ok (g1, lmRootTag lmFirstId) := by
+    decide +kernel
+  let tree0 : BorrowTree := BorrowTree.new (lmRootTag lmFirstId) a.byteSize
+  let alloc1 : Allocation Provenance BorrowTree := a.withExtra tree0
+  let entry1 : LocalAllocation Provenance BorrowTree MiriMemoryKind := ⟨.machine .global, alloc1⟩
+  let mem2 : LmMem := { mem1 with live := #[(lmFirstId, entry1)] }
+  let ctx1 : LmCtx := { treeBorrows := tb, global := g1 }
+  let st1 : LmState := { mem := mem2, ctx := ctx1 }
+  have hinit1 : lmInitExtra mem1 { treeBorrows := tb } lmFirstId (.machine .global) a.byteSize a.align =
+      ⟨mem1, ctx1, .ok tree0⟩ := by
+    unfold lmInitExtra; rw [hrpt0]
+  have hins_eq : { mem1 with live := (mem1.live.filter fun old => old.1 != lmFirstId).push (lmFirstId, entry1) } = mem2 := by
+    simp [mem2, hlive0]
+  have hadj1 : lmAdjustRoot mem2 ctx1 lmFirstId (.machine .global) =
+      ⟨mem2, ctx1, .ok ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩⟩ := by
+    unfold lmAdjustRoot; dsimp only [ctx1]; rw [hrpt1]
+  have halloc_ptr : lmAllocatePtr (lmInit tb) (Size.ofBytes (UInt64.ofNat size)) al (.machine .global) none =
+      ⟨mem2, ctx1, .ok ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩⟩ := by
+    unfold lmAllocatePtr lmInit
+    exact allocatePtr_ok MemoryState.empty { treeBorrows := tb } (fun _ ctx => ctx)
+      (Size.ofBytes (UInt64.ofNat size)) al (.machine .global) .Uninit
+      (Size.ofBytes (UInt64.ofNat lmIsizeMax)) none
+      (fun size _ => some (Array.replicate size.bytes.toNat 0))
+      lmInitExtra lmAdjustRoot a htry hfit mem1 lmFirstId hres0 (by decide)
+      mem1 ctx1 tree0 hinit1 mem2 ctx1
+      ⟨Size.ofBytes (lmBaseAddr lmFirstId), .concrete lmFirstId (lmRootTag lmFirstId)⟩
+      (by dsimp only; rw [hins_eq]; exact hadj1)
+  have halloc : lmAllocateKind (lmInit tb) size align (.machine .global) = .ok (ptr, st1) := by
+    unfold lmAllocateKind
+    simp only [halign, hsize, ↓reduceIte, halloc_ptr]
+    rfl
+  have hids1 : LeakCheck.allocationIds alloc1 = #[] := allocation_tryNew_ids_empty a tree0 hprov_a
+  have htake1 : LeakCheck.take mem2 #[] = .ok (mem2, #[]) := by
+    have htodo1 : (mem2.live.filterMap fun (id, entry) =>
+        if entry.kind == .machine .global then some id else none) ++ #[] = #[lmFirstId] := by
+      simp [mem2, entry1]
+    have hedges1 : mem2.live.foldl (fun count (_, entry) =>
+        count + (LeakCheck.allocationIds entry.allocation).size) 0 = 0 := by
+      simp [mem2, entry1, hids1]
+    have hfind1 : mem2.live.find? (·.1 == lmFirstId) = some (lmFirstId, entry1) := by
+      simp [mem2]
+    have hd0 : instDecidableEqBool ((#[] : Array AllocId).contains lmFirstId) true = isFalse (by simp) := by
+      cases instDecidableEqBool ((#[] : Array AllocId).contains lmFirstId) true with
+      | isFalse _ => rfl
+      | isTrue ht => exfalso; simp at ht
+    unfold LeakCheck.take LeakCheck.takeProfiled
+    dsimp only [Lean.profileit, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    rw [htodo1, hedges1]
+    split
+    · rename_i err herr
+      conv at herr => lhs; whnf
+      rw [hd0] at herr
+      dsimp only at herr
+      simp only [hfind1, entry1, hids1, List.nil_append] at herr
+      conv at herr => lhs; whnf
+      cases herr
+    · rename_i v hv
+      conv at hv => lhs; whnf
+      rw [hd0] at hv
+      dsimp only at hv
+      simp only [hfind1, entry1, hids1, List.nil_append] at hv
+      conv at hv => lhs; whnf
+      cases hv
+      simp [mem2, entry1, LeakCheck.mayLeak, MiriMemoryKind.mayLeak]
+  have hleak1 : lmLeakCheck st1 = .ok () := by
+    unfold lmLeakCheck
+    dsimp only [st1]
+    rw [htake1]
+    rfl
+  have hdealloc1 : lmDeallocate st1 ptr size align = .error (.dealloc (.memoryKindMismatch lmFirstId)) := by
+    unfold lmDeallocate
+    simp only [halign, st1]
+    have hres_ptr : lmResolve mem2 ctx1 ptr 0 =
+        ⟨mem2, ctx1, .ok (lmFirstId, Size.ZERO, .concrete (lmRootTag lmFirstId))⟩ := by
+      unfold lmResolve; dsimp only [ptr]
+      have hlt : ¬ ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes < lmBaseAddr lmFirstId) := by decide
+      simp only [hlt, ↓reduceIte]
+      have hsub : Size.ofBytes ((Size.ofBytes (lmBaseAddr lmFirstId)).bytes - lmBaseAddr lmFirstId) = Size.ZERO := by
+        decide
+      rw [hsub]
+    have hstep := deallocatePtrWith_zero_offset_step mem2 ctx1 ptr
+      (some (Size.ofBytes (UInt64.ofNat size), al)) (.machine .rust) lmDeallocHooks
+      lmFirstId (.concrete (lmRootTag lmFirstId))
+      (by change (lmResolve mem2 ctx1 ptr 0).outcome = _; rw [hres_ptr])
+    rw [hstep]
+    have hlive1 : mem2.live.find? (fun e => e.1 == lmFirstId) = some (lmFirstId, entry1) := by
+      simp [mem2]
+    have hmut1 : alloc1.mutability = .Mut := by
+      simpa [alloc1, Allocation.withExtra] using hmut_a
+    dsimp only [lmDeallocHooks]
+    rw [hres_ptr]
+    simp only [hlive1, Option.map_some, entry1, hmut1,
+      show (Mutability.Mut == .Not) = false by rfl, Bool.false_eq_true, ne_eq,
+      show (MemoryKind.machine MiriMemoryKind.global = .machine .rust) = False by decide,
+      not_false_eq_true, ↓reduceIte, ctx1, Option.getD_none]
+  exact ⟨st1, halloc, hleak1, hdealloc1⟩
 
 /-- Universal `RetagPolicy.create` law (`rust#165833`): at `FnEntry`, a `Box`
 (`Unpin`) ALWAYS receives a `.WeakProtector` (never `.StrongProtector`). -/
@@ -3107,13 +4317,39 @@ theorem ep1_lean_miri_heap_wide_capstone :
       lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true false false =
         some (.AccessFailure (.AccessFailure ⟨0, 4⟩
           (.TransitionError 1 (.ProtectedDisabled .Frozen)))) ∧
+      lmScenarioDeallocStatus .reference lmFrozenFacts .Mutable .FnEntry true false false true =
+        some (.ProtectedDealloc ⟨0, 32⟩ ⟨1⟩) ∧
       lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true true false =
         some .Deallocated ∧
       lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .Default true false false true =
         some (.AccessFailure (.AccessFailure ⟨0, 32⟩
           (.TransitionError 1 (.ChildAccessForbidden .Frozen)))) ∧
       lmScenarioDeallocStatus .reference lmCellFacts .Shared .FnEntry false false false false =
-        some .Deallocated) ∧
+        some .Deallocated ∧
+      (∀ (rootTag : BorTag) (size : Size) (protectedTags : ProtectedTags),
+        ((BorrowTree.new rootTag size).deallocateBorrowRange (.concrete rootTag)
+          Size.ZERO size protectedTags).status =
+          if size.bytes != 0 && protectedTags.get rootTag == some .StrongProtector then
+            .ProtectedDealloc ⟨0, size.bytes⟩ ⟨0⟩
+          else .Deallocated)) ∧
+    ((∀ (tb : Bool) (size align : Nat) (al : Align),
+        size ≤ lmIsizeMax → lmCheckAlign align = .ok al →
+        let ptr : Pointer (Option Provenance) :=
+          ⟨Size.ofBytes (lmBaseAddr lmFirstId), some (.concrete lmFirstId (lmRootTag lmFirstId))⟩
+        ∃ st1 st2,
+          lmAllocate (lmInit tb) size align = .ok (ptr, st1) ∧
+          lmLeakCheck st1 = .error (.leak [lmFirstId]) ∧
+          lmDeallocate st1 ptr size align = .ok st2 ∧
+          lmLeakCheck st2 = .ok () ∧
+          lmDeallocate st2 ptr size align = .error (.dealloc (.useAfterFree lmFirstId))) ∧
+      (∀ (tb : Bool) (size align : Nat) (al : Align),
+        size ≤ lmIsizeMax → lmCheckAlign align = .ok al →
+        let ptr : Pointer (Option Provenance) :=
+          ⟨Size.ofBytes (lmBaseAddr lmFirstId), some (.concrete lmFirstId (lmRootTag lmFirstId))⟩
+        ∃ st1,
+          lmAllocateKind (lmInit tb) size align (.machine .global) = .ok (ptr, st1) ∧
+          lmLeakCheck st1 = .ok () ∧
+          lmDeallocate st1 ptr size align = .error (.dealloc (.memoryKindMismatch lmFirstId)))) ∧
     ((List.range 30).map (lmHeapWideObserve false) =
         [.okAlloc 0 1, .okAlloc 0 32, .okRoundTrip 3735928559, .okRoundTrip 81985529216486895,
          .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub,
@@ -3136,7 +4372,7 @@ theorem ep1_lean_miri_heap_wide_capstone :
          .okDealloc, .ub]) ∧
     (lmProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       lmProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) := by
-  refine ⟨⟨?_, rfl, rfl⟩, ?_, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_⟩
+  refine ⟨⟨?_, rfl, rfl⟩, ?_, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩, ?_, ⟨?_, ?_⟩, ?_, ?_, ?_⟩
   · exact fun E memory memory' staticRoots leaked h =>
       leakCheck_take_sound memory memory' staticRoots leaked h
   · exact deallocationError_ub_iff
@@ -3146,8 +4382,10 @@ theorem ep1_lean_miri_heap_wide_capstone :
   · exact wideEq_slice_eq
   · exact thinEq_provenance_erased
   · exact fun a b c d => (wideEq_hetero_invalidProgram a b c d).1
-  · obtain ⟨h1, h2, _, h4, h5, h6⟩ := deallocateBorrowRange_protector_laws
-    exact ⟨h1, h2, h4, h5, h6⟩
+  · obtain ⟨h1, h2, h3, h4, h5, h6⟩ := deallocateBorrowRange_protector_laws
+    exact ⟨h1, h2, h3, h4, h5, h6, borrowTree_deallocate_fresh⟩
+  · exact lm_heap_lifecycle_universal
+  · exact lm_global_alloc_universal
   · exact lmHeapWideObserve_table
   · exact lmHeapLifecycleTrace_table
   · exact lmProtectorDeallocTrace_table
@@ -3204,7 +4442,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.HeapAllocAndWidePtrLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 89 then
+  if theorems < 113 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.HeapAllocAndWidePtrLM seen"
   logInfo m!"LeanMiriSpec.HeapAllocAndWidePtrLM: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 

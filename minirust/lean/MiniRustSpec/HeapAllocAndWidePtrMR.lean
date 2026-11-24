@@ -2409,6 +2409,197 @@ theorem heap_lifecycle_bm (m m1 : Mach) (size align : Int) (sTy aTy : «Type») 
     simp only [hd2]
     rfl
 
+/-! ### The heap lifecycle on `TreeBorrowsMemory` / `MachTB`, universally -/
+
+/-- Setting an element of `List.replicate n x` to `x` leaves the list unchanged. -/
+theorem list_set_replicate_same {α : Type} :
+    ∀ (n : Nat) (x : α) (i : Nat), (List.replicate n x).set i x = List.replicate n x
+  | 0, _, _ => rfl
+  | _ + 1, _, 0 => rfl
+  | n + 1, x, i + 1 => congrArg (x :: ·) (list_set_replicate_same n x i)
+
+/-- A local write over any valid subrange of a freshly allocated all-`Unique`
+unprotected permission vector leaves every byte `.Unprot .Unique`. -/
+theorem node_transitionRange_local_write_unique (total : Nat) :
+    ∀ (rem offset : Nat), offset + rem ≤ total →
+      Node.transitionRange .Local .Write offset rem
+          (List.replicate total (.Unprot .Unique)) =
+        .ok (List.replicate total (.Unprot .Unique))
+  | 0, _, _ => rfl
+  | rem + 1, offset, hle => by
+    have hlt : offset < total := by omega
+    have hidx : listIndex (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        "Node::transition" = .ok (Permission.Unprot .Unique) := by
+      rw [listIndex_eq_ok_iff]
+      refine ⟨Int.natCast_nonneg _, ?_⟩
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.getElem?_replicate, hlt, ↓reduceIte]
+    have hset : listSet (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        (Permission.Unprot .Unique) "Node::transition" =
+        .ok (List.replicate total (Permission.Unprot .Unique)) := by
+      unfold listSet
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.length_replicate,
+        Int.natCast_nonneg, hlt, and_self, ↓reduceIte, list_set_replicate_same]
+      rfl
+    have htr : Permission.transition (.Unprot .Unique) .Write .Local = .ok (.Unprot .Unique) := rfl
+    unfold Node.transitionRange listMutateAt
+    simp only [hidx, htr, hset, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    exact node_transitionRange_local_write_unique total rem (offset + 1) (by omega)
+
+/-- `Node::access` with a local write on the fresh unprotected all-`Unique` root
+tree created by `TreeBorrowsMemory::allocate` succeeds for **every** `size : Size`
+and preserves the root node. -/
+theorem node_access_write_fresh_root (size : Size) :
+    Node.access ⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩ (some []) .Write ⟨0⟩ size =
+      .ok ⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩ := by
+  simp only [Node.access, Node.transition, Option.isSome, ↓reduceIte,
+    node_transitionRange_local_write_unique size.bytes size.bytes 0
+      (Nat.le_of_eq (Nat.zero_add _))]
+  rfl
+
+/-- `tbDeallocHandler` succeeds on a freshly allocated root tree for every
+`size : Size`, because the local write passes and the unprotected leaf has no
+strong protector. -/
+theorem tbDeallocHandler_fresh_root (size : Size) :
+    tbDeallocHandler size ⟨⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩⟩ [] =
+      .ok ⟨⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩⟩ := by
+  unfold tbDeallocHandler
+  rw [node_access_write_fresh_root size]
+  rfl
+
+/-- **Deallocating what was just allocated succeeds on `TreeBorrowsMemory`**, for
+every `tbm : TBM`, every `kind`, `size`, and `align`. -/
+theorem tb_allocate_then_deallocate {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
+    {align : Align} {ptr : ThinPointer TreeBorrowsProvenance}
+    (h : TreeBorrowsMemory.allocate tbm kind size align = .ok (ptr, tbm')) :
+    ∃ addr, ptr.addr = addr ∧
+      tbm' = { tbm with mem := { tbm.mem with allocations :=
+        tbm.mem.allocations ++ [freshAllocation addr kind size align true
+          ⟨⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩⟩] } } ∧
+      TreeBorrowsMemory.deallocate tbm' ptr kind size align =
+        .ok { tbm with mem := { tbm.mem with allocations :=
+          tbm.mem.allocations ++ [freshAllocation addr kind size align false
+            ⟨⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩⟩] } } := by
+  unfold TreeBorrowsMemory.allocate at h
+  obtain ⟨⟨ptr', mem'⟩, halloc, hp⟩ := interp_bind_eq_ok h
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp)
+  obtain ⟨addr, haddr, hmem', hd⟩ :=
+    basicMemory_allocate_then_deallocate (tbDeallocHandler size) halloc (tbDeallocHandler_fresh_root size)
+  refine ⟨addr, haddr, by rw [hmem'], ?_⟩
+  rw [tb_deallocate_eq_basic]
+  simp only [hd]
+  rfl
+
+/-- A second `TreeBorrowsMemory::deallocate` of the same pointer is `"double-free"`. -/
+theorem tb_deallocate_twice_double_free {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
+    {align : Align} {ptr : ThinPointer TreeBorrowsProvenance}
+    (h : TreeBorrowsMemory.allocate tbm kind size align = .ok (ptr, tbm'))
+    (kind' : AllocationKind) (size' : Size) (align' : Align) :
+    ∃ tbm'', TreeBorrowsMemory.deallocate tbm' ptr kind size align = .ok tbm'' ∧
+      TreeBorrowsMemory.deallocate tbm'' ptr kind' size' align' = .error (.ub "double-free") := by
+  unfold TreeBorrowsMemory.allocate at h
+  obtain ⟨⟨ptr', mem'⟩, halloc, hp⟩ := interp_bind_eq_ok h
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp)
+  obtain ⟨mem'', hd, hd2⟩ :=
+    basicMemory_deallocate_twice_double_free (tbDeallocHandler size) halloc
+      (tbDeallocHandler_fresh_root size) kind' size' align'
+  refine ⟨{ tbm with mem := mem'' }, ?_, ?_⟩
+  · rw [tb_deallocate_eq_basic]; simp only [hd]; rfl
+  · rw [tb_deallocate_eq_basic]
+    have hd2' : BasicMemory.deallocate mem'' ptr' kind' size' align' (tbDeallocHandler size') =
+        .error (.ub "double-free") := by
+      obtain ⟨addr, _, rfl, hd'⟩ :=
+        basicMemory_allocate_then_deallocate (tbDeallocHandler size) halloc
+          (tbDeallocHandler_fresh_root size)
+      rw [hd'] at hd
+      cases hd
+      obtain ⟨_, _, _, hptr, _⟩ :=
+        (basicMemory_allocate_ok_iff tbm.mem _ kind size align [] _ ptr').mp halloc
+      refine basicMemory_deallocate_double_free_ub _ ptr' kind' size' align' (tbDeallocHandler size')
+        ⟨tbm.mem.allocations.length⟩ []
+        (freshAllocation addr kind size align false
+          ⟨⟨[], List.replicate size.bytes (.Unprot .Unique), .No⟩⟩) (by rw [hptr]) ?_ rfl
+      rw [listIndex_eq_ok_iff]
+      refine ⟨Int.natCast_nonneg _, ?_⟩
+      simp only [Int.toNat_natCast, List.getElem?_append_right (Nat.le_refl _), Nat.sub_self,
+        List.getElem?_cons_zero]
+    simp only [hd2']
+    rfl
+
+/-- A fresh `Heap` allocation on `TreeBorrowsMemory` makes `leak_check` report
+`MemoryLeak`, whatever memory it was allocated in. -/
+theorem tb_allocate_heap_leaks {tbm tbm' : TBM} {size : Size} {align : Align}
+    {ptr : ThinPointer TreeBorrowsProvenance}
+    (h : TreeBorrowsMemory.allocate tbm .Heap size align = .ok (ptr, tbm')) :
+    TreeBorrowsMemory.leak_check tbm' = .error .memoryLeak := by
+  unfold TreeBorrowsMemory.allocate at h
+  obtain ⟨⟨_, mem'⟩, halloc, hp⟩ := interp_bind_eq_ok h
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp)
+  exact basicMemory_allocate_heap_leaks halloc
+
+/-- After allocating and deallocating a block on `TreeBorrowsMemory`,
+`leak_check` returns to its pre-allocation result. -/
+theorem tb_allocate_deallocate_leak_check {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
+    {align : Align} {ptr : ThinPointer TreeBorrowsProvenance}
+    (h : TreeBorrowsMemory.allocate tbm kind size align = .ok (ptr, tbm')) :
+    ∃ tbm'', TreeBorrowsMemory.deallocate tbm' ptr kind size align = .ok tbm'' ∧
+      TreeBorrowsMemory.leak_check tbm'' = TreeBorrowsMemory.leak_check tbm := by
+  unfold TreeBorrowsMemory.allocate at h
+  obtain ⟨⟨_, mem'⟩, halloc, hp⟩ := interp_bind_eq_ok h
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp)
+  obtain ⟨mem'', hd, hleak⟩ :=
+    basicMemory_allocate_deallocate_leak_check (tbDeallocHandler size) halloc
+      (tbDeallocHandler_fresh_root size)
+  refine ⟨{ tbm with mem := mem'' }, ?_, hleak⟩
+  rw [tb_deallocate_eq_basic]; simp only [hd]; rfl
+
+/-- **The heap lifecycle on every `MachTB` (`TreeBorrowsMemory<x86_64>`).**
+Whenever `Allocate(size, align)` succeeds at a thin pointer type on any `MachTB`,
+the new machine reports a leak; `Deallocate(ptr, size, align)` succeeds (passing
+`Node.access .Write` and the strong-protector check on the fresh root tree);
+`leak_check` returns to its pre-allocation result; a second `Deallocate` is UB
+`"double-free"`; and `MachTB.wfLive` is preserved across both transitions. -/
+theorem heap_lifecycle_tb (m m1 : MachTB) (size align : Int) (sTy aTy : «Type») (p : PtrType)
+    (val : Value TBM) (pTy : «Type»)
+    (h : evalIntrinsicM m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) =
+      .ok (val, m1)) :
+    ∃ ptr m2, val = .Ptr ⟨ptr, none⟩ ∧
+      ConcurrentMemory.leak_check m1.mem = .error .memoryLeak ∧
+      evalIntrinsicM m1 .Deallocate [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)]
+        unitType = .ok (unitValueM, m2) ∧
+      ConcurrentMemory.leak_check m2.mem = ConcurrentMemory.leak_check m.mem ∧
+      evalIntrinsicM m2 .Deallocate [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)]
+        unitType = .error (.ub "double-free") ∧
+      (MiniRustSpec.Correspondence.MachTB.wfLive m →
+        MiniRustSpec.Correspondence.MachTB.wfLive m1 ∧
+        MiniRustSpec.Correspondence.MachTB.wfLive m2) := by
+  obtain ⟨size', sTy', align', aTy', al, p', ptr, cm, hargs, hs, ha, hret, hk, hal, hval, hm1⟩ :=
+    allocate_ok_iff.mp h
+  have hsz : size' = size := by cases hargs; rfl
+  have hag : align' = align := by cases hargs; rfl
+  subst hsz hag hval hm1
+  rw [cm_allocate_tb_eq] at hal
+  obtain ⟨⟨ptr', tbm1⟩, halloc, hp'⟩ := interp_bind_eq_ok hal
+  obtain ⟨rfl, rfl⟩ := Prod.mk.inj (interp_pure_eq_ok hp')
+  obtain ⟨tbm2, hd, hd2⟩ := tb_deallocate_twice_double_free halloc .Heap ⟨size'.toNat⟩ al
+  obtain ⟨tbm2', hd', hleak⟩ := tb_allocate_deallocate_leak_check halloc
+  rw [hd] at hd'
+  cases hd'
+  have hdealloc : evalIntrinsicM { m with mem := { m.mem with memory := tbm1 } } .Deallocate
+      [(.Ptr ⟨ptr', none⟩, pTy), (.Int size', sTy), (.Int align', aTy)] unitType =
+      .ok (unitValueM, { m with mem := { m.mem with memory := tbm2 } }) := by
+    rw [deallocate_eq_memory (M := TBM) _ ptr' pTy size' sTy align' aTy al hs ha, cm_deallocate_tb_eq]
+    simp only [hd]
+    rfl
+  refine ⟨ptr', { m with mem := { m.mem with memory := tbm2 } }, rfl, ?_, hdealloc, ?_, ?_, ?_⟩
+  · exact tb_allocate_heap_leaks halloc
+  · exact hleak
+  · rw [deallocate_eq_memory (M := TBM) _ ptr' pTy size' sTy align' aTy al hs ha, cm_deallocate_tb_eq]
+    simp only [hd2]
+    rfl
+  · intro hwf
+    have hwf1 := evalIntrinsicM_allocate_tb_wfLive hwf h
+    exact ⟨hwf1, evalIntrinsicM_deallocate_tb_wfLive hwf1 hdealloc⟩
+
 /-! ## §4. `ptr::addr_eq` against `==` on wide pointers
 
 `core::ptr::addr_eq(p, q)` is `p.cast::<()>() == q.cast::<()>()`: both
@@ -3454,8 +3645,11 @@ statement.
    successful `Allocate` leaks until its pointer is passed to `Deallocate`
    with the same size and alignment, which succeeds, restores `leak_check`,
    and makes a second `Deallocate` a double-free (`heap_lifecycle_bm`).
-2. On `MachTB`, both preserve the Tree Borrows invariant `MachTB.wfLive`,
-   which the initial machine satisfies.
+2. On `MachTB`, both preserve the Tree Borrows invariant `MachTB.wfLive` (which
+   the initial machine satisfies), and the full universal heap lifecycle
+   (`Allocate` -> leak -> `Deallocate` passing `Node.access .Write` +
+   protector check -> `leak_check` restored -> double-free UB + `wfLive`) holds
+   on every `MachTB` (`heap_lifecycle_tb`).
 3. `leak_check` reports `MemoryLeak` exactly when a live `Heap` allocation
    exists, on both memory models (so `Global`, `Stack`, `Function`, and
    `VTable` memory never leaks: `rust#166221`).
@@ -3488,7 +3682,22 @@ theorem ep1_minirust_heap_wide_capstone :
         MiniRustSpec.Correspondence.MachTB.wfLive m →
         evalIntrinsicM m op args retTy = .ok (val, m') →
         MiniRustSpec.Correspondence.MachTB.wfLive m') ∧
-      MiniRustSpec.Correspondence.MachTB.wfLive (initMach tbHarness)) ∧
+      MiniRustSpec.Correspondence.MachTB.wfLive (initMach tbHarness) ∧
+      (∀ (m m1 : MachTB) (size align : Int) (sTy aTy : «Type») (p : PtrType) (val : Value TBM)
+          (pTy : «Type»),
+        evalIntrinsicM m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) = .ok (val, m1) →
+        ∃ ptr m2, val = .Ptr ⟨ptr, none⟩ ∧
+          ConcurrentMemory.leak_check m1.mem = .error .memoryLeak ∧
+          evalIntrinsicM m1 .Deallocate
+              [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+            .ok (unitValueM, m2) ∧
+          ConcurrentMemory.leak_check m2.mem = ConcurrentMemory.leak_check m.mem ∧
+          evalIntrinsicM m2 .Deallocate
+              [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+            .error (.ub "double-free") ∧
+          (MiniRustSpec.Correspondence.MachTB.wfLive m →
+            MiniRustSpec.Correspondence.MachTB.wfLive m1 ∧
+            MiniRustSpec.Correspondence.MachTB.wfLive m2))) ∧
     ((∀ cm : ConcurrentMemory BM, ConcurrentMemory.leak_check cm = .error .memoryLeak ↔
         ∃ a ∈ cm.memory.allocations, a.live = true ∧ a.kind = .Heap) ∧
       (∀ cm : ConcurrentMemory TBM, ConcurrentMemory.leak_check cm = .error .memoryLeak ↔
@@ -3538,8 +3747,8 @@ theorem ep1_minirust_heap_wide_capstone :
     (mrProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
-  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_,
-    ?_⟩
+  refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩,
+    ⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
   · exact tbInit_wfLive
@@ -3619,8 +3828,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 166 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 166 then
+  -- This module states 175 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 175 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
