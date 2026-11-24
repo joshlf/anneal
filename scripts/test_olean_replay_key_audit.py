@@ -211,6 +211,17 @@ class TestCliArgumentParsing(unittest.TestCase):
             self.assertFalse(miss_payload["ok"])
             self.assertEqual(miss_payload["violations"][0]["category"], "missingSourceText")
 
+            # Non-UTF-8 `--source-map` JSON must exit 2 cleanly (never crash with UnicodeDecodeError).
+            bad_utf8_json = p / "bad_utf8.json"
+            bad_utf8_json.write_bytes(b"\xff\xfe\xfd")
+            buf_utf8 = io.StringIO()
+            with mock.patch("sys.stdout", buf_utf8):
+                rc_utf8 = audit.main(
+                    ["--audit-module", "Proof.A", "--source-map", str(bad_utf8_json), "--json"]
+                )
+            self.assertEqual(rc_utf8, 2)
+            self.assertTrue(json.loads(buf_utf8.getvalue())["operational_error"])
+
 
 class TestFailClosedFilesystemStat(unittest.TestCase):
     """Tests `zerocopy#4161` fail-closed `stat_regular_fail_closed` & `stat_dir_fail_closed`."""
@@ -385,6 +396,9 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             'def interp : String := s!"{f\'} and {1 + 1}"\n',
             'def echo! (s : String) : String := s\ndef bangCall : String := echo! "{"\n',
             'def «echo!» (s : String) : String := s\ndef escBangCall : String := «echo!» "{"\n',
+            "def decideTerm : Bool := decide ('.' ∉ ['a'])\n",
+            "def trace : Array Nat := #[0]\ndef traceIdx : Nat := trace[0]!\n",
+            'def strWithDecide : String := "decide -kernel"\n',
             "import Topic.all\nset_option maxHeartbeats 400000 in\n"
             "set_option linter.deprecated false in\ntheorem ok : True := trivial\n",
         ]
@@ -401,6 +415,21 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ("theorem p : 1 + 1 = 2 := by decide /- comment -/ -kernel", "forbiddenSourceOption"),
             ("theorem p : 1 + 1 = 2 := by decide (kernel := false)", "forbiddenSourceOption"),
             ("theorem p : 1 + 1 = 2 := by decide (revert := true)", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide(kernel := false)", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide-kernel", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide+revert", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide +kernel-kernel", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by iterate 1decide -kernel", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide +«revert»", "forbiddenSourceOption"),
+            ('def «"» : Nat := 1\ntheorem evil : 1 + 1 = 2 := by decide -kernel\ndef «"2» : Nat := 2', "forbiddenSourceOption"),
+            ("def «--» : Nat := 1; theorem evil : 1 + 1 = 2 := by decide -kernel", "forbiddenSourceOption"),
+            ("def «/-» : Nat := 1\ntheorem evil : 1 + 1 = 2 := by decide -kernel\ndef «-/» : Nat := 2", "forbiddenSourceOption"),
+            ('def s : String := «s!» "{let _ : 1 + 1 = 2 := by decide -kernel; 0}"', "forbiddenSourceOption"),
+            ('def sneak : Nat := dbg_trace "{(by set_option debug.skipKernelTC true in exact (0 : Nat) : Nat)}"; 0', "forbiddenSourceOption"),
+            ('def sneak : Nat := dbg_trace "{let _ : 1 + 1 = 2 := (by decide -kernel); 0}"; 0', "forbiddenSourceOption"),
+            ('def sneak : IO Unit := println! "{(by set_option debug.skipKernelTC true in exact (0 : Nat) : Nat)}"', "forbiddenSourceOption"),
+            ('def sneak : IO Unit := println! "{let _ : 1 + 1 = 2 := (by decide -kernel); 0}"', "forbiddenSourceOption"),
+            ('def sneak := Macro.trace[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
             ('def s : String := s!"{show Prop from by decide -kernel}"', "forbiddenSourceOption"),
             ("@[app_delab Nat.add] def badDelab : Nat := 0", "forbiddenSourceOption"),
             ("theorem p : True := by iterate 1native_decide", "forbiddenSourceOption"),
@@ -552,12 +581,26 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Topic/A1InstCoe/Defs", "namespace Topic.A1InstCoe.Defs\ninductive LocalAnchor | mk\ninstance : Inhabited LocalAnchor := ⟨.mk⟩\n@[coe] def sneakyInstCoe (n : Nat) [Inhabited LocalAnchor] : Bool := false\nend Topic.A1InstCoe.Defs\n"),
                 ("Topic/A1OptCoe/Defs", "namespace Topic.A1OptCoe.Defs\ninductive LocalAnchor | mk\n@[coe] def sneakyOptCoe (n : Nat) (_ : LocalAnchor := .mk) : Bool := false\nend Topic.A1OptCoe.Defs\n"),
                 ("Topic/A1AbbrCoe/Defs", "namespace Topic.A1AbbrCoe.Defs\ninductive LocalAnchor | mk\nabbrev HiddenTail := (_ : LocalAnchor := .mk) → Bool\n@[coe] def sneakyAbbrCoe (n : Nat) : HiddenTail := fun _ => false\nend Topic.A1AbbrCoe.Defs\n"),
+                ("Topic/B2CoeFirstArg/Defs", "namespace Topic.B2CoeFirstArg.Defs\ninductive LocalAnchor | mk\n@[coe] def evilCoe (n : Nat) (x : LocalAnchor) : Bool := false\nend Topic.B2CoeFirstArg.Defs\n"),
+                ("Topic/B2GoodCoe/Defs", "namespace Topic.B2GoodCoe.Defs\ninductive GoodTag | mk\n@[coe] def toNat (_ : GoodTag) : Nat := 0\n@[coe] def ofNat (_ : Nat) : GoodTag := .mk\nend Topic.B2GoodCoe.Defs\n"),
+                ("Topic/B2OutCls", "namespace Topic.B2OutCls\nabbrev MyOut (α : Sort u) := outParam α\nclass MyClass (a : Type) (b : MyOut Type) where val : a\nend Topic.B2OutCls\n"),
+                ("Proof/B2DbgTraceSkip", 'namespace Proof.B2DbgTraceSkip\ndef sneak : Nat :=\n  dbg_trace "{(by set_option debug.skipKernelTC true in exact (0 : Nat) : Nat)}"\n  0\nend Proof.B2DbgTraceSkip\n'),
+                ("Proof/B2PrintlnDecide", 'namespace Proof.B2PrintlnDecide\ndef sneak : IO Unit :=\n  println! "{let _ : 1 + 1 = 2 := (by decide -kernel); (0 : Nat)}"\nend Proof.B2PrintlnDecide\n'),
+                ("Proof/B2DecideNoSpace", "namespace Proof.B2DecideNoSpace\ntheorem t1 : 1 + 1 = 2 := by decide(kernel := false)\nend Proof.B2DecideNoSpace\n"),
+                ("Proof/B2GuillDecide", 'namespace Proof.B2GuillDecide\ndef «"» : Nat := 1\ntheorem evil : 1 + 1 = 2 := by decide -kernel\ndef «"2» : Nat := 2\nend Proof.B2GuillDecide\n'),
                 ("Topic/BadSkipSrc", "namespace Topic.BadSkipSrc\nset_option debug.skipKernelTC true in\ndef v : Nat := 1\nend Topic.BadSkipSrc\n"),
             ):
                 s = b1_dir / f"{rel}.lean"
                 s.parent.mkdir(parents=True, exist_ok=True)
                 s.write_text(code, encoding="utf-8")
                 jobs.append((b1_dir, s, b1_dir / f"{rel}.olean", []))
+            b2_hijack = b1_dir / "Topic" / "B2OutHijack" / "Defs.lean"
+            b2_hijack.parent.mkdir(parents=True, exist_ok=True)
+            b2_hijack.write_text(
+                "import Topic.B2OutCls\nnamespace Topic.B2OutHijack.Defs\ninductive LocalAnchor | mk\ninstance evilOutParamHijack : Topic.B2OutCls.MyClass Nat LocalAnchor := ⟨999⟩\nend Topic.B2OutHijack.Defs\n",
+                encoding="utf-8",
+            )
+            jobs.append((b1_dir, b2_hijack, b1_dir / "Topic" / "B2OutHijack" / "Defs.olean", [b1_dir]))
             top_clean = b1_dir / "Proof" / "TopClean.lean"
             top_clean.parent.mkdir(parents=True, exist_ok=True)
             top_clean.write_text(
@@ -687,6 +730,124 @@ def main (args : List String) : IO UInt32 := do
     (OLeanLevel.server.adjustFileName sbFile, sbPriv),
     (OLeanLevel.private.adjustFileName sbFile, sbPriv)
   ]
+  -- Pass B2 forged edge cases: 10-layer opaque chain, Init.Prelude-only batch leakage,
+  -- `folderExt` interpreter hook, `.ir.sig` split-brain constants/non-IR ext, `isModule` mismatch,
+  -- and `module` importing non-`module`.
+  let mut opNames : Array Name := #[]
+  let mut opInfos : Array ConstantInfo := #[]
+  let op0 := `Proof.B2DeepOp.op0
+  opNames := opNames.push op0
+  opInfos := opInfos.push (.opaqueInfo {
+    name := op0, levelParams := [], type := mkConst ``Bool,
+    value := mkConst ``Bool.false, isUnsafe := false, all := [op0]
+  })
+  let mut prevOp := op0
+  for i in [:10] do
+    let dn := Name.str `Proof.B2DeepOp s!"d{i}"
+    opNames := opNames.push dn
+    opInfos := opInfos.push (.defnInfo {
+      name := dn, levelParams := [], type := mkConst ``Bool,
+      value := mkApp2 (mkConst ``Bool.and) (mkConst ``Bool.true) (mkConst prevOp),
+      hints := .regular 1, safety := .safe, all := [dn]
+    })
+    let on := Name.str `Proof.B2DeepOp s!"o{i+1}"
+    opNames := opNames.push on
+    opInfos := opInfos.push (.opaqueInfo {
+      name := on, levelParams := [], type := mkConst ``Bool,
+      value := mkConst dn, isUnsafe := false, all := [on]
+    })
+    prevOp := on
+  let deepAx := `Proof.B2DeepOp.f._native.decide.ax_1
+  opNames := opNames.push deepAx
+  opInfos := opInfos.push (.axiomInfo {
+    name := deepAx, levelParams := [],
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) (mkConst prevOp) (mkConst ``Bool.true),
+    isUnsafe := false
+  })
+  writeO (out / "b2_deep_opaque") `Proof.B2DeepOp {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := opNames, constants := opInfos, extraConstNames := #[], entries := #[]
+  }
+  let prelDef : ConstantInfo := .defnInfo {
+    name := `Proof.B2PrelOnly.useXor, levelParams := [], type := mkConst ``Nat,
+    value := mkApp2 (mkConst ``Nat.xor) (mkConst ``Nat.zero) (mkConst ``Nat.zero),
+    hints := .regular 1, safety := .safe, all := [`Proof.B2PrelOnly.useXor]
+  }
+  writeO (out / "b2_prelude_only") `Proof.B2PrelOnly {
+    isModule := false, imports := #[{ module := `Init.Prelude }],
+    constNames := #[`Proof.B2PrelOnly.useXor], constants := #[prelDef],
+    extraConstNames := #[], entries := #[]
+  }
+  let foldOk : ConstantInfo := .thmInfo {
+    name := `Proof.B2FolderExt.ok, levelParams := [],
+    type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B2FolderExt.ok]
+  }
+  writeO (out / "b2_folder_ext") `Proof.B2FolderExt {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B2FolderExt.ok], constants := #[foldOk], extraConstNames := #[],
+    entries := #[(`Lean.Compiler.LCNF.Simp.ConstantFold.folderExt, #[unsafe unsafeCast ()])]
+  }
+  let irDir := out / "b2_ir_split" / "Proof"
+  IO.FS.createDirAll irDir
+  let irOlean := irDir / "B2IrSplit.olean"
+  let cleanIr : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B2IrSplit.ok],
+    constants := #[.thmInfo { name := `Proof.B2IrSplit.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B2IrSplit.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B2IrSplit #[
+    (irOlean, cleanIr),
+    (OLeanLevel.server.adjustFileName irOlean, cleanIr),
+    (OLeanLevel.private.adjustFileName irOlean, cleanIr)
+  ]
+  let badIrSig : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[], constants := #[], extraConstNames := #[],
+    entries := #[(`Lean.aliasExtension, #[unsafe unsafeCast ()])]
+  }
+  let emptyIr : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[], constants := #[], extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B2IrSplit #[
+    (irOlean.withExtension "ir.sig", badIrSig),
+    (irOlean.withExtension "ir", emptyIr)
+  ]
+  let mmDir := out / "b2_ismod" / "Proof"
+  IO.FS.createDirAll mmDir
+  let mmOlean := mmDir / "B2IsMod.olean"
+  let mmExp : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B2IsMod.ok],
+    constants := #[.thmInfo { name := `Proof.B2IsMod.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B2IsMod.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B2IsMod #[
+    (mmOlean, mmExp),
+    (OLeanLevel.server.adjustFileName mmOlean, { mmExp with isModule := false }),
+    (OLeanLevel.private.adjustFileName mmOlean, { mmExp with isModule := false })
+  ]
+  let mnDir := out / "b2_mod_imp_nm" / "Proof"
+  IO.FS.createDirAll mnDir
+  saveModuleData (mnDir / "DepNM.olean") `Proof.DepNM {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.DepNM.ok],
+    constants := #[.thmInfo { name := `Proof.DepNM.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.DepNM.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  let topModData : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }, { module := `Proof.DepNM }],
+    constNames := #[`Proof.TopMod.ok],
+    constants := #[.thmInfo { name := `Proof.TopMod.ok, levelParams := [], type := mkConst ``True, value := mkConst `Proof.DepNM.ok, all := [`Proof.TopMod.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  let topOlean := mnDir / "TopMod.olean"
+  saveModuleDataParts `Proof.TopMod #[
+    (topOlean, topModData),
+    (OLeanLevel.server.adjustFileName topOlean, topModData),
+    (OLeanLevel.private.adjustFileName topOlean, topModData)
+  ]
   return 0
 """,
                 encoding="utf-8",
@@ -761,6 +922,19 @@ def main (args : List String) : IO UInt32 := do
                     "olean_dirs": [a1_forged / "split_ext"],
                     "strict_proofs": True,
                 }),
+                ("b2_coe_first_arg_trailing_anchor", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B2CoeFirstArg.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("b2_coe_valid_unary_passes", True, None, {"target_modules": ["Topic.B2GoodCoe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("b2_outparam_behind_abbrev", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B2OutHijack.Defs"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b2_dbg_trace_skip_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.B2DbgTraceSkip"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b2_println_decide_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.B2PrintlnDecide"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b2_decide_nospace_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.B2DecideNoSpace"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b2_guillemet_decide_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.B2GuillDecide"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b2_deep_opaque_chain_refuted", False, "invalidNativeAxiomType", {"target_modules": ["Proof.B2DeepOp"], "olean_dirs": [a1_forged / "b2_deep_opaque"], "allow_provisional_native": True, "strict_proofs": True}),
+                ("b2_prelude_only_batch_no_init_leak", False, "unknownConstant", {"target_modules": ["Proof.B2PrelOnly"], "olean_dirs": [a1_forged / "b2_prelude_only"], "strict_proofs": True}),
+                ("b2_folder_ext_rejected", False, "forbiddenInitOrCodegenHook", {"target_modules": ["Proof.B2FolderExt"], "olean_dirs": [a1_forged / "b2_folder_ext"], "strict_proofs": True}),
+                ("b2_ir_split_non_ir_ext", False, "keyNameMismatch", {"target_modules": ["Proof.B2IrSplit"], "olean_dirs": [a1_forged / "b2_ir_split"], "strict_proofs": True}),
+                ("b2_ismodule_flag_mismatch", False, "keyNameMismatch", {"target_modules": ["Proof.B2IsMod"], "olean_dirs": [a1_forged / "b2_ismod"], "strict_proofs": True}),
+                ("b2_module_imports_nonmodule", False, "foreignImport", {"target_modules": ["Proof.TopMod"], "olean_dirs": [a1_forged / "b2_mod_imp_nm"], "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
@@ -792,6 +966,22 @@ def main (args : List String) : IO UInt32 := do
                     by_mod = {it["module"]: it for it in rep["summary"]["items"]}
                     self.assertEqual(by_mod["Verify.ItemProv"]["status"], "ProvisionalNative")
                     self.assertEqual(by_mod["Verify.Topic"]["status"], "VerifiedUnconditional")
+
+            # Non-UTF-8 `.lean` source file referenced by `--source-map` must raise AuditOperationalError (exit 2).
+            bad_utf8_lean = tmp / "BadUtf8Source.lean"
+            bad_utf8_lean.write_bytes(b"\xff\xfe\xfd")
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.audit_modules(
+                    ["Topic.B2GoodCoe.Defs"],
+                    olean_dirs=[b1_dir],
+                    source_map={"Topic.B2GoodCoe.Defs": bad_utf8_lean},
+                    require_sources=True,
+                    strict_proofs=True,
+                    lean_bin=lean_bin,
+                    sysroot=sysroot,
+                    compiled_inspector=insp,
+                    stage_dir=tmp,
+                )
 
 
 if __name__ == "__main__":

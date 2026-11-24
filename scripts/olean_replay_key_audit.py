@@ -542,6 +542,12 @@ EXT_HOOK_TOKENS: tuple[str, ...] = (
     "sym_discharger",
     "run_parser_attribute_hooks",
     "run_builtin_parser_attribute_hooks",
+    "throwNamedError",
+    "throwNamedErrorAt",
+    "logNamedError",
+    "logNamedErrorAt",
+    "logNamedWarning",
+    "logNamedWarningAt",
 )
 
 LEAN_PRIMITIVE_CONST_TOKENS: tuple[str, ...] = (
@@ -566,114 +572,133 @@ ALWAYS_FORBIDDEN_TOKENS: tuple[str, ...] = (
 NATIVE_TACTIC_TOKENS: tuple[str, ...] = ("native_decide", "bv_decide", "bv_check")
 
 
-BUILTIN_INTERP_PREFIXES: frozenset[str] = frozenset({"s!", "m!", "f!"})
+BUILTIN_INTERP_PREFIXES: frozenset[str] = frozenset({"s!", "m!", "f!", "println!", "dbg_trace"})
 
 
-def lex_lean_source(src: str) -> str:
-    """Faithful port of `Anneal.ReplayKeyAndTamperAudit.SourceScanner.lexSource`
-    with `+1]'` checked strictly outside comments and string/char literals and
-    interpolated-string tracking across whitespace/comments after `s!` / `m!` / `f!`
-    (plus any glued `<ident>!"..."` prefix, without crashing on `echo! "{"`)."""
+def _lex_lean_source_both(src: str) -> tuple[str, str]:
+    """Single-pass unified Lean 4.34.1 lexer returning `(token_stream, raw_code_stream)`.
+
+    - `token_stream` is the faithful port of `Anneal.ReplayKeyAndTamperAudit.SourceScanner.lexSource`
+      with `+1]'` checked strictly outside comments and string/char literals, interpolated-string
+      tracking across whitespace/comments after `s!`, `m!`, `f!`, `println!`, `dbg_trace`,
+      `Macro.trace[...]` / `trace[...]` (plus any glued `<ident>!"..."` prefix, without crashing on
+      `echo! "{"`).
+    - `raw_code_stream` is emitted in exact lockstep from the SAME state machine (eliminating
+      two-lexer desyncs such as `«"»`, `«--»`, `«/-»`, or `«s!»`), preserving code punctuation
+      (`+`, `-`, `(`, `)`, `:`, `=`) and interpolation holes while erasing comments and plain/raw/char
+      literals and sanitizing guillemet identifiers.
+    """
     state: tuple[Any, ...] = ("code", "other")
     out: list[str] = []
+    raw_out: list[str] = []
     code_tail = ""
     last_raw_char = ""
     cur_ident = ""
-    after_bang_ident = False
+    after_interp_prefix = False
+    trace_bracket_depth = 0
     guillemet_buf: list[str] = []
 
-    def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str]:
-        nonlocal after_bang_ident, cur_ident
+    def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
+        nonlocal after_interp_prefix, cur_ident, trace_bracket_depth
         sep = " " if prev == "escIdent" else ""
         if prev == "ident" and _is_id_rest(c):
             cur_ident += c
-            after_bang_ident = cur_ident in BUILTIN_INTERP_PREFIXES
-            return (("code", "ident"), _visible(c))
+            after_interp_prefix = cur_ident in BUILTIN_INTERP_PREFIXES
+            return (("code", "ident"), _visible(c), c)
         if prev == "symIdent" and (_is_id_rest(c) or c in ('"', "#")):
             if c in ("'", '"', "#") or ("0" <= c <= "9"):
                 raise ValueError("literal glued to a symbol keyword")
             cur_ident = ""
-            after_bang_ident = False
-            return (("code", "symIdent"), _visible(c))
+            after_interp_prefix = False
+            return (("code", "symIdent"), _visible(c), c)
         if prev == "sym" and c == "'":
             raise ValueError("quote glued to a symbol that may absorb it")
         if _is_id_first(c):
-            after_bang_ident = False
+            after_interp_prefix = False
             if prev == "sym":
                 cur_ident = ""
-                return (("code", "symIdent"), _visible(c))
+                return (("code", "symIdent"), _visible(c), c)
             if c == "r" and prev in ("other", "escIdent", "quoteTok"):
                 cur_ident = "r"
-                return (("rawR",), sep)
+                return (("rawR",), sep, "")
             if c == "r" and prev == "dot":
                 cur_ident = "r"
-                return (("dotR",), "")
+                return (("dotR",), "", "")
             cur_ident = c
-            return (("code", "ident"), sep + _visible(c))
+            return (("code", "ident"), sep + _visible(c), c)
+        prev_ident = cur_ident
         cur_ident = ""
         if c == ".":
-            after_bang_ident = False
+            after_interp_prefix = False
             nxt = "identDot" if prev in ("ident", "escIdent") else "dot"
-            return (("code", nxt), ".")
+            return (("code", nxt), ".", ".")
         if "0" <= c <= "9":
-            after_bang_ident = False
+            after_interp_prefix = False
             if prev in ("identDot", "dot"):
-                return (("fieldIdx",), c)
+                return (("fieldIdx",), c, c)
             if c == "0":
-                return (("numZero",), sep + c)
-            return (("numDec",), sep + c)
+                return (("numZero",), sep + c, c)
+            return (("numDec",), sep + c, c)
         if c == '"':
-            is_interp = (prev == "ident" and last_raw_char == "!") or after_bang_ident
-            after_bang_ident = False
+            is_interp = (prev == "ident" and last_raw_char == "!") or after_interp_prefix
+            after_interp_prefix = False
             if is_interp:
-                return (("str",), " ")
-            return (("plainStr",), " ")
+                return (("str",), " ", " ")
+            return (("plainStr",), " ", " ")
         if c == "'":
-            after_bang_ident = False
+            after_interp_prefix = False
             if prev == "quoteTok":
-                return (("code", "other"), " ")
-            return (("chrOpen",), " ")
+                return (("code", "other"), " ", "'")
+            return (("chrOpen",), " ", " ")
         if c == "`":
-            after_bang_ident = False
+            after_interp_prefix = False
             if prev == "tick":
                 raise ValueError("doubled backtick")
-            return (("code", "tick"), " ")
+            return (("code", "tick"), " ", "`")
         if c == "«":
-            after_bang_ident = False
-            return (("guillemet",), "" if prev in ("identDot", "dot") else " ")
+            after_interp_prefix = False
+            return (("guillemet",), "" if prev in ("identDot", "dot") else " ", "")
         if c == "»":
             raise ValueError("unmatched identifier escape")
         if c == "-":
-            return (("dash",), " ")
+            return (("dash",), " ", "")
         if c == "/":
-            return (("slash",), " ")
+            return (("slash",), " ", "")
         if c == "<":
-            after_bang_ident = False
-            return (("lt",), " ")
+            after_interp_prefix = False
+            return (("lt",), " ", "")
         if c == "\\":
-            after_bang_ident = False
-            return (("bslash",), " ")
+            after_interp_prefix = False
+            return (("bslash",), " ", "")
         if c == "@":
-            after_bang_ident = False
-            return (("code", "other"), " @ ")
+            after_interp_prefix = False
+            return (("code", "other"), " @ ", "@")
         if c == "[":
-            after_bang_ident = False
-            return (("code", "other"), " [ ")
+            after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                trace_bracket_depth += 1
+            elif prev_ident == "trace":
+                trace_bracket_depth = 1
+            return (("code", "other"), " [ ", "[")
         if c == "]":
-            after_bang_ident = False
-            return (("code", "quoteTok"), " ] ")
+            if trace_bracket_depth > 0:
+                trace_bracket_depth -= 1
+                after_interp_prefix = trace_bracket_depth == 0
+            else:
+                after_interp_prefix = False
+            return (("code", "quoteTok"), " ] ", "]")
         if c in ("×", "Σ", "⊕"):
-            after_bang_ident = False
-            return (("code", "quoteTok"), " ")
+            after_interp_prefix = False
+            return (("code", "quoteTok"), " ", c)
         if c == "#":
-            after_bang_ident = False
-            return (("code", "sym"), " #")
+            after_interp_prefix = False
+            return (("code", "sym"), " #", "#")
         if c == "~":
-            after_bang_ident = False
-            return (("code", "sym"), " ")
+            after_interp_prefix = False
+            return (("code", "sym"), " ", "~")
         if not c.isspace():
-            after_bang_ident = False
-        return (("code", "other"), " ")
+            after_interp_prefix = False
+        return (("code", "other"), " ", c)
 
     def step_block(depth: int, c: str) -> tuple[Any, ...]:
         if c == "-":
@@ -682,50 +707,50 @@ def lex_lean_source(src: str) -> str:
             return ("blockSlash", depth)
         return ("block", depth)
 
-    def step_hole(depth: int, prev: str, c: str) -> tuple[tuple[Any, ...], str]:
+    def step_hole(depth: int, prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
         if c == "{":
-            return (("hole", depth + 1, "other"), " ")
+            return (("hole", depth + 1, "other"), " ", " ")
         if c == "}":
             if depth <= 1:
-                return (("str",), " ")
-            return (("hole", depth - 1, "other"), " ")
+                return (("str",), " ", " ")
+            return (("hole", depth - 1, "other"), " ", " ")
         if c in ('"', "\\", "«", "»"):
             raise ValueError("literal or escape inside an interpolation hole")
         if c == "'":
             if prev == "ident":
-                return (("hole", depth, "ident"), "'")
+                return (("hole", depth, "ident"), "'", "'")
             if prev == "quoteTok":
-                return (("hole", depth, "other"), " ")
+                return (("hole", depth, "other"), " ", "'")
             raise ValueError("character literal inside an interpolation hole")
         if c == "-":
-            return (("holeDash", depth), " ")
+            return (("holeDash", depth), " ", "")
         if c == "/":
-            return (("holeSlash", depth), " ")
+            return (("holeSlash", depth), " ", "")
         if c == "@":
-            return (("hole", depth, "other"), " @ ")
+            return (("hole", depth, "other"), " @ ", "@")
         if c == "[":
-            return (("hole", depth, "other"), " [ ")
+            return (("hole", depth, "other"), " [ ", "[")
         if c == "]":
-            return (("hole", depth, "quoteTok"), " ] ")
+            return (("hole", depth, "quoteTok"), " ] ", "]")
         if c in ("×", "Σ", "⊕"):
-            return (("hole", depth, "quoteTok"), " ")
+            return (("hole", depth, "quoteTok"), " ", c)
         if c == "#":
-            return (("hole", depth, "sym"), " #")
+            return (("hole", depth, "sym"), " #", "#")
         if c == "~":
-            return (("hole", depth, "sym"), " ")
+            return (("hole", depth, "sym"), " ", "~")
         if "0" <= c <= "9":
             if prev == "symIdent":
                 raise ValueError("literal glued to a symbol keyword")
-            return (("hole", depth, "ident" if prev == "ident" else "num"), c)
+            return (("hole", depth, "ident" if prev == "ident" else "num"), c, c)
         if _is_id_first(c):
             if prev in ("sym", "symIdent"):
-                return (("hole", depth, "symIdent"), _visible(c))
-            return (("hole", depth, "num" if prev == "num" else "ident"), _visible(c))
+                return (("hole", depth, "symIdent"), _visible(c), c)
+            return (("hole", depth, "num" if prev == "num" else "ident"), _visible(c), c)
         if _is_id_rest(c):
-            return (("hole", depth, "symIdent" if prev == "symIdent" else prev), _visible(c))
+            return (("hole", depth, "symIdent" if prev == "symIdent" else prev), _visible(c), c)
         if c == ".":
-            return (("hole", depth, "other"), ".")
-        return (("hole", depth, "other"), " ")
+            return (("hole", depth, "other"), ".", ".")
+        return (("hole", depth, "other"), " ", c)
 
     non_code_tags = {
         "lineComment",
@@ -754,243 +779,270 @@ def lex_lean_source(src: str) -> str:
         else:
             code_tail = ""
         if tag == "code":
-            state, chunk = step_code(state[1], ch)
+            state, chunk, raw_chunk = step_code(state[1], ch)
         elif tag == "dash":
             if ch == "-":
-                state, chunk = (("lineComment",), "")
+                state, chunk, raw_chunk = (("lineComment",), "", "  ")
             else:
-                after_bang_ident = False
-                state, chunk = step_code("other", ch)
+                after_interp_prefix = False
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, ch2, "-" + r2)
         elif tag == "slash":
             if ch == "-":
-                state, chunk = (("blockStart", 1), "")
+                state, chunk, raw_chunk = (("blockStart", 1), "", "  ")
             elif ch == "/":
-                after_bang_ident = False
-                state, chunk = (("slashAmb",), "")
+                after_interp_prefix = False
+                state, chunk, raw_chunk = (("slashAmb",), "", "//")
             elif ch == "\\":
-                after_bang_ident = False
-                state, chunk = (("code", "other"), "")
+                after_interp_prefix = False
+                state, chunk, raw_chunk = (("code", "other"), "", "/\\")
             elif ch == ".":
                 raise ValueError("slash glued to a dot")
             else:
-                after_bang_ident = False
-                state, chunk = step_code("other", ch)
+                after_interp_prefix = False
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, ch2, "/" + r2)
         elif tag == "slashAmb":
             if ch in ("-", "."):
                 raise ValueError("comment opener or dot glued to a slash token")
             if ch == "/":
-                state, chunk = (("slashAmb",), "")
+                state, chunk, raw_chunk = (("slashAmb",), "", "/")
             else:
-                state, chunk = step_code("other", ch)
+                state, chunk, raw_chunk = step_code("other", ch)
         elif tag == "lt":
             if ch == "-":
-                state, chunk = (("ltDash",), "")
+                state, chunk, raw_chunk = (("ltDash",), "", "<-")
             else:
-                state, chunk = step_code("other", ch)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, ch2, "<" + r2)
         elif tag == "ltDash":
             if ch == "-":
                 raise ValueError("line comment opener glued to a left arrow")
-            state, chunk = step_code("other", ch)
+            state, chunk, raw_chunk = step_code("other", ch)
         elif tag == "bslash":
             if ch == "/":
-                state, chunk = (("slashAmb",), "")
+                state, chunk, raw_chunk = (("slashAmb",), "", "\\/")
             elif _is_id_first(ch):
                 raise ValueError("identifier glued to a backslash")
             else:
-                state, chunk = step_code("other", ch)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, ch2, "\\" + r2)
         elif tag == "dotR":
             if ch in ('"', "#"):
                 raise ValueError("raw string prefix after a dot")
-            st2, ch2 = step_code("ident", ch)
-            state, chunk = (st2, "r" + ch2)
+            st2, ch2, r2 = step_code("ident", ch)
+            state, chunk, raw_chunk = (st2, "r" + ch2, "r" + r2)
         elif tag == "lineComment":
-            state, chunk = ((("code", "other") if ch == "\n" else ("lineComment",)), "")
+            state = ("code", "other") if ch == "\n" else ("lineComment",)
+            chunk = ""
+            raw_chunk = "\n" if ch == "\n" else " "
         elif tag == "blockStart":
             d = state[1]
-            state, chunk = ((("block", d) if ch in ("-", "!") else step_block(d, ch)), "")
+            state = ("block", d) if ch in ("-", "!") else step_block(d, ch)
+            chunk = ""
+            raw_chunk = "\n" if ch == "\n" else " "
         elif tag == "block":
-            state, chunk = (step_block(state[1], ch), "")
+            state = step_block(state[1], ch)
+            chunk = ""
+            raw_chunk = "\n" if ch == "\n" else " "
         elif tag == "blockDash":
             d = state[1]
             if ch == "/":
-                state, chunk = ((("code", "other") if d <= 1 else ("block", d - 1)), "")
+                state = ("code", "other") if d <= 1 else ("block", d - 1)
             else:
-                state, chunk = (step_block(d, ch), "")
+                state = step_block(d, ch)
+            chunk = ""
+            raw_chunk = "\n" if ch == "\n" else " "
         elif tag == "blockSlash":
             d = state[1]
             if ch == "-":
-                state, chunk = (("block", d + 1), "")
+                state = ("block", d + 1)
             else:
-                state, chunk = (step_block(d, ch), "")
+                state = step_block(d, ch)
+            chunk = ""
+            raw_chunk = "\n" if ch == "\n" else " "
         elif tag == "str":
             if ch == '"':
-                state, chunk = (("code", "other"), "")
+                state, chunk, raw_chunk = (("code", "other"), "", " ")
             elif ch == "\\":
-                state, chunk = (("strEsc",), "")
+                state, chunk, raw_chunk = (("strEsc",), "", " ")
             elif ch == "{":
-                state, chunk = (("hole", 1, "other"), " ")
+                state, chunk, raw_chunk = (("hole", 1, "other"), " ", " ")
             else:
-                state, chunk = (("str",), "")
+                state, chunk, raw_chunk = (("str",), "", " ")
         elif tag == "strEsc":
-            state, chunk = (("str",), "")
+            state, chunk, raw_chunk = (("str",), "", " ")
         elif tag == "plainStr":
             if ch == '"':
-                state, chunk = (("code", "other"), "")
+                state, chunk, raw_chunk = (("code", "other"), "", " ")
             elif ch == "\\":
-                state, chunk = (("plainStrEsc",), "")
+                state, chunk, raw_chunk = (("plainStrEsc",), "", " ")
             else:
-                state, chunk = (("plainStr",), "")
+                state, chunk, raw_chunk = (("plainStr",), "", " ")
         elif tag == "plainStrEsc":
-            state, chunk = (("plainStr",), "")
+            state, chunk, raw_chunk = (("plainStr",), "", " ")
         elif tag == "hole":
-            state, chunk = step_hole(state[1], state[2], ch)
-        elif tag in ("holeDash", "holeSlash"):
+            state, chunk, raw_chunk = step_hole(state[1], state[2], ch)
+        elif tag == "holeDash":
             if ch == "-":
                 raise ValueError("comment inside an interpolation hole")
-            state, chunk = step_hole(state[1], "other", ch)
+            st2, ch2, r2 = step_hole(state[1], "other", ch)
+            state, chunk, raw_chunk = (st2, ch2, "-" + r2)
+        elif tag == "holeSlash":
+            if ch == "-":
+                raise ValueError("comment inside an interpolation hole")
+            st2, ch2, r2 = step_hole(state[1], "other", ch)
+            state, chunk, raw_chunk = (st2, ch2, "/" + r2)
         elif tag == "chrOpen":
             if ch == "\\":
-                state, chunk = (("chrEsc",), "")
+                state, chunk, raw_chunk = (("chrEsc",), "", " ")
             elif ch == "'":
                 raise ValueError("empty character literal")
             else:
-                state, chunk = (("chrEnd",), "")
+                state, chunk, raw_chunk = (("chrEnd",), "", " ")
         elif tag == "chrEsc":
             if ch == "x":
-                state, chunk = (("chrEscN", 2), "")
+                state, chunk, raw_chunk = (("chrEscN", 2), "", " ")
             elif ch == "u":
-                state, chunk = (("chrEscN", 4), "")
+                state, chunk, raw_chunk = (("chrEscN", 4), "", " ")
             else:
-                state, chunk = (("chrEnd",), "")
+                state, chunk, raw_chunk = (("chrEnd",), "", " ")
         elif tag == "chrEscN":
             k = state[1]
-            state, chunk = ((("chrEnd",) if k <= 1 else ("chrEscN", k - 1)), "")
+            state, chunk, raw_chunk = ((("chrEnd",) if k <= 1 else ("chrEscN", k - 1)), "", " ")
         elif tag == "chrEnd":
             if ch == "'":
-                state, chunk = (("code", "other"), "")
+                state, chunk, raw_chunk = (("code", "other"), "", " ")
             else:
                 raise ValueError("missing end of character literal")
         elif tag == "rawR":
             if ch == '"':
-                state, chunk = (("raw", 0), " ")
+                state, chunk, raw_chunk = (("raw", 0), " ", "  ")
             elif ch == "#":
-                state, chunk = (("rawHash", 1), "")
+                state, chunk, raw_chunk = (("rawHash", 1), "", "")
             else:
-                st2, ch2 = step_code("ident", ch)
-                state, chunk = (st2, "r" + ch2)
+                st2, ch2, r2 = step_code("ident", ch)
+                state, chunk, raw_chunk = (st2, "r" + ch2, "r" + r2)
         elif tag == "rawHash":
             n = state[1]
             if ch == "#":
-                state, chunk = (("rawHash", n + 1), "")
+                state, chunk, raw_chunk = (("rawHash", n + 1), "", "")
             elif ch == '"':
-                state, chunk = (("raw", n), " ")
+                state, chunk, raw_chunk = (("raw", n), " ", " " * (n + 2))
             else:
-                st2, ch2 = step_code("sym", ch)
-                state, chunk = (st2, "r #" + ch2)
+                st2, ch2, r2 = step_code("sym", ch)
+                state, chunk, raw_chunk = (st2, "r #" + ch2, "r" + ("#" * n) + r2)
         elif tag == "raw":
             n = state[1]
             if ch == '"':
-                state, chunk = ((("code", "other") if n == 0 else ("rawEnd", n, 0)), "")
+                state = ("code", "other") if n == 0 else ("rawEnd", n, 0)
             else:
-                state, chunk = (("raw", n), "")
+                state = ("raw", n)
+            chunk, raw_chunk = "", " "
         elif tag == "rawEnd":
             n, seen = state[1], state[2]
             if ch == "#":
-                state, chunk = ((("code", "other") if seen + 1 == n else ("rawEnd", n, seen + 1)), "")
+                state = ("code", "other") if seen + 1 == n else ("rawEnd", n, seen + 1)
             elif ch == '"':
-                state, chunk = (("rawEnd", n, 0), "")
+                state = ("rawEnd", n, 0)
             else:
-                state, chunk = (("raw", n), "")
+                state = ("raw", n)
+            chunk, raw_chunk = "", " "
         elif tag == "guillemet":
             if ch == "»":
-                after_bang_ident = "".join(guillemet_buf) in BUILTIN_INTERP_PREFIXES
+                gname = "".join(guillemet_buf)
+                cur_ident = gname
+                after_interp_prefix = gname in BUILTIN_INTERP_PREFIXES
                 guillemet_buf.clear()
-                state, chunk = (("code", "escIdent"), "")
+                state, chunk, raw_chunk = (("code", "escIdent"), "", "")
             else:
                 guillemet_buf.append(ch)
-                state, chunk = (("guillemet",), _visible(ch))
+                safe_raw = ch if _is_id_rest(ch) else "_"
+                state, chunk, raw_chunk = (("guillemet",), _visible(ch), safe_raw)
         elif tag == "numZero":
             if ch in ("b", "B"):
-                state, chunk = (("numRadix", "bin"), ch)
+                state, chunk, raw_chunk = (("numRadix", "bin"), ch, ch)
             elif ch in ("o", "O"):
-                state, chunk = (("numRadix", "oct"), ch)
+                state, chunk, raw_chunk = (("numRadix", "oct"), ch, ch)
             elif ch in ("x", "X"):
-                state, chunk = (("numRadix", "hex"), ch)
+                state, chunk, raw_chunk = (("numRadix", "hex"), ch, ch)
             elif ("0" <= ch <= "9") or ch == "_":
-                state, chunk = (("numDec",), ch)
+                state, chunk, raw_chunk = (("numDec",), ch, ch)
             elif ch == ".":
-                state, chunk = (("numDot",), "")
+                state, chunk, raw_chunk = (("numDot",), "", "")
             elif ch in ("e", "E"):
-                state, chunk = (("numExpStart",), ch)
+                state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         elif tag == "numRadix":
             r = state[1]
             if ch == "_" or _is_radix_digit(r, ch):
-                state, chunk = (("numRadix", r), ch)
+                state, chunk, raw_chunk = (("numRadix", r), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         elif tag == "numDec":
             if ("0" <= ch <= "9") or ch == "_":
-                state, chunk = (("numDec",), ch)
+                state, chunk, raw_chunk = (("numDec",), ch, ch)
             elif ch == ".":
-                state, chunk = (("numDot",), "")
+                state, chunk, raw_chunk = (("numDot",), "", "")
             elif ch in ("e", "E"):
-                state, chunk = (("numExpStart",), ch)
+                state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         elif tag == "numDot":
             if "0" <= ch <= "9":
-                state, chunk = (("numFrac",), "." + ch)
+                state, chunk, raw_chunk = (("numFrac",), "." + ch, "." + ch)
             elif ch == ".":
-                state, chunk = (("code", "other"), " ")
+                state, chunk, raw_chunk = (("code", "other"), " ", "..")
             elif ch in ("e", "E"):
-                state, chunk = (("numExpStart",), "." + ch)
+                state, chunk, raw_chunk = (("numExpStart",), "." + ch, "." + ch)
             elif _is_id_first(ch) or ch == "«":
                 raise ValueError("identifier after a decimal point")
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, "." + r2)
         elif tag == "numFrac":
             if ("0" <= ch <= "9") or ch == "_":
-                state, chunk = (("numFrac",), ch)
+                state, chunk, raw_chunk = (("numFrac",), ch, ch)
             elif ch in ("e", "E"):
-                state, chunk = (("numExpStart",), ch)
+                state, chunk, raw_chunk = (("numExpStart",), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         elif tag == "numExpStart":
             if ch in ("+", "-"):
-                state, chunk = (("numExpSign",), "")
+                state, chunk, raw_chunk = (("numExpSign",), "", ch)
             elif "0" <= ch <= "9":
-                state, chunk = (("numExp",), ch)
+                state, chunk, raw_chunk = (("numExp",), ch, ch)
             else:
                 raise ValueError("missing exponent digits in a scientific literal")
         elif tag == "numExpSign":
             if "0" <= ch <= "9":
-                state, chunk = (("numExp",), ch)
+                state, chunk, raw_chunk = (("numExp",), ch, ch)
             else:
                 raise ValueError("missing exponent digits in a scientific literal")
         elif tag == "numExp":
             if ("0" <= ch <= "9") or ch == "_":
-                state, chunk = (("numExp",), ch)
+                state, chunk, raw_chunk = (("numExp",), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         elif tag == "fieldIdx":
             if "0" <= ch <= "9":
-                state, chunk = (("fieldIdx",), ch)
+                state, chunk, raw_chunk = (("fieldIdx",), ch, ch)
             else:
-                st2, ch2 = step_code("other", ch)
-                state, chunk = (st2, " " + ch2)
+                st2, ch2, r2 = step_code("other", ch)
+                state, chunk, raw_chunk = (st2, " " + ch2, r2)
         else:
             raise ValueError(f"unknown lexer state {tag}")
         last_raw_char = ch
         if chunk:
             out.append(chunk)
+        if raw_chunk:
+            raw_out.append(raw_chunk)
 
     terminal_ok = {
         "code",
@@ -1014,9 +1066,29 @@ def lex_lean_source(src: str) -> str:
     }
     if state[0] not in terminal_ok:
         raise ValueError("input ends inside a literal, comment, or escape")
-    if state[0] in ("rawR", "dotR", "rawHash"):
+    if state[0] in ("rawR", "dotR"):
         out.append("r")
-    return "".join(out)
+        raw_out.append("r")
+    elif state[0] == "rawHash":
+        out.append("r")
+        raw_out.append("r" + ("#" * state[1]))
+    elif state[0] == "dash":
+        raw_out.append("-")
+    elif state[0] == "slash":
+        raw_out.append("/")
+    elif state[0] == "lt":
+        raw_out.append("<")
+    elif state[0] == "bslash":
+        raw_out.append("\\")
+    elif state[0] == "numDot":
+        raw_out.append(".")
+    return "".join(out), "".join(raw_out)
+
+
+def lex_lean_source(src: str) -> str:
+    """Faithful port of `Anneal.ReplayKeyAndTamperAudit.SourceScanner.lexSource`."""
+    code, _ = _lex_lean_source_both(src)
+    return code
 
 
 def _strip_tactic_suffix(seg: str) -> str:
@@ -1081,151 +1153,11 @@ def classify_module_role_py(mod_name: str) -> str | None:
     return "spec"
 
 
-def _strip_comments_and_noninterp_strings(src: str) -> str:
-    """Replaces comments and plain/raw/char literals (preserving interpolation holes `{...}`)
-    with spaces so tactic flag sequences like `decide -kernel` or `decide +revert` can be
-    inspected across comments and inside string interpolation holes."""
-    out: list[str] = []
-    i = 0
-    n = len(src)
-    block_depth = 0
-    in_interp = False
-    hole_depth = 0
-    cur_id = ""
-    after_builtin_interp = False
-
-    while i < n:
-        c = src[i]
-        if block_depth > 0:
-            if c == "/" and i + 1 < n and src[i + 1] == "-":
-                block_depth += 1
-                out.append("  ")
-                i += 2
-            elif c == "-" and i + 1 < n and src[i + 1] == "/":
-                block_depth -= 1
-                out.append("  ")
-                i += 2
-            else:
-                out.append("\n" if c == "\n" else " ")
-                i += 1
-            continue
-
-        if in_interp and hole_depth == 0:
-            if c == "\\":
-                out.append("  ")
-                i += 2
-            elif c == '"':
-                in_interp = False
-                out.append(" ")
-                i += 1
-            elif c == "{":
-                hole_depth = 1
-                out.append(" ")
-                i += 1
-            else:
-                out.append(" ")
-                i += 1
-            continue
-
-        if c == "-" and i + 1 < n and src[i + 1] == "-":
-            while i < n and src[i] != "\n":
-                out.append(" ")
-                i += 1
-            continue
-        if c == "/" and i + 1 < n and src[i + 1] == "-":
-            block_depth = 1
-            out.append("  ")
-            i += 2
-            continue
-        if hole_depth > 0:
-            if c == "{":
-                hole_depth += 1
-                out.append(" ")
-                i += 1
-                continue
-            if c == "}":
-                hole_depth -= 1
-                out.append(" ")
-                i += 1
-                continue
-
-        # Raw string `r"..."` or `r#"..."#`
-        if c == "r" and (i == 0 or not _is_id_rest(src[i - 1])):
-            j = i + 1
-            hashes = 0
-            while j < n and src[j] == "#":
-                hashes += 1
-                j += 1
-            if j < n and src[j] == '"':
-                closer = '"' + ("#" * hashes)
-                end_idx = src.find(closer, j + 1)
-                if end_idx == -1:
-                    break
-                out.append(" " * (end_idx + len(closer) - i))
-                i = end_idx + len(closer)
-                cur_id = ""
-                after_builtin_interp = False
-                continue
-
-        if c == '"':
-            glued_bang = i > 0 and src[i - 1] == "!" and bool(cur_id)
-            if glued_bang or after_builtin_interp:
-                in_interp = True
-                after_builtin_interp = False
-                cur_id = ""
-                out.append(" ")
-                i += 1
-                continue
-            i += 1
-            out.append(" ")
-            while i < n:
-                if src[i] == "\\":
-                    out.append("  ")
-                    i += 2
-                elif src[i] == '"':
-                    out.append(" ")
-                    i += 1
-                    break
-                else:
-                    out.append(" ")
-                    i += 1
-            cur_id = ""
-            after_builtin_interp = False
-            continue
-
-        if c == "'" and (i == 0 or not _is_id_rest(src[i - 1])):
-            j = i + 1
-            if j < n and src[j] == "\\":
-                j += 2
-                while j < n and src[j] != "'":
-                    j += 1
-            else:
-                j += 1
-            if j < n and src[j] == "'":
-                out.append(" " * (j + 1 - i))
-                i = j + 1
-                continue
-
-        if _is_id_first(c) and not cur_id:
-            cur_id = c
-            after_builtin_interp = False
-        elif cur_id and _is_id_rest(c):
-            cur_id += c
-            after_builtin_interp = cur_id in BUILTIN_INTERP_PREFIXES
-        else:
-            if not c.isspace():
-                after_builtin_interp = False
-            cur_id = ""
-        out.append(c)
-        i += 1
-    return "".join(out)
-
-
 _DECIDE_NONKERNEL_FLAG_RE = re.compile(
-    r"(?<![A-Za-z0-9_'!?\.»])(?:decide|«decide»)(?:\s+\+kernel(?![A-Za-z0-9_'!?]))*\s+"
-    r"(?:-(?:[A-Za-z_\u00c0-\uffff]|«)"
-    r"|\+(?!kernel(?![A-Za-z0-9_'!?]))(?:[A-Za-z_\u00c0-\uffff]|«)"
-    r"|\(\s*(?:[A-Za-z_\u00c0-\uffff][A-Za-z0-9_'!?\u00c0-\uffff]*|«[^»]+»)\s*:=)"
+    r"(?<![A-Za-z0-9_'!?\.])(?:[0-9]+)?decide[!?]?(?:\s*\+kernel(?![A-Za-z0-9_'!?]))*\s*"
+    r"(?:-(?:[A-Za-z_\u00c0-\uffff])"
+    r"|\+(?!kernel(?![A-Za-z0-9_'!?]))(?:[A-Za-z_\u00c0-\uffff])"
+    r"|\(\s*[A-Za-z_\u00c0-\uffff][A-Za-z0-9_'!?\u00c0-\uffff]*\s*:=)"
 )
 
 
@@ -1245,7 +1177,7 @@ def scan_source_defense_in_depth(
     """
     role = classify_module_role_py(mod_name) or "spec"
     try:
-        code = lex_lean_source(src_text)
+        code, raw_code = _lex_lean_source_both(src_text)
     except ValueError as exc:
         raise AuditPolicyError("unsupportedSourceLexing", mod_name, str(exc)) from exc
 
@@ -1355,8 +1287,7 @@ def scan_source_defense_in_depth(
                 for t in toks
             ):
                 raise AuditPolicyError("forbiddenSourceOption", mod_name, "decide with a configuration")
-            stripped_code = _strip_comments_and_noninterp_strings(src_text)
-            if _DECIDE_NONKERNEL_FLAG_RE.search(stripped_code):
+            if _DECIDE_NONKERNEL_FLAG_RE.search(raw_code):
                 raise AuditPolicyError(
                     "forbiddenSourceOption", mod_name, "decide with non-kernel flag"
                 )
@@ -1507,33 +1438,43 @@ partial def whnfKeepParamWrappers (env : Environment) (fuel : Nat) (e : Expr) : 
         else whnfKeepParamWrappers env fuel' (hd.beta args)
       | _ => some e
 
-partial def extractCoeSrcAndTgt (env : Environment) (rawType : Expr) : Option (Expr × Expr) :=
-  let rec go (fuel : Nat) (cur : Expr) (lastExplicitDom? : Option Expr) : Option (Expr × Expr) :=
-    match fuel with
-    | 0 => none
-    | fuel' + 1 =>
-      match whnfKeepParamWrappers env 512 cur with
-      | none => none
-      | some curWhnf =>
-        match curWhnf with
-        | .forallE _ d b bi =>
-          match whnfKeepParamWrappers env 512 d with
-          | none => none
-          | some dWhnf =>
-            let isSynth := bi != .default ||
-              (match dWhnf.consumeMData.getAppFn with
-               | .const c _ => isParamWrapperConst c
-               | _ => false)
-            let nextDom? := if isSynth then lastExplicitDom? else some d
-            go fuel' b nextDom?
-        | cod =>
-          match lastExplicitDom? with
-          | none => none
-          | some rawSrc =>
-            match normExprInEnv env 1024 rawSrc, normExprInEnv env 1024 cod with
-            | some normSrc, some normCod => some (normSrc, normCod)
-            | _, _ => none
-  go 256 rawType none
+partial def extractCoeSrcAndTgtForInfo (env : Environment) (rawType : Expr)
+    (coercee numArgs : Nat) : Option (Expr × Expr) :=
+  if numArgs == 0 || coercee >= numArgs || numArgs != coercee + 1 then
+    none
+  else
+    let rec go (fuel : Nat) (idx : Nat) (cur : Expr) (explicitDoms : Array (Nat × Expr)) :
+        Option (Expr × Expr) :=
+      match fuel with
+      | 0 => none
+      | fuel' + 1 =>
+        match whnfKeepParamWrappers env 512 cur with
+        | none => none
+        | some curWhnf =>
+          match curWhnf with
+          | .forallE _ d b bi =>
+            match whnfKeepParamWrappers env 512 d with
+            | none => none
+            | some dWhnf =>
+              let isSynth := bi != .default ||
+                (match dWhnf.consumeMData.getAppFn with
+                 | .const c _ => isParamWrapperConst c
+                 | _ => false)
+              if idx < coercee && !isSynth then
+                none
+              else if idx == coercee && isSynth then
+                none
+              else
+                let nextExps := if isSynth then explicitDoms else explicitDoms.push (idx, d)
+                go fuel' (idx + 1) b nextExps
+          | cod =>
+            if explicitDoms.size != 1 || explicitDoms[0]!.1 != coercee then
+              none
+            else
+              match normExprInEnv env 1024 explicitDoms[0]!.2, normExprInEnv env 1024 cod with
+              | some normSrc, some normCod => some (normSrc, normCod)
+              | _, _ => none
+    go 256 0 rawType #[]
 
 partial def stripForallAndLam : Expr → Expr
   | .forallE _ _ b _ => stripForallAndLam b
@@ -1941,12 +1882,15 @@ def checkProvisionalNativeAxiomShape (env : Environment) (user axName : Name) (c
   return lhs
 
 /-- Runs AFTER `baseEnv.toKernelEnv.replay` succeeds so C++ `Lean.Kernel.whnf` never touches
-    unchecked or non-terminating forged `.defnInfo` declarations! -/
+    unchecked or non-terminating forged `.defnInfo` declarations!
+    Refutes `Bool.false`, non-convergent opaque chains, AND terms stuck on non-computable axioms
+    such as `Classical.choice` / `Classical.propDecidable` or non-stdlib constants. -/
 def refuteProvisionalNativeWithKernelWhnf (replayedEnv : Environment) (fullEnv : Environment)
     (user axName : Name) (lhs : Expr) : IO Unit := do
   let mut cur := lhs
-  for _ in [:8] do
-    let some expanded := unfoldOpaquesInExpr fullEnv 2048 cur
+  let mut converged := false
+  for _ in [:256] do
+    let some expanded := unfoldOpaquesInExpr fullEnv 4096 cur
       | policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom opaque unfolding exhausted budget"
     match Lean.Kernel.whnf replayedEnv {} expanded with
     | .error _ =>
@@ -1954,9 +1898,43 @@ def refuteProvisionalNativeWithKernelWhnf (replayedEnv : Environment) (fullEnv :
     | .ok next =>
       if next.consumeMData.isConstOf ``Bool.false then
         policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS reduces to Bool.false in kernel"
-      if next.consumeMData.isConstOf ``Bool.true || next == cur then
+      if next.consumeMData.isConstOf ``Bool.true then
+        converged := true
+        break
+      if next == cur then
+        let mut pending : List Name := next.getUsedConstantsAsSet.toList
+        let mut seen : NameSet := {}
+        while !pending.isEmpty do
+          let c := pending.head!
+          pending := pending.tail!
+          if !seen.contains c then
+            seen := seen.insert c
+            match fullEnv.getModuleIdxFor? c with
+            | some ciIdx =>
+              let cm := fullEnv.header.modules[ciIdx]!.module
+              if !isStdlibMod cm then
+                policyFail "invalidNativeAxiomType" axName #[user, axName, c]
+                  s!"native axiom LHS stuck on non-stdlib constant {c}"
+            | none =>
+              policyFail "invalidNativeAxiomType" axName #[user, axName, c]
+                s!"native axiom LHS stuck on unknown constant {c}"
+            match replayedEnv.checked.get.find? c with
+            | some (.axiomInfo _) =>
+              policyFail "invalidNativeAxiomType" axName #[user, axName, c]
+                s!"native axiom LHS stuck on non-computable axiom {c}"
+            | some (.defnInfo dv) =>
+              pending := dv.value.getUsedConstantsAsSet.toList ++ pending
+            | some (.opaqueInfo ov) =>
+              pending := ov.value.getUsedConstantsAsSet.toList ++ pending
+            | some (.thmInfo tv) =>
+              pending := tv.value.getUsedConstantsAsSet.toList ++ pending
+            | _ => pure ()
+        converged := true
         break
       cur := next
+  unless converged do
+    policyFail "invalidNativeAxiomType" axName #[user, axName]
+      "native axiom LHS opaque unfolding did not converge"
 
 def isCodegenUnsafeRec (byName : Std.HashMap Name ConstantInfo) (ci : ConstantInfo) : Bool :=
   match ci with
@@ -1972,18 +1950,31 @@ def isCodegenUnsafeRec (byName : Std.HashMap Name ConstantInfo) (ci : ConstantIn
       | _ => false
   | _ => false
 
-def isOutParamDomain (d : Expr) : Bool :=
-  let hd := (stripForallAndLam d).getAppFn
-  hd.isConstOf ``outParam || hd.isConstOf ``semiOutParam
+partial def isOutParamDomain (env : Environment) (fuel : Nat) (d : Expr) : Option Bool :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match whnfKeepParamWrappers env 512 d with
+    | none => none
+    | some dWhnf =>
+      match dWhnf with
+      | .forallE _ _ b _ => isOutParamDomain env fuel' b
+      | .lam _ _ b _ => isOutParamDomain env fuel' b
+      | .mdata _ inner => isOutParamDomain env fuel' inner
+      | _ =>
+        let hd := dWhnf.getAppFn.consumeMData
+        some (hd.isConstOf ``outParam || hd.isConstOf ``semiOutParam)
 
-def nonOutParamArgs (env : Environment) (cls : Name) (args : Array Expr) : Array Expr := Id.run do
+def nonOutParamArgs (env : Environment) (cls : Name) (args : Array Expr) : Option (Array Expr) := do
   let some ci := env.checked.get.find? cls | return args
   let mut curTy := ci.type
   let mut kept : Array Expr := #[]
   for i in [:args.size] do
-    match curTy with
+    let some tyWhnf := whnfKeepParamWrappers env 512 curTy | none
+    match tyWhnf with
     | .forallE _ dom body _ =>
-      if !isOutParamDomain dom then
+      let some isOut := isOutParamDomain env 64 dom | none
+      if !isOut then
         kept := kept.push args[i]!
       curTy := body.instantiate1 args[i]!
     | _ =>
@@ -2022,23 +2013,36 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
     | _ => false
   | _ => false
 
-def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo) (instDecl cls : Name)
-    (args : Array Expr) : Bool :=
-  if cls != ``SizeOf || args.size != 1 then false
-  else match instDecl with
-    | .str indName "_sizeOf_inst" =>
-      match byName[indName]? with
-      | some (.inductInfo iv) =>
-        match normExprInEnv env 256 iv.type with
-        | none => false
-        | some normIvTy =>
-          let nonPropInd := (stripForallAndLam normIvTy).consumeMData != .sort .zero
-          let a0 := args[0]!.consumeMData
-          let aArgs := a0.getAppArgs
-          nonPropInd && a0.getAppFn.isConstOf indName &&
-            aArgs.size == iv.numParams + iv.numIndices &&
-            aArgs.all (fun x => x.consumeMData.isBVar)
-      | _ => false
+def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo)
+    (ci : ConstantInfo) (prio : Nat) (cls : Name) (args : Array Expr) : Bool :=
+  if cls != ``SizeOf || args.size != 1 || prio != eval_prio default then false
+  else match ci with
+    | .defnInfo dv =>
+      if dv.safety != .safe || dv.hints != .abbrev then false
+      else match ci.name with
+        | .str indName "_sizeOf_inst" =>
+          match byName[indName]? with
+          | some (.inductInfo iv) =>
+            if dv.levelParams != iv.levelParams then false
+            else match normExprInEnv env 256 iv.type with
+              | none => false
+              | some normIvTy =>
+                let isNeverPropInd := match (stripForallAndLam normIvTy).consumeMData with
+                  | .sort lvl => lvl.isNeverZero
+                  | _ => false
+                let valHead := (stripForallAndLam dv.value).consumeMData.getAppFn
+                let a0 := args[0]!.consumeMData
+                let aArgs := a0.getAppArgs
+                let distinctBVars := aArgs.foldl (init := (#[] : Array Nat)) fun acc x =>
+                  match x.consumeMData with
+                  | .bvar k => if acc.contains k then acc else acc.push k
+                  | _ => acc
+                isNeverPropInd && valHead.isConstOf ``SizeOf.mk &&
+                  a0.getAppFn.isConstOf indName &&
+                  aArgs.size == iv.numParams + iv.numIndices &&
+                  distinctBVars.size == aArgs.size
+          | _ => false
+        | _ => false
     | _ => false
 
 def verifyCertificateHead (headConst : Expr) : Bool :=
@@ -2063,13 +2067,30 @@ def insertReplayLocalUnique (env : Environment) (m : Name)
 
 def forbiddenRawExtSubstrings : List String := [
   "macro", "Elab", "elab", "delab", "unexpander", "simproc", "Simproc",
+  "sevalproc", "Sevalproc", "cbvSimproc", "CbvSimproc", "symSimproc", "SymSimproc",
+  "symDischarger", "SymDischarger",
   "unif_hint", "unificationHint", "UnificationHint", "parserExtension",
-  "cbvEval", "cbvOpaque", "tryAttr", "TryAttr", "grindTac"
+  "cbvEval", "cbvOpaque", "tryAttr", "TryAttr", "grindTac",
+  "userWidget", "UserWidget", "widget", "Widget",
+  "librarySuggestions", "LibrarySuggestions", "selectorExt",
+  "envLinter", "EnvLinter", "codeQuality", "CodeQuality",
+  "missingDocs", "MissingDocs", "unusedVariables", "UnusedVariables",
+  "codeSuggestions", "codeBlockSuggestions", "docRole", "deriving", "Deriving"
 ]
 
 def forbiddenRawCodegenSubstrings : List String := [
-  "CSimp", "csimp", "passManagerExt", "cpass",
+  "CSimp", "csimp", "passManagerExt", "cpass", "folderExt", "metaExt",
+  "borrowedAttr", "neverExtract",
   "regularInitAttr", "builtinInitAttr", "implementedByAttr", "externAttr", "exportAttr"
+]
+
+def forbiddenIrOnlyExtNames : List Name := [
+  `Lean.aliasExtension,
+  `Lean.Meta.instanceExtension,
+  `Lean.Meta.defaultInstanceExtension,
+  `Lean.Meta.coeExt,
+  `reducibilityCore,
+  `reducibilityExtra
 ]
 
 def checkRawForbiddenEntries (m : Name) (entries : Array (Name × Array EnvExtensionEntry)) : IO Unit := do
@@ -2084,6 +2105,14 @@ def checkRawForbiddenEntries (m : Name) (entries : Array (Name × Array EnvExten
         if forbiddenRawExtSubstrings.any (fun sub => (es.splitOn sub).length > 1) then
           policyFail "forbiddenMacroOrElab" m #[m, extName] es
 
+def checkIrPartForbiddenEntries (m : Name) (entries : Array (Name × Array EnvExtensionEntry)) : IO Unit := do
+  checkRawForbiddenEntries m entries
+  for (extName, rawArr) in entries do
+    if !rawArr.isEmpty then
+      if forbiddenIrOnlyExtNames.contains extName then
+        policyFail "keyNameMismatch" m #[m, extName]
+          s!"split-brain .ir/.ir.sig contains non-IR extension {extName}"
+
 def isValidSubPartConstant (ci privCi : ConstantInfo) : Bool :=
   if sameStoredDecl ci privCi then true
   else match ci with
@@ -2097,6 +2126,9 @@ def isValidSubPartConstant (ci privCi : ConstantInfo) : Bool :=
 
 def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : ModuleData)
     (privByName : Std.HashMap Name ConstantInfo) : IO Unit := do
+  unless part.isModule && priv.isModule do
+    policyFail "keyNameMismatch" modName #[modName]
+      s!"split-brain isModule flag mismatch between {partLabel} ({part.isModule}) and .olean.private ({priv.isModule})"
   unless part.imports == priv.imports do
     policyFail "foreignImport" modName #[modName]
       s!"split-brain imports mismatch between {partLabel} and .olean.private"
@@ -2234,12 +2266,12 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
 
   let coes := Meta.coeExt.ext.getModuleEntries checkEnv idx (level := extLevel)
   for ce in coes do
-    let decl := match ce with | .global (n, _) => n | .scoped _ (n, _) => n
+    let (decl, coeInfo) := match ce with | .global p => p | .scoped _ p => p
     unless role == "defsExempt" && localReplayable.contains decl do
       policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
     let some ci := byName[decl]?
       | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
-    let some (srcTy, tgtTy) := extractCoeSrcAndTgt normEnv ci.type
+    let some (srcTy, tgtTy) := extractCoeSrcAndTgtForInfo normEnv ci.type coeInfo.coercee coeInfo.numArgs
       | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe_between_imported_types"
     unless hasRigidBaseAnchor normEnv localReplayable localRedOver byName srcTy ||
            hasRigidBaseAnchor normEnv localReplayable localRedOver byName tgtTy do
@@ -2277,14 +2309,15 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
       let .const cls _ := normConcl.getAppFn
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
       let allArgs := normConcl.getAppArgs
-      if isAutoSizeOfInst normEnv byName dName cls allArgs then
+      if isAutoSizeOfInst normEnv byName ci ie.priority cls allArgs then
         pure ()
       else if isBaseInstanceAnchor localReplayable localRedOver byName cls then
         pure ()
       else
         if role == "proof" || role == "verify" || (strictProofs && role != "defsExempt") then
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "instance_of_imported_class"
-        let inputArgs := nonOutParamArgs normEnv cls allArgs
+        let some inputArgs := nonOutParamArgs normEnv cls allArgs
+          | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
         unless inputArgs.any (hasRigidBaseAnchor normEnv localReplayable localRedOver byName) do
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
 
@@ -2385,11 +2418,11 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
       verifyPartKeysOnly modName server.1
       let _ ← verifyModuleInventory modName priv.1
       allTargetsImportInit := allTargetsImportInit &&
-        priv.1.imports.any (fun imp => cachedInitMods.contains imp.module)
+        priv.1.imports.any (fun imp => imp.module == `Init)
     else
       let _ ← verifyModuleInventory modName main.1
       allTargetsImportInit := allTargetsImportInit &&
-        main.1.imports.any (fun imp => cachedInitMods.contains imp.module)
+        main.1.imports.any (fun imp => imp.module == `Init)
 
   -- 2. Import environment strictly with `loadExts := false` (ZERO initializer execution!)
   --    Reusing `cachedInitState?` avoids re-mapping ~300 MB of `Init` `CompactedRegion`s per item!
@@ -2498,23 +2531,33 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         extraConsts := extraConsts ++ serverPart.1.extraConstNames ++ privPart.1.extraConstNames
         publicNamesMap := publicNamesMap.insert m (NameSet.ofArray mainPart.1.constNames)
       let irSigFile := oleanPath.withExtension "ir.sig"
-      if (← irSigFile.pathExists) then
+      let irFile := oleanPath.withExtension "ir"
+      let hasIrSig ← irSigFile.pathExists
+      let hasIr ← irFile.pathExists
+      if hasIrSig != hasIr then
+        policyFail "missingOleanPart" m #[m]
+          s!"unpaired IR artifact ({irSigFile} exists={hasIrSig}, {irFile} exists={hasIr})"
+      if hasIrSig && hasIr then
         let irSigPart ← try
           unsafe CompactedRegion.read (α := ModuleData) irSigFile #[]
         catch ex =>
           opFail s!"failed deserializing .ir.sig {irSigFile}: {ex}"
         verifyPartAux m irSigPart.1
+        unless irSigPart.1.constNames.isEmpty && irSigPart.1.constants.isEmpty do
+          policyFail "keyNameMismatch" m #[m] "split-brain .ir.sig contains unexpected kernel constants"
+        checkIrPartForbiddenEntries m irSigPart.1.entries
         extraEntries := extraEntries ++ irSigPart.1.entries
         extraConsts := extraConsts ++ irSigPart.1.extraConstNames
-        let irFile := oleanPath.withExtension "ir"
-        if (← irFile.pathExists) then
-          let irPart ← try
-            unsafe CompactedRegion.read (α := ModuleData) irFile #[irSigPart.2]
-          catch ex =>
-            opFail s!"failed deserializing .ir {irFile}: {ex}"
-          verifyPartAux m irPart.1
-          extraEntries := extraEntries ++ irPart.1.entries
-          extraConsts := extraConsts ++ irPart.1.extraConstNames
+        let irPart ← try
+          unsafe CompactedRegion.read (α := ModuleData) irFile #[irSigPart.2]
+        catch ex =>
+          opFail s!"failed deserializing .ir {irFile}: {ex}"
+        verifyPartAux m irPart.1
+        unless irPart.1.constNames.isEmpty && irPart.1.constants.isEmpty do
+          policyFail "keyNameMismatch" m #[m] "split-brain .ir contains unexpected kernel constants"
+        checkIrPartForbiddenEntries m irPart.1.entries
+        extraEntries := extraEntries ++ irPart.1.entries
+        extraConsts := extraConsts ++ irPart.1.extraConstNames
       extraPartEntriesMap := extraPartEntriesMap.insert m extraEntries
       extraPartConstsMap := extraPartConstsMap.insert m extraConsts
       auditedSet := auditedSet.insert m
@@ -2535,6 +2578,7 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
   let mut modIdxMap : Std.HashMap Name Nat := {}
   let mut realDeclOwner : Std.HashMap Name Name := {}
   let mut replayLocals : Std.HashMap Name ConstantInfo := {}
+  let mut excusedUnsafeRecs : Std.HashMap Name (Name × DefinitionVal) := {}
   let mut crossDecls : Std.HashMap Name (Name × ConstantInfo) := {}
   let mut auditedIndices : Array Nat := #[]
 
@@ -2575,6 +2619,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
               "stored declaration differs from inventory copy"
         if !isCodegenUnsafeRec byName ci then
           replayLocals ← insertReplayLocalUnique env m replayLocals ci
+        else if let .defnInfo dv := ci then
+          excusedUnsafeRecs := excusedUnsafeRecs.insert ci.name (m, dv)
       let allExtras := d.extraConstNames ++ (extraPartConstsMap[m]?.getD #[])
       for extra in allExtras do
         if let some owner := realDeclOwner[extra]? then
@@ -2706,6 +2752,9 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "forbiddenImportModifier" m #[m, imp.module] "meta"
       if !isWellFormedName imp.module || isLeanCompilerMod imp.module || !seenModNames.contains imp.module then
         policyFail "foreignImport" m #[m, imp.module] s!"foreign or disallowed import {imp.module}"
+      if d.isModule && auditedSet.contains imp.module && !moduleFlaggedSet.contains imp.module then
+        policyFail "foreignImport" m #[m, imp.module]
+          s!"module-mode {m} cannot import non-module {imp.module}"
       let impRole := modRoles[imp.module]?.getD "spec"
       unless importRoleAllowed role impRole do
         policyFail "forbiddenImportDirection" m #[m, imp.module] s!"{role} -> {impRole}"
@@ -2722,6 +2771,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           let msg := ex.toString
           if (msg.splitOn "already contains").length > 1 then
             policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
+          if (msg.splitOn "cannot import non-").length > 1 then
+            policyFail "foreignImport" m #[m] msg
           opFail s!"exported-level importModules failed: {msg}"
         if let some (n, ciName) := findKeyMismatch (expE.setExporting true).constants then
           policyFail "keyNameMismatch" n #[n, ciName] s!"exported public SMap key {n} != ci.name {ciName}"
@@ -2736,6 +2787,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           let msg := ex.toString
           if (msg.splitOn "already contains").length > 1 then
             policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
+          if (msg.splitOn "cannot import non-").length > 1 then
+            policyFail "foreignImport" m #[m] msg
           opFail s!"server-level importModules failed: {msg}"
         let mut srvMap : Std.HashMap Name Nat := {}
         for h : i in [:srvE.header.modules.size] do
@@ -3030,6 +3083,27 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     baseEnv.toKernelEnv.replay replayLocals
   catch ex =>
     policyFail "kernelTypeError" targetMods[0]! #[targetMods[0]!] ex.toString
+
+  -- 8b. Kernel-typecheck every excused `_unsafe_rec` companion via disposable `.mutualDefnDecl`
+  --     so ill-typed forged `_unsafe_rec` bodies (e.g. `safeFn._unsafe_rec : Nat := True.intro`)
+  --     are caught by the kernel without polluting `replayedKEnv`!
+  let mut checkedUR : NameSet := {}
+  for (urName, (urMod, dv)) in excusedUnsafeRecs.toList do
+    if !checkedUR.contains urName then
+      let mut grp : List DefinitionVal := []
+      for peerName in dv.all do
+        checkedUR := checkedUR.insert peerName
+        match excusedUnsafeRecs[peerName]? with
+        | some (_, peerDv) => grp := grp ++ [peerDv]
+        | none =>
+          policyFail "unsafeOrPartialDecl" urMod #[urMod, urName, peerName]
+            s!"excused _unsafe_rec {urName} lists non-excused mutual peer {peerName}"
+      match replayedKEnv.addDeclCore 0 0 (.mutualDefnDecl grp) (cancelTk? := none) with
+      | .ok _ => pure ()
+      | .error ex =>
+        let msg ← ex.toMessageData {} |>.toString
+        policyFail "kernelTypeError" urMod #[urMod, urName]
+          s!"ill-typed _unsafe_rec {urName}: {msg}"
 
   -- 9. Post-Replay Kernel WHNF Refutation of Provisional Native Axioms
   --    (strictly AFTER `replay` succeeds so `Lean.Kernel.whnf` never touches unchecked/cyclic defs!)
@@ -3582,6 +3656,61 @@ def main (args : List String) : IO UInt32 := do
     entries := #[]
   }
 
+  -- 06d_native_classical_false: forged provisional native axiom proving `False` via `Classical.propDecidable`!
+  let axName06d := `Proof.Tamper06NatClassical.f._native.decide.ax_1
+  let decFalse06d := mkApp2 (mkConst ``decide) (mkConst ``False)
+    (mkApp (mkConst ``Classical.propDecidable) (mkConst ``False))
+  let axCi06d : ConstantInfo := .axiomInfo {
+    name := axName06d
+    levelParams := []
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) decFalse06d (mkConst ``Bool.true)
+    isUnsafe := false
+  }
+  let boom06d : ConstantInfo := .thmInfo {
+    name := `Proof.Tamper06NatClassical.boom
+    levelParams := []
+    type := mkConst ``False
+    value := mkApp3 (mkConst ``of_decide_eq_true) (mkConst ``False)
+      (mkApp (mkConst ``Classical.propDecidable) (mkConst ``False)) (mkConst axName06d)
+    all := [`Proof.Tamper06NatClassical.boom]
+  }
+  writeOlean (outDir / "06d_native_classical") `Proof.Tamper06NatClassical {
+    isModule := false
+    imports := #[{ module := `Init }]
+    constNames := #[axName06d, `Proof.Tamper06NatClassical.boom]
+    constants := #[axCi06d, boom06d]
+    extraConstNames := #[]
+    entries := #[]
+  }
+
+  -- 13e_forged_unsafe_rec_ill_typed: forged `_unsafe_rec` matching parent type `Nat` but with ill-typed body `True.intro`!
+  let safeParent4 : ConstantInfo := .defnInfo {
+    name := `Proof.Tamper13UnsafeRecIll.safeFn
+    levelParams := []
+    type := mkConst ``Nat
+    value := mkConst ``Nat.zero
+    hints := .opaque
+    safety := .safe
+    all := [`Proof.Tamper13UnsafeRecIll.safeFn]
+  }
+  let badUnsafeRecIll : ConstantInfo := .defnInfo {
+    name := `Proof.Tamper13UnsafeRecIll.safeFn._unsafe_rec
+    levelParams := []
+    type := mkConst ``Nat
+    value := mkConst ``True.intro
+    hints := .opaque
+    safety := .partial
+    all := [`Proof.Tamper13UnsafeRecIll.safeFn._unsafe_rec]
+  }
+  writeOlean (outDir / "13e_forged_unsafe_rec_ill") `Proof.Tamper13UnsafeRecIll {
+    isModule := false
+    imports := #[{ module := `Init }]
+    constNames := #[`Proof.Tamper13UnsafeRecIll.safeFn, `Proof.Tamper13UnsafeRecIll.safeFn._unsafe_rec]
+    constants := #[safeParent4, badUnsafeRecIll]
+    extraConstNames := #[]
+    entries := #[]
+  }
+
   return 0
 """
 
@@ -3746,7 +3875,7 @@ def resolve_source_map_arg(
             stat_regular_fail_closed(p)
             try:
                 raw_txt = p.read_text(encoding="utf-8")
-            except OSError as exc:
+            except (OSError, UnicodeDecodeError) as exc:
                 raise AuditOperationalError(f"cannot read --source-map {p}: {exc}") from exc
             raw = _parse_unique_json_object(raw_txt, p)
             if not all(isinstance(k, str) and isinstance(v, str) for k, v in raw.items()):
@@ -4054,7 +4183,12 @@ def _finalize_audit_case(
                 src_path = eff_sources[mod]
                 if stat_regular_fail_closed(src_path) is None:
                     raise AuditPolicyError("missingSourceText", mod, f"missing source {src_path}")
-                text = src_path.read_text(encoding="utf-8")
+                try:
+                    text = src_path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as exc:
+                    raise AuditOperationalError(
+                        f"cannot read source file {src_path} for {mod}: {exc}"
+                    ) from exc
                 scan_source_defense_in_depth(
                     mod,
                     text,
@@ -4796,6 +4930,7 @@ def run_tamper_suite(
             ("subcheck_13b_forged_unsafe_rec_type", "Proof.Tamper13UnsafeRec", forged_root / "13b_forged_unsafe_rec_type", "unsafeOrPartialDecl"),
             ("subcheck_13c_forged_unsafe_rec_sorry", "Proof.Tamper13UnsafeRecSorry", forged_root / "13c_forged_unsafe_rec_sorry", "forbiddenAxiom"),
             ("subcheck_13d_forged_unsafe_rec_level_params", "Proof.Tamper13UnsafeRecLvl", forged_root / "13d_forged_unsafe_rec_lvl", "unsafeOrPartialDecl"),
+            ("subcheck_13e_forged_unsafe_rec_ill_typed", "Proof.Tamper13UnsafeRecIll", forged_root / "13e_forged_unsafe_rec_ill", "kernelTypeError"),
             ("subcheck_18b_key_aligned_induct_all", "Proof.Tamper18Aligned", forged_root / "18b_aligned_induct_all", "invalidMutualAll"),
             ("subcheck_18c_foreign_quot_decl", "Proof.Tamper18Quot", forged_root / "18c_foreign_quot", "foreignQuotDecl"),
             ("subcheck_18e_asymmetric_mutual_all", "Proof.LowmemMutual18d", forged_root / "18e_asymmetric_mutual_all", "invalidMutualAll"),
@@ -4843,7 +4978,7 @@ def run_tamper_suite(
                 )
             )
 
-        # `06c`: Kernel-refuted provisional native axiom `@Eq Bool (Bool.not Bool.true) Bool.true`
+        # `06c` & `06d`: Kernel-refuted provisional native axioms (`Bool.not Bool.true` and `Classical.propDecidable False`)
         batched_specs.append(
             (
                 "subcheck_06c_provisional_refutes_bool_not_true",
@@ -4853,6 +4988,20 @@ def run_tamper_suite(
                 {
                     "target_modules": ["Proof.Tamper06NativeNot"],
                     "olean_dirs": [forged_root / "06c_native_not"],
+                    "allow_provisional_native": True,
+                    "strict_proofs": True,
+                },
+            )
+        )
+        batched_specs.append(
+            (
+                "subcheck_06d_provisional_rejects_classical_false",
+                False,
+                "invalidNativeAxiomType",
+                False,
+                {
+                    "target_modules": ["Proof.Tamper06NatClassical"],
+                    "olean_dirs": [forged_root / "06d_native_classical"],
                     "allow_provisional_native": True,
                     "strict_proofs": True,
                 },
