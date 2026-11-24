@@ -4804,5 +4804,176 @@ class GuardMutationTaxonomyAndWildcardTests(unittest.TestCase):
         self.assertTrue(all(f["guard_id"] == "error_branch_wildcard" for f in live["findings"]))
 
 
+class GuardMutationEp2B1AdversarialTests(unittest.TestCase):
+    """Pass B1 adversarial regressions for taxonomy parsing and the wildcard probe."""
+
+    RUST_REL = "crates/cargo-anneal/src/property_registry.rs"
+    LEAN_REL = "theory/Anneal/SpecBoundaryGuards.lean"
+
+    def _stage(self, root: Path, rel: str, old: str | None = None, new: str = "") -> None:
+        text = (ANNEAL_ROOT / rel).read_text(encoding="utf-8")
+        if old is not None:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [f.pattern for f in gmut.detect_postcondition_error_wildcards(source, language=language)]
+
+    def test_rust_block_arm_without_comma_and_struct_slice_at_patterns(self) -> None:
+        # Rust block-bodied error arm followed by another arm without comma (`rustfmt` default).
+        no_comma = (
+            "match out {\n"
+            "    Err(_) => {\n"
+            "        true\n"
+            "    }\n"
+            "    Ok(v) => *v == x + 1,\n"
+            "}"
+        )
+        self.assertEqual(self._patterns(no_comma, "rust"), ["err_arm_true"])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(no_comma, "err", language="rust")["status"],
+            "SURVIVED",
+        )
+        for source, expected in (
+            ("match w { W { r: Err(_) } => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Err { .. } => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Outcome::Err { msg: _ } => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, e @ (Err(_)) => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, &(Err(_)) => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Err(e @ _) => true }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, e @ _ => true }", "catch_all_arm_true"),
+            ("match out { Ok(v) => *v == 1, (0 | _) => true }", "catch_all_arm_true"),
+            ("match arr { [_, Err(_)] => true, _ => false }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Err(_) => { return true; false } }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Err(_) => if true { true } else { false } }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Err(_) => !cond == !cond }", "err_arm_true"),
+            ("match out { Ok(v) => *v == 1, Outcome::Fail(_) => true }", "ub_arm_true"),
+            ('let _ = cr#"Err(_) => true"#; match out { Ok(v) => *v == 1, Err(_) => true }', "err_arm_true"),
+        ):
+            self.assertEqual(self._patterns(source, "rust"), [expected], source)
+
+        # Early-return guard inside a Rust block must NOT be misclassified as constant truth.
+        guarded_block = (
+            "match out {\n"
+            "    Ok(v) => *v == x + 1,\n"
+            "    Err(e) => { if *e != E::Overflow { return false; }; true },\n"
+            "}"
+        )
+        self.assertEqual(self._patterns(guarded_block, "rust"), [])
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(guarded_block, "err", language="rust")["status"],
+            "KILLED",
+        )
+        # C raw string hiding a fake arm must NOT trigger a finding.
+        self.assertEqual(
+            self._patterns('let s = cr#"Err(_) => true"#; match out { Err(_) => false }', "rust"),
+            [],
+        )
+
+    def test_lean_records_angle_tuples_let_quantifiers_dedent_and_multi_match_scopes(self) -> None:
+        for source, expected in (
+            ("| ⟨_, .ub⟩ => True", "ub_arm_true"),
+            ("| { val := .err _ } => True", "err_arm_true"),
+            ("| .ub => Bool.true", "ub_arm_true"),
+            ("| .ub => ∀ _ : Nat, True", "ub_arm_true"),
+            ("| .ub => forall x, x = x", "ub_arm_true"),
+            ("| .ub => (x) = x", "ub_arm_true"),
+            ("| .ub => if true then True else False", "ub_arm_true"),
+            ("| .ub => by exact True.intro", "ub_arm_true"),
+            ("| .ub => by constructor", "ub_arm_true"),
+            ("| .ub => let _ := 0; True", "ub_arm_true"),
+            ("match out with\n| .ok v => v = 1\n| .ub =>\nTrue\n", "ub_arm_true"),
+            ("-- note //\nmatch out with .ub => trivial", "ub_arm_true"),
+            ("-- let ok\nmatch out with Err _ => trivial", "err_arm_true"),
+        ):
+            self.assertEqual(self._patterns(source), [expected], source)
+
+        # Unclosed Lean guillemet fails closed.
+        self.assertEqual(self._patterns("def «unclosed := match out with | .ub => False", "lean"), ["unclosed_literal_or_comment"])
+
+        # Lean `¬ x = x` is `¬ (x = x)` = False, not True.
+        self.assertEqual(self._patterns("| .ub => ¬ x = x", "lean"), [])
+
+        # Two sequential `match` expressions in one Lean `def` must not mask each other!
+        two_matches = (
+            "def post (other out : Outcome Nat) : Prop :=\n"
+            "  let helper := match other with\n"
+            "    | .ub => False\n"
+            "    | _ => True\n"
+            "  match out with\n"
+            "  | .ok v => v = 1\n"
+            "  | .ub => True\n"
+        )
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(two_matches, "ub", language="lean")["status"],
+            "SURVIVED",
+        )
+        self.assertFalse(gmut.verify_postcondition_kills_error_mutants(two_matches, language="lean")["ok"])
+
+        # Separate `match` on a non-outcome must not inherit `ok_groups` from an earlier `match out`.
+        separate_ok = (
+            "def post (x : Nat) (out : Outcome Nat) : Prop :=\n"
+            "  let a := match out with\n"
+            "    | .ok v => v = 1\n"
+            "    | .ub => False\n"
+            "  match x with\n"
+            "  | 0 => True\n"
+            "  | _ => True\n"
+        )
+        self.assertEqual(self._patterns(separate_ok, "lean"), [])
+
+    def test_taxonomy_parser_blocks_extra_statements_extra_lean_ctors_and_empty_root(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-b1-") as tmp:
+            # Sneaky extra waiver call in `for_partial_correctness` without `PropertyDisposition::`.
+            r1 = Path(tmp) / "sneaky_partial"
+            self._stage(
+                r1,
+                self.RUST_REL,
+                "        reg\n    }\n\n    /// Select the canonical",
+                "        reg.waive(PropertyClass::DivRemUb);\n        reg\n    }\n\n    /// Select the canonical",
+            )
+            errs = gmut.validate_property_taxonomy(r1)
+            self.assertTrue(any("for_partial_correctness" in e for e in errs), errs)
+
+            # Extra Lean constructor with parameters after the 12 nullary constructors.
+            r2 = Path(tmp) / "extra_lean_ctor"
+            self._stage(
+                r2,
+                self.LEAN_REL,
+                "  | unsupportedFallback\n  deriving DecidableEq",
+                "  | unsupportedFallback\n  | extra (n : Nat)\n  deriving DecidableEq",
+            )
+            errs2 = gmut.validate_property_taxonomy(r2)
+            self.assertTrue(any("constructor this parser cannot read" in e for e in errs2), errs2)
+
+            # `--taxonomy-json` pointed at an empty directory must fail closed (not print manifest).
+            empty = Path(tmp) / "empty"
+            empty.mkdir()
+            res = _run_cli(["--taxonomy-json", "--anneal-root", str(empty)])
+            self.assertEqual(res.returncode, 1)
+            self.assertEqual(res.stdout, "")
+            self.assertIn("cannot read", res.stderr)
+
+            # `--check-spec-wildcards` rejects FIFO without blocking and emits consistent JSON on sink error.
+            fifo = Path(tmp) / "pipe.lean"
+            os.mkfifo(fifo)
+            res_fifo = _run_cli(["--check-spec-wildcards", str(fifo), "--json"])
+            self.assertEqual(res_fifo.returncode, 1)
+            self.assertFalse(json.loads(res_fifo.stdout)["ok"])
+
+            clean = Path(tmp) / "clean.lean"
+            clean.write_text("| .ub => False\n", encoding="utf-8")
+            blocked = _run_cli(
+                ["--check-spec-wildcards", str(clean), "--json", "--json-out", str(clean / "x.json")]
+            )
+            self.assertEqual(blocked.returncode, 1)
+            blocked_json = json.loads(blocked.stdout)
+            self.assertFalse(blocked_json["ok"])
+            self.assertIsNotNone(blocked_json["fatal_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

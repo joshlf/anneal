@@ -119,6 +119,7 @@ from pathlib import Path
 import re
 import stat
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -358,11 +359,21 @@ def _opt_bool(obj: dict[str, object], key: str, source: str) -> bool | None:
     return value  # type: ignore[return-value]
 
 
-def _opt_str(obj: dict[str, object], key: str, source: str) -> str | None:
+def _opt_str(obj: dict[str, object], key: str, source: str, *, allow_empty: bool = True) -> str | None:
     value = obj.get(key)
-    if value is not None and not isinstance(value, str):
-        raise _bad(source, f"`{key}` must be a string, got {value!r}")
+    if value is not None and (not isinstance(value, str) or (not allow_empty and not value.strip())):
+        kind = "a string" if allow_empty else "a non-empty string"
+        raise _bad(source, f"`{key}` must be {kind}, got {value!r}")
     return value  # type: ignore[return-value]
+
+
+def _opt_nonneg_num(obj: dict[str, object], key: str, source: str) -> float | None:
+    value = obj.get(key)
+    if value is None:
+        return None
+    if type(value) not in (int, float) or value < 0 or value != value or value == float("inf"):
+        raise _bad(source, f"`{key}` must be a non-negative finite number, got {value!r}")
+    return float(value)
 
 
 def _axioms(value: object, source: str) -> tuple[str, ...] | None:
@@ -383,10 +394,11 @@ def _receipt_sha(value: object, source: str, key: str) -> str | None:
     return value
 
 
-def _canonical_step(obj: object, source: str) -> tuple[Step, str | None]:
+def _canonical_step(obj: object, source: str, *, allow_schema: bool = False) -> tuple[Step, str | None]:
     if not isinstance(obj, dict):
         raise _bad(source, "a step must be a JSON object")
-    unknown = sorted(set(obj) - _CANONICAL_STEP_KEYS - {"schema"})
+    allowed_keys = _CANONICAL_STEP_KEYS | ({"schema"} if allow_schema else set())
+    unknown = sorted(set(obj) - allowed_keys)
     if unknown:
         raise _bad(source, f"unknown step key(s) {unknown}")
     step_id = obj.get("step_id")
@@ -397,6 +409,10 @@ def _canonical_step(obj: object, source: str) -> tuple[Step, str | None]:
     exit_code = _opt_int(obj, "exit_code", where, minimum=None)
     if returncode is not None and exit_code is not None and returncode != exit_code:
         raise _bad(where, "`returncode` and `exit_code` disagree", "INCONSISTENT_RECEIPT")
+    _opt_nonneg_num(obj, "duration_sec", where)
+    artifacts = obj.get("artifacts")
+    if artifacts is not None and not isinstance(artifacts, (list, dict)):
+        raise _bad(where, f"`artifacts` must be a list or object, got {artifacts!r}")
     step = Step(
         step_id=step_id,
         kind="canonical",
@@ -404,13 +420,24 @@ def _canonical_step(obj: object, source: str) -> tuple[Step, str | None]:
         command=_opt_str(obj, "command", where),
         returncode=returncode if returncode is not None else exit_code,
         ok=_opt_bool(obj, "ok", where),
-        fatal_error=_opt_str(obj, "fatal_error", where),
+        fatal_error=_opt_str(obj, "fatal_error", where, allow_empty=False),
         axioms=_axioms(obj.get("axioms"), where),
     )
     for key, metric in _CANONICAL_COUNT_KEYS.items():
         value = _opt_int(obj, key, where)
         if value is not None:
             step.counts[metric] = value
+    if "total" in step.counts:
+        total = step.counts["total"]
+        parts = [step.counts[k] for k in ("killed", "survived", "errors") if k in step.counts]
+        if parts and sum(parts) > total:
+            raise _bad(where, "guard-mutation counts exceed `total`", "INCONSISTENT_RECEIPT")
+        if (
+            step.fatal_error is None
+            and all(k in step.counts for k in ("killed", "survived", "errors"))
+            and sum(parts) != total
+        ):
+            raise _bad(where, "`killed + survived + errors` disagrees with `total`", "INCONSISTENT_RECEIPT")
     if step.returncode is None and step.ok is None:
         raise _bad(where, "a step needs `returncode`, `exit_code` or `ok`")
     failure = Step(**{**step.__dict__, "ok": None}).failure()
@@ -421,9 +448,9 @@ def _canonical_step(obj: object, source: str) -> tuple[Step, str | None]:
     return step, _receipt_sha(obj.get("commit_sha"), where, "commit_sha")
 
 
-def _guard_mutation_step(obj: dict[str, object], step_id: str, source: str) -> Step:
+def _guard_mutation_step(obj: dict[str, object], step_id: str, source: str) -> tuple[Step, str | None]:
     ok = _opt_bool(obj, "ok", source)
-    fatal = _opt_str(obj, "fatal_error", source)
+    fatal = _opt_str(obj, "fatal_error", source, allow_empty=False)
     counts = {key: _opt_int(obj, key, source) for key in ("total", "killed", "survived", "errors")}
     results = obj.get("results")
     if ok is None or None in counts.values() or not isinstance(results, list):
@@ -440,10 +467,22 @@ def _guard_mutation_step(obj: dict[str, object], step_id: str, source: str) -> S
         or (tally["KILLED"], tally["SURVIVED"], tally["ERROR"]) != (killed, survived, errors)
     ):
         raise _bad(source, "guard-mutation counts contradict `results`", "INCONSISTENT_RECEIPT")
+    kill_rate = _opt_nonneg_num(obj, "kill_rate_pct", source)
+    if kill_rate is not None:
+        if kill_rate > 100.0:
+            raise _bad(source, f"`kill_rate_pct` exceeds 100: {kill_rate}", "INCONSISTENT_RECEIPT")
+        if fatal is None and total:
+            expected_rate = round(100.0 * killed / total, 2)  # type: ignore[operator]
+            if abs(kill_rate - expected_rate) > 0.01 or (kill_rate >= 100.0 and killed < total):  # type: ignore[operator]
+                raise _bad(
+                    source,
+                    f"`kill_rate_pct` ({kill_rate}) contradicts {killed}/{total}",
+                    "INCONSISTENT_RECEIPT",
+                )
     expected_ok = fatal is None and total > 0 and killed == total and not survived and not errors  # type: ignore[operator]
     if ok != expected_ok:
         raise _bad(source, f"`ok` is {ok} but the counts say {expected_ok}", "INCONSISTENT_RECEIPT")
-    return Step(
+    step = Step(
         step_id=step_id,
         kind="guard_mutation",
         source=source,
@@ -452,37 +491,74 @@ def _guard_mutation_step(obj: dict[str, object], step_id: str, source: str) -> S
         fatal_error=fatal,
         counts={k: v for k, v in counts.items() if v is not None},
     )
+    return step, _receipt_sha(obj.get("commit_sha"), source, "commit_sha")
 
 
-def _check_trusted_step(obj: dict[str, object], step_id: str, source: str) -> Step:
+def _check_trusted_step(
+    obj: dict[str, object], step_id: str, source: str, *, stdout_form: bool = False
+) -> tuple[Step, str | None]:
+    if stdout_form:
+        for section in ("trusted", "rustcCapture", "downstream"):
+            if not isinstance(obj.get(section), dict):
+                raise _bad(source, f"`check_trusted --audit-vacuity` summary missing `{section}` object")
     step = Step(step_id=step_id, kind="check_trusted", source=source)
     step.axioms = _axioms(obj.get("axioms"), source)
     downstream = obj.get("downstream")
-    theorems = None
-    for holder in (obj, downstream if isinstance(downstream, dict) else {}):
-        value = _opt_int(holder, "claimTheoremsChecked", source)
-        theorems = value if value is not None else theorems
+    if downstream is not None and not isinstance(downstream, dict):
+        raise _bad(source, "`downstream` must be a JSON object")
+    down_dict = downstream if isinstance(downstream, dict) else {}
+
+    def unique_int(key: str) -> int | None:
+        top_val = _opt_int(obj, key, source)
+        sub_val = _opt_int(down_dict, key, source)
+        if top_val is not None and sub_val is not None and top_val != sub_val:
+            raise _bad(source, f"`{key}` disagrees between top-level and `downstream`", "INCONSISTENT_RECEIPT")
+        return top_val if top_val is not None else sub_val
+
+    theorems = unique_int("claimTheoremsChecked")
     if theorems is not None:
         step.counts["theorems"] = theorems
     for key, metric in (("kernelDeclarations", "kernel_declarations"),
                         ("replayedDeclarations", "replayed_declarations")):
-        value = _opt_int(obj, key, source)
-        if value is None and isinstance(downstream, dict):
-            value = _opt_int(downstream, key, source)
+        value = unique_int(key)
         if value is not None:
             step.counts[metric] = value
     digest = obj.get("sourceSha256")
     if digest is not None and not (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest)):
         raise _bad(source, "`sourceSha256` must be 64 lowercase hex characters")
     replay = _opt_bool(obj, "replay", source)
+    explicit_ok = _opt_bool(obj, "ok", source)
+    returncode = _opt_int(obj, "returncode", source, minimum=None)
+    exit_code = _opt_int(obj, "exit_code", source, minimum=None)
+    if returncode is not None and exit_code is not None and returncode != exit_code:
+        raise _bad(source, "`returncode` and `exit_code` disagree", "INCONSISTENT_RECEIPT")
+    effective_rc = returncode if returncode is not None else exit_code
+    status = _opt_str(obj, "status", source, allow_empty=False)
+    fatal = _opt_str(obj, "fatal_error", source, allow_empty=False)
+    failed = (
+        replay is False
+        or explicit_ok is False
+        or fatal is not None
+        or effective_rc not in (None, 0)
+        or status not in (None, "PASS")
+    )
+    if explicit_ok is True and failed:
+        raise _bad(source, "`ok` is true but the check_trusted receipt records a failure", "INCONSISTENT_RECEIPT")
+    if (explicit_ok is False or replay is False) and effective_rc == 0:
+        raise _bad(source, "check_trusted failure contradicts exit code 0", "INCONSISTENT_RECEIPT")
+    if status == "PASS" and failed:
+        raise _bad(source, "`status` is PASS but the check_trusted receipt records a failure", "INCONSISTENT_RECEIPT")
+    step.fatal_error = fatal
+    step.status = status
     # The audit only writes a report (or prints its summary) after it passed;
-    # a recorded `replay: false` says the kernel replay did not hold.
-    step.ok = True if replay is None else replay
-    step.returncode = 0 if step.ok else 1
-    return step
+    # any explicit failure signal (`replay: false`, `ok: false`, non-zero rc,
+    # `fatal_error`, non-PASS `status`) marks it failed.
+    step.ok = not failed
+    step.returncode = effective_rc if effective_rc is not None else (0 if step.ok else 1)
+    return step, _receipt_sha(obj.get("commit_sha"), source, "commit_sha")
 
 
-def _nightly_step(obj: object, source: str) -> Step:
+def _nightly_step(obj: object, source: str) -> tuple[Step, str | None]:
     if not isinstance(obj, dict):
         raise _bad(source, "a nightly step must be a JSON object")
     name = obj.get("name")
@@ -495,7 +571,7 @@ def _nightly_step(obj: object, source: str) -> Step:
         raise _bad(where, "a nightly step needs an integer `exit_code`")
     if (status == "PASS") != (exit_code == 0):
         raise _bad(where, f"status {status!r} contradicts exit code {exit_code}", "INCONSISTENT_RECEIPT")
-    return Step(
+    step = Step(
         step_id=name.strip(),
         kind="nightly",
         source=source,
@@ -504,6 +580,7 @@ def _nightly_step(obj: object, source: str) -> Step:
         ok=status == "PASS",
         status=status,
     )
+    return step, _receipt_sha(obj.get("commit_sha"), where, "commit_sha")
 
 
 def load_receipt(
@@ -542,37 +619,62 @@ def load_receipt(
             if forced_id is not None:
                 raise _bad(source, "a STEP_ID= prefix cannot name a multi-step bundle")
             for entry in obj["steps"]:
-                step, sha = _canonical_step(entry, source)
+                step, sha = _canonical_step(entry, source, allow_schema=False)
                 steps.append(step)
                 shas += [sha] if sha else []
         else:
-            step, _ = _canonical_step(obj, source)
+            step, _ = _canonical_step(obj, source, allow_schema=True)
             step.step_id = single(step.step_id)
             steps.append(step)
         shas += [top_sha] if top_sha else []
     elif bundle_only:
         raise _bad(source, f"--receipt-bundle needs a {RECEIPT_SCHEMA} receipt")
     elif not stdout_form and {"ok", "fatal_error", "total", "killed", "survived", "errors", "results"} <= set(obj):
-        steps.append(_guard_mutation_step(obj, single("guard_mutation"), source))
+        step, sha = _guard_mutation_step(obj, single("guard_mutation"), source)
+        steps.append(step)
+        shas += [sha] if sha else []
     elif not stdout_form and isinstance(obj.get("pillar_2_correctness_and_correspondence"), dict):
-        entries = obj["pillar_2_correctness_and_correspondence"].get("steps")  # type: ignore[union-attr]
+        p2: dict[str, object] = obj["pillar_2_correctness_and_correspondence"]  # type: ignore[assignment]
+        entries = p2.get("steps")
         if not isinstance(entries, list) or not entries:
             raise _bad(source, "nightly dashboard has no `steps`")
         if forced_id is not None:
             raise _bad(source, "a STEP_ID= prefix cannot name a multi-step dashboard")
-        steps += [_nightly_step(entry, source) for entry in entries]
+        loaded_steps: list[Step] = []
+        for entry in entries:
+            step, sha = _nightly_step(entry, source)
+            loaded_steps.append(step)
+            shas += [sha] if sha else []
+        steps_total = _opt_int(p2, "steps_total", source)
+        steps_passed = _opt_int(p2, "steps_passed", source)
+        steps_failed = _opt_int(p2, "steps_failed", source)
+        actual_passed = sum(1 for s in loaded_steps if s.status == "PASS")
+        actual_failed = len(loaded_steps) - actual_passed
+        if steps_total is not None and steps_total != len(loaded_steps):
+            raise _bad(source, f"`steps_total` ({steps_total}) contradicts {len(loaded_steps)} steps", "INCONSISTENT_RECEIPT")
+        if steps_passed is not None and steps_passed != actual_passed:
+            raise _bad(source, f"`steps_passed` ({steps_passed}) contradicts {actual_passed} passing steps", "INCONSISTENT_RECEIPT")
+        if steps_failed is not None and steps_failed != actual_failed:
+            raise _bad(source, f"`steps_failed` ({steps_failed}) contradicts {actual_failed} failing steps", "INCONSISTENT_RECEIPT")
+        overall = _opt_str(p2, "overall_status", source, allow_empty=False)
+        if overall == "PASS" and actual_failed > 0:
+            raise _bad(source, "`overall_status` is PASS but a nightly step failed", "INCONSISTENT_RECEIPT")
+        steps += loaded_steps
         for key in ("unstable_commit_sha", "git_sha", "commit_sha"):
-            value = obj.get(key)
-            if isinstance(value, str) and _SHA_RE.fullmatch(value) and set(value) != {"0"}:
-                shas.append(value)
-                break
+            if key in obj:
+                sha = _receipt_sha(obj.get(key), source, key)
+                if sha is not None:
+                    shas.append(sha)
     elif not stdout_form and {"name", "status", "exit_code"} <= set(obj):
-        step = _nightly_step(obj, source)
+        step, sha = _nightly_step(obj, source)
         step.step_id = single(step.step_id)
         steps.append(step)
+        shas += [sha] if sha else []
     elif stdout_form or set(obj) & {"kernelDeclarations", "claimTheoremsChecked", "replayedDeclarations",
                                     "sourceSha256", "rustcCapture"}:
-        steps.append(_check_trusted_step(obj, single("check_trusted"), source))
+        step, sha = _check_trusted_step(obj, single("check_trusted"), source, stdout_form=stdout_form)
+        steps.append(step)
+        shas += [sha] if sha else []
     else:
         raise _bad(source, "unrecognized receipt format")
     return steps, shas
@@ -582,7 +684,7 @@ def load_receipt(
 # Claim extraction
 # ---------------------------------------------------------------------------
 
-_NUM = r"(?<![\w.,/=])([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)"
+_NUM = r"(?<![\w.,/=])[*_]*([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)[*_]*"
 _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("passed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+|checks?\s+)?(?:passed|passing|pass)\b", re.I)),
     ("failed", re.compile(_NUM + r"\s+(?:(?:unit\s+|doc\s+)?tests?\s+)?(?:failed|failing|failures?)\b", re.I)),
@@ -600,62 +702,120 @@ _COUNT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("sorry", re.compile(_NUM + r"\s+`?sorr(?:y|ies)\b`?", re.I)),
 )
 _KV_COUNT_RE = re.compile(
-    r"(?i)(?<![\w-])(passed|failed|killed|survived|errors|theorems?|sorry|total)(?:_count)?"
-    r"\s*[=:]\s*`?([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)"
+    r"(?i)(?<![\w-])[*_]*(passed|failed|failure|killed|survived|survivor|errors?|theorems?|sorry|total)"
+    r"(?:_count)?[*_]*\s*[=:]\s*[`*_]*([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)"
 )
+_KV_METRIC_ALIASES: dict[str, str] = {
+    "failure": "failed",
+    "survivor": "survived",
+    "error": "errors",
+    "theorem": "theorems",
+}
 _FRACTION_RE = re.compile(
-    _NUM + r"\s*/\s*([0-9]+(?:[,._][0-9]+)*)\s+(?:mutants?\s+|guards?\s+|tests?\s+)?(killed|passed)\b", re.I
+    _NUM
+    + r"\s*(?:/|\bof\b)\s*[*_]*([0-9]+(?:[,._][0-9]+)*)[*_]*\s+"
+    + r"(?:(?:unit\s+|doc\s+|new\s+|proved\s+|proven\s+|kernel-checked\s+|checked\s+|verified\s+|Lean\s+|total\s+)?"
+    + r"(?:mutants?|guards?|tests?|checks?)\s+)?"
+    + r"(killed|passed|passing|pass|failed|failing|failures?|survived|surviving|survivors?|theorems?)\b",
+    re.I,
 )
 _KILL_RATE_RES: tuple[re.Pattern[str], ...] = (
-    re.compile(r"(?i)(?<![\w.,/])([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)\s*%\s+(?:kill[ -]rate|killed|mutation\s+score)\b"),
-    re.compile(r"(?i)\bkill[ _-]rate(?:_pct)?\s*(?:[=:]|of|is)?\s*`?([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)\s*%?"),
+    re.compile(
+        r"(?i)(?<![\w.,/])[*_]*([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)[*_]*\s*%\s+"
+        r"(?:of\s+)?(?:(?:mutants?|guards?)\s+)?(?:kill[ -]rate|killed|mutation\s+score)\b"
+    ),
+    re.compile(
+        r"(?i)\b[*_]*kill[ _-]rate(?:_pct)?[*_]*\s*(?:[=:]|of|is)?\s*[`*_]*([~≈<>≥≤+\-]?)([0-9]+(?:[,._][0-9]+)*)\s*%?"
+    ),
 )
 _ZERO_WORD_RES: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("failed", re.compile(r"(?i)\b(?:no|zero)\s+(?:test\s+)?failures?\b")),
-    ("survived", re.compile(r"(?i)\b(?:no|zero)\s+surviv(?:ors?|ing(?:\s+mutants?)?)\b")),
-    ("sorry", re.compile(r"(?i)\b(?:no|zero|without)\s+`?sorr(?:y|ies)\b`?|\bsorry-free\b")),
+    (
+        "failed",
+        re.compile(
+            r"(?i)\b(?:no|zero)\s+(?:(?:unit\s+|doc\s+)?tests?\s+)?"
+            r"(?:failures?|failed(?:\s+tests?)?|failing(?:\s+tests?)?)\b"
+            r"|\b(?:no|zero)\s+(?:unit\s+|doc\s+)?tests?\s+failed\b"
+        ),
+    ),
+    (
+        "survived",
+        re.compile(
+            r"(?i)\b(?:no|zero)\s+(?:(?:mutants?|guards?)\s+)?"
+            r"surviv(?:ors?|ed|ing(?:\s+(?:mutants?|guards?))?)\b"
+        ),
+    ),
+    ("sorry", re.compile(r"(?i)\b(?:no|zero|without)\s+`?(?:sorr(?:y|ies)|sorryAx)\b`?|\bsorry-free\b")),
 )
 _RC_ASSIGN_RE = re.compile(
-    r"(?i)(?<![\w-])(?:rc|exit[ _-]?code|exit[ _-]?status|return[ _]?code)\s*[=:]\s*`?([^\s`,;)|*]+)"
+    r"(?i)(?<![\w-])[*_]*(?:rc|exit[ _-]?code|exit[ _-]?status|return[ _]?code)[*_]*\s*[=:]\s*[`*_]*([^\s`,;)|*]+)"
 )
 _RC_PROSE_RE = re.compile(
     r"(?i)(?<![\w-])(?:exit(?:ed)?(?:\s+with)?(?:\s+code|\s+status)?|rc|return\s+code)\s+"
     r"(?:is\s+|was\s+|of\s+)?`?(-?[0-9]+)\b"
 )
-_STATUS_RE = re.compile(r"(?i)(?<![\w-])(?:status|result|verdict|outcome)\s*[=:]\s*[`*_]*([A-Za-z]+)")
-_OK_RE = re.compile(r"(?i)(?<![\w-])ok\s*[=:]\s*`?(true|false)\b")
+_STATUS_RE = re.compile(r"(?i)(?<![\w-])[*_]*(?:status|result|verdict|outcome)[*_]*\s*[=:]\s*[`*_]*([A-Za-z]+)")
+_OK_RE = re.compile(r"(?i)(?<![\w-])[*_]*ok[*_]*\s*[=:]\s*[`*_]*(true|false)\b")
 _VERDICT_TOKEN_RE = re.compile(r"(?<![\w/-])(PASS(?:ED)?|FAIL(?:ED)?|✅|❌)(?![\w/-])")
 _ALL_PASS_RE = re.compile(
-    r"(?i)\ball\s+(?:[\w-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
+    r"(?i)\ball\s+(?:[\w'-]+\s+){0,3}(?:pass(?:ed|es)?|green|succeed(?:ed)?)\b"
+)
+_NEGATION_WORDS: frozenset[str] = frozenset({
+    "not", "never", "no", "without", "neither", "nor", "fail", "failed", "failing",
+    "cannot", "can't", "cant", "didn't", "didnt", "doesn't", "doesnt",
+    "don't", "dont", "won't", "wont", "unable", "unverified", "non",
+})
+_PRECEDING_NEG_RE = re.compile(
+    r"(?i)(?:\b(?:not|never|no|non|didn't|did\s+not|does\s+not|doesn't|failed\s+to|cannot|can't)\s*[-]?)$"
 )
 _PASS_WORDS: frozenset[str] = frozenset({"PASS", "PASSED", "PASSING", "OK", "SUCCESS", "GREEN", "✅"})
 _FAIL_WORDS: frozenset[str] = frozenset(
     {"FAIL", "FAILED", "FAILING", "FAILURE", "ERROR", "RED", "TIMEOUT", "❌"}
 )
 _SHA_CLAIM_RE = re.compile(
-    r"(?i)(?<![\w/-])(?P<label>(?:(?:base|parent|previous|prior|old|head|target|tip|final|new|current)"
-    r"\s+)*(?:commit(?:\s+(?:sha|hash|id))?|sha|revision|head|base|parent|target))(?![\w-])"
-    r"(?:\s+(?:is|was|at|of)){0,2}\s*(?P<sep>[:=])?\s*(?P<tick>`?)(?P<value>[0-9A-Za-z/_.?-]+)"
+    r"(?i)(?<![\w/-])[*_]*(?P<label>(?:(?:base|parent|previous|prior|old|head|target|tip|final|new|current|git)"
+    r"[\s_-]+)*(?:commit(?:[\s_-]+(?:sha|hash|id))?|sha|revision|head|base|parent|target))[*_]*(?![\w-])"
+    r"(?:\s+(?:is|was|at|of)){0,2}[*_]*\s*(?P<sep>[:=|])?[*_]*\s*[*_]*(?P<tick>`?)(?P<value>[0-9A-Za-z/_.?-]+)"
 )
-_BASE_ROLE_RE = re.compile(r"(?i)\b(?:base|parent|previous|prior|old)\b")
+_BASE_ROLE_RE = re.compile(r"(?i)(?:^|[\s_-])(?:base|parent|previous|prior|old)(?:$|[\s_-])")
 _SHA_PLACEHOLDERS: frozenset[str] = frozenset({"unknown", "none", "n/a", "na", "tbd", "null", "dirty", "?"})
+_AXIOM_PREFIX_OPT = r"(?:[*_]*axioms?(?:\s+used|\s+set|\s+closure)?[*_]*\s*[=:]\s*)?"
 _STANDARD_AXIOMS_RE = re.compile(
-    r"(?i)\b(?:only\s+)?(?:the\s+)?(?:three\s+)?standard\s+(?:kernel\s+|Lean\s+)?axioms?(?:\s+only)?\b"
-    r"|\b(?:no|zero)\s+(?:non-?standard|extra|additional|unauthorized|custom)\s+axioms?\b"
+    r"(?i)" + _AXIOM_PREFIX_OPT
+    + r"(?:\b(?:only\s+)?(?:the\s+)?(?:three\s+)?standard\s+(?:kernel\s+|Lean\s+)?axioms?(?:\s+only)?\b"
+    r"|\b(?:no|zero)\s+(?:non-?standard|extra|additional|unauthorized|custom)\s+axioms?\b)"
 )
-_NO_AXIOMS_RE = re.compile(r"(?i)\b(?:no|zero)\s+axioms?\b|\baxiom-free\b")
-_AXIOM_LIST_RE = re.compile(r"(?i)(?<![\w-])axioms?(?:\s+used|\s+set|\s+closure)?\s*[=:]\s*(.+)$")
-_EXPLICIT_STEP_RE = re.compile(r"(?i)(?<![\w-])step(?:[ _-]?id)?\s*[=:]\s*`?([A-Za-z0-9][\w.:/-]*)")
+_NO_AXIOMS_RE = re.compile(
+    r"(?i)" + _AXIOM_PREFIX_OPT + r"(?:\b(?:no|zero)\s+axioms?\b|\baxiom-free\b)"
+)
+_AXIOM_LIST_RE = re.compile(
+    r"(?i)(?<![\w-])[*_]*axioms?(?:\s+used|\s+set|\s+closure)?[*_]*\s*[=:]\s*([^;|\n]+)"
+)
+_EXPLICIT_STEP_RE = re.compile(r"(?i)(?<![\w-])[*_]*step(?:[ _-]?id)?[*_]*\s*[=:]\s*[`*_]*([A-Za-z0-9][\w.:/-]*)")
+_LEADING_LABEL_RE = re.compile(
+    r"^\s*(?:[-*+]|\d+[.)])?\s*(?:`([^`\n]+)`|\*\*([^*\n`]+)\*\*)\s*:"
+)
+_HEADING_CODE_STEP_RE = re.compile(r"^\s*#{1,6}\s+`([^`\n]+)`\s*$")
+_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 _CODE_SPAN_RE = re.compile(r"`([^`\n]+)`")
 _COMMAND_HEAD_RE = re.compile(
     r"(?:\./|(?:python3?|cargo|lake|lean|anneal-lean-run|bash|sh|git|pytest|make|rg)\b)"
 )
+_SHELL_META_RE = re.compile(r"[;&|`$<>]|\|\||&&")
+_NON_STEP_LABELS: frozenset[str] = frozenset({
+    "commit", "commit sha", "commit_sha", "git sha", "git_sha", "sha", "revision",
+    "head", "head sha", "head_sha", "base", "base sha", "base_sha", "parent",
+    "previous", "prior", "old", "target", "tip", "status", "result", "verdict",
+    "outcome", "axioms", "axioms used", "axioms set", "axioms closure", "axiom",
+    "summary", "note", "notes", "receipt", "receipts", "overall", "total",
+    "kill rate", "kill_rate", "passed", "failed", "killed", "survived", "errors",
+    "theorems", "sorry", "rc", "exit code", "exit_code", "ok", "step", "step_id",
+    "verification", "gate", "gates", "checks", "tests", "all", "command", "commands",
+})
 _FENCE_RE = re.compile(r"^\s{0,3}(```|~~~)")
 _HISTORICAL_RE = re.compile(
     r"(?i)^(?:[-*+>\s]|[0-9]+[.)])*[\[(*_]*(?:historical|previously|superseded|obsolete)[\])*_]*\s*[:\-–]"
 )
 _STRIKE_RE = re.compile(r"~~.*?~~")
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->")
 _IGNORE_BEGIN = "<!-- claim-guard: ignore-begin -->"
 _IGNORE_END = "<!-- claim-guard: ignore-end -->"
 _INVISIBLE_RE = re.compile("[\u200b-\u200f\u2060-\u2064\ufeff\u00ad]")
@@ -689,12 +849,57 @@ class _KnownSteps:
                 self.commands.setdefault(" ".join(step.command.split()), set()).add(step.step_id)
 
     def by_command(self, span: str) -> str | None:
-        """The one step whose command is `span`, allowing a `wrapper -- ` prefix on either."""
+        """The one step whose command is `span`, allowing a clean `wrapper -- ` prefix."""
         hits: set[str] = set()
         for command, step_ids in self.commands.items():
-            if span == command or command.endswith(" -- " + span) or span.endswith(" -- " + command):
+            if span == command or command.endswith(" -- " + span):
                 hits |= step_ids
+            elif span.endswith(" -- " + command):
+                prefix = span[: -len(" -- " + command)]
+                if not _SHELL_META_RE.search(prefix):
+                    hits |= step_ids
         return next(iter(hits)) if len(hits) == 1 else None
+
+
+def _is_candidate_unknown_step_label(label: str) -> bool:
+    """Whether `label` looks like an unrecognized step name rather than metadata or a value."""
+    norm = " ".join(label.strip().split())
+    if not norm or norm.lower() in _NON_STEP_LABELS:
+        return False
+    if any(ch in norm for ch in ("=", ":", "%", "|", ";")):
+        return False
+    if _SHA_RE.fullmatch(norm) or norm.isdigit():
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]*", norm))
+
+
+def _table_cell_spans(line: str) -> list[tuple[int, int]]:
+    """`(lo, hi)` character spans of Markdown table cells, ignoring `|` inside backticks."""
+    pipes: list[int] = []
+    in_ticks = False
+    for idx, ch in enumerate(line):
+        if ch == "`":
+            in_ticks = not in_ticks
+        elif ch == "|" and not in_ticks:
+            pipes.append(idx)
+    if len(pipes) < 2:
+        return []
+    return [(pipes[i] + 1, pipes[i + 1]) for i in range(len(pipes) - 1)]
+
+
+def _clause_spans(line: str) -> list[tuple[int, int]]:
+    """`(lo, hi)` spans split on `;` outside backticks."""
+    spans: list[tuple[int, int]] = []
+    start = 0
+    in_ticks = False
+    for idx, ch in enumerate(line):
+        if ch == "`":
+            in_ticks = not in_ticks
+        elif ch == ";" and not in_ticks:
+            spans.append((start, idx))
+            start = idx + 1
+    spans.append((start, len(line)))
+    return spans
 
 
 def _line_refs(line: str, known: _KnownSteps, in_fence: bool) -> list[tuple[int, str | None, str, bool]]:
@@ -702,36 +907,75 @@ def _line_refs(line: str, known: _KnownSteps, in_fence: bool) -> list[tuple[int,
     refs: list[tuple[int, str | None, str, bool]] = []
     taken: list[tuple[int, int]] = []
 
+    def overlaps(lo: int, hi: int) -> bool:
+        return any(a < hi and lo < b for a, b in taken)
+
     def add(m_start: int, m_end: int, step_id: str | None, name: str, explicit: bool) -> None:
         refs.append((m_start, step_id, name, explicit))
         taken.append((m_start, m_end))
 
     for m in _EXPLICIT_STEP_RE.finditer(line):
-        name = m.group(1).rstrip(".,;:")
+        name = m.group(1).rstrip(".,;:*_")
         add(m.start(), m.end(), name if name in known.ids else None, name, True)
     if in_fence:
         stripped = line.strip()
         shell = stripped.startswith("$ ")
         candidate = " ".join((stripped[2:] if shell else stripped).split())
         step_id = known.by_command(candidate)
-        if step_id is not None or shell:
+        if step_id is not None or shell or _COMMAND_HEAD_RE.match(candidate):
             add(0, len(line), step_id, candidate, False)
     for m in _CODE_SPAN_RE.finditer(line):
         span = " ".join(m.group(1).split())
         step_id = span if span in known.ids else known.by_command(span)
-        if step_id is not None or _COMMAND_HEAD_RE.match(span):
+        if step_id is not None or _COMMAND_HEAD_RE.match(span) or " -- " in span:
             add(m.start(), m.end(), step_id, span, False)
     for step_id, pattern in known.id_res:
         for m in pattern.finditer(line):
-            if not any(lo < m.end() and m.start() < hi for lo, hi in taken):
+            if not overlaps(m.start(), m.end()):
                 add(m.start(), m.end(), step_id, step_id, False)
+    if not in_fence:
+        m_head = _HEADING_CODE_STEP_RE.match(line)
+        if m_head is not None and not overlaps(m_head.start(1), m_head.end(1)):
+            label = " ".join(m_head.group(1).split())
+            if _is_candidate_unknown_step_label(label):
+                add(m_head.start(1), m_head.end(1), None, label, True)
+        m_lead = _LEADING_LABEL_RE.match(line)
+        if m_lead is not None:
+            grp = 1 if m_lead.group(1) is not None else 2
+            if not overlaps(m_lead.start(grp), m_lead.end(grp)):
+                label = " ".join(m_lead.group(grp).split())
+                if _is_candidate_unknown_step_label(label):
+                    add(m_lead.start(grp), m_lead.end(grp), None, label, True)
+                elif grp == 1 and label and label.lower() not in _NON_STEP_LABELS and " " in label:
+                    add(m_lead.start(grp), m_lead.end(grp), None, label, False)
+        if line.lstrip().startswith("|"):
+            cells = _table_cell_spans(line)
+            for idx, (lo, hi) in enumerate(cells):
+                if overlaps(lo, hi):
+                    continue
+                cell = line[lo:hi].strip()
+                if not cell or re.fullmatch(r"[-:\s]+", cell):
+                    continue
+                m_cell = re.fullmatch(r"(?:\*\*)?`([^`\n]+)`(?:\*\*)?", cell)
+                if m_cell is not None:
+                    label = " ".join(m_cell.group(1).split())
+                    if _is_candidate_unknown_step_label(label) and label.upper() not in (_PASS_WORDS | _FAIL_WORDS):
+                        add(lo, hi, None, label, True)
+                elif idx == 0 and re.fullmatch(r"(?:\*\*)?([A-Za-z][A-Za-z0-9_.-]*)(?:\*\*)?", cell):
+                    plain = cell.strip("*")
+                    if (
+                        ("_" in plain or "-" in plain)
+                        and _is_candidate_unknown_step_label(plain)
+                        and plain.upper() not in (_PASS_WORDS | _FAIL_WORDS)
+                    ):
+                        add(lo, hi, None, plain, True)
     refs.sort(key=lambda ref: ref[0])
     return refs
 
 
 def _classify_sha(value: str, explicit: bool) -> tuple[str, str]:
     """`("valid", sha)`, `("ignore", "")`, or a violation code with its reason."""
-    token = value.strip("`'\"").rstrip(".,;:)")
+    token = value.strip("`'\"*_").rstrip(".,;:)")
     if _SHA_RE.fullmatch(token):
         if set(token) == {"0"}:
             return "INVALID_COMMIT_SHA", f"`{token}` is the all-zero SHA"
@@ -757,17 +1001,29 @@ def _classify_sha(value: str, explicit: bool) -> tuple[str, str]:
 
 def _axiom_names(rest: str) -> frozenset[str] | None:
     """Axiom names of an `axioms: ...` list; `None` when the list cannot be read."""
+    trimmed = rest.strip()
+    if trimmed in ("[]", "{}", "()", "∅"):
+        return frozenset()
     names: set[str] = set()
-    for raw in re.split(r"[,\s+]+|\band\b", rest.strip()):
+    for raw in re.split(r"[,\s+]+|\band\b", trimmed):
+        had_sentence_stop = raw.rstrip("`'\"[](){}*_").endswith((".", ";", ":"))
         token = raw.strip("`'\"[](){}*_").rstrip(".;:")
         if not token:
+            if had_sentence_stop and names:
+                break
             continue
         if token.lower() in ("none", "no", "empty", "∅") and not names:
             return frozenset()
         if not _AXIOM_NAME_RE.fullmatch(token):
             break
         names.add(token)
+        if had_sentence_stop:
+            break
     return frozenset(names) if names else None
+
+
+def _preceded_by_negation(line: str, pos: int) -> bool:
+    return bool(_PRECEDING_NEG_RE.search(line[:pos]))
 
 
 def _line_claims(
@@ -790,7 +1046,8 @@ def _line_claims(
         return value
 
     for m in list(_SHA_CLAIM_RE.finditer(work[0])):
-        explicit = bool(m.group("sep")) or bool(m.group("tick"))
+        sep = m.group("sep")
+        explicit = bool(sep and sep != "|") or bool(m.group("tick"))
         verdict, detail = _classify_sha(m.group("tick") + m.group("value"), explicit)
         if verdict == "ignore":
             continue
@@ -804,10 +1061,28 @@ def _line_claims(
         take(m)
         part, whole = count(m, m.group(1), m.group(2)), count(m, "", m.group(3))
         if part is not None and whole is not None:
-            metric = m.group(4).lower()
-            found.append((m.start(), "count", metric, part, m.group(0).strip()))
-            found.append((m.start(), "count", "total" if metric == "killed" else "tests", whole,
-                          m.group(0).strip()))
+            raw_metric = m.group(4).lower()
+            snippet = m.group(0).strip()
+            if raw_metric.startswith("pass"):
+                found.append((m.start(), "count", "passed", part, snippet))
+                found.append((m.start(), "count", "tests", whole, snippet))
+            elif raw_metric == "killed":
+                found.append((m.start(), "count", "killed", part, snippet))
+                found.append((m.start(), "count", "total", whole, snippet))
+            elif raw_metric.startswith("fail"):
+                found.append((m.start(), "count", "failed", part, snippet))
+                found.append((m.start(), "count", "tests", whole, snippet))
+            elif raw_metric.startswith("surviv"):
+                found.append((m.start(), "count", "survived", part, snippet))
+                found.append((m.start(), "count", "total", whole, snippet))
+            elif raw_metric.startswith("theorem"):
+                if part > whole:
+                    violations.append(
+                        Violation("MALFORMED_CLAIM", lineno, None,
+                                  f"`{snippet}` numerator exceeds denominator")
+                    )
+                else:
+                    found.append((m.start(), "count", "theorems", part, snippet))
     for pattern in _KILL_RATE_RES:
         for m in list(pattern.finditer(work[0])):
             take(m)
@@ -821,9 +1096,9 @@ def _line_claims(
         take(m)
         value = count(m, m.group(2), m.group(3))
         if value is not None:
-            metric = m.group(1).lower()
-            found.append((m.start(), "count", "theorems" if metric.startswith("theorem") else metric,
-                          value, m.group(0).strip()))
+            raw_metric = m.group(1).lower()
+            metric = _KV_METRIC_ALIASES.get(raw_metric, raw_metric)
+            found.append((m.start(), "count", metric, value, m.group(0).strip()))
     for metric, pattern in _COUNT_PATTERNS:
         for m in list(pattern.finditer(work[0])):
             take(m)
@@ -853,19 +1128,26 @@ def _line_claims(
                 else "fail" if word in _FAIL_WORDS or word == "FALSE" else ""
             )
             if verdict:
+                if pattern is _VERDICT_TOKEN_RE and _preceded_by_negation(line, m.start()):
+                    verdict = "fail" if verdict == "pass" else "pass"
                 take(m)
                 found.append((m.start(), "exit_status", "status", verdict, m.group(0).strip()))
     for m in list(_ALL_PASS_RE.finditer(work[0])):
         take(m)
-        found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
+        words = [w.lower() for w in re.findall(r"[A-Za-z']+", m.group(0))]
+        negated = _preceded_by_negation(line, m.start()) or any(w in _NEGATION_WORDS for w in words[:-1])
+        if negated:
+            found.append((m.start(), "exit_status", "status", "fail", m.group(0).strip()))
+        else:
+            found.append((m.start(), "exit_status", "all", "pass", m.group(0).strip()))
     for m in list(_STANDARD_AXIOMS_RE.finditer(work[0])):
         take(m)
         found.append((m.start(), "axioms", "standard_only", None, m.group(0).strip()))
     for m in list(_NO_AXIOMS_RE.finditer(work[0])):
         take(m)
         found.append((m.start(), "axioms", "set", frozenset(), m.group(0).strip()))
-    m_list = _AXIOM_LIST_RE.search(work[0])
-    if m_list is not None:
+    for m_list in list(_AXIOM_LIST_RE.finditer(work[0])):
+        take(m_list)
         names = _axiom_names(m_list.group(1))
         words = {name.lower() for name in names or ()}
         if names is None:
@@ -877,6 +1159,74 @@ def _line_claims(
             found.append((m_list.start(), "axioms", "set", names, m_list.group(0).strip()))
     found.sort(key=lambda claim: claim[0])
     return found
+
+
+def _strip_ignore_and_comments_line(
+    line: str,
+    lineno: int,
+    in_ignore: bool,
+    ignore_line: int,
+    in_comment: bool,
+    comment_line: int,
+    violations: list[Violation],
+) -> tuple[str, bool, int, bool, int, bool]:
+    """Strip inline ignore blocks and HTML comments from one line.
+
+    Returns `(kept_text, in_ignore, ignore_line, in_comment, comment_line, was_ignored)`.
+    Text outside `ignore-begin`..`ignore-end` on the same line is preserved.
+    """
+    out: list[str] = []
+    pos = 0
+    had_ignored = False
+    while pos < len(line):
+        if in_ignore:
+            had_ignored = True
+            end_at = line.find(_IGNORE_END, pos)
+            begin_at = line.find(_IGNORE_BEGIN, pos)
+            if begin_at != -1 and (end_at == -1 or begin_at < end_at):
+                violations.append(
+                    Violation("MALFORMED_CLAIMS", lineno, None,
+                              "nested `claim-guard: ignore-begin` inside an open ignore block")
+                )
+            if end_at == -1:
+                pos = len(line)
+                break
+            in_ignore = False
+            pos = end_at + len(_IGNORE_END)
+            out.append(" ")
+        elif in_comment:
+            close_at = line.find("-->", pos)
+            if close_at == -1:
+                pos = len(line)
+                break
+            in_comment = False
+            pos = close_at + 3
+            out.append(" ")
+        else:
+            begin_at = line.find(_IGNORE_BEGIN, pos)
+            end_at = line.find(_IGNORE_END, pos)
+            comm_at = line.find("<!--", pos)
+            candidates = [idx for idx in (begin_at, end_at, comm_at) if idx != -1]
+            if not candidates:
+                out.append(line[pos:])
+                break
+            nxt = min(candidates)
+            out.append(line[pos:nxt])
+            if nxt == begin_at:
+                in_ignore, ignore_line = True, lineno
+                had_ignored = True
+                pos = nxt + len(_IGNORE_BEGIN)
+            elif nxt == end_at:
+                violations.append(
+                    Violation("MALFORMED_CLAIMS", lineno, None,
+                              "unmatched `claim-guard: ignore-end` without an open ignore block")
+                )
+                pos = nxt + len(_IGNORE_END)
+            else:
+                in_comment, comment_line = True, lineno
+                pos = nxt + 4
+    kept = "".join(out)
+    return kept, in_ignore, ignore_line, in_comment, comment_line, had_ignored and not kept.strip()
 
 
 def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[Violation], int]:
@@ -895,30 +1245,18 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
     text = _INVISIBLE_RE.sub("", text)
     known = _KnownSteps(steps)
     in_fence = in_ignore = in_comment = False
-    ignore_line = 0
+    ignore_line = comment_line = 0
     heading_ctx: tuple[str | None, str, bool] | None = None
     para_ctx: tuple[str | None, str, bool] | None = None
     for lineno, line in enumerate(text.split("\n"), 1):
-        if in_ignore:
+        line, in_ignore, ignore_line, in_comment, comment_line, was_ignored = (
+            _strip_ignore_and_comments_line(
+                line, lineno, in_ignore, ignore_line, in_comment, comment_line, violations
+            )
+        )
+        if was_ignored:
             ignored += 1
-            if _IGNORE_END in line:
-                in_ignore = False
             continue
-        if _IGNORE_BEGIN in line:
-            in_ignore, ignore_line = True, lineno
-            ignored += 1
-            if _IGNORE_END in line.split(_IGNORE_BEGIN, 1)[1]:
-                in_ignore = False
-            continue
-        if in_comment:
-            if "-->" not in line:
-                continue
-            line = line.split("-->", 1)[1]
-            in_comment = False
-        line = _HTML_COMMENT_RE.sub(" ", line)
-        if "<!--" in line:
-            line = line.split("<!--", 1)[0]
-            in_comment = True
         if _FENCE_RE.match(line):
             in_fence = not in_fence
             para_ctx = None
@@ -931,14 +1269,27 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         if _HISTORICAL_RE.match(line):
             ignored += 1
             continue
+        is_table_row = not in_fence and line.lstrip().startswith("|")
+        is_list_item = not in_fence and bool(_LIST_ITEM_RE.match(line))
+        if is_table_row or is_list_item:
+            para_ctx = None
         refs = _line_refs(line, known, in_fence)
+        clauses = _clause_spans(line)
         for pos, kind, metric, value, snippet in _line_claims(line, lineno, violations):
             if kind == "commit_sha" or metric == "all":
                 # A commit names the whole run, and "all ... pass" every step.
                 claims.append(Claim(kind, metric, value, lineno, snippet, None))
                 continue
-            before = [ref for ref in refs if ref[0] <= pos]
-            ref = (before[-1] if before else refs[0]) if refs else (para_ctx or heading_ctx)
+            seg_refs = [
+                ref for lo, hi in clauses if lo <= pos < hi
+                for ref in refs if lo <= ref[0] < hi
+            ]
+            if seg_refs:
+                seg_before = [ref for ref in seg_refs if ref[0] <= pos]
+                ref = seg_before[-1] if seg_before else seg_refs[0]
+            else:
+                before = [ref for ref in refs if ref[0] <= pos]
+                ref = (before[-1] if before else refs[0]) if refs else (para_ctx or heading_ctx)
             ref3 = ref[-3:] if ref else None
             if ref3 is None:
                 claims.append(Claim(kind, metric, value, lineno, snippet, None))
@@ -952,12 +1303,19 @@ def extract_claims(text: str, steps: Sequence[Step]) -> tuple[list[Claim], list[
         if is_heading:
             heading_ctx = distinct[0] if len(distinct) == 1 else None
             para_ctx = None
+        elif is_table_row:
+            para_ctx = None
         elif distinct:
             para_ctx = distinct[0] if len(distinct) == 1 else None
     if in_ignore:
         violations.append(
             Violation("MALFORMED_CLAIMS", ignore_line, None,
                       "`claim-guard: ignore-begin` is never closed")
+        )
+    if in_comment:
+        violations.append(
+            Violation("MALFORMED_CLAIMS", comment_line, None,
+                      "HTML comment `<!--` is never closed")
         )
     return claims, violations, ignored
 
@@ -985,6 +1343,8 @@ def _metric_value(step: Step, metric: str) -> int | None:
     if metric == "tests":
         if "passed" in step.counts and "failed" in step.counts:
             return step.counts["passed"] + step.counts["failed"]
+        if "total" in step.counts and "passed" in step.counts:
+            return step.counts["total"]
         return None
     return step.counts.get(metric)
 
@@ -1067,7 +1427,10 @@ def verify_claims(
                         f"`{claim.text}` but step `{step.step_id}` failed ({step.failure()})", step.step_id)
             elif claim.metric == "rc":
                 codes = {step.returncode for step in with_exit if step.returncode is not None}
-                if claim.value not in codes and not (not codes and failing):
+                if not codes:
+                    add("UNBACKED_CLAIM", claim,
+                        f"`{claim.text}`: {scope} record no integer exit code")
+                elif claim.value not in codes:
                     add("EXIT_CODE_MISMATCH", claim,
                         f"`{claim.text}` but {scope} record exit code(s) {sorted(codes)}")
             elif not failing:
@@ -1103,22 +1466,35 @@ def verify_claims(
                 continue
             killed = sum(step.counts["killed"] for step in rated)
             total = sum(step.counts["total"] for step in rated)
-            actual_rate = round(100.0 * killed / total, 2)
-            if abs(float(claim.value) - actual_rate) > 0.005:  # type: ignore[arg-type]
-                code = "INFLATED_COUNT" if float(claim.value) > actual_rate else "COUNT_MISMATCH"  # type: ignore[arg-type]
-                add(code, claim, f"`{claim.text}` but the receipts give {killed}/{total} = {actual_rate}%")
+            claimed_rate = float(claim.value)  # type: ignore[arg-type]
+            exact_rate = 100.0 * killed / total
+            actual_rate = round(exact_rate, 2)
+            # Never round a non-100% kill rate up to 100%, or a non-0% rate down to 0%.
+            boundary_lie = (claimed_rate >= 100.0 and killed < total) or (claimed_rate <= 0.0 and killed > 0)
+            if boundary_lie or claimed_rate > 100.0 or (
+                abs(claimed_rate - exact_rate) > 0.005 and abs(claimed_rate - actual_rate) > 0.005
+            ):
+                code = "INFLATED_COUNT" if claimed_rate > exact_rate else "COUNT_MISMATCH"
+                add(code, claim, f"`{claim.text}` but the receipts give {killed}/{total} = {exact_rate:.4g}%")
 
         elif claim.kind == "axioms":
             with_axioms = [step for step in targets if step.axioms is not None]
             if not with_axioms:
                 add("UNBACKED_CLAIM", claim, f"`{claim.text}`: {scope} report no axiom list")
                 continue
-            allowed = ALLOWED_KERNEL_AXIOMS if claim.metric == "standard_only" else claim.value
+            allowed = ALLOWED_KERNEL_AXIOMS if claim.metric == "standard_only" else set(claim.value)  # type: ignore[arg-type]
             for step in with_axioms:
-                extra = sorted(set(step.axioms or ()) - set(allowed))  # type: ignore[arg-type]
+                step_axioms = set(step.axioms or ())
+                extra = sorted(step_axioms - allowed)
                 if extra:
                     add("AXIOM_SET_MISMATCH", claim,
                         f"`{claim.text}` omits axiom(s) {', '.join(extra)} of step `{step.step_id}`", step.step_id)
+                if claim.metric == "set":
+                    bogus = sorted((allowed - authorized) - step_axioms)
+                    if bogus:
+                        add("AXIOM_SET_MISMATCH", claim,
+                            f"`{claim.text}` lists unauthorized axiom(s) {', '.join(bogus)} absent from step `{step.step_id}`",
+                            step.step_id)
     return out
 
 
@@ -1175,8 +1551,11 @@ def run_guard(
     else:
         claims, claim_violations, ignored = extract_claims(claims_text or "", steps)
         violations += claim_violations
+        # A `Base` SHA is informational context, not a verified claim; a document
+        # with only `Base` SHAs and vague prose must still fail closed.
+        verifiable = [c for c in claims if not (c.kind == "commit_sha" and c.metric == "base")]
         # A document whose only claims are unreadable already fails for that.
-        if not claims and not claim_violations and require_nonempty_claims:
+        if not verifiable and not claim_violations and require_nonempty_claims:
             violations.append(Violation("NO_CLAIMS_EXTRACTED", 0, None,
                                         "the document makes no checkable verification claim"))
     violations += verify_claims(
@@ -1223,9 +1602,25 @@ def format_report(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def _write_json_out(path: Path, report: dict[str, object]) -> None:
+def _write_json_out(path: Path, report: dict[str, object], *, no_symlinks: bool = False) -> None:
+    if no_symlinks and os.path.islink(path):
+        raise OSError(f"{path} is a symlink (--no-symlinks)")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    payload = json.dumps(report, indent=2, ensure_ascii=False) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=".rcg-", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(payload)
+        os.replace(tmp_name, path)
+    except BaseException:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1282,14 +1677,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_elapsed_ms is not None and not (0 < args.max_elapsed_ms < float("inf")):
         parser.error("--max-elapsed-ms must be a positive finite number")
 
+    sink_error: list[str] = []
+
     def write_out(report: dict[str, object]) -> bool:
         if args.json_out is None:
             return True
         try:
-            _write_json_out(args.json_out, report)
+            _write_json_out(args.json_out, report, no_symlinks=args.no_symlinks)
             return True
         except OSError as exc:
-            print(f"ERROR: cannot write {args.json_out}: {exc}", file=sys.stderr)
+            msg = f"cannot write {args.json_out}: {exc}"
+            sink_error.append(msg)
+            print(f"ERROR: {msg}", file=sys.stderr)
             return False
 
     # Fail-closed sink: a report left by an earlier green run must not outlive
@@ -1334,6 +1733,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         report["ok"] = False
     if not sink_ok or not write_out(report):
         report["ok"] = False
+        if report["fatal_error"] is None and sink_error:
+            report["fatal_error"] = sink_error[-1]
     if args.emit_json:
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
