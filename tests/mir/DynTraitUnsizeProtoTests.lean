@@ -882,6 +882,34 @@ theorem canary_a_protector_lifetime :
     ((stateAt false 10).map protectorView).map (·.1) = some [] := by
   decide +kernel
 
+open Anneal.RefFrame in
+/-- **`Trusted` protector and ranged Tree Borrows view agree on c16.** Inside
+the callee of the `&dyn Poke` run (10 steps), the ranged view of the
+`Trusted` borrow state for receiver tag `3` over `Receiver`'s bytes `[0, 4)`
+is protected: the entry reborrow read completes, a foreign write by the owner
+is `ProtectedDisabled` at tag `3`, and after `exitFrameWithProtectors` the same
+write completes. This is the verdict of the end-to-end run
+(`canary_a_c16_receiver_uaf_under_protector`: UB in the callee, `7` after
+return). The raw-pointer run registers no receiver tag (no view). -/
+theorem canary_a_trusted_and_ranged_views_agree :
+    (match stateAt true 10 with
+     | some s =>
+       match rangedReceiverView s.memory 3 0 4 with
+       | some t =>
+         [ accessCode (receiverEnter t 3 0 4).status,
+           accessCode
+             (receiverForeignAccess (receiverEnter t 3 0 4).tree 0 0 4 .Write).status,
+           releaseCode (receiverExit (receiverEnter t 3 0 4).tree 3).status,
+           accessCode
+             (receiverForeignAccess
+               (receiverExit (receiverEnter t 3 0 4).tree 3).tree 0 0 4 .Write).status ]
+       | none => [[9]]
+     | none => [[9]]) = [[0], [2, 0, 4, 3, 2], [0], [0]] ∧
+    (match stateAt false 10 with
+     | some s => (rangedReceiverView s.memory 3 0 4).isNone
+     | none => false) = true := by
+  decide +kernel
+
 end C16
 
 namespace Canary

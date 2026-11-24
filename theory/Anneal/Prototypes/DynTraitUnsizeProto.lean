@@ -2834,6 +2834,43 @@ def releaseCode : ProtectorReleaseStatus → List Nat
   | .AccessFailure o l t e => [2, o, l, t, tbErrCode e]
   | .InvariantFailure o l t => [3, o, l, t]
 
+/-! ### From `Trusted` borrow state to the ranged Tree Borrows view
+
+`rangedReceiverView` reads the receiver protector that `protectVirtualReceiver`
+registered in a `Trusted` `Memory` (the callee's child tag, its parent, their
+permissions, and whether the child's protector is in
+`Memory.activeProtectors`) and builds the corresponding `RangedBorrowTree`
+over the receiver's byte range. The tests evaluate the c16 scenario on both
+sides: the end-to-end `Trusted` run and the ranged view of its state agree. -/
+
+open Anneal.RefFrame in
+/-- Ranged permission of a `Trusted` Tree Borrows permission. -/
+def tbPermOf : TreeBorrowPerm → TbPermission
+  | .cell => .Cell
+  | .reservedFrz c => .ReservedFrz c
+  | .reservedIM => .ReservedIM
+  | .unique => .Unique
+  | .frozen => .Frozen
+  | .disabled => .Disabled
+
+open Anneal.RefFrame in
+/-- Ranged view of the receiver tag `childTag` over `[off, off + size)`: owner
+tag `0` (`Unique`), the child's parent borrow, and the child, protected iff its
+protector is active in `mem`. `none` when `childTag` or its parent is not in
+the borrow table. -/
+def rangedReceiverView (mem : Memory) (childTag off size : Nat) : Option RangedBorrowTree :=
+  match lookupBorrow mem.borrows childTag with
+  | none => none
+  | some c =>
+    match c.parentTag with
+    | none => none
+    | some pt =>
+      match lookupBorrow mem.borrows pt with
+      | none => none
+      | some par =>
+        some (receiverTree 0 pt childTag off size (tbPermOf par.perm) (tbPermOf c.perm)
+          (isBorrowProtected mem.activeProtectors c))
+
 /-! ## §6. `core::ptr::addr_eq` (`rust#166144`) versus wide `==` -/
 
 /-- Equality of the canonical addresses of two pointer words, as the thin
@@ -3668,11 +3705,48 @@ def dynRawBorrowProto?
                     match valid with
                     | true => some (.ok v)
                     | false => some .ub
-        | some { ty := { kind := .rawPtr _ (.dynamic _), .. }, .. } => some (.ok v)
+        | some { ty := { kind := .rawPtr srcMut (.dynamic _), .. }, .. } =>
+          -- `&raw mut (*p)` with `p : *const dyn Trait` is rejected by `rustc`
+          -- (E0596), exactly like `&raw mut (*r)` with `r : &dyn Trait`.
+          match unsizeMutCompatible (V06.lowerMut srcMut) (V06.lowerMut mutKind) with
+          | false => some .unsupported
+          | true => some (.ok v)
         | _ => some .unsupported
       | _ => none
     | _ => none
   | _ => none
+
+/-- **Raw-to-raw borrows are unchecked, and mutability never escalates.**
+`&raw const (*p)` / `&raw mut (*p)` of a raw trait-object pointer `p` return
+`p`'s value unchanged (no vtable or validity check: Miri performs none), except
+that `&raw mut (*p)` with `p : *const dyn Trait` is ill-typed MIR and fails
+closed. -/
+theorem dynRawBorrowProto?_raw_source
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (locals : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (r : Local)
+    (v : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (decl : LocalDecl)
+    (traitKey : String) (srcMut : Mutability)
+    (hSlot : get? locals r = some (.init v))
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hDecl : get? localDecls r = some decl)
+    (hTy : decl.ty.kind = .rawPtr srcMut (.dynamic traitKey)) :
+    dynRawBorrowProto? vt ptrBytes .not locals mem localDecls layouts
+        { local_ := r, projection := [.deref] } = some (.ok v) ∧
+    dynRawBorrowProto? vt ptrBytes .mut locals mem localDecls layouts
+        { local_ := r, projection := [.deref] } =
+      (match srcMut with
+       | .mut => some (.ok v)
+       | .not => some .unsupported) := by
+  obtain ⟨mu, ⟨kind, idx⟩, dn⟩ := decl
+  simp only at hTy
+  subst hTy
+  constructor
+  · unfold dynRawBorrowProto?
+    simp only [hSlot, hDec, hDecl]
+    cases srcMut <;> rfl
+  · unfold dynRawBorrowProto?
+    simp only [hSlot, hDec, hDecl]
+    cases srcMut <;> rfl
 
 /-- **Raw borrows of a valid live `dyn` reference perform no Tree Borrows
 permission check.** Even if the borrow tag's permission is `.disabled` or
