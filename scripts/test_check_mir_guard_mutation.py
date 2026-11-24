@@ -5134,5 +5134,155 @@ class GuardMutationEp2A1AdversarialTests(unittest.TestCase):
             self.assertIn(f"cannot read {self.LEAN_REL}", lean_req[0])
 
 
+class GuardMutationEp2B2AdversarialTests(unittest.TestCase):
+    """Round 2 adversarial regression tests for Shard A scanner/probe/lexing gaps."""
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        return [f.pattern for f in gmut.detect_postcondition_error_wildcards(source, language=language)]
+
+    def test_rust_block_like_arms_without_commas_nested_ifs_matches_and_closures(self) -> None:
+        # Block-like Rust arms without trailing commas (standard `rustfmt` output) must NOT swallow
+        # the following `Ok(v)` arm or drop `ok_groups`.
+        for source, expected in (
+            (
+                "match out {\n"
+                "    Err(_) => if c { true } else { true }\n"
+                "    Ok(v) => *v == 1,\n"
+                "}\n",
+                ["err_arm_true"],
+            ),
+            (
+                "match out {\n"
+                "    Err(_) => if c1 || c2 { true } else if c3 && c4 { true } else { true }\n"
+                "    Ok(v) => *v == 1,\n"
+                "}\n",
+                ["err_arm_true"],
+            ),
+            (
+                "match out {\n"
+                "    Err(_) => match x { _ => true }\n"
+                "    Ok(v) => *v == 1,\n"
+                "}\n",
+                ["err_arm_true"],
+            ),
+            (
+                "match out {\n"
+                "    Err(_) => match x {\n"
+                "        A => { true }\n"
+                "        B => { true }\n"
+                "    }\n"
+                "    | Ok(v) => *v == 1,\n"
+                "}\n",
+                ["err_arm_true"],
+            ),
+            (
+                "match out {\n"
+                "    Ok(v) => if c { *v == 1 } else { *v == 2 }\n"
+                "    _ => true,\n"
+                "}\n",
+                ["catch_all_arm_true"],
+            ),
+            ("Err(_) => move |_| true", ["err_arm_true"]),
+            ("Err(_) => move || true", ["err_arm_true"]),
+            ("Err(_) => |_| -> bool { true }", ["err_arm_true"]),
+            ("Err(_) => move |_: &E| -> bool { !false }", ["err_arm_true"]),
+            ("Err(_) => unsafe { true }", ["err_arm_true"]),
+            ("Err(e) => !(e == E::Overflow) || e == E::Overflow", ["err_arm_true"]),
+            ("Err(_) => { let ok = !false; ok }", ["err_arm_true"]),
+            ("Err(_) => { let _ = !x; true }", ["err_arm_true"]),
+            ("Err(_) => { let mut ok = false; ok = !false; ok }", ["err_arm_true"]),
+        ):
+            self.assertEqual(self._patterns(source, "rust"), expected, source)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(source, "err", language="rust")["status"],
+                "SURVIVED",
+                source,
+            )
+
+        # Sound constrained arms must NOT trigger false positives:
+        # 1. Mutable reassignment of `ok` to a real error predicate.
+        # 2. Compound assignment (`&=`) or helper assertion call inside a block.
+        # 3. `!x && y || x && y` (evaluates to `y`, NOT `true`!).
+        # 4. `if let Foo { a } = e { *a == 1 } else { false }` (brace inside `if let` pattern).
+        # 5. `match x` whose arms disagree (`true` vs `false`).
+        for guarded in (
+            "Err(e) => { let mut ok = true; ok = *e == E::Overflow; ok }",
+            "Err(e) => { let mut ok = true; ok &= *e == E::Overflow; ok }",
+            "Err(e) => { assert_overflow(e); true }",
+            "Err(e) => !x && y || x && y",
+            "Err(e) => !a == b || a == b",
+            "Err(e) => if let Foo { a } = e { *a == 1 } else { false }",
+            "Err(e) => match e { E::Overflow => true, _ => false }",
+            "Err(e) => if c1 || c2 { *e == E::Overflow } else if c3 { true } else { false }",
+        ):
+            self.assertEqual(self._patterns(guarded, "rust"), [], guarded)
+            self.assertEqual(
+                gmut.probe_postcondition_error_wildcard_mutant(guarded, "err", language="rust")["status"],
+                "KILLED",
+                guarded,
+            )
+
+    def test_lean_nested_if_pattern_lambdas_nested_match_let_shadowing_and_precedence(self) -> None:
+        for source, expected in (
+            ("| .ub => if c1 then True else if c2 then True else True", ["ub_arm_true"]),
+            ("| .ub => if c1 then if c2 then True else True else True", ["ub_arm_true"]),
+            ("| .ub => fun | _ => True", ["ub_arm_true"]),
+            (
+                "def post : Outcome Nat → Prop\n"
+                "  | .err _ => fun | _ => True\n"
+                "  | .ok v => v = 1\n",
+                ["err_arm_true"],
+            ),
+            (
+                "def post (x : Bool) : Outcome Nat → Prop\n"
+                "  | .ok v => v = 1\n"
+                "  | .err _ =>\n"
+                "    match x with\n"
+                "    | true => True\n"
+                "    | false => True\n",
+                ["err_arm_true"],
+            ),
+            ("| .err e => ¬(e = .overflow) ∨ e = .overflow", ["err_arm_true"]),
+            ("| .ub =>\n  let p := True\n  let p := p\n  p", ["ub_arm_true"]),
+        ):
+            self.assertEqual(self._patterns(source, "lean"), expected, source)
+
+        # Sound Lean arms must NOT trigger false positives:
+        # 1. `let p := True` shadowed by `let p := (e = .overflow)` or `fun p => p`.
+        # 2. `¬p ∧ q ∨ p ∧ q` (evaluates to `q`, NOT `True`!).
+        # 3. Variable named `or` / `and` (`| .err or => or = .overflow`).
+        # 4. Non-catch-all single-arm `fun | 0 => True` or `fun | _ => False` or disagreeing `match`.
+        for guarded in (
+            "| .err e =>\n  let p := True\n  let p := (e = .overflow)\n  p",
+            "| .err e =>\n  let p := True\n  fun p => p",
+            "| .err e =>\n  let p := True\n  let p := !p\n  p",
+            "| .err e => ¬p ∧ q ∨ p ∧ q",
+            "| .err or => or = .overflow",
+            "| .err and => and = .overflow",
+            "| .ub => fun | 0 => True",
+            "| .ub => fun | _ => False",
+            "def post (x : Bool) : Outcome Nat → Prop\n  | .ok v => v = 1\n  | .err _ =>\n    match x with\n    | true => True\n    | false => False\n",
+            "def post : Outcome Nat → Prop\n  | .ok v => fun | _ => True\n  | .ub => False\n",
+        ):
+            self.assertEqual(self._patterns(guarded, "lean"), [], guarded)
+
+    def test_empty_lean_guillemets_and_cross_language_unclosed_comments_fail_closed(self) -> None:
+        # Empty / whitespace-only guillemets fail closed (matching Episode 1's `SpecBoundaryGuards.lean`).
+        for bad_guil in ("| .ub => «»", "| .ub => «   »"):
+            self.assertEqual(self._patterns(bad_guil, "lean"), ["unclosed_literal_or_comment"], bad_guil)
+        # Under `language="auto"`, an unclosed block comment of one language with keywords of the other
+        # must NOT silently drop the failing language!
+        for cross_hazard in (
+            "/* unclosed Rust comment (fun stuff)\nErr(_) => false",
+            "/- unclosed Lean comment (fn demo; Err(e))\n| .ub => False",
+            "fn demo() { let _ = «unclosed; }\nErr(_) => false",
+        ):
+            self.assertEqual(
+                self._patterns(cross_hazard, "auto"),
+                ["unclosed_literal_or_comment"],
+                cross_hazard,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1125,5 +1125,139 @@ class Ep2A1AdversarialTests(GuardHarness):
         )
 
 
+class Ep2B2AdversarialTests(GuardHarness):
+    """Round 2 adversarial regression tests closing A1's remaining bypasses."""
+
+    def test_multi_ref_lines_table_cells_and_bare_unknown_bullets_cannot_overshadow_claims(self) -> None:
+        # Real leading step MUST NOT overshadow a later unbacked command or second step on the same line.
+        for prose, expected in (
+            ("- `unit_tests`: 42 passed, `cargo test --workspace` rc=0\n", ["UNBACKED_CLAIM"]),
+            ("- `unit_tests`: rc=0, `cargo_test`: 42 passed\n", ["COUNT_MISMATCH"]),
+            ("- `unit_tests`: rc=0, `cargo_test`: 200 passed\n", ["INFLATED_COUNT"]),
+            ("| `unit_tests` | 42 passed, `cargo test --workspace` rc=0 |\n", ["UNBACKED_CLAIM"]),
+            # Bare unquoted snake_case/kebab-case bullet under a real heading cannot inherit heading context.
+            ("## unit_tests\n- fabricated_step: rc=0, 42 passed\n", ["MISSING_STEP_RECEIPT"]),
+            ("## unit_tests\n- fake-gate: rc=0, 42 passed\n", ["MISSING_STEP_RECEIPT"]),
+        ):
+            self.assertEqual(self.codes(prose), expected, prose)
+        # Conversely, a genuine multi-step line where both steps match their receipts stays green.
+        self.assertEqual(
+            self.codes("- `unit_tests`: 42 passed, `cargo_test`: 118 passed\n"),
+            [],
+        )
+        # Parenthetical/comparative references still do not hijack a fabricated leading label.
+        self.assertEqual(
+            self.codes("- `fabricated_step` (same as `unit_tests`): rc=0, 42 passed\n"),
+            ["MISSING_STEP_RECEIPT"],
+        )
+
+    def test_code_fence_info_strings_and_inline_tildes_are_audited(self) -> None:
+        # Claims smuggled into a fence opener info string or single-line `~~~ ... ~~~` are audited.
+        self.assertEqual(
+            self.codes("``` unit_tests: 999 passed, rc=0\n```\n`unit_tests`: rc=0\n"),
+            ["INFLATED_COUNT"],
+        )
+        self.assertEqual(
+            self.codes("~~~ `unit_tests`: 999 passed ~~~\n`unit_tests`: rc=0\n"),
+            ["INFLATED_COUNT"],
+        )
+        # Ordinary language tags on fence openers (e.g. `bash`, `text`, `c++`) do not trigger false positives.
+        self.assertEqual(
+            self.codes("```bash\n$ python3 -B -m unittest scripts/test_check_mir_guard_mutation.py -v\nrc=0, 42 passed\n```\n"),
+            [],
+        )
+
+    def test_backticked_bad_kvs_colon_placeholders_negated_rc_ok_and_quoted_unicode_shas(self) -> None:
+        for bad in (
+            "`unit_tests`: passed=`TBD`, rc=0",
+            "`unit_tests`: failed_count: `unknown`, rc=0",
+            "`unit_tests`: passed: TBD, rc=0",
+            "`unit_tests`: failed: N/A, rc=0",
+            "`spec_boundary_guards`: sorry: unknown, rc=0",
+            "kill_rate=`NaN`, 20 killed",
+            "kill rate: NaN, 20 killed",
+        ):
+            self.assertIn("MALFORMED_CLAIM", self.codes(bad, [bundle(), guard_mutation()]), bad)
+
+        # Negated rc=0 / ok=true and `rc != 0` respect polarity instead of firing backwards.
+        failed_step = [bundle(unit_tests={"returncode": 1, "ok": False})]
+        for prose in (
+            "`unit_tests`: rc != 0",
+            "`unit_tests`: exit_code ≠ 0",
+            "`unit_tests`: not rc=0",
+            "`unit_tests`: not ok=true",
+            "`unit_tests`: did not exit 0",
+        ):
+            self.assertEqual(self.codes(prose, failed_step), [], prose)
+            self.assertIn("EXIT_CODE_MISMATCH", self.codes(prose), prose)
+
+        # Quoted SHAs and Unicode `→` arrow forms are extracted and verified.
+        for bad_sha in (
+            f'Commit SHA: "{OTHER_SHA[:12]}"\n`unit_tests`: rc=0\n',
+            f"Commit SHA: '{OTHER_SHA[:12]}'\n`unit_tests`: rc=0\n",
+            f"HEAD → {OTHER_SHA[:12]}\n`unit_tests`: rc=0\n",
+        ):
+            self.assertEqual(self.codes(bad_sha), ["COMMIT_SHA_MISMATCH"], bad_sha)
+        for good_sha in (
+            f'Commit SHA: "{SHA[:12]}"\n`unit_tests`: rc=0\n',
+            f"HEAD → `{SHA[:12]}`\n`unit_tests`: rc=0\n",
+        ):
+            self.assertEqual(self.codes(good_sha), [], good_sha)
+
+    def test_suppressed_failure_holes_local_test_axioms_and_symlinked_cwd_ancestor(self) -> None:
+        # 1. `0 failed` cannot mask a bundle step that failed with `errors=1, failed_count=0`.
+        errored_unit = [bundle(unit_tests={"returncode": 1, "ok": False, "failed_count": 0, "errors": 1})]
+        self.assertEqual(self.codes("`unit_tests`: 0 failed", errored_unit), ["SUPPRESSED_FAILURE"])
+        # 2. `0 survived` cannot mask an errored guard_mutation step (`errors=1, survived=0, ok=False`, no fatal_error).
+        errored_gm_report = {
+            "ok": False, "fatal_error": None, "mode": "all",
+            "total": 20, "killed": 19, "survived": 0, "errors": 1, "kill_rate_pct": 95.0,
+            "results": (
+                [{"guard_id": f"g{i}", "status": "KILLED"} for i in range(19)]
+                + [{"guard_id": "g19", "status": "ERROR"}]
+            ),
+        }
+        self.assertEqual(self.codes("`guard_mutation`: 0 survived", [errored_gm_report]), ["SUPPRESSED_FAILURE"])
+        # 3. `0 errors` cannot mask a crashed step (`rc=2, ok=False, errors=0`) without `fatal_error`.
+        crashed_errors_zero = [
+            bundle(unit_tests={"returncode": 2, "ok": False, "failed_count": 0, "errors": 0})
+        ]
+        self.assertEqual(self.codes("`unit_tests`: 0 errors", crashed_errors_zero), ["SUPPRESSED_FAILURE"])
+
+        # 4. Malformed `downstream.localTestAxioms: true` (bool is a subclass of int!) fails closed.
+        bad_ct = {
+            **CHECK_TRUSTED,
+            "downstream": {**CHECK_TRUSTED["downstream"], "localTestAxioms": True},
+        }
+        self.assertIn("MALFORMED_RECEIPT", self.codes("`check_trusted`: rc=0", [bad_ct]))
+
+        # 5. Relative path reached through a symlinked ancestor directory of `cwd` (`PWD`) fails closed.
+        real_root = self.tmp / "real_root"
+        sub = real_root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "r.json").write_text(json.dumps(bundle()), encoding="utf-8")
+        (sub / "c.md").write_text("`unit_tests`: rc=0\n", encoding="utf-8")
+        sym_root = self.tmp / "sym_root"
+        os.symlink(real_root, sym_root)
+        old_cwd = os.getcwd()
+        old_pwd = os.environ.get("PWD")
+        try:
+            os.chdir(sym_root / "sub")
+            os.environ["PWD"] = str(sym_root / "sub")
+            rc_rel, out_rel, _ = self.run_main(
+                ["--claims", "c.md", "--receipt", "r.json", "--no-symlinks", "--json"]
+            )
+        finally:
+            os.chdir(old_cwd)
+            if old_pwd is None:
+                os.environ.pop("PWD", None)
+            else:
+                os.environ["PWD"] = old_pwd
+        self.assertEqual(rc_rel, 1, out_rel)
+        codes = [v["code"] for v in json.loads(out_rel)["violations"]]
+        self.assertIn("UNREADABLE_CLAIMS", codes)
+        self.assertIn("MALFORMED_RECEIPT", codes)
+
+
 if __name__ == "__main__":
     unittest.main()
