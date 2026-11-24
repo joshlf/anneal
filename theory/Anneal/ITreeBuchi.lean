@@ -71,6 +71,8 @@ Trees*):
   against load-spinning and CAS-ignoring loops, a one-shot `Committer` monitor
   (`FairBuchiSat`), target-stateful `interpState_stateful` lowering, and the
   failure of `DWP`.
+- **Capstone** (§6): `temporal_hierarchy` / `temporal_hierarchy_strict` package
+  the strict chain `DWP ⊊ InfOften ⊊ FairInfOften ⊊ DWLP`.
 - **`iterChain`**: the finite-unfolding $\omega$-chain of `ITree.iter`, its
   convergence in the projective `CofixA` order (`ofITree_iterChain`), and the
   safety ($\bigwedge_n$) versus eventuality ($\bigvee_n$) continuity laws.
@@ -13279,5 +13281,52 @@ theorem tryUpdate_interpState_stateful (f : Nat → Nat) (h₀ : List Nat) (c₀
         · exact False.elim (hnf rfl)
 
 end TryUpdate
+
+/-! ## 6. The Strict Temporal Hierarchy `DWP ⊊ InfOften ⊊ FairInfOften ⊊ DWLP` -/
+
+section TemporalHierarchy
+
+/--
+**Capstone (inclusions).** For every transformer, accepting edges and fair
+edges: total correctness implies Büchi recurrence, which implies
+fairness-conditional (Streett) recurrence, which implies partial correctness.
+-/
+theorem temporal_hierarchy {S : Type u} {E : Effect.{u}} {R : Type u}
+    (ewp : StateEffectWP S E) (AccEdge Fair : (i : E.I) → E.O i → S → S → Prop)
+    (Q : R → S → Prop) (t : ITree E R) (s : S) :
+    (DWP ewp t Q s → InfOften ewp AccEdge Q t s) ∧
+      (InfOften ewp AccEdge Q t s → FairInfOften ewp AccEdge Fair Q t s) ∧
+      (FairInfOften ewp AccEdge Fair Q t s → DWLP ewp t Q s) :=
+  ⟨infOften_of_dwp AccEdge, InfOften.toFairInfOften Fair, FairInfOften.toDWLP⟩
+
+/--
+**Capstone (strictness).** Each inclusion of `temporal_hierarchy` is strict,
+witnessed with the *same* accepting edges on both sides:
+
+* the heartbeat service `loop { emit () }` is Büchi-recurrent (every emission
+  accepting) but not totally correct;
+* the CAS retry loop is fairness-conditionally live but not Büchi-recurrent
+  without accepting edges;
+* `ITree.spin` is partially correct but never fairness-conditionally live.
+-/
+theorem temporal_hierarchy_strict :
+    (InfOften (obsIgnoreWP PUnit.{1} PUnit.{1}) (fun _ _ _ _ => True)
+        (fun _ _ => True) (divergingLoop heartbeat.{0} PUnit.unit) PUnit.unit ∧
+      ¬ DWP (obsIgnoreWP PUnit.{1} PUnit.{1})
+        (divergingLoop heartbeat.{0} PUnit.unit) (fun _ _ => True) PUnit.unit) ∧
+    (FairInfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False) casFair
+        (fun _ _ => True) casLoop PUnit.unit ∧
+      ¬ InfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False)
+        (fun _ _ => True) casLoop PUnit.unit) ∧
+    (DWLP (pickWP PUnit.{1} Bool) (ITree.spin (E := CasE) (R := PUnit.{1}))
+        (fun _ _ => True) PUnit.unit ∧
+      ¬ FairInfOften (pickWP PUnit.{1} Bool) (fun _ _ _ _ => False) casFair
+        (fun _ _ => True) (ITree.spin (E := CasE) (R := PUnit.{1})) PUnit.unit) :=
+  ⟨⟨(infOften_heartbeat_not_chain_continuous _).1,
+    (infOften_heartbeat_not_chain_continuous _).2.2⟩,
+   ⟨fairInfOften_strict_separation.1.1, fairInfOften_strict_separation.1.2.2⟩,
+   ⟨DWLP.spin _ _ _, not_fairInfOften_spin⟩⟩
+
+end TemporalHierarchy
 
 end Anneal.ITreeBuchi
