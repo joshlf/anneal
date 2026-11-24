@@ -792,6 +792,27 @@ theorem u8_counter_mr_bm_and_tb_witness (delta limit : Nat) (hno : limit + delta
   exact ⟨tryUpdate_mr_bm_u8_safety (counter_realizable delta limit) hpre hrep b₀ acc₀ rfl hs₀,
     tryUpdate_mr_tb_u8_safety (counter_realizable delta limit) hpre hrep b₀ acc₀ rfl hs₀⟩
 
+/--
+**Machine-level Streett liveness for the `u8` counter**: on every symbolic `u8`
+`Mach` cell with monotone concurrent interference, `□◇ CasWon` forces the
+counter's `tryUpdateLoop` to return through MiniRust with the full contract.
+-/
+theorem u8_counter_mr_bm_fair (delta limit : Nat) (hno : limit + delta ≤ 256)
+    (b₀ : UInt8) (acc₀ : List MiniRustSpec.Gen.Access) (budget : Nat) :
+    CoBuchi (mrCellWP (counterEnv delta limit) MiniRustSpec.AtomicIntrinsicsMR.bmPtr
+        MiniRustSpec.AtomicIntrinsicsMR.tyRawPtr MiniRustSpec.AtomicIntrinsicsMR.itU8
+        (bmU8MRely (· ≤ ·))) CasWon
+      (fun r ms => bmU8MInv ms.1 ms.2.cell ∧
+        CreusotPost (counterEnv delta limit) (· ≤ ·) b₀.toNat 0 [] (.fresh b₀.toNat) r ms.2)
+      (tryUpdateLoop Nat)
+      (bmU8Mach b₀ acc₀, ⟨b₀.toNat, 0, .fresh b₀.toNat, 0, [], budget⟩) := by
+  refine tryUpdate_mr_bm_u8_fair (fun v => Nat.le_refl v) (counter_pre delta limit b₀.toNat 0 [])
+    ?_ b₀ acc₀ rfl ⟨rfl, rfl, rfl, rfl, rfl⟩
+  intro _ x _ n _ ⟨_, hr⟩ _
+  by_cases hx : x < limit
+  · simp only [hx, ↓reduceIte] at hr; cases hr; omega
+  · simp only [hx, ↓reduceIte] at hr; cases hr
+
 /-! ## 2. Negative Fail-Closed Canaries -/
 
 /-! ### 2.1 Silent divergence -/
@@ -1134,6 +1155,9 @@ run_cmd do
     , ``Anneal.AtomicHistInv.unrealizable_resolve_miracle
     , ``Anneal.AtomicHistInv.mrCellWP_tb_ticket_nonvacuous
     , ``Anneal.AtomicHistInv.mrCellWP_empty_rely_miracle
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_fairInfOften
+    , ``Anneal.AtomicHistInv.tryUpdate_mr_bm_u8_fair
+    , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u8_counter_mr_bm_fair
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_inconsistent_miracle
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.prophecy_consistent_nonvacuous
     , ``Anneal.ITreeBuchiAndAtomicHistInvTests.u64_counter_prophecy_eliminated

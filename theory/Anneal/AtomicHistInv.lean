@@ -52,8 +52,10 @@ A specification and verification library for `SeqCst` `Atomic::try_update` /
   (`mrCellWP_nonvacuous_not_false`), fail-closed out-of-range `specPanic`
   (`mr_cas_out_of_range_specPanic_canary`), positive universal symbolic
   instances on both `Mach` (`bmU8_mrCellAdmissible`, `tryUpdate_mr_bm_u8_safety`)
-  and `MachTB` (`tbU8_mrCellAdmissible`, `tryUpdate_mr_tb_u8_safety`), and
-  fail-closed rejection of misaligned / `u128` / `Frozen` UB.
+  and `MachTB` (`tbU8_mrCellAdmissible`, `tryUpdate_mr_tb_u8_safety`),
+  machine-backed Streett liveness (`tryUpdate_mr_fairInfOften`,
+  `tryUpdate_mr_bm_u8_fair`), and fail-closed rejection of misaligned / `u128` /
+  `Frozen` UB.
 * **§9** Fail-closed boundaries: irreflexive relations (on both `Err` and failed
   CAS), non-transitive relations, non-`hist_inv`-closed closure preconditions,
   one-shot committer double-fire rejection, weak-vs-strong CAS 2-axis
@@ -2646,6 +2648,102 @@ theorem tryUpdate_mr_tb_wfLive_safety {FState G : Type}
     (fun _ _ hq => ⟨⟨hq.1.1, hq.1.2⟩, hq.2⟩) h
 
 /--
+**Machine-backed Streett liveness (`tryUpdate_mr_fairInfOften`)**: on every
+coupled-admissible MiniRust cell, along every run on which a weak CAS *wins*
+infinitely often (`□◇ CasWon`), `tryUpdateLoop` returns through real
+`evalIntrinsicM` steps with the machine still holding the logical cell and the
+full `creusot#2386` contract — for any accepting edges. Lifts §6's
+`tryUpdate_fairInfOften` from the abstract environment to MiniRust machines.
+-/
+theorem tryUpdate_mr_fairInfOften {M FState G : Type} [Memory M] [MemoryOps M]
+    {A : AtomicEnv Nat FState G} {Rel : Nat → Nat → Prop}
+    {ptr : ThinPointer (Memory.Provenance M)} {pty : «Type»} {t : IntType}
+    {mRely : Machine M → Machine M → Prop} {MInv : Machine M → Nat → Prop}
+    {init : Nat} {f₀ : FState} {g₀ : G} {comm₀ : OneShotCommitter Nat}
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ (n : Nat), A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → IntType.can_represent t (n : Int) = true)
+    (hadm : MrCellAdmissible A ptr pty t mRely MInv)
+    {m₀ : Machine M} {s₀ : AtomicSt Nat FState G}
+    (hm₀ : MInv m₀ s₀.cell) (hs₀ : InitSt init f₀ g₀ comm₀ s₀)
+    (AccEdge : (i : (AtomicCellE Nat).I) → (AtomicCellE Nat).O i →
+      MrAtomicSt M FState G → MrAtomicSt M FState G → Prop) :
+    FairInfOften (mrCellWP A ptr pty t mRely) AccEdge CasWon
+      (fun r ms => MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (m₀, s₀) := by
+  refine FairInfOften.vis fun m₁ hm₁ => ?_
+  obtain ⟨c₁, _, hmc₁⟩ := hadm.rely_pres m₀ _ m₁ hm₀ hm₁
+  refine ⟨hadm.load_ok m₁ c₁ hmc₁, fun v m₂ hload => ?_⟩
+  obtain ⟨hv, hm2⟩ := mr_observe hadm hm₀ hm₁ hload
+  refine ⟨hv, fun b => ?_⟩
+  dsimp only [loadAns]
+  refine FairInfOften.iter_fair tryBody
+    (fun (prev : Nat) (ms : MrAtomicSt M FState G) =>
+      MInv ms.1 ms.2.cell ∧ LoopInv A Rel init f₀ g₀ comm₀ prev ms.2)
+    (fun prev ms hms => ?_) (init := v.toNat) (s := (m₂, { s₀ with cell := v.toNat, budget := b }))
+    ⟨hm2, loopInv_of_init hpre hs₀ hv b⟩
+  obtain ⟨m, s⟩ := ms
+  obtain ⟨hm, hl⟩ := hms
+  refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2
+    ⟨loopInv_pre hpre hl, fun f' r hpost => Or.inr ⟨fun h => h, ?_⟩⟩
+  have hinv := loopInv_call hpre hl hpost
+  cases r with
+  | none =>
+    dsimp only
+    change fairIter (mrCellWP A ptr pty t mRely) CasWon _ _ true
+      (tryCallK prev (callOut prev none)) _
+    rw [tryCallK_none]
+    refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2 fun m₁' hm₁' => ?_
+    obtain ⟨c', _, hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.load_ok m₁' c' hmc', fun v' m₂' hload' => ?_⟩
+    obtain ⟨hv', hm2'⟩ := mr_observe hadm hm hm₁' hload'
+    exact ⟨hv', fun b' hres => Or.inr ⟨fun h => h, (fairIter.ret_inr_iff _ _ _ _ _ _ _).2
+      ⟨hm2', loopInv_err_post hpre hl hpost hv' b' hres⟩⟩⟩
+  | some next =>
+    dsimp only
+    change fairIter (mrCellWP A ptr pty t mRely) CasWon _ _ true
+      (tryCallK prev (callOut prev (some next))) _
+    rw [tryCallK_some]
+    have hnext_rep : IntType.can_represent t next = true :=
+      hrep s.fst prev f' next hl.2.2.1 hpost hl.1
+    refine (fairIter.vis_iff _ _ _ _ _ _ _ _).2 fun m₁' hm₁' => ?_
+    obtain ⟨c', hc', hmc'⟩ := hadm.rely_pres m _ m₁' hm hm₁'
+    refine ⟨hadm.cas_ok m₁' c' prev next hmc' hnext_rep, fun ret m₂' hcas => ?_⟩
+    obtain ⟨hret, hstore, hkeep⟩ := hadm.cas_val m₁' c' prev next ret m₂' hmc' hnext_rep hcas
+    have hrel : A.rely s.cell ret.toNat := hret ▸ hc'
+    refine ⟨hrel, fun b' => ⟨fun hne => ?_, fun heq => ?_⟩⟩
+    · refine Or.inr ⟨fun h => Bool.noConfusion h, ?_⟩
+      dsimp only
+      change fairIter (mrCellWP A ptr pty t mRely) CasWon _ _ true
+        (tryCasK prev next (casOut prev next false ret.toNat)) _
+      rw [tryCasK_false]
+      have hm2' : MInv m₂' ret.toNat := hret ▸ hkeep (hret ▸ hne)
+      exact (fairIter.ret_inl_iff _ _ _ _ _ _ _).2
+        ⟨rfl, hm2', loopInv_fail hpre hl hpost hrel b'⟩
+    · refine ⟨⟨loopInv_unshot (s := s) hpre hl, loopInv_win_pre (s := s) hpre hl hpost,
+        fun g' hg' => Or.inl ⟨rfl, ?_⟩⟩,
+        fun mFail hfail => Or.inr ⟨fun h => Bool.noConfusion h, ?_⟩⟩
+      · dsimp only
+        rw [tryCasK_true]
+        have hm2' : MInv m₂' next := hstore (hret ▸ heq)
+        refine DWP.vis fun m₁'' hm₁'' => ?_
+        obtain ⟨c'', _, hmc''⟩ := hadm.rely_pres m₂' next m₁'' hm2' hm₁''
+        refine ⟨hadm.load_ok m₁'' c'' hmc'', fun v'' m₂'' hload'' => ?_⟩
+        obtain ⟨hv'', hm2''⟩ := mr_observe hadm hm2' hm₁'' hload''
+        refine ⟨hv'', fun b'' hres => DWP.ret ⟨hm2'', ?_⟩⟩
+        have hok := loopInv_ok_post hpre hl hpost hg' hv'' b' b'' hres
+        simpa only [heq] using hok
+      · dsimp only
+        change fairIter (mrCellWP A ptr pty t mRely) CasWon _ _ true
+          (tryCasK prev next (casOut prev next false ret.toNat)) _
+        rw [tryCasK_false]
+        have hmf : MInv mFail ret.toNat := by
+          have := (hadm.load_val m₁' c' ret mFail hmc' hfail)
+          exact this.1 ▸ this.2
+        exact (fairIter.ret_inl_iff _ _ _ _ _ _ _).2
+          ⟨rfl, hmf, loopInv_fail hpre hl hpost hrel b'⟩
+
+/--
 **General non-vacuity of `mrCellWP`**: for ANY memory model `M`, ANY
 `Realizable A`, and ANY coupled `MrCellAdmissible` invariant, `mrCellWP` cannot
 discharge `DWP … False` from any admissible state (`MInv m₀ s₀.cell`) — every
@@ -3269,6 +3367,28 @@ theorem tryUpdate_mr_bm_u8_safety {FState G : Type} {A : AtomicEnv Nat FState G}
   have hm₀ : bmU8MInv (bmU8Mach b₀ acc₀) s₀.cell := ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩
   exact ⟨tryUpdate_mr_always_safety hpre hrep' hadm hm₀ hs₀,
     mrCellWP_nonvacuous_not_false hR hpre hrep' hadm hm₀ hs₀⟩
+
+/--
+**Streett liveness on a real symbolic `u8` `Mach` cell**: for every byte `b₀`,
+every access log, and arbitrary `rely`-respecting concurrent interference, once
+a weak CAS wins infinitely often `tryUpdateLoop` returns through MiniRust
+`evalIntrinsicM` with the `creusot#2386` contract (`CoBuchi` form).
+-/
+theorem tryUpdate_mr_bm_u8_fair {FState G : Type} {A : AtomicEnv Nat FState G}
+    {Rel : Nat → Nat → Prop} {init : Nat} {f₀ : FState} {g₀ : G}
+    {comm₀ : OneShotCommitter Nat}
+    (hrefl : ∀ v, A.rely v v)
+    (hpre : TryUpdatePre A Rel init f₀ g₀ comm₀)
+    (hrep : ∀ f₂ x f₃ n, A.fSpec.hist_inv f₀ f₂ → A.fSpec.post_mut f₂ x f₃ (some n) →
+      Rel init x → n < 256)
+    (b₀ : UInt8) (acc₀ : List Access) {s₀ : AtomicSt Nat FState G}
+    (hb₀ : b₀.toNat = init) (hs₀ : InitSt init f₀ g₀ comm₀ s₀) :
+    CoBuchi (mrCellWP A bmPtr tyRawPtr itU8 (bmU8MRely A.rely)) CasWon
+      (fun r ms => bmU8MInv ms.1 ms.2.cell ∧ CreusotPost A Rel init f₀ g₀ comm₀ r ms.2)
+      (tryUpdateLoop Nat) (bmU8Mach b₀ acc₀, s₀) :=
+  tryUpdate_mr_fairInfOften hpre
+    (fun f₂ x f₃ n hf hp hr => (u8_can_represent_iff n).2 (hrep f₂ x f₃ n hf hp hr))
+    (bmU8_mrCellAdmissible A hrefl) ⟨b₀, acc₀, hb₀.trans hs₀.1.symm, rfl⟩ hs₀ _
 
 end MrBridge
 
