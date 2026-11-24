@@ -13,7 +13,9 @@ import Miri.Interpreter.AllocationMachine
 import Miri.Interpreter.LeakCheck
 import Miri.Interpreter.Cast
 import Miri.Interpreter.ExecutionScalar
+import Miri.Interpreter.MemoryErrors
 import Miri.TreeBorrows.MachineMemoryHooks
+import Miri.TreeBorrows.RetagPipeline
 import LeanMiriSpec.MemoryLemmas
 
 /-!
@@ -21,8 +23,10 @@ import LeanMiriSpec.MemoryLemmas
 
 This module is about the vendored, unmodified `lean-miri` only. It studies
 `Miri.Memory.MemoryLifecycle.{allocatePtr, deallocatePtrWith, deallocatePtr}`
-(rustc `interpret/memory.rs`), the classification
-`Miri.Interpreter.AllocationMachine.deallocationError`, the Tree Borrows
+(rustc `interpret/memory.rs`), `Miri.Memory.getPtrAccess`,
+`Miri.Interpreter.MemoryErrors.{access, allocation}`,
+`Miri.Interpreter.AllocationMachine.{deallocate, deallocationError}`, the Tree
+Borrows pipeline `Miri.TreeBorrows.RetagPipeline.retagPointerValue` and
 deallocation hook `Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryDeallocation`
 over `Miri.TreeBorrows.BorrowTree.{new, newChild, performBorrowAccessRange,
 releaseProtector, deallocateBorrowRange}`, the leak check
@@ -243,6 +247,32 @@ theorem findU64.eq_src :
   | true => rfl
   | false => exact keyedArray_find?_eq_none_of_contains_false table key h
 
+/-- A key that the index does not contain satisfies no row predicate. -/
+theorem keyedArray_any?_eq_false_of_contains_false {V : Type} {keyFn : V → UInt64}
+    (table : KeyedArray UInt64 V keyFn) (key : UInt64) (p : V → Bool)
+    (h : table.contains key = false) :
+    table.any? key p = false := by
+  unfold KeyedArray.contains at h
+  unfold KeyedArray.any?
+  rw [Std.HashMap.get?_eq_getElem?, Std.HashMap.getElem?_eq_none_of_contains_eq_false h]
+  rfl
+
+/-- `KeyedArray.any?` at `UInt64` keys, guarded by a scan of the rows. -/
+def anyU64 : (V : Type) → (keyFn : V → UInt64) → KeyedArray UInt64 V keyFn → UInt64 →
+    (V → Bool) → Bool :=
+  fun _ keyFn table key p =>
+    if (table.toArray.map keyFn).contains key then table.any? key p else false
+
+/-- The guard changes nothing. -/
+theorem anyU64.eq_src :
+    (fun (V : Type) (keyFn : V → UInt64) => @KeyedArray.any? UInt64 V _ _ keyFn) = anyU64 := by
+  funext V keyFn table key p
+  unfold anyU64
+  rw [← KeyedArray.contains_rows table key]
+  cases h : table.contains key with
+  | true => rfl
+  | false => exact keyedArray_any?_eq_false_of_contains_false table key p h
+
 /-! ### Evaluable twins of the vendored definitions
 
 Each line derives a twin `T` and proves `T.eq_src : @F = @T`. The fuel is the
@@ -256,6 +286,10 @@ unroll_loops insertAllocationU := Miri.Memory.MemoryLifecycle.insertAllocation f
   with reserveAllocIdU
 unroll_loops allocatePtrU := Miri.Memory.MemoryLifecycle.allocatePtr fuel 0 with insertAllocationU
 unroll_loops findGlobalU := Miri.Memory.MemoryState.findGlobal? fuel 0 with findU64
+unroll_loops hasFunctionPointerU := Miri.Memory.MemoryState.hasFunctionPointer fuel 0
+  with containsU64, anyU64
+unroll_loops getAllocInfoU := Miri.Memory.MemoryState.getAllocInfo fuel 0
+  with hasFunctionPointerU, containsU64, findGlobalU
 unroll_loops deallocatePtrWithU := Miri.Memory.MemoryLifecycle.deallocatePtrWith fuel 0
   with findGlobalU
 unroll_loops findOffsetU := Miri.DataStructures.DedupRangeMap.findOffset fuel 70
@@ -286,6 +320,14 @@ unroll_loops beforeMemoryWriteU := Miri.TreeBorrows.MachineMemoryHooks.beforeMem
   with commitTreeAccessU
 unroll_loops beforeMemoryDeallocationU :=
   Miri.TreeBorrows.MachineMemoryHooks.beforeMemoryDeallocation fuel 0 with deallocateBorrowRangeU
+unroll_loops buildInsidePermissionsU := Miri.TreeBorrows.RetagPipeline.buildInsidePermissions fuel 0
+  with modifyRangeU
+unroll_loops accessTreeForReborrowU := Miri.TreeBorrows.RetagPipeline.accessTreeForReborrow fuel 0
+  with performBorrowAccessRangeU, newChildU
+unroll_loops runReborrowU := Miri.TreeBorrows.RetagPipeline.runReborrow fuel 0
+  with getAllocInfoU, buildInsidePermissionsU, accessTreeForReborrowU
+unroll_loops retagPointerValueU := Miri.TreeBorrows.RetagPipeline.retagPointerValue fuel 0
+  with runReborrowU
 
 /-! ## §2. A single-threaded memory harness over the vendored definitions
 
@@ -303,33 +345,29 @@ abbrev LmMem := MemoryState Provenance BorrowTree MiriMemoryKind
 /-- A typed harness failure: the exact vendored error value that stopped an
 operation. -/
 inductive LmFailure where
-  /-- `check_alloc_request`: `Align::from_bytes` rejected the alignment. -/
+  /-- `check_alloc_request`: alignment is zero, not a power of two, or exceeds `Align::MAX`. -/
   | allocAlign (error : AlignError)
   /-- `check_alloc_request`: the size exceeds `isize::MAX`. -/
   | allocTooLarge (size : Nat)
   /-- `Memory::allocate_ptr` failed. -/
   | allocLifecycle (error : MemoryLifecycleError)
-  /-- The `dealloc` shim's `Align::from_bytes(align).unwrap()` failed. -/
+  /-- The `dealloc` shim's alignment check failed. -/
   | deallocAlign (error : AlignError)
-  /-- `Memory::deallocate_ptr` failed (classified by `deallocationError`). -/
+  /-- `Memory::deallocate_ptr` failed (classified by `AllocationMachine.deallocationError`). -/
   | dealloc (error : MemoryLifecycleError)
   /-- Tree Borrows rejected the deallocation. -/
   | treeDealloc (status : BorrowTree.BorrowTreeDeallocStatus)
   /-- Tree Borrows rejected a read or write access. -/
   | treeAccess (status : BorrowTree.BorrowTreeAccessStatus)
-  /-- `Tree::new_child` failed. -/
-  | treeRetag (error : BorrowTree.ChildInsertError)
+  /-- Vendored `RetagPipeline.retagPointerValue` failed. -/
+  | retag (error : RetagPipeline.Error)
   /-- Releasing a protector failed. -/
   | protectorRelease (status : BorrowTree.ProtectorReleaseStatus)
-  /-- An access through a pointer without (concrete) provenance. -/
-  | danglingAccess (address : UInt64)
-  /-- An access to an allocation that is not live. -/
-  | useAfterFree (allocId : AllocId)
-  /-- An access outside the bounds of its allocation. -/
-  | outOfBounds (allocId : AllocId) (offset size : UInt64)
-  /-- `Allocation::read_scalar` or `write_scalar` failed. -/
+  /-- Vendored `Miri.Memory.getPtrAccess` failed (classified by `MemoryErrors.access`). -/
+  | access (error : AccessError)
+  /-- `Allocation::read_scalar` or `write_scalar` failed (classified by `MemoryErrors.allocation`). -/
   | allocation (error : AllocError)
-  /-- A scalar conversion failed. -/
+  /-- A scalar conversion failed (classified by `ScalarOps.scalarError`). -/
   | scalar (error : ScalarError)
   /-- A cast or scalar operator failed. -/
   | step (error : StepError)
@@ -339,12 +377,15 @@ inductive LmFailure where
   | harness (message : String)
   deriving DecidableEq
 
-/-- The borrow tracker state threaded through the lifecycle hooks. -/
+/-- The borrow tracker state threaded through the lifecycle hooks, directly
+hosting vendored `GlobalState` and `FrameState`. -/
 structure LmCtx where
   /-- Whether Tree Borrows is enabled. -/
   treeBorrows : Bool
-  /-- The borrow tracker's protected tags. -/
-  protectedTags : ProtectedTags := {}
+  /-- Vendored Tree Borrows global tag supply & protected-tag table. -/
+  global : GlobalState := GlobalState.new
+  /-- Vendored active call frame's protected `(AllocId, BorTag)` records. -/
+  frame : FrameState := {}
   /-- The typed failure of a machine hook, as `AllocationMachine.deallocate`
   keeps one in `pendingError`. -/
   pending : Option LmFailure := none
@@ -356,22 +397,34 @@ structure LmState where
   /-- The borrow tracker state. -/
   ctx : LmCtx
 
-/-- The initial state: empty memory. -/
+/-- The initial state: empty memory and fresh vendored `GlobalState`. -/
 def lmInit (tb : Bool) : LmState := { mem := MemoryState.empty, ctx := { treeBorrows := tb } }
 
 /-- Little-endian, 64-bit. -/
 def lmLayout : TargetDataLayout := ⟨.little, .w64⟩
+
+/-- 64-bit pointer arithmetic context for vendored `Miri.Memory.getPtrAccess`. -/
+def lmPtrArith : PointerArithmetic := ⟨Size.ofBytes 8⟩
 
 /-- The base address of an allocation: `id * 2^32`, so every allocation is
 aligned to every supported alignment and allocations of less than `2^32`
 bytes do not overlap. -/
 def lmBaseAddr (id : AllocId) : UInt64 := id.value * 4294967296
 
-/-- The root tag of an allocation. -/
+/-- The root tag assigned to the first allocation by `GlobalState.rootPointerTag`. -/
 def lmRootTag (id : AllocId) : BorTag := ⟨id.value, id.nonzero⟩
 
 /-- `isize::MAX` on a 64-bit target. -/
 def lmIsizeMax : Nat := 9223372036854775807
+
+/-- Checked Rust allocator alignment guard (`Layout::from_size_align` / Miri
+`check_alloc_request`): rejects `align = 0` (which `rustc_abi::Align::from_bytes`
+accepts as `Align::ONE` for internal ABI use) and `align ≥ 2^64` before
+delegating to vendored `Align.fromBytes`. -/
+def lmCheckAlign (align : Nat) : Except AlignError Align :=
+  if align = 0 then .error (.notPowerOfTwo 0)
+  else if align ≥ 2 ^ 64 then .error (.tooLarge (UInt64.ofNat (2 ^ 64 - 1)))
+  else Align.fromBytes (UInt64.ofNat align)
 
 /-- The machine hooks of `MachineMemoryHooks`: no data-race detector, no
 synchronization objects, no diagnostics. -/
@@ -391,19 +444,26 @@ def lmMachineHooks (protectedTags : ProtectedTags) :
 def lmHookContext : MachineMemoryHooks.Context Unit Unit :=
   { state := (), syncObjects := .empty }
 
-/-- `init_local_allocation`: a fresh Tree Borrows tree rooted at the
-allocation's root tag. -/
+/-- `init_local_allocation`: allocate the allocation's root tag from vendored
+`GlobalState.rootPointerTag` and initialize a fresh `BorrowTree.new`. -/
 def lmInitExtra (memory : LmMem) (ctx : LmCtx) (id : AllocId) (_kind : MemoryKind MiriMemoryKind)
     (size : Size) (_align : Align) :
     MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx BorrowTree :=
-  ⟨memory, ctx, .ok (BorrowTree.new (lmRootTag id) size)⟩
+  match ctx.global.rootPointerTag id with
+  | .ok (global', rootTag) =>
+    ⟨memory, { ctx with global := global' }, .ok (BorrowTree.new rootTag size)⟩
+  | .error e => ⟨memory, ctx, .error (reprStr e)⟩
 
-/-- `adjust_alloc_root_pointer`: the allocation's base address with its root
-tag. -/
+/-- `adjust_alloc_root_pointer`: the allocation's base address paired with its
+stable root tag from `GlobalState.rootPointerTag`. -/
 def lmAdjustRoot (memory : LmMem) (ctx : LmCtx) (id : AllocId)
     (_kind : MemoryKind MiriMemoryKind) :
     MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx (Pointer Provenance) :=
-  ⟨memory, ctx, .ok ⟨Size.ofBytes (lmBaseAddr id), .concrete id (lmRootTag id)⟩⟩
+  match ctx.global.rootPointerTag id with
+  | .ok (global', rootTag) =>
+    ⟨memory, { ctx with global := global' },
+      .ok ⟨Size.ofBytes (lmBaseAddr id), .concrete id rootTag⟩⟩
+  | .error e => ⟨memory, ctx, .error (reprStr e)⟩
 
 /-- `Memory::allocate_ptr` with the harness hooks: zeroed backing storage,
 uninitialized contents, `GLOBAL_KIND = MiriMemoryKind::Global`, and objects of
@@ -415,44 +475,54 @@ def lmAllocatePtr (st : LmState) (size : Size) (align : Align) (kind : MemoryKin
     (Size.ofBytes (UInt64.ofNat lmIsizeMax)) globalKind
     (fun size _ => some (Array.replicate size.bytes.toNat 0)) lmInitExtra lmAdjustRoot
 
-/-- An allocation of `kind`: `Memory::allocate_ptr`. A request for the global
-kind models the state `get_alloc_raw_mut` leaves when it materializes a
-mutable static (a live allocation of `MemoryKind::Machine(GLOBAL_KIND)`), so
-only then is `GLOBAL_KIND` not passed to the dynamic-allocation check. -/
+/-- An allocation of `kind`: checks alignment (`lmCheckAlign`) and `size ≤ isize::MAX`
+before calling `Memory::allocate_ptr`. A request for the global kind models the
+state `get_alloc_raw_mut` leaves when it materializes a mutable static (a live
+allocation of `MemoryKind::Machine(GLOBAL_KIND)`), so only then is `GLOBAL_KIND`
+not passed to the dynamic-allocation check. -/
 def lmAllocateKind (st : LmState) (size align : Nat) (kind : MemoryKind MiriMemoryKind) :
     Except LmFailure (Pointer (Option Provenance) × LmState) :=
-  match Align.fromBytes (UInt64.ofNat align) with
+  match lmCheckAlign align with
   | .error e => .error (.allocAlign e)
   | .ok al =>
-    let globalKind : Option (MemoryKind MiriMemoryKind) :=
-      if kind = .machine .global then none else some (.machine .global)
-    let r := lmAllocatePtr st (Size.ofBytes (UInt64.ofNat size)) al kind globalKind
-    match r.outcome with
-    | .ok ptr => .ok (ptr.withOptionalProvenance, { mem := r.memory, ctx := r.hooks })
-    | .error e => .error (.allocLifecycle e)
-
-/-- The Rust heap allocation shim (`__rust_alloc`): `check_alloc_request`
-(`Align::from_bytes` must accept the alignment and the size must not exceed
-`isize::MAX`, both checked before any storage is created), then
-`Memory::allocate_ptr` with `MiriMemoryKind::Rust`. -/
-def lmAllocate (st : LmState) (size align : Nat) :
-    Except LmFailure (Pointer (Option Provenance) × LmState) :=
-  match Align.fromBytes (UInt64.ofNat align) with
-  | .error e => .error (.allocAlign e)
-  | .ok _ =>
-    if size ≤ lmIsizeMax then lmAllocateKind st size align (.machine .rust)
+    if size ≤ lmIsizeMax then
+      let globalKind : Option (MemoryKind MiriMemoryKind) :=
+        if kind = .machine .global then none else some (.machine .global)
+      let r := lmAllocatePtr st (Size.ofBytes (UInt64.ofNat size)) al kind globalKind
+      match r.outcome with
+      | .ok ptr => .ok (ptr.withOptionalProvenance, { mem := r.memory, ctx := r.hooks })
+      | .error e => .error (.allocLifecycle e)
     else .error (.allocTooLarge size)
 
-/-- `ptr_get_alloc_id` for the deallocation: a pointer with concrete
-provenance resolves to its allocation, its offset from the allocation's base
-address, and its tag; a pointer without provenance is dangling. -/
+/-- The Rust heap allocation shim (`__rust_alloc`): `check_alloc_request`
+(`lmCheckAlign` and `size ≤ isize::MAX`, both checked before any storage is
+created), then `Memory::allocate_ptr` with `MiriMemoryKind::Rust`. -/
+def lmAllocate (st : LmState) (size align : Nat) :
+    Except LmFailure (Pointer (Option Provenance) × LmState) :=
+  lmAllocateKind st size align (.machine .rust)
+
+/-- `ptr_get_alloc_id`: a pointer with concrete provenance resolves to its
+allocation, its non-underflowing offset from the allocation's base address,
+and its tag; a pointer without provenance or below its base address is dangling. -/
 def lmResolve (memory : LmMem) (ctx : LmCtx) (ptr : Pointer (Option Provenance)) (_size : Int) :
     PointerResolutionResult Provenance BorrowTree MiriMemoryKind LmCtx ProvenanceExtra :=
   match ptr.provenance with
   | some (.concrete id tag) =>
-    ⟨memory, ctx, .ok (id, Size.ofBytes (ptr.offset.bytes - lmBaseAddr id), .concrete tag)⟩
+    if ptr.offset.bytes < lmBaseAddr id then
+      ⟨memory, ctx, .error ptr.offset.bytes⟩
+    else
+      ⟨memory, ctx, .ok (id, Size.ofBytes (ptr.offset.bytes - lmBaseAddr id), .concrete tag)⟩
   | some .wildcard => ⟨memory, ctx, .error ptr.offset.bytes⟩
   | none => ⟨memory, ctx, .error ptr.offset.bytes⟩
+
+/-- Pure `PointerResolver` adapter of `lmResolve` for vendored `Miri.Memory.getPtrAccess`. -/
+def lmResolvePure : PointerResolver Provenance ProvenanceExtra := fun ptr _ =>
+  match ptr.provenance with
+  | some (.concrete id tag) =>
+    if ptr.offset.bytes < lmBaseAddr id then .error ptr.offset.bytes
+    else .ok ⟨id, Size.ofBytes (ptr.offset.bytes - lmBaseAddr id), .concrete tag⟩
+  | some .wildcard => .error ptr.offset.bytes
+  | none => .error ptr.offset.bytes
 
 /-- `before_memory_deallocation`: with Tree Borrows, the vendored
 `MachineMemoryHooks.beforeMemoryDeallocation`; a rejection is recorded with
@@ -465,14 +535,14 @@ def lmBeforeDeallocation (memory : LmMem) (ctx : LmCtx)
     MemoryStateHookResult Provenance BorrowTree MiriMemoryKind LmCtx Unit :=
   if ctx.treeBorrows then
     let r := MachineMemoryHooks.beforeMemoryDeallocation lmHookContext
-      (lmMachineHooks ctx.protectedTags) allocation pointer allocId provenance size align kind
+      (lmMachineHooks ctx.global.protectedTags) allocation pointer allocId provenance size align kind
     match r.outcome with
     | .ok () => ⟨memory, ctx, .ok ()⟩
     | .error message =>
       ⟨memory,
         { ctx with pending := some (.treeDealloc
             (allocation.extra.deallocateBorrowRange provenance Size.ZERO size
-              ctx.protectedTags).status) },
+              ctx.global.protectedTags).status) },
         .error message⟩
   else
     ⟨memory, ctx, .ok ()⟩
@@ -484,13 +554,13 @@ def lmDeallocHooks :
     resolvePointer := lmResolve
     beforeDeallocation := lmBeforeDeallocation }
 
-/-- The Rust heap deallocation shim (`__rust_dealloc`): `Align::from_bytes`,
+/-- The Rust heap deallocation shim (`__rust_dealloc`): `lmCheckAlign`,
 then `Memory::deallocate_ptr` with the claimed layout and
 `MiriMemoryKind::Rust`. A typed machine-hook failure takes precedence over the
 lifecycle's `hookFailure`, as in `AllocationMachine.deallocate`. -/
 def lmDeallocate (st : LmState) (ptr : Pointer (Option Provenance)) (size align : Nat) :
     Except LmFailure LmState :=
-  match Align.fromBytes (UInt64.ofNat align) with
+  match lmCheckAlign align with
   | .error e => .error (.deallocAlign e)
   | .ok al =>
     let r := MemoryLifecycle.deallocatePtrWith st.mem st.ctx ptr
@@ -499,22 +569,19 @@ def lmDeallocate (st : LmState) (ptr : Pointer (Option Provenance)) (size align 
     | .ok () => .ok { mem := r.memory, ctx := r.hooks }
     | .error e => .error (r.hooks.pending.getD (.dealloc e))
 
-/-- The target of an access of `size` bytes: the live allocation of the
-pointer's provenance, the offset in it, and the pointer's tag. -/
+/-- The target of an access of `size` bytes via vendored `Miri.Memory.getPtrAccess`
+and `MemoryState.getAllocInfo`: validates provenance, liveness (reporting
+`AccessError.allocationLookup (.deadAllocation id)` on UAF), and bounds. -/
 def lmAccessTarget (st : LmState) (ptr : Pointer (Option Provenance)) (size : UInt64) :
     Except LmFailure (AllocId × Size × ProvenanceExtra × Allocation Provenance BorrowTree) :=
-  match ptr.provenance with
-  | none => .error (.danglingAccess ptr.offset.bytes)
-  | some .wildcard => .error (.danglingAccess ptr.offset.bytes)
-  | some (.concrete id tag) =>
+  match getPtrAccess lmPtrArith ptr (Size.ofBytes size) .memoryAccess
+      lmResolvePure st.mem.getAllocInfo with
+  | .error e => .error (.access e)
+  | .ok none => .error (.harness "zero-sized access in scalar load/store")
+  | .ok (some (_, _, (id, offset, provenance))) =>
     match st.mem.live.find? (fun entry => entry.1 == id) with
-    | none => .error (.useAfterFree id)
-    | some (_, entry) =>
-      let offset := ptr.offset.bytes - lmBaseAddr id
-      if offset.toNat + size.toNat ≤ entry.allocation.byteSize.bytes.toNat then
-        .ok (id, Size.ofBytes offset, .concrete tag, entry.allocation)
-      else
-        .error (.outOfBounds id offset size)
+    | none => .error (.access (.allocationLookup (.unavailable id)))
+    | some (_, entry) => .ok (id, offset, provenance, entry.allocation)
 
 /-- `before_memory_read` / `before_memory_write`: with Tree Borrows, the
 vendored `MachineMemoryHooks` access hook, which updates the allocation's
@@ -526,28 +593,29 @@ def lmTreeAccess (st : LmState) (write : Bool) (allocation : Allocation Provenan
     let r :=
       if write then
         MachineMemoryHooks.beforeMemoryWrite st.mem lmHookContext
-          (lmMachineHooks st.ctx.protectedTags) allocation ptr id provenance range
+          (lmMachineHooks st.ctx.global.protectedTags) allocation ptr id provenance range
       else
         MachineMemoryHooks.beforeMemoryRead st.mem lmHookContext
-          (lmMachineHooks st.ctx.protectedTags) allocation ptr id provenance range
+          (lmMachineHooks st.ctx.global.protectedTags) allocation ptr id provenance range
     match r.outcome with
     | .ok () => .ok { st with mem := r.memory }
     | .error _ =>
       .error (.treeAccess
         (allocation.extra.performBorrowAccessRange provenance range.start range.size
-          (if write then .Write else .Read) st.ctx.protectedTags .VisitChildrenOfAccessed).status)
+          (if write then .Write else .Read) st.ctx.global.protectedTags
+          .VisitChildrenOfAccessed).status)
   else
     .ok st
 
-/-- Store the unsigned integer `bits` in `size` bytes through `ptr`: the
-access hook, then `Allocation::write_scalar`. -/
+/-- Store the unsigned integer `bits` in `size` bytes through `ptr`: vendored
+`getPtrAccess`, the access hook, then `Allocation::write_scalar`. -/
 def lmStore (st : LmState) (ptr : Pointer (Option Provenance)) (size : UInt64) (bits : Nat) :
     Except LmFailure LmState := do
   let (id, offset, provenance, allocation) ← lmAccessTarget st ptr size
   let range : AllocRange := ⟨offset, Size.ofBytes size⟩
   let st ← lmTreeAccess st true allocation ptr id provenance range
   match st.mem.live.find? (fun entry => entry.1 == id) with
-  | none => .error (.useAfterFree id)
+  | none => .error (.access (.allocationLookup (.unavailable id)))
   | some (_, entry) =>
     match Miri.Memory.Scalar.fromUInt (Prov := Provenance) (BitVec.ofNat 128 bits)
         (Size.ofBytes size) with
@@ -557,11 +625,11 @@ def lmStore (st : LmState) (ptr : Pointer (Option Provenance)) (size : UInt64) (
       | .error e _ => .error (.allocation e)
       | .ok () written =>
         match st.mem.setLiveAllocation id written with
-        | .error _ => .error (.useAfterFree id)
+        | .error e => .error (.access (.allocationLookup e))
         | .ok mem => .ok { st with mem := mem }
 
-/-- Load an unsigned integer of `size` bytes through `ptr`: the access hook,
-then `Allocation::read_scalar`. -/
+/-- Load an unsigned integer of `size` bytes through `ptr`: vendored
+`getPtrAccess`, the access hook, then `Allocation::read_scalar`. -/
 def lmLoad (st : LmState) (ptr : Pointer (Option Provenance)) (size : UInt64) :
     Except LmFailure (Nat × LmState) := do
   let (id, offset, provenance, allocation) ← lmAccessTarget st ptr size
@@ -581,71 +649,80 @@ def lmLeakCheck (st : LmState) : Except LmFailure Unit :=
   | .ok (_, leaked) =>
     if leaked.isEmpty then .ok () else .error (.leak (leaked.toList.map (·.1)))
 
-/-- A Tree Borrows retag of the whole allocation: without a borrow tracker
-the pointer is unchanged; with Tree Borrows, a read access through the parent
-tag (unless the new permission is `Cell`), then `Tree::new_child` with the new
-tag holding `permission` on every byte (accessed unless `Cell`), and the
-protector, if any, recorded in the borrow tracker. -/
-def lmRetag (st : LmState) (ptr : Pointer (Option Provenance)) (newTag : BorTag)
-    (permission : Permission) (protector : Option ProtectorKind) :
+/-- Tree Borrows retag wired directly through vendored
+`Miri.TreeBorrows.RetagPipeline.retagPointerValue` (and `RetagPolicy.create`
+with `implicitWrites := true`, matching MiniRust's `TreeBorrowsParams ⟨true⟩`):
+without a borrow tracker the pointer is unchanged; with Tree Borrows, vendored
+`RetagPipeline` allocates the child tag from `GlobalState`, registers any
+`WeakProtector` (`Box`) or `StrongProtector` (`&`/`&mut`) in `GlobalState` and
+`FrameState`, executes the parent tree access, and inserts the child node. -/
+def lmRetag (st : LmState) (ptr : Pointer (Option Provenance))
+    (typeShape : RetagPipeline.RetagTypeShape) (typeFacts : RetagPolicy.TypeFacts)
+    (refKind : RetagPolicy.ReferenceKind) (mode : RetagPolicy.RetagMode)
+    (pointeeIsFreeze : Bool) :
     Except LmFailure (Pointer (Option Provenance) × LmState) :=
   if st.ctx.treeBorrows then
-    match ptr.provenance with
-    | none => .error (.danglingAccess ptr.offset.bytes)
-    | some .wildcard => .error (.danglingAccess ptr.offset.bytes)
-    | some (.concrete id tag) =>
-      match st.mem.live.find? (fun entry => entry.1 == id) with
-      | none => .error (.useAfterFree id)
+    match lmResolvePure ptr 0 with
+    | .error addr => .error (.access (.danglingIntegerPointer addr 0 .memoryAccess))
+    | .ok resolved =>
+      match st.mem.live.find? (fun entry => entry.1 == resolved.allocId) with
+      | none => .error (.access (.allocationLookup (.deadAllocation resolved.allocId)))
       | some (_, entry) =>
-        let size := entry.allocation.byteSize
-        let accessed := !permission.isCell
-        let read : Except LmFailure LmState :=
-          if accessed then
-            lmTreeAccess st false entry.allocation ptr id (.concrete tag) ⟨Size.ZERO, size⟩
-          else .ok st
-        match read with
-        | .error e => .error e
-        | .ok st =>
-          match st.mem.live.find? (fun entry => entry.1 == id) with
-          | none => .error (.useAfterFree id)
-          | some (_, entry) =>
-            match permission.strongestIdempotentForeignAccess protector.isSome with
-            | .ImpossibleProtectedReservedIM => .error (.treeRetag .ProtectedReservedIM)
-            | .Access sifa =>
-              let inside : DedupRangeMap Tree.LocationState :=
-                DedupRangeMap.new size ⟨permission, accessed, sifa⟩
-              let r := entry.allocation.extra.newChild Size.ZERO (.concrete tag) newTag inside
-                permission protector.isSome
-              match r.outcome with
-              | .error e => .error (.treeRetag e)
-              | .ok () =>
-                match st.mem.setLiveAllocation id (entry.allocation.setExtra r.tree) with
-                | .error _ => .error (.useAfterFree id)
-                | .ok mem =>
-                  let protectedTags := match protector with
-                    | some kind => st.ctx.protectedTags.insert newTag kind
-                    | none => st.ctx.protectedTags
-                  .ok (⟨ptr.offset, some (.concrete id newTag)⟩,
-                    { mem := mem, ctx := { st.ctx with protectedTags := protectedTags } })
+        let req : RetagPipeline.Request := {
+          typeShape := typeShape
+          typeFacts := typeFacts
+          referenceKind := refKind
+          mode := mode
+          config := { implicitWrites := true, rustcNoWritable := false }
+          layoutSize := entry.allocation.byteSize
+          originalProvenance := ptr.provenance
+          pointeeIsFreeze := pointeeIsFreeze
+          preciseInteriorMut := false
+          hooks := {
+            allocationResolution := some ⟨resolved.allocId, resolved.offset, resolved.extra⟩
+          }
+        }
+        let mstate : RetagPipeline.MachineState MiriMemoryKind :=
+          ⟨st.mem, st.ctx.global, st.ctx.frame⟩
+        let res := RetagPipeline.retagPointerValue mstate req
+        match res.outcome with
+        | .error e => .error (.retag e)
+        | .ok prov =>
+          .ok (⟨ptr.offset, prov⟩,
+            { mem := res.state.memory
+              ctx := { st.ctx with global := res.state.global, frame := res.state.frame } })
   else
     .ok (ptr, st)
 
-/-- The end of the call that protected `tag` in allocation `id`:
-`Tree::release_protector` (the protector-end access), then the tag leaves
-the borrow tracker's protected set. Without a borrow tracker, nothing. -/
-def lmEndCall (st : LmState) (id : AllocId) (tag : BorTag) : Except LmFailure LmState :=
+/-- Release one protector `(id, tag)` in memory via vendored `BorrowTree.releaseProtector`. -/
+def lmReleaseOne (protectedTags : ProtectedTags) (mem : LmMem) (entryPair : AllocId × BorTag) :
+    Except LmFailure LmMem :=
+  let (id, tag) := entryPair
+  match mem.live.find? (fun entry => entry.1 == id) with
+  | none => .ok mem
+  | some (_, entry) =>
+    let r := entry.allocation.extra.releaseProtector tag protectedTags
+    if r.status = .Released then
+      match mem.setLiveAllocation id (entry.allocation.setExtra r.tree) with
+      | .error e => .error (.access (.allocationLookup e))
+      | .ok mem' => .ok mem'
+    else
+      .error (.protectorRelease r.status)
+
+/-- End the active call frame: for every protected `(allocId, tag)` recorded in
+`FrameState`, invoke vendored `BorrowTree.releaseProtector` (when the allocation
+is live), then invoke vendored `GlobalState.endCall` to remove the frame's
+protectors from `GlobalState.protectedTags`. Without Tree Borrows, a no-op. -/
+def lmEndCall (st : LmState) : Except LmFailure LmState :=
   if st.ctx.treeBorrows then
-    match st.mem.live.find? (fun entry => entry.1 == id) with
-    | none => .error (.useAfterFree id)
-    | some (_, entry) =>
-      let r := entry.allocation.extra.releaseProtector tag st.ctx.protectedTags
-      if r.status = .Released then
-        match st.mem.setLiveAllocation id (entry.allocation.setExtra r.tree) with
-        | .error _ => .error (.useAfterFree id)
-        | .ok mem =>
-          .ok { mem := mem, ctx := { st.ctx with protectedTags := st.ctx.protectedTags.remove tag } }
-      else
-        .error (.protectorRelease r.status)
+    match st.ctx.frame.protectedTags.toList.foldlM
+        (lmReleaseOne st.ctx.global.protectedTags) st.mem with
+    | .error e => .error e
+    | .ok mem' =>
+      .ok { mem := mem'
+            ctx := { st.ctx with
+              global := st.ctx.global.endCall st.ctx.frame
+              frame := {} } }
   else
     .ok st
 
@@ -908,10 +985,15 @@ def lmDeallocIsUb : BorrowTree.BorrowTreeDeallocStatus → Bool
   | .MissingTag _ => false
   | .RangeMapFailure _ => false
 
-/-- The observation class of a harness failure. Deallocation failures are
-classified by the vendored `AllocationMachine.deallocationError`. An invalid
-allocation request (`check_alloc_request`) violates the precondition of
-`Layout::from_size_align` and is undefined behavior at the Rust allocator
+/-- The observation class of a harness failure. Every vendored error type is
+classified by its own vendored classifier:
+- `MemoryLifecycleError` -> `AllocationMachine.deallocationError`,
+- `AccessError` -> `MemoryErrors.access`,
+- `AllocError` -> `MemoryErrors.allocation`,
+- `ScalarError` -> `ScalarOps.scalarError`,
+- `StepError` -> `lmObsOfStep`.
+An invalid allocation request (`check_alloc_request`) violates the precondition
+of `Layout::from_size_align` and is undefined behavior at the Rust allocator
 entry. -/
 def lmObsOfFailure : LmFailure → LmHeapWideObs
   | .allocAlign _ => .ub
@@ -921,15 +1003,11 @@ def lmObsOfFailure : LmFailure → LmHeapWideObs
   | .dealloc e => lmObsOfStep (AllocationMachine.deallocationError e)
   | .treeDealloc status => if lmDeallocIsUb status then .ub else .invalidOrUnsupported
   | .treeAccess status => if lmAccessIsUb status then .ub else .invalidOrUnsupported
-  | .treeRetag _ => .invalidOrUnsupported
+  | .retag _ => .invalidOrUnsupported
   | .protectorRelease _ => .invalidOrUnsupported
-  | .danglingAccess _ => .ub
-  | .useAfterFree _ => .ub
-  | .outOfBounds _ _ _ => .ub
-  | .allocation (.invalidUninitBytes _) => .ub
-  | .allocation .readOnlyAllocation => .ub
-  | .allocation _ => .invalidOrUnsupported
-  | .scalar _ => .invalidOrUnsupported
+  | .access e => lmObsOfStep (MemoryErrors.access e)
+  | .allocation e => lmObsOfStep (MemoryErrors.allocation e)
+  | .scalar e => lmObsOfStep (ScalarOps.scalarError e)
   | .step e => lmObsOfStep e
   | .leak _ => .memoryLeak
   | .harness _ => .invalidOrUnsupported
@@ -955,7 +1033,7 @@ def lmAllocObs (st : LmState) (ptr : Pointer (Option Provenance)) :
   match ptr.provenance with
   | some (.concrete id _) =>
     match st.mem.live.find? (fun entry => entry.1 == id) with
-    | none => .error (.useAfterFree id)
+    | none => .error (.access (.allocationLookup (.deadAllocation id)))
     | some (_, entry) =>
       match entry.allocation.align.bytes with
       | .error e => .error (.allocAlign e)
@@ -982,25 +1060,31 @@ def lmRoundTrip (tb : Bool) (size align : Nat) (width : UInt64) (bits : Nat) :
   lmLeakCheck st
   pure (.okRoundTrip r)
 
-/-- The tag of the child references. -/
+/-- A distinct second `BorTag` for heterogeneous wide-pointer comparison cases. -/
 def lmChildTag : BorTag := ⟨1000, by decide⟩
 
 /-- The over-aligned `Box` of the protector scenarios: a 32-byte, 32-aligned
-heap allocation holding `42u32`, with a child tag holding `permission` on
-every byte and the given protector (`lmRetag`), read once through the child
-when `readChild`. Returns the parent pointer, the child pointer, and the
-state. -/
-def lmBoxWithChild (tb : Bool) (permission : Permission) (protector : Option ProtectorKind)
-    (readChild : Bool) :
+heap allocation holding `42u32`, retagged through vendored
+`RetagPipeline.retagPointerValue`, and read once through the child when
+`readChild` is set. Returns the parent pointer, the child pointer, and the state. -/
+def lmBoxWithChild (tb : Bool) (typeShape : RetagPipeline.RetagTypeShape)
+    (typeFacts : RetagPolicy.TypeFacts) (refKind : RetagPolicy.ReferenceKind)
+    (mode : RetagPolicy.RetagMode) (pointeeIsFreeze readChild : Bool) :
     Except LmFailure (Pointer (Option Provenance) × Pointer (Option Provenance) × LmState) := do
   let (parent, st) ← lmAllocate (lmInit tb) 32 32
   let st ← lmStore st parent 4 42
-  let (child, st) ← lmRetag st parent lmChildTag permission protector
+  let (child, st) ← lmRetag st parent typeShape typeFacts refKind mode pointeeIsFreeze
   if readChild then
     let (_, st) ← lmLoad st child 4
     pure (parent, child, st)
   else
     pure (parent, child, st)
+
+/-- `TypeFacts` for a `Freeze + Unpin` 32-byte pointee. -/
+def lmFrozenFacts : RetagPolicy.TypeFacts := ⟨true, true, true⟩
+
+/-- `TypeFacts` for a `!Freeze + Unpin` (`UnsafeCell`) 32-byte pointee. -/
+def lmCellFacts : RetagPolicy.TypeFacts := ⟨true, true, false⟩
 
 /-- The allocation of the first allocation shim call. -/
 def lmFirstId : AllocId := ⟨1, by decide⟩
@@ -1086,24 +1170,24 @@ def lmCase (tb : Bool) : Nat → Except LmFailure LmHeapWideObs
     lmLeakCheck st
     pure .okDealloc
   | 18 => do
-    let (_, box, st) ← lmBoxWithChild tb (.ReservedFrz false) (some .WeakProtector) false
+    let (_, box, st) ← lmBoxWithChild tb .globalBox lmFrozenFacts .Box .FnEntry true false
     let _ ← lmDeallocate st box 32 32
     pure .okDealloc
   | 19 => do
-    let (parent, _, st) ← lmBoxWithChild tb .Frozen (some .StrongProtector) true
+    let (parent, _, st) ← lmBoxWithChild tb .reference lmFrozenFacts .Shared .FnEntry true true
     let _ ← lmDeallocate st parent 32 32
     pure .okDealloc
   | 20 => do
-    let (parent, _, st) ← lmBoxWithChild tb .Frozen (some .StrongProtector) true
-    let st ← lmEndCall st lmFirstId lmChildTag
+    let (parent, _, st) ← lmBoxWithChild tb .reference lmFrozenFacts .Shared .FnEntry true true
+    let st ← lmEndCall st
     let _ ← lmDeallocate st parent 32 32
     pure .okDealloc
   | 21 => do
-    let (_, child, st) ← lmBoxWithChild tb .Frozen none false
+    let (_, child, st) ← lmBoxWithChild tb .reference lmFrozenFacts .Shared .Default true false
     let _ ← lmDeallocate st child 32 32
     pure .okDealloc
   | 22 => do
-    let (parent, _, st) ← lmBoxWithChild tb .Cell (some .StrongProtector) false
+    let (parent, _, st) ← lmBoxWithChild tb .reference lmCellFacts .Shared .FnEntry false false
     let _ ← lmDeallocate st parent 32 32
     pure .okDealloc
   | 23 => lmCompare lmAddrEq (lmSlice (lmAddr 8192) 3) (lmSlice (lmAddr 8192) 7)
@@ -1167,7 +1251,7 @@ def lmHeapLifecycleTrace (tb : Bool) : List LmHeapWideObs :=
 and one through the child; deallocate through the parent while the child's
 protector is active; and, if that succeeded, the exit leak check. -/
 def lmProtectorDeallocTrace (tb : Bool) : List LmHeapWideObs :=
-  match lmBoxWithChild tb .Frozen (some .StrongProtector) false with
+  match lmBoxWithChild tb .reference lmFrozenFacts .Shared .FnEntry true false with
   | .error e => [lmObsOfFailure e]
   | .ok (parent, child, st) =>
     lmTraceStep (do
@@ -1184,30 +1268,44 @@ def lmProtectorDeallocTrace (tb : Bool) : List LmHeapWideObs :=
         pure (.okDealloc, ())) fun _ => []
 
 /-- The status of `BorrowTree.deallocateBorrowRange` on the block of a
-protector scenario (with Tree Borrows): the block of `lmBoxWithChild`,
-optionally after the protecting call ended, deallocated through the child tag
-or through the allocation's root tag. -/
-def lmScenarioDeallocStatus (permission : Permission) (protector : Option ProtectorKind)
-    (readChild release throughChild : Bool) : Option BorrowTree.BorrowTreeDeallocStatus :=
-  match lmBoxWithChild true permission protector readChild with
+protector scenario (with Tree Borrows, retagged via vendored `RetagPipeline`):
+optionally after `lmEndCall`, deallocated through the child tag or the parent tag. -/
+def lmScenarioDeallocStatus (typeShape : RetagPipeline.RetagTypeShape)
+    (typeFacts : RetagPolicy.TypeFacts) (refKind : RetagPolicy.ReferenceKind)
+    (mode : RetagPolicy.RetagMode) (pointeeIsFreeze readChild release throughChild : Bool) :
+    Option BorrowTree.BorrowTreeDeallocStatus :=
+  match lmBoxWithChild true typeShape typeFacts refKind mode pointeeIsFreeze readChild with
   | .error _ => none
-  | .ok (_, _, st) =>
-    match (if release then lmEndCall st lmFirstId lmChildTag else .ok st) with
+  | .ok (parent, child, st) =>
+    match (if release then lmEndCall st else .ok st) with
     | .error _ => none
     | .ok st =>
-      match st.mem.live.find? (fun entry => entry.1 == lmFirstId) with
-      | none => none
-      | some (_, entry) =>
-        some (entry.allocation.extra.deallocateBorrowRange
-          (.concrete (if throughChild then lmChildTag else lmRootTag lmFirstId))
-          Size.ZERO (Size.ofBytes 32) st.ctx.protectedTags).status
+      let ptr := if throughChild then child else parent
+      match ptr.provenance with
+      | some (.concrete id tag) =>
+        match st.mem.live.find? (fun entry => entry.1 == id) with
+        | none => none
+        | some (_, entry) =>
+          some (entry.allocation.extra.deallocateBorrowRange
+            (.concrete tag) Size.ZERO (Size.ofBytes 32) st.ctx.global.protectedTags).status
+      | _ => none
 
 /-- Deallocate the block of a protector scenario through its child pointer. -/
-def lmDeallocThroughChild (tb : Bool) (permission : Permission)
-    (protector : Option ProtectorKind) : Except LmFailure LmHeapWideObs := do
-  let (_, child, st) ← lmBoxWithChild tb permission protector false
+def lmDeallocThroughChild (tb : Bool) (typeShape : RetagPipeline.RetagTypeShape)
+    (typeFacts : RetagPolicy.TypeFacts) (refKind : RetagPolicy.ReferenceKind)
+    (mode : RetagPolicy.RetagMode) (pointeeIsFreeze : Bool) : Except LmFailure LmHeapWideObs := do
+  let (_, child, st) ← lmBoxWithChild tb typeShape typeFacts refKind mode pointeeIsFreeze false
   let _ ← lmDeallocate st child 32 32
   pure .okDealloc
+
+/-- Reading AND writing through a strongly protected `Cell` child reference
+still allows deallocation through the parent `Unique` tag in Tree Borrows. -/
+def lmStrongCellAccessedDealloc : Except LmFailure LmHeapWideObs := do
+  let (parent, child, st) ← lmBoxWithChild true .reference lmCellFacts .Shared .FnEntry false true
+  let st ← lmStore st child 4 99
+  let (v, st) ← lmLoad st child 4
+  let _ ← lmDeallocate st parent 32 32
+  pure (.okRoundTrip v)
 
 /-! ### Evaluable twins of the harness -/
 
@@ -1218,12 +1316,14 @@ unroll_loops lmBeforeDeallocationU := lmBeforeDeallocation fuel 0
   with beforeMemoryDeallocationU, deallocateBorrowRangeU
 unroll_loops lmDeallocHooksU := lmDeallocHooks fuel 0 with lmBeforeDeallocationU
 unroll_loops lmDeallocateU := lmDeallocate fuel 0 with deallocatePtrWithU, lmDeallocHooksU
+unroll_loops lmAccessTargetU := lmAccessTarget fuel 0 with getAllocInfoU
 unroll_loops lmTreeAccessU := lmTreeAccess fuel 0
   with beforeMemoryWriteU, beforeMemoryReadU, performBorrowAccessRangeU
-unroll_loops lmStoreU := lmStore fuel 0 with lmTreeAccessU
-unroll_loops lmLoadU := lmLoad fuel 0 with lmTreeAccessU
-unroll_loops lmRetagU := lmRetag fuel 0 with lmTreeAccessU, newChildU
-unroll_loops lmEndCallU := lmEndCall fuel 0 with releaseProtectorU
+unroll_loops lmStoreU := lmStore fuel 0 with lmAccessTargetU, lmTreeAccessU
+unroll_loops lmLoadU := lmLoad fuel 0 with lmAccessTargetU, lmTreeAccessU
+unroll_loops lmRetagU := lmRetag fuel 0 with retagPointerValueU
+unroll_loops lmReleaseOneU := lmReleaseOne fuel 0 with releaseProtectorU
+unroll_loops lmEndCallU := lmEndCall fuel 0 with lmReleaseOneU
 unroll_loops lmObsAllocU := lmObsAlloc fuel 0 with lmAllocateU
 unroll_loops lmRoundTripU := lmRoundTrip fuel 0 with lmAllocateU, lmStoreU, lmLoadU, lmDeallocateU
 unroll_loops lmBoxWithChildU := lmBoxWithChild fuel 0 with lmAllocateU, lmStoreU, lmRetagU, lmLoadU
@@ -1240,6 +1340,8 @@ unroll_loops lmScenarioDeallocStatusU := lmScenarioDeallocStatus fuel 0
   with lmBoxWithChildU, lmEndCallU, deallocateBorrowRangeU
 unroll_loops lmDeallocThroughChildU := lmDeallocThroughChild fuel 0
   with lmBoxWithChildU, lmDeallocateU
+unroll_loops lmStrongCellAccessedDeallocU := lmStrongCellAccessedDealloc fuel 0
+  with lmBoxWithChildU, lmStoreU, lmLoadU, lmDeallocateU
 
 /-- **The 30-case table.** Cases `0..27` succeed or are undefined behavior;
 case `28` (`==` on a slice pointer and a trait-object pointer) is rejected as
@@ -1272,14 +1374,16 @@ theorem lmHeapWideObserve_out_of_range (tb : Bool) (caseIdx : Nat) (h : 30 ≤ c
   rfl
 
 /-- The failures shared by both modes: the exact vendored error value of
-every failing case outside the two Tree Borrows cases. -/
+every failing case outside the two Tree Borrows cases (note case 8 is now
+reported directly by vendored `Miri.Memory.getPtrAccess` as
+`.access (.allocationLookup (.deadAllocation lmFirstId))`!). -/
 def lmSharedFailure : Nat → Option LmFailure
   | 4 => some (.allocation (.invalidUninitBytes (some
       ⟨⟨Size.ofBytes 0, Size.ofBytes 4⟩, ⟨Size.ofBytes 0, Size.ofBytes 4⟩⟩)))
   | 5 => some (.allocAlign (.notPowerOfTwo 3))
   | 6 => some (.allocTooLarge 9223372036854775808)
   | 7 => some (.dealloc (.useAfterFree lmFirstId))
-  | 8 => some (.useAfterFree lmFirstId)
+  | 8 => some (.access (.allocationLookup (.deadAllocation lmFirstId)))
   | 9 => some (.dealloc (.nonzeroAllocationOffset "deallocate" lmFirstId (Size.ofBytes 4)))
   | 10 => some (.dealloc (.layoutMismatch lmFirstId (Size.ofBytes 8) (Size.ofBytes 4) ⟨3⟩ ⟨3⟩))
   | 11 => some (.dealloc (.layoutMismatch lmFirstId (Size.ofBytes 8) (Size.ofBytes 8) ⟨3⟩ ⟨4⟩))
@@ -1345,48 +1449,61 @@ theorem lmProtectorDeallocTrace_table :
   refine ⟨?_, ?_⟩ <;> decide +kernel
 
 /-- **`BorrowTree.deallocateBorrowRange` and protectors (`rust#165833`)**, on
-the trees that `BorrowTree.new`, `newChild`, `performBorrowAccessRange`, and
-`releaseProtector` produced for the over-aligned block:
-1. through a weakly protected `Box` tag: `Deallocated`;
+the trees produced by vendored `RetagPipeline.retagPointerValue`,
+`BorrowTree.performBorrowAccessRange`, and `BorrowTree.releaseProtector`:
+1. through a weakly protected `Box` tag (`RetagPolicy` `.Box` + `.FnEntry`): `Deallocated`;
 2. through the root while a strongly protected `Frozen` child that was read is
    live: the write would disable it, `AccessFailure … ProtectedDisabled`;
-3. through a strongly protected (`Reserved`) tag itself: the write succeeds
-   and the strong-protector check rejects it, `ProtectedDealloc`;
-4. through the root after the protecting call ended: `Deallocated`;
-5. through an unprotected `Frozen` child tag: the write is forbidden,
+3. through a strongly protected `&mut` tag itself (`RetagPolicy` `.Mutable` + `.FnEntry`):
+   the write succeeds and the strong-protector check rejects it, `ProtectedDealloc`;
+4. through the root after the protecting call ended (`lmEndCall`): `Deallocated`;
+5. through an unprotected `Frozen` child tag (`.Default`): the write is forbidden,
    `AccessFailure … ChildAccessForbidden`;
 6. through the root while a strongly protected `Cell` child is live:
    `Deallocated` (interior mutability is exempt). -/
 theorem deallocateBorrowRange_protector_laws :
-    lmScenarioDeallocStatus (.ReservedFrz false) (some .WeakProtector) false false true =
+    lmScenarioDeallocStatus .globalBox lmFrozenFacts .Box .FnEntry true false false true =
       some .Deallocated ∧
-    lmScenarioDeallocStatus .Frozen (some .StrongProtector) true false false =
+    lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true false false =
       some (.AccessFailure (.AccessFailure ⟨0, 4⟩
         (.TransitionError 1 (.ProtectedDisabled .Frozen)))) ∧
-    lmScenarioDeallocStatus (.ReservedFrz false) (some .StrongProtector) false false true =
+    lmScenarioDeallocStatus .reference lmFrozenFacts .Mutable .FnEntry true false false true =
       some (.ProtectedDealloc ⟨0, 32⟩ ⟨1⟩) ∧
-    lmScenarioDeallocStatus .Frozen (some .StrongProtector) true true false =
+    lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true true false =
       some .Deallocated ∧
-    lmScenarioDeallocStatus .Frozen none false false true =
+    lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .Default true false false true =
       some (.AccessFailure (.AccessFailure ⟨0, 32⟩
         (.TransitionError 1 (.ChildAccessForbidden .Frozen)))) ∧
-    lmScenarioDeallocStatus .Cell (some .StrongProtector) false false false =
+    lmScenarioDeallocStatus .reference lmCellFacts .Shared .FnEntry false false false false =
       some .Deallocated := by
   rw [lmScenarioDeallocStatusU.eq_src]
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- The same through the whole deallocation shim (`Memory::deallocate_ptr`
 with `MachineMemoryHooks.beforeMemoryDeallocation`): through a strongly
-protected tag itself the shim fails with the exact `ProtectedDealloc` status,
-through a weakly protected `Box` tag it succeeds, and without a borrow tracker
-both succeed. -/
+protected `&mut` tag itself the shim fails with the exact `ProtectedDealloc`
+status, through a weakly protected `Box` tag it succeeds, and without a borrow
+tracker both succeed. -/
 theorem deallocate_through_protected_tag :
-    lmFailureOf (lmDeallocThroughChild true (.ReservedFrz false) (some .StrongProtector)) =
+    lmFailureOf (lmDeallocThroughChild true .reference lmFrozenFacts .Mutable .FnEntry true) =
       some (.treeDealloc (.ProtectedDealloc ⟨0, 32⟩ ⟨1⟩)) ∧
-    lmDeallocThroughChild true (.ReservedFrz false) (some .WeakProtector) = .ok .okDealloc ∧
-    lmDeallocThroughChild false (.ReservedFrz false) (some .StrongProtector) = .ok .okDealloc := by
+    lmDeallocThroughChild true .globalBox lmFrozenFacts .Box .FnEntry true = .ok .okDealloc ∧
+    lmDeallocThroughChild false .reference lmFrozenFacts .Mutable .FnEntry true = .ok .okDealloc := by
   rw [lmDeallocThroughChildU.eq_src]
   refine ⟨?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- Witness that reading AND writing through a strongly protected `Cell` child
+still permits deallocation through the parent `Unique` tag in Tree Borrows. -/
+theorem strongProtected_cell_accessed_dealloc_ok :
+    lmStrongCellAccessedDealloc = .ok (.okRoundTrip 99) := by
+  rw [lmStrongCellAccessedDeallocU.eq_src]
+  decide +kernel
+
+/-- Allocation with `align = 0` is rejected at the Rust allocator layout boundary
+(even though `rustc_abi::Align::from_bytes 0 = .ok Align.ONE`). -/
+theorem lmAllocate_align_zero_ub (tb : Bool) (size : Nat) :
+    lmAllocate (lmInit tb) size 0 = .error (.allocAlign (.notPowerOfTwo 0)) ∧
+    lmObserve (lmObsAlloc tb size 0) = .ub := ⟨rfl, rfl⟩
 
 /-! ## §1. Universal laws of the vendored definitions -/
 
@@ -1457,7 +1574,134 @@ theorem leakCheck_take_never_reports_global {E : Type}
   rw [hk] at hs
   cases hs
 
-/-! ### `Memory::deallocate_ptr` failure classification -/
+/-- `LeakCheck.takeProfiled` agrees with `LeakCheck.take` for any profiler options. -/
+theorem leakCheck_takeProfiled_eq_take {E : Type} (profile : Lean.Options)
+    (memory : MemoryState Provenance E MiriMemoryKind) (staticRoots : Array AllocId) :
+    LeakCheck.takeProfiled profile memory staticRoots = LeakCheck.take memory staticRoots :=
+  LeakCheck.takeProfiled_eq_take profile memory staticRoots
+
+/-- Every allocation reported as leaked by `LeakCheck.take` is removed from
+`memory'.live`. -/
+theorem leakCheck_take_removes_leaked {E : Type}
+    (memory memory' : MemoryState Provenance E MiriMemoryKind) (staticRoots : Array AllocId)
+    (leaked : Array (AllocId × LocalAllocation Provenance E MiriMemoryKind))
+    (h : LeakCheck.take memory staticRoots = .ok (memory', leaked)) :
+    ∀ entry ∈ memory'.live, leaked.any (·.1 == entry.1) = false := by
+  unfold LeakCheck.take LeakCheck.takeProfiled at h
+  obtain ⟨reachable, _, h⟩ := except_bind_eq_ok h
+  cases h
+  intro entry hmem
+  rcases entry with ⟨id, loc⟩
+  have hp := (Array.mem_filter.mp hmem).2
+  dsimp only at hp
+  simpa using hp
+
+/-- If every live allocation is permitted to leak (`LeakCheck.mayLeak = true`,
+for instance all `.machine .global` / `.callerLocation` allocations), then any
+succeeding `LeakCheck.take` reports zero leaks. -/
+theorem leakCheck_take_empty_of_all_mayLeak {E : Type}
+    (memory memory' : MemoryState Provenance E MiriMemoryKind) (staticRoots : Array AllocId)
+    (leaked : Array (AllocId × LocalAllocation Provenance E MiriMemoryKind))
+    (hall : ∀ entry ∈ memory.live, LeakCheck.mayLeak entry.2.kind = true)
+    (h : LeakCheck.take memory staticRoots = .ok (memory', leaked)) :
+    leaked = #[] := by
+  cases hsz : leaked.size with
+  | zero => exact Array.eq_empty_of_size_eq_zero hsz
+  | succ n =>
+    have hlt : 0 < leaked.size := by omega
+    have hmem : leaked[0] ∈ leaked := Array.getElem_mem hlt
+    have ⟨hlive, hno⟩ := leakCheck_take_sound memory memory' staticRoots leaked h leaked[0] hmem
+    rw [hall leaked[0] hlive] at hno
+    cases hno
+
+/-- **Universal global-root reachability seeding law (`rust#166221`)**:
+a live `.machine .rust` allocation (`id₁`) reachable from a live
+`.machine .global` allocation (`id₂`, `id₁ ≠ id₂`) via its provenance edges is
+NOT reported as leaked by `LeakCheck.take` (even with `staticRoots = #[]`),
+whereas without that edge `id₁` IS reported as leaked. -/
+theorem leakCheck_take_global_pointer_exempts_heap {E : Type}
+    (id1 id2 : AllocId) (hneq : id1 ≠ id2)
+    (rustAlloc globAlloc : Allocation Provenance E)
+    (hrust : LeakCheck.allocationIds rustAlloc = #[])
+    (hglob : LeakCheck.allocationIds globAlloc = #[id1]) :
+    let mem : MemoryState Provenance E MiriMemoryKind :=
+      { (MemoryState.empty : MemoryState Provenance E MiriMemoryKind) with
+        live := #[(id1, ⟨.machine .rust, rustAlloc⟩), (id2, ⟨.machine .global, globAlloc⟩)] }
+    LeakCheck.take mem #[] = .ok (mem, #[]) := by
+  intro mem
+  have h12 : (id1 == id2) = false := beq_false_of_ne hneq
+  have htodo : (mem.live.filterMap fun (id, entry) =>
+      if entry.kind == .machine .global then some id else none) ++ #[] = #[id2] := by
+    simp [mem]
+  have hedges : mem.live.foldl (fun count (_, entry) =>
+      count + (LeakCheck.allocationIds entry.allocation).size) 0 = 1 := by
+    simp [mem, hrust, hglob]
+  have hfind2 : mem.live.find? (·.1 == id2) = some (id2, ⟨.machine .global, globAlloc⟩) := by
+    simp [mem, h12]
+  have hfind1 : mem.live.find? (·.1 == id1) = some (id1, ⟨.machine .rust, rustAlloc⟩) := by
+    simp [mem]
+  have hnot0 : ((#[] : Array AllocId).contains id2) = false := by simp
+  have hnotc : ((#[id2] : Array AllocId).contains id1) = false := by simp [hneq]
+  have hpush2 : ((#[] : Array AllocId).push id2) = #[id2] := rfl
+  have hd0 : instDecidableEqBool ((#[] : Array AllocId).contains id2) true = isFalse (by simp) := by
+    cases instDecidableEqBool ((#[] : Array AllocId).contains id2) true with
+    | isFalse _ => rfl
+    | isTrue ht => rw [hnot0] at ht; cases ht
+  have hd1 : instDecidableEqBool ((#[id2] : Array AllocId).contains id1) true =
+      isFalse (by simp [hneq]) := by
+    cases instDecidableEqBool ((#[id2] : Array AllocId).contains id1) true with
+    | isFalse _ => rfl
+    | isTrue ht => rw [hnotc] at ht; cases ht
+  unfold LeakCheck.take LeakCheck.takeProfiled
+  dsimp only [Lean.profileit, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+  rw [htodo, hedges]
+  split
+  · rename_i err herr
+    conv at herr => lhs; whnf
+    rw [hd0] at herr
+    dsimp only at herr
+    simp only [hfind2, hglob, hpush2] at herr
+    conv at herr => lhs; whnf
+    rw [hd1] at herr
+    dsimp only at herr
+    simp only [hfind1, hrust] at herr
+    conv at herr => lhs; whnf
+    cases herr
+  · rename_i v hv
+    conv at hv => lhs; whnf
+    rw [hd0] at hv
+    dsimp only at hv
+    simp only [hfind2, hglob, hpush2] at hv
+    conv at hv => lhs; whnf
+    rw [hd1] at hv
+    dsimp only at hv
+    simp only [hfind1, hrust] at hv
+    conv at hv => lhs; whnf
+    cases hv
+    simp [LeakCheck.mayLeak, MiriMemoryKind.mayLeak, mem]
+
+/-- Concrete `staticRoots` seeding witness: a live unfreed `.machine .rust`
+allocation leaks under `staticRoots = #[]` and is exempted under
+`staticRoots = #[lmFirstId]`. -/
+def lmStaticRootCheck (seeded : Bool) : Except StepError (List AllocId) := do
+  let alloc ← match Allocation.fromBytes (Prov := Provenance) (Array.replicate 8 0) Align.EIGHT .Mut with
+    | .ok a => Except.ok a
+    | .error e => Except.error (MemoryErrors.allocation e)
+  let mem : MemoryState Provenance Unit MiriMemoryKind :=
+    { (MemoryState.empty : MemoryState Provenance Unit MiriMemoryKind) with
+      live := #[(lmFirstId, ⟨.machine .rust, alloc⟩)] }
+  let roots := if seeded then #[lmFirstId] else #[]
+  let (_, leaked) ← LeakCheck.take mem roots
+  pure (leaked.toList.map (·.1))
+
+/-- Without `staticRoots`, `lmFirstId` leaks; seeded in `staticRoots`, it is
+exempted (`leaked = []`). -/
+theorem leakCheck_static_root_seeded_witness :
+    lmStaticRootCheck false = .ok [lmFirstId] ∧
+    lmStaticRootCheck true = .ok [] := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-! ### `Memory::deallocate_ptr`, `AllocationMachine`, and `MemoryErrors` -/
 
 /-- `AllocationMachine.deallocationError` classifies exactly the seven
 `memory.rs::deallocate_ptr` failures as undefined behavior. -/
@@ -1473,6 +1717,47 @@ theorem deallocationError_ub_iff (error : MemoryLifecycleError) :
         error = .layoutMismatch id size requested align requestedAlign) := by
   cases error <;> simp [AllocationMachine.deallocationError, lmObsOfStep]
 
+/-- `MemoryErrors.access` classifies dangling integer pointers, dead-allocation
+use-after-free, out-of-bounds, and alignment failures as UB. -/
+theorem memoryErrors_access_ub_iff (error : AccessError) :
+    lmObsOfStep (MemoryErrors.access error) = .ub ↔
+      (∃ a s m, error = .danglingIntegerPointer a s m) ∨
+      (∃ id, error = .allocationLookup (.deadAllocation id)) ∨
+      (∃ id sz off isz m, error = .pointerOutOfBounds id sz off isz m) ∨
+      (∃ mis, error = .alignmentCheckFailed mis) := by
+  cases error with
+  | danglingIntegerPointer a s m => exact ⟨fun _ => Or.inl ⟨a, s, m, rfl⟩, fun _ => rfl⟩
+  | pointerOutOfBounds id sz off isz m =>
+    exact ⟨fun _ => Or.inr (Or.inr (Or.inl ⟨id, sz, off, isz, m, rfl⟩)), fun _ => rfl⟩
+  | alignmentCheckFailed mis =>
+    exact ⟨fun _ => Or.inr (Or.inr (Or.inr ⟨mis, rfl⟩)), fun _ => rfl⟩
+  | allocationLookup r =>
+    cases r with
+    | deadAllocation id => exact ⟨fun _ => Or.inr (Or.inl ⟨id, rfl⟩), fun _ => rfl⟩
+    | unavailable id =>
+      constructor
+      · intro h; cases h
+      · rintro (⟨_, _, _, h⟩ | ⟨_, h⟩ | ⟨_, _, _, _, _, h⟩ | ⟨_, h⟩) <;> cases h
+  | sizeDoesNotFitI64 _ | signedSizeOutsideI64 _ | pointerArithmetic _ | malformedAlignment _ =>
+    constructor
+    · intro h; cases h
+    · rintro (⟨_, _, _, h⟩ | ⟨_, h⟩ | ⟨_, _, _, _, _, h⟩ | ⟨_, h⟩) <;> cases h
+
+/-- `MemoryErrors.allocation` classifies uninitialized reads as UB. -/
+theorem memoryErrors_allocation_uninit_ub (info : Option BadBytesAccess) :
+    lmObsOfStep (MemoryErrors.allocation (.invalidUninitBytes info)) = .ub := rfl
+
+/-- `MemoryLifecycle.deallocatePtr` is `MemoryLifecycle.deallocatePtrWith` on
+the projected deallocation hooks. -/
+theorem deallocatePtr_eq_deallocatePtrWith {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryLifecycleHooks Prov Extra MachineKind HookState ProvExtra) :
+    MemoryLifecycle.deallocatePtr memory hooksState pointer oldSizeAndAlign kind hooks =
+      MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+        hooks.deallocation := rfl
+
 /-- A deallocation through a pointer that does not resolve to an allocation
 fails with `danglingPointer`, for every memory and every hooks. -/
 theorem deallocatePtrWith_dangling {Prov Extra MachineKind HookState ProvExtra : Type}
@@ -1483,10 +1768,12 @@ theorem deallocatePtrWith_dangling {Prov Extra MachineKind HookState ProvExtra :
     (h : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
       0).outcome = .error address) :
     (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
-      hooks).outcome = .error (.danglingPointer address) := by
+      hooks).outcome = .error (.danglingPointer address) ∧
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).detached = none := by
   unfold MemoryLifecycle.deallocatePtrWith
   simp only [Id.run, h]
-  rfl
+  exact ⟨rfl, rfl⟩
 
 /-- A deallocation through a pointer into the middle of an allocation fails
 with `nonzeroAllocationOffset`, for every memory and every hooks. -/
@@ -1500,15 +1787,535 @@ theorem deallocatePtrWith_nonzero_offset {Prov Extra MachineKind HookState ProvE
       0).outcome = .ok (id, offset, provExtra))
     (hoff : (offset.bytes != 0) = true) :
     (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
-      hooks).outcome = .error (.nonzeroAllocationOffset "deallocate" id offset) := by
+      hooks).outcome = .error (.nonzeroAllocationOffset "deallocate" id offset) ∧
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).detached = none := by
   unfold MemoryLifecycle.deallocatePtrWith
   simp only [Id.run, h]
   change (if (offset.bytes != 0) = true then _ else _ :
-    MemoryDeallocationResult Prov Extra MachineKind HookState).outcome = _
+    MemoryDeallocationResult Prov Extra MachineKind HookState).outcome = _ ∧
+    (if (offset.bytes != 0) = true then _ else _ :
+      MemoryDeallocationResult Prov Extra MachineKind HookState).detached = _
   rw [ite_eq_left hoff]
+  exact ⟨rfl, rfl⟩
+
+/-- Removing `id` from `live` leaves no row with key `id`. -/
+theorem live_filter_removes {Prov Extra MachineKind : Type}
+    (live : Array (AllocId × LocalAllocation Prov Extra MachineKind)) (id : AllocId) :
+    ∀ row ∈ live.filter (fun old => old.1 != id), row.1 ≠ id := by
+  intro row hmem heq
+  have hp := (Array.mem_filter.mp hmem).2
+  subst heq
+  simp at hp
+
+/-- Unfolded post-resolution body of `MemoryLifecycle.deallocatePtrWith` at
+offset `0`, exposing the live-map lookup and removal definitionally (without
+naming private `MemoryState.removeLive`). -/
+theorem deallocatePtrWith_zero_offset_step {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra)) :
+    let resolved := hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0
+    let resolvedState := hooks.synchronizeMemory resolved.memory resolved.state
+    let afterRemove := { resolved.memory with live := resolved.memory.live.filter fun old => old.1 != id }
+    MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind hooks =
+      match (resolved.memory.live.find? fun entry => entry.1 == id).map Prod.snd with
+      | some entry =>
+          let detached := some (id, entry)
+          let allocation := entry.allocation
+          if allocation.mutability == .Not then
+            ⟨afterRemove, hooks.synchronizeMemory afterRemove resolvedState, detached,
+              .error (.immutableAllocation id)⟩
+          else if entry.kind ≠ kind then
+            ⟨afterRemove, hooks.synchronizeMemory afterRemove resolvedState, detached,
+              .error (.memoryKindMismatch id)⟩
+          else
+            match oldSizeAndAlign with
+            | some (requestedSize, requestedAlign) =>
+                if requestedSize != allocation.byteSize || requestedAlign != allocation.align then
+                  ⟨afterRemove, hooks.synchronizeMemory afterRemove resolvedState, detached,
+                    .error (.layoutMismatch id allocation.byteSize requestedSize
+                      allocation.align requestedAlign)⟩
+                else
+                  let before := hooks.beforeDeallocation afterRemove
+                    (hooks.synchronizeMemory afterRemove resolvedState) allocation pointer id
+                    provExtra allocation.byteSize allocation.align kind
+                  let beforeState := hooks.synchronizeMemory before.memory before.state
+                  match before.outcome with
+                  | .ok () =>
+                      let deadEntry : DeadAllocation := ⟨id, allocation.byteSize, allocation.align⟩
+                      let alreadyDead := before.memory.dead.any fun old => old.allocId == id
+                      let afterDead := { before.memory with
+                        dead := (before.memory.dead.filter fun old => old.allocId != id).push deadEntry }
+                      let finalState := hooks.synchronizeMemory afterDead beforeState
+                      if alreadyDead then
+                        ⟨afterDead, finalState, detached, .error (.duplicateDeadAllocation id)⟩
+                      else
+                        ⟨afterDead, finalState, detached, .ok ()⟩
+                  | .error message =>
+                      ⟨before.memory, beforeState, detached,
+                        .error (.hookFailure "beforeMemoryDeallocation" message)⟩
+            | _ =>
+                let before := hooks.beforeDeallocation afterRemove
+                  (hooks.synchronizeMemory afterRemove resolvedState) allocation pointer id
+                  provExtra allocation.byteSize allocation.align kind
+                let beforeState := hooks.synchronizeMemory before.memory before.state
+                match before.outcome with
+                | .ok () =>
+                    let deadEntry : DeadAllocation := ⟨id, allocation.byteSize, allocation.align⟩
+                    let alreadyDead := before.memory.dead.any fun old => old.allocId == id
+                    let afterDead := { before.memory with
+                      dead := (before.memory.dead.filter fun old => old.allocId != id).push deadEntry }
+                    let finalState := hooks.synchronizeMemory afterDead beforeState
+                    if alreadyDead then
+                      ⟨afterDead, finalState, detached, .error (.duplicateDeadAllocation id)⟩
+                    else
+                      ⟨afterDead, finalState, detached, .ok ()⟩
+                | .error message =>
+                    ⟨before.memory, beforeState, detached,
+                      .error (.hookFailure "beforeMemoryDeallocation" message)⟩
+      | _ =>
+          match resolved.memory.findGlobal? id with
+          | some global =>
+              ⟨resolved.memory, resolvedState, none,
+                .error (.globalAllocationDeallocation id global.kind)⟩
+          | none => ⟨resolved.memory, resolvedState, none, .error (.useAfterFree id)⟩ := by
+  unfold MemoryLifecycle.deallocatePtrWith
+  simp only [Id.run, hres, Size.ZERO, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte,
+    pure, Pure.pure, bind, Bind.bind]
+  split
+  · rename_i entry hopt
+    change Option.map Prod.snd
+      ((hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.find?
+        fun e => e.1 == id) = some entry at hopt
+    rw [hopt]
+    dsimp only
+    cases hmut : (entry.allocation.mutability == Mutability.Not)
+    · simp only [Bool.false_eq_true, ↓reduceIte]
+      by_cases hkind : entry.kind = kind
+      · simp only [hkind, ne_eq, not_true_eq_false, ↓reduceIte]
+        cases oldSizeAndAlign with
+        | none =>
+          dsimp only
+          split
+          · rename_i hbef
+            change (hooks.beforeDeallocation
+              { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                  fun old => old.1 != id }
+              (hooks.synchronizeMemory
+                { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                  live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                    fun old => old.1 != id }
+                (hooks.synchronizeMemory
+                  (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory
+                  (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).state))
+              entry.allocation pointer id provExtra entry.allocation.byteSize entry.allocation.align kind).outcome =
+              Except.ok () at hbef
+            rw [hbef]
+            rfl
+          · rename_i msg hbef
+            change (hooks.beforeDeallocation
+              { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                  fun old => old.1 != id }
+              (hooks.synchronizeMemory
+                { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                  live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                    fun old => old.1 != id }
+                (hooks.synchronizeMemory
+                  (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory
+                  (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).state))
+              entry.allocation pointer id provExtra entry.allocation.byteSize entry.allocation.align kind).outcome =
+              Except.error msg at hbef
+            rw [hbef]
+            rfl
+        | some p =>
+          rcases p with ⟨rs, ra⟩
+          dsimp only
+          cases hlay : (rs != entry.allocation.byteSize || ra != entry.allocation.align)
+          · simp only [Bool.false_eq_true, ↓reduceIte]
+            split
+            · rename_i hbef
+              change (hooks.beforeDeallocation
+                { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                  live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                    fun old => old.1 != id }
+                (hooks.synchronizeMemory
+                  { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                    live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                      fun old => old.1 != id }
+                  (hooks.synchronizeMemory
+                    (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory
+                    (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).state))
+                entry.allocation pointer id provExtra entry.allocation.byteSize entry.allocation.align kind).outcome =
+                Except.ok () at hbef
+              rw [hbef]
+              rfl
+            · rename_i msg hbef
+              change (hooks.beforeDeallocation
+                { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                  live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                    fun old => old.1 != id }
+                (hooks.synchronizeMemory
+                  { (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory with
+                    live := (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.filter
+                      fun old => old.1 != id }
+                  (hooks.synchronizeMemory
+                    (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory
+                    (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).state))
+                entry.allocation pointer id provExtra entry.allocation.byteSize entry.allocation.align kind).outcome =
+                Except.error msg at hbef
+              rw [hbef]
+              rfl
+          · simp only [↓reduceIte]; rfl
+      · simp only [ne_eq, hkind, not_false_eq_true, ↓reduceIte]; rfl
+    · simp only [↓reduceIte]; rfl
+  · rename_i hopt
+    cases hfind : Option.map Prod.snd
+      ((hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.live.find?
+        fun e => e.1 == id) with
+    | none =>
+      cases (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0).memory.findGlobal? id <;>
+        rfl
+    | some entry =>
+      exact absurd hfind (hopt entry)
+
+/-- Deallocating an unmaterialized compiler global (absent from `live`, present
+in `findGlobal?`) fails with `globalAllocationDeallocation` (`rust#166221`). -/
+theorem deallocatePtrWith_global {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (global : GlobalAllocation)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hnotlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun entry => entry.1 == id) = none)
+    (hglob : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.findGlobal? id = some global) :
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).outcome = .error (.globalAllocationDeallocation id global.kind) ∧
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).detached = none := by
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer oldSizeAndAlign kind hooks id
+    provExtra hres]
+  simp [hnotlive, hglob]
+
+/-- Deallocating a pointer whose `AllocId` is neither live nor global fails
+with `useAfterFree` (covering double-free). -/
+theorem deallocatePtrWith_useAfterFree {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hnotlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun entry => entry.1 == id) = none)
+    (hnotglob : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.findGlobal? id = none) :
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).outcome = .error (.useAfterFree id) ∧
+    (MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind
+      hooks).detached = none := by
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer oldSizeAndAlign kind hooks id
+    provExtra hres]
+  simp [hnotlive, hnotglob]
+
+/-- Deallocating an immutable live allocation fails with `immutableAllocation`
+AND detaches it from `live` (live-map detachment invariant). -/
+theorem deallocatePtrWith_immutable {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (entry : LocalAllocation Prov Extra MachineKind)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (himmut : entry.allocation.mutability = .Not) :
+    let res := MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind hooks
+    res.outcome = .error (.immutableAllocation id) ∧
+    res.detached = some (id, entry) ∧
+    ∀ row ∈ res.memory.live, row.1 ≠ id := by
+  intro res
+  dsimp only [res]
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer oldSizeAndAlign kind hooks id
+    provExtra hres]
+  simp only [hlive, Option.map_some, himmut, beq_self_eq_true, ↓reduceIte]
+  exact ⟨trivial, trivial, live_filter_removes _ id⟩
+
+/-- Deallocating a mutable live allocation with the wrong `MemoryKind` (e.g.
+`.stack` or materialized `.machine .global` via `.machine .rust`) fails with
+`memoryKindMismatch` AND detaches it from `live` (live-map detachment invariant). -/
+theorem deallocatePtrWith_kindMismatch {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (oldSizeAndAlign : Option (Size × Align))
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (entry : LocalAllocation Prov Extra MachineKind)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut)
+    (hkind : entry.kind ≠ kind) :
+    let res := MemoryLifecycle.deallocatePtrWith memory hooksState pointer oldSizeAndAlign kind hooks
+    res.outcome = .error (.memoryKindMismatch id) ∧
+    res.detached = some (id, entry) ∧
+    ∀ row ∈ res.memory.live, row.1 ≠ id := by
+  intro res
+  dsimp only [res]
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer oldSizeAndAlign kind hooks id
+    provExtra hres]
+  simp only [hlive, Option.map_some, hmut, show (Mutability.Mut == .Not) = false by rfl,
+    Bool.false_eq_true, ne_eq, hkind, not_false_eq_true, ↓reduceIte]
+  exact ⟨trivial, trivial, live_filter_removes _ id⟩
+
+/-- Deallocating a mutable live allocation of matching kind with wrong size or
+alignment fails with `layoutMismatch` AND detaches it from `live`. -/
+theorem deallocatePtrWith_layoutMismatch {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (reqSize : Size) (reqAlign : Align)
+    (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (entry : LocalAllocation Prov Extra MachineKind)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut)
+    (hkind : entry.kind = kind)
+    (hbad : reqSize ≠ entry.allocation.byteSize ∨ reqAlign ≠ entry.allocation.align) :
+    let res := MemoryLifecycle.deallocatePtrWith memory hooksState pointer
+      (some (reqSize, reqAlign)) kind hooks
+    res.outcome = .error (.layoutMismatch id entry.allocation.byteSize reqSize
+      entry.allocation.align reqAlign) ∧
+    res.detached = some (id, entry) ∧
+    ∀ row ∈ res.memory.live, row.1 ≠ id := by
+  intro res
+  have hcond : (reqSize != entry.allocation.byteSize || reqAlign != entry.allocation.align) = true := by
+    rcases hbad with hs | ha
+    · simp [bne_iff_ne, hs]
+    · simp [bne_iff_ne, ha]
+  dsimp only [res]
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer (some (reqSize, reqAlign)) kind
+    hooks id provExtra hres]
+  simp only [hlive, Option.map_some, hmut, show (Mutability.Mut == .Not) = false by rfl,
+    Bool.false_eq_true, hkind, ne_eq, not_true_eq_false, hcond, ↓reduceIte]
+  exact ⟨trivial, trivial, live_filter_removes _ id⟩
+
+/-- When `beforeDeallocation` fails after kind/layout checks pass, `deallocatePtrWith`
+reports `.hookFailure "beforeMemoryDeallocation" msg` and retains `detached`. -/
+theorem deallocatePtrWith_hookFailure {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (entry : LocalAllocation Prov Extra MachineKind)
+    (msg : String)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut)
+    (hkind : entry.kind = kind)
+    (hbefore :
+      let r := hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      let st1 := hooks.synchronizeMemory afterRemove (hooks.synchronizeMemory r.memory r.state)
+      (hooks.beforeDeallocation afterRemove st1 entry.allocation pointer id provExtra
+        entry.allocation.byteSize entry.allocation.align kind).outcome = .error msg) :
+    let res := MemoryLifecycle.deallocatePtrWith memory hooksState pointer
+      (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks
+    res.outcome = .error (.hookFailure "beforeMemoryDeallocation" msg) ∧
+    res.detached = some (id, entry) := by
+  intro res
+  dsimp only [res]
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer
+    (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks id provExtra hres]
+  simp only [hlive, Option.map_some, hmut, show (Mutability.Mut == .Not) = false by rfl,
+    Bool.false_eq_true, hkind, ne_eq, not_true_eq_false, bne_self_eq_false,
+    Bool.or_self, hbefore, ↓reduceIte]
+  exact ⟨trivial, trivial⟩
+
+/-- When all checks and `beforeDeallocation` succeed and `id` is not already in
+`dead`, `deallocatePtrWith` returns `.ok ()`, detaches `id`, and records
+`DeadAllocation ⟨id, size, align⟩` in `res.memory.dead`. -/
+theorem deallocatePtrWith_ok {Prov Extra MachineKind HookState ProvExtra : Type}
+    [DecidableEq MachineKind] (memory : MemoryState Prov Extra MachineKind) (hooksState : HookState)
+    (pointer : Pointer (Option Prov)) (kind : MemoryKind MachineKind)
+    (hooks : MemoryDeallocationHooks Prov Extra MachineKind HookState ProvExtra)
+    (id : AllocId) (provExtra : ProvExtra) (entry : LocalAllocation Prov Extra MachineKind)
+    (hres : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).outcome = .ok (id, Size.ZERO, provExtra))
+    (hlive : (hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer
+      0).memory.live.find? (fun e => e.1 == id) = some (id, entry))
+    (hmut : entry.allocation.mutability = .Mut)
+    (hkind : entry.kind = kind)
+    (hbefore :
+      let r := hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      let st1 := hooks.synchronizeMemory afterRemove (hooks.synchronizeMemory r.memory r.state)
+      (hooks.beforeDeallocation afterRemove st1 entry.allocation pointer id provExtra
+        entry.allocation.byteSize entry.allocation.align kind).outcome = .ok ())
+    (hnotdead :
+      let r := hooks.resolvePointer memory (hooks.synchronizeMemory memory hooksState) pointer 0
+      let afterRemove := { r.memory with live := r.memory.live.filter fun old => old.1 != id }
+      let st1 := hooks.synchronizeMemory afterRemove (hooks.synchronizeMemory r.memory r.state)
+      let bef := hooks.beforeDeallocation afterRemove st1 entry.allocation pointer id provExtra
+        entry.allocation.byteSize entry.allocation.align kind
+      (bef.memory.dead.any fun old => old.allocId == id) = false) :
+    let res := MemoryLifecycle.deallocatePtrWith memory hooksState pointer
+      (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks
+    res.outcome = .ok () ∧
+    res.detached = some (id, entry) ∧
+    (⟨id, entry.allocation.byteSize, entry.allocation.align⟩ : DeadAllocation) ∈ res.memory.dead := by
+  intro res
+  dsimp only [res]
+  rw [deallocatePtrWith_zero_offset_step memory hooksState pointer
+    (some (entry.allocation.byteSize, entry.allocation.align)) kind hooks id provExtra hres]
+  simp only [hlive, Option.map_some, hmut, show (Mutability.Mut == .Not) = false by rfl,
+    Bool.false_eq_true, hkind, ne_eq, not_true_eq_false, bne_self_eq_false,
+    Bool.or_self, hbefore, hnotdead, ↓reduceIte]
+  exact ⟨trivial, trivial, Array.mem_push_self⟩
+
+/-- Direct universal bridge on vendored `Miri.Interpreter.AllocationMachine.deallocate`:
+when pointer resolution fails with a dangling address, `AllocationMachine.deallocate`
+throws `h.error (.danglingPointer address)` (since `pendingError = none`). -/
+theorem allocationMachine_deallocate_dangling {K User Payload : Type} [DecidableEq K]
+    (h : AllocationMachine.DeallocationHooks K User Payload)
+    (pointer : Pointer (Option Provenance)) (oldLayout : Option (Size × Align))
+    (kind : MemoryKind K) (st : MachineHooks.State K User) (address : UInt64)
+    (hres : (h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).outcome =
+      .error address)
+    (hpend : (h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0).state.pendingError =
+      none) :
+    let r := h.resolvePointer st.machine.memory ⟨st.machine, none⟩ pointer 0
+    AllocationMachine.deallocate h pointer oldLayout kind st =
+      .error (h.error (.danglingPointer address))
+        { st with machine := { r.state.machine with memory := r.memory } } := by
+  intro r
+  have hsync : ({ machine := { st.machine with memory := st.machine.memory }, pendingError := none } :
+      PlaceMachine.AccessState K User) = ⟨st.machine, none⟩ := rfl
+  unfold AllocationMachine.deallocate MemoryLifecycle.deallocatePtrWith
+  simp only [Id.run, get, getThe, MonadStateOf.get, modify, modifyGet, MonadStateOf.modifyGet,
+    bind, Bind.bind, pure, Pure.pure, EStateM.bind, EStateM.get, EStateM.modifyGet,
+    EStateM.throw, throw, throwThe, MonadExceptOf.throw, hsync, hres, hpend, Option.getD_none]
   rfl
 
-/-! ### `Align::from_bytes` at `Align::MAX` -/
+/-! ### Tree Borrows universal laws (`rust#165833`) -/
+
+/-- On the single-threaded hooks (`lmHookContext`, `lmMachineHooks`), vendored
+`MachineMemoryHooks.beforeMemoryDeallocation` succeeds **if and only if**
+vendored `BorrowTree.deallocateBorrowRange` returns `.Deallocated`. -/
+theorem beforeMemoryDeallocation_ok_iff (protectedTags : ProtectedTags)
+    (allocation : Allocation Provenance BorrowTree) (pointer : Pointer (Option Provenance))
+    (allocId : AllocId) (provenance : ProvenanceExtra) (size : Size) (align : Align)
+    (kind : MemoryKind MiriMemoryKind) :
+    (MachineMemoryHooks.beforeMemoryDeallocation lmHookContext (lmMachineHooks protectedTags)
+      allocation pointer allocId provenance size align kind).outcome = .ok () ↔
+      (allocation.extra.deallocateBorrowRange provenance Size.ZERO size protectedTags).status =
+        .Deallocated := by
+  unfold MachineMemoryHooks.beforeMemoryDeallocation lmHookContext lmMachineHooks
+  simp only [Id.run, MachineMemoryHooks.SyncObjectStore.get,
+    MachineMemoryHooks.SyncObjectStore.empty, MachineMemoryHooks.SyncObjectMap.empty,
+    Array.contains_empty, Bool.false_eq_true, ↓reduceIte, Array.find?_empty, Option.map_none,
+    Option.getD_none, pure, Pure.pure]
+  cases h : (allocation.extra.deallocateBorrowRange provenance Size.ZERO size protectedTags).status with
+  | Deallocated =>
+    simp only [bne_self_eq_false, Bool.false_eq_true, ↓reduceIte]
+    exact ⟨fun _ => trivial, fun _ => rfl⟩
+  | _ => simp
+
+/-- Universal write-first law of vendored `BorrowTree.deallocateBorrowRange`:
+whenever the initial write access (`performBorrowAccessRange ... .Write ...`)
+does not complete, `deallocateBorrowRange` immediately returns
+`.AccessFailure accessed.status`. -/
+theorem deallocateBorrowRange_access_failure (tree : BorrowTree)
+    (provenance : ProvenanceExtra) (offset length : Size) (protectedTags : ProtectedTags)
+    (hfail : (tree.performBorrowAccessRange provenance offset length .Write protectedTags
+      .VisitChildrenOfAccessed).status ≠ .Completed) :
+    (tree.deallocateBorrowRange provenance offset length protectedTags).status =
+      .AccessFailure (tree.performBorrowAccessRange provenance offset length .Write protectedTags
+        .VisitChildrenOfAccessed).status := by
+  unfold BorrowTree.deallocateBorrowRange
+  have hne : ((tree.performBorrowAccessRange provenance offset length .Write protectedTags
+      .VisitChildrenOfAccessed).status != .Completed) = true := bne_iff_ne.mpr hfail
+  simp only [Id.run, hne, ↓reduceIte, pure, Pure.pure]
+
+/-- Universal missing-tag law of vendored `BorrowTree.deallocateBorrowRange`. -/
+theorem deallocateBorrowRange_missing_tag (tree : BorrowTree)
+    (tag : BorTag) (offset length : Size) (protectedTags : ProtectedTags)
+    (hok : (tree.performBorrowAccessRange (.concrete tag) offset length .Write protectedTags
+      .VisitChildrenOfAccessed).status = .Completed)
+    (hmiss : (tree.performBorrowAccessRange (.concrete tag) offset length .Write protectedTags
+      .VisitChildrenOfAccessed).tree.indexOfTag tag = none) :
+    (tree.deallocateBorrowRange (.concrete tag) offset length protectedTags).status =
+      .MissingTag tag := by
+  unfold BorrowTree.deallocateBorrowRange
+  simp only [Id.run, hok, bne_self_eq_false, Bool.false_eq_true, ↓reduceIte, hmiss,
+    Option.isNone_none, pure, Pure.pure]
+
+/-- Universal `RetagPolicy.create` law (`rust#165833`): at `FnEntry`, a `Box`
+(`Unpin`) ALWAYS receives a `.WeakProtector` (never `.StrongProtector`). -/
+theorem retagPolicy_box_weak_protector (facts : RetagPolicy.TypeFacts)
+    (config : RetagPolicy.PolicyConfig) (hunpin : facts.isUnpin = true)
+    (hunsafe : facts.isUnsafeUnpin = true) :
+    (RetagPolicy.create facts .Box .FnEntry config).map (·.protector) =
+      some (some .WeakProtector) := by
+  unfold RetagPolicy.create
+  simp [Id.run, pure, Pure.pure, hunpin, hunsafe]
+
+/-- Universal `RetagPolicy.create` law (`rust#165833`): at `FnEntry`, `&T`
+(any facts) and `&mut T` (`Unpin`) ALWAYS receive a `.StrongProtector`. -/
+theorem retagPolicy_ref_strong_protector (facts : RetagPolicy.TypeFacts)
+    (config : RetagPolicy.PolicyConfig) :
+    (RetagPolicy.create facts .Shared .FnEntry config).map (·.protector) =
+      some (some .StrongProtector) ∧
+    (facts.isUnpin = true → facts.isUnsafeUnpin = true →
+      (RetagPolicy.create facts .Mutable .FnEntry config).map (·.protector) =
+        some (some .StrongProtector)) := by
+  constructor
+  · unfold RetagPolicy.create; simp [Id.run, pure, Pure.pure]
+  · intro hu hiu; unfold RetagPolicy.create; simp [Id.run, pure, Pure.pure, hu, hiu]
+
+/-- Universal `RetagPolicy.create` law: non-`FnEntry` `.Default` retags install
+NO protector (`protector = none`). -/
+theorem retagPolicy_default_unprotected (facts : RetagPolicy.TypeFacts)
+    (config : RetagPolicy.PolicyConfig) :
+    (RetagPolicy.create facts .Shared .Default config).map (·.protector) = some none := by
+  unfold RetagPolicy.create
+  simp [Id.run, pure, Pure.pure]
+
+/-- Universal per-location Tree Borrows deallocation-write transition laws on
+vendored `Tree.LocationState.performAccess`:
+1. Foreign write to `.Cell` succeeds even when `isProtected = true` and
+   `accessed = true` (`Cell` exemption, Case 22).
+2. Local write through `.Frozen` is always forbidden (`ChildAccessForbidden`, Case 21).
+3. Foreign write to a protected, accessed `.Frozen` location triggers
+   `ProtectedDisabled .Frozen` (Case 19).
+4. Foreign write to an *unprotected* `.Frozen` location succeeds (Case 20). -/
+theorem locationState_dealloc_write_laws (accessed isProtected : Bool)
+    (sifa : IdempotentForeignAccess) :
+    (Tree.LocationState.performAccess ⟨.Cell, accessed, sifa⟩ .Write .ForeignAccess isProtected =
+      .Success ⟨.Cell, accessed, sifa⟩ ⟨.Cell, .Cell⟩) ∧
+    (Tree.LocationState.performAccess ⟨.Frozen, accessed, sifa⟩ .Write .LocalAccess isProtected =
+      .Error ⟨.Frozen, accessed, sifa⟩ (.ChildAccessForbidden .Frozen)) ∧
+    (Tree.LocationState.performAccess ⟨.Frozen, true, sifa⟩ .Write .ForeignAccess true =
+      .Error ⟨.Disabled, true, sifa⟩ (.ProtectedDisabled .Frozen)) ∧
+    (Tree.LocationState.performAccess ⟨.Frozen, accessed, sifa⟩ .Write .ForeignAccess false =
+      .Success ⟨.Disabled, accessed, sifa⟩ ⟨.Frozen, .Disabled⟩) := by
+  cases accessed <;> cases isProtected <;> exact ⟨rfl, rfl, rfl, rfl⟩
+
+/-! ### `Align::from_bytes` at `Align::MAX` (universal over ALL `UInt64`) -/
 
 /-- `Align::from_bytes` accepts every power of two up to `2^29`. -/
 theorem align_fromBytes_pow2_ok (k : Nat) (h : k < 30) :
@@ -1540,24 +2347,224 @@ theorem align_fromBytes_boundary :
     Align.fromBytes 0 = .ok Align.ONE := by
   refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
-/-- `Align::from_bytes` rejects every non-power-of-two below `4096`. -/
-theorem align_fromBytes_not_pow2 (n : Nat) (h : n < 4096) (hne : n ≠ 0)
-    (hpow : ∀ k, k < 12 → n ≠ 2 ^ k) :
-    Align.fromBytes (UInt64.ofNat n) = .error (.notPowerOfTwo (UInt64.ofNat n)) := by
-  have hall : (List.range 4096).all (fun n => decide (n = 0) ||
-      (List.range 12).any (fun k => decide (n = 2 ^ k)) ||
-      decide (Align.fromBytes (UInt64.ofNat n) = .error (.notPowerOfTwo (UInt64.ofNat n)))) =
-        true := by
+/-- Left-shifting `1 : UInt64` by `UInt64.ofNat p` always produces the power of
+two `UInt64.ofNat (2 ^ (p % 64))`. -/
+theorem uint64_one_shiftLeft_eq_pow2 (p : Nat) :
+    UInt64.shiftLeft 1 (UInt64.ofNat p) = UInt64.ofNat (2 ^ (p % 64)) := by
+  have hlt : p % 64 < 64 := Nat.mod_lt p (by decide)
+  have hall : (List.range 64).all (fun k =>
+      decide (UInt64.shiftLeft 1 (UInt64.ofNat k) = UInt64.ofNat (2 ^ k))) = true := by
     decide +kernel
-  have hn := List.all_eq_true.mp hall n (List.mem_range.mpr h)
-  rw [Bool.or_eq_true, Bool.or_eq_true, decide_eq_true_eq, decide_eq_true_eq] at hn
-  rcases hn with (hn | hn) | hn
-  · exact absurd hn hne
-  · obtain ⟨k, hk, hkn⟩ := List.any_eq_true.mp hn
-    exact absurd (of_decide_eq_true hkn) (hpow k (List.mem_range.mp hk))
-  · exact hn
+  have hk := of_decide_eq_true (List.all_eq_true.mp hall (p % 64) (List.mem_range.mpr hlt))
+  have hshift : UInt64.shiftLeft 1 (UInt64.ofNat p) = UInt64.shiftLeft 1 (UInt64.ofNat (p % 64)) := by
+    apply UInt64.eq_of_toBitVec_eq
+    apply BitVec.eq_of_toNat_eq
+    have hdvd : 64 ∣ 2 ^ 64 := ⟨2 ^ 58, by decide⟩
+    have hmod : (UInt64.ofNat p).toNat % 64 = (UInt64.ofNat (p % 64)).toNat % 64 := by
+      rw [UInt64.toNat_ofNat', UInt64.toNat_ofNat']
+      rw [Nat.mod_mod_of_dvd p hdvd, Nat.mod_mod_of_dvd (p % 64) hdvd, Nat.mod_mod]
+    show ((1 : BitVec 64) <<< ((UInt64.ofNat p).toBitVec % 64)).toNat =
+      ((1 : BitVec 64) <<< ((UInt64.ofNat (p % 64)).toBitVec % 64)).toNat
+    have hbv : ((UInt64.ofNat p).toBitVec % 64).toNat =
+        ((UInt64.ofNat (p % 64)).toBitVec % 64).toNat := by
+      have h64 : (64 : BitVec 64).toNat = 64 := by decide
+      simpa only [BitVec.toNat_umod, h64, UInt64.toNat] using hmod
+    have hbvEq : (UInt64.ofNat p).toBitVec % 64 = (UInt64.ofNat (p % 64)).toBitVec % 64 :=
+      BitVec.eq_of_toNat_eq hbv
+    rw [hbvEq]
+  rw [hshift, hk]
 
-/-! ### `ptr::addr_eq` (`rust#166144`) -/
+/-- **Universal `notPowerOfTwo` law across ALL `2^64` values of `UInt64`**:
+every nonzero `UInt64` that is not a power of two `2^k` (`k < 64`) is rejected
+by `Align.fromBytes` with `.notPowerOfTwo bytes` (no `< 4096` cap!). -/
+theorem align_fromBytes_not_pow2_all (bytes : UInt64) (hne : bytes ≠ 0)
+    (hpow : ∀ k, k < 64 → bytes ≠ UInt64.ofNat (2 ^ k)) :
+    Align.fromBytes bytes = .error (.notPowerOfTwo bytes) := by
+  unfold Align.fromBytes
+  have hbz : (bytes == 0) = false := beq_false_of_ne hne
+  simp only [hbz, Bool.false_eq_true, ↓reduceIte]
+  have hneShift : ∀ p : Nat, UInt64.shiftLeft 1 (UInt64.ofNat p) ≠ bytes := by
+    intro p heq
+    rw [uint64_one_shiftLeft_eq_pow2] at heq
+    exact hpow (p % 64) (Nat.mod_lt p (by decide)) heq.symm
+  split
+  · rfl
+  · rename_i hnot
+    exfalso
+    exact hneShift _ (by simpa [bne_iff_ne] using hnot)
+
+/-- **Complete bidirectional `.ok` characterization of `Align.fromBytes` across
+all `UInt64`**: succeeds iff `bytes = 0` (`Align.ONE`) or `bytes = 2^k` with
+`k < 30`. -/
+theorem align_fromBytes_ok_iff (bytes : UInt64) (al : Align) :
+    Align.fromBytes bytes = .ok al ↔
+      (bytes = 0 ∧ al = Align.ONE) ∨
+      (∃ k, k < 30 ∧ bytes = UInt64.ofNat (2 ^ k) ∧ al = ⟨k⟩) := by
+  constructor
+  · intro h
+    by_cases hz : bytes = 0
+    · subst hz
+      rw [align_fromBytes_boundary.2.2.2] at h
+      exact Or.inl ⟨rfl, (Except.ok.inj h).symm⟩
+    · by_cases hpow : ∃ k, k < 64 ∧ bytes = UInt64.ofNat (2 ^ k)
+      · obtain ⟨k, hk64, rfl⟩ := hpow
+        by_cases hk30 : k < 30
+        · rw [align_fromBytes_pow2_ok k hk30] at h
+          exact Or.inr ⟨k, hk30, rfl, (Except.ok.inj h).symm⟩
+        · rw [align_fromBytes_too_large k (Nat.le_of_not_lt hk30) hk64] at h
+          cases h
+      · have hnp : ∀ k, k < 64 → bytes ≠ UInt64.ofNat (2 ^ k) :=
+          fun k hk heq => hpow ⟨k, hk, heq⟩
+        rw [align_fromBytes_not_pow2_all bytes hz hnp] at h
+        cases h
+  · rintro (⟨rfl, rfl⟩ | ⟨k, hk, rfl, rfl⟩)
+    · exact align_fromBytes_boundary.2.2.2
+    · exact align_fromBytes_pow2_ok k hk
+
+/-- **Complete bidirectional `.tooLarge` characterization of `Align.fromBytes`
+across all `UInt64`**: fails with `.tooLarge` iff `bytes = 2^k` with
+`30 ≤ k < 64`. -/
+theorem align_fromBytes_tooLarge_iff (bytes : UInt64) :
+    Align.fromBytes bytes = .error (.tooLarge bytes) ↔
+      ∃ k, 30 ≤ k ∧ k < 64 ∧ bytes = UInt64.ofNat (2 ^ k) := by
+  constructor
+  · intro h
+    by_cases hz : bytes = 0
+    · subst hz; rw [align_fromBytes_boundary.2.2.2] at h; cases h
+    · by_cases hpow : ∃ k, k < 64 ∧ bytes = UInt64.ofNat (2 ^ k)
+      · obtain ⟨k, hk64, rfl⟩ := hpow
+        by_cases hk30 : k < 30
+        · rw [align_fromBytes_pow2_ok k hk30] at h; cases h
+        · exact ⟨k, Nat.le_of_not_lt hk30, hk64, rfl⟩
+      · have hnp : ∀ k, k < 64 → bytes ≠ UInt64.ofNat (2 ^ k) :=
+          fun k hk heq => hpow ⟨k, hk, heq⟩
+        rw [align_fromBytes_not_pow2_all bytes hz hnp] at h
+        cases h
+  · rintro ⟨k, h30, h64, rfl⟩
+    exact align_fromBytes_too_large k h30 h64
+
+/-- **Complete bidirectional `.notPowerOfTwo` characterization of
+`Align.fromBytes` across all `UInt64`**. -/
+theorem align_fromBytes_notPowerOfTwo_iff (bytes : UInt64) :
+    Align.fromBytes bytes = .error (.notPowerOfTwo bytes) ↔
+      bytes ≠ 0 ∧ ∀ k, k < 64 → bytes ≠ UInt64.ofNat (2 ^ k) := by
+  constructor
+  · intro h
+    refine ⟨?_, ?_⟩
+    · intro hz; subst hz; rw [align_fromBytes_boundary.2.2.2] at h; cases h
+    · intro k hk64 heq; subst heq
+      by_cases hk30 : k < 30
+      · rw [align_fromBytes_pow2_ok k hk30] at h; cases h
+      · rw [align_fromBytes_too_large k (Nat.le_of_not_lt hk30) hk64] at h; cases h
+  · rintro ⟨hz, hpow⟩
+    exact align_fromBytes_not_pow2_all bytes hz hpow
+
+/-! ### `ptr::addr_eq` and wide `==` (`rust#166144`) -/
+
+/-- Truncating any `UInt64` embedded in `U128` to 8 bytes (64 bits) is the identity. -/
+theorem size_truncate_u64 (x : UInt64) :
+    (Size.ofBytes 8).truncate (BitVec.ofNat 128 x.toNat) = .ok (BitVec.ofNat 128 x.toNat) := by
+  have hlt : x.toNat < 2 ^ 64 := x.toFin.isLt
+  have h128 : x.toNat < 2 ^ 128 := Nat.lt_trans hlt (by decide)
+  have hbv : BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat)) =
+      BitVec.ofNat 128 x.toNat := by
+    apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.zeroExtend, BitVec.extractLsb, BitVec.extractLsb', BitVec.toNat_setWidth,
+      BitVec.toNat_ofNat, Nat.shiftRight_zero]
+    rw [Nat.mod_eq_of_lt h128, Nat.mod_eq_of_lt hlt, Nat.mod_eq_of_lt h128]
+  change Except.ok (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat))) = _
+  rw [hbv]
+
+/-- `ScalarInt.tryFromUInt` at 8 bytes always succeeds on any `UInt64`, yielding
+a `ScalarInt` whose `toBits (Size.ofBytes 8)` recovers `BitVec.ofNat 128 x.toNat`. -/
+theorem scalarInt_tryFromUInt_u64 (x : UInt64) :
+    ∃ si : ScalarInt,
+      ScalarInt.tryFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8) = .ok (some si) ∧
+      si.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 x.toNat) := by
+  have hlt : x.toNat < 2 ^ 64 := x.toFin.isLt
+  have h128 : x.toNat < 2 ^ 128 := Nat.lt_trans hlt (by decide)
+  have hbv : BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat)) =
+      BitVec.ofNat 128 x.toNat := by
+    apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.zeroExtend, BitVec.extractLsb, BitVec.extractLsb', BitVec.toNat_setWidth,
+      BitVec.toNat_ofNat, Nat.shiftRight_zero]
+    rw [Nat.mod_eq_of_lt h128, Nat.mod_eq_of_lt hlt, Nat.mod_eq_of_lt h128]
+  cases htr : ScalarInt.truncateFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8) with
+  | error e =>
+    have hok : (ScalarInt.truncateFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8)).isOk = true := rfl
+    rw [htr] at hok; cases hok
+  | ok p =>
+    rcases p with ⟨si, ovf⟩
+    have hovf : ovf = false := by
+      have h1 : (ScalarInt.truncateFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8)).map Prod.snd =
+          .ok (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat)) !=
+            BitVec.ofNat 128 x.toNat) := rfl
+      rw [htr] at h1
+      simp only [Except.map, Except.ok.injEq] at h1
+      rw [h1, hbv, bne_self_eq_false]
+    have hbits : si.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 x.toNat) := by
+      have h1 : (ScalarInt.truncateFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8)).bind
+          (fun p => p.1.toBits (Size.ofBytes 8)) =
+          .ok (BitVec.zeroExtend 128 (BitVec.extractLsb 63 0 (BitVec.ofNat 128 x.toNat))) := rfl
+      rw [htr] at h1
+      simpa only [Except.bind, hbv] using h1
+    refine ⟨si, ?_, hbits⟩
+    have htry : ScalarInt.tryFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8) =
+        (ScalarInt.truncateFromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8)).bind
+          (fun p => if p.2 then .ok none else .ok (some p.1)) := rfl
+    rw [htry, htr]
+    simp [hovf, Except.bind]
+
+/-- `Scalar.fromUInt` on any `UInt64` at 8 bytes succeeds and `toBits (Size.ofBytes 8)`
+recovers `BitVec.ofNat 128 x.toNat`. -/
+theorem scalar_fromUInt64_toBits (x : UInt64) :
+    ∃ s : Miri.Memory.Scalar Provenance,
+      Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 x.toNat) (Size.ofBytes 8) = .ok s ∧
+      s.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 x.toNat) := by
+  obtain ⟨si, htry, hbits⟩ := scalarInt_tryFromUInt_u64 x
+  refine ⟨Miri.Memory.Scalar.fromScalarInt si, ?_, ?_⟩
+  · unfold Miri.Memory.Scalar.fromUInt
+    simp only [htry, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+  · change (si.toBits (Size.ofBytes 8)).mapError Miri.Memory.ScalarError.scalarInt = _
+    rw [hbits]; rfl
+
+/-- `Scalar.fromMaybePointer lmLayout ⟨addr, prov⟩` always succeeds and
+`toBits (Size.ofBytes 8)` always returns `BitVec.ofNat 128 addr.bytes.toNat`,
+completely erasing `prov` (both `some _` and `none`). -/
+theorem scalar_fromMaybePointer_toBits (addr : Size) (prov : Option Provenance) :
+    ∃ s : Miri.Memory.Scalar Provenance,
+      Miri.Memory.Scalar.fromMaybePointer lmLayout ⟨addr, prov⟩ = .ok s ∧
+      s.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 addr.bytes.toNat) := by
+  obtain ⟨si, htry, hbits⟩ := scalarInt_tryFromUInt_u64 addr.bytes
+  cases prov with
+  | none =>
+    refine ⟨Miri.Memory.Scalar.fromScalarInt si, ?_, ?_⟩
+    · change ((do
+        let scalar ← (ScalarInt.tryFromUInt (BitVec.ofNat 128 addr.bytes.toNat) (Size.ofBytes 8)).mapError
+          Miri.Memory.ScalarError.scalarInt
+        match scalar with
+        | some s => pure (Miri.Memory.Scalar.fromScalarInt s)
+        | none => throw (.pointerOffsetDoesNotFit addr (Size.ofBytes 8))) :
+        Except Miri.Memory.ScalarError (Miri.Memory.Scalar Provenance)) = _
+      rw [htry]; rfl
+    · change (si.toBits (Size.ofBytes 8)).mapError Miri.Memory.ScalarError.scalarInt = _
+      rw [hbits]; rfl
+  | some p =>
+    refine ⟨Miri.Memory.Scalar.fromPointer lmLayout ⟨addr, p⟩, rfl, ?_⟩
+    change (Except.bind
+      (Except.bind
+        (Except.bind
+          ((ScalarInt.tryFromUInt (BitVec.ofNat 128 addr.bytes.toNat) (Size.ofBytes 8)).mapError
+            Miri.Memory.ScalarError.scalarInt)
+          (fun scalar => match scalar with
+            | some s => Except.ok (Miri.Memory.ScalarIntCastResult.integer s)
+            | none => Except.error (.pointerOffsetDoesNotFit addr (Size.ofBytes 8))))
+        (fun cast => match cast with
+          | .integer v => Except.ok v
+          | .erasedPointer _ _ => Except.error .readPointerAsInt))
+      (fun s => (s.toBits (Size.ofBytes 8)).mapError Miri.Memory.ScalarError.scalarInt)) = _
+    rw [htry]
+    simp only [Except.mapError, Except.bind, hbits]
 
 /-- The fat-to-thin cast keeps the data pointer and drops the metadata, for
 every data scalar and every metadata scalar, of a slice pointer and of a
@@ -1567,17 +2574,137 @@ theorem ptrToPtr_fat_to_thin (data metadata : Miri.Memory.Scalar Provenance) :
     lmToThin ⟨.scalarPair data metadata, layoutDyn⟩ = .ok ⟨.scalar data, layoutThin⟩ :=
   ⟨rfl, rfl⟩
 
-/-- **`addr_eq` erases metadata.** `addr_eq` of two wide pointers is `==` of
-their data pointers, whatever their metadata (two lengths, two vtables, or a
-length and a vtable). -/
+/-- **`addr_eq` erases metadata** across all four combinations of wide pointer
+types (`Slice`/`Slice`, `Dyn`/`Dyn`, `Slice`/`Dyn`, `Dyn`/`Slice`). -/
 theorem addrEq_metadata_erased (dataL dataR metaL metaR : Miri.Memory.Scalar Provenance) :
     lmAddrEq ⟨.scalarPair dataL metaL, layoutSlice⟩ ⟨.scalarPair dataR metaR, layoutSlice⟩ =
       lmEq ⟨.scalar dataL, layoutThin⟩ ⟨.scalar dataR, layoutThin⟩ ∧
     lmAddrEq ⟨.scalarPair dataL metaL, layoutDyn⟩ ⟨.scalarPair dataR metaR, layoutDyn⟩ =
       lmEq ⟨.scalar dataL, layoutThin⟩ ⟨.scalar dataR, layoutThin⟩ ∧
     lmAddrEq ⟨.scalarPair dataL metaL, layoutSlice⟩ ⟨.scalarPair dataR metaR, layoutDyn⟩ =
+      lmEq ⟨.scalar dataL, layoutThin⟩ ⟨.scalar dataR, layoutThin⟩ ∧
+    lmAddrEq ⟨.scalarPair dataL metaL, layoutDyn⟩ ⟨.scalarPair dataR metaR, layoutSlice⟩ =
       lmEq ⟨.scalar dataL, layoutThin⟩ ⟨.scalar dataR, layoutThin⟩ :=
-  ⟨rfl, rfl, rfl⟩
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- `compare x y == .eq` on `Nat` is `x == y`. -/
+theorem nat_compare_eq_iff (x y : Nat) : (compare x y == .eq) = decide (x = y) := by
+  change (compareOfLessAndEq x y == .eq) = decide (x = y)
+  unfold compareOfLessAndEq
+  by_cases hlt : x < y
+  · have hne : x ≠ y := Nat.ne_of_lt hlt
+    simp [hlt, hne]
+  · by_cases heq : x = y
+    · subst heq; simp
+    · simp [hlt, heq]
+
+/-- Lexicographic pair comparison of `UInt64`s at `Eq` is equality of both
+components. -/
+theorem u64_lex_compare_eq (a b c d : UInt64) :
+    ((if BitVec.ofNat 128 a.toNat == BitVec.ofNat 128 b.toNat then
+        compare (BitVec.ofNat 128 c.toNat).toNat (BitVec.ofNat 128 d.toNat).toNat
+      else
+        compare (BitVec.ofNat 128 a.toNat).toNat (BitVec.ofNat 128 b.toNat).toNat) == .eq) =
+      (a == b && c == d) := by
+  have ha : (BitVec.ofNat 128 a.toNat).toNat = a.toNat :=
+    Nat.mod_eq_of_lt (Nat.lt_trans a.toFin.isLt (by decide))
+  have hb : (BitVec.ofNat 128 b.toNat).toNat = b.toNat :=
+    Nat.mod_eq_of_lt (Nat.lt_trans b.toFin.isLt (by decide))
+  have hc : (BitVec.ofNat 128 c.toNat).toNat = c.toNat :=
+    Nat.mod_eq_of_lt (Nat.lt_trans c.toFin.isLt (by decide))
+  have hd : (BitVec.ofNat 128 d.toNat).toNat = d.toNat :=
+    Nat.mod_eq_of_lt (Nat.lt_trans d.toFin.isLt (by decide))
+  rw [ha, hb, hc, hd]
+  by_cases hab : a = b
+  · subst hab
+    simp only [beq_self_eq_true, ↓reduceIte, Bool.true_and, nat_compare_eq_iff]
+    by_cases hcd : c = d
+    · subst hcd; simp
+    · have hne : c.toNat ≠ d.toNat :=
+        fun h => hcd (UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h))
+      simp [hne, beq_false_of_ne hcd]
+  · have hne : a.toNat ≠ b.toNat :=
+      fun h => hab (UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h))
+    have hbvne : (BitVec.ofNat 128 a.toNat == BitVec.ofNat 128 b.toNat) = false := by
+      cases h : (BitVec.ofNat 128 a.toNat == BitVec.ofNat 128 b.toNat) with
+      | false => rfl
+      | true =>
+        have heq := congrArg BitVec.toNat (beq_iff_eq.mp h)
+        rw [ha, hb] at heq
+        exact absurd heq hne
+    rw [hbvne, beq_false_of_ne hab]
+    simp only [Bool.false_eq_true, ↓reduceIte, Bool.false_and, nat_compare_eq_iff, hne, decide_false]
+
+/-- Direct reduction of `lmEq` on two thin pointer scalars whose 8-byte bits are known. -/
+theorem lmEq_thin_of_bits (sL sR : Miri.Memory.Scalar Provenance) (a b : UInt64)
+    (hbL : sL.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 a.toNat))
+    (hbR : sR.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 b.toNat)) :
+    lmEq ⟨.scalar sL, layoutThin⟩ ⟨.scalar sR, layoutThin⟩ =
+      .ok ⟨.scalar (.fromBool (a == b)), layoutBool⟩ := by
+  have h1 : lmEq ⟨.scalar sL, layoutThin⟩ ⟨.scalar sR, layoutThin⟩ =
+      lmRun (ExecutionScalar.pointerBinary lmLayout lmLeaves (fun _ _ => pure true)
+        (fun _ => pure layoutUsize) () .Eq ⟨.scalar sL, layoutThin⟩ ⟨.scalar sR, layoutThin⟩) := rfl
+  rw [h1]
+  unfold lmRun ExecutionScalar.pointerBinary
+  have hsz : Size.fromBits lmLayout.pointerWidth.bits = Size.ofBytes 8 := rfl
+  simp only [hsz, hbL, hbR]
+  have hlex := u64_lex_compare_eq a b 0 0
+  have h0 : (0 : UInt64).toNat = 0 := rfl
+  simp only [h0, beq_self_eq_true, Bool.and_true] at hlex
+  exact congrArg
+    (fun x => (Except.ok ⟨.scalar (.fromBool x), layoutBool⟩ : Except StepError (RvalueImmTy Provenance)))
+    hlex
+
+/-- Direct reduction of `lmEq` on two matching-layout wide `.scalarPair` pointers
+whose data and metadata 8-byte bits are known. -/
+theorem lmEq_pair_of_bits (layout : LocalLayout)
+    (hlay : layout = layoutSlice ∨ layout = layoutDyn)
+    (sL mL sR mR : Miri.Memory.Scalar Provenance) (a b c d : UInt64)
+    (hbL : sL.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 a.toNat))
+    (hmL : mL.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 c.toNat))
+    (hbR : sR.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 b.toNat))
+    (hmR : mR.toBits (Size.ofBytes 8) = .ok (BitVec.ofNat 128 d.toNat)) :
+    lmEq ⟨.scalarPair sL mL, layout⟩ ⟨.scalarPair sR mR, layout⟩ =
+      .ok ⟨.scalar (.fromBool (a == b && c == d)), layoutBool⟩ := by
+  rcases hlay with rfl | rfl
+  · have h1 : lmEq ⟨.scalarPair sL mL, layoutSlice⟩ ⟨.scalarPair sR mR, layoutSlice⟩ =
+        lmRun (ExecutionScalar.pointerBinary lmLayout lmLeaves (fun _ _ => pure true)
+          (fun _ => pure layoutUsize) () .Eq ⟨.scalarPair sL mL, layoutSlice⟩
+          ⟨.scalarPair sR mR, layoutSlice⟩) := rfl
+    rw [h1]
+    unfold lmRun ExecutionScalar.pointerBinary
+    have hsz : Size.fromBits lmLayout.pointerWidth.bits = Size.ofBytes 8 := rfl
+    simp only [hsz, hbL, hmL, hbR, hmR]
+    exact congrArg
+      (fun x => (Except.ok ⟨.scalar (.fromBool x), layoutBool⟩ : Except StepError (RvalueImmTy Provenance)))
+      (u64_lex_compare_eq a b c d)
+  · have h1 : lmEq ⟨.scalarPair sL mL, layoutDyn⟩ ⟨.scalarPair sR mR, layoutDyn⟩ =
+        lmRun (ExecutionScalar.pointerBinary lmLayout lmLeaves (fun _ _ => pure true)
+          (fun _ => pure layoutUsize) () .Eq ⟨.scalarPair sL mL, layoutDyn⟩
+          ⟨.scalarPair sR mR, layoutDyn⟩) := rfl
+    rw [h1]
+    unfold lmRun ExecutionScalar.pointerBinary
+    have hsz : Size.fromBits lmLayout.pointerWidth.bits = Size.ofBytes 8 := rfl
+    simp only [hsz, hbL, hmL, hbR, hmR]
+    exact congrArg
+      (fun x => (Except.ok ⟨.scalar (.fromBool x), layoutBool⟩ : Except StepError (RvalueImmTy Provenance)))
+      (u64_lex_compare_eq a b c d)
+
+/-- **Exact universal thin-pointer `==` law**: for EVERY pair of addresses and
+EVERY pair of optional provenances, `lmEq` on thin pointers succeeds and returns
+`addrL.bytes == addrR.bytes`. -/
+theorem thinEq_eq (addrL addrR : Size) (provL provR : Option Provenance) :
+    (do
+      let sL ← (Miri.Memory.Scalar.fromMaybePointer lmLayout ⟨addrL, provL⟩).mapError
+        ScalarOps.scalarError
+      let sR ← (Miri.Memory.Scalar.fromMaybePointer lmLayout ⟨addrR, provR⟩).mapError
+        ScalarOps.scalarError
+      lmEq ⟨.scalar sL, layoutThin⟩ ⟨.scalar sR, layoutThin⟩) =
+    .ok ⟨.scalar (.fromBool (addrL.bytes == addrR.bytes)), layoutBool⟩ := by
+  obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addrL provL
+  obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addrR provR
+  simp only [hsL, hsR, Except.mapError, bind, Except.bind]
+  exact lmEq_thin_of_bits sL sR addrL.bytes addrR.bytes hbL hbR
 
 /-- **`==` on thin pointers erases provenance.** Comparing two pointers
 gives the same result whatever their provenance: only the addresses are
@@ -1587,6 +2714,128 @@ theorem thinEq_provenance_erased (addrL addrR : Size) (provL provL' provR provR'
         ⟨.scalar (Miri.Memory.Scalar.fromPointer lmLayout ⟨addrR, provR⟩), layoutThin⟩ =
       lmEq ⟨.scalar (Miri.Memory.Scalar.fromPointer lmLayout ⟨addrL, provL'⟩), layoutThin⟩
         ⟨.scalar (Miri.Memory.Scalar.fromPointer lmLayout ⟨addrR, provR'⟩), layoutThin⟩ := rfl
+
+/-- Reduction of `lmSlice` given succeeding data and length scalars. -/
+private theorem lmSlice_of_ok (ptr : Pointer (Option Provenance)) (len : UInt64)
+    (s m : Miri.Memory.Scalar Provenance)
+    (hs : Miri.Memory.Scalar.fromMaybePointer lmLayout ptr = .ok s)
+    (hm : Miri.Memory.Scalar.fromUInt (BitVec.ofNat 128 len.toNat) (Size.ofBytes 8) = .ok m) :
+    lmSlice ptr len = .ok ⟨.scalarPair s m, layoutSlice⟩ := by
+  unfold lmSlice Immediate.newSlice
+  have hsz : Size.fromBits lmLayout.pointerWidth.bits = Size.ofBytes 8 := rfl
+  simp only [hsz, hs, hm, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+
+/-- Reduction of `lmDyn` given succeeding data and vtable scalars. -/
+private theorem lmDyn_of_ok (ptr vt : Pointer (Option Provenance))
+    (s v : Miri.Memory.Scalar Provenance)
+    (hs : Miri.Memory.Scalar.fromMaybePointer lmLayout ptr = .ok s)
+    (hv : Miri.Memory.Scalar.fromMaybePointer lmLayout vt = .ok v) :
+    lmDyn ptr vt = .ok ⟨.scalarPair s v, layoutDyn⟩ := by
+  unfold lmDyn Immediate.newDynTrait
+  simp only [hs, hv, Except.mapError, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+
+/-- **Universal full wide slice `==` law (`rust#166144`)**: `ScalarOps.binary .Eq`
+on two slice `.scalarPair` pointers compares BOTH the address AND the length
+lexicographically, erasing provenance. -/
+theorem wideEq_slice_eq (addrL addrR : Size) (provL provR : Option Provenance)
+    (lenL lenR : UInt64) :
+    (do
+      let l ← lmSlice ⟨addrL, provL⟩ lenL
+      let r ← lmSlice ⟨addrR, provR⟩ lenR
+      lmEq l r) =
+    .ok ⟨.scalar (.fromBool (addrL.bytes == addrR.bytes && lenL == lenR)), layoutBool⟩ := by
+  obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addrL provL
+  obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addrR provR
+  obtain ⟨mL, hmL, hmbL⟩ := scalar_fromUInt64_toBits lenL
+  obtain ⟨mR, hmR, hmbR⟩ := scalar_fromUInt64_toBits lenR
+  rw [lmSlice_of_ok _ _ _ _ hsL hmL, lmSlice_of_ok _ _ _ _ hsR hmR]
+  exact lmEq_pair_of_bits layoutSlice (Or.inl rfl) sL mL sR mR addrL.bytes addrR.bytes lenL lenR
+    hbL hmbL hbR hmbR
+
+/-- **Universal full wide trait-object `==` law (`rust#166144`)**:
+`ScalarOps.binary .Eq` on two `dyn Trait` `.scalarPair` pointers compares BOTH
+the data address AND the vtable address lexicographically, erasing both
+provenances. -/
+theorem wideEq_dyn_eq (addrL addrR vtL vtR : Size)
+    (provL provR vtProvL vtProvR : Option Provenance) :
+    (do
+      let l ← lmDyn ⟨addrL, provL⟩ ⟨vtL, vtProvL⟩
+      let r ← lmDyn ⟨addrR, provR⟩ ⟨vtR, vtProvR⟩
+      lmEq l r) =
+    .ok ⟨.scalar (.fromBool (addrL.bytes == addrR.bytes && vtL.bytes == vtR.bytes)), layoutBool⟩ := by
+  obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addrL provL
+  obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addrR provR
+  obtain ⟨vL, hvL, hvbL⟩ := scalar_fromMaybePointer_toBits vtL vtProvL
+  obtain ⟨vR, hvR, hvbR⟩ := scalar_fromMaybePointer_toBits vtR vtProvR
+  rw [lmDyn_of_ok _ _ _ _ hsL hvL, lmDyn_of_ok _ _ _ _ hsR hvR]
+  exact lmEq_pair_of_bits layoutDyn (Or.inr rfl) sL vL sR vR addrL.bytes addrR.bytes
+    vtL.bytes vtR.bytes hbL hvbL hbR hvbR
+
+/-- **Universal closed-form `ptr::addr_eq` law on heterogeneous wide pointers
+(`rust#166144`)**: casting `*const [u8]` and `*const dyn Trait` to `*const ()`
+via `Cast.ptrToPtr` and comparing via `ExecutionScalar.pointerBinary .Eq`
+returns `addrL.bytes == addrR.bytes`, completely independent of slice length,
+vtable pointer, and both provenances. -/
+theorem addrEq_hetero_eq (addrL addrR vtR : Size)
+    (provL provR vtProvR : Option Provenance) (lenL : UInt64) :
+    (do
+      let l ← lmSlice ⟨addrL, provL⟩ lenL
+      let r ← lmDyn ⟨addrR, provR⟩ ⟨vtR, vtProvR⟩
+      lmAddrEq l r) =
+    .ok ⟨.scalar (.fromBool (addrL.bytes == addrR.bytes)), layoutBool⟩ := by
+  obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addrL provL
+  obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addrR provR
+  obtain ⟨mL, hmL, _⟩ := scalar_fromUInt64_toBits lenL
+  obtain ⟨vR, hvR, _⟩ := scalar_fromMaybePointer_toBits vtR vtProvR
+  rw [lmSlice_of_ok _ _ _ _ hsL hmL, lmDyn_of_ok _ _ _ _ hsR hvR]
+  dsimp only [bind, Except.bind]
+  rw [(addrEq_metadata_erased sL sR mL vR).2.2.1]
+  exact lmEq_thin_of_bits sL sR addrL.bytes addrR.bytes hbL hbR
+
+/-- **Universal separation of `addr_eq` and `==` on slices**: at equal addresses
+and distinct lengths, `lmAddrEq` is `true` while `lmEq` is `false`. -/
+theorem addrEq_true_wideEq_false_slice (addr : Size) (provL provR : Option Provenance)
+    (lenL lenR : UInt64) (hne : lenL ≠ lenR) :
+    (do let l ← lmSlice ⟨addr, provL⟩ lenL; let r ← lmSlice ⟨addr, provR⟩ lenR; lmAddrEq l r) =
+      .ok ⟨.scalar (.fromBool true), layoutBool⟩ ∧
+    (do let l ← lmSlice ⟨addr, provL⟩ lenL; let r ← lmSlice ⟨addr, provR⟩ lenR; lmEq l r) =
+      .ok ⟨.scalar (.fromBool false), layoutBool⟩ := by
+  refine ⟨?_, ?_⟩
+  · obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addr provL
+    obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addr provR
+    obtain ⟨mL, hmL, _⟩ := scalar_fromUInt64_toBits lenL
+    obtain ⟨mR, hmR, _⟩ := scalar_fromUInt64_toBits lenR
+    rw [lmSlice_of_ok _ _ _ _ hsL hmL, lmSlice_of_ok _ _ _ _ hsR hmR]
+    dsimp only [bind, Except.bind]
+    rw [(addrEq_metadata_erased sL sR mL mR).1,
+      lmEq_thin_of_bits sL sR addr.bytes addr.bytes hbL hbR, beq_self_eq_true]
+  · rw [wideEq_slice_eq]
+    simp [beq_false_of_ne hne]
+
+/-- **Universal separation of `addr_eq` and `==` on trait objects**: at equal
+data addresses and distinct vtable addresses, `lmAddrEq` is `true` while `lmEq`
+is `false`. -/
+theorem addrEq_true_wideEq_false_dyn (addr vtL vtR : Size)
+    (provL provR vtProvL vtProvR : Option Provenance) (hne : vtL.bytes ≠ vtR.bytes) :
+    (do
+      let l ← lmDyn ⟨addr, provL⟩ ⟨vtL, vtProvL⟩
+      let r ← lmDyn ⟨addr, provR⟩ ⟨vtR, vtProvR⟩
+      lmAddrEq l r) = .ok ⟨.scalar (.fromBool true), layoutBool⟩ ∧
+    (do
+      let l ← lmDyn ⟨addr, provL⟩ ⟨vtL, vtProvL⟩
+      let r ← lmDyn ⟨addr, provR⟩ ⟨vtR, vtProvR⟩
+      lmEq l r) = .ok ⟨.scalar (.fromBool false), layoutBool⟩ := by
+  refine ⟨?_, ?_⟩
+  · obtain ⟨sL, hsL, hbL⟩ := scalar_fromMaybePointer_toBits addr provL
+    obtain ⟨sR, hsR, hbR⟩ := scalar_fromMaybePointer_toBits addr provR
+    obtain ⟨vL, hvL, _⟩ := scalar_fromMaybePointer_toBits vtL vtProvL
+    obtain ⟨vR, hvR, _⟩ := scalar_fromMaybePointer_toBits vtR vtProvR
+    rw [lmDyn_of_ok _ _ _ _ hsL hvL, lmDyn_of_ok _ _ _ _ hsR hvR]
+    dsimp only [bind, Except.bind]
+    rw [(addrEq_metadata_erased sL sR vL vR).2.1,
+      lmEq_thin_of_bits sL sR addr.bytes addr.bytes hbL hbR, beq_self_eq_true]
+  · rw [wideEq_dyn_eq]
+    simp [beq_false_of_ne hne]
 
 /-- **`==` on a slice pointer and a trait-object pointer is rejected.** For
 every operand value, `ScalarOps.binary` at `Eq` on operands of the two wide
@@ -1598,21 +2847,28 @@ theorem wideEq_hetero_invalidProgram (a b c d : Miri.Memory.Scalar Provenance) :
     lmEq ⟨.scalarPair c d, layoutDyn⟩ ⟨.scalarPair a b, layoutSlice⟩ =
       .error (.invalidProgram "pointer comparison backend mismatch") := ⟨rfl, rfl⟩
 
-/-- A comparison of a wide pointer with a thin pointer is rejected as well. -/
+/-- Comparing any wide pointer (`Slice` or `Dyn`) with a thin pointer in either
+order is rejected with `invalidProgram`. -/
 theorem wideEq_thin_wide_invalidProgram (a b c : Miri.Memory.Scalar Provenance) :
     lmEq ⟨.scalarPair a b, layoutSlice⟩ ⟨.scalar c, layoutThin⟩ =
-      .error (.invalidProgram "pointer comparison backend mismatch") := rfl
+      .error (.invalidProgram "pointer comparison backend mismatch") ∧
+    lmEq ⟨.scalar c, layoutThin⟩ ⟨.scalarPair a b, layoutSlice⟩ =
+      .error (.invalidProgram "pointer comparison backend mismatch") ∧
+    lmEq ⟨.scalarPair a b, layoutDyn⟩ ⟨.scalar c, layoutThin⟩ =
+      .error (.invalidProgram "pointer comparison backend mismatch") ∧
+    lmEq ⟨.scalar c, layoutThin⟩ ⟨.scalarPair a b, layoutDyn⟩ =
+      .error (.invalidProgram "pointer comparison backend mismatch") := ⟨rfl, rfl, rfl, rfl⟩
 
 /-! ### Uninitialized heap memory -/
 
 /-- Reading a range that the initialization mask reports uninitialized is
-undefined behavior in the harness classification, for every allocation
-(`LeanMiriSpec.MemoryLemmas`: `Allocation.readScalar_uninit_err`). -/
+undefined behavior under vendored `MemoryErrors.allocation`, for every
+allocation (`LeanMiriSpec.MemoryLemmas`: `Allocation.readScalar_uninit_err`). -/
 theorem readScalar_uninit_ub {E : Type} (allocation : Allocation Provenance E)
     (range bad : AllocRange) (readProvenance : Bool)
     (h : allocation.initializationMask.isRangeInitialized range = .ok (.error bad)) :
     ∃ e, allocation.readScalar lmLayout range readProvenance = .error e ∧
-      lmObsOfFailure (.allocation e) = .ub :=
+      lmObsOfStep (MemoryErrors.allocation e) = .ub :=
   ⟨_, Allocation.readScalar_uninit_err allocation lmLayout range bad readProvenance h, rfl⟩
 
 /-! ## §4. Vacuity, capstone, and axiom audit -/
@@ -1640,7 +2896,39 @@ theorem deallocatePtrWith_dangling_witness :
     (MemoryLifecycle.deallocatePtrWith (MemoryState.empty : LmMem) { treeBorrows := false }
         (lmAddr 4096) (some (Size.ofBytes 8, Align.EIGHT)) (.machine .rust)
         lmDeallocHooks).outcome = .error (.danglingPointer 4096) :=
-  ⟨rfl, deallocatePtrWith_dangling _ _ _ _ _ lmDeallocHooks 4096 rfl⟩
+  ⟨rfl, (deallocatePtrWith_dangling _ _ _ _ _ lmDeallocHooks 4096 rfl).1⟩
+
+/-- `deallocatePtrWith_global` is not vacuous (`rust#166221`): registering a
+global in `MemoryState.empty.pushGlobal` and attempting to deallocate it yields
+`MemoryLifecycleError.globalAllocationDeallocation`. -/
+theorem deallocatePtrWith_global_witness :
+    let g : GlobalAllocation := ⟨lmFirstId, .static, Size.ofBytes 4, Align.ONE, .Not, none⟩
+    let mem : LmMem := (MemoryState.empty : LmMem).pushGlobal g
+    let ptr : Pointer (Option Provenance) :=
+      ⟨Size.ofBytes (lmBaseAddr lmFirstId), some (.concrete lmFirstId (lmRootTag lmFirstId))⟩
+    ∃ kind,
+      (MemoryLifecycle.deallocatePtrWith mem { treeBorrows := false } ptr
+        (some (Size.ofBytes 4, Align.ONE)) (.machine .rust) lmDeallocHooks).outcome =
+        .error (.globalAllocationDeallocation lmFirstId kind) := by
+  intro g mem ptr
+  have hcont : mem.hasGlobalId lmFirstId = true := by
+    unfold MemoryState.hasGlobalId mem MemoryState.pushGlobal MemoryState.empty
+    rw [KeyedArray.contains_rows]
+    simp [KeyedArray.toArray, KeyedArray.push, KeyedArray.empty, g]
+  obtain ⟨g', hfind⟩ := KeyedArray.find_of_contains _ lmFirstId.value hcont
+  refine ⟨g'.kind, ?_⟩
+  have hres : (lmDeallocHooks.resolvePointer mem
+      (lmDeallocHooks.synchronizeMemory mem { treeBorrows := false }) ptr 0).outcome =
+      .ok (lmFirstId, Size.ZERO, .concrete (lmRootTag lmFirstId)) := by
+    change (if lmBaseAddr lmFirstId < lmBaseAddr lmFirstId then
+        Except.error (lmBaseAddr lmFirstId)
+      else
+        Except.ok (lmFirstId, Size.ofBytes (lmBaseAddr lmFirstId - lmBaseAddr lmFirstId),
+          ProvenanceExtra.concrete (lmRootTag lmFirstId))) = _
+    decide
+  exact (deallocatePtrWith_global mem { treeBorrows := false } ptr
+    (some (Size.ofBytes 4, Align.ONE)) (.machine .rust) lmDeallocHooks
+    lmFirstId (.concrete (lmRootTag lmFirstId)) g' hres rfl hfind).1
 
 /-- `leakCheck_take_sound` is not vacuous: on the memory left by an unfreed
 Rust heap allocation, `take` reports exactly that allocation, and on the
@@ -1670,15 +2958,16 @@ statement.
 2. `deallocationError` classifies exactly the seven `deallocate_ptr`
    failures as undefined behavior.
 3. `Align::from_bytes` accepts the powers of two up to `2^29` and rejects
-   `2^30` as too large.
+   `2^30` as too large (and every non-power-of-two across all `2^64` values).
 4. `ptr::addr_eq` erases metadata (`Cast.ptrToPtr` then `pointerBinary`),
-   `==` on thin pointers erases provenance, and `==` on a slice pointer and a
+   `==` on thin pointers erases provenance, full wide `==` compares both
+   address and metadata lexicographically, and `==` on a slice pointer and a
    trait-object pointer is rejected (`rust#166144`).
-5. `BorrowTree.deallocateBorrowRange` on the over-aligned block
-   (`rust#165833`): weak protector `Deallocated`, active strong protector on
-   an accessed `Frozen` child `AccessFailure`, released protector
-   `Deallocated`, unprotected `Frozen` child tag `AccessFailure`, strongly
-   protected `Cell` child `Deallocated`.
+5. `BorrowTree.deallocateBorrowRange` on the over-aligned block via vendored
+   `RetagPipeline.retagPointerValue` (`rust#165833`): weak protector
+   `Deallocated`, active strong protector on an accessed `Frozen` child
+   `AccessFailure`, released protector `Deallocated`, unprotected `Frozen`
+   child tag `AccessFailure`, strongly protected `Cell` child `Deallocated`.
 6. The kernel-evaluated 30-case table in both modes, and both threaded
    traces. -/
 theorem ep1_lean_miri_heap_wide_capstone :
@@ -1698,11 +2987,16 @@ theorem ep1_lean_miri_heap_wide_capstone :
         (∃ id, error = .memoryKindMismatch id) ∨
         (∃ id size requested align requestedAlign,
           error = .layoutMismatch id size requested align requestedAlign)) ∧
-    ((∀ k, k < 30 → Align.fromBytes (UInt64.ofNat (2 ^ k)) = .ok ⟨k⟩) ∧
+    ((∀ bytes al, Align.fromBytes bytes = .ok al ↔
+        (bytes = 0 ∧ al = Align.ONE) ∨
+        (∃ k, k < 30 ∧ bytes = UInt64.ofNat (2 ^ k) ∧ al = ⟨k⟩)) ∧
       Align.fromBytes 1073741824 = .error (.tooLarge 1073741824)) ∧
     ((∀ dataL dataR metaL metaR : Miri.Memory.Scalar Provenance,
         lmAddrEq ⟨.scalarPair dataL metaL, layoutSlice⟩ ⟨.scalarPair dataR metaR, layoutDyn⟩ =
           lmEq ⟨.scalar dataL, layoutThin⟩ ⟨.scalar dataR, layoutThin⟩) ∧
+      (∀ (addrL addrR : Size) (provL provR : Option Provenance) (lenL lenR : UInt64),
+        (do let l ← lmSlice ⟨addrL, provL⟩ lenL; let r ← lmSlice ⟨addrR, provR⟩ lenR; lmEq l r) =
+          .ok ⟨.scalar (.fromBool (addrL.bytes == addrR.bytes && lenL == lenR)), layoutBool⟩) ∧
       (∀ (addrL addrR : Size) (provL provL' provR provR' : Provenance),
         lmEq ⟨.scalar (Miri.Memory.Scalar.fromPointer lmLayout ⟨addrL, provL⟩), layoutThin⟩
             ⟨.scalar (Miri.Memory.Scalar.fromPointer lmLayout ⟨addrR, provR⟩), layoutThin⟩ =
@@ -1711,17 +3005,17 @@ theorem ep1_lean_miri_heap_wide_capstone :
       (∀ a b c d : Miri.Memory.Scalar Provenance,
         lmEq ⟨.scalarPair a b, layoutSlice⟩ ⟨.scalarPair c d, layoutDyn⟩ =
           .error (.invalidProgram "pointer comparison backend mismatch"))) ∧
-    (lmScenarioDeallocStatus (.ReservedFrz false) (some .WeakProtector) false false true =
+    (lmScenarioDeallocStatus .globalBox lmFrozenFacts .Box .FnEntry true false false true =
         some .Deallocated ∧
-      lmScenarioDeallocStatus .Frozen (some .StrongProtector) true false false =
+      lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true false false =
         some (.AccessFailure (.AccessFailure ⟨0, 4⟩
           (.TransitionError 1 (.ProtectedDisabled .Frozen)))) ∧
-      lmScenarioDeallocStatus .Frozen (some .StrongProtector) true true false =
+      lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .FnEntry true true true false =
         some .Deallocated ∧
-      lmScenarioDeallocStatus .Frozen none false false true =
+      lmScenarioDeallocStatus .reference lmFrozenFacts .Shared .Default true false false true =
         some (.AccessFailure (.AccessFailure ⟨0, 32⟩
           (.TransitionError 1 (.ChildAccessForbidden .Frozen)))) ∧
-      lmScenarioDeallocStatus .Cell (some .StrongProtector) false false false =
+      lmScenarioDeallocStatus .reference lmCellFacts .Shared .FnEntry false false false false =
         some .Deallocated) ∧
     ((List.range 30).map (lmHeapWideObserve false) =
         [.okAlloc 0 1, .okAlloc 0 32, .okRoundTrip 3735928559, .okRoundTrip 81985529216486895,
@@ -1745,13 +3039,14 @@ theorem ep1_lean_miri_heap_wide_capstone :
          .okDealloc, .ub]) ∧
     (lmProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       lmProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) := by
-  refine ⟨⟨?_, rfl, rfl⟩, ?_, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ?_, ?_, ?_, ?_⟩
+  refine ⟨⟨?_, rfl, rfl⟩, ?_, ⟨?_, ?_⟩, ⟨?_, ?_, ?_, ?_⟩, ?_, ?_, ?_, ?_⟩
   · exact fun E memory memory' staticRoots leaked h =>
       leakCheck_take_sound memory memory' staticRoots leaked h
   · exact deallocationError_ub_iff
-  · exact align_fromBytes_pow2_ok
+  · exact align_fromBytes_ok_iff
   · exact align_fromBytes_boundary.2.1
-  · exact fun dataL dataR metaL metaR => (addrEq_metadata_erased dataL dataR metaL metaR).2.2
+  · exact fun dataL dataR metaL metaR => (addrEq_metadata_erased dataL dataR metaL metaR).2.2.1
+  · exact wideEq_slice_eq
   · exact thinEq_provenance_erased
   · exact fun a b c d => (wideEq_hetero_invalidProgram a b c d).1
   · obtain ⟨h1, h2, _, h4, h5, h6⟩ := deallocateBorrowRange_protector_laws
@@ -1770,7 +3065,7 @@ open Lean Elab Command
 1. this module's direct imports are exactly `Lean`, vendored `Miri.*`
    modules, and `LeanMiriSpec.MemoryLemmas` (plus the implicit `Init`);
 2. no `MiniRustSpec.*`, `Anneal.*`, or `Trusted.*` module is imported, even
-   transitively;
+   transitively, and no declaration refers to any constant from those prefixes;
 3. no file under `lean-miri/vendor/` is touched: every `Miri.*` constant used
    here is the vendored one (the module only *imports* `Miri.*`);
 4. every declaration of this module (`env.constants.map₂`) depends only on
@@ -1787,9 +3082,21 @@ run_cmd do
     if (`MiniRustSpec).isPrefixOf modName || (`Anneal).isPrefixOf modName ||
         (`Trusted).isPrefixOf modName then
       throwError "import-isolation violation: {modName} must not be imported"
+  let forbidden (modName : Lean.Name) : Bool :=
+    (`MiniRustSpec).isPrefixOf modName || (`Anneal).isPrefixOf modName ||
+      (`Trusted).isPrefixOf modName
   let mut checked : Nat := 0
   let mut theorems : Nat := 0
   for (c, info) in env.constants.map₂.toList do
+    let used := info.type.getUsedConstants ++
+      (match info.value? (allowOpaque := true) with
+        | some v => v.getUsedConstants
+        | none => #[])
+    for u in used do
+      if let some idx := env.getModuleIdxFor? u then
+        let modName := env.header.moduleNames[idx.toNat]!
+        if forbidden modName then
+          throwError "dependency-isolation violation: {c} refers to {u} of {modName}"
     let axs ← liftCoreM <| Lean.collectAxioms c
     for a in axs do
       if a == ``sorryAx then throwError "{c} depends on sorryAx"
@@ -1800,8 +3107,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.HeapAllocAndWidePtrLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 37 `theorem` declarations; generated `eq_src` theorems only add to it.
-  if theorems < 37 then
+  if theorems < 85 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.HeapAllocAndWidePtrLM seen"
   logInfo m!"LeanMiriSpec.HeapAllocAndWidePtrLM: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 

@@ -152,6 +152,90 @@ theorem sizeFromBytes_eq_some_iff {n : Int} {sz : Size} :
   · rintro ⟨hn, rfl⟩
     exact sizeFromBytes_nonneg hn
 
+/-- `Align::from_bytes(0)` is `None`: alignment must be a positive power of two. -/
+theorem alignFromBytesInt_zero : alignFromBytesInt 0 = none := rfl
+
+/-- `Align::from_bytes` of any negative integer is `None`. -/
+theorem alignFromBytesInt_neg {n : Int} (h : n < 0) : alignFromBytesInt n = none := by
+  simp only [alignFromBytesInt, h, ↓reduceIte]
+
+/-- Bitwise helper: `2^k &&& (2^k - 1) = 0` for every natural exponent `k`. -/
+theorem nat_pow2_land_pred (k : Nat) : (2 ^ k) &&& (2 ^ k - 1) = 0 := by
+  apply Nat.eq_of_testBit_eq
+  intro i
+  rw [Nat.testBit_and, Nat.zero_testBit, Nat.testBit_two_pow]
+  by_cases hik : k = i
+  · subst hik
+    have hlt : 2 ^ k - 1 < 2 ^ k := Nat.sub_lt (Nat.two_pow_pos k) (Nat.zero_lt_one)
+    have hbit : (2 ^ k - 1).testBit k = false := by
+      unfold Nat.testBit
+      rw [Nat.shiftRight_eq_div_pow, Nat.div_eq_of_lt hlt]
+      rfl
+    rw [hbit, Bool.and_false]
+  · simp [hik]
+
+/-- `Align::from_bytes` accepts *every* power of two `2^k`, with no upper bound
+(unlike `rustc_abi::Align::MAX = 2^29`, explaining case 29 universally). -/
+theorem alignFromBytesInt_pow2 (k : Nat) :
+    alignFromBytesInt ((2 : Int) ^ k) = some ⟨2 ^ k⟩ := by
+  have hpos : (0 : Int) ≤ (2 : Int) ^ k := Int.pow_nonneg (by decide)
+  have hnotlt : ¬ ((2 : Int) ^ k < 0) := Int.not_lt.mpr hpos
+  have htoNat : ((2 : Int) ^ k).toNat = 2 ^ k := by
+    change ((2 ^ k : Nat) : Int).toNat = 2 ^ k
+    exact Int.toNat_natCast (2 ^ k)
+  unfold alignFromBytesInt alignFromBytes
+  rw [ite_eq_right hnotlt, htoNat]
+  exact ite_eq_left ⟨Nat.ne_of_gt (Nat.two_pow_pos k), nat_pow2_land_pred k⟩
+
+/-- `Align::from_bytes` succeeds exactly on positive powers of two. -/
+theorem alignFromBytesInt_eq_some_iff {n : Int} {al : Align} :
+    alignFromBytesInt n = some al ↔
+      0 < n ∧ n.toNat &&& (n.toNat - 1) = 0 ∧ al = ⟨n.toNat⟩ := by
+  unfold alignFromBytesInt alignFromBytes
+  by_cases hn : n < 0
+  · rw [ite_eq_left hn]
+    constructor
+    · intro h; cases h
+    · rintro ⟨hpos, _⟩; omega
+  · rw [ite_eq_right hn]
+    by_cases hcond : n.toNat ≠ 0 ∧ n.toNat &&& (n.toNat - 1) = 0
+    · rw [ite_eq_left hcond]
+      constructor
+      · intro h
+        have hpos : 0 < n := by omega
+        exact ⟨hpos, hcond.2, (Option.some.inj h).symm⟩
+      · rintro ⟨_, _, rfl⟩; rfl
+    · rw [ite_eq_right hcond]
+      constructor
+      · intro h; cases h
+      · rintro ⟨hpos, hbit, _⟩
+        exact absurd ⟨by omega, hbit⟩ hcond
+
+/-- `x86_64::valid_size` holds iff the byte size is strictly below `2^63`
+(`isize::MAX = 2^63 - 1`). -/
+theorem x86_64_valid_size_iff (sz : Size) :
+    x86_64.valid_size sz = true ↔ sz.bytes < 2 ^ 63 := by
+  unfold x86_64.valid_size inBounds Size.bits x86_64.PTR_SIZE
+  simp only [Bool.and_eq_true, decide_eq_true_eq]
+  omega
+
+/-- `x86_64::valid_size` is false iff the byte size is at least `2^63`. -/
+theorem x86_64_valid_size_false_iff (sz : Size) :
+    x86_64.valid_size sz = false ↔ 2 ^ 63 ≤ sz.bytes := by
+  by_cases hlt : sz.bytes < 2 ^ 63
+  · have ht : x86_64.valid_size sz = true := (x86_64_valid_size_iff sz).mpr hlt
+    rw [ht]
+    constructor
+    · intro h; cases h
+    · intro h; omega
+  · have hge : 2 ^ 63 ≤ sz.bytes := Nat.le_of_not_lt hlt
+    have hf : x86_64.valid_size sz = false := by
+      cases h : x86_64.valid_size sz with
+      | false => rfl
+      | true => exact absurd ((x86_64_valid_size_iff sz).mp h) hlt
+    rw [hf]
+    exact ⟨fun _ => hge, fun _ => rfl⟩
+
 /-! ## §1. Determinism, `BasicMemory` equivalence, and `MachTB.wfLive` -/
 
 section Determinism
@@ -351,6 +435,13 @@ theorem allocate_align_not_pow2_ub (m : Machine M) (size : Int) (sTy : «Type»)
       .error (.ub "invalid alignment for `Allocate` intrinsic: not a power of 2") := by
   rw [allocate_eq, sizeFromBytes_nonneg hs, h]
   rfl
+
+/-- `Allocate` with `align = 0` is UB across every memory model `M`. -/
+theorem allocate_align_zero_ub (m : Machine M) (size : Int) (sTy aTy retTy : «Type»)
+    (hs : 0 ≤ size) :
+    evalIntrinsicM m .Allocate [(.Int size, sTy), (.Int 0, aTy)] retTy =
+      .error (.ub "invalid alignment for `Allocate` intrinsic: not a power of 2") :=
+  allocate_align_not_pow2_ub m size sTy 0 aTy retTy hs alignFromBytesInt_zero
 
 /-- `Allocate` at a return type that is not a pointer is UB. -/
 theorem allocate_ret_not_ptr_ub (m : Machine M) (size : Int) (sTy : «Type») (align : Int)
@@ -625,6 +716,14 @@ theorem deallocate_align_not_pow2_ub (m : Machine M) (ptr : ThinPointer (Memory.
       .error (.ub "invalid alignment for `Deallocate` intrinsic: not a power of 2") := by
   rw [deallocate_eq, sizeFromBytes_nonneg hs, h]
   rfl
+
+/-- `Deallocate` with `align = 0` is UB across every memory model `M`. -/
+theorem deallocate_align_zero_ub (m : Machine M) (ptr : ThinPointer (Memory.Provenance M))
+    (pTy : «Type») (size : Int) (sTy aTy retTy : «Type») (hs : 0 ≤ size) :
+    evalIntrinsicM m .Deallocate [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int 0, aTy)]
+        retTy =
+      .error (.ub "invalid alignment for `Deallocate` intrinsic: not a power of 2") :=
+  deallocate_align_not_pow2_ub m ptr pTy size sTy 0 aTy retTy hs alignFromBytesInt_zero
 
 /-- `Deallocate` at a return type other than `()` is UB. -/
 theorem deallocate_ret_not_unit_ub (m : Machine M) (ptr : ThinPointer (Memory.Provenance M))
@@ -1483,6 +1582,87 @@ theorem bm_deallocate_ok_iff (mem mem' : BM) (ptr : Ptr) (kind : AllocationKind)
   · rintro ⟨id, a, hp, hi, hget, hlive, haddr, hkind, hsize, halign, rfl⟩
     exact ⟨id, (), a, a.extra, hp, hi, hget, hlive, haddr, hkind, hsize, halign, rfl, rfl⟩
 
+/-- Complete bidirectional error characterization of `BM.deallocate`, in exact
+upstream check order (since `BM`'s trivial `handle_extra` never fails). -/
+theorem bm_deallocate_error_iff (mem : BM) (ptr : Ptr) (kind : AllocationKind) (size : Size)
+    (align : Align) (e : Stop) :
+    BM.deallocate mem ptr kind size align = .error e ↔
+      (ptr.provenance = none ∧ e = .ub "deallocating invalid pointer") ∨
+      ∃ id, ptr.provenance = some (id, ()) ∧
+        (listIndex mem.allocations id._0 "self.allocations[id.0]" = .error e ∨
+         ∃ a, listIndex mem.allocations id._0 "self.allocations[id.0]" = .ok a ∧
+          ((a.live = false ∧ e = .ub "double-free") ∨
+           (a.live = true ∧ ptr.addr ≠ a.addr ∧
+             e = .ub "deallocating with pointer not to the beginning of its allocation") ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind ≠ a.kind ∧
+             e = .ub (deallocKindMismatchMsg a.kind kind)) ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind = a.kind ∧ size ≠ Allocation.size a ∧
+             e = .ub "deallocating with incorrect size information") ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind = a.kind ∧ size = Allocation.size a ∧
+             align ≠ a.align ∧ e = .ub "deallocating with incorrect alignment information"))) := by
+  rw [bm_deallocate_eq_basic, basicMemory_deallocate_error_iff]
+  constructor
+  · rintro (h | ⟨id, ⟨⟩, hp, hbad | ⟨a, ha, hc⟩⟩)
+    · exact Or.inl h
+    · exact Or.inr ⟨id, hp, Or.inl hbad⟩
+    · refine Or.inr ⟨id, hp, Or.inr ⟨a, ha, ?_⟩⟩
+      rcases hc with h1 | h2 | h3 | h4 | h5 | ⟨_, _, _, _, _, hpure⟩
+      · exact Or.inl h1
+      · exact Or.inr (Or.inl h2)
+      · exact Or.inr (Or.inr (Or.inl h3))
+      · exact Or.inr (Or.inr (Or.inr (Or.inl h4)))
+      · exact Or.inr (Or.inr (Or.inr (Or.inr h5)))
+      · cases hpure
+  · rintro (h | ⟨id, hp, hbad | ⟨a, ha, hc⟩⟩)
+    · exact Or.inl h
+    · exact Or.inr ⟨id, (), hp, Or.inl hbad⟩
+    · refine Or.inr ⟨id, (), hp, Or.inr ⟨a, ha, ?_⟩⟩
+      rcases hc with h1 | h2 | h3 | h4 | h5
+      · exact Or.inl h1
+      · exact Or.inr (Or.inl h2)
+      · exact Or.inr (Or.inr (Or.inl h3))
+      · exact Or.inr (Or.inr (Or.inr (Or.inl h4)))
+      · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h5))))
+
+/-- `evalIntrinsicM .Allocate` on `Mach` with `size ≥ 2^63` (`!x86_64.valid_size`)
+is UB `"asking for a too large allocation"`. -/
+theorem allocate_oversized_bm_ub (m : Mach) (size : Int) (sTy : «Type») (align : Int)
+    (aTy : «Type») (p : PtrType) (al : Align) (hs : (2 : Int) ^ 63 ≤ size)
+    (ha : alignFromBytesInt align = some al) (hk : PtrType.meta_kind p = .None) :
+    evalIntrinsicM (M := BM) m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) =
+      .error (.ub "asking for a too large allocation") := by
+  have hs0 : 0 ≤ size := by omega
+  rw [allocate_eq_memory m size sTy align aTy p al hs0 ha hk, cm_allocate_bm_eq]
+  unfold CM.allocate
+  have hal : BM.allocate m.mem.memory .Heap ⟨size.toNat⟩ al =
+      .error (.ub "asking for a too large allocation") := by
+    rw [bm_allocate_eq_basic, basicMemory_allocate_too_large_ub]
+    exact (x86_64_valid_size_false_iff ⟨size.toNat⟩).mpr (by show 2 ^ 63 ≤ size.toNat; omega)
+  rw [hal]
+  rfl
+
+/-- `evalIntrinsicM .Deallocate` on `Mach` of a live non-`Heap` allocation
+(`Global` `StaticAllocator` `rust#166221`, `Stack`, `Function`, `VTable`) is UB. -/
+theorem evalIntrinsicM_deallocate_kind_mismatch_bm_ub (m : Mach) (ptr : Ptr) (pTy : «Type»)
+    (size : Int) (sTy : «Type») (align : Int) (aTy : «Type») (al : Align)
+    (id : AllocId) (a : Allocation Unit Unit)
+    (hs : 0 ≤ size) (ha : alignFromBytesInt align = some al)
+    (hp : ptr.provenance = some (id, ())) (hi : 0 ≤ id._0)
+    (hget : m.mem.memory.allocations[id._0.toNat]? = some a)
+    (hlive : a.live = true) (haddr : ptr.addr = a.addr) (hkind : AllocationKind.Heap ≠ a.kind) :
+    evalIntrinsicM (M := BM) m .Deallocate
+        [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+      .error (.ub (deallocKindMismatchMsg a.kind .Heap)) := by
+  rw [deallocate_eq_memory m ptr pTy size sTy align aTy al hs ha, cm_deallocate_bm_eq]
+  unfold CM.deallocate
+  have hd : BM.deallocate m.mem.memory ptr .Heap ⟨size.toNat⟩ al =
+      .error (.ub (deallocKindMismatchMsg a.kind .Heap)) := by
+    rw [bm_deallocate_eq_basic,
+      basicMemory_deallocate_kind_mismatch_ub m.mem.memory ptr .Heap ⟨size.toNat⟩ al _ id () a hp
+        (listIndex_eq_ok_iff.mpr ⟨hi, hget⟩) hlive haddr hkind]
+  rw [hd]
+  rfl
+
 /-! ### The `TreeBorrowsMemory<x86_64>` instance (`MachTB`): protectors -/
 
 /-- The `handle_extra` closure of `TreeBorrowsMemory::deallocate`
@@ -1678,6 +1858,109 @@ theorem tb_deallocate_access_ub (tbm : TBM) (ptr : ThinPointer TreeBorrowsProven
           ⟨hlive, haddr, hkind, hsize, halign, hh⟩))))⟩⟩)]
   rfl
 
+/-- Complete bidirectional error characterization of `TreeBorrowsMemory::deallocate`,
+combining `BasicMemory`'s upstream check order with `tbDeallocHandler`'s write
+access and strong-protector checks. -/
+theorem tb_deallocate_error_iff (tbm : TBM) (ptr : ThinPointer TreeBorrowsProvenance)
+    (kind : AllocationKind) (size : Size) (align : Align) (e : Stop) :
+    TreeBorrowsMemory.deallocate tbm ptr kind size align = .error e ↔
+      (ptr.provenance = none ∧ e = .ub "deallocating invalid pointer") ∨
+      ∃ id path, ptr.provenance = some (id, path) ∧
+        (listIndex tbm.mem.allocations id._0 "self.allocations[id.0]" = .error e ∨
+         ∃ a, listIndex tbm.mem.allocations id._0 "self.allocations[id.0]" = .ok a ∧
+          ((a.live = false ∧ e = .ub "double-free") ∨
+           (a.live = true ∧ ptr.addr ≠ a.addr ∧
+             e = .ub "deallocating with pointer not to the beginning of its allocation") ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind ≠ a.kind ∧
+             e = .ub (deallocKindMismatchMsg a.kind kind)) ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind = a.kind ∧ size ≠ Allocation.size a ∧
+             e = .ub "deallocating with incorrect size information") ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind = a.kind ∧ size = Allocation.size a ∧
+             align ≠ a.align ∧ e = .ub "deallocating with incorrect alignment information") ∨
+           (a.live = true ∧ ptr.addr = a.addr ∧ kind = a.kind ∧ size = Allocation.size a ∧
+             align = a.align ∧
+             (Node.access a.extra.root (some path) .Write ⟨0⟩ size = .error e ∨
+              ∃ root', Node.access a.extra.root (some path) .Write ⟨0⟩ size = .ok root' ∧
+                Node.contains_strong_protector_preventing_deallocation root' = true ∧
+                e = .ub "Tree Borrows: deallocating strongly protected allocation")))) := by
+  rw [tb_deallocate_eq_basic]
+  constructor
+  · intro h
+    rcases interp_bind_eq_error h with hd | ⟨_, _, hc⟩
+    · have hbm := (basicMemory_deallocate_error_iff tbm.mem ptr kind size align
+        (tbDeallocHandler size) e).mp hd
+      rcases hbm with h0 | ⟨id, path, hp, hbad | ⟨a, ha, hc⟩⟩
+      · exact Or.inl h0
+      · exact Or.inr ⟨id, path, hp, Or.inl hbad⟩
+      · refine Or.inr ⟨id, path, hp, Or.inr ⟨a, ha, ?_⟩⟩
+        rcases hc with h1 | h2 | h3 | h4 | h5 | ⟨hlive, haddr, hkind, hsize, halign, hh⟩
+        · exact Or.inl h1
+        · exact Or.inr (Or.inl h2)
+        · exact Or.inr (Or.inr (Or.inl h3))
+        · exact Or.inr (Or.inr (Or.inr (Or.inl h4)))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h5))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+            ⟨hlive, haddr, hkind, hsize, halign, (tbDeallocHandler_error_iff size a.extra path e).mp hh⟩))))
+    · cases hc
+  · intro h
+    have hbm : BasicMemory.deallocate tbm.mem ptr kind size align (tbDeallocHandler size) = .error e := by
+      rw [basicMemory_deallocate_error_iff]
+      rcases h with h0 | ⟨id, path, hp, hbad | ⟨a, ha, hc⟩⟩
+      · exact Or.inl h0
+      · exact Or.inr ⟨id, path, hp, Or.inl hbad⟩
+      · refine Or.inr ⟨id, path, hp, Or.inr ⟨a, ha, ?_⟩⟩
+        rcases hc with h1 | h2 | h3 | h4 | h5 | ⟨hlive, haddr, hkind, hsize, halign, htb⟩
+        · exact Or.inl h1
+        · exact Or.inr (Or.inl h2)
+        · exact Or.inr (Or.inr (Or.inl h3))
+        · exact Or.inr (Or.inr (Or.inr (Or.inl h4)))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inl h5))))
+        · exact Or.inr (Or.inr (Or.inr (Or.inr (Or.inr
+            ⟨hlive, haddr, hkind, hsize, halign, (tbDeallocHandler_error_iff size a.extra path e).mpr htb⟩))))
+    rw [hbm]
+    rfl
+
+/-- `evalIntrinsicM .Allocate` on `MachTB` with `size ≥ 2^63` (`!x86_64.valid_size`)
+is UB `"asking for a too large allocation"`. -/
+theorem allocate_oversized_tb_ub (m : MachTB) (size : Int) (sTy : «Type») (align : Int)
+    (aTy : «Type») (p : PtrType) (al : Align) (hs : (2 : Int) ^ 63 ≤ size)
+    (ha : alignFromBytesInt align = some al) (hk : PtrType.meta_kind p = .None) :
+    evalIntrinsicM (M := TBM) m .Allocate [(.Int size, sTy), (.Int align, aTy)] (.Ptr p) =
+      .error (.ub "asking for a too large allocation") := by
+  have hs0 : 0 ≤ size := by omega
+  rw [allocate_eq_memory m size sTy align aTy p al hs0 ha hk, cm_allocate_tb_eq]
+  have hal : TreeBorrowsMemory.allocate m.mem.memory .Heap ⟨size.toNat⟩ al =
+      .error (.ub "asking for a too large allocation") := by
+    unfold TreeBorrowsMemory.allocate
+    dsimp only
+    rw [basicMemory_allocate_too_large_ub]
+    · rfl
+    · exact (x86_64_valid_size_false_iff ⟨size.toNat⟩).mpr (by show 2 ^ 63 ≤ size.toNat; omega)
+  rw [hal]
+  rfl
+
+/-- `evalIntrinsicM .Deallocate` on `MachTB` of a live non-`Heap` allocation
+(`Global` `StaticAllocator` `rust#166221`, `Stack`, `Function`, `VTable`) is UB. -/
+theorem evalIntrinsicM_deallocate_kind_mismatch_tb_ub (m : MachTB)
+    (ptr : ThinPointer TreeBorrowsProvenance) (pTy : «Type»)
+    (size : Int) (sTy : «Type») (align : Int) (aTy : «Type») (al : Align)
+    (id : AllocId) (path : Path) (a : Allocation Path TreeBorrowsAllocationExtra)
+    (hs : 0 ≤ size) (ha : alignFromBytesInt align = some al)
+    (hp : ptr.provenance = some (id, path)) (hi : 0 ≤ id._0)
+    (hget : m.mem.memory.mem.allocations[id._0.toNat]? = some a)
+    (hlive : a.live = true) (haddr : ptr.addr = a.addr) (hkind : AllocationKind.Heap ≠ a.kind) :
+    evalIntrinsicM (M := TBM) m .Deallocate
+        [(.Ptr ⟨ptr, none⟩, pTy), (.Int size, sTy), (.Int align, aTy)] unitType =
+      .error (.ub (deallocKindMismatchMsg a.kind .Heap)) := by
+  rw [deallocate_eq_memory m ptr pTy size sTy align aTy al hs ha, cm_deallocate_tb_eq]
+  have hd : TreeBorrowsMemory.deallocate m.mem.memory ptr .Heap ⟨size.toNat⟩ al =
+      .error (.ub (deallocKindMismatchMsg a.kind .Heap)) := by
+    rw [tb_deallocate_error_iff]
+    exact Or.inr ⟨id, path, hp, Or.inr ⟨a, listIndex_eq_ok_iff.mpr ⟨hi, hget⟩,
+      Or.inr (Or.inr (Or.inl ⟨hlive, haddr, hkind, rfl⟩))⟩⟩
+  rw [hd]
+  rfl
+
 /-- `Permission::prevents_deallocation`, classified: exactly the protected
 `Unique`, and the protected `Reserved` and `Frozen` that had a local read.
 Unprotected permissions, protected `Disabled`, and `Cell` never prevent
@@ -1779,6 +2062,114 @@ theorem strong_accessed_prevents_deallocation (perms : List Permission) (p : Per
 references) leaves the memory unchanged. -/
 theorem tb_end_call_no_protectors (tbm : TBM) :
     TreeBorrowsMemory.end_call tbm { protectors := [] } = .ok tbm := rfl
+
+/-- `TreeBorrowsMemory::end_call` releases protectors in frame order: the head
+protector via `release_protector`, then the tail. -/
+theorem tb_end_call_cons (tbm : TBM) (p : TreeBorrowsProvenance)
+    (ps : List TreeBorrowsProvenance) :
+    TreeBorrowsMemory.end_call tbm { protectors := p :: ps } =
+      (do
+        let tbm' ← TreeBorrowsMemory.release_protector tbm p
+        TreeBorrowsMemory.end_call tbm' { protectors := ps }) := rfl
+
+/-- `Node::release_protector` at the protected node itself (`path = some []`)
+clears its protector to `Protected::No` and preserves its children and
+permissions. -/
+theorem node_release_protector_here (children : List Node) (perms : List Permission)
+    (prot : Protected) (accesses : List (Option AccessKind)) :
+    Node.release_protector ⟨children, perms, prot⟩ (some []) accesses =
+      .ok ⟨children, perms, .No⟩ := rfl
+
+mutual
+
+/-- `nd` occurs somewhere in the borrow tree rooted at `root` (either `root`
+itself or a descendant at arbitrary depth). -/
+def Node.InTree (nd : Node) : Node → Prop
+  | n@⟨children, _, _⟩ => nd = n ∨ Node.InForest nd children
+
+/-- `nd` occurs somewhere in one of the borrow trees of `forest`. -/
+def Node.InForest (nd : Node) : List Node → Prop
+  | [] => False
+  | c :: rest => Node.InTree nd c ∨ Node.InForest nd rest
+
+end
+
+mutual
+
+/-- **Arbitrary-tree characterization of `Node::contains_strong_protector_preventing_deallocation`**:
+a borrow tree of any depth prevents deallocation iff *some* node anywhere in the
+tree is `Protected::Strong` and carries a permission that prevents deallocation. -/
+theorem node_contains_strong_protector_iff : ∀ (n : Node),
+    Node.contains_strong_protector_preventing_deallocation n = true ↔
+      ∃ nd, Node.InTree nd n ∧ nd.«protected» = .Strong ∧
+        ∃ p ∈ nd.permissions, Permission.prevents_deallocation p = true
+  | ⟨children, perms, prot⟩ => by
+    rw [node_contains_strong_protector_eq, Bool.or_eq_true, Bool.and_eq_true,
+      decide_eq_true_eq, List.any_eq_true, anyChildPreventsDeallocation_iff children]
+    constructor
+    · rintro (⟨hprot, hp⟩ | ⟨nd, hfor, hstrong, hp⟩)
+      · exact ⟨⟨children, perms, prot⟩, Or.inl rfl, hprot, hp⟩
+      · exact ⟨nd, Or.inr hfor, hstrong, hp⟩
+    · rintro ⟨nd, (rfl | hfor), hstrong, hp⟩
+      · exact Or.inl ⟨hstrong, hp⟩
+      · exact Or.inr ⟨nd, hfor, hstrong, hp⟩
+
+/-- Forest counterpart of `node_contains_strong_protector_iff`. -/
+theorem anyChildPreventsDeallocation_iff : ∀ (children : List Node),
+    Node.anyChildPreventsDeallocation children = true ↔
+      ∃ nd, Node.InForest nd children ∧ nd.«protected» = .Strong ∧
+        ∃ p ∈ nd.permissions, Permission.prevents_deallocation p = true
+  | [] => by
+    simp only [Node.anyChildPreventsDeallocation, Node.InForest, Bool.false_eq_true, false_and,
+      exists_false]
+  | c :: rest => by
+    rw [Node.anyChildPreventsDeallocation, Bool.or_eq_true,
+      node_contains_strong_protector_iff c, anyChildPreventsDeallocation_iff rest]
+    constructor
+    · rintro (⟨nd, hin, hstrong, hp⟩ | ⟨nd, hin, hstrong, hp⟩)
+      · exact ⟨nd, Or.inl hin, hstrong, hp⟩
+      · exact ⟨nd, Or.inr hin, hstrong, hp⟩
+    · rintro ⟨nd, (hin | hin), hstrong, hp⟩
+      · exact Or.inl ⟨nd, hin, hstrong, hp⟩
+      · exact Or.inr ⟨nd, hin, hstrong, hp⟩
+
+end
+
+/-- **Arbitrary-tree Weak/Unprotected exemption (`rust#165833`)**: a borrow tree
+of any depth containing only `Protected::No` and `Protected::Weak` nodes never
+prevents deallocation. -/
+theorem tree_no_strong_never_prevents_deallocation (n : Node)
+    (h : ∀ nd, Node.InTree nd n → nd.«protected» ≠ .Strong) :
+    Node.contains_strong_protector_preventing_deallocation n = false := by
+  cases hc : Node.contains_strong_protector_preventing_deallocation n with
+  | false => rfl
+  | true =>
+    obtain ⟨nd, hin, hstrong, _⟩ := (node_contains_strong_protector_iff n).mp hc
+    exact absurd hstrong (h nd hin)
+
+/-- **Arbitrary-tree `Cell` exemption (`rust#165833`)**: a borrow tree of any
+depth in which every `Protected::Strong` node holds only `Cell` permissions
+never prevents deallocation. -/
+theorem tree_strong_cell_never_prevents_deallocation (n : Node)
+    (h : ∀ nd, Node.InTree nd n → nd.«protected» = .Strong →
+      ∀ p ∈ nd.permissions, p = .Prot .Cell) :
+    Node.contains_strong_protector_preventing_deallocation n = false := by
+  cases hc : Node.contains_strong_protector_preventing_deallocation n with
+  | false => rfl
+  | true =>
+    obtain ⟨nd, hin, hstrong, p, hmem, hp⟩ := (node_contains_strong_protector_iff n).mp hc
+    rw [h nd hin hstrong p hmem] at hp
+    cases hp
+
+/-- **Arbitrary-tree active strong protector (`rust#165833`)**: if *any* node at
+any depth in a borrow tree is `Protected::Strong` with `Unique`, `Frozen(true)`,
+or `Reserved(true, _)`, the whole tree prevents deallocation. -/
+theorem tree_descendant_strong_prevents_deallocation (n nd : Node) (hin : Node.InTree nd n)
+    (hstrong : nd.«protected» = .Strong) (p : Permission) (hm : p ∈ nd.permissions)
+    (hp : p = .Prot .Unique ∨ (∃ b, p = .Prot (.Reserved true b)) ∨ p = .Prot (.Frozen true)) :
+    Node.contains_strong_protector_preventing_deallocation n = true :=
+  (node_contains_strong_protector_iff n).mpr
+    ⟨nd, hin, hstrong, p, hm, (permission_prevents_deallocation_iff p).mpr hp⟩
 
 /-! ### `leak_check` for `TreeBorrowsMemory` and `ConcurrentMemory` -/
 
@@ -2007,6 +2398,55 @@ theorem addrEq_true_wideEq_false_slice (t : ThinPointer (Memory.Provenance M)) (
   · rw [evalWideEqM_slice]
     simp only [hne, and_false, decide_false]
 
+/-- `addr_eq` and `==` separated on trait-object pointers: two `dyn Trait`
+pointers at the same address with distinct vtable addresses are `addr_eq` and
+not `==`. -/
+theorem addrEq_true_wideEq_false_vtable (t vl vr : ThinPointer (Memory.Provenance M))
+    (hne : vl.addr ≠ vr.addr) (pty : PtrType) (tyr : «Type») :
+    evalAddrEqM (M := M) (.Ptr ⟨t, some (.VTablePointer vl)⟩, .Ptr pty)
+        (.Ptr ⟨t, some (.VTablePointer vr)⟩, tyr) = .ok (.Bool true, .Bool) ∧
+    evalWideEqM (M := M) (.Ptr ⟨t, some (.VTablePointer vl)⟩, .Ptr pty)
+        (.Ptr ⟨t, some (.VTablePointer vr)⟩, tyr) = .ok (.Bool false, .Bool) := by
+  refine ⟨?_, ?_⟩
+  · rw [evalAddrEqM_ptr]
+    simp only [decide_true]
+  · rw [evalWideEqM_vtable]
+    simp only [hne, and_false, decide_false]
+
+omit [MemoryOps M] in
+/-- `encodePtrBytesM` preserves list length. -/
+theorem encodePtrBytesM_length (prov : Option (Memory.Provenance M)) :
+    ∀ (idx : Nat) (bs : List UInt8), (encodePtrBytesM (M := M) prov idx bs).length = bs.length
+  | _, [] => rfl
+  | idx, _ :: rest => by
+    simp only [encodePtrBytesM, List.length_cons, encodePtrBytesM_length prov (idx + 1) rest]
+
+omit [MemoryOps M] in
+/-- `leBytes u n` has exact length `n`. -/
+theorem leBytes_length (u : Nat) : ∀ n : Nat, (leBytes u n).length = n
+  | 0 => rfl
+  | n + 1 => by simp only [leBytes, List.length_cons, leBytes_length (u / 256) n]
+
+omit [MemoryOps M] in
+/-- A successful `encodePtrM` always emits `x86_64.PTR_SIZE.bytes = 8` bytes. -/
+theorem encodePtrM_length (thin : ThinPointer (Memory.Provenance M))
+    (bs : List (AbstractByte (Memory.Provenance M)))
+    (h : encodePtrM (M := M) thin = .ok bs) : bs.length = 8 := by
+  unfold encodePtrM at h
+  cases henc : Endianness.encode x86_64.ENDIANNESS .Unsigned x86_64.PTR_SIZE thin.addr with
+  | none => rw [henc] at h; cases h
+  | some data =>
+    rw [henc] at h
+    cases h
+    rw [encodePtrBytesM_length]
+    unfold Endianness.encode at henc
+    by_cases hin : inBounds thin.addr .Unsigned x86_64.PTR_SIZE = true
+    · rw [ite_eq_left hin] at henc
+      cases henc
+      exact leBytes_length _ 8
+    · rw [ite_eq_right hin] at henc
+      cases henc
+
 omit [MemoryOps M] in
 /-- The encoding of a slice pointer is the encoding of its thin pointer
 followed by the encoding of its length: the first `PTR_SIZE` bytes, the ones
@@ -2019,6 +2459,22 @@ theorem encodeWidePtrM_slice (thin : ThinPointer (Memory.Provenance M)) (n : Int
         pure (thinBytes ++ metaBytes)) := rfl
 
 omit [MemoryOps M] in
+/-- Universal metadata-prefix independence for slice pointers: whenever
+`encodeWidePtrM` succeeds on a slice pointer, its first 8 bytes equal the
+thin-pointer encoding `encodePtrM thin`, independent of the slice length `n`. -/
+theorem encodeWidePtrM_slice_thin_prefix (thin : ThinPointer (Memory.Provenance M)) (n : Int)
+    (bs : List (AbstractByte (Memory.Provenance M)))
+    (h : encodeWidePtrM (M := M) .ElementCount ⟨thin, some (.ElementCount n)⟩ = .ok bs) :
+    ∃ thinBytes, encodePtrM (M := M) thin = .ok thinBytes ∧ bs.take 8 = thinBytes := by
+  rw [encodeWidePtrM_slice] at h
+  obtain ⟨thinBytes, hthin, h⟩ := interp_bind_eq_ok h
+  obtain ⟨metaBytes, _, h⟩ := interp_bind_eq_ok h
+  obtain rfl := interp_pure_eq_ok h
+  have hlen : thinBytes.length = 8 := encodePtrM_length thin thinBytes hthin
+  refine ⟨thinBytes, hthin, ?_⟩
+  rw [← hlen, List.take_left]
+
+omit [MemoryOps M] in
 /-- The encoding of a trait-object pointer is the encoding of its thin pointer
 followed by the encoding of its vtable pointer. -/
 theorem encodeWidePtrM_vtable (thin vtable : ThinPointer (Memory.Provenance M))
@@ -2029,7 +2485,33 @@ theorem encodeWidePtrM_vtable (thin vtable : ThinPointer (Memory.Provenance M))
         let metaBytes ← encodePtrM (M := M) vtable
         pure (thinBytes ++ metaBytes)) := rfl
 
+omit [MemoryOps M] in
+/-- Universal metadata-prefix independence for trait-object pointers: whenever
+`encodeWidePtrM` succeeds on a `dyn Trait` pointer, its first 8 bytes equal the
+thin-pointer encoding `encodePtrM thin`, independent of the vtable pointer. -/
+theorem encodeWidePtrM_vtable_thin_prefix (thin vtable : ThinPointer (Memory.Provenance M))
+    (trait : TraitName) (bs : List (AbstractByte (Memory.Provenance M)))
+    (h : encodeWidePtrM (M := M) (.VTablePointer trait) ⟨thin, some (.VTablePointer vtable)⟩ =
+      .ok bs) :
+    ∃ thinBytes, encodePtrM (M := M) thin = .ok thinBytes ∧ bs.take 8 = thinBytes := by
+  rw [encodeWidePtrM_vtable] at h
+  obtain ⟨thinBytes, hthin, h⟩ := interp_bind_eq_ok h
+  obtain ⟨metaBytes, _, h⟩ := interp_bind_eq_ok h
+  obtain rfl := interp_pure_eq_ok h
+  have hlen : thinBytes.length = 8 := encodePtrM_length thin thinBytes hthin
+  refine ⟨thinBytes, hthin, ?_⟩
+  rw [← hlen, List.take_left]
+
 end WidePointers
+
+/-- On `Mach`, the `BasicMemory` transcription `evalBinOp (.Rel .Eq)` agrees
+with `evalWideEqM (M := BM)` on every pair of pointer operands. -/
+theorem evalWideEq_bm (pl pr : Pointer Prov) (pty : PtrType) (tr : «Type») :
+    evalBinOp (.Rel .Eq) (.Ptr pl, .Ptr pty) (.Ptr pr, tr) =
+      evalWideEqM (M := BM) (.Ptr pl, .Ptr pty) (.Ptr pr, tr) := by
+  rcases pl with ⟨tl, ml⟩
+  rcases pr with ⟨trp, mr⟩
+  rcases ml with _ | (l | vl) <;> rcases mr with _ | (r | vr) <;> rfl
 
 /-- On `Mach`, the `BasicMemory` transcriptions `evalUnOp` and `evalBinOp`
 compute the same `addr_eq`: addresses only. -/
@@ -2610,6 +3092,23 @@ theorem tbStrongMut_dealloc :
       some (some (.ub "Tree Borrows: deallocating strongly protected allocation")) := by
   decide +kernel
 
+/-- Even after both a read AND a write through a strongly protected `Cell`
+(`UnsafeCell`) child reference, deallocating through the parent `Unique` tag
+still succeeds on `MachTB` (interior mutability exemption holds after access,
+not only when unaccessed). -/
+def strongProtectedCellAccessedDealloc : Interp MrHeapWideObs := do
+  let (parent, child, m, _) ← boxWithChild tbHarness (.Ref .Immutable cellPointee) true true
+  let m ← storeM m child 99 itU32
+  let (v, m) ← loadM m child itU32
+  let _ ← deallocM m parent 32 32
+  pure (.okRoundTrip v.toNat)
+
+/-- Witness that accessing (reading + mutating) a strongly protected `Cell`
+child still allows parent deallocation on `MachTB`. -/
+theorem strongProtected_cell_accessed_dealloc_ok :
+    strongProtectedCellAccessedDealloc = .ok (.okRoundTrip 99) := by
+  kernel_rfl
+
 /-! ### Wide-pointer encoding witnesses (`rust#166144`) -/
 
 /-- Encode a wide pointer and decode it again. -/
@@ -2807,12 +3306,18 @@ theorem ep1_minirust_heap_wide_capstone :
         evalWideEqM (M := TBM) (.Ptr ⟨tl, some (.ElementCount n)⟩, .Ptr pty)
             (.Ptr ⟨tr, some (.VTablePointer v)⟩, tyr) =
           .error (.specPanic "unmatching metadata in wide pointer comparasion"))) ∧
-    ((∀ perms : List Permission,
+    ((∀ n : Node,
+        Node.contains_strong_protector_preventing_deallocation n = true ↔
+          ∃ nd, Node.InTree nd n ∧ nd.«protected» = .Strong ∧
+            ∃ p ∈ nd.permissions, Permission.prevents_deallocation p = true) ∧
+      (∀ perms : List Permission,
         Node.contains_strong_protector_preventing_deallocation ⟨[], perms, .Weak⟩ = false) ∧
       (∀ perms : List Permission, (∀ p ∈ perms, p = .Prot .Cell) →
         Node.contains_strong_protector_preventing_deallocation ⟨[], perms, .Strong⟩ = false) ∧
       (∀ (perms : List Permission), Permission.Prot (.Frozen true) ∈ perms →
-        Node.contains_strong_protector_preventing_deallocation ⟨[], perms, .Strong⟩ = true)) ∧
+        Node.contains_strong_protector_preventing_deallocation ⟨[], perms, .Strong⟩ = true) ∧
+      (∀ k : Nat, alignFromBytesInt ((2 : Int) ^ k) = some ⟨2 ^ k⟩) ∧
+      (∀ sz : Size, x86_64.valid_size sz = true ↔ sz.bytes < 2 ^ 63)) ∧
     ((List.range 30).map (mrHeapWideObserve false) =
         [.okAlloc 0 1, .okAlloc 0 32, .okRoundTrip 3735928559, .okRoundTrip 81985529216486895,
          .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub, .ub,
@@ -2836,7 +3341,7 @@ theorem ep1_minirust_heap_wide_capstone :
     (mrProtectorDeallocTrace false = [.okRoundTrip 42, .okBool true, .okDealloc, .okDealloc] ∧
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
-  refine ⟨?_, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_⟩, ?_, ?_, ?_⟩
+  refine ⟨?_, ⟨?_, ?_⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩, ⟨?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
   · exact tbInit_wfLive
@@ -2847,9 +3352,12 @@ theorem ep1_minirust_heap_wide_capstone :
   · exact fun pl pr tl tr => evalAddrEqM_ptr (M := BM) pl pr tl tr
   · exact fun pl pr tl tr => evalAddrEqM_ptr (M := TBM) pl pr tl tr
   · exact fun tl tr v n pty tyr => (evalWideEqM_mixed_specPanic (M := TBM) tl tr v n pty tyr).1
+  · exact node_contains_strong_protector_iff
   · exact weak_protector_never_prevents_deallocation
   · exact strong_cell_never_prevents_deallocation
   · exact fun perms hm => strong_accessed_prevents_deallocation perms _ hm (Or.inl rfl)
+  · exact alignFromBytesInt_pow2
+  · exact x86_64_valid_size_iff
   · exact mrHeapWideObserve_table
   · exact mrHeapLifecycleTrace_table
   · exact mrProtectorDeallocTrace_table
@@ -2913,8 +3421,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 128 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 128 then
+  -- This module states 158 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 158 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
