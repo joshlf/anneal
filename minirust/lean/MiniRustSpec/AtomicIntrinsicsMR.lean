@@ -1058,6 +1058,29 @@ theorem typeEq_int_right_iff (ty : «Type») (t : IntType) :
     · intro h
       cases h
 
+/-- Mirror image of `typeEq_int_right_iff`: an integer type on the left of `typeEq`
+forces propositional equality too, the exact complement of `typeEq_not_eq`. -/
+theorem typeEq_int_left_iff (t : IntType) (ty : «Type») :
+    typeEq (.Int t) ty = true ↔ ty = .Int t := by
+  cases ty with
+  | Int t' =>
+    constructor
+    · intro h
+      simp only [typeEq] at h
+      have ht : t = t' := beq_iff_eq.mp h
+      subst ht
+      rfl
+    · intro h
+      cases h
+      simp only [typeEq, beq_self_eq_true]
+  | _ =>
+    constructor
+    · intro h
+      simp only [typeEq] at h
+      cases h
+    · intro h
+      cases h
+
 /-- Variant entries `[(0, bool), (1, bool)]` and their swapped-order counterpart. -/
 def permEnumEntriesA : List (Int × Variant) := [(0, ⟨.Bool, ⟨[]⟩⟩), (1, ⟨.Bool, ⟨[]⟩⟩)]
 /-- Swapped-order counterpart of `permEnumEntriesA`. -/
@@ -2959,6 +2982,55 @@ theorem evalTerminatorM_intrinsic_ok {m m1 m2 m3 m4 : Machine M}
   cases nextBlock with
   | none => simp only [evalTerminatorM, hplace, hargs, hint, hstore, interp_ok_bind, ub]
   | some _ => simp only [evalTerminatorM, hplace, hargs, hint, hstore, interp_ok_bind]
+
+/-- `Terminator::Intrinsic` evaluates the return place first (upstream: "First
+evaluate return place (left-to-right evaluation)"). If `eval_place` stops, so
+does the terminator: no argument is evaluated and no atomic access happens. -/
+theorem evalTerminatorM_intrinsic_place_error {m : Machine M} {op : IntrinsicOp}
+    {argExprs : List ValueExpr} {retExpr : PlaceExpr} {nextBlock : Option BbName} {e : Stop}
+    (hplace : evalPlaceM m retExpr = .error e) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) = .error e := by
+  simp only [evalTerminatorM, hplace, interp_error_bind]
+
+/-- Once the return place and the arguments evaluate, a `Stop` of the intrinsic
+is the terminator's `Stop`: every UB law above is also UB of the terminator. -/
+theorem evalTerminatorM_intrinsic_fn_error {m m1 m2 : Machine M} {op : IntrinsicOp}
+    {argExprs : List ValueExpr} {retExpr : PlaceExpr} {nextBlock : Option BbName}
+    {retPlace : Place M} {retTy : «Type»} {args : List (Value M × «Type»)} {e : Stop}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, retTy), m1))
+    (hargs : evalArgsM m1 argExprs = .ok (args, m2))
+    (hint : evalIntrinsicM m2 op args retTy = .error e) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) = .error e := by
+  simp only [evalTerminatorM, hplace, hargs, hint, interp_ok_bind, interp_error_bind]
+
+/-- The returned value is stored only after the intrinsic ran. If `place_store`
+stops, so does the terminator for every `next_block`: a faulting store preempts
+the missing-`next_block` UB, and `m3` with the intrinsic's accesses is discarded. -/
+theorem evalTerminatorM_intrinsic_store_error {m m1 m2 m3 : Machine M}
+    {op : IntrinsicOp} {argExprs : List ValueExpr} {retExpr : PlaceExpr}
+    {nextBlock : Option BbName} {retPlace : Place M} {retTy : «Type»}
+    {args : List (Value M × «Type»)} {val : Value M} {e : Stop}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, retTy), m1))
+    (hargs : evalArgsM m1 argExprs = .ok (args, m2))
+    (hint : evalIntrinsicM m2 op args retTy = .ok (val, m3))
+    (hstore : placeStoreM m3 retPlace val retTy = .error e) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) = .error e := by
+  simp only [evalTerminatorM, hplace, hargs, hint, hstore, interp_ok_bind, interp_error_bind]
+
+/-- A misaligned return place (`aligned = false`, which `eval_place` computes
+without failing) is UB only at `place_store`, after the intrinsic succeeded. -/
+theorem evalTerminatorM_intrinsic_misaligned_ret_ub {m m1 m2 m3 : Machine M}
+    {op : IntrinsicOp} {argExprs : List ValueExpr} {retExpr : PlaceExpr}
+    {nextBlock : Option BbName} {retPlace : Place M} {retTy : «Type»}
+    {args : List (Value M × «Type»)} {val : Value M}
+    (hplace : evalPlaceM m retExpr = .ok ((retPlace, retTy), m1))
+    (hargs : evalArgsM m1 argExprs = .ok (args, m2))
+    (hint : evalIntrinsicM m2 op args retTy = .ok (val, m3))
+    (hmis : retPlace.aligned = false) :
+    evalTerminatorM m (.Intrinsic op argExprs retExpr nextBlock) =
+      .error (.ub "storing to a place based on a misaligned pointer") := by
+  refine evalTerminatorM_intrinsic_store_error hplace hargs hint ?_
+  simp only [placeStoreM, hmis, Bool.not_false, ↓reduceIte, ub]
 
 end Guards
 
@@ -5080,6 +5152,51 @@ theorem divergingAtomicFn_no_next_block_ub :
       some (.ub "return from an intrinsic where caller did not specify next block") ∧
     stopOf (stepsTB 2 (tbStart divergingAtomicFn) >>= stepTB) =
       some (.ub "return from an intrinsic where caller did not specify next block") := by
+  refine ⟨?_, ?_⟩ <;> decide +kernel
+
+/-- `_1 = AtomicStore()` after `stmts`: no arguments and no `next_block`. -/
+def faultyAtomicFn (stmts : List Statement) : Function :=
+  { locals := ⟨[(lname 1, unitType)]⟩
+    args := [], ret := lname 1, calling_convention := .Rust
+    blocks := ⟨[(bname 0,
+      { statements := stmts
+        terminator := .Intrinsic .AtomicStore [] (.Local (lname 1)) none
+        kind := .Regular })]⟩
+    start := bname 0, implicit_writes := true }
+
+/-- Fault priority of `Terminator::Intrinsic` on `Mach` and `MachTB`: with the
+return place `_1` dead, `eval_place` stops first; with `_1` live, the arity
+check stops next; the missing `next_block` is never reported. -/
+theorem faultyAtomicFn_fault_priority :
+    stopOf (step (bmStart (faultyAtomicFn []))) = some (.ub "access to a dead local") ∧
+    stopOf (stepTB (tbStart (faultyAtomicFn []))) = some (.ub "access to a dead local") ∧
+    stopOf (steps 1 (bmStart (faultyAtomicFn [.StorageLive (lname 1)])) >>= step) =
+      some (.ub "invalid number of arguments for `AtomicStore` intrinsic") ∧
+    stopOf (stepsTB 1 (tbStart (faultyAtomicFn [.StorageLive (lname 1)])) >>= stepTB) =
+      some (.ub "invalid number of arguments for `AtomicStore` intrinsic") := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;> decide +kernel
+
+/-- `_0 = 5; *(&raw _1[1]) = AtomicLoad(&raw _0)`: the `u32` return place lies
+one byte into the `[u8; 8]` local `_1`, misaligned for `u32`. -/
+def misalignedRetAtomicFn : Function :=
+  { locals := ⟨[(lname 0, .Int itU32), (lname 1, .Array (.Int itU8) 8)]⟩
+    args := [], ret := lname 0, calling_convention := .Rust
+    blocks := ⟨[(bname 0,
+      { statements := [.StorageLive (lname 0), .StorageLive (lname 1),
+          .Assign (.Local (lname 0)) (constU32 5)]
+        terminator := .Intrinsic .AtomicLoad [cellPtrExpr]
+          (.Deref (.AddrOf (.Index (.Local (lname 1)) (constU32 1)) (.Raw .None)) (.Int itU32))
+          (some (bname 0))
+        kind := .Regular })]⟩
+    start := bname 0, implicit_writes := true }
+
+/-- `misalignedRetAtomicFn` end to end: `eval_place` and the `AtomicLoad`
+succeed, and only then `place_store` is UB, on both memory models. -/
+theorem misalignedRetAtomicFn_store_ub :
+    stopOf (steps 3 (bmStart misalignedRetAtomicFn) >>= step) =
+      some (.ub "storing to a place based on a misaligned pointer") ∧
+    stopOf (stepsTB 3 (tbStart misalignedRetAtomicFn) >>= stepTB) =
+      some (.ub "storing to a place based on a misaligned pointer") := by
   refine ⟨?_, ?_⟩ <;> decide +kernel
 
 /-! ## §5. Vacuity and axiom audit
