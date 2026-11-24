@@ -12942,7 +12942,7 @@ A destination that starts with `ProjectionElem.opaqueCast`
 (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is dispatched on the projections that remain
 after the leading cast chain (`stripLeadingOpaqueCast`): a pure cast chain
 `(_l as T)` is a write of the whole local (allowed on a live `.uninit` slot,
-validated against the cast type `placeTy localDecls layouts dst` when
+validated against the cast type `placeTyResolved localDecls layouts dst` when
 `localDecls` is non-empty); a cast chain followed by a dereference is not
 modeled (`.unsupported`); and a cast chain followed by any other projection is
 a projected write evaluated with local `dst.local_` re-declared at the cast type
@@ -13140,7 +13140,7 @@ def writePlaceValue
     let tyValid :=
       match localDecls with
       | .nil => true
-      | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) val
+      | _ :: _ => validateValueForTy? layouts (placeTyResolved localDecls layouts dst) val
     match stripLeadingOpaqueCast restCast with
     | .nil =>
       match tyValid with
@@ -22398,8 +22398,24 @@ Reference (The Rust Reference, "Borrow operators"):
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1148-L1150>
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1363-L1365>
+<https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1407-L1415>
 <https://github.com/rust-lang/rust/blob/14210df0e27ccd7d9e6a05b8085cbd438e4bbc65/compiler/rustc_middle/src/mir/syntax.rs#L1467-L1468>
+
+> "///  - [`OpaqueCast`](ProjectionElem::OpaqueCast): This projection changes the place's type to the
+> ///    given one, and makes no other changes. A `OpaqueCast` projection on any type other than an
+> ///    opaque type from the current crate is not well-formed."
+
+> "/// Reads the discriminant of an ADT; undefined if the place is uninitialized.
+> Discriminant(Place<'tcx>),"
+
+Justification for the `Discriminant` cast arm (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`):
+because `OpaqueCast` "changes the place's type to the given one, and makes no
+other changes", `discriminant((_l as T))` on a pure cast chain inspects the root
+slot `_l` directly via `evalPlaceDiscriminant` (just like `discriminant(_l)`),
+preserving direct-tag discriminant reads when payload fields hold `Value.uninit`
+after `SetDiscriminant((_l as T), v)`.
 
 > "pub enum Rvalue<'tcx> {
 >     /// Yields the operand unchanged, except for a potential retag.
@@ -22775,14 +22791,20 @@ def evalRvalue
   | .unaryOp .ptrMetadata op =>
     evalUnaryPtrMetadata locals op mem localDecls layouts
   | .discriminant place =>
-    match place.projection with
-    | .nil =>
+    match place.projection, stripLeadingOpaqueCast place.projection with
+    | .nil, _ =>
       match get? locals place.local_ with
       | .some (.init .uninit) => .ub
       | .some (.init val) =>
         evalPlaceDiscriminant val locals mem place localDecls layouts
       | _ => .ub
-    | _ :: _ =>
+    | .opaqueCast _ :: _, .nil =>
+      match get? locals place.local_ with
+      | .some (.init .uninit) => .ub
+      | .some (.init val) =>
+        evalPlaceDiscriminant val locals mem place localDecls layouts
+      | _ => .ub
+    | _ :: _, _ =>
       match evalOperand locals (.copy place) mem.borrows mem.globals layouts mem.callerLocals localDecls mem.callStack with
       | .ok val locals' =>
         evalPlaceDiscriminant val locals' mem place localDecls layouts

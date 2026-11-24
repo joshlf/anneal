@@ -14326,7 +14326,26 @@ theorem evalAdtDiscriminant_refines_evalRvalue {slots : List LocalSlotState}
   · rw [hp] at hProj
     obtain ⟨_, rfl⟩ := readProjectedValue_nil_eq_ok_iff.mp hProj
     simp only [hRoot, hT]
-  · exact hT
+  · cases hd with
+    | opaqueCast castTy =>
+      cases hs : stripLeadingOpaqueCast tl with
+      | nil =>
+        have hStrip : ∀ ps, stripLeadingOpaqueCast ps = .nil →
+            readProjectedValue locals rootVal ps = readProjectedValue locals rootVal .nil := by
+          intro ps hps
+          induction ps with
+          | nil => rfl
+          | cons p ps ih =>
+            cases p <;> try cases hps
+            exact ih hps
+        rw [hp] at hProj
+        dsimp only [readProjectedValue] at hProj
+        rw [hStrip tl hs] at hProj
+        obtain ⟨_, rfl⟩ := readProjectedValue_nil_eq_ok_iff.mp hProj
+        simp only [hRoot, hT]
+      | cons _ _ =>
+        exact hT
+    | _ => exact hT
 
 /-- `Trusted`'s operand load `evalUseRvalue` (the `Rvalue.use` operand semantics shared by the
 `ShallowInitBox` and `WrapUnsafeBinder` arms of `evalRvalue`) on a copied non-union place (no

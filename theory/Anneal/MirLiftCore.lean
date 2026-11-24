@@ -715,22 +715,24 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
     match (stripLeadingOpaqueCast (proj :: rest)).isEmpty with
     | true => none
     | false =>
+    let decls' :=
+      eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest)
     match get? locals dst.local_ with
     | some (.init rootVal) =>
       match
         ensureNestedFieldShells
           rootVal
           (proj :: rest)
-          localDecls
+          decls'
           layouts
-          (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
+          (placeTy decls' layouts { local_ := dst.local_, projection := .nil })
       with
       | .none => none
       | .some shelledRoot =>
         match
           writeProjectedForLocal
             locals
-            localDecls
+            decls'
             layouts
             dst.local_
             shelledRoot
@@ -742,7 +744,7 @@ def assignLocalPlace (locals : PureEnv) (borrows : List BorrowEntry)
           | some locals' =>
             let resolvedLocalProj :=
               resolveBorrowWriteLocalProj
-                localDecls
+                decls'
                 layouts
                 locals
                 dst.local_
@@ -1429,17 +1431,19 @@ private theorem assignLocalPlace_cons_inv
     (h_write :
       assignLocalPlace env₁ borrows { local_ := dstLoc, projection := proj :: rest } val
         localDecls layouts depth = some (env₂, borrows')) :
+    let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc (proj :: rest)
     proj ≠ .deref ∧
     stripLeadingOpaqueCast (proj :: rest) ≠ [] ∧
     ∃ rootVal shelledRoot rootVal',
       get? env₁ dstLoc = some (.init rootVal) ∧
-      ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
-        (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) = some shelledRoot ∧
-      writeProjectedForLocal env₁ localDecls layouts dstLoc shelledRoot (proj :: rest) val = .ok rootVal' ∧
+      ensureNestedFieldShells rootVal (proj :: rest) decls' layouts
+        (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) = some shelledRoot ∧
+      writeProjectedForLocal env₁ decls' layouts dstLoc shelledRoot (proj :: rest) val = .ok rootVal' ∧
       set? env₁ dstLoc (.init rootVal') = some env₂ ∧
       borrows' =
         invalidateConflictingBorrowsAtProj borrows dstLoc .none
-          (resolveBorrowWriteLocalProj localDecls layouts env₁ dstLoc (proj :: rest)) 0 0 depth := by
+          (resolveBorrowWriteLocalProj decls' layouts env₁ dstLoc (proj :: rest)) 0 0 depth := by
+  let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc (proj :: rest)
   have h_nd : proj ≠ .deref := by
     intro h_eq; subst h_eq; simp [assignLocalPlace] at h_write
   have h_unfold0 :
@@ -1448,17 +1452,17 @@ private theorem assignLocalPlace_cons_inv
        | false =>
          match get? env₁ dstLoc with
          | some (.init rootVal) =>
-           match ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
-               (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+           match ensureNestedFieldShells rootVal (proj :: rest) decls' layouts
+               (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) with
            | .none => none
            | .some shelledRoot =>
-             match writeProjectedForLocal env₁ localDecls layouts dstLoc shelledRoot (proj :: rest) val with
+             match writeProjectedForLocal env₁ decls' layouts dstLoc shelledRoot (proj :: rest) val with
              | .ok rootVal' =>
                match set? env₁ dstLoc (.init rootVal') with
                | some locals' =>
                  some (locals',
                    invalidateConflictingBorrowsAtProj borrows dstLoc .none
-                     (resolveBorrowWriteLocalProj localDecls layouts env₁ dstLoc (proj :: rest)) 0 0 depth)
+                     (resolveBorrowWriteLocalProj decls' layouts env₁ dstLoc (proj :: rest)) 0 0 depth)
                | none => none
              | _ => none
          | _ => none) = some (env₂, borrows') := by
@@ -1477,17 +1481,17 @@ private theorem assignLocalPlace_cons_inv
   have h_unfold :
       (match get? env₁ dstLoc with
        | some (.init rootVal) =>
-         match ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
-             (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+         match ensureNestedFieldShells rootVal (proj :: rest) decls' layouts
+             (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) with
          | .none => none
          | .some shelledRoot =>
-           match writeProjectedForLocal env₁ localDecls layouts dstLoc shelledRoot (proj :: rest) val with
+           match writeProjectedForLocal env₁ decls' layouts dstLoc shelledRoot (proj :: rest) val with
            | .ok rootVal' =>
              match set? env₁ dstLoc (.init rootVal') with
              | some locals' =>
                some (locals',
                  invalidateConflictingBorrowsAtProj borrows dstLoc .none
-                   (resolveBorrowWriteLocalProj localDecls layouts env₁ dstLoc (proj :: rest)) 0 0 depth)
+                   (resolveBorrowWriteLocalProj decls' layouts env₁ dstLoc (proj :: rest)) 0 0 depth)
              | none => none
            | _ => none
        | _ => none) = some (env₂, borrows') := by
@@ -1502,13 +1506,13 @@ private theorem assignLocalPlace_cons_inv
     | uninit => cases h_unfold
     | init rootVal =>
       dsimp only at h_unfold
-      cases h_ens : ensureNestedFieldShells rootVal (proj :: rest) localDecls layouts
-          (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+      cases h_ens : ensureNestedFieldShells rootVal (proj :: rest) decls' layouts
+          (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) with
       | none => rw [h_ens] at h_unfold; cases h_unfold
       | some shelledRoot =>
         rw [h_ens] at h_unfold
         dsimp only at h_unfold
-        cases h_wp : writeProjectedForLocal env₁ localDecls layouts dstLoc shelledRoot (proj :: rest) val with
+        cases h_wp : writeProjectedForLocal env₁ decls' layouts dstLoc shelledRoot (proj :: rest) val with
         | ub => rw [h_wp] at h_unfold; cases h_unfold
         | unsupported => rw [h_wp] at h_unfold; cases h_unfold
         | ok rootVal' =>
@@ -8385,22 +8389,23 @@ private def ccEvalAssignNonDeref
     (s : MachineState) (dstLoc : Local) (proj : List ProjectionElem)
     (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
+  let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc proj
   match get? locals₁ dstLoc with
   | .some (.init rootVal) =>
     match
       ensureNestedFieldShells
         rootVal
         proj
-        localDecls
+        decls'
         layouts
-        (placeTy localDecls layouts { local_ := dstLoc, projection := .nil })
+        (placeTy decls' layouts { local_ := dstLoc, projection := .nil })
     with
     | .none => MirStepNode.fail .ub
     | .some shelledRoot =>
       match
         writeProjectedForLocal
           locals₁
-          localDecls
+          decls'
           layouts
           dstLoc
           shelledRoot
@@ -8411,7 +8416,7 @@ private def ccEvalAssignNonDeref
         match set? locals₁ dstLoc (.init rootVal') with
         | .some locals₂ =>
           let resolvedLocalProj :=
-            resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc proj
+            resolveBorrowWriteLocalProj decls' layouts locals₁ dstLoc proj
           match mem₁.activeProtectors with
           | .nil =>
             let borrows' :=
@@ -8440,13 +8445,13 @@ private def ccEvalAssignNonDeref
     | hd :: tl =>
       match uninitFieldWriteShell? localDecls layouts dstLoc hd tl with
       | .some rootVal =>
-        match writeProjectedForLocal locals₁ localDecls layouts dstLoc rootVal (hd :: tl) val with
+        match writeProjectedForLocal locals₁ decls' layouts dstLoc rootVal (hd :: tl) val with
         | .ok rootVal' =>
           match set? locals₁ dstLoc (.init rootVal') with
           | .some locals₂ =>
             let resolvedLocalProj :=
               resolveBorrowWriteLocalProj
-                localDecls
+                decls'
                 layouts
                 locals₁
                 dstLoc

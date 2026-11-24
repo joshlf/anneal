@@ -875,21 +875,21 @@ theorem mir_evalTerminator_return_root_and_caller
     have hDepth : length s.memory.callStack = 0 := by
       rw [hStack]
       rfl
-    simp only [evalTerminator, bodyLocalDeclsOf, hRet, hDepth, hNoConflict]
+    simp only [evalTerminator, hRet, hDepth, hNoConflict]
     rw [hStack]
   · intro retVal caller restStack updatedCallerLocals mem' hRet hStack hNoConflict hDiv hProt
       hWrite
     refine ⟨?_, rfl⟩
-    simp only [evalTerminator, bodyLocalDeclsOf, hRet, hNoConflict]
+    simp only [evalTerminator, hRet, hNoConflict]
     rw [hStack] at hWrite ⊢
     simp only [hDiv, restoreCallerProtectors, hProt, hWrite]
   · intro retVal caller restStack hRet hStack hDiv
-    simp only [evalTerminator, bodyLocalDeclsOf, hRet]
+    simp only [evalTerminator, hRet]
     rw [hStack]
     simp only [hDiv]
     split <;> rfl
   · intro retVal hRet hConflict
-    simp only [evalTerminator, bodyLocalDeclsOf, hRet, hConflict]
+    simp only [evalTerminator, hRet, hConflict]
   · intro hUninit
     simp [evalTerminator, hUninit]
   · intro hDead
@@ -993,11 +993,11 @@ theorem mir_evalTerminator_call_transparent_and_unreachable_unchecked
   refine ⟨?_, ?_, ?_⟩
   · intro hUnreach hFind
     cases currentBody <;>
-      simp [evalTerminator, resolveCallTarget, evalOperands, hUnreach, hFind] <;>
+      simp [evalTerminator, resolveCallTarget, hUnreach, hFind] <;>
       rfl
   · intro hUnreach hFind
     cases currentBody <;>
-      simp [evalTerminator, resolveCallTarget, evalOperands, hUnreach, hFind] <;>
+      simp [evalTerminator, resolveCallTarget, hUnreach, hFind] <;>
       rfl
   · intro defPath targetBb calleeBody callerBody argVals locals' hFunc hCurr hArgs hFind
     subst hCurr
@@ -1077,27 +1077,27 @@ theorem mir_evalTerminator_exact_div_intrinsic_corresponds
   · intro retVal hExact
     unfold emptyMemory at hExact
     unfold evalTerminator
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
       hExact, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold emptyMemory at hUb
     unfold evalTerminator
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, hUb]
   · intro retVal hExact
     unfold emptyMemory at hExact
     unfold evalTerminator
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr,
       hExact, writeIntrinsicReturn, writePlaceValue, set?]
   · intro hUb
     unfold emptyMemory at hUb
     unfold evalTerminator
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, hUb]
   · unfold evalTerminator
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, hStr, resolveIntrinsicIsSigned,
       operandTy, placeTy]
 
@@ -2533,12 +2533,12 @@ theorem mir_evalTerminator_ub_checks_intrinsic_corresponds
   have hEx : stringEq "core::intrinsics::ub_checks" "core::intrinsics::exact_div" = false := rfl
   refine ⟨?_, ?_⟩
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, emptyMemory,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, emptyMemory,
       isDirectExactDivTarget, evalDirectRustIntrinsic?, h, hEx,
       evalNonSelectIntrinsicCall, writeIntrinsicReturn,
       writePlaceValue, get?, set?]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
 
@@ -2700,21 +2700,21 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
   have hExP : stringEq "core::panicking::panic" "core::intrinsics::exact_div" = false := rfl
   refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, unpackConstEvalSelectArgs?, resolveConstEvalSelectTarget?,
       hMatch2, hArgs2, hConv2, hParams2, callConvEq, length]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx, resolveConstEvalSelectTarget?, hMiss20, hMatch0, hArgs0, hConv0,
       hParams0, callConvEq, length]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
@@ -2722,7 +2722,7 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
       hMiss2U, hMiss0U, hKindU, hExU]
     rfl
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
@@ -2730,7 +2730,7 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
       hMiss2N, hMiss0N, hKindN, hExN]
     rfl
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, emptyMemory, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
@@ -2738,13 +2738,13 @@ theorem mir_evalTerminator_const_eval_select_intrinsic_corresponds
       hMiss2P, hMiss0P, hKindP, hExP]
     rfl
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
       hKind, hEx]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, evalConstValue, get?, lookupCallee,
       resolveCalleeBodyAndArgs?, findCallee?, checkCalleeTargetCompatible,
       hFindSel2, hFindSel0, isDirectExactDivTarget, evalDirectRustIntrinsic?,
@@ -2864,7 +2864,7 @@ theorem mir_evalTerminator_arith_offset_intrinsic_corresponds
          }
        | .none => MirStepNode.fail .ub) := by
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hKind, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, rigidTyKindByteSize,
@@ -2890,7 +2890,7 @@ theorem mir_evalTerminator_arith_offset_intrinsic_corresponds
          }
        | .none => MirStepNode.fail .ub) := by
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hKind, hEx, evalNonSelectIntrinsicCall, hPadSz,
       writeIntrinsicReturn, writePlaceValue, set?]
@@ -2903,7 +2903,7 @@ theorem mir_evalTerminator_arith_offset_intrinsic_corresponds
   · intro newPtr hOk
     rw [hCalcPad, hOk]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hKind, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, findDeclLayoutForRigidTy,
@@ -2912,12 +2912,12 @@ theorem mir_evalTerminator_arith_offset_intrinsic_corresponds
         intrinsicRigidTyByteSize .nil emptyLayoutTable (.tuple [.uint .u32, .slice (.uint .u8)]) = .none :=
       rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hKind, hEx, evalNonSelectIntrinsicCall, hUnsizedSz,
       intrinsicUnresolvedLayoutStep]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hKind, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux,
@@ -2973,7 +2973,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::ctlz" = .some .ctlz := rfl
     have hEx : stringEq "core::intrinsics::ctlz" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -2981,7 +2981,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::ctlz_nonzero" = .some .ctlzNonzero := rfl
     have hEx : stringEq "core::intrinsics::ctlz_nonzero" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -2989,7 +2989,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::cttz" = .some .cttz := rfl
     have hEx : stringEq "core::intrinsics::cttz" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -2997,7 +2997,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::cttz_nonzero" = .some .cttzNonzero := rfl
     have hEx : stringEq "core::intrinsics::cttz_nonzero" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3005,7 +3005,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::ctpop" = .some .ctpop := rfl
     have hEx : stringEq "core::intrinsics::ctpop" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3013,7 +3013,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::bswap" = .some .bswap := rfl
     have hEx : stringEq "core::intrinsics::bswap" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3021,7 +3021,7 @@ theorem mir_evalTerminator_bit_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::bitreverse" = .some .bitreverse := rfl
     have hEx : stringEq "core::intrinsics::bitreverse" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3099,7 +3099,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::wrapping_add" = .some .wrappingAdd := rfl
     have hEx : stringEq "core::intrinsics::wrapping_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3107,7 +3107,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::wrapping_sub" = .some .wrappingSub := rfl
     have hEx : stringEq "core::intrinsics::wrapping_sub" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3115,7 +3115,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::wrapping_mul" = .some .wrappingMul := rfl
     have hEx : stringEq "core::intrinsics::wrapping_mul" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3123,7 +3123,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_add" = .some .saturatingAdd := rfl
     have hEx : stringEq "core::intrinsics::saturating_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3131,7 +3131,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_sub" = .some .saturatingSub := rfl
     have hEx : stringEq "core::intrinsics::saturating_sub" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3139,7 +3139,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_shl" = .some .uncheckedShl := rfl
     have hEx : stringEq "core::intrinsics::unchecked_shl" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3147,7 +3147,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_shr" = .some .uncheckedShr := rfl
     have hEx : stringEq "core::intrinsics::unchecked_shr" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3155,7 +3155,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_add" = .some .uncheckedAdd := rfl
     have hEx : stringEq "core::intrinsics::unchecked_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3163,7 +3163,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_sub" = .some .uncheckedSub := rfl
     have hEx : stringEq "core::intrinsics::unchecked_sub" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3171,7 +3171,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_mul" = .some .uncheckedMul := rfl
     have hEx : stringEq "core::intrinsics::unchecked_mul" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3179,7 +3179,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_div" = .some .uncheckedDiv := rfl
     have hEx : stringEq "core::intrinsics::unchecked_div" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3187,7 +3187,7 @@ theorem mir_evalTerminator_wrapping_saturating_unchecked_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_rem" = .some .uncheckedRem := rfl
     have hEx : stringEq "core::intrinsics::unchecked_rem" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3443,7 +3443,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::three_way_compare" = .some .threeWayCompare := rfl
     have hEx : stringEq "core::intrinsics::three_way_compare" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3451,7 +3451,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, rigidTyKindByteSize,
@@ -3460,7 +3460,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, rigidTyKindByteSize,
@@ -3470,7 +3470,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyAlign, intrinsicRigidTyAlignAux, intrinsicRigidTyKindAlign,
@@ -3478,7 +3478,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, rigidTyKindByteSize,
@@ -3488,7 +3488,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
@@ -3497,7 +3497,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
         intrinsicRigidTyByteSize .nil emptyLayoutTable (.tuple [.uint .u32, .uint .u8]) = .some 8 :=
       rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hPadSz,
       writeIntrinsicReturn, writePlaceValue, set?]
@@ -3505,31 +3505,31 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux,
@@ -3538,7 +3538,7 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicReturn, writePlaceValue, set?]
@@ -3546,27 +3546,27 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicWidePointeeStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicWidePointeeStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
@@ -3576,14 +3576,14 @@ theorem mir_evalTerminator_comparison_and_layout_intrinsics_corresponds
           .none :=
       rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hSz,
       intrinsicUnresolvedLayoutStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicWidePointeeStep]
@@ -3632,14 +3632,14 @@ theorem mir_evalTerminator_align_of_val_rejects_oversized_slices
     rfl
   refine ⟨?_, ?_⟩
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicRigidTyByteSize, intrinsicRigidTyByteSizeAux, rigidTyKindByteSize,
       intrinsicRigidTyAlign, intrinsicRigidTyAlignAux, intrinsicRigidTyKindAlign,
       intCastTargetBytes, hBig]
   · unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hFit,
       writeIntrinsicReturn, writePlaceValue, set?]
@@ -3699,7 +3699,7 @@ theorem mir_evalTerminator_intrinsic_signedness_fails_closed
   · have h : classifyRustIntrinsic? "core::intrinsics::three_way_compare" = .some .threeWayCompare := rfl
     have hEx : stringEq "core::intrinsics::three_way_compare" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       writeIntrinsicScalarResult, writeIntrinsicReturn, writePlaceValue, set?]
@@ -3707,13 +3707,13 @@ theorem mir_evalTerminator_intrinsic_signedness_fails_closed
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_add" = .some .saturatingAdd := rfl
     have hEx : stringEq "core::intrinsics::saturating_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_shl" = .some .uncheckedShl := rfl
     have hEx : stringEq "core::intrinsics::unchecked_shl" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicShiftSigned, operandTy, placeTy]
@@ -4021,7 +4021,7 @@ theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
           (.tuple [.slice (.uint .u8), .foreign "test::Opaque"]) = .none :=
       rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hSz,
       intrinsicUnresolvedLayoutStep]
@@ -4032,59 +4032,59 @@ theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
           (.tuple [.slice (.uint .u8), .foreign "test::Opaque"]) = .none :=
       rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall, hAl,
       intrinsicUnresolvedLayoutStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicWidePointeeStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       intrinsicWidePointeeStep]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall]
   · have hSel : classifyRustIntrinsic? "core::intrinsics::const_eval_select" = .some .constEvalSelect := rfl
     have hEx1 : stringEq "core::intrinsics::const_eval_select" "core::intrinsics::exact_div" = false := rfl
     have hEx2 : stringEq "core::intrinsics::exact_div" "core::intrinsics::exact_div" = true := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, length]
@@ -4094,7 +4094,7 @@ theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
     have hEx2 : stringEq "core::intrinsics::unchecked_add" "core::intrinsics::exact_div" = false := rfl
     have hAdd : classifyRustIntrinsic? "core::intrinsics::unchecked_add" = .some .uncheckedAdd := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hAdd, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall, length]
@@ -4104,7 +4104,7 @@ theorem mir_evalTerminator_dst_prefix_meta_decl_and_select_typeArgs_corresponds
     have hEx2 : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
     have hOff : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hOff, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall,
@@ -4264,21 +4264,21 @@ theorem mir_evalTerminator_pointee_resolution_fails_closed
   · have h : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
     have hEx : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy]
@@ -4526,7 +4526,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::arith_offset" = .some .arithOffset := rfl
     have hEx : stringEq "core::intrinsics::arith_offset" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy,
@@ -4534,7 +4534,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy,
@@ -4542,7 +4542,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, intrinsicMissingPointeeStep, operandTy, placeTy,
@@ -4550,42 +4550,42 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     have hEx : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, isValidIntrinsicPtrArgVal, operandTy, placeTy]
   · have h : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     have hEx : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicPointeeTy?, isValidIntrinsicPtrArgVal, operandTy, placeTy]
@@ -4594,7 +4594,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     have hEx2 : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     have hSz : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hSz, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall,
@@ -4604,7 +4604,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     have hEx2 : stringEq "core::intrinsics::align_of_val" "core::intrinsics::exact_div" = false := rfl
     have hAl : classifyRustIntrinsic? "core::intrinsics::align_of_val" = .some .alignOfVal := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hAl, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall,
@@ -4614,7 +4614,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     have hEx2 : stringEq "core::intrinsics::size_of_val" "core::intrinsics::exact_div" = false := rfl
     have hSz : classifyRustIntrinsic? "core::intrinsics::size_of_val" = .some .sizeOfVal := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hSz, unpackConstEvalSelectArgs?,
       resolveConstEvalSelectTarget?, evalNonSelectIntrinsicCall,
@@ -4623,7 +4623,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
       writePlaceValue, set?, length]
   · have hEx : stringEq "core::intrinsics::exact_div" "core::intrinsics::exact_div" = true := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       hEx, resolveIntrinsicIsSigned, operandTy, placeTy]
     split
@@ -4642,7 +4642,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::saturating_add" = .some .saturatingAdd := rfl
     have hEx : stringEq "core::intrinsics::saturating_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicIsSigned, operandTy, placeTy]
@@ -4650,7 +4650,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_add" = .some .uncheckedAdd := rfl
     have hEx : stringEq "core::intrinsics::unchecked_add" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicIsSigned, operandTy, placeTy]
@@ -4658,7 +4658,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
   · have h : classifyRustIntrinsic? "core::intrinsics::unchecked_shr" = .some .uncheckedShr := rfl
     have hEx : stringEq "core::intrinsics::unchecked_shr" "core::intrinsics::exact_div" = false := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, h, hEx, evalNonSelectIntrinsicCall,
       resolveIntrinsicIsSigned, operandTy, placeTy]
@@ -4667,7 +4667,7 @@ theorem mir_evalTerminator_missing_pointee_ub_and_rhs_signedness_corresponds
     have hEx2 : stringEq "std::hint::unreachable_unchecked" "core::intrinsics::exact_div" = false := rfl
     have hUnr : classifyRustIntrinsic? "std::hint::unreachable_unchecked" = .none := rfl
     unfold evalTerminator mkIntrinsicCallTerm
-    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperands, evalOperand,
+    simp [extractCalleeDefPath?, extractCalleeTypeArgs, evalOperand,
       evalConstValue, readProjectedValue, emptyMemory, get?, isDirectExactDivTarget,
       evalDirectRustIntrinsic?, hSel, hEx1, hEx2, hUnr, resolveConstEvalSelectTarget?, length]
     rfl
@@ -6730,5 +6730,123 @@ theorem stmt_assign_deref_union_field_sibling_borrow_invalidation_and_protector_
         hEntries hDecl hUnion hNonZst hRv hPtr hTagNe hSibPerm⟩
 
 end UninitAggregateFieldWrites
+
+section SubplaceCopyTailCallOpaqueCastHardening
+
+/--
+Kernel-checked regression suite for `ep1-A1` hardening across Bugs 1, 2, and 4
+(`V2026_08_01` dialect):
+1. `copyBytesSubplace` rejects untyped `callerLocals` aggregate type confusion
+   while accepting representation-exact scalar caller referents.
+2. `copyBytesSubplace` fails closed with `.unsupported` (not false `.ub`) when
+   `decodeValueFromBytes` does not decode the copied bytes at `dstTy` (`2u8`
+   written via `*mut u8` into `bool`, or 4 `u8` bytes into `f32`).
+3. `writePlaceValue` and `writeReturnDestination` resolve `.opaqueCast` types
+   with `placeTyResolved` so a synthetic `layoutIdx = 0` on `castTy` does not
+   collide with `layouts.entries[0]`.
+4. `callConvCanUnwind? (.other "C") = .some false`, while `callConvCanUnwind? .c = .none`.
+-/
+theorem ep1_a1_subplace_copy_and_opaquecast_hardening :
+    let u8Ty : Ty := { kind := .uint .u8, layoutIdx := 0 }
+    let u32Ty : Ty := { kind := .uint .u32, layoutIdx := 0 }
+    let boolTy : Ty := { kind := .bool, layoutIdx := 0 }
+    let f32Ty : Ty := { kind := .float .f32, layoutIdx := 0 }
+    let arrU8_8Ty : Ty := { kind := .array (.uint .u8) 8, layoutIdx := 0 }
+    let srcBytes8 : Value :=
+      .aggregate 0
+        (.scalar ⟨1, 1⟩ :: .scalar ⟨2, 1⟩ :: .scalar ⟨3, 1⟩ :: .scalar ⟨4, 1⟩ ::
+          .scalar ⟨5, 1⟩ :: .scalar ⟨6, 1⟩ :: .scalar ⟨7, 1⟩ :: .scalar ⟨8, 1⟩ :: .nil)
+    let callerArrU32_2 : Value :=
+      .aggregate 0 (.scalar ⟨10, 4⟩ :: .scalar ⟨20, 4⟩ :: .nil)
+    let srcEntry0 : BorrowEntry :=
+      { tag := 1, targetLocal := 0, targetFrameDepth := 0, targetProjection := .nil, perm := .frozen }
+    let dstCallerEntry : BorrowEntry :=
+      { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+    let srcEp8 : CopyEndpoint :=
+      { ptr := { allocId := 1, offsetBytes := 0 }
+        entry := srcEntry0
+        rootValOpt := .some srcBytes8
+        pointeeOpt := .some arrU8_8Ty }
+    let dstCallerAggEp : CopyEndpoint :=
+      { ptr := { allocId := 2, offsetBytes := 0 }
+        entry := dstCallerEntry
+        rootValOpt := .some callerArrU32_2
+        pointeeOpt := .some arrU8_8Ty }
+    (copyBytesSubplace .nil emptyLayoutTable (.init srcBytes8 :: .nil)
+        (.uninit :: .init callerArrU32_2 :: .nil) .nil srcEp8 dstCallerAggEp (.some 8) 1
+        (.some (.nil, 0, .scalar ⟨1, 1⟩ :: .scalar ⟨2, 1⟩ :: .scalar ⟨3, 1⟩ :: .scalar ⟨4, 1⟩ ::
+          .scalar ⟨5, 1⟩ :: .scalar ⟨6, 1⟩ :: .scalar ⟨7, 1⟩ :: .scalar ⟨8, 1⟩ :: .nil)) .none =
+      .unsupported) ∧
+    (let srcWinU8 :=
+       .some (.nil, 0,
+         .scalar ⟨1, 1⟩ :: .scalar ⟨2, 1⟩ :: .scalar ⟨3, 1⟩ :: .scalar ⟨4, 1⟩ ::
+         .scalar ⟨5, 1⟩ :: .scalar ⟨6, 1⟩ :: .scalar ⟨7, 1⟩ :: .scalar ⟨8, 1⟩ :: .nil)
+     let srcEpU8At0 : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }
+         entry := srcEntry0
+         rootValOpt := .some srcBytes8
+         pointeeOpt := .some u8Ty }
+     let dstCallerScU8 : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }
+         entry := dstCallerEntry
+         rootValOpt := .some (.scalar ⟨99, 4⟩)
+         pointeeOpt := .some u32Ty }
+     copyBytesSubplace .nil emptyLayoutTable (.init srcBytes8 :: .nil)
+        (.uninit :: .init (.scalar ⟨99, 4⟩) :: .nil) .nil srcEpU8At0 dstCallerScU8 (.some 1) 4
+        srcWinU8 .none =
+      .write { local_ := 1, projection := .nil } (.scalar ⟨0x04030201, 4⟩)
+        (.subslice 0 4 false :: .nil) .nil) ∧
+    (let declsBool : List LocalDecl :=
+       { mutability := .not, ty := { kind := .array (.uint .u8) 2, layoutIdx := 0 }, debugName := .none } ::
+       { mutability := .mut, ty := boolTy, debugName := .none } :: .nil
+     let src2 : Value := .aggregate 0 (.scalar ⟨0, 1⟩ :: .scalar ⟨2, 1⟩ :: .nil)
+     let dstEntry1 : BorrowEntry :=
+       { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+     let sEp : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 1 }, entry := srcEntry0,
+         rootValOpt := .some src2, pointeeOpt := .some u8Ty }
+     let dEp : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨0, 1⟩), pointeeOpt := .some u8Ty }
+     copyBytesSubplace declsBool emptyLayoutTable
+       (.init src2 :: .init (.scalar ⟨0, 1⟩) :: .nil) .nil .nil sEp dEp (.some 1) 1
+       (.some (.nil, 0, .scalar ⟨0, 1⟩ :: .scalar ⟨2, 1⟩ :: .nil)) .none = .unsupported) ∧
+    (let declsF32 : List LocalDecl :=
+       { mutability := .not, ty := arrU8_8Ty, debugName := .none } ::
+       { mutability := .mut, ty := f32Ty, debugName := .none } :: .nil
+     let dstEntry1 : BorrowEntry :=
+       { tag := 2, targetLocal := 1, targetFrameDepth := 0, targetProjection := .nil, perm := .active }
+     let sEp : CopyEndpoint :=
+       { ptr := { allocId := 1, offsetBytes := 0 }, entry := srcEntry0,
+         rootValOpt := .some srcBytes8, pointeeOpt := .some u8Ty }
+     let dEp : CopyEndpoint :=
+       { ptr := { allocId := 2, offsetBytes := 0 }, entry := dstEntry1,
+         rootValOpt := .some (.scalar ⟨0, 4⟩), pointeeOpt := .some u8Ty }
+     copyBytesSubplace declsF32 emptyLayoutTable
+       (.init srcBytes8 :: .init (.scalar ⟨0, 4⟩) :: .nil) .nil .nil sEp dEp (.some 1) 4
+       (.some (.nil, 0, .scalar ⟨1, 1⟩ :: .scalar ⟨2, 1⟩ :: .scalar ⟨3, 1⟩ :: .scalar ⟨4, 1⟩ ::
+         .scalar ⟨5, 1⟩ :: .scalar ⟨6, 1⟩ :: .scalar ⟨7, 1⟩ :: .scalar ⟨8, 1⟩ :: .nil)) .none =
+       .unsupported) ∧
+    (let otherTwoFieldLayout : TypeLayout :=
+       { size := { bytes := 8 }, align := { bytes := 4 },
+         backendRepr := .memory,
+         fields := .arbitrary ({ bytes := 0 } :: { bytes := 4 } :: .nil) (0 :: 1 :: .nil),
+         variants := .single 0, isUninhabited := false }
+     let ltZero : LayoutTable :=
+       { pointerBits := 64, isLittleEndian := true, entries := otherTwoFieldLayout :: .nil }
+     let opaqueTy : Ty := { kind := .foreign "OpaqueOne", layoutIdx := 1 }
+     let synthCastTy : Ty := { kind := .adt "OneField" .nil, layoutIdx := 0 }
+     let decls0 : List LocalDecl :=
+       { mutability := .mut, ty := opaqueTy, debugName := .none } :: .nil
+     let dstCast : Place := { local_ := 0, projection := .opaqueCast synthCastTy :: .nil }
+     let v1 : Value := .aggregate 0 (.scalar ⟨7, 4⟩ :: .nil)
+     writePlaceValue (.uninit :: .nil) .nil dstCast v1 decls0 ltZero = .ok (.init v1 :: .nil) ∧
+     writeReturnDestination (.uninit :: .nil) emptyMemory dstCast v1 decls0 ltZero =
+       .ok (.init v1 :: .nil) emptyMemory) ∧
+    callConvCanUnwind? (.other "C") = .some false ∧
+    callConvCanUnwind? .c = .none := by
+  exact ⟨rfl, rfl, rfl, rfl, ⟨rfl, rfl⟩, rfl, rfl⟩
+
+end SubplaceCopyTailCallOpaqueCastHardening
 
 end Correspondence.V2026_08_01.L5_ControlAndCalls

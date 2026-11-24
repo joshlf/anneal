@@ -2247,13 +2247,13 @@ the written range is exactly the range of that value; every other placement
 would write a different set of bytes than the copy does, so it is not modeled.
 Undefined behavior is reported only when a necessary validity condition fails
 (the access is certainly outside the allocation), when the accessed places
-overlap, when the aliasing model rejects the accesses, or when the copied bytes
-do not form a value of the destination type.
+overlap, or when the aliasing model rejects the accesses.
 
-Modeling assumptions and unsupported behavior: bytes that do not decode at the
-destination type (for example uninitialized bytes) are reported as undefined
-behavior, the policy of the single-element path; a copy between two pointers
-with the same tag is undefined behavior as in the single-element path.
+Modeling assumptions and unsupported behavior: bytes that `decodeValueFromBytes`
+does not decode at the destination type, or untyped caller-owned aggregate
+destinations whose field layout is unknown, fail closed with `.unsupported`; a
+copy between two pointers with the same tag is undefined behavior as in the
+single-element path.
 -/
 def copyBytesSubplace
     (localDecls : List LocalDecl)
@@ -2331,10 +2331,7 @@ def copyBytesSubplace
     | .none =>
       match srcEp.rootValOpt with
       | .none => .ub
-      | .some srcRootVal =>
-        match readProjectedValue locals srcRootVal srcEp.entry.targetProjection with
-        | .ub => .ub
-        | _ => .unsupported
+      | .some _ => .unsupported
     | .some (sVal, srcEffProj) =>
       match encodeUntypedValueToBytes defaultCodecFuel sVal with
       | .none => .unsupported
@@ -2430,23 +2427,26 @@ def copyBytesSubplace
                         rigidTyByteSize layouts pt
                       with
                       | .ok dstSubVal, .some ptBytes =>
-                        let shapeCompatible : Bool :=
-                          match dstSubVal, pt.kind with
-                          | .aggregate _ _, .uint _ => false
-                          | .aggregate _ _, .int _ => false
-                          | .aggregate _ _, .bool => false
-                          | .aggregate _ _, .char => false
-                          | .aggregate _ _, .float _ => false
-                          | .scalar _, .array _ _ => false
-                          | .scalar _, .adt _ _ => false
-                          | .scalar _, .tuple _ => false
-                          | _, _ => true
-                        match shapeCompatible, valueDefaultByteSize dstSubVal with
-                        | true, .some subBytes =>
-                          match Nat.beq ptBytes subBytes with
-                          | true => .some pt
-                          | false => .none
-                        | _, _ => .none
+                        let repExact : Bool :=
+                          match dstSubVal with
+                          | .scalar sc =>
+                            Bool.and
+                              (isPrimitiveScalarKind pt.kind)
+                              (Nat.beq ptBytes sc.sizeBytes)
+                          | .ptr _ ptrSz =>
+                            let isThinPtrTy : Bool :=
+                              match pt.kind with
+                              | .fnPtr _ _ _ _ => true
+                              | .rawPtr _ pointee | .ref _ pointee =>
+                                match pointee with
+                                | .slice _ | .str | .dynamic _ => false
+                                | _ => true
+                              | _ => false
+                            Bool.and isThinPtrTy (Nat.beq ptBytes ptrSz)
+                          | _ => false
+                        match repExact with
+                        | true => .some pt
+                        | false => .none
                       | _, _ => .none
                     | _, _ => .none
                 let decodeAt
@@ -2472,7 +2472,7 @@ def copyBytesSubplace
                               { local_ := dstLocal, projection := dstProj }
                               decodedVal
                               dstEffProj)
-                        | .none => .some .ub
+                        | .none => .none
                   | _, _ => .none
                 match decodeAt dstTargetTyOpt dstEp.entry.targetProjection dstResolvedProj with
                 | .some outcome => outcome
@@ -2493,8 +2493,11 @@ def copyBytesSubplace
                   | .none =>
                     match dstEp.rootValOpt, splitLastConstantIndex? dstResolvedProj with
                     | .none, .some (initProj, .zero, _) =>
-                      match stripLeadingOpaqueCast initProj with
-                      | .nil =>
+                      match
+                        stripLeadingOpaqueCast initProj,
+                        copyPlaceIsNonArrayAggregate localDecls layouts locals dstLocal initProj
+                      with
+                      | .nil, false =>
                         let parentTyOpt : Option Ty :=
                           match get? locals dstLocal with
                           | .some _ =>
@@ -2506,7 +2509,7 @@ def copyBytesSubplace
                         match decodeAt parentTyOpt initProj initProj with
                         | .some outcome => outcome
                         | .none => .unsupported
-                      | _ :: _ => .unsupported
+                      | _, _ => .unsupported
                     | _, _ => .unsupported
                   | _ => .unsupported
 
@@ -5615,12 +5618,14 @@ def evalStmt
           | .none => MirStepNode.fail .ub
         | .none => MirStepNode.fail .ub
       | proj :: rest, _ =>
+        let decls' :=
+          eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest)
         match get? locals₁ dst.local_ with
         | .some (.init rootVal) =>
           match
             writeProjectedForLocal
               locals₁
-              localDecls
+              decls'
               layouts
               dst.local_
               (ensureNestedFieldShells rootVal (proj :: rest))
@@ -5632,7 +5637,7 @@ def evalStmt
             | .some locals₂ =>
               let resolvedLocalProj :=
                 resolveBorrowWriteLocalProj
-                  localDecls
+                  decls'
                   layouts
                   locals₁
                   dst.local_
@@ -5684,7 +5689,7 @@ def evalStmt
             match
               writeProjectedForLocal
                 locals₁
-                localDecls
+                decls'
                 layouts
                 dst.local_
                 rootVal
@@ -5696,7 +5701,7 @@ def evalStmt
               | .some locals₂ =>
                 let resolvedLocalProj :=
                   resolveBorrowWriteLocalProj
-                    localDecls
+                    decls'
                     layouts
                     locals₁
                     dst.local_

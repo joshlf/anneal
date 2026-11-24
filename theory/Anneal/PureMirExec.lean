@@ -2023,7 +2023,7 @@ theorem writeReturnDestination_borrows_nil_pushBaseStack
         split
         · rfl
         · rename_i rootVal _
-          cases writeProjectedForLocal cl ld ly dLoc rootVal (hd :: tl) rv with
+          cases writeProjectedForLocal cl (eraseLeadingOpaqueCastDecls ld ly dLoc (hd :: tl)) ly dLoc rootVal (hd :: tl) rv with
           | ub => rfl
           | unsupported => rfl
           | ok rootVal' =>
@@ -2879,6 +2879,7 @@ theorem evalStmt_borrows_nil_pushBaseStack
             · rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr,
                   evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_d h_nr]
               unfold evalAssignNonDeref
+              let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc (hd :: tl)
               dsimp only [MachineState.pushBaseStack, Memory.pushBaseStack]
               simp only [h_hpc, h_icbp]
               cases get? locals₁ dstLoc with
@@ -2892,17 +2893,17 @@ theorem evalStmt_borrows_nil_pushBaseStack
                   | none => rfl
                   | some rv0 =>
                     dsimp only
-                    cases writeProjectedForLocal locals₁ localDecls layouts dstLoc rv0 (hd :: tl) val with
+                    cases writeProjectedForLocal locals₁ decls' layouts dstLoc rv0 (hd :: tl) val with
                     | ub | unsupported => rfl
                     | ok rv' => dsimp only; cases set? locals₁ dstLoc (.init rv') <;> (cases ap1 <;> rfl)
                 | init rv0 =>
                   dsimp only
-                  cases ensureNestedFieldShells rv0 (hd :: tl) localDecls layouts
-                      (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+                  cases ensureNestedFieldShells rv0 (hd :: tl) decls' layouts
+                      (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) with
                   | none => rfl
                   | some sh0 =>
                     dsimp only
-                    cases writeProjectedForLocal locals₁ localDecls layouts dstLoc sh0 (hd :: tl) val with
+                    cases writeProjectedForLocal locals₁ decls' layouts dstLoc sh0 (hd :: tl) val with
                     | ub | unsupported => rfl
                     | ok rv' => dsimp only; cases set? locals₁ dstLoc (.init rv') <;> (cases ap1 <;> rfl)
 
@@ -5174,16 +5175,17 @@ theorem writeReturnDestination_activeCallee
                   cases set? cl dLoc (.init rv) <;> first | exact trivial | exact rfl
         | _ => cases h_s
       · rw [writeReturnDestination_nonDeref cl m dLoc hd tl rv ld ly h_nd h_nr]
+        let ld' := eraseLeadingOpaqueCastDecls ld ly dLoc (hd :: tl)
         dsimp only
         cases hasProtectedWriteConflict m.borrows m.activeProtectors dLoc none
-            (resolveBorrowWriteLocalProj ld ly cl dLoc (hd :: tl)) 0 0 (length m.callStack) with
+            (resolveBorrowWriteLocalProj ld' ly cl dLoc (hd :: tl)) 0 0 (length m.callStack) with
         | true => trivial
         | false =>
           dsimp only
           split
           · trivial
           · rename_i rootVal _
-            cases writeProjectedForLocal cl ld ly dLoc rootVal (hd :: tl) rv with
+            cases writeProjectedForLocal cl ld' ly dLoc rootVal (hd :: tl) rv with
             | ub | unsupported => trivial
             | ok rootVal' =>
               dsimp only
@@ -6116,6 +6118,7 @@ theorem writeReturnDestination_borrows_nil_eq
               dLoc hd tl retVal localDecls layouts h_nd h_nr,
             writeReturnDestination_nonDeref callerLocals emptyMemory
               dLoc hd tl retVal localDecls layouts h_nd h_nr]
+        let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dLoc (hd :: tl)
         dsimp only [emptyMemory, hasProtectedWriteConflict, invalidateConflictingBorrowsAtProj]
         cases get? callerLocals dLoc with
         | none => rfl
@@ -6128,18 +6131,18 @@ theorem writeReturnDestination_borrows_nil_eq
             | none => rfl
             | some rootVal =>
               dsimp only
-              cases writeProjectedForLocal callerLocals localDecls layouts dLoc rootVal (hd :: tl) retVal with
+              cases writeProjectedForLocal callerLocals decls' layouts dLoc rootVal (hd :: tl) retVal with
               | ub => rfl
               | unsupported => rfl
               | ok rv' => dsimp only; cases set? callerLocals dLoc (.init rv') <;> rfl
           | init rv0 =>
             dsimp only
-            cases ensureNestedFieldShells rv0 (hd :: tl) localDecls layouts
-                (placeTy localDecls layouts { local_ := dLoc, projection := .nil }) with
+            cases ensureNestedFieldShells rv0 (hd :: tl) decls' layouts
+                (placeTy decls' layouts { local_ := dLoc, projection := .nil }) with
             | none => rfl
             | some rootVal =>
               dsimp only
-              cases writeProjectedForLocal callerLocals localDecls layouts dLoc rootVal (hd :: tl) retVal with
+              cases writeProjectedForLocal callerLocals decls' layouts dLoc rootVal (hd :: tl) retVal with
               | ub => rfl
               | unsupported => rfl
               | ok rv' => dsimp only; cases set? callerLocals dLoc (.init rv') <;> rfl
@@ -8904,8 +8907,9 @@ theorem writeReturnDestination_pure_eq_withMem
   | cons hd tl =>
     simp only [isPurePlace, List.all_cons, Bool.and_eq_true] at h_pure
     have h_nd := ne_deref_of_isPureProjElem h_pure.1
+    let decls' := eraseLeadingOpaqueCastDecls localDecls layouts loc (hd :: tl)
     refine ⟨invalidateConflictingBorrowsAtProj mem.borrows loc .none
-      (resolveBorrowWriteLocalProj localDecls layouts callerLocals loc (hd :: tl))
+      (resolveBorrowWriteLocalProj decls' layouts callerLocals loc (hd :: tl))
       0 0 (length mem.callStack), ?_⟩
     have h_nr := stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem (tl := tl) h_pure.1
     rw [writeReturnDestination_nonDeref _ _ _ _ _ _ _ _ h_nd h_nr,
@@ -8924,7 +8928,7 @@ theorem writeReturnDestination_pure_eq_withMem
         | none => rfl
         | some rv =>
           dsimp only
-          cases writeProjectedForLocal callerLocals localDecls layouts loc rv (hd :: tl) retVal with
+          cases writeProjectedForLocal callerLocals decls' layouts loc rv (hd :: tl) retVal with
           | ub => rfl
           | unsupported => rfl
           | ok rv' =>
@@ -8932,12 +8936,12 @@ theorem writeReturnDestination_pure_eq_withMem
             cases set? callerLocals loc (.init rv') <;> rfl
       | init rv =>
         dsimp only
-        cases ensureNestedFieldShells rv (hd :: tl) localDecls layouts
-            (placeTy localDecls layouts { local_ := loc, projection := .nil }) with
+        cases ensureNestedFieldShells rv (hd :: tl) decls' layouts
+            (placeTy decls' layouts { local_ := loc, projection := .nil }) with
         | none => rfl
         | some shRv =>
           dsimp only
-          cases writeProjectedForLocal callerLocals localDecls layouts loc
+          cases writeProjectedForLocal callerLocals decls' layouts loc
               shRv (hd :: tl) retVal with
           | ub => rfl
           | unsupported => rfl
@@ -16184,6 +16188,7 @@ private theorem step_stmt_assign
       have h_nr := stripLeadingOpaqueCast_cons_ne_nil_of_isPureProjElem (tl := tl) h_dst.1
       rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr] at h_eval
       rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr]
+      let decls' := eraseLeadingOpaqueCastDecls body.localDecls body.layouts dstLoc (hd :: tl)
       unfold evalAssignNonDeref at h_eval ⊢
       dsimp only at h_eval ⊢
       cases h_g : get? l1 dstLoc with
@@ -16198,7 +16203,7 @@ private theorem step_stmt_assign
           | some rootVal =>
             rw [h_sh] at h_eval
             dsimp only at h_eval ⊢
-            generalize writeProjectedForLocal l1 body.localDecls body.layouts dstLoc rootVal _ val = wpvRes at h_eval ⊢
+            generalize writeProjectedForLocal l1 decls' body.layouts dstLoc rootVal _ val = wpvRes at h_eval ⊢
             cases wpvRes with
             | ub => cases h_eval
             | unsupported => cases h_eval
@@ -16216,14 +16221,14 @@ private theorem step_stmt_assign
         | dead => cases h_eval
         | init rootVal =>
           dsimp only at h_eval ⊢
-          cases h_ens : ensureNestedFieldShells rootVal (hd :: tl) body.localDecls body.layouts
-              (placeTy body.localDecls body.layouts { local_ := dstLoc, projection := .nil }) with
+          cases h_ens : ensureNestedFieldShells rootVal (hd :: tl) decls' body.layouts
+              (placeTy decls' body.layouts { local_ := dstLoc, projection := .nil }) with
           | none => rw [h_ens] at h_eval; cases h_eval
           | some shRoot =>
             rw [h_ens] at h_eval
             dsimp only at h_eval ⊢
             generalize
-              writeProjectedForLocal l1 body.localDecls body.layouts dstLoc shRoot _ val =
+              writeProjectedForLocal l1 decls' body.layouts dstLoc shRoot _ val =
                 wpvRes at h_eval ⊢
             cases wpvRes with
             | ub => cases h_eval
@@ -17824,6 +17829,7 @@ private theorem evalAssignDst_pure_sim
     rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr] at h_wp
     rw [evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr,
       evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr]
+    let decls' := eraseLeadingOpaqueCastDecls ld ly dstLoc (hd :: tl)
     unfold evalAssignNonDeref at h_wp ⊢
     dsimp only at h_wp ⊢
     cases h_g : get? l1 dstLoc with
@@ -17839,7 +17845,7 @@ private theorem evalAssignDst_pure_sim
         | some rootVal =>
           rw [h_sh] at h_wp
           dsimp only at h_wp ⊢
-          cases h_wpv : writeProjectedForLocal l1 ld ly dstLoc rootVal (hd :: tl) val with
+          cases h_wpv : writeProjectedForLocal l1 decls' ly dstLoc rootVal (hd :: tl) val with
           | ub => rw [h_wpv] at h_wp; exact False.elim h_wp
           | unsupported => rw [h_wpv] at h_wp; exact False.elim h_wp
           | ok rootVal' =>
@@ -17852,14 +17858,14 @@ private theorem evalAssignDst_pure_sim
               exact ⟨l2, _, _, rfl, rfl⟩
       | init rootVal =>
         dsimp only at h_wp ⊢
-        cases h_ens : ensureNestedFieldShells rootVal (hd :: tl) ld ly
-            (placeTy ld ly { local_ := dstLoc, projection := .nil }) with
+        cases h_ens : ensureNestedFieldShells rootVal (hd :: tl) decls' ly
+            (placeTy decls' ly { local_ := dstLoc, projection := .nil }) with
         | none => rw [h_ens] at h_wp; exact False.elim h_wp
         | some shRoot =>
           rw [h_ens] at h_wp
           dsimp only at h_wp ⊢
           cases h_wpv :
-              writeProjectedForLocal l1 ld ly dstLoc shRoot (hd :: tl) val with
+              writeProjectedForLocal l1 decls' ly dstLoc shRoot (hd :: tl) val with
           | ub => rw [h_wpv] at h_wp; exact False.elim h_wp
           | unsupported => rw [h_wpv] at h_wp; exact False.elim h_wp
           | ok rootVal' =>

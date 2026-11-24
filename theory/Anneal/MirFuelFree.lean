@@ -6884,22 +6884,23 @@ def evalAssignNonDeref
     (s : MachineState) (dstLoc : Local) (proj : List ProjectionElem)
     (val : Value) (locals₁ : List LocalSlot) (mem₁ : Memory)
     (localDecls : List LocalDecl) (layouts : LayoutTable) : MirStepNode :=
+  let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc proj
   match get? locals₁ dstLoc with
   | .some (.init rootVal) =>
     match
       ensureNestedFieldShells
         rootVal
         proj
-        localDecls
+        decls'
         layouts
-        (placeTy localDecls layouts { local_ := dstLoc, projection := .nil })
+        (placeTy decls' layouts { local_ := dstLoc, projection := .nil })
     with
     | .none => MirStepNode.fail .ub
     | .some shelledRoot =>
       match
         writeProjectedForLocal
           locals₁
-          localDecls
+          decls'
           layouts
           dstLoc
           shelledRoot
@@ -6910,7 +6911,7 @@ def evalAssignNonDeref
         match set? locals₁ dstLoc (.init rootVal') with
         | .some locals₂ =>
           let resolvedLocalProj :=
-            resolveBorrowWriteLocalProj localDecls layouts locals₁ dstLoc proj
+            resolveBorrowWriteLocalProj decls' layouts locals₁ dstLoc proj
           match mem₁.activeProtectors with
           | .nil =>
             let borrows' :=
@@ -6939,13 +6940,13 @@ def evalAssignNonDeref
        | hd :: tl => uninitFieldWriteShell? localDecls layouts dstLoc hd tl
        | .nil => .none) with
     | .some rootVal =>
-      match writeProjectedForLocal locals₁ localDecls layouts dstLoc rootVal proj val with
+      match writeProjectedForLocal locals₁ decls' layouts dstLoc rootVal proj val with
       | .ok rootVal' =>
         match set? locals₁ dstLoc (.init rootVal') with
         | .some locals₂ =>
           let resolvedLocalProj :=
             resolveBorrowWriteLocalProj
-              localDecls
+              decls'
               layouts
               locals₁
               dstLoc
@@ -7646,6 +7647,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
             evalAssignDst_nonDeref _ _ _ _ _ _ _ _ _ h_nd h_nr]
         unfold evalAssignNonDeref
         dsimp only
+        let decls' := eraseLeadingOpaqueCastDecls localDecls layouts dstLoc (hd :: tl)
         cases get? locals₁ dstLoc with
         | none => rw [MirStepNode.withMem_fail]
         | some slot =>
@@ -7656,7 +7658,7 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
             | none => rfl
             | some rootVal =>
               dsimp only
-              cases writeProjectedForLocal locals₁ localDecls layouts dstLoc rootVal _ val with
+              cases writeProjectedForLocal locals₁ decls' layouts dstLoc rootVal _ val with
               | ub => rfl
               | unsupported => rfl
               | ok rootVal' =>
@@ -7676,12 +7678,12 @@ theorem evalStmt_toMachineState_eq_withMem_of_frameFree
           | dead => rfl
           | init rootVal =>
             dsimp only
-            cases ensureNestedFieldShells rootVal (hd :: tl) localDecls layouts
-                (placeTy localDecls layouts { local_ := dstLoc, projection := .nil }) with
+            cases ensureNestedFieldShells rootVal (hd :: tl) decls' layouts
+                (placeTy decls' layouts { local_ := dstLoc, projection := .nil }) with
             | none => rw [MirStepNode.withMem_fail]
             | some shelledRoot =>
               dsimp only
-              cases writeProjectedForLocal locals₁ localDecls layouts dstLoc shelledRoot _ val with
+              cases writeProjectedForLocal locals₁ decls' layouts dstLoc shelledRoot _ val with
               | ub => rfl
               | unsupported => rfl
               | ok rootVal' =>
@@ -11331,8 +11333,9 @@ theorem writeReturnDestination_nonDeref
     (h_nr : stripLeadingOpaqueCast (hd :: tl) ≠ []) :
     writeReturnDestination callerLocals mem ⟨loc, hd :: tl⟩ retVal localDecls layouts =
       let depth := length mem.callStack
+      let decls' := eraseLeadingOpaqueCastDecls localDecls layouts loc (hd :: tl)
       let resolvedLocalProj :=
-        resolveBorrowWriteLocalProj localDecls layouts callerLocals loc (hd :: tl)
+        resolveBorrowWriteLocalProj decls' layouts callerLocals loc (hd :: tl)
       match
         hasProtectedWriteConflict mem.borrows mem.activeProtectors loc .none
           resolvedLocalProj 0 0 depth
@@ -11342,14 +11345,14 @@ theorem writeReturnDestination_nonDeref
         let rootOpt : Option Value :=
           match get? callerLocals loc with
           | .some (.init rootVal) =>
-            ensureNestedFieldShells rootVal (hd :: tl) localDecls layouts
-              (placeTy localDecls layouts { local_ := loc, projection := .nil })
+            ensureNestedFieldShells rootVal (hd :: tl) decls' layouts
+              (placeTy decls' layouts { local_ := loc, projection := .nil })
           | .some .uninit => uninitFieldWriteShell? localDecls layouts loc hd tl
           | _ => .none
         match rootOpt with
         | .none => .ub
         | .some rootVal =>
-          match writeProjectedForLocal callerLocals localDecls layouts loc rootVal (hd :: tl) retVal with
+          match writeProjectedForLocal callerLocals decls' layouts loc rootVal (hd :: tl) retVal with
           | .ok rootVal' =>
             match set? callerLocals loc (.init rootVal') with
             | .some locals' =>

@@ -1797,22 +1797,24 @@ def finishAssignStmtNode
         | .none => MirStepNode.fail .ub
       | .none => MirStepNode.fail .ub
     | proj :: rest, _ =>
+      let decls' :=
+        eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest)
       match get? locals₁ dst.local_ with
       | .some (.init rootVal) =>
         match
           ensureNestedFieldShells
             rootVal
             (proj :: rest)
-            localDecls
+            decls'
             layouts
-            (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
+            (placeTy decls' layouts { local_ := dst.local_, projection := .nil })
         with
         | .none => MirStepNode.fail .ub
         | .some shelledRoot =>
           match
             writeProjectedForLocal
               locals₁
-              localDecls
+              decls'
               layouts
               dst.local_
               shelledRoot
@@ -1824,7 +1826,7 @@ def finishAssignStmtNode
             | .some locals₂ =>
               let resolvedLocalProj :=
                 resolveBorrowWriteLocalProj
-                  localDecls
+                  decls'
                   layouts
                   locals₁
                   dst.local_
@@ -1876,7 +1878,7 @@ def finishAssignStmtNode
           match
             writeProjectedForLocal
               locals₁
-              localDecls
+              decls'
               layouts
               dst.local_
               rootVal
@@ -1888,7 +1890,7 @@ def finishAssignStmtNode
             | .some locals₂ =>
               let resolvedLocalProj :=
                 resolveBorrowWriteLocalProj
-                  localDecls
+                  decls'
                   layouts
                   locals₁
                   dst.local_

@@ -592,10 +592,10 @@ uninitialized local writes into its default field shell
 A destination that is a pure `ProjectionElem.opaqueCast` chain
 (`(_l as OpaqueTy) = call …`, `DIV-TR-OPAQUECAST-ROOT-DISPATCH`) names the whole
 local: it takes the whole-local write (allowed on a live `.uninit` `_l`) after
-validating `retVal` against the cast type `placeTy localDecls layouts dst` when
-`localDecls` is non-empty. A cast chain followed by further projections
-(`(_l as OpaqueTy).f`) takes the projected arm, whose field shell for an
-uninitialized local is keyed on the cast type (`uninitFieldWriteShell?`).
+validating `retVal` against the cast type `placeTyResolved localDecls layouts dst`
+when `localDecls` is non-empty. A cast chain followed by further projections
+(`(_l as OpaqueTy).f`) takes the projected arm with local `dst.local_`
+re-declared at the cast type (`eraseLeadingOpaqueCastDecls`, `uninitFieldWriteShell?`).
 
 Reference (`compiler/rustc_middle/src/mir/syntax.rs` at commit
 `14210df0e27ccd7d9e6a05b8085cbd438e4bbc65`):
@@ -699,7 +699,7 @@ def writeReturnDestination
     let tyValid :=
       match localDecls with
       | .nil => true
-      | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) retVal
+      | _ :: _ => validateValueForTy? layouts (placeTyResolved localDecls layouts dst) retVal
     match tyValid with
     | false => .ub
     | true =>
@@ -727,8 +727,10 @@ def writeReturnDestination
             | .none => .ub
         | .none => .ub
   | proj :: rest, _ =>
+    let decls' :=
+      eraseLeadingOpaqueCastDecls localDecls layouts dst.local_ (proj :: rest)
     let resolvedLocalProj :=
-      resolveBorrowWriteLocalProj localDecls layouts callerLocals dst.local_ (proj :: rest)
+      resolveBorrowWriteLocalProj decls' layouts callerLocals dst.local_ (proj :: rest)
     match
       hasProtectedWriteConflict
         mem.borrows
@@ -748,9 +750,9 @@ def writeReturnDestination
           ensureNestedFieldShells
             rootVal
             (proj :: rest)
-            localDecls
+            decls'
             layouts
-            (placeTy localDecls layouts { local_ := dst.local_, projection := .nil })
+            (placeTy decls' layouts { local_ := dst.local_, projection := .nil })
         | .some .uninit => uninitFieldWriteShell? localDecls layouts dst.local_ proj rest
         | _ => .none
       match rootOpt with
@@ -759,7 +761,7 @@ def writeReturnDestination
         match
           writeProjectedForLocal
             callerLocals
-            localDecls
+            decls'
             layouts
             dst.local_
             rootVal

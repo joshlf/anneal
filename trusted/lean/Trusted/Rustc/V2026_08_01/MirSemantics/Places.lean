@@ -12049,7 +12049,7 @@ A destination that starts with `ProjectionElem.opaqueCast`
 (`DIV-TR-OPAQUECAST-ROOT-DISPATCH`) is dispatched on the projections that remain
 after the leading cast chain (`stripLeadingOpaqueCast`): a pure cast chain
 `(_l as T)` is a write of the whole local (allowed on a live `.uninit` slot,
-validated against the cast type `placeTy localDecls layouts dst` when
+validated against the cast type `placeTyResolved localDecls layouts dst` when
 `localDecls` is non-empty); a cast chain followed by a dereference is not
 modeled (`.unsupported`); and a cast chain followed by any other projection is
 a projected write evaluated with local `dst.local_` re-declared at the cast type
@@ -12247,7 +12247,7 @@ def writePlaceValue
     let tyValid :=
       match localDecls with
       | .nil => true
-      | _ :: _ => validateValueForTy? layouts (placeTy localDecls layouts dst) val
+      | _ :: _ => validateValueForTy? layouts (placeTyResolved localDecls layouts dst) val
     match stripLeadingOpaqueCast restCast with
     | .nil =>
       match tyValid with
