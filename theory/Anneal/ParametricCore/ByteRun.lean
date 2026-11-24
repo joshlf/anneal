@@ -852,6 +852,63 @@ theorem writeRepeatRunsComp_preserves {Prov : Type x} {V : Sort y}
     proj m' = proj m :=
   ByteSubLens.set_preserves hPres hWr
 
+/-- Auxiliary metadata preservation for `writeRepeatedlyComp` (arbitrary
+evaluated payload `bs`, no `[LawfulByteStoreOps]` or layout decomposition
+required). -/
+theorem writeRepeatedlyComp_preserves {V : Sort y} {proj : Mem → V}
+    (hPres : ops.WritePreserves proj) {dstAddr : Addr} {dstOff n : Nat}
+    {bs : List Byte} {m m' : Mem}
+    (hWr : writeRepeatedlyComp dstAddr dstOff n bs m = some m') :
+    proj m' = proj m := by
+  unfold writeRepeatedlyComp at hWr
+  cases hGuard : (Nat.beq n 0 || Nat.beq bs.length 0) with
+  | true => rw [hGuard] at hWr; cases hWr
+  | false =>
+    rw [hGuard] at hWr
+    have hAux :
+        ∀ (j : Nat) (mOut : Mem),
+          @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs)
+            j = some mOut →
+          proj mOut = proj m := by
+      intro j
+      induction j with
+      | zero =>
+        intro mOut hEq
+        have hM : m = mOut := Option.some.inj hEq
+        rw [← hM]
+      | succ k ih =>
+        intro mOut hStep
+        change (match @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+          | none => none
+          | some mCur =>
+            ({ addr := dstAddr, offset := dstOff + k * bs.length,
+               len := bs.length } : ByteSubLens Addr).set mCur bs) =
+          some mOut at hStep
+        cases hPrev : @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+        | none => rw [hPrev] at hStep; cases hStep
+        | some mK =>
+          rw [hPrev] at hStep
+          exact (ByteSubLens.set_preserves hPres hStep).trans (ih mK hPrev)
+    exact hAux n m' hWr
+
 /-- Fail-closed: `copyRepeatedlyComp` returns `none` when `n = 0`. -/
 theorem copyRepeatedlyComp_none_of_zero_n (src : ByteSubLens Addr)
     (dstAddr : Addr) (dstOff : Nat) (m : Mem) :
@@ -1548,15 +1605,178 @@ theorem copyRepeatedlyComp_frame_disjoint {src : ByteSubLens Addr}
           exact hEqK.trans (ih (Nat.le_trans (Nat.le_succ k) hK1Le) mK hPrev)
     exact hAux n (Nat.le_refl n) m' hRep
 
+/-- Full MIR `Rvalue::Repeat` soundness theorem for `writeRepeatedlyComp`
+(fixed evaluated payload `flattenByteRuns codec runs`, **no** source-target
+disjointness side condition): witnesses `mFinal` with exact agreement between
+`writeRepeatedlyComp` and `writeRepeatRunsComp`, full-window readback,
+per-element `i < n` stride readback, per-run `focus` projection, and
+disjoint-lens framing. -/
+theorem writeRepeatedlyComp_sound {Prov : Type x}
+    (codec : ByteRunCodec Prov Byte)
+    {dstAddr : Addr} {dstOff n : Nat} {m : Mem} {oldWin : List Byte}
+    (runs : List (ByteRun Prov))
+    (hNPos : 0 < n) (hElemPos : 0 < runsByteLen runs)
+    (hWinGet :
+      ({ addr := dstAddr, offset := dstOff,
+         len := n * runsByteLen runs } : ByteSubLens Addr).get m = some oldWin) :
+    let dstWin : ByteSubLens Addr :=
+      { addr := dstAddr, offset := dstOff, len := n * runsByteLen runs }
+    ∃ mFinal : Mem,
+      writeRepeatedlyComp dstAddr dstOff n (flattenByteRuns codec runs) m =
+        some mFinal ∧
+      writeRepeatRunsComp codec dstAddr dstOff n runs m = some mFinal ∧
+      dstWin.get mFinal = some (flattenByteRuns codec (repeatByteRuns n runs)) ∧
+      (∀ i : Nat, i < n →
+        (dstWin.zoom (i * runsByteLen runs) (runsByteLen runs)).get mFinal =
+          some (flattenByteRuns codec runs)) ∧
+      (∀ (i : Nat) (pre post : List (ByteRun Prov)) (focus : ByteRun Prov),
+        i < n →
+        runs = pre ++ (focus :: post) →
+        0 < focus.byteLen →
+        (dstWin.zoom (i * runsByteLen runs + runsByteLen pre) focus.byteLen).get
+            mFinal = some (focus.toBytes codec)) ∧
+      (∀ other : ByteSubLens Addr,
+        ByteSubLens.Disjoint Mem dstWin other →
+        other.get mFinal = other.get m) := by
+  let dstWin : ByteSubLens Addr :=
+    { addr := dstAddr, offset := dstOff, len := n * runsByteLen runs }
+  let payload := flattenByteRuns codec (repeatByteRuns n runs)
+  have hPayLen : payload.length = dstWin.len :=
+    flattenByteRuns_repeat_length codec n runs
+  let ⟨mFinal, hWrite⟩ := ByteSubLens.set_isSome_of_get payload hWinGet hPayLen
+  have hFused :
+      writeRepeatedlyComp dstAddr dstOff n (flattenByteRuns codec runs) m =
+        writeRepeatRunsComp codec dstAddr dstOff n runs m :=
+    writeRepeatedlyComp_eq_writeRepeatRunsComp codec runs hNPos hElemPos hWinGet
+  have hWrEq :
+      writeRepeatedlyComp dstAddr dstOff n (flattenByteRuns codec runs) m =
+        some mFinal :=
+    hFused.trans hWrite
+  have hGetFinal : dstWin.get mFinal = some payload :=
+    ByteSubLens.get_set hWrite
+  refine ⟨mFinal, hWrEq, hWrite, hGetFinal, ?_, ?_, ?_⟩
+  · intro i hLt
+    have hSub : i * runsByteLen runs + runsByteLen runs ≤ dstWin.len := by
+      change i * runsByteLen runs + runsByteLen runs ≤ n * runsByteLen runs
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right (runsByteLen runs) hLt
+    rw [ByteSubLens.zoom_get hGetFinal hElemPos hSub]
+    exact congrArg some (flattenByteRuns_repeat_project_elem codec n i runs hLt)
+  · intro i pre post focus hLt hSplit hFocusPos
+    have hSubElem : i * runsByteLen runs + runsByteLen runs ≤ dstWin.len := by
+      change i * runsByteLen runs + runsByteLen runs ≤ n * runsByteLen runs
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right (runsByteLen runs) hLt
+    have hElemGet :
+        (dstWin.zoom (i * runsByteLen runs) (runsByteLen runs)).get mFinal =
+          some (flattenByteRuns codec runs) := by
+      rw [ByteSubLens.zoom_get hGetFinal hElemPos hSubElem]
+      exact congrArg some (flattenByteRuns_repeat_project_elem codec n i runs hLt)
+    have hSubRun : runsByteLen pre + focus.byteLen ≤ runsByteLen runs := by
+      rw [hSplit, runsByteLen_append]
+      change runsByteLen pre + focus.byteLen ≤
+        runsByteLen pre + (focus.byteLen + runsByteLen post)
+      rw [← Nat.add_assoc]
+      exact Nat.le_add_right _ _
+    have hZoomEq :=
+      ByteSubLens.zoom_zoom dstWin (i * runsByteLen runs) (runsByteLen runs)
+        (runsByteLen pre) focus.byteLen
+    rw [← hZoomEq, ByteSubLens.zoom_get hElemGet hFocusPos hSubRun, hSplit,
+      projectRunAtSplit codec pre focus post]
+  · intro other hDisjOther
+    exact ByteSubLens.get_set_disjoint hDisjOther hWrite
+
+/-- Disjoint-lens framing for `writeRepeatedlyComp` directly (for any payload
+`bs`, without requiring a `ByteRun` layout). -/
+theorem writeRepeatedlyComp_frame_disjoint {dstAddr : Addr} {dstOff n : Nat}
+    {bs : List Byte} {m m' : Mem} {other : ByteSubLens Addr}
+    (hDisj : ByteSubLens.Disjoint Mem
+      ({ addr := dstAddr, offset := dstOff, len := n * bs.length } :
+        ByteSubLens Addr) other)
+    (hWr : writeRepeatedlyComp dstAddr dstOff n bs m = some m') :
+    other.get m' = other.get m := by
+  unfold writeRepeatedlyComp at hWr
+  cases hGuard : (Nat.beq n 0 || Nat.beq bs.length 0) with
+  | true => rw [hGuard] at hWr; cases hWr
+  | false =>
+    rw [hGuard] at hWr
+    have hAux :
+        ∀ (j : Nat), j ≤ n → ∀ mOut,
+          @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs)
+            j = some mOut →
+          other.get mOut = other.get m := by
+      intro j
+      induction j with
+      | zero =>
+        intro _ mOut hEq
+        have hM : m = mOut := Option.some.inj hEq
+        rw [← hM]
+      | succ k ih =>
+        intro hK1Le mOut hStep
+        change (match @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+          | none => none
+          | some mCur =>
+            ({ addr := dstAddr, offset := dstOff + k * bs.length,
+               len := bs.length } : ByteSubLens Addr).set mCur bs) =
+          some mOut at hStep
+        cases hPrev : @Nat.rec (fun _ => Option Mem) (some m)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+        | none => rw [hPrev] at hStep; cases hStep
+        | some mK =>
+          rw [hPrev] at hStep
+          have hSubContained :
+              ({ addr := dstAddr, offset := dstOff + k * bs.length,
+                 len := bs.length } : ByteSubLens Addr).ContainedIn
+                { addr := dstAddr, offset := dstOff, len := n * bs.length } := by
+            refine ⟨rfl, Nat.le_add_right dstOff (k * bs.length), ?_⟩
+            change dstOff + k * bs.length + bs.length ≤ dstOff + n * bs.length
+            rw [Nat.add_assoc]
+            refine Nat.add_le_add_left ?_ dstOff
+            rw [← Nat.succ_mul]
+            exact Nat.mul_le_mul_right bs.length hK1Le
+          have hDisjK :
+              ByteSubLens.Disjoint Mem
+                { addr := dstAddr, offset := dstOff + k * bs.length,
+                  len := bs.length } other :=
+            ByteSubLens.disjoint_of_contained_disjoint hSubContained
+              (ByteSubLens.containedIn_refl other) hDisj
+          have hEqK : other.get mOut = other.get mK :=
+            ByteSubLens.get_set_disjoint hDisjK hStep
+          exact hEqK.trans (ih (Nat.le_trans (Nat.le_succ k) hK1Le) mK hPrev)
+    exact hAux n (Nat.le_refl n) m' hWr
+
 end CopyAlgebra
 
 /-! ## Part IV: Zero-`Prop`-Argument `@[irreducible] ByteRunCopyCut` -/
 
 /-- Pure-data descriptor of an untyped byte-run copy operation (`0` `Prop`
-fields). -/
+fields):
+- `.copyRange`: overlap-tolerant single-range copy (`copyRangeComp`);
+- `.copyRepeat`: sequential re-read-per-element repeat (`copyRepeatedlyComp`);
+- `.copyOperandRepeat`: MIR `Rvalue::Repeat` — read `src` once, then store the
+  fixed payload `n` times via `writeRepeatedlyComp` (overlap-tolerant). -/
 inductive ByteRunCopyOp (Addr : Type v) : Type v where
   | copyRange (src dst : ByteSubLens Addr) : ByteRunCopyOp Addr
   | copyRepeat (src : ByteSubLens Addr) (dstAddr : Addr) (dstOff n : Nat) :
+      ByteRunCopyOp Addr
+  | copyOperandRepeat (src : ByteSubLens Addr) (dstAddr : Addr) (dstOff n : Nat) :
       ByteRunCopyOp Addr
 
 namespace ByteRunCopyOp
@@ -1567,6 +1787,8 @@ def dstLens {Addr : Type v} (op : ByteRunCopyOp Addr) : ByteSubLens Addr :=
   | .copyRange _ dst => dst
   | .copyRepeat src dstAddr dstOff n =>
     { addr := dstAddr, offset := dstOff, len := n * src.len }
+  | .copyOperandRepeat src dstAddr dstOff n =>
+    { addr := dstAddr, offset := dstOff, len := n * src.len }
 
 /-- Executes a single `ByteRunCopyOp` on memory `m`. -/
 def exec {Mem : Type u} {Addr : Type v} {Byte : Type w}
@@ -1575,6 +1797,10 @@ def exec {Mem : Type u} {Addr : Type v} {Byte : Type w}
   match op with
   | .copyRange src dst => copyRangeComp src dst m
   | .copyRepeat src dstAddr dstOff n => copyRepeatedlyComp src dstAddr dstOff n m
+  | .copyOperandRepeat src dstAddr dstOff n =>
+    match src.get m with
+    | none => none
+    | some bs => writeRepeatedlyComp dstAddr dstOff n bs m
 
 /-- Frame law for a single `ByteRunCopyOp`. -/
 theorem exec_frame_disjoint {Mem : Type u} {Addr : Type v} {Byte : Type w}
@@ -1589,6 +1815,19 @@ theorem exec_frame_disjoint {Mem : Type u} {Addr : Type v} {Byte : Type w}
     exact ByteSubLens.get_set_disjoint hDisj hSet
   | copyRepeat src dstAddr dstOff n =>
     exact copyRepeatedlyComp_frame_disjoint hDisj hExec
+  | copyOperandRepeat src dstAddr dstOff n =>
+    dsimp only [exec, dstLens] at hExec hDisj
+    cases hGet : src.get m with
+    | none => rw [hGet] at hExec; cases hExec
+    | some bs =>
+      rw [hGet] at hExec
+      have hLen : bs.length = src.len := ByteSubLens.get_len hGet
+      have hDisj' :
+          ByteSubLens.Disjoint Mem
+            ({ addr := dstAddr, offset := dstOff, len := n * bs.length } :
+              ByteSubLens Addr) other := by
+        rw [hLen]; exact hDisj
+      exact writeRepeatedlyComp_frame_disjoint hDisj' hExec
 
 /-- Auxiliary metadata preservation for a single `ByteRunCopyOp`. -/
 theorem exec_preserves {Mem : Type u} {Addr : Type v} {Byte : Type w}
@@ -1601,6 +1840,13 @@ theorem exec_preserves {Mem : Type u} {Addr : Type v} {Byte : Type w}
   cases op with
   | copyRange _ _ => exact copyRangeComp_preserves hPres hExec
   | copyRepeat _ _ _ _ => exact copyRepeatedlyComp_preserves hPres hExec
+  | copyOperandRepeat src dstAddr dstOff n =>
+    dsimp only [exec] at hExec
+    cases hGet : src.get m with
+    | none => rw [hGet] at hExec; cases hExec
+    | some bs =>
+      rw [hGet] at hExec
+      exact writeRepeatedlyComp_preserves hPres hExec
 
 end ByteRunCopyOp
 
@@ -1797,6 +2043,28 @@ theorem ByteRunCopyCut.singleRepeat {step : S → StepOutcome S Out Fault}
   refine ⟨hStage, ?_⟩
   rw [execByteRunCopyOps_cons]
   change (match copyRepeatedlyComp src dstAddr dstOff n (memOf s₀) with
+    | none => none
+    | some m₁ => some m₁) = some (memOf s₁)
+  rw [hRep]
+
+/-- Seals a single `Rvalue::Repeat` (`.copyOperandRepeat`) transition into
+`ByteRunCopyCut`. -/
+theorem ByteRunCopyCut.singleOperandRepeat {step : S → StepOutcome S Out Fault}
+    {memOf : S → Mem} {src : ByteSubLens Addr} {dstAddr : Addr}
+    {dstOff n fuel : Nat} {s₀ s₁ : S}
+    (hStage : StepStageCut step fuel s₀ s₁)
+    (hRep :
+      (match src.get (memOf s₀) with
+        | none => none
+        | some bs => writeRepeatedlyComp dstAddr dstOff n bs (memOf s₀)) =
+      some (memOf s₁)) :
+    ByteRunCopyCut step memOf [.copyOperandRepeat src dstAddr dstOff n] fuel
+      s₀ s₁ := by
+  refine ⟨hStage, ?_⟩
+  rw [execByteRunCopyOps_cons]
+  change (match (match src.get (memOf s₀) with
+      | none => none
+      | some bs => writeRepeatedlyComp dstAddr dstOff n bs (memOf s₀)) with
     | none => none
     | some m₁ => some m₁) = some (memOf s₁)
   rw [hRep]
@@ -2455,5 +2723,57 @@ theorem canary_byterun_payload_repeat_overlap_fuses :
   · intro hEq
     have hEq' : some mRep = some mFused := hRep.symm.trans (hEq.trans hFused)
     exact hNe (Option.some.inj hEq')
+
+/-- End-to-end `ByteRunCopyCut` canary for `.copyOperandRepeat` (`Rvalue::Repeat`)
+under source-target overlap: seals a single `.copyOperandRepeat` transition
+reading `src = [0..4)` once and writing `[2..10)` twice, proves exact fused
+readback via `writeRepeatedlyComp_sound` and disjoint framing of `[10..12)` via
+`ByteRunCopyCut.frame_disjoint`. -/
+theorem canary_byterun_copyOperandRepeat_cut :
+    let elemRuns : List (ByteRun PEmpty.{1}) := [.initPlain [0x11, 0x22, 0x33, 0x44]]
+    let c := ByteRunCodec.optionUInt8
+    let m0 : SliceStore (Option UInt8) :=
+      { allocs := [{ allocId := 1,
+                     bytes := [some 0x11, some 0x22, some 0x33, some 0x44,
+                               none, none, none, none, none, none,
+                               some 0xFE, some 0xFF],
+                     writable := true }] }
+    let src : ByteSubLens Nat := { addr := 1, offset := 0, len := 4 }
+    let dstWin : ByteSubLens Nat := { addr := 1, offset := 2, len := 8 }
+    let tail : ByteSubLens Nat := { addr := 1, offset := 10, len := 2 }
+    let op : ByteRunCopyOp Nat := .copyOperandRepeat src 1 2 2
+    let step : Nat × SliceStore (Option UInt8) →
+        StepOutcome (Nat × SliceStore (Option UInt8)) Unit Unit :=
+      fun s =>
+        match s.1 with
+        | 0 =>
+          match op.exec s.2 with
+          | some m' => .step (1, m')
+          | none => .fault ()
+        | _ => .done ()
+    ∃ m1 : SliceStore (Option UInt8),
+      ByteRunCopyCut step Prod.snd [op] 1 (0, m0) (1, m1) ∧
+      dstWin.get m1 = some (flattenByteRuns c (repeatByteRuns 2 elemRuns)) ∧
+      tail.get m1 = tail.get m0 := by
+  intro elemRuns c m0 src dstWin tail op step
+  let ⟨m1, hWr, _, hGetWin, _, _, _⟩ :=
+    writeRepeatedlyComp_sound c (dstAddr := 1) (dstOff := 2) (n := 2) (m := m0)
+      (oldWin := [some 0x33, some 0x44, none, none, none, none, none, none])
+      elemRuns (Nat.zero_lt_succ 1) (Nat.zero_lt_succ 3) rfl
+  have hOpExec : op.exec m0 = some m1 := hWr
+  have hStep0 : step (0, m0) = .step (1, m1) := by
+    change (match op.exec m0 with
+        | some m' => StepOutcome.step (1, m')
+        | none => StepOutcome.fault ()) =
+      StepOutcome.step (1, m1)
+    rw [hOpExec]
+  have hCut : ByteRunCopyCut step Prod.snd [op] 1 (0, m0) (1, m1) :=
+    ByteRunCopyCut.singleOperandRepeat (StepStageCut.single hStep0) hOpExec
+  have hDisj :
+      AllCopyOpsDisjoint (SliceStore (Option UInt8)) tail [op] :=
+    ⟨ByteSubLens.disjoint_of_separated
+        (ByteSubLens.separated_of_natLensSeparatedBool rfl),
+     True.intro⟩
+  exact ⟨m1, hCut, hGetWin, ByteRunCopyCut.frame_disjoint hDisj hCut⟩
 
 end Anneal.ParametricCore

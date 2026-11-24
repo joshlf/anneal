@@ -1437,12 +1437,132 @@ theorem UpdatesOnly.of_copyRepeatedlyComp [LawfulByteStoreOps Mem Addr Byte]
           exact ⟨hUpdK.trans hUpdStep, _, hGetOut⟩
     exact (hRec n m₁ (Nat.le_refl n) hRep).1
 
+/-- Bridge from `ByteRun.writeRepeatedlyComp` (MIR `Rvalue::Repeat`) into
+`UpdatesOnly` with **no** source-target disjointness side condition: whenever
+`dstWin = { addr := dstAddr, offset := dstOff, len := n * bs.length }` lies in
+`allowed` and is readable in `m₀`, every successful `writeRepeatedlyComp`
+execution satisfies `UpdatesOnly allowed m₀ m₁`. -/
+theorem UpdatesOnly.of_writeRepeatedlyComp [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {dstAddr : Addr} {dstOff n : Nat}
+    {bs : List Byte} {m₀ m₁ : Mem} {oldWin : List Byte}
+    (hIn : ({ addr := dstAddr, offset := dstOff,
+              len := n * bs.length } : ByteSubLens Addr) ∈ allowed)
+    (hWinGet : ({ addr := dstAddr, offset := dstOff,
+                  len := n * bs.length } : ByteSubLens Addr).get m₀ = some oldWin)
+    (hWr : writeRepeatedlyComp dstAddr dstOff n bs m₀ = some m₁) :
+    UpdatesOnly allowed m₀ m₁ := by
+  let dstWin : ByteSubLens Addr :=
+    { addr := dstAddr, offset := dstOff, len := n * bs.length }
+  unfold writeRepeatedlyComp at hWr
+  cases hGuard : (Nat.beq n 0 || Nat.beq bs.length 0) with
+  | true => rw [hGuard] at hWr; cases hWr
+  | false =>
+    rw [hGuard] at hWr
+    have hRec :
+        ∀ (j : Nat) (mOut : Mem), j ≤ n →
+          @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) j =
+            some mOut →
+          UpdatesOnly allowed m₀ mOut ∧ ∃ curWin, dstWin.get mOut = some curWin := by
+      intro j
+      induction j with
+      | zero =>
+        intro mOut _ hEq
+        have hM : m₀ = mOut := Option.some.inj hEq
+        rw [← hM]
+        exact ⟨.refl m₀, oldWin, hWinGet⟩
+      | succ k ih =>
+        intro mOut hK1Le hStep
+        change (match @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+          | none => none
+          | some mCur =>
+            ({ addr := dstAddr, offset := dstOff + k * bs.length,
+               len := bs.length } : ByteSubLens Addr).set mCur bs) =
+          some mOut at hStep
+        cases hPrev : @Nat.rec (fun _ => Option Mem) (some m₀)
+            (fun i acc =>
+              match acc with
+              | none => none
+              | some mCur =>
+                ({ addr := dstAddr, offset := dstOff + i * bs.length,
+                   len := bs.length } : ByteSubLens Addr).set mCur bs) k with
+        | none => rw [hPrev] at hStep; cases hStep
+        | some mK =>
+          rw [hPrev] at hStep
+          let ⟨hUpdK, curWin, hGetK⟩ := ih mK (Nat.le_trans (Nat.le_succ k) hK1Le) hPrev
+          let elemLens : ByteSubLens Addr :=
+            { addr := dstAddr, offset := dstOff + k * bs.length, len := bs.length }
+          have hSubBound : k * bs.length + bs.length ≤ n * bs.length := by
+            rw [← Nat.succ_mul]
+            exact Nat.mul_le_mul_right bs.length hK1Le
+          have hElemZoom : dstWin.zoom (k * bs.length) bs.length = elemLens := rfl
+          have hCont : elemLens.ContainedIn dstWin := by
+            rw [← hElemZoom]
+            exact ByteSubLens.zoom_containedIn dstWin hSubBound
+          have hUpdStep : UpdatesOnly allowed mK mOut :=
+            UpdatesOnly.of_contained_set hIn hCont hGetK hStep
+          have hGetOut : dstWin.get mOut =
+              some (listSplice curWin (k * bs.length) bs) :=
+            ByteSubLens.get_zoom_set hGetK hSubBound hStep
+          exact ⟨hUpdK.trans hUpdStep, _, hGetOut⟩
+    exact (hRec n m₁ (Nat.le_refl n) hWr).1
+
+/-- Single-operation bridge from any `ByteRunCopyOp` (`.copyRange`,
+`.copyRepeat`, or `.copyOperandRepeat`) into `UpdatesOnly` whenever `op.dstLens
+∈ allowed` and `op.dstLens` is readable in `m₀`. -/
+theorem UpdatesOnly.of_byteRunCopyOp [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {op : ByteRunCopyOp Addr}
+    {m₀ m₁ : Mem} {oldWin : List Byte}
+    (hIn : op.dstLens ∈ allowed)
+    (hWinGet : op.dstLens.get m₀ = some oldWin)
+    (hExec : op.exec m₀ = some m₁) :
+    UpdatesOnly allowed m₀ m₁ := by
+  cases op with
+  | copyRange src dst =>
+    exact UpdatesOnly.of_copyRangeComp hIn hExec
+  | copyRepeat src dstAddr dstOff n =>
+    exact UpdatesOnly.of_copyRepeatedlyComp hIn hWinGet hExec
+  | copyOperandRepeat src dstAddr dstOff n =>
+    dsimp only [ByteRunCopyOp.exec, ByteRunCopyOp.dstLens] at hExec hIn hWinGet
+    cases hGet : src.get m₀ with
+    | none => rw [hGet] at hExec; cases hExec
+    | some bs =>
+      rw [hGet] at hExec
+      have hLen : bs.length = src.len := ByteSubLens.get_len hGet
+      have hIn' :
+          ({ addr := dstAddr, offset := dstOff,
+             len := n * bs.length } : ByteSubLens Addr) ∈ allowed := by
+        rw [hLen]; exact hIn
+      have hWinGet' :
+          ({ addr := dstAddr, offset := dstOff,
+             len := n * bs.length } : ByteSubLens Addr).get m₀ = some oldWin := by
+        rw [hLen]; exact hWinGet
+      exact UpdatesOnly.of_writeRepeatedlyComp hIn' hWinGet' hExec
+
 /-- Predicate that a `ByteRunCopyOp` pipeline consists solely of `.copyRange`
 operations whose target lenses lie in `allowed`. -/
 def CopyOpsTargetsIn (allowed : List (ByteSubLens Addr))
     (copyOps : List (ByteRunCopyOp Addr)) : Prop :=
   ∀ op : ByteRunCopyOp Addr, op ∈ copyOps →
     ∃ src dst : ByteSubLens Addr, op = .copyRange src dst ∧ dst ∈ allowed
+
+/-- General footprint predicate for ANY mixed `ByteRunCopyOp` pipeline
+(`.copyRange`, `.copyRepeat`, `.copyOperandRepeat`): every op's destination
+window `op.dstLens` lies in `allowed`. -/
+def CopyOpsDstIn (allowed : List (ByteSubLens Addr))
+    (copyOps : List (ByteRunCopyOp Addr)) : Prop :=
+  ∀ op : ByteRunCopyOp Addr, op ∈ copyOps → op.dstLens ∈ allowed
 
 /-- Bridge from `execByteRunCopyOps` into `UpdatesOnly` for `.copyRange`
 pipelines. -/
@@ -1469,8 +1589,48 @@ theorem UpdatesOnly.of_execByteRunCopyOps_ranges
       exact (UpdatesOnly.of_copyRangeComp hIn hStep).trans
         (ih (fun op' hM => hTargets op' (List.Mem.tail op hM)) hExec)
 
+/-- General bridge from `execByteRunCopyOps` into `UpdatesOnly` covering ALL
+three `ByteRunCopyOp` constructors (`.copyRange`, `.copyRepeat`,
+`.copyOperandRepeat`): if every `op.dstLens ∈ allowed`, every `L ∈ allowed` is
+initially readable in `m₀`, and `allowed` is pairwise compatible (disjoint or
+nested), then `lens_valid_after_updatesOnly` preserves readability across every
+step and the full pipeline satisfies `UpdatesOnly allowed m₀ m₁`. -/
+theorem UpdatesOnly.of_execByteRunCopyOps [LawfulByteStoreOps Mem Addr Byte]
+    {allowed : List (ByteSubLens Addr)} {copyOps : List (ByteRunCopyOp Addr)}
+    {m₀ m₁ : Mem}
+    (hDstIn : CopyOpsDstIn allowed copyOps)
+    (hReadable : ∀ L : ByteSubLens Addr, L ∈ allowed → ∃ bs : List Byte, L.get m₀ = some bs)
+    (hCompat : ∀ L₁ L₂ : ByteSubLens Addr, L₁ ∈ allowed → L₂ ∈ allowed →
+      ByteSubLens.Disjoint Mem L₁ L₂ ∨ L₁.ContainedIn L₂ ∨ L₂.ContainedIn L₁)
+    (hExec : execByteRunCopyOps copyOps m₀ = some m₁) :
+    UpdatesOnly allowed m₀ m₁ := by
+  induction copyOps generalizing m₀ with
+  | nil =>
+    have hEq : m₀ = m₁ := Option.some.inj hExec
+    rw [← hEq]
+    exact .refl m₀
+  | cons op rest ih =>
+    rw [execByteRunCopyOps_cons] at hExec
+    have hIn : op.dstLens ∈ allowed := hDstIn op (List.Mem.head rest)
+    let ⟨oldWin, hWinGet⟩ := hReadable op.dstLens hIn
+    cases hStep : op.exec m₀ with
+    | none => rw [hStep] at hExec; cases hExec
+    | some mMid =>
+      rw [hStep] at hExec
+      have hUpdStep : UpdatesOnly allowed m₀ mMid :=
+        UpdatesOnly.of_byteRunCopyOp hIn hWinGet hStep
+      have hReadableMid :
+          ∀ L : ByteSubLens Addr, L ∈ allowed → ∃ bs : List Byte, L.get mMid = some bs := by
+        intro L hLIn
+        let ⟨oldL, hGetL⟩ := hReadable L hLIn
+        let ⟨bsMid, hGetMid, _, _⟩ :=
+          lens_valid_after_updatesOnly hGetL (fun L' hL'In => hCompat L' L hL'In hLIn) hUpdStep
+        exact ⟨bsMid, hGetMid⟩
+      exact hUpdStep.trans
+        (ih (fun op' hM => hDstIn op' (List.Mem.tail op hM)) hReadableMid hExec)
+
 /-- Bridge from a sealed `ByteRunCopyCut` directly into `UpdatesOnly` (Episode 2
-hook connecting `ByteRun` copy stages to `CallSpecCut`'s modification footprint).
+hook connecting `.copyRange` stages to `CallSpecCut`'s modification footprint).
 -/
 theorem ByteRunCopyCut.to_updatesOnly_ranges {S : Type x} {Out : Type y}
     {Fault : Type z} {step : S → StepOutcome S Out Fault} {memOf : S → Mem}
@@ -1480,6 +1640,24 @@ theorem ByteRunCopyCut.to_updatesOnly_ranges {S : Type x} {Out : Type y}
     (hCut : ByteRunCopyCut step memOf copyOps fuel s₀ s₁) :
     UpdatesOnly allowed (memOf s₀) (memOf s₁) :=
   UpdatesOnly.of_execByteRunCopyOps_ranges hTargets (ByteRunCopyCut.exec_eq hCut)
+
+/-- General bridge from ANY sealed `ByteRunCopyCut` (mixing `.copyRange`,
+`.copyRepeat`, and `.copyOperandRepeat` / `Rvalue::Repeat`) directly into
+`UpdatesOnly allowed (memOf s₀) (memOf s₁)`. -/
+theorem ByteRunCopyCut.to_updatesOnly [LawfulByteStoreOps Mem Addr Byte]
+    {S : Type x} {Out : Type y} {Fault : Type z}
+    {step : S → StepOutcome S Out Fault} {memOf : S → Mem}
+    {allowed : List (ByteSubLens Addr)} {copyOps : List (ByteRunCopyOp Addr)}
+    {fuel : Nat} {s₀ s₁ : S}
+    (hCut : ByteRunCopyCut step memOf copyOps fuel s₀ s₁)
+    (hDstIn : CopyOpsDstIn allowed copyOps)
+    (hReadable : ∀ L : ByteSubLens Addr, L ∈ allowed →
+      ∃ bs : List Byte, L.get (memOf s₀) = some bs)
+    (hCompat : ∀ L₁ L₂ : ByteSubLens Addr, L₁ ∈ allowed → L₂ ∈ allowed →
+      ByteSubLens.Disjoint Mem L₁ L₂ ∨ L₁.ContainedIn L₂ ∨ L₂.ContainedIn L₁) :
+    UpdatesOnly allowed (memOf s₀) (memOf s₁) :=
+  UpdatesOnly.of_execByteRunCopyOps hDstIn hReadable hCompat
+    (ByteRunCopyCut.exec_eq hCut)
 
 /-- Bridge from Part I (`evalRefFrameExit`) into Part II (`UpdatesOnly`): every
 non-faulting outcome of `evalRefFrameExit rf mem exit` yields a post-memory
@@ -2075,6 +2253,139 @@ theorem evalUnwindStack_preserves_mem {FrameCtx : Type z} {Mem : Type u}
           | abortTerminate _ _ => exact id
           | fault => exact id
 
+/-- Full operational soundness of `evalUnwindStack` (strengthening
+`evalUnwindStack_preserves_mem` with `ContinueChainReleases` and protector-tag
+stripping across ALL THREE non-faulting outcomes):
+- `.landed st`: preserves `m`, splits `frames = pre ++ saved :: st.callers`,
+  certifies `ContinueChainReleases pre t st.tree`, validates `saved.isCleanupBb
+  st.blockIdx = true`, preserves absent tags, and strips every tag owned by any
+  frame in `pre`;
+- `.rootUnwind m' t'`: preserves `m`, certifies `ContinueChainReleases frames t
+  t'`, preserves absent tags, and strips every tag owned by any frame in
+  `frames`;
+- `.abortTerminate m' t'`: preserves `m`, splits `frames = pre ++ saved :: rest`
+  at a `.terminate` frame, certifies `ContinueChainReleases pre t t'`, preserves
+  absent tags, and strips every tag owned by any frame in `pre`. -/
+theorem evalUnwindStack_sound {FrameCtx : Type z} {Mem : Type u}
+    {Addr : Type v} (frames : List (SavedCallFrame FrameCtx Addr)) (m : Mem)
+    (t : Anneal.RefFrame.RangedBorrowTree) :
+    match evalUnwindStack frames m t with
+    | .landed st =>
+      st.mem = m ∧
+      ∃ (pre : List (SavedCallFrame FrameCtx Addr))
+        (saved : SavedCallFrame FrameCtx Addr),
+        frames = pre ++ saved :: st.callers ∧
+        ContinueChainReleases pre t st.tree ∧
+        saved.cont.onUnwind = .cleanup st.blockIdx ∧
+        saved.isCleanupBb st.blockIdx = true ∧
+        saved.ctx = st.ctx ∧
+        (∀ tag : Nat,
+          Anneal.RefFrame.natListMem tag t.protectedTags = false →
+          Anneal.RefFrame.natListMem tag st.tree.protectedTags = false) ∧
+        (∀ (tag : Nat) (fr : SavedCallFrame FrameCtx Addr),
+          fr ∈ pre → Anneal.RefFrame.natListMem tag fr.callerTags = true →
+          Anneal.RefFrame.natListMem tag st.tree.protectedTags = false)
+    | .rootUnwind m' t' =>
+      m' = m ∧
+      ContinueChainReleases frames t t' ∧
+      (∀ tag : Nat,
+        Anneal.RefFrame.natListMem tag t.protectedTags = false →
+        Anneal.RefFrame.natListMem tag t'.protectedTags = false) ∧
+      (∀ (tag : Nat) (fr : SavedCallFrame FrameCtx Addr),
+        fr ∈ frames → Anneal.RefFrame.natListMem tag fr.callerTags = true →
+        Anneal.RefFrame.natListMem tag t'.protectedTags = false)
+    | .abortTerminate m' t' =>
+      m' = m ∧
+      ∃ (pre : List (SavedCallFrame FrameCtx Addr))
+        (saved : SavedCallFrame FrameCtx Addr)
+        (rest : List (SavedCallFrame FrameCtx Addr)),
+        frames = pre ++ saved :: rest ∧
+        ContinueChainReleases pre t t' ∧
+        saved.cont.onUnwind = .terminate ∧
+        (∀ tag : Nat,
+          Anneal.RefFrame.natListMem tag t.protectedTags = false →
+          Anneal.RefFrame.natListMem tag t'.protectedTags = false) ∧
+        (∀ (tag : Nat) (fr : SavedCallFrame FrameCtx Addr),
+          fr ∈ pre → Anneal.RefFrame.natListMem tag fr.callerTags = true →
+          Anneal.RefFrame.natListMem tag t'.protectedTags = false)
+    | .fault => True := by
+  induction frames generalizing t with
+  | nil =>
+    exact ⟨rfl, rfl, fun _ h => h, fun _ _ hIn _ => False.elim (by cases hIn)⟩
+  | cons saved rest ih =>
+    cases hU : saved.cont.onUnwind with
+    | unreachable =>
+      dsimp only [evalUnwindStack]; rw [hU]; exact True.intro
+    | terminate =>
+      dsimp only [evalUnwindStack]; rw [hU]
+      exact ⟨rfl, [], saved, rest, rfl, rfl, hU,
+        fun _ h => h, fun _ _ hIn _ => False.elim (by cases hIn)⟩
+    | cleanup cleanupBb =>
+      dsimp only [evalUnwindStack]; rw [hU]; dsimp only
+      cases hB : saved.isCleanupBb cleanupBb with
+      | false => exact True.intro
+      | true =>
+        exact ⟨rfl, [], saved, rfl, rfl, hU, hB, rfl,
+          fun _ h => h, fun _ _ hIn _ => False.elim (by cases hIn)⟩
+    | continue_ =>
+      dsimp only [evalUnwindStack]; rw [hU]; dsimp only
+      cases hExit : Anneal.RefFrame.exitFrameWithProtectors t saved.callerTags with
+      | mk t' st =>
+        cases st with
+        | MissingTag _ => exact True.intro
+        | AccessFailure _ _ _ _ => exact True.intro
+        | InvariantFailure _ _ _ => exact True.intro
+        | Released =>
+          have h := ih t'
+          dsimp only
+          revert h
+          cases evalUnwindStack rest m t' with
+          | landed lSt =>
+            intro ⟨hMem, pre, sv, hSplit, hChain, hEdge, hValid, hCtx, _, _⟩
+            have hFullChain : ContinueChainReleases (saved :: pre) t lSt.tree :=
+              ⟨hU, t', hExit, hChain⟩
+            have hStrips := continueChainReleases_strips_tags hFullChain
+            exact ⟨hMem, saved :: pre, sv, by rw [hSplit]; rfl, hFullChain,
+              hEdge, hValid, hCtx,
+              fun tag hAbs => (hStrips tag).1 hAbs,
+              fun tag fr hIn hMemTag => (hStrips tag).2 fr hIn hMemTag⟩
+          | rootUnwind m' t'' =>
+            intro ⟨hMem, hChain, _, _⟩
+            have hFullChain : ContinueChainReleases (saved :: rest) t t'' :=
+              ⟨hU, t', hExit, hChain⟩
+            have hStrips := continueChainReleases_strips_tags hFullChain
+            exact ⟨hMem, hFullChain,
+              fun tag hAbs => (hStrips tag).1 hAbs,
+              fun tag fr hIn hMemTag => (hStrips tag).2 fr hIn hMemTag⟩
+          | abortTerminate m' t'' =>
+            intro ⟨hMem, pre, sv, tail, hSplit, hChain, hEdge, _, _⟩
+            have hFullChain : ContinueChainReleases (saved :: pre) t t'' :=
+              ⟨hU, t', hExit, hChain⟩
+            have hStrips := continueChainReleases_strips_tags hFullChain
+            exact ⟨hMem, saved :: pre, sv, tail, by rw [hSplit]; rfl, hFullChain,
+              hEdge,
+              fun tag hAbs => (hStrips tag).1 hAbs,
+              fun tag fr hIn hMemTag => (hStrips tag).2 fr hIn hMemTag⟩
+          | fault => intro _; exact True.intro
+
+/-- Fail-closed: whenever the computable unwinder `evalUnwindStack` faults,
+`wpUnwindStack` is strictly refutable (`¬ wpUnwindStack ...`). -/
+theorem not_wpUnwindStack_of_evalUnwindStack_fault {FrameCtx : Type z}
+    {Mem : Type u} {Addr : Type v}
+    {onCleanupFrame : StackFrameState FrameCtx Mem Addr → Prop}
+    {onRootUnwind : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onAbortTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {frames : List (SavedCallFrame FrameCtx Addr)} {m : Mem}
+    {t : Anneal.RefFrame.RangedBorrowTree}
+    (hFault : evalUnwindStack frames m t = .fault) :
+    ¬ wpUnwindStack onCleanupFrame onRootUnwind onAbortTerminate frames m t := by
+  intro hWp
+  have hHolds :=
+    (wpUnwindStack_iff_evalUnwindStack onCleanupFrame onRootUnwind
+      onAbortTerminate frames m t).mp hWp
+  rw [hFault] at hHolds
+  exact hHolds
+
 /-- Call-site weakest precondition over `[wops : MirWpOps State Out Fault]`:
 starting at `adapter.mkEntry m₀ t₀`, the callee terminates without faulting,
 its exit releases `frameTags` cleanly via `exitFrameWithProtectors`, and the
@@ -2565,6 +2876,59 @@ theorem callSpecCut_unwind_propagate_chain {FrameCtx : Type b}
       exact wpUnwindStack_append_continue_chain hRelChain hSuf)
     hAbort
 
+/-- Operational multi-frame unwind bridge for `CallSpecCut`: connects a sealed
+`CallSpecCut` directly to the computable unwinder `evalUnwindStack` via
+`wpUnwindStack_iff_evalUnwindStack` and `evalUnwindStack_append_continue_chain`. -/
+theorem callSpecCut_unwind_evalUnwindStack {FrameCtx : Type b}
+    [wops : MirWpOps State Out Fault] [ops : ByteStoreOps Mem Addr Byte]
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    {isCleanupBb : Nat → Bool} {retBb : Nat}
+    {prefixFrames suffixFrames : List (SavedCallFrame FrameCtx Addr)}
+    {onNormal : Nat → Val → Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onCleanup : Nat → Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onCleanupFrame : StackFrameState FrameCtx Mem Addr → Prop}
+    {onRootUnwind : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {onAbortTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop}
+    {m₀ : Mem} {t₀ : Anneal.RefFrame.RangedBorrowTree}
+    (hCut : CallSpecCut adapter spec)
+    (hPre : spec.pre m₀ t₀)
+    (hNormal : ∀ (retVal : Val) (m₁ : Mem) (tRel : Anneal.RefFrame.RangedBorrowTree),
+      spec.canNormal = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
+        Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
+      spec.postRet retVal m₁ tRel →
+      onNormal retBb retVal m₁ tRel)
+    (hChain : ∀ (m₁ : Mem) (tRel : Anneal.RefFrame.RangedBorrowTree),
+      spec.canUnwind = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      (∀ t : Nat, Anneal.RefFrame.natListMem t spec.frameTags = true →
+        Anneal.RefFrame.natListMem t tRel.protectedTags = false) →
+      spec.postUnwind m₁ tRel →
+      ∃ tFinal : Anneal.RefFrame.RangedBorrowTree,
+        ContinueChainReleases prefixFrames tRel tFinal ∧
+        (evalUnwindStack suffixFrames m₁ tFinal).holds
+          onCleanupFrame onRootUnwind onAbortTerminate)
+    (hAbort : ∀ (m₁ : Mem) (t₁ : Anneal.RefFrame.RangedBorrowTree),
+      spec.canAbort = true →
+      UpdatesOnly spec.modifies m₀ m₁ →
+      spec.postAbort m₁ t₁ →
+      onTerminate m₁ t₁) :
+    wpCallSite adapter ⟨some retBb, .continue_⟩ isCleanupBb spec.frameTags
+      onNormal onCleanup
+      (fun m₁ tRel =>
+        (evalUnwindStack (prefixFrames ++ suffixFrames) m₁ tRel).holds
+          onCleanupFrame onRootUnwind onAbortTerminate)
+      onTerminate m₀ t₀ :=
+  callSpecCut_call_normal_continue hCut hPre hNormal
+    (fun m₁ tRel hCanU hUpd hStripped hPost => by
+      let ⟨tFinal, hRelChain, hSuf⟩ := hChain m₁ tRel hCanU hUpd hStripped hPost
+      rw [evalUnwindStack_append_continue_chain hRelChain]
+      exact hSuf)
+    hAbort
+
 /-- Disjoint-lens frame rule for `CallSpecCut`: for any bystander lens `other`
 pairwise disjoint from `spec.modifies`, every normal return, unwind exit, and
 abort exit of the callee preserves `other.get m₁ = other.get m₀`. -/
@@ -2853,6 +3217,46 @@ theorem CallSpecCut.to_stageCut [wops : MirWpOps State Out Fault]
       | abortTerminate m₁ t₁ =>
         let ⟨hCanA, _, hPost⟩ := hOut
         exact ⟨hCanA, hPost⟩)
+
+/-- Footprint-preserving `ParametricCore.StageCut` lift at a fixed entry
+`(m₀, t₀)`: unlike `CallSpecCut.to_stageCut` (which existentially abstracts
+`(m₀, t₀)`), `to_stageCut_at` preserves `UpdatesOnly spec.modifies m₀ m₁` across
+all three exit arms (`returned`, `unwound`, `abortTerminate`). -/
+theorem CallSpecCut.to_stageCut_at [wops : MirWpOps State Out Fault]
+    [ops : ByteStoreOps Mem Addr Byte]
+    {adapter : CalleeMachineAdapter State Out Mem Val}
+    {spec : CallSpec Mem Addr Val}
+    (m₀ : Mem) (t₀ : Anneal.RefFrame.RangedBorrowTree)
+    (hCut : CallSpecCut adapter spec) :
+    StageCut (ops := wops)
+      (fun st => st = adapter.mkEntry m₀ t₀ ∧ spec.pre m₀ t₀)
+      (fun _ => False)
+      (fun out =>
+        match adapter.classifyOut out with
+        | none => False
+        | some (.returned retVal m₁ t₁) =>
+          spec.canNormal = true ∧
+          UpdatesOnly spec.modifies m₀ m₁ ∧
+          ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+            Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+              ⟨tRel, .Released⟩ ∧
+            spec.postRet retVal m₁ tRel
+        | some (.unwound m₁ t₁) =>
+          spec.canUnwind = true ∧
+          UpdatesOnly spec.modifies m₀ m₁ ∧
+          ∃ tRel : Anneal.RefFrame.RangedBorrowTree,
+            Anneal.RefFrame.exitFrameWithProtectors t₁ spec.frameTags =
+              ⟨tRel, .Released⟩ ∧
+            spec.postUnwind m₁ tRel
+        | some (.abortTerminate m₁ t₁) =>
+          spec.canAbort = true ∧
+          UpdatesOnly spec.modifies m₀ m₁ ∧
+          spec.postAbort m₁ t₁)
+      (fun _ => False) :=
+  StageCut.intro (ops := wops) (fun _ hEntry => by
+    let ⟨hEq, hPre⟩ := hEntry
+    rw [hEq]
+    exact hCut m₀ t₀ hPre)
 
 /-- Fail-closed: if a deterministic callee terminates immediately with a
 normal return `.returned`, `wpCallSite` at a diverging call site
@@ -3578,5 +3982,185 @@ theorem canary_evalUnwindStack_operational :
       | .abortTerminate m t => m = csuInitialMem ∧ t = tree0
       | _ => False) := by
   refine ⟨⟨rfl, rfl, rfl, rfl⟩, trivial, trivial, ⟨rfl, rfl⟩, trivial, ⟨rfl, rfl⟩⟩
+
+/-- End-to-end Episode 2 cross-module integration canary connecting:
+1. `ByteRunCopyOp.copyOperandRepeat` (MIR `Rvalue::Repeat` under overlap)
+   sealed inside `ByteRunCopyCut`,
+2. `ByteRunCopyCut.to_updatesOnly` lifting the overlapping repeat copy into
+   `UpdatesOnly [dstWin]`,
+3. `seal_callSpecCut` + `callSpecCut_frame_disjoint` preserving a disjoint
+   bystander lens `[10..12)`, AND
+4. `callSpecCut_unwind_evalUnwindStack` + `evalUnwindStack_sound` propagating
+   an unwind across a `.continue_` caller frame (releasing tag `1`) to a
+   validated cleanup pad `7` (while rejecting `.fault` via
+   `not_wpUnwindStack_of_evalUnwindStack_fault`). -/
+theorem canary_byterun_repeat_to_callSpecCut_and_evalUnwindStack :
+    let m0 : SliceStore (Option UInt8) :=
+      { allocs := [{ allocId := 1,
+                     bytes := [some 0x11, some 0x22, some 0x33, some 0x44,
+                               none, none, none, none, none, none,
+                               some 0xFE, some 0xFF],
+                     writable := true }] }
+    let src : ByteSubLens Nat := { addr := 1, offset := 0, len := 4 }
+    let dstWin : ByteSubLens Nat := { addr := 1, offset := 2, len := 8 }
+    let tail : ByteSubLens Nat := { addr := 1, offset := 10, len := 2 }
+    let tree0 := Anneal.RefFrame.mkSharedTopo3Tree16 .Frozen true .Unique true [1, 2]
+    let op : ByteRunCopyOp Nat := .copyOperandRepeat src 1 2 2
+    let step : (Nat × SliceStore (Option UInt8) × Anneal.RefFrame.RangedBorrowTree) →
+        StepOutcome
+          (Nat × SliceStore (Option UInt8) × Anneal.RefFrame.RangedBorrowTree)
+          (FrameExitOutcome (SliceStore (Option UInt8)) Unit) Unit :=
+      fun ⟨pc, m, t⟩ =>
+        match pc with
+        | 0 =>
+          match op.exec m with
+          | some m' => .step (1, m', t)
+          | none => .fault ()
+        | _ => .done (.unwound m t)
+    let adapter : CalleeMachineAdapter
+        (Nat × SliceStore (Option UInt8) × Anneal.RefFrame.RangedBorrowTree)
+        (FrameExitOutcome (SliceStore (Option UInt8)) Unit)
+        (SliceStore (Option UInt8)) Unit :=
+      { mkEntry := fun m t => (0, m, t)
+        classifyOut := fun o => some o }
+    let contFrame : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 3, .continue_⟩, isCleanupBb := fun _ => false,
+        callerModifies := [], callerTags := [1] }
+    let padFrame : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 4, .cleanup 7⟩,
+        isCleanupBb := fun b => Nat.beq b 7, callerModifies := [], callerTags := [] }
+    let badPadFrame : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 4, .cleanup 8⟩,
+        isCleanupBb := fun b => Nat.beq b 7, callerModifies := [], callerTags := [] }
+    wpCallSite (wops := MirWpOps.ofDetStep step (fun s => some s.1)) adapter
+      ⟨some 9, .continue_⟩ (fun _ => false) [2]
+      (fun _ _ _ _ => False) (fun _ _ _ => False)
+      (fun m₁ tRel =>
+        (evalUnwindStack ([contFrame] ++ [padFrame]) m₁ tRel).holds
+          (fun st => st.blockIdx = 7 ∧
+            dstWin.get st.mem =
+              some (flattenByteRuns ByteRunCodec.optionUInt8
+                (repeatByteRuns 2 ([.initPlain [0x11, 0x22, 0x33, 0x44]] :
+                  List (ByteRun PEmpty.{1})))) ∧
+            tail.get st.mem = tail.get m0 ∧
+            Anneal.RefFrame.natListMem 1 st.tree.protectedTags = false ∧
+            Anneal.RefFrame.natListMem 2 st.tree.protectedTags = false)
+          (fun _ _ => False) (fun _ _ => False))
+      (fun _ _ => False) m0 tree0 ∧
+    (¬ wpUnwindStack (fun _ => True) (fun _ _ => True) (fun _ _ => True)
+        [contFrame, badPadFrame] m0 tree0) := by
+  intro m0 src dstWin tail tree0 op step adapter contFrame padFrame badPadFrame
+  let elemRuns : List (ByteRun PEmpty.{1}) := [.initPlain [0x11, 0x22, 0x33, 0x44]]
+  let ⟨m1, hWr, _, hGetWin, _, _, _⟩ :=
+    writeRepeatedlyComp_sound ByteRunCodec.optionUInt8 (dstAddr := 1) (dstOff := 2)
+      (n := 2) (m := m0)
+      (oldWin := [some 0x33, some 0x44, none, none, none, none, none, none])
+      elemRuns (Nat.zero_lt_succ 1) (Nat.zero_lt_succ 3) rfl
+  have hOpExec : op.exec m0 = some m1 := hWr
+  have hStep0 : step (0, m0, tree0) = .step (1, m1, tree0) := by
+    change (match op.exec m0 with
+        | some m' => StepOutcome.step (1, m', tree0)
+        | none => StepOutcome.fault ()) =
+      StepOutcome.step (1, m1, tree0)
+    rw [hOpExec]
+  have hCopyCut :
+      ByteRunCopyCut step (fun s => s.2.1) [op] 1 (0, m0, tree0) (1, m1, tree0) :=
+    ByteRunCopyCut.singleOperandRepeat (StepStageCut.single hStep0) hOpExec
+  have hUpd : UpdatesOnly [dstWin] m0 m1 :=
+    hCopyCut.to_updatesOnly (allowed := [dstWin])
+      (fun o hIn => by cases hIn with | head => exact List.Mem.head [] | tail _ hE => cases hE)
+      (fun L hIn => by
+        cases hIn with
+        | head => exact ⟨[some 0x33, some 0x44, none, none, none, none, none, none], rfl⟩
+        | tail _ hE => cases hE)
+      (fun L₁ L₂ h1 h2 => by
+        cases h1 with
+        | head =>
+          cases h2 with
+          | head => exact Or.inr (Or.inl (ByteSubLens.containedIn_refl dstWin))
+          | tail _ hE => cases hE
+        | tail _ hE => cases hE)
+  let spec : CallSpec (SliceStore (Option UInt8)) Nat Unit :=
+    { pre := fun m t => m = m0 ∧ t = tree0
+      modifies := [dstWin]
+      frameTags := [2]
+      canNormal := false
+      canUnwind := true
+      postRet := fun _ _ _ => False
+      postUnwind := fun m t => m = m1 ∧
+        t = (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree }
+  have hCallCut :
+      CallSpecCut (wops := MirWpOps.ofDetStep step (fun s => some s.1)) adapter spec := by
+    refine seal_callSpecCut (wops := MirWpOps.ofDetStep step (fun s => some s.1))
+      (fun mIn tIn ⟨hM, hT⟩ => ?_)
+    rw [hM, hT]
+    refine wpUntil_step (ops := MirWpOps.ofDetStep step (fun s => some s.1)) ?_
+    change (step (0, m0, tree0)).wp _ _ _
+    rw [hStep0]
+    refine wpUntil_step (ops := MirWpOps.ofDetStep step (fun s => some s.1)) ?_
+    change (StepOutcome.done
+      (State := Nat × SliceStore (Option UInt8) × Anneal.RefFrame.RangedBorrowTree)
+      (Fault := Unit) (FrameExitOutcome.unwound m1 tree0)).wp _ _ _
+    refine ⟨rfl, hUpd, (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree, rfl, rfl, rfl⟩
+  have hTailDisj :
+      ∀ L : ByteSubLens Nat, L ∈ [dstWin] →
+        ByteSubLens.Disjoint (SliceStore (Option UInt8)) L tail := by
+    intro L hIn
+    cases hIn with
+    | head =>
+      exact ByteSubLens.disjoint_of_separated
+        (ByteSubLens.separated_of_natLensSeparatedBool rfl)
+    | tail _ hE => cases hE
+  refine ⟨?_, ?_⟩
+  · exact callSpecCut_unwind_evalUnwindStack
+      (wops := MirWpOps.ofDetStep step (fun s => some s.1))
+      (prefixFrames := [contFrame])
+      (suffixFrames := [padFrame]) hCallCut ⟨rfl, rfl⟩
+      (fun _ _ _ hN _ _ _ => False.elim (by cases hN))
+      (fun m₁ tRel _ hUpd1 hStrip2 ⟨hM1, hT1⟩ => by
+        rw [hM1, hT1]
+        have hRel1 :
+            Anneal.RefFrame.exitFrameWithProtectors
+              (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree [1] =
+              ⟨(Anneal.RefFrame.exitFrameWithProtectors
+                (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree [1]).tree,
+               .Released⟩ := rfl
+        have hChain1 :
+            ContinueChainReleases [contFrame]
+              (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree
+              (Anneal.RefFrame.exitFrameWithProtectors
+                (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree [1]).tree :=
+          ⟨rfl, _, hRel1, rfl⟩
+        refine ⟨_, hChain1, ?_⟩
+        have hSound :=
+          evalUnwindStack_sound [contFrame, padFrame] m1
+            (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree
+        have hEvalEq :
+            evalUnwindStack [contFrame, padFrame] m1
+              (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree =
+              .landed ⟨7, (), [], m1,
+                (Anneal.RefFrame.exitFrameWithProtectors
+                  (Anneal.RefFrame.exitFrameWithProtectors tree0 [2]).tree [1]).tree⟩ := rfl
+        rw [hEvalEq] at hSound
+        let ⟨_, pre, _, hSplit, _, _, _, _, hAbsPres, hPreStrip⟩ := hSound
+        have hContInPre : contFrame ∈ pre := by
+          cases pre with
+          | nil => cases hSplit
+          | cons hd _ =>
+            have hHd : contFrame = hd := (List.cons.inj hSplit).1
+            rw [hHd]
+            exact List.Mem.head _
+        have hTailEq : tail.get m1 = tail.get m0 := by
+          rw [← hM1]
+          exact updatesOnly_frame_disjoint hTailDisj hUpd1
+        have hS1 := hPreStrip 1 contFrame hContInPre rfl
+        have h2Mid : Anneal.RefFrame.natListMem 2 tRel.protectedTags = false :=
+          hStrip2 2 rfl
+        rw [hT1] at h2Mid
+        have hS2 := hAbsPres 2 h2Mid
+        exact ⟨rfl, hGetWin, hTailEq, hS1, hS2⟩)
+      (fun _ _ hA _ _ => False.elim (by cases hA))
+  · exact not_wpUnwindStack_of_evalUnwindStack_fault (frames := [contFrame, badPadFrame])
+      (m := m0) (t := tree0) rfl
 
 end Anneal.ParametricCore

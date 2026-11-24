@@ -1049,6 +1049,660 @@ theorem shlUncheckedU_none_of_ge (w : ScalarWidth) (a : Nat) {shift : Nat}
   dsimp only
   rw [shlWithOverflowU_overflow_of_ge w a h]
 
+/-! ### Signed Two's-Complement Checked & Unchecked Arithmetic (`*WithOverflowS`, `*UncheckedS`) -/
+
+/-- Order-preserving bijection (`toBiased w x = (x % M + H) % M`) mapping
+two's-complement bit patterns `x < w.modulus` monotonically from signed values
+`[-H, H - 1]` onto `[0, M - 1]` (`INT_MIN ↦ 0`, `-1 ↦ H - 1`, `0 ↦ H`,
+`INT_MAX ↦ M - 1`). -/
+def toBiased (w : ScalarWidth) (x : Nat) : Nat :=
+  (x % w.modulus + w.halfModulus) % w.modulus
+
+/-- Every `toBiased` value lies strictly below `w.modulus`. -/
+theorem toBiased_lt_modulus (w : ScalarWidth) (x : Nat) :
+    toBiased w x < w.modulus :=
+  Nat.mod_lt _ w.modulus_pos
+
+/-- For non-negative two's-complement values (`x < w.halfModulus`),
+`toBiased w x = x + w.halfModulus`. -/
+theorem toBiased_nonneg (w : ScalarWidth) {x : Nat} (hx : x < w.halfModulus) :
+    toBiased w x = x + w.halfModulus := by
+  have hMod : x < w.modulus := Nat.lt_trans hx w.halfModulus_lt_modulus
+  have hSumLt : x + w.halfModulus < w.modulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+    exact Nat.add_lt_add_right hx w.halfModulus
+  unfold toBiased
+  rw [Nat.mod_eq_of_lt hMod, Nat.mod_eq_of_lt hSumLt]
+
+/-- For negative two's-complement values (`w.halfModulus ≤ x < w.modulus`),
+`toBiased w x = x - w.halfModulus`. -/
+theorem toBiased_neg (w : ScalarWidth) {x : Nat}
+    (hNeg : w.halfModulus ≤ x) (hx : x < w.modulus) :
+    toBiased w x = x - w.halfModulus := by
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have hSubLt : x - w.halfModulus < w.halfModulus := by
+    have h1 : w.halfModulus + (x - w.halfModulus) < w.halfModulus + w.halfModulus := by
+      rw [Nat.add_sub_of_le hNeg, ← hModEq]
+      exact hx
+    cases Nat.lt_or_ge (x - w.halfModulus) w.halfModulus with
+    | inl hLt => exact hLt
+    | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_left hGe _))
+  have hSubLtM : x - w.halfModulus < w.modulus :=
+    Nat.lt_trans hSubLt w.halfModulus_lt_modulus
+  have hSplit : x + w.halfModulus = (x - w.halfModulus) + w.modulus := by
+    rw [hModEq, ← Nat.add_assoc, Nat.sub_add_cancel hNeg]
+  unfold toBiased
+  rw [Nat.mod_eq_of_lt hx, hSplit, Nat.add_mod_right, Nat.mod_eq_of_lt hSubLtM]
+
+private theorem add_mod_left_eq (a b m : Nat) :
+    (a % m + b) % m = (a + b) % m := by
+  have h1 : a + b = (a % m + b) + m * (a / m) := by
+    conv => lhs; rw [← Nat.div_add_mod a m]
+    rw [Nat.add_assoc (m * (a / m)) (a % m) b, Nat.add_comm]
+  rw [h1, Nat.add_mul_mod_self_left]
+
+private theorem add_mod_right_eq (a b m : Nat) :
+    (a + b % m) % m = (a + b) % m := by
+  rw [Nat.add_comm a (b % m), add_mod_left_eq, Nat.add_comm]
+
+private theorem sub_add_comm_nat {a b c : Nat} (h : b ≤ a) :
+    (a - b) + c = (a + c) - b := by
+  have h1 : ((a - b) + c) + b = a + c := by
+    rw [Nat.add_assoc, Nat.add_comm c b, ← Nat.add_assoc, Nat.sub_add_cancel h]
+  have h2 := congrArg (fun k => k - b) h1
+  rw [Nat.add_sub_cancel] at h2
+  exact h2
+
+/-- `toBiased w` is an involution on canonical `w`-bit patterns (`x < w.modulus`). -/
+theorem toBiased_involutive (w : ScalarWidth) (x : Nat) :
+    toBiased w (toBiased w x) = x % w.modulus := by
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  unfold toBiased
+  rw [Nat.mod_eq_of_lt (Nat.mod_lt _ w.modulus_pos),
+    add_mod_left_eq, Nat.add_assoc, ← hModEq, Nat.add_mod_right,
+    Nat.mod_eq_of_lt (Nat.mod_lt x w.modulus_pos)]
+
+/-- `toBiased w` is injective on canonical `w`-bit patterns. -/
+theorem toBiased_injective (w : ScalarWidth) {a b : Nat}
+    (ha : a < w.modulus) (hb : b < w.modulus)
+    (hEq : toBiased w a = toBiased w b) : a = b := by
+  have h1 := congrArg (toBiased w) hEq
+  rw [toBiased_involutive, toBiased_involutive,
+    Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb] at h1
+  exact h1
+
+/-- Checked signed two's-complement addition `(wrappedBits, overflowed)` at
+width `w` (matching Rust `iN::overflowing_add`, failing closed if either raw
+input `≥ w.modulus`). -/
+def addWithOverflowS (w : ScalarWidth) (a b : Nat) : Nat × Bool :=
+  let a' := a % w.modulus
+  let b' := b % w.modulus
+  let wrapped := (a' + b') % w.modulus
+  let ba := toBiased w a'
+  let bb := toBiased w b'
+  let ovf := Nat.ble w.modulus a || Nat.ble w.modulus b ||
+    Nat.blt (ba + bb) w.halfModulus ||
+    Nat.ble (w.modulus + w.halfModulus) (ba + bb)
+  (wrapped, ovf)
+
+/-- Checked signed two's-complement subtraction `(wrappedBits, overflowed)` at
+width `w` (matching Rust `iN::overflowing_sub`, failing closed if either raw
+input `≥ w.modulus`). -/
+def subWithOverflowS (w : ScalarWidth) (a b : Nat) : Nat × Bool :=
+  let a' := a % w.modulus
+  let b' := b % w.modulus
+  let wrapped := (a' + w.modulus - b') % w.modulus
+  let ba := toBiased w a'
+  let bb := toBiased w b'
+  let ovf := Nat.ble w.modulus a || Nat.ble w.modulus b ||
+    Nat.blt (ba + w.halfModulus) bb ||
+    Nat.ble (bb + w.modulus) (ba + w.halfModulus)
+  (wrapped, ovf)
+
+/-- Checked signed two's-complement multiplication `(wrappedBits, overflowed)`
+at width `w` (matching Rust `iN::overflowing_mul`, including `INT_MIN * 1`
+succeeding and `INT_MIN * (-1)` overflowing, failing closed if either raw input
+`≥ w.modulus`). -/
+def mulWithOverflowS (w : ScalarWidth) (a b : Nat) : Nat × Bool :=
+  let a' := a % w.modulus
+  let b' := b % w.modulus
+  let wrapped := (a' * b') % w.modulus
+  let sa := Nat.ble w.halfModulus a'
+  let sb := Nat.ble w.halfModulus b'
+  let magA := if sa then w.modulus - a' else a'
+  let magB := if sb then w.modulus - b' else b'
+  let prodMag := magA * magB
+  let negRes := sa != sb
+  let rangeOvf :=
+    match negRes with
+    | true => Nat.blt w.halfModulus prodMag
+    | false => Nat.ble w.halfModulus prodMag
+  let ovf := Nat.ble w.modulus a || Nat.ble w.modulus b || rangeOvf
+  (wrapped, ovf)
+
+/-- Checked signed left-shift `(wrappedBits, overflowed)` at width `w`
+(matching Rust `iN::overflowing_shl`: masks shift modulo `w.bits` and sets
+`overflowed = true` iff `w.bits ≤ shift` or raw input `w.modulus ≤ a`). -/
+def shlWithOverflowS (w : ScalarWidth) (a shift : Nat) : Nat × Bool :=
+  let a' := a % w.modulus
+  let masked := shift % w.bits
+  ((a' * pow2 masked) % w.modulus, Nat.ble w.modulus a || Nat.ble w.bits shift)
+
+/-- Interval-guarded unchecked signed addition (`none` on signed overflow). -/
+def addUncheckedS (w : ScalarWidth) (a b : Nat) : Option Nat :=
+  let r := addWithOverflowS w a b
+  match r.2 with
+  | true => none
+  | false => some r.1
+
+/-- Interval-guarded unchecked signed subtraction (`none` on signed overflow). -/
+def subUncheckedS (w : ScalarWidth) (a b : Nat) : Option Nat :=
+  let r := subWithOverflowS w a b
+  match r.2 with
+  | true => none
+  | false => some r.1
+
+/-- Interval-guarded unchecked signed multiplication (`none` on signed overflow). -/
+def mulUncheckedS (w : ScalarWidth) (a b : Nat) : Option Nat :=
+  let r := mulWithOverflowS w a b
+  match r.2 with
+  | true => none
+  | false => some r.1
+
+/-- Interval-guarded unchecked signed left-shift (`none` on shift overflow). -/
+def shlUncheckedS (w : ScalarWidth) (a shift : Nat) : Option Nat :=
+  let r := shlWithOverflowS w a shift
+  match r.2 with
+  | true => none
+  | false => some r.1
+
+private theorem nat_blt_false_iff_ge {a b : Nat} :
+    Nat.blt a b = false ↔ b ≤ a := by
+  unfold Nat.blt
+  constructor
+  · intro hF
+    have hLt : b < a + 1 := nat_ble_false_iff_lt.mp hF
+    exact Nat.le_of_lt_succ hLt
+  · intro hGe
+    exact nat_ble_false_iff_lt.mpr (Nat.lt_succ_of_le hGe)
+
+private theorem nat_blt_true_of_lt {a b : Nat} (h : a < b) :
+    Nat.blt a b = true :=
+  Nat.ble_eq_true_of_le h
+
+/-- Exact no-overflow equivalence for `addWithOverflowS`: no overflow iff both
+inputs are canonical `w`-bit patterns and their biased sum fits in
+`[H, M + H)`. -/
+theorem addWithOverflowS_no_overflow_iff (w : ScalarWidth) (a b : Nat) :
+    (addWithOverflowS w a b).2 = false ↔
+      a < w.modulus ∧ b < w.modulus ∧
+      w.halfModulus ≤ toBiased w a + toBiased w b ∧
+      toBiased w a + toBiased w b < w.modulus + w.halfModulus := by
+  unfold addWithOverflowS
+  dsimp only
+  constructor
+  · intro h
+    cases h1 : Nat.ble w.modulus a with
+    | true => rw [h1] at h; cases h
+    | false =>
+      cases h2 : Nat.ble w.modulus b with
+      | true => rw [h1, h2] at h; cases h
+      | false =>
+        rw [h1, h2] at h
+        have ha : a < w.modulus := nat_ble_false_iff_lt.mp h1
+        have hb : b < w.modulus := nat_ble_false_iff_lt.mp h2
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb] at h
+        cases h3 : Nat.blt (toBiased w a + toBiased w b) w.halfModulus with
+        | true => rw [h3] at h; cases h
+        | false =>
+          rw [h3] at h
+          exact ⟨ha, hb, nat_blt_false_iff_ge.mp h3, nat_ble_false_iff_lt.mp h⟩
+  · intro ⟨ha, hb, hLo, hHi⟩
+    rw [nat_ble_false_iff_lt.mpr ha, nat_ble_false_iff_lt.mpr hb,
+      Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb,
+      nat_blt_false_iff_ge.mpr hLo, nat_ble_false_iff_lt.mpr hHi]
+    rfl
+
+/-- Exact biased-value identity for non-overflowing signed addition:
+`toBiased w (addWithOverflowS w a b).1 = toBiased w a + toBiased w b - H`. -/
+theorem toBiased_addWithOverflowS_of_no_overflow (w : ScalarWidth) {a b : Nat}
+    (hNo : (addWithOverflowS w a b).2 = false) :
+    toBiased w (addWithOverflowS w a b).1 =
+      toBiased w a + toBiased w b - w.halfModulus := by
+  let ⟨ha, hb, hLo, hHi⟩ := (addWithOverflowS_no_overflow_iff w a b).mp hNo
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDiffLt : toBiased w a + toBiased w b - w.halfModulus < w.modulus := by
+    have h1 : (toBiased w a + toBiased w b - w.halfModulus) + w.halfModulus <
+        w.modulus + w.halfModulus := by
+      rw [Nat.sub_add_cancel hLo]
+      exact hHi
+    cases Nat.lt_or_ge (toBiased w a + toBiased w b - w.halfModulus) w.modulus with
+    | inl hLt => exact hLt
+    | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_right hGe _))
+  have hAddM :
+      toBiased w a + toBiased w b + w.halfModulus =
+        (toBiased w a + toBiased w b - w.halfModulus) + w.modulus := by
+    rw [hModEq, ← Nat.add_assoc, Nat.sub_add_cancel hLo]
+  have hCong :
+      (toBiased w a + toBiased w b + w.halfModulus) % w.modulus =
+        toBiased w (addWithOverflowS w a b).1 := by
+    unfold addWithOverflowS toBiased
+    dsimp only
+    rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb,
+      Nat.mod_eq_of_lt (Nat.mod_lt _ w.modulus_pos),
+      add_mod_left_eq (a + b) w.halfModulus w.modulus]
+    rw [← add_mod_left_eq ((a + w.halfModulus) % w.modulus + (b + w.halfModulus) % w.modulus)
+        w.halfModulus w.modulus,
+      add_mod_left_eq (a + w.halfModulus) ((b + w.halfModulus) % w.modulus) w.modulus,
+      add_mod_right_eq (a + w.halfModulus) (b + w.halfModulus) w.modulus,
+      add_mod_left_eq ((a + w.halfModulus) + (b + w.halfModulus)) w.halfModulus w.modulus]
+    have hRearr :
+        (a + w.halfModulus) + (b + w.halfModulus) + w.halfModulus =
+          (a + b + w.halfModulus) + w.modulus := by
+      rw [hModEq]
+      rw [Nat.add_assoc a w.halfModulus (b + w.halfModulus),
+        Nat.add_comm w.halfModulus (b + w.halfModulus),
+        Nat.add_assoc b w.halfModulus w.halfModulus,
+        ← Nat.add_assoc a b (w.halfModulus + w.halfModulus),
+        Nat.add_assoc (a + b) (w.halfModulus + w.halfModulus) w.halfModulus,
+        Nat.add_comm (w.halfModulus + w.halfModulus) w.halfModulus,
+        ← Nat.add_assoc (a + b) w.halfModulus (w.halfModulus + w.halfModulus)]
+    rw [hRearr, Nat.add_mod_right]
+  rw [← hCong, hAddM, Nat.add_mod_right, Nat.mod_eq_of_lt hDiffLt]
+
+/-- Signed addition of two non-negative operands (`a + b < w.halfModulus`)
+never overflows and equals exact `a + b`. -/
+theorem addWithOverflowS_nonneg_of_lt (w : ScalarWidth) {a b : Nat}
+    (hLt : a + b < w.halfModulus) :
+    addWithOverflowS w a b = (a + b, false) := by
+  have haH : a < w.halfModulus := Nat.lt_of_le_of_lt (Nat.le_add_right a b) hLt
+  have hbH : b < w.halfModulus := Nat.lt_of_le_of_lt (Nat.le_add_left b a) hLt
+  have haM : a < w.modulus := Nat.lt_trans haH w.halfModulus_lt_modulus
+  have hbM : b < w.modulus := Nat.lt_trans hbH w.halfModulus_lt_modulus
+  have hSumM : a + b < w.modulus := Nat.lt_trans hLt w.halfModulus_lt_modulus
+  have hNo : (addWithOverflowS w a b).2 = false := by
+    rw [addWithOverflowS_no_overflow_iff, toBiased_nonneg w haH, toBiased_nonneg w hbH]
+    refine ⟨haM, hbM, ?_, ?_⟩
+    · exact Nat.le_trans (Nat.le_add_left w.halfModulus a) (Nat.le_add_right _ _)
+    · have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+        rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+      have hRearr : (a + w.halfModulus) + (b + w.halfModulus) =
+          (a + b) + (w.halfModulus + w.halfModulus) := by
+        rw [Nat.add_assoc a w.halfModulus (b + w.halfModulus),
+          Nat.add_comm w.halfModulus (b + w.halfModulus),
+          Nat.add_assoc b w.halfModulus w.halfModulus,
+          ← Nat.add_assoc a b (w.halfModulus + w.halfModulus)]
+      rw [hRearr, ← hModEq, Nat.add_comm w.modulus w.halfModulus]
+      exact Nat.add_lt_add_right hLt w.modulus
+  have hFst : (addWithOverflowS w a b).1 = a + b := by
+    unfold addWithOverflowS
+    dsimp only
+    rw [Nat.mod_eq_of_lt haM, Nat.mod_eq_of_lt hbM, Nat.mod_eq_of_lt hSumM]
+  cases h : addWithOverflowS w a b with
+  | mk fst snd =>
+    rw [h] at hFst hNo
+    dsimp only at hFst hNo
+    rw [hFst, hNo]
+
+/-- Signed addition of a negative operand (`H ≤ a < M`) and a non-negative
+operand (`b < H`) NEVER overflows; if `a + b < M` it stays negative with exact
+wrapped bits `a + b`. -/
+theorem addWithOverflowS_neg_plus_nonneg_of_lt (w : ScalarWidth) {a b : Nat}
+    (hNeg : w.halfModulus ≤ a) (hb : b < w.halfModulus)
+    (hSumLt : a + b < w.modulus) :
+    addWithOverflowS w a b = (a + b, false) := by
+  have haM : a < w.modulus := Nat.lt_of_le_of_lt (Nat.le_add_right a b) hSumLt
+  have hbM : b < w.modulus := Nat.lt_trans hb w.halfModulus_lt_modulus
+  have hNo : (addWithOverflowS w a b).2 = false := by
+    rw [addWithOverflowS_no_overflow_iff, toBiased_neg w hNeg haM, toBiased_nonneg w hb]
+    refine ⟨haM, hbM, ?_, ?_⟩
+    · exact Nat.le_trans (Nat.le_add_left w.halfModulus b) (Nat.le_add_left _ _)
+    · have hEq : (a - w.halfModulus) + (b + w.halfModulus) = a + b := by
+        rw [Nat.add_comm b w.halfModulus, ← Nat.add_assoc,
+          Nat.sub_add_cancel hNeg]
+      rw [hEq]
+      exact Nat.lt_of_lt_of_le hSumLt (Nat.le_add_right w.modulus w.halfModulus)
+  have hFst : (addWithOverflowS w a b).1 = a + b := by
+    unfold addWithOverflowS
+    dsimp only
+    rw [Nat.mod_eq_of_lt haM, Nat.mod_eq_of_lt hbM, Nat.mod_eq_of_lt hSumLt]
+  cases h : addWithOverflowS w a b with
+  | mk fst snd =>
+    rw [h] at hFst hNo
+    dsimp only at hFst hNo
+    rw [hFst, hNo]
+
+/-- Fail-closed: signed addition of two non-negative operands whose sum reaches
+`w.halfModulus` overflows (`(addWithOverflowS w a b).2 = true`). -/
+theorem addWithOverflowS_overflow_of_pos_ge (w : ScalarWidth) {a b : Nat}
+    (ha : a < w.halfModulus) (hb : b < w.halfModulus)
+    (hGe : w.halfModulus ≤ a + b) :
+    (addWithOverflowS w a b).2 = true := by
+  cases h : (addWithOverflowS w a b).2 with
+  | true => rfl
+  | false =>
+    let ⟨_, _, _, hHi⟩ := (addWithOverflowS_no_overflow_iff w a b).mp h
+    rw [toBiased_nonneg w ha, toBiased_nonneg w hb] at hHi
+    have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+      rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+    have hRearr : (a + w.halfModulus) + (b + w.halfModulus) =
+        (a + b) + w.modulus := by
+      rw [hModEq, Nat.add_assoc a w.halfModulus (b + w.halfModulus),
+        Nat.add_comm w.halfModulus (b + w.halfModulus),
+        Nat.add_assoc b w.halfModulus w.halfModulus,
+        ← Nat.add_assoc a b (w.halfModulus + w.halfModulus)]
+    rw [hRearr, Nat.add_comm w.modulus w.halfModulus] at hHi
+    exact absurd hHi (Nat.not_lt_of_ge (Nat.add_le_add_right hGe w.modulus))
+
+/-- Exact no-overflow equivalence for `subWithOverflowS`: no overflow iff both
+inputs are canonical `w`-bit patterns and `toBiased w b ≤ toBiased w a + H <
+toBiased w b + M`. -/
+theorem subWithOverflowS_no_overflow_iff (w : ScalarWidth) (a b : Nat) :
+    (subWithOverflowS w a b).2 = false ↔
+      a < w.modulus ∧ b < w.modulus ∧
+      toBiased w b ≤ toBiased w a + w.halfModulus ∧
+      toBiased w a + w.halfModulus < toBiased w b + w.modulus := by
+  unfold subWithOverflowS
+  dsimp only
+  constructor
+  · intro h
+    cases h1 : Nat.ble w.modulus a with
+    | true => rw [h1] at h; cases h
+    | false =>
+      cases h2 : Nat.ble w.modulus b with
+      | true => rw [h1, h2] at h; cases h
+      | false =>
+        rw [h1, h2] at h
+        have ha : a < w.modulus := nat_ble_false_iff_lt.mp h1
+        have hb : b < w.modulus := nat_ble_false_iff_lt.mp h2
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb] at h
+        cases h3 : Nat.blt (toBiased w a + w.halfModulus) (toBiased w b) with
+        | true => rw [h3] at h; cases h
+        | false =>
+          rw [h3] at h
+          exact ⟨ha, hb, nat_blt_false_iff_ge.mp h3, nat_ble_false_iff_lt.mp h⟩
+  · intro ⟨ha, hb, hLo, hHi⟩
+    rw [nat_ble_false_iff_lt.mpr ha, nat_ble_false_iff_lt.mpr hb,
+      Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb,
+      nat_blt_false_iff_ge.mpr hLo, nat_ble_false_iff_lt.mpr hHi]
+    rfl
+
+/-- Exact biased-value identity for non-overflowing signed subtraction:
+`toBiased w (subWithOverflowS w a b).1 = toBiased w a + H - toBiased w b`. -/
+theorem toBiased_subWithOverflowS_of_no_overflow (w : ScalarWidth) {a b : Nat}
+    (hNo : (subWithOverflowS w a b).2 = false) :
+    toBiased w (subWithOverflowS w a b).1 =
+      toBiased w a + w.halfModulus - toBiased w b := by
+  let ⟨ha, hb, hLo, hHi⟩ := (subWithOverflowS_no_overflow_iff w a b).mp hNo
+  have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+    rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+  have hDiffLt : toBiased w a + w.halfModulus - toBiased w b < w.modulus := by
+    have h1 : (toBiased w a + w.halfModulus - toBiased w b) + toBiased w b <
+        w.modulus + toBiased w b := by
+      rw [Nat.sub_add_cancel hLo, Nat.add_comm w.modulus (toBiased w b)]
+      exact hHi
+    cases Nat.lt_or_ge (toBiased w a + w.halfModulus - toBiased w b) w.modulus with
+    | inl hLt => exact hLt
+    | inr hGe => exact absurd h1 (Nat.not_lt_of_ge (Nat.add_le_add_right hGe _))
+  have hBLeM : toBiased w b ≤ w.modulus := Nat.le_of_lt (toBiased_lt_modulus w b)
+  have hSubAdd :
+      (toBiased w a + w.halfModulus - toBiased w b) + w.modulus =
+        toBiased w a + w.halfModulus + (w.modulus - toBiased w b) := by
+    have h1 := Nat.add_sub_assoc hBLeM (toBiased w a + w.halfModulus)
+    have h2 : (toBiased w a + w.halfModulus + w.modulus) - toBiased w b =
+        (toBiased w a + w.halfModulus - toBiased w b) + w.modulus :=
+      (sub_add_comm_nat hLo).symm
+    exact h2.symm.trans h1
+  have hSumB : (b + w.halfModulus + (w.modulus - toBiased w b)) % w.modulus = 0 := by
+    rw [← add_mod_left_eq (b + w.halfModulus) (w.modulus - toBiased w b) w.modulus]
+    have hTb : (b + w.halfModulus) % w.modulus = toBiased w b := by
+      unfold toBiased; rw [Nat.mod_eq_of_lt hb]
+    rw [hTb, Nat.add_sub_of_le hBLeM, Nat.mod_self]
+  have hTarget :
+      toBiased w (subWithOverflowS w a b).1 =
+        (toBiased w a + w.halfModulus + (w.modulus - toBiased w b)) % w.modulus := by
+    unfold subWithOverflowS toBiased
+    dsimp only
+    rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb,
+      Nat.mod_eq_of_lt (Nat.mod_lt _ w.modulus_pos),
+      add_mod_left_eq (a + w.modulus - b) w.halfModulus w.modulus]
+    have hLhsAdd :
+        ((a + w.modulus - b + w.halfModulus) +
+          (b + w.halfModulus + (w.modulus - toBiased w b))) % w.modulus =
+          (a + w.modulus - b + w.halfModulus) % w.modulus := by
+      rw [← add_mod_right_eq (a + w.modulus - b + w.halfModulus), hSumB,
+        Nat.add_zero]
+    rw [← hLhsAdd]
+    have hCancel :
+        (a + w.modulus - b + w.halfModulus) +
+            (b + w.halfModulus + (w.modulus - toBiased w b)) =
+          (a + w.halfModulus + w.halfModulus + (w.modulus - toBiased w b)) +
+            w.modulus := by
+      have hbLe : b ≤ a + w.modulus :=
+        Nat.le_trans (Nat.le_of_lt hb) (Nat.le_add_left w.modulus a)
+      rw [Nat.add_assoc (a + w.modulus - b) w.halfModulus _,
+        Nat.add_assoc b w.halfModulus _,
+        ← Nat.add_assoc w.halfModulus b _,
+        Nat.add_comm w.halfModulus b,
+        Nat.add_assoc b w.halfModulus _,
+        ← Nat.add_assoc (a + w.modulus - b) b _,
+        Nat.sub_add_cancel hbLe]
+      rw [Nat.add_assoc a w.modulus _,
+        Nat.add_comm w.modulus (w.halfModulus + (w.halfModulus + (w.modulus - toBiased w b))),
+        ← Nat.add_assoc a _ w.modulus,
+        ← Nat.add_assoc a w.halfModulus _,
+        ← Nat.add_assoc (a + w.halfModulus) w.halfModulus (w.modulus - toBiased w b)]
+    rw [hCancel, Nat.add_mod_right]
+    have hTb : toBiased w b = (b + w.halfModulus) % w.modulus := by
+      unfold toBiased; rw [Nat.mod_eq_of_lt hb]
+    rw [hTb,
+      ← add_mod_left_eq ((a + w.halfModulus) % w.modulus + w.halfModulus)
+          (w.modulus - (b + w.halfModulus) % w.modulus) w.modulus,
+      add_mod_left_eq (a + w.halfModulus) w.halfModulus w.modulus,
+      add_mod_left_eq (a + w.halfModulus + w.halfModulus)
+          (w.modulus - (b + w.halfModulus) % w.modulus) w.modulus]
+  rw [hTarget, ← hSubAdd, Nat.add_mod_right, Nat.mod_eq_of_lt hDiffLt]
+
+/-- Exact no-overflow equivalence for `mulWithOverflowS`: no overflow iff both
+inputs are canonical `w`-bit patterns and the exact signed magnitude fits in
+`[-H, H - 1]` (allowing `INT_MIN * 1 = -H` while rejecting `INT_MIN * (-1) = +H`). -/
+theorem mulWithOverflowS_no_overflow_iff (w : ScalarWidth) (a b : Nat) :
+    (mulWithOverflowS w a b).2 = false ↔
+      a < w.modulus ∧ b < w.modulus ∧
+      let sa := Nat.ble w.halfModulus a
+      let sb := Nat.ble w.halfModulus b
+      let magA := if sa then w.modulus - a else a
+      let magB := if sb then w.modulus - b else b
+      match sa != sb with
+      | true => magA * magB ≤ w.halfModulus
+      | false => magA * magB < w.halfModulus := by
+  unfold mulWithOverflowS
+  dsimp only
+  constructor
+  · intro h
+    cases h1 : Nat.ble w.modulus a with
+    | true => rw [h1] at h; cases h
+    | false =>
+      cases h2 : Nat.ble w.modulus b with
+      | true => rw [h1, h2] at h; cases h
+      | false =>
+        rw [h1, h2] at h
+        have ha : a < w.modulus := nat_ble_false_iff_lt.mp h1
+        have hb : b < w.modulus := nat_ble_false_iff_lt.mp h2
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb] at h
+        refine ⟨ha, hb, ?_⟩
+        cases hNeg : (Nat.ble w.halfModulus a != Nat.ble w.halfModulus b) with
+        | true =>
+          rw [hNeg] at h
+          exact nat_blt_false_iff_ge.mp h
+        | false =>
+          rw [hNeg] at h
+          exact nat_ble_false_iff_lt.mp h
+  · intro ⟨ha, hb, hMag⟩
+    rw [nat_ble_false_iff_lt.mpr ha, nat_ble_false_iff_lt.mpr hb,
+      Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hb]
+    cases hNeg : (Nat.ble w.halfModulus a != Nat.ble w.halfModulus b) with
+    | true =>
+      rw [hNeg] at hMag
+      exact nat_blt_false_iff_ge.mpr hMag
+    | false =>
+      rw [hNeg] at hMag
+      exact nat_ble_false_iff_lt.mpr hMag
+
+/-- Exact `INT_MIN * (-1)` signed multiplication overflow boundary theorem:
+multiplying `w.halfModulus` (`INT_MIN`) by `w.modulus - 1` (`-1`) ALWAYS
+overflows at every `ScalarWidth` (`i8..i128`). -/
+theorem mulWithOverflowS_overflow_of_min_mul_neg_one (w : ScalarWidth) :
+    (mulWithOverflowS w w.halfModulus (w.modulus - 1)).2 = true := by
+  cases h : (mulWithOverflowS w w.halfModulus (w.modulus - 1)).2 with
+  | true => rfl
+  | false =>
+    let ⟨_, _, hMag⟩ :=
+      (mulWithOverflowS_no_overflow_iff w w.halfModulus (w.modulus - 1)).mp h
+    have hHalfLe : w.halfModulus ≤ w.modulus - 1 := by
+      have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+        rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+      have hHPos : 0 < w.halfModulus := by
+        cases w <;> exact Nat.zero_lt_succ _
+      rw [hModEq, Nat.add_sub_assoc hHPos]
+      exact Nat.le_add_right _ _
+    rw [Nat.ble_eq_true_of_le (Nat.le_refl w.halfModulus),
+      Nat.ble_eq_true_of_le hHalfLe] at hMag
+    dsimp only at hMag
+    have hSubH : w.modulus - w.halfModulus = w.halfModulus := by
+      have hModEq : w.modulus = w.halfModulus + w.halfModulus := by
+        rw [w.modulus_eq_two_mul_half, Nat.two_mul]
+      rw [hModEq, Nat.add_sub_cancel]
+    have hSub1 : w.modulus - (w.modulus - 1) = 1 := by
+      have hPos : 1 ≤ w.modulus := w.modulus_pos
+      have hEq : (w.modulus - 1) + 1 = w.modulus := Nat.sub_add_cancel hPos
+      have hC := congrArg (fun k => k - (w.modulus - 1)) hEq
+      rw [Nat.add_sub_cancel_left] at hC
+      exact hC.symm
+    rw [hSubH, hSub1] at hMag
+    change w.halfModulus * 1 < w.halfModulus at hMag
+    rw [Nat.mul_one] at hMag
+    exact False.elim (Nat.lt_irrefl w.halfModulus hMag)
+
+/-- Exact no-overflow equivalence for `shlWithOverflowS`. -/
+theorem shlWithOverflowS_no_overflow_iff (w : ScalarWidth) (a shift : Nat) :
+    (shlWithOverflowS w a shift).2 = false ↔
+      a < w.modulus ∧ shift < w.bits := by
+  unfold shlWithOverflowS
+  dsimp only
+  constructor
+  · intro h
+    cases h1 : Nat.ble w.modulus a with
+    | true => rw [h1] at h; cases h
+    | false =>
+      rw [h1] at h
+      exact ⟨nat_ble_false_iff_lt.mp h1, nat_ble_false_iff_lt.mp h⟩
+  · intro ⟨ha, hS⟩
+    rw [nat_ble_false_iff_lt.mpr ha, nat_ble_false_iff_lt.mpr hS]
+    rfl
+
+/-- Soundness equivalence for `addUncheckedS`. -/
+theorem addUncheckedS_eq_some_iff (w : ScalarWidth) (a b res : Nat) :
+    addUncheckedS w a b = some res ↔
+      (addWithOverflowS w a b).2 = false ∧ (addWithOverflowS w a b).1 = res := by
+  unfold addUncheckedS
+  dsimp only
+  cases h : (addWithOverflowS w a b).2 with
+  | true =>
+    constructor
+    · intro hc; cases hc
+    · intro ⟨hF, _⟩; cases hF
+  | false =>
+    constructor
+    · intro hEq; exact ⟨rfl, Option.some.inj hEq⟩
+    · intro ⟨_, hRes⟩; rw [hRes]
+
+/-- Soundness equivalence for `subUncheckedS`. -/
+theorem subUncheckedS_eq_some_iff (w : ScalarWidth) (a b res : Nat) :
+    subUncheckedS w a b = some res ↔
+      (subWithOverflowS w a b).2 = false ∧ (subWithOverflowS w a b).1 = res := by
+  unfold subUncheckedS
+  dsimp only
+  cases h : (subWithOverflowS w a b).2 with
+  | true =>
+    constructor
+    · intro hc; cases hc
+    · intro ⟨hF, _⟩; cases hF
+  | false =>
+    constructor
+    · intro hEq; exact ⟨rfl, Option.some.inj hEq⟩
+    · intro ⟨_, hRes⟩; rw [hRes]
+
+/-- Soundness equivalence for `mulUncheckedS`. -/
+theorem mulUncheckedS_eq_some_iff (w : ScalarWidth) (a b res : Nat) :
+    mulUncheckedS w a b = some res ↔
+      (mulWithOverflowS w a b).2 = false ∧ (mulWithOverflowS w a b).1 = res := by
+  unfold mulUncheckedS
+  dsimp only
+  cases h : (mulWithOverflowS w a b).2 with
+  | true =>
+    constructor
+    · intro hc; cases hc
+    · intro ⟨hF, _⟩; cases hF
+  | false =>
+    constructor
+    · intro hEq; exact ⟨rfl, Option.some.inj hEq⟩
+    · intro ⟨_, hRes⟩; rw [hRes]
+
+/-- Soundness equivalence for `shlUncheckedS`. -/
+theorem shlUncheckedS_eq_some_iff (w : ScalarWidth) (a shift res : Nat) :
+    shlUncheckedS w a shift = some res ↔
+      a < w.modulus ∧ shift < w.bits ∧ (a * pow2 shift) % w.modulus = res := by
+  unfold shlUncheckedS
+  dsimp only
+  cases h : (shlWithOverflowS w a shift).2 with
+  | true =>
+    constructor
+    · intro hc; cases hc
+    · intro ⟨ha, hS, _⟩
+      have hF := (shlWithOverflowS_no_overflow_iff w a shift).mpr ⟨ha, hS⟩
+      rw [h] at hF
+      cases hF
+  | false =>
+    let ⟨ha, hS⟩ := (shlWithOverflowS_no_overflow_iff w a shift).mp h
+    have hFst : (shlWithOverflowS w a shift).1 = (a * pow2 shift) % w.modulus := by
+      unfold shlWithOverflowS
+      dsimp only
+      rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hS]
+    rw [hFst]
+    constructor
+    · intro hEq; exact ⟨ha, hS, Option.some.inj hEq⟩
+    · intro ⟨_, _, hRes⟩; rw [hRes]
+
+/-- Fail-closed: `addUncheckedS` returns `none` when signed addition overflows. -/
+theorem addUncheckedS_none_of_overflow (w : ScalarWidth) {a b : Nat}
+    (hOvf : (addWithOverflowS w a b).2 = true) :
+    addUncheckedS w a b = none := by
+  unfold addUncheckedS; dsimp only; rw [hOvf]
+
+/-- Fail-closed: `subUncheckedS` returns `none` when signed subtraction overflows. -/
+theorem subUncheckedS_none_of_overflow (w : ScalarWidth) {a b : Nat}
+    (hOvf : (subWithOverflowS w a b).2 = true) :
+    subUncheckedS w a b = none := by
+  unfold subUncheckedS; dsimp only; rw [hOvf]
+
+/-- Fail-closed: `mulUncheckedS` returns `none` when signed multiplication overflows. -/
+theorem mulUncheckedS_none_of_overflow (w : ScalarWidth) {a b : Nat}
+    (hOvf : (mulWithOverflowS w a b).2 = true) :
+    mulUncheckedS w a b = none := by
+  unfold mulUncheckedS; dsimp only; rw [hOvf]
+
+/-- Fail-closed: `shlUncheckedS` returns `none` when `w.bits ≤ shift`. -/
+theorem shlUncheckedS_none_of_ge (w : ScalarWidth) (a : Nat) {shift : Nat}
+    (h : w.bits ≤ shift) : shlUncheckedS w a shift = none := by
+  unfold shlUncheckedS shlWithOverflowS
+  dsimp only
+  rw [Nat.ble_eq_true_of_le h]
+  cases Nat.ble w.modulus a <;> rfl
+
 /-! ## Part III: Parametric Frame Interface, Intervals, & `@[irreducible] OvfCastStageCut` -/
 
 /-- Parametric machine-state and local-slot interface (`0` `Prop` fields)
@@ -1887,6 +2541,171 @@ theorem ovfCastStageCut_checked_shl_diamond {fops : OvfCastFrameOps S Val}
       have hFlag : (shlWithOverflowU w acc shift).2 = true := congrArg Prod.snd hOp
       have hGe : w.bits ≤ shift := Nat.le_of_ble_eq_true hFlag
       exact hOvfArm s acc wrapped hInv hLo hHi hGe hOp)
+
+/-- Checked signed addition diamond (`addWithOverflowS`) with explicit biased
+join facts: hands the `overflowed = false` arm exact non-overflow bounds on
+`toBiased w acc + toBiased w c` and `toBiased w wrapped = toBiased w acc +
+toBiased w c - w.halfModulus`, and the `overflowed = true` arm the overflow
+certificate. -/
+theorem ovfCastStageCut_checked_add_signed_diamond {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (addWithOverflowS w acc c).1
+        (addWithOverflowS w acc c).2))
+    (hNoOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      acc < w.modulus → c < w.modulus →
+      w.halfModulus ≤ toBiased w acc + toBiased w c →
+      toBiased w acc + toBiased w c < w.modulus + w.halfModulus →
+      toBiased w wrapped = toBiased w acc + toBiased w c - w.halfModulus →
+      wrapped = (acc + c) % w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped false))
+    (hOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      addWithOverflowS w acc c = (wrapped, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped true)) :
+    OvfCastStageCut fops step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond (fun acc => addWithOverflowS w acc c)
+    branchState hDispatch
+    (fun s acc wrapped hInv hLo hHi hOp => by
+      have hNo : (addWithOverflowS w acc c).2 = false := congrArg Prod.snd hOp
+      have hW : (addWithOverflowS w acc c).1 = wrapped := congrArg Prod.fst hOp
+      let ⟨ha, hc, hBiLo, hBiHi⟩ := (addWithOverflowS_no_overflow_iff w acc c).mp hNo
+      have hBiEq : toBiased w wrapped =
+          toBiased w acc + toBiased w c - w.halfModulus := by
+        rw [← hW]
+        exact toBiased_addWithOverflowS_of_no_overflow w hNo
+      have hWrEq : wrapped = (acc + c) % w.modulus := by
+        rw [← hW]
+        unfold addWithOverflowS
+        dsimp only
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hc]
+      exact hNoOvfArm s acc wrapped hInv hLo hHi ha hc hBiLo hBiHi hBiEq hWrEq)
+    (fun s acc wrapped hInv hLo hHi hOp =>
+      hOvfArm s acc wrapped hInv hLo hHi hOp)
+
+/-- Checked signed subtraction diamond (`subWithOverflowS`) with explicit biased
+join facts. -/
+theorem ovfCastStageCut_checked_sub_signed_diamond {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (subWithOverflowS w acc c).1
+        (subWithOverflowS w acc c).2))
+    (hNoOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      acc < w.modulus → c < w.modulus →
+      toBiased w c ≤ toBiased w acc + w.halfModulus →
+      toBiased w acc + w.halfModulus < toBiased w c + w.modulus →
+      toBiased w wrapped = toBiased w acc + w.halfModulus - toBiased w c →
+      wrapped = (acc + w.modulus - c) % w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped false))
+    (hOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      subWithOverflowS w acc c = (wrapped, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped true)) :
+    OvfCastStageCut fops step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond (fun acc => subWithOverflowS w acc c)
+    branchState hDispatch
+    (fun s acc wrapped hInv hLo hHi hOp => by
+      have hNo : (subWithOverflowS w acc c).2 = false := congrArg Prod.snd hOp
+      have hW : (subWithOverflowS w acc c).1 = wrapped := congrArg Prod.fst hOp
+      let ⟨ha, hc, hBiLo, hBiHi⟩ := (subWithOverflowS_no_overflow_iff w acc c).mp hNo
+      have hBiEq : toBiased w wrapped =
+          toBiased w acc + w.halfModulus - toBiased w c := by
+        rw [← hW]
+        exact toBiased_subWithOverflowS_of_no_overflow w hNo
+      have hWrEq : wrapped = (acc + w.modulus - c) % w.modulus := by
+        rw [← hW]
+        unfold subWithOverflowS
+        dsimp only
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hc]
+      exact hNoOvfArm s acc wrapped hInv hLo hHi ha hc hBiLo hBiHi hBiEq hWrEq)
+    (fun s acc wrapped hInv hLo hHi hOp =>
+      hOvfArm s acc wrapped hInv hLo hHi hOp)
+
+/-- Checked signed multiplication diamond (`mulWithOverflowS`) with explicit
+signed-magnitude join facts. -/
+theorem ovfCastStageCut_checked_mul_signed_diamond {fops : OvfCastFrameOps S Val}
+    {step : S → StepOutcome S Out Fault} {baseLocals : List Val}
+    {ids : StageLocalIds} {earlyOk : Out → Bool}
+    {srcSpec dstSpec : StageIntervalSpec} {armFuel : Nat}
+    (w : ScalarWidth) (c : Nat)
+    (branchState : S → Nat → Bool → S)
+    (hDispatch : ∀ (s : S) (acc : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      listGet? (fops.localsOf s) ids.accId =
+        some (fops.mkScalar srcSpec.width acc) →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      step s = .step (branchState s (mulWithOverflowS w acc c).1
+        (mulWithOverflowS w acc c).2))
+    (hNoOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      acc < w.modulus → c < w.modulus →
+      (mulWithOverflowS w acc c).2 = false →
+      wrapped = (acc * c) % w.modulus →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped false))
+    (hOvfArm : ∀ (s : S) (acc wrapped : Nat),
+      StageIntervalStateInv fops baseLocals ids srcSpec s →
+      srcSpec.lo ≤ acc → acc ≤ srcSpec.hi →
+      mulWithOverflowS w acc c = (wrapped, true) →
+      wpUntilFuel (ops := MirWpOps.ofDetStep step (fun st => some (fops.blockOf st)))
+        (StageIntervalStateInv fops baseLocals ids dstSpec)
+        (fun o => earlyOk o = true) (fun _ => False)
+        armFuel (branchState s wrapped true)) :
+    OvfCastStageCut fops step baseLocals ids earlyOk srcSpec dstSpec
+      (armFuel + 1) :=
+  ovfCastStageCut_checked_diamond (fun acc => mulWithOverflowS w acc c)
+    branchState hDispatch
+    (fun s acc wrapped hInv hLo hHi hOp => by
+      have hNo : (mulWithOverflowS w acc c).2 = false := congrArg Prod.snd hOp
+      have hW : (mulWithOverflowS w acc c).1 = wrapped := congrArg Prod.fst hOp
+      let ⟨ha, hc, _⟩ := (mulWithOverflowS_no_overflow_iff w acc c).mp hNo
+      have hWrEq : wrapped = (acc * c) % w.modulus := by
+        rw [← hW]
+        unfold mulWithOverflowS
+        dsimp only
+        rw [Nat.mod_eq_of_lt ha, Nat.mod_eq_of_lt hc]
+      exact hNoOvfArm s acc wrapped hInv hLo hHi ha hc hNo hWrEq)
+    (fun s acc wrapped hInv hLo hHi hOp =>
+      hOvfArm s acc wrapped hInv hLo hHi hOp)
 
 /-- Generic single-step cast/transfer stage cut: when every entry state with
 `acc ∈ [srcSpec.lo, srcSpec.hi]` steps to `dstSpec.blockIdx` storing
@@ -3025,6 +3844,131 @@ theorem canary_ovfCast_signed_neg_stageCut_roundtrip (x : Nat)
   exact not_stageIntervalStateInv_of_decoded_out_of_range
     (fops := ocjFrameOps) ocjFrameOps_lawful (slot := .scalar .u8 0x80) (n := 0x80)
     rfl rfl (Or.inl (Nat.le_of_ble_eq_true rfl))
+
+/-- Signed two's-complement checked-arithmetic boundary & stage-cut canary:
+1. Verifies all Rust `i8` overflow extremes (`127+1`, `-128+(-1)`, `-128-1`,
+   `0-(-128)`, `-128*(-1)`, `16*8` overflow; `-64+(-64)`, `-1-(-128)`,
+   `-16*8`, `-128*1`, `-128*0` succeed with exact bit patterns);
+2. Composes an `ovfCastStageCut_checked_add_signed_diamond` (`i8` negative
+   range `[-16..-4]` (`[240..252]`) `+ 2` -> `[-14..-2]` (`[242..254]`), with
+   early-return overflow arm) directly into `ovfCastStageCut_widen_signed_neg`
+   (`i8 -> i16`, `[0xFFF2..0xFFFE]`) and lowers to `wpOutcome`. -/
+theorem canary_ovfCast_signed_checked_arithmetic_and_boundaries (x : Nat)
+    (hLo : 240 ≤ x) (hHi : x ≤ 252) :
+    -- Rust i8 boundary overflows:
+    addWithOverflowS .u8 127 1 = (128, true) ∧
+    addWithOverflowS .u8 128 255 = (127, true) ∧
+    subWithOverflowS .u8 128 1 = (127, true) ∧
+    subWithOverflowS .u8 0 128 = (128, true) ∧
+    mulWithOverflowS .u8 128 255 = (128, true) ∧
+    mulWithOverflowS .u8 16 8 = (128, true) ∧
+    -- Rust i8 non-overflowing extremes:
+    addWithOverflowS .u8 192 192 = (128, false) ∧
+    subWithOverflowS .u8 255 128 = (127, false) ∧
+    mulWithOverflowS .u8 240 8 = (128, false) ∧
+    mulWithOverflowS .u8 128 1 = (128, false) ∧
+    mulWithOverflowS .u8 128 0 = (0, false) ∧
+    -- Stage-cut signed checked-add diamond + signed widening composition:
+    (let base : List OcjVal := [.scalar .u8 x, .uninit, .uninit, .uninit]
+     let step : OcjState → StepOutcome OcjState Nat Unit := fun s =>
+       match s.bb with
+       | 0 =>
+         match listGet? s.locals 0 with
+         | some (.scalar .u8 a) =>
+           let r := addWithOverflowS .u8 a 2
+           if r.2 then .step { bb := 99, locals := s.locals }
+           else .step { bb := 1, locals := listSetAt s.locals 0 (.scalar .u8 r.1) }
+         | _ => .fault ()
+       | 1 =>
+         match listGet? s.locals 0 with
+         | some (.scalar .u8 a) =>
+           .step { bb := 2,
+                   locals := listSetAt s.locals 0 (.scalar .u16 (intToIntCast .u8 true .u16 a)) }
+         | _ => .fault ()
+       | 99 => .done 999
+       | _ => .done 0
+     wpOutcome (ops := MirWpOps.ofDetStep step (fun s => some s.bb))
+       (fun o => o = 0 ∨ o = 999) (fun _ => False) { bb := 0, locals := base }) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_⟩
+  let ids : StageLocalIds := { accId := 0, tmpId := 1, ovfMulId := 2, ovfAddId := 3 }
+  let base : List OcjVal := [.scalar .u8 x, .uninit, .uninit, .uninit]
+  let step : OcjState → StepOutcome OcjState Nat Unit := fun s =>
+    match s.bb with
+    | 0 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u8 a) =>
+        let r := addWithOverflowS .u8 a 2
+        if r.2 then .step { bb := 99, locals := s.locals }
+        else .step { bb := 1, locals := listSetAt s.locals 0 (.scalar .u8 r.1) }
+      | _ => .fault ()
+    | 1 =>
+      match listGet? s.locals 0 with
+      | some (.scalar .u8 a) =>
+        .step { bb := 2,
+                locals := listSetAt s.locals 0 (.scalar .u16 (intToIntCast .u8 true .u16 a)) }
+      | _ => .fault ()
+    | 99 => .done 999
+    | _ => .done 0
+  let branchState : OcjState → Nat → Bool → OcjState := fun s w b =>
+    if b then { bb := 99, locals := s.locals }
+    else { bb := 1, locals := listSetAt s.locals 0 (.scalar .u8 w) }
+  have hDia :
+      OvfCastStageCut ocjFrameOps step base ids (fun o => Nat.beq o 999)
+        ⟨0, .u8, 240, 252⟩ ⟨1, .u8, 242, 254⟩ 2 :=
+    ovfCastStageCut_checked_add_signed_diamond (fops := ocjFrameOps) (step := step)
+      .u8 2 branchState
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 0 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 acc) := hAccGet
+        dsimp only [step, branchState]
+        rw [hBb, hGet]
+        dsimp only
+        cases (addWithOverflowS .u8 acc 2).2 <;> rfl)
+      (fun s acc wrapped hInv hAccLo hAccHi _ _ _ _ _ hWrEq => by
+        have hSumLt : acc + 2 < ScalarWidth.u8.modulus :=
+          Nat.lt_of_le_of_lt (Nat.add_le_add_right hAccHi 2) (Nat.le_of_ble_eq_true rfl)
+        have hWrap : wrapped = acc + 2 := by
+          rw [hWrEq, Nat.mod_eq_of_lt hSumLt]
+        dsimp only [branchState]
+        refine wpUntilFuel_here (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        rw [hWrap]
+        exact stageIntervalStateInv_set_acc ocjFrameOps_lawful (by rfl)
+          (spec₂ := ⟨1, .u8, 242, 254⟩) hInv
+          (Nat.add_le_add_right hAccLo 2) (Nat.add_le_add_right hAccHi 2)
+          (Nat.le_of_ble_eq_true rfl))
+      (fun s _ _ _ _ _ _ => by
+        dsimp only [branchState]
+        refine wpUntilFuel_step (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+        change (StepOutcome.done (State := OcjState) (Fault := Unit) 999).wp _ _ _
+        dsimp only [StepOutcome.wp]
+        rfl)
+  have hWide :
+      OvfCastStageCut ocjFrameOps step base ids (fun o => Nat.beq o 999)
+        ⟨1, .u8, 242, 254⟩ ⟨2, .u16, 0xFFF2, 0xFFFE⟩ 1 :=
+    ovfCastStageCut_widen_signed_neg (fops := ocjFrameOps) (step := step)
+      ocjFrameOps_lawful (by rfl) (Nat.le_of_ble_eq_true rfl)
+      (Nat.le_of_ble_eq_true rfl) (Nat.le_of_ble_eq_true rfl)
+      (fun s acc hInv hAccGet _ _ => by
+        have hBb : s.bb = 1 := hInv.1
+        have hGet : listGet? s.locals 0 = some (.scalar .u8 acc) := hAccGet
+        dsimp only [step]
+        rw [hBb, hGet]
+        rfl)
+  have hComp := ovfCastStageCut_compose hDia hWide
+  have hEntry :
+      StageIntervalStateInv ocjFrameOps base ids ⟨0, .u8, 240, 252⟩
+        { bb := 0, locals := base } :=
+    ⟨rfl, rfl, ⟨x, rfl, hLo, hHi, Nat.le_of_ble_eq_true rfl⟩,
+     fun _ _ _ _ _ => rfl⟩
+  exact ovfCastStageCut_to_wpOutcome hEntry hComp
+    (fun o hEq => Or.inr (Nat.eq_of_beq_eq_true hEq))
+    (fun s hInv => by
+      have hBb : s.bb = 2 := hInv.1
+      refine wpUntil_step (ops := MirWpOps.ofDetStep step (fun st => some st.bb)) ?_
+      change (step s).wp _ _ _
+      dsimp only [step]
+      rw [hBb]
+      exact Or.inl rfl)
 
 end Anneal.ParametricCore
 
