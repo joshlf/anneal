@@ -103,12 +103,37 @@ def scan_olean_sizes(root: pathlib.Path, top_n: int) -> list[dict[str, Any]]:
     return oleans[:top_n]
 
 
+WORKBENCH_LEAN_DIR = pathlib.Path(__file__).resolve().parents[1] / "lean"
+
+
+def resolve_standalone_lean() -> tuple[pathlib.Path, pathlib.Path]:
+    if (WORKBENCH_LEAN_DIR / "lean-toolchain").is_file() and shutil.which("lake"):
+        proc = subprocess.run(
+            ["lake", "env", "which", "lean"],
+            cwd=str(WORKBENCH_LEAN_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            lb = pathlib.Path(proc.stdout.strip()).resolve()
+            pref = subprocess.run([str(lb), "--print-prefix"], capture_output=True, text=True, check=True)
+            return lb, pathlib.Path(pref.stdout.strip()).resolve()
+    which_lean = shutil.which("lean")
+    if not which_lean:
+        raise RuntimeError("Could not locate `lean` executable on PATH.")
+    lb = pathlib.Path(which_lean).resolve()
+    pref = subprocess.run([str(lb), "--print-prefix"], capture_output=True, text=True, check=True)
+    return lb, pathlib.Path(pref.stdout.strip()).resolve()
+
+
 def profile_module_exprs(
     lake_dir: pathlib.Path,
     module: str,
     prefix: str,
     top_n: int,
     disable_wrapper: bool,
+    lean_paths: list[pathlib.Path] | None = None,
 ) -> list[dict[str, Any]]:
     src = (
         EXPR_PROFILER_LEAN
@@ -117,12 +142,27 @@ def profile_module_exprs(
         .replace("{top_n}", str(top_n))
     )
     wrapper = find_lean_wrapper(disable_wrapper)
+    extra_paths = [str(p.resolve()) for p in (lean_paths or [])]
+    use_lake = (
+        (lake_dir / "lakefile.toml").is_file() or (lake_dir / "lakefile.lean").is_file()
+    )
     with tempfile.TemporaryDirectory(prefix="workbench-olean-prof-") as tmpdir:
         drv = pathlib.Path(tmpdir) / "ProfileExprs.lean"
         drv.write_text(src, encoding="utf-8")
+        env = dict(os.environ)
+        if use_lake and not extra_paths:
+            cmd = [*wrapper, "lake", "env", "lean", "--run", str(drv)]
+            cwd = str(lake_dir)
+        else:
+            lean_bin, sysroot = resolve_standalone_lean()
+            search_dirs = [str(lake_dir.resolve()), *extra_paths, str(sysroot / "lib" / "lean")]
+            env["LEAN_PATH"] = os.pathsep.join(search_dirs)
+            cmd = [*wrapper, str(lean_bin), "--run", str(drv)]
+            cwd = tmpdir
         proc = subprocess.run(
-            [*wrapper, "lake", "env", "lean", "--run", str(drv)],
-            cwd=str(lake_dir),
+            cmd,
+            cwd=cwd,
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -140,9 +180,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("target", help="Lake workspace root or directory containing `.olean` files.")
     parser.add_argument("--module", help="Optional Lean module to inspect per-declaration Expr DAG nodes.")
+    parser.add_argument("--lean-path", action="append", default=[], dest="lean_paths",
+                        help="Extra `.olean` directory on `LEAN_PATH` for Lake-free trees (repeatable).")
     parser.add_argument("--prefix", default="", help="Declaration namespace prefix (defaults to --module).")
     parser.add_argument("--top", type=int, default=20, help="Maximum rows to display (default: 20).")
-    parser.add_argument("--no-wrapper", action="store_true", help="Run `lake` without `anneal-lean-run`.")
+    parser.add_argument("--no-wrapper", action="store_true", help="Run `lake`/`lean` without `anneal-lean-run`.")
     parser.add_argument("--json", action="store_true", help="Emit JSON output.")
     args = parser.parse_args(argv)
 
@@ -150,7 +192,14 @@ def main(argv: list[str] | None = None) -> int:
     olean_rows = scan_olean_sizes(root, args.top)
     decl_rows: list[dict[str, Any]] = []
     if args.module:
-        decl_rows = profile_module_exprs(root, args.module, args.prefix, args.top, args.no_wrapper)
+        decl_rows = profile_module_exprs(
+            root,
+            args.module,
+            args.prefix,
+            args.top,
+            args.no_wrapper,
+            [pathlib.Path(p) for p in args.lean_paths],
+        )
 
     if args.json:
         print(json.dumps({"oleans": olean_rows, "declarations": decl_rows}, indent=2))

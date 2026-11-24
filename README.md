@@ -45,8 +45,13 @@ scripts.
       (replacing banned `by_cases` via `cases prop_em P`).
     - `ModIntOrder.lean`: `Nat` power-of-two monotonicity, modular arithmetic
       (`nat_mod_mod_mul_left`, `nat_add_mod_mod`, `nat_mod_sq_sub_succ`),
-      constructive `Int` order/subtraction without `Init.Data.Int.Order`, and
-      zero-axiom `BitVec` `bv_eq_of_toNat_eq`.
+      constructive `Int` order/subtraction without `Init.Data.Int.Order`,
+      `BitVec` / `UInt8`..`UInt64` non-wrapping arithmetic & `toNat`/`ofNat`
+      bridges, and polymorphic `List.beq` equality reflection.
+    - `NatBitwise.lean`: `Nat.bitwise` single-point unfolding, width bounds,
+      `Nat.testBit` characterization on numerals / `2^k` / `2^k - 1` / `mod 2^k` /
+      shifts / bitwise ops, bit extensionality (`nat_eq_of_testBit_eq`),
+      `nat_land_two_pow_sub_one_eq_mod`, and `nat_lor_add_land`.
   - `Workbench/Lab/` (`lab_meta` — rapid falsification & profiling):
     - `Counterexample.lean`: SplitMix64 + boundary-seed counterexample search
       (`findCounterexample1/2/3`) and 3-axis spec vacuity/output-sensitivity
@@ -54,22 +59,25 @@ scripts.
     - `KernelBench.lean`: `Lean.Expr` unique-node DAG vs. unfolded tree profiler
       (`measureExpr`, `profileDecl`).
 - `scripts/` — Standalone Python 3.10+ CLI diagnostics (`--help`, `--json`):
+  - `build_lean_dag.py`: Incremental, Merkle-cached, cgroup-governed multi-root
+    Lean 4 DAG builder (`--anneal-dir` / `--root` / `--out-dir`) for Lake-free
+    trees (`trusted/lean`, `theory`, `correspondence`, `vendor/lean-miri`).
   - `proof_health_scan.py`: `<50ms` static Pass-1 `TrustedBoundary` scanner
     (catches banned tactics, missing `prelude`, disallowed imports, `>=33`-item
     list literals, and cross-module `.eq_1` diamond hazards).
-  - `preflight_syntax_check.py`: Exact non-elaborating Lean 4 `Parser` CST
-    allowlist validator mirroring `TrustedBoundary.lean` (`--role theory` or
-    `--role trusted`).
-  - `audit_lean_hygiene.py`: Compiled `Lean.Environment` inspector pinpointing
-    `._unsafe_rec` parent definitions, `isPartial`/`isUnsafe` leaks,
-    out-of-namespace `realizeConst` `.eq_1` emissions, `sorryAx`, and
-    non-standard axioms (`_native.*` / `Lean.ofReduceBool`).
+  - `preflight_syntax_check.py`: Exact non-elaborating Lean 4 `Parser` CST +
+    pure-reference + import + scoped-extension validator mirroring
+    `TrustedBoundary.lean` (`--role theory` or `--role trusted`).
+  - `audit_lean_hygiene.py`: Compiled `Lean.Environment` inspector (`--lake-dir`
+    or Lake-free `--lean-path`) pinpointing `._unsafe_rec` parent definitions,
+    `isPartial`/`isUnsafe` leaks, out-of-namespace `realizeConst` helpers,
+    `sorryAx`, and non-standard axioms (`_native.*` / `Lean.ofReduceBool`).
   - `replay_audit_lean.py`: Compiles any standalone `.lean` file (no Lake
     project required) with `-DElab.async=false -Ddebug.skipKernelTC=false` and
     runs fresh `trustLevel := 0`, `loadExts := false` `Kernel.Environment.replay`
     plus optional namespace reachability checks.
   - `olean_profiler.py`: Ranks `.olean` sizes and per-declaration `Expr`
-    DAG/tree node hotspots.
+    DAG/tree node hotspots across Lake workspaces or Lake-free `.olean` dirs.
   - `farkas_cert_gen.py`: Synthesizes verified `Workbench.Pass1.LinearArith`
     `CutStep` certificates directly from linear `Nat` or `Int` inequalities.
   - `split_lean_module.py`: Analyzes declaration dependency DAGs and cross-chunk

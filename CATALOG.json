@@ -2293,9 +2293,28 @@
         "--allow-partial",
         "--json",
         "--lake-dir",
+        "--lean-path",
         "--module",
         "--namespace",
         "--no-wrapper"
+      ]
+    },
+    {
+      "name": "build_lean_dag",
+      "path": "scripts/build_lean_dag.py",
+      "badge": "host_script",
+      "summary": "Incremental, Merkle-cached, cgroup-governed Lean 4 DAG builder for Lake-free trees.",
+      "cli_flags": [
+        "--anneal-dir",
+        "--jobs",
+        "--json",
+        "--lean-bin",
+        "--lean-path",
+        "--memory-mb",
+        "--no-wrapper",
+        "--out-dir",
+        "--root",
+        "--strict-warnings"
       ]
     },
     {
@@ -2318,6 +2337,7 @@
       "summary": "Profiles `.olean` artifact sizes and per-declaration `Lean.Expr` DAG/tree bloat.",
       "cli_flags": [
         "--json",
+        "--lean-path",
         "--module",
         "--no-wrapper",
         "--prefix",

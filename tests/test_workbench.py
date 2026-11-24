@@ -18,7 +18,10 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import audit_lean_hygiene  # noqa: E402
+import build_lean_dag  # noqa: E402
 import farkas_cert_gen  # noqa: E402
+import olean_profiler  # noqa: E402
 import preflight_syntax_check  # noqa: E402
 import proof_health_scan  # noqa: E402
 import split_lean_module  # noqa: E402
@@ -179,6 +182,69 @@ class PreflightSyntaxCheckTests(unittest.TestCase):
             self.assertIn("Init.System.FilePath", msgs)
             self.assertIn("dbgTrace", msgs)
             self.assertIn("System", msgs)
+
+
+class BuildLeanDagTests(unittest.TestCase):
+    def test_lake_free_module_dag_build_cache_and_audit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            src_root = root / "src"
+            (src_root / "Demo").mkdir(parents=True)
+            out_dir = root / "out"
+            (src_root / "Demo" / "Base.lean").write_text(
+                "module\nprelude\npublic import Init.Core\n@[expose] public section\n"
+                "namespace Demo\npublic def idNat (n : Nat) : Nat := n\nend Demo\nend\n",
+                encoding="utf-8",
+            )
+            (src_root / "Demo" / "Top.lean").write_text(
+                "module\nprelude\npublic import Demo.Base\npublic section\n"
+                "namespace Demo\npublic theorem idNat_eq (n : Nat) : idNat n = n := rfl\nend Demo\nend\n",
+                encoding="utf-8",
+            )
+            lean_bin, sysroot = build_lean_dag.resolve_lean_toolchain(None)
+            roots = build_lean_dag.parse_root_specs(None, [str(src_root)])
+
+            cold = build_lean_dag.build_dag(
+                targets=["Demo.Top"],
+                roots=roots,
+                out_dir=out_dir,
+                extra_lean_paths=[],
+                lean_bin=lean_bin,
+                sysroot=sysroot,
+                jobs=2,
+                quiet=True,
+            )
+            self.assertTrue(cold["clean"], cold["failed"])
+            self.assertEqual(sorted(cold["built"]), ["Demo.Base", "Demo.Top"])
+            self.assertEqual(cold["cached"], [])
+
+            warm = build_lean_dag.build_dag(
+                targets=["Demo.Top"],
+                roots=roots,
+                out_dir=out_dir,
+                extra_lean_paths=[],
+                lean_bin=lean_bin,
+                sysroot=sysroot,
+                jobs=2,
+                quiet=True,
+            )
+            self.assertTrue(warm["clean"])
+            self.assertEqual(warm["built"], [])
+            self.assertEqual(warm["cached"], ["Demo.Base", "Demo.Top"])
+
+            hygiene = audit_lean_hygiene.run_environment_audit(
+                lake_dir=None,
+                modules=["Demo.Top"],
+                namespaces=["Demo"],
+                lean_paths=[out_dir],
+            )
+            self.assertTrue(hygiene["clean"], hygiene)
+            self.assertGreaterEqual(hygiene["total_constants"], 2)
+
+            prof = olean_profiler.profile_module_exprs(
+                out_dir, "Demo.Top", "Demo", 10, False, []
+            )
+            self.assertTrue(any(r["decl"] == "Demo.idNat_eq" for r in prof))
 
 
 if __name__ == "__main__":

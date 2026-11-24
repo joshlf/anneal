@@ -21,6 +21,7 @@ import tempfile
 from typing import Any
 
 STANDARD_AXIOMS = ["propext", "Classical.choice", "Quot.sound"]
+WORKBENCH_LEAN_DIR = pathlib.Path(__file__).resolve().parents[1] / "lean"
 
 LEAN_INSPECTOR_TEMPLATE = r"""import Lean
 {imports}
@@ -143,11 +144,33 @@ def find_lean_wrapper(disable_wrapper: bool) -> list[str]:
     return []
 
 
+def resolve_standalone_lean() -> tuple[pathlib.Path, pathlib.Path]:
+    if (WORKBENCH_LEAN_DIR / "lean-toolchain").is_file() and shutil.which("lake"):
+        proc = subprocess.run(
+            ["lake", "env", "which", "lean"],
+            cwd=str(WORKBENCH_LEAN_DIR),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            lb = pathlib.Path(proc.stdout.strip()).resolve()
+            pref = subprocess.run([str(lb), "--print-prefix"], capture_output=True, text=True, check=True)
+            return lb, pathlib.Path(pref.stdout.strip()).resolve()
+    which_lean = shutil.which("lean")
+    if not which_lean:
+        raise RuntimeError("Could not locate `lean` executable on PATH.")
+    lb = pathlib.Path(which_lean).resolve()
+    pref = subprocess.run([str(lb), "--print-prefix"], capture_output=True, text=True, check=True)
+    return lb, pathlib.Path(pref.stdout.strip()).resolve()
+
+
 def run_environment_audit(
-    lake_dir: pathlib.Path,
+    lake_dir: pathlib.Path | None,
     modules: list[str],
     namespaces: list[str],
     disable_wrapper: bool = False,
+    lean_paths: list[pathlib.Path] | None = None,
 ) -> dict[str, Any]:
     imports = "\n".join(f"import {m}" for m in modules)
     mod_names = ", ".join(f"{{ module := `{m} }}" for m in modules)
@@ -162,22 +185,46 @@ def run_environment_audit(
     )
 
     wrapper = find_lean_wrapper(disable_wrapper)
+    extra_paths = [str(p.resolve()) for p in (lean_paths or [])]
+    use_lake = (
+        lake_dir is not None
+        and ((lake_dir / "lakefile.toml").is_file() or (lake_dir / "lakefile.lean").is_file())
+    )
+    if lake_dir is not None and not use_lake:
+        extra_paths.insert(0, str(lake_dir.resolve()))
+
     with tempfile.TemporaryDirectory(prefix="workbench-hygiene-") as tmpdir:
         driver_path = pathlib.Path(tmpdir) / "InspectEnv.lean"
         driver_path.write_text(driver_src, encoding="utf-8")
-        cmd = [
-            *wrapper,
-            "lake",
-            "env",
-            "lean",
-            "-DElab.async=false",
-            "-Ddebug.skipKernelTC=false",
-            "--run",
-            str(driver_path),
-        ]
+        env = dict(os.environ)
+        if use_lake and not extra_paths:
+            cmd = [
+                *wrapper,
+                "lake",
+                "env",
+                "lean",
+                "-DElab.async=false",
+                "-Ddebug.skipKernelTC=false",
+                "--run",
+                str(driver_path),
+            ]
+            cwd = str(lake_dir)
+        else:
+            lean_bin, sysroot = resolve_standalone_lean()
+            env["LEAN_PATH"] = os.pathsep.join([*extra_paths, str(sysroot / "lib" / "lean")])
+            cmd = [
+                *wrapper,
+                str(lean_bin),
+                "-DElab.async=false",
+                "-Ddebug.skipKernelTC=false",
+                "--run",
+                str(driver_path),
+            ]
+            cwd = tmpdir
         proc = subprocess.run(
             cmd,
-            cwd=str(lake_dir),
+            cwd=cwd,
+            env=env,
             capture_output=True,
             text=True,
             check=False,
@@ -217,8 +264,10 @@ def run_environment_audit(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--lake-dir", required=True,
-                        help="Path to the Lake workspace directory containing lakefile.toml/lean.")
+    parser.add_argument("--lake-dir", default=None,
+                        help="Path to a Lake workspace directory (or `.olean` root directory).")
+    parser.add_argument("--lean-path", action="append", default=[], dest="lean_paths",
+                        help="Prebuilt `.olean` directory for Lake-free trees (repeatable).")
     parser.add_argument("--module", action="append", required=True, dest="modules",
                         help="Lean module name to import and inspect (repeatable).")
     parser.add_argument("--namespace", action="append", default=[], dest="namespaces",
@@ -226,15 +275,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-partial", action="store_true",
                         help="Do not fail exit code on partial/unsafe defs (for Lab/meta modules).")
     parser.add_argument("--no-wrapper", action="store_true",
-                        help="Invoke `lake` directly without `anneal-lean-run`.")
+                        help="Invoke `lake`/`lean` directly without `anneal-lean-run`.")
     parser.add_argument("--json", action="store_true", help="Emit JSON report.")
     args = parser.parse_args(argv)
+    if not args.lake_dir and not args.lean_paths:
+        parser.error("Provide `--lake-dir <dir>` and/or `--lean-path <dir>`.")
 
     report = run_environment_audit(
-        lake_dir=pathlib.Path(args.lake_dir).resolve(),
+        lake_dir=pathlib.Path(args.lake_dir).resolve() if args.lake_dir else None,
         modules=args.modules,
         namespaces=args.namespaces,
         disable_wrapper=args.no_wrapper,
+        lean_paths=[pathlib.Path(p) for p in args.lean_paths],
     )
     if args.allow_partial:
         ok = (

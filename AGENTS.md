@@ -62,9 +62,9 @@ every artifact under one of three mechanically checked badges:
 - Whenever `anneal-lean-run` is installed on the host (`$ANNEAL_LEAN_RUN` or
   `~/.local/bin/anneal-lean-run`), wrap CLI `lake` and `lean` invocations in
   `anneal-lean-run` so builds respect host cgroup memory caps and build slots.
-  `tools/workbench.py`, `scripts/audit_lean_hygiene.py`, and
-  `scripts/olean_profiler.py` discover and apply `anneal-lean-run`
-  automatically when present.
+  `tools/workbench.py`, `scripts/build_lean_dag.py`,
+  `scripts/audit_lean_hygiene.py`, and `scripts/olean_profiler.py` discover and
+  apply `anneal-lean-run` automatically when present.
 - Prefer warm Lean LSP tools (`lean_diagnostics`, `lean_goal`,
   `lean_multi_attempt`) during interactive proof editing.
 
