@@ -85,16 +85,18 @@ pub use miri_eval::{
 };
 pub use mutators_itree::{
     BranchLoopWeaver, CallBoundaryOutliner, ExtOracleInjector, GeneratedItreeCandidate,
-    ITREE_AST_MUTATORS, ItreeAstMutator, ItreeMutationStep, LayoutPaddingPerturber,
-    StagedItreeCandidate, annotate_itree_external_callees, contains_unsafe_token,
-    generate_itree_batch, generate_itree_identity_batch, itree_candidate_replay_is_faithful,
-    reconstruct_itree_mutation_steps, replay_itree_mutation_steps, stage_itree_candidate_items,
+    ITREE_AST_MUTATORS, IndirectDispatchOutliner, ItreeAstMutator, ItreeMutationStep,
+    LayoutPaddingPerturber, StagedItreeCandidate, annotate_itree_external_callees,
+    contains_unsafe_token, generate_itree_batch, generate_itree_identity_batch,
+    itree_candidate_replay_is_faithful, reconstruct_itree_mutation_steps,
+    replay_itree_mutation_steps, stage_itree_candidate_items,
 };
 pub use mutators_miri::{
-    ArithmeticCastMutator, BitValidityTransmuteMutator, GeneratedMiriCandidate, MIRI_AST_MUTATORS,
-    MIRI_CORPUS_CRATE_HEADER, MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MiriCorpusSeed,
-    MutationMode, PlaceProjectionWrapper, RAW_MIRI_DIFF_CORPUS_RS, RawPtrOffsetMutator,
-    RecordedMutationStep, TreeBorrowsRetagInterleaver, build_standalone_candidate_source,
+    ArithmeticCastMutator, BitValidityTransmuteMutator, ClosureAndAddrEqMutator,
+    GeneratedMiriCandidate, MIRI_AST_MUTATORS, MIRI_CORPUS_CRATE_HEADER,
+    MIRI_CORPUS_MODULE_PREAMBLE, MiriAstMutator, MiriCorpusSeed, MutationMode,
+    PlaceProjectionWrapper, RAW_MIRI_DIFF_CORPUS_RS, RawPtrOffsetMutator, RecordedMutationStep,
+    TreeBorrowsRetagInterleaver, VTableAndFnPtrMutator, build_standalone_candidate_source,
     extract_closed_corpus_seeds, generate_miri_batch, generate_miri_corpus_batch,
     generate_miri_identity_batch, load_miri_diff_corpus_seeds, miri_candidate_replay_is_faithful,
     reconstruct_miri_mutation_steps, replay_miri_mutation_steps,

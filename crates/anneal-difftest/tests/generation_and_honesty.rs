@@ -77,11 +77,14 @@ const MUTATOR_NAMES: &[&str] = &[
     "BitValidityTransmuteMutator",
     "BranchLoopWeaver",
     "CallBoundaryOutliner",
+    "ClosureAndAddrEqMutator",
     "ExtOracleInjector",
+    "IndirectDispatchOutliner",
     "LayoutPaddingPerturber",
     "PlaceProjectionWrapper",
     "RawPtrOffsetMutator",
     "TreeBorrowsRetagInterleaver",
+    "VTableAndFnPtrMutator",
 ];
 
 /// The only keys the runner writes to the ledger. It also preserves keys that
@@ -720,6 +723,8 @@ pub fn signed_window(v: i32, limit: i32) -> i32 {
         "RawPtrOffsetMutator",
         "TreeBorrowsRetagInterleaver",
         "BitValidityTransmuteMutator",
+        "VTableAndFnPtrMutator",
+        "ClosureAndAddrEqMutator",
     ] {
         assert!(
             seen_mutators.contains(expected_mutator),
@@ -810,6 +815,7 @@ pub fn kernel_step(magic: u32, len: u32) -> u32 {
         "LayoutPaddingPerturber",
         "BranchLoopWeaver",
         "ExtOracleInjector",
+        "IndirectDispatchOutliner",
     ] {
         assert!(
             seen_mutators.contains(expected_mutator),
