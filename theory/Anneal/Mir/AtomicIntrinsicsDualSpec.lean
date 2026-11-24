@@ -1001,6 +1001,48 @@ theorem lmFrozenTraceAuthorityCheck_sound (obs : Bool → List AtomicAccessOutco
   · exact (of_decide_eq_true h).1
   · exact (of_decide_eq_true h).2
 
+private def itS8 : IntType := ⟨.Signed, ⟨1⟩⟩
+/-- MiniRust signed two's-complement boundary cells on `i8`/`i32`/`i64`, observed as bit patterns: `.1` = seven **in-range** cells (`-1 + 1`, `126 + 1`, `-127 - 1`,
+`i32::MIN + i32::MAX`, `i64` `-1 + 1`, CAS hit `-5 → -1`, sign-flipped CAS miss `5 ≠ -5`); `.2` = four **overflow** cells (`i8::MAX + 1`, `i8::MIN - 1`, `i32::MAX + 1`, `i64::MIN - 1`). -/
+def mrSignedBoundary : AtomicMemoryMode → List AtomicAccessOutcome × List AtomicAccessOutcome
+  | .basic =>
+    ([obsMrTwosComp 1 bmAllocs (bmRmw (bmWith (initBytes [0xFF])) bmPtr .Add 1 itS8), obsMrTwosComp 1 bmAllocs (bmRmw (bmWith (initBytes [0x7E])) bmPtr .Add 1 itS8),
+      obsMrTwosComp 1 bmAllocs (bmRmw (bmWith (initBytes [0x81])) bmPtr .Sub 1 itS8), obsMrTwosComp 4 bmAllocs (bmRmw (bmWith (initBytes [0, 0, 0, 0x80])) bmPtr .Add 2147483647 itI32),
+      obsMrTwosComp 8 bmAllocs (bmRmw (bmWith (initBytes [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])) bmPtr .Add 1 itI64),
+      casFlagSynth 0xFFFFFFFB (obsMrTwosComp 4 bmAllocs (bmCas (bmWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF])) bmPtr (-5) (-1) itI32)),
+      casFlagSynth 5 (obsMrTwosComp 4 bmAllocs (bmCas (bmWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF])) bmPtr 5 9 itI32))],
+     [obsMrTwosComp 1 bmAllocs (bmRmw (bmWith (initBytes [0x7F])) bmPtr .Add 1 itS8), obsMrTwosComp 1 bmAllocs (bmRmw (bmWith (initBytes [0x80])) bmPtr .Sub 1 itS8),
+      obsMrTwosComp 4 bmAllocs (bmRmw (bmWith (initBytes [0xFF, 0xFF, 0xFF, 0x7F])) bmPtr .Add 1 itI32), obsMrTwosComp 8 bmAllocs (bmRmw (bmWith (initBytes [0, 0, 0, 0, 0, 0, 0, 0x80])) bmPtr .Sub 1 itI64)])
+  | .treeBorrows =>
+    ([obsMrTwosComp 1 tbAllocs (tbRmw (tbWith (initBytes [0xFF])) tbPtr .Add 1 itS8), obsMrTwosComp 1 tbAllocs (tbRmw (tbWith (initBytes [0x7E])) tbPtr .Add 1 itS8),
+      obsMrTwosComp 1 tbAllocs (tbRmw (tbWith (initBytes [0x81])) tbPtr .Sub 1 itS8), obsMrTwosComp 4 tbAllocs (tbRmw (tbWith (initBytes [0, 0, 0, 0x80])) tbPtr .Add 2147483647 itI32),
+      obsMrTwosComp 8 tbAllocs (tbRmw (tbWith (initBytes [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF])) tbPtr .Add 1 itI64),
+      casFlagSynth 0xFFFFFFFB (obsMrTwosComp 4 tbAllocs (tbCas (tbWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF])) tbPtr (-5) (-1) itI32)),
+      casFlagSynth 5 (obsMrTwosComp 4 tbAllocs (tbCas (tbWith (initBytes [0xFB, 0xFF, 0xFF, 0xFF])) tbPtr 5 9 itI32))],
+     [obsMrTwosComp 1 tbAllocs (tbRmw (tbWith (initBytes [0x7F])) tbPtr .Add 1 itS8), obsMrTwosComp 1 tbAllocs (tbRmw (tbWith (initBytes [0x80])) tbPtr .Sub 1 itS8),
+      obsMrTwosComp 4 tbAllocs (tbRmw (tbWith (initBytes [0xFF, 0xFF, 0xFF, 0x7F])) tbPtr .Add 1 itI32), obsMrTwosComp 8 tbAllocs (tbRmw (tbWith (initBytes [0, 0, 0, 0, 0, 0, 0, 0x80])) tbPtr .Sub 1 itI64)])
+/-- LeanMiri/Rust wrapping image of the four `mrSignedBoundary` overflow cells (two's-complement wrap modulo `2^(8·width)`). -/
+def signedOverflowWrapped : List AtomicAccessOutcome :=
+  [.okScalar 0x7F 0x80, .okScalar 0x80 0x7F, .okScalar 0x7FFFFFFF 0x80000000, .okScalar 0x8000000000000000 0x7FFFFFFFFFFFFFFF]
+/-- **Signed boundary table on `Mach`/`MachTB`**: every in-range cell succeeds; every signed overflow is `Stop.specPanic` (never a wrap). -/
+theorem mrSignedBoundary_table (m : AtomicMemoryMode) :
+    (mrSignedBoundary m).1 = [.okScalar 0xFF 0, .okScalar 0x7E 0x7F, .okScalar 0x81 0x80, .okScalar 0x80000000 0xFFFFFFFF, .okScalar 0xFFFFFFFFFFFFFFFF 0,
+      .okCas 0xFFFFFFFB true 0xFFFFFFFF, .okCas 0xFFFFFFFB false 0xFFFFFFFB] ∧
+    (mrSignedBoundary m).2 = [.specPanic, .specPanic, .specPanic, .specPanic] := by cases m <;> decide +kernel
+/-- Cross-authority signed-boundary check: equal to MiniRust on the in-range cells and wrapping exactly on its `specPanic` cells, in BOTH modes. -/
+def lmSignedBoundaryAuthorityCheck (obs : Bool → List AtomicAccessOutcome) : Bool :=
+  decide (obs (AtomicMemoryMode.toLmTreeBorrows .basic) = (mrSignedBoundary .basic).1 ++ signedOverflowWrapped ∧
+    obs (AtomicMemoryMode.toLmTreeBorrows .treeBorrows) = (mrSignedBoundary .treeBorrows).1 ++ signedOverflowWrapped)
+/-- Soundness: a passing authority agrees with MiniRust on every in-range cell, wraps on the overflow cells, and so **provably differs** from
+MiniRust's full 11-cell observation: signed overflow is a forced divergence in both modes. -/
+theorem lmSignedBoundaryAuthorityCheck_sound (obs : Bool → List AtomicAccessOutcome)
+    (h : lmSignedBoundaryAuthorityCheck obs = true) (m : AtomicMemoryMode) :
+    obs m.toLmTreeBorrows = (mrSignedBoundary m).1 ++ signedOverflowWrapped ∧
+    obs m.toLmTreeBorrows ≠ (mrSignedBoundary m).1 ++ (mrSignedBoundary m).2 := by
+  unfold lmSignedBoundaryAuthorityCheck at h; cases m
+  · exact ⟨(of_decide_eq_true h).1, fun e => absurd ((of_decide_eq_true h).1.symm.trans e) (by decide +kernel)⟩
+  · exact ⟨(of_decide_eq_true h).2, fun e => absurd ((of_decide_eq_true h).2.symm.trans e) (by decide +kernel)⟩
+
 /-! ## §6. Exhaustive Import-Isolation, Constructive-Codec, & Axiom Audit -/
 
 section AxiomAudit
@@ -1043,7 +1085,7 @@ run_cmd do
           if (`Trusted.Rustc).isPrefixOf u then
             throwError "shadow-evaluator violation: {c} value references {u}"
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 31 then
+  if theorems < 33 then
     throwError "axiom audit is vacuous: only {theorems} theorems seen"
   logInfo m!"Anneal.Mir.AtomicIntrinsicsDualSpec: verified {checked} declarations ({theorems} theorems), constructive codecs choice-free, import_isolated=true, sorry_free=true, ofReduceBool_free=true"
 

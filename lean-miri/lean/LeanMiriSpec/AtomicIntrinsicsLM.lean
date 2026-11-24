@@ -1542,13 +1542,30 @@ def lmTagTrace (tagMode : CellTagMode) (tb : Bool) : List LmAtomicObs :=
   lmTraceGo [ (c, "atomic_load", #[ptr], layoutU32, obsS), (cCas, "atomic_cxchg", #[ptr, v 6, v 9], mkCasDestLayout layoutU32, obsC),
     (c, "atomic_store", #[ptr, v 9], layoutUnit, fun st => (cell st).map LmAtomicObs.okStore), (c, "atomic_load", #[ptr], layoutU32, obsS) ] (mkSingleCellState cfg)
 
-/-- **`Reserved` vs. `Frozen` threaded trace & RMW/CAS asymmetry** (`treeBorrows = true`). -/
+/-- **`Reserved` vs. `Frozen` threaded trace** (both borrow modes); on a TB `Reserved` child `xadd` and a *succeeding* `cxchg` both write (no RMW/CAS asymmetry; the `Frozen` write-side `.ub` is `eval_tb_frozen_mode_sensitivity`). -/
 theorem lmTagTrace_reserved_vs_frozen :
     let resCfg : SingleCellConfig := { widthBytes := 4, initBits := 5, allocSize := 4, allocAlign := ⟨2⟩, treeBorrows := true, tagMode := .reservedChild }
     let ok4 : List LmAtomicObs := [.okScalar 5 5, .okCas 5 false 5, .okStore 9, .okScalar 9 9]
     lmTagTrace .frozenChild false = ok4 ∧ lmTagTrace .frozenChild true = [.okScalar 5 5, .okCas 5 false 5, .ub] ∧
     lmTagTrace .reservedChild false = ok4 ∧ lmTagTrace .reservedChild true = ok4 ∧
     runEvalRmw "atomic_xadd" resCfg layoutU32 1 = .okScalar 5 6 ∧ runEvalCas false resCfg layoutU32 5 9 = .okCas 5 true 9 := by decide +kernel
+
+/-- Signed two's-complement **boundary** cells on `i8`/`i32`/`i64` (`treeBorrows := tb`): seven in-range cells (`-1 + 1`, `126 + 1`, `-127 - 1`,
+`i32::MIN + i32::MAX`, `i64` `-1 + 1`, negative `cxchg` hit `-5 → -1`, sign-flipped miss `5 ≠ -5`), then four overflow cells (`i8::MAX + 1`, `i8::MIN - 1`, `i32::MAX + 1`, `i64::MIN - 1`). -/
+def lmSignedBoundaryObs (tb : Bool) : List LmAtomicObs :=
+  let c (w bits : Nat) : SingleCellConfig := { widthBytes := w, initBits := bits, treeBorrows := tb }
+  [ runEvalRmw "atomic_xadd" (c 1 0xFF) layoutI8 1, runEvalRmw "atomic_xadd" (c 1 0x7E) layoutI8 1, runEvalRmw "atomic_xsub" (c 1 0x81) layoutI8 1,
+    runEvalRmw "atomic_xadd" (c 4 0x80000000) layoutI32 0x7FFFFFFF, runEvalRmw "atomic_xadd" (c 8 0xFFFFFFFFFFFFFFFF) layoutI64 1,
+    runEvalCas false (c 4 0xFFFFFFFB) layoutI32 0xFFFFFFFB 0xFFFFFFFF, runEvalCas false (c 4 0xFFFFFFFB) layoutI32 5 9,
+    runEvalRmw "atomic_xadd" (c 1 0x7F) layoutI8 1, runEvalRmw "atomic_xsub" (c 1 0x80) layoutI8 1,
+    runEvalRmw "atomic_xadd" (c 4 0x7FFFFFFF) layoutI32 1, runEvalRmw "atomic_xsub" (c 8 0x8000000000000000) layoutI64 1 ]
+/-- **Signed boundary table** (both borrow modes): a carry out of the bit pattern (`0xFF + 1`) and a signed overflow (`0x7F + 1 = 0x80`) both wrap
+modulo `2^(8·width)` without faulting; a negative `cxchg` compares raw bit patterns (`0xFFFFFFFB`). -/
+theorem lmSignedBoundaryObs_table (tb : Bool) : lmSignedBoundaryObs tb =
+    ([.okScalar 0xFF 0, .okScalar 0x7E 0x7F, .okScalar 0x81 0x80, .okScalar 0x80000000 0xFFFFFFFF, .okScalar 0xFFFFFFFFFFFFFFFF 0,
+      .okCas 0xFFFFFFFB true 0xFFFFFFFF, .okCas 0xFFFFFFFB false 0xFFFFFFFB,
+      .okScalar 0x7F 0x80, .okScalar 0x80 0x7F, .okScalar 0x7FFFFFFF 0x80000000, .okScalar 0x8000000000000000 0x7FFFFFFFFFFFFFFF] : List LmAtomicObs) := by
+  cases tb <;> decide +kernel
 
 /-! ## §7. Exhaustive Axiom & Import-Isolation Audit -/
 
@@ -1573,7 +1590,7 @@ run_cmd do
     checked := checked + 1
     if (`LeanMiriSpec.AtomicIntrinsicsLM).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  if theorems < 37 then
+  if theorems < 38 then
     throwError "axiom audit is vacuous: only {theorems} theorems of LeanMiriSpec.AtomicIntrinsicsLM seen"
   logInfo m!"LeanMiriSpec.AtomicIntrinsicsLM: verified {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
