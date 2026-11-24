@@ -29,8 +29,10 @@ wide-pointer `ptr::addr_eq` vs `==` (`rust#166144`):
   `LeanMiriSpec.HeapAllocAndWidePtrLM.lmHeapWideObserve`.
 - **Authority 3 (Anneal TCB)**: theorems stated directly on the real
   `preventsDeallocation`, `hasProtectedLocalBorrow`, `hasFrameDeallocProtectorConflict`,
-  `evalTerminator`, `evalTailCallTerminator`, `evalCastPtrToPtr`, `ptrAddressScalar?`,
-  `ptrToAddrScalar`, `evalRvalue`, and `stepMirFn` (zero shadow evaluators).
+  `disableFrameBorrows`, `restoreCallerProtectors`, `evalStmt`, `evalTerminator`,
+  `evalTailCallTerminator`, `enterTailCalleeFrame`, `evalCastPtrToPtr`,
+  `ptrAddressScalar?`, `ptrToAddrScalar`, `evalRvalue`, `evalWidePtrAggregateRelBinOp`,
+  `evalWidePtrRelBinOp`, and `stepMirFn` (zero shadow evaluators).
 
 Classification (`2 × 30 = 60` cells):
 1. **Exact agreement (`0..27`, 56 cells)**, incl. joint Tree Borrows mode sensitivity on
@@ -1090,6 +1092,24 @@ theorem evalTerminator_return_no_conflict_root (s : MachineState) (span : String
   simp only [evalTerminator, h0, hstack, hc', hinit]
   rfl
 
+/-- **Root `return_` deallocation post-condition**: combining
+`evalTerminator_return_no_conflict_root` with `disableFrameBorrows_post`, after a
+conflict-free root return every borrow of a root-frame local `< length s.frame.locals`
+is `.disabled` with `allocDead = true`. -/
+theorem evalTerminator_return_root_disables_frame (s : MachineState) (span : String)
+    (cb : Option CapturedMir) (v : Value)
+    (h0 : get? s.frame.locals 0 = some (.init v))
+    (hc : hasFrameDeallocProtectorConflict s.memory.borrows s.memory.activeProtectors
+      (length s.memory.callStack) (length s.frame.locals) = false)
+    (hstack : s.memory.callStack = [])
+    (hinit : valueContainsUninit v = false) :
+    ∃ mem', evalTerminator s { kind := .return_, span := span } cb = MirStepNode.retNormal v mem' ∧
+      ∀ e ∈ mem'.borrows, e.targetFrameDepth = 0 → e.targetLocal < length s.frame.locals →
+        e.perm = .disabled ∧ e.allocDead = true :=
+  ⟨{ s.memory with borrows := disableFrameBorrows s.memory.borrows 0 (length s.frame.locals) },
+    evalTerminator_return_no_conflict_root s span cb v h0 hc hstack hinit,
+    (disableFrameBorrows_post s.memory.borrows 0 (length s.frame.locals)).1⟩
+
 /-- **Tail calls tear down the frame too** (`evalTailCallTerminator`): once the callee
 and arguments resolve, an active deallocation-preventing protector faults with `.ub`. -/
 theorem evalTailCallTerminator_protector_ub (s : MachineState) (func : Operand)
@@ -2114,6 +2134,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @isBorrowProtected_released) ∧
       (type_of% @evalTerminator_return_protector_ub) ∧
       (type_of% @evalTerminator_return_no_conflict_root) ∧
+      (type_of% @evalTerminator_return_root_disables_frame) ∧
       (type_of% @evalTerminator_callee_return_releases_protector) ∧
       (type_of% @evalTailCallTerminator_protector_ub) ∧
       (type_of% @evalTailCallTerminator_no_conflict_steps) ∧
@@ -2161,6 +2182,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       @hasFrameDeallocProtectorConflict_frame_isolation, @disableFrameBorrows_post,
       @hasProtectedLocalBorrow_iff, @isBorrowProtected_released,
       @evalTerminator_return_protector_ub, @evalTerminator_return_no_conflict_root,
+      @evalTerminator_return_root_disables_frame,
       @evalTerminator_callee_return_releases_protector, @evalTailCallTerminator_protector_ub,
       @evalTailCallTerminator_no_conflict_steps,
       @evalStmt_storageDead_protector_ub, @evalStmt_storageDead_no_conflict_steps,

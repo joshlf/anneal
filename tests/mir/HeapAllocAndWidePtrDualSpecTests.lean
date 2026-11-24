@@ -499,15 +499,20 @@ run_cmd do
         pure e
     let tbp := "Trusted.Rustc.V2026_06_01.MirSemantics.TreeBorrowPerm"
     let mp := "Miri.TreeBorrows.Permission"
-    let mkEmbed (swapCellFrozen : Bool) : String :=
+    let mkEmbed (swapCellFrozen swapUniqueDisabled : Bool := false) : String :=
       s!"fun (p : {tbp}) => @{tbp}.casesOn (fun _ => {mp}) p " ++
       (if swapCellFrozen then s!"{mp}.Frozen" else s!"{mp}.Cell") ++
-      s!" (fun c => {mp}.ReservedFrz c) {mp}.ReservedIM {mp}.Unique " ++
-      (if swapCellFrozen then s!"{mp}.Cell" else s!"{mp}.Frozen") ++ s!" {mp}.Disabled"
+      s!" (fun c => {mp}.ReservedFrz c) {mp}.ReservedIM " ++
+      (if swapUniqueDisabled then s!"{mp}.Disabled" else s!"{mp}.Unique") ++ " " ++
+      (if swapCellFrozen then s!"{mp}.Cell" else s!"{mp}.Frozen") ++ " " ++
+      (if swapUniqueDisabled then s!"{mp}.Unique" else s!"{mp}.Disabled")
     let embedName := ns ++ `embedTrustedPermInMiri
-    addDef embedName (← elabIn (mkEmbed false))
-    let embedForgedName := ns ++ `embedTrustedPermInMiriForged
-    addDef embedForgedName (← elabIn (mkEmbed true))
+    addDef embedName (← elabIn (mkEmbed false false))
+    let invEmbedName := ns ++ `embedMiriPermToTrusted
+    addDef invEmbedName (← elabIn (s!"fun (q : {mp}) => @{mp}.casesOn (fun _ => {tbp}) q " ++
+      s!"{tbp}.cell (fun c => {tbp}.reservedFrz c) {tbp}.reservedIM {tbp}.unique {tbp}.frozen {tbp}.disabled"))
+    let embedCellFrozenForged ← elabIn (mkEmbed true false)
+    let embedUniqueDisabledForged ← elabIn (mkEmbed false true)
     let blocksName := ns ++ `miriProtectedForeignWriteBlocks
     addDef blocksName (← elabIn (s!"fun (q : {mp}) => @Miri.TreeBorrows.AccessOutcome.casesOn " ++
       "(fun _ => Bool) (Miri.TreeBorrows.performAccess Miri.TreeBorrows.AccessKind.Write " ++
@@ -516,6 +521,19 @@ run_cmd do
     -- (`importModules` loads no environment extensions, so only builtin syntax is available:
     -- no `=`/`!`/`[..]` notation, no instances; everything is spelled with explicit constants.)
     let prev := "Trusted.Rustc.V2026_06_01.MirSemantics.preventsDeallocation"
+    -- Bijection round-trips between `TreeBorrowPerm` and `Miri.TreeBorrows.Permission`.
+    let rtTrustedTy ← elabIn s!"∀ p : {tbp}, Eq ({invEmbedName} ({embedName} p)) p" (some (mkSort .zero))
+    let rtTrustedPf ← elabIn (s!"fun (p : {tbp}) => @{tbp}.casesOn (fun (p : {tbp}) => Eq ({invEmbedName} ({embedName} p)) p) p " ++
+      s!"(Eq.refl {tbp}.cell) (fun (c : Bool) => Eq.refl ({tbp}.reservedFrz c)) " ++
+      s!"(Eq.refl {tbp}.reservedIM) (Eq.refl {tbp}.unique) (Eq.refl {tbp}.frozen) (Eq.refl {tbp}.disabled)") (some rtTrustedTy)
+    let rtTrustedName := ns ++ `miriPerm_roundtrip_trusted
+    addThm rtTrustedName rtTrustedTy rtTrustedPf
+    let rtMiriTy ← elabIn s!"∀ q : {mp}, Eq ({embedName} ({invEmbedName} q)) q" (some (mkSort .zero))
+    let rtMiriPf ← elabIn (s!"fun (q : {mp}) => @{mp}.casesOn (fun (q : {mp}) => Eq ({embedName} ({invEmbedName} q)) q) q " ++
+      s!"(Eq.refl {mp}.Cell) (fun (c : Bool) => Eq.refl ({mp}.ReservedFrz c)) " ++
+      s!"(Eq.refl {mp}.ReservedIM) (Eq.refl {mp}.Unique) (Eq.refl {mp}.Frozen) (Eq.refl {mp}.Disabled)") (some rtMiriTy)
+    let rtMiriName := ns ++ `trustedPerm_roundtrip_miri
+    addThm rtMiriName rtMiriTy rtMiriPf
     let motiveBody (x : String) : String := s!"Eq ({prev} {x}) ({blocksName} ({embedName} {x}))"
     let permEqTy ← elabIn s!"∀ p : {tbp}, {motiveBody "p"}" (some (mkSort .zero))
     let permEqPf ← elabIn (s!"fun (p : {tbp}) => @{tbp}.casesOn (fun (p : {tbp}) => {motiveBody "p"}) p " ++
@@ -524,6 +542,12 @@ run_cmd do
       "(Eq.refl Bool.true) (Eq.refl Bool.true) (Eq.refl Bool.true) (Eq.refl Bool.false)") (some permEqTy)
     let permEqName := ns ++ `trustedPreventsDeallocation_eq_miri
     addThm permEqName permEqTy permEqPf
+    -- Universal Miri-quantified direction (covering every `Miri.TreeBorrows.Permission`).
+    let miriAllTy ← elabIn s!"∀ q : {mp}, Eq ({blocksName} q) ({prev} ({invEmbedName} q))" (some (mkSort .zero))
+    let miriAllPf ← elabIn (s!"fun (q : {mp}) => Eq.trans (congrArg {blocksName} (Eq.symm ({rtMiriName} q))) " ++
+      s!"(Eq.symm ({permEqName} ({invEmbedName} q)))") (some miriAllTy)
+    let miriAllName := ns ++ `miriBlocks_eq_trustedPrevents
+    addThm miriAllName miriAllTy miriAllPf
     let permMrTy ← elabIn (s!"∀ p : {tbp}, Eq (MiniRustSpec.Interp.PermissionProt.prevents_deallocation " ++
       s!"({dsNs}.trustedPermToMrProt p)) ({blocksName} ({embedName} p))") (some (mkSort .zero))
     let permMrPf ← elabIn (s!"fun (p : {tbp}) => Eq.trans (Eq.symm ({dsNs}.preventsDeallocation_eq_mr p)) " ++
@@ -539,9 +563,23 @@ run_cmd do
       s!" (fun (p : {tbp}) => Bool.not (Bool.xor ({prev} p) ({blocksName} (e p))))"))
     let permCertName := ns ++ `permCorrCheckGenuine
     addThm permCertName (eqTrue (mkApp (mkConst permCheckName) (mkConst embedName))) reflTrue
-    for n in [embedName, blocksName, permEqName, permMrName, permCheckName, permCertName] do
+    -- Master 3-way closed capstone bundling DualSpec closed capstone + Ep1 LM capstone + universal 3-way permission bijection.
+    let masterName := ns ++ `closedMasterThreeWayCapstone
+    let masterPf ← elabIn (s!"And.intro ({ns}.ep2_heap_alloc_and_wide_ptr_dual_authority_capstone) " ++
+      s!"(And.intro ({lmNs}.ep1_lean_miri_heap_wide_capstone) " ++
+      s!"(And.intro {rtTrustedName} (And.intro {rtMiriName} (And.intro {permMrName} {miriAllName}))))")
+    let masterTy ← MetaM.run' <| inferType masterPf
+    addThm masterName masterTy masterPf
+    for n in [embedName, invEmbedName, blocksName, rtTrustedName, rtMiriName,
+              permEqName, miriAllName, permMrName, permCheckName, permCertName, masterName] do
       added := added.push n
-    -- The permission theorems must reach the REAL vendored Miri transition and Trusted/MR defs.
+    -- Choice-free check on the 3-way permission bijection & correspondence theorems.
+    for c in [embedName, invEmbedName, blocksName, rtTrustedName, rtMiriName,
+              permEqName, miriAllName, permMrName, permCertName] do
+      for a in ← collectAxioms c do
+        unless a == ``propext || a == ``Quot.sound do
+          throwError "cross-root permission constructive audit: {c} must not depend on {a}"
+    -- The permission theorems and master capstone must reach the REAL vendored Miri transition, Ep1 LM capstone, and Trusted/MR defs.
     let reachFrom (root : Lean.Name) : CoreM NameSet := do
       let env ← getEnv
       let mut seen : NameSet := {}
@@ -561,6 +599,13 @@ run_cmd do
                 `MiniRustSpec.Interp.PermissionProt.prevents_deallocation, permEqName] do
       unless permReach.contains req do
         throwError "cross-root permission reachability failure: {permMrName} does not reach {req}"
+    let masterReach ← reachFrom masterName
+    for req in [ns ++ `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone,
+                lmNs ++ `ep1_lean_miri_heap_wide_capstone,
+                `MiniRustSpec.HeapAllocAndWidePtrMR.ep1_minirust_heap_wide_capstone,
+                `Miri.TreeBorrows.performAccess, miriAllName, permMrName] do
+      unless masterReach.contains req do
+        throwError "cross-root master capstone reachability failure: {masterName} does not reach {req}"
 
     -- 6. Negative controls on scratch copies: every boolean forgery is FIRST verified to
     -- kernel-reduce to `Bool.false` (`addDecl` ACCEPTS `= false` via `Eq.refl false`), and
@@ -619,7 +664,9 @@ run_cmd do
         ("MiniRust observer passed off as LeanMiri (diverges on 28, 29)",
           "mrAsLm", authCheckExpr mrAsLm),
         ("cell/frozen-swapped Trusted→Miri permission embedding",
-          "permSwap", mkApp (mkConst permCheckName) (mkConst embedForgedName)) ]
+          "permSwapCellFrozen", mkApp (mkConst permCheckName) embedCellFrozenForged),
+        ("unique/disabled-swapped Trusted→Miri permission embedding",
+          "permSwapUniqueDisabled", mkApp (mkConst permCheckName) embedUniqueDisabledForged) ]
     let mut rejected : Nat := 0
     for (what, tag, expr) in boolForgeries do
       unless ← accepts (thm (tag ++ "IsFalse") (eqFalse expr) reflFalse) do
@@ -884,7 +931,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 94 && rejectedCount = 28 do
+  unless addedCount = 99 && rejectedCount = 29 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
