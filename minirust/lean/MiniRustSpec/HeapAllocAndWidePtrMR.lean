@@ -3015,6 +3015,208 @@ theorem tb_deallocate_prot_complete_witness :
       { params := ⟨true⟩, mem := { allocations := [aFrz], _phantom := ⟨⟩ } }
       ⟨4294967296, some (⟨0⟩, [0])⟩ ⟨0⟩ aFrz 32 (by decide) rfl (by decide) rfl rfl rfl rfl rfl rfl
 
+/-! ### Releasing a protector with `end_call` (`rust#165833`, case 20, universally)
+
+`TreeBorrowsMemory::end_call` releases the protector of a strongly protected,
+read `Frozen` child of the canonical tree: it unprotects every byte
+(`Frozen { had_local_read: true }` becomes the unprotected `Frozen` with a
+protector-end read), performs that read as a local access on the path to the
+child (a no-op on the `Unique` root), and clears the child's `protected` flag.
+Afterwards the deallocation through the root that was UB before (case 19)
+succeeds: the foreign write merely disables the child. -/
+
+/-- Unprotecting a uniform vector of read protected `Frozen` permissions. -/
+theorem mapM_unprotect_frozen (n : Nat) :
+    (List.replicate n (Permission.Prot (.Frozen true))).mapM Permission.unprotect =
+      .ok (List.replicate n (Permission.Unprot .Frozen, some AccessKind.Read)) := by
+  induction n with
+  | zero => rfl
+  | succ n ih =>
+    rw [List.replicate_succ, List.replicate_succ, List.mapM_cons, ih]
+    rfl
+
+/-- The protector-end reads as local accesses keep a uniform `Unique` vector. -/
+theorem releaseProtectorPermissions_local_read_unique (total : Nat) :
+    ∀ (k offset : Nat), offset + k ≤ total →
+      Node.releaseProtectorPermissions .Local offset (List.replicate k (some .Read))
+          (List.replicate total (Permission.Unprot .Unique)) =
+        .ok (List.replicate total (Permission.Unprot .Unique))
+  | 0, _, _ => rfl
+  | k + 1, offset, hle => by
+    have hlt : offset < total := by omega
+    have hidx : listIndex (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        "Node::release_protector" = .ok (Permission.Unprot .Unique) := by
+      rw [listIndex_eq_ok_iff]
+      refine ⟨Int.natCast_nonneg _, ?_⟩
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.getElem?_replicate, hlt, ↓reduceIte]
+    have hset : listSet (List.replicate total (Permission.Unprot .Unique)) (Int.ofNat offset)
+        (Permission.Unprot .Unique) "Node::release_protector" =
+        .ok (List.replicate total (Permission.Unprot .Unique)) := by
+      unfold listSet
+      simp only [Int.ofNat_eq_natCast, Int.toNat_natCast, List.length_replicate,
+        Int.natCast_nonneg, hlt, and_self, ↓reduceIte, list_set_replicate_same]
+      rfl
+    have htr : Permission.transition (.Unprot .Unique) .Read .Local = .ok (.Unprot .Unique) := rfl
+    rw [List.replicate_succ]
+    unfold Node.releaseProtectorPermissions listMutateAt
+    simp only [hidx, htr, hset, bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure]
+    exact releaseProtectorPermissions_local_read_unique total k (offset + 1) (by omega)
+
+/-- `Node::access_node` along the path `[0]` of a node with one child applies
+the callback to that child. -/
+theorem access_node_single_child {O : Type} (F : Node → Interp (O × Node)) (c : Node)
+    (perms : List Permission) (prot : Protected) :
+    Node.access_node F [0] ⟨[c], perms, prot⟩ =
+      (do let (o, c') ← F c; pure (o, ⟨[c'], perms, prot⟩)) := by
+  cases hF : F c with
+  | error e =>
+    simp [Node.access_node, Node.is_leaf, listMutateAt, listIndex, hF, bind, Except.bind]
+  | ok r =>
+    obtain ⟨o, c'⟩ := r
+    simp [Node.access_node, Node.is_leaf, listMutateAt, listIndex, listSet, hF, bind, Except.bind,
+      pure, Except.pure]
+
+/-- The callback of `TreeBorrowsMemory::release_protector`. -/
+def unprotectNode (node : Node) : Interp (List (Option AccessKind) × Node) := do
+  if !Protected.yes node.«protected» then
+    specPanic "assertion failed: node.protected.yes()"
+  else do
+    let pairs ← node.permissions.mapM Permission.unprotect
+    let perms := pairs.map Prod.fst
+    let accesses := pairs.map Prod.snd
+    pure (accesses, { node with permissions := perms })
+
+/-- Unprotecting the strongly protected, read `Frozen` child. -/
+theorem unprotectNode_frozen (n : Nat) :
+    unprotectNode ⟨[], List.replicate n (.Prot (.Frozen true)), .Strong⟩ =
+      .ok (List.replicate n (some AccessKind.Read),
+        ⟨[], List.replicate n (.Unprot .Frozen), .Strong⟩) := by
+  unfold unprotectNode
+  have hy : Protected.yes .Strong = true := rfl
+  show (if (!Protected.yes .Strong) = true then _ else _) = _
+  rw [hy]
+  show (do
+    let pairs ← (List.replicate n (Permission.Prot (.Frozen true))).mapM Permission.unprotect
+    pure (pairs.map Prod.snd, (⟨[], pairs.map Prod.fst, .Strong⟩ : Node))) = _
+  rw [mapM_unprotect_frozen]
+  simp [bind, Except.bind, pure, Except.pure, List.map_replicate]
+
+/-- `Node::access_node` on the child of the canonical tree unprotects it. -/
+theorem access_node_unprotect_boxRefTree (n : Nat) :
+    Node.access_node unprotectNode [0] (boxRefTree n (.Prot (.Frozen true)) .Strong) =
+      .ok (List.replicate n (some AccessKind.Read),
+        ⟨[⟨[], List.replicate n (.Unprot .Frozen), .Strong⟩],
+          List.replicate n (.Unprot .Unique), .No⟩) := by
+  rw [boxRefTree, access_node_single_child, unprotectNode_frozen]
+  rfl
+
+/-- `Node::release_protector` from the root of the canonical tree, after the
+child was unprotected. -/
+theorem release_protector_boxRefTree (n : Nat) :
+    Node.release_protector
+        ⟨[⟨[], List.replicate n (.Unprot .Frozen), .Strong⟩], List.replicate n (.Unprot .Unique), .No⟩
+        (some [0]) (List.replicate n (some AccessKind.Read)) =
+      .ok (boxRefTree n (.Unprot .Frozen) .No) := by
+  simp only [Node.release_protector, Option.isSome, ↓reduceIte, Node.releaseProtectorChildren,
+    releaseProtectorPermissions_local_read_unique n n 0 (by omega)]
+  rfl
+
+/-- `TreeBorrowsMemory::release_protector` of the child of the canonical tree,
+on every memory in which that tree belongs to a live allocation. -/
+theorem tb_release_protector_boxRefTree (tbm : TBM) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root = boxRefTree n (.Prot (.Frozen true)) .Strong) :
+    TreeBorrowsMemory.release_protector tbm (id, [0]) =
+      .ok { tbm with mem := { tbm.mem with allocations :=
+        (tbm.mem.allocations.set id._0.toNat
+          { a with extra := { root := boxRefTree n (.Unprot .Frozen) .No } }) } } := by
+  have hacc := access_node_unprotect_boxRefTree n
+  unfold unprotectNode at hacc
+  have hidx : listIndex tbm.mem.allocations id._0 "TreeBorrowsMemory::release_protector" = .ok a :=
+    listIndex_eq_ok_iff.mpr ⟨hi, hget⟩
+  have hset := listSet_of_getElem?
+    (x := ({ a with live := true, extra := { root := boxRefTree n (.Unprot .Frozen) .No } } :
+      Allocation Path TreeBorrowsAllocationExtra))
+    (what := "TreeBorrowsMemory::release_protector") hi hget
+  unfold TreeBorrowsMemory.release_protector listMutateAt
+  simp only [bind, Bind.bind, Except.bind, pure, Pure.pure, Except.pure] at hacc ⊢
+  simp only [hidx, hroot, hacc, hlive, Bool.not_true, Bool.false_eq_true, ↓reduceIte,
+    release_protector_boxRefTree, hset]
+
+/-- `TreeBorrowsMemory::end_call` of a frame whose only protector is the child
+of the canonical tree releases it. -/
+theorem tb_end_call_boxRefTree (tbm : TBM) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (hroot : a.extra.root = boxRefTree n (.Prot (.Frozen true)) .Strong) :
+    TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } =
+      .ok { tbm with mem := { tbm.mem with allocations :=
+        (tbm.mem.allocations.set id._0.toNat
+          { a with extra := { root := boxRefTree n (.Unprot .Frozen) .No } }) } } := by
+  unfold TreeBorrowsMemory.end_call
+  simp only [List.foldlM_cons, List.foldlM_nil,
+    tb_release_protector_boxRefTree tbm id a n hi hget hlive hroot]
+  rfl
+
+/-- After the protector is released, the deallocation handler on the root
+succeeds: the foreign write disables the child, and nothing is protected. -/
+theorem tbDeallocHandler_released_frozen_child (n : Nat) :
+    tbDeallocHandler ⟨n⟩ ⟨boxRefTree n (.Unprot .Frozen) .No⟩ [] =
+      .ok ⟨boxRefTree n (.Unprot .Disabled) .No⟩ := by
+  have hacc : Node.access (boxRefTree n (.Unprot .Frozen) .No) (some []) .Write ⟨0⟩ ⟨n⟩ =
+      .ok (boxRefTree n (.Unprot .Disabled) .No) := by
+    rw [node_access_boxRefTree,
+      node_transitionRange_fixed (.Unprot .Unique) .Write .Local rfl n n 0 (by omega),
+      node_transitionRange_uniform (.Unprot .Frozen) (.Unprot .Disabled) .Write .Foreign rfl n]
+    rfl
+  have hprot : Node.contains_strong_protector_preventing_deallocation
+      (boxRefTree n (.Unprot .Disabled) .No) = false := by
+    simp only [boxRefTree, node_contains_strong_protector_eq, Node.anyChildPreventsDeallocation,
+      Bool.or_false]
+    rfl
+  exact (tbDeallocHandler_ok_iff _ _ _ _).mpr ⟨_, hacc, hprot, rfl⟩
+
+/-- **Cases 19 and 20, universally on every `TreeBorrowsMemory`**: for a live
+heap block of `n > 0` bytes whose borrow tree is the canonical tree with a
+strongly protected, read `Frozen` child, deallocating through the root is UB
+while the protector is active; `end_call` of the protecting frame succeeds;
+and afterwards the same deallocation succeeds. -/
+theorem tb_protector_release_then_deallocate (tbm : TBM)
+    (ptr : ThinPointer TreeBorrowsProvenance) (id : AllocId)
+    (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat) (hn : 0 < n)
+    (hp : ptr.provenance = some (id, [])) (hi : 0 ≤ id._0)
+    (hget : tbm.mem.allocations[id._0.toNat]? = some a) (hlive : a.live = true)
+    (haddr : ptr.addr = a.addr) (hkind : a.kind = .Heap) (hsize : Allocation.size a = ⟨n⟩)
+    (hroot : a.extra.root = boxRefTree n (.Prot (.Frozen true)) .Strong) :
+    TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+      .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+    ∃ tbm1, TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } = .ok tbm1 ∧
+      ∃ tbm2, TreeBorrowsMemory.deallocate tbm1 ptr .Heap ⟨n⟩ a.align = .ok tbm2 := by
+  refine ⟨(tb_deallocate_boxRefTree tbm ptr id a n hn hp hi hget hlive haddr hkind hsize).2.1 hroot,
+    _, tb_end_call_boxRefTree tbm id a n hi hget hlive hroot, ?_⟩
+  let a' : Allocation Path TreeBorrowsAllocationExtra :=
+    { a with extra := { root := boxRefTree n (.Unprot .Frozen) .No } }
+  have hget' : (tbm.mem.allocations.set id._0.toNat a')[id._0.toNat]? = some a' := by
+    rw [List.getElem?_set_self]
+    exact (List.getElem?_eq_some_iff.mp hget).1
+  obtain ⟨root', hacc, hprot, _⟩ :=
+    (tbDeallocHandler_ok_iff _ _ _ _).mp (tbDeallocHandler_released_frozen_child n)
+  exact ⟨_, (tb_deallocate_ok_iff _ _ ptr .Heap ⟨n⟩ a.align).mpr
+    ⟨id, [], a', root', hp, hi, hget', hlive, haddr, hkind.symm, hsize.symm, rfl, hacc, hprot, rfl⟩⟩
+
+/-- `tb_protector_release_then_deallocate` is not vacuous: its hypotheses hold
+on `tbmBoxRef` with the read `Frozen` child, for the root pointer. -/
+theorem tb_protector_release_then_deallocate_witness :
+    ∃ tbm1 tbm2,
+      TreeBorrowsMemory.end_call (tbmBoxRef (.Prot (.Frozen true))) { protectors := [(⟨0⟩, [0])] } =
+        .ok tbm1 ∧
+      TreeBorrowsMemory.deallocate tbm1 ⟨4294967296, some (⟨0⟩, [])⟩ .Heap ⟨32⟩ ⟨32⟩ = .ok tbm2 := by
+  obtain ⟨_, tbm1, h1, tbm2, h2⟩ := tb_protector_release_then_deallocate
+    (tbmBoxRef (.Prot (.Frozen true))) ⟨4294967296, some (⟨0⟩, [])⟩ ⟨0⟩
+    (boxRefAlloc (.Prot (.Frozen true))) 32 (by decide) rfl (by decide) rfl rfl rfl rfl rfl rfl
+  exact ⟨tbm1, tbm2, h1, h2⟩
+
 /-- **Deallocating what was just allocated succeeds on `TreeBorrowsMemory`**, for
 every `tbm : TBM`, every `kind`, `size`, and `align`. -/
 theorem tb_allocate_then_deallocate {tbm tbm' : TBM} {kind : AllocationKind} {size : Size}
@@ -4207,7 +4409,10 @@ statement.
    pointer and a trait-object pointer is a specification panic (`rust#166144`).
 5. Protectors (`rust#165833`): a `Protected::Weak` node and a `Cell`-only
    strongly protected node never prevent deallocation; a strongly protected
-   node with a `Frozen` permission that had a local read does.
+   node with a `Frozen` permission that had a local read does; and on every
+   `TreeBorrowsMemory`, `end_call` of the protecting frame releases that
+   protector, after which the same deallocation succeeds (case 19 -> case 20,
+   `tb_protector_release_then_deallocate`).
 6. The kernel-evaluated 30-case table on both machines, and both threaded
    traces. -/
 theorem ep1_minirust_heap_wide_capstone :
@@ -4299,6 +4504,16 @@ theorem ep1_minirust_heap_wide_capstone :
         a.extra.root = boxRefTree n (.Unprot .Frozen) .No →
         TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
           .error (.ub "Tree Borrows: local write of Frozen reference")) ∧
+      (∀ (tbm : TBM) (ptr : ThinPointer TreeBorrowsProvenance) (id : AllocId)
+          (a : Allocation Path TreeBorrowsAllocationExtra) (n : Nat), 0 < n →
+        ptr.provenance = some (id, []) → 0 ≤ id._0 →
+        tbm.mem.allocations[id._0.toNat]? = some a → a.live = true →
+        ptr.addr = a.addr → a.kind = .Heap → Allocation.size a = ⟨n⟩ →
+        a.extra.root = boxRefTree n (.Prot (.Frozen true)) .Strong →
+        TreeBorrowsMemory.deallocate tbm ptr .Heap ⟨n⟩ a.align =
+          .error (.ub "Tree Borrows: foreign write of protected Frozen reference which had a local read") ∧
+        ∃ tbm1, TreeBorrowsMemory.end_call tbm { protectors := [(id, [0])] } = .ok tbm1 ∧
+          ∃ tbm2, TreeBorrowsMemory.deallocate tbm1 ptr .Heap ⟨n⟩ a.align = .ok tbm2) ∧
       (∀ k : Nat, alignFromBytesInt ((2 : Int) ^ k) = some ⟨2 ^ k⟩) ∧
       (∀ sz : Size, x86_64.valid_size sz = true ↔ sz.bytes < 2 ^ 63)) ∧
     ((List.range 30).map (mrHeapWideObserve false) =
@@ -4325,7 +4540,7 @@ theorem ep1_minirust_heap_wide_capstone :
       mrProtectorDeallocTrace true = [.okRoundTrip 42, .okBool true, .ub]) :=
   by
   refine ⟨?_, heap_lifecycle_bm, ⟨?_, ?_, heap_lifecycle_tb⟩, ⟨?_, ?_⟩, ⟨?_, ?_, ?_⟩,
-    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
+    ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩, ?_, ?_, ?_⟩
   · exact fun m op args retTy hop => evalIntrinsicM_bm_eq_heap m op args retTy hop
   · exact fun _ _ _ _ _ _ hop hwf h => evalIntrinsicM_heap_tb_wfLive hop hwf h
   · exact tbInit_wfLive
@@ -4346,6 +4561,7 @@ theorem ep1_minirust_heap_wide_capstone :
     have h3 := tb_deallocate_protRootTree tbm ptr id a n hn hp hi hget hlive haddr hkind hsize
     exact ⟨h1.1, h2.1, h1.2.1, h1.2.2, h3.1, h3.2⟩
   · exact tb_deallocate_frozen_child_tag
+  · exact tb_protector_release_then_deallocate
   · exact alignFromBytesInt_pow2
   · exact x86_64_valid_size_iff
   · exact mrHeapWideObserve_table
@@ -4411,8 +4627,8 @@ run_cmd do
     checked := checked + 1
     if (`MiniRustSpec.HeapAllocAndWidePtrMR).isPrefixOf c then
       if let .thmInfo _ := info then theorems := theorems + 1
-  -- This module states 200 `theorem` declarations; auxiliary theorem constants only add to it.
-  if theorems < 200 then
+  -- This module states 211 `theorem` declarations; auxiliary theorem constants only add to it.
+  if theorems < 211 then
     throwError "axiom audit is vacuous: only {theorems} theorems of MiniRustSpec.HeapAllocAndWidePtrMR seen"
   logInfo m!"MiniRustSpec.HeapAllocAndWidePtrMR: {checked} declarations ({theorems} theorems) depend only on propext, Quot.sound, Classical.choice (sorry_free=true, ofReduceBool_free=true, import_isolated=true)"
 
