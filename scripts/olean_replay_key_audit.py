@@ -518,6 +518,7 @@ EXT_HOOK_TOKENS: tuple[str, ...] = (
     "doElem_elab",
     "inductive_elab",
     "delab",
+    "app_delab",
     "app_unexpander",
     "simproc",
     "dsimproc",
@@ -565,26 +566,33 @@ ALWAYS_FORBIDDEN_TOKENS: tuple[str, ...] = (
 NATIVE_TACTIC_TOKENS: tuple[str, ...] = ("native_decide", "bv_decide", "bv_check")
 
 
+BUILTIN_INTERP_PREFIXES: frozenset[str] = frozenset({"s!", "m!", "f!"})
+
+
 def lex_lean_source(src: str) -> str:
     """Faithful port of `Anneal.ReplayKeyAndTamperAudit.SourceScanner.lexSource`
     with `+1]'` checked strictly outside comments and string/char literals and
-    interpolated-string tracking across whitespace/comments after `s!` / `m!` / `f!`."""
+    interpolated-string tracking across whitespace/comments after `s!` / `m!` / `f!`
+    (plus any glued `<ident>!"..."` prefix, without crashing on `echo! "{"`)."""
     state: tuple[Any, ...] = ("code", "other")
     out: list[str] = []
     code_tail = ""
     last_raw_char = ""
+    cur_ident = ""
     after_bang_ident = False
-    guillemet_last_char = ""
+    guillemet_buf: list[str] = []
 
     def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str]:
-        nonlocal after_bang_ident
+        nonlocal after_bang_ident, cur_ident
         sep = " " if prev == "escIdent" else ""
         if prev == "ident" and _is_id_rest(c):
-            after_bang_ident = (c == "!")
+            cur_ident += c
+            after_bang_ident = cur_ident in BUILTIN_INTERP_PREFIXES
             return (("code", "ident"), _visible(c))
         if prev == "symIdent" and (_is_id_rest(c) or c in ('"', "#")):
             if c in ("'", '"', "#") or ("0" <= c <= "9"):
                 raise ValueError("literal glued to a symbol keyword")
+            cur_ident = ""
             after_bang_ident = False
             return (("code", "symIdent"), _visible(c))
         if prev == "sym" and c == "'":
@@ -592,12 +600,17 @@ def lex_lean_source(src: str) -> str:
         if _is_id_first(c):
             after_bang_ident = False
             if prev == "sym":
+                cur_ident = ""
                 return (("code", "symIdent"), _visible(c))
             if c == "r" and prev in ("other", "escIdent", "quoteTok"):
+                cur_ident = "r"
                 return (("rawR",), sep)
             if c == "r" and prev == "dot":
+                cur_ident = "r"
                 return (("dotR",), "")
+            cur_ident = c
             return (("code", "ident"), sep + _visible(c))
+        cur_ident = ""
         if c == ".":
             after_bang_ident = False
             nxt = "identDot" if prev in ("ident", "escIdent") else "dot"
@@ -890,11 +903,11 @@ def lex_lean_source(src: str) -> str:
                 state, chunk = (("raw", n), "")
         elif tag == "guillemet":
             if ch == "»":
-                after_bang_ident = (guillemet_last_char == "!")
-                guillemet_last_char = ""
+                after_bang_ident = "".join(guillemet_buf) in BUILTIN_INTERP_PREFIXES
+                guillemet_buf.clear()
                 state, chunk = (("code", "escIdent"), "")
             else:
-                guillemet_last_char = ch
+                guillemet_buf.append(ch)
                 state, chunk = (("guillemet",), _visible(ch))
         elif tag == "numZero":
             if ch in ("b", "B"):
@@ -1053,7 +1066,7 @@ def classify_module_role_py(mod_name: str) -> str | None:
         return "assumptions" if len(parts) >= 2 else None
     if root == "Verify":
         return "verify" if len(parts) >= 2 else None
-    if root == "CrateVerify":
+    if root == "CrateVerify" or root.startswith("CrateVerify_"):
         return "verify"
     has_proof = ("Proof" in parts) or ("Proofs" in parts)
     has_test = ("Test" in parts) or ("Tests" in parts)
@@ -1066,6 +1079,154 @@ def classify_module_role_py(mod_name: str) -> str | None:
     if parts[-1] == "Defs":
         return "defsExempt"
     return "spec"
+
+
+def _strip_comments_and_noninterp_strings(src: str) -> str:
+    """Replaces comments and plain/raw/char literals (preserving interpolation holes `{...}`)
+    with spaces so tactic flag sequences like `decide -kernel` or `decide +revert` can be
+    inspected across comments and inside string interpolation holes."""
+    out: list[str] = []
+    i = 0
+    n = len(src)
+    block_depth = 0
+    in_interp = False
+    hole_depth = 0
+    cur_id = ""
+    after_builtin_interp = False
+
+    while i < n:
+        c = src[i]
+        if block_depth > 0:
+            if c == "/" and i + 1 < n and src[i + 1] == "-":
+                block_depth += 1
+                out.append("  ")
+                i += 2
+            elif c == "-" and i + 1 < n and src[i + 1] == "/":
+                block_depth -= 1
+                out.append("  ")
+                i += 2
+            else:
+                out.append("\n" if c == "\n" else " ")
+                i += 1
+            continue
+
+        if in_interp and hole_depth == 0:
+            if c == "\\":
+                out.append("  ")
+                i += 2
+            elif c == '"':
+                in_interp = False
+                out.append(" ")
+                i += 1
+            elif c == "{":
+                hole_depth = 1
+                out.append(" ")
+                i += 1
+            else:
+                out.append(" ")
+                i += 1
+            continue
+
+        if c == "-" and i + 1 < n and src[i + 1] == "-":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "-":
+            block_depth = 1
+            out.append("  ")
+            i += 2
+            continue
+        if hole_depth > 0:
+            if c == "{":
+                hole_depth += 1
+                out.append(" ")
+                i += 1
+                continue
+            if c == "}":
+                hole_depth -= 1
+                out.append(" ")
+                i += 1
+                continue
+
+        # Raw string `r"..."` or `r#"..."#`
+        if c == "r" and (i == 0 or not _is_id_rest(src[i - 1])):
+            j = i + 1
+            hashes = 0
+            while j < n and src[j] == "#":
+                hashes += 1
+                j += 1
+            if j < n and src[j] == '"':
+                closer = '"' + ("#" * hashes)
+                end_idx = src.find(closer, j + 1)
+                if end_idx == -1:
+                    break
+                out.append(" " * (end_idx + len(closer) - i))
+                i = end_idx + len(closer)
+                cur_id = ""
+                after_builtin_interp = False
+                continue
+
+        if c == '"':
+            glued_bang = i > 0 and src[i - 1] == "!" and bool(cur_id)
+            if glued_bang or after_builtin_interp:
+                in_interp = True
+                after_builtin_interp = False
+                cur_id = ""
+                out.append(" ")
+                i += 1
+                continue
+            i += 1
+            out.append(" ")
+            while i < n:
+                if src[i] == "\\":
+                    out.append("  ")
+                    i += 2
+                elif src[i] == '"':
+                    out.append(" ")
+                    i += 1
+                    break
+                else:
+                    out.append(" ")
+                    i += 1
+            cur_id = ""
+            after_builtin_interp = False
+            continue
+
+        if c == "'" and (i == 0 or not _is_id_rest(src[i - 1])):
+            j = i + 1
+            if j < n and src[j] == "\\":
+                j += 2
+                while j < n and src[j] != "'":
+                    j += 1
+            else:
+                j += 1
+            if j < n and src[j] == "'":
+                out.append(" " * (j + 1 - i))
+                i = j + 1
+                continue
+
+        if _is_id_first(c) and not cur_id:
+            cur_id = c
+            after_builtin_interp = False
+        elif cur_id and _is_id_rest(c):
+            cur_id += c
+            after_builtin_interp = cur_id in BUILTIN_INTERP_PREFIXES
+        else:
+            if not c.isspace():
+                after_builtin_interp = False
+            cur_id = ""
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+_DECIDE_NONKERNEL_FLAG_RE = re.compile(
+    r"(?<![A-Za-z0-9_'!?\.»])(?:decide|«decide»)(?:\s+\+kernel(?![A-Za-z0-9_'!?]))*\s+"
+    r"(?:-(?:[A-Za-z_\u00c0-\uffff]|«)"
+    r"|\+(?!kernel(?![A-Za-z0-9_'!?]))(?:[A-Za-z_\u00c0-\uffff]|«)"
+    r"|\(\s*(?:[A-Za-z_\u00c0-\uffff][A-Za-z0-9_'!?\u00c0-\uffff]*|«[^»]+»)\s*:=)"
+)
 
 
 def scan_source_defense_in_depth(
@@ -1186,13 +1347,19 @@ def scan_source_defense_in_depth(
         for kw in NATIVE_TACTIC_TOKENS:
             if any(_token_has_keyword(kw, t) for t in toks):
                 raise AuditPolicyError("forbiddenSourceOption", mod_name, kw)
-        if any(_token_has_keyword("decide", t) for t in toks) and any(
-            _token_has_keyword("native", t)
-            or _token_has_keyword("config", t)
-            or _token_has_keyword("DecideConfig", t)
-            for t in toks
-        ):
-            raise AuditPolicyError("forbiddenSourceOption", mod_name, "decide with a configuration")
+        if any(_token_has_keyword("decide", t) for t in toks):
+            if any(
+                _token_has_keyword("native", t)
+                or _token_has_keyword("config", t)
+                or _token_has_keyword("DecideConfig", t)
+                for t in toks
+            ):
+                raise AuditPolicyError("forbiddenSourceOption", mod_name, "decide with a configuration")
+            stripped_code = _strip_comments_and_noninterp_strings(src_text)
+            if _DECIDE_NONKERNEL_FLAG_RE.search(stripped_code):
+                raise AuditPolicyError(
+                    "forbiddenSourceOption", mod_name, "decide with non-kernel flag"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -1203,7 +1370,182 @@ def scan_source_defense_in_depth(
 # passes `loadExts := true` to `importModules`! All extension tables are read
 # statically via `getModuleEntries` / `getModuleIREntries` / `ModuleData.entries`.
 
+FAST_SMAP_LEAN_SOURCE = r"""import Lean
+
+open Lean
+
+namespace FastSMapCheck
+
+/-- Full `ConstMap` (`SMap.map₁` AND `SMap.map₂`) key-vs-`ConstantInfo.name` verifier.
+    Compiled at `-O2` into `FastSMapCheck.o` so checking 45,000+ entries per environment is < 1ms. -/
+def findKeyMismatch (m : ConstMap) : Option (Name × Name) :=
+  m.fold (init := none) fun acc n ci =>
+    if acc.isSome then acc else if n == ci.name then none else some (n, ci.name)
+
+def computeInitMultiNames (initEnv : Environment) : NameSet × NameSet := Id.run do
+  let mut mods : NameSet := {}
+  let mut s : NameSet := {}
+  for h : idx in [:initEnv.header.modules.size] do
+    let m := initEnv.header.modules[idx].module
+    mods := mods.insert m
+    let d := initEnv.header.moduleData[idx]!
+    for ci in d.constants do
+      let ge2 := match ci.name with
+        | .str p _ | .num p _ => !p.isAnonymous
+        | .anonymous => false
+      if !isPrivateName ci.name && ge2 then
+        s := s.insert ci.name
+  return (mods, s)
+
+partial def whnfAllowOpaque (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match e with
+    | .mdata _ inner => whnfAllowOpaque env fuel' inner
+    | .letE _ _ v b _ => whnfAllowOpaque env fuel' (b.instantiate1 v)
+    | .const c lvls =>
+      match env.checked.get.find? c with
+      | some (.defnInfo dv) =>
+        whnfAllowOpaque env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
+      | some (.opaqueInfo ov) =>
+        whnfAllowOpaque env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+      | _ => some e
+    | .app f a =>
+      match whnfAllowOpaque env fuel' f with
+      | none => none
+      | some (.lam _ _ b _) => whnfAllowOpaque env fuel' (b.instantiate1 a)
+      | some f' => some (.app f' a)
+    | _ => some e
+
+partial def unfoldOpaquesInExpr (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match e with
+    | .mdata _ inner => unfoldOpaquesInExpr env fuel' inner
+    | .const c lvls =>
+      match env.checked.get.find? c with
+      | some (.opaqueInfo ov) =>
+        unfoldOpaquesInExpr env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
+      | _ => some e
+    | .app f a =>
+      match unfoldOpaquesInExpr env fuel' f, unfoldOpaquesInExpr env fuel' a with
+      | some f', some a' => some (.app f' a')
+      | _, _ => none
+    | .lam n d b bi =>
+      match unfoldOpaquesInExpr env fuel' d, unfoldOpaquesInExpr env fuel' b with
+      | some d', some b' => some (.lam n d' b' bi)
+      | _, _ => none
+    | .forallE n d b bi =>
+      match unfoldOpaquesInExpr env fuel' d, unfoldOpaquesInExpr env fuel' b with
+      | some d', some b' => some (.forallE n d' b' bi)
+      | _, _ => none
+    | .letE n t v b nd =>
+      match unfoldOpaquesInExpr env fuel' t, unfoldOpaquesInExpr env fuel' v, unfoldOpaquesInExpr env fuel' b with
+      | some t', some v', some b' => some (.letE n t' v' b' nd)
+      | _, _, _ => none
+    | .proj s i x => (unfoldOpaquesInExpr env fuel' x).map (.proj s i)
+    | _ => some e
+
+partial def normExprInEnv (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match e with
+    | .mdata _ inner => normExprInEnv env fuel' inner
+    | .letE _ _ v b _ => normExprInEnv env fuel' (b.instantiate1 v)
+    | .const c lvls =>
+      match env.checked.get.find? c with
+      | some (.defnInfo dv) =>
+        normExprInEnv env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
+      | _ => some e
+    | .app f a =>
+      match normExprInEnv env fuel' f, normExprInEnv env fuel' a with
+      | some (.lam _ _ b _), some a' => normExprInEnv env fuel' (b.instantiate1 a')
+      | some f', some a' => some (.app f' a')
+      | _, _ => none
+    | .forallE n d b bi =>
+      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
+      | some d', some b' => some (.forallE n d' b' bi)
+      | _, _ => none
+    | .lam n d b bi =>
+      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
+      | some d', some b' => some (.lam n d' b' bi)
+      | _, _ => none
+    | .proj s i x => (normExprInEnv env fuel' x).map (.proj s i)
+    | _ => some e
+
+def isParamWrapperConst (c : Name) : Bool :=
+  c == ``optParam || c == ``autoParam || c == ``outParam || c == ``semiOutParam
+
+/-- Head-normalizes definitions, `let`, and beta-redexes WITHOUT unfolding `optParam`,
+    `autoParam`, `outParam`, or `semiOutParam` so synthesized binders hidden behind an
+    `abbrev`/`def` (e.g. `abbrev Tail := (_ : LocalAnchor := .mk) → Bool`) are caught! -/
+partial def whnfKeepParamWrappers (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
+  match fuel with
+  | 0 => none
+  | fuel' + 1 =>
+    match e with
+    | .mdata _ inner => whnfKeepParamWrappers env fuel' inner
+    | .letE _ _ v b _ => whnfKeepParamWrappers env fuel' (b.instantiate1 v)
+    | _ =>
+      let hd := e.getAppFn.consumeMData
+      let args := e.getAppArgs
+      match hd with
+      | .const c lvls =>
+        if isParamWrapperConst c then
+          some e
+        else
+          match env.checked.get.find? c with
+          | some (.defnInfo dv) =>
+            let unfolded := mkAppN (dv.value.instantiateLevelParams dv.levelParams lvls) args
+            whnfKeepParamWrappers env fuel' unfolded
+          | _ => some e
+      | .lam _ _ _ _ =>
+        if args.isEmpty then some e
+        else whnfKeepParamWrappers env fuel' (hd.beta args)
+      | _ => some e
+
+partial def extractCoeSrcAndTgt (env : Environment) (rawType : Expr) : Option (Expr × Expr) :=
+  let rec go (fuel : Nat) (cur : Expr) (lastExplicitDom? : Option Expr) : Option (Expr × Expr) :=
+    match fuel with
+    | 0 => none
+    | fuel' + 1 =>
+      match whnfKeepParamWrappers env 512 cur with
+      | none => none
+      | some curWhnf =>
+        match curWhnf with
+        | .forallE _ d b bi =>
+          match whnfKeepParamWrappers env 512 d with
+          | none => none
+          | some dWhnf =>
+            let isSynth := bi != .default ||
+              (match dWhnf.consumeMData.getAppFn with
+               | .const c _ => isParamWrapperConst c
+               | _ => false)
+            let nextDom? := if isSynth then lastExplicitDom? else some d
+            go fuel' b nextDom?
+        | cod =>
+          match lastExplicitDom? with
+          | none => none
+          | some rawSrc =>
+            match normExprInEnv env 1024 rawSrc, normExprInEnv env 1024 cod with
+            | some normSrc, some normCod => some (normSrc, normCod)
+            | _, _ => none
+  go 256 rawType none
+
+partial def stripForallAndLam : Expr → Expr
+  | .forallE _ _ b _ => stripForallAndLam b
+  | .lam _ _ b _ => stripForallAndLam b
+  | .mdata _ e => stripForallAndLam e
+  | e => e
+
+end FastSMapCheck
+"""
+
 INSPECTOR_LEAN_SOURCE = r"""import Lean
+import FastSMapCheck
 import Lean.Elab.Command
 import Lean.Elab.Term
 import Lean.Elab.Util
@@ -1224,6 +1566,7 @@ import Lean.Compiler.LCNF.Passes
 import Lean.Replay
 
 open Lean
+open FastSMapCheck
 
 namespace OleanReplayInspector
 
@@ -1310,7 +1653,7 @@ def classifyModuleRole (m : Name) : IO String := do
     if parts.length < 2 then
       policyFail "moduleRoleMismatch" m #[m] "bare Verify module name disallowed"
     return "verify"
-  if root == "CrateVerify" then
+  if root == "CrateVerify" || root.startsWith "CrateVerify_" then
     return "verify"
   let hasProof := parts.contains "Proof" || parts.contains "Proofs"
   let hasTest := parts.contains "Test" || parts.contains "Tests"
@@ -1573,62 +1916,7 @@ def isNativeReductionConst (n : Name) : Bool :=
 def isFoundationalAxiom (n : Name) : Bool :=
   n == `propext || n == `Classical.choice || n == `Quot.sound
 
-/-- Unfold `.defnInfo` and `.opaqueInfo` (with universe level-param instantiation) + beta-reduce
-    to check if a provisional native axiom's LHS evaluates to `Bool.false`. -/
-partial def whnfAllowOpaque (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
-  match fuel with
-  | 0 => none
-  | fuel' + 1 =>
-    match e with
-    | .mdata _ inner => whnfAllowOpaque env fuel' inner
-    | .letE _ _ v b _ => whnfAllowOpaque env fuel' (b.instantiate1 v)
-    | .const c lvls =>
-      match env.checked.get.find? c with
-      | some (.defnInfo dv) =>
-        whnfAllowOpaque env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
-      | some (.opaqueInfo ov) =>
-        whnfAllowOpaque env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
-      | _ => some e
-    | .app f a =>
-      match whnfAllowOpaque env fuel' f with
-      | none => none
-      | some (.lam _ _ b _) => whnfAllowOpaque env fuel' (b.instantiate1 a)
-      | some f' => some (.app f' a)
-    | _ => some e
-
-/-- Recursively unfold `.opaqueInfo` bodies (with level-param instantiation) so that
-    `Lean.Kernel.whnf` can reduce opaque-wrapped `Bool` expressions (runtime-faithful refutation). -/
-partial def unfoldOpaquesInExpr (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
-  match fuel with
-  | 0 => none
-  | fuel' + 1 =>
-    match e with
-    | .mdata _ inner => unfoldOpaquesInExpr env fuel' inner
-    | .const c lvls =>
-      match env.checked.get.find? c with
-      | some (.opaqueInfo ov) =>
-        unfoldOpaquesInExpr env fuel' (ov.value.instantiateLevelParams ov.levelParams lvls)
-      | _ => some e
-    | .app f a =>
-      match unfoldOpaquesInExpr env fuel' f, unfoldOpaquesInExpr env fuel' a with
-      | some f', some a' => some (.app f' a')
-      | _, _ => none
-    | .lam n d b bi =>
-      match unfoldOpaquesInExpr env fuel' d, unfoldOpaquesInExpr env fuel' b with
-      | some d', some b' => some (.lam n d' b' bi)
-      | _, _ => none
-    | .forallE n d b bi =>
-      match unfoldOpaquesInExpr env fuel' d, unfoldOpaquesInExpr env fuel' b with
-      | some d', some b' => some (.forallE n d' b' bi)
-      | _, _ => none
-    | .letE n t v b nd =>
-      match unfoldOpaquesInExpr env fuel' t, unfoldOpaquesInExpr env fuel' v, unfoldOpaquesInExpr env fuel' b with
-      | some t', some v', some b' => some (.letE n t' v' b' nd)
-      | _, _, _ => none
-    | .proj s i x => (unfoldOpaquesInExpr env fuel' x).map (.proj s i)
-    | _ => some e
-
-def checkValidProvisionalNativeAxiom (env : Environment) (user axName : Name) (ci : ConstantInfo) : IO Unit := do
+def checkProvisionalNativeAxiomShape (env : Environment) (user axName : Name) (ci : ConstantInfo) : IO Expr := do
   -- Must be ground (`levelParams = []`), `@Eq.{1} Bool e Bool.true` with closed `e`.
   unless ci.levelParams.isEmpty do
     policyFail "invalidNativeAxiomType" axName #[user, axName]
@@ -1650,13 +1938,17 @@ def checkValidProvisionalNativeAxiom (env : Environment) (user axName : Name) (c
     if c == ``Bool.false then
       policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS reduces to Bool.false"
   | some _ => pure ()
-  -- Also run alternating opaque-unfolding + real Lean 4.34.1 `Kernel.whnf` so iota/proj/Bool.not/Nat.beq
-  -- reductions to `Bool.false` (including through opaque wrappers) are refuted!
+  return lhs
+
+/-- Runs AFTER `baseEnv.toKernelEnv.replay` succeeds so C++ `Lean.Kernel.whnf` never touches
+    unchecked or non-terminating forged `.defnInfo` declarations! -/
+def refuteProvisionalNativeWithKernelWhnf (replayedEnv : Environment) (fullEnv : Environment)
+    (user axName : Name) (lhs : Expr) : IO Unit := do
   let mut cur := lhs
   for _ in [:8] do
-    let some expanded := unfoldOpaquesInExpr env 2048 cur
+    let some expanded := unfoldOpaquesInExpr fullEnv 2048 cur
       | policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom opaque unfolding exhausted budget"
-    match Lean.Kernel.whnf env {} expanded with
+    match Lean.Kernel.whnf replayedEnv {} expanded with
     | .error _ =>
       policyFail "invalidNativeAxiomType" axName #[user, axName] "native axiom LHS failed kernel reduction"
     | .ok next =>
@@ -1679,52 +1971,6 @@ def isCodegenUnsafeRec (byName : Std.HashMap Name ConstantInfo) (ci : ConstantIn
         | _ => false
       | _ => false
   | _ => false
-
-/-- Extracts the actual coercion `(sourceType, targetType)` from a coercion function's type
-    (the LAST explicit/non-implicit domain `src` and final codomain `tgt`, ignoring leading
-    type parameters or unused dummy binders). -/
-def coeSrcAndTgt (e : Expr) : Option (Expr × Expr) :=
-  let rec go (cur : Expr) (lastDom? : Option Expr) : Option (Expr × Expr) :=
-    match cur with
-    | .mdata _ inner => go inner lastDom?
-    | .forallE _ d b _ => go b (some d)
-    | cod => lastDom?.map fun d => (d, cod)
-  go e none
-
-/-- Normalize an expression by unfolding `.defnInfo` and beta-reducing, then strip leading `forallE`/`lam`. -/
-partial def normExprInEnv (env : Environment) (fuel : Nat) (e : Expr) : Option Expr :=
-  match fuel with
-  | 0 => none
-  | fuel' + 1 =>
-    match e with
-    | .mdata _ inner => normExprInEnv env fuel' inner
-    | .letE _ _ v b _ => normExprInEnv env fuel' (b.instantiate1 v)
-    | .const c lvls =>
-      match env.checked.get.find? c with
-      | some (.defnInfo dv) =>
-        normExprInEnv env fuel' (dv.value.instantiateLevelParams dv.levelParams lvls)
-      | _ => some e
-    | .app f a =>
-      match normExprInEnv env fuel' f, normExprInEnv env fuel' a with
-      | some (.lam _ _ b _), some a' => normExprInEnv env fuel' (b.instantiate1 a')
-      | some f', some a' => some (.app f' a')
-      | _, _ => none
-    | .forallE n d b bi =>
-      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
-      | some d', some b' => some (.forallE n d' b' bi)
-      | _, _ => none
-    | .lam n d b bi =>
-      match normExprInEnv env fuel' d, normExprInEnv env fuel' b with
-      | some d', some b' => some (.lam n d' b' bi)
-      | _, _ => none
-    | .proj s i x => (normExprInEnv env fuel' x).map (.proj s i)
-    | _ => some e
-
-partial def stripForallAndLam : Expr → Expr
-  | .forallE _ _ b _ => stripForallAndLam b
-  | .lam _ _ b _ => stripForallAndLam b
-  | .mdata _ e => stripForallAndLam e
-  | e => e
 
 def isOutParamDomain (d : Expr) : Bool :=
   let hd := (stripForallAndLam d).getAppFn
@@ -1776,12 +2022,22 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
     | _ => false
   | _ => false
 
-def isAutoSizeOfInst (byName : Std.HashMap Name ConstantInfo) (instDecl cls : Name) : Bool :=
-  if cls != ``SizeOf then false
+def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo) (instDecl cls : Name)
+    (args : Array Expr) : Bool :=
+  if cls != ``SizeOf || args.size != 1 then false
   else match instDecl with
     | .str indName "_sizeOf_inst" =>
       match byName[indName]? with
-      | some (.inductInfo _) => true
+      | some (.inductInfo iv) =>
+        match normExprInEnv env 256 iv.type with
+        | none => false
+        | some normIvTy =>
+          let nonPropInd := (stripForallAndLam normIvTy).consumeMData != .sort .zero
+          let a0 := args[0]!.consumeMData
+          let aArgs := a0.getAppArgs
+          nonPropInd && a0.getAppFn.isConstOf indName &&
+            aArgs.size == iv.numParams + iv.numIndices &&
+            aArgs.all (fun x => x.consumeMData.isBVar)
       | _ => false
     | _ => false
 
@@ -1794,21 +2050,6 @@ def verifyCertificateHead (headConst : Expr) : Bool :=
   headConst.isConstOf `Trusted.VerificationResult.StatefulEquivVerificationResult ||
   headConst.isConstOf `Trusted.VerificationResult.UbExceptionVerificationResult ||
   headConst.isConstOf `Trusted.VerificationResult.CrateVerificationResult
-
-def computeInitMultiNames (initEnv : Environment) : NameSet × NameSet := Id.run do
-  let mut mods : NameSet := {}
-  let mut s : NameSet := {}
-  for h : idx in [:initEnv.header.modules.size] do
-    let m := initEnv.header.modules[idx].module
-    mods := mods.insert m
-    let d := initEnv.header.moduleData[idx]!
-    for ci in d.constants do
-      let ge2 := match ci.name with
-        | .str p _ | .num p _ => !p.isAnonymous
-        | .anonymous => false
-      if !isPrivateName ci.name && ge2 then
-        s := s.insert ci.name
-  return (mods, s)
 
 def insertReplayLocalUnique (env : Environment) (m : Name)
     (acc : Std.HashMap Name ConstantInfo) (ci : ConstantInfo) :
@@ -1827,7 +2068,8 @@ def forbiddenRawExtSubstrings : List String := [
 ]
 
 def forbiddenRawCodegenSubstrings : List String := [
-  "CSimp", "csimp", "passManagerExt", "cpass"
+  "CSimp", "csimp", "passManagerExt", "cpass",
+  "regularInitAttr", "builtinInitAttr", "implementedByAttr", "externAttr", "exportAttr"
 ]
 
 def checkRawForbiddenEntries (m : Name) (entries : Array (Name × Array EnvExtensionEntry)) : IO Unit := do
@@ -1841,6 +2083,210 @@ def checkRawForbiddenEntries (m : Name) (entries : Array (Name × Array EnvExten
           policyFail "forbiddenInitOrCodegenHook" m #[m, extName] es
         if forbiddenRawExtSubstrings.any (fun sub => (es.splitOn sub).length > 1) then
           policyFail "forbiddenMacroOrElab" m #[m, extName] es
+
+def isValidSubPartConstant (ci privCi : ConstantInfo) : Bool :=
+  if sameStoredDecl ci privCi then true
+  else match ci with
+  | .axiomInfo av =>
+    !av.isUnsafe && av.name == privCi.name && av.type == privCi.type &&
+    av.levelParams == privCi.levelParams && !privCi.isUnsafe &&
+    (match privCi with
+     | .thmInfo _ | .defnInfo _ | .opaqueInfo _ | .inductInfo _ | .axiomInfo _ => true
+     | _ => false)
+  | _ => false
+
+def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : ModuleData)
+    (privByName : Std.HashMap Name ConstantInfo) : IO Unit := do
+  unless part.imports == priv.imports do
+    policyFail "foreignImport" modName #[modName]
+      s!"split-brain imports mismatch between {partLabel} and .olean.private"
+  for ci in part.constants do
+    let some privCi := privByName[ci.name]?
+      | policyFail "keyNameMismatch" modName #[modName, ci.name]
+          s!"split-brain {partLabel} contains phantom declaration {ci.name} absent from .olean.private"
+    unless isValidSubPartConstant ci privCi do
+      policyFail "duplicateConstName" modName #[modName, ci.name]
+        s!"split-brain {partLabel} declaration {ci.name} diverges from .olean.private"
+  let mut privEntCounts : Std.HashMap Name Nat := {}
+  for (eName, eArr) in priv.entries do
+    privEntCounts := privEntCounts.insert eName eArr.size
+  for (eName, eArr) in part.entries do
+    -- `Lean.declRangeExt` is server-specific source-range metadata (`computeExtEntries` `.server`);
+    -- all semantic kernel/meta/elab/compiler extensions must be monotonic into `.private`.
+    if !eArr.isEmpty && eName != `Lean.declRangeExt then
+      let privCnt := privEntCounts[eName]?.getD 0
+      if eArr.size > privCnt then
+        policyFail "keyNameMismatch" modName #[modName, eName]
+          s!"split-brain {partLabel} extension {eName} has {eArr.size} entries vs {privCnt} in .olean.private"
+
+def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OLeanLevel)
+    (m : Name) (idx : Nat) (role : String) (strictProofs : Bool)
+    (byName : Std.HashMap Name ConstantInfo) (localReplayable : NameSet) : IO Unit := do
+  let macros := Elab.macroAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in macros do
+    match entry with
+    | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "macro"
+    | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_macro"
+
+  let parsers := Parser.parserExtension.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in parsers do
+    match entry with
+    | .global _ => policyFail "forbiddenMacroOrElab" m #[m] "syntax"
+    | .scoped _ _ => policyFail "forbiddenMacroOrElab" m #[m] "scoped_syntax"
+
+  let cmdElabs := Elab.Command.commandElabAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in cmdElabs do
+    match entry with
+    | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "command_elab"
+    | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_elab"
+
+  let termElabs := Elab.Term.termElabAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in termElabs do
+    match entry with
+    | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "term_elab"
+    | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_term_elab"
+
+  let delabs := PrettyPrinter.Delaborator.delabAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in delabs do
+    match entry with
+    | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "delab"
+
+  let unexps := PrettyPrinter.Delaborator.appUnexpanderAttribute.ext.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in unexps do
+    match entry with
+    | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "app_unexpander"
+
+  let unifHints := Meta.unificationHintExtension.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in unifHints do
+    match entry with
+    | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.val] "unification_hint"
+
+  let cbvEvals := Meta.Tactic.Cbv.cbvEvalExt.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in cbvEvals do
+    match entry with
+    | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.origin] "cbv_eval"
+
+  let cbvOpaques := Meta.Tactic.Cbv.cbvOpaqueExt.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in cbvOpaques do
+    match entry with
+    | .global n | .scoped _ n => policyFail "forbiddenMacroOrElab" m #[m, n] "cbv_opaque"
+
+  let regInits := regularInitAttr.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                  regularInitAttr.ext.getModuleIREntries checkEnv idx
+  if let some (decl, _) := regInits[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "initialize"
+
+  let builtinInits := builtinInitAttr.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                      builtinInitAttr.ext.getModuleIREntries checkEnv idx
+  if let some (decl, _) := builtinInits[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "builtin_initialize"
+
+  let implBys := Compiler.implementedByAttr.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                 Compiler.implementedByAttr.ext.getModuleIREntries checkEnv idx
+  if let some (decl, _) := implBys[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "implemented_by"
+
+  let externs := externAttr.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                 externAttr.ext.getModuleIREntries checkEnv idx
+  if let some (decl, _) := externs[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "extern"
+
+  let cExports := exportAttr.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                  exportAttr.ext.getModuleIREntries checkEnv idx
+  if let some (decl, _) := cExports[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "c_export"
+
+  let csimps := Compiler.CSimp.ext.ext.getModuleEntries checkEnv idx (level := extLevel) ++
+                Compiler.CSimp.ext.ext.getModuleIREntries checkEnv idx
+  for entry in csimps do
+    match entry with
+    | .global e | .scoped _ e =>
+      policyFail "forbiddenInitOrCodegenHook" m #[m, e.thmName] "csimp"
+
+  let cpasses := Compiler.LCNF.passManagerExt.getModuleEntries checkEnv idx (level := extLevel) ++
+                 Compiler.LCNF.passManagerExt.getModuleIREntries checkEnv idx
+  if let some decl := cpasses[0]? then
+    policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "cpass"
+
+  let aliases := aliasExtension.getModuleEntries checkEnv idx (level := extLevel)
+  if let some (alName, _) := aliases[0]? then
+    policyFail "forbiddenShadowingOrExport" m #[m, alName] "export"
+
+  let mut localRedOver : NameSet := {}
+  for (target, status) in reducibilityCoreExt.getModuleEntries checkEnv idx (level := extLevel) do
+    unless localReplayable.contains target do
+      policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibilityCore on non-local decl"
+    if status == .reducible then
+      localRedOver := localRedOver.insert target
+  for entry in reducibilityExtraExt.ext.getModuleEntries checkEnv idx (level := extLevel) do
+    let target := match entry with | .global (t, _) => t | .scoped _ (t, _) => t
+    unless localReplayable.contains target do
+      policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibility override on foreign decl"
+    localRedOver := localRedOver.insert target
+
+  let defInsts := Meta.defaultInstanceExtension.getModuleEntries checkEnv idx (level := extLevel)
+  for de in defInsts do
+    unless role == "defsExempt" do
+      policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance"
+    unless localReplayable.contains de.instanceName &&
+           isBaseInstanceAnchor localReplayable localRedOver byName de.className do
+      policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
+
+  let coes := Meta.coeExt.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for ce in coes do
+    let decl := match ce with | .global (n, _) => n | .scoped _ (n, _) => n
+    unless role == "defsExempt" && localReplayable.contains decl do
+      policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
+    let some ci := byName[decl]?
+      | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
+    let some (srcTy, tgtTy) := extractCoeSrcAndTgt normEnv ci.type
+      | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe_between_imported_types"
+    unless hasRigidBaseAnchor normEnv localReplayable localRedOver byName srcTy ||
+           hasRigidBaseAnchor normEnv localReplayable localRedOver byName tgtTy do
+      policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe_between_imported_types"
+
+  let insts := Meta.instanceExtension.ext.getModuleEntries checkEnv idx (level := extLevel)
+  for entry in insts do
+    match entry with
+    | .scoped ns ie =>
+      let some dName := ie.globalName?
+        | policyFail "forbiddenInstanceOrCoe" m #[m] "anonymous_scoped_instance"
+      unless role == "defsExempt" do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance"
+      unless localReplayable.contains dName do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let some ci := byName[dName]?
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let some normConcl := (normExprInEnv normEnv 1024 ci.type).map stripForallAndLam
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
+      let .const cls _ := normConcl.getAppFn
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
+      unless isBaseInstanceAnchor localReplayable localRedOver byName cls do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
+      unless (nameComponents m).isPrefixOf (nameComponents ns) do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "invalid_instance_scope"
+    | .global ie =>
+      let some dName := ie.globalName?
+        | policyFail "forbiddenInstanceOrCoe" m #[m] "anonymous_local_instance"
+      unless localReplayable.contains dName do
+        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let some ci := byName[dName]?
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
+      let some normConcl := (normExprInEnv normEnv 1024 ci.type).map stripForallAndLam
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
+      let .const cls _ := normConcl.getAppFn
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
+      let allArgs := normConcl.getAppArgs
+      if isAutoSizeOfInst normEnv byName dName cls allArgs then
+        pure ()
+      else if isBaseInstanceAnchor localReplayable localRedOver byName cls then
+        pure ()
+      else
+        if role == "proof" || role == "verify" || (strictProofs && role != "defsExempt") then
+          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "instance_of_imported_class"
+        let inputArgs := nonOutParamArgs normEnv cls allArgs
+        unless inputArgs.any (hasRigidBaseAnchor normEnv localReplayable localRedOver byName) do
+          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
 
 def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
   verifyPartKeysOnly modName data
@@ -1858,7 +2304,8 @@ def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
 
 def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     (cachedInitEnv? : Option Environment := none)
-    (cachedInitMods : NameSet := {}) (cachedInitMulti? : Option NameSet := none) : IO Json := do
+    (cachedInitMods : NameSet := {}) (cachedInitMulti? : Option NameSet := none)
+    (cachedInitState? : Option ImportState := none) : IO Json := do
   let sysrootStr ← field (α := String) j "sysroot"
   let sysroot := System.FilePath.mk sysrootStr
   let stdRoot ← IO.FS.realPath (sysroot / "lib" / "lean")
@@ -1888,14 +2335,29 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
   let allowLocalTestAxioms ← field (α := Bool) j "allowLocalTestAxioms"
   let oleanSpecs ← field (α := Array Json) j "oleanFiles"
 
-  -- 1. Pre-check target module names & raw on-disk ModuleData BEFORE `importModules`
-  --    (catches size mismatch, duplicate keys, key!=ci.name, and missing .olean.{server,private}
-  --    even when `finalizeImport` would throw a generic `already imported` error).
+  -- 1. Pre-check target module names, search-path provenance, & raw on-disk ModuleData BEFORE `importModules`
+  --    (catches size mismatch, duplicate keys, key!=ci.name, missing .olean.{server,private},
+  --    and Init/Std/Lean/Trusted directory shadowing before `importModules` ever touches disk).
   for m in targetMods do
     let _ ← classifyModuleRole m
     if isStdlibMod m || isLeanCompilerMod m then
       policyFail "stdlibNamedPackageModule" m #[m] "cannot audit a module claiming Init/Std/Lean namespace"
 
+  let sp ← searchPathRef.get
+  for root in sp do
+    let realRoot ← try IO.FS.realPath root catch _ => pure root
+    unless realRoot == stdRoot do
+      for top in ["Init", "Std", "Lean"] do
+        if (← (root / top).pathExists) || (← (root / s!"{top}.olean").pathExists) then
+          policyFail "stdlibNamedPackageModule" top.toName #[top.toName]
+            s!"search-path root {root} shadows {top}"
+      if let some tRoot := trustedRoot? then
+        unless realRoot == tRoot do
+          if (← (root / "Trusted").pathExists) || (← (root / "Trusted.olean").pathExists) then
+            policyFail "trustedNamedPackageModule" `Trusted #[`Trusted]
+              s!"search-path root {root} shadows Trusted"
+
+  let mut allTargetsImportInit := !cachedInitMods.isEmpty
   for specObj in oleanSpecs do
     let modStr ← field (α := String) specObj "module"
     let oleanPathStr ← field (α := String) specObj "path"
@@ -1922,13 +2384,26 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
       let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
       verifyPartKeysOnly modName server.1
       let _ ← verifyModuleInventory modName priv.1
+      allTargetsImportInit := allTargetsImportInit &&
+        priv.1.imports.any (fun imp => cachedInitMods.contains imp.module)
     else
       let _ ← verifyModuleInventory modName main.1
+      allTargetsImportInit := allTargetsImportInit &&
+        main.1.imports.any (fun imp => cachedInitMods.contains imp.module)
 
   -- 2. Import environment strictly with `loadExts := false` (ZERO initializer execution!)
+  --    Reusing `cachedInitState?` avoids re-mapping ~300 MB of `Init` `CompactedRegion`s per item!
+  let targetImps := targetMods.map fun n => ({ module := n } : Import)
   let env ← try
-    importModules (targetMods.map fun n => { module := n }) {}
-      (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
+    match cachedInitState?, allTargetsImportInit with
+    | some initSt, true =>
+      withImporting do
+        let (_, s) ← importModulesCore (globalLevel := .private) targetImps |>.run initSt
+        finalizeImport s targetImps {} (trustLevel := 0)
+          (leakEnv := false) (loadExts := false) (level := .private)
+    | _, _ =>
+      importModules targetImps {}
+        (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
   catch ex =>
     let msg := ex.toString
     if (msg.splitOn "already contains").length > 1 then
@@ -1947,27 +2422,17 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
       nonStdLoaded := nonStdLoaded.push m.module
   loadedModsRef.set nonStdLoaded
 
-  -- 3. Verify search-path & stdlib/Trusted provenance (`Patch 8`) and module-name uniqueness
-  let sp ← searchPathRef.get
-  for root in sp do
-    let realRoot ← try IO.FS.realPath root catch _ => pure root
-    unless realRoot == stdRoot do
-      for top in ["Init", "Std", "Lean"] do
-        if (← (root / top).pathExists) || (← (root / s!"{top}.olean").pathExists) then
-          policyFail "stdlibNamedPackageModule" top.toName #[top.toName]
-            s!"search-path root {root} shadows {top}"
-      if let some tRoot := trustedRoot? then
-        unless realRoot == tRoot do
-          if (← (root / "Trusted").pathExists) || (← (root / "Trusted.olean").pathExists) then
-            policyFail "trustedNamedPackageModule" `Trusted #[`Trusted]
-              s!"search-path root {root} shadows Trusted"
+  -- 3. Verify stdlib/Trusted `.olean` file provenance (`Patch 8`) and module-name uniqueness
 
   let mut seenModNames : NameSet := {}
   let mut modRoles : Std.HashMap Name String := {}
   let mut auditedSet : NameSet := {}
+  let mut moduleFlaggedSet : NameSet := {}
   let mut baseMods : Array Name := #[]
   let mut publicNamesMap : Std.HashMap Name NameSet := {}
   let mut extraPartEntriesMap : Std.HashMap Name (Array (Name × Array EnvExtensionEntry)) := {}
+  let mut extraPartConstsMap : Std.HashMap Name (Array Name) := {}
+  let mut subPartsMap : Std.HashMap Name (ModuleData × ModuleData × ModuleData) := {}
   for h : idx in [:env.header.modules.size] do
     let m := env.header.modules[idx].module
     let d := env.header.moduleData[idx]!
@@ -2009,7 +2474,9 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "missingOleanServer" m #[m] "module was not compiled in module mode"
       verifyPartAux m mainPart.1
       let mut extraEntries := mainPart.1.entries
+      let mut extraConsts := mainPart.1.extraConstNames
       if mainPart.1.isModule || d.isModule then
+        moduleFlaggedSet := moduleFlaggedSet.insert m
         let sFile := OLeanLevel.server.adjustFileName oleanPath
         let pFile := OLeanLevel.private.adjustFileName oleanPath
         unless (← sFile.pathExists) do
@@ -2026,7 +2493,9 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           opFail s!"failed deserializing .olean.private {pFile}: {ex}"
         verifyPartAux m serverPart.1
         verifyPartAux m privPart.1
+        subPartsMap := subPartsMap.insert m (mainPart.1, serverPart.1, privPart.1)
         extraEntries := extraEntries ++ serverPart.1.entries ++ privPart.1.entries
+        extraConsts := extraConsts ++ serverPart.1.extraConstNames ++ privPart.1.extraConstNames
         publicNamesMap := publicNamesMap.insert m (NameSet.ofArray mainPart.1.constNames)
       let irSigFile := oleanPath.withExtension "ir.sig"
       if (← irSigFile.pathExists) then
@@ -2036,6 +2505,7 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           opFail s!"failed deserializing .ir.sig {irSigFile}: {ex}"
         verifyPartAux m irSigPart.1
         extraEntries := extraEntries ++ irSigPart.1.entries
+        extraConsts := extraConsts ++ irSigPart.1.extraConstNames
         let irFile := oleanPath.withExtension "ir"
         if (← irFile.pathExists) then
           let irPart ← try
@@ -2044,18 +2514,17 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
             opFail s!"failed deserializing .ir {irFile}: {ex}"
           verifyPartAux m irPart.1
           extraEntries := extraEntries ++ irPart.1.entries
+          extraConsts := extraConsts ++ irPart.1.extraConstNames
       extraPartEntriesMap := extraPartEntriesMap.insert m extraEntries
+      extraPartConstsMap := extraPartConstsMap.insert m extraConsts
       auditedSet := auditedSet.insert m
       if role == "verify" && !targetMods.contains m then
         policyFail "invalidVerifyRoot" m #[m.str "verified"]
           s!"verify module {m} was loaded transitively without being listed in --audit-module"
 
   -- 4. Verify inventory, FULL SMap key bijection (`map₁` & `map₂`, NEVER skipping `map₁`),
-  --    using pure `SMap.fold` (zero `IO` closure overhead across all ~60k entries),
-  --    cross-module duplicates, & extraConstNames
-  let findKeyMismatch (m : ConstMap) : Option (Name × Name) :=
-    m.fold (init := none) fun acc n ci =>
-      if acc.isSome then acc else if n == ci.name then none else some (n, ci.name)
+  --    split-brain `.olean`/`.olean.server`/`.olean.private` inclusion, cross-module duplicates,
+  --    & `realDeclOwner` provenance (immune to `extraConstNames` `const2ModIdx` spoofing!)
   if let some (n, ciName) := findKeyMismatch env.checked.get.constants then
     policyFail "keyNameMismatch" n #[n, ciName] s!"env.checked SMap key {n} != ci.name {ciName}"
   if env.header.isModule then
@@ -2064,15 +2533,24 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
 
   let mut byModMap : Std.HashMap Name (Std.HashMap Name ConstantInfo) := {}
   let mut modIdxMap : Std.HashMap Name Nat := {}
+  let mut realDeclOwner : Std.HashMap Name Name := {}
   let mut replayLocals : Std.HashMap Name ConstantInfo := {}
   let mut crossDecls : Std.HashMap Name (Name × ConstantInfo) := {}
+  let mut auditedIndices : Array Nat := #[]
 
   for h : idx in [:env.header.modules.size] do
     let m := env.header.modules[idx].module
     let d := env.header.moduleData[idx]!
     modIdxMap := modIdxMap.insert m idx
+    if !isStdlibMod m then
+      for cname in d.constNames do
+        realDeclOwner := realDeclOwner.insertIfNew cname m
     if auditedSet.contains m then
+      auditedIndices := auditedIndices.push idx
       let byName ← verifyModuleInventory m d (some env)
+      if let some (mainD, srvD, privD) := subPartsMap[m]? then
+        verifySubPartConsistent m ".olean" mainD privD byName
+        verifySubPartConsistent m ".olean.server" srvD privD byName
       byModMap := byModMap.insert m byName
       for ci in d.constants do
         if let some (prevMod, prevCi) := crossDecls[ci.name]? then
@@ -2084,18 +2562,25 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         let some origIdx := env.getModuleIdxFor? ci.name
           | policyFail "keyNameMismatch" m #[m, ci.name] "missing const2ModIdx entry"
         let origMod := env.header.modules[origIdx]!.module
-        if origMod != m then
-          unless auditedSet.contains origMod && Lean.isReservedName env ci.name do
-            policyFail "reservedOriginMissingSibling" m #[m, ci.name, origMod]
-              s!"origin mismatch: {ci.name} in {m} claims {origMod}"
+        let declOrigMod := realDeclOwner[ci.name]?.getD origMod
+        if origMod != m || declOrigMod != m then
+          let mismatchMod := if declOrigMod != m then declOrigMod else origMod
+          unless auditedSet.contains mismatchMod && Lean.isReservedName env ci.name do
+            policyFail "reservedOriginMissingSibling" m #[m, ci.name, mismatchMod]
+              s!"origin mismatch: {ci.name} in {m} claims {mismatchMod}"
           let some stored := env.checked.get.find? ci.name
             | policyFail "keyNameMismatch" m #[m, ci.name] "missing stored constant"
           unless sameStoredDecl stored ci do
-            policyFail "duplicateConstName" origMod #[origMod, ci.name]
+            policyFail "duplicateConstName" mismatchMod #[mismatchMod, ci.name]
               "stored declaration differs from inventory copy"
         if !isCodegenUnsafeRec byName ci then
           replayLocals ← insertReplayLocalUnique env m replayLocals ci
-      for extra in d.extraConstNames do
+      let allExtras := d.extraConstNames ++ (extraPartConstsMap[m]?.getD #[])
+      for extra in allExtras do
+        if let some owner := realDeclOwner[extra]? then
+          if owner != m then
+            policyFail "extraConstNameProvenance" m #[m, extra]
+              s!"extraConstName {extra} belongs to {owner}"
         if let some origIdx := env.getModuleIdxFor? extra then
           let origMod := env.header.modules[origIdx]!.module
           if origMod != m then
@@ -2179,283 +2664,155 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
             let dropRoot := (cParts.drop 1).foldl Name.str .anonymous
             trustedProtected := trustedProtected.insert dropRoot
 
+  -- Lazily loaded `.exported` and `.server` environments for surviving module-mode artifacts
+  -- (strictly with `loadExts := false`!) so public `publicConstantMap` SMap keys and split-brain
+  -- extension entries in `.olean` / `.olean.server` are verified with full typed precision!
+  let mut expLevelEnv? : Option (Environment × Std.HashMap Name Nat) := none
+  let mut srvLevelEnv? : Option (Environment × Std.HashMap Name Nat) := none
+
+  let mut pendingNativeRefutations : Array (Name × Name × Expr) := #[]
+
   -- 5. Audit imports, persistent extensions, shadowing, declarations, & reference-vs-import closure
-  for h : idx in [:env.header.modules.size] do
-    let m := env.header.modules[idx].module
+  for idx in auditedIndices do
+    let m := env.header.modules[idx]!.module
     let d := env.header.moduleData[idx]!
-    if auditedSet.contains m then
-      let role := modRoles[m]!
-      let byName := byModMap[m]!
-      let mut localConstSet : NameSet := {}
-      let mut localReplayable : NameSet := {}
-      for ci in d.constants do
-        localConstSet := localConstSet.insert ci.name
-        if !isCodegenUnsafeRec byName ci then
-          localReplayable := localReplayable.insert ci.name
+    let role := modRoles[m]!
+    let byName := byModMap[m]!
+    let mut localReplayable : NameSet := {}
+    for ci in d.constants do
+      if !isCodegenUnsafeRec byName ci then
+        localReplayable := localReplayable.insert ci.name
 
-      -- Check `unsafe`/`partial` declarations BEFORE extension hooks so `unsafe def` / `unsafe t`
-      -- (which also synthesizes `@[implemented_by ..._unsafe_impl]`) reports `unsafeOrPartialDecl`.
-      for ci in d.constants do
-        if isCodegenUnsafeRec byName ci then
+    -- Check `unsafe`/`partial` declarations BEFORE extension hooks so `unsafe def` / `unsafe t`
+    -- (which also synthesizes `@[implemented_by ..._unsafe_impl]`) reports `unsafeOrPartialDecl`.
+    for ci in d.constants do
+      if isCodegenUnsafeRec byName ci then
+        pure ()
+      else if ci.isUnsafe || ci.isPartial then
+        policyFail "unsafeOrPartialDecl" m #[m, ci.name] "unsafe or partial declaration"
+
+    -- 5a. Imports (`V14`, `B2`, `A2`, `B3`)
+    for imp in d.imports do
+      if imp.importAll then
+        if let some privInst := findPrivateInstanceInMod imp.module then
+          policyFail "privateInstanceLeakViaImportAll" m #[m, imp.module, privInst]
+            s!"import all exposes private instance {privInst} from {imp.module}"
+        else
+          policyFail "forbiddenImportAll" m #[m, imp.module] "import all is forbidden"
+      if !imp.isExported then
+        if !d.isModule then
+          policyFail "forbiddenImportModifier" m #[m, imp.module] "private"
+      if imp.isMeta && imp.module != `Init then
+        policyFail "forbiddenImportModifier" m #[m, imp.module] "meta"
+      if !isWellFormedName imp.module || isLeanCompilerMod imp.module || !seenModNames.contains imp.module then
+        policyFail "foreignImport" m #[m, imp.module] s!"foreign or disallowed import {imp.module}"
+      let impRole := modRoles[imp.module]?.getD "spec"
+      unless importRoleAllowed role impRole do
+        policyFail "forbiddenImportDirection" m #[m, imp.module] s!"{role} -> {impRole}"
+    let visClosure ← computeImportClosure m
+
+    -- 5b. Persistent extensions across `.private`, `.exported`, and `.server` levels (zero RCE!)
+    auditModuleExtensionsAtLevel env env .exported m idx role strictProofs byName localReplayable
+    if moduleFlaggedSet.contains m then
+      if expLevelEnv?.isNone then
+        let modTargets := (moduleFlaggedSet.toArray.qsort Name.lt).map fun n => ({ module := n } : Import)
+        let expE ← try
+          importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .exported)
+        catch ex =>
+          let msg := ex.toString
+          if (msg.splitOn "already contains").length > 1 then
+            policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
+          opFail s!"exported-level importModules failed: {msg}"
+        if let some (n, ciName) := findKeyMismatch (expE.setExporting true).constants then
+          policyFail "keyNameMismatch" n #[n, ciName] s!"exported public SMap key {n} != ci.name {ciName}"
+        let mut expMap : Std.HashMap Name Nat := {}
+        for h : i in [:expE.header.modules.size] do
+          expMap := expMap.insert expE.header.modules[i].module i
+        expLevelEnv? := some (expE.setExporting false, expMap)
+
+        let srvE ← try
+          importModules modTargets {} (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .server)
+        catch ex =>
+          let msg := ex.toString
+          if (msg.splitOn "already contains").length > 1 then
+            policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
+          opFail s!"server-level importModules failed: {msg}"
+        let mut srvMap : Std.HashMap Name Nat := {}
+        for h : i in [:srvE.header.modules.size] do
+          srvMap := srvMap.insert srvE.header.modules[i].module i
+        srvLevelEnv? := some (srvE.setExporting false, srvMap)
+      if let some (expE, expMap) := expLevelEnv? then
+        if let some eIdx := expMap[m]? then
+          auditModuleExtensionsAtLevel env expE .exported m eIdx role strictProofs byName localReplayable
+      if let some (srvE, srvMap) := srvLevelEnv? then
+        if let some sIdx := srvMap[m]? then
+          auditModuleExtensionsAtLevel env srvE .server m sIdx role strictProofs byName localReplayable
+
+    -- Raw `entries` catch-all across `.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`
+    checkRawForbiddenEntries m d.entries
+    if let some partEnts := extraPartEntriesMap[m]? then
+      checkRawForbiddenEntries m partEnts
+
+    -- 5c. Public namespace suffix shadowing (`V15`) — includes precomputed `Trusted.*` names too!
+    let mut stmtProtected : NameSet := if isTrustedMod m then {} else trustedProtected
+    for idx2 in auditedIndices do
+      let m2 := env.header.modules[idx2]!.module
+      if m2 != m && isStatementSideRole (modRoles[m2]!) then
+        let m2Parts := nameComponents m2
+        for ci2 in env.header.moduleData[idx2]!.constants do
+          if !isPrivateName ci2.name && !hasInternalPart ci2.name then
+            stmtProtected := stmtProtected.insert ci2.name
+            let cParts := nameComponents ci2.name
+            if m2Parts.isPrefixOf cParts && cParts.length > m2Parts.length then
+              let stripped := (cParts.drop m2Parts.length).foldl Name.str .anonymous
+              stmtProtected := stmtProtected.insert stripped
+
+    for ci in d.constants do
+      if !isPrivateName ci.name then
+        let cParts := nameComponents ci.name
+        if cParts.length >= 2 then
+          if let some lastSeg := cParts.getLast? then
+            if coreSingleProtected.contains (Name.mkSimple lastSeg) then
+              policyFail "forbiddenShadowingOrExport" m #[m, ci.name] "namespace_shadow"
+        for suf in properSuffixes ci.name do
+          if !hasInternalPart suf then
+            if stdMultiNames.contains suf || stmtProtected.contains suf then
+              policyFail "forbiddenShadowingOrExport" m #[m, ci.name] "namespace_shadow"
+
+    -- 5d. Declaration safety, unreferenced axioms (`V04`), & reference-vs-import closure (`B3`)
+    for ci in d.constants do
+      if isCodegenUnsafeRec byName ci then
+        pure ()
+      else if ci.isUnsafe || ci.isPartial then
+        policyFail "unsafeOrPartialDecl" m #[m, ci.name] "unsafe or partial declaration"
+
+      if ci.isAxiom then
+        if ci.name == `sorryAx then
+          policyFail "forbiddenAxiom" m #[ci.name, `sorryAx, m] "sorryAx"
+        if isCompilerTrustConst ci.name then
+          policyFail "forbiddenNativeReductionAxiom" m #[ci.name, ci.name] "Lean.trustCompiler"
+        if isNativeReductionConst ci.name then
+          unless allowProvisionalNative && role == "proof" && isProvisionalNativeName ci.name do
+            policyFail "forbiddenNativeReductionAxiom" m #[ci.name, ci.name] "native reduction axiom"
+          let lhs ← checkProvisionalNativeAxiomShape env ci.name ci.name ci
+          pendingNativeRefutations := pendingNativeRefutations.push (ci.name, ci.name, lhs)
+        else if role == "assumptions" then
+          unless allowAssumptions do
+            policyFail "forbiddenAxiom" m #[ci.name, ci.name, m] "assumption axiom requires --allow-assumptions"
+        else if role == "test" && allowLocalTestAxioms then
           pure ()
-        else if ci.isUnsafe || ci.isPartial then
-          policyFail "unsafeOrPartialDecl" m #[m, ci.name] "unsafe or partial declaration"
+        else
+          policyFail "forbiddenAxiom" m #[ci.name, ci.name, m] "unapproved axiom"
 
-      -- 5a. Imports (`V14`, `B2`, `A2`, `B3`)
-      for imp in d.imports do
-        if imp.importAll then
-          if let some privInst := findPrivateInstanceInMod imp.module then
-            policyFail "privateInstanceLeakViaImportAll" m #[m, imp.module, privInst]
-              s!"import all exposes private instance {privInst} from {imp.module}"
-          else
-            policyFail "forbiddenImportAll" m #[m, imp.module] "import all is forbidden"
-        if !imp.isExported then
-          if !d.isModule then
-            policyFail "forbiddenImportModifier" m #[m, imp.module] "private"
-        if imp.isMeta && imp.module != `Init then
-          policyFail "forbiddenImportModifier" m #[m, imp.module] "meta"
-        if !isWellFormedName imp.module || isLeanCompilerMod imp.module || !seenModNames.contains imp.module then
-          policyFail "foreignImport" m #[m, imp.module] s!"foreign or disallowed import {imp.module}"
-        let impRole := modRoles[imp.module]?.getD "spec"
-        unless importRoleAllowed role impRole do
-          policyFail "forbiddenImportDirection" m #[m, imp.module] s!"{role} -> {impRole}"
-      let visClosure ← computeImportClosure m
-
-      -- 5b. Persistent extensions (zero initializers executed!)
-      let macros := Elab.macroAttribute.ext.ext.getModuleEntries env idx
-      for entry in macros do
-        match entry with
-        | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "macro"
-        | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_macro"
-
-      let parsers := Parser.parserExtension.ext.getModuleEntries env idx
-      for entry in parsers do
-        match entry with
-        | .global _ => policyFail "forbiddenMacroOrElab" m #[m] "syntax"
-        | .scoped _ _ => policyFail "forbiddenMacroOrElab" m #[m] "scoped_syntax"
-
-      let cmdElabs := Elab.Command.commandElabAttribute.ext.ext.getModuleEntries env idx
-      for entry in cmdElabs do
-        match entry with
-        | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "command_elab"
-        | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_elab"
-
-      let termElabs := Elab.Term.termElabAttribute.ext.ext.getModuleEntries env idx
-      for entry in termElabs do
-        match entry with
-        | .global e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "term_elab"
-        | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "scoped_term_elab"
-
-      let delabs := PrettyPrinter.Delaborator.delabAttribute.ext.ext.getModuleEntries env idx
-      for entry in delabs do
-        match entry with
-        | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "delab"
-
-      let unexps := PrettyPrinter.Delaborator.appUnexpanderAttribute.ext.ext.getModuleEntries env idx
-      for entry in unexps do
-        match entry with
-        | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.declName] "app_unexpander"
-
-      let unifHints := Meta.unificationHintExtension.ext.getModuleEntries env idx
-      for entry in unifHints do
-        match entry with
-        | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.val] "unification_hint"
-
-      let cbvEvals := Meta.Tactic.Cbv.cbvEvalExt.ext.getModuleEntries env idx
-      for entry in cbvEvals do
-        match entry with
-        | .global e | .scoped _ e => policyFail "forbiddenMacroOrElab" m #[m, e.origin] "cbv_eval"
-
-      let cbvOpaques := Meta.Tactic.Cbv.cbvOpaqueExt.ext.getModuleEntries env idx
-      for entry in cbvOpaques do
-        match entry with
-        | .global n | .scoped _ n => policyFail "forbiddenMacroOrElab" m #[m, n] "cbv_opaque"
-
-      -- Init / codegen hooks (`V10`): check BOTH `.olean` (`getModuleEntries`) AND `.ir` (`getModuleIREntries`)!
-      let regInits := regularInitAttr.ext.getModuleEntries env idx ++
-                      regularInitAttr.ext.getModuleIREntries env idx
-      if let some (decl, _) := regInits[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "initialize"
-
-      let builtinInits := builtinInitAttr.ext.getModuleEntries env idx ++
-                          builtinInitAttr.ext.getModuleIREntries env idx
-      if let some (decl, _) := builtinInits[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "builtin_initialize"
-
-      let implBys := Compiler.implementedByAttr.ext.getModuleEntries env idx ++
-                     Compiler.implementedByAttr.ext.getModuleIREntries env idx
-      if let some (decl, _) := implBys[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "implemented_by"
-
-      let externs := externAttr.ext.getModuleEntries env idx ++
-                     externAttr.ext.getModuleIREntries env idx
-      if let some (decl, _) := externs[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "extern"
-
-      let cExports := exportAttr.ext.getModuleEntries env idx ++
-                      exportAttr.ext.getModuleIREntries env idx
-      if let some (decl, _) := cExports[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "c_export"
-
-      let csimps := Compiler.CSimp.ext.ext.getModuleEntries env idx ++
-                    Compiler.CSimp.ext.ext.getModuleIREntries env idx
-      for entry in csimps do
-        match entry with
-        | .global e | .scoped _ e =>
-          policyFail "forbiddenInitOrCodegenHook" m #[m, e.thmName] "csimp"
-
-      let cpasses := Compiler.LCNF.passManagerExt.getModuleEntries env idx ++
-                     Compiler.LCNF.passManagerExt.getModuleIREntries env idx
-      if let some decl := cpasses[0]? then
-        policyFail "forbiddenInitOrCodegenHook" m #[m, decl] "cpass"
-
-      -- Raw `entries` catch-all across `.olean`, `.olean.server`, `.olean.private`, `.ir.sig`, `.ir`
-      checkRawForbiddenEntries m d.entries
-      if let some partEnts := extraPartEntriesMap[m]? then
-        checkRawForbiddenEntries m partEnts
-
-      -- `export Ns (x)` aliases (`V15`)
-      let aliases := aliasExtension.getModuleEntries env idx
-      if let some (alName, _) := aliases[0]? then
-        policyFail "forbiddenShadowingOrExport" m #[m, alName] "export"
-
-      -- Reducibility overrides (`V13`)
-      let mut localRedOver : NameSet := {}
-      for (target, status) in reducibilityCoreExt.getModuleEntries env idx do
-        unless localReplayable.contains target do
-          policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibilityCore on non-local decl"
-        if status == .reducible then
-          localRedOver := localRedOver.insert target
-      for entry in reducibilityExtraExt.ext.getModuleEntries env idx do
-        let target := match entry with | .global (t, _) => t | .scoped _ (t, _) => t
-        unless localReplayable.contains target do
-          policyFail "forbiddenReducibilityOverride" m #[m, target] "reducibility override on foreign decl"
-        localRedOver := localRedOver.insert target
-
-      -- Default instances & coercions (`V12`)
-      let defInsts := Meta.defaultInstanceExtension.getModuleEntries env idx
-      for de in defInsts do
-        unless role == "defsExempt" do
-          policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance"
-        unless localReplayable.contains de.instanceName &&
-               isBaseInstanceAnchor localReplayable localRedOver byName de.className do
-          policyFail "forbiddenInstanceOrCoe" m #[m, de.instanceName] "default_instance_of_imported_target"
-
-      let coes := Meta.coeExt.ext.getModuleEntries env idx
-      for ce in coes do
-        let decl := match ce with | .global (n, _) => n | .scoped _ (n, _) => n
-        unless role == "defsExempt" && localReplayable.contains decl do
-          policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
-        let some ci := byName[decl]?
-          | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
-        let some normTy := normExprInEnv env 1024 ci.type
-          | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
-        let some (srcTy, tgtTy) := coeSrcAndTgt normTy
-          | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe_between_imported_types"
-        unless hasRigidBaseAnchor env localReplayable localRedOver byName srcTy ||
-               hasRigidBaseAnchor env localReplayable localRedOver byName tgtTy do
-          policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe_between_imported_types"
-
-      -- Instances (`V11`, `V12`, Episode 1 orphan-instance hardening)
-      let insts := Meta.instanceExtension.ext.getModuleEntries env idx
-      for entry in insts do
-        match entry with
-        | .scoped ns ie =>
-          let some dName := ie.globalName?
-            | policyFail "forbiddenInstanceOrCoe" m #[m] "anonymous_scoped_instance"
-          unless role == "defsExempt" do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance"
-          unless localReplayable.contains dName do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
-          let some ci := byName[dName]?
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
-          let some normConcl := (normExprInEnv env 1024 ci.type).map stripForallAndLam
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
-          let .const cls _ := normConcl.getAppFn
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
-          unless isBaseInstanceAnchor localReplayable localRedOver byName cls do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
-          unless (nameComponents m).isPrefixOf (nameComponents ns) do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "invalid_instance_scope"
-        | .global ie =>
-          let some dName := ie.globalName?
-            | policyFail "forbiddenInstanceOrCoe" m #[m] "anonymous_local_instance"
-          unless localReplayable.contains dName do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
-          let some ci := byName[dName]?
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "imported_instance"
-          let some normConcl := (normExprInEnv env 1024 ci.type).map stripForallAndLam
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-          let .const cls _ := normConcl.getAppFn
-            | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-          if isAutoSizeOfInst byName dName cls then
-            pure ()
-          else if isBaseInstanceAnchor localReplayable localRedOver byName cls then
-            pure ()
-          else
-            if role == "proof" || role == "verify" || (strictProofs && role != "defsExempt") then
-              policyFail "forbiddenInstanceOrCoe" m #[m, dName] "instance_of_imported_class"
-            let inputArgs := nonOutParamArgs env cls normConcl.getAppArgs
-            unless inputArgs.any (hasRigidBaseAnchor env localReplayable localRedOver byName) do
-              policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-
-      -- 5c. Public namespace suffix shadowing (`V15`) — includes precomputed `Trusted.*` names too!
-      let mut stmtProtected : NameSet := if isTrustedMod m then {} else trustedProtected
-      for h2 : idx2 in [:env.header.modules.size] do
-        let m2 := env.header.modules[idx2].module
-        if auditedSet.contains m2 && m2 != m && isStatementSideRole (modRoles[m2]!) then
-          let m2Parts := nameComponents m2
-          for ci2 in env.header.moduleData[idx2]!.constants do
-            if !isPrivateName ci2.name && !hasInternalPart ci2.name then
-              stmtProtected := stmtProtected.insert ci2.name
-              let cParts := nameComponents ci2.name
-              if m2Parts.isPrefixOf cParts && cParts.length > m2Parts.length then
-                let stripped := (cParts.drop m2Parts.length).foldl Name.str .anonymous
-                stmtProtected := stmtProtected.insert stripped
-
-      for ci in d.constants do
-        if !isPrivateName ci.name then
-          let cParts := nameComponents ci.name
-          if cParts.length >= 2 then
-            if let some lastSeg := cParts.getLast? then
-              if coreSingleProtected.contains (Name.mkSimple lastSeg) then
-                policyFail "forbiddenShadowingOrExport" m #[m, ci.name] "namespace_shadow"
-          for suf in properSuffixes ci.name do
-            if !hasInternalPart suf then
-              if stdMultiNames.contains suf || stmtProtected.contains suf then
-                policyFail "forbiddenShadowingOrExport" m #[m, ci.name] "namespace_shadow"
-
-      -- 5d. Declaration safety, unreferenced axioms (`V04`), & reference-vs-import closure (`B3`)
-      for ci in d.constants do
-        if isCodegenUnsafeRec byName ci then
-          pure ()
-        else if ci.isUnsafe || ci.isPartial then
-          policyFail "unsafeOrPartialDecl" m #[m, ci.name] "unsafe or partial declaration"
-
-        if ci.isAxiom then
-          if ci.name == `sorryAx then
-            policyFail "forbiddenAxiom" m #[ci.name, `sorryAx, m] "sorryAx"
-          if isCompilerTrustConst ci.name then
-            policyFail "forbiddenNativeReductionAxiom" m #[ci.name, ci.name] "Lean.trustCompiler"
-          if isNativeReductionConst ci.name then
-            unless allowProvisionalNative && role == "proof" && isProvisionalNativeName ci.name do
-              policyFail "forbiddenNativeReductionAxiom" m #[ci.name, ci.name] "native reduction axiom"
-            checkValidProvisionalNativeAxiom env ci.name ci.name ci
-          else if role == "assumptions" then
-            unless allowAssumptions do
-              policyFail "forbiddenAxiom" m #[ci.name, ci.name, m] "assumption axiom requires --allow-assumptions"
-          else if role == "test" && allowLocalTestAxioms then
-            pure ()
-          else
-            policyFail "forbiddenAxiom" m #[ci.name, ci.name, m] "unapproved axiom"
-
-        let edges ← declarationEdges m ci
-        for dep in edges do
-          if let some depIdx := env.getModuleIdxFor? dep then
-            let depMod := env.header.modules[depIdx]!.module
-            if auditedSet.contains depMod && depMod != m && !visClosure.contains depMod then
-              policyFail "referenceOutsideImportClosure" m #[m, ci.name, dep, depMod]
-                s!"{ci.name} references {dep} from unimported {depMod}"
+      let edges ← declarationEdges m ci
+      for dep in edges do
+        let depMod? := match realDeclOwner[dep]? with
+          | some om => some om
+          | none => (env.getModuleIdxFor? dep).map fun i => env.header.modules[i]!.module
+        if let some depMod := depMod? then
+          if auditedSet.contains depMod && depMod != m && !visClosure.contains depMod then
+            policyFail "referenceOutsideImportClosure" m #[m, ci.name, dep, depMod]
+              s!"{ci.name} references {dep} from unimported {depMod}"
 
   -- 6. Direct Constant-Closure Walk (explicitly ignoring `exportedAxiomsExt` — `V05`, `V06`)
   let edgesCache ← IO.mkRef ({} : Std.HashMap Name NameSet)
@@ -2465,17 +2822,23 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     edgesCache.modify (·.insert ci.name computed)
     return computed
 
+  let pendingNativeRef ← IO.mkRef pendingNativeRefutations
+
   let checkDepNode (rootMod rootName dep : Name) (isTestRoot : Bool) : IO (ConstantInfo × Name × String) := do
     if dep == `sorryAx then
-      let declMod := match env.getModuleIdxFor? dep with
-        | some i => env.header.modules[i]!.module
-        | none => `Init.Prelude
+      let declMod := match realDeclOwner[dep]? with
+        | some om => om
+        | none => match env.getModuleIdxFor? dep with
+          | some i => env.header.modules[i]!.module
+          | none => `Init.Prelude
       policyFail "forbiddenAxiom" rootMod #[rootName, `sorryAx, declMod] "depends on sorryAx"
     let some depCi := env.checked.get.find? dep
       | policyFail "unknownConstant" rootMod #[dep] s!"unknown constant {dep}"
-    let some depIdx := env.getModuleIdxFor? dep
-      | policyFail "unknownConstant" rootMod #[dep] s!"missing module index for {dep}"
-    let depMod := env.header.modules[depIdx]!.module
+    let depMod ← match realDeclOwner[dep]? with
+      | some om => pure om
+      | none => match env.getModuleIdxFor? dep with
+        | some depIdx => pure env.header.modules[depIdx]!.module
+        | none => policyFail "unknownConstant" rootMod #[dep] s!"missing module index for {dep}"
     let depRole := modRoles[depMod]?.getD "foundation"
     if dep != rootName then
       if depCi.isUnsafe || depCi.isPartial then
@@ -2489,7 +2852,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "forbiddenNativeReductionAxiom" rootMod #[rootName, dep] "native reduction in test module"
       unless allowProvisionalNative && depRole == "proof" && depCi.isAxiom && isProvisionalNativeName dep do
         policyFail "forbiddenNativeReductionAxiom" rootMod #[rootName, dep] "depends on native reduction axiom"
-      checkValidProvisionalNativeAxiom env rootName dep depCi
+      let lhs ← checkProvisionalNativeAxiomShape env rootName dep depCi
+      pendingNativeRef.modify (·.push (rootName, dep, lhs))
     else if depCi.isAxiom then
       let isFound := isStdlibMod depMod && isFoundationalAxiom dep
       if !isFound then
@@ -2582,7 +2946,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "invalidVerifyRoot" m #[thmName]
           "verified theorem statement must not have outer binders (forall/lambda/let)"
       let headConst := ty.getAppFn
-      let isCrateRollup := hasRootComp m "CrateVerify"
+      let mRoot := (nameComponents m).headD ""
+      let isCrateRollup := mRoot == "CrateVerify" || mRoot.startsWith "CrateVerify_"
       let isUbException :=
         headConst.isConstOf `Trusted.VerificationResult.UbExceptionVerificationResult
       if isCrateRollup then
@@ -2597,7 +2962,7 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         policyFail "invalidVerifyRoot" m #[thmName]
           "UbExceptionVerificationResult requires --allow-assumptions"
       -- Statement-origin walk: unfold everything except `foundation` (`Init`/`Std`) and `trusted` (`Trusted.*`),
-      -- rejecting any `theory` (`Anneal.*`) constant in `ci.type`!
+      -- rejecting any `theory` (`Anneal.*`), `proof` (`Proof.*`), or `test` (`Test.*`) constant in `ci.type`!
       let initStmtEdges ← expressionEdges m thmName ci.type
       let mut stmtPending := initStmtEdges.toList
       let mut stmtVisited : NameSet := {}
@@ -2606,13 +2971,15 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         stmtPending := stmtPending.tail!
         if !stmtVisited.contains curr then
           stmtVisited := stmtVisited.insert curr
-          let some sIdx := env.getModuleIdxFor? curr
-            | policyFail "unknownConstant" m #[curr] s!"unknown constant {curr} in statement"
-          let sMod := env.header.modules[sIdx]!.module
+          let sMod ← match realDeclOwner[curr]? with
+            | some om => pure om
+            | none => match env.getModuleIdxFor? curr with
+              | some sIdx => pure env.header.modules[sIdx]!.module
+              | none => policyFail "unknownConstant" m #[curr] s!"unknown constant {curr} in statement"
           let sRole := modRoles[sMod]?.getD "foundation"
-          if sRole == "theory" then
+          if sRole == "theory" || sRole == "proof" || sRole == "test" then
             policyFail "statementTheoryLeak" m #[thmName, curr, sMod]
-              s!"statement of {thmName} depends on theory declaration {curr} from {sMod}"
+              s!"statement of {thmName} depends on non-statement {sRole} declaration {curr} from {sMod}"
           if sRole != "foundation" && sRole != "trusted" then
             let some sCi := env.checked.get.find? curr
               | policyFail "unknownConstant" m #[curr] s!"missing {curr}"
@@ -2641,20 +3008,39 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     unless k == ci.name do
       policyFail "keyNameMismatch" k #[k, ci.name] "replayLocals key != ci.name"
 
-  let canReuseCleanInit := !cachedInitMods.isEmpty && baseMods.all cachedInitMods.contains
+  let baseModSet := NameSet.ofArray baseMods
+  let canReuseCleanInit :=
+    !cachedInitMods.isEmpty && baseMods.size == cachedInitMods.size && baseMods.all cachedInitMods.contains
+  let baseHasAllInit :=
+    !cachedInitMods.isEmpty && cachedInitMods.all baseModSet.contains
+  let baseImps := baseMods.map fun n => ({ module := n } : Import)
   let baseEnv ← match cachedInitEnv?, canReuseCleanInit with
     | some ie, true => pure ie
     | _, _ =>
-      importModules (baseMods.map fun n => { module := n }) {}
-        (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
-  try
-    let _ ← baseEnv.toKernelEnv.replay replayLocals
+      match cachedInitState?, baseHasAllInit with
+      | some initSt, true =>
+        withImporting do
+          let (_, s) ← importModulesCore (globalLevel := .private) baseImps |>.run initSt
+          finalizeImport s baseImps {} (trustLevel := 0)
+            (leakEnv := false) (loadExts := false) (level := .private)
+      | _, _ =>
+        importModules baseImps {}
+          (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
+  let replayedKEnv ← try
+    baseEnv.toKernelEnv.replay replayLocals
   catch ex =>
     policyFail "kernelTypeError" targetMods[0]! #[targetMods[0]!] ex.toString
+
+  -- 9. Post-Replay Kernel WHNF Refutation of Provisional Native Axioms
+  --    (strictly AFTER `replay` succeeds so `Lean.Kernel.whnf` never touches unchecked/cyclic defs!)
+  let replayedEnv := Environment.ofKernelEnv replayedKEnv
+  for (uName, axName, lhsExpr) in (← pendingNativeRef.get) do
+    refuteProvisionalNativeWithKernelWhnf replayedEnv env uName axName lhsExpr
 
   let sortedAxioms := (allReachedAxioms.toArray.qsort Name.lt).map Name.toString
   return Json.mkObj [
     ("auditedModules", toJson (auditedSet.toArray.qsort Name.lt |>.map Name.toString)),
+    ("moduleFlaggedModules", toJson (moduleFlaggedSet.toArray.qsort Name.lt |>.map Name.toString)),
     ("replayedDeclarations", toJson replayLocals.size),
     ("reachedAxioms", toJson sortedAxioms),
     ("items", .arr itemReports),
@@ -2665,10 +3051,11 @@ end OleanReplayInspector
 
 def runOneItem (j : Json) (cachedInitEnv? : Option Environment := none)
     (cachedInitMods : NameSet := {})
-    (cachedInitMulti? : Option NameSet := none) : IO (Json × UInt32) := do
+    (cachedInitMulti? : Option NameSet := none)
+    (cachedInitState? : Option ImportState := none) : IO (Json × UInt32) := do
   let loadedModsRef ← IO.mkRef (#[] : Array Name)
   try
-    let res ← OleanReplayInspector.auditOleans j loadedModsRef cachedInitEnv? cachedInitMods cachedInitMulti?
+    let res ← OleanReplayInspector.auditOleans j loadedModsRef cachedInitEnv? cachedInitMods cachedInitMulti? cachedInitState?
     return (Json.mkObj [("ok", toJson true), ("result", res)], 0)
   catch ex =>
     let loadedMods := (← loadedModsRef.get).map Name.toString
@@ -2710,17 +3097,18 @@ def main (args : List String) : IO UInt32 := do
       let sysrootStr ← OleanReplayInspector.field (α := String) j "sysroot"
       initSearchPath (System.FilePath.mk sysrootStr) []
       searchPathRef.set [System.FilePath.mk sysrootStr / "lib" / "lean"]
-      let cleanInit ← importModules #[{ module := `Init }] {}
-        (trustLevel := 0) (plugins := #[]) (loadExts := false) (level := .private)
-      let badInit? : Option (Name × Name) :=
-        cleanInit.checked.get.constants.fold (init := none) fun acc n ci =>
-          if acc.isSome then acc else if n == ci.name then none else some (n, ci.name)
-      if let some (n, ciName) := badInit? then
+      let initImps : Array Import := #[{ module := `Init }]
+      let (cleanInit, initState) ← withImporting do
+        let (_, st) ← importModulesCore (globalLevel := .private) initImps |>.run
+        let env ← finalizeImport st initImps {} (trustLevel := 0)
+          (leakEnv := false) (loadExts := false) (level := .private)
+        pure (env, st)
+      if let some (n, ciName) := findKeyMismatch cleanInit.checked.get.constants then
         OleanReplayInspector.opFail s!"cleanInit SMap key mismatch: {n} != {ciName}"
-      let (initMods, initMulti) := OleanReplayInspector.computeInitMultiNames cleanInit
+      let (initMods, initMulti) := computeInitMultiNames cleanInit
       let mut outs : Array Json := #[]
       for item in items do
-        let (outJ, _) ← runOneItem item (some cleanInit) initMods (some initMulti)
+        let (outJ, _) ← runOneItem item (some cleanInit) initMods (some initMulti) (some initState)
         outs := outs.push outJ
       IO.FS.writeFile respPath (Json.mkObj [("items", .arr outs)]).pretty
       return 0
@@ -3107,6 +3495,93 @@ def main (args : List String) : IO UInt32 := do
     entries := #[]
   }
 
+  -- 15c_split_brain_exported_axiom: module-mode artifact where `.olean.private` & `.olean.server`
+  -- contain only clean `theorem ok : True := True.intro`, while public `.olean` injects `axiom secretFalse : False`!
+  let splitOkThm : ConstantInfo := .thmInfo {
+    name := `Proof.SplitBrain15c.ok
+    levelParams := []
+    type := mkConst ``True
+    value := mkConst ``True.intro
+    all := [`Proof.SplitBrain15c.ok]
+  }
+  let splitOkAx : ConstantInfo := .axiomInfo {
+    name := `Proof.SplitBrain15c.ok
+    levelParams := []
+    type := mkConst ``True
+    isUnsafe := false
+  }
+  let splitEvilAx : ConstantInfo := .axiomInfo {
+    name := `Proof.SplitBrain15c.secretFalse
+    levelParams := []
+    type := mkConst ``False
+    isUnsafe := false
+  }
+  let splitDir := outDir / "15c_split_brain" / "Proof"
+  IO.FS.createDirAll splitDir
+  let splitMFile := splitDir / "SplitBrain15c.olean"
+  let splitCleanPriv : ModuleData := {
+    isModule := true
+    imports := #[{ module := `Init }]
+    constNames := #[`Proof.SplitBrain15c.ok]
+    constants := #[splitOkThm]
+    extraConstNames := #[]
+    entries := #[]
+  }
+  let splitTamperedExp : ModuleData := {
+    isModule := true
+    imports := #[{ module := `Init }]
+    constNames := #[`Proof.SplitBrain15c.ok, `Proof.SplitBrain15c.secretFalse]
+    constants := #[splitOkAx, splitEvilAx]
+    extraConstNames := #[]
+    entries := #[]
+  }
+  saveModuleDataParts `Proof.SplitBrain15c #[
+    (splitMFile, splitTamperedExp),
+    (OLeanLevel.server.adjustFileName splitMFile, splitCleanPriv),
+    (OLeanLevel.private.adjustFileName splitMFile, splitCleanPriv)
+  ]
+
+  -- 18d_valid_lowmem_2thm_mutual: valid 2-theorem mutual `.all` block (`lowmem_lean` cl/1027843093) — MUST PASS!
+  let mutThmA : ConstantInfo := .thmInfo {
+    name := `Proof.LowmemMutual18d.thmA
+    levelParams := []
+    type := mkConst ``True
+    value := mkConst ``True.intro
+    all := [`Proof.LowmemMutual18d.thmA, `Proof.LowmemMutual18d.thmB]
+  }
+  let mutThmB : ConstantInfo := .thmInfo {
+    name := `Proof.LowmemMutual18d.thmB
+    levelParams := []
+    type := mkConst ``True
+    value := mkConst `Proof.LowmemMutual18d.thmA
+    all := [`Proof.LowmemMutual18d.thmA, `Proof.LowmemMutual18d.thmB]
+  }
+  writeOlean (outDir / "18d_valid_lowmem_mutual") `Proof.LowmemMutual18d {
+    isModule := false
+    imports := #[{ module := `Init }]
+    constNames := #[`Proof.LowmemMutual18d.thmA, `Proof.LowmemMutual18d.thmB]
+    constants := #[mutThmA, mutThmB]
+    extraConstNames := #[]
+    entries := #[]
+  }
+
+  -- 18e_asymmetric_mutual_all: asymmetric mutual `.all` (`thmA.all != thmB.all`) — MUST REJECT (`invalidMutualAll`)!
+  let asymThmB : ConstantInfo := .thmInfo {
+    name := `Proof.LowmemMutual18d.thmB
+    levelParams := []
+    type := mkConst ``True
+    value := mkConst ``True.intro
+    all := [`Proof.LowmemMutual18d.thmB]
+  }
+  writeOlean (outDir / "18e_asymmetric_mutual_all") `Proof.LowmemMutual18d {
+    isModule := false
+    imports := #[{ module := `Init }]
+    constNames := #[`Proof.LowmemMutual18d.thmA, `Proof.LowmemMutual18d.thmB]
+    constants := #[mutThmA, asymThmB]
+    extraConstNames := #[]
+    entries := #[]
+  }
+
   return 0
 """
 
@@ -3114,6 +3589,33 @@ def main (args : List String) : IO UInt32 := do
 # ---------------------------------------------------------------------------
 # Inspector Compilation & Audit Execution
 # ---------------------------------------------------------------------------
+
+
+def _stage_fast_smap_helper(lean_bin: Path, stage_dir: Path, *, emit_obj: Path | None = None) -> bool:
+    """Stages `FastSMapCheck.lean` -> `.olean` (and optionally `-O2` `.o` when `emit_obj` is set)
+    inside `stage_dir` so hot `SMap` / `Expr` traversals run at `-O2` while the main inspector
+    compiles at `-O0` in ~2s."""
+    fast_lean = stage_dir / "FastSMapCheck.lean"
+    fast_olean = stage_dir / "FastSMapCheck.olean"
+    fast_c = stage_dir / "FastSMapCheck.c"
+    fast_lean.write_text(FAST_SMAP_LEAN_SOURCE, encoding="utf-8")
+    lean_cmd = [str(lean_bin), "-R", str(stage_dir), "-o", str(fast_olean)]
+    if emit_obj is not None:
+        lean_cmd.extend(["-c", str(fast_c)])
+    lean_cmd.append(str(fast_lean))
+    res = run_governed_cmd(lean_cmd, cwd=stage_dir, mode="file")
+    if res.returncode != 0 or not fast_olean.is_file():
+        return False
+    if emit_obj is not None:
+        leanc = lean_bin.parent / "leanc"
+        res_o = run_governed_cmd(
+            [str(leanc), "-O2", "-c", "-o", str(emit_obj), str(fast_c)],
+            cwd=stage_dir,
+            mode="file",
+        )
+        if res_o.returncode != 0 or not emit_obj.is_file():
+            return False
+    return True
 
 
 def compile_lean_helper_binary(
@@ -3125,13 +3627,21 @@ def compile_lean_helper_binary(
     sysroot: Path | None = None,
 ) -> Path | None:
     """Compiles a Lean helper program into a native executable inside `stage_dir`
-    (`lean -R <dir> -c` + `leanc -O0 -rdynamic -Wl,-rpath,<sysroot>/lib/lean -lleanshared`)
-    so repeated fresh-process runs take ~0.05s without re-elaborating `OleanReplayInspector.lean`."""
+    (`FastSMapCheck` at `leanc -O2 -c`, main driver at `leanc -O0 -rdynamic -Wl,-rpath,... -lleanshared`)
+    so compile time stays ~12s AND hot `SMap`/`Expr` loops run at `-O2` native speed."""
     leanc = lean_bin.parent / "leanc"
     if stat_regular_fail_closed(leanc, allow_symlink=True) is None:
         return None
     eff_sysroot = sysroot if sysroot is not None else lean_bin.parent.parent
     rpath_dir = (eff_sysroot / "lib" / "lean").resolve()
+    extra_objs: list[str] = []
+    extra_env: dict[str, str] = {}
+    if "import FastSMapCheck" in src_code:
+        fast_obj = stage_dir / "FastSMapCheck.o"
+        if not _stage_fast_smap_helper(lean_bin, stage_dir, emit_obj=fast_obj):
+            return None
+        extra_objs.append(str(fast_obj))
+        extra_env["LEAN_PATH"] = str(stage_dir)
     lean_file = stage_dir / f"{stem_name}.lean"
     c_file = stage_dir / f"{stem_name}.c"
     bin_file = stage_dir / stem_name
@@ -3139,6 +3649,7 @@ def compile_lean_helper_binary(
     res_c = run_governed_cmd(
         [str(lean_bin), "-R", str(stage_dir), "-c", str(c_file), str(lean_file)],
         cwd=stage_dir,
+        extra_env=extra_env or None,
         mode="file",
     )
     if res_c.returncode != 0 or not c_file.is_file():
@@ -3152,6 +3663,7 @@ def compile_lean_helper_binary(
             "-lleanshared",
             "-o",
             str(bin_file),
+            *extra_objs,
             str(c_file),
         ],
         cwd=stage_dir,
@@ -3181,14 +3693,40 @@ def _resolve_source_in_roots(mod: str, roots: Sequence[Path]) -> Path | None:
     return None
 
 
-def load_source_map(
+def _parse_unique_json_object(raw_text: str, src_label: Path) -> dict[str, Any]:
+    def _no_dup_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        acc: dict[str, Any] = {}
+        for k, v in pairs:
+            if k in acc:
+                raise AuditOperationalError(
+                    f"duplicate key '{k}' in JSON --source-map {src_label}"
+                )
+            acc[k] = v
+        return acc
+
+    try:
+        parsed = json.loads(raw_text, object_pairs_hook=_no_dup_pairs)
+    except AuditOperationalError:
+        raise
+    except ValueError as exc:
+        raise AuditOperationalError(f"malformed JSON --source-map {src_label}: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise AuditOperationalError(
+            "--source-map JSON must be an object mapping module names to file paths"
+        )
+    return parsed
+
+
+def resolve_source_map_arg(
     source_map_arg: Path | None,
     target_modules: Sequence[str],
     *,
     auto_repo_sources: bool = False,
-) -> dict[str, Path]:
-    """Resolves module -> `.lean` source path mapping with fail-closed stat checks."""
+) -> tuple[dict[str, Path], Path | None]:
+    """Resolves `(module -> .lean source path mapping, optional source_map_dir)` with
+    single fail-closed stat checks and duplicate-key rejection."""
     mapping: dict[str, Path] = {}
+    source_dir: Path | None = None
     if source_map_arg is not None:
         p = Path(source_map_arg)
         try:
@@ -3199,6 +3737,7 @@ def load_source_map(
             raise AuditOperationalError(f"disallowed symlink --source-map: {p}")
         if stat.S_ISDIR(st.st_mode):
             stat_dir_fail_closed(p)
+            source_dir = p
             for mod in target_modules:
                 cand = _resolve_source_in_roots(mod, (p,))
                 if cand is not None:
@@ -3206,12 +3745,11 @@ def load_source_map(
         elif stat.S_ISREG(st.st_mode):
             stat_regular_fail_closed(p)
             try:
-                raw = json.loads(p.read_text(encoding="utf-8"))
-            except (ValueError, OSError) as exc:
-                raise AuditOperationalError(f"malformed JSON --source-map {p}: {exc}") from exc
-            if not isinstance(raw, dict) or not all(
-                isinstance(k, str) and isinstance(v, str) for k, v in raw.items()
-            ):
+                raw_txt = p.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise AuditOperationalError(f"cannot read --source-map {p}: {exc}") from exc
+            raw = _parse_unique_json_object(raw_txt, p)
+            if not all(isinstance(k, str) and isinstance(v, str) for k, v in raw.items()):
                 raise AuditOperationalError(
                     "--source-map JSON must be an object mapping module names to file paths"
                 )
@@ -3229,6 +3767,19 @@ def load_source_map(
             cand = _resolve_source_in_roots(mod, REPO_SOURCE_ROOTS)
             if cand is not None:
                 mapping[mod] = cand
+    return mapping, source_dir
+
+
+def load_source_map(
+    source_map_arg: Path | None,
+    target_modules: Sequence[str],
+    *,
+    auto_repo_sources: bool = False,
+) -> dict[str, Path]:
+    """Resolves module -> `.lean` source path mapping with fail-closed stat checks."""
+    mapping, _ = resolve_source_map_arg(
+        source_map_arg, target_modules, auto_repo_sources=auto_repo_sources
+    )
     return mapping
 
 
@@ -3494,9 +4045,11 @@ def _finalize_audit_case(
                 if cand is not None:
                     eff_sources[mod] = cand
 
-    check_src_mods = list(target_modules) if not require_sources else audited_mods
+    module_flagged_set: set[str] = set(resp["result"].get("moduleFlaggedModules", []))
+    # Always scan EVERY audited module whose source was supplied/resolved (even if `require_sources=False`!),
+    # and require sources for all `audited_mods` whenever `require_sources=True`.
     try:
-        for mod in check_src_mods:
+        for mod in audited_mods:
             if mod in eff_sources:
                 src_path = eff_sources[mod]
                 if stat_regular_fail_closed(src_path) is None:
@@ -3508,7 +4061,7 @@ def _finalize_audit_case(
                     allow_provisional_native=allow_provisional_native,
                     allow_assumptions=allow_assumptions,
                     allow_local_test_axioms=allow_local_test_axioms,
-                    allow_module_header=module_mode,
+                    allow_module_header=bool(module_mode or (mod in module_flagged_set)),
                 )
             elif require_sources:
                 raise AuditPolicyError(
@@ -3593,11 +4146,14 @@ def audit_modules(
                 mode="file",
             )
         else:
+            if not _stage_fast_smap_helper(lean_bin, work_dir):
+                raise AuditOperationalError("failed staging FastSMapCheck.lean helper")
             insp_lean = work_dir / "OleanReplayInspector.lean"
             insp_lean.write_text(INSPECTOR_LEAN_SOURCE, encoding="utf-8")
             proc = run_governed_cmd(
                 [str(lean_bin), "--run", str(insp_lean), str(req_path), str(resp_path)],
                 cwd=work_dir,
+                extra_env={"LEAN_PATH": str(work_dir)},
                 mode="file",
             )
 
@@ -3698,11 +4254,14 @@ def batch_audit_modules(
                     mode="file",
                 )
             else:
+                if not _stage_fast_smap_helper(lean_bin, work_dir):
+                    raise AuditOperationalError("failed staging FastSMapCheck.lean helper")
                 insp_lean = work_dir / "OleanReplayInspector.lean"
                 insp_lean.write_text(INSPECTOR_LEAN_SOURCE, encoding="utf-8")
                 proc = run_governed_cmd(
                     [str(lean_bin), "--run", str(insp_lean), "--batch", str(req_path), str(resp_path)],
                     cwd=work_dir,
+                    extra_env={"LEAN_PATH": str(work_dir)},
                     mode="file",
                 )
             if proc.returncode != 0 or not resp_path.is_file():
@@ -4239,8 +4798,23 @@ def run_tamper_suite(
             ("subcheck_13d_forged_unsafe_rec_level_params", "Proof.Tamper13UnsafeRecLvl", forged_root / "13d_forged_unsafe_rec_lvl", "unsafeOrPartialDecl"),
             ("subcheck_18b_key_aligned_induct_all", "Proof.Tamper18Aligned", forged_root / "18b_aligned_induct_all", "invalidMutualAll"),
             ("subcheck_18c_foreign_quot_decl", "Proof.Tamper18Quot", forged_root / "18c_foreign_quot", "foreignQuotDecl"),
+            ("subcheck_18e_asymmetric_mutual_all", "Proof.LowmemMutual18d", forged_root / "18e_asymmetric_mutual_all", "invalidMutualAll"),
+            ("subcheck_15c_split_brain_exported_axiom", "Proof.SplitBrain15c", forged_root / "15c_split_brain", "keyNameMismatch"),
             ("subcheck_B3_reference_outside_import_closure", "Specs.UnimportedRef", forged_root / "b3_ref_outside", "referenceOutsideImportClosure"),
         ]
+        batched_specs.append(
+            (
+                "subcheck_18d_valid_lowmem_2thm_mutual",
+                True,
+                None,
+                False,
+                {
+                    "target_modules": ["Proof.LowmemMutual18d"],
+                    "olean_dirs": [forged_root / "18d_valid_lowmem_mutual"],
+                    "strict_proofs": True,
+                },
+            )
+        )
         for sub_id, sub_mod, sub_dir, sub_cat in sub_forged_cases:
             sub_smap = (
                 {sub_mod: clean_v09_src}
@@ -4416,7 +4990,7 @@ def run_tamper_suite(
             sysroot=sysroot,
             stage_dir=tmp,
             compiled_inspector=compiled_insp,
-            chunk_size=10,
+            chunk_size=50,
         )
         for (cid, exp_ok, exp_cat, is_canon, _), rep in zip(batched_specs, batch_reports):
             _record_case(cid, rep, expected_ok=exp_ok, expected_category=exp_cat, canonical=is_canon)
@@ -4636,12 +5210,26 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         olean_dirs = list(args.olean_dirs) if args.olean_dirs else [REPO_ROOT / ".lake" / "build" / "lib" / "lean"]
         auto_repo = not bool(args.olean_dirs) and args.source_map is None
-        smap = load_source_map(args.source_map, args.modules, auto_repo_sources=auto_repo)
-        source_map_dir = (
-            args.source_map
-            if (args.source_map is not None and stat.S_ISDIR(os.lstat(args.source_map).st_mode))
-            else None
-        )
+        try:
+            smap, source_map_dir = resolve_source_map_arg(
+                args.source_map, args.modules, auto_repo_sources=auto_repo
+            )
+        except AuditPolicyError as pol:
+            report_pol = {
+                "ok": False,
+                "schema_version": SCHEMA_VERSION,
+                "toolchain": PINNED_TOOLCHAIN,
+                "violations": [pol.to_dict()],
+                "summary": {"audited_modules": list(args.modules), "replayed_declarations": 0},
+            }
+            if args.json:
+                print(json.dumps(report_pol, indent=2, sort_keys=True))
+            else:
+                print(
+                    f"AUDIT FAIL [{pol.category}] in {pol.module}: {pol.detail}",
+                    file=sys.stderr,
+                )
+            return 1
         require_sources = bool(args.strict_proofs or args.source_map is not None or auto_repo)
 
         report = audit_modules(

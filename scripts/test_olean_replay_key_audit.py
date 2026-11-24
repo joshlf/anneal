@@ -64,10 +64,10 @@ class TestAstAndHygieneInvariants(unittest.TestCase):
                     )
 
     def test_inspector_lean_never_enables_initializers_or_load_exts(self) -> None:
-        lean_src = audit.INSPECTOR_LEAN_SOURCE
-        self.assertNotIn("enableInitializersExecution", lean_src)
-        self.assertNotIn("loadExts := true", lean_src)
-        self.assertIn("loadExts := false", lean_src)
+        for lean_src in (audit.FAST_SMAP_LEAN_SOURCE, audit.INSPECTOR_LEAN_SOURCE):
+            self.assertNotIn("enableInitializersExecution", lean_src)
+            self.assertNotIn("loadExts := true", lean_src)
+        self.assertIn("loadExts := false", audit.INSPECTOR_LEAN_SOURCE)
 
     def test_sanitized_env_preserves_anneal_lean_run_and_scrubs_lean_path(self) -> None:
         fake_env = {
@@ -168,6 +168,48 @@ class TestCliArgumentParsing(unittest.TestCase):
                 ["--audit-module", "Foo.Bar", "--lean", "relative/bin/lean", "--json"]
             )
         self.assertEqual(rc, 2)
+
+    def test_source_map_duplicate_keys_symlink_and_missing_target_handling(self) -> None:
+        self.assertEqual(audit.classify_module_role_py("CrateVerify_zerocopy"), "verify")
+        self.assertEqual(audit.classify_module_role_py("CrateVerify_zerocopy.Rollup"), "verify")
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            s1 = p / "A.lean"
+            s1.write_text("theorem ok : True := True.intro\n", encoding="utf-8")
+            dup_json = p / "dup_smap.json"
+            dup_json.write_text(
+                f'{{"Proof.A": "{s1}", "Proof.A": "{s1}"}}', encoding="utf-8"
+            )
+            buf_dup = io.StringIO()
+            with mock.patch("sys.stdout", buf_dup):
+                rc_dup = audit.main(
+                    ["--audit-module", "Proof.A", "--source-map", str(dup_json), "--json"]
+                )
+            self.assertEqual(rc_dup, 2)
+            self.assertTrue(json.loads(buf_dup.getvalue())["operational_error"])
+
+            sym_json = p / "sym_smap.json"
+            os.symlink(dup_json, sym_json)
+            buf_sym = io.StringIO()
+            with mock.patch("sys.stdout", buf_sym):
+                rc_sym = audit.main(
+                    ["--audit-module", "Proof.A", "--source-map", str(sym_json), "--json"]
+                )
+            self.assertEqual(rc_sym, 2)
+
+            miss_json = p / "miss_smap.json"
+            miss_json.write_text(
+                json.dumps({"Proof.A": str(p / "DoesNotExist.lean")}), encoding="utf-8"
+            )
+            buf_miss = io.StringIO()
+            with mock.patch("sys.stdout", buf_miss):
+                rc_miss = audit.main(
+                    ["--audit-module", "Proof.A", "--source-map", str(miss_json), "--json"]
+                )
+            self.assertEqual(rc_miss, 1)
+            miss_payload = json.loads(buf_miss.getvalue())
+            self.assertFalse(miss_payload["ok"])
+            self.assertEqual(miss_payload["violations"][0]["category"], "missingSourceText")
 
 
 class TestFailClosedFilesystemStat(unittest.TestCase):
@@ -341,6 +383,8 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             'def raw : String := r#"set_option debug.skipKernelTC true"#\n'
             "def f' : Nat := 1\n"
             'def interp : String := s!"{f\'} and {1 + 1}"\n',
+            'def echo! (s : String) : String := s\ndef bangCall : String := echo! "{"\n',
+            'def «echo!» (s : String) : String := s\ndef escBangCall : String := «echo!» "{"\n',
             "import Topic.all\nset_option maxHeartbeats 400000 in\n"
             "set_option linter.deprecated false in\ntheorem ok : True := trivial\n",
         ]
@@ -352,6 +396,13 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ('def g := f\'""\nset_option debug.skipKernelTC true in\ndef h := 1 --"', "forbiddenSourceOption"),
             ('prefix:0x1r"\\" => id\nset_option debug.skipKernelTC true in\ndef a := ""', "forbiddenSourceOption"),
             ("theorem p : 1 + 1 = 2 := by decide (config := ⟨false, true, true, false⟩)", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide -kernel", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide +revert", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide /- comment -/ -kernel", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide (kernel := false)", "forbiddenSourceOption"),
+            ("theorem p : 1 + 1 = 2 := by decide (revert := true)", "forbiddenSourceOption"),
+            ('def s : String := s!"{show Prop from by decide -kernel}"', "forbiddenSourceOption"),
+            ("@[app_delab Nat.add] def badDelab : Nat := 0", "forbiddenSourceOption"),
             ("theorem p : True := by iterate 1native_decide", "forbiddenSourceOption"),
             ("theorem p : True := by bv_decide?", "forbiddenSourceOption"),
             ("def x : Nat := unsafe (0 : Nat)", "forbiddenSourceOption"),
@@ -496,11 +547,24 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/Sub/B1ShadowNat", "namespace Proof.Sub.B1ShadowNat\ndef Nat : Type := Unit\nend Proof.Sub.B1ShadowNat\n"),
                 ("Topic/Proofs/Defs", "namespace Topic.Proofs.Defs\ntheorem spoof : True := True.intro\nend Topic.Proofs.Defs\n"),
                 ("Topic/B1Coe/Defs", "namespace Topic.B1Coe.Defs\ninductive DummyLocal | mk\n@[coe] def evilCoe (_ : DummyLocal) (n : Nat) : Bool := false\nend Topic.B1Coe.Defs\n"),
+                ("Proof/A1EvilSizeOfNat", "namespace Proof.A1EvilSizeOfNat\ninductive P : Prop | mk\ninstance P._sizeOf_inst : SizeOf Nat := ⟨fun _ => 999999⟩\nend Proof.A1EvilSizeOfNat\n"),
+                ("Proof/A1EvilSizeOfProp", "namespace Proof.A1EvilSizeOfProp\ninductive P : Prop | mk\ninstance P._sizeOf_inst : SizeOf P := ⟨fun _ => 999999⟩\nend Proof.A1EvilSizeOfProp\n"),
+                ("Topic/A1InstCoe/Defs", "namespace Topic.A1InstCoe.Defs\ninductive LocalAnchor | mk\ninstance : Inhabited LocalAnchor := ⟨.mk⟩\n@[coe] def sneakyInstCoe (n : Nat) [Inhabited LocalAnchor] : Bool := false\nend Topic.A1InstCoe.Defs\n"),
+                ("Topic/A1OptCoe/Defs", "namespace Topic.A1OptCoe.Defs\ninductive LocalAnchor | mk\n@[coe] def sneakyOptCoe (n : Nat) (_ : LocalAnchor := .mk) : Bool := false\nend Topic.A1OptCoe.Defs\n"),
+                ("Topic/A1AbbrCoe/Defs", "namespace Topic.A1AbbrCoe.Defs\ninductive LocalAnchor | mk\nabbrev HiddenTail := (_ : LocalAnchor := .mk) → Bool\n@[coe] def sneakyAbbrCoe (n : Nat) : HiddenTail := fun _ => false\nend Topic.A1AbbrCoe.Defs\n"),
+                ("Topic/BadSkipSrc", "namespace Topic.BadSkipSrc\nset_option debug.skipKernelTC true in\ndef v : Nat := 1\nend Topic.BadSkipSrc\n"),
             ):
                 s = b1_dir / f"{rel}.lean"
                 s.parent.mkdir(parents=True, exist_ok=True)
                 s.write_text(code, encoding="utf-8")
                 jobs.append((b1_dir, s, b1_dir / f"{rel}.olean", []))
+            top_clean = b1_dir / "Proof" / "TopClean.lean"
+            top_clean.parent.mkdir(parents=True, exist_ok=True)
+            top_clean.write_text(
+                "import Topic.BadSkipSrc\nnamespace Proof.TopClean\ntheorem ok : Topic.BadSkipSrc.v = 1 := rfl\nend Proof.TopClean\n",
+                encoding="utf-8",
+            )
+            jobs.append((b1_dir, top_clean, b1_dir / "Proof" / "TopClean.olean", [b1_dir]))
 
             pkg_pub15 = tmp / "pkg_pub15"
             for rel, code in (
@@ -523,15 +587,122 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/B1ShadowTrusted", "import Trusted.VerificationResult\nnamespace Proof.B1ShadowTrusted\ndef VerificationResult.VerificationResult : Prop := True\nend Proof.B1ShadowTrusted\n"),
                 ("Verify/EvilForall", 'import Trusted.VerificationResult\nnamespace Verify.EvilForall\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "evil", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified (_ : False) :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "evil", mirDialect := "V1", items := [{ identity := id1, certificate := False }] } :=\n  False.elim ‹False›\nend Verify.EvilForall\n'),
                 ("Verify/OuterGood", 'import Trusted.VerificationResult\nimport Verify.Topic\nnamespace Verify.OuterGood\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "og", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "og", mirDialect := "V1", items := [{ identity := id1, certificate := True }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 True.intro\nend Verify.OuterGood\n'),
-                ("Proof/ProvHelper", "namespace Proof.ProvHelper\ntheorem provEq : 1 + 1 = 2 := by native_decide\nend Proof.ProvHelper\n"),
+                ("Proof/ProvHelper", "namespace Proof.ProvHelper\ntheorem provEq : 1 + 1 = 2 := by native_decide\ndef provProp : Prop := True\nend Proof.ProvHelper\n"),
                 ("Verify/ItemProv", 'import Trusted.VerificationResult\nimport Proof.ProvHelper\nnamespace Verify.ItemProv\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "ip", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "ip", mirDialect := "V1", items := [{ identity := id1, certificate := 1 + 1 = 2 }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 Proof.ProvHelper.provEq\nend Verify.ItemProv\n'),
+                ("Verify/ProofLeak", 'import Trusted.VerificationResult\nimport Topic.Proofs\nnamespace Verify.ProofLeak\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "pl", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "pl", mirDialect := "V1", items := [{ identity := id1, certificate := Topic.Proofs.quoteCh = \'"\' }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 rfl\nend Verify.ProofLeak\n'),
+                ("CrateVerify_demo/Rollup", 'import Trusted.VerificationResult\nnamespace CrateVerify_demo.Rollup\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "cv", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "cv", mirDialect := "V1", items := [{ identity := id1, certificate := True }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 True.intro\nend CrateVerify_demo.Rollup\n'),
             ):
                 s = pkg_v / f"{rel}.lean"
                 s.parent.mkdir(parents=True, exist_ok=True)
                 s.write_text(code, encoding="utf-8")
                 jobs.append((pkg_v, s, pkg_v / f"{rel}.olean", v_deps))
 
+            clean_nm_lean = b1_dir / "Topic" / "B1CleanNonMod.lean"
+            clean_nm_lean.parent.mkdir(parents=True, exist_ok=True)
+            clean_nm_lean.write_text(
+                "namespace Topic.B1CleanNonMod\ntheorem ok : True := True.intro\nend Topic.B1CleanNonMod\n",
+                encoding="utf-8",
+            )
+            jobs.append((b1_dir, clean_nm_lean, b1_dir / "Topic" / "B1CleanNonMod.olean", []))
+
             audit._compile_lean_jobs(lean_bin, tmp, jobs)
+
+            # Forge Pass A1 binary `.olean` edge cases (`extraConstNames` provenance spoofing,
+            # cyclic `.defnInfo` before `Kernel.whnf`, and split-brain exported extension injection)
+            a1_forged = tmp / "a1_forged"
+            a1_forge_lean = tmp / "A1Forge.lean"
+            a1_forge_lean.write_text(
+                r"""import Lean
+open Lean
+def writeO (dir : System.FilePath) (m : Name) (d : ModuleData) : IO Unit := do
+  let p := dir / (System.mkFilePath (m.components.map Name.toString) |>.addExtension "olean")
+  if let some par := p.parent then IO.FS.createDirAll par
+  saveModuleData p m d
+
+def main (args : List String) : IO UInt32 := do
+  let [outStr] := args | return 2
+  let out := System.FilePath.mk outStr
+  let okThm : ConstantInfo := .thmInfo {
+    name := `Proof.A1ExtraSpoof.ok, levelParams := [],
+    type := mkConst ``True, value := mkConst ``True.intro,
+    all := [`Proof.A1ExtraSpoof.ok]
+  }
+  writeO (out / "extra_spoof") `Proof.A1ExtraSpoof {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A1ExtraSpoof.ok], constants := #[okThm],
+    extraConstNames := #[``Nat.add], entries := #[]
+  }
+  let cycDef : ConstantInfo := .defnInfo {
+    name := `Proof.A1CyclicWhnf.loop, levelParams := [],
+    type := mkConst ``Bool, value := mkConst `Proof.A1CyclicWhnf.loop,
+    hints := .regular 0, safety := .safe, all := [`Proof.A1CyclicWhnf.loop]
+  }
+  let cycAxName := `Proof.A1CyclicWhnf.f._native.decide.ax_1
+  let cycAx : ConstantInfo := .axiomInfo {
+    name := cycAxName, levelParams := [],
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool) (mkConst `Proof.A1CyclicWhnf.loop) (mkConst ``Bool.true),
+    isUnsafe := false
+  }
+  writeO (out / "cyclic_whnf") `Proof.A1CyclicWhnf {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A1CyclicWhnf.loop, cycAxName], constants := #[cycDef, cycAx],
+    extraConstNames := #[], entries := #[]
+  }
+  let cycDef2 : ConstantInfo := .defnInfo {
+    name := `Proof.A1CyclicBehindRec.loop, levelParams := [],
+    type := mkConst ``Bool, value := mkConst `Proof.A1CyclicBehindRec.loop,
+    hints := .regular 0, safety := .safe, all := [`Proof.A1CyclicBehindRec.loop]
+  }
+  let cycAxName2 := `Proof.A1CyclicBehindRec.f._native.decide.ax_1
+  let cycAx2 : ConstantInfo := .axiomInfo {
+    name := cycAxName2, levelParams := [],
+    type := mkApp3 (mkConst ``Eq [Level.one]) (mkConst ``Bool)
+      (mkApp (mkConst ``Bool.not) (mkConst `Proof.A1CyclicBehindRec.loop)) (mkConst ``Bool.true),
+    isUnsafe := false
+  }
+  writeO (out / "cyclic_behind_rec") `Proof.A1CyclicBehindRec {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A1CyclicBehindRec.loop, cycAxName2], constants := #[cycDef2, cycAx2],
+    extraConstNames := #[], entries := #[]
+  }
+  let sbDir := out / "split_ext" / "Proof"
+  IO.FS.createDirAll sbDir
+  let sbFile := sbDir / "A1SplitExt.olean"
+  let sbThm : ConstantInfo := .thmInfo {
+    name := `Proof.A1SplitExt.ok, levelParams := [],
+    type := mkConst ``True, value := mkConst ``True.intro,
+    all := [`Proof.A1SplitExt.ok]
+  }
+  let sbPriv : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[`Proof.A1SplitExt.ok], constants := #[sbThm],
+    extraConstNames := #[], entries := #[]
+  }
+  let sbExp : ModuleData := {
+    sbPriv with
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast ()])]
+  }
+  saveModuleDataParts `Proof.A1SplitExt #[
+    (sbFile, sbExp),
+    (OLeanLevel.server.adjustFileName sbFile, sbPriv),
+    (OLeanLevel.private.adjustFileName sbFile, sbPriv)
+  ]
+  return 0
+""",
+                encoding="utf-8",
+            )
+            forge_r = audit.run_governed_cmd(
+                [str(lean_bin), "--run", str(a1_forge_lean), str(a1_forged)],
+                cwd=tmp,
+                mode="file",
+            )
+            self.assertEqual(forge_r.returncode, 0, forge_r.stderr)
+
+            spoof_mod_hdr_src = tmp / "SpoofModHdr.lean"
+            spoof_mod_hdr_src.write_text(
+                "module\nnamespace Topic.B1CleanNonMod\ntheorem ok : True := True.intro\nend Topic.B1CleanNonMod\n",
+                encoding="utf-8",
+            )
 
             cases: list[tuple[str, bool, str | None, dict[str, object]]] = [
                 ("unsafe_term_only", False, "forbiddenInitOrCodegenHook", {"target_modules": ["Proof.B1UnsafeTerm"], "olean_dirs": [b1_dir], "strict_proofs": True}),
@@ -540,10 +711,62 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("len4_nat_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.Sub.B1ShadowNat"], "olean_dirs": [b1_dir], "strict_proofs": True}),
                 ("spoofed_defs", False, "spoofedExemptModule", {"target_modules": ["Topic.Proofs.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
                 ("coe_unused_binder", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B1Coe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_sizeof_nat", False, "forbiddenInstanceOrCoe", {"target_modules": ["Proof.A1EvilSizeOfNat"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_sizeof_prop", False, "forbiddenInstanceOrCoe", {"target_modules": ["Proof.A1EvilSizeOfProp"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_coe_inst_anchor", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A1InstCoe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_coe_opt_anchor", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A1OptCoe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_coe_abbrev_tail_opt", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A1AbbrCoe.Defs"], "olean_dirs": [b1_dir], "strict_proofs": True}),
+                ("a1_clean_module_without_flag", True, None, {
+                    "target_modules": ["Topic.Defs"],
+                    "olean_dirs": [pkg_pub15],
+                    "source_map": {"Topic.Defs": pkg_pub15 / "Topic" / "Defs.lean"},
+                    "require_sources": True,
+                    "module_mode": False,
+                    "strict_proofs": True,
+                }),
+                ("a1_fake_module_hdr_on_nonmodule_olean", False, "forbiddenSourceOption", {
+                    "target_modules": ["Topic.B1CleanNonMod"],
+                    "olean_dirs": [b1_dir],
+                    "source_map": {"Topic.B1CleanNonMod": spoof_mod_hdr_src},
+                    "require_sources": False,
+                    "module_mode": False,
+                    "strict_proofs": True,
+                }),
+                ("a1_transitive_source_scanned_when_optional", False, "forbiddenSourceOption", {
+                    "target_modules": ["Proof.TopClean"],
+                    "olean_dirs": [b1_dir],
+                    "source_map": {"Topic.BadSkipSrc": b1_dir / "Topic" / "BadSkipSrc.lean"},
+                    "require_sources": False,
+                    "strict_proofs": True,
+                }),
+                ("a1_extra_const_provenance_spoof", False, "extraConstNameProvenance", {
+                    "target_modules": ["Proof.A1ExtraSpoof"],
+                    "olean_dirs": [a1_forged / "extra_spoof"],
+                    "strict_proofs": True,
+                }),
+                ("a1_cyclic_defn_direct_lhs_budget", False, "invalidNativeAxiomType", {
+                    "target_modules": ["Proof.A1CyclicWhnf"],
+                    "olean_dirs": [a1_forged / "cyclic_whnf"],
+                    "allow_provisional_native": True,
+                    "strict_proofs": True,
+                }),
+                ("a1_cyclic_defn_caught_by_replay_before_whnf", False, "kernelTypeError", {
+                    "target_modules": ["Proof.A1CyclicBehindRec"],
+                    "olean_dirs": [a1_forged / "cyclic_behind_rec"],
+                    "allow_provisional_native": True,
+                    "strict_proofs": True,
+                }),
+                ("a1_split_brain_exported_ext", False, "keyNameMismatch", {
+                    "target_modules": ["Proof.A1SplitExt"],
+                    "olean_dirs": [a1_forged / "split_ext"],
+                    "strict_proofs": True,
+                }),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_unlisted_transitive", False, "invalidVerifyRoot", {"target_modules": ["Verify.OuterGood"], "olean_dirs": [pkg_v], "strict_proofs": True}),
+                ("a1_verify_stmt_proof_leak", False, "statementTheoryLeak", {"target_modules": ["Verify.ProofLeak"], "olean_dirs": [pkg_v], "strict_proofs": True}),
+                ("a1_crate_verify_prefix_good", True, None, {"target_modules": ["CrateVerify_demo.Rollup"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_multi_item_isolated", True, None, {
                     "target_modules": ["Verify.ItemProv", "Verify.Topic"],
                     "olean_dirs": [pkg_v],
@@ -559,7 +782,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 sysroot=sysroot,
                 stage_dir=tmp,
                 compiled_inspector=insp,
-                chunk_size=5,
+                chunk_size=30,
             )
             for (cid, exp_ok, exp_cat, _), rep in zip(cases, reps):
                 self.assertEqual(rep["ok"], exp_ok, f"{cid}: {rep}")
