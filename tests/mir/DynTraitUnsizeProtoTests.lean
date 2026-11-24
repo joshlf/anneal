@@ -1639,8 +1639,9 @@ theorem mr_universal_correspondence_instance (m : Mach) (mTB : MachTB) (d : Prot
   mach_and_machTB_vtable_correspondence traitOf fnOf vt 8 vtOtherTrait d tn m mTB
     (by decide +kernel) (by decide +kernel) rfl
 
-/-- **Universal MiniRust `checkPtrMetadataM`, `checkPtrM` (raw & ref), and
-`evalUnOpM` correspondence, instantiated on `Mach` and `MachTB`.** -/
+/-- **Universal MiniRust `checkPtrMetadataM`, `checkPtrM` (raw & ref, both
+positive acceptance and non-dereferenceable/null UB), and `evalUnOpM`
+correspondence, instantiated on `Mach` and `MachTB`.** -/
 theorem mr_universal_checkPtr_and_evalUnOp_instances
     (m : Mach) (mTB : MachTB) (dataPtr fnThin : Ptr) (dataPtrTB fnThinTB : Gen.ThinPointer Gen.TreeBorrowsProvenance)
     (hDataB : inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true)
@@ -1656,6 +1657,15 @@ theorem mr_universal_checkPtr_and_evalUnOp_instances
           metadata := some (.VTablePointer (vtPtr bmL vtOtherTrait)) }
         (.Ref .Immutable (dynInfo true)) (some (installVTables bmL vt m)) =
       ub "Value::Ptr: null safe pointer" ∧
+    (dataPtr.addr ≠ 0 → Align.is_aligned ⟨4⟩ dataPtr.addr = true →
+      ConcurrentMemory.dereferenceable m.mem dataPtr ⟨8⟩ = .ok () →
+      checkPtrM { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr bmL vtOtherTrait)) }
+          (.Ref .Immutable (dynInfo true)) (some (installVTables bmL vt m)) = .ok ()) ∧
+    (dataPtrTB.addr ≠ 0 → Align.is_aligned ⟨4⟩ dataPtrTB.addr = true →
+      ∀ msg, ConcurrentMemory.dereferenceable mTB.mem dataPtrTB ⟨8⟩ = .error (.ub msg) →
+      checkPtrM { thin_pointer := dataPtrTB, metadata := some (.VTablePointer (vtPtr tbL vtOtherTrait)) }
+          (.Ref .Immutable (dynInfo true)) (some (installVTables tbL vt mTB)) =
+        ub "Value::Ptr: non-dereferenceable safe pointer") ∧
     evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩) (vtVal vtOtherTrait) (some (installVTables bmL vt m)) =
       .ok (.Ptr (ThinPointer.widen fnThin none), .Ptr .FnPtr) ∧
     evalUnOpM (.VTableMethodLookup ⟨⟨3⟩⟩) (vtValTB vtOtherTrait) (some (installVTables tbL vt mTB)) =
@@ -1678,7 +1688,13 @@ theorem mr_universal_checkPtr_and_evalUnOp_instances
     dataPtr fnThin rawTy (bmLayout_provOf_inj _ _) hWf hLook hVtB rfl rfl hFn).2.2.2
   have hUnOpTB := (evalUnOpM_dyn_correspondence tbL vt mTB 8 3 vtOtherTrait otherEvalVt
     dataPtrTB fnThinTB rawTy (tbLayout_provOf_inj _ _) hWf hLook hVtBTB rfl rfl hFnTB).2.2.2
-  exact ⟨hRawBM, hRawTB, hNullBM, hUnOpBM, hUnOpTB⟩
+  refine ⟨hRawBM, hRawTB, hNullBM, ?_, ?_, hUnOpBM, hUnOpTB⟩
+  · intro hNz hAl hDeref
+    exact (checkPtrM_ref_dyn_ok_and_nonderef bmL vt m 8 vtOtherTrait .Immutable true true dataPtr
+      (bmLayout_provOf_inj _ _) hWf hLook hVtB hSzB hDataB hNz hAl).1 hDeref
+  · intro hNz hAl msg hDeref
+    exact (checkPtrM_ref_dyn_ok_and_nonderef tbL vt mTB 8 vtOtherTrait .Immutable true true dataPtrTB
+      (tbLayout_provOf_inj _ _) hWf hLook hVtBTB hSzB hDataBTB hNz hAl).2 msg hDeref
 
 end MrTest
 
@@ -2059,6 +2075,200 @@ theorem a1_raw_borrow_receiver_class_and_auto_trait_order :
     rvalTag (unsizeDynToDyn Lm.corpusTable 8 .raw false Lm.predA
       { Lm.predA with autoTraits := ["Send"] } (wide (ptrV 1 0) (ptrV 40000 8)) [] emptyMemory []
       layouts) = 3 := by
+  decide +kernel
+
+/-! ### B2 regressions (`Pin<&mut dyn>` end-to-end protector, `dynRawBorrowProto?`
+safe-reference validity without TB false positives, trailing-arg ABI check,
+and `stepDynLayoutIntrinsicProto` environment gate) -/
+
+def pinRefMutDynPokeTy : Ty :=
+  { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic C16.pokeKey)], layoutIdx := 5 }
+def pinRefDynPokeTy : Ty :=
+  { kind := .adt "core::pin::Pin" [.ref .not (.dynamic C16.pokeKey)], layoutIdx := 5 }
+def pinRefMutRecTy : Ty :=
+  { kind := .adt "core::pin::Pin" [.ref .mut (.adt recKey [])], layoutIdx := 3 }
+
+/-- Concrete `impl Poke for Receiver { fn poke(self: Pin<&mut Receiver>, alias: *mut u32) -> u32 }`
+that projects `self.pointer` (`.field 0`), reads `(*self.pointer).bias`, optionally
+writes through `alias` while the protected `Pin<&mut Receiver>` is live, and returns
+the bias. -/
+def pinPokeBody (writeInCallee : Bool) : CapturedMir :=
+  { defPath := C16.recPoke, phase := .runtimePostCleanup, role := .model, argCount := 2,
+    localDecls := [decl u32Ty, decl pinRefMutRecTy, decl C16.rawU32Ty, decl refMutRecTy, decl u32Ty],
+    basicBlocks :=
+      [ bb ([ live 3, live 4,
+              asg 3 (.use (.copy { local_ := 1, projection := [.field 0 refMutRecTy] })),
+              asg 4 (.use (selfField 3 0)) ] ++
+            (match writeInCallee with
+             | true =>
+               [{ kind := .assign { local_ := 2, projection := [.deref] } (.use (cU32 9)),
+                  span := "<b2-pin>" }]
+             | false => []) ++
+            [asg 0 (.use (cp 4))]) .return_ ],
+    fnAbi := { args := [ptrAbi, ptrAbi], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+/-- Caller constructing `Pin { pointer: (&mut rec) as &mut dyn Poke }` (runtime
+value `.aggregate 0 [widePtr]`) and invoking `<dyn Poke as Poke>::poke(pin, alias)`. -/
+def pinCallerBody (writeAfter : Bool) : CapturedMir :=
+  { defPath := "b2::pin_caller", phase := .runtimePostCleanup, role := .model, argCount := 0,
+    localDecls :=
+      [ decl u32Ty, decl recTy, decl C16.rawU32Ty, decl C16.refMutPokeTy, decl refMutRecTy,
+        decl pinRefMutDynPokeTy, decl u32Ty ],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4, live 5, live 6,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 17]),
+             asg 2 (.rawPtr .mut { local_ := 1, projection := [.field 0 u32Ty] }),
+             asg 4 (.ref (.mut false) (loc 1)),
+             asg 3 (unsize (mv 4) C16.refMutPokeTy),
+             asg 5 (.aggregate (.adt "core::pin::Pin" 0 none) [mv 3]) ]
+           (.call (virtFn C16.pokePath C16.pokeKey) [cp 5, cp 2] (loc 6) (some 1) .continue_),
+        bb ((match writeAfter with
+             | true => [asg 1 (.aggregate (.adt recKey 0 none) [cU32 5])]
+             | false => []) ++ [asg 0 (.use (cp 6))]) .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+def runPin (writeInCallee writeAfter : Bool) : ProtoRunResult :=
+  runMirProto C16.pokeProg (pinCallerBody writeAfter) 64
+    (initMachineStateWithCallees (pinCallerBody writeAfter) [] [pinPokeBody writeInCallee])
+
+def pinStateAfterCall : Option MachineState :=
+  advanceSteps (pinCallerBody false) (stepMirFnProto C16.pokeProg (pinCallerBody false)) 12
+    (initMachineStateWithCallees (pinCallerBody false) [] [pinPokeBody false])
+
+/-- **B2-1: End-to-end `Pin<&mut dyn Poke>` virtual dispatch & TB protector.**
+1. Clean `Pin<&mut dyn Poke>::poke` unwraps `Pin { pointer: widePtr }`,
+   allocates a fresh protected child tag `3` (under caller tag `2`, NOT mutating
+   caller tag `2` via `attachOnly`!), re-wraps callee `_1` as `.aggregate 0 [ptr]`,
+   projects `self.pointer` (`.field 0`), reads `bias = 17`, and returns `17u32`.
+2. Foreign write through `alias` during the `Pin<&mut dyn Poke>` call is UB (`3`).
+3. Overwriting `rec` strictly after return succeeds (`17u32`, protector released).
+4. `classifyVirtualReceiver` rejects non-`dyn` `Pin<&mut u32>` and `&u32`.
+5. `Pin<&dyn Poke>` cannot dispatch to a `Pin<&mut Receiver>` callee (UB `3`). -/
+theorem b2_pin_mut_dyn_end_to_end_and_protector :
+    scalarOf (runPin false false) = some (17, 4) ∧
+    tagOf (runPin true false) = 3 ∧
+    scalarOf (runPin false true) = some (17, 4) ∧
+    pinStateAfterCall.map C16.protectorView = some ([1], [(3, 3, 2), (2, 0, 0), (1, 0, 0)]) ∧
+    [ siteCode (virtualCallSite? prog
+        (wrappedReceiverCaller { kind := .adt "core::pin::Pin" [.ref .mut (.uint .u32)], layoutIdx := 5 })
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]),
+      siteCode (virtualCallSite? prog (wrappedReceiverCaller refRecTy)
+        (virtFn evalVtPath traitKey) [cp 1, cp 2]) ] = [[4], [4]] ∧
+    (match advanceSteps (pinCallerBody false) (stepMirFnProto C16.pokeProg (pinCallerBody false)) 11
+        (initMachineStateWithCallees (pinCallerBody false) [] [pinPokeBody false]) with
+     | some s =>
+       vcTag (evalVirtualCallProto C16.pokeProg.vtables
+         { traitPred := C16.pokePred, slotIdx := 3, receiverIsRef := true,
+           receiverIsMut := false, receiverIsPin := true }
+         s (pinCallerBody false) [cp 5, cp 2] (loc 6) 1 .continue_)
+     | none => 9) = 3 := by
+  decide +kernel
+
+/-- `&raw const (*r)` after `StorageDead(rec)` makes `r : &dyn Trait` dangling. -/
+def rawBorrowAfterDeadLocalBody : CapturedMir :=
+  { defPath := "b2::raw_borrow_after_dead", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl u32Ty, decl recTy, decl refRecTy, decl refDynTy, decl rawDynTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3, live 4,
+             asg 1 (.aggregate (.adt recKey 0 none) [cU32 1]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDynTy),
+             { kind := .storageDead 1, span := "<b2>" },
+             asg 4 (.rawPtr .not (derefPlace 3)),
+             asg 0 (.use (cU32 0)) ] .return_ ],
+    fnAbi := { args := [], ret := u32Abi, conv := .rust, canUnwind := false },
+    layouts := layouts, allocations := [] }
+
+/-- **B2-2: Hardened `dynRawBorrowProto?` closes `A1`'s safe-reference hole
+while preserving zero false-positive TB UB.**
+* `&raw const (*r)` after `StorageDead(rec)` faults UB (`3`).
+* `&raw const (*r)` with a null pointer, misaligned pointer, or offset/wrong-trait
+  vtable pointer faults UB (`3`).
+* `&raw const (*p)` on a raw `*const dyn Trait` with null/dangling data STILL
+  returns `.ok` (`0`).
+* `&raw const (*r)` with an unresolved existential binder fails closed (`4`). -/
+theorem b2_dyn_raw_borrow_ref_validity_without_tb_fp :
+    tagOf (runMirProto prog rawBorrowAfterDeadLocalBody 32
+      (initMachineStateWithCallees rawBorrowAfterDeadLocalBody [] [])) = 3 ∧
+    (match Canary.s49 with
+     | some s =>
+       let codeOf (r : Option (ProtoRes Value)) : Nat :=
+         match r with
+         | some (.ok _) => 0
+         | some .ub => 3
+         | some .unsupported => 4
+         | none => 9
+       let badDeclsRaw := (set? driverDecls 14 (decl rawDynTy)).getD driverDecls
+       let unresolvedVt : ProtoVTableTable :=
+         { vtables with
+           dynTypes := [(traitKey, { Fx.traitPred with hasUnresolvedExistentialBinder := true }),
+                        (altKey, altPred)] }
+       [ codeOf (dynRawBorrowProto? vtables 8 .not
+           (withLocal s 14 (wide (ptrV 0 0) (ptrV 40001 0))).frame.locals
+           s.memory driverDecls layouts (derefPlace 14)),
+         codeOf (dynRawBorrowProto? vtables 8 .not
+           (withLocal s 14 (wide (ptrV 2 1) (ptrV 40001 0))).frame.locals
+           s.memory driverDecls layouts (derefPlace 14)),
+         codeOf (dynRawBorrowProto? vtables 8 .not
+           (withLocal s 14 (wide (ptrV 2 0) (ptrV 40001 8))).frame.locals
+           s.memory driverDecls layouts (derefPlace 14)),
+         codeOf (dynRawBorrowProto? vtables 8 .not
+           (withLocal s 14 (wide (ptrV 2 0) (ptrV 40002 0))).frame.locals
+           s.memory driverDecls layouts (derefPlace 14)),
+         codeOf (dynRawBorrowProto? vtables 8 .not
+           (withLocal s 14 (wide (scV 0) (ptrV 40001 0))).frame.locals
+           s.memory badDeclsRaw layouts (derefPlace 14)),
+         codeOf (dynRawBorrowProto? unresolvedVt 8 .not
+           s.frame.locals s.memory driverDecls layouts (derefPlace 14)) ]
+     | none => [9]) = [3, 3, 3, 3, 0, 4] := by
+  decide +kernel
+
+/-- **B2-3 & B2-4: Trailing argument ABI size mismatch, non-pointer concrete
+receiver `_1`, `stepDynLayoutIntrinsicProto` `vtableEnvOk` gate, and
+`core::mem::{size_of_val_raw, align_of_val_raw}`.** -/
+def badTrailingArgCallee : CapturedMir :=
+  let u64Abi : ArgAbi := { layout := usizeLayout, mode := .direct }
+  { otherEvalVtBody with
+    fnAbi := { args := [ptrAbi, u64Abi], ret := u32Abi, conv := .rust, canUnwind := false } }
+
+def nonPtrRecvCallee : CapturedMir :=
+  { otherEvalVtBody with
+    localDecls := [decl u32Ty, decl usizeTy, decl u32Ty] }
+
+def memRawSizeCallerBody : CapturedMir :=
+  { defPath := "b2::mem_raw_size_caller", phase := .runtimePostCleanup, role := .model,
+    argCount := 0,
+    localDecls := [decl usizeTy, decl otherTy, decl refOtherTy, decl refDynTy],
+    basicBlocks :=
+      [ bb [ live 1, live 2, live 3,
+             asg 1 (.aggregate (.adt otherKey 0 none) [cU32 1, cU32 2]),
+             asg 2 (.ref .shared (loc 1)),
+             asg 3 (unsize (mv 2) refDynTy) ]
+           (.call (fnOp "core::mem::size_of_val_raw" [.dynamic traitKey]) [cp 3] (loc 0)
+             (some 1) .continue_),
+        bb [] .return_ ],
+    fnAbi :=
+      { args := [], ret := { layout := usizeLayout, mode := .direct },
+        conv := .rust, canUnwind := false },
+    layouts := layoutsWithUsize, allocations := [] }
+
+theorem b2_trailing_arg_abi_nonptr_recv_and_intrinsic_env_gate :
+    callWithFlags vtables Fx.traitPred 3 true false
+      (fun s => { s with memory := { s.memory with callees := [badTrailingArgCallee] } }) = 3 ∧
+    callWithFlags vtables Fx.traitPred 3 true false
+      (fun s => { s with memory := { s.memory with callees := [nonPtrRecvCallee] } }) = 3 ∧
+    scalarOf (runMirProto prog memRawSizeCallerBody 32
+      (initMachineStateWithCallees memRawSizeCallerBody [] [])) = some (8, 8) ∧
+    (let collidingProg : ProtoDynProgram :=
+       { prog with
+         vtables :=
+           { vtables with
+             entries := [{ vtRecTrait with vtableAllocId := 1 }, vtOtherTrait, vtRecAlt] } }
+     tagOf (runMirProto collidingProg (dynLayoutIntrinsicCallerBody false false) 32
+       (initMachineStateWithCallees (dynLayoutIntrinsicCallerBody false false) [] []))) = 4 := by
   decide +kernel
 
 end B1Hardening
@@ -2668,20 +2878,54 @@ def vtmInstalledHooks :
     VTableHooks Provenance VtmState Unit CallInstance (FnAbi Nat) :=
   VTableMachine.hooks vtmHooks vtmBaseVTableHooks
 
-/-- Exercises genuine `Miri.Interpreter.VTableMachine` completely inside the
-Lean kernel (`decide +kernel`):
+/-- Pure, choice-free `VTableMachine.Registry` check (zero `MemoryState` /
+`Std.HashMap` dependence): `mergePersistent` merges consistent registries and
+rejects conflicting `AllocId`s for the same key or one `AllocId` reused on two
+keys, and `ensureDisjointFromFunctions` accepts disjoint registries and rejects
+an `AllocId` shared with `FunctionPointers.Registry`. -/
+def vtmRegistryCheck : Bool :=
+  let id0 : AllocId := ⟨40000, by decide⟩
+  let id1 : AllocId := ⟨40001, by decide⟩
+  let reg := vtmSeedRegistry
+  let mergeSelfOk :=
+    match VTableMachine.Registry.mergePersistent reg reg with
+    | .ok r => r.entries.size == 3
+    | .error _ => false
+  let conflictKey : VTableMachine.Registry := ⟨#[⟨0, 0, ⟨0, by decide⟩, id1⟩]⟩
+  let mergeConflictKeyRej :=
+    match VTableMachine.Registry.mergePersistent reg conflictKey with
+    | .ok _ => false
+    | .error _ => true
+  let conflictAlloc : VTableMachine.Registry := ⟨#[⟨9, 9, ⟨0, by decide⟩, id0⟩]⟩
+  let mergeConflictAllocRej :=
+    match VTableMachine.Registry.mergePersistent reg conflictAlloc with
+    | .ok _ => false
+    | .error _ => true
+  let fnDisjointOk :=
+    match VTableMachine.Registry.ensureDisjointFromFunctions reg
+        (FunctionPointers.Registry.empty : FunctionPointers.Registry Unit) with
+    | .ok () => true
+    | .error _ => false
+  let fnColliding : FunctionPointers.Registry Unit :=
+    ⟨#[⟨⟨.Item 0, #[]⟩, ⟨0, by decide⟩, id0⟩], #[]⟩
+  let fnCollideRej :=
+    match VTableMachine.Registry.ensureDisjointFromFunctions reg fnColliding with
+    | .ok () => false
+    | .error _ => true
+  mergeSelfOk && mergeConflictKeyRej && mergeConflictAllocRej && fnDisjointOk && fnCollideRej
+
+theorem vtmRegistryCheck_ok : vtmRegistryCheck = true := by decide +kernel
+
+/-- Exercises stateful `Miri.Interpreter.VTableMachine` (`reserve`,
+`globalVTable`, `hooks`) over `MemoryState.empty` inside the Lean kernel
+(`decide +kernel`):
 1. `VTableMachine.reserve` deduplicates captured `(ty, dynType, salt)` keys and
    returns the exact prepared `AllocId` (`40000`, `40001`, `40002`);
 2. uncaptured salt (`salt = 1`) or uncaptured `(ty, dynType)` fails closed with
    `.unsupported` under `sourceAllocIdWorldActive = true`;
 3. `VTableMachine.hooks` routes `reserveVTable` / `globalVTable` and rejects
    out-of-range salt (`32`);
-4. `VTableMachine.globalVTable` recovers `(ty, dynType)` for each reserved id;
-5. `VTableMachine.Registry.mergePersistent` merges consistent registries and
-   rejects conflicting `AllocId`s for the same key or one `AllocId` reused on
-   two keys;
-6. `VTableMachine.Registry.ensureDisjointFromFunctions` accepts disjoint
-   registries and rejects an `AllocId` shared with `FunctionPointers.Registry`. -/
+4. `VTableMachine.globalVTable` recovers `(ty, dynType)` for each reserved id. -/
 def vtmMachineCheck : Bool :=
   let prog : MachineHooks.M Unit VtmUser Bool := do
     let id0 ← VTableMachine.reserve vtmHooks 0 0 ⟨0, by decide⟩
@@ -2712,38 +2956,10 @@ def vtmMachineCheck : Bool :=
     let g0 ← VTableMachine.globalVTable vtmHooks id0
     let g1 ← vtmInstalledHooks.globalVTable () id1
     let g2 ← VTableMachine.globalVTable vtmHooks id2
-    let reg := (← get).machine.user.2
-    let mergeSelfOk :=
-      match VTableMachine.Registry.mergePersistent reg reg with
-      | .ok r => r.entries.size == 3
-      | .error _ => false
-    let conflictKey : VTableMachine.Registry := ⟨#[⟨0, 0, ⟨0, by decide⟩, id1⟩]⟩
-    let mergeConflictKeyRej :=
-      match VTableMachine.Registry.mergePersistent reg conflictKey with
-      | .ok _ => false
-      | .error _ => true
-    let conflictAlloc : VTableMachine.Registry := ⟨#[⟨9, 9, ⟨0, by decide⟩, id0⟩]⟩
-    let mergeConflictAllocRej :=
-      match VTableMachine.Registry.mergePersistent reg conflictAlloc with
-      | .ok _ => false
-      | .error _ => true
-    let fnDisjointOk :=
-      match VTableMachine.Registry.ensureDisjointFromFunctions reg
-          (FunctionPointers.Registry.empty : FunctionPointers.Registry Unit) with
-      | .ok () => true
-      | .error _ => false
-    let fnColliding : FunctionPointers.Registry Unit :=
-      ⟨#[⟨⟨.Item 0, #[]⟩, ⟨0, by decide⟩, id0⟩], #[]⟩
-    let fnCollideRej :=
-      match VTableMachine.Registry.ensureDisjointFromFunctions reg fnColliding with
-      | .ok () => false
-      | .error _ => true
     pure (id0.value == 40000 && id1.value == 40001 && id2.value == 40002 &&
       id0 == id0ViaHooks && id0 != id1 && id0 != id2 && id1 != id2 &&
       uncapturedSaltRejected && uncapturedKeyRejected && badSaltRejected &&
-      g0 == some (0, 0) && g1 == some (1, 0) && g2 == some (0, 1) &&
-      mergeSelfOk && mergeConflictKeyRej && mergeConflictAllocRej &&
-      fnDisjointOk && fnCollideRej)
+      g0 == some (0, 0) && g1 == some (1, 0) && g2 == some (0, 1))
   match prog.run vtmInitState with
   | .ok ok _ => ok
   | .error _ _ => false
@@ -2810,6 +3026,7 @@ disjointness checks, and MiniRust's `vtable_from_ptr` / `compute_size` /
 same corpus table (`Mach` and `MachTB`). -/
 theorem dyn_dual_authority_capstone :
     LmDynContract miriAuthority ∧
+    vtmRegistryCheck = true ∧
     vtmMachineCheck = true ∧
     (∀ (m : MiniRustSpec.Interp.Mach) (mTB : MiniRustSpec.Interp.MachTB) (d : ProtoDataWord),
       type_of% (corpus_minirust_instance m mTB d)) ∧
@@ -2817,7 +3034,8 @@ theorem dyn_dual_authority_capstone :
       (hDataB : MiniRustSpec.Interp.inBounds dataPtr.addr .Unsigned MiniRustSpec.Interp.x86_64.PTR_SIZE = true)
       (hFn : MiniRustSpec.Interp.mapGet m.fn_ptrs ⟨⟨fnIdOf corpusTable "other::eval"⟩⟩ = some fnThin),
       type_of% (corpus_minirust_checkPtr_evalUnOp m dataPtr fnThin hDataB hFn)) :=
-  ⟨miriContract, vtmMachineCheck_ok, corpus_minirust_instance, corpus_minirust_checkPtr_evalUnOp⟩
+  ⟨miriContract, vtmRegistryCheck_ok, vtmMachineCheck_ok, corpus_minirust_instance,
+   corpus_minirust_checkPtr_evalUnOp⟩
 
 end Anneal.Prototypes.DynTraitUnsizeProtoTests.CrossRoot
 "##
@@ -2905,25 +3123,29 @@ run_cmd do
     let eqTrue (e : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.true)
     let eqFalse (e : Expr) : Expr := mkApp3 (mkConst ``Eq [1]) boolTy e (mkConst ``Bool.false)
 
-    -- 1. The elaborated certificate, contract, VTableMachine check, and capstone.
+    -- 1. The elaborated certificate, contract, VTableMachine checks, and capstone.
     let env0 ← getEnv
     let checkName := ns ++ `miriAuthority_check
     let contractName := ns ++ `miriContract
+    let vtmRegCheckName := ns ++ `vtmRegistryCheck_ok
     let vtmCheckName := ns ++ `vtmMachineCheck_ok
     let capstoneName := ns ++ `dyn_dual_authority_capstone
-    for n in [checkName, contractName, vtmCheckName, capstoneName] do
+    for n in [checkName, contractName, vtmRegCheckName, vtmCheckName, capstoneName] do
       let some (.thmInfo _) := env0.find? n | throwError "cross-root: theorem {n} missing"
     let some (.thmInfo checkInfo) := env0.find? checkName | throwError "unreachable"
     unless checkInfo.type == eqTrue (mkApp (mkConst (lmNs ++ `lmAuthorityCheck))
         (mkConst (ns ++ `miriAuthority))) do
       throwError "cross-root: {checkName} has an unexpected statement"
+    let some (.thmInfo vtmRegInfo) := env0.find? vtmRegCheckName | throwError "unreachable"
+    unless vtmRegInfo.type == eqTrue (mkConst (ns ++ `vtmRegistryCheck)) do
+      throwError "cross-root: {vtmRegCheckName} has an unexpected statement"
     let some (.thmInfo vtmInfo) := env0.find? vtmCheckName | throwError "unreachable"
     unless vtmInfo.type == eqTrue (mkConst (ns ++ `vtmMachineCheck)) do
       throwError "cross-root: {vtmCheckName} has an unexpected statement"
     let contractC := mkConst contractName
 
     -- 2. Closed per-law projections of the contract over the vendored interpreter.
-    let mut added : Array Lean.Name := #[checkName, contractName, vtmCheckName, capstoneName]
+    let mut added : Array Lean.Name := #[checkName, contractName, vtmRegCheckName, vtmCheckName, capstoneName]
     for law in [`agreement, `unsize_pairs_data_with_vtable, `upcast_selects_super_vtable,
                 `layout_from_vtable, `trait_check_ignores_auto_traits,
                 `invalid_vtable_pointer_ub, `invalid_vtable_trait_ub,
@@ -2994,6 +3216,10 @@ run_cmd do
           name := ns ++ `forged.checkFalse, levelParams := [],
           type := eqFalse (mkApp (mkConst (lmNs ++ `lmAuthorityCheck)) (mkConst (ns ++ `miriAuthority))),
           value := mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.false) }),
+        ("negated vtmRegistryCheck (= false)", .thmDecl {
+          name := ns ++ `forged.vtmRegFalse, levelParams := [],
+          type := eqFalse (mkConst (ns ++ `vtmRegistryCheck)),
+          value := mkApp2 (mkConst ``Eq.refl [1]) boolTy (mkConst ``Bool.false) }),
         ("negated vtmMachineCheck (= false)", .thmDecl {
           name := ns ++ `forged.vtmFalse, levelParams := [],
           type := eqFalse (mkConst (ns ++ `vtmMachineCheck)),
@@ -3038,20 +3264,38 @@ run_cmd do
         else if e.isAppOfArity ``Eq 3 then e.appFn!.appArg! == e.appArg!
         else false
     let mut crAxioms : NameSet := {}
+    let mut choiceFreeBridge : Nat := 0
+    -- Stateful `VTableMachine.{reserve, globalVTable, hooks}` transitively uses
+    -- vendored `Miri.Memory.MemoryState.empty` (`KeyedArray` / `Std.HashMap`),
+    -- which is the sole source of `Classical.choice` in the cross-root bridge.
+    -- Every other bridge declaration (including `miriAuthority_check`,
+    -- `miriContract`, all 10 law projections, all `cert.*`/`agree.*`,
+    -- `vtmRegistryCheck_ok`, and `corpus_minirust_checkPtr_evalUnOp`) MUST be
+    -- strictly choice-free (`⊆ [propext, Quot.sound]`).
+    let statefulChoiceDecls : List Lean.Name :=
+      [vtmCheckName, capstoneName, ns ++ `vtmHooks, ns ++ `vtmInstalledHooks, ns ++ `vtmMachineCheck]
     let bridgeDefs := [`miriRun, `miriAuthority, `lmVTableHooks, `lmCastHooks,
                        `lmDynLayoutHooks, `lmCompilerHooks, `lmVirtualHooks,
-                       `vtmHooks, `vtmInstalledHooks, `vtmMachineCheck]
+                       `vtmRegistryCheck, `vtmHooks, `vtmInstalledHooks, `vtmMachineCheck]
     for n in added ++ (bridgeDefs.map (ns ++ ·)).toArray do
       let some ci := env.find? n | throwError "cross-root: {n} missing"
       match ci with
       | .defnInfo v => if v.safety != .safe then throwError "cross-root: {n} is not safe"
       | .thmInfo v => if isTrivialProp v.type then throwError "cross-root: {n} is trivial"
       | _ => throwError "cross-root: {n} is not a defn or thm"
-      for a in ← collectAxioms n do
+      let axs ← collectAxioms n
+      for a in axs do
         if a == ``sorryAx || a == ``Lean.ofReduceBool || a == ``Lean.trustCompiler then
           throwError "cross-root: {n} depends on forbidden axiom {a}"
         unless isStdAx a do throwError "cross-root: {n} depends on non-standard axiom {a}"
         crAxioms := crAxioms.insert a
+      if !statefulChoiceDecls.contains n then
+        for a in axs do
+          if a == ``Classical.choice then
+            throwError "cross-root constructive audit failure: {n} unexpectedly uses Classical.choice"
+        choiceFreeBridge := choiceFreeBridge + 1
+    unless choiceFreeBridge ≥ 40 do
+      throwError "cross-root constructive audit vacuous: only {choiceFreeBridge} choice-free decls"
     unless !(← collectAxioms ``sorryAx).all isStdAx do
       throwError "cross-root self-test: sorryAx was not detected"
     unless !(← collectAxioms ``Lean.ofReduceBool).all isStdAx do
@@ -3071,7 +3315,8 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !reach.contains d then todo := todo.push d
     let requiredReach : List Lean.Name :=
-      [ contractName, checkName, vtmCheckName, lmNs ++ `lmDynContractOfCheck, lmNs ++ `protoLmRun,
+      [ contractName, checkName, vtmRegCheckName, vtmCheckName,
+        lmNs ++ `lmDynContractOfCheck, lmNs ++ `protoLmRun,
         `Anneal.Prototypes.DynTraitUnsizeProto.evalVirtualCallProto,
         `Anneal.Prototypes.DynTraitUnsizeProto.dynLayoutOfValProto,
         `Anneal.Prototypes.DynTraitUnsizeProto.unsizeDynToDyn,
@@ -3102,9 +3347,9 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<dyn-trait-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := bridgeEnv }
-  unless addedCount = 34 && rejectedCount = 14 do
+  unless addedCount = 35 && rejectedCount = 15 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
-  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter (incl. VTableMachine + DispatchFromDyn), rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
+  logInfo m!"dyn-trait cross-root kernel bridge: {addedCount} declarations over vendored Miri.Interpreter (incl. choice-free VTableMachine.Registry + stateful VTableMachine + DispatchFromDyn), rejected {rejectedCount} forged controls, reached MiniRust + Miri, axioms {crAxioms}"
 
 /-! ## §6. Axiom and vacuity audit of the prototype and the tests -/
 
@@ -3181,6 +3426,10 @@ run_cmd do
       ``Anneal.Prototypes.DynTraitUnsizeProto.evalUnsizeDynProto_failsClosed,
       ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_ancestor_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValid_zst_dangling_ptr,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.refDataValidNoTB_of_refDataValid,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.classifyVirtualReceiver_fail_closed,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.dynRawBorrowProto?_ignores_borrow_state,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.dynRawBorrowProto?_invalid_ref_ub,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_raw_ptr_unchecked,
       ``Anneal.Prototypes.DynTraitUnsizeProto.unsizeSizedToDyn_ref_ptr_iff_valid,
       ``Anneal.Prototypes.DynTraitUnsizeProto.upcastVTable?_rejects_unrelated_marker,
@@ -3204,6 +3453,7 @@ run_cmd do
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrMetadataM_install_correspondence,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrM_raw_dyn_unchecked,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrM_ref_dyn_rejects_invalid,
+      ``Anneal.Prototypes.DynTraitUnsizeProto.MR.checkPtrM_ref_dyn_ok_and_nonderef,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.evalUnOpM_dyn_correspondence,
       ``Anneal.Prototypes.DynTraitUnsizeProto.MR.computeSizeAlignM_eq_dynLayoutProto ]
   let mut choiceFree : Nat := 0

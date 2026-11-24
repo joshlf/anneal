@@ -1318,6 +1318,85 @@ def refDataValid
           -- `allocId = 0`, non-null aligned offset, `sizeBytes = 0`.
           Nat.beq e.sizeBytes 0 && Nat.beq p.allocId 0 && !Nat.beq p.offsetBytes 0
 
+/-- Safe-reference validity WITHOUT Tree Borrows permission / ancestor checks
+(matching MiniRust `checkPtrM` on `MachTB` and Miri's value-validity check on
+`&raw const (*r)` from `r : &dyn Trait`): enforces non-null, alignment,
+inhabitedness, live allocation (`!b.allocDead` and live stack/global slot), and
+in-bounds extent, while allowing `.disabled` or `.frozen` borrow tags. -/
+def refDataValidNoTB
+    (ptrBytes : Nat) (e : ProtoVTableEntry) (p : ProvenancePtr)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable) : Bool :=
+  match
+    ptrAddress? locals mem.borrows mem.callerLocals localDecls layouts ptrBytes p mem.callStack
+  with
+  | none => false
+  | some addr =>
+    match
+      isPow2 e.alignBytes && Nat.blt addr (scalarModulus ptrBytes) &&
+        !Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited
+    with
+    | false => false
+    | true =>
+      match lookupBorrow mem.borrows p.tag with
+      | some b =>
+        match !b.allocDead with
+        | false => false
+        | true =>
+          match borrowAllocExtent? locals mem localDecls layouts b with
+          | some (allocLen, placeOff) =>
+            Nat.ble (placeOff + p.offsetBytes + e.sizeBytes) allocLen
+          | none => false
+      | none =>
+        match lookupGlobalAlloc mem.globals p.allocId with
+        | some alloc =>
+          Nat.ble (p.offsetBytes + e.sizeBytes) (length alloc.bytes)
+        | none =>
+          Nat.beq e.sizeBytes 0 && Nat.beq p.allocId 0 && !Nat.beq p.offsetBytes 0
+
+/-- Every pointer that passes full `refDataValid` also passes `refDataValidNoTB`. -/
+theorem refDataValidNoTB_of_refDataValid
+    (ptrBytes : Nat) (e : ProtoVTableEntry) (dstMut : Bool) (p : ProvenancePtr)
+    (locals : List LocalSlot) (mem : Memory) (localDecls : List LocalDecl)
+    (layouts : LayoutTable)
+    (h : refDataValid ptrBytes e dstMut p locals mem localDecls layouts = true) :
+    refDataValidNoTB ptrBytes e p locals mem localDecls layouts = true := by
+  unfold refDataValid at h
+  unfold refDataValidNoTB
+  cases hAddr :
+      ptrAddress? locals mem.borrows mem.callerLocals localDecls layouts ptrBytes p mem.callStack with
+  | none => rw [hAddr] at h; cases h
+  | some addr =>
+    rw [hAddr] at h; dsimp only at h ⊢
+    cases hBase :
+        (isPow2 e.alignBytes && Nat.blt addr (scalarModulus ptrBytes) &&
+          !Nat.beq addr 0 && Nat.beq (addr % e.alignBytes) 0 && !e.isUninhabited) with
+    | false => rw [hBase] at h; cases h
+    | true =>
+      rw [hBase] at h; dsimp only at h ⊢
+      cases hB : lookupBorrow mem.borrows p.tag with
+      | some b =>
+        rw [hB] at h; dsimp only at h ⊢
+        cases hDead : !b.allocDead with
+        | false =>
+          rw [hDead, Bool.and_false, Bool.false_and] at h; cases h
+        | true =>
+          rw [hDead] at h; dsimp only at h ⊢
+          cases hTb :
+              (borrowPermAllows b.perm dstMut && true &&
+                !treeBorrowAncestorsChildAccessUB (refAccessKind dstMut) mem.borrows b.parentTag) with
+          | false => rw [hTb] at h; cases h
+          | true => rw [hTb] at h; exact h
+      | none =>
+        rw [hB] at h; dsimp only at h ⊢
+        cases hG : lookupGlobalAlloc mem.globals p.allocId with
+        | none => rw [hG] at h; exact h
+        | some alloc =>
+          rw [hG] at h; dsimp only at h ⊢
+          cases hM : (match dstMut, alloc.mutability with | true, .not => false | _, _ => true) with
+          | false => rw [hM, Bool.false_and] at h; cases h
+          | true => rw [hM, Bool.true_and] at h; exact h
+
 /-- Safe-reference validity of a provenance-less address word (valid only for a
 zero-sized, inhabited concrete type at a wrapped non-null aligned address). -/
 def refAddrValid (ptrBytes : Nat) (e : ProtoVTableEntry) (bits : Nat) : Bool :=
@@ -2251,6 +2330,7 @@ structure ProtoVirtualCallSite : Type where
   slotIdx : Nat
   receiverIsRef : Bool
   receiverIsMut : Bool := false
+  receiverIsPin : Bool := false
 
 /-- Outcome of resolving and entering a virtual call. -/
 inductive ProtoVirtualCallResult : Type where
@@ -2279,26 +2359,82 @@ def unwrapDispatchReceiver (ptrBytes : Nat) : Nat → Value → Option ProtoWide
         | _ => none
       | _ => none
 
-/-- Receiver mutability compatibility between the virtual call site and the
-concrete callee's `_1` parameter: an immutable `&dyn Trait` call site cannot
-dispatch to a callee expecting `&mut Self`. -/
+/-- Extract the inner reference `(mutability, pointee)` when `ty` is
+`core::pin::Pin<&[mut] pointee>`. -/
+def pinInnerRef? (ty : Ty) : Option (Mutability × RigidTy) :=
+  match ty.kind with
+  | .adt path [.ref m pointee] =>
+    match strEq path "core::pin::Pin" with
+    | true => some (m, pointee)
+    | false => none
+  | _ => none
+
+/-- Receiver compatibility between the virtual call site and the concrete
+callee's `_1` parameter:
+* a `Pin<&[mut] dyn Trait>` site must dispatch to a `Pin<&[mut] Concrete>`
+  callee (and `Pin<&dyn>` cannot escalate to `Pin<&mut Concrete>`);
+* a `&[mut] dyn Trait` site must dispatch to a `&[mut] Concrete` callee (and
+  `&dyn` cannot escalate to `&mut Concrete`);
+* a raw `*const`/`*mut dyn Trait` site must dispatch to a raw-pointer callee;
+* non-pointer `_1` (e.g. `u64` with size `ptrBytes`) is rejected. -/
 def virtualCalleeReceiverOk (site : ProtoVirtualCallSite) (callee : CapturedMir) : Bool :=
-  match site.receiverIsRef, site.receiverIsMut, get? callee.localDecls 1 with
-  | true, false, some { ty := { kind := .ref .mut _, .. }, .. } => false
-  | _, _, _ => true
+  match get? callee.localDecls 1 with
+  | none => true
+  | some recvDecl =>
+    match site.receiverIsPin, site.receiverIsRef, site.receiverIsMut with
+    | true, _, false =>
+      match pinInnerRef? recvDecl.ty with
+      | some (.not, _) => true
+      | _ => false
+    | true, _, true =>
+      match pinInnerRef? recvDecl.ty with
+      | some (_, _) => true
+      | _ => false
+    | false, true, false =>
+      match recvDecl.ty.kind with
+      | .ref .not _ => true
+      | _ => false
+    | false, true, true =>
+      match recvDecl.ty.kind with
+      | .ref _ _ => true
+      | _ => false
+    | false, false, _ =>
+      match recvDecl.ty.kind with
+      | .rawPtr _ _ => true
+      | _ => false
+
+/-- Trailing argument ABI size compatibility: each argument after the receiver
+whose caller operand has a known byte size must match the callee's captured
+`ArgAbi.layout.size.bytes`. -/
+def virtualTrailingArgsAbiOk
+    (callerBody : CapturedMir) : List ArgAbi → List Operand → Bool
+  | [], [] => true
+  | argAbi :: restAbi, argOp :: restOps =>
+    let ok :=
+      match operandTy callerBody.localDecls callerBody.layouts argOp with
+      | some opTy =>
+        match tyByteSize callerBody.localDecls callerBody.layouts opTy with
+        | some sz => Nat.beq sz argAbi.layout.size.bytes
+        | none => true
+      | none => true
+    ok && virtualTrailingArgsAbiOk callerBody restAbi restOps
+  | _, _ => false
 
 /-- ABI validation of the concrete callee against the call: not an intrinsic
-ABI, the same argument count, compatible receiver mutability, and (when the ABI
-is captured) a pointer-sized thin receiver. -/
-def virtualCalleeAbiOk (ptrBytes : Nat) (site : ProtoVirtualCallSite) (callee : CapturedMir)
-    (argCount : Nat) : Bool :=
+ABI, the same argument count, compatible receiver shape/mutability, pointer-sized
+thin receiver, and matching trailing argument sizes when `callee.fnAbi.args` is
+captured. -/
+def virtualCalleeAbiOk (ptrBytes : Nat) (site : ProtoVirtualCallSite) (callerBody callee : CapturedMir)
+    (argOps : List Operand) (argCount : Nat) : Bool :=
   !callConvEq callee.fnAbi.conv .rustIntrinsic && Nat.beq callee.argCount argCount &&
     virtualCalleeReceiverOk site callee &&
-    (match callee.fnAbi.args with
-     | [] => true
-     | recvAbi :: _ =>
+    (match callee.fnAbi.args, argOps with
+     | [], _ => true
+     | recvAbi :: restAbi, _ :: restOps =>
        Nat.beq (length callee.fnAbi.args) argCount &&
-         Nat.beq recvAbi.layout.size.bytes ptrBytes)
+         Nat.beq recvAbi.layout.size.bytes ptrBytes &&
+         virtualTrailingArgsAbiOk callerBody restAbi restOps
+     | _ :: _, [] => false)
 
 /-- Return ABI compatibility: for non-diverging calls, when the destination
 type has a known size and the callee ABI is captured, the sizes agree. -/
@@ -2318,9 +2454,14 @@ def virtualRetAbiOk (callerBody callee : CapturedMir) (destination : Place)
 pushed, retag the narrowed receiver `_1` with `Trusted`'s own function-entry
 retag (`evalFnEntryRetag`): the callee receives a fresh child tag of the
 caller's borrow tag, protected by a fresh protector in
-`Memory.activeProtectors`. The retag statement index advance is undone, so the
-callee still starts at its first statement. A receiver whose tag has no borrow
-entry (a global referent) is entered without a protector. -/
+`Memory.activeProtectors`. For `Pin<&[mut] Concrete>` callees (where
+`callee.localDecls[1]` is `core::pin::Pin<&[mut] T>`), the inner reference is
+retagged with `evalFnEntryRetag` (enforcing `rigidTyIsUninhabited`,
+`fnEntryRetagPerm`, `hasTreeReadUB`, `freezeTreeBorrowsOnReadAtProj`, and a
+fresh protected child tag rather than falling through to `attachOnly`) and
+re-wrapped into `Pin`'s single-field aggregate `.aggregate 0 [retaggedPtr]`.
+A receiver whose tag has no borrow entry (a global referent) is entered without
+a protector. -/
 def protectVirtualReceiver (s1 : MachineState) (callee : CapturedMir) (p : ProvenancePtr)
     (ptrBytes : Nat) : ProtoVirtualCallResult :=
   match lookupBorrow s1.memory.borrows p.tag with
@@ -2329,12 +2470,27 @@ def protectVirtualReceiver (s1 : MachineState) (callee : CapturedMir) (p : Prove
     match parentEntry.perm with
     | .disabled => .ub
     | _ =>
+      let (retagDecls, isPinCallee) : List LocalDecl × Bool :=
+        match get? callee.localDecls 1 with
+        | some d =>
+          match pinInnerRef? d.ty with
+          | some (m, pointee) =>
+            let unwrapped : LocalDecl :=
+              { d with ty := { d.ty with kind := .ref m pointee } }
+            ((set? callee.localDecls 1 unwrapped).getD callee.localDecls, true)
+          | none => (callee.localDecls, false)
+        | none => (callee.localDecls, false)
       match
-        evalFnEntryRetag s1 callee.localDecls callee.layouts { local_ := 1, projection := [] } p
+        evalFnEntryRetag s1 retagDecls callee.layouts { local_ := 1, projection := [] } p
           ptrBytes parentEntry s1.frame.locals
       with
       | .tau (.running s2) =>
-        .enter { s2 with frame := { s2.frame with stmtIdx := 0 } } callee
+        let localsFinal :=
+          match isPinCallee, get? s2.frame.locals 1 with
+          | true, some (.init retaggedPtr) =>
+            (set? s2.frame.locals 1 (.init (.aggregate 0 [retaggedPtr]))).getD s2.frame.locals
+          | _, _ => s2.frame.locals
+        .enter { s2 with frame := { s2.frame with stmtIdx := 0, locals := localsFinal } } callee
           (match lookupBorrow s2.memory.borrows s1.memory.nextTag with
            | some _ => some s1.memory.nextTag
            | none => none)
@@ -2415,19 +2571,23 @@ def evalVirtualCallProtoOpt
                     | none => .externalCall defPath (thinRecv :: rest) locals'
                     | some callee =>
                       match
-                        virtualCalleeAbiOk ptrBytes site callee (length argVals) &&
+                        virtualCalleeAbiOk ptrBytes site callerBody callee argOps (length argVals) &&
                           virtualRetAbiOk callerBody callee destination target
                       with
                       | false => .ub
                       | true =>
+                        let calleeRecv :=
+                          match site.receiverIsPin with
+                          | true => .aggregate 0 [thinRecv]
+                          | false => thinRecv
                         let s1 :=
                           match target with
                           | some bb =>
                             pushCalleeFrame s callerBody locals' destination bb callee
-                              (thinRecv :: rest) unwind
+                              (calleeRecv :: rest) unwind
                           | none =>
                             pushDivergingCalleeFrame s callerBody locals' destination unwind callee
-                              (thinRecv :: rest)
+                              (calleeRecv :: rest)
                         match site.receiverIsRef, d' with
                         | true, .prov p => protectVirtualReceiver s1 callee p ptrBytes
                         | _, _ => .enter s1 callee none
@@ -3298,33 +3458,36 @@ inductive VirtualSiteResolution : Type where
   | site (site : ProtoVirtualCallSite)
 
 /-- Receiver class of a virtual call from the type of its first argument:
-`(isRef, isMut)`. A reference `&[mut] dyn Trait` and a `Pin<&[mut] dyn Trait>`
-wrapper (whose inner reference Miri retags with a function-entry protector,
-`RetagFields`) are reference receivers; a raw pointer is not. Every other
-`DispatchFromDyn` receiver (`Box<dyn Trait>`, `Rc<Self>`, unknown types) fails
-closed with `none`: classifying it as raw would skip the safe-reference
-validity check and the receiver protector. -/
-def classifyVirtualReceiver : Option Ty → Option (Bool × Bool)
-  | some { kind := .ref m _, .. } => some (true, V06.lowerMut m)
-  | some { kind := .rawPtr _ _, .. } => some (false, false)
-  | some { kind := .adt path [.ref m _], .. } =>
+`(isRef, isMut, isPin)`. Only pointer-to-`dyn` receivers (`&[mut] dyn Trait`,
+`*[const/mut] dyn Trait`) and `Pin<&[mut] dyn Trait>` wrappers (whose inner
+reference Miri retags with a function-entry protector, `RetagFields`) are
+classified; non-`dyn` pointees (e.g. `&u32`, `Pin<&mut u32>`) and other
+`DispatchFromDyn` wrappers (`Box<dyn Trait>`, `Rc<dyn Trait>`, unknown types)
+fail closed with `none`. -/
+def classifyVirtualReceiver : Option Ty → Option (Bool × Bool × Bool)
+  | some { kind := .ref m (.dynamic _), .. } => some (true, V06.lowerMut m, false)
+  | some { kind := .rawPtr _ (.dynamic _), .. } => some (false, false, false)
+  | some { kind := .adt path [.ref m (.dynamic _)], .. } =>
     match strEq path "core::pin::Pin" with
-    | true => some (true, V06.lowerMut m)
+    | true => some (true, V06.lowerMut m, true)
     | false => none
   | _ => none
 
 /-- **Receiver classification fails closed.** A wrapper receiver other than
-`Pin<&[mut] _>` (for example `Box<dyn Trait>`) and an untyped receiver are never
-classified as raw pointers; `Pin<&mut dyn Trait>` is a mutable reference
-receiver. -/
+`Pin<&[mut] dyn _>` (for example `Box<dyn Trait>` or `Pin<&mut u32>`), a
+non-`dyn` reference `&u32`, and an untyped receiver are never classified;
+`Pin<&mut dyn Trait>` is classified as `(isRef := true, isMut := true, isPin := true)`. -/
 theorem classifyVirtualReceiver_fail_closed (path : String) (args : List RigidTy) (idx : Nat)
     (hPin : strEq path "core::pin::Pin" = false) :
     classifyVirtualReceiver (some { kind := .adt path args, layoutIdx := idx }) = none ∧
     classifyVirtualReceiver none = none ∧
     classifyVirtualReceiver
+      (some { kind := .adt "core::pin::Pin" [.ref .mut (.uint .u32)], layoutIdx := idx }) = none ∧
+    classifyVirtualReceiver (some { kind := .ref .not (.uint .u32), layoutIdx := idx }) = none ∧
+    classifyVirtualReceiver
       (some { kind := .adt "core::pin::Pin" [.ref .mut (.dynamic "T")], layoutIdx := idx }) =
-        some (true, true) := by
-  refine ⟨?_, rfl, ?_⟩
+        some (true, true, true) := by
+  refine ⟨?_, rfl, rfl, rfl, ?_⟩
   · unfold classifyVirtualReceiver
     split
     · rename_i h; cases h
@@ -3342,10 +3505,11 @@ theorem classifyVirtualReceiver_fail_closed (path : String) (args : List RigidTy
 
 /-- A call is virtual when its callee is a registered virtual method whose
 `Self` type argument is a trait object (`<dyn Trait as Trait>::method`). The
-receiver kind and mutability come from the type of the first argument. A
-registered virtual method whose predicate list was not captured fails closed;
-a callee that is not a registered virtual method is left to `stepMirFn` (which
-requests an external call when no body is linked). -/
+receiver kind, mutability, and `Pin` wrapper status come from the type of the
+first argument. A registered virtual method whose predicate list was not
+captured or whose receiver type is unsupported fails closed; a callee that is
+not a registered virtual method is left to `stepMirFn` (which requests an
+external call when no body is linked). -/
 def virtualCallSite? (prog : ProtoDynProgram) (callerBody : CapturedMir) (func : Operand)
     (argOps : List Operand) : VirtualSiteResolution :=
   match extractCallee? func with
@@ -3361,10 +3525,10 @@ def virtualCallSite? (prog : ProtoDynProgram) (callerBody : CapturedMir) (func :
         | recvOp :: _ =>
           match classifyVirtualReceiver (operandTy callerBody.localDecls callerBody.layouts recvOp) with
           | none => .unsupported
-          | some (isRef, isMut) =>
+          | some (isRef, isMut, isPin) =>
             .site
               { traitPred := pred, slotIdx := slotIdx, receiverIsRef := isRef,
-                receiverIsMut := isMut }
+                receiverIsMut := isMut, receiverIsPin := isPin }
   | _ => .notVirtual
 
 /-- A borrow entry targets the local `loc` of the frame at depth `depth`. -/
@@ -3454,54 +3618,126 @@ def assignWholeLocalProto (s : MachineState) (locals' : List LocalSlot) (mem' : 
 /-- Classification of `&raw const (*src)` / `&raw mut (*src)` on a trait-object
 pointer `src`.
 
-Creating a raw pointer performs no memory access and no retag under Tree
-Borrows (Miri does not retag raw pointers; MiniRust's `AddrOf Raw` only
-re-wraps the pointer), so the result is the same wide pointer whatever the
-permission of the borrow tag is: a `.disabled` or `.frozen` tag is *not* UB
-here (it becomes UB at the first access through the raw pointer). The only
-rejection is `&raw mut (*r)` with `r : &dyn Trait`, which `rustc` refuses to
-compile (E0596): such MIR is ill formed and fails closed with `.unsupported`.
+* Creating a raw pointer performs **no Tree Borrows access and no retag** (Miri
+  does not retag raw pointers; MiniRust `checkPtrM` on `MachTB` does not check
+  Tree Borrows permissions): a valid live reference whose borrow tag is
+  `.disabled` or `.frozen` is *not* UB here.
+* However, reading a reference `r : &dyn Trait` / `&mut dyn Trait` STILL
+  requires safe-reference value validity (`resolveVTablePtr` +
+  `refDataValidNoTB` / `refAddrValid`, matching MiniRust `checkPtrM` on
+  `PtrType.Ref`): a null, misaligned, dead, out-of-bounds, uninhabited, or
+  invalid-vtable `&dyn Trait` is UB, while an unresolved predicate or bad
+  vtable environment fails closed (`.unsupported`).
+* `&raw mut (*r)` with `r : &dyn Trait` is ill-typed MIR (`rustc` E0596) and
+  fails closed with `.unsupported`.
+* `&raw const/mut (*p)` on a raw `*const`/`*mut dyn Trait` returns `.ok v` with
+  no safe-reference check.
 Returns `none` to fall through to `stepMirFn`. -/
 def dynRawBorrowProto?
-    (ptrBytes : Nat) (mutKind : Mutability) (locals : List LocalSlot)
-    (localDecls : List LocalDecl) (srcPlace : Place) : Option (ProtoRes Value) :=
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (mutKind : Mutability) (locals : List LocalSlot)
+    (mem : Memory) (localDecls : List LocalDecl) (layouts : LayoutTable) (srcPlace : Place) :
+    Option (ProtoRes Value) :=
   match srcPlace.projection with
   | [.deref] =>
     match get? locals srcPlace.local_ with
     | some (.init v) =>
       match decodeWidePtr? ptrBytes v with
-      | some ⟨_, .vtable _⟩ =>
+      | some ⟨d, .vtable vtPtr⟩ =>
         match get? localDecls srcPlace.local_ with
-        | some { ty := { kind := .ref srcMut (.dynamic _), .. }, .. } =>
+        | some { ty := { kind := .ref srcMut (.dynamic traitKey), .. }, .. } =>
           match unsizeMutCompatible (V06.lowerMut srcMut) (V06.lowerMut mutKind) with
           | false => some .unsupported
-          | true => some (.ok v)
+          | true =>
+            match lookupDynPred vt.dynTypes traitKey with
+            | none => some .unsupported
+            | some pred =>
+              match pred.failsClosed with
+              | true => some .unsupported
+              | false =>
+                match vtableEnvOk ptrBytes vt mem with
+                | false => some .unsupported
+                | true =>
+                  match resolveVTablePtr vt pred vtPtr with
+                  | .invalidPointer => some .ub
+                  | .invalidTrait => some .ub
+                  | .ok e =>
+                    let valid :=
+                      match wrapDataWord ptrBytes d with
+                      | .prov p => refDataValidNoTB ptrBytes e p locals mem localDecls layouts
+                      | .addr bits => refAddrValid ptrBytes e bits
+                    match valid with
+                    | true => some (.ok v)
+                    | false => some .ub
         | some { ty := { kind := .rawPtr _ (.dynamic _), .. }, .. } => some (.ok v)
         | _ => some .unsupported
       | _ => none
     | _ => none
   | _ => none
 
-/-- **Raw borrows of a `dyn` place perform no Tree Borrows check.** Whatever the
-borrow table says (a `.disabled` or `.frozen` tag included), `&raw const (*r)`
-of a `&dyn Trait` / `&mut dyn Trait` local `r` holding a trait-object pointer
-returns that pointer unchanged. -/
+/-- **Raw borrows of a valid live `dyn` reference perform no Tree Borrows
+permission check.** Even if the borrow tag's permission is `.disabled` or
+`.frozen`, `&raw const (*r)` succeeds whenever the vtable resolves and
+`refDataValidNoTB` holds (matching MiniRust `checkPtrM` on `MachTB`). -/
 theorem dynRawBorrowProto?_ignores_borrow_state
-    (ptrBytes : Nat) (locals : List LocalSlot) (localDecls : List LocalDecl) (r : Local)
-    (v : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (decl : LocalDecl)
-    (m : Mutability) (traitKey : String)
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (locals : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (r : Local)
+    (v : Value) (p : ProvenancePtr) (vtPtr : ProvenancePtr) (decl : LocalDecl)
+    (m : Mutability) (traitKey : String) (pred : ProtoTraitPred) (e : ProtoVTableEntry)
     (hSlot : get? locals r = some (.init v))
-    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨.prov p, .vtable vtPtr⟩)
     (hDecl : get? localDecls r = some decl)
-    (hTy : decl.ty.kind = .ref m (.dynamic traitKey)) :
-    dynRawBorrowProto? ptrBytes .not locals localDecls { local_ := r, projection := [.deref] } =
-      some (.ok v) := by
+    (hTy : decl.ty.kind = .ref m (.dynamic traitKey))
+    (hPred : lookupDynPred vt.dynTypes traitKey = some pred)
+    (hFail : pred.failsClosed = false)
+    (hEnv : vtableEnvOk ptrBytes vt mem = true)
+    (hRes : resolveVTablePtr vt pred vtPtr = .ok e)
+    (hValid : refDataValidNoTB ptrBytes e p locals mem localDecls layouts = true) :
+    dynRawBorrowProto? vt ptrBytes .not locals mem localDecls layouts
+      { local_ := r, projection := [.deref] } = some (.ok v) := by
   obtain ⟨mu, ⟨kind, idx⟩, dn⟩ := decl
   simp only at hTy
   subst hTy
   unfold dynRawBorrowProto?
-  simp only [hSlot, hDec, hDecl]
+  simp only [hSlot, hDec, hDecl, hPred, hFail, hEnv, hRes, wrapDataWord, hValid]
   cases m <;> rfl
+
+/-- **Raw borrows of an invalid `&dyn Trait` reference fault UB.** If `r` has
+reference type `&dyn Trait` / `&mut dyn Trait` and carries an invalid vtable
+pointer or fails `refDataValidNoTB` (null, misaligned, dead, out-of-bounds, or
+uninhabited), `&raw const (*r)` is UB. -/
+theorem dynRawBorrowProto?_invalid_ref_ub
+    (vt : ProtoVTableTable) (ptrBytes : Nat) (locals : List LocalSlot) (mem : Memory)
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (r : Local)
+    (v : Value) (d : ProtoDataWord) (vtPtr : ProvenancePtr) (decl : LocalDecl)
+    (m : Mutability) (traitKey : String) (pred : ProtoTraitPred)
+    (hSlot : get? locals r = some (.init v))
+    (hDec : decodeWidePtr? ptrBytes v = some ⟨d, .vtable vtPtr⟩)
+    (hDecl : get? localDecls r = some decl)
+    (hTy : decl.ty.kind = .ref m (.dynamic traitKey))
+    (hPred : lookupDynPred vt.dynTypes traitKey = some pred)
+    (hFail : pred.failsClosed = false)
+    (hEnv : vtableEnvOk ptrBytes vt mem = true)
+    (hBad :
+      (∀ e, resolveVTablePtr vt pred vtPtr ≠ .ok e) ∨
+      (∃ e, resolveVTablePtr vt pred vtPtr = .ok e ∧
+        (match wrapDataWord ptrBytes d with
+         | .prov p => refDataValidNoTB ptrBytes e p locals mem localDecls layouts
+         | .addr bits => refAddrValid ptrBytes e bits) = false)) :
+    dynRawBorrowProto? vt ptrBytes .not locals mem localDecls layouts
+      { local_ := r, projection := [.deref] } = some .ub := by
+  obtain ⟨mu, ⟨kind, idx⟩, dn⟩ := decl
+  simp only at hTy
+  subst hTy
+  unfold dynRawBorrowProto?
+  have hMut : unsizeMutCompatible (V06.lowerMut m) (V06.lowerMut .not) = true := by
+    cases m <;> rfl
+  simp only [hSlot, hDec, hDecl, hMut, hPred, hFail, hEnv]
+  rcases hBad with hBadVt | ⟨e, hRes, hInv⟩
+  · cases hR : resolveVTablePtr vt pred vtPtr with
+    | ok e => exact absurd hR (hBadVt e)
+    | invalidPointer => rfl
+    | invalidTrait => rfl
+  · simp only [hRes, hInv]
 
 /-- The callee of a call terminator is `core::ptr::addr_eq`. -/
 def isAddrEqCallee (func : Operand) : Bool :=
@@ -3509,7 +3745,8 @@ def isAddrEqCallee (func : Operand) : Bool :=
   | some defPath => strEq defPath "core::ptr::addr_eq"
   | none => false
 
-/-- Detect `core::intrinsics::{size_of_val, align_of_val}` (or `core::mem::*`)
+/-- Detect `core::intrinsics::{size_of_val, align_of_val}` or
+`core::mem::{size_of_val, align_of_val, size_of_val_raw, align_of_val_raw}`
 called on a pointer to `.dynamic traitKey`. Returns `some (isAlign, traitKey)`. -/
 def dynLayoutIntrinsic?
     (currentBody : CapturedMir) (func : Operand) (argOps : List Operand) :
@@ -3521,10 +3758,12 @@ def dynLayoutIntrinsic?
       | some .sizeOfVal => some false
       | some .alignOfVal => some true
       | _ =>
-        match strEq defPath "core::mem::size_of_val" with
+        match strEq defPath "core::mem::size_of_val" ||
+            strEq defPath "core::mem::size_of_val_raw" with
         | true => some false
         | false =>
-          match strEq defPath "core::mem::align_of_val" with
+          match strEq defPath "core::mem::align_of_val" ||
+              strEq defPath "core::mem::align_of_val_raw" with
           | true => some true
           | false => none
     match isAlign? with
@@ -3547,7 +3786,7 @@ def dynLayoutIntrinsic?
   | none => none
 
 /-- Step `size_of_val` / `align_of_val` on a pointer to `.dynamic traitKey`
-using `dynSizeOfValProto` / `dynAlignOfValProto`. -/
+using `dynSizeOfValProto` / `dynAlignOfValProto`, guarded by `vtableEnvOk`. -/
 def stepDynLayoutIntrinsicProto
     (vt : ProtoVTableTable) (isAlign : Bool) (traitKey : String) (s : MachineState)
     (currentBody : CapturedMir) (argOps : List Operand) (destination : Place)
@@ -3563,14 +3802,20 @@ def stepDynLayoutIntrinsicProto
     match lookupDynPred vt.dynTypes traitKey with
     | none => MirStepNode.unsupported
     | some pred =>
-      let res :=
-        match isAlign with
-        | false => dynSizeOfValProto vt ptrBytes pred ptrVal
-        | true => dynAlignOfValProto vt ptrBytes pred ptrVal
-      match res with
-      | .ok n => writeIntrinsicReturn s locals' destination target (.scalar ⟨n, ptrBytes⟩)
-      | .ub => MirStepNode.fail .ub
-      | .unsupported => MirStepNode.unsupported
+      match pred.failsClosed with
+      | true => MirStepNode.unsupported
+      | false =>
+        match vtableEnvOk ptrBytes vt s.memory with
+        | false => MirStepNode.unsupported
+        | true =>
+          let res :=
+            match isAlign with
+            | false => dynSizeOfValProto vt ptrBytes pred ptrVal
+            | true => dynAlignOfValProto vt ptrBytes pred ptrVal
+          match res with
+          | .ok n => writeIntrinsicReturn s locals' destination target (.scalar ⟨n, ptrBytes⟩)
+          | .ub => MirStepNode.fail .ub
+          | .unsupported => MirStepNode.unsupported
   | .ok _ _ => MirStepNode.fail .ub
 
 /-- Call `core::ptr::addr_eq(p, q)`: evaluate both arguments, compare the data
@@ -3615,8 +3860,8 @@ def stepMirFnProto (prog : ProtoDynProgram) (body : CapturedMir) (s : MachineSta
         | .assign place (.rawPtr mutKind srcPlace) =>
           match
             place.projection,
-            dynRawBorrowProto? (layoutPointerBytes currentBody.layouts) mutKind s.frame.locals
-              currentBody.localDecls srcPlace
+            dynRawBorrowProto? prog.vtables (layoutPointerBytes currentBody.layouts) mutKind
+              s.frame.locals s.memory currentBody.localDecls currentBody.layouts srcPlace
           with
           | [], some (.ok v) => assignWholeLocalProto s s.frame.locals s.memory place.local_ v
           | [], some .ub => MirStepNode.fail .ub
@@ -4323,6 +4568,82 @@ theorem checkPtrM_ref_dyn_rejects_invalid (L : DynLayout M) (vt : ProtoVTableTab
     dsimp only
     rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, hNzB, ensureElseUb_true, bind_ok_interp,
       hAl, ensureElseUb_true, bind_ok_interp, ensureElseUb_false, bind_ub_interp]
+
+/-- **Universal MiniRust safe-reference positive acceptance and
+non-dereferenceability correspondence (`checkPtrM` on `PtrType.Ref`).**
+Completes `checkPtrM_ref_dyn_rejects_invalid`: on a safe `&dyn Trait` /
+`&mut dyn Trait` pointer with a valid vtable pointer, `size <= isize::MAX`,
+non-null aligned data pointer, and `inhabited = true`, `checkPtrM` succeeds
+when `ConcurrentMemory.dereferenceable` succeeds and raises
+`"Value::Ptr: non-dereferenceable safe pointer"` when `dereferenceable` raises
+UB — across EVERY memory model `M` (including `Mach` and `MachTB`). -/
+theorem checkPtrM_ref_dyn_ok_and_nonderef (L : DynLayout M) (vt : ProtoVTableTable)
+    (m : Gen.Machine M) (ptrBytes : Nat) (e : ProtoVTableEntry)
+    (mutbl : LibSpecr.Mutability) (freeze unpin : Bool)
+    (dataPtr : Gen.ThinPointer (Gen.Memory.Provenance M))
+    (hProv : ∀ x y, L.provOf x = L.provOf y → x = y)
+    (hWf : wfProtoVTableTable ptrBytes vt = true)
+    (hLook : lookupVTableByAlloc vt.entries e.vtableAllocId = some e)
+    (hVtBounds : inBounds (vtPtr L e).addr .Unsigned x86_64.PTR_SIZE = true)
+    (hSizeSigned : inBounds (e.sizeBytes : Int) .Signed x86_64.PTR_SIZE = true)
+    (hDataBounds : inBounds dataPtr.addr .Unsigned x86_64.PTR_SIZE = true)
+    (hNz : dataPtr.addr ≠ 0)
+    (hAlign : Align.is_aligned ⟨e.alignBytes⟩ dataPtr.addr = true) :
+    (ConcurrentMemory.dereferenceable m.mem dataPtr ⟨e.sizeBytes⟩ = .ok () →
+      checkPtrM
+          { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }
+          (.Ref mutbl
+            { layout := .TraitObject (traitName L e.traitPred), inhabited := true,
+              unsafe_cells := .TraitObject, freeze := freeze, unpin := unpin })
+          (some (installVTables L vt m)) = .ok ()) ∧
+    (∀ msg, ConcurrentMemory.dereferenceable m.mem dataPtr ⟨e.sizeBytes⟩ = .error (.ub msg) →
+      checkPtrM
+          { thin_pointer := dataPtr, metadata := some (.VTablePointer (vtPtr L e)) }
+          (.Ref mutbl
+            { layout := .TraitObject (traitName L e.traitPred), inhabited := true,
+              unsafe_cells := .TraitObject, freeze := freeze, unpin := unpin })
+          (some (installVTables L vt m)) = ub "Value::Ptr: non-dereferenceable safe pointer") := by
+  have hMeta :=
+    (checkPtrMetadataM_install_correspondence L vt m ptrBytes e.vtableAllocId e
+      (traitName L e.traitPred) hProv hWf hLook hVtBounds).1
+  have hLk := (vtableFromPtrM_install_ok L vt m ptrBytes e.vtableAllocId e hProv hWf hLook).2
+  have hNzB : (dataPtr.addr != 0) = true := bne_iff_ne.mpr hNz
+  refine ⟨?_, ?_⟩
+  · intro hDeref
+    unfold checkPtrM
+    rw [hDataBounds, ensureElseUb_true, bind_ok_interp]
+    dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map_some, vtPtr]
+    rw [hMeta, bind_ok_interp]
+    dsimp only [PtrType.safe_pointee, LayoutStrategy.compute_size_and_align]
+    rw [hLk, bind_ok_interp]
+    dsimp only [vtableOf]
+    rw [bind_pure_interp]
+    dsimp only
+    rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, hNzB, ensureElseUb_true, bind_ok_interp,
+      hAlign, ensureElseUb_true, bind_ok_interp, ensureElseUb_true, bind_ok_interp]
+    change (match ConcurrentMemory.dereferenceable m.mem dataPtr ⟨e.sizeBytes⟩ with
+            | .ok () => pure ()
+            | .error (.ub _) => ub "Value::Ptr: non-dereferenceable safe pointer"
+            | .error err => .error err) = .ok ()
+    rw [hDeref]
+    rfl
+  · intro msg hDeref
+    unfold checkPtrM
+    rw [hDataBounds, ensureElseUb_true, bind_ok_interp]
+    dsimp only [PtrType.meta_kind, LayoutStrategy.meta_kind, Option.map_some, vtPtr]
+    rw [hMeta, bind_ok_interp]
+    dsimp only [PtrType.safe_pointee, LayoutStrategy.compute_size_and_align]
+    rw [hLk, bind_ok_interp]
+    dsimp only [vtableOf]
+    rw [bind_pure_interp]
+    dsimp only
+    rw [hSizeSigned, ensureElseUb_true, bind_ok_interp, hNzB, ensureElseUb_true, bind_ok_interp,
+      hAlign, ensureElseUb_true, bind_ok_interp, ensureElseUb_true, bind_ok_interp]
+    change (match ConcurrentMemory.dereferenceable m.mem dataPtr ⟨e.sizeBytes⟩ with
+            | .ok () => pure ()
+            | .error (.ub _) => ub "Value::Ptr: non-dereferenceable safe pointer"
+            | .error err => .error err) = ub "Value::Ptr: non-dereferenceable safe pointer"
+    rw [hDeref]
 
 omit [MemoryOps M] in
 /-- Slot lookup in `methodsFrom` agrees with `get? slots` on every `.method` slot. -/
