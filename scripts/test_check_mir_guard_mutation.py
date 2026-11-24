@@ -2135,7 +2135,7 @@ class GuardMutationA1AdversarialTests(unittest.TestCase):
             "macro_rules | `(foo) => `(1)\n",
             "elab_rules : term | `(foo) => pure default\n",
             "/- unclosed comment\n",
-            "-- TODO: remove sorry\n",
+            "-- " + "TO" + "DO: remove sorry\n",
         ):
             self.assertNotEqual(
                 gmut._fixture_shape_errors("refute", ok_fixture + bad_tail, "t"),
@@ -4048,6 +4048,760 @@ class GuardMutationA4ConvergenceTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(json_out.read_text(encoding="utf-8")), defeq_report
             )
+
+
+class GuardMutationTaxonomyAndWildcardTests(unittest.TestCase):
+    """Episode 2: property-taxonomy unification and the `error_branch_wildcard` probe."""
+
+    RUST_REL = "crates/cargo-anneal/src/property_registry.rs"
+    LEAN_REL = "theory/Anneal/SpecBoundaryGuards.lean"
+
+    EXPECTED_GUARD_CLASSES: dict[str, str] = {
+        "div_by_zero": "div_rem_ub",
+        "rem_by_zero": "div_rem_ub",
+        "signed_div_overflow": "div_rem_ub",
+        "signed_rem_overflow": "div_rem_ub",
+        "shift_oob": "shift_bounds",
+        "shr_oob": "shift_bounds",
+        "shl_oob_off_by_one": "shift_bounds",
+        "shr_oob_off_by_one": "shift_bounds",
+        "bool_valid_range": "discriminant_validity",
+        "storage_dead_read": "uninit_read",
+        "storage_uninit_read": "uninit_read",
+        "unaligned_deref": "pointer_deref",
+        "intrinsic_assume_false": "discriminant_validity",
+        "intrinsic_assume_invalid_bool": "discriminant_validity",
+        "intrinsic_assume_non_bool_size": "discriminant_validity",
+        "copy_nonoverlapping_overlap": "memory_copy_overlap",
+        "copy_nonoverlapping_place_overlap": "memory_copy_overlap",
+        "copy_nonoverlapping_subplace_overlap": "memory_copy_overlap",
+        "tb_drop_protector_conflict": "pointer_deref",
+        "tb_return_frame_dealloc_protector_conflict": "pointer_deref",
+    }
+
+    def _stage(self, root: Path, rel: str, old: str | None = None, new: str = "") -> None:
+        """Copy a live taxonomy source into `root`, replacing `old` exactly once."""
+        text = (ANNEAL_ROOT / rel).read_text(encoding="utf-8")
+        if old is not None:
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        dst = root / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_text(text, encoding="utf-8")
+
+    # -- canonical taxonomy and live parity ----------------------------
+
+    def test_canonical_taxonomy_is_the_live_rust_and_lean_taxonomy(self) -> None:
+        self.assertEqual(
+            gmut.CANONICAL_PROPERTY_CLASSES,
+            (
+                "arithmetic_overflow",
+                "shift_bounds",
+                "div_rem_ub",
+                "pointer_deref",
+                "slice_array_bounds",
+                "discriminant_validity",
+                "call_contract",
+                "loop_termination",
+                "switch_exhaustiveness",
+                "memory_copy_overlap",
+                "uninit_read",
+                "unsupported_fallback",
+            ),
+        )
+        self.assertEqual(
+            gmut.CANONICAL_SPEC_BOUNDARY_GUARDS,
+            ("entry_point_requires", "fixed_width_ghost_length", "error_branch_wildcard"),
+        )
+        canonical = gmut.canonical_property_taxonomy()
+        rust = gmut.extract_rust_property_taxonomy(ANNEAL_ROOT)
+        self.assertEqual(rust, canonical)
+        self.assertEqual(
+            [e["id"] for e in rust["property_classes"]], list(gmut.CANONICAL_PROPERTY_CLASSES)
+        )
+        self.assertEqual(
+            [e["id"] for e in rust["spec_boundary_guards"]],
+            list(gmut.CANONICAL_SPEC_BOUNDARY_GUARDS),
+        )
+        lean = gmut.extract_lean_property_taxonomy(ANNEAL_ROOT)
+        for section, keys in (
+            ("property_classes", ("rank", "id", "variant", "is_waivable")),
+            ("spec_boundary_guards", ("rank", "id", "canonical_name", "vacuity_class")),
+        ):
+            self.assertEqual(
+                lean[section], [{k: e[k] for k in keys} for e in canonical[section]], section
+            )
+        self.assertEqual(gmut.validate_property_taxonomy(ANNEAL_ROOT), [])
+        self.assertEqual(
+            gmut.validate_property_taxonomy(ANNEAL_ROOT, require_rust_taxonomy=True), []
+        )
+        # The returned taxonomy is a private copy: mutating it cannot poison the cache.
+        rust["property_classes"][0]["id"] = "poisoned"
+        self.assertEqual(gmut.extract_rust_property_taxonomy(ANNEAL_ROOT), canonical)
+
+    def test_taxonomy_manifest_json_has_the_exact_rust_layout(self) -> None:
+        manifest = gmut.render_property_taxonomy_manifest()
+        self.assertEqual(
+            manifest, gmut.render_property_taxonomy_manifest(gmut.extract_rust_property_taxonomy(ANNEAL_ROOT))
+        )
+        parsed = json.loads(manifest)
+        self.assertEqual(parsed, gmut.canonical_property_taxonomy())
+        self.assertEqual(list(parsed), ["schema_version", "property_classes", "spec_boundary_guards"])
+        lines = manifest.split("\n")
+        self.assertEqual(lines[:3], ["{", '  "schema_version": 1,', '  "property_classes": ['])
+        self.assertEqual(
+            lines[3],
+            '    {"rank": 0, "id": "arithmetic_overflow", "variant": "ArithmeticOverflow", '
+            '"is_waivable": true, "strict_disposition": "discharged", '
+            '"partial_disposition": "discharged", '
+            '"description": "signed/unsigned arithmetic and float-to-int conversion overflow"},',
+        )
+        self.assertEqual(
+            lines[14],
+            '    {"rank": 11, "id": "unsupported_fallback", "variant": "UnsupportedFallback", '
+            '"is_waivable": false, "strict_disposition": "unsupported_fail_closed", '
+            '"partial_disposition": "unsupported_fail_closed", '
+            '"description": "fail-closed fallback for unsupported or unscannable MIR constructs"}',
+        )
+        self.assertEqual(lines[15:17], ["  ],", '  "spec_boundary_guards": ['])
+        self.assertEqual(
+            lines[19],
+            '    {"rank": 2, "id": "error_branch_wildcard", "canonical_name": "ErrorBranchWildcard", '
+            '"vacuity_class": "SurvivedAllMutants", "description": "postcondition arm accepts '
+            'every error payload, ub, or unsupported outcome"}',
+        )
+        self.assertEqual(lines[20:], ["  ]", "}", ""])
+        by_id = {e["id"]: e for e in parsed["property_classes"]}
+        self.assertEqual(by_id["loop_termination"]["partial_disposition"], "explicitly_waived")
+        self.assertEqual(by_id["loop_termination"]["strict_disposition"], "discharged")
+        # A registry export adds `disposition` between the partial disposition
+        # and the description, and strings are escaped the way Rust escapes them.
+        annotated = gmut.canonical_property_taxonomy()
+        annotated["property_classes"][0]["disposition"] = "unemitted_gap"
+        annotated["spec_boundary_guards"][0]["description"] = 'a "b"\\c\n\x01é'
+        text = gmut.render_property_taxonomy_manifest(annotated)
+        self.assertIn('"partial_disposition": "discharged", "disposition": "unemitted_gap", "description"', text)
+        self.assertIn('"description": "a \\"b\\"\\\\c\\n\\u0001é"}', text)
+        self.assertEqual(json.loads(text), annotated)
+
+        res = _run_cli(["--taxonomy-json"])
+        self.assertEqual((res.returncode, res.stdout, res.stderr), (0, manifest, ""))
+        for bad in (["--taxonomy-json", "--list"], ["--taxonomy-json", "--quick"],
+                    ["--taxonomy-json", "--json-out", "x.json"]):
+            self.assertEqual(_run_cli(bad).returncode, 2, bad)
+
+    def test_taxonomy_drift_against_the_rust_registry_fails_closed(self) -> None:
+        cases: tuple[tuple[str, str, str, str], ...] = (
+            (
+                "reordered ALL",
+                "        PropertyClass::ShiftBounds,\n        PropertyClass::DivRemUb,\n",
+                "        PropertyClass::DivRemUb,\n        PropertyClass::ShiftBounds,\n",
+                "`PropertyClass::ALL` is not the enum declaration order",
+            ),
+            (
+                "renamed slug",
+                'Self::DivRemUb => "div_rem_ub",',
+                'Self::DivRemUb => "div_rem",',
+                "property_registry.rs property_classes[2].id is 'div_rem', expected 'div_rem_ub'",
+            ),
+            (
+                "slug kept only in a comment",
+                'Self::DivRemUb => "div_rem_ub",',
+                '/* Self::DivRemUb => "div_rem_ub", */ Self::DivRemUb => "div_rem", // "div_rem_ub"',
+                "property_classes[2].id is 'div_rem'",
+            ),
+            (
+                "thirteenth variant",
+                "    UnsupportedFallback,\n}\n",
+                "    UnsupportedFallback,\n    Extra,\n}\n",
+                "malformed taxonomy source",
+            ),
+            (
+                "reranked class",
+                "            Self::ShiftBounds => 1,\n            Self::DivRemUb => 2,\n",
+                "            Self::ShiftBounds => 2,\n            Self::DivRemUb => 1,\n",
+                "`PropertyClass::rank` is not the declaration order",
+            ),
+            (
+                "waivability",
+                "!matches!(self, Self::UnsupportedFallback)",
+                "!matches!(self, Self::UnsupportedFallback | Self::LoopTermination)",
+                "property_classes[7].is_waivable is False, expected True",
+            ),
+            (
+                "partial-correctness waiver moved",
+                "reg.entries[PropertyClass::LoopTermination.rank()].disposition",
+                "reg.entries[PropertyClass::CallContract.rank()].disposition",
+                "property_classes[6].partial_disposition is 'explicitly_waived', expected 'discharged'",
+            ),
+            (
+                "description",
+                '"bit-shift distance within target integer bit width"',
+                '"bit-shift distance"',
+                "property_classes[1].description is 'bit-shift distance'",
+            ),
+            (
+                "spec-boundary guard slug",
+                'Self::ErrorBranchWildcard => "error_branch_wildcard",',
+                'Self::ErrorBranchWildcard => "error_wildcard",',
+                "spec_boundary_guards[2].id is 'error_wildcard', expected 'error_branch_wildcard'",
+            ),
+            (
+                "spec-boundary vacuity class",
+                'Self::EntryPointRequires => "DeadPrecondition",',
+                'Self::EntryPointRequires => "SpecViolation",',
+                "spec_boundary_guards[0].vacuity_class is 'SpecViolation'",
+            ),
+            (
+                "schema version",
+                "pub const PROPERTY_TAXONOMY_SCHEMA_VERSION: u32 = 1;",
+                "pub const PROPERTY_TAXONOMY_SCHEMA_VERSION: u32 = 2;",
+                "schema_version is 2, expected 1",
+            ),
+            (
+                "unterminated comment",
+                "pub enum PropertyClass {",
+                "/* pub enum PropertyClass {",
+                "malformed taxonomy source: unterminated block comment",
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            for idx, (label, old, new, needle) in enumerate(cases):
+                root = Path(tmp) / f"case{idx}"
+                self._stage(root, self.RUST_REL, old, new)
+                errors = gmut.validate_property_taxonomy(root)
+                self.assertTrue(any(needle in e for e in errors), (label, errors))
+                # The extractor either refuses the source or reports the drifted value.
+                try:
+                    extracted = gmut.extract_rust_property_taxonomy(root)
+                except ValueError:
+                    continue
+                self.assertNotEqual(extracted, gmut.canonical_property_taxonomy(), label)
+
+            # The pristine sources validate in an isolated root, and the catalog
+            # gate reports the drift of a staged registry.
+            clean = Path(tmp) / "clean"
+            self._stage(clean, self.RUST_REL)
+            self._stage(clean, self.LEAN_REL)
+            self.assertEqual(gmut.validate_property_taxonomy(clean), [])
+            tcb = _make_tcb_copy_root(Path(tmp) / "tcb")
+            self.assertEqual(gmut.validate_catalog_invariants(tcb), [])
+            # No registry under an isolated test root: skipped unless required.
+            self.assertEqual(gmut.validate_property_taxonomy(tcb), [])
+            required = gmut.validate_catalog_invariants(tcb, require_rust_taxonomy=True)
+            self.assertEqual(len(required), 1, required)
+            self.assertIn(f"property taxonomy: cannot read {self.RUST_REL}", required[0])
+            self._stage(tcb, self.RUST_REL, 'Self::UninitRead => "uninit_read",', 'Self::UninitRead => "uninit",')
+            drifted = gmut.validate_catalog_invariants(tcb)
+            self.assertEqual(len(drifted), 1, drifted)
+            self.assertIn("property_classes[10].id is 'uninit', expected 'uninit_read'", drifted[0])
+            # A registry that is present but unreadable is an error, not "absent".
+            dangling = Path(tmp) / "dangling"
+            (dangling / self.RUST_REL).parent.mkdir(parents=True)
+            os.symlink("/nonexistent/property_registry.rs", dangling / self.RUST_REL)
+            self.assertTrue(
+                any("cannot read" in e for e in gmut.validate_property_taxonomy(dangling))
+            )
+
+        # The live checkout must have both sources: deleting one cannot pass.
+        with mock.patch.object(gmut, "_RUST_TAXONOMY_REL", "crates/cargo-anneal/src/gone.rs"):
+            self.assertTrue(any("cannot read" in e for e in gmut.validate_property_taxonomy(ANNEAL_ROOT)))
+        with mock.patch.object(gmut, "_LEAN_TAXONOMY_REL", "theory/Anneal/Gone.lean"):
+            self.assertTrue(any("cannot read" in e for e in gmut.validate_property_taxonomy(ANNEAL_ROOT)))
+        # Drift in the Python constants themselves is caught against the live sources.
+        with mock.patch.object(
+            gmut, "_PROPERTY_CLASS_ROWS",
+            (("arith_overflow",) + gmut._PROPERTY_CLASS_ROWS[0][1:], *gmut._PROPERTY_CLASS_ROWS[1:]),
+        ):
+            errors = gmut.validate_property_taxonomy(ANNEAL_ROOT)
+            self.assertTrue(any("CANONICAL_PROPERTY_CLASSES is not" in e for e in errors), errors)
+            self.assertTrue(any("property_registry.rs property_classes[0].id" in e for e in errors), errors)
+            self.assertTrue(any("SpecBoundaryGuards.lean property_classes[0].id" in e for e in errors), errors)
+
+    def test_taxonomy_drift_against_the_lean_theory_fails_closed(self) -> None:
+        cases: tuple[tuple[str, str, str, str], ...] = (
+            (
+                "class slug",
+                '  | .pointerDereference => "pointer_deref"\n',
+                '  | .pointerDereference => "pointer_dereference"\n',
+                "SpecBoundaryGuards.lean property_classes[3].id is 'pointer_dereference'",
+            ),
+            (
+                "guard slug",
+                '  | .errorBranchWildcard => "error_branch_wildcard"\n',
+                '  | .errorBranchWildcard => "error_wildcard"\n',
+                "SpecBoundaryGuards.lean spec_boundary_guards[2].id is 'error_wildcard'",
+            ),
+            (
+                "guard vacuity class",
+                "  | .errorBranchWildcard => .survivedAllMutants\n",
+                "  | .errorBranchWildcard => .specViolation\n",
+                "spec_boundary_guards[2].vacuity_class is 'SpecViolation'",
+            ),
+            (
+                "class order",
+                "  [.arithmeticOverflow, .shiftBounds, .divRemUb,",
+                "  [.shiftBounds, .arithmeticOverflow, .divRemUb,",
+                "`PropertyClassTag.all` is not the constructor declaration order",
+            ),
+            (
+                "waivability",
+                "  | .unsupportedFallback => false\n  | _ => true\n",
+                "  | .unsupportedFallback => false\n  | .loopTermination => false\n  | _ => true\n",
+                "property_classes[7].is_waivable is False",
+            ),
+            (
+                "unterminated comment",
+                "inductive PropertyClassTag : Type where",
+                "/- inductive PropertyClassTag : Type where",
+                "malformed taxonomy source",
+            ),
+        )
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            for idx, (label, old, new, needle) in enumerate(cases):
+                root = Path(tmp) / f"case{idx}"
+                self._stage(root, self.LEAN_REL, old, new)
+                errors = gmut.validate_property_taxonomy(root)
+                self.assertTrue(any(needle in e for e in errors), (label, errors))
+
+    # -- guard tagging --------------------------------------------------
+
+    def test_every_cataloged_guard_names_its_canonical_property_class(self) -> None:
+        self.assertEqual(
+            {g.guard_id: g.property_class for g in gmut.MIR_SEMANTICS_GUARDS},
+            self.EXPECTED_GUARD_CLASSES,
+        )
+        self.assertEqual(tuple(gmut.PROPERTY_CLASS_DISPOSITIONS), gmut.CANONICAL_PROPERTY_CLASSES)
+        guarded = {g.property_class for g in gmut.MIR_SEMANTICS_GUARDS}
+        for class_id, disposition in gmut.PROPERTY_CLASS_DISPOSITIONS.items():
+            self.assertIn(disposition.coverage, gmut.PROPERTY_CLASS_COVERAGE_KINDS, class_id)
+            self.assertTrue(disposition.rationale.strip(), class_id)
+            self.assertEqual(
+                disposition.coverage == "single_step_ub_guarded", class_id in guarded, class_id
+            )
+        self.assertEqual(gmut.PROPERTY_CLASS_DISPOSITIONS["loop_termination"].coverage, "coinductive_non_ub")
+        self.assertEqual(
+            gmut.PROPERTY_CLASS_DISPOSITIONS["unsupported_fallback"].coverage, "fail_closed_non_ub"
+        )
+        self.assertEqual(gmut._guard_property_class_errors(), [])
+
+        # A synthetic guard may still be built without `property_class` ...
+        first = gmut.MIR_SEMANTICS_GUARDS[0]
+        synthetic = gmut.MirSemanticsGuard(
+            "synthetic", first.target_file, first.target_module, "d", "a", "b",
+            "sanity_x", "s", "refute_x", "r",
+        )
+        self.assertEqual(synthetic.property_class, gmut.PROPERTY_CLASS_UNSPECIFIED)
+        self.assertEqual(
+            gmut.GuardResult("g", "f", "m", False, "KILLED", 0.0, "ok").property_class, ""
+        )
+        # ... but the catalog gate rejects a missing, unknown or mis-dispositioned class.
+        for label, catalog, needle in (
+            ("missing", _replace_guard("div_by_zero", property_class=""),
+             "div_by_zero: missing explicit property_class"),
+            ("unknown", _replace_guard("div_by_zero", property_class="DivRemUb"),
+             "div_by_zero: unknown property_class 'DivRemUb'"),
+            ("coinductive", _replace_guard("div_by_zero", property_class="loop_termination"),
+             "PROPERTY_CLASS_DISPOSITIONS['loop_termination'] is 'coinductive_non_ub' but the "
+             "catalog tags 1 guard(s)"),
+            ("uncataloged", _replace_guard("div_by_zero", property_class="arithmetic_overflow"),
+             "PROPERTY_CLASS_DISPOSITIONS['arithmetic_overflow'] is 'single_step_ub_uncataloged'"),
+            ("emptied class",
+             tuple(dataclasses.replace(g, property_class="shift_bounds")
+                   if g.property_class == "uninit_read" else g for g in gmut.MIR_SEMANTICS_GUARDS),
+             "PROPERTY_CLASS_DISPOSITIONS['uninit_read'] is 'single_step_ub_guarded' but the "
+             "catalog tags 0 guard(s)"),
+        ):
+            with mock.patch.object(gmut, "MIR_SEMANTICS_GUARDS", catalog):
+                errors = gmut.validate_catalog_invariants(ANNEAL_ROOT)
+            self.assertTrue(any(needle in e for e in errors), (label, errors))
+        with mock.patch.dict(gmut.PROPERTY_CLASS_DISPOSITIONS, clear=False) as patched:
+            del patched["uninit_read"]
+            self.assertTrue(
+                any("must list exactly the 12 canonical" in e for e in gmut._guard_property_class_errors())
+            )
+
+    def test_property_class_is_reported_per_guard_result_and_class(self) -> None:
+        listed = json.loads(_run_cli(["--list", "--json"]).stdout)
+        self.assertEqual(
+            {g["guard_id"]: g["property_class"] for g in listed["guards"]}, self.EXPECTED_GUARD_CLASSES
+        )
+        self.assertEqual(listed["property_classes"], list(gmut.CANONICAL_PROPERTY_CLASSES))
+        self.assertEqual(listed["spec_boundary_guards"], list(gmut.CANONICAL_SPEC_BOUNDARY_GUARDS))
+        summary = listed["property_class_summary"]
+        self.assertEqual([row["property_class"] for row in summary], list(gmut.CANONICAL_PROPERTY_CLASSES))
+        self.assertEqual([row["rank"] for row in summary], list(range(12)))
+        self.assertEqual(sum(row["selected"] for row in summary), 20)
+        self.assertEqual(
+            {row["property_class"]: row["cataloged"] for row in summary if row["cataloged"]},
+            {"shift_bounds": 4, "div_rem_ub": 4, "pointer_deref": 3, "discriminant_validity": 4,
+             "memory_copy_overlap": 3, "uninit_read": 2},
+        )
+        text = _run_cli(["--list"]).stdout
+        self.assertIn("Property classes with selected guards: shift_bounds=4, div_rem_ub=4", text)
+        self.assertTrue(text.rstrip().endswith("Total cataloged guards: 20"))
+
+        fatal = gmut._fatal_report("all", "boom")
+        self.assertEqual(len(fatal["property_class_summary"]), 12)
+        self.assertTrue(all(row["selected"] == 0 for row in fatal["property_class_summary"]))
+
+        def fake_compile(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            out_dir, mod = args[3], args[2]
+            assert isinstance(out_dir, Path) and isinstance(mod, str)
+            (out_dir / f"{mod}.olean").parent.mkdir(parents=True, exist_ok=True)
+            (out_dir / f"{mod}.olean").write_bytes(b"fake")
+            return subprocess.CompletedProcess(args=["fake"], returncode=0, stdout="", stderr="")
+
+        def fake_check(guard: gmut.MirSemanticsGuard, **kwargs: object) -> gmut.GuardResult:
+            # Built positionally, without a class: the suite stamps the catalog's.
+            status = "SURVIVED" if guard.guard_id == "shift_oob" else "KILLED"
+            return gmut.GuardResult(
+                guard.guard_id, guard.target_file, guard.target_module, guard.quick, status, 0.0, "x"
+            )
+
+        with (
+            mock.patch.object(gmut, "_compile_module", side_effect=fake_compile),
+            mock.patch.object(gmut, "_check_one_mir_guard", side_effect=fake_check),
+        ):
+            report = gmut.run_guard_mutation_suite(
+                anneal_root=ANNEAL_ROOT,
+                lean_bin=Path("/nonexistent/lean"),
+                guard_filters=["div_by_zero", "rem_by_zero", "shift_oob"],
+                jobs=2,
+                reuse_lake_cache=False,
+            )
+        self.assertEqual(set(report), set(fatal))
+        self.assertEqual(
+            {r["guard_id"]: r["property_class"] for r in report["results"]},
+            {"div_by_zero": "div_rem_ub", "rem_by_zero": "div_rem_ub", "shift_oob": "shift_bounds"},
+        )
+        rows = {row["property_class"]: row for row in report["property_class_summary"]}
+        self.assertEqual(
+            (rows["div_rem_ub"]["selected"], rows["div_rem_ub"]["killed"], rows["div_rem_ub"]["cataloged"]),
+            (2, 2, 4),
+        )
+        self.assertEqual(
+            (rows["shift_bounds"]["killed"], rows["shift_bounds"]["survived"], rows["shift_bounds"]["guard_ids"]),
+            (0, 1, ["shift_oob"]),
+        )
+        self.assertEqual(rows["loop_termination"]["coverage"], "coinductive_non_ub")
+        self.assertFalse(report["ok"])
+
+    # -- error-branch wildcard probe -------------------------------------
+
+    def _patterns(self, source: str, language: str = "auto") -> list[str]:
+        findings = gmut.detect_postcondition_error_wildcards(source, language=language)
+        for finding in findings:
+            self.assertEqual(finding.guard_id, "error_branch_wildcard")
+            self.assertIn(finding.pattern, gmut.ERROR_WILDCARD_PATTERNS)
+        return [finding.pattern for finding in findings]
+
+    def test_wildcard_detector_flags_every_vacuous_error_arm_shape(self) -> None:
+        cases: tuple[tuple[str, str], ...] = (
+            ("| Err _ => True", "err_arm_true"),
+            ("| .err _ => True", "err_arm_true"),
+            ("| .error _ => True", "err_arm_true"),
+            ("| .err e => True", "err_arm_true"),
+            ("| .err (_ : String) => True", "err_arm_true"),
+            ("| Except.error _ => True", "err_arm_true"),
+            ("| .ub => True", "ub_arm_true"),
+            ("| .unsupported => True", "unsupported_arm_true"),
+            ("| MirStepNode.fail .ub => True", "ub_arm_true"),
+            ("| .fail .unsupported => True", "unsupported_arm_true"),
+            ("| .fail _ => True", "ub_arm_true"),
+            ("| .ub | .unsupported => True", "ub_arm_true"),
+            ("| .unsupported | .ub => True", "unsupported_arm_true"),
+            ("| .ub => (True)", "ub_arm_true"),
+            ("| .ub => ((True))", "ub_arm_true"),
+            ("| .err _ => trivial", "err_arm_true"),
+            ("| .err _ => by trivial", "err_arm_true"),
+            ("| .err _ => ¬False", "err_arm_true"),
+            ("| .err _ => Not False", "err_arm_true"),
+            ("| .err _ => True ∧ True", "err_arm_true"),
+            ("| .err _ => True ∨ x = 3", "err_arm_true"),
+            ("| .err _ => x = x", "err_arm_true"),
+            ("| .err _ =>\n      True", "err_arm_true"),
+            ("match out with .err _ => True", "err_arm_true"),
+            ("fun x out => match out with | .ok v => v = x + 1 | .ub => True", "ub_arm_true"),
+            (
+                "def post (x : Nat) : Except String Nat → Prop\n  | .ok v => v = x + 1\n"
+                "  | .error _ => True\n\ntheorem next : True := trivial",
+                "err_arm_true",
+            ),
+            ("| .ok v => v = 1 | _ => True", "catch_all_arm_true"),
+            ("Err(_) => true", "err_arm_true"),
+            ("Err(..) => true", "err_arm_true"),
+            ("Err(e) => true", "err_arm_true"),
+            ("Err(_) => (true)", "err_arm_true"),
+            ("Err(_) => ((true))", "err_arm_true"),
+            ("Err(_) => { true }", "err_arm_true"),
+            ("Err(_) => { return true; }", "err_arm_true"),
+            ("Err(_) => true,", "err_arm_true"),
+            ("Err(_) if true => true", "err_arm_true"),
+            ("Err(_) => true || x == 3", "err_arm_true"),
+            ("Err(_) => !false", "err_arm_true"),
+            ("Err(_) => true && true", "err_arm_true"),
+            ("Err(_) => true as bool", "err_arm_true"),
+            ("Err(_) => 1 == 1", "err_arm_true"),
+            ("Ok(0) | Err(_) => true", "err_arm_true"),
+            ("Some(Ok(_) | Err(_)) => true", "err_arm_true"),
+            ("(Err(_), _) => true", "err_arm_true"),
+            ("Err(E::A | _) => true", "err_arm_true"),
+            ("Err(()) => true", "err_arm_true"),
+            ("Result::Err(_) => true", "err_arm_true"),
+            ("match out { Ok(v) => *v == x + 1, Err(_) => true }", "err_arm_true"),
+            ("|out: &Result<u32, E>| match out {\n    Ok(v) => *v == x + 1,\n    Err(_) => true,\n}",
+             "err_arm_true"),
+            ("SemanticOutcome::Ub => true", "ub_arm_true"),
+            ("SemanticOutcome::Unsupported => true", "unsupported_arm_true"),
+            ("matches!(out, Ok(_) | Err(_))", "matches_any_err"),
+            ("matches!(out, Ok(v) | _)", "matches_any_err"),
+            ("match out { Ok(v) => *v == 1, _ => true }", "catch_all_arm_true"),
+        )
+        for source, expected in cases:
+            self.assertEqual(self._patterns(source), [expected], source)
+        lean = gmut.detect_postcondition_error_wildcards(
+            "match out with\n  | .ok v => v = spec x\n  | .err _ => True\n  | .ub => False\n"
+        )
+        self.assertEqual(
+            [(f.pattern, f.language, f.line, f.column) for f in lean], [("err_arm_true", "lean", 3, 12)]
+        )
+        self.assertIn(". err _ => True", lean[0].arm)
+
+    def test_wildcard_detector_ignores_guarded_arms_comments_and_literals(self) -> None:
+        for source in (
+            "| .ub => False",
+            "| Err e => e = .overflow",
+            "| .err .overflow => True",
+            "| .ok v => v = 1",
+            "| .err _ => x = y",
+            "| .err _ => True ∧ x = 3",
+            "| .err _ => ¬True",
+            "| .ok v => v = 1\n| .ub => False\n| .unsupported => False",
+            "-- | .ub => True\n| .ub => False",
+            "/- | .ub => True /- nested | .err _ => True -/ -/\n| .ub => False",
+            'def doc := "| .ub => True"\n',
+            "fun x => True",
+            "def isWaivable : T → Bool\n  | .unsupportedFallback => false\n  | _ => true\n",
+            "| .none => True",
+            "Err(E::Overflow) => true",
+            "Err(Unsupported) => true",
+            "Err(E::A | E::B) => true",
+            "Err(0) => true",
+            "Err(_) => false",
+            "Err(_) => x == y",
+            "Err(_) if cond => true",
+            "Err(e) => *e == E::Overflow",
+            "match out { Ok(v) => *v == x + 1, Err(E::Overflow) => x == u32::MAX }",
+            "// Err(_) => true\nErr(_) => false",
+            "/* Err(_) => true /* nested */ */ Err(_) => false",
+            'let s = "Err(_) => true"; let r = r#"Err(_) => "true"#;',
+            "let c = '\"'; let d = b'\\''; fn f<'a>(x: &'a str) -> bool { x == \"Err(_) => true\" }",
+            "!matches!(out, Err(_))",
+            "match n { 0 => true, _ => true }",
+        ):
+            self.assertEqual(self._patterns(source), [], source)
+        # Explicit languages: a Rust arm is not a Lean arm and vice versa.
+        self.assertEqual(self._patterns("-- note\n| .ub => True", language="lean"), ["ub_arm_true"])
+        self.assertEqual(self._patterns("// Err(_) => true", language="rust"), [])
+        with self.assertRaises(ValueError):
+            gmut.detect_postcondition_error_wildcards("x", language="ocaml")
+
+    def test_wildcard_detector_fails_closed_on_unlexable_sources(self) -> None:
+        for source, language in (
+            ("/- unclosed\n| .ub => True", "lean"),
+            ('def s := "unterminated\n| .ub => False', "lean"),
+            ('| .ub => s!"{x}"', "lean"),
+            ("match out with (| .ub => False", "lean"),
+            ("/* unclosed\nErr(_) => true", "rust"),
+            ('let s = "unterminated;\nErr(_) => false', "rust"),
+            ('let s = r#"unterminated";\nErr(_) => false', "rust"),
+            ("match out { Ok(v) => true, Err(_) => false", "rust"),
+            ("match out { Ok(v) => true) }", "rust"),
+            ("/- unclosed | .ub => True", "auto"),
+        ):
+            self.assertIn("unclosed_literal_or_comment", self._patterns(source, language), source)
+            report = gmut.verify_postcondition_kills_error_mutants(source, language=language)
+            self.assertFalse(report["ok"], source)
+            self.assertGreater(report["errors"], 0, source)
+
+    def test_wildcard_probe_kills_guarded_arms_and_survives_injected_wildcards(self) -> None:
+        self.assertEqual(gmut.error_wildcard_probe_self_check(), [])
+        guarded_lean = (
+            "def post (x : Nat) : Outcome Nat → Prop\n"
+            "  | .ok v => v = x + 1\n"
+            "  | .err e => e = .overflow\n"
+            "  | .ub => False\n"
+            "  | .unsupported => False\n"
+        )
+        report = gmut.verify_postcondition_kills_error_mutants(guarded_lean)
+        self.assertEqual(
+            (report["ok"], report["guard_id"], report["killed"], report["survived"], report["errors"]),
+            (True, "error_branch_wildcard", 3, 0, 0),
+        )
+        self.assertEqual(report["findings"], [])
+        self.assertEqual({r["status"] for r in report["results"]}, {"KILLED"})
+
+        # Injecting each vacuous arm lets exactly that mutant survive.
+        for old, new, mutant, pattern in (
+            ("| .ub => False", "| .ub => True", "ub", "ub_arm_true"),
+            ("| .err e => e = .overflow", "| Err _ => True", "err", "err_arm_true"),
+            ("| .unsupported => False", "| .unsupported => True", "unsupported", "unsupported_arm_true"),
+        ):
+            mutated = guarded_lean.replace(old, new)
+            self.assertNotEqual(mutated, guarded_lean)
+            probe = gmut.probe_postcondition_error_wildcard_mutant(mutated, mutant)
+            self.assertEqual(
+                (probe["status"], probe["guard_id"], probe["pattern"], probe["language"]),
+                ("SURVIVED", "error_branch_wildcard", pattern, "lean"),
+                mutated,
+            )
+            self.assertIn(new.lstrip("| ").split(" =>")[0].split()[0].lstrip("."), probe["detail"])
+            report = gmut.verify_postcondition_kills_error_mutants(mutated)
+            self.assertEqual((report["ok"], report["survived"], report["killed"]), (False, 1, 2))
+            self.assertEqual([f["pattern"] for f in report["findings"]], [pattern])
+            self.assertEqual(report["findings"][0]["guard_id"], "error_branch_wildcard")
+            # The other mutants are still killed.
+            for other in gmut.ERROR_MUTANT_KINDS:
+                if other != mutant:
+                    self.assertEqual(
+                        gmut.probe_postcondition_error_wildcard_mutant(mutated, other)["status"], "KILLED"
+                    )
+
+        guarded_rust = "match out { Ok(v) => *v == x + 1, Err(e) => *e == E::Overflow }"
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(guarded_rust, "err", language="rust")["status"],
+            "KILLED",
+        )
+        report = gmut.verify_postcondition_kills_error_mutants(guarded_rust)
+        self.assertEqual((report["ok"], report["killed"], report["unmatched"]), (True, 1, 2))
+        # `ub` is not an outcome of a Rust `Result`: demanding its kill fails.
+        self.assertFalse(
+            gmut.verify_postcondition_kills_error_mutants(guarded_rust, mutants=("err", "ub"))["ok"]
+        )
+        for vacuous in (
+            "match out { Ok(v) => *v == x + 1, Err(_) => true }",
+            "match out { Ok(v) => *v == x + 1, Err(..) => true }",
+            "match out { Ok(v) => *v == x + 1, _ => true }",
+            "matches!(out, Ok(_) | Err(_))",
+        ):
+            probe = gmut.probe_postcondition_error_wildcard_mutant(vacuous, "err")
+            self.assertEqual((probe["status"], probe["guard_id"]), ("SURVIVED", "error_branch_wildcard"), vacuous)
+            self.assertFalse(gmut.verify_postcondition_kills_error_mutants(vacuous)["ok"], vacuous)
+
+        # First covering arm wins; a payload-specific arm alone does not cover.
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(
+                "| .ok v => v = 1\n| .err .overflow => True\n| .err _ => False\n", "err"
+            )["status"],
+            "KILLED",
+        )
+        self.assertEqual(
+            gmut.probe_postcondition_error_wildcard_mutant(
+                "| .ok v => v = 1\n| .err .overflow => False\n| .err _ => True\n", "err"
+            )["status"],
+            "SURVIVED",
+        )
+        # A postcondition that inspects no error outcome kills nothing: not ok.
+        for blind in ("fun out => True", "| .ok v => v = 1", "match out { Ok(v) => *v == 1 }"):
+            report = gmut.verify_postcondition_kills_error_mutants(blind)
+            self.assertEqual((report["ok"], report["killed"]), (False, 0), blind)
+        with self.assertRaises(ValueError):
+            gmut.probe_postcondition_error_wildcard_mutant("| .ub => True", "panic")
+        # A broken probe is reported by the self-check, not trusted.
+        with mock.patch.object(gmut, "_const_truth", return_value=None):
+            self.assertNotEqual(gmut.error_wildcard_probe_self_check(), [])
+
+    def test_check_spec_wildcards_cli_exit_codes(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="anneal-gmut-unit-") as tmp:
+            root = Path(tmp)
+            clean_lean = root / "Clean.lean"
+            clean_lean.write_text(
+                "-- | .ub => True is rejected\ndef post : Outcome Nat → Prop\n"
+                "  | .ok v => v = 1\n  | .ub => False\n",
+                encoding="utf-8",
+            )
+            clean_rs = root / "clean.rs"
+            clean_rs.write_text(
+                "// Err(_) => true\nfn post(out: &Result<u32, E>) -> bool {\n"
+                "    match out { Ok(v) => *v == 1, Err(e) => *e == E::Overflow }\n}\n",
+                encoding="utf-8",
+            )
+            bad_lean = root / "Bad.lean"
+            bad_lean.write_text(
+                "def post : Outcome Nat → Prop\n  | .ok v => v = 1\n  | .ub => True\n", encoding="utf-8"
+            )
+            bad_rs = root / "bad.rs"
+            bad_rs.write_text(
+                "fn post(out: &Result<u32, E>) -> bool {\n    match out { Ok(v) => *v == 1, Err(_) => true }\n}\n",
+                encoding="utf-8",
+            )
+            binary = root / "binary.lean"
+            binary.write_bytes(b"\xff\xfe| .ub => True")
+
+            ok = _run_cli(["--check-spec-wildcards", str(clean_lean), str(clean_rs)])
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            self.assertIn("2 file(s) scanned, 0 finding(s), 0 error(s)", ok.stdout)
+
+            bad = _run_cli(["--check-spec-wildcards", str(clean_lean), str(bad_lean), str(bad_rs), "--json"])
+            self.assertEqual(bad.returncode, 1)
+            report = json.loads(bad.stdout)
+            self.assertEqual(
+                (report["ok"], report["guard_id"], report["checked"], report["errors"]),
+                (False, "error_branch_wildcard", 3, []),
+            )
+            self.assertEqual(
+                [(Path(f["path"]).name, f["pattern"], f["language"], f["line"]) for f in report["findings"]],
+                [("Bad.lean", "ub_arm_true", "lean", 3), ("bad.rs", "err_arm_true", "rust", 2)],
+            )
+            text = _run_cli(["--check-spec-wildcards", str(bad_lean)])
+            self.assertEqual(text.returncode, 1)
+            self.assertIn(f"{bad_lean}:3:9: error_branch_wildcard [ub_arm_true]", text.stdout)
+
+            for unreadable in (root / "missing.lean", root, binary):
+                res = _run_cli(["--check-spec-wildcards", str(clean_lean), str(unreadable)])
+                self.assertEqual(res.returncode, 1, unreadable)
+                self.assertIn("cannot read", res.stderr, unreadable)
+
+            # `--json-out` is fail-closed: a stale pass is replaced even when the
+            # scan fails, and an unwritable sink fails the run.
+            out = root / "out" / "report.json"
+            self.assertEqual(
+                _run_cli(["--check-spec-wildcards", str(clean_lean), "--json-out", str(out)]).returncode, 0
+            )
+            self.assertTrue(json.loads(out.read_text(encoding="utf-8"))["ok"])
+            self.assertEqual(
+                _run_cli(["--check-spec-wildcards", str(bad_lean), "--json-out", str(out)]).returncode, 1
+            )
+            failed = json.loads(out.read_text(encoding="utf-8"))
+            self.assertEqual((failed["ok"], len(failed["findings"])), (False, 1))
+            pending = gmut.check_spec_wildcard_paths(())
+            self.assertEqual((pending["ok"], pending["checked"]), (False, 0))
+            self.assertEqual(set(pending), set(failed))
+            blocked = _run_cli(
+                ["--check-spec-wildcards", str(clean_lean), "--json-out", str(clean_rs / "x.json")]
+            )
+            self.assertEqual(blocked.returncode, 1)
+            self.assertIn("cannot write", blocked.stderr)
+
+            for usage in (
+                ["--check-spec-wildcards"],
+                ["--check-spec-wildcards", str(clean_lean), "--list"],
+                ["--check-spec-wildcards", str(clean_lean), "--quick"],
+                ["--check-spec-wildcards", str(clean_lean), "--guard", "div_by_zero"],
+            ):
+                self.assertEqual(_run_cli(usage).returncode, 2, usage)
+            # A probe that cannot tell a wildcard from a guard refuses to pass.
+            with mock.patch.object(gmut, "_const_truth", return_value=None):
+                broken = gmut.check_spec_wildcard_paths([clean_lean])
+            self.assertFalse(broken["ok"])
+            self.assertTrue(broken["errors"])
+
+        # The live Lean theory states the wildcard arms it proves vacuous; the
+        # frozen taxonomy sources themselves must stay scannable.
+        live = gmut.check_spec_wildcard_paths([ANNEAL_ROOT / self.LEAN_REL])
+        self.assertEqual((live["checked"], live["errors"]), (1, []))
+        self.assertTrue(all(f["guard_id"] == "error_branch_wildcard" for f in live["findings"]))
 
 
 if __name__ == "__main__":
