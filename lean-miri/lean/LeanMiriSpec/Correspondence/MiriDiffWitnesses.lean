@@ -528,7 +528,7 @@ theorem w6_copy_nonoverlapping_full_bytes_returns :
     rfl rfl rfl (.uint .u64 rfl) rfl (.uint .u64 rfl)
     rfl rfl rfl (by decide)
   rw [hs₅] at hsim₅
-  have hmap_eq : copyNextAllocMap s₄.frame.locals [e₂, e₁] 6
+  have hmap_eq : copyStage1FullBytesNextAllocMap s₄.frame.locals [e₂, e₁] 5 6
       (.constant (WitnessLM4_2.constInt WitnessLM4_2.usizeK 8 8)) 1 = [e₂, e₁] := rfl
   rw [hmap_eq] at hsim₅
   obtain ⟨m₅, hm₅, hrel₅⟩ := hsim₅.step_of_anneal_step rfl

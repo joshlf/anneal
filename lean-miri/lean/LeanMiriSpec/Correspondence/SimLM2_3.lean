@@ -6511,6 +6511,8 @@ theorem enum_match_switchInt_simulation
   rw [hterm]
   dsimp only
   rw [hbor, hcaller, hstack]
+  rw [evalOperandWithBodyCast_eq_evalOperand _ _ _ _ _ _ _ _
+    (show operandIsLeadingOpaqueCastMove discr = false by cases hop_wt <;> rfl)]
   dsimp only [mRes]
   rw [hstep_eq, hstep_t, hm_term]
   rcases evalEnumScalarOp_lm2_3 henv_valid hframes hframe hop_wt s.memory.globals none with
@@ -6651,7 +6653,8 @@ theorem step_return_scalar_lm2_3_simulation
         traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
         activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
         nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
-        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds,
+        rootUnwindCeiling := s.memory.rootUnwindCeiling } = s.memory := by
     cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   unfold evalTerminator translateTerminator Miri.Interpreter.ControlFlow.evalTerminator
   rw [hterm, hstack, hbor, hprot, hctrl_eq, hslot0]
@@ -11452,7 +11455,8 @@ theorem step_return_enum_lm2_3_simulation
         traitImpls := s.memory.traitImpls, callStack := s.memory.callStack,
         activeCallee := s.memory.activeCallee, activeProtectors := s.memory.activeProtectors,
         nextProtector := s.memory.nextProtector, callerLocals := s.memory.callerLocals,
-        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds } = s.memory := by
+        fnPtrs := s.memory.fnPtrs, exposedAllocIds := s.memory.exposedAllocIds,
+        rootUnwindCeiling := s.memory.rootUnwindCeiling } = s.memory := by
     cases hm : s.memory; rw [hm] at hbor; dsimp at hbor; subst hbor; rfl
   rw [stepMirFn_eq_of_not_other body s hcal hphase]
   have hbeq_len : (s.frame.stmtIdx == length bb.statements) = true := by

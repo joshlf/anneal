@@ -206,19 +206,21 @@ Category 10 adds 2 tests:
 | Multi-element `copy_nonoverlapping` through whole-array pointer casts | `pass_copy_nonoverlapping_multi_elem_array_pair` (`[22, 99]` copied as 2 `u32` elements through `(&raw const src) as *const u32`, returning `22 ^ 99 = 117`) |
 | Raw-pointer reads of uninitialized struct padding (`model-checking/kani#5183`) | `ub_raw_ptr_read_uninit_struct_padding_kani5183` (byte offset `1` of `PaddedU8U32` read as `u8` through `(&raw const s) as *const u8` and `offset(base, 1isize)`) |
 
-Category 10 leaves out one construct on which Anneal currently disagrees with
-Miri: a multi-element `copy_nonoverlapping` between *element* sub-places,
-`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`. Anneal
-copies only the first element through the `.constantIndex` sub-place pointer
-(`wrong_value`, `value_mismatch`; Anneal returns `22` where Miri returns `117`
-for `[22, 99]`), whereas the whole-array casts of
-`pass_copy_nonoverlapping_multi_elem_array_pair` copy both elements and agree.
+Category 10 uses whole-array pointer casts for its multi-element
+`copy_nonoverlapping` seed. The *element* sub-place form,
+`copy_nonoverlapping(&raw const src[0], &raw mut dst[0], 2usize)`, used to be a
+construct on which Anneal disagreed with Miri: Anneal copied only the first
+element through the `.constantIndex` sub-place pointer (`wrong_value`,
+`value_mismatch`; Anneal returned `22` where Miri returns `117` for
+`[22, 99]`). `Trusted.Rustc.V2026_06_01.MirSemantics.Statements` now copies
+`count * size_of::<T>()` bytes for a sub-place copy (`evalCopySubplaceMulti`),
+so both forms copy both elements and agree with Miri.
 `semantic_mutant_probes_agree_live_and_known_provenance_gaps_stay_pinned` pins
-the element sub-place form (`probe_gap_subplace_multi_elem_copy`,
-kernel-confirmed) as a ratchet that fails once the gap is fixed, and the
-`subplace_multi_elem_copy_truncation` semantic mutant of
-`--self-check-mutants` replays a semantics that truncates the agreeing
-whole-array copy to one element (killed as `wrong_value`).
+the element sub-place form (`probe_gap_subplace_multi_elem_copy`) as a resolved
+gap that must agree with Miri on `117`, `RawPtrOffsetMutator`'s `Pass` copy
+template generates that form, and the `subplace_multi_elem_copy_truncation`
+semantic mutant of `--self-check-mutants` replays a semantics that truncates
+the whole-array copy to one element (killed as `wrong_value`).
 
 `miri-difftest` confirms each divergence in the Lean kernel with
 `lean -M 4096`. When the batched confirmation fails, every divergence is

@@ -18,15 +18,17 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 > `stepMirFnLM4_2` (`evalCopyNonOverlappingLM4_2` /
 > `evalCopyNonOverlappingWithCountLM4_2` / `evalCopyRootIntScalars`, defined in
 > `CallLM4_2.lean`) relates `lean-miri` to that reference model only. Stage-1
-> `evalCopyNonOverlapping` (`Statements.lean:1739`) disagrees with it on (at least)
-> zero-count misaligned copies, out-of-bounds distinct-local copies, same-local
-> disjoint sub-range copies, cross-type single-element copies, and partial
-> distinct-local copies (where Stage-1 stores the whole source value), each of
-> which `WitLM4_2.lean` §6/§14 certifies as a concrete Stage-1 divergence.
+> `evalCopyNonOverlapping` (`Statements.lean`) disagrees with it on (at least)
+> zero-count misaligned copies, same-tag disjoint sub-range copies, cross-type
+> single-element copies (`evalCopySingleDirect`), and partial distinct-local
+> scalar copies (`MirStepNode.unsupported` via `copyBytesSubplace` for `count > 1`,
+> or whole-source clobbering via `evalCopySingleDirect` for `count = 1`), each of
+> which `WitLM4_2.lean` §6/§14 certifies as a concrete Stage-1 divergence or
+> fail-closed boundary (while distinct-local out-of-bounds copies now agree on UB).
 > Stage-1 statements:
 > * §8 proves Stage-1 provenance preservation across both `evalCopySingleDirect`
->   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`) and byte-codec
->   `copyViaBytes` (`encodeUntypedValueToBytes_ptr_decode_roundtrip`), plus the
+>   (`stepMirFn_copyNonOverlapping_rawPtr_preserves_provenance`) and the byte codec
+>   (`encodeUntypedValueToBytes_ptr_decode_roundtrip`), plus the
 >   two-machine boundary on `copy_nonoverlapping::<*mut T>` where `annealStepHooks`
 >   fails closed at `annealPointeeTypeOf 80` (`rawPtrPointeeEncodedTyId? 80 = none`,
 >   `step_intrinsic_copyNonOverlapping_rawPtr_miri_unsupported`; memory-backed
@@ -35,10 +37,10 @@ import LeanMiriSpec.Correspondence.WriteBytesLM4_2
 > * §9 bridges `stepMirFn = stepMirFnLM4_2` on the aligned zero-count /
 >   single-element same-type integer fragment
 >   (`stepMirFn_copyNonOverlapping_stage1_eq_lm4_2`) as well as full-local
->   multi-element copies (`count * size_of::<T>() = localBytes` via `copyViaBytes`,
->   `step_intrinsic_copyNonOverlapping_stage1_full_bytes_simulation`), and proves
->   the Stage-1 uninitialized-source, Tree Borrows permission, and partial-copy
->   whole-destination clobbering (`step_intrinsic_copyNonOverlapping_stage1_partial_clobber_divergence`)
+>   multi-element copies (`count * size_of::<T>() = localBytes` via
+>   `evalCopySubplaceMulti` / `copyBytesSubplace`,
+>   `step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`),
+>   and proves the Stage-1 uninitialized-source and Tree Borrows permission
 >   divergences against `lean-miri`.
 
 One-step correspondence between the pre-Stage-1 reference model's
@@ -60,7 +62,7 @@ One-step correspondence between the pre-Stage-1 reference model's
      `StateRelLM3_1` in both);
   5. positive-byte copy with provenance-free `.scalar` `src` or `dst`, dead
      source or destination stack local, or out-of-bounds byte range (UB in
-     both; Stage-1 instead steps on out-of-bounds distinct-local copies);
+     both, including distinct-local out-of-bounds copies via `copyAccessFitsAlloc?`);
   6. positive-byte copy on overlapping byte ranges of the same live initialized
      allocation (`e_src.localIdx = e_dst.localIdx` with
      `srcStart < dstStart + total` and `dstStart < srcStart + total`): overlap UB
@@ -7001,8 +7003,7 @@ theorem decodeLittleEndianBytes_encodeLittleEndianBytes_some :
 
 /-- **`encodeUntypedValueToBytes_ptr_decode_roundtrip` (`LM-4.2`, Stage-1 byte-codec
 provenance preservation)**: Stage-1 `encodeUntypedValueToBytes` +
-`decodeValueFromBytes` (`Bytes.lean:579, 1253`, used by `copyViaBytes` in
-`Statements.lean:1549..1601`) round-trips any canonical 8-byte `ProvenancePtr` `p`
+`decodeValueFromBytes` (`Bytes.lean`) round-trips any canonical 8-byte `ProvenancePtr` `p`
 (`p.offsetBytes < scalarModulus 8`) at any thin `.rawPtr mutability pk` type,
 preserving `(p.allocId, p.tag)` across all 8 `AbstractByte.init` bytes. -/
 theorem encodeUntypedValueToBytes_ptr_decode_roundtrip
@@ -8032,45 +8033,171 @@ theorem decodeValueFromBytes_encodeLittleEndianBytes_int
     dsimp only
     rw [hsc_eq])
 
-/-- **Stage-1 `evalCopyNonOverlappingPermOk` on distinct initialized integer locals
-at offset `0` (`LM-4.2`)**: for **any** `countBits` (`countBits = 1` via
-`evalCopySingleDirect` or `countBits ≠ 1` via `copyViaBytes`), when `srcPtr` and
+private theorem copyTyByteSize_of_primScalar
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (ty : Ty) (sz : Nat)
+    (hprim : IsPrimScalarTy ty)
+    (hsz : rigidTyKindByteSize ty.kind = some sz) :
+    tyByteSize localDecls layouts ty = some sz := by
+  rcases hr : resolveTyWithLocalDecls localDecls layouts ty with ⟨rk, rl⟩
+  have hkind : rk = ty.kind := by
+    have hk0 := resolveTyWithLocalDecls_kind localDecls layouts ty
+    rw [hr] at hk0
+    exact hk0
+  subst hkind
+  show (match tyByteSizeAndAlignAux localDecls layouts (7 + 1) ty with
+    | .some (s, _) => .some s | .none => .none) = some sz
+  unfold tyByteSizeAndAlignAux
+  dsimp only
+  rw [hr]
+  rcases hprim with hk | hk | ⟨it, hk⟩ | ⟨ut, hk⟩ <;> (
+    rw [hk] at hsz ⊢
+    unfold rigidTyByteSize
+    dsimp only
+    first | exact hsz | rw [hsz])
+
+private theorem copyPrim_and_kindSize_of_intCastTargetBytes {ty : Ty} {sz : Nat}
+    (hint : intCastTargetBytes ty.kind = some sz) :
+    IsPrimScalarTy ty ∧ rigidTyKindByteSize ty.kind = some sz ∧
+    isLayoutIndepByteKind ty.kind = true := by
+  rcases ty with ⟨tk, tl⟩
+  dsimp only at hint ⊢
+  cases tk with
+  | int it => exact ⟨Or.inr (Or.inr (Or.inl ⟨it, rfl⟩)), hint, rfl⟩
+  | uint ut => exact ⟨Or.inr (Or.inr (Or.inr ⟨ut, rfl⟩)), hint, rfl⟩
+  | _ => cases hint
+
+private theorem copyResolveArraySliceEndpoint?_int_scalar_nil
+    (localDecls : List LocalDecl) (layouts : LayoutTable) (locals : List LocalSlot)
+    (ptr : ProvenancePtr) (e : AllocMapEntry) (sc : MirAst.ScalarInt)
+    (ptOpt : Option Ty) (elemSzOpt : Option Nat)
+    (decl : LocalDecl) (sz : Nat)
+    (hslot : get? locals e.localIdx = some (.init (.scalar sc)))
+    (hdecl : get? localDecls e.localIdx = some decl)
+    (hint : intCastTargetBytes decl.ty.kind = some sz) :
+    resolveArraySliceEndpoint? localDecls layouts locals
+      { ptr := ptr, entry := e.toBorrowEntry, rootValOpt := some (.scalar sc), pointeeOpt := ptOpt }
+      elemSzOpt = none := by
+  rcases decl with ⟨_, ⟨tk, tl⟩, _⟩
+  dsimp only at hint
+  unfold resolveArraySliceEndpoint? copyPlaceIsNonArrayAggregate placeTyResolved
+    resolveProjectedTyResolved
+  dsimp only [AllocMapEntry.toBorrowEntry, resolveBorrowProjectionElems,
+    normalizeSubsliceProjections, splitLastConstantIndex?, readProjectedValue]
+  rw [hslot, hdecl]
+  cases tk <;> first | cases hint | rfl
+
+private theorem copyAccessFitsAlloc?_int_root
+    (localDecls : List LocalDecl) (layouts : LayoutTable)
+    (locals callerLocals : List LocalSlot) (callStack : List SavedCallerFrame)
+    (ptr : ProvenancePtr) (e : AllocMapEntry) (v : Value)
+    (rootOpt : Option Value) (ptOpt : Option Ty) (decl : LocalDecl) (sz : Nat)
+    (hslot : get? locals e.localIdx = some (.init v))
+    (hdecl : get? localDecls e.localIdx = some decl)
+    (hint : intCastTargetBytes decl.ty.kind = some sz)
+    (hoff0 : ptr.offsetBytes = 0) :
+    copyAccessFitsAlloc? localDecls layouts locals callerLocals callStack
+      { ptr := ptr, entry := e.toBorrowEntry, rootValOpt := rootOpt, pointeeOpt := ptOpt }
+      sz = some true := by
+  obtain ⟨hprim, hksz, _⟩ := copyPrim_and_kindSize_of_intCastTargetBytes hint
+  have hty_sz := copyTyByteSize_of_primScalar localDecls layouts decl.ty sz hprim hksz
+  unfold copyAccessFitsAlloc? borrowPlaceByteOffset?
+  dsimp only [AllocMapEntry.toBorrowEntry, resolveBorrowProjectionElems,
+    stripTransparentProjections, normalizeSubsliceProjections]
+  rw [hslot, hdecl]
+  dsimp only
+  rw [hty_sz, hoff0]
+  dsimp only
+  have hble : Nat.ble (Nat.add (Nat.add 0 0) sz) sz = true := by
+    simp [Nat.ble_eq]
+  rw [hble]
+
+private theorem copyEncodeValueToBytes_int_scalar
+    (layouts : LayoutTable) (decl : LocalDecl) (sc : MirAst.ScalarInt) (sz : Nat)
+    (hint : intCastTargetBytes decl.ty.kind = some sz)
+    (hpos : 0 < sz)
+    (hsz : sc.sizeBytes = sz) :
+    encodeValueToBytes defaultCodecFuel layouts decl.ty (.scalar sc) =
+      some (encodeLittleEndianBytes sc.bits sz none) := by
+  have hnz : Nat.beq sc.sizeBytes 0 = false := by
+    rw [hsz]
+    cases sz with
+    | zero => exact absurd hpos (Nat.lt_irrefl 0)
+    | succ _ => rfl
+  rcases decl with ⟨_, ⟨tk, tl⟩, _⟩
+  dsimp only at hint ⊢
+  show encodeValueToBytes (15 + 1) layouts ⟨tk, tl⟩ (.scalar sc) = _
+  cases tk with
+  | int _ =>
+    unfold encodeValueToBytes
+    dsimp only
+    rw [hint]
+    dsimp only
+    rw [hsz, Nat.beq_refl]
+    dsimp only
+    unfold encodeScalarBytes
+    rw [hnz, hsz]
+  | uint _ =>
+    unfold encodeValueToBytes
+    dsimp only
+    rw [hint]
+    dsimp only
+    rw [hsz, Nat.beq_refl]
+    dsimp only
+    unfold encodeScalarBytes
+    rw [hnz, hsz]
+  | _ => cases hint
+
+/-- **Stage-1 `evalCopyNonOverlappingPermOk` on full-byte copies between distinct
+initialized integer locals at offset `0` (`LM-4.2`)**: when
+`countBits * elemBytes = srcBytes` (`countBits = 1` via `evalCopySingleDirect` or
+`countBits > 1` via `evalCopySubplaceMulti` / `copyBytesSubplace`), `srcPtr` and
 `dstPtr` have offset `0` and distinct tags targeting distinct non-union integer
-locals `e_s.localIdx ≠ e_d.localIdx` of the same byte width `srcBytes`, Stage-1
-writes the entire source scalar `.init (.scalar srcSc)` to `e_d.localIdx`. -/
+locals `e_s.localIdx ≠ e_d.localIdx` of equal byte width `srcBytes`, and the
+post-copy borrow table is `borrows'` (`invalidateConflictingBorrows` for
+`countBits = 1`, or `borrowsAfterCopySlice` for `countBits ≠ 1`), Stage-1 writes
+`.init (.scalar srcSc)` to `e_d.localIdx`. -/
 theorem evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
     {s : MachineState} {src dst : MirAst.Operand}
     {localDecls : List LocalDecl} {layouts : LayoutTable}
     {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
-    {pointeeTy : Ty} {idxS idxD srcBytes countBits : Nat}
-    {srcSc dstSc : MirAst.ScalarInt} {decl_d : LocalDecl}
+    {pointeeTy : Ty} {idxS idxD elemBytes srcBytes countBits : Nat}
+    {srcSc dstSc : MirAst.ScalarInt} {decl_s decl_d : LocalDecl}
+    {borrows' : List BorrowEntry}
     (hprim : IsPrimScalarTy pointeeTy)
+    (hpt_sz : rigidTyKindByteSize pointeeTy.kind = some elemBytes)
     (hopS : operandPointeeTy localDecls layouts src =
       some { kind := pointeeTy.kind, layoutIdx := idxS })
     (hopD : operandPointeeTy localDecls layouts dst =
       some { kind := pointeeTy.kind, layoutIdx := idxD })
     (hoff0_s : srcPtr.offsetBytes = 0)
     (hoff0_d : dstPtr.offsetBytes = 0)
+    (hfull : countBits * elemBytes = srcBytes)
     (hne_tag : srcPtr.tag ≠ dstPtr.tag)
     (hne_loc : e_s.localIdx ≠ e_d.localIdx)
     (hunion_s : unionLocalByteSize? localDecls layouts e_s.localIdx = none)
     (hunion_d : unionLocalByteSize? localDecls layouts e_d.localIdx = none)
     (hslot_s : get? s.frame.locals e_s.localIdx = some (.init (.scalar srcSc)))
     (hslot_d : get? s.frame.locals e_d.localIdx = some (.init (.scalar dstSc)))
+    (hdecl_s : get? localDecls e_s.localIdx = some decl_s)
+    (hint_s : intCastTargetBytes decl_s.ty.kind = some srcBytes)
     (hdecl_d : get? localDecls e_d.localIdx = some decl_d)
     (hint_d : intCastTargetBytes decl_d.ty.kind = some srcBytes)
     (hrig_d : rigidTyByteSize layouts decl_d.ty = some srcBytes)
     (hsrc_pos : 0 < srcBytes)
     (hsc_sz : srcSc.sizeBytes = srcBytes)
     (hsc_lt : srcSc.bits < scalarModulus srcBytes)
+    (hbor :
+      if Nat.beq countBits 1 then
+        borrows' = invalidateConflictingBorrows s.memory.borrows e_d.localIdx (some dstPtr.tag)
+      else
+        borrowsAfterCopySlice s.memory.borrows s.memory.activeProtectors
+          srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry .nil .nil = some borrows')
     (hstack : s.memory.callStack = .nil := by rfl) :
     evalCopyNonOverlappingPermOk s src dst localDecls layouts srcPtr dstPtr
         e_s.toBorrowEntry e_d.toBorrowEntry countBits s.frame.locals =
       MirStepNode.step
         (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar srcSc)))
-          { s.memory with
-            borrows := invalidateConflictingBorrows s.memory.borrows e_d.localIdx
-              (some dstPtr.tag) }) := by
+          { s.memory with borrows := borrows' }) := by
   have hbool_d : decl_d.ty.kind = .bool →
       srcSc.sizeBytes = 1 ∧ (srcSc.bits = 0 ∨ srcSc.bits = 1) :=
     fun h => by rw [h] at hint_d; cases hint_d
@@ -8082,9 +8209,12 @@ theorem evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
   rw [hunion_s, hunion_d, hoff0_s, hoff0_d]
   cases hc1 : Nat.beq countBits 1 with
   | true =>
+    simp only [hc1, ↓reduceIte] at hbor
+    subst hbor
     exact evalCopySingleDirect_distinct_ok hprim hopS hopD hne_tag hne_loc
       hslot_s hslot_d (by nofun) hdecl_d hbool_d hchar_d hstack
   | false =>
+    simp only [hc1, Bool.false_eq_true, ↓reduceIte] at hbor
     have hb_tag : Nat.beq srcPtr.tag dstPtr.tag = false := by
       cases h : Nat.beq srcPtr.tag dstPtr.tag
       · rfl
@@ -8093,63 +8223,151 @@ theorem evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
       cases h : Nat.beq e_s.localIdx e_d.localIdx
       · rfl
       · exact absurd (Nat.eq_of_beq_eq_true h) hne_loc
-    have hnz : Nat.beq srcSc.sizeBytes 0 = false := by
-      rw [hsc_sz]
-      cases srcBytes with
-      | zero => exact absurd (Nat.lt_irrefl 0) (by omega)
-      | succ _ => rfl
-    have henc : encodeUntypedValueToBytes defaultCodecFuel (.scalar srcSc) =
-        some (encodeLittleEndianBytes srcSc.bits srcBytes none) := by
-      show encodeScalarBytes srcSc none = _
-      unfold encodeScalarBytes
-      rw [hnz, hsc_sz]
-    have hplace_ty : placeTy localDecls layouts { local_ := e_d.localIdx, projection := .nil } =
-        some decl_d.ty := by
-      unfold placeTy resolveProjectedTy; rw [hdecl_d]
+    have hprim_ptS : IsPrimScalarTy { kind := pointeeTy.kind, layoutIdx := idxS } :=
+      isPrimScalarTy_of_kind_eq hprim rfl
+    have hprim_ptD : IsPrimScalarTy { kind := pointeeTy.kind, layoutIdx := idxD } :=
+      isPrimScalarTy_of_kind_eq hprim rfl
+    have hptS_sz := copyTyByteSize_of_primScalar localDecls layouts
+      { kind := pointeeTy.kind, layoutIdx := idxS } elemBytes hprim_ptS hpt_sz
+    have hptD_sz := copyTyByteSize_of_primScalar localDecls layouts
+      { kind := pointeeTy.kind, layoutIdx := idxD } elemBytes hprim_ptD hpt_sz
+    have helem_pos : 0 < elemBytes := by
+      cases he : elemBytes with
+      | zero => rw [he, Nat.mul_zero] at hfull; omega
+      | succ _ => omega
+    obtain ⟨_, _, hindep_s⟩ := copyPrim_and_kindSize_of_intCastTargetBytes hint_s
+    obtain ⟨_, _, hindep_d⟩ := copyPrim_and_kindSize_of_intCastTargetBytes hint_d
+    have hwin_s := copyResolveArraySliceEndpoint?_int_scalar_nil localDecls layouts
+      s.frame.locals srcPtr e_s srcSc
+      (operandPointeeTy localDecls layouts src) (some elemBytes) decl_s srcBytes
+      hslot_s hdecl_s hint_s
+    have hwin_d := copyResolveArraySliceEndpoint?_int_scalar_nil localDecls layouts
+      s.frame.locals dstPtr e_d dstSc
+      (operandPointeeTy localDecls layouts dst) (some elemBytes) decl_d srcBytes
+      hslot_d hdecl_d hint_d
+    have hfits_s := copyAccessFitsAlloc?_int_root localDecls layouts
+      s.frame.locals s.memory.callerLocals s.memory.callStack
+      srcPtr e_s (.scalar srcSc) (some (.scalar srcSc))
+      (operandPointeeTy localDecls layouts src) decl_s srcBytes
+      hslot_s hdecl_s hint_s hoff0_s
+    have hfits_d := copyAccessFitsAlloc?_int_root localDecls layouts
+      s.frame.locals s.memory.callerLocals s.memory.callStack
+      dstPtr e_d (.scalar dstSc) (some (.scalar dstSc))
+      (operandPointeeTy localDecls layouts dst) decl_d srcBytes
+      hslot_d hdecl_d hint_d hoff0_d
+    have henc := copyEncodeValueToBytes_int_scalar layouts decl_s srcSc srcBytes
+      hint_s hsrc_pos hsc_sz
     have hlen : length (encodeLittleEndianBytes srcSc.bits srcBytes none) = srcBytes :=
       encodeLittleEndianBytes_length_lm4_2 srcSc.bits srcBytes none
     have hdec := decodeValueFromBytes_encodeLittleEndianBytes_int layouts decl_d srcSc srcBytes
       hint_d hsrc_pos hsc_sz hsc_lt
+    have hplace_ty_d :
+        placeTy localDecls layouts { local_ := e_d.localIdx, projection := .nil } =
+          some decl_d.ty := by
+      unfold placeTy resolveProjectedTy; rw [hdecl_d]
     have hval_ok :
         validateValueForTy? layouts
           (placeTy localDecls layouts { local_ := e_d.localIdx, projection := .nil })
           (.scalar srcSc) = true := by
-      rw [hplace_ty]
+      rw [hplace_ty_d]
       rcases decl_d with ⟨_, ⟨dk, _⟩, _⟩
       dsimp only at hint_d ⊢
       unfold validateValueForTy?
       cases dk <;> first | cases hint_d | rfl
+    have hres :
+        resolveCopySubplaceMulti s.memory.callerLocals s.memory.callStack src dst
+          localDecls layouts srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry
+          countBits s.frame.locals =
+        .write { local_ := e_d.localIdx, projection := .nil } (.scalar srcSc) .nil .nil := by
+      unfold resolveCopySubplaceMulti
+      have hts : (e_s.toBorrowEntry).targetLocal = e_s.localIdx := rfl
+      have htd : (e_d.toBorrowEntry).targetLocal = e_d.localIdx := rfl
+      rw [hts, htd, hslot_s, hslot_d]
+      dsimp only
+      unfold checkDerefAlign
+      rw [hoff0_s, hoff0_d]
+      dsimp only
+      unfold copyPointeeSizesConflict copyPointeeByteSize?
+      rw [hopS, hopD]
+      dsimp only
+      rw [hptS_sz, hptD_sz]
+      dsimp only
+      rw [Nat.beq_refl]
+      cases he : elemBytes with
+      | zero => exact absurd he (by omega)
+      | succ elemPred =>
+        dsimp only
+        rw [← he]
+        rw [← hopS, ← hopD, hwin_s, hwin_d]
+        dsimp only
+        unfold copyBytesSubplace
+        dsimp only
+        rw [show Nat.mul countBits elemBytes = srcBytes from hfull, hfits_s, hfits_d, hb_tag]
+        dsimp only [copyAccessCertainlyOob, Bool.or]
+        have hps : (e_s.toBorrowEntry).targetProjection = .nil := rfl
+        have hpd : (e_d.toBorrowEntry).targetProjection = .nil := rfl
+        rw [hoff0_s, hps]
+        dsimp only [resolveBorrowProjectionElems, normalizeSubsliceProjections, readProjectedValue]
+        rw [hts, hslot_s]
+        dsimp only
+        unfold placeTyResolved resolveProjectedTyResolved
+        rw [hdecl_s]
+        dsimp only
+        unfold srcValHasExactByteEncoding
+        rw [hindep_s]
+        dsimp only
+        rw [henc]
+        dsimp only
+        rw [hlen, Nat.beq_refl]
+        dsimp only
+        rw [hfits_d]
+        dsimp only [copyAccessCertainlyOob]
+        rw [hoff0_d]
+        dsimp only
+        rw [htd, hslot_d, hpd]
+        dsimp only
+        rw [hdecl_d]
+        dsimp only [stripLeadingOpaqueCast]
+        unfold dstTyHasExactByteDecode
+        rw [hindep_d]
+        dsimp only
+        rw [hrig_d]
+        dsimp only
+        rw [Nat.beq_refl]
+        dsimp only
+        rw [hdec]
+        dsimp only
+        rw [hb_loc]
+        rfl
     simp only [Bool.false_and]
-    rw [hslot_s, hslot_d]
-    dsimp only [readProjectedValue]
-    rw [hplace_ty, hb_tag, hb_loc, henc]
+    change evalCopySubplaceMulti s src dst localDecls layouts srcPtr dstPtr
+      e_s.toBorrowEntry e_d.toBorrowEntry countBits s.frame.locals = _
+    unfold evalCopySubplaceMulti
+    rw [hres]
     dsimp only
-    rw [hrig_d, hlen]
+    rw [hbor]
     dsimp only
-    rw [Nat.beq_refl]
-    dsimp only
-    rw [hdec]
-    dsimp only
-    unfold commitCopyDstPlaceWrite
-    have hlen_cs : length s.memory.callStack = 0 := by rw [hstack]; rfl
-    rw [writePlaceValue_root_ok hval_ok hslot_d (by nofun), hlen_cs]
+    unfold commitCopyDstPlaceWriteWithBorrows
+    rw [writePlaceValue_root_ok hval_ok hslot_d (by nofun)]
 
-/-- **Stage-1 `stepMirFn` evaluation on distinct initialized integer locals at
-offset `0` (`LM-4.2`)**: for any `0 < countSc.bits`, Stage-1 `stepMirFn` steps
-to the state storing `.init (.scalar srcSc)` in `e_d.localIdx`. -/
+/-- **Stage-1 `stepMirFn` evaluation on full-byte copies between distinct
+initialized integer locals at offset `0` (`LM-4.2`)**: when `0 < countSc.bits`
+and `countSc.bits * elemBytes = srcBytes`, Stage-1 `stepMirFn` steps to the
+state storing `.init (.scalar srcSc)` in `e_d.localIdx` with borrow table `borrows'`. -/
 theorem stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
     {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
     (hphase : ∀ p, body.phase ≠ .other p)
     {bb : BasicBlockData} {srcIdx dstIdx : Local} {countOp : MirAst.Operand} {span : String}
-    {srcDecl dstDecl decl_d : LocalDecl} {srcMut dstMut : Mutability} {pointeeTy : Ty}
+    {srcDecl dstDecl decl_s decl_d : LocalDecl} {srcMut dstMut : Mutability} {pointeeTy : Ty}
     {srcPtr dstPtr : ProvenancePtr} {countSc srcSc dstSc : MirAst.ScalarInt}
-    {e_s e_d : AllocMapEntry} {srcBytes : Nat}
+    {e_s e_d : AllocMapEntry} {elemBytes srcBytes : Nat} {borrows' : List BorrowEntry}
     (hbb : get? body.basicBlocks s.frame.blockIdx = some bb)
     (hstmt : get? bb.statements s.frame.stmtIdx =
       some ⟨.intrinsic (.copyNonOverlapping (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp),
         span⟩)
     (hprim : IsPrimScalarTy pointeeTy)
+    (hpt_sz : rigidTyKindByteSize pointeeTy.kind = some elemBytes)
     (hsrcDecl : get? body.localDecls srcIdx = some srcDecl)
     (hsrcTy : srcDecl.ty.kind = .rawPtr srcMut pointeeTy.kind)
     (hdstDecl : get? body.localDecls dstIdx = some dstDecl)
@@ -8160,6 +8378,7 @@ theorem stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
     (hoff0_d : dstPtr.offsetBytes = 0)
     (hcnt_pre : WriteBytesScalarPreVal s.frame.locals countOp countSc)
     (hcnt_pos : 0 < countSc.bits)
+    (hfull : countSc.bits * elemBytes = srcBytes)
     (hlook_s : lookupBorrow s.memory.borrows srcPtr.tag = some e_s.toBorrowEntry)
     (hlook_d : lookupBorrow s.memory.borrows dstPtr.tag = some e_d.toBorrowEntry)
     (hperm_s : e_s.perm ≠ .disabled)
@@ -8170,19 +8389,25 @@ theorem stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
     (hunion_d : unionLocalByteSize? body.localDecls body.layouts e_d.localIdx = none)
     (hslot_s : get? s.frame.locals e_s.localIdx = some (.init (.scalar srcSc)))
     (hslot_d : get? s.frame.locals e_d.localIdx = some (.init (.scalar dstSc)))
+    (hdecl_s : get? body.localDecls e_s.localIdx = some decl_s)
+    (hint_s : intCastTargetBytes decl_s.ty.kind = some srcBytes)
     (hdecl_d : get? body.localDecls e_d.localIdx = some decl_d)
     (hint_d : intCastTargetBytes decl_d.ty.kind = some srcBytes)
     (hrig_d : rigidTyByteSize body.layouts decl_d.ty = some srcBytes)
     (hsrc_pos : 0 < srcBytes)
     (hsc_sz : srcSc.sizeBytes = srcBytes)
     (hsc_lt : srcSc.bits < scalarModulus srcBytes)
+    (hbor :
+      if Nat.beq countSc.bits 1 then
+        borrows' = invalidateConflictingBorrows s.memory.borrows e_d.localIdx (some dstPtr.tag)
+      else
+        borrowsAfterCopySlice s.memory.borrows s.memory.activeProtectors
+          srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry .nil .nil = some borrows')
     (hstack : s.memory.callStack = .nil := by rfl) :
     stepMirFn body s =
       MirStepNode.step
         (advanceStmt s (s.frame.locals.set e_d.localIdx (.init (.scalar srcSc)))
-          { s.memory with
-            borrows := invalidateConflictingBorrows s.memory.borrows e_d.localIdx
-              (some dstPtr.tag) }) := by
+          { s.memory with borrows := borrows' }) := by
   have hstep : stepMirFn body s =
       evalCopyNonOverlapping s (.copy ⟨srcIdx, []⟩) (.copy ⟨dstIdx, []⟩) countOp
         body.localDecls body.layouts := by
@@ -8207,11 +8432,11 @@ theorem stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
     | zero => rw [h] at hcnt_pos; exact absurd hcnt_pos (Nat.lt_irrefl 0)
     | succ _ => rfl
   have hperm_ok := evalCopyNonOverlappingPermOk_stage1_distinct_int_scalar_eq
-    (s := s) (countBits := countSc.bits) hprim
+    (s := s) (countBits := countSc.bits) hprim hpt_sz
     (operandPointeeTy_copy_rawPtr hsrcDecl hsrcTy)
     (operandPointeeTy_copy_rawPtr hdstDecl hdstTy)
-    hoff0_s hoff0_d hne_tag hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_d hint_d hrig_d hsrc_pos hsc_sz hsc_lt hstack
+    hoff0_s hoff0_d hfull hne_tag hne_loc hunion_s hunion_d
+    hslot_s hslot_d hdecl_s hint_s hdecl_d hint_d hrig_d hsrc_pos hsc_sz hsc_lt hbor hstack
   have hact_fr : ∀ a b, copyEntriesTargetActiveFrame s.memory.callStack a b = true := by
     rw [hstack]; intros; rfl
   rw [hstep]
@@ -8228,8 +8453,8 @@ theorem stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
 /-- **Reference `stepMirFnLM4_2` evaluation on full-local copies between distinct
 initialized integer locals at offset `0` (`LM-4.2`)**: when
 `countSc.bits * elemBytes = srcBytes` (`= dstBytes`) and `srcBytes ≤ isizeMaxBytes`,
-`stepMirFnLM4_2` steps to the exact same state as Stage-1 `stepMirFn`, storing
-`.init (.scalar srcSc)` in `e_d.localIdx`. -/
+`stepMirFnLM4_2` steps to the state storing `.init (.scalar srcSc)` in `e_d.localIdx`
+with `invalidateConflictingBorrows` on `e_d.localIdx`. -/
 theorem stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
     {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -8342,9 +8567,10 @@ theorem stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
 
 /-- **Stage-1 vs. `stepMirFnLM4_2` agreement on full-local multi-element integer
 copies (`LM-4.2`)**: when `countSc.bits * elemBytes = srcBytes` (`= dstBytes`) on
-distinct initialized non-union integer locals at offset `0`, Stage-1 `stepMirFn`
-(whether via `evalCopySingleDirect` for `count = 1` or `copyViaBytes` for `count > 1`)
-equals `stepMirFnLM4_2`. -/
+distinct initialized non-union integer locals at offset `0` and `borrowsAfterCopySlice`
+agrees with `invalidateConflictingBorrows` when `countSc.bits ≠ 1` (i.e., no foreign
+`.active` borrow on `e_s.localIdx` needs to be frozen), Stage-1 `stepMirFn` equals
+`stepMirFnLM4_2`. -/
 theorem stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2
     {body : CapturedMir} {s : MachineState}
     (hcal : s.memory.activeCallee = none)
@@ -8391,24 +8617,301 @@ theorem stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2
     (hsrc_le : srcBytes ≤ isizeMaxBytes)
     (hsc_sz : srcSc.sizeBytes = srcBytes)
     (hsc_lt : srcSc.bits < scalarModulus srcBytes)
+    (hbor_eq :
+      Nat.beq countSc.bits 1 = false →
+        borrowsAfterCopySlice s.memory.borrows s.memory.activeProtectors
+          srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry .nil .nil =
+          some (invalidateConflictingBorrows s.memory.borrows e_d.localIdx (some dstPtr.tag)))
     (hstack : s.memory.callStack = .nil := by rfl) :
     stepMirFn body s = stepMirFnLM4_2 body s :=
   (stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
-    hcal hphase hbb hstmt hprim hsrcDecl hsrcTy hdstDecl hdstTy
-    hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos hlook_s hlook_d
+    hcal hphase hbb hstmt hprim hpt.wb.anneal_size hsrcDecl hsrcTy hdstDecl hdstTy
+    hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos hfull hlook_s hlook_d
     hperm_s hperm_d hne_tag hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_d hint_d hrig_d hsrc_pos hsc_sz hsc_lt hstack).trans
+    hslot_s hslot_d hdecl_s hint_s hdecl_d hint_d hrig_d hsrc_pos hsc_sz hsc_lt
+    (by
+      cases hc1 : Nat.beq countSc.bits 1
+      · simp only [Bool.false_eq_true, ↓reduceIte]; exact hbor_eq hc1
+      · simp only [↓reduceIte]) hstack).trans
   (stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
     hcal hphase hbb hstmt hsrcDecl hsrcTy hpt
     hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hfull hlook_s hlook_d
     hperm_s hperm_d hne_loc hslot_s hslot_d
     hdecl_s hint_s hrig_s hdecl_d hint_d hrig_d hsrc_pos hsrc_le hsc_sz hsc_lt).symm
 
+/-- Computable post-step `allocMap'` for Stage-1 full-local `copy_nonoverlapping`
+(`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`):
+for `count = 1` (`evalCopySingleDirect`), coincides with `copyNextAllocMap`; for
+`count > 1` (`evalCopySubplaceMulti` / `borrowsAfterCopySlice`), additionally
+freezes foreign `.active` borrows on the source local via `AllocMapEntry.updateOnRead`. -/
+def copyStage1FullBytesNextAllocMap
+    (locals : List LocalSlot) (allocMap : List AllocMapEntry)
+    (srcIdx dstIdx : Local) (countOp : MirAst.Operand) (elemBytes : Nat) :
+    List AllocMapEntry :=
+  let afterWrite := copyNextAllocMap locals allocMap dstIdx countOp elemBytes
+  match writeBytesScalarVal? locals countOp with
+  | some countSc =>
+    if Nat.beq countSc.bits 1 then afterWrite
+    else
+      match get? locals srcIdx with
+      | some (.init (.ptr srcPtr 8)) =>
+        match lookupAllocMapByTag allocMap srcPtr.tag with
+        | some e_s => afterWrite.map (fun x => x.updateOnRead e_s.localIdx srcPtr.tag)
+        | none => afterWrite
+      | _ => afterWrite
+  | none => afterWrite
+
+private theorem updateOnRead_tag (e : AllocMapEntry) (loc : Local) (rTag : Nat) :
+    (e.updateOnRead loc rTag).tag = e.tag := by
+  unfold AllocMapEntry.updateOnRead
+  cases Nat.beq e.localIdx loc
+  · rfl
+  · dsimp only
+    cases Nat.beq rTag e.tag
+    · cases e.perm <;> rfl
+    · rfl
+
+private theorem updateOnRead_localIdx (e : AllocMapEntry) (loc : Local) (rTag : Nat) :
+    (e.updateOnRead loc rTag).localIdx = e.localIdx := by
+  unfold AllocMapEntry.updateOnRead
+  cases Nat.beq e.localIdx loc
+  · rfl
+  · dsimp only
+    cases Nat.beq rTag e.tag
+    · cases e.perm <;> rfl
+    · rfl
+
+private theorem updateOnRead_allocId (e : AllocMapEntry) (loc : Local) (rTag : Nat) :
+    (e.updateOnRead loc rTag).allocId = e.allocId := by
+  unfold AllocMapEntry.updateOnRead
+  cases Nat.beq e.localIdx loc
+  · rfl
+  · dsimp only
+    cases Nat.beq rTag e.tag
+    · cases e.perm <;> rfl
+    · rfl
+
+private theorem updateOnWrite_comm_updateOnRead_of_ne
+    (x : AllocMapEntry) {locS locD : Local} (hne : locS ≠ locD) (rTag wTag : Nat) :
+    (x.updateOnRead locS rTag).updateOnWrite locD (some wTag) =
+      (x.updateOnWrite locD (some wTag)).updateOnRead locS rTag := by
+  have hw_loc : (x.updateOnWrite locD (some wTag)).localIdx = x.localIdx := rfl
+  have hr_loc : (x.updateOnRead locS rTag).localIdx = x.localIdx := updateOnRead_localIdx x locS rTag
+  cases hs : Nat.beq x.localIdx locS with
+  | true =>
+    have hxs : x.localIdx = locS := Nat.eq_of_beq_eq_true hs
+    have hd : Nat.beq x.localIdx locD = false := by
+      cases h : Nat.beq x.localIdx locD
+      · rfl
+      · exact absurd (hxs.symm.trans (Nat.eq_of_beq_eq_true h)) hne
+    have hw_id : ∀ y : AllocMapEntry, y.localIdx = x.localIdx →
+        y.updateOnWrite locD (some wTag) = y := by
+      intro y hy
+      rcases y with ⟨yt, yl, ya, yp, ydead⟩
+      dsimp only at hy
+      unfold AllocMapEntry.updateOnWrite AllocMapEntry.toBorrowEntry updateBorrowPerm
+      dsimp only
+      rw [hy, hd]
+      simp only [Bool.and_false]
+    rw [hw_id (x.updateOnRead locS rTag) hr_loc, hw_id x rfl]
+  | false =>
+    have hr_id : ∀ y : AllocMapEntry, y.localIdx = x.localIdx →
+        y.updateOnRead locS rTag = y := by
+      intro y hy
+      unfold AllocMapEntry.updateOnRead
+      rw [hy, hs]
+    rw [hr_id x rfl, hr_id (x.updateOnWrite locD (some wTag)) hw_loc]
+
+private theorem borrowsAfterCopySlice_map_toBorrowEntry_distinct_ok
+    {allocMap : List AllocMapEntry}
+    (hnodup : (allocMap.map AllocMapEntry.tag).Nodup)
+    {srcPtr dstPtr : ProvenancePtr} {e_s e_d : AllocMapEntry}
+    (he_s : e_s ∈ allocMap) (het_s : e_s.tag = srcPtr.tag) (hperm_s : e_s.perm ≠ .disabled)
+    (he_d : e_d ∈ allocMap) (het_d : e_d.tag = dstPtr.tag)
+    (hperm_d : e_d.perm = .active ∨ e_d.perm = .reserved)
+    (hne_loc : e_s.localIdx ≠ e_d.localIdx) :
+    borrowsAfterCopySlice (allocMap.map AllocMapEntry.toBorrowEntry) .nil
+        srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry .nil .nil =
+      some (((updateAllocMapOnWrite allocMap e_d.localIdx (some dstPtr.tag)).map
+        (fun x => x.updateOnRead e_s.localIdx srcPtr.tag)).map AllocMapEntry.toBorrowEntry) := by
+  match allocMap with
+  | [] => cases he_s
+  | [a] =>
+    rcases List.mem_singleton.mp he_s with rfl
+    have hed := List.mem_singleton.mp he_d
+    exact absurd (congrArg AllocMapEntry.localIdx hed.symm) hne_loc
+  | a₁ :: a₂ :: rest =>
+    let full := a₁ :: a₂ :: rest
+    have hperm_tag : ∀ x ∈ full, x.tag = srcPtr.tag → x.perm ≠ .disabled := by
+      rw [← het_s]
+      exact perm_ne_disabled_of_tag_eq_of_nodup hnodup he_s hperm_s
+    have hrub := hasTreeReadUB_map_toBorrowEntry_eq_false full full e_s.localIdx srcPtr.tag hperm_tag
+    have hfrz := freezeTreeBorrowsOnReadAtProj_map_toBorrowEntry full full e_s.localIdx srcPtr.tag
+    let readMap := full.map (fun x => x.updateOnRead e_s.localIdx srcPtr.tag)
+    have hr_nodup : (readMap.map AllocMapEntry.tag).Nodup := by
+      have htags : readMap.map AllocMapEntry.tag = full.map AllocMapEntry.tag := by
+        dsimp only [readMap]
+        rw [List.map_map]
+        exact List.map_congr_left (fun x _ => updateOnRead_tag x e_s.localIdx srcPtr.tag)
+      rw [htags]
+      exact hnodup
+    have hed_read_eq : e_d.updateOnRead e_s.localIdx srcPtr.tag = e_d := by
+      unfold AllocMapEntry.updateOnRead
+      have hb : Nat.beq e_d.localIdx e_s.localIdx = false := by
+        cases h : Nat.beq e_d.localIdx e_s.localIdx
+        · rfl
+        · exact absurd (Nat.eq_of_beq_eq_true h).symm hne_loc
+      rw [hb]
+    have hed_mem : e_d ∈ readMap := by
+      rw [← hed_read_eq]
+      exact List.mem_map_of_mem he_d
+    have hlook_d : lookupBorrow (readMap.map AllocMapEntry.toBorrowEntry) dstPtr.tag =
+        some e_d.toBorrowEntry := by
+      rw [← het_d]
+      exact lookupBorrow_map_toBorrowEntry_of_nodup hr_nodup hed_mem
+    have hinv := invalidateTreeBorrowsAtProj_map_toBorrowEntry readMap readMap e_d.localIdx dstPtr.tag
+    have hcomm : updateAllocMapOnWrite readMap e_d.localIdx (some dstPtr.tag) =
+        (updateAllocMapOnWrite full e_d.localIdx (some dstPtr.tag)).map
+          (fun x => x.updateOnRead e_s.localIdx srcPtr.tag) := by
+      dsimp only [readMap, updateAllocMapOnWrite]
+      rw [List.map_map, List.map_map]
+      exact List.map_congr_left (fun x _ =>
+        updateOnWrite_comm_updateOnRead_of_ne x hne_loc srcPtr.tag dstPtr.tag)
+    have hse_eq :
+        { e_s.toBorrowEntry with targetProjection := .nil, rangeOffset := 0, rangeLen := 0 } =
+          e_s.toBorrowEntry := rfl
+    have hde_eq :
+        { e_d.toBorrowEntry with targetProjection := .nil, rangeOffset := 0, rangeLen := 0 } =
+          e_d.toBorrowEntry := rfl
+    unfold borrowsAfterCopySlice borrowsAfterCopySingleDirect
+    rw [hse_eq, hde_eq]
+    have hts : (e_s.toBorrowEntry).targetLocal = e_s.localIdx := rfl
+    have hps : (e_s.toBorrowEntry).targetProjection = .nil := rfl
+    have hros : (e_s.toBorrowEntry).rangeOffset = 0 := rfl
+    have hrls : (e_s.toBorrowEntry).rangeLen = 0 := rfl
+    have hds : (e_s.toBorrowEntry).targetFrameDepth = 0 := rfl
+    have htd : (e_d.toBorrowEntry).targetLocal = e_d.localIdx := rfl
+    have hpd : (e_d.toBorrowEntry).targetProjection = .nil := rfl
+    have hrod : (e_d.toBorrowEntry).rangeOffset = 0 := rfl
+    have hrld : (e_d.toBorrowEntry).rangeLen = 0 := rfl
+    have hdd : (e_d.toBorrowEntry).targetFrameDepth = 0 := rfl
+    change (match hasTreeReadUB (full.map AllocMapEntry.toBorrowEntry)
+        (full.map AllocMapEntry.toBorrowEntry) .nil e_s.localIdx (some srcPtr.tag) .nil 0 0 0 with
+      | true => none
+      | false => _) = _
+    rw [hrub]
+    have hfrz' :
+        freezeTreeBorrowsOnReadAtProj
+          (a₁.toBorrowEntry :: a₂.toBorrowEntry :: List.map AllocMapEntry.toBorrowEntry rest)
+          (a₁.toBorrowEntry :: a₂.toBorrowEntry :: List.map AllocMapEntry.toBorrowEntry rest)
+          e_s.localIdx (some srcPtr.tag) .nil =
+        (a₁.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+        (a₂.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+        List.map AllocMapEntry.toBorrowEntry
+          (List.map (fun e => e.updateOnRead e_s.localIdx srcPtr.tag) rest) := hfrz
+    have hlook_d' :
+        lookupBorrow
+          ((a₁.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           (a₂.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           List.map AllocMapEntry.toBorrowEntry
+             (List.map (fun e => e.updateOnRead e_s.localIdx srcPtr.tag) rest))
+          dstPtr.tag = some e_d.toBorrowEntry := hlook_d
+    have hinv' :
+        invalidateTreeBorrowsAtProj
+          ((a₁.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           (a₂.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           List.map AllocMapEntry.toBorrowEntry
+             (List.map (fun e => e.updateOnRead e_s.localIdx srcPtr.tag) rest))
+          ((a₁.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           (a₂.updateOnRead e_s.localIdx srcPtr.tag).toBorrowEntry ::
+           List.map AllocMapEntry.toBorrowEntry
+             (List.map (fun e => e.updateOnRead e_s.localIdx srcPtr.tag) rest))
+          e_d.localIdx (some dstPtr.tag) .nil =
+        List.map AllocMapEntry.toBorrowEntry (updateAllocMapOnWrite readMap e_d.localIdx (some dstPtr.tag)) := hinv
+    have hparent_d : (e_d.toBorrowEntry).parentTag = none := rfl
+    have hperm_ed : (e_d.toBorrowEntry).perm = e_d.perm := rfl
+    rcases hperm_d with hp_d | hp_d <;> (
+      simp only [List.map_cons, hts, hps, hros, hrls, hds, hfrz', hlook_d',
+        hperm_ed, hparent_d, hp_d, treeBorrowAncestorsChildAccessUB,
+        htd, hpd, hrod, hrld, hdd, hinv', hcomm]
+      rfl)
+
+private theorem StateRelLM3_1.perm_map
+    {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
+    {allocMap : List AllocMapEntry}
+    (hstate : StateRelLM3_1 body s m allocMap)
+    (f : AllocMapEntry → AllocMapEntry)
+    (htag : ∀ e, (f e).tag = e.tag)
+    (hloc_idx : ∀ e, (f e).localIdx = e.localIdx)
+    (halloc_id : ∀ e, (f e).allocId = e.allocId) :
+    StateRelLM3_1 body
+      { s with memory := { s.memory with borrows := (allocMap.map f).map AllocMapEntry.toBorrowEntry } }
+      m (allocMap.map f) := by
+  rcases hstate with
+    ⟨tf, hframes, hretCont, hretPlace, hfr, hcal, hcs, hprot, hcaller, _, halloc, hdisj⟩
+  have hnodup' : ((allocMap.map f).map AllocMapEntry.tag).Nodup := by
+    have hmap_tag : (allocMap.map f).map AllocMapEntry.tag = allocMap.map AllocMapEntry.tag := by
+      rw [List.map_map]
+      exact List.map_congr_left (fun e _ => htag e)
+    rw [hmap_tag]
+    exact halloc.tags_nodup
+  refine .mk tf hframes hretCont hretPlace (hfr.map_preserve f htag halloc_id)
+    hcal hcs hprot hcaller rfl ?_ hdisj
+  refine ⟨hnodup', ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · intro e₁ h₁ e₂ h₂ heq
+    obtain ⟨x₁, hx₁, rfl⟩ := List.mem_map.mp h₁
+    obtain ⟨x₂, hx₂, rfl⟩ := List.mem_map.mp h₂
+    rw [hloc_idx, hloc_idx] at heq
+    rw [halloc_id, halloc_id]
+    exact halloc.local_to_alloc_unique x₁ hx₁ x₂ hx₂ heq
+  · intro e₁ h₁ e₂ h₂ heq
+    obtain ⟨x₁, hx₁, rfl⟩ := List.mem_map.mp h₁
+    obtain ⟨x₂, hx₂, rfl⟩ := List.mem_map.mp h₂
+    rw [halloc_id, halloc_id] at heq
+    rw [hloc_idx, hloc_idx]
+    exact halloc.alloc_to_local_injective x₁ hx₁ x₂ hx₂ heq
+  · intro e' he'
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+    rw [hloc_idx]
+    exact halloc.target_decl e he
+  · intro e' he'
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+    rw [halloc_id]
+    exact halloc.base_addr_valid e he
+  · intro e' he'
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+    refine ⟨?_, lookupBorrow_map_toBorrowEntry_of_nodup hnodup' he'⟩
+    dsimp only
+    rw [htag]
+    exact (halloc.borrow_sync e he).1
+  · intro e' he' la₁ la₂ hla₁ hla₂
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+    rw [halloc_id] at hla₁ hla₂
+    exact halloc.live_key_unique e he la₁ la₂ hla₁ hla₂
+  · intro tf' htf' e' he'
+    obtain ⟨e, he, rfl⟩ := List.mem_map.mp he'
+    obtain ⟨hlive_e, hdead_e⟩ := halloc.local_alloc_sync tf' htf' e he
+    refine ⟨fun slot' hslot' hne_dead => ?_, fun hdead' => ?_⟩
+    · dsimp only at hslot'
+      rw [hloc_idx] at hslot'
+      obtain ⟨⟨lay, hlay⟩, hsc, hshape⟩ := hlive_e slot' hslot' hne_dead
+      refine ⟨⟨lay, ?_⟩, hsc, ?_⟩
+      · rw [hloc_idx, halloc_id]; exact hlay
+      · intro decl_e hdecl_e
+        rw [hloc_idx] at hdecl_e
+        rw [halloc_id]
+        exact hshape decl_e hdecl_e
+    · dsimp only at hdead'
+      rw [hloc_idx] at hdead'
+      rw [halloc_id]
+      exact hdead_e hdead'
+
 /-- **`step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation`
 (`LM-4.2`, Stage-1 `Trusted`)**: general Stage-1 `StepRelLM3_1` lockstep simulation
 for full-local multi-element copies (`countSc.bits * elemBytes = integerKindByteWidth srcKind`)
 at offset `0` between distinct initialized non-union integer locals of equal byte
-width (`integerKindByteWidth dstKind = integerKindByteWidth srcKind`). -/
+width (`integerKindByteWidth dstKind = integerKindByteWidth srcKind`), tracking
+Stage-1's post-copy borrow state via `copyStage1FullBytesNextAllocMap`. -/
 theorem step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulation
     {body : CapturedMir} {s : MachineState} {m : AnnealStepState}
     {allocMap : List AllocMapEntry}
@@ -8457,10 +8960,10 @@ theorem step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulat
     (hsc_sz : srcSc.sizeBytes = integerKindByteWidth srcKind)
     (hsc_lt : srcSc.bits < scalarModulus (integerKindByteWidth srcKind)) :
     StepRelLM3_1 body m
-      (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+      (copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes)
       (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
-  obtain ⟨_, _, _, _, _, hcal, _, _, _, _, halloc, _⟩ := id hstate
+  obtain ⟨_, _, _, _, _, hcal, hcs, hprot, _, hbor_eq, halloc, _⟩ := id hstate
   let srcBytes := integerKindByteWidth srcKind
   obtain ⟨hrig_s, _, hvalid_s⟩ := hsrcInt.size_spec body.layouts
   obtain ⟨hrig_d, _, _⟩ := hdstInt.size_spec body.layouts
@@ -8486,55 +8989,119 @@ theorem step_intrinsic_copyNonOverlapping_stage1_full_bytes_distinct_int_simulat
       (het_d.trans htag.symm)
     rw [hl1] at hl2; injection hl2 with heq
     exact hne_loc (congrArg AllocMapEntry.localIdx heq)
-  rw [stepMirFn_copyNonOverlapping_stage1_full_bytes_distinct_int_eq_lm4_2
-    hcal hphase hbb hstmt hprim hsrcDecl hsrcTy hdstDecl hdstTy hpt
-    hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos hfull hlook_s hlook_d
-    hperm_s hperm_d hne_tag hne_loc hunion_s hunion_d
-    hslot_s hslot_d hdecl_s hint_s hrig_s hdecl_d hint_d hrig_d'
-    hsrc_pos hsrc_le hsc_sz hsc_lt hstate.callStack_nil]
-  refine step_intrinsic_copyNonOverlapping_simulation_explicit hstate hphase hbb hstmt
-    hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt ?_ ?_
-  · intro srcPtr' dstPtr' e_s' e_d' decl_s' decl_d'
-      hsrc' hdst' he_s' het_s' he_d' het_d' hdecl_s' hdecl_d' _
-    have hpS : srcPtr' = srcPtr := by
-      have := Option.some.inj (hsrc'.symm.trans hsrc_val)
-      injection this with h; injection h
-    have hpD : dstPtr' = dstPtr := by
-      have := Option.some.inj (hdst'.symm.trans hdst_val)
-      injection this with h; injection h
-    subst hpS hpD
-    have hes_eq : e_s' = e_s := by
-      have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s' het_s'
-      have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
-      exact Option.some.inj (hl1.symm.trans hl2)
-    have hed_eq : e_d' = e_d := by
-      have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d' het_d'
-      have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d
-      exact Option.some.inj (hl1.symm.trans hl2)
-    subst hes_eq hed_eq
-    have hds_eq : decl_s' = decl_s := Option.some.inj (hdecl_s'.symm.trans hdecl_s)
-    have hdd_eq : decl_d' = decl_d := Option.some.inj (hdecl_d'.symm.trans hdecl_d)
-    subst hds_eq hdd_eq
-    exact Or.inl ⟨⟨srcKind, hsrcInt⟩, ⟨dstKind, hdstInt⟩⟩
-  · intro srcPtr' dstPtr' countSc' e_s' e_d' _ _ _ _
-      hsrc' hdst' _ _ _ he_s' het_s' he_d' het_d' _ _ _ _ _ _ _ _
-    have hpS : srcPtr' = srcPtr := by
-      have := Option.some.inj (hsrc'.symm.trans hsrc_val)
-      injection this with h; injection h
-    have hpD : dstPtr' = dstPtr := by
-      have := Option.some.inj (hdst'.symm.trans hdst_val)
-      injection this with h; injection h
-    subst hpS hpD
-    have hes_eq : e_s' = e_s := by
-      have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s' het_s'
-      have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
-      exact Option.some.inj (hl1.symm.trans hl2)
-    have hed_eq : e_d' = e_d := by
-      have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d' het_d'
-      have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d
-      exact Option.some.inj (hl1.symm.trans hl2)
-    subst hes_eq hed_eq
-    exact ⟨hperm_s, hperm_d, by rw [hslot_s]; nofun, Or.inr (by rw [hslot_d]; nofun)⟩
+  have hsim_lm :
+      StepRelLM3_1 body m
+        (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes)
+        (stepMirFnLM4_2 body s)
+        (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+    refine step_intrinsic_copyNonOverlapping_simulation_explicit hstate hphase hbb hstmt
+      hsrcDecl hsrcTy hsrcImm hdstDecl hdstTy hdstImm hcountInt hcountOp hpt ?_ ?_
+    · intro srcPtr' dstPtr' e_s' e_d' decl_s' decl_d'
+        hsrc' hdst' he_s' het_s' he_d' het_d' hdecl_s' hdecl_d' _
+      have hpS : srcPtr' = srcPtr := by
+        have := Option.some.inj (hsrc'.symm.trans hsrc_val)
+        injection this with h; injection h
+      have hpD : dstPtr' = dstPtr := by
+        have := Option.some.inj (hdst'.symm.trans hdst_val)
+        injection this with h; injection h
+      subst hpS hpD
+      have hes_eq : e_s' = e_s := by
+        have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s' het_s'
+        have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
+        exact Option.some.inj (hl1.symm.trans hl2)
+      have hed_eq : e_d' = e_d := by
+        have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d' het_d'
+        have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d
+        exact Option.some.inj (hl1.symm.trans hl2)
+      subst hes_eq hed_eq
+      have hds_eq : decl_s' = decl_s := Option.some.inj (hdecl_s'.symm.trans hdecl_s)
+      have hdd_eq : decl_d' = decl_d := Option.some.inj (hdecl_d'.symm.trans hdecl_d)
+      subst hds_eq hdd_eq
+      exact Or.inl ⟨⟨srcKind, hsrcInt⟩, ⟨dstKind, hdstInt⟩⟩
+    · intro srcPtr' dstPtr' countSc' e_s' e_d' _ _ _ _
+        hsrc' hdst' _ _ _ he_s' het_s' he_d' het_d' _ _ _ _ _ _ _ _
+      have hpS : srcPtr' = srcPtr := by
+        have := Option.some.inj (hsrc'.symm.trans hsrc_val)
+        injection this with h; injection h
+      have hpD : dstPtr' = dstPtr := by
+        have := Option.some.inj (hdst'.symm.trans hdst_val)
+        injection this with h; injection h
+      subst hpS hpD
+      have hes_eq : e_s' = e_s := by
+        have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s' het_s'
+        have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s
+        exact Option.some.inj (hl1.symm.trans hl2)
+      have hed_eq : e_d' = e_d := by
+        have hl1 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d' het_d'
+        have hl2 := copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d
+        exact Option.some.inj (hl1.symm.trans hl2)
+      subst hes_eq hed_eq
+      exact ⟨hperm_s, hperm_d, by rw [hslot_s]; nofun, Or.inr (by rw [hslot_d]; nofun)⟩
+  have hlm_eq := stepMirFnLM4_2_copyNonOverlapping_full_bytes_distinct_int_scalar_eq
+    hcal hphase hbb hstmt hsrcDecl hsrcTy hpt
+    hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hfull hlook_s hlook_d
+    hperm_s hperm_d hne_loc hslot_s hslot_d
+    hdecl_s hint_s hrig_s hdecl_d hint_d hrig_d' hsrc_pos hsrc_le hsc_sz hsc_lt
+  rw [hlm_eq] at hsim_lm
+  have hcnt_val : writeBytesScalarVal? s.frame.locals countOp = some countSc := by
+    rcases hcnt_pre with ⟨cc, rfl, hv⟩ | ⟨idx, rfl, hsl⟩
+    · simp [writeBytesScalarVal?, hv]
+    · simp [writeBytesScalarVal?, hsl]
+  generalize Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m = res at hsim_lm ⊢
+  cases hsim_lm with
+  | step _ m' hrel_lm =>
+    cases hc1 : Nat.beq countSc.bits 1 with
+  | true =>
+    have hmap_eq :
+        copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes =
+          copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes := by
+      unfold copyStage1FullBytesNextAllocMap
+      rw [hcnt_val]
+      simp [hc1]
+    have hst_eq := stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+      hcal hphase hbb hstmt hprim hpt.wb.anneal_size hsrcDecl hsrcTy hdstDecl hdstTy
+      hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos hfull hlook_s hlook_d
+      hperm_s hperm_d hne_tag hne_loc hunion_s hunion_d
+      hslot_s hslot_d hdecl_s hint_s hdecl_d hint_d hrig_d' hsrc_pos hsc_sz hsc_lt
+      (by rw [hc1]; rfl) hcs
+    rw [hmap_eq, hst_eq]
+    exact .step _ m' hrel_lm
+  | false =>
+    have hpos_bytes : countSc.bits * elemBytes ≠ 0 := by omega
+    have hmap_lm_eq :
+        copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes =
+          updateAllocMapOnWrite allocMap e_d.localIdx (some dstPtr.tag) := by
+      unfold copyNextAllocMap writeBytesNextAllocMap
+      simp only [hcnt_val, hpos_bytes, ↓reduceIte, hdst_val,
+        copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_d het_d]
+    have hmap_st_eq :
+        copyStage1FullBytesNextAllocMap s.frame.locals allocMap srcIdx dstIdx countOp elemBytes =
+          (copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes).map
+            (fun x => x.updateOnRead e_s.localIdx srcPtr.tag) := by
+      unfold copyStage1FullBytesNextAllocMap
+      rw [hcnt_val]
+      simp only [hc1, Bool.false_eq_true, ↓reduceIte, hsrc_val,
+        copyLookupAllocMapByTag_of_mem_nodup halloc.tags_nodup he_s het_s]
+    have hbor_slice :
+        borrowsAfterCopySlice s.memory.borrows s.memory.activeProtectors
+          srcPtr dstPtr e_s.toBorrowEntry e_d.toBorrowEntry .nil .nil =
+        some (((copyNextAllocMap s.frame.locals allocMap dstIdx countOp elemBytes).map
+          (fun x => x.updateOnRead e_s.localIdx srcPtr.tag)).map AllocMapEntry.toBorrowEntry) := by
+      rw [hbor_eq, hprot, hmap_lm_eq]
+      exact borrowsAfterCopySlice_map_toBorrowEntry_distinct_ok halloc.tags_nodup
+        he_s het_s hperm_s he_d het_d hperm_d hne_loc
+    have hst_eq := stepMirFn_copyNonOverlapping_stage1_distinct_int_scalar_eq
+      hcal hphase hbb hstmt hprim hpt.wb.anneal_size hsrcDecl hsrcTy hdstDecl hdstTy
+      hsrc_val hdst_val hoff0_s hoff0_d hcnt_pre hcnt_pos hfull hlook_s hlook_d
+      hperm_s hperm_d hne_tag hne_loc hunion_s hunion_d
+      hslot_s hslot_d hdecl_s hint_s hdecl_d hint_d hrig_d' hsrc_pos hsc_sz hsc_lt
+      (by simp only [hc1, Bool.false_eq_true, ↓reduceIte]; exact hbor_slice) hcs
+    rw [hmap_st_eq, hst_eq]
+    exact .step _ m' (hrel_lm.perm_map
+      (fun x => x.updateOnRead e_s.localIdx srcPtr.tag)
+      (fun x => updateOnRead_tag x e_s.localIdx srcPtr.tag)
+      (fun x => updateOnRead_localIdx x e_s.localIdx srcPtr.tag)
+      (fun x => updateOnRead_allocId x e_s.localIdx srcPtr.tag))
 
 
 end LeanMiriSpec.Correspondence

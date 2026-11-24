@@ -317,9 +317,11 @@ theorem call_intrinsic_bitcount_simulation
     (hdstImm : ∀ tf, m.stack.frames = #[tf] → IsImmediateFrameLocal tf dstIdx) :
     StepRelLM3_1 body m allocMap (stepMirFn body s)
       (Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m) := by
+  obtain ⟨tf₀, hframes₀, _⟩ := id hstate
   refine step_intrinsic_call_one_simulation hstate hphase hbb hstmt_none hstmt_len
     (AnnealIntrinsic.ofBit_arity op) hterm hc hprog hop₁ hint.prim hdst hdstInt.prim hdstImm
-    _ (evalTerminator_stage1_bitcount_call op hterm hc hcallee)
+    _ (evalTerminator_stage1_bitcount_call op hterm hc hcallee
+      (operandsHaveLeadingOpaqueCastMove_one_of_wellTyped (hop₁ tf₀ hframes₀)))
     ?_ ?_
   · intro dest m'
     rw [intrinsics_eval_numeric _ _ _ (AnnealIntrinsic.ofBit_numeric op)]
@@ -507,10 +509,11 @@ theorem call_intrinsic_rotate_stage1_boundary
         (m', .error (.unsupported msg))) ∨
       (∃ m' msg, Miri.Interpreter.Step.step (annealStepHooks body.localDecls body.layouts) () m =
         (m', .error (.undefinedBehavior msg)))) := by
-  obtain ⟨_, _, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id hstate
+  obtain ⟨tf₀, hframes₀, _, _, _, hcal, hstack, _, _, _, _, _⟩ := id hstate
   have hk : k.stage1Unmodeled = true := by rcases hrot with ⟨rfl, _⟩ | ⟨rfl, _⟩ <;> rfl
   have hstep := stepMirFn_stage1_unmodeled_intrinsic_extCall hcal hphase hbb hstmt_none hstmt_len
     hk hterm hc hcallee
+    (operandsHaveLeadingOpaqueCastMove_two_of_wellTyped (hop₁ tf₀ hframes₀) (hop₂ tf₀ hframes₀))
   rw [hstack] at hstep
   refine ⟨hstep, ?_⟩
   rcases call_intrinsic_rotate_simulation hstate hphase hbb hstmt_none hstmt_len hrot hterm hint
@@ -586,9 +589,12 @@ theorem call_intrinsic_saturating_simulation
     rcases hsat with ⟨rfl, rfl⟩ | ⟨rfl, rfl⟩
     · exact intrinsics_eval_saturatingAdd _ _ _ _ _ _ _
     · exact intrinsics_eval_saturatingSub _ _ _ _ _ _ _
+  obtain ⟨tf₀, hframes₀, _⟩ := id hstate
   refine step_intrinsic_call_two_simulation hstate hphase hbb hstmt_none hstmt_len hk2 hterm hc
     hprog hop₁ hop₂ hint.prim hint.prim hdst hdstInt.prim hdstImm _
-    (evalTerminator_stage1_saturating_call hsat hint hterm hc hcallee) ?_ ?_ ?_
+    (evalTerminator_stage1_saturating_call hsat hint hterm hc hcallee
+      (operandsHaveLeadingOpaqueCastMove_two_of_wellTyped (hop₁ tf₀ hframes₀) (hop₂ tf₀ hframes₀)))
+    ?_ ?_ ?_
   · intro v₂ dest m'
     rw [heval]
     exact ⟨_, rfl⟩
@@ -678,9 +684,12 @@ theorem call_intrinsic_exact_div_simulation
         dest (some targetBb) =
       annealExactDivEval body.localDecls body.layouts v₁ v₂ dest (some targetBb) :=
     fun v₁ v₂ dest => intrinsics_eval_exactDiv _ _ _ _ _ _ _
+  obtain ⟨tf₀, hframes₀, _⟩ := id hstate
   refine step_intrinsic_call_two_simulation hstate hphase hbb hstmt_none hstmt_len rfl hterm hc
     hprog hop₁ hop₂ hint.prim hint.prim hdst hdstInt.prim hdstImm _
-    (evalTerminator_stage1_exactDiv_call hint hterm hc hcallee) ?_ ?_ ?_
+    (evalTerminator_stage1_exactDiv_call hint hterm hc hcallee
+      (operandsHaveLeadingOpaqueCastMove_two_of_wellTyped (hop₁ tf₀ hframes₀) (hop₂ tf₀ hframes₀)))
+    ?_ ?_ ?_
   · intro v₂ dest m'
     rw [heval]
     exact ⟨_, rfl⟩
