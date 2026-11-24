@@ -1522,9 +1522,11 @@ Modeling assumptions and unsupported behavior: `CallConv.c` stands for both
 `"C"` (cannot unwind) and `"C-unwind"` (can unwind) because the capture lowers
 `ExternAbi::C { .. }` to it, and `CallConv.rustIntrinsic` and unknown names are
 not classified, so all three are `.none` (fail closed in
-`resumeExternalTailCallWithAbi`). A `-C panic=abort` build, `#[rustc_nounwind]`,
-and `-Z panic-in-drop=abort` only make more callees non-unwinding; they are
-outside this table and are treated as "may unwind".
+`resumeExternalTailCallWithAbi`). By contrast, `CallConv.other "C"` unambiguously
+names `ExternAbi::C { unwind: false }` (the `"C"` entry in the quoted
+`extern_abi.rs` passage) and maps to `.some false`. A `-C panic=abort` build,
+`#[rustc_nounwind]`, and `-Z panic-in-drop=abort` only make more callees
+non-unwinding; they are outside this table and are treated as "may unwind".
 -/
 @[reducible]
 def callConvCanUnwind? : CallConv → Option Bool
@@ -1543,7 +1545,7 @@ def callConvCanUnwind? : CallConv → Option Bool
     | false =>
       match
         abiNameIn name
-          ("system" :: "cdecl" :: "stdcall" :: "fastcall" :: "vectorcall" ::
+          ("C" :: "system" :: "cdecl" :: "stdcall" :: "fastcall" :: "vectorcall" ::
             "thiscall" :: "aapcs" :: "win64" :: "sysv64" :: "ptx-kernel" ::
             "msp430-interrupt" :: "x86-interrupt" :: "gpu-kernel" :: "efiapi" ::
             "avr-interrupt" :: "avr-non-blocking-interrupt" ::

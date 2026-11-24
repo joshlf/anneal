@@ -1619,16 +1619,18 @@ def elemsAreByteScalars : List Value → Bool
 /--
 One endpoint (`src` or `dst`) of a multi-element or sub-place
 `copy_nonoverlapping`: the pointer value `ptr`, its live borrow `entry`, the
-initialized root value `rootVal` of the local (or caller-owned referent) that
-`entry` targets, and the operand's static pointee type `pointeeOpt` when known.
+optional initialized root value `rootValOpt` of the local (or caller-owned
+referent) that `entry` targets (`.some v` when the root slot is `.init v`,
+`.none` when it is `.uninit`), and the operand's static pointee type
+`pointeeOpt` when known.
 -/
 structure CopyEndpoint : Type where
   /-- Pointer value of the operand. -/
   ptr : ProvenancePtr
   /-- Borrow entry of `ptr.tag`. -/
   entry : BorrowEntry
-  /-- Initialized root value of `entry.targetLocal`. -/
-  rootVal : Value
+  /-- Initialized root value of `entry.targetLocal`, or `.none` when `.uninit`. -/
+  rootValOpt : Option Value
   /-- Static pointee type of the operand (`operandPointeeTy`), when known. -/
   pointeeOpt : Option Ty
 
@@ -1780,46 +1782,49 @@ def resolveArraySliceEndpoint?
     (ep : CopyEndpoint)
     (elemSzOpt : Option Nat) :
     Option (List ProjectionElem × Nat × List Value) :=
-  let resolvedProj : List ProjectionElem :=
-    match resolveBorrowProjectionElems locals ep.entry.targetProjection with
-    | .some rp => normalizeSubsliceProjections rp
-    | .none => ep.entry.targetProjection
-  let direct : Option (List ProjectionElem × Nat × List Value) :=
-    match
-      copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal resolvedProj
-    with
-    | true => .none
-    | false =>
-      match readProjectedValue locals ep.rootVal resolvedProj with
-      | .ok (.aggregate 0 elems) => .some (resolvedProj, 0, elems)
-      | _ => .none
-  match splitLastConstantIndex? resolvedProj with
-  | .none => direct
-  | .some (initProj, idx, minLen) =>
-    match
-      copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal initProj
-    with
-    | true => direct
-    | false =>
-      match readProjectedValue locals ep.rootVal initProj with
-      | .ok (.aggregate 0 outerElems) =>
-        match
-          Bool.and
-            (Nat.ble minLen (length outerElems))
-            (Nat.blt idx (length outerElems))
-        with
-        | false => direct
-        | true =>
-          match direct, elemSzOpt with
-          | .some (innerProj, innerIdx, innerElems), .some elemSz =>
-            match
-              elemsMatchByteStride outerElems elemSz,
-              elemsMatchByteStride innerElems elemSz
-            with
-            | false, true => .some (innerProj, innerIdx, innerElems)
+  match ep.rootValOpt with
+  | .none => .none
+  | .some rootVal =>
+    let resolvedProj : List ProjectionElem :=
+      match resolveBorrowProjectionElems locals ep.entry.targetProjection with
+      | .some rp => normalizeSubsliceProjections rp
+      | .none => ep.entry.targetProjection
+    let direct : Option (List ProjectionElem × Nat × List Value) :=
+      match
+        copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal resolvedProj
+      with
+      | true => .none
+      | false =>
+        match readProjectedValue locals rootVal resolvedProj with
+        | .ok (.aggregate 0 elems) => .some (resolvedProj, 0, elems)
+        | _ => .none
+    match splitLastConstantIndex? resolvedProj with
+    | .none => direct
+    | .some (initProj, idx, minLen) =>
+      match
+        copyPlaceIsNonArrayAggregate localDecls layouts locals ep.entry.targetLocal initProj
+      with
+      | true => direct
+      | false =>
+        match readProjectedValue locals rootVal initProj with
+        | .ok (.aggregate 0 outerElems) =>
+          match
+            Bool.and
+              (Nat.ble minLen (length outerElems))
+              (Nat.blt idx (length outerElems))
+          with
+          | false => direct
+          | true =>
+            match direct, elemSzOpt with
+            | .some (innerProj, innerIdx, innerElems), .some elemSz =>
+              match
+                elemsMatchByteStride outerElems elemSz,
+                elemsMatchByteStride innerElems elemSz
+              with
+              | false, true => .some (innerProj, innerIdx, innerElems)
+              | _, _ => .some (initProj, idx, outerElems)
             | _, _ => .some (initProj, idx, outerElems)
-          | _, _ => .some (initProj, idx, outerElems)
-      | _ => direct
+        | _ => direct
 
 /--
 Element-stride guard for one container of a multi-element `copy_nonoverlapping`
@@ -1948,11 +1953,11 @@ allocation of the local it targets: `.some true` when it certainly does,
 or the place offset is unknown.
 
 The allocation size is `tyByteSize` of the declared type for a declared
-active-frame local and `valueDefaultByteSize ep.rootVal` otherwise (an untyped
-or caller-owned target); the offset of the borrowed place is
+active-frame local and `valueDefaultByteSize` of `ep.rootValOpt` otherwise (an
+untyped or caller-owned initialized target); the offset of the borrowed place is
 `borrowPlaceByteOffset?`, falling back to `projectionChainByteOffset?` on the
-runtime value only for an undeclared target (never for a declared local whose
-layout lacks field offsets).
+runtime value only for an undeclared initialized target (never for a declared
+local whose layout lacks field offsets).
 
 Reference (`core::ptr`, "Safety", Rust 1.98.0):
 <https://doc.rust-lang.org/1.98.0/core/ptr/index.html#safety>
@@ -1986,7 +1991,10 @@ def copyAccessFitsAlloc?
   let rootBytesOpt : Option Nat :=
     match declTyOpt with
     | .some declTy => tyByteSize localDecls layouts declTy
-    | .none => valueDefaultByteSize ep.rootVal
+    | .none =>
+      match ep.rootValOpt with
+      | .some rootVal => valueDefaultByteSize rootVal
+      | .none => .none
   let resolvedEntry : BorrowEntry :=
     match resolveBorrowProjectionElems locals ep.entry.targetProjection with
     | .some rp => { ep.entry with targetProjection := rp }
@@ -1995,18 +2003,18 @@ def copyAccessFitsAlloc?
     match borrowPlaceByteOffset? locals callerLocals localDecls layouts resolvedEntry callStack with
     | .some off => .some off
     | .none =>
-      match declTyOpt with
-      | .some _ => .none
-      | .none =>
+      match declTyOpt, ep.rootValOpt with
+      | .none, .some rootVal =>
         projectionChainByteOffset?
           layouts
           .none
-          (.some ep.rootVal)
+          (.some rootVal)
           .none
           0
           .nil
           (normalizeSubsliceProjections
             (stripTransparentProjections resolvedEntry.targetProjection))
+      | _, _ => .none
   match rootBytesOpt, placeOffOpt with
   | .some rootBytes, .some placeOff =>
     .some
@@ -2124,14 +2132,21 @@ def copySliceElements
       let dstIn := Nat.ble (Nat.add effDstStart n) (length dstElems)
       match Bool.and srcIn dstIn with
       | false =>
+        let boundsSzOpt : Option Nat :=
+          match elemSzOpt with
+          | .some sz => .some sz
+          | .none =>
+            match strideOk with
+            | true => effSzOpt
+            | false => .none
         let srcFits : Option Bool :=
-          match effSzOpt with
+          match boundsSzOpt with
           | .some sz =>
             copyAccessFitsAlloc?
               localDecls layouts locals callerLocals callStack srcEp (Nat.mul n sz)
           | .none => .none
         let dstFits : Option Bool :=
-          match effSzOpt with
+          match boundsSzOpt with
           | .some sz =>
             copyAccessFitsAlloc?
               localDecls layouts locals callerLocals callStack dstEp (Nat.mul n sz)
@@ -2251,17 +2266,23 @@ def copyBytesSubplace
     (n : Nat)
     (srcWinOpt dstWinOpt : Option (List ProjectionElem × Nat × List Value)) :
     CopySliceOutcome :=
-  let srcElemSzOpt : Option Nat :=
+  let expBytesOpt : Option Nat :=
+    match elemSzOpt with
+    | .some sz => .some (Nat.mul n sz)
+    | .none => .none
+  let sliceElemSzOpt : Option Nat :=
     match elemSzOpt with
     | .some sz => .some sz
     | .none =>
       match srcWinOpt with
-      | .some (_, _, e :: _) => inferValueByteSizeAux 8 e
+      | .some (_, _, e :: rest) =>
+        match inferValueByteSizeAux 8 e with
+        | .some sz =>
+          match elemsMatchByteStride (e :: rest) sz with
+          | true => .some sz
+          | false => .none
+        | .none => .none
       | _ => .none
-  let expBytesOpt : Option Nat :=
-    match srcElemSzOpt with
-    | .some sz => .some (Nat.mul n sz)
-    | .none => .none
   let fitsAt (ep : CopyEndpoint) (bytesOpt : Option Nat) : Option Bool :=
     match bytesOpt with
     | .some bytes =>
@@ -2274,15 +2295,23 @@ def copyBytesSubplace
   with
   | true => .ub
   | false =>
+    let srcResolvedProj : List ProjectionElem :=
+      match resolveBorrowProjectionElems locals srcEp.entry.targetProjection with
+      | .some rp => normalizeSubsliceProjections rp
+      | .none => srcEp.entry.targetProjection
+    let dstResolvedProj : List ProjectionElem :=
+      match resolveBorrowProjectionElems locals dstEp.entry.targetProjection with
+      | .some rp => normalizeSubsliceProjections rp
+      | .none => dstEp.entry.targetProjection
     let wholeSrc : Option (Value × List ProjectionElem) :=
-      match Nat.beq srcEp.ptr.offsetBytes 0 with
-      | false => .none
-      | true =>
-        match readProjectedValue locals srcEp.rootVal srcEp.entry.targetProjection with
-        | .ok srcSubVal => .some (srcSubVal, srcEp.entry.targetProjection)
+      match Nat.beq srcEp.ptr.offsetBytes 0, srcEp.rootValOpt with
+      | true, .some srcRootVal =>
+        match readProjectedValue locals srcRootVal srcEp.entry.targetProjection with
+        | .ok srcSubVal => .some (srcSubVal, srcResolvedProj)
         | _ => .none
+      | _, _ => .none
     let srcSlice : Option (Value × List ProjectionElem) :=
-      match srcWinOpt, srcElemSzOpt with
+      match srcWinOpt, sliceElemSzOpt with
       | .some (srcParentProj, srcBaseIdx, srcElems), .some elemSz =>
         match
           elemsMatchByteStride srcElems elemSz,
@@ -2300,9 +2329,12 @@ def copyBytesSubplace
       | _, _ => wholeSrc
     match srcSlice with
     | .none =>
-      match readProjectedValue locals srcEp.rootVal srcEp.entry.targetProjection with
-      | .ub => .ub
-      | _ => .unsupported
+      match srcEp.rootValOpt with
+      | .none => .ub
+      | .some srcRootVal =>
+        match readProjectedValue locals srcRootVal srcEp.entry.targetProjection with
+        | .ub => .ub
+        | _ => .unsupported
     | .some (sVal, srcEffProj) =>
       match encodeUntypedValueToBytes defaultCodecFuel sVal with
       | .none => .unsupported
@@ -2390,14 +2422,43 @@ def copyBytesSubplace
                 let dstTargetTyOpt : Option Ty :=
                   match dstPlaceTyOpt with
                   | .some t => .some t
-                  | .none => dstEp.pointeeOpt
+                  | .none =>
+                    match dstEp.pointeeOpt, dstEp.rootValOpt with
+                    | .some pt, .some dstRootVal =>
+                      match
+                        readProjectedValue locals dstRootVal dstEp.entry.targetProjection,
+                        rigidTyByteSize layouts pt
+                      with
+                      | .ok dstSubVal, .some ptBytes =>
+                        let shapeCompatible : Bool :=
+                          match dstSubVal, pt.kind with
+                          | .aggregate _ _, .uint _ => false
+                          | .aggregate _ _, .int _ => false
+                          | .aggregate _ _, .bool => false
+                          | .aggregate _ _, .char => false
+                          | .aggregate _ _, .float _ => false
+                          | .scalar _, .array _ _ => false
+                          | .scalar _, .adt _ _ => false
+                          | .scalar _, .tuple _ => false
+                          | _, _ => true
+                        match shapeCompatible, valueDefaultByteSize dstSubVal with
+                        | true, .some subBytes =>
+                          match Nat.beq ptBytes subBytes with
+                          | true => .some pt
+                          | false => .none
+                        | _, _ => .none
+                      | _, _ => .none
+                    | _, _ => .none
                 let decodeAt
                     (tyOpt : Option Ty)
-                    (dstProj : List ProjectionElem) :
+                    (dstProj dstEffProj : List ProjectionElem) :
                     Option CopySliceOutcome :=
-                  match tyOpt with
-                  | .none => .none
-                  | .some dstTy =>
+                  let canWriteToSlot : Bool :=
+                    match dstEp.rootValOpt, stripLeadingOpaqueCast dstProj with
+                    | .none, _ :: _ => false
+                    | _, _ => true
+                  match canWriteToSlot, tyOpt with
+                  | true, .some dstTy =>
                     match rigidTyByteSize layouts dstTy with
                     | .none => .none
                     | .some dstBytes =>
@@ -2410,9 +2471,10 @@ def copyBytesSubplace
                             (commit
                               { local_ := dstLocal, projection := dstProj }
                               decodedVal
-                              dstProj)
+                              dstEffProj)
                         | .none => .some .ub
-                match decodeAt dstTargetTyOpt dstEp.entry.targetProjection with
+                  | _, _ => .none
+                match decodeAt dstTargetTyOpt dstEp.entry.targetProjection dstResolvedProj with
                 | .some outcome => outcome
                 | .none =>
                   match dstWinOpt with
@@ -2425,9 +2487,27 @@ def copyBytesSubplace
                           layouts
                           { local_ := dstLocal, projection := dstParentProj }
                       | .none => .none
-                    match decodeAt parentTyOpt dstParentProj with
+                    match decodeAt parentTyOpt dstParentProj dstParentProj with
                     | .some outcome => outcome
                     | .none => .unsupported
+                  | .none =>
+                    match dstEp.rootValOpt, splitLastConstantIndex? dstResolvedProj with
+                    | .none, .some (initProj, .zero, _) =>
+                      match stripLeadingOpaqueCast initProj with
+                      | .nil =>
+                        let parentTyOpt : Option Ty :=
+                          match get? locals dstLocal with
+                          | .some _ =>
+                            placeTy
+                              localDecls
+                              layouts
+                              { local_ := dstLocal, projection := initProj }
+                          | .none => .none
+                        match decodeAt parentTyOpt initProj initProj with
+                        | .some outcome => outcome
+                        | .none => .unsupported
+                      | _ :: _ => .unsupported
+                    | _, _ => .unsupported
                   | _ => .unsupported
 
 /--
@@ -2436,14 +2516,18 @@ copy nor the single-element direct copy (`n = 1` with both pointers at byte
 offset `0`): a multi-element copy, or a copy through a pointer at a non-zero
 byte offset (`RawPtrOffsetMutator:wrong_value:MirDiffTag.normalScalar`).
 
-1. Both root slots must be initialized (else `.ub`, as before).
+1. Both root slots must be live (neither `.none` nor `.dead`, else `.ub`).
 2. Both pointers must be aligned for the pointee type (`checkDerefAlign`, else
    `.ub`).
 3. A copy whose pointee type is statically zero-sized transfers zero bytes and
-   is a no-op.
-4. When both endpoints point into arrays or slices
-   (`resolveArraySliceEndpoint?`), the copy is the element-window copy
-   `copySliceElements`; otherwise it is the byte-level copy `copyBytesSubplace`.
+   is a no-op (even if either live root slot is `.uninit`).
+4. Otherwise, the source root slot must be initialized (else `.ub`), while a
+   live `.uninit` destination may be initialized as a whole value through
+   `copyBytesSubplace` (failing closed with `.unsupported` for in-bounds partial
+   writes and `.ub` when certainly out of bounds). When both endpoints point
+   into initialized arrays or slices (`resolveArraySliceEndpoint?`), the copy is
+   the element-window copy `copySliceElements`; otherwise it is the byte-level
+   copy `copyBytesSubplace`.
 
 The resolution depends on the machine state only through `callerLocals` and
 `callStack` (to locate caller-owned referents and place offsets); the aliasing
@@ -2469,12 +2553,15 @@ consecutive elements, and the pointer's byte offset is a byte offset, not an
 element index. Alignment is required "even if the effectively copied size ...
 is 0", so it is checked before the zero-size case; a zero-sized access is
 otherwise valid through "every non-null pointer", and the model has no null
-pointers with a borrow entry, so it is a no-op.
+pointers with a borrow entry, so it is a no-op. A non-zero copy does not read
+`dst` before overwriting it, so a live `.uninit` destination is valid for
+writes.
 
 Modeling assumptions and unsupported behavior: alignment is decided by
 `checkDerefAlign` on the pointer's byte offset (the borrowed place itself is
 assumed aligned for the pointee type); operand pointee types that disagree in
-size fail closed with `.unsupported`.
+size fail closed with `.unsupported`; partial writes into an `.uninit`
+destination fail closed with `.unsupported` unless certainly out of bounds.
 -/
 def resolveCopySubplaceMulti
     (callerLocals : List LocalSlot)
@@ -2508,13 +2595,13 @@ def resolveCopySubplaceMulti
           callerLocals
           (Nat.sub dstEntry.targetLocal (length locals₃))
   match srcRootSlot, dstRootSlot with
-  | .some (.init srcRootVal), .some (.init dstRootVal) =>
+  | .none, _ => .ub
+  | _, .none => .ub
+  | .some .dead, _ => .ub
+  | _, .some .dead => .ub
+  | .some srcSlot, .some dstSlot =>
     let srcPtOpt := operandPointeeTy localDecls layouts src
     let dstPtOpt := operandPointeeTy localDecls layouts dst
-    let srcEp : CopyEndpoint :=
-      { ptr := srcPtr, entry := srcEntry, rootVal := srcRootVal, pointeeOpt := srcPtOpt }
-    let dstEp : CopyEndpoint :=
-      { ptr := dstPtr, entry := dstEntry, rootVal := dstRootVal, pointeeOpt := dstPtOpt }
     match
       Bool.and
         (checkDerefAlign localDecls layouts srcPtOpt srcPtr.offsetBytes)
@@ -2529,41 +2616,57 @@ def resolveCopySubplaceMulti
         match elemSzOpt with
         | .some .zero => .noop
         | _ =>
-          let srcWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ srcEp elemSzOpt
-          let dstWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ dstEp elemSzOpt
-          match srcWinOpt, dstWinOpt with
-          | .some (srcParentProj, srcBaseIdx, srcElems),
-            .some (dstParentProj, dstBaseIdx, dstElems) =>
-            copySliceElements
-              localDecls
-              layouts
-              locals₃
-              callerLocals
-              callStack
-              srcEp
-              dstEp
-              elemSzOpt
-              n
-              srcParentProj
-              srcBaseIdx
-              srcElems
-              dstParentProj
-              dstBaseIdx
-              dstElems
-          | _, _ =>
-            copyBytesSubplace
-              localDecls
-              layouts
-              locals₃
-              callerLocals
-              callStack
-              srcEp
-              dstEp
-              elemSzOpt
-              n
-              srcWinOpt
-              dstWinOpt
-  | _, _ => .ub
+          match srcSlot with
+          | .init srcRootVal =>
+            let srcEp : CopyEndpoint :=
+              { ptr := srcPtr
+                entry := srcEntry
+                rootValOpt := .some srcRootVal
+                pointeeOpt := srcPtOpt }
+            let dstRootValOpt : Option Value :=
+              match dstSlot with
+              | .init v => .some v
+              | _ => .none
+            let dstEp : CopyEndpoint :=
+              { ptr := dstPtr
+                entry := dstEntry
+                rootValOpt := dstRootValOpt
+                pointeeOpt := dstPtOpt }
+            let srcWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ srcEp elemSzOpt
+            let dstWinOpt := resolveArraySliceEndpoint? localDecls layouts locals₃ dstEp elemSzOpt
+            match srcWinOpt, dstWinOpt with
+            | .some (srcParentProj, srcBaseIdx, srcElems),
+              .some (dstParentProj, dstBaseIdx, dstElems) =>
+              copySliceElements
+                localDecls
+                layouts
+                locals₃
+                callerLocals
+                callStack
+                srcEp
+                dstEp
+                elemSzOpt
+                n
+                srcParentProj
+                srcBaseIdx
+                srcElems
+                dstParentProj
+                dstBaseIdx
+                dstElems
+            | _, _ =>
+              copyBytesSubplace
+                localDecls
+                layouts
+                locals₃
+                callerLocals
+                callStack
+                srcEp
+                dstEp
+                elemSzOpt
+                n
+                srcWinOpt
+                dstWinOpt
+          | _ => .ub
 
 /--
 Write `newVal` to `dstPlace` in `locals₃` (or `s.memory.callerLocals` when
