@@ -770,6 +770,65 @@ theorem classifyEntryPoint_assocFn_exported {d : EntryPointDescriptor} {sym : St
     classifyEntryPoint d = some .noMainStart := by
   simp [classifyEntryPoint, h, hSym, hLeaf]
 
+/-- A non-associated item carrying an entry attribute is always a `customEntryAttr`
+    entry point. -/
+theorem classifyEntryPoint_of_hasEntryAttr {d : EntryPointDescriptor}
+    (hNotAssoc : d.isAssocFn = false) (hAttr : d.hasEntryAttr = true) :
+    classifyEntryPoint d = some .customEntryAttr := by
+  simp [classifyEntryPoint, hNotAssoc, hAttr]
+
+/-- Enabling `#![no_main]` never drops an entry leaf: `main` remains an entry point
+    (changing from `.rustMain` to `.noMainStart`) and `_start` / `__start` become
+    entry points as well. -/
+theorem classifyEntryLeaf_mono_crateNoMain {leaf : String}
+    (h : (classifyEntryLeaf leaf false).isSome = true) :
+    (classifyEntryLeaf leaf true).isSome = true := by
+  unfold classifyEntryLeaf at h ⊢
+  by_cases hMain : (leaf == "main") = true
+  · simp [hMain]
+  · simp [hMain] at h
+
+/-- Enabling `#![no_main]` never drops a path-classified entry point. -/
+theorem classifyEntryPath_mono_crateNoMain {defPath : String}
+    (h : (classifyEntryPath defPath false).isSome = true) :
+    (classifyEntryPath defPath true).isSome = true := by
+  unfold classifyEntryPath at h ⊢
+  generalize normalizeEntryPathSegments defPath = segs at h ⊢
+  match segs with
+  | [leaf] => exact classifyEntryLeaf_mono_crateNoMain h
+  | [crateSeg, leaf] =>
+    by_cases hCrate : isValidCrateSegment crateSeg = true
+    · simp only [hCrate, ↓reduceIte] at h ⊢
+      exact classifyEntryLeaf_mono_crateNoMain h
+    · simp [hCrate] at h
+  | [] => simp at h
+  | _ :: _ :: _ :: _ => simp at h
+
+/-- Monotonicity in `#![no_main]`: every item classified as a binary entry point
+    without `#![no_main]` remains a binary entry point when `#![no_main]` is set. -/
+theorem classifyEntryPoint_mono_crateNoMain {d : EntryPointDescriptor}
+    (h : (classifyEntryPoint { d with crateNoMain := false }).isSome = true) :
+    (classifyEntryPoint { d with crateNoMain := true }).isSome = true := by
+  unfold classifyEntryPoint at h ⊢
+  dsimp only at h ⊢
+  cases hAssoc : d.isAssocFn
+  · simp only [hAssoc, Bool.false_eq_true, ↓reduceIte] at h ⊢
+    cases hAttr : d.hasEntryAttr
+    · simp only [hAttr, Bool.false_eq_true, ↓reduceIte] at h ⊢
+      cases hSym : d.linkSymbol with
+      | none =>
+        simp only [hSym] at h ⊢
+        exact classifyEntryPath_mono_crateNoMain h
+      | some sym =>
+        simp only [hSym] at h ⊢
+        by_cases hLeaf : isEntryLeafSymbol sym = true
+        · simp [hLeaf]
+        · simp only [hLeaf, Bool.false_eq_true, ↓reduceIte] at h ⊢
+          exact classifyEntryPath_mono_crateNoMain h
+    · simp
+  · simp only [hAssoc, ↓reduceIte] at h ⊢
+    exact h
+
 /-- Whatever leaf `classifyEntryLeaf` accepts is an entry link symbol. -/
 theorem isEntryLeafSymbol_of_classifyEntryLeaf {leaf : String} {crateNoMain : Bool}
     {kind : EntryPointKind} (h : classifyEntryLeaf leaf crateNoMain = some kind) :
@@ -1749,6 +1808,48 @@ theorem false_of_bitVec_list_len_zero_imp_nil (w : Nat) {α : Type u} (x : α)
     congrArg List.length hNil
   rw [List.length_replicate] at hLen
   exact Nat.ne_of_gt (Nat.two_pow_pos w) hLen
+
+/-- A ghost length stored in a signed 64-bit `Int64`. -/
+def i64GhostLen (n : Nat) : Int64 := Int64.ofNat n
+
+/-- The `Int64` ghost length of a list. -/
+def i64ListGhostLen {α : Type u} (xs : List α) : Int64 := i64GhostLen xs.length
+
+/-- The largest non-negative `Int64` length is `2 ^ 63 - 1`. -/
+theorem i64GhostLen_max_pos : (i64GhostLen (2 ^ 63 - 1)).toInt = 2 ^ 63 - 1 := by decide
+
+/-- **Signed overflow at `2 ^ 63`.** A signed 64-bit ghost length turns strictly
+    negative at half the unsigned range (`2 ^ 63`), grounding
+    `GhostIntWidth.Represents (.fixedSigned 64)` at capacity `2 ^ 63`. -/
+theorem i64GhostLen_two_pow_63_neg : (i64GhostLen (2 ^ 63)).toInt < 0 := by decide
+
+/-- **Signed wraparound to zero at `2 ^ 64`.** -/
+theorem i64GhostLen_two_pow_64_zero : i64GhostLen (2 ^ 64) = 0 := by decide
+
+/-- A list of `2 ^ 63` elements has a strictly negative `Int64` ghost length. -/
+theorem i64ListGhostLen_replicate_two_pow_63_neg {α : Type u} (x : α) :
+    (i64ListGhostLen (List.replicate (2 ^ 63) x)).toInt < 0 := by
+  unfold i64ListGhostLen
+  rw [List.length_replicate]
+  exact i64GhostLen_two_pow_63_neg
+
+/-- **`False` from non-negativity of a signed `Int64` ghost length.** Even before
+    reaching `2 ^ 64`, the axiom `∀ xs, 0 ≤ len xs` is inconsistent at `2 ^ 63`. -/
+theorem false_of_i64_list_len_nonneg {α : Type u} (x : α)
+    (hAxiom : ∀ xs : List α, 0 ≤ (i64ListGhostLen xs).toInt) : False :=
+  Int.not_le.mpr (i64ListGhostLen_replicate_two_pow_63_neg x) (hAxiom _)
+
+/-- A list of `2 ^ 64` elements has `Int64` ghost length `0`. -/
+theorem i64ListGhostLen_replicate_two_pow_64 {α : Type u} (x : α) :
+    i64ListGhostLen (List.replicate (2 ^ 64) x) = 0 := by
+  unfold i64ListGhostLen
+  rw [List.length_replicate]
+  exact i64GhostLen_two_pow_64_zero
+
+/-- **`False` from zero-length-is-empty on a signed `Int64` ghost length.** -/
+theorem false_of_i64_list_len_zero_imp_nil {α : Type u} (x : α)
+    (hAxiom : ∀ xs : List α, i64ListGhostLen xs = 0 → xs = []) : False :=
+  replicate_two_pow_64_ne_nil x (hAxiom _ (i64ListGhostLen_replicate_two_pow_64 x))
 
 /-! ### 4.3 `False` from Fixed-Width Ghost Collection Axioms -/
 

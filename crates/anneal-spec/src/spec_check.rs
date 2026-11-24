@@ -4283,7 +4283,7 @@ impl<'a> EntryPointDescriptor<'a> {
             self.has_entry_attr = true;
         }
         let inner = strip_unsafe_wrapper(body);
-        if inner == "no_mangle" {
+        if is_single_word(inner, "no_mangle") {
             let leaf = path_segment_count_and_leaf(self.def_path).1;
             if self.link_symbol.is_none() || is_entry_leaf_symbol(leaf) {
                 self.link_symbol = Some(leaf);
@@ -4309,7 +4309,7 @@ pub fn is_no_main_attribute(attribute: &str) -> bool {
     fn declares_no_main(body: &str, fuel: usize) -> bool {
         let body = body.trim();
         let Some(args) = cfg_attr_arguments(body) else {
-            return body == "no_main";
+            return is_single_word(body, "no_main");
         };
         let (_, mut rest) = split_top_level_comma(args);
         if fuel == 0 {
@@ -4328,12 +4328,95 @@ pub fn is_no_main_attribute(attribute: &str) -> bool {
     declares_no_main(attribute_body(attribute), MAX_CFG_ATTR_DEPTH)
 }
 
-/// Returns the argument list of a `cfg_attr(…)` attribute body.
+/// Skips leading Rust whitespace and comments (`//…` and nested `/*…*/`).
+/// Returns `None` if an unclosed block comment is encountered.
+fn strip_leading_rust_ws_and_comments(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let rest = &s[pos..];
+        let first = rest.chars().next()?;
+        if first.is_whitespace() {
+            pos += first.len_utf8();
+            continue;
+        }
+        if rest.starts_with("//") {
+            pos += 2;
+            while pos < bytes.len() && bytes[pos] != b'\n' {
+                pos += 1;
+            }
+            continue;
+        }
+        if rest.starts_with("/*") {
+            pos += 2;
+            let mut depth = 1u32;
+            while pos < bytes.len() && depth > 0 {
+                if bytes[pos..].starts_with(b"/*") {
+                    depth += 1;
+                    pos += 2;
+                } else if bytes[pos..].starts_with(b"*/") {
+                    depth -= 1;
+                    pos += 2;
+                } else {
+                    pos += 1;
+                }
+            }
+            if depth > 0 {
+                return None;
+            }
+            continue;
+        }
+        break;
+    }
+    Some(&s[pos..])
+}
+
+/// Returns `true` when `s` contains only Rust whitespace and well-formed
+/// comments.
+fn has_only_rust_ws_and_comments(s: &str) -> bool {
+    strip_leading_rust_ws_and_comments(s).is_some_and(str::is_empty)
+}
+
+/// Returns `true` when `body` consists solely of the identifier `expected`
+/// (ignoring Rust whitespace and comments).
+fn is_single_word(body: &str, expected: &str) -> bool {
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    matches!(lexer.next_tok(), Ok(Some(SpecTok::Word(w))) if w == expected)
+        && matches!(lexer.next_tok(), Ok(None))
+}
+
+/// If `body` (ignoring Rust whitespace and comments) has the exact form
+/// `<kw>(<inner>)`, returns `<inner>`.
+fn unwrap_keyword_parens<'a>(body: &'a str, kw: &str) -> Option<&'a str> {
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Word(w))) if w == kw) {
+        return None;
+    }
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("(")))) {
+        return None;
+    }
+    let inner_start = lexer.pos;
+    let mut depth = 1u32;
+    let inner_end = loop {
+        match lexer.next_tok() {
+            Ok(Some(SpecTok::Sym("("))) => depth += 1,
+            Ok(Some(SpecTok::Sym(")"))) => {
+                depth -= 1;
+                if depth == 0 {
+                    break lexer.pos - 1;
+                }
+            }
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => return None,
+        }
+    };
+    matches!(lexer.next_tok(), Ok(None)).then_some(&body[inner_start..inner_end])
+}
+
+/// Returns the argument list of a `cfg_attr(…)` attribute body (ignoring Rust
+/// whitespace and comments around `cfg_attr` and its parentheses).
 fn cfg_attr_arguments(body: &str) -> Option<&str> {
-    body.strip_prefix("cfg_attr")
-        .map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix('('))
-        .and_then(|rest| rest.trim_end().strip_suffix(')'))
+    unwrap_keyword_parens(body, "cfg_attr")
 }
 
 /// Splits `args` at its first top-level comma (outside brackets and
@@ -4449,22 +4532,26 @@ fn attribute_body(attribute: &str) -> &str {
     inner.trim()
 }
 
-/// Strips an `unsafe(…)` attribute wrapper (`#[unsafe(no_mangle)]`).
+/// Strips an `unsafe(…)` attribute wrapper (`#[unsafe(no_mangle)]`), ignoring
+/// Rust whitespace and comments around `unsafe` and its parentheses.
 fn strip_unsafe_wrapper(body: &str) -> &str {
-    body.strip_prefix("unsafe")
-        .map(str::trim_start)
-        .and_then(|rest| rest.strip_prefix('('))
-        .and_then(|rest| rest.strip_suffix(')'))
-        .map_or(body, str::trim)
+    unwrap_keyword_parens(body, "unsafe").unwrap_or(body)
 }
 
 /// Extracts the literal of `export_name = "sym"`, `export_name = r"sym"`, or
-/// `export_name = r#"sym"#`, rejecting trailing tokens after it. Returns the
-/// text between the quotes and whether the literal is raw (a non-raw literal
-/// may contain escape sequences).
+/// `export_name = r#"sym"#`, ignoring Rust comments around the tokens and
+/// rejecting trailing non-comment tokens after it. Returns the text between
+/// the quotes and whether the literal is raw (a non-raw literal may contain
+/// escape sequences).
 fn export_name_literal(body: &str) -> Option<(&str, bool)> {
-    let rest = body.strip_prefix("export_name")?.trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
+    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Word("export_name")))) {
+        return None;
+    }
+    if !matches!(lexer.next_tok(), Ok(Some(SpecTok::Sym("=")))) {
+        return None;
+    }
+    let rest = strip_leading_rust_ws_and_comments(&body[lexer.pos..])?;
     if let Some(after_r) = rest.strip_prefix('r') {
         let bytes = after_r.as_bytes();
         let mut hashes = 0usize;
@@ -4484,9 +4571,7 @@ fn export_name_literal(body: &str) -> Option<(&str, bool)> {
                 }
                 if closing == hashes {
                     let after = &after_r[idx + 1 + hashes..];
-                    return after
-                        .trim()
-                        .is_empty()
+                    return has_only_rust_ws_and_comments(after)
                         .then_some((&after_r[content_start..idx], true));
                 }
             }
@@ -4507,41 +4592,60 @@ fn export_name_literal(body: &str) -> Option<(&str, bool)> {
         }
     }
     let after = &rest[end + 1..];
-    if !after.trim().is_empty() {
+    if !has_only_rust_ws_and_comments(after) {
         return None;
     }
     Some((&rest[..end], false))
 }
 
-/// Returns `true` when the attribute body (without `#[…]`) names an entry
-/// attribute: its path ends in the segment `entry`, `main`, or `start`.
+/// Returns `true` when the attribute (with or without `#[…]`) names an entry
+/// attribute: its path ends in the segment `entry`, `main`, or `start`, either
+/// directly or as a conditional attribute of `cfg_attr`.
 ///
-/// Handles whitespace around `::` (`#[cortex_m_rt :: entry]`, `#[::tokio::main]`)
-/// and matches on the whole final segment, so `maintain`, `entry_point`, and
-/// `restart` are not entry attributes.
+/// Handles whitespace and comments around `::` (`#[cortex_m_rt :: entry]`,
+/// `#[::tokio::main]`, `#[cfg_attr(not(test), entry)]`) and matches on the
+/// whole final segment, so `maintain`, `entry_point`, and `restart` are not
+/// entry attributes.
 pub fn is_entry_attribute(attribute: &str) -> bool {
-    let body = attribute_body(attribute);
-    let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
-    let mut last_segment: Option<&str> = None;
-    let mut expect_segment = true;
-    while let Ok(Some(tok)) = lexer.next_tok() {
-        match tok {
-            SpecTok::PathSep => {
-                expect_segment = true;
+    fn is_entry_body(body: &str, fuel: usize) -> bool {
+        let body = body.trim();
+        if let Some(args) = cfg_attr_arguments(body) {
+            let (_, mut rest) = split_top_level_comma(args);
+            if fuel == 0 {
+                return rest.is_some();
             }
-            SpecTok::Word(word) if expect_segment => {
-                last_segment = Some(word);
-                expect_segment = false;
+            while let Some(attrs) = rest {
+                let (attr, tail) = split_top_level_comma(attrs);
+                if is_entry_body(attr, fuel - 1) {
+                    return true;
+                }
+                rest = tail;
             }
-            SpecTok::Sym("(") if !expect_segment => break,
-            SpecTok::Sym("=") => return false,
-            _ => return false,
+            return false;
         }
+        let mut lexer = SpecLexer::new(body, SpecSyntax::Rust);
+        let mut last_segment: Option<&str> = None;
+        let mut expect_segment = true;
+        while let Ok(Some(tok)) = lexer.next_tok() {
+            match tok {
+                SpecTok::PathSep => {
+                    expect_segment = true;
+                }
+                SpecTok::Word(word) if expect_segment => {
+                    last_segment = Some(word);
+                    expect_segment = false;
+                }
+                SpecTok::Sym("(") if !expect_segment => break,
+                SpecTok::Sym("=") => return false,
+                _ => return false,
+            }
+        }
+        if expect_segment {
+            return false;
+        }
+        matches!(last_segment, Some("entry" | "main" | "start"))
     }
-    if expect_segment {
-        return false;
-    }
-    matches!(last_segment, Some("entry" | "main" | "start"))
+    is_entry_body(attribute_body(attribute), MAX_CFG_ATTR_DEPTH)
 }
 
 /// Number of `::`-separated segments of `path`, and its last segment.
@@ -5347,12 +5451,19 @@ fn is_catch_all_binder_word(word: &str) -> bool {
 struct ArmAlternative {
     /// Brackets opened and not yet closed around the scan position.
     depth: u32,
+    /// Bracket depth at which this match arm's pattern began (e.g. `1` inside
+    /// `(match r with | …)`).
+    arm_base_depth: u32,
+    /// Number of outer grouping parentheses `(` opened around a catch-all
+    /// pattern (`(_)`, `((e))`, `(_ : T)`).
+    catch_all_parens: u32,
     /// Number of tokens.
     tokens: u32,
     /// The alternative is exactly a catch-all so far: `_`, a bare binding
-    /// (`e`, `other`), or a binding behind `ref` / `mut`.
+    /// (`e`, `other`), or a binding behind `&` / `ref` / `mut` / `(...)` /
+    /// Lean type ascription `(_ : T)`.
     catch_all: bool,
-    /// Every token so far is a `ref` / `mut` binding modifier.
+    /// Every token so far is a `&` / `ref` / `mut` / `(` catch-all modifier.
     only_modifiers: bool,
     /// Innermost error constructor seen.
     error_ctor: Option<ErrorCtor>,
@@ -5361,7 +5472,8 @@ struct ArmAlternative {
     /// The error payload is constrained (a constructor, literal, or path).
     constrained: bool,
     /// Bracket depth of a Lean type ascription `(_ : Type)` inside an
-    /// unconstrained error payload; tokens at `depth >= d` are type syntax.
+    /// unconstrained error payload or catch-all; tokens at `depth >= d` are
+    /// type syntax.
     type_ascription_depth: Option<u32>,
     /// The alternative began right after `=>`: it is an arm body, not a
     /// pattern.
@@ -5370,15 +5482,28 @@ struct ArmAlternative {
     /// the body and starts the next arm; a deeper `|` belongs to the body
     /// (`(a ||| b)`, a Rust closure `|x| …`).
     body_depth: u32,
-    /// Scanning a Lean `fun … =>` lambda binder list rather than a match arm.
+    /// Scanning a Lean `fun … =>` / `λ … =>` lambda binder list rather than a
+    /// match arm.
     in_lambda: bool,
 }
 
 impl ArmAlternative {
-    /// A fresh pattern alternative at bracket depth `depth`.
+    /// A fresh pattern alternative starting a new arm at bracket depth `depth`.
     fn pattern(depth: u32) -> Self {
         Self {
             depth,
+            arm_base_depth: depth,
+            ..Self::default()
+        }
+    }
+
+    /// The next `|` / sibling alternative inside the same arm, preserving the
+    /// arm's base depth and outer catch-all paren count.
+    fn next_alt(depth: u32, arm_base_depth: u32, catch_all_parens: u32) -> Self {
+        Self {
+            depth,
+            arm_base_depth,
+            catch_all_parens,
             ..Self::default()
         }
     }
@@ -5387,6 +5512,7 @@ impl ArmAlternative {
     fn body(depth: u32) -> Self {
         Self {
             depth,
+            arm_base_depth: depth,
             after_arrow: true,
             body_depth: depth,
             ..Self::default()
@@ -5623,146 +5749,255 @@ fn is_constraining_continuation(tok: SpecTok<'_>) -> bool {
 /// Maximum number of `&&` / `∧` terms unfolded in a trivially-true arm body.
 const MAX_TRIVIAL_CONJUNCTS: usize = 8;
 
+/// Maximum nesting of parenthesized / braced expressions inspected inside a
+/// trivially-true arm body.
+const MAX_TRIVIAL_EXPR_DEPTH: u32 = 8;
+
+/// Maximum tokens scanned while inspecting disjunctions inside an arm body.
+const MAX_ARM_BODY_SCAN_TOKENS: usize = 128;
+
+fn is_disjunction_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("||" | "∨" | "\\/") | SpecTok::Word("or"))
+}
+
+fn is_conjunction_tok(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("&&" | "∧" | "/\\") | SpecTok::Word("and"))
+}
+
+fn is_looser_than_disjunction(tok: SpecTok<'_>) -> bool {
+    matches!(tok, SpecTok::Sym("->" | "→" | "↔" | "<->" | "==>"))
+}
+
+fn is_arm_body_terminator(tok: SpecTok<'_>) -> bool {
+    match tok {
+        SpecTok::FatArrow => true,
+        SpecTok::Sym("," | "|" | ";" | ")" | "]" | "}") => true,
+        SpecTok::Word(word) => {
+            is_lean_decl_reset_word(word)
+                || matches!(
+                    word,
+                    "fn" | "pub" | "struct" | "enum" | "impl" | "trait" | "mod" | "where" | "end"
+                )
+        }
+        _ => false,
+    }
+}
+
 /// Consumes one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
-/// `!false`, `¬False`, `Not False`, optionally followed by `as bool` or,
-/// inside parentheses, by a `: Prop` / `: Bool` ascription).
+/// `!false`, `¬False`, `Not False`, or a parenthesized/braced trivially-true
+/// expression, optionally preceded by `return`/`by` and followed by `as bool`).
 /// Returns `Ok(true)` iff such an atom was consumed; `look` is left right
 /// after it.
-fn consume_trivial_true_atom(look: &mut SpecLexer<'_>) -> Result<bool, SpecScanError> {
-    let mut parens = 0u32;
-    let mut braces = 0u32;
-    let mut tok = look.next_tok()?;
-    loop {
-        match tok {
-            Some(SpecTok::Sym("(")) => parens += 1,
-            Some(SpecTok::Sym("{")) => braces += 1,
-            Some(SpecTok::Word("return" | "by")) => {}
-            _ => break,
-        }
-        tok = look.next_tok()?;
+fn consume_trivial_true_atom(look: &mut SpecLexer<'_>, depth: u32) -> Result<bool, SpecScanError> {
+    if depth == 0 {
+        return Ok(false);
+    }
+    let mut probe = *look;
+    let mut tok = probe.next_tok()?;
+    while matches!(tok, Some(SpecTok::Word("return" | "by"))) {
+        tok = probe.next_tok()?;
     }
     let matched = match tok {
+        Some(SpecTok::Sym("(")) => expr_is_trivially_true(&mut probe, Some(")"), depth - 1)?,
+        Some(SpecTok::Sym("{")) => expr_is_trivially_true(&mut probe, Some("}"), depth - 1)?,
         Some(SpecTok::Word("true" | "True" | "trivial")) => true,
-        Some(SpecTok::Sym("!")) => matches!(look.next_tok()?, Some(SpecTok::Word("false"))),
+        Some(SpecTok::Sym("!")) => matches!(probe.next_tok()?, Some(SpecTok::Word("false"))),
         Some(SpecTok::Sym("¬") | SpecTok::Word("Not")) => {
-            matches!(look.next_tok()?, Some(SpecTok::Word("False")))
+            matches!(probe.next_tok()?, Some(SpecTok::Word("False")))
         }
         _ => false,
     };
     if !matched {
         return Ok(false);
     }
-    // Consume an optional `as bool` cast before closing wrappers.
-    let mut probe = *look;
-    if matches!(probe.next_tok()?, Some(SpecTok::Word("as")))
-        && matches!(probe.next_tok()?, Some(SpecTok::Word("bool")))
+    // Consume an optional `as bool` cast.
+    let mut cast_probe = probe;
+    if matches!(cast_probe.next_tok()?, Some(SpecTok::Word("as")))
+        && matches!(cast_probe.next_tok()?, Some(SpecTok::Word("bool")))
     {
-        *look = probe;
+        probe = cast_probe;
     }
-    // Consume an optional `(True : Prop)` type ascription.
-    if parens > 0 {
-        let mut probe = *look;
-        if matches!(probe.next_tok()?, Some(SpecTok::Sym(":")))
-            && matches!(
-                probe.next_tok()?,
-                Some(SpecTok::Word("Prop" | "Bool" | "bool"))
-            )
-        {
-            *look = probe;
-        }
+    *look = probe;
+    Ok(true)
+}
+
+/// Consumes a conjunction of trivially-true atoms (`true && true`,
+/// `(True ∧ True)`, optionally followed by `as bool` or a parenthesized
+/// `: Prop` / `: Bool` ascription) that is not continued by a constraining
+/// operator.
+fn consume_trivial_conjunction(
+    look: &mut SpecLexer<'_>,
+    allow_type_ascription: bool,
+    depth: u32,
+) -> Result<bool, SpecScanError> {
+    let mut probe = *look;
+    if !consume_trivial_true_atom(&mut probe, depth)? {
+        return Ok(false);
     }
-    // Handle `true || …` / `True ∨ …` inside an open paren/brace wrapper.
-    if parens > 0 || braces > 0 {
-        let mut after = *look;
-        if matches!(
-            after.next_tok()?,
-            Some(SpecTok::Sym("||" | "∨" | "\\/")) | Some(SpecTok::Word("or"))
-        ) {
-            // Skip balanced tokens to the closing delimiter of the wrapper
-            // holding the disjunction.
-            let mut inner = 0u32;
-            while let Some(t) = after.next_tok()? {
-                match t {
-                    SpecTok::Sym("(" | "[" | "{") => inner += 1,
-                    SpecTok::Sym(")") if inner > 0 => inner -= 1,
-                    SpecTok::Sym("]" | "}") if inner > 0 => inner -= 1,
-                    SpecTok::Sym(";") if inner == 0 => {
-                        // A statement boundary: the disjunction is the value
-                        // of the block only when the block ends right here
-                        // (`{ return true || p; }`, not `{ true || p; false }`).
-                        if braces > 0 && matches!(after.next_tok()?, Some(SpecTok::Sym("}"))) {
-                            braces -= 1;
-                            *look = after;
-                            break;
-                        }
-                        return Ok(false);
-                    }
-                    SpecTok::Sym(")") if parens > 0 => {
-                        parens -= 1;
-                        *look = after;
-                        break;
-                    }
-                    SpecTok::Sym("}") if braces > 0 => {
-                        braces -= 1;
-                        *look = after;
-                        break;
-                    }
-                    _ => {}
+    for _ in 0..MAX_TRIVIAL_CONJUNCTS {
+        let mut next_probe = probe;
+        let next = next_probe.next_tok()?;
+        match next {
+            Some(tok) if is_conjunction_tok(tok) => {
+                if !consume_trivial_true_atom(&mut next_probe, depth)? {
+                    return Ok(false);
+                }
+                probe = next_probe;
+            }
+            Some(SpecTok::Word("as")) => {
+                if matches!(next_probe.next_tok()?, Some(SpecTok::Word("bool"))) {
+                    probe = next_probe;
+                } else {
+                    return Ok(false);
                 }
             }
+            Some(SpecTok::Sym(":")) if allow_type_ascription => {
+                if matches!(
+                    next_probe.next_tok()?,
+                    Some(SpecTok::Word("Prop" | "Bool" | "bool"))
+                ) {
+                    probe = next_probe;
+                } else {
+                    return Ok(false);
+                }
+            }
+            other => {
+                if !other.is_some_and(is_constraining_continuation) {
+                    *look = probe;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
         }
     }
-    while parens > 0 || braces > 0 {
-        let mut after = *look;
-        match after.next_tok()? {
-            Some(SpecTok::Sym(")")) if parens > 0 => {
-                parens -= 1;
-                *look = after;
-            }
-            Some(SpecTok::Sym("}")) if braces > 0 => {
-                braces -= 1;
-                *look = after;
-            }
-            Some(SpecTok::Sym(";")) if braces > 0 => {
-                *look = after;
-            }
-            _ => return Ok(false),
+    Ok(false)
+}
+
+/// Evaluates whether the expression starting at `look` (up to `stop_delim` at
+/// inner depth 0, or up to the arm-body terminator when `stop_delim` is
+/// `None`) is trivially true: a disjunction where at least one disjunct is a
+/// conjunction of trivially-true atoms, with no looser operator (`→`, `↔`) or
+/// trailing non-empty block statement invalidating it.
+fn expr_is_trivially_true(
+    look: &mut SpecLexer<'_>,
+    stop_delim: Option<&str>,
+    depth: u32,
+) -> Result<bool, SpecScanError> {
+    if depth == 0 {
+        return Ok(false);
+    }
+    // Strip optional leading `return` / `by` before splitting disjunctions so
+    // `{ return x == 1 || true; }` is handled identically to `x == 1 || true`.
+    loop {
+        let mut peek = *look;
+        if matches!(peek.next_tok()?, Some(SpecTok::Word("return" | "by"))) {
+            *look = peek;
+        } else {
+            break;
         }
     }
-    Ok(true)
+    let mut found_trivial = false;
+    let mut scanned = 0usize;
+    let mut at_disjunct_start = true;
+    let mut inner_depth = 0u32;
+    let mut prev_closed_brace_at_zero = false;
+    loop {
+        if at_disjunct_start && inner_depth == 0 {
+            at_disjunct_start = false;
+            let mut conj_probe = *look;
+            if consume_trivial_conjunction(&mut conj_probe, stop_delim == Some(")"), depth)? {
+                found_trivial = true;
+                *look = conj_probe;
+            }
+        }
+        let before = *look;
+        let Some(tok) = look.next_tok()? else {
+            return Ok(stop_delim.is_none() && found_trivial);
+        };
+        scanned += 1;
+        if scanned > MAX_ARM_BODY_SCAN_TOKENS {
+            return Ok(false);
+        }
+        if inner_depth == 0 {
+            if prev_closed_brace_at_zero {
+                prev_closed_brace_at_zero = false;
+                if stop_delim.is_none()
+                    && matches!(
+                        tok,
+                        SpecTok::Word(w) if !matches!(w, "else" | "or" | "and" | "as")
+                    )
+                {
+                    *look = before;
+                    return Ok(found_trivial);
+                }
+            }
+            if let Some(delim) = stop_delim {
+                if tok == SpecTok::Sym(delim) {
+                    return Ok(found_trivial);
+                }
+                if delim == "}" && tok == SpecTok::Sym(";") {
+                    return Ok(matches!(look.next_tok()?, Some(SpecTok::Sym("}"))) && found_trivial);
+                }
+                if matches!(tok, SpecTok::Sym(")" | "]" | "}")) {
+                    return Ok(false);
+                }
+            } else if is_arm_body_terminator(tok) {
+                *look = before;
+                return Ok(found_trivial);
+            }
+            if is_looser_than_disjunction(tok) {
+                return Ok(false);
+            }
+            if is_disjunction_tok(tok) {
+                at_disjunct_start = true;
+                continue;
+            }
+            if stop_delim == Some(")") && tok == SpecTok::Sym(":") {
+                let mut asc = *look;
+                if matches!(
+                    asc.next_tok()?,
+                    Some(SpecTok::Word("Prop" | "Bool" | "bool"))
+                ) && matches!(asc.next_tok()?, Some(SpecTok::Sym(")")))
+                {
+                    *look = asc;
+                    return Ok(found_trivial);
+                }
+                return Ok(false);
+            }
+            if tok == SpecTok::Word("as") {
+                let mut cast = *look;
+                if matches!(cast.next_tok()?, Some(SpecTok::Word("bool"))) {
+                    *look = cast;
+                    continue;
+                }
+                found_trivial = false;
+            }
+        }
+        match tok {
+            SpecTok::Sym("(" | "[" | "{") => inner_depth += 1,
+            SpecTok::Sym(")" | "]" | "}") => {
+                if inner_depth == 0 {
+                    return Ok(false);
+                }
+                inner_depth -= 1;
+                if inner_depth == 0 && tok == SpecTok::Sym("}") {
+                    prev_closed_brace_at_zero = true;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Returns `true` when the arm body starting at `look` is trivially true:
 /// `true`, `True`, `trivial`, `!false`, `¬False`, `Not False`, optionally
 /// wrapped (`(true)`, `{ true }`, `{ return true; }`, `by trivial`,
 /// `true as bool`), a conjunction of trivially-true atoms (`true && true`,
-/// `True ∧ True`), or a disjunction starting with one (`true || p`,
-/// `(true || p)`, `True ∨ P`), and not combined with a constraining operator.
+/// `(true && true)`, `(True ∧ True)`), or a disjunction containing one
+/// (`true || p`, `p || true`, `(p || true)`, `P ∨ True`), and not combined
+/// with a constraining operator.
 fn arm_body_is_trivially_true(mut look: SpecLexer<'_>) -> Result<bool, SpecScanError> {
-    if !consume_trivial_true_atom(&mut look)? {
-        return Ok(false);
-    }
-    for _ in 0..MAX_TRIVIAL_CONJUNCTS {
-        let mut probe = look;
-        let next = probe.next_tok()?;
-        match next {
-            Some(SpecTok::Sym("&&" | "∧" | "/\\")) | Some(SpecTok::Word("and")) => {
-                if !consume_trivial_true_atom(&mut probe)? {
-                    return Ok(false);
-                }
-                look = probe;
-            }
-            Some(SpecTok::Word("as")) => {
-                if matches!(probe.next_tok()?, Some(SpecTok::Word("bool"))) {
-                    look = probe;
-                } else {
-                    return Ok(false);
-                }
-            }
-            _ => return Ok(!next.is_some_and(is_constraining_continuation)),
-        }
-    }
-    Ok(false)
+    expr_is_trivially_true(&mut look, None, MAX_TRIVIAL_EXPR_DEPTH)
 }
 
 /// Lean declaration keywords that begin a fresh top-level item and therefore
@@ -5822,6 +6057,7 @@ pub fn scan_error_branch_wildcard(
     let mut matches_saw_ok = false;
     let mut matches_scope_floor = 0usize;
     let mut after_dot = false;
+    let mut in_match_scrutinee = false;
     let mut scopes = OkScopes::new();
 
     while let Some(tok) = lexer.next_tok()? {
@@ -5845,6 +6081,7 @@ pub fn scan_error_branch_wildcard(
                     matches_state = MatchesState::Pattern;
                     matches_saw_ok = false;
                     matches_scope_floor = scopes.len;
+                    in_match_scrutinee = false;
                     alt = ArmAlternative::default();
                     arm = ArmState::default();
                 }
@@ -5855,6 +6092,7 @@ pub fn scan_error_branch_wildcard(
 
         match tok {
             SpecTok::FatArrow => {
+                in_match_scrutinee = false;
                 if !alt.in_lambda {
                     arm.absorb(&alt);
                     if !arm.guard_blocks() && arm_body_is_trivially_true(lexer)? {
@@ -5892,8 +6130,14 @@ pub fn scan_error_branch_wildcard(
                             }
                         }
                         // Top-level or nested or-pattern
-                        // (`Some(Err(_) | Ok(0))`).
-                        _ => alt = ArmAlternative::pattern(alt.depth),
+                        // (`Some(Err(_) | Ok(0))`, `(0 | _)`).
+                        _ => {
+                            alt = ArmAlternative::next_alt(
+                                alt.depth,
+                                alt.arm_base_depth,
+                                alt.catch_all_parens,
+                            );
+                        }
                     }
                 }
             }
@@ -5908,9 +6152,10 @@ pub fn scan_error_branch_wildcard(
                 // Lean discriminant (`| .err _, .ok v`). Its constructors
                 // must not constrain the payload already scanned.
                 arm.absorb(&alt);
-                alt = ArmAlternative::pattern(alt.depth);
+                alt = ArmAlternative::next_alt(alt.depth, alt.arm_base_depth, 0);
             }
             SpecTok::Sym("," | ";") if alt.depth == 0 => {
+                in_match_scrutinee = false;
                 if matches_state == MatchesState::Pattern {
                     // Allow a Rust trailing comma in `matches!(out, pat,)`.
                     let mut look = lexer;
@@ -5924,16 +6169,47 @@ pub fn scan_error_branch_wildcard(
                 arm = ArmState::default();
                 alt = ArmAlternative::default();
             }
-            SpecTok::Sym("(" | "[") => {
+            SpecTok::Sym("(") => {
+                let outer_wrapper = (alt.tokens == 0 || alt.only_modifiers)
+                    && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
                 alt.depth += 1;
-                alt.push_non_word();
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.tokens += 1;
+                    alt.catch_all = false;
+                    alt.only_modifiers = outer_wrapper;
+                    if outer_wrapper {
+                        alt.catch_all_parens += 1;
+                    }
+                }
+            }
+            SpecTok::Sym("[") => {
+                alt.depth += 1;
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.push_non_word();
+                }
             }
             SpecTok::Sym("{") => {
-                if alt.error_ctor.is_some() && !alt.after_arrow && !arm.guarded {
-                    // Struct pattern inside an error payload.
+                let is_struct_pattern_brace = !alt.after_arrow
+                    && !arm.guarded
+                    && !in_match_scrutinee
+                    && (alt.error_ctor.is_some()
+                        || matches_state == MatchesState::Pattern
+                        || arm.wildcard.is_some()
+                        || arm.catch_all);
+                if is_struct_pattern_brace {
+                    // Struct pattern inside a match arm or `matches!` pattern.
                     alt.depth += 1;
-                    alt.push_non_word();
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                    }
                 } else {
+                    in_match_scrutinee = false;
                     scopes.push(OkScopeKind::Brace {
                         saved_depth: alt.depth,
                     });
@@ -5944,9 +6220,23 @@ pub fn scan_error_branch_wildcard(
             SpecTok::Sym(")" | "]" | "}") => {
                 if alt.depth > 0 {
                     alt.depth -= 1;
-                    alt.push_non_word();
+                    let was_ascription = alt.type_ascription_depth.is_some();
                     if alt.type_ascription_depth.is_some_and(|d| alt.depth < d) {
                         alt.type_ascription_depth = None;
+                    }
+                    let closed_outer_catch_all_paren = tok == SpecTok::Sym(")")
+                        && alt.catch_all_parens > 0
+                        && alt.depth < alt.arm_base_depth + alt.catch_all_parens;
+                    if closed_outer_catch_all_paren {
+                        alt.catch_all_parens -= 1;
+                    }
+                    if was_ascription || closed_outer_catch_all_paren {
+                        alt.tokens += 1;
+                        if !was_ascription {
+                            alt.only_modifiers = false;
+                        }
+                    } else {
+                        alt.push_non_word();
                     }
                     if alt.after_arrow && alt.depth < alt.body_depth {
                         // The bracket around the arm list closed: what
@@ -5964,6 +6254,7 @@ pub fn scan_error_branch_wildcard(
                 {
                     // The block closed: a new arm pattern may follow
                     // (`Ok(v) => { … } Err(_) => true`).
+                    in_match_scrutinee = false;
                     arm = ArmState::default();
                     alt = ArmAlternative::pattern(saved_depth);
                 } else {
@@ -5978,12 +6269,14 @@ pub fn scan_error_branch_wildcard(
                         }
                         matches_state = MatchesState::Outside;
                     }
+                    in_match_scrutinee = false;
                     scopes.close_lean_matches(0);
                     arm = ArmState::default();
                     alt = ArmAlternative::default();
                 }
             }
             SpecTok::Sym(":=") => {
+                in_match_scrutinee = false;
                 arm = ArmState::default();
                 alt = ArmAlternative::body(alt.depth);
             }
@@ -6007,6 +6300,7 @@ pub fn scan_error_branch_wildcard(
                     }
                 }
                 if !arm.guarded && alt.depth == 0 && is_lean_decl_reset_word(word) {
+                    in_match_scrutinee = false;
                     scopes.begin_declaration();
                     arm = ArmState::default();
                     alt = ArmAlternative::default();
@@ -6014,7 +6308,7 @@ pub fn scan_error_branch_wildcard(
                 }
                 if !arm.guarded
                     && lean_keywords
-                    && word == "fun"
+                    && matches!(word, "fun" | "λ")
                     && alt.error_ctor.is_none()
                     && (alt.after_arrow || alt.tokens == 0)
                 {
@@ -6026,6 +6320,7 @@ pub fn scan_error_branch_wildcard(
                     continue;
                 }
                 if !arm.guarded && matches!(word, "match" | "with") {
+                    in_match_scrutinee = word == "match";
                     if word == "with" && lean_keywords {
                         scopes.push(OkScopeKind::LeanMatch { depth: alt.depth });
                     }
@@ -6041,13 +6336,15 @@ pub fn scan_error_branch_wildcard(
                     alt = ArmAlternative::default();
                     arm.guarded = true;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    let leading = alt.tokens == 0 || alt.only_modifiers;
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                        continue;
+                    }
+                    let leading = (alt.tokens == 0 || alt.only_modifiers)
+                        && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
                     alt.catch_all = leading && is_catch_all_binder_word(word);
                     alt.only_modifiers = leading && matches!(word, "ref" | "mut");
                     alt.tokens += 1;
-                    if alt.type_ascription_depth.is_some() {
-                        continue;
-                    }
                     if let Some(ctor) = ErrorCtor::of(word, was_after_dot) {
                         match alt.error_ctor {
                             None => {
@@ -6075,9 +6372,13 @@ pub fn scan_error_branch_wildcard(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.push_non_word();
-                    if alt.error_ctor.is_some() && alt.type_ascription_depth.is_none() {
-                        alt.constrained = true;
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                        if alt.error_ctor.is_some() {
+                            alt.constrained = true;
+                        }
                     }
                 }
             }
@@ -6086,14 +6387,25 @@ pub fn scan_error_branch_wildcard(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.push_non_word();
-                    if tok == SpecTok::Sym(":")
-                        && alt.error_ctor.is_some()
-                        && !alt.constrained
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else if matches!(tok, SpecTok::Sym("&" | "&&")) {
+                        let keep_mod = alt.tokens == 0 || alt.only_modifiers;
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = keep_mod;
+                    } else if tok == SpecTok::Sym("@") && alt.catch_all {
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = true;
+                    } else if tok == SpecTok::Sym(":")
                         && alt.depth > 0
-                        && alt.type_ascription_depth.is_none()
+                        && ((alt.error_ctor.is_some() && !alt.constrained) || alt.catch_all)
                     {
+                        alt.tokens += 1;
                         alt.type_ascription_depth = Some(alt.depth);
+                    } else {
+                        alt.push_non_word();
                     }
                 }
             }
@@ -7329,6 +7641,70 @@ mod spec_boundary_guard_tests {
     }
 
     #[test]
+    fn attributes_tolerate_rust_comments_and_cfg_attr_entry_symmetry() {
+        use EntryPointKind::{EntryAttribute, NoMainStart};
+        // `is_entry_attribute` unwraps `cfg_attr` symmetrically with
+        // `is_no_main_attribute` and ignores comments inside attributes.
+        for attr in [
+            "#[cfg_attr(not(test), entry)]",
+            "#[cfg_attr(not(test), cortex_m_rt::entry)]",
+            "#[/* boot */ cfg_attr(/* pred */ not(test), /* attr */ entry /* end */)]",
+            "#[cfg_attr(a, cfg_attr(b, tokio::main(flavor = \"current_thread\")))]",
+        ] {
+            assert!(is_entry_attribute(attr), "{attr}");
+        }
+        for attr in [
+            "#[cfg_attr(entry, inline)]",
+            "#[cfg_attr(not(test), inline)]",
+            "#[cfg_attr(not(test), /* c */ maintain)]",
+        ] {
+            assert!(!is_entry_attribute(attr), "{attr}");
+        }
+        // Comments inside `no_main`, `no_mangle`, `unsafe(...)`, `export_name`,
+        // and `cfg_attr` must not hide entry points.
+        for attr in [
+            "#![/* boot */ no_main /* end */]",
+            "#![/* c */ cfg_attr(not(test), /* c */ no_main /* c */)]",
+        ] {
+            assert!(is_no_main_attribute(attr), "{attr}");
+        }
+        for attrs in [
+            &["#[/* boot */ no_mangle /* end */]"][..],
+            &["#[/* c */ unsafe(/* c */ no_mangle /* c */) /* c */]"],
+            &["#[cfg_attr(not(test), /* c */ no_mangle /* c */)]"],
+            &["#[/* c */ cfg_attr(not(test), /* c */ unsafe(/* c */ no_mangle))]"],
+        ] {
+            let start = desc("fw::arch::_start").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&start), Some(NoMainStart), "{attrs:?}");
+        }
+        for attrs in [
+            &["#[/* c */ export_name /* c */ = /* c */ \"_start\" /* c */]"][..],
+            &["#[unsafe(/* c */ export_name = /* c */ r#\"_start\"# /* c */)]"],
+            &["#[cfg_attr(not(test), /* c */ export_name /* c */ = /* c */ \"\\x5fstart\")]"],
+        ] {
+            let boot = desc("fw::arch::boot").with_attributes(attrs);
+            assert_eq!(classify_entry_point(&boot), Some(NoMainStart), "{attrs:?}");
+        }
+        let reset = desc("fw::reset").with_attributes(&[
+            "#[/* c */ cfg_attr(not(test), /* c */ cortex_m_rt :: /* c */ entry)]",
+        ]);
+        assert_eq!(classify_entry_point(&reset), Some(EntryAttribute));
+        // Trailing non-comment tokens after `unsafe(...)` or `export_name` stay rejected.
+        assert_eq!(
+            classify_entry_point(
+                &desc("fw::arch::_start").with_attributes(&["#[unsafe(no_mangle) bogus]"])
+            ),
+            None
+        );
+        assert_eq!(
+            classify_entry_point(
+                &desc("fw::boot").with_attributes(&["#[export_name = \"_start\" bogus]"])
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn escaped_export_names_are_decoded() {
         use EntryPointKind::NoMainStart;
         for (attr, symbol) in [
@@ -8299,6 +8675,105 @@ mod spec_boundary_guard_tests {
         ("rust", "Err(Wrap(E::A) | _) => true", "err_arm_true"),
         ("lean", "| .err (.a | _) => True", "err_arm_true"),
         ("lean", "| .err (.wrap (.a | _)) => True", ""),
+        // Struct patterns after `|` must not wipe an earlier wildcard or
+        // `matches!` arm state.
+        (
+            "rust",
+            "matches!(out, Err(_) | Ok(Foo { x: 1 }))",
+            "matches_any_err",
+        ),
+        (
+            "rust",
+            "matches!(out, Err(_) | Foo { x: 1 })",
+            "matches_any_err",
+        ),
+        ("rust", "Err(_) | Ok(Foo { x: 1 }) => true", "err_arm_true"),
+        ("rust", "Err(_) | Foo { x: 1 } => true", "err_arm_true"),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, _ | Foo { x: 1 } => true }",
+            "catch_all_arm_true",
+        ),
+        // Catch-all binders behind `&`, `&mut`, `(...)`, `@`, and Lean type
+        // ascriptions, without false-positiving on constructor-wrapped or-patterns.
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &mut e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &&_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, (_) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, ((e)) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => v = 1 | (_ : Except String Nat) => True",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | (e : Except String (List Nat)) => True)",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Some(0 | _) => true }",
+            "",
+        ),
+        ("rust", "match out { Ok(v) => v == 1, &E::A => true }", ""),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ E::A => true }",
+            "",
+        ),
+        // Parenthesized conjunctions and right-hand disjunctions in arm bodies,
+        // respecting `&&` > `||` and `∨` > `→` precedence.
+        ("rust", "Err(_) => (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => (True ∧ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true", "err_arm_true"),
+        ("rust", "Err(_) => (x == 1 || true)", "err_arm_true"),
+        (
+            "rust",
+            "Err(_) => { return x == 1 || true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(_) => x == 1 || (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => x = 1 ∨ True", "err_arm_true"),
+        ("lean", "| .err _ => (x = 1 ∨ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true && y == 2", ""),
+        ("rust", "Err(_) => (x == 1 || true) && y == 2", ""),
+        ("lean", "| .err _ => x = 1 ∨ True → False", ""),
+        ("lean", "| .err _ => True ∨ x = 1 → False", ""),
+        ("rust", "Err(_) => { check() } _ if a || true => false", ""),
+        // Unicode Lean lambda `λ` behaves like `fun`.
+        ("lean", "| .ok v => λ _ => True", ""),
+        ("lean", "| .ok v => f (λ e => True) | .err e => e = .a", ""),
     ];
 
     #[test]

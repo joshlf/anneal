@@ -254,6 +254,13 @@ theorem unexported_method_main_is_not_entry :
   ⟨classifyEntryPoint_assocFn rfl rfl,
     classifyEntryPoint_assocFn_of_non_entry_symbol rfl rfl (by decide)⟩
 
+/-- Enabling `#![no_main]` preserves every existing entry point on the classification
+    vectors. -/
+theorem entry_classification_monotone_in_no_main (d : EntryPointDescriptor)
+    (h : (classifyEntryPoint { d with crateNoMain := false }).isSome = true) :
+    (classifyEntryPoint { d with crateNoMain := true }).isSome = true :=
+  classifyEntryPoint_mono_crateNoMain h
+
 /-! ### 2.2 The Collapse on `main`, `_start`, and `__start` -/
 
 open EntryDemo in
@@ -536,6 +543,17 @@ theorem usize_and_bitvec_wraparound_false :
     false_of_usize_list_len_zero_imp_nil (),
     false_of_bitVec_list_len_zero_imp_nil 64 ()⟩
 
+/-- Signed 64-bit `Int64` ghost lengths fail non-negativity at `2 ^ 63` and wrap to
+    zero at `2 ^ 64`, refuting both non-negativity and emptiness axioms. -/
+theorem i64_signed_overflow_and_wraparound_false :
+    (i64GhostLen (2 ^ 63 - 1)).toInt = 2 ^ 63 - 1 ∧
+    (i64GhostLen (2 ^ 63)).toInt < 0 ∧
+    i64GhostLen (2 ^ 64) = 0 ∧
+    (¬ ∀ xs : List Unit, 0 ≤ (i64ListGhostLen xs).toInt) ∧
+    (¬ ∀ xs : List Unit, i64ListGhostLen xs = 0 → xs = []) :=
+  ⟨i64GhostLen_max_pos, i64GhostLen_two_pow_63_neg, i64GhostLen_two_pow_64_zero,
+    false_of_i64_list_len_nonneg (), false_of_i64_list_len_zero_imp_nil ()⟩
+
 /-- **Positive.** The unbounded `Int` list model is consistent and never wraps. -/
 theorem unboundedInt_list_model_never_wraps (n : Nat) :
     Nonempty (UnboundedIntGhostCollectionAxioms (List Unit)) ∧
@@ -782,6 +800,7 @@ run_cmd do
       [``Anneal.SpecBoundaryGuards.PropertyClassTag.asStr_injective,
         ``Anneal.SpecBoundaryGuards.SpecBoundaryGuardClass.guardId_injective,
         ``Anneal.SpecBoundaryGuards.classifyEntryPoint_isSome_of_exported_entry_symbol,
+        ``Anneal.SpecBoundaryGuards.classifyEntryPoint_mono_crateNoMain,
         ``Anneal.SpecBoundaryGuards.claimClosedProgramSafe_of_guard,
         ``Anneal.SpecBoundaryGuards.statefulClaimClosedProgramSafe_of_guard,
         ``Anneal.SpecBoundaryGuards.totalClaimClosedProgramTotal_of_guard,
@@ -792,6 +811,8 @@ run_cmd do
         ``Anneal.SpecBoundaryGuards.u64GhostLen_two_pow_64,
         ``Anneal.SpecBoundaryGuards.usizeGhostLen_wraps,
         ``Anneal.SpecBoundaryGuards.bitVec64GhostLen_two_pow_64,
+        ``Anneal.SpecBoundaryGuards.i64GhostLen_two_pow_63_neg,
+        ``Anneal.SpecBoundaryGuards.false_of_i64_list_len_nonneg,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_strict_mono,
         ``Anneal.SpecBoundaryGuards.false_of_fixedWidth_ghost_length_zero_empty,
         ``Anneal.SpecBoundaryGuards.isEmpty_model_of_fixedSigned,

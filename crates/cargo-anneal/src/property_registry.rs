@@ -7850,7 +7850,8 @@ fn is_fixed_width_int_type_name(word: &str) -> bool {
 /// parentheses.
 fn fixed_width_type_of(toks: &[GuardTok<'_>]) -> Option<(String, usize)> {
     let mut toks = toks;
-    while toks.len() >= 2 && matching_close(toks, 0) == Some(toks.len() - 1) && toks[0].is_sym("(") {
+    while toks.len() >= 2 && matching_close(toks, 0) == Some(toks.len() - 1) && toks[0].is_sym("(")
+    {
         toks = &toks[1..toks.len() - 1];
     }
     let first = toks.first()?;
@@ -7869,7 +7870,10 @@ fn fixed_width_type_of(toks: &[GuardTok<'_>]) -> Option<(String, usize)> {
                 t.kind == GuardTokKind::PathSep || t.is_sym(".")
             }
         });
-        if valid_path && let Some(last) = toks.last() && is_fixed_width_int_type_name(last.text) {
+        if valid_path
+            && let Some(last) = toks.last()
+            && is_fixed_width_int_type_name(last.text)
+        {
             return Some((String::from(last.text), last.line));
         }
     }
@@ -7946,66 +7950,371 @@ fn is_closed_width_bound(bound: &[GuardTok<'_>]) -> bool {
         })
 }
 
-/// The first fixed-width type mentioned anywhere in a type expression.
+/// Split a token slice on depth-0 occurrences of `sep` (outside `()`, `[]`,
+/// `{}`, `<>`, `⟨⟩`).
+fn split_top_level_toks<'t, 'a>(
+    toks: &'t [GuardTok<'a>],
+    is_sep: impl Fn(&GuardTok<'_>) -> bool,
+) -> Vec<&'t [GuardTok<'a>]> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut angle = 0i32;
+    let mut start = 0usize;
+    for (idx, tok) in toks.iter().enumerate() {
+        if depth == 0 && angle == 0 && is_sep(tok) {
+            parts.push(&toks[start..idx]);
+            start = idx + 1;
+            continue;
+        }
+        let delta = bracket_delta(tok);
+        if delta != 0 {
+            depth += delta;
+        } else if depth == 0 {
+            if tok.is_sym("<") {
+                angle += 1;
+            } else if tok.is_sym(">") && angle > 0 {
+                angle -= 1;
+            }
+        }
+    }
+    parts.push(&toks[start..]);
+    parts
+}
+
+/// Strip leading Rust field attributes (`#[…]`) and visibility (`pub`,
+/// `pub(crate)`, …) from a tuple-struct field type slice.
+fn strip_rust_field_prefix<'t, 'a>(mut toks: &'t [GuardTok<'a>]) -> &'t [GuardTok<'a>] {
+    loop {
+        if toks.first().is_some_and(|t| t.is_sym("#"))
+            && toks.get(1).is_some_and(|t| t.is_sym("["))
+            && let Some(close) = matching_close(toks, 1)
+        {
+            toks = &toks[close + 1..];
+            continue;
+        }
+        if toks.first().is_some_and(|t| t.is_word("pub")) {
+            toks = &toks[1..];
+            if toks.first().is_some_and(|t| t.is_sym("("))
+                && let Some(close) = matching_close(toks, 0)
+            {
+                toks = &toks[close + 1..];
+            }
+            continue;
+        }
+        break;
+    }
+    toks
+}
+
+/// Read a leading Rust or Lean path (`A::B::C` or `A.B.C`, optionally with a
+/// leading `::`) starting at `start`, returning `(leaf_tok, next_idx)`.
+fn read_type_path<'t, 'a>(
+    toks: &'t [GuardTok<'a>],
+    start: usize,
+) -> Option<(&'t GuardTok<'a>, usize)> {
+    let mut cursor = start;
+    if toks
+        .get(cursor)
+        .is_some_and(|t| t.kind == GuardTokKind::PathSep)
+    {
+        cursor += 1;
+    }
+    let mut leaf = toks.get(cursor).filter(|t| t.kind == GuardTokKind::Word)?;
+    cursor += 1;
+    while toks
+        .get(cursor)
+        .is_some_and(|sep| sep.kind == GuardTokKind::PathSep || sep.is_sym("."))
+        && let Some(next) = toks
+            .get(cursor + 1)
+            .filter(|t| t.kind == GuardTokKind::Word)
+    {
+        leaf = next;
+        cursor += 2;
+    }
+    Some((leaf, cursor))
+}
+
+/// Split Lean type arguments (`Arg1 (Arg2 ...) Arg3`) into bracket-balanced
+/// slices.
+fn split_lean_type_args<'t, 'a>(toks: &'t [GuardTok<'a>]) -> Vec<&'t [GuardTok<'a>]> {
+    let mut args = Vec::new();
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        let start = idx;
+        if bracket_delta(&toks[idx]) > 0 {
+            let mut depth = 0i32;
+            while idx < toks.len() {
+                depth += bracket_delta(&toks[idx]);
+                idx += 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            args.push(&toks[start..idx]);
+        } else if toks[idx].kind == GuardTokKind::Word {
+            idx += 1;
+            while toks.get(idx).is_some_and(|sep| sep.is_sym("."))
+                && toks
+                    .get(idx + 1)
+                    .is_some_and(|part| part.kind == GuardTokKind::Word)
+            {
+                idx += 2;
+            }
+            args.push(&toks[start..idx]);
+        } else {
+            idx += 1;
+        }
+    }
+    args
+}
+
+/// Resolve a bare or path-qualified fixed-width scalar integer name, Rust
+/// wrapper (`NonZeroU64`, `size_t`, …), or module-local alias.
+fn resolve_fixed_width_leaf(
+    leaf: &GuardTok<'_>,
+    aliases: &[(String, String)],
+) -> Option<(String, usize)> {
+    if is_fixed_width_int_type_name(leaf.text)
+        || RUST_FIXED_WIDTH_WRAPPER_TYPE_NAMES.contains(&leaf.text)
+    {
+        return Some((String::from(leaf.text), leaf.line));
+    }
+    aliases
+        .iter()
+        .find(|(alias, _)| alias == leaf.text)
+        .map(|(_, underlying)| (underlying.clone(), leaf.line))
+}
+
+/// Structurally inspect a type expression for a fixed-width scalar integer
+/// length type (descending only through scalar/reference/tuple/option/ok-result
+/// wrappers, never through collection/slice/array/error-slot element types).
 ///
 /// A wrapper does not make a machine integer unbounded, so `Option<u64>`,
-/// `Wrapping<u64>`, `&u64`, `(u64, bool)`, `Option UInt64`, and
-/// `UInt64 × Bool` are all fixed-width, as are `NonZeroU64`, `size_t`,
+/// `Wrapping<u64>`, `NonZero<u64>`, `&u64`, `(u64, bool)`, `Result<u64, E>`,
+/// `Option UInt64`, `UInt64 × Bool`, `Except String UInt64`, and
+/// `{ n : UInt64 // n < 10 }` are fixed-width, as are `NonZeroU64`, `size_t`,
 /// `Std.BitVec 64`, `Fin (2 ^ 64)`, and every name in `aliases`
-/// (`abbrev GhostLen := UInt64`, `type GhostLen = u64;`). A name used as a
-/// namespace (`UInt64.size`, `u64::MAX`) is not a type.
+/// (`abbrev GhostLen := UInt64`, `type GhostLen = u64;`). Conversely,
+/// collections and error slots (`GhostSeq<u8>`, `List UInt8`, `&[u8]`,
+/// `Result<Nat, u8>`, `Except UInt32 Nat`) are not flagged.
 fn fixed_width_type_within(
     toks: &[GuardTok<'_>],
     aliases: &[(String, String)],
 ) -> Option<(String, usize)> {
-    if let Some(found) = fixed_width_type_of(toks) {
-        return Some(found);
-    }
-    for (idx, tok) in toks.iter().enumerate() {
-        if tok.kind != GuardTokKind::Word {
-            continue;
+    const MAX_TYPE_DEPTH: u32 = 12;
+    fn inspect(
+        toks: &[GuardTok<'_>],
+        aliases: &[(String, String)],
+        depth: u32,
+    ) -> Option<(String, usize)> {
+        if depth == 0 || toks.is_empty() {
+            return None;
         }
-        let is_namespace = toks
-            .get(idx + 1)
-            .is_some_and(|sep| sep.is_sym(".") || sep.kind == GuardTokKind::PathSep)
+        let mut toks = toks;
+        while toks.len() >= 2
+            && toks[0].is_sym("(")
+            && matching_close(toks, 0) == Some(toks.len() - 1)
+        {
+            toks = &toks[1..toks.len() - 1];
+        }
+        if toks.is_empty() {
+            return None;
+        }
+        if let Some(found) = fixed_width_type_of(toks) {
+            return Some(found);
+        }
+        // Rust slice / array types (`[u8]`, `[u8; 64]`) are collections, not
+        // scalar lengths.
+        if toks[0].is_sym("[") && matching_close(toks, 0) == Some(toks.len() - 1) {
+            return None;
+        }
+        // Lean subtype `{ n : T // P }` or `{ n : T | P }`.
+        if toks[0].is_sym("{") && matching_close(toks, 0) == Some(toks.len() - 1) {
+            let inner = &toks[1..toks.len() - 1];
+            let mut d = 0i32;
+            let mut colon = None;
+            let mut pred_sep = None;
+            for idx in 0..inner.len() {
+                if d == 0 {
+                    if colon.is_none() && inner[idx].is_sym(":") {
+                        colon = Some(idx);
+                    } else if colon.is_some()
+                        && (inner[idx].is_sym("|")
+                            || (inner[idx].is_sym("/")
+                                && inner.get(idx + 1).is_some_and(|n| n.is_sym("/"))))
+                    {
+                        pred_sep = Some(idx);
+                        break;
+                    }
+                }
+                d += bracket_delta(&inner[idx]);
+            }
+            if let (Some(c), Some(sep)) = (colon, pred_sep) {
+                return inspect(&inner[c + 1..sep], aliases, depth - 1);
+            }
+            return None;
+        }
+        // Tuples / products at depth 0 (`(u64, bool)`, `UInt64 × Bool`).
+        let tuple_parts = split_top_level_toks(toks, |t| t.is_sym(",") || t.is_sym("×"));
+        if tuple_parts.len() > 1 {
+            for part in tuple_parts {
+                if let Some(found) = inspect(part, aliases, depth - 1) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
+        // Rust reference (`&'a mut T`, `&T`) or raw pointer (`*const T`, `*mut T`).
+        if toks[0].is_sym("&") {
+            let mut cursor = 1usize;
+            if toks.get(cursor).is_some_and(|t| t.is_sym("'"))
+                && toks
+                    .get(cursor + 1)
+                    .is_some_and(|t| t.kind == GuardTokKind::Word)
+            {
+                cursor += 2;
+            }
+            if toks.get(cursor).is_some_and(|t| t.is_word("mut")) {
+                cursor += 1;
+            }
+            return inspect(&toks[cursor..], aliases, depth - 1);
+        }
+        if toks[0].is_sym("*")
             && toks
-                .get(idx + 2)
-                .is_some_and(|member| member.kind == GuardTokKind::Word);
-        if is_namespace {
-            continue;
-        }
-        if is_fixed_width_int_type_name(tok.text)
-            || RUST_FIXED_WIDTH_WRAPPER_TYPE_NAMES.contains(&tok.text)
+                .get(1)
+                .is_some_and(|t| t.is_word("const") || t.is_word("mut"))
         {
-            return Some((String::from(tok.text), tok.line));
+            return inspect(&toks[2..], aliases, depth - 1);
         }
-        if let Some((_, underlying)) = aliases.iter().find(|(alias, _)| alias == tok.text) {
-            return Some((underlying.clone(), tok.line));
+        // Path-headed type (`u64`, `core::num::NonZeroU64`, `Std.BitVec 64`,
+        // `Fin (2 ^ 64)`, `Option<u64>`, `Result<u64, E>`, `Option UInt64`,
+        // `Except String UInt64`, `GhostSeq<u8>`, `List UInt8`, …).
+        let (head, after_head) = read_type_path(toks, 0)?;
+        if after_head == toks.len() {
+            return resolve_fixed_width_leaf(head, aliases);
         }
-        if tok.text == "BitVec"
-            && let Some((width, _)) = type_argument(&toks[idx + 1..])
+        if head.text == "BitVec"
+            && let Some((width, _)) = type_argument(&toks[after_head..])
         {
-            return Some((format!("BitVec {width}"), tok.line));
+            return Some((format!("BitVec {width}"), head.line));
         }
-        if tok.text == "Fin"
-            && let Some((bound, bound_toks)) = type_argument(&toks[idx + 1..])
+        if head.text == "Fin"
+            && let Some((bound, bound_toks)) = type_argument(&toks[after_head..])
             && is_closed_width_bound(bound_toks)
         {
-            return Some((format!("Fin {bound}"), tok.line));
+            return Some((format!("Fin {bound}"), head.line));
         }
+        // Rust generic wrapper `Head<Arg1, Arg2, …>`.
+        if toks.get(after_head).is_some_and(|t| t.is_sym("<")) {
+            let close = skip_rust_generics(toks, after_head);
+            if close > after_head + 1 && close == toks.len() {
+                let raw_args =
+                    split_top_level_toks(&toks[after_head + 1..close - 1], |t| t.is_sym(","));
+                let type_args: Vec<&[GuardTok<'_>]> = raw_args
+                    .into_iter()
+                    .filter(|arg| !arg.is_empty() && !arg.first().is_some_and(|t| t.is_sym("'")))
+                    .collect();
+                if matches!(
+                    head.text,
+                    "Option"
+                        | "Wrapping"
+                        | "Saturating"
+                        | "NonZero"
+                        | "Cell"
+                        | "RefCell"
+                        | "Box"
+                        | "Arc"
+                        | "Rc"
+                        | "ManuallyDrop"
+                        | "MaybeUninit"
+                        | "Pin"
+                        | "Ghost"
+                        | "Snapshot"
+                        | "Spec"
+                ) {
+                    if let Some(inner) = type_args.first() {
+                        return inspect(inner, aliases, depth - 1);
+                    }
+                } else if head.text == "Result"
+                    && let Some(ok_ty) = type_args.first()
+                {
+                    return inspect(ok_ty, aliases, depth - 1);
+                }
+            }
+            return None;
+        }
+        // Lean type application `Head Arg1 Arg2 …`.
+        let lean_args = split_lean_type_args(&toks[after_head..]);
+        if matches!(
+            head.text,
+            "Option" | "Id" | "Thunk" | "Ghost" | "PLift" | "ULift"
+        ) {
+            if let Some(inner) = lean_args.last() {
+                return inspect(inner, aliases, depth - 1);
+            }
+        } else if matches!(head.text, "Prod" | "PProd" | "MProd") {
+            for arg in lean_args {
+                if let Some(found) = inspect(arg, aliases, depth - 1) {
+                    return Some(found);
+                }
+            }
+        } else if head.text == "Except"
+            && let Some(ok_ty) = lean_args.get(1)
+        {
+            return inspect(ok_ty, aliases, depth - 1);
+        }
+        None
     }
-    None
+    inspect(toks, aliases, MAX_TYPE_DEPTH)
 }
 
 /// Whether a Lean expression is a type (applications, products, arrows,
-/// numerals) rather than a proposition or a term: no relation, connective,
-/// binder, or literal occurs in it.
+/// numerals, or subtypes `{ x : T // P }`) rather than a proposition or a
+/// term: no top-level relation, connective, binder, or literal occurs in it.
 fn is_lean_type_expression(toks: &[GuardTok<'_>]) -> bool {
-    !toks.is_empty()
-        && toks.iter().all(|tok| match tok.kind {
+    if toks.is_empty() {
+        return false;
+    }
+    let mut idx = 0usize;
+    while idx < toks.len() {
+        let tok = &toks[idx];
+        if tok.is_sym("{")
+            && let Some(close) = matching_close(toks, idx)
+        {
+            // Lean subtype `{ x : T // P }` or `{ x : T | P }`: validate `T`
+            // as a type expression and skip over the predicate `P`.
+            let inner = &toks[idx + 1..close];
+            let mut d = 0i32;
+            let mut colon = None;
+            let mut pred_sep = None;
+            for pos in 0..inner.len() {
+                if d == 0 {
+                    if colon.is_none() && inner[pos].is_sym(":") {
+                        colon = Some(pos);
+                    } else if colon.is_some()
+                        && (inner[pos].is_sym("|")
+                            || (inner[pos].is_sym("/")
+                                && inner.get(pos + 1).is_some_and(|n| n.is_sym("/"))))
+                    {
+                        pred_sep = Some(pos);
+                        break;
+                    }
+                }
+                d += bracket_delta(&inner[pos]);
+            }
+            let Some((c, sep)) = colon.zip(pred_sep) else {
+                return false;
+            };
+            if !is_lean_type_expression(&inner[c + 1..sep]) {
+                return false;
+            }
+            idx = close + 1;
+            continue;
+        }
+        let ok = match tok.kind {
             GuardTokKind::Word => !matches!(
                 tok.text,
-                "fun" | "match" | "if" | "then" | "else" | "let" | "by" | "do" | "forall"
+                "fun" | "λ" | "match" | "if" | "then" | "else" | "let" | "by" | "do" | "forall"
             ),
             GuardTokKind::Sym => {
                 matches!(
@@ -8014,7 +8323,13 @@ fn is_lean_type_expression(toks: &[GuardTok<'_>]) -> bool {
                 )
             }
             _ => false,
-        })
+        };
+        if !ok {
+            return false;
+        }
+        idx += 1;
+    }
+    true
 }
 
 /// The result type of a Lean type: what follows its last depth-0 arrow
@@ -8090,7 +8405,15 @@ fn collect_fixed_width_type_aliases(
                 if toks.get(open).is_some_and(|paren| paren.is_sym("("))
                     && let Some(close) = matching_close(toks, open)
                 {
-                    candidate = Some((String::from(name.text), &toks[open + 1..close]));
+                    let fields = split_top_level_toks(&toks[open + 1..close], |t| t.is_sym(","));
+                    let non_empty: Vec<&[GuardTok<'_>]> =
+                        fields.into_iter().filter(|f| !f.is_empty()).collect();
+                    if non_empty.len() == 1 {
+                        candidate = Some((
+                            String::from(name.text),
+                            strip_rust_field_prefix(non_empty[0]),
+                        ));
+                    }
                 }
             }
             if candidate.is_none()
@@ -8256,8 +8579,23 @@ fn read_lean_dotted_name(toks: &[GuardTok<'_>], start: usize) -> (String, usize)
     (name, cursor)
 }
 
-/// Qualify `name` with the active Lean `namespace` stack.
-fn qualify_lean_name(namespaces: &[String], name: &str) -> String {
+/// An open Lean `namespace` or `section` block.
+#[derive(Clone, Debug)]
+enum LeanScope {
+    Namespace(String),
+    Section(Option<String>),
+}
+
+/// Qualify `name` with the active Lean `namespace` scopes (ignoring `section`
+/// scopes).
+fn qualify_lean_name(scopes: &[LeanScope], name: &str) -> String {
+    let namespaces: Vec<&str> = scopes
+        .iter()
+        .filter_map(|scope| match scope {
+            LeanScope::Namespace(ns) => Some(ns.as_str()),
+            LeanScope::Section(_) => None,
+        })
+        .collect();
     if namespaces.is_empty() {
         String::from(name)
     } else {
@@ -8266,15 +8604,16 @@ fn qualify_lean_name(namespaces: &[String], name: &str) -> String {
 }
 
 /// Scan Lean declarations (`def`, `axiom`, `opaque`, `abbrev`, `theorem`,
-/// `lemma`) and ghost `structure` fields for ghost length specs with a
-/// fixed-width result or field type, tracking enclosing `namespace` scopes.
+/// `lemma`) and ghost `structure` / `class` fields for ghost length specs with
+/// a fixed-width result or field type, tracking enclosing `namespace` and
+/// `section` scopes.
 fn scan_lean_ghost_length_decls(
     source_label: &str,
     toks: &[GuardTok<'_>],
     aliases: &[(String, String)],
     out: &mut Vec<GhostLengthWidthDiagnostic>,
 ) {
-    let mut namespaces: Vec<String> = Vec::new();
+    let mut scopes: Vec<LeanScope> = Vec::new();
     let mut idx = 0usize;
     while idx < toks.len() {
         let tok = &toks[idx];
@@ -8282,25 +8621,51 @@ fn scan_lean_ghost_length_decls(
             let (ns, next) = read_lean_dotted_name(toks, idx + 1);
             if !ns.is_empty() {
                 for part in ns.split('.') {
-                    namespaces.push(String::from(part));
+                    scopes.push(LeanScope::Namespace(String::from(part)));
                 }
             }
             idx = next.max(idx + 1);
             continue;
         }
-        if tok.is_word("end") {
-            let (ns, next) = read_lean_dotted_name(toks, idx + 1);
-            if ns.is_empty() {
-                namespaces.pop();
+        if tok.is_word("section") {
+            let has_same_line_name = toks.get(idx + 1).is_some_and(|next| {
+                next.line == tok.line
+                    && next.kind == GuardTokKind::Word
+                    && !LEAN_COMMAND_KEYWORDS.contains(&next.text)
+            });
+            if has_same_line_name {
+                let (name, next) = read_lean_dotted_name(toks, idx + 1);
+                scopes.push(LeanScope::Section(Some(name)));
+                idx = next.max(idx + 1);
             } else {
-                let parts: Vec<&str> = ns.split('.').collect();
-                for _ in 0..parts.len() {
-                    if namespaces.pop().is_none() {
-                        break;
+                scopes.push(LeanScope::Section(None));
+                idx += 1;
+            }
+            continue;
+        }
+        if tok.is_word("end") {
+            let has_same_line_name = toks.get(idx + 1).is_some_and(|next| {
+                next.line == tok.line
+                    && next.kind == GuardTokKind::Word
+                    && !LEAN_COMMAND_KEYWORDS.contains(&next.text)
+            });
+            if !has_same_line_name {
+                scopes.pop();
+                idx += 1;
+            } else {
+                let (ns, next) = read_lean_dotted_name(toks, idx + 1);
+                if matches!(scopes.last(), Some(LeanScope::Section(Some(sec))) if *sec == ns) {
+                    scopes.pop();
+                } else {
+                    let parts: Vec<&str> = ns.split('.').collect();
+                    for _ in 0..parts.len() {
+                        if scopes.pop().is_none() {
+                            break;
+                        }
                     }
                 }
+                idx = next.max(idx + 1);
             }
-            idx = next.max(idx + 1);
             continue;
         }
         // Lean ghost `structure` / `class` fields
@@ -8312,7 +8677,7 @@ fn scan_lean_ghost_length_decls(
                 idx += 1;
                 continue;
             }
-            let struct_name = qualify_lean_name(&namespaces, &raw_name);
+            let struct_name = qualify_lean_name(&scopes, &raw_name);
             let header_start = cursor;
             while let Some(t) = toks.get(cursor) {
                 if t.is_word("where")
@@ -8333,7 +8698,8 @@ fn scan_lean_ghost_length_decls(
             while let Some(t) = toks.get(fields_end) {
                 if depth == 0
                     && (t.is_word("deriving")
-                        || (t.kind == GuardTokKind::Word && LEAN_COMMAND_KEYWORDS.contains(&t.text)))
+                        || (t.kind == GuardTokKind::Word
+                            && LEAN_COMMAND_KEYWORDS.contains(&t.text)))
                 {
                     break;
                 }
@@ -8407,7 +8773,7 @@ fn scan_lean_ghost_length_decls(
             idx += 1;
             continue;
         }
-        let name = qualify_lean_name(&namespaces, &raw_name);
+        let name = qualify_lean_name(&scopes, &raw_name);
         // Signature: up to `:=`, `where`, a match-arm `|`, or the next command.
         let sig_start = cursor;
         let mut depth = 0i32;
@@ -8514,7 +8880,8 @@ fn scan_lean_wraparound_casts(
     for idx in 0..toks.len() {
         let tok = &toks[idx];
         // Type ascription `(<expr containing .length> : <Fixed>)`, which
-        // coerces the length into the machine type.
+        // coerces the length into the machine type. Reject control-flow or
+        // relational expressions on the LHS (`(if xs.length == 0 then 0 else 1 : UInt64)`).
         if tok.is_sym("(")
             && let Some(close) = matching_close(toks, idx)
         {
@@ -8527,28 +8894,74 @@ fn scan_lean_wraparound_casts(
                 }
                 depth += bracket_delta(&toks[pos]);
             }
-            if let Some(colon) = colon
-                && (idx + 1..colon).any(is_length_projection)
-                && let Some((fixed_width_type, _)) =
-                    fixed_width_type_within(&toks[colon + 1..close], aliases)
-                    .filter(|_| is_lean_type_expression(&toks[colon + 1..close]))
-            {
-                out.push(GhostLengthWidthDiagnostic {
-                    source_label: String::from(source_label),
-                    line: tok.line,
-                    declaration: String::new(),
-                    fixed_width_type,
-                    kind: GhostLengthWidthKind::WraparoundCast,
-                });
+            if let Some(colon) = colon {
+                let lhs = &toks[idx + 1..colon];
+                let mut lhs_depth = 0i32;
+                let mut lhs_is_control_or_rel = false;
+                for lt in lhs {
+                    if lhs_depth == 0
+                        && ((lt.kind == GuardTokKind::Word
+                            && matches!(
+                                lt.text,
+                                "if" | "then" | "else" | "match" | "with" | "fun" | "λ" | "forall"
+                            ))
+                            || (lt.kind == GuardTokKind::Sym
+                                && matches!(
+                                    lt.text,
+                                    "=" | "=="
+                                        | "!="
+                                        | "≠"
+                                        | "<"
+                                        | ">"
+                                        | "<="
+                                        | ">="
+                                        | "≤"
+                                        | "≥"
+                                        | "∧"
+                                        | "∨"
+                                        | "/\\"
+                                        | "\\/"
+                                        | "&&"
+                                        | "||"
+                                        | "→"
+                                        | "->"
+                                        | "↔"
+                                        | "<->"
+                                        | "∀"
+                                        | "∃"
+                                        | ","
+                                        | ";"
+                                )))
+                    {
+                        lhs_is_control_or_rel = true;
+                        break;
+                    }
+                    lhs_depth += bracket_delta(lt);
+                }
+                if !lhs_is_control_or_rel
+                    && (idx + 1..colon).any(is_length_projection)
+                    && let Some((fixed_width_type, _)) =
+                        fixed_width_type_within(&toks[colon + 1..close], aliases)
+                            .filter(|_| is_lean_type_expression(&toks[colon + 1..close]))
+                {
+                    out.push(GhostLengthWidthDiagnostic {
+                        source_label: String::from(source_label),
+                        line: tok.line,
+                        declaration: String::new(),
+                        fixed_width_type,
+                        kind: GhostLengthWidthKind::WraparoundCast,
+                    });
+                }
             }
         }
-        // `<Fixed>.ofNat <expr containing .length>`
+        // `<Fixed>.ofNat <expr>`, `<Fixed>.ofNatTruncate <expr>`, `<Fixed>.ofInt <expr>`
         if tok.kind == GuardTokKind::Word
             && is_fixed_width_int_type_name(tok.text)
             && toks.get(idx + 1).is_some_and(|dot| dot.is_sym("."))
-            && toks
-                .get(idx + 2)
-                .is_some_and(|of_nat| of_nat.is_word("ofNat"))
+            && toks.get(idx + 2).is_some_and(|ctor| {
+                ctor.kind == GuardTokKind::Word
+                    && matches!(ctor.text, "ofNat" | "ofNatTruncate" | "ofInt")
+            })
         {
             let (arg_start, arg_end) = arg_span(idx + 3, tok.line);
             if (arg_start..arg_end).any(is_length_projection) {
@@ -8561,12 +8974,12 @@ fn scan_lean_wraparound_casts(
                 });
             }
         }
-        // `BitVec.ofNat <width> <expr containing .length>`
+        // `BitVec.ofNat <width> <expr>` / `BitVec.ofInt <width> <expr>`
         if tok.is_word("BitVec")
             && toks.get(idx + 1).is_some_and(|dot| dot.is_sym("."))
-            && toks
-                .get(idx + 2)
-                .is_some_and(|of_nat| of_nat.is_word("ofNat"))
+            && toks.get(idx + 2).is_some_and(|ctor| {
+                ctor.kind == GuardTokKind::Word && matches!(ctor.text, "ofNat" | "ofInt")
+            })
             && let Some(width_tok) = toks.get(idx + 3)
         {
             let (width_label, val_start) = if width_tok.is_sym("(")
@@ -8588,8 +9001,8 @@ fn scan_lean_wraparound_casts(
                 });
             }
         }
-        // `Nat.toUInt64 <expr containing .length>` / `Nat.toUSize …`
-        if tok.is_word("Nat")
+        // `Nat.toUInt64 <expr>` / `Int.toInt64 <expr>` / `Nat.toUSize …`
+        if (tok.is_word("Nat") || tok.is_word("Int"))
             && toks.get(idx + 1).is_some_and(|dot| dot.is_sym("."))
             && let Some(cast) = toks.get(idx + 2)
             && cast.kind == GuardTokKind::Word
@@ -8709,12 +9122,14 @@ fn rust_ghost_attr_body(attr: &[GuardTok<'_>], fuel: usize) -> Option<RustGhostA
     }
 }
 
-/// Scan a Rust token slice for `.len() as <fixed>` or `(<expr with .len()>) as <fixed>`
-/// wraparound casts.
+/// Scan a Rust token slice for `.len() as <fixed>`, `(<expr with .len()>) as <fixed>`,
+/// or `<fixed>::{from,try_from,new}(<expr with .len()>)` wraparound casts (including
+/// path-qualified types, C aliases, and module-local aliases).
 fn scan_rust_slice_wraparound_casts(
     source_label: &str,
     declaration: &str,
     toks: &[GuardTok<'_>],
+    aliases: &[(String, String)],
     require_ghost_receiver: bool,
     out: &mut Vec<GhostLengthWidthDiagnostic>,
 ) {
@@ -8737,31 +9152,51 @@ fn scan_rust_slice_wraparound_casts(
         })
     };
     for idx in 0..toks.len() {
-        if !toks[idx].is_word("as") {
-            continue;
-        }
-        let Some(ty_tok) = toks.get(idx + 1) else {
-            continue;
-        };
-        if !(ty_tok.kind == GuardTokKind::Word && is_fixed_width_int_type_name(ty_tok.text)) {
-            continue;
-        }
-        let matched = if idx >= 4 && is_len_call_at(idx - 4) && receiver_is_ghost(idx - 4) {
-            true
-        } else if idx >= 1
-            && toks[idx - 1].is_sym(")")
-            && let Some(open) = matching_open_paren(toks, idx - 1)
+        // `<expr with .len()> as <FixedPath>`
+        if toks[idx].is_word("as")
+            && let Some((leaf, _)) = read_type_path(toks, idx + 1)
+            && let Some((fixed_width_type, line)) = resolve_fixed_width_leaf(leaf, aliases)
         {
-            (open..idx).any(|at| is_len_call_at(at) && receiver_is_ghost(at))
-        } else {
-            false
-        };
-        if matched {
+            let matched = if idx >= 4 && is_len_call_at(idx - 4) && receiver_is_ghost(idx - 4) {
+                true
+            } else if idx >= 1
+                && toks[idx - 1].is_sym(")")
+                && let Some(open) = matching_open_paren(toks, idx - 1)
+            {
+                (open..idx).any(|at| is_len_call_at(at) && receiver_is_ghost(at))
+            } else {
+                false
+            };
+            if matched {
+                out.push(GhostLengthWidthDiagnostic {
+                    source_label: String::from(source_label),
+                    line,
+                    declaration: String::from(declaration),
+                    fixed_width_type,
+                    kind: GhostLengthWidthKind::WraparoundCast,
+                });
+            }
+            continue;
+        }
+        // `<FixedPath>::from(<expr with .len()>)`, `::try_from(…)`, `::new(…)`
+        let at_path_root = idx == 0 || toks[idx - 1].kind != GuardTokKind::PathSep;
+        if at_path_root
+            && (toks[idx].kind == GuardTokKind::Word || toks[idx].kind == GuardTokKind::PathSep)
+            && let Some((leaf, after_path)) = read_type_path(toks, idx)
+            && matches!(leaf.text, "from" | "try_from" | "new")
+            && after_path >= idx + 3
+            && toks[after_path - 2].kind == GuardTokKind::PathSep
+            && let Some((fixed_width_type, line)) =
+                resolve_fixed_width_leaf(&toks[after_path - 3], aliases)
+            && toks.get(after_path).is_some_and(|open| open.is_sym("("))
+            && let Some(close) = matching_close(toks, after_path)
+            && (after_path + 1..close).any(|at| is_len_call_at(at) && receiver_is_ghost(at))
+        {
             out.push(GhostLengthWidthDiagnostic {
                 source_label: String::from(source_label),
-                line: ty_tok.line,
+                line,
                 declaration: String::from(declaration),
-                fixed_width_type: String::from(ty_tok.text),
+                fixed_width_type,
                 kind: GhostLengthWidthKind::WraparoundCast,
             });
         }
@@ -8936,6 +9371,7 @@ fn scan_rust_ghost_length_fns(
                             source_label,
                             "",
                             &toks[open..=close_idx],
+                            aliases,
                             true,
                             out,
                         );
@@ -8945,7 +9381,8 @@ fn scan_rust_ghost_length_fns(
                 continue;
             }
         }
-        // `#[model] struct GhostBuf { len: u64 }`, and
+        // `#[model] struct GhostBuf { len: u64 }`,
+        // `#[model] struct GhostLen(u64);`, and
         // `#[invariant(self.items.len() as u64 <= CAP)] struct Buf { items: Seq<u8> }`.
         if tok.is_word("struct") {
             let attr = pending.take();
@@ -8954,7 +9391,11 @@ fn scan_rust_ghost_length_fns(
                 && let Some(name_tok) = toks.get(idx + 1).filter(|t| t.kind == GuardTokKind::Word)
             {
                 let mut open = skip_rust_generics(toks, idx + 2);
-                while open < toks.len() && !toks[open].is_sym("{") && !toks[open].is_sym(";") {
+                while open < toks.len()
+                    && !toks[open].is_sym("{")
+                    && !toks[open].is_sym("(")
+                    && !toks[open].is_sym(";")
+                {
                     open += 1;
                 }
                 if toks.get(open).is_some_and(|t| t.is_sym("{"))
@@ -8977,6 +9418,40 @@ fn scan_rust_ghost_length_fns(
                                 source_label,
                                 name_tok.text,
                                 &toks[*attr_open..=*attr_close],
+                                aliases,
+                                false,
+                                out,
+                            );
+                        }
+                    }
+                    idx = close + 1;
+                    continue;
+                } else if toks.get(open).is_some_and(|t| t.is_sym("("))
+                    && let Some(close) = matching_close(toks, open)
+                {
+                    if attr == Some(RustGhostAttr::Model) && is_ghost_length_name(name_tok.text) {
+                        for field in split_top_level_toks(&toks[open + 1..close], |t| t.is_sym(","))
+                        {
+                            if let Some((fixed_width_type, line)) =
+                                fixed_width_type_within(strip_rust_field_prefix(field), aliases)
+                            {
+                                out.push(GhostLengthWidthDiagnostic {
+                                    source_label: String::from(source_label),
+                                    line,
+                                    declaration: String::from(name_tok.text),
+                                    fixed_width_type,
+                                    kind: GhostLengthWidthKind::FixedWidthReturnType,
+                                });
+                            }
+                        }
+                    }
+                    if mentions_ghost_collection(&toks[idx + 1..=close]) {
+                        for (attr_open, attr_close) in &attr_ranges {
+                            scan_rust_slice_wraparound_casts(
+                                source_label,
+                                name_tok.text,
+                                &toks[*attr_open..=*attr_close],
+                                aliases,
                                 false,
                                 out,
                             );
@@ -9014,10 +9489,7 @@ fn scan_rust_ghost_length_fns(
             continue;
         }
         if tok.kind == GuardTokKind::Word
-            && matches!(
-                tok.text,
-                "enum" | "mod" | "static" | "type" | "use"
-            )
+            && matches!(tok.text, "enum" | "mod" | "static" | "type" | "use")
         {
             pending = None;
             pending_attr_ranges.clear();
@@ -9111,13 +9583,14 @@ fn scan_rust_ghost_length_fns(
             });
         }
         // Inside a ghost-collection `fn`, scan both its spec attributes and
-        // its body for `.len() as u64` / `(.len()) as u64` wraparound casts.
+        // its body for `.len() as u64` / `u64::from(s.len())` wraparound casts.
         if ghost_collection {
             for (attr_open, attr_close) in &attr_ranges {
                 scan_rust_slice_wraparound_casts(
                     source_label,
                     name,
                     &toks[*attr_open..=*attr_close],
+                    aliases,
                     false,
                     out,
                 );
@@ -9127,6 +9600,7 @@ fn scan_rust_ghost_length_fns(
                     source_label,
                     name,
                     &toks[body_open..=body_close],
+                    aliases,
                     false,
                     out,
                 );
@@ -9363,9 +9837,11 @@ fn is_catch_all_binder_word(word: &str) -> bool {
 #[derive(Clone, Copy, Debug, Default)]
 struct WildcardAlternative {
     depth: u32,
+    arm_base_depth: u32,
+    catch_all_parens: u32,
     tokens: u32,
     /// The alternative is exactly a catch-all so far (`_`, a bare binding,
-    /// or a binding behind `ref` / `mut`).
+    /// or a binding behind `&` / `ref` / `mut` / `(...)` / Lean `(_ : T)`).
     catch_all: bool,
     only_modifiers: bool,
     error_ctor: Option<WildcardCtor>,
@@ -9383,6 +9859,16 @@ impl WildcardAlternative {
     fn pattern(depth: u32) -> Self {
         Self {
             depth,
+            arm_base_depth: depth,
+            ..Self::default()
+        }
+    }
+
+    fn next_alt(depth: u32, arm_base_depth: u32, catch_all_parens: u32) -> Self {
+        Self {
+            depth,
+            arm_base_depth,
+            catch_all_parens,
             ..Self::default()
         }
     }
@@ -9390,6 +9876,7 @@ impl WildcardAlternative {
     fn body(depth: u32) -> Self {
         Self {
             depth,
+            arm_base_depth: depth,
             after_arrow: true,
             body_depth: depth,
             ..Self::default()
@@ -9592,26 +10079,61 @@ fn is_constraining_continuation(tok: &GuardTok<'_>) -> bool {
 /// Maximum number of `&&` / `∧` terms unfolded in a trivially-true arm body.
 const MAX_TRIVIAL_CONJUNCTS: usize = 8;
 
-/// Consume one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
-/// `!false`, `¬False`, `Not False`, optionally followed by `as bool`, a
-/// parenthesized `: Prop` / `: Bool` ascription, or an enclosed disjunction
-/// `(true || …)`). Returns `Some(next_idx)` on match.
-fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize) -> Option<usize> {
-    let mut idx = start;
-    let mut parens = 0u32;
-    let mut braces = 0u32;
-    while let Some(tok) = toks.get(idx) {
-        if tok.is_sym("(") {
-            parens += 1;
-        } else if tok.is_sym("{") {
-            braces += 1;
-        } else if !(tok.is_word("return") || tok.is_word("by")) {
-            break;
+/// Maximum nesting of parenthesized / braced expressions inspected inside a
+/// trivially-true arm body.
+const MAX_TRIVIAL_EXPR_DEPTH: u32 = 8;
+
+/// Maximum tokens scanned while inspecting disjunctions inside an arm body.
+const MAX_ARM_BODY_SCAN_TOKENS: usize = 128;
+
+fn is_disjunction_tok(tok: &GuardTok<'_>) -> bool {
+    (tok.kind == GuardTokKind::Sym && matches!(tok.text, "||" | "∨" | "\\/")) || tok.is_word("or")
+}
+
+fn is_conjunction_tok(tok: &GuardTok<'_>) -> bool {
+    (tok.kind == GuardTokKind::Sym && matches!(tok.text, "&&" | "∧" | "/\\")) || tok.is_word("and")
+}
+
+fn is_looser_than_disjunction(tok: &GuardTok<'_>) -> bool {
+    tok.kind == GuardTokKind::Sym && matches!(tok.text, "->" | "→" | "↔" | "<->" | "==>")
+}
+
+fn is_arm_body_terminator(tok: &GuardTok<'_>) -> bool {
+    match tok.kind {
+        GuardTokKind::FatArrow => true,
+        GuardTokKind::Sym => matches!(tok.text, "," | "|" | ";" | ")" | "]" | "}"),
+        GuardTokKind::Word => {
+            is_lean_decl_reset_word(tok.text)
+                || matches!(
+                    tok.text,
+                    "fn" | "pub" | "struct" | "enum" | "impl" | "trait" | "mod" | "where" | "end"
+                )
         }
+        _ => false,
+    }
+}
+
+/// Consume one trivially-true boolean/Prop atom (`true`, `True`, `trivial`,
+/// `!false`, `¬False`, `Not False`, or a parenthesized/braced trivially-true
+/// expression, optionally preceded by `return`/`by` and followed by `as bool`).
+/// Returns `Some(next_idx)` on match.
+fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize, depth: u32) -> Option<usize> {
+    if depth == 0 {
+        return None;
+    }
+    let mut idx = start;
+    while toks
+        .get(idx)
+        .is_some_and(|t| t.is_word("return") || t.is_word("by"))
+    {
         idx += 1;
     }
     let tok = toks.get(idx)?;
-    if tok.kind == GuardTokKind::Word && matches!(tok.text, "true" | "True" | "trivial") {
+    if tok.is_sym("(") {
+        idx = expr_is_trivially_true(toks, idx + 1, Some(")"), depth - 1)?;
+    } else if tok.is_sym("{") {
+        idx = expr_is_trivially_true(toks, idx + 1, Some("}"), depth - 1)?;
+    } else if tok.kind == GuardTokKind::Word && matches!(tok.text, "true" | "True" | "trivial") {
         idx += 1;
     } else if tok.is_sym("!") && toks.get(idx + 1).is_some_and(|t| t.is_word("false")) {
         idx += 2;
@@ -9622,106 +10144,171 @@ fn consume_trivial_true_atom(toks: &[GuardTok<'_>], start: usize) -> Option<usiz
     } else {
         return None;
     }
-    // Optional `as bool` before closing wrappers.
+    // Optional `as bool`.
     if toks.get(idx).is_some_and(|t| t.is_word("as"))
         && toks.get(idx + 1).is_some_and(|t| t.is_word("bool"))
     {
         idx += 2;
     }
-    // Optional `(True : Prop)` type ascription.
-    if parens > 0
-        && toks.get(idx).is_some_and(|t| t.is_sym(":"))
-        && toks.get(idx + 1).is_some_and(|t| {
-            t.kind == GuardTokKind::Word && matches!(t.text, "Prop" | "Bool" | "bool")
-        })
-    {
-        idx += 2;
-    }
-    // Disjunction inside an open paren/brace wrapper: `(true || p)`, `(True ∨ P)`.
-    if (parens > 0 || braces > 0)
-        && toks.get(idx).is_some_and(|t| {
-            (t.kind == GuardTokKind::Sym && matches!(t.text, "||" | "∨" | "\\/")) || t.is_word("or")
-        })
-    {
-        idx += 1;
-        let mut inner = 0u32;
-        while let Some(t) = toks.get(idx) {
-            idx += 1;
-            if t.kind == GuardTokKind::Sym {
-                match t.text {
-                    "(" | "[" | "{" => inner += 1,
-                    ")" | "]" | "}" if inner > 0 => inner -= 1,
-                    ";" if inner == 0 => {
-                        // A statement boundary: the disjunction is the block
-                        // value only when the block ends right here.
-                        if braces > 0 && toks.get(idx).is_some_and(|t| t.is_sym("}")) {
-                            braces -= 1;
-                            idx += 1;
-                            break;
-                        }
-                        return None;
-                    }
-                    ")" if parens > 0 => {
-                        parens -= 1;
-                        break;
-                    }
-                    "}" if braces > 0 => {
-                        braces -= 1;
-                        break;
-                    }
-                    _ => {}
-                }
+    Some(idx)
+}
+
+/// Consume a conjunction of trivially-true atoms (`true && true`,
+/// `(True ∧ True)`, optionally followed by `as bool` or a parenthesized
+/// `: Prop` / `: Bool` ascription) not continued by a constraining operator.
+fn consume_trivial_conjunction(
+    toks: &[GuardTok<'_>],
+    start: usize,
+    allow_type_ascription: bool,
+    depth: u32,
+) -> Option<usize> {
+    let mut idx = consume_trivial_true_atom(toks, start, depth)?;
+    for _ in 0..MAX_TRIVIAL_CONJUNCTS {
+        let Some(next) = toks.get(idx) else {
+            return Some(idx);
+        };
+        if is_conjunction_tok(next) {
+            idx = consume_trivial_true_atom(toks, idx + 1, depth)?;
+        } else if next.is_word("as") {
+            if toks.get(idx + 1).is_some_and(|t| t.is_word("bool")) {
+                idx += 2;
+            } else {
+                return None;
             }
-        }
-    }
-    while parens > 0 || braces > 0 {
-        let t = toks.get(idx)?;
-        if t.is_sym(")") && parens > 0 {
-            parens -= 1;
-            idx += 1;
-        } else if t.is_sym("}") && braces > 0 {
-            braces -= 1;
-            idx += 1;
-        } else if t.is_sym(";") && braces > 0 {
-            idx += 1;
+        } else if allow_type_ascription && next.is_sym(":") {
+            if toks.get(idx + 1).is_some_and(|t| {
+                t.kind == GuardTokKind::Word && matches!(t.text, "Prop" | "Bool" | "bool")
+            }) {
+                idx += 2;
+            } else {
+                return None;
+            }
+        } else if !is_constraining_continuation(next) {
+            return Some(idx);
         } else {
             return None;
         }
     }
-    Some(idx)
+    None
+}
+
+/// Evaluate whether the expression starting at `start` (up to `stop_delim` at
+/// inner depth 0, or up to the arm-body terminator when `stop_delim` is
+/// `None`) is trivially true; returns `Some(next_idx)` right after the closing
+/// delimiter (or at the terminator) on match.
+fn expr_is_trivially_true(
+    toks: &[GuardTok<'_>],
+    start: usize,
+    stop_delim: Option<&str>,
+    depth: u32,
+) -> Option<usize> {
+    if depth == 0 {
+        return None;
+    }
+    let mut idx = start;
+    while toks
+        .get(idx)
+        .is_some_and(|t| t.is_word("return") || t.is_word("by"))
+    {
+        idx += 1;
+    }
+    let mut found_trivial = false;
+    let mut scanned = 0usize;
+    let mut at_disjunct_start = true;
+    let mut inner_depth = 0u32;
+    let mut prev_closed_brace_at_zero = false;
+    loop {
+        if at_disjunct_start && inner_depth == 0 {
+            at_disjunct_start = false;
+            if let Some(after) =
+                consume_trivial_conjunction(toks, idx, stop_delim == Some(")"), depth)
+            {
+                found_trivial = true;
+                idx = after;
+            }
+        }
+        let Some(tok) = toks.get(idx) else {
+            return (stop_delim.is_none() && found_trivial).then_some(idx);
+        };
+        let before = idx;
+        idx += 1;
+        scanned += 1;
+        if scanned > MAX_ARM_BODY_SCAN_TOKENS {
+            return None;
+        }
+        if inner_depth == 0 {
+            if prev_closed_brace_at_zero {
+                prev_closed_brace_at_zero = false;
+                if stop_delim.is_none()
+                    && tok.kind == GuardTokKind::Word
+                    && !matches!(tok.text, "else" | "or" | "and" | "as")
+                {
+                    return found_trivial.then_some(before);
+                }
+            }
+            if let Some(delim) = stop_delim {
+                if tok.is_sym(delim) {
+                    return found_trivial.then_some(idx);
+                }
+                if delim == "}" && tok.is_sym(";") {
+                    return (toks.get(idx).is_some_and(|t| t.is_sym("}")) && found_trivial)
+                        .then_some(idx + 1);
+                }
+                if tok.kind == GuardTokKind::Sym && matches!(tok.text, ")" | "]" | "}") {
+                    return None;
+                }
+            } else if is_arm_body_terminator(tok) {
+                return found_trivial.then_some(before);
+            }
+            if is_looser_than_disjunction(tok) {
+                return None;
+            }
+            if is_disjunction_tok(tok) {
+                at_disjunct_start = true;
+                continue;
+            }
+            if stop_delim == Some(")") && tok.is_sym(":") {
+                if toks.get(idx).is_some_and(|t| {
+                    t.kind == GuardTokKind::Word && matches!(t.text, "Prop" | "Bool" | "bool")
+                }) && toks.get(idx + 1).is_some_and(|t| t.is_sym(")"))
+                {
+                    return found_trivial.then_some(idx + 2);
+                }
+                return None;
+            }
+            if tok.is_word("as") {
+                if toks.get(idx).is_some_and(|t| t.is_word("bool")) {
+                    idx += 1;
+                    continue;
+                }
+                found_trivial = false;
+            }
+        }
+        if tok.kind == GuardTokKind::Sym {
+            match tok.text {
+                "(" | "[" | "{" => inner_depth += 1,
+                ")" | "]" | "}" => {
+                    if inner_depth == 0 {
+                        return None;
+                    }
+                    inner_depth -= 1;
+                    if inner_depth == 0 && tok.text == "}" {
+                        prev_closed_brace_at_zero = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Whether the arm body starting at `start` is trivially true: `true`,
 /// `True`, `trivial`, `!false`, `¬False`, `Not False`, optionally wrapped
 /// (`(true)`, `{ true }`, `{ return true; }`, `by trivial`, `true as bool`),
-/// a conjunction of trivially-true atoms, or a disjunction starting with one,
+/// a conjunction of trivially-true atoms, or a disjunction containing one,
 /// and not combined with a constraining operator.
 fn arm_body_is_trivially_true(toks: &[GuardTok<'_>], start: usize) -> bool {
-    let Some(mut idx) = consume_trivial_true_atom(toks, start) else {
-        return false;
-    };
-    for _ in 0..MAX_TRIVIAL_CONJUNCTS {
-        let Some(next) = toks.get(idx) else {
-            return true;
-        };
-        if (next.kind == GuardTokKind::Sym && matches!(next.text, "&&" | "∧" | "/\\"))
-            || next.is_word("and")
-        {
-            let Some(after) = consume_trivial_true_atom(toks, idx + 1) else {
-                return false;
-            };
-            idx = after;
-        } else if next.is_word("as") {
-            if toks.get(idx + 1).is_some_and(|t| t.is_word("bool")) {
-                idx += 2;
-            } else {
-                return false;
-            }
-        } else {
-            return !is_constraining_continuation(next);
-        }
-    }
-    false
+    expr_is_trivially_true(toks, start, None, MAX_TRIVIAL_EXPR_DEPTH).is_some()
 }
 
 /// Lean declaration keywords that begin a fresh top-level item and close any
@@ -9764,6 +10351,7 @@ fn scan_error_branch_wildcard_tokens(
     let mut matches_saw_ok = false;
     let mut matches_scope_floor = 0usize;
     let mut after_dot = false;
+    let mut in_match_scrutinee = false;
     let mut scopes = OkScopes::new();
 
     let mut idx = 0usize;
@@ -9790,6 +10378,7 @@ fn scan_error_branch_wildcard_tokens(
                         matches_state = MatchesMacroState::Pattern;
                         matches_saw_ok = false;
                         matches_scope_floor = scopes.len;
+                        in_match_scrutinee = false;
                         alt = WildcardAlternative::default();
                         arm = WildcardArm::default();
                     }
@@ -9801,6 +10390,7 @@ fn scan_error_branch_wildcard_tokens(
 
         match tok.kind {
             GuardTokKind::FatArrow => {
+                in_match_scrutinee = false;
                 if !alt.in_lambda {
                     arm.absorb(&alt);
                     if !arm.guard_blocks() && arm_body_is_trivially_true(toks, idx) {
@@ -9837,7 +10427,13 @@ fn scan_error_branch_wildcard_tokens(
                                 alt.type_ascription_depth = None;
                             }
                         }
-                        _ => alt = WildcardAlternative::pattern(alt.depth),
+                        _ => {
+                            alt = WildcardAlternative::next_alt(
+                                alt.depth,
+                                alt.arm_base_depth,
+                                alt.catch_all_parens,
+                            );
+                        }
                     }
                 }
             }
@@ -9851,9 +10447,10 @@ fn scan_error_branch_wildcard_tokens(
                 // A sibling of the error constructor (`(Err(_), Ok(_))`,
                 // `| .err _, .ok v`), not part of its payload.
                 arm.absorb(&alt);
-                alt = WildcardAlternative::pattern(alt.depth);
+                alt = WildcardAlternative::next_alt(alt.depth, alt.arm_base_depth, 0);
             }
             GuardTokKind::Sym if matches!(tok.text, "," | ";") && alt.depth == 0 => {
+                in_match_scrutinee = false;
                 if matches_state == MatchesMacroState::Pattern {
                     // Allow a Rust trailing comma in `matches!(out, pat,)`.
                     if tok.text == ","
@@ -9868,16 +10465,47 @@ fn scan_error_branch_wildcard_tokens(
                 arm = WildcardArm::default();
                 alt = WildcardAlternative::default();
             }
-            GuardTokKind::Sym if matches!(tok.text, "(" | "[") => {
+            GuardTokKind::Sym if tok.text == "(" => {
+                let outer_wrapper = (alt.tokens == 0 || alt.only_modifiers)
+                    && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
                 alt.depth += 1;
-                alt.push_non_word();
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.tokens += 1;
+                    alt.catch_all = false;
+                    alt.only_modifiers = outer_wrapper;
+                    if outer_wrapper {
+                        alt.catch_all_parens += 1;
+                    }
+                }
+            }
+            GuardTokKind::Sym if tok.text == "[" => {
+                alt.depth += 1;
+                if alt.type_ascription_depth.is_some() {
+                    alt.tokens += 1;
+                } else {
+                    alt.push_non_word();
+                }
             }
             GuardTokKind::Sym if tok.text == "{" => {
-                if alt.error_ctor.is_some() && !alt.after_arrow && !arm.guarded {
-                    // Struct pattern inside an error payload.
+                let is_struct_pattern_brace = !alt.after_arrow
+                    && !arm.guarded
+                    && !in_match_scrutinee
+                    && (alt.error_ctor.is_some()
+                        || matches_state == MatchesMacroState::Pattern
+                        || arm.wildcard.is_some()
+                        || arm.catch_all);
+                if is_struct_pattern_brace {
+                    // Struct pattern inside a match arm or `matches!` pattern.
                     alt.depth += 1;
-                    alt.push_non_word();
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                    }
                 } else {
+                    in_match_scrutinee = false;
                     scopes.push(OkScopeKind::Brace {
                         saved_depth: alt.depth,
                     });
@@ -9893,9 +10521,23 @@ fn scan_error_branch_wildcard_tokens(
                 };
                 if alt.depth > 0 {
                     alt.depth -= 1;
-                    alt.push_non_word();
+                    let was_ascription = alt.type_ascription_depth.is_some();
                     if alt.type_ascription_depth.is_some_and(|d| alt.depth < d) {
                         alt.type_ascription_depth = None;
+                    }
+                    let closed_outer_catch_all_paren = tok.text == ")"
+                        && alt.catch_all_parens > 0
+                        && alt.depth < alt.arm_base_depth + alt.catch_all_parens;
+                    if closed_outer_catch_all_paren {
+                        alt.catch_all_parens -= 1;
+                    }
+                    if was_ascription || closed_outer_catch_all_paren {
+                        alt.tokens += 1;
+                        if !was_ascription {
+                            alt.only_modifiers = false;
+                        }
+                    } else {
+                        alt.push_non_word();
                     }
                     if alt.after_arrow && alt.depth < alt.body_depth {
                         // The bracket around the arm list closed.
@@ -9906,6 +10548,7 @@ fn scan_error_branch_wildcard_tokens(
                     && let Some(saved_depth) = scopes.pop_brace(brace_floor)
                 {
                     // The block closed: a new arm pattern may follow.
+                    in_match_scrutinee = false;
                     arm = WildcardArm::default();
                     alt = WildcardAlternative::pattern(saved_depth);
                 } else {
@@ -9920,12 +10563,14 @@ fn scan_error_branch_wildcard_tokens(
                         }
                         matches_state = MatchesMacroState::Outside;
                     }
+                    in_match_scrutinee = false;
                     scopes.close_lean_matches(0);
                     arm = WildcardArm::default();
                     alt = WildcardAlternative::default();
                 }
             }
             GuardTokKind::Sym if tok.text == ":=" => {
+                in_match_scrutinee = false;
                 arm = WildcardArm::default();
                 alt = WildcardAlternative::body(alt.depth);
             }
@@ -9951,6 +10596,7 @@ fn scan_error_branch_wildcard_tokens(
                     continue;
                 }
                 if !arm.guarded && alt.depth == 0 && is_lean_decl_reset_word(word) {
+                    in_match_scrutinee = false;
                     scopes.begin_declaration();
                     arm = WildcardArm::default();
                     alt = WildcardAlternative::default();
@@ -9958,7 +10604,7 @@ fn scan_error_branch_wildcard_tokens(
                 }
                 if !arm.guarded
                     && lean_keywords
-                    && word == "fun"
+                    && matches!(word, "fun" | "λ")
                     && alt.error_ctor.is_none()
                     && (alt.after_arrow || alt.tokens == 0)
                 {
@@ -9970,6 +10616,7 @@ fn scan_error_branch_wildcard_tokens(
                     continue;
                 }
                 if !arm.guarded && matches!(word, "match" | "with") {
+                    in_match_scrutinee = word == "match";
                     if word == "with" && lean_keywords {
                         scopes.push(OkScopeKind::LeanMatch { depth: alt.depth });
                     }
@@ -9985,13 +10632,15 @@ fn scan_error_branch_wildcard_tokens(
                     alt = WildcardAlternative::default();
                     arm.guarded = true;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    let leading = alt.tokens == 0 || alt.only_modifiers;
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                        continue;
+                    }
+                    let leading = (alt.tokens == 0 || alt.only_modifiers)
+                        && alt.depth == alt.arm_base_depth + alt.catch_all_parens;
                     alt.catch_all = leading && is_catch_all_binder_word(word);
                     alt.only_modifiers = leading && matches!(word, "ref" | "mut");
                     alt.tokens += 1;
-                    if alt.type_ascription_depth.is_some() {
-                        continue;
-                    }
                     if let Some(ctor) = WildcardCtor::of(word, was_after_dot) {
                         match alt.error_ctor {
                             None => {
@@ -10019,9 +10668,13 @@ fn scan_error_branch_wildcard_tokens(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.push_non_word();
-                    if alt.error_ctor.is_some() && alt.type_ascription_depth.is_none() {
-                        alt.constrained = true;
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else {
+                        alt.push_non_word();
+                        if alt.error_ctor.is_some() {
+                            alt.constrained = true;
+                        }
                     }
                 }
             }
@@ -10030,14 +10683,25 @@ fn scan_error_branch_wildcard_tokens(
                     arm.guard_tokens += 1;
                     arm.guard_trivial = false;
                 } else if !alt.after_arrow && !alt.in_lambda {
-                    alt.push_non_word();
-                    if tok.is_sym(":")
-                        && alt.error_ctor.is_some()
-                        && !alt.constrained
+                    if alt.type_ascription_depth.is_some() {
+                        alt.tokens += 1;
+                    } else if tok.kind == GuardTokKind::Sym && matches!(tok.text, "&" | "&&") {
+                        let keep_mod = alt.tokens == 0 || alt.only_modifiers;
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = keep_mod;
+                    } else if tok.is_sym("@") && alt.catch_all {
+                        alt.tokens += 1;
+                        alt.catch_all = false;
+                        alt.only_modifiers = true;
+                    } else if tok.is_sym(":")
                         && alt.depth > 0
-                        && alt.type_ascription_depth.is_none()
+                        && ((alt.error_ctor.is_some() && !alt.constrained) || alt.catch_all)
                     {
+                        alt.tokens += 1;
                         alt.type_ascription_depth = Some(alt.depth);
+                    } else {
+                        alt.push_non_word();
                     }
                 }
             }
@@ -10280,7 +10944,9 @@ fn lean_pre_body_is_trivial(body: &[GuardTok<'_>], module_defines_pre: bool) -> 
             body = &body[1..body.len() - 1];
             continue;
         }
-        if body.first().is_some_and(|tok| tok.is_word("fun"))
+        if body
+            .first()
+            .is_some_and(|tok| tok.is_word("fun") || tok.is_word("λ"))
             && let Some(arrow) = body
                 .iter()
                 .position(|tok| tok.kind == GuardTokKind::FatArrow)
@@ -10366,40 +11032,87 @@ fn is_first_on_line(toks: &[GuardTok<'_>], idx: usize) -> bool {
     idx == 0 || toks[idx - 1].line < toks[idx].line
 }
 
-/// If a structure field definition `name := …` or `name x y := …` starts at
-/// `idx`, the index of its `:=`.
-fn lean_field_assign(toks: &[GuardTok<'_>], idx: usize) -> Option<usize> {
+/// Kind of a Lean structure / instance field definition starting at `idx`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeanFieldHead {
+    /// `name [binders] [: Type] := …` at the index of `:=`.
+    Assign(usize),
+    /// `name [binders] [: Type] | pat => …` at the index of the first `|`.
+    Equations(usize),
+}
+
+/// If a structure or `where` field definition starts at `idx` (`name := …`,
+/// `name args := …`, `name (args : T) := …`, `name : T := …`, or
+/// equation-compiler `name | pat => …`), returns its header terminator.
+fn lean_field_header(toks: &[GuardTok<'_>], idx: usize) -> Option<LeanFieldHead> {
     let name = toks.get(idx)?;
-    if name.kind != GuardTokKind::Word || (idx > 0 && toks[idx - 1].is_sym(".")) {
+    if name.kind != GuardTokKind::Word
+        || LEAN_COMMAND_KEYWORDS.contains(&name.text)
+        || matches!(
+            name.text,
+            "where" | "with" | "in" | "then" | "else" | "do" | "by" | "fun" | "match"
+        )
+        || (idx > 0 && toks[idx - 1].is_sym("."))
+    {
         return None;
     }
-    let mut cursor = idx + 1;
-    while let Some(binder) = toks.get(cursor) {
-        let is_binder = binder.kind == GuardTokKind::Word
-            && !LEAN_COMMAND_KEYWORDS.contains(&binder.text)
-            && binder
-                .text
-                .chars()
-                .next()
-                .is_some_and(|first| first.is_lowercase() || first == '_');
-        if !is_binder {
-            break;
-        }
-        cursor += 1;
-    }
-    let assign = toks.get(cursor)?;
-    if !assign.is_sym(":=") {
-        return None;
-    }
-    // With binders, only a field position counts: `def helper pre x := …`
-    // declares a parameter named `pre`, not a field.
     let field_position = idx == 0
         || is_first_on_line(toks, idx)
         || toks[idx - 1].is_word("where")
         || toks[idx - 1].is_word("with")
         || toks[idx - 1].is_sym("{")
         || toks[idx - 1].is_sym(",");
-    (cursor == idx + 1 || field_position).then_some(cursor)
+    let mut cursor = idx + 1;
+    while let Some(binder) = toks.get(cursor) {
+        let is_plain_binder = binder.kind == GuardTokKind::Word
+            && !LEAN_COMMAND_KEYWORDS.contains(&binder.text)
+            && !matches!(
+                binder.text,
+                "where" | "with" | "in" | "then" | "else" | "do" | "by" | "fun" | "match"
+            )
+            && binder
+                .text
+                .chars()
+                .next()
+                .is_some_and(|first| first.is_lowercase() || first == '_');
+        if is_plain_binder {
+            cursor += 1;
+            continue;
+        }
+        if field_position
+            && (binder.is_sym("(") || binder.is_sym("{") || binder.is_sym("["))
+            && let Some(close) = matching_close(toks, cursor)
+        {
+            cursor = close + 1;
+            continue;
+        }
+        break;
+    }
+    // Optional explicit field type annotation `: Type` in field position.
+    if field_position && toks.get(cursor).is_some_and(|t| t.is_sym(":")) {
+        cursor += 1;
+        let mut depth = 0i32;
+        while let Some(t) = toks.get(cursor) {
+            if depth == 0
+                && (t.is_sym(":=")
+                    || t.is_sym("|")
+                    || is_lean_command_start(toks, cursor)
+                    || (t.kind == GuardTokKind::Sym && matches!(t.text, "," | "}" | ")" | "]")))
+            {
+                break;
+            }
+            depth += bracket_delta(t);
+            cursor += 1;
+        }
+    }
+    let head = toks.get(cursor)?;
+    if head.is_sym(":=") {
+        (cursor == idx + 1 || field_position).then_some(LeanFieldHead::Assign(cursor))
+    } else if head.is_sym("|") && field_position {
+        Some(LeanFieldHead::Equations(cursor))
+    } else {
+        None
+    }
 }
 
 /// Strip matched outer parentheses.
@@ -10608,11 +11321,35 @@ fn lean_spec_value_is_safe(
         }
         let inner = &value[1..value.len() - 1];
         let mut depth = 0i32;
+        let mut fields_start = 0usize;
         for (pos, tok) in inner.iter().enumerate() {
             if depth == 0 && tok.is_word("with") {
-                return lean_spec_value_is_safe(&inner[..pos], toks, decls, module_defines_pre);
+                if !lean_spec_value_is_safe(&inner[..pos], toks, decls, module_defines_pre) {
+                    return false;
+                }
+                fields_start = pos + 1;
+                break;
             }
             depth += bracket_delta(tok);
+        }
+        // Fail closed on a Lean structure field pun `{ pre, … }` or
+        // `{ base with pre }` unless `pre` is defined (and thus audited) in
+        // this module.
+        let fields = &inner[fields_start..];
+        let mut fdepth = 0i32;
+        let mut at_field_start = true;
+        for (pos, tok) in fields.iter().enumerate() {
+            if fdepth == 0 {
+                if at_field_start
+                    && tok.is_word("pre")
+                    && fields.get(pos + 1).is_none_or(|next| next.is_sym(","))
+                    && !module_defines_pre
+                {
+                    return false;
+                }
+                at_field_start = tok.is_sym(",");
+            }
+            fdepth += bracket_delta(tok);
         }
         return true;
     }
@@ -10685,7 +11422,10 @@ pub fn audit_lean_spec_entry_point_requires(
         if let Some(value) = decl.value
             && !lean_spec_value_is_safe(value, &toks, &spec_decls, module_defines_pre)
         {
-            out.push(diagnostic(decl.line, EntryPointRequiresKind::AuthoredLeanPre));
+            out.push(diagnostic(
+                decl.line,
+                EntryPointRequiresKind::AuthoredLeanPre,
+            ));
         }
     }
     let mut idx = 0usize;
@@ -10701,12 +11441,12 @@ pub fn audit_lean_spec_entry_point_requires(
                 decl_after_name = Some(after_name);
             }
         }
-        let field_assign = if toks[idx].is_word("pre") {
-            lean_field_assign(&toks, idx)
+        let field_head = if toks[idx].is_word("pre") {
+            lean_field_header(&toks, idx)
         } else {
             None
         };
-        if decl_after_name.is_none() && field_assign.is_none() {
+        if decl_after_name.is_none() && field_head.is_none() {
             idx += 1;
             continue;
         }
@@ -10722,8 +11462,7 @@ pub fn audit_lean_spec_entry_point_requires(
                         || tok.is_sym("|")
                         || (tok.kind == GuardTokKind::Word
                             && LEAN_COMMAND_KEYWORDS.contains(&tok.text))
-                        || (tok.is_sym("@")
-                            && toks.get(cursor + 1).is_some_and(|o| o.is_sym("["))))
+                        || (tok.is_sym("@") && toks.get(cursor + 1).is_some_and(|o| o.is_sym("["))))
                 {
                     break;
                 }
@@ -10741,8 +11480,7 @@ pub fn audit_lean_spec_entry_point_requires(
                     if d == 0
                         && ((t.kind == GuardTokKind::Word
                             && LEAN_COMMAND_KEYWORDS.contains(&t.text))
-                            || (t.is_sym("@")
-                                && toks.get(end + 1).is_some_and(|o| o.is_sym("["))))
+                            || (t.is_sym("@") && toks.get(end + 1).is_some_and(|o| o.is_sym("["))))
                     {
                         break;
                     }
@@ -10776,16 +11514,15 @@ pub fn audit_lean_spec_entry_point_requires(
                                         || (bt.kind == GuardTokKind::Word
                                             && LEAN_COMMAND_KEYWORDS.contains(&bt.text))
                                         || (bt.is_sym("@")
-                                            && toks
-                                                .get(b_end + 1)
-                                                .is_some_and(|o| o.is_sym("["))))
+                                            && toks.get(b_end + 1).is_some_and(|o| o.is_sym("["))))
                                 {
                                     break;
                                 }
                                 bd += bracket_delta(bt);
                                 b_end += 1;
                             }
-                            if !lean_pre_body_is_trivial(&toks[b_start..b_end], module_defines_pre) {
+                            if !lean_pre_body_is_trivial(&toks[b_start..b_end], module_defines_pre)
+                            {
                                 all_arms_trivial = false;
                             }
                             end = b_end;
@@ -10834,33 +11571,128 @@ pub fn audit_lean_spec_entry_point_requires(
             idx = body_end.max(idx + 1);
             continue;
         }
-        // Instance or struct literal field `pre := body` / `pre args := body`.
-        let body_start = field_assign.map_or(toks.len(), |assign| assign + 1);
-        let mut body_end = body_start;
-        let mut depth = 0i32;
-        while let Some(tok) = toks.get(body_end) {
-            if depth == 0 {
-                let next_command =
-                    tok.kind == GuardTokKind::Word && LEAN_COMMAND_KEYWORDS.contains(&tok.text);
-                let next_field = body_end > body_start
-                    && lean_field_assign(&toks, body_end).is_some_and(|assign| {
-                        assign == body_end + 1 || is_first_on_line(&toks, body_end)
-                    });
-                let attribute =
-                    tok.is_sym("@") && toks.get(body_end + 1).is_some_and(|open| open.is_sym("["));
-                let struct_sep = tok.kind == GuardTokKind::Sym
-                    && matches!(tok.text, "," | "}" | ")" | "]");
-                if next_command || next_field || attribute || struct_sep {
-                    break;
+        // Instance or struct literal field:
+        //   - `pre [binders] [: Type] := body`
+        //   - `pre [binders] [: Type] | pat => body` (equation compiler inside `where`)
+        let is_next_field = |pos: usize, start: usize| -> bool {
+            pos > start
+                && lean_field_header(&toks, pos).is_some_and(|head| match head {
+                    LeanFieldHead::Assign(assign) => {
+                        assign == pos + 1 || is_first_on_line(&toks, pos)
+                    }
+                    LeanFieldHead::Equations(_) => is_first_on_line(&toks, pos),
+                })
+        };
+        match field_head {
+            Some(LeanFieldHead::Equations(pipe_idx)) => {
+                let mut end = pipe_idx;
+                let mut d = 0i32;
+                let mut all_arms_trivial = true;
+                let mut saw_arm = false;
+                while let Some(t) = toks.get(end) {
+                    if d == 0 {
+                        let next_command =
+                            t.kind == GuardTokKind::Word && LEAN_COMMAND_KEYWORDS.contains(&t.text);
+                        let attribute =
+                            t.is_sym("@") && toks.get(end + 1).is_some_and(|o| o.is_sym("["));
+                        let struct_sep =
+                            t.kind == GuardTokKind::Sym && matches!(t.text, "," | "}" | ")" | "]");
+                        if next_command || attribute || struct_sep || is_next_field(end, pipe_idx) {
+                            break;
+                        }
+                    }
+                    if d == 0 && t.is_sym("|") {
+                        saw_arm = true;
+                        let mut arrow = end + 1;
+                        let mut ad = 0i32;
+                        while let Some(at) = toks.get(arrow) {
+                            if ad == 0 && at.kind == GuardTokKind::FatArrow {
+                                break;
+                            }
+                            if ad == 0
+                                && at.kind == GuardTokKind::Word
+                                && LEAN_COMMAND_KEYWORDS.contains(&at.text)
+                            {
+                                break;
+                            }
+                            ad += bracket_delta(at);
+                            arrow += 1;
+                        }
+                        if toks
+                            .get(arrow)
+                            .is_some_and(|at| at.kind == GuardTokKind::FatArrow)
+                        {
+                            let b_start = arrow + 1;
+                            let mut b_end = b_start;
+                            let mut bd = 0i32;
+                            while let Some(bt) = toks.get(b_end) {
+                                if bd == 0 {
+                                    let next_command = bt.kind == GuardTokKind::Word
+                                        && LEAN_COMMAND_KEYWORDS.contains(&bt.text);
+                                    let attribute = bt.is_sym("@")
+                                        && toks.get(b_end + 1).is_some_and(|o| o.is_sym("["));
+                                    let struct_sep = bt.kind == GuardTokKind::Sym
+                                        && matches!(bt.text, "," | "}" | ")" | "]");
+                                    if bt.is_sym("|")
+                                        || next_command
+                                        || attribute
+                                        || struct_sep
+                                        || is_next_field(b_end, b_start)
+                                    {
+                                        break;
+                                    }
+                                }
+                                bd += bracket_delta(bt);
+                                b_end += 1;
+                            }
+                            if !lean_pre_body_is_trivial(&toks[b_start..b_end], module_defines_pre)
+                            {
+                                all_arms_trivial = false;
+                            }
+                            end = b_end;
+                            continue;
+                        } else {
+                            all_arms_trivial = false;
+                        }
+                    }
+                    d += bracket_delta(t);
+                    end += 1;
                 }
+                if !saw_arm || !all_arms_trivial {
+                    out.push(diagnostic(line, EntryPointRequiresKind::AuthoredLeanPre));
+                }
+                idx = end.max(idx + 1);
             }
-            depth += bracket_delta(tok);
-            body_end += 1;
+            Some(LeanFieldHead::Assign(assign)) => {
+                let body_start = assign + 1;
+                let mut body_end = body_start;
+                let mut depth = 0i32;
+                while let Some(tok) = toks.get(body_end) {
+                    if depth == 0 {
+                        let next_command = tok.kind == GuardTokKind::Word
+                            && LEAN_COMMAND_KEYWORDS.contains(&tok.text);
+                        let attribute = tok.is_sym("@")
+                            && toks.get(body_end + 1).is_some_and(|open| open.is_sym("["));
+                        let struct_sep = tok.kind == GuardTokKind::Sym
+                            && matches!(tok.text, "," | "}" | ")" | "]");
+                        if next_command
+                            || is_next_field(body_end, body_start)
+                            || attribute
+                            || struct_sep
+                        {
+                            break;
+                        }
+                    }
+                    depth += bracket_delta(tok);
+                    body_end += 1;
+                }
+                if !lean_pre_body_is_trivial(&toks[body_start..body_end], module_defines_pre) {
+                    out.push(diagnostic(line, EntryPointRequiresKind::AuthoredLeanPre));
+                }
+                idx = body_end.max(idx + 1);
+            }
+            None => idx += 1,
         }
-        if !lean_pre_body_is_trivial(&toks[body_start..body_end], module_defines_pre) {
-            out.push(diagnostic(line, EntryPointRequiresKind::AuthoredLeanPre));
-        }
-        idx = body_end.max(idx + 1);
     }
     out.sort_by_key(|diagnostic| diagnostic.line);
     out.dedup();
@@ -11927,9 +12759,11 @@ mod tests {
             "\"description\": \"\\b\\fbit-shift",
         );
         let parsed_bf = parse_property_taxonomy_json(&with_bf).expect("\\b and \\f parse");
-        assert!(parsed_bf.property_classes[1]
-            .description
-            .starts_with("\u{0008}\u{000c}bit-shift"));
+        assert!(
+            parsed_bf.property_classes[1]
+                .description
+                .starts_with("\u{0008}\u{000c}bit-shift")
+        );
     }
 
     #[test]
@@ -12161,9 +12995,24 @@ theorem arithCast (xs : List α) : (xs.length + 1).toUSize = 0 := rfl
         assert_eq!(
             ghost_findings("Specs/ExtraGhost.lean", extra_lean),
             vec![
-                (2, "GhostList.len".into(), "UInt64".into(), FixedWidthReturnType),
-                (4, "GhostSeq.card".into(), "USize".into(), FixedWidthReturnType),
-                (7, "GhostBuf.len".into(), "UInt64".into(), FixedWidthReturnType),
+                (
+                    2,
+                    "GhostList.len".into(),
+                    "UInt64".into(),
+                    FixedWidthReturnType
+                ),
+                (
+                    4,
+                    "GhostSeq.card".into(),
+                    "USize".into(),
+                    FixedWidthReturnType
+                ),
+                (
+                    7,
+                    "GhostBuf.len".into(),
+                    "UInt64".into(),
+                    FixedWidthReturnType
+                ),
                 (8, String::new(), "BitVec 64".into(), WraparoundCast),
                 (9, String::new(), "UInt64".into(), WraparoundCast),
                 (10, String::new(), "UInt64".into(), WraparoundCast),
@@ -12268,7 +13117,12 @@ struct BoundedBuf { cap: u64 }
                 (2, "ghost_len".into(), "u64".into(), FixedWidthReturnType),
                 (2, "ghost_len".into(), "u64".into(), WraparoundCast),
                 (5, "ghost_size".into(), "usize".into(), FixedWidthReturnType),
-                (10, "GhostQueue.len".into(), "u64".into(), FixedWidthReturnType),
+                (
+                    10,
+                    "GhostQueue.len".into(),
+                    "u64".into(),
+                    FixedWidthReturnType
+                ),
                 (15, "len".into(), "u64".into(), FixedWidthReturnType),
                 (20, "card".into(), "usize".into(), FixedWidthReturnType),
                 (23, "seq_ok".into(), "u64".into(), WraparoundCast),
@@ -12484,6 +13338,123 @@ fn wrapper_len(w: &Wrapper) -> usize { 0 }
             "struct Meters(u64);\nfn len(m: Meters) -> Meters { m }",
         ] {
             assert_eq!(found("src/model.rs", clean), vec![], "{clean:?}");
+        }
+    }
+
+    #[test]
+    fn ghost_length_scanner_distinguishes_collections_scopes_newtypes_and_extra_casts() {
+        use GhostLengthWidthKind::{FixedWidthReturnType, WraparoundCast};
+        let found = |label: &str, text: &str| -> Vec<(usize, String, GhostLengthWidthKind)> {
+            ghost_findings(label, text)
+                .into_iter()
+                .map(|(line, _, ty, kind)| (line, ty, kind))
+                .collect()
+        };
+        let ret = |line: usize, ty: &str| vec![(line, String::from(ty), FixedWidthReturnType)];
+        let cast = |line: usize, ty: &str| vec![(line, String::from(ty), WraparoundCast)];
+
+        // Collection/slice/error-slot element types must NOT be falsely flagged
+        // as fixed-width ghost lengths.
+        for clean_rust in [
+            "#[model]\nfn ghost_len_prefix(s: GhostSeq<u8>) -> GhostSeq<u8> { s }",
+            "#[model]\nfn bound_slice<'a>(s: &'a GhostSeq<u8>) -> &'a [u8] { &[] }",
+            "#[model]\nfn ghost_len_or_err(s: Seq<u8>) -> Result<Nat, u8> { Ok(s.len()) }",
+            "struct ByteSeq(GhostSeq<u8>);\n#[model]\nfn ghost_len_seq(s: Seq<u8>) -> ByteSeq { ByteSeq(s) }",
+            "struct Pair(Nat, u8);\n#[model]\nfn ghost_len_pair(s: Seq<u8>) -> Pair { Pair(s.len(), 0) }",
+        ] {
+            assert_eq!(
+                found("src/clean_elem.rs", clean_rust),
+                vec![],
+                "{clean_rust:?}"
+            );
+        }
+        for clean_lean in [
+            "def GhostSeq.boundSeq (xs : GhostSeq UInt64) : GhostSeq UInt64 := xs",
+            "def ghostLenBytes (xs : GhostSeq UInt8) : List UInt8 := []",
+            "def ghostLenOrErr (xs : GhostSeq UInt8) : Except UInt32 Nat := .ok xs.length",
+            "abbrev ByteSeq := GhostSeq UInt8\ndef ghostLenSeq (xs : ByteSeq) : ByteSeq := xs",
+            "def cap (xs : List Nat) : UInt64 := (if xs.length == 0 then 0 else 1 : UInt64)",
+            "def prefix (xs : List UInt8) : List UInt8 := (xs.take xs.length : List UInt8)",
+        ] {
+            assert_eq!(
+                found("Specs/CleanElem.lean", clean_lean),
+                vec![],
+                "{clean_lean:?}"
+            );
+        }
+
+        // Scalar/result-ok/subtype wrappers, Lean `section`/`end` scopes,
+        // `ofNatTruncate`/`ofInt`, standalone Rust `#[model]` tuple structs,
+        // and Rust alias/conversion wraparound casts MUST be flagged.
+        for (text, expected) in [
+            (
+                "namespace GhostList\nsection Helpers\nend Helpers\naxiom len (xs : List α) : UInt64\nend GhostList",
+                ret(4, "UInt64"),
+            ),
+            (
+                "namespace GhostList\nsection\nend\naxiom len (xs : List α) : USize\nend GhostList",
+                ret(4, "USize"),
+            ),
+            (
+                "def ghostLen (s : GhostSeq Nat) : Except String UInt64 := .ok 0",
+                ret(1, "UInt64"),
+            ),
+            (
+                "def ghostLen (s : GhostSeq Nat) : { n : UInt64 // n < 10 } := ⟨0, by decide⟩",
+                ret(1, "UInt64"),
+            ),
+            (
+                "def ghostLen (s : GhostSeq Nat) : Option { n : USize // n < 10 } := none",
+                ret(1, "USize"),
+            ),
+            (
+                "def cap (xs : List Nat) : UInt64 := UInt64.ofNatTruncate xs.length",
+                cast(1, "UInt64"),
+            ),
+            (
+                "def cap (xs : List Nat) : Int64 := Int64.ofInt xs.length",
+                cast(1, "Int64"),
+            ),
+        ] {
+            assert_eq!(found("Specs/Scope.lean", text), expected, "{text:?}");
+        }
+        for (text, expected) in [
+            ("#[model]\nstruct GhostLen(u64);", ret(2, "u64")),
+            ("#[model]\nstruct SeqCard(pub usize);", ret(2, "usize")),
+            (
+                "struct GhostLen(pub u64);\n#[model]\nfn ghost_len(s: Seq<u8>) -> GhostLen { GhostLen(0) }",
+                ret(3, "u64"),
+            ),
+            (
+                "#[model]\nfn ghost_len_res(s: Seq<u8>) -> Result<u64, String> { Ok(0) }",
+                ret(2, "u64"),
+            ),
+            (
+                "#[model]\nfn ghost_len_nz(s: Seq<u8>) -> core::num::NonZero<u64> { NZ }",
+                ret(2, "u64"),
+            ),
+            (
+                "type GhostLen = u64;\n#[model]\nfn ok(s: Seq<u8>) -> Nat { let _ = s.len() as GhostLen; 0 }",
+                cast(3, "u64"),
+            ),
+            (
+                "#[model]\nfn ok(s: Seq<u8>) -> Nat { let _ = s.len() as core::primitive::u64; 0 }",
+                cast(2, "u64"),
+            ),
+            (
+                "#[model]\nfn ok(s: Seq<u8>) -> Nat { let _ = s.len() as libc::size_t; 0 }",
+                cast(2, "size_t"),
+            ),
+            (
+                "#[model]\nfn ok(s: Seq<u8>) -> Nat { let _ = u64::try_from(s.len()); 0 }",
+                cast(2, "u64"),
+            ),
+            (
+                "#[model]\nfn ok(s: Seq<u8>) -> Nat { let _ = core::num::NonZeroUsize::new(s.len()); 0 }",
+                cast(2, "NonZeroUsize"),
+            ),
+        ] {
+            assert_eq!(found("src/model_ext.rs", text), expected, "{text:?}");
         }
     }
 
@@ -12943,6 +13914,105 @@ fn one() -> Result<u32, E> { Ok(1) }
         ("rust", "Err(Wrap(E::A) | _) => true", "err_arm_true"),
         ("lean", "| .err (.a | _) => True", "err_arm_true"),
         ("lean", "| .err (.wrap (.a | _)) => True", ""),
+        // Struct patterns after `|` must not wipe an earlier wildcard or
+        // `matches!` arm state.
+        (
+            "rust",
+            "matches!(out, Err(_) | Ok(Foo { x: 1 }))",
+            "matches_any_err",
+        ),
+        (
+            "rust",
+            "matches!(out, Err(_) | Foo { x: 1 })",
+            "matches_any_err",
+        ),
+        ("rust", "Err(_) | Ok(Foo { x: 1 }) => true", "err_arm_true"),
+        ("rust", "Err(_) | Foo { x: 1 } => true", "err_arm_true"),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, _ | Foo { x: 1 } => true }",
+            "catch_all_arm_true",
+        ),
+        // Catch-all binders behind `&`, `&mut`, `(...)`, `@`, and Lean type
+        // ascriptions, without false-positiving on constructor-wrapped or-patterns.
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { &Ok(v) => v == 1, &e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &mut e => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, &&_ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, (_) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, ((e)) => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ _ => true }",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "| .ok v => v = 1 | (_ : Except String Nat) => True",
+            "catch_all_arm_true",
+        ),
+        (
+            "lean",
+            "(match r with | .ok v => v = 1 | (e : Except String (List Nat)) => True)",
+            "catch_all_arm_true",
+        ),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, Some(0 | _) => true }",
+            "",
+        ),
+        ("rust", "match out { Ok(v) => v == 1, &E::A => true }", ""),
+        (
+            "rust",
+            "match out { Ok(v) => v == 1, e @ E::A => true }",
+            "",
+        ),
+        // Parenthesized conjunctions and right-hand disjunctions in arm bodies,
+        // respecting `&&` > `||` and `∨` > `→` precedence.
+        ("rust", "Err(_) => (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => (True ∧ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true", "err_arm_true"),
+        ("rust", "Err(_) => (x == 1 || true)", "err_arm_true"),
+        (
+            "rust",
+            "Err(_) => { return x == 1 || true; }",
+            "err_arm_true",
+        ),
+        ("rust", "Err(_) => x == 1 || (true && true)", "err_arm_true"),
+        ("lean", "| .err _ => x = 1 ∨ True", "err_arm_true"),
+        ("lean", "| .err _ => (x = 1 ∨ True)", "err_arm_true"),
+        ("rust", "Err(_) => x == 1 || true && y == 2", ""),
+        ("rust", "Err(_) => (x == 1 || true) && y == 2", ""),
+        ("lean", "| .err _ => x = 1 ∨ True → False", ""),
+        ("lean", "| .err _ => True ∨ x = 1 → False", ""),
+        ("rust", "Err(_) => { check() } _ if a || true => false", ""),
+        // Unicode Lean lambda `λ` behaves like `fun`.
+        ("lean", "| .ok v => λ _ => True", ""),
+        ("lean", "| .ok v => f (λ e => True) | .err e => e = .a", ""),
     ];
 
     /// The same table is asserted by `scan_error_branch_wildcard` in
@@ -12970,12 +14040,18 @@ fn one() -> Result<u32, E> { Ok(1) }
         let closes = " }".repeat(depth);
         // Beyond the tracked capacity a catch-all is reported (fail closed).
         let deep = format!("{opens}match x {{ 0 => false, _ => true }}{closes}");
-        assert_eq!(wildcard_findings("spec.txt", &deep), vec![(1, CatchAllArmTrue)]);
+        assert_eq!(
+            wildcard_findings("spec.txt", &deep),
+            vec![(1, CatchAllArmTrue)]
+        );
         // The stack unwinds: after the nest, scopes are tracked exactly again.
         let after = format!("{opens}{closes} match y {{ 0 => false, _ => true }}");
         assert_eq!(wildcard_findings("spec.txt", &after), vec![]);
         let after_ok = format!("{opens}{closes} match out {{ Ok(v) => *v == 1, _ => true }}");
-        assert_eq!(wildcard_findings("spec.txt", &after_ok), vec![(1, CatchAllArmTrue)]);
+        assert_eq!(
+            wildcard_findings("spec.txt", &after_ok),
+            vec![(1, CatchAllArmTrue)]
+        );
         // Sequential Lean matches never accumulate scopes.
         let mut many = String::new();
         for _ in 0..(4 * MAX_OK_SCOPE_DEPTH) {
@@ -12984,10 +14060,16 @@ fn one() -> Result<u32, E> { Ok(1) }
         let clean = format!("{many}(match r with | .ok v => v = 1 | .err e => e = 2)");
         assert_eq!(wildcard_findings("Specs/A.lean", &clean), vec![]);
         let dirty = format!("{many}(match r with | .ok v => v = 1 | _ => True)");
-        assert_eq!(wildcard_findings("Specs/A.lean", &dirty), vec![(1, CatchAllArmTrue)]);
+        assert_eq!(
+            wildcard_findings("Specs/A.lean", &dirty),
+            vec![(1, CatchAllArmTrue)]
+        );
         // Closers of brackets opened before the snippet are tolerated.
         assert_eq!(
-            wildcard_findings("spec.txt", "} ) ] } match out { Ok(v) => *v == 1, _ => true }"),
+            wildcard_findings(
+                "spec.txt",
+                "} ) ] } match out { Ok(v) => *v == 1, _ => true }"
+            ),
             vec![(1, CatchAllArmTrue)]
         );
         assert_eq!(
@@ -13463,10 +14545,7 @@ fn one() -> Result<u32, E> { Ok(1) }
                 1,
             ),
             // A value or a `pre` that this module does not define.
-            (
-                "instance : ItemSpec \"demo::main\" := importedSpec\n",
-                1,
-            ),
+            ("instance : ItemSpec \"demo::main\" := importedSpec\n", 1),
             (
                 "instance : ItemSpec \"demo::main\" := { importedSpec with post := fun _ _ => True }\n",
                 1,
@@ -13488,8 +14567,44 @@ fn one() -> Result<u32, E> { Ok(1) }
                 "instance : ItemSpec \"demo::main\" := { pre args := args.length = 1, post _ _ := True }\n",
                 1,
             ),
+            // Typed binders, field type annotations, equation-compiler `where`
+            // fields, and un-audited structure field puns.
+            (
+                "instance : ItemSpec \"demo::main\" where\n  pre (args : List Value) := args.length = 1\n  post _ _ := True\n",
+                2,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" where\n  pre : List Value → Prop := fun args => args.length = 1\n  post _ _ := True\n",
+                2,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" := { Obligations.Demo.main.defaultSpec with\n  pre (args : List Value) := args.length = 1\n}\n",
+                2,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" where\n  pre\n    | [Value.scalar ⟨1, 1⟩] => True\n    | _ => False\n  post _ _ := True\n",
+                2,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" := { pre, post := fun _ _ => True }\n",
+                1,
+            ),
+            (
+                "instance : ItemSpec \"demo::main\" := { Obligations.Demo.main.defaultSpec with pre }\n",
+                1,
+            ),
         ] {
             assert_eq!(audit(flagged), vec![(line, AuthoredLeanPre)], "{flagged:?}");
+        }
+        // Trivial `pre` with Unicode `λ`, typed binders, equation-compiler
+        // `where` field, or followed by a typed `post` field must stay clean.
+        for clean in [
+            "instance : ItemSpec \"demo::main\" where\n  pre := λ _ => True\n  post (args : List Value) (ret : Value) := ret = Value.unit\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre (args : List Value) := True\n  post (args : List Value) (ret : Value) := ret = Value.unit\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre : List Value → Prop := λ args => Obligations.Demo.main.defaultPre args\n  post (args : List Value) (ret : Value) := True\n",
+            "instance : ItemSpec \"demo::main\" where\n  pre\n    | _ => True\n  post (args : List Value) (ret : Value) := ret = Value.unit\n",
+        ] {
+            assert_eq!(audit(clean), vec![], "{clean:?}");
         }
     }
 
