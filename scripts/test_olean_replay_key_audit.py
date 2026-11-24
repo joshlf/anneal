@@ -380,6 +380,35 @@ class TestFailClosedFilesystemStat(unittest.TestCase):
                 )
             self.assertEqual(ctx.exception.category, "duplicateModuleName")
 
+    def test_path_escape_and_slash_module_names_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td)
+            base = p / "base"
+            outside = p / "outside"
+            base.mkdir()
+            outside.mkdir()
+            ext_file = outside / "Out.olean"
+            ext_file.write_bytes(b"placeholder")
+            sym_outside = p / "sym_outside"
+            os.symlink(outside, sym_outside)
+            # `_check_intermediate_dirs_fail_closed` MUST raise AuditOperationalError on base_dir escape
+            # (never silently return True on ValueError and follow an out-of-tree symlink!).
+            with self.assertRaises(audit.AuditOperationalError):
+                audit.stat_regular_fail_closed(sym_outside / "Out.olean", base_dir=base)
+            # Slash / backslash / whitespace / NUL in module names MUST fail before touching disk!
+            _, sysroot = audit.resolve_lean_toolchain()
+            for bad_mod in (
+                str(sym_outside / "Out"),
+                "Proof/SlashSpoof",
+                "Proof\\Backslash",
+                "Proof Bad",
+                "Proof\x00Null",
+            ):
+                with self.assertRaises(audit.AuditPolicyError, msg=bad_mod) as ctx:
+                    audit.precheck_olean_dirs_and_locate_modules([bad_mod], [base], sysroot, None)
+                self.assertEqual(ctx.exception.category, "anonymousConstantName")
+                self.assertIsNone(audit.classify_module_role_py(bad_mod))
+
 
 class TestSourceScannerDefenseInDepth(unittest.TestCase):
     """Tests Episode 1-equivalent lexer desync, token glue, and header/option rules."""
@@ -399,6 +428,9 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             "def decideTerm : Bool := decide ('.' ∉ ['a'])\n",
             "def trace : Array Nat := #[0]\ndef traceIdx : Nat := trace[0]!\n",
             'def f (trace : List (String -> Nat)) (h : 0 < trace.length) : Nat := trace[0] "{"\n',
+            'def g : String := trace[a b] "{"\n',
+            'def numsInHole : String := s!"{1.5} {1e-2} {1e+2} {0x1f} {p.1}"\n',
+            'def decOkHole : String := s!"{by decide +kernel}"\n',
             "def «decide» : Int := 5\ndef kernel : Int := 3\ndef ok : Int := «decide» -kernel\n",
             'def strWithDecide : String := "decide -kernel"\n',
             "import Topic.all\nset_option maxHeartbeats 400000 in\n"
@@ -458,6 +490,16 @@ class TestSourceScannerDefenseInDepth(unittest.TestCase):
             ('def s := s!"{0x1builtin_elab}"', "forbiddenSourceOption"),
             ("theorem p : 1 + 1 = 2 := by decide («kernel» := false)", "forbiddenSourceOption"),
             ("set_option «debug».«skipKernelTC» true in def x := 0", "forbiddenSourceOption"),
+            ('def s := Macro.trace[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := Macro.trace[foo /- c -/] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := trace_goal[foo ] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := «trace»[foo] "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := throwErrorAt stx "{(by set_option debug.skipKernelTC true in exact 0)}"', "forbiddenSourceOption"),
+            ('def s := s!"{by iterate 0b1decide -kernel}"', "forbiddenSourceOption"),
+            ('def s := s!"{by iterate 0o1decide -kernel}"', "forbiddenSourceOption"),
+            ('def s := s!"{by 1.5decide -kernel}"', "forbiddenSourceOption"),
+            ('def s := s!"{by 1e5decide -kernel}"', "forbiddenSourceOption"),
+            ('def s := s!"{by 1e+5decide -kernel}"', "forbiddenSourceOption"),
         ]
         for sample, expected_cat in bad_samples:
             with self.assertRaises(audit.AuditPolicyError, msg=sample) as ctx:
@@ -607,6 +649,8 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Proof/A2ValidMutual", "namespace Proof.A2ValidMutual\nmutual\n  def isEven : Nat -> Bool\n    | 0 => true\n    | n + 1 => isOdd n\n  def isOdd : Nat -> Bool\n    | 0 => false\n    | n + 1 => isEven n\nend\ntheorem even4 : isEven 4 = true := rfl\nend Proof.A2ValidMutual\n"),
                 ("Topic/A2GoodCoeFun/Defs", "namespace Topic.A2GoodCoeFun.Defs\nstructure MyPred where\n  run : Nat -> Bool\ninstance : CoeFun MyPred (fun _ => Nat -> Bool) where\n  coe p := p.run\ninstance : Inhabited (Nat -> MyPred) := ⟨fun _ => ⟨fun _ => true⟩⟩\nend Topic.A2GoodCoeFun.Defs\n"),
                 ("Topic/A2NoindexHijack/Defs", "namespace Topic.A2NoindexHijack.Defs\ninductive LocalAnchor | mk\ninstance evilWildcard : Inhabited (no_index LocalAnchor) := ⟨.mk⟩\nend Topic.A2NoindexHijack.Defs\n"),
+                ("Topic/B3GoodAlias/Defs", "namespace Topic.B3GoodAlias.Defs\ninductive LocalAnchor | mk\ndef LocalAlias := LocalAnchor\ninductive ParamInd (α : Type u) : Nat -> Type u | nil : ParamInd α 0\ninstance instAlias : Inhabited LocalAlias := ⟨LocalAnchor.mk⟩\ninstance instArrow : Inhabited (Nat -> LocalAnchor) := ⟨fun _ => .mk⟩\ninstance instProd : Inhabited (Prod Nat LocalAnchor) := ⟨(0, .mk)⟩\ninstance instMyHAdd : HAdd LocalAnchor Nat LocalAnchor := ⟨fun a _ => a⟩\n@[coe] def toNat (_ : LocalAnchor) : Nat := 0\nend Topic.B3GoodAlias.Defs\n"),
+                ("Proof/B3HoleBinDecide", 'namespace Proof.B3HoleBinDecide\ndef sneak : String := s!"{(by iterate 0b1decide -kernel : 1 + 1 = 2) |> fun _ => (0 : Nat)}"\nend Proof.B3HoleBinDecide\n'),
                 ("Topic/BadSkipSrc", "namespace Topic.BadSkipSrc\nset_option debug.skipKernelTC true in\ndef v : Nat := 1\nend Topic.BadSkipSrc\n"),
             ):
                 s = b1_dir / f"{rel}.lean"
@@ -653,6 +697,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
                 ("Verify/ItemProv", 'import Trusted.VerificationResult\nimport Proof.ProvHelper\nnamespace Verify.ItemProv\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "ip", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "ip", mirDialect := "V1", items := [{ identity := id1, certificate := 1 + 1 = 2 }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 Proof.ProvHelper.provEq\nend Verify.ItemProv\n'),
                 ("Verify/ProofLeak", 'import Trusted.VerificationResult\nimport Topic.Proofs\nnamespace Verify.ProofLeak\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "pl", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "pl", mirDialect := "V1", items := [{ identity := id1, certificate := Topic.Proofs.quoteCh = \'"\' }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 rfl\nend Verify.ProofLeak\n'),
                 ("CrateVerify_demo/Rollup", 'import Trusted.VerificationResult\nnamespace CrateVerify_demo.Rollup\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "cv", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "cv", mirDialect := "V1", items := [{ identity := id1, certificate := True }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 True.intro\nend CrateVerify_demo.Rollup\n'),
+                ("Verify/B3PrivMod", 'import Trusted.VerificationResult\nnamespace Verify.B3PrivMod\ndef id1 : Trusted.VerificationResult.ArtifactIdentity :=\n  { defPath := "pm", mirDialect := "V1", mirModuleSha256 := "00" }\ntheorem verified :\n    Trusted.VerificationResult.CrateVerificationResult\n      { crateName := "pm", mirDialect := "V1", items := [{ identity := id1, certificate := True }] } :=\n  Trusted.VerificationResult.mkPolyVerificationResult id1 True.intro\nend Verify.B3PrivMod\n'),
             ):
                 s = pkg_v / f"{rel}.lean"
                 s.parent.mkdir(parents=True, exist_ok=True)
@@ -676,6 +721,7 @@ class TestPassB1AdversarialRegressions(unittest.TestCase):
             a1_forge_lean.write_text(
                 r"""import Lean
 import Lean.Meta.Instances
+import Lean.Meta.CoeAttr
 open Lean
 def writeO (dir : System.FilePath) (m : Name) (d : ModuleData) : IO Unit := do
   let p := dir / (System.mkFilePath (m.components.map Name.toString) |>.addExtension "olean")
@@ -683,7 +729,7 @@ def writeO (dir : System.FilePath) (m : Name) (d : ModuleData) : IO Unit := do
   saveModuleData p m d
 
 def main (args : List String) : IO UInt32 := do
-  let [outStr] := args | return 2
+  let [outStr, _] := args | return 2
   let out := System.FilePath.mk outStr
   let okThm : ConstantInfo := .thmInfo {
     name := `Proof.A1ExtraSpoof.ok, levelParams := [],
@@ -822,7 +868,7 @@ def main (args : List String) : IO UInt32 := do
     (OLeanLevel.private.adjustFileName irOlean, cleanIr)
   ]
   let badIrSig : ModuleData := {
-    isModule := true, imports := #[{ module := `Init }],
+    isModule := false, imports := #[],
     constNames := #[], constants := #[], extraConstNames := #[],
     entries := #[(`Lean.aliasExtension, #[unsafe unsafeCast ()])]
   }
@@ -984,16 +1030,260 @@ def main (args : List String) : IO UInt32 := do
     constants := #[.thmInfo { name := `Proof.TopDup.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.TopDup.ok] }],
     extraConstNames := #[], entries := #[]
   }
+  -- Pass B3 forged regressions:
+  -- B3-1: Forged `_sizeOf_inst` trailing-key wildcard (`#[.const SizeOf 1, .star, .const Anchor 0]`)
+  let b3SizeOfName := `Proof.B3SizeOfOv.Anchor._sizeOf_inst
+  let b3Anc := `Proof.B3SizeOfOv.Anchor
+  let b3AncMk := `Proof.B3SizeOfOv.Anchor.mk
+  let b3AncInd : ConstantInfo := .inductInfo {
+    name := b3Anc, levelParams := [], type := mkSort Level.one,
+    numParams := 0, numIndices := 0, all := [b3Anc], ctors := [b3AncMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let b3AncCtor : ConstantInfo := .ctorInfo {
+    name := b3AncMk, levelParams := [], type := mkConst b3Anc,
+    induct := b3Anc, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let b3AncRec : ConstantInfo := .recInfo {
+    name := `Proof.B3SizeOfOv.Anchor.rec, levelParams := [`u],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst b3Anc) (mkSort (.param `u)))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst b3AncMk))
+        (mkForall `t .default (mkConst b3Anc) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [b3Anc], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := b3AncMk, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst b3Anc) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst b3AncMk)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let b3SizeOfDef : ConstantInfo := .defnInfo {
+    name := b3SizeOfName, levelParams := [],
+    type := mkApp (mkConst ``SizeOf [Level.one]) (mkConst b3Anc),
+    value := mkApp2 (mkConst ``SizeOf.mk [Level.one]) (mkConst b3Anc) (mkLambda `_ .default (mkConst b3Anc) (mkNatLit 0)),
+    hints := .abbrev, safety := .safe, all := [b3SizeOfName]
+  }
+  let b3SizeOfEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``SizeOf 1, Meta.DiscrTree.Key.star, Meta.DiscrTree.Key.const b3Anc 0],
+    val := mkConst b3SizeOfName, priority := 1000, globalName? := some b3SizeOfName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "b3_sizeof_ov") `Proof.B3SizeOfOv {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[b3Anc, b3AncMk, `Proof.B3SizeOfOv.Anchor.rec, b3SizeOfName],
+    constants := #[b3AncInd, b3AncCtor, b3AncRec, b3SizeOfDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast b3SizeOfEnt])]
+  }
+  -- B3-2: Forged arrow domain `.star` (`Inhabited (Nat -> Anchor)` with `#[.const Inhabited 1, .arrow, .star]`)
+  --       + forged `Prod` trailing key + forged `HAdd` outParam swap + forged scoped instance overflow + forged scoped `coeExt`!
+  let arrTy := mkForall `_ .default (mkConst ``Nat) (mkConst a2AnchorName)
+  let arrInstName := `Topic.B3ArrowDom.Defs.instArr
+  let arrInst : ConstantInfo := .defnInfo {
+    name := arrInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) arrTy,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) arrTy (mkLambda `_ .default (mkConst ``Nat) (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [arrInstName]
+  }
+  let arrDomStarEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.arrow, Meta.DiscrTree.Key.star],
+    val := mkConst arrInstName, priority := 1000, globalName? := some arrInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "b3_arrow_dom_star") `Topic.B3ArrowDom.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, arrInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, arrInst],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast arrDomStarEnt])]
+  }
+  let prodTy := mkApp2 (mkConst ``Prod [Level.zero, Level.zero]) (mkConst ``Nat) (mkConst a2AnchorName)
+  let prodInstName := `Topic.B3ProdOv.Defs.instProd
+  let prodInst : ConstantInfo := .defnInfo {
+    name := prodInstName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) prodTy,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) prodTy
+      (mkApp4 (mkConst ``Prod.mk [Level.zero, Level.zero]) (mkConst ``Nat) (mkConst a2AnchorName) (mkNatLit 0) (mkConst a2AnchorMk)),
+    hints := .abbrev, safety := .safe, all := [prodInstName]
+  }
+  let prodOvEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.const ``Nat 0, Meta.DiscrTree.Key.const a2AnchorName 0],
+    val := mkConst prodInstName, priority := 1000, globalName? := some prodInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "b3_prod_ov") `Topic.B3ProdOv.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, prodInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, prodInst],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast prodOvEnt])]
+  }
+  let haddInstName := `Topic.B3HAddSwap.Defs.instHAdd
+  let haddInst : ConstantInfo := .defnInfo {
+    name := haddInstName, levelParams := [],
+    type := mkApp3 (mkConst ``HAdd [Level.zero, Level.zero, Level.zero]) (mkConst a2AnchorName) (mkConst ``Nat) (mkConst a2AnchorName),
+    value := mkApp4 (mkConst ``HAdd.mk [Level.zero, Level.zero, Level.zero]) (mkConst a2AnchorName) (mkConst ``Nat) (mkConst a2AnchorName)
+      (mkLambda `a .default (mkConst a2AnchorName) (mkLambda `_ .default (mkConst ``Nat) (mkBVar 1))),
+    hints := .abbrev, safety := .safe, all := [haddInstName]
+  }
+  let haddSwapEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``HAdd 3, Meta.DiscrTree.Key.star, Meta.DiscrTree.Key.const ``Nat 0, Meta.DiscrTree.Key.const a2AnchorName 0],
+    val := mkConst haddInstName, priority := 1000, globalName? := some haddInstName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeO (out / "b3_hadd_swap") `Topic.B3HAddSwap.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, haddInstName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, haddInst],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast haddSwapEnt])]
+  }
+  let scopedClsName := `Topic.B3ScopedOv.Defs.LocalCls
+  let scopedClsMk := `Topic.B3ScopedOv.Defs.LocalCls.mk
+  let scopedClsInd : ConstantInfo := .inductInfo {
+    name := scopedClsName, levelParams := [], type := mkForall `α .default (mkSort Level.one) (mkSort Level.one),
+    numParams := 1, numIndices := 0, all := [scopedClsName], ctors := [scopedClsMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let scopedClsCtor : ConstantInfo := .ctorInfo {
+    name := scopedClsMk, levelParams := [],
+    type := mkForall `α .implicit (mkSort Level.one) (mkApp (mkConst scopedClsName) (mkBVar 0)),
+    induct := scopedClsName, cidx := 0, numParams := 1, numFields := 0, isUnsafe := false
+  }
+  let scopedClsRec : ConstantInfo := .recInfo {
+    name := `Topic.B3ScopedOv.Defs.LocalCls.rec, levelParams := [`u],
+    type := mkForall `α .implicit (mkSort Level.one)
+      (mkForall `motive .implicit (mkForall `x .default (mkApp (mkConst scopedClsName) (mkBVar 0)) (mkSort (.param `u)))
+        (mkForall `h .default (mkApp (mkBVar 0) (mkApp (mkConst scopedClsMk) (mkBVar 1)))
+          (mkForall `t .default (mkApp (mkConst scopedClsName) (mkBVar 2)) (mkApp (mkBVar 2) (mkBVar 0))))),
+    all := [scopedClsName], numParams := 1, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := scopedClsMk, nfields := 0, rhs := mkLambda `α .implicit (mkSort Level.one) (mkLambda `motive .implicit (mkForall `x .default (mkApp (mkConst scopedClsName) (mkBVar 0)) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkApp (mkConst scopedClsMk) (mkBVar 1))) (mkBVar 0))) }],
+    k := true, isUnsafe := false
+  }
+  let scopedInstName := `Topic.B3ScopedOv.Defs.sInst
+  let scopedInstDef : ConstantInfo := .defnInfo {
+    name := scopedInstName, levelParams := [],
+    type := mkApp (mkConst scopedClsName) (mkConst ``Nat),
+    value := mkApp (mkConst scopedClsMk) (mkConst ``Nat),
+    hints := .abbrev, safety := .safe, all := [scopedInstName]
+  }
+  let scopedOvEnt : ScopedEnvExtension.Entry Meta.InstanceEntry := .scoped `Topic.B3ScopedOv.Defs {
+    keys := #[Meta.DiscrTree.Key.const scopedClsName 1, Meta.DiscrTree.Key.star, Meta.DiscrTree.Key.const ``Nat 0],
+    val := mkConst scopedInstName, priority := 1000, globalName? := some scopedInstName,
+    synthOrder := #[], attrKind := .scoped
+  }
+  writeO (out / "b3_scoped_ov") `Topic.B3ScopedOv.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[scopedClsName, scopedClsMk, `Topic.B3ScopedOv.Defs.LocalCls.rec, scopedInstName],
+    constants := #[scopedClsInd, scopedClsCtor, scopedClsRec, scopedInstDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast scopedOvEnt])]
+  }
+  -- B3-3: Forged `.scoped` `Meta.coeExt` entry
+  let coeFnName := `Topic.B3ScopedCoe.Defs.toNat
+  let coeFnDef : ConstantInfo := .defnInfo {
+    name := coeFnName, levelParams := [],
+    type := mkForall `_ .default (mkConst a2AnchorName) (mkConst ``Nat),
+    value := mkLambda `_ .default (mkConst a2AnchorName) (mkNatLit 0),
+    hints := .regular 1, safety := .safe, all := [coeFnName]
+  }
+  let scopedCoeEnt : ScopedEnvExtension.Entry (Name × Meta.CoeFnInfo) :=
+    .scoped `Nat (coeFnName, { numArgs := 1, coercee := 0, type := .coe })
+  writeO (out / "b3_scoped_coe") `Topic.B3ScopedCoe.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[a2AnchorName, a2AnchorMk, `Topic.A2SpoofInst.Defs.Anchor.rec, coeFnName],
+    constants := #[a2AnchorInd, a2AnchorCtor, a2AnchorRec, coeFnDef],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.coeExt, #[unsafe unsafeCast scopedCoeEnt])]
+  }
+  -- B3-4: Forged non-mutual `_unsafe_rec` cycle across unrelated safe functions
+  let urSafeA : ConstantInfo := .defnInfo {
+    name := `Proof.B3BadURAll.safeA, levelParams := [], type := mkConst ``Nat,
+    value := mkNatLit 0, hints := .opaque, safety := .safe, all := [`Proof.B3BadURAll.safeA]
+  }
+  let urSafeB : ConstantInfo := .defnInfo {
+    name := `Proof.B3BadURAll.safeB, levelParams := [], type := mkConst ``Nat,
+    value := mkNatLit 1, hints := .opaque, safety := .safe, all := [`Proof.B3BadURAll.safeB]
+  }
+  let urBadA : ConstantInfo := .defnInfo {
+    name := `Proof.B3BadURAll.safeA._unsafe_rec, levelParams := [], type := mkConst ``Nat,
+    value := mkConst `Proof.B3BadURAll.safeB._unsafe_rec, hints := .opaque, safety := .partial,
+    all := [`Proof.B3BadURAll.safeA._unsafe_rec, `Proof.B3BadURAll.safeB._unsafe_rec]
+  }
+  let urBadB : ConstantInfo := .defnInfo {
+    name := `Proof.B3BadURAll.safeB._unsafe_rec, levelParams := [], type := mkConst ``Nat,
+    value := mkConst `Proof.B3BadURAll.safeA._unsafe_rec, hints := .opaque, safety := .partial,
+    all := [`Proof.B3BadURAll.safeA._unsafe_rec, `Proof.B3BadURAll.safeB._unsafe_rec]
+  }
+  writeO (out / "b3_bad_ur_all") `Proof.B3BadURAll {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B3BadURAll.safeA, `Proof.B3BadURAll.safeB, `Proof.B3BadURAll.safeA._unsafe_rec, `Proof.B3BadURAll.safeB._unsafe_rec],
+    constants := #[urSafeA, urSafeB, urBadA, urBadB], extraConstNames := #[], entries := #[]
+  }
+  -- B3-5: Forged public `.olean` exposing `_private.*` constant name
+  let privLeakName := Name.str (Name.num (`_private ++ `Proof.B3PubPriv) 0) "secret"
+  let privLeakThm : ConstantInfo := .thmInfo {
+    name := privLeakName, levelParams := [], type := mkConst ``True,
+    value := mkConst ``True.intro, all := [privLeakName]
+  }
+  let ppDir := out / "b3_pub_priv" / "Proof"
+  IO.FS.createDirAll ppDir
+  let ppBase := ppDir / "B3PubPriv.olean"
+  let ppMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[privLeakName], constants := #[privLeakThm],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B3PubPriv #[
+    (ppBase, ppMd),
+    (OLeanLevel.server.adjustFileName ppBase, ppMd),
+    (OLeanLevel.private.adjustFileName ppBase, ppMd)
+  ]
+  -- B3-6: Forged module-mode `Verify.B3PrivMod` whose public `.olean` hides `verified`
+  let pvDir := out / "b3_priv_verify" / "Verify"
+  IO.FS.createDirAll pvDir
+  let pvBase := pvDir / "B3PrivMod.olean"
+  let pvSrcPath := System.FilePath.mk args[1]!
+  let (pvOrig, _) ← readModuleData pvSrcPath
+  let pvPub : ModuleData := { pvOrig with isModule := true, constNames := #[], constants := #[] }
+  let pvPriv : ModuleData := { pvOrig with isModule := true }
+  saveModuleDataParts `Verify.B3PrivMod #[
+    (pvBase, pvPub),
+    (OLeanLevel.server.adjustFileName pvBase, pvPub),
+    (OLeanLevel.private.adjustFileName pvBase, pvPriv)
+  ]
+  -- B3-7: Forged `.ir` (with clean empty `.ir.sig`) smuggling `imports := #[{ module := `Lean }]`
+  let irImpDir := out / "b3_ir_imp" / "Proof"
+  IO.FS.createDirAll irImpDir
+  let irImpBase := irImpDir / "B3IrImp.olean"
+  let irImpMd : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[`Proof.B3IrImp.ok],
+    constants := #[.thmInfo { name := `Proof.B3IrImp.ok, levelParams := [], type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.B3IrImp.ok] }],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B3IrImp #[
+    (irImpBase, irImpMd),
+    (OLeanLevel.server.adjustFileName irImpBase, irImpMd),
+    (OLeanLevel.private.adjustFileName irImpBase, irImpMd)
+  ]
+  let cleanIrSig : ModuleData := {
+    isModule := false, imports := #[], constNames := #[], constants := #[], extraConstNames := #[], entries := #[]
+  }
+  let evilIrBody : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }, { module := `Lean }],
+    constNames := #[], constants := #[], extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.B3IrImp #[
+    (irImpBase.withExtension "ir.sig", cleanIrSig),
+    (irImpBase.withExtension "ir", evilIrBody)
+  ]
   return 0
 """,
                 encoding="utf-8",
             )
             forge_r = audit.run_governed_cmd(
-                [str(lean_bin), "--run", str(a1_forge_lean), str(a1_forged)],
+                [str(lean_bin), "--run", str(a1_forge_lean), str(a1_forged), str(pkg_v / "Verify" / "B3PrivMod.olean")],
                 cwd=tmp,
                 mode="file",
             )
-            self.assertEqual(forge_r.returncode, 0, forge_r.stderr)
+            self.assertEqual(forge_r.returncode, 0, forge_r.stdout + "\n" + forge_r.stderr)
 
             spoof_mod_hdr_src = tmp / "SpoofModHdr.lean"
             spoof_mod_hdr_src.write_text(
@@ -1080,6 +1370,18 @@ def main (args : List String) : IO UInt32 := do
                 ("a2_forged_instance_entry_spoof_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.A2SpoofInst.Defs"], "olean_dirs": [a1_forged / "a2_spoof_inst"], "strict_proofs": True}),
                 ("a2_duplicate_ext_keys_in_entries_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A2DupExt"], "olean_dirs": [a1_forged / "a2_dup_ext"], "strict_proofs": True}),
                 ("a2_nonmodule_with_stray_ir_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.A2NmIr"], "olean_dirs": [a1_forged / "a2_nm_ir"], "strict_proofs": True}),
+                ("b3_good_semireducible_alias_and_param_sizeof_passes", True, None, {"target_modules": ["Topic.B3GoodAlias.Defs"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b3_hole_bin_decide_e2e", False, "forbiddenSourceOption", {"target_modules": ["Proof.B3HoleBinDecide"], "olean_dirs": [b1_dir], "source_map_dir": b1_dir, "require_sources": True, "strict_proofs": True}),
+                ("b3_sizeof_trailing_key_overflow_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Proof.B3SizeOfOv"], "olean_dirs": [a1_forged / "b3_sizeof_ov"], "strict_proofs": True}),
+                ("b3_arrow_domain_star_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B3ArrowDom.Defs"], "olean_dirs": [a1_forged / "b3_arrow_dom_star"], "strict_proofs": True}),
+                ("b3_prod_trailing_key_overflow_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B3ProdOv.Defs"], "olean_dirs": [a1_forged / "b3_prod_ov"], "strict_proofs": True}),
+                ("b3_hadd_outparam_swap_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B3HAddSwap.Defs"], "olean_dirs": [a1_forged / "b3_hadd_swap"], "strict_proofs": True}),
+                ("b3_scoped_instance_overflow_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B3ScopedOv.Defs"], "olean_dirs": [a1_forged / "b3_scoped_ov"], "strict_proofs": True}),
+                ("b3_forged_scoped_coe_rejected", False, "forbiddenInstanceOrCoe", {"target_modules": ["Topic.B3ScopedCoe.Defs"], "olean_dirs": [a1_forged / "b3_scoped_coe"], "strict_proofs": True}),
+                ("b3_forged_nonmutual_unsafe_rec_cycle_rejected", False, "unsafeOrPartialDecl", {"target_modules": ["Proof.B3BadURAll"], "olean_dirs": [a1_forged / "b3_bad_ur_all"], "strict_proofs": True}),
+                ("b3_public_olean_private_name_rejected", False, "keyNameMismatch", {"target_modules": ["Proof.B3PubPriv"], "olean_dirs": [a1_forged / "b3_pub_priv"], "module_mode": True, "strict_proofs": True}),
+                ("b3_module_verify_private_verified_rejected", False, "invalidVerifyRoot", {"target_modules": ["Verify.B3PrivMod"], "olean_dirs": [a1_forged / "b3_priv_verify", pkg_v], "module_mode": True, "strict_proofs": True}),
+                ("b3_forged_ir_body_imports_lean_rejected", False, "foreignImport", {"target_modules": ["Proof.B3IrImp"], "olean_dirs": [a1_forged / "b3_ir_imp"], "module_mode": True, "strict_proofs": True}),
                 ("public_inst_import_all", False, "forbiddenImportAll", {"target_modules": ["Proof.ImpAllPub"], "olean_dirs": [pkg_pub15], "module_mode": True, "strict_proofs": True}),
                 ("trusted_shadow", False, "forbiddenShadowingOrExport", {"target_modules": ["Proof.B1ShadowTrusted"], "olean_dirs": [pkg_v], "strict_proofs": True}),
                 ("verify_forall_false", False, "invalidVerifyRoot", {"target_modules": ["Verify.EvilForall"], "olean_dirs": [pkg_v], "strict_proofs": True}),

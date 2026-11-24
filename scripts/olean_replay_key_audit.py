@@ -93,19 +93,32 @@ class AuditPolicyError(Exception):
 # ---------------------------------------------------------------------------
 
 
+def _is_valid_module_name(mod: str) -> bool:
+    """Validates a dotted Lean module name strictly before any filesystem path join."""
+    if not mod:
+        return False
+    for ch in mod:
+        if ch in ("/", "\\", "\x00") or ch.isspace() or ord(ch) < 0x20:
+            return False
+    segs = mod.split(".")
+    return all(bool(seg) and seg not in (".", "..") for seg in segs)
+
+
 def _check_intermediate_dirs_fail_closed(
     path: Path, base_dir: Path, *, allow_symlink: bool = False
 ) -> bool:
     """Walks components from `base_dir` to `path.parent` via `os.lstat`.
 
     Returns False if an intermediate component is genuinely missing (`ENOENT`),
-    and raises `AuditOperationalError` on any non-`ENOENT` `OSError`, disallowed
-    symlink, or non-directory component.
+    and raises `AuditOperationalError` on any path escape outside `base_dir`,
+    non-`ENOENT` `OSError`, disallowed symlink, or non-directory component.
     """
     try:
         rel_parts = path.parent.relative_to(base_dir).parts
-    except ValueError:
-        return True
+    except ValueError as exc:
+        raise AuditOperationalError(
+            f"path {path} escapes base directory {base_dir}"
+        ) from exc
 
     cur = base_dir
     for part in rel_parts:
@@ -543,6 +556,7 @@ EXT_HOOK_TOKENS: tuple[str, ...] = (
     "sym_discharger",
     "run_parser_attribute_hooks",
     "run_builtin_parser_attribute_hooks",
+    "throwErrorAt",
     "throwNamedError",
     "throwNamedErrorAt",
     "logNamedError",
@@ -612,10 +626,13 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
     after_interp_prefix = False
     trace_bracket_depth = 0
     trace_bracket_valid = False
+    trace_bracket_seen_ident = False
+    trace_bracket_closed_ident = False
     guillemet_buf: list[str] = []
 
     def step_code(prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
         nonlocal after_interp_prefix, cur_ident, trace_bracket_depth, trace_bracket_valid
+        nonlocal trace_bracket_seen_ident, trace_bracket_closed_ident
         sep = " " if prev == "escIdent" else ""
         if prev == "ident" and _is_id_rest(c):
             cur_ident += c
@@ -639,6 +656,11 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 if trace_bracket_depth > 0:
                     trace_bracket_valid = False
                 return (("code", "symIdent"), _visible(c), c)
+            if trace_bracket_depth > 0:
+                if trace_bracket_closed_ident:
+                    trace_bracket_valid = False
+                else:
+                    trace_bracket_seen_ident = True
             if c == "r" and prev in ("other", "escIdent", "quoteTok"):
                 cur_ident = "r"
                 return (("rawR",), sep, "")
@@ -653,8 +675,11 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
         cur_ident = ""
         if c == ".":
             after_interp_prefix = False
-            if trace_bracket_depth > 0 and prev not in ("ident", "escIdent"):
-                trace_bracket_valid = False
+            if trace_bracket_depth > 0:
+                if prev in ("ident", "escIdent") and not trace_bracket_closed_ident:
+                    trace_bracket_seen_ident = False
+                else:
+                    trace_bracket_valid = False
             nxt = "identDot" if prev in ("ident", "escIdent") else "dot"
             return (("code", nxt), ".", ".")
         if "0" <= c <= "9":
@@ -690,12 +715,21 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             return (("code", "tick"), " ", "`")
         if c == "«":
             after_interp_prefix = False
+            if trace_bracket_depth > 0:
+                if trace_bracket_closed_ident:
+                    trace_bracket_valid = False
+                else:
+                    trace_bracket_seen_ident = True
             return (("guillemet",), "" if prev in ("identDot", "dot") else " ", "«")
         if c == "»":
             raise ValueError("unmatched identifier escape")
         if c == "-":
+            if trace_bracket_depth > 0 and trace_bracket_seen_ident:
+                trace_bracket_closed_ident = True
             return (("dash",), " ", "")
         if c == "/":
+            if trace_bracket_depth > 0 and trace_bracket_seen_ident:
+                trace_bracket_closed_ident = True
             return (("slash",), " ", "")
         if c == "<":
             after_interp_prefix = False
@@ -717,18 +751,23 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             if trace_bracket_depth > 0:
                 trace_bracket_depth += 1
                 trace_bracket_valid = False
-            elif prev == "ident" and prev_ident in ("trace", "trace_goal"):
+            elif prev in ("ident", "escIdent") and prev_ident in ("trace", "trace_goal"):
                 # Lean's `Macro.trace[id]`, `trace[id]`, and `trace_goal[id]` require `[`
-                # immediately glued to `trace`/`trace_goal` and an identifier `id` inside `[...]`.
+                # immediately glued to `trace`/`trace_goal` and an identifier `id` (with optional
+                # surrounding whitespace/comments) inside `[...]`.
                 trace_bracket_depth = 1
                 trace_bracket_valid = True
+                trace_bracket_seen_ident = False
+                trace_bracket_closed_ident = False
             return (("code", "other"), " [ ", "[")
         if c == "]":
             if trace_bracket_depth > 0:
                 trace_bracket_depth -= 1
                 if trace_bracket_depth == 0:
-                    after_interp_prefix = trace_bracket_valid and prev in ("ident", "escIdent")
+                    after_interp_prefix = trace_bracket_valid and trace_bracket_seen_ident
                     trace_bracket_valid = False
+                    trace_bracket_seen_ident = False
+                    trace_bracket_closed_ident = False
                 else:
                     after_interp_prefix = False
             else:
@@ -749,7 +788,10 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
             if trace_bracket_depth > 0:
                 trace_bracket_valid = False
             return (("code", "sym"), " ", "~")
-        if not c.isspace():
+        if c.isspace():
+            if trace_bracket_depth > 0 and trace_bracket_seen_ident:
+                trace_bracket_closed_ident = True
+        else:
             after_interp_prefix = False
             if trace_bracket_depth > 0:
                 trace_bracket_valid = False
@@ -763,6 +805,74 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
         return ("block", depth)
 
     def step_hole(depth: int, prev: str, c: str) -> tuple[tuple[Any, ...], str, str]:
+        if prev == "numZero":
+            if c in ("b", "B"):
+                return (("hole", depth, "numBin"), c, c)
+            if c in ("o", "O"):
+                return (("hole", depth, "numOct"), c, c)
+            if c in ("x", "X"):
+                return (("hole", depth, "numHex"), c, c)
+            if ("0" <= c <= "9") or c == "_":
+                return (("hole", depth, "numDec"), c, c)
+            if c == ".":
+                return (("hole", depth, "numDot"), ".", ".")
+            if c in ("e", "E"):
+                return (("hole", depth, "numExpStart"), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev in ("numBin", "numOct", "numHex"):
+            rad = {"numBin": "bin", "numOct": "oct", "numHex": "hex"}[prev]
+            if c == "_" or _is_radix_digit(rad, c):
+                return (("hole", depth, prev), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev == "numDec":
+            if ("0" <= c <= "9") or c == "_":
+                return (("hole", depth, "numDec"), c, c)
+            if c == ".":
+                return (("hole", depth, "numDot"), ".", ".")
+            if c in ("e", "E"):
+                return (("hole", depth, "numExpStart"), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev == "numDot":
+            if "0" <= c <= "9":
+                return (("hole", depth, "numFrac"), c, c)
+            if c == ".":
+                return (("hole", depth, "other"), ".", ".")
+            if c in ("e", "E"):
+                return (("hole", depth, "numExpStart"), c, c)
+            if _is_id_first(c) or c == "«":
+                raise ValueError("identifier after a decimal point")
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev == "numFrac":
+            if ("0" <= c <= "9") or c == "_":
+                return (("hole", depth, "numFrac"), c, c)
+            if c in ("e", "E"):
+                return (("hole", depth, "numExpStart"), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev == "numExpStart":
+            if c in ("+", "-"):
+                return (("hole", depth, "numExpSign"), "", c)
+            if "0" <= c <= "9":
+                return (("hole", depth, "numExp"), c, c)
+            raise ValueError("missing exponent digits in a scientific literal")
+        if prev == "numExpSign":
+            if "0" <= c <= "9":
+                return (("hole", depth, "numExp"), c, c)
+            raise ValueError("missing exponent digits in a scientific literal")
+        if prev == "numExp":
+            if ("0" <= c <= "9") or c == "_":
+                return (("hole", depth, "numExp"), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
+        if prev == "fieldIdx":
+            if "0" <= c <= "9":
+                return (("hole", depth, "fieldIdx"), c, c)
+            st2, ch2, r2 = step_hole(depth, "other", c)
+            return (st2, ch2, " " + r2)
         if c == "{":
             return (("hole", depth + 1, "other"), " ", " ")
         if c == "}":
@@ -796,15 +906,20 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
         if "0" <= c <= "9":
             if prev == "symIdent":
                 raise ValueError("literal glued to a symbol keyword")
-            return (("hole", depth, "ident" if prev == "ident" else "num"), c, c)
+            if prev == "ident":
+                return (("hole", depth, "ident"), c, c)
+            if prev in ("identDot", "dot"):
+                return (("hole", depth, "fieldIdx"), c, c)
+            return (("hole", depth, "numZero" if c == "0" else "numDec"), c, c)
         if _is_id_first(c):
             if prev in ("sym", "symIdent"):
                 return (("hole", depth, "symIdent"), _visible(c), c)
-            return (("hole", depth, "num" if prev == "num" else "ident"), _visible(c), c)
+            return (("hole", depth, "ident"), _visible(c), c)
         if _is_id_rest(c):
             return (("hole", depth, "symIdent" if prev == "symIdent" else prev), _visible(c), c)
         if c == ".":
-            return (("hole", depth, "other"), ".", ".")
+            nxt = "identDot" if prev == "ident" else "dot"
+            return (("hole", depth, nxt), ".", ".")
         return (("hole", depth, "other"), " ", c)
 
     non_code_tags = {
@@ -840,6 +955,8 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("lineComment",), "", "  ")
             else:
                 after_interp_prefix = False
+                if trace_bracket_depth > 0:
+                    trace_bracket_valid = False
                 st2, ch2, r2 = step_code("other", ch)
                 state, chunk, raw_chunk = (st2, ch2, "-" + r2)
         elif tag == "slash":
@@ -847,14 +964,20 @@ def _lex_lean_source_both(src: str) -> tuple[str, str]:
                 state, chunk, raw_chunk = (("blockStart", 1), "", "  ")
             elif ch == "/":
                 after_interp_prefix = False
+                if trace_bracket_depth > 0:
+                    trace_bracket_valid = False
                 state, chunk, raw_chunk = (("slashAmb",), "", "//")
             elif ch == "\\":
                 after_interp_prefix = False
+                if trace_bracket_depth > 0:
+                    trace_bracket_valid = False
                 state, chunk, raw_chunk = (("code", "other"), "", "/\\")
             elif ch == ".":
                 raise ValueError("slash glued to a dot")
             else:
                 after_interp_prefix = False
+                if trace_bracket_depth > 0:
+                    trace_bracket_valid = False
                 st2, ch2, r2 = step_code("other", ch)
                 state, chunk, raw_chunk = (st2, ch2, "/" + r2)
         elif tag == "slashAmb":
@@ -1189,9 +1312,9 @@ def _is_allowed_option_name(opt: str) -> bool:
 
 
 def classify_module_role_py(mod_name: str) -> str | None:
-    parts = [p for p in mod_name.split(".")]
-    if not mod_name or any(not p for p in parts):
+    if not _is_valid_module_name(mod_name):
         return None
+    parts = [p for p in mod_name.split(".")]
     root = parts[0]
     if root == "Lean":
         return None
@@ -1629,10 +1752,19 @@ def field [FromJson α] (j : Json) (key : String) : IO α :=
 def isWellFormedName : Name → Bool
   | .anonymous => false
   | .str p s =>
-    !s.isEmpty && !(s.contains '.') &&
+    !s.isEmpty && !(s.any fun c => c == '.' || c == '\x00') &&
       (if p.isAnonymous then true else isWellFormedName p)
   | .num p _ =>
     !p.isAnonymous && isWellFormedName p
+
+def isWellFormedModuleName : Name → Bool
+  | .anonymous => false
+  | .str p s =>
+    !s.isEmpty &&
+      !(s.any fun c => c == '.' || c == '/' || c == '\\' || c == '\x00' || c.isWhitespace) &&
+      (if p.isAnonymous then true else isWellFormedModuleName p)
+  | .num p _ =>
+    !p.isAnonymous && isWellFormedModuleName p
 
 def nameComponents : Name → List String
   | .anonymous => []
@@ -1645,13 +1777,13 @@ def hasRootComp (n : Name) (r : String) : Bool :=
   | [] => false
 
 def isStdlibMod (m : Name) : Bool :=
-  isWellFormedName m && (hasRootComp m "Init" || hasRootComp m "Std")
+  isWellFormedModuleName m && (hasRootComp m "Init" || hasRootComp m "Std")
 
 def isLeanCompilerMod (m : Name) : Bool :=
   hasRootComp m "Lean"
 
 def isTrustedMod (m : Name) : Bool :=
-  isWellFormedName m && hasRootComp m "Trusted"
+  isWellFormedModuleName m && hasRootComp m "Trusted"
 
 def isInternalPart (s : String) : Bool :=
   s.startsWith "_" || (!s.isEmpty && s.all Char.isDigit)
@@ -1666,7 +1798,7 @@ def properSuffixes (n : Name) : List Name :=
   (go (nameComponents n)).map fun ps => ps.foldl Name.str .anonymous
 
 def classifyModuleRole (m : Name) : IO String := do
-  if !isWellFormedName m then
+  if !isWellFormedModuleName m then
     policyFail "moduleRoleMismatch" m #[m] "malformed module name"
   let parts := nameComponents m
   let root := parts.headD ""
@@ -2018,14 +2150,15 @@ def refuteProvisionalNativeWithKernelWhnf (replayedEnv : Environment) (fullEnv :
 
 def isCodegenUnsafeRec (byName : Std.HashMap Name ConstantInfo) (ci : ConstantInfo) : Bool :=
   match ci with
-  | .defnInfo _ =>
+  | .defnInfo dv =>
     if ci.isUnsafe || !ci.isPartial then false
     else if (ci.value? (allowOpaque := true)).isNone then false
     else match ci.name with
       | .str parent "_unsafe_rec" =>
         match byName[parent]? with
         | some (.defnInfo pv) =>
-          pv.safety == .safe && pv.type == ci.type && pv.levelParams == ci.levelParams
+          pv.safety == .safe && pv.type == ci.type && pv.levelParams == ci.levelParams &&
+          dv.all == pv.all.map (·.str "_unsafe_rec")
         | _ => false
       | _ => false
   | _ => false
@@ -2045,24 +2178,63 @@ partial def isOutParamDomain (env : Environment) (fuel : Nat) (d : Expr) : Optio
         let hd := dWhnf.getAppFn.consumeMData
         some (hd.isConstOf ``outParam || hd.isConstOf ``semiOutParam)
 
-def nonOutParamArgs (env : Environment) (cls : Name) (lvls : List Level)
-    (args : Array Expr) : Option (Array Expr) := do
+def nonOutParamIndices (env : Environment) (cls : Name) (lvls : List Level)
+    (args : Array Expr) : Option (Array Nat) := do
   let some ci := env.checked.get.find? cls | none
   if ci.levelParams.length != lvls.length then
     none
   let mut curTy := ci.type.instantiateLevelParams ci.levelParams lvls
-  let mut kept : Array Expr := #[]
+  let mut kept : Array Nat := #[]
   for i in [:args.size] do
     let some tyWhnf := whnfKeepParamWrappers env 512 curTy | none
     match tyWhnf with
     | .forallE _ dom body _ =>
       let some isOut := isOutParamDomain env 64 dom | none
       if !isOut then
-        kept := kept.push args[i]!
+        kept := kept.push i
       curTy := body.instantiate1 args[i]!
     | _ =>
-      kept := kept.push args[i]!
+      kept := kept.push i
   return kept
+
+def discrKeyArity : Meta.DiscrTree.Key → Nat
+  | .const _ a  => a
+  | .fvar _ a   => a
+  | .arrow      => 1
+  | .proj _ _ a => 1 + a
+  | _           => 0
+
+def extractDiscrSubtree (keys : Array Meta.DiscrTree.Key) (start : Nat) :
+    Option (Array Meta.DiscrTree.Key × Nat) := Id.run do
+  let mut i := start
+  let mut need : Nat := 1
+  while need > 0 do
+    if h : i < keys.size then
+      let k := keys[i]
+      if let .fvar _ _ := k then
+        return none
+      need := need - 1 + discrKeyArity k
+      i := i + 1
+    else
+      return none
+  return some (keys.extract start i, i)
+
+def splitDiscrTreeChildren (keys : Array Meta.DiscrTree.Key) (cls : Name) (numArgs : Nat) :
+    Option (Array (Array Meta.DiscrTree.Key)) := Id.run do
+  if keys.isEmpty then return none
+  unless keys[0]! == Meta.DiscrTree.Key.const cls numArgs do
+    return none
+  let mut pos : Nat := 1
+  let mut subs : Array (Array Meta.DiscrTree.Key) := #[]
+  for _ in [:numArgs] do
+    match extractDiscrSubtree keys pos with
+    | some (sub, nextPos) =>
+      subs := subs.push sub
+      pos := nextPos
+    | none => return none
+  if pos != keys.size then
+    return none
+  return some subs
 
 def isBaseInstanceAnchor (localReplayable : NameSet) (localReducibilityOverridden : NameSet)
     (byName : Std.HashMap Name ConstantInfo) (d : Name) : Bool :=
@@ -2074,6 +2246,13 @@ def isBaseInstanceAnchor (localReplayable : NameSet) (localReducibilityOverridde
 def isRigidHeadInEnv (env : Environment) (c : Name) : Bool :=
   match env.checked.get.find? c with
   | some (.inductInfo _) | some (.ctorInfo _) | some (.opaqueInfo _) | some (.axiomInfo _) => true
+  | _ => false
+
+def isLocalNonReducibleDef (localReplayable localRedOver : NameSet)
+    (byName : Std.HashMap Name ConstantInfo) (c : Name) : Bool :=
+  localReplayable.contains c && !localRedOver.contains c &&
+  match byName[c]? with
+  | some (.defnInfo dv) => dv.hints != .abbrev
   | _ => false
 
 partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver : NameSet)
@@ -2099,19 +2278,116 @@ partial def hasRigidBaseAnchor (env : Environment) (localReplayable localRedOver
       | _ => false
     | _ => false
 
-def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo)
-    (ci : ConstantInfo) (prio : Nat) (cls : Name) (args : Array Expr) : Bool :=
-  if cls != ``SizeOf || args.size != 1 || prio != eval_prio default then false
+/-- Verifies the domain key subtree of a `.forallE _ d b _` arrow whose local anchor sits in
+    the codomain `b` (e.g. `Inhabited (Nat → LocalAnchor)`). Rejects forged `.star` wildcards
+    on rigid closed domains like `Nat`, while permitting `.star` on bound variables or `no_index`. -/
+def keySubtreeMatchesArrowDomain (env : Environment) (localReplayable localRedOver : NameSet)
+    (byName : Std.HashMap Name ConstantInfo) (rawD normD : Expr)
+    (domSub : Array Meta.DiscrTree.Key) : Bool :=
+  if domSub.isEmpty then false
+  else if (Lean.annotation? `noindex normD).isSome then
+    domSub == #[Meta.DiscrTree.Key.star]
+  else
+    let rD := rawD.consumeMData
+    let nD := normD.consumeMData
+    let matchesLocalAlias := match rD.getAppFn.consumeMData with
+      | .const rc _ =>
+        isLocalNonReducibleDef localReplayable localRedOver byName rc &&
+        domSub[0]! == Meta.DiscrTree.Key.const rc rD.getAppNumArgs
+      | _ => false
+    if matchesLocalAlias then true
+    else match nD with
+      | .const dc _ =>
+        if isRigidHeadInEnv env dc then domSub == #[Meta.DiscrTree.Key.const dc 0]
+        else true
+      | .app .. =>
+        match nD.getAppFn.consumeMData with
+        | .const dc _ =>
+          if isRigidHeadInEnv env dc then
+            domSub[0]! == Meta.DiscrTree.Key.const dc nD.getAppNumArgs
+          else true
+        | _ => true
+      | .forallE .. => domSub[0]! == Meta.DiscrTree.Key.arrow
+      | .lam .. | .sort .. => domSub[0]! == Meta.DiscrTree.Key.other
+      | _ => true
+
+/-- Structural alignment verifier between a non-outParam argument `(rawArg, normArg)` and its
+    exact arity-balanced `DiscrTree.Key` child subtree `sub`. Closes wildcard/arity-overflow/
+    arrow-skip/outParam-swap key forgeries while preserving valid semireducible local aliases. -/
+partial def keySubtreeAlignedWithAnchor (env : Environment) (localReplayable localRedOver : NameSet)
+    (byName : Std.HashMap Name ConstantInfo) (rawArg normArg : Expr)
+    (sub : Array Meta.DiscrTree.Key) : Bool :=
+  if sub.isEmpty || (Lean.annotation? `noindex normArg).isSome then
+    false
+  else
+    let rA := rawArg.consumeMData
+    let nA := normArg.consumeMData
+    -- Semireducible local type alias (`def LocalAlias := LocalAnchor`) keeps `.const LocalAlias k`
+    -- in `DiscrTree.mkPath` (`TransparencyMode.reducible`) while `normArg` unfolds to `LocalAnchor`.
+    let matchesLocalAlias := match rA.getAppFn.consumeMData with
+      | .const rc _ =>
+        isLocalNonReducibleDef localReplayable localRedOver byName rc &&
+        sub[0]! == Meta.DiscrTree.Key.const rc rA.getAppNumArgs
+      | _ => false
+    if matchesLocalAlias then
+      true
+    else match nA with
+      | .const c _ =>
+        isBaseInstanceAnchor localReplayable localRedOver byName c &&
+        sub == #[Meta.DiscrTree.Key.const c 0]
+      | .app .. =>
+        match nA.getAppFn.consumeMData with
+        | .const c _ =>
+          let args := nA.getAppArgs
+          if sub[0]! != Meta.DiscrTree.Key.const c args.size then
+            false
+          else if isBaseInstanceAnchor localReplayable localRedOver byName c then
+            true
+          else if !isRigidHeadInEnv env c then
+            false
+          else
+            match splitDiscrTreeChildren sub c args.size with
+            | none => false
+            | some childSubs =>
+              let rawSameHead := rA.getAppFn.consumeMData.isConstOf c && rA.getAppNumArgs == args.size
+              let rawSubArgs := if rawSameHead then rA.getAppArgs else args
+              (List.range args.size).any fun j =>
+                hasRigidBaseAnchor env localReplayable localRedOver byName args[j]! &&
+                keySubtreeAlignedWithAnchor env localReplayable localRedOver byName
+                  rawSubArgs[j]! args[j]! childSubs[j]!
+        | _ => false
+      | .forallE _ d b _ =>
+        if sub[0]! != Meta.DiscrTree.Key.arrow || sub.size < 2 then
+          false
+        else
+          let domSub := sub.extract 1 sub.size
+          let (rawD, _) := match rA with
+            | .forallE _ rd rb _ => (rd, rb)
+            | _ => (d, b)
+          if hasRigidBaseAnchor env localReplayable localRedOver byName d then
+            keySubtreeAlignedWithAnchor env localReplayable localRedOver byName rawD d domSub
+          else if hasRigidBaseAnchor env localReplayable localRedOver byName b then
+            keySubtreeMatchesArrowDomain env localReplayable localRedOver byName rawD d domSub
+          else
+            false
+      | .lam _ _ b _ =>
+        sub == #[Meta.DiscrTree.Key.other] &&
+        hasRigidBaseAnchor env localReplayable localRedOver byName b
+      | _ => false
+
+def autoSizeOfTarget? (env : Environment) (byName : Std.HashMap Name ConstantInfo)
+    (ci : ConstantInfo) (prio : Nat) (cls : Name) (args : Array Expr) : Option (Name × Nat) :=
+  if cls != ``SizeOf || args.size != 1 || prio != eval_prio default then none
   else match ci with
     | .defnInfo dv =>
-      if dv.safety != .safe || dv.hints != .abbrev then false
+      if dv.safety != .safe || dv.hints != .abbrev then none
       else match ci.name with
         | .str indName "_sizeOf_inst" =>
           match byName[indName]? with
           | some (.inductInfo iv) =>
-            if dv.levelParams != iv.levelParams then false
+            if dv.levelParams != iv.levelParams then none
             else match normExprInEnv env 256 iv.type with
-              | none => false
+              | none => none
               | some normIvTy =>
                 let isNeverPropInd := match (stripForallAndLam normIvTy).consumeMData with
                   | .sort lvl => lvl.isNeverZero
@@ -2123,13 +2399,17 @@ def isAutoSizeOfInst (env : Environment) (byName : Std.HashMap Name ConstantInfo
                   match x.consumeMData with
                   | .bvar k => if acc.contains k then acc else acc.push k
                   | _ => acc
-                isNeverPropInd && valHead.isConstOf ``SizeOf.mk &&
-                  a0.getAppFn.isConstOf indName &&
-                  aArgs.size == iv.numParams + iv.numIndices &&
-                  distinctBVars.size == aArgs.size
-          | _ => false
-        | _ => false
-    | _ => false
+                let arity := iv.numParams + iv.numIndices
+                if isNeverPropInd && valHead.isConstOf ``SizeOf.mk &&
+                   a0.getAppFn.isConstOf indName &&
+                   aArgs.size == arity &&
+                   distinctBVars.size == aArgs.size then
+                  some (indName, arity)
+                else
+                  none
+          | _ => none
+        | _ => none
+    | _ => none
 
 def verifyCertificateHead (headConst : Expr) : Bool :=
   headConst.isConstOf `Trusted.VerificationResult.VerificationResult ||
@@ -2204,7 +2484,7 @@ def isValidSubPartConstant (ci privCi : ConstantInfo) : Bool :=
   else match ci with
   | .axiomInfo av =>
     !av.isUnsafe && av.name == privCi.name && av.type == privCi.type &&
-    av.levelParams == privCi.levelParams && !privCi.isUnsafe &&
+    av.levelParams == privCi.levelParams && !privCi.isUnsafe && !privCi.isPartial &&
     (match privCi with
      | .thmInfo _ | .defnInfo _ | .opaqueInfo _ | .inductInfo _ | .axiomInfo _ => true
      | _ => false)
@@ -2219,6 +2499,9 @@ def verifySubPartConsistent (modName : Name) (partLabel : String) (part priv : M
     policyFail "foreignImport" modName #[modName]
       s!"split-brain imports mismatch between {partLabel} and .olean.private"
   for ci in part.constants do
+    if partLabel == ".olean" && isPrivateName ci.name then
+      policyFail "keyNameMismatch" modName #[modName, ci.name]
+        s!"split-brain public .olean exposes private declaration {ci.name}"
     let some privCi := privByName[ci.name]?
       | policyFail "keyNameMismatch" modName #[modName, ci.name]
           s!"split-brain {partLabel} contains phantom declaration {ci.name} absent from .olean.private"
@@ -2368,9 +2651,14 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
 
   let coes := Meta.coeExt.ext.getModuleEntries checkEnv idx (level := extLevel)
   for ce in coes do
-    let (decl, coeInfo) := match ce with | .global p => p | .scoped _ p => p
+    let (decl, coeInfo) ← match ce with
+      | .global p => pure p
+      | .scoped _ (d, _) =>
+        policyFail "forbiddenInstanceOrCoe" m #[m, d] "scoped_coe_forbidden"
     unless role == "defsExempt" && localReplayable.contains decl do
       policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
+    unless coeInfo.type == .coe do
+      policyFail "forbiddenInstanceOrCoe" m #[m, decl] "forged_coe_type"
     let some ci := byName[decl]?
       | policyFail "forbiddenInstanceOrCoe" m #[m, decl] "coe"
     let some (srcTy, tgtTy) := extractCoeSrcAndTgtForInfo normEnv ci.type coeInfo.coercee coeInfo.numArgs
@@ -2400,8 +2688,14 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
       let .const cls _ := normConclClean.getAppFn
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
       let allArgs := normConclClean.getAppArgs
-      unless !ie.keys.isEmpty && ie.keys[0]! == Meta.DiscrTree.Key.const cls allArgs.size do
-        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
+      let some _ := splitDiscrTreeChildren ie.keys cls allArgs.size
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
+      let allowedKeyConsts := normConclClean.getUsedConstantsAsSet ++
+        (stripForallAndLam ci.type).consumeMData.getUsedConstantsAsSet
+      for k in ie.keys.extract 1 ie.keys.size do
+        if let .const kc _ := k then
+          unless isWellFormedName kc && allowedKeyConsts.contains kc do
+            policyFail "forbiddenInstanceOrCoe" m #[m, dName, kc] "forged_instance_keys_foreign_const"
       unless isBaseInstanceAnchor localReplayable localRedOver byName cls do
         policyFail "forbiddenInstanceOrCoe" m #[m, dName] "scoped_instance_of_imported_target"
       unless (nameComponents m).isPrefixOf (nameComponents ns) do
@@ -2422,36 +2716,38 @@ def auditModuleExtensionsAtLevel (normEnv checkEnv : Environment) (extLevel : OL
       let .const cls lvls := normConclClean.getAppFn
         | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
       let allArgs := normConclClean.getAppArgs
-      unless !ie.keys.isEmpty && ie.keys[0]! == Meta.DiscrTree.Key.const cls allArgs.size do
-        policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
-      let conclConsts := normConclClean.getUsedConstantsAsSet
+      let some childSlices := splitDiscrTreeChildren ie.keys cls allArgs.size
+        | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_mismatch"
+      let rawConclClean := (stripForallAndLam ci.type).consumeMData
+      let allowedKeyConsts := normConclClean.getUsedConstantsAsSet ++ rawConclClean.getUsedConstantsAsSet
       for k in ie.keys.extract 1 ie.keys.size do
         if let .const kc _ := k then
-          unless conclConsts.contains kc do
+          unless isWellFormedName kc && allowedKeyConsts.contains kc do
             policyFail "forbiddenInstanceOrCoe" m #[m, dName, kc] "forged_instance_keys_foreign_const"
-      if isAutoSizeOfInst normEnv byName ci ie.priority cls allArgs then
-        let hasIndKey := (ie.keys.extract 1 ie.keys.size).any fun
-          | .const kc _ => isBaseInstanceAnchor localReplayable localRedOver byName kc
-          | _ => false
-        unless hasIndKey do
-          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_sizeof_keys_wildcard"
+      if let some (indName, arity) := autoSizeOfTarget? normEnv byName ci ie.priority cls allArgs then
+        let expectedSizeOfKeys : Array Meta.DiscrTree.Key :=
+          #[Meta.DiscrTree.Key.const ``SizeOf 1, Meta.DiscrTree.Key.const indName arity] ++
+          Array.replicate arity Meta.DiscrTree.Key.star
+        unless ie.keys == expectedSizeOfKeys do
+          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_sizeof_keys_mismatch"
       else if isBaseInstanceAnchor localReplayable localRedOver byName cls then
         pure ()
       else
         if role == "proof" || role == "verify" || (strictProofs && role != "defsExempt") then
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "instance_of_imported_class"
-        let some inputArgs := nonOutParamArgs normEnv cls lvls allArgs
+        let some inputIndices := nonOutParamIndices normEnv cls lvls allArgs
           | policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-        unless inputArgs.any (hasRigidBaseAnchor normEnv localReplayable localRedOver byName) do
+        unless inputIndices.any (fun i => hasRigidBaseAnchor normEnv localReplayable localRedOver byName allArgs[i]!) do
           policyFail "forbiddenInstanceOrCoe" m #[m, dName] "orphan_instance_of_imported_class"
-        let hasArrowOrLamInput := inputArgs.any fun a =>
-          (a.find? fun | .forallE .. | .lam .. => true | _ => false).isSome
-        if !hasArrowOrLamInput then
-          let hasKeyAnchor := (ie.keys.extract 1 ie.keys.size).any fun
-            | .const kc _ => isBaseInstanceAnchor localReplayable localRedOver byName kc
-            | _ => false
-          unless hasKeyAnchor do
-            policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_wildcard"
+        let rawSameHead := rawConclClean.getAppFn.consumeMData.isConstOf cls &&
+          rawConclClean.getAppNumArgs == allArgs.size
+        let rawArgs := if rawSameHead then rawConclClean.getAppArgs else allArgs
+        let hasAlignedInputKey := inputIndices.any fun i =>
+          hasRigidBaseAnchor normEnv localReplayable localRedOver byName allArgs[i]! &&
+          keySubtreeAlignedWithAnchor normEnv localReplayable localRedOver byName
+            rawArgs[i]! allArgs[i]! childSlices[i]!
+        unless hasAlignedInputKey do
+          policyFail "forbiddenInstanceOrCoe" m #[m, dName] "forged_instance_keys_unaligned"
 
 def verifyPartAux (modName : Name) (data : ModuleData) : IO Unit := do
   verifyPartKeysOnly modName data
@@ -2543,12 +2839,20 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
     if moduleMode && !main.1.isModule then
       policyFail "missingOleanServer" modName #[modName] "artifact was not compiled in module mode"
     verifyPartKeysOnly modName main.1
+    verifyEntriesUniqueWellFormed modName main.1.entries
     if main.1.isModule && hasServer && hasPrivate then
       let sFile := OLeanLevel.server.adjustFileName mFile
       let pFile := OLeanLevel.private.adjustFileName mFile
-      let server ← unsafe CompactedRegion.read (α := ModuleData) sFile #[main.2]
-      let priv ← unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
+      let server ← try
+        unsafe CompactedRegion.read (α := ModuleData) sFile #[main.2]
+      catch ex =>
+        opFail s!"failed deserializing .olean.server {sFile}: {ex}"
+      let priv ← try
+        unsafe CompactedRegion.read (α := ModuleData) pFile #[main.2, server.2]
+      catch ex =>
+        opFail s!"failed deserializing .olean.private {pFile}: {ex}"
       verifyPartKeysOnly modName server.1
+      verifyEntriesUniqueWellFormed modName server.1.entries
       let _ ← verifyModuleInventory modName priv.1
       allTargetsImportInit := allTargetsImportInit &&
         priv.1.imports.any (fun imp => imp.module == `Init)
@@ -2584,8 +2888,15 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           preLoaded := preLoaded.push cur
           try
             let p ← findOLean cur
-            let (md, _) ← readModuleData p
+            let (md, rMain) ← unsafe CompactedRegion.read (α := ModuleData) p #[]
             preQueue := (md.imports.toList.map (·.module)) ++ preQueue
+            if md.isModule then
+              let sFile := OLeanLevel.server.adjustFileName p
+              let pFile := OLeanLevel.private.adjustFileName p
+              let (sMd, rSrv) ← unsafe CompactedRegion.read (α := ModuleData) sFile #[rMain]
+              preQueue := (sMd.imports.toList.map (·.module)) ++ preQueue
+              let (pMd, _) ← unsafe CompactedRegion.read (α := ModuleData) pFile #[rMain, rSrv]
+              preQueue := (pMd.imports.toList.map (·.module)) ++ preQueue
           catch _ => pure ()
       loadedModsRef.set preLoaded
       policyFail "duplicateConstName" targetMods[0]! #[targetMods[0]!] msg
@@ -2694,6 +3005,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         catch ex =>
           opFail s!"failed deserializing .ir.sig {irSigFile}: {ex}"
         verifyPartAux m irSigPart.1
+        unless irSigPart.1.imports.isEmpty do
+          policyFail "foreignImport" m #[m] "split-brain .ir.sig contains unexpected imports"
         unless irSigPart.1.constNames.isEmpty && irSigPart.1.constants.isEmpty do
           policyFail "keyNameMismatch" m #[m] "split-brain .ir.sig contains unexpected kernel constants"
         checkIrPartForbiddenEntries m irSigPart.1.entries
@@ -2706,6 +3019,8 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         verifyPartAux m irPart.1
         unless irPart.1.isModule == d.isModule do
           policyFail "keyNameMismatch" m #[m] "split-brain .ir isModule flag mismatch"
+        unless irPart.1.imports == d.imports do
+          policyFail "foreignImport" m #[m] "split-brain .ir imports mismatch"
         unless irPart.1.constNames.isEmpty && irPart.1.constants.isEmpty do
           policyFail "keyNameMismatch" m #[m] "split-brain .ir contains unexpected kernel constants"
         checkIrPartForbiddenEntries m irPart.1.entries
@@ -2787,6 +3102,9 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
         if !isCodegenUnsafeRec byName ci then
           replayLocals ← insertReplayLocalUnique env m replayLocals ci
         else if let .defnInfo dv := ci then
+          if let some (prevMod, _) := excusedUnsafeRecs[ci.name]? then
+            policyFail "duplicateConstName" prevMod #[prevMod, ci.name]
+              s!"cross-module duplicate _unsafe_rec {ci.name} ({prevMod} vs {m})"
           excusedUnsafeRecs := excusedUnsafeRecs.insert ci.name (m, dv)
       let allExtras := d.extraConstNames ++ (extraPartConstsMap[m]?.getD #[])
       for extra in allExtras do
@@ -2917,7 +3235,7 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
           policyFail "forbiddenImportModifier" m #[m, imp.module] "private"
       if imp.isMeta && imp.module != `Init then
         policyFail "forbiddenImportModifier" m #[m, imp.module] "meta"
-      if !isWellFormedName imp.module || isLeanCompilerMod imp.module || !seenModNames.contains imp.module then
+      if !isWellFormedModuleName imp.module || isLeanCompilerMod imp.module || !seenModNames.contains imp.module then
         policyFail "foreignImport" m #[m, imp.module] s!"foreign or disallowed import {imp.module}"
       if d.isModule && auditedSet.contains imp.module && !moduleFlaggedSet.contains imp.module then
         policyFail "foreignImport" m #[m, imp.module]
@@ -3155,6 +3473,11 @@ def auditOleans (j : Json) (loadedModsRef : IO.Ref (Array Name))
       let byName := byModMap[m]!
       let some ci := byName[thmName]?
         | policyFail "invalidVerifyRoot" m #[thmName] "Verify module missing <Mod>.verified theorem"
+      if moduleFlaggedSet.contains m then
+        let pubSet := publicNamesMap[m]?.getD {}
+        unless pubSet.contains thmName do
+          policyFail "invalidVerifyRoot" m #[thmName]
+            s!"module-mode Verify module {m} must publicly export {thmName} in .olean"
       unless ci matches .thmInfo _ do
         policyFail "invalidVerifyRoot" m #[thmName] "verified must be a theorem"
       unless ci.levelParams.isEmpty do
@@ -3384,6 +3707,7 @@ def main (args : List String) : IO UInt32 := do
 
 FORGE_LEAN_SOURCE = r"""import Lean
 import Lean.Replay
+import Lean.Meta.Instances
 
 open Lean
 
@@ -3898,6 +4222,79 @@ def main (args : List String) : IO UInt32 := do
     entries := #[]
   }
 
+  -- 17b_forged_arrow_wildcard: `Inhabited (Nat -> Anchor)` with forged `#[.const Inhabited 1, .star]` wildcard!
+  let anc17b := `Topic.Tamper17b.Defs.Anchor
+  let anc17bMk := `Topic.Tamper17b.Defs.Anchor.mk
+  let anc17bInd : ConstantInfo := .inductInfo {
+    name := anc17b, levelParams := [], type := mkSort Level.one,
+    numParams := 0, numIndices := 0, all := [anc17b], ctors := [anc17bMk],
+    numNested := 0, isRec := false, isUnsafe := false, isReflexive := false
+  }
+  let anc17bCtor : ConstantInfo := .ctorInfo {
+    name := anc17bMk, levelParams := [], type := mkConst anc17b,
+    induct := anc17b, cidx := 0, numParams := 0, numFields := 0, isUnsafe := false
+  }
+  let anc17bRec : ConstantInfo := .recInfo {
+    name := `Topic.Tamper17b.Defs.Anchor.rec, levelParams := [`u],
+    type := mkForall `motive .implicit (mkForall `x .default (mkConst anc17b) (mkSort (.param `u)))
+      (mkForall `h .default (mkApp (mkBVar 0) (mkConst anc17bMk))
+        (mkForall `t .default (mkConst anc17b) (mkApp (mkBVar 2) (mkBVar 0)))),
+    all := [anc17b], numParams := 0, numIndices := 0, numMotives := 1, numMinors := 1,
+    rules := [{ ctor := anc17bMk, nfields := 0, rhs := mkLambda `motive .implicit (mkForall `x .default (mkConst anc17b) (mkSort (.param `u))) (mkLambda `h .default (mkApp (mkBVar 0) (mkConst anc17bMk)) (mkBVar 0)) }],
+    k := true, isUnsafe := false
+  }
+  let arrTy17b := mkForall `_ .default (mkConst ``Nat) (mkConst anc17b)
+  let inst17bName := `Topic.Tamper17b.Defs.instArr
+  let inst17b : ConstantInfo := .defnInfo {
+    name := inst17bName, levelParams := [],
+    type := mkApp (mkConst ``Inhabited [Level.one]) arrTy17b,
+    value := mkApp2 (mkConst ``Inhabited.mk [Level.one]) arrTy17b (mkLambda `_ .default (mkConst ``Nat) (mkConst anc17bMk)),
+    hints := .abbrev, safety := .safe, all := [inst17bName]
+  }
+  let wildEnt17b : ScopedEnvExtension.Entry Meta.InstanceEntry := .global {
+    keys := #[Meta.DiscrTree.Key.const ``Inhabited 1, Meta.DiscrTree.Key.star],
+    val := mkConst inst17bName, priority := 1000, globalName? := some inst17bName,
+    synthOrder := #[], attrKind := .global
+  }
+  writeOlean (outDir / "17b_arrow_wildcard") `Topic.Tamper17b.Defs {
+    isModule := false, imports := #[{ module := `Init }],
+    constNames := #[anc17b, anc17bMk, `Topic.Tamper17b.Defs.Anchor.rec, inst17bName],
+    constants := #[anc17bInd, anc17bCtor, anc17bRec, inst17b],
+    extraConstNames := #[],
+    entries := #[(`Lean.Meta.instanceExtension, #[unsafe unsafeCast wildEnt17b])]
+  }
+
+  -- 15d_forged_ir_imports_lean: module-mode artifact with paired `.ir.sig`/`.ir` importing `Lean`!
+  let irDir15d := outDir / "15d_ir_imports_lean" / "Proof"
+  IO.FS.createDirAll irDir15d
+  let irBase15d := irDir15d / "Tamper15d.olean"
+  let thm15d : ConstantInfo := .thmInfo {
+    name := `Proof.Tamper15d.ok, levelParams := [],
+    type := mkConst ``True, value := mkConst ``True.intro, all := [`Proof.Tamper15d.ok]
+  }
+  let md15d : ModuleData := {
+    isModule := true, imports := #[{ module := `Init }],
+    constNames := #[`Proof.Tamper15d.ok], constants := #[thm15d],
+    extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.Tamper15d #[
+    (irBase15d, md15d),
+    (OLeanLevel.server.adjustFileName irBase15d, md15d),
+    (OLeanLevel.private.adjustFileName irBase15d, md15d)
+  ]
+  let badIrSig15d : ModuleData := {
+    isModule := false, imports := #[{ module := `Lean }],
+    constNames := #[], constants := #[], extraConstNames := #[], entries := #[]
+  }
+  let badIr15d : ModuleData := {
+    isModule := true, imports := #[{ module := `Lean }],
+    constNames := #[], constants := #[], extraConstNames := #[], entries := #[]
+  }
+  saveModuleDataParts `Proof.Tamper15d #[
+    (irBase15d.withExtension "ir.sig", badIrSig15d),
+    (irBase15d.withExtension "ir", badIr15d)
+  ]
+
   return 0
 """
 
@@ -4000,6 +4397,8 @@ REPO_SOURCE_ROOTS: tuple[Path, ...] = (
 
 
 def _resolve_source_in_roots(mod: str, roots: Sequence[Path]) -> Path | None:
+    if not _is_valid_module_name(mod):
+        return None
     rel = mod.replace(".", "/") + ".lean"
     for rdir in roots:
         if rdir.is_dir():
@@ -4144,7 +4543,7 @@ def precheck_olean_dirs_and_locate_modules(
     located: list[tuple[str, Path, bool, bool]] = []
     seen_targets: set[str] = set()
     for mod in target_modules:
-        if not mod or any(not seg or "." in seg for seg in mod.split(".")):
+        if not _is_valid_module_name(mod):
             raise AuditPolicyError("anonymousConstantName", mod or "<anonymous>", "malformed module name")
         if mod in seen_targets:
             raise AuditPolicyError("duplicateModuleName", mod, f"duplicate target module {mod}")
@@ -4254,6 +4653,8 @@ def _stat_loaded_artifacts_fail_closed(
     """Fail-closed `stat_regular_fail_closed` on `.olean`, `.olean.server`, `.olean.private`,
     `.ir.sig`, and `.ir` for every loaded non-stdlib module (even on policy failure!)."""
     for mod in mods:
+        if not _is_valid_module_name(mod):
+            raise AuditPolicyError("anonymousConstantName", mod or "<anonymous>", "malformed module name")
         rel_base = mod.replace(".", "/")
         found_d: Path | None = None
         for d in all_artifact_dirs:
@@ -5122,6 +5523,8 @@ def run_tamper_suite(
             ("subcheck_18c_foreign_quot_decl", "Proof.Tamper18Quot", forged_root / "18c_foreign_quot", "foreignQuotDecl"),
             ("subcheck_18e_asymmetric_mutual_all", "Proof.LowmemMutual18d", forged_root / "18e_asymmetric_mutual_all", "invalidMutualAll"),
             ("subcheck_15c_split_brain_exported_axiom", "Proof.SplitBrain15c", forged_root / "15c_split_brain", "keyNameMismatch"),
+            ("subcheck_15d_forged_ir_imports_lean", "Proof.Tamper15d", forged_root / "15d_ir_imports_lean", "foreignImport"),
+            ("subcheck_17b_forged_arrow_instance_wildcard", "Topic.Tamper17b.Defs", forged_root / "17b_arrow_wildcard", "forbiddenInstanceOrCoe"),
             ("subcheck_B3_reference_outside_import_closure", "Specs.UnimportedRef", forged_root / "b3_ref_outside", "referenceOutsideImportClosure"),
         ]
         batched_specs.append(
