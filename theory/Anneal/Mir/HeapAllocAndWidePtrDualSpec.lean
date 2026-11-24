@@ -38,6 +38,9 @@ Classification (`2 × 30 = 60` cells):
 2. **Exact divergence set (`28`, `29`, 4 cells)**, as an `↔` (`contract_divergence_set_exact`,
    `contract_wire_divergence_exact`): `28` MiniRust `specPanic` vs LeanMiri
    `invalidProgram`; `29` MiniRust accepts `align = 2^30`, Miri's `Align::MAX = 2^29` rejects.
+3. **Totality**: both authorities are fail-closed `.invalidOrUnsupported` for `idx ≥ 30`
+   (`HeapWideLmAuthority.outOfRange`), so `contract_total_divergence_exact` /
+   `contract_total_wire_divergence_exact` hold for EVERY `idx : Nat`.
 
 Trusted bridge scope note: Anneal's `hasFrameDeallocProtectorConflict` governs the
 deallocation of *frame locals* at `return` / tail calls (heap `Allocate`/`Deallocate`
@@ -425,6 +428,11 @@ structure HeapWideLmAuthority : Type where
   observe : Bool → Nat → HeapWideObs
   matchesExpected : ∀ (tb : Bool) (idx : Nat), idx < canonicalCaseCount →
     observe tb idx = lmExpected (HeapWideMemoryMode.ofLmTreeBorrows tb) idx
+  /-- Outside the canonical table LeanMiri is fail-closed `.invalidOrUnsupported` (closed
+  across roots from `LeanMiriSpec.HeapAllocAndWidePtrLM.lmHeapWideObserve_out_of_range`),
+  so the classification below is total over ALL `idx : Nat`, not just `0..29`. -/
+  outOfRange : ∀ (tb : Bool) (idx : Nat), canonicalCaseCount ≤ idx →
+    observe tb idx = .invalidOrUnsupported
 
 /-- Decidable 60-cell check of a LeanMiri observation function. -/
 def lmAuthorityCheck (obs : Bool → Nat → HeapWideObs) : Bool :=
@@ -441,10 +449,12 @@ theorem lmAuthorityCheck_sound (obs : Bool → Nat → HeapWideObs)
   have h2 := List.all_eq_true.mp h1 idx (List.mem_range.mpr hIdx)
   exact of_decide_eq_true h2
 
-def lmAuthorityOfCheck (obs : Bool → Nat → HeapWideObs) (h : lmAuthorityCheck obs = true) :
+def lmAuthorityOfCheck (obs : Bool → Nat → HeapWideObs) (h : lmAuthorityCheck obs = true)
+    (hOut : ∀ (tb : Bool) (idx : Nat), canonicalCaseCount ≤ idx → obs tb idx = .invalidOrUnsupported) :
     HeapWideLmAuthority where
   observe := obs
   matchesExpected := lmAuthorityCheck_sound obs h
+  outOfRange := hOut
 
 /-- Cross-authority lifecycle trace check (both modes equal MiniRust's frozen trace). -/
 def lmLifecycleTraceAuthorityCheck (obs : Bool → List HeapWideObs) : Bool :=
@@ -568,8 +578,10 @@ def mkHeapWideDualContract (lm : HeapWideLmAuthority) (lc pt : Bool → List Hea
 /-- Direct check-to-contract constructor for the cross-root kernel bridge. -/
 def heapWideDualContractOfChecks (obs : Bool → Nat → HeapWideObs) (lc pt : Bool → List HeapWideObs)
     (h : lmAuthorityCheck obs = true) (hlc : lmLifecycleTraceAuthorityCheck lc = true)
-    (hpt : lmProtectorTraceAuthorityCheck pt = true) : HeapWideDualContract :=
-  mkHeapWideDualContract (lmAuthorityOfCheck obs h) lc pt hlc hpt
+    (hpt : lmProtectorTraceAuthorityCheck pt = true)
+    (hOut : ∀ (tb : Bool) (idx : Nat), canonicalCaseCount ≤ idx → obs tb idx = .invalidOrUnsupported) :
+    HeapWideDualContract :=
+  mkHeapWideDualContract (lmAuthorityOfCheck obs h hOut) lc pt hlc hpt
 
 /-- **Exact divergence set** (an `↔`, zero wildcards): on every canonical cell, the
 authorities differ iff the cell is case `28` or `29`. -/
@@ -609,6 +621,50 @@ theorem contract_wire_divergence_exact (c : HeapWideDualContract) (m : HeapWideM
         ((contract_divergence_set_exact c m idx hIdx).mpr hD)
   · intro hNo
     exact congrArg heapWideOutcomeCodec.encode (contract_agreement_of_not_diverges c m idx hIdx hNo)
+
+/-- **Total exact divergence set over ALL `idx : Nat`** (no `idx < 30` side condition):
+out of range both authorities are fail-closed `.invalidOrUnsupported` and agree. -/
+theorem contract_total_divergence_exact (c : HeapWideDualContract) (m : HeapWideMemoryMode)
+    (idx : Nat) :
+    mrObserve m idx ≠ c.lm.observe m.toLmTreeBorrows idx ↔ divergesAt m idx = true := by
+  cases Nat.lt_or_ge idx canonicalCaseCount with
+  | inl hIdx => exact contract_divergence_set_exact c m idx hIdx
+  | inr hOut =>
+    rw [mrObserve_out_of_range m idx hOut, c.lm.outOfRange _ idx hOut]
+    have hD : divergesAt m idx = false := by
+      apply decide_eq_false
+      have h30 : 30 ≤ idx := hOut
+      rintro (rfl | rfl) <;> exact absurd h30 (by decide)
+    rw [hD]
+    exact ⟨fun h => absurd rfl h, fun h => by cases h⟩
+
+/-- **Total wire-level exact divergence set over ALL `idx : Nat`.** -/
+theorem contract_total_wire_divergence_exact (c : HeapWideDualContract) (m : HeapWideMemoryMode)
+    (idx : Nat) :
+    heapWideOutcomeCodec.encode (mrObserve m idx) =
+        heapWideOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ↔
+      divergesAt m idx = false := by
+  constructor
+  · intro hEnc
+    cases hD : divergesAt m idx with
+    | false => rfl
+    | true =>
+      exact absurd (heapWideOutcomeCodec_encode_injective hEnc)
+        ((contract_total_divergence_exact c m idx).mpr hD)
+  · intro hNo
+    apply congrArg heapWideOutcomeCodec.encode
+    cases hEq : decide (mrObserve m idx = c.lm.observe m.toLmTreeBorrows idx) with
+    | true => exact of_decide_eq_true hEq
+    | false =>
+      have := (contract_total_divergence_exact c m idx).mp (of_decide_eq_false hEq)
+      rw [hNo] at this; cases this
+
+/-- Out of range both authorities are `.invalidOrUnsupported` in both modes. -/
+theorem contract_out_of_range_agreement (c : HeapWideDualContract) (m : HeapWideMemoryMode)
+    (idx : Nat) (hOut : canonicalCaseCount ≤ idx) :
+    mrObserve m idx = .invalidOrUnsupported ∧
+      c.lm.observe m.toLmTreeBorrows idx = .invalidOrUnsupported :=
+  ⟨mrObserve_out_of_range m idx hOut, c.lm.outOfRange _ idx hOut⟩
 
 /-- Decidable single-cell wire agreement (for cross-root positive / forged controls). -/
 def wireAgreesAt (obs : Bool → Nat → HeapWideObs) (m : HeapWideMemoryMode) (idx : Nat) : Bool :=
@@ -1190,22 +1246,28 @@ def hwCalleeBody : CapturedMir :=
 `_1` (`targetFrameDepth = 0`, `perm = .frozen`): returning from `hwCalleeBody` releases
 protector `1` via `restoreCallerProtectors`, allowing caller `StorageDead(_1)` to succeed
 (genuine operational Case `19 → 20` transition). -/
-def hwCalleeReleaseState : MachineState :=
-  let savedCaller : SavedCallerFrame :=
-    { callerBody := hwStorageDeadBody
-      frame := { blockIdx := 0, stmtIdx := 0,
-                 locals := [.init (.aggregate 0 []), .init (.scalar ⟨42, 4⟩)] }
-      destination := { local_ := 0, projection := [] }
-      returnTarget := 0
-      callerProtector := none
-      calleeProtectors := []
-      returnUnwind := .continue_
-      isDiverging := false }
+def hwSavedCaller (callerKeeps : Bool) : SavedCallerFrame :=
+  { callerBody := hwStorageDeadBody
+    frame := { blockIdx := 0, stmtIdx := 0,
+               locals := [.init (.aggregate 0 []), .init (.scalar ⟨42, 4⟩)] }
+    destination := { local_ := 0, projection := [] }
+    returnTarget := 0
+    callerProtector := if callerKeeps then some 1 else none
+    calleeProtectors := []
+    returnUnwind := .continue_
+    isDiverging := false }
+
+/-- Two-frame state inside `hwCalleeBody`; the saved caller frame re-installs protector
+`1` on return iff `callerKeeps`. -/
+def hwCalleeReturnState (callerKeeps : Bool) : MachineState :=
   { frame := { blockIdx := 0, stmtIdx := 0, locals := [.init (.aggregate 0 [])] }
     memory := { borrows := [hwProtectedEntry .frozen]
                 activeProtectors := [1]
-                callStack := [savedCaller]
+                callStack := [hwSavedCaller callerKeeps]
                 activeCallee := some hwCalleeBody } }
+
+/-- The releasing variant (`callerProtector := none`): returning drops protector `1`. -/
+def hwCalleeReleaseState : MachineState := hwCalleeReturnState false
 
 /-- Multi-step execution of callee return (releasing protector `1`) followed by caller
 `StorageDead(_1)` + `return_`. -/
@@ -1218,6 +1280,32 @@ def trustedTailCallObs (perm : TreeBorrowPerm) (active : Bool) : HeapWideObs :=
     .constant { ty := { kind := .fnDef "hw::tail_callee" [], layoutIdx := 0 },
                 val := .unevaluated "hw::tail_callee" }
   trustedStepObs (evalTailCallTerminator (hwTeardownState perm active) fnOp [] (some hwTeardownBody))
+
+/-- Callee return when the caller's saved frame re-installs protector `1`
+(`callerProtector := some 1`): the same caller `StorageDead(_1)` must still fault. -/
+def trustedCalleeKeepThenDeallocObs : HeapWideObs :=
+  trustedDeallocRun hwStorageDeadBody 6 (hwCalleeReturnState true)
+
+/-- **Non-vacuity twins** of the protector witnesses: (1) the callee-return release is
+the *only* difference between `.okDealloc` and `.ub` — the identical 2-frame run whose
+caller frame re-installs protector `1` via `restoreCallerProtectors` faults at
+`StorageDead(_1)`; (2) the tail-call `.ub` is caused by the protector check alone —
+without an active protector, or with a protected `.cell`, the same `evalTailCallTerminator`
+proceeds past teardown to the external tail call (not `.ub`); (3) the teardown `.ub` needs
+both an active protector and a deallocation-preventing permission. -/
+theorem trusted_protector_twins_table :
+    trustedCalleeKeepThenDeallocObs = .ub ∧
+    trustedCalleeReleaseThenDeallocObs = .okDealloc ∧
+    restoreCallerProtectors (hwSavedCaller true) = [1] ∧
+    restoreCallerProtectors (hwSavedCaller false) = [] ∧
+    trustedTailCallObs .frozen true = .ub ∧
+    trustedTailCallObs .frozen false = .invalidOrUnsupported ∧
+    trustedTailCallObs .cell true = .invalidOrUnsupported ∧
+    trustedTailCallObs .disabled true = .invalidOrUnsupported ∧
+    trustedTeardownObs .reservedIM false = .okDealloc ∧
+    trustedStorageDeadObs .disabled true = .okDealloc ∧
+    trustedStorageDeadObs (.reservedFrz true) true = .ub := by
+  refine ⟨?_, ?_, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩ <;> decide +kernel
 
 /-- **Concrete `StorageDead`, 2-frame callee-return protector release (`19 → 20`), and
 tail-call protector execution table** through real `stepMirFn` / `evalStmt` /
@@ -1666,7 +1754,16 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
           mrObserve .treeBorrows 19 = c.lm.observe true 19 ∧ c.lm.observe true 19 = .ub) ∧
         (mrObserve .basic 21 = c.lm.observe false 21 ∧ mrObserve .basic 21 = .okDealloc ∧
           mrObserve .treeBorrows 21 = c.lm.observe true 21 ∧ c.lm.observe true 21 = .ub)) ∧
-      (∀ m, type_of% (contract_static_leak_wide_agreement c m))) ∧
+      (∀ m, type_of% (contract_static_leak_wide_agreement c m)) ∧
+      (∀ (m : HeapWideMemoryMode) (idx : Nat),
+        (mrObserve m idx ≠ c.lm.observe m.toLmTreeBorrows idx ↔ divergesAt m idx = true)) ∧
+      (∀ (m : HeapWideMemoryMode) (idx : Nat),
+        (heapWideOutcomeCodec.encode (mrObserve m idx) =
+            heapWideOutcomeCodec.encode (c.lm.observe m.toLmTreeBorrows idx) ↔
+          divergesAt m idx = false)) ∧
+      (∀ (m : HeapWideMemoryMode) (idx : Nat), canonicalCaseCount ≤ idx →
+        mrObserve m idx = .invalidOrUnsupported ∧
+          c.lm.observe m.toLmTreeBorrows idx = .invalidOrUnsupported)) ∧
     ((∀ m, c.lmLifecycle m.toLmTreeBorrows = mrLifecycleTrace m) ∧
       (∀ m, c.lmProtector m.toLmTreeBorrows = mrProtectorTrace m) ∧
       c.lmProtector false ≠ c.lmProtector true ∧
@@ -1691,6 +1788,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       (type_of% @trustedTeardown_table) ∧
       (type_of% @trusted_protector_cases_match_mr) ∧
       (type_of% @trustedStorageDead_and_release_table) ∧
+      (type_of% @trusted_protector_twins_table) ∧
       (type_of% @evalCastPtrToPtr_slice_to_thin) ∧
       (type_of% @evalCastPtrToPtr_dyn_to_thin) ∧
       (type_of% @evalCastPtrToPtr_scalarPair_to_thin) ∧
@@ -1711,7 +1809,8 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
     ⟨c.mr_ep1_capstone, mr_addrEq_wideEq_bm_bridge⟩,
     ⟨c.mr_matches, mrObserve_out_of_range, mr_mode_sensitivity, c.agreement_zone_exact,
       contract_divergence_set_exact c, c.divergence_explicit, c.mode_sensitivity_joint,
-      contract_static_leak_wide_agreement c⟩,
+      contract_static_leak_wide_agreement c, contract_total_divergence_exact c,
+      contract_total_wire_divergence_exact c, contract_out_of_range_agreement c⟩,
     contract_traces c,
     ⟨@preventsDeallocation_eq_mr, @mr_prevents_deallocation_iff_trusted,
       @hasFrameDeallocProtectorConflict_eq_mr_node, @hasProtectedLocalBorrow_eq_mr_node,
@@ -1722,6 +1821,7 @@ theorem ep2_heap_alloc_and_wide_ptr_dual_authority_capstone (c : HeapWideDualCon
       @evalStmt_storageDead_protector_ub, @evalStmt_storageDead_no_conflict_steps,
       @evalStmt_storageLive_protector_ub, @trustedTeardown_table,
       @trusted_protector_cases_match_mr, @trustedStorageDead_and_release_table,
+      @trusted_protector_twins_table,
       @evalCastPtrToPtr_slice_to_thin, @evalCastPtrToPtr_dyn_to_thin,
       @evalCastPtrToPtr_scalarPair_to_thin, @evalCastPtrToPtr_scalarDyn_to_thin,
       @ptrAddressScalar?_unborrowed, @ptrToAddrScalar_addr_only,

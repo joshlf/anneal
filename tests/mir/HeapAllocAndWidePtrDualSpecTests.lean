@@ -373,11 +373,29 @@ run_cmd do
     let (wire29BU, wire29B) ← certifyWire `crossRootWireDivergesBasic29 modeBasic 29 false
     let (wire29TU, wire29T) ← certifyWire `crossRootWireDivergesTb29 modeTb 29 false
 
+    -- 4b. Out-of-range fail-closedness of the SOURCE observer (all `idx ≥ 30`), transported
+    -- through the genuine translator from `lmHeapWideObserve_out_of_range`: this makes the
+    -- contract's classification total over `Nat` (`contract_total_divergence_exact`).
+    let outName := ns ++ `crossRootLmOutOfRange
+    let (outTy, outPf) ← MetaM.run' <| withLocalDeclD `tb boolTy fun tb =>
+      withLocalDeclD `idx natTy fun idx => do
+        let hTy := mkApp4 (mkConst ``LE.le [0]) natTy (mkConst ``instLENat)
+          (mkConst (dsNs ++ `canonicalCaseCount)) idx
+        withLocalDeclD `h hTy fun h => do
+          let lmOut := mkApp3 (mkConst (lmNs ++ `lmHeapWideObserve_out_of_range)) tb idx h
+          let pf := mkApp6 (mkConst ``congrArg [1, 1]) lmObsTy obsTy
+            (mkApp2 (mkConst (lmNs ++ `lmHeapWideObserve)) tb idx)
+            (mkConst (lmNs ++ `LmHeapWideObs.invalidOrUnsupported)) trC lmOut
+          let body := mkApp3 (mkConst ``Eq [1]) obsTy (mkApp2 (mkConst crossObs) tb idx)
+            (obsC "invalidOrUnsupported")
+          return (← mkForallFVars #[tb, idx, h] body, ← mkLambdaFVars #[tb, idx, h] pf)
+    addThm outName outTy outPf
+
     -- 5. Closed `HeapWideDualContract`, every named projection, and the closed capstone.
     let contractName := ns ++ `closedHeapWideDualContract
     addDef contractName (mkAppN (mkConst (dsNs ++ `heapWideDualContractOfChecks))
       #[mkConst crossObs, mkConst lcObs, mkConst ptObs, mkConst crossCheck, mkConst lcCheck,
-        mkConst ptCheck])
+        mkConst ptCheck, mkConst outName])
     let some (.defnInfo cInfo) := (← getEnv).find? contractName
       | throwError "cross-root: contract missing"
     unless cInfo.type.isConstOf (dsNs ++ `HeapWideDualContract) do
@@ -387,11 +405,14 @@ run_cmd do
       #[translateName, crossObs, crossObsU, crossCheck, crossCheckU, lcObs, lcObsU, lcCheck, lcCheckU,
         ptObs, ptObsU, ptCheck, ptCheckU, lcEqName, ptEqName,
         wire0U, wire0, wire19U, wire19, wire21U, wire21, wire27U, wire27,
-        wire28BU, wire28B, wire28TU, wire28T, wire29BU, wire29B, wire29TU, wire29T, contractName]
+        wire28BU, wire28B, wire28TU, wire28T, wire29BU, wire29B, wire29TU, wire29T, outName,
+        contractName]
     for projName in [`contract_agreement_zone_exact, `contract_divergence_explicit,
                      `contract_mode_sensitivity_joint, `contract_traces,
                      `contract_divergence_set_exact, `contract_wire_divergence_exact,
                      `contract_static_leak_wide_agreement,
+                     `contract_total_divergence_exact, `contract_total_wire_divergence_exact,
+                     `contract_out_of_range_agreement,
                      `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone] do
       let val := mkApp (mkConst (dsNs ++ projName)) contractC
       let ty ← MetaM.run' <| inferType val
@@ -409,7 +430,7 @@ run_cmd do
               `evalStmt_storageDead_protector_ub, `evalStmt_storageDead_no_conflict_steps,
               `evalStmt_storageLive_protector_ub,
               `trustedTeardown_table, `trusted_protector_cases_match_mr,
-              `trustedStorageDead_and_release_table,
+              `trustedStorageDead_and_release_table, `trusted_protector_twins_table,
               `evalCastPtrToPtr_slice_to_thin, `evalCastPtrToPtr_dyn_to_thin,
               `evalCastPtrToPtr_scalarPair_to_thin, `evalCastPtrToPtr_scalarDyn_to_thin,
               `evalRvalue_thinPtr_eq, `evalRvalue_thinScalar_eq,
@@ -519,6 +540,23 @@ run_cmd do
             (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolFalse))),
           thm "sliceCmpForgedTrue" (mkApp3 (mkConst ``Eq [1]) obsTy sliceCmpFalse (mkApp (obsC "okBool") boolTrue))
             (mkApp2 (mkConst ``Eq.refl [1]) obsTy (mkApp (obsC "okBool") boolTrue))),
+        ("forged out-of-range LeanMiri cell (false, 30) = ub",
+          some (thm "outOfRangeIsInvalid"
+            (mkApp3 (mkConst ``Eq [1]) obsTy (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 30))
+              (obsC "invalidOrUnsupported"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "invalidOrUnsupported"))),
+          thm "outOfRangeForgedUb"
+            (mkApp3 (mkConst ``Eq [1]) obsTy (mkApp2 (mkConst crossObsU) boolFalse (mkNatLit 30))
+              (obsC "ub"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "ub"))),
+        ("forged callee-return that keeps protector 1 still deallocates (okDealloc)",
+          some (thm "calleeKeepIsUb"
+            (mkApp3 (mkConst ``Eq [1]) obsTy (mkConst (dsNs ++ `trustedCalleeKeepThenDeallocObs)) (obsC "ub"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "ub"))),
+          thm "calleeKeepForgedOk"
+            (mkApp3 (mkConst ``Eq [1]) obsTy (mkConst (dsNs ++ `trustedCalleeKeepThenDeallocObs))
+              (obsC "okDealloc"))
+            (mkApp2 (mkConst ``Eq.refl [1]) obsTy (obsC "okDealloc"))),
         ("forged malformed codec tuple decodes to some .ub",
           some (thm "badDecodeIsNone" (mkApp3 (mkConst ``Eq [1]) optObsTy badDecode (mkApp (mkConst ``Option.none [0]) obsTy))
             (mkApp2 (mkConst ``Eq.refl [1]) optObsTy (mkApp (mkConst ``Option.none [0]) obsTy))),
@@ -609,7 +647,8 @@ run_cmd do
         for d in ci.getUsedConstantsAsSet do
           if !reach.contains d then todo := todo.push d
     let requiredReach : List Lean.Name :=
-      [ contractName, crossObs, crossCheck, lcCheck, ptCheck,
+      [ outName, lmNs ++ `lmHeapWideObserve_out_of_range,
+        contractName, crossObs, crossCheck, lcCheck, ptCheck,
         dsNs ++ `ep2_heap_alloc_and_wide_ptr_dual_authority_capstone,
         lmNs ++ `lmHeapWideObserve, lmNs ++ `lmHeapWideObserveU,
         lmNs ++ `lmHeapLifecycleTrace, lmNs ++ `lmProtectorDeallocTrace,
@@ -644,7 +683,7 @@ run_cmd do
   let ctx : Core.Context :=
     { fileName := "<heap-wide-cross-root>", fileMap := default, options := opts, maxHeartbeats := 0 }
   let ((addedCount, rejectedCount, crAxioms), _) ← liftCoreM <| act.toIO ctx { env := baseEnv }
-  unless addedCount = 72 && rejectedCount = 20 do
+  unless addedCount = 77 && rejectedCount = 22 do
     throwError "cross-root: unexpected counts (added={addedCount}, rejected={rejectedCount})"
   logInfo m!"heap/wide cross-root kernel bridge: added {addedCount} declarations, rejected {rejectedCount} forged controls (all boolean/value forgeries verified two-sided), reached MiniRust+Miri+Trusted, axioms {crAxioms}"
 
