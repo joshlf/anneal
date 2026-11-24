@@ -1902,6 +1902,179 @@ theorem continueChainReleases_strips_tags {FrameCtx : Type z} {Addr : Type v}
       | tail _ hInRest =>
         exact (hIh t).2 fr hInRest hInFr
 
+/-- Terminal result of propagating a panic unwind through saved caller frames
+(`evalUnwindStack`). -/
+inductive UnwindStackResult (FrameCtx : Type z) (Mem : Type u) (Addr : Type v) where
+  /-- Landed on a validated cleanup pad of a caller frame. -/
+  | landed (st : StackFrameState FrameCtx Mem Addr)
+  /-- Propagated past every saved frame out of the modeled call subtree. -/
+  | rootUnwind (mem : Mem) (tree : Anneal.RefFrame.RangedBorrowTree)
+  /-- Hit a `.terminate` unwind edge (process abort). -/
+  | abortTerminate (mem : Mem) (tree : Anneal.RefFrame.RangedBorrowTree)
+  /-- `.unreachable` edge, invalid cleanup pad, or failed protector release. -/
+  | fault
+
+/-- Computable operational unwinder over the saved caller frames: pops frames
+while their unwind edge is `.continue_` (releasing each frame's `callerTags`
+via `Anneal.RefFrame.exitFrameWithProtectors`), stops on the first `.cleanup`
+pad (validated by `isCleanupBb`), `.terminate`, or an empty stack, and faults
+on `.unreachable`, an invalid pad, or a failed protector release. -/
+def evalUnwindStack {FrameCtx : Type z} {Mem : Type u} {Addr : Type v} :
+    List (SavedCallFrame FrameCtx Addr) → Mem →
+      Anneal.RefFrame.RangedBorrowTree → UnwindStackResult FrameCtx Mem Addr
+  | [], m, t => .rootUnwind m t
+  | saved :: rest, m, t =>
+    match saved.cont.onUnwind with
+    | .unreachable => .fault
+    | .terminate => .abortTerminate m t
+    | .cleanup cleanupBb =>
+      if saved.isCleanupBb cleanupBb then
+        .landed ⟨cleanupBb, saved.ctx, rest, m, t⟩
+      else
+        .fault
+    | .continue_ =>
+      match Anneal.RefFrame.exitFrameWithProtectors t saved.callerTags with
+      | ⟨t', .Released⟩ => evalUnwindStack rest m t'
+      | ⟨_, .MissingTag _⟩ => .fault
+      | ⟨_, .AccessFailure _ _ _ _⟩ => .fault
+      | ⟨_, .InvariantFailure _ _ _⟩ => .fault
+
+/-- Postcondition reading of an `UnwindStackResult` (`.fault ↦ False`). -/
+def UnwindStackResult.holds {FrameCtx : Type z} {Mem : Type u} {Addr : Type v}
+    (onCleanupFrame : StackFrameState FrameCtx Mem Addr → Prop)
+    (onRootUnwind : Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (onAbortTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop) :
+    UnwindStackResult FrameCtx Mem Addr → Prop
+  | .landed st => onCleanupFrame st
+  | .rootUnwind m t => onRootUnwind m t
+  | .abortTerminate m t => onAbortTerminate m t
+  | .fault => False
+
+/-- Operational adequacy of `wpUnwindStack`: the weakest precondition holds
+exactly when the computable unwinder `evalUnwindStack` produces a result
+satisfying the corresponding continuation (and never when it faults). -/
+theorem wpUnwindStack_iff_evalUnwindStack {FrameCtx : Type z} {Mem : Type u}
+    {Addr : Type v}
+    (onCleanupFrame : StackFrameState FrameCtx Mem Addr → Prop)
+    (onRootUnwind : Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (onAbortTerminate : Mem → Anneal.RefFrame.RangedBorrowTree → Prop)
+    (frames : List (SavedCallFrame FrameCtx Addr)) (m : Mem)
+    (t : Anneal.RefFrame.RangedBorrowTree) :
+    wpUnwindStack onCleanupFrame onRootUnwind onAbortTerminate frames m t ↔
+      (evalUnwindStack frames m t).holds onCleanupFrame onRootUnwind
+        onAbortTerminate := by
+  induction frames generalizing t with
+  | nil => exact Iff.rfl
+  | cons saved rest ih =>
+    cases hU : saved.cont.onUnwind with
+    | unreachable =>
+      dsimp only [wpUnwindStack, evalUnwindStack]
+      rw [hU]
+      exact Iff.rfl
+    | terminate =>
+      dsimp only [wpUnwindStack, evalUnwindStack]
+      rw [hU]
+      exact Iff.rfl
+    | cleanup cleanupBb =>
+      dsimp only [wpUnwindStack, evalUnwindStack]
+      rw [hU]
+      dsimp only
+      cases saved.isCleanupBb cleanupBb with
+      | true => exact Iff.rfl
+      | false => exact Iff.rfl
+    | continue_ =>
+      dsimp only [wpUnwindStack, evalUnwindStack]
+      rw [hU]
+      dsimp only
+      cases Anneal.RefFrame.exitFrameWithProtectors t saved.callerTags with
+      | mk t' st =>
+        cases st with
+        | Released => exact ih t'
+        | MissingTag _ => exact Iff.rfl
+        | AccessFailure _ _ _ _ => exact Iff.rfl
+        | InvariantFailure _ _ _ => exact Iff.rfl
+
+/-- Operational chain rule: a `ContinueChainReleases` prefix is transparent to
+`evalUnwindStack`, which resumes on the suffix with the released tree. -/
+theorem evalUnwindStack_append_continue_chain {FrameCtx : Type z} {Mem : Type u}
+    {Addr : Type v}
+    {prefixFrames suffixFrames : List (SavedCallFrame FrameCtx Addr)}
+    {m : Mem} {t₀ tFinal : Anneal.RefFrame.RangedBorrowTree}
+    (hChain : ContinueChainReleases prefixFrames t₀ tFinal) :
+    evalUnwindStack (prefixFrames ++ suffixFrames) m t₀ =
+      evalUnwindStack suffixFrames m tFinal := by
+  induction prefixFrames generalizing t₀ with
+  | nil =>
+    cases hChain
+    rfl
+  | cons saved rest ih =>
+    let ⟨hCont, tMid, hRel, hRest⟩ := hChain
+    dsimp only [List.cons_append, evalUnwindStack]
+    rw [hCont]
+    dsimp only
+    rw [hRel]
+    exact ih hRest
+
+/-- Unwind propagation never writes memory: every non-faulting result of
+`evalUnwindStack frames m t` carries the input memory `m` unchanged, and a
+landing frame is a validated cleanup pad (`isCleanupBb = true`) of one of the
+saved frames whose remaining callers are a suffix of `frames`. -/
+theorem evalUnwindStack_preserves_mem {FrameCtx : Type z} {Mem : Type u}
+    {Addr : Type v} (frames : List (SavedCallFrame FrameCtx Addr)) (m : Mem)
+    (t : Anneal.RefFrame.RangedBorrowTree) :
+    match evalUnwindStack frames m t with
+    | .landed st =>
+      st.mem = m ∧
+        ∃ saved : SavedCallFrame FrameCtx Addr, saved ∈ frames ∧
+          saved.cont.onUnwind = .cleanup st.blockIdx ∧
+          saved.isCleanupBb st.blockIdx = true ∧ saved.ctx = st.ctx ∧
+          ∃ pre : List (SavedCallFrame FrameCtx Addr),
+            frames = pre ++ saved :: st.callers
+    | .rootUnwind m' _ => m' = m
+    | .abortTerminate m' _ => m' = m
+    | .fault => True := by
+  induction frames generalizing t with
+  | nil => rfl
+  | cons saved rest ih =>
+    cases hU : saved.cont.onUnwind with
+    | unreachable =>
+      dsimp only [evalUnwindStack]
+      rw [hU]
+      trivial
+    | terminate =>
+      dsimp only [evalUnwindStack]
+      rw [hU]
+    | cleanup cleanupBb =>
+      dsimp only [evalUnwindStack]
+      rw [hU]
+      dsimp only
+      cases hB : saved.isCleanupBb cleanupBb with
+      | false => trivial
+      | true =>
+        exact ⟨rfl, saved, List.Mem.head _, hU, hB, rfl, [], rfl⟩
+    | continue_ =>
+      dsimp only [evalUnwindStack]
+      rw [hU]
+      dsimp only
+      cases Anneal.RefFrame.exitFrameWithProtectors t saved.callerTags with
+      | mk t' st =>
+        cases st with
+        | MissingTag _ => trivial
+        | AccessFailure _ _ _ _ => trivial
+        | InvariantFailure _ _ _ => trivial
+        | Released =>
+          have h := ih t'
+          dsimp only
+          revert h
+          cases evalUnwindStack rest m t' with
+          | landed st =>
+            intro ⟨hMem, sv, hIn, hEdge, hValid, hCtx, pre, hSplit⟩
+            exact ⟨hMem, sv, List.Mem.tail _ hIn, hEdge, hValid, hCtx,
+              saved :: pre, by rw [hSplit]; rfl⟩
+          | rootUnwind _ _ => exact id
+          | abortTerminate _ _ => exact id
+          | fault => exact id
+
 /-- Call-site weakest precondition over `[wops : MirWpOps State Out Fault]`:
 starting at `adapter.mkEntry m₀ t₀`, the callee terminates without faulting,
 its exit releases `frameTags` cleanly via `exitFrameWithProtectors`, and the
@@ -3363,5 +3536,47 @@ theorem canary_callSpecCut_abort_terminate_and_frame :
       (fun _ _ => True) (fun _ _ => False)
       csuInitialMem m' tree0 tree0 (.abortTerminate m' tree0) hDone rfl
       (fun hF => hF)
+
+/-- Operational unwinder canary (`evalUnwindStack`) on a 2-frame caller stack
+over `tree0` (protected tags `[1, 2]`):
+1. a `.continue_` frame owning tag `2` releases it and the unwind lands on the
+   validated cleanup pad `7` of the next frame, with memory unchanged and only
+   tag `1` still protected;
+2. the same stack with an invalid pad (`8`, rejected by `isCleanupBb`) faults;
+3. a `.continue_` frame claiming the unprotected tag `3` faults (`.MissingTag`);
+4. a lone `.continue_` frame propagates to the root with tag `2` released;
+5. a `.unreachable` frame faults and a `.terminate` frame aborts. -/
+theorem canary_evalUnwindStack_operational :
+    let tree0 := Anneal.RefFrame.mkSharedTopo3Tree16 .Frozen true .Unique true [1, 2]
+    let contFrame (tags : List Nat) : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 3, .continue_⟩, isCleanupBb := fun _ => false,
+        callerModifies := [], callerTags := tags }
+    let padFrame (bb : Nat) : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 4, .cleanup bb⟩,
+        isCleanupBb := fun b => Nat.beq b 7, callerModifies := [], callerTags := [] }
+    let edgeFrame (act : UnwindAction4) : SavedCallFrame Unit Nat :=
+      { ctx := (), cont := ⟨some 5, act⟩, isCleanupBb := fun _ => true,
+        callerModifies := [], callerTags := [] }
+    (match evalUnwindStack [contFrame [2], padFrame 7] csuInitialMem tree0 with
+      | .landed st =>
+        st.blockIdx = 7 ∧ st.callers = [] ∧ st.mem = csuInitialMem ∧
+          st.tree.protectedTags = [1]
+      | _ => False) ∧
+    (match evalUnwindStack [contFrame [2], padFrame 8] csuInitialMem tree0 with
+      | .fault => True
+      | _ => False) ∧
+    (match evalUnwindStack [contFrame [3], padFrame 7] csuInitialMem tree0 with
+      | .fault => True
+      | _ => False) ∧
+    (match evalUnwindStack [contFrame [2]] csuInitialMem tree0 with
+      | .rootUnwind m t => m = csuInitialMem ∧ t.protectedTags = [1]
+      | _ => False) ∧
+    (match evalUnwindStack [edgeFrame .unreachable] csuInitialMem tree0 with
+      | .fault => True
+      | _ => False) ∧
+    (match evalUnwindStack [edgeFrame .terminate] csuInitialMem tree0 with
+      | .abortTerminate m t => m = csuInitialMem ∧ t = tree0
+      | _ => False) := by
+  refine ⟨⟨rfl, rfl, rfl, rfl⟩, trivial, trivial, ⟨rfl, rfl⟩, trivial, ⟨rfl, rfl⟩⟩
 
 end Anneal.ParametricCore

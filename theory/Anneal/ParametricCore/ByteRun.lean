@@ -682,6 +682,39 @@ def writeRepeatRunsComp {Prov : Type x} (codec : ByteRunCodec Prov Byte)
   ({ addr := dstAddr, offset := dstOff, len := n * runsByteLen runs } :
       ByteSubLens Addr).set m (flattenByteRuns codec (repeatByteRuns n runs))
 
+/-- Sequential `n`-element store of a fixed, already-evaluated payload `bs`
+into `{ addr := dstAddr, offset := dstOff + i * bs.length, len := bs.length }`
+for `0 ≤ i < n` via `@Nat.rec`. This is the MIR `Rvalue::Repeat` shape (the
+operand is evaluated once, then its bytes are stored `n` times), as opposed to
+`copyRepeatedlyComp`, which re-reads a source place before every element
+write. Fails closed (`none`) when `n = 0` or `bs = []`. -/
+def writeRepeatedlyComp (dstAddr : Addr) (dstOff n : Nat) (bs : List Byte)
+    (m : Mem) : Option Mem :=
+  match Nat.beq n 0 || Nat.beq bs.length 0 with
+  | true => none
+  | false =>
+    @Nat.rec (fun _ => Option Mem) (some m)
+      (fun i acc =>
+        match acc with
+        | none => none
+        | some mCur =>
+          ({ addr := dstAddr, offset := dstOff + i * bs.length,
+             len := bs.length } : ByteSubLens Addr).set mCur bs)
+      n
+
+/-- Fail-closed: `writeRepeatedlyComp` rejects `n = 0`. -/
+theorem writeRepeatedlyComp_none_of_n_zero (dstAddr : Addr) (dstOff : Nat)
+    (bs : List Byte) (m : Mem) :
+    writeRepeatedlyComp dstAddr dstOff 0 bs m = none :=
+  rfl
+
+/-- Fail-closed: `writeRepeatedlyComp` rejects an empty payload. -/
+theorem writeRepeatedlyComp_none_of_nil (dstAddr : Addr) (dstOff n : Nat)
+    (m : Mem) :
+    writeRepeatedlyComp (Byte := Byte) dstAddr dstOff n [] m = none := by
+  unfold writeRepeatedlyComp
+  cases Nat.beq n 0 <;> rfl
+
 /-- Fail-closed: `copyRangeComp` rejects `src.len = 0`. -/
 theorem copyRangeComp_none_of_src_zero {src dst : ByteSubLens Addr} (m : Mem)
     (hZero : src.len = 0) : copyRangeComp src dst m = none := by
@@ -1196,6 +1229,158 @@ theorem copyRepeatedlyComp_eq_writeRepeatRunsComp {Prov : Type x}
   unfold writeRepeatRunsComp
   rw [flattenByteRuns_repeat codec n runs, hElemLen]
   rfl
+
+private theorem writeRepeatedly_fold_fused
+    (dstAddr : Addr) (dstOff n : Nat) (m : Mem) (elemBs oldWin : List Byte)
+    (hElemPos : 0 < elemBs.length)
+    (hWinGet : ({ addr := dstAddr, offset := dstOff,
+                  len := n * elemBs.length } : ByteSubLens Addr).get m =
+      some oldWin) :
+    ∀ (j : Nat), j ≤ n →
+      @Nat.rec (fun _ => Option Mem) (some m)
+        (fun i acc =>
+          match acc with
+          | none => none
+          | some mCur =>
+            ({ addr := dstAddr, offset := dstOff + i * elemBs.length,
+               len := elemBs.length } : ByteSubLens Addr).set mCur elemBs)
+        j =
+      ({ addr := dstAddr, offset := dstOff,
+         len := n * elemBs.length } : ByteSubLens Addr).set m
+        (listSplice oldWin 0 (repeatSlice j elemBs)) := by
+  let dstWin : ByteSubLens Addr :=
+    { addr := dstAddr, offset := dstOff, len := n * elemBs.length }
+  have hOldLen : oldWin.length = n * elemBs.length := ByteSubLens.get_len hWinGet
+  intro j
+  induction j with
+  | zero =>
+    intro _
+    change some m = dstWin.set m (listSplice oldWin 0 [])
+    rw [listSplice_zero_nil]
+    exact (ByteSubLens.set_get hWinGet).symm
+  | succ k ih =>
+    intro hK1Le
+    have hKLe : k ≤ n := Nat.le_trans (Nat.le_succ k) hK1Le
+    have hPrev := ih hKLe
+    have hRepKLen : (repeatSlice k elemBs).length = k * elemBs.length :=
+      repeatSlice_length k elemBs
+    have hKBound : 0 + (repeatSlice k elemBs).length ≤ oldWin.length := by
+      rw [Nat.zero_add, hRepKLen, hOldLen]
+      exact Nat.mul_le_mul_right elemBs.length hKLe
+    have hSpliceKLen :
+        (listSplice oldWin 0 (repeatSlice k elemBs)).length = dstWin.len :=
+      (listSplice_length oldWin 0 (repeatSlice k elemBs) hKBound).trans hOldLen
+    let ⟨mK, hSetK⟩ :=
+      ByteSubLens.set_isSome_of_get
+        (listSplice oldWin 0 (repeatSlice k elemBs)) hWinGet hSpliceKLen
+    have hRecEq :
+        @Nat.rec (fun _ => Option Mem) (some m)
+          (fun i acc =>
+            match acc with
+            | none => none
+            | some mCur =>
+              ({ addr := dstAddr, offset := dstOff + i * elemBs.length,
+                 len := elemBs.length } : ByteSubLens Addr).set mCur elemBs)
+          k = some mK := hPrev.trans hSetK
+    change (match @Nat.rec (fun _ => Option Mem) (some m)
+        (fun i acc =>
+          match acc with
+          | none => none
+          | some mCur =>
+            ({ addr := dstAddr, offset := dstOff + i * elemBs.length,
+               len := elemBs.length } : ByteSubLens Addr).set mCur elemBs) k with
+      | none => none
+      | some mCur =>
+        ({ addr := dstAddr, offset := dstOff + k * elemBs.length,
+           len := elemBs.length } : ByteSubLens Addr).set mCur elemBs) =
+      dstWin.set m (listSplice oldWin 0 (repeatSlice (k + 1) elemBs))
+    rw [hRecEq]
+    dsimp only
+    have hElemLensEq :
+        ({ addr := dstAddr, offset := dstOff + k * elemBs.length,
+           len := elemBs.length } : ByteSubLens Addr) =
+          dstWin.zoom (k * elemBs.length) elemBs.length := rfl
+    rw [hElemLensEq]
+    have hWinK : dstWin.get mK = some (listSplice oldWin 0 (repeatSlice k elemBs)) :=
+      ByteSubLens.get_set hSetK
+    have hSubIn : k * elemBs.length + elemBs.length ≤ dstWin.len := by
+      change k * elemBs.length + elemBs.length ≤ n * elemBs.length
+      rw [← Nat.succ_mul]
+      exact Nat.mul_le_mul_right elemBs.length hK1Le
+    rw [ByteSubLens.zoom_set_eq_splice hWinK hElemPos hSubIn rfl]
+    have hFuse :=
+      listSplice_contiguous_fuse oldWin 0 (repeatSlice k elemBs) elemBs hKBound
+    rw [Nat.zero_add, hRepKLen] at hFuse
+    rw [hFuse, ← repeatSlice_succ k elemBs]
+    exact ByteSubLens.set_set
+      (listSplice oldWin 0 (repeatSlice (k + 1) elemBs)) hSetK
+
+/-- **Fixed-payload Repeat Fusion Theorem (no disjointness side condition):**
+when `0 < n`, `0 < runsByteLen runs`, and the target window
+`[dstOff, dstOff + n * runsByteLen runs)` is readable, `n` sequential element
+stores of the evaluated payload `flattenByteRuns codec runs` via
+`writeRepeatedlyComp` produce the EXACT same `Option Mem` result as the fused
+bulk write `writeRepeatRunsComp`. Unlike `copyRepeatedlyComp_eq_writeRepeatRunsComp`
+no source lens is re-read, so overlap between where the payload came from and
+the target window is irrelevant (contrast with
+`canary_byterun_overlap_breaks_repeat_fusion`). -/
+theorem writeRepeatedlyComp_eq_writeRepeatRunsComp {Prov : Type x}
+    (codec : ByteRunCodec Prov Byte)
+    {dstAddr : Addr} {dstOff n : Nat} {m : Mem} {oldWin : List Byte}
+    (runs : List (ByteRun Prov))
+    (hNPos : 0 < n) (hElemPos : 0 < runsByteLen runs)
+    (hWinGet :
+      ({ addr := dstAddr, offset := dstOff,
+         len := n * runsByteLen runs } : ByteSubLens Addr).get m = some oldWin) :
+    writeRepeatedlyComp dstAddr dstOff n (flattenByteRuns codec runs) m =
+      writeRepeatRunsComp codec dstAddr dstOff n runs m := by
+  let elemBs := flattenByteRuns codec runs
+  have hElemLen : elemBs.length = runsByteLen runs :=
+    flattenByteRuns_length codec runs
+  have hNZero : Nat.beq n 0 = false :=
+    natBeq_false_of_not_eq (fun hZ => Nat.not_lt_zero 0 (hZ ▸ hNPos))
+  have hElemBsPos : 0 < elemBs.length := by
+    rw [hElemLen]; exact hElemPos
+  have hLenZero : Nat.beq elemBs.length 0 = false :=
+    natBeq_false_of_not_eq (fun hZ => Nat.not_lt_zero 0 (hZ ▸ hElemBsPos))
+  unfold writeRepeatedlyComp
+  change (match Nat.beq n 0 || Nat.beq elemBs.length 0 with
+    | true => none
+    | false => _) = _
+  rw [hNZero, hLenZero]
+  have hWinGet' :
+      ({ addr := dstAddr, offset := dstOff,
+         len := n * elemBs.length } : ByteSubLens Addr).get m = some oldWin := by
+    rw [hElemLen]; exact hWinGet
+  have hFused :=
+    writeRepeatedly_fold_fused dstAddr dstOff n m elemBs oldWin
+      hElemBsPos hWinGet' n (Nat.le_refl n)
+  rw [hFused]
+  have hRepLen : (repeatSlice n elemBs).length = oldWin.length := by
+    rw [repeatSlice_length, hElemLen, ByteSubLens.get_len hWinGet]
+  rw [listSplice_zero_full oldWin (repeatSlice n elemBs) hRepLen]
+  unfold writeRepeatRunsComp
+  rw [flattenByteRuns_repeat codec n runs, hElemLen]
+  rfl
+
+/-- Operand-then-repeat composition: reading the payload once from ANY
+readable `src` (overlapping the target window or not) and then storing it `n`
+times agrees with the fused write of the payload that was read. -/
+theorem writeRepeatedlyComp_of_src_get {Prov : Type x}
+    (codec : ByteRunCodec Prov Byte)
+    {src : ByteSubLens Addr} {dstAddr : Addr} {dstOff n : Nat}
+    {m : Mem} {oldWin : List Byte} (runs : List (ByteRun Prov))
+    (hNPos : 0 < n) (hElemPos : 0 < runsByteLen runs)
+    (hSrcGet : src.get m = some (flattenByteRuns codec runs))
+    (hWinGet :
+      ({ addr := dstAddr, offset := dstOff,
+         len := n * runsByteLen runs } : ByteSubLens Addr).get m = some oldWin) :
+    (match src.get m with
+      | none => none
+      | some bs => writeRepeatedlyComp dstAddr dstOff n bs m) =
+      writeRepeatRunsComp codec dstAddr dstOff n runs m := by
+  rw [hSrcGet]
+  exact writeRepeatedlyComp_eq_writeRepeatRunsComp codec runs hNPos hElemPos hWinGet
 
 /-- Full `[T; N]` repeat-fusion soundness theorem: produces the post-state
 `mFinal` witnessing exact agreement between `copyRepeatedlyComp` and
@@ -2232,5 +2417,43 @@ theorem canary_byterun_overlap_breaks_repeat_fusion :
   intro hEq
   have hGet := congrArg (dstWin.get) hEq
   cases hGet
+
+/-- Positive/negative contrast canary for `Rvalue::Repeat` semantics on the
+same overlapping store as `canary_byterun_overlap_breaks_repeat_fusion`
+(`src = [0..4)` overlaps the `[2..10)` target window):
+1. evaluating the payload ONCE from `src` and storing it twice
+   (`writeRepeatedlyComp`) agrees with the fused write, as
+   `writeRepeatedlyComp_of_src_get` predicts with no disjointness hypothesis;
+2. re-reading `src` before each element (`copyRepeatedlyComp`) does NOT agree,
+   so the disjointness hypothesis of `copyRepeatedlyComp_eq_writeRepeatRunsComp`
+   cannot be dropped;
+3. an empty payload fails closed. -/
+theorem canary_byterun_payload_repeat_overlap_fuses :
+    let elemRuns : List (ByteRun PEmpty.{1}) := [.initPlain [0x11, 0x22, 0x33, 0x44]]
+    let c := ByteRunCodec.optionUInt8
+    let m0 : SliceStore (Option UInt8) :=
+      { allocs := [{ allocId := 1,
+                     bytes := [some 0x11, some 0x22, some 0x33, some 0x44,
+                               none, none, none, none, none, none],
+                     writable := true }] }
+    let src : ByteSubLens Nat := { addr := 1, offset := 0, len := 4 }
+    (match src.get m0 with
+      | none => none
+      | some bs => writeRepeatedlyComp 1 2 2 bs m0) =
+      writeRepeatRunsComp c 1 2 2 elemRuns m0 ∧
+    copyRepeatedlyComp src 1 2 2 m0 ≠ writeRepeatRunsComp c 1 2 2 elemRuns m0 ∧
+    writeRepeatedlyComp (Byte := Option UInt8) 1 2 2 [] m0 = none := by
+  intro elemRuns c m0 src
+  have hNeg := canary_byterun_overlap_breaks_repeat_fusion
+  dsimp only at hNeg
+  let ⟨mRep, mFused, hRep, hFused, _, _, hNe⟩ := hNeg
+  refine ⟨?_, ?_, writeRepeatedlyComp_none_of_nil 1 2 2 m0⟩
+  · exact writeRepeatedlyComp_of_src_get (src := src) (dstAddr := 1) (dstOff := 2)
+      (n := 2) (m := m0)
+      (oldWin := [some 0x33, some 0x44, none, none, none, none, none, none])
+      c elemRuns (Nat.zero_lt_succ 1) (Nat.zero_lt_succ 3) rfl rfl
+  · intro hEq
+    have hEq' : some mRep = some mFused := hRep.symm.trans (hEq.trans hFused)
+    exact hNe (Option.some.inj hEq')
 
 end Anneal.ParametricCore
